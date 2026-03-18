@@ -54,7 +54,7 @@
     "typecheck:tsc": "tsc --noEmit"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "^0.15.0",
+    "@agentclientprotocol/sdk": "^0.16.1",
     "commander": "^14.0.3",
     "skillflag": "^0.1.4"
   },
