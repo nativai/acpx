@@ -487,6 +487,12 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   let sawAcpMessage = false;
   let eventWriterClosed = false;
 
+  // Flush pending messages to the stream file every 500ms so external readers
+  // (e.g. UI tools) can observe progress in real-time rather than only at turn end.
+  const streamFlushInterval = setInterval(() => {
+    void flushPendingMessages(false).catch(() => {});
+  }, 500);
+
   const closeEventWriter = async (checkpoint: boolean): Promise<void> => {
     if (eventWriterClosed) {
       return;
@@ -726,6 +732,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
     applyConversation(record, conversation);
     record.acpx = acpxState;
+    clearInterval(streamFlushInterval);
     await flushPendingMessages(false).catch(() => {
       // best effort on close
     });
