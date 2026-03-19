@@ -106,6 +106,7 @@ export class SessionQueueOwner {
   private readonly onQueueDepthChanged?: (queueDepth: number) => void;
   private readonly pending: QueueTask[] = [];
   private readonly waiters: Array<(task: QueueTask | undefined) => void> = [];
+  private midTurnHandler?: (task: QueueTask) => boolean;
   private closed = false;
 
   private constructor(
@@ -227,6 +228,19 @@ export class SessionQueueOwner {
     return this.pending.length;
   }
 
+  setMidTurnHandler(handler: (task: QueueTask) => boolean): void {
+    this.midTurnHandler = handler;
+  }
+
+  clearMidTurnHandler(): void {
+    this.midTurnHandler = undefined;
+  }
+
+  requeue(task: QueueTask): void {
+    this.pending.unshift(task);
+    this.emitQueueDepth();
+  }
+
   private emitQueueDepth(): void {
     this.onQueueDepthChanged?.(this.pending.length);
   }
@@ -246,6 +260,12 @@ export class SessionQueueOwner {
         );
       }
       task.close();
+      return;
+    }
+
+    // When a mid-turn handler is registered, new tasks are injected directly
+    // into the active prompt turn instead of being queued.
+    if (this.midTurnHandler?.(task)) {
       return;
     }
 

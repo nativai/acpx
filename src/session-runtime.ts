@@ -1071,36 +1071,65 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       });
     }, QUEUE_OWNER_HEARTBEAT_INTERVAL_MS);
 
+    // Mid-turn injection: tasks that arrive while a prompt is active bypass the
+    // normal queue and land here. After the current task finishes they are picked
+    // up immediately without waiting for another nextTask() poll cycle.
+    const midTurnQueue: QueueTask[] = [];
+
+    const pushMidTurn = (task: QueueTask): boolean => {
+      midTurnQueue.push(task);
+      return true;
+    };
+
+    const runTaskOptions = {
+      sharedClient,
+      verbose: options.verbose,
+      mcpServers: options.mcpServers,
+      nonInteractivePermissions: options.nonInteractivePermissions,
+      authCredentials: options.authCredentials,
+      authPolicy: options.authPolicy,
+      suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
+      onClientAvailable: setActiveController,
+      onClientClosed: clearActiveController,
+      onPromptActive: async () => {
+        turnController.markPromptActive();
+        await applyPendingCancel();
+      },
+    };
+
     let isFirstTask = true;
     while (true) {
-      const pollTimeoutMs = isFirstTask ? initialTaskPollTimeoutMs : taskPollTimeoutMs;
-      const task = await owner.nextTask(pollTimeoutMs);
+      // Drain any mid-turn tasks before waiting on the queue.
+      let task: QueueTask | undefined = midTurnQueue.shift();
+
+      if (!task) {
+        const pollTimeoutMs = isFirstTask ? initialTaskPollTimeoutMs : taskPollTimeoutMs;
+        task = (await owner.nextTask(pollTimeoutMs)) ?? undefined;
+      }
+
       if (!task) {
         break;
       }
       isFirstTask = false;
 
-      await runPromptTurn(async () => {
-        try {
-          await runQueuedTask(options.sessionId, task, {
-            sharedClient,
-            verbose: options.verbose,
-            mcpServers: options.mcpServers,
-            nonInteractivePermissions: options.nonInteractivePermissions,
-            authCredentials: options.authCredentials,
-            authPolicy: options.authPolicy,
-            suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
-            onClientAvailable: setActiveController,
-            onClientClosed: clearActiveController,
-            onPromptActive: async () => {
-              turnController.markPromptActive();
-              await applyPendingCancel();
-            },
-          });
-        } finally {
-          checkpointPerfMetricsCapture();
-        }
-      });
+      owner.setMidTurnHandler(pushMidTurn);
+      try {
+        await runPromptTurn(async () => {
+          try {
+            await runQueuedTask(options.sessionId, task!, runTaskOptions);
+          } finally {
+            checkpointPerfMetricsCapture();
+          }
+        });
+      } finally {
+        owner.clearMidTurnHandler();
+      }
+    }
+
+    // Return any unprocessed mid-turn tasks to the normal queue so they are
+    // handled by owner.close() (which sends QUEUE_OWNER_SHUTTING_DOWN errors).
+    for (const leftover of midTurnQueue.splice(0)) {
+      owner.requeue(leftover);
     }
   } finally {
     if (heartbeatTimer) {
