@@ -223,6 +223,10 @@ type RunSessionPromptOptions = {
   onClientClosed?: () => void;
   onPromptActive?: () => Promise<void> | void;
   client?: AcpClient;
+  // Called with a handler once the ACP prompt is in-flight; the handler
+  // accepts a QueueTask and concurrently calls client.prompt() for it so the
+  // agent sees the new message mid-turn via the Pushable queue.
+  setMidTurnHandler?: (handler: ((task: QueueTask) => void) | undefined) => void;
 };
 
 type ActiveSessionController = QueueOwnerActiveSessionController;
@@ -402,6 +406,7 @@ async function runQueuedTask(
     onClientAvailable?: (controller: ActiveSessionController) => void;
     onClientClosed?: () => void;
     onPromptActive?: () => Promise<void> | void;
+    setMidTurnHandler?: (handler: ((task: QueueTask) => void) | undefined) => void;
   },
 ): Promise<void> {
   const outputFormatter = task.waitForCompletion
@@ -426,6 +431,7 @@ async function runQueuedTask(
       onClientClosed: options.onClientClosed,
       onPromptActive: options.onPromptActive,
       client: options.sharedClient,
+      setMidTurnHandler: options.setMidTurnHandler,
     });
 
     if (task.waitForCompletion) {
@@ -637,15 +643,83 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
               }
             }
           }
+
+          // Register the mid-turn concurrent injection handler now that the ACP
+          // prompt is in-flight. Any task injected here calls client.prompt()
+          // concurrently so the agent sees the new message via its Pushable queue
+          // mid-turn rather than waiting for the current turn to end.
+          //
+          // We track each injected promise so we can await all of them after the
+          // first turn finishes. This prevents the main loop from picking up the
+          // next sequential task while an injected prompt is still in-flight —
+          // which would cause a second concurrent client.prompt() call that would
+          // cut the injected turn short before it produces any output.
+          const injectedPromises: Promise<void>[] = [];
+          options.setMidTurnHandler?.((injectedTask: QueueTask) => {
+            const injectedPromise = (async () => {
+              try {
+                const injectedResponse = await client.prompt(
+                  activeSessionId,
+                  injectedTask.prompt ?? textPrompt(injectedTask.message),
+                );
+                if (injectedTask.waitForCompletion) {
+                  injectedTask.send({
+                    type: "result",
+                    requestId: injectedTask.requestId,
+                    result: toPromptResult(
+                      injectedResponse.stopReason,
+                      record.acpxRecordId,
+                      client,
+                    ),
+                  });
+                }
+              } catch (injectedError) {
+                if (injectedTask.waitForCompletion) {
+                  const normalized = normalizeOutputError(injectedError, {
+                    origin: "runtime",
+                    detailCode: "MID_TURN_PROMPT_FAILED",
+                  });
+                  injectedTask.send({
+                    type: "error",
+                    requestId: injectedTask.requestId,
+                    code: normalized.code,
+                    detailCode: normalized.detailCode,
+                    origin: normalized.origin,
+                    message: normalized.message,
+                    retryable: normalized.retryable,
+                  });
+                }
+              } finally {
+                injectedTask.close();
+              }
+            })();
+            injectedPromises.push(injectedPromise);
+          });
+
           response = await measurePerf("runtime.prompt.agent_turn", async () => {
             return await withTimeout(promptPromise, options.timeoutMs);
           });
+
+          // First turn is done — clear the mid-turn handler so no new concurrent
+          // calls are made while we are writing the result and closing the writer.
+          options.setMidTurnHandler?.(undefined);
+
+          // Await all in-flight injected prompts before returning so the main
+          // loop does not start the next sequential task while the injected
+          // client.prompt() is still running. A second concurrent call would
+          // push the next sequential message into the injected turn's context,
+          // causing it to end early with no visible output.
+          if (injectedPromises.length > 0) {
+            await Promise.allSettled(injectedPromises);
+            await flushPendingMessages(false);
+          }
           if (options.verbose) {
             process.stderr.write(
               `[acpx] ${formatPerfMetric("prompt.agent_turn", Date.now() - promptStartedAt)}\n`,
             );
           }
         } catch (error) {
+          options.setMidTurnHandler?.(undefined);
           const snapshot = client.getAgentLifecycleSnapshot();
           applyLifecycleSnapshotToRecord(record, snapshot);
           if (snapshot.lastExit?.unexpectedDuringPrompt && options.verbose) {
@@ -1071,15 +1145,34 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       });
     }, QUEUE_OWNER_HEARTBEAT_INTERVAL_MS);
 
-    // Mid-turn injection: tasks that arrive while a prompt is active bypass the
-    // normal queue and land here. After the current task finishes they are picked
-    // up immediately without waiting for another nextTask() poll cycle.
-    const midTurnQueue: QueueTask[] = [];
+    // Mid-turn injection:
+    // Tasks that arrive while a prompt turn is active bypass the normal queue
+    // and are injected concurrently via client.prompt() so the agent sees the
+    // new message through its Pushable queue mid-turn.
+    //
+    // Two-phase design:
+    //   1. "Capture" phase — from the moment a task starts executing until
+    //      client.prompt() is in-flight, incoming tasks land in midTurnBuffer.
+    //   2. "Active" phase — once activeMidTurnHandler is registered (after
+    //      client.prompt() is called), the buffer is drained into it
+    //      immediately and all subsequent tasks are injected directly.
+    let activeMidTurnHandler: ((task: QueueTask) => void) | undefined;
+    const midTurnBuffer: QueueTask[] = [];
+    let midTurnCaptureActive = false;
 
-    const pushMidTurn = (task: QueueTask): boolean => {
-      midTurnQueue.push(task);
-      return true;
-    };
+    owner.setMidTurnHandler((task: QueueTask): boolean => {
+      if (activeMidTurnHandler) {
+        activeMidTurnHandler(task);
+        return true;
+      }
+      if (midTurnCaptureActive) {
+        // Buffer the task until the concurrent handler is ready.
+        midTurnBuffer.push(task);
+        return true;
+      }
+      // Not in a turn — let the task queue normally.
+      return false;
+    });
 
     const runTaskOptions = {
       sharedClient,
@@ -1095,42 +1188,47 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         turnController.markPromptActive();
         await applyPendingCancel();
       },
+      setMidTurnHandler: (handler: ((task: QueueTask) => void) | undefined) => {
+        activeMidTurnHandler = handler;
+        if (handler) {
+          // Drain any tasks that arrived during the capture phase.
+          for (const buffered of midTurnBuffer.splice(0)) {
+            handler(buffered);
+          }
+        }
+      },
     };
 
     let isFirstTask = true;
     while (true) {
-      // Drain any mid-turn tasks before waiting on the queue.
-      let task: QueueTask | undefined = midTurnQueue.shift();
-
-      if (!task) {
-        const pollTimeoutMs = isFirstTask ? initialTaskPollTimeoutMs : taskPollTimeoutMs;
-        task = (await owner.nextTask(pollTimeoutMs)) ?? undefined;
-      }
-
+      const pollTimeoutMs = isFirstTask ? initialTaskPollTimeoutMs : taskPollTimeoutMs;
+      const task = await owner.nextTask(pollTimeoutMs);
       if (!task) {
         break;
       }
       isFirstTask = false;
 
-      owner.setMidTurnHandler(pushMidTurn);
+      midTurnCaptureActive = true;
       try {
         await runPromptTurn(async () => {
           try {
-            await runQueuedTask(options.sessionId, task!, runTaskOptions);
+            await runQueuedTask(options.sessionId, task, runTaskOptions);
           } finally {
             checkpointPerfMetricsCapture();
           }
         });
       } finally {
-        owner.clearMidTurnHandler();
+        midTurnCaptureActive = false;
+        activeMidTurnHandler = undefined;
+        // Any buffered tasks that were never injected (e.g. handler never
+        // became active) go back to the normal queue.
+        for (const leftover of midTurnBuffer.splice(0)) {
+          owner.requeue(leftover);
+        }
       }
     }
 
-    // Return any unprocessed mid-turn tasks to the normal queue so they are
-    // handled by owner.close() (which sends QUEUE_OWNER_SHUTTING_DOWN errors).
-    for (const leftover of midTurnQueue.splice(0)) {
-      owner.requeue(leftover);
-    }
+    owner.clearMidTurnHandler();
   } finally {
     if (heartbeatTimer) {
       clearInterval(heartbeatTimer);
