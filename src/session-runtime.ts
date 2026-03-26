@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { tailClaudeSubagentJsonl } from "./claude-jsonl.js";
 import { AcpClient } from "./client.js";
 import { formatErrorMessage, normalizeOutputError } from "./error-normalization.js";
 import { checkpointPerfMetricsCapture } from "./perf-metrics-capture.js";
@@ -507,6 +508,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   const subagentRecordsById = new Map<string, SessionRecord>();
   // Subagent event writers: map from ACPX record id to event writer
   const subagentEventWriters = new Map<string, SessionEventWriter>();
+  // Subagent JSONL tailers: map from ACPX record id to stop function
+  const subagentTailers = new Map<string, { stop: () => Promise<void> }>();
 
   const getOrOpenSubagentEventWriter = async (
     childAcpxRecordId: string,
@@ -526,6 +529,12 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     } catch {
       return undefined;
     }
+  };
+
+  const stopAllSubagentTailers = async (): Promise<void> => {
+    const stops = [...subagentTailers.values()].map((t) => t.stop().catch(() => {}));
+    await Promise.all(stops);
+    subagentTailers.clear();
   };
 
   const closeAllSubagentEventWriters = async (): Promise<void> => {
@@ -550,6 +559,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       return;
     }
     eventWriterClosed = true;
+    await stopAllSubagentTailers();
     await closeAllSubagentEventWriters();
     await eventWriter.close({ checkpoint });
   };
@@ -627,6 +637,25 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
                 void writer.appendMessage(message).catch(() => {});
               }
             });
+            // On task completion/failure/stop: drain the tailer and persist final messages
+            const status = claudeCodeMeta.status;
+            if (
+              status === "task_completed" ||
+              status === "task_failed" ||
+              status === "task_stopped"
+            ) {
+              const tailer = subagentTailers.get(childAcpxRecordId);
+              if (tailer) {
+                subagentTailers.delete(childAcpxRecordId);
+                void tailer.stop().then(() => {
+                  const childRecord = subagentRecordsById.get(childAcpxRecordId);
+                  if (childRecord) {
+                    childRecord.lastUsedAt = isoNow();
+                    void writeSessionRecord(childRecord).catch(() => {});
+                  }
+                });
+              }
+            }
           }
         }
       }
@@ -700,6 +729,44 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
                 // best effort — don't fail the main prompt
               }
             })();
+
+            // Start tailing the subagent's JSONL file in real-time
+            const rawAgentId = agentId.split("@")[0];
+            const jsonlDir = claudeSubagentDir(record.cwd, record.acpSessionId);
+            const tailer = tailClaudeSubagentJsonl(jsonlDir, rawAgentId, (newMessages) => {
+              childRecord.messages.push(...newMessages);
+              childRecord.lastUsedAt = isoNow();
+              void getOrOpenSubagentEventWriter(childAcpxRecordId).then((writer) => {
+                if (!writer) {return;}
+                for (const msg of newMessages) {
+                  void writer
+                    .appendMessage({
+                      jsonrpc: "2.0",
+                      method: "session/update",
+                      params: {
+                        sessionId: record.acpSessionId,
+                        update: {
+                          _meta: {
+                            claudeCode: {
+                              toolName: "Agent",
+                              status: "subagent_message",
+                              subagentId: agentId,
+                              subagentName: childName ?? agentId,
+                            },
+                          },
+                          sessionUpdate: "tool_call_update",
+                          toolCallId: childAcpxRecordId,
+                          message: msg,
+                        },
+                      },
+                    })
+                    .catch(() => {});
+                }
+              });
+              // Persist messages to disk in background
+              void writeSessionRecord(childRecord).catch(() => {});
+            });
+            subagentTailers.set(childAcpxRecordId, tailer);
           }
         }
       }
