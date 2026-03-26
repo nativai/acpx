@@ -1363,7 +1363,9 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       const getOrOpenChildWriter = async (
         childAcpxRecordId: string,
       ): Promise<SessionEventWriter | undefined> => {
-        if (subagentWriters.has(childAcpxRecordId)) {return subagentWriters.get(childAcpxRecordId);}
+        if (subagentWriters.has(childAcpxRecordId)) {
+          return subagentWriters.get(childAcpxRecordId);
+        }
         try {
           const childRecord = await resolveSessionRecord(childAcpxRecordId);
           const writer = await SessionEventWriter.open(childRecord);
@@ -1380,10 +1382,14 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           await idleWriter.appendMessages(batch, { checkpoint: false }).catch(() => {});
         }
         for (const [childId, pending] of pendingSubagent) {
-          if (pending.length === 0) {continue;}
+          if (pending.length === 0) {
+            continue;
+          }
           const batch = pending.splice(0);
           const writer = subagentWriters.get(childId);
-          if (writer) {await writer.appendMessages(batch, { checkpoint: false }).catch(() => {});}
+          if (writer) {
+            await writer.appendMessages(batch, { checkpoint: false }).catch(() => {});
+          }
         }
       };
 
@@ -1397,7 +1403,9 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       // Handles the race where child records are written after drain starts.
       const resolveChildRecordId = async (agentName: string): Promise<string | undefined> => {
         const cached = subagentNameToRecordId.get(agentName);
-        if (cached) {return cached;}
+        if (cached) {
+          return cached;
+        }
         try {
           const refreshed = await resolveSessionRecord(options.sessionId);
           for (const ref of refreshed.subagents ?? []) {
@@ -1411,21 +1419,30 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
 
       sharedClient.setEventHandlers({
         onAcpMessage: (_dir, message) => {
-          if (!active) {return;}
+          if (!active) {
+            return;
+          }
           pendingIdle.push(message);
 
-          // Route to subagent child stream when subagentId is present
+          // Route to subagent child stream when subagentId is present.
+          // subagentId may be at notification-level (params._meta.claudeCode) or
+          // update-level (params.update._meta.claudeCode) depending on message type.
           const msg = message as Record<string, unknown>;
           if (msg.method === "session/update") {
             const params = msg.params as Record<string, unknown> | undefined;
             const notifMeta = params?._meta as Record<string, unknown> | undefined;
-            const claudeCode = notifMeta?.claudeCode as Record<string, unknown> | undefined;
-            const subagentId = claudeCode?.subagentId;
+            const notifClaudeCode = notifMeta?.claudeCode as Record<string, unknown> | undefined;
+            const update = params?.update as Record<string, unknown> | undefined;
+            const updateMeta = update?._meta as Record<string, unknown> | undefined;
+            const updateClaudeCode = updateMeta?.claudeCode as Record<string, unknown> | undefined;
+            const subagentId = notifClaudeCode?.subagentId ?? updateClaudeCode?.subagentId;
             if (typeof subagentId === "string") {
               const agentName = subagentId.split("@")[0];
               void (async () => {
                 const childAcpxRecordId = await resolveChildRecordId(agentName);
-                if (!childAcpxRecordId || !active) {return;}
+                if (!childAcpxRecordId || !active) {
+                  return;
+                }
                 if (!pendingSubagent.has(childAcpxRecordId)) {
                   pendingSubagent.set(childAcpxRecordId, []);
                   void getOrOpenChildWriter(childAcpxRecordId).catch(() => {});
