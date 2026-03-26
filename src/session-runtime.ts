@@ -86,6 +86,7 @@ import {
   type SessionSetModeResult,
   type SessionSendOutcome,
   type SessionSendResult,
+  type SubagentRef,
 } from "./types.js";
 
 export const DEFAULT_QUEUE_OWNER_TTL_MS = 300_000;
@@ -493,6 +494,39 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   let sawAcpMessage = false;
   let eventWriterClosed = false;
 
+  // Subagent tracking: map from agent_id (e.g. "poet-a@haiku-demo") to ACPX record id
+  const subagentIdToAcpxRecordId = new Map<string, string>();
+  // Subagent event writers: map from ACPX record id to event writer
+  const subagentEventWriters = new Map<string, SessionEventWriter>();
+
+  const getOrOpenSubagentEventWriter = async (
+    childAcpxRecordId: string,
+  ): Promise<SessionEventWriter | undefined> => {
+    const existing = subagentEventWriters.get(childAcpxRecordId);
+    if (existing) {
+      return existing;
+    }
+    try {
+      const childRecord = await resolveSessionRecord(childAcpxRecordId);
+      const writer = await SessionEventWriter.open(childRecord);
+      subagentEventWriters.set(childAcpxRecordId, writer);
+      return writer;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const closeAllSubagentEventWriters = async (): Promise<void> => {
+    for (const [id, writer] of subagentEventWriters) {
+      try {
+        await writer.close({ checkpoint: true });
+      } catch {
+        // best effort
+      }
+      subagentEventWriters.delete(id);
+    }
+  };
+
   // Flush pending messages to the stream file every 500ms so external readers
   // (e.g. UI tools) can observe progress in real-time rather than only at turn end.
   const streamFlushInterval = setInterval(() => {
@@ -504,6 +538,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       return;
     }
     eventWriterClosed = true;
+    await closeAllSubagentEventWriters();
     await eventWriter.close({ checkpoint });
   };
 
@@ -516,6 +551,32 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     await measurePerf("session.events.flush_pending", async () => {
       await eventWriter.appendMessages(batch, { checkpoint });
     });
+  };
+
+  // Extract claudeCode metadata from a raw ACP message (session/update notification)
+  const extractClaudeCodeMeta = (
+    message: AcpJsonRpcMessage,
+  ): Record<string, unknown> | undefined => {
+    const msg = message as Record<string, unknown>;
+    if (msg.method !== "session/update") {
+      return undefined;
+    }
+    const params = msg.params as Record<string, unknown> | undefined;
+    if (!params) {
+      return undefined;
+    }
+    // Check notification-level _meta first (for subagentId routing)
+    const notifMeta = params._meta as Record<string, unknown> | undefined;
+    if (notifMeta?.claudeCode) {
+      return notifMeta.claudeCode as Record<string, unknown>;
+    }
+    // Check update-level _meta (for teammate_spawned status)
+    const update = params.update as Record<string, unknown> | undefined;
+    if (!update) {
+      return undefined;
+    }
+    const updateMeta = update._meta as Record<string, unknown> | undefined;
+    return updateMeta?.claudeCode as Record<string, unknown> | undefined;
   };
 
   const ownClient = options.client == null;
@@ -542,6 +603,21 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     onAcpMessage: (_direction, message) => {
       sawAcpMessage = true;
       pendingMessages.push(message);
+      // Route messages with subagentId to the child stream as well
+      const claudeCodeMeta = extractClaudeCodeMeta(message);
+      if (claudeCodeMeta) {
+        const subagentId = claudeCodeMeta.subagentId;
+        if (typeof subagentId === "string") {
+          const childAcpxRecordId = subagentIdToAcpxRecordId.get(subagentId);
+          if (childAcpxRecordId) {
+            void getOrOpenSubagentEventWriter(childAcpxRecordId).then((writer) => {
+              if (writer) {
+                void writer.appendMessage(message).catch(() => {});
+              }
+            });
+          }
+        }
+      }
     },
     onAcpOutputMessage: (_direction, message) => {
       if (bufferingConnectOutput) {
@@ -553,6 +629,64 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     onSessionUpdate: (notification) => {
       acpxState = recordConversationSessionUpdate(conversation, acpxState, notification);
       trimConversationForRuntime(conversation);
+
+      // Detect teammate_spawned events to create subagent session records
+      const update = notification.update as Record<string, unknown>;
+      if (update.sessionUpdate === "tool_call_update" || update.sessionUpdate === "tool_call") {
+        const updateMeta = update._meta as Record<string, unknown> | null | undefined;
+        const claudeCodeMeta = updateMeta?.claudeCode as Record<string, unknown> | undefined;
+        if (claudeCodeMeta?.status === "teammate_spawned") {
+          const agentId = claudeCodeMeta.agent_id;
+          const subagentName = claudeCodeMeta.name ?? claudeCodeMeta.agent_id;
+          const color = claudeCodeMeta.color;
+          if (typeof agentId === "string") {
+            const spawnedAt = isoNow();
+            const childAcpxRecordId = crypto.randomUUID();
+            const childAcpSessionId = `subagent-${childAcpxRecordId}`;
+            const childName =
+              typeof subagentName === "string" ? subagentName.split("@")[0] : undefined;
+            const childRecord: SessionRecord = {
+              schema: SESSION_RECORD_SCHEMA,
+              acpxRecordId: childAcpxRecordId,
+              acpSessionId: childAcpSessionId,
+              agentCommand: "",
+              cwd: record.cwd,
+              name: childName,
+              createdAt: spawnedAt,
+              lastUsedAt: spawnedAt,
+              lastSeq: 0,
+              eventLog: defaultSessionEventLog(childAcpxRecordId),
+              closed: false,
+              messages: [],
+              updated_at: spawnedAt,
+              cumulative_token_usage: {},
+              request_token_usage: {},
+              kind: "subagent",
+              parentSessionId: record.acpxRecordId,
+            };
+            subagentIdToAcpxRecordId.set(agentId, childAcpxRecordId);
+
+            const subagentRef: SubagentRef = {
+              acpxRecordId: childAcpxRecordId,
+              name: childName ?? agentId,
+              color: typeof color === "string" ? color : undefined,
+              spawnedAt,
+            };
+
+            void (async () => {
+              try {
+                await writeSessionRecord(childRecord);
+                // Update parent record with new subagent ref
+                const parentRecord = eventWriter.getRecord();
+                parentRecord.subagents = [...(parentRecord.subagents ?? []), subagentRef];
+                await writeSessionRecord(parentRecord);
+              } catch {
+                // best effort — don't fail the main prompt
+              }
+            })();
+          }
+        }
+      }
     },
     onClientOperation: (operation) => {
       acpxState = recordConversationClientOperation(conversation, acpxState, operation);

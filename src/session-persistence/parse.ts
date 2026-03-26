@@ -5,6 +5,7 @@ import type {
   SessionEventLog,
   SessionRecord,
   SessionConversation,
+  SubagentRef,
 } from "../types.js";
 import { SESSION_RECORD_SCHEMA } from "../types.js";
 
@@ -393,6 +394,52 @@ function normalizeOptionalSignal(value: unknown): NodeJS.Signals | null | undefi
   return Symbol("invalid");
 }
 
+function parseSubagentRef(raw: unknown): SubagentRef | null {
+  const record = asRecord(raw);
+  if (
+    !record ||
+    typeof record.acpx_record_id !== "string" ||
+    typeof record.name !== "string" ||
+    typeof record.spawned_at !== "string"
+  ) {
+    return null;
+  }
+  return {
+    acpxRecordId: record.acpx_record_id,
+    name: record.name,
+    color: typeof record.color === "string" ? record.color : undefined,
+    spawnedAt: record.spawned_at,
+  };
+}
+
+function parseSubagentRefs(raw: unknown): SubagentRef[] | undefined {
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+  const refs: SubagentRef[] = [];
+  for (const entry of raw) {
+    const ref = parseSubagentRef(entry);
+    if (ref === null) {
+      return undefined;
+    }
+    refs.push(ref);
+  }
+  return refs;
+}
+
+function parseSessionKind(value: unknown): "session" | "subagent" | undefined | null {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (value === "session" || value === "subagent") {
+    return value;
+  }
+  return null;
+}
+
 export function parseSessionRecord(raw: unknown): SessionRecord | null {
   const record = asRecord(raw);
   if (!record) {
@@ -414,11 +461,28 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
   const lastAgentExitAt = normalizeOptionalString(record.last_agent_exit_at);
   const lastAgentDisconnectReason = normalizeOptionalString(record.last_agent_disconnect_reason);
 
+  const kind = parseSessionKind(record.kind);
+  if (kind === null) {
+    return null;
+  }
+
+  // agent_command is required for regular sessions but absent for subagents
+  const agentCommandRaw = record.agent_command;
+  if (kind !== "subagent" && typeof agentCommandRaw !== "string") {
+    return null;
+  }
+  const agentCommand = typeof agentCommandRaw === "string" ? agentCommandRaw : "";
+
+  // cwd is required for regular sessions but may be absent for subagents
+  const cwdRaw = record.cwd;
+  if (kind !== "subagent" && typeof cwdRaw !== "string") {
+    return null;
+  }
+  const cwd = typeof cwdRaw === "string" ? cwdRaw : "";
+
   if (
     typeof record.acpx_record_id !== "string" ||
     typeof record.acp_session_id !== "string" ||
-    typeof record.agent_command !== "string" ||
-    typeof record.cwd !== "string" ||
     typeof record.created_at !== "string" ||
     typeof record.last_used_at !== "string" ||
     typeof record.last_seq !== "number" ||
@@ -449,13 +513,20 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     return null;
   }
 
+  const parentSessionId = normalizeOptionalString(record.parent_session_id);
+  if (parentSessionId === null) {
+    return null;
+  }
+
+  const subagents = parseSubagentRefs(record.subagents);
+
   return {
     schema: SESSION_RECORD_SCHEMA,
     acpxRecordId: record.acpx_record_id,
     acpSessionId: record.acp_session_id,
     agentSessionId: normalizeRuntimeSessionId(record.agent_session_id),
-    agentCommand: record.agent_command,
-    cwd: record.cwd,
+    agentCommand,
+    cwd,
     name,
     createdAt: record.created_at,
     lastUsedAt: record.last_used_at,
@@ -480,5 +551,8 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     cumulative_token_usage: conversation.cumulative_token_usage,
     request_token_usage: conversation.request_token_usage,
     acpx: parseAcpxState(record.acpx),
+    kind,
+    parentSessionId,
+    subagents,
   };
 }

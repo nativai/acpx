@@ -9,6 +9,7 @@ export {
   isoNow,
   listSessions,
   listSessionsForAgent,
+  listSubagentsForSession,
   normalizeName,
   resolveSessionRecord,
   writeSessionRecord,

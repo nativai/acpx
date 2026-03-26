@@ -1,6 +1,15 @@
 import { normalizeRuntimeSessionId } from "../runtime-session-id.js";
-import type { SessionRecord } from "../types.js";
+import type { SessionRecord, SubagentRef } from "../types.js";
 import { SESSION_RECORD_SCHEMA } from "../types.js";
+
+function serializeSubagentRef(ref: SubagentRef): Record<string, unknown> {
+  return {
+    acpx_record_id: ref.acpxRecordId,
+    name: ref.name,
+    color: ref.color,
+    spawned_at: ref.spawnedAt,
+  };
+}
 
 export function serializeSessionRecordForDisk(record: SessionRecord): Record<string, unknown> {
   const canonical: SessionRecord = {
@@ -38,5 +47,8 @@ export function serializeSessionRecordForDisk(record: SessionRecord): Record<str
     cumulative_token_usage: canonical.cumulative_token_usage,
     request_token_usage: canonical.request_token_usage,
     acpx: canonical.acpx,
+    kind: canonical.kind,
+    parent_session_id: canonical.parentSessionId,
+    subagents: canonical.subagents?.map(serializeSubagentRef),
   };
 }
