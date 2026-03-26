@@ -636,9 +636,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         const updateMeta = update._meta as Record<string, unknown> | null | undefined;
         const claudeCodeMeta = updateMeta?.claudeCode as Record<string, unknown> | undefined;
         if (claudeCodeMeta?.status === "teammate_spawned") {
-          const agentId = claudeCodeMeta.agent_id;
-          const subagentName = claudeCodeMeta.name ?? claudeCodeMeta.agent_id;
-          const color = claudeCodeMeta.color;
+          const agentId = claudeCodeMeta.subagentId;
+          const subagentName = claudeCodeMeta.subagentName ?? claudeCodeMeta.subagentId;
+          const color = claudeCodeMeta.subagentColor;
           if (typeof agentId === "string") {
             const spawnedAt = isoNow();
             const childAcpxRecordId = crypto.randomUUID();
@@ -1157,6 +1157,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   const sessionRecord = await resolveSessionRecord(options.sessionId);
   let owner: SessionQueueOwner | undefined;
   let heartbeatTimer: NodeJS.Timeout | undefined;
+  let idleDrain: { stop: () => Promise<void> } | undefined;
   const sharedClient = new AcpClient({
     agentCommand: sessionRecord.agentCommand,
     cwd: absolutePath(sessionRecord.cwd),
@@ -1333,6 +1334,39 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       },
     };
 
+    // Idle stream drain: captures inter-turn teammate activity (session/update
+    // notifications sent by the adapter's background reader between prompts).
+    const startIdleStreamDrain = async (): Promise<{ stop: () => Promise<void> }> => {
+      let active = true;
+      const pendingIdle: AcpJsonRpcMessage[] = [];
+      const idleRecord = await resolveSessionRecord(options.sessionId);
+      const idleWriter = await SessionEventWriter.open(idleRecord);
+      const flushIdlePending = async () => {
+        if (pendingIdle.length === 0) {return;}
+        const batch = pendingIdle.splice(0);
+        await idleWriter.appendMessages(batch, { checkpoint: false }).catch(() => {});
+      };
+      const flushTimer = setInterval(() => {
+        if (active) {void flushIdlePending().catch(() => {});}
+      }, 500);
+      sharedClient.setEventHandlers({
+        onAcpMessage: (_dir, message) => {
+          if (active) {pendingIdle.push(message);}
+        },
+      });
+      return {
+        stop: async () => {
+          if (!active) {return;}
+          active = false;
+          clearInterval(flushTimer);
+          sharedClient.clearEventHandlers();
+          await flushIdlePending();
+          await idleWriter.close({ checkpoint: true }).catch(() => {});
+        },
+      };
+    };
+    idleDrain = await startIdleStreamDrain();
+
     let isFirstTask = true;
     while (true) {
       const pollTimeoutMs = isFirstTask ? initialTaskPollTimeoutMs : taskPollTimeoutMs;
@@ -1341,6 +1375,9 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         break;
       }
       isFirstTask = false;
+
+      // Stop idle drain before the prompt registers its own handlers
+      await idleDrain.stop();
 
       midTurnCaptureActive = true;
       try {
@@ -1359,11 +1396,15 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         for (const leftover of midTurnBuffer.splice(0)) {
           owner.requeue(leftover);
         }
+        // Restart idle drain to capture teammate activity until next prompt
+        idleDrain = await startIdleStreamDrain();
       }
     }
 
+    await idleDrain.stop();
     owner.clearMidTurnHandler();
   } finally {
+    await idleDrain?.stop().catch(() => {});
     if (heartbeatTimer) {
       clearInterval(heartbeatTimer);
     }
