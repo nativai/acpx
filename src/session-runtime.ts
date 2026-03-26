@@ -1436,8 +1436,14 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
             const updateMeta = update?._meta as Record<string, unknown> | undefined;
             const updateClaudeCode = updateMeta?.claudeCode as Record<string, unknown> | undefined;
             const subagentId = notifClaudeCode?.subagentId ?? updateClaudeCode?.subagentId;
-            if (typeof subagentId === "string") {
-              const agentName = subagentId.split("@")[0];
+            // subagentName (e.g. "poet-a") is more reliable for lookup than
+            // subagentId.split("@")[0] when subagentId is a raw task hash.
+            const subagentName = notifClaudeCode?.subagentName ?? updateClaudeCode?.subagentName;
+            if (typeof subagentId === "string" || typeof subagentName === "string") {
+              const agentName =
+                typeof subagentName === "string"
+                  ? subagentName.split("@")[0]
+                  : (subagentId as string).split("@")[0];
               void (async () => {
                 const childAcpxRecordId = await resolveChildRecordId(agentName);
                 if (!childAcpxRecordId || !active) {
