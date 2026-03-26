@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { AcpClient } from "./client.js";
 import { formatErrorMessage, normalizeOutputError } from "./error-normalization.js";
@@ -88,6 +89,12 @@ import {
   type SessionSendResult,
   type SubagentRef,
 } from "./types.js";
+
+function claudeSubagentDir(cwd: string, acpSessionId: string): string {
+  const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
+  const cwdHash = cwd.replace(/\//g, "-");
+  return path.join(configDir, "projects", cwdHash, acpSessionId, "subagents");
+}
 
 export const DEFAULT_QUEUE_OWNER_TTL_MS = 300_000;
 const INTERRUPT_CANCEL_WAIT_MS = 2_500;
@@ -671,6 +678,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
               name: childName ?? agentId,
               color: typeof color === "string" ? color : undefined,
               spawnedAt,
+              claudeJsonlPath: claudeSubagentDir(record.cwd, record.acpSessionId),
             };
 
             void (async () => {
@@ -1339,29 +1347,109 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
     const startIdleStreamDrain = async (): Promise<{ stop: () => Promise<void> }> => {
       let active = true;
       const pendingIdle: AcpJsonRpcMessage[] = [];
+      const pendingSubagent = new Map<string, AcpJsonRpcMessage[]>();
+      const subagentWriters = new Map<string, SessionEventWriter>();
+
       const idleRecord = await resolveSessionRecord(options.sessionId);
       const idleWriter = await SessionEventWriter.open(idleRecord);
-      const flushIdlePending = async () => {
-        if (pendingIdle.length === 0) {return;}
-        const batch = pendingIdle.splice(0);
-        await idleWriter.appendMessages(batch, { checkpoint: false }).catch(() => {});
+
+      // Build name → childAcpxRecordId from the parent's subagents array.
+      // This is populated after each prompt turn (teammate_spawned writes the child record).
+      const subagentNameToRecordId = new Map<string, string>();
+      for (const ref of idleRecord.subagents ?? []) {
+        subagentNameToRecordId.set(ref.name, ref.acpxRecordId);
+      }
+
+      const getOrOpenChildWriter = async (
+        childAcpxRecordId: string,
+      ): Promise<SessionEventWriter | undefined> => {
+        if (subagentWriters.has(childAcpxRecordId)) {return subagentWriters.get(childAcpxRecordId);}
+        try {
+          const childRecord = await resolveSessionRecord(childAcpxRecordId);
+          const writer = await SessionEventWriter.open(childRecord);
+          subagentWriters.set(childAcpxRecordId, writer);
+          return writer;
+        } catch {
+          return undefined;
+        }
       };
+
+      const flushIdlePending = async () => {
+        if (pendingIdle.length > 0) {
+          const batch = pendingIdle.splice(0);
+          await idleWriter.appendMessages(batch, { checkpoint: false }).catch(() => {});
+        }
+        for (const [childId, pending] of pendingSubagent) {
+          if (pending.length === 0) {continue;}
+          const batch = pending.splice(0);
+          const writer = subagentWriters.get(childId);
+          if (writer) {await writer.appendMessages(batch, { checkpoint: false }).catch(() => {});}
+        }
+      };
+
       const flushTimer = setInterval(() => {
-        if (active) {void flushIdlePending().catch(() => {});}
+        if (active) {
+          void flushIdlePending().catch(() => {});
+        }
       }, 500);
+
+      // Lazily resolve agentName → childAcpxRecordId, refreshing from disk if not found.
+      // Handles the race where child records are written after drain starts.
+      const resolveChildRecordId = async (agentName: string): Promise<string | undefined> => {
+        const cached = subagentNameToRecordId.get(agentName);
+        if (cached) {return cached;}
+        try {
+          const refreshed = await resolveSessionRecord(options.sessionId);
+          for (const ref of refreshed.subagents ?? []) {
+            subagentNameToRecordId.set(ref.name, ref.acpxRecordId);
+          }
+        } catch {
+          // best effort
+        }
+        return subagentNameToRecordId.get(agentName);
+      };
+
       sharedClient.setEventHandlers({
         onAcpMessage: (_dir, message) => {
-          if (active) {pendingIdle.push(message);}
+          if (!active) {return;}
+          pendingIdle.push(message);
+
+          // Route to subagent child stream when subagentId is present
+          const msg = message as Record<string, unknown>;
+          if (msg.method === "session/update") {
+            const params = msg.params as Record<string, unknown> | undefined;
+            const notifMeta = params?._meta as Record<string, unknown> | undefined;
+            const claudeCode = notifMeta?.claudeCode as Record<string, unknown> | undefined;
+            const subagentId = claudeCode?.subagentId;
+            if (typeof subagentId === "string") {
+              const agentName = subagentId.split("@")[0];
+              void (async () => {
+                const childAcpxRecordId = await resolveChildRecordId(agentName);
+                if (!childAcpxRecordId || !active) {return;}
+                if (!pendingSubagent.has(childAcpxRecordId)) {
+                  pendingSubagent.set(childAcpxRecordId, []);
+                  void getOrOpenChildWriter(childAcpxRecordId).catch(() => {});
+                }
+                pendingSubagent.get(childAcpxRecordId)!.push(message);
+              })();
+            }
+          }
         },
       });
+
       return {
         stop: async () => {
-          if (!active) {return;}
+          if (!active) {
+            return;
+          }
           active = false;
           clearInterval(flushTimer);
           sharedClient.clearEventHandlers();
           await flushIdlePending();
           await idleWriter.close({ checkpoint: true }).catch(() => {});
+          for (const writer of subagentWriters.values()) {
+            await writer.close({ checkpoint: true }).catch(() => {});
+          }
         },
       };
     };

@@ -409,6 +409,8 @@ function parseSubagentRef(raw: unknown): SubagentRef | null {
     name: record.name,
     color: typeof record.color === "string" ? record.color : undefined,
     spawnedAt: record.spawned_at,
+    claudeJsonlPath:
+      typeof record.claude_jsonl_path === "string" ? record.claude_jsonl_path : undefined,
   };
 }
 

@@ -8,6 +8,7 @@ function serializeSubagentRef(ref: SubagentRef): Record<string, unknown> {
     name: ref.name,
     color: ref.color,
     spawned_at: ref.spawnedAt,
+    claude_jsonl_path: ref.claudeJsonlPath,
   };
 }
 

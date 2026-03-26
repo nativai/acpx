@@ -288,6 +288,7 @@ export type SubagentRef = {
   name: string;
   color?: string;
   spawnedAt: string;
+  claudeJsonlPath?: string;
 };
 
 export type SessionRecord = {
