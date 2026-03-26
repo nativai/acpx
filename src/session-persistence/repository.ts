@@ -222,11 +222,24 @@ export async function listSessions(): Promise<SessionRecord[]> {
 
 export async function listSessionsForAgent(agentCommand: string): Promise<SessionRecord[]> {
   const entries = (await loadSessionIndexEntries()).filter(
-    (session) => session.agentCommand === agentCommand,
+    (session) => session.agentCommand === agentCommand && session.kind !== "subagent",
   );
   const records = await Promise.all(entries.map((entry) => loadRecordFromIndexEntry(entry)));
   return records
     .filter((entry): entry is SessionRecord => Boolean(entry))
+    .toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
+}
+
+export async function listSubagentsForSession(
+  parentAcpxRecordId: string,
+): Promise<SessionRecord[]> {
+  const entries = (await loadSessionIndexEntries()).filter(
+    (session) => session.kind === "subagent",
+  );
+  const records = await Promise.all(entries.map((entry) => loadRecordFromIndexEntry(entry)));
+  return records
+    .filter((entry): entry is SessionRecord => Boolean(entry))
+    .filter((entry) => entry.parentSessionId === parentAcpxRecordId)
     .toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
 }
 
@@ -318,6 +331,24 @@ export async function closeSession(id: string): Promise<SessionRecord> {
   record.lastPromptAt = record.lastPromptAt ?? now;
 
   await writeSessionRecord(record);
+
+  // Also mark any subagents of this session as closed
+  if (record.subagents && record.subagents.length > 0) {
+    for (const subagentRef of record.subagents) {
+      try {
+        const subagentRecord = await resolveSessionRecord(subagentRef.acpxRecordId);
+        if (!subagentRecord.closed) {
+          subagentRecord.closed = true;
+          subagentRecord.closedAt = now;
+          subagentRecord.lastUsedAt = now;
+          await writeSessionRecord(subagentRecord);
+        }
+      } catch {
+        // best effort — don't fail parent close if subagent record is missing
+      }
+    }
+  }
+
   await rebuildSessionIndex(sessionBaseDir()).catch(() => {
     // best effort cache rebuild
   });

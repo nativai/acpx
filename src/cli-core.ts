@@ -50,6 +50,7 @@ import {
   findGitRepositoryRoot,
   findSession,
   findSessionByDirectoryWalk,
+  listSubagentsForSession,
 } from "./session-persistence.js";
 import { InterruptedError } from "./session-runtime-helpers.js";
 import {
@@ -60,6 +61,7 @@ import {
   type SessionRecord,
   type SessionAgentContent,
   type SessionUserContent,
+  type SubagentRef,
 } from "./types.js";
 import { getAcpxVersion } from "./version.js";
 
@@ -1170,6 +1172,87 @@ function registerSessionsCommand(
     });
 }
 
+async function handleSubagents(
+  explicitAgentName: string | undefined,
+  flags: StatusFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const sessionName = resolveSessionNameFromFlags(flags, command);
+  const record = await findSession({
+    agentCommand: agent.agentCommand,
+    cwd: agent.cwd,
+    name: sessionName,
+    includeClosed: true,
+  });
+
+  if (!record) {
+    throw new Error(
+      sessionName
+        ? `No named session "${sessionName}" for cwd ${agent.cwd} and agent ${agent.agentName}`
+        : `No cwd session for ${agent.cwd} and agent ${agent.agentName}`,
+    );
+  }
+
+  type SubagentEntry = { acpxRecordId: string; name?: string; color?: string; spawnedAt: string };
+
+  // Use subagents from the parent record if present; fall back to index scan
+  let subagents: SubagentEntry[];
+  if (record.subagents && record.subagents.length > 0) {
+    subagents = record.subagents.map(
+      (s: SubagentRef): SubagentEntry => ({
+        acpxRecordId: s.acpxRecordId,
+        name: s.name,
+        color: s.color,
+        spawnedAt: s.spawnedAt,
+      }),
+    );
+  } else {
+    const subagentRecords = await listSubagentsForSession(record.acpxRecordId);
+    subagents = subagentRecords.map(
+      (sr: SessionRecord): SubagentEntry => ({
+        acpxRecordId: sr.acpxRecordId,
+        name: sr.name,
+        color: undefined,
+        spawnedAt: sr.createdAt,
+      }),
+    );
+  }
+
+  if (globalFlags.format === "json") {
+    process.stdout.write(
+      `${JSON.stringify({
+        action: "subagents_list",
+        parentAcpxRecordId: record.acpxRecordId,
+        count: subagents.length,
+        subagents,
+      })}\n`,
+    );
+    return;
+  }
+
+  if (globalFlags.format === "quiet") {
+    for (const s of subagents) {
+      process.stdout.write(`${s.acpxRecordId}\n`);
+    }
+    return;
+  }
+
+  if (subagents.length === 0) {
+    process.stdout.write(`No subagents for session ${record.acpxRecordId}\n`);
+    return;
+  }
+
+  process.stdout.write(`Subagents for session ${record.acpxRecordId}:\n`);
+  for (const s of subagents) {
+    process.stdout.write(
+      `  ${s.acpxRecordId}  name=${s.name ?? "-"}  color=${s.color ?? "-"}  spawnedAt=${s.spawnedAt}\n`,
+    );
+  }
+}
+
 type SharedSubcommandDescriptions = {
   prompt: string;
   exec: string;
@@ -1244,6 +1327,14 @@ function registerSharedAgentSubcommands(
   addSessionNameOption(statusCommand);
   statusCommand.action(async function (this: Command, flags: StatusFlags) {
     await handleStatus(explicitAgentName, flags, this, config);
+  });
+
+  const subagentsCommand = parent
+    .command("subagents")
+    .description("List subagents spawned by the current session");
+  addSessionNameOption(subagentsCommand);
+  subagentsCommand.action(async function (this: Command, flags: StatusFlags) {
+    await handleSubagents(explicitAgentName, flags, this, config);
   });
 }
 

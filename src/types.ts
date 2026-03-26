@@ -283,6 +283,14 @@ export type SessionAcpxState = {
   config_options?: SessionConfigOption[];
 };
 
+export type SubagentRef = {
+  acpxRecordId: string;
+  name: string;
+  color?: string;
+  spawnedAt: string;
+  claudeJsonlPath?: string;
+};
+
 export type SessionRecord = {
   schema: typeof SESSION_RECORD_SCHEMA;
   acpxRecordId: string;
@@ -313,6 +321,9 @@ export type SessionRecord = {
   cumulative_token_usage: SessionTokenUsage;
   request_token_usage: Record<string, SessionTokenUsage>;
   acpx?: SessionAcpxState;
+  kind?: "session" | "subagent";
+  parentSessionId?: string;
+  subagents?: SubagentRef[];
 };
 
 export type RunPromptResult = {
