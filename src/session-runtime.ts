@@ -503,6 +503,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
 
   // Subagent tracking: map from agent_id (e.g. "poet-a@haiku-demo") to ACPX record id
   const subagentIdToAcpxRecordId = new Map<string, string>();
+  // Subagent in-memory records: populated immediately on teammate_spawned, before disk write completes
+  const subagentRecordsById = new Map<string, SessionRecord>();
   // Subagent event writers: map from ACPX record id to event writer
   const subagentEventWriters = new Map<string, SessionEventWriter>();
 
@@ -514,7 +516,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       return existing;
     }
     try {
-      const childRecord = await resolveSessionRecord(childAcpxRecordId);
+      // Prefer in-memory record to avoid race condition where disk write hasn't completed yet
+      const childRecord =
+        subagentRecordsById.get(childAcpxRecordId) ??
+        (await resolveSessionRecord(childAcpxRecordId));
       const writer = await SessionEventWriter.open(childRecord);
       subagentEventWriters.set(childAcpxRecordId, writer);
       return writer;
@@ -672,6 +677,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
               parentSessionId: record.acpxRecordId,
             };
             subagentIdToAcpxRecordId.set(agentId, childAcpxRecordId);
+            // Cache in memory immediately so getOrOpenSubagentEventWriter doesn't
+            // race against the async disk write below
+            subagentRecordsById.set(childAcpxRecordId, childRecord);
 
             const subagentRef: SubagentRef = {
               acpxRecordId: childAcpxRecordId,
