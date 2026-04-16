@@ -14,6 +14,7 @@ export type SessionIndexEntry = {
   name?: string;
   closed: boolean;
   lastUsedAt: string;
+  kind?: "session" | "subagent";
 };
 
 type SessionIndex = {
@@ -48,6 +49,9 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
   if (record.name !== undefined && typeof record.name !== "string") {
     return undefined;
   }
+  if (record.kind !== undefined && record.kind !== "session" && record.kind !== "subagent") {
+    return undefined;
+  }
   return {
     file: record.file,
     acpxRecordId: record.acpxRecordId,
@@ -57,6 +61,7 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     name: record.name,
     closed: record.closed,
     lastUsedAt: record.lastUsedAt,
+    kind: record.kind as "session" | "subagent" | undefined,
   };
 }
 
@@ -74,6 +79,7 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     name: record.name,
     closed: record.closed === true,
     lastUsedAt: record.lastUsedAt,
+    kind: record.kind,
   };
 }
 
