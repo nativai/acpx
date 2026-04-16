@@ -1,3 +1,5 @@
+import os from "node:os";
+import path from "node:path";
 import { AcpClient } from "../../acp/client.js";
 import {
   formatErrorMessage,
@@ -5,6 +7,7 @@ import {
   normalizeOutputError,
 } from "../../acp/error-normalization.js";
 import { InterruptedError, withInterrupt, withTimeout } from "../../async-control.js";
+import { tailClaudeSubagentJsonl } from "../../claude-jsonl.js";
 export { InterruptedError, TimeoutError } from "../../async-control.js";
 import { formatPerfMetric, measurePerf, startPerfTimer } from "../../perf-metrics.js";
 import { textPrompt } from "../../prompt-content.js";
@@ -23,29 +26,44 @@ import {
   recordSessionUpdate as recordConversationSessionUpdate,
   trimConversationForRuntime,
 } from "../../session/conversation-model.js";
+import { defaultSessionEventLog } from "../../session/event-log.js";
 import { SessionEventWriter } from "../../session/events.js";
-import { absolutePath, isoNow, resolveSessionRecord } from "../../session/persistence.js";
-import type {
-  AcpJsonRpcMessage,
-  AcpMessageDirection,
-  AuthPolicy,
-  ClientOperation,
-  McpServer,
-  NonInteractivePermissionPolicy,
-  OutputErrorAcpPayload,
-  OutputErrorCode,
-  OutputErrorOrigin,
-  OutputFormatter,
-  PermissionMode,
-  PromptInput,
-  RunPromptResult,
-  SessionNotification,
+import {
+  absolutePath,
+  isoNow,
+  resolveSessionRecord,
+  writeSessionRecord,
+} from "../../session/persistence.js";
+import {
+  SESSION_RECORD_SCHEMA,
+  type AcpJsonRpcMessage,
+  type AcpMessageDirection,
+  type AuthPolicy,
+  type ClientOperation,
+  type McpServer,
+  type NonInteractivePermissionPolicy,
+  type OutputErrorAcpPayload,
+  type OutputErrorCode,
+  type OutputErrorOrigin,
+  type OutputFormatter,
+  type PermissionMode,
+  type PromptInput,
+  type RunPromptResult,
+  type SessionNotification,
+  SessionRecord,
   SessionResumePolicy,
   SessionSendResult,
+  SubagentRef,
 } from "../../types.js";
 import { type QueueOwnerMessage, type QueueTask, waitMs } from "../queue/ipc.js";
 import { type QueueOwnerActiveSessionController } from "../queue/owner-turn-controller.js";
 import type { RunOnceOptions, SessionSendOptions } from "./contracts.js";
+
+function claudeSubagentDir(cwd: string, acpSessionId: string): string {
+  const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
+  const cwdHash = cwd.replace(/\//g, "-");
+  return path.join(configDir, "projects", cwdHash, acpSessionId, "subagents");
+}
 
 const INTERRUPT_CANCEL_WAIT_MS = 2_500;
 
@@ -366,11 +384,91 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   let sawAcpMessage = false;
   let eventWriterClosed = false;
 
+  // Subagent tracking: map from agent_id (e.g. "poet-a@haiku-demo") to ACPX record id
+  const subagentIdToAcpxRecordId = new Map<string, string>();
+  // Subagent in-memory records: populated immediately on teammate_spawned, before disk write completes
+  const subagentRecordsById = new Map<string, SessionRecord>();
+  // Subagent event writers: map from ACPX record id to event writer
+  const subagentEventWriters = new Map<string, SessionEventWriter>();
+  // Subagent JSONL tailers: map from ACPX record id to stop function
+  const subagentTailers = new Map<string, { stop: () => Promise<void> }>();
+
+  const getOrOpenSubagentEventWriter = async (
+    childAcpxRecordId: string,
+  ): Promise<SessionEventWriter | undefined> => {
+    const existing = subagentEventWriters.get(childAcpxRecordId);
+    if (existing) {
+      return existing;
+    }
+    try {
+      // Prefer in-memory record to avoid race condition where disk write has not completed yet
+      const childRecord =
+        subagentRecordsById.get(childAcpxRecordId) ??
+        (await resolveSessionRecord(childAcpxRecordId));
+      const writer = await SessionEventWriter.open(childRecord);
+      subagentEventWriters.set(childAcpxRecordId, writer);
+      return writer;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const stopAllSubagentTailers = async (): Promise<void> => {
+    const stops = [...subagentTailers.values()].map((t) => t.stop().catch(() => {}));
+    await Promise.all(stops);
+    subagentTailers.clear();
+  };
+
+  const closeAllSubagentEventWriters = async (): Promise<void> => {
+    for (const [id, writer] of subagentEventWriters) {
+      try {
+        await writer.close({ checkpoint: true });
+      } catch {
+        // best effort
+      }
+      subagentEventWriters.delete(id);
+    }
+  };
+
+  // Flush pending messages to the stream file every 500ms so external readers
+  // (e.g. UI tools) can observe progress in real-time rather than only at turn end.
+  const streamFlushInterval = setInterval(() => {
+    void flushPendingMessages(false).catch(() => {});
+  }, 500);
+
+  // Extract claudeCode metadata from a raw ACP message (session/update notification)
+  const extractClaudeCodeMeta = (
+    message: AcpJsonRpcMessage,
+  ): Record<string, unknown> | undefined => {
+    const msg = message as Record<string, unknown>;
+    if (msg.method !== "session/update") {
+      return undefined;
+    }
+    const params = msg.params as Record<string, unknown> | undefined;
+    if (!params) {
+      return undefined;
+    }
+    // Check notification-level _meta first (for subagentId routing)
+    const notifMeta = params._meta as Record<string, unknown> | undefined;
+    if (notifMeta?.claudeCode) {
+      return notifMeta.claudeCode as Record<string, unknown>;
+    }
+    // Check update-level _meta (for teammate_spawned status)
+    const update = params.update as Record<string, unknown> | undefined;
+    if (!update) {
+      return undefined;
+    }
+    const updateMeta = update._meta as Record<string, unknown> | undefined;
+    return updateMeta?.claudeCode as Record<string, unknown> | undefined;
+  };
+
   const closeEventWriter = async (checkpoint: boolean): Promise<void> => {
     if (eventWriterClosed) {
       return;
     }
     eventWriterClosed = true;
+    await stopAllSubagentTailers();
+    await closeAllSubagentEventWriters();
     await eventWriter.close({ checkpoint });
   };
 
@@ -410,6 +508,40 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     onAcpMessage: (direction, message) => {
       sawAcpMessage = true;
       pendingMessages.push(message);
+      // Route messages with subagentId to the child stream as well
+      const claudeCodeMeta = extractClaudeCodeMeta(message);
+      if (claudeCodeMeta) {
+        const subagentId = claudeCodeMeta.subagentId;
+        if (typeof subagentId === "string") {
+          const childAcpxRecordId = subagentIdToAcpxRecordId.get(subagentId);
+          if (childAcpxRecordId) {
+            void getOrOpenSubagentEventWriter(childAcpxRecordId).then((writer) => {
+              if (writer) {
+                void writer.appendMessage(message).catch(() => {});
+              }
+            });
+            // On task completion/failure/stop: drain the tailer and persist final messages
+            const status = claudeCodeMeta.status;
+            if (
+              status === "task_completed" ||
+              status === "task_failed" ||
+              status === "task_stopped"
+            ) {
+              const tailer = subagentTailers.get(childAcpxRecordId);
+              if (tailer) {
+                subagentTailers.delete(childAcpxRecordId);
+                void tailer.stop().then(() => {
+                  const childRecord = subagentRecordsById.get(childAcpxRecordId);
+                  if (childRecord) {
+                    childRecord.lastUsedAt = isoNow();
+                    void writeSessionRecord(childRecord).catch(() => {});
+                  }
+                });
+              }
+            }
+          }
+        }
+      }
       options.onAcpMessage?.(direction, message);
     },
     onAcpOutputMessage: (_direction, message) => {
@@ -425,6 +557,103 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       }
       acpxState = recordConversationSessionUpdate(conversation, acpxState, notification);
       trimConversationForRuntime(conversation);
+
+      // Detect teammate_spawned events to create subagent session records
+      const update = notification.update as Record<string, unknown>;
+      if (update.sessionUpdate === "tool_call_update" || update.sessionUpdate === "tool_call") {
+        const updateMeta = update._meta as Record<string, unknown> | null | undefined;
+        const claudeCodeMeta = updateMeta?.claudeCode as Record<string, unknown> | undefined;
+        if (claudeCodeMeta?.status === "teammate_spawned") {
+          const agentId = claudeCodeMeta.subagentId;
+          const subagentName = claudeCodeMeta.subagentName ?? claudeCodeMeta.subagentId;
+          const color = claudeCodeMeta.subagentColor;
+          if (typeof agentId === "string") {
+            const spawnedAt = isoNow();
+            const childAcpxRecordId = crypto.randomUUID();
+            const childAcpSessionId = `subagent-${childAcpxRecordId}`;
+            const childName =
+              typeof subagentName === "string" ? subagentName.split("@")[0] : undefined;
+            const childRecord: SessionRecord = {
+              schema: SESSION_RECORD_SCHEMA,
+              acpxRecordId: childAcpxRecordId,
+              acpSessionId: childAcpSessionId,
+              agentCommand: "",
+              cwd: record.cwd,
+              name: childName,
+              createdAt: spawnedAt,
+              lastUsedAt: spawnedAt,
+              lastSeq: 0,
+              eventLog: defaultSessionEventLog(childAcpxRecordId),
+              closed: false,
+              messages: [],
+              updated_at: spawnedAt,
+              cumulative_token_usage: {},
+              request_token_usage: {},
+              kind: "subagent",
+              parentSessionId: record.acpxRecordId,
+            };
+            subagentIdToAcpxRecordId.set(agentId, childAcpxRecordId);
+            subagentRecordsById.set(childAcpxRecordId, childRecord);
+
+            const subagentRef: SubagentRef = {
+              acpxRecordId: childAcpxRecordId,
+              name: childName ?? agentId,
+              color: typeof color === "string" ? color : undefined,
+              spawnedAt,
+              claudeJsonlPath: claudeSubagentDir(record.cwd, record.acpSessionId),
+            };
+
+            void (async () => {
+              try {
+                await writeSessionRecord(childRecord);
+                const parentRecord = eventWriter.getRecord();
+                parentRecord.subagents = [...(parentRecord.subagents ?? []), subagentRef];
+                await writeSessionRecord(parentRecord);
+              } catch {
+                // best effort
+              }
+            })();
+
+            // Start tailing the subagent JSONL file in real-time
+            const rawAgentId = agentId.split("@")[0];
+            const jsonlDir = claudeSubagentDir(record.cwd, record.acpSessionId);
+            const tailer = tailClaudeSubagentJsonl(jsonlDir, rawAgentId, (newMessages) => {
+              childRecord.messages.push(...newMessages);
+              childRecord.lastUsedAt = isoNow();
+              void getOrOpenSubagentEventWriter(childAcpxRecordId).then((writer) => {
+                if (!writer) {return;}
+                for (const msg of newMessages) {
+                  void writer
+                    .appendMessage({
+                      jsonrpc: "2.0",
+                      method: "session/update",
+                      params: {
+                        sessionId: record.acpSessionId,
+                        update: {
+                          _meta: {
+                            claudeCode: {
+                              toolName: "Agent",
+                              status: "subagent_message",
+                              subagentId: agentId,
+                              subagentName: childName ?? agentId,
+                            },
+                          },
+                          sessionUpdate: "tool_call_update",
+                          toolCallId: childAcpxRecordId,
+                          message: msg,
+                        },
+                      },
+                    })
+                    .catch(() => {});
+                }
+              });
+              void writeSessionRecord(childRecord).catch(() => {});
+            });
+            subagentTailers.set(childAcpxRecordId, tailer);
+          }
+        }
+      }
+
       options.onSessionUpdate?.(notification);
     },
     onClientOperation: (operation) => {
@@ -661,6 +890,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
     applyConversation(record, conversation);
     record.acpx = acpxState;
+    clearInterval(streamFlushInterval);
     await flushPendingMessages(false).catch(() => {
       // best effort on close
     });

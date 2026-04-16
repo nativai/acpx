@@ -6,12 +6,13 @@ import { setPerfGauge } from "../../perf-metrics.js";
 import { promptToDisplayText } from "../../prompt-content.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
 import { sessionOptionsFromRecord } from "../../runtime/engine/session-options.js";
+import { SessionEventWriter } from "../../session/events.js";
 import {
   absolutePath,
   resolveSessionRecord,
   writeSessionRecord,
 } from "../../session/persistence.js";
-import type { SessionSendOutcome } from "../../types.js";
+import type { AcpJsonRpcMessage, SessionSendOutcome } from "../../types.js";
 import {
   QUEUE_CONNECT_RETRY_MS,
   SessionQueueOwner,
@@ -68,6 +69,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   const sessionRecord = await resolveSessionRecord(options.sessionId);
   let owner: SessionQueueOwner | undefined;
   let heartbeatTimer: NodeJS.Timeout | undefined;
+  let idleDrain: { stop: () => Promise<void> } | undefined;
   const sharedClient = new AcpClient({
     agentCommand: sessionRecord.agentCommand,
     cwd: absolutePath(sessionRecord.cwd),
@@ -206,6 +208,123 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       });
     }, QUEUE_OWNER_HEARTBEAT_INTERVAL_MS);
 
+    // Idle stream drain: captures inter-turn teammate activity (session/update
+    // notifications sent by the adapter background reader between prompts).
+    const startIdleStreamDrain = async (): Promise<{ stop: () => Promise<void> }> => {
+      let active = true;
+      const pendingIdle: AcpJsonRpcMessage[] = [];
+      const pendingSubagent = new Map<string, AcpJsonRpcMessage[]>();
+      const subagentWriters = new Map<string, SessionEventWriter>();
+
+      const idleRecord = await resolveSessionRecord(options.sessionId);
+      const idleWriter = await SessionEventWriter.open(idleRecord);
+
+      const subagentNameToRecordId = new Map<string, string>();
+      for (const ref of idleRecord.subagents ?? []) {
+        subagentNameToRecordId.set(ref.name, ref.acpxRecordId);
+      }
+
+      const getOrOpenChildWriter = async (
+        childAcpxRecordId: string,
+      ): Promise<SessionEventWriter | undefined> => {
+        if (subagentWriters.has(childAcpxRecordId)) {
+          return subagentWriters.get(childAcpxRecordId);
+        }
+        try {
+          const childRecord = await resolveSessionRecord(childAcpxRecordId);
+          const writer = await SessionEventWriter.open(childRecord);
+          subagentWriters.set(childAcpxRecordId, writer);
+          return writer;
+        } catch {
+          return undefined;
+        }
+      };
+
+      const flushIdlePending = async () => {
+        if (pendingIdle.length > 0) {
+          const batch = pendingIdle.splice(0);
+          await idleWriter.appendMessages(batch, { checkpoint: false }).catch(() => {});
+        }
+        for (const [childId, pending] of pendingSubagent) {
+          if (pending.length === 0) {continue;}
+          const batch = pending.splice(0);
+          const writer = subagentWriters.get(childId);
+          if (writer) {
+            await writer.appendMessages(batch, { checkpoint: false }).catch(() => {});
+          }
+        }
+      };
+
+      const flushTimer = setInterval(() => {
+        if (active) {
+          void flushIdlePending().catch(() => {});
+        }
+      }, 500);
+
+      const resolveChildRecordId = async (agentName: string): Promise<string | undefined> => {
+        const cached = subagentNameToRecordId.get(agentName);
+        if (cached) {return cached;}
+        try {
+          const refreshed = await resolveSessionRecord(options.sessionId);
+          for (const ref of refreshed.subagents ?? []) {
+            subagentNameToRecordId.set(ref.name, ref.acpxRecordId);
+          }
+        } catch {
+          // best effort
+        }
+        return subagentNameToRecordId.get(agentName);
+      };
+
+      sharedClient.setEventHandlers({
+        onAcpMessage: (_dir, message) => {
+          if (!active) {return;}
+          pendingIdle.push(message);
+
+          const msg = message as Record<string, unknown>;
+          if (msg.method === "session/update") {
+            const params = msg.params as Record<string, unknown> | undefined;
+            const notifMeta = params?._meta as Record<string, unknown> | undefined;
+            const notifClaudeCode = notifMeta?.claudeCode as Record<string, unknown> | undefined;
+            const update = params?.update as Record<string, unknown> | undefined;
+            const updateMeta = update?._meta as Record<string, unknown> | undefined;
+            const updateClaudeCode = updateMeta?.claudeCode as Record<string, unknown> | undefined;
+            const subagentId = notifClaudeCode?.subagentId ?? updateClaudeCode?.subagentId;
+            const subagentName = notifClaudeCode?.subagentName ?? updateClaudeCode?.subagentName;
+            if (typeof subagentId === "string" || typeof subagentName === "string") {
+              const agentName =
+                typeof subagentName === "string"
+                  ? subagentName.split("@")[0]
+                  : (subagentId as string).split("@")[0];
+              void (async () => {
+                const childAcpxRecordId = await resolveChildRecordId(agentName);
+                if (!childAcpxRecordId || !active) {return;}
+                if (!pendingSubagent.has(childAcpxRecordId)) {
+                  pendingSubagent.set(childAcpxRecordId, []);
+                  void getOrOpenChildWriter(childAcpxRecordId).catch(() => {});
+                }
+                pendingSubagent.get(childAcpxRecordId)!.push(message);
+              })();
+            }
+          }
+        },
+      });
+
+      return {
+        stop: async () => {
+          if (!active) {return;}
+          active = false;
+          clearInterval(flushTimer);
+          sharedClient.clearEventHandlers();
+          await flushIdlePending();
+          await idleWriter.close({ checkpoint: true }).catch(() => {});
+          for (const writer of subagentWriters.values()) {
+            await writer.close({ checkpoint: true }).catch(() => {});
+          }
+        },
+      };
+    };
+    idleDrain = await startIdleStreamDrain();
+
     let isFirstTask = true;
     while (true) {
       const pollTimeoutMs = isFirstTask ? initialTaskPollTimeoutMs : taskPollTimeoutMs;
@@ -214,6 +333,9 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         break;
       }
       isFirstTask = false;
+
+      // Stop idle drain before the prompt registers its own handlers
+      await idleDrain.stop();
 
       await runPromptTurn(async () => {
         try {
@@ -237,8 +359,13 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           checkpointPerfMetricsCapture();
         }
       });
+      // Restart idle drain to capture teammate activity until next prompt
+      idleDrain = await startIdleStreamDrain();
     }
+
+    await idleDrain.stop();
   } finally {
+    await idleDrain?.stop().catch(() => {});
     if (heartbeatTimer) {
       clearInterval(heartbeatTimer);
     }
