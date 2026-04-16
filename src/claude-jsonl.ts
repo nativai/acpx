@@ -41,8 +41,12 @@ interface RawJsonlEntry {
 // ─── Normalisation helpers ─────────────────────────────────────────────────────
 
 function normalizeContentBlocks(raw: string | RawContentBlock[] | undefined): RawContentBlock[] {
-  if (raw == null) {return [];}
-  if (typeof raw === "string") {return [{ type: "text", text: raw }];}
+  if (raw == null) {
+    return [];
+  }
+  if (typeof raw === "string") {
+    return [{ type: "text", text: raw }];
+  }
   return raw;
 }
 
@@ -97,7 +101,9 @@ function entriesToMessages(entries: RawJsonlEntry[]): SessionMessage[] {
   } | null = null;
 
   const flushAgent = (): void => {
-    if (!openAgent) {return;}
+    if (!openAgent) {
+      return;
+    }
     if (openAgent.content.length > 0 || Object.keys(openAgent.tool_results).length > 0) {
       messages.push({
         Agent: { content: openAgent.content, tool_results: openAgent.tool_results },
@@ -123,7 +129,9 @@ function entriesToMessages(entries: RawJsonlEntry[]): SessionMessage[] {
           openAgent = { content: [], tool_results: {} };
         }
         for (const tr of toolResultBlocks) {
-          if (typeof tr.tool_use_id !== "string") {continue;}
+          if (typeof tr.tool_use_id !== "string") {
+            continue;
+          }
           openAgent.tool_results[tr.tool_use_id] = {
             tool_use_id: tr.tool_use_id,
             tool_name: "",
@@ -158,7 +166,9 @@ function entriesToMessages(entries: RawJsonlEntry[]): SessionMessage[] {
         const lastMsg = messages.at(-1);
         if (lastMsg && typeof lastMsg === "object" && "Agent" in lastMsg) {
           for (const tr of toolResultBlocks) {
-            if (typeof tr.tool_use_id !== "string") {continue;}
+            if (typeof tr.tool_use_id !== "string") {
+              continue;
+            }
             lastMsg.Agent.tool_results[tr.tool_use_id] = {
               tool_use_id: tr.tool_use_id,
               tool_name: "",
@@ -236,7 +246,9 @@ export function tailClaudeSubagentJsonl(
       const buf = await fs.readFile(filePath);
       // Only read bytes we haven't seen yet
       const newBytes = buf.slice(bytesRead);
-      if (newBytes.length === 0) {return;}
+      if (newBytes.length === 0) {
+        return;
+      }
       bytesRead += newBytes.length;
       content = newBytes.toString("utf8");
     } catch {
@@ -259,7 +271,9 @@ export function tailClaudeSubagentJsonl(
       }
     }
 
-    if (pendingLines.length === 0) {return;}
+    if (pendingLines.length === 0) {
+      return;
+    }
 
     const messages = entriesToMessages(pendingLines);
     pendingLines = [];
@@ -273,9 +287,13 @@ export function tailClaudeSubagentJsonl(
     const deadline = Date.now() + FILE_APPEAR_TIMEOUT_MS;
     while (!stopped) {
       await readNewLines();
-      if (stopped) {break;}
+      if (stopped) {
+        break;
+      }
       // If file hasn't appeared yet and deadline passed, stop waiting
-      if (bytesRead === 0 && Date.now() > deadline) {break;}
+      if (bytesRead === 0 && Date.now() > deadline) {
+        break;
+      }
       await new Promise<void>((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
     }
   };

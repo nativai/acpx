@@ -2,8 +2,16 @@ import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import type { RequestPermissionRequest, RequestPermissionResponse } from "@agentclientprotocol/sdk";
-import { AcpClient, buildAgentSpawnOptions } from "../src/client.js";
 import {
+  AcpClient,
+  buildAgentSpawnOptions,
+  buildQoderAcpCommandArgs,
+  resolveAgentCloseAfterStdinEndMs,
+  shouldIgnoreNonJsonAgentOutputLine,
+} from "../src/acp/client.js";
+import {
+  AgentDisconnectedError,
+  AgentStartupError,
   AuthPolicyError,
   PermissionDeniedError,
   PermissionPromptUnavailableError,
@@ -96,6 +104,14 @@ type ClientInternals = {
     | undefined;
   cancellingSessionIds: Set<string>;
   promptPermissionFailures: Map<string, PermissionPromptUnavailableError>;
+  initResult?: {
+    agentCapabilities?: {
+      sessionCapabilities?: {
+        close?: Record<string, never>;
+      };
+    };
+  };
+  loadedSessionId?: string;
   lastKnownPid?: number;
   agentStartedAt?: string;
   closing: boolean;
@@ -130,6 +146,64 @@ test("buildAgentSpawnOptions normalizes auth env keys and preserves existing val
       assert.equal(options.env.ACPX_AUTH_BAD_KEY, "ignored-for-raw-key");
       assert.equal(options.env.empty, undefined);
     },
+  );
+});
+
+test("resolveAgentCloseAfterStdinEndMs gives qodercli extra EOF shutdown grace", () => {
+  assert.equal(resolveAgentCloseAfterStdinEndMs("qodercli --acp"), 750);
+  assert.equal(resolveAgentCloseAfterStdinEndMs("/Users/me/bin/qodercli --acp"), 750);
+  assert.equal(resolveAgentCloseAfterStdinEndMs("node ./test/mock-agent.js"), 100);
+});
+
+test("shouldIgnoreNonJsonAgentOutputLine ignores qoder shutdown chatter only", () => {
+  assert.equal(
+    shouldIgnoreNonJsonAgentOutputLine(
+      "qodercli --acp",
+      "Received interrupt signal. Cleaning up resources...",
+    ),
+    true,
+  );
+  assert.equal(
+    shouldIgnoreNonJsonAgentOutputLine("qodercli --acp", "Cleanup completed. Exiting..."),
+    true,
+  );
+  assert.equal(
+    shouldIgnoreNonJsonAgentOutputLine(
+      "node ./test/mock-agent.js",
+      "Cleanup completed. Exiting...",
+    ),
+    false,
+  );
+  assert.equal(
+    shouldIgnoreNonJsonAgentOutputLine("qodercli --acp", "unexpected non-json output"),
+    false,
+  );
+});
+
+test("buildQoderAcpCommandArgs forwards allowed-tools and max-turns", () => {
+  assert.deepEqual(
+    buildQoderAcpCommandArgs(["--acp"], {
+      sessionOptions: {
+        allowedTools: ["Read", "Grep", "custom_tool"],
+        maxTurns: 9,
+      },
+    }),
+    ["--acp", "--max-turns=9", "--allowed-tools=READ,GREP,custom_tool"],
+  );
+});
+
+test("buildQoderAcpCommandArgs preserves explicit qoder startup flags", () => {
+  assert.deepEqual(
+    buildQoderAcpCommandArgs(
+      ["--acp", "--max-turns=3", "--allowed-tools=READ", "--disallowed-tools=BASH"],
+      {
+        sessionOptions: {
+          allowedTools: ["Write"],
+          maxTurns: 7,
+        },
+      },
+    ),
+    ["--acp", "--max-turns=3", "--allowed-tools=READ", "--disallowed-tools=BASH"],
   );
 });
 
@@ -344,6 +418,93 @@ test("AcpClient createSession forwards claudeCode options in _meta", async () =>
   });
 });
 
+test("AcpClient createSession forwards codex model metadata without setting it explicitly", async () => {
+  const client = makeClient({
+    agentCommand: "npx @zed-industries/codex-acp",
+    sessionOptions: {
+      model: "GPT-5-2",
+    },
+  });
+
+  let capturedNewSessionParams: Record<string, unknown> | undefined;
+  let setConfigCalled = false;
+  asInternals(client).connection = {
+    newSession: async (params: Record<string, unknown>) => {
+      capturedNewSessionParams = params;
+      return { sessionId: "session-456" };
+    },
+    setSessionConfigOption: async () => {
+      setConfigCalled = true;
+      return { configOptions: [] };
+    },
+  };
+
+  const result = await client.createSession("/tmp/acpx-client-codex-model");
+  assert.equal(result.sessionId, "session-456");
+  assert.deepEqual(capturedNewSessionParams, {
+    cwd: "/tmp/acpx-client-codex-model",
+    mcpServers: [],
+    _meta: {
+      claudeCode: {
+        options: {
+          model: "GPT-5-2",
+        },
+      },
+    },
+  });
+  assert.equal(setConfigCalled, false);
+});
+
+test("AcpClient setSessionModel uses session/set_model", async () => {
+  const client = makeClient();
+
+  let capturedSetModelParams:
+    | {
+        sessionId: string;
+        modelId: string;
+      }
+    | undefined;
+  asInternals(client).connection = {
+    unstable_setSessionModel: async (params: { sessionId: string; modelId: string }) => {
+      capturedSetModelParams = params;
+    },
+  };
+
+  await client.setSessionModel("session-456", "GPT-5-2");
+  assert.deepEqual(capturedSetModelParams, {
+    sessionId: "session-456",
+    modelId: "GPT-5-2",
+  });
+});
+
+test("AcpClient closes sessions through session/close and clears the loaded session id", async () => {
+  const client = makeClient();
+  const internals = asInternals(client);
+  let capturedCloseSessionParams: { sessionId: string } | undefined;
+  internals.initResult = {
+    agentCapabilities: {
+      sessionCapabilities: {
+        close: {},
+      },
+    },
+  };
+  internals.loadedSessionId = "session-close-1";
+  internals.connection = {
+    unstable_closeSession: async (params: { sessionId: string }) => {
+      capturedCloseSessionParams = params;
+      return {};
+    },
+  };
+
+  assert.equal(client.supportsCloseSession(), true);
+  await client.closeSession("session-close-1");
+
+  assert.deepEqual(capturedCloseSessionParams, {
+    sessionId: "session-close-1",
+  });
+  assert.equal(internals.loadedSessionId, undefined);
+});
+
 test("AcpClient session update handling drains queued callbacks and swallows handler failures", async () => {
   const notifications: string[] = [];
   const client = makeClient({
@@ -406,6 +567,55 @@ test("AcpClient lifecycle snapshot and cancel helpers reflect active prompt stat
 
   const cancelled = await client.cancelActivePrompt(50);
   assert.deepEqual(cancelled, { stopReason: "cancelled" });
+});
+
+test("AcpClient prompt rejects when the agent disconnects mid-prompt", async () => {
+  const client = makeClient();
+  const internals = asInternals(client);
+
+  internals.connection = {
+    prompt: async () => await new Promise(() => {}),
+  };
+
+  const pending = client.prompt("session-5", "sleep 60000");
+  internals.recordAgentExit?.("connection_close", null, null);
+
+  const result = await Promise.race([
+    pending.then(
+      () => ({ type: "resolved" as const }),
+      (error) => ({ type: "rejected" as const, error }),
+    ),
+    new Promise<{ type: "timeout" }>((resolve) => {
+      setTimeout(() => resolve({ type: "timeout" }), 100);
+    }),
+  ]);
+
+  assert.equal(result.type, "rejected");
+  assert(result.error instanceof AgentDisconnectedError);
+  assert.match(result.error.message, /disconnected during request/i);
+  assert.equal(client.hasActivePrompt(), false);
+});
+
+test("AcpClient start fails fast when the agent exits during initialize", async () => {
+  const stderrLine = "startup boom";
+  const client = makeClient({
+    agentCommand: `${JSON.stringify(process.execPath)} --eval ${JSON.stringify(
+      `process.stderr.write(${JSON.stringify(`${stderrLine}\n`)}); process.exit(1);`,
+    )}`,
+  });
+
+  const startedAt = Date.now();
+  await assert.rejects(
+    () => client.start(),
+    (error: unknown) => {
+      assert(error instanceof AgentStartupError);
+      assert.equal(error.exitCode, 1);
+      assert.equal(error.signal, null);
+      assert.match(error.message, /startup boom/);
+      return true;
+    },
+  );
+  assert(Date.now() - startedAt < 2_000);
 });
 
 test("AcpClient close resets in-memory state and shuts down terminal manager", async () => {

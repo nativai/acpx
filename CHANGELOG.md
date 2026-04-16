@@ -7,11 +7,31 @@ Repo: https://github.com/openclaw/acpx
 ### Changes
 
 - Conformance/ACP: add a data-driven ACP core v1 conformance suite with CI smoke coverage, nightly coverage, and a hardened runner that reports startup failures cleanly and scopes filesystem checks to the session cwd. (#130) Thanks @lynnzc.
+- CLI/prompts: add `--prompt-retries` to retry transient prompt failures with exponential backoff while preserving strict JSON behavior and avoiding replay after prompt side effects. (#142) Thanks @lupuletic and @dutifulbob.
+- Output: add `--suppress-reads` to mask raw file-read bodies in text and JSON output while keeping normal tool activity visible. (#136) Thanks @hayatosc.
 - Agents/droid: add `factory-droid` and `factorydroid` aliases for the built-in Factory Droid adapter and sync the built-in docs. Thanks @vincentkoc.
+- Agents/built-ins: bump the default pinned `@zed-industries/codex-acp` and `@agentclientprotocol/claude-agent-acp` package ranges to the latest published releases.
+- Flows/workflows: add an initial `flow run` command, an `acpx/flows` runtime surface, and file-backed flow run state under `~/.acpx/flows/runs` for user-authored workflow modules. Thanks @osolmaz.
+- Flows/workspaces: let `acp` nodes bind to an explicit per-step cwd, add a native isolated-workspace example, and default active flow steps to a 15 minute timeout unless overridden. Thanks @osolmaz.
+- Flows/replay: store flow runs as trace bundles with `manifest.json`, `flow.json`, `trace.ndjson`, projections, bundled session replay data, and per-attempt ACP/action receipts for later inspection. Thanks @osolmaz.
+- Flows/replay viewer: add a React Flow-based replay viewer example that replays saved run bundles and shows the bundled ACP session beside the graph. Thanks @osolmaz.
+- Flows/replay viewer: keep recent runs and the active recent-run view live over a WebSocket snapshot/patch transport so in-progress runs update without manual refresh while rewind stays available.
+- Flows/permissions: let flows declare explicit required permission modes, fail fast when a flow requires an explicit `--approve-all` grant, and preserve the granted mode through persistent ACP queue-owner paths. Thanks @osolmaz.
+- Agents/qoder: add built-in Qoder CLI ACP support via `qoder -> qodercli --acp` and document Qoder-specific auth notes.
+- Agents/qoder: forward `--allowed-tools` and `--max-turns` session options into Qoder CLI startup flags, including persisted session reuse, without requiring a raw `--agent` override.
+- Runtime/embedding: add a supported `acpx/runtime` API for embedding ACPX session lifecycle, turn execution, status/control, and file-backed runtime storage. Thanks @osolmaz.
 
 ### Breaking
 
 ### Fixes
+
+- Sessions/reset: close the live backend session when discarding persistent state so reset flows start a fresh ACP session instead of silently reopening the old one.
+- Agents/kiro: use `kiro-cli-chat acp` for the built-in Kiro adapter command to avoid orphan child processes. (#129) Thanks @vokako.
+- Agents/cursor: recognize Cursor's `Session \"...\" not found` `session/load` error format so reconnects fall back to `session/new` instead of failing. (#162) Thanks @log-li.
+- Output/thinking: preserve line breaks in text-mode `[thinking]` output instead of flattening multi-line thought chunks into one line. (#144) Thanks @Huarong.
+- Sessions/load: fall back to a fresh ACP session when adapters reject `session/load` with JSON-RPC `-32601` or `-32602`, so persistent session reconnects do not crash on partial load support. (#174) Thanks @Bortlesboat.
+- Flows/runtime: finalize interrupted `flow run` bundles as failed instead of leaving them stuck at `running` when the process receives `SIGHUP`, `SIGINT`, or `SIGTERM`.
+- Client/auth: cache derived auth env key lists per auth method to avoid repeated allocations during credential lookup. (#167) Thanks @Yuan-ManX.
 
 ## 2026.3.12 (v0.3.0)
 

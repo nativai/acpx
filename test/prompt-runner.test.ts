@@ -4,12 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { serializeSessionRecordForDisk } from "../src/session-persistence.js";
-import { resolveSessionRecord } from "../src/session-persistence/repository.js";
 import {
   runSessionSetConfigOptionDirect,
+  runSessionSetModelDirect,
   runSessionSetModeDirect,
-} from "../src/session-runtime/prompt-runner.js";
+} from "../src/cli/session/prompt-runner.js";
+import { serializeSessionRecordForDisk } from "../src/session/persistence.js";
+import { resolveSessionRecord } from "../src/session/persistence/repository.js";
 import type { SessionRecord } from "../src/types.js";
 
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
@@ -122,6 +123,27 @@ test("runSessionSetConfigOptionDirect falls back to createSession and returns up
         ],
       },
       {
+        id: "model",
+        name: "Model",
+        category: "model",
+        type: "select",
+        currentValue: "default-model",
+        options: [
+          {
+            value: "default",
+            name: "Default",
+          },
+          {
+            value: "gpt-5.4",
+            name: "gpt-5.4",
+          },
+          {
+            value: "gpt-5.2",
+            name: "gpt-5.2",
+          },
+        ],
+      },
+      {
         id: "reasoning_effort",
         name: "Reasoning Effort",
         category: "thought_level",
@@ -152,6 +174,37 @@ test("runSessionSetConfigOptionDirect falls back to createSession and returns up
     assert.equal(persisted.acpSessionId, result.record.acpSessionId);
     assert.equal(persisted.protocolVersion, 1);
     assert.equal(persisted.closed, false);
+  });
+});
+
+test("runSessionSetModelDirect updates current and desired model", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "prompt-runner-model",
+      acpSessionId: "prompt-runner-model-session",
+      agentCommand: `node ${JSON.stringify(MOCK_AGENT_PATH)} --supports-load-session --advertise-models`,
+      cwd,
+      closed: true,
+      closedAt: "2026-01-01T00:05:00.000Z",
+    });
+    await writeSessionRecord(homeDir, record);
+
+    const result = await runSessionSetModelDirect({
+      sessionRecordId: record.acpxRecordId,
+      modelId: "gpt-5.4",
+      timeoutMs: 5_000,
+    });
+
+    assert.equal(result.resumed, true);
+    assert.equal(result.record.acpx?.current_model_id, "gpt-5.4");
+    assert.equal(result.record.acpx?.session_options?.model, "gpt-5.4");
+
+    const persisted = await resolveSessionRecord(record.acpxRecordId);
+    assert.equal(persisted.acpx?.current_model_id, "gpt-5.4");
+    assert.equal(persisted.acpx?.session_options?.model, "gpt-5.4");
   });
 });
 

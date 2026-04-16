@@ -13,9 +13,11 @@ Built-in agents:
 - `iflow -> iflow --experimental-acp`
 - `kilocode -> npx -y @kilocode/cli acp`
 - `kimi -> kimi acp`
-- `kiro -> kiro-cli acp`
+- `kiro -> kiro-cli-chat acp`
 - `opencode -> npx -y opencode-ai acp`
+- `qoder -> qodercli --acp`
 - `qwen -> qwen --acp`
+- `trae -> traecli acp serve`
 
 Harness-specific docs in this directory:
 
@@ -27,6 +29,8 @@ Harness-specific docs in this directory:
 - [iFlow](Iflow.md): built-in `iflow -> iflow --experimental-acp`
 - [Kilocode](Kilocode.md): built-in `kilocode -> npx -y @kilocode/cli acp`
 - [Kimi](Kimi.md): built-in `kimi -> kimi acp`
-- [Kiro](Kiro.md): built-in `kiro -> kiro-cli acp`
+- [Kiro](Kiro.md): built-in `kiro -> kiro-cli-chat acp`
 - [OpenCode](OpenCode.md): built-in `opencode -> npx -y opencode-ai acp`
+- [Qoder](Qoder.md): built-in `qoder -> qodercli --acp`
 - [Qwen](Qwen.md): built-in `qwen -> qwen --acp`
+- [Trae](Trae.md): built-in `trae -> traecli acp serve`

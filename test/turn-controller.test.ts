@@ -4,7 +4,7 @@ import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import {
   QueueOwnerTurnController,
   type QueueOwnerActiveSessionController,
-} from "../src/queue-owner-turn-controller.js";
+} from "../src/cli/queue/owner-turn-controller.js";
 
 test("QueueOwnerTurnController tracks explicit lifecycle states", async () => {
   const controller = createQueueOwnerTurnController();
@@ -113,6 +113,38 @@ test("QueueOwnerTurnController routes setSessionMode through active controller",
   assert.deepEqual(fallbackTimeouts, []);
 });
 
+test("QueueOwnerTurnController routes setSessionModel through active controller", async () => {
+  let activeCalls = 0;
+  let fallbackCalls = 0;
+  const observedTimeouts: Array<number | undefined> = [];
+  const fallbackTimeouts: Array<number | undefined> = [];
+
+  const controller = createQueueOwnerTurnController({
+    withTimeout: async (run, timeoutMs) => {
+      observedTimeouts.push(timeoutMs);
+      return await run();
+    },
+    setSessionModelFallback: async (_modelId, timeoutMs) => {
+      fallbackCalls += 1;
+      fallbackTimeouts.push(timeoutMs);
+    },
+  });
+
+  controller.setActiveController(
+    makeActiveController({
+      setSessionModel: async () => {
+        activeCalls += 1;
+      },
+    }),
+  );
+
+  await controller.setSessionModel("gpt-5.4", 1500);
+  assert.equal(activeCalls, 1);
+  assert.equal(fallbackCalls, 0);
+  assert.deepEqual(observedTimeouts, [1500]);
+  assert.deepEqual(fallbackTimeouts, []);
+});
+
 test("QueueOwnerTurnController routes setSessionConfigOption through fallback when inactive", async () => {
   let fallbackCalls = 0;
   const fallbackTimeouts: Array<number | undefined> = [];
@@ -133,10 +165,14 @@ test("QueueOwnerTurnController routes setSessionConfigOption through fallback wh
 
 test("QueueOwnerTurnController rejects control requests while closing", async () => {
   let setModeFallbackCalls = 0;
+  let setModelFallbackCalls = 0;
   let setConfigFallbackCalls = 0;
   const controller = createQueueOwnerTurnController({
     setSessionModeFallback: async () => {
       setModeFallbackCalls += 1;
+    },
+    setSessionModelFallback: async () => {
+      setModelFallbackCalls += 1;
     },
     setSessionConfigOptionFallback: async () => {
       setConfigFallbackCalls += 1;
@@ -151,16 +187,22 @@ test("QueueOwnerTurnController rejects control requests while closing", async ()
     /Queue owner is closing/,
   );
   await assert.rejects(
+    async () => await controller.setSessionModel("gpt-5.4"),
+    /Queue owner is closing/,
+  );
+  await assert.rejects(
     async () => await controller.setSessionConfigOption("k", "v"),
     /Queue owner is closing/,
   );
   assert.equal(setModeFallbackCalls, 0);
+  assert.equal(setModelFallbackCalls, 0);
   assert.equal(setConfigFallbackCalls, 0);
 });
 
 type QueueOwnerTurnControllerOverrides = Partial<{
   withTimeout: <T>(run: () => Promise<T>, timeoutMs?: number) => Promise<T>;
   setSessionModeFallback: (modeId: string, timeoutMs?: number) => Promise<void>;
+  setSessionModelFallback: (modelId: string, timeoutMs?: number) => Promise<void>;
   setSessionConfigOptionFallback: (
     configId: string,
     value: string,
@@ -178,6 +220,11 @@ function createQueueOwnerTurnController(
     (async (): Promise<void> => {
       // no-op
     });
+  const setSessionModelFallback =
+    overrides.setSessionModelFallback ??
+    (async (): Promise<void> => {
+      // no-op
+    });
   const setSessionConfigOptionFallback =
     overrides.setSessionConfigOptionFallback ??
     (async () => ({
@@ -187,6 +234,7 @@ function createQueueOwnerTurnController(
   return new QueueOwnerTurnController({
     withTimeout,
     setSessionModeFallback,
+    setSessionModelFallback,
     setSessionConfigOptionFallback,
   });
 }
@@ -201,6 +249,11 @@ function makeActiveController(
     requestCancelActivePrompt: overrides.requestCancelActivePrompt ?? (async () => false),
     setSessionMode:
       overrides.setSessionMode ??
+      (async () => {
+        // no-op
+      }),
+    setSessionModel:
+      overrides.setSessionModel ??
       (async () => {
         // no-op
       }),

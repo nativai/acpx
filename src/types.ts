@@ -7,7 +7,7 @@ import type {
   SetSessionConfigOptionResponse,
   StopReason,
 } from "@agentclientprotocol/sdk";
-export type { McpServer } from "@agentclientprotocol/sdk";
+export type { McpServer, SessionNotification } from "@agentclientprotocol/sdk";
 import type { PromptInput } from "./prompt-content.js";
 
 export const EXIT_CODES = {
@@ -33,6 +33,9 @@ export type AuthPolicy = (typeof AUTH_POLICIES)[number];
 
 export const NON_INTERACTIVE_PERMISSION_POLICIES = ["deny", "fail"] as const;
 export type NonInteractivePermissionPolicy = (typeof NON_INTERACTIVE_PERMISSION_POLICIES)[number];
+
+export const SESSION_RESUME_POLICIES = ["allow-new", "same-session-only"] as const;
+export type SessionResumePolicy = (typeof SESSION_RESUME_POLICIES)[number];
 
 export const OUTPUT_STREAMS = ["prompt", "control"] as const;
 export type OutputStream = (typeof OUTPUT_STREAMS)[number];
@@ -131,6 +134,7 @@ export type OutputFormatterContext = {
 export type OutputPolicy = {
   format: OutputFormat;
   jsonStrict: boolean;
+  suppressReads: boolean;
   suppressNonJsonStderr: boolean;
   queueErrorAlreadyEmitted: boolean;
   suppressSdkConsoleErrors: boolean;
@@ -277,10 +281,18 @@ export type SessionConversation = {
 };
 
 export type SessionAcpxState = {
+  reset_on_next_ensure?: boolean;
   current_mode_id?: string;
   desired_mode_id?: string;
+  current_model_id?: string;
+  available_models?: string[];
   available_commands?: string[];
   config_options?: SessionConfigOption[];
+  session_options?: {
+    model?: string;
+    allowed_tools?: string[];
+    max_turns?: number;
+  };
 };
 
 export type SubagentRef = {
@@ -347,6 +359,12 @@ export type SessionSetModeResult = {
 export type SessionSetConfigOptionResult = {
   record: SessionRecord;
   response: SetSessionConfigOptionResponse;
+  resumed: boolean;
+  loadError?: string;
+};
+
+export type SessionSetModelResult = {
+  record: SessionRecord;
   resumed: boolean;
   loadError?: string;
 };

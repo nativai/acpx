@@ -7,7 +7,7 @@ import {
   recordClientOperation,
   recordPromptSubmission,
   recordSessionUpdate,
-} from "../src/session-conversation-model.js";
+} from "../src/session/conversation-model.js";
 
 test("conversation model captures prompt, chunks, tool calls, and metadata", () => {
   const conversation = createSessionConversation("2026-02-27T10:00:00.000Z");
@@ -211,9 +211,19 @@ test("cloneSessionAcpxState preserves desired mode id", () => {
     current_mode_id: "auto",
     desired_mode_id: "plan",
     available_commands: ["review"],
+    session_options: {
+      model: "sonnet",
+      allowed_tools: ["Read", "Grep"],
+      max_turns: 7,
+    },
   });
 
   assert.equal(cloned?.current_mode_id, "auto");
   assert.equal(cloned?.desired_mode_id, "plan");
   assert.deepEqual(cloned?.available_commands, ["review"]);
+  assert.deepEqual(cloned?.session_options, {
+    model: "sonnet",
+    allowed_tools: ["Read", "Grep"],
+    max_turns: 7,
+  });
 });

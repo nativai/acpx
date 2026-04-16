@@ -15,7 +15,24 @@ import { queuePaths } from "./queue-test-helpers.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
+const FLOW_FIXTURE_PATH = fileURLToPath(new URL("./fixtures/flow-branch.flow.js", import.meta.url));
+const FLOW_SHELL_FIXTURE_PATH = fileURLToPath(
+  new URL("./fixtures/flow-shell.flow.js", import.meta.url),
+);
+const FLOW_INTERRUPT_FIXTURE_PATH = fileURLToPath(
+  new URL("./fixtures/flow-interrupt.flow.js", import.meta.url),
+);
+const FLOW_ACP_DISCONNECT_FIXTURE_PATH = fileURLToPath(
+  new URL("./fixtures/flow-acp-disconnect.flow.js", import.meta.url),
+);
+const FLOW_WAIT_FIXTURE_PATH = fileURLToPath(
+  new URL("./fixtures/flow-wait.flow.js", import.meta.url),
+);
+const FLOW_WORKDIR_FIXTURE_PATH = fileURLToPath(
+  new URL("./fixtures/flow-workdir.flow.js", import.meta.url),
+);
 const MOCK_AGENT_COMMAND = `node ${JSON.stringify(MOCK_AGENT_PATH)}`;
+const LOAD_CAPABLE_MOCK_AGENT_COMMAND = `${MOCK_AGENT_COMMAND} --supports-load-session`;
 
 type CliRunResult = {
   code: number | null;
@@ -67,6 +84,590 @@ test("integration: built-in cursor agent resolves to cursor-agent acp", async ()
       assert.match(result.stdout, /hello/);
     } finally {
       await fs.rm(fakeBinDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: flow run executes multiple ACP steps in one session and branches", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const result = await runCli(
+        [
+          ...baseLoadCapableAgentArgs(cwd),
+          "--format",
+          "json",
+          "--ttl",
+          "1",
+          "flow",
+          "run",
+          FLOW_FIXTURE_PATH,
+          "--input-json",
+          JSON.stringify({ next: "yes_path" }),
+        ],
+        homeDir,
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+      const payload = JSON.parse(result.stdout.trim()) as {
+        action?: string;
+        status?: string;
+        outputs?: Record<string, unknown>;
+        sessionBindings?: Record<string, { acpxRecordId: string }>;
+      };
+
+      assert.equal(payload.action, "flow_run_result");
+      assert.equal(payload.status, "completed");
+      assert.deepEqual(payload.outputs?.yes_path, { ok: true });
+      assert.equal(payload.outputs?.no_path, undefined);
+      assert.equal(
+        Object.keys(payload.sessionBindings ?? {}).length,
+        1,
+        JSON.stringify(payload, null, 2),
+      );
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: flow run supports dynamic ACP working directories", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const result = await runCli(
+        [
+          ...baseLoadCapableAgentArgs(cwd),
+          "--format",
+          "json",
+          "--ttl",
+          "1",
+          "flow",
+          "run",
+          FLOW_WORKDIR_FIXTURE_PATH,
+        ],
+        homeDir,
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+      const payload = JSON.parse(result.stdout.trim()) as {
+        action?: string;
+        status?: string;
+        outputs?: {
+          prepare?: { workdir: string };
+          finalize?: { cwd: string };
+        };
+        sessionBindings?: Record<string, { cwd: string }>;
+      };
+
+      assert.equal(payload.action, "flow_run_result");
+      assert.equal(payload.status, "completed");
+      const workdir = payload.outputs?.prepare?.workdir;
+      const finalCwd = payload.outputs?.finalize?.cwd;
+      assert.equal(typeof workdir, "string");
+      assert.equal(typeof finalCwd, "string");
+      assert.equal(await fs.realpath(String(finalCwd)), await fs.realpath(String(workdir)));
+      const bindings = Object.values(payload.sessionBindings ?? {});
+      assert.equal(bindings.length, 1);
+      assert.equal(await fs.realpath(bindings[0]?.cwd ?? ""), await fs.realpath(String(workdir)));
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: flow run executes function and shell actions from --input-file", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const inputPath = path.join(cwd, "input.json");
+
+    try {
+      await fs.writeFile(inputPath, JSON.stringify({ text: "smoke" }), "utf8");
+
+      const result = await runCli(
+        [
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "flow",
+          "run",
+          FLOW_SHELL_FIXTURE_PATH,
+          "--input-file",
+          inputPath,
+        ],
+        homeDir,
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+      const payload = JSON.parse(result.stdout.trim()) as {
+        action?: string;
+        status?: string;
+        outputs?: {
+          prepare?: { text: string };
+          finalize?: { value: string; cwd: string };
+        };
+      };
+
+      assert.equal(payload.action, "flow_run_result");
+      assert.equal(payload.status, "completed");
+      assert.equal(payload.outputs?.prepare?.text, "SMOKE");
+      assert.equal(payload.outputs?.finalize?.value, "SMOKE");
+      assert.equal(
+        await fs.realpath(String(payload.outputs?.finalize?.cwd ?? "")),
+        await fs.realpath(cwd),
+      );
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: flow run finalizes interrupted bundles on SIGHUP", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const child = spawn(
+        process.execPath,
+        [
+          CLI_PATH,
+          ...baseAgentArgs(cwd),
+          "--format",
+          "json",
+          "flow",
+          "run",
+          FLOW_INTERRUPT_FIXTURE_PATH,
+        ],
+        {
+          env: {
+            ...process.env,
+            HOME: homeDir,
+          },
+          cwd,
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+
+      let stderr = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk: string) => {
+        stderr += chunk;
+      });
+
+      const outputRoot = path.join(homeDir, ".acpx", "flows", "runs");
+      const runDir = await waitForFlowRunDir(outputRoot, "fixture-interrupt");
+      await waitFor(async () => {
+        const state = await readFlowRunJson(runDir);
+        if (state.currentNode === "slow" && state.status === "running") {
+          return state;
+        }
+        return null;
+      }, 5_000);
+
+      child.kill("SIGHUP");
+      const result = await awaitChildClose(child);
+      assert.equal(result.code, 130, stderr);
+
+      const finalState = await waitFor(async () => {
+        const state = await readFlowRunJson(runDir);
+        if (state.status === "failed" && state.error === "Interrupted") {
+          return state;
+        }
+        return null;
+      }, 5_000);
+
+      assert.equal(finalState.currentNode, "slow");
+      assert.equal(finalState.currentAttemptId, "slow#1");
+      assert.match(String(finalState.statusDetail ?? ""), /Failed in slow: Interrupted/);
+
+      const traceEvents = (await fs.readFile(path.join(runDir, "trace.ndjson"), "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { type?: string; payload?: { error?: string } });
+      const finalEvent = traceEvents.at(-1);
+      assert.equal(finalEvent?.type, "run_failed");
+      assert.equal(finalEvent?.payload?.error, "Interrupted");
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: flow run fails ACP nodes promptly when the agent disconnects mid-prompt", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const result = await runCli(
+        [
+          ...baseLoadCapableAgentArgs(cwd),
+          "--format",
+          "json",
+          "flow",
+          "run",
+          FLOW_ACP_DISCONNECT_FIXTURE_PATH,
+        ],
+        homeDir,
+        {
+          cwd,
+          timeoutMs: 5_000,
+        },
+      );
+
+      const outputRoot = path.join(homeDir, ".acpx", "flows", "runs");
+      const runDir = await waitForFlowRunDir(outputRoot, "fixture-acp-disconnect");
+      assert.notEqual(result.code, 0, result.stdout);
+
+      const finalState = await waitFor(async () => {
+        const state = await readFlowRunJson(runDir).catch(() => null);
+        return state && state.status === "failed" ? state : null;
+      }, 5_000);
+
+      assert.equal(finalState.status, "failed");
+      assert.equal(
+        (finalState.results as Record<string, { outcome?: string }>).slow?.outcome,
+        "failed",
+      );
+      assert.match(
+        String(
+          (finalState.results as Record<string, { error?: string }>).slow?.error ?? result.stderr,
+        ),
+        /agent disconnected/i,
+      );
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: flow run fails fast when a flow requires an explicit approve-all grant", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-permission-cwd-"));
+    const flowDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-permission-"));
+    const flowPath = path.join(flowDir, "requires-approve-all.flow.ts");
+
+    try {
+      await fs.writeFile(
+        flowPath,
+        [
+          'import { compute, defineFlow } from "acpx/flows";',
+          "",
+          "export default defineFlow({",
+          '  name: "requires-explicit-approve-all",',
+          "  permissions: {",
+          '    requiredMode: "approve-all",',
+          "    requireExplicitGrant: true,",
+          '    reason: "This flow writes to the repo and needs full ACP permissions.",',
+          "  },",
+          '  startAt: "done",',
+          "  nodes: {",
+          "    done: compute({",
+          "      run: () => ({ ok: true }),",
+          "    }),",
+          "  },",
+          "  edges: [],",
+          "});",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const result = await runCli(
+        ["--agent", MOCK_AGENT_COMMAND, "--cwd", cwd, "flow", "run", flowPath],
+        homeDir,
+      );
+
+      assert.equal(result.code, 2);
+      assert.match(result.stderr, /requires an explicit approve-all grant/i);
+      assert.match(result.stderr, /Rerun with --approve-all/i);
+    } finally {
+      await fs.rm(flowDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: flow run requires defineFlow before permission gating", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-permission-cwd-"));
+    const flowDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-permission-"));
+    const flowPath = path.join(flowDir, "plain-export.flow.ts");
+
+    try {
+      await fs.writeFile(
+        flowPath,
+        [
+          "export default {",
+          '  name: "plain-export",',
+          "  permissions: {",
+          '    requiredMode: "approve-all",',
+          "    requireExplicitGrant: true,",
+          '    reason: "This flow writes to the repo and needs full ACP permissions.",',
+          "  },",
+          '  startAt: "done",',
+          "  nodes: {",
+          '    done: { nodeType: "compute", run: () => ({ ok: true }) },',
+          "  },",
+          "  edges: [],",
+          "};",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const result = await runCli(["--cwd", cwd, "flow", "run", flowPath], homeDir);
+
+      assert.equal(result.code, 1);
+      assert.match(
+        result.stderr,
+        /Flow module must export default defineFlow\(\{\.\.\.\}\) from "acpx\/flows"/,
+      );
+      assert.doesNotMatch(result.stderr, /requires an explicit approve-all grant/i);
+      assert.doesNotMatch(result.stderr, /Rerun with --approve-all/i);
+    } finally {
+      await fs.rm(flowDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: flow run preserves approve-all through persistent ACP writes", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-write-cwd-"));
+    const flowDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-write-"));
+    const flowPath = path.join(flowDir, "write-through-session.flow.ts");
+    const writePath = path.join(cwd, "flow-write.txt");
+
+    try {
+      await fs.writeFile(
+        flowPath,
+        [
+          'import { acp, defineFlow } from "acpx/flows";',
+          "",
+          "export default defineFlow({",
+          '  name: "write-through-session",',
+          "  permissions: {",
+          '    requiredMode: "approve-all",',
+          "    requireExplicitGrant: true,",
+          '    reason: "This flow writes files through ACP.",',
+          "  },",
+          '  startAt: "write_file",',
+          "  nodes: {",
+          "    write_file: acp({",
+          `      prompt: () => ${JSON.stringify(`write ${writePath} hello`)},`,
+          "      parse: (text) => ({ reply: text }),",
+          "    }),",
+          "  },",
+          "  edges: [],",
+          "});",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const result = await runCli(
+        [
+          "--agent",
+          LOAD_CAPABLE_MOCK_AGENT_COMMAND,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "--ttl",
+          "1",
+          "flow",
+          "run",
+          flowPath,
+        ],
+        homeDir,
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+      const payload = JSON.parse(result.stdout.trim()) as {
+        action?: string;
+        status?: string;
+        outputs?: {
+          write_file?: {
+            reply?: string;
+          };
+        };
+      };
+
+      assert.equal(payload.action, "flow_run_result");
+      assert.equal(payload.status, "completed");
+      assert.match(payload.outputs?.write_file?.reply ?? "", /wrote /i);
+      assert.equal(await fs.readFile(writePath, "utf8"), "hello");
+    } finally {
+      await fs.rm(flowDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test('integration: flow run resolves "acpx/flows" imports for external flow files', async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const flowDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-import-"));
+    const flowPath = path.join(flowDir, "external.flow.ts");
+
+    try {
+      await fs.writeFile(
+        flowPath,
+        [
+          'import { compute, defineFlow } from "acpx/flows";',
+          "",
+          "export default defineFlow({",
+          '  name: "external-flow-import",',
+          '  startAt: "done",',
+          "  nodes: {",
+          "    done: compute({",
+          '      run: () => ({ ok: true, source: "external" }),',
+          "    }),",
+          "  },",
+          "  edges: [],",
+          "});",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const result = await runCli(
+        ["--approve-all", "--cwd", cwd, "--format", "json", "flow", "run", flowPath],
+        homeDir,
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+      const payload = JSON.parse(result.stdout.trim()) as {
+        action?: string;
+        status?: string;
+        outputs?: {
+          done?: {
+            ok?: boolean;
+            source?: string;
+          };
+        };
+      };
+
+      assert.equal(payload.action, "flow_run_result");
+      assert.equal(payload.status, "completed");
+      assert.deepEqual(payload.outputs?.done, {
+        ok: true,
+        source: "external",
+      });
+    } finally {
+      await fs.rm(flowDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: flow run supports staged defineFlow assembly in external modules", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const flowDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-staged-"));
+    const flowPath = path.join(flowDir, "staged.flow.ts");
+
+    try {
+      await fs.writeFile(
+        flowPath,
+        [
+          'import { compute, defineFlow } from "acpx/flows";',
+          "",
+          "const nodes = {};",
+          "const flow = defineFlow({",
+          '  name: "staged-flow-import",',
+          '  startAt: "done",',
+          "  nodes,",
+          "  edges: [],",
+          "});",
+          "",
+          "nodes.done = compute({",
+          '  run: () => ({ ok: true, source: "staged" }),',
+          "});",
+          "",
+          "export default flow;",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const result = await runCli(
+        ["--approve-all", "--cwd", cwd, "--format", "json", "flow", "run", flowPath],
+        homeDir,
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+      const payload = JSON.parse(result.stdout.trim()) as {
+        action?: string;
+        status?: string;
+        outputs?: {
+          done?: {
+            ok?: boolean;
+            source?: string;
+          };
+        };
+      };
+
+      assert.equal(payload.action, "flow_run_result");
+      assert.equal(payload.status, "completed");
+      assert.deepEqual(payload.outputs?.done, {
+        ok: true,
+        source: "staged",
+      });
+    } finally {
+      await fs.rm(flowDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: flow run reports waiting checkpoints in json mode", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const result = await runCli(
+        [
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "flow",
+          "run",
+          FLOW_WAIT_FIXTURE_PATH,
+          "--input-json",
+          JSON.stringify({ ticket: "pr-174" }),
+        ],
+        homeDir,
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+      const payload = JSON.parse(result.stdout.trim()) as {
+        action?: string;
+        status?: string;
+        waitingOn?: string;
+        outputs?: {
+          prepare?: { ticket: string };
+          wait_for_human?: { checkpoint: string; summary: string };
+          unreachable?: unknown;
+        };
+      };
+
+      assert.equal(payload.action, "flow_run_result");
+      assert.equal(payload.status, "waiting");
+      assert.equal(payload.waitingOn, "wait_for_human");
+      assert.equal(payload.outputs?.prepare?.ticket, "pr-174");
+      assert.equal(payload.outputs?.wait_for_human?.checkpoint, "wait_for_human");
+      assert.equal(payload.outputs?.wait_for_human?.summary, "review pr-174");
+      assert.equal(payload.outputs?.unreachable, undefined);
+    } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
   });
@@ -153,11 +754,119 @@ test("integration: built-in iflow agent resolves to iflow --experimental-acp", a
   });
 });
 
+test("integration: built-in qoder agent resolves to qodercli --acp", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-qoder-"));
+
+    try {
+      await writeFakeQoderAgent(fakeBinDir);
+
+      const result = await runCli(
+        ["--approve-all", "--cwd", cwd, "--format", "quiet", "qoder", "exec", "echo hello"],
+        homeDir,
+        {
+          env: {
+            PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+          },
+        },
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /hello/);
+    } finally {
+      await fs.rm(fakeBinDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: qoder session reuse preserves persisted startup flags", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-qoder-"));
+    const argLogPath = path.join(fakeBinDir, "qoder-args.log");
+
+    try {
+      await writeFakeQoderAgent(fakeBinDir, argLogPath);
+      const { createSession } = await import("../src/session/session.js");
+      const { runSessionSetModeDirect } = await import("../src/cli/session/prompt-runner.js");
+      const previousHome = process.env.HOME;
+      const previousPath = process.env.PATH;
+      process.env.HOME = homeDir;
+      process.env.PATH = `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`;
+
+      try {
+        const record = await createSession({
+          agentCommand: "qodercli --acp",
+          cwd,
+          permissionMode: "approve-reads",
+          timeoutMs: 10_000,
+          sessionOptions: {
+            allowedTools: ["Read", "Grep"],
+            maxTurns: 4,
+          },
+        });
+
+        const result = await runSessionSetModeDirect({
+          sessionRecordId: record.acpxRecordId,
+          modeId: "plan",
+          timeoutMs: 10_000,
+        });
+        assert.equal(result.record.acpxRecordId, record.acpxRecordId);
+      } finally {
+        if (previousHome === undefined) {
+          delete process.env.HOME;
+        } else {
+          process.env.HOME = previousHome;
+        }
+        process.env.PATH = previousPath;
+      }
+
+      const argLines = (await fs.readFile(argLogPath, "utf8"))
+        .split(/\r?\n/u)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+      assert.equal(
+        argLines.length >= 2,
+        true,
+        `expected at least two qoder invocations:\n${argLines.join("\n")}`,
+      );
+      assert.equal(
+        argLines.some(
+          (line) =>
+            line.includes("--acp") &&
+            line.includes("--max-turns=4") &&
+            line.includes("--allowed-tools=READ,GREP"),
+        ),
+        true,
+        `expected persisted qoder flags in logged invocations:\n${argLines.join("\n")}`,
+      );
+      assert.equal(
+        argLines.slice(-1)[0]?.includes("--allowed-tools=READ,GREP") ?? false,
+        true,
+        `expected reused prompt spawn to preserve allowed-tools:\n${argLines.join("\n")}`,
+      );
+      assert.equal(
+        argLines.slice(-1)[0]?.includes("--max-turns=4") ?? false,
+        true,
+        `expected reused prompt spawn to preserve max-turns:\n${argLines.join("\n")}`,
+      );
+    } finally {
+      await fs.rm(fakeBinDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: exec forwards model, allowed-tools, and max-turns in session/new _meta", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
 
     try {
+      const created = await runCli([...baseAgentArgs(cwd), "sessions", "new"], homeDir);
+      assert.equal(created.code, 0, created.stderr);
+
       const result = await runCli(
         [
           ...baseAgentArgs(cwd),
@@ -190,6 +899,305 @@ test("integration: exec forwards model, allowed-tools, and max-turns in session/
           },
         },
       });
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: exec --model calls session/set_model when agent advertises models", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const modelAgentCommand = `${MOCK_AGENT_COMMAND} --advertise-models`;
+
+    try {
+      const result = await runCli(
+        [
+          "--agent",
+          modelAgentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "--model",
+          "fast-model",
+          "exec",
+          "echo hello",
+        ],
+        homeDir,
+      );
+      assert.equal(result.code, 0, result.stderr);
+
+      const payloads = parseJsonRpcOutputLines(result.stdout);
+      const setModelRequest = payloads.find((payload) => payload.method === "session/set_model") as
+        | { params?: { modelId?: string } }
+        | undefined;
+      assert(setModelRequest, "expected session/set_model request in JSON-RPC output");
+      assert.equal(setModelRequest.params?.modelId, "fast-model");
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: exec --model skips session/set_model when agent does not advertise models", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const result = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "--model", "sonnet", "exec", "echo hello"],
+        homeDir,
+      );
+      assert.equal(result.code, 0, result.stderr);
+
+      const payloads = parseJsonRpcOutputLines(result.stdout);
+
+      // _meta.claudeCode.options.model should still be sent
+      const createRequest = payloads.find((payload) => payload.method === "session/new") as
+        | { params?: { _meta?: Record<string, unknown> } }
+        | undefined;
+      assert(createRequest, "expected session/new request");
+      assert.deepEqual((createRequest.params?._meta as Record<string, unknown>)?.claudeCode, {
+        options: { model: "sonnet" },
+      });
+
+      // session/set_model should NOT be called
+      const setModelRequest = payloads.find((payload) => payload.method === "session/set_model");
+      assert.equal(setModelRequest, undefined, "session/set_model should not be called");
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: exec --model fails when session/set_model fails", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const failModelAgentCommand = `${MOCK_AGENT_COMMAND} --set-session-model-fails`;
+
+    try {
+      const result = await runCli(
+        [
+          "--agent",
+          failModelAgentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "quiet",
+          "--model",
+          "bad-model",
+          "exec",
+          "echo hello",
+        ],
+        homeDir,
+      );
+      assert.notEqual(result.code, 0, "expected non-zero exit");
+      assert.equal(result.stdout, "");
+      assert.match(result.stderr, /setSessionModel failed|session\/set_model/i);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: sessions new --model fails when session/set_model fails", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const failModelAgentCommand = `${MOCK_AGENT_COMMAND} --set-session-model-fails`;
+
+    try {
+      const result = await runCli(
+        [
+          "--agent",
+          failModelAgentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--model",
+          "bad-model",
+          "sessions",
+          "new",
+        ],
+        homeDir,
+      );
+      assert.notEqual(result.code, 0, "expected non-zero exit");
+      assert.match(result.stderr, /setSessionModel failed|session\/set_model/i);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: set model routes through session/set_model and succeeds", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const modelAgentCommand = `${MOCK_AGENT_COMMAND} --advertise-models`;
+
+    try {
+      // Create session
+      const created = await runCli(
+        ["--agent", modelAgentCommand, "--approve-all", "--cwd", cwd, "sessions", "new"],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+
+      // Switch model mid-session via set command (uses session/set_model internally)
+      const setResult = await runCli(
+        [
+          "--agent",
+          modelAgentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "set",
+          "model",
+          "gpt-5.4",
+        ],
+        homeDir,
+      );
+      assert.equal(setResult.code, 0, setResult.stderr);
+      const payload = JSON.parse(setResult.stdout.trim()) as {
+        action?: string;
+        modelId?: string;
+      };
+      assert.equal(payload.action, "model_set");
+      assert.equal(payload.modelId, "gpt-5.4");
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: set model rejects with clear error on ACP invalid params", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const invalidModelAgentCommand = `${MOCK_AGENT_COMMAND} --set-session-model-invalid-params`;
+
+    try {
+      // Create session
+      const created = await runCli(
+        ["--agent", invalidModelAgentCommand, "--approve-all", "--cwd", cwd, "sessions", "new"],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+
+      // Attempt model switch — should fail with enriched error
+      const setResult = await runCli(
+        [
+          "--agent",
+          invalidModelAgentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "set",
+          "model",
+          "bad-model",
+        ],
+        homeDir,
+      );
+      assert.notEqual(setResult.code, 0, "expected non-zero exit");
+      assert.match(setResult.stderr, /rejected session\/set_model/i);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: status shows model after session creation with --model", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const modelAgentCommand = `${MOCK_AGENT_COMMAND} --advertise-models`;
+
+    try {
+      // Create session with --model
+      const created = await runCli(
+        [
+          "--agent",
+          modelAgentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--model",
+          "gpt-5.4",
+          "sessions",
+          "new",
+        ],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+
+      // Check status JSON
+      const status = await runCli(
+        ["--agent", modelAgentCommand, "--approve-all", "--cwd", cwd, "--format", "json", "status"],
+        homeDir,
+      );
+      assert.equal(status.code, 0, status.stderr);
+
+      const statusPayload = JSON.parse(status.stdout.trim()) as {
+        model?: string;
+        mode?: string;
+        availableModels?: string[];
+      };
+      assert.equal(statusPayload.model, "gpt-5.4");
+      assert(Array.isArray(statusPayload.availableModels), "expected availableModels array");
+
+      // Check status text
+      const statusText = await runCli(
+        ["--agent", modelAgentCommand, "--approve-all", "--cwd", cwd, "status"],
+        homeDir,
+      );
+      assert.equal(statusText.code, 0, statusText.stderr);
+      assert.match(statusText.stdout, /model: gpt-5\.4/);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: status shows updated model after set model", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const modelAgentCommand = `${MOCK_AGENT_COMMAND} --advertise-models`;
+
+    try {
+      // Create session with --model
+      const created = await runCli(
+        [
+          "--agent",
+          modelAgentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--model",
+          "fast-model",
+          "sessions",
+          "new",
+        ],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+
+      // Switch model
+      const setResult = await runCli(
+        ["--agent", modelAgentCommand, "--approve-all", "--cwd", cwd, "set", "model", "gpt-5.4"],
+        homeDir,
+      );
+      assert.equal(setResult.code, 0, setResult.stderr);
+
+      // Check status JSON — should show updated model
+      const status = await runCli(
+        ["--agent", modelAgentCommand, "--approve-all", "--cwd", cwd, "--format", "json", "status"],
+        homeDir,
+      );
+      assert.equal(status.code, 0, status.stderr);
+
+      const statusPayload = JSON.parse(status.stdout.trim()) as { model?: string };
+      assert.equal(statusPayload.model, "gpt-5.4");
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
@@ -937,6 +1945,44 @@ test("integration: json-strict exec success emits JSON-RPC lines only", async ()
   });
 });
 
+test("integration: json-strict exec retries without emitting stderr notices", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const result = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--format",
+          "json",
+          "--json-strict",
+          "--prompt-retries",
+          "1",
+          "exec",
+          "retryable-error-once",
+        ],
+        homeDir,
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(result.stderr.trim(), "");
+
+      const payloads = parseJsonRpcOutputLines(result.stdout);
+      const promptRequests = payloads.filter((payload) => payload.method === "session/prompt");
+      assert.equal(promptRequests.length, 2, result.stdout);
+      assert.equal(
+        payloads.some(
+          (payload) => extractAgentMessageChunkText(payload) === "recovered after retry",
+        ),
+        true,
+        result.stdout,
+      );
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: fs/read_text_file through mock agent", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
@@ -947,6 +1993,56 @@ test("integration: fs/read_text_file through mock agent", async () => {
       const result = await runCli([...baseExecArgs(cwd), `read ${readPath}`], homeDir);
       assert.equal(result.code, 0, result.stderr);
       assert.match(result.stdout, /mock read content/);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: --suppress-reads hides read file body in text format", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const readPath = path.join(cwd, "acpx-test-read-tools.txt");
+    await fs.writeFile(readPath, "mock read content", "utf8");
+
+    try {
+      const result = await runCli(
+        [...baseAgentArgs(cwd), "--suppress-reads", "exec", `read-tool ${readPath}`],
+        homeDir,
+      );
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /\[tool\] Read/);
+      assert.match(result.stdout, /\[read output suppressed\]/);
+      assert.doesNotMatch(result.stdout, /mock read content/);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: --suppress-reads hides read file body in json format", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const readPath = path.join(cwd, "acpx-test-read-json.txt");
+    await fs.writeFile(readPath, "mock read content", "utf8");
+
+    try {
+      const result = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "--suppress-reads", "exec", `read ${readPath}`],
+        homeDir,
+      );
+      assert.equal(result.code, 0, result.stderr);
+      const payloads = parseJsonRpcOutputLines(result.stdout);
+      const readResponse = payloads.find((payload) => {
+        if (!("result" in payload)) {
+          return false;
+        }
+        return typeof (payload.result as { content?: unknown } | undefined)?.content === "string";
+      });
+      assert.equal(
+        (readResponse?.result as { content?: string } | undefined)?.content,
+        "[read output suppressed]",
+      );
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
@@ -1226,6 +2322,71 @@ test("integration: prompt recovers when loadSession fails on empty session witho
         homeDir,
       );
       assert.equal(closed.code, 0, closed.stderr);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: prompt retries stop after partial prompt output", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const created = await runCli([...baseAgentArgs(cwd), "sessions", "new"], homeDir);
+      assert.equal(created.code, 0, created.stderr);
+
+      const result = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--format",
+          "json",
+          "--prompt-retries",
+          "1",
+          "prompt",
+          "partial-retryable-error",
+        ],
+        homeDir,
+      );
+      assert.notEqual(result.code, 0, result.stderr);
+      assert.equal(/retrying in/.test(result.stderr), false, result.stderr);
+
+      const payloads = parseJsonRpcOutputLines(result.stdout);
+      const partialUpdates = payloads.filter(
+        (payload) => extractAgentMessageChunkText(payload) === "partial update",
+      );
+      assert.equal(partialUpdates.length, 1, result.stdout);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: exec retries stop after partial prompt output", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const result = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--format",
+          "json",
+          "--prompt-retries",
+          "1",
+          "exec",
+          "partial-retryable-error",
+        ],
+        homeDir,
+      );
+      assert.equal(result.code, 1, result.stderr);
+      assert.equal(/retrying in/.test(result.stderr), false, result.stderr);
+
+      const payloads = parseJsonRpcOutputLines(result.stdout);
+      const partialUpdates = payloads.filter(
+        (payload) => extractAgentMessageChunkText(payload) === "partial update",
+      );
+      assert.equal(partialUpdates.length, 1, result.stdout);
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
@@ -1652,6 +2813,10 @@ function baseAgentArgs(cwd: string): string[] {
   return ["--agent", MOCK_AGENT_COMMAND, "--approve-all", "--cwd", cwd];
 }
 
+function baseLoadCapableAgentArgs(cwd: string): string[] {
+  return ["--agent", LOAD_CAPABLE_MOCK_AGENT_COMMAND, "--approve-all", "--cwd", cwd];
+}
+
 function baseExecArgs(cwd: string): string[] {
   return [...baseAgentArgs(cwd), "--format", "quiet", "exec"];
 }
@@ -1754,6 +2919,56 @@ async function writeFakeIflowAgent(binDir: string): Promise<void> {
   );
 }
 
+async function writeFakeQoderAgent(binDir: string, argLogPath?: string): Promise<void> {
+  if (process.platform === "win32") {
+    await fs.writeFile(
+      path.join(binDir, "qodercli.cmd"),
+      [
+        "@echo off",
+        "setlocal",
+        ...(argLogPath ? [`echo %*>> "${argLogPath}"`] : []),
+        ":shift_known",
+        'if "%~1"=="--acp" shift & goto shift_known',
+        'if /I "%~1"=="--max-turns" shift & shift & goto shift_known',
+        'if /I "%~1"=="--allowed-tools" shift & shift & goto shift_known',
+        'if /I "%~1"=="--disallowed-tools" shift & shift & goto shift_known',
+        'echo %~1 | findstr /B /C:"--max-turns=" >nul && shift & goto shift_known',
+        'echo %~1 | findstr /B /C:"--allowed-tools=" >nul && shift & goto shift_known',
+        'echo %~1 | findstr /B /C:"--disallowed-tools=" >nul && shift & goto shift_known',
+        `"${process.execPath}" "${MOCK_AGENT_PATH}" %*`,
+        "",
+      ].join("\r\n"),
+      { encoding: "utf8" },
+    );
+    return;
+  }
+
+  await fs.writeFile(
+    path.join(binDir, "qodercli"),
+    [
+      "#!/bin/sh",
+      ...(argLogPath ? [`printf '%s\\n' "$*" >> ${JSON.stringify(argLogPath)}`] : []),
+      'while [ "$#" -gt 0 ]; do',
+      '  case "$1" in',
+      "    --acp|--max-turns=*|--allowed-tools=*|--disallowed-tools=*)",
+      "      shift",
+      "      ;;",
+      "    --max-turns|--allowed-tools|--disallowed-tools)",
+      "      shift",
+      '      [ "$#" -gt 0 ] && shift',
+      "      ;;",
+      "    *)",
+      "      break",
+      "      ;;",
+      "  esac",
+      "done",
+      `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,
+      "",
+    ].join("\n"),
+    { encoding: "utf8", mode: 0o755 },
+  );
+}
+
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
   const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-home-"));
   try {
@@ -1763,13 +2978,54 @@ async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<vo
   }
 }
 
+async function waitForFlowRunDir(outputRoot: string, flowName: string): Promise<string> {
+  return await waitFor(async () => {
+    const entries = await fs.readdir(outputRoot).catch(() => []);
+    const match = entries.find((entry) => entry.includes(flowName));
+    return match ? path.join(outputRoot, match) : null;
+  }, 5_000);
+}
+
+async function readFlowRunJson(runDir: string): Promise<Record<string, unknown>> {
+  const payload = await fs.readFile(path.join(runDir, "projections", "run.json"), "utf8");
+  return JSON.parse(payload) as Record<string, unknown>;
+}
+
+async function waitFor<T>(fn: () => Promise<T | null>, timeoutMs: number): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+
+  while (Date.now() < deadline) {
+    try {
+      const value = await fn();
+      if (value != null) {
+        return value;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Timed out waiting for condition");
+}
+
 async function runCli(
   args: string[],
   homeDir: string,
   options: CliRunOptions = {},
 ): Promise<CliRunResult> {
+  return await runCliWithEntry(CLI_PATH, args, homeDir, options);
+}
+
+async function runCliWithEntry(
+  entryPath: string,
+  args: string[],
+  homeDir: string,
+  options: CliRunOptions = {},
+): Promise<CliRunResult> {
   return await new Promise<CliRunResult>((resolve, reject) => {
-    const child = spawn(process.execPath, [CLI_PATH, ...args], {
+    const child = spawn(process.execPath, [entryPath, ...args], {
       env: {
         ...process.env,
         HOME: homeDir,
@@ -1814,10 +3070,33 @@ async function runCli(
   });
 }
 
+async function awaitChildClose(child: ReturnType<typeof spawn>): Promise<CliRunResult> {
+  return await new Promise<CliRunResult>((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr?.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.once("error", reject);
+    child.once("close", (code, signal) => {
+      resolve({ code, signal, stdout, stderr });
+    });
+  });
+}
+
 async function runPerfReport(filePath: string): Promise<CliRunResult> {
   return await new Promise<CliRunResult>((resolve, reject) => {
     const child = spawn("pnpm", ["exec", "tsx", "scripts/perf-report.ts", filePath], {
-      env: process.env,
+      env: {
+        ...process.env,
+        NODE_V8_COVERAGE: "",
+      },
       cwd: process.cwd(),
       stdio: ["ignore", "pipe", "pipe"],
     });

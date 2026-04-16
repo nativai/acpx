@@ -144,6 +144,28 @@ Harness documentation synchronization policy:
 
 - Repo-local `/landpr` instructions live at [`.pi/prompts/landpr.md`](.pi/prompts/landpr.md).
   When landing or merging a PR in this repo, follow that process.
+- Pull request titles MUST use conventional prefixes such as `feat:`, `fix:`,
+  `docs:`, `chore:`, `refactor:`, or `test:` and should summarize the actual
+  change directly.
+- Do not prefix pull request titles with agent markers such as `[codex]` or
+  other AI-assistance tags. If AI assistance should be disclosed, put that in
+  the PR description instead.
+- Local `codex review --base ...` runs in this repo can legitimately take up to
+  30 minutes. Do not declare them stuck before that timeout unless you have
+  stronger evidence than elapsed time alone.
+- For workflow changes, prefer prompt and policy changes inside existing ACP
+  nodes over adding new workflow nodes, helper actions, or deterministic
+  side-logic.
+- If the problem is mainly judgment or policy, keep that judgment in the ACP
+  lane unless the runtime truly needs a distinct new execution capability.
+- Preserve the existing flow graph shape by default. Assume "no new node" unless
+  a new node adds a real execution boundary, timeout boundary, artifact
+  collection boundary, or capability the current node cannot own cleanly.
+- For persistent ACP flow sessions, preserve the underlying agent session across
+  steps. If the live ACP connection dies, the correct recovery is reconnect and
+  `session/load` the same session. Do not silently replace a dead persistent
+  session with a fresh one. If the original persistent session cannot be
+  resumed, fail the node or workflow clearly instead.
 - Before `/landpr`, run `/reviewpr` and require explicit evidence for bug-fix
   claims. Do not merge bug-fix PRs based only on issue text, PR text, or AI
   rationale.
@@ -157,6 +179,10 @@ Harness documentation synchronization policy:
   of the same commit when possible.
 - Group changelog updates with the PR that introduces the user-facing change
   instead of batching them later.
+- When referring to pull requests in comments, notes, or final reports, use a
+  full URL or a Markdown link. In lists, a short Markdown link label such as
+  [`#123`](https://github.com/openclaw/acpx/pull/123) is preferred over bare PR
+  numbers.
 
 ## Fundamental acpx Calls
 
@@ -243,12 +269,12 @@ Do not change release metadata or publishing behavior casually.
 
 ## Technical References
 
-- [`src/cli-core.ts`](src/cli-core.ts) — command handling and top-level CLI flow
-- [`src/client.ts`](src/client.ts) — ACP client integration
-- [`src/config.ts`](src/config.ts) — config loading and defaults
+- [`src/cli-core.ts`](src/cli-core.ts) — top-level CLI entrypoint and output policy handling
+- [`src/acp/client.ts`](src/acp/client.ts) — ACP client integration
+- [`src/cli/config.ts`](src/cli/config.ts) — config loading and defaults
 - [`src/agent-registry.ts`](src/agent-registry.ts) — built-in agent names and commands
-- [`src/session-runtime.ts`](src/session-runtime.ts) and [`src/session-runtime/`](src/session-runtime) — session lifecycle and runtime behavior
-- [`src/queue-ipc.ts`](src/queue-ipc.ts) and [`src/queue-ipc-server.ts`](src/queue-ipc-server.ts) — queue IPC behavior
+- [`src/cli/session/runtime.ts`](src/cli/session/runtime.ts) and [`src/cli/session/`](src/cli/session) — CLI session lifecycle and runtime behavior
+- [`src/cli/queue/ipc.ts`](src/cli/queue/ipc.ts) and [`src/cli/queue/ipc-server.ts`](src/cli/queue/ipc-server.ts) — queue IPC behavior
 - [`test/integration.test.ts`](test/integration.test.ts) — end-to-end CLI expectations
 - [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — CI behavior
 - [`.github/workflows/release.yml`](.github/workflows/release.yml) — release workflow

@@ -1,81 +1,41 @@
 #!/usr/bin/env node
 
-import fs from "node:fs/promises";
 import path from "node:path";
-import { Command, CommanderError, InvalidArgumentError } from "commander";
-import { listBuiltInAgents } from "./agent-registry.js";
-import {
-  addGlobalFlags,
-  addPromptInputOption,
-  addSessionNameOption,
-  addSessionOption,
-  parseAllowedTools,
-  parseHistoryLimit,
-  parseMaxTurns,
-  parseNonEmptyValue,
-  parseSessionName,
-  parseTtlSeconds,
-  resolveAgentInvocation,
-  resolveGlobalFlags,
-  resolveOutputPolicy,
-  resolvePermissionMode,
-  resolveSessionNameFromFlags,
-  type ExecFlags,
-  type PromptFlags,
-  type SessionsHistoryFlags,
-  type SessionsNewFlags,
-  type StatusFlags,
-} from "./cli/flags.js";
-import {
-  initGlobalConfigFile,
-  loadResolvedConfig,
-  toConfigDisplay,
-  type ResolvedAcpxConfig,
-} from "./config.js";
+import { Command, CommanderError } from "commander";
 import {
   exitCodeForOutputErrorCode,
   normalizeOutputError,
   type NormalizedOutputError,
-} from "./error-normalization.js";
+} from "./acp/error-normalization.js";
+import { listBuiltInAgents } from "./agent-registry.js";
+import { InterruptedError } from "./async-control.js";
+import { configurePublicCli } from "./cli-public.js";
+import { handlePrompt } from "./cli/command-handlers.js";
+import { registerAgentCommand, registerDefaultCommands } from "./cli/command-registration.js";
+import { loadResolvedConfig } from "./cli/config.js";
+import {
+  addGlobalFlags,
+  parseAllowedTools,
+  parseMaxTurns,
+  parseTtlSeconds,
+  resolveOutputPolicy,
+} from "./cli/flags.js";
+import { createOutputFormatter } from "./cli/output/output.js";
+import { runQueueOwnerFromEnv } from "./cli/queue/owner-env.js";
 import { flushPerfMetricsCapture, installPerfMetricsCapture } from "./perf-metrics-capture.js";
-import {
-  mergePromptSourceWithText,
-  parsePromptSource,
-  PromptInputValidationError,
-  textPrompt,
-} from "./prompt-content.js";
-import { runQueueOwnerFromEnv } from "./queue-owner-env.js";
-import {
-  DEFAULT_HISTORY_LIMIT,
-  findGitRepositoryRoot,
-  findSession,
-  findSessionByDirectoryWalk,
-  listSubagentsForSession,
-} from "./session-persistence.js";
-import { InterruptedError } from "./session-runtime-helpers.js";
-import {
-  EXIT_CODES,
-  OUTPUT_FORMATS,
-  type OutputFormat,
-  type OutputPolicy,
-  type SessionRecord,
-  type SessionAgentContent,
-  type SessionUserContent,
-  type SubagentRef,
-} from "./types.js";
+import { EXIT_CODES, OUTPUT_FORMATS, type OutputFormat, type OutputPolicy } from "./types.js";
 import { getAcpxVersion } from "./version.js";
 
-class NoSessionError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "NoSessionError";
-  }
-}
+export { parseAllowedTools, parseMaxTurns, parseTtlSeconds };
+export { formatPromptSessionBannerLine } from "./cli/output/render.js";
+
+type SkillflagModule = typeof import("skillflag");
 
 const TOP_LEVEL_VERBS = new Set([
   "prompt",
   "exec",
   "cancel",
+  "flow",
   "set-mode",
   "set",
   "sessions",
@@ -84,132 +44,7 @@ const TOP_LEVEL_VERBS = new Set([
   "help",
 ]);
 
-async function readPromptInputFromStdin(): Promise<string> {
-  let data = "";
-  for await (const chunk of process.stdin) {
-    data += String(chunk);
-  }
-  return data;
-}
-
-async function readPrompt(
-  promptParts: string[],
-  filePath: string | undefined,
-  cwd: string,
-): Promise<import("./types.js").PromptInput> {
-  try {
-    if (filePath) {
-      const source =
-        filePath === "-"
-          ? await readPromptInputFromStdin()
-          : await fs.readFile(path.resolve(cwd, filePath), "utf8");
-      const prompt = mergePromptSourceWithText(source, promptParts.join(" "));
-      if (prompt.length === 0) {
-        throw new InvalidArgumentError("Prompt from --file is empty");
-      }
-      return prompt;
-    }
-
-    const joined = promptParts.join(" ").trim();
-    if (joined.length > 0) {
-      return textPrompt(joined);
-    }
-
-    if (process.stdin.isTTY) {
-      throw new InvalidArgumentError(
-        "Prompt is required (pass as argument, --file, or pipe via stdin)",
-      );
-    }
-
-    const prompt = parsePromptSource(await readPromptInputFromStdin());
-    if (prompt.length === 0) {
-      throw new InvalidArgumentError("Prompt from stdin is empty");
-    }
-
-    return prompt;
-  } catch (error) {
-    if (error instanceof PromptInputValidationError) {
-      throw new InvalidArgumentError(error.message);
-    }
-    throw error;
-  }
-}
-
-function applyPermissionExitCode(result: {
-  permissionStats: {
-    requested: number;
-    approved: number;
-    denied: number;
-    cancelled: number;
-  };
-}): void {
-  const stats = result.permissionStats;
-  const deniedOrCancelled = stats.denied + stats.cancelled;
-
-  if (stats.requested > 0 && stats.approved === 0 && deniedOrCancelled > 0) {
-    process.exitCode = EXIT_CODES.PERMISSION_DENIED;
-  }
-}
-
-function emitJsonResult(format: OutputFormat, payload: unknown): boolean {
-  if (format !== "json") {
-    return false;
-  }
-  process.stdout.write(`${JSON.stringify(payload)}\n`);
-  return true;
-}
-
-function isCodexAgentInvocation(agent: { agentName: string; agentCommand: string }): boolean {
-  if (agent.agentName === "codex") {
-    return true;
-  }
-  return /\bcodex-acp\b/.test(agent.agentCommand);
-}
-
-function resolveCompatibleConfigId(
-  agent: { agentName: string; agentCommand: string },
-  configId: string,
-): string {
-  if (isCodexAgentInvocation(agent) && configId === "thought_level") {
-    return "reasoning_effort";
-  }
-  return configId;
-}
-
-export { parseAllowedTools, parseMaxTurns, parseTtlSeconds };
-export { formatPromptSessionBannerLine } from "./cli/output-render.js";
-
-type SessionModule = typeof import("./session.js");
-type OutputModule = typeof import("./output.js");
-type OutputRenderModule = typeof import("./cli/output-render.js");
-type QueueIpcModule = typeof import("./queue-ipc.js");
-type SkillflagModule = typeof import("skillflag");
-
-let sessionModulePromise: Promise<SessionModule> | undefined;
-let outputModulePromise: Promise<OutputModule> | undefined;
-let outputRenderModulePromise: Promise<OutputRenderModule> | undefined;
-let queueIpcModulePromise: Promise<QueueIpcModule> | undefined;
 let skillflagModulePromise: Promise<SkillflagModule> | undefined;
-
-function loadSessionModule(): Promise<SessionModule> {
-  sessionModulePromise ??= import("./session.js");
-  return sessionModulePromise;
-}
-
-function loadOutputModule(): Promise<OutputModule> {
-  outputModulePromise ??= import("./output.js");
-  return outputModulePromise;
-}
-
-function loadOutputRenderModule(): Promise<OutputRenderModule> {
-  outputRenderModulePromise ??= import("./cli/output-render.js");
-  return outputRenderModulePromise;
-}
-
-function loadQueueIpcModule(): Promise<QueueIpcModule> {
-  queueIpcModulePromise ??= import("./queue-ipc.js");
-  return queueIpcModulePromise;
-}
 
 function loadSkillflagModule(): Promise<SkillflagModule> {
   skillflagModulePromise ??= import("skillflag");
@@ -218,1193 +53,6 @@ function loadSkillflagModule(): Promise<SkillflagModule> {
 
 function shouldMaybeHandleSkillflag(argv: string[]): boolean {
   return argv.some((token) => token === "--skill" || token.startsWith("--skill="));
-}
-
-async function findRoutedSessionOrThrow(
-  agentCommand: string,
-  agentName: string,
-  cwd: string,
-  sessionName: string | undefined,
-): Promise<SessionRecord> {
-  const gitRoot = findGitRepositoryRoot(cwd);
-  const walkBoundary = gitRoot ?? cwd;
-
-  const record = await findSessionByDirectoryWalk({
-    agentCommand,
-    cwd,
-    name: sessionName,
-    boundary: walkBoundary,
-  });
-
-  if (record) {
-    return record;
-  }
-
-  const createCmd = sessionName
-    ? `acpx ${agentName} sessions new --name ${sessionName}`
-    : `acpx ${agentName} sessions new`;
-  throw new NoSessionError(
-    `⚠ No acpx session found (searched up to ${walkBoundary}).\nCreate one: ${createCmd}`,
-  );
-}
-
-async function handlePrompt(
-  explicitAgentName: string | undefined,
-  promptParts: string[],
-  flags: PromptFlags,
-  command: Command,
-  config: ResolvedAcpxConfig,
-): Promise<void> {
-  const globalFlags = resolveGlobalFlags(command, config);
-  const outputPolicy = resolveOutputPolicy(globalFlags.format, globalFlags.jsonStrict === true);
-  const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
-  const prompt = await readPrompt(promptParts, flags.file, globalFlags.cwd);
-  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const [
-    { createOutputFormatter },
-    { printPromptSessionBanner, printQueuedPromptByFormat },
-    { sendSession },
-  ] = await Promise.all([loadOutputModule(), loadOutputRenderModule(), loadSessionModule()]);
-  const record = await findRoutedSessionOrThrow(
-    agent.agentCommand,
-    agent.agentName,
-    agent.cwd,
-    resolveSessionNameFromFlags(flags, command),
-  );
-  const outputFormatter = createOutputFormatter(outputPolicy.format, {
-    jsonContext: {
-      sessionId: record.acpxRecordId,
-    },
-  });
-
-  await printPromptSessionBanner(record, agent.cwd, outputPolicy.format, outputPolicy.jsonStrict);
-  const result = await sendSession({
-    sessionId: record.acpxRecordId,
-    prompt,
-    mcpServers: config.mcpServers,
-    permissionMode,
-    nonInteractivePermissions: globalFlags.nonInteractivePermissions,
-    authCredentials: config.auth,
-    authPolicy: globalFlags.authPolicy,
-    outputFormatter,
-    errorEmissionPolicy: {
-      queueErrorAlreadyEmitted: outputPolicy.queueErrorAlreadyEmitted,
-    },
-    suppressSdkConsoleErrors: outputPolicy.suppressSdkConsoleErrors,
-    timeoutMs: globalFlags.timeout,
-    ttlMs: globalFlags.ttl,
-    maxQueueDepth: config.queueMaxDepth,
-    verbose: globalFlags.verbose,
-    waitForCompletion: flags.wait !== false,
-  });
-
-  if ("queued" in result) {
-    printQueuedPromptByFormat(result, outputPolicy.format);
-    return;
-  }
-
-  applyPermissionExitCode(result);
-
-  if (globalFlags.verbose && result.loadError) {
-    process.stderr.write(`[acpx] loadSession failed, started fresh session: ${result.loadError}\n`);
-  }
-}
-
-async function handleExec(
-  explicitAgentName: string | undefined,
-  promptParts: string[],
-  flags: ExecFlags,
-  command: Command,
-  config: ResolvedAcpxConfig,
-): Promise<void> {
-  if (config.disableExec) {
-    const globalFlags = resolveGlobalFlags(command, config);
-    const outputPolicy = resolveOutputPolicy(globalFlags.format, globalFlags.jsonStrict === true);
-    if (outputPolicy.format === "json") {
-      process.stdout.write(
-        `${JSON.stringify({
-          jsonrpc: "2.0",
-          error: {
-            code: -32603,
-            message: "exec subcommand is disabled by configuration (disableExec: true)",
-            data: {
-              acpxCode: "EXEC_DISABLED",
-            },
-          },
-        })}\n`,
-      );
-    } else {
-      process.stderr.write(
-        "Error: exec subcommand is disabled by configuration (disableExec: true)\n",
-      );
-    }
-    process.exitCode = EXIT_CODES.ERROR;
-    return;
-  }
-
-  const globalFlags = resolveGlobalFlags(command, config);
-  const outputPolicy = resolveOutputPolicy(globalFlags.format, globalFlags.jsonStrict === true);
-  const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
-  const prompt = await readPrompt(promptParts, flags.file, globalFlags.cwd);
-  const [{ createOutputFormatter }, { runOnce }] = await Promise.all([
-    loadOutputModule(),
-    loadSessionModule(),
-  ]);
-  const outputFormatter = createOutputFormatter(outputPolicy.format);
-  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-
-  const result = await runOnce({
-    agentCommand: agent.agentCommand,
-    cwd: agent.cwd,
-    prompt,
-    mcpServers: config.mcpServers,
-    permissionMode,
-    nonInteractivePermissions: globalFlags.nonInteractivePermissions,
-    authCredentials: config.auth,
-    authPolicy: globalFlags.authPolicy,
-    outputFormatter,
-    suppressSdkConsoleErrors: outputPolicy.suppressSdkConsoleErrors,
-    timeoutMs: globalFlags.timeout,
-    verbose: globalFlags.verbose,
-    sessionOptions: {
-      model: globalFlags.model,
-      allowedTools: globalFlags.allowedTools,
-      maxTurns: globalFlags.maxTurns,
-    },
-  });
-
-  applyPermissionExitCode(result);
-}
-
-function printCancelResultByFormat(
-  result: { sessionId: string; cancelled: boolean },
-  format: OutputFormat,
-): void {
-  if (
-    emitJsonResult(format, {
-      action: "cancel_result",
-      acpxRecordId: result.sessionId || "unknown",
-      cancelled: result.cancelled,
-    })
-  ) {
-    return;
-  }
-
-  if (result.cancelled) {
-    process.stdout.write("cancel requested\n");
-    return;
-  }
-
-  process.stdout.write("nothing to cancel\n");
-}
-
-function printSetModeResultByFormat(
-  modeId: string,
-  result: { record: SessionRecord; resumed: boolean; loadError?: string },
-  format: OutputFormat,
-): void {
-  if (
-    emitJsonResult(format, {
-      action: "mode_set",
-      modeId,
-      resumed: result.resumed,
-      acpxRecordId: result.record.acpxRecordId,
-      acpxSessionId: result.record.acpSessionId,
-      agentSessionId: result.record.agentSessionId,
-    })
-  ) {
-    return;
-  }
-
-  if (format === "quiet") {
-    process.stdout.write(`${modeId}\n`);
-    return;
-  }
-
-  process.stdout.write(`mode set: ${modeId}\n`);
-}
-
-function printSetConfigOptionResultByFormat(
-  configId: string,
-  value: string,
-  result: {
-    record: SessionRecord;
-    resumed: boolean;
-    response: { configOptions: unknown[] };
-  },
-  format: OutputFormat,
-): void {
-  if (
-    emitJsonResult(format, {
-      action: "config_set",
-      configId,
-      value,
-      resumed: result.resumed,
-      configOptions: result.response.configOptions,
-      acpxRecordId: result.record.acpxRecordId,
-      acpxSessionId: result.record.acpSessionId,
-      agentSessionId: result.record.agentSessionId,
-    })
-  ) {
-    return;
-  }
-
-  if (format === "quiet") {
-    process.stdout.write(`${value}\n`);
-    return;
-  }
-
-  process.stdout.write(
-    `config set: ${configId}=${value} (${result.response.configOptions.length} options)\n`,
-  );
-}
-
-async function handleCancel(
-  explicitAgentName: string | undefined,
-  flags: StatusFlags,
-  command: Command,
-  config: ResolvedAcpxConfig,
-): Promise<void> {
-  const globalFlags = resolveGlobalFlags(command, config);
-  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const { cancelSessionPrompt } = await loadSessionModule();
-  const gitRoot = findGitRepositoryRoot(agent.cwd);
-  const walkBoundary = gitRoot ?? agent.cwd;
-  const record = await findSessionByDirectoryWalk({
-    agentCommand: agent.agentCommand,
-    cwd: agent.cwd,
-    name: resolveSessionNameFromFlags(flags, command),
-    boundary: walkBoundary,
-  });
-
-  if (!record) {
-    printCancelResultByFormat(
-      {
-        sessionId: "",
-        cancelled: false,
-      },
-      globalFlags.format,
-    );
-    return;
-  }
-
-  const result = await cancelSessionPrompt({
-    sessionId: record.acpxRecordId,
-    verbose: globalFlags.verbose,
-  });
-  printCancelResultByFormat(result, globalFlags.format);
-}
-
-async function handleSetMode(
-  explicitAgentName: string | undefined,
-  modeId: string,
-  flags: StatusFlags,
-  command: Command,
-  config: ResolvedAcpxConfig,
-): Promise<void> {
-  const globalFlags = resolveGlobalFlags(command, config);
-  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const { setSessionMode } = await loadSessionModule();
-  const record = await findRoutedSessionOrThrow(
-    agent.agentCommand,
-    agent.agentName,
-    agent.cwd,
-    resolveSessionNameFromFlags(flags, command),
-  );
-  const result = await setSessionMode({
-    sessionId: record.acpxRecordId,
-    modeId,
-    mcpServers: config.mcpServers,
-    nonInteractivePermissions: globalFlags.nonInteractivePermissions,
-    authCredentials: config.auth,
-    authPolicy: globalFlags.authPolicy,
-    timeoutMs: globalFlags.timeout,
-    verbose: globalFlags.verbose,
-  });
-
-  if (globalFlags.verbose && result.loadError) {
-    process.stderr.write(`[acpx] loadSession failed, started fresh session: ${result.loadError}\n`);
-  }
-
-  printSetModeResultByFormat(modeId, result, globalFlags.format);
-}
-
-async function handleSetConfigOption(
-  explicitAgentName: string | undefined,
-  configId: string,
-  value: string,
-  flags: StatusFlags,
-  command: Command,
-  config: ResolvedAcpxConfig,
-): Promise<void> {
-  const globalFlags = resolveGlobalFlags(command, config);
-  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const resolvedConfigId = resolveCompatibleConfigId(agent, configId);
-  const { setSessionConfigOption } = await loadSessionModule();
-  const record = await findRoutedSessionOrThrow(
-    agent.agentCommand,
-    agent.agentName,
-    agent.cwd,
-    resolveSessionNameFromFlags(flags, command),
-  );
-  const result = await setSessionConfigOption({
-    sessionId: record.acpxRecordId,
-    configId: resolvedConfigId,
-    value,
-    mcpServers: config.mcpServers,
-    nonInteractivePermissions: globalFlags.nonInteractivePermissions,
-    authCredentials: config.auth,
-    authPolicy: globalFlags.authPolicy,
-    timeoutMs: globalFlags.timeout,
-    verbose: globalFlags.verbose,
-  });
-
-  if (globalFlags.verbose && result.loadError) {
-    process.stderr.write(`[acpx] loadSession failed, started fresh session: ${result.loadError}\n`);
-  }
-
-  printSetConfigOptionResultByFormat(configId, value, result, globalFlags.format);
-}
-
-async function handleSessionsList(
-  explicitAgentName: string | undefined,
-  command: Command,
-  config: ResolvedAcpxConfig,
-): Promise<void> {
-  const globalFlags = resolveGlobalFlags(command, config);
-  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const [{ listSessionsForAgent }, { printSessionsByFormat }] = await Promise.all([
-    loadSessionModule(),
-    loadOutputRenderModule(),
-  ]);
-  const sessions = await listSessionsForAgent(agent.agentCommand);
-  printSessionsByFormat(sessions, globalFlags.format);
-}
-
-async function handleSessionsClose(
-  explicitAgentName: string | undefined,
-  sessionName: string | undefined,
-  command: Command,
-  config: ResolvedAcpxConfig,
-): Promise<void> {
-  const globalFlags = resolveGlobalFlags(command, config);
-  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const [{ closeSession }, { printClosedSessionByFormat }] = await Promise.all([
-    loadSessionModule(),
-    loadOutputRenderModule(),
-  ]);
-
-  const record = await findSession({
-    agentCommand: agent.agentCommand,
-    cwd: agent.cwd,
-    name: sessionName,
-  });
-
-  if (!record) {
-    if (sessionName) {
-      throw new Error(
-        `No named session "${sessionName}" for cwd ${agent.cwd} and agent ${agent.agentName}`,
-      );
-    }
-
-    throw new Error(`No cwd session for ${agent.cwd} and agent ${agent.agentName}`);
-  }
-
-  const closed = await closeSession(record.acpxRecordId);
-  printClosedSessionByFormat(closed, globalFlags.format);
-}
-
-async function handleSessionsNew(
-  explicitAgentName: string | undefined,
-  flags: SessionsNewFlags,
-  command: Command,
-  config: ResolvedAcpxConfig,
-): Promise<void> {
-  const globalFlags = resolveGlobalFlags(command, config);
-  const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
-  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const [{ createSession, closeSession }, { printCreatedSessionBanner, printNewSessionByFormat }] =
-    await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
-
-  const replaced = await findSession({
-    agentCommand: agent.agentCommand,
-    cwd: agent.cwd,
-    name: flags.name,
-  });
-
-  if (replaced) {
-    await closeSession(replaced.acpxRecordId);
-    if (globalFlags.verbose) {
-      process.stderr.write(`[acpx] soft-closed prior session: ${replaced.acpxRecordId}\n`);
-    }
-  }
-
-  const created = await createSession({
-    agentCommand: agent.agentCommand,
-    cwd: agent.cwd,
-    name: flags.name,
-    resumeSessionId: flags.resumeSession,
-    mcpServers: config.mcpServers,
-    permissionMode,
-    nonInteractivePermissions: globalFlags.nonInteractivePermissions,
-    authCredentials: config.auth,
-    authPolicy: globalFlags.authPolicy,
-    timeoutMs: globalFlags.timeout,
-    verbose: globalFlags.verbose,
-    sessionOptions: {
-      model: globalFlags.model,
-      allowedTools: globalFlags.allowedTools,
-      maxTurns: globalFlags.maxTurns,
-    },
-  });
-
-  printCreatedSessionBanner(created, agent.agentName, globalFlags.format, globalFlags.jsonStrict);
-
-  if (globalFlags.verbose) {
-    const scope = flags.name ? `named session "${flags.name}"` : "cwd session";
-    process.stderr.write(`[acpx] created ${scope}: ${created.acpxRecordId}\n`);
-  }
-
-  printNewSessionByFormat(created, replaced, globalFlags.format);
-}
-
-async function handleSessionsEnsure(
-  explicitAgentName: string | undefined,
-  flags: SessionsNewFlags,
-  command: Command,
-  config: ResolvedAcpxConfig,
-): Promise<void> {
-  const globalFlags = resolveGlobalFlags(command, config);
-  const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
-  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const [{ ensureSession }, { printCreatedSessionBanner, printEnsuredSessionByFormat }] =
-    await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
-  const result = await ensureSession({
-    agentCommand: agent.agentCommand,
-    cwd: agent.cwd,
-    name: flags.name,
-    resumeSessionId: flags.resumeSession,
-    mcpServers: config.mcpServers,
-    permissionMode,
-    nonInteractivePermissions: globalFlags.nonInteractivePermissions,
-    authCredentials: config.auth,
-    authPolicy: globalFlags.authPolicy,
-    timeoutMs: globalFlags.timeout,
-    verbose: globalFlags.verbose,
-    sessionOptions: {
-      model: globalFlags.model,
-      allowedTools: globalFlags.allowedTools,
-      maxTurns: globalFlags.maxTurns,
-    },
-  });
-
-  if (result.created) {
-    printCreatedSessionBanner(
-      result.record,
-      agent.agentName,
-      globalFlags.format,
-      globalFlags.jsonStrict,
-    );
-  }
-
-  printEnsuredSessionByFormat(result.record, result.created, globalFlags.format);
-}
-
-function userContentToText(content: SessionUserContent): string {
-  if ("Text" in content) {
-    return content.Text;
-  }
-  if ("Mention" in content) {
-    return content.Mention.content;
-  }
-  if ("Image" in content) {
-    return content.Image.source || "[image]";
-  }
-  return "";
-}
-
-function agentContentToText(content: SessionAgentContent): string {
-  if ("Text" in content) {
-    return content.Text;
-  }
-  if ("Thinking" in content) {
-    return content.Thinking.text;
-  }
-  if ("RedactedThinking" in content) {
-    return "[redacted_thinking]";
-  }
-  if ("ToolUse" in content) {
-    return `[tool:${content.ToolUse.name}]`;
-  }
-  return "";
-}
-
-function conversationHistoryEntries(record: SessionRecord): Array<{
-  role: "user" | "assistant";
-  timestamp: string;
-  textPreview: string;
-}> {
-  const entries: Array<{
-    role: "user" | "assistant";
-    timestamp: string;
-    textPreview: string;
-  }> = [];
-
-  for (const message of record.messages) {
-    if (message === "Resume") {
-      continue;
-    }
-
-    if ("User" in message) {
-      const text = message.User.content
-        .map((entry) => userContentToText(entry))
-        .join(" ")
-        .trim();
-
-      if (!text) {
-        continue;
-      }
-
-      entries.push({
-        role: "user",
-        timestamp: record.updated_at,
-        textPreview: text,
-      });
-      continue;
-    }
-
-    if ("Agent" in message) {
-      const text = message.Agent.content
-        .map((entry) => agentContentToText(entry))
-        .join(" ")
-        .trim();
-
-      if (!text) {
-        continue;
-      }
-
-      entries.push({
-        role: "assistant",
-        timestamp: record.updated_at,
-        textPreview: text,
-      });
-    }
-  }
-
-  return entries;
-}
-
-function printSessionDetailsByFormat(record: SessionRecord, format: OutputFormat): void {
-  if (format === "json") {
-    process.stdout.write(`${JSON.stringify(record)}\n`);
-    return;
-  }
-
-  if (format === "quiet") {
-    process.stdout.write(`${record.acpxRecordId}\n`);
-    return;
-  }
-
-  process.stdout.write(`id: ${record.acpxRecordId}\n`);
-  process.stdout.write(`sessionId: ${record.acpSessionId}\n`);
-  process.stdout.write(`agentSessionId: ${record.agentSessionId ?? "-"}\n`);
-  process.stdout.write(`agent: ${record.agentCommand}\n`);
-  process.stdout.write(`cwd: ${record.cwd}\n`);
-  process.stdout.write(`name: ${record.name ?? "-"}\n`);
-  process.stdout.write(`created: ${record.createdAt}\n`);
-  process.stdout.write(`lastActivity: ${record.lastUsedAt}\n`);
-  process.stdout.write(`lastPrompt: ${record.lastPromptAt ?? "-"}\n`);
-  process.stdout.write(`closed: ${record.closed ? "yes" : "no"}\n`);
-  process.stdout.write(`closedAt: ${record.closedAt ?? "-"}\n`);
-  process.stdout.write(`pid: ${record.pid ?? "-"}\n`);
-  process.stdout.write(`agentStartedAt: ${record.agentStartedAt ?? "-"}\n`);
-  process.stdout.write(`lastExitCode: ${record.lastAgentExitCode ?? "-"}\n`);
-  process.stdout.write(`lastExitSignal: ${record.lastAgentExitSignal ?? "-"}\n`);
-  process.stdout.write(`lastExitAt: ${record.lastAgentExitAt ?? "-"}\n`);
-  process.stdout.write(`disconnectReason: ${record.lastAgentDisconnectReason ?? "-"}\n`);
-  process.stdout.write(`historyEntries: ${conversationHistoryEntries(record).length}\n`);
-}
-
-function printSessionHistoryByFormat(
-  record: SessionRecord,
-  limit: number,
-  format: OutputFormat,
-): void {
-  const history = conversationHistoryEntries(record);
-  const visible = limit === 0 ? history : history.slice(Math.max(0, history.length - limit));
-
-  if (format === "json") {
-    process.stdout.write(
-      `${JSON.stringify({
-        id: record.acpxRecordId,
-        sessionId: record.acpSessionId,
-        limit,
-        count: visible.length,
-        entries: visible,
-      })}\n`,
-    );
-    return;
-  }
-
-  if (format === "quiet") {
-    for (const entry of visible) {
-      process.stdout.write(`${entry.textPreview}\n`);
-    }
-    return;
-  }
-
-  process.stdout.write(
-    `session: ${record.acpxRecordId} (${visible.length}/${history.length} shown)\n`,
-  );
-  if (visible.length === 0) {
-    process.stdout.write("No history\n");
-    return;
-  }
-
-  for (const entry of visible) {
-    process.stdout.write(`${entry.timestamp}\t${entry.role}\t${entry.textPreview}\n`);
-  }
-}
-
-async function handleSessionsShow(
-  explicitAgentName: string | undefined,
-  sessionName: string | undefined,
-  command: Command,
-  config: ResolvedAcpxConfig,
-): Promise<void> {
-  const globalFlags = resolveGlobalFlags(command, config);
-  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const record = await findSession({
-    agentCommand: agent.agentCommand,
-    cwd: agent.cwd,
-    name: sessionName,
-    includeClosed: true,
-  });
-
-  if (!record) {
-    throw new Error(
-      sessionName
-        ? `No named session "${sessionName}" for cwd ${agent.cwd} and agent ${agent.agentName}`
-        : `No cwd session for ${agent.cwd} and agent ${agent.agentName}`,
-    );
-  }
-
-  printSessionDetailsByFormat(record, globalFlags.format);
-}
-
-async function handleSessionsHistory(
-  explicitAgentName: string | undefined,
-  sessionName: string | undefined,
-  flags: SessionsHistoryFlags,
-  command: Command,
-  config: ResolvedAcpxConfig,
-): Promise<void> {
-  const globalFlags = resolveGlobalFlags(command, config);
-  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const record = await findSession({
-    agentCommand: agent.agentCommand,
-    cwd: agent.cwd,
-    name: sessionName,
-    includeClosed: true,
-  });
-
-  if (!record) {
-    throw new Error(
-      sessionName
-        ? `No named session "${sessionName}" for cwd ${agent.cwd} and agent ${agent.agentName}`
-        : `No cwd session for ${agent.cwd} and agent ${agent.agentName}`,
-    );
-  }
-
-  printSessionHistoryByFormat(record, flags.limit, globalFlags.format);
-}
-
-function formatUptime(startedAt: string | undefined): string | undefined {
-  if (!startedAt) {
-    return undefined;
-  }
-
-  const startedMs = Date.parse(startedAt);
-  if (!Number.isFinite(startedMs)) {
-    return undefined;
-  }
-
-  const elapsedMs = Math.max(0, Date.now() - startedMs);
-  const seconds = Math.floor(elapsedMs / 1_000);
-  const hours = Math.floor(seconds / 3_600);
-  const minutes = Math.floor((seconds % 3_600) / 60);
-  const remSeconds = seconds % 60;
-  return `${hours.toString().padStart(2, "0")}:${minutes
-    .toString()
-    .padStart(2, "0")}:${remSeconds.toString().padStart(2, "0")}`;
-}
-
-async function handleStatus(
-  explicitAgentName: string | undefined,
-  flags: StatusFlags,
-  command: Command,
-  config: ResolvedAcpxConfig,
-): Promise<void> {
-  const globalFlags = resolveGlobalFlags(command, config);
-  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const [{ probeQueueOwnerHealth }, { agentSessionIdPayload, emitJsonResult }] = await Promise.all([
-    loadQueueIpcModule(),
-    loadOutputRenderModule(),
-  ]);
-  const record = await findSession({
-    agentCommand: agent.agentCommand,
-    cwd: agent.cwd,
-    name: resolveSessionNameFromFlags(flags, command),
-  });
-
-  if (!record) {
-    if (
-      emitJsonResult(globalFlags.format, {
-        action: "status_snapshot",
-        status: "no-session",
-        summary: "no active session",
-      })
-    ) {
-      return;
-    }
-
-    if (globalFlags.format === "quiet") {
-      process.stdout.write("no-session\n");
-      return;
-    }
-
-    process.stdout.write(`session: -\n`);
-    process.stdout.write(`agent: ${agent.agentCommand}\n`);
-    process.stdout.write(`pid: -\n`);
-    process.stdout.write(`status: no-session\n`);
-    process.stdout.write(`uptime: -\n`);
-    process.stdout.write(`lastPromptTime: -\n`);
-    return;
-  }
-
-  const health = await probeQueueOwnerHealth(record.acpxRecordId);
-  const running = health.healthy;
-  const payload = {
-    sessionId: record.acpxRecordId,
-    agentCommand: record.agentCommand,
-    pid: health.pid ?? record.pid ?? null,
-    status: running ? "running" : "dead",
-    uptime: running ? (formatUptime(record.agentStartedAt) ?? null) : null,
-    lastPromptTime: record.lastPromptAt ?? null,
-    exitCode: running ? null : (record.lastAgentExitCode ?? null),
-    signal: running ? null : (record.lastAgentExitSignal ?? null),
-    ...agentSessionIdPayload(record.agentSessionId),
-  };
-
-  if (
-    emitJsonResult(globalFlags.format, {
-      action: "status_snapshot",
-      status: running ? "alive" : "dead",
-      pid: payload.pid ?? undefined,
-      summary: running ? "queue owner healthy" : "queue owner unavailable",
-      uptime: payload.uptime ?? undefined,
-      lastPromptTime: payload.lastPromptTime ?? undefined,
-      exitCode: payload.exitCode ?? undefined,
-      signal: payload.signal ?? undefined,
-      acpxRecordId: record.acpxRecordId,
-      acpxSessionId: record.acpSessionId,
-      agentSessionId: record.agentSessionId,
-    })
-  ) {
-    return;
-  }
-
-  if (globalFlags.format === "quiet") {
-    process.stdout.write(`${payload.status}\n`);
-    return;
-  }
-
-  process.stdout.write(`session: ${payload.sessionId}\n`);
-  if ("agentSessionId" in payload) {
-    process.stdout.write(`agentSessionId: ${payload.agentSessionId}\n`);
-  }
-  process.stdout.write(`agent: ${payload.agentCommand}\n`);
-  process.stdout.write(`pid: ${payload.pid ?? "-"}\n`);
-  process.stdout.write(`status: ${payload.status}\n`);
-  process.stdout.write(`uptime: ${payload.uptime ?? "-"}\n`);
-  process.stdout.write(`lastPromptTime: ${payload.lastPromptTime ?? "-"}\n`);
-  if (payload.status === "dead") {
-    process.stdout.write(`exitCode: ${payload.exitCode ?? "-"}\n`);
-    process.stdout.write(`signal: ${payload.signal ?? "-"}\n`);
-  }
-}
-
-async function handleConfigShow(command: Command, config: ResolvedAcpxConfig): Promise<void> {
-  const globalFlags = resolveGlobalFlags(command, config);
-  const payload = {
-    ...toConfigDisplay(config),
-    paths: {
-      global: config.globalPath,
-      project: config.projectPath,
-    },
-    loaded: {
-      global: config.hasGlobalConfig,
-      project: config.hasProjectConfig,
-    },
-  };
-
-  if (globalFlags.format === "json") {
-    process.stdout.write(`${JSON.stringify(payload)}\n`);
-    return;
-  }
-
-  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
-}
-
-async function handleConfigInit(command: Command, config: ResolvedAcpxConfig): Promise<void> {
-  const globalFlags = resolveGlobalFlags(command, config);
-  const result = await initGlobalConfigFile();
-  if (globalFlags.format === "json") {
-    process.stdout.write(
-      `${JSON.stringify({
-        path: result.path,
-        created: result.created,
-      })}\n`,
-    );
-    return;
-  }
-  if (globalFlags.format === "quiet") {
-    process.stdout.write(`${result.path}\n`);
-    return;
-  }
-
-  if (result.created) {
-    process.stdout.write(`Created ${result.path}\n`);
-    return;
-  }
-  process.stdout.write(`Config already exists: ${result.path}\n`);
-}
-
-function registerSessionsCommand(
-  parent: Command,
-  explicitAgentName: string | undefined,
-  config: ResolvedAcpxConfig,
-): void {
-  const sessionsCommand = parent
-    .command("sessions")
-    .description("List, ensure, create, or close sessions for this agent");
-
-  sessionsCommand.action(async function (this: Command) {
-    await handleSessionsList(explicitAgentName, this, config);
-  });
-
-  sessionsCommand
-    .command("list")
-    .description("List sessions")
-    .action(async function (this: Command) {
-      await handleSessionsList(explicitAgentName, this, config);
-    });
-
-  sessionsCommand
-    .command("new")
-    .description("Create a fresh session for current cwd")
-    .option("--name <name>", "Session name", parseSessionName)
-    .option("--resume-session <id>", "Resume existing ACP session id", (value: string) =>
-      parseNonEmptyValue("Resume session id", value),
-    )
-    .action(async function (this: Command, flags: SessionsNewFlags) {
-      await handleSessionsNew(explicitAgentName, flags, this, config);
-    });
-
-  sessionsCommand
-    .command("ensure")
-    .description("Ensure a session exists for current cwd or ancestor")
-    .option("--name <name>", "Session name", parseSessionName)
-    .option("--resume-session <id>", "Resume existing ACP session id", (value: string) =>
-      parseNonEmptyValue("Resume session id", value),
-    )
-    .action(async function (this: Command, flags: SessionsNewFlags) {
-      await handleSessionsEnsure(explicitAgentName, flags, this, config);
-    });
-
-  sessionsCommand
-    .command("close")
-    .description("Close session for current cwd")
-    .argument("[name]", "Session name", parseSessionName)
-    .action(async function (this: Command, name?: string) {
-      await handleSessionsClose(explicitAgentName, name, this, config);
-    });
-
-  sessionsCommand
-    .command("show")
-    .description("Show session metadata for current cwd")
-    .argument("[name]", "Session name", parseSessionName)
-    .action(async function (this: Command, name?: string) {
-      await handleSessionsShow(explicitAgentName, name, this, config);
-    });
-
-  sessionsCommand
-    .command("history")
-    .description("Show recent session history entries")
-    .argument("[name]", "Session name", parseSessionName)
-    .option(
-      "--limit <count>",
-      "Maximum number of entries to show (default: 20)",
-      parseHistoryLimit,
-      DEFAULT_HISTORY_LIMIT,
-    )
-    .action(async function (this: Command, name: string | undefined, flags: SessionsHistoryFlags) {
-      await handleSessionsHistory(explicitAgentName, name, flags, this, config);
-    });
-
-  sessionsCommand
-    .command("read")
-    .description("Read full session history")
-    .argument("[name]", "Session name", parseSessionName)
-    .option(
-      "--tail <count>",
-      "Show only the last N entries instead of all history",
-      parseHistoryLimit,
-    )
-    .action(async function (this: Command, name: string | undefined, flags: { tail?: number }) {
-      await handleSessionsHistory(
-        explicitAgentName,
-        name,
-        { limit: flags.tail ?? 0 },
-        this,
-        config,
-      );
-    });
-}
-
-async function handleSubagents(
-  explicitAgentName: string | undefined,
-  flags: StatusFlags,
-  command: Command,
-  config: ResolvedAcpxConfig,
-): Promise<void> {
-  const globalFlags = resolveGlobalFlags(command, config);
-  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const sessionName = resolveSessionNameFromFlags(flags, command);
-  const record = await findSession({
-    agentCommand: agent.agentCommand,
-    cwd: agent.cwd,
-    name: sessionName,
-    includeClosed: true,
-  });
-
-  if (!record) {
-    throw new Error(
-      sessionName
-        ? `No named session "${sessionName}" for cwd ${agent.cwd} and agent ${agent.agentName}`
-        : `No cwd session for ${agent.cwd} and agent ${agent.agentName}`,
-    );
-  }
-
-  type SubagentEntry = { acpxRecordId: string; name?: string; color?: string; spawnedAt: string };
-
-  // Use subagents from the parent record if present; fall back to index scan
-  let subagents: SubagentEntry[];
-  if (record.subagents && record.subagents.length > 0) {
-    subagents = record.subagents.map(
-      (s: SubagentRef): SubagentEntry => ({
-        acpxRecordId: s.acpxRecordId,
-        name: s.name,
-        color: s.color,
-        spawnedAt: s.spawnedAt,
-      }),
-    );
-  } else {
-    const subagentRecords = await listSubagentsForSession(record.acpxRecordId);
-    subagents = subagentRecords.map(
-      (sr: SessionRecord): SubagentEntry => ({
-        acpxRecordId: sr.acpxRecordId,
-        name: sr.name,
-        color: undefined,
-        spawnedAt: sr.createdAt,
-      }),
-    );
-  }
-
-  if (globalFlags.format === "json") {
-    process.stdout.write(
-      `${JSON.stringify({
-        action: "subagents_list",
-        parentAcpxRecordId: record.acpxRecordId,
-        count: subagents.length,
-        subagents,
-      })}\n`,
-    );
-    return;
-  }
-
-  if (globalFlags.format === "quiet") {
-    for (const s of subagents) {
-      process.stdout.write(`${s.acpxRecordId}\n`);
-    }
-    return;
-  }
-
-  if (subagents.length === 0) {
-    process.stdout.write(`No subagents for session ${record.acpxRecordId}\n`);
-    return;
-  }
-
-  process.stdout.write(`Subagents for session ${record.acpxRecordId}:\n`);
-  for (const s of subagents) {
-    process.stdout.write(
-      `  ${s.acpxRecordId}  name=${s.name ?? "-"}  color=${s.color ?? "-"}  spawnedAt=${s.spawnedAt}\n`,
-    );
-  }
-}
-
-type SharedSubcommandDescriptions = {
-  prompt: string;
-  exec: string;
-  cancel: string;
-  setMode: string;
-  setConfig: string;
-  status: string;
-};
-
-function registerSharedAgentSubcommands(
-  parent: Command,
-  explicitAgentName: string | undefined,
-  config: ResolvedAcpxConfig,
-  descriptions: SharedSubcommandDescriptions,
-): void {
-  const promptCommand = parent
-    .command("prompt")
-    .description(descriptions.prompt)
-    .argument("[prompt...]", "Prompt text")
-    .showHelpAfterError();
-  addSessionOption(promptCommand);
-  addPromptInputOption(promptCommand);
-  promptCommand.action(async function (this: Command, promptParts: string[], flags: PromptFlags) {
-    await handlePrompt(explicitAgentName, promptParts, flags, this, config);
-  });
-
-  const execCommand = parent
-    .command("exec")
-    .description(descriptions.exec)
-    .argument("[prompt...]", "Prompt text")
-    .showHelpAfterError();
-  addPromptInputOption(execCommand);
-  execCommand.action(async function (this: Command, promptParts: string[], flags: ExecFlags) {
-    await handleExec(explicitAgentName, promptParts, flags, this, config);
-  });
-
-  const cancelCommand = parent.command("cancel").description(descriptions.cancel);
-  addSessionNameOption(cancelCommand);
-  cancelCommand.action(async function (this: Command, flags: StatusFlags) {
-    await handleCancel(explicitAgentName, flags, this, config);
-  });
-
-  const setModeCommand = parent
-    .command("set-mode")
-    .description(descriptions.setMode)
-    .argument("<mode>", "Mode id", (value: string) => parseNonEmptyValue("Mode", value));
-  addSessionNameOption(setModeCommand);
-  setModeCommand.action(async function (this: Command, modeId: string, flags: StatusFlags) {
-    await handleSetMode(explicitAgentName, modeId, flags, this, config);
-  });
-
-  const setConfigCommand = parent
-    .command("set")
-    .description(descriptions.setConfig)
-    .argument("<key>", "Config option id", (value: string) =>
-      parseNonEmptyValue("Config option key", value),
-    )
-    .argument("<value>", "Config option value", (value: string) =>
-      parseNonEmptyValue("Config option value", value),
-    );
-  addSessionNameOption(setConfigCommand);
-  setConfigCommand.action(async function (
-    this: Command,
-    key: string,
-    value: string,
-    flags: StatusFlags,
-  ) {
-    await handleSetConfigOption(explicitAgentName, key, value, flags, this, config);
-  });
-
-  const statusCommand = parent.command("status").description(descriptions.status);
-  addSessionNameOption(statusCommand);
-  statusCommand.action(async function (this: Command, flags: StatusFlags) {
-    await handleStatus(explicitAgentName, flags, this, config);
-  });
-
-  const subagentsCommand = parent
-    .command("subagents")
-    .description("List subagents spawned by the current session");
-  addSessionNameOption(subagentsCommand);
-  subagentsCommand.action(async function (this: Command, flags: StatusFlags) {
-    await handleSubagents(explicitAgentName, flags, this, config);
-  });
-}
-
-function registerAgentCommand(
-  program: Command,
-  agentName: string,
-  config: ResolvedAcpxConfig,
-): void {
-  const agentCommand = program
-    .command(agentName)
-    .description(`Use ${agentName} agent`)
-    .argument("[prompt...]", "Prompt text")
-    .enablePositionalOptions()
-    .passThroughOptions()
-    .showHelpAfterError();
-
-  addSessionOption(agentCommand);
-  addPromptInputOption(agentCommand);
-  agentCommand.action(async function (this: Command, promptParts: string[], flags: PromptFlags) {
-    await handlePrompt(agentName, promptParts, flags, this, config);
-  });
-
-  registerSharedAgentSubcommands(agentCommand, agentName, config, {
-    prompt: "Prompt using persistent session",
-    exec: "One-shot prompt without saved session",
-    cancel: "Cooperatively cancel current in-flight prompt",
-    setMode: "Set session mode",
-    setConfig: "Set session config option",
-    status: "Show local status of current session agent process",
-  });
-
-  registerSessionsCommand(agentCommand, agentName, config);
-}
-
-function registerConfigCommand(program: Command, config: ResolvedAcpxConfig): void {
-  const configCommand = program
-    .command("config")
-    .description("Inspect and initialize acpx configuration");
-
-  configCommand
-    .command("show")
-    .description("Show resolved config")
-    .action(async function (this: Command) {
-      await handleConfigShow(this, config);
-    });
-
-  configCommand
-    .command("init")
-    .description("Create global config template")
-    .action(async function (this: Command) {
-      await handleConfigInit(this, config);
-    });
-
-  configCommand.action(async function (this: Command) {
-    await handleConfigShow(this, config);
-  });
-}
-
-function registerDefaultCommands(program: Command, config: ResolvedAcpxConfig): void {
-  registerSharedAgentSubcommands(program, undefined, config, {
-    prompt: `Prompt using ${config.defaultAgent} by default`,
-    exec: `One-shot prompt using ${config.defaultAgent} by default`,
-    cancel: `Cancel active prompt for ${config.defaultAgent} by default`,
-    setMode: `Set session mode for ${config.defaultAgent} by default`,
-    setConfig: `Set session config option for ${config.defaultAgent} by default`,
-    status: `Show local status for ${config.defaultAgent} by default`,
-  });
-
-  registerSessionsCommand(program, undefined, config);
-  registerConfigCommand(program, config);
 }
 
 type AgentTokenScan = {
@@ -1474,7 +122,8 @@ function detectAgentToken(argv: string[]): AgentTokenScan {
       token === "--approve-reads" ||
       token === "--deny-all" ||
       token === "--json-strict" ||
-      token === "--verbose"
+      token === "--verbose" ||
+      token === "--suppress-reads"
     ) {
       continue;
     }
@@ -1488,6 +137,7 @@ function detectAgentToken(argv: string[]): AgentTokenScan {
 function detectInitialCwd(argv: string[]): string {
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
+
     if (token === "--cwd") {
       const next = argv[index + 1];
       if (next && next !== "--") {
@@ -1495,6 +145,7 @@ function detectInitialCwd(argv: string[]): string {
       }
       break;
     }
+
     if (token.startsWith("--cwd=")) {
       const value = token.slice("--cwd=".length).trim();
       if (value.length > 0) {
@@ -1502,17 +153,21 @@ function detectInitialCwd(argv: string[]): string {
       }
       break;
     }
+
     if (token === "--") {
       break;
     }
   }
+
   return process.cwd();
 }
 
 function detectRequestedOutputFormat(argv: string[], fallback: OutputFormat): OutputFormat {
   let detectedFormat = fallback;
+
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
+
     if (token === "--") {
       break;
     }
@@ -1543,25 +198,25 @@ function detectRequestedOutputFormat(argv: string[], fallback: OutputFormat): Ou
 function detectJsonStrict(argv: string[]): boolean {
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
+
     if (token === "--") {
       break;
     }
-    if (token === "--json-strict") {
-      return true;
-    }
-    if (token.startsWith("--json-strict=")) {
+
+    if (token === "--json-strict" || token.startsWith("--json-strict=")) {
       return true;
     }
   }
+
   return false;
 }
 
 async function emitJsonErrorEvent(error: NormalizedOutputError): Promise<void> {
-  const { createOutputFormatter } = await loadOutputModule();
   const formatter = createOutputFormatter("json", {
     jsonContext: {
       sessionId: "unknown",
     },
+    suppressReads: false,
   });
   formatter.onError(error);
   formatter.flush();
@@ -1582,9 +237,13 @@ async function emitRequestedError(
   if (isOutputAlreadyEmitted(error)) {
     return;
   }
+
   if (outputPolicy.format === "json") {
     await emitJsonErrorEvent(normalized);
-  } else if (!outputPolicy.suppressNonJsonStderr) {
+    return;
+  }
+
+  if (!outputPolicy.suppressNonJsonStderr) {
     process.stderr.write(`${normalized.message}\n`);
   }
 }
@@ -1626,11 +285,14 @@ export async function main(argv: string[] = process.argv): Promise<void> {
     });
   }
 
-  const config = await loadResolvedConfig(detectInitialCwd(argv.slice(2)));
-  const requestedJsonStrict = detectJsonStrict(argv.slice(2));
-  const requestedOutputFormat = detectRequestedOutputFormat(argv.slice(2), config.format);
-  const requestedOutputPolicy = resolveOutputPolicy(requestedOutputFormat, requestedJsonStrict);
-  const builtInAgents = listBuiltInAgents(config.agents);
+  const rawArgs = argv.slice(2);
+  const config = await loadResolvedConfig(detectInitialCwd(rawArgs));
+  const requestedJsonStrict = detectJsonStrict(rawArgs);
+  const requestedOutputFormat = detectRequestedOutputFormat(rawArgs, config.format);
+  const requestedOutputPolicy = {
+    ...resolveOutputPolicy(requestedOutputFormat, requestedJsonStrict),
+    suppressReads: rawArgs.some((token) => token === "--suppress-reads"),
+  };
 
   const program = new Command();
   program
@@ -1653,65 +315,20 @@ export async function main(argv: string[] = process.argv): Promise<void> {
 
   addGlobalFlags(program);
 
-  for (const agentName of builtInAgents) {
-    registerAgentCommand(program, agentName, config);
-  }
-
-  registerDefaultCommands(program, config);
-
-  const scan = detectAgentToken(argv.slice(2));
-  if (
-    !scan.hasAgentOverride &&
-    scan.token &&
-    !TOP_LEVEL_VERBS.has(scan.token) &&
-    !builtInAgents.includes(scan.token)
-  ) {
-    registerAgentCommand(program, scan.token, config);
-  }
-
-  program.argument("[prompt...]", "Prompt text").action(async function (
-    this: Command,
-    promptParts: string[],
-  ) {
-    if (promptParts.length === 0 && process.stdin.isTTY) {
-      if (requestedJsonStrict) {
-        throw new InvalidArgumentError(
-          "Prompt is required (pass as argument, --file, or pipe via stdin)",
-        );
-      }
-      this.outputHelp();
-      return;
-    }
-
-    await handlePrompt(undefined, promptParts, {}, this, config);
+  configurePublicCli({
+    program,
+    argv: rawArgs,
+    config,
+    requestedJsonStrict,
+    topLevelVerbs: TOP_LEVEL_VERBS,
+    listBuiltInAgents,
+    detectAgentToken,
+    registerAgentCommand,
+    registerDefaultCommands,
+    handlePromptAction: async (command, promptParts) => {
+      await handlePrompt(undefined, promptParts, {}, command, config);
+    },
   });
-
-  program.addHelpText(
-    "after",
-    `
-Examples:
-  acpx pi "review recent changes"
-  acpx openclaw exec "summarize active session state"
-  acpx codex sessions new
-  acpx codex "fix the tests"
-  acpx codex prompt "fix the tests"
-  acpx codex --no-wait "queue follow-up task"
-  acpx codex exec "what does this repo do"
-  acpx codex cancel
-  acpx codex set-mode plan
-  acpx codex set thought_level high
-  acpx codex -s backend "fix the API"
-  acpx codex sessions
-  acpx codex sessions new --name backend
-  acpx codex sessions ensure --name backend
-  acpx codex sessions close backend
-  acpx codex status
-  acpx config show
-  acpx config init
-  acpx --ttl 30 codex "investigate flaky tests"
-  acpx claude "refactor auth"
-  acpx --agent ./my-custom-server "do something"`,
-  );
 
   program.exitOverride((error) => {
     throw error;
@@ -1726,6 +343,7 @@ Examples:
           if (error.code === "commander.helpDisplayed" || error.code === "commander.version") {
             process.exit(EXIT_CODES.SUCCESS);
           }
+
           const normalized = normalizeOutputError(error, {
             defaultCode: "USAGE",
             origin: "cli",

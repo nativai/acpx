@@ -15,7 +15,7 @@ import {
   parseMaxTurns,
   parseTtlSeconds,
 } from "../src/cli.js";
-import { serializeSessionRecordForDisk } from "../src/session-persistence.js";
+import { serializeSessionRecordForDisk } from "../src/session/persistence.js";
 import type { SessionRecord } from "../src/types.js";
 import {
   cleanupOwnerArtifacts,
@@ -214,6 +214,8 @@ test("global passthrough flags are present in help output", async () => {
     assert.match(result.stdout, /--model <id>/);
     assert.match(result.stdout, /--allowed-tools <list>/);
     assert.match(result.stdout, /--max-turns <count>/);
+    assert.match(result.stdout, /text, json, quiet/);
+    assert.match(result.stdout, /--suppress-reads/);
   });
 });
 
@@ -238,6 +240,20 @@ test("sessions new command is present in help output", async () => {
     assert.equal(readHelp.code, 0, readHelp.stderr);
     assert.match(readHelp.stdout, /--tail <count>/);
     assert.match(ensureHelp.stdout, /--resume-session <id>/);
+  });
+});
+
+test("flow run command is present in help output", async () => {
+  await withTempHome(async (homeDir) => {
+    const flowHelp = await runCli(["flow", "--help"], homeDir);
+    assert.equal(flowHelp.code, 0, flowHelp.stderr);
+    assert.match(flowHelp.stdout, /\brun\b/);
+
+    const runHelp = await runCli(["flow", "run", "--help"], homeDir);
+    assert.equal(runHelp.code, 0, runHelp.stderr);
+    assert.match(runHelp.stdout, /--input-json <json>/);
+    assert.match(runHelp.stdout, /--input-file <path>/);
+    assert.match(runHelp.stdout, /--default-agent <name>/);
   });
 });
 
@@ -817,6 +833,53 @@ test("codex thought_level aliases to reasoning_effort", async () => {
     );
     assert.equal(reasoningEffort?.currentValue, "high");
     assert.equal(reasoningEffort?.category, "thought_level");
+  });
+});
+
+test("codex set model passes the requested model through unchanged", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          agents: {
+            codex: {
+              command: MOCK_AGENT_COMMAND,
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    const sessionId = "codex-model-alias";
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: sessionId,
+      acpSessionId: sessionId,
+      agentCommand: MOCK_AGENT_COMMAND,
+      cwd,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:00:00.000Z",
+      closed: false,
+    });
+
+    const result = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "set", "model", "GPT-5-2"],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+
+    const payload = JSON.parse(result.stdout.trim()) as {
+      action?: string;
+      modelId?: string;
+    };
+    assert.equal(payload.action, "model_set");
+    assert.equal(payload.modelId, "GPT-5-2");
   });
 });
 

@@ -23,6 +23,7 @@ Global options apply to all commands.
 acpx [global_options] [prompt_text...]
 acpx [global_options] prompt [prompt_options] [prompt_text...]
 acpx [global_options] exec [prompt_options] [prompt_text...]
+acpx [global_options] flow run <file> [--input-json <json> | --input-file <path>] [--default-agent <name>]
 acpx [global_options] cancel [-s <name>]
 acpx [global_options] set-mode <mode> [-s <name>]
 acpx [global_options] set <key> <value> [-s <name>]
@@ -59,27 +60,63 @@ Prompt options:
 Notes:
 
 - Top-level `prompt`, `exec`, `cancel`, `set-mode`, `set`, `sessions`, and bare `acpx <prompt>` default to `codex`.
+- Top-level `flow run <file>` executes a user-authored workflow module and persists run state under `~/.acpx/flows/runs/`.
 - If a prompt argument is omitted, `acpx` reads prompt text from stdin when piped.
 - `--file` works for implicit prompt, `prompt`, and `exec` commands.
 - `acpx` with no args in an interactive terminal shows help.
+
+## `flow run` subcommand
+
+```bash
+acpx [global_options] flow run <file> [--input-json <json> | --input-file <path>] [--default-agent <name>]
+```
+
+- Runs a user-authored workflow module step by step through the `acpx/flows` runtime.
+- Persists run artifacts under `~/.acpx/flows/runs/<runId>/`.
+- Reuses one implicit main ACP session by default for non-isolated `acp` nodes.
+- `acp` nodes may override their working directory per step, which lets flows prepare an isolated workspace with an action node and then keep the agent session inside that cwd.
+- `acp` and `action` nodes use the global `--timeout` value as their default step timeout. If `--timeout` is omitted, flows default to 15 minutes per active step.
+- Flows may declare permission requirements. If a flow requires an explicit grant such as `approve-all`, `acpx` fails fast before starting the flow and tells you which permission flag to pass.
+- `--input-json` passes flow input inline as JSON.
+- `--input-file` reads flow input JSON from disk.
+- `--default-agent` supplies the default agent profile for `acp` nodes that do not pin one.
+- The file is always provided by the caller at runtime. `acpx` does not require any built-in flow registry.
+- The source repo includes example flow files under `examples/flows/`, including a larger PR-triage example under `examples/flows/pr-triage/`.
+
+Example invocations:
+
+```bash
+acpx flow run ./my-flow.ts --input-file ./flow-input.json
+
+acpx flow run examples/flows/branch.flow.ts \
+  --input-json '{"task":"FIX: add a regression test for the reconnect bug"}'
+
+acpx --approve-all flow run examples/flows/pr-triage/pr-triage.flow.ts \
+  --input-json '{"repo":"openclaw/acpx","prNumber":150}'
+```
+
+The PR-triage example is only an example workflow. It can post GitHub comments
+or close a PR if you run it against a live repository.
 
 ## Global options
 
 All global options:
 
-| Option                                   | Description                                    | Details                                                             |
-| ---------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------- |
-| `--agent <command>`                      | Raw ACP agent command (escape hatch)           | Do not combine with positional agent token.                         |
-| `--cwd <dir>`                            | Working directory                              | Defaults to current directory. Stored as absolute path for scoping. |
-| `--approve-all`                          | Auto-approve all permissions                   | Permission mode `approve-all`.                                      |
-| `--approve-reads`                        | Auto-approve reads/searches, prompt for others | Default permission mode.                                            |
-| `--deny-all`                             | Deny all permissions                           | Permission mode `deny-all`.                                         |
-| `--format <fmt>`                         | Output format                                  | `text` (default), `json`, `quiet`.                                  |
-| `--json-strict`                          | Strict JSON mode                               | Requires `--format json`; suppresses non-JSON stderr output.        |
-| `--non-interactive-permissions <policy>` | Non-TTY prompt policy                          | `deny` (default) or `fail` when approval prompt cannot be shown.    |
-| `--timeout <seconds>`                    | Max wait time for agent response               | Must be positive. Decimal seconds allowed.                          |
-| `--ttl <seconds>`                        | Queue owner idle TTL before shutdown           | Default `300`. `0` disables TTL.                                    |
-| `--verbose`                              | Enable verbose logs                            | Prints ACP/debug details to stderr.                                 |
+| Option                                   | Description                                    | Details                                                                                                                                                         |
+| ---------------------------------------- | ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--agent <command>`                      | Raw ACP agent command (escape hatch)           | Do not combine with positional agent token.                                                                                                                     |
+| `--cwd <dir>`                            | Working directory                              | Defaults to current directory. Stored as absolute path for scoping.                                                                                             |
+| `--approve-all`                          | Auto-approve all permissions                   | Permission mode `approve-all`.                                                                                                                                  |
+| `--approve-reads`                        | Auto-approve reads/searches, prompt for others | Default permission mode.                                                                                                                                        |
+| `--deny-all`                             | Deny all permissions                           | Permission mode `deny-all`.                                                                                                                                     |
+| `--format <fmt>`                         | Output format                                  | `text` (default), `json`, `quiet`.                                                                                                                              |
+| `--suppress-reads`                       | Suppress read file contents                    | Replaces raw read payloads with `[read output suppressed]`.                                                                                                     |
+| `--json-strict`                          | Strict JSON mode                               | Requires `--format json`; suppresses non-JSON stderr output.                                                                                                    |
+| `--non-interactive-permissions <policy>` | Non-TTY prompt policy                          | `deny` (default) or `fail` when approval prompt cannot be shown.                                                                                                |
+| `--timeout <seconds>`                    | Max wait time for agent response               | Must be positive. Decimal seconds allowed.                                                                                                                      |
+| `--ttl <seconds>`                        | Queue owner idle TTL before shutdown           | Default `300`. `0` disables TTL.                                                                                                                                |
+| `--model <id>`                           | Set agent model                                | Passed through to agent-specific session creation metadata when applicable; if the agent advertises models, `acpx` also applies it via ACP `session/set_model`. |
+| `--verbose`                              | Enable verbose logs                            | Prints ACP/debug details to stderr.                                                                                                                             |
 
 Permission flags are mutually exclusive. Using more than one of `--approve-all`, `--approve-reads`, `--deny-all` is a usage error.
 
@@ -157,7 +194,7 @@ acpx [global_options] claude exec [prompt_text...]
 acpx [global_options] claude sessions [list | new [--name <name>] | ensure [--name <name>] | close [name]]
 ```
 
-Built-in command mapping: `claude -> npx -y @zed-industries/claude-agent-acp`
+Built-in command mapping: `claude -> npx -y @agentclientprotocol/claude-agent-acp`
 
 Additional built-in agent docs live in [../agents/README.md](../agents/README.md).
 
@@ -251,6 +288,7 @@ Behavior:
 - Calls ACP `session/set_config_option`.
 - Routes through queue-owner IPC when an owner is active.
 - Falls back to a direct client reconnect when no owner is running.
+- **`set model <id>`**: Intercepted to call `session/set_model` instead. Some agents support `session/set_model` but not `session/set_config_option` for model changes; routing through the dedicated method ensures broad compatibility.
 
 ## `sessions` subcommand
 
@@ -423,6 +461,12 @@ When a prompt is already in flight for a session, `acpx` uses a per-session queu
 - `text`: assistant text, tool status blocks, client-operation logs, plan updates, and `[done] <reason>`
 - `json`: one raw ACP JSON-RPC message per line
 - `quiet`: concatenated assistant text only
+
+When `--suppress-reads` is enabled:
+
+- `text`: read-like tool outputs render as `[read output suppressed]`
+- `json`: ACP `fs/read_text_file` responses and read-like tool-call outputs replace raw file contents with `[read output suppressed]`
+- `quiet`: unchanged, because quiet mode only prints assistant text
 
 ACP message examples:
 

@@ -19,8 +19,11 @@ import {
   type SessionId,
   type SetSessionConfigOptionRequest,
   type SetSessionConfigOptionResponse,
+  type SetSessionModelRequest,
+  type SetSessionModelResponse,
   type SetSessionModeRequest,
   type SetSessionModeResponse,
+  type SessionModelState,
 } from "@agentclientprotocol/sdk";
 
 type ParsedCommand = {
@@ -38,6 +41,9 @@ type MockAgentOptions = {
   setSessionModeFails: boolean;
   setSessionModeInvalidParams: boolean;
   setSessionConfigInvalidParams: boolean;
+  setSessionModelFails: boolean;
+  setSessionModelInvalidParams: boolean;
+  advertiseModels: boolean;
   replayLoadSessionUpdates: boolean;
   loadReplayText: string;
   ignoreSigterm: boolean;
@@ -47,7 +53,9 @@ type SessionState = {
   pendingPrompt?: AbortController;
   hasCompletedPrompt: boolean;
   modeId: string;
-  configValues: Record<string, string>;
+  configValues: Record<string, string | boolean>;
+  transientPromptAttempts: Record<string, number>;
+  modelId: string;
 };
 
 class CancelledError extends Error {
@@ -293,6 +301,9 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let setSessionModeFails = false;
   let setSessionModeInvalidParams = false;
   let setSessionConfigInvalidParams = false;
+  let setSessionModelFails = false;
+  let setSessionModelInvalidParams = false;
+  let advertiseModels = false;
   let replayLoadSessionUpdates = false;
   let loadReplayText = "replayed load session update";
   let ignoreSigterm = false;
@@ -330,6 +341,23 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
 
     if (token === "--set-session-config-invalid-params") {
       setSessionConfigInvalidParams = true;
+      continue;
+    }
+
+    if (token === "--set-session-model-fails") {
+      setSessionModelFails = true;
+      advertiseModels = true;
+      continue;
+    }
+
+    if (token === "--set-session-model-invalid-params") {
+      setSessionModelInvalidParams = true;
+      advertiseModels = true;
+      continue;
+    }
+
+    if (token === "--advertise-models") {
+      advertiseModels = true;
       continue;
     }
 
@@ -385,9 +413,22 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     setSessionModeFails,
     setSessionModeInvalidParams,
     setSessionConfigInvalidParams,
+    setSessionModelFails,
+    setSessionModelInvalidParams,
+    advertiseModels,
     replayLoadSessionUpdates,
     loadReplayText,
     ignoreSigterm,
+  };
+}
+
+const DEFAULT_MODEL_ID = "default-model";
+const AVAILABLE_MODELS = ["default-model", "fast-model", "smart-model"];
+
+function buildModelsState(currentModelId: string): SessionModelState {
+  return {
+    currentModelId,
+    availableModels: AVAILABLE_MODELS.map((id) => ({ modelId: id, name: id })),
   };
 }
 
@@ -395,13 +436,20 @@ function createSessionState(hasCompletedPrompt = false): SessionState {
   return {
     hasCompletedPrompt,
     modeId: "auto",
+    modelId: DEFAULT_MODEL_ID,
     configValues: {
       reasoning_effort: "medium",
     },
+    transientPromptAttempts: {},
   };
 }
 
 function buildConfigOptions(state: SessionState): SetSessionConfigOptionResponse["configOptions"] {
+  const reasoningEffort =
+    typeof state.configValues.reasoning_effort === "string"
+      ? state.configValues.reasoning_effort
+      : "medium";
+
   return [
     {
       id: "mode",
@@ -418,11 +466,23 @@ function buildConfigOptions(state: SessionState): SetSessionConfigOptionResponse
       ],
     },
     {
+      id: "model",
+      name: "Model",
+      category: "model",
+      type: "select",
+      currentValue: state.modelId,
+      options: [
+        { value: "default", name: "Default" },
+        { value: "gpt-5.4", name: "gpt-5.4" },
+        { value: "gpt-5.2", name: "gpt-5.2" },
+      ],
+    },
+    {
       id: "reasoning_effort",
       name: "Reasoning Effort",
       category: "thought_level",
       type: "select",
-      currentValue: state.configValues.reasoning_effort ?? "medium",
+      currentValue: reasoningEffort,
       options: [
         { value: "low", name: "Low" },
         { value: "medium", name: "Medium" },
@@ -463,14 +523,17 @@ class MockAgent implements Agent {
     const sessionId = randomUUID();
     this.sessions.set(sessionId, createSessionState(false));
 
+    const response: NewSessionResponse = { sessionId };
+
     if (this.options.newSessionMeta) {
-      return {
-        sessionId,
-        _meta: { ...this.options.newSessionMeta },
-      };
+      response._meta = { ...this.options.newSessionMeta };
     }
 
-    return { sessionId };
+    if (this.options.advertiseModels) {
+      response.models = buildModelsState(DEFAULT_MODEL_ID);
+    }
+
+    return response;
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
@@ -503,13 +566,18 @@ class MockAgent implements Agent {
       await this.sendAssistantMessage(params.sessionId, this.options.loadReplayText);
     }
 
+    const response: LoadSessionResponse = {};
+
     if (this.options.loadSessionMeta) {
-      return {
-        _meta: { ...this.options.loadSessionMeta },
-      };
+      response._meta = { ...this.options.loadSessionMeta };
     }
 
-    return {};
+    if (this.options.advertiseModels) {
+      const session = this.sessions.get(params.sessionId);
+      response.models = buildModelsState(session?.modelId ?? DEFAULT_MODEL_ID);
+    }
+
+    return response;
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
@@ -521,9 +589,54 @@ class MockAgent implements Agent {
     session.pendingPrompt?.abort();
     const promptAbort = new AbortController();
     session.pendingPrompt = promptAbort;
+    const text = getPromptText(params.prompt);
+
+    if (text === "partial-retryable-error") {
+      try {
+        await this.sendAssistantMessage(params.sessionId, "partial update");
+        const error = new Error("Internal error") as Error & {
+          code: number;
+          data: {
+            details: string;
+          };
+        };
+        error.code = -32603;
+        error.data = {
+          details: "transient failure after partial output",
+        };
+        throw error;
+      } finally {
+        if (session.pendingPrompt === promptAbort) {
+          session.pendingPrompt = undefined;
+        }
+      }
+    }
+
+    if (text === "retryable-error-once") {
+      const attempts = session.transientPromptAttempts[text] ?? 0;
+      session.transientPromptAttempts[text] = attempts + 1;
+      if (attempts === 0) {
+        try {
+          const error = new Error("Internal error") as Error & {
+            code: number;
+            data: {
+              details: string;
+            };
+          };
+          error.code = -32603;
+          error.data = {
+            details: "transient failure before output",
+          };
+          throw error;
+        } finally {
+          if (session.pendingPrompt === promptAbort) {
+            session.pendingPrompt = undefined;
+          }
+        }
+      }
+    }
 
     try {
-      const text = getPromptText(params.prompt);
       const response =
         text === "inspect-prompt"
           ? describePromptBlocks(params.prompt)
@@ -573,6 +686,30 @@ class MockAgent implements Agent {
     return {};
   }
 
+  async unstable_setSessionModel(params: SetSessionModelRequest): Promise<SetSessionModelResponse> {
+    const session = this.ensureSession(params.sessionId);
+    if (this.options.setSessionModelInvalidParams) {
+      const error = new Error("Invalid params") as Error & {
+        code: number;
+        data: {
+          method: string;
+          modelId: string;
+        };
+      };
+      error.code = -32602;
+      error.data = {
+        method: "session/set_model",
+        modelId: params.modelId,
+      };
+      throw error;
+    }
+    if (this.options.setSessionModelFails) {
+      throw new Error("setSessionModel failed");
+    }
+    session.modelId = params.modelId;
+    return {};
+  }
+
   async setSessionConfigOption(
     params: SetSessionConfigOptionRequest,
   ): Promise<SetSessionConfigOptionResponse> {
@@ -583,7 +720,7 @@ class MockAgent implements Agent {
         data: {
           method: string;
           configId: string;
-          value: string;
+          value: string | boolean;
         };
       };
       error.code = -32602;
@@ -594,7 +731,7 @@ class MockAgent implements Agent {
       };
       throw error;
     }
-    if (params.configId === "mode") {
+    if (params.configId === "mode" && typeof params.value === "string") {
       session.modeId = params.value;
     } else {
       session.configValues[params.configId] = params.value;
@@ -640,6 +777,9 @@ class MockAgent implements Agent {
     if (text === "echo") {
       return "";
     }
+    if (text === "retryable-error-once") {
+      return "recovered after retry";
+    }
 
     if (text.startsWith("read ")) {
       const filePath = text.slice("read ".length).trim();
@@ -652,6 +792,52 @@ class MockAgent implements Agent {
         path: filePath,
       });
       return readResult.content;
+    }
+
+    if (text.startsWith("read-tool ")) {
+      const filePath = text.slice("read-tool ".length).trim();
+      if (!filePath) {
+        throw new Error("Usage: read-tool <path>");
+      }
+
+      const toolCallId = randomUUID();
+      await this.connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId,
+          title: "Read",
+          kind: "read",
+          status: "in_progress",
+          rawInput: {
+            filePath,
+          },
+        },
+      });
+
+      const readResult = await this.connection.readTextFile({
+        sessionId,
+        path: filePath,
+      });
+
+      await this.connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId,
+          title: "Read",
+          kind: "read",
+          status: "completed",
+          rawInput: {
+            filePath,
+          },
+          rawOutput: {
+            content: readResult.content,
+          },
+        },
+      });
+
+      return `read complete: ${filePath}`;
     }
 
     if (text.startsWith("write ")) {
@@ -696,6 +882,21 @@ class MockAgent implements Agent {
 
       await sleepWithCancel(Math.round(ms), signal);
       return `slept ${Math.round(ms)}ms`;
+    }
+
+    if (text.startsWith("disconnect ")) {
+      const rawMs = text.slice("disconnect ".length).trim();
+      if (!rawMs) {
+        throw new Error("Usage: disconnect <milliseconds>");
+      }
+
+      const ms = Number(rawMs);
+      if (!Number.isFinite(ms) || ms < 0) {
+        throw new Error("Usage: disconnect <milliseconds>");
+      }
+
+      await sleepWithCancel(Math.round(ms), signal);
+      process.exit(91);
     }
 
     if (text.startsWith("kill-terminal ")) {

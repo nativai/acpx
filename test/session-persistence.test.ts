@@ -5,12 +5,12 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { serializeSessionRecordForDisk } from "../src/session-persistence.js";
+import { serializeSessionRecordForDisk } from "../src/session/persistence.js";
 import type { SessionRecord } from "../src/types.js";
 
-type SessionModule = typeof import("../src/session.js");
+type SessionModule = typeof import("../src/session/session.js");
 
-const SESSION_MODULE_URL = new URL("../src/session.js", import.meta.url);
+const SESSION_MODULE_URL = new URL("../src/session/session.js", import.meta.url);
 
 test("SessionRecord allows optional closed and closedAt fields", () => {
   const record = makeSessionRecord({
@@ -46,6 +46,64 @@ test("listSessions preserves acpx desired_mode_id", async () => {
     const record = sessions.find((entry) => entry.acpxRecordId === "desired-mode");
     assert.ok(record);
     assert.equal(record.acpx?.desired_mode_id, "plan");
+  });
+});
+
+test("listSessions preserves acpx reset_on_next_ensure", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "reset-on-next-ensure",
+        acpSessionId: "reset-on-next-ensure",
+        agentCommand: "agent-a",
+        cwd,
+        acpx: {
+          reset_on_next_ensure: true,
+        },
+      }),
+    );
+
+    const sessions = await session.listSessions();
+    const record = sessions.find((entry) => entry.acpxRecordId === "reset-on-next-ensure");
+    assert.ok(record);
+    assert.equal(record.acpx?.reset_on_next_ensure, true);
+  });
+});
+
+test("listSessions preserves acpx session_options", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "session-options",
+        acpSessionId: "session-options",
+        agentCommand: "agent-a",
+        cwd,
+        acpx: {
+          session_options: {
+            model: "sonnet",
+            allowed_tools: ["Read", "Grep"],
+            max_turns: 7,
+          },
+        },
+      }),
+    );
+
+    const sessions = await session.listSessions();
+    const record = sessions.find((entry) => entry.acpxRecordId === "session-options");
+    assert.ok(record);
+    assert.deepEqual(record.acpx?.session_options, {
+      model: "sonnet",
+      allowed_tools: ["Read", "Grep"],
+      max_turns: 7,
+    });
   });
 });
 

@@ -5,8 +5,7 @@ import {
   DEFAULT_AGENT_NAME,
   resolveAgentCommand as resolveAgentCommandFromRegistry,
 } from "../agent-registry.js";
-import type { ResolvedAcpxConfig } from "../config.js";
-import { DEFAULT_QUEUE_OWNER_TTL_MS } from "../session.js";
+import { DEFAULT_QUEUE_OWNER_TTL_MS } from "../session/session.js";
 import {
   AUTH_POLICIES,
   NON_INTERACTIVE_PERMISSION_POLICIES,
@@ -17,6 +16,7 @@ import {
   type OutputPolicy,
   type PermissionMode,
 } from "../types.js";
+import type { ResolvedAcpxConfig } from "./config.js";
 
 export type PermissionFlags = {
   approveAll?: boolean;
@@ -24,12 +24,17 @@ export type PermissionFlags = {
   denyAll?: boolean;
 };
 
+export function hasExplicitPermissionModeFlag(flags: PermissionFlags): boolean {
+  return flags.approveAll === true || flags.approveReads === true || flags.denyAll === true;
+}
+
 export type GlobalFlags = PermissionFlags & {
   agent?: string;
   cwd: string;
   authPolicy?: AuthPolicy;
   nonInteractivePermissions: NonInteractivePermissionPolicy;
   jsonStrict?: boolean;
+  suppressReads?: boolean;
   timeout?: number;
   ttl: number;
   verbose?: boolean;
@@ -37,6 +42,7 @@ export type GlobalFlags = PermissionFlags & {
   model?: string;
   allowedTools?: string[];
   maxTurns?: number;
+  promptRetries?: number;
 };
 
 export type PromptFlags = {
@@ -153,6 +159,14 @@ export function parseMaxTurns(value: string): number {
   return parsed;
 }
 
+export function parsePromptRetries(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new InvalidArgumentError("Prompt retries must be a non-negative integer");
+  }
+  return parsed;
+}
+
 export function resolvePermissionMode(
   flags: PermissionFlags,
   defaultMode: PermissionMode,
@@ -167,6 +181,9 @@ export function resolvePermissionMode(
 
   if (flags.approveAll) {
     return "approve-all";
+  }
+  if (flags.approveReads) {
+    return "approve-reads";
   }
   if (flags.denyAll) {
     return "deny-all";
@@ -193,6 +210,7 @@ export function addGlobalFlags(command: Command): Command {
       parseNonInteractivePermissionPolicy,
     )
     .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
+    .option("--suppress-reads", "Suppress raw read-file contents in output")
     .option("--model <id>", "Agent model id")
     .option(
       "--allowed-tools <list>",
@@ -200,6 +218,11 @@ export function addGlobalFlags(command: Command): Command {
       parseAllowedTools,
     )
     .option("--max-turns <count>", "Maximum turns for the session", parseMaxTurns)
+    .option(
+      "--prompt-retries <count>",
+      "Retry failed prompt turns on transient errors (default: 0)",
+      parsePromptRetries,
+    )
     .option(
       "--json-strict",
       "Strict JSON mode: requires --format json and suppresses non-JSON stderr output",
@@ -278,6 +301,7 @@ export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig)
     authPolicy: opts.authPolicy ?? config.authPolicy,
     nonInteractivePermissions: opts.nonInteractivePermissions ?? config.nonInteractivePermissions,
     jsonStrict,
+    suppressReads: opts.suppressReads === true,
     timeout: opts.timeout ?? config.timeoutMs,
     ttl: opts.ttl ?? config.ttlMs ?? DEFAULT_QUEUE_OWNER_TTL_MS,
     verbose,
@@ -285,6 +309,7 @@ export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig)
     model: typeof opts.model === "string" ? parseNonEmptyValue("Model", opts.model) : undefined,
     allowedTools: Array.isArray(opts.allowedTools) ? opts.allowedTools : undefined,
     maxTurns: typeof opts.maxTurns === "number" ? opts.maxTurns : undefined,
+    promptRetries: typeof opts.promptRetries === "number" ? opts.promptRetries : undefined,
     approveAll: opts.approveAll ? true : undefined,
     approveReads: opts.approveReads ? true : undefined,
     denyAll: opts.denyAll ? true : undefined,
@@ -295,6 +320,7 @@ export function resolveOutputPolicy(format: OutputFormat, jsonStrict: boolean): 
   return {
     format,
     jsonStrict,
+    suppressReads: false,
     suppressNonJsonStderr: jsonStrict,
     queueErrorAlreadyEmitted: format !== "quiet",
     suppressSdkConsoleErrors: jsonStrict,
