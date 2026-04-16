@@ -12,16 +12,6 @@ function serializeSubagentRef(ref: SubagentRef): Record<string, unknown> {
   };
 }
 
-function serializeSubagentRef(ref: SubagentRef): Record<string, unknown> {
-  return {
-    acpx_record_id: ref.acpxRecordId,
-    name: ref.name,
-    color: ref.color,
-    spawned_at: ref.spawnedAt,
-    claude_jsonl_path: ref.claudeJsonlPath,
-  };
-}
-
 export function serializeSessionRecordForDisk(record: SessionRecord): Record<string, unknown> {
   const canonical: SessionRecord = {
     ...record,
