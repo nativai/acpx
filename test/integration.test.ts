@@ -1285,7 +1285,14 @@ test("integration: perf metrics capture checkpoints queue-owner turns before own
         );
       });
       assert(queueOwnerRecord, "expected queue owner checkpoint record before owner exit");
-      assert.equal(readPerfTimingCount(queueOwnerRecord, "session.write_record"), 1);
+      // A queue-owner turn persists the session record at least once. With
+      // periodic-checkpoint crash-resistance, the count is now >= 1 rather
+      // than a fixed 1.
+      const writeRecordCount = readPerfTimingCount(queueOwnerRecord, "session.write_record");
+      assert.ok(
+        writeRecordCount != null && writeRecordCount >= 1,
+        `expected at least one session.write_record timing, got ${writeRecordCount}`,
+      );
 
       const status = await runCli([...baseAgentArgs(cwd), "--format", "json", "status"], homeDir);
       assert.equal(status.code, 0, status.stderr);

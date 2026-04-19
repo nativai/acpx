@@ -432,8 +432,26 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
 
   // Flush pending messages to the stream file every 500ms so external readers
   // (e.g. UI tools) can observe progress in real-time rather than only at turn end.
+  // We also checkpoint the session record to disk periodically — syncing the
+  // in-memory conversation onto the record — so that if the daemon is killed
+  // mid-turn, the reconciled `messages` array on disk is at most ~500ms stale
+  // rather than lost entirely (see fix-reconciliation-messages).
+  const periodicCheckpoint = async (): Promise<void> => {
+    try {
+      await flushPendingMessages(false);
+    } catch {
+      // best effort
+    }
+    try {
+      applyConversation(record, conversation);
+      record.acpx = acpxState;
+      await eventWriter.checkpoint();
+    } catch {
+      // best effort
+    }
+  };
   const streamFlushInterval = setInterval(() => {
-    void flushPendingMessages(false).catch(() => {});
+    void periodicCheckpoint();
   }, 500);
 
   // Extract claudeCode metadata from a raw ACP message (session/update notification)
@@ -608,6 +626,13 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
                 await writeSessionRecord(childRecord);
                 const parentRecord = eventWriter.getRecord();
                 parentRecord.subagents = [...(parentRecord.subagents ?? []), subagentRef];
+                // Sync the in-memory conversation onto the parent record before
+                // persisting. Without this the subagent-spawn checkpoint writes
+                // the record with stale/empty `messages`, which — if the daemon
+                // later dies before the end-of-turn flush — leaves the session
+                // JSON with subagent refs, last_seq set, but messages=[].
+                applyConversation(parentRecord, conversation);
+                parentRecord.acpx = acpxState;
                 await writeSessionRecord(parentRecord);
               } catch {
                 // best effort
