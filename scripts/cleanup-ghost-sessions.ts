@@ -21,6 +21,12 @@
  * A closed session with real data (`last_seq > 0` or `messages.length > 0`)
  * is still kept because the other criteria catch it.
  *
+ * Index pruning: the acpx-ui server reads sessions from `index.json`
+ * (the registry), not by scanning the directory. So deleting the JSON
+ * files alone isn't enough — the UI keeps showing phantoms. In --apply
+ * mode, this script also rewrites `index.json` to remove the entries
+ * for deleted sessions (atomic via tmp + rename).
+ *
  * Critical: some sessions have empty `messages` arrays in the JSON but
  * REAL conversation data in their NDJSON stream file. Those are a
  * separate bug (NDJSON reconciliation failure) and must NOT be touched.
@@ -423,6 +429,47 @@ function main(): void {
     console.log(`  Stream files deleted: ${deletedStreams}`);
     // eslint-disable-next-line no-console
     console.log(`  Lock files deleted:   ${deletedLocks}`);
+
+    // Prune index.json so the UI stops listing the deleted sessions.
+    // The server's GET /api/sessions iterates `index.entries`; a session
+    // whose JSON is gone but whose entry remains will still appear in the
+    // sidebar (as an `awaiting_input` phantom).
+    const indexPath = path.join(dir, "index.json");
+    const deletedFilenames = new Set(candidates.map((c) => c.filename));
+    if (fs.existsSync(indexPath) && deletedFilenames.size > 0) {
+      try {
+        const raw = fs.readFileSync(indexPath, "utf8");
+        const indexData = JSON.parse(raw) as {
+          schema?: string;
+          files?: string[];
+          entries?: { file?: string }[];
+        };
+        const beforeFiles = indexData.files?.length ?? 0;
+        const beforeEntries = indexData.entries?.length ?? 0;
+        if (Array.isArray(indexData.files)) {
+          indexData.files = indexData.files.filter((f) => !deletedFilenames.has(f));
+        }
+        if (Array.isArray(indexData.entries)) {
+          indexData.entries = indexData.entries.filter(
+            (e) => typeof e.file !== "string" || !deletedFilenames.has(e.file),
+          );
+        }
+        const afterFiles = indexData.files?.length ?? 0;
+        const afterEntries = indexData.entries?.length ?? 0;
+        const tmpPath = `${indexPath}.tmp-${process.pid}`;
+        fs.writeFileSync(tmpPath, JSON.stringify(indexData, null, 2), "utf8");
+        fs.renameSync(tmpPath, indexPath);
+        // eslint-disable-next-line no-console
+        console.log(
+          `  index.json pruned:    files ${beforeFiles} -> ${afterFiles}, entries ${beforeEntries} -> ${afterEntries}`,
+        );
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.log(`  index.json prune FAILED: ${(err as Error).message}`);
+        failures.push({ path: indexPath, error: (err as Error).message });
+      }
+    }
+
     if (failures.length > 0) {
       // eslint-disable-next-line no-console
       console.log(`  Failures:             ${failures.length}`);
