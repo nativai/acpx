@@ -8,6 +8,7 @@ import {
 } from "../../acp/error-normalization.js";
 import { InterruptedError, withInterrupt, withTimeout } from "../../async-control.js";
 import { tailClaudeSubagentJsonl } from "../../claude-jsonl.js";
+import { SessionClosedError } from "../../errors.js";
 export { InterruptedError, TimeoutError } from "../../async-control.js";
 import { formatPerfMetric, measurePerf, startPerfTimer } from "../../perf-metrics.js";
 import { textPrompt } from "../../prompt-content.js";
@@ -365,6 +366,16 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   const record = await measurePerf("session.resolve_prompt_record", async () => {
     return await resolveSessionRecord(options.sessionRecordId);
   });
+
+  // Fail-loud on send-to-closed. `closed` is user intent (UI-authored); once
+  // set, prompts are rejected until the user explicitly reopens the session
+  // (via `PATCH /api/sessions/:id/closed {closed:false}` in the UI, or the
+  // corresponding CLI surface). See DESIGN.md §4 "reopen question" for why
+  // we don't auto-reopen on a successful turn.
+  if (record.closed) {
+    throw new SessionClosedError(record.acpxRecordId, record.name ?? undefined);
+  }
+
   const conversation = cloneSessionConversation(record);
   let acpxState = cloneSessionAcpxState(record.acpx);
   const promptMessageId = recordPromptSubmission(conversation, options.prompt, isoNow());
@@ -871,8 +882,16 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
 
         const now = isoNow();
         record.lastUsedAt = now;
-        record.closed = false;
-        record.closedAt = undefined;
+        // NOTE: We intentionally do NOT touch `record.closed` / `record.closedAt` here.
+        // Under the session-lifecycle-state ownership model (see
+        // src/session/persistence/repository.ts docs + DESIGN.md), `closed` is
+        // UI-authored user intent. Silently re-opening a closed session on any
+        // successful turn violates that intent. The `runSessionPrompt` entry
+        // point already refuses to run against a closed record (throws
+        // SessionClosedError), so reaching this point means the session was
+        // open when the turn started and should remain open — which is the
+        // default already on disk. If a future lifecycle change needs to be
+        // written here, route it through writeSessionRecordWithLifecycle.
         record.protocolVersion = client.initializeResult?.protocolVersion;
         record.agentCapabilities = client.initializeResult?.agentCapabilities;
         applyConversation(record, conversation);

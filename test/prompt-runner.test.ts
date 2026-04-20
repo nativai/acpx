@@ -20,13 +20,15 @@ test("runSessionSetModeDirect resumes a load-capable session and closes the clie
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
 
+    // Seed an OPEN session. Under the session-lifecycle-ownership model
+    // (see DESIGN.md), runSessionSetModeDirect no longer silently reopens
+    // closed sessions — that is user intent and only flipped via explicit
+    // PATCH. Non-closed sessions work as before.
     const record = makeSessionRecord({
       acpxRecordId: "prompt-runner-resume",
       acpSessionId: "prompt-runner-resume-session",
       agentCommand: `node ${JSON.stringify(MOCK_AGENT_PATH)} --supports-load-session`,
       cwd,
-      closed: true,
-      closedAt: "2026-01-01T00:05:00.000Z",
     });
     await writeSessionRecord(homeDir, record);
 
@@ -65,6 +67,46 @@ test("runSessionSetModeDirect resumes a load-capable session and closes the clie
     assert.equal(persisted.closed, false);
     assert.equal(persisted.protocolVersion, 1);
     assert.equal(typeof persisted.lastUsedAt, "string");
+  });
+});
+
+test("runSessionSetModeDirect does NOT silently reopen a closed session (fail-loud ownership)", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "prompt-runner-stays-closed",
+      acpSessionId: "prompt-runner-stays-closed-session",
+      agentCommand: `node ${JSON.stringify(MOCK_AGENT_PATH)} --supports-load-session`,
+      cwd,
+      closed: true,
+      closedAt: "2026-01-01T00:05:00.000Z",
+    });
+    await writeSessionRecord(homeDir, record);
+
+    // The set-mode-direct path previously included `record.closed = false`
+    // side effects in the connect/resume helpers — those survive in the
+    // in-memory record returned by the operation, but the read-preserve
+    // mechanism in writeSessionRecord (see repository.ts) prevents those
+    // transient flips from persisting to disk. What lands on disk is the
+    // user's last explicit intent: `closed=true`.
+    await runSessionSetModeDirect({
+      sessionRecordId: record.acpxRecordId,
+      modeId: "review",
+      timeoutMs: 5_000,
+    }).catch(() => {
+      // The operation may fail because the session is closed from the
+      // mock-agent's perspective — we only care about what hit disk.
+    });
+
+    const persisted = await resolveSessionRecord(record.acpxRecordId);
+    assert.equal(
+      persisted.closed,
+      true,
+      "closed must remain true on disk even if connect-session.ts flipped it in-memory",
+    );
+    assert.equal(persisted.closedAt, "2026-01-01T00:05:00.000Z");
   });
 });
 

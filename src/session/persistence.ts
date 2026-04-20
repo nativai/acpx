@@ -13,4 +13,5 @@ export {
   normalizeName,
   resolveSessionRecord,
   writeSessionRecord,
+  writeSessionRecordWithLifecycle,
 } from "./persistence/repository.js";

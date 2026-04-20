@@ -5,7 +5,12 @@ import {
   setDesiredModeId,
   setDesiredModelId,
 } from "../../session/mode-preference.js";
-import { resolveSessionRecord, writeSessionRecord, isoNow } from "../../session/persistence.js";
+import {
+  resolveSessionRecord,
+  writeSessionRecord,
+  writeSessionRecordWithLifecycle,
+  isoNow,
+} from "../../session/persistence.js";
 import type {
   SessionRecord,
   SessionSetConfigOptionResult,
@@ -194,7 +199,10 @@ export async function closeSession(sessionId: string): Promise<SessionRecord> {
   record.pid = undefined;
   record.closed = true;
   record.closedAt = isoNow();
-  await writeSessionRecord(record);
+  // Privileged write: this is a daemon-authorized close — bypass the
+  // read-preserve-lifecycle step so `closed: true` actually lands on disk.
+  // See writeSessionRecord doc comment in repository.ts for the ownership rules.
+  await writeSessionRecordWithLifecycle(record);
 
   return record;
 }
