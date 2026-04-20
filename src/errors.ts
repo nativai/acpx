@@ -40,6 +40,25 @@ export class SessionNotFoundError extends AcpxOperationalError {
 
 export class SessionResolutionError extends AcpxOperationalError {}
 
+export class SessionClosedError extends AcpxOperationalError {
+  readonly sessionId: string;
+  readonly sessionName: string | undefined;
+
+  constructor(sessionId: string, sessionName: string | undefined) {
+    const label = sessionName ?? sessionId;
+    super(
+      `Session '${label}' is closed. Reopen with \`acpx sessions reopen <name>\` (or via the UI) before sending prompts.`,
+      {
+        outputCode: "RUNTIME",
+        detailCode: "SESSION_CLOSED",
+        origin: "runtime",
+      },
+    );
+    this.sessionId = sessionId;
+    this.sessionName = sessionName;
+  }
+}
+
 export class AgentSpawnError extends AcpxOperationalError {
   readonly agentCommand: string;
 

@@ -82,9 +82,76 @@ function matchesSessionEntry(
   return session.name === normalizedName;
 }
 
+/**
+ * Read the current on-disk <id>.json (if present) and return the persisted
+ * lifecycle fields (closed/closedAt). Returns undefined if the file is missing
+ * or unreadable — callers should treat that as "no prior state to preserve."
+ */
+async function readPersistedLifecycle(
+  acpxRecordId: string,
+): Promise<{ closed: boolean | undefined; closedAt: string | undefined } | undefined> {
+  try {
+    const payload = await fs.readFile(sessionFilePath(acpxRecordId), "utf8");
+    const parsed = parseSessionRecord(JSON.parse(payload));
+    if (!parsed) {
+      return undefined;
+    }
+    return { closed: parsed.closed, closedAt: parsed.closedAt };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Write a session record to `<id>.json` and update the index cache.
+ *
+ * ## Session-lifecycle-state ownership (see DESIGN.md)
+ *
+ * UI-authored lifecycle fields (`closed`, `closed_at`) are **read-preserved**
+ * on every daemon write: before serializing, we read the current on-disk
+ * `<id>.json` and overwrite the in-memory `record.closed` / `record.closedAt`
+ * with the on-disk values. This means a UI PATCH that flipped `closed=true`
+ * survives the next daemon checkpoint — the daemon can never silently revert
+ * user intent.
+ *
+ * The **one authorized daemon writer** of these fields is `closeSession`
+ * (and its privileged helper variants): it calls
+ * `writeSessionRecordWithLifecycle` to bypass the preserve step so it can
+ * write `closed: true` from the daemon side. Every other writer — periodic
+ * checkpoints, end-of-turn flushes, subagent updates — must use plain
+ * `writeSessionRecord` and will be transparent to lifecycle state.
+ *
+ * `toSessionIndexEntry` and `serializeSessionRecordForDisk` remain unchanged:
+ * they simply consume whatever `record.closed` is at call time, which is
+ * already the correct value because the preserve step ran first.
+ */
 export async function writeSessionRecord(record: SessionRecord): Promise<void> {
+  await writeSessionRecordInternal(record, { preserveLifecycle: true });
+}
+
+/**
+ * Privileged write path — bypasses the read-preserve-lifecycle step so the
+ * daemon's authorized closer (`closeSession`) can persist `closed: true` /
+ * `closed_at`. All other daemon paths must use plain `writeSessionRecord`.
+ */
+export async function writeSessionRecordWithLifecycle(record: SessionRecord): Promise<void> {
+  await writeSessionRecordInternal(record, { preserveLifecycle: false });
+}
+
+async function writeSessionRecordInternal(
+  record: SessionRecord,
+  options: { preserveLifecycle: boolean },
+): Promise<void> {
   await measurePerf("session.write_record", async () => {
     await ensureSessionDir();
+
+    if (options.preserveLifecycle) {
+      const persistedLifecycle = await readPersistedLifecycle(record.acpxRecordId);
+      if (persistedLifecycle) {
+        record.closed = persistedLifecycle.closed;
+        record.closedAt = persistedLifecycle.closedAt;
+      }
+    }
 
     const persisted = serializeSessionRecordForDisk(record);
     assertPersistedKeyPolicy(persisted);
@@ -330,9 +397,12 @@ export async function closeSession(id: string): Promise<SessionRecord> {
   record.lastUsedAt = now;
   record.lastPromptAt = record.lastPromptAt ?? now;
 
-  await writeSessionRecord(record);
+  // Privileged write: closeSession is the single daemon-authorized writer of
+  // lifecycle fields. See the writeSessionRecord doc comment for the rules.
+  await writeSessionRecordWithLifecycle(record);
 
-  // Also mark any subagents of this session as closed
+  // Also mark any subagents of this session as closed. Cascade is operational,
+  // not user-intent, and runs under the same privileged write path.
   if (record.subagents && record.subagents.length > 0) {
     for (const subagentRef of record.subagents) {
       try {
@@ -341,7 +411,7 @@ export async function closeSession(id: string): Promise<SessionRecord> {
           subagentRecord.closed = true;
           subagentRecord.closedAt = now;
           subagentRecord.lastUsedAt = now;
-          await writeSessionRecord(subagentRecord);
+          await writeSessionRecordWithLifecycle(subagentRecord);
         }
       } catch {
         // best effort
