@@ -116,7 +116,7 @@ export function createReplayLiveSyncServer(options: ReplayLiveSyncOptions): Repl
           sendMessage(client.socket, {
             type: "error",
             code: "protocol_error",
-            message: `Unsupported replay protocol: ${message.protocol}`,
+            message: "Unsupported replay protocol.",
           });
         }
         return;

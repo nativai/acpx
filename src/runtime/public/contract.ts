@@ -1,9 +1,17 @@
+import type { ToolCallContent, ToolCallLocation, ToolKind } from "@agentclientprotocol/sdk";
 import type {
+  AcpPermissionDecision,
+  AcpPermissionRequest,
   McpServer,
   NonInteractivePermissionPolicy,
   PermissionMode,
   SessionRecord,
 } from "../../types.js";
+import type { SessionAgentOptions } from "../engine/session-options.js";
+
+export type { SessionAgentOptions, SystemPromptOption } from "../engine/session-options.js";
+
+export type { AcpPermissionDecision, AcpPermissionRequest } from "../../types.js";
 
 export type AcpRuntimePromptMode = "prompt" | "steer";
 
@@ -40,6 +48,15 @@ export type AcpRuntimeEnsureInput = {
   mode: AcpRuntimeSessionMode;
   resumeSessionId?: string;
   cwd?: string;
+  /**
+   * Per-session agent options applied when a fresh ACP session is created.
+   * Threaded into `_meta.systemPrompt` (and `_meta.claudeCode.options.*`)
+   * on the underlying `session/new` request, and persisted onto the new
+   * record. Ignored when an existing persistent session is reused — system
+   * prompts are fixed at `newSession` time, so changing them requires a
+   * different sessionKey or closing the prior record first.
+   */
+  sessionOptions?: SessionAgentOptions;
 };
 
 export type AcpRuntimeTurnAttachment = {
@@ -62,11 +79,17 @@ export type AcpRuntimeCapabilities = {
   configOptionKeys?: string[];
 };
 
+export type AcpRuntimeSessionModels = {
+  currentModelId?: string;
+  availableModelIds: string[];
+};
+
 export type AcpRuntimeStatus = {
   summary?: string;
   acpxRecordId?: string;
   backendSessionId?: string;
   agentSessionId?: string;
+  models?: AcpRuntimeSessionModels;
   details?: Record<string, unknown>;
 };
 
@@ -99,20 +122,69 @@ export type AcpRuntimeEvent =
       toolCallId?: string;
       status?: string;
       title?: string;
+      kind?: ToolKind;
+      locations?: ToolCallLocation[];
+      rawInput?: unknown;
+      rawOutput?: unknown;
+      content?: ToolCallContent[];
     }
+  /**
+   * Compatibility terminal event emitted by runTurn(...). startTurn(...).events
+   * does not emit terminal events; use AcpRuntimeTurn.result instead.
+   */
   | {
       type: "done";
       stopReason?: string;
     }
+  /**
+   * Compatibility failure event emitted by runTurn(...). startTurn(...).events
+   * does not emit terminal events; use AcpRuntimeTurn.result instead.
+   */
   | {
       type: "error";
       message: string;
       code?: string;
+      detailCode?: string;
       retryable?: boolean;
     };
 
+export type AcpRuntimeTurnResultError = {
+  message: string;
+  code?: string;
+  detailCode?: string;
+  retryable?: boolean;
+};
+
+export type AcpRuntimeTurnResult =
+  | {
+      status: "completed";
+      stopReason?: string;
+    }
+  | {
+      status: "cancelled";
+      stopReason?: string;
+    }
+  | {
+      status: "failed";
+      error: AcpRuntimeTurnResultError;
+    };
+
+export interface AcpRuntimeTurn {
+  readonly requestId: string;
+  readonly events: AsyncIterable<AcpRuntimeEvent>;
+  readonly result: Promise<AcpRuntimeTurnResult>;
+  cancel(input?: { reason?: string }): Promise<void>;
+  closeStream(input?: { reason?: string }): Promise<void>;
+}
+
 export interface AcpRuntime {
   ensureSession(input: AcpRuntimeEnsureInput): Promise<AcpRuntimeHandle>;
+  startTurn(input: AcpRuntimeTurnInput): AcpRuntimeTurn;
+  /**
+   * Compatibility adapter for consumers that expect terminal status in the
+   * event stream. Prefer startTurn(...), which separates live events from the
+   * terminal result.
+   */
   runTurn(input: AcpRuntimeTurnInput): AsyncIterable<AcpRuntimeEvent>;
   getCapabilities?(input: {
     handle?: AcpRuntimeHandle;
@@ -151,6 +223,10 @@ export type AcpRuntimeOptions = {
   timeoutMs?: number;
   probeAgent?: string;
   verbose?: boolean;
+  onPermissionRequest?: (
+    req: AcpPermissionRequest,
+    ctx: { signal: AbortSignal },
+  ) => Promise<AcpPermissionDecision | undefined>;
 };
 
 export type AcpFileSessionStoreOptions = {

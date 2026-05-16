@@ -68,7 +68,7 @@ export async function withCapturedStderrWrites<T>(
   (process.stderr as unknown as { write: typeof process.stderr.write }).write = ((
     chunk: string,
   ) => {
-    writes.push(String(chunk));
+    writes.push(chunk);
     return true;
   }) as typeof process.stderr.write;
 

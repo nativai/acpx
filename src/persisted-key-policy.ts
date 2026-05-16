@@ -17,6 +17,7 @@ const MAP_OBJECT_PATHS = new Set(["request_token_usage", "messages.Agent.tool_re
 const OPAQUE_VALUE_PATHS = new Set([
   "agent_capabilities",
   "messages.Agent.content.ToolUse.input",
+  "acpx.desired_config_options",
   "acpx.config_options",
 ]);
 

@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {
   setCurrentModelId,
+  setDesiredConfigOption,
   setDesiredModeId,
   setDesiredModelId,
 } from "../../session/mode-preference.js";
@@ -22,6 +23,7 @@ import {
   terminateProcess,
   terminateQueueOwnerForSession,
   tryCancelOnRunningOwner,
+  tryCloseSessionOnRunningOwner,
   trySetConfigOptionOnRunningOwner,
   trySetModelOnRunningOwner,
   trySetModeOnRunningOwner,
@@ -75,6 +77,7 @@ export async function setSessionMode(
     nonInteractivePermissions: options.nonInteractivePermissions,
     authCredentials: options.authCredentials,
     authPolicy: options.authPolicy,
+    terminal: options.terminal,
     timeoutMs: options.timeoutMs,
     verbose: options.verbose,
   });
@@ -107,6 +110,7 @@ export async function setSessionModel(
     nonInteractivePermissions: options.nonInteractivePermissions,
     authCredentials: options.authCredentials,
     authPolicy: options.authPolicy,
+    terminal: options.terminal,
     timeoutMs: options.timeoutMs,
     verbose: options.verbose,
   });
@@ -126,8 +130,10 @@ export async function setSessionConfigOption(
     const record = await resolveSessionRecord(options.sessionId);
     if (options.configId === "mode") {
       setDesiredModeId(record, options.value);
-      await writeSessionRecord(record);
+    } else {
+      setDesiredConfigOption(record, options.configId, options.value);
     }
+    await writeSessionRecord(record);
     return {
       record,
       response: ownerResponse,
@@ -143,6 +149,7 @@ export async function setSessionConfigOption(
     nonInteractivePermissions: options.nonInteractivePermissions,
     authCredentials: options.authCredentials,
     authPolicy: options.authPolicy,
+    terminal: options.terminal,
     timeoutMs: options.timeoutMs,
     verbose: options.verbose,
   });
@@ -186,6 +193,9 @@ async function isLikelyMatchingProcess(pid: number, agentCommand: string): Promi
 
 export async function closeSession(sessionId: string): Promise<SessionRecord> {
   const record = await resolveSessionRecord(sessionId);
+  await tryCloseSessionOnRunningOwner({ sessionId: record.acpxRecordId }).catch(() => {
+    // Preserve local close semantics even if best-effort ACP session shutdown fails.
+  });
   await terminateQueueOwnerForSession(record.acpxRecordId);
 
   if (

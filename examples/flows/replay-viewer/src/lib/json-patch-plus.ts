@@ -1,8 +1,6 @@
 import fastJsonPatch from "fast-json-patch";
 import type { ReplayJsonPatchOperation } from "../types.js";
 
-const { applyPatch, compare } = fastJsonPatch;
-
 export function applyReplayPatch<TState extends object>(
   state: TState,
   ops: ReplayJsonPatchOperation[],
@@ -10,12 +8,13 @@ export function applyReplayPatch<TState extends object>(
   let nextDocument = structuredClone(state) as unknown;
 
   for (const op of ops) {
+    assertSafePatchOperation(op);
     if (op.op === "append") {
       applyAppendOperation(nextDocument, op.path, op.value);
       continue;
     }
 
-    nextDocument = applyPatch(nextDocument, [op], true, false).newDocument;
+    nextDocument = fastJsonPatch.applyPatch(nextDocument, [op], true, false).newDocument;
   }
 
   return nextDocument as TState;
@@ -25,13 +24,13 @@ export function createReplayPatch<TState extends object>(
   previousState: TState,
   nextState: TState,
 ): ReplayJsonPatchOperation[] {
-  const rawOps = compare(previousState, nextState) as ReplayJsonPatchOperation[];
+  const rawOps = fastJsonPatch.compare(previousState, nextState) as ReplayJsonPatchOperation[];
   if (rawOps.length === 0) {
     return rawOps;
   }
 
   const normalized: ReplayJsonPatchOperation[] = [];
-  let workingState = structuredClone(previousState) as TState;
+  let workingState = structuredClone(previousState);
 
   for (const op of rawOps) {
     const nextOp = normalizeReplayOperation(workingState, op);
@@ -42,8 +41,8 @@ export function createReplayPatch<TState extends object>(
   return normalized;
 }
 
-function normalizeReplayOperation<TState extends object>(
-  state: TState,
+function normalizeReplayOperation(
+  state: object,
   op: ReplayJsonPatchOperation,
 ): ReplayJsonPatchOperation {
   if (op.op === "replace") {
@@ -134,6 +133,7 @@ function getValueAtPointer(document: unknown, path: string): unknown {
     }
 
     if (current && typeof current === "object") {
+      assertSafeObjectKey(token, path);
       current = (current as Record<string, unknown>)[token];
       continue;
     }
@@ -167,7 +167,13 @@ function setValueAtPointer(document: unknown, path: string, value: unknown): voi
   if (!parent || typeof parent !== "object") {
     throw new Error(`Cannot set value at non-object parent for ${path}`);
   }
-  (parent as Record<string, unknown>)[lastToken] = value;
+  assertSafeObjectKey(lastToken, path);
+  Object.defineProperty(parent, lastToken, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true,
+  });
 }
 
 function resolveParentPointer(
@@ -181,7 +187,7 @@ function resolveParentPointer(
 
   let current = document;
   for (let index = 0; index < tokens.length - 1; index += 1) {
-    const token = tokens[index]!;
+    const token = tokens[index];
     if (Array.isArray(current)) {
       const arrayIndex = Number(token);
       if (!Number.isInteger(arrayIndex)) {
@@ -193,6 +199,7 @@ function resolveParentPointer(
     if (!current || typeof current !== "object") {
       throw new Error(`Invalid JSON Pointer parent for ${path}`);
     }
+    assertSafeObjectKey(token, path);
     current = (current as Record<string, unknown>)[token];
   }
 
@@ -207,4 +214,23 @@ function resolveParentPointer(
             .join("/")}`,
     lastToken: tokens.at(-1)!,
   };
+}
+
+function assertSafePatchOperation(op: ReplayJsonPatchOperation): void {
+  assertSafePointer(op.path);
+  if ("from" in op) {
+    assertSafePointer(op.from);
+  }
+}
+
+function assertSafePointer(path: string): void {
+  for (const token of decodePointer(path)) {
+    assertSafeObjectKey(token, path);
+  }
+}
+
+function assertSafeObjectKey(token: string, path: string): void {
+  if (token === "__proto__" || token === "prototype" || token === "constructor") {
+    throw new Error(`Unsafe JSON Pointer key in ${path}`);
+  }
 }

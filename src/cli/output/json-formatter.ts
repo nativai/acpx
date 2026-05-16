@@ -235,6 +235,11 @@ class JsonOutputFormatter implements OutputFormatter {
     );
   }
 
+  onPermissionEscalation(): void {
+    // JSON mode is raw ACP NDJSON. Escalation details ride on the ACP
+    // request_permission response _meta instead of a synthetic acpx event line.
+  }
+
   flush(): void {
     // no-op for streaming output
   }

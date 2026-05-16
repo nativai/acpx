@@ -6,7 +6,7 @@ export default defineFlow({
   nodes: {
     prepare: action({
       run: ({ input }) => ({
-        text: String((input as { text?: string }).text ?? "").toUpperCase(),
+        text: ((input as { text?: string }).text ?? "").toUpperCase(),
       }),
     }),
     run_shell: shell({
@@ -17,7 +17,7 @@ export default defineFlow({
           "process.stdout.write(JSON.stringify({ value: process.env.FLOW_TEXT, cwd: process.cwd() }))",
         ],
         env: {
-          FLOW_TEXT: String((outputs.prepare as { text: string }).text),
+          FLOW_TEXT: (outputs.prepare as { text: string }).text,
         },
       }),
       parse: (result) => extractJsonObject(result.stdout),

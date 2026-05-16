@@ -8,9 +8,14 @@ import { buildQueueOwnerArgOverride } from "./cli/session/queue-owner-process.js
 export { formatPromptSessionBannerLine } from "./cli-core.js";
 export { parseAllowedTools, parseMaxTurns, parseTtlSeconds } from "./cli/flags.js";
 
-const queueOwnerArgOverride = buildQueueOwnerArgOverride(fileURLToPath(import.meta.url));
-if (queueOwnerArgOverride) {
-  process.env.ACPX_QUEUE_OWNER_ARGS ??= queueOwnerArgOverride;
+function installBrokenPipeHandler(stream: NodeJS.WritableStream): void {
+  stream.on("error", (error: NodeJS.ErrnoException) => {
+    if (error.code === "EPIPE") {
+      process.exit(0);
+    }
+
+    throw error;
+  });
 }
 
 function isCliEntrypoint(argv: string[]): boolean {
@@ -30,5 +35,13 @@ function isCliEntrypoint(argv: string[]): boolean {
 }
 
 if (isCliEntrypoint(process.argv)) {
+  installBrokenPipeHandler(process.stdout);
+  installBrokenPipeHandler(process.stderr);
+
+  const queueOwnerArgOverride = buildQueueOwnerArgOverride(fileURLToPath(import.meta.url));
+  if (queueOwnerArgOverride) {
+    process.env.ACPX_QUEUE_OWNER_ARGS ??= queueOwnerArgOverride;
+  }
+
   void main(process.argv);
 }

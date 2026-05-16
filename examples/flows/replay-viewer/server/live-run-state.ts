@@ -124,7 +124,7 @@ function resolveCurrentSessionId(bundle: ViewerRunLiveState): string | null {
   }
 
   const sessions = Object.values(bundle.sessions);
-  return sessions.length === 1 ? sessions[0]!.id : null;
+  return sessions.length === 1 ? sessions[0].id : null;
 }
 
 function replayBundledSession(
@@ -245,7 +245,7 @@ function inferPersistedLiveTurn(
     return null;
   }
 
-  const normalizedMessages = messages as NonNullable<SessionRecord["messages"]>;
+  const normalizedMessages = messages;
 
   const messageStart = findLastUserMessageIndex(normalizedMessages);
   if (messageStart == null) {

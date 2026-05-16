@@ -172,6 +172,17 @@ export class SessionModelReplayError extends AcpxOperationalError {
   }
 }
 
+export class SessionConfigOptionReplayError extends AcpxOperationalError {
+  constructor(message: string, options?: AcpxErrorOptions) {
+    super(message, {
+      outputCode: "RUNTIME",
+      detailCode: "SESSION_CONFIG_OPTION_REPLAY_FAILED",
+      origin: "acp",
+      ...options,
+    });
+  }
+}
+
 export class ClaudeAcpSessionCreateTimeoutError extends AcpxOperationalError {
   constructor(message: string, options?: AcpxErrorOptions) {
     super(message, {

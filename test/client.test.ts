@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import type { RequestPermissionRequest, RequestPermissionResponse } from "@agentclientprotocol/sdk";
@@ -246,6 +247,34 @@ test("AcpClient prefers env auth credentials over config credentials", async () 
   );
 });
 
+test("AcpClient ignores ambient normalized provider env vars for auth selection", async () => {
+  await withEnv(
+    {
+      OPENAI_API_KEY: "sk-ambient",
+      ACPX_AUTH_OPENAI_API_KEY: undefined,
+    },
+    async () => {
+      const client = makeClient();
+      const internals = asInternals(client);
+
+      const selection = internals.selectAuthMethod?.([{ id: "openai-api-key" }]);
+      assert.equal(selection, undefined);
+
+      let authenticatedMethod: string | undefined;
+      await internals.authenticateIfRequired?.(
+        {
+          authenticate: async ({ methodId }: { methodId: string }) => {
+            authenticatedMethod = methodId;
+          },
+        },
+        [{ id: "openai-api-key" }],
+      );
+
+      assert.equal(authenticatedMethod, undefined);
+    },
+  );
+});
+
 test("AcpClient authenticateIfRequired throws when auth policy is fail and credentials are missing", async () => {
   const client = makeClient({ authPolicy: "fail" });
   const internals = asInternals(client);
@@ -328,6 +357,238 @@ test("AcpClient handlePermissionRequest records approved decisions", async () =>
   });
 });
 
+test("AcpClient partial runtime option updates preserve permission policy", async () => {
+  const client = makeClient({
+    permissionMode: "approve-all",
+    permissionPolicy: {
+      autoDeny: ["execute"],
+    },
+  });
+
+  client.updateRuntimeOptions({ verbose: true });
+
+  const denied = await asInternals(client).handlePermissionRequest?.(
+    makePermissionRequest("session-policy-preserve-1", "execute"),
+  );
+
+  assert.deepEqual(denied, {
+    outcome: {
+      outcome: "selected",
+      optionId: "reject",
+    },
+  });
+
+  client.updateRuntimeOptions({ permissionPolicy: undefined });
+
+  const approved = await asInternals(client).handlePermissionRequest?.(
+    makePermissionRequest("session-policy-preserve-2", "execute"),
+  );
+
+  assert.deepEqual(approved, {
+    outcome: {
+      outcome: "selected",
+      optionId: "allow",
+    },
+  });
+});
+
+test("AcpClient onPermissionRequest decision short-circuits the mode-based resolver", async () => {
+  let callbackInvocations = 0;
+  const client = makeClient({
+    permissionMode: "approve-reads",
+    nonInteractivePermissions: "deny",
+    onPermissionRequest: async (req) => {
+      callbackInvocations += 1;
+      assert.equal(req.sessionId, "session-cb-1");
+      assert.equal(req.inferredKind, "edit");
+      return { outcome: "allow_once" };
+    },
+  });
+
+  const response = await asInternals(client).handlePermissionRequest?.(
+    makePermissionRequest("session-cb-1", "edit"),
+  );
+
+  assert.deepEqual(response, {
+    outcome: {
+      outcome: "selected",
+      optionId: "allow",
+    },
+  });
+  assert.equal(callbackInvocations, 1);
+  assert.deepEqual(client.getPermissionStats(), {
+    requested: 1,
+    approved: 1,
+    denied: 0,
+    cancelled: 0,
+  });
+});
+
+test("AcpClient onPermissionRequest returning undefined falls through to mode-based resolver", async () => {
+  let callbackInvocations = 0;
+  const client = makeClient({
+    permissionMode: "approve-all",
+    onPermissionRequest: async () => {
+      callbackInvocations += 1;
+      return undefined;
+    },
+  });
+
+  const response = await asInternals(client).handlePermissionRequest?.(
+    makePermissionRequest("session-cb-2", "edit"),
+  );
+
+  assert.deepEqual(response, {
+    outcome: {
+      outcome: "selected",
+      optionId: "allow",
+    },
+  });
+  assert.equal(callbackInvocations, 1);
+  assert.deepEqual(client.getPermissionStats(), {
+    requested: 1,
+    approved: 1,
+    denied: 0,
+    cancelled: 0,
+  });
+});
+
+test("AcpClient onPermissionRequest throws fall through to mode-based resolver", async () => {
+  let callbackInvocations = 0;
+  const client = makeClient({
+    permissionMode: "approve-all",
+    onPermissionRequest: async () => {
+      callbackInvocations += 1;
+      throw new Error("UI exploded");
+    },
+  });
+
+  const response = await asInternals(client).handlePermissionRequest?.(
+    makePermissionRequest("session-cb-3", "edit"),
+  );
+
+  assert.deepEqual(response, {
+    outcome: {
+      outcome: "selected",
+      optionId: "allow",
+    },
+  });
+  assert.equal(callbackInvocations, 1);
+});
+
+test("AcpClient onPermissionRequest receives an AbortSignal that fires on session cancel", async () => {
+  let observedSignal: AbortSignal | undefined;
+  const client = makeClient({
+    permissionMode: "approve-all",
+    onPermissionRequest: async (_req, ctx) => {
+      observedSignal = ctx.signal;
+      return { outcome: "allow_once" };
+    },
+  });
+
+  await asInternals(client).handlePermissionRequest?.(
+    makePermissionRequest("session-cb-4", "edit"),
+  );
+
+  assert(observedSignal instanceof AbortSignal);
+  assert.equal(observedSignal?.aborted, false);
+
+  const internals = asInternals(client) as unknown as {
+    abortAndDropPermissionSignal: (sessionId: string) => void;
+  };
+  internals.abortAndDropPermissionSignal("session-cb-4");
+  assert.equal(observedSignal?.aborted, true);
+});
+
+test("AcpClient onPermissionRequest cancels a late decision after session cancel", async () => {
+  let resolveDecision!: (decision: { outcome: "allow_once" }) => void;
+  const decisionPromise = new Promise<{ outcome: "allow_once" }>((resolve) => {
+    resolveDecision = resolve;
+  });
+  let callbackStarted!: () => void;
+  const callbackStartedPromise = new Promise<void>((resolve) => {
+    callbackStarted = resolve;
+  });
+  let observedSignal: AbortSignal | undefined;
+
+  const client = makeClient({
+    permissionMode: "approve-all",
+    onPermissionRequest: async (_req, ctx) => {
+      observedSignal = ctx.signal;
+      callbackStarted();
+      return await decisionPromise;
+    },
+  });
+  const internals = asInternals(client) as ClientInternals & {
+    abortAndDropPermissionSignal: (sessionId: string) => void;
+  };
+
+  const responsePromise = internals.handlePermissionRequest?.(
+    makePermissionRequest("session-cb-5", "edit"),
+  );
+  await callbackStartedPromise;
+
+  internals.cancellingSessionIds.add("session-cb-5");
+  internals.abortAndDropPermissionSignal("session-cb-5");
+  assert.equal(observedSignal?.aborted, true);
+
+  resolveDecision({ outcome: "allow_once" });
+  const response = await responsePromise;
+
+  assert.deepEqual(response, {
+    outcome: {
+      outcome: "cancelled",
+    },
+  });
+  assert.deepEqual(client.getPermissionStats(), {
+    requested: 1,
+    approved: 0,
+    denied: 0,
+    cancelled: 1,
+  });
+});
+
+test("AcpClient onPermissionRequest treats abort rejections as cancelled", async () => {
+  let callbackStarted!: () => void;
+  const callbackStartedPromise = new Promise<void>((resolve) => {
+    callbackStarted = resolve;
+  });
+
+  const client = makeClient({
+    permissionMode: "approve-all",
+    onPermissionRequest: async (_req, ctx) => {
+      callbackStarted();
+      await new Promise<never>((_resolve, reject) => {
+        ctx.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      });
+    },
+  });
+  const internals = asInternals(client) as ClientInternals & {
+    abortAndDropPermissionSignal: (sessionId: string) => void;
+  };
+
+  const responsePromise = internals.handlePermissionRequest?.(
+    makePermissionRequest("session-cb-6", "edit"),
+  );
+  await callbackStartedPromise;
+
+  internals.cancellingSessionIds.add("session-cb-6");
+  internals.abortAndDropPermissionSignal("session-cb-6");
+  const response = await responsePromise;
+
+  assert.deepEqual(response, {
+    outcome: {
+      outcome: "cancelled",
+    },
+  });
+  assert.deepEqual(client.getPermissionStats(), {
+    requested: 1,
+    approved: 0,
+    denied: 0,
+    cancelled: 1,
+  });
+});
+
 test("AcpClient client-method permission errors update permission stats", async () => {
   const client = makeClient();
   const internals = asInternals(client);
@@ -385,6 +646,7 @@ test("AcpClient client-method permission errors update permission stats", async 
 });
 
 test("AcpClient createSession forwards claudeCode options in _meta", async () => {
+  const cwd = path.resolve("/tmp/acpx-client-meta");
   const client = makeClient({
     sessionOptions: {
       model: "sonnet",
@@ -404,7 +666,7 @@ test("AcpClient createSession forwards claudeCode options in _meta", async () =>
   const result = await client.createSession("/tmp/acpx-client-meta");
   assert.equal(result.sessionId, "session-123");
   assert.deepEqual(capturedParams, {
-    cwd: "/tmp/acpx-client-meta",
+    cwd,
     mcpServers: [],
     _meta: {
       claudeCode: {
@@ -418,7 +680,66 @@ test("AcpClient createSession forwards claudeCode options in _meta", async () =>
   });
 });
 
+test("AcpClient createSession forwards systemPrompt string in _meta", async () => {
+  const cwd = path.resolve("/tmp/acpx-client-system-prompt");
+  const client = makeClient({
+    sessionOptions: {
+      systemPrompt: "you are an obsidian assistant",
+    },
+  });
+
+  let capturedParams: Record<string, unknown> | undefined;
+  asInternals(client).connection = {
+    newSession: async (params: Record<string, unknown>) => {
+      capturedParams = params;
+      return { sessionId: "session-sp-string" };
+    },
+  };
+
+  await client.createSession("/tmp/acpx-client-system-prompt");
+  assert.deepEqual(capturedParams, {
+    cwd,
+    mcpServers: [],
+    _meta: {
+      systemPrompt: "you are an obsidian assistant",
+    },
+  });
+});
+
+test("AcpClient createSession forwards systemPrompt append in _meta alongside claudeCode options", async () => {
+  const cwd = path.resolve("/tmp/acpx-client-system-prompt-append");
+  const client = makeClient({
+    sessionOptions: {
+      model: "sonnet",
+      systemPrompt: { append: "always speak in spanish" },
+    },
+  });
+
+  let capturedParams: Record<string, unknown> | undefined;
+  asInternals(client).connection = {
+    newSession: async (params: Record<string, unknown>) => {
+      capturedParams = params;
+      return { sessionId: "session-sp-append" };
+    },
+  };
+
+  await client.createSession("/tmp/acpx-client-system-prompt-append");
+  assert.deepEqual(capturedParams, {
+    cwd,
+    mcpServers: [],
+    _meta: {
+      claudeCode: {
+        options: {
+          model: "sonnet",
+        },
+      },
+      systemPrompt: { append: "always speak in spanish" },
+    },
+  });
+});
+
 test("AcpClient createSession forwards codex model metadata without setting it explicitly", async () => {
+  const cwd = path.resolve("/tmp/acpx-client-codex-model");
   const client = makeClient({
     agentCommand: "npx @zed-industries/codex-acp",
     sessionOptions: {
@@ -442,7 +763,7 @@ test("AcpClient createSession forwards codex model metadata without setting it e
   const result = await client.createSession("/tmp/acpx-client-codex-model");
   assert.equal(result.sessionId, "session-456");
   assert.deepEqual(capturedNewSessionParams, {
-    cwd: "/tmp/acpx-client-codex-model",
+    cwd,
     mcpServers: [],
     _meta: {
       claudeCode: {
@@ -490,7 +811,7 @@ test("AcpClient closes sessions through session/close and clears the loaded sess
   };
   internals.loadedSessionId = "session-close-1";
   internals.connection = {
-    unstable_closeSession: async (params: { sessionId: string }) => {
+    closeSession: async (params: { sessionId: string }) => {
       capturedCloseSessionParams = params;
       return {};
     },

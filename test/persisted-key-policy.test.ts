@@ -91,7 +91,7 @@ test("serialized session record satisfies persisted key policy", () => {
 });
 
 test("persisted key policy rejects camelCase acpx-owned keys", () => {
-  const persisted = serializeSessionRecordForDisk(makeRecord()) as Record<string, unknown>;
+  const persisted = serializeSessionRecordForDisk(makeRecord());
   persisted.requestId = "bad";
 
   const violations = findPersistedKeyPolicyViolations(persisted);

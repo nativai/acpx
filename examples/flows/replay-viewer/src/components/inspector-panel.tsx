@@ -11,8 +11,8 @@ type InspectorPanelProps = {
   sessionRevealProgress: number | null;
   liveStreaming: boolean;
   activeTab: "attempt" | "session" | "events";
-  onTabChange(tab: "attempt" | "session" | "events"): void;
-  onSessionChange(sessionId: string): void;
+  onTabChange: (tab: "attempt" | "session" | "events") => void;
+  onSessionChange: (sessionId: string) => void;
 };
 
 export function InspectorPanel({
@@ -49,7 +49,6 @@ export function InspectorPanel({
         {activeTab === "session" ? (
           <SessionTab
             scrollContainerRef={bodyRef}
-            selectedAttempt={selectedAttempt}
             sessionItems={sessionItems}
             activeSessionId={activeSessionId}
             sessionRevealProgress={sessionRevealProgress}
@@ -71,7 +70,7 @@ function TabButton({
 }: {
   tab: "attempt" | "session" | "events";
   activeTab: "attempt" | "session" | "events";
-  onTabChange(tab: "attempt" | "session" | "events"): void;
+  onTabChange: (tab: "attempt" | "session" | "events") => void;
 }) {
   return (
     <button

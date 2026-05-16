@@ -11,15 +11,15 @@ type StepTimelineProps = {
   currentNodeLabel: string;
   currentMeta: string;
   playing: boolean;
-  onSelect(index: number): void;
-  onPlay(): void;
-  onPause(): void;
-  onReset(): void;
-  onJumpToEnd(): void;
-  onSeekStart(): void;
-  onSeek(value: number): void;
-  onSeekCommit(value: number): void;
-  onPlaybackRateChange(playbackRate: number): void;
+  onSelect: (index: number) => void;
+  onPlay: () => void;
+  onPause: () => void;
+  onReset: () => void;
+  onJumpToEnd: () => void;
+  onSeekStart: () => void;
+  onSeek: (value: number) => void;
+  onSeekCommit: (value: number) => void;
+  onPlaybackRateChange: (playbackRate: number) => void;
 };
 
 export function StepTimeline({
@@ -134,7 +134,7 @@ function IconButton({
 }: {
   children: ReactNode;
   label: string;
-  onClick(): void;
+  onClick: () => void;
   disabled?: boolean;
   primary?: boolean;
 }) {
@@ -161,7 +161,7 @@ function SpeedButton({
   children: ReactNode;
   label: string;
   active: boolean;
-  onClick(): void;
+  onClick: () => void;
 }) {
   return (
     <button

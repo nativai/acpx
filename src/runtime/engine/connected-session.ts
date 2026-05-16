@@ -3,6 +3,8 @@ import { AcpClient } from "../../acp/client.js";
 import { withInterrupt } from "../../async-control.js";
 import { absolutePath, isoNow } from "../../session/persistence.js";
 import type {
+  AcpPermissionDecision,
+  AcpPermissionRequest,
   AuthPolicy,
   McpServer,
   NonInteractivePermissionPolicy,
@@ -39,8 +41,13 @@ export type WithConnectedSessionOptions<T> = {
   mcpServers?: McpServer[];
   permissionMode?: PermissionMode;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
+  onPermissionRequest?: (
+    req: AcpPermissionRequest,
+    ctx: { signal: AbortSignal },
+  ) => Promise<AcpPermissionDecision | undefined>;
   authCredentials?: Record<string, string>;
   authPolicy?: AuthPolicy;
+  terminal?: boolean;
   resumePolicy?: SessionResumePolicy;
   timeoutMs?: number;
   verbose?: boolean;
@@ -89,8 +96,10 @@ export async function withConnectedSession<T>(
       mcpServers: options.mcpServers,
       permissionMode: options.permissionMode ?? "approve-reads",
       nonInteractivePermissions: options.nonInteractivePermissions,
+      onPermissionRequest: options.onPermissionRequest,
       authCredentials: options.authCredentials,
       authPolicy: options.authPolicy,
+      terminal: options.terminal,
       verbose: options.verbose,
       sessionOptions: sessionOptionsFromRecord(record),
     }) ??
@@ -100,8 +109,10 @@ export async function withConnectedSession<T>(
       mcpServers: options.mcpServers,
       permissionMode: options.permissionMode ?? "approve-reads",
       nonInteractivePermissions: options.nonInteractivePermissions,
+      onPermissionRequest: options.onPermissionRequest,
       authCredentials: options.authCredentials,
       authPolicy: options.authPolicy,
+      terminal: options.terminal,
       verbose: options.verbose,
       sessionOptions: sessionOptionsFromRecord(record),
     });

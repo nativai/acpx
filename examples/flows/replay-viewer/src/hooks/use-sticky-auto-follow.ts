@@ -37,7 +37,7 @@ export function useStickyAutoFollow(options: {
   useEffect(() => {
     const scrollContainer = scrollContainerRef.current;
     if (!enabled || !scrollContainer) {
-      return;
+      return undefined;
     }
 
     const handleWheel = (event: WheelEvent) => {

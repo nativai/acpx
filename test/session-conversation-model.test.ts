@@ -210,6 +210,9 @@ test("cloneSessionAcpxState preserves desired mode id", () => {
   const cloned = cloneSessionAcpxState({
     current_mode_id: "auto",
     desired_mode_id: "plan",
+    desired_config_options: {
+      reasoning_effort: "high",
+    },
     available_commands: ["review"],
     session_options: {
       model: "sonnet",
@@ -220,6 +223,9 @@ test("cloneSessionAcpxState preserves desired mode id", () => {
 
   assert.equal(cloned?.current_mode_id, "auto");
   assert.equal(cloned?.desired_mode_id, "plan");
+  assert.deepEqual(cloned?.desired_config_options, {
+    reasoning_effort: "high",
+  });
   assert.deepEqual(cloned?.available_commands, ["review"]);
   assert.deepEqual(cloned?.session_options, {
     model: "sonnet",

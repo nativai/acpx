@@ -91,6 +91,76 @@ test("CLI --version prints package version", async () => {
   });
 });
 
+test("CLI --version prints package version with top-level output flags", async () => {
+  await withTempHome(async (homeDir) => {
+    const before = await runCli(["--format", "quiet", "--version"], homeDir);
+    assert.equal(before.code, 0, before.stderr);
+    assert.equal(before.stderr.trim(), "");
+    assert.equal(before.stdout.trim(), PACKAGE_VERSION);
+
+    const after = await runCli(["--json-strict", "--version"], homeDir);
+    assert.equal(after.code, 0, after.stderr);
+    assert.equal(after.stderr.trim(), "");
+    assert.equal(after.stdout.trim(), PACKAGE_VERSION);
+  });
+});
+
+test("exec treats --version after end-of-options as prompt text", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const result = await runCli(
+      ["--agent", MOCK_AGENT_COMMAND, "--cwd", cwd, "--format", "quiet", "exec", "--", "--version"],
+      homeDir,
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /unrecognized prompt: --version/);
+    assert.notEqual(result.stdout.trim(), PACKAGE_VERSION);
+  });
+});
+
+test("config commands accept command-local --format json", async () => {
+  await withTempHome(async (homeDir) => {
+    const show = await runCli(["config", "show", "--format", "json"], homeDir);
+    assert.equal(show.code, 0, show.stderr);
+    const showPayload = JSON.parse(show.stdout.trim()) as Record<string, unknown>;
+    assert.equal(showPayload.defaultAgent, "codex");
+
+    const init = await runCli(["config", "init", "--format", "json"], homeDir);
+    assert.equal(init.code, 0, init.stderr);
+    const initPayload = JSON.parse(init.stdout.trim()) as Record<string, unknown>;
+    assert.equal(initPayload.created, true);
+    assert.equal(typeof initPayload.path, "string");
+  });
+});
+
+test(
+  "CLI exits cleanly when stdout pipe closes early",
+  { skip: process.platform === "win32" },
+  async () => {
+    await withTempHome(async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      await fs.mkdir(cwd, { recursive: true });
+
+      const result = await runShell(
+        '"$NODE" "$CLI_PATH" --cwd "$WORK" --approve-all --agent "$MOCK_AGENT" exec "echo pipe-ok" | grep -q pipe-ok',
+        {
+          HOME: homeDir,
+          NODE: process.execPath,
+          CLI_PATH,
+          WORK: cwd,
+          MOCK_AGENT: MOCK_AGENT_COMMAND,
+        },
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+      assert.doesNotMatch(result.stderr, /EPIPE|Unhandled 'error'/);
+    });
+  },
+);
+
 function parseSingleAcpErrorLine(stdout: string): ParsedAcpError {
   const payload = JSON.parse(stdout.trim()) as {
     jsonrpc?: string;
@@ -216,6 +286,7 @@ test("global passthrough flags are present in help output", async () => {
     assert.match(result.stdout, /--max-turns <count>/);
     assert.match(result.stdout, /text, json, quiet/);
     assert.match(result.stdout, /--suppress-reads/);
+    assert.match(result.stdout, /--no-terminal/);
   });
 });
 
@@ -226,6 +297,7 @@ test("sessions new command is present in help output", async () => {
     assert.match(result.stdout, /\bnew\b/);
     assert.match(result.stdout, /\bensure\b/);
     assert.match(result.stdout, /\bread\b/);
+    assert.match(result.stdout, /\bprune\b/);
 
     const newHelp = await runCli(["sessions", "new", "--help"], homeDir);
     assert.equal(newHelp.code, 0, newHelp.stderr);
@@ -240,6 +312,11 @@ test("sessions new command is present in help output", async () => {
     assert.equal(readHelp.code, 0, readHelp.stderr);
     assert.match(readHelp.stdout, /--tail <count>/);
     assert.match(ensureHelp.stdout, /--resume-session <id>/);
+
+    const pruneHelp = await runCli(["sessions", "prune", "--help"], homeDir);
+    assert.equal(pruneHelp.code, 0, pruneHelp.stderr);
+    assert.match(pruneHelp.stdout, /--dry-run/);
+    assert.match(pruneHelp.stdout, /--include-history/);
   });
 });
 
@@ -429,6 +506,47 @@ test("sessions ensure creates when missing and returns existing on subsequent ca
     assert.equal(secondPayload.action, "session_ensured");
     assert.equal(secondPayload.created, false);
     assert.equal(secondPayload.acpxRecordId, firstPayload.acpxRecordId);
+  });
+});
+
+test("sessions new and ensure accept -s as shorthand for --name", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          agents: {
+            codex: {
+              command: MOCK_AGENT_COMMAND,
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    const created = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "new", "-s", "ci"],
+      homeDir,
+    );
+    assert.equal(created.code, 0, created.stderr);
+    const createdPayload = JSON.parse(created.stdout.trim()) as Record<string, unknown>;
+    assert.equal(createdPayload.name, "ci");
+
+    const ensured = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "ensure", "-s", "ci"],
+      homeDir,
+    );
+    assert.equal(ensured.code, 0, ensured.stderr);
+    const ensuredPayload = JSON.parse(ensured.stdout.trim()) as Record<string, unknown>;
+    assert.equal(ensuredPayload.action, "session_ensured");
+    assert.equal(ensuredPayload.created, false);
+    assert.equal(ensuredPayload.name, "ci");
   });
 });
 
@@ -1541,9 +1659,45 @@ test("status resolves named session when -s is before subcommand", async () => {
     const payload = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
     assert.equal(payload.action, "status_snapshot");
     assert.equal(payload.acpxRecordId, "named-status-session");
-    assert.equal(payload.status, "dead");
+    assert.equal(payload.status, "idle");
+    assert.equal(payload.summary, "session idle; queue owner will start on next prompt");
     assert.notEqual(payload.status, "no-session");
     assert.equal(payload.agentSessionId, undefined);
+  });
+});
+
+test("status reports idle for resumable sessions without a live queue owner", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "idle-status-session",
+      acpSessionId: "idle-status-session",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:01:00.000Z",
+      lastPromptAt: "2026-01-01T00:01:00.000Z",
+      closed: false,
+      pid: 12345,
+      agentStartedAt: "2026-01-01T00:00:00.000Z",
+      lastAgentExitCode: 0,
+      lastAgentExitAt: "2026-01-01T00:02:00.000Z",
+    });
+
+    const json = await runCli(["--cwd", cwd, "--format", "json", "codex", "status"], homeDir);
+    assert.equal(json.code, 0, json.stderr);
+    const payload = JSON.parse(json.stdout.trim()) as Record<string, unknown>;
+    assert.equal(payload.action, "status_snapshot");
+    assert.equal(payload.status, "idle");
+    assert.equal(payload.summary, "session idle; queue owner will start on next prompt");
+    assert.equal(payload.exitCode, undefined);
+
+    const text = await runCli(["--cwd", cwd, "codex", "status"], homeDir);
+    assert.equal(text.code, 0, text.stderr);
+    assert.match(text.stdout, /status: idle/);
+    assert.doesNotMatch(text.stdout, /exitCode:/);
   });
 });
 
@@ -1850,6 +2004,86 @@ test("sessions history prints stored history entries", async () => {
   });
 });
 
+test("sessions prune dry-run previews closed sessions without deleting", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "prune-dry-run",
+      acpSessionId: "prune-dry-run",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:10:00.000Z",
+      closed: true,
+      closedAt: "2026-01-01T00:10:00.000Z",
+    });
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "prune-open",
+      acpSessionId: "prune-open",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:20:00.000Z",
+      closed: false,
+    });
+
+    const result = await runCli(["--cwd", cwd, "codex", "sessions", "prune", "--dry-run"], homeDir);
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /\[DRY RUN\] Would prune 1 session/);
+    assert.match(result.stdout, /prune-dry-run/);
+    assert.doesNotMatch(result.stdout, /prune-open/);
+    assert.ok(await fileExists(sessionFilePath(homeDir, "prune-dry-run")));
+    assert.ok(await fileExists(sessionFilePath(homeDir, "prune-open")));
+  });
+});
+
+test("sessions prune supports json output and include-history", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    await fs.mkdir(cwd, { recursive: true });
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "prune-json",
+      acpSessionId: "prune-json",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:10:00.000Z",
+      closed: true,
+      closedAt: "2026-01-01T00:10:00.000Z",
+    });
+
+    const safeId = encodeURIComponent("prune-json");
+    const streamFile = path.join(sessionDir, `${safeId}.stream.ndjson`);
+    await fs.writeFile(streamFile, "event-data\n", "utf8");
+
+    const result = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "prune", "--include-history"],
+      homeDir,
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    const payload = JSON.parse(result.stdout) as {
+      action?: string;
+      dryRun?: boolean;
+      count?: number;
+      bytesFreed?: number;
+      pruned?: string[];
+    };
+    assert.equal(payload.action, "sessions_pruned");
+    assert.equal(payload.dryRun, false);
+    assert.equal(payload.count, 1);
+    assert.ok((payload.bytesFreed ?? 0) > 0);
+    assert.deepEqual(payload.pruned, ["prune-json"]);
+    assert.ok(!(await fileExists(sessionFilePath(homeDir, "prune-json"))));
+    assert.ok(!(await fileExists(streamFile)));
+  });
+});
+
 test("sessions read prints full history by default and supports --tail", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -1937,6 +2171,48 @@ test("status reports running queue owner when owner socket is reachable", async 
       assert.match(result.stdout, /status: running/);
     } finally {
       await closeServer(server);
+      await cleanupOwnerArtifacts({ socketPath, lockPath });
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("status reports dead when queue owner lease is present but unreachable", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const sessionId = "status-unreachable-owner";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+
+    try {
+      await writeSessionRecord(homeDir, {
+        acpxRecordId: sessionId,
+        acpSessionId: sessionId,
+        agentCommand: AGENT_REGISTRY.codex,
+        cwd,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        lastUsedAt: "2026-01-01T00:00:00.000Z",
+        lastPromptAt: "2026-01-01T00:00:00.000Z",
+        closed: false,
+        pid: keeper.pid,
+        agentStartedAt: "2026-01-01T00:00:00.000Z",
+      });
+
+      await writeQueueOwnerLock({
+        lockPath,
+        pid: keeper.pid,
+        sessionId,
+        socketPath,
+      });
+
+      const result = await runCli(["--cwd", cwd, "--format", "json", "codex", "status"], homeDir);
+      assert.equal(result.code, 0, result.stderr);
+      const payload = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
+      assert.equal(payload.status, "dead");
+      assert.equal(payload.summary, "queue owner unavailable");
+    } finally {
       await cleanupOwnerArtifacts({ socketPath, lockPath });
       stopProcess(keeper);
     }
@@ -2095,7 +2371,7 @@ async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<vo
   try {
     await run(tempHome);
   } finally {
-    await fs.rm(tempHome, { recursive: true, force: true });
+    await fs.rm(tempHome, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
   }
 }
 
@@ -2105,6 +2381,35 @@ type CliRunOptions = {
   timeoutMs?: number;
   env?: NodeJS.ProcessEnv;
 };
+
+async function runShell(command: string, env: NodeJS.ProcessEnv = {}): Promise<CliRunResult> {
+  return await new Promise<CliRunResult>((resolve) => {
+    const child = spawn("/bin/bash", ["-o", "pipefail", "-c", command], {
+      env: {
+        ...process.env,
+        ...env,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+
+    child.once("close", (code) => {
+      resolve({ code, stdout, stderr });
+    });
+  });
+}
 
 async function runCli(
   args: string[],
@@ -2247,6 +2552,19 @@ async function writeSessionRecord(
     `${JSON.stringify(serializeSessionRecordForDisk(makeSessionRecord(record)), null, 2)}\n`,
     "utf8",
   );
+}
+
+function sessionFilePath(homeDir: string, acpxRecordId: string): string {
+  return path.join(homeDir, ".acpx", "sessions", `${encodeURIComponent(acpxRecordId)}.json`);
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function escapeRegex(value: string): string {

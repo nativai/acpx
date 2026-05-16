@@ -22,6 +22,16 @@ export type ReplayViewerCliOptions = {
   open: boolean;
 };
 
+export const REPLAY_VIEWER_HELP_TEXT = `Usage: pnpm viewer [start|status|stop] [options]
+
+Options:
+  --host <host>       Host to bind or inspect (default: 127.0.0.1)
+  --port <port>       Port to bind or inspect (default: 4173)
+  --runs-dir <path>   Flow runs directory (default: ~/.acpx/flows/runs)
+  --open              Open the viewer in a browser after start
+  -h, --help          Show help
+`;
+
 export function parseReplayViewerCliArgs(argv: readonly string[]): ReplayViewerCliOptions {
   let command: ReplayViewerCliCommand = "start";
   let host = DEFAULT_HOST;
@@ -82,6 +92,11 @@ export function parseReplayViewerCliArgs(argv: readonly string[]): ReplayViewerC
 }
 
 export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<void> {
+  if (argv[0] === "help" || argv.includes("--help") || argv.includes("-h")) {
+    process.stdout.write(REPLAY_VIEWER_HELP_TEXT);
+    return;
+  }
+
   const options = parseReplayViewerCliArgs(argv);
   const baseUrl = `http://${options.host}:${options.port}`;
   const requestedRunsDir = normalizeRunsDirPath(options.runsDir);

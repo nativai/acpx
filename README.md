@@ -33,7 +33,7 @@ One command surface for Pi, OpenClaw ACP, Codex, Claude, and other ACP-compatibl
 - **Prompt from file/stdin**: `--file <path>` or piped stdin for prompt content
 - **Config files**: global + project JSON config with `acpx config show|init`
 - **Session inspect/history**: `sessions show` and `sessions history --limit <n>`
-- **Local status checks**: `status` reports running/dead/no-session, pid, uptime, last prompt
+- **Local status checks**: `status` reports running/idle/dead/no-session, pid, uptime, last prompt
 - **Client methods**: stable `fs/*` and `terminal/*` handlers with permission controls and cwd sandboxing
 - **Auth handshake**: stable `authenticate` support via env/config credentials
 - **Structured output**: typed ACP messages (thinking, tool calls, diffs) instead of ANSI scraping
@@ -86,8 +86,12 @@ I want you to use acpx to run coding agents over the Agent Client Protocol
    Or without installing:
    npx acpx@latest
 
-2. Install the acpx skill so you have the full reference available:
-   npx acpx@latest --skill install acpx
+2. For Pi or OpenClaw, use the reference URL below. For Codex-style skill
+   installation, install the acpx skill so you have the full reference
+   available:
+   npx acpx@latest --skill install acpx --agent codex --scope user
+   Use --agent claude for Claude Code. For another harness not listed by
+   --skill install --help, use the reference URL below instead.
 
 3. Read the acpx skill reference so you know every command, flag, and
    workflow pattern:
@@ -202,6 +206,7 @@ acpx --approve-all codex 'apply the patch and run tests'
 acpx --approve-reads codex 'inspect repo structure and suggest plan' # default mode
 acpx --deny-all codex 'explain what you can do without tool access'
 acpx --non-interactive-permissions fail codex 'fail instead of deny in non-TTY'
+acpx --policy '{"escalate":["execute"],"defaultAction":"deny"}' --format json codex exec 'ask before shell'
 
 acpx --cwd ~/repos/backend codex 'review recent auth changes'
 acpx --format text codex 'summarize your findings'
@@ -225,6 +230,7 @@ runtime and persists run state under `~/.acpx/flows/runs/`.
 Flows are for multi-step ACP work where one prompt is not enough:
 
 - `acp` steps keep model-shaped work in ACP
+- `decision()` and `decisionEdge()` wrap constrained-choice ACP branching without adding a new node type
 - `action` steps handle deterministic mechanics like shell commands or GitHub calls
 - `compute` steps do local routing or shaping
 - `checkpoint` steps pause for something outside the runtime
@@ -271,7 +277,7 @@ Supported keys:
   "timeout": null,
   "format": "text",
   "agents": {
-    "my-custom": { "command": "./bin/my-acp-server" }
+    "my-custom": { "command": "./bin/my-acp-server", "args": ["acp"] }
   },
   "auth": {
     "my_auth_method_id": "credential-value"
@@ -280,6 +286,11 @@ Supported keys:
 ```
 
 Use `acpx config show` to inspect the resolved result and `acpx config init` to create the global template.
+
+For ACP `authenticate` handshakes, use either config `auth` entries or explicit
+`ACPX_AUTH_<METHOD_ID>` environment variables such as `ACPX_AUTH_OPENAI_API_KEY`.
+Ambient provider env vars such as `OPENAI_API_KEY` are still passed through to
+child agents, but they do not trigger ACP auth-method selection on their own.
 
 ## Output formats
 
@@ -319,8 +330,11 @@ JSON events include a stable envelope for correlation:
 }
 ```
 
-Session-control JSON payloads (`sessions new|ensure`, `status`) may also include
-`runtimeSessionId` when the adapter exposes a provider-native session ID.
+Session-control JSON payloads (`sessions new|ensure`, `status`) always include
+`acpxRecordId` and `acpxSessionId`. They include `agentSessionId` only when the
+adapter exposes a provider-native session ID. The text/quiet session id is the
+local acpx record id; do not assume it can be passed to the native provider CLI
+unless `agentSessionId` is present.
 
 ## Built-in agents and custom servers
 

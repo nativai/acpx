@@ -3,17 +3,19 @@ import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { QueueConnectionError, QueueProtocolError } from "../../errors.js";
 import { incrementPerfCounter } from "../../perf-metrics.js";
 import type {
+  AcpClientOptions,
   NonInteractivePermissionPolicy,
   OutputErrorEmissionPolicy,
   OutputFormatter,
   PermissionMode,
+  PermissionPolicy,
   PromptInput,
   SessionResumePolicy,
   SessionEnqueueResult,
   SessionSendOutcome,
 } from "../../types.js";
 import { probeQueueOwnerHealth, type QueueOwnerHealth } from "./ipc-health.js";
-import { QUEUE_CONNECT_RETRY_MS, connectToQueueOwner } from "./ipc-transport.js";
+import { connectToQueueOwner } from "./ipc-transport.js";
 import {
   type QueueOwnerRecord,
   readQueueOwnerRecord,
@@ -22,7 +24,9 @@ import {
 import {
   parseQueueOwnerMessage,
   type QueueCancelRequest,
+  type QueueCloseSessionRequest,
   type QueueOwnerCancelResultMessage,
+  type QueueOwnerCloseSessionResultMessage,
   type QueueOwnerMessage,
   type QueueOwnerSetConfigOptionResultMessage,
   type QueueOwnerSetModelResultMessage,
@@ -263,12 +267,15 @@ export type SubmitToQueueOwnerOptions = {
   permissionMode: PermissionMode;
   resumePolicy?: SessionResumePolicy;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
+  permissionPolicy?: PermissionPolicy;
   outputFormatter: OutputFormatter;
   errorEmissionPolicy?: OutputErrorEmissionPolicy;
   timeoutMs?: number;
   suppressSdkConsoleErrors?: boolean;
+  promptRetries?: number;
   waitForCompletion: boolean;
   verbose?: boolean;
+  sessionOptions?: NonNullable<AcpClientOptions["sessionOptions"]>;
 };
 
 async function submitToQueueOwner(
@@ -285,9 +292,12 @@ async function submitToQueueOwner(
     permissionMode: options.permissionMode,
     resumePolicy: options.resumePolicy,
     nonInteractivePermissions: options.nonInteractivePermissions,
+    permissionPolicy: options.permissionPolicy,
     timeoutMs: options.timeoutMs,
     suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
+    promptRetries: options.promptRetries ?? 0,
     waitForCompletion: options.waitForCompletion,
+    sessionOptions: options.sessionOptions,
   };
 
   options.outputFormatter.setContext({
@@ -357,6 +367,11 @@ async function submitToQueueOwner(
 
       if (message.type === "event") {
         options.outputFormatter.onAcpMessage(message.message);
+        return;
+      }
+
+      if (message.type === "permission_escalation") {
+        options.outputFormatter.onPermissionEscalation(message.event);
         return;
       }
 
@@ -593,6 +608,35 @@ async function submitSetConfigOptionToQueueOwner(
   return response.response;
 }
 
+async function submitCloseSessionToQueueOwner(
+  owner: QueueOwnerRecord,
+  timeoutMs?: number,
+): Promise<boolean | undefined> {
+  const request: QueueCloseSessionRequest = {
+    type: "close_session",
+    requestId: randomUUID(),
+    ownerGeneration: owner.ownerGeneration,
+    timeoutMs,
+  };
+  const response = await submitControlToQueueOwner(
+    owner,
+    request,
+    (message): message is QueueOwnerCloseSessionResultMessage =>
+      message.type === "close_session_result",
+  );
+  if (!response) {
+    return undefined;
+  }
+  if (response.requestId !== request.requestId) {
+    throw new QueueProtocolError("Queue owner returned mismatched close_session response", {
+      detailCode: "QUEUE_PROTOCOL_MALFORMED_MESSAGE",
+      origin: "queue",
+      retryable: true,
+    });
+  }
+  return response.closed;
+}
+
 export async function trySubmitToRunningOwner(
   options: SubmitToQueueOwnerOptions,
 ): Promise<SessionSendOutcome | undefined> {
@@ -632,6 +676,41 @@ export async function trySubmitToRunningOwner(
 
   throw new QueueConnectionError(
     "Session queue owner is running but not accepting queue requests",
+    {
+      detailCode: "QUEUE_NOT_ACCEPTING_REQUESTS",
+      origin: "queue",
+      retryable: true,
+    },
+  );
+}
+
+export async function tryCloseSessionOnRunningOwner(options: {
+  sessionId: string;
+  timeoutMs?: number;
+  verbose?: boolean;
+}): Promise<boolean | undefined> {
+  const owner = await readQueueOwnerRecord(options.sessionId);
+  if (!owner) {
+    return undefined;
+  }
+
+  const closed = await submitCloseSessionToQueueOwner(owner, options.timeoutMs);
+  if (closed !== undefined) {
+    if (options.verbose) {
+      process.stderr.write(
+        `[acpx] requested session/close on active owner pid ${owner.pid} for session ${options.sessionId}\n`,
+      );
+    }
+    return closed;
+  }
+
+  const health = await probeQueueOwnerHealth(options.sessionId);
+  if (!health.hasLease) {
+    return undefined;
+  }
+
+  throw new QueueConnectionError(
+    "Session queue owner is running but not accepting close_session requests",
     {
       detailCode: "QUEUE_NOT_ACCEPTING_REQUESTS",
       origin: "queue",

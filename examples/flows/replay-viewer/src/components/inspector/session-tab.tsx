@@ -1,12 +1,11 @@
 import { useRef, type RefObject } from "react";
 import { useStickyAutoFollow } from "../../hooks/use-sticky-auto-follow.js";
 import { resolveSessionRenderState } from "../../lib/session-render-state.js";
-import type { SelectedAttemptView, SessionListItemView } from "../../lib/view-model.js";
+import type { SessionListItemView } from "../../lib/view-model.js";
 import { ConversationMessage } from "./conversation-message.js";
 
 export function SessionTab({
   scrollContainerRef,
-  selectedAttempt,
   sessionItems,
   activeSessionId,
   sessionRevealProgress,
@@ -14,12 +13,11 @@ export function SessionTab({
   onSessionChange,
 }: {
   scrollContainerRef: RefObject<HTMLDivElement | null>;
-  selectedAttempt: SelectedAttemptView;
   sessionItems: SessionListItemView[];
   activeSessionId: string | null;
   sessionRevealProgress: number | null;
   liveStreaming: boolean;
-  onSessionChange(sessionId: string): void;
+  onSessionChange: (sessionId: string) => void;
 }) {
   const activeSession =
     sessionItems.find((session) => session.id === activeSessionId) ?? sessionItems[0] ?? null;

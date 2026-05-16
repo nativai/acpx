@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createOutputFormatter } from "../src/cli/output/output.js";
+import { createOutputFormatter, getTextErrorRemediationHints } from "../src/cli/output/output.js";
 
 class CaptureWriter {
   public readonly chunks: string[] = [];
@@ -43,12 +43,13 @@ function thoughtChunk(text: string): unknown {
   };
 }
 
-function doneResult(stopReason: string): unknown {
+function doneResult(stopReason: string, result: Record<string, unknown> = {}): unknown {
   return {
     jsonrpc: "2.0",
     id: "req-1",
     result: {
       stopReason,
+      ...result,
     },
   };
 }
@@ -181,6 +182,115 @@ test("json formatter emits ACP JSON-RPC error response from onError", () => {
   assert.equal(parsed.error?.data?.acpxCode, "RUNTIME");
   assert.equal(parsed.error?.data?.origin, "runtime");
   assert.equal(parsed.error?.data?.sessionId, "session-err");
+});
+
+test("json formatter keeps remediation hints out of JSON error payloads", () => {
+  const writer = new CaptureWriter();
+  const formatter = createOutputFormatter("json", {
+    stdout: writer,
+    jsonContext: {
+      sessionId: "session-auth",
+    },
+  });
+
+  formatter.onError({
+    code: "RUNTIME",
+    detailCode: "AUTH_REQUIRED",
+    message: "missing credentials for auth method openai-api-key",
+    origin: "acp",
+    acp: {
+      code: -32000,
+      message: "Authentication required",
+      data: {
+        methodId: "openai-api-key",
+      },
+    },
+  });
+
+  const parsed = JSON.parse(writer.toString().trim()) as {
+    error?: {
+      message?: string;
+      data?: {
+        acpxCode?: string;
+        detailCode?: string;
+      };
+    };
+  };
+  assert.equal(parsed.error?.message, "Authentication required");
+  assert.equal(parsed.error?.data?.acpxCode, "RUNTIME");
+  assert.equal(parsed.error?.data?.detailCode, "AUTH_REQUIRED");
+  assert.doesNotMatch(writer.toString(), /hint:/);
+});
+
+test("text formatter prints auth remediation hints", () => {
+  const writer = new CaptureWriter();
+  const formatter = createOutputFormatter("text", { stdout: writer });
+
+  formatter.onError({
+    code: "RUNTIME",
+    detailCode: "AUTH_REQUIRED",
+    message: "missing credentials for auth method openai-api-key",
+    origin: "acp",
+    acp: {
+      code: -32000,
+      message: "Authentication required",
+      data: {
+        methodId: "openai-api-key",
+      },
+    },
+  });
+
+  const output = writer.toString();
+  assert.match(output, /\[error\] RUNTIME: missing credentials/);
+  assert.match(output, /hint: run `acpx config show`/);
+  assert.match(output, /`auth\.openai-api-key`/);
+});
+
+test("text remediation hints cover missing session and ACP runtime failures", () => {
+  assert.deepEqual(getTextErrorRemediationHints({ code: "NO_SESSION", message: "No session" }), [
+    "hint: the saved ACP session is missing or stale; start a fresh session with `acpx <agent> sessions new`, then retry.",
+  ]);
+  assert.deepEqual(
+    getTextErrorRemediationHints({
+      code: "TIMEOUT",
+      message: "Timed out after 1000ms",
+    }),
+    [
+      "hint: increase `--timeout <seconds>` for long-running prompts, or check whether the agent/provider is stalled.",
+    ],
+  );
+  assert.deepEqual(
+    getTextErrorRemediationHints({
+      code: "RUNTIME",
+      message: "Provider returned 429 rate limit exceeded",
+      origin: "acp",
+    }),
+    [
+      "hint: the provider appears rate-limited; retry later, switch model, or check provider quota/billing.",
+    ],
+  );
+  assert.deepEqual(
+    getTextErrorRemediationHints({
+      code: "RUNTIME",
+      message: "model not found: cerebras/qwen-3-coder-480b",
+      origin: "acp",
+    }),
+    [
+      "hint: check the configured model name for this agent, then retry with `--model <model>` or `sessions set-model <model>`.",
+    ],
+  );
+  assert.deepEqual(
+    getTextErrorRemediationHints({
+      code: "RUNTIME",
+      message: "Failed session/set_mode for mode plan: Invalid params",
+      origin: "acp",
+      acp: {
+        code: -32602,
+        message: "Invalid params",
+      },
+    }),
+    ["hint: rerun with `--verbose` to capture the ACP method/error details before retrying."],
+  );
 });
 
 test("text formatter suppresses read output when requested", () => {
@@ -390,4 +500,33 @@ test("quiet formatter outputs only agent text and flushes on prompt result", () 
   formatter.onAcpMessage(doneResult("end_turn") as never);
 
   assert.equal(writer.toString(), "Hello world\n");
+});
+
+test("quiet formatter emits final usage and cost metadata to stderr", () => {
+  const stdout = new CaptureWriter();
+  const stderr = new CaptureWriter();
+  const formatter = createOutputFormatter("quiet", { stdout, stderr });
+
+  formatter.onAcpMessage(messageChunk("OK") as never);
+  formatter.onAcpMessage(
+    doneResult("end_turn", {
+      usage: {
+        inputTokens: 17_030,
+        outputTokens: 4,
+        cachedReadTokens: 12,
+        cachedWriteTokens: 3,
+        totalTokens: 17_049,
+      },
+      cost: {
+        amount: 0.051276,
+        currency: "USD",
+      },
+    }) as never,
+  );
+
+  assert.equal(stdout.toString(), "OK\n");
+  assert.equal(
+    stderr.toString(),
+    "[acpx] tokens: input=17030 output=4 cache_read=12 cache_write=3 total=17049\n[acpx] cost: 0.051276 USD\n",
+  );
 });

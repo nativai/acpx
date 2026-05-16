@@ -25,7 +25,7 @@ test("parsePromptSource rejects image blocks with non-image mime types", () => {
       ),
     (error: unknown) =>
       error instanceof PromptInputValidationError &&
-      /image block mimeType must start with image\//.test(error.message),
+      error.message.includes("image block mimeType must start with image/"),
   );
 });
 
@@ -35,7 +35,7 @@ test("parsePromptSource rejects image blocks with invalid base64 payloads", () =
       parsePromptSource(JSON.stringify([{ type: "image", mimeType: "image/png", data: "%%%" }])),
     (error: unknown) =>
       error instanceof PromptInputValidationError &&
-      /image block data must be valid base64/.test(error.message),
+      error.message.includes("image block data must be valid base64"),
   );
 });
 
@@ -88,7 +88,7 @@ test("parsePromptSource rejects invalid text and resource block shapes", () => {
     () => parsePromptSource(JSON.stringify([{ type: "text", text: 123 }])),
     (error: unknown) =>
       error instanceof PromptInputValidationError &&
-      /text block must include a string text field/.test(error.message),
+      error.message.includes("text block must include a string text field"),
   );
 
   assert.throws(
@@ -103,7 +103,7 @@ test("parsePromptSource rejects invalid text and resource block shapes", () => {
       ),
     (error: unknown) =>
       error instanceof PromptInputValidationError &&
-      /resource_link block must include a non-empty uri/.test(error.message),
+      error.message.includes("resource_link block must include a non-empty uri"),
   );
 
   assert.throws(
@@ -121,7 +121,9 @@ test("parsePromptSource rejects invalid text and resource block shapes", () => {
       ),
     (error: unknown) =>
       error instanceof PromptInputValidationError &&
-      /resource block resource must include a non-empty uri and optional text/.test(error.message),
+      error.message.includes(
+        "resource block resource must include a non-empty uri and optional text",
+      ),
   );
 });
 

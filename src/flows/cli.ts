@@ -13,6 +13,7 @@ import {
   type GlobalFlags,
 } from "../cli/flags.js";
 import { type FlowDefinition, FlowRunner } from "../flows.js";
+import { loadPermissionPolicySpec } from "../permission-policy.js";
 import { permissionModeSatisfies } from "../permissions.js";
 import type { PermissionMode } from "../types.js";
 import { isDefinedFlow } from "./authoring.js";
@@ -35,6 +36,7 @@ export async function handleFlowRun(
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
+  const permissionPolicy = await resolveFlowPermissionPolicy(globalFlags);
   const outputPolicy = resolveOutputPolicy(globalFlags.format, globalFlags.jsonStrict === true);
   const input = await readFlowInput(flags);
   const flowPath = path.resolve(flowFile);
@@ -48,6 +50,7 @@ export async function handleFlowRun(
     permissionMode,
     mcpServers: config.mcpServers,
     nonInteractivePermissions: globalFlags.nonInteractivePermissions,
+    permissionPolicy,
     authCredentials: config.auth,
     authPolicy: globalFlags.authPolicy,
     timeoutMs: globalFlags.timeout,
@@ -66,6 +69,15 @@ export async function handleFlowRun(
   });
 
   printFlowRunResult(result, globalFlags);
+}
+
+async function resolveFlowPermissionPolicy(globalFlags: GlobalFlags) {
+  try {
+    return await loadPermissionPolicySpec(globalFlags.permissionPolicy, globalFlags.cwd);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new InvalidArgumentError(`Invalid permission policy: ${message}`);
+  }
 }
 
 function assertFlowPermissionRequirements(
@@ -181,14 +193,16 @@ async function prepareFlowModuleImport(
 
 function resolveFlowRuntimeImportSpecifier(): string {
   const selfPath = fileURLToPath(import.meta.url);
+  let runtimePath: string;
 
   if (selfPath.endsWith(`${path.sep}src${path.sep}flows${path.sep}cli.ts`)) {
-    return new URL("../flows.ts", import.meta.url).href;
+    runtimePath = fileURLToPath(new URL("../flows.ts", import.meta.url));
+  } else if (selfPath.endsWith(`${path.sep}src${path.sep}flows${path.sep}cli.js`)) {
+    runtimePath = fileURLToPath(new URL("../flows.js", import.meta.url));
+  } else {
+    runtimePath = fileURLToPath(new URL("./flows.js", import.meta.url));
   }
-  if (selfPath.endsWith(`${path.sep}src${path.sep}flows${path.sep}cli.js`)) {
-    return new URL("../flows.js", import.meta.url).href;
-  }
-  return new URL("./flows.js", import.meta.url).href;
+  return runtimePath.replaceAll(path.sep, "/");
 }
 
 async function loadFlowRuntimeModule(
@@ -198,20 +212,49 @@ async function loadFlowRuntimeModule(
   default?: unknown;
   "module.exports"?: unknown;
 }> {
-  if (extension === ".ts" || extension === ".tsx" || extension === ".mts" || extension === ".cts") {
-    const { tsImport } = (await import("tsx/esm/api")) as {
-      tsImport: (
-        specifier: string,
-        parentURL: string,
-      ) => Promise<{
+  if (extension === ".ts" || extension === ".tsx" || extension === ".cts") {
+    const { register } = (await import("tsx/cjs/api")) as {
+      register: (options: { namespace: string }) => {
+        require: (
+          specifier: string,
+          parentURL: string,
+        ) => {
+          default?: unknown;
+          "module.exports"?: unknown;
+        };
+        unregister: () => void;
+      };
+    };
+    const loader = register({ namespace: randomUUID() });
+    try {
+      return loader.require(flowUrl, import.meta.url);
+    } finally {
+      loader.unregister();
+    }
+  }
+
+  if (extension === ".mts") {
+    const { register } = (await import("tsx/esm/api")) as {
+      register: (options: { namespace: string }) => {
+        import: (
+          specifier: string,
+          parentURL: string,
+        ) => Promise<{
+          default?: unknown;
+          "module.exports"?: unknown;
+        }>;
+        unregister: () => Promise<void>;
+      };
+    };
+    const loader = register({ namespace: randomUUID() });
+    try {
+      return (await loader.import(flowUrl, import.meta.url)) as {
         default?: unknown;
         "module.exports"?: unknown;
-      }>;
-    };
-    return (await tsImport(flowUrl, import.meta.url)) as {
-      default?: unknown;
-      "module.exports"?: unknown;
-    };
+      };
+    } finally {
+      await loader.unregister();
+    }
   }
 
   return (await import(flowUrl)) as {

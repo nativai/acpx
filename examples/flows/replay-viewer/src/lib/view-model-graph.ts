@@ -139,12 +139,11 @@ export function buildGraph(
 
   const graphEdges = expandedEdges.map((edge) => {
     const isTraversed = actualTransitions.has(`${edge.source}->${edge.target}`);
-    const isSelected = Boolean(
+    const isSelected =
       !terminalSelectionSettled &&
       selectedStep != null &&
       visibleSteps.at(-2)?.nodeId === edge.source &&
-      selectedStep.nodeId === edge.target,
-    );
+      selectedStep.nodeId === edge.target;
     const isBackEdge = backEdgeIds.has(edge.edgeId);
     const stroke = isSelected
       ? "var(--edge-active)"
@@ -753,7 +752,7 @@ function computeTailDepths(
       memo.set(nodeId, null);
       return null;
     }
-    const childDepth = visit(targets[0]!);
+    const childDepth = visit(targets[0]);
     const depth = childDepth == null ? null : childDepth + 1;
     memo.set(nodeId, depth);
     return depth;

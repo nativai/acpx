@@ -12,11 +12,11 @@ concurrency:
 
 env:
   NODE_VERSION: 24
-  PNPM_VERSION: 10.23.0
+  PNPM_VERSION: 10.33.2
 
 jobs:
   scope:
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       pull-requests: read
@@ -71,6 +71,7 @@ jobs:
                 fi
                 ;;
               .github/workflows/ci.yml)
+                docs_only=false
                 ;;
               *)
                 docs_only=false
@@ -90,7 +91,7 @@ jobs:
     name: ${{ matrix.name }}
     needs: scope
     if: needs.scope.outputs.docs_only != 'true'
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     strategy:
@@ -120,7 +121,7 @@ jobs:
           submodules: false
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v5
+        uses: pnpm/action-setup@v6.0.8
         with:
           version: ${{ env.PNPM_VERSION }}
 
@@ -141,7 +142,7 @@ jobs:
     name: Docs
     needs: scope
     if: needs.scope.outputs.docs_changed == 'true'
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -153,7 +154,7 @@ jobs:
           submodules: false
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v5
+        uses: pnpm/action-setup@v6.0.8
         with:
           version: ${{ env.PNPM_VERSION }}
 

@@ -1,6 +1,11 @@
 import { spawn } from "node:child_process";
+import path from "node:path";
 import { CopilotAcpUnsupportedError } from "../errors.js";
-import { buildSpawnCommandOptions } from "../spawn-command-options.js";
+import {
+  buildSpawnCommandOptions,
+  readWindowsEnvValue,
+  resolveWindowsCommand,
+} from "../spawn-command-options.js";
 import { type AcpClientOptions } from "../types.js";
 import { basenameToken, splitCommandLine } from "./client-process.js";
 
@@ -152,54 +157,12 @@ function compareVersionParts(left: readonly number[], right: readonly number[]):
 }
 
 async function detectGeminiVersion(command: string): Promise<GeminiVersion | undefined> {
-  return await new Promise<GeminiVersion | undefined>((resolve) => {
-    const child = spawn(
-      command,
-      ["--version"],
-      buildSpawnCommandOptions(command, {
-        stdio: ["ignore", "pipe", "pipe"],
-        windowsHide: true,
-      }),
-    );
-
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    const finish = (value: GeminiVersion | undefined) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(timer);
-      child.removeAllListeners();
-      child.stdout?.removeAllListeners();
-      child.stderr?.removeAllListeners();
-      resolve(value);
-    };
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      finish(undefined);
-    }, GEMINI_VERSION_TIMEOUT_MS);
-
-    child.stdout?.setEncoding("utf8");
-    child.stderr?.setEncoding("utf8");
-    child.stdout?.on("data", (chunk: string) => {
-      stdout += chunk;
-    });
-    child.stderr?.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
-    child.once("error", () => {
-      finish(undefined);
-    });
-    child.once("close", () => {
-      const versionLine = `${stdout}\n${stderr}`
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .find((line) => /\d+\.\d+\.\d+/.test(line));
-      finish(parseGeminiVersion(versionLine));
-    });
-  });
+  const output = await readCommandOutput(command, ["--version"], GEMINI_VERSION_TIMEOUT_MS);
+  const versionLine = output
+    ?.split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => /\d+\.\d+\.\d+/.test(line));
+  return parseGeminiVersion(versionLine);
 }
 
 export async function resolveGeminiCommandArgs(
@@ -340,13 +303,43 @@ export function buildClaudeCodeOptionsMeta(
     claudeCodeOptions.maxTurns = options.maxTurns;
   }
 
-  if (Object.keys(claudeCodeOptions).length === 0) {
+  const meta: Record<string, unknown> = {};
+  if (Object.keys(claudeCodeOptions).length > 0) {
+    meta.claudeCode = { options: claudeCodeOptions };
+  }
+
+  const systemPrompt = options.systemPrompt;
+  if (typeof systemPrompt === "string" && systemPrompt.length > 0) {
+    meta.systemPrompt = systemPrompt;
+  } else if (
+    systemPrompt &&
+    typeof systemPrompt === "object" &&
+    typeof systemPrompt.append === "string" &&
+    systemPrompt.append.length > 0
+  ) {
+    meta.systemPrompt = { append: systemPrompt.append };
+  }
+
+  if (Object.keys(meta).length === 0) {
     return undefined;
   }
 
-  return {
-    claudeCode: {
-      options: claudeCodeOptions,
-    },
-  };
+  return meta;
+}
+
+export function resolveClaudeCodeExecutable(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  if (platform !== "win32") {
+    return undefined;
+  }
+  if (readWindowsEnvValue(env, "CLAUDE_CODE_EXECUTABLE")) {
+    return undefined;
+  }
+  const resolved = resolveWindowsCommand("claude", env);
+  if (!resolved) {
+    return undefined;
+  }
+  return path.resolve(resolved);
 }

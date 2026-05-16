@@ -43,11 +43,11 @@ acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--n
 
 `<agent>` can be:
 
-- built-in friendly name from [../README.md](../README.md)
+- built-in friendly name from [the README](https://github.com/openclaw/acpx/blob/main/README.md)
 - unknown token (treated as raw command)
 - overridden by `--agent <command>` escape hatch
 
-Additional built-in agent docs live in [../agents/README.md](../agents/README.md).
+Additional built-in agent docs live in [the Agents page](agents.md).
 
 Prompt options:
 
@@ -102,21 +102,23 @@ or close a PR if you run it against a live repository.
 
 All global options:
 
-| Option                                   | Description                                    | Details                                                                                                                                                         |
-| ---------------------------------------- | ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--agent <command>`                      | Raw ACP agent command (escape hatch)           | Do not combine with positional agent token.                                                                                                                     |
-| `--cwd <dir>`                            | Working directory                              | Defaults to current directory. Stored as absolute path for scoping.                                                                                             |
-| `--approve-all`                          | Auto-approve all permissions                   | Permission mode `approve-all`.                                                                                                                                  |
-| `--approve-reads`                        | Auto-approve reads/searches, prompt for others | Default permission mode.                                                                                                                                        |
-| `--deny-all`                             | Deny all permissions                           | Permission mode `deny-all`.                                                                                                                                     |
-| `--format <fmt>`                         | Output format                                  | `text` (default), `json`, `quiet`.                                                                                                                              |
-| `--suppress-reads`                       | Suppress read file contents                    | Replaces raw read payloads with `[read output suppressed]`.                                                                                                     |
-| `--json-strict`                          | Strict JSON mode                               | Requires `--format json`; suppresses non-JSON stderr output.                                                                                                    |
-| `--non-interactive-permissions <policy>` | Non-TTY prompt policy                          | `deny` (default) or `fail` when approval prompt cannot be shown.                                                                                                |
-| `--timeout <seconds>`                    | Max wait time for agent response               | Must be positive. Decimal seconds allowed.                                                                                                                      |
-| `--ttl <seconds>`                        | Queue owner idle TTL before shutdown           | Default `300`. `0` disables TTL.                                                                                                                                |
-| `--model <id>`                           | Set agent model                                | Passed through to agent-specific session creation metadata when applicable; if the agent advertises models, `acpx` also applies it via ACP `session/set_model`. |
-| `--verbose`                              | Enable verbose logs                            | Prints ACP/debug details to stderr.                                                                                                                             |
+| Option                                   | Description                                    | Details                                                                                                                                                                                                    |
+| ---------------------------------------- | ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--agent <command>`                      | Raw ACP agent command (escape hatch)           | Do not combine with positional agent token.                                                                                                                                                                |
+| `--cwd <dir>`                            | Working directory                              | Defaults to current directory. Stored as absolute path for scoping.                                                                                                                                        |
+| `--approve-all`                          | Auto-approve all permissions                   | Permission mode `approve-all`.                                                                                                                                                                             |
+| `--approve-reads`                        | Auto-approve reads/searches, prompt for others | Default permission mode.                                                                                                                                                                                   |
+| `--deny-all`                             | Deny all permissions                           | Permission mode `deny-all`.                                                                                                                                                                                |
+| `--format <fmt>`                         | Output format                                  | `text` (default), `json`, `quiet`.                                                                                                                                                                         |
+| `--suppress-reads`                       | Suppress read file contents                    | Replaces raw read payloads with `[read output suppressed]`.                                                                                                                                                |
+| `--json-strict`                          | Strict JSON mode                               | Requires `--format json`; suppresses non-JSON stderr output.                                                                                                                                               |
+| `--no-terminal`                          | Disable ACP terminal capability                | Advertises `clientCapabilities.terminal: false` during ACP initialize for new agent clients.                                                                                                               |
+| `--non-interactive-permissions <policy>` | Non-TTY prompt policy                          | `deny` (default) or `fail` when approval prompt cannot be shown.                                                                                                                                           |
+| `--permission-policy <json-or-file>`     | Per-tool permission policy                     | JSON object or file path with `autoApprove`, `autoDeny`, `escalate`, and optional `defaultAction` (`approve`, `deny`, `escalate`). Alias: `--policy`.                                                      |
+| `--timeout <seconds>`                    | Max wait time for agent response               | Must be positive. Decimal seconds allowed.                                                                                                                                                                 |
+| `--ttl <seconds>`                        | Queue owner idle TTL before shutdown           | Default `300`. `0` disables TTL.                                                                                                                                                                           |
+| `--model <id>`                           | Set agent model                                | Claude-compatible adapters may consume session creation metadata; other agents must advertise ACP models and support `session/set_model`, otherwise `acpx` fails clearly instead of silently falling back. |
+| `--verbose`                              | Enable verbose logs                            | Prints ACP/debug details to stderr.                                                                                                                                                                        |
 
 Permission flags are mutually exclusive. Using more than one of `--approve-all`, `--approve-reads`, `--deny-all` is a usage error.
 
@@ -127,10 +129,12 @@ acpx --approve-all codex 'apply this patch and run tests'
 acpx --approve-reads codex 'inspect the repo and propose a plan'
 acpx --deny-all codex 'summarize this code without running tools'
 acpx --non-interactive-permissions fail codex 'fail fast when prompt cannot be shown'
+acpx --policy '{"escalate":["execute"],"defaultAction":"deny"}' --format json codex exec 'run tests'
 
 acpx --cwd ~/repos/api codex 'review auth middleware'
 acpx --format json codex exec 'summarize open TODO items'
 acpx --format json --json-strict codex exec 'machine-safe JSON output'
+acpx --no-terminal codex exec 'summarize without terminal capability'
 acpx --timeout 120 codex 'investigate flaky test failures'
 acpx --ttl 30 codex 'keep queue owner warm for quick follow-up'
 acpx --verbose codex 'debug adapter startup issues'
@@ -196,7 +200,7 @@ acpx [global_options] claude sessions [list | new [--name <name>] | ensure [--na
 
 Built-in command mapping: `claude -> npx -y @agentclientprotocol/claude-agent-acp`
 
-Additional built-in agent docs live in [../agents/README.md](../agents/README.md).
+Additional built-in agent docs live in [the Agents page](agents.md).
 
 ### Custom positional agents
 
@@ -305,6 +309,7 @@ acpx [global_options] <agent> sessions show
 acpx [global_options] <agent> sessions show <name>
 acpx [global_options] <agent> sessions history
 acpx [global_options] <agent> sessions history <name> [--limit <count>]
+acpx [global_options] <agent> sessions prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]
 
 acpx [global_options] sessions ...   # defaults to codex
 ```
@@ -316,12 +321,17 @@ Behavior:
 - `sessions new` creates a fresh cwd-scoped default session
 - `sessions new --name <name>` creates a fresh named session for cwd
 - creating a fresh session soft-closes the previous open session in that scope (if present)
+- text and quiet output print the local `acpxRecordId`; JSON output also includes
+  `acpxSessionId` and, when the adapter exposes one, `agentSessionId`
 - `sessions ensure` returns the nearest matching active session or creates one for cwd
 - `sessions ensure --name <name>` does the same for named sessions
 - `sessions close` soft-closes the current cwd default session
 - `sessions close <name>` soft-closes current cwd named session
 - `sessions show [name]` displays stored session metadata
 - `sessions history [name]` displays stored turn history previews (default 20, configurable with `--limit`)
+- `sessions prune --dry-run` previews closed sessions that can be deleted
+- `sessions prune` deletes closed session records for the selected agent; add `--include-history` to delete event stream files too
+- `sessions prune --before <date>` and `--older-than <days>` filter by close time, falling back to last-used time for older records
 - close errors if the target session does not exist
 
 ## `status` command
@@ -335,11 +345,15 @@ acpx [global_options] status -s <name>
 
 Shows local process status for the cwd-scoped session:
 
-- `running`, `dead`, or `no-session`
+- `running`, `idle`, `dead`, or `no-session`
 - session id, agent command, pid
 - uptime when running
 - last prompt timestamp
 - last known exit code/signal when dead
+
+`idle` means the persistent session is saved and resumable, but no queue owner is
+currently running. The next prompt starts a queue owner and reconnects the
+session.
 
 Status checks are local and PID-based (`kill(pid, 0)` semantics).
 
@@ -370,7 +384,7 @@ Supported keys:
   "timeout": null,
   "format": "text",
   "agents": {
-    "my-custom": { "command": "./bin/my-acp-server" }
+    "my-custom": { "command": "./bin/my-acp-server", "args": ["acp"] }
   },
   "auth": {
     "my_auth_method_id": "credential-value"
@@ -379,6 +393,11 @@ Supported keys:
 ```
 
 CLI flags always override config values.
+
+For ACP `authenticate` handshakes, use either config `auth` entries or explicit
+`ACPX_AUTH_<METHOD_ID>` environment variables such as `ACPX_AUTH_OPENAI_API_KEY`.
+Ambient provider env vars such as `OPENAI_API_KEY` are still passed through to
+child agents, but they do not trigger ACP auth-method selection on their own.
 
 ## `--agent` escape hatch
 
@@ -487,7 +506,7 @@ Hard rule for the ACP stream:
 When `--format json` is used:
 
 - commands that talk to an ACP adapter emit raw ACP JSON-RPC messages.
-- local query commands (`sessions list/show/history`) emit local JSON documents (not ACP stream traffic).
+- local query commands (`sessions list/show/history/prune`) emit local JSON documents (not ACP stream traffic).
 
 ### Sessions/query command output behavior
 
@@ -498,6 +517,9 @@ When `--format json` is used:
 - `sessions show` with `json`: full session record object
 - `sessions history` with `text`: tab-separated `timestamp role textPreview` entries
 - `sessions history` with `json`: object containing `entries` array
+- `sessions prune` with `text`: summary plus pruned ids and close/last-used time
+- `sessions prune` with `json`: object containing `action`, `dryRun`, `count`, `bytesFreed`, and `pruned`
+- `sessions prune` with `quiet`: one pruned session id per line
 - `status` with `text`: key/value process status lines
 
 ## Permission modes
@@ -517,6 +539,12 @@ Non-interactive prompt policy:
 
 - `--non-interactive-permissions deny`: deny non-read/search prompts when no TTY (default)
 - `--non-interactive-permissions fail`: fail with `PERMISSION_PROMPT_UNAVAILABLE`
+
+Per-tool policy:
+
+- `--permission-policy <json-or-file>` or `--policy <json-or-file>` matches ACP permission requests by tool kind, title head, title, or raw input tool/name.
+- `autoDeny` wins over `autoApprove`, which wins over `escalate`; unmatched requests use `defaultAction` when set, otherwise the selected permission mode.
+- Non-interactive escalations deny the current request. Text mode prints a `[permission]` notice; JSON mode keeps raw ACP NDJSON and includes escalation details, including tool input when supplied by the agent, on the `session/request_permission` response at `_meta.acpx.permissionEscalation`.
 
 ## Exit codes
 

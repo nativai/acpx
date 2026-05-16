@@ -6,7 +6,7 @@ export default defineFlow({
   nodes: {
     prepare: action({
       run: ({ input }) => ({
-        ticket: String((input as { ticket?: string }).ticket ?? "review"),
+        ticket: (input as { ticket?: string }).ticket ?? "review",
       }),
     }),
     wait_for_human: checkpoint({

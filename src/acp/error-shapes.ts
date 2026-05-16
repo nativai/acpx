@@ -9,7 +9,7 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value as Record<string, unknown>;
 }
 
-function toAcpErrorPayload(value: unknown): OutputErrorAcpPayload | undefined {
+export function toAcpErrorPayload(value: unknown): OutputErrorAcpPayload | undefined {
   const record = asRecord(value);
   if (!record) {
     return undefined;

@@ -270,7 +270,7 @@ function ModeButton({
   children: ReactNode;
   label: string;
   active: boolean;
-  onClick(): void;
+  onClick: () => void;
 }) {
   return (
     <button

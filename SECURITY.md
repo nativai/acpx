@@ -80,7 +80,7 @@ If an attacker can already modify those files or the commands that `acpx` launch
 
 ## Runtime Requirements
 
-`acpx` requires **Node.js 22.12.0 or later**.
+`acpx` requires **Node.js 22.13.0 or later**.
 
 Verify your version with:
 

@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { realpathSync } from "node:fs";
+import type { SessionAgentOptions } from "../../runtime/engine/session-options.js";
 import type {
   AuthPolicy,
   McpServer,
@@ -14,11 +15,13 @@ export type QueueOwnerRuntimeOptions = {
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
   authCredentials?: Record<string, string>;
   authPolicy?: AuthPolicy;
+  terminal?: boolean;
   suppressSdkConsoleErrors?: boolean;
   verbose?: boolean;
   ttlMs?: number;
   maxQueueDepth?: number;
   promptRetries?: number;
+  sessionOptions?: SessionAgentOptions;
 };
 
 type SessionSendLike = {
@@ -28,11 +31,13 @@ type SessionSendLike = {
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
   authCredentials?: Record<string, string>;
   authPolicy?: AuthPolicy;
+  terminal?: boolean;
   suppressSdkConsoleErrors?: boolean;
   verbose?: boolean;
   ttlMs?: number;
   maxQueueDepth?: number;
   promptRetries?: number;
+  sessionOptions?: SessionAgentOptions;
 };
 
 export function sanitizeQueueOwnerExecArgv(
@@ -126,11 +131,13 @@ export function queueOwnerRuntimeOptionsFromSend(
     nonInteractivePermissions: options.nonInteractivePermissions,
     authCredentials: options.authCredentials,
     authPolicy: options.authPolicy,
+    terminal: options.terminal,
     suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
     verbose: options.verbose,
     ttlMs: options.ttlMs,
     maxQueueDepth: options.maxQueueDepth,
     promptRetries: options.promptRetries,
+    sessionOptions: options.sessionOptions,
   };
 }
 

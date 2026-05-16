@@ -29,7 +29,7 @@ export function useGraphCamera({
 
   useEffect(() => {
     if (!flowInstance?.viewportInitialized || !runId || viewMode !== "overview") {
-      return;
+      return undefined;
     }
     lastFollowTargetRef.current = null;
 
@@ -55,11 +55,11 @@ export function useGraphCamera({
       !currentNodeId ||
       !currentNodePosition
     ) {
-      return;
+      return undefined;
     }
     const followTargetKey = `${runId}:${layoutKey}:${currentNodeId}`;
     if (lastFollowTargetRef.current === followTargetKey) {
-      return;
+      return undefined;
     }
     lastFollowTargetRef.current = followTargetKey;
 
@@ -95,5 +95,5 @@ export function useGraphCamera({
 }
 
 function easeOutCubic(value: number): number {
-  return 1 - Math.pow(1 - value, 3);
+  return 1 - (1 - value) ** 3;
 }

@@ -160,7 +160,7 @@ export function revealConversationTranscript(
     return sessionSlice;
   }
 
-  const firstHighlightedIndex = highlightedIndexes[0]!;
+  const firstHighlightedIndex = highlightedIndexes[0];
   const lastHighlightedIndex = highlightedIndexes.at(-1)!;
   const visiblePrefix = sessionSlice.slice(0, firstHighlightedIndex);
   const highlightedSlice = sessionSlice.slice(firstHighlightedIndex, lastHighlightedIndex + 1);
@@ -343,7 +343,7 @@ function describeMessage(
   "textBlocks" | "toolUses" | "toolResults" | "hiddenPayloads" | "parts"
 > {
   if (!message || typeof message !== "object") {
-    const text = String(message ?? "");
+    const text = primitiveText(message);
     return {
       textBlocks: [text].filter(Boolean),
       toolUses: [],
@@ -394,7 +394,7 @@ function describeStructuredMessage(
   if (Array.isArray(content)) {
     for (const [index, part] of content.entries()) {
       if (!part || typeof part !== "object") {
-        const text = String(part ?? "").trim();
+        const text = primitiveText(part).trim();
         if (text) {
           textBlocks.push(text);
           contentParts.push({ type: "text", text });
@@ -414,8 +414,12 @@ function describeStructuredMessage(
       if ("ToolUse" in part) {
         const toolUse = (part as { ToolUse?: Record<string, unknown> }).ToolUse;
         if (toolUse && typeof toolUse === "object") {
+          const toolUseId =
+            typeof toolUse.id === "string" || typeof toolUse.id === "number"
+              ? String(toolUse.id)
+              : `tool-use-${index}`;
           const toolUseView = {
-            id: String(toolUse.id ?? `tool-use-${index}`),
+            id: toolUseId,
             name: typeof toolUse.name === "string" ? toolUse.name : "Tool call",
             summary: summarizeToolUse(toolUse),
             raw: toolUse,
@@ -666,4 +670,19 @@ function truncate(value: string, maxLength: number): string {
     return normalized;
   }
   return `${normalized.slice(0, maxLength - 1)}…`;
+}
+
+function primitiveText(value: unknown): string {
+  if (value == null) {
+    return "";
+  }
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    typeof value === "bigint"
+  ) {
+    return String(value);
+  }
+  return "";
 }

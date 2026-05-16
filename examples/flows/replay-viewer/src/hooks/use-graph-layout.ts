@@ -11,7 +11,7 @@ export function useGraphLayout(bundle: LoadedRunBundle | null) {
 
     if (!bundle) {
       setLayout(null);
-      return;
+      return undefined;
     }
 
     setLayout(null);

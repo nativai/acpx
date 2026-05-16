@@ -6,6 +6,7 @@ import {
   isRetryablePromptError,
   normalizeOutputError,
 } from "../../acp/error-normalization.js";
+import { assertRequestedModelSupported } from "../../acp/model-support.js";
 import { InterruptedError, withInterrupt, withTimeout } from "../../async-control.js";
 import { tailClaudeSubagentJsonl } from "../../claude-jsonl.js";
 import { SessionClosedError } from "../../errors.js";
@@ -18,7 +19,11 @@ import {
 } from "../../runtime/engine/lifecycle.js";
 import { runPromptTurn } from "../../runtime/engine/prompt-turn.js";
 import { connectAndLoadSession } from "../../runtime/engine/reconnect.js";
-import { sessionOptionsFromRecord } from "../../runtime/engine/session-options.js";
+import {
+  mergeSessionOptions,
+  sessionOptionsFromRecord,
+  type SessionAgentOptions,
+} from "../../runtime/engine/session-options.js";
 import {
   cloneSessionAcpxState,
   cloneSessionConversation,
@@ -29,6 +34,9 @@ import {
 } from "../../session/conversation-model.js";
 import { defaultSessionEventLog } from "../../session/event-log.js";
 import { SessionEventWriter } from "../../session/events.js";
+import { LiveSessionCheckpoint } from "../../session/live-checkpoint.js";
+import { setCurrentModelId, setDesiredModelId } from "../../session/mode-preference.js";
+import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
 import {
   absolutePath,
   isoNow,
@@ -38,21 +46,17 @@ import {
 import {
   SESSION_RECORD_SCHEMA,
   type AcpJsonRpcMessage,
-  type AcpMessageDirection,
   type AuthPolicy,
-  type ClientOperation,
   type McpServer,
   type NonInteractivePermissionPolicy,
   type OutputErrorAcpPayload,
   type OutputErrorCode,
   type OutputErrorOrigin,
   type OutputFormatter,
-  type PermissionMode,
-  type PromptInput,
+  type PermissionEscalationEvent,
+  type PermissionPolicy,
   type RunPromptResult,
-  type SessionNotification,
   SessionRecord,
-  SessionResumePolicy,
   SessionSendResult,
   SubagentRef,
 } from "../../types.js";
@@ -68,27 +72,14 @@ function claudeSubagentDir(cwd: string, acpSessionId: string): string {
 
 const INTERRUPT_CANCEL_WAIT_MS = 2_500;
 
-type RunSessionPromptOptions = {
+type RunSessionPromptOptions = Omit<
+  SessionSendOptions,
+  "errorEmissionPolicy" | "maxQueueDepth" | "sessionId" | "ttlMs" | "waitForCompletion"
+> & {
   sessionRecordId: string;
-  prompt: PromptInput;
-  resumePolicy?: SessionResumePolicy;
-  mcpServers?: McpServer[];
-  permissionMode: PermissionMode;
-  nonInteractivePermissions?: NonInteractivePermissionPolicy;
-  authCredentials?: Record<string, string>;
-  authPolicy?: AuthPolicy;
-  outputFormatter: OutputFormatter;
-  onAcpMessage?: (direction: AcpMessageDirection, message: AcpJsonRpcMessage) => void;
-  onSessionUpdate?: (notification: SessionNotification) => void;
-  onClientOperation?: (operation: ClientOperation) => void;
-  timeoutMs?: number;
-  suppressSdkConsoleErrors?: boolean;
-  verbose?: boolean;
-  promptRetries?: number;
   onClientAvailable?: (controller: ActiveSessionController) => void;
   onClientClosed?: () => void;
   onPromptActive?: () => Promise<void> | void;
-  client?: AcpClient;
 };
 
 type ActiveSessionController = QueueOwnerActiveSessionController;
@@ -133,6 +124,14 @@ class QueueTaskOutputFormatter implements OutputFormatter {
     });
   }
 
+  onPermissionEscalation(event: PermissionEscalationEvent): void {
+    this.send({
+      type: "permission_escalation",
+      requestId: this.requestId,
+      event,
+    });
+  }
+
   flush(): void {}
 }
 
@@ -140,6 +139,7 @@ const DISCARD_OUTPUT_FORMATTER: OutputFormatter = {
   setContext() {},
   onAcpMessage() {},
   onError() {},
+  onPermissionEscalation() {},
   flush() {},
 };
 
@@ -155,27 +155,45 @@ function toPromptResult(
   };
 }
 
-async function applyRequestedModelIfAdvertised(params: {
+async function applyPromptModelIfAdvertised(params: {
   client: AcpClient;
   sessionId: string;
   requestedModel: string | undefined;
-  models: import("../../acp/client.js").SessionCreateResult["models"];
+  record: SessionRecord;
   timeoutMs?: number;
-}): Promise<boolean> {
+}): Promise<void> {
   const requestedModel =
     typeof params.requestedModel === "string" ? params.requestedModel.trim() : "";
-  if (!requestedModel || !params.models) {
-    return false;
+  if (!requestedModel) {
+    return;
   }
-  if (params.models.currentModelId === requestedModel) {
-    return true;
+
+  const availableModels = params.record.acpx?.available_models;
+  assertRequestedModelSupported({
+    requestedModel,
+    models: Array.isArray(availableModels)
+      ? {
+          currentModelId: params.record.acpx?.current_model_id ?? "",
+          availableModels: availableModels.map((modelId) => ({ modelId, name: modelId })),
+        }
+      : undefined,
+    agentCommand: params.record.agentCommand,
+    context: "apply",
+  });
+  if (!Array.isArray(availableModels)) {
+    return;
+  }
+  if (params.record.acpx?.current_model_id === requestedModel) {
+    setDesiredModelId(params.record, requestedModel);
+    return;
   }
 
   await withTimeout(
     params.client.setSessionModel(params.sessionId, requestedModel),
     params.timeoutMs,
   );
-  return true;
+  setDesiredModelId(params.record, requestedModel);
+  setCurrentModelId(params.record, requestedModel);
 }
 
 function jsonRpcIdKey(value: unknown): string | undefined {
@@ -289,10 +307,12 @@ export async function runQueuedTask(
     verbose?: boolean;
     mcpServers?: McpServer[];
     nonInteractivePermissions?: NonInteractivePermissionPolicy;
+    permissionPolicy?: PermissionPolicy;
     authCredentials?: Record<string, string>;
     authPolicy?: AuthPolicy;
     suppressSdkConsoleErrors?: boolean;
     promptRetries?: number;
+    sessionOptions?: SessionAgentOptions;
     onClientAvailable?: (controller: ActiveSessionController) => void;
     onClientClosed?: () => void;
     onPromptActive?: () => Promise<void> | void;
@@ -311,13 +331,15 @@ export async function runQueuedTask(
       resumePolicy: task.resumePolicy,
       nonInteractivePermissions:
         task.nonInteractivePermissions ?? options.nonInteractivePermissions,
+      permissionPolicy: task.permissionPolicy,
       authCredentials: options.authCredentials,
       authPolicy: options.authPolicy,
       outputFormatter,
       timeoutMs: task.timeoutMs,
       suppressSdkConsoleErrors: task.suppressSdkConsoleErrors ?? options.suppressSdkConsoleErrors,
       verbose: options.verbose,
-      promptRetries: options.promptRetries,
+      promptRetries: task.promptRetries ?? options.promptRetries ?? 0,
+      sessionOptions: mergeSessionOptions(task.sessionOptions, options.sessionOptions),
       onClientAvailable: options.onClientAvailable,
       onClientClosed: options.onClientClosed,
       onPromptActive: options.onPromptActive,
@@ -378,7 +400,13 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
 
   const conversation = cloneSessionConversation(record);
   let acpxState = cloneSessionAcpxState(record.acpx);
-  const promptMessageId = recordPromptSubmission(conversation, options.prompt, isoNow());
+  const promptStartedAt = isoNow();
+  const promptMessageId = recordPromptSubmission(conversation, options.prompt, promptStartedAt);
+  record.lastPromptAt = promptStartedAt;
+  record.lastUsedAt = promptStartedAt;
+  applyConversation(record, conversation);
+  record.acpx = acpxState;
+  await writeSessionRecord(record);
 
   output.setContext({
     sessionId: record.acpxRecordId,
@@ -389,6 +417,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   });
   const pendingMessages: AcpJsonRpcMessage[] = [];
   const pendingConnectOutputMessages: AcpJsonRpcMessage[] = [];
+  const sessionOptions = mergeSessionOptions(
+    options.sessionOptions,
+    sessionOptionsFromRecord(record),
+  );
   let bufferingConnectOutput = true;
   let promptTurnActive = false;
   let promptTurnHadSideEffects = false;
@@ -506,11 +538,44 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       return;
     }
 
-    const batch = pendingMessages.splice(0, pendingMessages.length);
+    const batch = pendingMessages.splice(0);
     await measurePerf("session.events.flush_pending", async () => {
       await eventWriter.appendMessages(batch, { checkpoint });
     });
   };
+  const preserveClosedState = async (): Promise<void> => {
+    const latest = await resolveSessionRecord(record.acpxRecordId).catch(() => undefined);
+    if (!latest?.closed) {
+      return;
+    }
+
+    record.closed = true;
+    record.closedAt = latest.closedAt ?? record.closedAt ?? isoNow();
+    record.pid = latest.pid;
+    if (latest.acpx) {
+      record.acpx = {
+        ...record.acpx,
+        ...latest.acpx,
+      };
+    }
+  };
+  const liveCheckpoint = new LiveSessionCheckpoint({
+    save: async () => {
+      await flushPendingMessages(false);
+      record.lastUsedAt = isoNow();
+      applyConversation(record, conversation);
+      record.acpx = acpxState;
+      await preserveClosedState();
+      await eventWriter.checkpoint();
+    },
+    onError: (error) => {
+      if (options.verbose) {
+        process.stderr.write(
+          "[acpx] live session checkpoint failed: " + formatErrorMessage(error) + "\n",
+        );
+      }
+    },
+  });
 
   const ownClient = options.client == null;
   const client =
@@ -521,15 +586,19 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       mcpServers: options.mcpServers,
       permissionMode: options.permissionMode,
       nonInteractivePermissions: options.nonInteractivePermissions,
+      permissionPolicy: options.permissionPolicy,
       authCredentials: options.authCredentials,
       authPolicy: options.authPolicy,
+      terminal: options.terminal,
       suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
       verbose: options.verbose,
-      sessionOptions: sessionOptionsFromRecord(record),
+      sessionOptions,
     });
   client.updateRuntimeOptions({
     permissionMode: options.permissionMode,
     nonInteractivePermissions: options.nonInteractivePermissions,
+    permissionPolicy: options.permissionPolicy,
+    terminal: options.terminal,
     suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
     verbose: options.verbose,
   });
@@ -692,6 +761,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         }
       }
 
+      liveCheckpoint.request();
       options.onSessionUpdate?.(notification);
     },
     onClientOperation: (operation) => {
@@ -700,7 +770,12 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       }
       acpxState = recordConversationClientOperation(conversation, acpxState, operation);
       trimConversationForRuntime(conversation);
+      liveCheckpoint.request();
       options.onClientOperation?.(operation);
+    },
+    onPermissionEscalation: (event) => {
+      output.onPermissionEscalation(event);
+      options.onPermissionEscalation?.(event);
     },
   });
   let activeSessionIdForControl = record.acpSessionId;
@@ -771,10 +846,18 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
           );
         }
 
+        await applyPromptModelIfAdvertised({
+          client,
+          sessionId: activeSessionId,
+          requestedModel: sessionOptions?.model,
+          record,
+          timeoutMs: options.timeoutMs,
+        });
+
         output.setContext({
           sessionId: record.acpxRecordId,
         });
-        await flushPendingMessages(false);
+        await liveCheckpoint.checkpoint();
 
         const maxRetries = options.promptRetries ?? 0;
         let response;
@@ -937,7 +1020,13 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     applyConversation(record, conversation);
     record.acpx = acpxState;
     clearInterval(streamFlushInterval);
+    await liveCheckpoint.flush().catch(() => {
+      // best effort on close
+    });
     await flushPendingMessages(false).catch(() => {
+      // best effort on close
+    });
+    await preserveClosedState().catch(() => {
       // best effort on close
     });
     await closeEventWriter(true).catch(() => {
@@ -956,8 +1045,10 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
     mcpServers: options.mcpServers,
     permissionMode: options.permissionMode,
     nonInteractivePermissions: options.nonInteractivePermissions,
+    permissionPolicy: options.permissionPolicy,
     authCredentials: options.authCredentials,
     authPolicy: options.authPolicy,
+    terminal: options.terminal,
     suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
     verbose: options.verbose,
     onAcpMessage: options.onAcpMessage,
@@ -973,6 +1064,10 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
         promptTurnHadSideEffects = true;
       }
       options.onClientOperation?.(operation);
+    },
+    onPermissionEscalation: (event) => {
+      output.onPermissionEscalation(event);
+      options.onPermissionEscalation?.(event);
     },
     sessionOptions: options.sessionOptions,
   });
@@ -995,6 +1090,7 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
           sessionId,
           requestedModel: options.sessionOptions?.model,
           models: createdSession.models,
+          agentCommand: options.agentCommand,
           timeoutMs: options.timeoutMs,
         });
 
@@ -1056,12 +1152,15 @@ export async function sendSessionDirect(options: SessionSendOptions): Promise<Se
     permissionMode: options.permissionMode,
     resumePolicy: options.resumePolicy,
     nonInteractivePermissions: options.nonInteractivePermissions,
+    permissionPolicy: options.permissionPolicy,
     authCredentials: options.authCredentials,
     authPolicy: options.authPolicy,
+    terminal: options.terminal,
     outputFormatter: options.outputFormatter,
     onAcpMessage: options.onAcpMessage,
     onSessionUpdate: options.onSessionUpdate,
     onClientOperation: options.onClientOperation,
+    onPermissionEscalation: options.onPermissionEscalation,
     timeoutMs: options.timeoutMs,
     suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
     verbose: options.verbose,

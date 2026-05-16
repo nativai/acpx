@@ -333,7 +333,15 @@ function createMessageInbox(socket: WebSocket) {
   }> = [];
 
   socket.on("message", (data) => {
-    const message = JSON.parse(data.toString()) as ReplayServerMessage;
+    const text =
+      typeof data === "string"
+        ? data
+        : Array.isArray(data)
+          ? Buffer.concat(data).toString("utf8")
+          : Buffer.isBuffer(data)
+            ? data.toString("utf8")
+            : Buffer.from(new Uint8Array(data)).toString("utf8");
+    const message = JSON.parse(text) as ReplayServerMessage;
 
     for (let index = 0; index < waiters.length; index += 1) {
       const waiter = waiters[index];

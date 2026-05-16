@@ -6,6 +6,12 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { runPromptTurn } from "../src/runtime/engine/prompt-turn.js";
+import {
+  createSessionConversation,
+  recordPromptSubmission,
+  recordSessionUpdate,
+} from "../src/session/conversation-model.js";
 import {
   extractAgentMessageChunkText,
   extractJsonRpcId,
@@ -33,6 +39,13 @@ const FLOW_WORKDIR_FIXTURE_PATH = fileURLToPath(
 );
 const MOCK_AGENT_COMMAND = `node ${JSON.stringify(MOCK_AGENT_PATH)}`;
 const LOAD_CAPABLE_MOCK_AGENT_COMMAND = `${MOCK_AGENT_COMMAND} --supports-load-session`;
+
+const unsafeCodeCharEscapes = Object.freeze({
+  "<": "\\u003C",
+  ">": "\\u003E",
+  "\u2028": "\\u2028",
+  "\u2029": "\\u2029",
+});
 
 type CliRunResult = {
   code: number | null;
@@ -217,10 +230,7 @@ test("integration: flow run executes function and shell actions from --input-fil
       assert.equal(payload.status, "completed");
       assert.equal(payload.outputs?.prepare?.text, "SMOKE");
       assert.equal(payload.outputs?.finalize?.value, "SMOKE");
-      assert.equal(
-        await fs.realpath(String(payload.outputs?.finalize?.cwd ?? "")),
-        await fs.realpath(cwd),
-      );
+      assert.equal(await fs.realpath(payload.outputs?.finalize?.cwd ?? ""), await fs.realpath(cwd));
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
@@ -283,7 +293,9 @@ test("integration: flow run finalizes interrupted bundles on SIGHUP", async () =
 
       assert.equal(finalState.currentNode, "slow");
       assert.equal(finalState.currentAttemptId, "slow#1");
-      assert.match(String(finalState.statusDetail ?? ""), /Failed in slow: Interrupted/);
+      const statusDetail =
+        typeof finalState.statusDetail === "string" ? finalState.statusDetail : "";
+      assert.match(statusDetail, /Failed in slow: Interrupted/);
 
       const traceEvents = (await fs.readFile(path.join(runDir, "trace.ndjson"), "utf8"))
         .trim()
@@ -334,9 +346,7 @@ test("integration: flow run fails ACP nodes promptly when the agent disconnects 
         "failed",
       );
       assert.match(
-        String(
-          (finalState.results as Record<string, { error?: string }>).slow?.error ?? result.stderr,
-        ),
+        (finalState.results as Record<string, { error?: string }>).slow?.error ?? result.stderr,
         /agent disconnected/i,
       );
     } finally {
@@ -459,7 +469,7 @@ test("integration: flow run preserves approve-all through persistent ACP writes"
           '  startAt: "write_file",',
           "  nodes: {",
           "    write_file: acp({",
-          `      prompt: () => ${JSON.stringify(`write ${writePath} hello`)},`,
+          `      prompt: () => ${jsStringLiteral(`write ${writePath} hello`)},`,
           "      parse: (text) => ({ reply: text }),",
           "    }),",
           "  },",
@@ -509,6 +519,89 @@ test("integration: flow run preserves approve-all through persistent ACP writes"
     }
   });
 });
+
+test("integration: flow run applies permission policy to ACP permission requests", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-policy-cwd-"));
+    const flowDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-policy-"));
+    const flowPath = path.join(flowDir, "permission-policy.flow.ts");
+
+    try {
+      await fs.writeFile(
+        flowPath,
+        [
+          'import { acp, defineFlow } from "acpx/flows";',
+          "",
+          "export default defineFlow({",
+          '  name: "permission-policy-flow",',
+          "  permissions: {",
+          '    requiredMode: "approve-all",',
+          "    requireExplicitGrant: true,",
+          '    reason: "This flow intentionally requests a write-like ACP permission.",',
+          "  },",
+          '  startAt: "permission",',
+          "  nodes: {",
+          "    permission: acp({",
+          '      prompt: () => "permission execute Bash",',
+          "      parse: (text) => ({ reply: text }),",
+          "    }),",
+          "  },",
+          "  edges: [],",
+          "});",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const result = await runCli(
+        [
+          "--agent",
+          LOAD_CAPABLE_MOCK_AGENT_COMMAND,
+          "--approve-all",
+          "--policy",
+          '{"autoDeny":["execute"]}',
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "flow",
+          "run",
+          flowPath,
+        ],
+        homeDir,
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+      const payload = JSON.parse(result.stdout.trim()) as {
+        action?: string;
+        status?: string;
+        outputs?: {
+          permission?: {
+            reply?: string;
+          };
+        };
+      };
+
+      assert.equal(payload.action, "flow_run_result");
+      assert.equal(payload.status, "completed");
+      assert.equal(payload.outputs?.permission?.reply, "permission selected:reject");
+    } finally {
+      await fs.rm(flowDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+function jsStringLiteral(value: string): string {
+  return escapeUnsafeCodeChars(JSON.stringify(value));
+}
+
+function escapeUnsafeCodeChars(value: string): string {
+  return value.replace(
+    /[<>\u2028\u2029]/g,
+    (char) => unsafeCodeCharEscapes[char as keyof typeof unsafeCodeCharEscapes],
+  );
+}
 
 test('integration: flow run resolves "acpx/flows" imports for external flow files', async () => {
   await withTempHome(async (homeDir) => {
@@ -862,14 +955,22 @@ test("integration: qoder session reuse preserves persisted startup flags", async
 test("integration: exec forwards model, allowed-tools, and max-turns in session/new _meta", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const claudeCompatibleAgentCommand = `${MOCK_AGENT_COMMAND} --claude-agent-acp`;
 
     try {
-      const created = await runCli([...baseAgentArgs(cwd), "sessions", "new"], homeDir);
+      const created = await runCli(
+        ["--agent", claudeCompatibleAgentCommand, "--approve-all", "--cwd", cwd, "sessions", "new"],
+        homeDir,
+      );
       assert.equal(created.code, 0, created.stderr);
 
       const result = await runCli(
         [
-          ...baseAgentArgs(cwd),
+          "--agent",
+          claudeCompatibleAgentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
           "--format",
           "json",
           "--model",
@@ -899,6 +1000,29 @@ test("integration: exec forwards model, allowed-tools, and max-turns in session/
           },
         },
       });
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: exec --no-terminal disables advertised terminal capability", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const result = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "--no-terminal", "exec", "echo hello"],
+        homeDir,
+      );
+      assert.equal(result.code, 0, result.stderr);
+
+      const payloads = parseJsonRpcOutputLines(result.stdout);
+      const initializeRequest = payloads.find((payload) => payload.method === "initialize") as
+        | { params?: { clientCapabilities?: { terminal?: unknown } } }
+        | undefined;
+      assert(initializeRequest, result.stdout);
+      assert.equal(initializeRequest.params?.clientCapabilities?.terminal, false);
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
@@ -941,7 +1065,7 @@ test("integration: exec --model calls session/set_model when agent advertises mo
   });
 });
 
-test("integration: exec --model skips session/set_model when agent does not advertise models", async () => {
+test("integration: exec --model fails when agent does not advertise models", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
 
@@ -950,11 +1074,11 @@ test("integration: exec --model skips session/set_model when agent does not adve
         [...baseAgentArgs(cwd), "--format", "json", "--model", "sonnet", "exec", "echo hello"],
         homeDir,
       );
-      assert.equal(result.code, 0, result.stderr);
+      assert.notEqual(result.code, 0, "expected non-zero exit");
+      assert.match(`${result.stderr}\n${result.stdout}`, /did not advertise model support/);
 
       const payloads = parseJsonRpcOutputLines(result.stdout);
 
-      // _meta.claudeCode.options.model should still be sent
       const createRequest = payloads.find((payload) => payload.method === "session/new") as
         | { params?: { _meta?: Record<string, unknown> } }
         | undefined;
@@ -966,6 +1090,83 @@ test("integration: exec --model skips session/set_model when agent does not adve
       // session/set_model should NOT be called
       const setModelRequest = payloads.find((payload) => payload.method === "session/set_model");
       assert.equal(setModelRequest, undefined, "session/set_model should not be called");
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: exec --model rejects models not advertised by the agent", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const modelAgentCommand = `${MOCK_AGENT_COMMAND} --advertise-models`;
+
+    try {
+      const result = await runCli(
+        [
+          "--agent",
+          modelAgentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "--model",
+          "missing-model",
+          "exec",
+          "echo hello",
+        ],
+        homeDir,
+      );
+      assert.notEqual(result.code, 0, "expected non-zero exit");
+      assert.match(`${result.stderr}\n${result.stdout}`, /did not advertise that model/);
+      assert.match(`${result.stderr}\n${result.stdout}`, /default-model, fast-model, smart-model/);
+
+      const payloads = parseJsonRpcOutputLines(result.stdout);
+      const setModelRequest = payloads.find((payload) => payload.method === "session/set_model");
+      assert.equal(setModelRequest, undefined, "session/set_model should not be called");
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: prompt --model updates existing session model before prompt", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const modelAgentCommand = `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --advertise-models`;
+
+    try {
+      const created = await runCli(
+        ["--agent", modelAgentCommand, "--approve-all", "--cwd", cwd, "sessions", "new"],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+
+      const result = await runCli(
+        [
+          "--agent",
+          modelAgentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "--model",
+          "fast-model",
+          "prompt",
+          "echo hello",
+        ],
+        homeDir,
+      );
+      assert.equal(result.code, 0, result.stderr);
+
+      const payloads = parseJsonRpcOutputLines(result.stdout);
+      const setModelRequest = payloads.find((payload) => payload.method === "session/set_model") as
+        | { params?: { modelId?: string } }
+        | undefined;
+      assert(setModelRequest, "expected session/set_model before the persistent prompt");
+      assert.equal(setModelRequest.params?.modelId, "fast-model");
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
@@ -988,7 +1189,7 @@ test("integration: exec --model fails when session/set_model fails", async () =>
           "--format",
           "quiet",
           "--model",
-          "bad-model",
+          "fast-model",
           "exec",
           "echo hello",
         ],
@@ -1017,7 +1218,7 @@ test("integration: sessions new --model fails when session/set_model fails", asy
           "--cwd",
           cwd,
           "--model",
-          "bad-model",
+          "fast-model",
           "sessions",
           "new",
         ],
@@ -1123,7 +1324,7 @@ test("integration: status shows model after session creation with --model", asyn
           "--cwd",
           cwd,
           "--model",
-          "gpt-5.4",
+          "smart-model",
           "sessions",
           "new",
         ],
@@ -1143,7 +1344,7 @@ test("integration: status shows model after session creation with --model", asyn
         mode?: string;
         availableModels?: string[];
       };
-      assert.equal(statusPayload.model, "gpt-5.4");
+      assert.equal(statusPayload.model, "smart-model");
       assert(Array.isArray(statusPayload.availableModels), "expected availableModels array");
 
       // Check status text
@@ -1152,7 +1353,7 @@ test("integration: status shows model after session creation with --model", asyn
         homeDir,
       );
       assert.equal(statusText.code, 0, statusText.stderr);
-      assert.match(statusText.stdout, /model: gpt-5\.4/);
+      assert.match(statusText.stdout, /model: smart-model/);
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
@@ -1285,14 +1486,7 @@ test("integration: perf metrics capture checkpoints queue-owner turns before own
         );
       });
       assert(queueOwnerRecord, "expected queue owner checkpoint record before owner exit");
-      // A queue-owner turn persists the session record at least once. With
-      // periodic-checkpoint crash-resistance, the count is now >= 1 rather
-      // than a fixed 1.
-      const writeRecordCount = readPerfTimingCount(queueOwnerRecord, "session.write_record");
-      assert.ok(
-        writeRecordCount != null && writeRecordCount >= 1,
-        `expected at least one session.write_record timing, got ${writeRecordCount}`,
-      );
+      assert.equal((readPerfTimingCount(queueOwnerRecord, "session.write_record") ?? 0) >= 2, true);
 
       const status = await runCli([...baseAgentArgs(cwd), "--format", "json", "status"], homeDir);
       assert.equal(status.code, 0, status.stderr);
@@ -1886,6 +2080,74 @@ test("integration: non-interactive fail emits structured permission error", asyn
   });
 });
 
+test("integration: permission policy emits structured escalation event", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const policyPath = path.join(cwd, "permission-policy.json");
+
+    try {
+      await fs.writeFile(policyPath, JSON.stringify({ escalate: ["execute"] }), "utf8");
+      const result = await runCli(
+        [
+          "--agent",
+          MOCK_AGENT_COMMAND,
+          "--permission-policy",
+          policyPath,
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "exec",
+          "permission execute Bash",
+        ],
+        homeDir,
+      );
+
+      assert.equal(result.code, 5, result.stderr);
+      const payloads = result.stdout
+        .trim()
+        .split("\n")
+        .filter((line) => line.trim().length > 0)
+        .map((line) => JSON.parse(line) as { result?: unknown; type?: string });
+      assert.equal(
+        payloads.some((payload) => payload.type === "permission_escalation"),
+        false,
+        result.stdout,
+      );
+      const escalation = payloads
+        .map((payload) => {
+          const resultPayload =
+            payload.result && typeof payload.result === "object"
+              ? (payload.result as { _meta?: unknown })
+              : undefined;
+          const meta =
+            resultPayload?._meta && typeof resultPayload._meta === "object"
+              ? (resultPayload._meta as { acpx?: unknown })
+              : undefined;
+          const acpx =
+            meta?.acpx && typeof meta.acpx === "object"
+              ? (meta.acpx as { permissionEscalation?: unknown })
+              : undefined;
+          return acpx?.permissionEscalation as
+            | { toolKind?: string; toolName?: string; toolTitle?: string }
+            | undefined;
+        })
+        .find(Boolean);
+      assert.deepEqual(
+        {
+          toolKind: escalation?.toolKind,
+          toolName: escalation?.toolName,
+          toolTitle: escalation?.toolTitle,
+        },
+        { toolKind: "execute", toolName: "Bash", toolTitle: "Bash" },
+        result.stdout,
+      );
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: json-strict suppresses runtime stderr diagnostics", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
@@ -1990,6 +2252,128 @@ test("integration: json-strict exec retries without emitting stderr notices", as
   });
 });
 
+test("integration: queued prompt honors per-request prompt retries on warm owner", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const created = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+
+      const warmup = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--format",
+          "quiet",
+          "--ttl",
+          "3600",
+          "prompt",
+          "say exactly: warm-owner-no-retries",
+        ],
+        homeDir,
+      );
+      assert.equal(warmup.code, 0, warmup.stderr);
+      assert.match(warmup.stdout, /warm-owner-no-retries/);
+
+      const retryingPrompt = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--format",
+          "json",
+          "--json-strict",
+          "--prompt-retries",
+          "1",
+          "prompt",
+          "retryable-error-once",
+        ],
+        homeDir,
+      );
+      assert.equal(retryingPrompt.code, 0, retryingPrompt.stderr);
+      assert.equal(retryingPrompt.stderr.trim(), "");
+
+      const payloads = parseJsonRpcOutputLines(retryingPrompt.stdout);
+      const promptRequests = payloads.filter((payload) => payload.method === "session/prompt");
+      assert.equal(promptRequests.length, 2, retryingPrompt.stdout);
+      assert.equal(
+        payloads.some(
+          (payload) => extractAgentMessageChunkText(payload) === "recovered after retry",
+        ),
+        true,
+        retryingPrompt.stdout,
+      );
+    } finally {
+      await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "close"], homeDir).catch(
+        () => {},
+      );
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: queued prompt without retry flag ignores warm owner startup retries", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const created = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+
+      const warmup = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--format",
+          "quiet",
+          "--ttl",
+          "3600",
+          "--prompt-retries",
+          "1",
+          "prompt",
+          "say exactly: warm-owner-with-retries",
+        ],
+        homeDir,
+      );
+      assert.equal(warmup.code, 0, warmup.stderr);
+      assert.match(warmup.stdout, /warm-owner-with-retries/);
+
+      const noRetryPrompt = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--format",
+          "json",
+          "--json-strict",
+          "prompt",
+          "retryable-error-once",
+        ],
+        homeDir,
+      );
+      assert.equal(noRetryPrompt.code, 1, noRetryPrompt.stderr);
+      assert.equal(noRetryPrompt.stderr.trim(), "");
+
+      const payloads = parseJsonRpcOutputLines(noRetryPrompt.stdout);
+      const promptRequests = payloads.filter((payload) => payload.method === "session/prompt");
+      assert.equal(promptRequests.length, 1, noRetryPrompt.stdout);
+      assert.equal(
+        payloads.some(
+          (payload) => extractAgentMessageChunkText(payload) === "recovered after retry",
+        ),
+        false,
+        noRetryPrompt.stdout,
+      );
+    } finally {
+      await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "close"], homeDir).catch(
+        () => {},
+      );
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: fs/read_text_file through mock agent", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
@@ -2056,6 +2440,37 @@ test("integration: --suppress-reads hides read file body in json format", async 
   });
 });
 
+test("integration: late post-success tool updates are rendered before prompt exits", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const created = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+
+      const result = await runCli(
+        [...baseAgentArgs(cwd), "--format", "text", "prompt", "late-tool 40 follow-up"],
+        homeDir,
+      );
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /writing now/);
+      assert.match(result.stdout, /\[tool\] LateTool/);
+      assert.match(result.stdout, /follow-up/);
+
+      const closed = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "close"],
+        homeDir,
+      );
+      assert.equal(closed.code, 0, closed.stderr);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: fs/write_text_file through mock agent", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
@@ -2095,17 +2510,39 @@ test("integration: terminal lifecycle create/output/wait/release", async () => {
   });
 });
 
-test("integration: terminal kill leaves no orphan sleep process", async () => {
+test("integration: terminal kill leaves no orphan sleep process", async (t) => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
-    const before = await listSleep60Pids();
+    const sleepSeconds = 4137;
+    let before: Set<number>;
+    try {
+      before = await listSleepPids(sleepSeconds);
+    } catch (error) {
+      if (isProcessListUnavailable(error)) {
+        t.skip("process listing unavailable");
+        return;
+      }
+      throw error;
+    }
 
     try {
-      const result = await runCli([...baseExecArgs(cwd), "kill-terminal sleep 60"], homeDir, {
-        timeoutMs: 25_000,
-      });
+      const result = await runCli(
+        [...baseExecArgs(cwd), `kill-terminal sleep ${sleepSeconds}`],
+        homeDir,
+        {
+          timeoutMs: 25_000,
+        },
+      );
       assert.equal(result.code, 0, result.stderr);
-      await assertNoNewSleep60Processes(before);
+      try {
+        await assertNoNewSleepProcesses(before, sleepSeconds);
+      } catch (error) {
+        if (isProcessListUnavailable(error)) {
+          t.skip("process listing unavailable");
+          return;
+        }
+        throw error;
+      }
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
@@ -2176,6 +2613,60 @@ test("integration: prompt reuses warm queue owner and agent pid across turns", a
         throw new Error("queue owner lock missing pid");
       }
       assert.equal(await waitForPidExit(lockTwo.pid, 5_000), true);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: warm queue owner does not retain per-request permission policy", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const created = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+
+      const first = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--policy",
+          '{"escalate":["execute"]}',
+          "--format",
+          "quiet",
+          "--ttl",
+          "5",
+          "prompt",
+          "permission execute Bash",
+        ],
+        homeDir,
+      );
+      assert.equal(first.code, 5, first.stderr);
+      assert.match(first.stdout, /permission selected:reject/);
+
+      const second = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--format",
+          "quiet",
+          "--ttl",
+          "5",
+          "prompt",
+          "permission execute Bash",
+        ],
+        homeDir,
+      );
+      assert.equal(second.code, 0, second.stderr);
+      assert.match(second.stdout, /permission selected:allow/);
+
+      const closed = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "close"],
+        homeDir,
+      );
+      assert.equal(closed.code, 0, closed.stderr);
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
@@ -2356,7 +2847,7 @@ test("integration: prompt retries stop after partial prompt output", async () =>
         homeDir,
       );
       assert.notEqual(result.code, 0, result.stderr);
-      assert.equal(/retrying in/.test(result.stderr), false, result.stderr);
+      assert.equal(result.stderr.includes("retrying in"), false, result.stderr);
 
       const payloads = parseJsonRpcOutputLines(result.stdout);
       const partialUpdates = payloads.filter(
@@ -2387,7 +2878,7 @@ test("integration: exec retries stop after partial prompt output", async () => {
         homeDir,
       );
       assert.equal(result.code, 1, result.stderr);
-      assert.equal(/retrying in/.test(result.stderr), false, result.stderr);
+      assert.equal(result.stderr.includes("retrying in"), false, result.stderr);
 
       const payloads = parseJsonRpcOutputLines(result.stdout);
       const partialUpdates = payloads.filter(
@@ -2729,6 +3220,323 @@ test("integration: prompt exits after done while detached owner stays warm", asy
   });
 });
 
+test("integration: prompt --no-wait is processed by the detached queue owner", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const created = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+
+      const queued = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--format",
+          "json",
+          "--ttl",
+          "5",
+          "prompt",
+          "--no-wait",
+          "say exactly: no-wait-done",
+        ],
+        homeDir,
+      );
+      assert.equal(queued.code, 0, queued.stderr);
+      const queuedPayload = JSON.parse(queued.stdout.trim()) as {
+        action?: string;
+        acpxRecordId?: string;
+      };
+      assert.equal(queuedPayload.action, "prompt_queued");
+
+      await waitFor(async () => {
+        const history = await runCli(
+          [...baseAgentArgs(cwd), "--format", "quiet", "sessions", "read"],
+          homeDir,
+        );
+        assert.equal(history.code, 0, history.stderr);
+        return history.stdout.includes("no-wait-done") ? history.stdout : null;
+      }, 5_000);
+
+      const closed = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "close"],
+        homeDir,
+      );
+      assert.equal(closed.code, 0, closed.stderr);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: sessions history shows in-flight prompt after prompt starts", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const created = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+
+      const promptChild = spawn(
+        process.execPath,
+        [CLI_PATH, ...baseAgentArgs(cwd), "--format", "quiet", "prompt", "sleep 1500"],
+        {
+          env: {
+            ...process.env,
+            HOME: homeDir,
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+
+      try {
+        const history = await waitFor(async () => {
+          const result = await runCli(
+            [...baseAgentArgs(cwd), "--format", "quiet", "sessions", "history"],
+            homeDir,
+          );
+          assert.equal(result.code, 0, result.stderr);
+          return result.stdout.includes("sleep 1500") ? result.stdout : null;
+        }, 5_000);
+
+        assert.match(history, /sleep 1500/);
+        assert.doesNotMatch(history, /No history/);
+
+        const promptResult = await awaitChildClose(promptChild);
+        assert.equal(promptResult.code, 0, promptResult.stderr);
+        assert.match(promptResult.stdout, /slept 1500ms/);
+      } finally {
+        if (promptChild.exitCode == null && promptChild.signalCode == null) {
+          promptChild.kill("SIGKILL");
+          await awaitChildClose(promptChild).catch(() => {});
+        }
+      }
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: sessions read shows assistant updates before the prompt finishes", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const created = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+
+      const promptChild = spawn(
+        process.execPath,
+        [
+          CLI_PATH,
+          ...baseAgentArgs(cwd),
+          "--format",
+          "quiet",
+          "prompt",
+          "stream-sleep 2500 foreground-live-update",
+        ],
+        {
+          env: {
+            ...process.env,
+            HOME: homeDir,
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+
+      try {
+        const history = await waitFor(async () => {
+          const result = await runCli(
+            [...baseAgentArgs(cwd), "--format", "json", "sessions", "read"],
+            homeDir,
+          );
+          assert.equal(result.code, 0, result.stderr);
+          const payload = JSON.parse(result.stdout.trim()) as {
+            entries?: Array<{ role?: string; textPreview?: string }>;
+          };
+          const assistantEntry = payload.entries?.find(
+            (entry) =>
+              entry.role === "assistant" && entry.textPreview?.includes("foreground-live-update"),
+          );
+          return assistantEntry ? result.stdout : null;
+        }, 5_000);
+
+        assert.equal(promptChild.exitCode, null, "prompt should still be running");
+        assert.match(history, /foreground-live-update/);
+        assert.doesNotMatch(history, /stream-sleep done/);
+
+        const promptResult = await awaitChildClose(promptChild);
+        assert.equal(promptResult.code, 0, promptResult.stderr);
+        assert.match(promptResult.stdout, /stream-sleep done: foreground-live-update/);
+      } finally {
+        if (promptChild.exitCode == null && promptChild.signalCode == null) {
+          promptChild.kill("SIGKILL");
+          await awaitChildClose(promptChild).catch(() => {});
+        }
+      }
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: --no-wait stdin prompt checkpoints live assistant updates", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const created = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+
+      const queued = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--format",
+          "json",
+          "--ttl",
+          "5",
+          "prompt",
+          "--no-wait",
+          "--file",
+          "-",
+        ],
+        homeDir,
+        {
+          stdin: "stream-sleep 5000 background-live-update",
+        },
+      );
+      assert.equal(queued.code, 0, queued.stderr);
+      const queuedPayload = JSON.parse(queued.stdout.trim()) as {
+        action?: string;
+      };
+      assert.equal(queuedPayload.action, "prompt_queued");
+
+      const history = await waitFor(async () => {
+        const result = await runCli(
+          [...baseAgentArgs(cwd), "--format", "json", "sessions", "read"],
+          homeDir,
+        );
+        assert.equal(result.code, 0, result.stderr);
+        const payload = JSON.parse(result.stdout.trim()) as {
+          entries?: Array<{ role?: string; textPreview?: string }>;
+        };
+        const assistantEntry = payload.entries?.find(
+          (entry) =>
+            entry.role === "assistant" && entry.textPreview?.includes("background-live-update"),
+        );
+        return assistantEntry ? result.stdout : null;
+      }, 5_000);
+
+      assert.match(history, /background-live-update/);
+      assert.doesNotMatch(history, /stream-sleep done/);
+
+      const closed = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "close"],
+        homeDir,
+      );
+      assert.equal(closed.code, 0, closed.stderr);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: sessions close stays closed after live checkpoints", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const created = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+      const createdPayload = JSON.parse(created.stdout.trim()) as {
+        acpxRecordId?: string;
+      };
+      const sessionId = createdPayload.acpxRecordId;
+      assert.equal(typeof sessionId, "string");
+
+      const promptChild = spawn(
+        process.execPath,
+        [
+          CLI_PATH,
+          ...baseAgentArgs(cwd),
+          "--format",
+          "quiet",
+          "prompt",
+          "stream-sleep 5000 close-live-update",
+        ],
+        {
+          env: {
+            ...process.env,
+            HOME: homeDir,
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+
+      try {
+        await waitFor(async () => {
+          const result = await runCli(
+            [...baseAgentArgs(cwd), "--format", "json", "sessions", "read"],
+            homeDir,
+          );
+          assert.equal(result.code, 0, result.stderr);
+          const payload = JSON.parse(result.stdout.trim()) as {
+            entries?: Array<{ role?: string; textPreview?: string }>;
+          };
+          const assistantEntry = payload.entries?.find(
+            (entry) =>
+              entry.role === "assistant" && entry.textPreview?.includes("close-live-update"),
+          );
+          return assistantEntry ? true : null;
+        }, 5_000);
+
+        const closed = await runCli(
+          [...baseAgentArgs(cwd), "--format", "json", "sessions", "close"],
+          homeDir,
+        );
+        assert.equal(closed.code, 0, closed.stderr);
+        if (promptChild.exitCode == null && promptChild.signalCode == null) {
+          await awaitChildClose(promptChild).catch(() => {});
+        }
+
+        const recordPath = path.join(
+          homeDir,
+          ".acpx",
+          "sessions",
+          `${encodeURIComponent(sessionId as string)}.json`,
+        );
+        const storedRecord = JSON.parse(await fs.readFile(recordPath, "utf8")) as {
+          closed?: boolean;
+          closed_at?: string;
+        };
+        assert.equal(storedRecord.closed, true);
+        assert.equal(typeof storedRecord.closed_at, "string");
+      } finally {
+        if (promptChild.exitCode == null && promptChild.signalCode == null) {
+          promptChild.kill("SIGKILL");
+          await awaitChildClose(promptChild).catch(() => {});
+        }
+      }
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: session remains resumable after queue owner exits and agent has exited", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
@@ -3039,7 +3847,7 @@ async function runCliWithEntry(
         ...options.env,
       },
       cwd: options.cwd,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
 
     let stdout = "";
@@ -3059,6 +3867,12 @@ async function runCliWithEntry(
     child.stderr.on("data", (chunk: string) => {
       stderr += chunk;
     });
+
+    if (options.stdin != null) {
+      child.stdin.end(options.stdin);
+    } else {
+      child.stdin.end();
+    }
 
     child.once("error", (error) => {
       clearTimeout(timer);
@@ -3359,9 +4173,10 @@ async function stopChildProcess(
   });
 }
 
-async function listSleep60Pids(): Promise<Set<number>> {
+async function listSleepPids(seconds: number): Promise<Set<number>> {
   const output = await runCommand("ps", ["-eo", "pid=,args="]);
   const pids = new Set<number>();
+  const sleepPattern = new RegExp(`(^|\\s)sleep ${seconds}(\\s|$)`);
 
   for (const line of output.split("\n")) {
     const match = line.trim().match(/^(\d+)\s+(.*)$/);
@@ -3375,7 +4190,7 @@ async function listSleep60Pids(): Promise<Set<number>> {
       continue;
     }
 
-    if (/(^|\s)sleep 60(\s|$)/.test(commandLine)) {
+    if (sleepPattern.test(commandLine)) {
       pids.add(pid);
     }
   }
@@ -3383,14 +4198,15 @@ async function listSleep60Pids(): Promise<Set<number>> {
   return pids;
 }
 
-async function assertNoNewSleep60Processes(
+async function assertNoNewSleepProcesses(
   baseline: Set<number>,
+  seconds: number,
   timeoutMs = 4_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
 
   for (;;) {
-    const current = await listSleep60Pids();
+    const current = await listSleepPids(seconds);
     const leaked = [...current].filter((pid) => !baseline.has(pid));
     if (leaked.length === 0) {
       return;
@@ -3444,6 +4260,14 @@ async function runCommand(command: string, args: string[]): Promise<string> {
   });
 }
 
+function isProcessListUnavailable(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "ENOENT" || code === "EPERM";
+}
+
 function queueOwnerLockPath(homeDir: string, sessionId: string): string {
   const queueKey = createHash("sha256").update(sessionId).digest("hex").slice(0, 24);
   return path.join(homeDir, ".acpx", "queues", `${queueKey}.lock`);
@@ -3487,3 +4311,119 @@ async function sleep(ms: number): Promise<void> {
     setTimeout(resolve, ms);
   });
 }
+
+test("runPromptTurn: post-success drain runs before closing the turn", async () => {
+  const calls: string[] = [];
+  const client = {
+    prompt: async () => {
+      calls.push("prompt");
+      return { stopReason: "end_turn" as const };
+    },
+    waitForSessionUpdatesIdle: async (options?: { idleMs?: number; timeoutMs?: number }) => {
+      calls.push(`drain(${options?.idleMs ?? 0}/${options?.timeoutMs ?? 0})`);
+    },
+  };
+
+  const conversation = createSessionConversation();
+  const promptMessageId = recordPromptSubmission(conversation, "hello");
+  const result = await runPromptTurn({
+    client,
+    sessionId: "session-under-test",
+    prompt: "hello",
+    conversation,
+    promptMessageId,
+  });
+
+  assert.equal(result.source, "rpc");
+  assert.equal(result.stopReason, "end_turn");
+  assert.deepEqual(
+    calls,
+    ["prompt", "drain(1000/5000)"],
+    "post-success drain must run before runPromptTurn returns",
+  );
+});
+
+test("runPromptTurn: late session updates after successful prompt reach the drain", async () => {
+  const observed: string[] = [];
+  let lateUpdateEmitted = false;
+  const client = {
+    prompt: async () => {
+      observed.push("prompt-resolved");
+      return { stopReason: "end_turn" as const };
+    },
+    waitForSessionUpdatesIdle: async (options?: { idleMs?: number; timeoutMs?: number }) => {
+      // Simulate a late assistant_delta / tool_call arriving shortly after prompt resolves.
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      lateUpdateEmitted = true;
+      observed.push(`drain-completed(idle=${options?.idleMs ?? 0})`);
+    },
+  };
+
+  const conversation = createSessionConversation();
+  const promptMessageId = recordPromptSubmission(conversation, "hello");
+  const result = await runPromptTurn({
+    client,
+    sessionId: "session-late-updates",
+    prompt: "hello",
+    conversation,
+    promptMessageId,
+  });
+
+  assert.equal(result.source, "rpc");
+  assert.equal(lateUpdateEmitted, true, "late session update must be consumed before turn closes");
+  assert.deepEqual(observed, ["prompt-resolved", "drain-completed(idle=1000)"]);
+});
+
+test("runPromptTurn: missing waitForSessionUpdatesIdle still returns cleanly on success", async () => {
+  const client = {
+    prompt: async () => ({ stopReason: "end_turn" as const }),
+  };
+
+  const conversation = createSessionConversation();
+  const promptMessageId = recordPromptSubmission(conversation, "hello");
+  const result = await runPromptTurn({
+    client,
+    sessionId: "session-no-drain",
+    prompt: "hello",
+    conversation,
+    promptMessageId,
+  });
+
+  assert.equal(result.source, "rpc");
+  assert.equal(result.stopReason, "end_turn");
+});
+
+test("runPromptTurn: existing agent reply still allows post-success drain", async () => {
+  const calls: string[] = [];
+  const conversation = createSessionConversation();
+  const promptMessageId = recordPromptSubmission(conversation, "hello");
+  assert.ok(promptMessageId);
+  recordSessionUpdate(conversation, undefined, {
+    sessionId: "session-existing-reply",
+    update: {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "already visible" },
+    },
+  });
+  const client = {
+    prompt: async () => {
+      calls.push("prompt");
+      return { stopReason: "end_turn" as const };
+    },
+    waitForSessionUpdatesIdle: async () => {
+      calls.push("drain");
+    },
+  };
+
+  const result = await runPromptTurn({
+    client,
+    sessionId: "session-existing-reply",
+    prompt: "hello",
+    conversation,
+    promptMessageId,
+  });
+
+  assert.equal(result.source, "rpc");
+  assert.equal(result.stopReason, "end_turn");
+  assert.deepEqual(calls, ["prompt", "drain"]);
+});

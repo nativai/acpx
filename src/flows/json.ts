@@ -1,5 +1,23 @@
 export type JsonObjectParseMode = "strict" | "fenced" | "compat";
 
+function normalizeJsonText(text: unknown): string {
+  if (typeof text === "string") {
+    return text.trim();
+  }
+  if (text == null) {
+    return "";
+  }
+  if (
+    typeof text === "number" ||
+    typeof text === "boolean" ||
+    typeof text === "bigint" ||
+    typeof text === "symbol"
+  ) {
+    return String(text).trim();
+  }
+  return "";
+}
+
 // The generic entrypoint when a workflow wants to choose its tolerance level
 // explicitly. Most callers should still use one of the small helpers below.
 export function parseJsonObject(
@@ -8,7 +26,7 @@ export function parseJsonObject(
     mode?: JsonObjectParseMode;
   } = {},
 ): unknown {
-  const trimmed = String(text ?? "").trim();
+  const trimmed = normalizeJsonText(text);
   if (!trimmed) {
     throw new Error("Expected JSON output, got empty text");
   }
@@ -20,9 +38,9 @@ export function parseJsonObject(
   }
 
   if (mode === "fenced" || mode === "compat") {
-    const fencedMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-    if (fencedMatch) {
-      const fenced = tryParse(fencedMatch[1].trim());
+    const fencedText = extractFencedJsonText(trimmed);
+    if (fencedText !== null) {
+      const fenced = tryParse(fencedText);
       if (fenced.ok) {
         return fenced.value;
       }
@@ -64,6 +82,36 @@ function tryParse(text: string): { ok: true; value: unknown } | { ok: false } {
       ok: false,
     };
   }
+}
+
+function extractFencedJsonText(text: string): string | null {
+  const openingFenceIndex = text.indexOf("```");
+  if (openingFenceIndex === -1) {
+    return null;
+  }
+
+  let contentStart = openingFenceIndex + 3;
+  if (
+    text.slice(contentStart, contentStart + 4).toLowerCase() === "json" &&
+    isFenceWhitespace(text[contentStart + 4])
+  ) {
+    contentStart += 4;
+  }
+
+  while (isFenceWhitespace(text[contentStart])) {
+    contentStart += 1;
+  }
+
+  const closingFenceIndex = text.indexOf("```", contentStart);
+  if (closingFenceIndex === -1) {
+    return null;
+  }
+
+  return text.slice(contentStart, closingFenceIndex).trim();
+}
+
+function isFenceWhitespace(char: string | undefined): boolean {
+  return char === " " || char === "\n" || char === "\r" || char === "\t";
 }
 
 function extractBalancedJsonCandidates(text: string): string[] {

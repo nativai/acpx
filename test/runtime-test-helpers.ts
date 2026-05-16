@@ -2,7 +2,14 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AcpAgentRegistry, AcpRuntimeOptions, AcpSessionStore } from "../src/runtime.js";
+import { serializeSessionRecordForDisk } from "../src/session/persistence.js";
 import type { SessionRecord } from "../src/types.js";
+
+export type MakeSessionRecordOptions = {
+  defaultName?: boolean;
+  defaultAcpx?: boolean;
+  resolveCwd?: boolean;
+};
 
 export function makeSessionRecord(
   overrides: Partial<SessionRecord> & {
@@ -11,16 +18,19 @@ export function makeSessionRecord(
     agentCommand: string;
     cwd: string;
   },
+  options: MakeSessionRecordOptions = {},
 ): SessionRecord {
   const timestamp = "2026-01-01T00:00:00.000Z";
+  const defaultName = options.defaultName ?? true;
+  const defaultAcpx = options.defaultAcpx ?? true;
   return {
     schema: "acpx.session.v1",
     acpxRecordId: overrides.acpxRecordId,
     acpSessionId: overrides.acpSessionId,
     agentSessionId: overrides.agentSessionId,
     agentCommand: overrides.agentCommand,
-    cwd: path.resolve(overrides.cwd),
-    name: overrides.name ?? overrides.acpxRecordId,
+    cwd: options.resolveCwd === false ? overrides.cwd : path.resolve(overrides.cwd),
+    name: overrides.name ?? (defaultName ? overrides.acpxRecordId : undefined),
     createdAt: overrides.createdAt ?? timestamp,
     lastUsedAt: overrides.lastUsedAt ?? timestamp,
     lastSeq: overrides.lastSeq ?? 0,
@@ -49,7 +59,7 @@ export function makeSessionRecord(
     updated_at: overrides.updated_at ?? overrides.lastUsedAt ?? timestamp,
     cumulative_token_usage: overrides.cumulative_token_usage ?? {},
     request_token_usage: overrides.request_token_usage ?? {},
-    acpx: overrides.acpx ?? {},
+    acpx: overrides.acpx ?? (defaultAcpx ? {} : undefined),
   };
 }
 
@@ -59,6 +69,52 @@ export async function withTempDir<T>(prefix: string, fn: (dir: string) => Promis
     return await fn(dir);
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
+  }
+}
+
+export async function withTempHome<T>(
+  prefix: string,
+  run: (homeDir: string) => Promise<T>,
+): Promise<T> {
+  const originalHome = process.env.HOME;
+  const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  process.env.HOME = tempHome;
+
+  try {
+    return await run(tempHome);
+  } finally {
+    if (originalHome == null) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = originalHome;
+    }
+    await fs.rm(tempHome, { recursive: true, force: true });
+  }
+}
+
+export function sessionFilePath(homeDir: string, acpxRecordId: string): string {
+  return path.join(homeDir, ".acpx", "sessions", `${encodeURIComponent(acpxRecordId)}.json`);
+}
+
+export async function writeSessionRecordFile(
+  homeDir: string,
+  record: SessionRecord,
+): Promise<void> {
+  const filePath = sessionFilePath(homeDir, record.acpxRecordId);
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(
+    filePath,
+    `${JSON.stringify(serializeSessionRecordForDisk(record), null, 2)}\n`,
+    "utf8",
+  );
+}
+
+export async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
   }
 }
 

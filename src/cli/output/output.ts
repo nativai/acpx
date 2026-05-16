@@ -22,6 +22,7 @@ import type {
   OutputFormat,
   OutputFormatter,
   OutputErrorOrigin,
+  PermissionEscalationEvent,
 } from "../../types.js";
 import { createJsonOutputFormatter } from "./json-formatter.js";
 import { isReadLikeTool, SUPPRESSED_READ_OUTPUT } from "./read-suppression.js";
@@ -31,8 +32,19 @@ type WritableLike = {
   isTTY?: boolean;
 };
 
+type RenderableOutputError = {
+  code: OutputErrorCode;
+  detailCode?: string;
+  origin?: OutputErrorOrigin;
+  message: string;
+  retryable?: boolean;
+  acp?: OutputErrorAcpPayload;
+  timestamp?: string;
+};
+
 type OutputFormatterOptions = {
   stdout?: WritableLike;
+  stderr?: WritableLike;
   jsonContext?: OutputFormatterContext;
   suppressReads?: boolean;
 };
@@ -192,6 +204,23 @@ function readFirstString(source: Record<string, unknown>, keys: string[]): strin
   return undefined;
 }
 
+function readFirstFiniteNumber(
+  source: Record<string, unknown>,
+  keys: string[],
+): number | undefined {
+  for (const key of keys) {
+    const value = source[key];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function formatMetadataNumber(value: number): string {
+  return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(8)));
+}
+
 function readFirstStringArray(
   source: Record<string, unknown>,
   keys: string[],
@@ -209,6 +238,160 @@ function readFirstStringArray(
     }
   }
   return undefined;
+}
+
+function formatDisjunction(values: string[]): string {
+  if (values.length <= 1) {
+    return values[0] ?? "";
+  }
+  if (values.length === 2) {
+    return `${values[0]} or ${values[1]}`;
+  }
+  return `${values.slice(0, -1).join(", ")}, or ${values.at(-1)}`;
+}
+
+function parseAuthMethodIdsFromMessage(message: string): string[] {
+  const methods: string[] = [];
+  const methodListMatch = message.match(/auth methods \[([^\]]+)\]/iu);
+  if (methodListMatch) {
+    methods.push(
+      ...methodListMatch[1]
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0),
+    );
+  }
+
+  const singleMethodMatch = message.match(/auth method ([\w.-]+)/iu);
+  if (singleMethodMatch) {
+    methods.push(singleMethodMatch[1]);
+  }
+
+  return dedupeStrings(methods);
+}
+
+function parseAuthMethodIdsFromAcpData(data: unknown): string[] {
+  const record = asRecord(data);
+  if (!record) {
+    return [];
+  }
+
+  const methodIds: string[] = [];
+  if (typeof record.methodId === "string" && record.methodId.trim().length > 0) {
+    methodIds.push(record.methodId.trim());
+  }
+
+  if (Array.isArray(record.methods)) {
+    for (const entry of record.methods) {
+      if (typeof entry === "string" && entry.trim().length > 0) {
+        methodIds.push(entry.trim());
+        continue;
+      }
+
+      const id = asRecord(entry)?.id;
+      if (typeof id === "string" && id.trim().length > 0) {
+        methodIds.push(id.trim());
+      }
+    }
+  }
+
+  return dedupeStrings(methodIds);
+}
+
+function renderAuthRequiredHint(params: RenderableOutputError): string {
+  const methodIds = dedupeStrings([
+    ...parseAuthMethodIdsFromAcpData(params.acp?.data),
+    ...parseAuthMethodIdsFromMessage(params.message),
+  ]);
+
+  if (methodIds.length === 0) {
+    return "hint: run `acpx config show` to locate the active config, then add the required credential under `auth` and retry.";
+  }
+
+  const configKeys = methodIds.map((methodId) => `\`auth.${methodId}\``);
+  return `hint: run \`acpx config show\` to locate the active config, then add ${formatDisjunction(configKeys)} and retry.`;
+}
+
+export function getTextErrorRemediationHints(params: RenderableOutputError): string[] {
+  const lowerMessage = params.message.toLowerCase();
+
+  if (params.detailCode === "AUTH_REQUIRED") {
+    return [renderAuthRequiredHint(params)];
+  }
+
+  if (params.code === "TIMEOUT") {
+    return [
+      "hint: increase `--timeout <seconds>` for long-running prompts, or check whether the agent/provider is stalled.",
+    ];
+  }
+
+  if (params.code === "NO_SESSION") {
+    if (lowerMessage.includes("create one:")) {
+      return [];
+    }
+
+    return [
+      "hint: the saved ACP session is missing or stale; start a fresh session with `acpx <agent> sessions new`, then retry.",
+    ];
+  }
+
+  if (lowerMessage.includes("does not support session/load")) {
+    return [
+      "hint: this adapter cannot resume saved ACP sessions; create a fresh one with `acpx <agent> sessions new` instead of reusing `--resume-session`.",
+    ];
+  }
+
+  if (
+    lowerMessage.includes("failed to resume acp session") ||
+    lowerMessage.includes("session/load")
+  ) {
+    return [
+      "hint: rerun with `--verbose` to capture the ACP load failure details.",
+      "hint: if you do not need the old backend session, start a fresh one with `acpx <agent> sessions new` and retry.",
+    ];
+  }
+
+  if (
+    /\b429\b/u.test(params.message) ||
+    lowerMessage.includes("rate limit") ||
+    lowerMessage.includes("quota exceeded")
+  ) {
+    return [
+      "hint: the provider appears rate-limited; retry later, switch model, or check provider quota/billing.",
+    ];
+  }
+
+  if (
+    lowerMessage.includes("model not found") ||
+    lowerMessage.includes("unknown model") ||
+    lowerMessage.includes("invalid model")
+  ) {
+    return [
+      "hint: check the configured model name for this agent, then retry with `--model <model>` or `sessions set-model <model>`.",
+    ];
+  }
+
+  if (
+    lowerMessage.includes("session/set_mode") ||
+    lowerMessage.includes("session/set_model") ||
+    lowerMessage.includes("session/set_config_option")
+  ) {
+    return [
+      "hint: rerun with `--verbose` to capture the ACP method/error details before retrying.",
+    ];
+  }
+
+  if (
+    params.origin === "acp" &&
+    params.code === "RUNTIME" &&
+    (params.acp?.code === -32602 ||
+      params.acp?.code === -32603 ||
+      lowerMessage.includes("internal error"))
+  ) {
+    return ["hint: rerun with `--verbose` to capture the underlying ACP error details."];
+  }
+
+  return [];
 }
 
 function summarizeToolInput(rawInput: unknown): string | undefined {
@@ -579,18 +762,13 @@ class TextOutputFormatter implements OutputFormatter {
     this.writeLine(this.dim(`[done] ${stopReason}`));
   }
 
-  onError(params: {
-    code: OutputErrorCode;
-    detailCode?: string;
-    origin?: OutputErrorOrigin;
-    message: string;
-    retryable?: boolean;
-    acp?: OutputErrorAcpPayload;
-    timestamp?: string;
-  }): void {
+  onError(params: RenderableOutputError): void {
     this.flushThoughtBuffer();
     this.beginSection("done");
     this.writeLine(this.formatAnsi(`[error] ${params.code}: ${params.message}`, "31"));
+    for (const hint of getTextErrorRemediationHints(params)) {
+      this.writeLine(this.dim(hint));
+    }
   }
 
   onClientOperation(operation: ClientOperation): void {
@@ -609,6 +787,24 @@ class TextOutputFormatter implements OutputFormatter {
       this.writeLine("  details:");
       this.writeLine(indentBlock(operation.details, "    "));
     }
+  }
+
+  onPermissionEscalation(event: PermissionEscalationEvent): void {
+    this.flushThoughtBuffer();
+    this.beginSection("client");
+    this.writeLine(`${this.bold("[permission]")} ${event.message}`);
+    const details = [
+      `sessionId: ${event.sessionId}`,
+      `toolCallId: ${event.toolCallId}`,
+      event.toolName ? `toolName: ${event.toolName}` : undefined,
+      `toolTitle: ${event.toolTitle}`,
+      event.toolInput !== undefined
+        ? `toolInput: ${summarizeToolInput(event.toolInput) ?? "(structured input)"}`
+        : undefined,
+      event.toolKind ? `toolKind: ${event.toolKind}` : undefined,
+      event.matchedRule ? `matchedRule: ${event.matchedRule}` : undefined,
+    ].filter((line): line is string => Boolean(line));
+    this.writeLine(indentBlock(details.join("\n"), "  "));
   }
 
   flush(): void {
@@ -824,11 +1020,14 @@ class TextOutputFormatter implements OutputFormatter {
 
 class QuietOutputFormatter implements OutputFormatter {
   private readonly stdout: WritableLike;
+  private readonly stderr: WritableLike;
   private chunks: string[] = [];
   private flushed = false;
+  private metadataFlushed = false;
 
-  constructor(stdout: WritableLike) {
+  constructor(stdout: WritableLike, stderr: WritableLike) {
     this.stdout = stdout;
+    this.stderr = stderr;
   }
 
   setContext(_context: OutputFormatterContext): void {
@@ -847,6 +1046,7 @@ class QuietOutputFormatter implements OutputFormatter {
 
     if (parsePromptStopReason(message)) {
       this.flushBufferedOutput();
+      this.flushMetadata(message);
     }
   }
 
@@ -859,6 +1059,10 @@ class QuietOutputFormatter implements OutputFormatter {
     acp?: OutputErrorAcpPayload;
     timestamp?: string;
   }): void {
+    // no-op in quiet mode
+  }
+
+  onPermissionEscalation(_event: PermissionEscalationEvent): void {
     // no-op in quiet mode
   }
 
@@ -875,6 +1079,81 @@ class QuietOutputFormatter implements OutputFormatter {
     const text = this.chunks.join("");
     this.stdout.write(text.endsWith("\n") ? text : `${text}\n`);
   }
+
+  private flushMetadata(message: AcpJsonRpcMessage): void {
+    if (this.metadataFlushed) {
+      return;
+    }
+
+    this.metadataFlushed = true;
+    const result = asRecord((message as { result?: unknown }).result);
+    if (!result) {
+      return;
+    }
+
+    const usageLine = this.formatUsageLine(asRecord(result.usage));
+    if (usageLine) {
+      this.stderr.write(`${usageLine}\n`);
+    }
+
+    const costLine = this.formatCostLine(result.cost);
+    if (costLine) {
+      this.stderr.write(`${costLine}\n`);
+    }
+  }
+
+  private formatUsageLine(usage: Record<string, unknown> | undefined): string | undefined {
+    if (!usage) {
+      return undefined;
+    }
+
+    const parts: string[] = [];
+    const fields: Array<[string, string[]]> = [
+      ["input", ["inputTokens", "input_tokens"]],
+      ["output", ["outputTokens", "output_tokens"]],
+      ["cache_read", ["cachedReadTokens", "cacheReadInputTokens", "cache_read_input_tokens"]],
+      [
+        "cache_write",
+        ["cachedWriteTokens", "cacheCreationInputTokens", "cache_creation_input_tokens"],
+      ],
+      ["total", ["totalTokens", "total_tokens"]],
+    ];
+
+    for (const [label, keys] of fields) {
+      const value = readFirstFiniteNumber(usage, keys);
+      if (value !== undefined) {
+        parts.push(`${label}=${formatMetadataNumber(value)}`);
+      }
+    }
+
+    return parts.length > 0 ? `[acpx] tokens: ${parts.join(" ")}` : undefined;
+  }
+
+  private formatCostLine(cost: unknown): string | undefined {
+    if (typeof cost === "number" && Number.isFinite(cost)) {
+      return `[acpx] cost: ${formatMetadataNumber(cost)}`;
+    }
+
+    if (typeof cost === "string" && cost.trim()) {
+      return `[acpx] cost: ${cost.trim()}`;
+    }
+
+    const record = asRecord(cost);
+    if (!record) {
+      return undefined;
+    }
+
+    const amount = readFirstFiniteNumber(record, ["amount", "value", "total"]);
+    if (amount === undefined) {
+      return undefined;
+    }
+
+    const currency =
+      typeof record.currency === "string" && record.currency.trim()
+        ? ` ${record.currency.trim()}`
+        : "";
+    return `[acpx] cost: ${formatMetadataNumber(amount)}${currency}`;
+  }
 }
 
 export function createOutputFormatter(
@@ -882,6 +1161,7 @@ export function createOutputFormatter(
   options: OutputFormatterOptions = {},
 ): OutputFormatter {
   const stdout = options.stdout ?? process.stdout;
+  const stderr = options.stderr ?? process.stderr;
   const suppressReads = options.suppressReads === true;
 
   switch (format) {
@@ -890,7 +1170,7 @@ export function createOutputFormatter(
     case "json":
       return createJsonOutputFormatter(stdout, suppressReads, options.jsonContext);
     case "quiet":
-      return new QuietOutputFormatter(stdout);
+      return new QuietOutputFormatter(stdout, stderr);
     default: {
       const exhaustive: never = format;
       void exhaustive;

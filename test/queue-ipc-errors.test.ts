@@ -38,6 +38,9 @@ const NOOP_OUTPUT_FORMATTER: OutputFormatter = {
   onError() {
     // no-op
   },
+  onPermissionEscalation() {
+    // no-op
+  },
   flush() {
     // no-op
   },
@@ -396,6 +399,9 @@ test("trySubmitToRunningOwner streams queued lifecycle and returns result", asyn
       onError(params) {
         events.push(`error:${params.code}`);
       },
+      onPermissionEscalation(event) {
+        events.push(`permission:${event.toolCallId}`);
+      },
       flush() {
         events.push("flush");
       },
@@ -513,6 +519,7 @@ test("SessionQueueOwner emits typed invalid request payload errors", async () =>
 
     const owner = await SessionQueueOwner.start(lease, {
       cancelPrompt: async () => false,
+      closeSession: async () => false,
       setSessionMode: async () => {
         // no-op
       },
@@ -560,6 +567,7 @@ test("SessionQueueOwner emits typed shutdown errors for pending prompts", async 
 
     const owner = await SessionQueueOwner.start(lease, {
       cancelPrompt: async () => false,
+      closeSession: async () => false,
       setSessionMode: async () => {
         // no-op
       },
@@ -628,6 +636,7 @@ test("SessionQueueOwner rejects prompts when queue depth exceeds the configured 
       lease,
       {
         cancelPrompt: async () => false,
+        closeSession: async () => false,
         setSessionMode: async () => {
           // no-op
         },

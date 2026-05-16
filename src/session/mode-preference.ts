@@ -25,6 +25,22 @@ export function getDesiredModeId(state: SessionAcpxState | undefined): string | 
   return normalizeModeId(state?.desired_mode_id);
 }
 
+export function getDesiredConfigOptions(
+  state: SessionAcpxState | undefined,
+): Record<string, string> {
+  const desired = state?.desired_config_options;
+  if (!desired) {
+    return {};
+  }
+
+  return Object.fromEntries(
+    Object.entries(desired).flatMap(([configId, value]) => {
+      const normalizedConfigId = normalizeModeId(configId);
+      return normalizedConfigId && typeof value === "string" ? [[normalizedConfigId, value]] : [];
+    }),
+  );
+}
+
 export function setDesiredModeId(record: SessionRecord, modeId: string | undefined): void {
   const acpx = ensureAcpxState(record.acpx);
   const normalized = normalizeModeId(modeId);
@@ -33,6 +49,34 @@ export function setDesiredModeId(record: SessionRecord, modeId: string | undefin
     acpx.desired_mode_id = normalized;
   } else {
     delete acpx.desired_mode_id;
+  }
+
+  record.acpx = acpx;
+}
+
+export function setDesiredConfigOption(
+  record: SessionRecord,
+  configId: string,
+  value: string | undefined,
+): void {
+  const normalizedConfigId = normalizeModeId(configId);
+  if (!normalizedConfigId || normalizedConfigId === "mode" || normalizedConfigId === "model") {
+    return;
+  }
+
+  const acpx = ensureAcpxState(record.acpx);
+  const desired = { ...acpx.desired_config_options };
+
+  if (typeof value === "string") {
+    desired[normalizedConfigId] = value;
+  } else {
+    delete desired[normalizedConfigId];
+  }
+
+  if (Object.keys(desired).length > 0) {
+    acpx.desired_config_options = desired;
+  } else {
+    delete acpx.desired_config_options;
   }
 
   record.acpx = acpx;
@@ -56,7 +100,8 @@ export function setDesiredModelId(record: SessionRecord, modelId: string | undef
   if (
     typeof sessionOptions.model === "string" ||
     Array.isArray(sessionOptions.allowed_tools) ||
-    typeof sessionOptions.max_turns === "number"
+    typeof sessionOptions.max_turns === "number" ||
+    sessionOptions.system_prompt !== undefined
   ) {
     acpx.session_options = sessionOptions;
   } else {

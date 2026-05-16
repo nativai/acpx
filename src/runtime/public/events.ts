@@ -1,11 +1,8 @@
+import type { ToolCallContent, ToolCallLocation, ToolKind } from "@agentclientprotocol/sdk";
 import type { AcpRuntimeEvent, AcpSessionUpdateTag } from "./contract.js";
-import {
-  asOptionalBoolean,
-  asOptionalString,
-  asString,
-  asTrimmedString,
-  isRecord,
-} from "./shared.js";
+import { asOptionalString, asString, asTrimmedString, isRecord } from "./shared.js";
+
+const TOOL_OUTPUT_SUMMARY_MAX_CHARS = 500;
 
 function safeParseJsonObject(line: string): Record<string, unknown> | null {
   try {
@@ -152,19 +149,206 @@ function createTextDeltaEvent(params: {
   };
 }
 
+function readFirstString(
+  record: Record<string, unknown>,
+  keys: readonly string[],
+): string | undefined {
+  for (const key of keys) {
+    const value = asOptionalString(record[key]);
+    if (value) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function readFirstStringArray(
+  record: Record<string, unknown>,
+  keys: readonly string[],
+): string[] | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (!Array.isArray(value)) {
+      continue;
+    }
+    const entries = value
+      .map((entry) => asOptionalString(entry))
+      .filter((entry): entry is string => entry !== undefined);
+    if (entries.length > 0) {
+      return entries;
+    }
+  }
+  return undefined;
+}
+
+function summarizeToolInput(rawInput: unknown): string | undefined {
+  if (rawInput == null) {
+    return undefined;
+  }
+  if (
+    typeof rawInput === "string" ||
+    typeof rawInput === "number" ||
+    typeof rawInput === "boolean"
+  ) {
+    return String(rawInput);
+  }
+  if (!isRecord(rawInput)) {
+    return undefined;
+  }
+
+  const command = readFirstString(rawInput, ["command", "cmd", "program"]);
+  const args = readFirstStringArray(rawInput, ["args", "arguments"]);
+  if (command) {
+    return [command, ...(args ?? [])].join(" ");
+  }
+
+  return readFirstString(rawInput, [
+    "path",
+    "file",
+    "filePath",
+    "filepath",
+    "target",
+    "uri",
+    "url",
+    "query",
+    "pattern",
+    "text",
+    "search",
+  ]);
+}
+
+function truncateToolSummary(value: string): string {
+  if (value.length <= TOOL_OUTPUT_SUMMARY_MAX_CHARS) {
+    return value;
+  }
+  return `${value.slice(0, TOOL_OUTPUT_SUMMARY_MAX_CHARS - 1)}…`;
+}
+
+function readToolContentText(value: unknown): string | undefined {
+  const record = isRecord(value) ? value : undefined;
+  if (!record) {
+    return undefined;
+  }
+  if (record.type === "content") {
+    return readToolContentText(record.content);
+  }
+  if (record.type === "text") {
+    return asString(record.text);
+  }
+  if (record.type === "resource_link") {
+    return (
+      asOptionalString(record.title) ||
+      asOptionalString(record.name) ||
+      asOptionalString(record.uri)
+    );
+  }
+  if (record.type === "resource") {
+    const resource = isRecord(record.resource) ? record.resource : undefined;
+    return asString(resource?.text) || asOptionalString(resource?.uri);
+  }
+  if (record.type === "diff") {
+    const path = asOptionalString(record.path) || "file";
+    return `diff ${path}`;
+  }
+  if (record.type === "terminal") {
+    const terminalId = asOptionalString(record.terminalId) || asOptionalString(record.id);
+    return terminalId ? `[terminal] ${terminalId}` : "[terminal]";
+  }
+  return undefined;
+}
+
+function summarizeToolContent(content: unknown): string | undefined {
+  if (!Array.isArray(content)) {
+    return undefined;
+  }
+  const fragments = content
+    .map((entry) => readToolContentText(entry)?.trim())
+    .filter((entry): entry is string => Boolean(entry));
+  if (fragments.length === 0) {
+    return undefined;
+  }
+  return truncateToolSummary([...new Set(fragments)].join("\n"));
+}
+
+function summarizeToolOutput(rawOutput: unknown): string | undefined {
+  if (rawOutput == null) {
+    return undefined;
+  }
+  if (
+    typeof rawOutput === "string" ||
+    typeof rawOutput === "number" ||
+    typeof rawOutput === "boolean"
+  ) {
+    return truncateToolSummary(String(rawOutput));
+  }
+  const record = isRecord(rawOutput) ? rawOutput : undefined;
+  if (!record) {
+    return undefined;
+  }
+  return (
+    truncateToolSummary(
+      readFirstString(record, ["text", "message", "error", "stdout", "stderr", "content"]) ?? "",
+    ) || undefined
+  );
+}
+
+function shouldForwardArray(value: unknown): boolean {
+  return Array.isArray(value);
+}
+
+function readToolKind(value: unknown): ToolKind | undefined {
+  const kind = asOptionalString(value);
+  if (
+    kind === "read" ||
+    kind === "edit" ||
+    kind === "delete" ||
+    kind === "move" ||
+    kind === "search" ||
+    kind === "execute" ||
+    kind === "fetch" ||
+    kind === "think" ||
+    kind === "other"
+  ) {
+    return kind;
+  }
+  return undefined;
+}
+
 function createToolCallEvent(params: {
   payload: Record<string, unknown>;
   tag: AcpSessionUpdateTag;
 }): AcpRuntimeEvent {
   const title = asTrimmedString(params.payload.title) || "tool call";
   const status = asTrimmedString(params.payload.status);
+  const inputSummary = summarizeToolInput(params.payload.rawInput);
+  const outputSummary =
+    summarizeToolContent(params.payload.content) ?? summarizeToolOutput(params.payload.rawOutput);
   const toolCallId = asOptionalString(params.payload.toolCallId);
+  const kind = readToolKind(params.payload.kind);
+  const summaryText = status ? `${title} (${status})` : title;
+  const detailSummary =
+    params.tag === "tool_call_update"
+      ? (outputSummary ?? inputSummary)
+      : (inputSummary ?? outputSummary);
   return {
     type: "tool_call",
-    text: status ? `${title} (${status})` : title,
+    text: detailSummary ? `${summaryText}: ${detailSummary}` : summaryText,
     tag: params.tag,
     ...(toolCallId ? { toolCallId } : {}),
     ...(status ? { status } : {}),
+    ...(kind ? { kind } : {}),
+    ...(shouldForwardArray(params.payload.locations)
+      ? { locations: params.payload.locations as ToolCallLocation[] }
+      : {}),
+    ...(Object.prototype.hasOwnProperty.call(params.payload, "rawInput")
+      ? { rawInput: params.payload.rawInput }
+      : {}),
+    ...(Object.prototype.hasOwnProperty.call(params.payload, "rawOutput")
+      ? { rawOutput: params.payload.rawOutput }
+      : {}),
+    ...(shouldForwardArray(params.payload.content)
+      ? { content: params.payload.content as ToolCallContent[] }
+      : {}),
     title,
   };
 }
@@ -271,19 +455,8 @@ export function parsePromptEventLine(line: string): AcpRuntimeEvent | null {
       return { type: "status", text: update, ...(tag ? { tag } : {}) };
     }
     case "done":
-      return {
-        type: "done",
-        stopReason: asOptionalString(payload.stopReason),
-      };
-    case "error": {
-      const message = asTrimmedString(payload.message) || "acpx runtime error";
-      return {
-        type: "error",
-        message,
-        code: asOptionalString(payload.code),
-        retryable: asOptionalBoolean(payload.retryable),
-      };
-    }
+    case "error":
+      return null;
     default:
       return null;
   }

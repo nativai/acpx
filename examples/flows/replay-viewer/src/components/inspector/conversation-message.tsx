@@ -15,7 +15,7 @@ export function ConversationMessage({
   useEffect(() => {
     if (!animate) {
       setEntered(true);
-      return;
+      return undefined;
     }
 
     setEntered(false);
@@ -123,10 +123,6 @@ function ToolEventCard({
       </div>
     </details>
   );
-}
-
-function formatToolStatus(status: string): string {
-  return status.replace(/_/g, " ").trim();
 }
 
 function resolveToolStatusTone(

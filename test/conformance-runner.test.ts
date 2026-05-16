@@ -215,6 +215,69 @@ test("runner rejects reads outside the session cwd root", async () => {
   }
 });
 
+test("runner observes late post-success tool updates after settle timeout", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-conformance-runner-"));
+  try {
+    const { profilePath, casesDir } = await writeFixture(tmp, [
+      {
+        id: "custom.prompt.post_success_drain",
+        title: "Late post-success tool updates remain observable",
+        steps: [
+          { action: "new_session", save_as: "session_id" },
+          {
+            action: "prompt",
+            session: "$session_id",
+            prompt: [{ type: "text", text: "late-tool 40 follow-up" }],
+            save_as: "prompt_result",
+          },
+        ],
+        checks: [
+          {
+            type: "saved_stop_reason_in",
+            key: "prompt_result",
+            values: ["end_turn"],
+          },
+          {
+            type: "updates_text_includes",
+            text: "writing now",
+          },
+          {
+            type: "updates_session_update_includes",
+            values: ["tool_call", "tool_call_update"],
+          },
+        ],
+        timeouts: {
+          settle_timeout_ms: 160,
+        },
+      },
+    ]);
+
+    const result = await runRunner(
+      [
+        "--profile",
+        profilePath,
+        "--cases-dir",
+        casesDir,
+        "--agent-command",
+        MOCK_AGENT_COMMAND,
+        "--format",
+        "json",
+      ],
+      { timeoutMs: 20_000 },
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    const report = parseReport(result.stdout);
+    assert.deepEqual(report.totals, {
+      cases: 1,
+      passed: 1,
+      failed: 0,
+    });
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 async function writeFixture(
   rootDir: string,
   cases: Array<Record<string, unknown>>,
@@ -229,7 +292,10 @@ async function writeFixture(
   for (const [index, definition] of cases.entries()) {
     const id = definition.id;
     assert.equal(typeof id, "string");
-    requiredCases.push(id as string);
+    if (typeof id !== "string") {
+      throw new TypeError("Conformance case id must be a string.");
+    }
+    requiredCases.push(id);
 
     const fileName = `${String(index + 1).padStart(3, "0")}-${id}.json`;
     await fs.writeFile(
@@ -273,6 +339,7 @@ async function runRunner(
       env: {
         ...process.env,
         NODE_V8_COVERAGE: "",
+        NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --disable-warning=DEP0205`.trim(),
       },
     });
 

@@ -288,6 +288,19 @@ function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
     state.desired_mode_id = record.desired_mode_id;
   }
 
+  const desiredConfigOptions = asRecord(record.desired_config_options);
+  if (desiredConfigOptions) {
+    const parsed: Record<string, string> = {};
+    for (const [key, value] of Object.entries(desiredConfigOptions)) {
+      if (typeof key === "string" && typeof value === "string") {
+        parsed[key] = value;
+      }
+    }
+    if (Object.keys(parsed).length > 0) {
+      state.desired_config_options = parsed;
+    }
+  }
+
   if (typeof record.current_model_id === "string") {
     state.current_model_id = record.current_model_id;
   }
@@ -322,6 +335,20 @@ function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
       sessionOptions.max_turns > 0
     ) {
       parsedSessionOptions.max_turns = sessionOptions.max_turns;
+    }
+
+    const rawSystemPrompt = sessionOptions.system_prompt;
+    if (typeof rawSystemPrompt === "string" && rawSystemPrompt.length > 0) {
+      parsedSessionOptions.system_prompt = rawSystemPrompt;
+    } else {
+      const appendRecord = asRecord(rawSystemPrompt);
+      if (
+        appendRecord &&
+        typeof appendRecord.append === "string" &&
+        appendRecord.append.length > 0
+      ) {
+        parsedSessionOptions.system_prompt = { append: appendRecord.append };
+      }
     }
 
     if (Object.keys(parsedSessionOptions).length > 0) {

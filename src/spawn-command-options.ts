@@ -2,12 +2,12 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
-function readWindowsEnvValue(env: NodeJS.ProcessEnv, key: string): string | undefined {
+export function readWindowsEnvValue(env: NodeJS.ProcessEnv, key: string): string | undefined {
   const matchedKey = Object.keys(env).find((entry) => entry.toUpperCase() === key);
   return matchedKey ? env[matchedKey] : undefined;
 }
 
-function resolveWindowsCommand(
+export function resolveWindowsCommand(
   command: string,
   env: NodeJS.ProcessEnv = process.env,
 ): string | undefined {
@@ -73,4 +73,27 @@ export function buildSpawnCommandOptions(
     ...options,
     shell: true,
   };
+}
+
+export type TerminalSpawnCommand = {
+  command: string;
+  args: string[];
+  killProcessGroup: boolean;
+};
+
+export function buildTerminalSpawnCommand(
+  command: string,
+  args: string[] | undefined,
+): TerminalSpawnCommand {
+  return { command, args: args ?? [], killProcessGroup: false };
+}
+
+export function buildTerminalShellSpawnCommand(
+  command: string,
+  platform: NodeJS.Platform = process.platform,
+): TerminalSpawnCommand {
+  if (platform === "win32") {
+    return { command: "cmd.exe", args: ["/d", "/s", "/c", command], killProcessGroup: true };
+  }
+  return { command: "/bin/sh", args: ["-c", command], killProcessGroup: true };
 }

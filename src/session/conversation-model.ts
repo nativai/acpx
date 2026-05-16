@@ -454,6 +454,9 @@ export function cloneSessionAcpxState(
   return {
     current_mode_id: state.current_mode_id,
     desired_mode_id: state.desired_mode_id,
+    desired_config_options: state.desired_config_options
+      ? { ...state.desired_config_options }
+      : undefined,
     current_model_id: state.current_model_id,
     available_models: state.available_models ? [...state.available_models] : undefined,
     available_commands: state.available_commands ? [...state.available_commands] : undefined,
@@ -465,6 +468,14 @@ export function cloneSessionAcpxState(
             ? [...state.session_options.allowed_tools]
             : undefined,
           max_turns: state.session_options.max_turns,
+          ...(state.session_options.system_prompt !== undefined
+            ? {
+                system_prompt:
+                  typeof state.session_options.system_prompt === "string"
+                    ? state.session_options.system_prompt
+                    : { append: state.session_options.system_prompt.append },
+              }
+            : {}),
         }
       : undefined,
   };

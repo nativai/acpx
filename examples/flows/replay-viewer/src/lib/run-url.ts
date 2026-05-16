@@ -40,7 +40,7 @@ function readRequestedRunIdFromPath(pathname: string): string | null {
     return null;
   }
 
-  const rawRunId = pathname.slice(RUN_PATH_PREFIX.length).split("/").filter(Boolean)[0] ?? "";
+  const rawRunId = pathname.slice(RUN_PATH_PREFIX.length).split("/").find(Boolean) ?? "";
   const runId = decodeURIComponent(rawRunId).trim();
   return runId.length > 0 ? runId : null;
 }

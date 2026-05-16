@@ -1,6 +1,6 @@
 import { Command } from "commander";
 import { initGlobalConfigFile, toConfigDisplay, type ResolvedAcpxConfig } from "./config.js";
-import { resolveGlobalFlags } from "./flags.js";
+import { parseOutputFormat, resolveGlobalFlags } from "./flags.js";
 
 async function handleConfigShow(command: Command, config: ResolvedAcpxConfig): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
@@ -56,6 +56,7 @@ export function registerConfigCommand(program: Command, config: ResolvedAcpxConf
   configCommand
     .command("show")
     .description("Show resolved config")
+    .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
     .action(async function (this: Command) {
       await handleConfigShow(this, config);
     });
@@ -63,6 +64,7 @@ export function registerConfigCommand(program: Command, config: ResolvedAcpxConf
   configCommand
     .command("init")
     .description("Create global config template")
+    .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
     .action(async function (this: Command) {
       await handleConfigInit(this, config);
     });

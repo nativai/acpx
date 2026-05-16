@@ -15,12 +15,17 @@ test("SessionQueueOwner handles control requests and nextTask timeouts", async (
     assert(lease);
 
     let cancelled = 0;
+    let closeSessionCalls = 0;
     const modes: string[] = [];
     const configRequests: Array<{ id: string; value: string }> = [];
 
     const owner = await SessionQueueOwner.start(lease, {
       cancelPrompt: async () => {
         cancelled += 1;
+        return true;
+      },
+      closeSession: async () => {
+        closeSessionCalls += 1;
         return true;
       },
       setSessionMode: async (modeId) => {
@@ -105,7 +110,30 @@ test("SessionQueueOwner handles control requests and nextTask timeouts", async (
       configLines.close();
       configSocket.destroy();
 
+      const closeSocket = await connectSocket(lease.socketPath);
+      const closeLines = readline.createInterface({ input: closeSocket });
+      const closeIterator = closeLines[Symbol.asyncIterator]();
+      closeSocket.write(
+        `${JSON.stringify({
+          type: "close_session",
+          requestId: "req-close-session",
+          timeoutMs: 250,
+        })}\n`,
+      );
+
+      const closeAccepted = (await nextJsonLine(closeIterator)) as { type: string };
+      const closeResult = (await nextJsonLine(closeIterator)) as {
+        type: string;
+        closed: boolean;
+      };
+      assert.equal(closeAccepted.type, "accepted");
+      assert.equal(closeResult.type, "close_session_result");
+      assert.equal(closeResult.closed, true);
+      closeLines.close();
+      closeSocket.destroy();
+
       assert.equal(cancelled, 1);
+      assert.equal(closeSessionCalls, 1);
       assert.deepEqual(modes, ["plan"]);
       assert.deepEqual(configRequests, [{ id: "thinking_level", value: "high" }]);
     } finally {
@@ -125,6 +153,7 @@ test("SessionQueueOwner enqueues fire-and-forget prompts and rejects invalid own
       lease,
       {
         cancelPrompt: async () => false,
+        closeSession: async () => false,
         setSessionMode: async () => {
           // no-op
         },

@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -9,9 +8,12 @@ import {
   runSessionSetModelDirect,
   runSessionSetModeDirect,
 } from "../src/cli/session/prompt-runner.js";
-import { serializeSessionRecordForDisk } from "../src/session/persistence.js";
 import { resolveSessionRecord } from "../src/session/persistence/repository.js";
-import type { SessionRecord } from "../src/types.js";
+import {
+  makeSessionRecord as makeSessionRecordFixture,
+  withTempHome as withTempHomeFixture,
+  writeSessionRecordFile as writeSessionRecord,
+} from "./runtime-test-helpers.js";
 
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 
@@ -216,6 +218,9 @@ test("runSessionSetConfigOptionDirect falls back to createSession and returns up
     assert.equal(persisted.acpSessionId, result.record.acpSessionId);
     assert.equal(persisted.protocolVersion, 1);
     assert.equal(persisted.closed, false);
+    assert.deepEqual(persisted.acpx?.desired_config_options, {
+      reasoning_effort: "high",
+    });
   });
 });
 
@@ -250,78 +255,12 @@ test("runSessionSetModelDirect updates current and desired model", async () => {
   });
 });
 
-function makeSessionRecord(
-  overrides: Partial<SessionRecord> & {
-    acpxRecordId: string;
-    acpSessionId: string;
-    agentCommand: string;
-    cwd: string;
-  },
-): SessionRecord {
-  const timestamp = "2026-01-01T00:00:00.000Z";
-  return {
-    schema: "acpx.session.v1",
-    acpxRecordId: overrides.acpxRecordId,
-    acpSessionId: overrides.acpSessionId,
-    agentSessionId: overrides.agentSessionId,
-    agentCommand: overrides.agentCommand,
-    cwd: path.resolve(overrides.cwd),
-    name: overrides.name,
-    createdAt: overrides.createdAt ?? timestamp,
-    lastUsedAt: overrides.lastUsedAt ?? timestamp,
-    lastSeq: overrides.lastSeq ?? 0,
-    lastRequestId: overrides.lastRequestId,
-    eventLog: overrides.eventLog ?? {
-      active_path: ".stream.ndjson",
-      segment_count: 1,
-      max_segment_bytes: 1024,
-      max_segments: 1,
-      last_write_at: overrides.lastUsedAt ?? timestamp,
-      last_write_error: null,
-    },
-    closed: overrides.closed ?? false,
-    closedAt: overrides.closedAt,
-    pid: overrides.pid,
-    agentStartedAt: overrides.agentStartedAt,
-    lastPromptAt: overrides.lastPromptAt,
-    lastAgentExitCode: overrides.lastAgentExitCode,
-    lastAgentExitSignal: overrides.lastAgentExitSignal,
-    lastAgentExitAt: overrides.lastAgentExitAt,
-    lastAgentDisconnectReason: overrides.lastAgentDisconnectReason,
-    protocolVersion: overrides.protocolVersion,
-    agentCapabilities: overrides.agentCapabilities,
-    title: overrides.title ?? null,
-    messages: overrides.messages ?? [],
-    updated_at: overrides.updated_at ?? overrides.lastUsedAt ?? timestamp,
-    cumulative_token_usage: overrides.cumulative_token_usage ?? {},
-    request_token_usage: overrides.request_token_usage ?? {},
-    acpx: overrides.acpx,
-  };
-}
-
-async function writeSessionRecord(homeDir: string, record: SessionRecord): Promise<void> {
-  const sessionDir = path.join(homeDir, ".acpx", "sessions");
-  await fs.mkdir(sessionDir, { recursive: true });
-  await fs.writeFile(
-    path.join(sessionDir, `${encodeURIComponent(record.acpxRecordId)}.json`),
-    `${JSON.stringify(serializeSessionRecordForDisk(record), null, 2)}\n`,
-    "utf8",
-  );
-}
-
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
-  const originalHome = process.env.HOME;
-  const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-prompt-runner-home-"));
-  process.env.HOME = homeDir;
+  await withTempHomeFixture("acpx-prompt-runner-home-", run);
+}
 
-  try {
-    await run(homeDir);
-  } finally {
-    if (originalHome == null) {
-      delete process.env.HOME;
-    } else {
-      process.env.HOME = originalHome;
-    }
-    await fs.rm(homeDir, { recursive: true, force: true });
-  }
+function makeSessionRecord(
+  overrides: Parameters<typeof makeSessionRecordFixture>[0],
+): ReturnType<typeof makeSessionRecordFixture> {
+  return makeSessionRecordFixture(overrides, { defaultName: false, defaultAcpx: false });
 }

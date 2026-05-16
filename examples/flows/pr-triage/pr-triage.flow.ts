@@ -519,7 +519,7 @@ async function prepareWorkspace(pr) {
     localBranch,
     pushRemote,
     pushRef: headRef,
-    isCrossRepository: Boolean(prData.head.repo.full_name !== prData.base.repo.full_name),
+    isCrossRepository: prData.head.repo.full_name !== prData.base.repo.full_name,
   });
 
   return {
@@ -536,7 +536,7 @@ async function prepareWorkspace(pr) {
     flowDir: metaDir,
     linkedIssueNumber,
     changedFiles: Array.isArray(files) ? files : [],
-    isCrossRepository: Boolean(prData.head.repo.full_name !== prData.base.repo.full_name),
+    isCrossRepository: prData.head.repo.full_name !== prData.base.repo.full_name,
   };
 }
 
@@ -1188,7 +1188,7 @@ function loadPullRequestInput(input) {
 }
 
 function formatPrTriageRunTitle(pr) {
-  const repoName = pr.repo.split("/").filter(Boolean).at(-1) ?? pr.repo;
+  const repoName = pr.repo.split("/").findLast(Boolean) ?? pr.repo;
   return `PR-triage-${repoName}-${pr.prNumber}`;
 }
 

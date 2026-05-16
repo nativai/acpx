@@ -40,7 +40,7 @@ function makeRecord(): SessionRecord {
 }
 
 function assertSerializationPolicy(): void {
-  const persisted = serializeSessionRecordForDisk(makeRecord()) as Record<string, unknown>;
+  const persisted = serializeSessionRecordForDisk(makeRecord());
   const violations = findPersistedKeyPolicyViolations(persisted);
   assert.equal(
     violations.length,

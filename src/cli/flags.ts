@@ -5,6 +5,7 @@ import {
   DEFAULT_AGENT_NAME,
   resolveAgentCommand as resolveAgentCommandFromRegistry,
 } from "../agent-registry.js";
+import type { SystemPromptOption } from "../runtime/engine/session-options.js";
 import { DEFAULT_QUEUE_OWNER_TTL_MS } from "../session/session.js";
 import {
   AUTH_POLICIES,
@@ -35,6 +36,7 @@ export type GlobalFlags = PermissionFlags & {
   nonInteractivePermissions: NonInteractivePermissionPolicy;
   jsonStrict?: boolean;
   suppressReads?: boolean;
+  terminal?: boolean;
   timeout?: number;
   ttl: number;
   verbose?: boolean;
@@ -42,7 +44,9 @@ export type GlobalFlags = PermissionFlags & {
   model?: string;
   allowedTools?: string[];
   maxTurns?: number;
+  systemPrompt?: SystemPromptOption;
   promptRetries?: number;
+  permissionPolicy?: string;
 };
 
 export type PromptFlags = {
@@ -66,6 +70,13 @@ export type SessionsHistoryFlags = {
 
 export type StatusFlags = {
   session?: string;
+};
+
+export type SessionsPruneFlags = {
+  dryRun?: boolean;
+  before?: Date;
+  olderThan?: number;
+  includeHistory?: boolean;
 };
 
 export function parseOutputFormat(value: string): OutputFormat {
@@ -135,6 +146,24 @@ export function parseHistoryLimit(value: string): number {
   return parsed;
 }
 
+export function parseDaysOlderThan(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new InvalidArgumentError("--older-than must be a positive integer number of days");
+  }
+  return parsed;
+}
+
+export function parsePruneBeforeDate(value: string): Date {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw new InvalidArgumentError(
+      `--before must be a valid date (e.g. 2026-01-01 or 2026-01-01T00:00:00Z)`,
+    );
+  }
+  return date;
+}
+
 export function parseAllowedTools(value: string): string[] {
   const trimmed = value.trim();
   if (trimmed.length === 0) {
@@ -157,6 +186,31 @@ export function parseMaxTurns(value: string): number {
     throw new InvalidArgumentError("Max turns must be a positive integer");
   }
   return parsed;
+}
+
+export function resolveSystemPromptFlag(opts: {
+  systemPrompt?: unknown;
+  appendSystemPrompt?: unknown;
+}): SystemPromptOption | undefined {
+  const replace =
+    typeof opts.systemPrompt === "string" && opts.systemPrompt.length > 0
+      ? opts.systemPrompt
+      : undefined;
+  const append =
+    typeof opts.appendSystemPrompt === "string" && opts.appendSystemPrompt.length > 0
+      ? opts.appendSystemPrompt
+      : undefined;
+
+  if (replace !== undefined && append !== undefined) {
+    throw new InvalidArgumentError("Use only one of --system-prompt or --append-system-prompt");
+  }
+  if (replace !== undefined) {
+    return replace;
+  }
+  if (append !== undefined) {
+    return { append };
+  }
+  return undefined;
 }
 
 export function parsePromptRetries(value: string): number {
@@ -209,6 +263,11 @@ export function addGlobalFlags(command: Command): Command {
       "When prompting is unavailable: deny or fail",
       parseNonInteractivePermissionPolicy,
     )
+    .option(
+      "--permission-policy <json-or-file>",
+      "Permission policy JSON or path (autoApprove, autoDeny, escalate, defaultAction)",
+    )
+    .option("--policy <json-or-file>", "Alias for --permission-policy")
     .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
     .option("--suppress-reads", "Suppress raw read-file contents in output")
     .option("--model <id>", "Agent model id")
@@ -219,6 +278,16 @@ export function addGlobalFlags(command: Command): Command {
     )
     .option("--max-turns <count>", "Maximum turns for the session", parseMaxTurns)
     .option(
+      "--system-prompt <text>",
+      "Replace the agent system prompt (claude-agent-acp via ACP _meta.systemPrompt)",
+      (value: string) => parseNonEmptyValue("System prompt", value),
+    )
+    .option(
+      "--append-system-prompt <text>",
+      "Append text to the agent system prompt (claude-agent-acp via ACP _meta.systemPrompt.append)",
+      (value: string) => parseNonEmptyValue("Append system prompt", value),
+    )
+    .option(
       "--prompt-retries <count>",
       "Retry failed prompt turns on transient errors (default: 0)",
       parsePromptRetries,
@@ -227,6 +296,7 @@ export function addGlobalFlags(command: Command): Command {
       "--json-strict",
       "Strict JSON mode: requires --format json and suppresses non-JSON stderr output",
     )
+    .option("--no-terminal", "Do not advertise ACP terminal capability")
     .option("--timeout <seconds>", "Maximum time to wait for agent response", parseTimeoutSeconds)
     .option(
       "--ttl <seconds>",
@@ -286,6 +356,12 @@ export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig)
   const format = opts.format ?? config.format ?? "text";
   const jsonStrict = opts.jsonStrict === true;
   const verbose = opts.verbose === true;
+  const permissionPolicy =
+    typeof opts.permissionPolicy === "string"
+      ? opts.permissionPolicy
+      : typeof opts.policy === "string"
+        ? opts.policy
+        : undefined;
 
   if (jsonStrict && format !== "json") {
     throw new InvalidArgumentError("--json-strict requires --format json");
@@ -295,13 +371,25 @@ export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig)
     throw new InvalidArgumentError("--json-strict cannot be combined with --verbose");
   }
 
+  if (
+    typeof opts.permissionPolicy === "string" &&
+    typeof opts.policy === "string" &&
+    opts.permissionPolicy !== opts.policy
+  ) {
+    throw new InvalidArgumentError(
+      "Use only one permission policy flag: --permission-policy or --policy",
+    );
+  }
+
   return {
     agent: opts.agent,
     cwd: opts.cwd ?? process.cwd(),
     authPolicy: opts.authPolicy ?? config.authPolicy,
     nonInteractivePermissions: opts.nonInteractivePermissions ?? config.nonInteractivePermissions,
+    permissionPolicy,
     jsonStrict,
     suppressReads: opts.suppressReads === true,
+    terminal: opts.terminal === false ? false : undefined,
     timeout: opts.timeout ?? config.timeoutMs,
     ttl: opts.ttl ?? config.ttlMs ?? DEFAULT_QUEUE_OWNER_TTL_MS,
     verbose,
@@ -309,6 +397,7 @@ export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig)
     model: typeof opts.model === "string" ? parseNonEmptyValue("Model", opts.model) : undefined,
     allowedTools: Array.isArray(opts.allowedTools) ? opts.allowedTools : undefined,
     maxTurns: typeof opts.maxTurns === "number" ? opts.maxTurns : undefined,
+    systemPrompt: resolveSystemPromptFlag(opts),
     promptRetries: typeof opts.promptRetries === "number" ? opts.promptRetries : undefined,
     approveAll: opts.approveAll ? true : undefined,
     approveReads: opts.approveReads ? true : undefined,

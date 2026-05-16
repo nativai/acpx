@@ -126,7 +126,7 @@ test("buildGraph applies playback progress to the active node during preview", (
   });
 
   const timeline = buildPlaybackTimeline(bundle);
-  const preview = derivePlaybackPreview(timeline, timeline.segments[1]!.startMs + 200);
+  const preview = derivePlaybackPreview(timeline, timeline.segments[1].startMs + 200);
   const graph = buildGraph(bundle, preview!.activeStepIndex, preview);
   const nodeMap = new Map(graph.nodes.map((node) => [node.id, node.data]));
 
@@ -271,7 +271,7 @@ test("buildGraphLayout uses layered routing and sinks terminal chains", async ()
   assert.ok(layout);
   assert.ok(layout.nodePositions.finalize);
   assert.ok(layout.nodePositions.comment_and_escalate_to_human);
-  assert.ok(layout.edgeRoutes["judge_solution->bug_or_feature-0-0"]?.points.length! >= 2);
+  assert.ok(layout.edgeRoutes["judge_solution->bug_or_feature-0-0"]?.points.length >= 2);
   assert.ok(layout.nodePositions.finalize.y > layout.nodePositions.comment_and_escalate_to_human.y);
 });
 
@@ -415,7 +415,7 @@ test("revealConversationTranscript keeps prior session messages visible while st
       },
     },
   });
-  bundle.steps[0]!.trace!.conversation = {
+  bundle.steps[0].trace!.conversation = {
     sessionId: "main-bundle",
     messageStart: 2,
     messageEnd: 3,
@@ -514,7 +514,7 @@ test("buildPlaybackTimeline and anchors support continuous preview with discrete
   assert.equal(playbackAnchorMs(timeline, 0), 0);
   assert.equal(playbackAnchorMs(timeline, 1), timeline.segments[1]?.startMs);
 
-  const preview = derivePlaybackPreview(timeline, timeline.segments[1]!.startMs + 120);
+  const preview = derivePlaybackPreview(timeline, timeline.segments[1].startMs + 120);
 
   assert.equal(preview?.activeStepIndex, 1);
   assert.equal(preview?.nearestStepIndex, 1);

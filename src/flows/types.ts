@@ -5,6 +5,7 @@ import type {
   AuthPolicy,
   McpServer,
   NonInteractivePermissionPolicy,
+  PermissionPolicy,
   PermissionMode,
   PromptInput,
   SessionRecord,
@@ -342,6 +343,7 @@ export type FlowRunnerOptions = {
   permissionMode: PermissionMode;
   mcpServers?: McpServer[];
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
+  permissionPolicy?: PermissionPolicy;
   authCredentials?: Record<string, string>;
   authPolicy?: AuthPolicy;
   timeoutMs?: number;

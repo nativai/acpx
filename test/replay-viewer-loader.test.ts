@@ -16,6 +16,22 @@ Object.assign(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }, {
   IS_REACT_ACT_ENVIRONMENT: true,
 });
 
+function createRenderer(element: Parameters<typeof create>[0]): ReturnType<typeof create> {
+  const originalError = console.error;
+  console.error = ((message?: unknown, ...args: unknown[]) => {
+    if (typeof message === "string" && message.includes("react-test-renderer is deprecated")) {
+      return;
+    }
+    originalError(message, ...args);
+  }) as typeof console.error;
+
+  try {
+    return create(element);
+  } finally {
+    console.error = originalError;
+  }
+}
+
 test("useRunBundleLoader bootstrap stays stable after recent-runs state updates", async () => {
   const run: RunBundleSummary = {
     runId: "2026-03-31T200000000Z-pr-triage-live",
@@ -59,7 +75,7 @@ test("useRunBundleLoader bootstrap stays stable after recent-runs state updates"
 
   let renderer: ReturnType<typeof create> | null = null;
   await act(async () => {
-    renderer = create(createElement(Harness));
+    renderer = createRenderer(createElement(Harness));
     await flushReactWork();
   });
 
@@ -124,7 +140,7 @@ test("useRunBundleLoader ignores stale bootstrap results after a newer live runs
   let renderer: ReturnType<typeof create> | null = null;
   try {
     await act(async () => {
-      renderer = create(createElement(Harness));
+      renderer = createRenderer(createElement(Harness));
       await flushReactWork();
     });
 
@@ -194,7 +210,7 @@ test("useRunBundleLoader waits for recent runs instead of loading the bundled sa
 
   let renderer: ReturnType<typeof create> | null = null;
   await act(async () => {
-    renderer = create(createElement(Harness));
+    renderer = createRenderer(createElement(Harness));
     await flushReactWork();
   });
 
@@ -252,7 +268,7 @@ test("useRunBundleLoader auto-loads the first recent run when the list becomes n
 
   let renderer: ReturnType<typeof create> | null = null;
   await act(async () => {
-    renderer = create(createElement(Harness));
+    renderer = createRenderer(createElement(Harness));
     await flushReactWork();
   });
 
@@ -351,7 +367,7 @@ test("useRunBundleLoader ignores stale recent-run loads when a newer live select
   let renderer: ReturnType<typeof create> | null = null;
   try {
     await act(async () => {
-      renderer = create(createElement(Harness));
+      renderer = createRenderer(createElement(Harness));
       await flushReactWork();
     });
 
@@ -429,7 +445,7 @@ test("useRunBundleLoader resyncs runs when a live runs patch cannot be applied",
   let renderer: ReturnType<typeof create> | null = null;
   try {
     await act(async () => {
-      renderer = create(createElement(Harness));
+      renderer = createRenderer(createElement(Harness));
       await flushReactWork();
     });
 
@@ -519,7 +535,7 @@ test("useRunBundleLoader resyncs the selected run when a live run patch cannot b
   let renderer: ReturnType<typeof create> | null = null;
   try {
     await act(async () => {
-      renderer = create(createElement(Harness));
+      renderer = createRenderer(createElement(Harness));
       await flushReactWork();
     });
 

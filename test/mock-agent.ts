@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import { Readable, Writable } from "node:stream";
 import {
   AgentSideConnection,
+  type CloseSessionRequest,
+  type CloseSessionResponse,
   PROTOCOL_VERSION,
   RequestError,
   ndJsonStream,
@@ -16,6 +19,7 @@ import {
   type NewSessionResponse,
   type PromptRequest,
   type PromptResponse,
+  type RequestPermissionRequest,
   type SessionId,
   type SetSessionConfigOptionRequest,
   type SetSessionConfigOptionResponse,
@@ -36,6 +40,8 @@ type MockAgentOptions = {
   newSessionMeta?: Record<string, string>;
   loadSessionMeta?: Record<string, string>;
   supportsLoadSession: boolean;
+  supportsCloseSession: boolean;
+  closeSessionMarker?: string;
   loadSessionNotFound: boolean;
   loadSessionFailsOnEmpty: boolean;
   setSessionModeFails: boolean;
@@ -43,6 +49,7 @@ type MockAgentOptions = {
   setSessionConfigInvalidParams: boolean;
   setSessionModelFails: boolean;
   setSessionModelInvalidParams: boolean;
+  advertiseConfigOptions: boolean;
   advertiseModels: boolean;
   replayLoadSessionUpdates: boolean;
   loadReplayText: string;
@@ -115,6 +122,8 @@ function describePromptBlocks(prompt: ContentBlock[]): string {
           return { type: "text", text: block.text };
         case "image":
           return { type: "image", mimeType: block.mimeType, bytes: block.data.length };
+        case "audio":
+          return { type: "audio", mimeType: block.mimeType, bytes: block.data.length };
         case "resource_link":
           return { type: "resource_link", uri: block.uri };
         case "resource":
@@ -123,6 +132,8 @@ function describePromptBlocks(prompt: ContentBlock[]): string {
             uri: block.resource.uri,
             hasText: "text" in block.resource && typeof block.resource.text === "string",
           };
+        default:
+          return { type: (block as { type: string }).type };
       }
     }),
   );
@@ -296,6 +307,8 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   const newSessionMeta: Record<string, string> = {};
   const loadSessionMeta: Record<string, string> = {};
   let supportsLoadSession = false;
+  let supportsCloseSession = false;
+  let closeSessionMarker: string | undefined;
   let loadSessionNotFound = false;
   let loadSessionFailsOnEmpty = false;
   let setSessionModeFails = false;
@@ -303,6 +316,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let setSessionConfigInvalidParams = false;
   let setSessionModelFails = false;
   let setSessionModelInvalidParams = false;
+  let advertiseConfigOptions = false;
   let advertiseModels = false;
   let replayLoadSessionUpdates = false;
   let loadReplayText = "replayed load session update";
@@ -361,9 +375,26 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    if (token === "--advertise-config-options") {
+      advertiseConfigOptions = true;
+      continue;
+    }
+
     if (token === "--replay-load-session-updates") {
       supportsLoadSession = true;
       replayLoadSessionUpdates = true;
+      continue;
+    }
+
+    if (token === "--supports-close-session") {
+      supportsCloseSession = true;
+      continue;
+    }
+
+    if (token === "--close-session-marker") {
+      supportsCloseSession = true;
+      closeSessionMarker = parseOptionValue(argv, index + 1, token);
+      index += 1;
       continue;
     }
 
@@ -374,6 +405,10 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
 
     if (token === "--hang-on-new-session") {
       hangOnNewSession = true;
+      continue;
+    }
+
+    if (token === "--claude-agent-acp") {
       continue;
     }
 
@@ -408,6 +443,8 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     newSessionMeta: Object.keys(newSessionMeta).length > 0 ? { ...newSessionMeta } : undefined,
     loadSessionMeta: Object.keys(loadSessionMeta).length > 0 ? { ...loadSessionMeta } : undefined,
     supportsLoadSession,
+    supportsCloseSession,
+    closeSessionMarker,
     loadSessionNotFound,
     loadSessionFailsOnEmpty,
     setSessionModeFails,
@@ -415,6 +452,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     setSessionConfigInvalidParams,
     setSessionModelFails,
     setSessionModelInvalidParams,
+    advertiseConfigOptions,
     advertiseModels,
     replayLoadSessionUpdates,
     loadReplayText,
@@ -507,7 +545,10 @@ class MockAgent implements Agent {
     return {
       protocolVersion: PROTOCOL_VERSION,
       authMethods: [],
-      agentCapabilities: this.options.supportsLoadSession ? { loadSession: true } : {},
+      agentCapabilities: {
+        ...(this.options.supportsLoadSession ? { loadSession: true } : {}),
+        ...(this.options.supportsCloseSession ? { sessionCapabilities: { close: {} } } : {}),
+      },
     };
   }
 
@@ -531,6 +572,11 @@ class MockAgent implements Agent {
 
     if (this.options.advertiseModels) {
       response.models = buildModelsState(DEFAULT_MODEL_ID);
+    }
+    if (this.options.advertiseConfigOptions) {
+      response.configOptions = buildConfigOptions(
+        this.sessions.get(sessionId) ?? createSessionState(false),
+      );
     }
 
     return response;
@@ -576,14 +622,30 @@ class MockAgent implements Agent {
       const session = this.sessions.get(params.sessionId);
       response.models = buildModelsState(session?.modelId ?? DEFAULT_MODEL_ID);
     }
+    if (this.options.advertiseConfigOptions) {
+      response.configOptions = buildConfigOptions(
+        this.sessions.get(params.sessionId) ?? createSessionState(false),
+      );
+    }
 
     return response;
+  }
+
+  async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
+    this.sessions.delete(params.sessionId);
+    if (this.options.closeSessionMarker) {
+      writeFileSync(this.options.closeSessionMarker, `${params.sessionId}\n`, { flag: "a" });
+    }
+    return {};
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
     const session = this.sessions.get(params.sessionId);
     if (!session) {
-      throw new Error(`Unknown session: ${params.sessionId}`);
+      throw RequestError.internalError(
+        { sessionId: params.sessionId },
+        `Unknown session: ${params.sessionId}`,
+      );
     }
 
     session.pendingPrompt?.abort();
@@ -755,6 +817,52 @@ class MockAgent implements Agent {
     });
   }
 
+  private emitLateToolCall(sessionId: SessionId, delayMs: number, text: string): void {
+    const scheduledDelay = Math.max(0, Math.round(delayMs));
+    const toolCallId = randomUUID();
+
+    setTimeout(() => {
+      void (async () => {
+        await this.connection.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId,
+            title: "LateTool",
+            kind: "other",
+            status: "in_progress",
+            rawInput: {
+              text,
+            },
+          },
+        });
+
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 5);
+        });
+
+        await this.connection.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId,
+            title: "LateTool",
+            kind: "other",
+            status: "completed",
+            rawInput: {
+              text,
+            },
+            rawOutput: {
+              echoedText: text,
+            },
+          },
+        });
+      })().catch((error: unknown) => {
+        process.stderr.write(`late-tool failed: ${toErrorMessage(error)}\n`);
+      });
+    }, scheduledDelay);
+  }
+
   private ensureSession(sessionId: SessionId): SessionState {
     let session = this.sessions.get(sessionId);
     if (!session) {
@@ -779,6 +887,27 @@ class MockAgent implements Agent {
     }
     if (text === "retryable-error-once") {
       return "recovered after retry";
+    }
+
+    if (text.startsWith("late-tool ")) {
+      const rest = text.slice("late-tool ".length).trim();
+      const firstSpace = rest.search(/\s/);
+
+      if (firstSpace <= 0) {
+        throw new Error("Usage: late-tool <milliseconds> <text>");
+      }
+
+      const rawMs = rest.slice(0, firstSpace).trim();
+      const lateText = rest.slice(firstSpace + 1).trim();
+      const delayMs = Number(rawMs);
+
+      if (!Number.isFinite(delayMs) || delayMs < 0 || lateText.length === 0) {
+        throw new Error("Usage: late-tool <milliseconds> <text>");
+      }
+
+      await this.sendAssistantMessage(sessionId, "writing now");
+      this.emitLateToolCall(sessionId, delayMs, lateText);
+      return `late-tool scheduled: ${lateText}`;
     }
 
     if (text.startsWith("read ")) {
@@ -860,6 +989,36 @@ class MockAgent implements Agent {
       return `wrote ${filePath}`;
     }
 
+    if (text.startsWith("permission ")) {
+      const rest = text.slice("permission ".length).trim();
+      const firstSpace = rest.search(/\s/);
+
+      if (firstSpace <= 0) {
+        throw new Error("Usage: permission <kind> <title>");
+      }
+
+      const rawKind = rest.slice(0, firstSpace).trim();
+      const title = rest.slice(firstSpace + 1).trim();
+      const toolCallId = randomUUID();
+      const response = await this.connection.requestPermission({
+        sessionId,
+        toolCall: {
+          toolCallId,
+          title,
+          kind: rawKind as RequestPermissionRequest["toolCall"]["kind"],
+        },
+        options: [
+          { optionId: "allow", name: "Allow", kind: "allow_once" },
+          { optionId: "reject", name: "Reject", kind: "reject_once" },
+        ],
+      });
+
+      if (response.outcome.outcome === "selected") {
+        return `permission selected:${response.outcome.optionId}`;
+      }
+      return "permission cancelled";
+    }
+
     if (text.startsWith("terminal ")) {
       const rawCommand = text.slice("terminal ".length).trim();
       if (!rawCommand) {
@@ -882,6 +1041,25 @@ class MockAgent implements Agent {
 
       await sleepWithCancel(Math.round(ms), signal);
       return `slept ${Math.round(ms)}ms`;
+    }
+
+    if (text.startsWith("stream-sleep ")) {
+      const rest = text.slice("stream-sleep ".length).trim();
+      const firstSpace = rest.search(/\s/);
+      if (firstSpace <= 0) {
+        throw new Error("Usage: stream-sleep <milliseconds> <text>");
+      }
+
+      const rawMs = rest.slice(0, firstSpace).trim();
+      const liveText = rest.slice(firstSpace + 1).trim();
+      const ms = Number(rawMs);
+      if (!Number.isFinite(ms) || ms < 0 || liveText.length === 0) {
+        throw new Error("Usage: stream-sleep <milliseconds> <text>");
+      }
+
+      await this.sendAssistantMessage(sessionId, liveText);
+      await sleepWithCancel(Math.round(ms), signal);
+      return `stream-sleep done: ${liveText}`;
     }
 
     if (text.startsWith("disconnect ")) {
@@ -991,4 +1169,8 @@ if (mockAgentOptions.ignoreSigterm) {
   });
 }
 
-new AgentSideConnection((connection) => new MockAgent(connection, mockAgentOptions), stream);
+const connection = new AgentSideConnection(
+  (agentConnection) => new MockAgent(agentConnection, mockAgentOptions),
+  stream,
+);
+void connection;
