@@ -74,6 +74,17 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   }
 
   const sessionRecord = await resolveSessionRecord(options.sessionId);
+  // Mid-turn prompt injection (concurrent client.prompt() into an in-flight
+  // turn) relies on claude-agent-acp's specific behavior: a Pushable input
+  // feeding the Claude SDK plus the UUID-based pendingMessages handoff that
+  // lets a second session/prompt resolve once the active turn surfaces the
+  // injected user message. Other ACP adapters (codex, gemini, the test
+  // mock) do not implement that contract — a concurrent session/prompt
+  // there has undefined semantics. So for non-claude agents we leave the
+  // owner's mid-turn handler unset and new prompts land in the normal
+  // pending queue, preserving the queue-and-wait behavior the original
+  // acpx tests assert.
+  const midTurnInjectionSupported = sessionRecord.agentCommand.includes("claude-agent-acp");
   let owner: SessionQueueOwner | undefined;
   let heartbeatTimer: NodeJS.Timeout | undefined;
   let idleDrain: { stop: () => Promise<void> } | undefined;
@@ -387,18 +398,20 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
     const midTurnBuffer: QueueTask[] = [];
     let midTurnCaptureActive = false;
 
-    owner.setMidTurnHandler((task: QueueTask): boolean => {
-      if (activeMidTurnHandler) {
-        activeMidTurnHandler(task);
-        return true;
-      }
-      if (midTurnCaptureActive) {
-        midTurnBuffer.push(task);
-        return true;
-      }
-      // Not in a turn — let the task land in the normal pending queue.
-      return false;
-    });
+    if (midTurnInjectionSupported) {
+      owner.setMidTurnHandler((task: QueueTask): boolean => {
+        if (activeMidTurnHandler) {
+          activeMidTurnHandler(task);
+          return true;
+        }
+        if (midTurnCaptureActive) {
+          midTurnBuffer.push(task);
+          return true;
+        }
+        // Not in a turn — let the task land in the normal pending queue.
+        return false;
+      });
+    }
 
     let isFirstTask = true;
     while (true) {
@@ -412,7 +425,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       // Stop idle drain before the prompt registers its own handlers
       await idleDrain.stop();
 
-      midTurnCaptureActive = true;
+      midTurnCaptureActive = midTurnInjectionSupported;
       try {
         await runPromptTurn(async () => {
           try {
@@ -432,15 +445,17 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
                 turnController.markPromptActive();
                 await applyPendingCancel();
               },
-              setMidTurnHandler: (handler) => {
-                activeMidTurnHandler = handler;
-                if (handler) {
-                  // Drain anything that arrived during the capture phase.
-                  for (const buffered of midTurnBuffer.splice(0)) {
-                    handler(buffered);
+              setMidTurnHandler: midTurnInjectionSupported
+                ? (handler) => {
+                    activeMidTurnHandler = handler;
+                    if (handler) {
+                      // Drain anything that arrived during the capture phase.
+                      for (const buffered of midTurnBuffer.splice(0)) {
+                        handler(buffered);
+                      }
+                    }
                   }
-                }
-              },
+                : undefined,
               onAcpMessage: (_dir, message) => {
                 // Detect hasScheduledWakeup during a prompt turn (same logic as
                 // the idle drain handler) to disable TTL even if the scheduling
@@ -483,7 +498,9 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
     }
 
     await idleDrain.stop();
-    owner.clearMidTurnHandler();
+    if (midTurnInjectionSupported) {
+      owner.clearMidTurnHandler();
+    }
   } finally {
     await idleDrain?.stop().catch(() => {});
     if (heartbeatTimer) {
