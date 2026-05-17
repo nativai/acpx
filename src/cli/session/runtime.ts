@@ -46,6 +46,7 @@ import {
 import {
   SESSION_RECORD_SCHEMA,
   type AcpJsonRpcMessage,
+  type AcpMessageDirection,
   type AuthPolicy,
   type McpServer,
   type NonInteractivePermissionPolicy,
@@ -316,6 +317,7 @@ export async function runQueuedTask(
     onClientAvailable?: (controller: ActiveSessionController) => void;
     onClientClosed?: () => void;
     onPromptActive?: () => Promise<void> | void;
+    onAcpMessage?: (direction: AcpMessageDirection, message: AcpJsonRpcMessage) => void;
   },
 ): Promise<void> {
   const outputFormatter = task.waitForCompletion
@@ -343,6 +345,7 @@ export async function runQueuedTask(
       onClientAvailable: options.onClientAvailable,
       onClientClosed: options.onClientClosed,
       onPromptActive: options.onPromptActive,
+      onAcpMessage: options.onAcpMessage,
       client: options.sharedClient,
     });
 

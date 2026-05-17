@@ -94,7 +94,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   });
   const ttlMs = normalizeQueueOwnerTtlMs(options.ttlMs);
   const maxQueueDepth = Math.max(1, Math.round(options.maxQueueDepth ?? 16));
-  const taskPollTimeoutMs = ttlMs === 0 ? undefined : ttlMs;
+  let taskPollTimeoutMs: number | undefined = ttlMs === 0 ? undefined : ttlMs;
   const initialTaskPollTimeoutMs =
     taskPollTimeoutMs == null ? undefined : Math.max(taskPollTimeoutMs, 1_000);
   const turnController = new QueueOwnerTurnController({
@@ -317,6 +317,18 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
             const update = params?.update as Record<string, unknown> | undefined;
             const updateMeta = update?._meta as Record<string, unknown> | undefined;
             const updateClaudeCode = updateMeta?.claudeCode as Record<string, unknown> | undefined;
+
+            // Disable idle TTL when the adapter signals a scheduled wakeup was
+            // created — keeps the process tree alive until the cron fires.
+            if (updateClaudeCode?.hasScheduledWakeup === true) {
+              taskPollTimeoutMs = undefined;
+              if (options.verbose) {
+                process.stderr.write(
+                  `[acpx] scheduled wakeup detected — disabling idle TTL for session ${options.sessionId}\n`,
+                );
+              }
+            }
+
             const subagentId = notifClaudeCode?.subagentId ?? updateClaudeCode?.subagentId;
             const subagentName = notifClaudeCode?.subagentName ?? updateClaudeCode?.subagentName;
             if (typeof subagentId === "string" || typeof subagentName === "string") {
@@ -387,6 +399,28 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
             onPromptActive: async () => {
               turnController.markPromptActive();
               await applyPendingCancel();
+            },
+            onAcpMessage: (_dir, message) => {
+              // Detect hasScheduledWakeup during a prompt turn (same logic as
+              // the idle drain handler) to disable TTL even if the scheduling
+              // tool fires mid-turn.
+              const msg = message as Record<string, unknown>;
+              if (msg.method === "session/update") {
+                const params = msg.params as Record<string, unknown> | undefined;
+                const update = params?.update as Record<string, unknown> | undefined;
+                const updateMeta = update?._meta as Record<string, unknown> | undefined;
+                const updateClaudeCode = updateMeta?.claudeCode as
+                  | Record<string, unknown>
+                  | undefined;
+                if (updateClaudeCode?.hasScheduledWakeup === true) {
+                  taskPollTimeoutMs = undefined;
+                  if (options.verbose) {
+                    process.stderr.write(
+                      `[acpx] scheduled wakeup detected — disabling idle TTL for session ${options.sessionId}\n`,
+                    );
+                  }
+                }
+              }
             },
           });
         } finally {
