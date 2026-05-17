@@ -18,6 +18,7 @@ import {
 import type { AcpJsonRpcMessage, SessionSendOutcome } from "../../types.js";
 import {
   QUEUE_CONNECT_RETRY_MS,
+  type QueueTask,
   SessionQueueOwner,
   releaseQueueOwnerLease,
   tryAcquireQueueOwnerLease,
@@ -370,6 +371,35 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
     };
     idleDrain = await startIdleStreamDrain();
 
+    // Mid-turn injection: tasks that arrive while a prompt turn is active
+    // bypass the normal pending queue and are injected concurrently via
+    // client.prompt() so the agent sees the new message through its
+    // Pushable input mid-turn.
+    //
+    // Two-phase design:
+    //   1. "Capture" — from when the queue-owner pulls a task until the
+    //      runtime's mid-turn handler is registered (client.prompt() is
+    //      in-flight), incoming tasks land in midTurnBuffer.
+    //   2. "Active" — once activeMidTurnHandler is set, the buffer is
+    //      drained into it immediately and subsequent tasks are routed
+    //      straight in.
+    let activeMidTurnHandler: ((injectedTask: QueueTask) => void) | undefined;
+    const midTurnBuffer: QueueTask[] = [];
+    let midTurnCaptureActive = false;
+
+    owner.setMidTurnHandler((task: QueueTask): boolean => {
+      if (activeMidTurnHandler) {
+        activeMidTurnHandler(task);
+        return true;
+      }
+      if (midTurnCaptureActive) {
+        midTurnBuffer.push(task);
+        return true;
+      }
+      // Not in a turn — let the task land in the normal pending queue.
+      return false;
+    });
+
     let isFirstTask = true;
     while (true) {
       const pollTimeoutMs = isFirstTask ? initialTaskPollTimeoutMs : taskPollTimeoutMs;
@@ -382,56 +412,78 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       // Stop idle drain before the prompt registers its own handlers
       await idleDrain.stop();
 
-      await runPromptTurn(async () => {
-        try {
-          await runQueuedTask(options.sessionId, task, {
-            sharedClient,
-            verbose: options.verbose,
-            mcpServers: options.mcpServers,
-            nonInteractivePermissions: options.nonInteractivePermissions,
-            authCredentials: options.authCredentials,
-            authPolicy: options.authPolicy,
-            suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
-            promptRetries: task.promptRetries ?? 0,
-            sessionOptions: options.sessionOptions,
-            onClientAvailable: setActiveController,
-            onClientClosed: clearActiveController,
-            onPromptActive: async () => {
-              turnController.markPromptActive();
-              await applyPendingCancel();
-            },
-            onAcpMessage: (_dir, message) => {
-              // Detect hasScheduledWakeup during a prompt turn (same logic as
-              // the idle drain handler) to disable TTL even if the scheduling
-              // tool fires mid-turn.
-              const msg = message as Record<string, unknown>;
-              if (msg.method === "session/update") {
-                const params = msg.params as Record<string, unknown> | undefined;
-                const update = params?.update as Record<string, unknown> | undefined;
-                const updateMeta = update?._meta as Record<string, unknown> | undefined;
-                const updateClaudeCode = updateMeta?.claudeCode as
-                  | Record<string, unknown>
-                  | undefined;
-                if (updateClaudeCode?.hasScheduledWakeup === true) {
-                  taskPollTimeoutMs = undefined;
-                  if (options.verbose) {
-                    process.stderr.write(
-                      `[acpx] scheduled wakeup detected — disabling idle TTL for session ${options.sessionId}\n`,
-                    );
+      midTurnCaptureActive = true;
+      try {
+        await runPromptTurn(async () => {
+          try {
+            await runQueuedTask(options.sessionId, task, {
+              sharedClient,
+              verbose: options.verbose,
+              mcpServers: options.mcpServers,
+              nonInteractivePermissions: options.nonInteractivePermissions,
+              authCredentials: options.authCredentials,
+              authPolicy: options.authPolicy,
+              suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
+              promptRetries: task.promptRetries ?? 0,
+              sessionOptions: options.sessionOptions,
+              onClientAvailable: setActiveController,
+              onClientClosed: clearActiveController,
+              onPromptActive: async () => {
+                turnController.markPromptActive();
+                await applyPendingCancel();
+              },
+              setMidTurnHandler: (handler) => {
+                activeMidTurnHandler = handler;
+                if (handler) {
+                  // Drain anything that arrived during the capture phase.
+                  for (const buffered of midTurnBuffer.splice(0)) {
+                    handler(buffered);
                   }
                 }
-              }
-            },
-          });
-        } finally {
-          checkpointPerfMetricsCapture();
+              },
+              onAcpMessage: (_dir, message) => {
+                // Detect hasScheduledWakeup during a prompt turn (same logic as
+                // the idle drain handler) to disable TTL even if the scheduling
+                // tool fires mid-turn.
+                const msg = message as Record<string, unknown>;
+                if (msg.method === "session/update") {
+                  const params = msg.params as Record<string, unknown> | undefined;
+                  const update = params?.update as Record<string, unknown> | undefined;
+                  const updateMeta = update?._meta as Record<string, unknown> | undefined;
+                  const updateClaudeCode = updateMeta?.claudeCode as
+                    | Record<string, unknown>
+                    | undefined;
+                  if (updateClaudeCode?.hasScheduledWakeup === true) {
+                    taskPollTimeoutMs = undefined;
+                    if (options.verbose) {
+                      process.stderr.write(
+                        `[acpx] scheduled wakeup detected — disabling idle TTL for session ${options.sessionId}\n`,
+                      );
+                    }
+                  }
+                }
+              },
+            });
+          } finally {
+            checkpointPerfMetricsCapture();
+          }
+        });
+      } finally {
+        midTurnCaptureActive = false;
+        activeMidTurnHandler = undefined;
+        // Any buffered tasks that were never injected (e.g. the handler was
+        // never registered because the turn failed before client.prompt())
+        // go back to the normal pending queue.
+        for (const leftover of midTurnBuffer.splice(0)) {
+          owner.requeue(leftover);
         }
-      });
+      }
       // Restart idle drain to capture teammate activity until next prompt
       idleDrain = await startIdleStreamDrain();
     }
 
     await idleDrain.stop();
+    owner.clearMidTurnHandler();
   } finally {
     await idleDrain?.stop().catch(() => {});
     if (heartbeatTimer) {

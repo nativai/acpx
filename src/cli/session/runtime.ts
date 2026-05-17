@@ -81,6 +81,11 @@ type RunSessionPromptOptions = Omit<
   onClientAvailable?: (controller: ActiveSessionController) => void;
   onClientClosed?: () => void;
   onPromptActive?: () => Promise<void> | void;
+  // Called with a handler once the ACP prompt is in-flight; the handler
+  // accepts a QueueTask and concurrently calls client.prompt() for it so the
+  // agent sees the new message mid-turn via the Pushable input. Pass undefined
+  // to clear the handler after the turn ends.
+  setMidTurnHandler?: (handler: ((task: QueueTask) => void) | undefined) => void;
 };
 
 type ActiveSessionController = QueueOwnerActiveSessionController;
@@ -318,6 +323,7 @@ export async function runQueuedTask(
     onClientClosed?: () => void;
     onPromptActive?: () => Promise<void> | void;
     onAcpMessage?: (direction: AcpMessageDirection, message: AcpJsonRpcMessage) => void;
+    setMidTurnHandler?: (handler: ((task: QueueTask) => void) | undefined) => void;
   },
 ): Promise<void> {
   const outputFormatter = task.waitForCompletion
@@ -346,6 +352,7 @@ export async function runQueuedTask(
       onClientClosed: options.onClientClosed,
       onPromptActive: options.onPromptActive,
       onAcpMessage: options.onAcpMessage,
+      setMidTurnHandler: options.setMidTurnHandler,
       client: options.sharedClient,
     });
 
@@ -864,6 +871,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
 
         const maxRetries = options.promptRetries ?? 0;
         let response;
+        const injectedPromises: Promise<void>[] = [];
         promptTurnActive = true;
         for (let attempt = 0; ; attempt++) {
           try {
@@ -876,24 +884,87 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
                 timeoutMs: options.timeoutMs,
                 conversation,
                 promptMessageId,
-                onPromptStarted:
-                  attempt === 0 && options.onPromptActive
-                    ? async () => {
-                        try {
-                          await options.onPromptActive?.();
-                        } catch (error) {
-                          if (options.verbose) {
-                            process.stderr.write(
-                              "[acpx] onPromptActive hook failed: " +
-                                formatErrorMessage(error) +
-                                "\n",
-                            );
-                          }
+                onPromptStarted: async () => {
+                  // Register the mid-turn injection handler now that the ACP
+                  // prompt is in-flight. Any task injected here calls
+                  // client.prompt() concurrently so the agent sees the new
+                  // message via its Pushable input mid-turn rather than
+                  // waiting for the current turn to end. We track each
+                  // injected promise so we can await all of them after the
+                  // first turn finishes — without this, the queue-owner loop
+                  // would pick up the next sequential task while an injected
+                  // client.prompt() is still running, causing a second
+                  // concurrent call that cuts the injected turn short.
+                  options.setMidTurnHandler?.((injectedTask: QueueTask) => {
+                    const injectedPromise = (async () => {
+                      try {
+                        const injectedResponse = await client.prompt(
+                          activeSessionId,
+                          injectedTask.prompt ?? textPrompt(injectedTask.message),
+                        );
+                        if (injectedTask.waitForCompletion) {
+                          injectedTask.send({
+                            type: "result",
+                            requestId: injectedTask.requestId,
+                            result: {
+                              ...toPromptResult(
+                                injectedResponse.stopReason,
+                                record.acpxRecordId,
+                                client,
+                              ),
+                              record,
+                              resumed: true,
+                            },
+                          });
                         }
+                      } catch (injectedError) {
+                        if (injectedTask.waitForCompletion) {
+                          const normalized = normalizeOutputError(injectedError, {
+                            origin: "runtime",
+                            detailCode: "MID_TURN_PROMPT_FAILED",
+                          });
+                          injectedTask.send({
+                            type: "error",
+                            requestId: injectedTask.requestId,
+                            code: normalized.code,
+                            detailCode: normalized.detailCode,
+                            origin: normalized.origin,
+                            message: normalized.message,
+                            retryable: normalized.retryable,
+                          });
+                        }
+                      } finally {
+                        injectedTask.close();
                       }
-                    : undefined,
+                    })();
+                    injectedPromises.push(injectedPromise);
+                  });
+                  if (attempt === 0 && options.onPromptActive) {
+                    try {
+                      await options.onPromptActive();
+                    } catch (error) {
+                      if (options.verbose) {
+                        process.stderr.write(
+                          "[acpx] onPromptActive hook failed: " + formatErrorMessage(error) + "\n",
+                        );
+                      }
+                    }
+                  }
+                },
               });
             });
+            // First turn done — clear the handler so no new concurrent calls
+            // are made while we write the result and close the writer. Then
+            // await all in-flight injected prompts so the queue-owner loop
+            // does not start the next sequential task while an injected
+            // client.prompt() is still running (a second concurrent call
+            // would push the next sequential message into the injected
+            // turn's context, causing it to end early with no output).
+            options.setMidTurnHandler?.(undefined);
+            if (injectedPromises.length > 0) {
+              await Promise.allSettled(injectedPromises);
+              injectedPromises.length = 0;
+            }
             if (options.verbose) {
               process.stderr.write(
                 `[acpx] ${formatPerfMetric("prompt.agent_turn", Date.now() - promptStartedAt)}\n`,
@@ -901,6 +972,11 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
             }
             break;
           } catch (error) {
+            options.setMidTurnHandler?.(undefined);
+            if (injectedPromises.length > 0) {
+              await Promise.allSettled(injectedPromises);
+              injectedPromises.length = 0;
+            }
             const snapshot = client.getAgentLifecycleSnapshot();
             const agentCrashed = snapshot.lastExit?.unexpectedDuringPrompt === true;
 
