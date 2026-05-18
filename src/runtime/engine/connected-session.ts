@@ -101,7 +101,10 @@ export async function withConnectedSession<T>(
       authPolicy: options.authPolicy,
       terminal: options.terminal,
       verbose: options.verbose,
-      sessionContext: { acpxRecordId: record.acpxRecordId },
+      sessionContext: {
+        acpxRecordId: record.acpxRecordId,
+        parentSessionId: record.parentSessionId ?? null,
+      },
       sessionOptions: sessionOptionsFromRecord(record),
     }) ??
     new AcpClient({
@@ -115,7 +118,10 @@ export async function withConnectedSession<T>(
       authPolicy: options.authPolicy,
       terminal: options.terminal,
       verbose: options.verbose,
-      sessionContext: { acpxRecordId: record.acpxRecordId },
+      sessionContext: {
+        acpxRecordId: record.acpxRecordId,
+        parentSessionId: record.parentSessionId ?? null,
+      },
       sessionOptions: sessionOptionsFromRecord(record),
     });
   let activeSessionIdForControl = record.acpSessionId;
