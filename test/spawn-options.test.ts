@@ -24,6 +24,48 @@ test("buildAgentSpawnOptions hides Windows console windows and preserves auth en
   assert.equal(options.env.ACPX_AUTH_TOKEN, "secret-token");
 });
 
+test("buildAgentSpawnOptions injects ACPX_SESSION_ID when sessionContext.acpxRecordId is set", () => {
+  const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+    acpxRecordId: "11111111-2222-3333-4444-555555555555",
+  });
+  assert.equal(options.env.ACPX_SESSION_ID, "11111111-2222-3333-4444-555555555555");
+  assert.equal(options.env.ACPX_PARENT_SESSION_ID, undefined);
+});
+
+test("buildAgentSpawnOptions injects ACPX_PARENT_SESSION_ID when parentSessionId is non-empty", () => {
+  const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+    acpxRecordId: "child-id",
+    parentSessionId: "parent-id-abc",
+  });
+  assert.equal(options.env.ACPX_SESSION_ID, "child-id");
+  assert.equal(options.env.ACPX_PARENT_SESSION_ID, "parent-id-abc");
+});
+
+test("buildAgentSpawnOptions omits ACPX_PARENT_SESSION_ID when parentSessionId is null", () => {
+  const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+    acpxRecordId: "child-id",
+    parentSessionId: null,
+  });
+  assert.equal(options.env.ACPX_SESSION_ID, "child-id");
+  assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_PARENT_SESSION_ID"), false);
+});
+
+test("buildAgentSpawnOptions omits ACPX_PARENT_SESSION_ID when parentSessionId is empty string", () => {
+  const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+    acpxRecordId: "child-id",
+    parentSessionId: "   ",
+  });
+  assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_PARENT_SESSION_ID"), false);
+});
+
+test("buildAgentSpawnOptions trims whitespace around parentSessionId", () => {
+  const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+    acpxRecordId: "child-id",
+    parentSessionId: "  parent-id-xyz  ",
+  });
+  assert.equal(options.env.ACPX_PARENT_SESSION_ID, "parent-id-xyz");
+});
+
 test("buildAgentSpawnOptions promotes explicit ACPX auth env vars into agent auth env", () => {
   const previousPrefixed = process.env.ACPX_AUTH_OPENAI_API_KEY;
   const previousNormalized = process.env.OPENAI_API_KEY;

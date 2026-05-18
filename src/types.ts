@@ -211,7 +211,7 @@ export type AcpClientOptions = {
   terminal?: boolean;
   suppressSdkConsoleErrors?: boolean;
   verbose?: boolean;
-  sessionContext?: { acpxRecordId: string };
+  sessionContext?: { acpxRecordId: string; parentSessionId?: string | null };
   sessionOptions?: {
     model?: string;
     allowedTools?: string[];

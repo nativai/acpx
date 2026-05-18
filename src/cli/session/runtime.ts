@@ -602,7 +602,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       terminal: options.terminal,
       suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
       verbose: options.verbose,
-      sessionContext: { acpxRecordId: record.acpxRecordId },
+      sessionContext: {
+        acpxRecordId: record.acpxRecordId,
+        parentSessionId: record.parentSessionId ?? null,
+      },
       sessionOptions,
     });
   client.updateRuntimeOptions({
