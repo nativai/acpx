@@ -205,6 +205,7 @@ export async function ensureSession(options: SessionEnsureOptions): Promise<Sess
     cwd,
     name: options.name,
     resumeSessionId: options.resumeSessionId,
+    parentSessionId: options.parentSessionId,
     mcpServers: options.mcpServers,
     permissionMode: options.permissionMode,
     nonInteractivePermissions: options.nonInteractivePermissions,

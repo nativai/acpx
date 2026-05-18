@@ -91,6 +91,11 @@ export function registerSessionsCommand(
     .option("--resume-session <id>", "Resume existing ACP session id", (value: string) =>
       parseNonEmptyValue("Resume session id", value),
     )
+    .option(
+      "--parent-id <uuid>",
+      "Record the spawning session's acpxRecordId as parent_session_id when creating (falls back to ACPX_SESSION_ID env; ignored when an existing session is reused)",
+      (value: string) => parseNonEmptyValue("Parent session id", value),
+    )
     .action(async function (this: Command, flags: SessionsNewFlags) {
       await handleSessionsEnsure(explicitAgentName, flags, this, config);
     });
