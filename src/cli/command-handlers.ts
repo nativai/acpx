@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { Command, InvalidArgumentError } from "commander";
 import { isCodexInvocation } from "../acp/codex-compat.js";
+import { SessionNotFoundError } from "../errors.js";
 import { loadPermissionPolicySpec } from "../permission-policy.js";
 import {
   mergePromptSourceWithText,
@@ -13,6 +14,7 @@ import {
   findGitRepositoryRoot,
   findSession,
   findSessionByDirectoryWalk,
+  resolveSessionRecord,
 } from "../session/persistence.js";
 import { EXIT_CODES } from "../types.js";
 import type {
@@ -183,6 +185,36 @@ async function resolvePermissionPolicyFromFlags(
   }
 }
 
+function resolveParentSessionIdFromFlagOrEnv(flags: SessionsNewFlags): string | undefined {
+  const flagValue = flags.parentId?.trim();
+  if (flagValue && flagValue.length > 0) {
+    return flagValue;
+  }
+  const envValue = process.env.ACPX_SESSION_ID?.trim();
+  if (envValue && envValue.length > 0) {
+    return envValue;
+  }
+  return undefined;
+}
+
+async function resolveAndValidateParentSessionId(
+  flags: SessionsNewFlags,
+): Promise<string | undefined> {
+  const candidate = resolveParentSessionIdFromFlagOrEnv(flags);
+  if (!candidate) {
+    return undefined;
+  }
+  try {
+    const parent = await resolveSessionRecord(candidate);
+    return parent.acpxRecordId;
+  } catch (error) {
+    if (error instanceof SessionNotFoundError) {
+      throw new InvalidArgumentError(`--parent-id refers to unknown session: ${candidate}`);
+    }
+    throw error;
+  }
+}
+
 function buildSessionStartOptions(params: {
   agent: ResolvedAgentInvocation;
   flags: SessionsNewFlags;
@@ -190,12 +222,14 @@ function buildSessionStartOptions(params: {
   config: ResolvedAcpxConfig;
   permissionMode: ReturnType<typeof resolvePermissionMode>;
   permissionPolicy?: PermissionPolicy;
+  parentSessionId?: string;
 }): Parameters<SessionModule["createSession"]>[0] {
   return {
     agentCommand: params.agent.agentCommand,
     cwd: params.agent.cwd,
     name: params.flags.name,
     resumeSessionId: params.flags.resumeSession,
+    parentSessionId: params.parentSessionId,
     mcpServers: params.config.mcpServers,
     permissionMode: params.permissionMode,
     nonInteractivePermissions: params.globalFlags.nonInteractivePermissions,
@@ -689,6 +723,7 @@ export async function handleSessionsNew(
   const globalFlags = resolveGlobalFlags(command, config);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
+  const parentSessionId = await resolveAndValidateParentSessionId(flags);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const [{ createSession, closeSession }, { printCreatedSessionBanner, printNewSessionByFormat }] =
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
@@ -714,6 +749,7 @@ export async function handleSessionsNew(
       config,
       permissionMode,
       permissionPolicy,
+      parentSessionId,
     }),
   );
 

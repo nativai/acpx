@@ -462,6 +462,7 @@ export class AcpClient {
     const agentSpawnOptions = buildAgentSpawnOptions(
       this.options.cwd,
       this.options.authCredentials,
+      this.options.sessionContext,
     );
     const claudeAcp = isClaudeAcpCommand(spawnCommand, args);
     if (claudeAcp) {

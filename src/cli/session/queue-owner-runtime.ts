@@ -99,6 +99,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
     terminal: options.terminal,
     suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
     verbose: options.verbose,
+    sessionContext: { acpxRecordId: sessionRecord.acpxRecordId },
     sessionOptions: mergeSessionOptions(
       options.sessionOptions,
       sessionOptionsFromRecord(sessionRecord),

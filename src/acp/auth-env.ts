@@ -59,9 +59,16 @@ function promotePrefixedAuthEnvironment(env: NodeJS.ProcessEnv): void {
 
 function buildAgentEnvironment(
   authCredentials: Record<string, string> | undefined,
+  sessionContext?: { acpxRecordId: string },
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   promotePrefixedAuthEnvironment(env);
+  if (sessionContext && typeof sessionContext.acpxRecordId === "string") {
+    const trimmed = sessionContext.acpxRecordId.trim();
+    if (trimmed.length > 0) {
+      env.ACPX_SESSION_ID = trimmed;
+    }
+  }
   if (!authCredentials) {
     return env;
   }
@@ -101,6 +108,7 @@ export function resolveConfiguredAuthCredential(
 export function buildAgentSpawnOptions(
   cwd: string,
   authCredentials: Record<string, string> | undefined,
+  sessionContext?: { acpxRecordId: string },
 ): {
   cwd: string;
   env: NodeJS.ProcessEnv;
@@ -109,7 +117,7 @@ export function buildAgentSpawnOptions(
 } {
   return {
     cwd,
-    env: buildAgentEnvironment(authCredentials),
+    env: buildAgentEnvironment(authCredentials, sessionContext),
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   };
