@@ -108,6 +108,9 @@ async function createSessionRecordWithClient(
     agentCapabilities: client.initializeResult?.agentCapabilities,
     ...createSessionConversation(now),
     acpx: {},
+    ...(options.parentSessionId
+      ? { kind: "session" as const, parentSessionId: options.parentSessionId }
+      : {}),
   };
 
   persistSessionOptions(record, options.sessionOptions);

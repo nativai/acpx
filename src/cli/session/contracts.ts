@@ -64,6 +64,7 @@ export type SessionCreateOptions = {
   cwd: string;
   name?: string;
   resumeSessionId?: string;
+  parentSessionId?: string;
   mcpServers?: McpServer[];
   permissionMode: PermissionMode;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
