@@ -772,6 +772,7 @@ export async function handleSessionsEnsure(
   const globalFlags = resolveGlobalFlags(command, config);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
+  const parentSessionId = await resolveAndValidateParentSessionId(flags);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const [{ ensureSession }, { printCreatedSessionBanner, printEnsuredSessionByFormat }] =
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
@@ -783,6 +784,7 @@ export async function handleSessionsEnsure(
       config,
       permissionMode,
       permissionPolicy,
+      parentSessionId,
     }),
   );
 
