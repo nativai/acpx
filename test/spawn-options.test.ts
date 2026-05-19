@@ -66,6 +66,168 @@ test("buildAgentSpawnOptions trims whitespace around parentSessionId", () => {
   assert.equal(options.env.ACPX_PARENT_SESSION_ID, "parent-id-xyz");
 });
 
+function withAcpxUiBaseUrlEnv<T>(value: string | undefined, fn: () => T): T {
+  const previous = process.env.ACPX_UI_BASE_URL;
+  if (value === undefined) {
+    delete process.env.ACPX_UI_BASE_URL;
+  } else {
+    process.env.ACPX_UI_BASE_URL = value;
+  }
+  try {
+    return fn();
+  } finally {
+    if (previous === undefined) {
+      delete process.env.ACPX_UI_BASE_URL;
+    } else {
+      process.env.ACPX_UI_BASE_URL = previous;
+    }
+  }
+}
+
+test("buildAgentSpawnOptions injects ACPX_SESSION_URL with default base URL when acpxRecordId is set", () => {
+  withAcpxUiBaseUrlEnv(undefined, () => {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "11111111-2222-3333-4444-555555555555",
+    });
+    assert.equal(
+      options.env.ACPX_SESSION_URL,
+      "https://acpx.devbox.nativai.de/?session=11111111-2222-3333-4444-555555555555",
+    );
+  });
+});
+
+test("buildAgentSpawnOptions omits ACPX_SESSION_URL when acpxRecordId is empty/whitespace", () => {
+  const previousId = process.env.ACPX_SESSION_ID;
+  const previousUrl = process.env.ACPX_SESSION_URL;
+  delete process.env.ACPX_SESSION_ID;
+  delete process.env.ACPX_SESSION_URL;
+  try {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "   ",
+    });
+    assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_SESSION_URL"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_SESSION_ID"), false);
+  } finally {
+    if (previousId === undefined) {
+      delete process.env.ACPX_SESSION_ID;
+    } else {
+      process.env.ACPX_SESSION_ID = previousId;
+    }
+    if (previousUrl === undefined) {
+      delete process.env.ACPX_SESSION_URL;
+    } else {
+      process.env.ACPX_SESSION_URL = previousUrl;
+    }
+  }
+});
+
+test("buildAgentSpawnOptions injects ACPX_PARENT_SESSION_URL when parentSessionId is non-empty", () => {
+  withAcpxUiBaseUrlEnv(undefined, () => {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+      parentSessionId: "parent-id-abc",
+    });
+    assert.equal(
+      options.env.ACPX_PARENT_SESSION_URL,
+      "https://acpx.devbox.nativai.de/?session=parent-id-abc",
+    );
+  });
+});
+
+test("buildAgentSpawnOptions omits ACPX_PARENT_SESSION_URL when parentSessionId is null/undefined/whitespace", () => {
+  const nullCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+    acpxRecordId: "child-id",
+    parentSessionId: null,
+  });
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(nullCase.env, "ACPX_PARENT_SESSION_URL"),
+    false,
+  );
+
+  const undefinedCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+    acpxRecordId: "child-id",
+  });
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(undefinedCase.env, "ACPX_PARENT_SESSION_URL"),
+    false,
+  );
+
+  const whitespaceCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+    acpxRecordId: "child-id",
+    parentSessionId: "   ",
+  });
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(whitespaceCase.env, "ACPX_PARENT_SESSION_URL"),
+    false,
+  );
+});
+
+test("buildAgentSpawnOptions honors ACPX_UI_BASE_URL override for both URL vars", () => {
+  withAcpxUiBaseUrlEnv("http://localhost:3456", () => {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+      parentSessionId: "parent-id",
+    });
+    assert.equal(options.env.ACPX_SESSION_URL, "http://localhost:3456/?session=child-id");
+    assert.equal(options.env.ACPX_PARENT_SESSION_URL, "http://localhost:3456/?session=parent-id");
+  });
+});
+
+test("buildAgentSpawnOptions normalizes a trailing slash on ACPX_UI_BASE_URL", () => {
+  withAcpxUiBaseUrlEnv("https://x.example.com/", () => {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+    });
+    assert.equal(options.env.ACPX_SESSION_URL, "https://x.example.com/?session=child-id");
+  });
+});
+
+test("buildAgentSpawnOptions falls through to default when ACPX_UI_BASE_URL is empty/whitespace", () => {
+  withAcpxUiBaseUrlEnv("   ", () => {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+    });
+    assert.equal(options.env.ACPX_SESSION_URL, "https://acpx.devbox.nativai.de/?session=child-id");
+  });
+
+  withAcpxUiBaseUrlEnv("", () => {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+    });
+    assert.equal(options.env.ACPX_SESSION_URL, "https://acpx.devbox.nativai.de/?session=child-id");
+  });
+});
+
+test("buildAgentSpawnOptions reflects trimmed UUIDs in URL vars", () => {
+  withAcpxUiBaseUrlEnv(undefined, () => {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "  child-id  ",
+      parentSessionId: "  parent-id-xyz  ",
+    });
+    assert.equal(options.env.ACPX_SESSION_URL, "https://acpx.devbox.nativai.de/?session=child-id");
+    assert.equal(
+      options.env.ACPX_PARENT_SESSION_URL,
+      "https://acpx.devbox.nativai.de/?session=parent-id-xyz",
+    );
+  });
+});
+
+test("buildAgentSpawnOptions keeps the additive contract: bare ID vars still injected alongside URL vars", () => {
+  withAcpxUiBaseUrlEnv(undefined, () => {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+      parentSessionId: "parent-id",
+    });
+    assert.equal(options.env.ACPX_SESSION_ID, "child-id");
+    assert.equal(options.env.ACPX_PARENT_SESSION_ID, "parent-id");
+    assert.equal(options.env.ACPX_SESSION_URL, "https://acpx.devbox.nativai.de/?session=child-id");
+    assert.equal(
+      options.env.ACPX_PARENT_SESSION_URL,
+      "https://acpx.devbox.nativai.de/?session=parent-id",
+    );
+  });
+});
+
 test("buildAgentSpawnOptions promotes explicit ACPX auth env vars into agent auth env", () => {
   const previousPrefixed = process.env.ACPX_AUTH_OPENAI_API_KEY;
   const previousNormalized = process.env.OPENAI_API_KEY;

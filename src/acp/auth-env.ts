@@ -57,22 +57,33 @@ function promotePrefixedAuthEnvironment(env: NodeJS.ProcessEnv): void {
   }
 }
 
+const DEFAULT_ACPX_UI_BASE_URL = "https://acpx.devbox.nativai.de";
+
+export function resolveAcpxUiBaseUrl(env: NodeJS.ProcessEnv): string {
+  const raw = env.ACPX_UI_BASE_URL?.trim();
+  const base = raw && raw.length > 0 ? raw : DEFAULT_ACPX_UI_BASE_URL;
+  return base.replace(/\/+$/, "");
+}
+
 function buildAgentEnvironment(
   authCredentials: Record<string, string> | undefined,
   sessionContext?: { acpxRecordId: string; parentSessionId?: string | null },
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   promotePrefixedAuthEnvironment(env);
+  const baseUrl = resolveAcpxUiBaseUrl(env);
   if (sessionContext && typeof sessionContext.acpxRecordId === "string") {
     const trimmed = sessionContext.acpxRecordId.trim();
     if (trimmed.length > 0) {
       env.ACPX_SESSION_ID = trimmed;
+      env.ACPX_SESSION_URL = `${baseUrl}/?session=${trimmed}`;
     }
   }
   if (sessionContext && typeof sessionContext.parentSessionId === "string") {
     const trimmedParent = sessionContext.parentSessionId.trim();
     if (trimmedParent.length > 0) {
       env.ACPX_PARENT_SESSION_ID = trimmedParent;
+      env.ACPX_PARENT_SESSION_URL = `${baseUrl}/?session=${trimmedParent}`;
     }
   }
   if (!authCredentials) {
