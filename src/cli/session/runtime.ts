@@ -483,30 +483,6 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     }
   };
 
-  // Flush pending messages to the stream file every 500ms so external readers
-  // (e.g. UI tools) can observe progress in real-time rather than only at turn end.
-  // We also checkpoint the session record to disk periodically — syncing the
-  // in-memory conversation onto the record — so that if the daemon is killed
-  // mid-turn, the reconciled `messages` array on disk is at most ~500ms stale
-  // rather than lost entirely (see fix-reconciliation-messages).
-  const periodicCheckpoint = async (): Promise<void> => {
-    try {
-      await flushPendingMessages(false);
-    } catch {
-      // best effort
-    }
-    try {
-      applyConversation(record, conversation);
-      record.acpx = acpxState;
-      await eventWriter.checkpoint();
-    } catch {
-      // best effort
-    }
-  };
-  const streamFlushInterval = setInterval(() => {
-    void periodicCheckpoint();
-  }, 500);
-
   // Extract claudeCode metadata from a raw ACP message (session/update notification)
   const extractClaudeCodeMeta = (
     message: AcpJsonRpcMessage,
@@ -1103,7 +1079,6 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
     applyConversation(record, conversation);
     record.acpx = acpxState;
-    clearInterval(streamFlushInterval);
     await liveCheckpoint.flush().catch(() => {
       // best effort on close
     });
