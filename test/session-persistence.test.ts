@@ -29,6 +29,80 @@ test("SessionRecord allows optional closed and closedAt fields", () => {
   assert.equal(record.closedAt, undefined);
 });
 
+test("SessionRecord allows optional favorite and favoritedAt fields", () => {
+  const record = makeSessionRecord({
+    acpxRecordId: "favorite-type-check",
+    acpSessionId: "favorite-type-check",
+    agentCommand: "agent",
+    cwd: "/tmp/favorite-type-check",
+    favorite: true,
+    favoritedAt: "2026-05-21T10:00:00.000Z",
+  });
+
+  assert.equal(record.favorite, true);
+  assert.equal(record.favoritedAt, "2026-05-21T10:00:00.000Z");
+});
+
+test("listSessions preserves favorite and favoritedAt", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "favorite-roundtrip",
+        acpSessionId: "favorite-roundtrip",
+        agentCommand: "agent-a",
+        cwd,
+        favorite: true,
+        favoritedAt: "2026-05-21T10:30:00.000Z",
+      }),
+    );
+
+    const sessions = await session.listSessions();
+    const record = sessions.find((entry) => entry.acpxRecordId === "favorite-roundtrip");
+    assert.ok(record);
+    assert.equal(record.favorite, true);
+    assert.equal(record.favoritedAt, "2026-05-21T10:30:00.000Z");
+
+    const onDisk = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, "favorite-roundtrip"), "utf8"),
+    ) as Record<string, unknown>;
+    assert.equal(onDisk.favorite, true);
+    assert.equal(onDisk.favorited_at, "2026-05-21T10:30:00.000Z");
+  });
+});
+
+test("listSessions omits favorite/favorited_at when unset (no schema noise)", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "no-favorite",
+        acpSessionId: "no-favorite",
+        agentCommand: "agent-a",
+        cwd,
+      }),
+    );
+
+    const sessions = await session.listSessions();
+    const record = sessions.find((entry) => entry.acpxRecordId === "no-favorite");
+    assert.ok(record);
+    assert.equal(record.favorite, undefined);
+    assert.equal(record.favoritedAt, undefined);
+
+    const onDisk = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, "no-favorite"), "utf8"),
+    ) as Record<string, unknown>;
+    assert.equal("favorite" in onDisk, false);
+    assert.equal("favorited_at" in onDisk, false);
+  });
+});
+
 test("listSessions preserves acpx desired_mode_id", async () => {
   await withTempHome(async (homeDir) => {
     const session = await loadSessionModule();

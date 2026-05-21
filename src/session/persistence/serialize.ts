@@ -33,6 +33,8 @@ export function serializeSessionRecordForDisk(record: SessionRecord): Record<str
     event_log: canonical.eventLog,
     closed: canonical.closed,
     closed_at: canonical.closedAt,
+    favorite: canonical.favorite,
+    favorited_at: canonical.favoritedAt,
     pid: canonical.pid,
     agent_started_at: canonical.agentStartedAt,
     last_prompt_at: canonical.lastPromptAt,

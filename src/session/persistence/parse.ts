@@ -425,6 +425,13 @@ function normalizeOptionalBoolean(value: unknown, fallback = false): boolean | n
   return typeof value === "boolean" ? value : null;
 }
 
+function normalizeOptionalBooleanField(value: unknown): boolean | undefined | null {
+  if (value == null) {
+    return undefined;
+  }
+  return typeof value === "boolean" ? value : null;
+}
+
 function normalizeOptionalString(value: unknown): string | undefined | null {
   if (value == null) {
     return undefined;
@@ -541,6 +548,8 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
   const pid = normalizeOptionalPid(record.pid);
   const closed = normalizeOptionalBoolean(record.closed, false);
   const closedAt = normalizeOptionalString(record.closed_at);
+  const favorite = normalizeOptionalBooleanField(record.favorite);
+  const favoritedAt = normalizeOptionalString(record.favorited_at);
   const agentStartedAt = normalizeOptionalString(record.agent_started_at);
   const lastPromptAt = normalizeOptionalString(record.last_prompt_at);
   const lastAgentExitCode = normalizeOptionalExitCode(record.last_agent_exit_code);
@@ -579,6 +588,8 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     pid === null ||
     closed === null ||
     closedAt === null ||
+    favorite === null ||
+    favoritedAt === null ||
     agentStartedAt === null ||
     lastPromptAt === null ||
     typeof lastAgentExitCode === "symbol" ||
@@ -625,6 +636,8 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     eventLog,
     closed,
     closedAt,
+    favorite,
+    favoritedAt,
     pid,
     agentStartedAt,
     lastPromptAt,
