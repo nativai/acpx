@@ -84,19 +84,31 @@ function matchesSessionEntry(
 
 /**
  * Read the current on-disk <id>.json (if present) and return the persisted
- * lifecycle fields (closed/closedAt). Returns undefined if the file is missing
- * or unreadable — callers should treat that as "no prior state to preserve."
+ * lifecycle fields (closed/closedAt) and UI-owned favorite state
+ * (favorite/favoritedAt). Returns undefined if the file is missing or
+ * unreadable — callers should treat that as "no prior state to preserve."
  */
-async function readPersistedLifecycle(
-  acpxRecordId: string,
-): Promise<{ closed: boolean | undefined; closedAt: string | undefined } | undefined> {
+async function readPersistedLifecycle(acpxRecordId: string): Promise<
+  | {
+      closed: boolean | undefined;
+      closedAt: string | undefined;
+      favorite: boolean | undefined;
+      favoritedAt: string | undefined;
+    }
+  | undefined
+> {
   try {
     const payload = await fs.readFile(sessionFilePath(acpxRecordId), "utf8");
     const parsed = parseSessionRecord(JSON.parse(payload));
     if (!parsed) {
       return undefined;
     }
-    return { closed: parsed.closed, closedAt: parsed.closedAt };
+    return {
+      closed: parsed.closed,
+      closedAt: parsed.closedAt,
+      favorite: parsed.favorite,
+      favoritedAt: parsed.favoritedAt,
+    };
   } catch {
     return undefined;
   }
@@ -107,23 +119,24 @@ async function readPersistedLifecycle(
  *
  * ## Session-lifecycle-state ownership (see DESIGN.md)
  *
- * UI-authored lifecycle fields (`closed`, `closed_at`) are **read-preserved**
- * on every daemon write: before serializing, we read the current on-disk
- * `<id>.json` and overwrite the in-memory `record.closed` / `record.closedAt`
- * with the on-disk values. This means a UI PATCH that flipped `closed=true`
- * survives the next daemon checkpoint — the daemon can never silently revert
- * user intent.
+ * UI-authored lifecycle fields (`closed`, `closed_at`) and UI-owned favorite
+ * state (`favorite`, `favorited_at`) are **read-preserved** on every daemon
+ * write: before serializing, we read the current on-disk `<id>.json` and
+ * overwrite the in-memory record's lifecycle / favorite fields with the
+ * on-disk values. This means a UI PATCH that flipped `closed=true` or
+ * `favorite=true` survives the next daemon checkpoint — the daemon can never
+ * silently revert user intent.
  *
  * The **one authorized daemon writer** of these fields is `closeSession`
  * (and its privileged helper variants): it calls
  * `writeSessionRecordWithLifecycle` to bypass the preserve step so it can
  * write `closed: true` from the daemon side. Every other writer — periodic
  * checkpoints, end-of-turn flushes, subagent updates — must use plain
- * `writeSessionRecord` and will be transparent to lifecycle state.
+ * `writeSessionRecord` and will be transparent to lifecycle / favorite state.
  *
  * `toSessionIndexEntry` and `serializeSessionRecordForDisk` remain unchanged:
- * they simply consume whatever `record.closed` is at call time, which is
- * already the correct value because the preserve step ran first.
+ * they simply consume whatever the in-memory record holds at call time,
+ * which is already the correct value because the preserve step ran first.
  */
 export async function writeSessionRecord(record: SessionRecord): Promise<void> {
   await writeSessionRecordInternal(record, { preserveLifecycle: true });
@@ -150,6 +163,8 @@ async function writeSessionRecordInternal(
       if (persistedLifecycle) {
         record.closed = persistedLifecycle.closed;
         record.closedAt = persistedLifecycle.closedAt;
+        record.favorite = persistedLifecycle.favorite;
+        record.favoritedAt = persistedLifecycle.favoritedAt;
       }
     }
 

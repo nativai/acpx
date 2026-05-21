@@ -373,6 +373,8 @@ export type SessionRecord = {
   eventLog: SessionEventLog;
   closed?: boolean;
   closedAt?: string;
+  favorite?: boolean;
+  favoritedAt?: string;
   pid?: number;
   agentStartedAt?: string;
   lastPromptAt?: string;

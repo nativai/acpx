@@ -45,6 +45,8 @@ export function makeSessionRecord(
     },
     closed: overrides.closed ?? false,
     closedAt: overrides.closedAt,
+    favorite: overrides.favorite,
+    favoritedAt: overrides.favoritedAt,
     pid: overrides.pid,
     agentStartedAt: overrides.agentStartedAt,
     lastPromptAt: overrides.lastPromptAt,

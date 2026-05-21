@@ -91,6 +91,8 @@ function makeSessionRecord(
     },
     closed: overrides.closed ?? false,
     closedAt: overrides.closedAt,
+    favorite: overrides.favorite,
+    favoritedAt: overrides.favoritedAt,
     pid: overrides.pid,
     agentStartedAt: overrides.agentStartedAt,
     lastPromptAt: overrides.lastPromptAt,
@@ -192,6 +194,113 @@ test("writeSessionRecordWithLifecycle bypasses preservation (privileged close pa
     const afterJson = JSON.parse(await fs.readFile(afterPath, "utf8")) as Record<string, unknown>;
     assert.equal(afterJson.closed, true);
     assert.equal(afterJson.closed_at, "2026-04-20T13:00:00.000Z");
+  });
+});
+
+test("writeSessionRecord preserves on-disk favorite=true when in-memory record drops it", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "repo");
+
+    // 1. Seed disk with favorite=true (UI PATCH result).
+    const favoritedOnDisk = makeSessionRecord({
+      acpxRecordId: "preserve-favorite",
+      acpSessionId: "preserve-favorite",
+      agentCommand: "agent-a",
+      cwd,
+      favorite: true,
+      favoritedAt: "2026-05-21T10:00:00.000Z",
+    });
+    await seedSessionJson(homeDir, favoritedOnDisk);
+
+    // 2. Daemon builds an in-memory record without favorite (stale view from
+    //    a parse that predates the UI PATCH) and calls plain writeSessionRecord.
+    const stale = makeSessionRecord({
+      acpxRecordId: "preserve-favorite",
+      acpSessionId: "preserve-favorite",
+      agentCommand: "agent-a",
+      cwd,
+      favorite: undefined,
+      favoritedAt: undefined,
+      lastUsedAt: "2026-05-21T12:00:00.000Z",
+      updated_at: "2026-05-21T12:00:00.000Z",
+    });
+    await repoWriteSessionRecord(stale);
+
+    // 3. Disk must still carry favorite=true and the original favorited_at.
+    const afterPath = sessionFilePath(homeDir, "preserve-favorite");
+    const afterJson = JSON.parse(await fs.readFile(afterPath, "utf8")) as Record<string, unknown>;
+    assert.equal(afterJson.favorite, true, "favorite must remain true after plain write");
+    assert.equal(
+      afterJson.favorited_at,
+      "2026-05-21T10:00:00.000Z",
+      "favorited_at must remain the original UI-written value",
+    );
+
+    // 4. But non-lifecycle fields must still reflect the daemon's new values.
+    assert.equal(
+      afterJson.last_used_at,
+      "2026-05-21T12:00:00.000Z",
+      "daemon-owned fields must still be written through",
+    );
+
+    // 5. And the in-memory record returned by resolve must show the disk's truth.
+    const resolved = await resolveSessionRecord("preserve-favorite");
+    assert.equal(resolved.favorite, true);
+    assert.equal(resolved.favoritedAt, "2026-05-21T10:00:00.000Z");
+  });
+});
+
+test("writeSessionRecord preserves on-disk favorite=false (un-favorite) against stale favorite=true", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "repo");
+
+    // 1. Seed disk with favorite=false (UI un-favorite PATCH — favorited_at deleted).
+    const unfavoritedOnDisk = makeSessionRecord({
+      acpxRecordId: "preserve-unfavorite",
+      acpSessionId: "preserve-unfavorite",
+      agentCommand: "agent-a",
+      cwd,
+      favorite: false,
+      favoritedAt: undefined,
+    });
+    await seedSessionJson(homeDir, unfavoritedOnDisk);
+
+    // 2. Daemon's stale in-memory record still says favorite=true.
+    const stale = makeSessionRecord({
+      acpxRecordId: "preserve-unfavorite",
+      acpSessionId: "preserve-unfavorite",
+      agentCommand: "agent-a",
+      cwd,
+      favorite: true,
+      favoritedAt: "2026-05-21T10:00:00.000Z",
+      lastUsedAt: "2026-05-21T12:00:00.000Z",
+      updated_at: "2026-05-21T12:00:00.000Z",
+    });
+    await repoWriteSessionRecord(stale);
+
+    const afterPath = sessionFilePath(homeDir, "preserve-unfavorite");
+    const afterJson = JSON.parse(await fs.readFile(afterPath, "utf8")) as Record<string, unknown>;
+    assert.equal(afterJson.favorite, false);
+    assert.equal("favorited_at" in afterJson, false);
+  });
+});
+
+test("writeSessionRecord leaves favorite field absent when no prior on-disk record exists", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "repo");
+    const fresh = makeSessionRecord({
+      acpxRecordId: "fresh-favorite",
+      acpSessionId: "fresh-favorite",
+      agentCommand: "agent-a",
+      cwd,
+    });
+    await repoWriteSessionRecord(fresh);
+
+    const afterJson = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, "fresh-favorite"), "utf8"),
+    ) as Record<string, unknown>;
+    assert.equal("favorite" in afterJson, false);
+    assert.equal("favorited_at" in afterJson, false);
   });
 });
 
