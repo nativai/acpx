@@ -65,9 +65,15 @@ export function resolveAcpxUiBaseUrl(env: NodeJS.ProcessEnv): string {
   return base.replace(/\/+$/, "");
 }
 
+export type AgentSessionContext = {
+  acpxRecordId: string;
+  parentSessionId?: string | null;
+  taskFolder?: string | null;
+};
+
 function buildAgentEnvironment(
   authCredentials: Record<string, string> | undefined,
-  sessionContext?: { acpxRecordId: string; parentSessionId?: string | null },
+  sessionContext?: AgentSessionContext,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   promotePrefixedAuthEnvironment(env);
@@ -84,6 +90,12 @@ function buildAgentEnvironment(
     if (trimmedParent.length > 0) {
       env.ACPX_PARENT_SESSION_ID = trimmedParent;
       env.ACPX_PARENT_SESSION_URL = `${baseUrl}/?session=${trimmedParent}`;
+    }
+  }
+  if (sessionContext && typeof sessionContext.taskFolder === "string") {
+    const trimmedTaskFolder = sessionContext.taskFolder.trim();
+    if (trimmedTaskFolder.length > 0) {
+      env.ACPX_TASK_FOLDER = trimmedTaskFolder;
     }
   }
   if (!authCredentials) {
@@ -125,7 +137,7 @@ export function resolveConfiguredAuthCredential(
 export function buildAgentSpawnOptions(
   cwd: string,
   authCredentials: Record<string, string> | undefined,
-  sessionContext?: { acpxRecordId: string; parentSessionId?: string | null },
+  sessionContext?: AgentSessionContext,
 ): {
   cwd: string;
   env: NodeJS.ProcessEnv;

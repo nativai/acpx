@@ -65,6 +65,7 @@ export type SessionCreateOptions = {
   name?: string;
   resumeSessionId?: string;
   parentSessionId?: string;
+  metadata?: Record<string, string>;
   mcpServers?: McpServer[];
   permissionMode: PermissionMode;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
@@ -109,6 +110,7 @@ export type SessionEnsureOptions = {
   name?: string;
   resumeSessionId?: string;
   parentSessionId?: string;
+  metadata?: Record<string, string>;
   mcpServers?: McpServer[];
   permissionMode: PermissionMode;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;

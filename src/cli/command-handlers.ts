@@ -230,6 +230,7 @@ function buildSessionStartOptions(params: {
     name: params.flags.name,
     resumeSessionId: params.flags.resumeSession,
     parentSessionId: params.parentSessionId,
+    metadata: params.flags.metadata,
     mcpServers: params.config.mcpServers,
     permissionMode: params.permissionMode,
     nonInteractivePermissions: params.globalFlags.nonInteractivePermissions,

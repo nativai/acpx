@@ -102,6 +102,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
     sessionContext: {
       acpxRecordId: sessionRecord.acpxRecordId,
       parentSessionId: sessionRecord.parentSessionId ?? null,
+      taskFolder: sessionRecord.metadata?.task_folder ?? null,
     },
     sessionOptions: mergeSessionOptions(
       options.sessionOptions,

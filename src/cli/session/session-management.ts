@@ -111,6 +111,9 @@ async function createSessionRecordWithClient(
     ...(options.parentSessionId
       ? { kind: "session" as const, parentSessionId: options.parentSessionId }
       : {}),
+    ...(options.metadata && Object.keys(options.metadata).length > 0
+      ? { metadata: { ...options.metadata } }
+      : {}),
   };
 
   persistSessionOptions(record, options.sessionOptions);
@@ -179,10 +182,18 @@ export async function ensureSession(options: SessionEnsureOptions): Promise<Sess
     boundary: walkBoundary,
   });
   if (existing) {
+    let working = existing;
+    if (options.metadata && Object.keys(options.metadata).length > 0) {
+      working = {
+        ...existing,
+        metadata: { ...existing.metadata, ...options.metadata },
+      };
+      await writeSessionRecord(working);
+    }
     const requestedModel = options.sessionOptions?.model;
     if (requestedModel) {
       const result = await setSessionModel({
-        sessionId: existing.acpxRecordId,
+        sessionId: working.acpxRecordId,
         modelId: requestedModel,
         mcpServers: options.mcpServers,
         nonInteractivePermissions: options.nonInteractivePermissions,
@@ -195,7 +206,7 @@ export async function ensureSession(options: SessionEnsureOptions): Promise<Sess
       return { record: result.record, created: false };
     }
     return {
-      record: existing,
+      record: working,
       created: false,
     };
   }
@@ -206,6 +217,7 @@ export async function ensureSession(options: SessionEnsureOptions): Promise<Sess
     name: options.name,
     resumeSessionId: options.resumeSessionId,
     parentSessionId: options.parentSessionId,
+    metadata: options.metadata,
     mcpServers: options.mcpServers,
     permissionMode: options.permissionMode,
     nonInteractivePermissions: options.nonInteractivePermissions,
