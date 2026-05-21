@@ -111,7 +111,8 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   });
   const ttlMs = normalizeQueueOwnerTtlMs(options.ttlMs);
   const maxQueueDepth = Math.max(1, Math.round(options.maxQueueDepth ?? 16));
-  let taskPollTimeoutMs: number | undefined = ttlMs === 0 ? undefined : ttlMs;
+  const defaultTaskPollTimeoutMs: number | undefined = ttlMs === 0 ? undefined : ttlMs;
+  let taskPollTimeoutMs: number | undefined = defaultTaskPollTimeoutMs;
   const initialTaskPollTimeoutMs =
     taskPollTimeoutMs == null ? undefined : Math.max(taskPollTimeoutMs, 1_000);
   const turnController = new QueueOwnerTurnController({
@@ -426,6 +427,15 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         break;
       }
       isFirstTask = false;
+
+      // Reset the idle poll timeout each turn. A previous turn's scheduling
+      // tool may have set taskPollTimeoutMs to undefined via the
+      // hasScheduledWakeup signal; the adapter never sends a corresponding
+      // "wakeup fired" notification, so without this reset the idle TTL stays
+      // disabled forever (immortal queue-owner). If this turn schedules
+      // another wakeup, the onAcpMessage handler below will set it back to
+      // undefined for the duration of that wakeup window.
+      taskPollTimeoutMs = defaultTaskPollTimeoutMs;
 
       // Stop idle drain before the prompt registers its own handlers
       await idleDrain.stop();
