@@ -201,7 +201,6 @@ export class SessionEventWriter {
   private activeSizeBytes: number;
   private segmentCount: number;
   private closed = false;
-  private appendChain: Promise<void> = Promise.resolve();
 
   private constructor(
     record: SessionRecord,
@@ -271,23 +270,6 @@ export class SessionEventWriter {
       return;
     }
 
-    // Serialize concurrent callers so the per-message fs.appendFile syscalls
-    // (and the in-memory segment bookkeeping they piggyback on) cannot race in
-    // libuv's threadpool. Without this, two flush paths writing in parallel can
-    // interleave their appends and scramble NDJSON chunk order on disk.
-    const prior = this.appendChain;
-    const next = (async () => {
-      await prior.catch(() => undefined);
-      await this.performAppend(messages, options);
-    })();
-    this.appendChain = next.catch(() => undefined);
-    await next;
-  }
-
-  private async performAppend(
-    messages: AcpJsonRpcMessage[],
-    options: AppendOptions,
-  ): Promise<void> {
     await ensureSessionDir();
 
     await measurePerf("session.events.append_batch", async () => {

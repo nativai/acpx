@@ -189,69 +189,6 @@ test("listSessionEvents skips malformed NDJSON lines", async () => {
   });
 });
 
-test("SessionEventWriter serializes concurrent appendMessages in FIFO order", async () => {
-  await withTempHome(async (homeDir) => {
-    const cwd = path.join(homeDir, "workspace");
-    await fs.mkdir(cwd, { recursive: true });
-
-    const sessionId = "session-stream-concurrent-fifo";
-    const record = makeSessionRecord(sessionId, cwd, 5);
-    await writeSessionRecord(record);
-
-    const writer = await SessionEventWriter.open(record);
-
-    // Fire B concurrent batches without awaiting between them. Each batch
-    // contains K messages tagged (batch,index). With a per-writer mutex the
-    // batches must land contiguously and in dispatch order; without it, the
-    // libuv threadpool can interleave per-message appendFile syscalls.
-    const batchCount = 12;
-    const messagesPerBatch = 8;
-    const pending: Promise<void>[] = [];
-    for (let batch = 0; batch < batchCount; batch += 1) {
-      const payload = Array.from({ length: messagesPerBatch }, (_unused, index) => ({
-        jsonrpc: "2.0" as const,
-        method: "session/update",
-        params: {
-          sessionId,
-          update: {
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: `batch-${batch}-msg-${index}` },
-          },
-        },
-      }));
-      pending.push(writer.appendMessages(payload as never));
-    }
-    await Promise.all(pending);
-    await writer.close({ checkpoint: true });
-
-    const events = await listSessionEvents(sessionId);
-    assert.equal(events.length, batchCount * messagesPerBatch);
-
-    // Reconstruct (batch, index) pairs from each event and assert ordering:
-    // batch ids appear in dispatch order, and within a batch indices are 0..K-1.
-    const seen: Array<{ batch: number; index: number }> = [];
-    for (const event of events) {
-      const params = (event as { params?: { update?: { content?: { text?: string } } } }).params;
-      const text = params?.update?.content?.text;
-      assert.ok(typeof text === "string", "expected text content");
-      const match = /^batch-(\d+)-msg-(\d+)$/.exec(text);
-      assert.ok(match, `unexpected event text: ${text}`);
-      seen.push({ batch: Number(match[1]), index: Number(match[2]) });
-    }
-
-    for (let batch = 0; batch < batchCount; batch += 1) {
-      for (let index = 0; index < messagesPerBatch; index += 1) {
-        const position = batch * messagesPerBatch + index;
-        assert.deepEqual(
-          seen[position],
-          { batch, index },
-          `event at position ${position} should be batch ${batch} index ${index}, got batch ${seen[position].batch} index ${seen[position].index}`,
-        );
-      }
-    }
-  });
-});
-
 test("SessionEventWriter recovers stale stream lock files", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
