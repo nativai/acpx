@@ -185,14 +185,35 @@ async function resolvePermissionPolicyFromFlags(
   }
 }
 
+// Parse the UUID from an acpx-ui session URL (...?session=<uuid>).
+// Returns undefined for missing / malformed input or empty session value.
+function parseSessionIdFromUrl(url: string | undefined): string | undefined {
+  if (!url) {return undefined;}
+  const trimmed = url.trim();
+  if (!trimmed) {return undefined;}
+  try {
+    const parsed = new URL(trimmed);
+    const sessionId = parsed.searchParams.get("session")?.trim();
+    return sessionId && sessionId.length > 0 ? sessionId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function resolveParentSessionIdFromFlagOrEnv(flags: SessionsNewFlags): string | undefined {
+  // --parent-session-url <url> wins over --parent-id <uuid>; both override env.
+  const flagUrlValue = parseSessionIdFromUrl(flags.parentSessionUrl);
+  if (flagUrlValue) {
+    return flagUrlValue;
+  }
   const flagValue = flags.parentId?.trim();
   if (flagValue && flagValue.length > 0) {
     return flagValue;
   }
-  const envValue = process.env.ACPX_SESSION_ID?.trim();
-  if (envValue && envValue.length > 0) {
-    return envValue;
+  // Env fallback: the URL is the agent's identity, parse the UUID out.
+  const envFromUrl = parseSessionIdFromUrl(process.env.ACPX_SESSION_URL);
+  if (envFromUrl) {
+    return envFromUrl;
   }
   return undefined;
 }
@@ -209,7 +230,8 @@ async function resolveAndValidateParentSessionId(
     return parent.acpxRecordId;
   } catch (error) {
     if (error instanceof SessionNotFoundError) {
-      throw new InvalidArgumentError(`--parent-id refers to unknown session: ${candidate}`);
+      const label = flags.parentSessionUrl ? "--parent-session-url" : "--parent-id";
+      throw new InvalidArgumentError(`${label} refers to unknown session: ${candidate}`);
     }
     throw error;
   }

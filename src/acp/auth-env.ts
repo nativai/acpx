@@ -81,14 +81,12 @@ function buildAgentEnvironment(
   if (sessionContext && typeof sessionContext.acpxRecordId === "string") {
     const trimmed = sessionContext.acpxRecordId.trim();
     if (trimmed.length > 0) {
-      env.ACPX_SESSION_ID = trimmed;
       env.ACPX_SESSION_URL = `${baseUrl}/?session=${trimmed}`;
     }
   }
   if (sessionContext && typeof sessionContext.parentSessionId === "string") {
     const trimmedParent = sessionContext.parentSessionId.trim();
     if (trimmedParent.length > 0) {
-      env.ACPX_PARENT_SESSION_ID = trimmedParent;
       env.ACPX_PARENT_SESSION_URL = `${baseUrl}/?session=${trimmedParent}`;
     }
   }
