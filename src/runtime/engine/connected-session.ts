@@ -104,6 +104,7 @@ export async function withConnectedSession<T>(
       sessionContext: {
         acpxRecordId: record.acpxRecordId,
         parentSessionId: record.parentSessionId ?? null,
+        taskFolder: record.metadata?.task_folder ?? null,
       },
       sessionOptions: sessionOptionsFromRecord(record),
     }) ??
@@ -121,6 +122,7 @@ export async function withConnectedSession<T>(
       sessionContext: {
         acpxRecordId: record.acpxRecordId,
         parentSessionId: record.parentSessionId ?? null,
+        taskFolder: record.metadata?.task_folder ?? null,
       },
       sessionOptions: sessionOptionsFromRecord(record),
     });

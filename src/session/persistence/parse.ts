@@ -496,6 +496,27 @@ function parseSubagentRefs(raw: unknown): SubagentRef[] | undefined {
   return refs;
 }
 
+function parseMetadata(raw: unknown): Record<string, string> | undefined | null {
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+  const record = asRecord(raw);
+  if (!record) {
+    return null;
+  }
+  const parsed: Record<string, string> = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (typeof key !== "string" || key.length === 0) {
+      return null;
+    }
+    if (typeof value !== "string") {
+      return null;
+    }
+    parsed[key] = value;
+  }
+  return parsed;
+}
+
 function parseSessionKind(value: unknown): "session" | "subagent" | undefined | null {
   if (value === undefined || value === null) {
     return undefined;
@@ -584,6 +605,11 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     return null;
   }
 
+  const metadata = parseMetadata(record.metadata);
+  if (metadata === null) {
+    return null;
+  }
+
   return {
     schema: SESSION_RECORD_SCHEMA,
     acpxRecordId: record.acpx_record_id,
@@ -618,5 +644,6 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     kind,
     parentSessionId: normalizeOptionalString(record.parent_session_id) ?? undefined,
     subagents: parseSubagentRefs(record.subagents),
+    metadata,
   };
 }

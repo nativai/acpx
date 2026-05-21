@@ -211,7 +211,11 @@ export type AcpClientOptions = {
   terminal?: boolean;
   suppressSdkConsoleErrors?: boolean;
   verbose?: boolean;
-  sessionContext?: { acpxRecordId: string; parentSessionId?: string | null };
+  sessionContext?: {
+    acpxRecordId: string;
+    parentSessionId?: string | null;
+    taskFolder?: string | null;
+  };
   sessionOptions?: {
     model?: string;
     allowedTools?: string[];
@@ -387,6 +391,7 @@ export type SessionRecord = {
   kind?: "session" | "subagent";
   parentSessionId?: string;
   subagents?: SubagentRef[];
+  metadata?: Record<string, string>;
 };
 
 export type RunPromptResult = {

@@ -63,6 +63,7 @@ export type SessionsNewFlags = {
   name?: string;
   resumeSession?: string;
   parentId?: string;
+  metadata?: Record<string, string>;
 };
 
 export type SessionsHistoryFlags = {
@@ -153,6 +154,24 @@ export function parseDaysOlderThan(value: string): number {
     throw new InvalidArgumentError("--older-than must be a positive integer number of days");
   }
   return parsed;
+}
+
+export function parseMetadataEntry(
+  value: string,
+  previous: Record<string, string> | undefined,
+): Record<string, string> {
+  const eqIndex = value.indexOf("=");
+  if (eqIndex < 0) {
+    throw new InvalidArgumentError(`--metadata expects key=value (got: ${JSON.stringify(value)})`);
+  }
+  const key = value.slice(0, eqIndex).trim();
+  if (key.length === 0) {
+    throw new InvalidArgumentError(
+      `--metadata key must not be empty (got: ${JSON.stringify(value)})`,
+    );
+  }
+  const rawValue = value.slice(eqIndex + 1);
+  return { ...previous, [key]: rawValue };
 }
 
 export function parsePruneBeforeDate(value: string): Date {

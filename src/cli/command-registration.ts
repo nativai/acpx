@@ -22,6 +22,7 @@ import {
   addSessionNameOption,
   addSessionOption,
   parseDaysOlderThan,
+  parseMetadataEntry,
   parseNonEmptyValue,
   parsePruneBeforeDate,
   parseSessionName,
@@ -80,6 +81,11 @@ export function registerSessionsCommand(
       "Record the spawning session's acpxRecordId as parent_session_id (falls back to ACPX_SESSION_ID env)",
       (value: string) => parseNonEmptyValue("Parent session id", value),
     )
+    .option(
+      "--metadata <key=value>",
+      "Set a metadata entry on the session (repeatable; e.g. --metadata task_folder=/abs/path)",
+      parseMetadataEntry,
+    )
     .action(async function (this: Command, flags: SessionsNewFlags) {
       await handleSessionsNew(explicitAgentName, flags, this, config);
     });
@@ -95,6 +101,11 @@ export function registerSessionsCommand(
       "--parent-id <uuid>",
       "Record the spawning session's acpxRecordId as parent_session_id when creating (falls back to ACPX_SESSION_ID env; ignored when an existing session is reused)",
       (value: string) => parseNonEmptyValue("Parent session id", value),
+    )
+    .option(
+      "--metadata <key=value>",
+      "Set or merge a metadata entry (repeatable; merges into existing session metadata, per-key overwrite)",
+      parseMetadataEntry,
     )
     .action(async function (this: Command, flags: SessionsNewFlags) {
       await handleSessionsEnsure(explicitAgentName, flags, this, config);

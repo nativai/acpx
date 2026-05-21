@@ -605,6 +605,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       sessionContext: {
         acpxRecordId: record.acpxRecordId,
         parentSessionId: record.parentSessionId ?? null,
+        taskFolder: record.metadata?.task_folder ?? null,
       },
       sessionOptions,
     });
