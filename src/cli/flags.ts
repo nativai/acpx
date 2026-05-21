@@ -63,6 +63,7 @@ export type SessionsNewFlags = {
   name?: string;
   resumeSession?: string;
   parentId?: string;
+  parentSessionUrl?: string;
   metadata?: Record<string, string>;
 };
 

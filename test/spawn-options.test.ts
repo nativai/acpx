@@ -24,46 +24,61 @@ test("buildAgentSpawnOptions hides Windows console windows and preserves auth en
   assert.equal(options.env.ACPX_AUTH_TOKEN, "secret-token");
 });
 
-test("buildAgentSpawnOptions injects ACPX_SESSION_ID when sessionContext.acpxRecordId is set", () => {
-  const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
-    acpxRecordId: "11111111-2222-3333-4444-555555555555",
-  });
-  assert.equal(options.env.ACPX_SESSION_ID, "11111111-2222-3333-4444-555555555555");
-  assert.equal(options.env.ACPX_PARENT_SESSION_ID, undefined);
+test("buildAgentSpawnOptions never injects ACPX_SESSION_ID (URL-only identity contract)", () => {
+  const previous = process.env.ACPX_SESSION_ID;
+  delete process.env.ACPX_SESSION_ID;
+  try {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "11111111-2222-3333-4444-555555555555",
+    });
+    assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_SESSION_ID"), false);
+    assert.equal(
+      options.env.ACPX_SESSION_URL,
+      "https://acpx.devbox.nativai.de/?session=11111111-2222-3333-4444-555555555555",
+    );
+  } finally {
+    if (previous === undefined) {
+      delete process.env.ACPX_SESSION_ID;
+    } else {
+      process.env.ACPX_SESSION_ID = previous;
+    }
+  }
 });
 
-test("buildAgentSpawnOptions injects ACPX_PARENT_SESSION_ID when parentSessionId is non-empty", () => {
-  const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
-    acpxRecordId: "child-id",
-    parentSessionId: "parent-id-abc",
-  });
-  assert.equal(options.env.ACPX_SESSION_ID, "child-id");
-  assert.equal(options.env.ACPX_PARENT_SESSION_ID, "parent-id-abc");
+test("buildAgentSpawnOptions never injects ACPX_PARENT_SESSION_ID (URL-only identity contract)", () => {
+  const previous = process.env.ACPX_PARENT_SESSION_ID;
+  delete process.env.ACPX_PARENT_SESSION_ID;
+  try {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+      parentSessionId: "parent-id-abc",
+    });
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(options.env, "ACPX_PARENT_SESSION_ID"),
+      false,
+    );
+    assert.equal(
+      options.env.ACPX_PARENT_SESSION_URL,
+      "https://acpx.devbox.nativai.de/?session=parent-id-abc",
+    );
+  } finally {
+    if (previous === undefined) {
+      delete process.env.ACPX_PARENT_SESSION_ID;
+    } else {
+      process.env.ACPX_PARENT_SESSION_ID = previous;
+    }
+  }
 });
 
-test("buildAgentSpawnOptions omits ACPX_PARENT_SESSION_ID when parentSessionId is null", () => {
-  const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
-    acpxRecordId: "child-id",
-    parentSessionId: null,
-  });
-  assert.equal(options.env.ACPX_SESSION_ID, "child-id");
-  assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_PARENT_SESSION_ID"), false);
-});
-
-test("buildAgentSpawnOptions omits ACPX_PARENT_SESSION_ID when parentSessionId is empty string", () => {
-  const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
-    acpxRecordId: "child-id",
-    parentSessionId: "   ",
-  });
-  assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_PARENT_SESSION_ID"), false);
-});
-
-test("buildAgentSpawnOptions trims whitespace around parentSessionId", () => {
+test("buildAgentSpawnOptions trims whitespace around parentSessionId into ACPX_PARENT_SESSION_URL", () => {
   const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
     acpxRecordId: "child-id",
     parentSessionId: "  parent-id-xyz  ",
   });
-  assert.equal(options.env.ACPX_PARENT_SESSION_ID, "parent-id-xyz");
+  assert.equal(
+    options.env.ACPX_PARENT_SESSION_URL,
+    "https://acpx.devbox.nativai.de/?session=parent-id-xyz",
+  );
 });
 
 function withAcpxUiBaseUrlEnv<T>(value: string | undefined, fn: () => T): T {
@@ -97,22 +112,14 @@ test("buildAgentSpawnOptions injects ACPX_SESSION_URL with default base URL when
 });
 
 test("buildAgentSpawnOptions omits ACPX_SESSION_URL when acpxRecordId is empty/whitespace", () => {
-  const previousId = process.env.ACPX_SESSION_ID;
   const previousUrl = process.env.ACPX_SESSION_URL;
-  delete process.env.ACPX_SESSION_ID;
   delete process.env.ACPX_SESSION_URL;
   try {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
       acpxRecordId: "   ",
     });
     assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_SESSION_URL"), false);
-    assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_SESSION_ID"), false);
   } finally {
-    if (previousId === undefined) {
-      delete process.env.ACPX_SESSION_ID;
-    } else {
-      process.env.ACPX_SESSION_ID = previousId;
-    }
     if (previousUrl === undefined) {
       delete process.env.ACPX_SESSION_URL;
     } else {
@@ -212,20 +219,43 @@ test("buildAgentSpawnOptions reflects trimmed UUIDs in URL vars", () => {
   });
 });
 
-test("buildAgentSpawnOptions keeps the additive contract: bare ID vars still injected alongside URL vars", () => {
-  withAcpxUiBaseUrlEnv(undefined, () => {
-    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
-      acpxRecordId: "child-id",
-      parentSessionId: "parent-id",
+test("buildAgentSpawnOptions: URL is the only identity surface — no _ID vars emitted", () => {
+  const previousSessionId = process.env.ACPX_SESSION_ID;
+  const previousParentId = process.env.ACPX_PARENT_SESSION_ID;
+  delete process.env.ACPX_SESSION_ID;
+  delete process.env.ACPX_PARENT_SESSION_ID;
+  try {
+    withAcpxUiBaseUrlEnv(undefined, () => {
+      const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        acpxRecordId: "child-id",
+        parentSessionId: "parent-id",
+      });
+      assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_SESSION_ID"), false);
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(options.env, "ACPX_PARENT_SESSION_ID"),
+        false,
+      );
+      assert.equal(
+        options.env.ACPX_SESSION_URL,
+        "https://acpx.devbox.nativai.de/?session=child-id",
+      );
+      assert.equal(
+        options.env.ACPX_PARENT_SESSION_URL,
+        "https://acpx.devbox.nativai.de/?session=parent-id",
+      );
     });
-    assert.equal(options.env.ACPX_SESSION_ID, "child-id");
-    assert.equal(options.env.ACPX_PARENT_SESSION_ID, "parent-id");
-    assert.equal(options.env.ACPX_SESSION_URL, "https://acpx.devbox.nativai.de/?session=child-id");
-    assert.equal(
-      options.env.ACPX_PARENT_SESSION_URL,
-      "https://acpx.devbox.nativai.de/?session=parent-id",
-    );
-  });
+  } finally {
+    if (previousSessionId === undefined) {
+      delete process.env.ACPX_SESSION_ID;
+    } else {
+      process.env.ACPX_SESSION_ID = previousSessionId;
+    }
+    if (previousParentId === undefined) {
+      delete process.env.ACPX_PARENT_SESSION_ID;
+    } else {
+      process.env.ACPX_PARENT_SESSION_ID = previousParentId;
+    }
+  }
 });
 
 test("buildAgentSpawnOptions injects ACPX_TASK_FOLDER when sessionContext.taskFolder is non-empty", () => {
@@ -285,22 +315,45 @@ test("buildAgentSpawnOptions omits ACPX_TASK_FOLDER when taskFolder is null/unde
   }
 });
 
-test("buildAgentSpawnOptions keeps the additive contract: ACPX_TASK_FOLDER coexists with session + parent vars", () => {
-  withAcpxUiBaseUrlEnv(undefined, () => {
-    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
-      acpxRecordId: "child-id",
-      parentSessionId: "parent-id",
-      taskFolder: "/task/abs",
+test("buildAgentSpawnOptions: ACPX_TASK_FOLDER coexists with URL session + parent vars (no _ID vars)", () => {
+  const previousSessionId = process.env.ACPX_SESSION_ID;
+  const previousParentId = process.env.ACPX_PARENT_SESSION_ID;
+  delete process.env.ACPX_SESSION_ID;
+  delete process.env.ACPX_PARENT_SESSION_ID;
+  try {
+    withAcpxUiBaseUrlEnv(undefined, () => {
+      const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        acpxRecordId: "child-id",
+        parentSessionId: "parent-id",
+        taskFolder: "/task/abs",
+      });
+      assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_SESSION_ID"), false);
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(options.env, "ACPX_PARENT_SESSION_ID"),
+        false,
+      );
+      assert.equal(
+        options.env.ACPX_SESSION_URL,
+        "https://acpx.devbox.nativai.de/?session=child-id",
+      );
+      assert.equal(
+        options.env.ACPX_PARENT_SESSION_URL,
+        "https://acpx.devbox.nativai.de/?session=parent-id",
+      );
+      assert.equal(options.env.ACPX_TASK_FOLDER, "/task/abs");
     });
-    assert.equal(options.env.ACPX_SESSION_ID, "child-id");
-    assert.equal(options.env.ACPX_PARENT_SESSION_ID, "parent-id");
-    assert.equal(options.env.ACPX_SESSION_URL, "https://acpx.devbox.nativai.de/?session=child-id");
-    assert.equal(
-      options.env.ACPX_PARENT_SESSION_URL,
-      "https://acpx.devbox.nativai.de/?session=parent-id",
-    );
-    assert.equal(options.env.ACPX_TASK_FOLDER, "/task/abs");
-  });
+  } finally {
+    if (previousSessionId === undefined) {
+      delete process.env.ACPX_SESSION_ID;
+    } else {
+      process.env.ACPX_SESSION_ID = previousSessionId;
+    }
+    if (previousParentId === undefined) {
+      delete process.env.ACPX_PARENT_SESSION_ID;
+    } else {
+      process.env.ACPX_PARENT_SESSION_ID = previousParentId;
+    }
+  }
 });
 
 test("buildAgentSpawnOptions promotes explicit ACPX auth env vars into agent auth env", () => {

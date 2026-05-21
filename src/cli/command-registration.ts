@@ -77,8 +77,13 @@ export function registerSessionsCommand(
       parseNonEmptyValue("Resume session id", value),
     )
     .option(
+      "--parent-session-url <url>",
+      "Record the spawning session's acpx-ui URL as parent (UUID parsed from ?session=). Mirrors the agent identity URL — the same URL humans paste in a browser and that agents POST to.",
+      (value: string) => parseNonEmptyValue("Parent session URL", value),
+    )
+    .option(
       "--parent-id <uuid>",
-      "Record the spawning session's acpxRecordId as parent_session_id (falls back to ACPX_SESSION_ID env)",
+      "Record the spawning session's acpxRecordId as parent_session_id (falls back to ACPX_SESSION_URL env). Use --parent-session-url for the URL form.",
       (value: string) => parseNonEmptyValue("Parent session id", value),
     )
     .option(
@@ -98,8 +103,13 @@ export function registerSessionsCommand(
       parseNonEmptyValue("Resume session id", value),
     )
     .option(
+      "--parent-session-url <url>",
+      "Record the spawning session's acpx-ui URL as parent when creating (UUID parsed from ?session=; ignored when an existing session is reused).",
+      (value: string) => parseNonEmptyValue("Parent session URL", value),
+    )
+    .option(
       "--parent-id <uuid>",
-      "Record the spawning session's acpxRecordId as parent_session_id when creating (falls back to ACPX_SESSION_ID env; ignored when an existing session is reused)",
+      "Record the spawning session's acpxRecordId as parent_session_id when creating (falls back to ACPX_SESSION_URL env; ignored when an existing session is reused). Use --parent-session-url for the URL form.",
       (value: string) => parseNonEmptyValue("Parent session id", value),
     )
     .option(
