@@ -304,6 +304,72 @@ test("writeSessionRecord leaves favorite field absent when no prior on-disk reco
   });
 });
 
+test("writeSessionRecord preserves on-disk name (UI rename) against stale in-memory record", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "repo");
+
+    // 1. Seed disk with the renamed value (UI PATCH result for an originally
+    //    unnamed session).
+    const renamedOnDisk = makeSessionRecord({
+      acpxRecordId: "preserve-name",
+      acpSessionId: "preserve-name",
+      agentCommand: "agent-a",
+      cwd,
+      name: "renamed-via-ui",
+    });
+    await seedSessionJson(homeDir, renamedOnDisk);
+
+    // 2. Daemon's in-memory record predates the UI rename and still has
+    //    name: undefined. A plain writeSessionRecord (checkpoint, event flush,
+    //    etc.) would clobber the rename without read-preserve.
+    const stale = makeSessionRecord({
+      acpxRecordId: "preserve-name",
+      acpSessionId: "preserve-name",
+      agentCommand: "agent-a",
+      cwd,
+      name: undefined,
+      lastUsedAt: "2026-05-27T12:00:00.000Z",
+      updated_at: "2026-05-27T12:00:00.000Z",
+    });
+    await repoWriteSessionRecord(stale);
+
+    // 3. Disk must still carry the UI-written name.
+    const afterPath = sessionFilePath(homeDir, "preserve-name");
+    const afterJson = JSON.parse(await fs.readFile(afterPath, "utf8")) as Record<string, unknown>;
+    assert.equal(afterJson.name, "renamed-via-ui", "name must survive plain daemon write");
+    assert.equal(
+      afterJson.last_used_at,
+      "2026-05-27T12:00:00.000Z",
+      "daemon-owned fields must still be written through",
+    );
+
+    // 4. And the in-memory record returned by resolve must show the disk's truth.
+    const resolved = await resolveSessionRecord("preserve-name");
+    assert.equal(resolved.name, "renamed-via-ui");
+  });
+});
+
+test("writeSessionRecord leaves name field absent when no prior on-disk record exists", async () => {
+  await withTempHome(async (homeDir) => {
+    // Create-session flow: no file on disk yet. Preserve step no-ops when
+    // there is nothing to preserve — caller's name (undefined) is what lands.
+    const cwd = path.join(homeDir, "repo");
+    const fresh = makeSessionRecord({
+      acpxRecordId: "fresh-name",
+      acpSessionId: "fresh-name",
+      agentCommand: "agent-a",
+      cwd,
+      name: undefined,
+    });
+    await repoWriteSessionRecord(fresh);
+
+    const afterJson = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, "fresh-name"), "utf8"),
+    ) as Record<string, unknown>;
+    assert.equal("name" in afterJson, false);
+  });
+});
+
 test("writeSessionRecord leaves closed field absent when no prior on-disk record exists", async () => {
   await withTempHome(async (homeDir) => {
     // Create-session flow: no file on disk yet. writeSessionRecord must NOT
