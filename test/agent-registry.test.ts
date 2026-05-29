@@ -78,11 +78,13 @@ test("default agent is codex", () => {
   assert.equal(DEFAULT_AGENT_NAME, "codex");
 });
 
-test("claude built-in uses the current ACP adapter package range", () => {
-  assert.equal(BUILT_IN_AGENT_PACKAGES.claude.packageRange, "^0.36.1");
-  // Fork override: dev-server uses the container-bundled claude-agent-acp install
-  // instead of the upstream npx form. Stays in sync with the override in src/agent-registry.ts.
+test("claude is not a built-in package so the /opt fork command spawns verbatim", () => {
+  // The fork override runs the container-built bridge directly. Keeping claude out of
+  // BUILT_IN_AGENT_PACKAGES is what stops resolveBuiltInAgentLaunch from shadowing it
+  // with an installed / npx-exec'd published package — see src/agent-registry.ts.
   assert.equal(AGENT_REGISTRY.claude, "node /opt/claude-agent-acp/dist/index.js");
+  assert.equal(Object.keys(BUILT_IN_AGENT_PACKAGES).includes("claude"), false);
+  assert.equal(resolveBuiltInAgentLaunch(AGENT_REGISTRY.claude), undefined);
 });
 
 test("npm-backed built-ins use current adapter package ranges", () => {
@@ -97,39 +99,34 @@ test("resolveInstalledBuiltInAgentLaunch uses a locally installed adapter when a
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  const packageRoot = path.join(
-    tempDir,
-    "node_modules",
-    "@agentclientprotocol",
-    "claude-agent-acp",
-  );
+  const packageRoot = path.join(tempDir, "node_modules", "@agentclientprotocol", "codex-acp");
   fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true });
   fs.mkdirSync(path.join(packageRoot, "bin"), { recursive: true });
   fs.writeFileSync(
     path.join(packageRoot, "package.json"),
     JSON.stringify({
-      name: BUILT_IN_AGENT_PACKAGES.claude.packageName,
-      version: "0.36.1",
+      name: BUILT_IN_AGENT_PACKAGES.codex.packageName,
+      version: "0.0.44",
       bin: {
-        "claude-agent-acp": "bin/claude-agent-acp.js",
+        "codex-acp": "bin/codex-acp.js",
       },
     }),
   );
   fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "export {};\n");
-  fs.writeFileSync(path.join(packageRoot, "bin", "claude-agent-acp.js"), "#!/usr/bin/env node\n");
+  fs.writeFileSync(path.join(packageRoot, "bin", "codex-acp.js"), "#!/usr/bin/env node\n");
 
-  const launch = resolveInstalledBuiltInAgentLaunch(AGENT_REGISTRY.claude, {
+  const launch = resolveInstalledBuiltInAgentLaunch(AGENT_REGISTRY.codex, {
     resolvePackageRoot: () => packageRoot,
   });
 
   assert.deepEqual(launch, {
     source: "installed",
     command: process.execPath,
-    args: [path.join(packageRoot, "bin", "claude-agent-acp.js")],
-    packageName: BUILT_IN_AGENT_PACKAGES.claude.packageName,
-    packageRange: BUILT_IN_AGENT_PACKAGES.claude.packageRange,
-    packageVersion: "0.36.1",
-    binPath: path.join(packageRoot, "bin", "claude-agent-acp.js"),
+    args: [path.join(packageRoot, "bin", "codex-acp.js")],
+    packageName: BUILT_IN_AGENT_PACKAGES.codex.packageName,
+    packageRange: BUILT_IN_AGENT_PACKAGES.codex.packageRange,
+    packageVersion: "0.0.44",
+    binPath: path.join(packageRoot, "bin", "codex-acp.js"),
   });
 });
 
@@ -158,37 +155,6 @@ test("resolvePackageExecBuiltInAgentLaunch bridges built-ins through the current
     ],
     packageName: BUILT_IN_AGENT_PACKAGES.codex.packageName,
     packageRange: BUILT_IN_AGENT_PACKAGES.codex.packageRange,
-    npmCliPath,
-  });
-});
-
-test("resolveBuiltInAgentLaunch accepts the legacy Claude npm exec default", () => {
-  const npmCliPath = path.join(os.tmpdir(), "acpx-test-claude-npm-cli.js");
-  const launch = resolveBuiltInAgentLaunch(
-    `npm exec @agentclientprotocol/claude-agent-acp@${BUILT_IN_AGENT_PACKAGES.claude.packageRange}`,
-    {
-      execPath: "/tmp/node",
-      existsSync: (candidate) => candidate === npmCliPath,
-      resolvePackageRoot: () => {
-        throw new Error("adapter not installed");
-      },
-      resolveNpmCliPath: () => npmCliPath,
-    },
-  );
-
-  assert.deepEqual(launch, {
-    source: "package-exec",
-    command: "/tmp/node",
-    args: [
-      npmCliPath,
-      "exec",
-      "--yes",
-      `--package=${BUILT_IN_AGENT_PACKAGES.claude.packageName}@${BUILT_IN_AGENT_PACKAGES.claude.packageRange}`,
-      "--",
-      BUILT_IN_AGENT_PACKAGES.claude.preferredBinName,
-    ],
-    packageName: BUILT_IN_AGENT_PACKAGES.claude.packageName,
-    packageRange: BUILT_IN_AGENT_PACKAGES.claude.packageRange,
     npmCliPath,
   });
 });

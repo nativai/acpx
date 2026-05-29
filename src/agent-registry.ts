@@ -5,7 +5,6 @@ import { fileURLToPath } from "node:url";
 const ACP_ADAPTER_PACKAGE_RANGES = {
   pi: "^0.0.26",
   codex: "^0.0.44",
-  claude: "^0.36.1",
 } as const;
 
 type BuiltInAgentPackageSpec = {
@@ -54,6 +53,12 @@ export const AGENT_REGISTRY: Record<string, string> = {
   trae: "traecli acp serve",
 };
 
+// `claude` is intentionally absent here. Its AGENT_REGISTRY entry points at the
+// container-built fork (`node /opt/claude-agent-acp/dist/index.js`); with no
+// built-in-package spec, findBuiltInAgentPackage() returns undefined for that
+// command, both resolvers bail, and the client spawns the /opt command verbatim.
+// Re-adding a claude spec here would make resolveInstalledBuiltInAgentLaunch
+// prefer an installed npm package and silently shadow the fork.
 export const BUILT_IN_AGENT_PACKAGES = {
   codex: {
     packageName: "@agentclientprotocol/codex-acp",
@@ -61,15 +66,6 @@ export const BUILT_IN_AGENT_PACKAGES = {
     preferredBinName: "codex-acp",
     fallbackCommand: AGENT_REGISTRY.codex,
     legacyFallbackCommands: [],
-  },
-  claude: {
-    packageName: "@agentclientprotocol/claude-agent-acp",
-    packageRange: ACP_ADAPTER_PACKAGE_RANGES.claude,
-    preferredBinName: "claude-agent-acp",
-    fallbackCommand: AGENT_REGISTRY.claude,
-    legacyFallbackCommands: [
-      `npm exec @agentclientprotocol/claude-agent-acp@${ACP_ADAPTER_PACKAGE_RANGES.claude}`,
-    ],
   },
 } as const satisfies Record<string, BuiltInAgentPackageSpec>;
 
