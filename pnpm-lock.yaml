@@ -12,8 +12,8 @@ importers:
   .:
     dependencies:
       '@agentclientprotocol/claude-agent-acp':
-        specifier: ^0.35.0
-        version: 0.35.0(@anthropic-ai/sdk@0.96.0(zod@4.4.3))(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))
+        specifier: git+file:///workspace/projects/claude-agent-acp/.bare#6c7ac921e2b9512902c86364ca8ea8bf37a61134
+        version: git+file:///workspace/projects/claude-agent-acp/.bare#6c7ac921e2b9512902c86364ca8ea8bf37a61134(@anthropic-ai/sdk@0.96.0(zod@4.4.3))(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))
       '@agentclientprotocol/sdk':
         specifier: ^0.21.1
         version: 0.21.1(zod@4.4.3)
@@ -102,8 +102,9 @@ importers:
 
 packages:
 
-  '@agentclientprotocol/claude-agent-acp@0.35.0':
-    resolution: {integrity: sha512-HsyG+/iCra+ts87tRtMuaDQkFVJmH14goBKPpjGOqk6/CQzu1WP93gdxx7J9iQyd0yvqQTm8HUosNUDGLXWv6g==}
+  '@agentclientprotocol/claude-agent-acp@git+file:///workspace/projects/claude-agent-acp/.bare#6c7ac921e2b9512902c86364ca8ea8bf37a61134':
+    resolution: {commit: 6c7ac921e2b9512902c86364ca8ea8bf37a61134, repo: file:///workspace/projects/claude-agent-acp/.bare, type: git}
+    version: 0.35.0
     hasBin: true
 
   '@agentclientprotocol/sdk@0.21.1':
@@ -2313,7 +2314,7 @@ packages:
 
 snapshots:
 
-  '@agentclientprotocol/claude-agent-acp@0.35.0(@anthropic-ai/sdk@0.96.0(zod@4.4.3))(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))':
+  '@agentclientprotocol/claude-agent-acp@git+file:///workspace/projects/claude-agent-acp/.bare#6c7ac921e2b9512902c86364ca8ea8bf37a61134(@anthropic-ai/sdk@0.96.0(zod@4.4.3))(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))':
     dependencies:
       '@agentclientprotocol/sdk': 0.21.1(zod@4.4.3)
       '@anthropic-ai/claude-agent-sdk': 0.3.156(@anthropic-ai/sdk@0.96.0(zod@4.4.3))(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(zod@4.4.3)

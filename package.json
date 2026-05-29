@@ -72,7 +72,7 @@
     "viewer:typecheck": "tsgo -p examples/flows/replay-viewer/tsconfig.json --noEmit && tsgo -p examples/flows/replay-viewer/tsconfig.server.json --noEmit"
   },
   "dependencies": {
-    "@agentclientprotocol/claude-agent-acp": "^0.35.0",
+    "@agentclientprotocol/claude-agent-acp": "git+file:///workspace/projects/claude-agent-acp/.bare#6c7ac921e2b9512902c86364ca8ea8bf37a61134",
     "@agentclientprotocol/sdk": "^0.21.1",
     "commander": "^14.0.3",
     "skillflag": "^0.1.4",

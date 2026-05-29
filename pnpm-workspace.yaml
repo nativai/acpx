@@ -1,6 +1,14 @@
 # Force the Claude Agent SDK to 0.3.156, which carries the upstream fix for the
 # `--resume` 400 "thinking/redacted_thinking blocks ... cannot be modified" defect.
-# acpx bundles the published @agentclientprotocol/claude-agent-acp, which pins an
-# older SDK transitively; this override is what actually reaches the runtime engine.
+# The `claude` agent bridge is our nativai/claude-agent-acp fork (see the git ref
+# in package.json). It pins SDK 0.3.143 transitively; this override is what forces
+# the runtime engine to 0.3.156 — for the fork exactly as it did for the published
+# bridge (the fork's 0.35.0 code is built against 0.3.143 and runs against 0.3.156).
 overrides:
   '@anthropic-ai/claude-agent-sdk': 0.3.156
+
+# The fork is installed from a git ref; pnpm 10 blocks git-dep build (`prepare`)
+# scripts unless the package is allowlisted here. Without this the fork's dist/
+# (gitignored) is never built and the bridge bin is missing.
+onlyBuiltDependencies:
+  - '@agentclientprotocol/claude-agent-acp'
