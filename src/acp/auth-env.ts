@@ -71,6 +71,7 @@ export type AgentSessionContext = {
   taskFolder?: string | null;
 };
 
+// eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
 function buildAgentEnvironment(
   authCredentials: Record<string, string> | undefined,
   sessionContext?: AgentSessionContext,

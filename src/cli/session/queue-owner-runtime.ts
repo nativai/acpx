@@ -202,6 +202,7 @@ async function writeQueueOwnerLifecycleSnapshot(
   }
 }
 
+// eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
 export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): Promise<void> {
   const lease = await tryAcquireQueueOwnerLease(options.sessionId);
   if (!lease) {
@@ -390,6 +391,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       };
 
       sharedClient.setEventHandlers({
+        // eslint-disable-next-line complexity -- fork integration handler; intentionally over budget, refactor would risk verified merge semantics
         onAcpMessage: (_dir, message) => {
           if (!active) {
             return;

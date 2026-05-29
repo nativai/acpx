@@ -93,6 +93,7 @@ export function parseClaudeJsonlToMessages(content: string): SessionMessage[] {
   return entriesToMessages(entries);
 }
 
+// eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
 function entriesToMessages(entries: RawJsonlEntry[]): SessionMessage[] {
   const messages: SessionMessage[] = [];
   let openAgent: {
@@ -240,6 +241,7 @@ export function tailClaudeSubagentJsonl(
   let bytesRead = 0;
   let pendingLines: RawJsonlEntry[] = [];
 
+  // eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
   const readNewLines = async (): Promise<void> => {
     let content: string;
     try {
@@ -285,6 +287,7 @@ export function tailClaudeSubagentJsonl(
   // Poll loop
   const poll = async (): Promise<void> => {
     const deadline = Date.now() + FILE_APPEAR_TIMEOUT_MS;
+    // eslint-disable-next-line no-unmodified-loop-condition -- false positive: `stopped` is mutated by the stop() closure below
     while (!stopped) {
       await readNewLines();
       if (stopped) {

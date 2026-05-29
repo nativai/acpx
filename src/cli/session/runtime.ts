@@ -516,6 +516,7 @@ export async function runQueuedTask(
   }
 }
 
+// eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
 async function runSessionPrompt(options: RunSessionPromptOptions): Promise<SessionSendResult> {
   const stopTotalTimer = startPerfTimer("runtime.prompt.total");
   const output = options.outputFormatter;
@@ -722,6 +723,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     verbose: options.verbose,
   });
   client.setEventHandlers({
+    // eslint-disable-next-line complexity -- fork integration handler; intentionally over budget, refactor would risk verified merge semantics
     onAcpMessage: (direction, message) => {
       sawAcpMessage = true;
       pendingMessages.push(message);
@@ -768,6 +770,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       }
       output.onAcpMessage(message);
     },
+    // eslint-disable-next-line complexity -- fork integration handler; intentionally over budget, refactor would risk verified merge semantics
     onSessionUpdate: (notification) => {
       if (promptTurnActive) {
         promptTurnHadSideEffects = true;

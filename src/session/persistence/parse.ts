@@ -649,6 +649,7 @@ function parseSessionKind(value: unknown): "session" | "subagent" | undefined | 
   return null;
 }
 
+// eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
 export function parseSessionRecord(raw: unknown): SessionRecord | null {
   const record = asRecord(raw);
   if (!record) {

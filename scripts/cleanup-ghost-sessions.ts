@@ -201,6 +201,8 @@ function formatSkipReason(reason: SkipReason): string {
       return "session event_log has last_write_at set";
     case "stream-has-data":
       return "stream file has data (protected: possibly NDJSON reconciliation bug)";
+    default:
+      return "unknown";
   }
 }
 

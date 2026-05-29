@@ -53,7 +53,7 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     name: record.name,
     closed: record.closed,
     lastUsedAt: record.lastUsedAt,
-    kind: record.kind as "session" | "subagent" | undefined,
+    kind: record.kind,
   };
 }
 

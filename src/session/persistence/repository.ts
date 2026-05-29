@@ -536,6 +536,7 @@ async function unlinkCountingBytes(filePath: string): Promise<number> {
   return bytes;
 }
 
+// eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
 export async function closeSession(id: string): Promise<SessionRecord> {
   const record = await resolveSessionRecord(id);
   const now = isoNow();
