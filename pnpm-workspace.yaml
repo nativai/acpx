@@ -1,0 +1,6 @@
+# Force the Claude Agent SDK to 0.3.156, which carries the upstream fix for the
+# `--resume` 400 "thinking/redacted_thinking blocks ... cannot be modified" defect.
+# acpx bundles the published @agentclientprotocol/claude-agent-acp, which pins an
+# older SDK transitively; this override is what actually reaches the runtime engine.
+overrides:
+  '@anthropic-ai/claude-agent-sdk': 0.3.156
