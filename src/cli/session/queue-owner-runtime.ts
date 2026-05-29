@@ -23,6 +23,7 @@ import {
   releaseQueueOwnerLease,
   tryAcquireQueueOwnerLease,
   trySubmitToRunningOwner,
+  type QueueOwnerLease,
   waitMs,
 } from "../queue/ipc.js";
 import { refreshQueueOwnerLease } from "../queue/lease-store.js";
@@ -67,28 +68,11 @@ async function submitToRunningOwner(
   });
 }
 
-export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): Promise<void> {
-  const lease = await tryAcquireQueueOwnerLease(options.sessionId);
-  if (!lease) {
-    return;
-  }
-
-  const sessionRecord = await resolveSessionRecord(options.sessionId);
-  // Mid-turn prompt injection (concurrent client.prompt() into an in-flight
-  // turn) relies on claude-agent-acp's specific behavior: a Pushable input
-  // feeding the Claude SDK plus the UUID-based pendingMessages handoff that
-  // lets a second session/prompt resolve once the active turn surfaces the
-  // injected user message. Other ACP adapters (codex, gemini, the test
-  // mock) do not implement that contract — a concurrent session/prompt
-  // there has undefined semantics. So for non-claude agents we leave the
-  // owner's mid-turn handler unset and new prompts land in the normal
-  // pending queue, preserving the queue-and-wait behavior the original
-  // acpx tests assert.
-  const midTurnInjectionSupported = sessionRecord.agentCommand.includes("claude-agent-acp");
-  let owner: SessionQueueOwner | undefined;
-  let heartbeatTimer: NodeJS.Timeout | undefined;
-  let idleDrain: { stop: () => Promise<void> } | undefined;
-  const sharedClient = new AcpClient({
+function createQueueOwnerSharedClient(
+  options: QueueOwnerRuntimeOptions,
+  sessionRecord: Awaited<ReturnType<typeof resolveSessionRecord>>,
+): AcpClient {
+  return new AcpClient({
     agentCommand: sessionRecord.agentCommand,
     cwd: absolutePath(sessionRecord.cwd),
     mcpServers: options.mcpServers,
@@ -109,13 +93,12 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       sessionOptionsFromRecord(sessionRecord),
     ),
   });
-  const ttlMs = normalizeQueueOwnerTtlMs(options.ttlMs);
-  const maxQueueDepth = Math.max(1, Math.round(options.maxQueueDepth ?? 16));
-  const defaultTaskPollTimeoutMs: number | undefined = ttlMs === 0 ? undefined : ttlMs;
-  let taskPollTimeoutMs: number | undefined = defaultTaskPollTimeoutMs;
-  const initialTaskPollTimeoutMs =
-    taskPollTimeoutMs == null ? undefined : Math.max(taskPollTimeoutMs, 1_000);
-  const turnController = new QueueOwnerTurnController({
+}
+
+function createQueueOwnerTurnController(
+  options: QueueOwnerRuntimeOptions,
+): QueueOwnerTurnController {
+  return new QueueOwnerTurnController({
     withTimeout: async (run, timeoutMs) => await withTimeout(run(), timeoutMs),
     setSessionModeFallback: async (modeId: string, timeoutMs?: number) => {
       await runSessionSetModeDirect({
@@ -159,6 +142,95 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       return result.response;
     },
   });
+}
+
+function logDeferredCancelFailure(error: unknown, verbose?: boolean): void {
+  if (!verbose) {
+    return;
+  }
+  process.stderr.write(`[acpx] failed to apply deferred cancel: ${formatErrorMessage(error)}\n`);
+}
+
+function logQueueOwnerReady(params: {
+  sessionId: string;
+  ttlMs: number;
+  maxQueueDepth: number;
+  verbose?: boolean;
+}): void {
+  if (!params.verbose) {
+    return;
+  }
+  process.stderr.write(
+    `[acpx] queue owner ready for session ${params.sessionId} (ttlMs=${params.ttlMs}, maxQueueDepth=${params.maxQueueDepth})\n`,
+  );
+}
+
+async function closeQueueOwnerRuntime(params: {
+  lease: QueueOwnerLease;
+  owner: SessionQueueOwner | undefined;
+  heartbeatTimer: NodeJS.Timeout | undefined;
+  turnController: QueueOwnerTurnController;
+  sharedClient: AcpClient;
+  sessionId: string;
+  verbose?: boolean;
+}): Promise<void> {
+  if (params.heartbeatTimer) {
+    clearInterval(params.heartbeatTimer);
+  }
+  params.turnController.beginClosing();
+  await params.owner?.close();
+  await params.sharedClient.close().catch(() => {
+    // best effort while queue owner is shutting down
+  });
+  await writeQueueOwnerLifecycleSnapshot(params.sessionId, params.sharedClient);
+  await releaseQueueOwnerLease(params.lease);
+  if (params.verbose) {
+    process.stderr.write(`[acpx] queue owner stopped for session ${params.sessionId}\n`);
+  }
+}
+
+async function writeQueueOwnerLifecycleSnapshot(
+  sessionId: string,
+  sharedClient: AcpClient,
+): Promise<void> {
+  try {
+    const record = await resolveSessionRecord(sessionId);
+    applyLifecycleSnapshotToRecord(record, sharedClient.getAgentLifecycleSnapshot());
+    await writeSessionRecord(record);
+  } catch {
+    // best effort - session may already be cleaned up
+  }
+}
+
+export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): Promise<void> {
+  const lease = await tryAcquireQueueOwnerLease(options.sessionId);
+  if (!lease) {
+    return;
+  }
+
+  const sessionRecord = await resolveSessionRecord(options.sessionId);
+  // Mid-turn prompt injection (concurrent client.prompt() into an in-flight
+  // turn) relies on claude-agent-acp's specific behavior: a Pushable input
+  // feeding the Claude SDK plus the UUID-based pendingMessages handoff that
+  // lets a second session/prompt resolve once the active turn surfaces the
+  // injected user message. Other ACP adapters (codex, gemini, the test
+  // mock) do not implement that contract — a concurrent session/prompt
+  // there has undefined semantics. So for non-claude agents we leave the
+  // owner's mid-turn handler unset and new prompts land in the normal
+  // pending queue, preserving the queue-and-wait behavior the original
+  // acpx tests assert.
+  const midTurnInjectionSupported = sessionRecord.agentCommand.includes("claude-agent-acp");
+  let owner: SessionQueueOwner | undefined;
+  let heartbeatTimer: NodeJS.Timeout | undefined;
+  let idleDrain: { stop: () => Promise<void> } | undefined;
+  const sharedClient = createQueueOwnerSharedClient(options, sessionRecord);
+  const ttlMs = normalizeQueueOwnerTtlMs(options.ttlMs);
+  const maxQueueDepth = Math.max(1, Math.round(options.maxQueueDepth ?? 16));
+  const defaultTaskPollTimeoutMs: number | undefined = ttlMs === 0 ? undefined : ttlMs;
+  let taskPollTimeoutMs: number | undefined = defaultTaskPollTimeoutMs;
+  const initialTaskPollTimeoutMs =
+    taskPollTimeoutMs == null ? undefined : Math.max(taskPollTimeoutMs, 1_000);
+  const turnController = createQueueOwnerTurnController(options);
 
   const applyPendingCancel = async (): Promise<boolean> => {
     return await turnController.applyPendingCancel();
@@ -166,11 +238,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
 
   const scheduleApplyPendingCancel = (): void => {
     void applyPendingCancel().catch((error) => {
-      if (options.verbose) {
-        process.stderr.write(
-          `[acpx] failed to apply deferred cancel: ${formatErrorMessage(error)}\n`,
-        );
-      }
+      logDeferredCancelFailure(error, options.verbose);
     });
   };
 
@@ -235,11 +303,12 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       },
     );
 
-    if (options.verbose) {
-      process.stderr.write(
-        `[acpx] queue owner ready for session ${options.sessionId} (ttlMs=${ttlMs}, maxQueueDepth=${maxQueueDepth})\n`,
-      );
-    }
+    logQueueOwnerReady({
+      sessionId: options.sessionId,
+      ttlMs,
+      maxQueueDepth,
+      verbose: options.verbose,
+    });
     await refreshQueueOwnerLease(lease, { queueDepth: owner.queueDepth() }).catch(() => {
       // best effort initial heartbeat
     });
@@ -518,28 +587,15 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
     }
   } finally {
     await idleDrain?.stop().catch(() => {});
-    if (heartbeatTimer) {
-      clearInterval(heartbeatTimer);
-    }
-    turnController.beginClosing();
-    if (owner) {
-      await owner.close();
-    }
-    await sharedClient.close().catch(() => {
-      // best effort while queue owner is shutting down
+    await closeQueueOwnerRuntime({
+      lease,
+      owner,
+      heartbeatTimer,
+      turnController,
+      sharedClient,
+      sessionId: options.sessionId,
+      verbose: options.verbose,
     });
-    try {
-      const record = await resolveSessionRecord(options.sessionId);
-      applyLifecycleSnapshotToRecord(record, sharedClient.getAgentLifecycleSnapshot());
-      await writeSessionRecord(record);
-    } catch {
-      // best effort — session may already be cleaned up
-    }
-    await releaseQueueOwnerLease(lease);
-
-    if (options.verbose) {
-      process.stderr.write(`[acpx] queue owner stopped for session ${options.sessionId}\n`);
-    }
   }
 }
 

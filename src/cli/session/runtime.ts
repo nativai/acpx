@@ -161,6 +161,26 @@ function toPromptResult(
   };
 }
 
+function requestedModelId(value: string | undefined): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function advertisedModelsForRecord(record: SessionRecord):
+  | {
+      currentModelId: string;
+      availableModels: Array<{ modelId: string; name: string }>;
+    }
+  | undefined {
+  const availableModels = record.acpx?.available_models;
+  if (!Array.isArray(availableModels)) {
+    return undefined;
+  }
+  return {
+    currentModelId: record.acpx?.current_model_id ?? "",
+    availableModels: availableModels.map((modelId) => ({ modelId, name: modelId })),
+  };
+}
+
 async function applyPromptModelIfAdvertised(params: {
   client: AcpClient;
   sessionId: string;
@@ -168,25 +188,19 @@ async function applyPromptModelIfAdvertised(params: {
   record: SessionRecord;
   timeoutMs?: number;
 }): Promise<void> {
-  const requestedModel =
-    typeof params.requestedModel === "string" ? params.requestedModel.trim() : "";
+  const requestedModel = requestedModelId(params.requestedModel);
   if (!requestedModel) {
     return;
   }
 
-  const availableModels = params.record.acpx?.available_models;
+  const models = advertisedModelsForRecord(params.record);
   assertRequestedModelSupported({
     requestedModel,
-    models: Array.isArray(availableModels)
-      ? {
-          currentModelId: params.record.acpx?.current_model_id ?? "",
-          availableModels: availableModels.map((modelId) => ({ modelId, name: modelId })),
-        }
-      : undefined,
+    models,
     agentCommand: params.record.agentCommand,
     context: "apply",
   });
-  if (!Array.isArray(availableModels)) {
+  if (!models) {
     return;
   }
   if (params.record.acpx?.current_model_id === requestedModel) {
@@ -248,6 +262,8 @@ function extractJsonRpcResponseInfo(
   };
 }
 
+const SESSION_RECONNECT_METHODS = new Set(["session/load", "session/resume"]);
+
 function filterRecoverableLoadFallbackOutput(messages: AcpJsonRpcMessage[]): AcpJsonRpcMessage[] {
   const requestMethodById = new Map<string, string>();
   const failedLoadRequestIds = new Set<string>();
@@ -264,7 +280,8 @@ function filterRecoverableLoadFallbackOutput(messages: AcpJsonRpcMessage[]): Acp
       continue;
     }
 
-    if (requestMethodById.get(response.idKey) === "session/load") {
+    const requestMethod = requestMethodById.get(response.idKey);
+    if (requestMethod && SESSION_RECONNECT_METHODS.has(requestMethod)) {
       failedLoadRequestIds.add(response.idKey);
     }
   }
@@ -275,7 +292,11 @@ function filterRecoverableLoadFallbackOutput(messages: AcpJsonRpcMessage[]): Acp
 
   return messages.filter((message) => {
     const request = extractJsonRpcRequestInfo(message);
-    if (request && request.method === "session/load" && failedLoadRequestIds.has(request.idKey)) {
+    if (
+      request &&
+      SESSION_RECONNECT_METHODS.has(request.method) &&
+      failedLoadRequestIds.has(request.idKey)
+    ) {
       return false;
     }
 
@@ -305,6 +326,156 @@ function emitPromptRetryNotice(params: {
   );
 }
 
+function emitConnectPerfMetric(startedAt: number, verbose?: boolean): void {
+  if (!verbose) {
+    return;
+  }
+  process.stderr.write(
+    `[acpx] ${formatPerfMetric("prompt.connect_and_load", Date.now() - startedAt)}\n`,
+  );
+}
+
+function emitPromptPerfMetric(startedAt: number, verbose?: boolean): void {
+  if (!verbose) {
+    return;
+  }
+  process.stderr.write(`[acpx] ${formatPerfMetric("prompt.agent_turn", Date.now() - startedAt)}\n`);
+}
+
+function emitPromptHookError(error: unknown, verbose?: boolean): void {
+  if (!verbose) {
+    return;
+  }
+  process.stderr.write("[acpx] onPromptActive hook failed: " + formatErrorMessage(error) + "\n");
+}
+
+function emitPromptDisconnectNotice(
+  snapshot: ReturnType<AcpClient["getAgentLifecycleSnapshot"]>,
+  verbose?: boolean,
+): void {
+  const lastExit = snapshot.lastExit;
+  if (!lastExit?.unexpectedDuringPrompt || !verbose) {
+    return;
+  }
+  process.stderr.write(
+    "[acpx] agent disconnected during prompt (" +
+      lastExit.reason +
+      ", exit=" +
+      lastExit.exitCode +
+      ", signal=" +
+      (lastExit.signal ?? "none") +
+      ")\n",
+  );
+}
+
+function shouldRetryRuntimePrompt(
+  error: unknown,
+  attempt: number,
+  maxRetries: number,
+  snapshot: ReturnType<AcpClient["getAgentLifecycleSnapshot"]>,
+  hasSideEffects: () => boolean,
+): boolean {
+  if (!shouldRetryPromptAttempt(error, attempt, maxRetries, hasSideEffects)) {
+    return false;
+  }
+  return snapshot.lastExit?.unexpectedDuringPrompt !== true;
+}
+
+function shouldRetryPromptAttempt(
+  error: unknown,
+  attempt: number,
+  maxRetries: number,
+  hasSideEffects: () => boolean,
+): boolean {
+  return attempt < maxRetries && !hasSideEffects() && isRetryablePromptError(error);
+}
+
+async function waitBeforePromptRetry(
+  error: unknown,
+  attempt: number,
+  maxRetries: number,
+  suppressSdkConsoleErrors?: boolean,
+): Promise<void> {
+  const delayMs = Math.min(1_000 * 2 ** attempt, 10_000);
+  emitPromptRetryNotice({
+    error,
+    delayMs,
+    attempt: attempt + 1,
+    maxRetries,
+    suppressSdkConsoleErrors,
+  });
+  await waitMs(delayMs);
+}
+
+type QueuedTaskRuntimeOptions = Parameters<typeof runQueuedTask>[2];
+
+function buildQueuedTaskRunOptions(
+  sessionRecordId: string,
+  task: QueueTask,
+  options: QueuedTaskRuntimeOptions,
+  outputFormatter: OutputFormatter,
+): RunSessionPromptOptions {
+  return {
+    sessionRecordId,
+    mcpServers: options.mcpServers,
+    prompt: task.prompt ?? textPrompt(task.message),
+    permissionMode: task.permissionMode,
+    resumePolicy: task.resumePolicy,
+    nonInteractivePermissions: task.nonInteractivePermissions ?? options.nonInteractivePermissions,
+    permissionPolicy: task.permissionPolicy,
+    authCredentials: options.authCredentials,
+    authPolicy: options.authPolicy,
+    outputFormatter,
+    timeoutMs: task.timeoutMs,
+    suppressSdkConsoleErrors: task.suppressSdkConsoleErrors ?? options.suppressSdkConsoleErrors,
+    verbose: options.verbose,
+    promptRetries: task.promptRetries ?? options.promptRetries ?? 0,
+    sessionOptions: mergeSessionOptions(task.sessionOptions, options.sessionOptions),
+    onClientAvailable: options.onClientAvailable,
+    onClientClosed: options.onClientClosed,
+    onPromptActive: options.onPromptActive,
+    // Fork: thread the queue-owner mid-turn-injection hooks through the
+    // extracted helper so concurrent in-turn prompts still reach runSessionPrompt.
+    onAcpMessage: options.onAcpMessage,
+    setMidTurnHandler: options.setMidTurnHandler,
+    client: options.sharedClient,
+  };
+}
+
+function sendQueuedTaskResult(task: QueueTask, result: SessionSendResult): void {
+  if (!task.waitForCompletion) {
+    return;
+  }
+  task.send({
+    type: "result",
+    requestId: task.requestId,
+    result,
+  });
+}
+
+function sendQueuedTaskError(task: QueueTask, error: unknown): void {
+  if (!task.waitForCompletion) {
+    return;
+  }
+  const normalizedError = normalizeOutputError(error, {
+    origin: "runtime",
+    detailCode: "QUEUE_RUNTIME_PROMPT_FAILED",
+  });
+  const alreadyEmitted =
+    (error as { outputAlreadyEmitted?: unknown }).outputAlreadyEmitted === true;
+  task.send({
+    type: "error",
+    requestId: task.requestId,
+    code: normalizedError.code,
+    detailCode: normalizedError.detailCode,
+    origin: normalizedError.origin,
+    message: normalizedError.message,
+    retryable: normalizedError.retryable,
+    acp: normalizedError.acp,
+    outputAlreadyEmitted: alreadyEmitted,
+  });
+}
+
 export async function runQueuedTask(
   sessionRecordId: string,
   task: QueueTask,
@@ -331,59 +502,12 @@ export async function runQueuedTask(
     : DISCARD_OUTPUT_FORMATTER;
 
   try {
-    const result = await runSessionPrompt({
-      sessionRecordId,
-      mcpServers: options.mcpServers,
-      prompt: task.prompt ?? textPrompt(task.message),
-      permissionMode: task.permissionMode,
-      resumePolicy: task.resumePolicy,
-      nonInteractivePermissions:
-        task.nonInteractivePermissions ?? options.nonInteractivePermissions,
-      permissionPolicy: task.permissionPolicy,
-      authCredentials: options.authCredentials,
-      authPolicy: options.authPolicy,
-      outputFormatter,
-      timeoutMs: task.timeoutMs,
-      suppressSdkConsoleErrors: task.suppressSdkConsoleErrors ?? options.suppressSdkConsoleErrors,
-      verbose: options.verbose,
-      promptRetries: task.promptRetries ?? options.promptRetries ?? 0,
-      sessionOptions: mergeSessionOptions(task.sessionOptions, options.sessionOptions),
-      onClientAvailable: options.onClientAvailable,
-      onClientClosed: options.onClientClosed,
-      onPromptActive: options.onPromptActive,
-      onAcpMessage: options.onAcpMessage,
-      setMidTurnHandler: options.setMidTurnHandler,
-      client: options.sharedClient,
-    });
-
-    if (task.waitForCompletion) {
-      task.send({
-        type: "result",
-        requestId: task.requestId,
-        result,
-      });
-    }
+    const result = await runSessionPrompt(
+      buildQueuedTaskRunOptions(sessionRecordId, task, options, outputFormatter),
+    );
+    sendQueuedTaskResult(task, result);
   } catch (error) {
-    const normalizedError = normalizeOutputError(error, {
-      origin: "runtime",
-      detailCode: "QUEUE_RUNTIME_PROMPT_FAILED",
-    });
-    const alreadyEmitted =
-      (error as { outputAlreadyEmitted?: unknown }).outputAlreadyEmitted === true;
-    if (task.waitForCompletion) {
-      task.send({
-        type: "error",
-        requestId: task.requestId,
-        code: normalizedError.code,
-        detailCode: normalizedError.detailCode,
-        origin: normalizedError.origin,
-        message: normalizedError.message,
-        retryable: normalizedError.retryable,
-        acp: normalizedError.acp,
-        outputAlreadyEmitted: alreadyEmitted,
-      });
-    }
-
+    sendQueuedTaskError(task, error);
     if (error instanceof InterruptedError) {
       throw error;
     }
@@ -434,6 +558,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   let bufferingConnectOutput = true;
   let promptTurnActive = false;
   let promptTurnHadSideEffects = false;
+  // Fork: in-flight mid-turn-injected prompts. Tracked so a turn awaits all
+  // of them before the queue-owner loop starts the next sequential task —
+  // otherwise a second concurrent client.prompt() would cut an injected turn short.
+  const injectedPromises: Promise<void>[] = [];
   let sawAcpMessage = false;
   let eventWriterClosed = false;
 
@@ -785,57 +913,232 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     },
   };
 
+  const flushConnectOutput = (loadError?: string): void => {
+    bufferingConnectOutput = false;
+    const messages =
+      loadError == null
+        ? pendingConnectOutputMessages
+        : filterRecoverableLoadFallbackOutput(pendingConnectOutputMessages);
+    for (const message of messages) {
+      output.onAcpMessage(message);
+    }
+    pendingConnectOutputMessages.length = 0;
+  };
+
+  const connectForPrompt = async () => {
+    const connectStartedAt = Date.now();
+    try {
+      const connected = await measurePerf("runtime.connect_and_load", async () => {
+        return await connectAndLoadSession({
+          client,
+          record,
+          resumePolicy: options.resumePolicy,
+          timeoutMs: options.timeoutMs,
+          verbose: options.verbose,
+          activeController,
+          onClientAvailable: (controller) => {
+            options.onClientAvailable?.(controller);
+            notifiedClientAvailable = true;
+          },
+          onConnectedRecord: (connectedRecord) => {
+            connectedRecord.lastPromptAt = isoNow();
+          },
+          onSessionIdResolved: (sessionId) => {
+            activeSessionIdForControl = sessionId;
+          },
+        });
+      });
+      flushConnectOutput(connected.loadError);
+      emitConnectPerfMetric(connectStartedAt, options.verbose);
+      return connected;
+    } catch (error) {
+      flushConnectOutput();
+      throw error;
+    }
+  };
+
+  const buildPromptStartedHook = (sessionId: string, attempt: number) => {
+    // The mid-turn injection handler must be (re)registered on EVERY attempt
+    // (including retries) so concurrently-arriving tasks reach the in-flight
+    // turn. onPromptActive, by contrast, fires only on the first attempt.
+    const needsInjectionHandler = options.setMidTurnHandler !== undefined;
+    if (!needsInjectionHandler && (attempt !== 0 || !options.onPromptActive)) {
+      return undefined;
+    }
+    return async () => {
+      // Register the mid-turn injection handler now that the ACP prompt is
+      // in-flight. Any task injected here calls client.prompt() concurrently
+      // so the agent sees the new message via its Pushable input mid-turn
+      // rather than waiting for the current turn to end. Each injected promise
+      // is tracked so the turn can await all of them once it finishes.
+      options.setMidTurnHandler?.((injectedTask: QueueTask) => {
+        const injectedPromise = (async () => {
+          try {
+            const injectedResponse = await client.prompt(
+              sessionId,
+              injectedTask.prompt ?? textPrompt(injectedTask.message),
+            );
+            if (injectedTask.waitForCompletion) {
+              injectedTask.send({
+                type: "result",
+                requestId: injectedTask.requestId,
+                result: {
+                  ...toPromptResult(injectedResponse.stopReason, record.acpxRecordId, client),
+                  record,
+                  resumed: true,
+                },
+              });
+            }
+          } catch (injectedError) {
+            if (injectedTask.waitForCompletion) {
+              const normalized = normalizeOutputError(injectedError, {
+                origin: "runtime",
+                detailCode: "MID_TURN_PROMPT_FAILED",
+              });
+              injectedTask.send({
+                type: "error",
+                requestId: injectedTask.requestId,
+                code: normalized.code,
+                detailCode: normalized.detailCode,
+                origin: normalized.origin,
+                message: normalized.message,
+                retryable: normalized.retryable,
+              });
+            }
+          } finally {
+            injectedTask.close();
+          }
+        })();
+        injectedPromises.push(injectedPromise);
+      });
+      if (attempt === 0 && options.onPromptActive) {
+        try {
+          await options.onPromptActive();
+        } catch (error) {
+          emitPromptHookError(error, options.verbose);
+        }
+      }
+    };
+  };
+
+  const drainInjectedPrompts = async () => {
+    // Clear the handler so no new concurrent calls are made, then await all
+    // in-flight injected prompts. Without this the queue-owner loop could
+    // start the next sequential task while an injected client.prompt() is
+    // still running, pushing that next message into the injected turn's
+    // context and cutting it short.
+    options.setMidTurnHandler?.(undefined);
+    if (injectedPromises.length > 0) {
+      await Promise.allSettled(injectedPromises);
+      injectedPromises.length = 0;
+    }
+  };
+
+  const runPromptAttempt = async (sessionId: string, attempt: number) => {
+    const promptStartedAt = Date.now();
+    const response = await measurePerf("runtime.prompt.agent_turn", async () => {
+      return await runPromptTurn({
+        client,
+        sessionId,
+        prompt: options.prompt,
+        timeoutMs: options.timeoutMs,
+        conversation,
+        promptMessageId,
+        onPromptStarted: buildPromptStartedHook(sessionId, attempt),
+      });
+    });
+    // First turn done — stop injecting and await any in-flight injected prompts.
+    await drainInjectedPrompts();
+    emitPromptPerfMetric(promptStartedAt, options.verbose);
+    return response;
+  };
+
+  const handlePromptFailure = async (error: unknown, attempt: number): Promise<"retry"> => {
+    // Stop injecting and await in-flight injected prompts before deciding
+    // whether to retry or fail (mirrors the success path).
+    await drainInjectedPrompts();
+    const snapshot = client.getAgentLifecycleSnapshot();
+    if (
+      shouldRetryRuntimePrompt(
+        error,
+        attempt,
+        options.promptRetries ?? 0,
+        snapshot,
+        () => promptTurnHadSideEffects,
+      )
+    ) {
+      await waitBeforePromptRetry(
+        error,
+        attempt,
+        options.promptRetries ?? 0,
+        options.suppressSdkConsoleErrors,
+      );
+      return promptTurnHadSideEffects ? await failRuntimePrompt(error, snapshot) : "retry";
+    }
+    return await failRuntimePrompt(error, snapshot);
+  };
+
+  const failRuntimePrompt = async (
+    error: unknown,
+    snapshot: ReturnType<AcpClient["getAgentLifecycleSnapshot"]>,
+  ): Promise<never> => {
+    promptTurnActive = false;
+    applyLifecycleSnapshotToRecord(record, snapshot);
+    emitPromptDisconnectNotice(snapshot, options.verbose);
+    const normalizedError = normalizeOutputError(error, { origin: "runtime" });
+    await flushPendingMessages(false).catch(() => {
+      // best effort while bubbling prompt failure
+    });
+    output.flush();
+    record.lastUsedAt = isoNow();
+    applyConversation(record, conversation);
+    record.acpx = acpxState;
+    const propagated = error instanceof Error ? error : new Error(formatErrorMessage(error));
+    (propagated as { outputAlreadyEmitted?: boolean }).outputAlreadyEmitted = sawAcpMessage;
+    (propagated as { normalizedOutputError?: unknown }).normalizedOutputError = normalizedError;
+    throw propagated;
+  };
+
+  const runPromptWithRetries = async (sessionId: string) => {
+    promptTurnActive = true;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await runPromptAttempt(sessionId, attempt);
+      } catch (error) {
+        if ((await handlePromptFailure(error, attempt)) === "retry") {
+          continue;
+        }
+      }
+    }
+  };
+
+  const savePromptSuccess = async (response: Awaited<ReturnType<typeof runPromptTurn>>) => {
+    await flushPendingMessages(false);
+    output.flush();
+    const now = isoNow();
+    record.lastUsedAt = now;
+    // NOTE: We intentionally do NOT touch `record.closed` / `record.closedAt` here.
+    // Under the session-lifecycle-state ownership model (see
+    // src/session/persistence/repository.ts docs + DESIGN.md), `closed` is
+    // UI-authored user intent. Silently re-opening a closed session on any
+    // successful turn violates that intent. `runSessionPrompt` already refuses to
+    // run against a closed record (throws SessionClosedError), so reaching this
+    // point means the session was open when the turn started and should remain
+    // open — the default already on disk. Route any future lifecycle write here
+    // through writeSessionRecordWithLifecycle.
+    record.protocolVersion = client.initializeResult?.protocolVersion;
+    record.agentCapabilities = client.initializeResult?.agentCapabilities;
+    applyConversation(record, conversation);
+    record.acpx = acpxState;
+    applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
+    stopTotalTimer();
+    return response;
+  };
+
   try {
     return await withInterrupt(
       async () => {
-        const connectStartedAt = Date.now();
-        const {
-          sessionId: activeSessionId,
-          resumed,
-          loadError,
-        } = await measurePerf("runtime.connect_and_load", async () => {
-          try {
-            return await connectAndLoadSession({
-              client,
-              record,
-              resumePolicy: options.resumePolicy,
-              timeoutMs: options.timeoutMs,
-              verbose: options.verbose,
-              activeController,
-              onClientAvailable: (controller) => {
-                options.onClientAvailable?.(controller);
-                notifiedClientAvailable = true;
-              },
-              onConnectedRecord: (connectedRecord) => {
-                connectedRecord.lastPromptAt = isoNow();
-              },
-              onSessionIdResolved: (sessionId) => {
-                activeSessionIdForControl = sessionId;
-              },
-            });
-          } catch (error) {
-            bufferingConnectOutput = false;
-            for (const message of pendingConnectOutputMessages) {
-              output.onAcpMessage(message);
-            }
-            pendingConnectOutputMessages.length = 0;
-            throw error;
-          }
-        });
-        bufferingConnectOutput = false;
-        const connectOutputMessages =
-          loadError == null
-            ? pendingConnectOutputMessages
-            : filterRecoverableLoadFallbackOutput(pendingConnectOutputMessages);
-        for (const message of connectOutputMessages) {
-          output.onAcpMessage(message);
-        }
-        pendingConnectOutputMessages.length = 0;
-        if (options.verbose) {
-          process.stderr.write(
-            `[acpx] ${formatPerfMetric("prompt.connect_and_load", Date.now() - connectStartedAt)}\n`,
-          );
-        }
+        const { sessionId: activeSessionId, resumed, loadError } = await connectForPrompt();
 
         await applyPromptModelIfAdvertised({
           client,
@@ -850,197 +1153,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         });
         await liveCheckpoint.checkpoint();
 
-        const maxRetries = options.promptRetries ?? 0;
-        let response;
-        const injectedPromises: Promise<void>[] = [];
-        promptTurnActive = true;
-        for (let attempt = 0; ; attempt++) {
-          try {
-            const promptStartedAt = Date.now();
-            response = await measurePerf("runtime.prompt.agent_turn", async () => {
-              return await runPromptTurn({
-                client,
-                sessionId: activeSessionId,
-                prompt: options.prompt,
-                timeoutMs: options.timeoutMs,
-                conversation,
-                promptMessageId,
-                onPromptStarted: async () => {
-                  // Register the mid-turn injection handler now that the ACP
-                  // prompt is in-flight. Any task injected here calls
-                  // client.prompt() concurrently so the agent sees the new
-                  // message via its Pushable input mid-turn rather than
-                  // waiting for the current turn to end. We track each
-                  // injected promise so we can await all of them after the
-                  // first turn finishes — without this, the queue-owner loop
-                  // would pick up the next sequential task while an injected
-                  // client.prompt() is still running, causing a second
-                  // concurrent call that cuts the injected turn short.
-                  options.setMidTurnHandler?.((injectedTask: QueueTask) => {
-                    const injectedPromise = (async () => {
-                      try {
-                        const injectedResponse = await client.prompt(
-                          activeSessionId,
-                          injectedTask.prompt ?? textPrompt(injectedTask.message),
-                        );
-                        if (injectedTask.waitForCompletion) {
-                          injectedTask.send({
-                            type: "result",
-                            requestId: injectedTask.requestId,
-                            result: {
-                              ...toPromptResult(
-                                injectedResponse.stopReason,
-                                record.acpxRecordId,
-                                client,
-                              ),
-                              record,
-                              resumed: true,
-                            },
-                          });
-                        }
-                      } catch (injectedError) {
-                        if (injectedTask.waitForCompletion) {
-                          const normalized = normalizeOutputError(injectedError, {
-                            origin: "runtime",
-                            detailCode: "MID_TURN_PROMPT_FAILED",
-                          });
-                          injectedTask.send({
-                            type: "error",
-                            requestId: injectedTask.requestId,
-                            code: normalized.code,
-                            detailCode: normalized.detailCode,
-                            origin: normalized.origin,
-                            message: normalized.message,
-                            retryable: normalized.retryable,
-                          });
-                        }
-                      } finally {
-                        injectedTask.close();
-                      }
-                    })();
-                    injectedPromises.push(injectedPromise);
-                  });
-                  if (attempt === 0 && options.onPromptActive) {
-                    try {
-                      await options.onPromptActive();
-                    } catch (error) {
-                      if (options.verbose) {
-                        process.stderr.write(
-                          "[acpx] onPromptActive hook failed: " + formatErrorMessage(error) + "\n",
-                        );
-                      }
-                    }
-                  }
-                },
-              });
-            });
-            // First turn done — clear the handler so no new concurrent calls
-            // are made while we write the result and close the writer. Then
-            // await all in-flight injected prompts so the queue-owner loop
-            // does not start the next sequential task while an injected
-            // client.prompt() is still running (a second concurrent call
-            // would push the next sequential message into the injected
-            // turn's context, causing it to end early with no output).
-            options.setMidTurnHandler?.(undefined);
-            if (injectedPromises.length > 0) {
-              await Promise.allSettled(injectedPromises);
-              injectedPromises.length = 0;
-            }
-            if (options.verbose) {
-              process.stderr.write(
-                `[acpx] ${formatPerfMetric("prompt.agent_turn", Date.now() - promptStartedAt)}\n`,
-              );
-            }
-            break;
-          } catch (error) {
-            options.setMidTurnHandler?.(undefined);
-            if (injectedPromises.length > 0) {
-              await Promise.allSettled(injectedPromises);
-              injectedPromises.length = 0;
-            }
-            const snapshot = client.getAgentLifecycleSnapshot();
-            const agentCrashed = snapshot.lastExit?.unexpectedDuringPrompt === true;
-
-            if (
-              attempt < maxRetries &&
-              !agentCrashed &&
-              !promptTurnHadSideEffects &&
-              isRetryablePromptError(error)
-            ) {
-              const delayMs = Math.min(1_000 * 2 ** attempt, 10_000);
-              emitPromptRetryNotice({
-                error,
-                delayMs,
-                attempt: attempt + 1,
-                maxRetries,
-                suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
-              });
-              await waitMs(delayMs);
-              if (!promptTurnHadSideEffects) {
-                continue;
-              }
-            }
-
-            promptTurnActive = false;
-            applyLifecycleSnapshotToRecord(record, snapshot);
-            const lastExit = snapshot.lastExit;
-            if (lastExit?.unexpectedDuringPrompt && options.verbose) {
-              process.stderr.write(
-                "[acpx] agent disconnected during prompt (" +
-                  lastExit.reason +
-                  ", exit=" +
-                  lastExit.exitCode +
-                  ", signal=" +
-                  (lastExit.signal ?? "none") +
-                  ")\n",
-              );
-            }
-
-            const normalizedError = normalizeOutputError(error, {
-              origin: "runtime",
-            });
-
-            await flushPendingMessages(false).catch(() => {
-              // best effort while bubbling prompt failure
-            });
-
-            output.flush();
-
-            record.lastUsedAt = isoNow();
-            applyConversation(record, conversation);
-            record.acpx = acpxState;
-
-            const propagated =
-              error instanceof Error ? error : new Error(formatErrorMessage(error));
-            (propagated as { outputAlreadyEmitted?: boolean }).outputAlreadyEmitted = sawAcpMessage;
-            (propagated as { normalizedOutputError?: unknown }).normalizedOutputError =
-              normalizedError;
-            throw propagated;
-          }
-        }
+        const response = await savePromptSuccess(await runPromptWithRetries(activeSessionId));
         promptTurnActive = false;
-
-        await flushPendingMessages(false);
-        output.flush();
-
-        const now = isoNow();
-        record.lastUsedAt = now;
-        // NOTE: We intentionally do NOT touch `record.closed` / `record.closedAt` here.
-        // Under the session-lifecycle-state ownership model (see
-        // src/session/persistence/repository.ts docs + DESIGN.md), `closed` is
-        // UI-authored user intent. Silently re-opening a closed session on any
-        // successful turn violates that intent. The `runSessionPrompt` entry
-        // point already refuses to run against a closed record (throws
-        // SessionClosedError), so reaching this point means the session was
-        // open when the turn started and should remain open — which is the
-        // default already on disk. If a future lifecycle change needs to be
-        // written here, route it through writeSessionRecordWithLifecycle.
-        record.protocolVersion = client.initializeResult?.protocolVersion;
-        record.agentCapabilities = client.initializeResult?.agentCapabilities;
-        applyConversation(record, conversation);
-        record.acpx = acpxState;
-        applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
-        stopTotalTimer();
 
         return {
           ...toPromptResult(response.stopReason, record.acpxRecordId, client),
@@ -1131,6 +1245,31 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
     sessionOptions: options.sessionOptions,
   });
 
+  const runExecPromptAttempt = async (sessionId: string) => {
+    return await measurePerf("runtime.exec.prompt", async () => {
+      return await withTimeout(client.prompt(sessionId, options.prompt), options.timeoutMs);
+    });
+  };
+
+  const runExecPromptWithRetries = async (sessionId: string) => {
+    const maxRetries = options.promptRetries ?? 0;
+    promptTurnActive = true;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await runExecPromptAttempt(sessionId);
+      } catch (error) {
+        if (shouldRetryPromptAttempt(error, attempt, maxRetries, () => promptTurnHadSideEffects)) {
+          await waitBeforePromptRetry(error, attempt, maxRetries, options.suppressSdkConsoleErrors);
+          if (!promptTurnHadSideEffects) {
+            continue;
+          }
+        }
+        promptTurnActive = false;
+        throw error;
+      }
+    }
+  };
+
   try {
     return await withInterrupt(
       async () => {
@@ -1157,38 +1296,7 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
           sessionId,
         });
 
-        const maxRetries = options.promptRetries ?? 0;
-        let response;
-        promptTurnActive = true;
-        for (let attempt = 0; ; attempt++) {
-          try {
-            response = await measurePerf("runtime.exec.prompt", async () => {
-              return await withTimeout(client.prompt(sessionId, options.prompt), options.timeoutMs);
-            });
-            break;
-          } catch (error) {
-            if (
-              attempt < maxRetries &&
-              !promptTurnHadSideEffects &&
-              isRetryablePromptError(error)
-            ) {
-              const delayMs = Math.min(1_000 * 2 ** attempt, 10_000);
-              emitPromptRetryNotice({
-                error,
-                delayMs,
-                attempt: attempt + 1,
-                maxRetries,
-                suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
-              });
-              await waitMs(delayMs);
-              if (!promptTurnHadSideEffects) {
-                continue;
-              }
-            }
-            promptTurnActive = false;
-            throw error;
-          }
-        }
+        const response = await runExecPromptWithRetries(sessionId);
         promptTurnActive = false;
         output.flush();
         return toPromptResult(response.stopReason, sessionId, client);

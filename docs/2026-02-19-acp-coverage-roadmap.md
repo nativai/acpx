@@ -81,6 +81,6 @@ Things acpx needs that aren't in the ACP spec:
       Session bridging.
 - [ ] **Webhooks / callbacks** — Notify a URL when a prompt finishes. For CI/CD
       and automation pipelines.
-- [ ] **Session export/import** — Move sessions between machines.
+- [x] **Session export/import** — Move sessions between machines.
 - [ ] **Watch mode** — Re-run prompt on file changes.
 - [ ] **Cost/token tracking** — Surface usage stats when agents/ACP expose them.

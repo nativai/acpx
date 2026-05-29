@@ -62,6 +62,7 @@ export function makeSessionRecord(
     cumulative_token_usage: overrides.cumulative_token_usage ?? {},
     request_token_usage: overrides.request_token_usage ?? {},
     acpx: overrides.acpx ?? (defaultAcpx ? {} : undefined),
+    importedFrom: overrides.importedFrom,
   };
 }
 

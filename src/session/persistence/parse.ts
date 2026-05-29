@@ -49,13 +49,17 @@ function parseTokenUsage(
     if (value === undefined) {
       continue;
     }
-    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    if (!isNonNegativeFiniteNumber(value)) {
       return null;
     }
     usage[field] = value;
   }
 
   return usage;
+}
+
+function isNonNegativeFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
 function parseRequestTokenUsage(
@@ -93,13 +97,16 @@ function isSessionMessageImage(raw: unknown): boolean {
   }
 
   const size = asRecord(record.size);
-  return (
-    !!size &&
-    typeof size.width === "number" &&
-    Number.isFinite(size.width) &&
-    typeof size.height === "number" &&
-    Number.isFinite(size.height)
-  );
+  return !!size && isFiniteNumber(size.width) && isFiniteNumber(size.height);
+}
+
+function isSessionMessageAudio(raw: unknown): boolean {
+  const record = asRecord(raw);
+  return !!record && typeof record.source === "string" && typeof record.mime_type === "string";
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
 }
 
 function isUserContent(raw: unknown): boolean {
@@ -121,6 +128,10 @@ function isUserContent(raw: unknown): boolean {
     return isSessionMessageImage(record.Image);
   }
 
+  if (record.Audio !== undefined) {
+    return isSessionMessageAudio(record.Audio);
+  }
+
   return false;
 }
 
@@ -128,15 +139,19 @@ function isToolUse(raw: unknown): boolean {
   const record = asRecord(raw);
   return (
     !!record &&
-    typeof record.id === "string" &&
-    typeof record.name === "string" &&
-    typeof record.raw_input === "string" &&
+    hasStringFields(record, ["id", "name", "raw_input"]) &&
     hasOwn(record, "input") &&
     typeof record.is_input_complete === "boolean" &&
-    (record.thought_signature === undefined ||
-      record.thought_signature === null ||
-      typeof record.thought_signature === "string")
+    isOptionalString(record.thought_signature)
   );
+}
+
+function hasStringFields(record: Record<string, unknown>, keys: readonly string[]): boolean {
+  return keys.every((key) => typeof record[key] === "string");
+}
+
+function isOptionalString(value: unknown): boolean {
+  return value === undefined || value === null || typeof value === "string";
 }
 
 function isToolResultContent(raw: unknown): boolean {
@@ -178,14 +193,7 @@ function isAgentContent(raw: unknown): boolean {
   }
 
   if (record.Thinking !== undefined) {
-    const thinking = asRecord(record.Thinking);
-    return (
-      !!thinking &&
-      typeof thinking.text === "string" &&
-      (thinking.signature === undefined ||
-        thinking.signature === null ||
-        typeof thinking.signature === "string")
-    );
+    return isThinkingContent(record.Thinking);
   }
 
   if (typeof record.RedactedThinking === "string") {
@@ -197,6 +205,11 @@ function isAgentContent(raw: unknown): boolean {
   }
 
   return false;
+}
+
+function isThinkingContent(raw: unknown): boolean {
+  const thinking = asRecord(raw);
+  return !!thinking && typeof thinking.text === "string" && isOptionalString(thinking.signature);
 }
 
 function isUserMessage(raw: unknown): boolean {
@@ -238,15 +251,12 @@ function isConversationMessage(raw: unknown): boolean {
 }
 
 function parseConversationRecord(record: Record<string, unknown>): SessionConversation | undefined {
-  if (
-    !Array.isArray(record.messages) ||
-    !record.messages.every(isConversationMessage) ||
-    typeof record.updated_at !== "string"
-  ) {
+  if (!hasValidConversationCore(record)) {
     return undefined;
   }
 
-  if (record.title !== undefined && record.title !== null && typeof record.title !== "string") {
+  const title = parseConversationTitle(record.title);
+  if (title === INVALID_VALUE) {
     return undefined;
   }
 
@@ -257,15 +267,35 @@ function parseConversationRecord(record: Record<string, unknown>): SessionConver
   }
 
   return {
-    title:
-      record.title === undefined || record.title === null || typeof record.title === "string"
-        ? record.title
-        : null,
-    messages: record.messages as SessionConversation["messages"],
+    title,
+    messages: record.messages,
     updated_at: record.updated_at,
     cumulative_token_usage: cumulativeTokenUsage ?? {},
     request_token_usage: requestTokenUsage ?? {},
   };
+}
+
+const INVALID_VALUE = Symbol("invalid");
+
+function parseConversationTitle(value: unknown): string | null | undefined | typeof INVALID_VALUE {
+  if (value === undefined || value === null || typeof value === "string") {
+    return value;
+  }
+  return INVALID_VALUE;
+}
+
+function hasValidConversationCore(record: Record<string, unknown>): record is Record<
+  string,
+  unknown
+> & {
+  messages: SessionConversation["messages"];
+  updated_at: string;
+} {
+  return (
+    Array.isArray(record.messages) &&
+    record.messages.every(isConversationMessage) &&
+    typeof record.updated_at === "string"
+  );
 }
 
 function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
@@ -276,34 +306,13 @@ function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
 
   const state: SessionAcpxState = {};
 
-  if (record.reset_on_next_ensure === true) {
-    state.reset_on_next_ensure = true;
-  }
+  assignBooleanTrue(state, "reset_on_next_ensure", record.reset_on_next_ensure);
+  assignStringState(state, "current_mode_id", record.current_mode_id);
+  assignStringState(state, "desired_mode_id", record.desired_mode_id);
 
-  if (typeof record.current_mode_id === "string") {
-    state.current_mode_id = record.current_mode_id;
-  }
+  assignDesiredConfigOptions(state, record.desired_config_options);
 
-  if (typeof record.desired_mode_id === "string") {
-    state.desired_mode_id = record.desired_mode_id;
-  }
-
-  const desiredConfigOptions = asRecord(record.desired_config_options);
-  if (desiredConfigOptions) {
-    const parsed: Record<string, string> = {};
-    for (const [key, value] of Object.entries(desiredConfigOptions)) {
-      if (typeof key === "string" && typeof value === "string") {
-        parsed[key] = value;
-      }
-    }
-    if (Object.keys(parsed).length > 0) {
-      state.desired_config_options = parsed;
-    }
-  }
-
-  if (typeof record.current_model_id === "string") {
-    state.current_model_id = record.current_model_id;
-  }
+  assignStringState(state, "current_model_id", record.current_model_id);
 
   if (isStringArray(record.available_models)) {
     state.available_models = [...record.available_models];
@@ -317,66 +326,110 @@ function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
     state.config_options = record.config_options as SessionAcpxState["config_options"];
   }
 
-  const sessionOptions = asRecord(record.session_options);
-  if (sessionOptions) {
-    const parsedSessionOptions: NonNullable<SessionAcpxState["session_options"]> = {};
-
-    if (typeof sessionOptions.model === "string") {
-      parsedSessionOptions.model = sessionOptions.model;
-    }
-
-    if (isStringArray(sessionOptions.allowed_tools)) {
-      parsedSessionOptions.allowed_tools = [...sessionOptions.allowed_tools];
-    }
-
-    if (
-      typeof sessionOptions.max_turns === "number" &&
-      Number.isInteger(sessionOptions.max_turns) &&
-      sessionOptions.max_turns > 0
-    ) {
-      parsedSessionOptions.max_turns = sessionOptions.max_turns;
-    }
-
-    const rawSystemPrompt = sessionOptions.system_prompt;
-    if (typeof rawSystemPrompt === "string" && rawSystemPrompt.length > 0) {
-      parsedSessionOptions.system_prompt = rawSystemPrompt;
-    } else {
-      const appendRecord = asRecord(rawSystemPrompt);
-      if (
-        appendRecord &&
-        typeof appendRecord.append === "string" &&
-        appendRecord.append.length > 0
-      ) {
-        parsedSessionOptions.system_prompt = { append: appendRecord.append };
-      }
-    }
-
-    if (Object.keys(parsedSessionOptions).length > 0) {
-      state.session_options = parsedSessionOptions;
-    }
-  }
+  assignParsedSessionOptions(state, record.session_options);
 
   return state;
 }
 
-function parseEventLog(raw: unknown, sessionId: string): SessionEventLog {
-  const record = asRecord(raw);
-  if (!record) {
-    return defaultSessionEventLog(sessionId);
+function assignBooleanTrue(
+  state: SessionAcpxState,
+  key: "reset_on_next_ensure",
+  value: unknown,
+): void {
+  if (value === true) {
+    state[key] = true;
+  }
+}
+
+function assignStringState(
+  state: SessionAcpxState,
+  key: "current_mode_id" | "desired_mode_id" | "current_model_id",
+  value: unknown,
+): void {
+  if (typeof value === "string") {
+    state[key] = value;
+  }
+}
+
+function assignDesiredConfigOptions(state: SessionAcpxState, raw: unknown): void {
+  const desiredConfigOptions = asRecord(raw);
+  if (!desiredConfigOptions) {
+    return;
   }
 
-  if (
-    typeof record.active_path !== "string" ||
-    typeof record.segment_count !== "number" ||
-    !Number.isInteger(record.segment_count) ||
-    record.segment_count < 1 ||
-    typeof record.max_segment_bytes !== "number" ||
-    !Number.isInteger(record.max_segment_bytes) ||
-    record.max_segment_bytes < 1 ||
-    typeof record.max_segments !== "number" ||
-    !Number.isInteger(record.max_segments) ||
-    record.max_segments < 1
-  ) {
+  const parsed = Object.fromEntries(
+    Object.entries(desiredConfigOptions).filter((entry): entry is [string, string] => {
+      const [, value] = entry;
+      return typeof value === "string";
+    }),
+  );
+  if (Object.keys(parsed).length > 0) {
+    state.desired_config_options = parsed;
+  }
+}
+
+function assignParsedSessionOptions(state: SessionAcpxState, raw: unknown): void {
+  const sessionOptions = asRecord(raw);
+  if (!sessionOptions) {
+    return;
+  }
+
+  const parsedSessionOptions: NonNullable<SessionAcpxState["session_options"]> = {};
+  assignSessionOptionModel(parsedSessionOptions, sessionOptions.model);
+  assignSessionOptionAllowedTools(parsedSessionOptions, sessionOptions.allowed_tools);
+  assignSessionOptionMaxTurns(parsedSessionOptions, sessionOptions.max_turns);
+  assignSessionOptionSystemPrompt(parsedSessionOptions, sessionOptions.system_prompt);
+
+  if (Object.keys(parsedSessionOptions).length > 0) {
+    state.session_options = parsedSessionOptions;
+  }
+}
+
+function assignSessionOptionModel(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+  value: unknown,
+): void {
+  if (typeof value === "string") {
+    options.model = value;
+  }
+}
+
+function assignSessionOptionAllowedTools(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+  value: unknown,
+): void {
+  if (isStringArray(value)) {
+    options.allowed_tools = [...value];
+  }
+}
+
+function assignSessionOptionMaxTurns(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+  value: unknown,
+): void {
+  if (typeof value === "number" && Number.isInteger(value) && value > 0) {
+    options.max_turns = value;
+  }
+}
+
+function assignSessionOptionSystemPrompt(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+  value: unknown,
+): void {
+  if (typeof value === "string" && value.length > 0) {
+    options.system_prompt = value;
+    return;
+  }
+
+  const appendRecord = asRecord(value);
+  if (appendRecord && typeof appendRecord.append === "string" && appendRecord.append.length > 0) {
+    options.system_prompt = { append: appendRecord.append };
+  }
+}
+
+function parseEventLog(raw: unknown, sessionId: string): SessionEventLog {
+  const record = asRecord(raw);
+  if (!record || !hasValidEventLogCore(record)) {
     return defaultSessionEventLog(sessionId);
   }
 
@@ -391,6 +444,68 @@ function parseEventLog(raw: unknown, sessionId: string): SessionEventLog {
         ? record.last_write_error
         : null,
   };
+}
+
+function hasValidEventLogCore(record: Record<string, unknown>): record is Record<
+  string,
+  unknown
+> & {
+  active_path: string;
+  segment_count: number;
+  max_segment_bytes: number;
+  max_segments: number;
+} {
+  return (
+    typeof record.active_path === "string" &&
+    isPositiveInteger(record.segment_count) &&
+    isPositiveInteger(record.max_segment_bytes) &&
+    isPositiveInteger(record.max_segments)
+  );
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0;
+}
+
+function parseImportedFrom(raw: unknown): SessionRecord["importedFrom"] | null | undefined {
+  if (raw == null) {
+    return undefined;
+  }
+
+  const record = asRecord(raw);
+  if (
+    !record ||
+    typeof record.record_id !== "string" ||
+    typeof record.cwd_original !== "string" ||
+    typeof record.exported_by !== "string" ||
+    typeof record.exported_at !== "string"
+  ) {
+    return null;
+  }
+
+  return {
+    recordId: record.record_id,
+    cwdOriginal: record.cwd_original,
+    exportedBy: record.exported_by,
+    exportedAt: record.exported_at,
+  };
+}
+
+function parseSessionRecordMetadata(record: Record<string, unknown>): {
+  lastRequestId: string | undefined;
+  importedFrom: SessionRecord["importedFrom"];
+} | null {
+  const lastRequestId = normalizeOptionalString(record.last_request_id);
+  if (lastRequestId === null) {
+    return null;
+  }
+
+  const importedFrom = parseImportedFrom(record.imported_from);
+  if (importedFrom === null) {
+    return null;
+  }
+
+  return { lastRequestId, importedFrom };
 }
 
 function normalizeOptionalName(value: unknown): string | undefined | null {
@@ -606,8 +721,11 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
   }
 
   const eventLog = parseEventLog(record.event_log, record.acpx_record_id);
-  const lastRequestId = normalizeOptionalString(record.last_request_id);
-  if (lastRequestId === null) {
+
+  // Upstream metadata helper: validates last_request_id and parses imported_from
+  // (session export/import feature). Subsumes the fork's standalone lastRequestId check.
+  const recordMetadata = parseSessionRecordMetadata(record);
+  if (!recordMetadata) {
     return null;
   }
 
@@ -632,7 +750,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     createdAt: record.created_at,
     lastUsedAt: record.last_used_at,
     lastSeq: record.last_seq,
-    lastRequestId,
+    lastRequestId: recordMetadata.lastRequestId,
     eventLog,
     closed,
     closedAt,
@@ -655,8 +773,9 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     request_token_usage: conversation.request_token_usage,
     acpx: parseAcpxState(record.acpx),
     kind,
-    parentSessionId: normalizeOptionalString(record.parent_session_id) ?? undefined,
+    parentSessionId: parentSessionId ?? undefined,
     subagents: parseSubagentRefs(record.subagents),
     metadata,
+    importedFrom: recordMetadata.importedFrom,
   };
 }

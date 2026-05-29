@@ -5,6 +5,7 @@ import type {
   RequestPermissionRequest,
   SessionNotification,
   SessionConfigOption,
+  SessionInfo,
   SetSessionConfigOptionResponse,
   StopReason,
   ToolKind,
@@ -242,6 +243,11 @@ export type SessionMessageImage = {
   } | null;
 };
 
+export type SessionMessageAudio = {
+  source: string;
+  mime_type: string;
+};
+
 export type SessionUserContent =
   | {
       Text: string;
@@ -254,6 +260,9 @@ export type SessionUserContent =
     }
   | {
       Image: SessionMessageImage;
+    }
+  | {
+      Audio: SessionMessageAudio;
     };
 
 export type SessionToolUse = {
@@ -358,6 +367,13 @@ export type SubagentRef = {
   claudeJsonlPath?: string;
 };
 
+export type SessionImportedFrom = {
+  recordId: string;
+  cwdOriginal: string;
+  exportedBy: string;
+  exportedAt: string;
+};
+
 export type SessionRecord = {
   schema: typeof SESSION_RECORD_SCHEMA;
   acpxRecordId: string;
@@ -394,6 +410,7 @@ export type SessionRecord = {
   parentSessionId?: string;
   subagents?: SubagentRef[];
   metadata?: Record<string, string>;
+  importedFrom?: SessionImportedFrom;
 };
 
 export type RunPromptResult = {
@@ -430,6 +447,17 @@ export type SessionSetModelResult = {
 export type SessionEnsureResult = {
   record: SessionRecord;
   created: boolean;
+};
+
+export type AgentSessionListResult = {
+  _meta?: {
+    [key: string]: unknown;
+  } | null;
+  source: "agent";
+  sessions: SessionInfo[];
+  cursor?: string;
+  cwd?: string;
+  nextCursor?: string | null;
 };
 
 export type SessionEnqueueResult = {

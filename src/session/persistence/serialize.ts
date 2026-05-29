@@ -54,5 +54,13 @@ export function serializeSessionRecordForDisk(record: SessionRecord): Record<str
     parent_session_id: canonical.parentSessionId,
     subagents: canonical.subagents?.map(serializeSubagentRef),
     metadata: canonical.metadata,
+    imported_from: canonical.importedFrom
+      ? {
+          record_id: canonical.importedFrom.recordId,
+          cwd_original: canonical.importedFrom.cwdOriginal,
+          exported_by: canonical.importedFrom.exportedBy,
+          exported_at: canonical.importedFrom.exportedAt,
+        }
+      : undefined,
   };
 }

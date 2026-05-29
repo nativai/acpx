@@ -20,6 +20,7 @@ Core capabilities:
 - Named parallel sessions (`-s/--session`)
 - Idempotent session creation (`sessions ensure`)
 - Session retention controls (`sessions prune` with age filters and history cleanup)
+- Portable session export/import for moving records and history across machines
 - Queue-aware prompt submission with optional fire-and-forget (`--no-wait`)
 - Cooperative cancel command (`cancel`) for in-flight turns
 - Graceful cancellation via ACP `session/cancel` on interrupt
@@ -58,7 +59,7 @@ acpx [global_options] cancel [-s <name>]
 acpx [global_options] set-mode <mode> [-s <name>]
 acpx [global_options] set <key> <value> [-s <name>]
 acpx [global_options] status [-s <name>]
-acpx [global_options] sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]]
+acpx [global_options] sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]]
 acpx [global_options] config [show | init]
 acpx [global_options] flow run <file> [--input-json '<json>' | --input-file <path>] [--default-agent <name>]
 
@@ -69,7 +70,7 @@ acpx [global_options] <agent> cancel [-s <name>]
 acpx [global_options] <agent> set-mode <mode> [-s <name>]
 acpx [global_options] <agent> set <key> <value> [-s <name>]
 acpx [global_options] <agent> status [-s <name>]
-acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]]
+acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]]
 ```
 
 If prompt text is omitted and stdin is piped, `acpx` reads prompt text from stdin.
@@ -80,7 +81,7 @@ Friendly agent names resolve to commands:
 
 - `pi` -> `npx pi-acp`
 - `openclaw` -> `openclaw acp`
-- `codex` -> `npx @zed-industries/codex-acp`
+- `codex` -> `npx -y @agentclientprotocol/codex-acp`
 - `claude` -> `npx -y @agentclientprotocol/claude-agent-acp` (ACPX-owned package range)
 - `gemini` -> `gemini --acp`
 - `cursor` -> `cursor-agent acp`
@@ -151,7 +152,7 @@ Behavior:
 ```bash
 acpx codex cancel
 acpx codex set-mode auto
-acpx codex set thought_level high
+acpx codex set model gpt-5.2[high]
 acpx codex set model gpt-5.4
 ```
 
@@ -161,7 +162,7 @@ Behavior:
 - `set-mode`: calls ACP `session/set_mode`.
 - `set-mode` mode ids are adapter-defined; unsupported values are rejected by the adapter (often `Invalid params`).
 - `set`: calls ACP `session/set_config_option`.
-- For codex, `thought_level` is accepted as a compatibility alias for codex-acp `reasoning_effort`.
+- For codex, reasoning effort is selected through advertised ACP model ids when the adapter reports model variants.
 - `--model <id>`: Claude-compatible adapters may consume session creation metadata; other agents must advertise ACP models and support `session/set_model`, otherwise `acpx` fails clearly instead of silently falling back.
 - `set model <id>`: calls `session/set_model`. This is the generic ACP method for mid-session model switching.
 - `set-mode`/`set` route through queue-owner IPC when active, otherwise reconnect directly.
@@ -171,6 +172,9 @@ Behavior:
 ```bash
 acpx sessions
 acpx sessions list
+acpx sessions list --filter-cwd .
+acpx sessions list --cursor <cursor>
+acpx sessions list --local
 acpx sessions new
 acpx sessions new --name backend
 acpx sessions ensure
@@ -179,6 +183,8 @@ acpx sessions close
 acpx sessions close backend
 acpx sessions show
 acpx sessions history --limit 20
+acpx sessions export backend --output backend-session.json
+acpx sessions import backend-session.json --name backend-restored
 acpx sessions prune --dry-run --older-than 7
 acpx sessions prune --older-than 30 --include-history
 acpx status
@@ -189,6 +195,8 @@ acpx codex sessions ensure --name backend
 acpx codex sessions close backend
 acpx codex sessions show backend
 acpx codex sessions history backend --limit 20
+acpx codex sessions export backend --output backend-session.json
+acpx codex sessions import backend-session.json --name backend-restored
 acpx codex sessions prune --before 2026-04-01 --include-history
 acpx codex status
 ```
@@ -196,6 +204,11 @@ acpx codex status
 Behavior:
 
 - `sessions` and `sessions list` are equivalent
+- `sessions list` uses ACP `session/list` when the agent advertises it; JSON
+  includes agent `SessionInfo`, `_meta`, and `nextCursor`
+- `sessions list --filter-cwd <dir>` applies the ACP cwd filter, and
+  `--cursor <cursor>` requests a specific page
+- `sessions list --local` reads saved acpx records instead
 - `new` creates a fresh session for the current `(agentCommand, cwd, optional name)` scope
 - `new --name <name>` targets a named session scope
 - when `new` replaces an existing open session in that scope, the old one is soft-closed
@@ -204,6 +217,10 @@ Behavior:
 - `close <name>` targets current cwd named session
 - `show [name]` prints stored metadata for that scoped session
 - `history [name]` prints stored turn history previews (default 20, use `--limit`)
+- `export [name] --output <path>` writes a portable JSON archive containing session state and event history
+- `import <archive>` creates a fresh local record, reopens the copied session as idle, keeps the provider session id, and clears source-machine process metadata
+- imported sessions must resume that provider session; if the destination agent cannot load it, prompts fail clearly instead of starting an empty conversation
+- `import --name <name>` and `--cwd <dir>` override the destination scope; import fails if that scope already has an active session or another local record already uses the same provider session id
 - `prune` deletes closed session records to reclaim disk space
   - `--dry-run` previews what would be deleted without touching disk
   - `--older-than <days>` and `--before <date>` filter by close time, falling back to last-used time when a record was never explicitly closed

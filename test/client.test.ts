@@ -16,6 +16,7 @@ import {
   AuthPolicyError,
   PermissionDeniedError,
   PermissionPromptUnavailableError,
+  UnsupportedPromptContentError,
 } from "../src/errors.js";
 
 type ClientInternals = {
@@ -107,8 +108,14 @@ type ClientInternals = {
   promptPermissionFailures: Map<string, PermissionPromptUnavailableError>;
   initResult?: {
     agentCapabilities?: {
+      promptCapabilities?: {
+        image?: boolean;
+        audio?: boolean;
+        embeddedContext?: boolean;
+      };
       sessionCapabilities?: {
         close?: Record<string, never>;
+        list?: Record<string, never>;
       };
     };
   };
@@ -741,7 +748,7 @@ test("AcpClient createSession forwards systemPrompt append in _meta alongside cl
 test("AcpClient createSession forwards codex model metadata without setting it explicitly", async () => {
   const cwd = path.resolve("/tmp/acpx-client-codex-model");
   const client = makeClient({
-    agentCommand: "npx @zed-industries/codex-acp",
+    agentCommand: "npx -y @agentclientprotocol/codex-acp",
     sessionOptions: {
       model: "GPT-5-2",
     },
@@ -826,6 +833,55 @@ test("AcpClient closes sessions through session/close and clears the loaded sess
   assert.equal(internals.loadedSessionId, undefined);
 });
 
+test("AcpClient lists agent sessions through session/list", async () => {
+  const client = makeClient();
+  const internals = asInternals(client);
+  let capturedListSessionsParams:
+    | {
+        cwd?: string | null;
+        cursor?: string | null;
+      }
+    | undefined;
+  internals.initResult = {
+    agentCapabilities: {
+      sessionCapabilities: {
+        list: {},
+      },
+    },
+  };
+  internals.connection = {
+    listSessions: async (params: { cwd?: string | null; cursor?: string | null }) => {
+      capturedListSessionsParams = params;
+      return {
+        sessions: [
+          {
+            sessionId: "agent-session-1",
+            cwd: "/tmp/acpx-client-list",
+            title: "Agent session",
+            updatedAt: "2026-05-21T00:00:00.000Z",
+            _meta: { messageCount: 3 },
+          },
+        ],
+        nextCursor: "cursor-2",
+      };
+    },
+  };
+
+  assert.equal(client.supportsListSessions(), true);
+  const result = await client.listSessions({
+    cwd: "/tmp/acpx-client-list",
+    cursor: "cursor-1",
+  });
+
+  assert.deepEqual(capturedListSessionsParams, {
+    cwd: "/tmp/acpx-client-list",
+    cursor: "cursor-1",
+  });
+  assert.equal(result.nextCursor, "cursor-2");
+  assert.equal(result.sessions[0]?.sessionId, "agent-session-1");
+  assert.deepEqual(result.sessions[0]?._meta, { messageCount: 3 });
+});
+
 test("AcpClient session update handling drains queued callbacks and swallows handler failures", async () => {
   const notifications: string[] = [];
   const client = makeClient({
@@ -888,6 +944,61 @@ test("AcpClient lifecycle snapshot and cancel helpers reflect active prompt stat
 
   const cancelled = await client.cancelActivePrompt(50);
   assert.deepEqual(cancelled, { stopReason: "cancelled" });
+});
+
+test("AcpClient rejects rich prompt content not advertised by promptCapabilities", async () => {
+  const client = makeClient();
+  const internals = asInternals(client);
+  let promptCalled = false;
+  internals.initResult = {
+    agentCapabilities: {
+      promptCapabilities: {
+        image: true,
+      },
+    },
+  };
+  internals.connection = {
+    prompt: async () => {
+      promptCalled = true;
+      return { stopReason: "end_turn" };
+    },
+  };
+
+  await assert.rejects(
+    async () =>
+      await client.prompt("session-audio", [
+        { type: "audio", mimeType: "audio/wav", data: "UklGRg==" },
+      ]),
+    (error: unknown) =>
+      error instanceof UnsupportedPromptContentError &&
+      error.message.includes("promptCapabilities.audio"),
+  );
+  assert.equal(promptCalled, false);
+});
+
+test("AcpClient sends audio prompts when the agent advertises audio support", async () => {
+  const client = makeClient();
+  const internals = asInternals(client);
+  let capturedPrompt: unknown;
+  internals.initResult = {
+    agentCapabilities: {
+      promptCapabilities: {
+        audio: true,
+      },
+    },
+  };
+  internals.connection = {
+    prompt: async (params: { prompt: unknown }) => {
+      capturedPrompt = params.prompt;
+      return { stopReason: "end_turn" };
+    },
+  };
+
+  await client.prompt("session-audio", [
+    { type: "audio", mimeType: "audio/wav", data: "UklGRg==" },
+  ]);
+
+  assert.deepEqual(capturedPrompt, [{ type: "audio", mimeType: "audio/wav", data: "UklGRg==" }]);
 });
 
 test("AcpClient prompt rejects when the agent disconnects mid-prompt", async () => {

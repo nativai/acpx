@@ -29,10 +29,11 @@ One command surface for Pi, OpenClaw ACP, Codex, Claude, and other ACP-compatibl
 - **Fire-and-forget**: `--no-wait` queues a prompt and returns immediately
 - **Graceful cancel**: `Ctrl+C` sends ACP `session/cancel` before force-kill fallback
 - **Session controls**: `set-mode` and `set <key> <value>` for `session/set_mode` and `session/set_config_option`
-- **Crash reconnect**: dead agent processes are detected and sessions are reloaded automatically
+- **Crash reconnect**: dead agent processes are detected and sessions are resumed or reloaded automatically
 - **Prompt from file/stdin**: `--file <path>` or piped stdin for prompt content
 - **Config files**: global + project JSON config with `acpx config show|init`
 - **Session inspect/history**: `sessions show` and `sessions history --limit <n>`
+- **Session export/import**: move portable session archives between machines
 - **Local status checks**: `status` reports running/idle/dead/no-session, pid, uptime, last prompt
 - **Client methods**: stable `fs/*` and `terminal/*` handlers with permission controls and cwd sandboxing
 - **Auth handshake**: stable `authenticate` support via env/config credentials
@@ -146,7 +147,7 @@ acpx codex --file - "extra context"            # explicit stdin + appended args
 acpx codex --no-wait 'draft test migration plan' # enqueue without waiting if session is busy
 acpx codex cancel                               # cooperative cancel of in-flight prompt
 acpx codex set-mode auto                        # session/set_mode (adapter-defined mode id)
-acpx codex set thought_level high               # codex compatibility alias -> reasoning_effort
+acpx codex set model 'gpt-5.2[high]'            # session/set_model with adapter-advertised id
 acpx exec 'summarize this repo'                # default agent shortcut (codex)
 acpx codex exec 'what does this repo do?'      # one-shot, no saved session
 
@@ -344,7 +345,7 @@ Built-ins:
 | ---------- | --------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
 | `pi`       | [pi-acp](https://github.com/svkozak/pi-acp)                                 | [Pi Coding Agent](https://github.com/mariozechner/pi)                                                           |
 | `openclaw` | native (`openclaw acp`)                                                     | [OpenClaw ACP bridge](https://github.com/openclaw/openclaw)                                                     |
-| `codex`    | [codex-acp](https://github.com/zed-industries/codex-acp)                    | [Codex CLI](https://codex.openai.com)                                                                           |
+| `codex`    | [codex-acp](https://github.com/agentclientprotocol/codex-acp)               | [Codex CLI](https://codex.openai.com)                                                                           |
 | `claude`   | [claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp) | [Claude Code](https://claude.ai/code)                                                                           |
 | `gemini`   | native (`gemini --acp`)                                                     | [Gemini CLI](https://github.com/google/gemini-cli)                                                              |
 | `cursor`   | native (`cursor-agent acp`)                                                 | [Cursor CLI](https://cursor.com/docs/cli/acp)                                                                   |
@@ -391,6 +392,9 @@ spawns the ACP bridge directly without `pnpm` wrapper noise:
 - `sessions new [--name <name>]` creates a fresh session for that scope and soft-closes the prior one.
 - `sessions ensure [--name <name>]` is idempotent: it returns an existing scoped session or creates one when missing.
 - `sessions close [name]` soft-closes the session: queue owner/processes are terminated, record is kept with `closed: true`.
+- `sessions list` uses agent-side ACP `session/list` when available; use
+  `--cursor`, `--filter-cwd`, or `--local` for pagination, cwd filtering, or
+  saved-record inspection.
 - Auto-resume for cwd scope skips sessions marked closed.
 - Prompt submissions are queue-aware per session. If a prompt is already running, new prompts are queued and drained by the running `acpx` process.
 - Queue owners use an idle TTL (default 300s). `--ttl <seconds>` overrides it; `--ttl 0` keeps owners alive indefinitely.
@@ -402,7 +406,7 @@ spawns the ACP bridge directly without `pnpm` wrapper noise:
 - Session metadata is stored under `~/.acpx/sessions/`.
 - Each successful prompt appends lightweight turn history previews (`role`, `timestamp`, `textPreview`) to session metadata.
 - `Ctrl+C` during a running turn sends ACP `session/cancel` and waits briefly for `stopReason=cancelled` before force-killing if needed.
-- If a saved session pid is dead on the next prompt, `acpx` respawns the agent, attempts `session/load`, and transparently falls back to `session/new` if loading fails.
+- If a saved session pid is dead on the next prompt, `acpx` respawns the agent, attempts `session/resume` when advertised or `session/load` otherwise, and transparently falls back to `session/new` if reconnecting fails.
 
 ## Full CLI reference
 

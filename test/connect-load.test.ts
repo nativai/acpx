@@ -27,6 +27,11 @@ type FakeClient = {
     };
   };
   supportsLoadSession: () => boolean;
+  supportsResumeSession?: () => boolean;
+  resumeSession?: (
+    sessionId: string,
+    cwd: string,
+  ) => Promise<{ agentSessionId?: string; models?: SessionModelState }>;
   loadSessionWithOptions: (
     sessionId: string,
     cwd: string,
@@ -69,6 +74,58 @@ function buildModelsState(currentModelId: string): SessionModelState {
   };
 }
 
+test("connectAndLoadSession prefers session/resume for resume-capable sessions", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "resume-record",
+      acpSessionId: "resume-session",
+      agentCommand: "agent",
+      cwd,
+    });
+
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({
+        running: true,
+      }),
+      supportsLoadSession: () => false,
+      supportsResumeSession: () => true,
+      resumeSession: async (sessionId, resumeCwd) => {
+        assert.equal(sessionId, "resume-session");
+        assert.equal(resumeCwd, cwd);
+        return { agentSessionId: "runtime-session" };
+      },
+      loadSessionWithOptions: async () => {
+        throw new Error("loadSessionWithOptions should not be called");
+      },
+      createSession: async () => {
+        throw new Error("createSession should not be called");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+    };
+
+    const result = await connectAndLoadSession({
+      client: client as never,
+      record,
+      timeoutMs: 1_000,
+      activeController: ACTIVE_CONTROLLER,
+    });
+
+    assert.deepEqual(result, {
+      sessionId: "resume-session",
+      agentSessionId: "runtime-session",
+      resumed: true,
+      loadError: undefined,
+    });
+    assert.equal(record.agentSessionId, "runtime-session");
+  });
+});
+
 test("connectAndLoadSession resumes an existing load-capable session", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -95,6 +152,7 @@ test("connectAndLoadSession resumes an existing load-capable session", async () 
         running: true,
       }),
       supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
       loadSessionWithOptions: async (sessionId, loadCwd, options) => {
         assert.equal(sessionId, "resume-session");
         assert.equal(loadCwd, cwd);
@@ -161,6 +219,7 @@ test("connectAndLoadSession falls back to createSession when load returns resour
         running: true,
       }),
       supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
       loadSessionWithOptions: async () => {
         throw {
           error: {
@@ -215,6 +274,7 @@ test("connectAndLoadSession fails instead of creating a fresh session when resum
         running: true,
       }),
       supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
       loadSessionWithOptions: async () => {
         throw {
           error: {
@@ -246,6 +306,62 @@ test("connectAndLoadSession fails instead of creating a fresh session when resum
   });
 });
 
+test("connectAndLoadSession requires the same provider session for imported records", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "imported-record",
+      acpSessionId: "imported-provider-session",
+      agentCommand: "agent",
+      cwd,
+      importedFrom: {
+        recordId: "source-record",
+        cwdOriginal: "/source/workspace",
+        exportedBy: "source-user",
+        exportedAt: "2026-01-01T00:00:00.000Z",
+      },
+    });
+
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({
+        running: true,
+      }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
+      loadSessionWithOptions: async () => {
+        throw {
+          error: {
+            code: -32002,
+            message: "session not found",
+          },
+        };
+      },
+      createSession: async () => {
+        throw new Error("createSession should not be called");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+    };
+
+    await assert.rejects(
+      async () =>
+        await connectAndLoadSession({
+          client: client as never,
+          record,
+          timeoutMs: 1_000,
+          activeController: ACTIVE_CONTROLLER,
+        }),
+      /Persistent ACP session imported-provider-session could not be resumed: .*session not found/i,
+    );
+
+    assert.equal(record.acpSessionId, "imported-provider-session");
+  });
+});
+
 test("connectAndLoadSession falls back to createSession for empty sessions on adapter internal errors", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -266,6 +382,7 @@ test("connectAndLoadSession falls back to createSession for empty sessions on ad
         running: true,
       }),
       supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
       loadSessionWithOptions: async () => {
         throw {
           error: {
@@ -295,7 +412,7 @@ test("connectAndLoadSession falls back to createSession for empty sessions on ad
   });
 });
 
-test("connectAndLoadSession fails clearly when same-session resume is required but session/load is unsupported", async () => {
+test("connectAndLoadSession fails clearly when same-session resume is required but session reuse is unsupported", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
@@ -314,6 +431,7 @@ test("connectAndLoadSession fails clearly when same-session resume is required b
         running: true,
       }),
       supportsLoadSession: () => false,
+      supportsResumeSession: () => false,
       loadSessionWithOptions: async () => {
         throw new Error("loadSession should not be called");
       },
@@ -333,7 +451,7 @@ test("connectAndLoadSession fails clearly when same-session resume is required b
           timeoutMs: 1_000,
           activeController: ACTIVE_CONTROLLER,
         }),
-      /Persistent ACP session unsupported-load-session could not be resumed: agent does not support session\/load/i,
+      /Persistent ACP session unsupported-load-session could not be resumed: agent does not support session\/resume or session\/load/i,
     );
   });
 });
@@ -365,6 +483,7 @@ test("connectAndLoadSession falls back to session/new on -32602 Invalid params",
         running: true,
       }),
       supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
       loadSessionWithOptions: async () => {
         throw {
           error: {
@@ -420,6 +539,7 @@ test("connectAndLoadSession falls back to session/new on -32601 Method not found
         running: true,
       }),
       supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
       loadSessionWithOptions: async () => {
         throw {
           error: {
@@ -475,6 +595,7 @@ test("connectAndLoadSession rethrows load failures that should not create a new 
         running: true,
       }),
       supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
       loadSessionWithOptions: async () => {
         throw {
           error: {
@@ -533,6 +654,7 @@ test("connectAndLoadSession fails when desired mode replay cannot be restored on
         running: true,
       }),
       supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
       loadSessionWithOptions: async () => {
         throw {
           error: {
@@ -598,6 +720,7 @@ test("connectAndLoadSession replays desired model on a fresh session", async () 
         running: true,
       }),
       supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
       loadSessionWithOptions: async () => {
         throw {
           error: {
@@ -658,6 +781,7 @@ test("connectAndLoadSession fails clearly when saved model cannot be replayed ge
         running: true,
       }),
       supportsLoadSession: () => false,
+      supportsResumeSession: () => false,
       loadSessionWithOptions: async () => {
         throw new Error("loadSessionWithOptions should not be called");
       },
@@ -715,6 +839,7 @@ test("connectAndLoadSession restores the original session when desired model rep
         running: true,
       }),
       supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
       loadSessionWithOptions: async () => {
         throw {
           error: {
@@ -783,6 +908,7 @@ test("connectAndLoadSession replays desired config options on a fresh session", 
         running: true,
       }),
       supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
       loadSessionWithOptions: async () => {
         throw {
           error: {
@@ -846,6 +972,7 @@ test("connectAndLoadSession restores the original session when desired config re
         running: true,
       }),
       supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
       loadSessionWithOptions: async () => {
         throw {
           error: {
@@ -917,6 +1044,7 @@ test("connectAndLoadSession reuses an already loaded client session", async () =
         running: true,
       }),
       supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
       loadSessionWithOptions: async () => {
         loaded = true;
         return {};

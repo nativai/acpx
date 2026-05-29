@@ -28,7 +28,7 @@ acpx [global_options] cancel [-s <name>]
 acpx [global_options] set-mode <mode> [-s <name>]
 acpx [global_options] set <key> <value> [-s <name>]
 acpx [global_options] status [-s <name>]
-acpx [global_options] sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>]]
+acpx [global_options] sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>]]
 acpx [global_options] config [show | init]
 
 acpx [global_options] <agent> [prompt_options] [prompt_text...]
@@ -38,7 +38,7 @@ acpx [global_options] <agent> cancel [-s <name>]
 acpx [global_options] <agent> set-mode <mode> [-s <name>]
 acpx [global_options] <agent> set <key> <value> [-s <name>]
 acpx [global_options] <agent> status [-s <name>]
-acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>]]
+acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>]]
 ```
 
 `<agent>` can be:
@@ -187,7 +187,7 @@ acpx [global_options] codex exec [prompt_text...]
 acpx [global_options] codex sessions [list | new [--name <name>] | ensure [--name <name>] | close [name]]
 ```
 
-Built-in command mapping: `codex -> npx @zed-industries/codex-acp`
+Built-in command mapping: `codex -> npx -y @agentclientprotocol/codex-acp`
 
 ### `claude`
 
@@ -299,6 +299,7 @@ Behavior:
 ```bash
 acpx [global_options] <agent> sessions
 acpx [global_options] <agent> sessions list
+acpx [global_options] <agent> sessions list [--cursor <cursor>] [--filter-cwd <dir>] [--local]
 acpx [global_options] <agent> sessions new
 acpx [global_options] <agent> sessions new --name <name>
 acpx [global_options] <agent> sessions ensure
@@ -309,6 +310,8 @@ acpx [global_options] <agent> sessions show
 acpx [global_options] <agent> sessions show <name>
 acpx [global_options] <agent> sessions history
 acpx [global_options] <agent> sessions history <name> [--limit <count>]
+acpx [global_options] <agent> sessions export [name] --output <path> [--cwd <dir>]
+acpx [global_options] <agent> sessions import <archive> [--name <name>] [--cwd <dir>]
 acpx [global_options] <agent> sessions prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]
 
 acpx [global_options] sessions ...   # defaults to codex
@@ -317,7 +320,17 @@ acpx [global_options] sessions ...   # defaults to codex
 Behavior:
 
 - `sessions` and `sessions list` are equivalent
-- list returns all saved sessions for selected `agentCommand` (across all cwd values)
+- list uses ACP `session/list` when the agent advertises
+  `sessionCapabilities.list`, returning agent-native `SessionInfo` metadata and
+  `nextCursor` in JSON output
+- `sessions list --cursor <cursor>` fetches an agent-side page from an ACP
+  cursor returned by a prior list response
+- `sessions list --filter-cwd <dir>` sends the ACP cwd filter; relative values
+  resolve against global `--cwd`
+- `sessions list --local` reads saved acpx records for selected `agentCommand`
+  instead of contacting the agent
+- when the agent does not support `session/list`, list falls back to local saved
+  records unless agent-side list filters were requested
 - `sessions new` creates a fresh cwd-scoped default session
 - `sessions new --name <name>` creates a fresh named session for cwd
 - creating a fresh session soft-closes the previous open session in that scope (if present)
@@ -329,6 +342,10 @@ Behavior:
 - `sessions close <name>` soft-closes current cwd named session
 - `sessions show [name]` displays stored session metadata
 - `sessions history [name]` displays stored turn history previews (default 20, configurable with `--limit`)
+- `sessions export [name] --output <path>` writes a portable JSON archive with session state and event history; `--cwd <dir>` selects a different source cwd relative to global `--cwd`
+- `sessions import <archive>` writes a fresh local record from a portable archive, reopens it as idle, keeps the provider session id, and clears source-machine process metadata
+- Imported sessions must resume that provider session; if the destination agent cannot load it, prompts fail clearly instead of starting an empty conversation
+- `sessions import --name <name>` and `--cwd <dir>` override the imported destination scope; import fails instead of creating a duplicate when an active session already exists for that `(agent, cwd, name)` scope or when another local record already uses the same provider session id
 - `sessions prune --dry-run` previews closed sessions that can be deleted
 - `sessions prune` deletes closed session records for the selected agent; add `--include-history` to delete event stream files too
 - `sessions prune --before <date>` and `--older-than <days>` filter by close time, falling back to last-used time for older records
@@ -346,7 +363,7 @@ acpx [global_options] status -s <name>
 Shows local process status for the cwd-scoped session:
 
 - `running`, `idle`, `dead`, or `no-session`
-- session id, agent command, pid
+- session id, agent command, live queue-owner pid when available
 - uptime when running
 - last prompt timestamp
 - last known exit code/signal when dead
@@ -355,7 +372,8 @@ Shows local process status for the cwd-scoped session:
 currently running. The next prompt starts a queue owner and reconnects the
 session.
 
-Status checks are local and PID-based (`kill(pid, 0)` semantics).
+Status checks are local and PID-based (`kill(pid, 0)` semantics). Cached session
+PIDs are not reported unless a live queue-owner lease ties them to the session.
 
 ## `config` command
 
@@ -438,7 +456,7 @@ For prompt commands:
 Use `sessions new [--name <name>]` when you explicitly want a fresh scoped session.
 Use `sessions ensure [--name <name>]` when you want idempotent "get-or-create" behavior.
 
-If a saved session PID is dead, `acpx` respawns the agent, tries `session/load`, and transparently falls back to `session/new` when loading fails.
+If a saved session PID is dead, `acpx` respawns the agent, tries `session/resume` when advertised or `session/load` otherwise, and transparently falls back to `session/new` when reconnecting fails.
 
 ### Prompt queueing
 
@@ -506,7 +524,7 @@ Hard rule for the ACP stream:
 When `--format json` is used:
 
 - commands that talk to an ACP adapter emit raw ACP JSON-RPC messages.
-- local query commands (`sessions list/show/history/prune`) emit local JSON documents (not ACP stream traffic).
+- local query commands (`sessions list/show/history/export/import/prune`) emit local JSON documents (not ACP stream traffic).
 
 ### Sessions/query command output behavior
 
@@ -517,6 +535,12 @@ When `--format json` is used:
 - `sessions show` with `json`: full session record object
 - `sessions history` with `text`: tab-separated `timestamp role textPreview` entries
 - `sessions history` with `json`: object containing `entries` array
+- `sessions export` with `text`: output path summary
+- `sessions export` with `json`: object containing `action` and `output`
+- `sessions export` with `quiet`: output path
+- `sessions import` with `text`: imported record id and cwd summary
+- `sessions import` with `json`: object containing `action`, `record_id`, and `cwd`
+- `sessions import` with `quiet`: imported record id
 - `sessions prune` with `text`: summary plus pruned ids and close/last-used time
 - `sessions prune` with `json`: object containing `action`, `dryRun`, `count`, `bytesFreed`, and `pruned`
 - `sessions prune` with `quiet`: one pruned session id per line

@@ -12,8 +12,41 @@ Repo: https://github.com/openclaw/acpx
 
 ### Fixes
 
+## 2026.5.23 (v0.10.0)
+
+### Changes
+
+- CLI/sessions: add `sessions export` and `sessions import` for moving portable session archives between machines. Thanks @mvanhorn.
+
+### Breaking
+
+### Fixes
+
+## 2026.5.22 (v0.9.0)
+
+### Changes
+
+- Tooling: add Slophammer TypeScript quality gates for coverage, complexity,
+  unsafe types, mutation testing, DRY checks, and dependency boundaries.
+- Agents/built-ins: switch the default Codex adapter to `@agentclientprotocol/codex-acp`, with Codex model selection handled through advertised ACP model ids, and bump the default Claude ACP adapter range.
+- Tooling: add a repo-local autoreview skill and helper for Codex-first
+  closeout review with acpx checks in parallel.
+
+### Breaking
+
+### Fixes
+
 - CLI: treat `--version` after `--` as prompt text instead of intercepting it as a top-level version request.
+- CLI: keep custom raw agent commands routed correctly when global flags such as `--system-prompt`, `--append-system-prompt`, `--prompt-retries`, or `--no-terminal` appear before the agent name. Thanks @amknight.
 - CLI/API: avoid installing CLI-only process handlers when the package entrypoint is imported as a module.
+- CLI/sessions: use agent-side ACP `session/list` when available, including
+  cursor pagination, cwd filtering, and agent-native session metadata. Thanks
+  @amknight.
+- Sessions/reconnect: use ACP `session/resume` when adapters advertise it, so resume-only agents can reuse saved sessions without requiring `session/load`. Thanks @amknight.
+- CLI/ACP: validate rich prompt blocks against advertised ACP
+  `promptCapabilities` and support audio prompt content end-to-end. Thanks
+  @amknight.
+- CLI/status: hide stale cached session PIDs when no live helper process exists. Thanks @dutifulbob.
 
 ## 2026.5.15 (v0.8.0)
 
