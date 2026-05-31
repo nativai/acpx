@@ -39,6 +39,10 @@ export type GlobalFlags = PermissionFlags & {
   terminal?: boolean;
   timeout?: number;
   ttl: number;
+  // The idle TTL the caller EXPLICITLY requested (--ttl or --keep-warm), in ms;
+  // undefined for a plain prompt. Used to override an already-running owner's TTL
+  // (keep-warm-while-engaged) without disturbing it on ordinary prompts.
+  ttlExplicitMs?: number;
   verbose?: boolean;
   format: OutputFormat;
   model?: string;
@@ -324,6 +328,10 @@ export function addGlobalFlags(command: Command): Command {
       "Queue owner idle TTL before shutdown (0 = keep alive forever) (default: 300)",
       parseTtlSeconds,
     )
+    .option(
+      "--keep-warm",
+      "Keep the session's queue owner warm while engaged: use the keep-warm idle TTL (config keepWarmTtl, default 1800s) and also extend an already-running owner. Ignored when --ttl is given. (For favorited/pinned sessions pass --ttl 0.)",
+    )
     .option("--verbose", "Enable verbose debug logs");
 }
 
@@ -412,7 +420,17 @@ export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig)
     suppressReads: opts.suppressReads === true,
     terminal: opts.terminal === false ? false : undefined,
     timeout: opts.timeout ?? config.timeoutMs,
-    ttl: opts.ttl ?? config.ttlMs ?? DEFAULT_QUEUE_OWNER_TTL_MS,
+    // Explicit --ttl wins; else --keep-warm selects the keep-warm TTL; else the
+    // ordinary default. ttlExplicitMs stays undefined for a plain prompt so it
+    // never overrides a live owner's TTL. Explicit --ttl 0 (favorited) is kept
+    // because 0 is not nullish.
+    ttl:
+      opts.ttl ??
+      (opts.keepWarm === true ? config.keepWarmTtlMs : undefined) ??
+      config.ttlMs ??
+      DEFAULT_QUEUE_OWNER_TTL_MS,
+    ttlExplicitMs:
+      opts.ttl != null ? opts.ttl : opts.keepWarm === true ? config.keepWarmTtlMs : undefined,
     verbose,
     format,
     model: typeof opts.model === "string" ? parseNonEmptyValue("Model", opts.model) : undefined,

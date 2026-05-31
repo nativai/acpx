@@ -43,6 +43,54 @@ export async function startKeeperProcess(): Promise<ReturnType<typeof spawn>> {
   return keeper;
 }
 
+// A keeper spawned `detached: true`, i.e. its own process-group leader
+// (pgid === pid) — matching how the real queue owner is spawned
+// (queue-owner-process.ts). Lets tests exercise the process-group kill path.
+export async function startDetachedKeeperProcess(): Promise<ReturnType<typeof spawn>> {
+  const keeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], {
+    stdio: "ignore",
+    detached: true,
+  });
+  await once(keeper, "spawn");
+  return keeper;
+}
+
+// A detached group-leader "owner" that itself spawns a non-detached "grandchild"
+// in the same process group, mirroring owner -> ACP adapter -> SDK child. The
+// grandchild's pid is written to `pidFile` so a test can assert the process-group
+// kill reaps it (risk R2: a native-blocked grandchild must not be orphaned).
+export async function startDetachedOwnerWithChild(
+  pidFile: string,
+): Promise<{ owner: ReturnType<typeof spawn>; childPid: number }> {
+  const script =
+    "const{spawn}=require('node:child_process');const fs=require('node:fs');" +
+    "const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});" +
+    "fs.writeFileSync(process.argv[1],String(c.pid));setInterval(()=>{},1000);";
+  const owner = spawn(process.execPath, ["-e", script, pidFile], {
+    stdio: "ignore",
+    detached: true,
+  });
+  await once(owner, "spawn");
+
+  let childPid = 0;
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    try {
+      const raw = (await fs.readFile(pidFile, "utf8")).trim();
+      if (raw) {
+        const parsed = Number(raw);
+        if (Number.isInteger(parsed) && parsed > 0) {
+          childPid = parsed;
+          break;
+        }
+      }
+    } catch {
+      // pid file not written yet
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return { owner, childPid };
+}
+
 export function stopProcess(child: ReturnType<typeof spawn>): void {
   if (child.pid && child.exitCode == null && child.signalCode == null) {
     child.kill("SIGKILL");
