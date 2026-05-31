@@ -17,6 +17,7 @@ import {
   findSession,
   findSessionByDirectoryWalk,
   resolveSessionRecord,
+  writeSessionRecord,
 } from "../session/persistence.js";
 import { EXIT_CODES } from "../types.js";
 import type {
@@ -49,6 +50,7 @@ import {
 import { emitJsonResult } from "./output/json-output.js";
 import type { SessionListResult } from "./session/contracts.js";
 import { withInheritedTaskFolder } from "./session/inherited-metadata.js";
+import { mergeSessionMetadata, validateSessionMetadataValue } from "./session/session-metadata.js";
 
 class NoSessionError extends Error {
   constructor(message: string) {
@@ -742,6 +744,63 @@ export async function handleSetConfigOption(
   }
 
   printSetConfigOptionResultByFormat(configId, value, result, globalFlags.format);
+}
+
+function printSetMetadataResultByFormat(
+  key: string,
+  value: string,
+  record: SessionRecord,
+  format: OutputFormat,
+): void {
+  if (
+    emitJsonResult(format, {
+      action: "metadata_set",
+      key,
+      value,
+      acpxRecordId: record.acpxRecordId,
+      acpxSessionId: record.acpSessionId,
+    })
+  ) {
+    return;
+  }
+  process.stdout.write(format === "quiet" ? `${value}\n` : `metadata set: ${key}=${value}\n`);
+}
+
+async function warnIfTaskFolderMissing(folder: string): Promise<void> {
+  try {
+    await fs.access(folder);
+  } catch {
+    process.stderr.write(`[acpx] warning: task_folder does not exist yet: ${folder}\n`);
+  }
+}
+
+// Self-apply: let a running session set/update its OWN session-record metadata
+// (e.g. task_folder) without an ACP round-trip. Pure record edit: resolve the
+// cwd-scoped session, merge the key into a freshly-read record, and persist it.
+// acpx-ui reflects the link on its next read; $ACPX_TASK_FOLDER reaches the agent
+// on its NEXT prompt/exec turn (a live process's env cannot be mutated in place).
+export async function handleSessionsSetMetadata(
+  explicitAgentName: string | undefined,
+  key: string,
+  value: string,
+  flags: StatusFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const trimmedValue = validateSessionMetadataValue(key, value);
+  const record = await findRoutedSessionOrThrow(
+    agent.agentCommand,
+    agent.agentName,
+    agent.cwd,
+    resolveSessionNameFromFlags(flags, command),
+  );
+  if (key === "task_folder") {
+    await warnIfTaskFolderMissing(trimmedValue);
+  }
+  await writeSessionRecord(mergeSessionMetadata(record, key, trimmedValue));
+  printSetMetadataResultByFormat(key, trimmedValue, record, globalFlags.format);
 }
 
 async function tryListAgentSessions(

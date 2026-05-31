@@ -14,6 +14,7 @@ import {
   handleSessionsOwnerStatus,
   handleSessionsPrune,
   handleSessionsRecover,
+  handleSessionsSetMetadata,
   handleSessionsShow,
   handleSetConfigOption,
   handleSetMode,
@@ -196,6 +197,25 @@ export function registerSessionsCommand(
     .action(async function (this: Command, name?: string) {
       await handleSessionsShow(explicitAgentName, name, this, config);
     });
+
+  const setMetadataCommand = sessionsCommand
+    .command("set-metadata")
+    .description(
+      "Set/update a metadata entry on this cwd's session in place (e.g. task_folder) — no agent connection. task_folder must be absolute; $ACPX_TASK_FOLDER reaches the agent on its next prompt/exec turn, not the in-flight one",
+    )
+    .argument("<key>", "Metadata key", (value: string) => parseNonEmptyValue("Metadata key", value))
+    .argument("<value>", "Metadata value", (value: string) =>
+      parseNonEmptyValue("Metadata value", value),
+    );
+  addSessionNameOption(setMetadataCommand);
+  setMetadataCommand.action(async function (
+    this: Command,
+    key: string,
+    value: string,
+    flags: StatusFlags,
+  ) {
+    await handleSessionsSetMetadata(explicitAgentName, key, value, flags, this, config);
+  });
 
   sessionsCommand
     .command("history")
