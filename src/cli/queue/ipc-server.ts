@@ -89,6 +89,10 @@ export type QueueTask = {
   promptRetries?: number;
   sessionOptions?: NonNullable<AcpClientOptions["sessionOptions"]>;
   waitForCompletion: boolean;
+  // Keep-warm idle-TTL override (ms; 0 = keep alive forever) carried from the
+  // submit request; the owner runtime adopts it as its new idle TTL. Absent =>
+  // leave the owner's TTL unchanged.
+  ttlMs?: number;
   enqueuedAt: number;
   send: (message: QueueOwnerMessage) => void;
   close: () => void;
@@ -493,6 +497,7 @@ export class SessionQueueOwner {
       promptRetries: request.promptRetries,
       sessionOptions: request.sessionOptions,
       waitForCompletion: request.waitForCompletion,
+      ttlMs: request.ttlMs,
       enqueuedAt: Date.now(),
       send: (message) => {
         writeQueueMessage(socket, {

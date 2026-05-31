@@ -99,6 +99,11 @@ export type SessionSendOptions = {
   verbose?: boolean;
   waitForCompletion?: boolean;
   ttlMs?: number;
+  // Keep-warm-while-engaged: idle-TTL override (ms; 0 = forever) applied to an
+  // ALREADY-RUNNING owner when this send is an explicit keep-warm opt-in
+  // (--keep-warm / explicit --ttl). Distinct from `ttlMs`, which only sizes a
+  // freshly cold-spawned owner. Absent => never disturb a live owner's TTL.
+  keepWarmTtlMs?: number;
   maxQueueDepth?: number;
   client?: AcpClient;
   promptRetries?: number;

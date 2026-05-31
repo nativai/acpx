@@ -20,6 +20,9 @@ import type {
 } from "../../types.js";
 import {
   isProcessAlive,
+  type QueueOwnerRecoveryResult,
+  readQueueOwnerLiveness,
+  recoverQueueOwnerForSession,
   terminateProcess,
   terminateQueueOwnerForSession,
   tryCancelOnRunningOwner,
@@ -215,4 +218,50 @@ export async function closeSession(sessionId: string): Promise<SessionRecord> {
   await writeSessionRecordWithLifecycle(record);
 
   return record;
+}
+
+export type SessionOwnerStatus = {
+  /** Resolved acpx record id (the id the queue lease is keyed by). */
+  sessionId: string;
+  ownerFound: boolean;
+  pid: number | null;
+  alive: boolean;
+  stale: boolean;
+  heartbeatAt: string | null;
+};
+
+// Read-only owner-liveness probe for a session. Resolves the caller-supplied id
+// (acpx record id, ACP session id, or unique suffix — same as `prompt -s`) to its
+// record, then reads the queue lease keyed by `record.acpxRecordId`. Never reaps.
+export async function readSessionOwnerStatus(sessionId: string): Promise<SessionOwnerStatus> {
+  const record = await resolveSessionRecord(sessionId);
+  const liveness = await readQueueOwnerLiveness(record.acpxRecordId);
+  if (!liveness) {
+    return {
+      sessionId: record.acpxRecordId,
+      ownerFound: false,
+      pid: null,
+      alive: false,
+      stale: false,
+      heartbeatAt: null,
+    };
+  }
+  return {
+    sessionId: record.acpxRecordId,
+    ownerFound: true,
+    pid: liveness.pid,
+    alive: liveness.alive,
+    stale: liveness.stale,
+    heartbeatAt: liveness.heartbeatAt,
+  };
+}
+
+// Force-restart (un-wedge) a session's queue owner. Resolves the caller-supplied
+// id the same way `prompt -s`/close do, then force-kills the owner process GROUP
+// keyed by `record.acpxRecordId` and clears its lease. Idempotent: a session with
+// no live owner succeeds. The next prompt cold-spawns a fresh owner. Redelivery of
+// the in-flight prompt is the caller's job (acpx-ui), not this command's.
+export async function recoverSession(sessionId: string): Promise<QueueOwnerRecoveryResult> {
+  const record = await resolveSessionRecord(sessionId);
+  return await recoverQueueOwnerForSession(record.acpxRecordId);
 }

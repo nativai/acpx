@@ -42,13 +42,19 @@ export { QUEUE_CONNECT_RETRY_MS } from "./ipc-transport.js";
 export const MAX_MESSAGE_BUFFER_SIZE = 10 * 1024 * 1024;
 export {
   isProcessAlive,
+  readQueueOwnerLiveness,
+  recoverQueueOwnerForSession,
   releaseQueueOwnerLease,
   terminateProcess,
   terminateQueueOwnerForSession,
   tryAcquireQueueOwnerLease,
   waitMs,
 } from "./lease-store.js";
-export type { QueueOwnerLease } from "./lease-store.js";
+export type {
+  QueueOwnerLease,
+  QueueOwnerLiveness,
+  QueueOwnerRecoveryResult,
+} from "./lease-store.js";
 
 const STALE_OWNER_PROTOCOL_DETAIL_CODES = new Set([
   "QUEUE_PROTOCOL_MALFORMED_MESSAGE",
@@ -313,6 +319,9 @@ export type SubmitToQueueOwnerOptions = {
   waitForCompletion: boolean;
   verbose?: boolean;
   sessionOptions?: NonNullable<AcpClientOptions["sessionOptions"]>;
+  // Keep-warm idle-TTL override (ms; 0 = forever) for the running owner. Absent
+  // => do not change the owner's TTL.
+  ttlMs?: number;
 };
 
 function missingQueueAckError(): QueueConnectionError {
@@ -395,6 +404,7 @@ async function submitToQueueOwner(
     promptRetries: options.promptRetries ?? 0,
     waitForCompletion: options.waitForCompletion,
     sessionOptions: options.sessionOptions,
+    ...(options.ttlMs !== undefined ? { ttlMs: options.ttlMs } : {}),
   };
 
   options.outputFormatter.setContext({

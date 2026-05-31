@@ -3434,6 +3434,185 @@ test("integration: prompt --no-wait is processed by the detached queue owner", a
   });
 });
 
+test("integration: sessions recover force-kills the queue owner, is idempotent, and the next prompt cold-respawns", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      // 1. Create a session and spawn a real detached queue owner via a queued
+      //    prompt with a long TTL so the owner stays alive while we recover it.
+      const created = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+      const sessionId = (JSON.parse(created.stdout.trim()) as { acpxRecordId?: string })
+        .acpxRecordId;
+      assert.equal(typeof sessionId, "string");
+
+      const queued = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--format",
+          "json",
+          "--ttl",
+          "60",
+          "prompt",
+          "--no-wait",
+          "echo warm-owner",
+        ],
+        homeDir,
+      );
+      assert.equal(queued.code, 0, queued.stderr);
+
+      // 2. Wait for the owner lease and read the (live) owner pid.
+      const { lockPath } = queuePaths(homeDir, sessionId as string);
+      const ownerPid = await waitFor(async () => {
+        try {
+          const pid = (JSON.parse(await fs.readFile(lockPath, "utf8")) as { pid?: number }).pid;
+          return typeof pid === "number" && isPidAlive(pid) ? pid : null;
+        } catch {
+          return null;
+        }
+      }, 10_000);
+
+      // 3. owner-status reports the live owner (read-only JSON probe).
+      const statusBefore = await runCli(
+        [...baseAgentArgs(cwd), "sessions", "owner-status", sessionId as string],
+        homeDir,
+      );
+      assert.equal(statusBefore.code, 0, statusBefore.stderr);
+      const before = JSON.parse(statusBefore.stdout.trim()) as {
+        ownerFound?: boolean;
+        alive?: boolean;
+        pid?: number;
+      };
+      assert.equal(before.ownerFound, true);
+      assert.equal(before.alive, true);
+      assert.equal(before.pid, ownerPid);
+
+      // 4. recover kills the owner pid, exits 0, and reports the kill.
+      const recovered = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "recover", sessionId as string],
+        homeDir,
+      );
+      assert.equal(recovered.code, 0, recovered.stderr);
+      const recoverResult = JSON.parse(recovered.stdout.trim()) as {
+        killed?: boolean;
+        alive?: boolean;
+      };
+      assert.equal(recoverResult.killed, true);
+      assert.equal(recoverResult.alive, false);
+      assert.equal(
+        await waitForPidExit(ownerPid, 10_000),
+        true,
+        "owner pid must be dead after recover",
+      );
+
+      // 5. owner-status now reports no owner.
+      const statusAfter = await runCli(
+        [...baseAgentArgs(cwd), "sessions", "owner-status", sessionId as string],
+        homeDir,
+      );
+      const after = JSON.parse(statusAfter.stdout.trim()) as {
+        ownerFound?: boolean;
+        alive?: boolean;
+      };
+      assert.equal(after.ownerFound, false);
+      assert.equal(after.alive, false);
+
+      // 6. recover again is idempotent: nothing to kill -> still exit 0.
+      const again = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "recover", sessionId as string],
+        homeDir,
+      );
+      assert.equal(again.code, 0, again.stderr);
+      const againResult = JSON.parse(again.stdout.trim()) as {
+        ownerFound?: boolean;
+        alive?: boolean;
+      };
+      assert.equal(againResult.ownerFound, false);
+      assert.equal(againResult.alive, false);
+
+      // 7. A subsequent prompt cold-respawns a fresh owner and runs the turn.
+      const reprompt = await runCli(
+        [...baseAgentArgs(cwd), "--format", "quiet", "--ttl", "5", "prompt", "echo respawned"],
+        homeDir,
+      );
+      assert.equal(reprompt.code, 0, reprompt.stderr);
+      assert.match(reprompt.stdout, /respawned/);
+    } finally {
+      await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "close"], homeDir).catch(
+        () => {},
+      );
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: --keep-warm/--ttl on a prompt extends an already-running owner's idle TTL", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const created = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+      const sessionId = (JSON.parse(created.stdout.trim()) as { acpxRecordId?: string })
+        .acpxRecordId;
+      assert.equal(typeof sessionId, "string");
+
+      // 1. Spawn an owner with a SHORT idle TTL (2s). Without keep-warm it would
+      //    idle-die ~2s after the last prompt.
+      const first = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "--ttl", "2", "prompt", "--no-wait", "echo a"],
+        homeDir,
+      );
+      assert.equal(first.code, 0, first.stderr);
+
+      const { lockPath } = queuePaths(homeDir, sessionId as string);
+      const ownerPid = await waitFor(async () => {
+        try {
+          const pid = (JSON.parse(await fs.readFile(lockPath, "utf8")) as { pid?: number }).pid;
+          return typeof pid === "number" && isPidAlive(pid) ? pid : null;
+        } catch {
+          return null;
+        }
+      }, 10_000);
+
+      // 2. Send a keep-warm prompt with a long idle TTL (30s) to the SAME live
+      //    owner. The override must extend the running owner's idle TTL.
+      const second = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "--ttl", "30", "prompt", "--no-wait", "echo b"],
+        homeDir,
+      );
+      assert.equal(second.code, 0, second.stderr);
+      const ownerPidAfter = (JSON.parse(await fs.readFile(lockPath, "utf8")) as { pid?: number })
+        .pid;
+      assert.equal(
+        ownerPidAfter,
+        ownerPid,
+        "expected the same owner to handle the keep-warm prompt",
+      );
+
+      // 3. Wait well past the original 2s TTL but far short of the 30s override.
+      await sleep(5_000);
+
+      // The owner must still be alive: the keep-warm override extended its TTL.
+      assert.equal(isPidAlive(ownerPid), true, "owner idle-died despite keep-warm TTL extension");
+    } finally {
+      // `sessions close` terminates the (still-warm) queue owner so the test
+      // does not leak the process.
+      await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "close"], homeDir).catch(
+        () => {},
+      );
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: sessions history shows in-flight prompt after prompt starts", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));

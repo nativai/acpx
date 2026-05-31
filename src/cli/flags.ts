@@ -39,6 +39,10 @@ export type GlobalFlags = PermissionFlags & {
   terminal?: boolean;
   timeout?: number;
   ttl: number;
+  // The idle TTL the caller EXPLICITLY requested (--ttl or --keep-warm), in ms;
+  // undefined for a plain prompt. Used to override an already-running owner's TTL
+  // (keep-warm-while-engaged) without disturbing it on ordinary prompts.
+  ttlExplicitMs?: number;
   verbose?: boolean;
   format: OutputFormat;
   model?: string;
@@ -358,6 +362,10 @@ export function addGlobalFlags(command: Command): Command {
       "Queue owner idle TTL before shutdown (0 = keep alive forever) (default: 300)",
       parseTtlSeconds,
     )
+    .option(
+      "--keep-warm",
+      "Keep the session's queue owner warm while engaged: use the keep-warm idle TTL (config keepWarmTtl, default 1800s) and also extend an already-running owner. Ignored when --ttl is given. (For favorited/pinned sessions pass --ttl 0.)",
+    )
     .option("--verbose", "Enable verbose debug logs");
 }
 
@@ -431,7 +439,8 @@ export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig)
     suppressReads: opts.suppressReads === true,
     terminal: resolveTerminalOption(opts.terminal),
     timeout: resolveTimeoutOption(opts.timeout, config),
-    ttl: resolveTtlOption(opts.ttl, config),
+    ttl: resolveTtlOption(opts, config),
+    ttlExplicitMs: resolveExplicitTtlMs(opts, config),
     verbose,
     format,
     model: resolveModelOption(opts.model),
@@ -483,8 +492,21 @@ function resolveTimeoutOption(value: unknown, config: ResolvedAcpxConfig): numbe
   return numberOption(value) ?? config.timeoutMs;
 }
 
-function resolveTtlOption(value: unknown, config: ResolvedAcpxConfig): number {
-  return numberOption(value) ?? config.ttlMs ?? DEFAULT_QUEUE_OWNER_TTL_MS;
+// The idle TTL the caller explicitly requested (ms), or undefined for a plain
+// prompt. Explicit --ttl wins (incl. --ttl 0 for favorited, since 0 is not
+// nullish); else --keep-warm selects the configured keep-warm TTL.
+function resolveExplicitTtlMs(
+  opts: { ttl?: unknown; keepWarm?: unknown },
+  config: ResolvedAcpxConfig,
+): number | undefined {
+  return numberOption(opts.ttl) ?? (opts.keepWarm === true ? config.keepWarmTtlMs : undefined);
+}
+
+function resolveTtlOption(
+  opts: { ttl?: unknown; keepWarm?: unknown },
+  config: ResolvedAcpxConfig,
+): number {
+  return resolveExplicitTtlMs(opts, config) ?? config.ttlMs ?? DEFAULT_QUEUE_OWNER_TTL_MS;
 }
 
 function assertOutputFlagCompatibility(

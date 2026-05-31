@@ -37,6 +37,30 @@ export type QueueOwnerStatus = {
   stale: boolean;
 };
 
+/** Read-only owner liveness snapshot — never mutates/reaps the lease. */
+export type QueueOwnerLiveness = {
+  pid: number;
+  alive: boolean;
+  stale: boolean;
+  heartbeatAt: string;
+};
+
+/** Outcome of a force-restart (recover) of a session's queue owner. */
+export type QueueOwnerRecoveryResult = {
+  /** The session id whose lease was targeted (acpx record id). */
+  sessionId: string;
+  /** A lease/owner record existed when recovery started. */
+  ownerFound: boolean;
+  /** The owner pid from the lease, if any. */
+  pid: number | undefined;
+  /** The owner pid was alive when recovery started. */
+  wasAlive: boolean;
+  /** A live owner was found and is now confirmed gone. */
+  killed: boolean;
+  /** The owner pid is STILL alive after recovery — true means the kill failed. */
+  alive: boolean;
+};
+
 function parseQueueOwnerRecord(raw: unknown): QueueOwnerRecord | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return null;
@@ -198,6 +222,32 @@ export async function terminateProcess(pid: number): Promise<boolean> {
   return true;
 }
 
+// True when the process GROUP led by `pid` still has at least one live member.
+// The queue owner is spawned `detached: true` (queue-owner-process.ts), so it is
+// a process-group leader and its pgid equals its pid. Mirrors the liveness probe
+// in acp/terminal-manager.ts.
+function hasLiveProcessGroup(pid: number): boolean {
+  if (process.platform === "win32" || !Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Best-effort signal to the whole process group led by `pid` (negative pid).
+// Swallows errors: the group may already be gone (ESRCH) or unkillable (EPERM).
+function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    // best-effort: process group cleanup races with members exiting on their own
+  }
+}
+
 export async function ensureOwnerIsUsable(
   sessionId: string,
   owner: QueueOwnerRecord,
@@ -350,6 +400,83 @@ export async function terminateQueueOwnerForSession(sessionId: string): Promise<
   }
 
   await cleanupStaleQueueOwner(sessionId, owner);
+}
+
+// Read-only owner liveness — unlike readQueueOwnerStatus(), this never calls
+// ensureOwnerIsUsable() and therefore never terminates or removes a stale lease.
+// Safe for the acpx-ui server to poll for the `ownerAlive` status input.
+export async function readQueueOwnerLiveness(
+  sessionId: string,
+): Promise<QueueOwnerLiveness | undefined> {
+  const owner = await readQueueOwnerRecord(sessionId);
+  if (!owner) {
+    return undefined;
+  }
+
+  return {
+    pid: owner.pid,
+    alive: isProcessAlive(owner.pid),
+    stale: isQueueOwnerHeartbeatStale(owner),
+    heartbeatAt: owner.heartbeatAt,
+  };
+}
+
+// Force-restart primitive (the un-wedge): kill the session's queue-owner process
+// GROUP and clear its lease so the next submit_prompt cold-spawns a fresh owner.
+//
+// Goes beyond terminateQueueOwnerForSession() (single-pid SIGTERM->SIGKILL) by
+// also SIGKILL-ing the owner's process group. The owner spawns the ACP adapter,
+// which runs the agent SDK child; a natively-blocked grandchild can survive a
+// single-pid kill but stays in the owner's process group, so the group sweep
+// guarantees it is reaped rather than orphaned (risk R2). Mirrors the
+// process-group kill pattern in acp/terminal-manager.ts.
+//
+// Idempotent: a missing lease (nothing to kill) is success. The result reports
+// `alive: true` only when the owner pid genuinely survived the kill.
+export async function recoverQueueOwnerForSession(
+  sessionId: string,
+): Promise<QueueOwnerRecoveryResult> {
+  const owner = await readQueueOwnerRecord(sessionId);
+  if (!owner) {
+    // Idempotent: no lease means there is no owner to kill. "Already gone" is success.
+    return {
+      sessionId,
+      ownerFound: false,
+      pid: undefined,
+      wasAlive: false,
+      killed: false,
+      alive: false,
+    };
+  }
+
+  const pid = owner.pid;
+  const wasAlive = isProcessAlive(pid);
+
+  if (wasAlive) {
+    // SIGTERM -> grace -> SIGKILL on the owner (the group leader). Reuses the
+    // audited single-pid primitive; the owner shuts the adapter down on exit.
+    await terminateProcess(pid);
+  }
+
+  // Process-group sweep (R2): reap any group member (e.g. a native-blocked SDK
+  // grandchild) that outlived the leader. The group still exists as long as any
+  // member is alive, even once the leader pid is gone.
+  if (hasLiveProcessGroup(pid)) {
+    signalProcessGroup(pid, "SIGKILL");
+    await waitForProcessExit(pid, PROCESS_EXIT_GRACE_MS);
+  }
+
+  await cleanupStaleQueueOwner(sessionId, owner);
+
+  const alive = isProcessAlive(pid);
+  return {
+    sessionId,
+    ownerFound: true,
+    pid,
+    wasAlive,
+    killed: wasAlive && !alive,
+    alive,
+  };
 }
 
 export async function waitMs(ms: number): Promise<void> {

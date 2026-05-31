@@ -42,6 +42,55 @@ test("parseQueueRequest rejects invalid nonInteractivePermissions value", () => 
   assert.equal(parsed, null);
 });
 
+test("parseQueueRequest round-trips a keep-warm ttlMs override (incl. 0 = forever)", () => {
+  const extended = parseQueueRequest({
+    type: "submit_prompt",
+    requestId: "req-ttl",
+    message: "hello",
+    permissionMode: "approve-reads",
+    waitForCompletion: true,
+    ttlMs: 1_800_000,
+  });
+  assert(extended);
+  assert.equal((extended as { ttlMs?: number }).ttlMs, 1_800_000);
+
+  const forever = parseQueueRequest({
+    type: "submit_prompt",
+    requestId: "req-ttl0",
+    message: "hello",
+    permissionMode: "approve-reads",
+    waitForCompletion: true,
+    ttlMs: 0,
+  });
+  assert(forever);
+  assert.equal((forever as { ttlMs?: number }).ttlMs, 0);
+
+  // Absent ttlMs must NOT appear on the parsed request (so a plain prompt never
+  // disturbs a running owner's TTL).
+  const none = parseQueueRequest({
+    type: "submit_prompt",
+    requestId: "req-no-ttl",
+    message: "hello",
+    permissionMode: "approve-reads",
+    waitForCompletion: true,
+  });
+  assert(none);
+  assert.equal("ttlMs" in (none as object), false);
+});
+
+test("parseQueueRequest rejects a negative ttlMs", () => {
+  const parsed = parseQueueRequest({
+    type: "submit_prompt",
+    requestId: "req-ttl-neg",
+    message: "hello",
+    permissionMode: "approve-reads",
+    waitForCompletion: true,
+    ttlMs: -5,
+  });
+
+  assert.equal(parsed, null);
+});
+
 test("parseQueueRequest rejects invalid promptRetries value", () => {
   const parsed = parseQueueRequest({
     type: "submit_prompt",

@@ -22,6 +22,7 @@ type ConfigFileShape = {
   nonInteractivePermissions?: unknown;
   authPolicy?: unknown;
   ttl?: unknown;
+  keepWarmTtl?: unknown;
   timeout?: unknown;
   queueMaxDepth?: unknown;
   format?: unknown;
@@ -37,6 +38,7 @@ export type ResolvedAcpxConfig = {
   nonInteractivePermissions: NonInteractivePermissionPolicy;
   authPolicy: AuthPolicy;
   ttlMs: number;
+  keepWarmTtlMs: number;
   timeoutMs?: number;
   queueMaxDepth: number;
   format: OutputFormat;
@@ -57,6 +59,11 @@ type ConfigFileLoadResult = {
 
 const DEFAULT_TIMEOUT_MS = undefined;
 const DEFAULT_TTL_MS = 300_000;
+// Keep-warm idle TTL for a session engaged from the UI (matches the conception's
+// KEEPWARM_WINDOW_MS = 30 min). Only applied when a prompt opts in via
+// --keep-warm; the default owner TTL (DEFAULT_TTL_MS) is intentionally unchanged
+// so abandoned sessions still reap.
+const DEFAULT_KEEPWARM_TTL_MS = 1_800_000;
 const DEFAULT_PERMISSION_MODE: PermissionMode = "approve-reads";
 const DEFAULT_NON_INTERACTIVE_PERMISSION_POLICY: NonInteractivePermissionPolicy = "deny";
 const DEFAULT_AUTH_POLICY: AuthPolicy = "skip";
@@ -358,6 +365,7 @@ function resolveScalarConfigValues(
   | "nonInteractivePermissions"
   | "authPolicy"
   | "ttlMs"
+  | "keepWarmTtlMs"
   | "timeoutMs"
   | "queueMaxDepth"
   | "format"
@@ -378,6 +386,7 @@ function resolveScalarConfigValues(
     ),
     authPolicy: resolveAuthPolicy(projectConfig, projectPath, globalConfig, globalPath),
     ttlMs: resolveTtlMs(projectConfig, projectPath, globalConfig, globalPath),
+    keepWarmTtlMs: resolveKeepWarmTtlMs(projectConfig, projectPath, globalConfig, globalPath),
     timeoutMs: resolveTimeoutMs(projectConfig, projectPath, globalConfig, globalPath),
     queueMaxDepth: resolveQueueMaxDepth(projectConfig, projectPath, globalConfig, globalPath),
     format: resolveFormat(projectConfig, projectPath, globalConfig, globalPath),
@@ -446,6 +455,19 @@ function resolveTtlMs(
     parseTtlMs(projectConfig?.ttl, projectPath) ??
     parseTtlMs(globalConfig?.ttl, globalPath) ??
     DEFAULT_TTL_MS
+  );
+}
+
+function resolveKeepWarmTtlMs(
+  projectConfig: ConfigFileShape | undefined,
+  projectPath: string,
+  globalConfig: ConfigFileShape | undefined,
+  globalPath: string,
+): number {
+  return (
+    parseTtlMs(projectConfig?.keepWarmTtl, projectPath) ??
+    parseTtlMs(globalConfig?.keepWarmTtl, globalPath) ??
+    DEFAULT_KEEPWARM_TTL_MS
   );
 }
 
@@ -528,6 +550,7 @@ export function toConfigDisplay(config: ResolvedAcpxConfig): {
   nonInteractivePermissions: NonInteractivePermissionPolicy;
   authPolicy: AuthPolicy;
   ttl: number;
+  keepWarmTtl: number;
   timeout: number | null;
   queueMaxDepth: number;
   format: OutputFormat;
@@ -546,6 +569,7 @@ export function toConfigDisplay(config: ResolvedAcpxConfig): {
     nonInteractivePermissions: config.nonInteractivePermissions,
     authPolicy: config.authPolicy,
     ttl: Math.round(config.ttlMs / 1_000),
+    keepWarmTtl: Math.round(config.keepWarmTtlMs / 1_000),
     timeout: config.timeoutMs == null ? null : config.timeoutMs / 1_000,
     queueMaxDepth: config.queueMaxDepth,
     format: config.format,

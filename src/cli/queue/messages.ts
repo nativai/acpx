@@ -38,6 +38,9 @@ export type QueueSubmitRequest = {
   promptRetries?: number;
   waitForCompletion: boolean;
   sessionOptions?: QueueSessionOptions;
+  // Keep-warm-while-engaged: when set, the running owner adopts this as its new
+  // idle TTL (ms; 0 = keep alive forever). Absent => leave the owner's TTL as-is.
+  ttlMs?: number;
 };
 
 export type QueueCancelRequest = {
@@ -448,6 +451,7 @@ function parseSubmitRequest(
     ...(parsed.promptRetries !== undefined ? { promptRetries: parsed.promptRetries } : {}),
     waitForCompletion: parsed.waitForCompletion,
     ...(parsed.sessionOptions !== undefined ? { sessionOptions: parsed.sessionOptions } : {}),
+    ...(parsed.ttlMs !== undefined ? { ttlMs: parsed.ttlMs } : {}),
   };
 }
 
@@ -463,6 +467,7 @@ type ParsedSubmitRequestFields = Pick<
   | "promptRetries"
   | "waitForCompletion"
   | "sessionOptions"
+  | "ttlMs"
 >;
 
 function parseSubmitRequestFields(
@@ -483,6 +488,7 @@ function parseSubmitRequestFields(
     waitForCompletion:
       typeof request.waitForCompletion === "boolean" ? request.waitForCompletion : null,
     sessionOptions: parseSessionOptions(request.sessionOptions),
+    ttlMs: parseNonNegativeInteger(request.ttlMs),
   };
   if (Object.values(parsed).some((value) => value === null)) {
     return null;

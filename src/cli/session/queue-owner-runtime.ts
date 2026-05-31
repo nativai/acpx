@@ -65,6 +65,7 @@ async function submitToRunningOwner(
     waitForCompletion,
     verbose: options.verbose,
     sessionOptions: options.sessionOptions,
+    ttlMs: options.keepWarmTtlMs,
   });
 }
 
@@ -227,7 +228,9 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   const sharedClient = createQueueOwnerSharedClient(options, sessionRecord);
   const ttlMs = normalizeQueueOwnerTtlMs(options.ttlMs);
   const maxQueueDepth = Math.max(1, Math.round(options.maxQueueDepth ?? 16));
-  const defaultTaskPollTimeoutMs: number | undefined = ttlMs === 0 ? undefined : ttlMs;
+  // Mutable: a keep-warm prompt (task.ttlMs) can extend/disable the idle TTL of
+  // this already-running owner (see the per-turn apply below).
+  let defaultTaskPollTimeoutMs: number | undefined = ttlMs === 0 ? undefined : ttlMs;
   let taskPollTimeoutMs: number | undefined = defaultTaskPollTimeoutMs;
   const initialTaskPollTimeoutMs =
     taskPollTimeoutMs == null ? undefined : Math.max(taskPollTimeoutMs, 1_000);
@@ -498,6 +501,23 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         break;
       }
       isFirstTask = false;
+
+      // Keep-warm-while-engaged: a prompt may carry an idle-TTL override (e.g.
+      // acpx-ui passing --keep-warm / --ttl for a session engaged from the UI).
+      // Adopt it as this owner's new idle TTL so the session you're actively
+      // using doesn't idle-die into a catastrophic cold resume. Reuses the same
+      // dynamic-TTL lever as the scheduled-wakeup hook below. Persisting it into
+      // defaultTaskPollTimeoutMs makes it stick across subsequent idle waits.
+      if (task.ttlMs != null) {
+        defaultTaskPollTimeoutMs = task.ttlMs === 0 ? undefined : task.ttlMs;
+        if (options.verbose) {
+          process.stderr.write(
+            `[acpx] keep-warm: idle TTL set to ${
+              defaultTaskPollTimeoutMs ?? "disabled"
+            } for session ${options.sessionId}\n`,
+          );
+        }
+      }
 
       // Reset the idle poll timeout each turn. A previous turn's scheduling
       // tool may have set taskPollTimeoutMs to undefined via the

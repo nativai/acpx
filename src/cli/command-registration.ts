@@ -11,7 +11,9 @@ import {
   handleSessionsImport,
   handleSessionsList,
   handleSessionsNew,
+  handleSessionsOwnerStatus,
   handleSessionsPrune,
+  handleSessionsRecover,
   handleSessionsShow,
   handleSetConfigOption,
   handleSetMode,
@@ -157,6 +159,34 @@ export function registerSessionsCommand(
     .argument("[name]", "Session name", parseSessionName)
     .action(async function (this: Command, name?: string) {
       await handleSessionsClose(explicitAgentName, name, this, config);
+    });
+
+  sessionsCommand
+    .command("recover")
+    .description(
+      "Force-restart a wedged session: SIGKILL its queue-owner process group and clear the lease so the next prompt cold-respawns a fresh owner. Idempotent (no owner = success).",
+    )
+    .argument(
+      "<id>",
+      "Session id (acpx record id, ACP session id, or unique suffix)",
+      (value: string) => parseNonEmptyValue("Session id", value),
+    )
+    .action(async function (this: Command, id: string) {
+      await handleSessionsRecover(explicitAgentName, id, this, config);
+    });
+
+  sessionsCommand
+    .command("owner-status")
+    .description(
+      "Print queue-owner liveness as JSON: {sessionId,ownerFound,pid,alive,stale,heartbeatAt}",
+    )
+    .argument(
+      "<id>",
+      "Session id (acpx record id, ACP session id, or unique suffix)",
+      (value: string) => parseNonEmptyValue("Session id", value),
+    )
+    .action(async function (this: Command, id: string) {
+      await handleSessionsOwnerStatus(id);
     });
 
   sessionsCommand

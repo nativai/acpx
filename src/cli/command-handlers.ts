@@ -199,9 +199,13 @@ async function resolvePermissionPolicyFromFlags(
 // Parse the UUID from an acpx-ui session URL (...?session=<uuid>).
 // Returns undefined for missing / malformed input or empty session value.
 function parseSessionIdFromUrl(url: string | undefined): string | undefined {
-  if (!url) {return undefined;}
+  if (!url) {
+    return undefined;
+  }
   const trimmed = url.trim();
-  if (!trimmed) {return undefined;}
+  if (!trimmed) {
+    return undefined;
+  }
   try {
     const parsed = new URL(trimmed);
     const sessionId = parsed.searchParams.get("session")?.trim();
@@ -402,6 +406,7 @@ export async function handlePrompt(
     suppressSdkConsoleErrors: outputPolicy.suppressSdkConsoleErrors,
     timeoutMs: globalFlags.timeout,
     ttlMs: globalFlags.ttl,
+    keepWarmTtlMs: globalFlags.ttlExplicitMs,
     maxQueueDepth: config.queueMaxDepth,
     promptRetries: globalFlags.promptRetries,
     verbose: globalFlags.verbose,
@@ -1193,6 +1198,50 @@ export async function handleSessionsPrune(
   });
 
   printPruneResultByFormat(result, globalFlags.format);
+}
+
+// Force-restart (un-wedge) a session's queue owner. Takes a session id (the same
+// id `prompt -s` accepts: acpx record id, ACP session id, or unique suffix). The
+// agent prefix is incidental — recovery is purely id-scoped. Exit 0 once the owner
+// pid is confirmed gone (including the idempotent "already gone" case); a non-zero
+// exit only when a live owner genuinely survived the kill.
+export async function handleSessionsRecover(
+  _explicitAgentName: string | undefined,
+  sessionId: string,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const { recoverSession } = await loadSessionModule();
+
+  const result = await recoverSession(sessionId);
+
+  if (!emitJsonResult(globalFlags.format, result)) {
+    const target = result.pid != null ? `owner pid ${result.pid}` : "owner";
+    const summary = !result.ownerFound
+      ? "no queue owner found (already gone)"
+      : result.killed
+        ? `killed ${target} and its process group`
+        : result.alive
+          ? `FAILED to kill ${target} (still alive)`
+          : `${target} already gone; cleared stale lease`;
+    process.stdout.write(`recover ${result.sessionId}: ${summary}\n`);
+  }
+
+  if (result.alive) {
+    throw new Error(
+      `Failed to recover session ${result.sessionId}: queue owner pid ${result.pid} is still alive after kill`,
+    );
+  }
+}
+
+// Read-only owner-liveness probe — emits {sessionId,ownerFound,pid,alive,stale,
+// heartbeatAt} as JSON so the acpx-ui server can read owner liveness without
+// replicating the lease-key hashing. Never mutates the lease.
+export async function handleSessionsOwnerStatus(sessionId: string): Promise<void> {
+  const { readSessionOwnerStatus } = await loadSessionModule();
+  const status = await readSessionOwnerStatus(sessionId);
+  process.stdout.write(`${JSON.stringify(status)}\n`);
 }
 
 export { parseHistoryLimit, NoSessionError, loadSessionModule };

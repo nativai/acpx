@@ -5,8 +5,10 @@ import test from "node:test";
 import {
   ensureOwnerIsUsable,
   isProcessAlive,
+  readQueueOwnerLiveness,
   readQueueOwnerRecord,
   readQueueOwnerStatus,
+  recoverQueueOwnerForSession,
   refreshQueueOwnerLease,
   releaseQueueOwnerLease,
   terminateProcess,
@@ -16,11 +18,23 @@ import {
 import { queueBaseDir, queueLockFilePath, queueSocketBaseDir } from "../src/cli/queue/paths.js";
 import {
   queuePaths,
+  startDetachedKeeperProcess,
+  startDetachedOwnerWithChild,
   startKeeperProcess,
   stopProcess,
   withTempHome,
   writeQueueOwnerLock,
 } from "./queue-test-helpers.js";
+
+async function waitUntilDead(pid: number, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    if (!isProcessAlive(pid)) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
 
 test("readQueueOwnerRecord returns undefined for missing and malformed lock files", async () => {
   await withTempHome(async (homeDir) => {
@@ -191,6 +205,136 @@ test("ensureOwnerIsUsable cleans up stale live owners", async () => {
       assert.equal(await readQueueOwnerRecord(sessionId), undefined);
     } finally {
       stopProcess(keeper);
+    }
+  });
+});
+
+test("recoverQueueOwnerForSession succeeds idempotently when no owner lease exists", async () => {
+  await withTempHome(async () => {
+    const result = await recoverQueueOwnerForSession("no-such-owner");
+    assert.equal(result.ownerFound, false);
+    assert.equal(result.wasAlive, false);
+    assert.equal(result.killed, false);
+    assert.equal(result.alive, false);
+    assert.equal(result.pid, undefined);
+  });
+});
+
+test("recoverQueueOwnerForSession clears a stale lease for an already-dead owner", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "recover-stale-dead";
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({ lockPath, pid: 999_999, sessionId, socketPath });
+
+    const result = await recoverQueueOwnerForSession(sessionId);
+    assert.equal(result.ownerFound, true);
+    assert.equal(result.wasAlive, false);
+    assert.equal(result.killed, false);
+    assert.equal(result.alive, false);
+    // "Already gone" is success — the stale lease is cleared so the next prompt
+    // can cold-spawn a fresh owner.
+    assert.equal(await readQueueOwnerRecord(sessionId), undefined);
+  });
+});
+
+test("recoverQueueOwnerForSession kills a live owner and clears the lease", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "recover-live-owner";
+    const keeper = await startDetachedKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+
+    try {
+      assert.equal(isProcessAlive(keeper.pid), true);
+      await writeQueueOwnerLock({ lockPath, pid: keeper.pid, sessionId, socketPath });
+
+      const result = await recoverQueueOwnerForSession(sessionId);
+      assert.equal(result.ownerFound, true);
+      assert.equal(result.pid, keeper.pid);
+      assert.equal(result.wasAlive, true);
+      assert.equal(result.killed, true);
+      assert.equal(result.alive, false);
+      assert.equal(isProcessAlive(keeper.pid), false);
+      assert.equal(await readQueueOwnerRecord(sessionId), undefined);
+    } finally {
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("recoverQueueOwnerForSession kills the owner's whole process group (reaps grandchild, R2)", async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+
+  await withTempHome(async (homeDir) => {
+    const sessionId = "recover-process-group";
+    const pidFile = path.join(homeDir, "grandchild.pid");
+    const { owner, childPid } = await startDetachedOwnerWithChild(pidFile);
+    const ownerPid = owner.pid;
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+
+    try {
+      assert(ownerPid && Number.isInteger(ownerPid));
+      assert(childPid && Number.isInteger(childPid));
+      assert.equal(isProcessAlive(ownerPid), true);
+      assert.equal(isProcessAlive(childPid), true);
+
+      await writeQueueOwnerLock({ lockPath, pid: ownerPid, sessionId, socketPath });
+
+      const result = await recoverQueueOwnerForSession(sessionId);
+      assert.equal(result.killed, true);
+      assert.equal(result.alive, false);
+      assert.equal(isProcessAlive(ownerPid), false);
+
+      // The grandchild (e.g. a native-blocked SDK child) shares the owner's
+      // process group, so the group SIGKILL must reap it rather than orphan it.
+      await waitUntilDead(childPid);
+      assert.equal(isProcessAlive(childPid), false);
+    } finally {
+      stopProcess(owner);
+      if (childPid) {
+        try {
+          process.kill(childPid, "SIGKILL");
+        } catch {
+          // already gone
+        }
+      }
+    }
+  });
+});
+
+test("readQueueOwnerLiveness reports liveness read-only and never reaps the lease", async () => {
+  await withTempHome(async (homeDir) => {
+    assert.equal(await readQueueOwnerLiveness("no-lease"), undefined);
+
+    const sessionId = "liveness-stale-live";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+
+    try {
+      // Live pid but a stale heartbeat: readQueueOwnerStatus would terminate +
+      // remove this owner; readQueueOwnerLiveness must only report it.
+      await writeQueueOwnerLock({
+        lockPath,
+        pid: keeper.pid,
+        sessionId,
+        socketPath,
+        heartbeatAt: "2000-01-01T00:00:00.000Z",
+      });
+
+      const liveness = await readQueueOwnerLiveness(sessionId);
+      assert(liveness);
+      assert.equal(liveness.pid, keeper.pid);
+      assert.equal(liveness.alive, true);
+      assert.equal(liveness.stale, true);
+      assert.equal(liveness.heartbeatAt, "2000-01-01T00:00:00.000Z");
+
+      // The lease is still on disk (no reaping side effect) and the owner is alive.
+      assert.notEqual(await readQueueOwnerRecord(sessionId), undefined);
+      assert.equal(isProcessAlive(keeper.pid), true);
+    } finally {
+      stopProcess(keeper);
+      await fs.rm(lockPath, { force: true });
     }
   });
 });
