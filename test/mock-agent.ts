@@ -65,6 +65,7 @@ type MockAgentOptions = {
   replayLoadSessionUpdates: boolean;
   loadReplayText: string;
   ignoreSigterm: boolean;
+  envDumpFile?: string;
 };
 
 type SessionState = {
@@ -368,6 +369,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let loadReplayText = "replayed load session update";
   let ignoreSigterm = false;
   let hangOnNewSession = false;
+  let envDumpFile: string | undefined;
 
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
@@ -477,6 +479,12 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    if (token === "--env-dump-file") {
+      envDumpFile = parseOptionValue(argv, index + 1, token);
+      index += 1;
+      continue;
+    }
+
     if (token === "--claude-agent-acp") {
       continue;
     }
@@ -537,6 +545,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     replayLoadSessionUpdates,
     loadReplayText,
     ignoreSigterm,
+    envDumpFile,
   };
 }
 
@@ -1340,6 +1349,20 @@ const output = Writable.toWeb(process.stdout);
 const input = Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>;
 const stream = ndJsonStream(output, input);
 const mockAgentOptions = parseMockAgentOptions(process.argv.slice(2));
+
+if (mockAgentOptions.envDumpFile) {
+  // Capture the ACPX_* env the adapter was spawned with, so an E2E can assert
+  // what acpx injected (ACPX_TASK_FOLDER, ACPX_AGENT_FOLDER, …).
+  const acpxEnv: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (key.startsWith("ACPX_") && typeof value === "string") {
+      acpxEnv[key] = value;
+    }
+  }
+  writeFileSync(mockAgentOptions.envDumpFile, JSON.stringify(acpxEnv, null, 2), {
+    encoding: "utf8",
+  });
+}
 
 if (mockAgentOptions.ignoreSigterm) {
   process.on("SIGTERM", () => {
