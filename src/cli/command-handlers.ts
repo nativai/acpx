@@ -48,6 +48,7 @@ import {
 } from "./flags.js";
 import { emitJsonResult } from "./output/json-output.js";
 import type { SessionListResult } from "./session/contracts.js";
+import { withInheritedTaskFolder } from "./session/inherited-metadata.js";
 
 class NoSessionError extends Error {
   constructor(message: string) {
@@ -233,16 +234,18 @@ function resolveParentSessionIdFromFlagOrEnv(flags: SessionsNewFlags): string | 
   return undefined;
 }
 
+type ResolvedParentSession = { acpxRecordId: string; taskFolder?: string };
+
 async function resolveAndValidateParentSessionId(
   flags: SessionsNewFlags,
-): Promise<string | undefined> {
+): Promise<ResolvedParentSession | undefined> {
   const candidate = resolveParentSessionIdFromFlagOrEnv(flags);
   if (!candidate) {
     return undefined;
   }
   try {
     const parent = await resolveSessionRecord(candidate);
-    return parent.acpxRecordId;
+    return { acpxRecordId: parent.acpxRecordId, taskFolder: parent.metadata?.task_folder };
   } catch (error) {
     if (error instanceof SessionNotFoundError) {
       const label = flags.parentSessionUrl ? "--parent-session-url" : "--parent-id";
@@ -260,6 +263,7 @@ function buildSessionStartOptions(params: {
   permissionMode: ReturnType<typeof resolvePermissionMode>;
   permissionPolicy?: PermissionPolicy;
   parentSessionId?: string;
+  parentTaskFolder?: string;
 }): Parameters<SessionModule["createSession"]>[0] {
   return {
     agentCommand: params.agent.agentCommand,
@@ -267,7 +271,7 @@ function buildSessionStartOptions(params: {
     name: params.flags.name,
     resumeSessionId: params.flags.resumeSession,
     parentSessionId: params.parentSessionId,
-    metadata: params.flags.metadata,
+    metadata: withInheritedTaskFolder(params.flags.metadata, params.parentTaskFolder),
     mcpServers: params.config.mcpServers,
     permissionMode: params.permissionMode,
     nonInteractivePermissions: params.globalFlags.nonInteractivePermissions,
@@ -845,7 +849,7 @@ export async function handleSessionsNew(
   const globalFlags = resolveGlobalFlags(command, config);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
-  const parentSessionId = await resolveAndValidateParentSessionId(flags);
+  const parent = await resolveAndValidateParentSessionId(flags);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const [{ createSession, closeSession }, { printCreatedSessionBanner, printNewSessionByFormat }] =
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
@@ -871,7 +875,8 @@ export async function handleSessionsNew(
       config,
       permissionMode,
       permissionPolicy,
-      parentSessionId,
+      parentSessionId: parent?.acpxRecordId,
+      parentTaskFolder: parent?.taskFolder,
     }),
   );
 
@@ -894,7 +899,7 @@ export async function handleSessionsEnsure(
   const globalFlags = resolveGlobalFlags(command, config);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
-  const parentSessionId = await resolveAndValidateParentSessionId(flags);
+  const parent = await resolveAndValidateParentSessionId(flags);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const [{ ensureSession }, { printCreatedSessionBanner, printEnsuredSessionByFormat }] =
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
@@ -906,7 +911,8 @@ export async function handleSessionsEnsure(
       config,
       permissionMode,
       permissionPolicy,
-      parentSessionId,
+      parentSessionId: parent?.acpxRecordId,
+      parentTaskFolder: parent?.taskFolder,
     }),
   );
 
