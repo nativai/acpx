@@ -296,6 +296,7 @@ export class SessionEventWriter {
 
     await ensureSessionDir();
 
+    // eslint-disable-next-line complexity -- the activity-neutral marker guard adds a branch to the per-message write; keeping the batch write inline avoids hot-path indirection
     await measurePerf("session.events.append_batch", async () => {
       for (const message of messages) {
         if (!isAcpJsonRpcMessage(message)) {

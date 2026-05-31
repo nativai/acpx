@@ -425,6 +425,7 @@ function parseTypedQueueRequest(
   }
 }
 
+// eslint-disable-next-line complexity -- one more optional passthrough field (ttlMs) than the budget allows in this flat submit-request builder
 function parseSubmitRequest(
   request: Record<string, unknown>,
   context: QueueRequestContext,
