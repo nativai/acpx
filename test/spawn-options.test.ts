@@ -356,6 +356,77 @@ test("buildAgentSpawnOptions: ACPX_TASK_FOLDER coexists with URL session + paren
   }
 });
 
+test("buildAgentSpawnOptions injects ACPX_AGENT_FOLDER when sessionContext.agentFolder is non-empty", () => {
+  const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+    acpxRecordId: "child-id",
+    agentFolder: "/abs/task/agents/child-12345678",
+  });
+  assert.equal(options.env.ACPX_AGENT_FOLDER, "/abs/task/agents/child-12345678");
+});
+
+test("buildAgentSpawnOptions trims whitespace around agentFolder before injecting ACPX_AGENT_FOLDER", () => {
+  const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+    acpxRecordId: "child-id",
+    agentFolder: "   /abs/task/agents/child  ",
+  });
+  assert.equal(options.env.ACPX_AGENT_FOLDER, "/abs/task/agents/child");
+});
+
+test("buildAgentSpawnOptions omits ACPX_AGENT_FOLDER when agentFolder is null/undefined/empty/whitespace", () => {
+  const previous = process.env.ACPX_AGENT_FOLDER;
+  delete process.env.ACPX_AGENT_FOLDER;
+  try {
+    const undefinedCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+    });
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(undefinedCase.env, "ACPX_AGENT_FOLDER"),
+      false,
+    );
+
+    const nullCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+      agentFolder: null,
+    });
+    assert.equal(Object.prototype.hasOwnProperty.call(nullCase.env, "ACPX_AGENT_FOLDER"), false);
+
+    const emptyCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+      agentFolder: "",
+    });
+    assert.equal(Object.prototype.hasOwnProperty.call(emptyCase.env, "ACPX_AGENT_FOLDER"), false);
+
+    const whitespaceCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+      agentFolder: "   ",
+    });
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(whitespaceCase.env, "ACPX_AGENT_FOLDER"),
+      false,
+    );
+  } finally {
+    if (previous === undefined) {
+      delete process.env.ACPX_AGENT_FOLDER;
+    } else {
+      process.env.ACPX_AGENT_FOLDER = previous;
+    }
+  }
+});
+
+test("buildAgentSpawnOptions: ACPX_AGENT_FOLDER coexists with task folder + URL session vars", () => {
+  withAcpxUiBaseUrlEnv(undefined, () => {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+      parentSessionId: "parent-id",
+      taskFolder: "/task/abs",
+      agentFolder: "/task/abs/agents/child-id",
+    });
+    assert.equal(options.env.ACPX_TASK_FOLDER, "/task/abs");
+    assert.equal(options.env.ACPX_AGENT_FOLDER, "/task/abs/agents/child-id");
+    assert.equal(options.env.ACPX_SESSION_URL, "https://acpx.devbox.nativai.de/?session=child-id");
+  });
+});
+
 test("buildAgentSpawnOptions promotes explicit ACPX auth env vars into agent auth env", () => {
   const previousPrefixed = process.env.ACPX_AUTH_OPENAI_API_KEY;
   const previousNormalized = process.env.OPENAI_API_KEY;

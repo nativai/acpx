@@ -63,6 +63,7 @@ import {
 } from "../../types.js";
 import { type QueueOwnerMessage, type QueueTask, waitMs } from "../queue/ipc.js";
 import { type QueueOwnerActiveSessionController } from "../queue/owner-turn-controller.js";
+import { resolveAndEnsureAgentFolder } from "./agent-folder.js";
 import type { RunOnceOptions, SessionSendOptions } from "./contracts.js";
 
 function claudeSubagentDir(cwd: string, acpSessionId: string): string {
@@ -711,6 +712,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         acpxRecordId: record.acpxRecordId,
         parentSessionId: record.parentSessionId ?? null,
         taskFolder: record.metadata?.task_folder ?? null,
+        agentFolder: resolveAndEnsureAgentFolder(record),
       },
       sessionOptions,
     });

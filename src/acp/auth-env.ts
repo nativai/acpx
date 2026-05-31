@@ -69,6 +69,7 @@ export type AgentSessionContext = {
   acpxRecordId: string;
   parentSessionId?: string | null;
   taskFolder?: string | null;
+  agentFolder?: string | null;
 };
 
 // eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
@@ -95,6 +96,12 @@ function buildAgentEnvironment(
     const trimmedTaskFolder = sessionContext.taskFolder.trim();
     if (trimmedTaskFolder.length > 0) {
       env.ACPX_TASK_FOLDER = trimmedTaskFolder;
+    }
+  }
+  if (sessionContext && typeof sessionContext.agentFolder === "string") {
+    const trimmedAgentFolder = sessionContext.agentFolder.trim();
+    if (trimmedAgentFolder.length > 0) {
+      env.ACPX_AGENT_FOLDER = trimmedAgentFolder;
     }
   }
   if (!authCredentials) {

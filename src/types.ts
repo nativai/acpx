@@ -216,6 +216,7 @@ export type AcpClientOptions = {
     acpxRecordId: string;
     parentSessionId?: string | null;
     taskFolder?: string | null;
+    agentFolder?: string | null;
   };
   sessionOptions?: {
     model?: string;

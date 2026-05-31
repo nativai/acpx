@@ -28,6 +28,7 @@ import {
 } from "../queue/ipc.js";
 import { refreshQueueOwnerLease } from "../queue/lease-store.js";
 import { QueueOwnerTurnController } from "../queue/owner-turn-controller.js";
+import { resolveAndEnsureAgentFolder } from "./agent-folder.js";
 import {
   DEFAULT_QUEUE_OWNER_TTL_MS,
   normalizeQueueOwnerTtlMs,
@@ -88,6 +89,7 @@ function createQueueOwnerSharedClient(
       acpxRecordId: sessionRecord.acpxRecordId,
       parentSessionId: sessionRecord.parentSessionId ?? null,
       taskFolder: sessionRecord.metadata?.task_folder ?? null,
+      agentFolder: resolveAndEnsureAgentFolder(sessionRecord),
     },
     sessionOptions: mergeSessionOptions(
       options.sessionOptions,

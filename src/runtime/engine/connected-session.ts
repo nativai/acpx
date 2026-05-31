@@ -1,6 +1,7 @@
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { AcpClient } from "../../acp/client.js";
 import { withInterrupt } from "../../async-control.js";
+import { resolveAndEnsureAgentFolder } from "../../cli/session/agent-folder.js";
 import { absolutePath, isoNow } from "../../session/persistence.js";
 import type {
   AcpPermissionDecision,
@@ -106,6 +107,7 @@ export async function withConnectedSession<T>(
         acpxRecordId: record.acpxRecordId,
         parentSessionId: record.parentSessionId ?? null,
         taskFolder: record.metadata?.task_folder ?? null,
+        agentFolder: resolveAndEnsureAgentFolder(record),
       },
       sessionOptions: sessionOptionsFromRecord(record),
     }) ??
@@ -124,6 +126,7 @@ export async function withConnectedSession<T>(
         acpxRecordId: record.acpxRecordId,
         parentSessionId: record.parentSessionId ?? null,
         taskFolder: record.metadata?.task_folder ?? null,
+        agentFolder: resolveAndEnsureAgentFolder(record),
       },
       sessionOptions: sessionOptionsFromRecord(record),
     });
