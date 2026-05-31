@@ -148,6 +148,92 @@ test("SessionEventWriter stores actual segment_count and increments lastSeq", as
   });
 });
 
+test("appendMessages persists _claude/sessionStatus markers but leaves last_write_at unchanged", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const sessionId = "session-activity-neutral-marker";
+    const record = makeSessionRecord(sessionId, cwd, 5);
+    await writeSessionRecord(record);
+
+    const writer = await SessionEventWriter.open(record);
+
+    // A real agent message advances last_write_at + lastUsedAt.
+    await writer.appendMessage({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "real output" },
+        },
+      },
+    } as never);
+    const lastWriteAfterReal = writer.getRecord().eventLog.last_write_at;
+    const lastUsedAfterReal = writer.getRecord().lastUsedAt;
+    const seqAfterReal = writer.getRecord().lastSeq;
+    assert.equal(typeof lastWriteAfterReal, "string");
+
+    // Delay so that IF the marker wrongly bumped the clock the ISO timestamp would
+    // differ (guards against a same-millisecond false pass).
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // The adapter heartbeat marker: persisted to the stream + advances lastSeq
+    // (it IS a stream line), but must NOT advance last_write_at / lastUsedAt — else
+    // a heartbeat during a silent turn would reset acpx-ui's wedge clock.
+    await writer.appendMessage({
+      jsonrpc: "2.0",
+      method: "_claude/sessionStatus",
+      params: { sessionId, phase: "turn_no_activity", elapsedMs: 90_000 },
+    } as never);
+
+    assert.equal(
+      writer.getRecord().eventLog.last_write_at,
+      lastWriteAfterReal,
+      "marker must NOT advance last_write_at",
+    );
+    assert.equal(
+      writer.getRecord().lastUsedAt,
+      lastUsedAfterReal,
+      "marker must NOT advance lastUsedAt",
+    );
+    assert.equal(
+      writer.getRecord().lastSeq,
+      seqAfterReal + 1,
+      "marker is still a stream line, so lastSeq advances",
+    );
+
+    // A subsequent real message DOES advance the clock again (mechanism intact).
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await writer.appendMessage({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "more output" },
+        },
+      },
+    } as never);
+    assert.notEqual(
+      writer.getRecord().eventLog.last_write_at,
+      lastWriteAfterReal,
+      "a real message after a marker must advance last_write_at",
+    );
+
+    await writer.close({ checkpoint: true });
+
+    // The marker IS in the stream (live transcript + debug); the persisted record's
+    // last_write_at reflects only real agent output.
+    const events = await listSessionEvents(sessionId);
+    assert.equal(events.length, 3);
+    assert.equal((events[1] as { method?: string }).method, "_claude/sessionStatus");
+  });
+});
+
 test("listSessionEvents skips malformed NDJSON lines", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
