@@ -16,6 +16,23 @@ import { resolveSessionRecord, writeSessionRecord } from "./persistence.js";
 const LOCK_RETRY_MS = 15;
 const EVENT_LOCK_STALE_MS = 15_000;
 
+// The claude-agent-acp adapter emits resume / no-activity heartbeats as a custom
+// JSON-RPC notification with this method. acpx's onAcpMessage tap persists these
+// markers to the stream (so the live per-session transcript + debug see them), but
+// they are ACTIVITY-NEUTRAL: they must NOT advance `event_log.last_write_at` /
+// `lastUsedAt`, or a heartbeat fired during a silent turn would reset acpx-ui's
+// wall-clock staleness / wedge-detection clock and mask a true wedge. Only genuine
+// agent output counts as activity.
+//
+// Scope is strictly this marker METHOD. It deliberately does NOT match the
+// `_claude/origin` / `_claude/lastTurnEndReason` `_meta` keys, which ride on REAL
+// messages (e.g. the terminal `usage_update`) that MUST keep counting as activity.
+export const ACTIVITY_NEUTRAL_EVENT_METHOD = "_claude/sessionStatus";
+
+export function isActivityNeutralEventMessage(message: AcpJsonRpcMessage): boolean {
+  return (message as { method?: unknown }).method === ACTIVITY_NEUTRAL_EVENT_METHOD;
+}
+
 async function ensureSessionDir(): Promise<void> {
   await fs.mkdir(sessionBaseDir(), { recursive: true });
 }
@@ -305,14 +322,21 @@ export class SessionEventWriter {
             this.record.lastRequestId = String(id);
           }
         }
+        // Activity-neutral markers (adapter heartbeats) are persisted above for the
+        // live transcript + debug, but advance neither last_write_at nor lastUsedAt
+        // — so a heartbeat during a silent turn can't reset acpx-ui's wedge clock.
+        // Structural eventLog fields still track any rotation done while writing it.
+        const neutral = isActivityNeutralEventMessage(message);
         const writeTs = new Date().toISOString();
-        this.record.lastUsedAt = writeTs;
+        if (!neutral) {
+          this.record.lastUsedAt = writeTs;
+        }
         this.record.eventLog = {
           active_path: this.activePath,
           segment_count: this.segmentCount,
           max_segment_bytes: this.maxSegmentBytes,
           max_segments: this.maxSegments,
-          last_write_at: writeTs,
+          last_write_at: neutral ? this.record.eventLog.last_write_at : writeTs,
           last_write_error: null,
         };
       }
