@@ -15,6 +15,7 @@ export type SessionIndexEntry = {
   closed: boolean;
   lastUsedAt: string;
   kind?: "session" | "subagent";
+  template: boolean;
 };
 
 type SessionIndex = {
@@ -32,16 +33,11 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 
 function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
   const record = asRecord(raw);
-  if (!record) {
-    return undefined;
-  }
-  if (!hasRequiredIndexEntryFields(record)) {
-    return undefined;
-  }
-  if (record.name !== undefined && typeof record.name !== "string") {
-    return undefined;
-  }
-  if (record.kind !== undefined && record.kind !== "session" && record.kind !== "subagent") {
+  if (
+    !record ||
+    !hasRequiredIndexEntryFields(record) ||
+    !hasValidOptionalIndexEntryFields(record)
+  ) {
     return undefined;
   }
   return {
@@ -50,11 +46,32 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     acpSessionId: record.acpSessionId,
     agentCommand: record.agentCommand,
     cwd: record.cwd,
-    name: record.name,
+    name: typeof record.name === "string" ? record.name : undefined,
     closed: record.closed,
     lastUsedAt: record.lastUsedAt,
-    kind: record.kind,
+    kind: record.kind === "session" || record.kind === "subagent" ? record.kind : undefined,
+    template: record.template === true,
   };
+}
+
+function hasValidOptionalIndexEntryFields(record: Record<string, unknown>): boolean {
+  return (
+    isOptionalStringIndexField(record.name) &&
+    isOptionalSessionKindIndexField(record.kind) &&
+    isOptionalBooleanIndexField(record.template)
+  );
+}
+
+function isOptionalStringIndexField(value: unknown): boolean {
+  return value === undefined || typeof value === "string";
+}
+
+function isOptionalSessionKindIndexField(value: unknown): boolean {
+  return value === undefined || value === "session" || value === "subagent";
+}
+
+function isOptionalBooleanIndexField(value: unknown): boolean {
+  return value === undefined || typeof value === "boolean";
 }
 
 function hasRequiredIndexEntryFields(record: Record<string, unknown>): record is Record<
@@ -91,6 +108,7 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     closed: record.closed === true,
     lastUsedAt: record.lastUsedAt,
     kind: record.kind,
+    template: record.template?.enabled === true,
   };
 }
 

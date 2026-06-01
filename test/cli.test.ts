@@ -351,6 +351,7 @@ test("sessions new command is present in help output", async () => {
     assert.equal(result.code, 0, result.stderr);
     assert.match(result.stdout, /\bnew\b/);
     assert.match(result.stdout, /\bensure\b/);
+    assert.match(result.stdout, /\btemplates\b/);
     assert.match(result.stdout, /\bread\b/);
     assert.match(result.stdout, /\bprune\b/);
 
@@ -358,6 +359,7 @@ test("sessions new command is present in help output", async () => {
     assert.equal(newHelp.code, 0, newHelp.stderr);
     assert.match(newHelp.stdout, /--name <name>/);
     assert.match(newHelp.stdout, /--resume-session <id>/);
+    assert.match(newHelp.stdout, /--template <name-or-id>/);
 
     const ensureHelp = await runCli(["sessions", "ensure", "--help"], homeDir);
     assert.equal(ensureHelp.code, 0, ensureHelp.stderr);
@@ -602,6 +604,180 @@ test("sessions new and ensure accept -s as shorthand for --name", async () => {
     assert.equal(ensuredPayload.action, "session_ensured");
     assert.equal(ensuredPayload.created, false);
     assert.equal(ensuredPayload.name, "ci");
+  });
+});
+
+test("sessions template mark moves session from local list to templates list", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "template-source",
+      acpSessionId: "template-source",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+      name: "starter",
+      closed: false,
+    });
+
+    const mark = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "template", "mark", "starter"],
+      homeDir,
+    );
+    assert.equal(mark.code, 0, mark.stderr);
+    const markPayload = JSON.parse(mark.stdout.trim()) as {
+      action?: string;
+      template?: { enabled?: boolean; createdAt?: string };
+    };
+    assert.equal(markPayload.action, "session_template_marked");
+    assert.equal(markPayload.template?.enabled, true);
+    assert.equal(typeof markPayload.template?.createdAt, "string");
+
+    const local = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "list", "--local"],
+      homeDir,
+    );
+    assert.equal(local.code, 0, local.stderr);
+    assert.deepEqual(JSON.parse(local.stdout.trim()), []);
+
+    const templates = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "templates"],
+      homeDir,
+    );
+    assert.equal(templates.code, 0, templates.stderr);
+    const templatesPayload = JSON.parse(templates.stdout.trim()) as Array<{ acpxRecordId: string }>;
+    assert.deepEqual(
+      templatesPayload.map((entry) => entry.acpxRecordId),
+      ["template-source"],
+    );
+
+    const unmark = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "template", "unmark", "starter"],
+      homeDir,
+    );
+    assert.equal(unmark.code, 0, unmark.stderr);
+    const unmarkPayload = JSON.parse(unmark.stdout.trim()) as {
+      action?: string;
+      template?: unknown;
+    };
+    assert.equal(unmarkPayload.action, "session_template_unmarked");
+    assert.equal(unmarkPayload.template, undefined);
+
+    const localAfterUnmark = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "list", "--local"],
+      homeDir,
+    );
+    assert.equal(localAfterUnmark.code, 0, localAfterUnmark.stderr);
+    const localAfterUnmarkPayload = JSON.parse(localAfterUnmark.stdout.trim()) as Array<{
+      acpxRecordId: string;
+      closed?: boolean;
+    }>;
+    assert.equal(localAfterUnmarkPayload.length, 1);
+    assert.equal(localAfterUnmarkPayload[0]?.acpxRecordId, "template-source");
+    assert.equal(localAfterUnmarkPayload[0]?.closed, false);
+  });
+});
+
+test("sessions new --template copies template state and keeps requested parent linkage", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          agents: {
+            codex: {
+              command: MOCK_AGENT_COMMAND,
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "parent-session",
+      acpSessionId: "parent-session",
+      agentCommand: MOCK_AGENT_COMMAND,
+      cwd,
+      name: "parent",
+    });
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "template-source",
+      acpSessionId: "template-source",
+      agentCommand: MOCK_AGENT_COMMAND,
+      cwd,
+      name: "starter",
+      closed: true,
+      closedAt: "2026-05-31T10:00:00.000Z",
+      title: "Reusable setup",
+      messages: [
+        {
+          User: {
+            id: "u1",
+            content: [{ Text: "seed prompt" }],
+          },
+        },
+      ],
+      acpx: {
+        session_options: {
+          model: "test-model",
+        },
+      },
+      template: {
+        enabled: true,
+        createdAt: "2026-05-31T10:00:00.000Z",
+      },
+    });
+
+    const result = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--format",
+        "json",
+        "codex",
+        "sessions",
+        "new",
+        "--name",
+        "child",
+        "--template",
+        "starter",
+        "--parent-id",
+        "parent-session",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const payload = JSON.parse(result.stdout.trim()) as { acpxRecordId?: string };
+    assert.equal(typeof payload.acpxRecordId, "string");
+    const created = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, payload.acpxRecordId ?? ""), "utf8"),
+    ) as Record<string, unknown>;
+
+    assert.equal(created.name, "child");
+    assert.equal(created.template, undefined);
+    assert.equal(created.parent_session_id, "parent-session");
+    assert.equal(created.kind, "session");
+    assert.equal(created.title, "Reusable setup");
+    assert.deepEqual(created.acpx, {
+      session_options: {
+        model: "test-model",
+      },
+    });
+    assert.deepEqual(created.messages, [
+      {
+        User: {
+          id: "u1",
+          content: [{ Text: "seed prompt" }],
+        },
+      },
+    ]);
   });
 });
 
@@ -2729,6 +2905,12 @@ function makeSessionRecord(
     cumulative_token_usage: record.cumulative_token_usage ?? {},
     request_token_usage: record.request_token_usage ?? {},
     acpx: record.acpx,
+    kind: record.kind,
+    parentSessionId: record.parentSessionId,
+    subagents: record.subagents,
+    metadata: record.metadata,
+    importedFrom: record.importedFrom,
+    template: record.template,
   };
 }
 

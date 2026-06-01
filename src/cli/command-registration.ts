@@ -10,12 +10,15 @@ import {
   handleSessionsHistory,
   handleSessionsImport,
   handleSessionsList,
+  handleSessionsMarkTemplate,
   handleSessionsNew,
   handleSessionsOwnerStatus,
   handleSessionsPrune,
   handleSessionsRecover,
   handleSessionsSetMetadata,
   handleSessionsShow,
+  handleSessionsTemplatesList,
+  handleSessionsUnmarkTemplate,
   handleSetConfigOption,
   handleSetMode,
   parseHistoryLimit,
@@ -109,6 +112,9 @@ export function registerSessionsCommand(
     .option("--resume-session <id>", "Resume existing ACP session id", (value: string) =>
       parseNonEmptyValue("Resume session id", value),
     )
+    .option("--template <name-or-id>", "Create by copying a template session", (value: string) =>
+      parseNonEmptyValue("Template", value),
+    )
     .option(
       "--parent-session-url <url>",
       "Record the spawning session's acpx-ui URL as parent (UUID parsed from ?session=). Mirrors the agent identity URL — the same URL humans paste in a browser and that agents POST to.",
@@ -152,6 +158,33 @@ export function registerSessionsCommand(
     )
     .action(async function (this: Command, flags: SessionsNewFlags) {
       await handleSessionsEnsure(explicitAgentName, flags, this, config);
+    });
+
+  sessionsCommand
+    .command("templates")
+    .description("List template sessions")
+    .action(async function (this: Command) {
+      await handleSessionsTemplatesList(explicitAgentName, this, config);
+    });
+
+  const templateCommand = sessionsCommand
+    .command("template")
+    .description("Mark or unmark reusable template sessions");
+
+  templateCommand
+    .command("mark")
+    .description("Mark a session as a template")
+    .argument("[name]", "Session name", parseSessionName)
+    .action(async function (this: Command, name?: string) {
+      await handleSessionsMarkTemplate(explicitAgentName, name, this, config);
+    });
+
+  templateCommand
+    .command("unmark")
+    .description("Unmark a template session")
+    .argument("[name]", "Session name or id", parseSessionName)
+    .action(async function (this: Command, name?: string) {
+      await handleSessionsUnmarkTemplate(explicitAgentName, name, this, config);
     });
 
   sessionsCommand

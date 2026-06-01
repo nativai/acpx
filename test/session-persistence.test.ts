@@ -43,6 +43,48 @@ test("SessionRecord allows optional favorite and favoritedAt fields", () => {
   assert.equal(record.favoritedAt, "2026-05-21T10:00:00.000Z");
 });
 
+test("SessionRecord preserves optional template marker", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "template-roundtrip",
+        acpSessionId: "template-roundtrip",
+        agentCommand: "agent-a",
+        cwd,
+        closed: true,
+        closedAt: "2026-05-31T10:00:00.000Z",
+        template: {
+          enabled: true,
+          createdAt: "2026-05-31T10:00:00.000Z",
+          sourceSessionId: "source-session",
+        },
+      }),
+    );
+
+    const templates = await session.listTemplateSessionsForAgent("agent-a");
+    assert.equal(templates.length, 1);
+    assert.deepEqual(templates[0]?.template, {
+      enabled: true,
+      createdAt: "2026-05-31T10:00:00.000Z",
+      sourceSessionId: "source-session",
+    });
+    assert.equal((await session.listSessions()).length, 0);
+
+    const onDisk = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, "template-roundtrip"), "utf8"),
+    ) as Record<string, unknown>;
+    assert.deepEqual(onDisk.template, {
+      enabled: true,
+      created_at: "2026-05-31T10:00:00.000Z",
+      source_session_id: "source-session",
+    });
+  });
+});
+
 test("listSessions preserves favorite and favoritedAt", async () => {
   await withTempHome(async (homeDir) => {
     const session = await loadSessionModule();

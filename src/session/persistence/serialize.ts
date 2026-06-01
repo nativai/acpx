@@ -62,5 +62,12 @@ export function serializeSessionRecordForDisk(record: SessionRecord): Record<str
           exported_at: canonical.importedFrom.exportedAt,
         }
       : undefined,
+    template: canonical.template
+      ? {
+          enabled: true,
+          created_at: canonical.template.createdAt,
+          source_session_id: canonical.template.sourceSessionId,
+        }
+      : undefined,
   };
 }

@@ -9,7 +9,7 @@ import {
 import { assertRequestedModelSupported } from "../../acp/model-support.js";
 import { InterruptedError, withInterrupt, withTimeout } from "../../async-control.js";
 import { tailClaudeSubagentJsonl } from "../../claude-jsonl.js";
-import { SessionClosedError } from "../../errors.js";
+import { SessionClosedError, TemplateSessionReadOnlyError } from "../../errors.js";
 export { InterruptedError, TimeoutError } from "../../async-control.js";
 import { formatPerfMetric, measurePerf, startPerfTimer } from "../../perf-metrics.js";
 import { textPrompt } from "../../prompt-content.js";
@@ -530,6 +530,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   // (via `PATCH /api/sessions/:id/closed {closed:false}` in the UI, or the
   // corresponding CLI surface). See DESIGN.md §4 "reopen question" for why
   // we don't auto-reopen on a successful turn.
+  if (record.template?.enabled === true) {
+    throw new TemplateSessionReadOnlyError(record.acpxRecordId, record.name ?? undefined);
+  }
   if (record.closed) {
     throw new SessionClosedError(record.acpxRecordId, record.name ?? undefined);
   }

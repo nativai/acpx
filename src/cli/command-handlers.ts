@@ -326,6 +326,7 @@ async function findScopedSessionOrThrow(
     cwd: agent.cwd,
     name: sessionName,
     includeClosed: true,
+    includeTemplates: true,
   });
 
   if (!record) {
@@ -333,6 +334,79 @@ async function findScopedSessionOrThrow(
   }
 
   return record;
+}
+
+async function resolveTemplateSourceOrThrow(
+  agent: ResolvedAgentInvocation,
+  templateNameOrId: string,
+): Promise<SessionRecord> {
+  const scoped = await findSession({
+    agentCommand: agent.agentCommand,
+    cwd: agent.cwd,
+    name: templateNameOrId,
+    includeClosed: true,
+    includeTemplates: true,
+  });
+  const record = scoped ?? (await resolveSessionRecord(templateNameOrId));
+  if (record.agentCommand !== agent.agentCommand) {
+    throw new Error(`Template ${templateNameOrId} belongs to a different agent command`);
+  }
+  if (record.template?.enabled !== true) {
+    throw new Error(`Session is not a template: ${templateNameOrId}`);
+  }
+  return record;
+}
+
+async function createSessionWithOptionalTemplate(params: {
+  template: SessionRecord | undefined;
+  createSession: SessionModule["createSession"];
+  createSessionFromTemplate: SessionModule["createSessionFromTemplate"];
+  startOptions: Parameters<SessionModule["createSession"]>[0];
+}): Promise<SessionRecord> {
+  if (!params.template) {
+    return await params.createSession(params.startOptions);
+  }
+
+  return await params.createSessionFromTemplate({
+    ...params.startOptions,
+    templateSessionId: params.template.acpxRecordId,
+  });
+}
+
+function assertSessionsNewTemplateFlags(flags: SessionsNewFlags): void {
+  if (flags.template && flags.resumeSession) {
+    throw new InvalidArgumentError("--template cannot be combined with --resume-session");
+  }
+}
+
+async function resolveOptionalTemplateSource(
+  agent: ResolvedAgentInvocation,
+  flags: SessionsNewFlags,
+): Promise<SessionRecord | undefined> {
+  return flags.template ? await resolveTemplateSourceOrThrow(agent, flags.template) : undefined;
+}
+
+async function closeReplacedSession(params: {
+  agent: ResolvedAgentInvocation;
+  flags: SessionsNewFlags;
+  closeSession: SessionModule["closeSession"];
+  verbose: boolean;
+}): Promise<SessionRecord | undefined> {
+  const replaced = await findSession({
+    agentCommand: params.agent.agentCommand,
+    cwd: params.agent.cwd,
+    name: params.flags.name,
+  });
+
+  if (!replaced) {
+    return undefined;
+  }
+
+  await params.closeSession(replaced.acpxRecordId);
+  if (params.verbose) {
+    process.stderr.write(`[acpx] soft-closed prior session: ${replaced.acpxRecordId}\n`);
+  }
+  return replaced;
 }
 
 async function findRoutedSessionOrThrow(
@@ -623,7 +697,7 @@ export async function handleCancel(
 
   const result = await cancelSessionPrompt({
     sessionId: record.acpxRecordId,
-    verbose: globalFlags.verbose,
+    verbose: globalFlags.verbose === true,
   });
   printCancelResultByFormat(result, globalFlags.format);
 }
@@ -653,7 +727,7 @@ export async function handleSetMode(
     authPolicy: globalFlags.authPolicy,
     terminal: globalFlags.terminal,
     timeoutMs: globalFlags.timeout,
-    verbose: globalFlags.verbose,
+    verbose: globalFlags.verbose === true,
   });
 
   if (globalFlags.verbose && result.loadError) {
@@ -906,38 +980,39 @@ export async function handleSessionsNew(
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
+  assertSessionsNewTemplateFlags(flags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const parent = await resolveAndValidateParentSessionId(flags);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const [{ createSession, closeSession }, { printCreatedSessionBanner, printNewSessionByFormat }] =
-    await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
-
-  const replaced = await findSession({
-    agentCommand: agent.agentCommand,
-    cwd: agent.cwd,
-    name: flags.name,
+  const [
+    { createSession, createSessionFromTemplate, closeSession },
+    { printCreatedSessionBanner, printNewSessionByFormat },
+  ] = await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
+  const template = await resolveOptionalTemplateSource(agent, flags);
+  const replaced = await closeReplacedSession({
+    agent,
+    flags,
+    closeSession,
+    verbose: globalFlags.verbose === true,
   });
 
-  if (replaced) {
-    await closeSession(replaced.acpxRecordId);
-    if (globalFlags.verbose) {
-      process.stderr.write(`[acpx] soft-closed prior session: ${replaced.acpxRecordId}\n`);
-    }
-  }
-
-  const created = await createSession(
-    buildSessionStartOptions({
-      agent,
-      flags,
-      globalFlags,
-      config,
-      permissionMode,
-      permissionPolicy,
-      parentSessionId: parent?.acpxRecordId,
-      parentTaskFolder: parent?.taskFolder,
-    }),
-  );
+  const startOptions = buildSessionStartOptions({
+    agent,
+    flags,
+    globalFlags,
+    config,
+    permissionMode,
+    permissionPolicy,
+    parentSessionId: parent?.acpxRecordId,
+    parentTaskFolder: parent?.taskFolder,
+  });
+  const created = await createSessionWithOptionalTemplate({
+    template,
+    createSession,
+    createSessionFromTemplate,
+    startOptions,
+  });
 
   printCreatedSessionBanner(created, agent.agentName, globalFlags.format, globalFlags.jsonStrict);
 
@@ -956,6 +1031,9 @@ export async function handleSessionsEnsure(
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
+  if (flags.template) {
+    throw new InvalidArgumentError("--template can only be used with sessions new");
+  }
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const parent = await resolveAndValidateParentSessionId(flags);
@@ -985,6 +1063,50 @@ export async function handleSessionsEnsure(
   }
 
   printEnsuredSessionByFormat(result.record, result.created, globalFlags.format);
+}
+
+export async function handleSessionsTemplatesList(
+  explicitAgentName: string | undefined,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const [{ listTemplateSessionsForAgent }, { printSessionsByFormat }] = await Promise.all([
+    loadSessionModule(),
+    loadOutputRenderModule(),
+  ]);
+  printSessionsByFormat(await listTemplateSessionsForAgent(agent.agentCommand), globalFlags.format);
+}
+
+export async function handleSessionsMarkTemplate(
+  explicitAgentName: string | undefined,
+  sessionName: string | undefined,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const { setSessionTemplateMarker } = await loadSessionModule();
+  const record = await findScopedSessionOrThrow(agent, sessionName);
+  const updated = await setSessionTemplateMarker(record.acpxRecordId, true);
+  printTemplateUpdateByFormat(updated, true, globalFlags.format);
+}
+
+export async function handleSessionsUnmarkTemplate(
+  explicitAgentName: string | undefined,
+  sessionNameOrId: string | undefined,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const { setSessionTemplateMarker } = await loadSessionModule();
+  const record = sessionNameOrId
+    ? await resolveTemplateSourceOrThrow(agent, sessionNameOrId)
+    : await findScopedSessionOrThrow(agent, undefined);
+  const updated = await setSessionTemplateMarker(record.acpxRecordId, false);
+  printTemplateUpdateByFormat(updated, false, globalFlags.format);
 }
 
 function userContentToText(content: SessionUserContent): string {
@@ -1072,6 +1194,33 @@ function printSessionDetailsByFormat(record: SessionRecord, format: OutputFormat
   }
 }
 
+function printTemplateUpdateByFormat(
+  record: SessionRecord,
+  enabled: boolean,
+  format: OutputFormat,
+): void {
+  if (
+    emitJsonResult(format, {
+      action: enabled ? "session_template_marked" : "session_template_unmarked",
+      acpxRecordId: record.acpxRecordId,
+      acpxSessionId: record.acpSessionId,
+      name: record.name,
+      template: record.template,
+    })
+  ) {
+    return;
+  }
+
+  if (format === "quiet") {
+    process.stdout.write(`${record.acpxRecordId}\n`);
+    return;
+  }
+
+  process.stdout.write(
+    `${record.acpxRecordId}\t${enabled ? "marked template" : "unmarked template"}\n`,
+  );
+}
+
 function sessionDetailsLines(record: SessionRecord): string[] {
   return [
     `id: ${record.acpxRecordId}`,
@@ -1085,6 +1234,9 @@ function sessionDetailsLines(record: SessionRecord): string[] {
     `lastPrompt: ${displayValue(record.lastPromptAt)}`,
     `closed: ${record.closed ? "yes" : "no"}`,
     `closedAt: ${displayValue(record.closedAt)}`,
+    `template: ${record.template?.enabled === true ? "yes" : "no"}`,
+    `templateCreatedAt: ${displayValue(record.template?.createdAt)}`,
+    `templateSourceSessionId: ${displayValue(record.template?.sourceSessionId)}`,
     `pid: ${displayValue(record.pid)}`,
     `agentStartedAt: ${displayValue(record.agentStartedAt)}`,
     `lastExitCode: ${displayValue(record.lastAgentExitCode)}`,

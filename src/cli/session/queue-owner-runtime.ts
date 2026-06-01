@@ -1,6 +1,7 @@
 import { AcpClient } from "../../acp/client.js";
 import { formatErrorMessage } from "../../acp/error-normalization.js";
 import { withTimeout } from "../../async-control.js";
+import { TemplateSessionReadOnlyError } from "../../errors.js";
 import { checkpointPerfMetricsCapture } from "../../perf-metrics-capture.js";
 import { setPerfGauge } from "../../perf-metrics.js";
 import { promptToDisplayText } from "../../prompt-content.js";
@@ -624,6 +625,11 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
 }
 
 export async function sendSession(options: SessionSendOptions): Promise<SessionSendOutcome> {
+  const record = await resolveSessionRecord(options.sessionId);
+  if (record.template?.enabled === true) {
+    throw new TemplateSessionReadOnlyError(record.acpxRecordId, record.name ?? undefined);
+  }
+
   const waitForCompletion = options.waitForCompletion !== false;
 
   const queuedToOwner = await submitToRunningOwner(options, waitForCompletion);

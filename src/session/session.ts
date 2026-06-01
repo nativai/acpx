@@ -10,6 +10,7 @@ export {
   findSessionByDirectoryWalk,
   listSessions,
   listSessionsForAgent,
+  listTemplateSessionsForAgent,
   pruneSessions,
 } from "./persistence.js";
 export type { PruneOptions, PruneResult } from "./persistence.js";

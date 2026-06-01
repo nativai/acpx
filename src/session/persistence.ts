@@ -11,6 +11,7 @@ export {
   listSessions,
   listSessionsForAgent,
   listSubagentsForSession,
+  listTemplateSessionsForAgent,
   normalizeName,
   pruneSessions,
   resolveSessionRecord,
