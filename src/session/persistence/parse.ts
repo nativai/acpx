@@ -491,9 +491,32 @@ function parseImportedFrom(raw: unknown): SessionRecord["importedFrom"] | null |
   };
 }
 
+function parseTemplateMarker(raw: unknown): SessionRecord["template"] | null | undefined {
+  if (raw == null) {
+    return undefined;
+  }
+
+  const record = asRecord(raw);
+  if (
+    !record ||
+    record.enabled !== true ||
+    typeof record.created_at !== "string" ||
+    (record.source_session_id !== undefined && typeof record.source_session_id !== "string")
+  ) {
+    return null;
+  }
+
+  return {
+    enabled: true,
+    createdAt: record.created_at,
+    sourceSessionId: record.source_session_id,
+  };
+}
+
 function parseSessionRecordMetadata(record: Record<string, unknown>): {
   lastRequestId: string | undefined;
   importedFrom: SessionRecord["importedFrom"];
+  template: SessionRecord["template"];
 } | null {
   const lastRequestId = normalizeOptionalString(record.last_request_id);
   if (lastRequestId === null) {
@@ -505,7 +528,12 @@ function parseSessionRecordMetadata(record: Record<string, unknown>): {
     return null;
   }
 
-  return { lastRequestId, importedFrom };
+  const template = parseTemplateMarker(record.template);
+  if (template === null) {
+    return null;
+  }
+
+  return { lastRequestId, importedFrom, template };
 }
 
 function normalizeOptionalName(value: unknown): string | undefined | null {
@@ -778,5 +806,6 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     subagents: parseSubagentRefs(record.subagents),
     metadata,
     importedFrom: recordMetadata.importedFrom,
+    template: recordMetadata.template,
   };
 }

@@ -78,6 +78,10 @@ export type SessionCreateOptions = {
   sessionOptions?: SessionAgentOptions;
 } & TimedRunOptions;
 
+export type SessionCreateFromTemplateOptions = SessionCreateOptions & {
+  templateSessionId: string;
+};
+
 export type SessionSendOptions = {
   sessionId: string;
   prompt: PromptInput;
@@ -188,6 +192,11 @@ export type SessionSetConfigOptionOptions = {
 export type SessionCreateWithClientResult = {
   record: SessionRecord;
   client: AcpClient;
+};
+
+export type SessionTemplateUpdateResult = {
+  record: SessionRecord;
+  enabled: boolean;
 };
 
 export type { SessionAgentOptions };

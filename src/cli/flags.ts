@@ -62,6 +62,7 @@ export type ExecFlags = {
 export type SessionsNewFlags = {
   name?: string;
   resumeSession?: string;
+  template?: string;
   parentId?: string;
   parentSessionUrl?: string;
   metadata?: Record<string, string>;

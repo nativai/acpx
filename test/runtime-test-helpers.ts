@@ -62,7 +62,12 @@ export function makeSessionRecord(
     cumulative_token_usage: overrides.cumulative_token_usage ?? {},
     request_token_usage: overrides.request_token_usage ?? {},
     acpx: overrides.acpx ?? (defaultAcpx ? {} : undefined),
+    kind: overrides.kind,
+    parentSessionId: overrides.parentSessionId,
+    subagents: overrides.subagents,
+    metadata: overrides.metadata,
     importedFrom: overrides.importedFrom,
+    template: overrides.template,
   };
 }
 

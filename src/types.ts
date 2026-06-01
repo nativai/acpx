@@ -374,6 +374,12 @@ export type SessionImportedFrom = {
   exportedAt: string;
 };
 
+export type SessionTemplateMarker = {
+  enabled: true;
+  createdAt: string;
+  sourceSessionId?: string;
+};
+
 export type SessionRecord = {
   schema: typeof SESSION_RECORD_SCHEMA;
   acpxRecordId: string;
@@ -411,6 +417,7 @@ export type SessionRecord = {
   subagents?: SubagentRef[];
   metadata?: Record<string, string>;
   importedFrom?: SessionImportedFrom;
+  template?: SessionTemplateMarker;
 };
 
 export type RunPromptResult = {

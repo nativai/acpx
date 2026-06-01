@@ -199,9 +199,13 @@ async function resolvePermissionPolicyFromFlags(
 // Parse the UUID from an acpx-ui session URL (...?session=<uuid>).
 // Returns undefined for missing / malformed input or empty session value.
 function parseSessionIdFromUrl(url: string | undefined): string | undefined {
-  if (!url) {return undefined;}
+  if (!url) {
+    return undefined;
+  }
   const trimmed = url.trim();
-  if (!trimmed) {return undefined;}
+  if (!trimmed) {
+    return undefined;
+  }
   try {
     const parsed = new URL(trimmed);
     const sessionId = parsed.searchParams.get("session")?.trim();
@@ -316,6 +320,7 @@ async function findScopedSessionOrThrow(
     cwd: agent.cwd,
     name: sessionName,
     includeClosed: true,
+    includeTemplates: true,
   });
 
   if (!record) {
@@ -323,6 +328,43 @@ async function findScopedSessionOrThrow(
   }
 
   return record;
+}
+
+async function resolveTemplateSourceOrThrow(
+  agent: ResolvedAgentInvocation,
+  templateNameOrId: string,
+): Promise<SessionRecord> {
+  const scoped = await findSession({
+    agentCommand: agent.agentCommand,
+    cwd: agent.cwd,
+    name: templateNameOrId,
+    includeClosed: true,
+    includeTemplates: true,
+  });
+  const record = scoped ?? (await resolveSessionRecord(templateNameOrId));
+  if (record.agentCommand !== agent.agentCommand) {
+    throw new Error(`Template ${templateNameOrId} belongs to a different agent command`);
+  }
+  if (record.template?.enabled !== true) {
+    throw new Error(`Session is not a template: ${templateNameOrId}`);
+  }
+  return record;
+}
+
+async function createSessionWithOptionalTemplate(params: {
+  template: SessionRecord | undefined;
+  createSession: SessionModule["createSession"];
+  createSessionFromTemplate: SessionModule["createSessionFromTemplate"];
+  startOptions: Parameters<SessionModule["createSession"]>[0];
+}): Promise<SessionRecord> {
+  if (!params.template) {
+    return await params.createSession(params.startOptions);
+  }
+
+  return await params.createSessionFromTemplate({
+    ...params.startOptions,
+    templateSessionId: params.template.acpxRecordId,
+  });
 }
 
 async function findRoutedSessionOrThrow(
@@ -838,12 +880,20 @@ export async function handleSessionsNew(
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
+  if (flags.template && flags.resumeSession) {
+    throw new InvalidArgumentError("--template cannot be combined with --resume-session");
+  }
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const parentSessionId = await resolveAndValidateParentSessionId(flags);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const [{ createSession, closeSession }, { printCreatedSessionBanner, printNewSessionByFormat }] =
-    await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
+  const [
+    { createSession, createSessionFromTemplate, closeSession },
+    { printCreatedSessionBanner, printNewSessionByFormat },
+  ] = await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
+  const template = flags.template
+    ? await resolveTemplateSourceOrThrow(agent, flags.template)
+    : undefined;
 
   const replaced = await findSession({
     agentCommand: agent.agentCommand,
@@ -858,17 +908,21 @@ export async function handleSessionsNew(
     }
   }
 
-  const created = await createSession(
-    buildSessionStartOptions({
-      agent,
-      flags,
-      globalFlags,
-      config,
-      permissionMode,
-      permissionPolicy,
-      parentSessionId,
-    }),
-  );
+  const startOptions = buildSessionStartOptions({
+    agent,
+    flags,
+    globalFlags,
+    config,
+    permissionMode,
+    permissionPolicy,
+    parentSessionId,
+  });
+  const created = await createSessionWithOptionalTemplate({
+    template,
+    createSession,
+    createSessionFromTemplate,
+    startOptions,
+  });
 
   printCreatedSessionBanner(created, agent.agentName, globalFlags.format, globalFlags.jsonStrict);
 
@@ -887,6 +941,9 @@ export async function handleSessionsEnsure(
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
+  if (flags.template) {
+    throw new InvalidArgumentError("--template can only be used with sessions new");
+  }
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const parentSessionId = await resolveAndValidateParentSessionId(flags);
@@ -915,6 +972,50 @@ export async function handleSessionsEnsure(
   }
 
   printEnsuredSessionByFormat(result.record, result.created, globalFlags.format);
+}
+
+export async function handleSessionsTemplatesList(
+  explicitAgentName: string | undefined,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const [{ listTemplateSessionsForAgent }, { printSessionsByFormat }] = await Promise.all([
+    loadSessionModule(),
+    loadOutputRenderModule(),
+  ]);
+  printSessionsByFormat(await listTemplateSessionsForAgent(agent.agentCommand), globalFlags.format);
+}
+
+export async function handleSessionsMarkTemplate(
+  explicitAgentName: string | undefined,
+  sessionName: string | undefined,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const { setSessionTemplateMarker } = await loadSessionModule();
+  const record = await findScopedSessionOrThrow(agent, sessionName);
+  const updated = await setSessionTemplateMarker(record.acpxRecordId, true);
+  printTemplateUpdateByFormat(updated, true, globalFlags.format);
+}
+
+export async function handleSessionsUnmarkTemplate(
+  explicitAgentName: string | undefined,
+  sessionNameOrId: string | undefined,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const { setSessionTemplateMarker } = await loadSessionModule();
+  const record = sessionNameOrId
+    ? await resolveTemplateSourceOrThrow(agent, sessionNameOrId)
+    : await findScopedSessionOrThrow(agent, undefined);
+  const updated = await setSessionTemplateMarker(record.acpxRecordId, false);
+  printTemplateUpdateByFormat(updated, false, globalFlags.format);
 }
 
 function userContentToText(content: SessionUserContent): string {
@@ -1002,6 +1103,33 @@ function printSessionDetailsByFormat(record: SessionRecord, format: OutputFormat
   }
 }
 
+function printTemplateUpdateByFormat(
+  record: SessionRecord,
+  enabled: boolean,
+  format: OutputFormat,
+): void {
+  if (
+    emitJsonResult(format, {
+      action: enabled ? "session_template_marked" : "session_template_unmarked",
+      acpxRecordId: record.acpxRecordId,
+      acpxSessionId: record.acpSessionId,
+      name: record.name,
+      template: record.template,
+    })
+  ) {
+    return;
+  }
+
+  if (format === "quiet") {
+    process.stdout.write(`${record.acpxRecordId}\n`);
+    return;
+  }
+
+  process.stdout.write(
+    `${record.acpxRecordId}\t${enabled ? "marked template" : "unmarked template"}\n`,
+  );
+}
+
 function sessionDetailsLines(record: SessionRecord): string[] {
   return [
     `id: ${record.acpxRecordId}`,
@@ -1015,6 +1143,9 @@ function sessionDetailsLines(record: SessionRecord): string[] {
     `lastPrompt: ${displayValue(record.lastPromptAt)}`,
     `closed: ${record.closed ? "yes" : "no"}`,
     `closedAt: ${displayValue(record.closedAt)}`,
+    `template: ${record.template?.enabled === true ? "yes" : "no"}`,
+    `templateCreatedAt: ${displayValue(record.template?.createdAt)}`,
+    `templateSourceSessionId: ${displayValue(record.template?.sourceSessionId)}`,
     `pid: ${displayValue(record.pid)}`,
     `agentStartedAt: ${displayValue(record.agentStartedAt)}`,
     `lastExitCode: ${displayValue(record.lastAgentExitCode)}`,

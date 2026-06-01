@@ -10,17 +10,21 @@ import { setCurrentModelId, syncAdvertisedModelState } from "../../session/mode-
 import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
 import {
   absolutePath,
+  closeSession,
   findGitRepositoryRoot,
   findSessionByDirectoryWalk,
   isoNow,
   normalizeName,
+  resolveSessionRecord,
   writeSessionRecord,
+  writeSessionRecordWithLifecycle,
 } from "../../session/persistence.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
 import type { SessionEnsureResult, SessionRecord } from "../../types.js";
 import { DEFAULT_QUEUE_OWNER_TTL_MS } from "./contracts.js";
 import type {
   SessionCreateOptions,
+  SessionCreateFromTemplateOptions,
   SessionCreateWithClientResult,
   SessionEnsureOptions,
   SessionListOptions,
@@ -209,6 +213,62 @@ export async function createSession(options: SessionCreateOptions): Promise<Sess
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
     await writeSessionRecord(record);
   }
+}
+
+function copyReusableTemplateState(target: SessionRecord, template: SessionRecord): void {
+  target.title = template.title;
+  target.messages = [...template.messages];
+  target.updated_at = template.updated_at;
+  target.cumulative_token_usage = { ...template.cumulative_token_usage };
+  target.request_token_usage = Object.fromEntries(
+    Object.entries(template.request_token_usage).map(([key, value]) => [key, { ...value }]),
+  );
+  target.acpx = template.acpx ? { ...template.acpx } : {};
+  target.lastSeq = template.lastSeq;
+}
+
+export async function createSessionFromTemplate(
+  options: SessionCreateFromTemplateOptions,
+): Promise<SessionRecord> {
+  const template = await resolveSessionRecord(options.templateSessionId);
+  if (template.template?.enabled !== true) {
+    throw new Error(`Session is not a template: ${options.templateSessionId}`);
+  }
+
+  const created = await createSession(options);
+  copyReusableTemplateState(created, template);
+  created.template = undefined;
+  created.subagents = undefined;
+  created.importedFrom = undefined;
+  created.closed = false;
+  created.closedAt = undefined;
+  created.lastUsedAt = isoNow();
+  await writeSessionRecordWithLifecycle(created);
+  return created;
+}
+
+export async function setSessionTemplateMarker(
+  sessionId: string,
+  enabled: boolean,
+): Promise<SessionRecord> {
+  const record = enabled ? await closeSession(sessionId) : await resolveSessionRecord(sessionId);
+  const now = isoNow();
+
+  if (enabled) {
+    record.template = {
+      enabled: true,
+      createdAt: record.template?.createdAt ?? now,
+      sourceSessionId: record.template?.sourceSessionId,
+    };
+  } else {
+    record.template = undefined;
+    record.closed = false;
+    record.closedAt = undefined;
+  }
+
+  record.lastUsedAt = now;
+  await writeSessionRecordWithLifecycle(record);
+  return record;
 }
 
 export async function listAgentSessions(options: SessionListOptions): Promise<SessionListResult> {

@@ -59,6 +59,25 @@ export class SessionClosedError extends AcpxOperationalError {
   }
 }
 
+export class TemplateSessionReadOnlyError extends AcpxOperationalError {
+  readonly sessionId: string;
+  readonly sessionName: string | undefined;
+
+  constructor(sessionId: string, sessionName: string | undefined) {
+    const label = sessionName ?? sessionId;
+    super(
+      `Session '${label}' is a template and is read-only. Create a new session from the template before sending prompts.`,
+      {
+        outputCode: "RUNTIME",
+        detailCode: "TEMPLATE_SESSION_READ_ONLY",
+        origin: "runtime",
+      },
+    );
+    this.sessionId = sessionId;
+    this.sessionName = sessionName;
+  }
+}
+
 export class AgentSpawnError extends AcpxOperationalError {
   readonly agentCommand: string;
 

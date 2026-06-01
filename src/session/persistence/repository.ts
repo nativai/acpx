@@ -23,6 +23,7 @@ type FindSessionOptions = {
   cwd: string;
   name?: string;
   includeClosed?: boolean;
+  includeTemplates?: boolean;
 };
 
 type FindSessionByDirectoryWalkOptions = {
@@ -30,6 +31,7 @@ type FindSessionByDirectoryWalkOptions = {
   cwd: string;
   name?: string;
   boundary?: string;
+  includeTemplates?: boolean;
 };
 
 function sessionFilePath(acpxRecordId: string): string {
@@ -69,17 +71,28 @@ function matchesSessionEntry(
   normalizedCwd: string,
   normalizedName: string | undefined,
   includeClosed = false,
+  includeTemplates = false,
 ): boolean {
-  if (session.cwd !== normalizedCwd) {
-    return false;
-  }
-  if (!includeClosed && session.closed) {
-    return false;
-  }
-  if (normalizedName == null) {
-    return session.name == null;
-  }
-  return session.name === normalizedName;
+  return (
+    session.cwd === normalizedCwd &&
+    matchesVisibility(session, includeClosed, includeTemplates) &&
+    matchesSessionName(session.name, normalizedName)
+  );
+}
+
+function matchesVisibility(
+  session: SessionIndexEntry,
+  includeClosed: boolean,
+  includeTemplates: boolean,
+): boolean {
+  return (includeClosed || !session.closed) && (includeTemplates || !session.template);
+}
+
+function matchesSessionName(
+  sessionName: string | undefined,
+  normalizedName: string | undefined,
+): boolean {
+  return normalizedName == null ? sessionName == null : sessionName === normalizedName;
 }
 
 /**
@@ -96,6 +109,7 @@ async function readPersistedLifecycle(acpxRecordId: string): Promise<
       favorite: boolean | undefined;
       favoritedAt: string | undefined;
       name: string | undefined;
+      template: SessionRecord["template"];
     }
   | undefined
 > {
@@ -111,6 +125,7 @@ async function readPersistedLifecycle(acpxRecordId: string): Promise<
       favorite: parsed.favorite,
       favoritedAt: parsed.favoritedAt,
       name: parsed.name,
+      template: parsed.template,
     };
   } catch {
     return undefined;
@@ -173,6 +188,7 @@ async function writeSessionRecordInternal(
         record.favorite = persistedLifecycle.favorite;
         record.favoritedAt = persistedLifecycle.favoritedAt;
         record.name = persistedLifecycle.name;
+        record.template = persistedLifecycle.template;
       }
     }
 
@@ -301,7 +317,7 @@ export async function listSessions(): Promise<SessionRecord[]> {
 
   for (const entry of entries) {
     const parsed = await loadRecordFromIndexEntry(entry);
-    if (parsed) {
+    if (parsed && !parsed.template) {
       records.push(parsed);
     }
   }
@@ -316,7 +332,19 @@ export async function listSessionsForAgent(agentCommand: string): Promise<Sessio
   );
   const records = await Promise.all(entries.map((entry) => loadRecordFromIndexEntry(entry)));
   return records
-    .filter((entry): entry is SessionRecord => Boolean(entry))
+    .filter((entry): entry is SessionRecord => entry !== undefined && !entry.template)
+    .toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
+}
+
+export async function listTemplateSessionsForAgent(agentCommand: string): Promise<SessionRecord[]> {
+  const entries = (await loadSessionIndexEntries()).filter(
+    (session) => session.agentCommand === agentCommand && session.kind !== "subagent",
+  );
+  const records = await Promise.all(entries.map((entry) => loadRecordFromIndexEntry(entry)));
+  return records
+    .filter(
+      (entry): entry is SessionRecord => entry !== undefined && entry.template?.enabled === true,
+    )
     .toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
 }
 
@@ -337,15 +365,18 @@ export async function findSession(options: FindSessionOptions): Promise<SessionR
   const normalizedCwd = absolutePath(options.cwd);
   const normalizedName = normalizeName(options.name);
   const entries = await loadSessionIndexEntries();
-  const match = entries.find(
+  const matches = entries.filter(
     (session) =>
       session.agentCommand === options.agentCommand &&
-      matchesSessionEntry(session, normalizedCwd, normalizedName, options.includeClosed),
+      matchesSessionEntry(session, normalizedCwd, normalizedName, options.includeClosed, true),
   );
-  if (!match) {
-    return undefined;
+  for (const match of matches) {
+    const record = await loadRecordFromIndexEntry(match);
+    if (record && (options.includeTemplates || !record.template)) {
+      return record;
+    }
   }
-  return await loadRecordFromIndexEntry(match);
+  return undefined;
 }
 
 export async function findSessionByDirectoryWalk(
@@ -365,9 +396,12 @@ export async function findSessionByDirectoryWalk(
   const walkRoot = path.parse(current).root;
 
   for (;;) {
-    const match = sessions.find((session) => matchesSessionEntry(session, current, normalizedName));
-    if (match) {
-      return await loadRecordFromIndexEntry(match);
+    const record = await findMatchingLoadedRecord(sessions, current, normalizedName, {
+      includeClosed: false,
+      includeTemplates: options.includeTemplates === true,
+    });
+    if (record) {
+      return record;
     }
 
     const parent = nextWalkParent(current, walkBoundary, walkRoot);
@@ -376,6 +410,24 @@ export async function findSessionByDirectoryWalk(
     }
     current = parent;
   }
+}
+
+async function findMatchingLoadedRecord(
+  sessions: SessionIndexEntry[],
+  cwd: string,
+  normalizedName: string | undefined,
+  options: { includeClosed: boolean; includeTemplates: boolean },
+): Promise<SessionRecord | undefined> {
+  const matches = sessions.filter((session) =>
+    matchesSessionEntry(session, cwd, normalizedName, options.includeClosed, true),
+  );
+  for (const match of matches) {
+    const record = await loadRecordFromIndexEntry(match);
+    if (record && (options.includeTemplates || !record.template)) {
+      return record;
+    }
+  }
+  return undefined;
 }
 
 function nextWalkParent(
