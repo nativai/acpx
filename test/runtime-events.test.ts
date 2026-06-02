@@ -54,6 +54,70 @@ test("parsePromptEventLine handles text chunks, usage updates, tool updates, and
         params: {
           sessionId: "s1",
           update: {
+            sessionUpdate: "agent_progress_update",
+            progress: {
+              phase: "thinking",
+              tokens: { reasoning: 958 },
+              final: true,
+              source: "codex",
+            },
+          },
+        },
+      }),
+    ),
+    {
+      type: "status",
+      text: "progress: thinking",
+      tag: "agent_progress_update",
+      progress: {
+        phase: "thinking",
+        tokens: { reasoning: 958 },
+        final: true,
+        source: "codex",
+      },
+    },
+  );
+
+  assert.deepEqual(
+    parsePromptEventLine(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "s1",
+          update: {
+            sessionUpdate: "agent_thought_chunk",
+            content: { type: "text", text: "thinking" },
+            progress: {
+              phase: "thinking",
+              tokens: { reasoning: 1200 },
+              source: "claude-code",
+            },
+          },
+        },
+      }),
+    ),
+    {
+      type: "text_delta",
+      text: "thinking",
+      stream: "thought",
+      tag: "agent_thought_chunk",
+      progress: {
+        phase: "thinking",
+        tokens: { reasoning: 1200 },
+        source: "claude-code",
+      },
+    },
+  );
+
+  assert.deepEqual(
+    parsePromptEventLine(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "s1",
+          update: {
             sessionUpdate: "tool_call_update",
             toolCallId: "call_READ",
             status: "in_progress",

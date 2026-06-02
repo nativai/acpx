@@ -1,5 +1,6 @@
 import { AcpClient } from "../../acp/client.js";
 import { formatErrorMessage } from "../../acp/error-normalization.js";
+import { supportsMidTurnPromptInjection } from "../../acp/mid-turn-injection-support.js";
 import { withTimeout } from "../../async-control.js";
 import { checkpointPerfMetricsCapture } from "../../perf-metrics-capture.js";
 import { setPerfGauge } from "../../perf-metrics.js";
@@ -214,16 +215,11 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
 
   const sessionRecord = await resolveSessionRecord(options.sessionId);
   // Mid-turn prompt injection (concurrent client.prompt() into an in-flight
-  // turn) relies on claude-agent-acp's specific behavior: a Pushable input
-  // feeding the Claude SDK plus the UUID-based pendingMessages handoff that
-  // lets a second session/prompt resolve once the active turn surfaces the
-  // injected user message. Other ACP adapters (codex, gemini, the test
-  // mock) do not implement that contract — a concurrent session/prompt
-  // there has undefined semantics. So for non-claude agents we leave the
-  // owner's mid-turn handler unset and new prompts land in the normal
-  // pending queue, preserving the queue-and-wait behavior the original
-  // acpx tests assert.
-  const midTurnInjectionSupported = sessionRecord.agentCommand.includes("claude-agent-acp");
+  // turn) relies on adapter-specific support for accepting a new prompt while
+  // another turn is active. Claude ACP and Codex ACP support that contract;
+  // adapters without known support keep the owner's mid-turn handler unset so
+  // new prompts land in the normal pending queue.
+  const midTurnInjectionSupported = supportsMidTurnPromptInjection(sessionRecord.agentCommand);
   let owner: SessionQueueOwner | undefined;
   let heartbeatTimer: NodeJS.Timeout | undefined;
   let idleDrain: { stop: () => Promise<void> } | undefined;

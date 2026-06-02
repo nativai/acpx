@@ -135,6 +135,24 @@ test("conversation model captures prompt, chunks, tool calls, and metadata", () 
     "2026-02-27T10:00:07.000Z",
   );
 
+  acpxState = recordSessionUpdate(
+    conversation,
+    acpxState,
+    {
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "agent_progress_update",
+        progress: {
+          phase: "thinking",
+          tokens: { reasoning: 958 },
+          final: true,
+          source: "codex",
+        },
+      },
+    } as unknown as SessionNotification,
+    "2026-02-27T10:00:07.500Z",
+  );
+
   acpxState = recordClientOperation(
     conversation,
     acpxState,
@@ -186,6 +204,12 @@ test("conversation model captures prompt, chunks, tool calls, and metadata", () 
 
   assert.equal(acpxState?.current_mode_id, "code");
   assert.deepEqual(acpxState?.available_commands, ["create_plan"]);
+  assert.deepEqual(acpxState?.progress, {
+    phase: "thinking",
+    tokens: { reasoning: 958 },
+    final: true,
+    source: "codex",
+  });
 });
 
 test("recordPromptSubmission preserves audio prompt content", () => {
@@ -245,6 +269,11 @@ test("cloneSessionAcpxState preserves desired mode id", () => {
       reasoning_effort: "high",
     },
     available_commands: ["review"],
+    progress: {
+      phase: "thinking",
+      tokens: { reasoning: 123 },
+      source: "codex",
+    },
     session_options: {
       model: "sonnet",
       allowed_tools: ["Read", "Grep"],
@@ -258,6 +287,11 @@ test("cloneSessionAcpxState preserves desired mode id", () => {
     reasoning_effort: "high",
   });
   assert.deepEqual(cloned?.available_commands, ["review"]);
+  assert.deepEqual(cloned?.progress, {
+    phase: "thinking",
+    tokens: { reasoning: 123 },
+    source: "codex",
+  });
   assert.deepEqual(cloned?.session_options, {
     model: "sonnet",
     allowed_tools: ["Read", "Grep"],

@@ -57,6 +57,7 @@ import { extractRuntimeSessionId } from "../session/runtime-session-id.js";
 import { buildSpawnCommandOptions } from "../spawn-command-options.js";
 import type {
   AcpClientOptions,
+  AgentProgress,
   NonInteractivePermissionPolicy,
   PermissionMode,
   PermissionStats,
@@ -94,8 +95,9 @@ import {
   waitForChildExit,
   waitForSpawn,
 } from "./client-process.js";
+import { isCodexAcpCommand } from "./codex-compat.js";
 import { extractAcpError } from "./error-shapes.js";
-import { isSessionUpdateNotification } from "./jsonrpc.js";
+import { avoidBidirectionalJsonRpcIdCollisions, isSessionUpdateNotification } from "./jsonrpc.js";
 import {
   formatSessionControlAcpSummary,
   maybeWrapSessionControlError,
@@ -182,6 +184,30 @@ type SessionUpdateSuppressionState = {
   suppressSessionUpdates: boolean;
   suppressReplaySessionUpdateMessages: boolean;
 };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readFiniteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function readNestedNumber(value: unknown, path: readonly string[]): number | undefined {
+  let cursor = value;
+  for (const segment of path) {
+    if (!isRecord(cursor)) {
+      return undefined;
+    }
+    cursor = cursor[segment];
+  }
+  return readFiniteNumber(cursor);
+}
+
+function maxFiniteNumber(values: readonly (number | undefined)[]): number | undefined {
+  const numbers = values.filter((value): value is number => value !== undefined);
+  return numbers.length > 0 ? Math.max(...numbers) : undefined;
+}
 
 export type AgentExitInfo = {
   exitCode: number | null;
@@ -634,7 +660,7 @@ export class AcpClient {
     readable: ReadableStream<AnyMessage>;
     writable: WritableStream<AnyMessage>;
   }): ClientSideConnection {
-    return new ClientSideConnection(
+    const connection = new ClientSideConnection(
       () => ({
         sessionUpdate: async (params: SessionNotification) => {
           await this.handleSessionUpdate(params);
@@ -672,6 +698,11 @@ export class AcpClient {
       }),
       stream,
     );
+    // The ACP SDK starts client request ids at 0. Some bidirectional ACP
+    // adapters also issue client-bound requests from 0; using a disjoint range
+    // avoids same-id overlap between e.g. session/prompt and request_permission.
+    avoidBidirectionalJsonRpcIdCollisions(connection);
+    return connection;
   }
 
   private async initializeAgentConnection(params: {
@@ -944,7 +975,10 @@ export class AcpClient {
     };
 
     try {
-      return this.returnPromptResponseOrPermissionFailure(sessionId, await promptPromise);
+      const response = await promptPromise;
+      this.throwPromptPermissionFailureIfPresent(sessionId);
+      await this.emitCodexFinalProgressUpdate(sessionId, response);
+      return response;
     } catch (error) {
       this.throwPromptPermissionFailureIfPresent(sessionId);
       throw error;
@@ -984,6 +1018,62 @@ export class AcpClient {
     if (permissionFailure) {
       throw permissionFailure;
     }
+  }
+
+  private isCodexBackend(): boolean {
+    const command = splitCommandLine(this.options.agentCommand);
+    return isCodexAcpCommand(command.command, command.args);
+  }
+
+  private readCodexFinalReasoningTokens(response: PromptResponse): number | undefined {
+    const rawResponse = response as unknown;
+    return maxFiniteNumber([
+      readNestedNumber(rawResponse, ["thoughtTokens"]),
+      readNestedNumber(rawResponse, ["usage", "thoughtTokens"]),
+      readNestedNumber(rawResponse, ["usage", "reasoningOutputTokens"]),
+      readNestedNumber(rawResponse, ["_meta", "quota", "token_count", "reasoningOutputTokens"]),
+      readNestedNumber(rawResponse, [
+        "usage",
+        "_meta",
+        "quota",
+        "token_count",
+        "reasoningOutputTokens",
+      ]),
+    ]);
+  }
+
+  private async emitCodexFinalProgressUpdate(
+    sessionId: string,
+    response: PromptResponse,
+  ): Promise<void> {
+    if (!this.isCodexBackend()) {
+      return;
+    }
+    const reasoning = this.readCodexFinalReasoningTokens(response);
+    if (reasoning === undefined) {
+      return;
+    }
+    const progress: AgentProgress = {
+      phase: "thinking",
+      tokens: { reasoning },
+      final: true,
+      source: "codex",
+    };
+    const notification: SessionNotification = {
+      sessionId,
+      update: {
+        sessionUpdate: "agent_progress_update",
+        progress,
+      } as unknown as SessionNotification["update"],
+    };
+    const message: AnyMessage = {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: notification,
+    };
+    this.eventHandlers.onAcpOutputMessage?.("inbound", message);
+    this.eventHandlers.onAcpMessage?.("inbound", message);
+    await this.handleSessionUpdate(notification);
   }
 
   async setSessionMode(sessionId: string, modeId: string): Promise<void> {

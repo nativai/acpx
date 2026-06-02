@@ -335,6 +335,23 @@ export type SessionTokenUsage = {
   cache_read_input_tokens?: number;
 };
 
+export type AgentProgressPhase = "thinking" | "responding" | "tool_calling" | "idle";
+
+export type AgentProgressTokens = {
+  reasoning?: number;
+  output?: number;
+  input?: number;
+  total?: number;
+};
+
+export type AgentProgress = {
+  phase: AgentProgressPhase;
+  label?: string;
+  tokens?: AgentProgressTokens;
+  final?: boolean;
+  source?: string;
+};
+
 export type SessionConversation = {
   title?: string | null;
   messages: SessionMessage[];
@@ -351,6 +368,7 @@ export type SessionAcpxState = {
   current_model_id?: string;
   available_models?: string[];
   available_commands?: string[];
+  progress?: AgentProgress;
   config_options?: SessionConfigOption[];
   session_options?: {
     model?: string;

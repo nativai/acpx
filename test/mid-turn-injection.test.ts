@@ -13,10 +13,12 @@
 //     against regressing to that behavior: it fails if buildPromptStartedHook
 //     returns undefined on retry.)
 //   - the registered handler calls `client.prompt()` for the injected task and
-//     tracks the promise so the turn can await it.
-//   - `drainInjectedPrompts()` clears the handler and awaits all in-flight
+//     tracks wait-for-completion promises so the turn can await them.
+//   - `drainInjectedPrompts()` clears the handler and awaits tracked in-flight
 //     injected prompts before the turn settles (on both the success and the
-//     failure/retry paths).
+//     failure/retry paths). Fire-and-forget injected prompts are deliberately
+//     not tracked because Codex ACP can act on them without returning a terminal
+//     JSON-RPC response for that injected request.
 //
 // These tests drive the real `runQueuedTask` -> `runSessionPrompt` -> retry
 // path with a mock `AcpClient` (passed as `sharedClient`) and a real
@@ -193,6 +195,7 @@ function makeQueueTask(
   text: string,
   onSend: (message: QueueOwnerMessage) => void,
   onClose: () => void,
+  waitForCompletion = true,
 ): QueueTask {
   return {
     requestId,
@@ -200,7 +203,7 @@ function makeQueueTask(
     prompt: textPrompt(text),
     permissionMode: "approve-all",
     timeoutMs: 10_000,
-    waitForCompletion: true,
+    waitForCompletion,
     enqueuedAt: Date.now(),
     send: onSend,
     close: onClose,
@@ -457,11 +460,92 @@ async function runRetryInjectionScenario(): Promise<void> {
   });
 }
 
+async function runFireAndForgetInjectionWithoutTerminalResponseScenario(): Promise<void> {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeSessionRecord(homeDir);
+      await writeSessionRecordFile(homeDir, record);
+
+      const injectionInitiated = createDeferred<void>();
+
+      const control = makeMockClient({
+        onMainPrompt: async () => {
+          await injectionInitiated.promise;
+          return { stopReason: "end_turn" };
+        },
+        onInjectedPrompt: async () => {
+          injectionInitiated.resolve();
+          return await new Promise<PromptResponse>(() => {});
+        },
+      });
+
+      const injectedSends: QueueOwnerMessage[] = [];
+      let injectedCloses = 0;
+      const midTurn = makeMidTurnControl((registration, ctrl) => {
+        if (registration === 1) {
+          const injectedTask = makeQueueTask(
+            "req-fire-and-forget-injected",
+            INJECTED_PROMPT_TEXT,
+            (message) => injectedSends.push(message),
+            () => {
+              injectedCloses += 1;
+            },
+            false,
+          );
+          queueMicrotask(() => {
+            ctrl.currentHandler?.(injectedTask);
+          });
+        }
+      });
+
+      const mainSends: QueueOwnerMessage[] = [];
+      let mainCloses = 0;
+      const mainTask = makeQueueTask(
+        "req-main-fire-and-forget",
+        MAIN_PROMPT_TEXT,
+        (message) => mainSends.push(message),
+        () => {
+          mainCloses += 1;
+        },
+      );
+
+      await Promise.race([
+        runQueuedTask(record.acpxRecordId, mainTask, {
+          sharedClient: control.client,
+          setMidTurnHandler: midTurn.setMidTurnHandler,
+          suppressSdkConsoleErrors: true,
+        }),
+        new Promise<never>((_resolve, reject) => {
+          setTimeout(() => {
+            reject(new Error("timed out waiting for fire-and-forget injected prompt drain"));
+          }, 250);
+        }),
+      ]);
+
+      assert.ok(
+        mainSends.find((m) => m.type === "result"),
+        "main task settled even though injected prompt never returned",
+      );
+      assert.equal(mainCloses, 1, "main task closed exactly once");
+      assert.equal(midTurn.registrations, 1, "mid-turn handler registered for the main attempt");
+      assert.equal(midTurn.clears, 1, "mid-turn handler cleared after the main attempt");
+
+      const injectedCalls = control.promptCalls.filter((c) => c.kind === "injected");
+      assert.equal(injectedCalls.length, 1, "fire-and-forget injected prompt was still sent");
+      assert.deepEqual(injectedSends, [], "fire-and-forget injected task sent no result/error");
+      assert.equal(injectedCloses, 0, "pending fire-and-forget task was not double-closed");
+    });
+  });
+}
+
 // One standing test covering both injection scenarios: injection during the
-// active turn on attempt 0 (drained across a failed-then-retried turn), and
-// injection during the retried attempt itself (the core fork guard). Kept as a
-// single test so the two scenarios share the same isolated, sequential run.
+// active turn on attempt 0 (drained across a failed-then-retried turn),
+// injection during the retried attempt itself (the core fork guard), and a
+// Codex ACP fire-and-forget injection that never returns a terminal response.
+// Kept as a single test so the scenarios share the same isolated, sequential
+// run.
 test("mid-turn prompt injection fires and settles exactly once, including across a retry", async () => {
   await runAttempt0InjectionScenario();
   await runRetryInjectionScenario();
+  await runFireAndForgetInjectionWithoutTerminalResponseScenario();
 });

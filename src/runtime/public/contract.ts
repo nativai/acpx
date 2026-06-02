@@ -5,6 +5,7 @@ import type {
   McpServer,
   NonInteractivePermissionPolicy,
   PermissionMode,
+  AgentProgress,
   SessionRecord,
 } from "../../types.js";
 import type { SessionAgentOptions } from "../engine/session-options.js";
@@ -20,6 +21,7 @@ export type AcpRuntimeSessionMode = "persistent" | "oneshot";
 export type AcpSessionUpdateTag =
   | "agent_message_chunk"
   | "agent_thought_chunk"
+  | "agent_progress_update"
   | "tool_call"
   | "tool_call_update"
   | "usage_update"
@@ -111,6 +113,7 @@ export type AcpRuntimeEvent =
       text: string;
       stream?: "output" | "thought";
       tag?: AcpSessionUpdateTag;
+      progress?: AgentProgress;
     }
   | {
       type: "status";
@@ -118,6 +121,7 @@ export type AcpRuntimeEvent =
       tag?: AcpSessionUpdateTag;
       used?: number;
       size?: number;
+      progress?: AgentProgress;
     }
   | {
       type: "tool_call";
@@ -131,6 +135,7 @@ export type AcpRuntimeEvent =
       rawInput?: unknown;
       rawOutput?: unknown;
       content?: ToolCallContent[];
+      progress?: AgentProgress;
     }
   /**
    * Compatibility terminal event emitted by runTurn(...). startTurn(...).events

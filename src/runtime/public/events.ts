@@ -1,4 +1,5 @@
 import type { ToolCallContent, ToolCallLocation, ToolKind } from "@agentclientprotocol/sdk";
+import type { AgentProgress, AgentProgressPhase, AgentProgressTokens } from "../../types.js";
 import type { AcpRuntimeEvent, AcpSessionUpdateTag } from "./contract.js";
 import { asOptionalString, asString, asTrimmedString, isRecord } from "./shared.js";
 
@@ -15,6 +16,84 @@ function safeParseJsonObject(line: string): Record<string, unknown> | null {
 
 function asOptionalFiniteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function asAgentProgressPhase(value: unknown): AgentProgressPhase | undefined {
+  return value === "thinking" ||
+    value === "responding" ||
+    value === "tool_calling" ||
+    value === "idle"
+    ? value
+    : undefined;
+}
+
+function readProgressTokens(value: unknown): AgentProgressTokens | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const tokens: AgentProgressTokens = {};
+  const reasoning = asOptionalFiniteNumber(value.reasoning);
+  const output = asOptionalFiniteNumber(value.output);
+  const input = asOptionalFiniteNumber(value.input);
+  const total = asOptionalFiniteNumber(value.total);
+  if (reasoning !== undefined) {
+    tokens.reasoning = reasoning;
+  }
+  if (output !== undefined) {
+    tokens.output = output;
+  }
+  if (input !== undefined) {
+    tokens.input = input;
+  }
+  if (total !== undefined) {
+    tokens.total = total;
+  }
+  return Object.keys(tokens).length > 0 ? tokens : undefined;
+}
+
+function readAgentProgress(value: unknown): AgentProgress | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const phase = asAgentProgressPhase(value.phase);
+  if (!phase) {
+    return undefined;
+  }
+  const progress: AgentProgress = { phase };
+  const label = asOptionalString(value.label);
+  const source = asOptionalString(value.source);
+  const tokens = readProgressTokens(value.tokens);
+  if (label) {
+    progress.label = label;
+  }
+  if (tokens) {
+    progress.tokens = tokens;
+  }
+  if (typeof value.final === "boolean") {
+    progress.final = value.final;
+  }
+  if (source) {
+    progress.source = source;
+  }
+  return progress;
+}
+
+function createTextDeltaWithProgress(params: {
+  text: string;
+  stream: "output" | "thought";
+  tag: AcpSessionUpdateTag;
+  progress?: AgentProgress;
+}): AcpRuntimeEvent {
+  const event: AcpRuntimeEvent = {
+    type: "text_delta",
+    text: params.text,
+    stream: params.stream,
+    tag: params.tag,
+  };
+  if (params.progress) {
+    event.progress = params.progress;
+  }
+  return event;
 }
 
 function resolveStructuredPromptPayload(parsed: Record<string, unknown>): {
@@ -115,6 +194,7 @@ function resolveTextChunk(params: {
   stream: "output" | "thought";
   tag: AcpSessionUpdateTag;
 }): AcpRuntimeEvent | null {
+  const progress = readAgentProgress(params.payload.progress);
   const contentRaw = params.payload.content;
   if (isRecord(contentRaw)) {
     const contentType = asTrimmedString(contentRaw.type);
@@ -123,24 +203,24 @@ function resolveTextChunk(params: {
     }
     const text = asString(contentRaw.text);
     if (text && text.length > 0) {
-      return {
-        type: "text_delta",
+      return createTextDeltaWithProgress({
         text,
         stream: params.stream,
         tag: params.tag,
-      };
+        progress,
+      });
     }
   }
   const text = asString(params.payload.text);
   if (!text || text.length === 0) {
     return null;
   }
-  return {
-    type: "text_delta",
+  return createTextDeltaWithProgress({
     text,
     stream: params.stream,
     tag: params.tag,
-  };
+    progress,
+  });
 }
 
 function createTextDeltaEvent(params: {
@@ -314,6 +394,16 @@ function readToolKind(value: unknown): ToolKind | undefined {
   return kind && TOOL_KINDS.has(kind) ? (kind as ToolKind) : undefined;
 }
 
+function selectToolDetailSummary(params: {
+  tag: AcpSessionUpdateTag;
+  inputSummary?: string;
+  outputSummary?: string;
+}): string | undefined {
+  return params.tag === "tool_call_update"
+    ? (params.outputSummary ?? params.inputSummary)
+    : (params.inputSummary ?? params.outputSummary);
+}
+
 const TOOL_KINDS = new Set([
   "read",
   "edit",
@@ -330,6 +420,7 @@ function createToolCallEvent(params: {
   payload: Record<string, unknown>;
   tag: AcpSessionUpdateTag;
 }): AcpRuntimeEvent {
+  const progress = readAgentProgress(params.payload.progress);
   const title = asTrimmedString(params.payload.title) || "tool call";
   const status = asTrimmedString(params.payload.status);
   const inputSummary = summarizeToolInput(params.payload.rawInput);
@@ -338,16 +429,20 @@ function createToolCallEvent(params: {
   const toolCallId = asOptionalString(params.payload.toolCallId);
   const kind = readToolKind(params.payload.kind);
   const summaryText = status ? `${title} (${status})` : title;
-  const detailSummary =
-    params.tag === "tool_call_update"
-      ? (outputSummary ?? inputSummary)
-      : (inputSummary ?? outputSummary);
+  const detailSummary = selectToolDetailSummary({
+    tag: params.tag,
+    inputSummary,
+    outputSummary,
+  });
   const event: AcpRuntimeEvent = {
     type: "tool_call",
     text: detailSummary ? `${summaryText}: ${detailSummary}` : summaryText,
     tag: params.tag,
     title,
   };
+  if (progress) {
+    event.progress = progress;
+  }
   assignToolCallEventMetadata(event, params.payload, { toolCallId, status, kind });
   return event;
 }
@@ -428,6 +523,7 @@ const PROMPT_EVENT_PARSERS: Record<string, PromptEventParser> = {
     resolveTextChunk({ payload, stream: "output", tag: "agent_message_chunk" }),
   agent_thought_chunk: (payload) =>
     resolveTextChunk({ payload, stream: "thought", tag: "agent_thought_chunk" }),
+  agent_progress_update: agentProgressUpdateEvent,
   usage_update: usageUpdateEvent,
   available_commands_update: (payload) => statusUpdateEvent("available_commands_update", payload),
   current_mode_update: (payload) => statusUpdateEvent("current_mode_update", payload),
@@ -447,6 +543,7 @@ function promptEventParser(type: string): PromptEventParser | undefined {
 function usageUpdateEvent(payload: Record<string, unknown>): AcpRuntimeEvent {
   const used = asOptionalFiniteNumber(payload.used);
   const size = asOptionalFiniteNumber(payload.size);
+  const progress = readAgentProgress(payload.progress);
   const text = used != null && size != null ? `usage updated: ${used}/${size}` : "usage updated";
   return {
     type: "status",
@@ -454,6 +551,20 @@ function usageUpdateEvent(payload: Record<string, unknown>): AcpRuntimeEvent {
     tag: "usage_update",
     ...(used != null ? { used } : {}),
     ...(size != null ? { size } : {}),
+    ...(progress ? { progress } : {}),
+  };
+}
+
+function agentProgressUpdateEvent(payload: Record<string, unknown>): AcpRuntimeEvent | null {
+  const progress = readAgentProgress(payload.progress);
+  if (!progress) {
+    return null;
+  }
+  return {
+    type: "status",
+    text: progress.label ?? `progress: ${progress.phase}`,
+    tag: "agent_progress_update",
+    progress,
   };
 }
 

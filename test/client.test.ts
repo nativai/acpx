@@ -59,6 +59,10 @@ type ClientInternals = {
   ) => PermissionPromptUnavailableError | undefined;
   handleSessionUpdate?: (notification: { sessionId: string }) => Promise<void>;
   waitForSessionUpdateDrain?: (idleMs: number, timeoutMs: number) => Promise<void>;
+  emitCodexFinalProgressUpdate?: (
+    sessionId: string,
+    response: { stopReason: "end_turn" | "cancelled"; thoughtTokens?: number; _meta?: unknown },
+  ) => Promise<void>;
   recordAgentExit?: (
     reason: "process_exit" | "process_close" | "pipe_close" | "connection_close",
     exitCode: number | null,
@@ -1115,6 +1119,58 @@ test("AcpClient close resets in-memory state and shuts down terminal manager", a
   assert.equal(internals.suppressSessionUpdates, false);
   assert.equal(internals.suppressReplaySessionUpdateMessages, false);
   assert.equal(internals.closing, true);
+});
+
+test("AcpClient emits final Codex reasoning usage as generic progress", async () => {
+  const rawMessages: unknown[] = [];
+  const outputMessages: unknown[] = [];
+  const updates: unknown[] = [];
+  const client = makeClient({
+    agentCommand: "npx @zed-industries/codex-acp@^0.12.0",
+    onAcpMessage: (_direction, message) => {
+      rawMessages.push(message);
+    },
+    onAcpOutputMessage: (_direction, message) => {
+      outputMessages.push(message);
+    },
+    onSessionUpdate: (notification) => {
+      updates.push(notification);
+    },
+  });
+
+  await asInternals(client).emitCodexFinalProgressUpdate?.("session-1", {
+    stopReason: "end_turn",
+    thoughtTokens: 958,
+    _meta: {
+      quota: {
+        token_count: {
+          reasoningOutputTokens: 900,
+        },
+      },
+    },
+  });
+
+  const expectedNotification = {
+    sessionId: "session-1",
+    update: {
+      sessionUpdate: "agent_progress_update",
+      progress: {
+        phase: "thinking",
+        tokens: { reasoning: 958 },
+        final: true,
+        source: "codex",
+      },
+    },
+  };
+  const expectedMessage = {
+    jsonrpc: "2.0",
+    method: "session/update",
+    params: expectedNotification,
+  };
+
+  assert.deepEqual(rawMessages, [expectedMessage]);
+  assert.deepEqual(outputMessages, [expectedMessage]);
+  assert.deepEqual(updates, [expectedNotification]);
 });
 
 function makeClient(

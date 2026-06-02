@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { Command, InvalidArgumentError } from "commander";
 import { isLegacyZedCodexAcpInvocation } from "../acp/codex-compat.js";
+import { listBuiltInAgents, resolveAgentCommand } from "../agent-registry.js";
 import { AgentSpawnError, SessionNotFoundError } from "../errors.js";
 import { loadPermissionPolicySpec } from "../permission-policy.js";
 import {
@@ -16,6 +17,8 @@ import {
   findGitRepositoryRoot,
   findSession,
   findSessionByDirectoryWalk,
+  listSessions,
+  normalizeName,
   resolveSessionRecord,
   writeSessionRecord,
 } from "../session/persistence.js";
@@ -333,6 +336,76 @@ async function findScopedSessionOrThrow(
   }
 
   return record;
+}
+
+function agentNamesForCommand(agentCommand: string, config: ResolvedAcpxConfig): string[] {
+  return listBuiltInAgents(config.agents).filter(
+    (name) => resolveAgentCommand(name, config.agents) === agentCommand,
+  );
+}
+
+function explicitSessionCommand(
+  agentCommand: string,
+  sessionName: string | undefined,
+  subcommand: string,
+  config: ResolvedAcpxConfig,
+): string {
+  const names = agentNamesForCommand(agentCommand, config);
+  const prefix = names[0] ? `acpx ${names[0]}` : `acpx --agent ${JSON.stringify(agentCommand)}`;
+  return sessionName
+    ? `${prefix} sessions ${subcommand} ${sessionName}`
+    : `${prefix} sessions ${subcommand}`;
+}
+
+async function findGenericReadableSessionOrThrow(
+  agent: ResolvedAgentInvocation,
+  sessionName: string | undefined,
+  subcommand: string,
+  config: ResolvedAcpxConfig,
+): Promise<SessionRecord> {
+  const defaultScopedRecord = await findSession({
+    agentCommand: agent.agentCommand,
+    cwd: agent.cwd,
+    name: sessionName,
+    includeClosed: true,
+  });
+
+  if (defaultScopedRecord) {
+    return defaultScopedRecord;
+  }
+
+  const normalizedName = normalizeName(sessionName);
+  const candidates = (await listSessions()).filter(
+    (record) =>
+      record.kind !== "subagent" &&
+      record.cwd === agent.cwd &&
+      (normalizedName == null ? record.name == null : record.name === normalizedName),
+  );
+
+  if (candidates.length === 1) {
+    return candidates[0];
+  }
+
+  const baseMessage = missingScopedSessionMessage(agent, sessionName);
+  const defaultHint = `Searched default agent ${agent.agentName}.`;
+
+  if (candidates.length === 0) {
+    throw new Error(
+      `${baseMessage}\n${defaultHint} To inspect another agent, use \`acpx <agent> sessions ${subcommand}${
+        sessionName ? ` ${sessionName}` : ""
+      }\`.`,
+    );
+  }
+
+  const suggestions = candidates
+    .map(
+      (candidate) =>
+        `  - ${explicitSessionCommand(candidate.agentCommand, sessionName, subcommand, config)}`,
+    )
+    .join("\n");
+  throw new Error(
+    `${baseMessage}\n${defaultHint} Multiple matching sessions exist across agents; use an explicit agent command:\n${suggestions}`,
+  );
 }
 
 async function findRoutedSessionOrThrow(
@@ -1148,7 +1221,10 @@ export async function handleSessionsShow(
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const record = await findScopedSessionOrThrow(agent, sessionName);
+  const record =
+    explicitAgentName == null
+      ? await findGenericReadableSessionOrThrow(agent, sessionName, "show", config)
+      : await findScopedSessionOrThrow(agent, sessionName);
 
   printSessionDetailsByFormat(record, globalFlags.format);
 }
@@ -1162,7 +1238,11 @@ export async function handleSessionsHistory(
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const record = await findScopedSessionOrThrow(agent, sessionName);
+  const subcommand = command.name() === "read" ? "read" : "history";
+  const record =
+    explicitAgentName == null
+      ? await findGenericReadableSessionOrThrow(agent, sessionName, subcommand, config)
+      : await findScopedSessionOrThrow(agent, sessionName);
 
   printSessionHistoryByFormat(record, flags.limit, globalFlags.format);
 }

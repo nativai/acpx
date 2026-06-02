@@ -738,6 +738,111 @@ test("sessions ensure resolves existing session by directory walk", async () => 
   });
 });
 
+test("generic sessions show resolves a uniquely matching non-default agent session", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          defaultAgent: "claude",
+          agents: {
+            claude: {
+              command: "mock-claude-acp",
+            },
+            codex: {
+              command: "mock-codex-acp",
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "codex-named-session",
+      acpSessionId: "codex-named-session",
+      agentCommand: "mock-codex-acp",
+      cwd,
+      name: "hod-codex-model-steering",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:00:00.000Z",
+      closed: false,
+    });
+
+    const result = await runCli(
+      ["--cwd", cwd, "sessions", "show", "hod-codex-model-steering"],
+      homeDir,
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /id: codex-named-session/);
+    assert.match(result.stdout, /agent: mock-codex-acp/);
+  });
+});
+
+test("generic sessions show reports ambiguous cross-agent matches with explicit commands", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          defaultAgent: "claude",
+          agents: {
+            claude: {
+              command: "mock-claude-acp",
+            },
+            codex: {
+              command: "mock-codex-acp",
+            },
+            pi: {
+              command: "mock-pi-acp",
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "codex-ambiguous-session",
+      acpSessionId: "codex-ambiguous-session",
+      agentCommand: "mock-codex-acp",
+      cwd,
+      name: "shared",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:00:00.000Z",
+      closed: false,
+    });
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "pi-ambiguous-session",
+      acpSessionId: "pi-ambiguous-session",
+      agentCommand: "mock-pi-acp",
+      cwd,
+      name: "shared",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-02T00:00:00.000Z",
+      closed: false,
+    });
+
+    const result = await runCli(["--cwd", cwd, "sessions", "show", "shared"], homeDir);
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /Searched default agent claude/);
+    assert.match(result.stderr, /acpx codex sessions show shared/);
+    assert.match(result.stderr, /acpx pi sessions show shared/);
+  });
+});
+
 test("sessions and status surface agentSessionId for codex and claude in JSON mode", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

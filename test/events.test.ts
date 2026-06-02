@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  ACPX_CLIENT_JSON_RPC_ID_FLOOR,
+  avoidBidirectionalJsonRpcIdCollisions,
   isAcpJsonRpcMessage,
   isJsonRpcNotification,
   isSessionUpdateNotification,
@@ -21,6 +23,15 @@ test("isAcpJsonRpcMessage accepts JSON-RPC request", () => {
     }),
     true,
   );
+});
+
+test("avoidBidirectionalJsonRpcIdCollisions moves SDK client ids to a high range", () => {
+  const connection = { connection: { nextRequestId: 6 } };
+
+  assert.equal(avoidBidirectionalJsonRpcIdCollisions(connection), true);
+  assert.equal(connection.connection.nextRequestId, ACPX_CLIENT_JSON_RPC_ID_FLOOR);
+  assert.equal(avoidBidirectionalJsonRpcIdCollisions(connection), false);
+  assert.equal(connection.connection.nextRequestId, ACPX_CLIENT_JSON_RPC_ID_FLOOR);
 });
 
 test("isAcpJsonRpcMessage accepts JSON-RPC notification", () => {

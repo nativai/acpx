@@ -3434,6 +3434,91 @@ test("integration: prompt --no-wait is processed by the detached queue owner", a
   });
 });
 
+test("integration: codex-acp prompt --no-wait injects into an active queue-owner turn", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-codex-"));
+
+    try {
+      await writeFakeCodexAgent(fakeBinDir);
+
+      const codexAgentArgs = ["--agent", "codex-acp", "--approve-all", "--cwd", cwd];
+      const env = {
+        ACPX_SESSION_URL: "",
+        PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+      };
+      const created = await runCli(
+        [...codexAgentArgs, "--format", "json", "sessions", "new"],
+        homeDir,
+        { env },
+      );
+      assert.equal(created.code, 0, created.stderr);
+
+      const activeTurn = await runCli(
+        [
+          ...codexAgentArgs,
+          "--format",
+          "json",
+          "--ttl",
+          "10",
+          "prompt",
+          "--no-wait",
+          "stream-sleep 5000 codex-active-turn",
+        ],
+        homeDir,
+        { env },
+      );
+      assert.equal(activeTurn.code, 0, activeTurn.stderr);
+
+      await waitFor(async () => {
+        const history = await runCli(
+          [...codexAgentArgs, "--format", "quiet", "sessions", "read"],
+          homeDir,
+          { env },
+        );
+        assert.equal(history.code, 0, history.stderr);
+        return history.stdout.includes("codex-active-turn") ? history.stdout : null;
+      }, 5_000);
+
+      const injected = await runCli(
+        [
+          ...codexAgentArgs,
+          "--format",
+          "json",
+          "--ttl",
+          "10",
+          "prompt",
+          "--no-wait",
+          "echo codex-midturn-injected",
+        ],
+        homeDir,
+        { env },
+      );
+      assert.equal(injected.code, 0, injected.stderr);
+
+      await waitFor(async () => {
+        const history = await runCli(
+          [...codexAgentArgs, "--format", "quiet", "sessions", "read"],
+          homeDir,
+          { env },
+        );
+        assert.equal(history.code, 0, history.stderr);
+        return history.stdout.includes("codex-midturn-injected") ? history.stdout : null;
+      }, 1_500);
+
+      const closed = await runCli(
+        [...codexAgentArgs, "--format", "json", "sessions", "close"],
+        homeDir,
+        { env },
+      );
+      assert.equal(closed.code, 0, closed.stderr);
+    } finally {
+      await fs.rm(fakeBinDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: sessions recover force-kills the queue owner, is idempotent, and the next prompt cold-respawns", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
@@ -4122,6 +4207,23 @@ async function writeFakeQoderAgent(binDir: string, argLogPath?: string): Promise
       `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,
       "",
     ].join("\n"),
+    { encoding: "utf8", mode: 0o755 },
+  );
+}
+
+async function writeFakeCodexAgent(binDir: string): Promise<void> {
+  if (process.platform === "win32") {
+    await fs.writeFile(
+      path.join(binDir, "codex-acp.cmd"),
+      ["@echo off", "setlocal", `"${process.execPath}" "${MOCK_AGENT_PATH}" %*`, ""].join("\r\n"),
+      { encoding: "utf8" },
+    );
+    return;
+  }
+
+  await fs.writeFile(
+    path.join(binDir, "codex-acp"),
+    ["#!/bin/sh", `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`, ""].join("\n"),
     { encoding: "utf8", mode: 0o755 },
   );
 }

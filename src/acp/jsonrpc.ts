@@ -2,6 +2,8 @@ import type { AnyMessage, SessionNotification } from "@agentclientprotocol/sdk";
 
 type JsonRpcId = string | number | null;
 
+export const ACPX_CLIENT_JSON_RPC_ID_FLOOR = 1_000_000;
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
@@ -134,4 +136,23 @@ export function parseJsonRpcErrorMessage(message: AnyMessage): string | undefine
     return undefined;
   }
   return errorRecord.message;
+}
+
+export function avoidBidirectionalJsonRpcIdCollisions(connection: unknown): boolean {
+  const outer = asRecord(connection);
+  const inner = asRecord(outer?.connection);
+  if (!inner) {
+    return false;
+  }
+
+  const current = inner.nextRequestId;
+  if (typeof current !== "number" || !Number.isFinite(current)) {
+    return false;
+  }
+  if (current >= ACPX_CLIENT_JSON_RPC_ID_FLOOR) {
+    return false;
+  }
+
+  inner.nextRequestId = ACPX_CLIENT_JSON_RPC_ID_FLOOR;
+  return true;
 }

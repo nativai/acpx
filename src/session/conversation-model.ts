@@ -9,6 +9,9 @@ import type {
 } from "@agentclientprotocol/sdk";
 import { textPrompt } from "../prompt-content.js";
 import type {
+  AgentProgress,
+  AgentProgressPhase,
+  AgentProgressTokens,
   ClientOperation,
   PromptInput,
   SessionAcpxState,
@@ -28,6 +31,13 @@ export type LegacyHistoryEntry = {
   timestamp: string;
   textPreview: string;
 };
+
+type ProgressSessionUpdate = {
+  sessionUpdate: "agent_progress_update";
+  progress?: unknown;
+};
+
+type ExtendedSessionUpdate = SessionUpdate | ProgressSessionUpdate;
 
 const MAX_RUNTIME_MESSAGES = 200;
 const MAX_RUNTIME_AGENT_TEXT_CHARS = 8_000;
@@ -49,6 +59,93 @@ function deepClone<T>(value: T): T {
 
 function hasOwn(source: object, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(source, key);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function asAgentProgressPhase(value: unknown): AgentProgressPhase | undefined {
+  return value === "thinking" ||
+    value === "responding" ||
+    value === "tool_calling" ||
+    value === "idle"
+    ? value
+    : undefined;
+}
+
+function readFiniteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function readProgressTokens(value: unknown): AgentProgressTokens | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const tokens: AgentProgressTokens = {};
+  const reasoning = readFiniteNumber(value.reasoning);
+  const output = readFiniteNumber(value.output);
+  const input = readFiniteNumber(value.input);
+  const total = readFiniteNumber(value.total);
+  if (reasoning !== undefined) {
+    tokens.reasoning = reasoning;
+  }
+  if (output !== undefined) {
+    tokens.output = output;
+  }
+  if (input !== undefined) {
+    tokens.input = input;
+  }
+  if (total !== undefined) {
+    tokens.total = total;
+  }
+  return Object.keys(tokens).length > 0 ? tokens : undefined;
+}
+
+function readOptionalNonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value ? value : undefined;
+}
+
+function assignProgressDetails(
+  progress: AgentProgress,
+  value: Record<string, unknown>,
+): AgentProgress {
+  const label = readOptionalNonEmptyString(value.label);
+  const source = readOptionalNonEmptyString(value.source);
+  const tokens = readProgressTokens(value.tokens);
+  if (label) {
+    progress.label = label;
+  }
+  if (tokens) {
+    progress.tokens = tokens;
+  }
+  if (typeof value.final === "boolean") {
+    progress.final = value.final;
+  }
+  if (source) {
+    progress.source = source;
+  }
+  return progress;
+}
+
+function readAgentProgress(value: unknown): AgentProgress | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const phase = asAgentProgressPhase(value.phase);
+  if (!phase) {
+    return undefined;
+  }
+  return assignProgressDetails({ phase }, value);
+}
+
+function recordProgress(state: SessionAcpxState, update: ExtendedSessionUpdate): void {
+  const progress = readAgentProgress(
+    isRecord(update) ? (update as Record<string, unknown>).progress : undefined,
+  );
+  if (progress) {
+    state.progress = progress;
+  }
 }
 
 function normalizeAgentName(value: unknown): string | undefined {
@@ -508,6 +605,7 @@ export function cloneSessionAcpxState(
     current_model_id: state.current_model_id,
     available_models: state.available_models ? [...state.available_models] : undefined,
     available_commands: state.available_commands ? [...state.available_commands] : undefined,
+    progress: state.progress ? deepClone(state.progress) : undefined,
     config_options: state.config_options ? deepClone(state.config_options) : undefined,
     session_options: cloneSessionOptions(state.session_options),
   };
@@ -631,7 +729,8 @@ export function recordSessionUpdate(
 ): SessionAcpxState {
   const acpx = ensureAcpxState(state);
 
-  const update: SessionUpdate = notification.update;
+  const update = notification.update as ExtendedSessionUpdate;
+  recordProgress(acpx, update);
   applySessionUpdate(conversation, acpx, update);
 
   updateConversationTimestamp(conversation, timestamp);
@@ -642,7 +741,7 @@ export function recordSessionUpdate(
 function applySessionUpdate(
   conversation: SessionConversation,
   acpx: SessionAcpxState,
-  update: SessionUpdate,
+  update: ExtendedSessionUpdate,
 ): void {
   const handler = SESSION_UPDATE_HANDLERS[update.sessionUpdate];
   handler?.(conversation, acpx, update);
@@ -651,7 +750,7 @@ function applySessionUpdate(
 type SessionUpdateHandler = (
   conversation: SessionConversation,
   acpx: SessionAcpxState,
-  update: SessionUpdate,
+  update: ExtendedSessionUpdate,
 ) => void;
 
 const SESSION_UPDATE_HANDLERS: Record<string, SessionUpdateHandler> = {
@@ -670,6 +769,7 @@ const SESSION_UPDATE_HANDLERS: Record<string, SessionUpdateHandler> = {
       appendAgentMessageChunk(conversation, update.content, appendAgentThinking);
     }
   },
+  agent_progress_update: () => {},
   tool_call: (conversation, _acpx, update) => {
     if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
       applyToolCallUpdate(ensureAgentMessage(conversation), update);
