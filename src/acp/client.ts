@@ -95,7 +95,7 @@ import {
   waitForSpawn,
 } from "./client-process.js";
 import { extractAcpError } from "./error-shapes.js";
-import { isSessionUpdateNotification } from "./jsonrpc.js";
+import { avoidBidirectionalJsonRpcIdCollisions, isSessionUpdateNotification } from "./jsonrpc.js";
 import {
   formatSessionControlAcpSummary,
   maybeWrapSessionControlError,
@@ -634,7 +634,7 @@ export class AcpClient {
     readable: ReadableStream<AnyMessage>;
     writable: WritableStream<AnyMessage>;
   }): ClientSideConnection {
-    return new ClientSideConnection(
+    const connection = new ClientSideConnection(
       () => ({
         sessionUpdate: async (params: SessionNotification) => {
           await this.handleSessionUpdate(params);
@@ -672,6 +672,11 @@ export class AcpClient {
       }),
       stream,
     );
+    // The ACP SDK starts client request ids at 0. Some bidirectional ACP
+    // adapters also issue client-bound requests from 0; using a disjoint range
+    // avoids same-id overlap between e.g. session/prompt and request_permission.
+    avoidBidirectionalJsonRpcIdCollisions(connection);
+    return connection;
   }
 
   private async initializeAgentConnection(params: {
