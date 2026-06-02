@@ -1014,7 +1014,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
             injectedTask.close();
           }
         })();
-        injectedPromises.push(injectedPromise);
+        if (injectedTask.waitForCompletion) {
+          injectedPromises.push(injectedPromise);
+        }
       });
       if (attempt === 0 && options.onPromptActive) {
         try {
