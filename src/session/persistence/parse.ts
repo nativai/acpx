@@ -379,6 +379,7 @@ function assignParsedSessionOptions(state: SessionAcpxState, raw: unknown): void
   assignSessionOptionAllowedTools(parsedSessionOptions, sessionOptions.allowed_tools);
   assignSessionOptionMaxTurns(parsedSessionOptions, sessionOptions.max_turns);
   assignSessionOptionSystemPrompt(parsedSessionOptions, sessionOptions.system_prompt);
+  assignSessionOptionSubscription(parsedSessionOptions, sessionOptions.subscription);
 
   if (Object.keys(parsedSessionOptions).length > 0) {
     state.session_options = parsedSessionOptions;
@@ -391,6 +392,15 @@ function assignSessionOptionModel(
 ): void {
   if (typeof value === "string") {
     options.model = value;
+  }
+}
+
+function assignSessionOptionSubscription(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+  value: unknown,
+): void {
+  if (typeof value === "string" && value.length > 0) {
+    options.subscription = value;
   }
 }
 

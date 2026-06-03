@@ -188,6 +188,7 @@ function sessionOptionsFromGlobalFlags(
     allowedTools: globalFlags.allowedTools,
     maxTurns: globalFlags.maxTurns,
     systemPrompt: globalFlags.systemPrompt,
+    subscription: globalFlags.subscription,
   };
 }
 
@@ -495,6 +496,7 @@ export async function handlePrompt(
       allowedTools: globalFlags.allowedTools,
       maxTurns: globalFlags.maxTurns,
       systemPrompt: globalFlags.systemPrompt,
+      subscription: globalFlags.subscription,
     },
   });
 
@@ -577,6 +579,7 @@ export async function handleExec(
       allowedTools: globalFlags.allowedTools,
       maxTurns: globalFlags.maxTurns,
       systemPrompt: globalFlags.systemPrompt,
+      subscription: globalFlags.subscription,
     },
   });
 

@@ -217,12 +217,14 @@ export type AcpClientOptions = {
     parentSessionId?: string | null;
     taskFolder?: string | null;
     agentFolder?: string | null;
+    subscriptionId?: string | null;
   };
   sessionOptions?: {
     model?: string;
     allowedTools?: string[];
     maxTurns?: number;
     systemPrompt?: string | { append: string };
+    subscription?: string;
   };
   onAcpMessage?: (direction: AcpMessageDirection, message: AcpJsonRpcMessage) => void;
   onAcpOutputMessage?: (direction: AcpMessageDirection, message: AcpJsonRpcMessage) => void;
@@ -375,6 +377,7 @@ export type SessionAcpxState = {
     allowed_tools?: string[];
     max_turns?: number;
     system_prompt?: string | { append: string };
+    subscription?: string;
   };
 };
 

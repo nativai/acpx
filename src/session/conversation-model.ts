@@ -621,6 +621,7 @@ function cloneSessionOptions(
     model: options.model,
     allowed_tools: options.allowed_tools ? [...options.allowed_tools] : undefined,
     max_turns: options.max_turns,
+    subscription: options.subscription,
     ...(options.system_prompt !== undefined
       ? { system_prompt: cloneSystemPromptOption(options.system_prompt) }
       : {}),

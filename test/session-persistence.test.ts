@@ -199,6 +199,7 @@ test("listSessions preserves acpx session_options", async () => {
             model: "sonnet",
             allowed_tools: ["Read", "Grep"],
             max_turns: 7,
+            subscription: "sub1",
           },
         },
       }),
@@ -211,6 +212,7 @@ test("listSessions preserves acpx session_options", async () => {
       model: "sonnet",
       allowed_tools: ["Read", "Grep"],
       max_turns: 7,
+      subscription: "sub1",
     });
   });
 });

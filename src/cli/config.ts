@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULT_AGENT_NAME, normalizeAgentName } from "../agent-registry.js";
+import { loadSubscriptionRegistry, type SubscriptionRegistry } from "../config/subscriptions.js";
 import { parseMcpServers } from "../mcp-servers.js";
 import type {
   AuthPolicy,
@@ -46,6 +47,7 @@ export type ResolvedAcpxConfig = {
   auth: Record<string, string>;
   disableExec: boolean;
   mcpServers: McpServer[];
+  subscriptions: SubscriptionRegistry;
   globalPath: string;
   projectPath: string;
   hasGlobalConfig: boolean;
@@ -346,6 +348,7 @@ export async function loadResolvedConfig(cwd: string): Promise<ResolvedAcpxConfi
     auth,
     disableExec,
     mcpServers,
+    subscriptions: loadSubscriptionRegistry(),
     globalPath,
     projectPath,
     hasGlobalConfig: globalResult.exists,

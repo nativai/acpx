@@ -123,6 +123,16 @@ function assignQueueOwnerSessionOptions(
   assignSessionAllowedTools(options.sessionOptions, sessionOpts.allowedTools);
   assignSessionMaxTurns(options.sessionOptions, sessionOpts.maxTurns);
   assignSessionSystemPrompt(options.sessionOptions, sessionOpts.systemPrompt);
+  assignSessionSubscription(options.sessionOptions, sessionOpts.subscription);
+}
+
+function assignSessionSubscription(
+  options: NonNullable<QueueOwnerRuntimeOptions["sessionOptions"]>,
+  value: unknown,
+): void {
+  if (typeof value === "string" && value.trim().length > 0) {
+    options.subscription = value;
+  }
 }
 
 function assignSessionModel(

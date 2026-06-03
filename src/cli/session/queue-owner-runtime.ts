@@ -91,6 +91,7 @@ function createQueueOwnerSharedClient(
       parentSessionId: sessionRecord.parentSessionId ?? null,
       taskFolder: sessionRecord.metadata?.task_folder ?? null,
       agentFolder: resolveAndEnsureAgentFolder(sessionRecord),
+      subscriptionId: sessionRecord.acpx?.session_options?.subscription ?? null,
     },
     sessionOptions: mergeSessionOptions(
       options.sessionOptions,

@@ -7,6 +7,7 @@ export type SessionAgentOptions = {
   allowedTools?: string[];
   maxTurns?: number;
   systemPrompt?: SystemPromptOption;
+  subscription?: string;
 };
 
 export function mergeSessionOptions(
@@ -18,6 +19,7 @@ export function mergeSessionOptions(
   assignDefinedOption(merged, "allowedTools", preferred?.allowedTools);
   assignDefinedOption(merged, "maxTurns", preferred?.maxTurns);
   assignDefinedOption(merged, "systemPrompt", preferred?.systemPrompt);
+  assignDefinedOption(merged, "subscription", preferred?.subscription);
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
@@ -66,6 +68,7 @@ export function sessionOptionsFromRecord(record: SessionRecord): SessionAgentOpt
     "systemPrompt",
     storedSystemPromptOption(stored.system_prompt),
   );
+  assignStoredOption(sessionOptions, "subscription", nonEmptyString(stored.subscription));
 
   return Object.keys(sessionOptions).length > 0 ? sessionOptions : undefined;
 }
@@ -80,6 +83,7 @@ function persistedSessionOptions(
     allowed_tools: Array.isArray(options.allowedTools) ? [...options.allowedTools] : undefined,
     max_turns: typeof options.maxTurns === "number" ? options.maxTurns : undefined,
     system_prompt: normalizeSystemPromptOption(options.systemPrompt),
+    subscription: nonEmptyString(options.subscription),
   } satisfies PersistedSessionOptions;
   return hasPersistedSessionOptions(next) ? next : undefined;
 }
@@ -89,7 +93,8 @@ function hasPersistedSessionOptions(options: PersistedSessionOptions): boolean {
     options.model !== undefined ||
     options.allowed_tools !== undefined ||
     options.max_turns !== undefined ||
-    options.system_prompt !== undefined
+    options.system_prompt !== undefined ||
+    options.subscription !== undefined
   );
 }
 

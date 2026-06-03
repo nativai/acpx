@@ -1,3 +1,7 @@
+import {
+  resolveSubscriptionConfigDir,
+  subscriptionConfigDirExists,
+} from "../config/subscriptions.js";
 import type { AcpClientOptions } from "../types.js";
 
 const AUTH_ENV_PREFIX = "ACPX_AUTH_";
@@ -70,6 +74,13 @@ export type AgentSessionContext = {
   parentSessionId?: string | null;
   taskFolder?: string | null;
   agentFolder?: string | null;
+  /**
+   * Selected Claude subscription id (from ~/.acpx/subscriptions/registry.json).
+   * When set and resolvable, buildAgentEnvironment points the adapter at that
+   * subscription's CLAUDE_CONFIG_DIR. Unset/unknown ⇒ today's behavior (global
+   * ~/.claude). Mirrors how per-session `model` flows from the session record.
+   */
+  subscriptionId?: string | null;
 };
 
 // eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
@@ -104,6 +115,12 @@ function buildAgentEnvironment(
       env.ACPX_AGENT_FOLDER = trimmedAgentFolder;
     }
   }
+  if (sessionContext && typeof sessionContext.subscriptionId === "string") {
+    const trimmedSubscriptionId = sessionContext.subscriptionId.trim();
+    if (trimmedSubscriptionId.length > 0) {
+      applySubscriptionConfigDir(env, trimmedSubscriptionId);
+    }
+  }
   if (!authCredentials) {
     return env;
   }
@@ -113,6 +130,40 @@ function buildAgentEnvironment(
   }
 
   return env;
+}
+
+// Resolve a selected subscription id to its CLAUDE_CONFIG_DIR and set it on the
+// adapter env. This is the SINGLE resolution point — every spawn path (create /
+// recover / keepwarm) routes through buildAgentEnvironment, so they all inherit
+// it. Guard: an unknown id or a missing configDir logs and leaves CLAUDE_CONFIG_DIR
+// untouched (today's global ~/.claude behavior) rather than crashing the spawn.
+function applySubscriptionConfigDir(env: NodeJS.ProcessEnv, subscriptionId: string): void {
+  let configDir: string | undefined;
+  try {
+    configDir = resolveSubscriptionConfigDir(subscriptionId);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(
+      `[acpx] failed to read subscription registry for "${subscriptionId}" (${message}); using default Claude config\n`,
+    );
+    return;
+  }
+
+  if (configDir === undefined) {
+    process.stderr.write(
+      `[acpx] subscription "${subscriptionId}" not found in registry; using default Claude config (no CLAUDE_CONFIG_DIR override)\n`,
+    );
+    return;
+  }
+
+  if (!subscriptionConfigDirExists(configDir)) {
+    process.stderr.write(
+      `[acpx] subscription "${subscriptionId}" configDir not found at ${configDir}; using default Claude config (no CLAUDE_CONFIG_DIR override)\n`,
+    );
+    return;
+  }
+
+  env.CLAUDE_CONFIG_DIR = configDir;
 }
 
 function assignAuthCredentialEnv(

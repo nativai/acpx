@@ -278,6 +278,7 @@ test("cloneSessionAcpxState preserves desired mode id", () => {
       model: "sonnet",
       allowed_tools: ["Read", "Grep"],
       max_turns: 7,
+      subscription: "sub1",
     },
   });
 
@@ -296,5 +297,6 @@ test("cloneSessionAcpxState preserves desired mode id", () => {
     model: "sonnet",
     allowed_tools: ["Read", "Grep"],
     max_turns: 7,
+    subscription: "sub1",
   });
 });

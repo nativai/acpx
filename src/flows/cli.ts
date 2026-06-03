@@ -61,6 +61,7 @@ export async function handleFlowRun(
       model: globalFlags.model,
       allowedTools: globalFlags.allowedTools,
       maxTurns: globalFlags.maxTurns,
+      subscription: globalFlags.subscription,
     },
   });
 

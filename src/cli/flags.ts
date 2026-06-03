@@ -46,6 +46,7 @@ export type GlobalFlags = PermissionFlags & {
   verbose?: boolean;
   format: OutputFormat;
   model?: string;
+  subscription?: string;
   allowedTools?: string[];
   maxTurns?: number;
   systemPrompt?: SystemPromptOption;
@@ -331,6 +332,10 @@ export function addGlobalFlags(command: Command): Command {
     .option("--suppress-reads", "Suppress raw read-file contents in output")
     .option("--model <id>", "Agent model id")
     .option(
+      "--subscription <id>",
+      "Claude subscription id from the subscriptions registry (sets CLAUDE_CONFIG_DIR per session)",
+    )
+    .option(
       "--allowed-tools <list>",
       'Allowed tool names as a comma-separated list (use "" for no tools)',
       parseAllowedTools,
@@ -444,6 +449,7 @@ export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig)
     verbose,
     format,
     model: resolveModelOption(opts.model),
+    subscription: resolveSubscriptionOption(opts.subscription),
     allowedTools: stringArrayOption(opts.allowedTools),
     maxTurns: numberOption(opts.maxTurns),
     systemPrompt: resolveSystemPromptFlag(opts),
@@ -526,6 +532,11 @@ function assertOutputFlagCompatibility(
 function resolveModelOption(value: unknown): string | undefined {
   const model = stringOption(value);
   return model === undefined ? undefined : parseNonEmptyValue("Model", model);
+}
+
+function resolveSubscriptionOption(value: unknown): string | undefined {
+  const subscription = stringOption(value);
+  return subscription === undefined ? undefined : parseNonEmptyValue("Subscription", subscription);
 }
 
 export function resolveOutputPolicy(format: OutputFormat, jsonStrict: boolean): OutputPolicy {

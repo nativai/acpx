@@ -284,8 +284,22 @@ function parseSessionOptions(value: unknown): QueueSessionOptions | null | undef
   if (!assignSessionSystemPrompt(sessionOptions, record.systemPrompt)) {
     return null;
   }
+  if (!assignSessionSubscription(sessionOptions, record.subscription)) {
+    return null;
+  }
 
   return sessionOptions;
+}
+
+function assignSessionSubscription(options: QueueSessionOptions, value: unknown): boolean {
+  if (value == null) {
+    return true;
+  }
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return false;
+  }
+  options.subscription = value;
+  return true;
 }
 
 function assignSessionModel(options: QueueSessionOptions, value: unknown): boolean {
