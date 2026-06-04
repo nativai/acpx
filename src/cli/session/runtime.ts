@@ -10,7 +10,7 @@ import { assertRequestedModelSupported } from "../../acp/model-support.js";
 import { InterruptedError, withInterrupt, withTimeout } from "../../async-control.js";
 import { tailClaudeSubagentJsonl } from "../../claude-jsonl.js";
 import { transcriptCwdHash } from "../../config/subscription-transcript.js";
-import { SessionClosedError } from "../../errors.js";
+import { AllSubscriptionsExhaustedError, SessionClosedError } from "../../errors.js";
 import {
   attemptFailoverAndRetry,
   classifyFailover,
@@ -43,6 +43,7 @@ import { SessionEventWriter } from "../../session/events.js";
 import { LiveSessionCheckpoint } from "../../session/live-checkpoint.js";
 import { setCurrentModelId, setDesiredModelId } from "../../session/mode-preference.js";
 import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
+import { persistTerminalTurnError } from "../../session/persist-terminal-error.js";
 import {
   absolutePath,
   isoNow,
@@ -549,18 +550,33 @@ async function runQueuedTaskFailover(
     throw error;
   }
   const record = await resolveSessionRecord(sessionRecordId);
-  const { result, switchedTo } = await attemptFailoverAndRetry<SessionSendResult>({
-    record,
-    verbose: options.verbose,
-    runTurn: async () =>
-      // Fresh client (omit sharedClient) so the retry resolves the new dir.
-      await runSessionPrompt({
-        ...buildQueuedTaskRunOptions(sessionRecordId, task, options, outputFormatter),
-        client: undefined,
-      }),
-  });
-  options.onFailoverSwitched?.(switchedTo);
-  return result;
+  let outcome: { result: SessionSendResult; switchedTo: string };
+  try {
+    outcome = await attemptFailoverAndRetry<SessionSendResult>({
+      record,
+      verbose: options.verbose,
+      runTurn: async () =>
+        // Fresh client (omit sharedClient) so the retry resolves the new dir.
+        await runSessionPrompt({
+          ...buildQueuedTaskRunOptions(sessionRecordId, task, options, outputFormatter),
+          client: undefined,
+        }),
+    });
+  } catch (failoverError) {
+    // Exhausting all subscriptions throws AllSubscriptionsExhaustedError — an
+    // acpx-synthesized terminal error that is never an ACP message, so the
+    // onAcpMessage tap never persists it to the session `.stream.ndjson`. Write
+    // it there explicitly so acpx-ui's stream-tail derivation surfaces its
+    // `detailCode: "all-subscriptions-exhausted"` and renders the exhausted
+    // banner. Best-effort — persistence failure must not swallow the turn error,
+    // which still reaches the CLI output layer via sendQueuedTaskError below.
+    if (failoverError instanceof AllSubscriptionsExhaustedError) {
+      await persistTerminalTurnError(record, failoverError).catch(() => {});
+    }
+    throw failoverError;
+  }
+  options.onFailoverSwitched?.(outcome.switchedTo);
+  return outcome.result;
 }
 
 // eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
