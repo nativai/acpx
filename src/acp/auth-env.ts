@@ -1,7 +1,9 @@
 import {
-  resolveSubscriptionConfigDir,
+  chooseSubscriptionConfigDir,
+  loadSubscriptionRegistry,
   subscriptionConfigDirExists,
 } from "../config/subscriptions.js";
+import type { ConfigDirChoice, SubscriptionLookupOptions } from "../config/subscriptions.js";
 import type { AcpClientOptions } from "../types.js";
 
 const AUTH_ENV_PREFIX = "ACPX_AUTH_";
@@ -87,6 +89,7 @@ export type AgentSessionContext = {
 function buildAgentEnvironment(
   authCredentials: Record<string, string> | undefined,
   sessionContext?: AgentSessionContext,
+  lookupOptions?: SubscriptionLookupOptions,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   promotePrefixedAuthEnvironment(env);
@@ -115,12 +118,11 @@ function buildAgentEnvironment(
       env.ACPX_AGENT_FOLDER = trimmedAgentFolder;
     }
   }
-  if (sessionContext && typeof sessionContext.subscriptionId === "string") {
-    const trimmedSubscriptionId = sessionContext.subscriptionId.trim();
-    if (trimmedSubscriptionId.length > 0) {
-      applySubscriptionConfigDir(env, trimmedSubscriptionId);
-    }
-  }
+  // Resolve unconditionally: an UNSELECTED session is now meaningful — the
+  // registry `default` (when usable) governs it. On a box with no registry or no
+  // usable default this is a no-op that leaves CLAUDE_CONFIG_DIR unset and stays
+  // silent, i.e. byte-identical to the pre-default behavior.
+  applySubscriptionConfigDir(env, sessionContext?.subscriptionId ?? null, lookupOptions);
   if (!authCredentials) {
     return env;
   }
@@ -132,38 +134,82 @@ function buildAgentEnvironment(
   return env;
 }
 
-// Resolve a selected subscription id to its CLAUDE_CONFIG_DIR and set it on the
-// adapter env. This is the SINGLE resolution point — every spawn path (create /
-// recover / keepwarm) routes through buildAgentEnvironment, so they all inherit
-// it. Guard: an unknown id or a missing configDir logs and leaves CLAUDE_CONFIG_DIR
-// untouched (today's global ~/.claude behavior) rather than crashing the spawn.
-function applySubscriptionConfigDir(env: NodeJS.ProcessEnv, subscriptionId: string): void {
-  let configDir: string | undefined;
+// Resolve which CLAUDE_CONFIG_DIR an adapter spawn should use and set it on the
+// env. This is the SINGLE resolution point — every spawn path (create / recover /
+// keepwarm) routes through buildAgentEnvironment, so they all inherit it. Order
+// (see chooseSubscriptionConfigDir): explicit valid id → registry default →
+// raw ~/.claude. An explicit id we can't honor logs the legacy line and falls
+// through the same default→raw chain instead of crashing the spawn.
+//
+// BACKWARD SAFETY: on a box with no registry / no usable default, an UNSELECTED
+// spawn produces no configDir and ZERO stderr (byte-identical to pre-default
+// behavior); the legacy rejection lines for an explicit id are emitted verbatim.
+// The new default-applied note only ever fires on a box with a usable default.
+function applySubscriptionConfigDir(
+  env: NodeJS.ProcessEnv,
+  explicitId: string | null | undefined,
+  lookupOptions?: SubscriptionLookupOptions,
+): void {
+  let choice: ConfigDirChoice;
+  let defaultId: string | undefined;
   try {
-    configDir = resolveSubscriptionConfigDir(subscriptionId);
+    const registry = loadSubscriptionRegistry(lookupOptions);
+    defaultId = registry.default;
+    choice = chooseSubscriptionConfigDir(explicitId, registry, subscriptionConfigDirExists);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    process.stderr.write(
-      `[acpx] failed to read subscription registry for "${subscriptionId}" (${message}); using default Claude config\n`,
-    );
+    emitRegistryReadFailure(explicitId, error);
     return;
   }
 
-  if (configDir === undefined) {
-    process.stderr.write(
-      `[acpx] subscription "${subscriptionId}" not found in registry; using default Claude config (no CLAUDE_CONFIG_DIR override)\n`,
-    );
+  if (choice.explicitRejection) {
+    emitExplicitRejection(choice.explicitRejection);
+  }
+
+  if (choice.configDir === undefined) {
     return;
   }
 
-  if (!subscriptionConfigDirExists(configDir)) {
+  env.CLAUDE_CONFIG_DIR = choice.configDir;
+  if (choice.source === "default" && defaultId) {
+    emitDefaultApplied(defaultId, choice.configDir, choice.explicitRejection !== undefined);
+  }
+}
+
+// loadSubscriptionRegistry never throws; this defends the explicit-id path
+// against a surprising fs error from the existence check, matching the legacy
+// behavior (and staying silent for unselected spawns, which never logged here).
+function emitRegistryReadFailure(explicitId: string | null | undefined, error: unknown): void {
+  const trimmed = explicitId?.trim();
+  if (!trimmed) {
+    return;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  process.stderr.write(
+    `[acpx] failed to read subscription registry for "${trimmed}" (${message}); using default Claude config\n`,
+  );
+}
+
+// EXACT legacy lines — preserved byte-for-byte so a no-usable-default box behaves
+// identically to the pre-default build.
+function emitExplicitRejection(rejection: NonNullable<ConfigDirChoice["explicitRejection"]>): void {
+  if (rejection.kind === "unknown") {
     process.stderr.write(
-      `[acpx] subscription "${subscriptionId}" configDir not found at ${configDir}; using default Claude config (no CLAUDE_CONFIG_DIR override)\n`,
+      `[acpx] subscription "${rejection.id}" not found in registry; using default Claude config (no CLAUDE_CONFIG_DIR override)\n`,
     );
     return;
   }
+  process.stderr.write(
+    `[acpx] subscription "${rejection.id}" configDir not found at ${rejection.configDir}; using default Claude config (no CLAUDE_CONFIG_DIR override)\n`,
+  );
+}
 
-  env.CLAUDE_CONFIG_DIR = configDir;
+// NEW note — only reachable when a usable default produced the configDir, i.e.
+// never on a no-default box.
+function emitDefaultApplied(defaultId: string, configDir: string, viaRejection: boolean): void {
+  const lead = viaRejection
+    ? `using registry default "${defaultId}" instead`
+    : `no subscription selected; using registry default "${defaultId}"`;
+  process.stderr.write(`[acpx] ${lead} (CLAUDE_CONFIG_DIR=${configDir})\n`);
 }
 
 function assignAuthCredentialEnv(
@@ -204,6 +250,7 @@ export function buildAgentSpawnOptions(
   cwd: string,
   authCredentials: Record<string, string> | undefined,
   sessionContext?: AgentSessionContext,
+  lookupOptions?: SubscriptionLookupOptions,
 ): {
   cwd: string;
   env: NodeJS.ProcessEnv;
@@ -212,7 +259,7 @@ export function buildAgentSpawnOptions(
 } {
   return {
     cwd,
-    env: buildAgentEnvironment(authCredentials, sessionContext),
+    env: buildAgentEnvironment(authCredentials, sessionContext, lookupOptions),
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   };

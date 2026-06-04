@@ -19,9 +19,31 @@ export type SubscriptionEntry = {
 };
 
 export type SubscriptionRegistry = {
-  /** Default subscription id (informational; selection is per-session). */
+  /** Default subscription id. Governs spawns with no explicit selection. */
   default?: string;
   subscriptions: SubscriptionEntry[];
+};
+
+/**
+ * Outcome of resolving which CLAUDE_CONFIG_DIR a spawn should use. Pure data —
+ * the caller (auth-env.ts) turns it into env mutation + stderr. `configDir`
+ * undefined means "leave CLAUDE_CONFIG_DIR unset" (raw ~/.claude). The optional
+ * rejection/unusable fields carry the *reason* a selection could not be honored
+ * so the caller can log without re-deriving it.
+ */
+export type ConfigDirChoice = {
+  /** Final dir to set; undefined ⇒ leave CLAUDE_CONFIG_DIR unset. */
+  configDir?: string;
+  /** Which input produced `configDir` (only present when `configDir` is). */
+  source?: "explicit" | "default";
+  /** A provided explicit id we could NOT honor (still emitted for logging). */
+  explicitRejection?:
+    | { kind: "unknown"; id: string }
+    | { kind: "missing-dir"; id: string; configDir: string };
+  /** A configured `default` that was itself unusable (set+unknown / set+dir-missing). */
+  defaultUnusable?:
+    | { kind: "unknown"; id: string }
+    | { kind: "missing-dir"; id: string; configDir: string };
 };
 
 const SUBSCRIPTIONS_DIRNAME = "subscriptions";
@@ -98,6 +120,69 @@ export function resolveSubscriptionConfigDir(
 
 export function subscriptionConfigDirExists(configDir: string): boolean {
   return existsSync(configDir);
+}
+
+type IdResolution =
+  | { kind: "ok"; configDir: string }
+  | { kind: "unknown"; id: string }
+  | { kind: "missing-dir"; id: string; configDir: string };
+
+function resolveRegisteredDir(
+  id: string,
+  registry: SubscriptionRegistry,
+  dirExists: (dir: string) => boolean,
+): IdResolution {
+  const entry = findSubscription(id, registry);
+  if (!entry) {
+    return { kind: "unknown", id };
+  }
+  if (!dirExists(entry.configDir)) {
+    return { kind: "missing-dir", id, configDir: entry.configDir };
+  }
+  return { kind: "ok", configDir: entry.configDir };
+}
+
+/**
+ * PURE resolution of CLAUDE_CONFIG_DIR for one adapter spawn. No env, no logging,
+ * no fs beyond the injected `dirExists`. Resolution order:
+ *   1. explicit valid id (registered AND configDir exists)        → source "explicit"
+ *   2. else registry.default valid (registered AND configDir exists) → source "default"
+ *   3. else                                                        → no configDir (raw)
+ * An explicit id that is unknown or whose dir is missing falls through the SAME
+ * default→raw chain (its reason is carried in `explicitRejection` for logging).
+ * A configured-but-unusable default is reported in `defaultUnusable`. Both reason
+ * fields are populated only on a box that actually configured those values, which
+ * is what keeps no-registry / no-default boxes byte-identical to pre-default
+ * behavior (empty registry ⇒ no explicit match, no default ⇒ plain `{}`).
+ */
+export function chooseSubscriptionConfigDir(
+  explicitId: string | null | undefined,
+  registry: SubscriptionRegistry,
+  dirExists: (dir: string) => boolean = subscriptionConfigDirExists,
+): ConfigDirChoice {
+  const result: ConfigDirChoice = {};
+
+  const trimmedExplicit = explicitId?.trim();
+  if (trimmedExplicit) {
+    const resolved = resolveRegisteredDir(trimmedExplicit, registry, dirExists);
+    if (resolved.kind === "ok") {
+      return { configDir: resolved.configDir, source: "explicit" };
+    }
+    result.explicitRejection = resolved;
+  }
+
+  const defaultId = registry.default?.trim();
+  if (defaultId) {
+    const resolved = resolveRegisteredDir(defaultId, registry, dirExists);
+    if (resolved.kind === "ok") {
+      result.configDir = resolved.configDir;
+      result.source = "default";
+      return result;
+    }
+    result.defaultUnusable = resolved;
+  }
+
+  return result;
 }
 
 function normalizeRegistry(value: unknown, homeDir: string): SubscriptionRegistry {
