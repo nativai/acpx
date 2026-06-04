@@ -180,6 +180,21 @@ export async function createSessionWithClient(
     terminal: options.terminal,
     verbose: options.verbose,
     sessionOptions: options.sessionOptions,
+    // The CREATION spawn must resolve CLAUDE_CONFIG_DIR from the chosen
+    // subscription, exactly like the prompt/recover/keepwarm spawns do
+    // (connected-session.ts / runtime.ts). Without this the first turn ignores
+    // `--subscription` and falls through to the registry default. The record
+    // does not exist yet, so the id is sourced from sessionOptions; the other
+    // sessionContext fields are best-effort (each is guarded independently in
+    // buildAgentEnvironment, so a null acpxRecordId only skips ACPX_SESSION_URL
+    // on this one spawn — it is set on the next spawn from the persisted record).
+    sessionContext: {
+      acpxRecordId: "",
+      parentSessionId: options.parentSessionId ?? null,
+      taskFolder: options.metadata?.task_folder ?? null,
+      agentFolder: null,
+      subscriptionId: options.sessionOptions?.subscription ?? null,
+    },
   });
 
   try {
