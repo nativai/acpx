@@ -217,6 +217,71 @@ test("listSessions preserves acpx session_options", async () => {
   });
 });
 
+test("listSessions preserves acpx session_options subscription_switch breadcrumb", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "sub-switch",
+        acpSessionId: "sub-switch",
+        agentCommand: "agent-a",
+        cwd,
+        acpx: {
+          session_options: {
+            subscription: "sub2",
+            subscription_switch: {
+              from: "sub1",
+              to: "sub2",
+              reason: "failover",
+              at: "2026-06-04T12:00:00.000Z",
+            },
+          },
+        },
+      }),
+    );
+
+    const sessions = await session.listSessions();
+    const record = sessions.find((entry) => entry.acpxRecordId === "sub-switch");
+    assert.ok(record);
+    // The breadcrumb must survive the disk write→read round-trip (regression:
+    // the read-parser whitelist used to drop subscription_switch).
+    assert.deepEqual(record.acpx?.session_options?.subscription_switch, {
+      from: "sub1",
+      to: "sub2",
+      reason: "failover",
+      at: "2026-06-04T12:00:00.000Z",
+    });
+    assert.equal(record.acpx?.session_options?.subscription, "sub2");
+  });
+});
+
+test("listSessions drops a malformed subscription_switch (missing required fields)", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "sub-switch-bad",
+        acpSessionId: "sub-switch-bad",
+        agentCommand: "agent-a",
+        cwd,
+        // `to`/`reason`/`at` missing → must be dropped on read, not surfaced.
+        acpx: { session_options: { subscription_switch: { from: "sub1" } } as never },
+      }),
+    );
+
+    const sessions = await session.listSessions();
+    const record = sessions.find((entry) => entry.acpxRecordId === "sub-switch-bad");
+    assert.ok(record);
+    assert.equal(record.acpx?.session_options?.subscription_switch, undefined);
+  });
+});
+
 test("listSessions preserves acpx session_options system_prompt string and append", async () => {
   await withTempHome(async (homeDir) => {
     const session = await loadSessionModule();

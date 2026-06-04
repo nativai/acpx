@@ -380,10 +380,39 @@ function assignParsedSessionOptions(state: SessionAcpxState, raw: unknown): void
   assignSessionOptionMaxTurns(parsedSessionOptions, sessionOptions.max_turns);
   assignSessionOptionSystemPrompt(parsedSessionOptions, sessionOptions.system_prompt);
   assignSessionOptionSubscription(parsedSessionOptions, sessionOptions.subscription);
+  assignSessionOptionSubscriptionSwitch(parsedSessionOptions, sessionOptions.subscription_switch);
 
   if (Object.keys(parsedSessionOptions).length > 0) {
     state.session_options = parsedSessionOptions;
   }
+}
+
+function isValidSubscriptionSwitch(
+  record: Record<string, unknown>,
+): record is { from?: string; to: string; reason: "manual" | "failover"; at: string } {
+  return (
+    typeof record.to === "string" &&
+    record.to.length > 0 &&
+    (record.reason === "manual" || record.reason === "failover") &&
+    typeof record.at === "string" &&
+    record.at.length > 0
+  );
+}
+
+function assignSessionOptionSubscriptionSwitch(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+  value: unknown,
+): void {
+  const record = asRecord(value);
+  if (!record || !isValidSubscriptionSwitch(record)) {
+    return;
+  }
+  options.subscription_switch = {
+    ...(typeof record.from === "string" ? { from: record.from } : {}),
+    to: record.to,
+    reason: record.reason,
+    at: record.at,
+  };
 }
 
 function assignSessionOptionModel(
