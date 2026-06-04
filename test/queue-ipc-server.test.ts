@@ -40,6 +40,7 @@ test("SessionQueueOwner handles control requests and nextTask timeouts", async (
           configOptions: [],
         } as SetSessionConfigOptionResponse;
       },
+      queryActiveTurn: () => false,
     });
 
     try {
@@ -164,6 +165,7 @@ test("SessionQueueOwner enqueues fire-and-forget prompts and rejects invalid own
           ({
             configOptions: [],
           }) as SetSessionConfigOptionResponse,
+        queryActiveTurn: () => false,
       },
       {
         maxQueueDepth: 4,

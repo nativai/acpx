@@ -1,5 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { SubscriptionTurnInFlightError } from "../../errors.js";
+import { switchSessionSubscription } from "../../runtime/engine/subscription-switch.js";
 import {
   setCurrentModelId,
   setDesiredConfigOption,
@@ -27,6 +29,7 @@ import {
   terminateQueueOwnerForSession,
   tryCancelOnRunningOwner,
   tryCloseSessionOnRunningOwner,
+  tryQueryActiveTurnOnRunningOwner,
   trySetConfigOptionOnRunningOwner,
   trySetModelOnRunningOwner,
   trySetModeOnRunningOwner,
@@ -37,6 +40,8 @@ import type {
   SessionSetConfigOptionOptions,
   SessionSetModelOptions,
   SessionSetModeOptions,
+  SessionSetSubscriptionOptions,
+  SessionSetSubscriptionResult,
 } from "./contracts.js";
 import {
   runSessionSetConfigOptionDirect,
@@ -156,6 +161,53 @@ export async function setSessionConfigOption(
     timeoutMs: options.timeoutMs,
     verbose: options.verbose,
   });
+}
+
+// Change a session's active Claude subscription in place. Unlike set-mode/model
+// (ACP config ops), a subscription is CLAUDE_CONFIG_DIR, re-resolved from the
+// record on every spawn — so the durable switch is the record edit + transcript
+// copy (switchSessionSubscription). Binding it requires a respawn:
+//   COLD (no live owner) → record edit only; the next spawn resolves the new dir.
+//   LIVE (queue owner holds a client on the old dir) → after the record edit,
+//     terminate the owner so the next prompt cold-spawns a fresh owner on the new
+//     dir (resuming the ported transcript). Refuse if a turn is in flight.
+export async function setSessionSubscription(
+  options: SessionSetSubscriptionOptions,
+): Promise<SessionSetSubscriptionResult> {
+  const liveness = await readQueueOwnerLiveness(options.sessionId);
+  const ownerAlive = liveness?.alive === true;
+
+  if (ownerAlive) {
+    const active = await tryQueryActiveTurnOnRunningOwner(options.sessionId);
+    if (active === true) {
+      throw new SubscriptionTurnInFlightError(options.sessionName);
+    }
+  }
+
+  const record = await resolveSessionRecord(options.sessionId);
+  const { from, to, transcriptCopied } = await switchSessionSubscription({
+    record,
+    targetSubId: options.subscriptionId,
+    reason: "manual",
+    loadOpts: options.loadOpts,
+  });
+  await writeSessionRecord(record);
+
+  // Bind on a live session by recycling the owner; the next prompt re-resolves
+  // CLAUDE_CONFIG_DIR from the updated record. The ported transcript means the
+  // fresh client resumes WITH context.
+  let ownerRestarted = false;
+  if (ownerAlive) {
+    await terminateQueueOwnerForSession(options.sessionId);
+    ownerRestarted = true;
+    if (options.verbose) {
+      process.stderr.write(
+        `[acpx] restarted queue owner for session ${options.sessionId} to bind subscription "${to}"\n`,
+      );
+    }
+  }
+
+  return { record, from, to, transcriptCopied, ownerRestarted };
 }
 
 function firstAgentCommandToken(command: string): string | undefined {

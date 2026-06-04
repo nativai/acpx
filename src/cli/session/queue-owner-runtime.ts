@@ -294,6 +294,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         setSessionConfigOption: async (configId: string, value: string, timeoutMs?: number) => {
           return await turnController.setSessionConfigOption(configId, value, timeoutMs);
         },
+        queryActiveTurn: () => turnController.hasActiveTurn(),
       },
       {
         maxQueueDepth,

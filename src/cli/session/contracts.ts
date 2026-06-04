@@ -1,4 +1,5 @@
 import type { AcpClient } from "../../acp/client.js";
+import type { SubscriptionLookupOptions } from "../../config/subscriptions.js";
 import type { SessionAgentOptions } from "../../runtime/engine/session-options.js";
 import type {
   AcpJsonRpcMessage,
@@ -193,6 +194,25 @@ export type SessionSetConfigOptionOptions = {
 export type SessionCreateWithClientResult = {
   record: SessionRecord;
   client: AcpClient;
+};
+
+export type SessionSetSubscriptionOptions = {
+  sessionId: string;
+  subscriptionId: string;
+  /** Used only for the turn-in-flight error message. */
+  sessionName?: string;
+  verbose?: boolean;
+  /** Test override for the registry/home lookup. */
+  loadOpts?: SubscriptionLookupOptions;
+};
+
+export type SessionSetSubscriptionResult = {
+  record: SessionRecord;
+  from?: string;
+  to: string;
+  transcriptCopied: boolean;
+  /** True when a live queue owner existed and was restarted to bind the switch. */
+  ownerRestarted: boolean;
 };
 
 export type { SessionAgentOptions };

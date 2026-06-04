@@ -3,7 +3,8 @@ import path from "node:path";
 import { Command, InvalidArgumentError } from "commander";
 import { isLegacyZedCodexAcpInvocation } from "../acp/codex-compat.js";
 import { listBuiltInAgents, resolveAgentCommand } from "../agent-registry.js";
-import { AgentSpawnError, SessionNotFoundError } from "../errors.js";
+import { findSubscription, loadSubscriptionRegistry } from "../config/subscriptions.js";
+import { AgentSpawnError, SessionNotFoundError, SubscriptionUnknownError } from "../errors.js";
 import { loadPermissionPolicySpec } from "../permission-policy.js";
 import {
   mergePromptSourceWithText,
@@ -792,6 +793,12 @@ export async function handleSetConfigOption(
     await handleSetModel(explicitAgentName, value, flags, command, config);
     return;
   }
+  // `set subscription <id>` is a record edit (CLAUDE_CONFIG_DIR), not an ACP
+  // config option — route it like `model` above. acpx-ui shells exactly this.
+  if (configId === "subscription") {
+    await handleSetSubscription(explicitAgentName, value, flags, command, config);
+    return;
+  }
   const resolvedConfigId = resolveCompatibleConfigId(agent, configId);
   const { setSessionConfigOption } = await loadSessionModule();
   const record = await findRoutedSessionOrThrow(
@@ -820,6 +827,72 @@ export async function handleSetConfigOption(
   }
 
   printSetConfigOptionResultByFormat(configId, value, result, globalFlags.format);
+}
+
+// `acpx <agent> set subscription <id>` — change the session's Claude
+// subscription in place (record edit + transcript port; respawn binds it). Cold
+// vs live handling lives in setSessionSubscription. Refuses with turn-in-flight
+// if a turn is active on the live owner (surfaced to acpx-ui as 409).
+export async function handleSetSubscription(
+  explicitAgentName: string | undefined,
+  subscriptionId: string,
+  flags: StatusFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const trimmedId = subscriptionId.trim();
+  const registry = loadSubscriptionRegistry();
+  if (!findSubscription(trimmedId, registry)) {
+    throw new SubscriptionUnknownError(trimmedId);
+  }
+  const sessionName = resolveSessionNameFromFlags(flags, command);
+  const record = await findRoutedSessionOrThrow(
+    agent.agentCommand,
+    agent.agentName,
+    agent.cwd,
+    sessionName,
+  );
+  const { setSessionSubscription } = await loadSessionModule();
+  const result = await setSessionSubscription({
+    sessionId: record.acpxRecordId,
+    subscriptionId: trimmedId,
+    sessionName: sessionName ?? record.name,
+    verbose: globalFlags.verbose,
+  });
+  printSetSubscriptionResultByFormat(result, globalFlags.format);
+}
+
+function printSetSubscriptionResultByFormat(
+  result: {
+    record: SessionRecord;
+    from?: string;
+    to: string;
+    transcriptCopied: boolean;
+    ownerRestarted: boolean;
+  },
+  format: OutputFormat,
+): void {
+  if (
+    emitJsonResult(format, {
+      action: "subscription_set",
+      subscription: result.to,
+      from: result.from,
+      transcriptCopied: result.transcriptCopied,
+      ownerRestarted: result.ownerRestarted,
+      acpxRecordId: result.record.acpxRecordId,
+      acpxSessionId: result.record.acpSessionId,
+    })
+  ) {
+    return;
+  }
+  if (format === "quiet") {
+    process.stdout.write(`${result.to}\n`);
+    return;
+  }
+  const fromLabel = result.from ? `${result.from} → ` : "";
+  process.stdout.write(`subscription set: ${fromLabel}${result.to}\n`);
 }
 
 function printSetMetadataResultByFormat(

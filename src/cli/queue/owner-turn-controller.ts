@@ -43,6 +43,16 @@ export class QueueOwnerTurnController {
     return this.pendingCancel;
   }
 
+  // True while a turn is in flight (starting or active, or the live client
+  // reports an active prompt). Used to refuse a mid-turn subscription switch
+  // (B4 / turn-in-flight) — a switch must not tear the client down mid-stream.
+  hasActiveTurn(): boolean {
+    if (this.state === "starting" || this.state === "active") {
+      return true;
+    }
+    return this.activeController?.hasActivePrompt() === true;
+  }
+
   beginTurn(): void {
     this.state = "starting";
     this.pendingCancel = false;

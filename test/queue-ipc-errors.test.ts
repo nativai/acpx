@@ -530,6 +530,7 @@ test("SessionQueueOwner emits typed invalid request payload errors", async () =>
         ({
           configOptions: [],
         }) as SetSessionConfigOptionResponse,
+      queryActiveTurn: () => false,
     });
 
     const socket = await connectSocket(lease.socketPath);
@@ -578,6 +579,7 @@ test("SessionQueueOwner emits typed shutdown errors for pending prompts", async 
         ({
           configOptions: [],
         }) as SetSessionConfigOptionResponse,
+      queryActiveTurn: () => false,
     });
 
     const socket = await connectSocket(lease.socketPath);
@@ -647,6 +649,7 @@ test("SessionQueueOwner rejects prompts when queue depth exceeds the configured 
           ({
             configOptions: [],
           }) as SetSessionConfigOptionResponse,
+        queryActiveTurn: () => false,
       },
       {
         maxQueueDepth: 1,

@@ -25,12 +25,14 @@ import {
   parseQueueOwnerMessage,
   type QueueCancelRequest,
   type QueueCloseSessionRequest,
+  type QueueOwnerActiveTurnResultMessage,
   type QueueOwnerCancelResultMessage,
   type QueueOwnerCloseSessionResultMessage,
   type QueueOwnerMessage,
   type QueueOwnerSetConfigOptionResultMessage,
   type QueueOwnerSetModelResultMessage,
   type QueueOwnerSetModeResultMessage,
+  type QueueQueryActiveTurnRequest,
   type QueueRequest,
   type QueueSetConfigOptionRequest,
   type QueueSetModelRequest,
@@ -556,6 +558,33 @@ async function submitCancelToQueueOwner(owner: QueueOwnerRecord): Promise<boolea
   return response.cancelled;
 }
 
+async function submitQueryActiveTurnToQueueOwner(
+  owner: QueueOwnerRecord,
+): Promise<boolean | undefined> {
+  const request: QueueQueryActiveTurnRequest = {
+    type: "query_active_turn",
+    requestId: randomUUID(),
+    ownerGeneration: owner.ownerGeneration,
+  };
+  const response = await submitControlToQueueOwner(
+    owner,
+    request,
+    (message): message is QueueOwnerActiveTurnResultMessage =>
+      message.type === "query_active_turn_result",
+  );
+  if (!response) {
+    return undefined;
+  }
+  if (response.requestId !== request.requestId) {
+    throw new QueueProtocolError("Queue owner returned mismatched query_active_turn response", {
+      detailCode: "QUEUE_PROTOCOL_MALFORMED_MESSAGE",
+      origin: "queue",
+      retryable: true,
+    });
+  }
+  return response.active;
+}
+
 async function submitSetModeToQueueOwner(
   owner: QueueOwnerRecord,
   modeId: string,
@@ -786,6 +815,37 @@ export async function tryCancelOnRunningOwner(options: {
 
   throw new QueueConnectionError(
     "Session queue owner is running but not accepting cancel requests",
+    {
+      detailCode: "QUEUE_NOT_ACCEPTING_REQUESTS",
+      origin: "queue",
+      retryable: true,
+    },
+  );
+}
+
+// Query a live owner for whether a turn is in flight. Returns undefined when
+// there is no live owner (cold session — caller proceeds), true/false otherwise.
+// Used to refuse a mid-turn manual subscription switch (turn-in-flight).
+export async function tryQueryActiveTurnOnRunningOwner(
+  sessionId: string,
+): Promise<boolean | undefined> {
+  const owner = await readQueueOwnerRecord(sessionId);
+  if (!owner) {
+    return undefined;
+  }
+
+  const active = await submitQueryActiveTurnToQueueOwner(owner);
+  if (active !== undefined) {
+    return active;
+  }
+
+  const health = await probeQueueOwnerHealth(sessionId);
+  if (!health.hasLease) {
+    return undefined;
+  }
+
+  throw new QueueConnectionError(
+    "Session queue owner is running but not accepting query_active_turn requests",
     {
       detailCode: "QUEUE_NOT_ACCEPTING_REQUESTS",
       origin: "queue",

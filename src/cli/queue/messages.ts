@@ -81,13 +81,22 @@ export type QueueCloseSessionRequest = {
   timeoutMs?: number;
 };
 
+// Read-only query: is a turn currently in flight on the live owner? Used by the
+// manual `set subscription` CLI to refuse a mid-turn switch (turn-in-flight).
+export type QueueQueryActiveTurnRequest = {
+  type: "query_active_turn";
+  requestId: string;
+  ownerGeneration?: number;
+};
+
 export type QueueRequest =
   | QueueSubmitRequest
   | QueueCancelRequest
   | QueueSetModeRequest
   | QueueSetModelRequest
   | QueueSetConfigOptionRequest
-  | QueueCloseSessionRequest;
+  | QueueCloseSessionRequest
+  | QueueQueryActiveTurnRequest;
 
 export type QueueOwnerAcceptedMessage = {
   type: "accepted";
@@ -151,6 +160,13 @@ export type QueueOwnerCloseSessionResultMessage = {
   closed: boolean;
 };
 
+export type QueueOwnerActiveTurnResultMessage = {
+  type: "query_active_turn_result";
+  requestId: string;
+  ownerGeneration?: number;
+  active: boolean;
+};
+
 export type QueueOwnerErrorMessage = {
   type: "error";
   requestId: string;
@@ -174,6 +190,7 @@ export type QueueOwnerMessage =
   | QueueOwnerSetModelResultMessage
   | QueueOwnerSetConfigOptionResultMessage
   | QueueOwnerCloseSessionResultMessage
+  | QueueOwnerActiveTurnResultMessage
   | QueueOwnerErrorMessage;
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -428,6 +445,12 @@ function parseTypedQueueRequest(
       };
     case "close_session":
       return { type: "close_session", ...context };
+    case "query_active_turn":
+      return {
+        type: "query_active_turn",
+        requestId: context.requestId,
+        ownerGeneration: context.ownerGeneration,
+      };
     case "set_mode":
       return parseStringFieldRequest(request, context, "set_mode", "modeId");
     case "set_model":
@@ -669,6 +692,12 @@ const QUEUE_OWNER_MESSAGE_PARSERS: Record<string, QueueOwnerMessageParser> = {
     parseBooleanResultOwnerMessage(message, context, "cancel_result", "cancelled"),
   close_session_result: (message, context) =>
     parseBooleanResultOwnerMessage(message, context, "close_session_result", "closed"),
+  query_active_turn_result: (message, context) => {
+    if (typeof message.active !== "boolean") {
+      return null;
+    }
+    return { type: "query_active_turn_result", ...context, active: message.active };
+  },
   set_mode_result: (message, context) =>
     parseStringResultOwnerMessage(message, context, "set_mode_result", "modeId"),
   set_model_result: (message, context) =>

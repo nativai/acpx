@@ -108,6 +108,7 @@ export type QueueOwnerControlHandlers = {
     value: string,
     timeoutMs?: number,
   ) => Promise<SetSessionConfigOptionResponse>;
+  queryActiveTurn: () => boolean;
 };
 
 type SessionQueueOwnerOptions = {
@@ -473,6 +474,18 @@ export class SessionQueueOwner {
             request.value,
             request.timeoutMs,
           ),
+        }),
+      });
+      return true;
+    }
+    if (request.type === "query_active_turn") {
+      this.handleControlRequest({
+        socket,
+        requestId: request.requestId,
+        run: async () => ({
+          type: "query_active_turn_result",
+          requestId: request.requestId,
+          active: this.controlHandlers.queryActiveTurn(),
         }),
       });
       return true;

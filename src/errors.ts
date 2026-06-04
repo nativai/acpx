@@ -160,6 +160,34 @@ export class GeminiAcpStartupTimeoutError extends AcpxOperationalError {
   }
 }
 
+// A subscription id was requested that is not in the registry. Usage error.
+export class SubscriptionUnknownError extends AcpxOperationalError {
+  constructor(id: string) {
+    super(`subscription "${id}" not found in registry (~/.acpx/subscriptions/registry.json)`, {
+      outputCode: "USAGE",
+      detailCode: "SUBSCRIPTION_UNKNOWN",
+      origin: "cli",
+    });
+  }
+}
+
+// A manual subscription switch was requested while a turn is in flight on the
+// live queue owner. Refused (not queued) — switching mid-stream would tear the
+// client down. acpx-ui maps the "turn-in-flight" detailCode to a 409.
+export class SubscriptionTurnInFlightError extends AcpxOperationalError {
+  constructor(sessionName?: string) {
+    const label = sessionName ? ` '${sessionName}'` : "";
+    super(
+      `Cannot switch subscription while a turn is in flight on session${label}; wait for the current turn to finish (turn-in-flight).`,
+      {
+        outputCode: "USAGE",
+        detailCode: "TURN_IN_FLIGHT",
+        origin: "queue",
+      },
+    );
+  }
+}
+
 export class SessionModeReplayError extends AcpxOperationalError {
   constructor(message: string, options?: AcpxErrorOptions) {
     super(message, {
