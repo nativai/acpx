@@ -378,6 +378,18 @@ export type SessionAcpxState = {
     max_turns?: number;
     system_prompt?: string | { append: string };
     subscription?: string;
+    /**
+     * Breadcrumb recorded when a session's subscription is changed in place
+     * (manual switch or auto-failover). Drives the acpx-ui badge/notice and
+     * survives restart. `from` is '' / undefined when the prior selection was
+     * the registry default or raw global (no explicit sub).
+     */
+    subscription_switch?: {
+      from?: string;
+      to: string;
+      reason: "manual" | "failover";
+      at: string;
+    };
   };
 };
 

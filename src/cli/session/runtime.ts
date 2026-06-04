@@ -9,6 +9,7 @@ import {
 import { assertRequestedModelSupported } from "../../acp/model-support.js";
 import { InterruptedError, withInterrupt, withTimeout } from "../../async-control.js";
 import { tailClaudeSubagentJsonl } from "../../claude-jsonl.js";
+import { transcriptCwdHash } from "../../config/subscription-transcript.js";
 import { SessionClosedError } from "../../errors.js";
 export { InterruptedError, TimeoutError } from "../../async-control.js";
 import { formatPerfMetric, measurePerf, startPerfTimer } from "../../perf-metrics.js";
@@ -68,8 +69,9 @@ import type { RunOnceOptions, SessionSendOptions } from "./contracts.js";
 
 function claudeSubagentDir(cwd: string, acpSessionId: string): string {
   const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
-  const cwdHash = cwd.replace(/\//g, "-");
-  return path.join(configDir, "projects", cwdHash, acpSessionId, "subagents");
+  // transcriptCwdHash is the single source of truth for the projects/<cwdHash>
+  // layout (shared with subscription-transcript.ts's JSONL portability).
+  return path.join(configDir, "projects", transcriptCwdHash(cwd), acpSessionId, "subagents");
 }
 
 const INTERRUPT_CANCEL_WAIT_MS = 2_500;

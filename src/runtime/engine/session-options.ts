@@ -37,11 +37,27 @@ export function persistSessionOptions(
   record: SessionRecord,
   options: SessionAgentOptions | undefined,
 ): void {
+  // The subscription_switch breadcrumb is a record-only field (not a user
+  // flag, so it is absent from SessionAgentOptions). Carry it forward across a
+  // re-persist (e.g. a model change next turn) so a manual/failover switch
+  // stays visible; a subsequent switch overwrites it via switchSessionSubscription.
+  const priorSwitch = record.acpx?.session_options?.subscription_switch;
   const next = options === undefined ? undefined : persistedSessionOptions(options);
   if (next !== undefined) {
+    if (priorSwitch !== undefined) {
+      next.subscription_switch = priorSwitch;
+    }
     record.acpx = {
       ...record.acpx,
       session_options: next,
+    };
+    return;
+  }
+
+  if (priorSwitch !== undefined) {
+    record.acpx = {
+      ...record.acpx,
+      session_options: { subscription_switch: priorSwitch },
     };
     return;
   }

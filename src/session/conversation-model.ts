@@ -625,6 +625,9 @@ function cloneSessionOptions(
     ...(options.system_prompt !== undefined
       ? { system_prompt: cloneSystemPromptOption(options.system_prompt) }
       : {}),
+    ...(options.subscription_switch !== undefined
+      ? { subscription_switch: { ...options.subscription_switch } }
+      : {}),
   };
 }
 
