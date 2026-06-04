@@ -53,7 +53,10 @@ import {
 } from "./flags.js";
 import { emitJsonResult } from "./output/json-output.js";
 import type { SessionListResult } from "./session/contracts.js";
-import { withInheritedTaskFolder } from "./session/inherited-metadata.js";
+import {
+  withInheritedSubscription,
+  withInheritedTaskFolder,
+} from "./session/inherited-metadata.js";
 import { mergeSessionMetadata, validateSessionMetadataValue } from "./session/session-metadata.js";
 
 class NoSessionError extends Error {
@@ -241,7 +244,7 @@ function resolveParentSessionIdFromFlagOrEnv(flags: SessionsNewFlags): string | 
   return undefined;
 }
 
-type ResolvedParentSession = { acpxRecordId: string; taskFolder?: string };
+type ResolvedParentSession = { acpxRecordId: string; taskFolder?: string; subscription?: string };
 
 async function resolveAndValidateParentSessionId(
   flags: SessionsNewFlags,
@@ -252,7 +255,11 @@ async function resolveAndValidateParentSessionId(
   }
   try {
     const parent = await resolveSessionRecord(candidate);
-    return { acpxRecordId: parent.acpxRecordId, taskFolder: parent.metadata?.task_folder };
+    return {
+      acpxRecordId: parent.acpxRecordId,
+      taskFolder: parent.metadata?.task_folder,
+      subscription: parent.acpx?.session_options?.subscription,
+    };
   } catch (error) {
     if (error instanceof SessionNotFoundError) {
       const label = flags.parentSessionUrl ? "--parent-session-url" : "--parent-id";
@@ -271,6 +278,7 @@ function buildSessionStartOptions(params: {
   permissionPolicy?: PermissionPolicy;
   parentSessionId?: string;
   parentTaskFolder?: string;
+  parentSubscription?: string;
 }): Parameters<SessionModule["createSession"]>[0] {
   return {
     agentCommand: params.agent.agentCommand,
@@ -288,7 +296,15 @@ function buildSessionStartOptions(params: {
     terminal: params.globalFlags.terminal,
     timeoutMs: params.globalFlags.timeout,
     verbose: params.globalFlags.verbose,
-    sessionOptions: sessionOptionsFromGlobalFlags(params.globalFlags),
+    sessionOptions: {
+      ...sessionOptionsFromGlobalFlags(params.globalFlags),
+      // Child inherits the parent's subscription when it has no explicit
+      // --subscription; explicit child selection wins (mirrors task_folder).
+      subscription: withInheritedSubscription(
+        params.globalFlags.subscription,
+        params.parentSubscription,
+      ),
+    },
   };
 }
 
@@ -1085,6 +1101,7 @@ export async function handleSessionsNew(
       permissionPolicy,
       parentSessionId: parent?.acpxRecordId,
       parentTaskFolder: parent?.taskFolder,
+      parentSubscription: parent?.subscription,
     }),
   );
 
@@ -1121,6 +1138,7 @@ export async function handleSessionsEnsure(
       permissionPolicy,
       parentSessionId: parent?.acpxRecordId,
       parentTaskFolder: parent?.taskFolder,
+      parentSubscription: parent?.subscription,
     }),
   );
 
