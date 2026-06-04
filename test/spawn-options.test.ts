@@ -8,6 +8,10 @@ import { resolveAgentSessionCwd } from "../src/acp/client-process.js";
 import { buildAgentSpawnOptions, buildSpawnCommandOptions } from "../src/acp/client.js";
 import { buildTerminalSpawnOptions } from "../src/acp/terminal-manager.js";
 import { buildQueueOwnerSpawnOptions } from "../src/cli/session/queue-owner-process.js";
+import {
+  markSubscriptionDead,
+  resetKnownDeadSubs,
+} from "../src/config/known-dead-subscriptions.js";
 import type { SubscriptionLookupOptions } from "../src/config/subscriptions.js";
 import {
   buildTerminalShellSpawnCommand,
@@ -985,6 +989,98 @@ test("buildAgentSpawnOptions (G4) explicit id with MISSING dir, no default → e
           `[acpx] subscription "sub1" configDir not found at ${ctx.configDir("sub1")}; using default Claude config (no CLAUDE_CONFIG_DIR override)\n`,
         ]);
       });
+    },
+  );
+});
+
+// --- ACPX_SUBSCRIPTION env export (E.2) ---
+
+test("buildAgentSpawnOptions (S1) explicit sub → ACPX_SUBSCRIPTION = that id", async () => {
+  resetKnownDeadSubs();
+  await withSubscriptionsHome(
+    { registry: TWO_SUB_REGISTRY, existingDirs: ["sub1", "sub2"] },
+    async (ctx) => {
+      const options = buildAgentSpawnOptions(
+        "/tmp/acpx-agent",
+        undefined,
+        { acpxRecordId: "rec", subscriptionId: "sub1" },
+        ctx.lookupOptions,
+      );
+      assert.equal(options.env.ACPX_SUBSCRIPTION, "sub1");
+    },
+  );
+});
+
+test("buildAgentSpawnOptions (S2) unselected + default → ACPX_SUBSCRIPTION = the resolved default id", async () => {
+  resetKnownDeadSubs();
+  await withSubscriptionsHome(
+    { registry: TWO_SUB_REGISTRY, existingDirs: ["sub1", "sub2"] },
+    async (ctx) => {
+      await withCapturedStderrWrites(async () => {
+        const options = buildAgentSpawnOptions(
+          "/tmp/acpx-agent",
+          undefined,
+          { acpxRecordId: "rec" },
+          ctx.lookupOptions,
+        );
+        assert.equal(options.env.ACPX_SUBSCRIPTION, "sub2");
+      });
+    },
+  );
+});
+
+test("buildAgentSpawnOptions (S3) no registry → ACPX_SUBSCRIPTION ABSENT (backward safety)", async () => {
+  resetKnownDeadSubs();
+  await withSubscriptionsHome({ registry: undefined }, async (ctx) => {
+    const options = buildAgentSpawnOptions(
+      "/tmp/acpx-agent",
+      undefined,
+      { acpxRecordId: "rec" },
+      ctx.lookupOptions,
+    );
+    assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_SUBSCRIPTION"), false);
+  });
+});
+
+// --- Pre-spawn known-dead avoidance (§4.1.4) ---
+
+test("buildAgentSpawnOptions (K1) resolved sub known-dead → substitutes a healthy sub", async () => {
+  resetKnownDeadSubs();
+  await withSubscriptionsHome(
+    { registry: TWO_SUB_REGISTRY, existingDirs: ["sub1", "sub2"] },
+    async (ctx) => {
+      markSubscriptionDead("sub1");
+      try {
+        await withCapturedStderrWrites(async () => {
+          const options = buildAgentSpawnOptions(
+            "/tmp/acpx-agent",
+            undefined,
+            { acpxRecordId: "rec", subscriptionId: "sub1" }, // explicitly pinned to the dead sub
+            ctx.lookupOptions,
+          );
+          // Substituted to the healthy sub2.
+          assert.equal(options.env.CLAUDE_CONFIG_DIR, ctx.configDir("sub2"));
+          assert.equal(options.env.ACPX_SUBSCRIPTION, "sub2");
+        });
+      } finally {
+        resetKnownDeadSubs();
+      }
+    },
+  );
+});
+
+test("buildAgentSpawnOptions (K2) known-dead set empty → no substitution (identical to today)", async () => {
+  resetKnownDeadSubs();
+  await withSubscriptionsHome(
+    { registry: TWO_SUB_REGISTRY, existingDirs: ["sub1", "sub2"] },
+    async (ctx) => {
+      const options = buildAgentSpawnOptions(
+        "/tmp/acpx-agent",
+        undefined,
+        { acpxRecordId: "rec", subscriptionId: "sub1" },
+        ctx.lookupOptions,
+      );
+      assert.equal(options.env.CLAUDE_CONFIG_DIR, ctx.configDir("sub1"));
     },
   );
 });

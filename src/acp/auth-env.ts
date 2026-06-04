@@ -1,9 +1,14 @@
+import { hasKnownDeadSubs, isSubscriptionKnownDead } from "../config/known-dead-subscriptions.js";
 import {
   chooseSubscriptionConfigDir,
   loadSubscriptionRegistry,
   subscriptionConfigDirExists,
 } from "../config/subscriptions.js";
-import type { ConfigDirChoice, SubscriptionLookupOptions } from "../config/subscriptions.js";
+import type {
+  ConfigDirChoice,
+  SubscriptionLookupOptions,
+  SubscriptionRegistry,
+} from "../config/subscriptions.js";
 import type { AcpClientOptions } from "../types.js";
 
 const AUTH_ENV_PREFIX = "ACPX_AUTH_";
@@ -134,12 +139,45 @@ function buildAgentEnvironment(
   return env;
 }
 
+type ResolvedSubscription = {
+  registry: SubscriptionRegistry;
+  choice: ConfigDirChoice;
+  defaultId: string | undefined;
+};
+
+// Load the registry and resolve the choice, emitting the legacy log lines. Returns
+// undefined when there is no configDir to apply (no registry / unusable default /
+// registry read failure) — i.e. the caller leaves CLAUDE_CONFIG_DIR unset.
+function resolveSubscriptionChoice(
+  explicitId: string | null | undefined,
+  lookupOptions: SubscriptionLookupOptions | undefined,
+): ResolvedSubscription | undefined {
+  let resolved: ResolvedSubscription;
+  try {
+    const registry = loadSubscriptionRegistry(lookupOptions);
+    resolved = {
+      registry,
+      defaultId: registry.default,
+      choice: chooseSubscriptionConfigDir(explicitId, registry, subscriptionConfigDirExists),
+    };
+  } catch (error) {
+    emitRegistryReadFailure(explicitId, error);
+    return undefined;
+  }
+  if (resolved.choice.explicitRejection) {
+    emitExplicitRejection(resolved.choice.explicitRejection);
+  }
+  return resolved.choice.configDir === undefined ? undefined : resolved;
+}
+
 // Resolve which CLAUDE_CONFIG_DIR an adapter spawn should use and set it on the
 // env. This is the SINGLE resolution point — every spawn path (create / recover /
 // keepwarm) routes through buildAgentEnvironment, so they all inherit it. Order
 // (see chooseSubscriptionConfigDir): explicit valid id → registry default →
 // raw ~/.claude. An explicit id we can't honor logs the legacy line and falls
-// through the same default→raw chain instead of crashing the spawn.
+// through the same default→raw chain instead of crashing the spawn. Also sets
+// ACPX_SUBSCRIPTION to the resolved id (E.2) and applies process-local
+// known-dead avoidance (§4.1.4) before committing the dir.
 //
 // BACKWARD SAFETY: on a box with no registry / no usable default, an UNSELECTED
 // spawn produces no configDir and ZERO stderr (byte-identical to pre-default
@@ -150,29 +188,75 @@ function applySubscriptionConfigDir(
   explicitId: string | null | undefined,
   lookupOptions?: SubscriptionLookupOptions,
 ): void {
-  let choice: ConfigDirChoice;
-  let defaultId: string | undefined;
-  try {
-    const registry = loadSubscriptionRegistry(lookupOptions);
-    defaultId = registry.default;
-    choice = chooseSubscriptionConfigDir(explicitId, registry, subscriptionConfigDirExists);
-  } catch (error) {
-    emitRegistryReadFailure(explicitId, error);
+  const resolved = resolveSubscriptionChoice(explicitId, lookupOptions);
+  if (!resolved) {
     return;
   }
+  const { registry, choice, defaultId } = resolved;
 
-  if (choice.explicitRejection) {
-    emitExplicitRejection(choice.explicitRejection);
-  }
+  // The id this choice resolved to (explicit selection or registry default).
+  const baseResolvedId = choice.source === "explicit" ? explicitId?.trim() : defaultId;
+  const { resolvedId, configDir, substituted } = applyPreSpawnAvoidance(
+    registry,
+    baseResolvedId,
+    choice.configDir as string,
+  );
 
-  if (choice.configDir === undefined) {
-    return;
+  env.CLAUDE_CONFIG_DIR = configDir;
+  // Export the RESOLVED subscription id so the agent (and its children) can read
+  // its own sub and inherit it (ACPX_SUBSCRIPTION, beside ACPX_TASK_FOLDER).
+  if (resolvedId) {
+    env.ACPX_SUBSCRIPTION = resolvedId;
   }
+  // Only emit the "default applied" note when we used the default verbatim (no
+  // failover substitution kicked in), to keep the existing message accurate.
+  if (choice.source === "default" && defaultId && !substituted) {
+    emitDefaultApplied(
+      defaultId,
+      choice.configDir as string,
+      choice.explicitRejection !== undefined,
+    );
+  }
+}
 
-  env.CLAUDE_CONFIG_DIR = choice.configDir;
-  if (choice.source === "default" && defaultId) {
-    emitDefaultApplied(defaultId, choice.configDir, choice.explicitRejection !== undefined);
+// Pre-spawn avoidance (§4.1.4): if the resolved sub failed over earlier in this
+// process, substitute the first registered, dir-present sub that is NOT
+// known-dead — a cheap registry walk, no probe. Best-effort; the durable signal
+// is the persisted record (which failover already updated). When nothing is
+// known-dead this is a no-op that returns the inputs unchanged (backward safety).
+function applyPreSpawnAvoidance(
+  registry: SubscriptionRegistry,
+  resolvedId: string | undefined,
+  configDir: string,
+): { resolvedId: string | undefined; configDir: string; substituted: boolean } {
+  if (!resolvedId || !hasKnownDeadSubs() || !isSubscriptionKnownDead(resolvedId)) {
+    return { resolvedId, configDir, substituted: false };
   }
+  const healthy = firstHealthySubscription(registry, resolvedId);
+  if (!healthy) {
+    return { resolvedId, configDir, substituted: false };
+  }
+  process.stderr.write(
+    `[acpx] subscription "${resolvedId}" recently failed over; using "${healthy.id}" for this spawn (CLAUDE_CONFIG_DIR=${healthy.configDir})\n`,
+  );
+  return { resolvedId: healthy.id, configDir: healthy.configDir, substituted: true };
+}
+
+// First registered subscription whose dir exists and is not known-dead, skipping
+// `avoidId`. Pure registry walk (no probe) for pre-spawn avoidance (§4.1.4).
+function firstHealthySubscription(
+  registry: SubscriptionRegistry,
+  avoidId: string,
+): { id: string; configDir: string } | undefined {
+  for (const entry of registry.subscriptions) {
+    if (entry.id === avoidId || isSubscriptionKnownDead(entry.id)) {
+      continue;
+    }
+    if (subscriptionConfigDirExists(entry.configDir)) {
+      return { id: entry.id, configDir: entry.configDir };
+    }
+  }
+  return undefined;
 }
 
 // loadSubscriptionRegistry never throws; this defends the explicit-id path

@@ -134,10 +134,15 @@ function cachedUsage(id: string): SubscriptionUsage | undefined {
   return undefined;
 }
 
-async function usageForEntry(entry: SubscriptionEntry): Promise<SubscriptionUsage> {
-  const cached = cachedUsage(entry.id);
-  if (cached) {
-    return cached;
+async function usageForEntry(
+  entry: SubscriptionEntry,
+  forceRefresh = false,
+): Promise<SubscriptionUsage> {
+  if (!forceRefresh) {
+    const cached = cachedUsage(entry.id);
+    if (cached) {
+      return cached;
+    }
   }
   const value = await probeSubscriptionUsage(entry);
   // Only cache successful probes so transient failures retry on the next call.
@@ -150,10 +155,71 @@ async function usageForEntry(entry: SubscriptionEntry): Promise<SubscriptionUsag
 /**
  * Probe each subscription's current 5h + 7d utilization, in parallel, with a
  * per-subscription 5-minute cache. Never rejects: a failed probe yields an
- * entry with `error` set and null windows.
+ * entry with `error` set and null windows. `forceRefresh` bypasses the cache
+ * (used on the first failover for a turn so target selection does not act on a
+ * stale "everything's fine" reading).
  */
 export async function getSubscriptionsUsage(
   entries: SubscriptionEntry[],
+  forceRefresh = false,
 ): Promise<SubscriptionUsage[]> {
-  return await Promise.all(entries.map((entry) => usageForEntry(entry)));
+  return await Promise.all(entries.map((entry) => usageForEntry(entry, forceRefresh)));
+}
+
+/** Highest of the two windows' utilization (the binding constraint), or 0. */
+export function maxUtilization(usage: SubscriptionUsage): number {
+  return Math.max(usage.fiveHour?.utilization ?? 0, usage.sevenDay?.utilization ?? 0);
+}
+
+const DEFAULT_MAXED_THRESHOLD = 0.98;
+
+/**
+ * Resolve the "too maxed to target" utilization threshold. Per CONCEPTION §8
+ * OQ1 default: only skip a sub for being maxed if it is ≥0.98 (or has a probe
+ * error / 401); otherwise utilization is used solely to RANK targets — we never
+ * strand a usable sub. Configurable via ACPX_SUBSCRIPTION_MAXED_THRESHOLD.
+ */
+export function maxedThreshold(): number {
+  const raw = process.env.ACPX_SUBSCRIPTION_MAXED_THRESHOLD?.trim();
+  if (!raw) {
+    return DEFAULT_MAXED_THRESHOLD;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 1) {
+    return DEFAULT_MAXED_THRESHOLD;
+  }
+  return parsed;
+}
+
+/**
+ * Pick the best failover target from a set of probed usages: exclude already-
+ * tried subs, any with a probe error (401/probe-fail), and any at/above the
+ * maxed threshold; among the rest pick the lowest max-utilization (most
+ * headroom). Ties resolve to input order (callers pass registry order).
+ * Returns undefined when nothing qualifies (→ all-subscriptions-exhausted).
+ */
+export function pickFailoverTarget(
+  usages: SubscriptionUsage[],
+  options: { exclude: ReadonlySet<string>; threshold?: number },
+): SubscriptionUsage | undefined {
+  const threshold = options.threshold ?? maxedThreshold();
+  let best: SubscriptionUsage | undefined;
+  let bestUtil = Number.POSITIVE_INFINITY;
+  for (const usage of usages) {
+    if (options.exclude.has(usage.id)) {
+      continue;
+    }
+    if (usage.error !== undefined) {
+      continue;
+    }
+    const util = maxUtilization(usage);
+    if (util >= threshold) {
+      continue;
+    }
+    if (util < bestUtil) {
+      best = usage;
+      bestUtil = util;
+    }
+  }
+  return best;
 }

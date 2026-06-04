@@ -171,6 +171,22 @@ export class SubscriptionUnknownError extends AcpxOperationalError {
   }
 }
 
+// Every registered subscription is dead (401) or maxed (≥ threshold) — there is
+// nothing to fail over to. Terminal turn error; the record's selection is left
+// unchanged so a later turn re-probes and auto-recovers when a window resets.
+// `code` (OutputErrorCode) is a closed set, so the cross-repo contract string
+// lives in detailCode = "all-subscriptions-exhausted" (acpx-ui maps it to its
+// "all subscriptions exhausted" notice).
+export class AllSubscriptionsExhaustedError extends AcpxOperationalError {
+  constructor(statuses: string) {
+    super(`All subscriptions are exhausted or unavailable. ${statuses}`, {
+      outputCode: "RUNTIME",
+      detailCode: "all-subscriptions-exhausted",
+      origin: "runtime",
+    });
+  }
+}
+
 // A manual subscription switch was requested while a turn is in flight on the
 // live queue owner. Refused (not queued) — switching mid-stream would tear the
 // client down. acpx-ui maps the "turn-in-flight" detailCode to a 409.

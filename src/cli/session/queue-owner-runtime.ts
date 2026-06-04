@@ -224,6 +224,11 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   let owner: SessionQueueOwner | undefined;
   let heartbeatTimer: NodeJS.Timeout | undefined;
   let idleDrain: { stop: () => Promise<void> } | undefined;
+  // Set when a turn auto-failed-over to a new subscription. The shared client is
+  // pinned to the OLD CLAUDE_CONFIG_DIR for the owner's lifetime, so we recycle
+  // the owner (exit the loop, release the lease) after the current turn; the
+  // next prompt cold-spawns a fresh owner on the new dir.
+  let recycleOwnerAfterTask = false;
   const sharedClient = createQueueOwnerSharedClient(options, sessionRecord);
   const ttlMs = normalizeQueueOwnerTtlMs(options.ttlMs);
   const maxQueueDepth = Math.max(1, Math.round(options.maxQueueDepth ?? 16));
@@ -551,6 +556,14 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
                 turnController.markPromptActive();
                 await applyPendingCancel();
               },
+              onFailoverSwitched: (newSubId: string) => {
+                recycleOwnerAfterTask = true;
+                if (options.verbose) {
+                  process.stderr.write(
+                    `[acpx] subscription failover applied (→ ${newSubId}); recycling queue owner for session ${options.sessionId} after this turn\n`,
+                  );
+                }
+              },
               setMidTurnHandler: midTurnInjectionSupported
                 ? (handler) => {
                     activeMidTurnHandler = handler;
@@ -601,6 +614,12 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       }
       // Restart idle drain to capture teammate activity until next prompt
       idleDrain = await startIdleStreamDrain();
+
+      // A failover this turn pinned the shared client to a now-stale config dir.
+      // Exit so the next prompt cold-spawns a fresh owner on the new subscription.
+      if (recycleOwnerAfterTask) {
+        break;
+      }
     }
 
     await idleDrain.stop();

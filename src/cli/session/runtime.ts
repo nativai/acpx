@@ -11,6 +11,11 @@ import { InterruptedError, withInterrupt, withTimeout } from "../../async-contro
 import { tailClaudeSubagentJsonl } from "../../claude-jsonl.js";
 import { transcriptCwdHash } from "../../config/subscription-transcript.js";
 import { SessionClosedError } from "../../errors.js";
+import {
+  attemptFailoverAndRetry,
+  classifyFailover,
+  failoverEnabled,
+} from "../../runtime/engine/failover.js";
 export { InterruptedError, TimeoutError } from "../../async-control.js";
 import { formatPerfMetric, measurePerf, startPerfTimer } from "../../perf-metrics.js";
 import { textPrompt } from "../../prompt-content.js";
@@ -498,6 +503,10 @@ export async function runQueuedTask(
     onPromptActive?: () => Promise<void> | void;
     onAcpMessage?: (direction: AcpMessageDirection, message: AcpJsonRpcMessage) => void;
     setMidTurnHandler?: (handler: ((task: QueueTask) => void) | undefined) => void;
+    // Failover: signaled after a turn auto-switched the session to a new
+    // subscription. The owner uses it to recycle its (now stale-dir) shared
+    // client so subsequent turns cold-spawn on the new CLAUDE_CONFIG_DIR.
+    onFailoverSwitched?: (newSubId: string) => void;
   },
 ): Promise<void> {
   const outputFormatter = task.waitForCompletion
@@ -505,9 +514,14 @@ export async function runQueuedTask(
     : DISCARD_OUTPUT_FORMATTER;
 
   try {
-    const result = await runSessionPrompt(
-      buildQueuedTaskRunOptions(sessionRecordId, task, options, outputFormatter),
-    );
+    let result: SessionSendResult;
+    try {
+      result = await runSessionPrompt(
+        buildQueuedTaskRunOptions(sessionRecordId, task, options, outputFormatter),
+      );
+    } catch (error) {
+      result = await runQueuedTaskFailover(sessionRecordId, task, options, outputFormatter, error);
+    }
     sendQueuedTaskResult(task, result);
   } catch (error) {
     sendQueuedTaskError(task, error);
@@ -517,6 +531,36 @@ export async function runQueuedTask(
   } finally {
     task.close();
   }
+}
+
+// On a failover-classified turn error (401/429/billing), switch the session to a
+// usable subscription and re-run the turn on a FRESH client (built from the
+// updated record → new CLAUDE_CONFIG_DIR, resuming the ported transcript). Not a
+// failover trigger, no registry, or exhausted → rethrow (the original error, or
+// AllSubscriptionsExhaustedError) for the normal failure path.
+async function runQueuedTaskFailover(
+  sessionRecordId: string,
+  task: QueueTask,
+  options: QueuedTaskRuntimeOptions,
+  outputFormatter: OutputFormatter,
+  error: unknown,
+): Promise<SessionSendResult> {
+  if (!classifyFailover(error) || !failoverEnabled()) {
+    throw error;
+  }
+  const record = await resolveSessionRecord(sessionRecordId);
+  const { result, switchedTo } = await attemptFailoverAndRetry<SessionSendResult>({
+    record,
+    verbose: options.verbose,
+    runTurn: async () =>
+      // Fresh client (omit sharedClient) so the retry resolves the new dir.
+      await runSessionPrompt({
+        ...buildQueuedTaskRunOptions(sessionRecordId, task, options, outputFormatter),
+        client: undefined,
+      }),
+  });
+  options.onFailoverSwitched?.(switchedTo);
+  return result;
 }
 
 // eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
