@@ -251,378 +251,6 @@ const ROOT_SCALAR_KEYS = new Set([
   "pid",
 ]);
 
-type FrameRole = "root" | "metadata" | "subagents" | "subagentElem";
-type Frame = {
-  kind: "object" | "array";
-  role: FrameRole;
-  expect: "key" | "colon" | "value" | "comma";
-  key?: string;
-};
-
-type CaptureTarget = { sink: "root"; key: string } | { sink: "task" } | { sink: "subagent" };
-
-type Mode = "struct" | "string" | "prim" | "skip";
-
-const WHITESPACE = new Set([" ", "\t", "\n", "\r"]);
-
-/**
- * Incremental scanner: feed it the record's bytes as UTF-8 string chunks (any
- * chunking, including 1 char at a time), then call `finish()`. It tracks JSON
- * structure depth + string/escape state so message content can never spoof a
- * top-level key, and skips the bytes of large values rather than buffering them.
- */
-export class ProjectionScanner {
-  private mode: Mode = "struct";
-  private frames: Frame[] = [];
-  private done = false;
-  private invalid = false;
-
-  // string state
-  private buf = "";
-  private capturing = false;
-  private stringIsKey = false;
-  private afterStringSkip = false; // true → string lives inside a skipped value
-  private pendingEscape = false;
-  private captureTarget: CaptureTarget | null = null;
-
-  // primitive state
-  private primBuf = "";
-  private primCapture = false;
-
-  // skip state
-  private skipDepth = 0;
-
-  // collected
-  private raw: Record<string, string | number | boolean | null> = {};
-  private taskFolder: string | undefined;
-  private readonly subagentIds: string[] = [];
-
-  private readonly reString = /["\\]/g;
-  private readonly reStruct = /[{}[\]"]/g;
-
-  // eslint-disable-next-line complexity -- streaming JSON scanner state machine; verified byte-identical against the full store, kept inline for parse correctness
-  feed(chunk: string): void {
-    if (this.done || this.invalid) {
-      return;
-    }
-    const n = chunk.length;
-    let i = 0;
-    while (i < n) {
-      if (this.mode === "string") {
-        i = this.feedString(chunk, i, n);
-      } else if (this.mode === "skip") {
-        i = this.feedSkip(chunk, i, n);
-      } else if (this.mode === "prim") {
-        i = this.feedPrim(chunk, i, n);
-      } else {
-        i = this.feedStruct(chunk, i, n);
-      }
-      if (this.done || this.invalid) {
-        return;
-      }
-    }
-  }
-
-  finish(): RawProjection | null {
-    if (this.invalid) {
-      return null;
-    }
-    return buildProjection(this.raw, this.taskFolder, this.subagentIds);
-  }
-
-  // ----- string mode -----------------------------------------------------
-  // eslint-disable-next-line complexity -- streaming JSON scanner state machine; verified byte-identical against the full store, kept inline for parse correctness
-  private feedString(chunk: string, start: number, n: number): number {
-    let i = start;
-    if (this.pendingEscape) {
-      if (this.capturing) {
-        this.buf += chunk[i];
-      }
-      this.pendingEscape = false;
-      i += 1;
-      if (i >= n) {
-        return i;
-      }
-    }
-    this.reString.lastIndex = i;
-    const match = this.reString.exec(chunk);
-    if (!match) {
-      if (this.capturing) {
-        this.buf += chunk.slice(i);
-      }
-      return n;
-    }
-    const j = match.index;
-    if (this.capturing) {
-      this.buf += chunk.slice(i, j);
-    }
-    if (chunk[j] === "\\") {
-      if (j + 1 < n) {
-        if (this.capturing) {
-          this.buf += chunk.slice(j, j + 2);
-        }
-        return j + 2;
-      }
-      if (this.capturing) {
-        this.buf += "\\";
-      }
-      this.pendingEscape = true;
-      return n;
-    }
-    // closing quote
-    this.endString();
-    return j + 1;
-  }
-
-  private endString(): void {
-    if (this.afterStringSkip) {
-      this.mode = "skip";
-      this.afterStringSkip = false;
-      return;
-    }
-    const top = this.frames[this.frames.length - 1];
-    if (this.stringIsKey) {
-      top.key = this.capturing ? decodeJsonString(this.buf) : undefined;
-      top.expect = "colon";
-    } else {
-      if (this.captureTarget) {
-        this.assign(this.captureTarget, decodeJsonString(this.buf));
-        this.captureTarget = null;
-      }
-      top.expect = "comma";
-    }
-    this.mode = "struct";
-    this.buf = "";
-    this.capturing = false;
-  }
-
-  // ----- skip mode (bulk-skip a structural value) ------------------------
-  private feedSkip(chunk: string, start: number, n: number): number {
-    this.reStruct.lastIndex = start;
-    const match = this.reStruct.exec(chunk);
-    if (!match) {
-      return n;
-    }
-    const j = match.index;
-    const c = chunk[j];
-    if (c === '"') {
-      this.mode = "string";
-      this.capturing = false;
-      this.stringIsKey = false;
-      this.afterStringSkip = true;
-      return j + 1;
-    }
-    if (c === "{" || c === "[") {
-      this.skipDepth += 1;
-      return j + 1;
-    }
-    // } or ]
-    this.skipDepth -= 1;
-    if (this.skipDepth === 0) {
-      this.mode = "struct";
-      const top = this.frames[this.frames.length - 1];
-      top.expect = "comma";
-    }
-    return j + 1;
-  }
-
-  // ----- primitive mode --------------------------------------------------
-  private feedPrim(chunk: string, start: number, n: number): number {
-    let i = start;
-    while (i < n) {
-      const c = chunk[i];
-      if (c === "," || c === "}" || c === "]" || WHITESPACE.has(c)) {
-        this.endPrim();
-        return i; // re-process terminator in struct mode
-      }
-      if (this.primCapture) {
-        this.primBuf += c;
-      }
-      i += 1;
-    }
-    return i;
-  }
-
-  private endPrim(): void {
-    if (this.captureTarget && this.primCapture) {
-      this.assign(this.captureTarget, parsePrimitive(this.primBuf));
-      this.captureTarget = null;
-    }
-    this.primBuf = "";
-    this.primCapture = false;
-    this.mode = "struct";
-    const top = this.frames[this.frames.length - 1];
-    top.expect = "comma";
-  }
-
-  // ----- struct mode -----------------------------------------------------
-  private feedStruct(chunk: string, start: number, n: number): number {
-    let i = start;
-    while (i < n) {
-      const c = chunk[i];
-      if (WHITESPACE.has(c)) {
-        i += 1;
-        continue;
-      }
-      if (this.frames.length === 0) {
-        if (c === "{") {
-          this.frames.push({ kind: "object", role: "root", expect: "key" });
-          return i + 1;
-        }
-        this.invalid = true;
-        return n;
-      }
-      const top = this.frames[this.frames.length - 1];
-      const consumed = this.dispatchStruct(top, c, chunk, i);
-      return consumed;
-    }
-    return i;
-  }
-
-  // eslint-disable-next-line complexity -- streaming JSON scanner state machine; verified byte-identical against the full store, kept inline for parse correctness
-  private dispatchStruct(top: Frame, c: string, _chunk: string, i: number): number {
-    if (top.kind === "object") {
-      if (top.expect === "key") {
-        if (c === "}") {
-          this.popFrame();
-          return i + 1;
-        }
-        if (c === '"') {
-          this.startKeyString();
-          return i + 1;
-        }
-        this.invalid = true;
-        return i + 1;
-      }
-      if (top.expect === "colon") {
-        if (c === ":") {
-          top.expect = "value";
-        }
-        return i + 1;
-      }
-      if (top.expect === "comma") {
-        if (c === "}") {
-          this.popFrame();
-        } else if (c === ",") {
-          top.expect = "key";
-        }
-        return i + 1;
-      }
-      // expect === "value"
-      return this.startValue(top, c, i);
-    }
-    // array
-    if (top.expect === "comma") {
-      if (c === "]") {
-        this.popFrame();
-      } else if (c === ",") {
-        top.expect = "value";
-      }
-      return i + 1;
-    }
-    // expect === "value" (array element)
-    if (c === "]") {
-      this.popFrame();
-      return i + 1;
-    }
-    return this.startValue(top, c, i);
-  }
-
-  private startKeyString(): void {
-    this.mode = "string";
-    this.capturing = true;
-    this.stringIsKey = true;
-    this.afterStringSkip = false;
-    this.buf = "";
-  }
-
-  private startValue(top: Frame, c: string, i: number): number {
-    const key = top.kind === "object" ? top.key : undefined;
-    if (c === '"') {
-      const target = this.captureTargetFor(top.role, key);
-      this.mode = "string";
-      this.stringIsKey = false;
-      this.afterStringSkip = false;
-      this.capturing = target !== null;
-      this.captureTarget = target;
-      this.buf = "";
-      return i + 1;
-    }
-    if (c === "{" || c === "[") {
-      const childRole = this.childRoleFor(top.role, key, c);
-      if (childRole) {
-        this.frames.push({
-          kind: c === "{" ? "object" : "array",
-          role: childRole,
-          expect: c === "{" ? "key" : "value",
-        });
-      } else {
-        this.mode = "skip";
-        this.skipDepth = 1;
-      }
-      return i + 1;
-    }
-    // primitive
-    const target = this.captureTargetFor(top.role, key);
-    this.mode = "prim";
-    this.captureTarget = target;
-    this.primCapture = target !== null;
-    this.primBuf = "";
-    return i; // start consuming from this char
-  }
-
-  /** Decide whether (role, key) wants a *scalar* value captured. */
-  private captureTargetFor(role: FrameRole, key: string | undefined): CaptureTarget | null {
-    if (role === "root" && key !== undefined && ROOT_SCALAR_KEYS.has(key)) {
-      return { sink: "root", key };
-    }
-    if (role === "metadata" && key === "task_folder") {
-      return { sink: "task" };
-    }
-    if (role === "subagentElem" && key === "acpx_record_id") {
-      return { sink: "subagent" };
-    }
-    return null;
-  }
-
-  /** Decide whether a structural value should be parsed (and as which role) or bulk-skipped. */
-  // eslint-disable-next-line complexity -- streaming JSON scanner state machine; verified byte-identical against the full store, kept inline for parse correctness
-  private childRoleFor(role: FrameRole, key: string | undefined, open: string): FrameRole | null {
-    if (role === "root" && open === "{" && key === "metadata") {
-      return "metadata";
-    }
-    if (role === "root" && open === "[" && key === "subagents") {
-      return "subagents";
-    }
-    if (role === "subagents" && open === "{") {
-      return "subagentElem";
-    }
-    return null;
-  }
-
-  private assign(target: CaptureTarget, value: string | number | boolean | null): void {
-    if (target.sink === "root") {
-      this.raw[target.key] = value;
-    } else if (target.sink === "task") {
-      if (typeof value === "string") {
-        this.taskFolder = value;
-      }
-    } else if (typeof value === "string") {
-      this.subagentIds.push(value);
-    }
-  }
-
-  private popFrame(): void {
-    this.frames.pop();
-    if (this.frames.length === 0) {
-      this.done = true;
-      return;
-    }
-    const parent = this.frames[this.frames.length - 1];
-    parent.expect = "comma";
-  }
-}
-
 function decodeJsonString(inner: string): string {
   try {
     return JSON.parse(`"${inner}"`) as string;
@@ -686,26 +314,79 @@ function buildProjection(
   };
 }
 
-/** Scan a record from an async iterable of UTF-8 string chunks (structural scanner). */
-export async function scanProjection(chunks: AsyncIterable<string>): Promise<RawProjection | null> {
-  const scanner = new ProjectionScanner();
-  for await (const chunk of chunks) {
-    scanner.feed(chunk);
-  }
-  return scanner.finish();
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
 }
 
-/** Convenience for tests: structural-scan a whole record string (optionally re-chunked). */
-export function scanProjectionFromString(text: string, chunkSize = 0): RawProjection | null {
-  const scanner = new ProjectionScanner();
-  if (chunkSize > 0) {
-    for (let i = 0; i < text.length; i += chunkSize) {
-      scanner.feed(text.slice(i, i + chunkSize));
+function extractScalarKeys(
+  record: Record<string, unknown>,
+): Record<string, string | number | boolean | null> {
+  const raw: Record<string, string | number | boolean | null> = {};
+  for (const key of ROOT_SCALAR_KEYS) {
+    const v = record[key];
+    if (typeof v === "string" || typeof v === "number" || typeof v === "boolean" || v === null) {
+      raw[key] = v;
     }
-  } else {
-    scanner.feed(text);
   }
-  return scanner.finish();
+  return raw;
+}
+
+function extractSubagentIds(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const ids: string[] = [];
+  for (const entry of value) {
+    const sub = asRecord(entry);
+    if (sub && typeof sub.acpx_record_id === "string") {
+      ids.push(sub.acpx_record_id);
+    }
+  }
+  return ids;
+}
+
+/**
+ * Correctness guard for the rare non-pretty-printed (compact) record the line
+ * scanner can't read: extract the same projection fields from a one-shot
+ * `JSON.parse`d object. Returns null for a non-record (→ counted as skipped).
+ */
+export function projectionFromObject(value: unknown): RawProjection | null {
+  const record = asRecord(value);
+  if (!record) {
+    return null;
+  }
+  const metadata = asRecord(record.metadata);
+  const taskFolder = typeof metadata?.task_folder === "string" ? metadata.task_folder : undefined;
+  return buildProjection(
+    extractScalarKeys(record),
+    taskFolder,
+    extractSubagentIds(record.subagents),
+  );
+}
+
+// Upper bound for the JSON.parse fallback. A compact record above this is skipped
+// (counted, never silently dropped) rather than risk materialising a huge object.
+const MAX_FALLBACK_BYTES = 8 * 1024 * 1024;
+
+/** Read a single file (bounded) and JSON.parse-extract its projection. */
+export async function scanProjectionFallback(
+  chunks: AsyncIterable<string>,
+  maxBytes: number,
+): Promise<RawProjection | null> {
+  let text = "";
+  for await (const chunk of chunks) {
+    text += chunk;
+    if (text.length > maxBytes) {
+      return null; // compact AND oversized → skip (surfaced in the `skipped` count)
+    }
+  }
+  try {
+    return projectionFromObject(JSON.parse(text));
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -715,10 +396,12 @@ export function scanProjectionFromString(text: string, chunkSize = 0): RawProjec
 // escapes literal newlines (`\n`) — so EVERY physical newline in the file is
 // structural whitespace, and a top-level key is always a line at exactly
 // 2-space indent (`^  "key":`). Message content can therefore never spoof a
-// top-level key (it has no physical newlines), giving the same robustness the
-// depth-aware scanner provides, while skipping message-content lines with a
-// 3-char check instead of walking every byte. Non-pretty-printed files (never
-// produced by acpx) fall back to the structural scanner.
+// top-level key (it has no physical newlines), so this scanner is both correct
+// and fast (it skips message-content lines with a 3-char check instead of
+// walking every byte, and never materialises `messages[]`). It is the correct
+// primary for 100% of acpx-written records. A non-pretty-printed (compact) file
+// — never produced by acpx — yields no projection here and is handled by the
+// small `JSON.parse` guard in `loadProjections` (never a silent drop).
 // ---------------------------------------------------------------------------
 
 const RE_SUBAGENT_ID = /^\s{2,}"acpx_record_id"\s*:\s*"((?:[^"\\]|\\.)*)"/;
@@ -1837,11 +1520,13 @@ export async function loadProjections(
       }
     }
     try {
-      // Fast line scan first; fall back to the structural scanner for any file
-      // that isn't recognisably 2-space pretty-printed (never produced by acpx).
+      // Fast line scan first (correct for every acpx-written, pretty-printed
+      // record). A non-pretty-printed (compact) record — never produced by acpx
+      // — yields nothing here, so JSON.parse just that one (small) file; a
+      // compact AND pathologically large file is skipped, never silently.
       let projection = await scanProjectionLines(io.openChunks(filePath));
       if (!projection) {
-        projection = await scanProjection(io.openChunks(filePath));
+        projection = await scanProjectionFallback(io.openChunks(filePath), MAX_FALLBACK_BYTES);
       }
       if (!projection) {
         return null;

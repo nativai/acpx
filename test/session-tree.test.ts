@@ -6,16 +6,18 @@ import {
   buildTreeResult,
   deriveEdge,
   formatAge,
+  loadProjections,
   parseDuration,
   parseSessionIdFromUrl,
+  projectionFromObject,
   resolveAnchor,
-  scanProjection,
-  scanProjectionFromString,
+  scanProjectionFallback,
   scanProjectionLines,
   walkAncestors,
   walkConnectedComponent,
   walkDescendants,
   type RawProjection,
+  type TreeIO,
   type TreeOptions,
 } from "../src/cli/session/session-tree.js";
 
@@ -193,36 +195,85 @@ test("line scanner survives arbitrary chunk boundaries", async () => {
   }
 });
 
-test("structural scanner agrees with the line scanner and survives chunking", async () => {
-  const json = recordJson({
-    parent_session_id: "parent-1",
-    forked_from_session_id: "fork-src",
-    forked_at_message_index: 7,
-    metadata: { task_folder: "/wisdom/task" },
-    subagents: [{ acpx_record_id: "sub-a", name: "n", spawned_at: "t" }],
-  });
-  const line = await fromChunks(json);
-  const structWhole = scanProjectionFromString(json);
-  const structChunked = scanProjectionFromString(json, 5);
-  assert.deepEqual(structWhole, line);
-  assert.deepEqual(structChunked, line);
-  assert.ok(line);
-  assert.equal(line.forkedAtMessageIndex, 7);
-});
-
-test("scanners reject non-records / wrong schema", async () => {
+test("line scanner rejects non-records / wrong schema", async () => {
   assert.equal(await fromChunks('{\n  "schema": "other.v1",\n  "acpx_record_id": "x"\n}\n'), null);
   assert.equal(await fromChunks('{\n  "no_id": true\n}\n'), null);
-  assert.equal(scanProjectionFromString("not json at all"), null);
 });
 
-test("scanProjection (structural) over an async iterable", async () => {
-  async function* gen(): AsyncIterable<string> {
-    yield recordJson({ kind: "subagent" });
-  }
-  const p = await scanProjection(gen());
+// --- JSON.parse correctness guard for non-pretty-printed (compact) records ---
+
+test("projectionFromObject extracts the projection from a parsed object", () => {
+  const p = projectionFromObject({
+    schema: "acpx.session.v1",
+    acpx_record_id: "c1",
+    acp_session_id: "a1",
+    agent_command: "npx -y @agentclientprotocol/codex-acp@^0.0.44",
+    forked_from_session_id: "p",
+    forked_at_message_index: 0,
+    metadata: { task_folder: "/t" },
+    subagents: [{ acpx_record_id: "s1" }, { acpx_record_id: "s2" }],
+    messages: [{ ignored: true }],
+  });
   assert.ok(p);
-  assert.equal(p.kind, "subagent");
+  assert.equal(p.id, "c1");
+  assert.equal(p.forkedFromSessionId, "p");
+  assert.equal(p.forkedAtMessageIndex, 0);
+  assert.equal(p.taskFolder, "/t");
+  assert.deepEqual(p.subagentIds, ["s1", "s2"]);
+  // non-records / wrong shapes → null
+  assert.equal(projectionFromObject({ no_id: true }), null);
+  assert.equal(projectionFromObject("nope"), null);
+  assert.equal(projectionFromObject(null), null);
+});
+
+test("scanProjectionFallback parses small compact, skips oversized, rejects junk", async () => {
+  const gen = (s: string) =>
+    (async function* (): AsyncIterable<string> {
+      yield s;
+    })();
+  const compact = JSON.stringify({
+    schema: "acpx.session.v1",
+    acpx_record_id: "z",
+    acp_session_id: "z",
+    agent_command: "node /opt/claude-agent-acp/dist/index.js",
+  });
+  assert.equal((await scanProjectionFallback(gen(compact), 1 << 20))?.id, "z");
+  assert.equal(await scanProjectionFallback(gen("x".repeat(100)), 50), null); // oversized → skip
+  assert.equal(await scanProjectionFallback(gen("not json"), 1 << 20), null); // unparseable
+});
+
+test("loadProjections: pretty via line scan, compact via JSON.parse guard, junk skipped", async () => {
+  const pretty = recordJson({ acpx_record_id: "pretty-1" }); // 2-space pretty-printed
+  const compact = JSON.stringify({
+    schema: "acpx.session.v1",
+    acpx_record_id: "compact-1",
+    acp_session_id: "c",
+    agent_command: "node /opt/claude-agent-acp/dist/index.js",
+    forked_from_session_id: "src",
+    forked_at_message_index: 3,
+    messages: [{ a: 1 }],
+  });
+  const files: Record<string, string> = {
+    "a.json": pretty,
+    "b.json": compact,
+    "c.json": "this is not json",
+  };
+  const io: TreeIO = {
+    baseDir: "/fake",
+    listSessionFiles: async () => Object.keys(files),
+    statFile: async () => null,
+    openChunks: (filePath) =>
+      (async function* (): AsyncIterable<string> {
+        yield files[filePath.slice(filePath.lastIndexOf("/") + 1)] ?? "";
+      })(),
+    now: () => NOW,
+  };
+  const { projections, skipped } = await loadProjections(io);
+  assert.deepEqual(projections.map((p) => p.id).toSorted(), ["compact-1", "pretty-1"]);
+  assert.equal(skipped, 1); // the junk file
+  const c = projections.find((p) => p.id === "compact-1");
+  assert.equal(c?.forkedFromSessionId, "src");
+  assert.equal(c?.forkedAtMessageIndex, 3);
 });
 
 // ---------------------------------------------------------------------------
