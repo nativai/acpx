@@ -48,6 +48,7 @@ import {
 } from "./flags.js";
 import { registerStatusCommand } from "./status-command.js";
 import { registerSubscriptionsCommand } from "./subscriptions-command.js";
+import { registerUsageCommand } from "./usage-command.js";
 
 type FlowRunFlags = {
   inputJson?: string;
@@ -524,6 +525,7 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
 
   registerSessionsCommand(program, undefined, config);
   registerSubscriptionsCommand(program, config);
+  registerUsageCommand(program, config);
   registerConfigCommand(program, config);
   registerFlowCommand(program, config);
 }

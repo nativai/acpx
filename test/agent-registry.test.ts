@@ -5,6 +5,8 @@ import path from "node:path";
 import test from "node:test";
 import {
   AGENT_REGISTRY,
+  agentKindFromCommand,
+  agentNameFromCommand,
   BUILT_IN_AGENT_PACKAGES,
   DEFAULT_AGENT_NAME,
   listBuiltInAgents,
@@ -157,4 +159,32 @@ test("resolvePackageExecBuiltInAgentLaunch bridges built-ins through the current
     packageRange: BUILT_IN_AGENT_PACKAGES.codex.packageRange,
     npmCliPath,
   });
+});
+
+// agentKindFromCommand — the load-bearing `acpx usage` guard. Substring match so
+// it survives codex version-range drift; classifies from the record's command,
+// never the env (a codex session's env still carries ACPX_SUBSCRIPTION).
+test("agentKindFromCommand classifies the claude fork command", () => {
+  assert.equal(agentKindFromCommand(AGENT_REGISTRY.claude), "claude");
+  assert.equal(agentKindFromCommand("node /opt/claude-agent-acp/dist/index.js"), "claude");
+});
+
+test("agentKindFromCommand classifies codex across version-range drift", () => {
+  assert.equal(agentKindFromCommand(AGENT_REGISTRY.codex), "codex");
+  // An older stored record with a different pinned range must still be codex.
+  assert.equal(agentKindFromCommand("npx -y @agentclientprotocol/codex-acp@^0.0.40"), "codex");
+  assert.equal(agentKindFromCommand("/usr/local/bin/codex-acp"), "codex");
+});
+
+test("agentKindFromCommand returns 'other' for non-claude/non-codex and empty commands", () => {
+  assert.equal(agentKindFromCommand(AGENT_REGISTRY.gemini), "other");
+  assert.equal(agentKindFromCommand("openclaw acp"), "other");
+  assert.equal(agentKindFromCommand(""), "other"); // subagent records have an empty command
+});
+
+test("agentNameFromCommand reverse-maps known commands and falls back to the first token", () => {
+  assert.equal(agentNameFromCommand(AGENT_REGISTRY.gemini), "gemini");
+  assert.equal(agentNameFromCommand(AGENT_REGISTRY.claude), "claude");
+  assert.equal(agentNameFromCommand("some-unknown-binary --acp"), "some-unknown-binary");
+  assert.equal(agentNameFromCommand(""), "unknown");
 });
