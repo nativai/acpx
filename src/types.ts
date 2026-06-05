@@ -41,6 +41,15 @@ export type ExitCode = (typeof EXIT_CODES)[keyof typeof EXIT_CODES];
 export const OUTPUT_FORMATS = ["text", "json", "quiet"] as const;
 export type OutputFormat = (typeof OUTPUT_FORMATS)[number];
 
+// Claude thinking-depth vocabulary for the `--reasoning-effort` spawn flag. A
+// 1:1 subset of the deployed adapter's advertised `effort` config-option levels
+// (default/low/medium/high/xhigh/max); we expose the three portable ones and
+// reject the model-coupled `xhigh`/`max` at the flag boundary. The value lands
+// on the record as `acpx.desired_config_options.effort` (an opaque string), so
+// inheritance can still carry a parent's live-set level outside this union.
+export const REASONING_EFFORTS = ["low", "medium", "high"] as const;
+export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
+
 export const PERMISSION_MODES = ["approve-all", "approve-reads", "deny-all"] as const;
 export type PermissionMode = (typeof PERMISSION_MODES)[number];
 

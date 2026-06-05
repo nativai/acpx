@@ -30,6 +30,7 @@ import {
   sessionOptionsFromRecord,
   type SessionAgentOptions,
 } from "../../runtime/engine/session-options.js";
+import { applyExecReasoningEffort } from "../../session/config-option-application.js";
 import {
   cloneSessionAcpxState,
   cloneSessionConversation,
@@ -1360,6 +1361,15 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
           models: createdSession.models,
           agentCommand: options.agentCommand,
           timeoutMs: options.timeoutMs,
+        });
+        // One-shot: no persisted record, so apply effort live for this turn only.
+        await applyExecReasoningEffort({
+          client,
+          sessionId,
+          reasoningEffort: options.sessionOptions?.reasoningEffort,
+          advertised: createdSession.configOptions,
+          timeoutMs: options.timeoutMs,
+          verbose: options.verbose,
         });
 
         output.setContext({

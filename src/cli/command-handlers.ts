@@ -2,7 +2,11 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { Command, InvalidArgumentError } from "commander";
 import { isLegacyZedCodexAcpInvocation } from "../acp/codex-compat.js";
-import { listBuiltInAgents, resolveAgentCommand } from "../agent-registry.js";
+import {
+  listBuiltInAgents,
+  resolveAgentCommand,
+  resolveAgentNameFromCommand,
+} from "../agent-registry.js";
 import { findSubscription, loadSubscriptionRegistry } from "../config/subscriptions.js";
 import { AgentSpawnError, SessionNotFoundError, SubscriptionUnknownError } from "../errors.js";
 import { loadPermissionPolicySpec } from "../permission-policy.js";
@@ -54,6 +58,9 @@ import {
 import { emitJsonResult } from "./output/json-output.js";
 import type { SessionListResult } from "./session/contracts.js";
 import {
+  withInheritedAgentCommand,
+  withInheritedModel,
+  withInheritedReasoningEffort,
   withInheritedSubscription,
   withInheritedTaskFolder,
 } from "./session/inherited-metadata.js";
@@ -193,7 +200,24 @@ function sessionOptionsFromGlobalFlags(
     maxTurns: globalFlags.maxTurns,
     systemPrompt: globalFlags.systemPrompt,
     subscription: globalFlags.subscription,
+    reasoningEffort: globalFlags.reasoningEffort,
   };
+}
+
+// `--reasoning-effort` is claude-only. When it's passed but the effective agent
+// is not claude (explicit codex, or a bare spawn that inherited a non-claude
+// parent), it never writes effort — say so once on stderr (never an error).
+function warnReasoningEffortIgnoredForNonClaude(
+  globalFlags: GlobalFlags,
+  effectiveAgentName: string,
+): void {
+  if (!globalFlags.reasoningEffort || effectiveAgentName === "claude" || globalFlags.jsonStrict) {
+    return;
+  }
+  process.stderr.write(
+    `[acpx] --reasoning-effort applies to claude; ignoring for agent "${effectiveAgentName}" ` +
+      `(codex depth is set via --model '<model>[depth]')\n`,
+  );
 }
 
 async function resolvePermissionPolicyFromFlags(
@@ -244,7 +268,30 @@ function resolveParentSessionIdFromFlagOrEnv(flags: SessionsNewFlags): string | 
   return undefined;
 }
 
-type ResolvedParentSession = { acpxRecordId: string; taskFolder?: string; subscription?: string };
+type ResolvedParentSession = {
+  acpxRecordId: string;
+  taskFolder?: string;
+  subscription?: string;
+  agentCommand?: string;
+  model?: string;
+  effort?: string;
+};
+
+// Snapshot the parent record's inheritable fields. Agent-type + model + effort
+// inheritance is gated on sameAgentAsParent in buildSessionStartOptions; effort
+// is the persisted desired intent (the single source of truth — the live
+// config_options snapshot can be stale).
+function parentInheritableFields(parent: SessionRecord): ResolvedParentSession {
+  const sessionOptions = parent.acpx?.session_options;
+  return {
+    acpxRecordId: parent.acpxRecordId,
+    taskFolder: parent.metadata?.task_folder,
+    subscription: sessionOptions?.subscription,
+    agentCommand: parent.agentCommand,
+    model: sessionOptions?.model,
+    effort: parent.acpx?.desired_config_options?.effort,
+  };
+}
 
 async function resolveAndValidateParentSessionId(
   flags: SessionsNewFlags,
@@ -254,12 +301,7 @@ async function resolveAndValidateParentSessionId(
     return undefined;
   }
   try {
-    const parent = await resolveSessionRecord(candidate);
-    return {
-      acpxRecordId: parent.acpxRecordId,
-      taskFolder: parent.metadata?.task_folder,
-      subscription: parent.acpx?.session_options?.subscription,
-    };
+    return parentInheritableFields(await resolveSessionRecord(candidate));
   } catch (error) {
     if (error instanceof SessionNotFoundError) {
       const label = flags.parentSessionUrl ? "--parent-session-url" : "--parent-id";
@@ -269,24 +311,78 @@ async function resolveAndValidateParentSessionId(
   }
 }
 
+type EffectiveSpawnAgent = {
+  agentName: string;
+  agentCommand: string;
+  cwd: string;
+  sameAgentAsParent: boolean;
+};
+
+// Resolve the agent a spawn (`sessions new` / `ensure`) actually uses, applying
+// parent agent-type inheritance: a bare/defaulted spawn inside an acpx session
+// adopts the parent's agent command (an explicit positional agent / --agent
+// always wins), while a top-level shell with no resolvable parent keeps today's
+// default. `sameAgentAsParent` then gates model/effort inheritance so an
+// agent-namespaced value never crosses agent boundaries.
+function resolveEffectiveSpawnAgent(
+  agent: ResolvedAgentInvocation,
+  explicitAgentName: string | undefined,
+  globalFlags: GlobalFlags,
+  parent: ResolvedParentSession | undefined,
+  config: ResolvedAcpxConfig,
+): EffectiveSpawnAgent {
+  const agentWasExplicit = explicitAgentName !== undefined || !!globalFlags.agent?.trim();
+  const agentCommand = withInheritedAgentCommand(
+    agent.agentCommand,
+    agentWasExplicit,
+    parent?.agentCommand,
+  );
+  const inherited = agentCommand !== agent.agentCommand;
+  // Keep the banner's display name consistent with the inherited command.
+  const agentName = inherited
+    ? (resolveAgentNameFromCommand(agentCommand, config.agents) ?? agent.agentName)
+    : agent.agentName;
+  const sameAgentAsParent = !!parent?.agentCommand && agentCommand === parent.agentCommand;
+  return { agentName, agentCommand, cwd: agent.cwd, sameAgentAsParent };
+}
+
+// Assemble the child's sessionOptions, layering parent inheritance over the
+// global flags. Model/effort inherit only when the child resolves to the SAME
+// agent (both are agent-namespaced); subscription always inherits. Explicit
+// child values win throughout. effort for a non-claude child is harmless here —
+// the creation sites only write/apply it when the session advertises `effort`.
+function inheritedSpawnSessionOptions(
+  globalFlags: GlobalFlags,
+  sameAgentAsParent: boolean,
+  parent: ResolvedParentSession | undefined,
+): NonNullable<Parameters<SessionModule["createSession"]>[0]["sessionOptions"]> {
+  return {
+    ...sessionOptionsFromGlobalFlags(globalFlags),
+    model: withInheritedModel(globalFlags.model, sameAgentAsParent ? parent?.model : undefined),
+    reasoningEffort: withInheritedReasoningEffort(
+      globalFlags.reasoningEffort,
+      sameAgentAsParent ? parent?.effort : undefined,
+    ),
+    subscription: withInheritedSubscription(globalFlags.subscription, parent?.subscription),
+  };
+}
+
 function buildSessionStartOptions(params: {
-  agent: ResolvedAgentInvocation;
+  agent: EffectiveSpawnAgent;
   flags: SessionsNewFlags;
   globalFlags: GlobalFlags;
   config: ResolvedAcpxConfig;
   permissionMode: ReturnType<typeof resolvePermissionMode>;
   permissionPolicy?: PermissionPolicy;
-  parentSessionId?: string;
-  parentTaskFolder?: string;
-  parentSubscription?: string;
+  parent?: ResolvedParentSession;
 }): Parameters<SessionModule["createSession"]>[0] {
   return {
     agentCommand: params.agent.agentCommand,
     cwd: params.agent.cwd,
     name: params.flags.name,
     resumeSessionId: params.flags.resumeSession,
-    parentSessionId: params.parentSessionId,
-    metadata: withInheritedTaskFolder(params.flags.metadata, params.parentTaskFolder),
+    parentSessionId: params.parent?.acpxRecordId,
+    metadata: withInheritedTaskFolder(params.flags.metadata, params.parent?.taskFolder),
     mcpServers: params.config.mcpServers,
     permissionMode: params.permissionMode,
     nonInteractivePermissions: params.globalFlags.nonInteractivePermissions,
@@ -296,15 +392,11 @@ function buildSessionStartOptions(params: {
     terminal: params.globalFlags.terminal,
     timeoutMs: params.globalFlags.timeout,
     verbose: params.globalFlags.verbose,
-    sessionOptions: {
-      ...sessionOptionsFromGlobalFlags(params.globalFlags),
-      // Child inherits the parent's subscription when it has no explicit
-      // --subscription; explicit child selection wins (mirrors task_folder).
-      subscription: withInheritedSubscription(
-        params.globalFlags.subscription,
-        params.parentSubscription,
-      ),
-    },
+    sessionOptions: inheritedSpawnSessionOptions(
+      params.globalFlags,
+      params.agent.sameAgentAsParent,
+      params.parent,
+    ),
   };
 }
 
@@ -467,6 +559,7 @@ export async function handlePrompt(
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const prompt = await readPrompt(promptParts, flags.file, globalFlags.cwd);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  warnReasoningEffortIgnoredForNonClaude(globalFlags, agent.agentName);
   const [
     { createOutputFormatter },
     { printPromptSessionBanner, printQueuedPromptByFormat },
@@ -514,6 +607,7 @@ export async function handlePrompt(
       maxTurns: globalFlags.maxTurns,
       systemPrompt: globalFlags.systemPrompt,
       subscription: globalFlags.subscription,
+      reasoningEffort: globalFlags.reasoningEffort,
     },
   });
 
@@ -574,6 +668,7 @@ export async function handleExec(
     suppressReads: outputPolicy.suppressReads,
   });
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  warnReasoningEffortIgnoredForNonClaude(globalFlags, agent.agentName);
 
   const result = await runOnce({
     agentCommand: agent.agentCommand,
@@ -597,6 +692,7 @@ export async function handleExec(
       maxTurns: globalFlags.maxTurns,
       systemPrompt: globalFlags.systemPrompt,
       subscription: globalFlags.subscription,
+      reasoningEffort: globalFlags.reasoningEffort,
     },
   });
 
@@ -1075,12 +1171,20 @@ export async function handleSessionsNew(
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const parent = await resolveAndValidateParentSessionId(flags);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const effectiveAgent = resolveEffectiveSpawnAgent(
+    agent,
+    explicitAgentName,
+    globalFlags,
+    parent,
+    config,
+  );
+  warnReasoningEffortIgnoredForNonClaude(globalFlags, effectiveAgent.agentName);
   const [{ createSession, closeSession }, { printCreatedSessionBanner, printNewSessionByFormat }] =
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
 
   const replaced = await findSession({
-    agentCommand: agent.agentCommand,
-    cwd: agent.cwd,
+    agentCommand: effectiveAgent.agentCommand,
+    cwd: effectiveAgent.cwd,
     name: flags.name,
   });
 
@@ -1093,19 +1197,22 @@ export async function handleSessionsNew(
 
   const created = await createSession(
     buildSessionStartOptions({
-      agent,
+      agent: effectiveAgent,
       flags,
       globalFlags,
       config,
       permissionMode,
       permissionPolicy,
-      parentSessionId: parent?.acpxRecordId,
-      parentTaskFolder: parent?.taskFolder,
-      parentSubscription: parent?.subscription,
+      parent,
     }),
   );
 
-  printCreatedSessionBanner(created, agent.agentName, globalFlags.format, globalFlags.jsonStrict);
+  printCreatedSessionBanner(
+    created,
+    effectiveAgent.agentName,
+    globalFlags.format,
+    globalFlags.jsonStrict,
+  );
 
   if (globalFlags.verbose) {
     const scope = flags.name ? `named session "${flags.name}"` : "cwd session";
@@ -1126,26 +1233,32 @@ export async function handleSessionsEnsure(
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const parent = await resolveAndValidateParentSessionId(flags);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const effectiveAgent = resolveEffectiveSpawnAgent(
+    agent,
+    explicitAgentName,
+    globalFlags,
+    parent,
+    config,
+  );
+  warnReasoningEffortIgnoredForNonClaude(globalFlags, effectiveAgent.agentName);
   const [{ ensureSession }, { printCreatedSessionBanner, printEnsuredSessionByFormat }] =
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
   const result = await ensureSession(
     buildSessionStartOptions({
-      agent,
+      agent: effectiveAgent,
       flags,
       globalFlags,
       config,
       permissionMode,
       permissionPolicy,
-      parentSessionId: parent?.acpxRecordId,
-      parentTaskFolder: parent?.taskFolder,
-      parentSubscription: parent?.subscription,
+      parent,
     }),
   );
 
   if (result.created) {
     printCreatedSessionBanner(
       result.record,
-      agent.agentName,
+      effectiveAgent.agentName,
       globalFlags.format,
       globalFlags.jsonStrict,
     );

@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  withInheritedAgentCommand,
+  withInheritedModel,
+  withInheritedReasoningEffort,
   withInheritedSubscription,
   withInheritedTaskFolder,
 } from "../src/cli/session/inherited-metadata.js";
@@ -69,4 +72,48 @@ test("withInheritedSubscription: a whitespace-only child is treated as absent â†
 
 test("withInheritedSubscription: a whitespace-only parent is treated as absent", () => {
   assert.equal(withInheritedSubscription(undefined, "   "), undefined);
+});
+
+const CLAUDE_CMD = "node /opt/claude-agent-acp/dist/index.js";
+const CODEX_CMD = "npx -y @agentclientprotocol/codex-acp@^0.0.44";
+
+test("withInheritedAgentCommand: a bare spawn inherits the parent's agent command", () => {
+  assert.equal(withInheritedAgentCommand(CODEX_CMD, false, CLAUDE_CMD), CLAUDE_CMD);
+});
+
+test("withInheritedAgentCommand: an explicit child agent always wins over the parent", () => {
+  assert.equal(withInheritedAgentCommand(CODEX_CMD, true, CLAUDE_CMD), CODEX_CMD);
+});
+
+test("withInheritedAgentCommand: no resolvable parent keeps the child's own command", () => {
+  assert.equal(withInheritedAgentCommand(CODEX_CMD, false, undefined), CODEX_CMD);
+  assert.equal(withInheritedAgentCommand(CODEX_CMD, false, "   "), CODEX_CMD);
+});
+
+test("withInheritedModel: child inherits the parent model when it has no explicit --model", () => {
+  assert.equal(withInheritedModel(undefined, "gpt-5.5[xhigh]"), "gpt-5.5[xhigh]");
+});
+
+test("withInheritedModel: an explicit child --model wins over the parent", () => {
+  assert.equal(withInheritedModel("opus[1m]", "gpt-5.5[xhigh]"), "opus[1m]");
+});
+
+test("withInheritedModel: undefined-safe / whitespace-aware", () => {
+  assert.equal(withInheritedModel(undefined, undefined), undefined);
+  assert.equal(withInheritedModel("   ", "gpt-5.5[xhigh]"), "gpt-5.5[xhigh]");
+  assert.equal(withInheritedModel(undefined, "   "), undefined);
+});
+
+test("withInheritedReasoningEffort: child inherits the parent effort when it has no flag", () => {
+  assert.equal(withInheritedReasoningEffort(undefined, "high"), "high");
+});
+
+test("withInheritedReasoningEffort: an explicit child --reasoning-effort wins", () => {
+  assert.equal(withInheritedReasoningEffort("low", "high"), "low");
+});
+
+test("withInheritedReasoningEffort: undefined-safe / whitespace-aware", () => {
+  assert.equal(withInheritedReasoningEffort(undefined, undefined), undefined);
+  assert.equal(withInheritedReasoningEffort("   ", "high"), "high");
+  assert.equal(withInheritedReasoningEffort(undefined, "   "), undefined);
 });

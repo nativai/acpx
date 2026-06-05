@@ -11,11 +11,13 @@ import {
   AUTH_POLICIES,
   NON_INTERACTIVE_PERMISSION_POLICIES,
   OUTPUT_FORMATS,
+  REASONING_EFFORTS,
   type AuthPolicy,
   type NonInteractivePermissionPolicy,
   type OutputFormat,
   type OutputPolicy,
   type PermissionMode,
+  type ReasoningEffort,
 } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 
@@ -46,6 +48,7 @@ export type GlobalFlags = PermissionFlags & {
   verbose?: boolean;
   format: OutputFormat;
   model?: string;
+  reasoningEffort?: ReasoningEffort;
   subscription?: string;
   allowedTools?: string[];
   maxTurns?: number;
@@ -143,6 +146,16 @@ export function parseAuthPolicy(value: string): AuthPolicy {
     );
   }
   return value as AuthPolicy;
+}
+
+export function parseReasoningEffort(value: string): ReasoningEffort {
+  const normalized = value.trim().toLowerCase();
+  if (!REASONING_EFFORTS.includes(normalized as ReasoningEffort)) {
+    throw new InvalidArgumentError(
+      `Invalid reasoning effort "${value}". Expected one of: ${REASONING_EFFORTS.join(", ")}`,
+    );
+  }
+  return normalized as ReasoningEffort;
 }
 
 export function parseNonInteractivePermissionPolicy(value: string): NonInteractivePermissionPolicy {
@@ -332,6 +345,11 @@ export function addGlobalFlags(command: Command): Command {
     .option("--suppress-reads", "Suppress raw read-file contents in output")
     .option("--model <id>", "Agent model id")
     .option(
+      "--reasoning-effort <level>",
+      "Claude thinking depth: low, medium, or high (ignored by codex — set codex depth via --model '<model>[depth]')",
+      parseReasoningEffort,
+    )
+    .option(
       "--subscription <id>",
       "Claude subscription id from the subscriptions registry (sets CLAUDE_CONFIG_DIR per session)",
     )
@@ -449,6 +467,7 @@ export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig)
     verbose,
     format,
     model: resolveModelOption(opts.model),
+    reasoningEffort: resolveReasoningEffortOption(opts.reasoningEffort),
     subscription: resolveSubscriptionOption(opts.subscription),
     allowedTools: stringArrayOption(opts.allowedTools),
     maxTurns: numberOption(opts.maxTurns),
@@ -537,6 +556,13 @@ function resolveModelOption(value: unknown): string | undefined {
 function resolveSubscriptionOption(value: unknown): string | undefined {
   const subscription = stringOption(value);
   return subscription === undefined ? undefined : parseNonEmptyValue("Subscription", subscription);
+}
+
+// Commander already runs parseReasoningEffort via the option parser, so the
+// value reaching here is validated; re-validate defensively (cheap, and guards
+// any path that reads the option without the parser attached).
+function resolveReasoningEffortOption(value: unknown): ReasoningEffort | undefined {
+  return typeof value === "string" ? parseReasoningEffort(value) : undefined;
 }
 
 export function resolveOutputPolicy(format: OutputFormat, jsonStrict: boolean): OutputPolicy {

@@ -8,6 +8,13 @@ export type SessionAgentOptions = {
   maxTurns?: number;
   systemPrompt?: SystemPromptOption;
   subscription?: string;
+  // Claude thinking depth (the `effort` config option). In-memory only: it is
+  // NOT written to `session_options` on disk — the creation sites persist it as
+  // `acpx.desired_config_options.effort` and apply it live via the config-option
+  // path. Carried forward across turns by mergeSessionOptions so a per-spawn
+  // depth survives a same-session re-create. Opaque string (an advertised effort
+  // level), validated at the flag boundary and again against the advertised set.
+  reasoningEffort?: string;
 };
 
 export function mergeSessionOptions(
@@ -20,6 +27,7 @@ export function mergeSessionOptions(
   assignDefinedOption(merged, "maxTurns", preferred?.maxTurns);
   assignDefinedOption(merged, "systemPrompt", preferred?.systemPrompt);
   assignDefinedOption(merged, "subscription", preferred?.subscription);
+  assignDefinedOption(merged, "reasoningEffort", preferred?.reasoningEffort);
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 

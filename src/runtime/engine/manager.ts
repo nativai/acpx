@@ -5,6 +5,7 @@ import { normalizeOutputError } from "../../acp/error-normalization.js";
 import { extractAcpError, isAcpResourceNotFoundError } from "../../acp/error-shapes.js";
 import { withTimeout } from "../../async-control.js";
 import { textPrompt, type PromptInput } from "../../prompt-content.js";
+import { persistAndApplyRequestedEffort } from "../../session/config-option-application.js";
 import { applyConfigOptionsToRecord } from "../../session/config-options.js";
 import {
   cloneSessionAcpxState,
@@ -599,6 +600,15 @@ export class AcpRuntimeManager {
       models: session.sessionResult.models,
       agentCommand,
       timeoutMs: this.options.timeoutMs,
+    });
+    await persistAndApplyRequestedEffort({
+      client,
+      sessionId: session.sessionId,
+      record,
+      reasoningEffort: input.sessionOptions?.reasoningEffort,
+      advertised: session.sessionResult.configOptions,
+      timeoutMs: this.options.timeoutMs,
+      verbose: this.options.verbose,
     });
     syncAdvertisedModelState(record, session.sessionResult.models);
     if (requestedModelApplied) {

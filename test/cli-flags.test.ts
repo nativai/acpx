@@ -17,6 +17,7 @@ import {
   parseOutputFormat,
   parsePruneBeforeDate,
   parsePromptRetries,
+  parseReasoningEffort,
   parseSessionName,
   parseTimeoutSeconds,
   parseTtlSeconds,
@@ -153,6 +154,18 @@ test("flag parsers reject invalid enum values with actionable messages", () => {
     () => parseNonInteractivePermissionPolicy("ask"),
     /Invalid non-interactive permission policy "ask".*deny, fail/,
   );
+
+  assert.equal(parseReasoningEffort("low"), "low");
+  assert.equal(parseReasoningEffort("medium"), "medium");
+  assert.equal(parseReasoningEffort("high"), "high");
+  assert.equal(parseReasoningEffort(" HIGH "), "high");
+  for (const bad of ["xhigh", "max", "default", ""]) {
+    assert.throws(
+      () => parseReasoningEffort(bad),
+      /Invalid reasoning effort.*low, medium, high/,
+      `expected ${JSON.stringify(bad)} to be rejected`,
+    );
+  }
 });
 
 test("numeric flag parsers reject non-finite and out-of-range values", () => {
@@ -223,6 +236,7 @@ test("resolveGlobalFlags validates and normalizes dynamic Commander options", ()
       verbose: false,
       format: "json",
       model: " opus ",
+      reasoningEffort: "high",
       subscription: " sub1 ",
       allowedTools: ["Read", "Edit"],
       maxTurns: 3,
@@ -248,6 +262,7 @@ test("resolveGlobalFlags validates and normalizes dynamic Commander options", ()
     verbose: false,
     format: "json",
     model: "opus",
+    reasoningEffort: "high",
     subscription: "sub1",
     allowedTools: ["Read", "Edit"],
     maxTurns: 3,

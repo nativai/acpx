@@ -151,6 +151,8 @@ function createStatusPayload(
     model: acpx.model,
     mode: acpx.mode,
     availableModels: acpx.availableModels,
+    reasoningEffort: acpx.reasoningEffort,
+    reasoningEffortLive: acpx.reasoningEffortLive,
     uptime: running ? optionalStatusString(formatUptime(record.agentStartedAt)) : null,
     lastPromptTime: optionalStatusString(record.lastPromptAt),
     exitCode: running ? null : optionalStatusNumber(record.lastAgentExitCode),
@@ -163,12 +165,28 @@ function statusAcpxFields(record: SessionRecord): {
   model: string | null;
   mode: string | null;
   availableModels: string[] | null;
+  reasoningEffort: string | null;
+  reasoningEffortLive: string | null;
 } {
   return {
     model: record.acpx?.current_model_id ?? null,
     mode: record.acpx?.current_mode_id ?? null,
     availableModels: record.acpx?.available_models ?? null,
+    // Intent (the authoritative per-session signal) + the adapter's advertised
+    // live value. NOTE: on the deployed claude adapter the live snapshot is the
+    // model default and may not track a per-session set — prefer the intent.
+    reasoningEffort: desiredEffort(record),
+    reasoningEffortLive: liveEffortCurrentValue(record),
   };
+}
+
+function desiredEffort(record: SessionRecord): string | null {
+  return record.acpx?.desired_config_options?.effort ?? null;
+}
+
+function liveEffortCurrentValue(record: SessionRecord): string | null {
+  const option = record.acpx?.config_options?.find((entry) => entry.id === "effort");
+  return option && option.type === "select" ? option.currentValue : null;
 }
 
 function statusPid(health: Awaited<ReturnType<typeof probeQueueOwnerHealth>>): number | null {
@@ -206,6 +224,8 @@ type StatusPayload = {
   model: string | null;
   mode: string | null;
   availableModels: string[] | null;
+  reasoningEffort: string | null;
+  reasoningEffortLive: string | null;
   uptime: string | null;
   lastPromptTime: string | null;
   exitCode: number | null;
@@ -243,6 +263,8 @@ function statusJsonPayload(
   assignDefinedJsonField(result, "model", payload.model);
   assignDefinedJsonField(result, "mode", payload.mode);
   assignDefinedJsonField(result, "availableModels", payload.availableModels);
+  assignDefinedJsonField(result, "reasoningEffort", payload.reasoningEffort);
+  assignDefinedJsonField(result, "reasoningEffortLive", payload.reasoningEffortLive);
   assignDefinedJsonField(result, "uptime", payload.uptime);
   assignDefinedJsonField(result, "lastPromptTime", payload.lastPromptTime);
   if (dead) {
@@ -262,18 +284,23 @@ function assignDefinedJsonField(
   }
 }
 
+function orDash(value: string | number | null): string {
+  return value == null ? "-" : String(value);
+}
+
 function printTextStatus(payload: StatusPayload, dead: boolean): void {
   process.stdout.write(`session: ${payload.sessionId}\n`);
   if ("agentSessionId" in payload) {
     process.stdout.write(`agentSessionId: ${payload.agentSessionId}\n`);
   }
   process.stdout.write(`agent: ${payload.agentCommand}\n`);
-  process.stdout.write(`pid: ${payload.pid ?? "-"}\n`);
+  process.stdout.write(`pid: ${orDash(payload.pid)}\n`);
   process.stdout.write(`status: ${payload.status}\n`);
-  process.stdout.write(`model: ${payload.model ?? "-"}\n`);
-  process.stdout.write(`mode: ${payload.mode ?? "-"}\n`);
-  process.stdout.write(`uptime: ${payload.uptime ?? "-"}\n`);
-  process.stdout.write(`lastPromptTime: ${payload.lastPromptTime ?? "-"}\n`);
+  process.stdout.write(`model: ${orDash(payload.model)}\n`);
+  process.stdout.write(`mode: ${orDash(payload.mode)}\n`);
+  process.stdout.write(`reasoningEffort: ${orDash(payload.reasoningEffort)}\n`);
+  process.stdout.write(`uptime: ${orDash(payload.uptime)}\n`);
+  process.stdout.write(`lastPromptTime: ${orDash(payload.lastPromptTime)}\n`);
   if (dead) {
     printDeadStatusDetails(payload);
   }

@@ -3,6 +3,7 @@ import { formatErrorMessage } from "../../acp/error-normalization.js";
 import { withInterrupt, withTimeout } from "../../async-control.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
 import { persistSessionOptions } from "../../runtime/engine/session-options.js";
+import { persistAndApplyRequestedEffort } from "../../session/config-option-application.js";
 import { applyConfigOptionsToRecord } from "../../session/config-options.js";
 import { createSessionConversation } from "../../session/conversation-model.js";
 import { defaultSessionEventLog } from "../../session/event-log.js";
@@ -97,6 +98,15 @@ async function createSessionRecordWithClient(
 
   persistSessionOptions(record, options.sessionOptions);
   applyConfigOptionsToRecord(record, sessionResult);
+  await persistAndApplyRequestedEffort({
+    client,
+    sessionId,
+    record,
+    reasoningEffort: options.sessionOptions?.reasoningEffort,
+    advertised: sessionResult.configOptions,
+    timeoutMs: options.timeoutMs,
+    verbose: options.verbose,
+  });
   syncAdvertisedModelState(record, sessionModels);
   if (requestedModelApplied) {
     setCurrentModelId(record, options.sessionOptions?.model);

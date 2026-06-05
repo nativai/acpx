@@ -102,6 +102,27 @@ export function resolveAgentCommand(agentName: string, overrides?: Record<string
   return registry[normalized] ?? registry[AGENT_ALIASES[normalized] ?? normalized] ?? agentName;
 }
 
+// Reverse of resolveAgentCommand: the registry agent name whose command equals
+// `agentCommand`, or undefined for a raw/unknown command (e.g. an `--agent`
+// escape hatch). Used only to label an INHERITED agent in spawn banners; the
+// record's `agentCommand` remains the source of truth.
+export function resolveAgentNameFromCommand(
+  agentCommand: string,
+  overrides?: Record<string, string>,
+): string | undefined {
+  const normalized = agentCommand.trim();
+  if (!normalized) {
+    return undefined;
+  }
+  const registry = mergeAgentRegistry(overrides);
+  for (const [name, command] of Object.entries(registry)) {
+    if (command === normalized) {
+      return name;
+    }
+  }
+  return undefined;
+}
+
 export function findBuiltInAgentPackage(agentCommand: string): BuiltInAgentPackageSpec | undefined {
   const normalized = agentCommand.trim();
   const builtInAgentPackages = Object.values(BUILT_IN_AGENT_PACKAGES) as BuiltInAgentPackageSpec[];
