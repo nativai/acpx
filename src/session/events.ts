@@ -3,6 +3,7 @@ import { isAcpJsonRpcMessage } from "../acp/jsonrpc.js";
 import { incrementPerfCounter, measurePerf } from "../perf-metrics.js";
 import { isProcessAlive } from "../process-liveness.js";
 import type { AcpJsonRpcMessage, SessionRecord } from "../types.js";
+import { DELIVERY_EVENT_METHOD } from "./delivery-events.js";
 import {
   DEFAULT_EVENT_MAX_SEGMENTS,
   DEFAULT_EVENT_SEGMENT_MAX_BYTES,
@@ -28,9 +29,14 @@ const EVENT_LOCK_STALE_MS = 15_000;
 // `_claude/origin` / `_claude/lastTurnEndReason` `_meta` keys, which ride on REAL
 // messages (e.g. the terminal `usage_update`) that MUST keep counting as activity.
 export const ACTIVITY_NEUTRAL_EVENT_METHOD = "_claude/sessionStatus";
+export const ACTIVITY_NEUTRAL_EVENT_METHODS = new Set([
+  ACTIVITY_NEUTRAL_EVENT_METHOD,
+  DELIVERY_EVENT_METHOD,
+]);
 
 export function isActivityNeutralEventMessage(message: AcpJsonRpcMessage): boolean {
-  return (message as { method?: unknown }).method === ACTIVITY_NEUTRAL_EVENT_METHOD;
+  const method = (message as { method?: unknown }).method;
+  return typeof method === "string" && ACTIVITY_NEUTRAL_EVENT_METHODS.has(method);
 }
 
 async function ensureSessionDir(): Promise<void> {

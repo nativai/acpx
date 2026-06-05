@@ -27,6 +27,7 @@ export type QueueSubmitRequest = {
   type: "submit_prompt";
   requestId: string;
   ownerGeneration?: number;
+  messageId?: string;
   message: string;
   prompt?: PromptInput;
   permissionMode: PermissionMode;
@@ -476,6 +477,7 @@ function parseSubmitRequest(
     type: "submit_prompt",
     requestId: context.requestId,
     ownerGeneration: context.ownerGeneration,
+    ...(parsed.messageId !== undefined ? { messageId: parsed.messageId } : {}),
     message: parsed.message,
     prompt: parsed.prompt ?? textPrompt(parsed.message),
     permissionMode: parsed.permissionMode,
@@ -496,6 +498,7 @@ function parseSubmitRequest(
 type ParsedSubmitRequestFields = Pick<
   QueueSubmitRequest,
   | "message"
+  | "messageId"
   | "prompt"
   | "permissionMode"
   | "resumePolicy"
@@ -513,6 +516,7 @@ function parseSubmitRequestFields(
 ): ParsedSubmitRequestFields | null {
   const parsed = {
     message: typeof request.message === "string" ? request.message : null,
+    messageId: parseOptionalValue(request.messageId, isNonEmptyString),
     prompt: parseOptionalValue(request.prompt, isPromptInput),
     permissionMode: parseRequiredValue(request.permissionMode, isPermissionMode),
     resumePolicy: parseOptionalValue(request.resumePolicy, isSessionResumePolicy),
@@ -585,6 +589,10 @@ function parseNonEmptyString(value: unknown): string | null {
     return null;
   }
   return value;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 function parseSessionSendResult(raw: unknown): SessionSendResult | null {

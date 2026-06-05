@@ -99,6 +99,7 @@ export type SessionSendOptions = {
   suppressSdkConsoleErrors?: boolean;
   verbose?: boolean;
   waitForCompletion?: boolean;
+  messageId?: string;
   ttlMs?: number;
   // Keep-warm-while-engaged: idle-TTL override (ms; 0 = forever) applied to an
   // ALREADY-RUNNING owner when this send is an explicit keep-warm opt-in

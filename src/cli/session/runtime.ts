@@ -39,6 +39,12 @@ import {
   recordSessionUpdate as recordConversationSessionUpdate,
   trimConversationForRuntime,
 } from "../../session/conversation-model.js";
+import {
+  buildDeliveryEvent,
+  type DeliveryEventError,
+  type DeliveryPhase,
+  type DeliveryStopReason,
+} from "../../session/delivery-events.js";
 import { defaultSessionEventLog } from "../../session/event-log.js";
 import { SessionEventWriter } from "../../session/events.js";
 import { LiveSessionCheckpoint } from "../../session/live-checkpoint.js";
@@ -64,6 +70,7 @@ import {
   type OutputFormatter,
   type PermissionEscalationEvent,
   type PermissionPolicy,
+  type PromptInput,
   type RunPromptResult,
   SessionRecord,
   SessionSendResult,
@@ -88,6 +95,7 @@ type RunSessionPromptOptions = Omit<
   "errorEmissionPolicy" | "maxQueueDepth" | "sessionId" | "ttlMs" | "waitForCompletion"
 > & {
   sessionRecordId: string;
+  requestId?: string;
   onClientAvailable?: (controller: ActiveSessionController) => void;
   onClientClosed?: () => void;
   onPromptActive?: () => Promise<void> | void;
@@ -168,6 +176,77 @@ function toPromptResult(
     stopReason,
     sessionId,
     permissionStats: client.getPermissionStats(),
+  };
+}
+
+type DeliveryContext = {
+  messageId: string;
+  requestId: string;
+};
+
+function deliveryContextFor(params: {
+  messageId?: string;
+  requestId?: string;
+}): DeliveryContext | undefined {
+  if (!params.messageId || !params.requestId) {
+    return undefined;
+  }
+  return {
+    messageId: params.messageId,
+    requestId: params.requestId,
+  };
+}
+
+function deliveryKey(context: DeliveryContext): string {
+  return `${context.messageId}\0${context.requestId}`;
+}
+
+function shouldSkipDeliveryEvent(params: {
+  phase: DeliveryPhase;
+  terminal: boolean;
+  key: string;
+  acceptedDeliveryKeys: Set<string>;
+  terminalDeliveryKeys: Set<string>;
+}): boolean {
+  if (params.phase === "accepted" && params.acceptedDeliveryKeys.has(params.key)) {
+    return true;
+  }
+  return params.terminal && params.terminalDeliveryKeys.has(params.key);
+}
+
+function markDeliveryEvent(params: {
+  phase: DeliveryPhase;
+  terminal: boolean;
+  key: string;
+  acceptedDeliveryKeys: Set<string>;
+  terminalDeliveryKeys: Set<string>;
+}): void {
+  if (params.phase === "accepted") {
+    params.acceptedDeliveryKeys.add(params.key);
+  }
+  if (params.terminal) {
+    params.terminalDeliveryKeys.add(params.key);
+  }
+}
+
+const DELIVERY_STOP_REASONS = new Set(["end_turn", "max_tokens", "max_turns", "cancelled"]);
+
+function toDeliveryStopReason(stopReason: RunPromptResult["stopReason"]): DeliveryStopReason {
+  return DELIVERY_STOP_REASONS.has(stopReason) ? (stopReason as DeliveryStopReason) : null;
+}
+
+function deliveryPhaseForStopReason(
+  stopReason: RunPromptResult["stopReason"],
+): Exclude<DeliveryPhase, "accepted"> {
+  return stopReason === "cancelled" ? "cancelled" : "done";
+}
+
+function deliveryErrorFrom(error: unknown): DeliveryEventError {
+  const normalized = normalizeOutputError(error, { origin: "runtime" });
+  return {
+    code: normalized.acp?.code ?? 0,
+    message: normalized.message,
+    detailCode: normalized.detailCode ?? "",
   };
 }
 
@@ -428,6 +507,8 @@ function buildQueuedTaskRunOptions(
   return {
     sessionRecordId,
     mcpServers: options.mcpServers,
+    requestId: task.requestId,
+    messageId: task.messageId,
     prompt: task.prompt ?? textPrompt(task.message),
     permissionMode: task.permissionMode,
     resumePolicy: task.resumePolicy,
@@ -599,13 +680,27 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
 
   const conversation = cloneSessionConversation(record);
   let acpxState = cloneSessionAcpxState(record.acpx);
-  const promptStartedAt = isoNow();
-  const promptMessageId = recordPromptSubmission(conversation, options.prompt, promptStartedAt);
-  record.lastPromptAt = promptStartedAt;
-  record.lastUsedAt = promptStartedAt;
-  applyConversation(record, conversation);
-  record.acpx = acpxState;
-  await writeSessionRecord(record);
+
+  const recordPromptStart = async (
+    prompt: PromptInput | string,
+    messageId?: string,
+  ): Promise<string | undefined> => {
+    const promptStartedAt = isoNow();
+    const promptMessageId = recordPromptSubmission(
+      conversation,
+      prompt,
+      promptStartedAt,
+      messageId,
+    );
+    record.lastPromptAt = promptStartedAt;
+    record.lastUsedAt = promptStartedAt;
+    applyConversation(record, conversation);
+    record.acpx = acpxState;
+    await writeSessionRecord(record);
+    return promptMessageId;
+  };
+
+  const promptMessageId = await recordPromptStart(options.prompt, options.messageId);
 
   output.setContext({
     sessionId: record.acpxRecordId,
@@ -629,6 +724,66 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   const injectedPromises: Promise<void>[] = [];
   let sawAcpMessage = false;
   let eventWriterClosed = false;
+  const acceptedDeliveryKeys = new Set<string>();
+  const terminalDeliveryKeys = new Set<string>();
+  const mainDeliveryContext = deliveryContextFor(options);
+
+  const appendDeliveryEvent = async (
+    context: DeliveryContext | undefined,
+    phase: DeliveryPhase,
+    params: {
+      stopReason?: DeliveryStopReason;
+      error?: DeliveryEventError;
+      terminal?: boolean;
+    } = {},
+  ): Promise<void> => {
+    if (!context) {
+      return;
+    }
+    const key = deliveryKey(context);
+    const terminal = params.terminal === true;
+    if (
+      shouldSkipDeliveryEvent({
+        phase,
+        terminal,
+        key,
+        acceptedDeliveryKeys,
+        terminalDeliveryKeys,
+      })
+    ) {
+      return;
+    }
+    await eventWriter.appendMessage(
+      buildDeliveryEvent({
+        messageId: context.messageId,
+        requestId: context.requestId,
+        phase,
+        stopReason: params.stopReason,
+        error: params.error,
+      }),
+    );
+    markDeliveryEvent({
+      phase,
+      terminal,
+      key,
+      acceptedDeliveryKeys,
+      terminalDeliveryKeys,
+    });
+  };
+
+  const appendDeliveryTerminal = async (
+    context: DeliveryContext | undefined,
+    phase: Exclude<DeliveryPhase, "accepted">,
+    params: {
+      stopReason?: DeliveryStopReason;
+      error?: DeliveryEventError;
+    } = {},
+  ): Promise<void> => {
+    await appendDeliveryEvent(context, phase, {
+      ...params,
+      terminal: true,
+    });
+  };
 
   // Subagent tracking: map from agent_id (e.g. "poet-a@haiku-demo") to ACPX record id
   const subagentIdToAcpxRecordId = new Map<string, string>();
@@ -1042,10 +1197,22 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       // is tracked so the turn can await all of them once it finishes.
       options.setMidTurnHandler?.((injectedTask: QueueTask) => {
         const injectedPromise = (async () => {
+          const injectedPrompt = injectedTask.prompt ?? textPrompt(injectedTask.message);
+          const injectedDeliveryContext = deliveryContextFor(injectedTask);
           try {
+            await recordPromptStart(injectedPrompt, injectedTask.messageId);
+            await appendDeliveryEvent(injectedDeliveryContext, "accepted");
             const injectedResponse = await client.prompt(
               sessionId,
-              injectedTask.prompt ?? textPrompt(injectedTask.message),
+              injectedPrompt,
+              injectedTask.messageId !== undefined
+                ? { messageId: injectedTask.messageId }
+                : undefined,
+            );
+            await appendDeliveryTerminal(
+              injectedDeliveryContext,
+              deliveryPhaseForStopReason(injectedResponse.stopReason),
+              { stopReason: toDeliveryStopReason(injectedResponse.stopReason) },
             );
             if (injectedTask.waitForCompletion) {
               injectedTask.send({
@@ -1059,6 +1226,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
               });
             }
           } catch (injectedError) {
+            await appendDeliveryTerminal(injectedDeliveryContext, "failed", {
+              error: deliveryErrorFrom(injectedError),
+            }).catch(() => {});
             if (injectedTask.waitForCompletion) {
               const normalized = normalizeOutputError(injectedError, {
                 origin: "runtime",
@@ -1107,6 +1277,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
 
   const runPromptAttempt = async (sessionId: string, attempt: number) => {
     const promptStartedAt = Date.now();
+    await appendDeliveryEvent(mainDeliveryContext, "accepted");
     const response = await measurePerf("runtime.prompt.agent_turn", async () => {
       return await runPromptTurn({
         client,
@@ -1115,6 +1286,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         timeoutMs: options.timeoutMs,
         conversation,
         promptMessageId,
+        messageId: options.messageId,
         onPromptStarted: buildPromptStartedHook(sessionId, attempt),
       });
     });
@@ -1160,6 +1332,13 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     await flushPendingMessages(false).catch(() => {
       // best effort while bubbling prompt failure
     });
+    await appendDeliveryTerminal(mainDeliveryContext, "failed", {
+      error: {
+        code: normalizedError.acp?.code ?? 0,
+        message: normalizedError.message,
+        detailCode: normalizedError.detailCode ?? "",
+      },
+    }).catch(() => {});
     output.flush();
     record.lastUsedAt = isoNow();
     applyConversation(record, conversation);
@@ -1225,6 +1404,11 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         await liveCheckpoint.checkpoint();
 
         const response = await savePromptSuccess(await runPromptWithRetries(activeSessionId));
+        await appendDeliveryTerminal(
+          mainDeliveryContext,
+          deliveryPhaseForStopReason(response.stopReason),
+          { stopReason: toDeliveryStopReason(response.stopReason) },
+        );
         promptTurnActive = false;
 
         return {
@@ -1235,7 +1419,12 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         };
       },
       async () => {
-        await client.cancelActivePrompt(INTERRUPT_CANCEL_WAIT_MS);
+        const response = await client.cancelActivePrompt(INTERRUPT_CANCEL_WAIT_MS);
+        if (response?.stopReason === "cancelled") {
+          await appendDeliveryTerminal(mainDeliveryContext, "cancelled", {
+            stopReason: "cancelled",
+          }).catch(() => {});
+        }
         applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
         record.lastUsedAt = isoNow();
         applyConversation(record, conversation);
@@ -1248,6 +1437,17 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         }
       },
     );
+  } catch (error) {
+    if (error instanceof InterruptedError) {
+      await appendDeliveryTerminal(mainDeliveryContext, "cancelled", {
+        stopReason: "cancelled",
+      }).catch(() => {});
+    } else {
+      await appendDeliveryTerminal(mainDeliveryContext, "failed", {
+        error: deliveryErrorFrom(error),
+      }).catch(() => {});
+    }
+    throw error;
   } finally {
     if (options.verbose) {
       process.stderr.write(`[acpx] ${formatPerfMetric("prompt.total", stopTotalTimer())}\n`);
@@ -1396,6 +1596,7 @@ export async function sendSessionDirect(options: SessionSendOptions): Promise<Se
   return await runSessionPrompt({
     sessionRecordId: options.sessionId,
     prompt: options.prompt,
+    messageId: options.messageId,
     mcpServers: options.mcpServers,
     permissionMode: options.permissionMode,
     resumePolicy: options.resumePolicy,

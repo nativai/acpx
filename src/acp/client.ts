@@ -125,6 +125,22 @@ type LoadSessionOptions = {
   replayDrainTimeoutMs?: number;
 };
 
+export type AcpPromptOptions = {
+  messageId?: string;
+};
+
+function buildPromptRequest(
+  sessionId: string,
+  prompt: PromptInput,
+  options: AcpPromptOptions | undefined,
+) {
+  return {
+    sessionId,
+    prompt,
+    ...(options?.messageId !== undefined ? { messageId: options.messageId } : {}),
+  };
+}
+
 export type SessionCreateResult = {
   sessionId: string;
   agentSessionId?: string;
@@ -949,7 +965,11 @@ export class AcpClient {
     this.suppressReplaySessionUpdateMessages = previous.suppressReplaySessionUpdateMessages;
   }
 
-  async prompt(sessionId: string, prompt: PromptInput | string): Promise<PromptResponse> {
+  async prompt(
+    sessionId: string,
+    prompt: PromptInput | string,
+    options?: AcpPromptOptions,
+  ): Promise<PromptResponse> {
     const connection = this.getConnection();
     const normalizedPrompt = this.normalizePromptForAgent(prompt);
     const restoreConsoleError = this.options.suppressSdkConsoleErrors
@@ -960,8 +980,7 @@ export class AcpClient {
     try {
       promptPromise = this.runConnectionRequest(() =>
         connection.prompt({
-          sessionId,
-          prompt: normalizedPrompt,
+          ...buildPromptRequest(sessionId, normalizedPrompt, options),
         }),
       );
     } catch (error) {

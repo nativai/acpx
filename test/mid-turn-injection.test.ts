@@ -34,6 +34,8 @@ import type { QueueTask } from "../src/cli/queue/ipc.js";
 import type { QueueOwnerMessage } from "../src/cli/queue/messages.js";
 import { runQueuedTask } from "../src/cli/session/runtime.js";
 import { type PromptInput, textPrompt } from "../src/prompt-content.js";
+import { listSessionEvents } from "../src/session/events.js";
+import { resolveSessionRecord } from "../src/session/persistence.js";
 import type { SessionRecord } from "../src/types.js";
 import {
   makeSessionRecord as makeSessionRecordFixture,
@@ -88,7 +90,12 @@ function tick(): Promise<void> {
 // A record of every client.prompt() call the production code makes, tagged by
 // whether it was the main turn prompt or an injected mid-turn prompt, plus the
 // 0-based main-turn attempt index that was active when the call was made.
-type PromptCall = { kind: "main" | "injected"; sessionId: string; attempt: number };
+type PromptCall = {
+  kind: "main" | "injected";
+  sessionId: string;
+  attempt: number;
+  messageId?: string;
+};
 
 type MockClientControl = {
   client: AcpClient;
@@ -140,16 +147,25 @@ function makeMockClient(handlers: {
     close: async () => {},
     waitForSessionUpdatesIdle: async () => {},
 
-    prompt: (sessionId: string, input: PromptInput | string): Promise<PromptResponse> => {
+    prompt: (
+      sessionId: string,
+      input: PromptInput | string,
+      options?: { messageId?: string },
+    ): Promise<PromptResponse> => {
       const text = promptText(input);
       if (text === INJECTED_PROMPT_TEXT) {
-        control.promptCalls.push({ kind: "injected", sessionId, attempt: control.activeAttempt });
+        control.promptCalls.push({
+          kind: "injected",
+          sessionId,
+          attempt: control.activeAttempt,
+          messageId: options?.messageId,
+        });
         return handlers.onInjectedPrompt(sessionId);
       }
       const attempt = nextMainAttempt;
       nextMainAttempt += 1;
       control.activeAttempt = attempt;
-      control.promptCalls.push({ kind: "main", sessionId, attempt });
+      control.promptCalls.push({ kind: "main", sessionId, attempt, messageId: options?.messageId });
       return handlers.onMainPrompt(attempt, sessionId);
     },
   };
@@ -196,9 +212,11 @@ function makeQueueTask(
   onSend: (message: QueueOwnerMessage) => void,
   onClose: () => void,
   waitForCompletion = true,
+  messageId?: string,
 ): QueueTask {
   return {
     requestId,
+    ...(messageId !== undefined ? { messageId } : {}),
     message: text,
     prompt: textPrompt(text),
     permissionMode: "approve-all",
@@ -548,4 +566,123 @@ test("mid-turn prompt injection fires and settles exactly once, including across
   await runAttempt0InjectionScenario();
   await runRetryInjectionScenario();
   await runFireAndForgetInjectionWithoutTerminalResponseScenario();
+});
+
+test("mid-turn prompt injection threads messageId and emits delivery events", async () => {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeSessionRecord(homeDir);
+      await writeSessionRecordFile(homeDir, record);
+
+      const mainMessageId = "11111111-1111-4111-8111-111111111111";
+      const injectedMessageId = "22222222-2222-4222-8222-222222222222";
+      const injectionInitiated = createDeferred<void>();
+
+      const control = makeMockClient({
+        onMainPrompt: async () => {
+          await injectionInitiated.promise;
+          return { stopReason: "end_turn" };
+        },
+        onInjectedPrompt: async () => {
+          injectionInitiated.resolve();
+          return { stopReason: "end_turn" };
+        },
+      });
+
+      const injectedSends: QueueOwnerMessage[] = [];
+      const midTurn = makeMidTurnControl((registration, ctrl) => {
+        if (registration === 1) {
+          const injectedTask = makeQueueTask(
+            "req-injected-delivery",
+            INJECTED_PROMPT_TEXT,
+            (message) => injectedSends.push(message),
+            () => {},
+            true,
+            injectedMessageId,
+          );
+          setTimeout(() => {
+            ctrl.currentHandler?.(injectedTask);
+          }, 10);
+        }
+      });
+
+      const mainSends: QueueOwnerMessage[] = [];
+      const mainTask = makeQueueTask(
+        "req-main-delivery",
+        MAIN_PROMPT_TEXT,
+        (message) => mainSends.push(message),
+        () => {},
+        true,
+        mainMessageId,
+      );
+
+      await runQueuedTask(record.acpxRecordId, mainTask, {
+        sharedClient: control.client,
+        setMidTurnHandler: midTurn.setMidTurnHandler,
+        suppressSdkConsoleErrors: true,
+      });
+
+      assert.ok(mainSends.find((m) => m.type === "result"));
+      assert.ok(injectedSends.find((m) => m.type === "result"));
+
+      const mainCalls = control.promptCalls.filter((c) => c.kind === "main");
+      const injectedCalls = control.promptCalls.filter((c) => c.kind === "injected");
+      assert.equal(mainCalls.length, 1);
+      assert.equal(injectedCalls.length, 1);
+      assert.equal(mainCalls[0]?.messageId, mainMessageId);
+      assert.equal(injectedCalls[0]?.messageId, injectedMessageId);
+
+      const stored = await resolveSessionRecord(record.acpxRecordId);
+      const userIds = stored.messages.flatMap((message) => {
+        if (typeof message !== "object" || message === null || !("User" in message)) {
+          return [];
+        }
+        return [message.User.id];
+      });
+      assert.deepEqual(userIds, [mainMessageId, injectedMessageId]);
+      assert.equal(typeof stored.lastPromptAt, "string");
+
+      const deliveryEvents = (await listSessionEvents(record.acpxRecordId))
+        .filter((event) => (event as { method?: string }).method === "acpx/delivery")
+        .map((event) => (event as { params: Record<string, unknown> }).params);
+
+      assert.deepEqual(
+        deliveryEvents.map(({ at: _at, ...params }) => params),
+        [
+          {
+            messageId: mainMessageId,
+            requestId: "req-main-delivery",
+            phase: "accepted",
+            stopReason: null,
+            error: { code: 0, message: "", detailCode: "" },
+          },
+          {
+            messageId: injectedMessageId,
+            requestId: "req-injected-delivery",
+            phase: "accepted",
+            stopReason: null,
+            error: { code: 0, message: "", detailCode: "" },
+          },
+          {
+            messageId: injectedMessageId,
+            requestId: "req-injected-delivery",
+            phase: "done",
+            stopReason: "end_turn",
+            error: { code: 0, message: "", detailCode: "" },
+          },
+          {
+            messageId: mainMessageId,
+            requestId: "req-main-delivery",
+            phase: "done",
+            stopReason: "end_turn",
+            error: { code: 0, message: "", detailCode: "" },
+          },
+        ],
+      );
+      assert.equal(
+        deliveryEvents.every((event) => typeof event.at === "string"),
+        true,
+      );
+    });
+  });
 });

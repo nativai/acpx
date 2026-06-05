@@ -31,6 +31,7 @@ import {
   collectEdgeType,
   parseDaysOlderThan,
   parseMaxNodes,
+  parseMessageId,
   parseMetadataEntry,
   parseNonEmptyValue,
   parsePruneBeforeDate,
@@ -407,6 +408,11 @@ export function registerSharedAgentSubcommands(
     .showHelpAfterError();
   addSessionOption(promptCommand);
   addPromptInputOption(promptCommand);
+  promptCommand.option(
+    "--message-id <uuid>",
+    "External prompt message identity to forward through ACP",
+    parseMessageId,
+  );
   promptCommand.action(async function (this: Command, promptParts: string[], flags: PromptFlags) {
     await handlePrompt(explicitAgentName, promptParts, flags, this, config);
   });

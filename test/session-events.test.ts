@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
+import { buildDeliveryEvent } from "../src/session/delivery-events.js";
 import { defaultSessionEventLog } from "../src/session/event-log.js";
 import { SessionEventWriter, listSessionEvents } from "../src/session/events.js";
 import { resolveSessionRecord, writeSessionRecord } from "../src/session/persistence.js";
@@ -231,6 +232,101 @@ test("appendMessages persists _claude/sessionStatus markers but leaves last_writ
     const events = await listSessionEvents(sessionId);
     assert.equal(events.length, 3);
     assert.equal((events[1] as { method?: string }).method, "_claude/sessionStatus");
+  });
+});
+
+test("acpx/delivery events are stream lines but do not advance last_write_at", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const sessionId = "session-delivery-neutral";
+    const record = makeSessionRecord(sessionId, cwd, 5);
+    await writeSessionRecord(record);
+
+    const writer = await SessionEventWriter.open(record);
+    await writer.appendMessage({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "real output" },
+        },
+      },
+    } as never);
+    const lastWriteAfterReal = writer.getRecord().eventLog.last_write_at;
+    const lastUsedAfterReal = writer.getRecord().lastUsedAt;
+    const seqAfterReal = writer.getRecord().lastSeq;
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await writer.appendMessage(
+      buildDeliveryEvent({
+        messageId: "11111111-1111-4111-8111-111111111111",
+        requestId: "req-delivery",
+        phase: "accepted",
+        at: "2026-06-05T00:00:00.000Z",
+      }),
+    );
+
+    assert.equal(writer.getRecord().eventLog.last_write_at, lastWriteAfterReal);
+    assert.equal(writer.getRecord().lastUsedAt, lastUsedAfterReal);
+    assert.equal(writer.getRecord().lastSeq, seqAfterReal + 1);
+
+    const events = await listSessionEvents(sessionId);
+    assert.equal(events.length, 2);
+    assert.deepEqual(events[1], {
+      jsonrpc: "2.0",
+      method: "acpx/delivery",
+      params: {
+        messageId: "11111111-1111-4111-8111-111111111111",
+        requestId: "req-delivery",
+        phase: "accepted",
+        stopReason: null,
+        error: { code: 0, message: "", detailCode: "" },
+        at: "2026-06-05T00:00:00.000Z",
+      },
+    });
+  });
+});
+
+test("Codex agent_progress_update advances last_write_at activity", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const sessionId = "session-codex-progress-activity";
+    const record = makeSessionRecord(sessionId, cwd, 5);
+    await writeSessionRecord(record);
+
+    const writer = await SessionEventWriter.open(record);
+    await writer.appendMessage({
+      jsonrpc: "2.0",
+      method: "_claude/sessionStatus",
+      params: { sessionId, phase: "turn_no_activity", elapsedMs: 90_000 },
+    } as never);
+    assert.equal(writer.getRecord().eventLog.last_write_at, undefined);
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await writer.appendMessage({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "agent_progress_update",
+          progress: {
+            phase: "thinking",
+            tokens: { reasoning: 42 },
+            source: "codex",
+          },
+        },
+      },
+    } as never);
+
+    assert.equal(typeof writer.getRecord().eventLog.last_write_at, "string");
+    assert.equal(writer.getRecord().lastSeq, 2);
   });
 });
 

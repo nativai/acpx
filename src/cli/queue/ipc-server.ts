@@ -78,6 +78,7 @@ function writeQueueMessage(socket: net.Socket, message: QueueOwnerMessage): void
 
 export type QueueTask = {
   requestId: string;
+  messageId?: string;
   message: string;
   prompt: PromptInput;
   permissionMode: PermissionMode;
@@ -499,6 +500,7 @@ export class SessionQueueOwner {
   ): void {
     const task: QueueTask = {
       requestId: request.requestId,
+      messageId: request.messageId,
       message: request.message,
       prompt: request.prompt ?? textPrompt(request.message),
       permissionMode: request.permissionMode,
