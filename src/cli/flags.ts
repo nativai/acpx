@@ -106,6 +106,71 @@ export type SessionsPruneFlags = {
   includeHistory?: boolean;
 };
 
+export type SessionsTreeFlags = {
+  self?: boolean;
+  session?: string;
+  root?: string;
+  all?: boolean;
+  connected?: boolean;
+  ancestors?: boolean;
+  descendants?: boolean;
+  depth?: number;
+  active?: boolean;
+  open?: boolean;
+  closed?: boolean;
+  since?: string;
+  live?: boolean;
+  type?: string[];
+  subagents?: boolean; // commander `--no-subagents` → subagents === false
+  agentType?: string[];
+  name?: string;
+  filterCwd?: string;
+  task?: string;
+  maxNodes?: number;
+  legend?: boolean; // commander `--no-legend` → legend === false
+};
+
+const EDGE_TYPES = ["spawn", "fork", "subagent"] as const;
+
+export function parseTreeDepth(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new InvalidArgumentError("--depth must be a non-negative integer");
+  }
+  return parsed;
+}
+
+export function parseMaxNodes(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new InvalidArgumentError("--max-nodes must be a positive integer");
+  }
+  return parsed;
+}
+
+export function collectEdgeType(value: string, previous: string[] = []): string[] {
+  const items = value
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter((item) => item.length > 0);
+  for (const item of items) {
+    if (!EDGE_TYPES.includes(item as (typeof EDGE_TYPES)[number])) {
+      throw new InvalidArgumentError(
+        `Invalid --type "${item}". Expected one of: ${EDGE_TYPES.join(", ")}`,
+      );
+    }
+  }
+  return [...previous, ...items];
+}
+
+export function collectAgentType(value: string, previous: string[] = []): string[] {
+  const items = value
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter((item) => item.length > 0);
+  return [...previous, ...items];
+}
+
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)

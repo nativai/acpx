@@ -572,6 +572,19 @@ function normalizeOptionalPid(value: unknown): number | undefined | null {
   return value as number;
 }
 
+// Like normalizeOptionalPid but allows 0 (a fork at message index 0 is valid).
+function normalizeOptionalNonNegativeInteger(value: unknown): number | undefined | null {
+  if (value == null) {
+    return undefined;
+  }
+
+  if (!Number.isInteger(value) || (value as number) < 0) {
+    return null;
+  }
+
+  return value as number;
+}
+
 function normalizeOptionalBoolean(value: unknown, fallback = false): boolean | null {
   if (value == null) {
     return fallback;
@@ -774,6 +787,16 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     return null;
   }
 
+  const forkedFromSessionId = normalizeOptionalString(record.forked_from_session_id);
+  if (forkedFromSessionId === null) {
+    return null;
+  }
+
+  const forkedAtMessageIndex = normalizeOptionalNonNegativeInteger(record.forked_at_message_index);
+  if (forkedAtMessageIndex === null) {
+    return null;
+  }
+
   const metadata = parseMetadata(record.metadata);
   if (metadata === null) {
     return null;
@@ -814,6 +837,8 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     acpx: parseAcpxState(record.acpx),
     kind,
     parentSessionId: parentSessionId ?? undefined,
+    forkedFromSessionId: forkedFromSessionId ?? undefined,
+    forkedAtMessageIndex: forkedAtMessageIndex ?? undefined,
     subagents: parseSubagentRefs(record.subagents),
     metadata,
     importedFrom: recordMetadata.importedFrom,

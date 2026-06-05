@@ -37,7 +37,7 @@ function sessionFilePath(acpxRecordId: string): string {
   return path.join(sessionBaseDir(), `${safeId}.json`);
 }
 
-function sessionBaseDir(): string {
+export function sessionBaseDir(): string {
   return path.join(os.homedir(), ".acpx", "sessions");
 }
 

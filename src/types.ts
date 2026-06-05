@@ -451,6 +451,8 @@ export type SessionRecord = {
   acpx?: SessionAcpxState;
   kind?: "session" | "subagent";
   parentSessionId?: string;
+  forkedFromSessionId?: string;
+  forkedAtMessageIndex?: number;
   subagents?: SubagentRef[];
   metadata?: Record<string, string>;
   importedFrom?: SessionImportedFrom;
