@@ -61,6 +61,7 @@ export type PromptFlags = {
   session?: string;
   wait?: boolean;
   file?: string;
+  messageId?: string;
 };
 
 export type ExecFlags = {
@@ -262,6 +263,14 @@ export function parseNonEmptyValue(label: string, value: string): string {
     throw new InvalidArgumentError(`${label} must not be empty`);
   }
   return trimmed;
+}
+
+export function parseMessageId(value: string): string {
+  const parsed = parseNonEmptyValue("Message id", value);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(parsed)) {
+    throw new InvalidArgumentError("--message-id must be a UUID");
+  }
+  return parsed;
 }
 
 export function parseHistoryLimit(value: string): number {

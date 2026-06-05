@@ -1173,6 +1173,28 @@ test("AcpClient emits final Codex reasoning usage as generic progress", async ()
   assert.deepEqual(updates, [expectedNotification]);
 });
 
+test("AcpClient.prompt forwards external messageId on PromptRequest", async () => {
+  const client = makeClient();
+  let captured: unknown;
+  asInternals(client).connection = {
+    prompt: async (params: unknown) => {
+      captured = params;
+      return { stopReason: "end_turn" };
+    },
+  };
+
+  const response = await client.prompt("session-message-id", "hello", {
+    messageId: "11111111-1111-4111-8111-111111111111",
+  });
+
+  assert.deepEqual(response, { stopReason: "end_turn" });
+  assert.deepEqual(captured, {
+    sessionId: "session-message-id",
+    prompt: [{ type: "text", text: "hello" }],
+    messageId: "11111111-1111-4111-8111-111111111111",
+  });
+});
+
 function makeClient(
   overrides: Partial<ConstructorParameters<typeof AcpClient>[0]> = {},
 ): AcpClient {

@@ -597,6 +597,7 @@ export async function handlePrompt(
     promptRetries: globalFlags.promptRetries,
     verbose: globalFlags.verbose,
     waitForCompletion: flags.wait !== false,
+    messageId: flags.messageId,
     sessionOptions: {
       model: globalFlags.model,
       allowedTools: globalFlags.allowedTools,

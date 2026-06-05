@@ -9,6 +9,7 @@ type PromptTurnClient = {
   prompt: (
     sessionId: string,
     prompt: PromptInput | string,
+    options?: { messageId?: string },
   ) => Promise<{ stopReason: RunPromptResult["stopReason"] }>;
   waitForSessionUpdatesIdle?: (options?: { idleMs?: number; timeoutMs?: number }) => Promise<void>;
 };
@@ -20,10 +21,13 @@ export async function runPromptTurn(params: {
   timeoutMs?: number;
   conversation: SessionConversation;
   promptMessageId?: string;
+  messageId?: string;
   onPromptStarted?: () => Promise<void> | void;
 }): Promise<{ stopReason: RunPromptResult["stopReason"]; source: "rpc" | "session" }> {
   try {
-    const promptPromise = params.client.prompt(params.sessionId, params.prompt);
+    const promptPromise = params.client.prompt(params.sessionId, params.prompt, {
+      messageId: params.messageId,
+    });
     await params.onPromptStarted?.();
     const response = await withTimeout(promptPromise, params.timeoutMs);
     await params.client

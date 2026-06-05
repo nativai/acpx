@@ -54,6 +54,7 @@ async function submitToRunningOwner(
 ): Promise<SessionSendOutcome | undefined> {
   return await trySubmitToRunningOwner({
     sessionId: options.sessionId,
+    messageId: options.messageId,
     message: promptToDisplayText(options.prompt),
     prompt: options.prompt,
     permissionMode: options.permissionMode,

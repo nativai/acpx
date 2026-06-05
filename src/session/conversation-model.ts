@@ -671,6 +671,7 @@ export function recordPromptSubmission(
   conversation: SessionConversation,
   prompt: PromptInput | string,
   timestamp = isoNow(),
+  messageId?: string,
 ): string | undefined {
   const normalizedPrompt = typeof prompt === "string" ? textPrompt(prompt) : prompt;
   const userContent = normalizedPrompt
@@ -680,7 +681,7 @@ export function recordPromptSubmission(
     return undefined;
   }
 
-  const promptMessageId = nextUserMessageId();
+  const promptMessageId = messageId ?? nextUserMessageId();
   conversation.messages.push({
     User: {
       id: promptMessageId,

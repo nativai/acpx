@@ -184,6 +184,7 @@ test("SessionQueueOwner enqueues fire-and-forget prompts and rejects invalid own
           type: "submit_prompt",
           requestId: "req-submit",
           ownerGeneration: lease.ownerGeneration,
+          messageId: "11111111-1111-4111-8111-111111111111",
           message: "hello from queue",
           permissionMode: "approve-reads",
           waitForCompletion: false,
@@ -200,6 +201,7 @@ test("SessionQueueOwner enqueues fire-and-forget prompts and rejects invalid own
       const task = await owner.nextTask();
       assert(task);
       assert.equal(task.requestId, "req-submit");
+      assert.equal(task.messageId, "11111111-1111-4111-8111-111111111111");
       assert.equal(task.message, "hello from queue");
       assert.deepEqual(task.prompt, [{ type: "text", text: "hello from queue" }]);
       assert.equal(owner.queueDepth(), 0);

@@ -307,6 +307,7 @@ async function runQueueOwnerRequest<TResult>(options: {
 
 export type SubmitToQueueOwnerOptions = {
   sessionId: string;
+  messageId?: string;
   message: string;
   prompt?: PromptInput;
   permissionMode: PermissionMode;
@@ -395,6 +396,7 @@ async function submitToQueueOwner(
     type: "submit_prompt",
     requestId,
     ownerGeneration: owner.ownerGeneration,
+    ...(options.messageId !== undefined ? { messageId: options.messageId } : {}),
     message: options.message,
     prompt: options.prompt,
     permissionMode: options.permissionMode,
