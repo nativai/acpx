@@ -1101,8 +1101,11 @@ function resolveTreeSinceMs(flags: SessionsTreeFlags): number | undefined {
   return parsed;
 }
 
-// Status / recency predicate, shared by the active-forest default and explicit
-// filters. `--all` overrides status filters (handled by the caller).
+// Status / recency predicate, shared by every scope (the active-forest default
+// and explicit filters, including `--all`). Runs conflict validation and resolves
+// status/sinceMs from the flags; the implicit active default applies only when
+// `isActiveForestDefault` is true (never under `--all`, which suppresses only that
+// implicit default, not explicit `--active/--open/--closed/--since`).
 // eslint-disable-next-line complexity -- flag-combination validation + the bounded-active-forest default; independent guards
 function resolveTreeStatusFilters(
   flags: SessionsTreeFlags,
