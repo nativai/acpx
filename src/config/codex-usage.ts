@@ -206,16 +206,24 @@ function snapshotFromFile(rolloutPath: string): Snapshot | null {
   return best;
 }
 
-// Walk day dirs newest-first, files within each by mtime desc, and stop at the
-// first file that yields a non-null snapshot (short-circuit — don't rescan all
-// 200+ files per request). `filesScanned` counts files read up to and
-// including the hit. Newest mtime is the freshness heuristic; the snapshot's
-// own `capturedAt` is reported so consumers can judge staleness directly.
+// Scan ALL rollout files and return the snapshot with the maximum `capturedAt`.
+//
+// We must NOT short-circuit at the first file that yields a snapshot. Rollout
+// files are bucketed into `YYYY/MM/DD` by the session's START date, and a
+// long-running session keeps appending `rate_limits` on later days while its
+// file stays in the start-day dir. So neither the day-dir order nor the file
+// mtime is a reliable proxy for which file holds the freshest snapshot — a
+// fresher reading can live in an earlier-dated dir, and a file touched after its
+// last rate-limit turn can have a newer mtime than a file holding a fresher
+// snapshot. The only correct selector is the snapshot's own `capturedAt`, so we
+// read every file and keep the global max (cheap: per-turn rollouts are small).
+// `filesScanned` = files read; `filesWithRateLimits` = files holding a snapshot.
 function findFreshestSnapshot(sessionsDir: string): {
   snapshot: Snapshot | null;
   filesScanned: number;
   filesWithRateLimits: number;
 } {
+  let best: Snapshot | null = null;
   let filesScanned = 0;
   let filesWithRateLimits = 0;
   for (const dayDir of listDayDirsNewestFirst(sessionsDir)) {
@@ -224,11 +232,13 @@ function findFreshestSnapshot(sessionsDir: string): {
       const snapshot = snapshotFromFile(rolloutPath);
       if (snapshot) {
         filesWithRateLimits++;
-        return { snapshot, filesScanned, filesWithRateLimits };
+        if (!best || snapshot.capturedAtMs > best.capturedAtMs) {
+          best = snapshot;
+        }
       }
     }
   }
-  return { snapshot: null, filesScanned, filesWithRateLimits };
+  return { snapshot: best, filesScanned, filesWithRateLimits };
 }
 
 function buildWindow(raw: unknown, nowEpoch: number): CodexQuotaWindow | null {

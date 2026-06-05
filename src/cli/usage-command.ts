@@ -129,6 +129,12 @@ function noSubscriptionResolvable(): AcpxOperationalError {
 // `--session <value>` per OQ4: URL → id → name. Name is tried ONLY when id
 // resolution raises not-found (an ambiguous suffix is a real error, surfaced).
 async function resolveSessionTarget(value: string): Promise<SessionRecord> {
+  if (value.trim().length === 0) {
+    throw new AcpxOperationalError("--session requires a session id, URL, or name", {
+      outputCode: "USAGE",
+      origin: "cli",
+    });
+  }
   const fromUrl = parseSessionIdFromUrl(value);
   if (fromUrl) {
     return await resolveSessionRecord(fromUrl);
@@ -332,6 +338,24 @@ async function resolveWithoutRecord(registry: SubscriptionRegistry): Promise<Usa
   return await claudeResultForSubscription(subId, registry, null, source);
 }
 
+// `--subscription <id>`: probe one registered subscription directly (claude
+// only). An unknown id is a usage error that lists the available ids.
+async function resolveExplicitSubscription(
+  id: string,
+  registry: SubscriptionRegistry,
+): Promise<UsageResult> {
+  const entry = findSubscription(id, registry);
+  if (!entry) {
+    const available = registry.subscriptions.map((e) => e.id).join(", ") || "(none registered)";
+    throw new AcpxOperationalError(
+      `subscription "${id}" not found in registry (~/.acpx/subscriptions/registry.json). Available: ${available}`,
+      { outputCode: "USAGE", origin: "cli" },
+    );
+  }
+  const [usage] = await getSubscriptionsUsage([entry]);
+  return claudeResultFromUsage(usage, entry, null, "explicit-subscription");
+}
+
 async function resolveUsage(flags: UsageFlags, config: ResolvedAcpxConfig): Promise<UsageResult> {
   const registry = config.subscriptions;
 
@@ -343,12 +367,7 @@ async function resolveUsage(flags: UsageFlags, config: ResolvedAcpxConfig): Prom
   }
 
   if (flags.subscription !== undefined) {
-    const entry = findSubscription(flags.subscription, registry);
-    if (!entry) {
-      throw new SubscriptionUnknownError(flags.subscription);
-    }
-    const [usage] = await getSubscriptionsUsage([entry]);
-    return claudeResultFromUsage(usage, entry, null, "explicit-subscription");
+    return await resolveExplicitSubscription(flags.subscription, registry);
   }
 
   if (flags.session !== undefined) {

@@ -210,6 +210,33 @@ test("newest day directory wins over an older one", async () => {
   assert.equal(quota.primary?.usedPercent, 88);
 });
 
+test("freshest snapshot in an OLDER day-dir wins (selection is by capturedAt, not day-dir or mtime)", async () => {
+  // The real-backend bug: a session started 06-01 keeps writing rate_limits into
+  // its 06-01-bucketed file on 06-02 (capturedAt 15:01, fresher), while a short
+  // session started 06-02 holds an older snapshot (capturedAt 09:00). The freshest
+  // capturedAt must win even though it lives in the EARLIER day-dir AND (here) its
+  // file has the OLDER mtime — so neither the day-dir order nor mtime may decide it.
+  await writeRollout(
+    "2026/06/01",
+    "rollout-2026-06-01T21-40-59-long-session.jsonl",
+    [snapshotLine("2026-06-02T15:01:42.313Z", { primaryPct: 99, secondaryPct: 77 })],
+    1_700_000_000, // OLDER mtime
+  );
+  await writeRollout(
+    "2026/06/02",
+    "rollout-2026-06-02T08-00-00-short-session.jsonl",
+    [snapshotLine("2026-06-02T09:00:00.000Z", { primaryPct: 11, secondaryPct: 12 })],
+    1_700_000_500, // NEWER mtime
+  );
+
+  const quota = collectCodexQuota(scratch);
+  assert.equal(quota.capturedAt, "2026-06-02T15:01:42.313Z");
+  assert.equal(quota.primary?.usedPercent, 99);
+  assert.equal(quota.secondary?.usedPercent, 77);
+  assert.ok(quota.rolloutPath?.endsWith("rollout-2026-06-01T21-40-59-long-session.jsonl"));
+  assert.equal(quota.scan.filesWithRateLimits, 2);
+});
+
 test("malformed lines are skipped, snapshot still found, never throws", async () => {
   await writeRollout("2026/06/02", "rollout-malformed.jsonl", [
     "{ not valid json",
