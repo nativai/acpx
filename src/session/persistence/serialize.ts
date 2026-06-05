@@ -52,6 +52,8 @@ export function serializeSessionRecordForDisk(record: SessionRecord): Record<str
     acpx: canonical.acpx,
     kind: canonical.kind,
     parent_session_id: canonical.parentSessionId,
+    forked_from_session_id: canonical.forkedFromSessionId,
+    forked_at_message_index: canonical.forkedAtMessageIndex,
     subagents: canonical.subagents?.map(serializeSubagentRef),
     metadata: canonical.metadata,
     imported_from: canonical.importedFrom
