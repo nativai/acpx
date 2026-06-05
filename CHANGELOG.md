@@ -10,6 +10,9 @@ Repo: https://github.com/openclaw/acpx
 
 ### Breaking
 
+- CLI: remove the agent-facing `acpx usage` and `acpx sessions tree` commands;
+  agents should use the deployed acpx wisdom usage and session-tree scripts.
+
 ### Fixes
 
 - CLI/sessions: map inherited Claude effort levels to the child model's supported

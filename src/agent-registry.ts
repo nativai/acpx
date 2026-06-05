@@ -76,50 +76,6 @@ const AGENT_ALIASES: Record<string, string> = {
 
 export const DEFAULT_AGENT_NAME = "codex";
 
-export type AgentKind = "claude" | "codex" | "other";
-
-/**
- * Classify a session's agent kind from its persisted `agentCommand` string.
- *
- * Matches by SUBSTRING, never exact, so it survives version-range drift in the
- * codex adapter spec (`@agentclientprotocol/codex-acp@^0.0.44` bumps over time;
- * an older record may hold an earlier range) and path variation in the claude
- * fork command. This is the load-bearing guard behind `acpx usage`: a codex
- * session's env still carries `ACPX_SUBSCRIPTION` (auth-env injects it
- * unconditionally), so the agent kind MUST be derived from the record's command
- * — never the env — or a codex session would wrongly report Claude numbers.
- */
-export function agentKindFromCommand(command: string): AgentKind {
-  const normalized = command.toLowerCase();
-  if (normalized.includes("claude-agent-acp")) {
-    return "claude";
-  }
-  if (normalized.includes("codex-acp")) {
-    return "codex";
-  }
-  return "other";
-}
-
-/**
- * Best-effort human-readable agent name for an `agentCommand` (for display in
- * `usage` not-applicable output). Reverse-maps against the registry; falls back
- * to the command's first token. Cosmetic only — branching uses
- * `agentKindFromCommand`, which is drift-proof.
- */
-export function agentNameFromCommand(command: string, overrides?: Record<string, string>): string {
-  const normalized = command.trim();
-  if (normalized.length === 0) {
-    return "unknown";
-  }
-  const registry = mergeAgentRegistry(overrides);
-  for (const [name, cmd] of Object.entries(registry)) {
-    if (normalized === cmd || normalized.startsWith(`${cmd} `) || normalized.includes(cmd)) {
-      return name;
-    }
-  }
-  return normalized.split(/\s+/)[0] ?? normalized;
-}
-
 export function normalizeAgentName(value: string): string {
   return value.trim().toLowerCase();
 }

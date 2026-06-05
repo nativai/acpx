@@ -39,6 +39,22 @@ Core capabilities:
 - Tool whitelist (`--allowed-tools`), turn cap (`--max-turns`), retry on transient failures (`--prompt-retries`)
 - Multi-agent flows via `acpx flow run` and the `acpx/flows` authoring API (`defineFlow`, `decision`, `decisionEdge`, `acp`, `action`, `compute`, `checkpoint`)
 
+Agent-facing usage and lineage views are provided outside the npm CLI by deployed wisdom scripts that call acpx-ui:
+
+```bash
+"/wisdom/Operating System/Skills/acpx/scripts/usage.sh" --format json
+"/wisdom/Operating System/Skills/acpx/scripts/session-tree.sh" --format json
+```
+
+Both scripts derive the cluster-internal acpx-ui endpoint from the caller's own `ACPX_SESSION_URL`. The shared helper `/wisdom/Operating System/Skills/acpx/scripts/acpx-ui-url.sh` is the only place for public-to-cluster acpx-ui host mapping, and it is sourced by `send-message.sh`, `usage.sh`, and `session-tree.sh`.
+
+Usage parity:
+
+- default target is your own session
+- `usage.sh --session <uuid>`, `--session-url <url>`, or `--name <exact-name>` targets another session
+- `usage.sh --all-subscriptions` reports every Claude subscription
+- `session-tree.sh` supports self, connected, ancestors, descendants/subtree, named/id/url targets, active/status filters, agent-type/type filters, recency filters, max node caps, and `--relations`
+
 ## Install
 
 ```bash

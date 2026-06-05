@@ -53,7 +53,6 @@ import {
   type SessionsListFlags,
   type SessionsNewFlags,
   type SessionsPruneFlags,
-  type SessionsTreeFlags,
   type StatusFlags,
 } from "./flags.js";
 import { emitJsonResult } from "./output/json-output.js";
@@ -66,20 +65,6 @@ import {
   withInheritedTaskFolder,
 } from "./session/inherited-metadata.js";
 import { mergeSessionMetadata, validateSessionMetadataValue } from "./session/session-metadata.js";
-import { createDefaultTreeIO } from "./session/session-tree-io.js";
-import {
-  buildSessionTree,
-  DEFAULT_ACTIVE_WINDOW_MS,
-  DEFAULT_MAX_NODES,
-  parseDuration,
-  parseSessionIdFromUrl,
-  SessionTreeError,
-  type EdgeType,
-  type TreeDirection,
-  type TreeFilters,
-  type TreeOptions,
-  type TreeScopeMode,
-} from "./session/session-tree.js";
 
 class NoSessionError extends Error {
   constructor(message: string) {
@@ -233,6 +218,19 @@ function warnReasoningEffortIgnoredForNonClaude(
     `[acpx] --reasoning-effort applies to claude; ignoring for agent "${effectiveAgentName}" ` +
       `(codex depth is set via --model '<model>[depth]')\n`,
   );
+}
+
+function parseSessionIdFromUrl(url: string | undefined): string | undefined {
+  if (!url) {
+    return undefined;
+  }
+  try {
+    const parsed = new URL(url);
+    const id = parsed.searchParams.get("session");
+    return id && id.trim().length > 0 ? id : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function resolvePermissionPolicyFromFlags(
@@ -1128,214 +1126,6 @@ export async function handleSessionsList(
   }
 
   printAgentSessionsByFormat(result, globalFlags.format);
-}
-
-// `sessions tree` is global / cross-agent and READ-ONLY over the store; the
-// agent prefix does not scope it (see CONCEPTION §4). All filtering happens in
-// the CLI via the lightweight reader in ./session/session-tree.ts.
-export async function handleSessionsTree(
-  _explicitAgentName: string | undefined,
-  flags: SessionsTreeFlags,
-  command: Command,
-  config: ResolvedAcpxConfig,
-): Promise<void> {
-  const globalFlags = resolveGlobalFlags(command, config);
-  const options = resolveTreeOptions(flags);
-
-  const io = createDefaultTreeIO();
-  let result;
-  try {
-    result = await buildSessionTree(io, options);
-  } catch (error) {
-    if (error instanceof SessionTreeError) {
-      // --self that can't resolve falls back to the bounded active forest (§5.1).
-      if (options.scope === "self") {
-        result = await buildSessionTree(io, {
-          ...buildActiveForestOptions(flags),
-          selfFallbackNote: `--self could not resolve ${options.anchor ?? "your session"} — showing active forest instead`,
-        });
-      } else {
-        throw new InvalidArgumentError(error.message);
-      }
-    } else {
-      throw error;
-    }
-  }
-
-  const { printSessionTreeByFormat } = await loadOutputRenderModule();
-  printSessionTreeByFormat(result, globalFlags.format);
-}
-
-function countScopeFlags(flags: SessionsTreeFlags): number {
-  return (
-    (flags.self ? 1 : 0) + (flags.session ? 1 : 0) + (flags.root ? 1 : 0) + (flags.all ? 1 : 0)
-  );
-}
-
-function resolveTreeDirection(flags: SessionsTreeFlags): TreeDirection {
-  if (flags.ancestors && flags.descendants) {
-    throw new InvalidArgumentError("Use only one of --ancestors or --descendants");
-  }
-  if (flags.ancestors) {
-    return "ancestors";
-  }
-  if (flags.descendants) {
-    return "descendants";
-  }
-  return "both";
-}
-
-function resolveTreeSinceMs(flags: SessionsTreeFlags): number | undefined {
-  if (flags.since === undefined) {
-    return undefined;
-  }
-  const parsed = parseDuration(flags.since);
-  if (parsed === null) {
-    throw new InvalidArgumentError(
-      `Invalid --since "${flags.since}". Expected e.g. 30m, 6h, 2d, 1w`,
-    );
-  }
-  return parsed;
-}
-
-// Status / recency predicate, shared by every scope (the active-forest default
-// and explicit filters, including `--all`). Runs conflict validation and resolves
-// status/sinceMs from the flags; the implicit active default applies only when
-// `isActiveForestDefault` is true (never under `--all`, which suppresses only that
-// implicit default, not explicit `--active/--open/--closed/--since`).
-// eslint-disable-next-line complexity -- flag-combination validation + the bounded-active-forest default; independent guards
-function resolveTreeStatusFilters(
-  flags: SessionsTreeFlags,
-  isActiveForestDefault: boolean,
-): { status?: "open" | "closed"; sinceMs?: number } {
-  if (flags.active && flags.closed) {
-    throw new InvalidArgumentError("Cannot combine --active with --closed");
-  }
-  if (flags.open && flags.closed) {
-    throw new InvalidArgumentError("Cannot combine --open with --closed");
-  }
-
-  let status: "open" | "closed" | undefined;
-  if (flags.closed) {
-    status = "closed";
-  } else if (flags.open || flags.active) {
-    status = "open";
-  }
-
-  let sinceMs = resolveTreeSinceMs(flags);
-  if (sinceMs === undefined && flags.active) {
-    sinceMs = DEFAULT_ACTIVE_WINDOW_MS;
-  }
-
-  // Bounded active forest default (env unset, no scope/status flags): open ∧ <24h.
-  if (
-    isActiveForestDefault &&
-    !flags.open &&
-    !flags.closed &&
-    !flags.active &&
-    flags.since === undefined
-  ) {
-    status = "open";
-    sinceMs = DEFAULT_ACTIVE_WINDOW_MS;
-  }
-
-  return { status, sinceMs };
-}
-
-function buildTreeFilters(flags: SessionsTreeFlags, scope: TreeScopeMode): TreeFilters {
-  // `--all` widens the *scope* (whole-forest node set, incl. closed/old); it only
-  // suppresses the *implicit* active-forest default, NOT explicit predicates. So
-  // `--all` still runs conflict validation and applies any explicit
-  // `--active/--open/--closed/--since`, AND-combined with the full-forest scope;
-  // `--all` with no status flag → isActiveForestDefault:false → no implicit filter.
-  const isActiveForestDefault = scope === "active-forest";
-  const { status, sinceMs } = resolveTreeStatusFilters(flags, isActiveForestDefault);
-
-  return {
-    status,
-    sinceMs,
-    types: flags.type && flags.type.length > 0 ? (flags.type as EdgeType[]) : undefined,
-    agentTypes: flags.agentType && flags.agentType.length > 0 ? flags.agentType : undefined,
-    noSubagents: flags.subagents === false,
-    live: flags.live === true,
-    name: flags.name,
-    cwd: flags.filterCwd,
-    task: flags.task,
-  };
-}
-
-function buildActiveForestOptions(flags: SessionsTreeFlags): TreeOptions {
-  return {
-    scope: "active-forest",
-    connected: false,
-    direction: "both",
-    depth: flags.depth,
-    filters: buildTreeFilters(flags, "active-forest"),
-    maxNodes: flags.maxNodes ?? DEFAULT_MAX_NODES,
-    showLegend: flags.legend !== false,
-  };
-}
-
-// eslint-disable-next-line complexity -- scope resolution (self/session/root/all + env default + fallback); flat dispatch
-export function resolveTreeOptions(flags: SessionsTreeFlags): TreeOptions {
-  if (countScopeFlags(flags) > 1) {
-    throw new InvalidArgumentError("Use only one of --self, --session, --root, --all");
-  }
-  const direction = resolveTreeDirection(flags);
-  const anchored = Boolean(flags.self || flags.session || flags.root);
-  if ((flags.ancestors || flags.descendants) && !flags.self && !flags.session) {
-    throw new InvalidArgumentError("--ancestors/--descendants require --self or --session");
-  }
-  if (flags.connected && !anchored) {
-    throw new InvalidArgumentError("--connected requires --self, --session, or --root");
-  }
-
-  let scope: TreeScopeMode;
-  let anchor: string | undefined;
-  if (flags.all) {
-    scope = "all";
-  } else if (flags.root) {
-    scope = "root";
-    anchor = flags.root;
-  } else if (flags.session) {
-    scope = "session";
-    anchor = flags.session;
-  } else if (flags.self) {
-    const fromEnv = parseSessionIdFromUrl(process.env.ACPX_SESSION_URL);
-    scope = "self";
-    anchor = fromEnv;
-  } else {
-    // No scope flag: implicit --self when ACPX_SESSION_URL is set, else active forest.
-    const fromEnv = parseSessionIdFromUrl(process.env.ACPX_SESSION_URL);
-    if (fromEnv) {
-      scope = "self";
-      anchor = fromEnv;
-    } else {
-      scope = "active-forest";
-    }
-  }
-
-  const base: TreeOptions = {
-    scope,
-    anchor,
-    connected: flags.connected === true,
-    direction,
-    depth: flags.depth,
-    filters: buildTreeFilters(flags, scope),
-    maxNodes: flags.maxNodes ?? DEFAULT_MAX_NODES,
-    showLegend: flags.legend !== false,
-  };
-
-  // Explicit --self with a missing/invalid ACPX_SESSION_URL → active forest (§5.1).
-  if (flags.self && !anchor) {
-    return {
-      ...buildActiveForestOptions(flags),
-      selfFallbackNote:
-        "--self requested but ACPX_SESSION_URL is unset/invalid — showing active forest instead",
-    };
-  }
-
-  return base;
 }
 
 export async function handleSessionsClose(
