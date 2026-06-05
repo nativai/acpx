@@ -78,9 +78,6 @@ Examples:
   acpx codex status
   acpx config show
   acpx config init
-  acpx usage
-  acpx usage --session hod-tree-cli --format json
-  acpx usage --all
   acpx --ttl 30 codex "investigate flaky tests"
   acpx claude "refactor auth"
   acpx --agent ./my-custom-server "do something"`,
