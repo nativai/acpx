@@ -209,7 +209,7 @@ async function resolvePermissionPolicyFromFlags(
 
 // Parse the UUID from an acpx-ui session URL (...?session=<uuid>).
 // Returns undefined for missing / malformed input or empty session value.
-function parseSessionIdFromUrl(url: string | undefined): string | undefined {
+export function parseSessionIdFromUrl(url: string | undefined): string | undefined {
   if (!url) {
     return undefined;
   }

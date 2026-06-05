@@ -41,7 +41,7 @@ function handleSubscriptionsList(command: Command, config: ResolvedAcpxConfig): 
   process.stdout.write(renderSubscriptionsListText(registry));
 }
 
-function formatPercent(window: SubscriptionUsage["fiveHour"]): string {
+export function formatPercent(window: SubscriptionUsage["fiveHour"]): string {
   if (!window) {
     return "-";
   }
@@ -61,7 +61,7 @@ function renderUsageEntryText(entry: SubscriptionUsage): string {
   );
 }
 
-function renderUsageText(usage: SubscriptionUsage[]): string {
+export function renderUsageText(usage: SubscriptionUsage[]): string {
   if (usage.length === 0) {
     return NO_REGISTRY_MESSAGE;
   }
@@ -70,6 +70,16 @@ function renderUsageText(usage: SubscriptionUsage[]): string {
     out += renderUsageEntryText(entry);
   }
   return out;
+}
+
+/** Quiet output for a subscription-usage list: one `id\t5h%\t7d%` line each. */
+export function renderSubscriptionsUsageQuiet(usage: SubscriptionUsage[]): string {
+  return usage
+    .map(
+      (entry) =>
+        `${entry.id}\t${formatPercent(entry.fiveHour)}\t${formatPercent(entry.sevenDay)}\n`,
+    )
+    .join("");
 }
 
 async function handleSubscriptionsUsage(
@@ -85,14 +95,7 @@ async function handleSubscriptionsUsage(
   }
 
   if (format === "quiet") {
-    process.stdout.write(
-      usage
-        .map(
-          (entry) =>
-            `${entry.id}\t${formatPercent(entry.fiveHour)}\t${formatPercent(entry.sevenDay)}\n`,
-        )
-        .join(""),
-    );
+    process.stdout.write(renderSubscriptionsUsageQuiet(usage));
     return;
   }
 
