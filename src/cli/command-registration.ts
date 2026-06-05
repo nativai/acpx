@@ -16,6 +16,7 @@ import {
   handleSessionsRecover,
   handleSessionsSetMetadata,
   handleSessionsShow,
+  handleSessionsTree,
   handleSetConfigOption,
   handleSetMode,
   parseHistoryLimit,
@@ -26,11 +27,15 @@ import {
   addPromptInputOption,
   addSessionNameOption,
   addSessionOption,
+  collectAgentType,
+  collectEdgeType,
   parseDaysOlderThan,
+  parseMaxNodes,
   parseMetadataEntry,
   parseNonEmptyValue,
   parsePruneBeforeDate,
   parseSessionName,
+  parseTreeDepth,
   type PromptFlags,
   type SessionsExportFlags,
   type SessionsHistoryFlags,
@@ -38,6 +43,7 @@ import {
   type SessionsListFlags,
   type SessionsNewFlags,
   type SessionsPruneFlags,
+  type SessionsTreeFlags,
   type StatusFlags,
 } from "./flags.js";
 import { registerStatusCommand } from "./status-command.js";
@@ -83,6 +89,96 @@ function addSessionsListOptions(command: Command): Command {
     );
 }
 
+function registerSessionsTreeCommand(
+  parent: Command,
+  explicitAgentName: string | undefined,
+  config: ResolvedAcpxConfig,
+): void {
+  const treeCommand = parent
+    .command("tree")
+    .description(
+      "Show the session lineage forest (spawn/fork/subagent edges) with CLI-side filtering. Global / cross-agent; read-only.",
+    );
+
+  treeCommand
+    .option(
+      "--self",
+      "Anchor on the calling session (record id from ACPX_SESSION_URL). Default when that env is set.",
+    )
+    .addOption(
+      new LocalAttributeOption(
+        "--session <id>",
+        "Anchor on <id> (ancestors→self→descendants); id = record id, ACP session id, or unique suffix",
+        "session",
+      ).argParser((value: string) => parseNonEmptyValue("Session id", value)),
+    )
+    .addOption(
+      new LocalAttributeOption("--anchor <id>", "Alias for --session", "session").argParser(
+        (value: string) => parseNonEmptyValue("Session id", value),
+      ),
+    )
+    .option(
+      "--root <id>",
+      "Show the subtree under <id> (descendants only; <id> becomes the displayed root)",
+      (value: string) => parseNonEmptyValue("Root id", value),
+    )
+    .option("--all", "Show the whole forest (open and closed, no recency)")
+    .option("--connected", "With an anchor, widen to the whole connected component")
+    .option("--ancestors", "With an anchor: only the upward chain (+ self)")
+    .option("--descendants", "With an anchor: only self + downward subtree")
+    .option("-d, --depth <n>", "Cap traversal depth from the anchor/root", parseTreeDepth)
+    .option("--active", "Sugar for --open --since 24h")
+    .option("--open", "Only non-closed sessions")
+    .option("--closed", "Only closed sessions")
+    .addOption(
+      new LocalAttributeOption(
+        "--since <dur>",
+        "Used since now − dur (e.g. 30m, 6h, 2d, 1w)",
+        "since",
+      ).argParser((value: string) => parseNonEmptyValue("Since", value)),
+    )
+    .addOption(
+      new LocalAttributeOption("--active-within <dur>", "Alias for --since", "since").argParser(
+        (value: string) => parseNonEmptyValue("Since", value),
+      ),
+    )
+    .option("--live", "Only sessions whose queue owner is alive (opt-in; probed lazily)")
+    .option(
+      "--type <t>",
+      "Filter by edge-to-parent type: spawn|fork|subagent (repeatable / comma-separated)",
+      collectEdgeType,
+    )
+    .option("--no-subagents", "Hide subagent (task-tool) nodes")
+    .option(
+      "--agent-type <t>",
+      "Filter by agent type: claude|codex|gemini|… (repeatable / comma-separated)",
+      collectAgentType,
+    )
+    .option("--name <substr>", "Filter by name/title substring (case-insensitive)")
+    .addOption(
+      new LocalAttributeOption("--cwd <substr>", "Filter by cwd substring", "filterCwd").argParser(
+        (value: string) => parseNonEmptyValue("Cwd filter", value),
+      ),
+    )
+    .option("--task <substr>", "Filter by metadata.task_folder substring")
+    .addOption(
+      new LocalAttributeOption(
+        "--max-nodes <n>",
+        "Cap rendered nodes (default 200); over-cap prints a truncation notice",
+        "maxNodes",
+      ).argParser(parseMaxNodes),
+    )
+    .addOption(
+      new LocalAttributeOption("--limit <n>", "Alias for --max-nodes", "maxNodes").argParser(
+        parseMaxNodes,
+      ),
+    )
+    .option("--no-legend", "Suppress the legend / notes summary lines")
+    .action(async function (this: Command, flags: SessionsTreeFlags) {
+      await handleSessionsTree(explicitAgentName, flags, this, config);
+    });
+}
+
 export function registerSessionsCommand(
   parent: Command,
   explicitAgentName: string | undefined,
@@ -102,6 +198,8 @@ export function registerSessionsCommand(
     .action(async function (this: Command, flags: SessionsListFlags) {
       await handleSessionsList(explicitAgentName, flags, this, config);
     });
+
+  registerSessionsTreeCommand(sessionsCommand, explicitAgentName, config);
 
   sessionsCommand
     .command("new")

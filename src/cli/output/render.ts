@@ -2,6 +2,7 @@ import path from "node:path";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
 import type { AgentSessionListResult, OutputFormat, SessionRecord } from "../../types.js";
 import { probeQueueOwnerHealth } from "../queue/ipc.js";
+import type { SessionTreeResult, TreeNodeView } from "../session/session-tree.js";
 import { emitJsonResult } from "./json-output.js";
 
 function formatSessionLabel(record: SessionRecord): string {
@@ -324,6 +325,134 @@ function formatPruneSummaryLine(
   const bytesSuffix =
     !result.dryRun && result.bytesFreed > 0 ? `, freed ${formatBytes(result.bytesFreed)}` : "";
   return `${prefix} ${count} session${count === 1 ? "" : "s"}${bytesSuffix}`;
+}
+
+// ---------------------------------------------------------------------------
+// `sessions tree` rendering
+// ---------------------------------------------------------------------------
+
+export function printSessionTreeByFormat(result: SessionTreeResult, format: OutputFormat): void {
+  if (format === "json") {
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    return;
+  }
+  if (format === "quiet") {
+    for (const id of treePreOrder(result)) {
+      process.stdout.write(`${id}\n`);
+    }
+    return;
+  }
+  printSessionTreeText(result);
+}
+
+function treePreOrder(result: SessionTreeResult): string[] {
+  const order: string[] = [];
+  const visit = (id: string): void => {
+    const node = result.nodes[id];
+    if (!node || order.includes(id)) {
+      return;
+    }
+    order.push(id);
+    for (const childId of node.childIds) {
+      visit(childId);
+    }
+  };
+  for (const rootId of result.roots) {
+    visit(rootId);
+  }
+  return order;
+}
+
+function printSessionTreeText(result: SessionTreeResult): void {
+  const { summary } = result;
+  const activeSuffix = result.scope.mode === "active-forest" ? "" : ` · active ${summary.active}`;
+  process.stdout.write(
+    `session tree · ${result.scopeLabel} · showing ${summary.shown} of ${summary.total} · roots ${summary.roots}${activeSuffix}\n`,
+  );
+  if (result.hint) {
+    process.stdout.write(`hint: ${result.hint}\n`);
+  }
+  process.stdout.write("\n");
+
+  const selfScope = result.scope.mode === "self";
+  if (summary.shown === 0) {
+    process.stdout.write("(no matching sessions)\n");
+  } else {
+    for (const rootId of result.roots) {
+      renderTreeNode(result, rootId, "", true, true, selfScope);
+    }
+  }
+
+  if (result.showLegend) {
+    process.stdout.write("\n");
+    process.stdout.write(
+      "legend: ● anchor (you, with --self) · · context · (spawn|fork@idx|subagent) edge to parent · age = since last activity\n",
+    );
+    if (result.notes.length > 0) {
+      process.stdout.write(`notes: ${result.notes.join(" · ")}\n`);
+    }
+  }
+}
+
+function renderTreeNode(
+  result: SessionTreeResult,
+  id: string,
+  prefix: string,
+  isLast: boolean,
+  isRoot: boolean,
+  selfScope: boolean,
+): void {
+  const node = result.nodes[id];
+  if (!node) {
+    return;
+  }
+  const connector = isRoot ? "" : isLast ? "└─ " : "├─ ";
+  process.stdout.write(`${prefix}${connector}${formatTreeRow(node, selfScope)}\n`);
+
+  const childPrefix = isRoot ? "" : `${prefix}${isLast ? "   " : "│  "}`;
+  const children = node.childIds;
+  for (let i = 0; i < children.length; i += 1) {
+    renderTreeNode(result, children[i], childPrefix, i === children.length - 1, false, selfScope);
+  }
+}
+
+// eslint-disable-next-line complexity -- flat column assembly (marker/name/status/age/edge); ternary-dense by nature
+function formatTreeRow(node: TreeNodeView, selfScope: boolean): string {
+  const marker = node.anchor ? "● " : node.context ? "· " : "";
+  const rawName = node.missing ? "(orphan)" : (node.name ?? node.title ?? "-");
+  const name = truncate(rawName, 28);
+  const statusCol = node.live === true ? `${node.status} live` : node.status;
+  const location = shortenLocation(node.cwd, node.taskFolder);
+  const youSuffix = node.anchor && selfScope ? " ← you" : "";
+  return [
+    `${marker}${node.shortId}`,
+    padEnd(name, 28),
+    padEnd(node.agentType, 8),
+    padEnd(statusCol, 11),
+    padEnd(node.age, 4),
+    location,
+    `(${node.edgeLabel}${youSuffix})`,
+  ].join("  ");
+}
+
+function truncate(value: string, max: number): string {
+  return value.length <= max ? value : `${value.slice(0, max - 1)}…`;
+}
+
+function padEnd(value: string, width: number): string {
+  return value.length >= width ? value : value + " ".repeat(width - value.length);
+}
+
+function shortenLocation(cwd: string | undefined, taskFolder: string | undefined): string {
+  const value = cwd ?? taskFolder ?? "";
+  if (value.length === 0) {
+    return "-";
+  }
+  const segments = value.split("/").filter((segment) => segment.length > 0);
+  if (value.length <= 30 || segments.length <= 1) {
+    return value;
+  }
+  return `/…/${segments[segments.length - 1]}`;
 }
 
 export function agentSessionIdPayload(agentSessionId: string | undefined): {
