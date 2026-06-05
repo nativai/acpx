@@ -1368,6 +1368,7 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
           sessionId,
           reasoningEffort: options.sessionOptions?.reasoningEffort,
           advertised: createdSession.configOptions,
+          modelId: options.sessionOptions?.model,
           timeoutMs: options.timeoutMs,
           verbose: options.verbose,
         });

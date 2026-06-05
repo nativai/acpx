@@ -1019,6 +1019,86 @@ test("connectAndLoadSession restores the original session when desired config re
   });
 });
 
+test("connectAndLoadSession does not persist normalized effort when later config replay fails", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "config-replay-normalized-failure-record",
+      acpSessionId: "stale-session",
+      agentSessionId: "stale-runtime",
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+      cwd,
+      acpx: {
+        session_options: {
+          model: "sonnet",
+        },
+        desired_config_options: {
+          effort: "xhigh",
+          secondary: "kept",
+        },
+      },
+    });
+
+    const configCalls: Array<{ sessionId: string; configId: string; value: string }> = [];
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({
+        running: true,
+      }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
+      loadSessionWithOptions: async () => {
+        throw {
+          error: {
+            code: -32002,
+            message: "session not found",
+          },
+        };
+      },
+      createSession: async () => ({
+        sessionId: "fresh-session",
+        agentSessionId: "fresh-runtime",
+      }),
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+      setSessionConfigOption: async (sessionId, configId, value) => {
+        configCalls.push({ sessionId, configId, value });
+        if (configId === "secondary") {
+          throw new Error("secondary config restore rejected");
+        }
+        return { configOptions: [] };
+      },
+    };
+
+    await assert.rejects(
+      async () =>
+        await connectAndLoadSession({
+          client: client as never,
+          record,
+          activeController: ACTIVE_CONTROLLER,
+        }),
+      (error: unknown) => {
+        assert(error instanceof Error);
+        assert.equal(error.name, "SessionConfigOptionReplayError");
+        assert.match(error.message, /Failed to replay saved session config option secondary/);
+        return true;
+      },
+    );
+
+    assert.deepEqual(configCalls, [
+      { sessionId: "fresh-session", configId: "effort", value: "high" },
+      { sessionId: "fresh-session", configId: "secondary", value: "kept" },
+    ]);
+    assert.equal(record.acpSessionId, "stale-session");
+    assert.equal(record.agentSessionId, "stale-runtime");
+    assert.equal(record.acpx?.desired_config_options?.effort, "xhigh");
+    assert.equal(record.acpx?.desired_config_options?.secondary, "kept");
+  });
+});
+
 test("connectAndLoadSession reuses an already loaded client session", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

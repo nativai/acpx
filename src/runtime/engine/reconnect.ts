@@ -14,11 +14,13 @@ import {
   SessionResumeRequiredError,
 } from "../../errors.js";
 import { incrementPerfCounter } from "../../perf-metrics.js";
+import { normalizeEffortLevelForModel } from "../../session/config-option-application.js";
 import { applyConfigOptionsToRecord } from "../../session/config-options.js";
 import {
   getDesiredConfigOptions,
   getDesiredModeId,
   getDesiredModelId,
+  setDesiredConfigOption,
   setCurrentModelId,
   syncAdvertisedModelState,
 } from "../../session/mode-preference.js";
@@ -199,16 +201,23 @@ async function replayDesiredConfigOptions(params: {
   client: AcpClient;
   sessionId: string;
   desiredConfigOptions: Record<string, string>;
+  desiredModelId?: string;
   previousSessionId: string;
+  record: SessionRecord;
   timeoutMs?: number;
   verbose?: boolean;
 }): Promise<void> {
+  const normalizedDesiredConfigOptions: Array<[configId: string, value: string]> = [];
   for (const [configId, value] of Object.entries(params.desiredConfigOptions)) {
+    const replayValue = replayConfigOptionValue(configId, value, params.desiredModelId);
     try {
       await withTimeout(
-        params.client.setSessionConfigOption(params.sessionId, configId, value),
+        params.client.setSessionConfigOption(params.sessionId, configId, replayValue),
         params.timeoutMs,
       );
+      if (replayValue !== value) {
+        normalizedDesiredConfigOptions.push([configId, replayValue]);
+      }
       if (params.verbose) {
         process.stderr.write(
           `[acpx] replayed desired config option ${configId} on fresh ACP session ${params.sessionId} (previous ${params.previousSessionId})\n`,
@@ -224,6 +233,20 @@ async function replayDesiredConfigOptions(params: {
       );
     }
   }
+  for (const [configId, value] of normalizedDesiredConfigOptions) {
+    setDesiredConfigOption(params.record, configId, value);
+  }
+}
+
+function replayConfigOptionValue(
+  configId: string,
+  value: string,
+  modelId: string | undefined,
+): string {
+  if (configId !== "effort") {
+    return value;
+  }
+  return normalizeEffortLevelForModel(value, modelId) ?? value;
 }
 
 function restoreOriginalSessionState(params: {
@@ -388,7 +411,9 @@ async function replayFreshSessionPreferences(params: {
       client: params.client,
       sessionId: params.sessionId,
       desiredConfigOptions: params.desiredConfigOptions,
+      desiredModelId: params.desiredModelId,
       previousSessionId: params.originalSessionId,
+      record: params.record,
       timeoutMs: params.timeoutMs,
       verbose: params.verbose,
     });

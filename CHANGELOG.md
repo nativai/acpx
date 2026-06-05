@@ -12,6 +12,9 @@ Repo: https://github.com/openclaw/acpx
 
 ### Fixes
 
+- CLI/sessions: map inherited Claude effort levels to the child model's supported
+  range when spawning model-overridden child sessions.
+
 ## 2026.5.23 (v0.10.0)
 
 ### Changes

@@ -605,6 +605,94 @@ test("sessions new and ensure accept -s as shorthand for --name", async () => {
   });
 });
 
+test("sessions new maps inherited effort to the child model's advertised levels", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const claudeCommand = `${MOCK_AGENT_COMMAND} --claude-agent-acp --advertise-models --advertise-config-options`;
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          agents: {
+            claude: {
+              command: claudeCommand,
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "parent-opus",
+      acpSessionId: "parent-opus",
+      agentCommand: claudeCommand,
+      cwd,
+      acpx: {
+        session_options: {
+          model: "opus[1m]",
+        },
+        desired_config_options: {
+          effort: "xhigh",
+        },
+      },
+    });
+
+    const created = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--format",
+        "json",
+        "--model",
+        "sonnet",
+        "claude",
+        "sessions",
+        "new",
+        "--parent-id",
+        "parent-opus",
+      ],
+      homeDir,
+    );
+    assert.equal(created.code, 0, created.stderr);
+    const payload = JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown };
+    assert.equal(typeof payload.acpxRecordId, "string");
+    const childId = payload.acpxRecordId;
+    if (typeof childId !== "string") {
+      throw new Error("missing child session id");
+    }
+
+    const stored = JSON.parse(await fs.readFile(sessionFilePath(homeDir, childId), "utf8")) as {
+      agent_command?: unknown;
+      parent_session_id?: unknown;
+      acpx?: {
+        session_options?: { model?: unknown };
+        desired_config_options?: { effort?: unknown };
+        config_options?: Array<{
+          id?: unknown;
+          currentValue?: unknown;
+          options?: Array<{ value?: unknown }>;
+        }>;
+      };
+    };
+    assert.equal(stored.agent_command, claudeCommand);
+    assert.equal(stored.parent_session_id, "parent-opus");
+    assert.equal(stored.acpx?.session_options?.model, "sonnet");
+    assert.equal(stored.acpx?.desired_config_options?.effort, "high");
+
+    const effortOption = stored.acpx?.config_options?.find((option) => option.id === "effort");
+    assert.equal(effortOption?.currentValue, "high");
+    assert.deepEqual(
+      effortOption?.options?.map((option) => option.value),
+      ["low", "medium", "high"],
+    );
+  });
+});
+
 test("sessions ensure --resume-session loads ACP session when creating missing session", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

@@ -21,24 +21,91 @@ export function advertisesConfigOption(
   return (advertised ?? []).some((option) => option.id === configId);
 }
 
+// Effort ids are adapter-defined strings, but acpx deliberately knows the
+// comparable ordered levels so inherited/requested values can be safely mapped
+// across model vocabularies. `default` is intentionally not on the scale: when a
+// source value cannot be placed here, fall back to the child model's advertised
+// default/current effort instead of guessing.
+const ORDERED_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+const EFFORT_LEVEL_RANKS = new Map<string, number>(
+  ORDERED_EFFORT_LEVELS.map((level, index) => [level, index]),
+);
+const COMPACT_CLAUDE_EFFORT_LEVELS = new Set(["low", "medium", "high"]);
+
+export function normalizeEffortLevelForAdvertisedOption(
+  requestedLevel: string,
+  option: SessionConfigOption,
+  modelId?: string,
+): string | undefined {
+  if (option.type !== "select") {
+    return undefined;
+  }
+  const supported = effortLevelsForModel(modelId) ?? selectableValues(option);
+  const requested = requestedLevel.trim();
+  if (requested === "default" && supported.has(requested)) {
+    return requested;
+  }
+  const requestedRank = EFFORT_LEVEL_RANKS.get(requested);
+  if (requestedRank === undefined) {
+    return advertisedDefaultEffort(option, supported, modelId);
+  }
+  if (supported.has(requested)) {
+    return requested;
+  }
+  return (
+    nearestSupportedEffort(requestedRank, supported) ??
+    advertisedDefaultEffort(option, supported, modelId)
+  );
+}
+
+export function normalizeEffortLevelForModel(
+  requestedLevel: string,
+  modelId: string | undefined,
+): string | undefined {
+  const supported = effortLevelsForModel(modelId);
+  if (!supported) {
+    return undefined;
+  }
+  const requested = requestedLevel.trim();
+  if (requested === "default" && supported.has(requested)) {
+    return requested;
+  }
+  const requestedRank = EFFORT_LEVEL_RANKS.get(requested);
+  if (requestedRank === undefined) {
+    return modelDefaultEffort(modelId, supported);
+  }
+  if (supported.has(requested)) {
+    return requested;
+  }
+  return nearestSupportedEffort(requestedRank, supported) ?? modelDefaultEffort(modelId, supported);
+}
+
 // Apply one config option to the live session when it is advertised, the value
-// is a supported (model-coupled) level, and it differs from the current value —
-// otherwise skip (never error: "layer on top, never break"). Returns the
-// set-response (for record capture) or undefined when skipped.
+// can be normalized to a supported value, and it differs from the current value
+// — otherwise skip (never error: "layer on top, never break"). Returns the
+// normalized value plus the set-response (for record capture) or undefined when
+// skipped.
+type ConfigOptionApplyResult = {
+  value: string;
+  response?: { configOptions?: SessionConfigOption[] };
+};
+
 async function applyConfigOptionIfAdvertised(params: {
   client: ConfigOptionApplyClient;
   sessionId: string;
   configId: string;
   value: string;
   advertised: SessionConfigOption[];
+  modelId?: string;
   timeoutMs?: number;
   verbose?: boolean;
-}): Promise<{ configOptions?: SessionConfigOption[] } | undefined> {
+}): Promise<ConfigOptionApplyResult | undefined> {
   const option = params.advertised.find((entry) => entry.id === params.configId);
   if (!option || option.type !== "select") {
     return undefined; // not advertised, or not a selectable option (e.g. codex effort)
   }
-  if (!selectableValues(option).has(params.value)) {
+  const value = supportedConfigOptionValue(params.configId, params.value, option, params.modelId);
+  if (!value) {
     if (params.verbose) {
       process.stderr.write(
         `[acpx] config option ${params.configId}=${params.value} is not an advertised level for this model; skipping\n`,
@@ -46,13 +113,19 @@ async function applyConfigOptionIfAdvertised(params: {
     }
     return undefined; // model-coupled level unsupported → skip
   }
-  if (option.currentValue === params.value) {
-    return undefined; // already at the requested value
+  if (params.verbose && value !== params.value) {
+    process.stderr.write(
+      `[acpx] config option ${params.configId}=${params.value} is not advertised for this model; applying ${value}\n`,
+    );
   }
-  return await withTimeout(
-    params.client.setSessionConfigOption(params.sessionId, params.configId, params.value),
+  if (option.currentValue === value) {
+    return { value }; // already at the normalized value
+  }
+  const response = await withTimeout(
+    params.client.setSessionConfigOption(params.sessionId, params.configId, value),
     params.timeoutMs,
   );
+  return { value, response };
 }
 
 /**
@@ -73,6 +146,7 @@ export async function applyRequestedConfigOptionsIfAdvertised(params: {
   sessionId: string;
   record: SessionRecord;
   advertised: SessionConfigOption[] | undefined;
+  modelId?: string;
   timeoutMs?: number;
   verbose?: boolean;
 }): Promise<void> {
@@ -80,17 +154,24 @@ export async function applyRequestedConfigOptionsIfAdvertised(params: {
   const advertised = params.advertised ?? [];
 
   for (const [configId, value] of Object.entries(desired)) {
-    const response = await applyConfigOptionIfAdvertised({
+    const result = await applyConfigOptionIfAdvertised({
       client: params.client,
       sessionId: params.sessionId,
       configId,
       value,
       advertised,
+      modelId: params.modelId,
       timeoutMs: params.timeoutMs,
       verbose: params.verbose,
     });
-    if (response) {
-      applyConfigOptionsToRecord(params.record, response);
+    if (!result) {
+      continue;
+    }
+    if (configId === "effort" && result.value !== value) {
+      setDesiredConfigOption(params.record, "effort", result.value);
+    }
+    if (result.response) {
+      applyConfigOptionsToRecord(params.record, result.response);
     }
   }
 }
@@ -110,6 +191,7 @@ export async function persistAndApplyRequestedEffort(params: {
   record: SessionRecord;
   reasoningEffort: string | undefined;
   advertised: SessionConfigOption[] | undefined;
+  modelId?: string;
   timeoutMs?: number;
   verbose?: boolean;
 }): Promise<void> {
@@ -122,6 +204,7 @@ export async function persistAndApplyRequestedEffort(params: {
     sessionId: params.sessionId,
     record: params.record,
     advertised: params.advertised,
+    modelId: params.modelId,
     timeoutMs: params.timeoutMs,
     verbose: params.verbose,
   });
@@ -137,6 +220,7 @@ export async function applyExecReasoningEffort(params: {
   sessionId: string;
   reasoningEffort: string | undefined;
   advertised: SessionConfigOption[] | undefined;
+  modelId?: string;
   timeoutMs?: number;
   verbose?: boolean;
 }): Promise<void> {
@@ -149,6 +233,7 @@ export async function applyExecReasoningEffort(params: {
     configId: "effort",
     value: params.reasoningEffort,
     advertised: params.advertised ?? [],
+    modelId: params.modelId,
     timeoutMs: params.timeoutMs,
     verbose: params.verbose,
   });
@@ -169,4 +254,98 @@ function selectableValues(option: SessionConfigOption): Set<string> {
     }
   }
   return values;
+}
+
+function supportedConfigOptionValue(
+  configId: string,
+  requestedValue: string,
+  option: SessionConfigOption,
+  modelId: string | undefined,
+): string | undefined {
+  if (configId === "effort") {
+    return normalizeEffortLevelForAdvertisedOption(requestedValue, option, modelId);
+  }
+  return selectableValues(option).has(requestedValue) ? requestedValue : undefined;
+}
+
+function nearestSupportedEffort(
+  requestedRank: number,
+  supported: ReadonlySet<string>,
+): string | undefined {
+  let best: { value: string; rank: number; distance: number } | undefined;
+  for (const value of supported) {
+    const rank = EFFORT_LEVEL_RANKS.get(value);
+    if (rank === undefined) {
+      continue;
+    }
+    const distance = Math.abs(rank - requestedRank);
+    if (isBetterEffortMatch(distance, rank, best)) {
+      best = { value, rank, distance };
+    }
+  }
+  return best?.value;
+}
+
+function isBetterEffortMatch(
+  distance: number,
+  rank: number,
+  best: { rank: number; distance: number } | undefined,
+): boolean {
+  if (!best || distance < best.distance) {
+    return true;
+  }
+  // If two supported levels are equally near, prefer the lower effort. That is
+  // deterministic and avoids silently exceeding the requested intensity.
+  return distance === best.distance && rank < best.rank;
+}
+
+function advertisedDefaultEffort(
+  option: SessionConfigOption,
+  supported: ReadonlySet<string>,
+  modelId: string | undefined,
+): string | undefined {
+  if (option.type !== "select") {
+    return undefined;
+  }
+  const current = typeof option.currentValue === "string" ? option.currentValue.trim() : "";
+  if (current && supported.has(current)) {
+    return current;
+  }
+  const modelDefault = modelDefaultEffort(modelId, supported);
+  if (modelDefault) {
+    return modelDefault;
+  }
+  if (supported.has("default")) {
+    return "default";
+  }
+  return [...supported][0];
+}
+
+function effortLevelsForModel(modelId: string | undefined): ReadonlySet<string> | undefined {
+  const model = modelId?.trim().toLowerCase();
+  if (!model) {
+    return undefined;
+  }
+  // The Claude adapter may report the broad Opus effort list in session/new even
+  // when `--model sonnet|haiku` was requested, but session/set_config_option is
+  // stricter and rejects xhigh/max for those compact models. Use the effective
+  // child model id as a documented fallback when the live advertisement is stale.
+  if (model.includes("sonnet") || model.includes("haiku")) {
+    return COMPACT_CLAUDE_EFFORT_LEVELS;
+  }
+  return undefined;
+}
+
+function modelDefaultEffort(
+  modelId: string | undefined,
+  supported: ReadonlySet<string>,
+): string | undefined {
+  const model = modelId?.trim().toLowerCase();
+  if (!model) {
+    return undefined;
+  }
+  if ((model.includes("sonnet") || model.includes("haiku")) && supported.has("high")) {
+    return "high";
+  }
+  return undefined;
 }

@@ -607,6 +607,7 @@ export class AcpRuntimeManager {
       record,
       reasoningEffort: input.sessionOptions?.reasoningEffort,
       advertised: session.sessionResult.configOptions,
+      modelId: input.sessionOptions?.model,
       timeoutMs: this.options.timeoutMs,
       verbose: this.options.verbose,
     });

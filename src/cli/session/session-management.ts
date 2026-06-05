@@ -104,6 +104,7 @@ async function createSessionRecordWithClient(
     record,
     reasoningEffort: options.sessionOptions?.reasoningEffort,
     advertised: sessionResult.configOptions,
+    modelId: options.sessionOptions?.model,
     timeoutMs: options.timeoutMs,
     verbose: options.verbose,
   });

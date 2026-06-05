@@ -19,6 +19,7 @@ import {
   type ListSessionsResponse,
   type LoadSessionRequest,
   type LoadSessionResponse,
+  type NewSessionRequest,
   type NewSessionResponse,
   type PromptRequest,
   type PromptResponse,
@@ -32,6 +33,7 @@ import {
   type SetSessionModelResponse,
   type SetSessionModeRequest,
   type SetSessionModeResponse,
+  type SessionConfigOption,
   type SessionInfo,
   type SessionModelState,
 } from "@agentclientprotocol/sdk";
@@ -66,6 +68,7 @@ type MockAgentOptions = {
   loadReplayText: string;
   ignoreSigterm: boolean;
   envDumpFile?: string;
+  claudeAgentAcp: boolean;
 };
 
 type SessionState = {
@@ -370,6 +373,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let ignoreSigterm = false;
   let hangOnNewSession = false;
   let envDumpFile: string | undefined;
+  let claudeAgentAcp = false;
 
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
@@ -486,6 +490,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     }
 
     if (token === "--claude-agent-acp") {
+      claudeAgentAcp = true;
       continue;
     }
 
@@ -546,11 +551,21 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     loadReplayText,
     ignoreSigterm,
     envDumpFile,
+    claudeAgentAcp,
   };
 }
 
 const DEFAULT_MODEL_ID = "default-model";
-const AVAILABLE_MODELS = ["default-model", "fast-model", "smart-model"];
+const AVAILABLE_MODELS = [
+  "default-model",
+  "fast-model",
+  "smart-model",
+  "opus[1m]",
+  "sonnet",
+  "haiku",
+];
+const OPUS_EFFORT_LEVELS = ["default", "low", "medium", "high", "xhigh", "max"];
+const COMPACT_CLAUDE_EFFORT_LEVELS = ["low", "medium", "high"];
 
 function buildModelsState(currentModelId: string): SessionModelState {
   return {
@@ -559,13 +574,14 @@ function buildModelsState(currentModelId: string): SessionModelState {
   };
 }
 
-function createSessionState(hasCompletedPrompt = false): SessionState {
+function createSessionState(hasCompletedPrompt = false, modelId = DEFAULT_MODEL_ID): SessionState {
   return {
     hasCompletedPrompt,
     modeId: "auto",
-    modelId: DEFAULT_MODEL_ID,
+    modelId,
     configValues: {
       reasoning_effort: "medium",
+      effort: defaultClaudeEffort(modelId),
     },
     transientPromptAttempts: {},
   };
@@ -617,11 +633,48 @@ function parseListCursor(cursor: string | null | undefined): number {
   return parsed;
 }
 
-function buildConfigOptions(state: SessionState): SetSessionConfigOptionResponse["configOptions"] {
+function effortLevelsForModel(modelId: string): readonly string[] {
+  return modelId.includes("sonnet") || modelId.includes("haiku")
+    ? COMPACT_CLAUDE_EFFORT_LEVELS
+    : OPUS_EFFORT_LEVELS;
+}
+
+function defaultClaudeEffort(modelId: string): string {
+  return effortLevelsForModel(modelId).includes("high") ? "high" : "medium";
+}
+
+function modelFromNewSessionMeta(params: NewSessionRequest): string | undefined {
+  const meta = params._meta;
+  if (!isRecord(meta)) {
+    return undefined;
+  }
+  const claudeCode = meta.claudeCode;
+  if (!isRecord(claudeCode)) {
+    return undefined;
+  }
+  const options = claudeCode.options;
+  if (!isRecord(options) || typeof options.model !== "string") {
+    return undefined;
+  }
+  return options.model.trim() || undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function buildConfigOptions(
+  state: SessionState,
+  options: MockAgentOptions,
+): SetSessionConfigOptionResponse["configOptions"] {
   const reasoningEffort =
     typeof state.configValues.reasoning_effort === "string"
       ? state.configValues.reasoning_effort
       : "medium";
+  const claudeEffort =
+    typeof state.configValues.effort === "string"
+      ? state.configValues.effort
+      : defaultClaudeEffort(state.modelId);
 
   return [
     {
@@ -650,20 +703,64 @@ function buildConfigOptions(state: SessionState): SetSessionConfigOptionResponse
         { value: "gpt-5.2", name: "gpt-5.2" },
       ],
     },
-    {
-      id: "reasoning_effort",
-      name: "Reasoning Effort",
-      category: "thought_level",
-      type: "select",
-      currentValue: reasoningEffort,
-      options: [
-        { value: "low", name: "Low" },
-        { value: "medium", name: "Medium" },
-        { value: "high", name: "High" },
-        { value: "xhigh", name: "Xhigh" },
-      ],
-    },
+    options.claudeAgentAcp
+      ? {
+          id: "effort",
+          name: "Effort",
+          category: "thought_level",
+          type: "select",
+          currentValue: claudeEffort,
+          options: effortLevelsForModel(state.modelId).map((value) => ({ value, name: value })),
+        }
+      : {
+          id: "reasoning_effort",
+          name: "Reasoning Effort",
+          category: "thought_level",
+          type: "select",
+          currentValue: reasoningEffort,
+          options: [
+            { value: "low", name: "Low" },
+            { value: "medium", name: "Medium" },
+            { value: "high", name: "High" },
+            { value: "xhigh", name: "Xhigh" },
+          ],
+        },
   ];
+}
+
+function assertAdvertisedConfigValue(
+  state: SessionState,
+  options: MockAgentOptions,
+  params: SetSessionConfigOptionRequest,
+): void {
+  const option = buildConfigOptions(state, options)?.find((entry) => entry.id === params.configId);
+  if (!option || option.type !== "select" || typeof params.value !== "string") {
+    return;
+  }
+  if (selectableConfigValues(option).has(params.value)) {
+    return;
+  }
+  throw RequestError.internalError(
+    { configId: params.configId, value: params.value },
+    `Invalid value for config option ${params.configId}: ${params.value}`,
+  );
+}
+
+function selectableConfigValues(option: SessionConfigOption): Set<string> {
+  const values = new Set<string>();
+  if (option.type !== "select") {
+    return values;
+  }
+  for (const entry of option.options) {
+    if ("value" in entry) {
+      values.add(entry.value);
+    } else {
+      for (const grouped of entry.options) {
+        values.add(grouped.value);
+      }
+    }
+  }
+  return values;
 }
 
 class MockAgent implements Agent {
@@ -701,13 +798,16 @@ class MockAgent implements Agent {
     return;
   }
 
-  async newSession(): Promise<NewSessionResponse> {
+  async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
     if (this.options.hangOnNewSession) {
       return await new Promise<NewSessionResponse>(() => {});
     }
 
     const sessionId = randomUUID();
-    this.sessions.set(sessionId, createSessionState(false));
+    const requestedModel = this.options.claudeAgentAcp
+      ? (modelFromNewSessionMeta(params) ?? DEFAULT_MODEL_ID)
+      : DEFAULT_MODEL_ID;
+    this.sessions.set(sessionId, createSessionState(false, requestedModel));
 
     const response: NewSessionResponse = { sessionId };
 
@@ -716,11 +816,12 @@ class MockAgent implements Agent {
     }
 
     if (this.options.advertiseModels) {
-      response.models = buildModelsState(DEFAULT_MODEL_ID);
+      response.models = buildModelsState(requestedModel);
     }
     if (this.options.advertiseConfigOptions) {
       response.configOptions = buildConfigOptions(
         this.sessions.get(sessionId) ?? createSessionState(false),
+        this.options,
       );
     }
 
@@ -792,6 +893,7 @@ class MockAgent implements Agent {
     if (this.options.advertiseConfigOptions) {
       response.configOptions = buildConfigOptions(
         this.sessions.get(sessionId) ?? createSessionState(false),
+        this.options,
       );
     }
 
@@ -956,6 +1058,7 @@ class MockAgent implements Agent {
       throw new Error("setSessionModel failed");
     }
     session.modelId = params.modelId;
+    session.configValues.effort = defaultClaudeEffort(params.modelId);
     return {};
   }
 
@@ -980,6 +1083,9 @@ class MockAgent implements Agent {
       };
       throw error;
     }
+    if (this.options.advertiseConfigOptions) {
+      assertAdvertisedConfigValue(session, this.options, params);
+    }
     if (params.configId === "mode" && typeof params.value === "string") {
       session.modeId = params.value;
     } else {
@@ -987,7 +1093,7 @@ class MockAgent implements Agent {
     }
 
     return {
-      configOptions: buildConfigOptions(session),
+      configOptions: buildConfigOptions(session, this.options),
     };
   }
 
