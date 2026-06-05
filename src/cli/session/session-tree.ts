@@ -1244,14 +1244,19 @@ type NotesInput = {
 // eslint-disable-next-line complexity -- linear list of independent "what was withheld" notices
 function buildTreeNotes(input: NotesInput): string[] {
   const notes: string[] = [];
+  // Under --all the scope is already the whole forest, so the remedy is to relax
+  // the explicit predicate, not "use --all" (which would be a no-op hint).
+  const allScope = input.options.scope === "all";
   if (input.options.selfFallbackNote) {
     notes.push(input.options.selfFallbackNote);
   }
   if (input.hiddenClosed > 0) {
-    notes.push(`+${input.hiddenClosed} closed hidden — use --all`);
+    const widen = allScope ? "drop --open/--active" : "use --all";
+    notes.push(`+${input.hiddenClosed} closed hidden — ${widen}`);
   }
   if (input.hiddenInactive > 0) {
-    notes.push(`+${input.hiddenInactive} open but inactive hidden — use --since <dur> or --all`);
+    const widen = allScope ? "raise or drop --since" : "use --since <dur> or --all";
+    notes.push(`+${input.hiddenInactive} open but inactive hidden — ${widen}`);
   }
   if (input.truncated) {
     notes.push(

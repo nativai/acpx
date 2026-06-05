@@ -1143,11 +1143,13 @@ function resolveTreeStatusFilters(
 }
 
 function buildTreeFilters(flags: SessionsTreeFlags, scope: TreeScopeMode): TreeFilters {
+  // `--all` widens the *scope* (whole-forest node set, incl. closed/old); it only
+  // suppresses the *implicit* active-forest default, NOT explicit predicates. So
+  // `--all` still runs conflict validation and applies any explicit
+  // `--active/--open/--closed/--since`, AND-combined with the full-forest scope;
+  // `--all` with no status flag → isActiveForestDefault:false → no implicit filter.
   const isActiveForestDefault = scope === "active-forest";
-  const { status, sinceMs } =
-    scope === "all"
-      ? { status: undefined, sinceMs: undefined } // --all overrides status filters
-      : resolveTreeStatusFilters(flags, isActiveForestDefault);
+  const { status, sinceMs } = resolveTreeStatusFilters(flags, isActiveForestDefault);
 
   return {
     status,
@@ -1175,7 +1177,7 @@ function buildActiveForestOptions(flags: SessionsTreeFlags): TreeOptions {
 }
 
 // eslint-disable-next-line complexity -- scope resolution (self/session/root/all + env default + fallback); flat dispatch
-function resolveTreeOptions(flags: SessionsTreeFlags): TreeOptions {
+export function resolveTreeOptions(flags: SessionsTreeFlags): TreeOptions {
   if (countScopeFlags(flags) > 1) {
     throw new InvalidArgumentError("Use only one of --self, --session, --root, --all");
   }
