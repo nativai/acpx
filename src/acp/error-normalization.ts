@@ -237,6 +237,35 @@ function resolveDetailCode(
   );
 }
 
+// errorKind values (supplied by the adapter as data.errorKind) that mean the
+// adapter already forwarded the prompt to the Claude API and Claude rejected it.
+// These are the same values as FAILOVER_ERROR_KINDS in runtime/engine/failover.ts —
+// kept in sync manually here to avoid a layering violation (acp/ ← runtime/engine/).
+const POST_DELIVERY_ERROR_KINDS = new Set(["rate_limit", "authentication_failed", "billing_error"]);
+
+/**
+ * Returns true when an ACP error indicates the adapter already received and
+ * processed the prompt before the error occurred (i.e. the user message is
+ * already in the conversation). Retrying would produce a duplicate.
+ *
+ * Covers:
+ * - Machine-readable `data.errorKind` from the adapter.
+ * - Text patterns for weekly / rate-limit / quota / 429 responses that may
+ *   arrive without errorKind (belt-and-suspenders fallback).
+ */
+export function isPostDeliveryAcpError(acp: OutputErrorAcpPayload): boolean {
+  const data = asRecord(acp.data);
+  const kind = data?.errorKind;
+  if (typeof kind === "string" && POST_DELIVERY_ERROR_KINDS.has(kind)) {
+    return true;
+  }
+  const lower = acp.message.toLowerCase();
+  return (
+    /\b429\b/u.test(acp.message) ||
+    ["rate limit", "quota exceeded", "usage limit", "weekly limit"].some((s) => lower.includes(s))
+  );
+}
+
 /**
  * Returns true when an error from `client.prompt()` looks transient and
  * can reasonably be retried (e.g. model-API 400/500, network hiccups that
@@ -261,9 +290,15 @@ export function isRetryablePromptError(error: unknown): boolean {
     return false;
   }
 
-  // ACP internal errors (-32603) typically wrap model-API failures → retryable.
-  // Parse errors (-32700) can also be transient.
-  return acp.code === -32603 || acp.code === -32700;
+  // ACP internal errors (-32603) and parse errors (-32700) are retryable when
+  // they represent transient pre-delivery failures. But if the adapter already
+  // received and forwarded the prompt (post-delivery error), retrying re-sends
+  // the same prompt → duplicate user message in the conversation.
+  if (acp.code === -32603 || acp.code === -32700) {
+    return !isPostDeliveryAcpError(acp);
+  }
+
+  return false;
 }
 
 function isNonRetryablePromptError(error: unknown): boolean {

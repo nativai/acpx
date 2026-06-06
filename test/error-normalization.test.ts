@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   exitCodeForOutputErrorCode,
+  isPostDeliveryAcpError,
+  isRetryablePromptError,
   normalizeOutputError,
   isAcpQueryClosedBeforeResponseError,
   isAcpResourceNotFoundError,
@@ -167,4 +169,153 @@ test("exitCodeForOutputErrorCode maps machine codes to stable exits", () => {
   assert.equal(exitCodeForOutputErrorCode("PERMISSION_DENIED"), 5);
   assert.equal(exitCodeForOutputErrorCode("PERMISSION_PROMPT_UNAVAILABLE"), 5);
   assert.equal(exitCodeForOutputErrorCode("RUNTIME"), 1);
+});
+
+// ---------------------------------------------------------------------------
+// isPostDeliveryAcpError
+// ---------------------------------------------------------------------------
+
+test("isPostDeliveryAcpError detects rate_limit errorKind", () => {
+  assert.equal(
+    isPostDeliveryAcpError({
+      code: -32603,
+      message: "turn failed",
+      data: { errorKind: "rate_limit" },
+    }),
+    true,
+  );
+});
+
+test("isPostDeliveryAcpError detects authentication_failed errorKind", () => {
+  assert.equal(
+    isPostDeliveryAcpError({
+      code: -32603,
+      message: "turn failed",
+      data: { errorKind: "authentication_failed" },
+    }),
+    true,
+  );
+});
+
+test("isPostDeliveryAcpError detects billing_error errorKind", () => {
+  assert.equal(
+    isPostDeliveryAcpError({
+      code: -32603,
+      message: "turn failed",
+      data: { errorKind: "billing_error" },
+    }),
+    true,
+  );
+});
+
+test("isPostDeliveryAcpError detects weekly limit message text (C2 bug scenario)", () => {
+  assert.equal(
+    isPostDeliveryAcpError({
+      code: -32603,
+      message: "You've hit your weekly limit · resets Jun 8, 3am (UTC)",
+    }),
+    true,
+  );
+});
+
+test("isPostDeliveryAcpError detects 429 in message", () => {
+  assert.equal(isPostDeliveryAcpError({ code: -32603, message: "HTTP 429 rate limited" }), true);
+});
+
+test("isPostDeliveryAcpError detects 'quota exceeded' in message", () => {
+  assert.equal(
+    isPostDeliveryAcpError({ code: -32603, message: "Quota exceeded for this account" }),
+    true,
+  );
+});
+
+test("isPostDeliveryAcpError detects 'usage limit' in message", () => {
+  assert.equal(
+    isPostDeliveryAcpError({ code: -32603, message: "You have hit your usage limit" }),
+    true,
+  );
+});
+
+test("isPostDeliveryAcpError returns false for generic transient message", () => {
+  assert.equal(
+    isPostDeliveryAcpError({ code: -32603, message: "Internal adapter error — model API timeout" }),
+    false,
+  );
+});
+
+test("isPostDeliveryAcpError returns false for unknown errorKind", () => {
+  assert.equal(
+    isPostDeliveryAcpError({
+      code: -32603,
+      message: "turn failed",
+      data: { errorKind: "max_output_tokens" },
+    }),
+    false,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// isRetryablePromptError — rate-limit / post-delivery cases (Bug: C2 fix)
+// ---------------------------------------------------------------------------
+
+function acpWrapped(code: number, message: string, data?: Record<string, unknown>): unknown {
+  return { acp: { code, message, data } };
+}
+
+test("isRetryablePromptError returns false for -32603 with rate_limit errorKind", () => {
+  assert.equal(
+    isRetryablePromptError(acpWrapped(-32603, "turn failed", { errorKind: "rate_limit" })),
+    false,
+  );
+});
+
+test("isRetryablePromptError returns false for -32603 with weekly limit message (C2 bug scenario)", () => {
+  assert.equal(
+    isRetryablePromptError(
+      acpWrapped(-32603, "You've hit your weekly limit · resets Jun 8, 3am (UTC)"),
+    ),
+    false,
+  );
+});
+
+test("isRetryablePromptError returns false for -32603 with authentication_failed errorKind", () => {
+  assert.equal(
+    isRetryablePromptError(
+      acpWrapped(-32603, "turn failed", { errorKind: "authentication_failed" }),
+    ),
+    false,
+  );
+});
+
+test("isRetryablePromptError returns false for -32603 with billing_error errorKind", () => {
+  assert.equal(
+    isRetryablePromptError(acpWrapped(-32603, "turn failed", { errorKind: "billing_error" })),
+    false,
+  );
+});
+
+test("isRetryablePromptError returns true for generic transient -32603 (pre-delivery crash)", () => {
+  assert.equal(
+    isRetryablePromptError(acpWrapped(-32603, "Internal adapter error — model API timeout")),
+    true,
+  );
+});
+
+test("isRetryablePromptError returns true for -32700 with no post-delivery signal", () => {
+  assert.equal(isRetryablePromptError(acpWrapped(-32700, "Parse error")), true);
+});
+
+test("isRetryablePromptError returns false for -32700 with rate_limit errorKind", () => {
+  assert.equal(
+    isRetryablePromptError(acpWrapped(-32700, "Parse error", { errorKind: "rate_limit" })),
+    false,
+  );
+});
+
+test("isRetryablePromptError returns false for permanent -32601 (method not found)", () => {
+  assert.equal(isRetryablePromptError(acpWrapped(-32601, "Method not found")), false);
+});
+
+test("isRetryablePromptError returns false for non-ACP error", () => {
+  assert.equal(isRetryablePromptError(new Error("process crash")), false);
 });
