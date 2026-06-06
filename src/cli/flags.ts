@@ -355,7 +355,7 @@ export function addGlobalFlags(command: Command): Command {
     .option("--model <id>", "Agent model id")
     .option(
       "--reasoning-effort <level>",
-      "Claude thinking depth: low, medium, or high (ignored by codex — set codex depth via --model '<model>[depth]')",
+      "Claude thinking depth: low, medium, high, xhigh, or max (ignored by codex — set codex depth via --model '<model>[depth]')",
       parseReasoningEffort,
     )
     .option(

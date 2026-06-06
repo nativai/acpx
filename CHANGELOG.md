@@ -17,6 +17,9 @@ Repo: https://github.com/openclaw/acpx
 
 - CLI/sessions: map inherited Claude effort levels to the child model's supported
   range when spawning model-overridden child sessions.
+- CLI/sessions: keep Claude effort application from failing child-session
+  creation when an adapter advertises stale effort options, including explicit
+  `--reasoning-effort xhigh|max` requests.
 
 ## 2026.5.23 (v0.10.0)
 

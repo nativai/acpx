@@ -30,7 +30,8 @@ const ORDERED_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const
 const EFFORT_LEVEL_RANKS = new Map<string, number>(
   ORDERED_EFFORT_LEVELS.map((level, index) => [level, index]),
 );
-const COMPACT_CLAUDE_EFFORT_LEVELS = new Set(["low", "medium", "high"]);
+const SONNET_CLAUDE_EFFORT_LEVELS = new Set(["low", "medium", "high"]);
+const HAIKU_CLAUDE_EFFORT_LEVELS = new Set(["high"]);
 
 export function normalizeEffortLevelForAdvertisedOption(
   requestedLevel: string,
@@ -90,7 +91,7 @@ type ConfigOptionApplyResult = {
   response?: { configOptions?: SessionConfigOption[] };
 };
 
-async function applyConfigOptionIfAdvertised(params: {
+type ConfigOptionApplyParams = {
   client: ConfigOptionApplyClient;
   sessionId: string;
   configId: string;
@@ -99,7 +100,11 @@ async function applyConfigOptionIfAdvertised(params: {
   modelId?: string;
   timeoutMs?: number;
   verbose?: boolean;
-}): Promise<ConfigOptionApplyResult | undefined> {
+};
+
+async function applyConfigOptionIfAdvertised(
+  params: ConfigOptionApplyParams,
+): Promise<ConfigOptionApplyResult | undefined> {
   const option = params.advertised.find((entry) => entry.id === params.configId);
   if (!option || option.type !== "select") {
     return undefined; // not advertised, or not a selectable option (e.g. codex effort)
@@ -121,11 +126,46 @@ async function applyConfigOptionIfAdvertised(params: {
   if (option.currentValue === value) {
     return { value }; // already at the normalized value
   }
-  const response = await withTimeout(
-    params.client.setSessionConfigOption(params.sessionId, params.configId, value),
-    params.timeoutMs,
+  const response = await setConfigOptionWithEffortFallback(params, option, value);
+  return { value: response.value, response: response.response };
+}
+
+async function setConfigOptionWithEffortFallback(
+  params: ConfigOptionApplyParams,
+  option: SessionConfigOption,
+  value: string,
+): Promise<ConfigOptionApplyResult> {
+  try {
+    const response = await withTimeout(
+      params.client.setSessionConfigOption(params.sessionId, params.configId, value),
+      params.timeoutMs,
+    );
+    return { value, response };
+  } catch (error) {
+    if (params.configId !== "effort") {
+      throw error;
+    }
+    return rejectedEffortFallback(option, params.modelId, value, params.verbose);
+  }
+}
+
+function rejectedEffortFallback(
+  option: SessionConfigOption,
+  modelId: string | undefined,
+  value: string,
+  verbose: boolean | undefined,
+): ConfigOptionApplyResult {
+  const fallback = advertisedDefaultEffort(
+    option,
+    effortLevelsForModel(modelId) ?? selectableValues(option),
+    modelId,
   );
-  return { value, response };
+  if (verbose) {
+    process.stderr.write(
+      `[acpx] config option effort=${value} was rejected by the agent; keeping ${fallback ?? "default"}\n`,
+    );
+  }
+  return { value: fallback ?? value };
 }
 
 /**
@@ -326,12 +366,16 @@ function effortLevelsForModel(modelId: string | undefined): ReadonlySet<string> 
   if (!model) {
     return undefined;
   }
-  // The Claude adapter may report the broad Opus effort list in session/new even
-  // when `--model sonnet|haiku` was requested, but session/set_config_option is
-  // stricter and rejects xhigh/max for those compact models. Use the effective
-  // child model id as a documented fallback when the live advertisement is stale.
-  if (model.includes("sonnet") || model.includes("haiku")) {
-    return COMPACT_CLAUDE_EFFORT_LEVELS;
+  // The Claude adapter may report stale/broad effort lists in session/new. The
+  // follow-up session/set_config_option call is stricter: sonnet accepts the
+  // compact low/medium/high set, while haiku currently advertises broad levels
+  // but rejects effort mutation outright. Keep haiku at its advertised default
+  // `high` so spawn-time effort never aborts the child session.
+  if (model.includes("haiku")) {
+    return HAIKU_CLAUDE_EFFORT_LEVELS;
+  }
+  if (model.includes("sonnet")) {
+    return SONNET_CLAUDE_EFFORT_LEVELS;
   }
   return undefined;
 }

@@ -158,11 +158,13 @@ test("flag parsers reject invalid enum values with actionable messages", () => {
   assert.equal(parseReasoningEffort("low"), "low");
   assert.equal(parseReasoningEffort("medium"), "medium");
   assert.equal(parseReasoningEffort("high"), "high");
+  assert.equal(parseReasoningEffort("xhigh"), "xhigh");
+  assert.equal(parseReasoningEffort("max"), "max");
   assert.equal(parseReasoningEffort(" HIGH "), "high");
-  for (const bad of ["xhigh", "max", "default", ""]) {
+  for (const bad of ["default", ""]) {
     assert.throws(
       () => parseReasoningEffort(bad),
-      /Invalid reasoning effort.*low, medium, high/,
+      /Invalid reasoning effort.*low, medium, high, xhigh, max/,
       `expected ${JSON.stringify(bad)} to be rejected`,
     );
   }

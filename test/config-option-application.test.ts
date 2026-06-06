@@ -46,6 +46,17 @@ function mockClient(responseOptions?: SessionConfigOption[]): {
   };
 }
 
+function rejectingMockClient(error: Error): ReturnType<typeof mockClient> {
+  const calls: Call[] = [];
+  return {
+    calls,
+    setSessionConfigOption(sessionId, configId, value) {
+      calls.push({ sessionId, configId, value });
+      return Promise.reject(error);
+    },
+  };
+}
+
 function recordWithDesired(desired?: Record<string, string>): SessionRecord {
   return {
     acpx: desired ? { desired_config_options: { ...desired } } : {},
@@ -61,6 +72,8 @@ test("normalizeEffortLevelForAdvertisedOption: clamps xhigh/max to high for low/
 test("normalizeEffortLevelForAdvertisedOption: child model id overrides stale broad advertisements", () => {
   const staleOption = effortOption("high", OPUS_EFFORT_LEVELS);
   assert.equal(normalizeEffortLevelForAdvertisedOption("xhigh", staleOption, "sonnet"), "high");
+  assert.equal(normalizeEffortLevelForAdvertisedOption("low", staleOption, "haiku"), "high");
+  assert.equal(normalizeEffortLevelForAdvertisedOption("medium", staleOption, "haiku"), "high");
   assert.equal(normalizeEffortLevelForAdvertisedOption("max", staleOption, "haiku"), "high");
 });
 
@@ -76,6 +89,7 @@ test("normalizeEffortLevelForAdvertisedOption: passes through supported effort l
 test("normalizeEffortLevelForModel: maps compact Claude model efforts without advertised options", () => {
   assert.equal(normalizeEffortLevelForModel("xhigh", "sonnet"), "high");
   assert.equal(normalizeEffortLevelForModel("future-ultra", "haiku"), "high");
+  assert.equal(normalizeEffortLevelForModel("low", "claude-haiku-4-5"), "high");
   assert.equal(normalizeEffortLevelForModel("xhigh", "opus[1m]"), undefined);
 });
 
@@ -155,6 +169,33 @@ test("applyRequestedConfigOptionsIfAdvertised: maps stale broad effort advertise
   });
   assert.equal(getDesiredConfigOptions(record.acpx).effort, "high");
   assert.equal(client.calls.length, 0);
+});
+
+test("applyRequestedConfigOptionsIfAdvertised: keeps haiku at default when advertisement is stale", async () => {
+  const client = mockClient();
+  const record = recordWithDesired({ effort: "low" });
+  await applyRequestedConfigOptionsIfAdvertised({
+    client,
+    sessionId: "s1",
+    record,
+    advertised: [effortOption("high", OPUS_EFFORT_LEVELS)],
+    modelId: "claude-haiku-4-5",
+  });
+  assert.equal(getDesiredConfigOptions(record.acpx).effort, "high");
+  assert.equal(client.calls.length, 0);
+});
+
+test("applyRequestedConfigOptionsIfAdvertised: rejected effort set falls back to default", async () => {
+  const client = rejectingMockClient(new Error("Unknown config option: effort"));
+  const record = recordWithDesired({ effort: "low" });
+  await applyRequestedConfigOptionsIfAdvertised({
+    client,
+    sessionId: "s1",
+    record,
+    advertised: [effortOption("high", OPUS_EFFORT_LEVELS)],
+  });
+  assert.equal(getDesiredConfigOptions(record.acpx).effort, "high");
+  assert.deepEqual(client.calls, [{ sessionId: "s1", configId: "effort", value: "low" }]);
 });
 
 test("applyRequestedConfigOptionsIfAdvertised: unknown effort falls back to the advertised default", async () => {
@@ -239,6 +280,21 @@ test("persistAndApplyRequestedEffort: persists mapped effort when the requested 
   });
   assert.equal(getDesiredConfigOptions(record.acpx).effort, "high");
   assert.deepEqual(client.calls, [{ sessionId: "s1", configId: "effort", value: "high" }]);
+});
+
+test("persistAndApplyRequestedEffort: maps haiku effort to default without sending rejected set", async () => {
+  const client = mockClient();
+  const record = recordWithDesired();
+  await persistAndApplyRequestedEffort({
+    client,
+    sessionId: "s1",
+    record,
+    reasoningEffort: "low",
+    advertised: [effortOption("high", OPUS_EFFORT_LEVELS)],
+    modelId: "haiku",
+  });
+  assert.equal(getDesiredConfigOptions(record.acpx).effort, "high");
+  assert.equal(client.calls.length, 0);
 });
 
 test("persistAndApplyRequestedEffort: never writes effort when the agent has no effort option", async () => {
