@@ -97,6 +97,31 @@ type PromptCall = {
   messageId?: string;
 };
 
+function eventMethod(event: unknown): string | undefined {
+  if (typeof event !== "object" || event === null) {
+    return undefined;
+  }
+  const method = (event as { method?: unknown }).method;
+  return typeof method === "string" ? method : undefined;
+}
+
+function eventParams(event: unknown): Record<string, unknown> {
+  if (typeof event !== "object" || event === null) {
+    return {};
+  }
+  const params = (event as { params?: unknown }).params;
+  if (typeof params !== "object" || params === null || Array.isArray(params)) {
+    return {};
+  }
+  return params as Record<string, unknown>;
+}
+
+function turnPhases(events: unknown[]): unknown[] {
+  return events
+    .filter((event) => eventMethod(event) === "acpx/turn")
+    .map((event) => eventParams(event).phase);
+}
+
 type MockClientControl = {
   client: AcpClient;
   promptCalls: PromptCall[];
@@ -568,6 +593,143 @@ test("mid-turn prompt injection fires and settles exactly once, including across
   await runFireAndForgetInjectionWithoutTerminalResponseScenario();
 });
 
+test("runQueuedTask emits active before prompt execution and idle after completion", async () => {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeSessionRecord(homeDir);
+      await writeSessionRecordFile(homeDir, record);
+
+      let activeSeenInsidePrompt = false;
+      const control = makeMockClient({
+        onMainPrompt: async () => {
+          const events = await listSessionEvents(record.acpxRecordId);
+          const phases = turnPhases(events);
+          assert.deepEqual(phases, ["active"]);
+          const turnParams = eventParams(
+            events.find((event) => eventMethod(event) === "acpx/turn"),
+          );
+          assert.equal(turnParams.sessionId, record.acpxRecordId);
+          assert.equal(typeof turnParams.at, "string");
+          activeSeenInsidePrompt = true;
+          return { stopReason: "end_turn" };
+        },
+        onInjectedPrompt: async () => ({ stopReason: "end_turn" }),
+      });
+
+      const mainSends: QueueOwnerMessage[] = [];
+      const mainTask = makeQueueTask(
+        "req-turn-markers",
+        MAIN_PROMPT_TEXT,
+        (message) => mainSends.push(message),
+        () => {},
+      );
+
+      await runQueuedTask(record.acpxRecordId, mainTask, {
+        sharedClient: control.client,
+        suppressSdkConsoleErrors: true,
+      });
+
+      assert.equal(activeSeenInsidePrompt, true);
+      assert.ok(mainSends.find((message) => message.type === "result"));
+
+      const events = await listSessionEvents(record.acpxRecordId);
+      assert.deepEqual(turnPhases(events), ["active", "idle"]);
+      const idleParams = eventParams(
+        events.findLast((event) => eventMethod(event) === "acpx/turn"),
+      );
+      assert.equal(idleParams.sessionId, record.acpxRecordId);
+      assert.equal(typeof idleParams.at, "string");
+    });
+  });
+});
+
+test("idle marker waits for pending mid-turn injected prompt drain", async () => {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeSessionRecord(homeDir);
+      await writeSessionRecordFile(homeDir, record);
+
+      const injectionInitiated = createDeferred<void>();
+      const mainReturned = createDeferred<void>();
+      const injectedResponse = createDeferred<PromptResponse>();
+      const mainMessageId = "33333333-3333-4333-8333-333333333333";
+      const injectedMessageId = "44444444-4444-4444-8444-444444444444";
+      const control = makeMockClient({
+        onMainPrompt: async () => {
+          await injectionInitiated.promise;
+          mainReturned.resolve();
+          return { stopReason: "end_turn" };
+        },
+        onInjectedPrompt: async () => {
+          injectionInitiated.resolve();
+          return await injectedResponse.promise;
+        },
+      });
+
+      const injectedSends: QueueOwnerMessage[] = [];
+      const midTurn = makeMidTurnControl((registration, ctrl) => {
+        if (registration === 1) {
+          const injectedTask = makeQueueTask(
+            "req-injected-turn-marker",
+            INJECTED_PROMPT_TEXT,
+            (message) => injectedSends.push(message),
+            () => {},
+            true,
+            injectedMessageId,
+          );
+          queueMicrotask(() => {
+            ctrl.currentHandler?.(injectedTask);
+          });
+        }
+      });
+
+      const mainSends: QueueOwnerMessage[] = [];
+      const mainTask = makeQueueTask(
+        "req-main-turn-marker",
+        MAIN_PROMPT_TEXT,
+        (message) => mainSends.push(message),
+        () => {},
+        true,
+        mainMessageId,
+      );
+
+      const runPromise = runQueuedTask(record.acpxRecordId, mainTask, {
+        sharedClient: control.client,
+        setMidTurnHandler: midTurn.setMidTurnHandler,
+        suppressSdkConsoleErrors: true,
+      });
+
+      await mainReturned.promise;
+      await tick();
+      try {
+        const eventsBeforeInjectedDrain = await listSessionEvents(record.acpxRecordId);
+        assert.deepEqual(turnPhases(eventsBeforeInjectedDrain), ["active"]);
+        assert.equal(
+          mainSends.find((message) => message.type === "result"),
+          undefined,
+          "main result must wait for injected prompt drain",
+        );
+      } finally {
+        injectedResponse.resolve({ stopReason: "end_turn" });
+      }
+
+      await runPromise;
+
+      assert.ok(mainSends.find((message) => message.type === "result"));
+      assert.ok(injectedSends.find((message) => message.type === "result"));
+
+      const events = await listSessionEvents(record.acpxRecordId);
+      assert.deepEqual(turnPhases(events), ["active", "idle"]);
+      const idleIndex = events.findLastIndex((event) => eventMethod(event) === "acpx/turn");
+      const lastDeliveryIndex = events.findLastIndex(
+        (event) => eventMethod(event) === "acpx/delivery",
+      );
+      assert.ok(lastDeliveryIndex >= 0);
+      assert.ok(idleIndex > lastDeliveryIndex);
+    });
+  });
+});
+
 test("mid-turn prompt injection threads messageId and emits delivery events", async () => {
   await withNoUnhandledRejections(async () => {
     await withTempHome(async (homeDir) => {
@@ -642,7 +804,18 @@ test("mid-turn prompt injection threads messageId and emits delivery events", as
       assert.deepEqual(userIds, [mainMessageId, injectedMessageId]);
       assert.equal(typeof stored.lastPromptAt, "string");
 
-      const deliveryEvents = (await listSessionEvents(record.acpxRecordId))
+      const streamEvents = await listSessionEvents(record.acpxRecordId);
+      assert.deepEqual(turnPhases(streamEvents), ["active", "idle"]);
+      const idleIndex = streamEvents.findLastIndex((event) => eventMethod(event) === "acpx/turn");
+      const lastDeliveryIndex = streamEvents.findLastIndex(
+        (event) => eventMethod(event) === "acpx/delivery",
+      );
+      assert.ok(
+        idleIndex > lastDeliveryIndex,
+        "idle marker must be emitted after main and injected delivery events drain",
+      );
+
+      const deliveryEvents = streamEvents
         .filter((event) => (event as { method?: string }).method === "acpx/delivery")
         .map((event) => (event as { params: Record<string, unknown> }).params);
 
