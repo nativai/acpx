@@ -3635,69 +3635,6 @@ test("integration: sessions recover force-kills the queue owner, is idempotent, 
   });
 });
 
-test("integration: --keep-warm/--ttl on a prompt extends an already-running owner's idle TTL", async () => {
-  await withTempHome(async (homeDir) => {
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
-
-    try {
-      const created = await runCli(
-        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
-        homeDir,
-      );
-      assert.equal(created.code, 0, created.stderr);
-      const sessionId = (JSON.parse(created.stdout.trim()) as { acpxRecordId?: string })
-        .acpxRecordId;
-      assert.equal(typeof sessionId, "string");
-
-      // 1. Spawn an owner with a SHORT idle TTL (2s). Without keep-warm it would
-      //    idle-die ~2s after the last prompt.
-      const first = await runCli(
-        [...baseAgentArgs(cwd), "--format", "json", "--ttl", "2", "prompt", "--no-wait", "echo a"],
-        homeDir,
-      );
-      assert.equal(first.code, 0, first.stderr);
-
-      const { lockPath } = queuePaths(homeDir, sessionId as string);
-      const ownerPid = await waitFor(async () => {
-        try {
-          const pid = (JSON.parse(await fs.readFile(lockPath, "utf8")) as { pid?: number }).pid;
-          return typeof pid === "number" && isPidAlive(pid) ? pid : null;
-        } catch {
-          return null;
-        }
-      }, 10_000);
-
-      // 2. Send a keep-warm prompt with a long idle TTL (30s) to the SAME live
-      //    owner. The override must extend the running owner's idle TTL.
-      const second = await runCli(
-        [...baseAgentArgs(cwd), "--format", "json", "--ttl", "30", "prompt", "--no-wait", "echo b"],
-        homeDir,
-      );
-      assert.equal(second.code, 0, second.stderr);
-      const ownerPidAfter = (JSON.parse(await fs.readFile(lockPath, "utf8")) as { pid?: number })
-        .pid;
-      assert.equal(
-        ownerPidAfter,
-        ownerPid,
-        "expected the same owner to handle the keep-warm prompt",
-      );
-
-      // 3. Wait well past the original 2s TTL but far short of the 30s override.
-      await sleep(5_000);
-
-      // The owner must still be alive: the keep-warm override extended its TTL.
-      assert.equal(isPidAlive(ownerPid), true, "owner idle-died despite keep-warm TTL extension");
-    } finally {
-      // `sessions close` terminates the (still-warm) queue owner so the test
-      // does not leak the process.
-      await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "close"], homeDir).catch(
-        () => {},
-      );
-      await fs.rm(cwd, { recursive: true, force: true });
-    }
-  });
-});
-
 test("integration: sessions history shows in-flight prompt after prompt starts", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));

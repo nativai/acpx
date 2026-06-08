@@ -38,7 +38,6 @@ function config(overrides: Partial<ResolvedAcpxConfig> = {}): ResolvedAcpxConfig
     nonInteractivePermissions: "deny",
     authPolicy: "skip",
     ttlMs: 300_000,
-    keepWarmTtlMs: 1_800_000,
     queueMaxDepth: 16,
     format: "text",
     agents: {},
@@ -309,20 +308,10 @@ test("resolveGlobalFlags ignores malformed dynamic options and keeps typed confi
   assert.equal(flags.promptRetries, undefined);
 });
 
-test("resolveGlobalFlags resolves --keep-warm / favorited --ttl 0 into ttl + ttlExplicitMs", () => {
-  const cfg = { ttlMs: 300_000, keepWarmTtlMs: 1_800_000 };
+test("resolveGlobalFlags resolves explicit --ttl into ttl + ttlExplicitMs", () => {
+  const cfg = { ttlMs: 300_000 };
 
-  // --keep-warm (no explicit --ttl): use the configured keep-warm TTL for both
-  // the spawn ttl and the live-owner override.
-  const keepWarm = resolveGlobalFlags(commandWithOptions({ keepWarm: true }), config(cfg));
-  assert.equal(keepWarm.ttl, 1_800_000);
-  assert.equal(keepWarm.ttlExplicitMs, 1_800_000);
-
-  // Explicit --ttl wins over --keep-warm.
-  const explicit = resolveGlobalFlags(
-    commandWithOptions({ ttl: 45_000, keepWarm: true }),
-    config(cfg),
-  );
+  const explicit = resolveGlobalFlags(commandWithOptions({ ttl: 45_000 }), config(cfg));
   assert.equal(explicit.ttl, 45_000);
   assert.equal(explicit.ttlExplicitMs, 45_000);
 
@@ -331,7 +320,7 @@ test("resolveGlobalFlags resolves --keep-warm / favorited --ttl 0 into ttl + ttl
   assert.equal(favorited.ttl, 0);
   assert.equal(favorited.ttlExplicitMs, 0);
 
-  // Plain prompt: NO explicit override, so a running owner's TTL is never disturbed.
+  // Plain prompt: no explicit --ttl.
   const plain = resolveGlobalFlags(commandWithOptions({}), config(cfg));
   assert.equal(plain.ttl, 300_000);
   assert.equal(plain.ttlExplicitMs, undefined);
