@@ -5,6 +5,7 @@ import {
   handleExec,
   handlePrompt,
   handleSessionsClose,
+  handleSessionsCopy,
   handleSessionsEnsure,
   handleSessionsExport,
   handleSessionsHistory,
@@ -27,12 +28,14 @@ import {
   addSessionNameOption,
   addSessionOption,
   parseDaysOlderThan,
+  parseForkAtIndex,
   parseMessageId,
   parseMetadataEntry,
   parseNonEmptyValue,
   parsePruneBeforeDate,
   parseSessionName,
   type PromptFlags,
+  type SessionsCopyFlags,
   type SessionsExportFlags,
   type SessionsHistoryFlags,
   type SessionsImportFlags,
@@ -162,6 +165,31 @@ export function registerSessionsCommand(
     .argument("[name]", "Session name", parseSessionName)
     .action(async function (this: Command, name?: string) {
       await handleSessionsClose(explicitAgentName, name, this, config);
+    });
+
+  sessionsCommand
+    .command("copy")
+    .alias("fork")
+    .description("Copy/fork a session with the source agent type")
+    .requiredOption(
+      "--from <id>",
+      "Source session id (acpx record id, ACP session id, or unique suffix)",
+      (value: string) => parseNonEmptyValue("Source session id", value),
+    )
+    .option(
+      "--at-index <n>",
+      "Truncate the copy at acpx message index N (omit = full copy)",
+      parseForkAtIndex,
+    )
+    .option("-s, --name <name>", "Name for the copied session", parseSessionName)
+    .option(
+      "--metadata <key=value>",
+      "Set a metadata entry on the copied session (repeatable)",
+      parseMetadataEntry,
+    )
+    .option("--ephemeral", "Mark the copy as a by-the-way ephemeral side-thread")
+    .action(async function (this: Command, flags: SessionsCopyFlags) {
+      await handleSessionsCopy(explicitAgentName, flags, this, config);
     });
 
   sessionsCommand

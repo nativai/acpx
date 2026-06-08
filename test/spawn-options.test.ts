@@ -148,31 +148,41 @@ test("buildAgentSpawnOptions injects ACPX_PARENT_SESSION_URL when parentSessionI
 });
 
 test("buildAgentSpawnOptions omits ACPX_PARENT_SESSION_URL when parentSessionId is null/undefined/whitespace", () => {
-  const nullCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
-    acpxRecordId: "child-id",
-    parentSessionId: null,
-  });
-  assert.equal(
-    Object.prototype.hasOwnProperty.call(nullCase.env, "ACPX_PARENT_SESSION_URL"),
-    false,
-  );
+  const previousParentUrl = process.env.ACPX_PARENT_SESSION_URL;
+  delete process.env.ACPX_PARENT_SESSION_URL;
+  try {
+    const nullCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+      parentSessionId: null,
+    });
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(nullCase.env, "ACPX_PARENT_SESSION_URL"),
+      false,
+    );
 
-  const undefinedCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
-    acpxRecordId: "child-id",
-  });
-  assert.equal(
-    Object.prototype.hasOwnProperty.call(undefinedCase.env, "ACPX_PARENT_SESSION_URL"),
-    false,
-  );
+    const undefinedCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+    });
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(undefinedCase.env, "ACPX_PARENT_SESSION_URL"),
+      false,
+    );
 
-  const whitespaceCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
-    acpxRecordId: "child-id",
-    parentSessionId: "   ",
-  });
-  assert.equal(
-    Object.prototype.hasOwnProperty.call(whitespaceCase.env, "ACPX_PARENT_SESSION_URL"),
-    false,
-  );
+    const whitespaceCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+      parentSessionId: "   ",
+    });
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(whitespaceCase.env, "ACPX_PARENT_SESSION_URL"),
+      false,
+    );
+  } finally {
+    if (previousParentUrl === undefined) {
+      delete process.env.ACPX_PARENT_SESSION_URL;
+    } else {
+      process.env.ACPX_PARENT_SESSION_URL = previousParentUrl;
+    }
+  }
 });
 
 test("buildAgentSpawnOptions honors ACPX_UI_BASE_URL override for both URL vars", () => {
@@ -787,7 +797,7 @@ test("resolveClaudeCodeExecutable returns undefined when claude is not on PATH",
 // --- CLAUDE_CONFIG_DIR resolution (registry `default` governs unselected sessions) ---
 // Hermetic: every case injects a temp registry + real temp configDirs via the
 // 4th `lookupOptions` arg, so NONE of these read this box's real ~/.acpx (which
-// has default=sub2). The ambient CLAUDE_CONFIG_DIR is scrubbed so ABSENT
+// has default=sub2). Ambient Claude subscription env is scrubbed so ABSENT
 // assertions are meaningful regardless of how the test runner was launched.
 
 type SubsHomeContext = {
@@ -800,7 +810,9 @@ async function withSubscriptionsHome(
   run: (ctx: SubsHomeContext) => Promise<void>,
 ): Promise<void> {
   const previousClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
+  const previousAcpxSubscription = process.env.ACPX_SUBSCRIPTION;
   delete process.env.CLAUDE_CONFIG_DIR;
+  delete process.env.ACPX_SUBSCRIPTION;
   const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-spawn-subs-"));
   try {
     const subsDir = path.join(homeDir, ".acpx", "subscriptions");
@@ -822,6 +834,11 @@ async function withSubscriptionsHome(
       delete process.env.CLAUDE_CONFIG_DIR;
     } else {
       process.env.CLAUDE_CONFIG_DIR = previousClaudeConfigDir;
+    }
+    if (previousAcpxSubscription === undefined) {
+      delete process.env.ACPX_SUBSCRIPTION;
+    } else {
+      process.env.ACPX_SUBSCRIPTION = previousAcpxSubscription;
     }
   }
 }

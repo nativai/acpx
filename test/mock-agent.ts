@@ -8,6 +8,8 @@ import {
   AgentSideConnection,
   type CloseSessionRequest,
   type CloseSessionResponse,
+  type ForkSessionRequest,
+  type ForkSessionResponse,
   PROTOCOL_VERSION,
   RequestError,
   ndJsonStream,
@@ -50,6 +52,7 @@ type MockAgentOptions = {
   resumeSessionMeta?: Record<string, string>;
   supportsLoadSession: boolean;
   supportsResumeSession: boolean;
+  supportsForkSession: boolean;
   supportsCloseSession: boolean;
   supportsListSessions: boolean;
   listPageSize: number;
@@ -69,6 +72,7 @@ type MockAgentOptions = {
   ignoreSigterm: boolean;
   envDumpFile?: string;
   claudeAgentAcp: boolean;
+  expectedForkMeta?: unknown;
 };
 
 type SessionState = {
@@ -115,6 +119,29 @@ function toErrorMessage(error: unknown): string {
     }
   }
   return String(error);
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => stableJson(entry)).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).toSorted(([left], [right]) =>
+      left.localeCompare(right),
+    );
+    return `{${entries
+      .map(([key, entry]) => `${JSON.stringify(key)}:${stableJson(entry)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "undefined";
+}
+
+function assertJsonEqual(actual: unknown, expected: unknown, label: string): void {
+  const actualJson = stableJson(actual);
+  const expectedJson = stableJson(expected);
+  if (actualJson !== expectedJson) {
+    throw new Error(`Unexpected ${label}: expected ${expectedJson}, received ${actualJson}`);
+  }
 }
 
 function getPromptText(prompt: ContentBlock[]): string {
@@ -354,6 +381,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   const resumeSessionMeta: Record<string, string> = {};
   let supportsLoadSession = false;
   let supportsResumeSession = false;
+  let supportsForkSession = false;
   let supportsCloseSession = false;
   let supportsListSessions = false;
   let listPageSize = 100;
@@ -374,6 +402,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let hangOnNewSession = false;
   let envDumpFile: string | undefined;
   let claudeAgentAcp = false;
+  let expectedForkMeta: unknown;
 
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
@@ -385,6 +414,11 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
 
     if (token === "--supports-resume-session") {
       supportsResumeSession = true;
+      continue;
+    }
+
+    if (token === "--supports-fork-session") {
+      supportsForkSession = true;
       continue;
     }
 
@@ -494,6 +528,13 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    if (token === "--expect-fork-meta-json") {
+      const rawValue = parseOptionValue(argv, index + 1, token);
+      expectedForkMeta = JSON.parse(rawValue) as unknown;
+      index += 1;
+      continue;
+    }
+
     if (token === "--load-replay-text") {
       supportsLoadSession = true;
       replayLoadSessionUpdates = true;
@@ -533,6 +574,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       Object.keys(resumeSessionMeta).length > 0 ? { ...resumeSessionMeta } : undefined,
     supportsLoadSession,
     supportsResumeSession,
+    supportsForkSession,
     supportsCloseSession,
     supportsListSessions,
     listPageSize,
@@ -552,6 +594,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     ignoreSigterm,
     envDumpFile,
     claudeAgentAcp,
+    expectedForkMeta,
   };
 }
 
@@ -778,6 +821,7 @@ class MockAgent implements Agent {
       ...(this.options.supportsCloseSession ? { close: {} } : {}),
       ...(this.options.supportsListSessions ? { list: {} } : {}),
       ...(this.options.supportsResumeSession ? { resume: {} } : {}),
+      ...(this.options.supportsForkSession ? { fork: {} } : {}),
     };
     return {
       protocolVersion: PROTOCOL_VERSION,
@@ -874,6 +918,32 @@ class MockAgent implements Agent {
     this.sessions.set(params.sessionId, existing ?? createSessionState(false));
 
     return this.buildSessionReconnectResponse(params.sessionId, this.options.resumeSessionMeta);
+  }
+
+  async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+    if (!this.options.supportsForkSession) {
+      throw RequestError.methodNotFound("session/fork");
+    }
+    if (this.options.expectedForkMeta !== undefined) {
+      assertJsonEqual(params._meta ?? null, this.options.expectedForkMeta, "fork _meta");
+    }
+
+    const source = this.sessions.get(params.sessionId);
+    const sessionId = randomUUID();
+    const forkState = source ?? createSessionState(false);
+    this.sessions.set(sessionId, forkState);
+
+    return {
+      sessionId,
+      _meta: {
+        agentSessionId: `forked-runtime-${sessionId}`,
+        receivedMeta: params._meta ?? null,
+      },
+      ...(this.options.advertiseModels ? { models: buildModelsState(DEFAULT_MODEL_ID) } : {}),
+      ...(this.options.advertiseConfigOptions
+        ? { configOptions: buildConfigOptions(forkState, this.options) }
+        : {}),
+    };
   }
 
   private buildSessionReconnectResponse(

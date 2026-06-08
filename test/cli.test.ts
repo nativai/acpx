@@ -15,6 +15,7 @@ import {
   parseMaxTurns,
   parseTtlSeconds,
 } from "../src/cli.js";
+import { transcriptJsonlPath } from "../src/config/subscription-transcript.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence.js";
 import type { SessionRecord } from "../src/types.js";
 import {
@@ -62,6 +63,7 @@ const MOCK_AGENT_WITH_DISTINCT_CREATE_AND_LOAD_RUNTIME_SESSION_IDS =
 const MOCK_AGENT_WITH_LOAD_FALLBACK = `${MOCK_AGENT_COMMAND} --supports-load-session --load-session-fails-on-empty`;
 const MOCK_AGENT_WITH_LOAD_SESSION_NOT_FOUND = `${MOCK_AGENT_COMMAND} --supports-load-session --load-session-not-found`;
 const MOCK_AGENT_WITH_LOAD_FALLBACK_AND_MODE_FAILURE = `${MOCK_AGENT_COMMAND} --supports-load-session --load-session-fails-on-empty --set-session-mode-fails`;
+const MOCK_AGENT_WITH_FORK_SESSION = `${MOCK_AGENT_COMMAND} --supports-fork-session`;
 const MOCK_AGENT_WITH_SET_MODE_INVALID_PARAMS = `${MOCK_AGENT_COMMAND} --set-session-mode-invalid-params`;
 const MOCK_AGENT_WITH_SET_CONFIG_INVALID_PARAMS = `${MOCK_AGENT_COMMAND} --set-session-config-invalid-params`;
 
@@ -519,6 +521,597 @@ test("sessions new --resume-session surfaces not-found loadSession errors withou
     const sessionsDir = path.join(homeDir, ".acpx", "sessions");
     const entries = await fs.readdir(sessionsDir).catch(() => [] as string[]);
     assert.equal(entries.includes(`${encodeURIComponent(resumeSessionId)}.json`), false);
+  });
+});
+
+test("sessions copy creates a full same-agent copy with lineage and metadata", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          agents: {
+            codex: {
+              command: MOCK_AGENT_WITH_FORK_SESSION,
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    const messages: SessionRecord["messages"] = [
+      { User: { id: "user-1", content: [{ Text: "remember alpha" }] } },
+      { Agent: { content: [{ Text: "alpha noted" }], tool_results: {} } },
+    ];
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "source-copy",
+      acpSessionId: "source-acp-copy",
+      agentCommand: MOCK_AGENT_WITH_FORK_SESSION,
+      cwd,
+      name: "source",
+      lastSeq: messages.length,
+      messages,
+      acpx: {
+        session_options: {
+          subscription: "sub1",
+          allowed_tools: ["Read", "Grep"],
+          max_turns: 3,
+          system_prompt: "stay on task",
+        },
+        desired_config_options: {
+          effort: "high",
+          custom: "keep-me",
+        },
+      },
+    });
+
+    const result = await runCli(
+      [
+        "--format",
+        "json",
+        "codex",
+        "sessions",
+        "copy",
+        "--from",
+        "source-copy",
+        "--name",
+        "copied",
+        "--metadata",
+        "task_folder=/wisdom/task",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+
+    const payload = JSON.parse(result.stdout.trim()) as {
+      action?: unknown;
+      acpxRecordId?: unknown;
+      acpxSessionId?: unknown;
+      agentSessionId?: unknown;
+      sourceSessionId?: unknown;
+      forkedAtMessageIndex?: unknown;
+    };
+    assert.equal(payload.action, "session_copied");
+    assert.equal(payload.sourceSessionId, "source-copy");
+    assert.equal(payload.forkedAtMessageIndex, messages.length);
+    assert.equal(typeof payload.acpxRecordId, "string");
+    assert.notEqual(payload.acpxSessionId, payload.agentSessionId);
+    assert.match(String(payload.acpxSessionId), /^[0-9a-f-]{36}$/);
+    assert.match(String(payload.agentSessionId), /^forked-runtime-/);
+
+    const stored = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, String(payload.acpxRecordId)), "utf8"),
+    ) as {
+      acp_session_id?: unknown;
+      agent_session_id?: unknown;
+      agent_command?: unknown;
+      cwd?: unknown;
+      name?: unknown;
+      last_seq?: unknown;
+      forked_from_session_id?: unknown;
+      forked_at_message_index?: unknown;
+      metadata?: Record<string, unknown>;
+      messages?: unknown[];
+      acpx?: {
+        session_options?: {
+          subscription?: unknown;
+          allowed_tools?: unknown;
+          max_turns?: unknown;
+          system_prompt?: unknown;
+        };
+        desired_config_options?: Record<string, unknown>;
+      };
+    };
+    assert.equal(stored.acp_session_id, payload.acpxSessionId);
+    assert.equal(stored.agent_session_id, payload.agentSessionId);
+    assert.equal(stored.agent_command, MOCK_AGENT_WITH_FORK_SESSION);
+    assert.equal(stored.cwd, cwd);
+    assert.equal(stored.name, "copied");
+    assert.equal(stored.last_seq, 0);
+    assert.equal(stored.forked_from_session_id, "source-copy");
+    assert.equal(stored.forked_at_message_index, messages.length);
+    assert.equal(stored.metadata?.task_folder, "/wisdom/task");
+    assert.deepEqual(stored.messages, messages);
+    assert.equal(stored.acpx?.session_options?.subscription, "sub1");
+    assert.deepEqual(stored.acpx?.session_options?.allowed_tools, ["Read", "Grep"]);
+    assert.equal(stored.acpx?.session_options?.max_turns, 3);
+    assert.equal(stored.acpx?.session_options?.system_prompt, "stay on task");
+    assert.equal(stored.acpx?.desired_config_options?.effort, "high");
+    assert.equal(stored.acpx?.desired_config_options?.custom, "keep-me");
+  });
+});
+
+test("sessions copy --at-index 0 creates an empty Claude copy with lineage", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const claudeCommand = `${MOCK_AGENT_COMMAND} --claude-agent-acp --supports-fork-session`;
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          agents: {
+            claude: {
+              command: claudeCommand,
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "source-claude-zero",
+      acpSessionId: "source-acp-claude-zero",
+      agentCommand: claudeCommand,
+      cwd,
+      messages: [
+        { User: { id: "user-1", content: [{ Text: "first" }] } },
+        { Agent: { content: [{ Text: "second" }], tool_results: {} } },
+      ],
+      lastSeq: 2,
+    });
+
+    const result = await runCli(
+      [
+        "--format",
+        "json",
+        "claude",
+        "sessions",
+        "copy",
+        "--from",
+        "source-claude-zero",
+        "--at-index",
+        "0",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+
+    const payload = JSON.parse(result.stdout.trim()) as {
+      acpxRecordId?: unknown;
+      forkedAtMessageIndex?: unknown;
+    };
+    assert.equal(payload.forkedAtMessageIndex, 0);
+    assert.equal(typeof payload.acpxRecordId, "string");
+
+    const stored = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, String(payload.acpxRecordId)), "utf8"),
+    ) as {
+      forked_from_session_id?: unknown;
+      forked_at_message_index?: unknown;
+      messages?: unknown[];
+    };
+    assert.equal(stored.forked_from_session_id, "source-claude-zero");
+    assert.equal(stored.forked_at_message_index, 0);
+    assert.deepEqual(stored.messages, []);
+  });
+});
+
+test("sessions copy --at-index --ephemeral truncates messages and stamps byway metadata", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          agents: {
+            codex: {
+              command: MOCK_AGENT_WITH_FORK_SESSION,
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    const messages: SessionRecord["messages"] = [
+      { User: { id: "user-1", content: [{ Text: "first" }] } },
+      { Agent: { content: [{ Text: "second" }], tool_results: {} } },
+      { User: { id: "user-2", content: [{ Text: "third" }] } },
+    ];
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "source-truncate",
+      acpSessionId: "source-acp-truncate",
+      agentCommand: MOCK_AGENT_WITH_FORK_SESSION,
+      cwd,
+      name: "source",
+      lastSeq: messages.length,
+      messages,
+    });
+
+    const result = await runCli(
+      [
+        "--format",
+        "json",
+        "codex",
+        "sessions",
+        "copy",
+        "--from",
+        "source-truncate",
+        "--at-index",
+        "1",
+        "--ephemeral",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const payload = JSON.parse(result.stdout.trim()) as {
+      acpxRecordId?: unknown;
+      ephemeral?: unknown;
+      forkedAtMessageIndex?: unknown;
+    };
+    assert.equal(payload.ephemeral, true);
+    assert.equal(payload.forkedAtMessageIndex, 1);
+    assert.equal(typeof payload.acpxRecordId, "string");
+
+    const stored = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, String(payload.acpxRecordId)), "utf8"),
+    ) as {
+      name?: unknown;
+      kind?: unknown;
+      last_seq?: unknown;
+      forked_from_session_id?: unknown;
+      forked_at_message_index?: unknown;
+      metadata?: Record<string, unknown>;
+      messages?: unknown[];
+    };
+    assert.equal(stored.name, "source (fork)");
+    assert.equal(stored.kind, "session");
+    assert.equal(stored.last_seq, 0);
+    assert.equal(stored.forked_from_session_id, "source-truncate");
+    assert.equal(stored.forked_at_message_index, 1);
+    assert.equal(stored.metadata?.byway, "1");
+    assert.equal(stored.metadata?.byway_parent, "source-truncate");
+    assert.equal(stored.metadata?.byway_at, "1");
+    assert.deepEqual(stored.messages, messages.slice(0, 1));
+  });
+});
+
+test("sessions copy rejects Claude --at-index when no transcript UUID can be resolved", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const claudeCommand = `${MOCK_AGENT_COMMAND} --claude-agent-acp --supports-fork-session`;
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          agents: {
+            claude: {
+              command: claudeCommand,
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "source-claude-no-transcript",
+      acpSessionId: "source-acp-claude-no-transcript",
+      agentCommand: claudeCommand,
+      cwd,
+      messages: [{ User: { id: "user-1", content: [{ Text: "hello" }] } }],
+      lastSeq: 1,
+    });
+
+    const result = await runCli(
+      ["claude", "sessions", "copy", "--from", "source-claude-no-transcript", "--at-index", "1"],
+      homeDir,
+    );
+
+    assert.equal(result.code, 1, result.stderr);
+    assert.match(
+      result.stderr,
+      /Cannot copy Claude session at --at-index 1: no Claude transcript UUID could be resolved/,
+    );
+  });
+});
+
+test("sessions copy resolves Claude --at-index from source cwd and forwards copied options", async () => {
+  await withTempHome(async (homeDir) => {
+    const sourceCwd = path.join(homeDir, "source-workspace");
+    const destinationCwd = path.join(homeDir, "destination-workspace");
+    const sourceAcpSessionId = "source-acp-claude-transcript";
+    const expectedForkMeta = {
+      claudeCode: {
+        options: {
+          allowedTools: ["Read"],
+          maxTurns: 2,
+          resumeSessionAt: "assistant-uuid",
+        },
+      },
+      systemPrompt: "copy prompt",
+    };
+    const claudeCommand = `${MOCK_AGENT_COMMAND} --claude-agent-acp --supports-fork-session --expect-fork-meta-json ${JSON.stringify(
+      JSON.stringify(expectedForkMeta),
+    )}`;
+    await fs.mkdir(sourceCwd, { recursive: true });
+    await fs.mkdir(destinationCwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          agents: {
+            claude: {
+              command: claudeCommand,
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    const transcriptPath = transcriptJsonlPath(
+      path.join(homeDir, ".claude"),
+      sourceCwd,
+      sourceAcpSessionId,
+    );
+    await fs.mkdir(path.dirname(transcriptPath), { recursive: true });
+    await fs.writeFile(
+      transcriptPath,
+      [
+        JSON.stringify({
+          type: "user",
+          uuid: "user-uuid",
+          message: { content: [{ type: "text", text: "remember source cwd" }] },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          uuid: "assistant-uuid",
+          message: { content: [{ type: "text", text: "noted" }] },
+        }),
+      ].join("\n"),
+      "utf8",
+    );
+
+    const messages: SessionRecord["messages"] = [
+      { User: { id: "user-1", content: [{ Text: "remember source cwd" }] } },
+      { Agent: { content: [{ Text: "noted" }], tool_results: {} } },
+    ];
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "source-claude-transcript",
+      acpSessionId: sourceAcpSessionId,
+      agentCommand: claudeCommand,
+      cwd: sourceCwd,
+      messages,
+      lastSeq: messages.length,
+      acpx: {
+        session_options: {
+          allowed_tools: ["Read"],
+          max_turns: 2,
+          system_prompt: "copy prompt",
+        },
+      },
+    });
+
+    const result = await runCli(
+      [
+        "--cwd",
+        destinationCwd,
+        "--format",
+        "json",
+        "claude",
+        "sessions",
+        "copy",
+        "--from",
+        "source-claude-transcript",
+        "--at-index",
+        "2",
+      ],
+      homeDir,
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    const payload = JSON.parse(result.stdout.trim()) as {
+      acpxRecordId?: unknown;
+      forkedAtMessageIndex?: unknown;
+    };
+    assert.equal(payload.forkedAtMessageIndex, 2);
+    assert.equal(typeof payload.acpxRecordId, "string");
+
+    const stored = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, String(payload.acpxRecordId)), "utf8"),
+    ) as {
+      cwd?: unknown;
+      forked_from_session_id?: unknown;
+      forked_at_message_index?: unknown;
+      messages?: unknown[];
+    };
+    assert.equal(stored.cwd, destinationCwd);
+    assert.equal(stored.forked_from_session_id, "source-claude-transcript");
+    assert.equal(stored.forked_at_message_index, 2);
+    assert.deepEqual(stored.messages, messages);
+  });
+});
+
+test("sessions copy rejects explicit agent type mismatch", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          agents: {
+            codex: {
+              command: MOCK_AGENT_WITH_FORK_SESSION,
+            },
+            claude: {
+              command: MOCK_AGENT_COMMAND,
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "source-lock",
+      acpSessionId: "source-acp-lock",
+      agentCommand: MOCK_AGENT_WITH_FORK_SESSION,
+      cwd,
+    });
+
+    const result = await runCli(["claude", "sessions", "copy", "--from", "source-lock"], homeDir);
+
+    assert.equal(result.code, 1, result.stderr);
+    assert.match(
+      result.stderr,
+      /sessions copy preserves the source agent type \(codex\); cannot copy as claude/,
+    );
+  });
+});
+
+test("sessions copy rejects adapters without fork capability", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          agents: {
+            codex: {
+              command: MOCK_AGENT_COMMAND,
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "source-no-fork",
+      acpSessionId: "source-acp-no-fork",
+      agentCommand: MOCK_AGENT_COMMAND,
+      cwd,
+    });
+
+    const result = await runCli(["codex", "sessions", "copy", "--from", "source-no-fork"], homeDir);
+
+    assert.equal(result.code, 1, result.stderr);
+    assert.match(result.stderr, /does not advertise sessionCapabilities\.fork/);
+  });
+});
+
+test("sessions copy rejects Codex --at-index until Codex truncation lands", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          agents: {
+            codex: {
+              command: "codex-acp",
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "source-codex-at-index",
+      acpSessionId: "source-acp-codex-at-index",
+      agentCommand: "codex-acp",
+      cwd,
+      messages: [{ User: { id: "user-1", content: [{ Text: "hello" }] } }],
+      lastSeq: 1,
+    });
+
+    const result = await runCli(
+      ["codex", "sessions", "copy", "--from", "source-codex-at-index", "--at-index", "1"],
+      homeDir,
+    );
+
+    assert.equal(result.code, 1, result.stderr);
+    assert.match(result.stderr, /Codex fork-at-index not yet supported \(full copy only\)/);
+  });
+});
+
+test("sessions copy rejects subagent source records", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          agents: {
+            codex: {
+              command: MOCK_AGENT_WITH_FORK_SESSION,
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "source-subagent",
+      acpSessionId: "source-acp-subagent",
+      agentCommand: MOCK_AGENT_WITH_FORK_SESSION,
+      cwd,
+      kind: "subagent",
+    });
+
+    const result = await runCli(
+      ["codex", "sessions", "copy", "--from", "source-subagent"],
+      homeDir,
+    );
+
+    assert.equal(result.code, 1, result.stderr);
+    assert.match(result.stderr, /Cannot copy a subagent session/);
   });
 });
 
@@ -2822,12 +3415,23 @@ async function runCli(
   options: CliRunOptions = {},
 ): Promise<CliRunResult> {
   return await new Promise<CliRunResult>((resolve) => {
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: homeDir,
+      ...options.env,
+    };
+    for (const key of [
+      "ACPX_SESSION_URL",
+      "ACPX_SESSION_NAME",
+      "ACPX_PARENT_SESSION_URL",
+      "ACPX_TASK_FOLDER",
+    ]) {
+      if (!Object.prototype.hasOwnProperty.call(options.env ?? {}, key)) {
+        delete env[key];
+      }
+    }
     const child = spawn(process.execPath, [CLI_PATH, ...args], {
-      env: {
-        ...process.env,
-        HOME: homeDir,
-        ...options.env,
-      },
+      env,
       cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -2922,6 +3526,12 @@ function makeSessionRecord(
     cumulative_token_usage: record.cumulative_token_usage ?? {},
     request_token_usage: record.request_token_usage ?? {},
     acpx: record.acpx,
+    kind: record.kind,
+    parentSessionId: record.parentSessionId,
+    forkedFromSessionId: record.forkedFromSessionId,
+    forkedAtMessageIndex: record.forkedAtMessageIndex,
+    metadata: record.metadata,
+    importedFrom: record.importedFrom,
   };
 }
 

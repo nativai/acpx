@@ -10,6 +10,7 @@ import {
   parseAllowedTools,
   parseAuthPolicy,
   parseDaysOlderThan,
+  parseForkAtIndex,
   parseHistoryLimit,
   parseMaxTurns,
   parseNonInteractivePermissionPolicy,
@@ -205,6 +206,11 @@ test("history and prune parsers validate positive numbers and dates", () => {
   assert.equal(parseHistoryLimit("3"), 3);
   assert.throws(() => parseHistoryLimit("0"), /positive integer/);
   assert.throws(() => parseHistoryLimit("2.5"), /positive integer/);
+
+  assert.equal(parseForkAtIndex("0"), 0);
+  assert.equal(parseForkAtIndex("2"), 2);
+  assert.throws(() => parseForkAtIndex("-1"), /non-negative integer/);
+  assert.throws(() => parseForkAtIndex("1.5"), /non-negative integer/);
 
   assert.equal(parseDaysOlderThan("14"), 14);
   assert.throws(() => parseDaysOlderThan("0"), /positive integer number of days/);

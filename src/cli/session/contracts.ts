@@ -66,6 +66,8 @@ export type SessionCreateOptions = {
   cwd: string;
   name?: string;
   resumeSessionId?: string;
+  forkFromSessionId?: string;
+  forkAtMessageIndex?: number;
   parentSessionId?: string;
   metadata?: Record<string, string>;
   mcpServers?: McpServer[];
@@ -77,6 +79,7 @@ export type SessionCreateOptions = {
   terminal?: boolean;
   verbose?: boolean;
   sessionOptions?: SessionAgentOptions;
+  desiredConfigOptions?: Record<string, string>;
 } & TimedRunOptions;
 
 export type SessionSendOptions = {

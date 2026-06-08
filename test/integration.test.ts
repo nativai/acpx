@@ -4221,12 +4221,24 @@ async function runCliWithEntry(
   options: CliRunOptions = {},
 ): Promise<CliRunResult> {
   return await new Promise<CliRunResult>((resolve, reject) => {
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: homeDir,
+      ...options.env,
+    };
+    for (const key of [
+      "ACPX_SESSION_URL",
+      "ACPX_SESSION_NAME",
+      "ACPX_PARENT_SESSION_URL",
+      "ACPX_TASK_FOLDER",
+      "ACPX_SUBSCRIPTION",
+    ]) {
+      if (!Object.prototype.hasOwnProperty.call(options.env ?? {}, key)) {
+        delete env[key];
+      }
+    }
     const child = spawn(process.execPath, [entryPath, ...args], {
-      env: {
-        ...process.env,
-        HOME: homeDir,
-        ...options.env,
-      },
+      env,
       cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
     });
