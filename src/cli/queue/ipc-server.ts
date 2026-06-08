@@ -1,8 +1,10 @@
+import { appendFile } from "node:fs/promises";
 import net from "node:net";
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { normalizeOutputError } from "../../acp/error-normalization.js";
 import { recordPerfDuration } from "../../perf-metrics.js";
 import { textPrompt } from "../../prompt-content.js";
+import { sessionEventActivePath } from "../../session/event-log.js";
 import type {
   AcpClientOptions,
   NonInteractivePermissionPolicy,
@@ -18,6 +20,7 @@ import {
 } from "./messages.js";
 
 type QueueOwnerSocketLease = {
+  sessionId: string;
   socketPath: string;
   ownerGeneration?: number;
 };
@@ -120,6 +123,7 @@ type SessionQueueOwnerOptions = {
 export class SessionQueueOwner {
   private readonly server: net.Server;
   private readonly controlHandlers: QueueOwnerControlHandlers;
+  private readonly sessionId: string;
   private readonly ownerGeneration?: number;
   private readonly maxQueueDepth: number;
   private readonly onQueueDepthChanged?: (queueDepth: number) => void;
@@ -136,6 +140,7 @@ export class SessionQueueOwner {
   ) {
     this.server = server;
     this.controlHandlers = controlHandlers;
+    this.sessionId = lease.sessionId;
     this.ownerGeneration = lease.ownerGeneration;
     this.maxQueueDepth = Math.max(1, Math.round(options.maxQueueDepth));
     this.onQueueDepthChanged = options.onQueueDepthChanged;
@@ -532,6 +537,16 @@ export class SessionQueueOwner {
       requestId: request.requestId,
       ownerGeneration: this.ownerGeneration,
     });
+    const marker = `${JSON.stringify({
+      jsonrpc: "2.0",
+      method: "acpx/received",
+      params: {
+        requestId: task.requestId,
+        ...(task.messageId != null ? { messageId: task.messageId } : {}),
+        at: new Date().toISOString(),
+      },
+    })}\n`;
+    void appendFile(sessionEventActivePath(this.sessionId), marker, "utf8").catch(() => {});
 
     if (!request.waitForCompletion) {
       task.close();

@@ -17,21 +17,24 @@ import { resolveSessionRecord, writeSessionRecord } from "./persistence.js";
 const LOCK_RETRY_MS = 15;
 const EVENT_LOCK_STALE_MS = 15_000;
 
-// The claude-agent-acp adapter emits resume / no-activity heartbeats as a custom
-// JSON-RPC notification with this method. acpx's onAcpMessage tap persists these
-// markers to the stream (so the live per-session transcript + debug see them), but
-// they are ACTIVITY-NEUTRAL: they must NOT advance `event_log.last_write_at` /
-// `lastUsedAt`, or a heartbeat fired during a silent turn would reset acpx-ui's
-// wall-clock staleness / wedge-detection clock and mask a true wedge. Only genuine
-// agent output counts as activity.
+// Adapter heartbeats, delivery notifications, and ACPX status chrome are
+// persisted to the stream (so the live per-session transcript + debug see them),
+// but they are ACTIVITY-NEUTRAL: they must NOT advance
+// `event_log.last_write_at` / `lastUsedAt`, or status-only markers during a
+// silent turn would reset acpx-ui's wall-clock staleness / wedge-detection clock.
+// Only genuine agent output counts as activity.
 //
 // Scope is strictly this marker METHOD. It deliberately does NOT match the
 // `_claude/origin` / `_claude/lastTurnEndReason` `_meta` keys, which ride on REAL
 // messages (e.g. the terminal `usage_update`) that MUST keep counting as activity.
 export const ACTIVITY_NEUTRAL_EVENT_METHOD = "_claude/sessionStatus";
+export const TURN_EVENT_METHOD = "acpx/turn";
+export const RECEIVED_EVENT_METHOD = "acpx/received";
 export const ACTIVITY_NEUTRAL_EVENT_METHODS = new Set([
   ACTIVITY_NEUTRAL_EVENT_METHOD,
   DELIVERY_EVENT_METHOD,
+  TURN_EVENT_METHOD,
+  RECEIVED_EVENT_METHOD,
 ]);
 
 export function isActivityNeutralEventMessage(message: AcpJsonRpcMessage): boolean {

@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import path from "node:path";
 import readline from "node:readline";
 import test from "node:test";
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
@@ -7,7 +9,31 @@ import {
   releaseQueueOwnerLease,
   tryAcquireQueueOwnerLease,
 } from "../src/cli/queue/ipc.js";
+import { sessionEventActivePath } from "../src/session/event-log.js";
 import { connectSocket, nextJsonLine, withTempHome } from "./queue-test-helpers.js";
+
+async function readStreamLines(filePath: string): Promise<unknown[]> {
+  const payload = await fs.readFile(filePath, "utf8");
+  return payload
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as unknown);
+}
+
+async function waitForStreamLines(filePath: string, count: number): Promise<unknown[]> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      const lines = await readStreamLines(filePath);
+      if (lines.length >= count) {
+        return lines;
+      }
+    } catch {
+      // stream may not exist until the fire-and-forget append lands
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return await readStreamLines(filePath);
+}
 
 test("SessionQueueOwner handles control requests and nextTask timeouts", async () => {
   await withTempHome(async () => {
@@ -146,7 +172,10 @@ test("SessionQueueOwner handles control requests and nextTask timeouts", async (
 
 test("SessionQueueOwner enqueues fire-and-forget prompts and rejects invalid owner generations", async () => {
   await withTempHome(async () => {
-    const lease = await tryAcquireQueueOwnerLease("owner-prompt-success");
+    const sessionId = "owner-prompt-success";
+    const streamPath = sessionEventActivePath(sessionId);
+    await fs.mkdir(path.dirname(streamPath), { recursive: true });
+    const lease = await tryAcquireQueueOwnerLease(sessionId);
     assert(lease);
 
     const queueDepths: number[] = [];
@@ -198,6 +227,18 @@ test("SessionQueueOwner enqueues fire-and-forget prompts and rejects invalid own
       assert.equal(accepted.type, "accepted");
       assert.equal(accepted.ownerGeneration, lease.ownerGeneration);
 
+      const receivedEvents = await waitForStreamLines(streamPath, 1);
+      assert.deepEqual(receivedEvents[0], {
+        jsonrpc: "2.0",
+        method: "acpx/received",
+        params: {
+          requestId: "req-submit",
+          messageId: "11111111-1111-4111-8111-111111111111",
+          at: (receivedEvents[0] as { params: { at: string } }).params.at,
+        },
+      });
+      assert.equal(typeof (receivedEvents[0] as { params: { at: unknown } }).params.at, "string");
+
       const task = await owner.nextTask();
       assert(task);
       assert.equal(task.requestId, "req-submit");
@@ -208,6 +249,43 @@ test("SessionQueueOwner enqueues fire-and-forget prompts and rejects invalid own
       assert.deepEqual(queueDepths, [1, 0]);
       promptLines.close();
       promptSocket.destroy();
+
+      const noMessageIdSocket = await connectSocket(lease.socketPath);
+      const noMessageIdLines = readline.createInterface({ input: noMessageIdSocket });
+      const noMessageIdIterator = noMessageIdLines[Symbol.asyncIterator]();
+      noMessageIdSocket.write(
+        `${JSON.stringify({
+          type: "submit_prompt",
+          requestId: "req-submit-no-message-id",
+          ownerGeneration: lease.ownerGeneration,
+          message: "hello without message id",
+          permissionMode: "approve-reads",
+          waitForCompletion: false,
+        })}\n`,
+      );
+
+      const noMessageIdAccepted = (await nextJsonLine(noMessageIdIterator)) as {
+        type: string;
+        ownerGeneration?: number;
+      };
+      assert.equal(noMessageIdAccepted.type, "accepted");
+      assert.equal(noMessageIdAccepted.ownerGeneration, lease.ownerGeneration);
+      const secondReceivedEvents = await waitForStreamLines(streamPath, 2);
+      const noMessageIdEvent = secondReceivedEvents[1] as {
+        method: string;
+        params: Record<string, unknown>;
+      };
+      assert.equal(noMessageIdEvent.method, "acpx/received");
+      assert.equal(noMessageIdEvent.params.requestId, "req-submit-no-message-id");
+      assert.equal(Object.hasOwn(noMessageIdEvent.params, "messageId"), false);
+      assert.equal(typeof noMessageIdEvent.params.at, "string");
+
+      const noMessageIdTask = await owner.nextTask();
+      assert(noMessageIdTask);
+      assert.equal(noMessageIdTask.requestId, "req-submit-no-message-id");
+      assert.equal(noMessageIdTask.messageId, undefined);
+      noMessageIdLines.close();
+      noMessageIdSocket.destroy();
 
       const badSocket = await connectSocket(lease.socketPath);
       const badLines = readline.createInterface({ input: badSocket });

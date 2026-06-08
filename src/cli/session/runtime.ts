@@ -709,6 +709,18 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   const eventWriter = await measurePerf("session.events.open", async () => {
     return await SessionEventWriter.open(record);
   });
+  await eventWriter.appendMessage(
+    {
+      jsonrpc: "2.0",
+      method: "acpx/turn",
+      params: {
+        phase: "active",
+        sessionId: record.acpxRecordId,
+        at: new Date().toISOString(),
+      },
+    },
+    { checkpoint: false },
+  );
   const pendingMessages: AcpJsonRpcMessage[] = [];
   const pendingConnectOutputMessages: AcpJsonRpcMessage[] = [];
   const sessionOptions = mergeSessionOptions(
@@ -1473,6 +1485,22 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     await preserveClosedState().catch(() => {
       // best effort on close
     });
+    await eventWriter
+      .appendMessage(
+        {
+          jsonrpc: "2.0",
+          method: "acpx/turn",
+          params: {
+            phase: "idle",
+            sessionId: record.acpxRecordId,
+            at: new Date().toISOString(),
+          },
+        },
+        { checkpoint: false },
+      )
+      .catch(() => {
+        // best effort on close
+      });
     await closeEventWriter(true).catch(() => {
       // best effort on close
     });

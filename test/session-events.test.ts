@@ -291,6 +291,60 @@ test("acpx/delivery events are stream lines but do not advance last_write_at", a
   });
 });
 
+test("acpx turn and received markers do not advance last_write_at", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const sessionId = "session-turn-received-neutral";
+    const record = makeSessionRecord(sessionId, cwd, 5);
+    await writeSessionRecord(record);
+
+    const writer = await SessionEventWriter.open(record);
+    await writer.appendMessage({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "real output" },
+        },
+      },
+    } as never);
+    const lastWriteAfterReal = writer.getRecord().eventLog.last_write_at;
+    const lastUsedAfterReal = writer.getRecord().lastUsedAt;
+    const seqAfterReal = writer.getRecord().lastSeq;
+
+    await writer.appendMessage({
+      jsonrpc: "2.0",
+      method: "acpx/turn",
+      params: {
+        phase: "active",
+        sessionId,
+        at: "2026-06-08T00:00:00.000Z",
+      },
+    } as never);
+    await writer.appendMessage({
+      jsonrpc: "2.0",
+      method: "acpx/received",
+      params: {
+        requestId: "req-received",
+        at: "2026-06-08T00:00:01.000Z",
+      },
+    } as never);
+
+    assert.equal(writer.getRecord().eventLog.last_write_at, lastWriteAfterReal);
+    assert.equal(writer.getRecord().lastUsedAt, lastUsedAfterReal);
+    assert.equal(writer.getRecord().lastSeq, seqAfterReal + 2);
+
+    const events = await listSessionEvents(sessionId);
+    assert.equal(events.length, 3);
+    assert.equal((events[1] as { method?: string }).method, "acpx/turn");
+    assert.equal((events[2] as { method?: string }).method, "acpx/received");
+  });
+});
+
 test("Codex agent_progress_update advances last_write_at activity", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
