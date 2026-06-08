@@ -159,29 +159,6 @@ test("initGlobalConfigFile creates the config once and then reports existing fil
   });
 });
 
-test("loadResolvedConfig defaults keepWarmTtlMs to 30 minutes and parses keepWarmTtl override", async () => {
-  await withTempEnv(async ({ homeDir }) => {
-    const cwd = path.join(homeDir, "workspace");
-    await fs.mkdir(cwd, { recursive: true });
-
-    // No config files: keep-warm TTL falls back to the 30-minute default while
-    // the ordinary owner TTL default (300s) is intentionally left untouched.
-    const defaults = await loadResolvedConfig(cwd);
-    assert.equal(defaults.keepWarmTtlMs, 1_800_000);
-    assert.equal(defaults.ttlMs, 300_000);
-
-    // keepWarmTtl is configurable in seconds, independently of ttl.
-    await fs.writeFile(
-      path.join(cwd, ".acpxrc.json"),
-      `${JSON.stringify({ ttl: 300, keepWarmTtl: 3600 })}\n`,
-      "utf8",
-    );
-    const overridden = await loadResolvedConfig(cwd);
-    assert.equal(overridden.ttlMs, 300_000);
-    assert.equal(overridden.keepWarmTtlMs, 3_600_000);
-  });
-});
-
 test("loadResolvedConfig defaults disableExec to false", async () => {
   await withTempEnv(async ({ homeDir }) => {
     const cwd = path.join(homeDir, "workspace");

@@ -68,7 +68,6 @@ async function submitToRunningOwner(
     waitForCompletion,
     verbose: options.verbose,
     sessionOptions: options.sessionOptions,
-    ttlMs: options.keepWarmTtlMs,
   });
 }
 
@@ -233,12 +232,9 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   const sharedClient = createQueueOwnerSharedClient(options, sessionRecord);
   const ttlMs = normalizeQueueOwnerTtlMs(options.ttlMs);
   const maxQueueDepth = Math.max(1, Math.round(options.maxQueueDepth ?? 16));
-  // Mutable: a keep-warm prompt (task.ttlMs) can extend/disable the idle TTL of
-  // this already-running owner (see the per-turn apply below).
-  let defaultTaskPollTimeoutMs: number | undefined = ttlMs === 0 ? undefined : ttlMs;
-  let taskPollTimeoutMs: number | undefined = defaultTaskPollTimeoutMs;
+  const defaultTaskPollTimeoutMs: number | undefined = ttlMs === 0 ? undefined : ttlMs;
   const initialTaskPollTimeoutMs =
-    taskPollTimeoutMs == null ? undefined : Math.max(taskPollTimeoutMs, 1_000);
+    defaultTaskPollTimeoutMs == null ? undefined : Math.max(defaultTaskPollTimeoutMs, 1_000);
   const turnController = createQueueOwnerTurnController(options);
 
   const applyPendingCancel = async (): Promise<boolean> => {
@@ -416,17 +412,6 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
             const updateMeta = update?._meta as Record<string, unknown> | undefined;
             const updateClaudeCode = updateMeta?.claudeCode as Record<string, unknown> | undefined;
 
-            // Disable idle TTL when the adapter signals a scheduled wakeup was
-            // created — keeps the process tree alive until the cron fires.
-            if (updateClaudeCode?.hasScheduledWakeup === true) {
-              taskPollTimeoutMs = undefined;
-              if (options.verbose) {
-                process.stderr.write(
-                  `[acpx] scheduled wakeup detected — disabling idle TTL for session ${options.sessionId}\n`,
-                );
-              }
-            }
-
             const subagentId = notifClaudeCode?.subagentId ?? updateClaudeCode?.subagentId;
             const subagentName = notifClaudeCode?.subagentName ?? updateClaudeCode?.subagentName;
             if (typeof subagentId === "string" || typeof subagentName === "string") {
@@ -501,38 +486,12 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
 
     let isFirstTask = true;
     while (true) {
-      const pollTimeoutMs = isFirstTask ? initialTaskPollTimeoutMs : taskPollTimeoutMs;
+      const pollTimeoutMs = isFirstTask ? initialTaskPollTimeoutMs : defaultTaskPollTimeoutMs;
       const task = await owner.nextTask(pollTimeoutMs);
       if (!task) {
         break;
       }
       isFirstTask = false;
-
-      // Keep-warm-while-engaged: a prompt may carry an idle-TTL override (e.g.
-      // acpx-ui passing --keep-warm / --ttl for a session engaged from the UI).
-      // Adopt it as this owner's new idle TTL so the session you're actively
-      // using doesn't idle-die into a catastrophic cold resume. Reuses the same
-      // dynamic-TTL lever as the scheduled-wakeup hook below. Persisting it into
-      // defaultTaskPollTimeoutMs makes it stick across subsequent idle waits.
-      if (task.ttlMs != null) {
-        defaultTaskPollTimeoutMs = task.ttlMs === 0 ? undefined : task.ttlMs;
-        if (options.verbose) {
-          process.stderr.write(
-            `[acpx] keep-warm: idle TTL set to ${
-              defaultTaskPollTimeoutMs ?? "disabled"
-            } for session ${options.sessionId}\n`,
-          );
-        }
-      }
-
-      // Reset the idle poll timeout each turn. A previous turn's scheduling
-      // tool may have set taskPollTimeoutMs to undefined via the
-      // hasScheduledWakeup signal; the adapter never sends a corresponding
-      // "wakeup fired" notification, so without this reset the idle TTL stays
-      // disabled forever (immortal queue-owner). If this turn schedules
-      // another wakeup, the onAcpMessage handler below will set it back to
-      // undefined for the duration of that wakeup window.
-      taskPollTimeoutMs = defaultTaskPollTimeoutMs;
 
       // Stop idle drain before the prompt registers its own handlers
       await idleDrain.stop();
@@ -576,28 +535,6 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
                     }
                   }
                 : undefined,
-              onAcpMessage: (_dir, message) => {
-                // Detect hasScheduledWakeup during a prompt turn (same logic as
-                // the idle drain handler) to disable TTL even if the scheduling
-                // tool fires mid-turn.
-                const msg = message as Record<string, unknown>;
-                if (msg.method === "session/update") {
-                  const params = msg.params as Record<string, unknown> | undefined;
-                  const update = params?.update as Record<string, unknown> | undefined;
-                  const updateMeta = update?._meta as Record<string, unknown> | undefined;
-                  const updateClaudeCode = updateMeta?.claudeCode as
-                    | Record<string, unknown>
-                    | undefined;
-                  if (updateClaudeCode?.hasScheduledWakeup === true) {
-                    taskPollTimeoutMs = undefined;
-                    if (options.verbose) {
-                      process.stderr.write(
-                        `[acpx] scheduled wakeup detected — disabling idle TTL for session ${options.sessionId}\n`,
-                      );
-                    }
-                  }
-                }
-              },
             });
           } finally {
             checkpointPerfMetricsCapture();

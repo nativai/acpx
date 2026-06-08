@@ -590,7 +590,6 @@ export async function handlePrompt(
     suppressSdkConsoleErrors: outputPolicy.suppressSdkConsoleErrors,
     timeoutMs: globalFlags.timeout,
     ttlMs: globalFlags.ttl,
-    keepWarmTtlMs: globalFlags.ttlExplicitMs,
     maxQueueDepth: config.queueMaxDepth,
     promptRetries: globalFlags.promptRetries,
     verbose: globalFlags.verbose,
