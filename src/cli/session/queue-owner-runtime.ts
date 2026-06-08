@@ -1,3 +1,5 @@
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
 import { AcpClient } from "../../acp/client.js";
 import { formatErrorMessage } from "../../acp/error-normalization.js";
 import { supportsMidTurnPromptInjection } from "../../acp/mid-turn-injection-support.js";
@@ -22,9 +24,11 @@ import {
   type QueueTask,
   SessionQueueOwner,
   releaseQueueOwnerLease,
+  hasLiveProcessGroup,
   tryAcquireQueueOwnerLease,
   trySubmitToRunningOwner,
   type QueueOwnerLease,
+  signalProcessGroup,
   waitMs,
 } from "../queue/ipc.js";
 import { refreshQueueOwnerLease } from "../queue/lease-store.js";
@@ -170,6 +174,44 @@ function logQueueOwnerReady(params: {
   );
 }
 
+function readLinuxProcessGroupId(): number | undefined {
+  try {
+    const stat = fs.readFileSync("/proc/self/stat", "utf8");
+    const commandEndIndex = stat.lastIndexOf(")");
+    if (commandEndIndex < 0) {
+      return undefined;
+    }
+    const fieldsAfterCommand = stat
+      .slice(commandEndIndex + 2)
+      .trim()
+      .split(/\s+/);
+    const processGroupId = Number.parseInt(fieldsAfterCommand[2] ?? "", 10);
+    return Number.isInteger(processGroupId) && processGroupId > 0 ? processGroupId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readProcessGroupIdFromPs(): number | undefined {
+  try {
+    const output = execFileSync("ps", ["-o", "pgid=", "-p", String(process.pid)], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const processGroupId = Number.parseInt(output.trim(), 10);
+    return Number.isInteger(processGroupId) && processGroupId > 0 ? processGroupId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function ownerIsGroupLeader(): boolean {
+  if (process.platform === "win32") {
+    return false;
+  }
+  return (readLinuxProcessGroupId() ?? readProcessGroupIdFromPs()) === process.pid;
+}
+
 async function closeQueueOwnerRuntime(params: {
   lease: QueueOwnerLease;
   owner: SessionQueueOwner | undefined;
@@ -191,6 +233,11 @@ async function closeQueueOwnerRuntime(params: {
   await releaseQueueOwnerLease(params.lease);
   if (params.verbose) {
     process.stderr.write(`[acpx] queue owner stopped for session ${params.sessionId}\n`);
+  }
+  // Final orphan backstop: adapter descendants share this owner's process group.
+  // The leader guard prevents sweeping an embedding parent's unrelated group.
+  if (ownerIsGroupLeader() && hasLiveProcessGroup(process.pid)) {
+    signalProcessGroup(process.pid, "SIGKILL");
   }
 }
 

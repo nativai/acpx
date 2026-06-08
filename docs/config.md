@@ -35,7 +35,7 @@ acpx config init
   "defaultPermissions": "approve-all",
   "nonInteractivePermissions": "deny",
   "authPolicy": "skip",
-  "ttl": 300,
+  "ttl": 5400,
   "timeout": null,
   "format": "text",
   "agents": {
@@ -53,7 +53,7 @@ acpx config init
 | `defaultPermissions`        | enum             | `"approve-reads"` | `approve-all` / `approve-reads` / `deny-all`.                                                      |
 | `nonInteractivePermissions` | enum             | `"deny"`          | `deny` or `fail` when no TTY is present.                                                           |
 | `authPolicy`                | enum             | `"skip"`          | Controls when ACP `authenticate` is attempted.                                                     |
-| `ttl`                       | integer          | `300`             | Queue owner idle TTL in seconds. `0` disables idle shutdown.                                       |
+| `ttl`                       | integer          | `5400`            | Queue owner idle TTL in seconds. `0` disables idle shutdown.                                       |
 | `timeout`                   | number \| `null` | `null`            | Default `--timeout` in seconds (decimal allowed).                                                  |
 | `format`                    | enum             | `"text"`          | Default `--format`.                                                                                |
 | `agents`                    | object           | `{}`              | Override or add agent commands (see below).                                                        |

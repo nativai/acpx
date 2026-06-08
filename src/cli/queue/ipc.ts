@@ -19,6 +19,7 @@ import { connectToQueueOwner } from "./ipc-transport.js";
 import {
   type QueueOwnerRecord,
   readQueueOwnerRecord,
+  recoverQueueOwnerForSession,
   terminateQueueOwnerForSession,
 } from "./lease-store.js";
 import {
@@ -44,9 +45,11 @@ export { QUEUE_CONNECT_RETRY_MS } from "./ipc-transport.js";
 export const MAX_MESSAGE_BUFFER_SIZE = 10 * 1024 * 1024;
 export {
   isProcessAlive,
+  hasLiveProcessGroup,
   readQueueOwnerLiveness,
   recoverQueueOwnerForSession,
   releaseQueueOwnerLease,
+  signalProcessGroup,
   terminateProcess,
   terminateQueueOwnerForSession,
   tryAcquireQueueOwnerLease,
@@ -62,6 +65,61 @@ const STALE_OWNER_PROTOCOL_DETAIL_CODES = new Set([
   "QUEUE_PROTOCOL_MALFORMED_MESSAGE",
   "QUEUE_PROTOCOL_UNEXPECTED_RESPONSE",
 ]);
+const OWNER_SHUTDOWN_DETAIL_CODES = new Set(["QUEUE_OWNER_CLOSED", "QUEUE_OWNER_SHUTTING_DOWN"]);
+
+function isOwnerShutdownDetailCode(detailCode: string | undefined): boolean {
+  return detailCode !== undefined && OWNER_SHUTDOWN_DETAIL_CODES.has(detailCode);
+}
+
+function isOwnerShutdownError(error: unknown): error is QueueConnectionError {
+  return error instanceof QueueConnectionError && isOwnerShutdownDetailCode(error.detailCode);
+}
+
+function isSameQueueOwner(left: QueueOwnerRecord, right: QueueOwnerRecord): boolean {
+  return left.pid === right.pid && left.ownerGeneration === right.ownerGeneration;
+}
+
+async function recoverOwnerAfterShutdownError(params: {
+  sessionId: string;
+  owner: QueueOwnerRecord;
+  detailCode?: string;
+  verbose?: boolean;
+}): Promise<boolean> {
+  await recoverQueueOwnerForSession(params.sessionId).catch(() => {
+    // Preserve the original shutdown error if cleanup fails.
+  });
+
+  const currentOwner = await readQueueOwnerRecord(params.sessionId);
+  if (currentOwner && isSameQueueOwner(currentOwner, params.owner)) {
+    return false;
+  }
+
+  incrementPerfCounter("queue.owner.shutdown_recovered");
+  if (params.verbose) {
+    process.stderr.write(
+      `[acpx] cleared shutting-down queue owner metadata for session ${params.sessionId} (${params.detailCode ?? "unknown"})\n`,
+    );
+  }
+  return true;
+}
+
+async function maybeRecoverSubmitFailure(params: {
+  sessionId: string;
+  owner: QueueOwnerRecord;
+  error: unknown;
+  verbose?: boolean;
+}): Promise<boolean> {
+  if (isOwnerShutdownError(params.error)) {
+    return await recoverOwnerAfterShutdownError({
+      sessionId: params.sessionId,
+      owner: params.owner,
+      detailCode: params.error.detailCode,
+      verbose: params.verbose,
+    });
+  }
+
+  return await maybeRecoverStaleOwnerAfterProtocolMismatch(params);
+}
 
 async function maybeRecoverStaleOwnerAfterProtocolMismatch(params: {
   sessionId: string;
@@ -370,6 +428,10 @@ function handleSubmitQueueOwnerMessage(
   options: SubmitToQueueOwnerOptions,
 ): void {
   if (message.type === "error") {
+    if (isOwnerShutdownDetailCode(message.detailCode)) {
+      controls.reject(queueConnectionErrorFromOwner(message, false));
+      return;
+    }
     controls.reject(
       emitQueueOwnerError(
         options.outputFormatter,
@@ -721,7 +783,7 @@ export async function trySubmitToRunningOwner(
   try {
     submitted = await submitToQueueOwner(owner, options);
   } catch (error) {
-    const recovered = await maybeRecoverStaleOwnerAfterProtocolMismatch({
+    const recovered = await maybeRecoverSubmitFailure({
       sessionId: options.sessionId,
       owner,
       error,

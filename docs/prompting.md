@@ -81,7 +81,7 @@ When a turn is already in flight for the target session, `acpx` does not spawn a
 - **blocks** until the queued prompt completes (default), streaming events as they happen, or
 - **returns** as soon as the owner acknowledges (`--no-wait`).
 
-Queued prompts drain in submission order. After the queue empties, the owner stays alive for an idle TTL (`--ttl <seconds>`, default `300`).
+Queued prompts drain in submission order. After the queue empties, the owner stays alive for an idle TTL (`--ttl <seconds>`, default `5400`).
 
 ```bash
 # Long-running turn

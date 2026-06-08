@@ -157,7 +157,7 @@ Queue mechanics:
 
 - Owner generates a Unix socket at `~/.acpx/queues/<hash>.sock` (named pipe on Windows) and a `<hash>.lock` ownership file.
 - Sockets and lock files are owner-only.
-- After the queue drains, the owner stays alive for an idle TTL (default `300s`) so quick follow-ups do not pay the spawn cost.
+- After the queue drains, the owner stays alive for an idle TTL (default `5400s`) so quick follow-ups do not pay the spawn cost.
 - Override TTL with `--ttl <seconds>`. `--ttl 0` keeps it alive indefinitely (until idle shutdown is otherwise triggered).
 - Owner generation IDs are cryptographically random so rapid restarts cannot reuse a stale generation token.
 

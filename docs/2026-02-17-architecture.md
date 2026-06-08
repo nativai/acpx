@@ -66,7 +66,7 @@ Prompt submission is queue-aware per persistent session:
 
 - one `acpx` process becomes queue owner for the active turn
 - concurrent invocations submit prompt requests to the owner via local IPC
-- after queue drain, owner waits up to idle TTL (`--ttl`, default 300s) for new work
+- after queue drain, owner waits up to idle TTL (`--ttl`, default 5400s) for new work
 - TTL expiry shuts down owner, releases socket/lock, and clears queue-owner record
 - `sessions close`/`sessions new` soft-close and terminate related processes without deleting session JSON
 

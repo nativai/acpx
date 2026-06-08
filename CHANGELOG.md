@@ -8,6 +8,9 @@ Repo: https://github.com/openclaw/acpx
 
 ### Changes
 
+- CLI/sessions: raise the default queue-owner idle TTL from 5 minutes to 90
+  minutes while preserving `--ttl 0` as keep-alive forever.
+
 ### Breaking
 
 - CLI: remove the agent-facing `acpx usage` and `acpx sessions tree` commands;

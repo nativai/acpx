@@ -116,7 +116,7 @@ All global options:
 | `--non-interactive-permissions <policy>` | Non-TTY prompt policy                          | `deny` (default) or `fail` when approval prompt cannot be shown.                                                                                                                                           |
 | `--permission-policy <json-or-file>`     | Per-tool permission policy                     | JSON object or file path with `autoApprove`, `autoDeny`, `escalate`, and optional `defaultAction` (`approve`, `deny`, `escalate`). Alias: `--policy`.                                                      |
 | `--timeout <seconds>`                    | Max wait time for agent response               | Must be positive. Decimal seconds allowed.                                                                                                                                                                 |
-| `--ttl <seconds>`                        | Queue owner idle TTL before shutdown           | Default `300`. `0` disables TTL.                                                                                                                                                                           |
+| `--ttl <seconds>`                        | Queue owner idle TTL before shutdown           | Default `5400`. `0` disables TTL.                                                                                                                                                                          |
 | `--model <id>`                           | Set agent model                                | Claude-compatible adapters may consume session creation metadata; other agents must advertise ACP models and support `session/set_model`, otherwise `acpx` fails clearly instead of silently falling back. |
 | `--verbose`                              | Enable verbose logs                            | Prints ACP/debug details to stderr.                                                                                                                                                                        |
 
@@ -398,7 +398,7 @@ Supported keys:
   "defaultPermissions": "approve-all",
   "nonInteractivePermissions": "deny",
   "authPolicy": "skip",
-  "ttl": 300,
+  "ttl": 5400,
   "timeout": null,
   "format": "text",
   "agents": {
@@ -465,7 +465,7 @@ When a prompt is already in flight for a session, `acpx` uses a per-session queu
 1. owner process keeps the active turn running
 2. other `acpx` invocations enqueue prompts through local IPC
 3. owner drains queued prompts one-by-one after each completed turn
-4. after the queue drains, owner waits for new work up to TTL (`--ttl`, default 300s)
+4. after the queue drains, owner waits for new work up to TTL (`--ttl`, default 5400s)
 5. submitter either blocks until completion (default) or exits immediately with `--no-wait`
 6. if interrupted (`Ctrl+C`) during an active turn, `acpx` sends `session/cancel` first, waits briefly for cancelled completion, then force-kills only if needed
 

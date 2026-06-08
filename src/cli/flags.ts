@@ -390,7 +390,7 @@ export function addGlobalFlags(command: Command): Command {
     .option("--timeout <seconds>", "Maximum time to wait for agent response", parseTimeoutSeconds)
     .option(
       "--ttl <seconds>",
-      "Queue owner idle TTL before shutdown (0 = keep alive forever) (default: 300)",
+      "Queue owner idle TTL before shutdown (0 = keep alive forever) (default: 5400)",
       parseTtlSeconds,
     )
     .option("--verbose", "Enable verbose debug logs");

@@ -46,6 +46,15 @@ const NOOP_OUTPUT_FORMATTER: OutputFormatter = {
   },
 };
 
+function recordingOutputFormatter(detailCodes: string[]): OutputFormatter {
+  return {
+    ...NOOP_OUTPUT_FORMATTER,
+    onError(params) {
+      detailCodes.push(params.detailCode ?? params.message);
+    },
+  };
+}
+
 test("trySubmitToRunningOwner propagates typed queue prompt errors", async () => {
   await withTempHome(async (homeDir) => {
     const sessionId = "prompt-error-session";
@@ -116,6 +125,60 @@ test("trySubmitToRunningOwner propagates typed queue prompt errors", async () =>
       stopProcess(keeper);
     }
   });
+});
+
+test("trySubmitToRunningOwner treats owner shutdown errors as no usable owner", async () => {
+  for (const detailCode of ["QUEUE_OWNER_CLOSED", "QUEUE_OWNER_SHUTTING_DOWN"]) {
+    await withTempHome(async (homeDir) => {
+      const sessionId = `submit-${detailCode.toLowerCase().replaceAll("_", "-")}`;
+      const keeper = await startKeeperProcess();
+      const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+      await writeQueueOwnerLock({
+        lockPath,
+        pid: keeper.pid,
+        sessionId,
+        socketPath,
+      });
+
+      const server = createSingleRequestServer((socket, request) => {
+        assert.equal(request.type, "submit_prompt");
+        socket.write(
+          `${JSON.stringify({
+            type: "error",
+            requestId: request.requestId,
+            code: "RUNTIME",
+            detailCode,
+            origin: "queue",
+            retryable: true,
+            message: `owner unavailable: ${detailCode}`,
+          })}\n`,
+        );
+        socket.end();
+      });
+
+      await listenServer(server, socketPath);
+
+      try {
+        const emittedErrors: string[] = [];
+        const result = await trySubmitToRunningOwner({
+          sessionId,
+          message: "hello",
+          permissionMode: "approve-reads",
+          outputFormatter: recordingOutputFormatter(emittedErrors),
+          waitForCompletion: true,
+        });
+        assert.equal(result, undefined);
+        assert.deepEqual(emittedErrors, []);
+        await assert.rejects(async () => await fs.access(lockPath), {
+          code: "ENOENT",
+        });
+      } finally {
+        await closeServer(server);
+        await cleanupOwnerArtifacts({ socketPath, lockPath });
+        stopProcess(keeper);
+      }
+    });
+  }
 });
 
 test("trySetModeOnRunningOwner propagates typed queue control errors", async () => {

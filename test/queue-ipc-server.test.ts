@@ -170,6 +170,66 @@ test("SessionQueueOwner handles control requests and nextTask timeouts", async (
   });
 });
 
+test("SessionQueueOwner nextTask without ttl waits until a prompt arrives", async () => {
+  await withTempHome(async () => {
+    const sessionId = "owner-ttl-zero";
+    const lease = await tryAcquireQueueOwnerLease(sessionId);
+    assert(lease);
+
+    const owner = await SessionQueueOwner.start(lease, {
+      cancelPrompt: async () => false,
+      closeSession: async () => false,
+      setSessionMode: async () => {
+        // no-op
+      },
+      setSessionModel: async () => {
+        // no-op
+      },
+      setSessionConfigOption: async () =>
+        ({
+          configOptions: [],
+        }) as SetSessionConfigOptionResponse,
+      queryActiveTurn: () => false,
+    });
+
+    try {
+      const pendingTask = owner.nextTask(undefined);
+      const beforePrompt = await Promise.race([
+        pendingTask.then(() => "resolved"),
+        new Promise<"waiting">((resolve) => {
+          setTimeout(() => resolve("waiting"), 30);
+        }),
+      ]);
+      assert.equal(beforePrompt, "waiting");
+
+      const promptSocket = await connectSocket(lease.socketPath);
+      const promptLines = readline.createInterface({ input: promptSocket });
+      const promptIterator = promptLines[Symbol.asyncIterator]();
+      promptSocket.write(
+        `${JSON.stringify({
+          type: "submit_prompt",
+          requestId: "req-ttl-zero",
+          ownerGeneration: lease.ownerGeneration,
+          message: "hello",
+          permissionMode: "approve-reads",
+          waitForCompletion: false,
+        })}\n`,
+      );
+
+      const accepted = (await nextJsonLine(promptIterator)) as { type: string };
+      assert.equal(accepted.type, "accepted");
+      const task = await pendingTask;
+      assert(task);
+      assert.equal(task.requestId, "req-ttl-zero");
+      promptLines.close();
+      promptSocket.destroy();
+    } finally {
+      await owner.close();
+      await releaseQueueOwnerLease(lease);
+    }
+  });
+});
+
 test("SessionQueueOwner enqueues fire-and-forget prompts and rejects invalid owner generations", async () => {
   await withTempHome(async () => {
     const sessionId = "owner-prompt-success";

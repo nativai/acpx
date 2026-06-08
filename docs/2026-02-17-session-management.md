@@ -107,7 +107,7 @@ Lifecycle behavior:
 
 - a queue owner `acpx` process is elected per active session turn and accepts queued prompts over local IPC
 - the owner drains queued prompts sequentially (one ACP prompt at a time)
-- after the queue drains, owner waits for new prompts up to an idle TTL (default 300s)
+- after the queue drains, owner waits for new prompts up to an idle TTL (default 5400s)
 - TTL is configurable via `--ttl <seconds>` (`0` disables TTL)
 - when TTL expires, owner shuts down, releases socket/lock, and exits
 - each prompt turn launches a fresh adapter subprocess owned by that queue owner process

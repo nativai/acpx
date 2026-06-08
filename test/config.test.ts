@@ -149,22 +149,25 @@ test("initGlobalConfigFile creates the config once and then reports existing fil
       defaultPermissions: string;
       nonInteractivePermissions: string;
       authPolicy: string;
+      ttl: number;
       queueMaxDepth: number;
     };
     assert.equal(payload.defaultAgent, "codex");
     assert.equal(payload.defaultPermissions, "approve-all");
     assert.equal(payload.nonInteractivePermissions, "deny");
     assert.equal(payload.authPolicy, "skip");
+    assert.equal(payload.ttl, 5400);
     assert.equal(payload.queueMaxDepth, 16);
   });
 });
 
-test("loadResolvedConfig defaults disableExec to false", async () => {
+test("loadResolvedConfig applies default operational values", async () => {
   await withTempEnv(async ({ homeDir }) => {
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
 
     const config = await loadResolvedConfig(cwd);
+    assert.equal(config.ttlMs, 5_400_000);
     assert.equal(config.disableExec, false);
   });
 });

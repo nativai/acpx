@@ -4,6 +4,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   ensureOwnerIsUsable,
+  hasLiveProcessGroup,
   isProcessAlive,
   readQueueOwnerLiveness,
   readQueueOwnerRecord,
@@ -11,6 +12,7 @@ import {
   recoverQueueOwnerForSession,
   refreshQueueOwnerLease,
   releaseQueueOwnerLease,
+  signalProcessGroup,
   terminateProcess,
   terminateQueueOwnerForSession,
   tryAcquireQueueOwnerLease,
@@ -290,6 +292,42 @@ test("recoverQueueOwnerForSession kills the owner's whole process group (reaps g
       // process group, so the group SIGKILL must reap it rather than orphan it.
       await waitUntilDead(childPid);
       assert.equal(isProcessAlive(childPid), false);
+    } finally {
+      stopProcess(owner);
+      if (childPid) {
+        try {
+          process.kill(childPid, "SIGKILL");
+        } catch {
+          // already gone
+        }
+      }
+    }
+  });
+});
+
+test("process group helpers detect and signal a detached owner group", async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+
+  await withTempHome(async (homeDir) => {
+    const pidFile = path.join(homeDir, "helper-grandchild.pid");
+    const { owner, childPid } = await startDetachedOwnerWithChild(pidFile);
+    const ownerPid = owner.pid;
+
+    try {
+      assert(ownerPid && Number.isInteger(ownerPid));
+      assert(childPid && Number.isInteger(childPid));
+      assert.equal(hasLiveProcessGroup(ownerPid), true);
+      assert.equal(hasLiveProcessGroup(999_999), false);
+
+      signalProcessGroup(ownerPid, "SIGKILL");
+      await waitUntilDead(ownerPid);
+      await waitUntilDead(childPid);
+
+      assert.equal(isProcessAlive(ownerPid), false);
+      assert.equal(isProcessAlive(childPid), false);
+      assert.equal(hasLiveProcessGroup(ownerPid), false);
     } finally {
       stopProcess(owner);
       if (childPid) {

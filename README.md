@@ -274,7 +274,7 @@ Supported keys:
   "defaultPermissions": "approve-all",
   "nonInteractivePermissions": "deny",
   "authPolicy": "skip",
-  "ttl": 300,
+  "ttl": 5400,
   "timeout": null,
   "format": "text",
   "agents": {
@@ -397,7 +397,7 @@ spawns the ACP bridge directly without `pnpm` wrapper noise:
   saved-record inspection.
 - Auto-resume for cwd scope skips sessions marked closed.
 - Prompt submissions are queue-aware per session. If a prompt is already running, new prompts are queued and drained by the running `acpx` process.
-- Queue owners use an idle TTL (default 300s). `--ttl <seconds>` overrides it; `--ttl 0` keeps owners alive indefinitely.
+- Queue owners use an idle TTL (default 5400s). `--ttl <seconds>` overrides it; `--ttl 0` keeps owners alive indefinitely.
 - `--no-wait` submits to that queue and returns immediately.
 - `cancel` sends cooperative `session/cancel` to the running queue owner process and returns success when no prompt is running (`nothing to cancel`).
 - `set-mode` and `set` route through queue-owner IPC when active, otherwise they reconnect directly to apply `session/set_mode` and `session/set_config_option`.

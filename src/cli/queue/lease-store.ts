@@ -226,7 +226,7 @@ export async function terminateProcess(pid: number): Promise<boolean> {
 // The queue owner is spawned `detached: true` (queue-owner-process.ts), so it is
 // a process-group leader and its pgid equals its pid. Mirrors the liveness probe
 // in acp/terminal-manager.ts.
-function hasLiveProcessGroup(pid: number): boolean {
+export function hasLiveProcessGroup(pid: number): boolean {
   if (process.platform === "win32" || !Number.isInteger(pid) || pid <= 0) {
     return false;
   }
@@ -240,7 +240,7 @@ function hasLiveProcessGroup(pid: number): boolean {
 
 // Best-effort signal to the whole process group led by `pid` (negative pid).
 // Swallows errors: the group may already be gone (ESRCH) or unkillable (EPERM).
-function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
+export function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
   try {
     process.kill(-pid, signal);
   } catch {

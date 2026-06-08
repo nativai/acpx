@@ -326,6 +326,11 @@ test("resolveGlobalFlags resolves explicit --ttl into ttl + ttlExplicitMs", () =
   assert.equal(plain.ttlExplicitMs, undefined);
 });
 
+test("addGlobalFlags documents the 90 minute ttl default", () => {
+  const command = addGlobalFlags(new Command());
+  assert.match(command.helpInformation(), /default: 5400/);
+});
+
 test("resolveGlobalFlags treats non-object Commander options as absent", () => {
   const flags = resolveGlobalFlags(
     {

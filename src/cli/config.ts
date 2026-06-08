@@ -58,7 +58,7 @@ type ConfigFileLoadResult = {
 };
 
 const DEFAULT_TIMEOUT_MS = undefined;
-const DEFAULT_TTL_MS = 300_000;
+const DEFAULT_TTL_MS = 5_400_000;
 const DEFAULT_PERMISSION_MODE: PermissionMode = "approve-reads";
 const DEFAULT_NON_INTERACTIVE_PERMISSION_POLICY: NonInteractivePermissionPolicy = "deny";
 const DEFAULT_AUTH_POLICY: AuthPolicy = "skip";
@@ -580,7 +580,7 @@ export async function initGlobalConfigFile(): Promise<{
     defaultPermissions: "approve-all",
     nonInteractivePermissions: "deny",
     authPolicy: "skip",
-    ttl: 300,
+    ttl: 5400,
     timeout: null,
     queueMaxDepth: DEFAULT_QUEUE_MAX_DEPTH,
     format: "text",
