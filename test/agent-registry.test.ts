@@ -20,6 +20,50 @@ test("resolveAgentCommand maps known agents to commands", () => {
   }
 });
 
+test("AGENT_REGISTRY.claude uses ACPX_CLAUDE_ACP_COMMAND env override when set", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const result = execFileSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      `import { AGENT_REGISTRY } from "./dist-test/src/agent-registry.js"; process.stdout.write(AGENT_REGISTRY.claude);`,
+    ],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, ACPX_CLAUDE_ACP_COMMAND: "my-custom-bridge --acp" },
+      encoding: "utf8",
+    },
+  );
+  assert.equal(result, "my-custom-bridge --acp");
+});
+
+test("AGENT_REGISTRY.claude falls back to /opt path when ACPX_CLAUDE_ACP_COMMAND is not set", () => {
+  // In the test environment ACPX_CLAUDE_ACP_COMMAND is not set;
+  // this verifies the registry was loaded with the fallback.
+  const envOverride = process.env.ACPX_CLAUDE_ACP_COMMAND;
+  const expected = envOverride || "node /opt/claude-agent-acp/dist/index.js";
+  assert.equal(AGENT_REGISTRY.claude, expected);
+});
+
+test("AGENT_REGISTRY.claude falls back to /opt path when ACPX_CLAUDE_ACP_COMMAND is empty string", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const result = execFileSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      `import { AGENT_REGISTRY } from "./dist-test/src/agent-registry.js"; process.stdout.write(AGENT_REGISTRY.claude);`,
+    ],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, ACPX_CLAUDE_ACP_COMMAND: "" },
+      encoding: "utf8",
+    },
+  );
+  assert.equal(result, "node /opt/claude-agent-acp/dist/index.js");
+});
+
 test("resolveAgentCommand returns raw value for unknown agents", () => {
   assert.equal(resolveAgentCommand("custom-acp-server"), "custom-acp-server");
 });

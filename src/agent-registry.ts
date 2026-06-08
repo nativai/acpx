@@ -38,7 +38,7 @@ export const AGENT_REGISTRY: Record<string, string> = {
   pi: `npx pi-acp@${ACP_ADAPTER_PACKAGE_RANGES.pi}`,
   openclaw: "openclaw acp",
   codex: `npx -y @agentclientprotocol/codex-acp@${ACP_ADAPTER_PACKAGE_RANGES.codex}`,
-  claude: `node /opt/claude-agent-acp/dist/index.js`,
+  claude: process.env.ACPX_CLAUDE_ACP_COMMAND || `node /opt/claude-agent-acp/dist/index.js`,
   gemini: "gemini --acp",
   cursor: "cursor-agent acp",
   copilot: "copilot --acp --stdio",
