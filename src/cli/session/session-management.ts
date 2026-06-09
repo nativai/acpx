@@ -1,4 +1,9 @@
-import { AcpClient, type SessionCreateResult } from "../../acp/client.js";
+import {
+  AcpClient,
+  type SessionCreateResult,
+  type SessionForkResult,
+  type SessionLoadResult,
+} from "../../acp/client.js";
 import { formatErrorMessage } from "../../acp/error-normalization.js";
 import { withInterrupt, withTimeout } from "../../async-control.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
@@ -15,6 +20,7 @@ import {
   findSessionByDirectoryWalk,
   isoNow,
   normalizeName,
+  resolveSessionRecord,
   writeSessionRecord,
 } from "../../session/persistence.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
@@ -37,21 +43,40 @@ async function createSessionRecordWithClient(
   const cwd = absolutePath(options.cwd);
   await withTimeout(client.start(), options.timeoutMs);
   let sessionId: string;
+  let acpSessionId: string;
   let agentSessionId: string | undefined;
-  let sessionResult: Awaited<ReturnType<AcpClient["createSession" | "loadSession"]>>;
+  let sessionResult: SessionCreateResult | SessionLoadResult | SessionForkResult;
   let sessionModels: SessionCreateResult["models"];
   let requestedModelApplied = false;
+  let forkContext:
+    | {
+        sourceRecord: SessionRecord;
+        forkAtMessageIndex: number;
+        messages: SessionRecord["messages"];
+      }
+    | undefined;
 
   if (options.resumeSessionId) {
     const resumed = await resumeSessionRecordWithClient(client, options, cwd);
     sessionId = resumed.sessionId;
+    acpSessionId = resumed.acpSessionId;
     agentSessionId = resumed.agentSessionId;
     sessionResult = resumed.sessionResult;
     sessionModels = resumed.sessionModels;
     requestedModelApplied = resumed.requestedModelApplied;
+  } else if (options.forkFromSessionId) {
+    const forked = await forkSessionRecordWithClient(client, options, cwd);
+    sessionId = forked.sessionId;
+    acpSessionId = forked.acpSessionId;
+    agentSessionId = forked.agentSessionId;
+    sessionResult = forked.sessionResult;
+    sessionModels = forked.sessionModels;
+    requestedModelApplied = forked.requestedModelApplied;
+    forkContext = forked.forkContext;
   } else {
     const createdSession = await withTimeout(client.createSession(cwd), options.timeoutMs);
     sessionId = createdSession.sessionId;
+    acpSessionId = sessionId;
     agentSessionId = normalizeRuntimeSessionId(createdSession.agentSessionId);
     sessionResult = createdSession;
     sessionModels = createdSession.models;
@@ -67,10 +92,15 @@ async function createSessionRecordWithClient(
 
   const lifecycle = client.getAgentLifecycleSnapshot();
   const now = isoNow();
+  const conversation = createSessionConversation(now);
+  const desiredConfigOptions = cloneDesiredConfigOptions(options.desiredConfigOptions);
+  if (forkContext) {
+    conversation.messages = structuredClone(forkContext.messages);
+  }
   const record: SessionRecord = {
     schema: "acpx.session.v1",
     acpxRecordId: sessionId,
-    acpSessionId: sessionId,
+    acpSessionId,
     agentSessionId,
     agentCommand: options.agentCommand,
     cwd,
@@ -86,8 +116,15 @@ async function createSessionRecordWithClient(
     agentStartedAt: lifecycle.startedAt,
     protocolVersion: client.initializeResult?.protocolVersion,
     agentCapabilities: client.initializeResult?.agentCapabilities,
-    ...createSessionConversation(now),
-    acpx: {},
+    ...conversation,
+    acpx: desiredConfigOptions ? { desired_config_options: desiredConfigOptions } : {},
+    ...(forkContext
+      ? {
+          kind: "session" as const,
+          forkedFromSessionId: forkContext.sourceRecord.acpxRecordId,
+          forkedAtMessageIndex: forkContext.forkAtMessageIndex,
+        }
+      : {}),
     ...(options.parentSessionId
       ? { kind: "session" as const, parentSessionId: options.parentSessionId }
       : {}),
@@ -117,12 +154,35 @@ async function createSessionRecordWithClient(
   return record;
 }
 
+function cloneDesiredConfigOptions(
+  desiredConfigOptions: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (!desiredConfigOptions || Object.keys(desiredConfigOptions).length === 0) {
+    return undefined;
+  }
+  return { ...desiredConfigOptions };
+}
+
 type CreatedSessionState = {
   sessionId: string;
+  acpSessionId: string;
   agentSessionId: string | undefined;
-  sessionResult: Awaited<ReturnType<AcpClient["createSession" | "loadSession"]>>;
+  sessionResult: SessionCreateResult | SessionLoadResult | SessionForkResult;
   sessionModels: SessionCreateResult["models"];
   requestedModelApplied: boolean;
+};
+
+type ForkedSessionState = CreatedSessionState & {
+  forkContext: {
+    sourceRecord: SessionRecord;
+    forkAtMessageIndex: number;
+    messages: SessionRecord["messages"];
+  };
+};
+
+type ForkSourceContext = {
+  sourceRecord: SessionRecord;
+  forkAtMessageIndex: number;
 };
 
 async function resumeSessionRecordWithClient(
@@ -154,6 +214,7 @@ async function resumeSessionRecordWithClient(
     const sessionModels = resumedSession.models;
     return {
       sessionId: options.resumeSessionId,
+      acpSessionId: options.resumeSessionId,
       agentSessionId: normalizeRuntimeSessionId(resumedSession.agentSessionId),
       sessionResult: resumedSession,
       sessionModels,
@@ -169,6 +230,81 @@ async function resumeSessionRecordWithClient(
   } catch (error) {
     throw new Error(
       `Failed to resume ACP session ${options.resumeSessionId}: ${formatErrorMessage(error)}`,
+      {
+        cause: error,
+      },
+    );
+  }
+}
+
+async function resolveForkSourceContext(options: SessionCreateOptions): Promise<ForkSourceContext> {
+  if (!options.forkFromSessionId) {
+    throw new Error("forkFromSessionId is required");
+  }
+
+  const sourceRecord = await resolveSessionRecord(options.forkFromSessionId);
+  if (sourceRecord.kind === "subagent") {
+    throw new Error("Cannot copy a subagent session");
+  }
+
+  const forkAtMessageIndex = options.forkAtMessageIndex ?? sourceRecord.messages.length;
+  if (forkAtMessageIndex < 0 || forkAtMessageIndex > sourceRecord.messages.length) {
+    throw new Error(`--at-index out of range (0-${sourceRecord.messages.length})`);
+  }
+
+  return { sourceRecord, forkAtMessageIndex };
+}
+
+async function forkSessionRecordWithClient(
+  client: AcpClient,
+  options: SessionCreateOptions,
+  cwd: string,
+): Promise<ForkedSessionState> {
+  const { sourceRecord, forkAtMessageIndex } = await resolveForkSourceContext(options);
+
+  if (!client.supportsForkSession()) {
+    throw new Error(
+      `Agent command "${options.agentCommand}" does not advertise sessionCapabilities.fork; cannot copy session ${sourceRecord.acpxRecordId}`,
+    );
+  }
+
+  try {
+    const forkedSession =
+      forkAtMessageIndex === 0
+        ? await withTimeout(client.createSession(cwd), options.timeoutMs)
+        : await withTimeout(
+            client.forkSession(sourceRecord.acpSessionId, cwd, {
+              atIndex: options.forkAtMessageIndex,
+              sourceCwd: sourceRecord.cwd,
+              suppressReplayUpdates: true,
+            }),
+            options.timeoutMs,
+          );
+    const sessionModels = forkedSession.models;
+    const agentSessionId = normalizeRuntimeSessionId(forkedSession.agentSessionId);
+    return {
+      sessionId: forkedSession.sessionId,
+      acpSessionId: forkedSession.sessionId,
+      agentSessionId,
+      sessionResult: forkedSession,
+      sessionModels,
+      requestedModelApplied: await applyRequestedModelIfAdvertised({
+        client,
+        sessionId: forkedSession.sessionId,
+        requestedModel: options.sessionOptions?.model,
+        models: sessionModels,
+        agentCommand: options.agentCommand,
+        timeoutMs: options.timeoutMs,
+      }),
+      forkContext: {
+        sourceRecord,
+        forkAtMessageIndex,
+        messages: sourceRecord.messages.slice(0, forkAtMessageIndex),
+      },
+    };
+  } catch (error) {
+    throw new Error(
+      `Failed to copy ACP session ${sourceRecord.acpSessionId}: ${formatErrorMessage(error)}`,
       {
         cause: error,
       },

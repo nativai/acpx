@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess, type ChildProcessByStdio } from "node:child_process";
+import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
   ClientSideConnection,
@@ -7,6 +8,7 @@ import {
   type AuthMethod,
   type CreateTerminalRequest,
   type CreateTerminalResponse,
+  type ForkSessionResponse,
   type InitializeResponse,
   type ListSessionsRequest,
   type ListSessionsResponse,
@@ -86,6 +88,10 @@ import {
   resolveConfiguredAuthCredential,
 } from "./auth-env.js";
 import {
+  materializeClaudeForkSession,
+  resolveClaudeUuidForAcpxIndex,
+} from "./claude-fork-index.js";
+import {
   asAbsoluteCwd,
   isoNow,
   isChildProcessRunning,
@@ -125,6 +131,18 @@ type LoadSessionOptions = {
   replayDrainTimeoutMs?: number;
 };
 
+type ForkSessionOptions = LoadSessionOptions & {
+  atIndex?: number;
+  sourceCwd?: string;
+};
+
+type ForkRequestContext = {
+  meta?: Record<string, unknown>;
+  claudeFork: boolean;
+  sourceCwd: string;
+  claudeResumeSessionAt?: string;
+};
+
 export type AcpPromptOptions = {
   messageId?: string;
 };
@@ -156,6 +174,10 @@ export type SessionLoadResult = {
 
 export type SessionResumeResult = SessionLoadResult;
 
+export type SessionForkResult = SessionLoadResult & {
+  sessionId: string;
+};
+
 type ReconnectedSessionResponse = LoadSessionResponse | ResumeSessionResponse;
 
 function toReconnectedSessionResult(
@@ -166,6 +188,35 @@ function toReconnectedSessionResult(
     configOptions: response?.configOptions ?? undefined,
     models: response?.models ?? undefined,
   };
+}
+
+function toForkSessionResult(response: ForkSessionResponse): SessionForkResult {
+  return {
+    sessionId: response.sessionId,
+    agentSessionId: extractRuntimeSessionId(response._meta),
+    configOptions: response.configOptions ?? undefined,
+    models: response.models ?? undefined,
+  };
+}
+
+function mergeRecordValues(
+  left: Record<string, unknown>,
+  right: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...left };
+  for (const [key, value] of Object.entries(right)) {
+    const existing = merged[key];
+    if (isPlainRecord(existing) && isPlainRecord(value)) {
+      merged[key] = mergeRecordValues(existing, value);
+      continue;
+    }
+    merged[key] = value;
+  }
+  return merged;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 type AgentDisconnectReason = "process_exit" | "process_close" | "pipe_close" | "connection_close";
@@ -458,6 +509,10 @@ export class AcpClient {
 
   supportsResumeSession(): boolean {
     return Boolean(this.initResult?.agentCapabilities?.sessionCapabilities?.resume);
+  }
+
+  supportsForkSession(): boolean {
+    return Boolean(this.initResult?.agentCapabilities?.sessionCapabilities?.fork);
   }
 
   supportsCloseSession(): boolean {
@@ -947,6 +1002,155 @@ export class AcpClient {
     this.loadedSessionId = sessionId;
 
     return toReconnectedSessionResult(response);
+  }
+
+  async forkSession(
+    sourceAcpSessionId: string,
+    cwd = this.options.cwd,
+    options: ForkSessionOptions = {},
+  ): Promise<SessionForkResult> {
+    const connection = this.getConnection();
+    const sessionCwd = await resolveAgentSessionCwd(cwd, this.options.agentCommand);
+    const sourceCwd = await resolveAgentSessionCwd(
+      options.sourceCwd ?? cwd,
+      this.options.agentCommand,
+    );
+    const forkContext = await this.buildForkRequestContext(
+      sourceAcpSessionId,
+      sourceCwd,
+      options.atIndex,
+    );
+    const requestMeta = this.buildForkRequestMeta(forkContext);
+    const requestCwd = this.resolveForkRequestCwd(forkContext, sessionCwd);
+    const previousSuppression = this.applySessionUpdateSuppression(
+      Boolean(options.suppressReplayUpdates),
+    );
+
+    let response: ForkSessionResponse | undefined;
+
+    try {
+      response = await this.runConnectionRequest(() =>
+        connection.unstable_forkSession({
+          sessionId: sourceAcpSessionId,
+          cwd: requestCwd,
+          mcpServers: this.options.mcpServers ?? [],
+          ...(requestMeta ? { _meta: requestMeta } : {}),
+        }),
+      );
+
+      await this.waitForSessionUpdateDrain(
+        options.replayIdleMs ?? REPLAY_IDLE_MS,
+        options.replayDrainTimeoutMs ?? REPLAY_DRAIN_TIMEOUT_MS,
+      );
+    } finally {
+      this.restoreSessionUpdateSuppression(previousSuppression);
+    }
+
+    if (!response) {
+      throw new Error("session/fork returned no response");
+    }
+    const result = toForkSessionResult(response);
+    await this.applyDurableClaudeForkSessionId(result, forkContext, sourceAcpSessionId, sessionCwd);
+
+    this.loadedSessionId = result.sessionId;
+
+    return result;
+  }
+
+  private resolveForkRequestCwd(forkContext: ForkRequestContext, sessionCwd: string): string {
+    // Claude's ACP fork path resolves the source transcript relative to the
+    // request cwd. Cross-cwd copies therefore ask ACP to fork from the source cwd;
+    // the SDK materializer below writes the durable copy into the destination cwd.
+    if (
+      forkContext.claudeFork &&
+      path.resolve(forkContext.sourceCwd) !== path.resolve(sessionCwd)
+    ) {
+      return forkContext.sourceCwd;
+    }
+    return sessionCwd;
+  }
+
+  private buildForkRequestMeta(
+    forkContext: ForkRequestContext,
+  ): Record<string, unknown> | undefined {
+    const optionsMeta = forkContext.claudeFork
+      ? buildClaudeCodeOptionsMeta(this.options.sessionOptions)
+      : undefined;
+    if (!forkContext.meta) {
+      return optionsMeta;
+    }
+    if (!optionsMeta) {
+      return forkContext.meta;
+    }
+    return mergeRecordValues(optionsMeta, forkContext.meta);
+  }
+
+  private async applyDurableClaudeForkSessionId(
+    result: SessionForkResult,
+    forkContext: ForkRequestContext,
+    sourceAcpSessionId: string,
+    cwd: string,
+  ): Promise<void> {
+    if (!forkContext.claudeFork) {
+      return;
+    }
+
+    const durableClaudeSessionId = await materializeClaudeForkSession({
+      agentCommand: this.options.agentCommand,
+      cwd,
+      sourceCwd: forkContext.sourceCwd,
+      sourceAcpSessionId,
+      subscriptionId: this.options.sessionOptions?.subscription,
+      upToMessageId: forkContext.claudeResumeSessionAt,
+    });
+    if (!durableClaudeSessionId) {
+      return;
+    }
+
+    result.sessionId = durableClaudeSessionId;
+    result.agentSessionId = durableClaudeSessionId;
+  }
+
+  private async buildForkRequestContext(
+    sourceAcpSessionId: string,
+    cwd: string,
+    atIndex: number | undefined,
+  ): Promise<ForkRequestContext> {
+    const { command, args } = splitCommandLine(this.options.agentCommand);
+
+    if (atIndex === undefined) {
+      return { claudeFork: isClaudeAcpCommand(command, args), sourceCwd: cwd };
+    }
+
+    if (isClaudeAcpCommand(command, args)) {
+      const uuid = await resolveClaudeUuidForAcpxIndex({
+        cwd,
+        acpSessionId: sourceAcpSessionId,
+        forkAtIndex: atIndex,
+        subscriptionId: this.options.sessionOptions?.subscription,
+      });
+      if (!uuid) {
+        throw new Error(
+          `Cannot copy Claude session at --at-index ${atIndex}: no Claude transcript UUID could be resolved for that acpx message index`,
+        );
+      }
+      return {
+        claudeFork: true,
+        sourceCwd: cwd,
+        claudeResumeSessionAt: uuid,
+        meta: { claudeCode: { options: { resumeSessionAt: uuid } } },
+      };
+    }
+
+    if (isCodexAcpCommand(command, args)) {
+      throw new Error("Codex fork-at-index not yet supported (full copy only)");
+    }
+
+    return {
+      claudeFork: false,
+      sourceCwd: cwd,
+      meta: { acpx: { forkAtMessageIndex: atIndex } },
+    };
   }
 
   private applySessionUpdateSuppression(enabled: boolean): SessionUpdateSuppressionState {

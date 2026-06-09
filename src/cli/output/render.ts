@@ -149,6 +149,36 @@ export function printNewSessionByFormat(
   process.stdout.write(`${record.acpxRecordId}\n`);
 }
 
+export function printCopiedSessionByFormat(
+  record: SessionRecord,
+  source: SessionRecord,
+  format: OutputFormat,
+): void {
+  if (
+    emitJsonResult(format, {
+      action: "session_copied",
+      created: true,
+      acpxRecordId: record.acpxRecordId,
+      acpxSessionId: record.acpSessionId,
+      agentSessionId: record.agentSessionId,
+      name: record.name,
+      sourceSessionId: source.acpxRecordId,
+      forkedFromSessionId: record.forkedFromSessionId,
+      forkedAtMessageIndex: record.forkedAtMessageIndex,
+      ephemeral: record.metadata?.byway === "1",
+    })
+  ) {
+    return;
+  }
+
+  if (format === "quiet") {
+    process.stdout.write(`${record.acpxRecordId}\n`);
+    return;
+  }
+
+  process.stdout.write(`${record.acpxRecordId}\n`);
+}
+
 export function printEnsuredSessionByFormat(
   record: SessionRecord,
   created: boolean,

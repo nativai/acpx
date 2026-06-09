@@ -75,6 +75,14 @@ export type SessionsNewFlags = {
   metadata?: Record<string, string>;
 };
 
+export type SessionsCopyFlags = {
+  from: string;
+  atIndex?: number;
+  name?: string;
+  metadata?: Record<string, string>;
+  ephemeral?: boolean;
+};
+
 export type SessionsHistoryFlags = {
   limit: number;
 };
@@ -211,6 +219,14 @@ export function parseHistoryLimit(value: string): number {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed <= 0) {
     throw new InvalidArgumentError("Limit must be a positive integer");
+  }
+  return parsed;
+}
+
+export function parseForkAtIndex(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new InvalidArgumentError("--at-index must be a non-negative integer");
   }
   return parsed;
 }

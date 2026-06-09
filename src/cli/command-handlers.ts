@@ -1,7 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Command, InvalidArgumentError } from "commander";
-import { isLegacyZedCodexAcpInvocation } from "../acp/codex-compat.js";
+import { splitCommandLine } from "../acp/client-process.js";
+import { isCodexAcpCommand, isLegacyZedCodexAcpInvocation } from "../acp/codex-compat.js";
 import {
   listBuiltInAgents,
   resolveAgentCommand,
@@ -16,8 +17,10 @@ import {
   PromptInputValidationError,
   textPrompt,
 } from "../prompt-content.js";
+import { sessionOptionsFromRecord } from "../runtime/engine/session-options.js";
 import { exportSession } from "../session/export.js";
 import { importSession } from "../session/import.js";
+import { getDesiredConfigOptions } from "../session/mode-preference.js";
 import {
   findGitRepositoryRoot,
   findSession,
@@ -46,6 +49,7 @@ import {
   resolveSessionNameFromFlags,
   type ExecFlags,
   type GlobalFlags,
+  type SessionsCopyFlags,
   type SessionsExportFlags,
   type PromptFlags,
   type SessionsImportFlags,
@@ -394,6 +398,108 @@ function buildSessionStartOptions(params: {
   };
 }
 
+function optionValueSourceWithGlobals(command: Command, optionName: string): string | undefined {
+  let current: Command | null = command;
+  while (current) {
+    const source = current.getOptionValueSource(optionName);
+    if (source !== undefined) {
+      return source;
+    }
+    current = current.parent;
+  }
+  return undefined;
+}
+
+function resolveCopyDestinationCwd(
+  command: Command,
+  globalFlags: GlobalFlags,
+  source: SessionRecord,
+): string {
+  const cwdSource = optionValueSourceWithGlobals(command, "cwd");
+  return cwdSource && cwdSource !== "default" ? path.resolve(globalFlags.cwd) : source.cwd;
+}
+
+function sourceDefaultForkName(source: SessionRecord): string {
+  const sourceName = source.name ?? source.title ?? "session";
+  return `${sourceName} (fork)`;
+}
+
+function agentTypeLabel(agentCommand: string, config: ResolvedAcpxConfig): string {
+  return resolveAgentNameFromCommand(agentCommand, config.agents) ?? agentCommand;
+}
+
+function sourceIsCodex(source: SessionRecord): boolean {
+  const parsed = splitCommandLine(source.agentCommand);
+  return isCodexAcpCommand(parsed.command, parsed.args);
+}
+
+function copyMetadata(
+  flags: SessionsCopyFlags,
+  source: SessionRecord,
+  forkAtMessageIndex: number,
+): Record<string, string> | undefined {
+  const metadata: Record<string, string> = { ...flags.metadata };
+  if (flags.ephemeral === true) {
+    metadata.byway = "1";
+    metadata.byway_parent = source.acpxRecordId;
+    metadata.byway_at = String(forkAtMessageIndex);
+  }
+  return Object.keys(metadata).length > 0 ? metadata : undefined;
+}
+
+function sourceSessionOptions(source: SessionRecord) {
+  const sessionOptions = { ...sessionOptionsFromRecord(source) };
+  const reasoningEffort = getDesiredConfigOptions(source.acpx).effort;
+  if (reasoningEffort !== undefined) {
+    sessionOptions.reasoningEffort = reasoningEffort;
+  }
+  return Object.keys(sessionOptions).length > 0 ? sessionOptions : undefined;
+}
+
+function sourceDesiredConfigOptions(source: SessionRecord): Record<string, string> | undefined {
+  const desired = getDesiredConfigOptions(source.acpx);
+  return Object.keys(desired).length > 0 ? desired : undefined;
+}
+
+function assertCopyableSource(source: SessionRecord): void {
+  if (source.kind === "subagent") {
+    throw new Error("Cannot copy a subagent session");
+  }
+}
+
+function resolveForkAtMessageIndex(source: SessionRecord, atIndex: number | undefined): number {
+  const messageCount = source.messages.length;
+  const forkAtMessageIndex = atIndex ?? messageCount;
+  if (forkAtMessageIndex < 0 || forkAtMessageIndex > messageCount) {
+    throw new InvalidArgumentError(`--at-index out of range (0-${messageCount})`);
+  }
+  return forkAtMessageIndex;
+}
+
+function assertCodexAtIndexSupported(source: SessionRecord, atIndex: number | undefined): void {
+  if (atIndex !== undefined && sourceIsCodex(source)) {
+    throw new Error("Codex fork-at-index not yet supported (full copy only)");
+  }
+}
+
+function assertCopyAgentLock(params: {
+  explicitAgentName?: string;
+  globalFlags: GlobalFlags;
+  pathAgent: ResolvedAgentInvocation;
+  source: SessionRecord;
+  config: ResolvedAcpxConfig;
+}): void {
+  const agentWasExplicit =
+    params.explicitAgentName !== undefined || !!params.globalFlags.agent?.trim();
+  if (!agentWasExplicit || params.pathAgent.agentCommand === params.source.agentCommand) {
+    return;
+  }
+  const sourceType = agentTypeLabel(params.source.agentCommand, params.config);
+  throw new Error(
+    `sessions copy preserves the source agent type (${sourceType}); cannot copy as ${params.pathAgent.agentName}`,
+  );
+}
+
 function resolveSessionListFilterCwd(
   flags: Pick<SessionsListFlags, "filterCwd">,
   agentCwd: string,
@@ -510,6 +616,33 @@ async function findGenericReadableSessionOrThrow(
   throw new Error(
     `${baseMessage}\n${defaultHint} Multiple matching sessions exist across agents; use an explicit agent command:\n${suggestions}`,
   );
+}
+
+async function findReadableSessionOrThrow(params: {
+  explicitAgentName: string | undefined;
+  agent: ResolvedAgentInvocation;
+  sessionNameOrId: string | undefined;
+  subcommand: string;
+  config: ResolvedAcpxConfig;
+}): Promise<SessionRecord> {
+  if (params.sessionNameOrId !== undefined) {
+    try {
+      return await resolveSessionRecord(params.sessionNameOrId);
+    } catch (error) {
+      if (!(error instanceof SessionNotFoundError)) {
+        throw error;
+      }
+    }
+  }
+
+  return params.explicitAgentName == null
+    ? await findGenericReadableSessionOrThrow(
+        params.agent,
+        params.sessionNameOrId,
+        params.subcommand,
+        params.config,
+      )
+    : await findScopedSessionOrThrow(params.agent, params.sessionNameOrId);
 }
 
 async function findRoutedSessionOrThrow(
@@ -1216,6 +1349,48 @@ export async function handleSessionsNew(
   printNewSessionByFormat(created, replaced, globalFlags.format);
 }
 
+export async function handleSessionsCopy(
+  explicitAgentName: string | undefined,
+  flags: SessionsCopyFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
+  const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
+  const pathAgent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const source = await resolveSessionRecord(flags.from);
+  assertCopyableSource(source);
+  const forkAtMessageIndex = resolveForkAtMessageIndex(source, flags.atIndex);
+  assertCodexAtIndexSupported(source, flags.atIndex);
+  assertCopyAgentLock({ explicitAgentName, globalFlags, pathAgent, source, config });
+
+  const [{ createSession }, { printCopiedSessionByFormat, printCreatedSessionBanner }] =
+    await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
+  const created = await createSession({
+    agentCommand: source.agentCommand,
+    cwd: resolveCopyDestinationCwd(command, globalFlags, source),
+    name: flags.name ?? sourceDefaultForkName(source),
+    metadata: copyMetadata(flags, source, forkAtMessageIndex),
+    forkFromSessionId: source.acpxRecordId,
+    forkAtMessageIndex: flags.atIndex,
+    mcpServers: config.mcpServers,
+    permissionMode,
+    nonInteractivePermissions: globalFlags.nonInteractivePermissions,
+    permissionPolicy,
+    authCredentials: config.auth,
+    authPolicy: globalFlags.authPolicy,
+    terminal: globalFlags.terminal,
+    timeoutMs: globalFlags.timeout,
+    verbose: globalFlags.verbose,
+    sessionOptions: sourceSessionOptions(source),
+    desiredConfigOptions: sourceDesiredConfigOptions(source),
+  });
+  const sourceType = agentTypeLabel(source.agentCommand, config);
+  printCreatedSessionBanner(created, sourceType, globalFlags.format, globalFlags.jsonStrict);
+  printCopiedSessionByFormat(created, source, globalFlags.format);
+}
+
 export async function handleSessionsEnsure(
   explicitAgentName: string | undefined,
   flags: SessionsNewFlags,
@@ -1422,10 +1597,13 @@ export async function handleSessionsShow(
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const record =
-    explicitAgentName == null
-      ? await findGenericReadableSessionOrThrow(agent, sessionName, "show", config)
-      : await findScopedSessionOrThrow(agent, sessionName);
+  const record = await findReadableSessionOrThrow({
+    explicitAgentName,
+    agent,
+    sessionNameOrId: sessionName,
+    subcommand: "show",
+    config,
+  });
 
   printSessionDetailsByFormat(record, globalFlags.format);
 }
@@ -1440,10 +1618,13 @@ export async function handleSessionsHistory(
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const subcommand = command.name() === "read" ? "read" : "history";
-  const record =
-    explicitAgentName == null
-      ? await findGenericReadableSessionOrThrow(agent, sessionName, subcommand, config)
-      : await findScopedSessionOrThrow(agent, sessionName);
+  const record = await findReadableSessionOrThrow({
+    explicitAgentName,
+    agent,
+    sessionNameOrId: sessionName,
+    subcommand,
+    config,
+  });
 
   printSessionHistoryByFormat(record, flags.limit, globalFlags.format);
 }
