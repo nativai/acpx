@@ -7,8 +7,6 @@ const ACP_ADAPTER_PACKAGE_RANGES = {
   codex: "^0.0.44",
 } as const;
 
-const DEFAULT_CODEX_ACP_COMMAND = `npx -y @agentclientprotocol/codex-acp@${ACP_ADAPTER_PACKAGE_RANGES.codex}`;
-
 type BuiltInAgentPackageSpec = {
   packageName: string;
   packageRange: string;
@@ -39,7 +37,7 @@ type BuiltInLaunchResolverOptions = {
 export const AGENT_REGISTRY: Record<string, string> = {
   pi: `npx pi-acp@${ACP_ADAPTER_PACKAGE_RANGES.pi}`,
   openclaw: "openclaw acp",
-  codex: process.env.ACPX_CODEX_ACP_COMMAND || DEFAULT_CODEX_ACP_COMMAND,
+  codex: process.env.ACPX_CODEX_ACP_COMMAND || `node /opt/codex-acp/dist/index.js`,
   claude: process.env.ACPX_CLAUDE_ACP_COMMAND || `node /opt/claude-agent-acp/dist/index.js`,
   gemini: "gemini --acp",
   cursor: "cursor-agent acp",
@@ -55,21 +53,18 @@ export const AGENT_REGISTRY: Record<string, string> = {
   trae: "traecli acp serve",
 };
 
-// `claude` is intentionally absent here. Its AGENT_REGISTRY entry points at the
-// container-built fork (`node /opt/claude-agent-acp/dist/index.js`); with no
-// built-in-package spec, findBuiltInAgentPackage() returns undefined for that
-// command, both resolvers bail, and the client spawns the /opt command verbatim.
-// Re-adding a claude spec here would make resolveInstalledBuiltInAgentLaunch
-// prefer an installed npm package and silently shadow the fork.
-export const BUILT_IN_AGENT_PACKAGES = {
-  codex: {
-    packageName: "@agentclientprotocol/codex-acp",
-    packageRange: ACP_ADAPTER_PACKAGE_RANGES.codex,
-    preferredBinName: "codex-acp",
-    fallbackCommand: DEFAULT_CODEX_ACP_COMMAND,
-    legacyFallbackCommands: [],
-  },
-} as const satisfies Record<string, BuiltInAgentPackageSpec>;
+// `claude` and `codex` are intentionally absent here. Their AGENT_REGISTRY entries
+// point at the container-built forks (`node /opt/claude-agent-acp/dist/index.js`,
+// `node /opt/codex-acp/dist/index.js`); with no built-in-package spec,
+// findBuiltInAgentPackage() returns undefined for those commands, both resolvers
+// bail, and the client spawns the /opt command verbatim. Adding a spec whose
+// fallbackCommand equals the /opt command would make resolveInstalledBuiltInAgentLaunch
+// prefer an installed npm package and silently shadow the fork — this exact
+// collision once broke Codex session copy.
+export const BUILT_IN_AGENT_PACKAGES = {} as const satisfies Record<
+  string,
+  BuiltInAgentPackageSpec
+>;
 
 const AGENT_ALIASES: Record<string, string> = {
   "factory-droid": "droid",

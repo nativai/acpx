@@ -1,7 +1,4 @@
 import assert from "node:assert/strict";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import test from "node:test";
 import {
   AGENT_REGISTRY,
@@ -10,7 +7,6 @@ import {
   listBuiltInAgents,
   resolveBuiltInAgentLaunch,
   resolveInstalledBuiltInAgentLaunch,
-  resolvePackageExecBuiltInAgentLaunch,
   resolveAgentCommand,
 } from "../src/agent-registry.js";
 
@@ -85,7 +81,7 @@ test("AGENT_REGISTRY.codex uses ACPX_CODEX_ACP_COMMAND env override when set", a
   });
 });
 
-test("AGENT_REGISTRY.codex falls back to npx package when ACPX_CODEX_ACP_COMMAND is empty string", async () => {
+test("AGENT_REGISTRY.codex falls back to /opt path when ACPX_CODEX_ACP_COMMAND is empty string", async () => {
   const { execFileSync } = await import("node:child_process");
   const result = execFileSync(
     process.execPath,
@@ -100,7 +96,7 @@ test("AGENT_REGISTRY.codex falls back to npx package when ACPX_CODEX_ACP_COMMAND
       encoding: "utf8",
     },
   );
-  assert.equal(result, "npx -y @agentclientprotocol/codex-acp@^0.0.44");
+  assert.equal(result, "node /opt/codex-acp/dist/index.js");
 });
 
 test("resolveAgentCommand returns raw value for unknown agents", () => {
@@ -161,83 +157,22 @@ test("default agent is codex", () => {
   assert.equal(DEFAULT_AGENT_NAME, "codex");
 });
 
-test("claude is not a built-in package so the /opt fork command spawns verbatim", () => {
-  // The fork override runs the container-built bridge directly. Keeping claude out of
-  // BUILT_IN_AGENT_PACKAGES is what stops resolveBuiltInAgentLaunch from shadowing it
-  // with an installed / npx-exec'd published package — see src/agent-registry.ts.
+test("claude and codex are not built-in packages so the /opt fork commands spawn verbatim", () => {
+  // The fork overrides run the container-built bridges directly. Keeping claude and
+  // codex out of BUILT_IN_AGENT_PACKAGES is what stops resolveBuiltInAgentLaunch from
+  // shadowing them with an installed / npx-exec'd published package — see src/agent-registry.ts.
   assert.equal(AGENT_REGISTRY.claude, "node /opt/claude-agent-acp/dist/index.js");
+  assert.equal(AGENT_REGISTRY.codex, "node /opt/codex-acp/dist/index.js");
   assert.equal(Object.keys(BUILT_IN_AGENT_PACKAGES).includes("claude"), false);
+  assert.equal(Object.keys(BUILT_IN_AGENT_PACKAGES).includes("codex"), false);
   assert.equal(resolveBuiltInAgentLaunch(AGENT_REGISTRY.claude), undefined);
+  assert.equal(resolveBuiltInAgentLaunch(AGENT_REGISTRY.codex), undefined);
 });
 
-test("npm-backed built-ins use current adapter package ranges", () => {
-  assert.equal(BUILT_IN_AGENT_PACKAGES.codex.packageRange, "^0.0.44");
-  assert.equal(AGENT_REGISTRY.codex, "npx -y @agentclientprotocol/codex-acp@^0.0.44");
+test("pi built-in uses the current adapter package range", () => {
   assert.equal(AGENT_REGISTRY.pi, "npx pi-acp@^0.0.26");
 });
 
-test("resolveInstalledBuiltInAgentLaunch uses a locally installed adapter when available", (t) => {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-agent-registry-"));
-  t.after(() => {
-    fs.rmSync(tempDir, { recursive: true, force: true });
-  });
-
-  const packageRoot = path.join(tempDir, "node_modules", "@agentclientprotocol", "codex-acp");
-  fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true });
-  fs.mkdirSync(path.join(packageRoot, "bin"), { recursive: true });
-  fs.writeFileSync(
-    path.join(packageRoot, "package.json"),
-    JSON.stringify({
-      name: BUILT_IN_AGENT_PACKAGES.codex.packageName,
-      version: "0.0.44",
-      bin: {
-        "codex-acp": "bin/codex-acp.js",
-      },
-    }),
-  );
-  fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "export {};\n");
-  fs.writeFileSync(path.join(packageRoot, "bin", "codex-acp.js"), "#!/usr/bin/env node\n");
-
-  const launch = resolveInstalledBuiltInAgentLaunch(AGENT_REGISTRY.codex, {
-    resolvePackageRoot: () => packageRoot,
-  });
-
-  assert.deepEqual(launch, {
-    source: "installed",
-    command: process.execPath,
-    args: [path.join(packageRoot, "bin", "codex-acp.js")],
-    packageName: BUILT_IN_AGENT_PACKAGES.codex.packageName,
-    packageRange: BUILT_IN_AGENT_PACKAGES.codex.packageRange,
-    packageVersion: "0.0.44",
-    binPath: path.join(packageRoot, "bin", "codex-acp.js"),
-  });
-});
-
-test("resolveInstalledBuiltInAgentLaunch ignores non-built-in commands", () => {
+test("resolveInstalledBuiltInAgentLaunch returns undefined now that no built-in packages remain", () => {
   assert.equal(resolveInstalledBuiltInAgentLaunch("custom-acp-server --stdio"), undefined);
-});
-
-test("resolvePackageExecBuiltInAgentLaunch bridges built-ins through the current Node npm CLI", () => {
-  const npmCliPath = path.join(os.tmpdir(), "acpx-test-npm-cli.js");
-  const launch = resolvePackageExecBuiltInAgentLaunch(AGENT_REGISTRY.codex, {
-    execPath: "/tmp/node",
-    existsSync: (candidate) => candidate === npmCliPath,
-    resolveNpmCliPath: () => npmCliPath,
-  });
-
-  assert.deepEqual(launch, {
-    source: "package-exec",
-    command: "/tmp/node",
-    args: [
-      npmCliPath,
-      "exec",
-      "--yes",
-      `--package=${BUILT_IN_AGENT_PACKAGES.codex.packageName}@${BUILT_IN_AGENT_PACKAGES.codex.packageRange}`,
-      "--",
-      BUILT_IN_AGENT_PACKAGES.codex.preferredBinName,
-    ],
-    packageName: BUILT_IN_AGENT_PACKAGES.codex.packageName,
-    packageRange: BUILT_IN_AGENT_PACKAGES.codex.packageRange,
-    npmCliPath,
-  });
 });
