@@ -7,6 +7,8 @@ const ACP_ADAPTER_PACKAGE_RANGES = {
   codex: "^0.0.44",
 } as const;
 
+const DEFAULT_CODEX_ACP_COMMAND = `npx -y @agentclientprotocol/codex-acp@${ACP_ADAPTER_PACKAGE_RANGES.codex}`;
+
 type BuiltInAgentPackageSpec = {
   packageName: string;
   packageRange: string;
@@ -37,7 +39,7 @@ type BuiltInLaunchResolverOptions = {
 export const AGENT_REGISTRY: Record<string, string> = {
   pi: `npx pi-acp@${ACP_ADAPTER_PACKAGE_RANGES.pi}`,
   openclaw: "openclaw acp",
-  codex: `npx -y @agentclientprotocol/codex-acp@${ACP_ADAPTER_PACKAGE_RANGES.codex}`,
+  codex: process.env.ACPX_CODEX_ACP_COMMAND || DEFAULT_CODEX_ACP_COMMAND,
   claude: process.env.ACPX_CLAUDE_ACP_COMMAND || `node /opt/claude-agent-acp/dist/index.js`,
   gemini: "gemini --acp",
   cursor: "cursor-agent acp",
@@ -64,7 +66,7 @@ export const BUILT_IN_AGENT_PACKAGES = {
     packageName: "@agentclientprotocol/codex-acp",
     packageRange: ACP_ADAPTER_PACKAGE_RANGES.codex,
     preferredBinName: "codex-acp",
-    fallbackCommand: AGENT_REGISTRY.codex,
+    fallbackCommand: DEFAULT_CODEX_ACP_COMMAND,
     legacyFallbackCommands: [],
   },
 } as const satisfies Record<string, BuiltInAgentPackageSpec>;

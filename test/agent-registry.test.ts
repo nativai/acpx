@@ -64,6 +64,45 @@ test("AGENT_REGISTRY.claude falls back to /opt path when ACPX_CLAUDE_ACP_COMMAND
   assert.equal(result, "node /opt/claude-agent-acp/dist/index.js");
 });
 
+test("AGENT_REGISTRY.codex uses ACPX_CODEX_ACP_COMMAND env override when set", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const result = execFileSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      `import { AGENT_REGISTRY, resolveBuiltInAgentLaunch } from "./dist-test/src/agent-registry.js"; process.stdout.write(JSON.stringify({ command: AGENT_REGISTRY.codex, launch: resolveBuiltInAgentLaunch(AGENT_REGISTRY.codex) ?? null }));`,
+    ],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, ACPX_CODEX_ACP_COMMAND: "node /tmp/codex-acp-fork/dist/index.js" },
+      encoding: "utf8",
+    },
+  );
+  assert.deepEqual(JSON.parse(result), {
+    command: "node /tmp/codex-acp-fork/dist/index.js",
+    launch: null,
+  });
+});
+
+test("AGENT_REGISTRY.codex falls back to npx package when ACPX_CODEX_ACP_COMMAND is empty string", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const result = execFileSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      `import { AGENT_REGISTRY } from "./dist-test/src/agent-registry.js"; process.stdout.write(AGENT_REGISTRY.codex);`,
+    ],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, ACPX_CODEX_ACP_COMMAND: "" },
+      encoding: "utf8",
+    },
+  );
+  assert.equal(result, "npx -y @agentclientprotocol/codex-acp@^0.0.44");
+});
+
 test("resolveAgentCommand returns raw value for unknown agents", () => {
   assert.equal(resolveAgentCommand("custom-acp-server"), "custom-acp-server");
 });
