@@ -1466,6 +1466,85 @@ test("generic sessions show resolves a uniquely matching non-default agent sessi
   });
 });
 
+test("sessions show and read resolve session ids while preserving name lookup", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const recordId = "11111111-1111-4111-8111-111111111111";
+    const acpSessionId = "22222222-2222-4222-8222-222222222222";
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    const messages: SessionRecord["messages"] = [
+      { User: { id: "user-1", content: [{ Text: "hello by id" }] } },
+      { Agent: { content: [{ Text: "hello from assistant" }], tool_results: {} } },
+    ];
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: recordId,
+      acpSessionId,
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+      name: "readable-copy",
+      messages,
+      lastSeq: messages.length,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:00:00.000Z",
+      closed: false,
+    });
+
+    const showByRecordId = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "show", recordId],
+      homeDir,
+    );
+    assert.equal(showByRecordId.code, 0, showByRecordId.stderr);
+    const shownByRecordId = JSON.parse(showByRecordId.stdout.trim()) as SessionRecord;
+    assert.equal(shownByRecordId.acpxRecordId, recordId);
+    assert.equal(shownByRecordId.acpSessionId, acpSessionId);
+    assert.equal(shownByRecordId.name, "readable-copy");
+
+    const readByAcpSessionId = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "read", acpSessionId],
+      homeDir,
+    );
+    assert.equal(readByAcpSessionId.code, 0, readByAcpSessionId.stderr);
+    const readByAcpPayload = JSON.parse(readByAcpSessionId.stdout.trim()) as {
+      id?: unknown;
+      sessionId?: unknown;
+      count?: unknown;
+      entries?: Array<{ textPreview?: unknown }>;
+    };
+    assert.equal(readByAcpPayload.id, recordId);
+    assert.equal(readByAcpPayload.sessionId, acpSessionId);
+    assert.equal(readByAcpPayload.count, messages.length);
+    assert.deepEqual(
+      readByAcpPayload.entries?.map((entry) => entry.textPreview),
+      ["hello by id", "hello from assistant"],
+    );
+
+    const showBySuffix = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "show", "222222222222"],
+      homeDir,
+    );
+    assert.equal(showBySuffix.code, 0, showBySuffix.stderr);
+    const shownBySuffix = JSON.parse(showBySuffix.stdout.trim()) as SessionRecord;
+    assert.equal(shownBySuffix.acpxRecordId, recordId);
+
+    const showByName = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "show", "readable-copy"],
+      homeDir,
+    );
+    assert.equal(showByName.code, 0, showByName.stderr);
+    const shownByName = JSON.parse(showByName.stdout.trim()) as SessionRecord;
+    assert.equal(shownByName.acpxRecordId, recordId);
+
+    const readByName = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "read", "readable-copy"],
+      homeDir,
+    );
+    assert.equal(readByName.code, 0, readByName.stderr);
+    const readByNamePayload = JSON.parse(readByName.stdout.trim()) as { id?: unknown };
+    assert.equal(readByNamePayload.id, recordId);
+  });
+});
+
 test("generic sessions show reports ambiguous cross-agent matches with explicit commands", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

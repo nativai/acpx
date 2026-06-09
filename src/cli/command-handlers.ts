@@ -618,6 +618,33 @@ async function findGenericReadableSessionOrThrow(
   );
 }
 
+async function findReadableSessionOrThrow(params: {
+  explicitAgentName: string | undefined;
+  agent: ResolvedAgentInvocation;
+  sessionNameOrId: string | undefined;
+  subcommand: string;
+  config: ResolvedAcpxConfig;
+}): Promise<SessionRecord> {
+  if (params.sessionNameOrId !== undefined) {
+    try {
+      return await resolveSessionRecord(params.sessionNameOrId);
+    } catch (error) {
+      if (!(error instanceof SessionNotFoundError)) {
+        throw error;
+      }
+    }
+  }
+
+  return params.explicitAgentName == null
+    ? await findGenericReadableSessionOrThrow(
+        params.agent,
+        params.sessionNameOrId,
+        params.subcommand,
+        params.config,
+      )
+    : await findScopedSessionOrThrow(params.agent, params.sessionNameOrId);
+}
+
 async function findRoutedSessionOrThrow(
   agentCommand: string,
   agentName: string,
@@ -1570,10 +1597,13 @@ export async function handleSessionsShow(
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const record =
-    explicitAgentName == null
-      ? await findGenericReadableSessionOrThrow(agent, sessionName, "show", config)
-      : await findScopedSessionOrThrow(agent, sessionName);
+  const record = await findReadableSessionOrThrow({
+    explicitAgentName,
+    agent,
+    sessionNameOrId: sessionName,
+    subcommand: "show",
+    config,
+  });
 
   printSessionDetailsByFormat(record, globalFlags.format);
 }
@@ -1588,10 +1618,13 @@ export async function handleSessionsHistory(
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const subcommand = command.name() === "read" ? "read" : "history";
-  const record =
-    explicitAgentName == null
-      ? await findGenericReadableSessionOrThrow(agent, sessionName, subcommand, config)
-      : await findScopedSessionOrThrow(agent, sessionName);
+  const record = await findReadableSessionOrThrow({
+    explicitAgentName,
+    agent,
+    sessionNameOrId: sessionName,
+    subcommand,
+    config,
+  });
 
   printSessionHistoryByFormat(record, flags.limit, globalFlags.format);
 }
