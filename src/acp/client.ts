@@ -1021,6 +1021,7 @@ export class AcpClient {
       options.atIndex,
     );
     const requestMeta = this.buildForkRequestMeta(forkContext);
+    const requestCwd = this.resolveForkRequestCwd(forkContext, sessionCwd);
     const previousSuppression = this.applySessionUpdateSuppression(
       Boolean(options.suppressReplayUpdates),
     );
@@ -1031,7 +1032,7 @@ export class AcpClient {
       response = await this.runConnectionRequest(() =>
         connection.unstable_forkSession({
           sessionId: sourceAcpSessionId,
-          cwd: sessionCwd,
+          cwd: requestCwd,
           mcpServers: this.options.mcpServers ?? [],
           ...(requestMeta ? { _meta: requestMeta } : {}),
         }),
@@ -1054,6 +1055,19 @@ export class AcpClient {
     this.loadedSessionId = result.sessionId;
 
     return result;
+  }
+
+  private resolveForkRequestCwd(forkContext: ForkRequestContext, sessionCwd: string): string {
+    // Claude's ACP fork path resolves the source transcript relative to the
+    // request cwd. Cross-cwd copies therefore ask ACP to fork from the source cwd;
+    // the SDK materializer below writes the durable copy into the destination cwd.
+    if (
+      forkContext.claudeFork &&
+      path.resolve(forkContext.sourceCwd) !== path.resolve(sessionCwd)
+    ) {
+      return forkContext.sourceCwd;
+    }
+    return sessionCwd;
   }
 
   private buildForkRequestMeta(
@@ -1080,13 +1094,11 @@ export class AcpClient {
     if (!forkContext.claudeFork) {
       return;
     }
-    if (path.resolve(forkContext.sourceCwd) !== path.resolve(cwd)) {
-      return;
-    }
 
     const durableClaudeSessionId = await materializeClaudeForkSession({
       agentCommand: this.options.agentCommand,
       cwd,
+      sourceCwd: forkContext.sourceCwd,
       sourceAcpSessionId,
       subscriptionId: this.options.sessionOptions?.subscription,
       upToMessageId: forkContext.claudeResumeSessionAt,

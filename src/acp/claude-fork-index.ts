@@ -64,6 +64,7 @@ async function readClaudeTranscript(
 export async function materializeClaudeForkSession(args: {
   agentCommand: string;
   cwd: string;
+  sourceCwd: string;
   sourceAcpSessionId: string;
   subscriptionId?: string;
   upToMessageId?: string;
@@ -74,8 +75,16 @@ export async function materializeClaudeForkSession(args: {
   }
 
   const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
-  process.env.CLAUDE_CONFIG_DIR = resolveClaudeConfigDir(args.subscriptionId);
+  const configDir = resolveClaudeConfigDir(args.subscriptionId);
+  process.env.CLAUDE_CONFIG_DIR = configDir;
+  let cleanupStagedTranscript: () => Promise<void> = async () => {};
   try {
+    cleanupStagedTranscript = await stageClaudeSourceTranscriptForDestination({
+      configDir,
+      sourceCwd: args.sourceCwd,
+      destinationCwd: args.cwd,
+      sourceAcpSessionId: args.sourceAcpSessionId,
+    });
     const result = await sdk.forkSession(args.sourceAcpSessionId, {
       dir: args.cwd,
       ...(args.upToMessageId ? { upToMessageId: args.upToMessageId } : {}),
@@ -84,12 +93,71 @@ export async function materializeClaudeForkSession(args: {
       ? result.sessionId
       : undefined;
   } finally {
-    if (previousConfigDir === undefined) {
-      delete process.env.CLAUDE_CONFIG_DIR;
-    } else {
-      process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
+    try {
+      await cleanupStagedTranscript();
+    } finally {
+      if (previousConfigDir === undefined) {
+        delete process.env.CLAUDE_CONFIG_DIR;
+      } else {
+        process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
+      }
     }
   }
+}
+
+async function stageClaudeSourceTranscriptForDestination(args: {
+  configDir: string;
+  sourceCwd: string;
+  destinationCwd: string;
+  sourceAcpSessionId: string;
+}): Promise<() => Promise<void>> {
+  if (path.resolve(args.sourceCwd) === path.resolve(args.destinationCwd)) {
+    return async () => {};
+  }
+
+  const sourcePath = transcriptJsonlPath(args.configDir, args.sourceCwd, args.sourceAcpSessionId);
+  const destinationPath = transcriptJsonlPath(
+    args.configDir,
+    args.destinationCwd,
+    args.sourceAcpSessionId,
+  );
+  if (sourcePath === destinationPath) {
+    return async () => {};
+  }
+
+  const sourceContent = await fs.readFile(sourcePath, "utf8");
+  const existingDestinationContent = await readOptionalFile(destinationPath);
+  await fs.mkdir(path.dirname(destinationPath), { recursive: true });
+  await fs.writeFile(destinationPath, sourceContent, "utf8");
+
+  return async () => {
+    if (existingDestinationContent === undefined) {
+      await fs.unlink(destinationPath).catch((error: unknown) => {
+        if (!isNotFoundError(error)) {
+          throw error;
+        }
+      });
+      return;
+    }
+    await fs.writeFile(destinationPath, existingDestinationContent, "utf8");
+  };
+}
+
+async function readOptionalFile(filePath: string): Promise<string | undefined> {
+  try {
+    return await fs.readFile(filePath, "utf8");
+  } catch (error) {
+    if (isNotFoundError(error)) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return (
+    typeof error === "object" && error !== null && (error as { code?: unknown }).code === "ENOENT"
+  );
 }
 
 export function resolveClaudeConfigDir(subscriptionId: string | undefined): string {

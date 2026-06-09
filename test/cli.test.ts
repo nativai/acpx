@@ -6,7 +6,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { InvalidArgumentError } from "commander";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
 import {
@@ -66,6 +66,71 @@ const MOCK_AGENT_WITH_LOAD_FALLBACK_AND_MODE_FAILURE = `${MOCK_AGENT_COMMAND} --
 const MOCK_AGENT_WITH_FORK_SESSION = `${MOCK_AGENT_COMMAND} --supports-fork-session`;
 const MOCK_AGENT_WITH_SET_MODE_INVALID_PARAMS = `${MOCK_AGENT_COMMAND} --set-session-mode-invalid-params`;
 const MOCK_AGENT_WITH_SET_CONFIG_INVALID_PARAMS = `${MOCK_AGENT_COMMAND} --set-session-config-invalid-params`;
+
+async function writeFakeClaudeAgentPackage(homeDir: string): Promise<string> {
+  const packageRoot = path.join(homeDir, "fake-claude-agent-acp");
+  const packageIndexPath = path.join(packageRoot, "dist", "index.js");
+  const sdkPath = path.join(
+    packageRoot,
+    "node_modules",
+    "@anthropic-ai",
+    "claude-agent-sdk",
+    "sdk.mjs",
+  );
+  await fs.mkdir(path.dirname(packageIndexPath), { recursive: true });
+  await fs.mkdir(path.dirname(sdkPath), { recursive: true });
+  await fs.writeFile(
+    packageIndexPath,
+    `import ${JSON.stringify(pathToFileURL(MOCK_AGENT_PATH).href)};\n`,
+    "utf8",
+  );
+  await fs.writeFile(
+    sdkPath,
+    `
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+function cwdHash(cwd) {
+  return cwd.replace(/\\//g, "-");
+}
+
+async function readSourceTranscript(configDir, sessionId, dir) {
+  return await fs.readFile(
+    path.join(configDir, "projects", cwdHash(dir), sessionId + ".jsonl"),
+    "utf8",
+  );
+}
+
+export async function forkSession(sessionId, options = {}) {
+  const dir = options.dir;
+  if (typeof dir !== "string" || dir.length === 0) {
+    throw new Error("missing destination dir");
+  }
+  const configDir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
+  const newId = "durable-" + sessionId;
+  const source = await readSourceTranscript(configDir, sessionId, dir);
+  const destinationPath = path.join(configDir, "projects", cwdHash(dir), newId + ".jsonl");
+  await fs.mkdir(path.dirname(destinationPath), { recursive: true });
+  await fs.writeFile(destinationPath, source, "utf8");
+  await fs.appendFile(
+    path.join(configDir, "fork-sdk-calls.jsonl"),
+    JSON.stringify({
+      sessionId,
+      dir,
+      upToMessageId: options.upToMessageId ?? null,
+      destinationPath,
+    }) + "\\n",
+    "utf8",
+  );
+  return { sessionId: newId };
+}
+`,
+    "utf8",
+  );
+
+  return packageIndexPath;
+}
 
 type CliRunResult = {
   code: number | null;
@@ -849,6 +914,7 @@ test("sessions copy resolves Claude --at-index from source cwd and forwards copi
     const sourceCwd = path.join(homeDir, "source-workspace");
     const destinationCwd = path.join(homeDir, "destination-workspace");
     const sourceAcpSessionId = "source-acp-claude-transcript";
+    const packageIndexPath = await writeFakeClaudeAgentPackage(homeDir);
     const expectedForkMeta = {
       claudeCode: {
         options: {
@@ -859,7 +925,9 @@ test("sessions copy resolves Claude --at-index from source cwd and forwards copi
       },
       systemPrompt: "copy prompt",
     };
-    const claudeCommand = `${MOCK_AGENT_COMMAND} --claude-agent-acp --supports-fork-session --expect-fork-meta-json ${JSON.stringify(
+    const claudeCommand = `node ${JSON.stringify(
+      packageIndexPath,
+    )} --claude-agent-acp --supports-fork-session --expect-fork-meta-json ${JSON.stringify(
       JSON.stringify(expectedForkMeta),
     )}`;
     await fs.mkdir(sourceCwd, { recursive: true });
@@ -961,6 +1029,161 @@ test("sessions copy resolves Claude --at-index from source cwd and forwards copi
     assert.equal(stored.forked_from_session_id, "source-claude-transcript");
     assert.equal(stored.forked_at_message_index, 2);
     assert.deepEqual(stored.messages, messages);
+
+    const callLog = await fs.readFile(
+      path.join(homeDir, ".claude", "fork-sdk-calls.jsonl"),
+      "utf8",
+    );
+    const call = JSON.parse(callLog.trim()) as {
+      sessionId?: unknown;
+      dir?: unknown;
+      upToMessageId?: unknown;
+    };
+    assert.equal(call.sessionId, sourceAcpSessionId);
+    assert.equal(call.dir, destinationCwd);
+    assert.equal(call.upToMessageId, "assistant-uuid");
+    await assert.rejects(
+      fs.access(
+        transcriptJsonlPath(path.join(homeDir, ".claude"), destinationCwd, sourceAcpSessionId),
+      ),
+      { code: "ENOENT" },
+    );
+  });
+});
+
+test("sessions copy materializes cross-cwd Claude forks in the destination project path", async () => {
+  await withTempHome(async (homeDir) => {
+    const sourceCwd = path.join(homeDir, "source-workspace");
+    const destinationCwd = path.join(homeDir, "destination-workspace");
+    const packageIndexPath = await writeFakeClaudeAgentPackage(homeDir);
+    const configDir = path.join(homeDir, ".claude");
+    const sourceAcpSessionId = "source-acp-cross-cwd";
+    const marker = "MARKER-PHRASE-CROSS-CWD";
+    const sourceTranscript = [
+      JSON.stringify({
+        type: "user",
+        uuid: "cross-user-uuid",
+        message: { content: [{ type: "text", text: "remember CROSS_CWD_SECRET=RUBY" }] },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        uuid: "cross-assistant-uuid",
+        message: { content: [{ type: "text", text: `tool result: ${marker}` }] },
+      }),
+    ].join("\n");
+    const claudeCommand = `node ${JSON.stringify(packageIndexPath)} --claude-agent-acp --supports-fork-session`;
+
+    await fs.mkdir(sourceCwd, { recursive: true });
+    await fs.mkdir(destinationCwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          agents: {
+            claude: {
+              command: claudeCommand,
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    const sourceTranscriptPath = transcriptJsonlPath(configDir, sourceCwd, sourceAcpSessionId);
+    await fs.mkdir(path.dirname(sourceTranscriptPath), { recursive: true });
+    await fs.writeFile(sourceTranscriptPath, sourceTranscript, "utf8");
+
+    const messages: SessionRecord["messages"] = [
+      { User: { id: "user-1", content: [{ Text: "remember CROSS_CWD_SECRET=RUBY" }] } },
+      { Agent: { content: [{ Text: `tool result: ${marker}` }], tool_results: {} } },
+    ];
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "source-claude-cross-cwd",
+      acpSessionId: sourceAcpSessionId,
+      agentCommand: claudeCommand,
+      cwd: sourceCwd,
+      messages,
+      lastSeq: messages.length,
+    });
+
+    const result = await runCli(
+      [
+        "--cwd",
+        destinationCwd,
+        "--format",
+        "json",
+        "claude",
+        "sessions",
+        "copy",
+        "--from",
+        "source-claude-cross-cwd",
+        "--name",
+        "cross-cwd-copy",
+      ],
+      homeDir,
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    const payload = JSON.parse(result.stdout.trim()) as {
+      acpxRecordId?: unknown;
+      acpxSessionId?: unknown;
+      agentSessionId?: unknown;
+      forkedAtMessageIndex?: unknown;
+    };
+    assert.equal(payload.forkedAtMessageIndex, messages.length);
+    assert.equal(payload.acpxSessionId, `durable-${sourceAcpSessionId}`);
+    assert.equal(payload.agentSessionId, `durable-${sourceAcpSessionId}`);
+    assert.equal(typeof payload.acpxRecordId, "string");
+
+    const stored = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, String(payload.acpxRecordId)), "utf8"),
+    ) as {
+      acp_session_id?: unknown;
+      agent_session_id?: unknown;
+      cwd?: unknown;
+      forked_from_session_id?: unknown;
+      forked_at_message_index?: unknown;
+      messages?: unknown[];
+    };
+    assert.equal(stored.acp_session_id, `durable-${sourceAcpSessionId}`);
+    assert.equal(stored.agent_session_id, `durable-${sourceAcpSessionId}`);
+    assert.equal(stored.cwd, destinationCwd);
+    assert.equal(stored.forked_from_session_id, "source-claude-cross-cwd");
+    assert.equal(stored.forked_at_message_index, messages.length);
+    assert.deepEqual(stored.messages, messages);
+
+    const callLog = await fs.readFile(path.join(configDir, "fork-sdk-calls.jsonl"), "utf8");
+    const call = JSON.parse(callLog.trim()) as {
+      sessionId?: unknown;
+      dir?: unknown;
+      upToMessageId?: unknown;
+    };
+    assert.equal(call.sessionId, sourceAcpSessionId);
+    assert.equal(call.dir, destinationCwd);
+    assert.equal(call.upToMessageId, null);
+
+    const destinationTranscriptPath = transcriptJsonlPath(
+      configDir,
+      destinationCwd,
+      `durable-${sourceAcpSessionId}`,
+    );
+    const destinationTranscript = await fs.readFile(destinationTranscriptPath, "utf8");
+    assert.equal(destinationTranscript, sourceTranscript);
+    assert.match(destinationTranscript, new RegExp(marker));
+    assert.equal(await fs.readFile(sourceTranscriptPath, "utf8"), sourceTranscript);
+    await assert.rejects(
+      fs.access(transcriptJsonlPath(configDir, destinationCwd, sourceAcpSessionId)),
+      {
+        code: "ENOENT",
+      },
+    );
+    await assert.rejects(
+      fs.access(transcriptJsonlPath(configDir, sourceCwd, `durable-${sourceAcpSessionId}`)),
+      { code: "ENOENT" },
+    );
   });
 });
 
