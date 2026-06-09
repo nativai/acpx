@@ -1142,10 +1142,6 @@ export class AcpClient {
       };
     }
 
-    if (isCodexAcpCommand(command, args)) {
-      throw new Error("Codex fork-at-index not yet supported (full copy only)");
-    }
-
     return {
       claudeFork: false,
       sourceCwd: cwd,

@@ -1261,9 +1261,13 @@ test("sessions copy rejects adapters without fork capability", async () => {
   });
 });
 
-test("sessions copy rejects Codex --at-index until Codex truncation lands", async () => {
+test("sessions copy Codex --at-index forwards forkAtMessageIndex to the agent", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
+    // Use a mock agent that supports fork and expects the acpx forkAtMessageIndex meta
+    const CODEX_AGENT_WITH_FORK = `${MOCK_AGENT_WITH_FORK_SESSION} --expect-fork-meta-json ${JSON.stringify(
+      JSON.stringify({ acpx: { forkAtMessageIndex: 1 } }),
+    )}`;
     await fs.mkdir(cwd, { recursive: true });
     await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
     await fs.writeFile(
@@ -1272,7 +1276,7 @@ test("sessions copy rejects Codex --at-index until Codex truncation lands", asyn
         {
           agents: {
             codex: {
-              command: "codex-acp",
+              command: CODEX_AGENT_WITH_FORK,
             },
           },
         },
@@ -1284,19 +1288,34 @@ test("sessions copy rejects Codex --at-index until Codex truncation lands", asyn
     await writeSessionRecord(homeDir, {
       acpxRecordId: "source-codex-at-index",
       acpSessionId: "source-acp-codex-at-index",
-      agentCommand: "codex-acp",
+      agentCommand: CODEX_AGENT_WITH_FORK,
       cwd,
       messages: [{ User: { id: "user-1", content: [{ Text: "hello" }] } }],
       lastSeq: 1,
     });
 
     const result = await runCli(
-      ["codex", "sessions", "copy", "--from", "source-codex-at-index", "--at-index", "1"],
+      [
+        "--format",
+        "json",
+        "codex",
+        "sessions",
+        "copy",
+        "--from",
+        "source-codex-at-index",
+        "--at-index",
+        "1",
+      ],
       homeDir,
     );
 
-    assert.equal(result.code, 1, result.stderr);
-    assert.match(result.stderr, /Codex fork-at-index not yet supported \(full copy only\)/);
+    assert.equal(result.code, 0, result.stderr);
+    const payload = JSON.parse(result.stdout.trim()) as {
+      forkedAtMessageIndex?: unknown;
+      acpxRecordId?: unknown;
+    };
+    assert.equal(payload.forkedAtMessageIndex, 1);
+    assert.equal(typeof payload.acpxRecordId, "string");
   });
 });
 

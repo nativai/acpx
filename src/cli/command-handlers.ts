@@ -1,8 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Command, InvalidArgumentError } from "commander";
-import { splitCommandLine } from "../acp/client-process.js";
-import { isCodexAcpCommand, isLegacyZedCodexAcpInvocation } from "../acp/codex-compat.js";
+import { isLegacyZedCodexAcpInvocation } from "../acp/codex-compat.js";
 import {
   listBuiltInAgents,
   resolveAgentCommand,
@@ -428,11 +427,6 @@ function agentTypeLabel(agentCommand: string, config: ResolvedAcpxConfig): strin
   return resolveAgentNameFromCommand(agentCommand, config.agents) ?? agentCommand;
 }
 
-function sourceIsCodex(source: SessionRecord): boolean {
-  const parsed = splitCommandLine(source.agentCommand);
-  return isCodexAcpCommand(parsed.command, parsed.args);
-}
-
 function copyMetadata(
   flags: SessionsCopyFlags,
   source: SessionRecord,
@@ -474,12 +468,6 @@ function resolveForkAtMessageIndex(source: SessionRecord, atIndex: number | unde
     throw new InvalidArgumentError(`--at-index out of range (0-${messageCount})`);
   }
   return forkAtMessageIndex;
-}
-
-function assertCodexAtIndexSupported(source: SessionRecord, atIndex: number | undefined): void {
-  if (atIndex !== undefined && sourceIsCodex(source)) {
-    throw new Error("Codex fork-at-index not yet supported (full copy only)");
-  }
 }
 
 function assertCopyAgentLock(params: {
@@ -1362,7 +1350,6 @@ export async function handleSessionsCopy(
   const source = await resolveSessionRecord(flags.from);
   assertCopyableSource(source);
   const forkAtMessageIndex = resolveForkAtMessageIndex(source, flags.atIndex);
-  assertCodexAtIndexSupported(source, flags.atIndex);
   assertCopyAgentLock({ explicitAgentName, globalFlags, pathAgent, source, config });
 
   const [{ createSession }, { printCopiedSessionByFormat, printCreatedSessionBanner }] =
