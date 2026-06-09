@@ -7,7 +7,7 @@ const ACP_ADAPTER_PACKAGE_RANGES = {
   codex: "^0.0.44",
 } as const;
 
-const DEFAULT_CODEX_ACP_COMMAND = `npx -y @agentclientprotocol/codex-acp@${ACP_ADAPTER_PACKAGE_RANGES.codex}`;
+const DEFAULT_CODEX_ACP_COMMAND = `node /opt/codex-acp/dist/index.js`;
 
 type BuiltInAgentPackageSpec = {
   packageName: string;
