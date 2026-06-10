@@ -380,6 +380,7 @@ function assignParsedSessionOptions(state: SessionAcpxState, raw: unknown): void
   assignSessionOptionMaxTurns(parsedSessionOptions, sessionOptions.max_turns);
   assignSessionOptionSystemPrompt(parsedSessionOptions, sessionOptions.system_prompt);
   assignSessionOptionSubscription(parsedSessionOptions, sessionOptions.subscription);
+  assignSessionOptionProfile(parsedSessionOptions, sessionOptions.profile);
   assignSessionOptionSubscriptionSwitch(parsedSessionOptions, sessionOptions.subscription_switch);
 
   if (Object.keys(parsedSessionOptions).length > 0) {
@@ -430,6 +431,15 @@ function assignSessionOptionSubscription(
 ): void {
   if (typeof value === "string" && value.length > 0) {
     options.subscription = value;
+  }
+}
+
+function assignSessionOptionProfile(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+  value: unknown,
+): void {
+  if (typeof value === "string" && value.length > 0) {
+    options.profile = value;
   }
 }
 

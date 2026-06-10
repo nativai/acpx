@@ -63,6 +63,7 @@ import type { SessionListResult } from "./session/contracts.js";
 import {
   withInheritedAgentCommand,
   withInheritedModel,
+  withInheritedProfile,
   withInheritedReasoningEffort,
   withInheritedSubscription,
   withInheritedTaskFolder,
@@ -203,6 +204,7 @@ function sessionOptionsFromGlobalFlags(
     maxTurns: globalFlags.maxTurns,
     systemPrompt: globalFlags.systemPrompt,
     subscription: globalFlags.subscription,
+    profile: globalFlags.profile,
     reasoningEffort: globalFlags.reasoningEffort,
   };
 }
@@ -269,6 +271,7 @@ type ResolvedParentSession = {
   acpxRecordId: string;
   taskFolder?: string;
   subscription?: string;
+  profile?: string;
   agentCommand?: string;
   model?: string;
   effort?: string;
@@ -284,6 +287,7 @@ function parentInheritableFields(parent: SessionRecord): ResolvedParentSession {
     acpxRecordId: parent.acpxRecordId,
     taskFolder: parent.metadata?.task_folder,
     subscription: sessionOptions?.subscription,
+    profile: sessionOptions?.profile,
     agentCommand: parent.agentCommand,
     model: sessionOptions?.model,
     effort: parent.acpx?.desired_config_options?.effort,
@@ -361,6 +365,7 @@ function inheritedSpawnSessionOptions(
       sameAgentAsParent ? parent?.effort : undefined,
     ),
     subscription: withInheritedSubscription(globalFlags.subscription, parent?.subscription),
+    profile: withInheritedProfile(globalFlags.profile, parent?.profile),
   };
 }
 

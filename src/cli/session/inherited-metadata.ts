@@ -41,6 +41,22 @@ export function withInheritedSubscription(
 }
 
 /**
+ * Spawn-time profile inheritance — pure, no IO. Mirrors
+ * `withInheritedSubscription`: a child with no explicit `--profile` inherits
+ * the parent's `session_options.profile` (a snapshot at spawn — the child owns
+ * it thereafter). Explicit child selection always wins.
+ */
+export function withInheritedProfile(
+  childProfile: string | undefined,
+  parentProfile: string | undefined,
+): string | undefined {
+  if (childProfile?.trim()) {
+    return childProfile; // explicit child --profile wins
+  }
+  return parentProfile?.trim() || childProfile;
+}
+
+/**
  * Spawn-time agent-type inheritance — pure, no IO. A bare/defaulted spawn (no
  * positional agent, no `--agent`) inside an acpx session resolves to the
  * parent's agent command instead of the machine default; an explicit child

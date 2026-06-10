@@ -225,6 +225,8 @@ export type AcpClientOptions = {
     taskFolder?: string | null;
     agentFolder?: string | null;
     subscriptionId?: string | null;
+    /** Profile id from session_options.profile — takes priority over subscriptionId. */
+    profileId?: string | null;
   };
   sessionOptions?: {
     model?: string;
@@ -385,6 +387,8 @@ export type SessionAcpxState = {
     max_turns?: number;
     system_prompt?: string | { append: string };
     subscription?: string;
+    /** Profile id selected via `--profile <id>`. Takes priority over `subscription`. */
+    profile?: string;
     /**
      * Breadcrumb recorded when a session's subscription is changed in place
      * (manual switch or auto-failover). Drives the acpx-ui badge/notice and

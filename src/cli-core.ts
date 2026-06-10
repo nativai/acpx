@@ -56,6 +56,7 @@ const TOP_LEVEL_VERSION_VALUE_FLAG_VALUES = [
   "--format",
   "--model",
   "--subscription",
+  "--profile",
   "--allowed-tools",
   "--max-turns",
   "--system-prompt",

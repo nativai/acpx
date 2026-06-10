@@ -274,6 +274,7 @@ test("resolveGlobalFlags validates and normalizes dynamic Commander options", ()
     allowedTools: ["Read", "Edit"],
     maxTurns: 3,
     systemPrompt: "replace",
+    profile: undefined,
     promptRetries: 2,
     approveAll: undefined,
     approveReads: true,

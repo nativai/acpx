@@ -49,6 +49,8 @@ export type GlobalFlags = PermissionFlags & {
   model?: string;
   reasoningEffort?: ReasoningEffort;
   subscription?: string;
+  /** Profile id from `--profile <id>` — stored as session_options.profile. */
+  profile?: string;
   allowedTools?: string[];
   maxTurns?: number;
   systemPrompt?: SystemPromptOption;
@@ -378,6 +380,10 @@ export function addGlobalFlags(command: Command): Command {
       "Claude subscription id from the subscriptions registry (sets CLAUDE_CONFIG_DIR per session)",
     )
     .option(
+      "--profile <id>",
+      "Profile id from the profiles registry (supports subscription and openrouter auth modes)",
+    )
+    .option(
       "--allowed-tools <list>",
       'Allowed tool names as a comma-separated list (use "" for no tools)',
       parseAllowedTools,
@@ -489,6 +495,7 @@ export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig)
     model: resolveModelOption(opts.model),
     reasoningEffort: resolveReasoningEffortOption(opts.reasoningEffort),
     subscription: resolveSubscriptionOption(opts.subscription),
+    profile: resolveProfileOption(opts.profile),
     allowedTools: stringArrayOption(opts.allowedTools),
     maxTurns: numberOption(opts.maxTurns),
     systemPrompt: resolveSystemPromptFlag(opts),
@@ -568,6 +575,11 @@ function resolveModelOption(value: unknown): string | undefined {
 function resolveSubscriptionOption(value: unknown): string | undefined {
   const subscription = stringOption(value);
   return subscription === undefined ? undefined : parseNonEmptyValue("Subscription", subscription);
+}
+
+function resolveProfileOption(value: unknown): string | undefined {
+  const profile = stringOption(value);
+  return profile === undefined ? undefined : parseNonEmptyValue("Profile", profile);
 }
 
 // Commander already runs parseReasoningEffort via the option parser, so the

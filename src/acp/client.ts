@@ -83,6 +83,7 @@ import {
   shouldIgnoreNonJsonAgentOutputLine,
 } from "./agent-command.js";
 import {
+  applyProfileAuth,
   buildAgentSpawnOptions,
   readEnvCredential,
   resolveConfiguredAuthCredential,
@@ -104,6 +105,7 @@ import {
 import { isCodexAcpCommand } from "./codex-compat.js";
 import { extractAcpError } from "./error-shapes.js";
 import { avoidBidirectionalJsonRpcIdCollisions, isSessionUpdateNotification } from "./jsonrpc.js";
+import type { ShimHandle } from "./openrouter-shim.js";
 import {
   formatSessionControlAcpSummary,
   maybeWrapSessionControlError,
@@ -442,6 +444,7 @@ export class AcpClient {
   private readonly cancellingSessionIds = new Set<string>();
   private readonly permissionAbortControllers = new Map<string, AbortController>();
   private closing = false;
+  private shimHandle?: ShimHandle;
   private agentStartedAt?: string;
   private lastAgentExit?: AgentExitInfo;
   private lastKnownPid?: number;
@@ -665,6 +668,12 @@ export class AcpClient {
     if (isQoderAcpCommand(spawnCommand, args)) {
       args = buildQoderAcpCommandArgs(args, this.options);
     }
+    const spawnOptions = buildAgentSpawnOptions(
+      this.options.cwd,
+      this.options.authCredentials,
+      this.options.sessionContext,
+    );
+    await this.applyProfileEnv(spawnOptions.env);
     return {
       spawnCommand,
       args,
@@ -672,12 +681,26 @@ export class AcpClient {
       geminiAcp: isGeminiAcpCommand(spawnCommand, args),
       copilotAcp: isCopilotAcpCommand(spawnCommand, args),
       claudeAcp: isClaudeAcpCommand(spawnCommand, args),
-      spawnOptions: buildAgentSpawnOptions(
-        this.options.cwd,
-        this.options.authCredentials,
-        this.options.sessionContext,
-      ),
+      spawnOptions,
     };
+  }
+
+  /**
+   * Apply the async portion of profile-based auth to the spawn env in place.
+   * For authMode=openrouter: starts the shim (first spawn) or reinjects the
+   * running shim's port (reconnect). For subscription / no profile: no-op.
+   */
+  private async applyProfileEnv(env: NodeJS.ProcessEnv): Promise<void> {
+    const profileId = this.options.sessionContext?.profileId?.trim();
+    if (!profileId) {return;}
+    if (!this.shimHandle) {
+      const sessionId = this.options.sessionContext?.acpxRecordId ?? profileId;
+      this.shimHandle = (await applyProfileAuth(env, profileId, sessionId)) ?? undefined;
+    } else {
+      env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${this.shimHandle.port}`;
+      env.ANTHROPIC_AUTH_TOKEN = " ";
+      delete env.ANTHROPIC_CUSTOM_HEADERS;
+    }
   }
 
   private logAgentLaunch(plan: AgentLaunchPlan): void {
@@ -1483,6 +1506,8 @@ export class AcpClient {
     this.initResult = undefined;
     this.connection = undefined;
     this.agent = undefined;
+    this.shimHandle?.stop();
+    this.shimHandle = undefined;
   }
 
   private async terminateAgentProcess(

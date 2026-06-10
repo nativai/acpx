@@ -1,15 +1,18 @@
+import { mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { hasKnownDeadSubs, isSubscriptionKnownDead } from "../config/known-dead-subscriptions.js";
+import { findProfile, loadProfileRegistry } from "../config/profiles.js";
+import type { SubscriptionLookupOptions } from "../config/subscriptions.js";
 import {
   chooseSubscriptionConfigDir,
   loadSubscriptionRegistry,
   subscriptionConfigDirExists,
 } from "../config/subscriptions.js";
-import type {
-  ConfigDirChoice,
-  SubscriptionLookupOptions,
-  SubscriptionRegistry,
-} from "../config/subscriptions.js";
+import type { ConfigDirChoice, SubscriptionRegistry } from "../config/subscriptions.js";
 import type { AcpClientOptions } from "../types.js";
+import type { ShimHandle } from "./openrouter-shim.js";
+import { spawnOpenRouterShim } from "./openrouter-shim.js";
 
 const AUTH_ENV_PREFIX = "ACPX_AUTH_";
 
@@ -88,6 +91,12 @@ export type AgentSessionContext = {
    * ~/.claude). Mirrors how per-session `model` flows from the session record.
    */
   subscriptionId?: string | null;
+  /**
+   * Profile id from session_options.profile — takes priority over subscriptionId
+   * when set. The profile-based auth is applied asynchronously after the
+   * synchronous env build (see applyProfileAuth in client.ts usage).
+   */
+  profileId?: string | null;
 };
 
 // eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
@@ -123,11 +132,14 @@ function buildAgentEnvironment(
       env.ACPX_AGENT_FOLDER = trimmedAgentFolder;
     }
   }
-  // Resolve unconditionally: an UNSELECTED session is now meaningful — the
-  // registry `default` (when usable) governs it. On a box with no registry or no
-  // usable default this is a no-op that leaves CLAUDE_CONFIG_DIR unset and stays
-  // silent, i.e. byte-identical to the pre-default behavior.
-  applySubscriptionConfigDir(env, sessionContext?.subscriptionId ?? null, lookupOptions);
+  // When a profileId is set the async applyProfileAuth path (called from
+  // client.ts after this synchronous env build) handles all auth env setup.
+  // Skip subscription resolution here to avoid clobbering what applyProfileAuth
+  // will write. Subscription-only sessions (no profileId) continue to use the
+  // existing synchronous path below, byte-identical to pre-profile behavior.
+  if (!sessionContext?.profileId?.trim()) {
+    applySubscriptionConfigDir(env, sessionContext?.subscriptionId ?? null, lookupOptions);
+  }
   if (!authCredentials) {
     return env;
   }
@@ -328,6 +340,71 @@ export function resolveConfiguredAuthCredential(
 ): string | undefined {
   const configCredentials = authCredentials ?? {};
   return configCredentials[methodId] ?? configCredentials[toEnvToken(methodId)];
+}
+
+/**
+ * Apply profile-based authentication to the env dict and return a ShimHandle
+ * for openrouter profiles (caller must stop it when the session closes), or
+ * null for subscription profiles. Called asynchronously after the synchronous
+ * env build so the shim port is known before the adapter process spawns.
+ *
+ * Constraint: openRouterApiKey must never appear in logs or process output.
+ */
+export async function applyProfileAuth(
+  env: NodeJS.ProcessEnv,
+  profileId: string,
+  sessionId: string,
+  lookupOptions?: SubscriptionLookupOptions,
+): Promise<ShimHandle | null> {
+  const trimmedId = profileId.trim();
+  if (!trimmedId) {
+    return null;
+  }
+  const registry = loadProfileRegistry(lookupOptions);
+  const profile = findProfile(trimmedId, registry);
+  if (!profile) {
+    process.stderr.write(
+      `[acpx] profile "${trimmedId}" not found in registry; using default Claude config\n`,
+    );
+    return null;
+  }
+
+  if (profile.authMode === "subscription") {
+    // Behave exactly like applySubscriptionConfigDir for subscription profiles.
+    applySubscriptionConfigDir(env, trimmedId, lookupOptions);
+    return null;
+  }
+
+  if (profile.authMode === "openrouter") {
+    const apiKey = profile.openRouterApiKey;
+    const model = profile.model;
+    if (!apiKey || !model) {
+      process.stderr.write(
+        `[acpx] profile "${trimmedId}" is missing openRouterApiKey or model; using default Claude config\n`,
+      );
+      return null;
+    }
+
+    // Isolate Claude config in a per-session temp dir (no OAuth inheritance).
+    const configDir = join(tmpdir(), `or-${sessionId}`);
+    mkdirSync(configDir, { recursive: true });
+    env.CLAUDE_CONFIG_DIR = configDir;
+
+    // Start the model-rewrite shim; apiKey never appears in logs.
+    const shim = await spawnOpenRouterShim(apiKey, model);
+
+    env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${shim.port}`;
+    // Bypass the Bun availability / key check in claude-agent-acp.
+    env.ANTHROPIC_AUTH_TOKEN = " ";
+    // Remove any custom headers set by the subscription path —
+    // the shim injects Authorization itself.
+    delete env.ANTHROPIC_CUSTOM_HEADERS;
+
+    return shim;
+  }
+
+  // authMode=chatgpt or unknown: no extra env manipulation from the profile side.
+  return null;
 }
 
 export function buildAgentSpawnOptions(

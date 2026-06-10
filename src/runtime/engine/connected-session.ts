@@ -109,6 +109,7 @@ export async function withConnectedSession<T>(
         taskFolder: record.metadata?.task_folder ?? null,
         agentFolder: resolveAndEnsureAgentFolder(record),
         subscriptionId: record.acpx?.session_options?.subscription ?? null,
+        profileId: record.acpx?.session_options?.profile ?? null,
       },
       sessionOptions: sessionOptionsFromRecord(record),
     }) ??
@@ -129,6 +130,7 @@ export async function withConnectedSession<T>(
         taskFolder: record.metadata?.task_folder ?? null,
         agentFolder: resolveAndEnsureAgentFolder(record),
         subscriptionId: record.acpx?.session_options?.subscription ?? null,
+        profileId: record.acpx?.session_options?.profile ?? null,
       },
       sessionOptions: sessionOptionsFromRecord(record),
     });

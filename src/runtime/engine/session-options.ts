@@ -8,6 +8,11 @@ export type SessionAgentOptions = {
   maxTurns?: number;
   systemPrompt?: SystemPromptOption;
   subscription?: string;
+  /**
+   * Profile id set via `--profile <id>`. Stored as `session_options.profile` on
+   * disk. When set, takes priority over `subscription` for auth resolution.
+   */
+  profile?: string;
   // Claude thinking depth (the `effort` config option). In-memory only: it is
   // NOT written to `session_options` on disk — the creation sites persist it as
   // `acpx.desired_config_options.effort` and apply it live via the config-option
@@ -22,12 +27,15 @@ export function mergeSessionOptions(
   fallback: SessionAgentOptions | undefined,
 ): SessionAgentOptions | undefined {
   const merged: SessionAgentOptions = { ...fallback };
-  assignDefinedOption(merged, "model", preferred?.model);
-  assignDefinedOption(merged, "allowedTools", preferred?.allowedTools);
-  assignDefinedOption(merged, "maxTurns", preferred?.maxTurns);
-  assignDefinedOption(merged, "systemPrompt", preferred?.systemPrompt);
-  assignDefinedOption(merged, "subscription", preferred?.subscription);
-  assignDefinedOption(merged, "reasoningEffort", preferred?.reasoningEffort);
+  if (preferred) {
+    assignDefinedOption(merged, "model", preferred.model);
+    assignDefinedOption(merged, "allowedTools", preferred.allowedTools);
+    assignDefinedOption(merged, "maxTurns", preferred.maxTurns);
+    assignDefinedOption(merged, "systemPrompt", preferred.systemPrompt);
+    assignDefinedOption(merged, "subscription", preferred.subscription);
+    assignDefinedOption(merged, "profile", preferred.profile);
+    assignDefinedOption(merged, "reasoningEffort", preferred.reasoningEffort);
+  }
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
@@ -93,6 +101,7 @@ export function sessionOptionsFromRecord(record: SessionRecord): SessionAgentOpt
     storedSystemPromptOption(stored.system_prompt),
   );
   assignStoredOption(sessionOptions, "subscription", nonEmptyString(stored.subscription));
+  assignStoredOption(sessionOptions, "profile", nonEmptyString(stored.profile));
 
   return Object.keys(sessionOptions).length > 0 ? sessionOptions : undefined;
 }
@@ -108,6 +117,7 @@ function persistedSessionOptions(
     max_turns: typeof options.maxTurns === "number" ? options.maxTurns : undefined,
     system_prompt: normalizeSystemPromptOption(options.systemPrompt),
     subscription: nonEmptyString(options.subscription),
+    profile: nonEmptyString(options.profile),
   } satisfies PersistedSessionOptions;
   return hasPersistedSessionOptions(next) ? next : undefined;
 }
@@ -118,7 +128,8 @@ function hasPersistedSessionOptions(options: PersistedSessionOptions): boolean {
     options.allowed_tools !== undefined ||
     options.max_turns !== undefined ||
     options.system_prompt !== undefined ||
-    options.subscription !== undefined
+    options.subscription !== undefined ||
+    options.profile !== undefined
   );
 }
 
