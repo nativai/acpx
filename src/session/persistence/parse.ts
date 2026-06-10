@@ -701,6 +701,28 @@ function parseMetadata(raw: unknown): Record<string, string> | undefined | null 
   return parsed;
 }
 
+// acpx-ui-owned passthrough. Parsed leniently: a malformed `template` block is
+// dropped (returns undefined) rather than rejecting the whole record, since the
+// daemon does not author or depend on it — it only round-trips it so it survives
+// daemon rewrites and can be projected into the index sidecar.
+function parseTemplateState(raw: unknown): SessionRecord["template"] {
+  const record = asRecord(raw);
+  if (!record) {
+    return undefined;
+  }
+  const template: NonNullable<SessionRecord["template"]> = {};
+  if (typeof record.enabled === "boolean") {
+    template.enabled = record.enabled;
+  }
+  if (typeof record.created_at === "string") {
+    template.created_at = record.created_at;
+  }
+  if (typeof record.source_session_id === "string") {
+    template.source_session_id = record.source_session_id;
+  }
+  return Object.keys(template).length > 0 ? template : undefined;
+}
+
 function parseSessionKind(value: unknown): "session" | "subagent" | undefined | null {
   if (value === undefined || value === null) {
     return undefined;
@@ -852,5 +874,6 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     subagents: parseSubagentRefs(record.subagents),
     metadata,
     importedFrom: recordMetadata.importedFrom,
+    template: parseTemplateState(record.template),
   };
 }
