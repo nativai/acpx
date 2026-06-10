@@ -9,6 +9,7 @@ import {
 
 export type Harness = "claude" | "codex";
 export type AuthMode = "subscription" | "openrouter" | "chatgpt";
+export type ReasoningEffort = "low" | "medium" | "high";
 
 export interface ProfileEntry {
   id: string;
@@ -24,6 +25,11 @@ export interface ProfileEntry {
    * MUST NEVER be logged or written to stderr.
    */
   openRouterApiKey?: string;
+  /**
+   * Static reasoning depth for OpenRouter profiles. When set, the shim injects
+   * `reasoning: { effort }` into every /v1/messages request. Ignored for non-openrouter profiles.
+   */
+  reasoningEffort?: ReasoningEffort;
 }
 
 export interface ProfileRegistry {
@@ -50,29 +56,50 @@ function isValidAuthMode(value: unknown): value is AuthMode {
   return value === "subscription" || value === "openrouter" || value === "chatgpt";
 }
 
+function isValidReasoningEffort(value: unknown): value is ReasoningEffort {
+  return value === "low" || value === "medium" || value === "high";
+}
+
 function resolveCredentialSource(
   authMode: AuthMode,
   id: string,
   raw: Record<string, unknown>,
   homeDir: string,
 ): string | null {
-  if (authMode !== "subscription") {return null;}
+  if (authMode !== "subscription") {
+    return null;
+  }
   return nonEmptyString(raw.credentialSource) ?? path.join(subscriptionsDir(homeDir), id);
 }
 
+function applyOptionalProfileFields(entry: ProfileEntry, raw: Record<string, unknown>): void {
+  const model = nonEmptyString(raw.model);
+  if (model !== undefined) {
+    entry.model = model;
+  }
+  const apiKey = nonEmptyString(raw.openRouterApiKey);
+  if (apiKey !== undefined) {
+    entry.openRouterApiKey = apiKey;
+  }
+  if (isValidReasoningEffort(raw.reasoningEffort)) {
+    entry.reasoningEffort = raw.reasoningEffort;
+  }
+}
+
 function normalizeProfileEntry(value: unknown, homeDir: string): ProfileEntry | undefined {
-  if (!isRecord(value)) {return undefined;}
+  if (!isRecord(value)) {
+    return undefined;
+  }
   const id = nonEmptyString(value.id);
-  if (!id) {return undefined;}
+  if (!id) {
+    return undefined;
+  }
   const label = nonEmptyString(value.label) ?? id;
   const harness: Harness = isValidHarness(value.harness) ? value.harness : "claude";
   const authMode: AuthMode = isValidAuthMode(value.authMode) ? value.authMode : "subscription";
   const credentialSource = resolveCredentialSource(authMode, id, value, homeDir);
   const entry: ProfileEntry = { id, label, harness, authMode, credentialSource };
-  const model = nonEmptyString(value.model);
-  if (model !== undefined) {entry.model = model;}
-  const apiKey = nonEmptyString(value.openRouterApiKey);
-  if (apiKey !== undefined) {entry.openRouterApiKey = apiKey;}
+  applyOptionalProfileFields(entry, value);
   return entry;
 }
 
@@ -108,7 +135,9 @@ function synthesiseFromV1(options: SubscriptionLookupOptions | undefined): Profi
     credentialSource: sub.configDir,
   }));
   const registry: ProfileRegistry = { profiles };
-  if (subRegistry.default !== undefined) {registry.default = subRegistry.default;}
+  if (subRegistry.default !== undefined) {
+    registry.default = subRegistry.default;
+  }
   return registry;
 }
 
@@ -116,7 +145,7 @@ function synthesiseFromV1(options: SubscriptionLookupOptions | undefined): Profi
 function readRegistryJson(registryPath: string): Record<string, unknown> | null {
   try {
     const raw = readFileSync(registryPath, "utf8");
-    const parsed = JSON.parse(raw);
+    const parsed: unknown = JSON.parse(raw);
     return isRecord(parsed) ? parsed : null;
   } catch {
     return null;
@@ -134,13 +163,19 @@ export function loadProfileRegistry(options?: SubscriptionLookupOptions): Profil
   const registryPath =
     options?.registryPath ?? path.join(homeDir, ".acpx", "subscriptions", "registry.json");
   const parsed = readRegistryJson(registryPath);
-  if (!parsed) {return EMPTY_PROFILE_REGISTRY;}
+  if (!parsed) {
+    return EMPTY_PROFILE_REGISTRY;
+  }
 
   // v2 format: has a "profiles" key
-  if (Array.isArray(parsed.profiles)) {return normalizeV2Registry(parsed, homeDir);}
+  if (Array.isArray(parsed.profiles)) {
+    return normalizeV2Registry(parsed, homeDir);
+  }
 
   // v1 format: has a "subscriptions" key — synthesise ProfileEntry objects
-  if (Array.isArray(parsed.subscriptions)) {return synthesiseFromV1(options);}
+  if (Array.isArray(parsed.subscriptions)) {
+    return synthesiseFromV1(options);
+  }
 
   return EMPTY_PROFILE_REGISTRY;
 }

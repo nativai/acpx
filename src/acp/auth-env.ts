@@ -432,7 +432,7 @@ export async function applyProfileAuth(
     env.CLAUDE_CONFIG_DIR = configDir;
 
     // Start the model-rewrite shim; apiKey never appears in logs.
-    const shim = await spawnOpenRouterShim(apiKey, model);
+    const shim = await spawnOpenRouterShim(apiKey, model, profile.reasoningEffort);
 
     env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${shim.port}`;
     // Bypass the Bun availability / key check in claude-agent-acp.

@@ -13,8 +13,9 @@ export const OPENROUTER_SHIM_CODE = `
 import http from 'node:http'
 import https from 'node:https'
 
-const API_KEY = process.env.OPENROUTER_API_KEY
-const MODEL   = process.env.OR_MODEL
+const API_KEY           = process.env.OPENROUTER_API_KEY
+const MODEL             = process.env.OR_MODEL
+const REASONING_EFFORT  = process.env.OR_REASONING_EFFORT || null
 if (!API_KEY || !MODEL) {
   process.stderr.write('[or-shim] OPENROUTER_API_KEY and OR_MODEL are required\\n')
   process.exit(1)
@@ -69,6 +70,8 @@ const server = http.createServer((req, res) => {
         const obj = JSON.parse(body.toString('utf8'))
         // Rewrite model to the configured OR model.
         obj.model = MODEL
+        // Inject static reasoning effort when configured on the profile.
+        if (REASONING_EFFORT) { obj.reasoning = { effort: REASONING_EFFORT } }
         // Inject an identity override so the model self-identifies by its real
         // OR model name instead of following the Claude identity system prompt.
         const identityOverride = { type: 'text', text: '[IDENTITY] Your actual model id is ' + MODEL + '. When asked what model or AI you are, always answer: "' + MODEL + '".' }

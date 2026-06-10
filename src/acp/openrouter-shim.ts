@@ -16,7 +16,9 @@ export type ShimHandle = {
 let shimPath: string | undefined;
 
 function ensureShimFile(): string {
-  if (shimPath) {return shimPath;}
+  if (shimPath) {
+    return shimPath;
+  }
   const dir = join(tmpdir(), "acpx-or-shim");
   mkdirSync(dir, { recursive: true });
   const p = join(dir, "shim.mjs");
@@ -33,17 +35,22 @@ function ensureShimFile(): string {
 export function spawnOpenRouterShim(
   apiKey: string,
   model: string,
+  reasoningEffort?: string,
   timeoutMs = 5000,
 ): Promise<ShimHandle> {
   return new Promise((resolve, reject) => {
     const path = ensureShimFile();
+    const shimEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      OPENROUTER_API_KEY: apiKey,
+      OR_MODEL: model,
+      PORT: "0",
+    };
+    if (reasoningEffort) {
+      shimEnv.OR_REASONING_EFFORT = reasoningEffort;
+    }
     const child = spawn(process.execPath, [path], {
-      env: {
-        ...process.env,
-        OPENROUTER_API_KEY: apiKey,
-        OR_MODEL: model,
-        PORT: "0",
-      },
+      env: shimEnv,
       stdio: ["ignore", "pipe", "pipe"],
     });
 
