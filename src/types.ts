@@ -425,6 +425,21 @@ export type SessionImportedFrom = {
   exportedAt: string;
 };
 
+/**
+ * acpx-ui-owned passthrough. acpx-ui marks a session as a reusable template by
+ * writing this block into the record (and flipping `closed`). The daemon does
+ * not author it, but parses + re-serializes it untouched so a daemon rewrite of
+ * a template session no longer drops the flag, and so `toSessionIndexEntry` can
+ * project `templateEnabled`/`templateCreatedAt` into the index sidecar (lets
+ * acpx-ui's hot rebuild path skip the per-session record read). All fields
+ * optional — acpx-ui owns the schema.
+ */
+export type SessionTemplateState = {
+  enabled?: boolean;
+  created_at?: string;
+  source_session_id?: string;
+};
+
 export type SessionRecord = {
   schema: typeof SESSION_RECORD_SCHEMA;
   acpxRecordId: string;
@@ -464,6 +479,8 @@ export type SessionRecord = {
   subagents?: SubagentRef[];
   metadata?: Record<string, string>;
   importedFrom?: SessionImportedFrom;
+  /** acpx-ui-owned template marker; daemon round-trips it untouched. */
+  template?: SessionTemplateState;
 };
 
 export type RunPromptResult = {
