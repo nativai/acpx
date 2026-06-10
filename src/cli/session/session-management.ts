@@ -312,6 +312,18 @@ async function forkSessionRecordWithClient(
   }
 }
 
+/** Build the best-effort sessionContext for the first (creation) spawn. */
+function creationSessionContext(options: SessionCreateOptions) {
+  return {
+    acpxRecordId: "",
+    parentSessionId: options.parentSessionId ?? null,
+    taskFolder: options.metadata?.task_folder ?? null,
+    agentFolder: null,
+    subscriptionId: options.sessionOptions?.subscription ?? null,
+    profileId: options.sessionOptions?.profile ?? null,
+  };
+}
+
 export async function createSessionWithClient(
   options: SessionCreateOptions,
 ): Promise<SessionCreateWithClientResult> {
@@ -335,13 +347,7 @@ export async function createSessionWithClient(
     // sessionContext fields are best-effort (each is guarded independently in
     // buildAgentEnvironment, so a null acpxRecordId only skips ACPX_SESSION_URL
     // on this one spawn — it is set on the next spawn from the persisted record).
-    sessionContext: {
-      acpxRecordId: "",
-      parentSessionId: options.parentSessionId ?? null,
-      taskFolder: options.metadata?.task_folder ?? null,
-      agentFolder: null,
-      subscriptionId: options.sessionOptions?.subscription ?? null,
-    },
+    sessionContext: creationSessionContext(options),
   });
 
   try {
