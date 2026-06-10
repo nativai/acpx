@@ -75,6 +75,18 @@ async function submitToRunningOwner(
   });
 }
 
+// eslint-disable-next-line complexity -- mirrors the sessionContext shape from runtime.ts / connected-session.ts; the ?. chains are load-bearing and cannot be simplified further without losing null safety
+function sessionContextFromRecord(record: Awaited<ReturnType<typeof resolveSessionRecord>>) {
+  return {
+    acpxRecordId: record.acpxRecordId,
+    parentSessionId: record.parentSessionId ?? null,
+    taskFolder: record.metadata?.task_folder ?? null,
+    agentFolder: resolveAndEnsureAgentFolder(record),
+    subscriptionId: record.acpx?.session_options?.subscription ?? null,
+    profileId: record.acpx?.session_options?.profile ?? null,
+  };
+}
+
 function createQueueOwnerSharedClient(
   options: QueueOwnerRuntimeOptions,
   sessionRecord: Awaited<ReturnType<typeof resolveSessionRecord>>,
@@ -90,13 +102,7 @@ function createQueueOwnerSharedClient(
     terminal: options.terminal,
     suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
     verbose: options.verbose,
-    sessionContext: {
-      acpxRecordId: sessionRecord.acpxRecordId,
-      parentSessionId: sessionRecord.parentSessionId ?? null,
-      taskFolder: sessionRecord.metadata?.task_folder ?? null,
-      agentFolder: resolveAndEnsureAgentFolder(sessionRecord),
-      subscriptionId: sessionRecord.acpx?.session_options?.subscription ?? null,
-    },
+    sessionContext: sessionContextFromRecord(sessionRecord),
     sessionOptions: mergeSessionOptions(
       options.sessionOptions,
       sessionOptionsFromRecord(sessionRecord),

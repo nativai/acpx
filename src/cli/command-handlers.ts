@@ -812,6 +812,7 @@ export async function handleExec(
       maxTurns: globalFlags.maxTurns,
       systemPrompt: globalFlags.systemPrompt,
       subscription: globalFlags.subscription,
+      profile: globalFlags.profile,
       reasoningEffort: globalFlags.reasoningEffort,
     },
   });

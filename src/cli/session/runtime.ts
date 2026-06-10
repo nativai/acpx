@@ -944,6 +944,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         taskFolder: record.metadata?.task_folder ?? null,
         agentFolder: resolveAndEnsureAgentFolder(record),
         subscriptionId: record.acpx?.session_options?.subscription ?? null,
+        profileId: record.acpx?.session_options?.profile ?? null,
       },
       sessionOptions,
     });
@@ -1540,6 +1541,11 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
     onPermissionEscalation: (event) => {
       output.onPermissionEscalation(event);
       options.onPermissionEscalation?.(event);
+    },
+    sessionContext: {
+      acpxRecordId: "",
+      subscriptionId: options.sessionOptions?.subscription ?? null,
+      profileId: options.sessionOptions?.profile ?? null,
     },
     sessionOptions: options.sessionOptions,
   });
