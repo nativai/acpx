@@ -82,6 +82,18 @@ const server = http.createServer((req, res) => {
         } else {
           obj.system = [identityOverride]
         }
+        // Stabilise the per-request 'cch=<hash>' token Claude Code injects into the
+        // system billing-header block. It changes every request and, sitting inside
+        // the cache_control-marked prefix, defeats prompt caching on exact-match
+        // providers (OpenRouter -> DeepSeek). Normalising it makes the cached prefix
+        // byte-stable so caching engages. Harmless to Anthropic (which already caches).
+        if (Array.isArray(obj.system)) {
+          for (const blk of obj.system) {
+            if (blk && typeof blk.text === 'string' && blk.text.indexOf('cch=') !== -1) {
+              blk.text = blk.text.replace(/cch=[0-9a-f]+/g, 'cch=stable')
+            }
+          }
+        }
         // Strip extended-thinking / computer-use fields that GPT models don't support.
         delete obj.thinking
         delete obj.betas
