@@ -1,5 +1,5 @@
-import { mkdirSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { hasKnownDeadSubs, isSubscriptionKnownDead } from "../config/known-dead-subscriptions.js";
 import { findProfile, loadProfileRegistry } from "../config/profiles.js";
@@ -342,6 +342,42 @@ export function resolveConfiguredAuthCredential(
   return configCredentials[methodId] ?? configCredentials[toEnvToken(methodId)];
 }
 
+// Seed a freshly-created OpenRouter config dir with the universal SessionStart
+// primer hook. OpenRouter sessions run with CLAUDE_CONFIG_DIR pointed at an
+// isolated temp dir (so no Anthropic OAuth can leak in); that isolation also
+// means Claude Code no longer reads the host's global ~/.claude/settings.json,
+// so the primer hook configured there would never fire. We fix that by copying
+// ONLY the `hooks` block from the host's global settings into the temp dir —
+// never the `.credentials.json`, so the shim's ANTHROPIC_BASE_URL/AUTH_TOKEN
+// remain the sole auth path and "local OAuth" can't win.
+//
+// Best-effort: if the source settings or its hooks are missing/unparseable we
+// leave the dir without a settings.json (the primer simply won't fire — same as
+// before this fix). Never throws — the primer is a nicety, not worth failing a
+// spawn over. The openRouterApiKey is not involved here, so nothing sensitive
+// is written.
+function seedOpenRouterPrimerHooks(configDir: string): void {
+  try {
+    const source = join(homedir(), ".claude", "settings.json");
+    if (!existsSync(source)) {
+      return;
+    }
+    const parsed = JSON.parse(readFileSync(source, "utf8")) as { hooks?: unknown };
+    if (!parsed || typeof parsed !== "object" || parsed.hooks == null) {
+      return;
+    }
+    writeFileSync(
+      join(configDir, "settings.json"),
+      JSON.stringify({ hooks: parsed.hooks }, null, 2),
+      {
+        mode: 0o644,
+      },
+    );
+  } catch {
+    /* best-effort: the primer is a nicety; never block the spawn over it */
+  }
+}
+
 /**
  * Apply profile-based authentication to the env dict and return a ShimHandle
  * for openrouter profiles (caller must stop it when the session closes), or
@@ -388,6 +424,11 @@ export async function applyProfileAuth(
     // Isolate Claude config in a per-session temp dir (no OAuth inheritance).
     const configDir = join(tmpdir(), `or-${sessionId}`);
     mkdirSync(configDir, { recursive: true });
+    // Seed the dir with the universal SessionStart primer hook so OpenRouter
+    // sessions get the same primer that subscription sessions get from their
+    // own config dir. Copies ONLY the hooks block — never .credentials.json —
+    // so the shim's ANTHROPIC_BASE_URL/AUTH_TOKEN stay the sole auth path.
+    seedOpenRouterPrimerHooks(configDir);
     env.CLAUDE_CONFIG_DIR = configDir;
 
     // Start the model-rewrite shim; apiKey never appears in logs.
