@@ -44,6 +44,7 @@ import {
   type SessionsPruneFlags,
   type StatusFlags,
 } from "./flags.js";
+import { registerProfilesCommand } from "./profiles-command.js";
 import { registerStatusCommand } from "./status-command.js";
 import { registerSubscriptionsCommand } from "./subscriptions-command.js";
 
@@ -424,6 +425,7 @@ export function registerAgentCommand(
 
   registerSessionsCommand(agentCommand, agentName, config);
   registerSubscriptionsCommand(agentCommand, config);
+  registerProfilesCommand(agentCommand, config);
 }
 
 export function registerFlowCommand(program: Command, config: ResolvedAcpxConfig): void {
@@ -460,6 +462,7 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
 
   registerSessionsCommand(program, undefined, config);
   registerSubscriptionsCommand(program, config);
+  registerProfilesCommand(program, config);
   registerConfigCommand(program, config);
   registerFlowCommand(program, config);
 }

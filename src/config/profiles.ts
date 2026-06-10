@@ -11,6 +11,10 @@ export type Harness = "claude" | "codex";
 export type AuthMode = "subscription" | "openrouter" | "chatgpt";
 export type ReasoningEffort = "low" | "medium" | "high";
 
+/** Effort levels valid for OpenRouter profiles with reasoningSupported=true. */
+export const OPENROUTER_REASONING_EFFORTS = ["minimal", "low", "medium", "high"] as const;
+export type OpenRouterReasoningEffort = (typeof OPENROUTER_REASONING_EFFORTS)[number];
+
 export interface ProfileEntry {
   id: string;
   label: string;
@@ -30,6 +34,12 @@ export interface ProfileEntry {
    * `reasoning: { effort }` into every /v1/messages request. Ignored for non-openrouter profiles.
    */
   reasoningEffort?: ReasoningEffort;
+  /**
+   * Manual flag (no auto-retrieval) indicating the OR model supports reasoning.
+   * When true, the valid effort levels are minimal/low/medium/high and the CLI
+   * `--reasoning-effort` flag accepts those values. Ignored for non-openrouter.
+   */
+  reasoningSupported?: boolean;
 }
 
 export interface ProfileRegistry {
@@ -84,6 +94,26 @@ function applyOptionalProfileFields(entry: ProfileEntry, raw: Record<string, unk
   if (isValidReasoningEffort(raw.reasoningEffort)) {
     entry.reasoningEffort = raw.reasoningEffort;
   }
+  if (raw.reasoningSupported === true) {
+    entry.reasoningSupported = true;
+  }
+}
+
+/**
+ * Return the valid effort levels for a profile, or null when reasoning is not
+ * applicable (used by CLI validation and the `profiles` discovery command).
+ * - subscription → Claude set: low/medium/high/xhigh/max
+ * - openrouter + reasoningSupported → OR set: minimal/low/medium/high
+ * - openrouter without reasoningSupported → null
+ */
+export function getValidEffortsForProfile(profile: ProfileEntry): readonly string[] | null {
+  if (profile.authMode === "subscription") {
+    return ["low", "medium", "high", "xhigh", "max"];
+  }
+  if (profile.authMode === "openrouter" && profile.reasoningSupported) {
+    return OPENROUTER_REASONING_EFFORTS;
+  }
+  return null;
 }
 
 function normalizeProfileEntry(value: unknown, homeDir: string): ProfileEntry | undefined {

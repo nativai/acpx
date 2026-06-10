@@ -692,15 +692,25 @@ export class AcpClient {
    */
   private async applyProfileEnv(env: NodeJS.ProcessEnv): Promise<void> {
     const profileId = this.options.sessionContext?.profileId?.trim();
-    if (!profileId) {return;}
+    if (!profileId) {
+      return;
+    }
     if (!this.shimHandle) {
-      const sessionId = this.options.sessionContext?.acpxRecordId ?? profileId;
-      this.shimHandle = (await applyProfileAuth(env, profileId, sessionId)) ?? undefined;
+      await this.startProfileShim(env, profileId);
     } else {
       env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${this.shimHandle.port}`;
       env.ANTHROPIC_AUTH_TOKEN = " ";
       delete env.ANTHROPIC_CUSTOM_HEADERS;
     }
+  }
+
+  /** First-spawn path: create the OR shim and inject its port into the env. */
+  private async startProfileShim(env: NodeJS.ProcessEnv, profileId: string): Promise<void> {
+    const ctx = this.options.sessionContext;
+    const sessionId = ctx?.acpxRecordId ?? profileId;
+    const reasoningEffort = ctx?.reasoningEffort ?? null;
+    this.shimHandle =
+      (await applyProfileAuth(env, profileId, sessionId, reasoningEffort)) ?? undefined;
   }
 
   private logAgentLaunch(plan: AgentLaunchPlan): void {

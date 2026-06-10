@@ -945,6 +945,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         agentFolder: resolveAndEnsureAgentFolder(record),
         subscriptionId: record.acpx?.session_options?.subscription ?? null,
         profileId: record.acpx?.session_options?.profile ?? null,
+        reasoningEffort: sessionOptions?.reasoningEffort ?? null,
       },
       sessionOptions,
     });
@@ -1546,6 +1547,7 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
       acpxRecordId: "",
       subscriptionId: options.sessionOptions?.subscription ?? null,
       profileId: options.sessionOptions?.profile ?? null,
+      reasoningEffort: options.sessionOptions?.reasoningEffort ?? null,
     },
     sessionOptions: options.sessionOptions,
   });

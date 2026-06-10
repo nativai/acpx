@@ -47,7 +47,11 @@ export type GlobalFlags = PermissionFlags & {
   verbose?: boolean;
   format: OutputFormat;
   model?: string;
-  reasoningEffort?: ReasoningEffort;
+  // Opaque string at parse time — validated against the profile's valid set at
+  // execution time (subscription: low/medium/high/xhigh/max; openrouter:
+  // minimal/low/medium/high). Typed as string (not ReasoningEffort) because OR
+  // profiles add 'minimal' which is outside Claude's set.
+  reasoningEffort?: string;
   subscription?: string;
   /** Profile id from `--profile <id>` — stored as session_options.profile. */
   profile?: string;
@@ -158,14 +162,21 @@ export function parseAuthPolicy(value: string): AuthPolicy {
   return value as AuthPolicy;
 }
 
-export function parseReasoningEffort(value: string): ReasoningEffort {
+// Union of all valid effort values across all profile types. Profile-specific
+// validation (e.g. 'xhigh' rejected for openrouter) happens at execution time
+// inside applyProfileAuth where the profile is known.
+const ALL_KNOWN_EFFORTS = ["minimal", ...REASONING_EFFORTS] as const;
+
+export function parseReasoningEffort(value: string): string {
   const normalized = value.trim().toLowerCase();
-  if (!REASONING_EFFORTS.includes(normalized as ReasoningEffort)) {
+  if (!(ALL_KNOWN_EFFORTS as readonly string[]).includes(normalized)) {
     throw new InvalidArgumentError(
-      `Invalid reasoning effort "${value}". Expected one of: ${REASONING_EFFORTS.join(", ")}`,
+      `Invalid reasoning effort "${value}". ` +
+        `Claude profiles: ${REASONING_EFFORTS.join(", ")}. ` +
+        `OpenRouter profiles: minimal, low, medium, high.`,
     );
   }
-  return normalized as ReasoningEffort;
+  return normalized;
 }
 
 export function parseNonInteractivePermissionPolicy(value: string): NonInteractivePermissionPolicy {
@@ -372,7 +383,11 @@ export function addGlobalFlags(command: Command): Command {
     .option("--model <id>", "Agent model id")
     .option(
       "--reasoning-effort <level>",
-      "Claude thinking depth: low, medium, high, xhigh, or max (ignored by codex — set codex depth via --model '<model>[depth]')",
+      "Thinking depth: Claude profiles accept low/medium/high/xhigh/max; " +
+        "OpenRouter profiles with reasoningSupported accept minimal/low/medium/high. " +
+        "Overrides the profile's default reasoningEffort. " +
+        "Out-of-range values for the active profile are rejected with a clear error. " +
+        "(Ignored by codex — set codex depth via --model '<model>[depth]'.)",
       parseReasoningEffort,
     )
     .option(

@@ -227,6 +227,12 @@ export type AcpClientOptions = {
     subscriptionId?: string | null;
     /** Profile id from session_options.profile — takes priority over subscriptionId. */
     profileId?: string | null;
+    /**
+     * Per-session reasoning effort override for openrouter profiles. Overrides
+     * the profile's default reasoningEffort. Validated against the profile's
+     * valid effort set inside applyProfileAuth.
+     */
+    reasoningEffort?: string | null;
   };
   sessionOptions?: {
     model?: string;

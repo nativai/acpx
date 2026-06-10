@@ -40,6 +40,7 @@ const TOP_LEVEL_VERBS = new Set([
   "set",
   "sessions",
   "subscriptions",
+  "profiles",
   "usage",
   "status",
   "config",

@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { hasKnownDeadSubs, isSubscriptionKnownDead } from "../config/known-dead-subscriptions.js";
-import { findProfile, loadProfileRegistry } from "../config/profiles.js";
+import { findProfile, getValidEffortsForProfile, loadProfileRegistry } from "../config/profiles.js";
 import type { SubscriptionLookupOptions } from "../config/subscriptions.js";
 import {
   chooseSubscriptionConfigDir,
@@ -97,6 +97,12 @@ export type AgentSessionContext = {
    * synchronous env build (see applyProfileAuth in client.ts usage).
    */
   profileId?: string | null;
+  /**
+   * Per-session reasoning effort override. Overrides profile.reasoningEffort when
+   * set. For openrouter profiles only — passed to spawnOpenRouterShim via the
+   * shim's OR_REASONING_EFFORT env var. Must be in the profile's valid effort set.
+   */
+  reasoningEffort?: string | null;
 };
 
 // eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
@@ -384,12 +390,88 @@ function seedOpenRouterPrimerHooks(configDir: string): void {
  * null for subscription profiles. Called asynchronously after the synchronous
  * env build so the shim port is known before the adapter process spawns.
  *
+ * reasoningEffortOverride: per-session effort from --reasoning-effort; overrides
+ * the profile's default reasoningEffort for openrouter profiles. Validated
+ * against the profile's valid effort set — throws on mismatch so the caller
+ * gets a clear error rather than a silently wrong effort level.
+ *
  * Constraint: openRouterApiKey must never appear in logs or process output.
  */
+// Validate that an effort override is in the profile's valid set; throws with a
+// clear, user-facing error listing the valid levels on mismatch.
+function validateOpenRouterEffort(
+  profileId: string,
+  profile: ReturnType<typeof findProfile> & object,
+  effortOverride: string | undefined,
+): void {
+  if (!effortOverride) {
+    return;
+  }
+  const validEfforts = getValidEffortsForProfile(profile);
+  if (!validEfforts) {
+    throw new Error(
+      `[acpx] profile "${profileId}" does not support reasoning (reasoningSupported is not set). ` +
+        `Remove --reasoning-effort to use this profile without reasoning.`,
+    );
+  }
+  if (!validEfforts.includes(effortOverride)) {
+    throw new Error(
+      `[acpx] --reasoning-effort "${effortOverride}" is not valid for OpenRouter profile "${profileId}". ` +
+        `Valid levels: ${validEfforts.join(", ")}`,
+    );
+  }
+}
+
+// Handles the openrouter authMode branch of applyProfileAuth.
+async function applyOpenRouterProfileAuth(
+  env: NodeJS.ProcessEnv,
+  profileId: string,
+  sessionId: string,
+  profile: NonNullable<ReturnType<typeof findProfile>>,
+  reasoningEffortOverride: string | null | undefined,
+): Promise<ShimHandle | null> {
+  const apiKey = profile.openRouterApiKey;
+  const model = profile.model;
+  if (!apiKey || !model) {
+    process.stderr.write(
+      `[acpx] profile "${profileId}" is missing openRouterApiKey or model; using default Claude config\n`,
+    );
+    return null;
+  }
+
+  // Validate then resolve effort: per-session override > profile default.
+  const trimmedEffort = reasoningEffortOverride?.trim() || undefined;
+  validateOpenRouterEffort(profileId, profile, trimmedEffort);
+  const resolvedEffort = trimmedEffort ?? profile.reasoningEffort;
+
+  // Isolate Claude config in a per-session temp dir (no OAuth inheritance).
+  const configDir = join(tmpdir(), `or-${sessionId}`);
+  mkdirSync(configDir, { recursive: true });
+  // Seed the dir with the universal SessionStart primer hook so OpenRouter
+  // sessions get the same primer that subscription sessions get from their
+  // own config dir. Copies ONLY the hooks block — never .credentials.json —
+  // so the shim's ANTHROPIC_BASE_URL/AUTH_TOKEN stay the sole auth path.
+  seedOpenRouterPrimerHooks(configDir);
+  env.CLAUDE_CONFIG_DIR = configDir;
+
+  // Start the model-rewrite shim; apiKey never appears in logs.
+  const shim = await spawnOpenRouterShim(apiKey, model, resolvedEffort);
+
+  env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${shim.port}`;
+  // Bypass the Bun availability / key check in claude-agent-acp.
+  env.ANTHROPIC_AUTH_TOKEN = " ";
+  // Remove any custom headers set by the subscription path —
+  // the shim injects Authorization itself.
+  delete env.ANTHROPIC_CUSTOM_HEADERS;
+
+  return shim;
+}
+
 export async function applyProfileAuth(
   env: NodeJS.ProcessEnv,
   profileId: string,
   sessionId: string,
+  reasoningEffortOverride?: string | null,
   lookupOptions?: SubscriptionLookupOptions,
 ): Promise<ShimHandle | null> {
   const trimmedId = profileId.trim();
@@ -412,36 +494,7 @@ export async function applyProfileAuth(
   }
 
   if (profile.authMode === "openrouter") {
-    const apiKey = profile.openRouterApiKey;
-    const model = profile.model;
-    if (!apiKey || !model) {
-      process.stderr.write(
-        `[acpx] profile "${trimmedId}" is missing openRouterApiKey or model; using default Claude config\n`,
-      );
-      return null;
-    }
-
-    // Isolate Claude config in a per-session temp dir (no OAuth inheritance).
-    const configDir = join(tmpdir(), `or-${sessionId}`);
-    mkdirSync(configDir, { recursive: true });
-    // Seed the dir with the universal SessionStart primer hook so OpenRouter
-    // sessions get the same primer that subscription sessions get from their
-    // own config dir. Copies ONLY the hooks block — never .credentials.json —
-    // so the shim's ANTHROPIC_BASE_URL/AUTH_TOKEN stay the sole auth path.
-    seedOpenRouterPrimerHooks(configDir);
-    env.CLAUDE_CONFIG_DIR = configDir;
-
-    // Start the model-rewrite shim; apiKey never appears in logs.
-    const shim = await spawnOpenRouterShim(apiKey, model, profile.reasoningEffort);
-
-    env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${shim.port}`;
-    // Bypass the Bun availability / key check in claude-agent-acp.
-    env.ANTHROPIC_AUTH_TOKEN = " ";
-    // Remove any custom headers set by the subscription path —
-    // the shim injects Authorization itself.
-    delete env.ANTHROPIC_CUSTOM_HEADERS;
-
-    return shim;
+    return applyOpenRouterProfileAuth(env, trimmedId, sessionId, profile, reasoningEffortOverride);
   }
 
   // authMode=chatgpt or unknown: no extra env manipulation from the profile side.
