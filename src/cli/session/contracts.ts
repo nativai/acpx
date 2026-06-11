@@ -24,7 +24,7 @@ type TimedRunOptions = {
   timeoutMs?: number;
 };
 
-export const DEFAULT_QUEUE_OWNER_TTL_MS = 5_400_000;
+export const DEFAULT_QUEUE_OWNER_TTL_MS = 900_000;
 
 export function normalizeQueueOwnerTtlMs(ttlMs: number | undefined): number {
   if (ttlMs == null) {

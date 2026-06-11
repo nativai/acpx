@@ -582,7 +582,7 @@ test("closeSession soft-closes and terminates matching process", async () => {
 test("normalizeQueueOwnerTtlMs applies default and edge-case normalization", async () => {
   await withTempHome(async () => {
     const session = await loadSessionModule();
-    assert.equal(session.DEFAULT_QUEUE_OWNER_TTL_MS, 5_400_000);
+    assert.equal(session.DEFAULT_QUEUE_OWNER_TTL_MS, 900_000);
     assert.equal(session.normalizeQueueOwnerTtlMs(undefined), session.DEFAULT_QUEUE_OWNER_TTL_MS);
     assert.equal(session.normalizeQueueOwnerTtlMs(0), 0);
     assert.equal(session.normalizeQueueOwnerTtlMs(-1), session.DEFAULT_QUEUE_OWNER_TTL_MS);
