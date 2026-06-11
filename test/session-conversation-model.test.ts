@@ -298,5 +298,6 @@ test("cloneSessionAcpxState preserves desired mode id", () => {
     allowed_tools: ["Read", "Grep"],
     max_turns: 7,
     subscription: "sub1",
+    profile: undefined,
   });
 });

@@ -17,7 +17,6 @@ import {
   type OutputFormat,
   type OutputPolicy,
   type PermissionMode,
-  type ReasoningEffort,
 } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 
@@ -600,7 +599,7 @@ function resolveProfileOption(value: unknown): string | undefined {
 // Commander already runs parseReasoningEffort via the option parser, so the
 // value reaching here is validated; re-validate defensively (cheap, and guards
 // any path that reads the option without the parser attached).
-function resolveReasoningEffortOption(value: unknown): ReasoningEffort | undefined {
+function resolveReasoningEffortOption(value: unknown): string | undefined {
   return typeof value === "string" ? parseReasoningEffort(value) : undefined;
 }
 
