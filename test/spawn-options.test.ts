@@ -331,6 +331,71 @@ test("buildAgentSpawnOptions omits ACPX_TASK_FOLDER when taskFolder is null/unde
   }
 });
 
+test("buildAgentSpawnOptions injects ACPX_TELEGRAM when sessionContext.telegram is set", () => {
+  const previous = process.env.ACPX_TELEGRAM;
+  delete process.env.ACPX_TELEGRAM;
+  try {
+    const stringCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+      telegram: "1",
+    });
+    assert.equal(stringCase.env.ACPX_TELEGRAM, "1");
+
+    const booleanCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+      telegram: true,
+    });
+    assert.equal(booleanCase.env.ACPX_TELEGRAM, "1");
+  } finally {
+    if (previous === undefined) {
+      delete process.env.ACPX_TELEGRAM;
+    } else {
+      process.env.ACPX_TELEGRAM = previous;
+    }
+  }
+});
+
+test("buildAgentSpawnOptions omits ACPX_TELEGRAM when telegram is absent or blank", () => {
+  const previous = process.env.ACPX_TELEGRAM;
+  delete process.env.ACPX_TELEGRAM;
+  try {
+    const undefinedCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+    });
+    assert.equal(Object.prototype.hasOwnProperty.call(undefinedCase.env, "ACPX_TELEGRAM"), false);
+
+    const nullCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+      telegram: null,
+    });
+    assert.equal(Object.prototype.hasOwnProperty.call(nullCase.env, "ACPX_TELEGRAM"), false);
+
+    const falseCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+      telegram: false,
+    });
+    assert.equal(Object.prototype.hasOwnProperty.call(falseCase.env, "ACPX_TELEGRAM"), false);
+
+    const emptyCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+      telegram: "",
+    });
+    assert.equal(Object.prototype.hasOwnProperty.call(emptyCase.env, "ACPX_TELEGRAM"), false);
+
+    const whitespaceCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+      telegram: "   ",
+    });
+    assert.equal(Object.prototype.hasOwnProperty.call(whitespaceCase.env, "ACPX_TELEGRAM"), false);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.ACPX_TELEGRAM;
+    } else {
+      process.env.ACPX_TELEGRAM = previous;
+    }
+  }
+});
+
 test("buildAgentSpawnOptions: ACPX_TASK_FOLDER coexists with URL session + parent vars (no _ID vars)", () => {
   const previousSessionId = process.env.ACPX_SESSION_ID;
   const previousParentId = process.env.ACPX_PARENT_SESSION_ID;

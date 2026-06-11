@@ -313,11 +313,13 @@ async function forkSessionRecordWithClient(
 }
 
 /** Build the best-effort sessionContext for the first (creation) spawn. */
+// eslint-disable-next-line complexity -- mirrors the persisted-record sessionContext shape; the optional fields stay guarded independently in buildAgentEnvironment
 function creationSessionContext(options: SessionCreateOptions) {
   return {
     acpxRecordId: "",
     parentSessionId: options.parentSessionId ?? null,
     taskFolder: options.metadata?.task_folder ?? null,
+    telegram: options.metadata?.telegram ?? null,
     agentFolder: null,
     subscriptionId: options.sessionOptions?.subscription ?? null,
     profileId: options.sessionOptions?.profile ?? null,

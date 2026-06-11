@@ -942,6 +942,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         acpxRecordId: record.acpxRecordId,
         parentSessionId: record.parentSessionId ?? null,
         taskFolder: record.metadata?.task_folder ?? null,
+        telegram: record.metadata?.telegram ?? null,
         agentFolder: resolveAndEnsureAgentFolder(record),
         subscriptionId: record.acpx?.session_options?.subscription ?? null,
         profileId: record.acpx?.session_options?.profile ?? null,

@@ -522,6 +522,40 @@ test("sessions new --resume-session loads ACP session and stores resumed ids", a
   });
 });
 
+test("sessions new --metadata telegram=1 injects ACPX_TELEGRAM into initial agent env", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const envDumpFile = path.join(homeDir, "acpx-env.json");
+    const agentCommand = `${MOCK_AGENT_COMMAND} --env-dump-file ${JSON.stringify(envDumpFile)}`;
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          agents: {
+            codex: {
+              command: agentCommand,
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    const result = await runCli(
+      ["--cwd", cwd, "codex", "sessions", "new", "--metadata", "telegram=1"],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+
+    const dumpedEnv = JSON.parse(await fs.readFile(envDumpFile, "utf8")) as Record<string, string>;
+    assert.equal(dumpedEnv.ACPX_TELEGRAM, "1");
+  });
+});
+
 test("sessions new --resume-session fails when agent does not support session reuse", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -3746,6 +3780,7 @@ async function runCli(
       "ACPX_SESSION_NAME",
       "ACPX_PARENT_SESSION_URL",
       "ACPX_TASK_FOLDER",
+      "ACPX_TELEGRAM",
     ]) {
       if (!Object.prototype.hasOwnProperty.call(options.env ?? {}, key)) {
         delete env[key];

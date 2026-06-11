@@ -223,6 +223,7 @@ export type AcpClientOptions = {
     acpxRecordId: string;
     parentSessionId?: string | null;
     taskFolder?: string | null;
+    telegram?: boolean | string | null;
     agentFolder?: string | null;
     subscriptionId?: string | null;
     /** Profile id from session_options.profile — takes priority over subscriptionId. */

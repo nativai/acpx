@@ -83,6 +83,7 @@ export type AgentSessionContext = {
   acpxRecordId: string;
   parentSessionId?: string | null;
   taskFolder?: string | null;
+  telegram?: boolean | string | null;
   agentFolder?: string | null;
   /**
    * Selected Claude subscription id (from ~/.acpx/subscriptions/registry.json).
@@ -137,6 +138,13 @@ function buildAgentEnvironment(
     if (trimmedAgentFolder.length > 0) {
       env.ACPX_AGENT_FOLDER = trimmedAgentFolder;
     }
+  }
+  if (
+    sessionContext &&
+    (sessionContext.telegram === true ||
+      (typeof sessionContext.telegram === "string" && sessionContext.telegram.trim().length > 0))
+  ) {
+    env.ACPX_TELEGRAM = "1";
   }
   // When a profileId is set the async applyProfileAuth path (called from
   // client.ts after this synchronous env build) handles all auth env setup.
