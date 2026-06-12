@@ -57,6 +57,25 @@ export function isClaudeAcpCommand(command: string, args: readonly string[]): bo
   return args.some((arg) => arg.includes("claude-agent-acp"));
 }
 
+// The claude-pty bridge (independent-claude-acp). Matches both the bootstrapped
+// default (`node /opt/claude-pty-acp/acp-server-transcript.mjs`) and dev
+// overrides via ACPX_CLAUDE_PTY_ACP_COMMAND or a config.json `agents` entry
+// pointing at a checkout (any path containing the repo name or the server
+// script name). Deliberately does NOT overlap isClaudeAcpCommand
+// ("claude-agent-acp"), so the SDK-adapter-specific handling never applies.
+export function isClaudePtyAcpCommand(command: string, args: readonly string[]): boolean {
+  return [command, ...args].some(
+    (part) => part.includes("claude-pty-acp") || part.includes("acp-server-transcript"),
+  );
+}
+
+// String-level variant for callers that hold the unsplit agentCommand
+// (auth-env validation, session-create compatibility checks).
+export function isClaudePtyAgentCommand(agentCommand: string): boolean {
+  const { command, args } = splitCommandLine(agentCommand);
+  return isClaudePtyAcpCommand(command, args);
+}
+
 export function isCopilotAcpCommand(command: string, args: readonly string[]): boolean {
   return basenameToken(command) === "copilot" && args.includes("--acp");
 }

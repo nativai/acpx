@@ -141,6 +141,7 @@ test("listBuiltInAgents preserves the required example prefix and alphabetical t
     "copilot",
   ]);
   assert.deepEqual(agents.slice(7), [
+    "claude-pty",
     "droid",
     "iflow",
     "kilocode",
