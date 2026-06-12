@@ -267,26 +267,47 @@ export async function writeSessionIndex(
   await fs.rename(tempFile, filePath);
 }
 
-export async function rebuildSessionIndex(sessionDir: string): Promise<SessionIndex> {
-  const entries = await fs.readdir(sessionDir, { withFileTypes: true });
-  const files = entries
+async function listSessionRecordFiles(sessionDir: string): Promise<string[]> {
+  return (await fs.readdir(sessionDir, { withFileTypes: true }))
     .filter(
       (entry) => entry.isFile() && entry.name.endsWith(".json") && entry.name !== "index.json",
     )
     .map((entry) => entry.name)
     .toSorted();
+}
+
+async function readIndexEntryFromDisk(
+  sessionDir: string,
+  file: string,
+): Promise<SessionIndexEntry | undefined> {
+  try {
+    const payload = await fs.readFile(path.join(sessionDir, file), "utf8");
+    const parsed = parseSessionRecord(JSON.parse(payload));
+    if (!parsed) {
+      return undefined;
+    }
+    return toSessionIndexEntry(parsed, file);
+  } catch {
+    // corrupt, or vanished between readdir and read — treated the same as the
+    // full-rebuild path: the file keeps its file-list row but gets no entry
+    return undefined;
+  }
+}
+
+export async function rebuildSessionIndex(
+  sessionDir: string,
+  reason: string,
+): Promise<SessionIndex> {
+  // Full-store re-parse — the prod observable for the "zero full-store
+  // rebuilds on new-file creation" target (VERIFICATION-ANNEX S4 greps for it).
+  process.stderr.write(`[acpx] full session-index rebuild (reason: ${reason})\n`);
+  const files = await listSessionRecordFiles(sessionDir);
 
   const indexEntries: SessionIndexEntry[] = [];
   for (const file of files) {
-    try {
-      const payload = await fs.readFile(path.join(sessionDir, file), "utf8");
-      const parsed = parseSessionRecord(JSON.parse(payload));
-      if (!parsed) {
-        continue;
-      }
-      indexEntries.push(toSessionIndexEntry(parsed, file));
-    } catch {
-      // ignore corrupt session files while rebuilding the cache index
+    const entry = await readIndexEntryFromDisk(sessionDir, file);
+    if (entry) {
+      indexEntries.push(entry);
     }
   }
 
@@ -299,20 +320,74 @@ export async function rebuildSessionIndex(sessionDir: string): Promise<SessionIn
   return index;
 }
 
-export async function loadOrRebuildSessionIndex(sessionDir: string): Promise<SessionIndex> {
-  const files = (await fs.readdir(sessionDir, { withFileTypes: true }))
-    .filter(
-      (entry) => entry.isFile() && entry.name.endsWith(".json") && entry.name !== "index.json",
-    )
-    .map((entry) => entry.name)
-    .toSorted();
+export type ReconciledSessionIndex = {
+  index: SessionIndex;
+  /** True when the on-disk file list and index.files disagreed (the returned
+   * index reflects disk but has NOT been written back — membership changes
+   * persist via the caller's index write). */
+  drift: boolean;
+};
+
+/**
+ * Load the session index, reconciling file-list drift incrementally: records
+ * absent from the index are read and parsed individually; index rows whose
+ * files vanished are dropped without any read. The full-store re-parse
+ * (`rebuildSessionIndex`) is reserved for a missing or unparseable index.json.
+ *
+ * `providedEntries` lets a caller that already holds a fresh entry for a file
+ * (e.g. the record writer that just created it) supply it directly, so the
+ * reconcile does not re-read the multi-MB record it was derived from.
+ */
+export async function reconcileSessionIndex(
+  sessionDir: string,
+  providedEntries?: ReadonlyMap<string, SessionIndexEntry>,
+): Promise<ReconciledSessionIndex> {
+  const files = await listSessionRecordFiles(sessionDir);
   const existing = await readSessionIndex(sessionDir);
-  if (
-    existing &&
-    existing.files.length === files.length &&
-    existing.files.every((file, index) => file === files[index])
-  ) {
-    return existing;
+  if (!existing) {
+    return {
+      index: await rebuildSessionIndex(sessionDir, "index.json missing or unparseable"),
+      drift: true,
+    };
   }
-  return await rebuildSessionIndex(sessionDir);
+  if (existing.files.length === files.length && existing.files.every((f, i) => f === files[i])) {
+    return { index: existing, drift: false };
+  }
+
+  return {
+    index: {
+      schema: SESSION_INDEX_SCHEMA,
+      files,
+      entries: await reconcileDriftedEntries(sessionDir, existing, files, providedEntries),
+    },
+    drift: true,
+  };
+}
+
+async function reconcileDriftedEntries(
+  sessionDir: string,
+  existing: SessionIndex,
+  files: string[],
+  providedEntries: ReadonlyMap<string, SessionIndexEntry> | undefined,
+): Promise<SessionIndexEntry[]> {
+  const diskFiles = new Set(files);
+  const indexedFiles = new Set(existing.files);
+  // Vanished files: drop their entries; no reads.
+  const entries = existing.entries.filter((entry) => diskFiles.has(entry.file));
+  // New files: parse only those records (last-wins on duplicate entries,
+  // matching the existing filter+push replace behaviour).
+  for (const file of files) {
+    if (indexedFiles.has(file)) {
+      continue;
+    }
+    const entry = providedEntries?.get(file) ?? (await readIndexEntryFromDisk(sessionDir, file));
+    if (entry) {
+      entries.push(entry);
+    }
+  }
+  return entries;
+}
+
+export async function loadOrRebuildSessionIndex(sessionDir: string): Promise<SessionIndex> {
+  return (await reconcileSessionIndex(sessionDir)).index;
 }

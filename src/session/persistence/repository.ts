@@ -473,7 +473,7 @@ export async function pruneSessions(options: PruneOptions = {}): Promise<PruneRe
     );
   }
 
-  await rebuildSessionIndex(sessionDir).catch(() => {
+  await rebuildSessionIndex(sessionDir, "prune").catch(() => {
     // best effort cache rebuild
   });
 
@@ -579,8 +579,8 @@ export async function closeSession(id: string): Promise<SessionRecord> {
     }
   }
 
-  await rebuildSessionIndex(sessionBaseDir()).catch(() => {
-    // best effort cache rebuild
-  });
+  // No index rebuild here: the lifecycle writes above already updated the
+  // affected entries, and the full-store re-parse is reserved for a missing
+  // or unparseable index.json (incremental reconcile heals any drift).
   return record;
 }
