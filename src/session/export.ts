@@ -10,13 +10,21 @@ import {
   sessionEventLockPath,
   sessionEventSegmentPath,
 } from "./event-log.js";
-import { findSession, listSessions, normalizeName } from "./persistence.js";
+import { getLoggedMessageCount } from "./messages-log-bookkeeping.js";
+import { messagesLogPath } from "./messages-log.js";
+import { findSession, listSessions, normalizeName, sessionBaseDir } from "./persistence.js";
 import { serializeSessionRecordForDisk } from "./persistence/serialize.js";
 
 export type ExportedSession = {
   format_version: 1;
   exported_at: string;
   exported_by: string;
+  messages_log?: {
+    path: ".messages.ndjson";
+    state: NonNullable<SessionRecord["messagesLog"]>;
+    data: string;
+    inline_count: number;
+  };
   session: {
     record_id: string;
     name: string | null;
@@ -188,7 +196,7 @@ function serializeSessionRecordForArchive(
   record: SessionRecord,
   cwdRelative: string,
 ): Record<string, unknown> {
-  const state = serializeSessionRecordForDisk(record);
+  const state = serializeSessionRecordForDisk(record, { messages: "inline" });
   state.cwd = cwdRelative;
 
   if (state.event_log && typeof state.event_log === "object" && !Array.isArray(state.event_log)) {
@@ -199,6 +207,37 @@ function serializeSessionRecordForArchive(
   }
 
   return state;
+}
+
+async function readMessagesLogForArchive(
+  record: SessionRecord,
+): Promise<ExportedSession["messages_log"] | undefined> {
+  const state = record.messagesLog;
+  if (!state) {
+    return undefined;
+  }
+
+  const filePath = messagesLogPath(sessionBaseDir(), record.acpxRecordId);
+  let payload: Buffer;
+  try {
+    payload = await fs.readFile(filePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+
+  const committed = payload.subarray(0, Math.min(state.bytes, payload.length)).toString("utf8");
+  return {
+    path: ".messages.ndjson",
+    state: {
+      ...state,
+      bytes: Buffer.byteLength(committed),
+    },
+    data: committed,
+    inline_count: record.messages.length - getLoggedMessageCount(record),
+  };
 }
 
 export async function exportSession(
@@ -219,10 +258,12 @@ export async function exportSession(
 
   const home = os.homedir();
   const cwdRelative = cwdRelativeToHome(record.cwd, home);
+  const messagesLog = await readMessagesLogForArchive(record);
   const exported: ExportedSession = {
     format_version: 1,
     exported_at: new Date().toISOString(),
     exported_by: "acpx",
+    messages_log: messagesLog,
     session: {
       record_id: record.acpxRecordId,
       name: record.name ?? null,

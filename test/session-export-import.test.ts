@@ -7,8 +7,9 @@ import test from "node:test";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
 import { exportSession } from "../src/session/export.js";
 import { importSession } from "../src/session/import.js";
+import { messagesLogPath } from "../src/session/messages-log.js";
 import { resolveSessionRecord, serializeSessionRecordForDisk } from "../src/session/persistence.js";
-import type { SessionRecord } from "../src/types.js";
+import type { SessionMessage, SessionRecord } from "../src/types.js";
 
 function makeSessionRecord(
   overrides: Partial<SessionRecord> & {
@@ -52,6 +53,7 @@ function makeSessionRecord(
     agentCapabilities: overrides.agentCapabilities,
     title: overrides.title ?? null,
     messages: overrides.messages ?? [],
+    messagesLog: overrides.messagesLog,
     updated_at: overrides.updated_at ?? overrides.lastUsedAt ?? timestamp,
     cumulative_token_usage: overrides.cumulative_token_usage ?? {},
     request_token_usage: overrides.request_token_usage ?? {},
@@ -89,6 +91,33 @@ async function writeSessionRecordFile(homeDir: string, record: SessionRecord): P
     `${JSON.stringify(serializeSessionRecordForDisk(record), null, 2)}\n`,
     "utf8",
   );
+}
+
+async function writeSplitSessionRecordFile(homeDir: string, record: SessionRecord): Promise<void> {
+  const filePath = sessionFilePath(homeDir, record.acpxRecordId);
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(
+    filePath,
+    `${JSON.stringify(
+      {
+        ...serializeSessionRecordForDisk(record),
+        messages_log: record.messagesLog,
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+}
+
+function sessionMessagesLogPath(homeDir: string, recordId: string): string {
+  return messagesLogPath(path.join(homeDir, ".acpx", "sessions"), recordId);
+}
+
+function serializeMessages(messages: readonly SessionMessage[]): string {
+  return messages.length === 0
+    ? ""
+    : `${messages.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
 }
 
 function streamPath(homeDir: string, recordId: string): string {
@@ -180,6 +209,91 @@ test("exportSession and importSession round-trip session state with a fresh reco
       exportedBy: record.importedFrom?.exportedBy,
       exportedAt: record.importedFrom?.exportedAt,
     });
+  });
+});
+
+test("exportSession includes split message logs while state stays legacy-shaped, and import restores the log", async () => {
+  await withTempHome("acpx-export-import-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const archivePath = path.join(homeDir, "archive.json");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const logMessages: SessionMessage[] = [
+      { User: { id: "u1", content: [{ Text: "hello" }] } },
+      { Agent: { content: [{ Text: "hi" }], tool_results: {} } },
+    ];
+    const inlineMessages: SessionMessage[] = [{ User: { id: "u2", content: [{ Text: "next" }] } }];
+    const logPayload = serializeMessages(logMessages);
+    await fs.mkdir(path.dirname(sessionMessagesLogPath(homeDir, "split-source")), {
+      recursive: true,
+    });
+    await fs.writeFile(sessionMessagesLogPath(homeDir, "split-source"), logPayload, "utf8");
+    await writeSplitSessionRecordFile(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "split-source",
+        acpSessionId: "split-source",
+        agentCommand: AGENT_REGISTRY.codex,
+        cwd,
+        name: "split",
+        messages: inlineMessages,
+        messagesLog: {
+          v: 1,
+          count: logMessages.length,
+          base_index: 0,
+          bytes: Buffer.byteLength(logPayload),
+        },
+      }),
+    );
+
+    await exportSession(
+      {
+        agentCommand: AGENT_REGISTRY.codex,
+        cwd,
+        name: "split",
+      },
+      archivePath,
+    );
+
+    const archive = JSON.parse(await fs.readFile(archivePath, "utf8")) as {
+      messages_log?: {
+        path: string;
+        data: string;
+        inline_count: number;
+        state: Record<string, unknown>;
+      };
+      session: { state: Record<string, unknown> };
+    };
+    assert.equal(Object.hasOwn(archive.session.state, "messages_log"), false);
+    assert.deepEqual(archive.session.state.messages, [...logMessages, ...inlineMessages]);
+    assert.deepEqual(archive.messages_log, {
+      path: ".messages.ndjson",
+      state: {
+        v: 1,
+        count: logMessages.length,
+        base_index: 0,
+        bytes: Buffer.byteLength(logPayload),
+      },
+      data: logPayload,
+      inline_count: inlineMessages.length,
+    });
+
+    await fs.rm(sessionFilePath(homeDir, "split-source"));
+    await fs.rm(sessionMessagesLogPath(homeDir, "split-source"));
+
+    const imported = await importSession(archivePath, { name: "split-imported" });
+    const importedRaw = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, imported.record_id), "utf8"),
+    ) as Record<string, unknown>;
+    assert.deepEqual(importedRaw.messages, inlineMessages);
+    assert.deepEqual(importedRaw.messages_log, archive.messages_log?.state);
+    assert.equal(
+      await fs.readFile(sessionMessagesLogPath(homeDir, imported.record_id), "utf8"),
+      logPayload,
+    );
+
+    const hydrated = await resolveSessionRecord(imported.record_id);
+    assert.deepEqual(hydrated.messages, [...logMessages, ...inlineMessages]);
   });
 });
 

@@ -25,6 +25,7 @@ import {
   findSession,
   findSessionByDirectoryWalk,
   listSessions,
+  migrateSessionMessages,
   normalizeName,
   resolveSessionRecord,
   writeSessionRecord,
@@ -1692,6 +1693,34 @@ export async function handleSessionsImport(
   }
 
   process.stdout.write(`imported session ${result.record_id} at ${result.cwd}\n`);
+}
+
+export async function handleSessionsMigrateMessages(
+  flags: { dryRun?: boolean },
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const result = await migrateSessionMessages({ dryRun: flags.dryRun });
+
+  if (
+    emitJsonResult(globalFlags.format, {
+      action: "messages_migrated",
+      ...result,
+    })
+  ) {
+    return;
+  }
+
+  if (globalFlags.format === "quiet") {
+    process.stdout.write(`${result.migrated}\n`);
+    return;
+  }
+
+  const prefix = result.dryRun ? "would migrate" : "migrated";
+  process.stdout.write(
+    `${prefix} ${result.migrated} sessions (scanned ${result.scanned}, skipped active ${result.skippedActive}, already split ${result.skippedAlreadySplit}, failed ${result.failed})\n`,
+  );
 }
 
 export async function handleSessionsPrune(

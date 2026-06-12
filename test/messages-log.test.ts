@@ -15,7 +15,9 @@ import {
   readPersistedLifecycle,
   resolveSessionRecord,
   serializeSessionRecordForDisk,
+  migrateSessionMessages,
   writeSessionRecord,
+  writeSessionRecordAtBoundary,
 } from "../src/session/persistence.js";
 import type { SessionMessage, SessionRecord } from "../src/types.js";
 import {
@@ -286,7 +288,7 @@ test("appendFinalizedMessagesToLog truncates from the watermark before appending
   });
 });
 
-test("writeSessionRecord folds split records back to pointer-less inline without touching the log", async () => {
+test("writeSessionRecord keeps split records split without touching the log", async () => {
   await withTempHome("acpx-messages-log-", async (homeDir) => {
     const sessionDir = path.join(homeDir, ".acpx", "sessions");
     const messages = [userMessage(1), agentMessage(2), toolMessage(3)];
@@ -312,22 +314,74 @@ test("writeSessionRecord folds split records back to pointer-less inline without
     await writeSessionRecord(resolved);
 
     const raw = await readRawRecord(homeDir, "fold-write");
-    assert.equal(Object.hasOwn(raw, "messages_log"), false);
-    assert.deepEqual(raw.messages, messages);
+    assert.deepEqual(raw.messages, inlineMessages);
+    assert.deepEqual(raw.messages_log, {
+      v: 1,
+      count: logMessages.length,
+      base_index: 0,
+      bytes: log.completeBytes,
+    });
     assert.equal(await fs.readFile(log.path, "utf8"), originalLogPayload);
   });
 });
 
-test("folded pointer-less records hydrate inline and ignore orphan message logs", async () => {
+test("writeSessionRecordAtBoundary migrates legacy inline records to split form", async () => {
   await withTempHome("acpx-messages-log-", async (homeDir) => {
     const sessionDir = path.join(homeDir, ".acpx", "sessions");
     const messages = [userMessage(1), agentMessage(2), userMessage(3)];
-    const logMessages = messages.slice(0, 2);
-    const inlineMessages = messages.slice(2);
-    const log = await writeMessagesLog(sessionDir, "fold-roundtrip", logMessages);
+    await writeRawRecord(homeDir, sessionRecord("boundary-migrate", structuredClone(messages)));
+
+    await writeSessionRecordAtBoundary(await resolveSessionRecord("boundary-migrate"));
+
+    const raw = await readRawRecord(homeDir, "boundary-migrate");
+    const logPath = messagesLogPath(sessionDir, "boundary-migrate");
+    assert.deepEqual(raw.messages, []);
+    assert.deepEqual(raw.messages_log, {
+      v: 1,
+      count: messages.length,
+      base_index: 0,
+      bytes: Buffer.byteLength(serializeMessages(messages)),
+    });
+    assert.equal(await fs.readFile(logPath, "utf8"), serializeMessages(messages));
+
+    const hydrated = await resolveSessionRecord("boundary-migrate");
+    assert.deepEqual(hydrated.messages, messages);
+  });
+});
+
+test("boundary migration renames a pointer-less pre-existing log before writing a fresh one", async () => {
+  await withTempHome("acpx-messages-log-", async (homeDir) => {
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const staleMessages = [agentMessage(99)];
+    const freshMessages = [userMessage(1), agentMessage(2)];
+    const stale = await writeMessagesLog(sessionDir, "rename-first", staleMessages);
+    const stalePayload = await fs.readFile(stale.path, "utf8");
+    await writeRawRecord(homeDir, sessionRecord("rename-first", structuredClone(freshMessages)));
+
+    await writeSessionRecordAtBoundary(await resolveSessionRecord("rename-first"));
+
+    assert.equal(await fs.readFile(`${stale.path}.stale`, "utf8"), stalePayload);
+    assert.equal(await fs.readFile(stale.path, "utf8"), serializeMessages(freshMessages));
+    const raw = await readRawRecord(homeDir, "rename-first");
+    assert.deepEqual(raw.messages, []);
+    assert.deepEqual(raw.messages_log, {
+      v: 1,
+      count: freshMessages.length,
+      base_index: 0,
+      bytes: Buffer.byteLength(serializeMessages(freshMessages)),
+    });
+  });
+});
+
+test("checkpoints never append unlogged split tails and the next boundary appends once", async () => {
+  await withTempHome("acpx-messages-log-", async (homeDir) => {
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const logMessages = [userMessage(1), agentMessage(2)];
+    const inlineMessages = [userMessage(3)];
+    const log = await writeMessagesLog(sessionDir, "append-once", logMessages);
     await writeSplitRecord(
       homeDir,
-      sessionRecord("fold-roundtrip", structuredClone(inlineMessages), {
+      sessionRecord("append-once", structuredClone(inlineMessages), {
         messagesLog: {
           v: 1,
           count: logMessages.length,
@@ -337,16 +391,107 @@ test("folded pointer-less records hydrate inline and ignore orphan message logs"
       }),
     );
 
-    await writeSessionRecord(await resolveSessionRecord("fold-roundtrip"));
+    const resolved = await resolveSessionRecord("append-once");
+    await writeSessionRecord(resolved);
+    await writeSessionRecord(resolved);
+    await writeSessionRecord(resolved);
 
-    const foldedRaw = await readRawRecord(homeDir, "fold-roundtrip");
-    assert.equal(Object.hasOwn(foldedRaw, "messages_log"), false);
-    assert.ok(await fileExists(log.path));
+    assert.equal(await fs.readFile(log.path, "utf8"), serializeMessages(logMessages));
+    assert.deepEqual((await readRawRecord(homeDir, "append-once")).messages, inlineMessages);
 
-    const hydrated = await resolveSessionRecord("fold-roundtrip");
-    assert.equal(hydrated.messagesLog, undefined);
-    assert.deepEqual(hydrated.messages, messages);
-    assert.equal(await fileExists(`${log.path}.stale`), false);
+    await writeSessionRecordAtBoundary(resolved);
+
+    assert.equal(
+      await fs.readFile(log.path, "utf8"),
+      serializeMessages([...logMessages, ...inlineMessages]),
+    );
+    const raw = await readRawRecord(homeDir, "append-once");
+    assert.deepEqual(raw.messages, []);
+    assert.deepEqual(raw.messages_log, {
+      v: 1,
+      count: 3,
+      base_index: 0,
+      bytes: Buffer.byteLength(serializeMessages([...logMessages, ...inlineMessages])),
+    });
+  });
+});
+
+test("boundary compaction rewrites the current window and advances base_index", async () => {
+  await withTempHome("acpx-messages-log-", async (homeDir) => {
+    const previousThreshold = process.env.ACPX_MESSAGES_LOG_COMPACT_BYTES;
+    process.env.ACPX_MESSAGES_LOG_COMPACT_BYTES = "1";
+    try {
+      const messages = Array.from({ length: 205 }, (_, index) => userMessage(index + 1));
+      await writeRawRecord(homeDir, sessionRecord("boundary-compact", structuredClone(messages)));
+
+      await writeSessionRecordAtBoundary(await resolveSessionRecord("boundary-compact"));
+
+      const raw = await readRawRecord(homeDir, "boundary-compact");
+      assert.deepEqual(raw.messages, []);
+      assert.deepEqual(raw.messages_log, {
+        v: 1,
+        count: 200,
+        base_index: 5,
+        bytes: Buffer.byteLength(serializeMessages(messages.slice(5))),
+      });
+
+      const hydrated = await resolveSessionRecord("boundary-compact");
+      assert.deepEqual(messageLabels(hydrated.messages), messageLabels(messages.slice(5)));
+    } finally {
+      if (previousThreshold === undefined) {
+        delete process.env.ACPX_MESSAGES_LOG_COMPACT_BYTES;
+      } else {
+        process.env.ACPX_MESSAGES_LOG_COMPACT_BYTES = previousThreshold;
+      }
+    }
+  });
+});
+
+test("migrateSessionMessages migrates closed legacy records and skips active owners", async () => {
+  await withTempHome("acpx-messages-log-", async (homeDir) => {
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
+      stdio: "ignore",
+    });
+    await once(child, "spawn");
+    assert.ok(child.pid);
+
+    const closedMessages = [userMessage(1), agentMessage(2)];
+    try {
+      await writeRawRecord(
+        homeDir,
+        sessionRecord("migrate-closed", structuredClone(closedMessages), {
+          closed: true,
+          closedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      );
+      await writeRawRecord(
+        homeDir,
+        sessionRecord("migrate-active", [userMessage(3)], {
+          pid: child.pid,
+        }),
+      );
+
+      const result = await migrateSessionMessages();
+
+      assert.equal(result.scanned, 2);
+      assert.equal(result.migrated, 1);
+      assert.equal(result.skippedActive, 1);
+      assert.equal(result.skippedAlreadySplit, 0);
+      assert.equal(result.failed, 0);
+
+      const raw = await readRawRecord(homeDir, "migrate-closed");
+      assert.deepEqual(raw.messages, []);
+      assert.deepEqual(raw.messages_log, {
+        v: 1,
+        count: closedMessages.length,
+        base_index: 0,
+        bytes: Buffer.byteLength(serializeMessages(closedMessages)),
+      });
+      assert.deepEqual((await readRawRecord(homeDir, "migrate-active")).messages, [userMessage(3)]);
+    } finally {
+      child.kill("SIGTERM");
+      await once(child, "exit").catch(() => undefined);
+    }
   });
 });
 

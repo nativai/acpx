@@ -10,6 +10,7 @@ import type {
   SessionUserContent,
 } from "../types.js";
 import { trimConversationForRuntime } from "./conversation-model.js";
+import { markAllMessagesLogged, setLoggedMessageCount } from "./messages-log-bookkeeping.js";
 
 export const MESSAGES_LOG_COMPACT_BYTES = 32 * 1024 * 1024;
 
@@ -23,6 +24,10 @@ export function messagesLogFileName(acpxRecordId: string): string {
 
 export function messagesLogPath(sessionDir: string, acpxRecordId: string): string {
   return path.join(sessionDir, messagesLogFileName(acpxRecordId));
+}
+
+export function messagesLogStalePath(logPath: string): string {
+  return `${logPath}.stale`;
 }
 
 function warn(message: string): void {
@@ -334,6 +339,7 @@ export async function hydrateSessionMessagesFromLog(
 ): Promise<SessionRecord> {
   const logState = record.messagesLog;
   if (!logState) {
+    setLoggedMessageCount(record, 0);
     return record;
   }
 
@@ -343,6 +349,7 @@ export async function hydrateSessionMessagesFromLog(
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       warn(`messages log missing for ${record.acpxRecordId}; using inline messages only`);
+      setLoggedMessageCount(record, 0);
       return record;
     }
     throw error;
@@ -375,7 +382,66 @@ export async function hydrateSessionMessagesFromLog(
   const logTailLimit = Math.min(neededFromLog, effectiveCount);
   const logTail = await readMessagesLogTail(logPath, effectiveBytes, logTailLimit);
   record.messages = [...logTail, ...inlineMessages];
+  setLoggedMessageCount(record, logTail.length);
   return record;
+}
+
+export async function prepareMessagesLogForBoundary(
+  record: SessionRecord,
+  logPath: string,
+): Promise<void> {
+  if (!record.messagesLog) {
+    await fs.mkdir(path.dirname(logPath), { recursive: true });
+    await fs.rm(messagesLogStalePath(logPath), { force: true });
+    await fs
+      .rename(logPath, messagesLogStalePath(logPath))
+      .catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT") {
+          throw error;
+        }
+      });
+    return;
+  }
+
+  try {
+    await fs.stat(logPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+    warn(`messages log missing for ${record.acpxRecordId}; starting a fresh log at next boundary`);
+    record.messagesLog = undefined;
+    setLoggedMessageCount(record, 0);
+  }
+}
+
+export async function clearMissingMessagesLogPointerForWrite(
+  record: SessionRecord,
+  logPath: string,
+): Promise<void> {
+  if (!record.messagesLog) {
+    return;
+  }
+
+  try {
+    await fs.stat(logPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+    warn(`messages log missing for ${record.acpxRecordId}; writing inline messages only`);
+    record.messagesLog = undefined;
+    setLoggedMessageCount(record, 0);
+  }
+}
+
+export function resolveMessagesLogCompactBytes(): number {
+  const raw = process.env.ACPX_MESSAGES_LOG_COMPACT_BYTES ?? process.env.MESSAGES_LOG_COMPACT_BYTES;
+  if (!raw) {
+    return MESSAGES_LOG_COMPACT_BYTES;
+  }
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : MESSAGES_LOG_COMPACT_BYTES;
 }
 
 export async function appendFinalizedMessagesToLog(
@@ -465,5 +531,6 @@ export async function compactMessagesLog(
     base_index: previous.base_index + dropped,
     bytes: payload.length,
   };
+  markAllMessagesLogged(record);
   return true;
 }

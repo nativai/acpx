@@ -11,7 +11,7 @@ import {
 import {
   resolveSessionRecord,
   writeSessionRecord,
-  writeSessionRecordWithLifecycle,
+  writeSessionRecordAtBoundaryWithLifecycle,
   isoNow,
 } from "../../session/persistence.js";
 import type {
@@ -267,7 +267,7 @@ export async function closeSession(sessionId: string): Promise<SessionRecord> {
   // Privileged write: this is a daemon-authorized close — bypass the
   // read-preserve-lifecycle step so `closed: true` actually lands on disk.
   // See writeSessionRecord doc comment in repository.ts for the ownership rules.
-  await writeSessionRecordWithLifecycle(record);
+  await writeSessionRecordAtBoundaryWithLifecycle(record);
 
   return record;
 }
