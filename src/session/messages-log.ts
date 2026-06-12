@@ -29,15 +29,6 @@ function warn(message: string): void {
   process.stderr.write(`[acpx] warning: ${message}\n`);
 }
 
-async function fileExists(filePath: string): Promise<boolean> {
-  try {
-    await fs.access(filePath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
@@ -337,47 +328,13 @@ async function readMessagesLogTail(
   return messagesFromTail.toReversed();
 }
 
-function trimHydratedRecord(record: SessionRecord): SessionRecord {
-  const conversation: SessionConversation = {
-    title: record.title,
-    messages: record.messages,
-    updated_at: record.updated_at,
-    cumulative_token_usage: record.cumulative_token_usage,
-    request_token_usage: record.request_token_usage,
-  };
-  trimConversationForRuntime(conversation);
-  record.messages = conversation.messages;
-  record.request_token_usage = conversation.request_token_usage;
-  return record;
-}
-
-async function selfHealStaleLogIfNeeded(record: SessionRecord, logPath: string): Promise<boolean> {
-  if (record.messagesLog || record.messages.length === 0 || !(await fileExists(logPath))) {
-    return false;
-  }
-
-  try {
-    await fs.rename(logPath, `${logPath}.stale`);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code !== "ENOENT") {
-      warn(`could not rename stale messages log for ${record.acpxRecordId}: ${code ?? "error"}`);
-    }
-  }
-  return true;
-}
-
 export async function hydrateSessionMessagesFromLog(
   record: SessionRecord,
   logPath: string,
 ): Promise<SessionRecord> {
-  if (await selfHealStaleLogIfNeeded(record, logPath)) {
-    return trimHydratedRecord(record);
-  }
-
   const logState = record.messagesLog;
   if (!logState) {
-    return trimHydratedRecord(record);
+    return record;
   }
 
   let stat;
@@ -386,7 +343,7 @@ export async function hydrateSessionMessagesFromLog(
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       warn(`messages log missing for ${record.acpxRecordId}; using inline messages only`);
-      return trimHydratedRecord(record);
+      return record;
     }
     throw error;
   }
@@ -418,7 +375,7 @@ export async function hydrateSessionMessagesFromLog(
   const logTailLimit = Math.min(neededFromLog, effectiveCount);
   const logTail = await readMessagesLogTail(logPath, effectiveBytes, logTailLimit);
   record.messages = [...logTail, ...inlineMessages];
-  return trimHydratedRecord(record);
+  return record;
 }
 
 export async function appendFinalizedMessagesToLog(

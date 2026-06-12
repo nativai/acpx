@@ -50,6 +50,10 @@ function agentMessage(index: number, text = `agent-${index}`): SessionMessage {
   };
 }
 
+function overCapText(label: string): string {
+  return `${label}-${"z".repeat(9_000)}`;
+}
+
 function toolMessage(index: number): SessionMessage {
   const toolUseId = `tool-${index}`;
   return {
@@ -295,7 +299,8 @@ test("hydrate ignores a torn final line and keeps the inline checkpointed tail",
 test("hydrate degrades to inline messages and warns when a pointed log is missing", async () => {
   await withTempHome("acpx-messages-log-", async (homeDir) => {
     const sessionDir = path.join(homeDir, ".acpx", "sessions");
-    const record = sessionRecord("missing", [userMessage(1)], {
+    const messages = [userMessage(1, overCapText("missing-inline"))];
+    const record = sessionRecord("missing", structuredClone(messages), {
       messagesLog: { v: 1, count: 7, base_index: 0, bytes: 128 },
     });
 
@@ -303,22 +308,78 @@ test("hydrate degrades to inline messages and warns when a pointed log is missin
       return await hydrateSessionMessagesFromLog(record, messagesLogPath(sessionDir, "missing"));
     });
 
-    assert.deepEqual(messageLabels(result.messages), ["user-1"]);
+    assert.deepEqual(result.messages, messages);
     assert.match(stderr, /messages log missing/);
   });
 });
 
-test("hydrate self-heals an inline non-empty no-pointer record by renaming a stale log", async () => {
+test("hydrate leaves no-pointer records byte-preserved when a stale log is present", async () => {
   await withTempHome("acpx-messages-log-", async (homeDir) => {
     const sessionDir = path.join(homeDir, ".acpx", "sessions");
     const { path: logPath } = await writeMessagesLog(sessionDir, "stale", [agentMessage(9)]);
-    const record = sessionRecord("stale", [userMessage(1)]);
+    const messages = [
+      userMessage(1, overCapText("legacy-user")),
+      agentMessage(2, overCapText("legacy-agent")),
+    ];
+    const record = sessionRecord("stale", structuredClone(messages));
+    const before = JSON.stringify(record);
 
     const hydrated = await hydrateSessionMessagesFromLog(record, logPath);
 
-    assert.deepEqual(messageLabels(hydrated.messages), ["user-1"]);
-    assert.equal(await fileExists(logPath), false);
-    assert.equal(await fileExists(`${logPath}.stale`), true);
+    assert.equal(JSON.stringify(hydrated), before);
+    assert.deepEqual(hydrated.messages, messages);
+    assert.equal(await fileExists(logPath), true);
+    assert.equal(await fileExists(`${logPath}.stale`), false);
+  });
+});
+
+test("hydrate split records preserves over-cap content exactly like the legacy twin", async () => {
+  await withTempHome("acpx-messages-log-", async (homeDir) => {
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const messages = [
+      userMessage(1, overCapText("split-log-user")),
+      agentMessage(2, overCapText("split-log-agent")),
+      userMessage(3, overCapText("split-inline-user")),
+    ];
+    const logMessages = messages.slice(0, 2);
+    const inlineMessages = messages.slice(2);
+    const legacy = sessionRecord("split-overcap-legacy", structuredClone(messages));
+    const log = await writeMessagesLog(sessionDir, "split-overcap", logMessages);
+    const splitRecord = sessionRecord("split-overcap", structuredClone(inlineMessages), {
+      messagesLog: {
+        v: 1,
+        count: logMessages.length,
+        base_index: 0,
+        bytes: log.completeBytes,
+      },
+    });
+
+    const hydrated = await hydrateSessionMessagesFromLog(splitRecord, log.path);
+
+    assert.deepEqual(hydrated.messages, legacy.messages);
+  });
+});
+
+test("hydrate bounds only the log tail and never drops inline messages for the count cap", async () => {
+  await withTempHome("acpx-messages-log-", async (homeDir) => {
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const logMessages = Array.from({ length: 10 }, (_unused, index) => userMessage(index + 1));
+    const inlineMessages = Array.from({ length: 205 }, (_unused, index) =>
+      agentMessage(index + 100),
+    );
+    const log = await writeMessagesLog(sessionDir, "inline-overcap", logMessages);
+    const record = sessionRecord("inline-overcap", structuredClone(inlineMessages), {
+      messagesLog: {
+        v: 1,
+        count: logMessages.length,
+        base_index: 0,
+        bytes: log.completeBytes,
+      },
+    });
+
+    const hydrated = await hydrateSessionMessagesFromLog(record, log.path);
+
+    assert.deepEqual(hydrated.messages, inlineMessages);
   });
 });
 
@@ -390,17 +451,12 @@ test("property: hydrate(split(record)) is equivalent to the inline window", asyn
     const random = seededRandom(0xace);
 
     for (let iteration = 0; iteration < 80; iteration += 1) {
-      const count = Math.floor(random() * 260);
+      const count = Math.floor(random() * 201);
       const messages = Array.from({ length: count }, (_unused, index) =>
         randomMessage(iteration * 1_000 + index, random),
       );
       const splitAt = count === 0 ? 0 : Math.floor(random() * (count + 1));
       const id = `property-${iteration}`;
-
-      const expected = await hydrateSessionMessagesFromLog(
-        sessionRecord(`${id}-expected`, structuredClone(messages)),
-        messagesLogPath(sessionDir, `${id}-expected`),
-      );
 
       const logMessages = messages.slice(0, splitAt);
       const inlineMessages = messages.slice(splitAt);
@@ -419,7 +475,7 @@ test("property: hydrate(split(record)) is equivalent to the inline window", asyn
         splitRecord,
         messagesLogPath(sessionDir, id),
       );
-      assert.deepEqual(actual.messages, expected.messages);
+      assert.deepEqual(actual.messages, messages);
     }
   });
 });
