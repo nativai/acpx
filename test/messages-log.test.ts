@@ -15,6 +15,7 @@ import {
   readPersistedLifecycle,
   resolveSessionRecord,
   serializeSessionRecordForDisk,
+  writeSessionRecord,
 } from "../src/session/persistence.js";
 import type { SessionMessage, SessionRecord } from "../src/types.js";
 import {
@@ -155,6 +156,31 @@ async function writeRawRecord(homeDir: string, record: SessionRecord): Promise<v
   );
 }
 
+async function writeSplitRecord(homeDir: string, record: SessionRecord): Promise<void> {
+  assertTempHomeActive();
+  const recordPath = sessionFilePath(homeDir, record.acpxRecordId);
+  await fs.mkdir(path.dirname(recordPath), { recursive: true });
+  await fs.writeFile(
+    recordPath,
+    `${JSON.stringify({
+      ...serializeSessionRecordForDisk(record),
+      messages_log: record.messagesLog,
+    })}\n`,
+    "utf8",
+  );
+}
+
+async function readRawRecord(
+  homeDir: string,
+  acpxRecordId: string,
+): Promise<Record<string, unknown>> {
+  assertTempHomeActive();
+  return JSON.parse(await fs.readFile(sessionFilePath(homeDir, acpxRecordId), "utf8")) as Record<
+    string,
+    unknown
+  >;
+}
+
 async function captureStderr<T>(run: () => Promise<T>): Promise<{ result: T; stderr: string }> {
   let stderr = "";
   const originalWrite = process.stderr.write.bind(process.stderr);
@@ -218,6 +244,18 @@ function randomMessage(index: number, random: () => number): SessionMessage {
   return "Resume";
 }
 
+test("serializeSessionRecordForDisk drops messages_log for write-inline records", () => {
+  const messages = [userMessage(1)];
+  const record = sessionRecord("serialize-drop", structuredClone(messages), {
+    messagesLog: { v: 1, count: 5, base_index: 0, bytes: 512 },
+  });
+
+  const persisted = serializeSessionRecordForDisk(record);
+
+  assert.equal(Object.hasOwn(persisted, "messages_log"), false);
+  assert.deepEqual(persisted.messages, messages);
+});
+
 test("appendFinalizedMessagesToLog truncates from the watermark before appending", async () => {
   await withTempHome("acpx-messages-log-", async (homeDir) => {
     const sessionDir = path.join(homeDir, ".acpx", "sessions");
@@ -245,6 +283,70 @@ test("appendFinalizedMessagesToLog truncates from the watermark before appending
       base_index: 0,
       bytes: Buffer.byteLength(expectedPayload),
     });
+  });
+});
+
+test("writeSessionRecord folds split records back to pointer-less inline without touching the log", async () => {
+  await withTempHome("acpx-messages-log-", async (homeDir) => {
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const messages = [userMessage(1), agentMessage(2), toolMessage(3)];
+    const logMessages = messages.slice(0, 2);
+    const inlineMessages = messages.slice(2);
+    const log = await writeMessagesLog(sessionDir, "fold-write", logMessages);
+    const originalLogPayload = await fs.readFile(log.path, "utf8");
+    await writeSplitRecord(
+      homeDir,
+      sessionRecord("fold-write", structuredClone(inlineMessages), {
+        messagesLog: {
+          v: 1,
+          count: logMessages.length,
+          base_index: 0,
+          bytes: log.completeBytes,
+        },
+      }),
+    );
+
+    const resolved = await resolveSessionRecord("fold-write");
+    assert.deepEqual(resolved.messages, messages);
+
+    await writeSessionRecord(resolved);
+
+    const raw = await readRawRecord(homeDir, "fold-write");
+    assert.equal(Object.hasOwn(raw, "messages_log"), false);
+    assert.deepEqual(raw.messages, messages);
+    assert.equal(await fs.readFile(log.path, "utf8"), originalLogPayload);
+  });
+});
+
+test("folded pointer-less records hydrate inline and ignore orphan message logs", async () => {
+  await withTempHome("acpx-messages-log-", async (homeDir) => {
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const messages = [userMessage(1), agentMessage(2), userMessage(3)];
+    const logMessages = messages.slice(0, 2);
+    const inlineMessages = messages.slice(2);
+    const log = await writeMessagesLog(sessionDir, "fold-roundtrip", logMessages);
+    await writeSplitRecord(
+      homeDir,
+      sessionRecord("fold-roundtrip", structuredClone(inlineMessages), {
+        messagesLog: {
+          v: 1,
+          count: logMessages.length,
+          base_index: 0,
+          bytes: log.completeBytes,
+        },
+      }),
+    );
+
+    await writeSessionRecord(await resolveSessionRecord("fold-roundtrip"));
+
+    const foldedRaw = await readRawRecord(homeDir, "fold-roundtrip");
+    assert.equal(Object.hasOwn(foldedRaw, "messages_log"), false);
+    assert.ok(await fileExists(log.path));
+
+    const hydrated = await resolveSessionRecord("fold-roundtrip");
+    assert.equal(hydrated.messagesLog, undefined);
+    assert.deepEqual(hydrated.messages, messages);
+    assert.equal(await fileExists(`${log.path}.stale`), false);
   });
 });
 
@@ -496,7 +598,7 @@ test("repository hydration gives legacy and hand-split twins identical windows a
       const logMessages = messages.slice(0, 3);
       const inlineMessages = messages.slice(3);
       const log = await writeMessagesLog(sessionDir, "golden", logMessages);
-      await writeSessionRecordFile(
+      await writeSplitRecord(
         homeDir,
         sessionRecord("golden", structuredClone(inlineMessages), {
           messagesLog: {
