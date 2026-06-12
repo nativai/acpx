@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { SessionRecord } from "../../types.js";
+import { withSessionIndexLock } from "./index-lock.js";
 import { parseSessionRecord } from "./parse.js";
 
 const SESSION_INDEX_SCHEMA = "acpx.session-index.v1";
@@ -301,23 +302,29 @@ export async function rebuildSessionIndex(
   // Full-store re-parse — the prod observable for the "zero full-store
   // rebuilds on new-file creation" target (VERIFICATION-ANNEX S4 greps for it).
   process.stderr.write(`[acpx] full session-index rebuild (reason: ${reason})\n`);
-  const files = await listSessionRecordFiles(sessionDir);
+  // Advisory lock (re-entrant under a caller already holding it). A rebuild
+  // over a very large store can outlive the 5 s stale threshold and lose the
+  // lock to a takeover — acceptable: that degrades to the pre-lock racing
+  // behaviour for this rare reserve path.
+  return await withSessionIndexLock(sessionDir, async () => {
+    const files = await listSessionRecordFiles(sessionDir);
 
-  const indexEntries: SessionIndexEntry[] = [];
-  for (const file of files) {
-    const entry = await readIndexEntryFromDisk(sessionDir, file);
-    if (entry) {
-      indexEntries.push(entry);
+    const indexEntries: SessionIndexEntry[] = [];
+    for (const file of files) {
+      const entry = await readIndexEntryFromDisk(sessionDir, file);
+      if (entry) {
+        indexEntries.push(entry);
+      }
     }
-  }
 
-  const index: SessionIndex = {
-    schema: SESSION_INDEX_SCHEMA,
-    files,
-    entries: indexEntries,
-  };
-  await writeSessionIndex(sessionDir, index);
-  return index;
+    const index: SessionIndex = {
+      schema: SESSION_INDEX_SCHEMA,
+      files,
+      entries: indexEntries,
+    };
+    await writeSessionIndex(sessionDir, index);
+    return index;
+  });
 }
 
 export type ReconciledSessionIndex = {

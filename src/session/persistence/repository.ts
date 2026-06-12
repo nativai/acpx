@@ -6,6 +6,7 @@ import { SessionNotFoundError, SessionResolutionError } from "../../errors.js";
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { assertPersistedKeyPolicy } from "../../persisted-key-policy.js";
 import type { SessionRecord } from "../../types.js";
+import { withSessionIndexLock } from "./index-lock.js";
 import {
   loadOrRebuildSessionIndex,
   rebuildSessionIndex,
@@ -186,12 +187,17 @@ async function writeSessionRecordInternal(
     await fs.rename(tempFile, file);
 
     const sessionDir = sessionBaseDir();
-    const index = await loadOrRebuildSessionIndex(sessionDir);
     const fileName = path.basename(file);
-    const entries = index.entries.filter((entry) => entry.file !== fileName);
-    entries.push(toSessionIndexEntry(record, fileName));
-    const files = [...new Set([...index.files.filter((entry) => entry !== fileName), fileName])];
-    await writeSessionIndex(sessionDir, { files, entries });
+    // Serialize the index read-modify-write across processes so a concurrent
+    // writer's just-added file-list row / entry is not clobbered by a stale
+    // snapshot (the race that kept re-arming full-rebuild storms).
+    await withSessionIndexLock(sessionDir, async () => {
+      const index = await loadOrRebuildSessionIndex(sessionDir);
+      const entries = index.entries.filter((entry) => entry.file !== fileName);
+      entries.push(toSessionIndexEntry(record, fileName));
+      const files = [...new Set([...index.files.filter((entry) => entry !== fileName), fileName])];
+      await writeSessionIndex(sessionDir, { files, entries });
+    });
   });
 }
 
