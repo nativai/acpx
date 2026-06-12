@@ -1,6 +1,7 @@
 import type {
   SessionAcpxState,
   SessionEventLog,
+  SessionMessagesLogState,
   SessionRecord,
   SessionConversation,
   SubagentRef,
@@ -60,6 +61,10 @@ function parseTokenUsage(
 
 function isNonNegativeFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return Number.isInteger(value) && typeof value === "number" && value >= 0;
 }
 
 function parseRequestTokenUsage(
@@ -733,6 +738,29 @@ function parseSessionKind(value: unknown): "session" | "subagent" | undefined | 
   return null;
 }
 
+function parseMessagesLogState(raw: unknown): SessionMessagesLogState | undefined {
+  const record = asRecord(raw);
+  if (!record) {
+    return undefined;
+  }
+
+  if (
+    record.v !== 1 ||
+    !isNonNegativeInteger(record.count) ||
+    !isNonNegativeInteger(record.base_index) ||
+    !isNonNegativeInteger(record.bytes)
+  ) {
+    return undefined;
+  }
+
+  return {
+    v: 1,
+    count: record.count,
+    base_index: record.base_index,
+    bytes: record.bytes,
+  };
+}
+
 // eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
 export function parseSessionRecord(raw: unknown): SessionRecord | null {
   const record = asRecord(raw);
@@ -863,6 +891,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     agentCapabilities: asRecord(record.agent_capabilities) as SessionRecord["agentCapabilities"],
     title: conversation.title,
     messages: conversation.messages,
+    messagesLog: parseMessagesLogState(record.messages_log),
     updated_at: conversation.updated_at,
     cumulative_token_usage: conversation.cumulative_token_usage,
     request_token_usage: conversation.request_token_usage,

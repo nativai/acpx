@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { assertPersistedKeyPolicy } from "../../persisted-key-policy.js";
+import { hydrateSessionMessagesFromLog, messagesLogPath } from "../../session/messages-log.js";
 import { parseSessionRecord } from "../../session/persistence/parse.js";
 import { serializeSessionRecordForDisk } from "../../session/persistence/serialize.js";
 import type { AcpFileSessionStoreOptions, AcpSessionRecord, AcpSessionStore } from "./contract.js";
@@ -28,7 +29,13 @@ class FileSessionStore implements AcpSessionStore {
     await this.ensureDir();
     try {
       const payload = await fs.readFile(this.filePath(sessionId), "utf8");
-      return parseSessionRecord(JSON.parse(payload)) ?? undefined;
+      const record = parseSessionRecord(JSON.parse(payload));
+      return record
+        ? await hydrateSessionMessagesFromLog(
+            record,
+            messagesLogPath(this.sessionDir, record.acpxRecordId),
+          )
+        : undefined;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         return undefined;

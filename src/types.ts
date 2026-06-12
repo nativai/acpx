@@ -377,6 +377,13 @@ export type SessionConversation = {
   request_token_usage: Record<string, SessionTokenUsage>;
 };
 
+export type SessionMessagesLogState = {
+  v: 1;
+  count: number;
+  base_index: number;
+  bytes: number;
+};
+
 export type SessionAcpxState = {
   reset_on_next_ensure?: boolean;
   current_mode_id?: string;
@@ -468,6 +475,7 @@ export type SessionRecord = {
   agentCapabilities?: AgentCapabilities;
   title?: string | null;
   messages: SessionMessage[];
+  messagesLog?: SessionMessagesLogState;
   updated_at: string;
   cumulative_token_usage: SessionTokenUsage;
   request_token_usage: Record<string, SessionTokenUsage>;

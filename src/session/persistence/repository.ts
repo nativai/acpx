@@ -6,6 +6,7 @@ import { SessionNotFoundError, SessionResolutionError } from "../../errors.js";
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { assertPersistedKeyPolicy } from "../../persisted-key-policy.js";
 import type { SessionRecord } from "../../types.js";
+import { hydrateSessionMessagesFromLog, messagesLogPath } from "../messages-log.js";
 import {
   flushPendingSessionIndexUpdates,
   updateSessionIndexForRecordWrite,
@@ -53,7 +54,13 @@ async function loadRecordFromIndexEntry(
 ): Promise<SessionRecord | undefined> {
   try {
     const payload = await fs.readFile(path.join(sessionBaseDir(), entry.file), "utf8");
-    return parseSessionRecord(JSON.parse(payload)) ?? undefined;
+    const record = parseSessionRecord(JSON.parse(payload));
+    return record
+      ? await hydrateSessionMessagesFromLog(
+          record,
+          messagesLogPath(sessionBaseDir(), record.acpxRecordId),
+        )
+      : undefined;
   } catch {
     return undefined;
   }
@@ -246,7 +253,10 @@ export async function resolveSessionRecord(sessionId: string): Promise<SessionRe
     });
     const directRecord = parseSessionRecord(JSON.parse(directPayload));
     if (directRecord) {
-      return directRecord;
+      return await hydrateSessionMessagesFromLog(
+        directRecord,
+        messagesLogPath(sessionBaseDir(), directRecord.acpxRecordId),
+      );
     }
   } catch {
     // fallback to indexed search

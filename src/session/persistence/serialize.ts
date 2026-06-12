@@ -46,6 +46,7 @@ export function serializeSessionRecordForDisk(record: SessionRecord): Record<str
     agent_capabilities: canonical.agentCapabilities,
     title: canonical.title,
     messages: canonical.messages,
+    messages_log: canonical.messagesLog,
     updated_at: canonical.updated_at,
     cumulative_token_usage: canonical.cumulative_token_usage,
     request_token_usage: canonical.request_token_usage,
