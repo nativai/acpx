@@ -32,9 +32,12 @@ export function sessionIndexLockPath(sessionDir: string): string {
 }
 
 function delay(ms: number): Promise<void> {
+  // Deliberately NOT unref'd: this timer is awaited inline by a foreground
+  // write. With unref, a process whose only pending work is the lock backoff
+  // sees its event loop empty and node exits mid-write (observed as
+  // "unsettled top-level await" in the D1 self-test).
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    timer.unref?.();
+    setTimeout(resolve, ms);
   });
 }
 
