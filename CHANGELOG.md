@@ -8,6 +8,14 @@ Repo: https://github.com/openclaw/acpx
 
 ### Changes
 
+- Agents: register the `claude-pty` bridge agent (independent-claude-acp) with
+  the `ACPX_CLAUDE_PTY_ACP_COMMAND` override seam.
+- Profiles: new `authMode: "claude-home"` profile kind (`homePath`, optional
+  `accountEmail`) selecting an interactive Claude HOME via the bridge's
+  `INDEPENDENT_CLAUDE_HOME_MAP` env + `independent-claude-acp/home` session
+  `_meta` selector, re-resolved from the session record on every spawn.
+  Incompatible agent/profile combinations fail fast at spawn; claude-home
+  sessions skip subscription configDir resolution and subscription failover.
 - CLI/sessions: raise the default queue-owner idle TTL from 5 minutes to 90
   minutes while preserving `--ttl 0` as keep-alive forever.
 

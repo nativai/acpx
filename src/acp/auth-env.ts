@@ -2,7 +2,14 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { hasKnownDeadSubs, isSubscriptionKnownDead } from "../config/known-dead-subscriptions.js";
-import { findProfile, getValidEffortsForProfile, loadProfileRegistry } from "../config/profiles.js";
+import {
+  buildClaudeHomeMap,
+  findProfile,
+  getValidEffortsForProfile,
+  loadProfileRegistry,
+  type ProfileEntry,
+  type ProfileRegistry,
+} from "../config/profiles.js";
 import type { SubscriptionLookupOptions } from "../config/subscriptions.js";
 import {
   chooseSubscriptionConfigDir,
@@ -11,10 +18,21 @@ import {
 } from "../config/subscriptions.js";
 import type { ConfigDirChoice, SubscriptionRegistry } from "../config/subscriptions.js";
 import type { AcpClientOptions } from "../types.js";
+import { isClaudePtyAgentCommand } from "./agent-command.js";
 import type { ShimHandle } from "./openrouter-shim.js";
 import { spawnOpenRouterShim } from "./openrouter-shim.js";
 
 const AUTH_ENV_PREFIX = "ACPX_AUTH_";
+
+/**
+ * The claude-pty bridge's published session/new `_meta` selector key
+ * (independent-claude-acp). This exact string is the bridge interface —
+ * never introduce a second name.
+ */
+export const INDEPENDENT_CLAUDE_HOME_META_KEY = "independent-claude-acp/home";
+
+/** The bridge's server-side HOME allow-list env (JSON {id → abs home path}). */
+export const INDEPENDENT_CLAUDE_HOME_MAP_ENV = "INDEPENDENT_CLAUDE_HOME_MAP";
 
 function toEnvToken(value: string): string {
   return value
@@ -110,6 +128,7 @@ function buildAgentEnvironment(
   authCredentials: Record<string, string> | undefined,
   sessionContext?: AgentSessionContext,
   lookupOptions?: SubscriptionLookupOptions,
+  agentCommand?: string,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   promotePrefixedAuthEnvironment(env);
@@ -143,8 +162,17 @@ function buildAgentEnvironment(
   // Skip subscription resolution here to avoid clobbering what applyProfileAuth
   // will write. Subscription-only sessions (no profileId) continue to use the
   // existing synchronous path below, byte-identical to pre-profile behavior.
+  // For the claude-pty bridge agent, subscription configDir resolution does not
+  // apply at all: an explicit --subscription is rejected (setup-tokens would
+  // wedge interactive Claude at the login picker) and the unselected default
+  // is skipped silently (no CLAUDE_CONFIG_DIR, no "no subscription selected"
+  // banner — the bridge owns auth via its HOME selector).
   if (!sessionContext?.profileId?.trim()) {
-    applySubscriptionConfigDir(env, sessionContext?.subscriptionId ?? null, lookupOptions);
+    if (agentCommand !== undefined && isClaudePtyAgentCommand(agentCommand)) {
+      rejectExplicitSubscriptionForClaudePty(sessionContext?.subscriptionId);
+    } else {
+      applySubscriptionConfigDir(env, sessionContext?.subscriptionId ?? null, lookupOptions);
+    }
   }
   if (!authCredentials) {
     return env;
@@ -422,6 +450,94 @@ function validateOpenRouterEffort(
   }
 }
 
+// Fail-fast guard for v1 subscription selection on the claude-pty bridge.
+// Unselected spawns pass silently (the bridge owns auth via its HOME selector);
+// an explicit id is a configuration error worth stopping the spawn over —
+// subscription configDirs hold headless setup-tokens, which interactive Claude
+// rejects at its login picker (a wedged TUI, not a clean error).
+function rejectExplicitSubscriptionForClaudePty(subscriptionId: string | null | undefined): void {
+  const trimmed = subscriptionId?.trim();
+  if (!trimmed) {
+    return;
+  }
+  throw new Error(
+    `[acpx] subscription "${trimmed}" cannot be used with the claude-pty bridge agent: ` +
+      `subscription configDirs hold headless setup-tokens, which interactive Claude does not accept. ` +
+      `Use a claude-home profile instead (--profile <id>).`,
+  );
+}
+
+// Both-directions profile↔agent compatibility gate, evaluated on EVERY spawn
+// (create / recover / keepwarm — applyProfileAuth is on the single resolution
+// path). claude-home profiles only work on the claude-pty bridge (interactive
+// HOME logins); every other authMode must stay off the bridge (their
+// credentials are not an interactive Claude login). Skipped when the caller
+// cannot supply the agent command (no silent false negatives — every
+// production spawn path passes it).
+function validateProfileAgentCompatibility(
+  profileId: string,
+  profile: ProfileEntry,
+  agentCommand: string | undefined,
+): void {
+  if (agentCommand === undefined) {
+    return;
+  }
+  const claudePty = isClaudePtyAgentCommand(agentCommand);
+  if (profile.authMode === "claude-home" && !claudePty) {
+    throw new Error(
+      `[acpx] profile "${profileId}" (authMode "claude-home") requires the claude-pty bridge agent; ` +
+        `this session's agent command is "${agentCommand}". ` +
+        `Create the session with the claude-pty agent to use this profile.`,
+    );
+  }
+  if (profile.authMode !== "claude-home" && claudePty) {
+    throw new Error(
+      `[acpx] profile "${profileId}" (authMode "${profile.authMode}") cannot be used with the ` +
+        `claude-pty bridge agent: its credentials are not an interactive Claude login ` +
+        `(interactive Claude would wedge at the login picker). Use a claude-home profile.`,
+    );
+  }
+}
+
+// claude-home branch of applyProfileAuth: the bridge owns auth via its HOME
+// selector. Inject the full allow-list map (ALL claude-home profiles in the
+// registry) so the bridge's unknown-selector diagnostics stay meaningful; the
+// per-session selection travels as session/new _meta (buildClaudeHomeSelectorMeta),
+// never as env. No CLAUDE_CONFIG_DIR / ACPX_SUBSCRIPTION: subscription
+// resolution does not apply to interactive-home credentials (the bridge strips
+// leaked SDK env defensively, but acpx must not emit it — drop anything
+// inherited from the owner's own process env). The map holds paths only,
+// never credential contents.
+function applyClaudeHomeProfileAuth(env: NodeJS.ProcessEnv, registry: ProfileRegistry): void {
+  env[INDEPENDENT_CLAUDE_HOME_MAP_ENV] = JSON.stringify(buildClaudeHomeMap(registry));
+  delete env.CLAUDE_CONFIG_DIR;
+  delete env.ACPX_SUBSCRIPTION;
+}
+
+/**
+ * The `_meta` fragment selecting the bridge HOME for a claude-home profile
+ * session: { "independent-claude-acp/home": <profile id> }. Undefined for
+ * non-claude-home (or unknown) profiles. Re-resolved from the registry on
+ * every call, so each spawn stays record-driven (restart safety): a missing
+ * selector would NOT error bridge-side — it silently falls back to the box
+ * default HOME (wrong credentials) — so callers attach this on every
+ * session/new (and session/load, for when the bridge advertises loadSession).
+ */
+export function buildClaudeHomeSelectorMeta(
+  profileId: string | null | undefined,
+  lookupOptions?: SubscriptionLookupOptions,
+): Record<string, unknown> | undefined {
+  const trimmed = profileId?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const profile = findProfile(trimmed, loadProfileRegistry(lookupOptions));
+  if (profile?.authMode !== "claude-home") {
+    return undefined;
+  }
+  return { [INDEPENDENT_CLAUDE_HOME_META_KEY]: trimmed };
+}
+
 // Handles the openrouter authMode branch of applyProfileAuth.
 async function applyOpenRouterProfileAuth(
   env: NodeJS.ProcessEnv,
@@ -473,6 +589,7 @@ export async function applyProfileAuth(
   sessionId: string,
   reasoningEffortOverride?: string | null,
   lookupOptions?: SubscriptionLookupOptions,
+  agentCommand?: string,
 ): Promise<ShimHandle | null> {
   const trimmedId = profileId.trim();
   if (!trimmedId) {
@@ -481,9 +598,27 @@ export async function applyProfileAuth(
   const registry = loadProfileRegistry(lookupOptions);
   const profile = findProfile(trimmedId, registry);
   if (!profile) {
+    // For the bridge agent a soft fallback would be a SILENT wrong-home run:
+    // with no profile there is no map env and no _meta selector, and the
+    // bridge then falls back to the box-default HOME (wrong credentials)
+    // without erroring. Fail the spawn instead.
+    if (agentCommand !== undefined && isClaudePtyAgentCommand(agentCommand)) {
+      throw new Error(
+        `[acpx] profile "${trimmedId}" not found in registry; the claude-pty bridge agent ` +
+          `requires a claude-home profile — refusing to spawn under the box-default HOME. ` +
+          `Restore the profile in ~/.acpx/subscriptions/registry.json or recreate the session.`,
+      );
+    }
     process.stderr.write(
       `[acpx] profile "${trimmedId}" not found in registry; using default Claude config\n`,
     );
+    return null;
+  }
+
+  validateProfileAgentCompatibility(trimmedId, profile, agentCommand);
+
+  if (profile.authMode === "claude-home") {
+    applyClaudeHomeProfileAuth(env, registry);
     return null;
   }
 
@@ -506,6 +641,7 @@ export function buildAgentSpawnOptions(
   authCredentials: Record<string, string> | undefined,
   sessionContext?: AgentSessionContext,
   lookupOptions?: SubscriptionLookupOptions,
+  agentCommand?: string,
 ): {
   cwd: string;
   env: NodeJS.ProcessEnv;
@@ -514,7 +650,7 @@ export function buildAgentSpawnOptions(
 } {
   return {
     cwd,
-    env: buildAgentEnvironment(authCredentials, sessionContext, lookupOptions),
+    env: buildAgentEnvironment(authCredentials, sessionContext, lookupOptions, agentCommand),
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   };

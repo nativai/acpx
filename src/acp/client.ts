@@ -85,6 +85,7 @@ import {
 import {
   applyProfileAuth,
   buildAgentSpawnOptions,
+  buildClaudeHomeSelectorMeta,
   readEnvCredential,
   resolveConfiguredAuthCredential,
 } from "./auth-env.js";
@@ -672,6 +673,8 @@ export class AcpClient {
       this.options.cwd,
       this.options.authCredentials,
       this.options.sessionContext,
+      undefined,
+      this.options.agentCommand,
     );
     await this.applyProfileEnv(spawnOptions.env);
     return {
@@ -710,7 +713,14 @@ export class AcpClient {
     const sessionId = ctx?.acpxRecordId ?? profileId;
     const reasoningEffort = ctx?.reasoningEffort ?? null;
     this.shimHandle =
-      (await applyProfileAuth(env, profileId, sessionId, reasoningEffort)) ?? undefined;
+      (await applyProfileAuth(
+        env,
+        profileId,
+        sessionId,
+        reasoningEffort,
+        undefined,
+        this.options.agentCommand,
+      )) ?? undefined;
   }
 
   private logAgentLaunch(plan: AgentLaunchPlan): void {
@@ -955,7 +965,7 @@ export class AcpClient {
         connection.newSession({
           cwd: sessionCwd,
           mcpServers: this.options.mcpServers ?? [],
-          _meta: buildClaudeCodeOptionsMeta(this.options.sessionOptions),
+          _meta: this.buildNewSessionMeta(),
         }),
       );
       result = claudeAcp
@@ -981,6 +991,27 @@ export class AcpClient {
     };
   }
 
+  /**
+   * session/new `_meta`: the claudeCode options fragment plus — for a
+   * claude-home profile session — the bridge HOME selector
+   * (independent-claude-acp/home). Recomputed per call, so EVERY spawn path
+   * that lands in createSession (create / recover-fresh / keepwarm) carries
+   * the selector: a missing selector does not error bridge-side, it silently
+   * runs under the box-default HOME (wrong credentials).
+   */
+  private buildNewSessionMeta(): Record<string, unknown> | undefined {
+    const optionsMeta = buildClaudeCodeOptionsMeta(this.options.sessionOptions);
+    const homeSelectorMeta = this.buildHomeSelectorMeta();
+    if (!homeSelectorMeta) {
+      return optionsMeta;
+    }
+    return { ...optionsMeta, ...homeSelectorMeta };
+  }
+
+  private buildHomeSelectorMeta(): Record<string, unknown> | undefined {
+    return buildClaudeHomeSelectorMeta(this.options.sessionContext?.profileId);
+  }
+
   async loadSession(sessionId: string, cwd = this.options.cwd): Promise<SessionLoadResult> {
     this.getConnection();
     return await this.loadSessionWithOptions(sessionId, cwd, {});
@@ -1000,11 +1031,17 @@ export class AcpClient {
     let response: LoadSessionResponse | undefined;
 
     try {
+      // For claude-home sessions, carry the HOME selector on session/load too:
+      // when the bridge advertises loadSession (feat/session-load), the loaded
+      // session must re-bind to the same home — and a missing selector falls
+      // back silently to the box-default HOME, not an error.
+      const homeSelectorMeta = this.buildHomeSelectorMeta();
       response = await this.runConnectionRequest(() =>
         connection.loadSession({
           sessionId,
           cwd: sessionCwd,
           mcpServers: this.options.mcpServers ?? [],
+          ...(homeSelectorMeta ? { _meta: homeSelectorMeta } : {}),
         }),
       );
 

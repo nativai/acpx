@@ -1528,10 +1528,16 @@ const mockAgentOptions = parseMockAgentOptions(process.argv.slice(2));
 
 if (mockAgentOptions.envDumpFile) {
   // Capture the ACPX_* env the adapter was spawned with, so an E2E can assert
-  // what acpx injected (ACPX_TASK_FOLDER, ACPX_AGENT_FOLDER, …).
+  // what acpx injected (ACPX_TASK_FOLDER, ACPX_AGENT_FOLDER, …). Also capture
+  // the claude-pty bridge selector env (INDEPENDENT_CLAUDE_*) and
+  // CLAUDE_CONFIG_DIR so tests can assert both presence AND absence.
   const acpxEnv: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
-    if (key.startsWith("ACPX_") && typeof value === "string") {
+    const captured =
+      key.startsWith("ACPX_") ||
+      key.startsWith("INDEPENDENT_CLAUDE_") ||
+      key === "CLAUDE_CONFIG_DIR";
+    if (captured && typeof value === "string") {
       acpxEnv[key] = value;
     }
   }

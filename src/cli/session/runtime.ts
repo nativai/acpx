@@ -9,6 +9,7 @@ import {
 import { assertRequestedModelSupported } from "../../acp/model-support.js";
 import { InterruptedError, withInterrupt, withTimeout } from "../../async-control.js";
 import { tailClaudeSubagentJsonl } from "../../claude-jsonl.js";
+import { isClaudeHomeProfileId } from "../../config/profiles.js";
 import { transcriptCwdHash } from "../../config/subscription-transcript.js";
 import { AllSubscriptionsExhaustedError, SessionClosedError } from "../../errors.js";
 import {
@@ -618,6 +619,29 @@ export async function runQueuedTask(
   }
 }
 
+// Failover eligibility gate: returns the session record when this turn error
+// should attempt subscription failover, or null to rethrow the original error.
+// Null when the error is not failover-classified, the box has no registry, or
+// the session uses a claude-home profile — claude-home is excluded from
+// subscription failover (v1): its credential is an interactive HOME owned by
+// the bridge, not a subscription configDir, so rewriting
+// session_options.subscription cannot move it anywhere (the profile keeps
+// winning at spawn) and a failover loop would only churn breadcrumbs through
+// every registered sub.
+async function resolveFailoverRecord(
+  sessionRecordId: string,
+  error: unknown,
+): Promise<SessionRecord | null> {
+  if (!classifyFailover(error) || !failoverEnabled()) {
+    return null;
+  }
+  const record = await resolveSessionRecord(sessionRecordId);
+  if (isClaudeHomeProfileId(record.acpx?.session_options?.profile)) {
+    return null;
+  }
+  return record;
+}
+
 // On a failover-classified turn error (401/429/billing), switch the session to a
 // usable subscription and re-run the turn on a FRESH client (built from the
 // updated record → new CLAUDE_CONFIG_DIR, resuming the ported transcript). Not a
@@ -630,10 +654,10 @@ async function runQueuedTaskFailover(
   outputFormatter: OutputFormatter,
   error: unknown,
 ): Promise<SessionSendResult> {
-  if (!classifyFailover(error) || !failoverEnabled()) {
+  const record = await resolveFailoverRecord(sessionRecordId, error);
+  if (!record) {
     throw error;
   }
-  const record = await resolveSessionRecord(sessionRecordId);
   let outcome: { result: SessionSendResult; switchedTo: string };
   try {
     outcome = await attemptFailoverAndRetry<SessionSendResult>({
