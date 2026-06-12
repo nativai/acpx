@@ -23,6 +23,7 @@ import {
 import { createOutputFormatter, getTextErrorRemediationHints } from "./cli/output/output.js";
 import { runQueueOwnerFromEnv } from "./cli/queue/owner-env.js";
 import { flushPerfMetricsCapture, installPerfMetricsCapture } from "./perf-metrics-capture.js";
+import { setSessionIndexRebuildLogSuppressed } from "./session/persistence/index.js";
 import { EXIT_CODES, OUTPUT_FORMATS, type OutputFormat, type OutputPolicy } from "./types.js";
 import { getAcpxVersion } from "./version.js";
 
@@ -460,6 +461,9 @@ export async function main(argv: string[] = process.argv): Promise<void> {
 
   const config = await loadResolvedConfig(detectInitialCwd(rawArgs));
   const requestedJsonStrict = detectJsonStrict(rawArgs);
+  // --json-strict promises machine-clean stderr: silence the session-index
+  // full-rebuild notice (same suppression class as session banners).
+  setSessionIndexRebuildLogSuppressed(requestedJsonStrict);
   const requestedOutputFormat = detectRequestedOutputFormat(rawArgs, config.format);
   const requestedOutputPolicy = {
     ...resolveOutputPolicy(requestedOutputFormat, requestedJsonStrict),

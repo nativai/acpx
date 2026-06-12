@@ -295,13 +295,23 @@ async function readIndexEntryFromDisk(
   }
 }
 
+// --json-strict guarantees machine-clean stderr; the CLI entrypoint suppresses
+// the rebuild notice for those invocations (same class as session banners).
+let rebuildLogSuppressed = false;
+
+export function setSessionIndexRebuildLogSuppressed(suppressed: boolean): void {
+  rebuildLogSuppressed = suppressed;
+}
+
 export async function rebuildSessionIndex(
   sessionDir: string,
   reason: string,
 ): Promise<SessionIndex> {
   // Full-store re-parse — the prod observable for the "zero full-store
   // rebuilds on new-file creation" target (VERIFICATION-ANNEX S4 greps for it).
-  process.stderr.write(`[acpx] full session-index rebuild (reason: ${reason})\n`);
+  if (!rebuildLogSuppressed) {
+    process.stderr.write(`[acpx] full session-index rebuild (reason: ${reason})\n`);
+  }
   // Advisory lock (re-entrant under a caller already holding it). A rebuild
   // over a very large store can outlive the 5 s stale threshold and lose the
   // lock to a takeover — acceptable: that degrades to the pre-lock racing
