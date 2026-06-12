@@ -88,6 +88,18 @@ function matchesSessionEntry(
   return session.name === normalizedName;
 }
 
+export type PersistedSessionLifecycle = {
+  closed: boolean | undefined;
+  closedAt: string | undefined;
+  favorite: boolean | undefined;
+  favoritedAt: string | undefined;
+  name: string | undefined;
+  /** Extra fields the live-checkpoint closed-state merge needs — carried so
+   * one read can serve both the preserve step and that merge (W2.4). */
+  pid: number | undefined;
+  acpx: SessionRecord["acpx"];
+};
+
 /**
  * Read the current on-disk <id>.json (if present) and return the persisted
  * lifecycle fields (closed/closedAt), the UI-owned favorite state
@@ -95,16 +107,9 @@ function matchesSessionEntry(
  * if the file is missing or unreadable — callers should treat that as
  * "no prior state to preserve."
  */
-async function readPersistedLifecycle(acpxRecordId: string): Promise<
-  | {
-      closed: boolean | undefined;
-      closedAt: string | undefined;
-      favorite: boolean | undefined;
-      favoritedAt: string | undefined;
-      name: string | undefined;
-    }
-  | undefined
-> {
+export async function readPersistedLifecycle(
+  acpxRecordId: string,
+): Promise<PersistedSessionLifecycle | undefined> {
   try {
     const payload = await fs.readFile(sessionFilePath(acpxRecordId), "utf8");
     const parsed = parseSessionRecord(JSON.parse(payload));
@@ -117,6 +122,8 @@ async function readPersistedLifecycle(acpxRecordId: string): Promise<
       favorite: parsed.favorite,
       favoritedAt: parsed.favoritedAt,
       name: parsed.name,
+      pid: parsed.pid,
+      acpx: parsed.acpx,
     };
   } catch {
     return undefined;
@@ -164,15 +171,40 @@ export async function writeSessionRecordWithLifecycle(record: SessionRecord): Pr
   await writeSessionRecordInternal(record, { preserveLifecycle: false });
 }
 
+/**
+ * Preserving write variant for callers that already hold the persisted
+ * lifecycle from a fresh `readPersistedLifecycle` read — the live-checkpoint
+ * path, which previously parsed the same multi-MB record twice per
+ * checkpoint (once for its closed-state merge, once inside the write).
+ * Semantics are identical to `writeSessionRecord`; `persisted` may be
+ * undefined when the file was missing ("no prior state to preserve").
+ */
+export async function writeSessionRecordWithPersistedLifecycle(
+  record: SessionRecord,
+  persisted: PersistedSessionLifecycle | undefined,
+): Promise<void> {
+  await writeSessionRecordInternal(record, {
+    preserveLifecycle: true,
+    persisted: { value: persisted },
+  });
+}
+
 async function writeSessionRecordInternal(
   record: SessionRecord,
-  options: { preserveLifecycle: boolean },
+  options: {
+    preserveLifecycle: boolean;
+    /** Wrapper distinguishes "caller provided a read result (possibly
+     * undefined)" from "not provided — read from disk here". */
+    persisted?: { value: PersistedSessionLifecycle | undefined };
+  },
 ): Promise<void> {
   await measurePerf("session.write_record", async () => {
     await ensureSessionDir();
 
     if (options.preserveLifecycle) {
-      const persistedLifecycle = await readPersistedLifecycle(record.acpxRecordId);
+      const persistedLifecycle = options.persisted
+        ? options.persisted.value
+        : await readPersistedLifecycle(record.acpxRecordId);
       if (persistedLifecycle) {
         record.closed = persistedLifecycle.closed;
         record.closedAt = persistedLifecycle.closedAt;

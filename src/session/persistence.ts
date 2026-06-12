@@ -14,9 +14,15 @@ export {
   listSubagentsForSession,
   normalizeName,
   pruneSessions,
+  readPersistedLifecycle,
   resolveSessionRecord,
   sessionBaseDir,
   writeSessionRecord,
   writeSessionRecordWithLifecycle,
+  writeSessionRecordWithPersistedLifecycle,
 } from "./persistence/repository.js";
-export type { PruneOptions, PruneResult } from "./persistence/repository.js";
+export type {
+  PersistedSessionLifecycle,
+  PruneOptions,
+  PruneResult,
+} from "./persistence/repository.js";

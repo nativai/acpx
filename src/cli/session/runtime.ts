@@ -54,8 +54,10 @@ import { persistTerminalTurnError } from "../../session/persist-terminal-error.j
 import {
   absolutePath,
   isoNow,
+  readPersistedLifecycle,
   resolveSessionRecord,
   writeSessionRecord,
+  type PersistedSessionLifecycle,
 } from "../../session/persistence.js";
 import {
   SESSION_RECORD_SCHEMA,
@@ -805,6 +807,27 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   const subagentEventWriters = new Map<string, SessionEventWriter>();
   // Subagent JSONL tailers: map from ACPX record id to stop function
   const subagentTailers = new Map<string, { stop: () => Promise<void> }>();
+  // Subagent record-write debouncers (same 500 ms class as the live
+  // checkpoint): each tailed batch used to rewrite the child record
+  // undebounced — at adapter batch rates that is another full-record
+  // rewrite stream per active subagent.
+  const subagentCheckpoints = new Map<string, LiveSessionCheckpoint>();
+
+  const getSubagentCheckpoint = (
+    childAcpxRecordId: string,
+    childRecord: SessionRecord,
+  ): LiveSessionCheckpoint => {
+    let checkpoint = subagentCheckpoints.get(childAcpxRecordId);
+    if (!checkpoint) {
+      checkpoint = new LiveSessionCheckpoint({
+        save: async () => {
+          await writeSessionRecord(childRecord);
+        },
+      });
+      subagentCheckpoints.set(childAcpxRecordId, checkpoint);
+    }
+    return checkpoint;
+  };
 
   const getOrOpenSubagentEventWriter = async (
     childAcpxRecordId: string,
@@ -830,6 +853,11 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     const stops = [...subagentTailers.values()].map((t) => t.stop().catch(() => {}));
     await Promise.all(stops);
     subagentTailers.clear();
+    const flushes = [...subagentCheckpoints.values()].map((checkpoint) =>
+      checkpoint.flush().catch(() => {}),
+    );
+    subagentCheckpoints.clear();
+    await Promise.all(flushes);
   };
 
   const closeAllSubagentEventWriters = async (): Promise<void> => {
@@ -889,21 +917,23 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       await eventWriter.appendMessages(batch, { checkpoint });
     });
   };
-  const preserveClosedState = async (): Promise<void> => {
-    const latest = await resolveSessionRecord(record.acpxRecordId).catch(() => undefined);
-    if (!latest?.closed) {
+  const applyPersistedClosedState = (persisted: PersistedSessionLifecycle | undefined): void => {
+    if (!persisted?.closed) {
       return;
     }
 
     record.closed = true;
-    record.closedAt = latest.closedAt ?? record.closedAt ?? isoNow();
-    record.pid = latest.pid;
-    if (latest.acpx) {
+    record.closedAt = persisted.closedAt ?? record.closedAt ?? isoNow();
+    record.pid = persisted.pid;
+    if (persisted.acpx) {
       record.acpx = {
         ...record.acpx,
-        ...latest.acpx,
+        ...persisted.acpx,
       };
     }
+  };
+  const preserveClosedState = async (): Promise<void> => {
+    applyPersistedClosedState(await readPersistedLifecycle(record.acpxRecordId));
   };
   const liveCheckpoint = new LiveSessionCheckpoint({
     save: async () => {
@@ -911,8 +941,11 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       record.lastUsedAt = isoNow();
       applyConversation(record, conversation);
       record.acpx = acpxState;
-      await preserveClosedState();
-      await eventWriter.checkpoint();
+      // Exactly ONE full record read per checkpoint (W2.4): this read feeds
+      // both the closed-state merge and the write's lifecycle preserve.
+      const persisted = await readPersistedLifecycle(record.acpxRecordId);
+      applyPersistedClosedState(persisted);
+      await eventWriter.checkpoint({ persistedLifecycle: { value: persisted } });
     },
     onError: (error) => {
       if (options.verbose) {
@@ -988,7 +1021,11 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
                   const childRecord = subagentRecordsById.get(childAcpxRecordId);
                   if (childRecord) {
                     childRecord.lastUsedAt = isoNow();
-                    void writeSessionRecord(childRecord).catch(() => {});
+                    const checkpoint = subagentCheckpoints.get(childAcpxRecordId);
+                    subagentCheckpoints.delete(childAcpxRecordId);
+                    void (checkpoint?.checkpoint() ?? writeSessionRecord(childRecord)).catch(
+                      () => {},
+                    );
                   }
                 });
               }
@@ -1111,7 +1148,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
                     .catch(() => {});
                 }
               });
-              void writeSessionRecord(childRecord).catch(() => {});
+              getSubagentCheckpoint(childAcpxRecordId, childRecord).request();
             });
             subagentTailers.set(childAcpxRecordId, tailer);
           }

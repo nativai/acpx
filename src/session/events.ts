@@ -12,7 +12,12 @@ import {
   sessionEventLockPath as eventsLockPath,
   sessionEventSegmentPath as segmentEventPath,
 } from "./event-log.js";
-import { resolveSessionRecord, writeSessionRecord } from "./persistence.js";
+import {
+  resolveSessionRecord,
+  writeSessionRecord,
+  writeSessionRecordWithPersistedLifecycle,
+  type PersistedSessionLifecycle,
+} from "./persistence.js";
 
 const LOCK_RETRY_MS = 15;
 const EVENT_LOCK_STALE_MS = 15_000;
@@ -357,9 +362,21 @@ export class SessionEventWriter {
     }
   }
 
-  async checkpoint(): Promise<void> {
+  /**
+   * Persist the record. When the caller already read the persisted lifecycle
+   * this turn (the live-checkpoint path), pass it through so the write does
+   * not parse the same multi-MB record a second time; `value: undefined`
+   * means "file was missing — nothing to preserve".
+   */
+  async checkpoint(options?: {
+    persistedLifecycle?: { value: PersistedSessionLifecycle | undefined };
+  }): Promise<void> {
     if (this.closed) {
       throw new Error("SessionEventWriter is closed");
+    }
+    if (options?.persistedLifecycle) {
+      await writeSessionRecordWithPersistedLifecycle(this.record, options.persistedLifecycle.value);
+      return;
     }
     await writeSessionRecord(this.record);
   }
