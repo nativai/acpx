@@ -255,15 +255,13 @@ export async function writeSessionIndex(
 ): Promise<void> {
   const filePath = sessionIndexPath(sessionDir);
   const tempFile = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  const payload = JSON.stringify(
-    {
-      schema: SESSION_INDEX_SCHEMA,
-      files: [...index.files].toSorted(),
-      entries: [...index.entries].toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt)),
-    },
-    null,
-    2,
-  );
+  // Compact JSON (no pretty-print): parses identically for every consumer,
+  // saves ~30-40% of bytes and stringify CPU per rewrite.
+  const payload = JSON.stringify({
+    schema: SESSION_INDEX_SCHEMA,
+    files: [...index.files].toSorted(),
+    entries: [...index.entries].toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt)),
+  });
   await fs.writeFile(tempFile, `${payload}\n`, "utf8");
   await fs.rename(tempFile, filePath);
 }

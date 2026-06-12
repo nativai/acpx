@@ -6,12 +6,14 @@ import { SessionNotFoundError, SessionResolutionError } from "../../errors.js";
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { assertPersistedKeyPolicy } from "../../persisted-key-policy.js";
 import type { SessionRecord } from "../../types.js";
-import { withSessionIndexLock } from "./index-lock.js";
+import {
+  flushPendingSessionIndexUpdates,
+  updateSessionIndexForRecordWrite,
+} from "./index-update-queue.js";
 import {
   loadOrRebuildSessionIndex,
   rebuildSessionIndex,
   toSessionIndexEntry,
-  writeSessionIndex,
   type SessionIndexEntry,
 } from "./index.js";
 import { parseSessionRecord } from "./parse.js";
@@ -59,6 +61,9 @@ async function loadRecordFromIndexEntry(
 
 async function loadSessionIndexEntries(): Promise<SessionIndexEntry[]> {
   await ensureSessionDir();
+  // Read-your-writes within the process: drain any coalesced scalar updates
+  // before serving index entries.
+  await flushPendingSessionIndexUpdates(sessionBaseDir());
   const index = await measurePerf("session.index_load", async () => {
     return await loadOrRebuildSessionIndex(sessionBaseDir());
   });
@@ -182,21 +187,19 @@ async function writeSessionRecordInternal(
 
     const file = sessionFilePath(record.acpxRecordId);
     const tempFile = `${file}.${process.pid}.${Date.now()}.tmp`;
-    const payload = JSON.stringify(persisted, null, 2);
+    // Compact JSON: parses identically everywhere, saves ~30-40% of bytes and
+    // stringify CPU on every checkpoint of a multi-MB record.
+    const payload = JSON.stringify(persisted);
     await fs.writeFile(tempFile, `${payload}\n`, "utf8");
     await fs.rename(tempFile, file);
 
     const sessionDir = sessionBaseDir();
     const fileName = path.basename(file);
-    // Serialize the index read-modify-write across processes so a concurrent
-    // writer's just-added file-list row / entry is not clobbered by a stale
-    // snapshot (the race that kept re-arming full-rebuild storms).
-    await withSessionIndexLock(sessionDir, async () => {
-      const index = await loadOrRebuildSessionIndex(sessionDir);
-      const entries = index.entries.filter((entry) => entry.file !== fileName);
-      entries.push(toSessionIndexEntry(record, fileName));
-      const files = [...new Set([...index.files.filter((entry) => entry !== fileName), fileName])];
-      await writeSessionIndex(sessionDir, { files, entries });
+    // Membership-immediate / scalar-throttled index update (W2.3). The
+    // privileged lifecycle path (close/favorite/name) always writes
+    // immediately — human-frequency and freshness-sensitive.
+    await updateSessionIndexForRecordWrite(sessionDir, toSessionIndexEntry(record, fileName), {
+      immediate: !options.preserveLifecycle,
     });
   });
 }

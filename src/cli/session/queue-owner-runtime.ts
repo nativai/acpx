@@ -15,6 +15,7 @@ import {
 import { SessionEventWriter } from "../../session/events.js";
 import {
   absolutePath,
+  flushPendingSessionIndexUpdates,
   resolveSessionRecord,
   writeSessionRecord,
 } from "../../session/persistence.js";
@@ -236,6 +237,11 @@ async function closeQueueOwnerRuntime(params: {
     // best effort while queue owner is shutting down
   });
   await writeQueueOwnerLifecycleSnapshot(params.sessionId, params.sharedClient);
+  // The exit snapshot's index update may be in the coalesced scalar class —
+  // drain it so the index reflects the final owner state (W2.3 / D6).
+  await flushPendingSessionIndexUpdates().catch(() => {
+    // best effort while queue owner is shutting down
+  });
   await releaseQueueOwnerLease(params.lease);
   if (params.verbose) {
     process.stderr.write(`[acpx] queue owner stopped for session ${params.sessionId}\n`);

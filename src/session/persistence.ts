@@ -1,5 +1,6 @@
 export { serializeSessionRecordForDisk } from "./persistence/serialize.js";
 export { parseSessionRecord } from "./persistence/parse.js";
+export { flushPendingSessionIndexUpdates } from "./persistence/index-update-queue.js";
 export {
   DEFAULT_HISTORY_LIMIT,
   absolutePath,
