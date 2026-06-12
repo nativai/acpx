@@ -1,4 +1,5 @@
 import type { AgentLifecycleSnapshot } from "../../acp/client.js";
+import { copyLoggedMessageCount } from "../../session/messages-log-bookkeeping.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
 import type { SessionConversation, SessionRecord } from "../../types.js";
 
@@ -51,6 +52,7 @@ export function applyConversation(record: SessionRecord, conversation: SessionCo
   record.title = conversation.title;
   record.updated_at = conversation.updated_at;
   record.messages = conversation.messages;
+  copyLoggedMessageCount(conversation, record);
   record.cumulative_token_usage = conversation.cumulative_token_usage;
   record.request_token_usage = conversation.request_token_usage;
 }

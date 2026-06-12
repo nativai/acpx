@@ -48,6 +48,7 @@ import {
 import { defaultSessionEventLog } from "../../session/event-log.js";
 import { SessionEventWriter } from "../../session/events.js";
 import { LiveSessionCheckpoint } from "../../session/live-checkpoint.js";
+import { copyLoggedMessageCount } from "../../session/messages-log-bookkeeping.js";
 import { setCurrentModelId, setDesiredModelId } from "../../session/mode-preference.js";
 import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
 import { persistTerminalTurnError } from "../../session/persist-terminal-error.js";
@@ -57,6 +58,7 @@ import {
   readPersistedLifecycle,
   resolveSessionRecord,
   writeSessionRecord,
+  writeSessionRecordAtBoundary,
   type PersistedSessionLifecycle,
 } from "../../session/persistence.js";
 import {
@@ -698,7 +700,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     record.lastUsedAt = promptStartedAt;
     applyConversation(record, conversation);
     record.acpx = acpxState;
-    await writeSessionRecord(record);
+    await writeSessionRecordAtBoundary(record);
+    copyLoggedMessageCount(record, conversation);
     return promptMessageId;
   };
 
@@ -807,26 +810,27 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   const subagentEventWriters = new Map<string, SessionEventWriter>();
   // Subagent JSONL tailers: map from ACPX record id to stop function
   const subagentTailers = new Map<string, { stop: () => Promise<void> }>();
-  // Subagent record-write debouncers (same 500 ms class as the live
-  // checkpoint): each tailed batch used to rewrite the child record
-  // undebounced — at adapter batch rates that is another full-record
-  // rewrite stream per active subagent.
-  const subagentCheckpoints = new Map<string, LiveSessionCheckpoint>();
+  const subagentSaveChains = new Map<string, Promise<void>>();
 
-  const getSubagentCheckpoint = (
+  const enqueueSubagentBoundaryWrite = (
     childAcpxRecordId: string,
     childRecord: SessionRecord,
-  ): LiveSessionCheckpoint => {
-    let checkpoint = subagentCheckpoints.get(childAcpxRecordId);
-    if (!checkpoint) {
-      checkpoint = new LiveSessionCheckpoint({
-        save: async () => {
-          await writeSessionRecord(childRecord);
-        },
+  ): Promise<void> => {
+    const previous = subagentSaveChains.get(childAcpxRecordId) ?? Promise.resolve();
+    const next = previous
+      .catch(() => {
+        // Preserve ordering after a best-effort write failure.
+      })
+      .then(async () => {
+        await writeSessionRecordAtBoundary(childRecord);
       });
-      subagentCheckpoints.set(childAcpxRecordId, checkpoint);
-    }
-    return checkpoint;
+    subagentSaveChains.set(childAcpxRecordId, next);
+    void next.finally(() => {
+      if (subagentSaveChains.get(childAcpxRecordId) === next) {
+        subagentSaveChains.delete(childAcpxRecordId);
+      }
+    });
+    return next;
   };
 
   const getOrOpenSubagentEventWriter = async (
@@ -853,11 +857,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     const stops = [...subagentTailers.values()].map((t) => t.stop().catch(() => {}));
     await Promise.all(stops);
     subagentTailers.clear();
-    const flushes = [...subagentCheckpoints.values()].map((checkpoint) =>
-      checkpoint.flush().catch(() => {}),
-    );
-    subagentCheckpoints.clear();
-    await Promise.all(flushes);
+    await Promise.all([...subagentSaveChains.values()].map((save) => save.catch(() => {})));
   };
 
   const closeAllSubagentEventWriters = async (): Promise<void> => {
@@ -1021,9 +1021,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
                   const childRecord = subagentRecordsById.get(childAcpxRecordId);
                   if (childRecord) {
                     childRecord.lastUsedAt = isoNow();
-                    const checkpoint = subagentCheckpoints.get(childAcpxRecordId);
-                    subagentCheckpoints.delete(childAcpxRecordId);
-                    void (checkpoint?.checkpoint() ?? writeSessionRecord(childRecord)).catch(
+                    void enqueueSubagentBoundaryWrite(childAcpxRecordId, childRecord).catch(
                       () => {},
                     );
                   }
@@ -1148,7 +1146,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
                     .catch(() => {});
                 }
               });
-              getSubagentCheckpoint(childAcpxRecordId, childRecord).request();
+              void enqueueSubagentBoundaryWrite(childAcpxRecordId, childRecord).catch(() => {});
             });
             subagentTailers.set(childAcpxRecordId, tailer);
           }

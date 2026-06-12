@@ -25,6 +25,7 @@ import type {
   SessionToolUse,
   SessionUserContent,
 } from "../types.js";
+import { copyLoggedMessageCount, dropLoggedMessagesFromHead } from "./messages-log-bookkeeping.js";
 
 export type LegacyHistoryEntry = {
   role: "user" | "assistant";
@@ -580,13 +581,15 @@ export function cloneSessionConversation(
     return createSessionConversation();
   }
 
-  return {
+  const cloned = {
     title: conversation.title,
     messages: deepClone(conversation.messages ?? []),
     updated_at: conversation.updated_at,
     cumulative_token_usage: deepClone(conversation.cumulative_token_usage ?? {}),
     request_token_usage: deepClone(conversation.request_token_usage ?? {}),
   };
+  copyLoggedMessageCount(conversation, cloned);
+  return cloned;
 }
 
 export function cloneSessionAcpxState(
@@ -877,7 +880,9 @@ export function recordClientOperation(
 
 export function trimConversationForRuntime(conversation: SessionConversation): void {
   if (conversation.messages.length > MAX_RUNTIME_MESSAGES) {
+    const dropped = conversation.messages.length - MAX_RUNTIME_MESSAGES;
     conversation.messages = conversation.messages.slice(-MAX_RUNTIME_MESSAGES);
+    dropLoggedMessagesFromHead(conversation, dropped);
   }
 
   for (const message of conversation.messages) {

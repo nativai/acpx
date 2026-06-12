@@ -5,8 +5,20 @@ import path from "node:path";
 import { SessionNotFoundError, SessionResolutionError } from "../../errors.js";
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { assertPersistedKeyPolicy } from "../../persisted-key-policy.js";
+import { isProcessAlive } from "../../process-liveness.js";
 import type { SessionRecord } from "../../types.js";
-import { hydrateSessionMessagesFromLog, messagesLogPath } from "../messages-log.js";
+import { getLoggedMessageCount, markAllMessagesLogged } from "../messages-log-bookkeeping.js";
+import {
+  appendFinalizedMessagesToLog,
+  clearMissingMessagesLogPointerForWrite,
+  compactMessagesLog,
+  hydrateSessionMessagesFromLog,
+  messagesLogFileName,
+  messagesLogPath,
+  messagesLogStalePath,
+  prepareMessagesLogForBoundary,
+  resolveMessagesLogCompactBytes,
+} from "../messages-log.js";
 import {
   flushPendingSessionIndexUpdates,
   updateSessionIndexForRecordWrite,
@@ -154,19 +166,24 @@ export async function readPersistedLifecycle(
  * suppress.)
  *
  * The **one authorized daemon writer** of these fields is `closeSession`
- * (and its privileged helper variants): it calls
- * `writeSessionRecordWithLifecycle` to bypass the preserve step so it can
- * write `closed: true` from the daemon side. Every other writer — periodic
- * checkpoints, end-of-turn flushes, subagent updates — must use plain
- * `writeSessionRecord` and will be transparent to lifecycle / favorite / name
- * state.
- *
- * `toSessionIndexEntry` and `serializeSessionRecordForDisk` remain unchanged:
- * they simply consume whatever the in-memory record holds at call time,
- * which is already the correct value because the preserve step ran first.
+ * (and its privileged helper variants): it bypasses the preserve step so it
+ * can write `closed: true` from the daemon side. Finalization sites use the
+ * boundary variants, which append finalized messages before writing the slim
+ * record; periodic checkpoints and scalar edits use the non-boundary variants,
+ * which never touch the messages log.
  */
 export async function writeSessionRecord(record: SessionRecord): Promise<void> {
-  await writeSessionRecordInternal(record, { preserveLifecycle: true });
+  await writeSessionRecordInternal(record, {
+    messagePersistence: "checkpoint",
+    preserveLifecycle: true,
+  });
+}
+
+export async function writeSessionRecordAtBoundary(record: SessionRecord): Promise<void> {
+  await writeSessionRecordInternal(record, {
+    messagePersistence: "boundary",
+    preserveLifecycle: true,
+  });
 }
 
 /**
@@ -175,7 +192,19 @@ export async function writeSessionRecord(record: SessionRecord): Promise<void> {
  * `closed_at`. All other daemon paths must use plain `writeSessionRecord`.
  */
 export async function writeSessionRecordWithLifecycle(record: SessionRecord): Promise<void> {
-  await writeSessionRecordInternal(record, { preserveLifecycle: false });
+  await writeSessionRecordInternal(record, {
+    messagePersistence: "checkpoint",
+    preserveLifecycle: false,
+  });
+}
+
+export async function writeSessionRecordAtBoundaryWithLifecycle(
+  record: SessionRecord,
+): Promise<void> {
+  await writeSessionRecordInternal(record, {
+    messagePersistence: "boundary",
+    preserveLifecycle: false,
+  });
 }
 
 /**
@@ -191,6 +220,7 @@ export async function writeSessionRecordWithPersistedLifecycle(
   persisted: PersistedSessionLifecycle | undefined,
 ): Promise<void> {
   await writeSessionRecordInternal(record, {
+    messagePersistence: "checkpoint",
     preserveLifecycle: true,
     persisted: { value: persisted },
   });
@@ -199,6 +229,7 @@ export async function writeSessionRecordWithPersistedLifecycle(
 async function writeSessionRecordInternal(
   record: SessionRecord,
   options: {
+    messagePersistence: "checkpoint" | "boundary";
     preserveLifecycle: boolean;
     /** Wrapper distinguishes "caller provided a read result (possibly
      * undefined)" from "not provided — read from disk here". */
@@ -221,7 +252,15 @@ async function writeSessionRecordInternal(
       }
     }
 
-    const persisted = serializeSessionRecordForDisk(record);
+    const sessionDir = sessionBaseDir();
+    const logPath = messagesLogPath(sessionDir, record.acpxRecordId);
+    if (options.messagePersistence === "boundary") {
+      await writeMessagesLogBoundary(record, logPath);
+    } else {
+      await clearMissingMessagesLogPointerForWrite(record, logPath);
+    }
+
+    const persisted = serializeSessionRecordForDisk(record, { messages: "split-tail" });
     assertPersistedKeyPolicy(persisted);
 
     const file = sessionFilePath(record.acpxRecordId);
@@ -232,7 +271,6 @@ async function writeSessionRecordInternal(
     await fs.writeFile(tempFile, `${payload}\n`, "utf8");
     await fs.rename(tempFile, file);
 
-    const sessionDir = sessionBaseDir();
     const fileName = path.basename(file);
     // Membership-immediate / scalar-throttled index update (W2.3). The
     // privileged lifecycle path (close/favorite/name) always writes
@@ -241,6 +279,21 @@ async function writeSessionRecordInternal(
       immediate: !options.preserveLifecycle,
     });
   });
+}
+
+async function writeMessagesLogBoundary(record: SessionRecord, logPath: string): Promise<void> {
+  await prepareMessagesLogForBoundary(record, logPath);
+
+  const loggedCount = getLoggedMessageCount(record);
+  const messagesToAppend = record.messages.slice(loggedCount);
+  await appendFinalizedMessagesToLog(record, logPath, messagesToAppend);
+  if (messagesToAppend.length > 0) {
+    markAllMessagesLogged(record);
+  }
+
+  if (record.messagesLog) {
+    await compactMessagesLog(record, logPath, resolveMessagesLogCompactBytes());
+  }
 }
 
 export async function resolveSessionRecord(sessionId: string): Promise<SessionRecord> {
@@ -473,6 +526,22 @@ export type PruneResult = {
   dryRun: boolean;
 };
 
+export type MigrateMessagesOptions = {
+  dryRun?: boolean;
+  includeActive?: boolean;
+};
+
+export type MigrateMessagesResult = {
+  scanned: number;
+  migrated: number;
+  skippedActive: number;
+  skippedAlreadySplit: number;
+  failed: number;
+  dryRun: boolean;
+};
+
+type MigrateMessagesEntryResult = "migrated" | "active" | "already-split" | "failed";
+
 function closedAtOrLastUsedAt(record: SessionRecord): string {
   return record.closedAt ?? record.lastUsedAt;
 }
@@ -531,6 +600,76 @@ export async function pruneSessions(options: PruneOptions = {}): Promise<PruneRe
   return { pruned: records, bytesFreed, dryRun: false };
 }
 
+export async function migrateSessionMessages(
+  options: MigrateMessagesOptions = {},
+): Promise<MigrateMessagesResult> {
+  await ensureSessionDir();
+  const entries = await loadSessionIndexEntries();
+  const result: MigrateMessagesResult = {
+    scanned: 0,
+    migrated: 0,
+    skippedActive: 0,
+    skippedAlreadySplit: 0,
+    failed: 0,
+    dryRun: options.dryRun === true,
+  };
+
+  for (const entry of entries) {
+    result.scanned += 1;
+    tallyMigrateMessagesEntryResult(
+      result,
+      await migrateSessionMessagesEntry(entry, options, result.dryRun),
+    );
+  }
+
+  return result;
+}
+
+async function migrateSessionMessagesEntry(
+  entry: SessionIndexEntry,
+  options: MigrateMessagesOptions,
+  dryRun: boolean,
+): Promise<MigrateMessagesEntryResult> {
+  const record = await loadRecordFromIndexEntry(entry);
+  if (!record) {
+    return "failed";
+  }
+
+  if (record.messagesLog) {
+    return "already-split";
+  }
+
+  if (!record.closed && options.includeActive !== true && isProcessAlive(record.pid)) {
+    return "active";
+  }
+
+  if (dryRun) {
+    return "migrated";
+  }
+
+  try {
+    await writeSessionRecordAtBoundary(record);
+    return "migrated";
+  } catch {
+    return "failed";
+  }
+}
+
+function tallyMigrateMessagesEntryResult(
+  result: MigrateMessagesResult,
+  entryResult: MigrateMessagesEntryResult,
+): void {
+  if (entryResult === "migrated") {
+    result.migrated += 1;
+  } else if (entryResult === "active") {
+    result.skippedActive += 1;
+  } else if (entryResult === "already-split") {
+    result.skippedAlreadySplit += 1;
+  } else {
+    result.failed += 1;
+  }
+}
+
 function filterPruneCandidates(
   entries: SessionIndexEntry[],
   agentCommand: string | undefined,
@@ -567,6 +706,9 @@ async function pruneSessionFiles(
 ): Promise<number> {
   const safeId = encodeURIComponent(record.acpxRecordId);
   let bytesFreed = await unlinkCountingBytes(path.join(sessionDir, `${safeId}.json`));
+  const logPath = path.join(sessionDir, messagesLogFileName(record.acpxRecordId));
+  bytesFreed += await unlinkCountingBytes(logPath);
+  bytesFreed += await unlinkCountingBytes(messagesLogStalePath(logPath));
   if (includeHistory) {
     for (const name of dirEntries.filter((entry) => isSessionStreamFile(entry, safeId))) {
       bytesFreed += await unlinkCountingBytes(path.join(sessionDir, name));
@@ -610,7 +752,7 @@ export async function closeSession(id: string): Promise<SessionRecord> {
 
   // Privileged write: closeSession is the single daemon-authorized writer of
   // lifecycle fields. See the writeSessionRecord doc comment for the rules.
-  await writeSessionRecordWithLifecycle(record);
+  await writeSessionRecordAtBoundaryWithLifecycle(record);
 
   // Also mark any subagents of this session as closed. Cascade is operational,
   // not user-intent, and runs under the same privileged write path.
@@ -622,7 +764,7 @@ export async function closeSession(id: string): Promise<SessionRecord> {
           subagentRecord.closed = true;
           subagentRecord.closedAt = now;
           subagentRecord.lastUsedAt = now;
-          await writeSessionRecordWithLifecycle(subagentRecord);
+          await writeSessionRecordAtBoundaryWithLifecycle(subagentRecord);
         }
       } catch {
         // best effort

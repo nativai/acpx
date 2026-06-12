@@ -6,6 +6,8 @@ import { z, ZodError } from "zod";
 import { AcpxOperationalError } from "../errors.js";
 import type { AcpJsonRpcMessage, SessionRecord } from "../types.js";
 import { defaultSessionEventLog, sessionEventActivePath } from "./event-log.js";
+import { setLoggedMessageCount } from "./messages-log-bookkeeping.js";
+import { messagesLogPath } from "./messages-log.js";
 import {
   findSession,
   listSessions,
@@ -15,10 +17,23 @@ import {
 
 const SUPPORTED_FORMAT_VERSION = 1;
 
+const exportedMessagesLogSchema = z.object({
+  path: z.literal(".messages.ndjson").optional(),
+  state: z.object({
+    v: z.literal(1),
+    count: z.number().int().nonnegative(),
+    base_index: z.number().int().nonnegative(),
+    bytes: z.number().int().nonnegative(),
+  }),
+  data: z.string(),
+  inline_count: z.number().int().nonnegative(),
+});
+
 const exportedSessionSchema = z.object({
   format_version: z.literal(SUPPORTED_FORMAT_VERSION),
   exported_at: z.string(),
   exported_by: z.string(),
+  messages_log: exportedMessagesLogSchema.optional(),
   session: z.object({
     record_id: z.string(),
     name: z.string().nullable(),
@@ -35,6 +50,7 @@ const exportedSessionSchema = z.object({
 });
 
 type ParsedExportedSession = z.infer<typeof exportedSessionSchema>;
+type ParsedExportedMessagesLog = NonNullable<ParsedExportedSession["messages_log"]>;
 
 export type ImportSessionOptions = {
   name?: string;
@@ -288,6 +304,32 @@ function buildImportedRecord(
   };
 }
 
+async function restoreImportedMessagesLog(
+  sessionsDir: string,
+  record: SessionRecord,
+  exportedLog: ParsedExportedMessagesLog,
+): Promise<void> {
+  const bytes = Buffer.byteLength(exportedLog.data);
+  if (bytes !== exportedLog.state.bytes) {
+    throw importError(
+      "Invalid session export archive: messages_log byte count does not match data",
+      "invalid-archive",
+    );
+  }
+  if (exportedLog.inline_count > record.messages.length) {
+    throw importError(
+      "Invalid session export archive: messages_log inline_count exceeds session.state messages",
+      "invalid-archive",
+    );
+  }
+
+  await fs.writeFile(messagesLogPath(sessionsDir, record.acpxRecordId), exportedLog.data, "utf8");
+  record.messagesLog = exportedLog.state;
+  record.messages =
+    exportedLog.inline_count === 0 ? [] : record.messages.slice(-exportedLog.inline_count);
+  setLoggedMessageCount(record, 0);
+}
+
 export async function importSession(
   archivePath: string,
   options: ImportSessionOptions = {},
@@ -315,6 +357,9 @@ export async function importSession(
 
   await assertDestinationScopeAvailable(newRecord);
   await assertProviderSessionAvailable(newRecord);
+  if (parsed.messages_log) {
+    await restoreImportedMessagesLog(sessionsDir, newRecord, parsed.messages_log);
+  }
   await writeSessionRecord(newRecord);
 
   if (parsed.history.length > 0) {

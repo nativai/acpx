@@ -1,5 +1,6 @@
 import type { SessionRecord, SubagentRef } from "../../types.js";
 import { SESSION_RECORD_SCHEMA } from "../../types.js";
+import { getLoggedMessageCount } from "../messages-log-bookkeeping.js";
 import { normalizeRuntimeSessionId } from "../runtime-session-id.js";
 
 function serializeSubagentRef(ref: SubagentRef): Record<string, unknown> {
@@ -12,11 +13,22 @@ function serializeSubagentRef(ref: SubagentRef): Record<string, unknown> {
   };
 }
 
-export function serializeSessionRecordForDisk(record: SessionRecord): Record<string, unknown> {
+export type SerializeSessionRecordForDiskOptions = {
+  messages?: "inline" | "split-tail";
+};
+
+export function serializeSessionRecordForDisk(
+  record: SessionRecord,
+  options: SerializeSessionRecordForDiskOptions = {},
+): Record<string, unknown> {
   const canonical: SessionRecord = {
     ...record,
     schema: SESSION_RECORD_SCHEMA,
   };
+  const useSplitTail = options.messages === "split-tail" && canonical.messagesLog !== undefined;
+  const messages = useSplitTail
+    ? canonical.messages.slice(getLoggedMessageCount(record))
+    : canonical.messages;
 
   return {
     schema: canonical.schema,
@@ -45,7 +57,8 @@ export function serializeSessionRecordForDisk(record: SessionRecord): Record<str
     protocol_version: canonical.protocolVersion,
     agent_capabilities: canonical.agentCapabilities,
     title: canonical.title,
-    messages: canonical.messages,
+    messages,
+    ...(useSplitTail ? { messages_log: canonical.messagesLog } : {}),
     updated_at: canonical.updated_at,
     cumulative_token_usage: canonical.cumulative_token_usage,
     request_token_usage: canonical.request_token_usage,

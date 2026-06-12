@@ -17,7 +17,7 @@ import {
   absolutePath,
   flushPendingSessionIndexUpdates,
   resolveSessionRecord,
-  writeSessionRecord,
+  writeSessionRecordAtBoundary,
 } from "../../session/persistence.js";
 import type { AcpJsonRpcMessage, SessionSendOutcome } from "../../types.js";
 import {
@@ -260,7 +260,7 @@ async function writeQueueOwnerLifecycleSnapshot(
   try {
     const record = await resolveSessionRecord(sessionId);
     applyLifecycleSnapshotToRecord(record, sharedClient.getAgentLifecycleSnapshot());
-    await writeSessionRecord(record);
+    await writeSessionRecordAtBoundary(record);
   } catch {
     // best effort - session may already be cleaned up
   }

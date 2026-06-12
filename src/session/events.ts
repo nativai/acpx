@@ -15,6 +15,7 @@ import {
 import {
   resolveSessionRecord,
   writeSessionRecord,
+  writeSessionRecordAtBoundary,
   writeSessionRecordWithPersistedLifecycle,
   type PersistedSessionLifecycle,
 } from "./persistence.js";
@@ -388,7 +389,7 @@ export class SessionEventWriter {
 
     try {
       if (options.checkpoint !== false) {
-        await writeSessionRecord(this.record);
+        await writeSessionRecordAtBoundary(this.record);
       }
     } finally {
       this.closed = true;
