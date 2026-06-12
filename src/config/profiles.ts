@@ -8,7 +8,7 @@ import {
 } from "./subscriptions.js";
 
 export type Harness = "claude" | "codex";
-export type AuthMode = "subscription" | "openrouter" | "chatgpt";
+export type AuthMode = "subscription" | "openrouter" | "chatgpt" | "claude-home";
 export type ReasoningEffort = "low" | "medium" | "high";
 
 /** Effort levels valid for OpenRouter profiles with reasoningSupported=true. */
@@ -40,6 +40,21 @@ export interface ProfileEntry {
    * `--reasoning-effort` flag accepts those values. Ignored for non-openrouter.
    */
   reasoningSupported?: boolean;
+  /**
+   * Required when authMode="claude-home": absolute HOME directory holding an
+   * interactive full-scope Claude login (NOT a CLAUDE_CONFIG_DIR — interactive
+   * Claude splits its login across <home>/.claude/ and <home>/.claude.json).
+   * Deliberately a dedicated field, not an overload of credentialSource.
+   * The path itself is not a secret, but it must never be logged together
+   * with credential contents.
+   */
+  homePath?: string;
+  /**
+   * Optional account identity (e.g. login email) carried alongside `label` so
+   * profiles sharing one billing subscription can be grouped later (UIC-4 D5).
+   * Display/grouping only — plays no role in auth resolution.
+   */
+  accountEmail?: string;
 }
 
 export interface ProfileRegistry {
@@ -63,7 +78,12 @@ function isValidHarness(value: unknown): value is Harness {
 }
 
 function isValidAuthMode(value: unknown): value is AuthMode {
-  return value === "subscription" || value === "openrouter" || value === "chatgpt";
+  return (
+    value === "subscription" ||
+    value === "openrouter" ||
+    value === "chatgpt" ||
+    value === "claude-home"
+  );
 }
 
 function isValidReasoningEffort(value: unknown): value is ReasoningEffort {
@@ -97,6 +117,10 @@ function applyOptionalProfileFields(entry: ProfileEntry, raw: Record<string, unk
   if (raw.reasoningSupported === true) {
     entry.reasoningSupported = true;
   }
+  const accountEmail = nonEmptyString(raw.accountEmail);
+  if (accountEmail !== undefined) {
+    entry.accountEmail = accountEmail;
+  }
 }
 
 /**
@@ -107,13 +131,40 @@ function applyOptionalProfileFields(entry: ProfileEntry, raw: Record<string, unk
  * - openrouter without reasoningSupported → null
  */
 export function getValidEffortsForProfile(profile: ProfileEntry): readonly string[] | null {
-  if (profile.authMode === "subscription") {
+  // claude-home runs the same interactive Claude effort ladder as subscription
+  // (the bridge maps `set effort` onto interactive Claude's --effort).
+  if (profile.authMode === "subscription" || profile.authMode === "claude-home") {
     return ["low", "medium", "high", "xhigh", "max"];
   }
   if (profile.authMode === "openrouter" && profile.reasoningSupported) {
     return OPENROUTER_REASONING_EFFORTS;
   }
   return null;
+}
+
+// A DECLARED but unrecognized authMode stays inert (null = skip the entry): a
+// registry written by a newer binary must not be misread as a subscription
+// profile (which would resolve a bogus CLAUDE_CONFIG_DIR). A missing authMode
+// still defaults to "subscription" (v1-shaped entries).
+function resolveDeclaredAuthMode(raw: unknown): AuthMode | null {
+  if (raw === undefined) {
+    return "subscription";
+  }
+  return isValidAuthMode(raw) ? raw : null;
+}
+
+// claude-home requires homePath; an entry without one is unusable — false =
+// skip the entry rather than guess. No-op for other authModes.
+function applyClaudeHomeFields(entry: ProfileEntry, raw: Record<string, unknown>): boolean {
+  if (entry.authMode !== "claude-home") {
+    return true;
+  }
+  const homePath = nonEmptyString(raw.homePath);
+  if (!homePath) {
+    return false;
+  }
+  entry.homePath = homePath;
+  return true;
 }
 
 function normalizeProfileEntry(value: unknown, homeDir: string): ProfileEntry | undefined {
@@ -124,11 +175,17 @@ function normalizeProfileEntry(value: unknown, homeDir: string): ProfileEntry | 
   if (!id) {
     return undefined;
   }
+  const authMode = resolveDeclaredAuthMode(value.authMode);
+  if (!authMode) {
+    return undefined;
+  }
   const label = nonEmptyString(value.label) ?? id;
   const harness: Harness = isValidHarness(value.harness) ? value.harness : "claude";
-  const authMode: AuthMode = isValidAuthMode(value.authMode) ? value.authMode : "subscription";
   const credentialSource = resolveCredentialSource(authMode, id, value, homeDir);
   const entry: ProfileEntry = { id, label, harness, authMode, credentialSource };
+  if (!applyClaudeHomeFields(entry, value)) {
+    return undefined;
+  }
   applyOptionalProfileFields(entry, value);
   return entry;
 }
@@ -216,6 +273,39 @@ export function findProfile(id: string, registry: ProfileRegistry): ProfileEntry
     return undefined;
   }
   return registry.profiles.find((entry) => entry.id === trimmed);
+}
+
+/**
+ * id → homePath map over ALL claude-home profiles in the registry — the value
+ * of the bridge's INDEPENDENT_CLAUDE_HOME_MAP allow-list env. Always the full
+ * map (not a single entry) so the bridge's unknown-selector diagnostics stay
+ * meaningful.
+ */
+export function buildClaudeHomeMap(registry: ProfileRegistry): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const profile of registry.profiles) {
+    if (profile.authMode === "claude-home" && profile.homePath) {
+      map[profile.id] = profile.homePath;
+    }
+  }
+  return map;
+}
+
+/**
+ * True when `profileId` names a claude-home profile in the registry. Used to
+ * exclude claude-home sessions from subscription failover (their credential is
+ * an interactive HOME, not a configDir — rewriting session_options.subscription
+ * cannot move them anywhere) and to gate the bridge `_meta` selector.
+ */
+export function isClaudeHomeProfileId(
+  profileId: string | null | undefined,
+  options?: SubscriptionLookupOptions,
+): boolean {
+  const trimmed = profileId?.trim();
+  if (!trimmed) {
+    return false;
+  }
+  return findProfile(trimmed, loadProfileRegistry(options))?.authMode === "claude-home";
 }
 
 /** Ensure the temp config dir for an openrouter session exists and return its path. */

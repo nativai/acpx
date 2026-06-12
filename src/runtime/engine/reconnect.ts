@@ -76,6 +76,17 @@ export type ConnectAndLoadSessionResult = {
 
 const SESSION_LOAD_UNSUPPORTED_CODES = new Set([-32601, -32602]);
 
+// Structured session/load rejection schema published by the independent-claude-acp
+// bridge on the error's data payload (e.g. code -32000, reason "transcript-gone"
+// for a session that never ran a turn). Recognized as fallback-safe ONLY for
+// records with zero agent messages (see shouldFallbackToNewSession): a
+// never-prompted session has nothing to lose, so recovering through a fresh
+// session/new matches what create would have done — without this, a freshly
+// created session whose owner idle-released before its first prompt is
+// permanently unpromptable (UIC-4 verification F1). A rejection AFTER real
+// turns keeps surfacing loudly — silent continuity loss is forbidden.
+const SESSION_LOAD_REJECTION_SCHEMA = "independent-claude-acp/load-session/v1";
+
 function shouldFallbackToNewSession(error: unknown, record: SessionRecord): boolean {
   if (isHardReconnectFailure(error)) {
     return false;
@@ -96,11 +107,23 @@ function isUnsupportedSessionLoadAcpError(acp: ReturnType<typeof extractAcpError
   return !!acp && SESSION_LOAD_UNSUPPORTED_CODES.has(acp.code);
 }
 
+function isStructuredSessionLoadRejection(acp: ReturnType<typeof extractAcpError>): boolean {
+  const data = acp?.data;
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return false;
+  }
+  return (data as Record<string, unknown>).schema === SESSION_LOAD_REJECTION_SCHEMA;
+}
+
 function isFallbackSafeEmptySessionError(
   error: unknown,
   acp: ReturnType<typeof extractAcpError>,
 ): boolean {
-  return isAcpQueryClosedBeforeResponseError(error) || acp?.code === -32603;
+  return (
+    isAcpQueryClosedBeforeResponseError(error) ||
+    acp?.code === -32603 ||
+    isStructuredSessionLoadRejection(acp)
+  );
 }
 
 function requiresSameSession(resumePolicy: SessionResumePolicy | undefined): boolean {
