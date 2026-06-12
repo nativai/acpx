@@ -26,6 +26,10 @@ Repo: https://github.com/openclaw/acpx
 
 ### Fixes
 
+- Runtime/reconnect: recover a never-prompted session whose `session/load` is
+  rejected with the structured `independent-claude-acp/load-session/v1` payload
+  (e.g. transcript-gone) by falling back to a fresh `session/new`; load
+  failures after real turns keep surfacing loudly.
 - CLI/sessions: map inherited Claude effort levels to the child model's supported
   range when spawning model-overridden child sessions.
 - CLI/sessions: keep Claude effort application from failing child-session

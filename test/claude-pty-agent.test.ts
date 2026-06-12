@@ -21,7 +21,20 @@ import {
   loadProfileRegistry,
 } from "../src/config/profiles.js";
 import type { SubscriptionLookupOptions } from "../src/config/subscriptions.js";
+import {
+  connectAndLoadSession,
+  type ConnectedSessionController,
+} from "../src/runtime/engine/reconnect.js";
+import { makeSessionRecord } from "./runtime-test-helpers.js";
 import { withCapturedStderrWrites } from "./tty-test-helpers.js";
+
+const F1_ACTIVE_CONTROLLER: ConnectedSessionController = {
+  hasActivePrompt: () => false,
+  requestCancelActivePrompt: async () => false,
+  setSessionMode: async () => {},
+  setSessionModel: async () => {},
+  setSessionConfigOption: async () => ({ configOptions: [] }),
+};
 
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 const DEFAULT_CLAUDE_PTY_COMMAND = "node /opt/claude-pty-acp/acp-server-transcript.mjs";
@@ -631,6 +644,56 @@ test("claude-pty advertising loadSession:true later — session/load carries the
         const loadRequest = outbound.findLast((m) => m.method === "session/load");
         assert.ok(loadRequest, "expected an outbound session/load request");
         assert.equal(loadRequest.params?._meta?.[INDEPENDENT_CLAUDE_HOME_META_KEY], "home2");
+      } finally {
+        await client.close().catch(() => {});
+      }
+    });
+  });
+});
+
+test("F1 wedge: never-prompted session + loadSession:true + transcript-gone rejection → falls back to session/new with the selector _meta", async () => {
+  await withBridgeNamedMockAgent(async (bridgeScriptPath) => {
+    await withScratchHomeRegistry(HYBRID_REGISTRY, async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      await fs.mkdir(cwd, { recursive: true });
+      // A freshly-created record: session/new ran, owner idle-released, zero turns.
+      const record = makeSessionRecord({
+        acpxRecordId: "f1-wedge-record",
+        acpSessionId: "f1-wedge-session",
+        agentCommand: `node ${JSON.stringify(bridgeScriptPath)} --load-session-transcript-gone`,
+        cwd,
+        messages: [],
+      });
+      const outbound: OutboundCapture[] = [];
+      const client = new AcpClient({
+        agentCommand: record.agentCommand,
+        cwd,
+        permissionMode: "approve-reads",
+        sessionContext: { acpxRecordId: record.acpxRecordId, profileId: "home1" },
+        onAcpMessage: (direction, message) => {
+          if (direction === "outbound") {
+            outbound.push(message as OutboundCapture);
+          }
+        },
+      });
+      try {
+        const result = await connectAndLoadSession({
+          client,
+          record,
+          activeController: F1_ACTIVE_CONTROLLER,
+        });
+        // The reconnect tried the advertised session/load first…
+        assert.ok(
+          outbound.some((m) => m.method === "session/load"),
+          "expected a session/load attempt before the fallback",
+        );
+        // …then recovered through a fresh session/new instead of wedging,
+        // and the fallback create carried the home selector again.
+        assert.equal(result.resumed, false);
+        assert.notEqual(result.sessionId, "f1-wedge-session");
+        assert.equal(record.acpSessionId, result.sessionId);
+        const newSession = outbound.findLast((m) => m.method === "session/new");
+        assert.equal(newSession?.params?._meta?.[INDEPENDENT_CLAUDE_HOME_META_KEY], "home1");
       } finally {
         await client.close().catch(() => {});
       }

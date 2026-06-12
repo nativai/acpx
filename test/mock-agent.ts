@@ -58,6 +58,7 @@ type MockAgentOptions = {
   listPageSize: number;
   closeSessionMarker?: string;
   loadSessionNotFound: boolean;
+  loadSessionTranscriptGone: boolean;
   resumeSessionNotFound: boolean;
   loadSessionFailsOnEmpty: boolean;
   setSessionModeFails: boolean;
@@ -387,6 +388,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let listPageSize = 100;
   let closeSessionMarker: string | undefined;
   let loadSessionNotFound = false;
+  let loadSessionTranscriptGone = false;
   let resumeSessionNotFound = false;
   let loadSessionFailsOnEmpty = false;
   let setSessionModeFails = false;
@@ -431,6 +433,12 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     if (token === "--load-session-not-found") {
       supportsLoadSession = true;
       loadSessionNotFound = true;
+      continue;
+    }
+
+    if (token === "--load-session-transcript-gone") {
+      supportsLoadSession = true;
+      loadSessionTranscriptGone = true;
       continue;
     }
 
@@ -580,6 +588,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     listPageSize,
     closeSessionMarker,
     loadSessionNotFound,
+    loadSessionTranscriptGone,
     resumeSessionNotFound,
     loadSessionFailsOnEmpty,
     setSessionModeFails,
@@ -879,6 +888,24 @@ class MockAgent implements Agent {
 
     if (this.options.loadSessionNotFound) {
       throw RequestError.resourceNotFound(params.sessionId);
+    }
+
+    if (this.options.loadSessionTranscriptGone) {
+      // Pinned wire shape of the independent-claude-acp bridge's session/load
+      // rejection for a never-prompted session (UIC-4 verification F1).
+      throw new RequestError(
+        -32000,
+        `session/load rejected: Claude session ${params.sessionId} is not resumable (transcript gone)`,
+        {
+          schema: "independent-claude-acp/load-session/v1",
+          reason: "transcript-gone",
+          sessionId: params.sessionId,
+          claudeSessionId: params.sessionId,
+          cwd: params.cwd,
+          homeSelector: "home1",
+          detail: `No transcript at expected path; the Claude session ${params.sessionId} is not resumable.`,
+        },
+      );
     }
 
     const existing = this.sessions.get(params.sessionId);

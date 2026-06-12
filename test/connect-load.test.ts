@@ -631,6 +631,121 @@ test("connectAndLoadSession rethrows load failures that should not create a new 
   });
 });
 
+// Pinned wire shape of the independent-claude-acp bridge's session/load
+// rejection for a never-prompted session (UIC-4 verification F1).
+const TRANSCRIPT_GONE_LOAD_ERROR = {
+  error: {
+    code: -32000,
+    message:
+      "session/load rejected: Claude session wedge-session is not resumable (transcript gone)",
+    data: {
+      schema: "independent-claude-acp/load-session/v1",
+      reason: "transcript-gone",
+      sessionId: "wedge-session",
+      claudeSessionId: "wedge-session",
+      homeSelector: "home1",
+      detail: "No transcript at expected path; the Claude session wedge-session is not resumable.",
+    },
+  },
+};
+
+test("connectAndLoadSession falls back to session/new when a NEVER-prompted session's load is rejected with the structured transcript-gone schema (F1)", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "wedge-record",
+      acpSessionId: "wedge-session",
+      agentCommand: "agent",
+      cwd,
+      messages: [], // created, owner idle-released, never prompted
+    });
+
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({
+        running: true,
+      }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
+      loadSessionWithOptions: async () => {
+        throw TRANSCRIPT_GONE_LOAD_ERROR;
+      },
+      createSession: async () => ({
+        sessionId: "unwedged-fresh",
+        agentSessionId: "unwedged-runtime",
+      }),
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+    };
+
+    const result = await connectAndLoadSession({
+      client: client as never,
+      record,
+      activeController: ACTIVE_CONTROLLER,
+    });
+
+    assert.equal(result.sessionId, "unwedged-fresh");
+    assert.equal(result.resumed, false);
+    assert.equal(record.acpSessionId, "unwedged-fresh");
+  });
+});
+
+test("connectAndLoadSession keeps a transcript-gone rejection LOUD after real turns (no silent continuity loss)", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "lost-history-record",
+      acpSessionId: "wedge-session",
+      agentCommand: "agent",
+      cwd,
+      messages: [
+        {
+          Agent: {
+            content: [{ Text: "real prior turn" }],
+            tool_results: {},
+          },
+        },
+      ],
+    });
+
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({
+        running: true,
+      }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
+      loadSessionWithOptions: async () => {
+        throw TRANSCRIPT_GONE_LOAD_ERROR;
+      },
+      createSession: async () => {
+        throw new Error("createSession must not be called for a session with real history");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+    };
+
+    await assert.rejects(
+      async () =>
+        await connectAndLoadSession({
+          client: client as never,
+          record,
+          activeController: ACTIVE_CONTROLLER,
+        }),
+      (error: unknown) => {
+        assert.deepEqual(error, TRANSCRIPT_GONE_LOAD_ERROR);
+        return true;
+      },
+    );
+  });
+});
+
 test("connectAndLoadSession fails when desired mode replay cannot be restored on a fresh session", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
