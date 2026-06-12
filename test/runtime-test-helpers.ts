@@ -95,6 +95,18 @@ export async function withTempHome<T>(
   }
 }
 
+export function assertTempHomeActive(): string {
+  const home = process.env.HOME;
+  assertTempHomePath(home);
+  return home;
+}
+
+export function assertTempHomePath(homeDir: string | undefined): asserts homeDir is string {
+  if (!homeDir || !path.resolve(homeDir).startsWith(path.resolve(os.tmpdir()) + path.sep)) {
+    throw new Error("test attempted to touch the acpx session store without a temp HOME");
+  }
+}
+
 export function sessionFilePath(homeDir: string, acpxRecordId: string): string {
   return path.join(homeDir, ".acpx", "sessions", `${encodeURIComponent(acpxRecordId)}.json`);
 }
@@ -103,6 +115,7 @@ export async function writeSessionRecordFile(
   homeDir: string,
   record: SessionRecord,
 ): Promise<void> {
+  assertTempHomePath(homeDir);
   const filePath = sessionFilePath(homeDir, record.acpxRecordId);
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   await fs.writeFile(
