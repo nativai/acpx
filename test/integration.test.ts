@@ -2955,11 +2955,31 @@ test("integration: prompt recovers when loadSession fails on empty session witho
         acp_session_id?: string;
         messages?: unknown[];
       };
+      const storedMessages = Array.isArray(storedRecord.messages) ? storedRecord.messages : [];
+      const messagesLogPath = path.join(
+        homeDir,
+        ".acpx",
+        "sessions",
+        `${encodeURIComponent(originalSessionId as string)}.messages.ndjson`,
+      );
+      const loggedMessages = await fs
+        .readFile(messagesLogPath, "utf8")
+        .then((payload) =>
+          payload
+            .split("\n")
+            .filter((line) => line.length > 0)
+            .map((line) => JSON.parse(line) as unknown),
+        )
+        .catch((error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") {
+            return [];
+          }
+          throw error;
+        });
 
       assert.notEqual(storedRecord.acp_session_id, originalSessionId);
-      const messages = Array.isArray(storedRecord.messages) ? storedRecord.messages : [];
       assert.equal(
-        messages.some(
+        [...loggedMessages, ...storedMessages].some(
           (message) =>
             typeof message === "object" &&
             message !== null &&

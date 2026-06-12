@@ -29,6 +29,10 @@ function makeSessionRecord(
   return makeSessionRecordFixture(overrides, { defaultName: false, defaultAcpx: false });
 }
 
+function messagesLogPath(homeDir: string, recordId: string): string {
+  return path.join(homeDir, ".acpx", "sessions", `${encodeURIComponent(recordId)}.messages.ndjson`);
+}
+
 test("pruneSessions returns empty result when no closed sessions exist", async () => {
   await withTempHome(async (homeDir) => {
     const session = await loadSessionModule();
@@ -78,6 +82,39 @@ test("pruneSessions deletes closed session files and removes them from the index
     assert.ok(result.bytesFreed > 0);
     assert.equal(result.dryRun, false);
     assert.ok(!(await fileExists(filePath)));
+  });
+});
+
+test("pruneSessions deletes message log sidecars with the closed session record", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "closed-with-log",
+        acpSessionId: "closed-with-log",
+        agentCommand: "agent-a",
+        cwd,
+        closed: true,
+        closedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    const logPath = messagesLogPath(homeDir, "closed-with-log");
+    await fs.writeFile(logPath, '{"User":{"id":"u1","content":[{"Text":"hi"}]}}\n', "utf8");
+    await fs.writeFile(
+      `${logPath}.stale`,
+      '{"User":{"id":"stale","content":[{"Text":"old"}]}}\n',
+      "utf8",
+    );
+
+    const result = await session.pruneSessions({ agentCommand: "agent-a" });
+
+    assert.equal(result.pruned.length, 1);
+    assert.ok(!(await fileExists(sessionFilePath(homeDir, "closed-with-log"))));
+    assert.ok(!(await fileExists(logPath)));
+    assert.ok(!(await fileExists(`${logPath}.stale`)));
   });
 });
 
