@@ -141,3 +141,53 @@ test("a live fresh foreign lock makes the caller proceed unlocked after ~2 s", a
     }
   });
 });
+
+test("a directory squatting the lock path does not busy-spin: proceed unlocked after ~2 s", async () => {
+  await withSessionDir(async (sessionDir) => {
+    const lockPath = sessionIndexLockPath(sessionDir);
+    // EEXIST on create, EISDIR on read, EPERM/EISDIR on unlink — the shape
+    // that used to retry-immediately forever (te-w2b finding).
+    await fs.mkdir(lockPath);
+
+    const startedAt = Date.now();
+    let ran = false;
+    await withSessionIndexLock(sessionDir, async () => {
+      ran = true;
+    });
+    const waited = Date.now() - startedAt;
+    assert.equal(ran, true, "must proceed without the lock instead of spinning");
+    assert.ok(waited >= 1900, `must run the normal backoff (waited ${waited} ms)`);
+    assert.ok(waited < 4000, `must not spin past the 2 s bound (waited ${waited} ms)`);
+    // The squatting directory was not ours to remove.
+    const stat = await fs.stat(lockPath);
+    assert.equal(stat.isDirectory(), true);
+  });
+});
+
+test("an unreadable lock file does not busy-spin: proceed unlocked after ~2 s", async (t) => {
+  if (process.getuid?.() === 0) {
+    t.skip("running as root — chmod 000 does not produce EACCES");
+    return;
+  }
+  await withSessionDir(async (sessionDir) => {
+    const lockPath = sessionIndexLockPath(sessionDir);
+    // Fresh live-pid body, but unreadable: EEXIST on create, EACCES on read.
+    await fs.writeFile(lockPath, `${JSON.stringify({ pid: 1, ts: new Date().toISOString() })}\n`);
+    await fs.chmod(lockPath, 0o000);
+
+    try {
+      const startedAt = Date.now();
+      let ran = false;
+      await withSessionIndexLock(sessionDir, async () => {
+        ran = true;
+      });
+      const waited = Date.now() - startedAt;
+      assert.equal(ran, true, "must proceed without the lock instead of spinning");
+      assert.ok(waited >= 1900, `must run the normal backoff (waited ${waited} ms)`);
+      assert.ok(waited < 4000, `must not spin past the 2 s bound (waited ${waited} ms)`);
+      assert.equal(await fileExists(lockPath), true, "foreign lock must be left in place");
+    } finally {
+      await fs.chmod(lockPath, 0o644).catch(() => {});
+    }
+  });
+});

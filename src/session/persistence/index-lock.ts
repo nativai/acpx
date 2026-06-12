@@ -76,9 +76,16 @@ async function takeOverStaleLock(lockPath: string): Promise<boolean> {
     }
     await fs.unlink(lockPath);
     return true;
-  } catch {
-    // Lock vanished (holder released) or is unreadable — retry immediately.
-    return true;
+  } catch (error) {
+    // ENOENT only: the holder released between our EEXIST and this read —
+    // safe to retry the create immediately. Any OTHER error (EISDIR when a
+    // directory squats the lock path, EACCES on an unreadable lock, a failed
+    // unlink, ...) must NOT short-circuit back to the create: the
+    // retry-immediately `continue` skips the caller's deadline check and
+    // backoff sleep, so a persistent error becomes a busy spin and the write
+    // never completes. Report no-takeover instead — the caller backs off and
+    // proceeds unlocked after ~2 s.
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
   }
 }
 
