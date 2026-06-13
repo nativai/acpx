@@ -595,6 +595,27 @@ test("sessions copy creates a full same-agent copy with lineage and metadata", a
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
     await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    const sub1Dir = path.join(homeDir, ".acpx", "subscriptions", "sub1");
+    await fs.mkdir(sub1Dir, { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "subscriptions", "registry.json"),
+      `${JSON.stringify(
+        {
+          profiles: [
+            {
+              id: "sub1",
+              label: "Sub One",
+              authMode: "subscription",
+              account: "acct-sub1",
+              credentialSource: sub1Dir,
+            },
+          ],
+        },
+        null,
+        2,
+      )}\n`,
+      { mode: 0o600 },
+    );
     await fs.writeFile(
       path.join(homeDir, ".acpx", "config.json"),
       `${JSON.stringify(

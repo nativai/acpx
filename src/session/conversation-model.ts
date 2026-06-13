@@ -632,6 +632,9 @@ function cloneSessionOptions(
     ...(options.subscription_switch !== undefined
       ? { subscription_switch: { ...options.subscription_switch } }
       : {}),
+    ...(options.account_switch !== undefined
+      ? { account_switch: { ...options.account_switch } }
+      : {}),
   };
 }
 

@@ -7,6 +7,9 @@ import { parseOutputFormat, resolveGlobalFlags } from "./flags.js";
 type ProfileDisplayEntry = {
   id: string;
   label: string;
+  account: string;
+  accountEmail: string | null;
+  adapter: string;
   authMode: string;
   model: string | null;
   reasoningSupported: boolean;
@@ -17,11 +20,26 @@ function toDisplayEntry(p: ProfileEntry): ProfileDisplayEntry {
   return {
     id: p.id,
     label: p.label,
+    account: p.account,
+    accountEmail: p.accountEmail ?? null,
+    adapter: p.adapter,
     authMode: p.authMode,
     model: p.model ?? null,
     reasoningSupported: p.authMode === "openrouter" ? (p.reasoningSupported ?? false) : false,
     validEfforts: getValidEffortsForProfile(p),
   };
+}
+
+function renderProfileListEntry(entry: ProfileDisplayEntry, defaultId?: string): string {
+  const marker = entry.id === defaultId ? "*" : " ";
+  const efforts = entry.validEfforts ? entry.validEfforts.join("/") : "n/a";
+  const model = entry.model ? `  model=${entry.model}` : "";
+  const email = entry.accountEmail ? ` (${entry.accountEmail})` : "";
+  return (
+    `  ${marker} ${entry.id}\t[${entry.adapter}/${entry.authMode}]\t${entry.label}${model}\n` +
+    `      account: ${entry.account}${email}\n` +
+    `      reasoning: ${entry.reasoningSupported ? "supported" : "not supported"}  valid-efforts: ${efforts}\n`
+  );
 }
 
 function renderProfilesListText(entries: ProfileDisplayEntry[], defaultId?: string): string {
@@ -30,11 +48,7 @@ function renderProfilesListText(entries: ProfileDisplayEntry[], defaultId?: stri
   }
   let out = `Profiles (default: ${defaultId ?? "-"}):\n`;
   for (const e of entries) {
-    const marker = e.id === defaultId ? "*" : " ";
-    const efforts = e.validEfforts ? e.validEfforts.join("/") : "n/a";
-    const model = e.model ? `  model=${e.model}` : "";
-    out += `  ${marker} ${e.id}\t[${e.authMode}]\t${e.label}${model}\n`;
-    out += `      reasoning: ${e.reasoningSupported ? "supported" : "not supported"}  valid-efforts: ${efforts}\n`;
+    out += renderProfileListEntry(e, defaultId);
   }
   return out;
 }
@@ -80,6 +94,9 @@ function handleProfileShow(command: Command, id: string, config: ResolvedAcpxCon
   process.stdout.write(
     `Profile: ${entry.id}\n` +
       `  label:            ${entry.label}\n` +
+      `  account:          ${entry.account}\n` +
+      `  accountEmail:     ${entry.accountEmail ?? "-"}\n` +
+      `  adapter:          ${entry.adapter}\n` +
       `  authMode:         ${entry.authMode}\n` +
       `  model:            ${entry.model ?? "-"}\n` +
       `  reasoningSupported: ${String(entry.reasoningSupported)}\n` +

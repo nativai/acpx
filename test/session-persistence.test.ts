@@ -502,6 +502,75 @@ test("findSession and findSessionByDirectoryWalk resolve expected records", asyn
   });
 });
 
+test("findSession routes by stable agentName when command changes", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+
+    const repoRoot = path.join(homeDir, "repo");
+    const nestedDir = path.join(repoRoot, "src");
+    const legacyDir = path.join(homeDir, "legacy");
+
+    await fs.mkdir(path.join(repoRoot, ".git"), { recursive: true });
+    await fs.mkdir(nestedDir, { recursive: true });
+    await fs.mkdir(legacyDir, { recursive: true });
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "stable-agent-session",
+        acpSessionId: "stable-agent-session",
+        agentName: "claude",
+        agentCommand: "npx @old/claude-agent-acp",
+        cwd: repoRoot,
+      }),
+    );
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "legacy-command-session",
+        acpSessionId: "legacy-command-session",
+        agentCommand: "legacy-agent-command",
+        cwd: legacyDir,
+      }),
+    );
+
+    const found = await session.findSession({
+      agentName: "claude",
+      agentCommand: "npx @new/claude-agent-acp",
+      cwd: repoRoot,
+    });
+    assert.equal(found?.acpxRecordId, "stable-agent-session");
+
+    const walked = await session.findSessionByDirectoryWalk({
+      agentName: "claude",
+      agentCommand: "npx @new/claude-agent-acp",
+      cwd: nestedDir,
+      boundary: repoRoot,
+    });
+    assert.equal(walked?.acpxRecordId, "stable-agent-session");
+
+    const listed = await session.listSessionsForAgent("npx @new/claude-agent-acp", "claude");
+    assert.deepEqual(
+      listed.map((record) => record.acpxRecordId),
+      ["stable-agent-session"],
+    );
+
+    const legacyFallback = await session.findSession({
+      agentName: "claude",
+      agentCommand: "legacy-agent-command",
+      cwd: legacyDir,
+    });
+    assert.equal(legacyFallback?.acpxRecordId, "legacy-command-session");
+
+    const legacyMissAfterCommandChange = await session.findSession({
+      agentName: "claude",
+      agentCommand: "renamed-legacy-agent-command",
+      cwd: legacyDir,
+    });
+    assert.equal(legacyMissAfterCommandChange, undefined);
+  });
+});
+
 test("writeSessionRecord maintains an index and listSessions rebuilds it when missing", async () => {
   await withTempHome(async (homeDir) => {
     const session = await loadSessionModule();

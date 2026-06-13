@@ -13,10 +13,20 @@ export type SessionIndexSubscriptionSwitch = {
   at: string;
 };
 
+export type SessionIndexAccountSwitch = {
+  fromProfile?: string;
+  toProfile: string;
+  fromAccount?: string;
+  toAccount: string;
+  reason: "manual" | "failover";
+  at: string;
+};
+
 export type SessionIndexEntry = {
   file: string;
   acpxRecordId: string;
   acpSessionId: string;
+  agentName?: string;
   agentCommand: string;
   cwd: string;
   name?: string;
@@ -53,6 +63,7 @@ export type SessionIndexEntry = {
   subscription?: string;
   profile?: string;
   subscriptionSwitch?: SessionIndexSubscriptionSwitch;
+  accountSwitch?: SessionIndexAccountSwitch;
   templateEnabled?: boolean;
   templateCreatedAt?: string;
 };
@@ -100,6 +111,37 @@ function parseIndexSubscriptionSwitch(value: unknown): SessionIndexSubscriptionS
   };
 }
 
+function isValidIndexAccountSwitch(record: Record<string, unknown>): record is {
+  fromProfile?: string;
+  toProfile: string;
+  fromAccount?: string;
+  toAccount: string;
+  reason: "manual" | "failover";
+  at: string;
+} {
+  return (
+    typeof record.toProfile === "string" &&
+    typeof record.toAccount === "string" &&
+    (record.reason === "manual" || record.reason === "failover") &&
+    typeof record.at === "string"
+  );
+}
+
+function parseIndexAccountSwitch(value: unknown): SessionIndexAccountSwitch | undefined {
+  const record = asRecord(value);
+  if (!record || !isValidIndexAccountSwitch(record)) {
+    return undefined;
+  }
+  return {
+    ...(typeof record.fromProfile === "string" ? { fromProfile: record.fromProfile } : {}),
+    toProfile: record.toProfile,
+    ...(typeof record.fromAccount === "string" ? { fromAccount: record.fromAccount } : {}),
+    toAccount: record.toAccount,
+    reason: record.reason,
+    at: record.at,
+  };
+}
+
 // eslint-disable-next-line complexity -- flat field-by-field projection of the optional hot-path enrichment scalars; linear, not branchy logic
 function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
   const record = asRecord(raw);
@@ -125,6 +167,7 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     file: record.file,
     acpxRecordId: record.acpxRecordId,
     acpSessionId: record.acpSessionId,
+    agentName: optionalString(record.agentName),
     agentCommand: record.agentCommand,
     cwd: record.cwd,
     name: record.name,
@@ -148,6 +191,7 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     subscription: optionalString(record.subscription),
     profile: optionalString(record.profile),
     subscriptionSwitch: parseIndexSubscriptionSwitch(record.subscriptionSwitch),
+    accountSwitch: parseIndexAccountSwitch(record.accountSwitch),
     templateEnabled: optionalBoolean(record.templateEnabled),
     templateCreatedAt: optionalString(record.templateCreatedAt),
   };
@@ -160,6 +204,7 @@ function hasRequiredIndexEntryFields(record: Record<string, unknown>): record is
   file: string;
   acpxRecordId: string;
   acpSessionId: string;
+  agentName?: string;
   agentCommand: string;
   cwd: string;
   lastUsedAt: string;
@@ -189,6 +234,7 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     file: fileName,
     acpxRecordId: record.acpxRecordId,
     acpSessionId: record.acpSessionId,
+    agentName: record.agentName,
     agentCommand: record.agentCommand,
     cwd: record.cwd,
     name: record.name,
@@ -212,6 +258,7 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     subscription: sessionOptions?.subscription,
     profile: sessionOptions?.profile,
     subscriptionSwitch: sessionOptions?.subscription_switch,
+    accountSwitch: sessionOptions?.account_switch,
     templateEnabled: record.template?.enabled,
     templateCreatedAt: record.template?.created_at,
   };

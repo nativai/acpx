@@ -35,6 +35,7 @@ export function serializeSessionRecordForDisk(
     acpx_record_id: canonical.acpxRecordId,
     acp_session_id: canonical.acpSessionId,
     agent_session_id: normalizeRuntimeSessionId(canonical.agentSessionId),
+    agent_name: canonical.agentName,
     agent_command: canonical.agentCommand,
     cwd: canonical.cwd,
     name: canonical.name,

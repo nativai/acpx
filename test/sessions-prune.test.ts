@@ -270,6 +270,48 @@ test("pruneSessions scoped to agentCommand only prunes that agent's sessions", a
   });
 });
 
+test("pruneSessions scopes by stable agentName when command changes", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "stable-claude-session",
+        acpSessionId: "stable-claude-session",
+        agentName: "claude",
+        agentCommand: "npx @old/claude-agent-acp",
+        cwd,
+        closed: true,
+        closedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "other-agent-session",
+        acpSessionId: "other-agent-session",
+        agentName: "codex",
+        agentCommand: "npx @agentclientprotocol/codex-acp",
+        cwd,
+        closed: true,
+        closedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    const result = await session.pruneSessions({
+      agentCommand: "npx @new/claude-agent-acp",
+      agentName: "claude",
+    });
+    assert.equal(result.pruned.length, 1);
+    assert.equal(result.pruned[0].acpxRecordId, "stable-claude-session");
+    assert.ok(!(await fileExists(sessionFilePath(homeDir, "stable-claude-session"))));
+    assert.ok(await fileExists(sessionFilePath(homeDir, "other-agent-session")));
+  });
+});
+
 test("pruneSessions --include-history deletes stream files", async () => {
   await withTempHome(async (homeDir) => {
     const session = await loadSessionModule();

@@ -57,12 +57,9 @@ export function persistSessionOptions(
   // flag, so it is absent from SessionAgentOptions). Carry it forward across a
   // re-persist (e.g. a model change next turn) so a manual/failover switch
   // stays visible; a subsequent switch overwrites it via switchSessionSubscription.
-  const priorSwitch = record.acpx?.session_options?.subscription_switch;
-  const next = options === undefined ? undefined : persistedSessionOptions(options);
+  const breadcrumbs = switchBreadcrumbs(record);
+  const next = persistedSessionOptionsWithBreadcrumbs(options, breadcrumbs);
   if (next !== undefined) {
-    if (priorSwitch !== undefined) {
-      next.subscription_switch = priorSwitch;
-    }
     record.acpx = {
       ...record.acpx,
       session_options: next,
@@ -70,19 +67,59 @@ export function persistSessionOptions(
     return;
   }
 
+  clearPersistedSessionOptions(record);
+}
+
+type SwitchBreadcrumbs = {
+  subscriptionSwitch: PersistedSessionOptions["subscription_switch"];
+  accountSwitch: PersistedSessionOptions["account_switch"];
+};
+
+function switchBreadcrumbs(record: SessionRecord): SwitchBreadcrumbs {
+  return {
+    subscriptionSwitch: record.acpx?.session_options?.subscription_switch,
+    accountSwitch: record.acpx?.session_options?.account_switch,
+  };
+}
+
+function persistedSessionOptionsWithBreadcrumbs(
+  options: SessionAgentOptions | undefined,
+  breadcrumbs: SwitchBreadcrumbs,
+): PersistedSessionOptions | undefined {
+  const next = options === undefined ? undefined : persistedSessionOptions(options);
+  if (next !== undefined) {
+    assignSwitchBreadcrumbs(next, breadcrumbs.subscriptionSwitch, breadcrumbs.accountSwitch);
+    return next;
+  }
+  return switchBreadcrumbSessionOptions(breadcrumbs.subscriptionSwitch, breadcrumbs.accountSwitch);
+}
+
+function clearPersistedSessionOptions(record: SessionRecord): void {
+  if (record.acpx) {
+    delete record.acpx.session_options;
+  }
+}
+
+function assignSwitchBreadcrumbs(
+  target: PersistedSessionOptions,
+  priorSwitch: PersistedSessionOptions["subscription_switch"],
+  priorAccountSwitch: PersistedSessionOptions["account_switch"],
+): void {
   if (priorSwitch !== undefined) {
-    record.acpx = {
-      ...record.acpx,
-      session_options: { subscription_switch: priorSwitch },
-    };
-    return;
+    target.subscription_switch = priorSwitch;
   }
-
-  if (!record.acpx) {
-    return;
+  if (priorAccountSwitch !== undefined) {
+    target.account_switch = priorAccountSwitch;
   }
+}
 
-  delete record.acpx.session_options;
+function switchBreadcrumbSessionOptions(
+  priorSwitch: PersistedSessionOptions["subscription_switch"],
+  priorAccountSwitch: PersistedSessionOptions["account_switch"],
+): PersistedSessionOptions | undefined {
+  const next: PersistedSessionOptions = {};
+  assignSwitchBreadcrumbs(next, priorSwitch, priorAccountSwitch);
+  return Object.keys(next).length > 0 ? next : undefined;
 }
 
 export function sessionOptionsFromRecord(record: SessionRecord): SessionAgentOptions | undefined {

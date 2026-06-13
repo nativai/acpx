@@ -36,6 +36,7 @@ export const DEFAULT_HISTORY_LIMIT = 20;
 
 type FindSessionOptions = {
   agentCommand: string;
+  agentName?: string;
   cwd: string;
   name?: string;
   includeClosed?: boolean;
@@ -43,6 +44,7 @@ type FindSessionOptions = {
 
 type FindSessionByDirectoryWalkOptions = {
   agentCommand: string;
+  agentName?: string;
   cwd: string;
   name?: string;
   boundary?: string;
@@ -105,6 +107,17 @@ function matchesSessionEntry(
     return session.name == null;
   }
   return session.name === normalizedName;
+}
+
+function matchesAgentIdentity(
+  session: Pick<SessionIndexEntry, "agentCommand" | "agentName">,
+  agentCommand: string,
+  agentName: string | undefined,
+): boolean {
+  if (agentName && session.agentName) {
+    return session.agentName === agentName;
+  }
+  return session.agentCommand === agentCommand;
 }
 
 export type PersistedSessionLifecycle = {
@@ -414,9 +427,13 @@ export async function listSessions(): Promise<SessionRecord[]> {
   return records;
 }
 
-export async function listSessionsForAgent(agentCommand: string): Promise<SessionRecord[]> {
+export async function listSessionsForAgent(
+  agentCommand: string,
+  agentName?: string,
+): Promise<SessionRecord[]> {
   const entries = (await loadSessionIndexEntries()).filter(
-    (session) => session.agentCommand === agentCommand && session.kind !== "subagent",
+    (session) =>
+      matchesAgentIdentity(session, agentCommand, agentName) && session.kind !== "subagent",
   );
   const records = await Promise.all(entries.map((entry) => loadRecordFromIndexEntry(entry)));
   return records
@@ -443,7 +460,7 @@ export async function findSession(options: FindSessionOptions): Promise<SessionR
   const entries = await loadSessionIndexEntries();
   const match = entries.find(
     (session) =>
-      session.agentCommand === options.agentCommand &&
+      matchesAgentIdentity(session, options.agentCommand, options.agentName) &&
       matchesSessionEntry(session, normalizedCwd, normalizedName, options.includeClosed),
   );
   if (!match) {
@@ -461,8 +478,8 @@ export async function findSessionByDirectoryWalk(
   const walkBoundary = isWithinBoundary(normalizedBoundary, normalizedStart)
     ? normalizedBoundary
     : normalizedStart;
-  const sessions = (await loadSessionIndexEntries()).filter(
-    (session) => session.agentCommand === options.agentCommand,
+  const sessions = (await loadSessionIndexEntries()).filter((session) =>
+    matchesAgentIdentity(session, options.agentCommand, options.agentName),
   );
 
   let current = normalizedStart;
@@ -514,6 +531,7 @@ function killSignalCandidates(signal: NodeJS.Signals | undefined): NodeJS.Signal
 
 export type PruneOptions = {
   agentCommand?: string;
+  agentName?: string;
   before?: Date;
   olderThanMs?: number;
   includeHistory?: boolean;
@@ -558,7 +576,7 @@ export async function pruneSessions(options: PruneOptions = {}): Promise<PruneRe
   await ensureSessionDir();
   const entries = await loadSessionIndexEntries();
 
-  const eligible = filterPruneCandidates(entries, options.agentCommand);
+  const eligible = filterPruneCandidates(entries, options.agentCommand, options.agentName);
 
   const cutoff =
     options.before ??
@@ -673,9 +691,11 @@ function tallyMigrateMessagesEntryResult(
 function filterPruneCandidates(
   entries: SessionIndexEntry[],
   agentCommand: string | undefined,
+  agentName: string | undefined,
 ): SessionIndexEntry[] {
   return entries.filter(
-    (entry) => entry.closed && (!agentCommand || entry.agentCommand === agentCommand),
+    (entry) =>
+      entry.closed && (!agentCommand || matchesAgentIdentity(entry, agentCommand, agentName)),
   );
 }
 
