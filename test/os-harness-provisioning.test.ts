@@ -8,6 +8,7 @@ import {
   applyProfileAuth,
   buildAgentSpawnOptions,
 } from "../src/acp/auth-env.js";
+import { AcpClient } from "../src/acp/client.js";
 import {
   ensureProfileOsHarnessProvisioning,
   type ProvisioningWarningBreadcrumb,
@@ -21,6 +22,9 @@ import { withCapturedStderrWrites } from "./tty-test-helpers.js";
 const SDK_CLAUDE_COMMAND = "node /opt/claude-agent-acp/dist/index.js";
 const CLAUDE_PTY_COMMAND = "node /opt/claude-pty-acp/acp-server-transcript.mjs";
 const CODEX_COMMAND = "node /opt/codex-acp/dist/index.js";
+const BRIDGE_SCRIPT_PATH =
+  process.env.ACPX_CLAUDE_PTY_BRIDGE_SCRIPT ??
+  "/workspace/projects/claude-pty-acp/main/acp-server-transcript.mjs";
 
 type HarnessFixture = {
   root: string;
@@ -104,6 +108,29 @@ async function readJson(filePath: string): Promise<Record<string, unknown>> {
   return JSON.parse(await fs.readFile(filePath, "utf8")) as Record<string, unknown>;
 }
 
+function snapshotEnv(keys: string[]): Map<string, string | undefined> {
+  return new Map(keys.map((key) => [key, process.env[key]]));
+}
+
+function restoreEnv(snapshot: Map<string, string | undefined>): void {
+  for (const [key, value] of snapshot.entries()) {
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+}
+
+function settingSourcesFromArgv(argv: unknown[] | undefined): string | undefined {
+  if (!Array.isArray(argv)) {
+    return undefined;
+  }
+  const index = argv.findIndex((entry) => entry === "--setting-sources");
+  const value = index >= 0 ? argv[index + 1] : undefined;
+  return typeof value === "string" ? value : undefined;
+}
+
 async function assertSymlinkTarget(linkPath: string, targetPath: string): Promise<void> {
   const stat = await fs.lstat(linkPath);
   assert.equal(stat.isSymbolicLink(), true, `${linkPath} should be a symlink`);
@@ -117,6 +144,87 @@ async function listDirNames(dir: string): Promise<string[]> {
   } catch {
     return [];
   }
+}
+
+async function commandExists(command: string): Promise<boolean> {
+  for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+    if (!dir) {
+      continue;
+    }
+    if (await fileExists(path.join(dir, command))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function writeFakeClaude(filePath: string): Promise<void> {
+  const script = [
+    "#!/usr/bin/env node",
+    "import fs from 'node:fs';",
+    "import path from 'node:path';",
+    "import { randomUUID } from 'node:crypto';",
+    "",
+    "function argValue(name) {",
+    "  const index = process.argv.indexOf(name);",
+    "  return index >= 0 ? process.argv[index + 1] : undefined;",
+    "}",
+    "",
+    "function cwdSlug(cwd) {",
+    "  return path.resolve(cwd).replace(/\\//g, '-');",
+    "}",
+    "",
+    "function settingsContainPrimer(settingSources) {",
+    "  if (!String(settingSources || '').split(',').includes('user')) return false;",
+    "  try {",
+    "    const settingsPath = path.join(process.env.HOME || process.cwd(), '.claude', 'settings.json');",
+    "    return JSON.stringify(JSON.parse(fs.readFileSync(settingsPath, 'utf8'))).includes('nativai-os-primer');",
+    "  } catch {",
+    "    return false;",
+    "  }",
+    "}",
+    "",
+    "const sessionId = argValue('--session-id') || randomUUID();",
+    "const hasPrimer = settingsContainPrimer(argValue('--setting-sources'));",
+    "const homeDir = process.env.HOME || process.cwd();",
+    "const transcriptPath = path.join(homeDir, '.claude', 'projects', cwdSlug(process.cwd()), sessionId + '.jsonl');",
+    "fs.mkdirSync(path.dirname(transcriptPath), { recursive: true });",
+    "fs.writeFileSync(path.join(homeDir, '.claude', 'fake-claude-argv.json'), JSON.stringify(process.argv.slice(2), null, 2) + '\\n');",
+    "process.stdout.write('Try \"help\"\\n> ');",
+    "",
+    "let buffer = '';",
+    "let responded = false;",
+    "",
+    "function appendFirstTurn() {",
+    "  if (responded) return;",
+    "  responded = true;",
+    "  const text = hasPrimer ? 'nativai-os-primer delivered on first bridge turn' : 'missing primer';",
+    "  const record = {",
+    "    type: 'assistant',",
+    "    uuid: randomUUID(),",
+    "    sessionId,",
+    "    timestamp: new Date().toISOString(),",
+    "    message: {",
+    "      role: 'assistant',",
+    "      content: [{ type: 'text', text }],",
+    "      stop_reason: 'end_turn',",
+    "    },",
+    "  };",
+    "  fs.appendFileSync(transcriptPath, JSON.stringify(record) + '\\n');",
+    "  process.stdout.write('\\n' + text + '\\nTry \"help\"\\n> ');",
+    "}",
+    "",
+    "process.stdin.setEncoding('utf8');",
+    "process.stdin.on('data', (chunk) => {",
+    "  buffer += chunk;",
+    "  if (buffer.includes('FIRST_BRIDGE_TURN')) appendFirstTurn();",
+    "});",
+    "process.stdin.on('end', () => process.exit(0));",
+    "process.on('SIGTERM', () => process.exit(0));",
+    "setInterval(() => {}, 1000);",
+    "",
+  ].join("\n");
+  await fs.writeFile(filePath, script, { mode: 0o755 });
 }
 
 test("W2 provisioning: subscription anchors symlink entries, rerun is idempotent, and dangling links self-heal", async () => {
@@ -190,6 +298,108 @@ test("W2 provisioning: subscription anchors symlink entries, rerun is idempotent
     await assertSymlinkTarget(path.join(subDir, "skills"), path.join(fixture.sourceDir, "skills"));
   });
 });
+
+test(
+  "W2 provisioning: claude-pty bridge loads provisioned user hook on first turn",
+  { timeout: 30_000 },
+  async (t) => {
+    if (!(await fileExists(BRIDGE_SCRIPT_PATH))) {
+      t.skip(`claude-pty bridge script not found: ${BRIDGE_SCRIPT_PATH}`);
+      return;
+    }
+    if (!(await commandExists("tmux"))) {
+      t.skip("tmux is required for claude-pty bridge regression");
+      return;
+    }
+
+    await withHarnessFixture(async (fixture) => {
+      const cwd = path.join(fixture.root, "bridge-cwd");
+      const homePath = path.join(fixture.root, "bridge-home");
+      const claudeDir = path.join(homePath, ".claude");
+      const fakeClaudePath = path.join(fixture.root, "fake-claude.mjs");
+      await fs.mkdir(cwd, { recursive: true });
+      await fs.mkdir(claudeDir, { recursive: true });
+      await fs.writeFile(path.join(claudeDir, ".credentials.json"), "{}\n", { mode: 0o600 });
+      await writeFakeClaude(fakeClaudePath);
+      await writeRegistry(
+        fixture.registryPath,
+        registryWithProvisioning(fixture.sourceDir, [
+          {
+            id: "home1",
+            label: "Interactive bridge",
+            authMode: "claude-home",
+            homePath,
+          },
+        ]),
+      );
+
+      const previousEnv = snapshotEnv([
+        "HOME",
+        "CLAUDE_BIN",
+        "M2_RUNTIME_ROOT",
+        "M2_SERVER_LOG",
+        "ACP_SDK_DIST",
+        "E7_STARTUP_READY_TIMEOUT_MS",
+        "E7_PROMPT_READY_TIMEOUT_MS",
+        "E7_TURN_TIMEOUT_MS",
+        "E7_STARTUP_LIVENESS_GRACE_MS",
+        "E7_PROMPT_SUBMIT_DELAY_MS",
+        "E7_PROMPT_SUBMIT_CONFIRM_MS",
+      ]);
+      const updates: unknown[] = [];
+      const client = new AcpClient({
+        agentCommand: `node ${JSON.stringify(BRIDGE_SCRIPT_PATH)}`,
+        cwd,
+        permissionMode: "approve-reads",
+        suppressSdkConsoleErrors: true,
+        sessionContext: { acpxRecordId: "bridge-hook-regression", profileId: "home1" },
+        onSessionUpdate: (notification) => {
+          updates.push(notification);
+        },
+      });
+
+      try {
+        process.env.HOME = fixture.homeDir;
+        process.env.CLAUDE_BIN = fakeClaudePath;
+        process.env.M2_RUNTIME_ROOT = path.join(fixture.root, "bridge-runtime");
+        process.env.M2_SERVER_LOG = path.join(fixture.root, "bridge.log");
+        process.env.ACP_SDK_DIST = path.join(
+          process.cwd(),
+          "node_modules",
+          "@agentclientprotocol",
+          "sdk",
+          "dist",
+          "acp.js",
+        );
+        process.env.E7_STARTUP_READY_TIMEOUT_MS = "5000";
+        process.env.E7_PROMPT_READY_TIMEOUT_MS = "5000";
+        process.env.E7_TURN_TIMEOUT_MS = "10000";
+        process.env.E7_STARTUP_LIVENESS_GRACE_MS = "500";
+        process.env.E7_PROMPT_SUBMIT_DELAY_MS = "50";
+        process.env.E7_PROMPT_SUBMIT_CONFIRM_MS = "100";
+
+        await client.start();
+        const created = await client.createSession();
+        const response = await client.prompt(created.sessionId, "FIRST_BRIDGE_TURN");
+
+        assert.equal(response.stopReason, "end_turn");
+        assert.equal(
+          settingSourcesFromArgv(
+            (response._meta as { claudeArgv?: unknown[] } | undefined)?.claudeArgv,
+          ),
+          "user,project,local",
+        );
+        assert.match(JSON.stringify(updates), /nativai-os-primer/);
+      } finally {
+        await client.close().catch(() => {});
+        restoreEnv(previousEnv);
+      }
+
+      const settings = await readJson(path.join(claudeDir, "settings.json"));
+      assert.match(JSON.stringify(settings), /nativai-os-primer/);
+    });
+  },
+);
 
 test("W2 provisioning: openrouter temp config dir uses acpx-owned symlinks", async () => {
   await withHarnessFixture(async (fixture) => {
