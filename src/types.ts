@@ -11,6 +11,7 @@ import type {
   ToolKind,
 } from "@agentclientprotocol/sdk";
 export type { McpServer, SessionNotification } from "@agentclientprotocol/sdk";
+import type { EffectiveAccountMetadata } from "./acp/auth-env.js";
 import type { PromptInput } from "./prompt-content.js";
 
 export type AcpPermissionRequest = {
@@ -201,6 +202,7 @@ export interface OutputFormatter {
     message: string;
     retryable?: boolean;
     acp?: OutputErrorAcpPayload;
+    effectiveAccount?: EffectiveAccountMetadata;
     timestamp?: string;
   }): void;
   onPermissionEscalation(event: PermissionEscalationEvent): void;
@@ -434,6 +436,12 @@ export type SessionAcpxState = {
       toProfile: string;
       fromAccount?: string;
       toAccount: string;
+      /** Physically effective source account at the time the switch was decided. */
+      effectiveAccount?: string;
+      effectiveProfile?: string;
+      effectiveAuthMode?: string;
+      effectiveAnchor?: string;
+      effectiveResolutionMethod?: "path" | "selection";
       reason: "manual" | "failover";
       at: string;
     };

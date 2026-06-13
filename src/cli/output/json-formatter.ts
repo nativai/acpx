@@ -1,3 +1,4 @@
+import type { EffectiveAccountMetadata } from "../../acp/auth-env.js";
 import { buildJsonRpcErrorResponse } from "../../acp/jsonrpc-error.js";
 import type {
   OutputErrorAcpPayload,
@@ -238,6 +239,7 @@ class JsonOutputFormatter implements OutputFormatter {
     message: string;
     retryable?: boolean;
     acp?: OutputErrorAcpPayload;
+    effectiveAccount?: EffectiveAccountMetadata;
     timestamp?: string;
   }): void {
     this.stdout.write(
@@ -251,6 +253,7 @@ class JsonOutputFormatter implements OutputFormatter {
           timestamp: params.timestamp,
           sessionId: this.sessionId,
           acp: params.acp,
+          effectiveAccount: params.effectiveAccount,
         }),
       )}\n`,
     );

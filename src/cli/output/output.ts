@@ -8,6 +8,7 @@ import type {
   ToolCallStatus,
   ToolCallUpdate,
 } from "@agentclientprotocol/sdk";
+import type { EffectiveAccountMetadata } from "../../acp/auth-env.js";
 import {
   extractSessionUpdateNotification,
   parseJsonRpcErrorMessage,
@@ -39,6 +40,7 @@ type RenderableOutputError = {
   message: string;
   retryable?: boolean;
   acp?: OutputErrorAcpPayload;
+  effectiveAccount?: EffectiveAccountMetadata;
   timestamp?: string;
 };
 

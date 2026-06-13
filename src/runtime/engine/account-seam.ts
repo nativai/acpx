@@ -5,10 +5,11 @@ import {
   type ProfileEntry,
   type ProfileId,
 } from "../../config/profiles.js";
-import { portTranscript } from "../../config/subscription-transcript.js";
+import { ensureTranscriptAtConfigDir } from "../../config/subscription-transcript.js";
 import type { SubscriptionLookupOptions } from "../../config/subscriptions.js";
 import { isoNow } from "../../session/persistence/repository.js";
 import type { SessionRecord } from "../../types.js";
+import { sessionHasAgentMessages } from "./lifecycle.js";
 
 export {
   getResolvedProfile,
@@ -95,6 +96,7 @@ function recordAccountSwitch(
   const sessionOptions = { ...acpx.session_options };
   sessionOptions.profile = toProfile.id;
   delete sessionOptions.subscription;
+  delete sessionOptions.subscription_switch;
   sessionOptions.account_switch = {
     fromProfile: fromProfile.id,
     toProfile: toProfile.id,
@@ -104,6 +106,38 @@ function recordAccountSwitch(
     at: isoNow(),
   };
   record.acpx = { ...acpx, session_options: sessionOptions };
+}
+
+async function portSwitchTranscript(args: {
+  record: SessionRecord;
+  toProfile: ProfileEntry;
+  srcAnchor: string;
+  dstAnchor: string;
+  loadOpts?: SubscriptionLookupOptions;
+}): Promise<boolean> {
+  const acpSessionId = args.record.acpSessionId?.trim();
+  if (!acpSessionId) {
+    return false;
+  }
+
+  const recovery = await ensureTranscriptAtConfigDir(args.record, args.dstAnchor, {
+    ...args.loadOpts,
+    sourceConfigDirs: [args.srcAnchor],
+  });
+  if (recovery.status === "missing" && sessionHasAgentMessages(args.record)) {
+    throw new AccountSwitchError(
+      `cannot switch session ${args.record.acpSessionId} to profile "${args.toProfile.id}": ${missingTranscriptMessage(recovery)}`,
+    );
+  }
+  return recovery.status === "ported";
+}
+
+function missingTranscriptMessage(
+  recovery: Awaited<ReturnType<typeof ensureTranscriptAtConfigDir>>,
+): string {
+  const searched =
+    recovery.searchedPaths.length > 0 ? `; searched: ${recovery.searchedPaths.join(", ")}` : "";
+  return `missing transcript at ${recovery.activePath}${searched}`;
 }
 
 export async function switchSessionAccount(
@@ -118,7 +152,11 @@ export async function switchSessionAccount(
   }
 
   const registry = loadProfileRegistry(loadOpts);
-  const fromProfile = requireProfile(registry.profiles, selectedProfileId(record), "current");
+  const fromProfile = requireProfile(
+    registry.profiles,
+    selectedProfileId(record) ?? registry.default,
+    "current",
+  );
   const toProfile = requireProfile(registry.profiles, targetId, "target");
   if (reason === "failover") {
     assertFailoverSibling(fromProfile, toProfile);
@@ -126,17 +164,13 @@ export async function switchSessionAccount(
 
   const srcAnchor = requireAnchor(fromProfile, "current");
   const dstAnchor = requireAnchor(toProfile, "target");
-  let transcriptCopied = false;
-  const acpSessionId = record.acpSessionId?.trim();
-  if (acpSessionId) {
-    const result = await portTranscript({
-      srcConfigDir: srcAnchor,
-      dstConfigDir: dstAnchor,
-      cwd: record.cwd,
-      acpSessionId,
-    });
-    transcriptCopied = result.copied;
-  }
+  const transcriptCopied = await portSwitchTranscript({
+    record,
+    toProfile,
+    srcAnchor,
+    dstAnchor,
+    loadOpts,
+  });
 
   recordAccountSwitch(record, fromProfile, toProfile, reason);
   return {

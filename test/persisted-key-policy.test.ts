@@ -100,3 +100,30 @@ test("persisted key policy rejects camelCase acpx-owned keys", () => {
     assertPersistedKeyPolicy(persisted);
   }, /snake_case/);
 });
+
+test("persisted key policy allows pinned account_switch seam keys", () => {
+  const record = makeRecord();
+  record.acpx = {
+    ...record.acpx,
+    session_options: {
+      profile: "subB",
+      account_switch: {
+        fromProfile: "subA",
+        toProfile: "subB",
+        fromAccount: "acct-a",
+        toAccount: "acct-b",
+        effectiveAccount: "acct-a",
+        effectiveProfile: "subA",
+        effectiveAuthMode: "subscription",
+        effectiveAnchor: "/tmp/subA",
+        effectiveResolutionMethod: "path",
+        reason: "failover",
+        at: "2026-06-13T00:00:00.000Z",
+      },
+    },
+  };
+
+  const persisted = serializeSessionRecordForDisk(record);
+  assert.deepEqual(findPersistedKeyPolicyViolations(persisted), []);
+  assertPersistedKeyPolicy(persisted);
+});

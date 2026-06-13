@@ -100,6 +100,7 @@ test("switchSessionAccount rewrites profile, ports transcript, and preserves acc
     assert.equal(result.transcriptCopied, true);
     assert.equal(record.acpx?.session_options?.profile, "subB");
     assert.equal(record.acpx?.session_options?.subscription, undefined);
+    assert.equal(record.acpx?.session_options?.subscription_switch, undefined);
     assert.deepEqual(record.acpx?.session_options?.account_switch, {
       fromProfile: "subA",
       toProfile: "subB",
@@ -117,5 +118,43 @@ test("switchSessionAccount rewrites profile, ports transcript, and preserves acc
     assert.equal(parsed?.acpx?.session_options?.account_switch?.toProfile, "subB");
     const indexEntry = toSessionIndexEntry(record, "rec-1.json");
     assert.equal(indexEntry.accountSwitch?.toProfile, "subB");
+  });
+});
+
+test("switchSessionAccount fails loudly when a non-fresh session has no portable transcript", async () => {
+  await withSeamRegistry(async (ctx) => {
+    const record = makeSessionRecord({
+      acpxRecordId: "rec-missing",
+      acpSessionId: "agent-session-missing",
+      agentCommand: "claude",
+      cwd: path.join(ctx.homeDir, "work"),
+      messages: [
+        {
+          Agent: {
+            content: [{ Text: "prior response" }],
+            tool_results: {},
+          },
+        },
+      ],
+      acpx: { session_options: { profile: "subA" } },
+    });
+
+    await assert.rejects(
+      async () =>
+        await switchSessionAccount(record, "subB", "failover", {
+          homeDir: ctx.homeDir,
+          registryPath: ctx.registryPath,
+        }),
+      (error: unknown) => {
+        assert(error instanceof Error);
+        assert.equal(error.name, "AccountSwitchError");
+        assert.match(error.message, /cannot switch session agent-session-missing/);
+        assert.match(error.message, /missing transcript at/);
+        return true;
+      },
+    );
+
+    assert.equal(record.acpx?.session_options?.profile, "subA");
+    assert.equal(record.acpx?.session_options?.account_switch, undefined);
   });
 });

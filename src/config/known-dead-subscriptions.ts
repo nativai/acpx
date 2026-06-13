@@ -38,9 +38,11 @@ function markAccountDeadSync(account: string, until?: string): void {
   if (!trimmed) {
     return;
   }
+  const resetAt = until?.trim();
   accountHealth.set(trimmed, {
     ...accountHealth.get(trimmed),
-    deadUntil: until?.trim() || farFutureIso(),
+    deadUntil: resetAt || farFutureIso(),
+    ...(resetAt ? { resetsAt: resetAt } : {}),
   });
 }
 

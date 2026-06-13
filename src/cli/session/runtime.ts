@@ -1,5 +1,6 @@
 import os from "node:os";
 import path from "node:path";
+import type { EffectiveAccountMetadata } from "../../acp/auth-env.js";
 import { AcpClient } from "../../acp/client.js";
 import {
   formatErrorMessage,
@@ -9,7 +10,6 @@ import {
 import { assertRequestedModelSupported } from "../../acp/model-support.js";
 import { InterruptedError, withInterrupt, withTimeout } from "../../async-control.js";
 import { tailClaudeSubagentJsonl } from "../../claude-jsonl.js";
-import { isClaudeHomeProfileId } from "../../config/profiles.js";
 import { transcriptCwdHash } from "../../config/subscription-transcript.js";
 import {
   AllSubscriptionsExhaustedError,
@@ -20,6 +20,7 @@ import {
   attemptFailoverAndRetry,
   classifyFailover,
   failoverEnabled,
+  failoverEnabledForRecord,
 } from "../../runtime/engine/failover.js";
 export { InterruptedError, TimeoutError } from "../../async-control.js";
 import { formatPerfMetric, measurePerf, startPerfTimer } from "../../perf-metrics.js";
@@ -261,7 +262,22 @@ function deliveryErrorFrom(error: unknown): DeliveryEventError {
     code: normalized.acp?.code ?? 0,
     message: normalized.message,
     detailCode: normalized.detailCode ?? "",
+    ...(normalized.effectiveAccount?.effectiveAccount !== undefined
+      ? { effectiveAccount: normalized.effectiveAccount.effectiveAccount }
+      : {}),
   };
+}
+
+function attachEffectiveAccountMetadata(
+  error: unknown,
+  metadata: EffectiveAccountMetadata | undefined,
+): unknown {
+  if (metadata === undefined || !error || typeof error !== "object") {
+    return error;
+  }
+  const target = error as { effectiveAccountMetadata?: EffectiveAccountMetadata };
+  target.effectiveAccountMetadata ??= metadata;
+  return error;
 }
 
 function requestedModelId(value: string | undefined): string {
@@ -577,6 +593,7 @@ function sendQueuedTaskError(task: QueueTask, error: unknown): void {
     message: normalizedError.message,
     retryable: normalizedError.retryable,
     acp: normalizedError.acp,
+    effectiveAccount: normalizedError.effectiveAccount,
     outputAlreadyEmitted: alreadyEmitted,
   });
 }
@@ -601,9 +618,9 @@ export async function runQueuedTask(
     onAcpMessage?: (direction: AcpMessageDirection, message: AcpJsonRpcMessage) => void;
     setMidTurnHandler?: (handler: ((task: QueueTask) => void) | undefined) => void;
     // Failover: signaled after a turn auto-switched the session to a new
-    // subscription. The owner uses it to recycle its (now stale-dir) shared
-    // client so subsequent turns cold-spawn on the new CLAUDE_CONFIG_DIR.
-    onFailoverSwitched?: (newSubId: string) => void;
+    // profile/account. The owner uses it to recycle its stale shared client so
+    // subsequent turns cold-spawn on the new transcript anchor.
+    onFailoverSwitched?: (newProfileId: string) => void;
   },
 ): Promise<void> {
   const outputFormatter = task.waitForCompletion
@@ -631,14 +648,9 @@ export async function runQueuedTask(
 }
 
 // Failover eligibility gate: returns the session record when this turn error
-// should attempt subscription failover, or null to rethrow the original error.
-// Null when the error is not failover-classified, the box has no registry, or
-// the session uses a claude-home profile — claude-home is excluded from
-// subscription failover (v1): its credential is an interactive HOME owned by
-// the bridge, not a subscription configDir, so rewriting
-// session_options.subscription cannot move it anywhere (the profile keeps
-// winning at spawn) and a failover loop would only churn breadcrumbs through
-// every registered sub.
+// should attempt account failover, or null to rethrow the original error.
+// Null when the error is not failover-classified, the box has no provider
+// registry, or the selected/default profile has no portable transcript anchor.
 async function resolveFailoverRecord(
   sessionRecordId: string,
   error: unknown,
@@ -647,7 +659,7 @@ async function resolveFailoverRecord(
     return null;
   }
   const record = await resolveSessionRecord(sessionRecordId);
-  if (isClaudeHomeProfileId(record.acpx?.session_options?.profile)) {
+  if (!failoverEnabledForRecord(record)) {
     return null;
   }
   return record;
@@ -673,6 +685,7 @@ async function runQueuedTaskFailover(
   try {
     outcome = await attemptFailoverAndRetry<SessionSendResult>({
       record,
+      triggerError: error,
       verbose: options.verbose,
       runTurn: async () =>
         // Fresh client (omit sharedClient) so the retry resolves the new dir.
@@ -1429,6 +1442,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     (propagated as { outputAlreadyEmitted?: boolean }).outputAlreadyEmitted =
       sawAcpMessage && !(error instanceof PermissionPromptUnavailableError);
     (propagated as { normalizedOutputError?: unknown }).normalizedOutputError = normalizedError;
+    attachEffectiveAccountMetadata(propagated, client.getEffectiveAccountMetadata());
     throw propagated;
   };
 
@@ -1521,16 +1535,20 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       },
     );
   } catch (error) {
+    const annotatedError = attachEffectiveAccountMetadata(
+      error,
+      client.getEffectiveAccountMetadata(),
+    );
     if (error instanceof InterruptedError) {
       await appendDeliveryTerminal(mainDeliveryContext, "cancelled", {
         stopReason: "cancelled",
       }).catch(() => {});
     } else {
       await appendDeliveryTerminal(mainDeliveryContext, "failed", {
-        error: deliveryErrorFrom(error),
+        error: deliveryErrorFrom(annotatedError),
       }).catch(() => {});
     }
-    throw error;
+    throw annotatedError;
   } finally {
     if (options.verbose) {
       process.stderr.write(`[acpx] ${formatPerfMetric("prompt.total", stopTotalTimer())}\n`);

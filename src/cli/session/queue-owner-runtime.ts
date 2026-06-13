@@ -580,11 +580,11 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
                 turnController.markPromptActive();
                 await applyPendingCancel();
               },
-              onFailoverSwitched: (newSubId: string) => {
+              onFailoverSwitched: (newProfileId: string) => {
                 recycleOwnerAfterTask = true;
                 if (options.verbose) {
                   process.stderr.write(
-                    `[acpx] subscription failover applied (→ ${newSubId}); recycling queue owner for session ${options.sessionId} after this turn\n`,
+                    `[acpx] account failover applied (→ ${newProfileId}); recycling queue owner for session ${options.sessionId} after this turn\n`,
                   );
                 }
               },
@@ -617,8 +617,9 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       // Restart idle drain to capture teammate activity until next prompt
       idleDrain = await startIdleStreamDrain();
 
-      // A failover this turn pinned the shared client to a now-stale config dir.
-      // Exit so the next prompt cold-spawns a fresh owner on the new subscription.
+      // A failover this turn pinned the shared client to a now-stale transcript
+      // anchor. Exit so the next prompt cold-spawns a fresh owner on the new
+      // profile/account.
       if (recycleOwnerAfterTask) {
         break;
       }

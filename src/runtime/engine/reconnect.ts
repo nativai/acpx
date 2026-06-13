@@ -7,7 +7,9 @@ import {
 } from "../../acp/error-normalization.js";
 import { assertRequestedModelSupported } from "../../acp/model-support.js";
 import { InterruptedError, TimeoutError, withTimeout } from "../../async-control.js";
+import { findProfile, loadProfileRegistry, transcriptAnchorDir } from "../../config/profiles.js";
 import {
+  ensureTranscriptAtConfigDir,
   ensureTranscriptAtActiveConfigDir,
   type TranscriptRecoveryResult,
 } from "../../config/subscription-transcript.js";
@@ -312,7 +314,7 @@ export async function connectAndLoadSession(
   record.closed = false;
   record.closedAt = undefined;
   options.onConnectedRecord?.(record);
-  await ensurePendingSubscriptionSwitchTranscript(record, options.verbose);
+  await ensurePendingSwitchTranscript(record, options.verbose);
 
   let resumed = false;
   let loadError: string | undefined;
@@ -629,12 +631,30 @@ async function recoverMissingTranscriptAndRetry(
   return undefined;
 }
 
+async function ensurePendingSwitchTranscript(
+  record: SessionRecord,
+  verbose?: boolean,
+): Promise<void> {
+  if (!record.acpSessionId.trim() || !sessionHasAgentMessages(record)) {
+    return;
+  }
+  if (record.acpx?.session_options?.account_switch) {
+    await ensurePendingAccountSwitchTranscript(
+      record,
+      record.acpx.session_options.account_switch,
+      verbose,
+    );
+    return;
+  }
+  await ensurePendingSubscriptionSwitchTranscript(record, verbose);
+}
+
 async function ensurePendingSubscriptionSwitchTranscript(
   record: SessionRecord,
   verbose?: boolean,
 ): Promise<void> {
   const pendingSwitch = record.acpx?.session_options?.subscription_switch;
-  if (!pendingSwitch || !record.acpSessionId.trim() || !sessionHasAgentMessages(record)) {
+  if (!pendingSwitch) {
     return;
   }
 
@@ -643,6 +663,41 @@ async function ensurePendingSubscriptionSwitchTranscript(
     throw makeSessionResumeRequiredError({
       record,
       reason: `pending subscription switch ${formatSubscriptionSwitch(pendingSwitch)} cannot resume: ${missingTranscriptReason(recovery)}`,
+    });
+  }
+  if (recovery.status === "ported") {
+    logTranscriptRecovery(record, recovery, verbose);
+  }
+}
+
+async function ensurePendingAccountSwitchTranscript(
+  record: SessionRecord,
+  pendingSwitch: NonNullable<
+    NonNullable<NonNullable<SessionRecord["acpx"]>["session_options"]>["account_switch"]
+  >,
+  verbose?: boolean,
+): Promise<void> {
+  const registry = loadProfileRegistry();
+  const toProfile = findProfile(pendingSwitch.toProfile, registry);
+  const dstAnchor = toProfile ? transcriptAnchorDir(toProfile) : null;
+  if (dstAnchor === null) {
+    throw makeSessionResumeRequiredError({
+      record,
+      reason: `pending account switch ${formatAccountSwitch(pendingSwitch)} cannot resume: target profile "${pendingSwitch.toProfile}" has no transcript anchor`,
+    });
+  }
+
+  const fromProfile = pendingSwitch.fromProfile
+    ? findProfile(pendingSwitch.fromProfile, registry)
+    : undefined;
+  const srcAnchor = fromProfile ? transcriptAnchorDir(fromProfile) : null;
+  const recovery = await ensureTranscriptAtConfigDir(record, dstAnchor, {
+    sourceConfigDirs: srcAnchor === null ? [] : [srcAnchor],
+  });
+  if (recovery.status === "missing") {
+    throw makeSessionResumeRequiredError({
+      record,
+      reason: `pending account switch ${formatAccountSwitch(pendingSwitch)} cannot resume: ${missingTranscriptReason(recovery)}`,
     });
   }
   if (recovery.status === "ported") {
@@ -662,6 +717,14 @@ function formatSubscriptionSwitch(
   >,
 ): string {
   return `${pendingSwitch.from ?? "<default>"} -> ${pendingSwitch.to}`;
+}
+
+function formatAccountSwitch(
+  pendingSwitch: NonNullable<
+    NonNullable<NonNullable<SessionRecord["acpx"]>["session_options"]>["account_switch"]
+  >,
+): string {
+  return `${pendingSwitch.fromProfile ?? "<unknown>"} -> ${pendingSwitch.toProfile}`;
 }
 
 function logTranscriptRecovery(

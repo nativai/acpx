@@ -437,6 +437,11 @@ function isValidAccountSwitch(record: Record<string, unknown>): record is {
   toProfile: string;
   fromAccount?: string;
   toAccount: string;
+  effectiveAccount?: string;
+  effectiveProfile?: string;
+  effectiveAuthMode?: string;
+  effectiveAnchor?: string;
+  effectiveResolutionMethod?: "path" | "selection";
   reason: "manual" | "failover";
   at: string;
 } {
@@ -451,6 +456,42 @@ function isValidAccountSwitch(record: Record<string, unknown>): record is {
   );
 }
 
+type ParsedAccountSwitch = NonNullable<
+  NonNullable<SessionAcpxState["session_options"]>["account_switch"]
+>;
+
+type ParsedAccountSwitchStringKey = Exclude<
+  keyof Omit<ParsedAccountSwitch, "reason" | "at">,
+  "effectiveResolutionMethod"
+>;
+
+function assignOptionalAccountSwitchString(
+  target: Partial<ParsedAccountSwitch>,
+  key: ParsedAccountSwitchStringKey,
+  value: unknown,
+): void {
+  if (typeof value === "string") {
+    target[key] = value;
+  }
+}
+
+function accountSwitchMetadata(record: Record<string, unknown>): Partial<ParsedAccountSwitch> {
+  const metadata: Partial<ParsedAccountSwitch> = {};
+  assignOptionalAccountSwitchString(metadata, "fromProfile", record.fromProfile);
+  assignOptionalAccountSwitchString(metadata, "fromAccount", record.fromAccount);
+  assignOptionalAccountSwitchString(metadata, "effectiveAccount", record.effectiveAccount);
+  assignOptionalAccountSwitchString(metadata, "effectiveProfile", record.effectiveProfile);
+  assignOptionalAccountSwitchString(metadata, "effectiveAuthMode", record.effectiveAuthMode);
+  assignOptionalAccountSwitchString(metadata, "effectiveAnchor", record.effectiveAnchor);
+  if (
+    record.effectiveResolutionMethod === "path" ||
+    record.effectiveResolutionMethod === "selection"
+  ) {
+    metadata.effectiveResolutionMethod = record.effectiveResolutionMethod;
+  }
+  return metadata;
+}
+
 function assignSessionOptionAccountSwitch(
   options: NonNullable<SessionAcpxState["session_options"]>,
   value: unknown,
@@ -460,10 +501,9 @@ function assignSessionOptionAccountSwitch(
     return;
   }
   options.account_switch = {
-    ...(typeof record.fromProfile === "string" ? { fromProfile: record.fromProfile } : {}),
     toProfile: record.toProfile,
-    ...(typeof record.fromAccount === "string" ? { fromAccount: record.fromAccount } : {}),
     toAccount: record.toAccount,
+    ...accountSwitchMetadata(record),
     reason: record.reason,
     at: record.at,
   };

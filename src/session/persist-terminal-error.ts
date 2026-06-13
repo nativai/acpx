@@ -33,6 +33,7 @@ export async function persistTerminalTurnError(
     message: normalized.message,
     retryable: normalized.retryable,
     acp: normalized.acp,
+    effectiveAccount: normalized.effectiveAccount,
     sessionId: record.acpxRecordId,
     timestamp: isoNow(),
   }) as AcpJsonRpcMessage;
