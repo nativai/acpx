@@ -488,6 +488,103 @@ test("connectAndLoadSession completes a pending subscription switch by porting t
   });
 });
 
+test("connectAndLoadSession completes a pending account switch by porting the profile transcript before load", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const subADir = path.join(homeDir, ".acpx", "subscriptions", "sub-a");
+    const subBDir = path.join(homeDir, ".acpx", "subscriptions", "sub-b");
+    await writeProfileRegistry(homeDir, {
+      profiles: [
+        {
+          id: "sub-a",
+          label: "Sub A",
+          authMode: "subscription",
+          adapter: "claude",
+          account: "acct-a",
+          credentialSource: subADir,
+        },
+        {
+          id: "sub-b",
+          label: "Sub B",
+          authMode: "subscription",
+          adapter: "claude",
+          account: "acct-b",
+          credentialSource: subBDir,
+        },
+      ],
+    });
+
+    const sessionId = "account-switch-session";
+    const sourceTranscriptPath = transcriptJsonlPath(subADir, cwd, sessionId);
+    await fs.mkdir(path.dirname(sourceTranscriptPath), { recursive: true });
+    await fs.writeFile(sourceTranscriptPath, '{"account-switch":"source"}\n', "utf8");
+
+    const record = makeSessionRecord({
+      acpxRecordId: "pending-account-switch-record",
+      acpSessionId: sessionId,
+      agentCommand: "agent",
+      cwd,
+      messages: [
+        {
+          Agent: {
+            content: [{ Text: "prior response" }],
+            tool_results: {},
+          },
+        },
+      ],
+      acpx: {
+        session_options: {
+          profile: "sub-b",
+          account_switch: {
+            fromProfile: "sub-a",
+            toProfile: "sub-b",
+            fromAccount: "acct-a",
+            toAccount: "acct-b",
+            reason: "failover",
+            at: "2026-01-01T00:00:00.000Z",
+          },
+        },
+      },
+    });
+
+    const targetTranscriptPath = transcriptJsonlPath(subBDir, cwd, sessionId);
+    let loadCalls = 0;
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({
+        running: true,
+      }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
+      loadSessionWithOptions: async () => {
+        loadCalls += 1;
+        assert.equal(
+          await fs.readFile(targetTranscriptPath, "utf8"),
+          '{"account-switch":"source"}\n',
+        );
+        return { agentSessionId: "runtime-session" };
+      },
+      createSession: async () => {
+        throw new Error("createSession must not be called for pending account switch recovery");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+    };
+
+    const result = await connectAndLoadSession({
+      client: client as never,
+      record,
+      activeController: ACTIVE_CONTROLLER,
+    });
+
+    assert.equal(loadCalls, 1);
+    assert.equal(result.resumed, true);
+    assert.equal(record.acpSessionId, sessionId);
+  });
+});
+
 test("connectAndLoadSession fails a pending subscription switch loudly when no transcript can be ported", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -1586,6 +1683,34 @@ async function writeSubscriptionRegistry(
     await fs.mkdir(entry.configDir, { recursive: true });
   }
   await fs.writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`, "utf8");
+}
+
+type TestProfileRegistryEntry = {
+  id: string;
+  label: string;
+  authMode: string;
+  adapter: string;
+  account: string;
+  credentialSource: string;
+};
+
+async function writeProfileRegistry(
+  homeDir: string,
+  registry: {
+    default?: string;
+    profiles: TestProfileRegistryEntry[];
+  },
+): Promise<void> {
+  const registryPath = path.join(homeDir, ".acpx", "subscriptions", "registry.json");
+  await fs.mkdir(path.dirname(registryPath), { recursive: true });
+  for (const entry of registry.profiles) {
+    await fs.mkdir(entry.credentialSource, { recursive: true });
+  }
+  await fs.writeFile(
+    registryPath,
+    `${JSON.stringify({ version: 3, ...registry }, null, 2)}\n`,
+    "utf8",
+  );
 }
 
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
