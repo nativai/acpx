@@ -153,6 +153,67 @@ function errorEffectiveAccount(error: unknown): EffectiveAccountMetadata | undef
   );
 }
 
+const RESET_KEYS = new Set([
+  "reset",
+  "resetAt",
+  "resetsAt",
+  "reset_at",
+  "resets_at",
+  "resetTime",
+  "reset_time",
+]);
+
+function resetIsoFromError(error: unknown): string | undefined {
+  return resetIsoFromValue(extractAcpError(error)?.data) ?? resetIsoFromValue(error);
+}
+
+function resetIsoFromValue(value: unknown, depth = 0): string | undefined {
+  if (depth > 4) {
+    return undefined;
+  }
+  const direct = parseResetTimestamp(value);
+  if (direct !== undefined) {
+    return direct;
+  }
+  const record = asRecord(value);
+  if (!record) {
+    return undefined;
+  }
+  for (const key of RESET_KEYS) {
+    const nested = resetIsoFromValue(record[key], depth + 1);
+    if (nested !== undefined) {
+      return nested;
+    }
+  }
+  return Object.values(record)
+    .map((entry) => resetIsoFromValue(entry, depth + 1))
+    .find((entry) => entry !== undefined);
+}
+
+function parseResetTimestamp(value: unknown): string | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return dateIsoFromEpoch(value);
+  }
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  if (/^\d+$/u.test(trimmed)) {
+    return dateIsoFromEpoch(Number(trimmed));
+  }
+  const time = Date.parse(trimmed);
+  return Number.isNaN(time) ? undefined : new Date(time).toISOString();
+}
+
+function dateIsoFromEpoch(value: number): string | undefined {
+  const millis = value > 1_000_000_000_000 ? value : value * 1000;
+  const date = new Date(millis);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
 function attachEffectiveAccount(
   error: unknown,
   metadata: EffectiveAccountMetadata | undefined,
@@ -389,10 +450,15 @@ async function pickSibling(
 
 type PickedSibling = Awaited<ReturnType<typeof pickSibling>>;
 
-function noSiblingMessage(current: ResolvedProfile, context: EffectiveAccountMetadata): string {
+function noSiblingMessage(
+  current: ResolvedProfile,
+  context: EffectiveAccountMetadata,
+  health: AccountHealth,
+): string {
+  const reset = health.resetsAt ? formatReset(health.resetsAt) : "unknown";
   return (
     `failover unavailable - profile "${current.id}" (${current.authMode}) has no sibling account; ` +
-    `account "${current.account}" resets unknown; effectiveAccount "${context.effectiveAccount}"`
+    `account "${current.account}" resets ${reset}; effectiveAccount "${context.effectiveAccount}"`
   );
 }
 
@@ -446,7 +512,8 @@ async function requirePickedTarget(
 ): Promise<ResolvedProfile> {
   if (picked.siblingCount === 0) {
     await restoreOriginalSelection();
-    throw exhaustedError([noSiblingMessage(current, context)], context);
+    const health = await getAccountHealth(context.effectiveAccount);
+    throw exhaustedError([noSiblingMessage(current, context, health)], context);
   }
   if (picked.portableCount === 0) {
     await restoreOriginalSelection();
@@ -512,7 +579,11 @@ export async function attemptFailoverAndRetry<T>(args: {
   // re-pick it this turn.
   const tried = new Set<string>();
   tried.add(initialContext.effectiveAccount);
-  await markAccountDead(initialContext.effectiveAccount, "failover trigger");
+  await markAccountDead(
+    initialContext.effectiveAccount,
+    "failover trigger",
+    resetIsoFromError(args.triggerError),
+  );
 
   for (let attempt = 0; ; attempt++) {
     const picked = await pickSibling(current, tried, args.loadOpts);

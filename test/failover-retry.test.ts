@@ -148,8 +148,20 @@ function makeRecord(options: {
   } as SessionRecord;
 }
 
-function rateLimitError(message = "rate limit", effectiveAccount?: string): Error {
+function rateLimitError(
+  message = "rate limit",
+  effectiveAccount?: string,
+  resetAt?: string,
+): Error {
   const error = new Error(message);
+  (error as { acp?: { code: number; message: string; data: Record<string, unknown> } }).acp = {
+    code: -32603,
+    message,
+    data: {
+      errorKind: "rate_limit",
+      ...(resetAt ? { resetsAt: resetAt } : {}),
+    },
+  };
   if (effectiveAccount) {
     (
       error as { effectiveAccountMetadata?: { effectiveAccount: string } }
@@ -421,14 +433,16 @@ test("no sibling profile produces an honest failover-unavailable exhaustion", as
       process.env.HOME = homeDir;
       try {
         const record = makeRecord({ profile: "solo" });
+        const resetAt = "2099-01-01T22:00:00.000Z";
         await assert.rejects(
           () =>
             attemptFailoverAndRetry<string>({
               record,
+              triggerError: rateLimitError("rate limit", "acct-solo", resetAt),
               loadOpts: { homeDir, registryPath },
               runTurn: async () => "never",
             }),
-          /failover unavailable - profile "solo" \(subscription\) has no sibling account; account "acct-solo" resets unknown; effectiveAccount "acct-solo"/,
+          /failover unavailable - profile "solo" \(subscription\) has no sibling account; account "acct-solo" resets 22:00Z; effectiveAccount "acct-solo"/,
         );
         assert.equal(record.acpx?.session_options?.profile, "solo");
         assert.equal(record.acpx?.session_options?.account_switch, undefined);
