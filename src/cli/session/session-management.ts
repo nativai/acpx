@@ -14,6 +14,7 @@ import { createSessionConversation } from "../../session/conversation-model.js";
 import { defaultSessionEventLog } from "../../session/event-log.js";
 import { setCurrentModelId, syncAdvertisedModelState } from "../../session/mode-preference.js";
 import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
+import { persistSessionOwnerOptions } from "../../session/owner-options.js";
 import {
   absolutePath,
   findGitRepositoryRoot,
@@ -135,6 +136,7 @@ async function createSessionRecordWithClient(
   };
 
   persistSessionOptions(record, options.sessionOptions);
+  persistSessionOwnerOptions(record, options);
   applyConfigOptionsToRecord(record, sessionResult);
   await persistAndApplyRequestedEffort({
     client,

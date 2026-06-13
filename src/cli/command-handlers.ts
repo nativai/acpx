@@ -8,7 +8,12 @@ import {
   resolveAgentNameFromCommand,
 } from "../agent-registry.js";
 import { findSubscription, loadSubscriptionRegistry } from "../config/subscriptions.js";
-import { AgentSpawnError, SessionNotFoundError, SubscriptionUnknownError } from "../errors.js";
+import {
+  AgentSpawnError,
+  SessionNotFoundError,
+  SubscriptionChangeRequiresSwitchError,
+  SubscriptionUnknownError,
+} from "../errors.js";
 import { loadPermissionPolicySpec } from "../permission-policy.js";
 import {
   mergePromptSourceWithText,
@@ -16,6 +21,7 @@ import {
   PromptInputValidationError,
   textPrompt,
 } from "../prompt-content.js";
+import { getResolvedProfile } from "../runtime/engine/account-seam.js";
 import { sessionOptionsFromRecord } from "../runtime/engine/session-options.js";
 import { exportSession } from "../session/export.js";
 import { importSession } from "../session/import.js";
@@ -41,6 +47,7 @@ import type {
 } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import {
+  hasExplicitPermissionModeFlag,
   parseHistoryLimit,
   resolveAgentInvocation,
   resolveGlobalFlags,
@@ -175,6 +182,23 @@ function applyPermissionExitCode(result: {
   }
 }
 
+function maybeEmitQuietPermissionUnavailable(params: {
+  result: Parameters<typeof applyPermissionExitCode>[0];
+  outputPolicy: OutputPolicy;
+  nonInteractivePermissions?: string;
+}): void {
+  const stats = params.result.permissionStats;
+  if (
+    params.outputPolicy.format === "quiet" &&
+    params.nonInteractivePermissions === "fail" &&
+    stats.requested > 0 &&
+    stats.approved === 0 &&
+    stats.denied + stats.cancelled > 0
+  ) {
+    process.stderr.write("Permission prompt unavailable in non-interactive mode\n");
+  }
+}
+
 function resolveCompatibleConfigId(agent: { agentCommand: string }, configId: string): string {
   if (isLegacyZedCodexAcpInvocation(agent.agentCommand) && configId === "thought_level") {
     return "reasoning_effort";
@@ -207,6 +231,105 @@ function sessionOptionsFromGlobalFlags(
     profile: unifiedSelection,
     reasoningEffort: globalFlags.reasoningEffort,
   };
+}
+
+function validateExplicitSubscriptionFlag(globalFlags: GlobalFlags): void {
+  const subscriptionId = globalFlags.subscription?.trim();
+  if (!subscriptionId) {
+    return;
+  }
+
+  const registry = loadSubscriptionRegistry();
+  if (findSubscription(subscriptionId, registry)) {
+    return;
+  }
+
+  throw new SubscriptionUnknownError(
+    subscriptionId,
+    registry.subscriptions.map((entry) => entry.id),
+  );
+}
+
+function existingSessionSubscriptionLabel(record: SessionRecord): string {
+  return record.name ? `"${record.name}" (${record.acpxRecordId})` : record.acpxRecordId;
+}
+
+function switchSubscriptionCommand(
+  record: SessionRecord,
+  agentName: string,
+  requested: string,
+): string {
+  const sessionFlag = record.name ? ` --session ${record.name}` : "";
+  return `acpx ${agentName} set${sessionFlag} subscription ${requested}`;
+}
+
+type EffectiveSubscriptionSelection = {
+  id?: string;
+  account?: string;
+};
+
+async function resolveEffectiveSubscriptionSelection(
+  id: string | undefined,
+): Promise<EffectiveSubscriptionSelection> {
+  const trimmed = id?.trim();
+  if (!trimmed) {
+    return {};
+  }
+  const profile = await getResolvedProfile(trimmed);
+  return {
+    id: trimmed,
+    account: profile?.account,
+  };
+}
+
+async function effectiveRecordedSubscriptionSelection(
+  record: SessionRecord,
+): Promise<EffectiveSubscriptionSelection> {
+  const sessionOptions = record.acpx?.session_options;
+  const profile = sessionOptions?.profile?.trim();
+  if (profile) {
+    return await resolveEffectiveSubscriptionSelection(profile);
+  }
+  return await resolveEffectiveSubscriptionSelection(sessionOptions?.subscription);
+}
+
+function subscriptionSelectionsMatch(
+  current: EffectiveSubscriptionSelection,
+  requested: EffectiveSubscriptionSelection,
+): boolean {
+  if (!current.id || !requested.id) {
+    return false;
+  }
+  if (current.id === requested.id) {
+    return true;
+  }
+  return current.account !== undefined && current.account === requested.account;
+}
+
+async function assertExplicitSubscriptionMatchesExistingSession(params: {
+  globalFlags: GlobalFlags;
+  record: SessionRecord;
+  agentName: string;
+}): Promise<void> {
+  const requested = params.globalFlags.subscription?.trim();
+  if (!requested) {
+    return;
+  }
+
+  const [current, requestedSelection] = await Promise.all([
+    effectiveRecordedSubscriptionSelection(params.record),
+    resolveEffectiveSubscriptionSelection(requested),
+  ]);
+  if (subscriptionSelectionsMatch(current, requestedSelection)) {
+    return;
+  }
+
+  throw new SubscriptionChangeRequiresSwitchError({
+    sessionLabel: existingSessionSubscriptionLabel(params.record),
+    currentSubscription: current.id,
+    requestedSubscription: requested,
+    switchCommand: switchSubscriptionCommand(params.record, params.agentName, requested),
+  });
 }
 
 // `--reasoning-effort` is claude-only. When it's passed but the effective agent
@@ -688,10 +811,10 @@ export async function handlePrompt(
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
+  validateExplicitSubscriptionFlag(globalFlags);
   const outputPolicy = resolveRequestedOutputPolicy(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
-  const prompt = await readPrompt(promptParts, flags.file, globalFlags.cwd);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   warnReasoningEffortIgnoredForNonClaude(globalFlags, agent.agentName);
   const [
@@ -705,6 +828,12 @@ export async function handlePrompt(
     agent.cwd,
     flags.session,
   );
+  await assertExplicitSubscriptionMatchesExistingSession({
+    globalFlags,
+    record,
+    agentName: agent.agentName,
+  });
+  const prompt = await readPrompt(promptParts, flags.file, globalFlags.cwd);
   const outputFormatter = createOutputFormatter(outputPolicy.format, {
     jsonContext: {
       sessionId: record.acpxRecordId,
@@ -718,6 +847,7 @@ export async function handlePrompt(
     prompt,
     mcpServers: config.mcpServers,
     permissionMode,
+    permissionModeExplicit: hasExplicitPermissionModeFlag(globalFlags),
     nonInteractivePermissions: globalFlags.nonInteractivePermissions,
     permissionPolicy,
     authCredentials: config.auth,
@@ -743,6 +873,11 @@ export async function handlePrompt(
     return;
   }
 
+  maybeEmitQuietPermissionUnavailable({
+    result,
+    outputPolicy,
+    nonInteractivePermissions: globalFlags.nonInteractivePermissions,
+  });
   applyPermissionExitCode(result);
 
   if (globalFlags.verbose && result.loadError) {
@@ -759,8 +894,10 @@ export async function handleExec(
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  validateExplicitSubscriptionFlag(globalFlags);
+
   if (config.disableExec) {
-    const globalFlags = resolveGlobalFlags(command, config);
     const outputPolicy = resolveRequestedOutputPolicy(globalFlags);
     if (outputPolicy.format === "json") {
       process.stdout.write(
@@ -782,7 +919,6 @@ export async function handleExec(
     return;
   }
 
-  const globalFlags = resolveGlobalFlags(command, config);
   const outputPolicy = resolveRequestedOutputPolicy(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
@@ -1079,7 +1215,10 @@ export async function handleSetSubscription(
   const trimmedId = subscriptionId.trim();
   const registry = loadSubscriptionRegistry();
   if (!findSubscription(trimmedId, registry)) {
-    throw new SubscriptionUnknownError(trimmedId);
+    throw new SubscriptionUnknownError(
+      trimmedId,
+      registry.subscriptions.map((entry) => entry.id),
+    );
   }
   const sessionName = resolveSessionNameFromFlags(flags, command);
   const record = await findRoutedSessionOrThrow(
@@ -1301,6 +1440,7 @@ export async function handleSessionsNew(
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
+  validateExplicitSubscriptionFlag(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const parent = await resolveAndValidateParentSessionId(flags);
@@ -1406,6 +1546,7 @@ export async function handleSessionsEnsure(
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
+  validateExplicitSubscriptionFlag(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const parent = await resolveAndValidateParentSessionId(flags);
@@ -1418,6 +1559,19 @@ export async function handleSessionsEnsure(
     config,
   );
   warnReasoningEffortIgnoredForNonClaude(globalFlags, effectiveAgent.agentName);
+  const existing = await findSessionByDirectoryWalk({
+    agentCommand: effectiveAgent.agentCommand,
+    cwd: effectiveAgent.cwd,
+    name: flags.name,
+    boundary: findGitRepositoryRoot(effectiveAgent.cwd) ?? effectiveAgent.cwd,
+  });
+  if (existing) {
+    await assertExplicitSubscriptionMatchesExistingSession({
+      globalFlags,
+      record: existing,
+      agentName: effectiveAgent.agentName,
+    });
+  }
   const [{ ensureSession }, { printCreatedSessionBanner, printEnsuredSessionByFormat }] =
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
   const result = await ensureSession(

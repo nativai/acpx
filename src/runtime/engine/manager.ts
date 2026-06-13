@@ -25,6 +25,7 @@ import {
   syncAdvertisedModelState,
 } from "../../session/mode-preference.js";
 import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
+import { persistSessionOwnerOptions } from "../../session/owner-options.js";
 import type { ClientOperation, SessionRecord, SessionResumePolicy } from "../../types.js";
 import type {
   AcpRuntimeEvent,
@@ -617,6 +618,7 @@ export class AcpRuntimeManager {
     }
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
     persistSessionOptions(record, input.sessionOptions);
+    persistSessionOwnerOptions(record, this.options);
     await this.options.sessionStore.save(record);
     return record;
   }

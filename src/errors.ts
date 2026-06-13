@@ -149,6 +149,18 @@ export class SessionResumeRequiredError extends AcpxOperationalError {
   }
 }
 
+export class SessionOwnerRestoreError extends AcpxOperationalError {
+  constructor(message: string, options?: AcpxErrorOptions) {
+    super(message, {
+      outputCode: "RUNTIME",
+      detailCode: "SESSION_OWNER_RESTORE_FAILED",
+      origin: "runtime",
+      retryable: false,
+      ...options,
+    });
+  }
+}
+
 export class GeminiAcpStartupTimeoutError extends AcpxOperationalError {
   constructor(message: string, options?: AcpxErrorOptions) {
     super(message, {
@@ -162,12 +174,40 @@ export class GeminiAcpStartupTimeoutError extends AcpxOperationalError {
 
 // A subscription id was requested that is not in the registry. Usage error.
 export class SubscriptionUnknownError extends AcpxOperationalError {
-  constructor(id: string) {
-    super(`subscription "${id}" not found in registry (~/.acpx/subscriptions/registry.json)`, {
-      outputCode: "USAGE",
-      detailCode: "SUBSCRIPTION_UNKNOWN",
-      origin: "cli",
-    });
+  constructor(id: string, knownIds?: readonly string[]) {
+    const known =
+      knownIds && knownIds.length > 0
+        ? ` Known subscription ids: ${knownIds.join(", ")}.`
+        : " Known subscription ids: none.";
+    super(
+      `subscription "${id}" not found in registry (~/.acpx/subscriptions/registry.json).${known}`,
+      {
+        outputCode: "USAGE",
+        detailCode: "SUBSCRIPTION_UNKNOWN",
+        origin: "cli",
+      },
+    );
+  }
+}
+
+export class SubscriptionChangeRequiresSwitchError extends AcpxOperationalError {
+  constructor(params: {
+    sessionLabel: string;
+    currentSubscription?: string;
+    requestedSubscription: string;
+    switchCommand: string;
+  }) {
+    const current = params.currentSubscription
+      ? `"${params.currentSubscription}"`
+      : "no recorded subscription";
+    super(
+      `Cannot apply --subscription "${params.requestedSubscription}" to existing session ${params.sessionLabel}: current subscription is ${current}. Use \`${params.switchCommand}\` to switch the session before prompting; no prompt was sent.`,
+      {
+        outputCode: "USAGE",
+        detailCode: "SUBSCRIPTION_CHANGE_REQUIRES_SWITCH",
+        origin: "cli",
+      },
+    );
   }
 }
 

@@ -610,6 +610,7 @@ export function cloneSessionAcpxState(
     available_commands: state.available_commands ? [...state.available_commands] : undefined,
     progress: state.progress ? deepClone(state.progress) : undefined,
     config_options: state.config_options ? deepClone(state.config_options) : undefined,
+    owner_options: state.owner_options ? { ...state.owner_options } : undefined,
     session_options: cloneSessionOptions(state.session_options),
   };
 }

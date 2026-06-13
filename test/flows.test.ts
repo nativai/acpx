@@ -981,13 +981,14 @@ test("FlowRunner fails persistent ACP sessions when session/load cannot resume t
 
       await assert.rejects(
         async () => await runner.run(flow, {}),
-        /Persistent ACP session .* could not be resumed: .*resource not found/i,
+        /Persistent ACP session .* could not be resumed: missing transcript at .*\.jsonl/i,
       );
 
       const runDir = await waitForRunDir(outputRoot, "persistent-resume-not-found-test");
       const state = await readRunJson(runDir);
       assert.equal(state.status, "failed");
       assert.match(String(state.error), /Persistent ACP session .* could not be resumed/i);
+      assert.match(String(state.error), /missing transcript at .*\.jsonl/i);
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }

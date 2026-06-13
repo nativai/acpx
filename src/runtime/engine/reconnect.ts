@@ -8,6 +8,10 @@ import {
 import { assertRequestedModelSupported } from "../../acp/model-support.js";
 import { InterruptedError, TimeoutError, withTimeout } from "../../async-control.js";
 import {
+  ensureTranscriptAtActiveConfigDir,
+  type TranscriptRecoveryResult,
+} from "../../config/subscription-transcript.js";
+import {
   SessionConfigOptionReplayError,
   SessionModeReplayError,
   SessionModelReplayError,
@@ -93,7 +97,7 @@ function shouldFallbackToNewSession(error: unknown, record: SessionRecord): bool
   }
   const acp = extractAcpError(error);
   if (isAcpResourceNotFoundError(error) || isUnsupportedSessionLoadAcpError(acp)) {
-    return true;
+    return !sessionHasAgentMessages(record);
   }
 
   return !sessionHasAgentMessages(record) && isFallbackSafeEmptySessionError(error, acp);
@@ -308,6 +312,7 @@ export async function connectAndLoadSession(
   record.closed = false;
   record.closedAt = undefined;
   options.onConnectedRecord?.(record);
+  await ensurePendingSubscriptionSwitchTranscript(record, options.verbose);
 
   let resumed = false;
   let loadError: string | undefined;
@@ -322,6 +327,7 @@ export async function connectAndLoadSession(
     reusingLoadedSession,
     sameSessionOnly,
     timeoutMs: options.timeoutMs,
+    verbose: options.verbose,
   });
   resumed = loadState.resumed;
   loadError = loadState.loadError;
@@ -471,6 +477,7 @@ async function loadOrCreateRuntimeSession(params: {
   reusingLoadedSession: boolean;
   sameSessionOnly: boolean;
   timeoutMs?: number;
+  verbose?: boolean;
 }): Promise<RuntimeSessionLoadState> {
   if (params.reusingLoadedSession) {
     return {
@@ -505,22 +512,19 @@ async function resumeRuntimeSession(params: {
   record: SessionRecord;
   sameSessionOnly: boolean;
   timeoutMs?: number;
+  verbose?: boolean;
 }): Promise<RuntimeSessionLoadState> {
   try {
-    const resumeResult = await withTimeout(
-      params.client.resumeSession(params.record.acpSessionId, params.record.cwd),
-      params.timeoutMs,
-    );
-    reconcileAgentSessionId(params.record, resumeResult.agentSessionId);
-    applyConfigOptionsToRecord(params.record, resumeResult);
-    return {
-      sessionId: params.record.acpSessionId,
-      pendingAgentSessionId: params.record.agentSessionId,
-      sessionModels: resumeResult.models,
-      resumed: true,
-      createdFreshSession: false,
-    };
+    return await runResumeRuntimeSession(params);
   } catch (error) {
+    const recovered = await recoverMissingTranscriptAndRetry(
+      params,
+      error,
+      runResumeRuntimeSession,
+    );
+    if (recovered) {
+      return recovered;
+    }
     return await recoverRuntimeSessionLoadFailure(params, error);
   }
 }
@@ -530,26 +534,147 @@ async function loadRuntimeSession(params: {
   record: SessionRecord;
   sameSessionOnly: boolean;
   timeoutMs?: number;
+  verbose?: boolean;
 }): Promise<RuntimeSessionLoadState> {
   try {
-    const loadResult = await withTimeout(
-      params.client.loadSessionWithOptions(params.record.acpSessionId, params.record.cwd, {
-        suppressReplayUpdates: true,
-      }),
-      params.timeoutMs,
-    );
-    reconcileAgentSessionId(params.record, loadResult.agentSessionId);
-    applyConfigOptionsToRecord(params.record, loadResult);
-    return {
-      sessionId: params.record.acpSessionId,
-      pendingAgentSessionId: params.record.agentSessionId,
-      sessionModels: loadResult.models,
-      resumed: true,
-      createdFreshSession: false,
-    };
+    return await runLoadRuntimeSession(params);
   } catch (error) {
+    const recovered = await recoverMissingTranscriptAndRetry(params, error, runLoadRuntimeSession);
+    if (recovered) {
+      return recovered;
+    }
     return await recoverRuntimeSessionLoadFailure(params, error);
   }
+}
+
+async function runResumeRuntimeSession(params: {
+  client: AcpClient;
+  record: SessionRecord;
+  timeoutMs?: number;
+}): Promise<RuntimeSessionLoadState> {
+  const resumeResult = await withTimeout(
+    params.client.resumeSession(params.record.acpSessionId, params.record.cwd),
+    params.timeoutMs,
+  );
+  reconcileAgentSessionId(params.record, resumeResult.agentSessionId);
+  applyConfigOptionsToRecord(params.record, resumeResult);
+  return {
+    sessionId: params.record.acpSessionId,
+    pendingAgentSessionId: params.record.agentSessionId,
+    sessionModels: resumeResult.models,
+    resumed: true,
+    createdFreshSession: false,
+  };
+}
+
+async function runLoadRuntimeSession(params: {
+  client: AcpClient;
+  record: SessionRecord;
+  timeoutMs?: number;
+}): Promise<RuntimeSessionLoadState> {
+  const loadResult = await withTimeout(
+    params.client.loadSessionWithOptions(params.record.acpSessionId, params.record.cwd, {
+      suppressReplayUpdates: true,
+    }),
+    params.timeoutMs,
+  );
+  reconcileAgentSessionId(params.record, loadResult.agentSessionId);
+  applyConfigOptionsToRecord(params.record, loadResult);
+  return {
+    sessionId: params.record.acpSessionId,
+    pendingAgentSessionId: params.record.agentSessionId,
+    sessionModels: loadResult.models,
+    resumed: true,
+    createdFreshSession: false,
+  };
+}
+
+async function recoverMissingTranscriptAndRetry(
+  params: {
+    client: AcpClient;
+    record: SessionRecord;
+    sameSessionOnly: boolean;
+    timeoutMs?: number;
+    verbose?: boolean;
+  },
+  error: unknown,
+  retry: (params: {
+    client: AcpClient;
+    record: SessionRecord;
+    timeoutMs?: number;
+  }) => Promise<RuntimeSessionLoadState>,
+): Promise<RuntimeSessionLoadState | undefined> {
+  if (!isAcpResourceNotFoundError(error)) {
+    return undefined;
+  }
+
+  const recovery = await ensureTranscriptAtActiveConfigDir(params.record);
+  if (recovery.status === "ported") {
+    logTranscriptRecovery(params.record, recovery, params.verbose);
+    try {
+      return await retry(params);
+    } catch (retryError) {
+      return await recoverRuntimeSessionLoadFailure(params, retryError);
+    }
+  }
+
+  if (sessionHasAgentMessages(params.record)) {
+    throw makeSessionResumeRequiredError({
+      record: params.record,
+      reason: missingTranscriptReason(recovery),
+      cause: error,
+    });
+  }
+
+  return undefined;
+}
+
+async function ensurePendingSubscriptionSwitchTranscript(
+  record: SessionRecord,
+  verbose?: boolean,
+): Promise<void> {
+  const pendingSwitch = record.acpx?.session_options?.subscription_switch;
+  if (!pendingSwitch || !record.acpSessionId.trim() || !sessionHasAgentMessages(record)) {
+    return;
+  }
+
+  const recovery = await ensureTranscriptAtActiveConfigDir(record);
+  if (recovery.status === "missing") {
+    throw makeSessionResumeRequiredError({
+      record,
+      reason: `pending subscription switch ${formatSubscriptionSwitch(pendingSwitch)} cannot resume: ${missingTranscriptReason(recovery)}`,
+    });
+  }
+  if (recovery.status === "ported") {
+    logTranscriptRecovery(record, recovery, verbose);
+  }
+}
+
+function missingTranscriptReason(recovery: TranscriptRecoveryResult): string {
+  const searched =
+    recovery.searchedPaths.length > 0 ? `; searched: ${recovery.searchedPaths.join(", ")}` : "";
+  return `missing transcript at ${recovery.activePath}${searched}`;
+}
+
+function formatSubscriptionSwitch(
+  pendingSwitch: NonNullable<
+    NonNullable<NonNullable<SessionRecord["acpx"]>["session_options"]>["subscription_switch"]
+  >,
+): string {
+  return `${pendingSwitch.from ?? "<default>"} -> ${pendingSwitch.to}`;
+}
+
+function logTranscriptRecovery(
+  record: SessionRecord,
+  recovery: TranscriptRecoveryResult,
+  verbose?: boolean,
+): void {
+  if (!verbose || recovery.status !== "ported") {
+    return;
+  }
+  process.stderr.write(
+    `[acpx] ported transcript for session ${record.acpSessionId} from ${recovery.sourcePath} to ${recovery.activePath}\n`,
+  );
 }
 
 async function recoverRuntimeSessionLoadFailure(
@@ -558,6 +683,7 @@ async function recoverRuntimeSessionLoadFailure(
     record: SessionRecord;
     sameSessionOnly: boolean;
     timeoutMs?: number;
+    verbose?: boolean;
   },
   error: unknown,
 ): Promise<RuntimeSessionLoadState> {
@@ -570,6 +696,13 @@ async function recoverRuntimeSessionLoadFailure(
     });
   }
   if (!shouldFallbackToNewSession(error, params.record)) {
+    if (sessionHasAgentMessages(params.record)) {
+      throw makeSessionResumeRequiredError({
+        record: params.record,
+        reason: loadError,
+        cause: error,
+      });
+    }
     throw error;
   }
   return {

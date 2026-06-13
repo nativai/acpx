@@ -8,6 +8,7 @@ import type {
 } from "../../types.js";
 import { SESSION_RECORD_SCHEMA } from "../../types.js";
 import { defaultSessionEventLog } from "../event-log.js";
+import { normalizeSessionOwnerOptions } from "../owner-options.js";
 import { normalizeRuntimeSessionId } from "../runtime-session-id.js";
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -331,6 +332,7 @@ function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
     state.config_options = record.config_options as SessionAcpxState["config_options"];
   }
 
+  assignParsedOwnerOptions(state, record.owner_options);
   assignParsedSessionOptions(state, record.session_options);
 
   return state;
@@ -370,6 +372,13 @@ function assignDesiredConfigOptions(state: SessionAcpxState, raw: unknown): void
   );
   if (Object.keys(parsed).length > 0) {
     state.desired_config_options = parsed;
+  }
+}
+
+function assignParsedOwnerOptions(state: SessionAcpxState, raw: unknown): void {
+  const ownerOptions = normalizeSessionOwnerOptions(raw as SessionAcpxState["owner_options"]);
+  if (ownerOptions) {
+    state.owner_options = ownerOptions;
   }
 }
 

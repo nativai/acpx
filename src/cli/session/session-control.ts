@@ -8,6 +8,7 @@ import {
   setDesiredModeId,
   setDesiredModelId,
 } from "../../session/mode-preference.js";
+import { assertRecordModelSupported } from "../../session/model-application.js";
 import {
   resolveSessionRecord,
   writeSessionRecord,
@@ -94,6 +95,13 @@ export async function setSessionMode(
 export async function setSessionModel(
   options: SessionSetModelOptions,
 ): Promise<SessionSetModelResult> {
+  const record = await resolveSessionRecord(options.sessionId);
+  assertRecordModelSupported({
+    record,
+    requestedModel: options.modelId,
+    context: "apply",
+  });
+
   const submittedToOwner = await trySetModelOnRunningOwner(
     options.sessionId,
     options.modelId,
@@ -101,7 +109,6 @@ export async function setSessionModel(
     options.verbose,
   );
   if (submittedToOwner) {
-    const record = await resolveSessionRecord(options.sessionId);
     setDesiredModelId(record, options.modelId);
     setCurrentModelId(record, options.modelId);
     await writeSessionRecord(record);

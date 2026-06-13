@@ -1,6 +1,6 @@
 import os from "node:os";
 import path from "node:path";
-import { portTranscript } from "../../config/subscription-transcript.js";
+import { ensureTranscriptAtConfigDir } from "../../config/subscription-transcript.js";
 import {
   chooseSubscriptionConfigDir,
   findSubscription,
@@ -11,6 +11,7 @@ import {
 } from "../../config/subscriptions.js";
 import { isoNow } from "../../session/persistence/repository.js";
 import type { SessionRecord } from "../../types.js";
+import { sessionHasAgentMessages } from "./lifecycle.js";
 
 // The switch primitive: change a session's active Claude subscription IN PLACE,
 // reused by both the manual `set subscription` CLI and auto-failover. PURE record
@@ -109,21 +110,50 @@ export async function switchSessionSubscription(args: {
   const dstConfigDir = resolveTargetConfigDir(targetSubId, registry);
   const from = args.record.acpx?.session_options?.subscription?.trim() || undefined;
 
-  // Port the transcript so the respawn resumes with context (no-op for a fresh
-  // session that never ran a turn — no acpSessionId / no source JSONL).
-  let transcriptCopied = false;
-  const acpSessionId = args.record.acpSessionId?.trim();
-  if (acpSessionId) {
-    const result = await portTranscript({
-      srcConfigDir: resolveCurrentConfigDir(args.record, registry),
-      dstConfigDir,
-      cwd: args.record.cwd,
-      acpSessionId,
-    });
-    transcriptCopied = result.copied;
-  }
+  const transcriptCopied = await portSwitchTranscript({
+    record: args.record,
+    targetSubId,
+    dstConfigDir,
+    registry,
+    loadOpts: args.loadOpts,
+  });
 
   recordSwitch(args.record, from, targetSubId, args.reason);
 
   return { from, to: targetSubId, transcriptCopied };
+}
+
+async function portSwitchTranscript(args: {
+  record: SessionRecord;
+  targetSubId: string;
+  dstConfigDir: string;
+  registry: SubscriptionRegistry;
+  loadOpts?: SubscriptionLookupOptions;
+}): Promise<boolean> {
+  // Port the transcript so the respawn resumes with context (no-op for a fresh
+  // session that never ran a turn -- no acpSessionId / no source JSONL).
+  const acpSessionId = args.record.acpSessionId?.trim();
+  if (!acpSessionId) {
+    return false;
+  }
+
+  const recovery = await ensureTranscriptAtConfigDir(args.record, args.dstConfigDir, {
+    ...args.loadOpts,
+    registry: args.registry,
+    sourceConfigDirs: [resolveCurrentConfigDir(args.record, args.registry)],
+  });
+  if (recovery.status === "missing" && sessionHasAgentMessages(args.record)) {
+    throw new SubscriptionSwitchError(
+      `cannot switch session ${args.record.acpSessionId} to subscription "${args.targetSubId}": ${missingTranscriptMessage(recovery)}`,
+    );
+  }
+  return recovery.status === "ported";
+}
+
+function missingTranscriptMessage(
+  recovery: Awaited<ReturnType<typeof ensureTranscriptAtConfigDir>>,
+): string {
+  const searched =
+    recovery.searchedPaths.length > 0 ? `; searched: ${recovery.searchedPaths.join(", ")}` : "";
+  return `missing transcript at ${recovery.activePath}${searched}`;
 }

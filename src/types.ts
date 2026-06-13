@@ -387,6 +387,13 @@ export type SessionMessagesLogState = {
   bytes: number;
 };
 
+export type SessionOwnerOptions = {
+  permission_mode: PermissionMode;
+  non_interactive_permissions?: NonInteractivePermissionPolicy;
+  auth_policy?: AuthPolicy;
+  terminal?: boolean;
+};
+
 export type SessionAcpxState = {
   reset_on_next_ensure?: boolean;
   current_mode_id?: string;
@@ -397,6 +404,7 @@ export type SessionAcpxState = {
   available_commands?: string[];
   progress?: AgentProgress;
   config_options?: SessionConfigOption[];
+  owner_options?: SessionOwnerOptions;
   session_options?: {
     model?: string;
     allowed_tools?: string[];

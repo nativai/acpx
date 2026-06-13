@@ -11,6 +11,7 @@ import {
   setDesiredModeId,
   setDesiredModelId,
 } from "../../session/mode-preference.js";
+import { assertRecordModelSupported } from "../../session/model-application.js";
 import { resolveSessionRecord, writeSessionRecord } from "../../session/persistence.js";
 import type {
   AuthPolicy,
@@ -131,6 +132,11 @@ export async function runSessionSetModelDirect(
 ): Promise<SessionSetModelResult> {
   const result = await withConnectedSession(
     buildDirectConnectedSessionOptions(options, async ({ client, sessionId, record }) => {
+      assertRecordModelSupported({
+        record,
+        requestedModel: options.modelId,
+        context: "apply",
+      });
       await withTimeout(client.setSessionModel(sessionId, options.modelId), options.timeoutMs);
       setDesiredModelId(record, options.modelId);
       setCurrentModelId(record, options.modelId);

@@ -1462,6 +1462,368 @@ test("sessions new and ensure accept -s as shorthand for --name", async () => {
   });
 });
 
+test("explicit unknown --subscription fails before spawn or persistence at runtime entry points", async () => {
+  const scenarios = [
+    {
+      name: "sessions new",
+      args: (cwd: string) => [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--subscription",
+        "ghost",
+        "sessions",
+        "new",
+      ],
+    },
+    {
+      name: "sessions ensure",
+      args: (cwd: string) => [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--subscription",
+        "ghost",
+        "sessions",
+        "ensure",
+      ],
+    },
+    {
+      name: "exec",
+      args: (cwd: string) => [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--subscription",
+        "ghost",
+        "exec",
+        "echo hello",
+      ],
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await withTempHome(async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      await fs.mkdir(cwd, { recursive: true });
+      await writeSubscriptionRegistry(homeDir);
+
+      const result = await runCli(scenario.args(cwd), homeDir);
+
+      assert.notEqual(result.code, 0, `${scenario.name} unexpectedly succeeded`);
+      assert.match(result.stderr, /subscription "ghost" not found in registry/);
+      assert.match(result.stderr, /Known subscription ids: sub1, sub2/);
+      assert.deepEqual(await listSessionRecordFiles(homeDir), []);
+    });
+  }
+
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeSubscriptionRegistry(homeDir);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "subscription-prompt-session",
+      acpSessionId: "subscription-prompt-session",
+      agentCommand: MOCK_AGENT_COMMAND,
+      cwd,
+      acpx: {
+        session_options: {
+          subscription: "sub1",
+        },
+      },
+    });
+    const sessionPath = sessionFilePath(homeDir, "subscription-prompt-session");
+    const before = await fs.readFile(sessionPath, "utf8");
+
+    const result = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--subscription",
+        "ghost",
+        "prompt",
+        "echo hello",
+      ],
+      homeDir,
+    );
+
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /subscription "ghost" not found in registry/);
+    assert.match(result.stderr, /Known subscription ids: sub1, sub2/);
+    assert.deepEqual(await listSessionRecordFiles(homeDir), ["subscription-prompt-session.json"]);
+    assert.equal(await fs.readFile(sessionPath, "utf8"), before);
+  });
+});
+
+test("explicit valid --subscription on existing persistent sessions must apply or fail loud", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const envDumpFile = path.join(homeDir, "adapter-env.json");
+    const agentCommand = `${MOCK_AGENT_COMMAND} --supports-load-session --env-dump-file ${JSON.stringify(envDumpFile)}`;
+    const sub1Dir = path.join(homeDir, ".acpx", "subscriptions", "sub1");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeSubscriptionRegistry(homeDir);
+
+    const created = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        agentCommand,
+        "--approve-all",
+        "--subscription",
+        "sub1",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+      ],
+      homeDir,
+    );
+    assert.equal(created.code, 0, created.stderr);
+    const createdPayload = JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown };
+    assert.equal(typeof createdPayload.acpxRecordId, "string");
+
+    const samePrompt = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        agentCommand,
+        "--approve-all",
+        "--subscription",
+        "sub1",
+        "--format",
+        "quiet",
+        "--ttl",
+        "1",
+        "prompt",
+        "echo same-sub",
+      ],
+      homeDir,
+      { timeoutMs: 20_000 },
+    );
+    assert.equal(samePrompt.code, 0, samePrompt.stderr);
+    assert.match(samePrompt.stdout, /same-sub/);
+
+    const promptEnv = JSON.parse(await fs.readFile(envDumpFile, "utf8")) as Record<string, string>;
+    assert.equal(promptEnv.CLAUDE_CONFIG_DIR, sub1Dir);
+    assert.equal(promptEnv.ACPX_SUBSCRIPTION, "sub1");
+
+    const sameEnsure = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        agentCommand,
+        "--subscription",
+        "sub1",
+        "--format",
+        "json",
+        "sessions",
+        "ensure",
+      ],
+      homeDir,
+    );
+    assert.equal(sameEnsure.code, 0, sameEnsure.stderr);
+    const sameEnsurePayload = JSON.parse(sameEnsure.stdout.trim()) as {
+      created?: unknown;
+    };
+    assert.equal(sameEnsurePayload.created, false);
+  });
+
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const envDumpFile = path.join(homeDir, "adapter-env.json");
+    const agentCommand = `${MOCK_AGENT_COMMAND} --supports-load-session --env-dump-file ${JSON.stringify(envDumpFile)}`;
+    const sub2Dir = path.join(homeDir, ".acpx", "subscriptions", "sub2");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeSubscriptionRegistry(homeDir);
+
+    const created = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        agentCommand,
+        "--approve-all",
+        "--subscription",
+        "sub1",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+      ],
+      homeDir,
+    );
+    assert.equal(created.code, 0, created.stderr);
+    const createdPayload = JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown };
+    assert.equal(typeof createdPayload.acpxRecordId, "string");
+    const sessionPath = sessionFilePath(homeDir, String(createdPayload.acpxRecordId));
+
+    const beforeRejectRecord = await fs.readFile(sessionPath, "utf8");
+    const beforeRejectEnv = await fs.readFile(envDumpFile, "utf8");
+
+    const differentPrompt = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        agentCommand,
+        "--approve-all",
+        "--subscription",
+        "sub2",
+        "prompt",
+        "echo should-not-run",
+      ],
+      homeDir,
+    );
+    assert.notEqual(differentPrompt.code, 0);
+    assert.match(differentPrompt.stderr, /Cannot apply --subscription "sub2"/);
+    assert.match(differentPrompt.stderr, /current subscription is "sub1"/);
+    assert.match(differentPrompt.stderr, /set subscription sub2/);
+    assert.doesNotMatch(differentPrompt.stdout, /should-not-run/);
+    assert.equal(await fs.readFile(sessionPath, "utf8"), beforeRejectRecord);
+    assert.equal(await fs.readFile(envDumpFile, "utf8"), beforeRejectEnv);
+
+    const differentEnsure = await runCli(
+      ["--cwd", cwd, "--agent", agentCommand, "--subscription", "sub2", "sessions", "ensure"],
+      homeDir,
+    );
+    assert.notEqual(differentEnsure.code, 0);
+    assert.match(differentEnsure.stderr, /Cannot apply --subscription "sub2"/);
+    assert.match(differentEnsure.stderr, /current subscription is "sub1"/);
+    assert.equal(await fs.readFile(sessionPath, "utf8"), beforeRejectRecord);
+
+    const execResult = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        agentCommand,
+        "--approve-all",
+        "--subscription",
+        "sub2",
+        "--format",
+        "quiet",
+        "exec",
+        "echo one-shot",
+      ],
+      homeDir,
+      { timeoutMs: 20_000 },
+    );
+    assert.equal(execResult.code, 0, execResult.stderr);
+    assert.match(execResult.stdout, /one-shot/);
+    const execEnv = JSON.parse(await fs.readFile(envDumpFile, "utf8")) as Record<string, string>;
+    assert.equal(execEnv.CLAUDE_CONFIG_DIR, sub2Dir);
+    assert.equal(execEnv.ACPX_SUBSCRIPTION, "sub2");
+    assert.equal(await fs.readFile(sessionPath, "utf8"), beforeRejectRecord);
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "profile-backed-sub2",
+      acpSessionId: "profile-backed-sub2",
+      agentCommand,
+      cwd,
+      name: "profile-backed",
+      acpx: {
+        session_options: {
+          profile: "sub2",
+        },
+      },
+    });
+    const profileSame = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        agentCommand,
+        "--approve-all",
+        "--subscription",
+        "sub2-same-account",
+        "--format",
+        "quiet",
+        "--ttl",
+        "1",
+        "prompt",
+        "--session",
+        "profile-backed",
+        "echo profile-backed-same",
+      ],
+      homeDir,
+      { timeoutMs: 20_000 },
+    );
+    assert.equal(profileSame.code, 0, profileSame.stderr);
+    assert.match(profileSame.stdout, /profile-backed-same/);
+    const profileSameEnv = JSON.parse(await fs.readFile(envDumpFile, "utf8")) as Record<
+      string,
+      string
+    >;
+    assert.equal(profileSameEnv.CLAUDE_CONFIG_DIR, sub2Dir);
+    assert.equal(profileSameEnv.ACPX_SUBSCRIPTION, "sub2");
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "profile-backed-reject",
+      acpSessionId: "profile-backed-reject",
+      agentCommand,
+      cwd,
+      name: "profile-reject",
+      acpx: {
+        session_options: {
+          profile: "sub2",
+        },
+      },
+    });
+    const profileRejectPath = sessionFilePath(homeDir, "profile-backed-reject");
+    const beforeProfileReject = await fs.readFile(profileRejectPath, "utf8");
+    const profileDifferentPrompt = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        agentCommand,
+        "--approve-all",
+        "--subscription",
+        "sub1",
+        "prompt",
+        "--session",
+        "profile-reject",
+        "echo profile-should-not-run",
+      ],
+      homeDir,
+    );
+    assert.notEqual(profileDifferentPrompt.code, 0);
+    assert.match(profileDifferentPrompt.stderr, /Cannot apply --subscription "sub1"/);
+    assert.match(profileDifferentPrompt.stderr, /current subscription is "sub2"/);
+    assert.doesNotMatch(profileDifferentPrompt.stdout, /profile-should-not-run/);
+    assert.equal(await fs.readFile(profileRejectPath, "utf8"), beforeProfileReject);
+
+    const profileDifferentEnsure = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        agentCommand,
+        "--subscription",
+        "sub1",
+        "sessions",
+        "ensure",
+        "--name",
+        "profile-reject",
+      ],
+      homeDir,
+    );
+    assert.notEqual(profileDifferentEnsure.code, 0);
+    assert.match(profileDifferentEnsure.stderr, /Cannot apply --subscription "sub1"/);
+    assert.match(profileDifferentEnsure.stderr, /current subscription is "sub2"/);
+    assert.equal(await fs.readFile(profileRejectPath, "utf8"), beforeProfileReject);
+  });
+});
+
 test("sessions new maps inherited effort to the child model's advertised levels", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -3819,6 +4181,64 @@ async function runCli(
       resolve({ code, stdout, stderr });
     });
   });
+}
+
+async function writeSubscriptionRegistry(homeDir: string): Promise<void> {
+  const subscriptionsRoot = path.join(homeDir, ".acpx", "subscriptions");
+  await fs.mkdir(path.join(subscriptionsRoot, "sub1"), { recursive: true });
+  await fs.mkdir(path.join(subscriptionsRoot, "sub2"), { recursive: true });
+  await fs.mkdir(path.join(subscriptionsRoot, "sub2-same-account"), { recursive: true });
+  await fs.writeFile(
+    path.join(subscriptionsRoot, "registry.json"),
+    `${JSON.stringify(
+      {
+        version: 3,
+        default: "sub1",
+        profiles: [
+          {
+            id: "sub1",
+            label: "Sub 1",
+            authMode: "subscription",
+            adapter: "claude",
+            account: "acct-a",
+            credentialSource: path.join(subscriptionsRoot, "sub1"),
+          },
+          {
+            id: "sub2",
+            label: "Sub 2",
+            authMode: "subscription",
+            adapter: "claude",
+            account: "acct-b",
+            credentialSource: path.join(subscriptionsRoot, "sub2"),
+          },
+          {
+            id: "sub2-same-account",
+            label: "Sub 2 Same Account",
+            authMode: "subscription",
+            adapter: "claude",
+            account: "acct-b",
+            credentialSource: path.join(subscriptionsRoot, "sub2-same-account"),
+          },
+        ],
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+}
+
+async function listSessionRecordFiles(homeDir: string): Promise<string[]> {
+  const sessionDir = path.join(homeDir, ".acpx", "sessions");
+  try {
+    const entries = await fs.readdir(sessionDir);
+    return entries.filter((entry) => entry.endsWith(".json") && entry !== "index.json").toSorted();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
 }
 
 function makeSessionRecord(
