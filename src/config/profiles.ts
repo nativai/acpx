@@ -86,6 +86,7 @@ export type EffectiveResolution = {
   selectedAccountId: AccountId | null;
   physicalDir: string;
   effectiveAccount: AccountId | null;
+  method: "path" | "selection";
   verified: boolean;
 };
 
@@ -773,15 +774,37 @@ function profileMatchesPhysicalDir(profile: ResolvedProfile, normalizedDir: stri
   return anchor !== null && normalizeAnchorPath(anchor) === normalizedDir;
 }
 
+function profileMatchesCodexHome(profile: ResolvedProfile, normalizedDir: string): boolean {
+  return profile.authMode === "chatgpt" && normalizeAnchorPath(profile.codexHome) === normalizedDir;
+}
+
+function resolvePhysicalAccountFromRegistry(
+  dir: string,
+  registry: ProfileRegistry,
+): AccountId | null {
+  const normalizedDir = normalizeAnchorPath(dir);
+  const match = registry.profiles.find((profile) =>
+    profileMatchesPhysicalDir(profile, normalizedDir),
+  );
+  return match?.account ?? null;
+}
+
+function resolveChatGptPhysicalAccountFromRegistry(
+  dir: string,
+  registry: ProfileRegistry,
+): AccountId | null {
+  const normalizedDir = normalizeAnchorPath(dir);
+  const match = registry.profiles.find((profile) =>
+    profileMatchesCodexHome(profile, normalizedDir),
+  );
+  return match?.account ?? null;
+}
+
 export async function resolvePhysicalAccount(
   dir: string,
   options?: SubscriptionLookupOptions,
 ): Promise<AccountId | null> {
-  const normalizedDir = normalizeAnchorPath(dir);
-  const match = loadProfileRegistry(options).profiles.find((profile) =>
-    profileMatchesPhysicalDir(profile, normalizedDir),
-  );
-  return match?.account ?? null;
+  return resolvePhysicalAccountFromRegistry(dir, loadProfileRegistry(options));
 }
 
 function selectedProfileIdFromRecord(record: EffectiveResolutionRecord): ProfileId | null {
@@ -799,6 +822,26 @@ function physicalDirFromEnv(env: NodeJS.ProcessEnv): string {
   );
 }
 
+function effectiveResolutionForProfile(
+  selectedProfile: ResolvedProfile | undefined,
+  physicalDir: string,
+  registry: ProfileRegistry,
+): Pick<EffectiveResolution, "effectiveAccount" | "method"> {
+  if (selectedProfile?.authMode === "openrouter") {
+    return { effectiveAccount: selectedProfile.account, method: "selection" };
+  }
+  if (selectedProfile?.authMode === "chatgpt") {
+    return {
+      effectiveAccount: resolveChatGptPhysicalAccountFromRegistry(physicalDir, registry),
+      method: "path",
+    };
+  }
+  return {
+    effectiveAccount: resolvePhysicalAccountFromRegistry(physicalDir, registry),
+    method: "path",
+  };
+}
+
 export async function verifyEffectiveResolution(
   record: EffectiveResolutionRecord,
   env: NodeJS.ProcessEnv,
@@ -808,13 +851,18 @@ export async function verifyEffectiveResolution(
   const selectedProfileId = selectedProfileIdFromRecord(record);
   const selectedProfile = selectedProfileId ? findProfile(selectedProfileId, registry) : undefined;
   const physicalDir = physicalDirFromEnv(env);
-  const effectiveAccount = await resolvePhysicalAccount(physicalDir, options);
+  const { effectiveAccount, method } = effectiveResolutionForProfile(
+    selectedProfile,
+    physicalDir,
+    registry,
+  );
   const selectedAccountId = selectedProfile?.account ?? null;
   return {
     selectedProfileId,
     selectedAccountId,
     physicalDir,
     effectiveAccount,
+    method,
     verified: selectedAccountId === null || selectedAccountId === effectiveAccount,
   };
 }

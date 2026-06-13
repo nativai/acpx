@@ -318,6 +318,21 @@ test("W5 seam contract: siblings, transcript anchors, and physical account verif
           account: "home-b",
           homePath: "__HOME2__",
         },
+        {
+          id: "openrouter1",
+          label: "OpenRouter One",
+          authMode: "openrouter",
+          account: "or-a",
+          model: "anthropic/claude-3-5-sonnet",
+          openRouterApiKey: "test-key",
+        },
+        {
+          id: "codex1",
+          label: "Codex One",
+          authMode: "chatgpt",
+          account: "codex-a",
+          codexHome: "__CODEX1__",
+        },
       ],
     },
     async (ctx) => {
@@ -326,12 +341,16 @@ test("W5 seam contract: siblings, transcript anchors, and physical account verif
       const sub3Dir = ctx.configDir("sub3");
       const home1 = path.join(ctx.homeDir, "homes", "home1");
       const home2 = path.join(ctx.homeDir, "homes", "home2");
+      const codex1 = path.join(ctx.homeDir, "codex", "one");
+      const codexOther = path.join(ctx.homeDir, "codex", "other");
       await Promise.all([
         fs.mkdir(sub1Dir, { recursive: true }),
         fs.mkdir(sub2Dir, { recursive: true }),
         fs.mkdir(sub3Dir, { recursive: true }),
         fs.mkdir(path.join(home1, ".claude"), { recursive: true }),
         fs.mkdir(path.join(home2, ".claude"), { recursive: true }),
+        fs.mkdir(codex1, { recursive: true }),
+        fs.mkdir(codexOther, { recursive: true }),
       ]);
 
       const raw = await fs.readFile(ctx.registryPath, "utf8");
@@ -342,7 +361,8 @@ test("W5 seam contract: siblings, transcript anchors, and physical account verif
           .replace("__SUB2__", sub2Dir)
           .replace("__SUB3__", sub3Dir)
           .replace("__HOME1__", home1)
-          .replace("__HOME2__", home2),
+          .replace("__HOME2__", home2)
+          .replace("__CODEX1__", codex1),
         { mode: 0o600 },
       );
 
@@ -356,6 +376,8 @@ test("W5 seam contract: siblings, transcript anchors, and physical account verif
           ["sub3-same-account", "claude"],
           ["home1", "claude-pty"],
           ["home2", "claude-pty"],
+          ["openrouter1", "claude"],
+          ["codex1", "codex"],
         ],
       );
 
@@ -380,6 +402,7 @@ test("W5 seam contract: siblings, transcript anchors, and physical account verif
         lookup,
       );
       assert.equal(verified.effectiveAccount, "acct-b");
+      assert.equal(verified.method, "path");
       assert.equal(verified.verified, true);
 
       const mismatch = await verifyEffectiveResolution(
@@ -388,7 +411,35 @@ test("W5 seam contract: siblings, transcript anchors, and physical account verif
         lookup,
       );
       assert.equal(mismatch.effectiveAccount, "acct-a");
+      assert.equal(mismatch.method, "path");
       assert.equal(mismatch.verified, false);
+
+      const openrouter = await verifyEffectiveResolution(
+        { acpx: { session_options: { profile: "openrouter1" } } },
+        { CLAUDE_CONFIG_DIR: path.join(ctx.homeDir, "tmp", "or-session") },
+        lookup,
+      );
+      assert.equal(openrouter.effectiveAccount, "or-a");
+      assert.equal(openrouter.method, "selection");
+      assert.equal(openrouter.verified, true);
+
+      const chatgpt = await verifyEffectiveResolution(
+        { acpx: { session_options: { profile: "codex1" } } },
+        { CODEX_HOME: codex1 },
+        lookup,
+      );
+      assert.equal(chatgpt.effectiveAccount, "codex-a");
+      assert.equal(chatgpt.method, "path");
+      assert.equal(chatgpt.verified, true);
+
+      const chatgptMismatch = await verifyEffectiveResolution(
+        { acpx: { session_options: { profile: "codex1" } } },
+        { CODEX_HOME: codexOther },
+        lookup,
+      );
+      assert.equal(chatgptMismatch.effectiveAccount, null);
+      assert.equal(chatgptMismatch.method, "path");
+      assert.equal(chatgptMismatch.verified, false);
     },
   );
 });

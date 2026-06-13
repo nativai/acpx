@@ -872,6 +872,16 @@ export function buildClaudeHomeSelectorMeta(
 }
 
 // Handles the openrouter authMode branch of applyProfileAuth.
+function resolveOpenRouterApiKey(profile: OpenRouterProfileEntry): string | undefined {
+  if (profile.openRouterApiKeyEnv) {
+    const envValue = process.env[profile.openRouterApiKeyEnv];
+    if (typeof envValue === "string" && envValue.trim().length > 0) {
+      return envValue;
+    }
+  }
+  return profile.openRouterApiKey;
+}
+
 async function applyOpenRouterProfileAuth(
   env: NodeJS.ProcessEnv,
   profileId: string,
@@ -879,9 +889,7 @@ async function applyOpenRouterProfileAuth(
   profile: OpenRouterProfileEntry,
   reasoningEffortOverride: string | null | undefined,
 ): Promise<ShimHandle | null> {
-  const apiKey =
-    profile.openRouterApiKey ??
-    (profile.openRouterApiKeyEnv ? process.env[profile.openRouterApiKeyEnv] : undefined);
+  const apiKey = resolveOpenRouterApiKey(profile);
   const model = profile.model;
   if (!apiKey || !model) {
     throw new Error(
