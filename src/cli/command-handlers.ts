@@ -228,6 +228,23 @@ function sessionOptionsFromGlobalFlags(
   };
 }
 
+function validateExplicitSubscriptionFlag(globalFlags: GlobalFlags): void {
+  const subscriptionId = globalFlags.subscription?.trim();
+  if (!subscriptionId) {
+    return;
+  }
+
+  const registry = loadSubscriptionRegistry();
+  if (findSubscription(subscriptionId, registry)) {
+    return;
+  }
+
+  throw new SubscriptionUnknownError(
+    subscriptionId,
+    registry.subscriptions.map((entry) => entry.id),
+  );
+}
+
 // `--reasoning-effort` is claude-only. When it's passed but the effective agent
 // is not claude (explicit codex, or a bare spawn that inherited a non-claude
 // parent), it never writes effort — say so once on stderr (never an error).
@@ -693,6 +710,7 @@ export async function handlePrompt(
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
+  validateExplicitSubscriptionFlag(globalFlags);
   const outputPolicy = resolveRequestedOutputPolicy(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
@@ -777,8 +795,10 @@ export async function handleExec(
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  validateExplicitSubscriptionFlag(globalFlags);
+
   if (config.disableExec) {
-    const globalFlags = resolveGlobalFlags(command, config);
     const outputPolicy = resolveRequestedOutputPolicy(globalFlags);
     if (outputPolicy.format === "json") {
       process.stdout.write(
@@ -800,7 +820,6 @@ export async function handleExec(
     return;
   }
 
-  const globalFlags = resolveGlobalFlags(command, config);
   const outputPolicy = resolveRequestedOutputPolicy(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
@@ -1103,7 +1122,10 @@ export async function handleSetSubscription(
   const trimmedId = subscriptionId.trim();
   const registry = loadSubscriptionRegistry();
   if (!findSubscription(trimmedId, registry)) {
-    throw new SubscriptionUnknownError(trimmedId);
+    throw new SubscriptionUnknownError(
+      trimmedId,
+      registry.subscriptions.map((entry) => entry.id),
+    );
   }
   const sessionName = resolveSessionNameFromFlags(flags, command);
   const record = await findRoutedSessionOrThrow(
@@ -1313,6 +1335,7 @@ export async function handleSessionsNew(
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
+  validateExplicitSubscriptionFlag(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const parent = await resolveAndValidateParentSessionId(flags);
@@ -1416,6 +1439,7 @@ export async function handleSessionsEnsure(
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
+  validateExplicitSubscriptionFlag(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const parent = await resolveAndValidateParentSessionId(flags);

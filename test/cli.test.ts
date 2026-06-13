@@ -1441,6 +1441,104 @@ test("sessions new and ensure accept -s as shorthand for --name", async () => {
   });
 });
 
+test("explicit unknown --subscription fails before spawn or persistence at runtime entry points", async () => {
+  const scenarios = [
+    {
+      name: "sessions new",
+      args: (cwd: string) => [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--subscription",
+        "ghost",
+        "sessions",
+        "new",
+      ],
+    },
+    {
+      name: "sessions ensure",
+      args: (cwd: string) => [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--subscription",
+        "ghost",
+        "sessions",
+        "ensure",
+      ],
+    },
+    {
+      name: "exec",
+      args: (cwd: string) => [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--subscription",
+        "ghost",
+        "exec",
+        "echo hello",
+      ],
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await withTempHome(async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      await fs.mkdir(cwd, { recursive: true });
+      await writeSubscriptionRegistry(homeDir);
+
+      const result = await runCli(scenario.args(cwd), homeDir);
+
+      assert.notEqual(result.code, 0, `${scenario.name} unexpectedly succeeded`);
+      assert.match(result.stderr, /subscription "ghost" not found in registry/);
+      assert.match(result.stderr, /Known subscription ids: sub1, sub2/);
+      assert.deepEqual(await listSessionRecordFiles(homeDir), []);
+    });
+  }
+
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeSubscriptionRegistry(homeDir);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "subscription-prompt-session",
+      acpSessionId: "subscription-prompt-session",
+      agentCommand: MOCK_AGENT_COMMAND,
+      cwd,
+      acpx: {
+        session_options: {
+          subscription: "sub1",
+        },
+      },
+    });
+    const sessionPath = sessionFilePath(homeDir, "subscription-prompt-session");
+    const before = await fs.readFile(sessionPath, "utf8");
+
+    const result = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--subscription",
+        "ghost",
+        "prompt",
+        "echo hello",
+      ],
+      homeDir,
+    );
+
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /subscription "ghost" not found in registry/);
+    assert.match(result.stderr, /Known subscription ids: sub1, sub2/);
+    assert.deepEqual(await listSessionRecordFiles(homeDir), ["subscription-prompt-session.json"]);
+    assert.equal(await fs.readFile(sessionPath, "utf8"), before);
+  });
+});
+
 test("sessions new maps inherited effort to the child model's advertised levels", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -3798,6 +3896,48 @@ async function runCli(
       resolve({ code, stdout, stderr });
     });
   });
+}
+
+async function writeSubscriptionRegistry(homeDir: string): Promise<void> {
+  const subscriptionsRoot = path.join(homeDir, ".acpx", "subscriptions");
+  await fs.mkdir(path.join(subscriptionsRoot, "sub1"), { recursive: true });
+  await fs.mkdir(path.join(subscriptionsRoot, "sub2"), { recursive: true });
+  await fs.writeFile(
+    path.join(subscriptionsRoot, "registry.json"),
+    `${JSON.stringify(
+      {
+        default: "sub1",
+        subscriptions: [
+          {
+            id: "sub1",
+            label: "Sub 1",
+            configDir: path.join(subscriptionsRoot, "sub1"),
+          },
+          {
+            id: "sub2",
+            label: "Sub 2",
+            configDir: path.join(subscriptionsRoot, "sub2"),
+          },
+        ],
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+}
+
+async function listSessionRecordFiles(homeDir: string): Promise<string[]> {
+  const sessionDir = path.join(homeDir, ".acpx", "sessions");
+  try {
+    const entries = await fs.readdir(sessionDir);
+    return entries.filter((entry) => entry.endsWith(".json") && entry !== "index.json").toSorted();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
 }
 
 function makeSessionRecord(
