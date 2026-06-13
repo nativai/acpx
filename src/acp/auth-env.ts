@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 import {
   hasKnownDeadAccounts,
@@ -7,6 +7,11 @@ import {
   isAccountKnownDead,
   isSubscriptionKnownDead,
 } from "../config/known-dead-subscriptions.js";
+import {
+  ensureProfileOsHarnessProvisioning,
+  registryMayConfigureProvisioning,
+  type ProvisioningWarningHandler,
+} from "../config/os-harness-provisioning.js";
 import {
   buildClaudeHomeMap,
   findProfile,
@@ -151,6 +156,7 @@ function buildAgentEnvironment(
   sessionContext?: AgentSessionContext,
   lookupOptions?: SubscriptionLookupOptions,
   agentCommand?: string,
+  onProvisioningWarning?: ProvisioningWarningHandler,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   promotePrefixedAuthEnvironment(env);
@@ -194,6 +200,7 @@ function buildAgentEnvironment(
       rejectExplicitSubscriptionForClaudePty(sessionContext?.subscriptionId);
     } else {
       applySubscriptionConfigDir(env, sessionContext?.subscriptionId ?? null, lookupOptions);
+      ensureProvisioningForResolvedSubscription(env, lookupOptions, onProvisioningWarning);
     }
   }
   if (!authCredentials) {
@@ -205,6 +212,27 @@ function buildAgentEnvironment(
   }
 
   return env;
+}
+
+function ensureProvisioningForResolvedSubscription(
+  env: NodeJS.ProcessEnv,
+  lookupOptions?: SubscriptionLookupOptions,
+  onProvisioningWarning?: ProvisioningWarningHandler,
+): void {
+  if (!env[ACPX_EFFECTIVE_PROFILE_ENV] || !registryMayConfigureProvisioning(lookupOptions)) {
+    return;
+  }
+  const registry = loadProfileRegistry(lookupOptions);
+  const profile = findProfile(env[ACPX_EFFECTIVE_PROFILE_ENV], registry);
+  if (!profile) {
+    return;
+  }
+  ensureProfileOsHarnessProvisioning({
+    registry,
+    profile,
+    env,
+    onWarning: onProvisioningWarning,
+  });
 }
 
 type ResolvedSubscription = {
@@ -667,42 +695,6 @@ export function resolveConfiguredAuthCredential(
   return configCredentials[methodId] ?? configCredentials[toEnvToken(methodId)];
 }
 
-// Seed a freshly-created OpenRouter config dir with the universal SessionStart
-// primer hook. OpenRouter sessions run with CLAUDE_CONFIG_DIR pointed at an
-// isolated temp dir (so no Anthropic OAuth can leak in); that isolation also
-// means Claude Code no longer reads the host's global ~/.claude/settings.json,
-// so the primer hook configured there would never fire. We fix that by copying
-// ONLY the `hooks` block from the host's global settings into the temp dir —
-// never the `.credentials.json`, so the shim's ANTHROPIC_BASE_URL/AUTH_TOKEN
-// remain the sole auth path and "local OAuth" can't win.
-//
-// Best-effort: if the source settings or its hooks are missing/unparseable we
-// leave the dir without a settings.json (the primer simply won't fire — same as
-// before this fix). Never throws — the primer is a nicety, not worth failing a
-// spawn over. The openRouterApiKey is not involved here, so nothing sensitive
-// is written.
-function seedOpenRouterPrimerHooks(configDir: string): void {
-  try {
-    const source = join(homedir(), ".claude", "settings.json");
-    if (!existsSync(source)) {
-      return;
-    }
-    const parsed = JSON.parse(readFileSync(source, "utf8")) as { hooks?: unknown };
-    if (!parsed || typeof parsed !== "object" || parsed.hooks == null) {
-      return;
-    }
-    writeFileSync(
-      join(configDir, "settings.json"),
-      JSON.stringify({ hooks: parsed.hooks }, null, 2),
-      {
-        mode: 0o644,
-      },
-    );
-  } catch {
-    /* best-effort: the primer is a nicety; never block the spawn over it */
-  }
-}
-
 /**
  * Apply profile-based authentication to the env dict and return a ShimHandle
  * for openrouter profiles (caller must stop it when the session closes), or
@@ -905,11 +897,6 @@ async function applyOpenRouterProfileAuth(
   // Isolate Claude config in a per-session temp dir (no OAuth inheritance).
   const configDir = join(tmpdir(), `or-${sessionId}`);
   mkdirSync(configDir, { recursive: true });
-  // Seed the dir with the universal SessionStart primer hook so OpenRouter
-  // sessions get the same primer that subscription sessions get from their
-  // own config dir. Copies ONLY the hooks block — never .credentials.json —
-  // so the shim's ANTHROPIC_BASE_URL/AUTH_TOKEN stay the sole auth path.
-  seedOpenRouterPrimerHooks(configDir);
   env.CLAUDE_CONFIG_DIR = configDir;
 
   // Start the model-rewrite shim; apiKey never appears in logs.
@@ -932,6 +919,7 @@ export async function applyProfileAuth(
   reasoningEffortOverride?: string | null,
   lookupOptions?: SubscriptionLookupOptions,
   agentCommand?: string,
+  onProvisioningWarning?: ProvisioningWarningHandler,
 ): Promise<ShimHandle | null> {
   const trimmedId = profileId.trim();
   if (!trimmedId) {
@@ -951,6 +939,12 @@ export async function applyProfileAuth(
   if (profile.authMode === "claude-home") {
     applyClaudeHomeProfileAuth(env, registry);
     verifyProfileEffectiveAccount(env, profile, registry);
+    ensureProfileOsHarnessProvisioning({
+      registry,
+      profile,
+      env,
+      onWarning: onProvisioningWarning,
+    });
     return null;
   }
 
@@ -958,6 +952,12 @@ export async function applyProfileAuth(
     // Behave exactly like applySubscriptionConfigDir for subscription profiles.
     applySubscriptionConfigDir(env, trimmedId, lookupOptions);
     verifyProfileEffectiveAccount(env, profile, registry);
+    ensureProfileOsHarnessProvisioning({
+      registry,
+      profile,
+      env,
+      onWarning: onProvisioningWarning,
+    });
     return null;
   }
 
@@ -970,12 +970,24 @@ export async function applyProfileAuth(
       reasoningEffortOverride,
     );
     verifyProfileEffectiveAccount(env, profile, registry);
+    ensureProfileOsHarnessProvisioning({
+      registry,
+      profile,
+      env,
+      onWarning: onProvisioningWarning,
+    });
     return shim;
   }
 
   if (profile.authMode === "chatgpt") {
     applyChatGptProfileAuth(env, profile);
     verifyProfileEffectiveAccount(env, profile, registry);
+    ensureProfileOsHarnessProvisioning({
+      registry,
+      profile,
+      env,
+      onWarning: onProvisioningWarning,
+    });
     return null;
   }
 
@@ -988,6 +1000,7 @@ export function buildAgentSpawnOptions(
   sessionContext?: AgentSessionContext,
   lookupOptions?: SubscriptionLookupOptions,
   agentCommand?: string,
+  onProvisioningWarning?: ProvisioningWarningHandler,
 ): {
   cwd: string;
   env: NodeJS.ProcessEnv;
@@ -996,7 +1009,13 @@ export function buildAgentSpawnOptions(
 } {
   return {
     cwd,
-    env: buildAgentEnvironment(authCredentials, sessionContext, lookupOptions, agentCommand),
+    env: buildAgentEnvironment(
+      authCredentials,
+      sessionContext,
+      lookupOptions,
+      agentCommand,
+      onProvisioningWarning,
+    ),
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   };

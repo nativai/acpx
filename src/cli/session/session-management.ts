@@ -135,6 +135,7 @@ async function createSessionRecordWithClient(
       : {}),
   };
 
+  applyLifecycleSnapshotToRecord(record, lifecycle);
   persistSessionOptions(record, options.sessionOptions);
   persistSessionOwnerOptions(record, options);
   applyConfigOptionsToRecord(record, sessionResult);

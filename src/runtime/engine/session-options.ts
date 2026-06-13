@@ -57,7 +57,7 @@ export function persistSessionOptions(
   // flag, so it is absent from SessionAgentOptions). Carry it forward across a
   // re-persist (e.g. a model change next turn) so a manual/failover switch
   // stays visible; a subsequent switch overwrites it via switchSessionSubscription.
-  const breadcrumbs = switchBreadcrumbs(record);
+  const breadcrumbs = sessionOptionBreadcrumbs(record);
   const next = persistedSessionOptionsWithBreadcrumbs(options, breadcrumbs);
   if (next !== undefined) {
     record.acpx = {
@@ -70,28 +70,30 @@ export function persistSessionOptions(
   clearPersistedSessionOptions(record);
 }
 
-type SwitchBreadcrumbs = {
+type SessionOptionBreadcrumbs = {
   subscriptionSwitch: PersistedSessionOptions["subscription_switch"];
   accountSwitch: PersistedSessionOptions["account_switch"];
+  provisioningWarning: PersistedSessionOptions["provisioning_warning"];
 };
 
-function switchBreadcrumbs(record: SessionRecord): SwitchBreadcrumbs {
+function sessionOptionBreadcrumbs(record: SessionRecord): SessionOptionBreadcrumbs {
   return {
     subscriptionSwitch: record.acpx?.session_options?.subscription_switch,
     accountSwitch: record.acpx?.session_options?.account_switch,
+    provisioningWarning: record.acpx?.session_options?.provisioning_warning,
   };
 }
 
 function persistedSessionOptionsWithBreadcrumbs(
   options: SessionAgentOptions | undefined,
-  breadcrumbs: SwitchBreadcrumbs,
+  breadcrumbs: SessionOptionBreadcrumbs,
 ): PersistedSessionOptions | undefined {
   const next = options === undefined ? undefined : persistedSessionOptions(options);
   if (next !== undefined) {
-    assignSwitchBreadcrumbs(next, breadcrumbs.subscriptionSwitch, breadcrumbs.accountSwitch);
+    assignBreadcrumbs(next, breadcrumbs);
     return next;
   }
-  return switchBreadcrumbSessionOptions(breadcrumbs.subscriptionSwitch, breadcrumbs.accountSwitch);
+  return breadcrumbSessionOptions(breadcrumbs);
 }
 
 function clearPersistedSessionOptions(record: SessionRecord): void {
@@ -100,25 +102,26 @@ function clearPersistedSessionOptions(record: SessionRecord): void {
   }
 }
 
-function assignSwitchBreadcrumbs(
+function assignBreadcrumbs(
   target: PersistedSessionOptions,
-  priorSwitch: PersistedSessionOptions["subscription_switch"],
-  priorAccountSwitch: PersistedSessionOptions["account_switch"],
+  breadcrumbs: SessionOptionBreadcrumbs,
 ): void {
-  if (priorSwitch !== undefined) {
-    target.subscription_switch = priorSwitch;
+  if (breadcrumbs.subscriptionSwitch !== undefined) {
+    target.subscription_switch = breadcrumbs.subscriptionSwitch;
   }
-  if (priorAccountSwitch !== undefined) {
-    target.account_switch = priorAccountSwitch;
+  if (breadcrumbs.accountSwitch !== undefined) {
+    target.account_switch = breadcrumbs.accountSwitch;
+  }
+  if (breadcrumbs.provisioningWarning !== undefined) {
+    target.provisioning_warning = breadcrumbs.provisioningWarning;
   }
 }
 
-function switchBreadcrumbSessionOptions(
-  priorSwitch: PersistedSessionOptions["subscription_switch"],
-  priorAccountSwitch: PersistedSessionOptions["account_switch"],
+function breadcrumbSessionOptions(
+  breadcrumbs: SessionOptionBreadcrumbs,
 ): PersistedSessionOptions | undefined {
   const next: PersistedSessionOptions = {};
-  assignSwitchBreadcrumbs(next, priorSwitch, priorAccountSwitch);
+  assignBreadcrumbs(next, breadcrumbs);
   return Object.keys(next).length > 0 ? next : undefined;
 }
 

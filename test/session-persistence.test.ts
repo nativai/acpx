@@ -282,6 +282,47 @@ test("listSessions drops a malformed subscription_switch (missing required field
   });
 });
 
+test("listSessions preserves acpx session_options provisioning_warning breadcrumb", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "provisioning-warning",
+        acpSessionId: "provisioning-warning",
+        agentCommand: "agent-a",
+        cwd,
+        acpx: {
+          session_options: {
+            provisioning_warning: {
+              at: "2026-06-13T12:00:00.000Z",
+              profileId: "home1",
+              authMode: "claude-home",
+              adapter: "claude-pty",
+              anchor: "/tmp/home1/.claude",
+              message: "human-owned commands directory left unchanged",
+            },
+          },
+        },
+      }),
+    );
+
+    const sessions = await session.listSessions();
+    const record = sessions.find((entry) => entry.acpxRecordId === "provisioning-warning");
+    assert.ok(record);
+    assert.deepEqual(record.acpx?.session_options?.provisioning_warning, {
+      at: "2026-06-13T12:00:00.000Z",
+      profileId: "home1",
+      authMode: "claude-home",
+      adapter: "claude-pty",
+      anchor: "/tmp/home1/.claude",
+      message: "human-owned commands directory left unchanged",
+    });
+  });
+});
+
 test("listSessions preserves acpx session_options system_prompt string and append", async () => {
   await withTempHome(async (homeDir) => {
     const session = await loadSessionModule();

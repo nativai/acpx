@@ -397,6 +397,7 @@ function assignParsedSessionOptions(state: SessionAcpxState, raw: unknown): void
   assignSessionOptionProfile(parsedSessionOptions, sessionOptions.profile);
   assignSessionOptionSubscriptionSwitch(parsedSessionOptions, sessionOptions.subscription_switch);
   assignSessionOptionAccountSwitch(parsedSessionOptions, sessionOptions.account_switch);
+  assignSessionOptionProvisioningWarning(parsedSessionOptions, sessionOptions.provisioning_warning);
 
   if (Object.keys(parsedSessionOptions).length > 0) {
     state.session_options = parsedSessionOptions;
@@ -465,6 +466,40 @@ function assignSessionOptionAccountSwitch(
     toAccount: record.toAccount,
     reason: record.reason,
     at: record.at,
+  };
+}
+
+function isValidProvisioningWarning(record: Record<string, unknown>): record is {
+  at: string;
+  profileId?: string;
+  authMode?: string;
+  adapter?: string;
+  anchor?: string;
+  message: string;
+} {
+  return (
+    typeof record.at === "string" &&
+    record.at.length > 0 &&
+    typeof record.message === "string" &&
+    record.message.length > 0
+  );
+}
+
+function assignSessionOptionProvisioningWarning(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+  value: unknown,
+): void {
+  const record = asRecord(value);
+  if (!record || !isValidProvisioningWarning(record)) {
+    return;
+  }
+  options.provisioning_warning = {
+    at: record.at,
+    ...(typeof record.profileId === "string" ? { profileId: record.profileId } : {}),
+    ...(typeof record.authMode === "string" ? { authMode: record.authMode } : {}),
+    ...(typeof record.adapter === "string" ? { adapter: record.adapter } : {}),
+    ...(typeof record.anchor === "string" ? { anchor: record.anchor } : {}),
+    message: record.message,
   };
 }
 

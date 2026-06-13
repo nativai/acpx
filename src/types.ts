@@ -437,6 +437,19 @@ export type SessionAcpxState = {
       reason: "manual" | "failover";
       at: string;
     };
+    /**
+     * Latest best-effort OS harness provisioning warning for this session.
+     * Provisioning must never fail the spawn; this breadcrumb makes degraded
+     * harness state visible to operators.
+     */
+    provisioning_warning?: {
+      at: string;
+      profileId?: string;
+      authMode?: string;
+      adapter?: string;
+      anchor?: string;
+      message: string;
+    };
   };
 };
 

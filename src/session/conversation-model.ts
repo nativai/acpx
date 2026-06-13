@@ -636,6 +636,9 @@ function cloneSessionOptions(
     ...(options.account_switch !== undefined
       ? { account_switch: { ...options.account_switch } }
       : {}),
+    ...(options.provisioning_warning !== undefined
+      ? { provisioning_warning: { ...options.provisioning_warning } }
+      : {}),
   };
 }
 

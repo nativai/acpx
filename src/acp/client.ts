@@ -36,6 +36,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import { resolveBuiltInAgentLaunch } from "../agent-registry.js";
 import { TimeoutError, withTimeout } from "../async-control.js";
+import type { ProvisioningWarningBreadcrumb } from "../config/os-harness-provisioning.js";
 import {
   AgentDisconnectedError,
   AgentSpawnError,
@@ -292,6 +293,7 @@ export type AgentLifecycleSnapshot = {
   startedAt?: string;
   running: boolean;
   lastExit?: AgentExitInfo;
+  provisioningWarning?: ProvisioningWarningBreadcrumb;
 };
 
 type ConsoleErrorMethod = typeof console.error;
@@ -449,6 +451,7 @@ export class AcpClient {
   private agentStartedAt?: string;
   private lastAgentExit?: AgentExitInfo;
   private lastKnownPid?: number;
+  private latestProvisioningWarning?: ProvisioningWarningBreadcrumb;
   private readonly promptPermissionFailures = new Map<string, PermissionPromptUnavailableError>();
   private readonly pendingConnectionRequests = new Set<PendingConnectionRequest>();
 
@@ -504,6 +507,9 @@ export class AcpClient {
       startedAt: this.agentStartedAt,
       running,
       lastExit: this.lastAgentExit ? { ...this.lastAgentExit } : undefined,
+      provisioningWarning: this.latestProvisioningWarning
+        ? { ...this.latestProvisioningWarning }
+        : undefined,
     };
   }
 
@@ -675,6 +681,9 @@ export class AcpClient {
       this.options.sessionContext,
       undefined,
       this.options.agentCommand,
+      (warning) => {
+        this.latestProvisioningWarning = warning;
+      },
     );
     await this.applyProfileEnv(spawnOptions.env);
     return {
@@ -720,6 +729,9 @@ export class AcpClient {
         reasoningEffort,
         undefined,
         this.options.agentCommand,
+        (warning) => {
+          this.latestProvisioningWarning = warning;
+        },
       )) ?? undefined;
   }
 

@@ -13,6 +13,12 @@ export function applyLifecycleSnapshotToRecord(
 
   record.pid = snapshot.running ? snapshot.pid : undefined;
   record.agentStartedAt = snapshot.startedAt;
+  if (snapshot.provisioningWarning) {
+    const acpx = record.acpx ?? {};
+    const sessionOptions = { ...acpx.session_options };
+    sessionOptions.provisioning_warning = { ...snapshot.provisioningWarning };
+    record.acpx = { ...acpx, session_options: sessionOptions };
+  }
 
   if (snapshot.lastExit) {
     record.lastAgentExitCode = snapshot.lastExit.exitCode;
