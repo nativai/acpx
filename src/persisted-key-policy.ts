@@ -15,6 +15,18 @@ const ZED_TAG_KEYS = new Set([
 
 const MAP_OBJECT_PATHS = new Set(["request_token_usage", "messages.Agent.tool_results"]);
 
+const ACCOUNT_SWITCH_KEYS = new Set([
+  "fromProfile",
+  "toProfile",
+  "fromAccount",
+  "toAccount",
+  "effectiveAccount",
+  "effectiveProfile",
+  "effectiveAuthMode",
+  "effectiveAnchor",
+  "effectiveResolutionMethod",
+]);
+
 const OPAQUE_VALUE_PATHS = new Set([
   "agent_capabilities",
   "messages.Agent.content.ToolUse.input",
@@ -32,6 +44,9 @@ function joinPath(path: string[]): string {
 
 function isAllowedKey(path: string[], key: string): boolean {
   if (ZED_TAG_KEYS.has(key)) {
+    return true;
+  }
+  if (joinPath(path) === "acpx.session_options.account_switch" && ACCOUNT_SWITCH_KEYS.has(key)) {
     return true;
   }
 

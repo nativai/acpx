@@ -4,7 +4,8 @@ import { createServer, type Server } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { resetKnownDeadSubs } from "../src/config/known-dead-subscriptions.js";
+import { getAccountHealth, resetKnownDeadSubs } from "../src/config/known-dead-subscriptions.js";
+import { transcriptJsonlPath } from "../src/config/subscription-transcript.js";
 import { AllSubscriptionsExhaustedError } from "../src/errors.js";
 import { attemptFailoverAndRetry } from "../src/runtime/engine/failover.js";
 import type { SessionRecord } from "../src/types.js";
@@ -38,17 +39,22 @@ function startMockMessages(
 }
 
 async function withRig(
-  subs: Array<{ id: string; token: string }>,
+  subs: Array<{ id: string; token: string; account?: string }>,
   defaultId: string,
-  run: (ctx: { registryPath: string }) => Promise<void>,
+  run: (ctx: {
+    homeDir: string;
+    registryPath: string;
+    profileDir: (id: string) => string;
+  }) => Promise<void>,
 ): Promise<void> {
   resetKnownDeadSubs();
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fo-"));
   const subsDir = path.join(home, ".acpx", "subscriptions");
   const registryPath = path.join(subsDir, "registry.json");
+  const profileDir = (id: string) => path.join(subsDir, id);
   try {
     for (const s of subs) {
-      const dir = path.join(subsDir, s.id);
+      const dir = profileDir(s.id);
       await fs.mkdir(dir, { recursive: true });
       await fs.writeFile(
         path.join(dir, ".credentials.json"),
@@ -58,27 +64,100 @@ async function withRig(
     await fs.writeFile(
       registryPath,
       JSON.stringify({
+        version: 3,
         default: defaultId,
-        subscriptions: subs.map((s) => ({
+        profiles: subs.map((s) => ({
           id: s.id,
           label: s.id,
-          configDir: path.join(subsDir, s.id),
+          authMode: "subscription",
+          adapter: "claude",
+          account: s.account ?? s.id,
+          credentialSource: profileDir(s.id),
         })),
       }),
     );
-    await run({ registryPath });
+    await run({ homeDir: home, registryPath, profileDir });
   } finally {
     await fs.rm(home, { recursive: true, force: true });
   }
 }
 
-function makeRecord(sessionsDir: string, subscription?: string): SessionRecord {
+async function withHomeRig(
+  homes: Array<{ id: string; account: string }>,
+  defaultId: string,
+  run: (ctx: {
+    homeDir: string;
+    registryPath: string;
+    claudeAnchor: (id: string) => string;
+  }) => Promise<void>,
+): Promise<void> {
+  resetKnownDeadSubs();
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fo-home-"));
+  const registryPath = path.join(home, ".acpx", "subscriptions", "registry.json");
+  const homePath = (id: string) => path.join(home, "homes", id);
+  const claudeAnchor = (id: string) => path.join(homePath(id), ".claude");
+  try {
+    for (const profile of homes) {
+      await fs.mkdir(claudeAnchor(profile.id), { recursive: true });
+    }
+    await fs.mkdir(path.dirname(registryPath), { recursive: true });
+    await fs.writeFile(
+      registryPath,
+      JSON.stringify({
+        version: 3,
+        default: defaultId,
+        profiles: homes.map((profile) => ({
+          id: profile.id,
+          label: profile.id,
+          authMode: "claude-home",
+          adapter: "claude-pty",
+          account: profile.account,
+          credentialSource: null,
+          homePath: homePath(profile.id),
+        })),
+      }),
+    );
+    await run({ homeDir: home, registryPath, claudeAnchor });
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
+    resetKnownDeadSubs();
+  }
+}
+
+function makeRecord(options: {
+  profile?: string;
+  subscription?: string;
+  acpSessionId?: string;
+  cwd?: string;
+}): SessionRecord {
   return {
     acpxRecordId: "rec-fo",
-    cwd: "/work/fo",
+    cwd: options.cwd ?? "/work/fo",
     agentCommand: "claude",
-    ...(subscription ? { acpx: { session_options: { subscription } } } : {}),
+    ...(options.acpSessionId ? { acpSessionId: options.acpSessionId } : {}),
+    ...(options.profile || options.subscription
+      ? {
+          acpx: {
+            session_options: {
+              ...(options.profile ? { profile: options.profile } : {}),
+              ...(options.subscription ? { subscription: options.subscription } : {}),
+            },
+          },
+        }
+      : {}),
   } as SessionRecord;
+}
+
+function rateLimitError(message = "rate limit", effectiveAccount?: string): Error {
+  const error = new Error(message);
+  if (effectiveAccount) {
+    (
+      error as { effectiveAccountMetadata?: { effectiveAccount: string } }
+    ).effectiveAccountMetadata = {
+      effectiveAccount,
+    };
+  }
+  return error;
 }
 
 test("attemptFailoverAndRetry switches to a healthy sub and returns its result", async () => {
@@ -88,7 +167,7 @@ test("attemptFailoverAndRetry switches to a healthy sub and returns its result",
       { id: "b", token: "tok-b" },
     ],
     "a",
-    async ({ registryPath }) => {
+    async ({ homeDir, registryPath }) => {
       // a (the failed/current sub) is 401; b is healthy.
       const { server, url } = await startMockMessages(
         new Map([
@@ -99,13 +178,13 @@ test("attemptFailoverAndRetry switches to a healthy sub and returns its result",
       const prevEndpoint = process.env.CLAUDE_MESSAGES_ENDPOINT;
       const prevHome = process.env.HOME;
       process.env.CLAUDE_MESSAGES_ENDPOINT = url;
-      process.env.HOME = path.dirname(path.dirname(path.dirname(registryPath)));
+      process.env.HOME = homeDir;
       try {
-        const record = makeRecord("", "a");
+        const record = makeRecord({ subscription: "a" });
         let turns = 0;
         const out = await attemptFailoverAndRetry<string>({
           record,
-          loadOpts: { registryPath },
+          loadOpts: { homeDir, registryPath },
           runTurn: async () => {
             turns += 1;
             return "200-OK";
@@ -114,8 +193,9 @@ test("attemptFailoverAndRetry switches to a healthy sub and returns its result",
         assert.equal(out.result, "200-OK");
         assert.equal(out.switchedTo, "b");
         assert.equal(turns, 1);
-        assert.equal(record.acpx?.session_options?.subscription, "b");
-        assert.equal(record.acpx?.session_options?.subscription_switch?.reason, "failover");
+        assert.equal(record.acpx?.session_options?.profile, "b");
+        assert.equal(record.acpx?.session_options?.subscription, undefined);
+        assert.equal(record.acpx?.session_options?.account_switch?.reason, "failover");
       } finally {
         server.close();
         process.env.CLAUDE_MESSAGES_ENDPOINT = prevEndpoint;
@@ -132,7 +212,7 @@ test("attemptFailoverAndRetry throws AllSubscriptionsExhaustedError and restores
       { id: "b", token: "tok-b" },
     ],
     "a",
-    async ({ registryPath }) => {
+    async ({ homeDir, registryPath }) => {
       const { server, url } = await startMockMessages(
         new Map([
           ["tok-a", { status: 401 }],
@@ -142,15 +222,15 @@ test("attemptFailoverAndRetry throws AllSubscriptionsExhaustedError and restores
       const prevEndpoint = process.env.CLAUDE_MESSAGES_ENDPOINT;
       const prevHome = process.env.HOME;
       process.env.CLAUDE_MESSAGES_ENDPOINT = url;
-      process.env.HOME = path.dirname(path.dirname(path.dirname(registryPath)));
+      process.env.HOME = homeDir;
       try {
-        const record = makeRecord("", "a");
+        const record = makeRecord({ subscription: "a" });
         let turns = 0;
         await assert.rejects(
           () =>
             attemptFailoverAndRetry<string>({
               record,
-              loadOpts: { registryPath },
+              loadOpts: { homeDir, registryPath },
               runTurn: async () => {
                 turns += 1;
                 return "should-not-run";
@@ -161,7 +241,7 @@ test("attemptFailoverAndRetry throws AllSubscriptionsExhaustedError and restores
         assert.equal(turns, 0, "no retry when nothing to fail over to");
         // Selection restored (unchanged) so a later turn re-probes.
         assert.equal(record.acpx?.session_options?.subscription, "a");
-        assert.equal(record.acpx?.session_options?.subscription_switch, undefined);
+        assert.equal(record.acpx?.session_options?.account_switch, undefined);
       } finally {
         server.close();
         process.env.CLAUDE_MESSAGES_ENDPOINT = prevEndpoint;
@@ -178,7 +258,7 @@ test("attemptFailoverAndRetry rethrows a non-failover error from the retried tur
       { id: "b", token: "tok-b" },
     ],
     "a",
-    async ({ registryPath }) => {
+    async ({ homeDir, registryPath }) => {
       const { server, url } = await startMockMessages(
         new Map([
           ["tok-a", { status: 401 }],
@@ -188,14 +268,14 @@ test("attemptFailoverAndRetry rethrows a non-failover error from the retried tur
       const prevEndpoint = process.env.CLAUDE_MESSAGES_ENDPOINT;
       const prevHome = process.env.HOME;
       process.env.CLAUDE_MESSAGES_ENDPOINT = url;
-      process.env.HOME = path.dirname(path.dirname(path.dirname(registryPath)));
+      process.env.HOME = homeDir;
       try {
-        const record = makeRecord("", "a");
+        const record = makeRecord({ subscription: "a" });
         await assert.rejects(
           () =>
             attemptFailoverAndRetry<string>({
               record,
-              loadOpts: { registryPath },
+              loadOpts: { homeDir, registryPath },
               runTurn: async () => {
                 throw new Error("model not found"); // not a failover trigger
               },
@@ -205,6 +285,154 @@ test("attemptFailoverAndRetry rethrows a non-failover error from the retried tur
       } finally {
         server.close();
         process.env.CLAUDE_MESSAGES_ENDPOINT = prevEndpoint;
+        process.env.HOME = prevHome;
+      }
+    },
+  );
+});
+
+test("profile-pinned SDK failover rewrites the unified profile selection", async () => {
+  await withRig(
+    [
+      { id: "subA", token: "tok-a", account: "acct-a" },
+      { id: "subB", token: "tok-b", account: "acct-b" },
+    ],
+    "subA",
+    async ({ homeDir, registryPath }) => {
+      const { server, url } = await startMockMessages(
+        new Map([
+          ["tok-a", { status: 401 }],
+          ["tok-b", { status: 200, util: 0.1 }],
+        ]),
+      );
+      const prevEndpoint = process.env.CLAUDE_MESSAGES_ENDPOINT;
+      const prevHome = process.env.HOME;
+      process.env.CLAUDE_MESSAGES_ENDPOINT = url;
+      process.env.HOME = homeDir;
+      try {
+        const record = makeRecord({ profile: "subA", subscription: "legacy-subA" });
+        const out = await attemptFailoverAndRetry<string>({
+          record,
+          loadOpts: { homeDir, registryPath },
+          runTurn: async () => "OK",
+        });
+
+        assert.equal(out.switchedTo, "subB");
+        assert.equal(record.acpx?.session_options?.profile, "subB");
+        assert.equal(record.acpx?.session_options?.subscription, undefined);
+        assert.equal(record.acpx?.session_options?.account_switch?.fromAccount, "acct-a");
+        assert.equal(record.acpx?.session_options?.account_switch?.toAccount, "acct-b");
+        assert.equal(record.acpx?.session_options?.account_switch?.effectiveAccount, "acct-a");
+      } finally {
+        server.close();
+        process.env.CLAUDE_MESSAGES_ENDPOINT = prevEndpoint;
+        process.env.HOME = prevHome;
+      }
+    },
+  );
+});
+
+test("claude-home sibling failover ports the transcript across HOME anchors", async () => {
+  await withHomeRig(
+    [
+      { id: "homeA", account: "acct-a" },
+      { id: "homeB", account: "acct-b" },
+    ],
+    "homeA",
+    async ({ homeDir, registryPath, claudeAnchor }) => {
+      const prevHome = process.env.HOME;
+      process.env.HOME = homeDir;
+      try {
+        const cwd = path.join(homeDir, "work");
+        const acpSessionId = "claude-home-session";
+        const record = makeRecord({
+          profile: "homeA",
+          acpSessionId,
+          cwd,
+        });
+        const src = transcriptJsonlPath(claudeAnchor("homeA"), cwd, acpSessionId);
+        await fs.mkdir(path.dirname(src), { recursive: true });
+        await fs.writeFile(src, "remember: bridge context survives\n");
+
+        const out = await attemptFailoverAndRetry<string>({
+          record,
+          loadOpts: { homeDir, registryPath },
+          runTurn: async () => "HOME-OK",
+        });
+
+        assert.equal(out.switchedTo, "homeB");
+        assert.equal(record.acpx?.session_options?.profile, "homeB");
+        assert.equal(record.acpx?.session_options?.account_switch?.toAccount, "acct-b");
+        const dst = transcriptJsonlPath(claudeAnchor("homeB"), cwd, acpSessionId);
+        assert.equal(await fs.readFile(dst, "utf8"), "remember: bridge context survives\n");
+      } finally {
+        process.env.HOME = prevHome;
+      }
+    },
+  );
+});
+
+test("retry failure marks the effective account, not the intended target account", async () => {
+  await withRig(
+    [
+      { id: "subA", token: "tok-a", account: "acct-a" },
+      { id: "subB", token: "tok-b", account: "acct-b" },
+    ],
+    "subA",
+    async ({ homeDir, registryPath }) => {
+      const { server, url } = await startMockMessages(
+        new Map([["tok-b", { status: 200, util: 0.1 }]]),
+      );
+      const prevEndpoint = process.env.CLAUDE_MESSAGES_ENDPOINT;
+      const prevHome = process.env.HOME;
+      process.env.CLAUDE_MESSAGES_ENDPOINT = url;
+      process.env.HOME = homeDir;
+      try {
+        const record = makeRecord({ profile: "subA" });
+        await assert.rejects(
+          () =>
+            attemptFailoverAndRetry<string>({
+              record,
+              loadOpts: { homeDir, registryPath },
+              runTurn: async () => {
+                throw rateLimitError("rate limit on still-pinned source", "acct-a");
+              },
+            }),
+          AllSubscriptionsExhaustedError,
+        );
+
+        assert.equal((await getAccountHealth("acct-a")).deadUntil, "9999-12-31T23:59:59.999Z");
+        assert.equal((await getAccountHealth("acct-b")).deadUntil, undefined);
+      } finally {
+        server.close();
+        process.env.CLAUDE_MESSAGES_ENDPOINT = prevEndpoint;
+        process.env.HOME = prevHome;
+      }
+    },
+  );
+});
+
+test("no sibling profile produces an honest failover-unavailable exhaustion", async () => {
+  await withRig(
+    [{ id: "solo", token: "tok-solo", account: "acct-solo" }],
+    "solo",
+    async ({ homeDir, registryPath }) => {
+      const prevHome = process.env.HOME;
+      process.env.HOME = homeDir;
+      try {
+        const record = makeRecord({ profile: "solo" });
+        await assert.rejects(
+          () =>
+            attemptFailoverAndRetry<string>({
+              record,
+              loadOpts: { homeDir, registryPath },
+              runTurn: async () => "never",
+            }),
+          /failover unavailable - profile "solo" \(subscription\) has no sibling account; account "acct-solo" resets unknown; effectiveAccount "acct-solo"/,
+        );
+        assert.equal(record.acpx?.session_options?.profile, "solo");
+        assert.equal(record.acpx?.session_options?.account_switch, undefined);
+      } finally {
         process.env.HOME = prevHome;
       }
     },

@@ -18,6 +18,11 @@ export type SessionIndexAccountSwitch = {
   toProfile: string;
   fromAccount?: string;
   toAccount: string;
+  effectiveAccount?: string;
+  effectiveProfile?: string;
+  effectiveAuthMode?: string;
+  effectiveAnchor?: string;
+  effectiveResolutionMethod?: "path" | "selection";
   reason: "manual" | "failover";
   at: string;
 };
@@ -116,6 +121,11 @@ function isValidIndexAccountSwitch(record: Record<string, unknown>): record is {
   toProfile: string;
   fromAccount?: string;
   toAccount: string;
+  effectiveAccount?: string;
+  effectiveProfile?: string;
+  effectiveAuthMode?: string;
+  effectiveAnchor?: string;
+  effectiveResolutionMethod?: "path" | "selection";
   reason: "manual" | "failover";
   at: string;
 } {
@@ -127,16 +137,49 @@ function isValidIndexAccountSwitch(record: Record<string, unknown>): record is {
   );
 }
 
+type IndexAccountSwitchStringKey = Exclude<
+  keyof Omit<SessionIndexAccountSwitch, "reason" | "at">,
+  "effectiveResolutionMethod"
+>;
+
+function assignOptionalAccountSwitchString(
+  target: Partial<SessionIndexAccountSwitch>,
+  key: IndexAccountSwitchStringKey,
+  value: unknown,
+): void {
+  if (typeof value === "string") {
+    target[key] = value;
+  }
+}
+
+function accountSwitchMetadata(
+  record: Record<string, unknown>,
+): Partial<SessionIndexAccountSwitch> {
+  const metadata: Partial<SessionIndexAccountSwitch> = {};
+  assignOptionalAccountSwitchString(metadata, "fromProfile", record.fromProfile);
+  assignOptionalAccountSwitchString(metadata, "fromAccount", record.fromAccount);
+  assignOptionalAccountSwitchString(metadata, "effectiveAccount", record.effectiveAccount);
+  assignOptionalAccountSwitchString(metadata, "effectiveProfile", record.effectiveProfile);
+  assignOptionalAccountSwitchString(metadata, "effectiveAuthMode", record.effectiveAuthMode);
+  assignOptionalAccountSwitchString(metadata, "effectiveAnchor", record.effectiveAnchor);
+  if (
+    record.effectiveResolutionMethod === "path" ||
+    record.effectiveResolutionMethod === "selection"
+  ) {
+    metadata.effectiveResolutionMethod = record.effectiveResolutionMethod;
+  }
+  return metadata;
+}
+
 function parseIndexAccountSwitch(value: unknown): SessionIndexAccountSwitch | undefined {
   const record = asRecord(value);
   if (!record || !isValidIndexAccountSwitch(record)) {
     return undefined;
   }
   return {
-    ...(typeof record.fromProfile === "string" ? { fromProfile: record.fromProfile } : {}),
     toProfile: record.toProfile,
-    ...(typeof record.fromAccount === "string" ? { fromAccount: record.fromAccount } : {}),
     toAccount: record.toAccount,
+    ...accountSwitchMetadata(record),
     reason: record.reason,
     at: record.at,
   };

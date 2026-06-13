@@ -1,5 +1,10 @@
+import type { EffectiveAccountMetadata } from "../../acp/auth-env.js";
+import {
+  effectiveAccountMetadataFromValue,
+  formatErrorMessage,
+} from "../../acp/error-normalization.js";
 import { extractAcpError } from "../../acp/error-shapes.js";
-import { markSubscriptionDead } from "../../config/known-dead-subscriptions.js";
+import { findProfile, loadProfileRegistry } from "../../config/profiles.js";
 import {
   getSubscriptionsUsage,
   maxUtilization,
@@ -8,12 +13,21 @@ import {
 } from "../../config/subscription-usage.js";
 import {
   loadSubscriptionRegistry,
+  type SubscriptionEntry,
   type SubscriptionLookupOptions,
 } from "../../config/subscriptions.js";
 import { AllSubscriptionsExhaustedError } from "../../errors.js";
 import { writeSessionRecord } from "../../session/persistence/repository.js";
 import type { SessionRecord } from "../../types.js";
-import { switchSessionSubscription } from "./subscription-switch.js";
+import {
+  getAccountHealth,
+  markAccountDead,
+  siblingProfiles,
+  switchSessionAccount,
+  transcriptAnchorDir,
+  type AccountHealth,
+  type ResolvedProfile,
+} from "./account-seam.js";
 
 // Classify a thrown turn error (manager.ts:745) into a subscription-failover
 // trigger. The primary signal is machine-readable: the adapter attaches the SDK
@@ -103,58 +117,370 @@ export function classifyFailover(error: unknown): FailoverTrigger {
 }
 
 /**
- * Failover only engages on a box with a usable registry — i.e. ≥1 registered
- * subscription. On a no-registry box this is false and resolution stays
+ * Failover only engages on a box with a usable provider registry. On a
+ * no-registry box this is false and resolution stays
  * byte-identical to today (backward safety A5).
  */
 export function failoverEnabled(loadOpts?: SubscriptionLookupOptions): boolean {
-  return loadSubscriptionRegistry(loadOpts).subscriptions.length > 0;
+  return loadProfileRegistry(loadOpts).profiles.some(
+    (profile) => transcriptAnchorDir(profile) !== null,
+  );
 }
 
-function describeUsage(usage: SubscriptionUsage): string {
+function describeUsage(usage: SubscriptionUsage, account: string): string {
   if (usage.error) {
-    return `${usage.id}: ${usage.error}`;
+    return `${account} (${usage.id}): ${usage.error}`;
   }
-  return `${usage.id}: ${Math.round(maxUtilization(usage) * 100)}% used`;
+  const reset = earliestUsageReset(usage);
+  return `${account} (${usage.id}): ${Math.round(maxUtilization(usage) * 100)}% used${
+    reset ? `, resets ${formatReset(reset)}` : ""
+  }`;
 }
 
-/** The current subscription a record resolves to (explicit selection, if any). */
-function currentSubId(record: SessionRecord): string | undefined {
-  return record.acpx?.session_options?.subscription?.trim() || undefined;
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function errorEffectiveAccount(error: unknown): EffectiveAccountMetadata | undefined {
+  const record = asRecord(error);
+  if (!record) {
+    return undefined;
+  }
+  return effectiveAccountMetadataFromValue(
+    record.effectiveAccountMetadata ?? record.effectiveAccount,
+  );
+}
+
+function attachEffectiveAccount(
+  error: unknown,
+  metadata: EffectiveAccountMetadata | undefined,
+): unknown {
+  if (metadata === undefined || !error || typeof error !== "object") {
+    return error;
+  }
+  (error as { effectiveAccountMetadata?: EffectiveAccountMetadata }).effectiveAccountMetadata ??=
+    metadata;
+  return error;
+}
+
+function storedSelectionId(record: SessionRecord): string | undefined {
+  const options = record.acpx?.session_options;
+  return options?.profile?.trim() || options?.subscription?.trim() || undefined;
+}
+
+function defaultProfileId(loadOpts?: SubscriptionLookupOptions): string | undefined {
+  return loadProfileRegistry(loadOpts).default?.trim() || undefined;
+}
+
+function selectedProfileId(
+  record: SessionRecord,
+  loadOpts?: SubscriptionLookupOptions,
+): string | undefined {
+  return storedSelectionId(record) ?? defaultProfileId(loadOpts);
+}
+
+function currentProfile(
+  record: SessionRecord,
+  loadOpts?: SubscriptionLookupOptions,
+): ResolvedProfile | undefined {
+  const id = selectedProfileId(record, loadOpts);
+  return id ? findProfile(id, loadProfileRegistry(loadOpts)) : undefined;
+}
+
+function metadataFromProfile(profile: ResolvedProfile): EffectiveAccountMetadata {
+  const anchor = transcriptAnchorDir(profile);
+  return {
+    effectiveAccount: profile.account,
+    effectiveProfile: profile.id,
+    effectiveAdapter: profile.adapter,
+    effectiveAuthMode: profile.authMode,
+    ...(anchor !== null ? { effectiveAnchor: anchor } : {}),
+    effectiveResolutionMethod: profile.authMode === "openrouter" ? "selection" : "path",
+  };
+}
+
+function failureContext(
+  error: unknown,
+  fallbackProfile: ResolvedProfile,
+): EffectiveAccountMetadata {
+  return errorEffectiveAccount(error) ?? metadataFromProfile(fallbackProfile);
+}
+
+export function failoverEnabledForRecord(
+  record: SessionRecord,
+  loadOpts?: SubscriptionLookupOptions,
+): boolean {
+  const profile = currentProfile(record, loadOpts);
+  return profile !== undefined && transcriptAnchorDir(profile) !== null;
+}
+
+function cloneSessionOptions(
+  options: NonNullable<NonNullable<SessionRecord["acpx"]>["session_options"]> | undefined,
+): NonNullable<NonNullable<SessionRecord["acpx"]>["session_options"]> | undefined {
+  if (options === undefined) {
+    return undefined;
+  }
+  return {
+    ...options,
+    ...(options.subscription_switch !== undefined
+      ? { subscription_switch: { ...options.subscription_switch } }
+      : {}),
+    ...(options.account_switch !== undefined
+      ? { account_switch: { ...options.account_switch } }
+      : {}),
+  };
 }
 
 /**
- * Snapshot the record's current subscription selection + breadcrumb and return a
+ * Snapshot the record's current unified selection + breadcrumbs and return a
  * restore-and-persist function. Used so exhaustion leaves the record UNCHANGED
  * (A3 / edge-1): after some failover attempts mutated it, restore the original
  * so a later turn re-probes and auto-recovers.
  */
 function snapshotSelectionRestorer(record: SessionRecord): () => Promise<void> {
-  const originalSelection = record.acpx?.session_options?.subscription;
-  const originalSwitch = record.acpx?.session_options?.subscription_switch;
+  const originalOptions = cloneSessionOptions(record.acpx?.session_options);
   return async () => {
-    const sessionOptions = record.acpx?.session_options;
-    if (!sessionOptions) {
+    if (!record.acpx) {
       return;
     }
-    if (originalSelection === undefined) {
-      delete sessionOptions.subscription;
+    if (originalOptions === undefined) {
+      delete record.acpx.session_options;
     } else {
-      sessionOptions.subscription = originalSelection;
-    }
-    if (originalSwitch === undefined) {
-      delete sessionOptions.subscription_switch;
-    } else {
-      sessionOptions.subscription_switch = originalSwitch;
+      record.acpx.session_options = cloneSessionOptions(originalOptions);
     }
     await writeSessionRecord(record);
   };
 }
 
+type CandidateStatus = {
+  profile: ResolvedProfile;
+  health: AccountHealth;
+  usage?: SubscriptionUsage;
+  missingSubscriptionEntry?: boolean;
+  tried: boolean;
+};
+
+function activeDeadUntil(health: AccountHealth): string | undefined {
+  const raw = health.deadUntil?.trim();
+  if (!raw) {
+    return undefined;
+  }
+  const time = Date.parse(raw);
+  return Number.isNaN(time) || time > Date.now() ? raw : undefined;
+}
+
+function earliestUsageReset(usage: SubscriptionUsage): string | undefined {
+  const resets = [usage.fiveHour?.reset, usage.sevenDay?.reset]
+    .filter((value): value is string => typeof value === "string" && value.length > 0)
+    .toSorted();
+  return resets[0];
+}
+
+function formatReset(iso: string): string {
+  const time = Date.parse(iso);
+  if (Number.isNaN(time)) {
+    return iso;
+  }
+  return `${new Date(time).toISOString().slice(11, 16)}Z`;
+}
+
+function describeStatus(status: CandidateStatus): string {
+  const account = status.profile.account;
+  if (status.tried) {
+    return `${account} (${status.profile.id}): already tried this turn`;
+  }
+  const deadUntil = activeDeadUntil(status.health);
+  if (deadUntil) {
+    return `${account} (${status.profile.id}): marked dead until ${formatReset(deadUntil)}`;
+  }
+  if (status.missingSubscriptionEntry) {
+    return `${account} (${status.profile.id}): no subscription probe entry`;
+  }
+  if (status.usage) {
+    return describeUsage(status.usage, account);
+  }
+  return `${account} (${status.profile.id}): eligible`;
+}
+
+function accountHealthy(status: CandidateStatus): boolean {
+  return !status.tried && activeDeadUntil(status.health) === undefined;
+}
+
+function bySubscriptionId(entries: SubscriptionEntry[]): Map<string, SubscriptionEntry> {
+  return new Map(entries.map((entry) => [entry.id, entry]));
+}
+
+function byUsageId(usages: SubscriptionUsage[]): Map<string, SubscriptionUsage> {
+  return new Map(usages.map((usage) => [usage.id, usage]));
+}
+
+async function candidateStatuses(
+  profiles: ResolvedProfile[],
+  triedAccounts: ReadonlySet<string>,
+): Promise<CandidateStatus[]> {
+  return await Promise.all(
+    profiles.map(async (profile) => ({
+      profile,
+      health: await getAccountHealth(profile.account),
+      tried: triedAccounts.has(profile.account),
+    })),
+  );
+}
+
+async function pickSubscriptionSibling(
+  statuses: CandidateStatus[],
+  loadOpts?: SubscriptionLookupOptions,
+): Promise<{ target?: ResolvedProfile; statuses: CandidateStatus[] }> {
+  const entryById = bySubscriptionId(loadSubscriptionRegistry(loadOpts).subscriptions);
+  const entries = statuses
+    .filter(accountHealthy)
+    .map((status) => entryById.get(status.profile.id))
+    .filter((entry): entry is SubscriptionEntry => entry !== undefined);
+  const usages = await getSubscriptionsUsage(entries, true);
+  const usageById = byUsageId(usages);
+  const enriched = statuses.map((status) => ({
+    ...status,
+    ...(usageById.get(status.profile.id) !== undefined
+      ? { usage: usageById.get(status.profile.id) }
+      : {}),
+    ...(status.profile.authMode === "subscription" && !entryById.has(status.profile.id)
+      ? { missingSubscriptionEntry: true }
+      : {}),
+  }));
+  const picked = pickFailoverTarget(usages, { exclude: new Set() });
+  return {
+    target: picked
+      ? enriched.find((status) => status.profile.id === picked.id)?.profile
+      : undefined,
+    statuses: enriched,
+  };
+}
+
+async function pickSibling(
+  current: ResolvedProfile,
+  triedAccounts: ReadonlySet<string>,
+  loadOpts?: SubscriptionLookupOptions,
+): Promise<{
+  target?: ResolvedProfile;
+  statuses: string[];
+  siblingCount: number;
+  portableCount: number;
+}> {
+  const siblings = await siblingProfiles(current.id, loadOpts);
+  const currentAnchor = transcriptAnchorDir(current);
+  const portable =
+    currentAnchor === null
+      ? []
+      : siblings.filter((profile) => transcriptAnchorDir(profile) !== null);
+  const baseStatuses = await candidateStatuses(portable, triedAccounts);
+  const picked =
+    current.authMode === "subscription"
+      ? await pickSubscriptionSibling(baseStatuses, loadOpts)
+      : { target: baseStatuses.find(accountHealthy)?.profile, statuses: baseStatuses };
+  return {
+    target: picked.target,
+    statuses: picked.statuses.map(describeStatus),
+    siblingCount: siblings.length,
+    portableCount: portable.length,
+  };
+}
+
+type PickedSibling = Awaited<ReturnType<typeof pickSibling>>;
+
+function noSiblingMessage(current: ResolvedProfile, context: EffectiveAccountMetadata): string {
+  return (
+    `failover unavailable - profile "${current.id}" (${current.authMode}) has no sibling account; ` +
+    `account "${current.account}" resets unknown; effectiveAccount "${context.effectiveAccount}"`
+  );
+}
+
+function noPortableSiblingMessage(
+  current: ResolvedProfile,
+  context: EffectiveAccountMetadata,
+): string {
+  return (
+    `failover unavailable - profile "${current.id}" (${current.authMode}) has no portable sibling account; ` +
+    `account "${current.account}" resets unknown; effectiveAccount "${context.effectiveAccount}"`
+  );
+}
+
+function exhaustedError(
+  statuses: string[],
+  context: EffectiveAccountMetadata,
+): AllSubscriptionsExhaustedError {
+  const error = new AllSubscriptionsExhaustedError(statuses.join("; "));
+  attachEffectiveAccount(error, context);
+  return error;
+}
+
+function enrichAccountSwitchBreadcrumb(
+  record: SessionRecord,
+  context: EffectiveAccountMetadata,
+): void {
+  const accountSwitch = record.acpx?.session_options?.account_switch;
+  if (!accountSwitch) {
+    return;
+  }
+  accountSwitch.effectiveAccount = context.effectiveAccount;
+  if (context.effectiveProfile !== undefined) {
+    accountSwitch.effectiveProfile = context.effectiveProfile;
+  }
+  if (context.effectiveAuthMode !== undefined) {
+    accountSwitch.effectiveAuthMode = context.effectiveAuthMode;
+  }
+  if (context.effectiveAnchor !== undefined) {
+    accountSwitch.effectiveAnchor = context.effectiveAnchor;
+  }
+  if (context.effectiveResolutionMethod !== undefined) {
+    accountSwitch.effectiveResolutionMethod = context.effectiveResolutionMethod;
+  }
+}
+
+async function requirePickedTarget(
+  picked: PickedSibling,
+  current: ResolvedProfile,
+  context: EffectiveAccountMetadata,
+  restoreOriginalSelection: () => Promise<void>,
+): Promise<ResolvedProfile> {
+  if (picked.siblingCount === 0) {
+    await restoreOriginalSelection();
+    throw exhaustedError([noSiblingMessage(current, context)], context);
+  }
+  if (picked.portableCount === 0) {
+    await restoreOriginalSelection();
+    throw exhaustedError([noPortableSiblingMessage(current, context)], context);
+  }
+  if (!picked.target) {
+    await restoreOriginalSelection();
+    throw exhaustedError(picked.statuses, context);
+  }
+  return picked.target;
+}
+
+async function switchToFailoverTarget(params: {
+  record: SessionRecord;
+  target: ResolvedProfile;
+  context: EffectiveAccountMetadata;
+  loadOpts?: SubscriptionLookupOptions;
+}): Promise<void> {
+  try {
+    await switchSessionAccount(params.record, params.target.id, "failover", params.loadOpts);
+  } catch (error) {
+    throw attachEffectiveAccount(
+      error instanceof Error ? error : new Error(formatErrorMessage(error)),
+      params.context,
+    );
+  }
+  enrichAccountSwitchBreadcrumb(params.record, params.context);
+  await writeSessionRecord(params.record);
+}
+
 export type FailoverRetryResult<T> = {
   /** Whatever the retried turn returned (on success). */
   result: T;
-  /** The subscription the turn ultimately succeeded on. */
+  /** The profile/account the turn ultimately succeeded on. */
   switchedTo: string;
 };
 
@@ -170,44 +496,43 @@ export type FailoverRetryResult<T> = {
 export async function attemptFailoverAndRetry<T>(args: {
   record: SessionRecord;
   runTurn: () => Promise<T>;
+  triggerError?: unknown;
   loadOpts?: SubscriptionLookupOptions;
   verbose?: boolean;
 }): Promise<FailoverRetryResult<T>> {
-  const registry = loadSubscriptionRegistry(args.loadOpts);
-  const entries = registry.subscriptions;
+  const current = currentProfile(args.record, args.loadOpts);
+  if (!current) {
+    throw new AllSubscriptionsExhaustedError("failover unavailable - no selected profile");
+  }
+  const initialContext = failureContext(args.triggerError, current);
+  let lastFailureContext = initialContext;
   const restoreOriginalSelection = snapshotSelectionRestorer(args.record);
 
-  // Seed the tried set with the failed sub so we never re-pick it this turn.
+  // Seed the tried set with the account that physically failed so we never
+  // re-pick it this turn.
   const tried = new Set<string>();
-  const failed = currentSubId(args.record);
-  if (failed) {
-    tried.add(failed);
-    markSubscriptionDead(failed); // §4.1.4 pre-spawn avoidance (process-local)
-  }
+  tried.add(initialContext.effectiveAccount);
+  await markAccountDead(initialContext.effectiveAccount, "failover trigger");
 
-  // Force-refresh on the first failover so target selection does not act on a
-  // stale "everything's fine" reading (CONCEPTION §4.1.2).
-  let usages = await getSubscriptionsUsage(entries, true);
-
-  for (let attempt = 0; attempt < entries.length; attempt++) {
-    const target = pickFailoverTarget(usages, { exclude: tried });
-    if (!target) {
-      await restoreOriginalSelection();
-      throw new AllSubscriptionsExhaustedError(usages.map(describeUsage).join("; "));
-    }
-
-    await switchSessionSubscription({
+  for (let attempt = 0; ; attempt++) {
+    const picked = await pickSibling(current, tried, args.loadOpts);
+    const target = await requirePickedTarget(
+      picked,
+      current,
+      lastFailureContext,
+      restoreOriginalSelection,
+    );
+    await switchToFailoverTarget({
       record: args.record,
-      targetSubId: target.id,
-      reason: "failover",
+      target,
+      context: lastFailureContext,
       loadOpts: args.loadOpts,
     });
-    await writeSessionRecord(args.record);
-    tried.add(target.id);
+    tried.add(target.account);
 
     if (args.verbose) {
       process.stderr.write(
-        `[acpx] subscription failover → "${target.id}" (failed: ${failed ?? "default"}); retrying turn\n`,
+        `[acpx] account failover → profile "${target.id}" (failed account: ${lastFailureContext.effectiveAccount}); retrying turn\n`,
       );
     }
 
@@ -217,14 +542,14 @@ export async function attemptFailoverAndRetry<T>(args: {
     } catch (retryError) {
       const trigger = classifyFailover(retryError);
       if (!trigger) {
-        throw retryError;
+        throw attachEffectiveAccount(retryError, failureContext(retryError, target));
       }
-      // The new target also failed over — mark it dead, drop it, refresh, loop.
-      markSubscriptionDead(target.id);
-      usages = await getSubscriptionsUsage(entries, true);
+      // The retried turn failed too. Charge the physically effective account
+      // when the runtime stamped one; fall back to the selected target only for
+      // direct unit harnesses that do not spawn an adapter.
+      lastFailureContext = failureContext(retryError, target);
+      tried.add(lastFailureContext.effectiveAccount);
+      await markAccountDead(lastFailureContext.effectiveAccount, `failover retry ${trigger}`);
     }
   }
-
-  await restoreOriginalSelection();
-  throw new AllSubscriptionsExhaustedError(usages.map(describeUsage).join("; "));
 }

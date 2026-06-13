@@ -10,6 +10,7 @@ export type DeliveryEventError = {
   code: number;
   message: string;
   detailCode: string;
+  effectiveAccount?: string;
 };
 
 export const EMPTY_DELIVERY_ERROR: DeliveryEventError = {

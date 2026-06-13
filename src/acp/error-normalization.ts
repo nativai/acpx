@@ -12,6 +12,7 @@ import {
   type OutputErrorCode,
   type OutputErrorOrigin,
 } from "../types.js";
+import type { EffectiveAccountMetadata } from "./auth-env.js";
 import {
   extractAcpError,
   formatUnknownErrorMessage,
@@ -27,6 +28,7 @@ type ErrorMeta = {
   origin?: OutputErrorOrigin;
   retryable?: boolean;
   acp?: OutputErrorAcpPayload;
+  effectiveAccount?: EffectiveAccountMetadata;
 };
 
 export type NormalizedOutputError = {
@@ -36,6 +38,7 @@ export type NormalizedOutputError = {
   origin?: OutputErrorOrigin;
   retryable?: boolean;
   acp?: OutputErrorAcpPayload;
+  effectiveAccount?: EffectiveAccountMetadata;
 };
 
 export type NormalizeOutputErrorOptions = {
@@ -44,6 +47,7 @@ export type NormalizeOutputErrorOptions = {
   origin?: OutputErrorOrigin;
   retryable?: boolean;
   acp?: OutputErrorAcpPayload;
+  effectiveAccount?: EffectiveAccountMetadata;
 };
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -98,6 +102,56 @@ function hasNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function trimString(value: unknown): string | undefined {
+  return hasNonEmptyString(value) ? value.trim() : undefined;
+}
+
+export function effectiveAccountMetadataFromValue(
+  value: unknown,
+): EffectiveAccountMetadata | undefined {
+  const record = asRecord(value);
+  if (!record) {
+    const effectiveAccount = trimString(value);
+    return effectiveAccount ? { effectiveAccount } : undefined;
+  }
+
+  const effectiveAccount = trimString(record.effectiveAccount);
+  if (!effectiveAccount) {
+    return undefined;
+  }
+  return effectiveAccountMetadataFromRecord(record, effectiveAccount);
+}
+
+function assignMetadataString(
+  target: Partial<EffectiveAccountMetadata>,
+  key: keyof Omit<EffectiveAccountMetadata, "effectiveAccount" | "effectiveResolutionMethod">,
+  value: unknown,
+): void {
+  const trimmed = trimString(value);
+  if (trimmed !== undefined) {
+    target[key] = trimmed;
+  }
+}
+
+function effectiveAccountMetadataFromRecord(
+  record: Record<string, unknown>,
+  effectiveAccount: string,
+): EffectiveAccountMetadata {
+  const metadata: EffectiveAccountMetadata = { effectiveAccount };
+  const effectiveResolutionMethod =
+    record.effectiveResolutionMethod === "path" || record.effectiveResolutionMethod === "selection"
+      ? record.effectiveResolutionMethod
+      : undefined;
+  assignMetadataString(metadata, "effectiveProfile", record.effectiveProfile);
+  assignMetadataString(metadata, "effectiveAdapter", record.effectiveAdapter);
+  assignMetadataString(metadata, "effectiveAuthMode", record.effectiveAuthMode);
+  assignMetadataString(metadata, "effectiveAnchor", record.effectiveAnchor);
+  if (effectiveResolutionMethod !== undefined) {
+    metadata.effectiveResolutionMethod = effectiveResolutionMethod;
+  }
+  return metadata;
+}
+
 function hasNonEmptyArray(value: unknown): value is unknown[] {
   return Array.isArray(value) && value.length > 0;
 }
@@ -123,6 +177,9 @@ function readOutputErrorMeta(error: unknown): ErrorMeta {
       : undefined;
   const origin = isOutputErrorOrigin(record.origin) ? record.origin : undefined;
   const retryable = typeof record.retryable === "boolean" ? record.retryable : undefined;
+  const effectiveAccount = effectiveAccountMetadataFromValue(
+    record.effectiveAccountMetadata ?? record.effectiveAccount,
+  );
 
   const acp = extractAcpError(record.acp);
   return {
@@ -131,6 +188,7 @@ function readOutputErrorMeta(error: unknown): ErrorMeta {
     origin,
     retryable,
     acp,
+    effectiveAccount,
   };
 }
 
@@ -207,6 +265,7 @@ export function normalizeOutputError(
     origin: meta.origin ?? options.origin,
     retryable: meta.retryable ?? options.retryable,
     acp,
+    effectiveAccount: meta.effectiveAccount ?? options.effectiveAccount,
   };
 }
 

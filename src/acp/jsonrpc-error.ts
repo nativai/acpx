@@ -1,4 +1,5 @@
 import type { OutputErrorAcpPayload, OutputErrorCode, OutputErrorOrigin } from "../types.js";
+import type { EffectiveAccountMetadata } from "./auth-env.js";
 
 export const OUTPUT_ERROR_JSONRPC_CODES: Record<OutputErrorCode, number> = {
   NO_SESSION: -32002,
@@ -15,6 +16,24 @@ type JsonRpcErrorObject = {
   data?: unknown;
 };
 
+function assignDefined(target: Record<string, unknown>, key: string, value: unknown): void {
+  if (value !== undefined) {
+    target[key] = value;
+  }
+}
+
+function assignEffectiveAccountData(
+  target: Record<string, unknown>,
+  metadata: EffectiveAccountMetadata | undefined,
+): void {
+  assignDefined(target, "effectiveAccount", metadata?.effectiveAccount);
+  assignDefined(target, "effectiveProfile", metadata?.effectiveProfile);
+  assignDefined(target, "effectiveAdapter", metadata?.effectiveAdapter);
+  assignDefined(target, "effectiveAuthMode", metadata?.effectiveAuthMode);
+  assignDefined(target, "effectiveAnchor", metadata?.effectiveAnchor);
+  assignDefined(target, "effectiveResolutionMethod", metadata?.effectiveResolutionMethod);
+}
+
 export type BuildJsonRpcErrorParams = {
   id?: string | number | null;
   outputCode: OutputErrorCode;
@@ -25,6 +44,7 @@ export type BuildJsonRpcErrorParams = {
   timestamp?: string;
   sessionId?: string;
   acp?: OutputErrorAcpPayload;
+  effectiveAccount?: EffectiveAccountMetadata;
 };
 
 function hasValidAcpError(
@@ -47,6 +67,7 @@ function buildFallbackData(params: BuildJsonRpcErrorParams): Record<string, unkn
     timestamp: params.timestamp,
     sessionId: params.sessionId,
   };
+  assignEffectiveAccountData(data, params.effectiveAccount);
 
   for (const [key, value] of Object.entries(data)) {
     if (value === undefined) {

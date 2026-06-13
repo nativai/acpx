@@ -86,8 +86,10 @@ import {
   applyProfileAuth,
   buildAgentSpawnOptions,
   buildClaudeHomeSelectorMeta,
+  effectiveAccountMetadataFromEnv,
   readEnvCredential,
   resolveConfiguredAuthCredential,
+  type EffectiveAccountMetadata,
 } from "./auth-env.js";
 import {
   materializeClaudeForkSession,
@@ -449,6 +451,7 @@ export class AcpClient {
   private agentStartedAt?: string;
   private lastAgentExit?: AgentExitInfo;
   private lastKnownPid?: number;
+  private lastEffectiveAccountMetadata?: EffectiveAccountMetadata;
   private readonly promptPermissionFailures = new Map<string, PermissionPromptUnavailableError>();
   private readonly pendingConnectionRequests = new Set<PendingConnectionRequest>();
 
@@ -494,6 +497,10 @@ export class AcpClient {
 
   getPermissionStats(): PermissionStats {
     return { ...this.permissionStats };
+  }
+
+  getEffectiveAccountMetadata(): EffectiveAccountMetadata | undefined {
+    return this.lastEffectiveAccountMetadata ? { ...this.lastEffectiveAccountMetadata } : undefined;
   }
 
   getAgentLifecycleSnapshot(): AgentLifecycleSnapshot {
@@ -619,6 +626,7 @@ export class AcpClient {
     const launch = await this.resolveAgentLaunchPlan();
     this.logAgentLaunch(launch);
     await this.ensureLaunchSupport(launch);
+    this.lastEffectiveAccountMetadata = effectiveAccountMetadataFromEnv(launch.spawnOptions.env);
     const child = await this.spawnAgentProcess(launch);
     this.closing = false;
     this.agentStartedAt = isoNow();

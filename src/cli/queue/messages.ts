@@ -1,4 +1,6 @@
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
+import type { EffectiveAccountMetadata } from "../../acp/auth-env.js";
+import { effectiveAccountMetadataFromValue } from "../../acp/error-normalization.js";
 import { toAcpErrorPayload } from "../../acp/error-shapes.js";
 import { isAcpJsonRpcMessage } from "../../acp/jsonrpc.js";
 import { isPromptInput, textPrompt } from "../../prompt-content.js";
@@ -178,6 +180,7 @@ export type QueueOwnerErrorMessage = {
   message: string;
   retryable?: boolean;
   acp?: OutputErrorAcpPayload;
+  effectiveAccount?: EffectiveAccountMetadata;
   outputAlreadyEmitted?: boolean;
 };
 
@@ -588,7 +591,7 @@ function parseNonEmptyString(value: unknown): string | null {
   if (typeof value !== "string" || value.trim().length === 0) {
     return null;
   }
-  return value;
+  return value.trim();
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -806,6 +809,7 @@ function parseErrorOwnerMessage(
 
   const outputAlreadyEmitted =
     typeof message.outputAlreadyEmitted === "boolean" ? message.outputAlreadyEmitted : undefined;
+  const effectiveAccount = effectiveAccountMetadataFromValue(message.effectiveAccount);
 
   return {
     type: "error",
@@ -816,6 +820,7 @@ function parseErrorOwnerMessage(
     message: message.message,
     retryable: typeof message.retryable === "boolean" ? message.retryable : undefined,
     acp: toAcpErrorPayload(message.acp),
+    ...(effectiveAccount === undefined ? {} : { effectiveAccount }),
     ...(outputAlreadyEmitted === undefined ? {} : { outputAlreadyEmitted }),
   };
 }

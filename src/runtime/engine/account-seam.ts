@@ -118,7 +118,11 @@ export async function switchSessionAccount(
   }
 
   const registry = loadProfileRegistry(loadOpts);
-  const fromProfile = requireProfile(registry.profiles, selectedProfileId(record), "current");
+  const fromProfile = requireProfile(
+    registry.profiles,
+    selectedProfileId(record) ?? registry.default,
+    "current",
+  );
   const toProfile = requireProfile(registry.profiles, targetId, "target");
   if (reason === "failover") {
     assertFailoverSibling(fromProfile, toProfile);

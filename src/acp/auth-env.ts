@@ -46,6 +46,15 @@ export const ACPX_EFFECTIVE_ADAPTER_ENV = "ACPX_EFFECTIVE_ADAPTER";
 export const ACPX_EFFECTIVE_AUTH_MODE_ENV = "ACPX_EFFECTIVE_AUTH_MODE";
 export const ACPX_EFFECTIVE_ANCHOR_ENV = "ACPX_EFFECTIVE_ANCHOR";
 
+export type EffectiveAccountMetadata = {
+  effectiveAccount: string;
+  effectiveProfile?: string;
+  effectiveAdapter?: string;
+  effectiveAuthMode?: string;
+  effectiveAnchor?: string;
+  effectiveResolutionMethod?: "path" | "selection";
+};
+
 /**
  * The claude-pty bridge's published session/new `_meta` selector key
  * (independent-claude-acp). This exact string is the bridge interface —
@@ -62,6 +71,44 @@ function toEnvToken(value: string): string {
     .replace(/[^a-zA-Z0-9]+/g, "_")
     .replace(/^_+|_+$/g, "")
     .toUpperCase();
+}
+
+function nonEmptyEnvString(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function effectiveResolutionMethod(authMode: string | undefined): "path" | "selection" | undefined {
+  if (authMode === undefined) {
+    return undefined;
+  }
+  return authMode === "openrouter" ? "selection" : "path";
+}
+
+export function effectiveAccountMetadataFromEnv(
+  env: NodeJS.ProcessEnv,
+): EffectiveAccountMetadata | undefined {
+  const effectiveAccount = nonEmptyEnvString(env[ACPX_EFFECTIVE_ACCOUNT_ENV]);
+  if (effectiveAccount === undefined) {
+    return undefined;
+  }
+  const effectiveAuthMode = nonEmptyEnvString(env[ACPX_EFFECTIVE_AUTH_MODE_ENV]);
+  return {
+    effectiveAccount,
+    ...(nonEmptyEnvString(env[ACPX_EFFECTIVE_PROFILE_ENV]) !== undefined
+      ? { effectiveProfile: nonEmptyEnvString(env[ACPX_EFFECTIVE_PROFILE_ENV]) }
+      : {}),
+    ...(nonEmptyEnvString(env[ACPX_EFFECTIVE_ADAPTER_ENV]) !== undefined
+      ? { effectiveAdapter: nonEmptyEnvString(env[ACPX_EFFECTIVE_ADAPTER_ENV]) }
+      : {}),
+    ...(effectiveAuthMode !== undefined ? { effectiveAuthMode } : {}),
+    ...(nonEmptyEnvString(env[ACPX_EFFECTIVE_ANCHOR_ENV]) !== undefined
+      ? { effectiveAnchor: nonEmptyEnvString(env[ACPX_EFFECTIVE_ANCHOR_ENV]) }
+      : {}),
+    ...(effectiveResolutionMethod(effectiveAuthMode) !== undefined
+      ? { effectiveResolutionMethod: effectiveResolutionMethod(effectiveAuthMode) }
+      : {}),
+  };
 }
 
 function buildAuthEnvKey(methodId: string): string | undefined {
