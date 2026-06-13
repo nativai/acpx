@@ -8,7 +8,12 @@ import {
   resolveAgentNameFromCommand,
 } from "../agent-registry.js";
 import { findSubscription, loadSubscriptionRegistry } from "../config/subscriptions.js";
-import { AgentSpawnError, SessionNotFoundError, SubscriptionUnknownError } from "../errors.js";
+import {
+  AgentSpawnError,
+  SessionNotFoundError,
+  SubscriptionChangeRequiresSwitchError,
+  SubscriptionUnknownError,
+} from "../errors.js";
 import { loadPermissionPolicySpec } from "../permission-policy.js";
 import {
   mergePromptSourceWithText,
@@ -243,6 +248,42 @@ function validateExplicitSubscriptionFlag(globalFlags: GlobalFlags): void {
     subscriptionId,
     registry.subscriptions.map((entry) => entry.id),
   );
+}
+
+function existingSessionSubscriptionLabel(record: SessionRecord): string {
+  return record.name ? `"${record.name}" (${record.acpxRecordId})` : record.acpxRecordId;
+}
+
+function switchSubscriptionCommand(
+  record: SessionRecord,
+  agentName: string,
+  requested: string,
+): string {
+  const sessionFlag = record.name ? ` --session ${record.name}` : "";
+  return `acpx ${agentName} set${sessionFlag} subscription ${requested}`;
+}
+
+function assertExplicitSubscriptionMatchesExistingSession(params: {
+  globalFlags: GlobalFlags;
+  record: SessionRecord;
+  agentName: string;
+}): void {
+  const requested = params.globalFlags.subscription?.trim();
+  if (!requested) {
+    return;
+  }
+
+  const current = params.record.acpx?.session_options?.subscription?.trim();
+  if (current === requested) {
+    return;
+  }
+
+  throw new SubscriptionChangeRequiresSwitchError({
+    sessionLabel: existingSessionSubscriptionLabel(params.record),
+    currentSubscription: current,
+    requestedSubscription: requested,
+    switchCommand: switchSubscriptionCommand(params.record, params.agentName, requested),
+  });
 }
 
 // `--reasoning-effort` is claude-only. When it's passed but the effective agent
@@ -714,7 +755,6 @@ export async function handlePrompt(
   const outputPolicy = resolveRequestedOutputPolicy(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
-  const prompt = await readPrompt(promptParts, flags.file, globalFlags.cwd);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   warnReasoningEffortIgnoredForNonClaude(globalFlags, agent.agentName);
   const [
@@ -728,6 +768,12 @@ export async function handlePrompt(
     agent.cwd,
     flags.session,
   );
+  assertExplicitSubscriptionMatchesExistingSession({
+    globalFlags,
+    record,
+    agentName: agent.agentName,
+  });
+  const prompt = await readPrompt(promptParts, flags.file, globalFlags.cwd);
   const outputFormatter = createOutputFormatter(outputPolicy.format, {
     jsonContext: {
       sessionId: record.acpxRecordId,
@@ -1452,6 +1498,19 @@ export async function handleSessionsEnsure(
     config,
   );
   warnReasoningEffortIgnoredForNonClaude(globalFlags, effectiveAgent.agentName);
+  const existing = await findSessionByDirectoryWalk({
+    agentCommand: effectiveAgent.agentCommand,
+    cwd: effectiveAgent.cwd,
+    name: flags.name,
+    boundary: findGitRepositoryRoot(effectiveAgent.cwd) ?? effectiveAgent.cwd,
+  });
+  if (existing) {
+    assertExplicitSubscriptionMatchesExistingSession({
+      globalFlags,
+      record: existing,
+      agentName: effectiveAgent.agentName,
+    });
+  }
   const [{ ensureSession }, { printCreatedSessionBanner, printEnsuredSessionByFormat }] =
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
   const result = await ensureSession(

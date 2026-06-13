@@ -190,6 +190,27 @@ export class SubscriptionUnknownError extends AcpxOperationalError {
   }
 }
 
+export class SubscriptionChangeRequiresSwitchError extends AcpxOperationalError {
+  constructor(params: {
+    sessionLabel: string;
+    currentSubscription?: string;
+    requestedSubscription: string;
+    switchCommand: string;
+  }) {
+    const current = params.currentSubscription
+      ? `"${params.currentSubscription}"`
+      : "no recorded subscription";
+    super(
+      `Cannot apply --subscription "${params.requestedSubscription}" to existing session ${params.sessionLabel}: current subscription is ${current}. Use \`${params.switchCommand}\` to switch the session before prompting; no prompt was sent.`,
+      {
+        outputCode: "USAGE",
+        detailCode: "SUBSCRIPTION_CHANGE_REQUIRES_SWITCH",
+        origin: "cli",
+      },
+    );
+  }
+}
+
 // Every registered subscription is dead (401) or maxed (≥ threshold) — there is
 // nothing to fail over to. Terminal turn error; the record's selection is left
 // unchanged so a later turn re-probes and auto-recovers when a window resets.
