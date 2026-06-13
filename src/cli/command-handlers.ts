@@ -21,6 +21,7 @@ import {
   PromptInputValidationError,
   textPrompt,
 } from "../prompt-content.js";
+import { getResolvedProfile } from "../runtime/engine/account-seam.js";
 import { sessionOptionsFromRecord } from "../runtime/engine/session-options.js";
 import { exportSession } from "../session/export.js";
 import { importSession } from "../session/import.js";
@@ -262,24 +263,70 @@ function switchSubscriptionCommand(
   return `acpx ${agentName} set${sessionFlag} subscription ${requested}`;
 }
 
-function assertExplicitSubscriptionMatchesExistingSession(params: {
+type EffectiveSubscriptionSelection = {
+  id?: string;
+  account?: string;
+};
+
+async function resolveEffectiveSubscriptionSelection(
+  id: string | undefined,
+): Promise<EffectiveSubscriptionSelection> {
+  const trimmed = id?.trim();
+  if (!trimmed) {
+    return {};
+  }
+  const profile = await getResolvedProfile(trimmed);
+  return {
+    id: trimmed,
+    account: profile?.account,
+  };
+}
+
+async function effectiveRecordedSubscriptionSelection(
+  record: SessionRecord,
+): Promise<EffectiveSubscriptionSelection> {
+  const sessionOptions = record.acpx?.session_options;
+  const profile = sessionOptions?.profile?.trim();
+  if (profile) {
+    return await resolveEffectiveSubscriptionSelection(profile);
+  }
+  return await resolveEffectiveSubscriptionSelection(sessionOptions?.subscription);
+}
+
+function subscriptionSelectionsMatch(
+  current: EffectiveSubscriptionSelection,
+  requested: EffectiveSubscriptionSelection,
+): boolean {
+  if (!current.id || !requested.id) {
+    return false;
+  }
+  if (current.id === requested.id) {
+    return true;
+  }
+  return current.account !== undefined && current.account === requested.account;
+}
+
+async function assertExplicitSubscriptionMatchesExistingSession(params: {
   globalFlags: GlobalFlags;
   record: SessionRecord;
   agentName: string;
-}): void {
+}): Promise<void> {
   const requested = params.globalFlags.subscription?.trim();
   if (!requested) {
     return;
   }
 
-  const current = params.record.acpx?.session_options?.subscription?.trim();
-  if (current === requested) {
+  const [current, requestedSelection] = await Promise.all([
+    effectiveRecordedSubscriptionSelection(params.record),
+    resolveEffectiveSubscriptionSelection(requested),
+  ]);
+  if (subscriptionSelectionsMatch(current, requestedSelection)) {
     return;
   }
 
   throw new SubscriptionChangeRequiresSwitchError({
     sessionLabel: existingSessionSubscriptionLabel(params.record),
-    currentSubscription: current,
+    currentSubscription: current.id,
     requestedSubscription: requested,
     switchCommand: switchSubscriptionCommand(params.record, params.agentName, requested),
   });
@@ -781,7 +828,7 @@ export async function handlePrompt(
     agent.cwd,
     flags.session,
   );
-  assertExplicitSubscriptionMatchesExistingSession({
+  await assertExplicitSubscriptionMatchesExistingSession({
     globalFlags,
     record,
     agentName: agent.agentName,
@@ -1519,7 +1566,7 @@ export async function handleSessionsEnsure(
     boundary: findGitRepositoryRoot(effectiveAgent.cwd) ?? effectiveAgent.cwd,
   });
   if (existing) {
-    assertExplicitSubscriptionMatchesExistingSession({
+    await assertExplicitSubscriptionMatchesExistingSession({
       globalFlags,
       record: existing,
       agentName: effectiveAgent.agentName,

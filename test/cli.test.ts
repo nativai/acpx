@@ -1723,6 +1723,104 @@ test("explicit valid --subscription on existing persistent sessions must apply o
     assert.equal(execEnv.CLAUDE_CONFIG_DIR, sub2Dir);
     assert.equal(execEnv.ACPX_SUBSCRIPTION, "sub2");
     assert.equal(await fs.readFile(sessionPath, "utf8"), beforeRejectRecord);
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "profile-backed-sub2",
+      acpSessionId: "profile-backed-sub2",
+      agentCommand,
+      cwd,
+      name: "profile-backed",
+      acpx: {
+        session_options: {
+          profile: "sub2",
+        },
+      },
+    });
+    const profileSame = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        agentCommand,
+        "--approve-all",
+        "--subscription",
+        "sub2-same-account",
+        "--format",
+        "quiet",
+        "--ttl",
+        "1",
+        "prompt",
+        "--session",
+        "profile-backed",
+        "echo profile-backed-same",
+      ],
+      homeDir,
+      { timeoutMs: 20_000 },
+    );
+    assert.equal(profileSame.code, 0, profileSame.stderr);
+    assert.match(profileSame.stdout, /profile-backed-same/);
+    const profileSameEnv = JSON.parse(await fs.readFile(envDumpFile, "utf8")) as Record<
+      string,
+      string
+    >;
+    assert.equal(profileSameEnv.CLAUDE_CONFIG_DIR, sub2Dir);
+    assert.equal(profileSameEnv.ACPX_SUBSCRIPTION, "sub2");
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "profile-backed-reject",
+      acpSessionId: "profile-backed-reject",
+      agentCommand,
+      cwd,
+      name: "profile-reject",
+      acpx: {
+        session_options: {
+          profile: "sub2",
+        },
+      },
+    });
+    const profileRejectPath = sessionFilePath(homeDir, "profile-backed-reject");
+    const beforeProfileReject = await fs.readFile(profileRejectPath, "utf8");
+    const profileDifferentPrompt = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        agentCommand,
+        "--approve-all",
+        "--subscription",
+        "sub1",
+        "prompt",
+        "--session",
+        "profile-reject",
+        "echo profile-should-not-run",
+      ],
+      homeDir,
+    );
+    assert.notEqual(profileDifferentPrompt.code, 0);
+    assert.match(profileDifferentPrompt.stderr, /Cannot apply --subscription "sub1"/);
+    assert.match(profileDifferentPrompt.stderr, /current subscription is "sub2"/);
+    assert.doesNotMatch(profileDifferentPrompt.stdout, /profile-should-not-run/);
+    assert.equal(await fs.readFile(profileRejectPath, "utf8"), beforeProfileReject);
+
+    const profileDifferentEnsure = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        agentCommand,
+        "--subscription",
+        "sub1",
+        "sessions",
+        "ensure",
+        "--name",
+        "profile-reject",
+      ],
+      homeDir,
+    );
+    assert.notEqual(profileDifferentEnsure.code, 0);
+    assert.match(profileDifferentEnsure.stderr, /Cannot apply --subscription "sub1"/);
+    assert.match(profileDifferentEnsure.stderr, /current subscription is "sub2"/);
+    assert.equal(await fs.readFile(profileRejectPath, "utf8"), beforeProfileReject);
   });
 });
 
@@ -4089,21 +4187,37 @@ async function writeSubscriptionRegistry(homeDir: string): Promise<void> {
   const subscriptionsRoot = path.join(homeDir, ".acpx", "subscriptions");
   await fs.mkdir(path.join(subscriptionsRoot, "sub1"), { recursive: true });
   await fs.mkdir(path.join(subscriptionsRoot, "sub2"), { recursive: true });
+  await fs.mkdir(path.join(subscriptionsRoot, "sub2-same-account"), { recursive: true });
   await fs.writeFile(
     path.join(subscriptionsRoot, "registry.json"),
     `${JSON.stringify(
       {
+        version: 3,
         default: "sub1",
-        subscriptions: [
+        profiles: [
           {
             id: "sub1",
             label: "Sub 1",
-            configDir: path.join(subscriptionsRoot, "sub1"),
+            authMode: "subscription",
+            adapter: "claude",
+            account: "acct-a",
+            credentialSource: path.join(subscriptionsRoot, "sub1"),
           },
           {
             id: "sub2",
             label: "Sub 2",
-            configDir: path.join(subscriptionsRoot, "sub2"),
+            authMode: "subscription",
+            adapter: "claude",
+            account: "acct-b",
+            credentialSource: path.join(subscriptionsRoot, "sub2"),
+          },
+          {
+            id: "sub2-same-account",
+            label: "Sub 2 Same Account",
+            authMode: "subscription",
+            adapter: "claude",
+            account: "acct-b",
+            credentialSource: path.join(subscriptionsRoot, "sub2-same-account"),
           },
         ],
       },
