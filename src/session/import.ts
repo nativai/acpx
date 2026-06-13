@@ -178,6 +178,7 @@ function assertExpectedAgentCommand(
     })
   ) {
     sourceRecord.agentCommand = expectedAgentCommand;
+    sourceRecord.agentName = expectedAgentName;
     return;
   }
   throw importError(
@@ -244,6 +245,7 @@ function commandLooksLikeBuiltInAgent(command: string, agentName: string): boole
 async function assertDestinationScopeAvailable(record: SessionRecord): Promise<void> {
   const existing = await findSession({
     agentCommand: record.agentCommand,
+    agentName: record.agentName,
     cwd: record.cwd,
     name: record.name,
   });
@@ -284,6 +286,7 @@ function buildImportedRecord(
   return {
     ...sourceRecord,
     acpxRecordId: options.newRecordId,
+    agentName: sourceRecord.agentName ?? normalizeAgentIdentity(parsed.session.agent_name),
     cwd: options.cwd,
     name: resolveImportedName(parsed, options.name),
     closed: false,

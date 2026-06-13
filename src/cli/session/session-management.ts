@@ -103,6 +103,7 @@ async function createSessionRecordWithClient(
     acpxRecordId: sessionId,
     acpSessionId,
     agentSessionId,
+    agentName: options.agentName,
     agentCommand: options.agentCommand,
     cwd,
     name: normalizeName(options.name),
@@ -436,6 +437,7 @@ export async function ensureSession(options: SessionEnsureOptions): Promise<Sess
   const walkBoundary = options.walkBoundary ?? gitRoot ?? cwd;
   const existing = await findSessionByDirectoryWalk({
     agentCommand: options.agentCommand,
+    agentName: options.agentName,
     cwd,
     name: options.name,
     boundary: walkBoundary,
@@ -472,6 +474,7 @@ export async function ensureSession(options: SessionEnsureOptions): Promise<Sess
 
   const record = await createSession({
     agentCommand: options.agentCommand,
+    agentName: options.agentName,
     cwd,
     name: options.name,
     resumeSessionId: options.resumeSessionId,

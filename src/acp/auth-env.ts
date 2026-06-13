@@ -1,28 +1,50 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
-import { hasKnownDeadSubs, isSubscriptionKnownDead } from "../config/known-dead-subscriptions.js";
+import { join, resolve as resolvePath } from "node:path";
+import {
+  hasKnownDeadAccounts,
+  hasKnownDeadSubs,
+  isAccountKnownDead,
+  isSubscriptionKnownDead,
+} from "../config/known-dead-subscriptions.js";
 import {
   buildClaudeHomeMap,
   findProfile,
   getValidEffortsForProfile,
   loadProfileRegistry,
+  transcriptAnchorDir,
+  type ChatGptProfileEntry,
+  type ClaudeHomeProfileEntry,
+  type OpenRouterProfileEntry,
   type ProfileEntry,
   type ProfileRegistry,
+  type SubscriptionProfileEntry,
 } from "../config/profiles.js";
 import type { SubscriptionLookupOptions } from "../config/subscriptions.js";
 import {
   chooseSubscriptionConfigDir,
+  findSubscription,
   loadSubscriptionRegistry,
   subscriptionConfigDirExists,
 } from "../config/subscriptions.js";
-import type { ConfigDirChoice, SubscriptionRegistry } from "../config/subscriptions.js";
+import type {
+  ConfigDirChoice,
+  SubscriptionEntry,
+  SubscriptionRegistry,
+} from "../config/subscriptions.js";
 import type { AcpClientOptions } from "../types.js";
 import { isClaudePtyAgentCommand } from "./agent-command.js";
+import { splitCommandLine } from "./client-process.js";
+import { isCodexAcpCommand } from "./codex-compat.js";
 import type { ShimHandle } from "./openrouter-shim.js";
 import { spawnOpenRouterShim } from "./openrouter-shim.js";
 
 const AUTH_ENV_PREFIX = "ACPX_AUTH_";
+export const ACPX_EFFECTIVE_PROFILE_ENV = "ACPX_EFFECTIVE_PROFILE";
+export const ACPX_EFFECTIVE_ACCOUNT_ENV = "ACPX_EFFECTIVE_ACCOUNT";
+export const ACPX_EFFECTIVE_ADAPTER_ENV = "ACPX_EFFECTIVE_ADAPTER";
+export const ACPX_EFFECTIVE_AUTH_MODE_ENV = "ACPX_EFFECTIVE_AUTH_MODE";
+export const ACPX_EFFECTIVE_ANCHOR_ENV = "ACPX_EFFECTIVE_ANCHOR";
 
 /**
  * The claude-pty bridge's published session/new `_meta` selector key
@@ -191,6 +213,207 @@ type ResolvedSubscription = {
   defaultId: string | undefined;
 };
 
+type EffectiveAccountStamp = {
+  profileId: string;
+  account: string;
+  adapter: string;
+  authMode: string;
+  anchor: string;
+};
+
+function normalizedFsPath(value: string): string {
+  return resolvePath(value);
+}
+
+function findSubscriptionByConfigDir(
+  configDir: string,
+  registry: SubscriptionRegistry,
+): SubscriptionEntry | undefined {
+  const normalized = normalizedFsPath(configDir);
+  return registry.subscriptions.find((entry) => normalizedFsPath(entry.configDir) === normalized);
+}
+
+function findSubscriptionProfileByConfigDir(
+  configDir: string,
+  registry: ProfileRegistry,
+): ProfileEntry | undefined {
+  const normalized = normalizedFsPath(configDir);
+  return registry.profiles.find(
+    (entry) =>
+      entry.authMode === "subscription" && normalizedFsPath(entry.credentialSource) === normalized,
+  );
+}
+
+function findClaudeHomeProfileByAnchor(
+  anchor: string,
+  registry: ProfileRegistry,
+): ProfileEntry | undefined {
+  const normalized = normalizedFsPath(anchor);
+  return registry.profiles.find((entry) => {
+    if (entry.authMode !== "claude-home") {
+      return false;
+    }
+    const profileAnchor = transcriptAnchorDir(entry);
+    return profileAnchor !== null && normalizedFsPath(profileAnchor) === normalized;
+  });
+}
+
+function findChatGptProfileByCodexHome(
+  codexHome: string,
+  registry: ProfileRegistry,
+): ProfileEntry | undefined {
+  const normalized = normalizedFsPath(codexHome);
+  return registry.profiles.find(
+    (entry) => entry.authMode === "chatgpt" && normalizedFsPath(entry.codexHome) === normalized,
+  );
+}
+
+function stampEffectiveAccount(env: NodeJS.ProcessEnv, stamp: EffectiveAccountStamp): void {
+  env.ACPX_SUBSCRIPTION = stamp.profileId;
+  env[ACPX_EFFECTIVE_PROFILE_ENV] = stamp.profileId;
+  env[ACPX_EFFECTIVE_ACCOUNT_ENV] = stamp.account;
+  env[ACPX_EFFECTIVE_ADAPTER_ENV] = stamp.adapter;
+  env[ACPX_EFFECTIVE_AUTH_MODE_ENV] = stamp.authMode;
+  env[ACPX_EFFECTIVE_ANCHOR_ENV] = stamp.anchor;
+}
+
+function throwAccountMismatch(params: {
+  expectedAccount: string;
+  selectionKind: "subscription" | "profile";
+  selectionId: string;
+  physicalAccount: string;
+  anchor: string;
+}): never {
+  throw new Error(
+    `[acpx] recorded account "${params.expectedAccount}" for ${params.selectionKind} "${params.selectionId}" ` +
+      `does not match the physically resolved account "${params.physicalAccount}" at ${params.anchor}; ` +
+      `refusing to spawn on the wrong account`,
+  );
+}
+
+function assertPhysicalAccount(params: {
+  expectedAccount: string;
+  selectionKind: "subscription" | "profile";
+  selectionId: string;
+  physicalAccount: string;
+  anchor: string;
+}): void {
+  if (params.physicalAccount !== params.expectedAccount) {
+    throwAccountMismatch(params);
+  }
+}
+
+function verifySubscriptionEffectiveAccount(
+  env: NodeJS.ProcessEnv,
+  expectedEntry: SubscriptionEntry,
+  registry: SubscriptionRegistry,
+  configDir: string,
+): void {
+  const physicalEntry = findSubscriptionByConfigDir(configDir, registry) ?? expectedEntry;
+  assertPhysicalAccount({
+    expectedAccount: expectedEntry.account,
+    selectionKind: "subscription",
+    selectionId: expectedEntry.id,
+    physicalAccount: physicalEntry.account,
+    anchor: configDir,
+  });
+  stampEffectiveAccount(env, {
+    profileId: expectedEntry.id,
+    account: expectedEntry.account,
+    adapter: "claude",
+    authMode: "subscription",
+    anchor: configDir,
+  });
+}
+
+function stampProfileEffectiveAccount(
+  env: NodeJS.ProcessEnv,
+  profile: ProfileEntry,
+  anchor: string,
+): void {
+  stampEffectiveAccount(env, {
+    profileId: profile.id,
+    account: profile.account,
+    adapter: profile.adapter,
+    authMode: profile.authMode,
+    anchor,
+  });
+}
+
+function verifySubscriptionProfileEffectiveAccount(
+  env: NodeJS.ProcessEnv,
+  expectedProfile: SubscriptionProfileEntry,
+  registry: ProfileRegistry,
+): void {
+  const configDir = env.CLAUDE_CONFIG_DIR;
+  if (!configDir) {
+    throw new Error(
+      `[acpx] profile "${expectedProfile.id}" resolved as subscription but no CLAUDE_CONFIG_DIR was applied`,
+    );
+  }
+  const physicalProfile =
+    findSubscriptionProfileByConfigDir(configDir, registry) ?? expectedProfile;
+  assertPhysicalAccount({
+    expectedAccount: expectedProfile.account,
+    selectionKind: "profile",
+    selectionId: expectedProfile.id,
+    physicalAccount: physicalProfile.account,
+    anchor: configDir,
+  });
+  stampProfileEffectiveAccount(env, expectedProfile, configDir);
+}
+
+function verifyClaudeHomeProfileEffectiveAccount(
+  env: NodeJS.ProcessEnv,
+  expectedProfile: ClaudeHomeProfileEntry,
+  registry: ProfileRegistry,
+): void {
+  const anchor = transcriptAnchorDir(expectedProfile) ?? expectedProfile.homePath;
+  const physicalProfile = findClaudeHomeProfileByAnchor(anchor, registry) ?? expectedProfile;
+  assertPhysicalAccount({
+    expectedAccount: expectedProfile.account,
+    selectionKind: "profile",
+    selectionId: expectedProfile.id,
+    physicalAccount: physicalProfile.account,
+    anchor,
+  });
+  stampProfileEffectiveAccount(env, expectedProfile, anchor);
+}
+
+function verifyChatGptProfileEffectiveAccount(
+  env: NodeJS.ProcessEnv,
+  expectedProfile: ChatGptProfileEntry,
+  registry: ProfileRegistry,
+): void {
+  const codexHome = env.CODEX_HOME ?? expectedProfile.codexHome;
+  const physicalProfile = findChatGptProfileByCodexHome(codexHome, registry) ?? expectedProfile;
+  assertPhysicalAccount({
+    expectedAccount: expectedProfile.account,
+    selectionKind: "profile",
+    selectionId: expectedProfile.id,
+    physicalAccount: physicalProfile.account,
+    anchor: codexHome,
+  });
+  stampProfileEffectiveAccount(env, expectedProfile, codexHome);
+}
+
+function verifyProfileEffectiveAccount(
+  env: NodeJS.ProcessEnv,
+  expectedProfile: ProfileEntry,
+  registry: ProfileRegistry,
+): void {
+  switch (expectedProfile.authMode) {
+    case "subscription":
+      return verifySubscriptionProfileEffectiveAccount(env, expectedProfile, registry);
+    case "claude-home":
+      return verifyClaudeHomeProfileEffectiveAccount(env, expectedProfile, registry);
+    case "chatgpt":
+      return verifyChatGptProfileEffectiveAccount(env, expectedProfile, registry);
+    case "openrouter":
+      return stampProfileEffectiveAccount(env, expectedProfile, env.CLAUDE_CONFIG_DIR ?? "");
+  }
+}
+
 // Load the registry and resolve the choice, emitting the legacy log lines. Returns
 // undefined when there is no configDir to apply (no registry / unusable default /
 // registry read failure) — i.e. the caller leaves CLAUDE_CONFIG_DIR unset.
@@ -211,9 +434,56 @@ function resolveSubscriptionChoice(
     return undefined;
   }
   if (resolved.choice.explicitRejection) {
-    emitExplicitRejection(resolved.choice.explicitRejection);
+    throw new Error(formatExplicitRejection(resolved.choice.explicitRejection));
   }
   return resolved.choice.configDir === undefined ? undefined : resolved;
+}
+
+type AppliedSubscriptionChoice = {
+  resolvedId: string | undefined;
+  configDir: string;
+  substituted: boolean;
+};
+
+function applySubscriptionChoiceAvoidance(
+  explicitId: string | null | undefined,
+  resolved: ResolvedSubscription,
+): AppliedSubscriptionChoice {
+  const baseResolvedId =
+    resolved.choice.source === "explicit" ? explicitId?.trim() : resolved.defaultId;
+  return applyPreSpawnAvoidance(
+    resolved.registry,
+    baseResolvedId,
+    resolved.choice.configDir as string,
+    resolved.choice.source !== "explicit",
+  );
+}
+
+function maybeEmitDefaultApplied(
+  resolved: ResolvedSubscription,
+  applied: AppliedSubscriptionChoice,
+): void {
+  if (resolved.choice.source !== "default" || !resolved.defaultId || applied.substituted) {
+    return;
+  }
+  emitDefaultApplied(
+    resolved.defaultId,
+    resolved.choice.configDir as string,
+    resolved.choice.explicitRejection !== undefined,
+  );
+}
+
+function verifyAppliedSubscription(
+  env: NodeJS.ProcessEnv,
+  resolved: ResolvedSubscription,
+  applied: AppliedSubscriptionChoice,
+): void {
+  const expectedEntry = applied.resolvedId
+    ? findSubscription(applied.resolvedId, resolved.registry)
+    : undefined;
+  if (expectedEntry) {
+    verifySubscriptionEffectiveAccount(env, expectedEntry, resolved.registry, applied.configDir);
+  }
 }
 
 // Resolve which CLAUDE_CONFIG_DIR an adapter spawn should use and set it on the
@@ -238,31 +508,18 @@ function applySubscriptionConfigDir(
   if (!resolved) {
     return;
   }
-  const { registry, choice, defaultId } = resolved;
+  const applied = applySubscriptionChoiceAvoidance(explicitId, resolved);
 
-  // The id this choice resolved to (explicit selection or registry default).
-  const baseResolvedId = choice.source === "explicit" ? explicitId?.trim() : defaultId;
-  const { resolvedId, configDir, substituted } = applyPreSpawnAvoidance(
-    registry,
-    baseResolvedId,
-    choice.configDir as string,
-  );
-
-  env.CLAUDE_CONFIG_DIR = configDir;
+  env.CLAUDE_CONFIG_DIR = applied.configDir;
   // Export the RESOLVED subscription id so the agent (and its children) can read
   // its own sub and inherit it (ACPX_SUBSCRIPTION, beside ACPX_TASK_FOLDER).
-  if (resolvedId) {
-    env.ACPX_SUBSCRIPTION = resolvedId;
+  if (applied.resolvedId) {
+    env.ACPX_SUBSCRIPTION = applied.resolvedId;
   }
   // Only emit the "default applied" note when we used the default verbatim (no
   // failover substitution kicked in), to keep the existing message accurate.
-  if (choice.source === "default" && defaultId && !substituted) {
-    emitDefaultApplied(
-      defaultId,
-      choice.configDir as string,
-      choice.explicitRejection !== undefined,
-    );
-  }
+  maybeEmitDefaultApplied(resolved, applied);
+  verifyAppliedSubscription(env, resolved, applied);
 }
 
 // Pre-spawn avoidance (§4.1.4): if the resolved sub failed over earlier in this
@@ -274,18 +531,49 @@ function applyPreSpawnAvoidance(
   registry: SubscriptionRegistry,
   resolvedId: string | undefined,
   configDir: string,
+  allowSubstitution = true,
 ): { resolvedId: string | undefined; configDir: string; substituted: boolean } {
-  if (!resolvedId || !hasKnownDeadSubs() || !isSubscriptionKnownDead(resolvedId)) {
+  const target = avoidanceTarget(registry, resolvedId, allowSubstitution);
+  if (!target) {
     return { resolvedId, configDir, substituted: false };
   }
-  const healthy = firstHealthySubscription(registry, resolvedId);
+  const healthy = firstHealthySubscription(registry, target.id, target.account);
   if (!healthy) {
     return { resolvedId, configDir, substituted: false };
   }
   process.stderr.write(
-    `[acpx] subscription "${resolvedId}" recently failed over; using "${healthy.id}" for this spawn (CLAUDE_CONFIG_DIR=${healthy.configDir})\n`,
+    `[acpx] subscription "${target.id}" recently failed over; using "${healthy.id}" for this spawn (CLAUDE_CONFIG_DIR=${healthy.configDir})\n`,
   );
   return { resolvedId: healthy.id, configDir: healthy.configDir, substituted: true };
+}
+
+function avoidanceTarget(
+  registry: SubscriptionRegistry,
+  resolvedId: string | undefined,
+  allowSubstitution: boolean,
+): { id: string; account?: string } | undefined {
+  if (!allowSubstitution || !resolvedId || !hasKnownDeadCredentialState()) {
+    return undefined;
+  }
+  const failedEntry = findSubscription(resolvedId, registry);
+  if (!isResolvedSubscriptionDead(resolvedId, failedEntry)) {
+    return undefined;
+  }
+  return { id: resolvedId, ...(failedEntry !== undefined ? { account: failedEntry.account } : {}) };
+}
+
+function hasKnownDeadCredentialState(): boolean {
+  return hasKnownDeadSubs() || hasKnownDeadAccounts();
+}
+
+function isResolvedSubscriptionDead(
+  resolvedId: string,
+  entry: SubscriptionEntry | undefined,
+): boolean {
+  return (
+    isSubscriptionKnownDead(resolvedId) ||
+    (entry !== undefined && isAccountKnownDead(entry.account))
+  );
 }
 
 // First registered subscription whose dir exists and is not known-dead, skipping
@@ -293,9 +581,15 @@ function applyPreSpawnAvoidance(
 function firstHealthySubscription(
   registry: SubscriptionRegistry,
   avoidId: string,
+  avoidAccount?: string,
 ): { id: string; configDir: string } | undefined {
   for (const entry of registry.subscriptions) {
-    if (entry.id === avoidId || isSubscriptionKnownDead(entry.id)) {
+    if (
+      entry.id === avoidId ||
+      entry.account === avoidAccount ||
+      isSubscriptionKnownDead(entry.id) ||
+      isAccountKnownDead(entry.account)
+    ) {
       continue;
     }
     if (subscriptionConfigDirExists(entry.configDir)) {
@@ -319,18 +613,15 @@ function emitRegistryReadFailure(explicitId: string | null | undefined, error: u
   );
 }
 
-// EXACT legacy lines — preserved byte-for-byte so a no-usable-default box behaves
-// identically to the pre-default build.
-function emitExplicitRejection(rejection: NonNullable<ConfigDirChoice["explicitRejection"]>): void {
+// Explicit selections are apply-or-loud. Falling through to a default would make
+// the session record lie about the account that physically ran the agent.
+function formatExplicitRejection(
+  rejection: NonNullable<ConfigDirChoice["explicitRejection"]>,
+): string {
   if (rejection.kind === "unknown") {
-    process.stderr.write(
-      `[acpx] subscription "${rejection.id}" not found in registry; using default Claude config (no CLAUDE_CONFIG_DIR override)\n`,
-    );
-    return;
+    return `[acpx] subscription "${rejection.id}" not found in registry; refusing to spawn on a different account`;
   }
-  process.stderr.write(
-    `[acpx] subscription "${rejection.id}" configDir not found at ${rejection.configDir}; using default Claude config (no CLAUDE_CONFIG_DIR override)\n`,
-  );
+  return `[acpx] subscription "${rejection.id}" configDir not found at ${rejection.configDir}; refusing to spawn on a different account`;
 }
 
 // NEW note — only reachable when a usable default produced the configDir, i.e.
@@ -467,6 +758,48 @@ function rejectExplicitSubscriptionForClaudePty(subscriptionId: string | null | 
   );
 }
 
+function assertClaudePtyProfileCompatibility(params: {
+  profileId: string;
+  profile: ProfileEntry;
+  agentCommand: string;
+  claudePty: boolean;
+}): void {
+  if (params.profile.authMode === "claude-home" && !params.claudePty) {
+    throw new Error(
+      `[acpx] profile "${params.profileId}" (authMode "claude-home") requires the claude-pty bridge agent; ` +
+        `this session's agent command is "${params.agentCommand}". ` +
+        `Create the session with the claude-pty agent to use this profile.`,
+    );
+  }
+  if (params.profile.authMode !== "claude-home" && params.claudePty) {
+    throw new Error(
+      `[acpx] profile "${params.profileId}" (authMode "${params.profile.authMode}") cannot be used with the ` +
+        `claude-pty bridge agent: its credentials are not an interactive Claude login ` +
+        `(interactive Claude would wedge at the login picker). Use a claude-home profile.`,
+    );
+  }
+}
+
+function assertCodexProfileCompatibility(params: {
+  profileId: string;
+  profile: ProfileEntry;
+  agentCommand: string;
+  codex: boolean;
+}): void {
+  if (params.profile.authMode === "chatgpt" && !params.codex) {
+    throw new Error(
+      `[acpx] profile "${params.profileId}" (authMode "chatgpt") requires the codex adapter; ` +
+        `this session's agent command is "${params.agentCommand}". Create the session with the codex agent.`,
+    );
+  }
+  if (params.profile.authMode !== "chatgpt" && params.codex) {
+    throw new Error(
+      `[acpx] profile "${params.profileId}" (authMode "${params.profile.authMode}") cannot be used with the ` +
+        `codex adapter. Use a chatgpt profile for codex auth.`,
+    );
+  }
+}
+
 // Both-directions profile↔agent compatibility gate, evaluated on EVERY spawn
 // (create / recover / keepwarm — applyProfileAuth is on the single resolution
 // path). claude-home profiles only work on the claude-pty bridge (interactive
@@ -482,36 +815,36 @@ function validateProfileAgentCompatibility(
   if (agentCommand === undefined) {
     return;
   }
+  const split = splitCommandLine(agentCommand);
   const claudePty = isClaudePtyAgentCommand(agentCommand);
-  if (profile.authMode === "claude-home" && !claudePty) {
-    throw new Error(
-      `[acpx] profile "${profileId}" (authMode "claude-home") requires the claude-pty bridge agent; ` +
-        `this session's agent command is "${agentCommand}". ` +
-        `Create the session with the claude-pty agent to use this profile.`,
-    );
-  }
-  if (profile.authMode !== "claude-home" && claudePty) {
-    throw new Error(
-      `[acpx] profile "${profileId}" (authMode "${profile.authMode}") cannot be used with the ` +
-        `claude-pty bridge agent: its credentials are not an interactive Claude login ` +
-        `(interactive Claude would wedge at the login picker). Use a claude-home profile.`,
-    );
-  }
+  const codex = isCodexAcpCommand(split.command, split.args);
+  assertClaudePtyProfileCompatibility({ profileId, profile, agentCommand, claudePty });
+  assertCodexProfileCompatibility({ profileId, profile, agentCommand, codex });
 }
 
 // claude-home branch of applyProfileAuth: the bridge owns auth via its HOME
 // selector. Inject the full allow-list map (ALL claude-home profiles in the
 // registry) so the bridge's unknown-selector diagnostics stay meaningful; the
 // per-session selection travels as session/new _meta (buildClaudeHomeSelectorMeta),
-// never as env. No CLAUDE_CONFIG_DIR / ACPX_SUBSCRIPTION: subscription
-// resolution does not apply to interactive-home credentials (the bridge strips
-// leaked SDK env defensively, but acpx must not emit it — drop anything
-// inherited from the owner's own process env). The map holds paths only,
-// never credential contents.
+// never as env. No CLAUDE_CONFIG_DIR: subscription configDir resolution does
+// not apply to interactive-home credentials (the bridge strips leaked SDK env
+// defensively, but acpx must not emit it). ACPX_SUBSCRIPTION is re-stamped
+// later as the unified selection id for child-spawn compatibility. The map
+// holds paths only, never credential contents.
 function applyClaudeHomeProfileAuth(env: NodeJS.ProcessEnv, registry: ProfileRegistry): void {
   env[INDEPENDENT_CLAUDE_HOME_MAP_ENV] = JSON.stringify(buildClaudeHomeMap(registry));
   delete env.CLAUDE_CONFIG_DIR;
   delete env.ACPX_SUBSCRIPTION;
+}
+
+function applyChatGptProfileAuth(env: NodeJS.ProcessEnv, profile: ProfileEntry): void {
+  if (profile.authMode !== "chatgpt") {
+    return;
+  }
+  env.CODEX_HOME = profile.codexHome;
+  delete env.CLAUDE_CONFIG_DIR;
+  delete env.ACPX_SUBSCRIPTION;
+  delete env[INDEPENDENT_CLAUDE_HOME_MAP_ENV];
 }
 
 /**
@@ -539,20 +872,29 @@ export function buildClaudeHomeSelectorMeta(
 }
 
 // Handles the openrouter authMode branch of applyProfileAuth.
+function resolveOpenRouterApiKey(profile: OpenRouterProfileEntry): string | undefined {
+  if (profile.openRouterApiKeyEnv) {
+    const envValue = process.env[profile.openRouterApiKeyEnv];
+    if (typeof envValue === "string" && envValue.trim().length > 0) {
+      return envValue;
+    }
+  }
+  return profile.openRouterApiKey;
+}
+
 async function applyOpenRouterProfileAuth(
   env: NodeJS.ProcessEnv,
   profileId: string,
   sessionId: string,
-  profile: NonNullable<ReturnType<typeof findProfile>>,
+  profile: OpenRouterProfileEntry,
   reasoningEffortOverride: string | null | undefined,
 ): Promise<ShimHandle | null> {
-  const apiKey = profile.openRouterApiKey;
+  const apiKey = resolveOpenRouterApiKey(profile);
   const model = profile.model;
   if (!apiKey || !model) {
-    process.stderr.write(
-      `[acpx] profile "${profileId}" is missing openRouterApiKey or model; using default Claude config\n`,
+    throw new Error(
+      `[acpx] profile "${profileId}" is missing OpenRouter credentials or model; refusing to spawn under a different account`,
     );
-    return null;
   }
 
   // Validate then resolve effort: per-session override > profile default.
@@ -598,41 +940,45 @@ export async function applyProfileAuth(
   const registry = loadProfileRegistry(lookupOptions);
   const profile = findProfile(trimmedId, registry);
   if (!profile) {
-    // For the bridge agent a soft fallback would be a SILENT wrong-home run:
-    // with no profile there is no map env and no _meta selector, and the
-    // bridge then falls back to the box-default HOME (wrong credentials)
-    // without erroring. Fail the spawn instead.
-    if (agentCommand !== undefined && isClaudePtyAgentCommand(agentCommand)) {
-      throw new Error(
-        `[acpx] profile "${trimmedId}" not found in registry; the claude-pty bridge agent ` +
-          `requires a claude-home profile — refusing to spawn under the box-default HOME. ` +
-          `Restore the profile in ~/.acpx/subscriptions/registry.json or recreate the session.`,
-      );
-    }
-    process.stderr.write(
-      `[acpx] profile "${trimmedId}" not found in registry; using default Claude config\n`,
+    throw new Error(
+      `[acpx] profile "${trimmedId}" not found in registry; refusing to spawn under a different account. ` +
+        `Restore the profile in ~/.acpx/subscriptions/registry.json or recreate the session.`,
     );
-    return null;
   }
 
   validateProfileAgentCompatibility(trimmedId, profile, agentCommand);
 
   if (profile.authMode === "claude-home") {
     applyClaudeHomeProfileAuth(env, registry);
+    verifyProfileEffectiveAccount(env, profile, registry);
     return null;
   }
 
   if (profile.authMode === "subscription") {
     // Behave exactly like applySubscriptionConfigDir for subscription profiles.
     applySubscriptionConfigDir(env, trimmedId, lookupOptions);
+    verifyProfileEffectiveAccount(env, profile, registry);
     return null;
   }
 
   if (profile.authMode === "openrouter") {
-    return applyOpenRouterProfileAuth(env, trimmedId, sessionId, profile, reasoningEffortOverride);
+    const shim = await applyOpenRouterProfileAuth(
+      env,
+      trimmedId,
+      sessionId,
+      profile,
+      reasoningEffortOverride,
+    );
+    verifyProfileEffectiveAccount(env, profile, registry);
+    return shim;
   }
 
-  // authMode=chatgpt or unknown: no extra env manipulation from the profile side.
+  if (profile.authMode === "chatgpt") {
+    applyChatGptProfileAuth(env, profile);
+    verifyProfileEffectiveAccount(env, profile, registry);
+    return null;
+  }
+
   return null;
 }
 

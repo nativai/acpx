@@ -396,6 +396,7 @@ function assignParsedSessionOptions(state: SessionAcpxState, raw: unknown): void
   assignSessionOptionSubscription(parsedSessionOptions, sessionOptions.subscription);
   assignSessionOptionProfile(parsedSessionOptions, sessionOptions.profile);
   assignSessionOptionSubscriptionSwitch(parsedSessionOptions, sessionOptions.subscription_switch);
+  assignSessionOptionAccountSwitch(parsedSessionOptions, sessionOptions.account_switch);
 
   if (Object.keys(parsedSessionOptions).length > 0) {
     state.session_options = parsedSessionOptions;
@@ -425,6 +426,43 @@ function assignSessionOptionSubscriptionSwitch(
   options.subscription_switch = {
     ...(typeof record.from === "string" ? { from: record.from } : {}),
     to: record.to,
+    reason: record.reason,
+    at: record.at,
+  };
+}
+
+function isValidAccountSwitch(record: Record<string, unknown>): record is {
+  fromProfile?: string;
+  toProfile: string;
+  fromAccount?: string;
+  toAccount: string;
+  reason: "manual" | "failover";
+  at: string;
+} {
+  return (
+    typeof record.toProfile === "string" &&
+    record.toProfile.length > 0 &&
+    typeof record.toAccount === "string" &&
+    record.toAccount.length > 0 &&
+    (record.reason === "manual" || record.reason === "failover") &&
+    typeof record.at === "string" &&
+    record.at.length > 0
+  );
+}
+
+function assignSessionOptionAccountSwitch(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+  value: unknown,
+): void {
+  const record = asRecord(value);
+  if (!record || !isValidAccountSwitch(record)) {
+    return;
+  }
+  options.account_switch = {
+    ...(typeof record.fromProfile === "string" ? { fromProfile: record.fromProfile } : {}),
+    toProfile: record.toProfile,
+    ...(typeof record.fromAccount === "string" ? { fromAccount: record.fromAccount } : {}),
+    toAccount: record.toAccount,
     reason: record.reason,
     at: record.at,
   };
@@ -805,6 +843,10 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     return null;
   }
   const agentCommand = typeof agentCommandRaw === "string" ? agentCommandRaw : "";
+  const agentName = normalizeOptionalString(record.agent_name);
+  if (agentName === null) {
+    return null;
+  }
 
   // cwd is required for regular sessions but may be absent for subagents
   const cwdRaw = record.cwd;
@@ -876,6 +918,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     acpxRecordId: record.acpx_record_id,
     acpSessionId: record.acp_session_id,
     agentSessionId: normalizeRuntimeSessionId(record.agent_session_id),
+    agentName: agentName ?? undefined,
     agentCommand,
     cwd,
     name,

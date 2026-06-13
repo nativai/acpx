@@ -240,6 +240,7 @@ export type AcpClientOptions = {
     maxTurns?: number;
     systemPrompt?: string | { append: string };
     subscription?: string;
+    profile?: string;
   };
   onAcpMessage?: (direction: AcpMessageDirection, message: AcpJsonRpcMessage) => void;
   onAcpOutputMessage?: (direction: AcpMessageDirection, message: AcpJsonRpcMessage) => void;
@@ -422,6 +423,20 @@ export type SessionAcpxState = {
       reason: "manual" | "failover";
       at: string;
     };
+    /**
+     * Breadcrumb recorded when the provider-domain seam switches the unified
+     * profile/account selection. W5 keeps this separate from the legacy
+     * subscription breadcrumb so Wave 4 can converge without writing
+     * session_options.subscription.
+     */
+    account_switch?: {
+      fromProfile?: string;
+      toProfile: string;
+      fromAccount?: string;
+      toAccount: string;
+      reason: "manual" | "failover";
+      at: string;
+    };
   };
 };
 
@@ -460,6 +475,8 @@ export type SessionRecord = {
   acpxRecordId: string;
   acpSessionId: string;
   agentSessionId?: string;
+  /** Stable acpx agent name; preferred over mutable agentCommand for routing. */
+  agentName?: string;
   agentCommand: string;
   cwd: string;
   name?: string;

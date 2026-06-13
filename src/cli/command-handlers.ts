@@ -72,7 +72,6 @@ import {
   withInheritedModel,
   withInheritedProfile,
   withInheritedReasoningEffort,
-  withInheritedSubscription,
   withInheritedTaskFolder,
 } from "./session/inherited-metadata.js";
 import { mergeSessionMetadata, validateSessionMetadataValue } from "./session/session-metadata.js";
@@ -222,13 +221,13 @@ type ResolvedAgentInvocation = ReturnType<typeof resolveAgentInvocation>;
 function sessionOptionsFromGlobalFlags(
   globalFlags: GlobalFlags,
 ): NonNullable<Parameters<SessionModule["createSession"]>[0]["sessionOptions"]> {
+  const unifiedSelection = globalFlags.profile ?? globalFlags.subscription;
   return {
     model: globalFlags.model,
     allowedTools: globalFlags.allowedTools,
     maxTurns: globalFlags.maxTurns,
     systemPrompt: globalFlags.systemPrompt,
-    subscription: globalFlags.subscription,
-    profile: globalFlags.profile,
+    profile: unifiedSelection,
     reasoningEffort: globalFlags.reasoningEffort,
   };
 }
@@ -424,6 +423,16 @@ function resolveEffectiveSpawnAgent(
   return { agentName, agentCommand, cwd: agent.cwd, sameAgentAsParent };
 }
 
+function inheritedProfileSelection(
+  globalFlags: GlobalFlags,
+  parent: ResolvedParentSession | undefined,
+): string | undefined {
+  return withInheritedProfile(
+    globalFlags.profile ?? globalFlags.subscription,
+    parent?.profile ?? parent?.subscription,
+  );
+}
+
 // Assemble the child's sessionOptions, layering parent inheritance over the
 // global flags. Model/effort inherit only when the child resolves to the SAME
 // agent (both are agent-namespaced); subscription always inherits. Explicit
@@ -441,8 +450,7 @@ function inheritedSpawnSessionOptions(
       globalFlags.reasoningEffort,
       sameAgentAsParent ? parent?.effort : undefined,
     ),
-    subscription: withInheritedSubscription(globalFlags.subscription, parent?.subscription),
-    profile: withInheritedProfile(globalFlags.profile, parent?.profile),
+    profile: inheritedProfileSelection(globalFlags, parent),
   };
 }
 
@@ -457,6 +465,7 @@ function buildSessionStartOptions(params: {
 }): Parameters<SessionModule["createSession"]>[0] {
   return {
     agentCommand: params.agent.agentCommand,
+    agentName: params.agent.agentName,
     cwd: params.agent.cwd,
     name: params.flags.name,
     resumeSessionId: params.flags.resumeSession,
@@ -579,6 +588,7 @@ function resolveSessionListFilterCwd(
 
 async function printLocalSessionsList(
   agentCommand: string,
+  agentName: string,
   filterCwd: string | undefined,
   format: OutputFormat,
 ): Promise<void> {
@@ -586,7 +596,7 @@ async function printLocalSessionsList(
     loadSessionModule(),
     loadOutputRenderModule(),
   ]);
-  const sessions = await listSessionsForAgent(agentCommand);
+  const sessions = await listSessionsForAgent(agentCommand, agentName);
   const filtered = filterCwd ? sessions.filter((session) => session.cwd === filterCwd) : sessions;
   printSessionsByFormat(filtered, format);
 }
@@ -606,6 +616,7 @@ async function findScopedSessionOrThrow(
 ): Promise<SessionRecord> {
   const record = await findSession({
     agentCommand: agent.agentCommand,
+    agentName: agent.agentName,
     cwd: agent.cwd,
     name: sessionName,
     includeClosed: true,
@@ -645,6 +656,7 @@ async function findGenericReadableSessionOrThrow(
 ): Promise<SessionRecord> {
   const defaultScopedRecord = await findSession({
     agentCommand: agent.agentCommand,
+    agentName: agent.agentName,
     cwd: agent.cwd,
     name: sessionName,
     includeClosed: true,
@@ -726,6 +738,7 @@ async function findRoutedSessionOrThrow(
 
   const record = await findSessionByDirectoryWalk({
     agentCommand,
+    agentName,
     cwd,
     name: sessionName,
     boundary: walkBoundary,
@@ -805,14 +818,7 @@ export async function handlePrompt(
     verbose: globalFlags.verbose,
     waitForCompletion: flags.wait !== false,
     messageId: flags.messageId,
-    sessionOptions: {
-      model: globalFlags.model,
-      allowedTools: globalFlags.allowedTools,
-      maxTurns: globalFlags.maxTurns,
-      systemPrompt: globalFlags.systemPrompt,
-      subscription: globalFlags.subscription,
-      reasoningEffort: globalFlags.reasoningEffort,
-    },
+    sessionOptions: sessionOptionsFromGlobalFlags(globalFlags),
   });
 
   if ("queued" in result) {
@@ -882,6 +888,7 @@ export async function handleExec(
 
   const result = await runOnce({
     agentCommand: agent.agentCommand,
+    agentName: agent.agentName,
     cwd: agent.cwd,
     prompt,
     mcpServers: config.mcpServers,
@@ -896,15 +903,7 @@ export async function handleExec(
     timeoutMs: globalFlags.timeout,
     verbose: globalFlags.verbose,
     promptRetries: globalFlags.promptRetries,
-    sessionOptions: {
-      model: globalFlags.model,
-      allowedTools: globalFlags.allowedTools,
-      maxTurns: globalFlags.maxTurns,
-      systemPrompt: globalFlags.systemPrompt,
-      subscription: globalFlags.subscription,
-      profile: globalFlags.profile,
-      reasoningEffort: globalFlags.reasoningEffort,
-    },
+    sessionOptions: sessionOptionsFromGlobalFlags(globalFlags),
   });
 
   applyPermissionExitCode(result);
@@ -1011,6 +1010,7 @@ export async function handleCancel(
   const walkBoundary = gitRoot ?? agent.cwd;
   const record = await findSessionByDirectoryWalk({
     agentCommand: agent.agentCommand,
+    agentName: agent.agentName,
     cwd: agent.cwd,
     name: resolveSessionNameFromFlags(flags, command),
     boundary: walkBoundary,
@@ -1290,6 +1290,7 @@ async function tryListAgentSessions(
   try {
     return await listAgentSessions({
       agentCommand: agent.agentCommand,
+      agentName: agent.agentName,
       cwd: agent.cwd,
       cursor: flags.cursor,
       filterCwd: resolveSessionListFilterCwd(flags, agent.cwd),
@@ -1325,7 +1326,12 @@ export async function handleSessionsList(
     if (flags.cursor) {
       throw new InvalidArgumentError("--cursor cannot be combined with --local");
     }
-    await printLocalSessionsList(agent.agentCommand, filterCwd, globalFlags.format);
+    await printLocalSessionsList(
+      agent.agentCommand,
+      agent.agentName,
+      filterCwd,
+      globalFlags.format,
+    );
     return;
   }
 
@@ -1340,7 +1346,12 @@ export async function handleSessionsList(
         `Agent command "${agent.agentCommand}" does not advertise sessionCapabilities.list; cannot use agent-side session/list filters`,
       );
     }
-    await printLocalSessionsList(agent.agentCommand, undefined, globalFlags.format);
+    await printLocalSessionsList(
+      agent.agentCommand,
+      agent.agentName,
+      undefined,
+      globalFlags.format,
+    );
     return;
   }
 
@@ -1362,6 +1373,7 @@ export async function handleSessionsClose(
 
   const record = await findSession({
     agentCommand: agent.agentCommand,
+    agentName: agent.agentName,
     cwd: agent.cwd,
     name: sessionName,
   });
@@ -1399,6 +1411,7 @@ export async function handleSessionsNew(
 
   const replaced = await findSession({
     agentCommand: effectiveAgent.agentCommand,
+    agentName: effectiveAgent.agentName,
     cwd: effectiveAgent.cwd,
     name: flags.name,
   });
@@ -1456,6 +1469,7 @@ export async function handleSessionsCopy(
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
   const created = await createSession({
     agentCommand: source.agentCommand,
+    agentName: source.agentName ?? resolveAgentNameFromCommand(source.agentCommand, config.agents),
     cwd: resolveCopyDestinationCwd(command, globalFlags, source),
     name: flags.name ?? sourceDefaultForkName(source),
     metadata: copyMetadata(flags, source, forkAtMessageIndex),
@@ -1847,6 +1861,7 @@ export async function handleSessionsPrune(
 
   const result = await pruneSessions({
     agentCommand: agent.agentCommand,
+    agentName: agent.agentName,
     before: flags.before,
     olderThanMs,
     includeHistory: flags.includeHistory,

@@ -170,7 +170,7 @@ test("loader parses claude-home profiles (homePath, accountEmail) from a hybrid 
     const registry = loadProfileRegistry(ctx.lookupOptions);
     assert.deepEqual(
       registry.profiles.map((p) => p.id),
-      ["sub1", "home1", "home2"],
+      ["sub1", "home1", "home2", "sub2"],
     );
     const home1 = registry.profiles.find((p) => p.id === "home1");
     assert.equal(home1?.authMode, "claude-home");
@@ -178,7 +178,10 @@ test("loader parses claude-home profiles (homePath, accountEmail) from a hybrid 
     assert.equal(home1?.accountEmail, "one@example.com");
     assert.equal(home1?.credentialSource, null);
     const home2 = registry.profiles.find((p) => p.id === "home2");
-    assert.equal(home2?.homePath, "/home/node/.acpx/homes/sub2");
+    assert.equal(
+      home2?.authMode === "claude-home" ? home2.homePath : undefined,
+      "/home/node/.acpx/homes/sub2",
+    );
     assert.equal(home2?.accountEmail, undefined);
     // subscription profile untouched
     const sub1 = registry.profiles.find((p) => p.id === "sub1");
@@ -291,7 +294,7 @@ test("buildClaudeHomeSelectorMeta emits the bridge's published _meta key for cla
 // Slice 2 — applyProfileAuth: claude-home env injection + compatibility gate
 // ---------------------------------------------------------------------------
 
-test("applyProfileAuth (claude-home): injects the FULL home map, no CLAUDE_CONFIG_DIR/ACPX_SUBSCRIPTION", async () => {
+test("applyProfileAuth (claude-home): injects the FULL home map, no CLAUDE_CONFIG_DIR, selection id exported", async () => {
   await withProfilesHome(HYBRID_REGISTRY, async (ctx) => {
     const env: NodeJS.ProcessEnv = {
       CLAUDE_CONFIG_DIR: "/leaked/from/owner",
@@ -310,9 +313,10 @@ test("applyProfileAuth (claude-home): injects the FULL home map, no CLAUDE_CONFI
       home1: "/home/node/.acpx/homes/sub1",
       home2: "/home/node/.acpx/homes/sub2",
     });
-    // subscription machinery must not leak onto a bridge spawn
+    // subscription configDir machinery must not leak onto a bridge spawn; the
+    // compatibility env name now carries the unified selection id.
     assert.equal("CLAUDE_CONFIG_DIR" in env, false);
-    assert.equal("ACPX_SUBSCRIPTION" in env, false);
+    assert.equal(env.ACPX_SUBSCRIPTION, "home1");
   });
 });
 
@@ -380,21 +384,21 @@ test("applyProfileAuth: vanished profile + bridge agent fails the spawn (no sile
         ctx.lookupOptions,
         DEFAULT_CLAUDE_PTY_COMMAND,
       ),
-      /profile "deleted-home" not found in registry.*refusing to spawn under the box-default HOME/s,
+      /profile "deleted-home" not found in registry.*refusing to spawn under a different account/s,
     );
-    // Non-bridge agents keep the legacy soft fallback (stderr note, null shim).
-    await withCapturedStderrWrites(async (writes) => {
-      const shim = await applyProfileAuth(
+    // Non-bridge agents also fail loud: recorded selection must never fall
+    // through to a different physical account.
+    await assert.rejects(
+      applyProfileAuth(
         {},
         "deleted-home",
         "session-1",
         null,
         ctx.lookupOptions,
         SDK_CLAUDE_COMMAND,
-      );
-      assert.equal(shim, null);
-      assert.match(writes.join(""), /profile "deleted-home" not found in registry/);
-    });
+      ),
+      /profile "deleted-home" not found in registry.*refusing to spawn under a different account/s,
+    );
   });
 });
 
@@ -569,6 +573,7 @@ test("claude-pty + claude-home profile: home map env + _meta selector on create 
           home2: "/home/node/.acpx/homes/sub2",
         });
         assert.equal("CLAUDE_CONFIG_DIR" in firstDump, false);
+        assert.equal(firstDump.ACPX_SUBSCRIPTION, "home1");
         assert.equal(newSessionEvidence()?.[INDEPENDENT_CLAUDE_HOME_META_KEY], "home1");
 
         // --- spawn 2: simulated owner respawn (process restart, record-driven re-resolution) ---
@@ -583,6 +588,7 @@ test("claude-pty + claude-home profile: home map env + _meta selector on create 
           home2: "/home/node/.acpx/homes/sub2",
         });
         assert.equal("CLAUDE_CONFIG_DIR" in secondDump, false);
+        assert.equal(secondDump.ACPX_SUBSCRIPTION, "home1");
         assert.equal(newSessionEvidence()?.[INDEPENDENT_CLAUDE_HOME_META_KEY], "home1");
       } finally {
         await client.close().catch(() => {});

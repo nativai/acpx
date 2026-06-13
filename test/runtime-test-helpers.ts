@@ -28,6 +28,7 @@ export function makeSessionRecord(
     acpxRecordId: overrides.acpxRecordId,
     acpSessionId: overrides.acpSessionId,
     agentSessionId: overrides.agentSessionId,
+    agentName: overrides.agentName,
     agentCommand: overrides.agentCommand,
     cwd: options.resolveCwd === false ? overrides.cwd : path.resolve(overrides.cwd),
     name: overrides.name ?? (defaultName ? overrides.acpxRecordId : undefined),

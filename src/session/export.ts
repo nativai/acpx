@@ -71,8 +71,10 @@ async function loadSessionRecord(
   const name = normalizeName(sessionLookup.name);
 
   if (sessionLookup.agentCommand) {
+    const agentCommand = sessionLookup.agentCommand;
     const active = await findSession({
-      agentCommand: sessionLookup.agentCommand,
+      agentCommand,
+      agentName: sessionLookup.agentName,
       cwd,
       name,
     });
@@ -81,7 +83,10 @@ async function loadSessionRecord(
     }
 
     return (await listSessions()).find((session) => {
-      if (session.agentCommand !== sessionLookup.agentCommand || session.cwd !== cwd) {
+      if (
+        !matchesAgentIdentity(session, agentCommand, sessionLookup.agentName) ||
+        session.cwd !== cwd
+      ) {
         return false;
       }
       if (name == null) {
@@ -106,6 +111,17 @@ async function loadSessionRecord(
   }
 
   return matches[0];
+}
+
+function matchesAgentIdentity(
+  session: Pick<SessionRecord, "agentCommand" | "agentName">,
+  agentCommand: string,
+  agentName: string | undefined,
+): boolean {
+  if (agentName && session.agentName) {
+    return session.agentName === agentName;
+  }
+  return session.agentCommand === agentCommand;
 }
 
 type EventLockPayload = {
@@ -268,7 +284,7 @@ export async function exportSession(
       record_id: record.acpxRecordId,
       name: record.name ?? null,
       agent: record.agentCommand,
-      agent_name: normalizeAgentName(sessionLookup.agentName),
+      agent_name: normalizeAgentName(record.agentName ?? sessionLookup.agentName),
       cwd_relative: cwdRelative,
       cwd_original: cwdRelative,
       created_at: record.createdAt,

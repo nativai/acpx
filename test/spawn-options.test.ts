@@ -911,30 +911,22 @@ test("buildAgentSpawnOptions (N3) unselected + default whose dir is MISSING → 
   );
 });
 
-test("buildAgentSpawnOptions (N4) explicit unknown + usable default → default dir; legacy not-found line + default note", async () => {
+test("buildAgentSpawnOptions (N4) explicit unknown + usable default → loud refusal", async () => {
   await withSubscriptionsHome(
     { registry: TWO_SUB_REGISTRY, existingDirs: ["sub1", "sub2"] },
     async (ctx) => {
       await withCapturedStderrWrites(async (writes) => {
-        const options = buildAgentSpawnOptions(
-          "/tmp/acpx-agent",
-          undefined,
-          { acpxRecordId: "rec", subscriptionId: "ghost" },
-          ctx.lookupOptions,
+        assert.throws(
+          () =>
+            buildAgentSpawnOptions(
+              "/tmp/acpx-agent",
+              undefined,
+              { acpxRecordId: "rec", subscriptionId: "ghost" },
+              ctx.lookupOptions,
+            ),
+          /subscription "ghost" not found in registry; refusing to spawn on a different account/,
         );
-        assert.equal(options.env.CLAUDE_CONFIG_DIR, ctx.configDir("sub2"));
-        assert.ok(
-          writes.includes(
-            `[acpx] subscription "ghost" not found in registry; using default Claude config (no CLAUDE_CONFIG_DIR override)\n`,
-          ),
-          "legacy not-found line must be emitted verbatim",
-        );
-        assert.ok(
-          writes.includes(
-            `[acpx] using registry default "sub2" instead (CLAUDE_CONFIG_DIR=${ctx.configDir("sub2")})\n`,
-          ),
-          "default-applied (via rejection) note must be emitted",
-        );
+        assert.deepEqual(writes, []);
       });
     },
   );
@@ -955,19 +947,20 @@ test("buildAgentSpawnOptions (G1) no registry + unselected → CLAUDE_CONFIG_DIR
   });
 });
 
-test("buildAgentSpawnOptions (G2) no registry + explicit unknown → exact legacy line + ABSENT", async () => {
+test("buildAgentSpawnOptions (G2) no registry + explicit unknown → loud refusal", async () => {
   await withSubscriptionsHome({ registry: undefined }, async (ctx) => {
     await withCapturedStderrWrites(async (writes) => {
-      const options = buildAgentSpawnOptions(
-        "/tmp/acpx-agent",
-        undefined,
-        { acpxRecordId: "rec", subscriptionId: "ghost" },
-        ctx.lookupOptions,
+      assert.throws(
+        () =>
+          buildAgentSpawnOptions(
+            "/tmp/acpx-agent",
+            undefined,
+            { acpxRecordId: "rec", subscriptionId: "ghost" },
+            ctx.lookupOptions,
+          ),
+        /subscription "ghost" not found in registry; refusing to spawn on a different account/,
       );
-      assert.equal(hasClaudeConfigDir(options.env), false);
-      assert.deepEqual(writes, [
-        `[acpx] subscription "ghost" not found in registry; using default Claude config (no CLAUDE_CONFIG_DIR override)\n`,
-      ]);
+      assert.deepEqual(writes, []);
     });
   });
 });
@@ -990,21 +983,26 @@ test("buildAgentSpawnOptions (G3) registry present but default ABSENT + unselect
   );
 });
 
-test("buildAgentSpawnOptions (G4) explicit id with MISSING dir, no default → exact legacy missing-dir line + ABSENT", async () => {
+test("buildAgentSpawnOptions (G4) explicit id with MISSING dir, no default → loud refusal", async () => {
   await withSubscriptionsHome(
     { registry: { subscriptions: [{ id: "sub1", label: "One" }] }, existingDirs: [] }, // sub1 dir not created, no default
     async (ctx) => {
       await withCapturedStderrWrites(async (writes) => {
-        const options = buildAgentSpawnOptions(
-          "/tmp/acpx-agent",
-          undefined,
-          { acpxRecordId: "rec", subscriptionId: "sub1" },
-          ctx.lookupOptions,
+        assert.throws(
+          () =>
+            buildAgentSpawnOptions(
+              "/tmp/acpx-agent",
+              undefined,
+              { acpxRecordId: "rec", subscriptionId: "sub1" },
+              ctx.lookupOptions,
+            ),
+          new RegExp(
+            `subscription "sub1" configDir not found at ${ctx.configDir(
+              "sub1",
+            )}; refusing to spawn on a different account`,
+          ),
         );
-        assert.equal(hasClaudeConfigDir(options.env), false);
-        assert.deepEqual(writes, [
-          `[acpx] subscription "sub1" configDir not found at ${ctx.configDir("sub1")}; using default Claude config (no CLAUDE_CONFIG_DIR override)\n`,
-        ]);
+        assert.deepEqual(writes, []);
       });
     },
   );
@@ -1061,7 +1059,7 @@ test("buildAgentSpawnOptions (S3) no registry → ACPX_SUBSCRIPTION ABSENT (back
 
 // --- Pre-spawn known-dead avoidance (§4.1.4) ---
 
-test("buildAgentSpawnOptions (K1) resolved sub known-dead → substitutes a healthy sub", async () => {
+test("buildAgentSpawnOptions (K1) explicit resolved sub known-dead → no hidden substitution", async () => {
   resetKnownDeadSubs();
   await withSubscriptionsHome(
     { registry: TWO_SUB_REGISTRY, existingDirs: ["sub1", "sub2"] },
@@ -1075,9 +1073,8 @@ test("buildAgentSpawnOptions (K1) resolved sub known-dead → substitutes a heal
             { acpxRecordId: "rec", subscriptionId: "sub1" }, // explicitly pinned to the dead sub
             ctx.lookupOptions,
           );
-          // Substituted to the healthy sub2.
-          assert.equal(options.env.CLAUDE_CONFIG_DIR, ctx.configDir("sub2"));
-          assert.equal(options.env.ACPX_SUBSCRIPTION, "sub2");
+          assert.equal(options.env.CLAUDE_CONFIG_DIR, ctx.configDir("sub1"));
+          assert.equal(options.env.ACPX_SUBSCRIPTION, "sub1");
         });
       } finally {
         resetKnownDeadSubs();

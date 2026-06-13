@@ -37,8 +37,13 @@ test("loadSubscriptionRegistry parses entries and default, applying configDir de
     const registry = loadSubscriptionRegistry({ homeDir, registryPath });
     assert.equal(registry.default, "sub2");
     assert.deepEqual(registry.subscriptions, [
-      { id: "sub1", label: "One", configDir: "/custom/sub1" },
-      { id: "sub2", label: "Two", configDir: path.join(homeDir, ".acpx", "subscriptions", "sub2") },
+      { id: "sub1", label: "One", configDir: "/custom/sub1", account: "sub1" },
+      {
+        id: "sub2",
+        label: "Two",
+        configDir: path.join(homeDir, ".acpx", "subscriptions", "sub2"),
+        account: "sub2",
+      },
     ]);
   });
 });
@@ -104,9 +109,9 @@ const resolverDirExists = (dir: string): boolean => RESOLVER_EXISTING_DIRS.has(d
 function resolverRegistry(overrides: Partial<SubscriptionRegistry> = {}): SubscriptionRegistry {
   return {
     subscriptions: [
-      { id: "sub1", label: "One", configDir: "/cfg/sub1" },
-      { id: "sub2", label: "Two", configDir: "/cfg/sub2" },
-      { id: "subGone", label: "Gone", configDir: "/cfg/gone" }, // configDir never "exists"
+      { id: "sub1", label: "One", configDir: "/cfg/sub1", account: "sub1" },
+      { id: "sub2", label: "Two", configDir: "/cfg/sub2", account: "sub2" },
+      { id: "subGone", label: "Gone", configDir: "/cfg/gone", account: "subGone" }, // configDir never "exists"
     ],
     ...overrides,
   };
@@ -204,8 +209,8 @@ test("chooseSubscriptionConfigDir: default dirExists arg falls back to real fs c
     const registry: SubscriptionRegistry = {
       default: "d",
       subscriptions: [
-        { id: "d", label: "Present", configDir: present },
-        { id: "x", label: "Absent", configDir: path.join(dir, "absent") },
+        { id: "d", label: "Present", configDir: present, account: "d" },
+        { id: "x", label: "Absent", configDir: path.join(dir, "absent"), account: "x" },
       ],
     };
     // dirExists omitted → uses subscriptionConfigDirExists (existsSync) against real temp dirs.

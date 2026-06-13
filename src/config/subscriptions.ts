@@ -16,6 +16,10 @@ export type SubscriptionEntry = {
   label: string;
   /** Absolute CLAUDE_CONFIG_DIR for this subscription. */
   configDir: string;
+  /** Functional account seam id; defaults to id for legacy registries. */
+  account: string;
+  /** Display/grouping metadata only. */
+  accountEmail?: string;
 };
 
 export type SubscriptionRegistry = {
@@ -185,28 +189,7 @@ export function chooseSubscriptionConfigDir(
   return result;
 }
 
-function normalizeRegistry(value: unknown, homeDir: string): SubscriptionRegistry {
-  if (!isRecord(value) || !Array.isArray(value.subscriptions)) {
-    return EMPTY_REGISTRY;
-  }
-
-  const subscriptions: SubscriptionEntry[] = [];
-  const seen = new Set<string>();
-  for (const entry of value.subscriptions) {
-    const normalized = normalizeEntry(entry, homeDir);
-    if (normalized && !seen.has(normalized.id)) {
-      seen.add(normalized.id);
-      subscriptions.push(normalized);
-    }
-  }
-
-  const registry: SubscriptionRegistry = { subscriptions };
-  const defaultId = nonEmptyString(value.default);
-  if (defaultId !== undefined) {
-    registry.default = defaultId;
-  }
-  return registry;
-}
+type SubscriptionNormalizer = (entry: unknown, homeDir: string) => SubscriptionEntry | undefined;
 
 function normalizeEntry(value: unknown, homeDir: string): SubscriptionEntry | undefined {
   if (!isRecord(value)) {
@@ -218,7 +201,105 @@ function normalizeEntry(value: unknown, homeDir: string): SubscriptionEntry | un
   }
   const label = nonEmptyString(value.label) ?? id;
   const configDir = nonEmptyString(value.configDir) ?? path.join(subscriptionsDir(homeDir), id);
-  return { id, label, configDir };
+  const account = nonEmptyString(value.account) ?? id;
+  const accountEmail = nonEmptyString(value.accountEmail);
+  return {
+    id,
+    label,
+    configDir,
+    account,
+    ...(accountEmail !== undefined ? { accountEmail } : {}),
+  };
+}
+
+function addUniqueSubscription(
+  normalized: SubscriptionEntry | undefined,
+  subscriptions: SubscriptionEntry[],
+  seen: Set<string>,
+): void {
+  if (!normalized || seen.has(normalized.id)) {
+    return;
+  }
+  seen.add(normalized.id);
+  subscriptions.push(normalized);
+}
+
+function collectSubscriptions(
+  items: unknown,
+  homeDir: string,
+  normalizer: SubscriptionNormalizer,
+  subscriptions: SubscriptionEntry[],
+  seen: Set<string>,
+): void {
+  if (!Array.isArray(items)) {
+    return;
+  }
+  for (const entry of items) {
+    addUniqueSubscription(normalizer(entry, homeDir), subscriptions, seen);
+  }
+}
+
+function isSubscriptionProfileRecord(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return value.authMode === undefined || value.authMode === "subscription";
+}
+
+function normalizeSubscriptionProfileEntry(
+  value: unknown,
+  homeDir: string,
+): SubscriptionEntry | undefined {
+  if (!isSubscriptionProfileRecord(value)) {
+    return undefined;
+  }
+  const id = nonEmptyString(value.id);
+  if (id === undefined) {
+    return undefined;
+  }
+  const label = nonEmptyString(value.label) ?? id;
+  const configDir =
+    nonEmptyString(value.credentialSource) ??
+    nonEmptyString(value.configDir) ??
+    path.join(subscriptionsDir(homeDir), id);
+  const account = nonEmptyString(value.account) ?? id;
+  const accountEmail = nonEmptyString(value.accountEmail);
+  return {
+    id,
+    label,
+    configDir,
+    account,
+    ...(accountEmail !== undefined ? { accountEmail } : {}),
+  };
+}
+
+function normalizeRegistry(value: unknown, homeDir: string): SubscriptionRegistry {
+  if (!isRecord(value)) {
+    return EMPTY_REGISTRY;
+  }
+  if (!Array.isArray(value.profiles) && !Array.isArray(value.subscriptions)) {
+    return EMPTY_REGISTRY;
+  }
+
+  const subscriptions: SubscriptionEntry[] = [];
+  const seen = new Set<string>();
+
+  // v3 drops subscriptions[]; subscription auth lives as tagged profiles. Read
+  // these first so --subscription remains valid after migration.
+  collectSubscriptions(
+    value.profiles,
+    homeDir,
+    normalizeSubscriptionProfileEntry,
+    subscriptions,
+    seen,
+  );
+  collectSubscriptions(value.subscriptions, homeDir, normalizeEntry, subscriptions, seen);
+
+  const defaultId = nonEmptyString(value.default);
+  return {
+    subscriptions,
+    ...(defaultId !== undefined ? { default: defaultId } : {}),
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

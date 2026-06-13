@@ -76,6 +76,7 @@ export async function handleStatus(
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const record = await findSession({
     agentCommand: agent.agentCommand,
+    agentName: agent.agentName,
     cwd: agent.cwd,
     name: resolveSessionNameFromFlags(flags, command),
   });
