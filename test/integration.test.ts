@@ -1258,7 +1258,7 @@ test("integration: set model routes through session/set_model and succeeds", asy
           "json",
           "set",
           "model",
-          "gpt-5.4",
+          "smart-model",
         ],
         homeDir,
       );
@@ -1268,7 +1268,7 @@ test("integration: set model routes through session/set_model and succeeds", asy
         modelId?: string;
       };
       assert.equal(payload.action, "model_set");
-      assert.equal(payload.modelId, "gpt-5.4");
+      assert.equal(payload.modelId, "smart-model");
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
@@ -1298,7 +1298,7 @@ test("integration: set model rejects with clear error on ACP invalid params", as
           cwd,
           "set",
           "model",
-          "bad-model",
+          "fast-model",
         ],
         homeDir,
       );
@@ -1386,7 +1386,16 @@ test("integration: status shows updated model after set model", async () => {
 
       // Switch model
       const setResult = await runCli(
-        ["--agent", modelAgentCommand, "--approve-all", "--cwd", cwd, "set", "model", "gpt-5.4"],
+        [
+          "--agent",
+          modelAgentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "set",
+          "model",
+          "smart-model",
+        ],
         homeDir,
       );
       assert.equal(setResult.code, 0, setResult.stderr);
@@ -1399,7 +1408,7 @@ test("integration: status shows updated model after set model", async () => {
       assert.equal(status.code, 0, status.stderr);
 
       const statusPayload = JSON.parse(status.stdout.trim()) as { model?: string };
-      assert.equal(statusPayload.model, "gpt-5.4");
+      assert.equal(statusPayload.model, "smart-model");
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }

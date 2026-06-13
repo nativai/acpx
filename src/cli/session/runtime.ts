@@ -11,7 +11,11 @@ import { InterruptedError, withInterrupt, withTimeout } from "../../async-contro
 import { tailClaudeSubagentJsonl } from "../../claude-jsonl.js";
 import { isClaudeHomeProfileId } from "../../config/profiles.js";
 import { transcriptCwdHash } from "../../config/subscription-transcript.js";
-import { AllSubscriptionsExhaustedError, SessionClosedError } from "../../errors.js";
+import {
+  AllSubscriptionsExhaustedError,
+  PermissionPromptUnavailableError,
+  SessionClosedError,
+} from "../../errors.js";
 import {
   attemptFailoverAndRetry,
   classifyFailover,
@@ -52,6 +56,11 @@ import { LiveSessionCheckpoint } from "../../session/live-checkpoint.js";
 import { copyLoggedMessageCount } from "../../session/messages-log-bookkeeping.js";
 import { setCurrentModelId, setDesiredModelId } from "../../session/mode-preference.js";
 import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
+import {
+  ownerOptionsToInput,
+  persistSessionOwnerOptions,
+  resolveSessionOwnerOptions,
+} from "../../session/owner-options.js";
 import { persistTerminalTurnError } from "../../session/persist-terminal-error.js";
 import {
   absolutePath,
@@ -1417,7 +1426,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     applyConversation(record, conversation);
     record.acpx = acpxState;
     const propagated = error instanceof Error ? error : new Error(formatErrorMessage(error));
-    (propagated as { outputAlreadyEmitted?: boolean }).outputAlreadyEmitted = sawAcpMessage;
+    (propagated as { outputAlreadyEmitted?: boolean }).outputAlreadyEmitted =
+      sawAcpMessage && !(error instanceof PermissionPromptUnavailableError);
     (propagated as { normalizedOutputError?: unknown }).normalizedOutputError = normalizedError;
     throw propagated;
   };
@@ -1688,18 +1698,25 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
 }
 
 export async function sendSessionDirect(options: SessionSendOptions): Promise<SessionSendResult> {
+  const record = await resolveSessionRecord(options.sessionId);
+  const ownerOptions = resolveSessionOwnerOptions(record, options, {
+    permissionModeExplicit: options.permissionModeExplicit,
+  });
+  persistSessionOwnerOptions(record, ownerOptionsToInput(ownerOptions));
+  await writeSessionRecordAtBoundary(record);
+
   return await runSessionPrompt({
     sessionRecordId: options.sessionId,
     prompt: options.prompt,
     messageId: options.messageId,
     mcpServers: options.mcpServers,
-    permissionMode: options.permissionMode,
+    permissionMode: ownerOptions.permission_mode,
     resumePolicy: options.resumePolicy,
-    nonInteractivePermissions: options.nonInteractivePermissions,
+    nonInteractivePermissions: ownerOptions.non_interactive_permissions,
     permissionPolicy: options.permissionPolicy,
     authCredentials: options.authCredentials,
-    authPolicy: options.authPolicy,
-    terminal: options.terminal,
+    authPolicy: ownerOptions.auth_policy,
+    terminal: ownerOptions.terminal,
     outputFormatter: options.outputFormatter,
     onAcpMessage: options.onAcpMessage,
     onSessionUpdate: options.onSessionUpdate,
@@ -1708,6 +1725,8 @@ export async function sendSessionDirect(options: SessionSendOptions): Promise<Se
     timeoutMs: options.timeoutMs,
     suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
     verbose: options.verbose,
+    promptRetries: options.promptRetries,
+    sessionOptions: options.sessionOptions,
     client: options.client,
   });
 }

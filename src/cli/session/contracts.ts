@@ -88,6 +88,7 @@ export type SessionSendOptions = {
   resumePolicy?: SessionResumePolicy;
   mcpServers?: McpServer[];
   permissionMode: PermissionMode;
+  permissionModeExplicit?: boolean;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
   permissionPolicy?: PermissionPolicy;
   authCredentials?: Record<string, string>;

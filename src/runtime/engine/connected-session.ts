@@ -2,6 +2,11 @@ import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { AcpClient } from "../../acp/client.js";
 import { withInterrupt } from "../../async-control.js";
 import { resolveAndEnsureAgentFolder } from "../../cli/session/agent-folder.js";
+import {
+  persistSessionOwnerOptions,
+  resolveSessionOwnerOptions,
+  ownerOptionsToInput,
+} from "../../session/owner-options.js";
 import { absolutePath, isoNow } from "../../session/persistence.js";
 import type {
   AcpPermissionDecision,
@@ -91,17 +96,24 @@ export async function withConnectedSession<T>(
   options: WithConnectedSessionOptions<T>,
 ): Promise<WithConnectedSessionResult<T>> {
   const record = await options.loadRecord(options.sessionRecordId);
+  const ownerOptions = resolveSessionOwnerOptions(record, {
+    permissionMode: options.permissionMode ?? "approve-reads",
+    nonInteractivePermissions: options.nonInteractivePermissions,
+    authPolicy: options.authPolicy,
+    terminal: options.terminal,
+  });
+  persistSessionOwnerOptions(record, ownerOptionsToInput(ownerOptions));
   const client =
     options.createClient?.({
       agentCommand: record.agentCommand,
       cwd: absolutePath(record.cwd),
       mcpServers: options.mcpServers,
-      permissionMode: options.permissionMode ?? "approve-reads",
-      nonInteractivePermissions: options.nonInteractivePermissions,
+      permissionMode: ownerOptions.permission_mode,
+      nonInteractivePermissions: ownerOptions.non_interactive_permissions,
       onPermissionRequest: options.onPermissionRequest,
       authCredentials: options.authCredentials,
-      authPolicy: options.authPolicy,
-      terminal: options.terminal,
+      authPolicy: ownerOptions.auth_policy,
+      terminal: ownerOptions.terminal,
       verbose: options.verbose,
       sessionContext: {
         acpxRecordId: record.acpxRecordId,
@@ -117,12 +129,12 @@ export async function withConnectedSession<T>(
       agentCommand: record.agentCommand,
       cwd: absolutePath(record.cwd),
       mcpServers: options.mcpServers,
-      permissionMode: options.permissionMode ?? "approve-reads",
-      nonInteractivePermissions: options.nonInteractivePermissions,
+      permissionMode: ownerOptions.permission_mode,
+      nonInteractivePermissions: ownerOptions.non_interactive_permissions,
       onPermissionRequest: options.onPermissionRequest,
       authCredentials: options.authCredentials,
-      authPolicy: options.authPolicy,
-      terminal: options.terminal,
+      authPolicy: ownerOptions.auth_policy,
+      terminal: ownerOptions.terminal,
       verbose: options.verbose,
       sessionContext: {
         acpxRecordId: record.acpxRecordId,

@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import type { SessionModelState, SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
+import { transcriptJsonlPath } from "../src/config/subscription-transcript.js";
 import {
   connectAndLoadSession,
   type ConnectedSessionController,
@@ -255,6 +256,316 @@ test("connectAndLoadSession falls back to createSession when load returns resour
   });
 });
 
+test("connectAndLoadSession ports a stranded transcript before retrying resource-not-found", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const subscriptionDir = path.join(homeDir, ".acpx", "subscriptions", "paid");
+    await writeSubscriptionRegistry(homeDir, {
+      default: "paid",
+      subscriptions: [{ id: "paid", label: "Paid", configDir: subscriptionDir }],
+    });
+
+    const oldSessionId = "old-session";
+    const rawTranscriptPath = transcriptJsonlPath(path.join(homeDir, ".claude"), cwd, oldSessionId);
+    await fs.mkdir(path.dirname(rawTranscriptPath), { recursive: true });
+    await fs.writeFile(rawTranscriptPath, '{"type":"message"}\n', "utf8");
+
+    const record = makeSessionRecord({
+      acpxRecordId: "transcript-port-record",
+      acpSessionId: oldSessionId,
+      agentCommand: "agent",
+      cwd,
+      messages: [
+        {
+          Agent: {
+            content: [{ Text: "prior response" }],
+            tool_results: {},
+          },
+        },
+      ],
+      acpx: {
+        session_options: {
+          subscription: "paid",
+        },
+      },
+    });
+
+    let loadCalls = 0;
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({
+        running: true,
+      }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
+      loadSessionWithOptions: async () => {
+        loadCalls += 1;
+        if (loadCalls === 1) {
+          throw {
+            error: {
+              code: -32002,
+              message: "session not found",
+            },
+          };
+        }
+        return { agentSessionId: "runtime-session" };
+      },
+      createSession: async () => {
+        throw new Error("createSession must not be called after transcript recovery");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+    };
+
+    const result = await connectAndLoadSession({
+      client: client as never,
+      record,
+      timeoutMs: 1_000,
+      activeController: ACTIVE_CONTROLLER,
+    });
+
+    const activeTranscriptPath = transcriptJsonlPath(subscriptionDir, cwd, oldSessionId);
+    assert.equal(loadCalls, 2);
+    assert.equal(await fs.readFile(activeTranscriptPath, "utf8"), '{"type":"message"}\n');
+    assert.equal(result.resumed, true);
+    assert.equal(result.sessionId, oldSessionId);
+    assert.equal(record.acpSessionId, oldSessionId);
+    assert.equal(record.agentSessionId, "runtime-session");
+  });
+});
+
+test("connectAndLoadSession fails loudly for history when resource-not-found has no transcript anywhere", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const subscriptionDir = path.join(homeDir, ".acpx", "subscriptions", "paid");
+    await writeSubscriptionRegistry(homeDir, {
+      default: "paid",
+      subscriptions: [{ id: "paid", label: "Paid", configDir: subscriptionDir }],
+    });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "missing-transcript-record",
+      acpSessionId: "missing-session",
+      agentCommand: "agent",
+      cwd,
+      messages: [
+        {
+          Agent: {
+            content: [{ Text: "prior response" }],
+            tool_results: {},
+          },
+        },
+      ],
+      acpx: {
+        session_options: {
+          subscription: "paid",
+        },
+      },
+    });
+
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({
+        running: true,
+      }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
+      loadSessionWithOptions: async () => {
+        throw {
+          error: {
+            code: -32002,
+            message: "session not found",
+          },
+        };
+      },
+      createSession: async () => {
+        throw new Error("createSession must not be called for history without transcript");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+    };
+
+    await assert.rejects(
+      async () =>
+        await connectAndLoadSession({
+          client: client as never,
+          record,
+          timeoutMs: 1_000,
+          activeController: ACTIVE_CONTROLLER,
+        }),
+      (error: unknown) => {
+        assert(error instanceof Error);
+        assert.equal(error.name, "SessionResumeRequiredError");
+        assert.match(error.message, /missing transcript at/);
+        assert.match(error.message, /missing-session\.jsonl/);
+        assert.match(error.message, /\.claude\/projects/);
+        return true;
+      },
+    );
+    assert.equal(record.acpSessionId, "missing-session");
+  });
+});
+
+test("connectAndLoadSession completes a pending subscription switch by porting the transcript before load", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const subADir = path.join(homeDir, ".acpx", "subscriptions", "sub-a");
+    const subBDir = path.join(homeDir, ".acpx", "subscriptions", "sub-b");
+    await writeSubscriptionRegistry(homeDir, {
+      subscriptions: [
+        { id: "sub-a", label: "Sub A", configDir: subADir },
+        { id: "sub-b", label: "Sub B", configDir: subBDir },
+      ],
+    });
+
+    const sessionId = "switch-session";
+    const sourceTranscriptPath = transcriptJsonlPath(subADir, cwd, sessionId);
+    await fs.mkdir(path.dirname(sourceTranscriptPath), { recursive: true });
+    await fs.writeFile(sourceTranscriptPath, '{"switch":"source"}\n', "utf8");
+
+    const record = makeSessionRecord({
+      acpxRecordId: "pending-switch-record",
+      acpSessionId: sessionId,
+      agentCommand: "agent",
+      cwd,
+      messages: [
+        {
+          Agent: {
+            content: [{ Text: "prior response" }],
+            tool_results: {},
+          },
+        },
+      ],
+      acpx: {
+        session_options: {
+          subscription: "sub-b",
+          subscription_switch: {
+            from: "sub-a",
+            to: "sub-b",
+            reason: "manual",
+            at: "2026-01-01T00:00:00.000Z",
+          },
+        },
+      },
+    });
+
+    const targetTranscriptPath = transcriptJsonlPath(subBDir, cwd, sessionId);
+    let loadCalls = 0;
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({
+        running: true,
+      }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
+      loadSessionWithOptions: async () => {
+        loadCalls += 1;
+        assert.equal(await fs.readFile(targetTranscriptPath, "utf8"), '{"switch":"source"}\n');
+        return { agentSessionId: "runtime-session" };
+      },
+      createSession: async () => {
+        throw new Error("createSession must not be called for pending switch recovery");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+    };
+
+    const result = await connectAndLoadSession({
+      client: client as never,
+      record,
+      activeController: ACTIVE_CONTROLLER,
+    });
+
+    assert.equal(loadCalls, 1);
+    assert.equal(result.resumed, true);
+    assert.equal(record.acpSessionId, sessionId);
+  });
+});
+
+test("connectAndLoadSession fails a pending subscription switch loudly when no transcript can be ported", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const subADir = path.join(homeDir, ".acpx", "subscriptions", "sub-a");
+    const subBDir = path.join(homeDir, ".acpx", "subscriptions", "sub-b");
+    await writeSubscriptionRegistry(homeDir, {
+      subscriptions: [
+        { id: "sub-a", label: "Sub A", configDir: subADir },
+        { id: "sub-b", label: "Sub B", configDir: subBDir },
+      ],
+    });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "pending-switch-missing-record",
+      acpSessionId: "switch-missing-session",
+      agentCommand: "agent",
+      cwd,
+      messages: [
+        {
+          Agent: {
+            content: [{ Text: "prior response" }],
+            tool_results: {},
+          },
+        },
+      ],
+      acpx: {
+        session_options: {
+          subscription: "sub-b",
+          subscription_switch: {
+            from: "sub-a",
+            to: "sub-b",
+            reason: "manual",
+            at: "2026-01-01T00:00:00.000Z",
+          },
+        },
+      },
+    });
+
+    let loadCalled = false;
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({
+        running: true,
+      }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
+      loadSessionWithOptions: async () => {
+        loadCalled = true;
+        throw new Error("load should be preflight-blocked");
+      },
+      createSession: async () => {
+        throw new Error("createSession must not be called for pending switch wedge");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+    };
+
+    await assert.rejects(
+      async () =>
+        await connectAndLoadSession({
+          client: client as never,
+          record,
+          activeController: ACTIVE_CONTROLLER,
+        }),
+      (error: unknown) => {
+        assert(error instanceof Error);
+        assert.equal(error.name, "SessionResumeRequiredError");
+        assert.match(error.message, /pending subscription switch sub-a -> sub-b cannot resume/);
+        assert.match(error.message, /switch-missing-session\.jsonl/);
+        return true;
+      },
+    );
+    assert.equal(loadCalled, false);
+  });
+});
+
 test("connectAndLoadSession fails instead of creating a fresh session when resume policy requires the same session", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -456,7 +767,7 @@ test("connectAndLoadSession fails clearly when same-session resume is required b
   });
 });
 
-test("connectAndLoadSession falls back to session/new on -32602 Invalid params", async () => {
+test("connectAndLoadSession fails loudly on -32602 Invalid params after real turns", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
@@ -492,27 +803,28 @@ test("connectAndLoadSession falls back to session/new on -32602 Invalid params",
           },
         };
       },
-      createSession: async () => ({
-        sessionId: "fallback-from-32602",
-        agentSessionId: "fallback-runtime",
-      }),
+      createSession: async () => {
+        throw new Error("createSession must not be called for a session with real history");
+      },
       setSessionMode: async () => {},
       setSessionModel: async () => {},
     };
 
-    const result = await connectAndLoadSession({
-      client: client as never,
-      record,
-      activeController: ACTIVE_CONTROLLER,
-    });
+    await assert.rejects(
+      async () =>
+        await connectAndLoadSession({
+          client: client as never,
+          record,
+          activeController: ACTIVE_CONTROLLER,
+        }),
+      /Persistent ACP session invalid-params-session could not be resumed: .*Invalid params/i,
+    );
 
-    assert.equal(result.sessionId, "fallback-from-32602");
-    assert.equal(result.resumed, false);
-    assert.equal(record.acpSessionId, "fallback-from-32602");
+    assert.equal(record.acpSessionId, "invalid-params-session");
   });
 });
 
-test("connectAndLoadSession falls back to session/new on -32601 Method not found", async () => {
+test("connectAndLoadSession fails loudly on -32601 Method not found after real turns", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
@@ -548,23 +860,24 @@ test("connectAndLoadSession falls back to session/new on -32601 Method not found
           },
         };
       },
-      createSession: async () => ({
-        sessionId: "fallback-from-32601",
-        agentSessionId: "fallback-runtime",
-      }),
+      createSession: async () => {
+        throw new Error("createSession must not be called for a session with real history");
+      },
       setSessionMode: async () => {},
       setSessionModel: async () => {},
     };
 
-    const result = await connectAndLoadSession({
-      client: client as never,
-      record,
-      activeController: ACTIVE_CONTROLLER,
-    });
+    await assert.rejects(
+      async () =>
+        await connectAndLoadSession({
+          client: client as never,
+          record,
+          activeController: ACTIVE_CONTROLLER,
+        }),
+      /Persistent ACP session method-not-found-session could not be resumed: .*Method not found/i,
+    );
 
-    assert.equal(result.sessionId, "fallback-from-32601");
-    assert.equal(result.resumed, false);
-    assert.equal(record.acpSessionId, "fallback-from-32601");
+    assert.equal(record.acpSessionId, "method-not-found-session");
   });
 });
 
@@ -618,16 +931,9 @@ test("connectAndLoadSession rethrows load failures that should not create a new 
           record,
           activeController: ACTIVE_CONTROLLER,
         }),
-      (error: unknown) => {
-        assert.deepEqual(error, {
-          error: {
-            code: -32603,
-            message: "still broken",
-          },
-        });
-        return true;
-      },
+      /Persistent ACP session agent-history-session could not be resumed: .*still broken/i,
     );
+    assert.equal(record.acpSessionId, "agent-history-session");
   });
 });
 
@@ -738,11 +1044,9 @@ test("connectAndLoadSession keeps a transcript-gone rejection LOUD after real tu
           record,
           activeController: ACTIVE_CONTROLLER,
         }),
-      (error: unknown) => {
-        assert.deepEqual(error, TRANSCRIPT_GONE_LOAD_ERROR);
-        return true;
-      },
+      /Persistent ACP session wedge-session could not be resumed: .*transcript gone/i,
     );
+    assert.equal(record.acpSessionId, "wedge-session");
   });
 });
 
@@ -1075,7 +1379,7 @@ test("connectAndLoadSession restores the original session when desired config re
       cwd,
       acpx: {
         desired_config_options: {
-          reasoning_effort: "xhigh",
+          effort: "xhigh",
         },
       },
     });
@@ -1104,9 +1408,9 @@ test("connectAndLoadSession restores the original session when desired config re
       setSessionModel: async () => {},
       setSessionConfigOption: async (sessionId, configId, value) => {
         assert.equal(sessionId, "fresh-session");
-        assert.equal(configId, "reasoning_effort");
+        assert.equal(configId, "effort");
         assert.equal(value, "xhigh");
-        throw new Error("config restore rejected");
+        throw new Error("Unknown config option: effort");
       },
     };
 
@@ -1121,10 +1425,8 @@ test("connectAndLoadSession restores the original session when desired config re
         assert(error instanceof Error);
         assert.equal(error.name, "SessionConfigOptionReplayError");
         assert.equal((error as Error & { retryable?: boolean }).retryable, true);
-        assert.match(
-          error.message,
-          /Failed to replay saved session config option reasoning_effort/,
-        );
+        assert.match(error.message, /Failed to replay saved session config option effort/);
+        assert.match(error.message, /Unknown config option: effort/);
         return true;
       },
     );
@@ -1269,6 +1571,21 @@ function makeSessionRecord(
   overrides: Parameters<typeof makeSessionRecordFixture>[0],
 ): ReturnType<typeof makeSessionRecordFixture> {
   return makeSessionRecordFixture(overrides, { defaultName: false, defaultAcpx: false });
+}
+
+async function writeSubscriptionRegistry(
+  homeDir: string,
+  registry: {
+    default?: string;
+    subscriptions: Array<{ id: string; label: string; configDir: string }>;
+  },
+): Promise<void> {
+  const registryPath = path.join(homeDir, ".acpx", "subscriptions", "registry.json");
+  await fs.mkdir(path.dirname(registryPath), { recursive: true });
+  for (const entry of registry.subscriptions) {
+    await fs.mkdir(entry.configDir, { recursive: true });
+  }
+  await fs.writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`, "utf8");
 }
 
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {

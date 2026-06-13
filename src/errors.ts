@@ -149,6 +149,18 @@ export class SessionResumeRequiredError extends AcpxOperationalError {
   }
 }
 
+export class SessionOwnerRestoreError extends AcpxOperationalError {
+  constructor(message: string, options?: AcpxErrorOptions) {
+    super(message, {
+      outputCode: "RUNTIME",
+      detailCode: "SESSION_OWNER_RESTORE_FAILED",
+      origin: "runtime",
+      retryable: false,
+      ...options,
+    });
+  }
+}
+
 export class GeminiAcpStartupTimeoutError extends AcpxOperationalError {
   constructor(message: string, options?: AcpxErrorOptions) {
     super(message, {

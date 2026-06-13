@@ -1,6 +1,7 @@
 import type { AcpClient, SessionCreateResult } from "../acp/client.js";
 import { assertRequestedModelSupported } from "../acp/model-support.js";
 import { withTimeout } from "../async-control.js";
+import type { SessionRecord } from "../types.js";
 
 export async function applyRequestedModelIfAdvertised(params: {
   client: AcpClient;
@@ -33,4 +34,25 @@ export async function applyRequestedModelIfAdvertised(params: {
     params.timeoutMs,
   );
   return true;
+}
+
+export function assertRecordModelSupported(params: {
+  record: SessionRecord;
+  requestedModel: string;
+  context?: "apply" | "replay";
+}): void {
+  const availableModels = params.record.acpx?.available_models;
+  if (!availableModels || availableModels.length === 0) {
+    return;
+  }
+  const models = {
+    currentModelId: params.record.acpx?.current_model_id ?? "",
+    availableModels: availableModels.map((modelId) => ({ modelId, name: modelId })),
+  };
+  assertRequestedModelSupported({
+    requestedModel: params.requestedModel,
+    models,
+    agentCommand: params.record.agentCommand,
+    context: params.context ?? "apply",
+  });
 }

@@ -241,17 +241,17 @@ test("runSessionSetModelDirect updates current and desired model", async () => {
 
     const result = await runSessionSetModelDirect({
       sessionRecordId: record.acpxRecordId,
-      modelId: "gpt-5.4",
+      modelId: "smart-model",
       timeoutMs: 5_000,
     });
 
     assert.equal(result.resumed, true);
-    assert.equal(result.record.acpx?.current_model_id, "gpt-5.4");
-    assert.equal(result.record.acpx?.session_options?.model, "gpt-5.4");
+    assert.equal(result.record.acpx?.current_model_id, "smart-model");
+    assert.equal(result.record.acpx?.session_options?.model, "smart-model");
 
     const persisted = await resolveSessionRecord(record.acpxRecordId);
-    assert.equal(persisted.acpx?.current_model_id, "gpt-5.4");
-    assert.equal(persisted.acpx?.session_options?.model, "gpt-5.4");
+    assert.equal(persisted.acpx?.current_model_id, "smart-model");
+    assert.equal(persisted.acpx?.session_options?.model, "smart-model");
   });
 });
 

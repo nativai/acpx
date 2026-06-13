@@ -14,6 +14,11 @@ import {
 } from "../../runtime/engine/session-options.js";
 import { SessionEventWriter } from "../../session/events.js";
 import {
+  ownerOptionsToInput,
+  persistSessionOwnerOptions,
+  resolveSessionOwnerOptions,
+} from "../../session/owner-options.js";
+import {
   absolutePath,
   flushPendingSessionIndexUpdates,
   resolveSessionRecord,
@@ -639,16 +644,17 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
 
 export async function sendSession(options: SessionSendOptions): Promise<SessionSendOutcome> {
   const waitForCompletion = options.waitForCompletion !== false;
+  const effectiveOptions = await resolveAndPersistSendOwnerOptions(options);
 
-  const queuedToOwner = await submitToRunningOwner(options, waitForCompletion);
+  const queuedToOwner = await submitToRunningOwner(effectiveOptions, waitForCompletion);
   if (queuedToOwner) {
     return queuedToOwner;
   }
 
-  spawnQueueOwnerProcess(queueOwnerRuntimeOptionsFromSend(options));
+  spawnQueueOwnerProcess(queueOwnerRuntimeOptionsFromSend(effectiveOptions));
 
   for (let attempt = 0; attempt < QUEUE_OWNER_STARTUP_MAX_ATTEMPTS; attempt += 1) {
-    const queued = await submitToRunningOwner(options, waitForCompletion);
+    const queued = await submitToRunningOwner(effectiveOptions, waitForCompletion);
     if (queued) {
       return queued;
     }
@@ -656,6 +662,24 @@ export async function sendSession(options: SessionSendOptions): Promise<SessionS
   }
 
   throw new Error(`Session queue owner failed to start for session ${options.sessionId}`);
+}
+
+async function resolveAndPersistSendOwnerOptions(
+  options: SessionSendOptions,
+): Promise<SessionSendOptions> {
+  const record = await resolveSessionRecord(options.sessionId);
+  const ownerOptions = resolveSessionOwnerOptions(record, options, {
+    permissionModeExplicit: options.permissionModeExplicit,
+  });
+  persistSessionOwnerOptions(record, ownerOptionsToInput(ownerOptions));
+  await writeSessionRecordAtBoundary(record);
+  return {
+    ...options,
+    permissionMode: ownerOptions.permission_mode,
+    nonInteractivePermissions: ownerOptions.non_interactive_permissions,
+    authPolicy: ownerOptions.auth_policy,
+    terminal: ownerOptions.terminal,
+  };
 }
 
 export type { QueueOwnerRuntimeOptions };

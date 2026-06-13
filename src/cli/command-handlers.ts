@@ -41,6 +41,7 @@ import type {
 } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import {
+  hasExplicitPermissionModeFlag,
   parseHistoryLimit,
   resolveAgentInvocation,
   resolveGlobalFlags,
@@ -173,6 +174,23 @@ function applyPermissionExitCode(result: {
 
   if (stats.requested > 0 && stats.approved === 0 && deniedOrCancelled > 0) {
     process.exitCode = EXIT_CODES.PERMISSION_DENIED;
+  }
+}
+
+function maybeEmitQuietPermissionUnavailable(params: {
+  result: Parameters<typeof applyPermissionExitCode>[0];
+  outputPolicy: OutputPolicy;
+  nonInteractivePermissions?: string;
+}): void {
+  const stats = params.result.permissionStats;
+  if (
+    params.outputPolicy.format === "quiet" &&
+    params.nonInteractivePermissions === "fail" &&
+    stats.requested > 0 &&
+    stats.approved === 0 &&
+    stats.denied + stats.cancelled > 0
+  ) {
+    process.stderr.write("Permission prompt unavailable in non-interactive mode\n");
   }
 }
 
@@ -705,6 +723,7 @@ export async function handlePrompt(
     prompt,
     mcpServers: config.mcpServers,
     permissionMode,
+    permissionModeExplicit: hasExplicitPermissionModeFlag(globalFlags),
     nonInteractivePermissions: globalFlags.nonInteractivePermissions,
     permissionPolicy,
     authCredentials: config.auth,
@@ -737,6 +756,11 @@ export async function handlePrompt(
     return;
   }
 
+  maybeEmitQuietPermissionUnavailable({
+    result,
+    outputPolicy,
+    nonInteractivePermissions: globalFlags.nonInteractivePermissions,
+  });
   applyPermissionExitCode(result);
 
   if (globalFlags.verbose && result.loadError) {
