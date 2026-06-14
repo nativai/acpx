@@ -60,7 +60,7 @@ type WriteArtifactOptions = {
   emitTrace?: boolean;
 };
 
-export function flowRunsBaseDir(homeDir: string = os.homedir()): string {
+export function flowRunsBaseDir(homeDir: string = process.env.ACPX_STATE_HOME || os.homedir()): string {
   return path.join(homeDir, ".acpx", "flows", "runs");
 }
 

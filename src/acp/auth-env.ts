@@ -133,6 +133,11 @@ function buildAgentEnvironment(
   const env: NodeJS.ProcessEnv = { ...process.env };
   promotePrefixedAuthEnvironment(env);
   const baseUrl = resolveAcpxUiBaseUrl(env);
+  // FW-07: never inherit a stale ACPX_SESSION_URL/_PARENT from {...process.env} (e.g. a
+  // long-lived queue-owner that served a different session). Clear both, then set only from
+  // THIS spawn ids below so a bridge session can never carry another session identity.
+  delete env.ACPX_SESSION_URL;
+  delete env.ACPX_PARENT_SESSION_URL;
   if (sessionContext && typeof sessionContext.acpxRecordId === "string") {
     const trimmed = sessionContext.acpxRecordId.trim();
     if (trimmed.length > 0) {

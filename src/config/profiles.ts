@@ -246,7 +246,7 @@ function readRegistryJson(registryPath: string): Record<string, unknown> | null 
  * Never throws; returns an empty registry on any error.
  */
 export function loadProfileRegistry(options?: SubscriptionLookupOptions): ProfileRegistry {
-  const homeDir = options?.homeDir ?? os.homedir();
+  const homeDir = options?.homeDir ?? (process.env.ACPX_STATE_HOME || os.homedir());
   const registryPath =
     options?.registryPath ?? path.join(homeDir, ".acpx", "subscriptions", "registry.json");
   const parsed = readRegistryJson(registryPath);

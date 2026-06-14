@@ -10,22 +10,22 @@ export function queueKeyForSession(sessionId: string): string {
   return shortHash(sessionId, 24);
 }
 
-export function queueBaseDir(homeDir: string = os.homedir()): string {
+export function queueBaseDir(homeDir: string = process.env.ACPX_STATE_HOME || os.homedir()): string {
   return path.join(homeDir, ".acpx", "queues");
 }
 
-export function queueSocketBaseDir(homeDir: string = os.homedir()): string | undefined {
+export function queueSocketBaseDir(homeDir: string = process.env.ACPX_STATE_HOME || os.homedir()): string | undefined {
   if (process.platform === "win32") {
     return undefined;
   }
   return path.join("/tmp", `acpx-${shortHash(homeDir, 10)}`);
 }
 
-export function queueLockFilePath(sessionId: string, homeDir: string = os.homedir()): string {
+export function queueLockFilePath(sessionId: string, homeDir: string = process.env.ACPX_STATE_HOME || os.homedir()): string {
   return path.join(queueBaseDir(homeDir), `${queueKeyForSession(sessionId)}.lock`);
 }
 
-export function queueSocketPath(sessionId: string, homeDir: string = os.homedir()): string {
+export function queueSocketPath(sessionId: string, homeDir: string = process.env.ACPX_STATE_HOME || os.homedir()): string {
   const key = queueKeyForSession(sessionId);
   if (process.platform === "win32") {
     return `\\\\.\\pipe\\acpx-${key}`;

@@ -58,11 +58,11 @@ export type SubscriptionLookupOptions = {
   registryPath?: string;
 };
 
-export function subscriptionsDir(homeDir: string = os.homedir()): string {
+export function subscriptionsDir(homeDir: string = process.env.ACPX_STATE_HOME || os.homedir()): string {
   return path.join(homeDir, ".acpx", SUBSCRIPTIONS_DIRNAME);
 }
 
-export function subscriptionRegistryPath(homeDir: string = os.homedir()): string {
+export function subscriptionRegistryPath(homeDir: string = process.env.ACPX_STATE_HOME || os.homedir()): string {
   return path.join(subscriptionsDir(homeDir), REGISTRY_FILENAME);
 }
 
@@ -75,7 +75,7 @@ export function subscriptionRegistryPath(homeDir: string = os.homedir()): string
 export function loadSubscriptionRegistry(
   options?: SubscriptionLookupOptions,
 ): SubscriptionRegistry {
-  const homeDir = options?.homeDir ?? os.homedir();
+  const homeDir = options?.homeDir ?? (process.env.ACPX_STATE_HOME || os.homedir());
   const registryPath = options?.registryPath ?? subscriptionRegistryPath(homeDir);
 
   let raw: string;

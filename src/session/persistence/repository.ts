@@ -54,7 +54,7 @@ function sessionFilePath(acpxRecordId: string): string {
 }
 
 export function sessionBaseDir(): string {
-  return path.join(os.homedir(), ".acpx", "sessions");
+  return path.join(process.env.ACPX_STATE_HOME || os.homedir(), ".acpx", "sessions");
 }
 
 async function ensureSessionDir(): Promise<void> {

@@ -344,7 +344,7 @@ export async function importSession(
   }
   assertExpectedAgentCommand(parsed, sourceRecord, options);
 
-  const sessionsDir = path.join(os.homedir(), ".acpx", "sessions");
+  const sessionsDir = path.join(process.env.ACPX_STATE_HOME || os.homedir(), ".acpx", "sessions");
   await fs.mkdir(sessionsDir, { recursive: true });
 
   const cwd = resolveImportedCwd(parsed.session.cwd_relative, options.newCwd);
