@@ -4,7 +4,7 @@ import { once } from "node:events";
 import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import { serializeSessionRecordForDisk } from "../src/session/persistence.js";
+import { isTemplateRecord, serializeSessionRecordForDisk } from "../src/session/persistence.js";
 import {
   fileExists,
   makeSessionRecord as makeSessionRecordFixture,
@@ -708,6 +708,18 @@ test("normalizeQueueOwnerTtlMs applies default and edge-case normalization", asy
     assert.equal(session.normalizeQueueOwnerTtlMs(1.6), 2);
     assert.equal(session.normalizeQueueOwnerTtlMs(15_000), 15_000);
   });
+});
+
+test("isTemplateRecord is the single source of truth: true only when template.enabled === true", () => {
+  // The centralized predicate the CLI template verbs and acpx-ui must agree on.
+  assert.equal(
+    isTemplateRecord({ template: { enabled: true, created_at: "2026-06-01T00:00:00.000Z" } }),
+    true,
+  );
+  assert.equal(isTemplateRecord({ template: { enabled: false } }), false);
+  assert.equal(isTemplateRecord({ template: {} }), false);
+  assert.equal(isTemplateRecord({ template: undefined }), false);
+  assert.equal(isTemplateRecord({}), false);
 });
 
 async function loadSessionModule(): Promise<SessionModule> {
