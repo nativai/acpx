@@ -441,6 +441,16 @@ export async function listSessionsForAgent(
     .toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
 }
 
+/**
+ * A session is a reusable template when acpx-ui has flagged it via the top-level
+ * `template` block (an acpx-ui-owned marker the daemon parses + re-serializes
+ * untouched). Centralized so the CLI template verbs and acpx-ui agree on exactly
+ * one predicate; if the marker representation ever changes, change it only here.
+ */
+export function isTemplateRecord(record: Pick<SessionRecord, "template">): boolean {
+  return record.template?.enabled === true;
+}
+
 export async function listSubagentsForSession(
   parentAcpxRecordId: string,
 ): Promise<SessionRecord[]> {

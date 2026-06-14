@@ -8,6 +8,7 @@ export {
   findGitRepositoryRoot,
   findSession,
   findSessionByDirectoryWalk,
+  isTemplateRecord,
   isoNow,
   listSessions,
   listSessionsForAgent,

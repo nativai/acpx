@@ -30,6 +30,7 @@ import {
   findGitRepositoryRoot,
   findSession,
   findSessionByDirectoryWalk,
+  isTemplateRecord,
   listSessions,
   migrateSessionMessages,
   normalizeName,
@@ -1439,6 +1440,23 @@ export async function handleSessionsNew(
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
+  // `sessions new --from-template <id>` instantiates a working session from a
+  // saved template. It is a copy whose source must be a template; the copy
+  // inherits the template's agent type + context and is itself a normal open
+  // session (createSession never carries the template marker forward). Routes
+  // through the shared copy core so it reuses native deep-copy, the agent-type
+  // lock, and cwd/lineage handling rather than the fresh-session path.
+  if (flags.fromTemplate !== undefined) {
+    await runSessionCopy(
+      explicitAgentName,
+      { from: flags.fromTemplate, name: flags.name, metadata: flags.metadata },
+      command,
+      config,
+      true,
+    );
+    return;
+  }
+
   const globalFlags = resolveGlobalFlags(command, config);
   validateExplicitSubscriptionFlag(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
@@ -1503,12 +1521,28 @@ export async function handleSessionsCopy(
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
+  await runSessionCopy(explicitAgentName, flags, command, config, false);
+}
+
+// Shared core for `sessions copy`/`fork` and `sessions new --from-template`.
+// `requireTemplate` gates the source to acpx-ui-marked templates; everything else
+// (native deep-copy, agent-type lock, cwd/lineage handling, output) is identical.
+async function runSessionCopy(
+  explicitAgentName: string | undefined,
+  flags: SessionsCopyFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+  requireTemplate: boolean,
+): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const pathAgent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const source = await resolveSessionRecord(flags.from);
   assertCopyableSource(source);
+  if (requireTemplate) {
+    assertTemplateSource(source);
+  }
   const forkAtMessageIndex = resolveForkAtMessageIndex(source, flags.atIndex);
   assertCopyAgentLock({ explicitAgentName, globalFlags, pathAgent, source, config });
 
@@ -1537,6 +1571,34 @@ export async function handleSessionsCopy(
   const sourceType = agentTypeLabel(source.agentCommand, config);
   printCreatedSessionBanner(created, sourceType, globalFlags.format, globalFlags.jsonStrict);
   printCopiedSessionByFormat(created, source, globalFlags.format);
+}
+
+function assertTemplateSource(source: SessionRecord): void {
+  if (!isTemplateRecord(source)) {
+    throw new Error(
+      `Session ${source.acpxRecordId} is not a template; mark it as a template first ` +
+        `(acpx-ui: "Save as template", or PATCH /api/sessions/:id/template) before instantiating`,
+    );
+  }
+}
+
+// `acpx <agent> sessions templates` — list the agent's saved templates. Templates
+// are local, acpx-ui-owned records (closed sessions flagged template.enabled), so
+// this reads the local store and filters; the agent adapter is never consulted.
+export async function handleSessionsTemplates(
+  explicitAgentName: string | undefined,
+  _flags: SessionsListFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const [{ listSessionsForAgent }, { printSessionsByFormat }] = await Promise.all([
+    loadSessionModule(),
+    loadOutputRenderModule(),
+  ]);
+  const sessions = await listSessionsForAgent(agent.agentCommand, agent.agentName);
+  printSessionsByFormat(sessions.filter(isTemplateRecord), globalFlags.format);
 }
 
 export async function handleSessionsEnsure(

@@ -18,6 +18,7 @@ import {
   handleSessionsRecover,
   handleSessionsSetMetadata,
   handleSessionsShow,
+  handleSessionsTemplates,
   handleSetConfigOption,
   handleSetMode,
   parseHistoryLimit,
@@ -110,8 +111,15 @@ export function registerSessionsCommand(
     });
 
   sessionsCommand
+    .command("templates")
+    .description("List saved templates for this agent")
+    .action(async function (this: Command, flags: SessionsListFlags) {
+      await handleSessionsTemplates(explicitAgentName, flags, this, config);
+    });
+
+  sessionsCommand
     .command("new")
-    .description("Create a fresh session for current cwd")
+    .description("Create a new session for current cwd (optionally from a template)")
     .option("-s, --name <name>", "Session name", parseSessionName)
     .option("--resume-session <id>", "Resume existing ACP session id", (value: string) =>
       parseNonEmptyValue("Resume session id", value),
@@ -130,6 +138,13 @@ export function registerSessionsCommand(
       "--metadata <key=value>",
       "Set a metadata entry on the session (repeatable; e.g. --metadata task_folder=/abs/path)",
       parseMetadataEntry,
+    )
+    .option(
+      "--from-template <id>",
+      "Instantiate from a saved template (acpx record id, ACP session id, or unique suffix). " +
+        "Inherits the template's agent type + context; the new session is a normal open session. " +
+        "Combine with --cwd to place it elsewhere and -s to name it.",
+      (value: string) => parseNonEmptyValue("Template id", value),
     )
     .action(async function (this: Command, flags: SessionsNewFlags) {
       await handleSessionsNew(explicitAgentName, flags, this, config);
