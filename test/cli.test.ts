@@ -4350,11 +4350,10 @@ async function writeRecordWithTemplate(
   },
   template?: { enabled: boolean; created_at: string },
 ): Promise<void> {
-  const onDisk = serializeSessionRecordForDisk(makeSessionRecord(overrides)) as Record<
-    string,
-    unknown
-  >;
-  if (template) {onDisk["template"] = template;}
+  const onDisk = serializeSessionRecordForDisk(makeSessionRecord(overrides));
+  if (template) {
+    onDisk["template"] = template;
+  }
   const dir = path.join(homeDir, ".acpx", "sessions");
   await fs.mkdir(dir, { recursive: true });
   await fs.writeFile(
@@ -4420,7 +4419,9 @@ test("sessions templates lists only the agent's template records", async () => {
       template?: { enabled?: boolean };
     }>;
     assert.deepEqual(new Set(listed.map((s) => s.acpxRecordId)), new Set(["tmpl-a", "tmpl-b"]));
-    for (const s of listed) {assert.equal(s.template?.enabled, true);}
+    for (const s of listed) {
+      assert.equal(s.template?.enabled, true);
+    }
   });
 });
 

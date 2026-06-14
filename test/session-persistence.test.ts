@@ -746,7 +746,7 @@ test("FW-16: agent-exit checkpoint flush preserves an externally-marked template
         closedAt: MARK_TS,
         updated_at: MARK_TS,
       }),
-    ) as Record<string, unknown>;
+    );
     marked["template"] = { enabled: true, created_at: MARK_TS };
     await fs.mkdir(path.dirname(sessionFilePath(homeDir, id)), { recursive: true });
     await fs.writeFile(
