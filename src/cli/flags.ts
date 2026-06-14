@@ -78,6 +78,7 @@ export type SessionsNewFlags = {
   parentId?: string;
   parentSessionUrl?: string;
   metadata?: Record<string, string>;
+  fromTemplate?: string;
 };
 
 export type SessionsCopyFlags = {

@@ -4333,3 +4333,188 @@ async function fileExists(filePath: string): Promise<boolean> {
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+
+// ── FW-11: `sessions templates` (list) + `sessions new --from-template` ───────
+
+// Write an on-disk session record carrying an acpx-ui-owned `template` block.
+// makeSessionRecord (the fixture) intentionally omits the field, so inject it
+// onto the serialized record the way acpx-ui's PATCH /template does; the daemon
+// parser round-trips it back into record.template.
+async function writeRecordWithTemplate(
+  homeDir: string,
+  overrides: Partial<SessionRecord> & {
+    acpxRecordId: string;
+    acpSessionId: string;
+    agentCommand: string;
+    cwd: string;
+  },
+  template?: { enabled: boolean; created_at: string },
+): Promise<void> {
+  const onDisk = serializeSessionRecordForDisk(makeSessionRecord(overrides)) as Record<
+    string,
+    unknown
+  >;
+  if (template) {onDisk["template"] = template;}
+  const dir = path.join(homeDir, ".acpx", "sessions");
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(
+    path.join(dir, `${encodeURIComponent(overrides.acpxRecordId)}.json`),
+    `${JSON.stringify(onDisk, null, 2)}\n`,
+    "utf8",
+  );
+}
+
+async function writeCodexAgentConfig(homeDir: string, command: string): Promise<void> {
+  await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+  await fs.writeFile(
+    path.join(homeDir, ".acpx", "config.json"),
+    `${JSON.stringify({ agents: { codex: { command } } }, null, 2)}\n`,
+    "utf8",
+  );
+}
+
+test("sessions templates lists only the agent's template records", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_COMMAND);
+
+    await writeRecordWithTemplate(
+      homeDir,
+      {
+        acpxRecordId: "tmpl-a",
+        acpSessionId: "acp-a",
+        agentName: "codex",
+        agentCommand: MOCK_AGENT_COMMAND,
+        cwd,
+        name: "alpha",
+      },
+      { enabled: true, created_at: "2026-06-01T00:00:00.000Z" },
+    );
+    await writeRecordWithTemplate(
+      homeDir,
+      {
+        acpxRecordId: "tmpl-b",
+        acpSessionId: "acp-b",
+        agentName: "codex",
+        agentCommand: MOCK_AGENT_COMMAND,
+        cwd,
+        name: "beta",
+      },
+      { enabled: true, created_at: "2026-06-02T00:00:00.000Z" },
+    );
+    // A plain (non-template) record for the same agent — must be excluded.
+    await writeRecordWithTemplate(homeDir, {
+      acpxRecordId: "plain-c",
+      acpSessionId: "acp-c",
+      agentName: "codex",
+      agentCommand: MOCK_AGENT_COMMAND,
+      cwd,
+      name: "gamma",
+    });
+
+    const result = await runCli(["--format", "json", "codex", "sessions", "templates"], homeDir);
+    assert.equal(result.code, 0, result.stderr);
+    const listed = JSON.parse(result.stdout.trim()) as Array<{
+      acpxRecordId: string;
+      template?: { enabled?: boolean };
+    }>;
+    assert.deepEqual(new Set(listed.map((s) => s.acpxRecordId)), new Set(["tmpl-a", "tmpl-b"]));
+    for (const s of listed) {assert.equal(s.template?.enabled, true);}
+  });
+});
+
+test("sessions new --from-template rejects a non-template source", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_WITH_FORK_SESSION);
+    // Copyable, but NOT a template — assertTemplateSource must reject it.
+    await writeRecordWithTemplate(homeDir, {
+      acpxRecordId: "not-a-template",
+      acpSessionId: "acp-not-tmpl",
+      agentName: "codex",
+      agentCommand: MOCK_AGENT_WITH_FORK_SESSION,
+      cwd,
+      lastSeq: 1,
+      messages: [{ User: { id: "u1", content: [{ Text: "hi" }] } }],
+    });
+
+    const result = await runCli(
+      ["codex", "sessions", "new", "--from-template", "not-a-template"],
+      homeDir,
+    );
+    assert.notEqual(result.code, 0);
+    assert.match(`${result.stderr}${result.stdout}`, /not a template/i);
+  });
+});
+
+test("sessions new --from-template instantiates a normal open session from a template", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_WITH_FORK_SESSION);
+    const messages: SessionRecord["messages"] = [
+      { User: { id: "u1", content: [{ Text: "scaffold" }] } },
+      { Agent: { content: [{ Text: "ready" }], tool_results: {} } },
+    ];
+    // A realistic template: closed + template.enabled, as acpx-ui writes it.
+    await writeRecordWithTemplate(
+      homeDir,
+      {
+        acpxRecordId: "tmpl-src",
+        acpSessionId: "acp-tmpl-src",
+        agentName: "codex",
+        agentCommand: MOCK_AGENT_WITH_FORK_SESSION,
+        cwd,
+        name: "blueprint",
+        lastSeq: messages.length,
+        messages,
+        closed: true,
+      },
+      { enabled: true, created_at: "2026-06-01T05:00:00.000Z" },
+    );
+
+    const result = await runCli(
+      [
+        "--format",
+        "json",
+        "codex",
+        "sessions",
+        "new",
+        "--from-template",
+        "tmpl-src",
+        "--name",
+        "instance",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const payload = JSON.parse(result.stdout.trim()) as {
+      action?: unknown;
+      acpxRecordId?: unknown;
+      sourceSessionId?: unknown;
+    };
+    assert.equal(payload.action, "session_copied");
+    assert.equal(payload.sourceSessionId, "tmpl-src");
+
+    const stored = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, String(payload.acpxRecordId)), "utf8"),
+    ) as {
+      template?: unknown;
+      closed?: unknown;
+      agent_command?: unknown;
+      messages?: unknown[];
+      name?: unknown;
+    };
+    assert.equal(stored.template, undefined, "instantiated session must NOT itself be a template");
+    assert.notEqual(stored.closed, true, "instantiated session must be a normal OPEN session");
+    assert.equal(
+      stored.agent_command,
+      MOCK_AGENT_WITH_FORK_SESSION,
+      "inherits the template's agent type",
+    );
+    assert.deepEqual(stored.messages, messages, "inherits the template's context");
+    assert.equal(stored.name, "instance");
+  });
+});

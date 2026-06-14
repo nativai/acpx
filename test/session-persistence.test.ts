@@ -4,7 +4,11 @@ import { once } from "node:events";
 import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import { serializeSessionRecordForDisk } from "../src/session/persistence.js";
+import {
+  isTemplateRecord,
+  serializeSessionRecordForDisk,
+  writeSessionRecord as flushSessionRecord,
+} from "../src/session/persistence.js";
 import {
   fileExists,
   makeSessionRecord as makeSessionRecordFixture,
@@ -707,6 +711,116 @@ test("normalizeQueueOwnerTtlMs applies default and edge-case normalization", asy
     );
     assert.equal(session.normalizeQueueOwnerTtlMs(1.6), 2);
     assert.equal(session.normalizeQueueOwnerTtlMs(15_000), 15_000);
+  });
+});
+
+test("isTemplateRecord is the single source of truth: true only when template.enabled === true", () => {
+  // The centralized predicate the CLI template verbs and acpx-ui must agree on.
+  assert.equal(
+    isTemplateRecord({ template: { enabled: true, created_at: "2026-06-01T00:00:00.000Z" } }),
+    true,
+  );
+  assert.equal(isTemplateRecord({ template: { enabled: false } }), false);
+  assert.equal(isTemplateRecord({ template: {} }), false);
+  assert.equal(isTemplateRecord({ template: undefined }), false);
+  assert.equal(isTemplateRecord({}), false);
+});
+
+test("FW-16: agent-exit checkpoint flush preserves an externally-marked template and does not regress updated_at", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const id = "tmpl-live";
+    const MARK_TS = "2026-06-14T17:23:36.000Z";
+    const STALE_TS = "2026-06-14T17:19:23.000Z";
+
+    // On-disk record as acpx-ui leaves it after "Save as template": closed + a top-level
+    // `template` block + a post-mark updated_at. makeSessionRecord omits `template`, so
+    // inject it onto the serialized on-disk record the way the acpx-ui PATCH does.
+    const marked = serializeSessionRecordForDisk(
+      makeSessionRecord({
+        acpxRecordId: id,
+        acpSessionId: id,
+        agentCommand: "agent-a",
+        cwd,
+        closed: true,
+        closedAt: MARK_TS,
+        updated_at: MARK_TS,
+      }),
+    ) as Record<string, unknown>;
+    marked["template"] = { enabled: true, created_at: MARK_TS };
+    await fs.mkdir(path.dirname(sessionFilePath(homeDir, id)), { recursive: true });
+    await fs.writeFile(
+      sessionFilePath(homeDir, id),
+      `${JSON.stringify(marked, null, 2)}\n`,
+      "utf8",
+    );
+
+    // The live agent's STALE in-memory record (predates the mark: no template, older
+    // updated_at, still open). A graceful connection_close flushes it through the real
+    // preserve-lifecycle write path.
+    const stale = makeSessionRecord({
+      acpxRecordId: id,
+      acpSessionId: id,
+      agentCommand: "agent-a",
+      cwd,
+      updated_at: STALE_TS,
+    });
+    await flushSessionRecord(stale);
+
+    const onDisk = JSON.parse(await fs.readFile(sessionFilePath(homeDir, id), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    assert.deepEqual(
+      onDisk["template"],
+      { enabled: true, created_at: MARK_TS },
+      "the template marker must survive a stale agent-exit flush",
+    );
+    assert.equal(
+      onDisk["updated_at"],
+      MARK_TS,
+      "updated_at must not regress below the on-disk mark",
+    );
+    assert.equal(onDisk["closed"], true, "existing closed/lifecycle read-preserve still holds");
+  });
+});
+
+test("FW-16: a normal agent-exit flush still persists a non-template record (no regression)", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const id = "plain-live";
+    const OLD_TS = "2026-06-14T10:00:00.000Z";
+    const NEW_TS = "2026-06-14T11:00:00.000Z";
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: id,
+        acpSessionId: id,
+        agentCommand: "agent-a",
+        cwd,
+        updated_at: OLD_TS,
+      }),
+    );
+
+    // The normal case: the agent genuinely advanced the record (newer updated_at, more seq).
+    const fresher = makeSessionRecord({
+      acpxRecordId: id,
+      acpSessionId: id,
+      agentCommand: "agent-a",
+      cwd,
+      updated_at: NEW_TS,
+      lastSeq: 3,
+    });
+    await flushSessionRecord(fresher);
+
+    const onDisk = JSON.parse(await fs.readFile(sessionFilePath(homeDir, id), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    assert.equal("template" in onDisk, false, "no spurious template marker is introduced");
+    assert.equal(onDisk["updated_at"], NEW_TS, "a genuinely newer in-memory updated_at still wins");
+    assert.equal(onDisk["last_seq"], 3, "record content still persists on a normal flush");
   });
 });
 

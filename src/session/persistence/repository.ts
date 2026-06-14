@@ -126,6 +126,11 @@ export type PersistedSessionLifecycle = {
   favorite: boolean | undefined;
   favoritedAt: string | undefined;
   name: string | undefined;
+  /** acpx-ui-owned template marker — read-preserved like closed/favorite/name so a
+   * stale agent-exit checkpoint flush can't clobber an externally-set template (FW-16). */
+  template: SessionRecord["template"];
+  /** Last on-disk updated_at — lets the flush keep updated_at monotonic (no stale regress). */
+  updatedAt: string | undefined;
   /** Extra fields the live-checkpoint closed-state merge needs — carried so
    * one read can serve both the preserve step and that merge (W2.4). */
   pid: number | undefined;
@@ -154,6 +159,8 @@ export async function readPersistedLifecycle(
       favorite: parsed.favorite,
       favoritedAt: parsed.favoritedAt,
       name: parsed.name,
+      template: parsed.template,
+      updatedAt: parsed.updated_at,
       pid: parsed.pid,
       acpx: parsed.acpx,
     };
@@ -262,6 +269,22 @@ async function writeSessionRecordInternal(
         record.favorite = persistedLifecycle.favorite;
         record.favoritedAt = persistedLifecycle.favoritedAt;
         record.name = persistedLifecycle.name;
+        // `template` is an acpx-ui-owned marker the daemon/agent never authors, so the
+        // agent-exit checkpoint flush of a (possibly stale) in-memory record must adopt
+        // the on-disk value rather than overwrite it — same read-preserve contract as
+        // closed/favorite/name. Without this, marking a template while its agent is live
+        // then letting the agent gracefully disconnect (connection_close) clobbers the
+        // marker and the template silently vanishes from ?view=templates (FW-16).
+        record.template = persistedLifecycle.template;
+        // Keep updated_at monotonic: a stale in-memory flush must not roll it back below
+        // what is already on disk (e.g. the template-mark write). A genuinely newer
+        // in-memory value still wins.
+        if (
+          persistedLifecycle.updatedAt !== undefined &&
+          persistedLifecycle.updatedAt > record.updated_at
+        ) {
+          record.updated_at = persistedLifecycle.updatedAt;
+        }
       }
     }
 
@@ -439,6 +462,16 @@ export async function listSessionsForAgent(
   return records
     .filter((entry): entry is SessionRecord => Boolean(entry))
     .toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
+}
+
+/**
+ * A session is a reusable template when acpx-ui has flagged it via the top-level
+ * `template` block (an acpx-ui-owned marker the daemon parses + re-serializes
+ * untouched). Centralized so the CLI template verbs and acpx-ui agree on exactly
+ * one predicate; if the marker representation ever changes, change it only here.
+ */
+export function isTemplateRecord(record: Pick<SessionRecord, "template">): boolean {
+  return record.template?.enabled === true;
 }
 
 export async function listSubagentsForSession(
