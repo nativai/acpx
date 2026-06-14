@@ -46,6 +46,11 @@ export const AGENT_REGISTRY: Record<string, string> = {
   // position per the listBuiltInAgents ordering convention.
   "claude-pty":
     process.env.ACPX_CLAUDE_PTY_ACP_COMMAND || `node /opt/claude-pty-acp/acp-server-transcript.mjs`,
+  // moabualruz/claude-code-cli-acp — external Rust PTY bridge (spike). Plain
+  // $HOME/.claude auth (ignores our claude-home selector), so it is NOT wired
+  // into the claude-pty auth path — kept as a generic agent on purpose. Point
+  // ACPX_CLAUDE_CLI_ACP_COMMAND at the built binary's real path for the spike.
+  "claude-cli-acp": process.env.ACPX_CLAUDE_CLI_ACP_COMMAND || `claude-code-cli-acp acp`,
   droid: "droid exec --output-format acp",
   iflow: "iflow --experimental-acp",
   kilocode: "npx -y @kilocode/cli acp",
