@@ -78,7 +78,7 @@ const VALID_AUTH_POLICIES = new Set<AuthPolicy>(["skip", "fail"]);
 const VALID_OUTPUT_FORMATS = new Set<OutputFormat>(["text", "json", "quiet"]);
 
 function defaultGlobalConfigPath(): string {
-  return path.join(os.homedir(), ".acpx", "config.json");
+  return path.join(process.env.ACPX_STATE_HOME || os.homedir(), ".acpx", "config.json");
 }
 
 function projectConfigPath(cwd: string): string {

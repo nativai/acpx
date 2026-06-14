@@ -633,7 +633,7 @@ function writeV3Migration(
  * Never throws; returns an empty registry on any read/parse error.
  */
 export function loadProfileRegistry(options?: SubscriptionLookupOptions): ProfileRegistry {
-  const homeDir = options?.homeDir ?? os.homedir();
+  const homeDir = options?.homeDir ?? (process.env.ACPX_STATE_HOME || os.homedir());
   const registryPath = options?.registryPath ?? subscriptionRegistryPath(homeDir);
   const parsed = readRegistryJson(registryPath);
   if (!parsed) {
