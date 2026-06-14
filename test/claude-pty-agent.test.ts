@@ -9,8 +9,12 @@ import { isClaudePtyAcpCommand, isClaudePtyAgentCommand } from "../src/acp/agent
 import {
   applyProfileAuth,
   buildClaudeHomeSelectorMeta,
+  buildClaudeParentSessionMeta,
   INDEPENDENT_CLAUDE_HOME_MAP_ENV,
   INDEPENDENT_CLAUDE_HOME_META_KEY,
+  INDEPENDENT_CLAUDE_PARENT_SESSION_URL_META_KEY,
+  parseBoxBaseUrlFromResolvConf,
+  resolveAcpxUiBaseUrl,
 } from "../src/acp/auth-env.js";
 import { AcpClient, buildAgentSpawnOptions } from "../src/acp/client.js";
 import { AGENT_REGISTRY, resolveAgentCommand } from "../src/agent-registry.js";
@@ -288,6 +292,132 @@ test("buildClaudeHomeSelectorMeta emits the bridge's published _meta key for cla
     assert.equal(buildClaudeHomeSelectorMeta(null, ctx.lookupOptions), undefined);
     assert.equal(buildClaudeHomeSelectorMeta("", ctx.lookupOptions), undefined);
   });
+});
+
+// ---------------------------------------------------------------------------
+// FW-18 / FW-19 — bridge parent session URL in session/new `_meta`
+// ---------------------------------------------------------------------------
+
+test("buildClaudeParentSessionMeta (FW-18): derives parent URL from parentSessionId for the bridge (same-box)", () => {
+  const prev = process.env.ACPX_UI_BASE_URL;
+  process.env.ACPX_UI_BASE_URL = "https://acpx.devbox.nativai.de";
+  try {
+    assert.deepEqual(
+      buildClaudeParentSessionMeta(
+        { acpxRecordId: "child", parentSessionId: "parent-abc" },
+        DEFAULT_CLAUDE_PTY_COMMAND,
+      ),
+      {
+        [INDEPENDENT_CLAUDE_PARENT_SESSION_URL_META_KEY]:
+          "https://acpx.devbox.nativai.de/?session=parent-abc",
+      },
+    );
+    assert.equal(
+      INDEPENDENT_CLAUDE_PARENT_SESSION_URL_META_KEY,
+      "independent-claude-acp/parent-session-url",
+    );
+  } finally {
+    if (prev === undefined) {
+      delete process.env.ACPX_UI_BASE_URL;
+    } else {
+      process.env.ACPX_UI_BASE_URL = prev;
+    }
+  }
+});
+
+test("buildClaudeParentSessionMeta (FW-19): prefers an explicit full parentSessionUrl (cross-box real host)", () => {
+  const prev = process.env.ACPX_UI_BASE_URL;
+  // Local base url is devbox, but the parent lives on tubeyakker — the explicit
+  // url must win so the child can identify the parent on its OWN host.
+  process.env.ACPX_UI_BASE_URL = "https://acpx.devbox.nativai.de";
+  try {
+    assert.deepEqual(
+      buildClaudeParentSessionMeta(
+        {
+          acpxRecordId: "child",
+          parentSessionId: "parent-abc",
+          parentSessionUrl: "https://acpx.tubeyakker.nativai.de/?session=parent-abc",
+        },
+        DEFAULT_CLAUDE_PTY_COMMAND,
+      ),
+      {
+        [INDEPENDENT_CLAUDE_PARENT_SESSION_URL_META_KEY]:
+          "https://acpx.tubeyakker.nativai.de/?session=parent-abc",
+      },
+    );
+  } finally {
+    if (prev === undefined) {
+      delete process.env.ACPX_UI_BASE_URL;
+    } else {
+      process.env.ACPX_UI_BASE_URL = prev;
+    }
+  }
+});
+
+test("buildClaudeParentSessionMeta: undefined for the SDK claude adapter (it inherits parent via process env)", () => {
+  assert.equal(
+    buildClaudeParentSessionMeta(
+      { acpxRecordId: "child", parentSessionId: "parent-abc" },
+      SDK_CLAUDE_COMMAND,
+    ),
+    undefined,
+  );
+});
+
+test("buildClaudeParentSessionMeta: undefined when there is no parent, or no agent command", () => {
+  assert.equal(
+    buildClaudeParentSessionMeta({ acpxRecordId: "child" }, DEFAULT_CLAUDE_PTY_COMMAND),
+    undefined,
+  );
+  assert.equal(
+    buildClaudeParentSessionMeta(
+      { acpxRecordId: "child", parentSessionId: "   " },
+      DEFAULT_CLAUDE_PTY_COMMAND,
+    ),
+    undefined,
+  );
+  assert.equal(
+    buildClaudeParentSessionMeta({ acpxRecordId: "child", parentSessionId: "p" }, undefined),
+    undefined,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// FW-20 — auto-detect the box's acpx-ui base URL from the K8s namespace
+// ---------------------------------------------------------------------------
+
+test("parseBoxBaseUrlFromResolvConf (FW-20): derives the box host from the dev-<box> namespace search domain", () => {
+  assert.equal(
+    parseBoxBaseUrlFromResolvConf(
+      "search dev-tubeyakker.svc.cluster.local svc.cluster.local cluster.local\nnameserver 10.0.0.10\n",
+    ),
+    "https://acpx.tubeyakker.nativai.de",
+  );
+  assert.equal(
+    parseBoxBaseUrlFromResolvConf(
+      "search dev-devbox.svc.cluster.local svc.cluster.local\noptions ndots:5\n",
+    ),
+    "https://acpx.devbox.nativai.de",
+  );
+});
+
+test("parseBoxBaseUrlFromResolvConf (FW-20): undefined for non-cluster / unrecognized search domains", () => {
+  assert.equal(parseBoxBaseUrlFromResolvConf("nameserver 1.1.1.1\n"), undefined);
+  assert.equal(parseBoxBaseUrlFromResolvConf("search example.com lan\n"), undefined);
+  assert.equal(parseBoxBaseUrlFromResolvConf("search svc.cluster.local\n"), undefined);
+  assert.equal(parseBoxBaseUrlFromResolvConf(""), undefined);
+});
+
+test("resolveAcpxUiBaseUrl (FW-20): explicit ACPX_UI_BASE_URL wins over namespace detection and is trimmed", () => {
+  assert.equal(
+    resolveAcpxUiBaseUrl({ ACPX_UI_BASE_URL: "https://acpx.labidio.nativai.de/" }),
+    "https://acpx.labidio.nativai.de",
+  );
+  // Empty/whitespace env is ignored → falls through to namespace/default (a valid https acpx url).
+  assert.match(
+    resolveAcpxUiBaseUrl({ ACPX_UI_BASE_URL: "   " }),
+    /^https:\/\/acpx\.[a-z0-9-]+\.nativai\.de$/,
+  );
 });
 
 // ---------------------------------------------------------------------------

@@ -71,6 +71,8 @@ export type SessionCreateOptions = {
   forkFromSessionId?: string;
   forkAtMessageIndex?: number;
   parentSessionId?: string;
+  /** Full parent acpx-ui URL (host+id) for cross-machine lineage. (FW-19) */
+  parentSessionUrl?: string;
   metadata?: Record<string, string>;
   mcpServers?: McpServer[];
   permissionMode: PermissionMode;
@@ -120,6 +122,8 @@ export type SessionEnsureOptions = {
   name?: string;
   resumeSessionId?: string;
   parentSessionId?: string;
+  /** Full parent acpx-ui URL (host+id) for cross-machine lineage. (FW-19) */
+  parentSessionUrl?: string;
   metadata?: Record<string, string>;
   mcpServers?: McpServer[];
   permissionMode: PermissionMode;

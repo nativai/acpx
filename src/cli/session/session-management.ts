@@ -316,11 +316,18 @@ async function forkSessionRecordWithClient(
   }
 }
 
-/** Build the best-effort sessionContext for the first (creation) spawn. */
+// Build the best-effort sessionContext for the first (creation) spawn. The ?? null chains mirror
+// the sessionContext shape in queue-owner-runtime.ts / connected-session.ts (trivial field-mapping).
+// eslint-disable-next-line complexity -- ?? null field-mapping; cannot simplify without losing null safety
 function creationSessionContext(options: SessionCreateOptions) {
   return {
     acpxRecordId: "",
     parentSessionId: options.parentSessionId ?? null,
+    // FW-19: the full parent URL (real host) only needs to reach the bridge at
+    // session/new — the bridge persists it across reloads. Later (recover/keepwarm)
+    // spawns derive the URL from parentSessionId against the local base URL
+    // (correct same-box; the bridge has the cross-box URL persisted already).
+    parentSessionUrl: options.parentSessionUrl ?? null,
     taskFolder: options.metadata?.task_folder ?? null,
     agentFolder: null,
     subscriptionId: options.sessionOptions?.subscription ?? null,
@@ -480,6 +487,7 @@ export async function ensureSession(options: SessionEnsureOptions): Promise<Sess
     name: options.name,
     resumeSessionId: options.resumeSessionId,
     parentSessionId: options.parentSessionId,
+    parentSessionUrl: options.parentSessionUrl,
     metadata: options.metadata,
     mcpServers: options.mcpServers,
     permissionMode: options.permissionMode,

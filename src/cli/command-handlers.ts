@@ -373,26 +373,42 @@ async function resolvePermissionPolicyFromFlags(
   }
 }
 
-function resolveParentSessionIdFromFlagOrEnv(flags: SessionsNewFlags): string | undefined {
+// The parent identity resolved from flags/env: its bare id (for parent_session_id
+// linkage + local record lookup) and, when known, its FULL url (host+id). The url
+// is preserved verbatim so a cross-box parent keeps its real host (FW-19); a bare
+// --parent-id has no url (same-box, derived from the local base url downstream).
+type ParentSessionRef = { id: string; url?: string; fromUrlFlag: boolean };
+
+function resolveParentSessionRefFromFlagOrEnv(
+  flags: SessionsNewFlags,
+): ParentSessionRef | undefined {
   // --parent-session-url <url> wins over --parent-id <uuid>; both override env.
-  const flagUrlValue = parseSessionIdFromUrl(flags.parentSessionUrl);
-  if (flagUrlValue) {
-    return flagUrlValue;
+  const flagUrl = flags.parentSessionUrl?.trim();
+  if (flagUrl) {
+    const id = parseSessionIdFromUrl(flagUrl);
+    if (id) {
+      return { id, url: flagUrl, fromUrlFlag: true };
+    }
   }
   const flagValue = flags.parentId?.trim();
-  if (flagValue && flagValue.length > 0) {
-    return flagValue;
+  if (flagValue) {
+    return { id: flagValue, fromUrlFlag: false };
   }
-  // Env fallback: the URL is the agent's identity, parse the UUID out.
-  const envFromUrl = parseSessionIdFromUrl(process.env.ACPX_SESSION_URL);
+  // Env fallback: ACPX_SESSION_URL is the spawning agent's OWN url (its real host).
+  // Preserve the full url so an agent on box A spawning a child on box B records A's
+  // host as the parent identity, not B's local base url.
+  const envUrl = process.env.ACPX_SESSION_URL?.trim();
+  const envFromUrl = parseSessionIdFromUrl(envUrl);
   if (envFromUrl) {
-    return envFromUrl;
+    return { id: envFromUrl, url: envUrl, fromUrlFlag: false };
   }
   return undefined;
 }
 
 type ResolvedParentSession = {
   acpxRecordId: string;
+  /** Full parent url (host+id) for cross-machine lineage, when known. (FW-19) */
+  sessionUrl?: string;
   taskFolder?: string;
   subscription?: string;
   profile?: string;
@@ -421,16 +437,25 @@ function parentInheritableFields(parent: SessionRecord): ResolvedParentSession {
 async function resolveAndValidateParentSessionId(
   flags: SessionsNewFlags,
 ): Promise<ResolvedParentSession | undefined> {
-  const candidate = resolveParentSessionIdFromFlagOrEnv(flags);
-  if (!candidate) {
+  const ref = resolveParentSessionRefFromFlagOrEnv(flags);
+  if (!ref) {
     return undefined;
   }
   try {
-    return parentInheritableFields(await resolveSessionRecord(candidate));
+    // Local parent: snapshot its inheritable fields, and carry the explicit url
+    // when one was supplied (else downstream derives it from the id same-box).
+    return { ...parentInheritableFields(await resolveSessionRecord(ref.id)), sessionUrl: ref.url };
   } catch (error) {
     if (error instanceof SessionNotFoundError) {
+      // FW-19: a parent identified by URL may live on ANOTHER box — its id won't
+      // resolve locally. The url carries the host, so accept it as the parent
+      // identity (linkage only; no local field inheritance). A bare --parent-id /
+      // env id with no url cannot identify a cross-box session → still an error.
+      if (ref.url) {
+        return { acpxRecordId: ref.id, sessionUrl: ref.url };
+      }
       const label = flags.parentSessionUrl ? "--parent-session-url" : "--parent-id";
-      throw new InvalidArgumentError(`${label} refers to unknown session: ${candidate}`);
+      throw new InvalidArgumentError(`${label} refers to unknown session: ${ref.id}`);
     }
     throw error;
   }
@@ -518,6 +543,7 @@ function buildSessionStartOptions(params: {
     name: params.flags.name,
     resumeSessionId: params.flags.resumeSession,
     parentSessionId: params.parent?.acpxRecordId,
+    parentSessionUrl: params.parent?.sessionUrl,
     metadata: withInheritedTaskFolder(params.flags.metadata, params.parent?.taskFolder),
     mcpServers: params.config.mcpServers,
     permissionMode: params.permissionMode,

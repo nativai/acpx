@@ -87,6 +87,7 @@ import {
   applyProfileAuth,
   buildAgentSpawnOptions,
   buildClaudeHomeSelectorMeta,
+  buildClaudeParentSessionMeta,
   effectiveAccountMetadataFromEnv,
   readEnvCredential,
   resolveConfiguredAuthCredential,
@@ -1022,10 +1023,16 @@ export class AcpClient {
   private buildNewSessionMeta(): Record<string, unknown> | undefined {
     const optionsMeta = buildClaudeCodeOptionsMeta(this.options.sessionOptions);
     const homeSelectorMeta = this.buildHomeSelectorMeta();
-    if (!homeSelectorMeta) {
-      return optionsMeta;
-    }
-    return { ...optionsMeta, ...homeSelectorMeta };
+    // FW-18/FW-19: the claude-pty bridge learns its per-session parent from the
+    // session/new `_meta` (not the spawn process env — one bridge serves many
+    // sessions). Carry the parent URL here so the child claude gets
+    // ACPX_PARENT_SESSION_URL and can message its parent back.
+    const parentMeta = buildClaudeParentSessionMeta(
+      this.options.sessionContext,
+      this.options.agentCommand,
+    );
+    const merged = { ...optionsMeta, ...homeSelectorMeta, ...parentMeta };
+    return Object.keys(merged).length > 0 ? merged : undefined;
   }
 
   private buildHomeSelectorMeta(): Record<string, unknown> | undefined {

@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 import {
@@ -66,6 +66,18 @@ export type EffectiveAccountMetadata = {
  * never introduce a second name.
  */
 export const INDEPENDENT_CLAUDE_HOME_META_KEY = "independent-claude-acp/home";
+
+/**
+ * The claude-pty bridge's session/new `_meta` key carrying the parent session's
+ * acpx-ui URL (lineage). The bridge reads this (parentSessionUrlFromMeta) and
+ * forwards it to the claude child as ACPX_PARENT_SESSION_URL so the child can
+ * message its parent back. Unlike the SDK claude adapter (which inherits the
+ * parent from the spawn PROCESS env), one bridge PROCESS serves many ACP
+ * sessions, so the parent must be delivered PER session — via this `_meta` —
+ * not via the process env. This exact string is the bridge interface. (FW-18)
+ */
+export const INDEPENDENT_CLAUDE_PARENT_SESSION_URL_META_KEY =
+  "independent-claude-acp/parent-session-url";
 
 /** The bridge's server-side HOME allow-list env (JSON {id → abs home path}). */
 export const INDEPENDENT_CLAUDE_HOME_MAP_ENV = "INDEPENDENT_CLAUDE_HOME_MAP";
@@ -165,15 +177,70 @@ function promotePrefixedAuthEnvironment(env: NodeJS.ProcessEnv): void {
 
 const DEFAULT_ACPX_UI_BASE_URL = "https://acpx.devbox.nativai.de";
 
+/**
+ * FW-20: derive the box's acpx-ui base URL from its K8s namespace. Each box runs
+ * in namespace `dev-<box>` whose pods get a resolv.conf search domain
+ * `dev-<box>.svc.cluster.local`; the box name maps to `https://acpx.<box>.nativai.de`.
+ * Pure (content in, url out) so it is testable without touching the filesystem.
+ * Returns undefined for non-cluster / unrecognized search domains.
+ */
+export function parseBoxBaseUrlFromResolvConf(resolvConf: string): string | undefined {
+  const match = resolvConf.match(/^search\s+(\S+)/m);
+  if (!match) {
+    return undefined;
+  }
+  const nsMatch = match[1].match(/^dev-([a-z0-9-]+)\.svc\.cluster\.local$/i);
+  const box = nsMatch?.[1];
+  if (!box) {
+    return undefined;
+  }
+  return `https://acpx.${box}.nativai.de`;
+}
+
+// Cache the namespace-derived base URL: /etc/resolv.conf does not change within a
+// process. `null` = computed-and-absent (not-in-cluster); undefined = not computed.
+let cachedBoxBaseUrl: string | null | undefined;
+
+function deriveBoxBaseUrl(): string | undefined {
+  if (cachedBoxBaseUrl !== undefined) {
+    return cachedBoxBaseUrl ?? undefined;
+  }
+  let value: string | undefined;
+  try {
+    value = parseBoxBaseUrlFromResolvConf(readFileSync("/etc/resolv.conf", "utf8"));
+  } catch {
+    value = undefined;
+  }
+  cachedBoxBaseUrl = value ?? null;
+  return value;
+}
+
+/**
+ * The acpx-ui base URL for THIS box. Precedence (FW-20):
+ *   1. explicit ACPX_UI_BASE_URL env (operator override / test seam)
+ *   2. namespace-derived host (robust to restarts wiping per-box env — the bug:
+ *      a missing ACPX_UI_BASE_URL on tubeyakker fell back to the devbox default,
+ *      giving every agent the WRONG own/parent URL host)
+ *   3. the hardcoded devbox default (non-cluster / unknown namespace)
+ */
 export function resolveAcpxUiBaseUrl(env: NodeJS.ProcessEnv): string {
   const raw = env.ACPX_UI_BASE_URL?.trim();
-  const base = raw && raw.length > 0 ? raw : DEFAULT_ACPX_UI_BASE_URL;
+  const base = raw && raw.length > 0 ? raw : (deriveBoxBaseUrl() ?? DEFAULT_ACPX_UI_BASE_URL);
   return base.replace(/\/+$/, "");
 }
 
 export type AgentSessionContext = {
   acpxRecordId: string;
   parentSessionId?: string | null;
+  /**
+   * The parent session's FULL acpx-ui URL (host + id), used for cross-machine
+   * lineage. When the parent lives on another box, its bare id cannot identify
+   * it locally — only the URL carries the host. Set from `--parent-session-url`
+   * or the spawning agent's ACPX_SESSION_URL at creation. When absent, the
+   * parent URL is derived from parentSessionId against the LOCAL base URL
+   * (correct same-box). Carried into the bridge's session/new `_meta`. (FW-19)
+   */
+  parentSessionUrl?: string | null;
   taskFolder?: string | null;
   agentFolder?: string | null;
   /**
@@ -913,6 +980,42 @@ export function buildClaudeHomeSelectorMeta(
     return undefined;
   }
   return { [INDEPENDENT_CLAUDE_HOME_META_KEY]: trimmed };
+}
+
+/**
+ * FW-18/FW-19: the claude-pty bridge's session/new `_meta` fragment carrying the
+ * parent session URL. ONLY for the bridge agent — the SDK claude adapter inherits
+ * its parent from the spawn PROCESS env (ACPX_PARENT_SESSION_URL via
+ * buildAgentEnvironment), but the bridge serves many ACP sessions per process and
+ * must learn each session's parent per-`session/new`. Prefers the full
+ * parentSessionUrl (carries the real host for a cross-box parent); otherwise
+ * derives `${baseUrl}/?session=${parentSessionId}` against the LOCAL base URL
+ * (correct for a same-box parent) — byte-identical to buildAgentEnvironment's
+ * ACPX_PARENT_SESSION_URL. Returns undefined when there is no parent or the agent
+ * is not the bridge (the namespaced key is harmless to other adapters, but gating
+ * keeps the contract explicit).
+ */
+function resolveParentMetaUrl(sessionContext: AgentSessionContext | undefined): string | undefined {
+  const explicitUrl = sessionContext?.parentSessionUrl?.trim();
+  if (explicitUrl) {
+    return explicitUrl;
+  }
+  const parentId = sessionContext?.parentSessionId?.trim();
+  if (!parentId) {
+    return undefined;
+  }
+  return `${resolveAcpxUiBaseUrl(process.env)}/?session=${parentId}`;
+}
+
+export function buildClaudeParentSessionMeta(
+  sessionContext: AgentSessionContext | undefined,
+  agentCommand: string | undefined,
+): Record<string, unknown> | undefined {
+  if (agentCommand === undefined || !isClaudePtyAgentCommand(agentCommand)) {
+    return undefined;
+  }
+  const url = resolveParentMetaUrl(sessionContext);
+  return url ? { [INDEPENDENT_CLAUDE_PARENT_SESSION_URL_META_KEY]: url } : undefined;
 }
 
 // Handles the openrouter authMode branch of applyProfileAuth.

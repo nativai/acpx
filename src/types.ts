@@ -224,6 +224,8 @@ export type AcpClientOptions = {
   sessionContext?: {
     acpxRecordId: string;
     parentSessionId?: string | null;
+    /** Full parent acpx-ui URL (host+id) for cross-machine lineage. (FW-19) */
+    parentSessionUrl?: string | null;
     taskFolder?: string | null;
     agentFolder?: string | null;
     subscriptionId?: string | null;
