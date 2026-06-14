@@ -1175,6 +1175,22 @@ export class AcpClient {
     return mergeRecordValues(optionsMeta, forkContext.meta);
   }
 
+  /**
+   * The subscription selection the Claude copy path must resolve its
+   * CLAUDE_CONFIG_DIR from. `--subscription`/`--profile` are unified into
+   * `sessionOptions.profile` (see `sessionOptionsFromGlobalFlags`); legacy
+   * records may still carry `.subscription`. The adapter spawn resolves its
+   * config dir from this same selection (via `sessionContext.profileId`), so
+   * `materializeClaudeForkSession` and the at-index UUID lookup must use it too
+   * — otherwise they fall back to the registry default and write/read the
+   * durable fork transcript in a different config dir than the adapter, making
+   * the post-fork `set_model`/recall fail on a non-default-subscription fork
+   * (FW-15).
+   */
+  private claudeCopySubscriptionSelection(): string | undefined {
+    return this.options.sessionOptions?.profile ?? this.options.sessionOptions?.subscription;
+  }
+
   private async applyDurableClaudeForkSessionId(
     result: SessionForkResult,
     forkContext: ForkRequestContext,
@@ -1190,7 +1206,7 @@ export class AcpClient {
       cwd,
       sourceCwd: forkContext.sourceCwd,
       sourceAcpSessionId,
-      subscriptionId: this.options.sessionOptions?.subscription,
+      subscriptionId: this.claudeCopySubscriptionSelection(),
       upToMessageId: forkContext.claudeResumeSessionAt,
     });
     if (!durableClaudeSessionId) {
@@ -1217,7 +1233,7 @@ export class AcpClient {
         cwd,
         acpSessionId: sourceAcpSessionId,
         forkAtIndex: atIndex,
-        subscriptionId: this.options.sessionOptions?.subscription,
+        subscriptionId: this.claudeCopySubscriptionSelection(),
       });
       if (!uuid) {
         throw new Error(
