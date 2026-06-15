@@ -30,6 +30,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { AcpClient } from "../src/acp/client.js";
+import { supportsMidTurnPromptInjection } from "../src/acp/mid-turn-injection-support.js";
 import type { QueueTask } from "../src/cli/queue/ipc.js";
 import type { QueueOwnerMessage } from "../src/cli/queue/messages.js";
 import { runQueuedTask } from "../src/cli/session/runtime.js";
@@ -253,12 +254,12 @@ function makeQueueTask(
   } satisfies QueueTask;
 }
 
-function makeSessionRecord(cwd: string): SessionRecord {
+function makeSessionRecord(cwd: string, agentCommand = "node mock-agent.js"): SessionRecord {
   return makeSessionRecordFixture(
     {
       acpxRecordId: "mid-turn-injection",
       acpSessionId: "mid-turn-injection-session",
-      agentCommand: "node mock-agent.js",
+      agentCommand,
       cwd,
     },
     { defaultName: false },
@@ -591,6 +592,92 @@ test("mid-turn prompt injection fires and settles exactly once, including across
   await runAttempt0InjectionScenario();
   await runRetryInjectionScenario();
   await runFireAndForgetInjectionWithoutTerminalResponseScenario();
+});
+
+// Gate wiring: the claude-pty bridge command must now opt a session into
+// mid-turn injection, exactly as the queue owner derives it
+// (queue-owner-runtime.ts: midTurnInjectionSupported =
+// supportsMidTurnPromptInjection(sessionRecord.agentCommand), then passed as
+// setMidTurnHandler to runSessionPrompt). This test mirrors that derivation for
+// a bridge session and asserts a mid-turn task actually routes through the
+// injection handler (concurrent client.prompt), rather than being serialized
+// behind the active turn. Guards the A.i gate flip from regressing.
+test("claude-pty bridge session opts into mid-turn injection and routes a mid-turn task through the handler", async () => {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const bridgeCommand = "node /opt/claude-pty-acp/acp-server-transcript.mjs";
+      const record = makeSessionRecord(homeDir, bridgeCommand);
+      await writeSessionRecordFile(homeDir, record);
+
+      // The exact gate the queue owner consults to decide whether to register
+      // the mid-turn handler for this session's adapter.
+      const midTurnInjectionSupported = supportsMidTurnPromptInjection(record.agentCommand);
+      assert.equal(
+        midTurnInjectionSupported,
+        true,
+        "claude-pty bridge command must support mid-turn injection",
+      );
+
+      const injectionInitiated = createDeferred<void>();
+      const control = makeMockClient({
+        onMainPrompt: async () => {
+          await injectionInitiated.promise;
+          return { stopReason: "end_turn" };
+        },
+        onInjectedPrompt: async () => {
+          injectionInitiated.resolve();
+          return { stopReason: "end_turn" };
+        },
+      });
+
+      const injectedSends: QueueOwnerMessage[] = [];
+      let injectedCloses = 0;
+      const midTurn = makeMidTurnControl((registration, ctrl) => {
+        if (registration === 1) {
+          const injectedTask = makeQueueTask(
+            "req-injected-bridge",
+            INJECTED_PROMPT_TEXT,
+            (message) => injectedSends.push(message),
+            () => {
+              injectedCloses += 1;
+            },
+          );
+          queueMicrotask(() => {
+            ctrl.currentHandler?.(injectedTask);
+          });
+        }
+      });
+
+      const mainSends: QueueOwnerMessage[] = [];
+      const mainTask = makeQueueTask(
+        "req-main-bridge",
+        MAIN_PROMPT_TEXT,
+        (message) => mainSends.push(message),
+        () => {},
+      );
+
+      await runQueuedTask(record.acpxRecordId, mainTask, {
+        sharedClient: control.client,
+        // Mirror queue-owner-runtime.ts:591 — the handler is wired only because
+        // the gate (A.i) reports the bridge supports injection.
+        setMidTurnHandler: midTurnInjectionSupported ? midTurn.setMidTurnHandler : undefined,
+        suppressSdkConsoleErrors: true,
+      });
+
+      assert.ok(
+        mainSends.find((m) => m.type === "result"),
+        "main task settled with a result",
+      );
+      assert.equal(midTurn.registrations, 1, "mid-turn handler registered for the bridge session");
+
+      const injectedCalls = control.promptCalls.filter((c) => c.kind === "injected");
+      assert.equal(injectedCalls.length, 1, "mid-turn task routed through the injection handler");
+      const injectedResults = injectedSends.filter((m) => m.type === "result");
+      assert.equal(injectedResults.length, 1, "injected task settled exactly once");
+      assert.equal(injectedResults[0]?.requestId, "req-injected-bridge");
+      assert.equal(injectedCloses, 1, "injected task closed exactly once");
+    });
+  });
 });
 
 test("runQueuedTask emits active before prompt execution and idle after completion", async () => {

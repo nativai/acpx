@@ -12,6 +12,21 @@ test("supportsMidTurnPromptInjection accepts Claude ACP and Codex ACP commands",
   );
 });
 
+test("supportsMidTurnPromptInjection accepts the claude-pty bridge command", () => {
+  // The bootstrapped default and dev-override forms of the bridge command both
+  // support native mid-turn steering, so injection must be enabled for them.
+  assert.equal(
+    supportsMidTurnPromptInjection("node /opt/claude-pty-acp/acp-server-transcript.mjs"),
+    true,
+  );
+  assert.equal(
+    supportsMidTurnPromptInjection(
+      "node /workspace/projects/claude-pty-acp/main/acp-server-transcript.mjs",
+    ),
+    true,
+  );
+});
+
 test("supportsMidTurnPromptInjection rejects unrelated ACP command text", () => {
   assert.equal(supportsMidTurnPromptInjection("gemini --experimental-acp"), false);
   assert.equal(supportsMidTurnPromptInjection("node ./mock-agent.js --codex-compatible"), false);
