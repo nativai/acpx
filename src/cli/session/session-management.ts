@@ -23,6 +23,7 @@ import {
   normalizeName,
   resolveSessionRecord,
   writeSessionRecord,
+  writeSessionRecordAtBoundary,
 } from "../../session/persistence.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
 import type { SessionEnsureResult, SessionRecord } from "../../types.js";
@@ -154,7 +155,22 @@ async function createSessionRecordWithClient(
     setCurrentModelId(record, options.sessionOptions?.model);
   }
 
-  await writeSessionRecord(record);
+  // A fork inherits the source's (truncated) conversation in
+  // `conversation.messages`. acpx-ui renders a session's conversation from the
+  // messages-log sidecar (`<id>.messages.ndjson`, pointed at by `messages_log`)
+  // — its record/fork-prepend fallback runs through hydrateSessionMessages, and
+  // a normal session always carries that sidecar. A plain checkpoint write
+  // leaves `messages_log` undefined and never writes the sidecar, so the fork
+  // is stored differently from every other session (inline-only) and the UI
+  // shows an empty page. Flush the inherited messages through the boundary
+  // writer so the fork's `messages_log` is populated (count == forkAtMessageIndex,
+  // matching the truncated Claude resume transcript) and the sidecar exists —
+  // making the fork store identically to its parent. FW-10 fork UI-empty fix.
+  if (forkContext) {
+    await writeSessionRecordAtBoundary(record);
+  } else {
+    await writeSessionRecord(record);
+  }
   return record;
 }
 

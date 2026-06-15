@@ -705,6 +705,7 @@ test("sessions copy creates a full same-agent copy with lineage and metadata", a
       forked_at_message_index?: unknown;
       metadata?: Record<string, unknown>;
       messages?: unknown[];
+      messages_log?: { count?: unknown };
       acpx?: {
         session_options?: {
           subscription?: unknown;
@@ -724,7 +725,12 @@ test("sessions copy creates a full same-agent copy with lineage and metadata", a
     assert.equal(stored.forked_from_session_id, "source-copy");
     assert.equal(stored.forked_at_message_index, messages.length);
     assert.equal(stored.metadata?.task_folder, "/wisdom/task");
-    assert.deepEqual(stored.messages, messages);
+    // FW-10 fix: the inherited conversation is flushed to the messages-log
+    // sidecar (count == forkAtMessageIndex), leaving inline `messages` as the
+    // split-tail — the fork is now stored exactly like its parent.
+    assert.deepEqual(stored.messages, []);
+    assert.equal(stored.messages_log?.count, messages.length);
+    assert.deepEqual(await readForkMessagesLog(homeDir, String(payload.acpxRecordId)), messages);
     assert.equal(stored.acpx?.session_options?.subscription, "sub1");
     assert.deepEqual(stored.acpx?.session_options?.allowed_tools, ["Read", "Grep"]);
     assert.equal(stored.acpx?.session_options?.max_turns, 3);
@@ -797,10 +803,14 @@ test("sessions copy --at-index 0 creates an empty Claude copy with lineage", asy
       forked_from_session_id?: unknown;
       forked_at_message_index?: unknown;
       messages?: unknown[];
+      messages_log?: { count?: unknown };
     };
     assert.equal(stored.forked_from_session_id, "source-claude-zero");
     assert.equal(stored.forked_at_message_index, 0);
     assert.deepEqual(stored.messages, []);
+    // An at-index-0 fork inherits no conversation, so there is no messages-log
+    // sidecar to write and `messages_log` stays absent.
+    assert.equal(stored.messages_log, undefined);
   });
 });
 
@@ -875,6 +885,7 @@ test("sessions copy --at-index --ephemeral truncates messages and stamps byway m
       forked_at_message_index?: unknown;
       metadata?: Record<string, unknown>;
       messages?: unknown[];
+      messages_log?: { count?: unknown };
     };
     assert.equal(stored.name, "source (fork)");
     assert.equal(stored.kind, "session");
@@ -884,7 +895,15 @@ test("sessions copy --at-index --ephemeral truncates messages and stamps byway m
     assert.equal(stored.metadata?.byway, "1");
     assert.equal(stored.metadata?.byway_parent, "source-truncate");
     assert.equal(stored.metadata?.byway_at, "1");
-    assert.deepEqual(stored.messages, messages.slice(0, 1));
+    // FW-10 fix: truncated inherited conversation lives in the messages-log
+    // sidecar (count == forkAtMessageIndex == 1), inline `messages` is the
+    // split-tail.
+    assert.deepEqual(stored.messages, []);
+    assert.equal(stored.messages_log?.count, 1);
+    assert.deepEqual(
+      await readForkMessagesLog(homeDir, String(payload.acpxRecordId)),
+      messages.slice(0, 1),
+    );
   });
 });
 
@@ -1046,11 +1065,15 @@ test("sessions copy resolves Claude --at-index from source cwd and forwards copi
       forked_from_session_id?: unknown;
       forked_at_message_index?: unknown;
       messages?: unknown[];
+      messages_log?: { count?: unknown };
     };
     assert.equal(stored.cwd, destinationCwd);
     assert.equal(stored.forked_from_session_id, "source-claude-transcript");
     assert.equal(stored.forked_at_message_index, 2);
-    assert.deepEqual(stored.messages, messages);
+    // FW-10 fix: inherited conversation flushed to the messages-log sidecar.
+    assert.deepEqual(stored.messages, []);
+    assert.equal(stored.messages_log?.count, messages.length);
+    assert.deepEqual(await readForkMessagesLog(homeDir, String(payload.acpxRecordId)), messages);
 
     const callLog = await fs.readFile(
       path.join(homeDir, ".claude", "fork-sdk-calls.jsonl"),
@@ -1169,13 +1192,17 @@ test("sessions copy materializes cross-cwd Claude forks in the destination proje
       forked_from_session_id?: unknown;
       forked_at_message_index?: unknown;
       messages?: unknown[];
+      messages_log?: { count?: unknown };
     };
     assert.equal(stored.acp_session_id, `durable-${sourceAcpSessionId}`);
     assert.equal(stored.agent_session_id, `durable-${sourceAcpSessionId}`);
     assert.equal(stored.cwd, destinationCwd);
     assert.equal(stored.forked_from_session_id, "source-claude-cross-cwd");
     assert.equal(stored.forked_at_message_index, messages.length);
-    assert.deepEqual(stored.messages, messages);
+    // FW-10 fix: inherited conversation flushed to the messages-log sidecar.
+    assert.deepEqual(stored.messages, []);
+    assert.equal(stored.messages_log?.count, messages.length);
+    assert.deepEqual(await readForkMessagesLog(homeDir, String(payload.acpxRecordId)), messages);
 
     const callLog = await fs.readFile(path.join(configDir, "fork-sdk-calls.jsonl"), "utf8");
     const call = JSON.parse(callLog.trim()) as {
@@ -4321,6 +4348,26 @@ function sessionFilePath(homeDir: string, acpxRecordId: string): string {
   return path.join(homeDir, ".acpx", "sessions", `${encodeURIComponent(acpxRecordId)}.json`);
 }
 
+// FW-10: a fork flushes its inherited conversation to the messages-log sidecar
+// (so it is stored like every normal session). Read it back to verify the
+// inherited messages are retrievable the same way the UI hydrates them.
+async function readForkMessagesLog(
+  homeDir: string,
+  acpxRecordId: string,
+): Promise<SessionRecord["messages"]> {
+  const logPath = path.join(
+    homeDir,
+    ".acpx",
+    "sessions",
+    `${encodeURIComponent(acpxRecordId)}.messages.ndjson`,
+  );
+  const raw = await fs.readFile(logPath, "utf8");
+  return raw
+    .split("\n")
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line) as SessionRecord["messages"][number]);
+}
+
 async function fileExists(filePath: string): Promise<boolean> {
   try {
     await fs.access(filePath);
@@ -4506,6 +4553,7 @@ test("sessions new --from-template instantiates a normal open session from a tem
       closed?: unknown;
       agent_command?: unknown;
       messages?: unknown[];
+      messages_log?: { count?: unknown };
       name?: unknown;
     };
     assert.equal(stored.template, undefined, "instantiated session must NOT itself be a template");
@@ -4515,7 +4563,16 @@ test("sessions new --from-template instantiates a normal open session from a tem
       MOCK_AGENT_WITH_FORK_SESSION,
       "inherits the template's agent type",
     );
-    assert.deepEqual(stored.messages, messages, "inherits the template's context");
+    // FW-10 fix: an instantiated template inherits its context through the same
+    // fork core, so the inherited messages live in the messages-log sidecar
+    // (rendered like any normal session) and inline `messages` is the split-tail.
+    assert.deepEqual(stored.messages, [], "context moved to the messages-log sidecar");
+    assert.equal(stored.messages_log?.count, messages.length);
+    assert.deepEqual(
+      await readForkMessagesLog(homeDir, String(payload.acpxRecordId)),
+      messages,
+      "inherits the template's context",
+    );
     assert.equal(stored.name, "instance");
   });
 });
