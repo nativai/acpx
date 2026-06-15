@@ -333,12 +333,26 @@ export type SessionAgentContent =
 export type SessionUserMessage = {
   id: string;
   content: SessionUserContent[];
+  /**
+   * Claude transcript record uuid this messages_log entry corresponds to
+   * (durable byway-fork provenance). Stamped from the steer ack
+   * `_meta.steerBoundaryUuid`, or inherited from the immediately preceding
+   * entry as a deterministic fallback. Absent on the very first User entry
+   * (no predecessor) → fork falls back to the legacy index path.
+   */
+  claudeUuid?: string;
 };
 
 export type SessionAgentMessage = {
   content: SessionAgentContent[];
   tool_results: Record<string, SessionToolResult>;
   reasoning_details?: unknown;
+  /**
+   * Claude transcript record uuid of the last record streamed into this
+   * entry (durable byway-fork provenance). Stamped last-wins from
+   * `update._meta.claudeUuid`.
+   */
+  claudeUuid?: string;
 };
 
 export type SessionMessage =

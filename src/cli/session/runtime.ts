@@ -43,6 +43,7 @@ import {
   recordClientOperation as recordConversationClientOperation,
   recordPromptSubmission,
   recordSessionUpdate as recordConversationSessionUpdate,
+  stampSteerBoundaryUuid,
   trimConversationForRuntime,
 } from "../../session/conversation-model.js";
 import {
@@ -254,6 +255,21 @@ function deliveryPhaseForStopReason(
   stopReason: RunPromptResult["stopReason"],
 ): Exclude<DeliveryPhase, "accepted"> {
   return stopReason === "cancelled" ? "cancelled" : "done";
+}
+
+/**
+ * Read the pre-steer transcript tail uuid the bridge stamps on a mid-turn steer
+ * ack (`_meta.steerBoundaryUuid`). Used to stamp durable byway-fork provenance
+ * onto the steer's User entry (A3).
+ */
+function readSteerBoundaryUuid(
+  meta: { [key: string]: unknown } | null | undefined,
+): string | undefined {
+  if (!meta || typeof meta !== "object") {
+    return undefined;
+  }
+  const value = (meta as Record<string, unknown>).steerBoundaryUuid;
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 function deliveryErrorFrom(error: unknown): DeliveryEventError {
@@ -1295,7 +1311,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
           const injectedPrompt = injectedTask.prompt ?? textPrompt(injectedTask.message);
           const injectedDeliveryContext = deliveryContextFor(injectedTask);
           try {
-            await recordPromptStart(injectedPrompt, injectedTask.messageId);
+            const injectedMessageId = await recordPromptStart(
+              injectedPrompt,
+              injectedTask.messageId,
+            );
             await appendDeliveryEvent(injectedDeliveryContext, "accepted");
             const injectedResponse = await client.prompt(
               sessionId,
@@ -1304,6 +1323,23 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
                 ? { messageId: injectedTask.messageId }
                 : undefined,
             );
+            // Durable byway-fork provenance (A3): a mid-turn steer produces no
+            // distinct claude user record, so the bridge hands back the pre-steer
+            // transcript tail uuid in the steer ack `_meta.steerBoundaryUuid`.
+            // Stamp it onto the steer's User entry as the contract's primary
+            // signal. Note: `recordPromptStart` above already finalized this entry
+            // to the append-only messages_log with its inherit-preceding value
+            // (= the preceding Agent's claudeUuid = the same pre-steer tail, equal
+            // by construction — see CONTRACT §2), so that inherited value is what
+            // the fork resolver durably reads. This stamp keeps the live record in
+            // sync with the bridge-authoritative uuid (and is picked up by a later
+            // log compaction rewrite); it does not rewrite the committed log line.
+            const steerBoundaryUuid = readSteerBoundaryUuid(injectedResponse._meta);
+            if (injectedMessageId && steerBoundaryUuid) {
+              stampSteerBoundaryUuid(conversation, injectedMessageId, steerBoundaryUuid);
+              applyConversation(record, conversation);
+              await writeSessionRecordAtBoundary(record);
+            }
             await appendDeliveryTerminal(
               injectedDeliveryContext,
               deliveryPhaseForStopReason(injectedResponse.stopReason),

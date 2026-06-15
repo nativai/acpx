@@ -296,6 +296,7 @@ async function forkSessionRecordWithClient(
             client.forkSession(sourceRecord.acpSessionId, cwd, {
               atIndex: options.forkAtMessageIndex,
               sourceCwd: sourceRecord.cwd,
+              sourceMessages: sourceRecord.messages,
               suppressReplayUpdates: true,
             }),
             options.timeoutMs,

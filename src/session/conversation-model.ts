@@ -255,6 +255,86 @@ function isAgentMessage(message: SessionMessage): message is { Agent: SessionAge
   return typeof message === "object" && message !== null && hasOwn(message, "Agent");
 }
 
+/**
+ * Durable byway-fork provenance: the claude transcript record uuid the bridge
+ * tagged onto this `session/update` via `_meta.claudeUuid`. See the fork
+ * provenance contract — producer is the bridge, consumer is acpx.
+ */
+function claudeUuidFromUpdate(update: ExtendedSessionUpdate): string | undefined {
+  const meta = asRecord((update as { _meta?: unknown })._meta);
+  const value = meta?.claudeUuid;
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/**
+ * Stamp the Agent entry the update streams into with its originating claude
+ * record uuid, last-wins, so the entry ends up holding the uuid of the last
+ * record streamed into it (A2).
+ */
+function stampAgentClaudeUuid(
+  conversation: SessionConversation,
+  update: ExtendedSessionUpdate,
+): void {
+  const uuid = claudeUuidFromUpdate(update);
+  if (uuid) {
+    ensureAgentMessage(conversation).claudeUuid = uuid;
+  }
+}
+
+/** The provenance uuid of a messages_log entry, if it carries one. */
+function messageClaudeUuid(message: SessionMessage | undefined): string | undefined {
+  if (!message || message === "Resume") {
+    return undefined;
+  }
+  if (isUserMessage(message)) {
+    return message.User.claudeUuid;
+  }
+  if (isAgentMessage(message)) {
+    return message.Agent.claudeUuid;
+  }
+  return undefined;
+}
+
+/**
+ * Deterministic A3 fallback: a User entry with no own provenance inherits the
+ * immediately preceding messages_log entry's claudeUuid. The very first User
+ * entry (no predecessor) is left without one, so the fork falls back to the
+ * legacy index path. Called right after the User entry is appended (it is the
+ * last message), so the predecessor is at index -2.
+ */
+function inheritPrecedingClaudeUuid(conversation: SessionConversation): void {
+  const last = conversation.messages.at(-1);
+  if (!last || !isUserMessage(last) || last.User.claudeUuid !== undefined) {
+    return;
+  }
+  const inherited = messageClaudeUuid(conversation.messages.at(-2));
+  if (inherited) {
+    last.User.claudeUuid = inherited;
+  }
+}
+
+/**
+ * Primary A3 path: stamp the steer User entry from the steer ack's
+ * `_meta.steerBoundaryUuid` (the pre-steer transcript tail), overriding the
+ * inherit-preceding fallback. Finds the entry by its prompt message id.
+ */
+export function stampSteerBoundaryUuid(
+  conversation: SessionConversation,
+  promptMessageId: string,
+  steerBoundaryUuid: string | undefined,
+): void {
+  if (!steerBoundaryUuid) {
+    return;
+  }
+  for (let index = conversation.messages.length - 1; index >= 0; index -= 1) {
+    const message = conversation.messages[index];
+    if (isUserMessage(message) && message.User.id === promptMessageId) {
+      message.User.claudeUuid = steerBoundaryUuid;
+      return;
+    }
+  }
+}
+
 function isAgentTextContent(content: SessionAgentContent): content is { Text: string } {
   return hasOwn(content, "Text");
 }
@@ -706,6 +786,7 @@ export function recordPromptSubmission(
       }),
     },
   });
+  inheritPrecedingClaudeUuid(conversation);
   updateConversationTimestamp(conversation, timestamp);
   trimConversationForRuntime(conversation);
   return promptMessageId;
@@ -778,22 +859,26 @@ const SESSION_UPDATE_HANDLERS: Record<string, SessionUpdateHandler> = {
   agent_message_chunk: (conversation, _acpx, update) => {
     if (update.sessionUpdate === "agent_message_chunk") {
       appendAgentMessageChunk(conversation, update.content, appendAgentText);
+      stampAgentClaudeUuid(conversation, update);
     }
   },
   agent_thought_chunk: (conversation, _acpx, update) => {
     if (update.sessionUpdate === "agent_thought_chunk") {
       appendAgentMessageChunk(conversation, update.content, appendAgentThinking);
+      stampAgentClaudeUuid(conversation, update);
     }
   },
   agent_progress_update: () => {},
   tool_call: (conversation, _acpx, update) => {
     if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
       applyToolCallUpdate(ensureAgentMessage(conversation), update);
+      stampAgentClaudeUuid(conversation, update);
     }
   },
   tool_call_update: (conversation, _acpx, update) => {
     if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
       applyToolCallUpdate(ensureAgentMessage(conversation), update);
+      stampAgentClaudeUuid(conversation, update);
     }
   },
   usage_update: (conversation, _acpx, update) => {

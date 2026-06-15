@@ -65,6 +65,7 @@ import type {
   PermissionMode,
   PermissionStats,
   PromptInput,
+  SessionMessage,
 } from "../types.js";
 import {
   buildClaudeAcpSessionCreateTimeoutMessage,
@@ -141,6 +142,12 @@ type LoadSessionOptions = {
 type ForkSessionOptions = LoadSessionOptions & {
   atIndex?: number;
   sourceCwd?: string;
+  /**
+   * The source session's messages_log entries, threaded in so the fork
+   * resolver can read durable byway-fork provenance (`messages[atIndex-1]
+   * .claudeUuid`) on the PTY-bridge path (A5).
+   */
+  sourceMessages?: readonly SessionMessage[];
 };
 
 type ForkRequestContext = {
@@ -149,6 +156,39 @@ type ForkRequestContext = {
   sourceCwd: string;
   claudeResumeSessionAt?: string;
 };
+
+/** The durable byway-fork provenance uuid a messages_log entry carries, if any. */
+function forkEntryClaudeUuid(entry: SessionMessage | undefined): string | undefined {
+  if (!entry || entry === "Resume") {
+    return undefined;
+  }
+  if ("User" in entry) {
+    return entry.User.claudeUuid;
+  }
+  if ("Agent" in entry) {
+    return entry.Agent.claudeUuid;
+  }
+  return undefined;
+}
+
+/**
+ * Resolve the fork `_meta` for the PTY-bridge path (A5). When the entry being
+ * forked at (`messages[atIndex-1]`) carries durable provenance, send it via the
+ * EXISTING direct-uuid path (`claudeCode.options.resumeSessionAt`) — immune to
+ * mid-turn steers and any messages_log/transcript divergence. Otherwise fall
+ * back to the LEGACY index (`acpx.forkAtMessageIndex`), which the bridge
+ * resolves with its reconstructed-index model for pre-provenance sessions.
+ */
+export function resolvePtyForkMeta(
+  sourceMessages: readonly SessionMessage[] | undefined,
+  atIndex: number,
+): Record<string, unknown> {
+  const claudeUuid = forkEntryClaudeUuid(sourceMessages?.[atIndex - 1]);
+  if (claudeUuid) {
+    return { claudeCode: { options: { resumeSessionAt: claudeUuid } } };
+  }
+  return { acpx: { forkAtMessageIndex: atIndex } };
+}
 
 export type AcpPromptOptions = {
   messageId?: string;
@@ -1116,6 +1156,7 @@ export class AcpClient {
       sourceAcpSessionId,
       sourceCwd,
       options.atIndex,
+      options.sourceMessages,
     );
     const requestMeta = this.buildForkRequestMeta(forkContext);
     const requestCwd = this.resolveForkRequestCwd(forkContext, sessionCwd);
@@ -1228,6 +1269,7 @@ export class AcpClient {
     sourceAcpSessionId: string,
     cwd: string,
     atIndex: number | undefined,
+    sourceMessages: readonly SessionMessage[] | undefined,
   ): Promise<ForkRequestContext> {
     const { command, args } = splitCommandLine(this.options.agentCommand);
 
@@ -1255,10 +1297,12 @@ export class AcpClient {
       };
     }
 
+    // PTY-bridge path (not isClaudeAcpCommand): prefer durable provenance, fall
+    // back to the legacy messages_log index for pre-provenance sessions (A5).
     return {
       claudeFork: false,
       sourceCwd: cwd,
-      meta: { acpx: { forkAtMessageIndex: atIndex } },
+      meta: resolvePtyForkMeta(sourceMessages, atIndex),
     };
   }
 
