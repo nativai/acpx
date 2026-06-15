@@ -28,7 +28,7 @@ import { EXIT_CODES, OUTPUT_FORMATS, type OutputFormat, type OutputPolicy } from
 import { getAcpxVersion } from "./version.js";
 
 export { parseAllowedTools, parseMaxTurns, parseTtlSeconds };
-export { formatPromptSessionBannerLine } from "./cli/output/render.js";
+export { classifyConnectionStatus, formatPromptSessionBannerLine } from "./cli/output/render.js";
 
 type SkillflagModule = typeof import("skillflag");
 

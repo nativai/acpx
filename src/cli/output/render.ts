@@ -18,11 +18,30 @@ function formatRoutedFrom(sessionCwd: string, currentCwd: string): string | unde
 
 type SessionConnectionStatus = "connected" | "needs reconnect";
 
+/**
+ * Maps queue-owner health into the prompt banner's connection segment.
+ *
+ * Three-state, keyed on `hasLease` so a benign cold spawn is not reported as a
+ * fault:
+ * - `healthy`                  → "connected"
+ * - `!healthy && hasLease`     → "needs reconnect" (genuinely wedged owner)
+ * - `!healthy && !hasLease`    → null (cold spawn — no owner yet, omit segment)
+ */
+export function classifyConnectionStatus(health: {
+  healthy: boolean;
+  hasLease: boolean;
+}): SessionConnectionStatus | null {
+  if (health.healthy) {
+    return "connected";
+  }
+  return health.hasLease ? "needs reconnect" : null;
+}
+
 async function resolveSessionConnectionStatus(
   record: SessionRecord,
-): Promise<SessionConnectionStatus> {
+): Promise<SessionConnectionStatus | null> {
   const health = await probeQueueOwnerHealth(record.acpxRecordId);
-  return health.healthy ? "connected" : "needs reconnect";
+  return classifyConnectionStatus(health);
 }
 
 export function printSessionsByFormat(sessions: SessionRecord[], format: OutputFormat): void {
@@ -233,7 +252,7 @@ export function printQueuedPromptByFormat(
 export function formatPromptSessionBannerLine(
   record: SessionRecord,
   currentCwd: string,
-  connectionStatus: SessionConnectionStatus = "needs reconnect",
+  connectionStatus: SessionConnectionStatus | null = null,
 ): string {
   const label = formatSessionLabel(record);
   const normalizedSessionCwd = path.resolve(record.cwd);
@@ -242,13 +261,16 @@ export function formatPromptSessionBannerLine(
     normalizedSessionCwd === normalizedCurrentCwd
       ? undefined
       : formatRoutedFrom(normalizedSessionCwd, normalizedCurrentCwd);
-  const status = connectionStatus;
+
+  // On a cold spawn (no queue owner yet) there is no health verdict to assert,
+  // so omit the `· agent <status>` segment entirely — the banner is pure identity.
+  const agentSuffix = connectionStatus === null ? "" : ` · agent ${connectionStatus}`;
 
   if (routedFrom) {
-    return `[acpx] session ${label} (${record.acpxRecordId}) · ${normalizedSessionCwd} (routed from ${routedFrom}) · agent ${status}`;
+    return `[acpx] session ${label} (${record.acpxRecordId}) · ${normalizedSessionCwd} (routed from ${routedFrom})${agentSuffix}`;
   }
 
-  return `[acpx] session ${label} (${record.acpxRecordId}) · ${normalizedSessionCwd} · agent ${status}`;
+  return `[acpx] session ${label} (${record.acpxRecordId}) · ${normalizedSessionCwd}${agentSuffix}`;
 }
 
 export async function printPromptSessionBanner(

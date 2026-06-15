@@ -10,6 +10,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { InvalidArgumentError } from "commander";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
 import {
+  classifyConnectionStatus,
   formatPromptSessionBannerLine,
   parseAllowedTools,
   parseMaxTurns,
@@ -280,8 +281,8 @@ test("parseMaxTurns accepts positive integers and rejects invalid values", () =>
   assert.throws(() => parseMaxTurns("1.5"), InvalidArgumentError);
 });
 
-test("formatPromptSessionBannerLine prints single-line prompt banner for matching cwd", () => {
-  const record = makeSessionRecord({
+function makeBannerRecord(): SessionRecord {
+  return makeSessionRecord({
     acpxRecordId: "abc123",
     acpSessionId: "abc123",
     agentCommand: "agent-a",
@@ -291,30 +292,73 @@ test("formatPromptSessionBannerLine prints single-line prompt banner for matchin
     lastUsedAt: "2026-01-01T00:00:00.000Z",
     closed: false,
   });
+}
 
+test("classifyConnectionStatus maps healthy/hasLease to a three-state verdict", () => {
+  // healthy → connected (regardless of hasLease)
+  assert.equal(classifyConnectionStatus({ healthy: true, hasLease: true }), "connected");
+  assert.equal(classifyConnectionStatus({ healthy: true, hasLease: false }), "connected");
+  // wedged owner (has a lease but unreachable) → genuine needs-reconnect signal
+  assert.equal(classifyConnectionStatus({ healthy: false, hasLease: true }), "needs reconnect");
+  // cold spawn (no owner yet) → null ⇒ banner omits the segment
+  assert.equal(classifyConnectionStatus({ healthy: false, hasLease: false }), null);
+});
+
+test("formatPromptSessionBannerLine omits agent segment on cold spawn (matching cwd)", () => {
+  const record = makeBannerRecord();
+  const line = formatPromptSessionBannerLine(record, "/home/user/project", null);
+  assert.equal(line, "[acpx] session calm-forest (abc123) · /home/user/project");
+});
+
+test("formatPromptSessionBannerLine omits agent segment on cold spawn (routed-from)", () => {
+  const record = makeBannerRecord();
+  const line = formatPromptSessionBannerLine(record, "/home/user/project/src/auth", null);
+  assert.equal(
+    line,
+    "[acpx] session calm-forest (abc123) · /home/user/project (routed from ./src/auth)",
+  );
+});
+
+test("formatPromptSessionBannerLine defaults to cold-spawn (no agent segment)", () => {
+  const record = makeBannerRecord();
   const line = formatPromptSessionBannerLine(record, "/home/user/project");
+  assert.equal(line, "[acpx] session calm-forest (abc123) · /home/user/project");
+});
+
+test("formatPromptSessionBannerLine keeps needs-reconnect signal for a wedged owner", () => {
+  const record = makeBannerRecord();
+  const line = formatPromptSessionBannerLine(record, "/home/user/project", "needs reconnect");
   assert.equal(
     line,
     "[acpx] session calm-forest (abc123) · /home/user/project · agent needs reconnect",
   );
 });
 
-test("formatPromptSessionBannerLine includes routed-from path when cwd differs", () => {
-  const record = makeSessionRecord({
-    acpxRecordId: "abc123",
-    acpSessionId: "abc123",
-    agentCommand: "agent-a",
-    cwd: "/home/user/project",
-    name: "calm-forest",
-    createdAt: "2026-01-01T00:00:00.000Z",
-    lastUsedAt: "2026-01-01T00:00:00.000Z",
-    closed: false,
-  });
-
-  const line = formatPromptSessionBannerLine(record, "/home/user/project/src/auth");
+test("formatPromptSessionBannerLine shows needs-reconnect with routed-from for a wedged owner", () => {
+  const record = makeBannerRecord();
+  const line = formatPromptSessionBannerLine(
+    record,
+    "/home/user/project/src/auth",
+    "needs reconnect",
+  );
   assert.equal(
     line,
     "[acpx] session calm-forest (abc123) · /home/user/project (routed from ./src/auth) · agent needs reconnect",
+  );
+});
+
+test("formatPromptSessionBannerLine shows connected for a healthy owner", () => {
+  const record = makeBannerRecord();
+  const line = formatPromptSessionBannerLine(record, "/home/user/project", "connected");
+  assert.equal(line, "[acpx] session calm-forest (abc123) · /home/user/project · agent connected");
+});
+
+test("formatPromptSessionBannerLine shows connected with routed-from for a healthy owner", () => {
+  const record = makeBannerRecord();
+  const line = formatPromptSessionBannerLine(record, "/home/user/project/src/auth", "connected");
+  assert.equal(
+    line,
+    "[acpx] session calm-forest (abc123) · /home/user/project (routed from ./src/auth) · agent connected",
   );
 });
 
