@@ -30,12 +30,14 @@ import {
   findGitRepositoryRoot,
   findSession,
   findSessionByDirectoryWalk,
+  isoNow,
   isTemplateRecord,
   listSessions,
   migrateSessionMessages,
   normalizeName,
   resolveSessionRecord,
   writeSessionRecord,
+  writeSessionRecordWithLifecycle,
 } from "../session/persistence.js";
 import { EXIT_CODES } from "../types.js";
 import type {
@@ -65,6 +67,7 @@ import {
   type SessionsListFlags,
   type SessionsNewFlags,
   type SessionsPruneFlags,
+  type SessionsTemplateFlags,
   type StatusFlags,
 } from "./flags.js";
 import { emitJsonResult } from "./output/json-output.js";
@@ -1633,6 +1636,87 @@ export async function handleSessionsTemplates(
   ]);
   const sessions = await listSessionsForAgent(agent.agentCommand, agent.agentName);
   printSessionsByFormat(sessions.filter(isTemplateRecord), globalFlags.format);
+}
+
+// Mark a session as a template: terminate any live owner first so the template is a
+// clean, closed record (no agent left attached to a "closed template"). closeSession
+// kills the queue owner/process group and persists closed:true via the privileged
+// path; it is idempotent (no owner = success). Re-resolve afterwards to pick up the
+// persisted close, then stamp the marker. Idempotent re-enable preserves the original
+// creation stamp / source id.
+async function markSessionAsTemplate(sessionId: string): Promise<SessionRecord> {
+  const initial = await resolveSessionRecord(sessionId);
+  const { closeSession } = await loadSessionModule();
+  await closeSession(initial.acpxRecordId);
+  const record = await resolveSessionRecord(sessionId);
+  record.template = {
+    enabled: true,
+    created_at: record.template?.created_at ?? isoNow(),
+    source_session_id: record.template?.source_session_id ?? record.acpSessionId,
+  };
+  record.closed = true;
+  record.closedAt = record.closedAt ?? isoNow();
+  return record;
+}
+
+// Clear the template marker. Disable un-templates only — leave closed/closedAt as-is
+// (disabling does not reopen a session). Idempotent on a non-template record.
+async function unmarkSessionTemplate(sessionId: string): Promise<SessionRecord> {
+  const record = await resolveSessionRecord(sessionId);
+  record.template = undefined;
+  return record;
+}
+
+// `acpx <agent> sessions template <id> --enable|--disable` — mark/unmark a session
+// as a reusable template. A template is a local record carrying `template.enabled`
+// plus `closed` (acpx-ui parity). The verb writes the local store directly via the
+// PRIVILEGED lifecycle writer (`writeSessionRecordWithLifecycle`): a plain
+// `writeSessionRecord` read-preserves `template`/`closed` (FW-16) and would silently
+// revert the change. This verb thus joins `closeSession` as a second authorized
+// writer of those lifecycle fields. Addressed by id (like `recover`/`owner-status`),
+// not cwd+name.
+export async function handleSessionsTemplate(
+  _explicitAgentName: string | undefined,
+  sessionId: string,
+  flags: SessionsTemplateFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  if (flags.enable === true && flags.disable === true) {
+    throw new InvalidArgumentError("--enable and --disable are mutually exclusive");
+  }
+  // Default action when neither flag is passed = enable (the verb's job is to make
+  // a template).
+  const enable = flags.disable !== true;
+
+  const record = enable
+    ? await markSessionAsTemplate(sessionId)
+    : await unmarkSessionTemplate(sessionId);
+
+  // PRIVILEGED write — see the function doc-comment. Never use plain writeSessionRecord
+  // here; it would read-preserve the on-disk template/closed and drop the change.
+  await writeSessionRecordWithLifecycle(record);
+
+  printTemplateResult(record, enable, globalFlags.format);
+}
+
+function printTemplateResult(record: SessionRecord, enable: boolean, format: OutputFormat): void {
+  const result = {
+    action: enable ? ("template_enabled" as const) : ("template_disabled" as const),
+    acpxRecordId: record.acpxRecordId,
+    template: enable,
+    closed: record.closed === true,
+    created_at: record.template?.created_at,
+    source_session_id: record.template?.source_session_id,
+  };
+  if (!emitJsonResult(format, result)) {
+    process.stdout.write(
+      enable
+        ? `template ${record.acpxRecordId}: enabled (closed)\n`
+        : `template ${record.acpxRecordId}: disabled\n`,
+    );
+  }
 }
 
 export async function handleSessionsEnsure(

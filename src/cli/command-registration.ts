@@ -18,6 +18,7 @@ import {
   handleSessionsRecover,
   handleSessionsSetMetadata,
   handleSessionsShow,
+  handleSessionsTemplate,
   handleSessionsTemplates,
   handleSetConfigOption,
   handleSetMode,
@@ -44,6 +45,7 @@ import {
   type SessionsListFlags,
   type SessionsNewFlags,
   type SessionsPruneFlags,
+  type SessionsTemplateFlags,
   type StatusFlags,
 } from "./flags.js";
 import { registerProfilesCommand } from "./profiles-command.js";
@@ -115,6 +117,20 @@ export function registerSessionsCommand(
     .description("List saved templates for this agent")
     .action(async function (this: Command, flags: SessionsListFlags) {
       await handleSessionsTemplates(explicitAgentName, flags, this, config);
+    });
+
+  sessionsCommand
+    .command("template")
+    .description("Mark/unmark a session as a reusable template (default: --enable)")
+    .argument(
+      "<id>",
+      "Session id (acpx record id, ACP session id, or unique suffix)",
+      (value: string) => parseNonEmptyValue("Session id", value),
+    )
+    .option("--enable", "Mark the session as a template (also closes it); the default action")
+    .option("--disable", "Clear the template marker (leaves the session closed as-is)")
+    .action(async function (this: Command, id: string, flags: SessionsTemplateFlags) {
+      await handleSessionsTemplate(explicitAgentName, id, flags, this, config);
     });
 
   sessionsCommand

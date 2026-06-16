@@ -89,6 +89,11 @@ export type SessionsCopyFlags = {
   ephemeral?: boolean;
 };
 
+export type SessionsTemplateFlags = {
+  enable?: boolean;
+  disable?: boolean;
+};
+
 export type SessionsHistoryFlags = {
   limit: number;
 };

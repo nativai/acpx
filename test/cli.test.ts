@@ -4620,3 +4620,198 @@ test("sessions new --from-template instantiates a normal open session from a tem
     assert.equal(stored.name, "instance");
   });
 });
+
+// ── CLI template verb: `sessions template <id> --enable|--disable` ───────────
+
+// enable marks + closes, the marker SURVIVES a re-read (guards the
+// privileged-writer requirement — a plain write would read-preserve it away),
+// lists under `templates`, and `--disable` clears it while leaving it closed.
+test("sessions template --enable marks + closes and survives a re-read; --disable clears", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_COMMAND);
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "to-template",
+      acpSessionId: "acp-to-template",
+      agentName: "codex",
+      agentCommand: MOCK_AGENT_COMMAND,
+      cwd,
+      name: "candidate",
+    });
+
+    const enabled = await runCli(
+      ["--format", "json", "codex", "sessions", "template", "to-template", "--enable"],
+      homeDir,
+    );
+    assert.equal(enabled.code, 0, enabled.stderr);
+    const enPayload = JSON.parse(enabled.stdout.trim()) as {
+      action?: unknown;
+      template?: unknown;
+      closed?: unknown;
+    };
+    assert.equal(enPayload.action, "template_enabled");
+    assert.equal(enPayload.template, true);
+    assert.equal(enPayload.closed, true);
+
+    // Re-read from disk: the marker must have PERSISTED (privileged write worked).
+    const stored = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, "to-template"), "utf8"),
+    ) as {
+      template?: { enabled?: unknown; created_at?: unknown; source_session_id?: unknown };
+      closed?: unknown;
+    };
+    assert.equal(stored.template?.enabled, true, "marker survived the re-read");
+    assert.equal(typeof stored.template?.created_at, "string");
+    assert.equal(stored.template?.source_session_id, "acp-to-template");
+    assert.equal(stored.closed, true);
+
+    const listed = await runCli(["--format", "json", "codex", "sessions", "templates"], homeDir);
+    const list = JSON.parse(listed.stdout.trim()) as Array<{ acpxRecordId: string }>;
+    assert.ok(
+      list.some((s) => s.acpxRecordId === "to-template"),
+      "now listed as a template",
+    );
+
+    const disabled = await runCli(
+      ["--format", "json", "codex", "sessions", "template", "to-template", "--disable"],
+      homeDir,
+    );
+    assert.equal(disabled.code, 0, disabled.stderr);
+    const storedAfter = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, "to-template"), "utf8"),
+    ) as { template?: unknown; closed?: unknown };
+    assert.equal(storedAfter.template, undefined, "marker cleared");
+    assert.equal(storedAfter.closed, true, "disable does not reopen");
+
+    const listedAfter = await runCli(
+      ["--format", "json", "codex", "sessions", "templates"],
+      homeDir,
+    );
+    const listAfter = JSON.parse(listedAfter.stdout.trim()) as Array<{ acpxRecordId: string }>;
+    assert.ok(!listAfter.some((s) => s.acpxRecordId === "to-template"), "no longer listed");
+  });
+});
+
+// Default action when neither flag is passed = enable.
+test("sessions template with no flag defaults to enable", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_COMMAND);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "default-on",
+      acpSessionId: "acp-default-on",
+      agentName: "codex",
+      agentCommand: MOCK_AGENT_COMMAND,
+      cwd,
+    });
+
+    const result = await runCli(
+      ["--format", "json", "codex", "sessions", "template", "default-on"],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const stored = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, "default-on"), "utf8"),
+    ) as {
+      template?: { enabled?: unknown };
+      closed?: unknown;
+    };
+    assert.equal(stored.template?.enabled, true);
+    assert.equal(stored.closed, true);
+  });
+});
+
+// --enable + --disable together is a clean error.
+test("sessions template --enable --disable is rejected", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_COMMAND);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "conflict",
+      acpSessionId: "acp-conflict",
+      agentName: "codex",
+      agentCommand: MOCK_AGENT_COMMAND,
+      cwd,
+    });
+
+    const result = await runCli(
+      ["codex", "sessions", "template", "conflict", "--enable", "--disable"],
+      homeDir,
+    );
+    assert.notEqual(result.code, 0);
+    assert.match(`${result.stderr}${result.stdout}`, /mutually exclusive/i);
+  });
+});
+
+// --enable on an already-template is idempotent and preserves the original created_at.
+test("sessions template --enable twice is idempotent and preserves created_at", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_COMMAND);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "twice",
+      acpSessionId: "acp-twice",
+      agentName: "codex",
+      agentCommand: MOCK_AGENT_COMMAND,
+      cwd,
+    });
+
+    const first = await runCli(["codex", "sessions", "template", "twice", "--enable"], homeDir);
+    assert.equal(first.code, 0, first.stderr);
+    const afterFirst = JSON.parse(await fs.readFile(sessionFilePath(homeDir, "twice"), "utf8")) as {
+      template?: { created_at?: unknown };
+    };
+    const createdAt = afterFirst.template?.created_at;
+    assert.equal(typeof createdAt, "string");
+
+    const second = await runCli(["codex", "sessions", "template", "twice", "--enable"], homeDir);
+    assert.equal(second.code, 0, second.stderr);
+    const afterSecond = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, "twice"), "utf8"),
+    ) as {
+      template?: { enabled?: unknown; created_at?: unknown };
+    };
+    assert.equal(afterSecond.template?.enabled, true);
+    assert.equal(afterSecond.template?.created_at, createdAt, "original created_at preserved");
+  });
+});
+
+// --disable on a non-template is a no-op success.
+test("sessions template --disable on a non-template succeeds as a no-op", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_COMMAND);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "plain",
+      acpSessionId: "acp-plain",
+      agentName: "codex",
+      agentCommand: MOCK_AGENT_COMMAND,
+      cwd,
+    });
+
+    const result = await runCli(["codex", "sessions", "template", "plain", "--disable"], homeDir);
+    assert.equal(result.code, 0, result.stderr);
+    const stored = JSON.parse(await fs.readFile(sessionFilePath(homeDir, "plain"), "utf8")) as {
+      template?: unknown;
+    };
+    assert.equal(stored.template, undefined);
+  });
+});
+
+// Unknown id surfaces a clean error.
+test("sessions template on an unknown id errors cleanly", async () => {
+  await withTempHome(async (homeDir) => {
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_COMMAND);
+    const result = await runCli(
+      ["codex", "sessions", "template", "does-not-exist", "--enable"],
+      homeDir,
+    );
+    assert.notEqual(result.code, 0);
+  });
+});
