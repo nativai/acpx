@@ -333,14 +333,22 @@ async function assertExplicitSubscriptionMatchesExistingSession(params: {
   });
 }
 
-// `--reasoning-effort` is claude-only. When it's passed but the effective agent
-// is not claude (explicit codex, or a bare spawn that inherited a non-claude
-// parent), it never writes effort — say so once on stderr (never an error).
+// `--reasoning-effort` applies to the effort-capable Claude agents: `claude`
+// and `claude-pty` (the claude-pty bridge advertises an `effort` config option
+// and acpx applies the requested level to it). When it's passed but the
+// effective agent is not effort-capable (explicit codex, or a bare spawn that
+// inherited a non-claude parent), it never writes effort — say so once on
+// stderr (never an error).
 function warnReasoningEffortIgnoredForNonClaude(
   globalFlags: GlobalFlags,
   effectiveAgentName: string,
 ): void {
-  if (!globalFlags.reasoningEffort || effectiveAgentName === "claude" || globalFlags.jsonStrict) {
+  if (
+    !globalFlags.reasoningEffort ||
+    effectiveAgentName === "claude" ||
+    effectiveAgentName === "claude-pty" ||
+    globalFlags.jsonStrict
+  ) {
     return;
   }
   process.stderr.write(

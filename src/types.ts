@@ -430,6 +430,16 @@ export type SessionAcpxState = {
     /** Profile id selected via `--profile <id>`. Takes priority over `subscription`. */
     profile?: string;
     /**
+     * Requested Claude thinking depth (the `effort` config option), persisted as
+     * the durable end-to-end contract field. Carries the value requested via
+     * `--reasoning-effort` so it survives cold-resume (the claude-pty bridge reads
+     * `session_options.effort` when reconstructing source state from the acpx
+     * record). Kept alongside `acpx.desired_config_options.effort`, which remains
+     * the live-config / reconnect-reapply field. Opaque string (an advertised
+     * effort level), validated at the flag boundary.
+     */
+    effort?: string;
+    /**
      * Breadcrumb recorded when a session's subscription is changed in place
      * (manual switch or auto-failover). Drives the acpx-ui badge/notice and
      * survives restart. `from` is '' / undefined when the prior selection was

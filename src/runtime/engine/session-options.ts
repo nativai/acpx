@@ -13,11 +13,12 @@ export type SessionAgentOptions = {
    * disk. When set, takes priority over `subscription` for auth resolution.
    */
   profile?: string;
-  // Claude thinking depth (the `effort` config option). In-memory only: it is
-  // NOT written to `session_options` on disk — the creation sites persist it as
-  // `acpx.desired_config_options.effort` and apply it live via the config-option
-  // path. Carried forward across turns by mergeSessionOptions so a per-spawn
-  // depth survives a same-session re-create. Opaque string (an advertised effort
+  // Claude thinking depth (the `effort` config option). Persisted to disk as
+  // `session_options.effort` (the durable end-to-end contract field the claude-pty
+  // bridge reads on cold-resume) AND, at the creation sites, as
+  // `acpx.desired_config_options.effort` (live config + reconnect reapply).
+  // Carried forward across turns by mergeSessionOptions so a per-spawn depth
+  // survives a same-session re-create. Opaque string (an advertised effort
   // level), validated at the flag boundary and again against the advertised set.
   reasoningEffort?: string;
 };
@@ -142,6 +143,7 @@ export function sessionOptionsFromRecord(record: SessionRecord): SessionAgentOpt
   );
   assignStoredOption(sessionOptions, "subscription", nonEmptyString(stored.subscription));
   assignStoredOption(sessionOptions, "profile", nonEmptyString(stored.profile));
+  assignStoredOption(sessionOptions, "reasoningEffort", nonEmptyString(stored.effort));
 
   return Object.keys(sessionOptions).length > 0 ? sessionOptions : undefined;
 }
@@ -158,6 +160,7 @@ function persistedSessionOptions(
     system_prompt: normalizeSystemPromptOption(options.systemPrompt),
     subscription: nonEmptyString(options.subscription),
     profile: nonEmptyString(options.profile),
+    effort: nonEmptyString(options.reasoningEffort),
   } satisfies PersistedSessionOptions;
   return hasPersistedSessionOptions(next) ? next : undefined;
 }
@@ -169,7 +172,8 @@ function hasPersistedSessionOptions(options: PersistedSessionOptions): boolean {
     options.max_turns !== undefined ||
     options.system_prompt !== undefined ||
     options.subscription !== undefined ||
-    options.profile !== undefined
+    options.profile !== undefined ||
+    options.effort !== undefined
   );
 }
 

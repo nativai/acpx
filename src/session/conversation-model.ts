@@ -707,6 +707,7 @@ function cloneSessionOptions(
     max_turns: options.max_turns,
     subscription: options.subscription,
     profile: options.profile,
+    effort: options.effort,
     ...(options.system_prompt !== undefined
       ? { system_prompt: cloneSystemPromptOption(options.system_prompt) }
       : {}),
