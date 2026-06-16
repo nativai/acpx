@@ -26,7 +26,7 @@ export function advertisesConfigOption(
 // across model vocabularies. `default` is intentionally not on the scale: when a
 // source value cannot be placed here, fall back to the child model's advertised
 // default/current effort instead of guessing.
-const ORDERED_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+const ORDERED_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max", "ultracode"] as const;
 const EFFORT_LEVEL_RANKS = new Map<string, number>(
   ORDERED_EFFORT_LEVELS.map((level, index) => [level, index]),
 );

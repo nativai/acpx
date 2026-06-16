@@ -616,7 +616,7 @@ const AVAILABLE_MODELS = [
   "sonnet",
   "haiku",
 ];
-const OPUS_EFFORT_LEVELS = ["default", "low", "medium", "high", "xhigh", "max"];
+const OPUS_EFFORT_LEVELS = ["default", "low", "medium", "high", "xhigh", "max", "ultracode"];
 const COMPACT_CLAUDE_EFFORT_LEVELS = ["low", "medium", "high"];
 
 function buildModelsState(currentModelId: string): SessionModelState {
