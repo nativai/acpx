@@ -658,13 +658,13 @@ export function findProfile(id: string, registry: ProfileRegistry): ProfileEntry
 /**
  * Return the valid effort levels for a profile, or null when reasoning is not
  * applicable (used by CLI validation and the `profiles` discovery command).
- * - subscription / claude-home -> Claude set: low/medium/high/xhigh/max/ultracode
+ * - subscription / claude-home -> Claude set: low/medium/high/xhigh/max
  * - openrouter + reasoningSupported -> OR set: minimal/low/medium/high
  * - openrouter without reasoningSupported -> null
  */
 export function getValidEffortsForProfile(profile: ProfileEntry): readonly string[] | null {
   if (profile.authMode === "subscription" || profile.authMode === "claude-home") {
-    return ["low", "medium", "high", "xhigh", "max", "ultracode"];
+    return ["low", "medium", "high", "xhigh", "max"];
   }
   if (profile.authMode === "openrouter" && profile.reasoningSupported) {
     return OPENROUTER_REASONING_EFFORTS;

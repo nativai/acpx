@@ -277,14 +277,7 @@ test("getValidEffortsForProfile: claude-home uses the interactive Claude effort 
     const registry = loadProfileRegistry(ctx.lookupOptions);
     const home1 = registry.profiles.find((p) => p.id === "home1");
     assert.ok(home1);
-    assert.deepEqual(getValidEffortsForProfile(home1), [
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-      "max",
-      "ultracode",
-    ]);
+    assert.deepEqual(getValidEffortsForProfile(home1), ["low", "medium", "high", "xhigh", "max"]);
   });
 });
 

@@ -46,7 +46,7 @@ export type OutputFormat = (typeof OUTPUT_FORMATS)[number];
 // value lands on the record as `acpx.desired_config_options.effort`; creation
 // then maps it onto the child model's advertised/safe `effort` levels before any
 // live config mutation.
-export const REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultracode"] as const;
+export const REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 
 export const PERMISSION_MODES = ["approve-all", "approve-reads", "deny-all"] as const;

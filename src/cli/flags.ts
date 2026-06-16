@@ -383,7 +383,7 @@ export function addGlobalFlags(command: Command): Command {
     .option("--model <id>", "Agent model id")
     .option(
       "--reasoning-effort <level>",
-      "Thinking depth: Claude profiles accept low/medium/high/xhigh/max/ultracode; " +
+      "Thinking depth: Claude profiles accept low/medium/high/xhigh/max; " +
         "OpenRouter profiles with reasoningSupported accept minimal/low/medium/high. " +
         "Overrides the profile's default reasoningEffort. " +
         "Out-of-range values for the active profile are rejected with a clear error. " +

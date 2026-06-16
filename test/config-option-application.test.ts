@@ -12,7 +12,7 @@ import {
 import { getDesiredConfigOptions } from "../src/session/mode-preference.js";
 import type { SessionRecord } from "../src/types.js";
 
-const OPUS_EFFORT_LEVELS = ["default", "low", "medium", "high", "xhigh", "max", "ultracode"];
+const OPUS_EFFORT_LEVELS = ["default", "low", "medium", "high", "xhigh", "max"];
 const SONNET_EFFORT_LEVELS = ["low", "medium", "high"];
 
 function effortOption(currentValue: string, levels = OPUS_EFFORT_LEVELS): SessionConfigOption {
@@ -79,10 +79,6 @@ test("normalizeEffortLevelForAdvertisedOption: child model id overrides stale br
 
 test("normalizeEffortLevelForAdvertisedOption: passes through supported effort levels", () => {
   assert.equal(normalizeEffortLevelForAdvertisedOption("xhigh", effortOption("high")), "xhigh");
-  assert.equal(
-    normalizeEffortLevelForAdvertisedOption("ultracode", effortOption("high")),
-    "ultracode",
-  );
   assert.equal(normalizeEffortLevelForAdvertisedOption("default", effortOption("high")), "default");
   assert.equal(
     normalizeEffortLevelForAdvertisedOption("medium", effortOption("high", SONNET_EFFORT_LEVELS)),
