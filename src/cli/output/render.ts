@@ -1,4 +1,5 @@
 import path from "node:path";
+import { resolveAcpxUiBaseUrl } from "../../acp/auth-env.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
 import type { AgentSessionListResult, OutputFormat, SessionRecord } from "../../types.js";
 import { probeQueueOwnerHealth } from "../queue/ipc.js";
@@ -6,6 +7,13 @@ import { emitJsonResult } from "./json-output.js";
 
 function formatSessionLabel(record: SessionRecord): string {
   return record.name ?? "cwd";
+}
+
+// The created child's own acpx-ui URL (this box's base + ?session=<id>) — so a
+// spawning agent gets the child's address directly. Reuses the box-base resolver
+// the rest of the CLI uses (env override → namespace-derived → devbox default).
+function composeSessionUrl(record: SessionRecord): string {
+  return `${resolveAcpxUiBaseUrl(process.env)}/?session=${record.acpxRecordId}`;
 }
 
 function formatRoutedFrom(sessionCwd: string, currentCwd: string): string | undefined {
@@ -150,6 +158,7 @@ export function printNewSessionByFormat(
       agentSessionId: record.agentSessionId,
       name: record.name,
       replacedSessionId: replaced?.acpxRecordId,
+      sessionUrl: composeSessionUrl(record),
     })
   ) {
     return;
@@ -185,6 +194,7 @@ export function printCopiedSessionByFormat(
       forkedFromSessionId: record.forkedFromSessionId,
       forkedAtMessageIndex: record.forkedAtMessageIndex,
       ephemeral: record.metadata?.byway === "1",
+      sessionUrl: composeSessionUrl(record),
     })
   ) {
     return;
@@ -301,6 +311,7 @@ export function printCreatedSessionBanner(
   process.stderr.write(`[acpx] created session ${label} (${record.acpxRecordId})\n`);
   process.stderr.write(`[acpx] agent: ${agentName}\n`);
   process.stderr.write(`[acpx] cwd: ${record.cwd}\n`);
+  process.stderr.write(`[acpx] url: ${composeSessionUrl(record)}\n`);
 }
 
 function formatBytes(bytes: number): string {

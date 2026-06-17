@@ -4621,6 +4621,374 @@ test("sessions new --from-template instantiates a normal open session from a tem
   });
 });
 
+// ── GAP 1: parent-edge on the copy/template/fork path (both edges) ────────────
+// A template/fork child must record BOTH its spawn-parent (parentSessionId/Url,
+// from --parent-* flags or the ACPX_SESSION_URL env fallback) AND its template
+// /fork origin (forkedFromSessionId). With no parent context the record is
+// byte-identical to today (parent fields omitted).
+
+test("sessions new --from-template records the env-fallback parent AND the template origin (both edges + task_folder inherit)", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_WITH_FORK_SESSION);
+
+    // A real local parent so its task_folder is inheritable (matches plain-`new`).
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "parent-s",
+      acpSessionId: "acp-parent-s",
+      agentName: "codex",
+      agentCommand: MOCK_AGENT_WITH_FORK_SESSION,
+      cwd,
+      name: "spawner",
+      metadata: { task_folder: "/wisdom/task-x" },
+    });
+    await writeRecordWithTemplate(
+      homeDir,
+      {
+        acpxRecordId: "tmpl-src",
+        acpSessionId: "acp-tmpl-src",
+        agentName: "codex",
+        agentCommand: MOCK_AGENT_WITH_FORK_SESSION,
+        cwd,
+        name: "blueprint",
+        closed: true,
+      },
+      { enabled: true, created_at: "2026-06-01T05:00:00.000Z" },
+    );
+
+    const parentUrl = "https://test-ui.example/?session=parent-s";
+    const result = await runCli(
+      ["--format", "json", "codex", "sessions", "new", "--from-template", "tmpl-src"],
+      homeDir,
+      { env: { ACPX_SESSION_URL: parentUrl } },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const payload = JSON.parse(result.stdout.trim()) as { acpxRecordId?: unknown };
+    const childId = String(payload.acpxRecordId);
+
+    const stored = JSON.parse(await fs.readFile(sessionFilePath(homeDir, childId), "utf8")) as {
+      parent_session_id?: unknown;
+      forked_from_session_id?: unknown;
+      template?: unknown;
+      metadata?: Record<string, unknown>;
+    };
+    // Both persisted edges present: the spawn-parent (parent_session_id) AND the
+    // template origin (forked_from_session_id). (parentSessionUrl is a runtime
+    // sessionContext hint for cross-box adapter lineage, not a persisted record
+    // field — serialize.ts persists only parent_session_id, which is what the
+    // acpx-ui relations graph keys on.)
+    assert.equal(stored.parent_session_id, "parent-s");
+    assert.equal(stored.forked_from_session_id, "tmpl-src");
+    // The instantiated session is itself a normal session, not a template.
+    assert.equal(stored.template, undefined);
+    // task_folder inherited from the spawner (matches plain-`new`).
+    assert.equal(stored.metadata?.task_folder, "/wisdom/task-x");
+  });
+});
+
+test("sessions copy records an explicit --parent-session-url / --parent-id parent (both edges)", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_WITH_FORK_SESSION);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "source-x",
+      acpSessionId: "acp-source-x",
+      agentName: "codex",
+      agentCommand: MOCK_AGENT_WITH_FORK_SESSION,
+      cwd,
+      name: "source",
+    });
+
+    // (1) --parent-session-url
+    const byUrl = await runCli(
+      [
+        "--format",
+        "json",
+        "codex",
+        "sessions",
+        "copy",
+        "--from",
+        "source-x",
+        "--parent-session-url",
+        "https://test-ui.example/?session=spawner-u",
+      ],
+      homeDir,
+    );
+    assert.equal(byUrl.code, 0, byUrl.stderr);
+    const urlChild = String(
+      (JSON.parse(byUrl.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const urlStored = JSON.parse(await fs.readFile(sessionFilePath(homeDir, urlChild), "utf8")) as {
+      parent_session_id?: unknown;
+      forked_from_session_id?: unknown;
+    };
+    // --parent-session-url resolves the UUID from ?session= and records it as the
+    // parent edge (the URL itself is a runtime-only cross-box lineage hint, not a
+    // persisted record field).
+    assert.equal(urlStored.parent_session_id, "spawner-u");
+    assert.equal(urlStored.forked_from_session_id, "source-x");
+
+    // (2) --parent-id (same-box; no url recorded, derived downstream)
+    const byId = await runCli(
+      [
+        "--format",
+        "json",
+        "codex",
+        "sessions",
+        "copy",
+        "--from",
+        "source-x",
+        "--parent-id",
+        "source-x",
+      ],
+      homeDir,
+    );
+    assert.equal(byId.code, 0, byId.stderr);
+    const idChild = String(
+      (JSON.parse(byId.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const idStored = JSON.parse(await fs.readFile(sessionFilePath(homeDir, idChild), "utf8")) as {
+      parent_session_id?: unknown;
+      forked_from_session_id?: unknown;
+    };
+    assert.equal(idStored.parent_session_id, "source-x");
+    assert.equal(idStored.forked_from_session_id, "source-x");
+  });
+});
+
+test("sessions copy with NO parent context omits parent fields (fork regression — byte-identical)", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_WITH_FORK_SESSION);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "source-noparent",
+      acpSessionId: "acp-source-noparent",
+      agentName: "codex",
+      agentCommand: MOCK_AGENT_WITH_FORK_SESSION,
+      cwd,
+      name: "source",
+    });
+
+    // No --parent-* flag and ACPX_SESSION_URL is stripped by runCli → no parent.
+    const result = await runCli(
+      ["--format", "json", "codex", "sessions", "copy", "--from", "source-noparent"],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const childId = String(
+      (JSON.parse(result.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const onDisk = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, childId), "utf8"),
+    ) as Record<string, unknown>;
+    // Parent fields must be entirely absent (omitted, not null) — same shape as today.
+    assert.equal(Object.prototype.hasOwnProperty.call(onDisk, "parent_session_id"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(onDisk, "parent_session_url"), false);
+    assert.equal(onDisk["forked_from_session_id"], "source-noparent");
+  });
+});
+
+test("sessions copy --ephemeral inside a session stamps byway AND carries the parent edge (byway markers intact)", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_WITH_FORK_SESSION);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "source-byway",
+      acpSessionId: "acp-source-byway",
+      agentName: "codex",
+      agentCommand: MOCK_AGENT_WITH_FORK_SESSION,
+      cwd,
+      name: "source",
+    });
+
+    const result = await runCli(
+      ["--format", "json", "codex", "sessions", "copy", "--from", "source-byway", "--ephemeral"],
+      homeDir,
+      { env: { ACPX_SESSION_URL: "https://test-ui.example/?session=spawner-b" } },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const childId = String(
+      (JSON.parse(result.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const stored = JSON.parse(await fs.readFile(sessionFilePath(homeDir, childId), "utf8")) as {
+      parent_session_id?: unknown;
+      metadata?: Record<string, unknown>;
+    };
+    // byway markers must still be present so acpx-ui's `kind!=='byway'` graph
+    // guard keeps the copy out of the relations graph even though it now carries
+    // a parent edge.
+    assert.equal(stored.metadata?.byway, "1");
+    assert.equal(stored.metadata?.byway_parent, "source-byway");
+    assert.equal(stored.parent_session_id, "spawner-b");
+  });
+});
+
+// ── #3: template params as defaults, explicit --model/--reasoning-effort wins ─
+
+test("sessions new --from-template uses template params by default and lets explicit flags override", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const claudeCommand = `${MOCK_AGENT_COMMAND} --claude-agent-acp --advertise-models --advertise-config-options --supports-fork-session`;
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify({ agents: { claude: { command: claudeCommand } } }, null, 2)}\n`,
+      "utf8",
+    );
+
+    // Template baked with model=opus[1m], effort=high.
+    await writeRecordWithTemplate(
+      homeDir,
+      {
+        acpxRecordId: "tmpl-params",
+        acpSessionId: "acp-tmpl-params",
+        agentName: "claude",
+        agentCommand: claudeCommand,
+        cwd,
+        name: "blueprint",
+        closed: true,
+        acpx: {
+          session_options: { model: "opus[1m]" },
+          desired_config_options: { effort: "high" },
+        },
+      },
+      { enabled: true, created_at: "2026-06-01T05:00:00.000Z" },
+    );
+
+    // (a) No flags → template defaults.
+    const defaults = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--format",
+        "json",
+        "claude",
+        "sessions",
+        "new",
+        "--from-template",
+        "tmpl-params",
+      ],
+      homeDir,
+    );
+    assert.equal(defaults.code, 0, defaults.stderr);
+    const defChild = String(
+      (JSON.parse(defaults.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const defStored = JSON.parse(await fs.readFile(sessionFilePath(homeDir, defChild), "utf8")) as {
+      acpx?: {
+        session_options?: { model?: unknown };
+        desired_config_options?: { effort?: unknown };
+      };
+    };
+    assert.equal(defStored.acpx?.session_options?.model, "opus[1m]");
+    assert.equal(defStored.acpx?.desired_config_options?.effort, "high");
+
+    // (b) Explicit --model/--reasoning-effort override the template values.
+    const overridden = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--format",
+        "json",
+        "--model",
+        "sonnet",
+        "--reasoning-effort",
+        "low",
+        "claude",
+        "sessions",
+        "new",
+        "--from-template",
+        "tmpl-params",
+      ],
+      homeDir,
+    );
+    assert.equal(overridden.code, 0, overridden.stderr);
+    const ovChild = String(
+      (JSON.parse(overridden.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const ovStored = JSON.parse(await fs.readFile(sessionFilePath(homeDir, ovChild), "utf8")) as {
+      acpx?: {
+        session_options?: { model?: unknown };
+        desired_config_options?: { effort?: unknown };
+        config_options?: Array<{ id?: unknown; currentValue?: unknown }>;
+      };
+    };
+    assert.equal(ovStored.acpx?.session_options?.model, "sonnet");
+    assert.equal(ovStored.acpx?.desired_config_options?.effort, "low");
+    // The override reaches the downstream apply path (advertised config option).
+    const effortOption = ovStored.acpx?.config_options?.find((o) => o.id === "effort");
+    assert.equal(effortOption?.currentValue, "low");
+  });
+});
+
+// ── #4: create ops return the child's acpx-ui URL (stderr banner + JSON) ──────
+
+test("create ops emit the acpx-ui URL on stderr banner + JSON without changing stdout's id token", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_WITH_FORK_SESSION);
+    const uiEnv = { ACPX_UI_BASE_URL: "https://test-ui.example" };
+
+    // sessions new — default format: id-only on stdout, url on stderr banner.
+    const created = await runCli(["--cwd", cwd, "codex", "sessions", "new", "-s", "n1"], homeDir, {
+      env: uiEnv,
+    });
+    assert.equal(created.code, 0, created.stderr);
+    const newId = created.stdout.trim();
+    assert.match(newId, /^[0-9a-f-]{36}$/, "stdout first token is the bare id");
+    assert.match(
+      created.stderr,
+      new RegExp(`\\[acpx\\] url: https://test-ui\\.example/\\?session=${newId}`),
+    );
+
+    // sessions new --format json: additive sessionUrl field.
+    const createdJson = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "new", "-s", "n2"],
+      homeDir,
+      { env: uiEnv },
+    );
+    assert.equal(createdJson.code, 0, createdJson.stderr);
+    const newPayload = JSON.parse(createdJson.stdout.trim()) as {
+      acpxRecordId?: unknown;
+      sessionUrl?: unknown;
+    };
+    assert.equal(
+      newPayload.sessionUrl,
+      `https://test-ui.example/?session=${String(newPayload.acpxRecordId)}`,
+    );
+
+    // sessions copy --format json: additive sessionUrl field.
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "src-url",
+      acpSessionId: "acp-src-url",
+      agentName: "codex",
+      agentCommand: MOCK_AGENT_WITH_FORK_SESSION,
+      cwd,
+      name: "src",
+    });
+    const copied = await runCli(
+      ["--format", "json", "codex", "sessions", "copy", "--from", "src-url"],
+      homeDir,
+      { env: uiEnv },
+    );
+    assert.equal(copied.code, 0, copied.stderr);
+    const copyPayload = JSON.parse(copied.stdout.trim()) as {
+      acpxRecordId?: unknown;
+      sessionUrl?: unknown;
+    };
+    assert.equal(
+      copyPayload.sessionUrl,
+      `https://test-ui.example/?session=${String(copyPayload.acpxRecordId)}`,
+    );
+  });
+});
+
 // ── CLI template verb: `sessions template <id> --enable|--disable` ───────────
 
 // enable marks + closes, the marker SURVIVES a re-read (guards the

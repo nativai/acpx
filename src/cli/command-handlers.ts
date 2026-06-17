@@ -390,8 +390,13 @@ async function resolvePermissionPolicyFromFlags(
 // --parent-id has no url (same-box, derived from the local base url downstream).
 type ParentSessionRef = { id: string; url?: string; fromUrlFlag: boolean };
 
+// The minimal flag shape the parent resolver reads. Both `SessionsNewFlags` and
+// `SessionsCopyFlags` carry `--parent-session-url`/`--parent-id`, so the shared
+// resolver accepts either (used by plain `new` and by the copy/template path).
+type ParentFlagSource = { parentSessionUrl?: string; parentId?: string };
+
 function resolveParentSessionRefFromFlagOrEnv(
-  flags: SessionsNewFlags,
+  flags: ParentFlagSource,
 ): ParentSessionRef | undefined {
   // --parent-session-url <url> wins over --parent-id <uuid>; both override env.
   const flagUrl = flags.parentSessionUrl?.trim();
@@ -446,7 +451,7 @@ function parentInheritableFields(parent: SessionRecord): ResolvedParentSession {
 }
 
 async function resolveAndValidateParentSessionId(
-  flags: SessionsNewFlags,
+  flags: ParentFlagSource,
 ): Promise<ResolvedParentSession | undefined> {
   const ref = resolveParentSessionRefFromFlagOrEnv(flags);
   if (!ref) {
@@ -629,6 +634,51 @@ function sourceSessionOptions(source: SessionRecord) {
 function sourceDesiredConfigOptions(source: SessionRecord): Record<string, string> | undefined {
   const desired = getDesiredConfigOptions(source.acpx);
   return Object.keys(desired).length > 0 ? desired : undefined;
+}
+
+// #3 — template params as defaults, explicit flag overrides. Precedence:
+// explicit `--model`/`--reasoning-effort` > template/source value > box default.
+// Layers the explicit global flag over the source's baked-in value via the same
+// pure helpers plain-`new` uses for parent inheritance ("child" = explicit copy
+// flag, "inherit" = template value). Same-agent is guaranteed on the copy path
+// (assertCopyAgentLock), so no cross-agent gating is needed. When neither the
+// flag nor the source sets a field it is omitted → falls to the box default, and
+// with no explicit flag the result is byte-identical to `sourceSessionOptions`.
+function copySessionOptionsWithOverride(
+  source: SessionRecord,
+  globalFlags: GlobalFlags,
+): ReturnType<typeof sourceSessionOptions> {
+  const base = sourceSessionOptions(source);
+  const model = withInheritedModel(globalFlags.model, base?.model);
+  const reasoningEffort = withInheritedReasoningEffort(
+    globalFlags.reasoningEffort,
+    base?.reasoningEffort,
+  );
+  const merged = { ...base };
+  if (model !== undefined) {
+    merged.model = model;
+  }
+  if (reasoningEffort !== undefined) {
+    merged.reasoningEffort = reasoningEffort;
+  }
+  return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+// Mirror of the above for `desiredConfigOptions` — the persisted desired effort
+// that the downstream apply path reads. Explicit `--reasoning-effort` wins over
+// the template's baked-in effort; byte-identical to `sourceDesiredConfigOptions`
+// when no flag is passed.
+function copyDesiredConfigOptionsWithOverride(
+  source: SessionRecord,
+  globalFlags: GlobalFlags,
+): Record<string, string> | undefined {
+  const base = sourceDesiredConfigOptions(source);
+  const effort = withInheritedReasoningEffort(globalFlags.reasoningEffort, base?.effort);
+  const merged = { ...base };
+  if (effort !== undefined) {
+    merged.effort = effort;
+  }
+  return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
 function assertCopyableSource(source: SessionRecord): void {
@@ -1486,7 +1536,13 @@ export async function handleSessionsNew(
   if (flags.fromTemplate !== undefined) {
     await runSessionCopy(
       explicitAgentName,
-      { from: flags.fromTemplate, name: flags.name, metadata: flags.metadata },
+      {
+        from: flags.fromTemplate,
+        name: flags.name,
+        metadata: flags.metadata,
+        parentId: flags.parentId,
+        parentSessionUrl: flags.parentSessionUrl,
+      },
       command,
       config,
       true,
@@ -1583,6 +1639,13 @@ async function runSessionCopy(
   const forkAtMessageIndex = resolveForkAtMessageIndex(source, flags.atIndex);
   assertCopyAgentLock({ explicitAgentName, globalFlags, pathAgent, source, config });
 
+  // GAP 1 — resolve the spawn parent the same way plain-`new` does (flag →
+  // flag → ACPX_SESSION_URL env fallback). The copy/template/fork child then
+  // carries BOTH its spawn-parent edge (parentSessionId/Url) AND its template
+  // /fork origin (forkFromSessionId) — the "both edges" write. With no parent
+  // context the `?.` guards omit both fields → byte-identical to today.
+  const parent = await resolveAndValidateParentSessionId(flags);
+
   const [{ createSession }, { printCopiedSessionByFormat, printCreatedSessionBanner }] =
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
   const created = await createSession({
@@ -1590,7 +1653,12 @@ async function runSessionCopy(
     agentName: source.agentName ?? resolveAgentNameFromCommand(source.agentCommand, config.agents),
     cwd: resolveCopyDestinationCwd(command, globalFlags, source),
     name: flags.name ?? sourceDefaultForkName(source),
-    metadata: copyMetadata(flags, source, forkAtMessageIndex),
+    metadata: withInheritedTaskFolder(
+      copyMetadata(flags, source, forkAtMessageIndex),
+      parent?.taskFolder,
+    ),
+    parentSessionId: parent?.acpxRecordId,
+    parentSessionUrl: parent?.sessionUrl,
     forkFromSessionId: source.acpxRecordId,
     forkAtMessageIndex: flags.atIndex,
     mcpServers: config.mcpServers,
@@ -1602,8 +1670,8 @@ async function runSessionCopy(
     terminal: globalFlags.terminal,
     timeoutMs: globalFlags.timeout,
     verbose: globalFlags.verbose,
-    sessionOptions: sourceSessionOptions(source),
-    desiredConfigOptions: sourceDesiredConfigOptions(source),
+    sessionOptions: copySessionOptionsWithOverride(source, globalFlags),
+    desiredConfigOptions: copyDesiredConfigOptionsWithOverride(source, globalFlags),
   });
   const sourceType = agentTypeLabel(source.agentCommand, config);
   printCreatedSessionBanner(created, sourceType, globalFlags.format, globalFlags.jsonStrict);

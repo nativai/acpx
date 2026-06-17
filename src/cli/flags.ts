@@ -85,6 +85,8 @@ export type SessionsCopyFlags = {
   from: string;
   atIndex?: number;
   name?: string;
+  parentId?: string;
+  parentSessionUrl?: string;
   metadata?: Record<string, string>;
   ephemeral?: boolean;
 };

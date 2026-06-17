@@ -216,6 +216,16 @@ export function registerSessionsCommand(
     )
     .option("-s, --name <name>", "Name for the copied session", parseSessionName)
     .option(
+      "--parent-session-url <url>",
+      "Record the spawning session's acpx-ui URL as parent (UUID parsed from ?session=; falls back to ACPX_SESSION_URL env). Roots the copy/fork under its spawner in addition to its fork origin.",
+      (value: string) => parseNonEmptyValue("Parent session URL", value),
+    )
+    .option(
+      "--parent-id <uuid>",
+      "Record the spawning session's acpxRecordId as parent_session_id (falls back to ACPX_SESSION_URL env). Use --parent-session-url for the URL form.",
+      (value: string) => parseNonEmptyValue("Parent session id", value),
+    )
+    .option(
       "--metadata <key=value>",
       "Set a metadata entry on the copied session (repeatable)",
       parseMetadataEntry,
