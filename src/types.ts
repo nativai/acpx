@@ -554,6 +554,9 @@ export type SessionRecord = {
   acpx?: SessionAcpxState;
   kind?: "session" | "subagent";
   parentSessionId?: string;
+  /** Full parent acpx-ui URL (host+id) for cross-machine lineage. Set at spawn when the
+   * parent was identified by URL (flag/env); absent for bare same-box --parent-id. (W11-22) */
+  parentSessionUrl?: string;
   forkedFromSessionId?: string;
   forkedAtMessageIndex?: number;
   subagents?: SubagentRef[];

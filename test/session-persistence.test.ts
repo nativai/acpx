@@ -78,6 +78,65 @@ test("listSessions preserves favorite and favoritedAt", async () => {
   });
 });
 
+test("W11-22: listSessions round-trips parentSessionUrl (cross-machine lineage)", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "remote-parent-child",
+        acpSessionId: "remote-parent-child",
+        agentCommand: "agent-a",
+        cwd,
+        kind: "session",
+        parentSessionId: "11111111-2222-3333-4444-555555555555",
+        parentSessionUrl:
+          "https://acpx.otherbox.nativai.de/?session=11111111-2222-3333-4444-555555555555",
+      }),
+    );
+
+    const sessions = await session.listSessions();
+    const record = sessions.find((entry) => entry.acpxRecordId === "remote-parent-child");
+    assert.ok(record);
+    assert.equal(
+      record.parentSessionUrl,
+      "https://acpx.otherbox.nativai.de/?session=11111111-2222-3333-4444-555555555555",
+    );
+
+    const onDisk = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, "remote-parent-child"), "utf8"),
+    ) as Record<string, unknown>;
+    assert.equal(
+      onDisk.parent_session_url,
+      "https://acpx.otherbox.nativai.de/?session=11111111-2222-3333-4444-555555555555",
+    );
+  });
+});
+
+test("W11-22: parent_session_url is omitted on disk when unset (same-box parent)", () => {
+  // serializeSessionRecordForDisk leaves the key undefined; JSON.stringify then
+  // drops it from the written file (same pattern as parent_session_id et al).
+  const onDisk = JSON.parse(
+    JSON.stringify(
+      serializeSessionRecordForDisk(
+        makeSessionRecord({
+          acpxRecordId: "local-parent-child",
+          acpSessionId: "local-parent-child",
+          agentCommand: "agent-a",
+          cwd: "/tmp/local-parent-child",
+          kind: "session",
+          parentSessionId: "local-parent",
+        }),
+      ),
+    ),
+  ) as Record<string, unknown>;
+
+  assert.equal(onDisk.parent_session_id, "local-parent");
+  assert.ok(!("parent_session_url" in onDisk));
+});
+
 test("listSessions omits favorite/favorited_at when unset (no schema noise)", async () => {
   await withTempHome(async (homeDir) => {
     const session = await loadSessionModule();

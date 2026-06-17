@@ -129,7 +129,14 @@ async function createSessionRecordWithClient(
         }
       : {}),
     ...(options.parentSessionId
-      ? { kind: "session" as const, parentSessionId: options.parentSessionId }
+      ? {
+          kind: "session" as const,
+          parentSessionId: options.parentSessionId,
+          // W11-22: persist the full parent URL when the parent was identified by
+          // URL (flag/env) so the tree view can link a cross-machine parent to its
+          // real host. Absent for bare same-box --parent-id.
+          ...(options.parentSessionUrl ? { parentSessionUrl: options.parentSessionUrl } : {}),
+        }
       : {}),
     ...(options.metadata && Object.keys(options.metadata).length > 0
       ? { metadata: { ...options.metadata } }
