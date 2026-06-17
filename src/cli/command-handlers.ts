@@ -1539,7 +1539,12 @@ export async function handleSessionsNew(
       {
         from: flags.fromTemplate,
         name: flags.name,
-        metadata: flags.metadata,
+        // Mark this child as a template-spawn (vs a plain fork): a normal
+        // `sessions copy`/`fork` writes the same parent_session_id +
+        // forked_from_session_id, so the board needs an explicit discriminator
+        // to place it under its creator with a "from template" provenance badge.
+        // Only the --from-template path sets it; plain copy/fork never does.
+        metadata: { ...flags.metadata, template_source: flags.fromTemplate },
         parentId: flags.parentId,
         parentSessionUrl: flags.parentSessionUrl,
       },

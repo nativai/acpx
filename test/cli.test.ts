@@ -4684,6 +4684,10 @@ test("sessions new --from-template records the env-fallback parent AND the templ
     assert.equal(stored.template, undefined);
     // task_folder inherited from the spawner (matches plain-`new`).
     assert.equal(stored.metadata?.task_folder, "/wisdom/task-x");
+    // Template-spawn discriminator: lets the board place this under its creator
+    // with a "from template" badge, distinct from a plain fork (which has the
+    // same parent_session_id + forked_from_session_id but NO template_source).
+    assert.equal(stored.metadata?.template_source, "tmpl-src");
   });
 });
 
@@ -4788,6 +4792,9 @@ test("sessions copy with NO parent context omits parent fields (fork regression 
     assert.equal(Object.prototype.hasOwnProperty.call(onDisk, "parent_session_id"), false);
     assert.equal(Object.prototype.hasOwnProperty.call(onDisk, "parent_session_url"), false);
     assert.equal(onDisk["forked_from_session_id"], "source-noparent");
+    // A plain copy/fork must NOT carry the template-spawn discriminator.
+    const meta = (onDisk["metadata"] ?? {}) as Record<string, unknown>;
+    assert.equal(Object.prototype.hasOwnProperty.call(meta, "template_source"), false);
   });
 });
 
