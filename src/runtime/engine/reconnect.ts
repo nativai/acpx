@@ -253,18 +253,52 @@ async function replayDesiredConfigOptions(params: {
         );
       }
     } catch (error) {
-      throw new SessionConfigOptionReplayError(
-        `Failed to replay saved session config option ${configId} on fresh ACP session ${params.sessionId}: ${formatErrorMessage(error)}`,
-        {
-          cause: error instanceof Error ? error : undefined,
-          retryable: true,
-        },
-      );
+      // A returning call means a non-fatal effort rejection — proceed with the
+      // turn; any other failure rethrows. See handleConfigOptionReplayError.
+      handleConfigOptionReplayError({
+        configId,
+        error,
+        sessionId: params.sessionId,
+        verbose: params.verbose,
+      });
     }
   }
   for (const [configId, value] of normalizedDesiredConfigOptions) {
     setDesiredConfigOption(params.record, configId, value);
   }
+}
+
+// Decide how a config-option replay failure is handled. Effort is a best-effort
+// preference, never a turn-blocker: some models (e.g. haiku) advertise an
+// `effort` option at session/new yet have the adapter REJECT mutating it
+// (`Unknown config option: effort`), so a persisted/inherited effort cannot be
+// replayed onto the fresh ACP session. The creation path already absorbs this via
+// setConfigOptionWithEffortFallback ("layer on top, never break"); mirror it here
+// so replay can't lose the turn. Returns (caller proceeds with the turn) only for
+// `effort` AND only when the agent actually returned a rejection (an ACP error
+// payload). Transport failures (timeout/interrupt — no ACP payload) and every
+// other config option rethrow fatally/retryably exactly as before.
+function handleConfigOptionReplayError(params: {
+  configId: string;
+  error: unknown;
+  sessionId: string;
+  verbose?: boolean;
+}): void {
+  if (params.configId === "effort" && extractAcpError(params.error)) {
+    if (params.verbose) {
+      process.stderr.write(
+        `[acpx] effort replay rejected by the agent on fresh ACP session ${params.sessionId} (${formatErrorMessage(params.error)}); continuing without it\n`,
+      );
+    }
+    return;
+  }
+  throw new SessionConfigOptionReplayError(
+    `Failed to replay saved session config option ${params.configId} on fresh ACP session ${params.sessionId}: ${formatErrorMessage(params.error)}`,
+    {
+      cause: params.error instanceof Error ? params.error : undefined,
+      retryable: true,
+    },
+  );
 }
 
 function replayConfigOptionValue(
