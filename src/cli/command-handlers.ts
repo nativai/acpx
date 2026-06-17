@@ -70,6 +70,7 @@ import {
   type SessionsTemplateFlags,
   type StatusFlags,
 } from "./flags.js";
+import { formatIdleDuration } from "./idle-duration.js";
 import { emitJsonResult } from "./output/json-output.js";
 import type { SessionListResult } from "./session/contracts.js";
 import {
@@ -1919,7 +1920,8 @@ function conversationHistoryEntries(record: SessionRecord): Array<{
 
 function printSessionDetailsByFormat(record: SessionRecord, format: OutputFormat): void {
   if (format === "json") {
-    process.stdout.write(`${JSON.stringify(record)}\n`);
+    const idleFor = formatIdleDuration(record.lastUsedAt, Date.now());
+    process.stdout.write(`${JSON.stringify({ ...record, idleFor })}\n`);
     return;
   }
   if (format === "quiet") {
@@ -1941,6 +1943,7 @@ function sessionDetailsLines(record: SessionRecord): string[] {
     `name: ${displayValue(record.name)}`,
     `created: ${record.createdAt}`,
     `lastActivity: ${record.lastUsedAt}`,
+    `idleFor: ${displayValue(formatIdleDuration(record.lastUsedAt, Date.now()))}`,
     `lastPrompt: ${displayValue(record.lastPromptAt)}`,
     `closed: ${record.closed ? "yes" : "no"}`,
     `closedAt: ${displayValue(record.closedAt)}`,
