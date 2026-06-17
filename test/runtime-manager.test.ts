@@ -2726,6 +2726,7 @@ test("AcpRuntimeManager forwards sessionOptions to createClient on fresh session
     system_prompt: "Be terse.",
     subscription: undefined,
     profile: undefined,
+    effort: undefined,
   });
 });
 
@@ -2798,6 +2799,7 @@ test("AcpRuntimeManager persists sessionOptions { append } and model/allowedTool
     system_prompt: { append: "Also review tests." },
     subscription: undefined,
     profile: undefined,
+    effort: undefined,
   });
 });
 
@@ -2818,6 +2820,7 @@ test("persistSessionOptions preserves an explicit empty allowedTools list", () =
     system_prompt: undefined,
     subscription: undefined,
     profile: undefined,
+    effort: undefined,
   });
 });
 

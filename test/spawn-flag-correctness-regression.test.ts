@@ -27,6 +27,11 @@ import { fileURLToPath } from "node:url";
 import { buildAgentSpawnOptions } from "../src/acp/client.js";
 import { resetKnownDeadSubs } from "../src/config/known-dead-subscriptions.js";
 import type { SubscriptionLookupOptions } from "../src/config/subscriptions.js";
+import { connectAndLoadSession } from "../src/runtime/engine/reconnect.js";
+import {
+  makeSessionRecord,
+  withTempHome as withReconnectTempHome,
+} from "./runtime-test-helpers.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
@@ -359,3 +364,141 @@ for (const site of PROFILE_THREADING_SITES) {
     );
   });
 }
+
+// ---------------------------------------------------------------------------
+// HAIKU-FIX lock (sibling defect, fix 9bae3c7 in src/runtime/engine/reconnect.ts;
+// task bugs/haiku-effort-replay-loses-first-turn). A fresh `--model haiku` spawn
+// deterministically LOST its first turn: the deployed adapter advertises an
+// `effort` option at session/new for haiku yet REJECTS set_config_option(effort)
+// for it, so replaying the persisted/inherited effort (added by BUG2 fix 2ff3498)
+// on the fresh ACP session threw a fatal SessionConfigOptionReplayError. The fix
+// makes that replay NON-FATAL — but ONLY for `effort` AND only on a genuine ACP
+// rejection (extractAcpError payload); every other config option, and an effort
+// transport failure (no ACP payload), still throws fatally.
+//
+// These drive the REAL reconnect path connectAndLoadSession →
+// replayDesiredConfigOptions → handleConfigOptionReplayError with a mock client
+// (the handler is module-private; this locks it through its exported entrypoint).
+// BEHAVIORAL signal: the reconnect RESOLVES (turn proceeds) vs REJECTS (turn lost).
+// ---------------------------------------------------------------------------
+
+const RECONNECT_ACTIVE_CONTROLLER = {
+  hasActivePrompt: () => false,
+  requestCancelActivePrompt: async () => false,
+  setSessionMode: async () => {},
+  setSessionModel: async () => {},
+  setSessionConfigOption: async () => ({ configOptions: [] }),
+};
+
+// A fresh-session reconnect: the stale session is gone (load → -32002 not found),
+// so connectAndLoadSession creates a fresh session and replays desired config
+// options onto it via setSessionConfigOption — whose behavior we inject per test.
+function makeReconnectClient(
+  setSessionConfigOption: (sessionId: string, configId: string, value: string) => Promise<unknown>,
+) {
+  return {
+    hasReusableSession: () => false,
+    start: async () => {},
+    getAgentLifecycleSnapshot: () => ({ running: true }),
+    supportsLoadSession: () => true,
+    supportsResumeSession: () => false,
+    loadSessionWithOptions: async () => {
+      throw { error: { code: -32002, message: "session not found" } };
+    },
+    createSession: async () => ({ sessionId: "fresh-session", agentSessionId: "fresh-runtime" }),
+    setSessionMode: async () => {},
+    setSessionModel: async () => {},
+    setSessionConfigOption,
+  };
+}
+
+test("HAIKU-fix: effort replay rejected by the adapter (ACP error) is NON-FATAL — first turn proceeds", async () => {
+  await withReconnectTempHome("acpx-haikufix-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = makeSessionRecord({
+      acpxRecordId: "haiku-effort-record",
+      acpSessionId: "stale-session",
+      agentCommand: "agent",
+      cwd,
+      acpx: { desired_config_options: { effort: "high" } },
+    });
+    let attempted = false;
+    const client = makeReconnectClient(async (_sessionId, configId) => {
+      attempted = true;
+      assert.equal(configId, "effort");
+      // mirrors deployed haiku: adapter rejects the effort mutation (-32603)
+      throw { error: { code: -32603, message: "Unknown config option: effort" } };
+    });
+    // Resolves (does NOT throw) → the first turn is NOT lost.
+    const result = await connectAndLoadSession({
+      client: client as never,
+      record,
+      activeController: RECONNECT_ACTIVE_CONTROLLER as never,
+    });
+    assert.equal(attempted, true, "effort replay must have been attempted");
+    assert.equal(result.sessionId, "fresh-session");
+  });
+});
+
+test("HAIKU-fix scope guard: a NON-effort config option rejection still throws fatally", async () => {
+  await withReconnectTempHome("acpx-haikufix-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = makeSessionRecord({
+      acpxRecordId: "other-config-record",
+      acpSessionId: "stale-session",
+      agentCommand: "agent",
+      cwd,
+      acpx: { desired_config_options: { thought_level: "deep" } },
+    });
+    const client = makeReconnectClient(async () => {
+      throw { error: { code: -32603, message: "rejected" } };
+    });
+    await assert.rejects(
+      async () =>
+        await connectAndLoadSession({
+          client: client as never,
+          record,
+          activeController: RECONNECT_ACTIVE_CONTROLLER as never,
+        }),
+      (error: unknown) => {
+        assert(error instanceof Error);
+        assert.equal(error.name, "SessionConfigOptionReplayError");
+        return true;
+      },
+    );
+  });
+});
+
+test("HAIKU-fix scope guard: an effort replay TRANSPORT failure (no ACP payload) still throws fatally", async () => {
+  await withReconnectTempHome("acpx-haikufix-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = makeSessionRecord({
+      acpxRecordId: "effort-transport-record",
+      acpSessionId: "stale-session",
+      agentCommand: "agent",
+      cwd,
+      acpx: { desired_config_options: { effort: "high" } },
+    });
+    const client = makeReconnectClient(async () => {
+      // a transport failure carries NO ACP error payload → must rethrow (retryable)
+      throw new Error("socket hang up");
+    });
+    await assert.rejects(
+      async () =>
+        await connectAndLoadSession({
+          client: client as never,
+          record,
+          activeController: RECONNECT_ACTIVE_CONTROLLER as never,
+        }),
+      (error: unknown) => {
+        assert(error instanceof Error);
+        assert.equal(error.name, "SessionConfigOptionReplayError");
+        assert.equal((error as Error & { retryable?: boolean }).retryable, true);
+        return true;
+      },
+    );
+  });
+});
