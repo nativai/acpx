@@ -84,6 +84,12 @@ export type SessionsNewFlags = {
   parentSessionUrl?: string;
   metadata?: Record<string, string>;
   fromTemplate?: string;
+  // --from-template auto-fire (ignored outside the --from-template path). Commander
+  // couples `--prompt <text>` and `--no-prompt` onto this one property:
+  //   string  → override the template's stored auto_prompt with this text
+  //   false   → --no-prompt: suppress any auto-prompt
+  //   true / undefined → use the template's auto_prompt (the default)
+  prompt?: string | boolean;
 };
 
 export type SessionsCopyFlags = {
@@ -99,6 +105,9 @@ export type SessionsCopyFlags = {
 export type SessionsTemplateFlags = {
   enable?: boolean;
   disable?: boolean;
+  // Prompt auto-sent on every spawn from this template. Present (incl. "") sets it
+  // (empty clears); absent preserves any existing value.
+  autoPrompt?: string;
 };
 
 export type SessionsHistoryFlags = SessionSelectorFlags & {

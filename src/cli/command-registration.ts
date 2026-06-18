@@ -130,6 +130,11 @@ export function registerSessionsCommand(
     )
     .option("--enable", "Mark the session as a template (also closes it); the default action")
     .option("--disable", "Clear the template marker (leaves the session closed as-is)")
+    .option(
+      "--auto-prompt <text>",
+      "Prompt auto-sent on every spawn from this template (empty string clears it). " +
+        "Stored plaintext — do not put secrets here.",
+    )
     .action(async function (this: Command, id: string, flags: SessionsTemplateFlags) {
       await handleSessionsTemplate(explicitAgentName, id, flags, this, config);
     });
@@ -162,6 +167,15 @@ export function registerSessionsCommand(
         "Inherits the template's agent type + context; the new session is a normal open session. " +
         "Combine with --cwd to place it elsewhere and -s to name it.",
       (value: string) => parseNonEmptyValue("Template id", value),
+    )
+    .option(
+      "--prompt <text>",
+      "With --from-template: override the template's stored auto-prompt with this text " +
+        "(auto-fired into the new session). Ignored without --from-template.",
+    )
+    .option(
+      "--no-prompt",
+      "With --from-template: do not auto-fire the template's stored auto-prompt (create a pure copy).",
     )
     .action(async function (this: Command, flags: SessionsNewFlags) {
       await handleSessionsNew(explicitAgentName, flags, this, config);

@@ -925,6 +925,57 @@ async function findOptionalRoutedTargetSession(
   });
 }
 
+// Shared prompt-delivery core: build the output formatter and enqueue/run the
+// prompt against an existing session. Used by `handlePrompt` and by the
+// `sessions new --from-template` auto-fire (which calls it with
+// waitForCompletion:false so the spawn returns promptly while the warm child
+// works the prompt asynchronously).
+async function deliverPrompt(params: {
+  sessionId: string;
+  prompt: import("../types.js").PromptInput;
+  waitForCompletion: boolean;
+  globalFlags: GlobalFlags;
+  permissionMode: ReturnType<typeof resolvePermissionMode>;
+  permissionPolicy?: PermissionPolicy;
+  outputPolicy: ReturnType<typeof resolveRequestedOutputPolicy>;
+  config: ResolvedAcpxConfig;
+  messageId?: string;
+}) {
+  const { createOutputFormatter } = await loadOutputModule();
+  const { sendSession } = await loadSessionModule();
+  const outputFormatter = createOutputFormatter(params.outputPolicy.format, {
+    jsonContext: {
+      sessionId: params.sessionId,
+    },
+    suppressReads: params.outputPolicy.suppressReads,
+  });
+  return sendSession({
+    sessionId: params.sessionId,
+    prompt: params.prompt,
+    mcpServers: params.config.mcpServers,
+    permissionMode: params.permissionMode,
+    permissionModeExplicit: hasExplicitPermissionModeFlag(params.globalFlags),
+    nonInteractivePermissions: params.globalFlags.nonInteractivePermissions,
+    permissionPolicy: params.permissionPolicy,
+    authCredentials: params.config.auth,
+    authPolicy: params.globalFlags.authPolicy,
+    terminal: params.globalFlags.terminal,
+    outputFormatter,
+    errorEmissionPolicy: {
+      queueErrorAlreadyEmitted: params.outputPolicy.queueErrorAlreadyEmitted,
+    },
+    suppressSdkConsoleErrors: params.outputPolicy.suppressSdkConsoleErrors,
+    timeoutMs: params.globalFlags.timeout,
+    ttlMs: params.globalFlags.ttl,
+    maxQueueDepth: params.config.queueMaxDepth,
+    promptRetries: params.globalFlags.promptRetries,
+    verbose: params.globalFlags.verbose,
+    waitForCompletion: params.waitForCompletion,
+    messageId: params.messageId,
+    sessionOptions: sessionOptionsFromGlobalFlags(params.globalFlags),
+  });
+}
+
 export async function handlePrompt(
   explicitAgentName: string | undefined,
   promptParts: string[],
@@ -939,11 +990,7 @@ export async function handlePrompt(
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   warnReasoningEffortIgnoredForNonClaude(globalFlags, agent.agentName);
-  const [
-    { createOutputFormatter },
-    { printPromptSessionBanner, printQueuedPromptByFormat },
-    { sendSession },
-  ] = await Promise.all([loadOutputModule(), loadOutputRenderModule(), loadSessionModule()]);
+  const { printPromptSessionBanner, printQueuedPromptByFormat } = await loadOutputRenderModule();
   const selector = resolveSessionTargetSelector({ flags, command });
   const record = await findRoutedTargetSessionOrThrow(agent, selector);
   await assertExplicitSubscriptionMatchesExistingSession({
@@ -952,38 +999,18 @@ export async function handlePrompt(
     agentName: agent.agentName,
   });
   const prompt = await readPrompt(promptParts, flags.file, globalFlags.cwd);
-  const outputFormatter = createOutputFormatter(outputPolicy.format, {
-    jsonContext: {
-      sessionId: record.acpxRecordId,
-    },
-    suppressReads: outputPolicy.suppressReads,
-  });
 
   await printPromptSessionBanner(record, agent.cwd, outputPolicy.format, outputPolicy.jsonStrict);
-  const result = await sendSession({
+  const result = await deliverPrompt({
     sessionId: record.acpxRecordId,
     prompt,
-    mcpServers: config.mcpServers,
-    permissionMode,
-    permissionModeExplicit: hasExplicitPermissionModeFlag(globalFlags),
-    nonInteractivePermissions: globalFlags.nonInteractivePermissions,
-    permissionPolicy,
-    authCredentials: config.auth,
-    authPolicy: globalFlags.authPolicy,
-    terminal: globalFlags.terminal,
-    outputFormatter,
-    errorEmissionPolicy: {
-      queueErrorAlreadyEmitted: outputPolicy.queueErrorAlreadyEmitted,
-    },
-    suppressSdkConsoleErrors: outputPolicy.suppressSdkConsoleErrors,
-    timeoutMs: globalFlags.timeout,
-    ttlMs: globalFlags.ttl,
-    maxQueueDepth: config.queueMaxDepth,
-    promptRetries: globalFlags.promptRetries,
-    verbose: globalFlags.verbose,
     waitForCompletion: flags.wait !== false,
+    globalFlags,
+    permissionMode,
+    permissionPolicy,
+    outputPolicy,
+    config,
     messageId: flags.messageId,
-    sessionOptions: sessionOptionsFromGlobalFlags(globalFlags),
   });
 
   if ("queued" in result) {
@@ -1528,6 +1555,78 @@ export async function handleSessionsClose(
   printClosedSessionByFormat(closed, globalFlags.format);
 }
 
+// Resolve the prompt to auto-fire on a `--from-template` spawn. Commander couples
+// --prompt <text> / --no-prompt onto flags.prompt:
+//   false → --no-prompt (suppress); string → explicit override;
+//   true/undefined → fall through to the template's stored auto_prompt.
+// Precedence: --prompt <text>  ▷  template.auto_prompt  ▷  nothing. A blank result
+// (absent/empty/whitespace) means no fire.
+function resolveTemplateAutoPrompt(
+  flags: SessionsNewFlags,
+  source: SessionRecord,
+): string | undefined {
+  if (flags.prompt === false) {
+    return undefined;
+  }
+  const resolved = typeof flags.prompt === "string" ? flags.prompt : source.template?.auto_prompt;
+  return resolved?.trim() ? resolved : undefined;
+}
+
+// `sessions new --from-template <id>` instantiates a working session from a saved
+// template (a copy whose source must be a template), then auto-fires the template's
+// stored prompt into the child so it starts work immediately (the warm-worker
+// northstar). The auto-fire lives HERE (the --from-template wrapper), NOT in shared
+// runSessionCopy — acpx-ui's UI path shells out to the low-level `sessions copy`
+// (which routes through runSessionCopy) and fires its own dialog prompt via the
+// server's `if (prompt)`, so an auto-fire inside runSessionCopy would double-fire on
+// the UI path (K4).
+async function handleSessionsNewFromTemplate(
+  explicitAgentName: string | undefined,
+  flags: SessionsNewFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  // Caller guards on flags.fromTemplate !== undefined before dispatching here.
+  const fromTemplate = flags.fromTemplate as string;
+  const { created, source } = await runSessionCopy(
+    explicitAgentName,
+    {
+      from: fromTemplate,
+      name: flags.name,
+      // Mark this child as a template-spawn (vs a plain fork): a normal
+      // `sessions copy`/`fork` writes the same parent_session_id +
+      // forked_from_session_id, so the board needs an explicit discriminator
+      // to place it under its creator with a "from template" provenance badge.
+      // Only the --from-template path sets it; plain copy/fork never does.
+      metadata: { ...flags.metadata, template_source: fromTemplate },
+      parentId: flags.parentId,
+      parentSessionUrl: flags.parentSessionUrl,
+    },
+    command,
+    config,
+    true,
+  );
+  const autoPromptText = resolveTemplateAutoPrompt(flags, source);
+  if (!autoPromptText) {
+    return;
+  }
+  const globalFlags = resolveGlobalFlags(command, config);
+  const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
+  const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
+  await deliverPrompt({
+    sessionId: created.acpxRecordId,
+    prompt: textPrompt(autoPromptText),
+    // Enqueue-and-return: the spawn command surfaces the child's URL promptly while
+    // the agent works the prompt asynchronously (mirrors the UI's `prompt --no-wait`).
+    waitForCompletion: false,
+    globalFlags,
+    permissionMode,
+    permissionPolicy,
+    outputPolicy: resolveRequestedOutputPolicy(globalFlags),
+    config,
+  });
+}
+
 export async function handleSessionsNew(
   explicitAgentName: string | undefined,
   flags: SessionsNewFlags,
@@ -1541,24 +1640,7 @@ export async function handleSessionsNew(
   // through the shared copy core so it reuses native deep-copy, the agent-type
   // lock, and cwd/lineage handling rather than the fresh-session path.
   if (flags.fromTemplate !== undefined) {
-    await runSessionCopy(
-      explicitAgentName,
-      {
-        from: flags.fromTemplate,
-        name: flags.name,
-        // Mark this child as a template-spawn (vs a plain fork): a normal
-        // `sessions copy`/`fork` writes the same parent_session_id +
-        // forked_from_session_id, so the board needs an explicit discriminator
-        // to place it under its creator with a "from template" provenance badge.
-        // Only the --from-template path sets it; plain copy/fork never does.
-        metadata: { ...flags.metadata, template_source: flags.fromTemplate },
-        parentId: flags.parentId,
-        parentSessionUrl: flags.parentSessionUrl,
-      },
-      command,
-      config,
-      true,
-    );
+    await handleSessionsNewFromTemplate(explicitAgentName, flags, command, config);
     return;
   }
 
@@ -1638,7 +1720,10 @@ async function runSessionCopy(
   command: Command,
   config: ResolvedAcpxConfig,
   requireTemplate: boolean,
-): Promise<void> {
+): Promise<{
+  created: Awaited<ReturnType<SessionModule["createSession"]>>;
+  source: SessionRecord;
+}> {
   const globalFlags = resolveGlobalFlags(command, config);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
@@ -1688,6 +1773,7 @@ async function runSessionCopy(
   const sourceType = agentTypeLabel(source.agentCommand, config);
   printCreatedSessionBanner(created, sourceType, globalFlags.format, globalFlags.jsonStrict);
   printCopiedSessionByFormat(created, source, globalFlags.format);
+  return { created, source };
 }
 
 function assertTemplateSource(source: SessionRecord): void {
@@ -1724,7 +1810,24 @@ export async function handleSessionsTemplates(
 // path; it is idempotent (no owner = success). Re-resolve afterwards to pick up the
 // persisted close, then stamp the marker. Idempotent re-enable preserves the original
 // creation stamp / source id.
-async function markSessionAsTemplate(sessionId: string): Promise<SessionRecord> {
+// Resolve the template's auto_prompt on a mark (--enable). Set when --auto-prompt is
+// present (incl. "" → clear); preserve the existing value when the flag is absent,
+// mirroring the created_at ?? idempotent-preserve idiom so a plain re-enable keeps
+// the stored prompt.
+function resolveMarkAutoPrompt(
+  flags: SessionsTemplateFlags,
+  record: SessionRecord,
+): string | undefined {
+  if (flags.autoPrompt !== undefined) {
+    return flags.autoPrompt || undefined;
+  }
+  return record.template?.auto_prompt;
+}
+
+async function markSessionAsTemplate(
+  sessionId: string,
+  flags: SessionsTemplateFlags,
+): Promise<SessionRecord> {
   const initial = await resolveSessionRecord(sessionId);
   const { closeSession } = await loadSessionModule();
   await closeSession(initial.acpxRecordId);
@@ -1733,6 +1836,7 @@ async function markSessionAsTemplate(sessionId: string): Promise<SessionRecord> 
     enabled: true,
     created_at: record.template?.created_at ?? isoNow(),
     source_session_id: record.template?.source_session_id ?? record.acpSessionId,
+    auto_prompt: resolveMarkAutoPrompt(flags, record),
   };
   record.closed = true;
   record.closedAt = record.closedAt ?? isoNow();
@@ -1771,7 +1875,7 @@ export async function handleSessionsTemplate(
   const enable = flags.disable !== true;
 
   const record = enable
-    ? await markSessionAsTemplate(sessionId)
+    ? await markSessionAsTemplate(sessionId, flags)
     : await unmarkSessionTemplate(sessionId);
 
   // PRIVILEGED write — see the function doc-comment. Never use plain writeSessionRecord
@@ -1779,6 +1883,14 @@ export async function handleSessionsTemplate(
   await writeSessionRecordWithLifecycle(record);
 
   printTemplateResult(record, enable, globalFlags.format);
+}
+
+function templateResultHumanLine(record: SessionRecord, enable: boolean): string {
+  if (!enable) {
+    return "disabled";
+  }
+  const autoPromptNote = record.template?.auto_prompt ? " (auto-prompt set)" : "";
+  return `enabled (closed)${autoPromptNote}`;
 }
 
 function printTemplateResult(record: SessionRecord, enable: boolean, format: OutputFormat): void {
@@ -1789,12 +1901,11 @@ function printTemplateResult(record: SessionRecord, enable: boolean, format: Out
     closed: record.closed === true,
     created_at: record.template?.created_at,
     source_session_id: record.template?.source_session_id,
+    auto_prompt: record.template?.auto_prompt,
   };
   if (!emitJsonResult(format, result)) {
     process.stdout.write(
-      enable
-        ? `template ${record.acpxRecordId}: enabled (closed)\n`
-        : `template ${record.acpxRecordId}: disabled\n`,
+      `template ${record.acpxRecordId}: ${templateResultHumanLine(record, enable)}\n`,
     );
   }
 }
