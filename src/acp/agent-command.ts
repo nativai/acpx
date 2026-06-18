@@ -8,6 +8,7 @@ import {
 } from "../spawn-command-options.js";
 import { type AcpClientOptions } from "../types.js";
 import { basenameToken, splitCommandLine } from "./client-process.js";
+import { isCodexAcpCommand } from "./codex-compat.js";
 
 const DEFAULT_AGENT_CLOSE_AFTER_STDIN_END_MS = 100;
 const QODER_AGENT_CLOSE_AFTER_STDIN_END_MS = 750;
@@ -78,6 +79,84 @@ export function isClaudePtyAgentCommand(agentCommand: string): boolean {
 
 export function isCopilotAcpCommand(command: string, args: readonly string[]): boolean {
   return basenameToken(command) === "copilot" && args.includes("--acp");
+}
+
+/**
+ * Which `_meta` channel carries the OS primer for a given agent (CONCEPTION
+ * §4.3). Routed by the substring command detectors — NOT
+ * `resolveAgentNameFromCommand`, which requires an exact registry-string match
+ * and would miss dev overrides / `--agent` custom commands.
+ *
+ *  - `system-prompt`           → claude + claude-pty (`_meta.systemPrompt {append}`)
+ *  - `developer-instructions`  → codex (`_meta.codex.developerInstructions`)
+ *  - `none`                    → unknown agents (inject nothing — safe)
+ */
+export type PrimerChannel = "system-prompt" | "developer-instructions" | "none";
+
+export function resolvePrimerChannel(agentCommand: string): PrimerChannel {
+  const { command, args } = splitCommandLine(agentCommand);
+  if (isClaudeAcpCommand(command, args) || isClaudePtyAcpCommand(command, args)) {
+    return "system-prompt";
+  }
+  if (isCodexAcpCommand(command, args)) {
+    return "developer-instructions";
+  }
+  return "none";
+}
+
+/**
+ * Compose the primer `_meta` fragment for a session request (CONCEPTION §4.4).
+ * The fragment OWNS `systemPrompt` / `codex.developerInstructions`, so the
+ * caller must merge it AFTER `optionsMeta` to win.
+ *
+ * `humanSystemPrompt` is the value already routed into `optionsMeta.systemPrompt`
+ * by `assignClaudeCodeSystemPrompt` (a string = `--system-prompt` replace, or
+ * `{ append }` = `--append-system-prompt`).
+ *
+ *  - system-prompt channel: `systemPrompt = { append: PRIMER_PLUS }`, where
+ *    PRIMER_PLUS = primer then (if the human passed `--append-system-prompt T`)
+ *    `"\n\n---\n\n" + T` — primer FIRST (foundational, cacheable), human append
+ *    LAST (most salient). A human REPLACE (string) is the power-user escape
+ *    hatch (Q4): return `undefined` so the replace survives untouched and the
+ *    auto-primer is skipped.
+ *  - developer-instructions channel: `codex.developerInstructions = primer`
+ *    (no human-append channel for codex today).
+ */
+export function buildPrimerSessionMeta(
+  channel: PrimerChannel,
+  primer: string | undefined,
+  humanSystemPrompt?: unknown,
+): Record<string, unknown> | undefined {
+  if (channel === "none" || typeof primer !== "string" || primer.length === 0) {
+    return undefined;
+  }
+
+  if (channel === "developer-instructions") {
+    return { codex: { developerInstructions: primer } };
+  }
+
+  // system-prompt channel (claude, claude-pty).
+  if (typeof humanSystemPrompt === "string" && humanSystemPrompt.length > 0) {
+    // Human `--system-prompt` replace wins — skip the auto-primer (Q4).
+    return undefined;
+  }
+  const humanAppend = readAppendString(humanSystemPrompt);
+  const primerPlus = humanAppend ? `${primer}\n\n---\n\n${humanAppend}` : primer;
+  return { systemPrompt: { append: primerPlus } };
+}
+
+/** The `.append` string of a `{ append }` system-prompt value, if present. */
+function readAppendString(value: unknown): string | undefined {
+  if (
+    !!value &&
+    typeof value === "object" &&
+    "append" in value &&
+    typeof (value as { append: unknown }).append === "string" &&
+    (value as { append: string }).append.length > 0
+  ) {
+    return (value as { append: string }).append;
+  }
+  return undefined;
 }
 
 export function isQoderAcpCommand(command: string, args: readonly string[]): boolean {

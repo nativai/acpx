@@ -10,6 +10,7 @@ import {
   resolveAgentCloseAfterStdinEndMs,
   shouldIgnoreNonJsonAgentOutputLine,
 } from "../src/acp/client.js";
+import { resetSessionPrimerMemoForTests } from "../src/acp/session-primer.js";
 import {
   AgentDisconnectedError,
   AgentStartupError,
@@ -771,7 +772,23 @@ test("AcpClient createSession forwards codex model metadata without setting it e
     },
   };
 
-  const result = await client.createSession("/tmp/acpx-client-codex-model");
+  // codex-acp now routes the OS primer into `_meta.codex.developerInstructions`
+  // (session-primer). Point the primer at a missing path so it fails open and
+  // this test stays focused on the codex model-metadata forwarding.
+  const previousPrimer = process.env.ACPX_SESSION_PRIMER_COMMAND;
+  process.env.ACPX_SESSION_PRIMER_COMMAND = "/nonexistent/acpx-test-primer.sh";
+  resetSessionPrimerMemoForTests();
+  let result: Awaited<ReturnType<typeof client.createSession>>;
+  try {
+    result = await client.createSession("/tmp/acpx-client-codex-model");
+  } finally {
+    if (previousPrimer === undefined) {
+      delete process.env.ACPX_SESSION_PRIMER_COMMAND;
+    } else {
+      process.env.ACPX_SESSION_PRIMER_COMMAND = previousPrimer;
+    }
+    resetSessionPrimerMemoForTests();
+  }
   assert.equal(result.sessionId, "session-456");
   assert.deepEqual(capturedNewSessionParams, {
     cwd,

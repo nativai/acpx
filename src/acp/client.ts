@@ -71,6 +71,7 @@ import {
   buildClaudeAcpSessionCreateTimeoutMessage,
   buildClaudeCodeOptionsMeta,
   buildGeminiAcpStartupTimeoutMessage,
+  buildPrimerSessionMeta,
   buildQoderAcpCommandArgs,
   ensureCopilotAcpSupport,
   isClaudeAcpCommand,
@@ -82,6 +83,7 @@ import {
   resolveClaudeCodeExecutable,
   resolveGeminiAcpStartupTimeoutMs,
   resolveGeminiCommandArgs,
+  resolvePrimerChannel,
   shouldIgnoreNonJsonAgentOutputLine,
 } from "./agent-command.js";
 import {
@@ -116,6 +118,7 @@ import {
   formatSessionControlAcpSummary,
   maybeWrapSessionControlError,
 } from "./session-control-errors.js";
+import { resolveSessionPrimer } from "./session-primer.js";
 import { TerminalManager } from "./terminal-manager.js";
 
 export { buildSpawnCommandOptions };
@@ -264,6 +267,20 @@ function mergeRecordValues(
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Deep-merge two optional records; undefined operands drop out. */
+function mergeOptionalRecords(
+  left: Record<string, unknown> | undefined,
+  right: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!left) {
+    return right;
+  }
+  if (!right) {
+    return left;
+  }
+  return mergeRecordValues(left, right);
 }
 
 type AgentDisconnectReason = "process_exit" | "process_close" | "pipe_close" | "connection_close";
@@ -1020,13 +1037,15 @@ export class AcpClient {
     const claudeAcp = isClaudeAcpCommand(command, args);
     const sessionCwd = await resolveAgentSessionCwd(cwd, this.options.agentCommand);
 
+    const newSessionMeta = await this.buildNewSessionMeta();
+
     let result: Awaited<ReturnType<typeof connection.newSession>>;
     try {
       const createPromise = this.runConnectionRequest(() =>
         connection.newSession({
           cwd: sessionCwd,
           mcpServers: this.options.mcpServers ?? [],
-          _meta: this.buildNewSessionMeta(),
+          _meta: newSessionMeta,
         }),
       );
       result = claudeAcp
@@ -1060,7 +1079,7 @@ export class AcpClient {
    * the selector: a missing selector does not error bridge-side, it silently
    * runs under the box-default HOME (wrong credentials).
    */
-  private buildNewSessionMeta(): Record<string, unknown> | undefined {
+  private async buildNewSessionMeta(): Promise<Record<string, unknown> | undefined> {
     const optionsMeta = buildClaudeCodeOptionsMeta(this.options.sessionOptions);
     const homeSelectorMeta = this.buildHomeSelectorMeta();
     // FW-18/FW-19: the claude-pty bridge learns its per-session parent from the
@@ -1071,8 +1090,53 @@ export class AcpClient {
       this.options.sessionContext,
       this.options.agentCommand,
     );
-    const merged = { ...optionsMeta, ...homeSelectorMeta, ...parentMeta };
+    // OS primer (CONCEPTION §4.5.1): resolve `session-context.sh`, route by
+    // agent type, and fold in any human `--append-system-prompt`. Merged LAST so
+    // the primer fragment owns `systemPrompt` / `codex.developerInstructions`.
+    const primerMeta = await this.buildPrimerSessionMeta(optionsMeta);
+    const merged = { ...optionsMeta, ...homeSelectorMeta, ...parentMeta, ...primerMeta };
     return Object.keys(merged).length > 0 ? merged : undefined;
+  }
+
+  /**
+   * The OS-primer `_meta` fragment for this agent's channel (CONCEPTION §4.4),
+   * or undefined when the agent type is unknown / the primer is unavailable
+   * (fail-open). `optionsMeta.systemPrompt` carries any human `--system-prompt`
+   * / `--append-system-prompt` so the composer can compose (never clobber) it.
+   */
+  private async buildPrimerSessionMeta(
+    optionsMeta: Record<string, unknown> | undefined,
+  ): Promise<Record<string, unknown> | undefined> {
+    const channel = resolvePrimerChannel(this.options.agentCommand);
+    if (channel === "none") {
+      return undefined;
+    }
+    const primer = await resolveSessionPrimer();
+    if (primer === undefined) {
+      return undefined;
+    }
+    return buildPrimerSessionMeta(channel, primer, optionsMeta?.systemPrompt);
+  }
+
+  /**
+   * Resume/reconnect re-supply (CONCEPTION §4.5.2, gotcha D): for the
+   * SYSTEM-PROMPT channels only, re-attach the primer `_meta.systemPrompt` so a
+   * cold rebuild (adapter restarted) regenerates it. Idempotent — a system
+   * prompt is regenerated each launch, never stored in conversation history. For
+   * CODEX this returns undefined: the developer item is already in the restored
+   * thread history, so re-sending would duplicate it.
+   */
+  private async buildResumePrimerMeta(): Promise<Record<string, unknown> | undefined> {
+    const channel = resolvePrimerChannel(this.options.agentCommand);
+    if (channel !== "system-prompt") {
+      return undefined;
+    }
+    const primer = await resolveSessionPrimer();
+    if (primer === undefined) {
+      return undefined;
+    }
+    const optionsMeta = buildClaudeCodeOptionsMeta(this.options.sessionOptions);
+    return buildPrimerSessionMeta(channel, primer, optionsMeta?.systemPrompt);
   }
 
   private buildHomeSelectorMeta(): Record<string, unknown> | undefined {
@@ -1103,12 +1167,17 @@ export class AcpClient {
       // session must re-bind to the same home — and a missing selector falls
       // back silently to the box-default HOME, not an error.
       const homeSelectorMeta = this.buildHomeSelectorMeta();
+      // Re-supply the primer on cold load for the system-prompt channels
+      // (CONCEPTION §4.5.2) so a restarted adapter regenerates it; codex returns
+      // undefined here (its developer item is already in restored history).
+      const primerMeta = await this.buildResumePrimerMeta();
+      const loadMeta = { ...homeSelectorMeta, ...primerMeta };
       response = await this.runConnectionRequest(() =>
         connection.loadSession({
           sessionId,
           cwd: sessionCwd,
           mcpServers: this.options.mcpServers ?? [],
-          ...(homeSelectorMeta ? { _meta: homeSelectorMeta } : {}),
+          ...(Object.keys(loadMeta).length > 0 ? { _meta: loadMeta } : {}),
         }),
       );
 
@@ -1128,11 +1197,16 @@ export class AcpClient {
   async resumeSession(sessionId: string, cwd = this.options.cwd): Promise<SessionResumeResult> {
     const connection = this.getConnection();
     const sessionCwd = await resolveAgentSessionCwd(cwd, this.options.agentCommand);
+    // Re-supply the primer on cold resume for the system-prompt channels
+    // (CONCEPTION §4.5.2): a regenerated system prompt is dropped on rebuild
+    // unless re-sent. Idempotent; codex returns undefined (restored from thread).
+    const primerMeta = await this.buildResumePrimerMeta();
     const response = await this.runConnectionRequest(() =>
       connection.resumeSession({
         sessionId,
         cwd: sessionCwd,
         mcpServers: this.options.mcpServers ?? [],
+        ...(primerMeta ? { _meta: primerMeta } : {}),
       }),
     );
 
@@ -1158,7 +1232,7 @@ export class AcpClient {
       options.atIndex,
       options.sourceMessages,
     );
-    const requestMeta = this.buildForkRequestMeta(forkContext);
+    const requestMeta = await this.buildForkRequestMeta(forkContext);
     const requestCwd = this.resolveForkRequestCwd(forkContext, sessionCwd);
     const previousSuppression = this.applySessionUpdateSuppression(
       Boolean(options.suppressReplayUpdates),
@@ -1208,19 +1282,24 @@ export class AcpClient {
     return sessionCwd;
   }
 
-  private buildForkRequestMeta(
+  private async buildForkRequestMeta(
     forkContext: ForkRequestContext,
-  ): Record<string, unknown> | undefined {
+  ): Promise<Record<string, unknown> | undefined> {
     const optionsMeta = forkContext.claudeFork
       ? buildClaudeCodeOptionsMeta(this.options.sessionOptions)
       : undefined;
+    // A forked Claude session rebuilds its system prompt fresh, so carry the
+    // primer through for the system-prompt channels too (CONCEPTION §4.5.3).
+    // codex forks inherit the developer item via threadFork's copied history.
+    const primerMeta = await this.buildResumePrimerMeta();
+    const baseMeta = mergeOptionalRecords(optionsMeta, primerMeta);
     if (!forkContext.meta) {
-      return optionsMeta;
+      return baseMeta;
     }
-    if (!optionsMeta) {
+    if (!baseMeta) {
       return forkContext.meta;
     }
-    return mergeRecordValues(optionsMeta, forkContext.meta);
+    return mergeRecordValues(baseMeta, forkContext.meta);
   }
 
   /**

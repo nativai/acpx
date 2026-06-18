@@ -957,11 +957,18 @@ test("integration: exec forwards model, allowed-tools, and max-turns in session/
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
     const claudeCompatibleAgentCommand = `${MOCK_AGENT_COMMAND} --claude-agent-acp`;
+    // This claude-compatible agent now also gets the OS primer routed into
+    // `_meta.systemPrompt` (session-primer). Point the primer at a missing path
+    // so it fails open and this test stays focused on options forwarding.
+    const noPrimerEnv = {
+      env: { ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh" },
+    };
 
     try {
       const created = await runCli(
         ["--agent", claudeCompatibleAgentCommand, "--approve-all", "--cwd", cwd, "sessions", "new"],
         homeDir,
+        noPrimerEnv,
       );
       assert.equal(created.code, 0, created.stderr);
 
@@ -984,6 +991,7 @@ test("integration: exec forwards model, allowed-tools, and max-turns in session/
           "echo hello",
         ],
         homeDir,
+        noPrimerEnv,
       );
       assert.equal(result.code, 0, result.stderr);
 
