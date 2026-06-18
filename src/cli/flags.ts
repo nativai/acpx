@@ -61,8 +61,13 @@ export type GlobalFlags = PermissionFlags & {
   permissionPolicy?: string;
 };
 
-export type PromptFlags = {
+export type SessionSelectorFlags = {
   session?: string;
+  sessionId?: string;
+  sessionUrl?: string;
+};
+
+export type PromptFlags = SessionSelectorFlags & {
   wait?: boolean;
   file?: string;
   messageId?: string;
@@ -96,7 +101,7 @@ export type SessionsTemplateFlags = {
   disable?: boolean;
 };
 
-export type SessionsHistoryFlags = {
+export type SessionsHistoryFlags = SessionSelectorFlags & {
   limit: number;
 };
 
@@ -106,7 +111,7 @@ export type SessionsListFlags = {
   local?: boolean;
 };
 
-export type SessionsExportFlags = {
+export type SessionsExportFlags = SessionSelectorFlags & {
   output: string;
   sourceCwd?: string;
 };
@@ -116,9 +121,7 @@ export type SessionsImportFlags = {
   destinationCwd?: string;
 };
 
-export type StatusFlags = {
-  session?: string;
-};
+export type StatusFlags = SessionSelectorFlags;
 
 export type SessionsPruneFlags = {
   dryRun?: boolean;
@@ -440,25 +443,45 @@ export function addGlobalFlags(command: Command): Command {
     .option("--verbose", "Enable verbose debug logs");
 }
 
-export function addSessionOption(command: Command): Command {
+export function addSessionIdentityOptions(command: Command): Command {
   return command
-    .option("-s, --session <name>", "Use named session instead of cwd default", parseSessionName)
     .option(
-      "--no-wait",
-      "Queue prompt and return immediately when another prompt is already running",
+      "--session-id <id>",
+      "Resolve a session globally by acpx record id, ACP session id, or unique suffix",
+      (value: string) => parseNonEmptyValue("Session id", value),
+    )
+    .option(
+      "--session-url <url>",
+      "Resolve a session globally from an acpx-ui URL containing ?session=<id>",
+      (value: string) => parseNonEmptyValue("Session URL", value),
     );
 }
 
+export function addSessionOption(command: Command): Command {
+  return addSessionIdentityOptions(
+    command.option(
+      "-s, --session <name>",
+      "Use named session instead of cwd default",
+      parseSessionName,
+    ),
+  ).option(
+    "--no-wait",
+    "Queue prompt and return immediately when another prompt is already running",
+  );
+}
+
 export function addSessionNameOption(command: Command): Command {
-  return command.option(
-    "-s, --session <name>",
-    "Use named session instead of cwd default",
-    parseSessionName,
+  return addSessionIdentityOptions(
+    command.option(
+      "-s, --session <name>",
+      "Use named session instead of cwd default",
+      parseSessionName,
+    ),
   );
 }
 
 export function resolveSessionNameFromFlags(
-  flags: StatusFlags,
+  flags: SessionSelectorFlags,
   command: Command,
 ): string | undefined {
   const directSession = parseOptionalSessionName(flags.session);
@@ -481,9 +504,51 @@ export function resolveSessionNameFromFlags(
   return parseOptionalSessionName(parentOpts?.session);
 }
 
+export function resolveSessionSelectorFromFlags(
+  flags: SessionSelectorFlags,
+  command: Command,
+): SessionSelectorFlags {
+  return {
+    session: resolveSessionNameFromFlags(flags, command),
+    sessionId: resolveStringFlagFromScopes("Session id", "sessionId", flags, command),
+    sessionUrl: resolveStringFlagFromScopes("Session URL", "sessionUrl", flags, command),
+  };
+}
+
 function parseOptionalSessionName(value: unknown): string | undefined {
   const session = stringOption(value);
   return session === undefined ? undefined : parseSessionName(session);
+}
+
+function resolveStringFlagFromScopes(
+  label: string,
+  optionName: string,
+  flags: SessionSelectorFlags,
+  command: Command,
+): string | undefined {
+  return (
+    parseOptionalNonEmptyFlag(label, asRecord(flags)?.[optionName]) ??
+    resolveStringFlagFromCommandScopes(label, optionName, command)
+  );
+}
+
+function resolveStringFlagFromCommandScopes(
+  label: string,
+  optionName: string,
+  command: Command,
+): string | undefined {
+  const allOpts = asRecord(
+    (command as unknown as { optsWithGlobals?: () => unknown }).optsWithGlobals?.(),
+  );
+  const globalValue = parseOptionalNonEmptyFlag(label, allOpts?.[optionName]);
+
+  const parentOpts = asRecord(command.parent?.opts?.() as unknown);
+  return globalValue ?? parseOptionalNonEmptyFlag(label, parentOpts?.[optionName]);
+}
+
+function parseOptionalNonEmptyFlag(label: string, value: unknown): string | undefined {
+  const stringValue = stringOption(value);
+  return stringValue === undefined ? undefined : parseNonEmptyValue(label, stringValue);
 }
 
 export function addPromptInputOption(command: Command): Command {

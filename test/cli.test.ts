@@ -2242,6 +2242,266 @@ test("sessions show and read resolve session ids while preserving name lookup", 
   });
 });
 
+test("explicit session selectors resolve records globally while name lookup stays cwd-scoped", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionCwd = path.join(homeDir, "workspace", "project");
+    const otherCwd = path.join(homeDir, "elsewhere");
+    const archivePath = path.join(homeDir, "selector-export.json");
+    const recordId = "33333333-3333-4333-8333-333333333333";
+    const acpSessionId = "44444444-4444-4444-8444-444444444444";
+    const sessionUrl = `https://acpx.devbox.nativai.de/?session=${recordId}`;
+    const messages: SessionRecord["messages"] = [
+      { User: { id: "user-1", content: [{ Text: "selector user text" }] } },
+      { Agent: { content: [{ Text: "selector assistant text" }], tool_results: {} } },
+    ];
+    await fs.mkdir(sessionCwd, { recursive: true });
+    await fs.mkdir(otherCwd, { recursive: true });
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: recordId,
+      acpSessionId,
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd: sessionCwd,
+      name: "mutable-label",
+      messages,
+      lastSeq: messages.length,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:00:00.000Z",
+      closed: false,
+    });
+
+    const wrongCwdNameStatus = await runCli(
+      ["--cwd", otherCwd, "--format", "json", "codex", "status", "-s", "mutable-label"],
+      homeDir,
+    );
+    assert.equal(wrongCwdNameStatus.code, 0, wrongCwdNameStatus.stderr);
+    const wrongCwdNamePayload = JSON.parse(wrongCwdNameStatus.stdout.trim()) as {
+      status?: unknown;
+    };
+    assert.equal(wrongCwdNamePayload.status, "no-session");
+
+    const correctCwdNameStatus = await runCli(
+      ["--cwd", sessionCwd, "--format", "json", "codex", "status", "-s", "mutable-label"],
+      homeDir,
+    );
+    assert.equal(correctCwdNameStatus.code, 0, correctCwdNameStatus.stderr);
+    const correctCwdNamePayload = JSON.parse(correctCwdNameStatus.stdout.trim()) as {
+      acpxRecordId?: unknown;
+    };
+    assert.equal(correctCwdNamePayload.acpxRecordId, recordId);
+
+    const showByUrl = await runCli(
+      [
+        "--cwd",
+        otherCwd,
+        "--format",
+        "json",
+        "codex",
+        "sessions",
+        "show",
+        "--session-url",
+        sessionUrl,
+      ],
+      homeDir,
+    );
+    assert.equal(showByUrl.code, 0, showByUrl.stderr);
+    const shown = JSON.parse(showByUrl.stdout.trim()) as SessionRecord;
+    assert.equal(shown.acpxRecordId, recordId);
+    assert.equal(shown.cwd, sessionCwd);
+
+    const readByIdSuffix = await runCli(
+      [
+        "--cwd",
+        otherCwd,
+        "--format",
+        "json",
+        "codex",
+        "sessions",
+        "read",
+        "--session-id",
+        "333333333333",
+      ],
+      homeDir,
+    );
+    assert.equal(readByIdSuffix.code, 0, readByIdSuffix.stderr);
+    const readPayload = JSON.parse(readByIdSuffix.stdout.trim()) as {
+      id?: unknown;
+      entries?: Array<{ textPreview?: unknown }>;
+    };
+    assert.equal(readPayload.id, recordId);
+    assert.deepEqual(
+      readPayload.entries?.map((entry) => entry.textPreview),
+      ["selector user text", "selector assistant text"],
+    );
+
+    const historyByUrl = await runCli(
+      [
+        "--cwd",
+        otherCwd,
+        "--format",
+        "json",
+        "codex",
+        "sessions",
+        "history",
+        "--session-url",
+        sessionUrl,
+        "--limit",
+        "1",
+      ],
+      homeDir,
+    );
+    assert.equal(historyByUrl.code, 0, historyByUrl.stderr);
+    const historyPayload = JSON.parse(historyByUrl.stdout.trim()) as {
+      id?: unknown;
+      count?: unknown;
+      entries?: Array<{ textPreview?: unknown }>;
+    };
+    assert.equal(historyPayload.id, recordId);
+    assert.equal(historyPayload.count, 1);
+    assert.deepEqual(
+      historyPayload.entries?.map((entry) => entry.textPreview),
+      ["selector assistant text"],
+    );
+
+    const metadataByUrl = await runCli(
+      [
+        "--cwd",
+        otherCwd,
+        "--format",
+        "json",
+        "codex",
+        "sessions",
+        "set-metadata",
+        "--session-url",
+        sessionUrl,
+        "owner",
+        "uuid-selector",
+      ],
+      homeDir,
+    );
+    assert.equal(metadataByUrl.code, 0, metadataByUrl.stderr);
+    const storedAfterMetadata = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, recordId), "utf8"),
+    ) as { metadata?: Record<string, unknown> };
+    assert.equal(storedAfterMetadata.metadata?.owner, "uuid-selector");
+
+    const exportedByUrl = await runCli(
+      [
+        "--cwd",
+        otherCwd,
+        "--format",
+        "quiet",
+        "codex",
+        "sessions",
+        "export",
+        "--session-url",
+        sessionUrl,
+        "--output",
+        archivePath,
+      ],
+      homeDir,
+    );
+    assert.equal(exportedByUrl.code, 0, exportedByUrl.stderr);
+    assert.equal(exportedByUrl.stdout.trim(), archivePath);
+    const archive = JSON.parse(await fs.readFile(archivePath, "utf8")) as {
+      session?: { record_id?: unknown; cwd_original?: unknown };
+    };
+    assert.equal(archive.session?.record_id, recordId);
+    assert.equal(archive.session?.cwd_original, "workspace/project");
+
+    const closeById = await runCli(
+      [
+        "--cwd",
+        otherCwd,
+        "--format",
+        "json",
+        "codex",
+        "sessions",
+        "close",
+        "--session-id",
+        recordId,
+      ],
+      homeDir,
+    );
+    assert.equal(closeById.code, 0, closeById.stderr);
+    const closePayload = JSON.parse(closeById.stdout.trim()) as {
+      action?: unknown;
+      acpxRecordId?: unknown;
+    };
+    assert.equal(closePayload.action, "session_closed");
+    assert.equal(closePayload.acpxRecordId, recordId);
+  });
+});
+
+test("explicit session selectors reject ambiguous name and id combinations", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "selector-conflict",
+      acpSessionId: "selector-conflict",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+      name: "label",
+    });
+
+    const nameAndId = await runCli(
+      ["--cwd", cwd, "codex", "status", "-s", "label", "--session-id", "selector-conflict"],
+      homeDir,
+    );
+    assert.notEqual(nameAndId.code, 0);
+    assert.match(nameAndId.stderr, /session name.*--session-id\/--session-url/i);
+
+    const positionalAndUrl = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "codex",
+        "sessions",
+        "show",
+        "label",
+        "--session-url",
+        "https://acpx.devbox.nativai.de/?session=selector-conflict",
+      ],
+      homeDir,
+    );
+    assert.notEqual(positionalAndUrl.code, 0);
+    assert.match(positionalAndUrl.stderr, /session name.*--session-id\/--session-url/i);
+
+    const idAndUrl = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "codex",
+        "sessions",
+        "show",
+        "--session-id",
+        "selector-conflict",
+        "--session-url",
+        "https://acpx.devbox.nativai.de/?session=selector-conflict",
+      ],
+      homeDir,
+    );
+    assert.notEqual(idAndUrl.code, 0);
+    assert.match(idAndUrl.stderr, /only one of --session-id or --session-url/i);
+
+    const invalidUrl = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "codex",
+        "sessions",
+        "show",
+        "--session-url",
+        "https://acpx.devbox.nativai.de/",
+      ],
+      homeDir,
+    );
+    assert.notEqual(invalidUrl.code, 0);
+    assert.match(invalidUrl.stderr, /must include.*\?session=<id>/i);
+  });
+});
+
 test("generic sessions show reports ambiguous cross-agent matches with explicit commands", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -2606,6 +2866,119 @@ test("codex set model passes the requested model through unchanged", async () =>
     };
     assert.equal(payload.action, "model_set");
     assert.equal(payload.modelId, "GPT-5-2");
+  });
+});
+
+test("explicit session selectors route prompt and live control commands globally", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionCwd = path.join(homeDir, "workspace", "live-session");
+    const otherCwd = path.join(homeDir, "outside-live-session");
+    const sessionId = "live-selector-session";
+    const sessionUrl = `https://acpx.devbox.nativai.de/?session=${sessionId}`;
+    await fs.mkdir(sessionCwd, { recursive: true });
+    await fs.mkdir(otherCwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_WITH_LOAD_RUNTIME_SESSION_ID);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: sessionId,
+      acpSessionId: sessionId,
+      agentCommand: MOCK_AGENT_WITH_LOAD_RUNTIME_SESSION_ID,
+      cwd: sessionCwd,
+      name: "live-label",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:00:00.000Z",
+      closed: false,
+    });
+
+    const barePrompt = await runCli(
+      [
+        "--cwd",
+        otherCwd,
+        "--format",
+        "quiet",
+        "codex",
+        "--session-url",
+        sessionUrl,
+        "echo bare-selector",
+      ],
+      homeDir,
+    );
+    assert.equal(barePrompt.code, 0, barePrompt.stderr);
+    assert.match(barePrompt.stdout, /bare-selector/);
+
+    const promptSubcommand = await runCli(
+      [
+        "--cwd",
+        otherCwd,
+        "--format",
+        "quiet",
+        "codex",
+        "prompt",
+        "--session-id",
+        sessionId,
+        "echo subcommand-selector",
+      ],
+      homeDir,
+    );
+    assert.equal(promptSubcommand.code, 0, promptSubcommand.stderr);
+    assert.match(promptSubcommand.stdout, /subcommand-selector/);
+
+    const cancelByUrl = await runCli(
+      ["--cwd", otherCwd, "codex", "cancel", "--session-url", sessionUrl],
+      homeDir,
+    );
+    assert.equal(cancelByUrl.code, 0, cancelByUrl.stderr);
+    assert.match(cancelByUrl.stdout, /nothing to cancel/);
+
+    const setModeById = await runCli(
+      [
+        "--cwd",
+        otherCwd,
+        "--format",
+        "json",
+        "codex",
+        "set-mode",
+        "--session-id",
+        sessionId,
+        "plan",
+      ],
+      homeDir,
+    );
+    assert.equal(setModeById.code, 0, setModeById.stderr);
+    const setModePayload = JSON.parse(setModeById.stdout.trim()) as {
+      action?: unknown;
+      acpxRecordId?: unknown;
+      modeId?: unknown;
+    };
+    assert.equal(setModePayload.action, "mode_set");
+    assert.equal(setModePayload.acpxRecordId, sessionId);
+    assert.equal(setModePayload.modeId, "plan");
+
+    const setConfigByUrl = await runCli(
+      [
+        "--cwd",
+        otherCwd,
+        "--format",
+        "json",
+        "codex",
+        "set",
+        "--session-url",
+        sessionUrl,
+        "reasoning_effort",
+        "high",
+      ],
+      homeDir,
+    );
+    assert.equal(setConfigByUrl.code, 0, setConfigByUrl.stderr);
+    const setConfigPayload = JSON.parse(setConfigByUrl.stdout.trim()) as {
+      action?: unknown;
+      acpxRecordId?: unknown;
+      configId?: unknown;
+      value?: unknown;
+    };
+    assert.equal(setConfigPayload.action, "config_set");
+    assert.equal(setConfigPayload.acpxRecordId, sessionId);
+    assert.equal(setConfigPayload.configId, "reasoning_effort");
+    assert.equal(setConfigPayload.value, "high");
   });
 });
 

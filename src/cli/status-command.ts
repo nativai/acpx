@@ -6,12 +6,12 @@ import {
   addSessionNameOption,
   resolveAgentInvocation,
   resolveGlobalFlags,
-  resolveSessionNameFromFlags,
   type StatusFlags,
 } from "./flags.js";
 import { emitJsonResult } from "./output/json-output.js";
 import { agentSessionIdPayload } from "./output/render.js";
 import { probeQueueOwnerHealth } from "./queue/ipc.js";
+import { resolveExplicitSessionRecord, resolveSessionTargetSelector } from "./session-selector.js";
 
 type SessionStatusState = "running" | "idle" | "dead";
 
@@ -74,12 +74,16 @@ export async function handleStatus(
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const record = await findSession({
-    agentCommand: agent.agentCommand,
-    agentName: agent.agentName,
-    cwd: agent.cwd,
-    name: resolveSessionNameFromFlags(flags, command),
-  });
+  const selector = resolveSessionTargetSelector({ flags, command });
+  const explicitRecord = await resolveExplicitSessionRecord(selector);
+  const record =
+    explicitRecord ??
+    (await findSession({
+      agentCommand: agent.agentCommand,
+      agentName: agent.agentName,
+      cwd: agent.cwd,
+      name: selector.name,
+    }));
 
   if (!record) {
     printMissingStatus(globalFlags.format, agent.agentCommand);

@@ -56,7 +56,6 @@ import {
   resolveGlobalFlags,
   resolveOutputPolicy,
   resolvePermissionMode,
-  resolveSessionNameFromFlags,
   type ExecFlags,
   type GlobalFlags,
   type SessionsCopyFlags,
@@ -71,6 +70,13 @@ import {
   type StatusFlags,
 } from "./flags.js";
 import { emitJsonResult } from "./output/json-output.js";
+import {
+  explicitSessionIdFromSelector,
+  parseSessionIdFromUrl,
+  resolveExplicitSessionRecord,
+  resolveSessionTargetSelector,
+  type SessionTargetSelector,
+} from "./session-selector.js";
 import type { SessionListResult } from "./session/contracts.js";
 import {
   withInheritedAgentCommand,
@@ -358,19 +364,6 @@ function warnReasoningEffortIgnoredForNonClaude(
     `[acpx] --reasoning-effort applies to claude; ignoring for agent "${effectiveAgentName}" ` +
       `(codex depth is set via --model '<model>[depth]')\n`,
   );
-}
-
-function parseSessionIdFromUrl(url: string | undefined): string | undefined {
-  if (!url) {
-    return undefined;
-  }
-  try {
-    const parsed = new URL(url);
-    const id = parsed.searchParams.get("session");
-    return id && id.trim().length > 0 ? id : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 async function resolvePermissionPolicyFromFlags(
@@ -838,13 +831,18 @@ async function findGenericReadableSessionOrThrow(
 async function findReadableSessionOrThrow(params: {
   explicitAgentName: string | undefined;
   agent: ResolvedAgentInvocation;
-  sessionNameOrId: string | undefined;
+  selector: SessionTargetSelector;
   subcommand: string;
   config: ResolvedAcpxConfig;
 }): Promise<SessionRecord> {
-  if (params.sessionNameOrId !== undefined) {
+  const explicitRecord = await resolveExplicitSessionRecord(params.selector);
+  if (explicitRecord) {
+    return explicitRecord;
+  }
+
+  if (params.selector.name !== undefined) {
     try {
-      return await resolveSessionRecord(params.sessionNameOrId);
+      return await resolveSessionRecord(params.selector.name);
     } catch (error) {
       if (!(error instanceof SessionNotFoundError)) {
         throw error;
@@ -855,11 +853,11 @@ async function findReadableSessionOrThrow(params: {
   return params.explicitAgentName == null
     ? await findGenericReadableSessionOrThrow(
         params.agent,
-        params.sessionNameOrId,
+        params.selector.name,
         params.subcommand,
         params.config,
       )
-    : await findScopedSessionOrThrow(params.agent, params.sessionNameOrId);
+    : await findScopedSessionOrThrow(params.agent, params.selector.name);
 }
 
 async function findRoutedSessionOrThrow(
@@ -891,6 +889,42 @@ async function findRoutedSessionOrThrow(
   );
 }
 
+async function findRoutedTargetSessionOrThrow(
+  agent: ResolvedAgentInvocation,
+  selector: SessionTargetSelector,
+): Promise<SessionRecord> {
+  const explicitRecord = await resolveExplicitSessionRecord(selector);
+  if (explicitRecord) {
+    return explicitRecord;
+  }
+
+  return await findRoutedSessionOrThrow(
+    agent.agentCommand,
+    agent.agentName,
+    agent.cwd,
+    selector.name,
+  );
+}
+
+async function findOptionalRoutedTargetSession(
+  agent: ResolvedAgentInvocation,
+  selector: SessionTargetSelector,
+): Promise<SessionRecord | undefined> {
+  const explicitRecord = await resolveExplicitSessionRecord(selector);
+  if (explicitRecord) {
+    return explicitRecord;
+  }
+
+  const gitRoot = findGitRepositoryRoot(agent.cwd);
+  return await findSessionByDirectoryWalk({
+    agentCommand: agent.agentCommand,
+    agentName: agent.agentName,
+    cwd: agent.cwd,
+    name: selector.name,
+    boundary: gitRoot ?? agent.cwd,
+  });
+}
+
 export async function handlePrompt(
   explicitAgentName: string | undefined,
   promptParts: string[],
@@ -910,12 +944,8 @@ export async function handlePrompt(
     { printPromptSessionBanner, printQueuedPromptByFormat },
     { sendSession },
   ] = await Promise.all([loadOutputModule(), loadOutputRenderModule(), loadSessionModule()]);
-  const record = await findRoutedSessionOrThrow(
-    agent.agentCommand,
-    agent.agentName,
-    agent.cwd,
-    flags.session,
-  );
+  const selector = resolveSessionTargetSelector({ flags, command });
+  const record = await findRoutedTargetSessionOrThrow(agent, selector);
   await assertExplicitSubscriptionMatchesExistingSession({
     globalFlags,
     record,
@@ -1141,15 +1171,8 @@ export async function handleCancel(
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const { cancelSessionPrompt } = await loadSessionModule();
-  const gitRoot = findGitRepositoryRoot(agent.cwd);
-  const walkBoundary = gitRoot ?? agent.cwd;
-  const record = await findSessionByDirectoryWalk({
-    agentCommand: agent.agentCommand,
-    agentName: agent.agentName,
-    cwd: agent.cwd,
-    name: resolveSessionNameFromFlags(flags, command),
-    boundary: walkBoundary,
-  });
+  const selector = resolveSessionTargetSelector({ flags, command });
+  const record = await findOptionalRoutedTargetSession(agent, selector);
 
   if (!record) {
     printCancelResultByFormat({ sessionId: "", cancelled: false }, globalFlags.format);
@@ -1173,12 +1196,8 @@ export async function handleSetMode(
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const { setSessionMode } = await loadSessionModule();
-  const record = await findRoutedSessionOrThrow(
-    agent.agentCommand,
-    agent.agentName,
-    agent.cwd,
-    resolveSessionNameFromFlags(flags, command),
-  );
+  const selector = resolveSessionTargetSelector({ flags, command });
+  const record = await findRoutedTargetSessionOrThrow(agent, selector);
   const result = await setSessionMode({
     sessionId: record.acpxRecordId,
     modeId,
@@ -1210,12 +1229,8 @@ export async function handleSetModel(
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const { setSessionModel } = await loadSessionModule();
-  const record = await findRoutedSessionOrThrow(
-    agent.agentCommand,
-    agent.agentName,
-    agent.cwd,
-    resolveSessionNameFromFlags(flags, command),
-  );
+  const selector = resolveSessionTargetSelector({ flags, command });
+  const record = await findRoutedTargetSessionOrThrow(agent, selector);
   const result = await setSessionModel({
     sessionId: record.acpxRecordId,
     modelId,
@@ -1259,12 +1274,8 @@ export async function handleSetConfigOption(
   }
   const resolvedConfigId = resolveCompatibleConfigId(agent, configId);
   const { setSessionConfigOption } = await loadSessionModule();
-  const record = await findRoutedSessionOrThrow(
-    agent.agentCommand,
-    agent.agentName,
-    agent.cwd,
-    resolveSessionNameFromFlags(flags, command),
-  );
+  const selector = resolveSessionTargetSelector({ flags, command });
+  const record = await findRoutedTargetSessionOrThrow(agent, selector);
   const result = await setSessionConfigOption({
     sessionId: record.acpxRecordId,
     configId: resolvedConfigId,
@@ -1308,18 +1319,13 @@ export async function handleSetSubscription(
       registry.subscriptions.map((entry) => entry.id),
     );
   }
-  const sessionName = resolveSessionNameFromFlags(flags, command);
-  const record = await findRoutedSessionOrThrow(
-    agent.agentCommand,
-    agent.agentName,
-    agent.cwd,
-    sessionName,
-  );
+  const selector = resolveSessionTargetSelector({ flags, command });
+  const record = await findRoutedTargetSessionOrThrow(agent, selector);
   const { setSessionSubscription } = await loadSessionModule();
   const result = await setSessionSubscription({
     sessionId: record.acpxRecordId,
     subscriptionId: trimmedId,
-    sessionName: sessionName ?? record.name,
+    sessionName: selector.name ?? record.name,
     verbose: globalFlags.verbose,
   });
   printSetSubscriptionResultByFormat(result, globalFlags.format);
@@ -1400,12 +1406,8 @@ export async function handleSessionsSetMetadata(
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const trimmedValue = validateSessionMetadataValue(key, value);
-  const record = await findRoutedSessionOrThrow(
-    agent.agentCommand,
-    agent.agentName,
-    agent.cwd,
-    resolveSessionNameFromFlags(flags, command),
-  );
+  const selector = resolveSessionTargetSelector({ flags, command });
+  const record = await findRoutedTargetSessionOrThrow(agent, selector);
   if (key === "task_folder") {
     await warnIfTaskFolderMissing(trimmedValue);
   }
@@ -1496,6 +1498,7 @@ export async function handleSessionsList(
 export async function handleSessionsClose(
   explicitAgentName: string | undefined,
   sessionName: string | undefined,
+  flags: StatusFlags,
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
@@ -1506,12 +1509,16 @@ export async function handleSessionsClose(
     loadOutputRenderModule(),
   ]);
 
-  const record = await findSession({
-    agentCommand: agent.agentCommand,
-    agentName: agent.agentName,
-    cwd: agent.cwd,
-    name: sessionName,
-  });
+  const selector = resolveSessionTargetSelector({ flags, command, positionalName: sessionName });
+  const explicitRecord = await resolveExplicitSessionRecord(selector);
+  const record =
+    explicitRecord ??
+    (await findSession({
+      agentCommand: agent.agentCommand,
+      agentName: agent.agentName,
+      cwd: agent.cwd,
+      name: selector.name,
+    }));
 
   if (!record) {
     throw new Error(missingScopedSessionMessage(agent, sessionName));
@@ -2007,15 +2014,17 @@ function printSessionHistoryByFormat(
 export async function handleSessionsShow(
   explicitAgentName: string | undefined,
   sessionName: string | undefined,
+  flags: StatusFlags,
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const selector = resolveSessionTargetSelector({ flags, command, positionalName: sessionName });
   const record = await findReadableSessionOrThrow({
     explicitAgentName,
     agent,
-    sessionNameOrId: sessionName,
+    selector,
     subcommand: "show",
     config,
   });
@@ -2033,10 +2042,11 @@ export async function handleSessionsHistory(
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const subcommand = command.name() === "read" ? "read" : "history";
+  const selector = resolveSessionTargetSelector({ flags, command, positionalName: sessionName });
   const record = await findReadableSessionOrThrow({
     explicitAgentName,
     agent,
-    sessionNameOrId: sessionName,
+    selector,
     subcommand,
     config,
   });
@@ -2054,14 +2064,18 @@ export async function handleSessionsExport(
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const cwd = flags.sourceCwd ? path.resolve(agent.cwd, flags.sourceCwd) : agent.cwd;
+  const selector = resolveSessionTargetSelector({ flags, command, positionalName: sessionName });
+  const explicitSessionId = explicitSessionIdFromSelector(selector);
 
   await exportSession(
-    {
-      agentName: globalFlags.agent ? undefined : agent.agentName,
-      agentCommand: agent.agentCommand,
-      cwd,
-      name: sessionName,
-    },
+    explicitSessionId
+      ? { sessionId: explicitSessionId }
+      : {
+          agentName: globalFlags.agent ? undefined : agent.agentName,
+          agentCommand: agent.agentCommand,
+          cwd,
+          name: selector.name,
+        },
     flags.output,
   );
 

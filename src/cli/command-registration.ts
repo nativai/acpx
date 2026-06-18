@@ -27,6 +27,7 @@ import {
 import { registerConfigCommand } from "./config-command.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import {
+  addSessionIdentityOptions,
   addPromptInputOption,
   addSessionNameOption,
   addSessionOption,
@@ -192,13 +193,14 @@ export function registerSessionsCommand(
       await handleSessionsEnsure(explicitAgentName, flags, this, config);
     });
 
-  sessionsCommand
+  const closeCommand = sessionsCommand
     .command("close")
     .description("Close session for current cwd")
-    .argument("[name]", "Session name", parseSessionName)
-    .action(async function (this: Command, name?: string) {
-      await handleSessionsClose(explicitAgentName, name, this, config);
-    });
+    .argument("[name]", "Session name", parseSessionName);
+  addSessionIdentityOptions(closeCommand);
+  closeCommand.action(async function (this: Command, name: string | undefined, flags: StatusFlags) {
+    await handleSessionsClose(explicitAgentName, name, flags, this, config);
+  });
 
   sessionsCommand
     .command("copy")
@@ -263,13 +265,14 @@ export function registerSessionsCommand(
       await handleSessionsOwnerStatus(id);
     });
 
-  sessionsCommand
+  const showCommand = sessionsCommand
     .command("show")
     .description("Show session metadata for current cwd")
-    .argument("[name]", "Session name", parseSessionName)
-    .action(async function (this: Command, name?: string) {
-      await handleSessionsShow(explicitAgentName, name, this, config);
-    });
+    .argument("[name]", "Session name", parseSessionName);
+  addSessionIdentityOptions(showCommand);
+  showCommand.action(async function (this: Command, name: string | undefined, flags: StatusFlags) {
+    await handleSessionsShow(explicitAgentName, name, flags, this, config);
+  });
 
   const setMetadataCommand = sessionsCommand
     .command("set-metadata")
@@ -290,7 +293,7 @@ export function registerSessionsCommand(
     await handleSessionsSetMetadata(explicitAgentName, key, value, flags, this, config);
   });
 
-  sessionsCommand
+  const historyCommand = sessionsCommand
     .command("history")
     .description("Show recent session history entries")
     .argument("[name]", "Session name", parseSessionName)
@@ -299,12 +302,17 @@ export function registerSessionsCommand(
       `Maximum number of entries to show (default: ${DEFAULT_HISTORY_LIMIT})`,
       parseHistoryLimit,
       DEFAULT_HISTORY_LIMIT,
-    )
-    .action(async function (this: Command, name: string | undefined, flags: SessionsHistoryFlags) {
-      await handleSessionsHistory(explicitAgentName, name, flags, this, config);
-    });
+    );
+  addSessionIdentityOptions(historyCommand);
+  historyCommand.action(async function (
+    this: Command,
+    name: string | undefined,
+    flags: SessionsHistoryFlags,
+  ) {
+    await handleSessionsHistory(explicitAgentName, name, flags, this, config);
+  });
 
-  sessionsCommand
+  const readCommand = sessionsCommand
     .command("read")
     .description("Read full session history")
     .argument("[name]", "Session name", parseSessionName)
@@ -312,18 +320,28 @@ export function registerSessionsCommand(
       "--tail <count>",
       "Show only the last N entries instead of all history",
       parseHistoryLimit,
-    )
-    .action(async function (this: Command, name: string | undefined, flags: { tail?: number }) {
-      await handleSessionsHistory(
-        explicitAgentName,
-        name,
-        { limit: flags.tail ?? 0 },
-        this,
-        config,
-      );
-    });
+    );
+  addSessionIdentityOptions(readCommand);
+  readCommand.action(async function (
+    this: Command,
+    name: string | undefined,
+    flags: { tail?: number } & StatusFlags,
+  ) {
+    await handleSessionsHistory(
+      explicitAgentName,
+      name,
+      {
+        limit: flags.tail ?? 0,
+        session: flags.session,
+        sessionId: flags.sessionId,
+        sessionUrl: flags.sessionUrl,
+      },
+      this,
+      config,
+    );
+  });
 
-  sessionsCommand
+  const exportCommand = sessionsCommand
     .command("export")
     .description("Export a portable session archive")
     .argument("[name]", "Session name", parseSessionName)
@@ -334,10 +352,15 @@ export function registerSessionsCommand(
       new LocalAttributeOption("--cwd <cwd>", "Session cwd to export", "sourceCwd").argParser(
         (value: string) => parseNonEmptyValue("Session cwd", value),
       ),
-    )
-    .action(async function (this: Command, name: string | undefined, flags: SessionsExportFlags) {
-      await handleSessionsExport(explicitAgentName, name, flags, this, config);
-    });
+    );
+  addSessionIdentityOptions(exportCommand);
+  exportCommand.action(async function (
+    this: Command,
+    name: string | undefined,
+    flags: SessionsExportFlags,
+  ) {
+    await handleSessionsExport(explicitAgentName, name, flags, this, config);
+  });
 
   sessionsCommand
     .command("import")
