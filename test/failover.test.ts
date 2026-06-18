@@ -41,6 +41,76 @@ test("classifyFailover maps the auth-required ACP code (-32000) to auth_failed",
   );
 });
 
+// S1 — THE CRUX. A claude-pty bridge whose stored Claude login expired throws a
+// generic AdapterHealthError on the catch-all code -32000 carrying
+// data.reason/state === "auth-gated". This MUST classify as "auth_gated" (a
+// distinct, non-quota trigger), NOT "auth_failed" — otherwise it rides the
+// subscription failover+dead-mark machinery and collapses to a false exhaustion.
+test("S1: classifyFailover maps an auth-gated bridge health error (-32000 + reason/state) to auth_gated", () => {
+  // Direct payload shape.
+  assert.equal(
+    classifyFailover({
+      code: -32000,
+      message: "Interactive Claude login is required for this HOME",
+      data: { reason: "auth-gated", state: "auth-gated" },
+    }),
+    "auth_gated",
+  );
+  // Real path: the adapter error reaches acpx nested under `.acp`.
+  assert.equal(
+    classifyFailover({
+      acp: {
+        code: -32000,
+        message: "Interactive Claude login is required for this HOME",
+        data: { reason: "auth-gated", state: "auth-gated", health: { canAcceptPrompt: false } },
+      },
+    }),
+    "auth_gated",
+  );
+});
+
+test("S1: auth-gated detection fires on reason alone and on state alone", () => {
+  assert.equal(
+    classifyFailover({
+      acp: { code: -32000, message: "login required", data: { reason: "auth-gated" } },
+    }),
+    "auth_gated",
+  );
+  assert.equal(
+    classifyFailover({
+      acp: { code: -32000, message: "login required", data: { state: "auth-gated" } },
+    }),
+    "auth_gated",
+  );
+});
+
+// S2 — regression. A real subscription 401 carries -32000 with NO auth-gated
+// data, so it must stay "auth_failed" (this pins the carve-out: auth-gated is
+// detected ahead of the -32000 rule, but the -32000 rule itself is unchanged).
+test("S2: a plain -32000 (no auth-gated data) still classifies as auth_failed, not auth_gated", () => {
+  assert.equal(
+    classifyFailover({
+      acp: { code: -32000, message: "Please run /login", data: { reason: "other" } },
+    }),
+    "auth_failed",
+  );
+});
+
+// S2 — regression. errorKind classification wins ahead of any auth-gated data,
+// so a rate-limit that also happens to carry an auth-gated hint stays rate_limit.
+test("S2: errorKind (rate_limit) still wins even if auth-gated data is also present", () => {
+  assert.equal(
+    classifyFailover({
+      acp: {
+        code: -32603,
+        message: "rate limited",
+        data: { errorKind: "rate_limit", state: "auth-gated" },
+      },
+    }),
+    "rate_limit",
+  );
+});
+
 test("classifyFailover string-match fallback catches 429 / usage limit", () => {
   assert.equal(classifyFailover(new Error("HTTP 429 rate limited")), "rate_limit");
   assert.equal(classifyFailover(new Error("You have hit your usage limit")), "rate_limit");

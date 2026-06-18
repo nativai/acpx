@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { isAcpJsonRpcMessage } from "../src/acp/jsonrpc.js";
 import { resetKnownDeadSubs } from "../src/config/known-dead-subscriptions.js";
-import { AllSubscriptionsExhaustedError } from "../src/errors.js";
+import { AllSubscriptionsExhaustedError, BridgeAuthGatedError } from "../src/errors.js";
 import { attemptFailoverAndRetry } from "../src/runtime/engine/failover.js";
 import { defaultSessionEventLog, sessionEventActivePath } from "../src/session/event-log.js";
 import { persistTerminalTurnError } from "../src/session/persist-terminal-error.js";
@@ -185,5 +185,115 @@ test("a real exhausted turn persists the terminal error to .stream.ndjson with d
       process.env.HOME = prevHome;
     }
     await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
+// The auth-gated bridge failure shape (claude-pty AdapterHealthError surfaced to
+// acpx as a generic -32000 with data.reason/state === "auth-gated").
+function authGatedError(message: string, effectiveAccount: string): Error {
+  const error = new Error(message);
+  (error as { acp?: { code: number; message: string; data: Record<string, unknown> } }).acp = {
+    code: -32000,
+    message,
+    data: { reason: "auth-gated", state: "auth-gated" },
+  };
+  (error as { effectiveAccountMetadata?: { effectiveAccount: string } }).effectiveAccountMetadata =
+    {
+      effectiveAccount,
+    };
+  return error;
+}
+
+// S5 (persist half) + S6 (UI contract): an auth-gated bridge pool throws a
+// BridgeAuthGatedError, and persistTerminalTurnError must write its terminal line
+// to .stream.ndjson carrying detailCode === "auth-gated" — the EXACT value
+// acpx-ui's stream-tail derivation maps to lastError.code === 'auth-gated', which
+// renders the AuthGatedBanner (NOT the exhausted/quota banner). This is the
+// surfacing fix that replaces the false "all subscriptions exhausted" verdict.
+test("an auth-gated bridge turn persists a terminal error with detailCode 'auth-gated'", async () => {
+  resetKnownDeadSubs();
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-authgated-"));
+  const subsDir = path.join(home, ".acpx", "subscriptions");
+  const registryPath = path.join(subsDir, "registry.json");
+  const homePath = path.join(subsDir, "bridge-solo-home");
+  const prevHome = process.env.HOME;
+  process.env.HOME = home;
+
+  try {
+    // A single claude-home bridge profile (no sibling) whose login is gated.
+    await fs.mkdir(path.join(homePath, ".claude"), { recursive: true });
+    await fs.mkdir(subsDir, { recursive: true });
+    await fs.writeFile(
+      registryPath,
+      JSON.stringify({
+        version: 3,
+        default: "bridge-solo",
+        profiles: [
+          {
+            id: "bridge-solo",
+            label: "bridge-solo",
+            authMode: "claude-home",
+            adapter: "claude-pty",
+            account: "acct-bridge-solo",
+            credentialSource: null,
+            homePath,
+          },
+        ],
+      }),
+    );
+
+    const record = makeRecord("rec-authgated");
+    record.acpx = { session_options: { profile: "bridge-solo" } };
+    await writeSessionRecord(record);
+
+    // 1) Produce a GENUINE BridgeAuthGatedError (selected bridge gated, no sibling).
+    let caught: unknown;
+    await assert.rejects(
+      () =>
+        attemptFailoverAndRetry<string>({
+          record,
+          triggerError: authGatedError(
+            "Interactive Claude login is required for this HOME",
+            "acct-bridge-solo",
+          ),
+          loadOpts: { registryPath },
+          runTurn: async () => "should-not-run",
+        }),
+      (err: unknown) => {
+        caught = err;
+        return err instanceof BridgeAuthGatedError;
+      },
+    );
+
+    // 2) Run the exact persistence the runtime chokepoint runs.
+    await persistTerminalTurnError(record, caught);
+
+    // 3) Read the terminal line back off the session stream the UI consumes.
+    const streamPath = sessionEventActivePath("rec-authgated");
+    const raw = await fs.readFile(streamPath, "utf8");
+    const lines = raw.split("\n").filter((l) => l.trim().length > 0);
+    assert.equal(lines.length, 1, "exactly one terminal error line persisted");
+    const parsed = JSON.parse(lines[0]) as Record<string, unknown>;
+
+    assert.equal(isAcpJsonRpcMessage(parsed), true);
+    assert.equal("method" in parsed, false);
+
+    // S6: acpx-ui derives lastError.code === 'auth-gated' from this line.
+    const lastError = extractLastErrorLikeAcpxUi(parsed);
+    assert.ok(lastError, "acpx-ui derives a lastError from the line");
+    assert.equal(lastError.code, "auth-gated");
+    assert.match(lastError.message, /Claude bridge needs an interactive login/);
+
+    const err = parsed.error as { code: unknown; message: unknown; data: { detailCode: unknown } };
+    assert.equal(typeof err.code, "number");
+    assert.equal(err.data.detailCode, "auth-gated");
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    await fs.rm(home, { recursive: true, force: true });
+    resetKnownDeadSubs();
   }
 });

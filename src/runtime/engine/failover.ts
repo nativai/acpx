@@ -16,7 +16,7 @@ import {
   type SubscriptionEntry,
   type SubscriptionLookupOptions,
 } from "../../config/subscriptions.js";
-import { AllSubscriptionsExhaustedError } from "../../errors.js";
+import { AllSubscriptionsExhaustedError, BridgeAuthGatedError } from "../../errors.js";
 import { writeSessionRecord } from "../../session/persistence/repository.js";
 import type { SessionRecord } from "../../types.js";
 import {
@@ -46,7 +46,7 @@ import {
 // contract; the unit test pins it so any change is a deliberate, reviewed edit,
 // and the string-match fallback covers a silent upstream rename.
 
-export type FailoverTrigger = "rate_limit" | "auth_failed" | "billing" | null;
+export type FailoverTrigger = "rate_limit" | "auth_failed" | "billing" | "auth_gated" | null;
 
 /** The adapter-supplied `data.errorKind` values that warrant a sub failover. */
 export const FAILOVER_ERROR_KINDS = {
@@ -94,6 +94,17 @@ function errorMessageText(error: unknown): string {
   return typeof error === "string" ? error : "";
 }
 
+// A claude-pty bridge whose stored Claude login expired surfaces as a generic
+// AdapterHealthError on the adapter's catch-all code (-32000) carrying
+// data.reason/state === "auth-gated". Detect that auth-gated state explicitly so
+// it does NOT collapse into the broad "-32000 → auth_failed" rule below (which is
+// reserved for a real subscription 401). Mirrors acpx-ui's isAuthGatedTailError —
+// the single source of truth for this cross-repo contract.
+function isAuthGatedAcp(acp: ReturnType<typeof extractAcpError>): boolean {
+  const data = asRecord(acp?.data);
+  return data?.reason === "auth-gated" || data?.state === "auth-gated";
+}
+
 function classifyFromAcp(acp: ReturnType<typeof extractAcpError>): FailoverTrigger {
   // 1. Machine-readable errorKind (preferred).
   const kind = errorKindFromData(acp?.data);
@@ -101,7 +112,12 @@ function classifyFromAcp(acp: ReturnType<typeof extractAcpError>): FailoverTrigg
   if (byKind) {
     return byKind;
   }
-  // 2. Auth-required ACP code (401 / login path) → dead sub.
+  // 2. Auth-gated bridge (expired claude-home login) → distinct trigger, ahead
+  //    of the generic -32000 rule. Still non-null so failover engages.
+  if (isAuthGatedAcp(acp)) {
+    return "auth_gated";
+  }
+  // 3. Auth-required ACP code (401 / login path) → dead sub.
   return acp?.code === AUTH_REQUIRED_ACP_CODE ? "auth_failed" : null;
 }
 
@@ -114,6 +130,21 @@ export function classifyFailover(error: unknown): FailoverTrigger {
   // 3. String-match fallback for a 429/usage-limit with no errorKind.
   const message = acp?.message ?? errorMessageText(error);
   return message && matchesRateLimitText(message) ? "rate_limit" : null;
+}
+
+// A non-quota failure (auth-gated bridge / subscription 401) carries no reset
+// timestamp, so without this it would fall to the process-lifetime sentinel
+// (9999-…) in markAccountDeadSync — locking the account out for the rest of the
+// process with no auto-recovery even after the login is fixed. Bound it to a
+// short TTL instead: activeDeadUntil() treats a past deadUntil as "not dead", so
+// the account auto-re-probes in ~1 min. Quota (rate_limit/billing) is unaffected
+// — those keep today's reset-or-sentinel behavior.
+const NON_QUOTA_DEAD_TTL_MS = 60_000;
+
+function nonQuotaDeadUntil(trigger: FailoverTrigger): string | undefined {
+  return trigger === "auth_gated" || trigger === "auth_failed"
+    ? new Date(Date.now() + NON_QUOTA_DEAD_TTL_MS).toISOString()
+    : undefined;
 }
 
 /**
@@ -472,11 +503,21 @@ function noPortableSiblingMessage(
   );
 }
 
-function exhaustedError(
+// Choose the terminal error class by the INITIAL trigger (the user's selected
+// profile's failure — the actionable cause; sibling reasons are incidental). An
+// auth-gated bridge → BridgeAuthGatedError (detailCode 'auth-gated' → acpx-ui's
+// AuthGatedBanner, "log in"); everything else (quota/401) →
+// AllSubscriptionsExhaustedError (detailCode 'all-subscriptions-exhausted' →
+// ExhaustedBanner, "free up quota"). UNCHANGED for every non-auth-gated trigger.
+function makeExhaustedError(
+  initialTrigger: FailoverTrigger,
   statuses: string[],
   context: EffectiveAccountMetadata,
-): AllSubscriptionsExhaustedError {
-  const error = new AllSubscriptionsExhaustedError(statuses.join("; "));
+): AllSubscriptionsExhaustedError | BridgeAuthGatedError {
+  const error =
+    initialTrigger === "auth_gated"
+      ? new BridgeAuthGatedError(statuses.join("; "))
+      : new AllSubscriptionsExhaustedError(statuses.join("; "));
   attachEffectiveAccount(error, context);
   return error;
 }
@@ -509,19 +550,20 @@ async function requirePickedTarget(
   current: ResolvedProfile,
   context: EffectiveAccountMetadata,
   restoreOriginalSelection: () => Promise<void>,
+  initialTrigger: FailoverTrigger,
 ): Promise<ResolvedProfile> {
   if (picked.siblingCount === 0) {
     await restoreOriginalSelection();
     const health = await getAccountHealth(context.effectiveAccount);
-    throw exhaustedError([noSiblingMessage(current, context, health)], context);
+    throw makeExhaustedError(initialTrigger, [noSiblingMessage(current, context, health)], context);
   }
   if (picked.portableCount === 0) {
     await restoreOriginalSelection();
-    throw exhaustedError([noPortableSiblingMessage(current, context)], context);
+    throw makeExhaustedError(initialTrigger, [noPortableSiblingMessage(current, context)], context);
   }
   if (!picked.target) {
     await restoreOriginalSelection();
-    throw exhaustedError(picked.statuses, context);
+    throw makeExhaustedError(initialTrigger, picked.statuses, context);
   }
   return picked.target;
 }
@@ -579,10 +621,17 @@ export async function attemptFailoverAndRetry<T>(args: {
   // re-pick it this turn.
   const tried = new Set<string>();
   tried.add(initialContext.effectiveAccount);
+  const initialTrigger = classifyFailover(args.triggerError);
+  // Non-quota triggers (auth-gated / 401) have no legitimate reset window, so the
+  // bounded TTL takes precedence: it both prevents the process-lifetime sentinel
+  // AND avoids resetIsoFromError misreading an incidental numeric field (e.g. the
+  // adapter's -32000 health code) as a bogus epoch reset. Quota triggers
+  // (rate_limit / billing) yield `undefined` here and fall through to the genuine
+  // reset timestamp (or today's sentinel when absent) — byte-identical to before.
   await markAccountDead(
     initialContext.effectiveAccount,
     "failover trigger",
-    resetIsoFromError(args.triggerError),
+    nonQuotaDeadUntil(initialTrigger) ?? resetIsoFromError(args.triggerError),
   );
 
   for (let attempt = 0; ; attempt++) {
@@ -592,6 +641,7 @@ export async function attemptFailoverAndRetry<T>(args: {
       current,
       lastFailureContext,
       restoreOriginalSelection,
+      initialTrigger,
     );
     await switchToFailoverTarget({
       record: args.record,
@@ -620,7 +670,11 @@ export async function attemptFailoverAndRetry<T>(args: {
       // direct unit harnesses that do not spawn an adapter.
       lastFailureContext = failureContext(retryError, target);
       tried.add(lastFailureContext.effectiveAccount);
-      await markAccountDead(lastFailureContext.effectiveAccount, `failover retry ${trigger}`);
+      await markAccountDead(
+        lastFailureContext.effectiveAccount,
+        `failover retry ${trigger}`,
+        nonQuotaDeadUntil(trigger),
+      );
     }
   }
 }
