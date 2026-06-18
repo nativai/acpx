@@ -56,7 +56,11 @@ import { defaultSessionEventLog } from "../../session/event-log.js";
 import { SessionEventWriter } from "../../session/events.js";
 import { LiveSessionCheckpoint } from "../../session/live-checkpoint.js";
 import { copyLoggedMessageCount } from "../../session/messages-log-bookkeeping.js";
-import { setCurrentModelId, setDesiredModelId } from "../../session/mode-preference.js";
+import {
+  mergeLatestDurableAcpxPreferences,
+  setCurrentModelId,
+  setDesiredModelId,
+} from "../../session/mode-preference.js";
 import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
 import {
   ownerOptionsToInput,
@@ -997,15 +1001,26 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   const preserveClosedState = async (): Promise<void> => {
     applyPersistedClosedState(await readPersistedLifecycle(record.acpxRecordId));
   };
+  const mergeLatestDurablePreferences = (
+    persisted: PersistedSessionLifecycle | undefined,
+  ): void => {
+    acpxState = cloneSessionAcpxState(
+      mergeLatestDurableAcpxPreferences(acpxState, persisted?.acpx),
+    );
+    record.acpx = acpxState;
+  };
+  const mergeLatestDurablePreferencesFromDisk = async (): Promise<void> => {
+    mergeLatestDurablePreferences(await readPersistedLifecycle(record.acpxRecordId));
+  };
   const liveCheckpoint = new LiveSessionCheckpoint({
     save: async () => {
       await flushPendingMessages(false);
       record.lastUsedAt = isoNow();
       applyConversation(record, conversation);
-      record.acpx = acpxState;
       // Exactly ONE full record read per checkpoint (W2.4): this read feeds
       // both the closed-state merge and the write's lifecycle preserve.
       const persisted = await readPersistedLifecycle(record.acpxRecordId);
+      mergeLatestDurablePreferences(persisted);
       applyPersistedClosedState(persisted);
       await eventWriter.checkpoint({ persistedLifecycle: { value: persisted } });
     },
@@ -1512,7 +1527,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     record.protocolVersion = client.initializeResult?.protocolVersion;
     record.agentCapabilities = client.initializeResult?.agentCapabilities;
     applyConversation(record, conversation);
-    record.acpx = acpxState;
+    await mergeLatestDurablePreferencesFromDisk();
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
     stopTotalTimer();
     return response;
@@ -1530,6 +1545,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
           record,
           timeoutMs: options.timeoutMs,
         });
+        acpxState = cloneSessionAcpxState(record.acpx);
 
         output.setContext({
           sessionId: record.acpxRecordId,
@@ -1561,7 +1577,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
         record.lastUsedAt = isoNow();
         applyConversation(record, conversation);
-        record.acpx = acpxState;
+        await mergeLatestDurablePreferencesFromDisk().catch(() => {
+          record.acpx = acpxState;
+        });
         await flushPendingMessages(false).catch(() => {
           // best effort while process is being interrupted
         });
@@ -1600,9 +1618,14 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     }
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
     applyConversation(record, conversation);
-    record.acpx = acpxState;
+    await mergeLatestDurablePreferencesFromDisk().catch(() => {
+      record.acpx = acpxState;
+    });
     await liveCheckpoint.flush().catch(() => {
       // best effort on close
+    });
+    await mergeLatestDurablePreferencesFromDisk().catch(() => {
+      record.acpx = acpxState;
     });
     await flushPendingMessages(false).catch(() => {
       // best effort on close

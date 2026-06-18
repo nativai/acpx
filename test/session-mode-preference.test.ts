@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   getDesiredConfigOptions,
   getDesiredModeId,
+  mergeLatestDurableAcpxPreferences,
   normalizeModeId,
   setDesiredConfigOption,
   setDesiredModeId,
@@ -55,6 +56,89 @@ test("setDesiredConfigOption persists non-mode config option preferences", () =>
 
   setDesiredConfigOption(record, "reasoning_effort", undefined);
   assert.deepEqual(record.acpx, {});
+});
+
+test("setDesiredConfigOption keeps effort aligned with session options", () => {
+  const record = makeSessionRecord();
+  record.acpx = {
+    session_options: {
+      model: "sonnet",
+      subscription_switch: {
+        to: "sub-b",
+        reason: "manual",
+        at: "2026-01-02T00:00:00.000Z",
+      },
+    },
+  };
+
+  setDesiredConfigOption(record, "effort", "low");
+  assert.deepEqual(record.acpx, {
+    desired_config_options: {
+      effort: "low",
+    },
+    session_options: {
+      model: "sonnet",
+      effort: "low",
+      subscription_switch: {
+        to: "sub-b",
+        reason: "manual",
+        at: "2026-01-02T00:00:00.000Z",
+      },
+    },
+  });
+
+  setDesiredConfigOption(record, "effort", undefined);
+  assert.deepEqual(record.acpx, {
+    session_options: {
+      model: "sonnet",
+      subscription_switch: {
+        to: "sub-b",
+        reason: "manual",
+        at: "2026-01-02T00:00:00.000Z",
+      },
+    },
+  });
+});
+
+test("mergeLatestDurableAcpxPreferences preserves newer replay intent", () => {
+  const merged = mergeLatestDurableAcpxPreferences(
+    {
+      desired_config_options: {
+        approval: "manual",
+      },
+      session_options: {
+        subscription: "sub-a",
+        model: "old-model",
+      },
+      config_options: [
+        {
+          id: "effort",
+          name: "Effort",
+          type: "select",
+          currentValue: "high",
+          options: [{ value: "high", name: "High" }],
+        },
+      ],
+    },
+    {
+      desired_config_options: {
+        effort: "low",
+      },
+      session_options: {
+        model: "smart-model",
+        effort: "low",
+      },
+    },
+  );
+
+  assert.deepEqual(merged?.desired_config_options, {
+    approval: "manual",
+    effort: "low",
+  });
+  assert.equal(merged?.session_options?.subscription, "sub-a");
+  assert.equal(merged?.session_options?.model, "smart-model");
+  assert.equal(merged?.session_options?.effort, "low");
+  assert.equal(merged?.config_options?.[0]?.currentValue, "high");
 });
 
 function makeSessionRecord(): SessionRecord {

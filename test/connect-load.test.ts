@@ -127,6 +127,149 @@ test("connectAndLoadSession prefers session/resume for resume-capable sessions",
   });
 });
 
+test("connectAndLoadSession replays desired config options after cold session/resume", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "resume-config-replay-record",
+      acpSessionId: "resume-session",
+      agentSessionId: "old-runtime-session",
+      agentCommand: "agent",
+      cwd,
+      acpx: {
+        desired_config_options: {
+          effort: "low",
+        },
+      },
+    });
+
+    const configCalls: Array<{ sessionId: string; configId: string; value: string }> = [];
+    let started = false;
+    let resumed = false;
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {
+        started = true;
+      },
+      getAgentLifecycleSnapshot: () => ({
+        running: true,
+      }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => true,
+      resumeSession: async (sessionId, resumeCwd) => {
+        resumed = true;
+        assert.equal(sessionId, "resume-session");
+        assert.equal(resumeCwd, cwd);
+        return { agentSessionId: "resumed-runtime-session" };
+      },
+      loadSessionWithOptions: async () => {
+        throw new Error("loadSessionWithOptions should not be called");
+      },
+      createSession: async () => {
+        throw new Error("createSession should not be called");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+      setSessionConfigOption: async (sessionId, configId, value) => {
+        configCalls.push({ sessionId, configId, value });
+        return { configOptions: [] };
+      },
+    };
+
+    const result = await connectAndLoadSession({
+      client: client as never,
+      record,
+      timeoutMs: 1_000,
+      activeController: ACTIVE_CONTROLLER,
+    });
+
+    assert.equal(started, true);
+    assert.equal(resumed, true);
+    assert.deepEqual(result, {
+      sessionId: "resume-session",
+      agentSessionId: "resumed-runtime-session",
+      resumed: true,
+      loadError: undefined,
+    });
+    assert.deepEqual(configCalls, [
+      {
+        sessionId: "resume-session",
+        configId: "effort",
+        value: "low",
+      },
+    ]);
+    assert.equal(record.acpx?.desired_config_options?.effort, "low");
+  });
+});
+
+test("connectAndLoadSession replays desired config options after cold session/load", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "load-config-replay-record",
+      acpSessionId: "load-session",
+      agentCommand: "agent",
+      cwd,
+      acpx: {
+        desired_config_options: {
+          effort: "low",
+        },
+      },
+    });
+
+    const configCalls: Array<{ sessionId: string; configId: string; value: string }> = [];
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({
+        running: true,
+      }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
+      loadSessionWithOptions: async (sessionId, loadCwd, options) => {
+        assert.equal(sessionId, "load-session");
+        assert.equal(loadCwd, cwd);
+        assert.deepEqual(options, { suppressReplayUpdates: true });
+        return { agentSessionId: "loaded-runtime-session" };
+      },
+      createSession: async () => {
+        throw new Error("createSession should not be called");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+      setSessionConfigOption: async (sessionId, configId, value) => {
+        configCalls.push({ sessionId, configId, value });
+        return { configOptions: [] };
+      },
+    };
+
+    const result = await connectAndLoadSession({
+      client: client as never,
+      record,
+      activeController: ACTIVE_CONTROLLER,
+    });
+
+    assert.deepEqual(result, {
+      sessionId: "load-session",
+      agentSessionId: "loaded-runtime-session",
+      resumed: true,
+      loadError: undefined,
+    });
+    assert.deepEqual(configCalls, [
+      {
+        sessionId: "load-session",
+        configId: "effort",
+        value: "low",
+      },
+    ]);
+    assert.equal(record.acpx?.desired_config_options?.effort, "low");
+  });
+});
+
 test("connectAndLoadSession resumes an existing load-capable session", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -1273,6 +1416,160 @@ test("connectAndLoadSession replays desired model on a fresh session", async () 
   });
 });
 
+test("connectAndLoadSession replays desired model after cold session/resume and records it current", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "resume-model-replay-record",
+      acpSessionId: "resume-session",
+      agentCommand: "codex-agent",
+      cwd,
+      acpx: {
+        current_model_id: "gpt-5.4[low]",
+        session_options: {
+          model: "gpt-5.4[xhigh]",
+        },
+      },
+    });
+
+    const resumedModels: SessionModelState = {
+      currentModelId: "gpt-5.4[low]",
+      availableModels: [
+        { modelId: "gpt-5.4[low]", name: "gpt-5.4[low]" },
+        { modelId: "gpt-5.4[xhigh]", name: "gpt-5.4[xhigh]" },
+      ],
+    };
+    const modelCalls: Array<{ sessionId: string; modelId: string }> = [];
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({
+        running: true,
+      }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => true,
+      resumeSession: async (sessionId, resumeCwd) => {
+        assert.equal(sessionId, "resume-session");
+        assert.equal(resumeCwd, cwd);
+        return {
+          agentSessionId: "resumed-runtime-session",
+          models: resumedModels,
+        };
+      },
+      loadSessionWithOptions: async () => {
+        throw new Error("loadSessionWithOptions should not be called");
+      },
+      createSession: async () => {
+        throw new Error("createSession should not be called");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async (sessionId, modelId) => {
+        modelCalls.push({ sessionId, modelId });
+      },
+      setSessionConfigOption: async () => ({ configOptions: [] }),
+    };
+
+    const result = await connectAndLoadSession({
+      client: client as never,
+      record,
+      activeController: ACTIVE_CONTROLLER,
+    });
+
+    assert.deepEqual(result, {
+      sessionId: "resume-session",
+      agentSessionId: "resumed-runtime-session",
+      resumed: true,
+      loadError: undefined,
+    });
+    assert.deepEqual(modelCalls, [
+      {
+        sessionId: "resume-session",
+        modelId: "gpt-5.4[xhigh]",
+      },
+    ]);
+    assert.equal(record.acpx?.current_model_id, "gpt-5.4[xhigh]");
+    assert.deepEqual(record.acpx?.available_models, ["gpt-5.4[low]", "gpt-5.4[xhigh]"]);
+  });
+});
+
+test("connectAndLoadSession replays desired model after cold session/load", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "load-model-replay-record",
+      acpSessionId: "load-session",
+      agentCommand: "codex-agent",
+      cwd,
+      acpx: {
+        current_model_id: "gpt-5.4[low]",
+        session_options: {
+          model: "gpt-5.4[xhigh]",
+        },
+      },
+    });
+
+    const resumedModels: SessionModelState = {
+      currentModelId: "gpt-5.4[low]",
+      availableModels: [
+        { modelId: "gpt-5.4[low]", name: "gpt-5.4[low]" },
+        { modelId: "gpt-5.4[xhigh]", name: "gpt-5.4[xhigh]" },
+      ],
+    };
+    const modelCalls: Array<{ sessionId: string; modelId: string }> = [];
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({
+        running: true,
+      }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
+      loadSessionWithOptions: async (sessionId, loadCwd, options) => {
+        assert.equal(sessionId, "load-session");
+        assert.equal(loadCwd, cwd);
+        assert.deepEqual(options, { suppressReplayUpdates: true });
+        return {
+          agentSessionId: "loaded-runtime-session",
+          models: resumedModels,
+        };
+      },
+      createSession: async () => {
+        throw new Error("createSession should not be called");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async (sessionId, modelId) => {
+        modelCalls.push({ sessionId, modelId });
+      },
+      setSessionConfigOption: async () => ({ configOptions: [] }),
+    };
+
+    const result = await connectAndLoadSession({
+      client: client as never,
+      record,
+      activeController: ACTIVE_CONTROLLER,
+    });
+
+    assert.deepEqual(result, {
+      sessionId: "load-session",
+      agentSessionId: "loaded-runtime-session",
+      resumed: true,
+      loadError: undefined,
+    });
+    assert.deepEqual(modelCalls, [
+      {
+        sessionId: "load-session",
+        modelId: "gpt-5.4[xhigh]",
+      },
+    ]);
+    assert.equal(record.acpx?.current_model_id, "gpt-5.4[xhigh]");
+    assert.deepEqual(record.acpx?.available_models, ["gpt-5.4[low]", "gpt-5.4[xhigh]"]);
+  });
+});
+
 test("connectAndLoadSession fails clearly when saved model cannot be replayed generically", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -1623,6 +1920,14 @@ test("connectAndLoadSession reuses an already loaded client session", async () =
       acpSessionId: "reused-session",
       agentCommand: "agent",
       cwd,
+      acpx: {
+        desired_config_options: {
+          effort: "low",
+        },
+        session_options: {
+          model: "gpt-5.4",
+        },
+      },
     });
 
     let started = false;
@@ -1647,7 +1952,12 @@ test("connectAndLoadSession reuses an already loaded client session", async () =
         throw new Error("createSession should not be called");
       },
       setSessionMode: async () => {},
-      setSessionModel: async () => {},
+      setSessionModel: async () => {
+        throw new Error("setSessionModel should not be called for a warm reusable session");
+      },
+      setSessionConfigOption: async () => {
+        throw new Error("setSessionConfigOption should not be called for a warm reusable session");
+      },
     };
 
     const result = await connectAndLoadSession({

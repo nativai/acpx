@@ -79,7 +79,88 @@ export function setDesiredConfigOption(
     delete acpx.desired_config_options;
   }
 
+  if (normalizedConfigId === "effort") {
+    setSessionOptionEffort(acpx, value);
+  }
+
   record.acpx = acpx;
+}
+
+function setSessionOptionEffort(acpx: SessionAcpxState, value: string | undefined): void {
+  const sessionOptions = { ...acpx.session_options };
+  if (typeof value === "string") {
+    sessionOptions.effort = value;
+  } else {
+    delete sessionOptions.effort;
+  }
+
+  if (hasSessionOptions(sessionOptions)) {
+    acpx.session_options = sessionOptions;
+  } else {
+    delete acpx.session_options;
+  }
+}
+
+function hasSessionOptions(options: NonNullable<SessionAcpxState["session_options"]>): boolean {
+  return Object.values(options).some((value) => value !== undefined);
+}
+
+export function mergeLatestDurableAcpxPreferences(
+  pending: SessionAcpxState | undefined,
+  latest: SessionAcpxState | undefined,
+): SessionAcpxState | undefined {
+  const latestState = cloneAcpxStateForPreferenceMerge(latest);
+  if (!latestState) {
+    return cloneAcpxStateForPreferenceMerge(pending);
+  }
+
+  const merged = cloneAcpxStateForPreferenceMerge(pending) ?? {};
+
+  // Runtime turn/checkpoint writers can race with `acpx set ...`. Keep durable
+  // intent from the store so a stale turn snapshot does not erase replay input.
+  if (latestState.desired_mode_id !== undefined) {
+    merged.desired_mode_id = latestState.desired_mode_id;
+  }
+  if (latestState.desired_config_options) {
+    merged.desired_config_options = {
+      ...merged.desired_config_options,
+      ...latestState.desired_config_options,
+    };
+  }
+
+  const sessionOptions = mergeLatestDurableSessionOptions(
+    merged.session_options,
+    latestState.session_options,
+  );
+  if (sessionOptions) {
+    merged.session_options = sessionOptions;
+  }
+
+  return merged;
+}
+
+function cloneAcpxStateForPreferenceMerge(
+  state: SessionAcpxState | undefined,
+): SessionAcpxState | undefined {
+  return state ? structuredClone(state) : undefined;
+}
+
+function mergeLatestDurableSessionOptions(
+  pending: SessionAcpxState["session_options"],
+  latest: SessionAcpxState["session_options"],
+): SessionAcpxState["session_options"] {
+  if (!latest || (latest.model === undefined && latest.effort === undefined)) {
+    return pending;
+  }
+
+  const merged = { ...pending };
+  if (latest.model !== undefined) {
+    merged.model = latest.model;
+  }
+  if (latest.effort !== undefined) {
+    merged.effort = latest.effort;
+  }
+  return hasSessionOptions(merged) ? merged : undefined;
 }
 
 export function getDesiredModelId(state: SessionAcpxState | undefined): string | undefined {

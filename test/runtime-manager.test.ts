@@ -1441,6 +1441,114 @@ test("AcpRuntimeManager maps active generic thinking config against live adverti
   assert.deepEqual(events, []);
 });
 
+test("AcpRuntimeManager preserves durable preferences saved while a turn is active", async () => {
+  const record = makeSessionRecord({
+    acpxRecordId: "durable-preference-race-session",
+    acpSessionId: "durable-preference-race-backend-session",
+    agentCommand: "claude --acp",
+    cwd: "/workspace",
+    acpx: {
+      config_options: [
+        {
+          id: "effort",
+          name: "Effort",
+          type: "select",
+          currentValue: "medium",
+          options: [{ value: "medium", name: "Medium" }],
+        },
+      ],
+    },
+  });
+  const store = new InMemorySessionStore([record]);
+  let handlers: FakeClientHandlers = {};
+  let resolvePromptStart!: () => void;
+  let resolvePrompt!: (value: { stopReason: string }) => void;
+  const promptStarted = new Promise<void>((resolve) => {
+    resolvePromptStart = resolve;
+  });
+  const promptResult = new Promise<{ stopReason: string }>((resolve) => {
+    resolvePrompt = resolve;
+  });
+  const manager = new AcpRuntimeManager(
+    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+    {
+      clientFactory: () =>
+        ({
+          start: async () => {},
+          close: async () => {},
+          createSession: async () => ({ sessionId: "unused" }),
+          loadSession: async () => ({ agentSessionId: "unused" }),
+          hasReusableSession: (sessionId: string) =>
+            sessionId === "durable-preference-race-backend-session",
+          supportsLoadSession: () => true,
+          supportsResumeSession: () => false,
+          loadSessionWithOptions: async () => ({ agentSessionId: "unused" }),
+          getAgentLifecycleSnapshot: () => ({ running: true }),
+          prompt: async () => {
+            resolvePromptStart();
+            return await promptResult;
+          },
+          requestCancelActivePrompt: async () => false,
+          hasActivePrompt: () => true,
+          setSessionMode: async () => {},
+          setSessionConfigOption: async () => {},
+          clearEventHandlers: () => {
+            handlers = {};
+          },
+          setEventHandlers: (nextHandlers: FakeClientHandlers) => {
+            handlers = nextHandlers;
+          },
+        }) as never,
+    },
+  );
+
+  const handle = createHandle("durable-preference-race-session");
+  const turn = manager.startTurn({
+    handle,
+    text: "hello",
+    mode: "prompt",
+    sessionMode: "persistent",
+    requestId: "req-durable-preference-race",
+  });
+  const collected = collectTurn(turn);
+  await promptStarted;
+
+  const latest = await store.load("durable-preference-race-session");
+  assert(latest);
+  latest.acpx = {
+    ...latest.acpx,
+    desired_config_options: {
+      ...latest.acpx?.desired_config_options,
+      effort: "low",
+    },
+    session_options: {
+      ...latest.acpx?.session_options,
+      model: "smart-model",
+      effort: "low",
+    },
+  };
+  await store.save(latest);
+  handlers.onSessionUpdate?.({
+    sessionId: "durable-preference-race-backend-session",
+    update: {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "checkpoint" },
+    },
+  });
+
+  resolvePrompt({ stopReason: "end_turn" });
+  const { events, result } = await collected;
+
+  assert.deepEqual(result, { status: "completed", stopReason: "end_turn" });
+  assert.deepEqual(events, [
+    { type: "text_delta", text: "checkpoint", stream: "output", tag: "agent_message_chunk" },
+  ]);
+  const stored = await store.load("durable-preference-race-session");
+  assert.equal(stored?.acpx?.desired_config_options?.effort, "low");
+  assert.equal(stored?.acpx?.session_options?.effort, "low");
+  assert.equal(stored?.acpx?.session_options?.model, "smart-model");
+});
+
 test("AcpRuntimeManager waits for active load refresh before resolving generic config keys", async () => {
   const record = makeSessionRecord({
     acpxRecordId: "loading-thinking-alias-session",

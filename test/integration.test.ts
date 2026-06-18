@@ -12,6 +12,7 @@ import {
   recordPromptSubmission,
   recordSessionUpdate,
 } from "../src/session/conversation-model.js";
+import type { SessionRecord } from "../src/types.js";
 import {
   extractAgentMessageChunkText,
   extractJsonRpcId,
@@ -1892,6 +1893,135 @@ test("integration: prompt reconnect uses session/resume when advertised", async 
         false,
       );
     } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: cold owner respawn replays mid-session effort before the next prompt", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const effortAgentCommand = `${RESUME_CAPABLE_MOCK_AGENT_COMMAND} --advertise-config-options --claude-agent-acp`;
+    const effortAgentArgs = ["--agent", effortAgentCommand, "--approve-all", "--cwd", cwd];
+
+    try {
+      const sessionId = await createSessionAndWarmOwner(effortAgentArgs, homeDir, cwd);
+
+      const setEffort = await runCli(
+        [...effortAgentArgs, "--format", "json", "set", "effort", "low"],
+        homeDir,
+      );
+      assert.equal(setEffort.code, 0, setEffort.stderr);
+      const afterSet = await readSessionRecord(homeDir, sessionId);
+      assert.equal(
+        afterSet.acpx?.desired_config_options?.effort,
+        "low",
+        `stored acpx state after set effort:\n${JSON.stringify(afterSet.acpx)}`,
+      );
+      assert.equal(
+        afterSet.acpx?.session_options?.effort,
+        "low",
+        `stored acpx state after set effort:\n${JSON.stringify(afterSet.acpx)}`,
+      );
+
+      const recovered = await runCli(
+        [...effortAgentArgs, "--format", "json", "sessions", "recover", sessionId],
+        homeDir,
+      );
+      assert.equal(recovered.code, 0, recovered.stderr);
+      const afterRecover = await readSessionRecord(homeDir, sessionId);
+      assert.equal(
+        afterRecover.acpx?.desired_config_options?.effort,
+        "low",
+        `stored acpx state after recover:\n${JSON.stringify(afterRecover.acpx)}`,
+      );
+      assert.equal(
+        afterRecover.acpx?.session_options?.effort,
+        "low",
+        `stored acpx state after recover:\n${JSON.stringify(afterRecover.acpx)}`,
+      );
+
+      const reprompt = await runCli(
+        [...effortAgentArgs, "--format", "json", "--ttl", "5", "prompt", "echo effort-replayed"],
+        homeDir,
+      );
+      assert.equal(reprompt.code, 0, reprompt.stderr);
+
+      const messages = parseJsonRpcOutputLines(reprompt.stdout);
+      assertRequestBefore(messages, "session/resume", "session/prompt", reprompt.stdout);
+      const setConfigIndex = assertRequestBefore(
+        messages,
+        "session/set_config_option",
+        "session/prompt",
+        reprompt.stdout,
+      );
+      const setConfigRequest = messages[setConfigIndex] as {
+        params?: { sessionId?: string; configId?: string; value?: string };
+      };
+      assert.equal(setConfigRequest.params?.sessionId, sessionId);
+      assert.equal(setConfigRequest.params?.configId, "effort");
+      assert.equal(setConfigRequest.params?.value, "low");
+
+      const stored = await readSessionRecord(homeDir, sessionId);
+      assert.equal(stored.acpx?.desired_config_options?.effort, "low");
+      assert.equal(stored.acpx?.session_options?.effort, "low");
+    } finally {
+      await runCli([...effortAgentArgs, "--format", "json", "sessions", "close"], homeDir).catch(
+        () => {},
+      );
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: cold owner respawn replays mid-session model before the next prompt", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const modelAgentCommand = `${RESUME_CAPABLE_MOCK_AGENT_COMMAND} --advertise-models`;
+    const modelAgentArgs = ["--agent", modelAgentCommand, "--approve-all", "--cwd", cwd];
+
+    try {
+      const sessionId = await createSessionAndWarmOwner(modelAgentArgs, homeDir, cwd);
+
+      const setModel = await runCli(
+        [...modelAgentArgs, "--format", "json", "set", "model", "smart-model"],
+        homeDir,
+      );
+      assert.equal(setModel.code, 0, setModel.stderr);
+
+      const recovered = await runCli(
+        [...modelAgentArgs, "--format", "json", "sessions", "recover", sessionId],
+        homeDir,
+      );
+      assert.equal(recovered.code, 0, recovered.stderr);
+
+      const reprompt = await runCli(
+        [...modelAgentArgs, "--format", "json", "--ttl", "5", "prompt", "echo model-replayed"],
+        homeDir,
+      );
+      assert.equal(reprompt.code, 0, reprompt.stderr);
+
+      const messages = parseJsonRpcOutputLines(reprompt.stdout);
+      assertRequestBefore(messages, "session/resume", "session/prompt", reprompt.stdout);
+      const setModelIndex = assertRequestBefore(
+        messages,
+        "session/set_model",
+        "session/prompt",
+        reprompt.stdout,
+      );
+      const setModelRequest = messages[setModelIndex] as {
+        params?: { sessionId?: string; modelId?: string };
+      };
+      assert.equal(setModelRequest.params?.sessionId, sessionId);
+      assert.equal(setModelRequest.params?.modelId, "smart-model");
+
+      const stored = await readSessionRecord(homeDir, sessionId);
+      assert.equal(stored.acpx?.session_options?.model, "smart-model");
+      assert.equal(stored.acpx?.current_model_id, "smart-model");
+    } finally {
+      await runCli([...modelAgentArgs, "--format", "json", "sessions", "close"], homeDir).catch(
+        () => {},
+      );
       await fs.rm(cwd, { recursive: true, force: true });
     }
   });
@@ -4035,6 +4165,73 @@ function baseLoadCapableAgentArgs(cwd: string): string[] {
 
 function baseExecArgs(cwd: string): string[] {
   return [...baseAgentArgs(cwd), "--format", "quiet", "exec"];
+}
+
+async function createSessionAndWarmOwner(
+  agentArgs: string[],
+  homeDir: string,
+  cwd: string,
+): Promise<string> {
+  const created = await runCli([...agentArgs, "--format", "json", "sessions", "new"], homeDir);
+  assert.equal(created.code, 0, created.stderr);
+  const sessionId = (JSON.parse(created.stdout.trim()) as { acpxRecordId?: string }).acpxRecordId;
+  assert.equal(typeof sessionId, "string");
+  const warmMarker = `warm-owner-${path.basename(cwd)}`;
+
+  const queued = await runCli(
+    [...agentArgs, "--format", "json", "--ttl", "60", "prompt", "--no-wait", `echo ${warmMarker}`],
+    homeDir,
+  );
+  assert.equal(queued.code, 0, queued.stderr);
+
+  const { lockPath } = queuePaths(homeDir, sessionId as string);
+  await waitFor(async () => {
+    try {
+      const pid = (JSON.parse(await fs.readFile(lockPath, "utf8")) as { pid?: number }).pid;
+      return typeof pid === "number" && isPidAlive(pid) ? pid : null;
+    } catch {
+      return null;
+    }
+  }, 10_000);
+
+  await waitFor(async () => {
+    const history = await runCli([...agentArgs, "--format", "quiet", "sessions", "read"], homeDir);
+    assert.equal(history.code, 0, history.stderr);
+    return history.stdout.includes(warmMarker) ? history.stdout : null;
+  }, 10_000);
+
+  return sessionId as string;
+}
+
+function assertRequestBefore(
+  messages: Array<Record<string, unknown>>,
+  beforeMethod: string,
+  afterMethod: string,
+  output: string,
+): number {
+  const beforeIndex = messages.findIndex(
+    (message) => message.method === beforeMethod && extractJsonRpcId(message) !== undefined,
+  );
+  const afterIndex = messages.findIndex(
+    (message) => message.method === afterMethod && extractJsonRpcId(message) !== undefined,
+  );
+  assert.notEqual(beforeIndex, -1, `expected ${beforeMethod} request in output:\n${output}`);
+  assert.notEqual(afterIndex, -1, `expected ${afterMethod} request in output:\n${output}`);
+  assert(
+    beforeIndex < afterIndex,
+    `expected ${beforeMethod} before ${afterMethod} in output:\n${output}`,
+  );
+  return beforeIndex;
+}
+
+async function readSessionRecord(homeDir: string, sessionId: string): Promise<SessionRecord> {
+  const recordPath = path.join(
+    homeDir,
+    ".acpx",
+    "sessions",
+    `${encodeURIComponent(sessionId)}.json`,
+  );
+  return JSON.parse(await fs.readFile(recordPath, "utf8")) as SessionRecord;
 }
 
 async function writeFakeCursorAgent(binDir: string): Promise<void> {

@@ -19,6 +19,7 @@ import {
 import { defaultSessionEventLog } from "../../session/event-log.js";
 import { LiveSessionCheckpoint } from "../../session/live-checkpoint.js";
 import {
+  mergeLatestDurableAcpxPreferences,
   setCurrentModelId,
   setDesiredConfigOption,
   setDesiredModeId,
@@ -815,7 +816,10 @@ export class AcpRuntimeManager {
     return new LiveSessionCheckpoint({
       save: async () => {
         record.lastUsedAt = isoNow();
-        record.acpx = readAcpxState();
+        const latest = await this.options.sessionStore.load(record.acpxRecordId).catch(() => {
+          return undefined;
+        });
+        record.acpx = mergeLatestDurableAcpxPreferences(readAcpxState(), latest?.acpx);
         applyConversation(record, conversation);
         await this.refreshClosedState(record);
         await this.options.sessionStore.save(record);
@@ -921,12 +925,12 @@ export class AcpRuntimeManager {
       return;
     }
     if (configId !== "model") {
-      const nextState = cloneSessionAcpxState(turn.acpxState) ?? {};
-      nextState.desired_config_options = {
-        ...nextState.desired_config_options,
-        [configId]: value,
+      const nextRecord: SessionRecord = {
+        ...turn.record,
+        acpx: cloneSessionAcpxState(turn.acpxState),
       };
-      turn.acpxState = nextState;
+      setDesiredConfigOption(nextRecord, configId, value);
+      turn.acpxState = cloneSessionAcpxState(nextRecord.acpx);
     }
   }
 
@@ -1064,6 +1068,7 @@ export class AcpRuntimeManager {
     reconcileAgentSessionId(turn.record, turn.record.agentSessionId);
     turn.record.protocolVersion = turn.client.initializeResult?.protocolVersion;
     turn.record.agentCapabilities = turn.client.initializeResult?.agentCapabilities;
+    turn.acpxState = await this.acpxStateForRuntimeSave(turn);
     turn.record.acpx = turn.acpxState;
     applyConversation(turn.record, turn.conversation);
     applyLifecycleSnapshotToRecord(turn.record, turn.client.getAgentLifecycleSnapshot());
@@ -1104,10 +1109,13 @@ export class AcpRuntimeManager {
 
   private async finalizeRuntimeTurnRecord(turn: RunningRuntimeTurn): Promise<boolean> {
     applyLifecycleSnapshotToRecord(turn.record, turn.client.getAgentLifecycleSnapshot());
+    turn.acpxState = await this.acpxStateForRuntimeSave(turn);
     turn.record.acpx = turn.acpxState;
     applyConversation(turn.record, turn.conversation);
     turn.record.lastUsedAt = isoNow();
     await turn.liveCheckpoint.flush().catch(() => {});
+    turn.acpxState = await this.acpxStateForRuntimeSave(turn);
+    turn.record.acpx = turn.acpxState;
     const closed = await this.refreshClosedState(turn.record);
     await this.options.sessionStore.save(turn.record).catch(() => {});
     if (closed) {
@@ -1117,6 +1125,15 @@ export class AcpRuntimeManager {
       record: turn.record,
       client: turn.client,
     });
+  }
+
+  private async acpxStateForRuntimeSave(
+    turn: RunningRuntimeTurn,
+  ): Promise<ReturnType<typeof cloneSessionAcpxState>> {
+    const latest = await this.options.sessionStore.load(turn.record.acpxRecordId).catch(() => {
+      return undefined;
+    });
+    return cloneSessionAcpxState(mergeLatestDurableAcpxPreferences(turn.acpxState, latest?.acpx));
   }
 
   async *runTurn(input: {
