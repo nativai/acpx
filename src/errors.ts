@@ -227,6 +227,22 @@ export class AllSubscriptionsExhaustedError extends AcpxOperationalError {
   }
 }
 
+// A claude-home (PTY bridge) turn failed because the bridge's Claude login is
+// gated/expired and no sibling bridge has a usable login. NOT quota — detailCode
+// 'auth-gated' so acpx-ui renders the existing AuthGatedBanner (keyed on
+// lastError.code === 'auth-gated'), never the exhausted/quota one. Sibling of
+// AllSubscriptionsExhaustedError; the record's selection is left unchanged so a
+// later turn re-probes and auto-recovers once the login is refreshed.
+export class BridgeAuthGatedError extends AcpxOperationalError {
+  constructor(statuses: string) {
+    super(`Claude bridge needs an interactive login on this box. ${statuses}`, {
+      outputCode: "RUNTIME",
+      detailCode: "auth-gated",
+      origin: "runtime",
+    });
+  }
+}
+
 // A manual subscription switch was requested while a turn is in flight on the
 // live queue owner. Refused (not queued) — switching mid-stream would tear the
 // client down. acpx-ui maps the "turn-in-flight" detailCode to a 409.

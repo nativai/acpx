@@ -13,6 +13,7 @@ import { tailClaudeSubagentJsonl } from "../../claude-jsonl.js";
 import { transcriptCwdHash } from "../../config/subscription-transcript.js";
 import {
   AllSubscriptionsExhaustedError,
+  BridgeAuthGatedError,
   PermissionPromptUnavailableError,
   SessionClosedError,
 } from "../../errors.js";
@@ -715,14 +716,19 @@ async function runQueuedTaskFailover(
         }),
     });
   } catch (failoverError) {
-    // Exhausting all subscriptions throws AllSubscriptionsExhaustedError — an
-    // acpx-synthesized terminal error that is never an ACP message, so the
-    // onAcpMessage tap never persists it to the session `.stream.ndjson`. Write
-    // it there explicitly so acpx-ui's stream-tail derivation surfaces its
-    // `detailCode: "all-subscriptions-exhausted"` and renders the exhausted
-    // banner. Best-effort — persistence failure must not swallow the turn error,
-    // which still reaches the CLI output layer via sendQueuedTaskError below.
-    if (failoverError instanceof AllSubscriptionsExhaustedError) {
+    // Exhausting all subscriptions throws AllSubscriptionsExhaustedError, and an
+    // auth-gated bridge pool throws BridgeAuthGatedError — both acpx-synthesized
+    // terminal errors that are never an ACP message, so the onAcpMessage tap
+    // never persists them to the session `.stream.ndjson`. Write them there
+    // explicitly so acpx-ui's stream-tail derivation surfaces their detailCode
+    // (`all-subscriptions-exhausted` → exhausted banner; `auth-gated` →
+    // AuthGatedBanner). Best-effort — persistence failure must not swallow the
+    // turn error, which still reaches the CLI output layer via
+    // sendQueuedTaskError below.
+    if (
+      failoverError instanceof AllSubscriptionsExhaustedError ||
+      failoverError instanceof BridgeAuthGatedError
+    ) {
       await persistTerminalTurnError(record, failoverError).catch(() => {});
     }
     throw failoverError;
