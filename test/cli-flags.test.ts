@@ -29,6 +29,7 @@ import {
   resolveOutputPolicy,
   resolvePermissionMode,
   resolveSessionNameFromFlags,
+  resolveSessionSelectorFromFlags,
   resolveSystemPromptFlag,
 } from "../src/cli/flags.js";
 
@@ -499,15 +500,78 @@ test("session and prompt option registration parse command-local flags", () => {
   const sessionCommand = parseCommand(addSessionOption(new Command()), [
     "--session",
     " docs ",
+    "--session-id",
+    " record-suffix ",
     "--no-wait",
   ]);
-  assert.deepEqual(sessionCommand.opts(), { session: "docs", wait: false });
+  assert.deepEqual(sessionCommand.opts(), {
+    session: "docs",
+    sessionId: "record-suffix",
+    wait: false,
+  });
 
-  const sessionNameCommand = parseCommand(addSessionNameOption(new Command()), ["-s", " review "]);
-  assert.deepEqual(sessionNameCommand.opts(), { session: "review" });
+  const sessionNameCommand = parseCommand(addSessionNameOption(new Command()), [
+    "-s",
+    " review ",
+    "--session-url",
+    " https://acpx.devbox.nativai.de/?session=abc ",
+  ]);
+  assert.deepEqual(sessionNameCommand.opts(), {
+    session: "review",
+    sessionUrl: "https://acpx.devbox.nativai.de/?session=abc",
+  });
 
   const promptCommand = parseCommand(addPromptInputOption(new Command()), ["--file", "-"]);
   assert.deepEqual(promptCommand.opts(), { file: "-" });
+});
+
+test("session selector flags document explicit identity options", () => {
+  const promptSessionHelp = addSessionOption(new Command()).helpInformation().replace(/\s+/g, " ");
+  assert.match(promptSessionHelp, /Use named session instead of cwd default/);
+  assert.match(
+    promptSessionHelp,
+    /Resolve a session globally by acpx record id, ACP session id, or unique suffix/,
+  );
+  assert.match(
+    promptSessionHelp,
+    /Resolve a session globally from an acpx-ui URL containing \?session=<id>/,
+  );
+  assert.match(
+    promptSessionHelp,
+    /Queue prompt and return immediately when another prompt is already running/,
+  );
+
+  const namedSessionHelp = addSessionNameOption(new Command())
+    .helpInformation()
+    .replace(/\s+/g, " ");
+  assert.match(namedSessionHelp, /Use named session instead of cwd default/);
+  assert.match(
+    namedSessionHelp,
+    /Resolve a session globally by acpx record id, ACP session id, or unique suffix/,
+  );
+  assert.match(
+    namedSessionHelp,
+    /Resolve a session globally from an acpx-ui URL containing \?session=<id>/,
+  );
+});
+
+test("session selector flags reject empty explicit identity values with labeled errors", () => {
+  assert.throws(
+    () => parseCommand(addSessionOption(new Command()), ["--session-id", " "]),
+    /Session id must not be empty/,
+  );
+  assert.throws(
+    () => parseCommand(addSessionOption(new Command()), ["--session-url", " "]),
+    /Session URL must not be empty/,
+  );
+  assert.throws(
+    () => resolveSessionSelectorFromFlags({ sessionId: " " }, commandWithOptions({})),
+    /Session id must not be empty/,
+  );
+  assert.throws(
+    () => resolveSessionSelectorFromFlags({ sessionUrl: " " }, commandWithOptions({})),
+    /Session URL must not be empty/,
+  );
 });
 
 test("resolveSessionNameFromFlags falls back through global and parent command options", () => {
@@ -601,5 +665,48 @@ test("resolveAgentInvocation rejects conflicting positional and override agents"
         config(),
       ),
     /Do not combine positional agent with --agent override/,
+  );
+});
+
+test("resolveSessionSelectorFromFlags falls back through global and parent command options", () => {
+  assert.deepEqual(
+    resolveSessionSelectorFromFlags(
+      { sessionId: "direct-id" },
+      commandWithOptions({ sessionId: "global-id", sessionUrl: "global-url" }),
+    ),
+    { session: undefined, sessionId: "direct-id", sessionUrl: "global-url" },
+  );
+
+  assert.deepEqual(
+    resolveSessionSelectorFromFlags({} as const, commandWithOptions({ sessionUrl: "global-url" })),
+    { session: undefined, sessionId: undefined, sessionUrl: "global-url" },
+  );
+
+  const command = {
+    optsWithGlobals: () => ({}),
+    parent: {
+      opts: () => ({ session: "parent-name", sessionId: "parent-id" }),
+    },
+  } as unknown as Command;
+
+  assert.deepEqual(resolveSessionSelectorFromFlags({} as const, command), {
+    session: "parent-name",
+    sessionId: "parent-id",
+    sessionUrl: undefined,
+  });
+});
+
+test("resolveSessionSelectorFromFlags tolerates missing Commander option scopes", () => {
+  assert.deepEqual(
+    resolveSessionSelectorFromFlags(
+      "" as unknown as Parameters<typeof resolveSessionSelectorFromFlags>[0],
+      {} as unknown as Command,
+    ),
+    { session: undefined, sessionId: undefined, sessionUrl: undefined },
+  );
+
+  assert.deepEqual(
+    resolveSessionSelectorFromFlags({}, { optsWithGlobals: () => undefined } as unknown as Command),
+    { session: undefined, sessionId: undefined, sessionUrl: undefined },
   );
 });

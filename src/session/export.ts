@@ -12,7 +12,13 @@ import {
 } from "./event-log.js";
 import { getLoggedMessageCount } from "./messages-log-bookkeeping.js";
 import { messagesLogPath } from "./messages-log.js";
-import { findSession, listSessions, normalizeName, sessionBaseDir } from "./persistence.js";
+import {
+  findSession,
+  listSessions,
+  normalizeName,
+  resolveSessionRecord,
+  sessionBaseDir,
+} from "./persistence.js";
 import { serializeSessionRecordForDisk } from "./persistence/serialize.js";
 
 export type ExportedSession = {
@@ -40,6 +46,7 @@ export type ExportedSession = {
 };
 
 export type SessionExportLookup = {
+  sessionId?: string;
   agentName?: string;
   agentCommand?: string;
   cwd?: string;
@@ -67,6 +74,10 @@ function sessionLookupError(message: string, code: string): SessionExportError {
 async function loadSessionRecord(
   sessionLookup: SessionExportLookup,
 ): Promise<SessionRecord | undefined> {
+  if (sessionLookup.sessionId) {
+    return await resolveSessionRecord(sessionLookup.sessionId);
+  }
+
   const cwd = path.resolve(sessionLookup.cwd ?? process.cwd());
   const name = normalizeName(sessionLookup.name);
 
