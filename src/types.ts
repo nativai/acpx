@@ -515,6 +515,9 @@ export type SessionTemplateState = {
   enabled?: boolean;
   created_at?: string;
   source_session_id?: string;
+  /** Literal prompt text auto-sent on every spawn from this template. Absent or
+   *  empty ⇒ no auto-prompt (pure copy). Stored plaintext — do not put secrets here. */
+  auto_prompt?: string;
 };
 
 export type SessionRecord = {

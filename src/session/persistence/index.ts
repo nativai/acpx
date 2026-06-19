@@ -71,6 +71,7 @@ export type SessionIndexEntry = {
   accountSwitch?: SessionIndexAccountSwitch;
   templateEnabled?: boolean;
   templateCreatedAt?: string;
+  templateAutoPrompt?: string;
 };
 
 type SessionIndex = {
@@ -237,6 +238,7 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     accountSwitch: parseIndexAccountSwitch(record.accountSwitch),
     templateEnabled: optionalBoolean(record.templateEnabled),
     templateCreatedAt: optionalString(record.templateCreatedAt),
+    templateAutoPrompt: optionalString(record.templateAutoPrompt),
   };
 }
 
@@ -304,6 +306,7 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     accountSwitch: sessionOptions?.account_switch,
     templateEnabled: record.template?.enabled,
     templateCreatedAt: record.template?.created_at,
+    templateAutoPrompt: record.template?.auto_prompt,
   };
 }
 

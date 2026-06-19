@@ -857,6 +857,9 @@ function parseTemplateState(raw: unknown): SessionRecord["template"] {
   if (typeof record.source_session_id === "string") {
     template.source_session_id = record.source_session_id;
   }
+  if (typeof record.auto_prompt === "string") {
+    template.auto_prompt = record.auto_prompt;
+  }
   return Object.keys(template).length > 0 ? template : undefined;
 }
 
