@@ -18,7 +18,7 @@ import {
   extractJsonRpcId,
   parseJsonRpcOutputLines,
 } from "./jsonrpc-test-helpers.js";
-import { queuePaths } from "./queue-test-helpers.js";
+import { queuePaths, writeQueueOwnerLock } from "./queue-test-helpers.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
@@ -3738,10 +3738,12 @@ test("integration: sessions recover force-kills the queue owner, is idempotent, 
         ownerFound?: boolean;
         alive?: boolean;
         pid?: number;
+        state?: string;
       };
       assert.equal(before.ownerFound, true);
       assert.equal(before.alive, true);
       assert.equal(before.pid, ownerPid);
+      assert.equal(before.state, "healthy");
 
       // 4. recover kills the owner pid, exits 0, and reports the kill.
       const recovered = await runCli(
@@ -3769,9 +3771,11 @@ test("integration: sessions recover force-kills the queue owner, is idempotent, 
       const after = JSON.parse(statusAfter.stdout.trim()) as {
         ownerFound?: boolean;
         alive?: boolean;
+        state?: string;
       };
       assert.equal(after.ownerFound, false);
       assert.equal(after.alive, false);
+      assert.equal(after.state, "no_owner");
 
       // 6. recover again is idempotent: nothing to kill -> still exit 0.
       const again = await runCli(
@@ -3793,6 +3797,193 @@ test("integration: sessions recover force-kills the queue owner, is idempotent, 
       );
       assert.equal(reprompt.code, 0, reprompt.stderr);
       assert.match(reprompt.stdout, /respawned/);
+    } finally {
+      await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "close"], homeDir).catch(
+        () => {},
+      );
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: sessions owner-status --all scans open sessions read-only", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const created = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+      const sessionId = (JSON.parse(created.stdout.trim()) as { acpxRecordId?: string })
+        .acpxRecordId;
+      assert.equal(typeof sessionId, "string");
+
+      const { lockPath, socketPath } = queuePaths(homeDir, sessionId as string);
+      await writeQueueOwnerLock({
+        lockPath,
+        pid: 999_999,
+        sessionId: sessionId as string,
+        socketPath,
+      });
+
+      const scanned = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "owner-status", "--all"],
+        homeDir,
+      );
+      assert.equal(scanned.code, 0, scanned.stderr);
+      const batch = JSON.parse(scanned.stdout.trim()) as {
+        count?: number;
+        recoverableCount?: number;
+        sessions?: Array<{
+          sessionId?: string;
+          ownerFound?: boolean;
+          state?: string;
+          recoverable?: boolean;
+        }>;
+      };
+      const status = batch.sessions?.find((entry) => entry.sessionId === sessionId);
+      assert(status);
+      assert.equal(status.ownerFound, true);
+      assert.equal(status.state, "dead_owner");
+      assert.equal(status.recoverable, true);
+      assert.equal(batch.count, 1);
+      assert.equal(batch.recoverableCount, 1);
+      await fs.access(lockPath);
+    } finally {
+      await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "close"], homeDir).catch(
+        () => {},
+      );
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: sessions owner-status --descendants-of scans transitive descendants read-only", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const parent = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new", "--name", "parent"],
+        homeDir,
+      );
+      assert.equal(parent.code, 0, parent.stderr);
+      const parentId = (JSON.parse(parent.stdout.trim()) as { acpxRecordId?: string }).acpxRecordId;
+      assert.equal(typeof parentId, "string");
+
+      const child = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--format",
+          "json",
+          "sessions",
+          "new",
+          "--name",
+          "child",
+          "--parent-id",
+          parentId as string,
+        ],
+        homeDir,
+      );
+      assert.equal(child.code, 0, child.stderr);
+      const childId = (JSON.parse(child.stdout.trim()) as { acpxRecordId?: string }).acpxRecordId;
+      assert.equal(typeof childId, "string");
+
+      const grandchild = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--format",
+          "json",
+          "sessions",
+          "new",
+          "--name",
+          "grandchild",
+          "--parent-id",
+          childId as string,
+        ],
+        homeDir,
+      );
+      assert.equal(grandchild.code, 0, grandchild.stderr);
+      const grandchildId = (JSON.parse(grandchild.stdout.trim()) as { acpxRecordId?: string })
+        .acpxRecordId;
+      assert.equal(typeof grandchildId, "string");
+
+      const { lockPath, socketPath } = queuePaths(homeDir, grandchildId as string);
+      await writeQueueOwnerLock({
+        lockPath,
+        pid: 999_999,
+        sessionId: grandchildId as string,
+        socketPath,
+      });
+
+      const closedChild = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--format",
+          "json",
+          "sessions",
+          "close",
+          "--session-id",
+          childId as string,
+        ],
+        homeDir,
+      );
+      assert.equal(closedChild.code, 0, closedChild.stderr);
+
+      const scanned = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--format",
+          "json",
+          "sessions",
+          "owner-status",
+          "--descendants-of",
+          parentId as string,
+        ],
+        homeDir,
+      );
+      assert.equal(scanned.code, 0, scanned.stderr);
+      const batch = JSON.parse(scanned.stdout.trim()) as {
+        scope?: string;
+        rootSessionId?: string;
+        count?: number;
+        recoverableCount?: number;
+        ignoredCount?: number;
+        sessions?: Array<{
+          sessionId?: string;
+          parentSessionId?: string;
+          state?: string;
+          recoverable?: boolean;
+          classification?: string;
+          ignored?: boolean;
+        }>;
+      };
+      assert.equal(batch.scope, "descendants");
+      assert.equal(batch.rootSessionId, parentId);
+      assert.equal(batch.count, 2);
+      assert.equal(batch.recoverableCount, 1);
+      assert.equal(batch.ignoredCount, 1);
+      assert.equal(
+        batch.sessions?.some((entry) => entry.sessionId === parentId),
+        false,
+        "scan must not include the parent/root session itself",
+      );
+
+      const childStatus = batch.sessions?.find((entry) => entry.sessionId === childId);
+      assert(childStatus);
+      assert.equal(childStatus.classification, "closed_ignored");
+      assert.equal(childStatus.ignored, true);
+      assert.equal(childStatus.recoverable, false);
+
+      const grandchildStatus = batch.sessions?.find((entry) => entry.sessionId === grandchildId);
+      assert(grandchildStatus);
+      assert.equal(grandchildStatus.parentSessionId, childId);
+      assert.equal(grandchildStatus.state, "dead_owner");
+      assert.equal(grandchildStatus.classification, "recoverable_owner");
+      assert.equal(grandchildStatus.recoverable, true);
+      await fs.access(lockPath);
     } finally {
       await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "close"], homeDir).catch(
         () => {},

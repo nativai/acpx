@@ -9,6 +9,19 @@ const PROCESS_EXIT_GRACE_MS = 1_500;
 const PROCESS_POLL_MS = 50;
 const QUEUE_OWNER_STALE_HEARTBEAT_MS = 15_000;
 
+export type QueueOwnerProcessIdentity = {
+  kind: "linux-proc-stat-starttime";
+  startTimeTicks: string;
+};
+
+export type QueueOwnerStateKind =
+  | "no_owner"
+  | "healthy"
+  | "dead_owner"
+  | "stale_owner"
+  | "socket_unreachable"
+  | "pid_reused";
+
 export type QueueOwnerRecord = {
   pid: number;
   sessionId: string;
@@ -17,6 +30,7 @@ export type QueueOwnerRecord = {
   heartbeatAt: string;
   ownerGeneration: number;
   queueDepth: number;
+  processIdentity?: QueueOwnerProcessIdentity;
 };
 
 export type QueueOwnerLease = {
@@ -25,6 +39,7 @@ export type QueueOwnerLease = {
   socketPath: string;
   createdAt: string;
   ownerGeneration: number;
+  processIdentity?: QueueOwnerProcessIdentity;
 };
 
 export type QueueOwnerStatus = {
@@ -35,14 +50,36 @@ export type QueueOwnerStatus = {
   queueDepth: number;
   alive: boolean;
   stale: boolean;
+  state: Exclude<QueueOwnerStateKind, "no_owner">;
+  recoverable: boolean;
+  pidAlive: boolean;
+  heartbeatAgeMs: number | null;
+  processIdentity?: QueueOwnerProcessIdentity;
+  currentProcessIdentity?: QueueOwnerProcessIdentity;
+  processIdentityMatched: boolean | null;
+  socketReachable: boolean | null;
 };
 
 /** Read-only owner liveness snapshot — never mutates/reaps the lease. */
 export type QueueOwnerLiveness = {
-  pid: number;
+  sessionId: string;
+  ownerFound: boolean;
+  state: QueueOwnerStateKind;
+  recoverable: boolean;
+  pid: number | null;
+  pidAlive: boolean;
   alive: boolean;
   stale: boolean;
-  heartbeatAt: string;
+  socketPath: string | null;
+  socketReachable: boolean | null;
+  heartbeatAt: string | null;
+  heartbeatAgeMs: number | null;
+  createdAt: string | null;
+  ownerGeneration: number | null;
+  queueDepth: number;
+  processIdentity?: QueueOwnerProcessIdentity;
+  currentProcessIdentity?: QueueOwnerProcessIdentity;
+  processIdentityMatched: boolean | null;
 };
 
 /** Outcome of a force-restart (recover) of a session's queue owner. */
@@ -59,6 +96,14 @@ export type QueueOwnerRecoveryResult = {
   killed: boolean;
   /** The owner pid is STILL alive after recovery — true means the kill failed. */
   alive: boolean;
+  /** Precise owner-state classification observed before recovery. */
+  state: QueueOwnerStateKind;
+  /** The pid in the lease was alive, even if it no longer belonged to this owner. */
+  pidAlive: boolean;
+  /** True when a live pid matched the persisted process identity, false on PID reuse, null when unknown. */
+  processIdentityMatched: boolean | null;
+  /** True when a live pid was deliberately not signalled because it failed the identity guard. */
+  killSkipped: boolean;
 };
 
 function parseQueueOwnerRecord(raw: unknown): QueueOwnerRecord | null {
@@ -79,7 +124,30 @@ function parseQueueOwnerRecord(raw: unknown): QueueOwnerRecord | null {
     heartbeatAt: record.heartbeatAt,
     ownerGeneration: record.ownerGeneration,
     queueDepth: record.queueDepth,
+    ...(parseQueueOwnerProcessIdentity(record.processIdentity)
+      ? { processIdentity: parseQueueOwnerProcessIdentity(record.processIdentity) }
+      : {}),
   };
+}
+
+function parseQueueOwnerProcessIdentity(value: unknown): QueueOwnerProcessIdentity | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const record = value as Record<string, unknown>;
+  if (
+    record.kind === "linux-proc-stat-starttime" &&
+    typeof record.startTimeTicks === "string" &&
+    /^\d+$/.test(record.startTimeTicks)
+  ) {
+    return {
+      kind: "linux-proc-stat-starttime",
+      startTimeTicks: record.startTimeTicks,
+    };
+  }
+
+  return undefined;
 }
 
 function hasValidQueueOwnerRecordFields(record: Record<string, unknown>): record is Record<
@@ -121,12 +189,82 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function isQueueOwnerHeartbeatStale(owner: QueueOwnerRecord): boolean {
+function heartbeatAgeMs(owner: QueueOwnerRecord, nowMs: number = Date.now()): number | null {
   const heartbeatMs = Date.parse(owner.heartbeatAt);
   if (!Number.isFinite(heartbeatMs)) {
+    return null;
+  }
+  return Math.max(0, nowMs - heartbeatMs);
+}
+
+function isQueueOwnerHeartbeatStale(owner: QueueOwnerRecord): boolean {
+  const ageMs = heartbeatAgeMs(owner);
+  if (ageMs == null) {
     return true;
   }
-  return Date.now() - heartbeatMs > QUEUE_OWNER_STALE_HEARTBEAT_MS;
+  return ageMs > QUEUE_OWNER_STALE_HEARTBEAT_MS;
+}
+
+function parseLinuxProcStatStartTime(payload: string): string | undefined {
+  const endCommandIndex = payload.lastIndexOf(")");
+  if (endCommandIndex < 0) {
+    return undefined;
+  }
+
+  const fieldsFromState = payload
+    .slice(endCommandIndex + 1)
+    .trim()
+    .split(/\s+/);
+  const startTime = fieldsFromState[19];
+  return startTime && /^\d+$/.test(startTime) ? startTime : undefined;
+}
+
+export async function readQueueOwnerProcessIdentity(
+  pid: number,
+): Promise<QueueOwnerProcessIdentity | undefined> {
+  if (process.platform !== "linux" || !Number.isInteger(pid) || pid <= 0) {
+    return undefined;
+  }
+
+  try {
+    const payload = await fs.readFile(`/proc/${pid}/stat`, "utf8");
+    const startTimeTicks = parseLinuxProcStatStartTime(payload);
+    return startTimeTicks
+      ? {
+          kind: "linux-proc-stat-starttime",
+          startTimeTicks,
+        }
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function processIdentitiesMatch(
+  expected: QueueOwnerProcessIdentity | undefined,
+  current: QueueOwnerProcessIdentity | undefined,
+): boolean | null {
+  if (!expected || !current) {
+    return null;
+  }
+  return expected.kind === current.kind && expected.startTimeTicks === current.startTimeTicks;
+}
+
+async function isQueueSocketReachable(owner: QueueOwnerRecord): Promise<boolean | null> {
+  if (process.platform === "win32") {
+    return null;
+  }
+
+  try {
+    await fs.stat(owner.socketPath);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      return false;
+    }
+    return false;
+  }
 }
 
 async function ensureQueueDir(): Promise<void> {
@@ -182,6 +320,165 @@ async function cleanupStaleQueueOwner(
       throw error;
     }
   });
+}
+
+type QueueOwnerStateInputs = {
+  pidAlive: boolean;
+  stale: boolean;
+  socketReachable: boolean | null;
+  processIdentityMatched: boolean | null;
+};
+
+function classifyQueueOwnerState(inputs: QueueOwnerStateInputs): QueueOwnerStateKind {
+  if (inputs.processIdentityMatched === false) {
+    return "pid_reused";
+  }
+  if (!inputs.pidAlive) {
+    return "dead_owner";
+  }
+  if (inputs.stale) {
+    return "stale_owner";
+  }
+  if (inputs.socketReachable === false) {
+    return "socket_unreachable";
+  }
+  return "healthy";
+}
+
+function isRecoverableQueueOwnerState(state: QueueOwnerStateKind): boolean {
+  return state === "dead_owner" || state === "stale_owner" || state === "pid_reused";
+}
+
+async function queueOwnerStateFromRecord(
+  sessionId: string,
+  owner: QueueOwnerRecord,
+): Promise<QueueOwnerLiveness> {
+  const pidAlive = isProcessAlive(owner.pid);
+  const currentProcessIdentity = pidAlive
+    ? await readQueueOwnerProcessIdentity(owner.pid)
+    : undefined;
+  const processIdentityMatched = processIdentitiesMatch(
+    owner.processIdentity,
+    currentProcessIdentity,
+  );
+  const stale = isQueueOwnerHeartbeatStale(owner);
+  const socketReachable = await isQueueSocketReachable(owner);
+  const state = classifyQueueOwnerState({
+    pidAlive,
+    stale,
+    socketReachable,
+    processIdentityMatched,
+  });
+
+  return {
+    sessionId,
+    ownerFound: true,
+    state,
+    recoverable: isRecoverableQueueOwnerState(state),
+    pid: owner.pid,
+    pidAlive,
+    alive: pidAlive && processIdentityMatched !== false,
+    stale,
+    socketPath: owner.socketPath,
+    socketReachable,
+    heartbeatAt: owner.heartbeatAt,
+    heartbeatAgeMs: heartbeatAgeMs(owner),
+    createdAt: owner.createdAt,
+    ownerGeneration: owner.ownerGeneration,
+    queueDepth: owner.queueDepth,
+    ...(owner.processIdentity ? { processIdentity: owner.processIdentity } : {}),
+    ...(currentProcessIdentity ? { currentProcessIdentity } : {}),
+    processIdentityMatched,
+  };
+}
+
+function noQueueOwnerState(sessionId: string): QueueOwnerLiveness {
+  return {
+    sessionId,
+    ownerFound: false,
+    state: "no_owner",
+    recoverable: false,
+    pid: null,
+    pidAlive: false,
+    alive: false,
+    stale: false,
+    socketPath: null,
+    socketReachable: null,
+    heartbeatAt: null,
+    heartbeatAgeMs: null,
+    createdAt: null,
+    ownerGeneration: null,
+    queueDepth: 0,
+    processIdentityMatched: null,
+  };
+}
+
+async function readQueueOwnerStateForRecord(
+  sessionId: string,
+  owner: QueueOwnerRecord | undefined,
+): Promise<QueueOwnerLiveness> {
+  return owner ? await queueOwnerStateFromRecord(sessionId, owner) : noQueueOwnerState(sessionId);
+}
+
+function canSignalQueueOwner(state: QueueOwnerLiveness): boolean {
+  return state.pid !== null && state.pidAlive && state.processIdentityMatched !== false;
+}
+
+function noQueueOwnerRecoveryResult(sessionId: string): QueueOwnerRecoveryResult {
+  return {
+    sessionId,
+    ownerFound: false,
+    pid: undefined,
+    wasAlive: false,
+    killed: false,
+    alive: false,
+    state: "no_owner",
+    pidAlive: false,
+    processIdentityMatched: null,
+    killSkipped: false,
+  };
+}
+
+async function terminateConfirmedQueueOwnerProcessGroup(
+  pid: number,
+  shouldSignalOwner: boolean,
+): Promise<boolean> {
+  if (!shouldSignalOwner) {
+    return false;
+  }
+
+  // SIGTERM -> grace -> SIGKILL on the owner (the group leader). Reuses the
+  // audited single-pid primitive; the owner shuts the adapter down on exit.
+  await terminateProcess(pid);
+
+  // Process-group sweep (R2): reap any group member (e.g. a native-blocked SDK
+  // grandchild) that outlived the leader. The group still exists as long as any
+  // member is alive, even once the leader pid is gone.
+  if (hasLiveProcessGroup(pid)) {
+    signalProcessGroup(pid, "SIGKILL");
+    await waitForProcessExit(pid, PROCESS_EXIT_GRACE_MS);
+  }
+
+  return isProcessAlive(pid);
+}
+
+async function cleanupRecoverableQueueOwner(
+  sessionId: string,
+  owner: QueueOwnerRecord,
+  state: QueueOwnerLiveness,
+): Promise<boolean> {
+  if (!state.recoverable) {
+    return false;
+  }
+
+  if (state.state === "stale_owner" && canSignalQueueOwner(state)) {
+    await terminateProcess(owner.pid).catch(() => {
+      // best effort stale owner termination
+    });
+  }
+
+  await cleanupStaleQueueOwner(sessionId, owner);
+  return true;
 }
 
 export async function readQueueOwnerRecord(
@@ -252,18 +549,12 @@ export async function ensureOwnerIsUsable(
   sessionId: string,
   owner: QueueOwnerRecord,
 ): Promise<boolean> {
-  const alive = isProcessAlive(owner.pid);
-  const stale = isQueueOwnerHeartbeatStale(owner);
-  if (alive && !stale) {
+  const state = await queueOwnerStateFromRecord(sessionId, owner);
+  if (state.state === "healthy" || state.state === "socket_unreachable") {
     return true;
   }
 
-  if (alive) {
-    await terminateProcess(owner.pid).catch(() => {
-      // best effort stale owner termination
-    });
-  }
-  await cleanupStaleQueueOwner(sessionId, owner);
+  await cleanupRecoverableQueueOwner(sessionId, owner, state);
   return false;
 }
 
@@ -275,8 +566,9 @@ export async function readQueueOwnerStatus(
     return undefined;
   }
 
-  const alive = await ensureOwnerIsUsable(sessionId, owner);
-  if (!alive) {
+  const state = await queueOwnerStateFromRecord(sessionId, owner);
+  if (state.recoverable) {
+    await cleanupRecoverableQueueOwner(sessionId, owner, state);
     return undefined;
   }
 
@@ -286,8 +578,18 @@ export async function readQueueOwnerStatus(
     heartbeatAt: owner.heartbeatAt,
     ownerGeneration: owner.ownerGeneration,
     queueDepth: owner.queueDepth,
-    alive,
-    stale: isQueueOwnerHeartbeatStale(owner),
+    alive: state.alive,
+    stale: state.stale,
+    state: state.state as Exclude<QueueOwnerStateKind, "no_owner">,
+    recoverable: state.recoverable,
+    pidAlive: state.pidAlive,
+    heartbeatAgeMs: state.heartbeatAgeMs,
+    ...(owner.processIdentity ? { processIdentity: owner.processIdentity } : {}),
+    ...(state.currentProcessIdentity
+      ? { currentProcessIdentity: state.currentProcessIdentity }
+      : {}),
+    processIdentityMatched: state.processIdentityMatched,
+    socketReachable: state.socketReachable,
   };
 }
 
@@ -300,6 +602,7 @@ export async function tryAcquireQueueOwnerLease(
   const socketPath = queueSocketPath(sessionId);
   const createdAt = nowIsoFactory();
   const ownerGeneration = createOwnerGeneration();
+  const processIdentity = await readQueueOwnerProcessIdentity(process.pid);
   const payload = JSON.stringify(
     {
       pid: process.pid,
@@ -309,6 +612,7 @@ export async function tryAcquireQueueOwnerLease(
       heartbeatAt: createdAt,
       ownerGeneration,
       queueDepth: 0,
+      ...(processIdentity ? { processIdentity } : {}),
     },
     null,
     2,
@@ -328,6 +632,7 @@ export async function tryAcquireQueueOwnerLease(
       socketPath,
       createdAt,
       ownerGeneration,
+      ...(processIdentity ? { processIdentity } : {}),
     };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
@@ -340,14 +645,8 @@ export async function tryAcquireQueueOwnerLease(
       return undefined;
     }
 
-    if (!isProcessAlive(owner.pid) || isQueueOwnerHeartbeatStale(owner)) {
-      if (isProcessAlive(owner.pid)) {
-        await terminateProcess(owner.pid).catch(() => {
-          // best effort stale owner termination
-        });
-      }
-      await cleanupStaleQueueOwner(sessionId, owner);
-    }
+    const state = await queueOwnerStateFromRecord(sessionId, owner);
+    await cleanupRecoverableQueueOwner(sessionId, owner, state);
     return undefined;
   }
 }
@@ -368,6 +667,7 @@ export async function refreshQueueOwnerLease(
       heartbeatAt: nowIsoFactory(),
       ownerGeneration: lease.ownerGeneration,
       queueDepth: Math.max(0, Math.round(options.queueDepth)),
+      ...(lease.processIdentity ? { processIdentity: lease.processIdentity } : {}),
     },
     null,
     2,
@@ -395,30 +695,23 @@ export async function terminateQueueOwnerForSession(sessionId: string): Promise<
     return;
   }
 
-  if (isProcessAlive(owner.pid)) {
+  const state = await queueOwnerStateFromRecord(sessionId, owner);
+  if (canSignalQueueOwner(state)) {
     await terminateProcess(owner.pid);
   }
 
   await cleanupStaleQueueOwner(sessionId, owner);
 }
 
+export async function readQueueOwnerState(sessionId: string): Promise<QueueOwnerLiveness> {
+  return await readQueueOwnerStateForRecord(sessionId, await readQueueOwnerRecord(sessionId));
+}
+
 // Read-only owner liveness — unlike readQueueOwnerStatus(), this never calls
 // ensureOwnerIsUsable() and therefore never terminates or removes a stale lease.
-// Safe for the acpx-ui server to poll for the `ownerAlive` status input.
-export async function readQueueOwnerLiveness(
-  sessionId: string,
-): Promise<QueueOwnerLiveness | undefined> {
-  const owner = await readQueueOwnerRecord(sessionId);
-  if (!owner) {
-    return undefined;
-  }
-
-  return {
-    pid: owner.pid,
-    alive: isProcessAlive(owner.pid),
-    stale: isQueueOwnerHeartbeatStale(owner),
-    heartbeatAt: owner.heartbeatAt,
-  };
+// Safe for the acpx-ui server or heartbeat tooling to poll.
+export async function readQueueOwnerLiveness(sessionId: string): Promise<QueueOwnerLiveness> {
+  return await readQueueOwnerState(sessionId);
 }
 
 // Force-restart primitive (the un-wedge): kill the session's queue-owner process
@@ -439,43 +732,28 @@ export async function recoverQueueOwnerForSession(
   const owner = await readQueueOwnerRecord(sessionId);
   if (!owner) {
     // Idempotent: no lease means there is no owner to kill. "Already gone" is success.
-    return {
-      sessionId,
-      ownerFound: false,
-      pid: undefined,
-      wasAlive: false,
-      killed: false,
-      alive: false,
-    };
+    return noQueueOwnerRecoveryResult(sessionId);
   }
 
   const pid = owner.pid;
-  const wasAlive = isProcessAlive(pid);
-
-  if (wasAlive) {
-    // SIGTERM -> grace -> SIGKILL on the owner (the group leader). Reuses the
-    // audited single-pid primitive; the owner shuts the adapter down on exit.
-    await terminateProcess(pid);
-  }
-
-  // Process-group sweep (R2): reap any group member (e.g. a native-blocked SDK
-  // grandchild) that outlived the leader. The group still exists as long as any
-  // member is alive, even once the leader pid is gone.
-  if (hasLiveProcessGroup(pid)) {
-    signalProcessGroup(pid, "SIGKILL");
-    await waitForProcessExit(pid, PROCESS_EXIT_GRACE_MS);
-  }
+  const state = await queueOwnerStateFromRecord(sessionId, owner);
+  const shouldSignalOwner = canSignalQueueOwner(state);
+  const wasAlive = state.pidAlive;
+  const alive = await terminateConfirmedQueueOwnerProcessGroup(pid, shouldSignalOwner);
 
   await cleanupStaleQueueOwner(sessionId, owner);
 
-  const alive = isProcessAlive(pid);
   return {
     sessionId,
     ownerFound: true,
     pid,
     wasAlive,
-    killed: wasAlive && !alive,
+    killed: shouldSignalOwner && wasAlive && !alive,
     alive,
+    state: state.state,
+    pidAlive: state.pidAlive,
+    processIdentityMatched: state.processIdentityMatched,
+    killSkipped: state.pidAlive && !shouldSignalOwner,
   };
 }
 

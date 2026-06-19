@@ -65,6 +65,7 @@ import {
   type SessionsHistoryFlags,
   type SessionsListFlags,
   type SessionsNewFlags,
+  type SessionsOwnerStatusFlags,
   type SessionsPruneFlags,
   type SessionsTemplateFlags,
   type StatusFlags,
@@ -2381,11 +2382,44 @@ export async function handleSessionsRecover(
   }
 }
 
-// Read-only owner-liveness probe — emits {sessionId,ownerFound,pid,alive,stale,
-// heartbeatAt} as JSON so the acpx-ui server can read owner liveness without
-// replicating the lease-key hashing. Never mutates the lease.
-export async function handleSessionsOwnerStatus(sessionId: string): Promise<void> {
-  const { readSessionOwnerStatus } = await loadSessionModule();
+// Read-only owner-state probe so acpx-ui/heartbeat callers can consume the CLI
+// source of truth without duplicating lease-key hashing or PID semantics.
+export async function handleSessionsOwnerStatus(
+  sessionId: string | undefined,
+  flags: SessionsOwnerStatusFlags,
+): Promise<void> {
+  const {
+    readAllSessionOwnerStatuses,
+    readDescendantSessionOwnerStatuses,
+    readSessionOwnerStatus,
+  } = await loadSessionModule();
+  const hasDescendantScope = flags.descendantsOf !== undefined;
+  if (flags.all === true) {
+    if (sessionId || hasDescendantScope) {
+      throw new InvalidArgumentError(
+        "owner-status accepts exactly one of <id>, --all, or --descendants-of",
+      );
+    }
+    const batch = await readAllSessionOwnerStatuses();
+    process.stdout.write(`${JSON.stringify(batch)}\n`);
+    return;
+  }
+
+  if (hasDescendantScope) {
+    if (sessionId) {
+      throw new InvalidArgumentError(
+        "owner-status accepts exactly one of <id>, --all, or --descendants-of",
+      );
+    }
+    const batch = await readDescendantSessionOwnerStatuses(flags.descendantsOf as string);
+    process.stdout.write(`${JSON.stringify(batch)}\n`);
+    return;
+  }
+
+  if (!sessionId) {
+    throw new InvalidArgumentError("owner-status requires <id>, --all, or --descendants-of <id>");
+  }
+
   const status = await readSessionOwnerStatus(sessionId);
   process.stdout.write(`${JSON.stringify(status)}\n`);
 }

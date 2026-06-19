@@ -122,6 +122,11 @@ export type SessionsListFlags = {
   local?: boolean;
 };
 
+export type SessionsOwnerStatusFlags = {
+  all?: boolean;
+  descendantsOf?: string;
+};
+
 export type SessionsExportFlags = SessionSelectorFlags & {
   output: string;
   sourceCwd?: string;

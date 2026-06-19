@@ -19,6 +19,7 @@ import { connectToQueueOwner } from "./ipc-transport.js";
 import {
   type QueueOwnerRecord,
   readQueueOwnerRecord,
+  readQueueOwnerState,
   recoverQueueOwnerForSession,
   terminateQueueOwnerForSession,
 } from "./lease-store.js";
@@ -47,6 +48,7 @@ export {
   isProcessAlive,
   hasLiveProcessGroup,
   readQueueOwnerLiveness,
+  readQueueOwnerState,
   recoverQueueOwnerForSession,
   releaseQueueOwnerLease,
   signalProcessGroup,
@@ -58,7 +60,9 @@ export {
 export type {
   QueueOwnerLease,
   QueueOwnerLiveness,
+  QueueOwnerProcessIdentity,
   QueueOwnerRecoveryResult,
+  QueueOwnerStateKind,
 } from "./lease-store.js";
 
 const STALE_OWNER_PROTOCOL_DETAIL_CODES = new Set([
@@ -772,11 +776,32 @@ async function submitCloseSessionToQueueOwner(
   return response.closed;
 }
 
+async function recoverRecoverableOwnerBeforeSubmit(
+  options: SubmitToQueueOwnerOptions,
+): Promise<boolean> {
+  const ownerState = await readQueueOwnerState(options.sessionId);
+  if (!ownerState.ownerFound || !ownerState.recoverable) {
+    return false;
+  }
+
+  await recoverQueueOwnerForSession(options.sessionId);
+  if (options.verbose) {
+    process.stderr.write(
+      `[acpx] cleared ${ownerState.state} queue owner metadata for session ${options.sessionId}\n`,
+    );
+  }
+  return true;
+}
+
 export async function trySubmitToRunningOwner(
   options: SubmitToQueueOwnerOptions,
 ): Promise<SessionSendOutcome | undefined> {
   const owner = await readQueueOwnerRecord(options.sessionId);
   if (!owner) {
+    return undefined;
+  }
+
+  if (await recoverRecoverableOwnerBeforeSubmit(options)) {
     return undefined;
   }
 

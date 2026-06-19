@@ -6,6 +6,7 @@ import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import {
   MAX_MESSAGE_BUFFER_SIZE,
   SessionQueueOwner,
+  readQueueOwnerLiveness,
   releaseQueueOwnerLease,
   tryAcquireQueueOwnerLease,
   trySetConfigOptionOnRunningOwner,
@@ -818,5 +819,35 @@ test("trySubmitToRunningOwner clears stale owner lock on protocol mismatch", asy
       await cleanupOwnerArtifacts({ socketPath, lockPath });
       stopProcess(keeper);
     }
+  });
+});
+
+test("trySubmitToRunningOwner clears dead post-restart owner lock before cold spawn", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "submit-dead-owner-post-restart";
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({
+      lockPath,
+      pid: 999_999,
+      sessionId,
+      socketPath,
+    });
+
+    const before = await readQueueOwnerLiveness(sessionId);
+    assert.equal(before.ownerFound, true);
+    assert.equal(before.state, "dead_owner");
+    assert.equal(before.recoverable, true);
+    assert.equal(before.socketReachable, process.platform === "win32" ? null : false);
+
+    const outcome = await trySubmitToRunningOwner({
+      sessionId,
+      message: "hello after restart",
+      permissionMode: "approve-reads",
+      outputFormatter: NOOP_OUTPUT_FORMATTER,
+      waitForCompletion: true,
+    });
+
+    assert.equal(outcome, undefined);
+    await assert.rejects(fs.access(lockPath));
   });
 });

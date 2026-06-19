@@ -45,6 +45,7 @@ import {
   type SessionsImportFlags,
   type SessionsListFlags,
   type SessionsNewFlags,
+  type SessionsOwnerStatusFlags,
   type SessionsPruneFlags,
   type SessionsTemplateFlags,
   type StatusFlags,
@@ -278,15 +279,25 @@ export function registerSessionsCommand(
   sessionsCommand
     .command("owner-status")
     .description(
-      "Print queue-owner liveness as JSON: {sessionId,ownerFound,pid,alive,stale,heartbeatAt}",
+      "Print read-only queue-owner state as JSON. Use --all for a bounded scan of open local sessions.",
     )
     .argument(
-      "<id>",
-      "Session id (acpx record id, ACP session id, or unique suffix)",
+      "[id]",
+      "Session id (acpx record id, ACP session id, or unique suffix). Omit only with --all.",
       (value: string) => parseNonEmptyValue("Session id", value),
     )
-    .action(async function (this: Command, id: string) {
-      await handleSessionsOwnerStatus(id);
+    .option("--all", "Scan all open local sessions. Read-only; does not recover leases.")
+    .option(
+      "--descendants-of <id>",
+      "Scan transitive local descendants of a parent/root session. Read-only; does not recover leases.",
+      (value: string) => parseNonEmptyValue("Parent session id", value),
+    )
+    .action(async function (
+      this: Command,
+      id: string | undefined,
+      flags: SessionsOwnerStatusFlags,
+    ) {
+      await handleSessionsOwnerStatus(id, flags);
     });
 
   const showCommand = sessionsCommand

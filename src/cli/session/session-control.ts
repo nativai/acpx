@@ -11,6 +11,7 @@ import {
 import { assertRecordModelSupported } from "../../session/model-application.js";
 import {
   resolveSessionRecord,
+  listSessions,
   writeSessionRecord,
   writeSessionRecordAtBoundaryWithLifecycle,
   isoNow,
@@ -23,8 +24,10 @@ import type {
 } from "../../types.js";
 import {
   isProcessAlive,
+  type QueueOwnerLiveness,
   type QueueOwnerRecoveryResult,
   readQueueOwnerLiveness,
+  readQueueOwnerState,
   recoverQueueOwnerForSession,
   terminateProcess,
   terminateQueueOwnerForSession,
@@ -182,7 +185,7 @@ export async function setSessionSubscription(
   options: SessionSetSubscriptionOptions,
 ): Promise<SessionSetSubscriptionResult> {
   const liveness = await readQueueOwnerLiveness(options.sessionId);
-  const ownerAlive = liveness?.alive === true;
+  const ownerAlive = liveness.alive;
 
   if (ownerAlive) {
     const active = await tryQueryActiveTurnOnRunningOwner(options.sessionId);
@@ -279,14 +282,28 @@ export async function closeSession(sessionId: string): Promise<SessionRecord> {
   return record;
 }
 
-export type SessionOwnerStatus = {
-  /** Resolved acpx record id (the id the queue lease is keyed by). */
-  sessionId: string;
-  ownerFound: boolean;
-  pid: number | null;
-  alive: boolean;
-  stale: boolean;
-  heartbeatAt: string | null;
+export type SessionOwnerStatusClassification =
+  | "healthy"
+  | "idle_no_owner"
+  | "recoverable_owner"
+  | "socket_unreachable"
+  | "closed_ignored";
+
+export type SessionOwnerStatus = QueueOwnerLiveness & {
+  parentSessionId?: string;
+  kind?: SessionRecord["kind"];
+  closed: boolean;
+  ignored: boolean;
+  classification: SessionOwnerStatusClassification;
+};
+
+export type SessionOwnerStatusBatch = {
+  scope: "all_open" | "descendants";
+  rootSessionId?: string;
+  count: number;
+  recoverableCount: number;
+  ignoredCount: number;
+  sessions: SessionOwnerStatus[];
 };
 
 // Read-only owner-liveness probe for a session. Resolves the caller-supplied id
@@ -294,25 +311,105 @@ export type SessionOwnerStatus = {
 // record, then reads the queue lease keyed by `record.acpxRecordId`. Never reaps.
 export async function readSessionOwnerStatus(sessionId: string): Promise<SessionOwnerStatus> {
   const record = await resolveSessionRecord(sessionId);
-  const liveness = await readQueueOwnerLiveness(record.acpxRecordId);
-  if (!liveness) {
-    return {
-      sessionId: record.acpxRecordId,
-      ownerFound: false,
-      pid: null,
-      alive: false,
-      stale: false,
-      heartbeatAt: null,
-    };
-  }
+  return await readOwnerStatusForRecord(record);
+}
+
+export async function readAllSessionOwnerStatuses(): Promise<SessionOwnerStatusBatch> {
+  const records = (await listSessions()).filter((record) => record.closed !== true);
+  const sessions = await Promise.all(
+    records.map(async (record) => await readOwnerStatusForRecord(record)),
+  );
+  return ownerStatusBatch("all_open", undefined, sessions);
+}
+
+export async function readDescendantSessionOwnerStatuses(
+  rootSessionId: string,
+): Promise<SessionOwnerStatusBatch> {
+  const root = await resolveSessionRecord(rootSessionId);
+  const descendants = descendantRecords(root.acpxRecordId, await listSessions());
+  const sessions = await Promise.all(
+    descendants.map(async (record) => await readOwnerStatusForRecord(record)),
+  );
+  return ownerStatusBatch("descendants", root.acpxRecordId, sessions);
+}
+
+function ownerStatusBatch(
+  scope: SessionOwnerStatusBatch["scope"],
+  rootSessionId: string | undefined,
+  sessions: SessionOwnerStatus[],
+): SessionOwnerStatusBatch {
   return {
-    sessionId: record.acpxRecordId,
-    ownerFound: true,
-    pid: liveness.pid,
-    alive: liveness.alive,
-    stale: liveness.stale,
-    heartbeatAt: liveness.heartbeatAt,
+    scope,
+    ...(rootSessionId ? { rootSessionId } : {}),
+    count: sessions.length,
+    recoverableCount: sessions.filter((status) => status.recoverable).length,
+    ignoredCount: sessions.filter((status) => status.ignored).length,
+    sessions,
   };
+}
+
+function childrenByParentSessionId(records: SessionRecord[]): Map<string, SessionRecord[]> {
+  const childrenByParent = new Map<string, SessionRecord[]>();
+  for (const record of records) {
+    if (!record.parentSessionId) {
+      continue;
+    }
+    childrenByParent.set(record.parentSessionId, [
+      ...(childrenByParent.get(record.parentSessionId) ?? []),
+      record,
+    ]);
+  }
+  return childrenByParent;
+}
+
+function descendantRecords(rootSessionId: string, records: SessionRecord[]): SessionRecord[] {
+  const childrenByParent = childrenByParentSessionId(records);
+  const descendants: SessionRecord[] = [];
+  const queue = [...(childrenByParent.get(rootSessionId) ?? [])];
+  const seen = new Set<string>([rootSessionId]);
+  while (queue.length > 0) {
+    const record = queue.shift();
+    if (!record || seen.has(record.acpxRecordId)) {
+      continue;
+    }
+    seen.add(record.acpxRecordId);
+    descendants.push(record);
+    queue.push(...(childrenByParent.get(record.acpxRecordId) ?? []));
+  }
+  return descendants.toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
+}
+
+async function readOwnerStatusForRecord(record: SessionRecord): Promise<SessionOwnerStatus> {
+  const state = await readQueueOwnerState(record.acpxRecordId);
+  const closed = record.closed === true;
+  return {
+    ...state,
+    ...(record.parentSessionId ? { parentSessionId: record.parentSessionId } : {}),
+    ...(record.kind ? { kind: record.kind } : {}),
+    closed,
+    ignored: closed,
+    classification: classifySessionOwnerStatus(state, closed),
+    recoverable: closed ? false : state.recoverable,
+  };
+}
+
+function classifySessionOwnerStatus(
+  state: QueueOwnerLiveness,
+  closed: boolean,
+): SessionOwnerStatusClassification {
+  if (closed) {
+    return "closed_ignored";
+  }
+  if (state.state === "no_owner") {
+    return "idle_no_owner";
+  }
+  if (state.recoverable) {
+    return "recoverable_owner";
+  }
+  if (state.state === "socket_unreachable") {
+    return "socket_unreachable";
+  }
+  return "healthy";
 }
 
 // Force-restart (un-wedge) a session's queue owner. Resolves the caller-supplied
