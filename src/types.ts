@@ -223,6 +223,7 @@ export type AcpClientOptions = {
   verbose?: boolean;
   sessionContext?: {
     acpxRecordId: string;
+    sessionName?: string | null;
     parentSessionId?: string | null;
     /** Full parent acpx-ui URL (host+id) for cross-machine lineage. (FW-19) */
     parentSessionUrl?: string | null;

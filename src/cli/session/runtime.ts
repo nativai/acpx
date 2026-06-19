@@ -1056,6 +1056,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       verbose: options.verbose,
       sessionContext: {
         acpxRecordId: record.acpxRecordId,
+        sessionName: record.name ?? null,
         parentSessionId: record.parentSessionId ?? null,
         taskFolder: record.metadata?.task_folder ?? null,
         agentFolder: resolveAndEnsureAgentFolder(record),
@@ -1697,6 +1698,7 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
     },
     sessionContext: {
       acpxRecordId: "",
+      sessionName: null,
       subscriptionId: options.sessionOptions?.subscription ?? null,
       profileId: options.sessionOptions?.profile ?? null,
       reasoningEffort: options.sessionOptions?.reasoningEffort ?? null,

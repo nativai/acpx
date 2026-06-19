@@ -281,6 +281,51 @@ test("getValidEffortsForProfile: claude-home uses the interactive Claude effort 
   });
 });
 
+test("getValidEffortsForProfile: subscription and OpenRouter profiles expose distinct effort ladders", async () => {
+  await withProfilesHome(
+    {
+      ...HYBRID_REGISTRY,
+      profiles: [
+        ...HYBRID_REGISTRY.profiles,
+        {
+          id: "or-reasoning",
+          label: "OpenRouter reasoning",
+          harness: "claude",
+          authMode: "openrouter",
+          model: "deepseek/deepseek-chat",
+          openRouterApiKey: "test-key-never-logged",
+          reasoningSupported: true,
+        },
+        {
+          id: "or-plain",
+          label: "OpenRouter plain",
+          harness: "claude",
+          authMode: "openrouter",
+          model: "anthropic/claude-3-5-sonnet",
+          openRouterApiKey: "test-key-never-logged",
+        },
+      ],
+    },
+    async (ctx) => {
+      const registry = loadProfileRegistry(ctx.lookupOptions);
+      const sub1 = registry.profiles.find((p) => p.id === "sub1");
+      const orReasoning = registry.profiles.find((p) => p.id === "or-reasoning");
+      const orPlain = registry.profiles.find((p) => p.id === "or-plain");
+      assert.ok(sub1);
+      assert.ok(orReasoning);
+      assert.ok(orPlain);
+      assert.deepEqual(getValidEffortsForProfile(sub1), ["low", "medium", "high", "xhigh", "max"]);
+      assert.deepEqual(getValidEffortsForProfile(orReasoning), [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+      ]);
+      assert.equal(getValidEffortsForProfile(orPlain), null);
+    },
+  );
+});
+
 test("buildClaudeHomeSelectorMeta emits the bridge's published _meta key for claude-home profiles only", async () => {
   await withProfilesHome(HYBRID_REGISTRY, async (ctx) => {
     assert.deepEqual(buildClaudeHomeSelectorMeta("home1", ctx.lookupOptions), {
@@ -434,7 +479,7 @@ test("applyProfileAuth (claude-home): injects the FULL home map, no CLAUDE_CONFI
       env,
       "home1",
       "session-1",
-      null,
+      "max",
       ctx.lookupOptions,
       DEFAULT_CLAUDE_PTY_COMMAND,
     );
@@ -541,7 +586,7 @@ test("applyProfileAuth: subscription profile on the SDK agent stays byte-identic
       env,
       "sub1",
       "session-1",
-      null,
+      "max",
       ctx.lookupOptions,
       SDK_CLAUDE_COMMAND,
     );
@@ -549,6 +594,47 @@ test("applyProfileAuth: subscription profile on the SDK agent stays byte-identic
     assert.equal(env.CLAUDE_CONFIG_DIR, path.join(subsDir, "sub1"));
     assert.equal(INDEPENDENT_CLAUDE_HOME_MAP_ENV in env, false);
   });
+});
+
+test("applyProfileAuth validates explicit reasoning effort against the selected profile type", async () => {
+  await withProfilesHome(
+    {
+      ...HYBRID_REGISTRY,
+      profiles: [
+        ...HYBRID_REGISTRY.profiles,
+        {
+          id: "or-reasoning",
+          label: "OpenRouter reasoning",
+          harness: "claude",
+          authMode: "openrouter",
+          model: "deepseek/deepseek-chat",
+          openRouterApiKey: "test-key-never-logged",
+          reasoningSupported: true,
+        },
+      ],
+    },
+    async (ctx) => {
+      const subsDir = path.join(ctx.homeDir, ".acpx", "subscriptions");
+      await fs.mkdir(path.join(subsDir, "sub1"), { recursive: true });
+
+      await assert.rejects(
+        applyProfileAuth({}, "sub1", "session-1", "minimal", ctx.lookupOptions, SDK_CLAUDE_COMMAND),
+        /--reasoning-effort "minimal" is not valid for profile "sub1" \(subscription\).*low, medium, high, xhigh, max/s,
+      );
+
+      await assert.rejects(
+        applyProfileAuth(
+          {},
+          "or-reasoning",
+          "session-1",
+          "max",
+          ctx.lookupOptions,
+          SDK_CLAUDE_COMMAND,
+        ),
+        /--reasoning-effort "max" is not valid for profile "or-reasoning" \(openrouter\).*minimal, low, medium, high/s,
+      );
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------

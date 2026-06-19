@@ -561,7 +561,7 @@ test("S3+S5: auth-gated dead-mark uses a ~60s TTL (not the sentinel) and throws 
           "9999-12-31T23:59:59.999Z",
           "NOT the process-lifetime sentinel",
         );
-        const deadMs = Date.parse(health.deadUntil as string);
+        const deadMs = Date.parse(health.deadUntil);
         // deadUntil ≈ now + 60s (bounded by the call window).
         assert.ok(
           deadMs >= before + 60_000 && deadMs <= after + 60_000,

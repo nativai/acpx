@@ -85,6 +85,7 @@ async function submitToRunningOwner(
 function sessionContextFromRecord(record: Awaited<ReturnType<typeof resolveSessionRecord>>) {
   return {
     acpxRecordId: record.acpxRecordId,
+    sessionName: record.name ?? null,
     parentSessionId: record.parentSessionId ?? null,
     taskFolder: record.metadata?.task_folder ?? null,
     agentFolder: resolveAndEnsureAgentFolder(record),

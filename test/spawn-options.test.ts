@@ -282,6 +282,46 @@ test("buildAgentSpawnOptions injects ACPX_TASK_FOLDER when sessionContext.taskFo
   assert.equal(options.env.ACPX_TASK_FOLDER, "/abs/path/to/task");
 });
 
+test("buildAgentSpawnOptions injects ACPX_SESSION_NAME when sessionContext.sessionName is non-empty", () => {
+  const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+    acpxRecordId: "child-id",
+    sessionName: " self-status ",
+  });
+  assert.equal(options.env.ACPX_SESSION_NAME, "self-status");
+});
+
+test("buildAgentSpawnOptions omits ACPX_SESSION_NAME for unnamed sessions and clears inherited stale names", () => {
+  const previous = process.env.ACPX_SESSION_NAME;
+  process.env.ACPX_SESSION_NAME = "stale-parent-name";
+  try {
+    const unnamed = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+    });
+    assert.equal(Object.prototype.hasOwnProperty.call(unnamed.env, "ACPX_SESSION_NAME"), false);
+
+    const nullName = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+      sessionName: null,
+    });
+    assert.equal(Object.prototype.hasOwnProperty.call(nullName.env, "ACPX_SESSION_NAME"), false);
+
+    const whitespaceName = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+      sessionName: "   ",
+    });
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(whitespaceName.env, "ACPX_SESSION_NAME"),
+      false,
+    );
+  } finally {
+    if (previous === undefined) {
+      delete process.env.ACPX_SESSION_NAME;
+    } else {
+      process.env.ACPX_SESSION_NAME = previous;
+    }
+  }
+});
+
 test("buildAgentSpawnOptions trims whitespace around taskFolder before injecting ACPX_TASK_FOLDER", () => {
   const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
     acpxRecordId: "child-id",

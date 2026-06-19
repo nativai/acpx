@@ -339,6 +339,7 @@ async function forkSessionRecordWithClient(
 function creationSessionContext(options: SessionCreateOptions) {
   return {
     acpxRecordId: "",
+    sessionName: normalizeName(options.name) ?? null,
     parentSessionId: options.parentSessionId ?? null,
     // FW-19: the full parent URL (real host) only needs to reach the bridge at
     // session/new — the bridge persists it across reloads. Later (recover/keepwarm)

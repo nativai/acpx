@@ -27,7 +27,7 @@ acpx [global_options] flow run <file> [--input-json <json> | --input-file <path>
 acpx [global_options] cancel [-s <name>]
 acpx [global_options] set-mode <mode> [-s <name>]
 acpx [global_options] set <key> <value> [-s <name>]
-acpx [global_options] status [-s <name>]
+acpx [global_options] status [-s <name> | --session-id <id> | --session-url <url>]
 acpx [global_options] sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>]]
 acpx [global_options] config [show | init]
 
@@ -37,7 +37,7 @@ acpx [global_options] <agent> exec [prompt_options] [prompt_text...]
 acpx [global_options] <agent> cancel [-s <name>]
 acpx [global_options] <agent> set-mode <mode> [-s <name>]
 acpx [global_options] <agent> set <key> <value> [-s <name>]
-acpx [global_options] <agent> status [-s <name>]
+acpx [global_options] <agent> status [-s <name> | --session-id <id> | --session-url <url>]
 acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>]]
 ```
 
@@ -118,6 +118,7 @@ All global options:
 | `--timeout <seconds>`                    | Max wait time for agent response               | Must be positive. Decimal seconds allowed.                                                                                                                                                                 |
 | `--ttl <seconds>`                        | Queue owner idle TTL before shutdown           | Default `5400`. `0` disables TTL.                                                                                                                                                                          |
 | `--model <id>`                           | Set agent model                                | Claude-compatible adapters may consume session creation metadata; other agents must advertise ACP models and support `session/set_model`, otherwise `acpx` fails clearly instead of silently falling back. |
+| `--reasoning-effort <level>`             | Set Claude thinking depth                      | Claude subscription and claude-home profiles accept `low`, `medium`, `high`, `xhigh`, `max`; OpenRouter reasoning profiles accept `minimal`, `low`, `medium`, `high`.                                      |
 | `--verbose`                              | Enable verbose logs                            | Prints ACP/debug details to stderr.                                                                                                                                                                        |
 
 Permission flags are mutually exclusive. Using more than one of `--approve-all`, `--approve-reads`, `--deny-all` is a usage error.
@@ -356,14 +357,22 @@ Behavior:
 ```bash
 acpx [global_options] <agent> status
 acpx [global_options] <agent> status -s <name>
+acpx [global_options] <agent> status --session-id <id>
+acpx [global_options] <agent> status --session-url <url>
 acpx [global_options] status
 acpx [global_options] status -s <name>
+acpx [global_options] status --session-id <id>
+acpx [global_options] status --session-url <url>
 ```
 
-Shows local process status for the cwd-scoped session:
+Shows local process status for the selected session. Name lookup (`-s/--session`)
+remains cwd-scoped. Explicit identity selectors (`--session-id` and
+`--session-url`) resolve the persisted session globally, so an agent can check
+its own URL-addressed session even when its current cwd or name is unavailable.
 
 - `running`, `idle`, `dead`, or `no-session`
 - session id, agent command, live queue-owner pid when available
+- model id, available models, desired reasoning effort, and live advertised effort when known
 - uptime when running
 - last prompt timestamp
 - last known exit code/signal when dead
@@ -584,12 +593,17 @@ Per-tool policy:
 
 ## Environment variables
 
-No `acpx`-specific environment variables are currently defined.
+Child adapter processes inherit the current environment by default. `acpx`
+also injects session identity variables when a saved session is involved:
 
-Related runtime behavior:
+- `ACPX_SESSION_URL`: acpx-ui URL for this session, including `?session=<id>`.
+- `ACPX_PARENT_SESSION_URL`: parent session URL when lineage is known.
+- `ACPX_SESSION_NAME`: set only for named sessions; unset for unnamed sessions.
+- `ACPX_TASK_FOLDER`: task folder metadata when present on the session.
+- `ACPX_AGENT_FOLDER`: per-agent working folder when acpx creates one.
 
-- session storage path is derived from OS home directory (`~/.acpx/sessions`)
-- child processes inherit the current environment by default
+Session storage path is derived from the OS home directory
+(`~/.acpx/sessions`).
 
 ## Practical examples
 

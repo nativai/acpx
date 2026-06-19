@@ -66,10 +66,12 @@ For setting the model at session creation instead, use the `--model` global flag
 ```bash
 acpx codex status
 acpx codex status -s backend
+acpx codex status --session-url "$ACPX_SESSION_URL"
+acpx codex status --session-id 33333333-3333-4333-8333-333333333333
 acpx status              # defaults to codex
 ```
 
-Reports local process status for the cwd-scoped session:
+Reports local process status for the selected session:
 
 | State        | Meaning                                                                          |
 | ------------ | -------------------------------------------------------------------------------- |
@@ -81,6 +83,13 @@ Reports local process status for the cwd-scoped session:
 Plus, when applicable: session id, agent command, live queue-owner pid, uptime,
 last prompt timestamp, and last known exit code or signal for `dead`.
 
+Name lookup (`-s/--session`) is cwd-scoped. `--session-url` and `--session-id`
+resolve persisted sessions globally, which is the durable path for an agent
+checking its own `$ACPX_SESSION_URL`.
+
+Status output also includes model, available model ids, desired reasoning
+effort, and live advertised effort when the adapter has reported them.
+
 `status` is local — it uses `kill(pid, 0)` semantics and does not touch the
 agent. Cached session PIDs are not reported unless a live queue-owner lease ties
 them to the session. It is safe to run from automation that polls for queue
@@ -89,7 +98,7 @@ readiness.
 ### Output
 
 - `text`: key/value lines (default).
-- `json`: full record with `acpxRecordId`, `acpxSessionId`, optional `agentSessionId`, plus state and timestamps.
+- `json`: full status snapshot with `acpxRecordId`, `acpxSessionId`, optional `agentSessionId`, model/effort fields, state, and timestamps.
 
 `idle` is meaningful: it means the persistent session is saved and resumable, but no queue owner is currently running. The next prompt will start an owner and reconnect.
 

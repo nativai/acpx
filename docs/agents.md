@@ -41,7 +41,7 @@ acpx <agent> exec [prompt_text...]            # one-shot, no saved session
 acpx <agent> cancel [-s <name>]               # cooperative session/cancel
 acpx <agent> set-mode <mode> [-s <name>]      # session/set_mode
 acpx <agent> set <key> <value> [-s <name>]    # session/set_config_option
-acpx <agent> status [-s <name>]
+acpx <agent> status [-s <name> | --session-id <id> | --session-url <url>]
 acpx <agent> sessions [list | new | ensure | close | show | history | prune]
 ```
 

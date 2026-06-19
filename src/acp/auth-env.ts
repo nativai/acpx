@@ -231,6 +231,7 @@ export function resolveAcpxUiBaseUrl(env: NodeJS.ProcessEnv): string {
 
 export type AgentSessionContext = {
   acpxRecordId: string;
+  sessionName?: string | null;
   parentSessionId?: string | null;
   /**
    * The parent session's FULL acpx-ui URL (host + id), used for cross-machine
@@ -279,11 +280,18 @@ function buildAgentEnvironment(
   // THIS spawn ids below so a bridge session can never carry another session identity.
   delete env.ACPX_SESSION_URL;
   delete env.ACPX_PARENT_SESSION_URL;
+  delete env.ACPX_SESSION_NAME;
   const baseUrl = resolveAcpxUiBaseUrl(env);
   if (sessionContext && typeof sessionContext.acpxRecordId === "string") {
     const trimmed = sessionContext.acpxRecordId.trim();
     if (trimmed.length > 0) {
       env.ACPX_SESSION_URL = `${baseUrl}/?session=${trimmed}`;
+    }
+  }
+  if (sessionContext && typeof sessionContext.sessionName === "string") {
+    const trimmedName = sessionContext.sessionName.trim();
+    if (trimmedName.length > 0) {
+      env.ACPX_SESSION_NAME = trimmedName;
     }
   }
   if (sessionContext && typeof sessionContext.parentSessionId === "string") {
@@ -827,27 +835,28 @@ export function resolveConfiguredAuthCredential(
  *
  * Constraint: openRouterApiKey must never appear in logs or process output.
  */
-// Validate that an effort override is in the profile's valid set; throws with a
-// clear, user-facing error listing the valid levels on mismatch.
-function validateOpenRouterEffort(
+// Validate that an explicit effort override is in the selected profile's valid
+// set; throws with a clear, user-facing error listing the valid levels.
+function validateProfileReasoningEffort(
   profileId: string,
-  profile: ReturnType<typeof findProfile> & object,
-  effortOverride: string | undefined,
+  profile: ProfileEntry,
+  effortOverride: string | null | undefined,
 ): void {
-  if (!effortOverride) {
+  const trimmedEffort = effortOverride?.trim();
+  if (!trimmedEffort) {
     return;
   }
   const validEfforts = getValidEffortsForProfile(profile);
   if (!validEfforts) {
     throw new Error(
-      `[acpx] profile "${profileId}" does not support reasoning (reasoningSupported is not set). ` +
-        `Remove --reasoning-effort to use this profile without reasoning.`,
+      `[acpx] profile "${profileId}" does not support --reasoning-effort. ` +
+        `Remove --reasoning-effort to use this profile without a reasoning override.`,
     );
   }
-  if (!validEfforts.includes(effortOverride)) {
+  if (!validEfforts.includes(trimmedEffort)) {
     throw new Error(
-      `[acpx] --reasoning-effort "${effortOverride}" is not valid for OpenRouter profile "${profileId}". ` +
-        `Valid levels: ${validEfforts.join(", ")}`,
+      `[acpx] --reasoning-effort "${trimmedEffort}" is not valid for profile "${profileId}" ` +
+        `(${profile.authMode}). Valid levels: ${validEfforts.join(", ")}`,
     );
   }
 }
@@ -1046,7 +1055,6 @@ async function applyOpenRouterProfileAuth(
 
   // Validate then resolve effort: per-session override > profile default.
   const trimmedEffort = reasoningEffortOverride?.trim() || undefined;
-  validateOpenRouterEffort(profileId, profile, trimmedEffort);
   const resolvedEffort = trimmedEffort ?? profile.reasoningEffort;
 
   // Isolate Claude config in a per-session temp dir (no OAuth inheritance).
@@ -1090,6 +1098,7 @@ export async function applyProfileAuth(
   }
 
   validateProfileAgentCompatibility(trimmedId, profile, agentCommand);
+  validateProfileReasoningEffort(trimmedId, profile, reasoningEffortOverride);
 
   if (profile.authMode === "claude-home") {
     applyClaudeHomeProfileAuth(env, registry);

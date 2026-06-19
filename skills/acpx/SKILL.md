@@ -74,7 +74,7 @@ acpx [global_options] exec [prompt_options] [prompt_text...]
 acpx [global_options] cancel [-s <name>]
 acpx [global_options] set-mode <mode> [-s <name>]
 acpx [global_options] set <key> <value> [-s <name>]
-acpx [global_options] status [-s <name>]
+acpx [global_options] status [-s <name> | --session-id <id> | --session-url <url>]
 acpx [global_options] sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]]
 acpx [global_options] config [show | init]
 acpx [global_options] flow run <file> [--input-json '<json>' | --input-file <path>] [--default-agent <name>]
@@ -85,7 +85,7 @@ acpx [global_options] <agent> exec [prompt_options] [prompt_text...]
 acpx [global_options] <agent> cancel [-s <name>]
 acpx [global_options] <agent> set-mode <mode> [-s <name>]
 acpx [global_options] <agent> set <key> <value> [-s <name>]
-acpx [global_options] <agent> status [-s <name>]
+acpx [global_options] <agent> status [-s <name> | --session-id <id> | --session-url <url>]
 acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]]
 ```
 
@@ -204,6 +204,7 @@ acpx sessions import backend-session.json --name backend-restored
 acpx sessions prune --dry-run --older-than 7
 acpx sessions prune --older-than 30 --include-history
 acpx status
+acpx status --session-url "$ACPX_SESSION_URL"
 
 acpx codex sessions
 acpx codex sessions new --name backend
@@ -215,6 +216,7 @@ acpx codex sessions export backend --output backend-session.json
 acpx codex sessions import backend-session.json --name backend-restored
 acpx codex sessions prune --before 2026-04-01 --include-history
 acpx codex status
+acpx codex status --session-id <id>
 ```
 
 Behavior:
@@ -241,6 +243,8 @@ Behavior:
   - `--dry-run` previews what would be deleted without touching disk
   - `--older-than <days>` and `--before <date>` filter by close time, falling back to last-used time when a record was never explicitly closed
   - `--include-history` also removes per-session event stream files (otherwise only the JSON record is removed)
+- `status -s <name>` remains cwd-scoped, while `status --session-id <id>` and `status --session-url <url>` resolve persisted sessions globally
+- `status --format json` includes model and reasoning-effort fields when the adapter has reported them
 
 ## Global options
 
@@ -338,6 +342,7 @@ Persistence:
 - Changing `--cwd` changes scope and therefore session lookup.
 - closed sessions are retained on disk with `closed: true` and `closedAt` until pruned.
 - auto-resume by scope skips closed sessions.
+- Child agents receive `ACPX_SESSION_URL`; named sessions also receive `ACPX_SESSION_NAME`. Unnamed sessions do not receive `ACPX_SESSION_NAME`.
 
 Resume behavior:
 

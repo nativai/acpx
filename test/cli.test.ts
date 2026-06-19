@@ -2268,6 +2268,24 @@ test("explicit session selectors resolve records globally while name lookup stay
       createdAt: "2026-01-01T00:00:00.000Z",
       lastUsedAt: "2026-01-01T00:00:00.000Z",
       closed: false,
+      acpx: {
+        current_model_id: "default",
+        available_models: ["default", "opus"],
+        desired_config_options: { effort: "max" },
+        config_options: [
+          {
+            id: "effort",
+            name: "Effort",
+            type: "select",
+            currentValue: "high",
+            options: [
+              { value: "low", name: "Low" },
+              { value: "high", name: "High" },
+              { value: "max", name: "Max" },
+            ],
+          },
+        ],
+      },
     });
 
     const wrongCwdNameStatus = await runCli(
@@ -2289,6 +2307,36 @@ test("explicit session selectors resolve records globally while name lookup stay
       acpxRecordId?: unknown;
     };
     assert.equal(correctCwdNamePayload.acpxRecordId, recordId);
+
+    const statusByUrl = await runCli(
+      ["--cwd", otherCwd, "--format", "json", "codex", "status", "--session-url", sessionUrl],
+      homeDir,
+    );
+    assert.equal(statusByUrl.code, 0, statusByUrl.stderr);
+    const statusByUrlPayload = JSON.parse(statusByUrl.stdout.trim()) as {
+      acpxRecordId?: unknown;
+      model?: unknown;
+      availableModels?: unknown;
+      reasoningEffort?: unknown;
+      reasoningEffortLive?: unknown;
+    };
+    assert.equal(statusByUrlPayload.acpxRecordId, recordId);
+    assert.equal(statusByUrlPayload.model, "default");
+    assert.deepEqual(statusByUrlPayload.availableModels, ["default", "opus"]);
+    assert.equal(statusByUrlPayload.reasoningEffort, "max");
+    assert.equal(statusByUrlPayload.reasoningEffortLive, "high");
+
+    const statusByIdSuffix = await runCli(
+      ["--cwd", otherCwd, "--format", "json", "codex", "status", "--session-id", "333333333333"],
+      homeDir,
+    );
+    assert.equal(statusByIdSuffix.code, 0, statusByIdSuffix.stderr);
+    const statusByIdSuffixPayload = JSON.parse(statusByIdSuffix.stdout.trim()) as {
+      acpxRecordId?: unknown;
+      reasoningEffort?: unknown;
+    };
+    assert.equal(statusByIdSuffixPayload.acpxRecordId, recordId);
+    assert.equal(statusByIdSuffixPayload.reasoningEffort, "max");
 
     const showByUrl = await runCli(
       [
@@ -4605,7 +4653,7 @@ async function runCli(
     }
 
     let timedOut = false;
-    let timeout: NodeJS.Timeout | undefined;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     if (options.timeoutMs != null && options.timeoutMs > 0) {
       timeout = setTimeout(() => {
         timedOut = true;

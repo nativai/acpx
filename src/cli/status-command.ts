@@ -114,7 +114,10 @@ function printMissingStatus(format: ResolvedAcpxConfig["format"], agentCommand: 
   process.stdout.write("pid: -\n");
   process.stdout.write("status: no-session\n");
   process.stdout.write("model: -\n");
+  process.stdout.write("availableModels: -\n");
   process.stdout.write("mode: -\n");
+  process.stdout.write("reasoningEffort: -\n");
+  process.stdout.write("reasoningEffortLive: -\n");
   process.stdout.write("uptime: -\n");
   process.stdout.write("lastPromptTime: -\n");
 }
@@ -293,6 +296,10 @@ function orDash(value: string | number | null): string {
   return value == null ? "-" : String(value);
 }
 
+function listOrDash(value: string[] | null): string {
+  return value && value.length > 0 ? value.join(", ") : "-";
+}
+
 function printTextStatus(payload: StatusPayload, dead: boolean): void {
   process.stdout.write(`session: ${payload.sessionId}\n`);
   if ("agentSessionId" in payload) {
@@ -302,8 +309,10 @@ function printTextStatus(payload: StatusPayload, dead: boolean): void {
   process.stdout.write(`pid: ${orDash(payload.pid)}\n`);
   process.stdout.write(`status: ${payload.status}\n`);
   process.stdout.write(`model: ${orDash(payload.model)}\n`);
+  process.stdout.write(`availableModels: ${listOrDash(payload.availableModels)}\n`);
   process.stdout.write(`mode: ${orDash(payload.mode)}\n`);
   process.stdout.write(`reasoningEffort: ${orDash(payload.reasoningEffort)}\n`);
+  process.stdout.write(`reasoningEffortLive: ${orDash(payload.reasoningEffortLive)}\n`);
   process.stdout.write(`uptime: ${orDash(payload.uptime)}\n`);
   process.stdout.write(`lastPromptTime: ${orDash(payload.lastPromptTime)}\n`);
   if (dead) {

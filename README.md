@@ -34,7 +34,7 @@ One command surface for Pi, OpenClaw ACP, Codex, Claude, and other ACP-compatibl
 - **Config files**: global + project JSON config with `acpx config show|init`
 - **Session inspect/history**: `sessions show` and `sessions history --limit <n>`
 - **Session export/import**: move portable session archives between machines
-- **Local status checks**: `status` reports running/idle/dead/no-session, pid, uptime, last prompt
+- **Local status checks**: `status` reports running/idle/dead/no-session, model/effort, pid, uptime, last prompt
 - **Client methods**: stable `fs/*` and `terminal/*` handlers with permission controls and cwd sandboxing
 - **Auth handshake**: stable `authenticate` support via env/config credentials
 - **Structured output**: typed ACP messages (thinking, tool calls, diffs) instead of ANSI scraping
@@ -167,6 +167,7 @@ acpx codex sessions ensure --name api # ensure named scoped session
 acpx codex sessions close        # close cwd-scoped default session
 acpx codex sessions close api    # close cwd-scoped named session
 acpx codex status                # local process status for current session
+acpx codex status --session-url "$ACPX_SESSION_URL" # durable self-check by URL
 
 acpx config show                 # show resolved config (global + project)
 acpx config init                 # create ~/.acpx/config.json template
@@ -336,6 +337,10 @@ Session-control JSON payloads (`sessions new|ensure`, `status`) always include
 adapter exposes a provider-native session ID. The text/quiet session id is the
 local acpx record id; do not assume it can be passed to the native provider CLI
 unless `agentSessionId` is present.
+
+`status --session-id <id>` and `status --session-url <url>` resolve sessions by
+durable identity instead of cwd/name scope. Status JSON includes model and
+reasoning-effort fields when the adapter has reported them.
 
 ## Built-in agents and custom servers
 
