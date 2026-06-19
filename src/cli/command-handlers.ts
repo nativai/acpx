@@ -1708,7 +1708,57 @@ export async function handleSessionsCopy(
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
-  await runSessionCopy(explicitAgentName, flags, command, config, false);
+  const handoffPrompt = await resolveCopyHandoffPrompt(flags, command, config);
+  const { created } = await runSessionCopy(explicitAgentName, flags, command, config, false);
+  if (!handoffPrompt) {
+    return;
+  }
+  await deliverCopyHandoffPrompt(created.acpxRecordId, handoffPrompt, command, config);
+}
+
+async function resolveCopyHandoffPrompt(
+  flags: SessionsCopyFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<import("../types.js").PromptInput | undefined> {
+  const hasPrompt = typeof flags.prompt === "string";
+  const hasPromptFile = typeof flags.promptFile === "string";
+  if (!hasPrompt && !hasPromptFile) {
+    return undefined;
+  }
+  if (hasPrompt && hasPromptFile) {
+    throw new InvalidArgumentError("Use only one of --prompt or --prompt-file");
+  }
+
+  const globalFlags = resolveGlobalFlags(command, config);
+  return await readPrompt(
+    hasPrompt ? [flags.prompt as string] : [],
+    flags.promptFile,
+    globalFlags.cwd,
+  );
+}
+
+async function deliverCopyHandoffPrompt(
+  sessionId: string,
+  prompt: import("../types.js").PromptInput,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
+  const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
+  await deliverPrompt({
+    sessionId,
+    prompt,
+    // Copy/fork handoff is a spawn-style fire-and-return operation: the parent
+    // gets the child's id/URL immediately while the copied session works async.
+    waitForCompletion: false,
+    globalFlags,
+    permissionMode,
+    permissionPolicy,
+    outputPolicy: resolveRequestedOutputPolicy(globalFlags),
+    config,
+  });
 }
 
 // Shared core for `sessions copy`/`fork` and `sessions new --from-template`.

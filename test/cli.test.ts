@@ -4627,6 +4627,26 @@ async function runCli(
   });
 }
 
+async function waitFor<T>(fn: () => Promise<T | null>, timeoutMs: number): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      const result = await fn();
+      if (result !== null) {
+        return result;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  if (lastError) {
+    throw lastError;
+  }
+  throw new Error(`Timed out after ${timeoutMs}ms`);
+}
+
 async function writeSubscriptionRegistry(homeDir: string): Promise<void> {
   const subscriptionsRoot = path.join(homeDir, ".acpx", "subscriptions");
   await fs.mkdir(path.join(subscriptionsRoot, "sub1"), { recursive: true });
@@ -4812,7 +4832,12 @@ async function writeRecordWithTemplate(
     agentCommand: string;
     cwd: string;
   },
-  template?: { enabled: boolean; created_at: string },
+  template?: {
+    enabled: boolean;
+    created_at: string;
+    source_session_id?: string;
+    auto_prompt?: string;
+  },
 ): Promise<void> {
   const onDisk = serializeSessionRecordForDisk(makeSessionRecord(overrides));
   if (template) {
@@ -5168,6 +5193,240 @@ test("sessions copy with NO parent context omits parent fields (fork regression 
     // A plain copy/fork must NOT carry the template-spawn discriminator.
     const meta = (onDisk["metadata"] ?? {}) as Record<string, unknown>;
     assert.equal(Object.prototype.hasOwnProperty.call(meta, "template_source"), false);
+  });
+});
+
+test("sessions copy --prompt queues a non-blocking prompt handoff into the copied session", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_WITH_FORK_SESSION);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "source-prompt-handoff",
+      acpSessionId: "acp-source-prompt-handoff",
+      agentName: "codex",
+      agentCommand: MOCK_AGENT_WITH_FORK_SESSION,
+      cwd,
+      name: "source",
+    });
+
+    const result = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--format",
+        "json",
+        "--ttl",
+        "0.2",
+        "codex",
+        "sessions",
+        "copy",
+        "--from",
+        "source-prompt-handoff",
+        "--name",
+        "handoff-child",
+        "--prompt",
+        "sleep 1500",
+      ],
+      homeDir,
+      { timeoutMs: 1_200 },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const payload = JSON.parse(result.stdout.trim()) as {
+      action?: unknown;
+      acpxRecordId?: unknown;
+      sessionUrl?: unknown;
+    };
+    assert.equal(payload.action, "session_copied");
+    assert.equal(typeof payload.acpxRecordId, "string");
+    assert.match(String(payload.sessionUrl), new RegExp(`session=${String(payload.acpxRecordId)}`));
+
+    const childId = String(payload.acpxRecordId);
+    const stored = JSON.parse(await fs.readFile(sessionFilePath(homeDir, childId), "utf8")) as {
+      forked_from_session_id?: unknown;
+      name?: unknown;
+    };
+    assert.equal(stored.forked_from_session_id, "source-prompt-handoff");
+    assert.equal(stored.name, "handoff-child");
+
+    await waitFor(async () => {
+      const history = await runCli(
+        ["--cwd", cwd, "--format", "json", "codex", "sessions", "read", "--session-id", childId],
+        homeDir,
+      );
+      if (history.code !== 0) {
+        return null;
+      }
+      const read = JSON.parse(history.stdout.trim()) as {
+        entries?: Array<{ textPreview?: unknown }>;
+      };
+      const previews = read.entries?.map((entry) => entry.textPreview);
+      return previews?.includes("slept 1500ms") ? previews : null;
+    }, 6_000);
+
+    const close = await runCli(["codex", "sessions", "close", "--session-id", childId], homeDir);
+    assert.equal(close.code, 0, close.stderr);
+  });
+});
+
+test("sessions fork --prompt-file queues prompt handoff from a file", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_WITH_FORK_SESSION);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "source-file-handoff",
+      acpSessionId: "acp-source-file-handoff",
+      agentName: "codex",
+      agentCommand: MOCK_AGENT_WITH_FORK_SESSION,
+      cwd,
+      name: "source",
+    });
+    await fs.writeFile(path.join(cwd, "handoff.txt"), "echo file-handoff\n", "utf8");
+
+    const result = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--format",
+        "json",
+        "--ttl",
+        "0.2",
+        "codex",
+        "sessions",
+        "fork",
+        "--from",
+        "source-file-handoff",
+        "--prompt-file",
+        "handoff.txt",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const payload = JSON.parse(result.stdout.trim()) as { acpxRecordId?: unknown };
+    const childId = String(payload.acpxRecordId);
+
+    await waitFor(async () => {
+      const history = await runCli(
+        ["--cwd", cwd, "--format", "json", "codex", "sessions", "read", "--session-id", childId],
+        homeDir,
+      );
+      if (history.code !== 0) {
+        return null;
+      }
+      const read = JSON.parse(history.stdout.trim()) as {
+        entries?: Array<{ textPreview?: unknown }>;
+      };
+      const previews = read.entries?.map((entry) => entry.textPreview);
+      return previews?.includes("file-handoff") ? previews : null;
+    }, 5_000);
+
+    const close = await runCli(["codex", "sessions", "close", "--session-id", childId], homeDir);
+    assert.equal(close.code, 0, close.stderr);
+  });
+});
+
+test("sessions copy rejects combining --prompt and --prompt-file before creating a copy", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_WITH_FORK_SESSION);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "source-conflict-handoff",
+      acpSessionId: "acp-source-conflict-handoff",
+      agentName: "codex",
+      agentCommand: MOCK_AGENT_WITH_FORK_SESSION,
+      cwd,
+      name: "source",
+    });
+    await fs.writeFile(path.join(cwd, "handoff.txt"), "echo file-handoff\n", "utf8");
+
+    const before = await listSessionRecordFiles(homeDir);
+    const result = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "codex",
+        "sessions",
+        "copy",
+        "--from",
+        "source-conflict-handoff",
+        "--prompt",
+        "echo inline",
+        "--prompt-file",
+        "handoff.txt",
+      ],
+      homeDir,
+    );
+    assert.notEqual(result.code, 0);
+    assert.match(`${result.stderr}${result.stdout}`, /Use only one of --prompt or --prompt-file/);
+    assert.deepEqual(await listSessionRecordFiles(homeDir), before);
+  });
+});
+
+test("sessions new --from-template auto-prompt still fires once and does not use copy handoff flags", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_WITH_FORK_SESSION);
+    await writeRecordWithTemplate(
+      homeDir,
+      {
+        acpxRecordId: "tmpl-auto-prompt",
+        acpSessionId: "acp-tmpl-auto-prompt",
+        agentName: "codex",
+        agentCommand: MOCK_AGENT_WITH_FORK_SESSION,
+        cwd,
+        name: "blueprint",
+        closed: true,
+      },
+      {
+        enabled: true,
+        created_at: "2026-06-01T05:00:00.000Z",
+        auto_prompt: "echo template-auto-handoff",
+      },
+    );
+
+    const result = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--format",
+        "json",
+        "--ttl",
+        "0.2",
+        "codex",
+        "sessions",
+        "new",
+        "--from-template",
+        "tmpl-auto-prompt",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const payload = JSON.parse(result.stdout.trim()) as { acpxRecordId?: unknown };
+    const childId = String(payload.acpxRecordId);
+
+    const previews = await waitFor(async () => {
+      const history = await runCli(
+        ["--cwd", cwd, "--format", "json", "codex", "sessions", "read", "--session-id", childId],
+        homeDir,
+      );
+      if (history.code !== 0) {
+        return null;
+      }
+      const read = JSON.parse(history.stdout.trim()) as {
+        entries?: Array<{ textPreview?: unknown }>;
+      };
+      const textPreviews = read.entries?.map((entry) => entry.textPreview);
+      return textPreviews?.includes("template-auto-handoff") ? textPreviews : null;
+    }, 5_000);
+
+    assert.equal(previews.filter((preview) => preview === "echo template-auto-handoff").length, 1);
+    assert.equal(previews.filter((preview) => preview === "template-auto-handoff").length, 1);
+
+    const close = await runCli(["codex", "sessions", "close", "--session-id", childId], homeDir);
+    assert.equal(close.code, 0, close.stderr);
   });
 });
 

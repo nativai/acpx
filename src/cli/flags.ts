@@ -100,6 +100,8 @@ export type SessionsCopyFlags = {
   parentSessionUrl?: string;
   metadata?: Record<string, string>;
   ephemeral?: boolean;
+  prompt?: string;
+  promptFile?: string;
 };
 
 export type SessionsTemplateFlags = {

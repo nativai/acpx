@@ -247,6 +247,16 @@ export function registerSessionsCommand(
       parseMetadataEntry,
     )
     .option("--ephemeral", "Mark the copy as a by-the-way ephemeral side-thread")
+    .option(
+      "--prompt <text>",
+      "Prompt to enqueue into the copied session immediately after creation (non-blocking)",
+      (value: string) => parseNonEmptyValue("Prompt", value),
+    )
+    .option(
+      "--prompt-file <path>",
+      "Read prompt handoff from file path (use - for stdin) and enqueue it after creation (non-blocking)",
+      (value: string) => parseNonEmptyValue("Prompt file", value),
+    )
     .action(async function (this: Command, flags: SessionsCopyFlags) {
       await handleSessionsCopy(explicitAgentName, flags, this, config);
     });
