@@ -64,6 +64,12 @@ export type SessionIndexEntry = {
   byway?: boolean;
   currentModelId?: string;
   sessionModel?: string;
+  // Agent's advertised image-prompt capability (record agentCapabilities
+  // .promptCapabilities.image), projected so acpx-ui drives the chat image-attach
+  // affordance from this entry instead of reading the multi-MB record on every
+  // ~2 Hz session-list rebuild. undefined = the agent never advertised a boolean
+  // (older record / capability not captured) → acpx-ui treats absent as off.
+  promptImageSupported?: boolean;
   desiredEffort?: string;
   subscription?: string;
   profile?: string;
@@ -231,6 +237,7 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     byway: optionalBoolean(record.byway),
     currentModelId: optionalString(record.currentModelId),
     sessionModel: optionalString(record.sessionModel),
+    promptImageSupported: optionalBoolean(record.promptImageSupported),
     desiredEffort: optionalString(record.desiredEffort),
     subscription: optionalString(record.subscription),
     profile: optionalString(record.profile),
@@ -266,6 +273,18 @@ export function sessionIndexPath(sessionDir: string): string {
   return path.join(sessionDir, "index.json");
 }
 
+// Agent's advertised image-prompt capability, derived from the record's
+// agentCapabilities.promptCapabilities.image. Mirrors acpx-ui's
+// extractPromptImageSupported EXACTLY (`typeof boolean ? value : undefined`) so the
+// projected index field and acpx-ui's record-read derivation agree byte-for-byte —
+// this is one half of the cross-repo W13-18 contract (the other half: acpx-ui reads
+// `entry.promptImageSupported` and drops its per-record fallback). undefined = the
+// agent never advertised a boolean (older record / capability never captured).
+function promptImageSupportedFromRecord(record: SessionRecord): boolean | undefined {
+  const image = record.agentCapabilities?.promptCapabilities?.image;
+  return typeof image === "boolean" ? image : undefined;
+}
+
 // eslint-disable-next-line complexity -- flat field-by-field projection of the optional hot-path enrichment scalars; linear, not branchy logic
 export function toSessionIndexEntry(record: SessionRecord, fileName: string): SessionIndexEntry {
   const acpx = record.acpx;
@@ -299,6 +318,7 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     byway: metadata?.byway === "1" ? true : undefined,
     currentModelId: acpx?.current_model_id,
     sessionModel: sessionOptions?.model,
+    promptImageSupported: promptImageSupportedFromRecord(record),
     desiredEffort: acpx?.desired_config_options?.effort,
     subscription: sessionOptions?.subscription,
     profile: sessionOptions?.profile,

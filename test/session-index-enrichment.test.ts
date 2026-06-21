@@ -69,6 +69,7 @@ function enrichedRecord(overrides: Partial<SessionRecord> = {}): SessionRecord {
     parentSessionId: "parent-1",
     forkedFromSessionId: "src-1",
     forkedAtMessageIndex: 7,
+    agentCapabilities: { promptCapabilities: { image: true } },
     metadata: { task_folder: "/wisdom/x", byway: "1", byway_parent: "src-1", byway_at: "7" },
     template: {
       enabled: true,
@@ -94,6 +95,7 @@ test("toSessionIndexEntry projects every hot scalar from the record", () => {
   assert.equal(entry.byway, true);
   assert.equal(entry.currentModelId, "gpt-5.5[high]");
   assert.equal(entry.sessionModel, "gpt-5.5[high]");
+  assert.equal(entry.promptImageSupported, true);
   assert.equal(entry.desiredEffort, "high");
   assert.equal(entry.subscription, "sub-a");
   assert.equal(entry.profile, "prof-a");
@@ -105,6 +107,44 @@ test("toSessionIndexEntry projects every hot scalar from the record", () => {
   });
   assert.equal(entry.templateEnabled, true);
   assert.equal(entry.templateCreatedAt, "2026-06-01T05:00:00.000Z");
+});
+
+test("promptImageSupported derivation mirrors acpx-ui's extractPromptImageSupported", () => {
+  // true → projected true (e.g. codex / claude-pty that advertise image:true)
+  assert.equal(
+    toSessionIndexEntry(
+      enrichedRecord({ agentCapabilities: { promptCapabilities: { image: true } } }),
+      "x.json",
+    ).promptImageSupported,
+    true,
+  );
+  // false → projected false (advertised, but image not supported)
+  assert.equal(
+    toSessionIndexEntry(
+      enrichedRecord({ agentCapabilities: { promptCapabilities: { image: false } } }),
+      "x.json",
+    ).promptImageSupported,
+    false,
+  );
+  // capability never captured (older record) → undefined; on disk the field drops
+  // out (JSON.stringify), so acpx-ui sees absent → image-attach off (NO record
+  // read). This is the accepted, self-healing rollout transient (W13-18).
+  const undef = toSessionIndexEntry(enrichedRecord({ agentCapabilities: undefined }), "x.json");
+  assert.equal(undef.promptImageSupported, undefined);
+  assert.equal(
+    "promptImageSupported" in toDisk(undef as unknown as Record<string, unknown>),
+    false,
+  );
+  // non-boolean image (malformed) → undefined, never a truthy leak
+  assert.equal(
+    toSessionIndexEntry(
+      enrichedRecord({
+        agentCapabilities: { promptCapabilities: { image: "yes" as unknown as boolean } },
+      }),
+      "x.json",
+    ).promptImageSupported,
+    undefined,
+  );
 });
 
 test("toSessionIndexEntry omits absent optionals (no byway flag, no acpx block)", () => {
@@ -169,6 +209,9 @@ test("parseIndexEntry preserves enrichment across a write→read round-trip (unt
     assert.equal(back.subscription, "sub-a");
     assert.equal(back.profile, "prof-a");
     assert.equal(back.desiredEffort, "high");
+    // Load-bearing: parseIndexEntry must preserve promptImageSupported, else a
+    // daemon write that rebuilds ONE entry strips the capability off all others.
+    assert.equal(back.promptImageSupported, true);
     assert.equal(back.byway, true);
     assert.equal(back.metadataTaskFolder, "/wisdom/x");
     assert.equal(back.templateEnabled, true);
