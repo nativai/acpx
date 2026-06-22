@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { SubscriptionTurnInFlightError } from "../../errors.js";
+import { ProfileTurnInFlightError, SubscriptionTurnInFlightError } from "../../errors.js";
+import { switchSessionAccount } from "../../runtime/engine/account-seam.js";
 import { switchSessionSubscription } from "../../runtime/engine/subscription-switch.js";
 import {
   setCurrentModelId,
@@ -44,6 +45,8 @@ import type {
   SessionSetConfigOptionOptions,
   SessionSetModelOptions,
   SessionSetModeOptions,
+  SessionSetProfileOptions,
+  SessionSetProfileResult,
   SessionSetSubscriptionOptions,
   SessionSetSubscriptionResult,
 } from "./contracts.js";
@@ -218,6 +221,54 @@ export async function setSessionSubscription(
   }
 
   return { record, from, to, transcriptCopied, ownerRestarted };
+}
+
+// Move a session to a different credential PROFILE in place — the unified
+// primitive behind both SDK subscription moves (sub1↔sub2) and claude-pty bridge
+// moves (bridge1↔bridge2). Like setSessionSubscription, a profile is resolved
+// from the record on every spawn (CLAUDE_CONFIG_DIR for subscriptions, the
+// bridge's HOME for claude-home), so the durable move is the record edit +
+// transcript port (switchSessionAccount); binding it requires a respawn:
+//   COLD (no live owner) → record edit only; the next spawn resolves the new dir.
+//   LIVE (queue owner holds a client on the old credential) → after the record
+//     edit, terminate the owner so the next prompt cold-spawns on the new
+//     credential (resuming the ported transcript). Refuse if a turn is in flight.
+// The caller (handleSetProfile) guards the credential-class constraint before
+// invoking this; switchSessionAccount with reason "manual" does not assert it.
+export async function setSessionProfile(
+  options: SessionSetProfileOptions,
+): Promise<SessionSetProfileResult> {
+  const liveness = await readQueueOwnerLiveness(options.sessionId);
+  const ownerAlive = liveness.alive;
+
+  if (ownerAlive) {
+    const active = await tryQueryActiveTurnOnRunningOwner(options.sessionId);
+    if (active === true) {
+      throw new ProfileTurnInFlightError(options.sessionName);
+    }
+  }
+
+  const record = await resolveSessionRecord(options.sessionId);
+  const { fromProfile, toProfile, transcriptCopied } = await switchSessionAccount(
+    record,
+    options.profileId,
+    "manual",
+    options.loadOpts,
+  );
+  await writeSessionRecord(record);
+
+  let ownerRestarted = false;
+  if (ownerAlive) {
+    await terminateQueueOwnerForSession(options.sessionId);
+    ownerRestarted = true;
+    if (options.verbose) {
+      process.stderr.write(
+        `[acpx] restarted queue owner for session ${options.sessionId} to bind profile "${toProfile}"\n`,
+      );
+    }
+  }
+
+  return { record, from: fromProfile, to: toProfile, transcriptCopied, ownerRestarted };
 }
 
 function firstAgentCommandToken(command: string): string | undefined {

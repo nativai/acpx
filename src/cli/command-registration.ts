@@ -527,7 +527,7 @@ export function registerAgentCommand(
     cancel: "Cooperatively cancel current in-flight prompt",
     setMode: "Set session mode",
     setConfig:
-      "Set session config option (special keys: `model`, `subscription` <id> — switch the Claude subscription in place)",
+      "Set session config option (special keys: `model`, `subscription` <id> — switch the Claude subscription in place; `profile` <id> — move the session to a different credential profile, SDK sub1↔sub2 or bridge1↔bridge2)",
     status: "Show local status of current session agent process",
   });
 
@@ -564,7 +564,7 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
     exec: `One-shot prompt using ${config.defaultAgent} by default`,
     cancel: `Cancel active prompt for ${config.defaultAgent} by default`,
     setMode: `Set session mode for ${config.defaultAgent} by default`,
-    setConfig: `Set session config option for ${config.defaultAgent} by default (special keys: \`model\`, \`subscription\` <id>)`,
+    setConfig: `Set session config option for ${config.defaultAgent} by default (special keys: \`model\`, \`subscription\` <id>, \`profile\` <id> — move the session's credential, SDK sub1↔sub2 or bridge1↔bridge2)`,
     status: `Show local status for ${config.defaultAgent} by default`,
   });
 

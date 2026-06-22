@@ -7,9 +7,17 @@ import {
   resolveAgentCommand,
   resolveAgentNameFromCommand,
 } from "../agent-registry.js";
+import {
+  findProfile,
+  loadProfileRegistry,
+  type ProfileEntry,
+  type ProfileRegistry,
+} from "../config/profiles.js";
 import { findSubscription, loadSubscriptionRegistry } from "../config/subscriptions.js";
 import {
   AgentSpawnError,
+  ProfileClassMismatchError,
+  ProfileUnknownError,
   SessionNotFoundError,
   SubscriptionChangeRequiresSwitchError,
   SubscriptionUnknownError,
@@ -1300,6 +1308,13 @@ export async function handleSetConfigOption(
     await handleSetSubscription(explicitAgentName, value, flags, command, config);
     return;
   }
+  // `set profile <id>` is the unified credential-move verb (SDK sub1↔sub2 AND
+  // claude-pty bridge1↔bridge2) — a record edit + transcript port, not an ACP
+  // config option. acpx-ui shells exactly this for the bridge case.
+  if (configId === "profile") {
+    await handleSetProfile(explicitAgentName, value, flags, command, config);
+    return;
+  }
   const resolvedConfigId = resolveCompatibleConfigId(agent, configId);
   const { setSessionConfigOption } = await loadSessionModule();
   const selector = resolveSessionTargetSelector({ flags, command });
@@ -1388,6 +1403,112 @@ function printSetSubscriptionResultByFormat(
   }
   const fromLabel = result.from ? `${result.from} → ` : "";
   process.stdout.write(`subscription set: ${fromLabel}${result.to}\n`);
+}
+
+// Credential-CLASS guard for a manual profile move. The move must stay within
+// the session's adapter/authMode class; its current credential is the same value
+// switchSessionAccount resolves as its `from` (pinned profile/subscription, else
+// the registry default). If that resolves and crosses adapter/authMode, refuse —
+// switchSessionAccount does not assert this for manual moves and a cross-class
+// move would wedge auth at the next turn.
+// The session's current credential id — the same value switchSessionAccount
+// resolves as its `from`: the pinned profile/subscription, else the registry
+// default.
+function currentCredentialId(record: SessionRecord, registry: ProfileRegistry): string | undefined {
+  const options = record.acpx?.session_options;
+  const pinned = (options?.profile ?? options?.subscription)?.trim();
+  return pinned ? pinned : registry.default;
+}
+
+function assertSameCredentialClass(
+  record: SessionRecord,
+  target: ProfileEntry,
+  registry: ProfileRegistry,
+): void {
+  const currentId = currentCredentialId(record, registry);
+  const current = currentId ? findProfile(currentId, registry) : undefined;
+  if (!current) {
+    return;
+  }
+  if (current.adapter === target.adapter && current.authMode === target.authMode) {
+    return;
+  }
+  throw new ProfileClassMismatchError({
+    targetId: target.id,
+    targetAuthMode: target.authMode,
+    currentId: current.id,
+    currentAuthMode: current.authMode,
+  });
+}
+
+// `acpx <agent> set profile <id>` — move the session to a different credential
+// PROFILE in place (the unified SDK-subscription + claude-pty-bridge move). Like
+// `set subscription`, the move is a record edit + transcript port; a respawn
+// binds it. Refuses with turn-in-flight if a turn is active on the live owner
+// (surfaced to acpx-ui as 409). The credential-CLASS guard below rejects a move
+// that would cross adapter/authMode classes (which would otherwise wedge auth at
+// the next turn — switchSessionAccount does not assert this for manual moves).
+export async function handleSetProfile(
+  explicitAgentName: string | undefined,
+  profileId: string,
+  flags: StatusFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const trimmedId = profileId.trim();
+  const registry = loadProfileRegistry();
+  const target = findProfile(trimmedId, registry);
+  if (!target) {
+    throw new ProfileUnknownError(
+      trimmedId,
+      registry.profiles.map((entry) => entry.id),
+    );
+  }
+  const selector = resolveSessionTargetSelector({ flags, command });
+  const record = await findRoutedTargetSessionOrThrow(agent, selector);
+  assertSameCredentialClass(record, target, registry);
+
+  const { setSessionProfile } = await loadSessionModule();
+  const result = await setSessionProfile({
+    sessionId: record.acpxRecordId,
+    profileId: trimmedId,
+    sessionName: selector.name ?? record.name,
+    verbose: globalFlags.verbose,
+  });
+  printSetProfileResultByFormat(result, globalFlags.format);
+}
+
+function printSetProfileResultByFormat(
+  result: {
+    record: SessionRecord;
+    from?: string;
+    to: string;
+    transcriptCopied: boolean;
+    ownerRestarted: boolean;
+  },
+  format: OutputFormat,
+): void {
+  if (
+    emitJsonResult(format, {
+      action: "profile_set",
+      profile: result.to,
+      from: result.from,
+      transcriptCopied: result.transcriptCopied,
+      ownerRestarted: result.ownerRestarted,
+      acpxRecordId: result.record.acpxRecordId,
+      acpxSessionId: result.record.acpSessionId,
+    })
+  ) {
+    return;
+  }
+  if (format === "quiet") {
+    process.stdout.write(`${result.to}\n`);
+    return;
+  }
+  const fromLabel = result.from ? `${result.from} → ` : "";
+  process.stdout.write(`profile set: ${fromLabel}${result.to}\n`);
 }
 
 function printSetMetadataResultByFormat(

@@ -223,4 +223,23 @@ export type SessionSetSubscriptionResult = {
   ownerRestarted: boolean;
 };
 
+export type SessionSetProfileOptions = {
+  sessionId: string;
+  profileId: string;
+  /** Used only for the turn-in-flight error message. */
+  sessionName?: string;
+  verbose?: boolean;
+  /** Test override for the registry/home lookup. */
+  loadOpts?: SubscriptionLookupOptions;
+};
+
+export type SessionSetProfileResult = {
+  record: SessionRecord;
+  from?: string;
+  to: string;
+  transcriptCopied: boolean;
+  /** True when a live queue owner existed and was restarted to bind the move. */
+  ownerRestarted: boolean;
+};
+
 export type { SessionAgentOptions };

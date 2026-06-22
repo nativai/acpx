@@ -260,6 +260,65 @@ export class SubscriptionTurnInFlightError extends AcpxOperationalError {
   }
 }
 
+// `set profile <id>` names a profile not in the registry. Sibling of
+// SubscriptionUnknownError for the unified credential-move path.
+export class ProfileUnknownError extends AcpxOperationalError {
+  constructor(id: string, knownIds?: readonly string[]) {
+    const known =
+      knownIds && knownIds.length > 0
+        ? ` Known profile ids: ${knownIds.join(", ")}.`
+        : " Known profile ids: none.";
+    super(`profile "${id}" not found in registry (~/.acpx/subscriptions/registry.json).${known}`, {
+      outputCode: "USAGE",
+      detailCode: "PROFILE_UNKNOWN",
+      origin: "cli",
+    });
+  }
+}
+
+// A `set profile` move was requested across credential classes (e.g. an SDK
+// subscription session → a claude-pty bridge profile, or → an openrouter API-key
+// profile). The auth layer requires a move to stay within the session's
+// adapter/authMode class (claude-home⟺claude-pty vs subscription⟺SDK), so the
+// move is refused before it can wedge the next turn's auth.
+export class ProfileClassMismatchError extends AcpxOperationalError {
+  constructor(params: {
+    targetId: string;
+    targetAuthMode: string;
+    currentId: string;
+    currentAuthMode: string;
+  }) {
+    super(
+      `Cannot move session to profile "${params.targetId}" (authMode "${params.targetAuthMode}"): ` +
+        `the session's current credential "${params.currentId}" is authMode "${params.currentAuthMode}". ` +
+        `A move must stay within the same credential class (subscription↔subscription or claude-home↔claude-home).`,
+      {
+        outputCode: "USAGE",
+        detailCode: "PROFILE_CLASS_MISMATCH",
+        origin: "cli",
+      },
+    );
+  }
+}
+
+// A manual profile move was requested while a turn is in flight on the live
+// queue owner. Refused (not queued) — moving mid-stream would tear the client
+// down. Shares the "TURN_IN_FLIGHT" detailCode with the subscription path so
+// acpx-ui maps it to the same 409.
+export class ProfileTurnInFlightError extends AcpxOperationalError {
+  constructor(sessionName?: string) {
+    const label = sessionName ? ` '${sessionName}'` : "";
+    super(
+      `Cannot move the session to a different credential while a turn is in flight on session${label}; wait for the current turn to finish (turn-in-flight).`,
+      {
+        outputCode: "USAGE",
+        detailCode: "TURN_IN_FLIGHT",
+        origin: "queue",
+      },
+    );
+  }
+}
+
 export class SessionModeReplayError extends AcpxOperationalError {
   constructor(message: string, options?: AcpxErrorOptions) {
     super(message, {
