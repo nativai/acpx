@@ -1,0 +1,13 @@
+# pnpm settings for the acpx repo.
+#
+# onlyBuiltDependencies — the explicit allowlist of dependencies permitted to run
+# install/build scripts. pnpm 11.8+ blocks unapproved build scripts by default and
+# a `pnpm install --frozen-lockfile` (the CI / bootstrap.sh / refresh.sh path)
+# HARD-FAILS on them rather than warning. Without this allowlist every acpx build
+# on the box breaks. List the deps acpx genuinely needs to build.
+onlyBuiltDependencies:
+  - agent-browser
+  - esbuild
+
+# Auto-confirm node_modules purge instead of prompting (no TTY in CI / agents).
+confirmModulesPurge: false
