@@ -2105,6 +2105,21 @@ export class AcpClient {
     signal: NodeJS.Signals | null,
   ): void {
     if (this.lastAgentExit) {
+      // First-write-wins for the disconnect REASON, but enrich a missing
+      // code/signal once. The first observer is usually `connection_close` /
+      // `pipe_close` (fired on stdout EOF, before Node delivers the child `exit`),
+      // which captures null/null — so the persisted record was the non-diagnostic
+      // connection_close/null/null. A later `process_exit`/`process_close` carries
+      // the REAL OS exit code/signal; fold it in so the record can tell e.g. a
+      // SIGKILL (signal) from a clean exit. The (transport) reason is preserved.
+      const prev = this.lastAgentExit;
+      if (
+        prev.exitCode === null &&
+        prev.signal === null &&
+        (exitCode !== null || signal !== null)
+      ) {
+        this.lastAgentExit = { ...prev, exitCode, signal };
+      }
       return;
     }
 

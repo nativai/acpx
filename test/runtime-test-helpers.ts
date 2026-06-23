@@ -55,6 +55,7 @@ export function makeSessionRecord(
     lastAgentExitSignal: overrides.lastAgentExitSignal,
     lastAgentExitAt: overrides.lastAgentExitAt,
     lastAgentDisconnectReason: overrides.lastAgentDisconnectReason,
+    lastAgentUnexpectedDuringPrompt: overrides.lastAgentUnexpectedDuringPrompt,
     protocolVersion: overrides.protocolVersion,
     agentCapabilities: overrides.agentCapabilities,
     title: overrides.title ?? null,

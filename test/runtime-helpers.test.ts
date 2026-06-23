@@ -108,7 +108,7 @@ test("runtime lifecycle helpers update records from runtime snapshots and conver
       signal: "SIGKILL",
       exitedAt: "2026-01-01T00:10:00.000Z",
       reason: "process_exit",
-      unexpectedDuringPrompt: false,
+      unexpectedDuringPrompt: true,
     },
   });
   assert.equal(record.pid, undefined);
@@ -117,6 +117,9 @@ test("runtime lifecycle helpers update records from runtime snapshots and conver
   assert.equal(record.lastAgentExitSignal, "SIGKILL");
   assert.equal(record.lastAgentExitAt, "2026-01-01T00:10:00.000Z");
   assert.equal(record.lastAgentDisconnectReason, "process_exit");
+  // The mid-turn-vs-reap signal is carried onto the record (and cleared on a fresh
+  // running snapshot below).
+  assert.equal(record.lastAgentUnexpectedDuringPrompt, true);
 
   applyLifecycleSnapshotToRecord(record, {
     pid: 654,
@@ -128,6 +131,7 @@ test("runtime lifecycle helpers update records from runtime snapshots and conver
   assert.equal(record.lastAgentExitSignal, undefined);
   assert.equal(record.lastAgentExitAt, undefined);
   assert.equal(record.lastAgentDisconnectReason, undefined);
+  assert.equal(record.lastAgentUnexpectedDuringPrompt, undefined);
 
   reconcileAgentSessionId(record, "  runtime-123  ");
   assert.equal(record.agentSessionId, "runtime-123");

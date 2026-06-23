@@ -297,6 +297,7 @@ function buildImportedRecord(
     lastAgentExitSignal: undefined,
     lastAgentExitAt: undefined,
     lastAgentDisconnectReason: undefined,
+    lastAgentUnexpectedDuringPrompt: undefined,
     eventLog,
     importedFrom: {
       recordId: parsed.session.record_id,

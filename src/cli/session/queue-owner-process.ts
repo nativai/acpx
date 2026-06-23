@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { SessionAgentOptions } from "../../runtime/engine/session-options.js";
 import type {
   AuthPolicy,
@@ -166,15 +168,49 @@ export function queueOwnerRuntimeOptionsFromSend(
   };
 }
 
-export function buildQueueOwnerSpawnOptions(payload: string): {
+// Cap the per-session owner log so it can't grow unbounded across respawns.
+const OWNER_LOG_MAX_BYTES = 1024 * 1024;
+
+// Open the per-session queue-owner log (`~/.acpx/sessions/<id>.owner.log`) to
+// capture the detached owner's stdout+stderr — which includes the ACP adapter's
+// forwarded stderr (AcpClient writes the adapter's stderr to this process's
+// stderr). Previously the owner spawned with stdio:"ignore" → /dev/null, so a
+// mid-turn owner/adapter death left connection_close/null/null with NO crash
+// output (the records-non-diagnostic weakness). Returns an fd, or null if logging
+// can't be set up (never block the spawn on it).
+function openQueueOwnerLogFd(sessionId: string): number | null {
+  try {
+    const dir = join(homedir(), ".acpx", "sessions");
+    mkdirSync(dir, { recursive: true });
+    const logPath = join(dir, `${sessionId}.owner.log`);
+    let size = 0;
+    try {
+      size = statSync(logPath).size;
+    } catch {
+      // absent → size 0
+    }
+    // Truncate a bloated log ("w"), otherwise append ("a") to preserve recent
+    // crash output across respawns.
+    return openSync(logPath, size > OWNER_LOG_MAX_BYTES ? "w" : "a");
+  } catch {
+    return null;
+  }
+}
+
+export function buildQueueOwnerSpawnOptions(
+  payload: string,
+  logFd: number | null = null,
+): {
   detached: true;
-  stdio: "ignore";
+  stdio: "ignore" | ["ignore", number, number];
   env: NodeJS.ProcessEnv;
   windowsHide: true;
 } {
   return {
     detached: true,
-    stdio: "ignore",
+    // stdin ignored; stdout+stderr → the per-session owner log when available
+    // (so an owner/adapter crash is diagnosable), else the prior "ignore".
+    stdio: logFd !== null ? ["ignore", logFd, logFd] : "ignore",
     env: {
       ...process.env,
       ACPX_QUEUE_OWNER_PAYLOAD: payload,
@@ -185,10 +221,19 @@ export function buildQueueOwnerSpawnOptions(payload: string): {
 
 export function spawnQueueOwnerProcess(options: QueueOwnerRuntimeOptions): void {
   const payload = JSON.stringify(options);
+  const logFd = openQueueOwnerLogFd(options.sessionId);
   const child = spawn(
     process.execPath,
     resolveQueueOwnerSpawnArgs(),
-    buildQueueOwnerSpawnOptions(payload),
+    buildQueueOwnerSpawnOptions(payload, logFd),
   );
+  if (logFd !== null) {
+    // The detached child inherited its own copy of the fd; release the parent's.
+    try {
+      closeSync(logFd);
+    } catch {
+      // already closed
+    }
+  }
   child.unref();
 }

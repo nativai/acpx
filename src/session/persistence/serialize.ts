@@ -55,6 +55,7 @@ export function serializeSessionRecordForDisk(
     last_agent_exit_signal: canonical.lastAgentExitSignal,
     last_agent_exit_at: canonical.lastAgentExitAt,
     last_agent_disconnect_reason: canonical.lastAgentDisconnectReason,
+    last_agent_unexpected_during_prompt: canonical.lastAgentUnexpectedDuringPrompt,
     protocol_version: canonical.protocolVersion,
     agent_capabilities: canonical.agentCapabilities,
     title: canonical.title,
