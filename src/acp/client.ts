@@ -579,16 +579,19 @@ export class AcpClient {
   }
 
   /**
-   * (b) Wait (bounded) for the agent child's `exit` so a mid-turn disconnect's REAL
-   * OS exit code/signal can enrich the latched null/null BEFORE the caller reads the
-   * lifecycle snapshot to persist it. `connection_close` fires on stdout EOF, which
-   * Node delivers BEFORE the child `exit` event carrying the signal — so a persist
-   * taken on the close microtask records null/null, and in the queue-owner flow the
-   * client is POOLED (not closed) after the turn, so the exit is otherwise never
-   * awaited. Resolves immediately when there is nothing to wait for (no disconnect
-   * recorded, the code/signal already landed, or the child is already reaped).
-   * Safe-degrade: returns after `boundMs` even if `exit` never arrives, so the
-   * persist proceeds (with null/null, as before) — the path NEVER hangs.
+   * (b) Make a mid-turn disconnect's REAL OS exit code/signal land on the latched
+   * null/null BEFORE the caller reads the lifecycle snapshot to persist it.
+   * `connection_close` fires on stdout EOF, which Node delivers BEFORE the child
+   * `exit` event carrying the signal — and in the queue-owner flow the client is
+   * POOLED (not closed) after the turn, so the exit is otherwise never awaited.
+   * Waits (bounded) for the child to be reaped if it is still running, then folds
+   * its real exit code/signal in DIRECTLY — NOT via the `exit`/`close` event handler,
+   * which may already be queued behind us: the child can be reaped (exitCode/
+   * signalCode set) while its handler has not run yet, so relying on the handler
+   * would let the enrich land AFTER this persist and leave the record null/null.
+   * No-op when there is nothing to settle (no disconnect, or already enriched).
+   * Safe-degrade: if the child never exits within `boundMs`, both stay null and we
+   * persist null/null as before — the path NEVER hangs.
    */
   async settleAgentExit(boundMs: number): Promise<void> {
     const pending = this.lastAgentExit;
@@ -596,10 +599,15 @@ export class AcpClient {
       return;
     }
     const child = this.agent;
-    if (!child || !isChildProcessRunning(child)) {
+    if (!child) {
       return;
     }
-    await waitForChildExit(child, boundMs);
+    if (isChildProcessRunning(child)) {
+      await waitForChildExit(child, boundMs);
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      this.enrichLastAgentExit(child.exitCode, child.signalCode);
+    }
   }
 
   supportsLoadSession(): boolean {
