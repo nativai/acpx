@@ -477,6 +477,12 @@ export class AcpClient {
   private options: AcpClientOptions;
   private connection?: ClientSideConnection;
   private agent?: ChildProcessByStdio<Writable, Readable, Readable>;
+  // The most recently spawned agent child, retained for exit-settling. Unlike
+  // `agent` (nulled by close()/reset on disconnect), this survives so a post-turn
+  // settleAgentExit can still read the dead child's real exitCode/signalCode after a
+  // mid-turn death. Replaced on the next spawn; only read when a disconnect is
+  // pending an enrich.
+  private lastSpawnedChild?: ChildProcessByStdio<Writable, Readable, Readable>;
   private initResult?: InitializeResponse;
   private loadedSessionId?: string;
   private eventHandlers: Pick<
@@ -598,7 +604,10 @@ export class AcpClient {
     if (!pending || pending.exitCode !== null || pending.signal !== null) {
       return;
     }
-    const child = this.agent;
+    // Use lastSpawnedChild, NOT `agent`: by the time the turn finalizes after a
+    // mid-turn death, `agent` may already be nulled (close()/reset), whereas the
+    // dead child object still carries its real exitCode/signalCode.
+    const child = this.lastSpawnedChild;
     if (!child) {
       return;
     }
@@ -944,6 +953,7 @@ export class AcpClient {
       params.startupFailure.dispose();
       this.connection = params.connection;
       this.agent = params.child;
+      this.lastSpawnedChild = params.child;
       this.initResult = initResult;
       this.log(`initialized protocol version ${initResult.protocolVersion}`);
     } catch (error) {
