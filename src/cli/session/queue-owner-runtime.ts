@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
-import { AcpClient } from "../../acp/client.js";
+import { AcpClient, AGENT_EXIT_SETTLE_MS } from "../../acp/client.js";
 import { formatErrorMessage } from "../../acp/error-normalization.js";
 import { supportsMidTurnPromptInjection } from "../../acp/mid-turn-injection-support.js";
 import { withTimeout } from "../../async-control.js";
@@ -265,6 +265,13 @@ async function writeQueueOwnerLifecycleSnapshot(
 ): Promise<void> {
   try {
     const record = await resolveSessionRecord(sessionId);
+    // (b) THE queue-owner persist path (acpx __queue-owner) — what actually runs on a
+    // real owner/adapter death. Settle the agent exit FIRST (bounded, safe-degrade)
+    // so a mid-turn death's REAL exit code/signal has enriched the latched null/null
+    // before we snapshot it; otherwise this records connection_close/null/null and the
+    // signal only ever reaches owner.log via the later child `exit` observer. Mirrors
+    // the manager's finalizeRuntimeTurnRecord.
+    await sharedClient.settleAgentExit(AGENT_EXIT_SETTLE_MS);
     applyLifecycleSnapshotToRecord(record, sharedClient.getAgentLifecycleSnapshot());
     await writeSessionRecordAtBoundary(record);
   } catch {

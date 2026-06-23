@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { AcpClient } from "../../acp/client.js";
+import { AcpClient, AGENT_EXIT_SETTLE_MS } from "../../acp/client.js";
 import { normalizeOutputError } from "../../acp/error-normalization.js";
 import { extractAcpError, isAcpResourceNotFoundError } from "../../acp/error-shapes.js";
 import { withTimeout } from "../../async-control.js";
@@ -89,12 +89,6 @@ function createDeferred<T>(): Deferred<T> {
   });
   return { promise, resolve, reject };
 }
-
-// (b) Upper bound for awaiting the child `exit` after a mid-turn disconnect so the
-// REAL OS exit code/signal can enrich the latched null/null before we persist the
-// turn record. The exit normally lands within milliseconds of the connection_close;
-// this is only the safety cap (on timeout we persist as before — never hang).
-const AGENT_EXIT_SETTLE_MS = 2_000;
 
 class AsyncEventQueue {
   private readonly items: AcpRuntimeEvent[] = [];

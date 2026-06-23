@@ -134,6 +134,13 @@ const REPLAY_DRAIN_TIMEOUT_MS = 5_000;
 const DRAIN_POLL_INTERVAL_MS = 20;
 const AGENT_CLOSE_TERM_GRACE_MS = 1_500;
 const AGENT_CLOSE_KILL_GRACE_MS = 1_000;
+// (b) Upper bound for awaiting the child `exit` after a mid-turn disconnect so the
+// REAL OS exit code/signal can enrich the latched null/null before the lifecycle
+// snapshot is persisted (see AcpClient.settleAgentExit + its callers on BOTH persist
+// paths — the manager turn-finalize and the queue-owner lifecycle snapshot). The
+// exit normally lands within ms of the connection_close; this is only the safety cap
+// (on timeout we persist as before — never hang).
+export const AGENT_EXIT_SETTLE_MS = 2_000;
 const STARTUP_STDERR_MAX_CHARS = 8_192;
 
 type LoadSessionOptions = {
