@@ -1120,7 +1120,7 @@ export class AcpRuntimeManager {
     // record below would persist the latched connection_close/null/null. Settle the
     // exit first (bounded, safe-degrade — never hangs) so the snapshot carries the
     // real signal (e.g. SIGKILL). A no-op for normal turns / already-settled exits.
-    await turn.client.settleAgentExit(AGENT_EXIT_SETTLE_MS);
+    await this.settleAgentExitBeforePersist(turn.client);
     applyLifecycleSnapshotToRecord(turn.record, turn.client.getAgentLifecycleSnapshot());
     turn.acpxState = await this.acpxStateForRuntimeSave(turn);
     turn.record.acpx = turn.acpxState;
@@ -1138,6 +1138,17 @@ export class AcpRuntimeManager {
       record: turn.record,
       client: turn.client,
     });
+  }
+
+  // (b) Bounded settle of the agent child exit before the death-persist (see
+  // AcpClient.settleAgentExit). Tolerant of a test double that does not implement
+  // the method — the real client always does, and the real-env proof validates the
+  // end-to-end behavior.
+  private async settleAgentExitBeforePersist(client: AcpClient): Promise<void> {
+    const settle = (client as Partial<Pick<AcpClient, "settleAgentExit">>).settleAgentExit;
+    if (typeof settle === "function") {
+      await settle.call(client, AGENT_EXIT_SETTLE_MS);
+    }
   }
 
   private async acpxStateForRuntimeSave(

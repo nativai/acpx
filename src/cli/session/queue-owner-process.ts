@@ -214,6 +214,11 @@ export function buildQueueOwnerSpawnOptions(
     env: {
       ...process.env,
       ACPX_QUEUE_OWNER_PAYLOAD: payload,
+      // Signal to the in-owner client that its stderr is the per-session owner log,
+      // so it may emit diagnostic disconnect/exit lines there. Set ONLY when the log
+      // fd actually opened — elsewhere (e.g. a --json-strict CLI, which must keep
+      // stderr to JSON-RPC only) it is absent and those lines stay suppressed.
+      ...(logFd !== null ? { ACPX_OWNER_LOG: "1" } : {}),
     },
     windowsHide: true,
   };

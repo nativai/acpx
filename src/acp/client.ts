@@ -1830,6 +1830,13 @@ export class AcpClient {
   // death is a signal (e.g. SIGKILL) that writes nothing. Best-effort: never let
   // logging break exit handling.
   private logOwnerEvent(message: string): void {
+    // Only when this process is a queue-owner whose stderr is redirected to the
+    // per-session owner log (ACPX_OWNER_LOG=1, set at spawn iff the log fd opened).
+    // Elsewhere — notably a --json-strict CLI that must emit JSON-RPC on stderr only
+    // — stay silent so we never pollute the stream.
+    if (process.env.ACPX_OWNER_LOG !== "1") {
+      return;
+    }
     try {
       process.stderr.write(`[acpx] ${message}\n`);
     } catch {
