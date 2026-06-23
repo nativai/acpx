@@ -90,6 +90,12 @@ function createDeferred<T>(): Deferred<T> {
   return { promise, resolve, reject };
 }
 
+// (b) Upper bound for awaiting the child `exit` after a mid-turn disconnect so the
+// REAL OS exit code/signal can enrich the latched null/null before we persist the
+// turn record. The exit normally lands within milliseconds of the connection_close;
+// this is only the safety cap (on timeout we persist as before — never hang).
+const AGENT_EXIT_SETTLE_MS = 2_000;
+
 class AsyncEventQueue {
   private readonly items: AcpRuntimeEvent[] = [];
   private readonly waits: Deferred<AcpRuntimeEvent | null>[] = [];
@@ -1108,6 +1114,13 @@ export class AcpRuntimeManager {
   }
 
   private async finalizeRuntimeTurnRecord(turn: RunningRuntimeTurn): Promise<boolean> {
+    // (b) On a mid-turn agent death the real OS exit code/signal arrive on the child
+    // `exit` event AFTER the connection_close that ended this turn, and the client is
+    // POOLED (not closed) here — so the exit is otherwise never awaited and the
+    // record below would persist the latched connection_close/null/null. Settle the
+    // exit first (bounded, safe-degrade — never hangs) so the snapshot carries the
+    // real signal (e.g. SIGKILL). A no-op for normal turns / already-settled exits.
+    await turn.client.settleAgentExit(AGENT_EXIT_SETTLE_MS);
     applyLifecycleSnapshotToRecord(turn.record, turn.client.getAgentLifecycleSnapshot());
     turn.acpxState = await this.acpxStateForRuntimeSave(turn);
     turn.record.acpx = turn.acpxState;

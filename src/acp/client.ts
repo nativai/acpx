@@ -578,6 +578,30 @@ export class AcpClient {
     };
   }
 
+  /**
+   * (b) Wait (bounded) for the agent child's `exit` so a mid-turn disconnect's REAL
+   * OS exit code/signal can enrich the latched null/null BEFORE the caller reads the
+   * lifecycle snapshot to persist it. `connection_close` fires on stdout EOF, which
+   * Node delivers BEFORE the child `exit` event carrying the signal — so a persist
+   * taken on the close microtask records null/null, and in the queue-owner flow the
+   * client is POOLED (not closed) after the turn, so the exit is otherwise never
+   * awaited. Resolves immediately when there is nothing to wait for (no disconnect
+   * recorded, the code/signal already landed, or the child is already reaped).
+   * Safe-degrade: returns after `boundMs` even if `exit` never arrives, so the
+   * persist proceeds (with null/null, as before) — the path NEVER hangs.
+   */
+  async settleAgentExit(boundMs: number): Promise<void> {
+    const pending = this.lastAgentExit;
+    if (!pending || pending.exitCode !== null || pending.signal !== null) {
+      return;
+    }
+    const child = this.agent;
+    if (!child || !isChildProcessRunning(child)) {
+      return;
+    }
+    await waitForChildExit(child, boundMs);
+  }
+
   supportsLoadSession(): boolean {
     return Boolean(this.initResult?.agentCapabilities?.loadSession);
   }
@@ -1800,6 +1824,19 @@ export class AcpClient {
     process.stderr.write(`[acpx] ${message}\n`);
   }
 
+  // Unconditional (NOT verbose-gated) owner-log line. The queue-owner now routes
+  // its stdout+stderr to `<id>.owner.log`, so an agent disconnect/exit leaves a
+  // diagnostic trail even when the adapter itself is SILENT on stderr and the
+  // death is a signal (e.g. SIGKILL) that writes nothing. Best-effort: never let
+  // logging break exit handling.
+  private logOwnerEvent(message: string): void {
+    try {
+      process.stderr.write(`[acpx] ${message}\n`);
+    } catch {
+      // best effort
+    }
+  }
+
   private captureStartupStderr(target: string[], chunk: Buffer | string): void {
     const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
     if (text.length === 0) {
@@ -2105,35 +2142,49 @@ export class AcpClient {
     signal: NodeJS.Signals | null,
   ): void {
     if (this.lastAgentExit) {
-      // First-write-wins for the disconnect REASON, but enrich a missing
-      // code/signal once. The first observer is usually `connection_close` /
-      // `pipe_close` (fired on stdout EOF, before Node delivers the child `exit`),
-      // which captures null/null — so the persisted record was the non-diagnostic
-      // connection_close/null/null. A later `process_exit`/`process_close` carries
-      // the REAL OS exit code/signal; fold it in so the record can tell e.g. a
-      // SIGKILL (signal) from a clean exit. The (transport) reason is preserved.
-      const prev = this.lastAgentExit;
-      if (
-        prev.exitCode === null &&
-        prev.signal === null &&
-        (exitCode !== null || signal !== null)
-      ) {
-        this.lastAgentExit = { ...prev, exitCode, signal };
-      }
+      this.enrichLastAgentExit(exitCode, signal);
       return;
     }
 
+    const unexpectedDuringPrompt = !this.closing && Boolean(this.activePrompt);
     this.lastAgentExit = {
       exitCode,
       signal,
       exitedAt: isoNow(),
       reason,
-      unexpectedDuringPrompt: !this.closing && Boolean(this.activePrompt),
+      unexpectedDuringPrompt,
     };
+    // (a) Always leave a disconnect line in the owner log (was /dev/null before) —
+    // diagnostic even for a SILENT SIGKILL (a null code/signal renders as "null").
+    this.logOwnerEvent(
+      `agent disconnect: reason=${reason} code=${exitCode} signal=${signal} unexpectedDuringPrompt=${unexpectedDuringPrompt} pid=${this.lastKnownPid ?? "?"}`,
+    );
     this.rejectPendingConnectionRequests(
       new AgentDisconnectedError(reason, exitCode, signal, {
         outputAlreadyEmitted: Boolean(this.activePrompt),
       }),
+    );
+  }
+
+  // First-write-wins for the disconnect REASON, but enrich a missing code/signal
+  // ONCE. The first observer is usually `connection_close`/`pipe_close` (stdout
+  // EOF, before Node delivers the child `exit`) → null/null, so the record was the
+  // non-diagnostic connection_close/null/null. A later `process_exit`/
+  // `process_close` carries the REAL OS code/signal; fold it in (reason preserved)
+  // so the record can tell e.g. a SIGKILL from a clean exit, and leave it in the
+  // owner log. NOTE: in the queue-owner flow the death is often PERSISTED before
+  // this enrich lands (see the awaited-exit settle on the persist path).
+  private enrichLastAgentExit(exitCode: number | null, signal: NodeJS.Signals | null): void {
+    const prev = this.lastAgentExit;
+    if (!prev || prev.exitCode !== null || prev.signal !== null) {
+      return;
+    }
+    if (exitCode === null && signal === null) {
+      return;
+    }
+    this.lastAgentExit = { ...prev, exitCode, signal };
+    this.logOwnerEvent(
+      `agent exit observed: reason=${prev.reason} code=${exitCode} signal=${signal} unexpectedDuringPrompt=${prev.unexpectedDuringPrompt}`,
     );
   }
 
