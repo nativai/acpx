@@ -785,6 +785,64 @@ test("FW-16: agent-exit checkpoint flush preserves an externally-marked template
   });
 });
 
+test("W13-01: template slug+version survive a plain (read-preserve) daemon write", async () => {
+  // The single most important "don't forget": the FW-16 read-preserve path
+  // re-parses the on-disk `template` block (via parseTemplateState) on EVERY
+  // plain daemon write and re-adopts it. If parseTemplateState did not parse the
+  // new slug/version fields, they would silently evaporate on the next
+  // checkpoint. This proves the parse round-trip preserves them.
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const id = "tmpl-slug-live";
+    const MARK_TS = "2026-06-23T12:00:00.000Z";
+
+    const marked = serializeSessionRecordForDisk(
+      makeSessionRecord({
+        acpxRecordId: id,
+        acpSessionId: id,
+        agentCommand: "agent-a",
+        cwd,
+        closed: true,
+        closedAt: MARK_TS,
+        updated_at: MARK_TS,
+      }),
+    );
+    marked["template"] = {
+      enabled: true,
+      created_at: MARK_TS,
+      slug: "context-engineer",
+      version: 3,
+    };
+    await fs.mkdir(path.dirname(sessionFilePath(homeDir, id)), { recursive: true });
+    await fs.writeFile(
+      sessionFilePath(homeDir, id),
+      `${JSON.stringify(marked, null, 2)}\n`,
+      "utf8",
+    );
+
+    // A stale in-memory record (no template) flushed through the real
+    // preserve-lifecycle write path — the agent-exit checkpoint case.
+    const stale = makeSessionRecord({
+      acpxRecordId: id,
+      acpSessionId: id,
+      agentCommand: "agent-a",
+      cwd,
+      updated_at: "2026-06-23T11:00:00.000Z",
+    });
+    await flushSessionRecord(stale);
+
+    const onDisk = JSON.parse(await fs.readFile(sessionFilePath(homeDir, id), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    assert.deepEqual(
+      onDisk["template"],
+      { enabled: true, created_at: MARK_TS, slug: "context-engineer", version: 3 },
+      "slug + version must survive the plain-write re-parse round-trip",
+    );
+  });
+});
+
 test("FW-16: a normal agent-exit flush still persists a non-template record (no regression)", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

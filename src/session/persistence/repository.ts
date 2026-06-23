@@ -19,6 +19,7 @@ import {
   prepareMessagesLogForBoundary,
   resolveMessagesLogCompactBytes,
 } from "../messages-log.js";
+import { withSessionIndexLock } from "./index-lock.js";
 import {
   flushPendingSessionIndexUpdates,
   updateSessionIndexForRecordWrite,
@@ -31,6 +32,12 @@ import {
 } from "./index.js";
 import { parseSessionRecord } from "./parse.js";
 import { serializeSessionRecordForDisk } from "./serialize.js";
+import {
+  effectiveTemplateSlug,
+  pickLatestTemplate,
+  slugify,
+  type TemplateOrderKey,
+} from "./template-slug.js";
 
 export const DEFAULT_HISTORY_LIMIT = 20;
 
@@ -472,6 +479,444 @@ export async function listSessionsForAgent(
  */
 export function isTemplateRecord(record: Pick<SessionRecord, "template">): boolean {
   return record.template?.enabled === true;
+}
+
+// ===========================================================================
+// Template slug + version primitive (W13-01). acpx is the SOLE author of
+// `template.slug` / `template.version`. The two algorithms it leans on
+// (slugify, the "latest" comparator) live in template-slug.ts and are a frozen
+// cross-repo contract mirrored byte-for-byte by acpx-ui.
+// ===========================================================================
+
+function indexEntryTemplateOrderKey(entry: SessionIndexEntry): TemplateOrderKey {
+  return {
+    version: entry.templateVersion,
+    created_at: entry.templateCreatedAt,
+    acpxRecordId: entry.acpxRecordId,
+  };
+}
+
+// Index entries for the ENABLED templates that resolve/group under `slug`
+// (effectiveSlug === slug). Subagents are never templates. Used by slug
+// resolution and rollback (both enabled-gated, so a soft-retract drops a
+// record from both at once).
+async function enabledTemplateEntriesForSlug(slug: string): Promise<SessionIndexEntry[]> {
+  const entries = await loadSessionIndexEntries();
+  return entries.filter(
+    (entry) =>
+      entry.templateEnabled === true &&
+      entry.kind !== "subagent" &&
+      effectiveTemplateSlug(entry.templateSlug, entry.name) === slug,
+  );
+}
+
+export type TemplateSelectorKind = "id" | "slug";
+export type TemplateSelectorResult = {
+  record: SessionRecord;
+  selectorKind: TemplateSelectorKind;
+};
+
+/**
+ * Resolve a `--from-template <arg>` selector: id-first, then slug. ONLY for the
+ * --from-template path — the global `resolveSessionRecord` (which backs many
+ * verbs) is deliberately NOT widened.
+ *
+ * 1. id semantics via `resolveSessionRecord` (direct file → exact id → unique
+ *    suffix). A known id / unique suffix is a SNAPSHOT and is NEVER silently
+ *    redirected to a slug. An AMBIGUOUS id is rethrown (surfaced), not fallen
+ *    through. Only a true miss continues to (2).
+ * 2. slug: among ENABLED templates whose effectiveSlug === arg, the Appendix-B
+ *    latest. Runs off the index, then loads the single winner.
+ * 3. miss: one clear error naming both attempts.
+ *
+ * Documented edge (E4): a slug made only of [0-9a-f] could in theory suffix-
+ * match a record's UUID. Because step 1 is id-first and we only reach step 2 on
+ * an id MISS, the id always wins when it exists — there is nothing to special-
+ * case. Real slugs come from display names (letters g/i/n/r/s/t/x…) that a
+ * hex+dash UUID suffix can't match, so the clash is theoretical.
+ */
+export async function resolveTemplateSelector(arg: string): Promise<TemplateSelectorResult> {
+  try {
+    const record = await resolveSessionRecord(arg);
+    return { record, selectorKind: "id" };
+  } catch (error) {
+    if (error instanceof SessionResolutionError) {
+      throw error; // ambiguous id — surface it, do NOT fall through to slug
+    }
+    if (!(error instanceof SessionNotFoundError)) {
+      throw error; // unexpected failure — propagate
+    }
+    // SessionNotFoundError ⇒ id miss, fall through to slug resolution
+  }
+
+  const winner = pickLatestTemplate(
+    await enabledTemplateEntriesForSlug(arg),
+    indexEntryTemplateOrderKey,
+  );
+  if (winner) {
+    const record = await loadRecordFromIndexEntry(winner);
+    if (record) {
+      return { record, selectorKind: "slug" };
+    }
+  }
+
+  throw new SessionNotFoundError(`no template matches '${arg}' (tried session id, then slug)`);
+}
+
+// Canonicalize the slug to store at mark-time: an explicit `--slug` is run
+// through slugify (idempotent on an already-canonical value) and must be
+// non-empty; otherwise default to slugify(name). A degenerate name (slugifies
+// to empty) ⇒ undefined: the mark leaves slug/version unset and the record
+// groups/resolves by id (graceful — same as a UI-created slug-less template).
+function resolveMarkSlug(
+  record: SessionRecord,
+  explicitSlug: string | undefined,
+): string | undefined {
+  if (explicitSlug !== undefined) {
+    const slug = slugify(explicitSlug);
+    if (slug === undefined) {
+      throw new SessionResolutionError(
+        `--slug '${explicitSlug}' has no [a-z0-9] characters; provide a non-empty slug`,
+      );
+    }
+    return slug;
+  }
+  return record.name !== undefined ? slugify(record.name) : undefined;
+}
+
+// An index entry counts toward a slug's version-max when it IS or WAS a template
+// (templateEnabled present: enabled OR soft-retracted — never a plain session or a
+// subagent), it is not the record being marked, and its effectiveSlug matches —
+// counting slug-less/version-less siblings via slugify(name).
+function entryIsVersionPeer(entry: SessionIndexEntry, slug: string, selfRecordId: string): boolean {
+  return (
+    entry.templateEnabled !== undefined &&
+    entry.kind !== "subagent" &&
+    entry.acpxRecordId !== selfRecordId &&
+    effectiveTemplateSlug(entry.templateSlug, entry.name) === slug
+  );
+}
+
+// version = max(version ?? 0) + 1 over the effectiveSlug group, read from the
+// INDEX (nuance #1). So a refresh always sorts latest even over prior versions
+// that predate this feature. An idempotent re-mark under the SAME slug preserves
+// the existing version (re-enabling an old version must not bump it to latest) —
+// mirroring the created_at/source_session_id preserve idiom.
+function markVersionForSlug(
+  record: SessionRecord,
+  slug: string,
+  entries: SessionIndexEntry[],
+): number {
+  if (record.template?.slug === slug && typeof record.template.version === "number") {
+    return record.template.version;
+  }
+  let max = 0;
+  for (const entry of entries) {
+    if (entryIsVersionPeer(entry, slug, record.acpxRecordId)) {
+      max = Math.max(max, entry.templateVersion ?? 0);
+    }
+  }
+  return max + 1;
+}
+
+/**
+ * Persist a template mark, assigning slug + version under a single hold of the
+ * index lock (E6): the max+1 read and the record write happen atomically, so two
+ * concurrent marks under the same slug can't both read the same max. The lock is
+ * re-entrant, so the privileged write's own immediate index update runs inline.
+ * `record.template` must already carry the enabled/created_at/source/auto_prompt
+ * block (built by the caller); this only adds slug/version then writes.
+ */
+export async function persistTemplateMark(
+  record: SessionRecord,
+  options: { slug?: string } = {},
+): Promise<void> {
+  await ensureSessionDir();
+  await withSessionIndexLock(sessionBaseDir(), async () => {
+    const slug = resolveMarkSlug(record, options.slug);
+    if (slug !== undefined && record.template) {
+      const version = markVersionForSlug(record, slug, await loadSessionIndexEntries());
+      record.template.slug = slug;
+      record.template.version = version;
+    }
+    await writeSessionRecordWithLifecycle(record);
+  });
+}
+
+export type TemplateRollbackOutcome = "soft-retract" | "delete" | "noop";
+export type TemplateRollbackTarget = {
+  acpxRecordId: string;
+  version: number | undefined;
+};
+export type TemplateRollbackResult = {
+  slug: string;
+  outcome: TemplateRollbackOutcome;
+  retracted?: TemplateRollbackTarget;
+  newLatest?: TemplateRollbackTarget;
+};
+
+/**
+ * Retract the current latest version of `slug`. Default is a SOFT retract (flip
+ * `template.enabled = false`, keeping slug/version/created_at/auto_prompt) so it
+ * drops from both slug resolution and ?view=templates (both enabled-gated) and
+ * re-enable restores it. `--delete` HARD-deletes the record + sidecars + index
+ * entry (loses the version). The whole find→retract→find-new-latest runs under
+ * one lock hold so it's atomic against a concurrent mark.
+ */
+export async function rollbackTemplateSlug(
+  slug: string,
+  options: { delete?: boolean } = {},
+): Promise<TemplateRollbackResult> {
+  await ensureSessionDir();
+  return await withSessionIndexLock(sessionBaseDir(), async () => {
+    const target = pickLatestTemplate(
+      await enabledTemplateEntriesForSlug(slug),
+      indexEntryTemplateOrderKey,
+    );
+    if (!target) {
+      return { slug, outcome: "noop" };
+    }
+    if (options.delete === true) {
+      await hardDeleteSessionRecord(target.acpxRecordId);
+    } else {
+      await softRetractTemplateRecord(target.acpxRecordId);
+    }
+    const newLatest = pickLatestTemplate(
+      await enabledTemplateEntriesForSlug(slug),
+      indexEntryTemplateOrderKey,
+    );
+    return {
+      slug,
+      outcome: options.delete === true ? "delete" : "soft-retract",
+      retracted: { acpxRecordId: target.acpxRecordId, version: target.templateVersion },
+      newLatest: newLatest
+        ? { acpxRecordId: newLatest.acpxRecordId, version: newLatest.templateVersion }
+        : undefined,
+    };
+  });
+}
+
+// Soft retract: keep the whole template block, only flip enabled:false. Distinct
+// from `--disable`/unmark, which clears the block entirely (losing slug/version).
+async function softRetractTemplateRecord(acpxRecordId: string): Promise<void> {
+  const record = await resolveSessionRecord(acpxRecordId);
+  if (record.template) {
+    record.template = { ...record.template, enabled: false };
+  }
+  await writeSessionRecordWithLifecycle(record);
+}
+
+async function unlinkIfPresent(filePath: string): Promise<void> {
+  try {
+    await fs.unlink(filePath);
+  } catch {
+    // already absent — nothing to remove
+  }
+}
+
+// Hard delete: record JSON + messages-log sidecars + stream sidecars, then a
+// rebuild to drop the now-missing index entry (the same teardown prune uses).
+async function hardDeleteSessionRecord(acpxRecordId: string): Promise<void> {
+  const sessionDir = sessionBaseDir();
+  const safeId = encodeURIComponent(acpxRecordId);
+  await unlinkIfPresent(path.join(sessionDir, `${safeId}.json`));
+  const logPath = path.join(sessionDir, messagesLogFileName(acpxRecordId));
+  await unlinkIfPresent(logPath);
+  await unlinkIfPresent(messagesLogStalePath(logPath));
+  try {
+    const dirEntries = await fs.readdir(sessionDir);
+    for (const name of dirEntries.filter((entry) => isSessionStreamFile(entry, safeId))) {
+      await unlinkIfPresent(path.join(sessionDir, name));
+    }
+  } catch {
+    // dir vanished between operations — nothing left to clean
+  }
+  await rebuildSessionIndex(sessionDir, "template-rollback-delete").catch(() => {
+    // best-effort cache rebuild; the record files are already gone
+  });
+}
+
+export type TemplateSlugAssignment = {
+  acpxRecordId: string;
+  name: string | undefined;
+  slug: string;
+  version: number;
+};
+export type MigrateSlugsResult = {
+  scanned: number;
+  assigned: number;
+  skipped: number;
+  degenerate: number;
+  failed: number;
+  dryRun: boolean;
+  assignments: TemplateSlugAssignment[];
+};
+
+function disambiguateSlug(base: string, taken: ReadonlySet<string>): string {
+  if (!taken.has(base)) {
+    return base;
+  }
+  for (let suffix = 2; ; suffix += 1) {
+    const candidate = `${base}-${suffix}`;
+    if (!taken.has(candidate)) {
+      return candidate;
+    }
+  }
+}
+
+// Deterministic created_at-asc, then acpxRecordId-asc, via a single composite key
+// (NUL separator keeps the created_at boundary clean — neither field contains NUL).
+function templateCreatedAtSortKey(record: SessionRecord): string {
+  return `${record.template?.created_at ?? record.createdAt ?? ""} ${record.acpxRecordId}`;
+}
+
+function byTemplateCreatedAtThenId(a: SessionRecord, b: SessionRecord): number {
+  const aKey = templateCreatedAtSortKey(a);
+  const bKey = templateCreatedAtSortKey(b);
+  return aKey < bKey ? -1 : aKey > bKey ? 1 : 0;
+}
+
+type TemplateSlugPlan =
+  | { kind: "assign"; slug: string; version: number }
+  | { kind: "skipped" }
+  | { kind: "degenerate" };
+
+// The slug a record keeps (already-slugged) or is assigned during migration: a
+// slug-less record gets a disambiguated slug (D3) added to `takenSlugs`. Returns
+// undefined only for a degenerate name (slugifies to empty) — leave it slug-less.
+function migrationSlugFor(record: SessionRecord, takenSlugs: Set<string>): string | undefined {
+  const existing = record.template?.slug;
+  if (existing !== undefined) {
+    return existing;
+  }
+  const base = record.name !== undefined ? slugify(record.name) : undefined;
+  if (base === undefined) {
+    return undefined;
+  }
+  const slug = disambiguateSlug(base, takenSlugs);
+  takenSlugs.add(slug);
+  return slug;
+}
+
+// Decide the slug+version for one template record during migration. Skips an
+// already slug+version-bearing record (idempotency); otherwise assigns the
+// migration slug + the next version for that slug. Updates the in-memory state.
+function planTemplateSlugMigration(
+  record: SessionRecord,
+  takenSlugs: Set<string>,
+  maxVersionBySlug: Map<string, number>,
+): TemplateSlugPlan {
+  const { slug: existingSlug, version: existingVersion } = record.template ?? {};
+  if (existingSlug !== undefined && typeof existingVersion === "number") {
+    return { kind: "skipped" };
+  }
+  const slug = migrationSlugFor(record, takenSlugs);
+  if (slug === undefined) {
+    return { kind: "degenerate" };
+  }
+  const currentMax = maxVersionBySlug.get(slug) ?? 0;
+  const version = typeof existingVersion === "number" ? existingVersion : currentMax + 1;
+  maxVersionBySlug.set(slug, Math.max(currentMax, version));
+  return { kind: "assign", slug, version };
+}
+
+// Anchor idempotency + disambiguation on slugs/versions already persisted.
+function seedTemplateSlugState(records: readonly SessionRecord[]): {
+  takenSlugs: Set<string>;
+  maxVersionBySlug: Map<string, number>;
+} {
+  const takenSlugs = new Set<string>();
+  const maxVersionBySlug = new Map<string, number>();
+  for (const record of records) {
+    const slug = record.template?.slug;
+    if (slug !== undefined) {
+      takenSlugs.add(slug);
+      maxVersionBySlug.set(
+        slug,
+        Math.max(maxVersionBySlug.get(slug) ?? 0, record.template?.version ?? 0),
+      );
+    }
+  }
+  return { takenSlugs, maxVersionBySlug };
+}
+
+async function loadEnabledTemplateRecordsSorted(): Promise<SessionRecord[]> {
+  const entries = (await loadSessionIndexEntries()).filter(
+    (entry) => entry.templateEnabled === true && entry.kind !== "subagent",
+  );
+  const records = (
+    await Promise.all(entries.map((entry) => loadRecordFromIndexEntry(entry)))
+  ).filter((record): record is SessionRecord => Boolean(record));
+  // created_at asc so the EARLIEST collision gets the bare slug (D3).
+  records.sort(byTemplateCreatedAtThenId);
+  return records;
+}
+
+// Apply one record's migration plan: record the assignment, then (unless dry-run)
+// write slug+version via the privileged writer. Tallies the outcome onto `result`.
+async function migrateOneTemplateRecord(
+  record: SessionRecord,
+  plan: TemplateSlugPlan,
+  dryRun: boolean,
+  result: MigrateSlugsResult,
+): Promise<void> {
+  if (plan.kind === "skipped") {
+    result.skipped += 1;
+    return;
+  }
+  if (plan.kind === "degenerate") {
+    result.degenerate += 1; // emoji-only/empty name — leave slug-less (groups by id)
+    return;
+  }
+  result.assignments.push({
+    acpxRecordId: record.acpxRecordId,
+    name: record.name,
+    slug: plan.slug,
+    version: plan.version,
+  });
+  if (dryRun) {
+    result.assigned += 1;
+    return;
+  }
+  try {
+    record.template = { ...record.template, enabled: true, slug: plan.slug, version: plan.version };
+    await writeSessionRecordWithLifecycle(record);
+    result.assigned += 1;
+  } catch {
+    result.failed += 1;
+  }
+}
+
+/**
+ * Idempotent one-shot backfill of slug + version onto existing (enabled)
+ * templates. Only fills where ABSENT — never renumbers an already-versioned
+ * record (re-runnable as a no-op). Collisions (two distinct templates slugifying
+ * to the same base, D3) get DISTINCT slugs (`-2`, `-3` by created_at), never
+ * merged. Runs under the index lock; in-memory bookkeeping keeps the assignment
+ * consistent across the batch without re-reading the index per record.
+ */
+export async function migrateTemplateSlugs(
+  options: { dryRun?: boolean } = {},
+): Promise<MigrateSlugsResult> {
+  await ensureSessionDir();
+  return await withSessionIndexLock(sessionBaseDir(), async () => {
+    const records = await loadEnabledTemplateRecordsSorted();
+    const { takenSlugs, maxVersionBySlug } = seedTemplateSlugState(records);
+    const result: MigrateSlugsResult = {
+      scanned: records.length,
+      assigned: 0,
+      skipped: 0,
+      degenerate: 0,
+      failed: 0,
+      dryRun: options.dryRun === true,
+      assignments: [],
+    };
+    for (const record of records) {
+      const plan = planTemplateSlugMigration(record, takenSlugs, maxVersionBySlug);
+      await migrateOneTemplateRecord(record, plan, options.dryRun === true, result);
+    }
+    return result;
+  });
 }
 
 export async function listSubagentsForSession(

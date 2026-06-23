@@ -842,6 +842,7 @@ function parseMetadata(raw: unknown): Record<string, string> | undefined | null 
 // dropped (returns undefined) rather than rejecting the whole record, since the
 // daemon does not author or depend on it — it only round-trips it so it survives
 // daemon rewrites and can be projected into the index sidecar.
+// eslint-disable-next-line complexity -- flat field-by-field parse of the optional template block; linear, not branchy logic
 function parseTemplateState(raw: unknown): SessionRecord["template"] {
   const record = asRecord(raw);
   if (!record) {
@@ -859,6 +860,16 @@ function parseTemplateState(raw: unknown): SessionRecord["template"] {
   }
   if (typeof record.auto_prompt === "string") {
     template.auto_prompt = record.auto_prompt;
+  }
+  // slug + version (W13-01). MUST be parsed here: the FW-16 read-preserve path
+  // re-parses `template` on every plain daemon write, so an unparsed field is
+  // silently dropped on the next checkpoint. version is a finite non-negative
+  // integer (the monotonic per-slug counter); a malformed value is ignored.
+  if (typeof record.slug === "string") {
+    template.slug = record.slug;
+  }
+  if (isNonNegativeInteger(record.version)) {
+    template.version = record.version;
   }
   return Object.keys(template).length > 0 ? template : undefined;
 }

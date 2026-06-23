@@ -78,6 +78,12 @@ export type SessionIndexEntry = {
   templateEnabled?: boolean;
   templateCreatedAt?: string;
   templateAutoPrompt?: string;
+  // Slug + version (W13-01). Projected so the latest-per-slug collapse + slug
+  // resolution run off the index with no per-record read. effectiveSlug =
+  // templateSlug ?? slugify(name); the comparator (template-slug.ts Appendix B)
+  // uses templateVersion/templateCreatedAt to pick the latest.
+  templateSlug?: string;
+  templateVersion?: number;
 };
 
 type SessionIndex = {
@@ -246,6 +252,8 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     templateEnabled: optionalBoolean(record.templateEnabled),
     templateCreatedAt: optionalString(record.templateCreatedAt),
     templateAutoPrompt: optionalString(record.templateAutoPrompt),
+    templateSlug: optionalString(record.templateSlug),
+    templateVersion: optionalFiniteNumber(record.templateVersion),
   };
 }
 
@@ -327,6 +335,8 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     templateEnabled: record.template?.enabled,
     templateCreatedAt: record.template?.created_at,
     templateAutoPrompt: record.template?.auto_prompt,
+    templateSlug: record.template?.slug,
+    templateVersion: record.template?.version,
   };
 }
 

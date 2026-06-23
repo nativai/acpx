@@ -20,6 +20,8 @@ import {
   handleSessionsShow,
   handleSessionsTemplate,
   handleSessionsTemplates,
+  handleSessionsTemplatesMigrateSlugs,
+  handleSessionsTemplatesRollback,
   handleSetConfigOption,
   handleSetMode,
   parseHistoryLimit,
@@ -114,11 +116,37 @@ export function registerSessionsCommand(
       await handleSessionsList(explicitAgentName, flags, this, config);
     });
 
-  sessionsCommand
+  const templatesCommand = sessionsCommand
     .command("templates")
-    .description("List saved templates for this agent")
+    .description("List saved templates for this agent (subcommands: rollback, migrate-slugs)")
     .action(async function (this: Command, flags: SessionsListFlags) {
       await handleSessionsTemplates(explicitAgentName, flags, this, config);
+    });
+
+  templatesCommand
+    .command("rollback")
+    .description(
+      "Retract a template slug's latest version (default: soft-retract, reversible; --delete hard-removes)",
+    )
+    .argument("<slug>", "Template slug to roll back", (value: string) =>
+      parseNonEmptyValue("Template slug", value),
+    )
+    .option(
+      "--delete",
+      "Hard-delete the latest version (record + sidecars + index entry) instead of soft-retracting it",
+    )
+    .action(async function (this: Command, slug: string, flags: { delete?: boolean }) {
+      await handleSessionsTemplatesRollback(slug, flags, this, config);
+    });
+
+  templatesCommand
+    .command("migrate-slugs")
+    .description(
+      "Backfill slug+version on existing templates (idempotent; disambiguates name collisions)",
+    )
+    .option("--dry-run", "Preview slug/version assignments without writing records")
+    .action(async function (this: Command, flags: { dryRun?: boolean }) {
+      await handleSessionsTemplatesMigrateSlugs(flags, this, config);
     });
 
   sessionsCommand
@@ -135,6 +163,11 @@ export function registerSessionsCommand(
       "--auto-prompt <text>",
       "Prompt auto-sent on every spawn from this template (empty string clears it). " +
         "Stored plaintext — do not put secrets here.",
+    )
+    .option(
+      "--slug <slug>",
+      "Explicit template slug for --enable (canonicalized; default is slugify(name)). " +
+        "Use when the target slug differs from the session name's slug (e.g. a refresh).",
     )
     .action(async function (this: Command, id: string, flags: SessionsTemplateFlags) {
       await handleSessionsTemplate(explicitAgentName, id, flags, this, config);

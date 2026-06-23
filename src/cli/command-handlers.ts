@@ -42,11 +42,16 @@ import {
   isTemplateRecord,
   listSessions,
   migrateSessionMessages,
+  migrateTemplateSlugs,
   normalizeName,
+  persistTemplateMark,
   resolveSessionRecord,
+  resolveTemplateSelector,
+  rollbackTemplateSlug,
   writeSessionRecord,
   writeSessionRecordWithLifecycle,
 } from "../session/persistence.js";
+import type { MigrateSlugsResult, TemplateRollbackResult } from "../session/persistence.js";
 import { EXIT_CODES } from "../types.js";
 import type {
   OutputFormat,
@@ -1710,17 +1715,33 @@ async function handleSessionsNewFromTemplate(
 ): Promise<void> {
   // Caller guards on flags.fromTemplate !== undefined before dispatching here.
   const fromTemplate = flags.fromTemplate as string;
+  const globalFlags = resolveGlobalFlags(command, config);
+  // Resolve the selector here (id-first → slug) so we can stamp the RESOLVED
+  // immutable record id as template_source (provenance must point at the concrete
+  // version actually spawned from, not the raw slug/arg) and print the selector
+  // kind. runSessionCopy re-resolves the concrete id (exact-id match → the same
+  // record) and still gates it through assertTemplateSource.
+  const { record: resolvedSource, selectorKind } = await resolveTemplateSelector(fromTemplate);
+  if (globalFlags.verbose) {
+    const via =
+      selectorKind === "slug" ? `slug (version ${resolvedSource.template?.version ?? "?"})` : "id";
+    process.stderr.write(
+      `[acpx] --from-template '${fromTemplate}' → ${resolvedSource.acpxRecordId} via ${via}\n`,
+    );
+  }
   const { created, source } = await runSessionCopy(
     explicitAgentName,
     {
-      from: fromTemplate,
+      from: resolvedSource.acpxRecordId,
       name: flags.name,
       // Mark this child as a template-spawn (vs a plain fork): a normal
       // `sessions copy`/`fork` writes the same parent_session_id +
       // forked_from_session_id, so the board needs an explicit discriminator
       // to place it under its creator with a "from template" provenance badge.
       // Only the --from-template path sets it; plain copy/fork never does.
-      metadata: { ...flags.metadata, template_source: fromTemplate },
+      // template_source = the RESOLVED immutable id (not the raw arg) so a child
+      // spawned by slug records the concrete version it actually came from.
+      metadata: { ...flags.metadata, template_source: resolvedSource.acpxRecordId },
       parentId: flags.parentId,
       parentSessionUrl: flags.parentSessionUrl,
     },
@@ -1732,7 +1753,6 @@ async function handleSessionsNewFromTemplate(
   if (!autoPromptText) {
     return;
   }
-  const globalFlags = resolveGlobalFlags(command, config);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   await deliverPrompt({
@@ -2009,6 +2029,11 @@ async function markSessionAsTemplate(
     created_at: record.template?.created_at ?? isoNow(),
     source_session_id: record.template?.source_session_id ?? record.acpSessionId,
     auto_prompt: resolveMarkAutoPrompt(flags, record),
+    // Carry existing slug/version forward (like created_at/source above) so an
+    // idempotent re-enable is detected by persistTemplateMark and does NOT bump
+    // the version. persistTemplateMark fills/overrides these next.
+    slug: record.template?.slug,
+    version: record.template?.version,
   };
   record.closed = true;
   record.closedAt = record.closedAt ?? isoNow();
@@ -2050,9 +2075,16 @@ export async function handleSessionsTemplate(
     ? await markSessionAsTemplate(sessionId, flags)
     : await unmarkSessionTemplate(sessionId);
 
-  // PRIVILEGED write — see the function doc-comment. Never use plain writeSessionRecord
-  // here; it would read-preserve the on-disk template/closed and drop the change.
-  await writeSessionRecordWithLifecycle(record);
+  if (enable) {
+    // Assigns slug (default slugify(name), overridable via --slug) + version =
+    // max+1 for the slug group, under the index lock (E6), then PRIVILEGED-writes.
+    await persistTemplateMark(record, { slug: flags.slug });
+  } else {
+    // PRIVILEGED write — see the function doc-comment. Never use plain
+    // writeSessionRecord here; it would read-preserve the on-disk template/closed
+    // and drop the clear.
+    await writeSessionRecordWithLifecycle(record);
+  }
 
   printTemplateResult(record, enable, globalFlags.format);
 }
@@ -2062,7 +2094,9 @@ function templateResultHumanLine(record: SessionRecord, enable: boolean): string
     return "disabled";
   }
   const autoPromptNote = record.template?.auto_prompt ? " (auto-prompt set)" : "";
-  return `enabled (closed)${autoPromptNote}`;
+  const slug = record.template?.slug;
+  const slugNote = slug !== undefined ? ` [${slug} v${record.template?.version ?? "?"}]` : "";
+  return `enabled (closed)${slugNote}${autoPromptNote}`;
 }
 
 function printTemplateResult(record: SessionRecord, enable: boolean, format: OutputFormat): void {
@@ -2074,6 +2108,8 @@ function printTemplateResult(record: SessionRecord, enable: boolean, format: Out
     created_at: record.template?.created_at,
     source_session_id: record.template?.source_session_id,
     auto_prompt: record.template?.auto_prompt,
+    slug: record.template?.slug,
+    version: record.template?.version,
   };
   if (!emitJsonResult(format, result)) {
     process.stdout.write(
@@ -2439,6 +2475,77 @@ export async function handleSessionsMigrateMessages(
   process.stdout.write(
     `${prefix} ${result.migrated} sessions (scanned ${result.scanned}, skipped active ${result.skippedActive}, already split ${result.skippedAlreadySplit}, failed ${result.failed})\n`,
   );
+}
+
+// `acpx <agent> sessions templates rollback <slug> [--delete]` — retract the
+// current latest version of a slug. Default soft-retract (reversible); --delete
+// hard-removes. The slug is resolved GLOBALLY (D2), so the agent prefix is just
+// the CLI convention — the op spans the whole store.
+export async function handleSessionsTemplatesRollback(
+  slug: string,
+  flags: { delete?: boolean },
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const result = await rollbackTemplateSlug(slug, { delete: flags.delete });
+  printTemplateRollbackResult(result, globalFlags.format);
+}
+
+function formatRollbackTarget(target: {
+  acpxRecordId: string;
+  version: number | undefined;
+}): string {
+  return `${target.acpxRecordId} (version ${target.version ?? "?"})`;
+}
+
+function printTemplateRollbackResult(result: TemplateRollbackResult, format: OutputFormat): void {
+  if (emitJsonResult(format, { action: "template_rollback", ...result })) {
+    return;
+  }
+  if (result.outcome === "noop" || !result.retracted) {
+    process.stdout.write(`template ${result.slug}: no enabled version to roll back\n`);
+    return;
+  }
+  const verb = result.outcome === "delete" ? "deleted" : "retracted";
+  const tail = result.newLatest
+    ? `; new latest ${formatRollbackTarget(result.newLatest)}`
+    : "; slug now empty";
+  process.stdout.write(
+    `template ${result.slug}: ${verb} ${formatRollbackTarget(result.retracted)}${tail}\n`,
+  );
+}
+
+// `acpx <agent> sessions templates migrate-slugs [--dry-run]` — idempotent
+// backfill of slug+version on existing templates (global, D2). Modeled on
+// migrate-messages.
+export async function handleSessionsTemplatesMigrateSlugs(
+  flags: { dryRun?: boolean },
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const result = await migrateTemplateSlugs({ dryRun: flags.dryRun });
+  printMigrateSlugsResult(result, globalFlags.format);
+}
+
+function printMigrateSlugsResult(result: MigrateSlugsResult, format: OutputFormat): void {
+  if (emitJsonResult(format, { action: "template_slugs_migrated", ...result })) {
+    return;
+  }
+  if (format === "quiet") {
+    process.stdout.write(`${result.assigned}\n`);
+    return;
+  }
+  const prefix = result.dryRun ? "would assign" : "assigned";
+  process.stdout.write(
+    `${prefix} ${result.assigned} template slugs (scanned ${result.scanned}, skipped ${result.skipped}, slug-less ${result.degenerate}, failed ${result.failed})\n`,
+  );
+  for (const assignment of result.assignments) {
+    process.stdout.write(
+      `  ${assignment.acpxRecordId} → ${assignment.slug} v${assignment.version}\n`,
+    );
+  }
 }
 
 export async function handleSessionsPrune(

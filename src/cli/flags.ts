@@ -110,6 +110,10 @@ export type SessionsTemplateFlags = {
   // Prompt auto-sent on every spawn from this template. Present (incl. "") sets it
   // (empty clears); absent preserves any existing value.
   autoPrompt?: string;
+  // Explicit template slug on --enable (canonicalized via slugify). Absent ⇒
+  // default slug = slugify(name). The refresh skill passes this when the target
+  // slug differs from slugify(the candidate's name).
+  slug?: string;
 };
 
 export type SessionsHistoryFlags = SessionSelectorFlags & {

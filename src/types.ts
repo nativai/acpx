@@ -519,6 +519,16 @@ export type SessionTemplateState = {
   /** Literal prompt text auto-sent on every spawn from this template. Absent or
    *  empty ⇒ no auto-prompt (pure copy). Stored plaintext — do not put secrets here. */
   auto_prompt?: string;
+  /** Stable human handle for the template; lowercase kebab (canonical slugify,
+   *  see template-slug.ts Appendix A). Global across the store — one slug = one
+   *  logical template. Read-side derives `slug ?? slugify(name)` so slug-less
+   *  records still group/resolve. acpx is the sole author (W13-01). */
+  slug?: string;
+  /** Monotonic version within a slug, assigned `max(existing for slug)+1` at
+   *  mark-time. Latest-wins resolution picks the max-version enabled record
+   *  (see template-slug.ts Appendix B). A refresh always sorts latest because
+   *  the new version is derived from existing data, not the wall clock. */
+  version?: number;
 };
 
 export type SessionRecord = {
