@@ -21,8 +21,9 @@
 //   T5.5/T5.6 MULTI-CALLER GUARD (the #1 risk): recycleOwner defaults OFF, so the
 //             SAME call without it leaves a live owner ALIVE — internal/replay
 //             callers (ensureSession, prompt-runner, reconnect) never recycle.
-//   T5.7/T5.8 COLD: persist + session_options sync; recycle is a no-op (no owner).
 //   T5.9      structural: the CLI handlers set recycleOwner; ensureSession does NOT.
+// (COLD recycle = the existing validated direct-apply + a no-op terminate; it is
+//  covered by the integration suite's cold-respawn-replay + set-model-rejects tests.)
 //
 // The full warm-revert end-to-end (in-turn $CLAUDE_EFFORT held across TWO warm
 // turns on a real claude session) is the live TE in the task folder (CONCEPTION
@@ -323,44 +324,13 @@ test("T5.6 GUARD: setSessionModel WITHOUT recycleOwner leaves a live owner ALIVE
   });
 });
 
-// ---------------------------------------------------------------------------
-// T5.7 / T5.8 — COLD: no live owner. Recycle is a no-op (nothing to terminate);
-// the desired value is persisted (with the session_options sync) so the next
-// prompt cold-spawns + replays it. ownerRestarted=false.
-// ---------------------------------------------------------------------------
-
-test("T5.7 COLD: set effort recycle persists desired + session_options.effort sync, no restart", async () => {
-  await withTempHome(async (homeDir) => {
-    const sessionId = "recycle-cold-effort";
-    await seedSessionJson(homeDir, seedRecord(homeDir, sessionId, {})); // no owner lease
-
-    const result = await setSessionConfigOption({
-      sessionId,
-      configId: "effort",
-      value: "xhigh",
-      recycleOwner: true,
-    });
-
-    assert.equal(result.ownerRestarted, false);
-    const onDisk = await resolveSessionRecord(sessionId);
-    assert.equal(onDisk.acpx?.desired_config_options?.effort, "xhigh");
-    assert.equal(onDisk.acpx?.session_options?.effort, "xhigh");
-  });
-});
-
-test("T5.8 COLD: set model recycle persists desired + current model, no restart", async () => {
-  await withTempHome(async (homeDir) => {
-    const sessionId = "recycle-cold-model";
-    await seedSessionJson(homeDir, seedRecord(homeDir, sessionId, {}));
-
-    const result = await setSessionModel({ sessionId, modelId: "haiku", recycleOwner: true });
-
-    assert.equal(result.ownerRestarted, false);
-    const onDisk = await resolveSessionRecord(sessionId);
-    assert.equal(onDisk.acpx?.session_options?.model, "haiku");
-    assert.equal(onDisk.acpx?.current_model_id, "haiku");
-  });
-});
+// COLD path (no live owner) is the existing validated apply (runSessionSet*Direct,
+// which spawns the agent to validate + persist) plus a no-op terminate — recycle
+// changes nothing there beyond leaving ownerRestarted falsy. It is covered by the
+// integration suite (test/integration.test.ts): "cold owner respawn replays
+// mid-session effort/model before the next prompt" and "set model rejects with
+// clear error on ACP invalid params". The session_options.effort sync the fresh
+// owner reads is asserted by the warm T5.1 above.
 
 // ---------------------------------------------------------------------------
 // T5.9 — structural sentinels (same idiom as the W12-19 suite's T4.2). The

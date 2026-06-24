@@ -4369,11 +4369,18 @@ async function createSessionAndWarmOwner(
   assert.equal(typeof sessionId, "string");
   const warmMarker = `warm-owner-${path.basename(cwd)}`;
 
-  const queued = await runCli(
-    [...agentArgs, "--format", "json", "--ttl", "60", "prompt", "--no-wait", `echo ${warmMarker}`],
+  // Blocking prompt (NOT --no-wait): it returns only after the turn COMPLETES, so
+  // the warm owner is left IDLE. A --no-wait prompt returns mid-turn — its output
+  // can appear in history while the turn is still finishing, leaving the owner
+  // briefly turn-in-flight. That race is harmless for live-apply ops, but
+  // `set effort`/`set model` now REFUSE while a turn is in flight (W13-24 owner
+  // recycle), so a "warm owner" handed to those ops must be genuinely idle. --ttl
+  // 60 keeps the owner warm after the turn returns.
+  const warmed = await runCli(
+    [...agentArgs, "--format", "json", "--ttl", "60", "prompt", `echo ${warmMarker}`],
     homeDir,
   );
-  assert.equal(queued.code, 0, queued.stderr);
+  assert.equal(warmed.code, 0, warmed.stderr);
 
   const { lockPath } = queuePaths(homeDir, sessionId as string);
   await waitFor(async () => {
@@ -4383,12 +4390,6 @@ async function createSessionAndWarmOwner(
     } catch {
       return null;
     }
-  }, 10_000);
-
-  await waitFor(async () => {
-    const history = await runCli([...agentArgs, "--format", "quiet", "sessions", "read"], homeDir);
-    assert.equal(history.code, 0, history.stderr);
-    return history.stdout.includes(warmMarker) ? history.stdout : null;
   }, 10_000);
 
   return sessionId as string;
