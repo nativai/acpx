@@ -1138,3 +1138,17 @@ test("buildAgentSpawnOptions (K2) known-dead set empty → no substitution (iden
     },
   );
 });
+
+test("buildQueueOwnerSpawnOptions routes stdout+stderr to the owner-log fd when provided", () => {
+  const withFd = buildQueueOwnerSpawnOptions('{"sessionId":"queue-session"}', 42);
+  assert.deepEqual(withFd.stdio, ["ignore", 42, 42]);
+  assert.equal(withFd.detached, true);
+  assert.equal(withFd.env.ACPX_QUEUE_OWNER_PAYLOAD, '{"sessionId":"queue-session"}');
+  // (a) With the log fd active, the owner is marked (ACPX_OWNER_LOG=1) so its
+  // in-process client may emit diagnostic disconnect/exit lines to stderr (→ the
+  // owner log); absent it (e.g. a json-strict CLI) those lines stay suppressed.
+  assert.equal(withFd.env.ACPX_OWNER_LOG, "1");
+  // No fd (or null) → the prior "ignore" behavior is preserved.
+  assert.equal(buildQueueOwnerSpawnOptions('{"sessionId":"queue-session"}', null).stdio, "ignore");
+  assert.equal(buildQueueOwnerSpawnOptions('{"sessionId":"queue-session"}').stdio, "ignore");
+});

@@ -25,6 +25,10 @@ export function applyLifecycleSnapshotToRecord(
     record.lastAgentExitSignal = snapshot.lastExit.signal;
     record.lastAgentExitAt = snapshot.lastExit.exitedAt;
     record.lastAgentDisconnectReason = snapshot.lastExit.reason;
+    // Persist whether the disconnect happened MID-TURN (a prompt was active) vs at
+    // rest — the one signal that distinguishes a mid-turn death from a routine idle
+    // TTL-reap, both of which otherwise serialize as connection_close/null/null.
+    record.lastAgentUnexpectedDuringPrompt = snapshot.lastExit.unexpectedDuringPrompt;
     return;
   }
 
@@ -32,6 +36,7 @@ export function applyLifecycleSnapshotToRecord(
   record.lastAgentExitSignal = undefined;
   record.lastAgentExitAt = undefined;
   record.lastAgentDisconnectReason = undefined;
+  record.lastAgentUnexpectedDuringPrompt = undefined;
 }
 
 export function reconcileAgentSessionId(

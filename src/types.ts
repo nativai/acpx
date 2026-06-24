@@ -557,6 +557,10 @@ export type SessionRecord = {
   lastAgentExitSignal?: NodeJS.Signals | null;
   lastAgentExitAt?: string;
   lastAgentDisconnectReason?: string;
+  /** True when the last disconnect happened mid-turn (a prompt was active) — the
+   * signal that tells a mid-turn death apart from a routine idle TTL-reap (both
+   * otherwise serialize as connection_close/null/null). */
+  lastAgentUnexpectedDuringPrompt?: boolean;
   protocolVersion?: number;
   agentCapabilities?: AgentCapabilities;
   title?: string | null;

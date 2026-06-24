@@ -434,6 +434,7 @@ test("listSessions preserves lifecycle and conversation metadata", async () => {
         lastAgentExitSignal: "SIGTERM",
         lastAgentExitAt: "2026-01-01T00:02:00.000Z",
         lastAgentDisconnectReason: "process_exit",
+        lastAgentUnexpectedDuringPrompt: true,
         title: "My Thread",
         messages: [
           {
@@ -467,6 +468,7 @@ test("listSessions preserves lifecycle and conversation metadata", async () => {
     assert.equal(record.lastAgentExitSignal, "SIGTERM");
     assert.equal(record.lastAgentExitAt, "2026-01-01T00:02:00.000Z");
     assert.equal(record.lastAgentDisconnectReason, "process_exit");
+    assert.equal(record.lastAgentUnexpectedDuringPrompt, true);
     assert.equal(record.messages.length, 2);
     assert.deepEqual(record.messages[0], {
       User: {

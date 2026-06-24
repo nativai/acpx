@@ -930,6 +930,9 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
   const lastAgentExitSignal = normalizeOptionalSignal(record.last_agent_exit_signal);
   const lastAgentExitAt = normalizeOptionalString(record.last_agent_exit_at);
   const lastAgentDisconnectReason = normalizeOptionalString(record.last_agent_disconnect_reason);
+  const lastAgentUnexpectedDuringPrompt = normalizeOptionalBooleanField(
+    record.last_agent_unexpected_during_prompt,
+  );
 
   const kind = parseSessionKind(record.kind);
   if (kind === null) {
@@ -973,7 +976,8 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     typeof lastAgentExitCode === "symbol" ||
     typeof lastAgentExitSignal === "symbol" ||
     lastAgentExitAt === null ||
-    lastAgentDisconnectReason === null
+    lastAgentDisconnectReason === null ||
+    lastAgentUnexpectedDuringPrompt === null
   ) {
     return null;
   }
@@ -1037,6 +1041,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     lastAgentExitSignal: lastAgentExitSignal,
     lastAgentExitAt,
     lastAgentDisconnectReason,
+    lastAgentUnexpectedDuringPrompt,
     protocolVersion:
       typeof record.protocol_version === "number" ? record.protocol_version : undefined,
     agentCapabilities: asRecord(record.agent_capabilities) as SessionRecord["agentCapabilities"],
