@@ -185,6 +185,16 @@ export type SessionSetModelOptions = {
   authPolicy?: AuthPolicy;
   terminal?: boolean;
   verbose?: boolean;
+  /**
+   * CLI-verb path only: when set, a live idle queue owner is recycled after the
+   * desired model is persisted so the change binds on the next turn (the next
+   * prompt cold-resumes and replays it — mirrors `set profile`). Defaults off so
+   * internal/replay callers (e.g. ensureSession) never recycle; they already
+   * cold-reconnect. See setSessionModel.
+   */
+  recycleOwner?: boolean;
+  /** Only used for the turn-in-flight error message on the recycle path. */
+  sessionName?: string;
 } & TimedRunOptions;
 
 export type SessionSetConfigOptionOptions = {
@@ -197,6 +207,15 @@ export type SessionSetConfigOptionOptions = {
   authPolicy?: AuthPolicy;
   terminal?: boolean;
   verbose?: boolean;
+  /**
+   * CLI-verb path only: when set, a live idle queue owner is recycled after the
+   * desired value is persisted so the change binds on the next turn (mirrors
+   * `set profile`). Defaults off so internal/replay callers never recycle. Used
+   * by the CLI `set effort` handler. See setSessionConfigOption.
+   */
+  recycleOwner?: boolean;
+  /** Only used for the turn-in-flight error message on the recycle path. */
+  sessionName?: string;
 } & TimedRunOptions;
 
 export type SessionCreateWithClientResult = {

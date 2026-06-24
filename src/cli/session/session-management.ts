@@ -479,6 +479,11 @@ export async function ensureSession(options: SessionEnsureOptions): Promise<Sess
     }
     const requestedModel = options.sessionOptions?.model;
     if (requestedModel) {
+      // Internal ensure path — must NOT recycle the owner (the recycle flag is
+      // left off). This runs as part of session ensure/spawn, which already
+      // cold-reconnects; recycling here would thrash owners on ordinary prompts.
+      // Owner-recycle is a CLI-verb-only behavior, set by the set-model and
+      // set-effort handlers.
       const result = await setSessionModel({
         sessionId: working.acpxRecordId,
         modelId: requestedModel,

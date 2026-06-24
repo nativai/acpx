@@ -230,6 +230,14 @@ function resolveCompatibleConfigId(agent: { agentCommand: string }, configId: st
   return configId;
 }
 
+// Thinking-depth config options. These are the ones that suffer the warm-owner
+// revert (the owner binds reasoningEffort at spawn and re-asserts it every turn),
+// so the CLI `set` verb recycles the owner for them to make the change bind on
+// the next turn (W13-24). Other config options keep the live/direct-apply path.
+function isDepthConfigOption(configId: string): boolean {
+  return configId === "effort" || configId === "reasoning_effort";
+}
+
 function resolveRequestedOutputPolicy(globalFlags: {
   format: OutputFormat;
   jsonStrict?: boolean;
@@ -1154,7 +1162,7 @@ function printSetModeResultByFormat(
 
 function printSetModelResultByFormat(
   modelId: string,
-  result: { record: SessionRecord; resumed: boolean },
+  result: { record: SessionRecord; resumed: boolean; ownerRestarted?: boolean },
   format: OutputFormat,
 ): void {
   if (
@@ -1162,6 +1170,7 @@ function printSetModelResultByFormat(
       action: "model_set",
       modelId,
       resumed: result.resumed,
+      ownerRestarted: result.ownerRestarted ?? false,
       acpxRecordId: result.record.acpxRecordId,
       acpxSessionId: result.record.acpSessionId,
       agentSessionId: result.record.agentSessionId,
@@ -1179,6 +1188,7 @@ function printSetConfigOptionResultByFormat(
     record: SessionRecord;
     resumed: boolean;
     response: { configOptions: unknown[] };
+    ownerRestarted?: boolean;
   },
   format: OutputFormat,
 ): void {
@@ -1188,6 +1198,7 @@ function printSetConfigOptionResultByFormat(
       configId,
       value,
       resumed: result.resumed,
+      ownerRestarted: result.ownerRestarted ?? false,
       configOptions: result.response.configOptions,
       acpxRecordId: result.record.acpxRecordId,
       acpxSessionId: result.record.acpSessionId,
@@ -1282,6 +1293,10 @@ export async function handleSetModel(
     terminal: globalFlags.terminal,
     timeoutMs: globalFlags.timeout,
     verbose: globalFlags.verbose,
+    // CLI verb: recycle a live idle owner so the change binds on the next turn
+    // (refuses with turn-in-flight if a turn is active). acpx-ui shells this.
+    recycleOwner: true,
+    sessionName: selector.name ?? record.name,
   });
 
   if (globalFlags.verbose && result.loadError) {
@@ -1335,6 +1350,12 @@ export async function handleSetConfigOption(
     terminal: globalFlags.terminal,
     timeoutMs: globalFlags.timeout,
     verbose: globalFlags.verbose,
+    // CLI verb: recycle a live idle owner so a thinking-depth change binds on the
+    // next turn (the owner re-asserts its spawn-time effort every turn otherwise,
+    // reverting a live set). Scoped to depth options — other config options keep
+    // the existing live/direct apply. Refuses with turn-in-flight if active.
+    recycleOwner: isDepthConfigOption(resolvedConfigId),
+    sessionName: selector.name ?? record.name,
   });
 
   if (globalFlags.verbose && result.loadError) {

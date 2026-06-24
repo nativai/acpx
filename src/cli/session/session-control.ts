@@ -1,6 +1,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { ProfileTurnInFlightError, SubscriptionTurnInFlightError } from "../../errors.js";
+import {
+  ConfigOptionTurnInFlightError,
+  ModelTurnInFlightError,
+  ProfileTurnInFlightError,
+  SubscriptionTurnInFlightError,
+} from "../../errors.js";
 import { switchSessionAccount } from "../../runtime/engine/account-seam.js";
 import { switchSessionSubscription } from "../../runtime/engine/subscription-switch.js";
 import {
@@ -108,6 +113,13 @@ export async function setSessionModel(
     context: "apply",
   });
 
+  // CLI-verb path: bind the change by recycling the owner (see comment on
+  // recycleSetSessionModel). Internal/replay callers leave recycleOwner off and
+  // fall through to the live/direct apply below.
+  if (options.recycleOwner) {
+    return await recycleSetSessionModel(options, record);
+  }
+
   const submittedToOwner = await trySetModelOnRunningOwner(
     options.sessionId,
     options.modelId,
@@ -137,9 +149,57 @@ export async function setSessionModel(
   });
 }
 
+// CLI-verb `set model` recycle path. The deployed warm bug: the queue owner binds
+// its model at spawn and re-asserts it every turn, so a live IPC `set_model` is
+// reverted on the next warm turn (W12-19 only fixed the cold replay). The remedy
+// mirrors `setSessionProfile`: refuse if a turn is in flight, persist the desired
+// model, then terminate a live idle owner. The next prompt cold-resumes (same
+// CLAUDE_CONFIG_DIR → in-place transcript reused, so context is preserved) and
+// replays the desired model (reconnect.ts replayDesiredModel), which then sticks.
+// Unlike `set profile` there is no transcript port and no pre-apply to the owner
+// we are about to kill. Recycling is a no-op when already cold.
+async function recycleSetSessionModel(
+  options: SessionSetModelOptions,
+  record: SessionRecord,
+): Promise<SessionSetModelResult> {
+  const liveness = await readQueueOwnerLiveness(options.sessionId);
+  const ownerAlive = liveness.alive;
+
+  if (ownerAlive) {
+    const active = await tryQueryActiveTurnOnRunningOwner(options.sessionId);
+    if (active === true) {
+      throw new ModelTurnInFlightError(options.sessionName);
+    }
+  }
+
+  setDesiredModelId(record, options.modelId);
+  setCurrentModelId(record, options.modelId);
+  await writeSessionRecord(record);
+
+  let ownerRestarted = false;
+  if (ownerAlive) {
+    await terminateQueueOwnerForSession(options.sessionId);
+    ownerRestarted = true;
+    if (options.verbose) {
+      process.stderr.write(
+        `[acpx] restarted queue owner for session ${options.sessionId} to bind model "${options.modelId}"\n`,
+      );
+    }
+  }
+
+  return { record, resumed: false, ownerRestarted };
+}
+
 export async function setSessionConfigOption(
   options: SessionSetConfigOptionOptions,
 ): Promise<SessionSetConfigOptionResult> {
+  // CLI-verb path: bind the change by recycling the owner (see comment on
+  // recycleSetSessionConfigOption). Internal/replay callers leave recycleOwner
+  // off and fall through to the live/direct apply below.
+  if (options.recycleOwner) {
+    return await recycleSetSessionConfigOption(options);
+  }
+
   const ownerResponse = await trySetConfigOptionOnRunningOwner(
     options.sessionId,
     options.configId,
@@ -174,6 +234,58 @@ export async function setSessionConfigOption(
     timeoutMs: options.timeoutMs,
     verbose: options.verbose,
   });
+}
+
+// CLI-verb `set effort` (thinking depth) recycle path. Same warm bug as model:
+// the queue owner binds sessionContext.reasoningEffort at spawn and re-asserts +
+// re-persists it every turn, reverting a live IPC `set_config_option(effort)` on
+// the next warm turn (W12-19 only fixed the cold replay). The remedy mirrors
+// `setSessionProfile`: refuse if a turn is in flight, persist the desired value
+// (setDesiredConfigOption also syncs session_options.effort, which the fresh
+// owner reads into sessionContext), then terminate a live idle owner. The next
+// prompt cold-resumes (same CLAUDE_CONFIG_DIR → in-place transcript reused) and
+// replays the desired option (reconnect.ts replayDesiredConfigOptions), which
+// then sticks. No pre-apply to the owner we are about to kill; no transcript
+// port. Recycling is a no-op when already cold. The synthesized response carries
+// the record's last-known advertised options (we do not query the owner here).
+async function recycleSetSessionConfigOption(
+  options: SessionSetConfigOptionOptions,
+): Promise<SessionSetConfigOptionResult> {
+  const liveness = await readQueueOwnerLiveness(options.sessionId);
+  const ownerAlive = liveness.alive;
+
+  if (ownerAlive) {
+    const active = await tryQueryActiveTurnOnRunningOwner(options.sessionId);
+    if (active === true) {
+      throw new ConfigOptionTurnInFlightError(options.configId, options.sessionName);
+    }
+  }
+
+  const record = await resolveSessionRecord(options.sessionId);
+  if (options.configId === "mode") {
+    setDesiredModeId(record, options.value);
+  } else {
+    setDesiredConfigOption(record, options.configId, options.value);
+  }
+  await writeSessionRecord(record);
+
+  let ownerRestarted = false;
+  if (ownerAlive) {
+    await terminateQueueOwnerForSession(options.sessionId);
+    ownerRestarted = true;
+    if (options.verbose) {
+      process.stderr.write(
+        `[acpx] restarted queue owner for session ${options.sessionId} to bind config option "${options.configId}"\n`,
+      );
+    }
+  }
+
+  return {
+    record,
+    response: { configOptions: record.acpx?.config_options ?? [] },
+    resumed: false,
+    ownerRestarted,
+  };
 }
 
 // Change a session's active Claude subscription in place. Unlike set-mode/model

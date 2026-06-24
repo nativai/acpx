@@ -604,12 +604,16 @@ export type SessionSetConfigOptionResult = {
   response: SetSessionConfigOptionResponse;
   resumed: boolean;
   loadError?: string;
+  /** True when a live queue owner existed and was recycled to bind the change. */
+  ownerRestarted?: boolean;
 };
 
 export type SessionSetModelResult = {
   record: SessionRecord;
   resumed: boolean;
   loadError?: string;
+  /** True when a live queue owner existed and was recycled to bind the change. */
+  ownerRestarted?: boolean;
 };
 
 export type SessionEnsureResult = {

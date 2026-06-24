@@ -319,6 +319,41 @@ export class ProfileTurnInFlightError extends AcpxOperationalError {
   }
 }
 
+// A manual `set model` (CLI verb, recycle path) was requested while a turn is in
+// flight on the live queue owner. Refused (not queued) — recycling the owner
+// would SIGKILL the live turn. Shares the "TURN_IN_FLIGHT" detailCode with the
+// subscription/profile paths so acpx-ui maps it to the same 409.
+export class ModelTurnInFlightError extends AcpxOperationalError {
+  constructor(sessionName?: string) {
+    const label = sessionName ? ` '${sessionName}'` : "";
+    super(
+      `Cannot change the model while a turn is in flight on session${label}; wait for the current turn to finish (turn-in-flight).`,
+      {
+        outputCode: "USAGE",
+        detailCode: "TURN_IN_FLIGHT",
+        origin: "queue",
+      },
+    );
+  }
+}
+
+// A manual `set <configId>` (CLI verb, recycle path — e.g. thinking depth via
+// `set effort`) was requested while a turn is in flight on the live queue owner.
+// Refused for the same reason as ModelTurnInFlightError; same 409 contract.
+export class ConfigOptionTurnInFlightError extends AcpxOperationalError {
+  constructor(configId: string, sessionName?: string) {
+    const label = sessionName ? ` '${sessionName}'` : "";
+    super(
+      `Cannot change config option "${configId}" while a turn is in flight on session${label}; wait for the current turn to finish (turn-in-flight).`,
+      {
+        outputCode: "USAGE",
+        detailCode: "TURN_IN_FLIGHT",
+        origin: "queue",
+      },
+    );
+  }
+}
+
 export class SessionModeReplayError extends AcpxOperationalError {
   constructor(message: string, options?: AcpxErrorOptions) {
     super(message, {
