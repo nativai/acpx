@@ -125,6 +125,18 @@ async function maybeRecoverSubmitFailure(params: {
   return await maybeRecoverStaleOwnerAfterProtocolMismatch(params);
 }
 
+// DELIBERATELY RETAINED auto-replace of a live owner (W13-24-10, North Star).
+// This is the ONE remaining place the system auto-terminates a process that is
+// still alive. It is NOT a quiet/idle/heartbeat heuristic: it fires only when the
+// owner is positively RESPONDING but with malformed/unexpected queue protocol —
+// i.e. deterministic version-skew unusability after a breaking queue-protocol
+// change between deploys. Without it a protocol-incompatible owner permanently
+// wedges the session. The strict-North-Star alternative (surface a MANUAL restart
+// instead) was weighed and DEFERRED: given the rarity and the deterministic
+// (non-heuristic) trigger, preserve-and-document is the lower-risk choice. Revisit
+// if a breaking queue-protocol change is ever shipped. A generic submit timeout
+// (not shutdown, not protocol) deliberately does NOT reach here → no kill; the
+// user must manually recover (North-Star compliant for the wedged-but-alive case).
 async function maybeRecoverStaleOwnerAfterProtocolMismatch(params: {
   sessionId: string;
   owner: QueueOwnerRecord;
