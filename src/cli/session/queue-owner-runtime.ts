@@ -785,6 +785,12 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
               ? "queue.owner.deploy_recycled"
               : "queue.owner.idle_released",
           );
+          // Flush the counter to ACPX_PERF_METRICS_FILE NOW (the secondary signal):
+          // the graceful close self-SIGKILLs the owner's process group (the
+          // W13-24-10 orphan backstop in closeQueueOwnerRuntime), which preempts
+          // the process 'exit' perf flush — so a checkpoint here is what makes the
+          // counter observable, the same call the turn-completion path uses.
+          checkpointPerfMetricsCapture();
           // Graceful close via the existing clean path (finally →
           // closeQueueOwnerRuntime). The next prompt cold-respawns, resuming WITH
           // context. No new kill primitive.
