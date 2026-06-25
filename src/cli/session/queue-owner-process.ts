@@ -329,7 +329,9 @@ export function readQueueOwnerStartupFailureDetail(sessionId: string): string | 
     }
     // Prefer the most recent explicit owner-failure line; fall back to the last
     // line written (still the freshest crash output across re-spawns).
-    const failureLine = [...lines].toReversed().find((line) => line.includes("queue owner failed:"));
+    const failureLine = [...lines]
+      .toReversed()
+      .find((line) => line.includes("queue owner failed:"));
     const chosen = failureLine ?? lines[lines.length - 1];
     return chosen.slice(0, OWNER_LOG_REASON_MAX_CHARS);
   } catch {
