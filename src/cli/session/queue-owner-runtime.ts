@@ -6,7 +6,7 @@ import { formatErrorMessage } from "../../acp/error-normalization.js";
 import { supportsMidTurnPromptInjection } from "../../acp/mid-turn-injection-support.js";
 import { withTimeout } from "../../async-control.js";
 import { checkpointPerfMetricsCapture } from "../../perf-metrics-capture.js";
-import { setPerfGauge } from "../../perf-metrics.js";
+import { incrementPerfCounter, setPerfGauge } from "../../perf-metrics.js";
 import { promptToDisplayText } from "../../prompt-content.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
 import {
@@ -43,6 +43,7 @@ import { QueueOwnerTurnController } from "../queue/owner-turn-controller.js";
 import { resolveAndEnsureAgentFolder } from "./agent-folder.js";
 import {
   DEFAULT_QUEUE_OWNER_TTL_MS,
+  normalizeOwnerIdleReleaseMs,
   normalizeQueueOwnerTtlMs,
   type SessionSendOptions,
 } from "./contracts.js";
@@ -334,6 +335,93 @@ async function writeQueueOwnerLifecycleSnapshot(
   }
 }
 
+// Parse an integer-millisecond env var. Empty/absent → undefined so the
+// normalizer applies its default; this guards against `Number("") === 0`
+// silently disabling a feature on an unset-but-present env var.
+function parseEnvMs(raw: string | undefined): number | undefined {
+  if (raw == null || raw.trim() === "") {
+    return undefined;
+  }
+  return Number(raw);
+}
+
+// W13-24-14 Phase 2 — the idle-owner release reasons. Two INDEPENDENT triggers,
+// OR'd, that share one safety gate (see decideIdleOwnerRelease):
+//   - "deploy-staleness": the owner is running OUTDATED code (W13-24-10 Path 1).
+//   - "idle-memory":      the owner is provably idle past the memory timeout.
+export type IdleOwnerReleaseReason = "deploy-staleness" | "idle-memory";
+
+export type IdleOwnerReleaseDecision =
+  | { release: false }
+  | { release: true; reason: IdleOwnerReleaseReason };
+
+export type DecideIdleOwnerReleaseInput = {
+  ttlMs: number;
+  hasActiveTurn: boolean;
+  now: number;
+  lastIdleDrainActivityAt: number;
+  lastTaskCompletedAt: number;
+  quiescenceWindowMs: number;
+  idleReleaseMs: number;
+  // Lazy so the deploy-file read happens ONLY after the safety gate already holds
+  // (preserves the W13-24-10 short-circuit cost-ordering). Pure helper otherwise.
+  deployDiffers: () => boolean | Promise<boolean>;
+};
+
+// THE LOAD-BEARING DECISION (W13-24-14 Phase 2). Pure (modulo the deployDiffers
+// thunk) so the North-Star gate is unit-testable without a live owner, mirroring
+// how the queue module factors isRecoverableQueueOwnerState / classifyQueueOwnerState.
+//
+// Separation of concerns — state it once, here, so no future edit blurs it:
+//   * The SHARED GATE (`idleAndQuiescent`) decides WHETHER a maybe-active owner is
+//     protected. It is the North-Star invariant and is evaluated ONCE so a future
+//     edit cannot relax it for one release reason while keeping it for the other.
+//   * The accumulated-idle CLOCK (`idleReleaseMs`) decides only WHEN an owner that
+//     has ALREADY passed the gate is released. It can NEVER release an active owner
+//     — a clock bug can at worst over-release a genuinely-idle owner (benign:
+//     cold-respawn recovers WITH context).
+export async function decideIdleOwnerRelease(
+  input: DecideIdleOwnerReleaseInput,
+): Promise<IdleOwnerReleaseDecision> {
+  // SHARED safety gate — BOTH reasons require provably-idle + quiescent:
+  //   - ttlMs !== 0    : `--ttl 0` is the master never-recycle opt-out
+  //                      (belt-and-suspenders; nextTask(undefined) never times out,
+  //                      so the idle branch is structurally unreachable at ttl 0).
+  //   - !hasActiveTurn : the reliable local turn signal (starting/active or a live
+  //                      prompt) — NEVER inFlight / heartbeat age. A long 15-20 min
+  //                      tool call keeps the turn active → the owner is never idle.
+  //   - quiescent      : no inter-turn idle-drain relay within the check cadence,
+  //                      so an owner relaying background work is never torn down.
+  const idleAndQuiescent =
+    input.ttlMs !== 0 &&
+    !input.hasActiveTurn &&
+    input.now - input.lastIdleDrainActivityAt >= input.quiescenceWindowMs;
+  if (!idleAndQuiescent) {
+    return { release: false };
+  }
+
+  // Deploy-staleness checked first: an owner that is BOTH outdated AND long-idle is
+  // reported under the more specific, more actionable reason. The deploy check (a
+  // file read) is evaluated only now — after the gate already holds.
+  if (await input.deployDiffers()) {
+    return { release: true, reason: "deploy-staleness" };
+  }
+
+  // idle-memory: provably idle past the timeout. The accumulated-idle clock is
+  // now - max(lastTaskCompletedAt, lastIdleDrainActivityAt): ANY activity — a
+  // completed turn or a relay message — resets it, so only genuine silence
+  // accumulates. idleReleaseMs <= 0 disables ONLY this path (deploy recycle survives).
+  if (
+    input.idleReleaseMs > 0 &&
+    input.now - Math.max(input.lastTaskCompletedAt, input.lastIdleDrainActivityAt) >=
+      input.idleReleaseMs
+  ) {
+    return { release: true, reason: "idle-memory" };
+  }
+
+  return { release: false };
+}
+
 // eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
 export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): Promise<void> {
   const lease = await tryAcquireQueueOwnerLease(options.sessionId);
@@ -361,8 +449,23 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   // spawn. Stamped in the idle-drain onAcpMessage handler; read by the idle
   // loop's quiescence gate so a continuously-relaying owner is NEVER recycled.
   let lastIdleDrainActivityAt = 0;
+  // W13-24-14 Phase 2 — authoritative "owner went idle" stamp for the
+  // accumulated-idle clock. Baselined at spawn (so a freshly-spawned owner that
+  // never gets a task still has a well-defined clock), re-stamped at each turn
+  // completion. Combined via Math.max with lastIdleDrainActivityAt so ANY activity
+  // — a completed turn OR a relay message — resets the clock. This governs only
+  // WHEN an already-idle owner is released; WHETHER an active owner is protected is
+  // the hasActiveTurn()+quiescence gate (see decideIdleOwnerRelease).
+  let lastTaskCompletedAt = Date.now();
   const sharedClient = createQueueOwnerSharedClient(options, sessionRecord);
   const ttlMs = normalizeQueueOwnerTtlMs(options.ttlMs);
+  // W13-24-14 Phase 2 — memory-release idle timeout (ms), read from env at owner
+  // start (reaches the owner via ...process.env, like ACPX_DEPLOY_VERSION_FILE).
+  // 0 disables ONLY the memory-release path (deploy-staleness recycle survives);
+  // invalid/negative/unset → the 30-min default.
+  const idleReleaseMs = normalizeOwnerIdleReleaseMs(
+    parseEnvMs(process.env.ACPX_OWNER_IDLE_RELEASE_MS),
+  );
   const maxQueueDepth = Math.max(1, Math.round(options.maxQueueDepth ?? 16));
   const defaultTaskPollTimeoutMs: number | undefined = ttlMs === 0 ? undefined : ttlMs;
   const initialTaskPollTimeoutMs =
@@ -645,30 +748,50 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         // A full idle window elapsed; subsequent waits use the steady cadence.
         isFirstTask = false;
         // No new prompt arrived within the idle-check window. Per the North Star
-        // we do NOT reap a live owner for being quiet — the idle window is a
-        // deploy-staleness CHECK, never a liveness reap. Recycle ONLY when ALL of:
-        //   1. TTL is not disabled (`--ttl 0` means never-recycle).
-        //   2. No turn is active — the reliable local turn state, NEVER `inFlight`.
-        //   3. Quiescent — no inter-turn idle-drain activity within one check
-        //      cadence, so we never tear down an owner relaying background work.
-        //   4. The deployed build differs from the owner's — it is running
-        //      OUTDATED code (a deploy happened). A current-code owner re-arms
-        //      and stays warm forever.
-        // When ttl 0, `nextTask` never times out (no task ⇒ keeps waiting), so
-        // this branch is unreachable; the `ttlMs !== 0` guard is belt-and-suspenders.
+        // we do NOT reap a live owner for being quiet. Two INDEPENDENT release
+        // reasons share ONE safety gate (see decideIdleOwnerRelease):
+        //   - deploy-staleness: running OUTDATED code (W13-24-10 Path 1).
+        //   - idle-memory:      provably idle past the memory timeout (Phase 2),
+        //                       released to free ~287 MB; the next prompt
+        //                       cold-respawns WITH context (reliable post Phase 1).
+        // The shared gate (ttl!==0 && !hasActiveTurn && quiescent) governs WHETHER
+        // a maybe-active owner is protected; the accumulated-idle clock governs
+        // only WHEN an already-idle owner is released — it can never release an
+        // active owner. When ttl 0, `nextTask` never times out, so this branch is
+        // structurally unreachable (the ttl!==0 term is belt-and-suspenders).
         const quiescenceWindowMs = pollTimeoutMs ?? 0;
-        const safeToRecycle =
-          ttlMs !== 0 &&
-          !turnController.hasActiveTurn() &&
-          Date.now() - lastIdleDrainActivityAt >= quiescenceWindowMs &&
-          (await deployedBuildDiffersFromOwner());
-        if (safeToRecycle) {
-          // Graceful deploy-staleness recycle via the existing clean close path
-          // (finally → closeQueueOwnerRuntime). The next prompt cold-respawns on
-          // current code, resuming WITH context. No new kill primitive.
+        const decision = await decideIdleOwnerRelease({
+          ttlMs,
+          hasActiveTurn: turnController.hasActiveTurn(),
+          now: Date.now(),
+          lastIdleDrainActivityAt,
+          lastTaskCompletedAt,
+          quiescenceWindowMs,
+          idleReleaseMs,
+          // Lazy: the deploy-file read happens only after the gate already holds,
+          // preserving the W13-24-10 short-circuit cost-ordering.
+          deployDiffers: deployedBuildDiffersFromOwner,
+        });
+        if (decision.release) {
+          // Diagnosable, NON-verbose-gated → owner.log (the RCA's "make the owner
+          // lifecycle diagnosable" recommendation; the TE asserts this line + its
+          // reason=). Safe to emit unconditionally: the owner's stderr is its own
+          // owner.log fd, never a --json-strict client's JSON-RPC stream.
+          process.stderr.write(
+            `[acpx] queue owner releasing session ${options.sessionId} (reason=${decision.reason}); next prompt cold-respawns with context\n`,
+          );
+          incrementPerfCounter(
+            decision.reason === "deploy-staleness"
+              ? "queue.owner.deploy_recycled"
+              : "queue.owner.idle_released",
+          );
+          // Graceful close via the existing clean path (finally →
+          // closeQueueOwnerRuntime). The next prompt cold-respawns, resuming WITH
+          // context. No new kill primitive.
           break;
         }
-        // Current code / busy / active / relaying background work → re-arm, stay warm.
+        // Current code & within the idle window, OR busy / active / relaying
+        // background work → re-arm, stay warm.
         continue;
       }
       isFirstTask = false;
@@ -732,6 +855,10 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       }
       // Restart idle drain to capture teammate activity until next prompt
       idleDrain = await startIdleStreamDrain();
+      // W13-24-14 Phase 2 — the owner just became idle: (re)start the
+      // accumulated-idle clock. Stamped at turn END (never turn start) so the
+      // clock measures idle duration — a 25-min turn leaves it at ~0 when it ends.
+      lastTaskCompletedAt = Date.now();
 
       // A failover this turn pinned the shared client to a now-stale transcript
       // anchor. Exit so the next prompt cold-spawns a fresh owner on the new

@@ -39,6 +39,28 @@ export function normalizeQueueOwnerTtlMs(ttlMs: number | undefined): number {
   return Math.round(ttlMs);
 }
 
+// W13-24-14 Phase 2 — memory-release idle timeout (ms). The accumulated-idle
+// threshold after which a provably-idle, provably-done owner is gracefully
+// released to free its ~287 MB; the next prompt cold-respawns WITH context
+// (reliable post Phase 1). Daniel's decided default is 30 min; tune per box via
+// the ACPX_OWNER_IDLE_RELEASE_MS env var (milliseconds). Mirrors the
+// DEFAULT_QUEUE_OWNER_TTL_MS / normalizeQueueOwnerTtlMs pair above.
+export const DEFAULT_OWNER_IDLE_RELEASE_MS = 1_800_000; // 30 min
+
+export function normalizeOwnerIdleReleaseMs(value: number | undefined): number {
+  if (value == null) {
+    return DEFAULT_OWNER_IDLE_RELEASE_MS;
+  }
+
+  if (!Number.isFinite(value) || value < 0) {
+    return DEFAULT_OWNER_IDLE_RELEASE_MS;
+  }
+
+  // 0 is a valid value: it disables ONLY the memory-release path (the
+  // deploy-staleness recycle still works). Invalid/negative/unset → default.
+  return Math.round(value);
+}
+
 export type RunOnceOptions = {
   agentCommand: string;
   agentName?: string;
