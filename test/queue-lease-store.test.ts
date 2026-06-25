@@ -204,7 +204,11 @@ test("readQueueOwnerStatus returns live owner details for a healthy owner", asyn
   });
 });
 
-test("ensureOwnerIsUsable cleans up stale live owners", async () => {
+test("ensureOwnerIsUsable never reaps a stale-but-alive owner (W13-24-10 North Star)", async () => {
+  // North Star: a stale heartbeat != a dead process. ensureOwnerIsUsable is inert
+  // dead code (no callers), but it must still honour the new predicate: a
+  // stale_owner is no longer recoverable, so cleanup never signals it and never
+  // removes its lease. The live owner survives.
   await withTempHome(async (homeDir) => {
     const sessionId = "stale-live-owner";
     const keeper = await startKeeperProcess();
@@ -225,8 +229,10 @@ test("ensureOwnerIsUsable cleans up stale live owners", async () => {
 
       const owner = await readQueueOwnerRecord(sessionId);
       assert(owner);
+      // Not "usable" by its legacy contract, but it must NOT be killed or cleared.
       assert.equal(await ensureOwnerIsUsable(sessionId, owner), false);
-      assert.equal(await readQueueOwnerRecord(sessionId), undefined);
+      assert.notEqual(await readQueueOwnerRecord(sessionId), undefined);
+      assert.equal(isProcessAlive(keeper.pid), true);
     } finally {
       stopProcess(keeper);
     }
@@ -472,8 +478,9 @@ test("readQueueOwnerLiveness reports liveness read-only and never reaps the leas
     const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
 
     try {
-      // Live pid but a stale heartbeat: readQueueOwnerStatus would terminate +
-      // remove this owner; readQueueOwnerLiveness must only report it.
+      // Live pid but a stale heartbeat. Post-W13-24-10 a stale_owner is alive and
+      // NOT recoverable: neither readQueueOwnerStatus nor readQueueOwnerLiveness
+      // ever reaps it. (readQueueOwnerLiveness has always been read-only.)
       await writeQueueOwnerLock({
         lockPath,
         pid: keeper.pid,
@@ -490,7 +497,8 @@ test("readQueueOwnerLiveness reports liveness read-only and never reaps the leas
       assert.equal(liveness.alive, true);
       assert.equal(liveness.stale, true);
       assert.equal(liveness.state, "stale_owner");
-      assert.equal(liveness.recoverable, true);
+      // North Star: a stale-but-alive owner is left running (recovery is manual).
+      assert.equal(liveness.recoverable, false);
       assert.equal(liveness.heartbeatAt, "2000-01-01T00:00:00.000Z");
 
       // The lease is still on disk (no reaping side effect) and the owner is alive.

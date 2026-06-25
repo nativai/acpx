@@ -6,6 +6,7 @@ import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import {
   MAX_MESSAGE_BUFFER_SIZE,
   SessionQueueOwner,
+  isProcessAlive,
   readQueueOwnerLiveness,
   releaseQueueOwnerLease,
   tryAcquireQueueOwnerLease,
@@ -849,5 +850,50 @@ test("trySubmitToRunningOwner clears dead post-restart owner lock before cold sp
 
     assert.equal(outcome, undefined);
     await assert.rejects(fs.access(lockPath));
+  });
+});
+
+// W13-24-10 #3 — the hot submit path: a new prompt to a stale-but-ALIVE owner must
+// NOT group-SIGKILL it (recoverRecoverableOwnerBeforeSubmit gates on `recoverable`,
+// now false for stale_owner). The submit proceeds to the live owner; if its socket
+// is unreachable the error propagates (user must manually recover) — but the owner
+// process and its lease SURVIVE. No autonomous kill of a live owner.
+test("W13-24-10 #3: submit to a stale-but-alive owner never kills it", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "submit-stale-alive-owner";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({
+      lockPath,
+      pid: keeper.pid,
+      sessionId,
+      socketPath,
+      heartbeatAt: "2000-01-01T00:00:00.000Z",
+    });
+
+    try {
+      const before = await readQueueOwnerLiveness(sessionId);
+      assert.equal(before.state, "stale_owner");
+      assert.equal(before.pidAlive, true);
+      assert.equal(before.recoverable, false);
+
+      // No server is listening on the socket, so the submit fails to deliver — but
+      // it must reach (and survive against) the live owner, never reap it.
+      await assert.rejects(
+        trySubmitToRunningOwner({
+          sessionId,
+          message: "hello stale-but-alive owner",
+          permissionMode: "approve-reads",
+          outputFormatter: NOOP_OUTPUT_FORMATTER,
+          waitForCompletion: true,
+        }),
+      );
+
+      assert.equal(isProcessAlive(keeper.pid), true, "submit must NOT kill the live owner");
+      await fs.access(lockPath); // lease preserved (no autonomous cleanup)
+    } finally {
+      stopProcess(keeper);
+      await fs.rm(lockPath, { force: true });
+    }
   });
 });

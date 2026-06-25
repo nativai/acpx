@@ -346,7 +346,14 @@ function classifyQueueOwnerState(inputs: QueueOwnerStateInputs): QueueOwnerState
 }
 
 function isRecoverableQueueOwnerState(state: QueueOwnerStateKind): boolean {
-  return state === "dead_owner" || state === "stale_owner" || state === "pid_reused";
+  // North Star: a stale heartbeat != a dead process; never auto-act on a live owner.
+  // Only a provably-gone owner is auto-cleanable: dead_owner (pid not alive) or
+  // pid_reused (the lease's pid is now a DIFFERENT process). A stale_owner is
+  // ALIVE (heartbeat merely lagged behind the 5s refresh) — it is left running;
+  // recovery is manual. This single predicate is the sole gate for all three
+  // stale-kill triggers (submit-path group-SIGKILL, status-read, lease-acquire),
+  // so dropping stale_owner here neutralises all three at once.
+  return state === "dead_owner" || state === "pid_reused";
 }
 
 async function queueOwnerStateFromRecord(
@@ -471,12 +478,12 @@ async function cleanupRecoverableQueueOwner(
     return false;
   }
 
-  if (state.state === "stale_owner" && canSignalQueueOwner(state)) {
-    await terminateProcess(owner.pid).catch(() => {
-      // best effort stale owner termination
-    });
-  }
-
+  // INVARIANT (North Star): cleanup NEVER signals a process. Only dead_owner /
+  // pid_reused reach here (isRecoverableQueueOwnerState), and canSignalQueueOwner
+  // is false for BOTH (dead pid / identity mismatch), so no live process is ever
+  // signalled. We only remove the orphan lease + socket so the next prompt can
+  // cold-spawn a fresh owner. A stale-but-alive owner is no longer recoverable,
+  // so it is never torn down here.
   await cleanupStaleQueueOwner(sessionId, owner);
   return true;
 }
