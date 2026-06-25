@@ -14,7 +14,7 @@ import { resetSessionPrimerMemoForTests, resolveSessionPrimer } from "../src/acp
 // resume for the system-prompt channels only (codex restores from thread).
 
 const SDK_CLAUDE_COMMAND = "node /opt/claude-agent-acp/dist/index.js";
-const CLAUDE_PTY_COMMAND = "node /opt/claude-pty-acp/acp-server-transcript.mjs";
+const CLAUDE_PTY_COMMAND = "node /opt/claude-pty-acp/dist/index.js";
 const CODEX_COMMAND = "node /opt/codex-acp/dist/index.js";
 const UNKNOWN_COMMAND = "node ./test/mock-agent.js";
 

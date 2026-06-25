@@ -605,7 +605,7 @@ test("mid-turn prompt injection fires and settles exactly once, including across
 test("claude-pty bridge session opts into mid-turn injection and routes a mid-turn task through the handler", async () => {
   await withNoUnhandledRejections(async () => {
     await withTempHome(async (homeDir) => {
-      const bridgeCommand = "node /opt/claude-pty-acp/acp-server-transcript.mjs";
+      const bridgeCommand = "node /opt/claude-pty-acp/dist/index.js";
       const record = makeSessionRecord(homeDir, bridgeCommand);
       await writeSessionRecordFile(homeDir, record);
 

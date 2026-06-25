@@ -13,12 +13,9 @@ test("supportsMidTurnPromptInjection accepts Claude ACP and Codex ACP commands",
 });
 
 test("supportsMidTurnPromptInjection accepts the claude-pty bridge command", () => {
-  // The bootstrapped default and dev-override forms of the bridge command both
+  // The bootstrapped built default and dev-override forms of the bridge command both
   // support native mid-turn steering, so injection must be enabled for them.
-  assert.equal(
-    supportsMidTurnPromptInjection("node /opt/claude-pty-acp/acp-server-transcript.mjs"),
-    true,
-  );
+  assert.equal(supportsMidTurnPromptInjection("node /opt/claude-pty-acp/dist/index.js"), true);
   assert.equal(
     supportsMidTurnPromptInjection(
       "node /workspace/projects/claude-pty-acp/main/acp-server-transcript.mjs",

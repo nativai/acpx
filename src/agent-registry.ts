@@ -42,10 +42,9 @@ export const AGENT_REGISTRY: Record<string, string> = {
   gemini: "gemini --acp",
   cursor: "cursor-agent acp",
   copilot: "copilot --acp --stdio",
-  // Same /opt-fork env-seam pattern as claude/codex (Block G); alphabetical-tail
+  // Same built /opt-fork env-seam pattern as claude/codex; alphabetical-tail
   // position per the listBuiltInAgents ordering convention.
-  "claude-pty":
-    process.env.ACPX_CLAUDE_PTY_ACP_COMMAND || `node /opt/claude-pty-acp/acp-server-transcript.mjs`,
+  "claude-pty": process.env.ACPX_CLAUDE_PTY_ACP_COMMAND || `node /opt/claude-pty-acp/dist/index.js`,
   droid: "droid exec --output-format acp",
   iflow: "iflow --experimental-acp",
   kilocode: "npx -y @kilocode/cli acp",
@@ -60,7 +59,7 @@ export const AGENT_REGISTRY: Record<string, string> = {
 // `claude`, `codex`, and `claude-pty` are intentionally absent here. Their
 // AGENT_REGISTRY entries point at the container-built forks
 // (`node /opt/claude-agent-acp/dist/index.js`, `node /opt/codex-acp/dist/index.js`,
-// `node /opt/claude-pty-acp/acp-server-transcript.mjs`); with no built-in-package spec,
+// `node /opt/claude-pty-acp/dist/index.js`); with no built-in-package spec,
 // findBuiltInAgentPackage() returns undefined for those commands, both resolvers
 // bail, and the client spawns the /opt command verbatim. Adding a spec whose
 // fallbackCommand equals the /opt command would make resolveInstalledBuiltInAgentLaunch
