@@ -52,11 +52,26 @@ import {
   runSessionSetModeDirect,
   type ActiveSessionController,
 } from "./prompt-runner.js";
-import type { QueueOwnerRuntimeOptions } from "./queue-owner-process.js";
-import { queueOwnerRuntimeOptionsFromSend, spawnQueueOwnerProcess } from "./queue-owner-process.js";
+import type {
+  OwnerExitInfo,
+  QueueOwnerRuntimeOptions,
+  SpawnedQueueOwner,
+} from "./queue-owner-process.js";
+import {
+  queueOwnerRuntimeOptionsFromSend,
+  readQueueOwnerStartupFailureDetail,
+  spawnQueueOwnerProcess,
+} from "./queue-owner-process.js";
 import { runQueuedTask } from "./runtime.js";
 
+// Overall connect-poll budget for a cold-respawn owner startup (× 50 ms ≈ 6 s).
+// Shared across all re-spawn attempts so the worst-case latency stays at the
+// historical ~6 s bound rather than ballooning to a multiple of it.
 const QUEUE_OWNER_STARTUP_MAX_ATTEMPTS = 120;
+// Bounded re-spawns within that budget. A transient single-owner startup failure
+// (owner dies before lock+listen) must self-heal within ONE message; a persistent
+// one must still fail fast (W13-24-14 / RCA §3.5). One spawn + up to two re-spawns.
+const QUEUE_OWNER_MAX_SPAWN_ATTEMPTS = 3;
 const QUEUE_OWNER_HEARTBEAT_INTERVAL_MS = 5_000;
 
 // Path-1 deploy-staleness signal (W13-24-10). The default deployed-SHA record on
@@ -744,6 +759,142 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   }
 }
 
+// Injection seam for the cold-respawn startup loop. Production binds the real
+// primitives (the defaults below); the queue-owner tests substitute deterministic
+// fakes so the bounded re-spawn / fail-fast / exit-reason behaviour is exercised
+// without real owner processes. The real spawn + exit-detection primitive is
+// proven separately (queue-owner-process tests) and end-to-end by the
+// reproduce-first selftest, so faking it here is not "mocking the spawn path"
+// for the proof — it isolates the orchestration. (W13-24-14.)
+export type SendSessionRuntimeDeps = {
+  submitToRunningOwner: (
+    options: SessionSendOptions,
+    waitForCompletion: boolean,
+  ) => Promise<SessionSendOutcome | undefined>;
+  spawnQueueOwnerProcess: (options: QueueOwnerRuntimeOptions) => SpawnedQueueOwner;
+  waitMs: (ms: number) => Promise<void>;
+  readStartupFailureDetail: (sessionId: string) => string | undefined;
+  maxPollAttempts: number;
+  maxSpawnAttempts: number;
+};
+
+const defaultSendSessionRuntimeDeps: SendSessionRuntimeDeps = {
+  submitToRunningOwner,
+  spawnQueueOwnerProcess,
+  waitMs,
+  readStartupFailureDetail: readQueueOwnerStartupFailureDetail,
+  maxPollAttempts: QUEUE_OWNER_STARTUP_MAX_ATTEMPTS,
+  maxSpawnAttempts: QUEUE_OWNER_MAX_SPAWN_ATTEMPTS,
+};
+
+function describeOwnerExit(exit: OwnerExitInfo): string {
+  if (exit.signal !== null) {
+    return `killed by signal ${exit.signal}`;
+  }
+  if (exit.code !== null) {
+    return `exit code ${exit.code}`;
+  }
+  return "exit reason unavailable";
+}
+
+function logQueueOwnerStartupRespawn(params: {
+  sessionId: string;
+  exit: OwnerExitInfo;
+  nextAttempt: number;
+  maxSpawnAttempts: number;
+  verbose?: boolean;
+}): void {
+  if (!params.verbose) {
+    return;
+  }
+  process.stderr.write(
+    `[acpx] queue owner for session ${params.sessionId} died on startup ` +
+      `(${describeOwnerExit(params.exit)}); re-spawning ` +
+      `(attempt ${params.nextAttempt}/${params.maxSpawnAttempts})\n`,
+  );
+}
+
+function formatOwnerStartFailure(
+  sessionId: string,
+  exit: OwnerExitInfo | undefined,
+  spawnsUsed: number,
+  detail: string | undefined,
+): string {
+  const base = `Session queue owner failed to start for session ${sessionId}`;
+  if (!exit) {
+    // No owner exit was observed within the budget — the owner is alive but never
+    // became submittable (hung start). A re-spawn would only defer on its lease,
+    // so there is nothing diagnostic to add beyond the spawn count.
+    return `${base} after ${spawnsUsed} spawn attempt(s)`;
+  }
+  const reasonSuffix = detail ? `: ${detail}` : "";
+  return (
+    `${base} after ${spawnsUsed} spawn attempt(s) ` +
+    `(owner process died on startup: ${describeOwnerExit(exit)}${reasonSuffix})`
+  );
+}
+
+// Cold-respawn startup: spawn a queue owner and wait for it to become
+// submittable, re-spawning a fresh owner (bounded) whenever the spawned one dies
+// before it can create its lock + listen. This is the W13-24-14 fix: a transient
+// single-owner startup hiccup self-heals within ONE message instead of surfacing
+// "failed to start", while a persistent failure still fails fast and now carries
+// the owner's exit code/reason. Extracted from `sendSession` so the orchestration
+// is unit-testable via `deps` without real owner processes.
+export async function spawnAndAwaitQueueOwner(
+  effectiveOptions: SessionSendOptions,
+  deps: SendSessionRuntimeDeps = defaultSendSessionRuntimeDeps,
+): Promise<SessionSendOutcome> {
+  const waitForCompletion = effectiveOptions.waitForCompletion !== false;
+  const sessionId = effectiveOptions.sessionId;
+  const runtimeOptions = queueOwnerRuntimeOptionsFromSend(effectiveOptions);
+
+  let spawned = deps.spawnQueueOwnerProcess(runtimeOptions);
+  let spawnsUsed = 1;
+  let lastExit: OwnerExitInfo | undefined;
+  try {
+    for (let attempt = 0; attempt < deps.maxPollAttempts; attempt += 1) {
+      const queued = await deps.submitToRunningOwner(effectiveOptions, waitForCompletion);
+      if (queued) {
+        return queued;
+      }
+
+      const exit = spawned.exit;
+      if (exit) {
+        // The spawned owner died before becoming submittable. Re-spawn a fresh
+        // one (within the shared poll budget) so a transient hiccup self-heals;
+        // once the bounded attempts are spent, fail fast rather than polling a
+        // corpse for the remaining budget.
+        lastExit = exit;
+        if (spawnsUsed >= deps.maxSpawnAttempts) {
+          break;
+        }
+        spawned.dispose();
+        logQueueOwnerStartupRespawn({
+          sessionId,
+          exit,
+          nextAttempt: spawnsUsed + 1,
+          maxSpawnAttempts: deps.maxSpawnAttempts,
+          verbose: effectiveOptions.verbose,
+        });
+        spawned = deps.spawnQueueOwnerProcess(runtimeOptions);
+        spawnsUsed += 1;
+        continue;
+      }
+
+      await deps.waitMs(QUEUE_CONNECT_RETRY_MS);
+    }
+  } finally {
+    spawned.dispose();
+  }
+
+  // Surface the owner's death reason (RCA §3.5 observability gap): the exit
+  // code/signal is the reliable signal, enriched best-effort with the failure
+  // line the dead owner left in its owner.log.
+  const detail = lastExit ? deps.readStartupFailureDetail(sessionId) : undefined;
+  throw new Error(formatOwnerStartFailure(sessionId, lastExit, spawnsUsed, detail));
+}
+
 export async function sendSession(options: SessionSendOptions): Promise<SessionSendOutcome> {
   const waitForCompletion = options.waitForCompletion !== false;
   const effectiveOptions = await resolveAndPersistSendOwnerOptions(options);
@@ -753,17 +904,7 @@ export async function sendSession(options: SessionSendOptions): Promise<SessionS
     return queuedToOwner;
   }
 
-  spawnQueueOwnerProcess(queueOwnerRuntimeOptionsFromSend(effectiveOptions));
-
-  for (let attempt = 0; attempt < QUEUE_OWNER_STARTUP_MAX_ATTEMPTS; attempt += 1) {
-    const queued = await submitToRunningOwner(effectiveOptions, waitForCompletion);
-    if (queued) {
-      return queued;
-    }
-    await waitMs(QUEUE_CONNECT_RETRY_MS);
-  }
-
-  throw new Error(`Session queue owner failed to start for session ${options.sessionId}`);
+  return await spawnAndAwaitQueueOwner(effectiveOptions);
 }
 
 async function resolveAndPersistSendOwnerOptions(

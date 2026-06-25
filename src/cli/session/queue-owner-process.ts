@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { closeSync, mkdirSync, openSync, realpathSync, statSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { SessionAgentOptions } from "../../runtime/engine/session-options.js";
@@ -24,6 +24,26 @@ export type QueueOwnerRuntimeOptions = {
   maxQueueDepth?: number;
   promptRetries?: number;
   sessionOptions?: SessionAgentOptions;
+};
+
+// How a spawned queue-owner process terminated, captured by the parent so a
+// dead-on-arrival owner is diagnosable (W13-24-14). `signal` wins when the
+// process was killed; otherwise `code` carries the exit status.
+export type OwnerExitInfo = {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+};
+
+// Handle over a spawned queue owner. `exit` flips from `undefined` to the
+// captured exit the instant the (detached) child terminates while the parent is
+// still watching — this is how `sendSession` detects an owner that died before
+// it could create its lock + listen, so it can re-spawn instead of polling out
+// the whole startup budget against a corpse.
+export type SpawnedQueueOwner = {
+  readonly exit: OwnerExitInfo | undefined;
+  // Stop watching the child's exit/error. Idempotent; call once the owner is
+  // confirmed up (or after the final spawn attempt) so the listener is released.
+  dispose(): void;
 };
 
 type SessionSendLike = {
@@ -224,7 +244,7 @@ export function buildQueueOwnerSpawnOptions(
   };
 }
 
-export function spawnQueueOwnerProcess(options: QueueOwnerRuntimeOptions): void {
+export function spawnQueueOwnerProcess(options: QueueOwnerRuntimeOptions): SpawnedQueueOwner {
   const payload = JSON.stringify(options);
   const logFd = openQueueOwnerLogFd(options.sessionId);
   const child = spawn(
@@ -240,5 +260,87 @@ export function spawnQueueOwnerProcess(options: QueueOwnerRuntimeOptions): void 
       // already closed
     }
   }
+
+  // Watch for a premature exit. The child is detached + unref()'d (it must
+  // outlive us on a healthy start), but we keep a listener so `sendSession` can
+  // see a dead-on-arrival owner and re-spawn. unref() means a lingering listener
+  // never keeps THIS process alive past its own work, and on a healthy start the
+  // listener simply never fires (the owner runs until idle-recycle).
+  let exit: OwnerExitInfo | undefined;
+  const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+    exit = { code, signal };
+  };
+  const onError = (): void => {
+    // spawn/runtime error before an exit was reported — still treat the owner as
+    // failed-to-start so the caller re-spawns rather than waiting on a ghost.
+    if (exit === undefined) {
+      exit = { code: null, signal: null };
+    }
+  };
+  child.once("exit", onExit);
+  child.once("error", onError);
   child.unref();
+
+  return {
+    get exit() {
+      return exit;
+    },
+    dispose() {
+      child.removeListener("exit", onExit);
+      child.removeListener("error", onError);
+    },
+  };
+}
+
+// Cap how much of the tail of the owner log we scan for a failure reason.
+const OWNER_LOG_TAIL_SCAN_BYTES = 8 * 1024;
+// Cap the surfaced reason so a runaway line can't bloat the thrown error.
+const OWNER_LOG_REASON_MAX_CHARS = 300;
+
+// Best-effort: recover the human-readable reason a queue owner died on startup
+// from the tail of its per-session owner log (`~/.acpx/sessions/<id>.owner.log`,
+// where `handleQueueOwnerCommand` writes `[acpx] queue owner failed: <reason>`).
+// Turns a bare "exit code 1" into the actual cause (e.g. the EISDIR that blocked
+// the lock) so the next occurrence is diagnosable rather than inferred
+// (W13-24-14 / RCA §3.5 observability gap). Returns undefined when nothing
+// useful is on disk — the owner may die before writing, so callers MUST keep the
+// exit code as the reliable primary signal. Mirrors `openQueueOwnerLogFd`'s bare
+// homedir() path (the log is intentionally not state-home-isolated).
+export function readQueueOwnerStartupFailureDetail(sessionId: string): string | undefined {
+  let fd: number | null = null;
+  try {
+    const logPath = join(homedir(), ".acpx", "sessions", `${sessionId}.owner.log`);
+    const size = statSync(logPath).size;
+    if (size === 0) {
+      return undefined;
+    }
+    const start = Math.max(0, size - OWNER_LOG_TAIL_SCAN_BYTES);
+    const length = size - start;
+    const buffer = Buffer.allocUnsafe(length);
+    fd = openSync(logPath, "r");
+    readSync(fd, buffer, 0, length, start);
+    const lines = buffer
+      .toString("utf8")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    if (lines.length === 0) {
+      return undefined;
+    }
+    // Prefer the most recent explicit owner-failure line; fall back to the last
+    // line written (still the freshest crash output across re-spawns).
+    const failureLine = [...lines].toReversed().find((line) => line.includes("queue owner failed:"));
+    const chosen = failureLine ?? lines[lines.length - 1];
+    return chosen.slice(0, OWNER_LOG_REASON_MAX_CHARS);
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // already closed
+      }
+    }
+  }
 }
