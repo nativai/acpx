@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { AcpClient } from "../../acp/client.js";
 import { formatErrorMessage } from "../../acp/error-normalization.js";
@@ -57,6 +58,52 @@ import { runQueuedTask } from "./runtime.js";
 
 const QUEUE_OWNER_STARTUP_MAX_ATTEMPTS = 120;
 const QUEUE_OWNER_HEARTBEAT_INTERVAL_MS = 5_000;
+
+// Path-1 deploy-staleness signal (W13-24-10). The default deployed-SHA record on
+// every dev-server; `refresh.sh` rewrites `.acpx.sha` here on every deploy.
+const DEFAULT_DEPLOY_VERSION_FILE = "/workspace/.runtime/info.json";
+
+// Primary signal: the dev-server deploy record's `.acpx.sha` (path from
+// `ACPX_DEPLOY_VERSION_FILE`, else the default above). refresh.sh rewrites it.
+function readDeployRecordSha(): string | undefined {
+  const infoPath = process.env.ACPX_DEPLOY_VERSION_FILE || DEFAULT_DEPLOY_VERSION_FILE;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(infoPath, "utf8")) as { acpx?: { sha?: unknown } };
+    const sha = parsed?.acpx?.sha;
+    return typeof sha === "string" && sha.length > 0 ? sha : undefined;
+  } catch {
+    // Absent / unparseable / no `.acpx.sha`.
+    return undefined;
+  }
+}
+
+// Fallback signal: a content hash of the acpx CLI entry point on disk
+// ("has my own code-on-disk changed since I started?").
+function readEntryPointHash(): string | undefined {
+  const entryPoint = process.argv[1];
+  if (typeof entryPoint !== "string" || entryPoint.length === 0) {
+    return undefined;
+  }
+  try {
+    return createHash("sha1").update(fs.readFileSync(entryPoint)).digest("hex");
+  } catch {
+    return undefined;
+  }
+}
+
+// Resolve a build token identifying the code generation the owner is running.
+// Used purely to detect a deploy-staleness recycle — NEVER a liveness signal.
+// Safe default (North Star): if NEITHER signal resolves (e.g. acpx is not on a
+// dev-server), return `undefined` so the owner never staleness-recycles and stays
+// warm forever. Errs toward never tearing down a live owner.
+function readDeployedBuildToken(): string | undefined {
+  const sha = readDeployRecordSha();
+  if (sha !== undefined) {
+    return `info:${sha}`;
+  }
+  const hash = readEntryPointHash();
+  return hash !== undefined ? `entry:${hash}` : undefined;
+}
 
 async function submitToRunningOwner(
   options: SessionSendOptions,
@@ -294,6 +341,11 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   // the owner (exit the loop, release the lease) after the current turn; the
   // next prompt cold-spawns a fresh owner on the new dir.
   let recycleOwnerAfterTask = false;
+  // Wall-clock of the most recent inter-turn idle-drain activity (background
+  // session/update relay of teammate/sub-agent work). 0 = no activity since
+  // spawn. Stamped in the idle-drain onAcpMessage handler; read by the idle
+  // loop's quiescence gate so a continuously-relaying owner is NEVER recycled.
+  let lastIdleDrainActivityAt = 0;
   const sharedClient = createQueueOwnerSharedClient(options, sessionRecord);
   const ttlMs = normalizeQueueOwnerTtlMs(options.ttlMs);
   const maxQueueDepth = Math.max(1, Math.round(options.maxQueueDepth ?? 16));
@@ -301,6 +353,24 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   const initialTaskPollTimeoutMs =
     defaultTaskPollTimeoutMs == null ? undefined : Math.max(defaultTaskPollTimeoutMs, 1_000);
   const turnController = createQueueOwnerTurnController(options);
+
+  // Deploy-staleness signal (Path 1, W13-24-10). Capture the owner's build token
+  // at spawn; re-read it at each idle check. A difference means a deploy happened
+  // while this owner was alive (it is running OUTDATED code) — the ONLY condition
+  // under which a quiet, current-code owner may be recycled. Never a liveness check.
+  const ownerBuildToken = readDeployedBuildToken();
+  const deployedBuildDiffersFromOwner = async (): Promise<boolean> => {
+    // Safe default (North Star): no resolvable signal at spawn OR now → never
+    // recycle, stay warm. We only recycle on a positive build difference.
+    if (ownerBuildToken === undefined) {
+      return false;
+    }
+    const current = readDeployedBuildToken();
+    if (current === undefined) {
+      return false;
+    }
+    return current !== ownerBuildToken;
+  };
 
   const applyPendingCancel = async (): Promise<boolean> => {
     return await turnController.applyPendingCancel();
@@ -466,6 +536,9 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           if (!active) {
             return;
           }
+          // Stamp inter-turn activity so the idle loop's quiescence gate keeps a
+          // quietly-relaying owner warm (never recycles it mid background work).
+          lastIdleDrainActivityAt = Date.now();
           pendingIdle.push(message);
 
           const msg = message as Record<string, unknown>;
@@ -554,7 +627,34 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       const pollTimeoutMs = isFirstTask ? initialTaskPollTimeoutMs : defaultTaskPollTimeoutMs;
       const task = await owner.nextTask(pollTimeoutMs);
       if (!task) {
-        break;
+        // A full idle window elapsed; subsequent waits use the steady cadence.
+        isFirstTask = false;
+        // No new prompt arrived within the idle-check window. Per the North Star
+        // we do NOT reap a live owner for being quiet — the idle window is a
+        // deploy-staleness CHECK, never a liveness reap. Recycle ONLY when ALL of:
+        //   1. TTL is not disabled (`--ttl 0` means never-recycle).
+        //   2. No turn is active — the reliable local turn state, NEVER `inFlight`.
+        //   3. Quiescent — no inter-turn idle-drain activity within one check
+        //      cadence, so we never tear down an owner relaying background work.
+        //   4. The deployed build differs from the owner's — it is running
+        //      OUTDATED code (a deploy happened). A current-code owner re-arms
+        //      and stays warm forever.
+        // When ttl 0, `nextTask` never times out (no task ⇒ keeps waiting), so
+        // this branch is unreachable; the `ttlMs !== 0` guard is belt-and-suspenders.
+        const quiescenceWindowMs = pollTimeoutMs ?? 0;
+        const safeToRecycle =
+          ttlMs !== 0 &&
+          !turnController.hasActiveTurn() &&
+          Date.now() - lastIdleDrainActivityAt >= quiescenceWindowMs &&
+          (await deployedBuildDiffersFromOwner());
+        if (safeToRecycle) {
+          // Graceful deploy-staleness recycle via the existing clean close path
+          // (finally → closeQueueOwnerRuntime). The next prompt cold-respawns on
+          // current code, resuming WITH context. No new kill primitive.
+          break;
+        }
+        // Current code / busy / active / relaying background work → re-arm, stay warm.
+        continue;
       }
       isFirstTask = false;
 

@@ -3806,6 +3806,142 @@ test("integration: sessions recover force-kills the queue owner, is idempotent, 
   });
 });
 
+test("integration: Path-1 current-code owner stays warm; recycles only on a deploy-version change (W13-24-10 #6)", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const versionFile = path.join(homeDir, "deploy-info.json");
+    // Deploy-version signal: refresh.sh rewrites .acpx.sha on every deploy.
+    await fs.writeFile(versionFile, JSON.stringify({ acpx: { sha: "build-A" } }), "utf8");
+    const env = { ACPX_DEPLOY_VERSION_FILE: versionFile };
+
+    try {
+      const created = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+        homeDir,
+        { env },
+      );
+      assert.equal(created.code, 0, created.stderr);
+      const sessionId = (JSON.parse(created.stdout.trim()) as { acpxRecordId?: string })
+        .acpxRecordId;
+      assert.equal(typeof sessionId, "string");
+
+      // Short idle-check cadence (2s) so we needn't wait the 15-min default.
+      const queued = await runCli(
+        [...baseAgentArgs(cwd), "--format", "quiet", "--ttl", "2", "prompt", "echo warm-a"],
+        homeDir,
+        { env },
+      );
+      assert.equal(queued.code, 0, queued.stderr);
+      assert.match(queued.stdout, /warm-a/);
+
+      const { lockPath } = queuePaths(homeDir, sessionId as string);
+      const ownerPid = await waitFor(async () => {
+        try {
+          const pid = (JSON.parse(await fs.readFile(lockPath, "utf8")) as { pid?: number }).pid;
+          return typeof pid === "number" && isPidAlive(pid) ? pid : null;
+        } catch {
+          return null;
+        }
+      }, 10_000);
+
+      // (a) Current code, version unchanged: the idle owner re-arms across several
+      // idle-check intervals (~3.5 cadences) and NEVER self-exits for being quiet.
+      await sleep(7_000);
+      assert.equal(isPidAlive(ownerPid), true, "current-code idle owner must stay warm");
+
+      const statusWarm = await runCli(
+        [...baseAgentArgs(cwd), "sessions", "owner-status", sessionId as string],
+        homeDir,
+        { env },
+      );
+      const warm = JSON.parse(statusWarm.stdout.trim()) as { alive?: boolean; pid?: number };
+      assert.equal(warm.alive, true);
+      assert.equal(warm.pid, ownerPid);
+
+      // (b) Flip the deploy version → on the next idle check the owner is running
+      // OUTDATED code, so it gracefully recycles (clean close, lease released).
+      await fs.writeFile(versionFile, JSON.stringify({ acpx: { sha: "build-B" } }), "utf8");
+      assert.equal(
+        await waitForPidExit(ownerPid, 12_000),
+        true,
+        "an outdated-code idle owner must gracefully recycle after a deploy",
+      );
+
+      const statusAfter = await runCli(
+        [...baseAgentArgs(cwd), "sessions", "owner-status", sessionId as string],
+        homeDir,
+        { env },
+      );
+      const after = JSON.parse(statusAfter.stdout.trim()) as { ownerFound?: boolean };
+      assert.equal(after.ownerFound, false);
+
+      // (c) The next prompt cold-respawns on build-B and runs the turn.
+      const reprompt = await runCli(
+        [...baseAgentArgs(cwd), "--format", "quiet", "--ttl", "2", "prompt", "echo warm-b"],
+        homeDir,
+        { env },
+      );
+      assert.equal(reprompt.code, 0, reprompt.stderr);
+      assert.match(reprompt.stdout, /warm-b/);
+    } finally {
+      await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "close"], homeDir, {
+        env,
+      }).catch(() => {});
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: Path-1 --ttl 0 never recycles even when the deploy version changes (W13-24-10 #6)", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const versionFile = path.join(homeDir, "deploy-info.json");
+    await fs.writeFile(versionFile, JSON.stringify({ acpx: { sha: "build-A" } }), "utf8");
+    const env = { ACPX_DEPLOY_VERSION_FILE: versionFile };
+
+    try {
+      const created = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+        homeDir,
+        { env },
+      );
+      assert.equal(created.code, 0, created.stderr);
+      const sessionId = (JSON.parse(created.stdout.trim()) as { acpxRecordId?: string })
+        .acpxRecordId;
+
+      // --ttl 0 = "keep alive forever": nextTask never times out, so the idle-check
+      // branch is unreachable and a version change can never trigger a recycle.
+      const queued = await runCli(
+        [...baseAgentArgs(cwd), "--format", "quiet", "--ttl", "0", "prompt", "echo ttl-zero"],
+        homeDir,
+        { env },
+      );
+      assert.equal(queued.code, 0, queued.stderr);
+      assert.match(queued.stdout, /ttl-zero/);
+
+      const { lockPath } = queuePaths(homeDir, sessionId as string);
+      const ownerPid = await waitFor(async () => {
+        try {
+          const pid = (JSON.parse(await fs.readFile(lockPath, "utf8")) as { pid?: number }).pid;
+          return typeof pid === "number" && isPidAlive(pid) ? pid : null;
+        } catch {
+          return null;
+        }
+      }, 10_000);
+
+      // Flip the version and wait well past any plausible cadence; the owner must persist.
+      await fs.writeFile(versionFile, JSON.stringify({ acpx: { sha: "build-B" } }), "utf8");
+      await sleep(6_000);
+      assert.equal(isPidAlive(ownerPid), true, "--ttl 0 owner must never recycle");
+    } finally {
+      await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "close"], homeDir, {
+        env,
+      }).catch(() => {});
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: sessions owner-status --all scans open sessions read-only", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
@@ -4262,12 +4398,19 @@ test("integration: sessions close stays closed after live checkpoints", async ()
 test("integration: session remains resumable after queue owner exits and agent has exited", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    // W13-24-10: a current-code owner no longer idle-reaps. Drive a ROUTINE owner
+    // shutdown via the deploy-version recycle (the new clean-exit path) and assert
+    // the session stays resumable — the same invariant, the new shutdown trigger.
+    const versionFile = path.join(homeDir, "deploy-info.json");
+    await fs.writeFile(versionFile, JSON.stringify({ acpx: { sha: "build-A" } }), "utf8");
+    const env = { ACPX_DEPLOY_VERSION_FILE: versionFile };
 
     try {
       // 1. Create a persistent session
       const created = await runCli(
         [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
         homeDir,
+        { env },
       );
       assert.equal(created.code, 0, created.stderr);
       const createdPayload = JSON.parse(created.stdout.trim()) as {
@@ -4276,29 +4419,28 @@ test("integration: session remains resumable after queue owner exits and agent h
       const sessionId = createdPayload.acpxRecordId;
       assert.equal(typeof sessionId, "string");
 
-      // 2. Send a prompt with a very short TTL so the queue owner exits quickly
+      // 2. Send a prompt with a short idle-check cadence so the recycle check runs often.
       const prompt = await runCli(
         [...baseAgentArgs(cwd), "--format", "quiet", "--ttl", "1", "prompt", "echo oneshot-done"],
         homeDir,
+        { env },
       );
       assert.equal(prompt.code, 0, prompt.stderr);
       assert.match(prompt.stdout, /oneshot-done/);
 
-      // 3. Wait for the queue owner to exit (it should exit after 1s TTL)
+      // 3. Read the owner pid, then simulate a deploy so the idle owner gracefully
+      //    recycles (clean close path) on its next idle check.
       const { lockPath } = queuePaths(homeDir, sessionId as string);
-      let ownerPid: number | undefined;
-      try {
-        const lockPayload = JSON.parse(await fs.readFile(lockPath, "utf8")) as {
-          pid?: number;
-        };
-        ownerPid = lockPayload.pid;
-      } catch {
-        // lock file may already be gone
-      }
-
-      if (typeof ownerPid === "number") {
-        assert.equal(await waitForPidExit(ownerPid, 10_000), true, "queue owner did not exit");
-      }
+      const ownerPid = await waitFor(async () => {
+        try {
+          const pid = (JSON.parse(await fs.readFile(lockPath, "utf8")) as { pid?: number }).pid;
+          return typeof pid === "number" && isPidAlive(pid) ? pid : null;
+        } catch {
+          return null;
+        }
+      }, 10_000);
+      await fs.writeFile(versionFile, JSON.stringify({ acpx: { sha: "build-B" } }), "utf8");
+      assert.equal(await waitForPidExit(ownerPid, 12_000), true, "queue owner did not exit");
 
       // Give a moment for final writes
       await sleep(500);
