@@ -1983,6 +1983,237 @@ test("sessions new maps inherited effort to the child model's advertised levels"
   });
 });
 
+async function setupCredentialInheritanceFixture(homeDir: string): Promise<{
+  cwd: string;
+  claudeCommand: string;
+  codexCommand: string;
+}> {
+  const cwd = path.join(homeDir, "workspace");
+  const subscriptionsRoot = path.join(homeDir, ".acpx", "subscriptions");
+  const codexHome = path.join(homeDir, ".codex");
+  const binDir = path.join(homeDir, "bin");
+  const codexCommand = path.join(binDir, "codex-acp");
+  const claudeCommand = MOCK_AGENT_COMMAND;
+
+  await fs.mkdir(cwd, { recursive: true });
+  await fs.mkdir(path.join(subscriptionsRoot, "sub1"), { recursive: true });
+  await fs.mkdir(path.join(subscriptionsRoot, "sub2"), { recursive: true });
+  await fs.mkdir(codexHome, { recursive: true });
+  await fs.mkdir(binDir, { recursive: true });
+  await fs.writeFile(
+    codexCommand,
+    `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(MOCK_AGENT_PATH)} "$@"\n`,
+    { mode: 0o755 },
+  );
+  await fs.chmod(codexCommand, 0o755);
+
+  await fs.writeFile(
+    path.join(subscriptionsRoot, "registry.json"),
+    `${JSON.stringify(
+      {
+        version: 3,
+        default: "sub1",
+        profiles: [
+          {
+            id: "sub1",
+            label: "Sub 1",
+            authMode: "subscription",
+            adapter: "claude",
+            account: "acct-a",
+            credentialSource: path.join(subscriptionsRoot, "sub1"),
+          },
+          {
+            id: "sub2",
+            label: "Sub 2",
+            authMode: "subscription",
+            adapter: "claude",
+            account: "acct-b",
+            credentialSource: path.join(subscriptionsRoot, "sub2"),
+          },
+          {
+            id: "chatgpt",
+            label: "ChatGPT Codex",
+            authMode: "chatgpt",
+            adapter: "codex",
+            codexHome,
+            credentialSource: null,
+          },
+        ],
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+  await fs.writeFile(
+    path.join(homeDir, ".acpx", "config.json"),
+    `${JSON.stringify(
+      {
+        agents: {
+          claude: { command: claudeCommand },
+          codex: { command: codexCommand },
+        },
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+
+  return { cwd, claudeCommand, codexCommand };
+}
+
+async function writeClaudeParentWithProfile(
+  homeDir: string,
+  params: {
+    cwd: string;
+    claudeCommand: string;
+    profile: string;
+    id?: string;
+  },
+): Promise<string> {
+  const id = params.id ?? "claude-parent-sub2";
+  await writeSessionRecord(homeDir, {
+    acpxRecordId: id,
+    acpSessionId: id,
+    agentCommand: params.claudeCommand,
+    cwd: params.cwd,
+    acpx: {
+      session_options: {
+        profile: params.profile,
+      },
+    },
+  });
+  return id;
+}
+
+async function createChildAndReadRecord(
+  homeDir: string,
+  args: string[],
+): Promise<Record<string, unknown>> {
+  const result = await runCli(args, homeDir, { timeoutMs: 8_000 });
+  assert.equal(result.code, 0, result.stderr);
+  const payload = JSON.parse(result.stdout.trim()) as { acpxRecordId?: unknown };
+  assert.equal(typeof payload.acpxRecordId, "string");
+  return JSON.parse(
+    await fs.readFile(sessionFilePath(homeDir, payload.acpxRecordId as string), "utf8"),
+  ) as Record<string, unknown>;
+}
+
+function sessionOptionsFromRecord(record: Record<string, unknown>): Record<string, unknown> {
+  const acpx = record.acpx as { session_options?: Record<string, unknown> } | undefined;
+  return acpx?.session_options ?? {};
+}
+
+test("codex child of claude parent does not inherit parent profile", async () => {
+  await withTempHome(async (homeDir) => {
+    const { cwd, claudeCommand, codexCommand } = await setupCredentialInheritanceFixture(homeDir);
+    const parentId = await writeClaudeParentWithProfile(homeDir, {
+      cwd,
+      claudeCommand,
+      profile: "sub2",
+    });
+
+    const stored = await createChildAndReadRecord(homeDir, [
+      "--cwd",
+      cwd,
+      "--format",
+      "json",
+      "codex",
+      "sessions",
+      "new",
+      "--parent-id",
+      parentId,
+    ]);
+    const options = sessionOptionsFromRecord(stored);
+
+    assert.equal(stored.parent_session_id, parentId);
+    assert.equal(stored.agent_command, codexCommand);
+    assert.equal(options.profile, undefined);
+    assert.equal(options.subscription, undefined);
+  });
+});
+
+test("same-agent claude child inherits parent profile when no child credential is explicit", async () => {
+  await withTempHome(async (homeDir) => {
+    const { cwd, claudeCommand } = await setupCredentialInheritanceFixture(homeDir);
+    const parentId = await writeClaudeParentWithProfile(homeDir, {
+      cwd,
+      claudeCommand,
+      profile: "sub2",
+    });
+
+    const stored = await createChildAndReadRecord(homeDir, [
+      "--cwd",
+      cwd,
+      "--format",
+      "json",
+      "claude",
+      "sessions",
+      "new",
+      "--parent-id",
+      parentId,
+    ]);
+    const options = sessionOptionsFromRecord(stored);
+
+    assert.equal(stored.parent_session_id, parentId);
+    assert.equal(stored.agent_command, claudeCommand);
+    assert.equal(options.profile, "sub2");
+  });
+});
+
+test("explicit chatgpt profile on codex child is preserved over claude parent profile", async () => {
+  await withTempHome(async (homeDir) => {
+    const { cwd, claudeCommand, codexCommand } = await setupCredentialInheritanceFixture(homeDir);
+    const parentId = await writeClaudeParentWithProfile(homeDir, {
+      cwd,
+      claudeCommand,
+      profile: "sub2",
+    });
+
+    const stored = await createChildAndReadRecord(homeDir, [
+      "--cwd",
+      cwd,
+      "--format",
+      "json",
+      "--profile",
+      "chatgpt",
+      "codex",
+      "sessions",
+      "new",
+      "--parent-id",
+      parentId,
+    ]);
+    const options = sessionOptionsFromRecord(stored);
+
+    assert.equal(stored.parent_session_id, parentId);
+    assert.equal(stored.agent_command, codexCommand);
+    assert.equal(options.profile, "chatgpt");
+    assert.equal(options.subscription, undefined);
+  });
+});
+
+test("explicit claude subscription on codex child still rejects as incompatible", async () => {
+  await withTempHome(async (homeDir) => {
+    const { cwd } = await setupCredentialInheritanceFixture(homeDir);
+
+    const result = await runCli(
+      ["--cwd", cwd, "--format", "json", "--subscription", "sub2", "codex", "sessions", "new"],
+      homeDir,
+      { timeoutMs: 8_000 },
+    );
+
+    assert.notEqual(result.code, 0);
+    const errorPayload = JSON.parse(result.stdout.trim()) as {
+      error?: { message?: unknown };
+    };
+    const message = String(errorPayload.error?.message ?? "");
+    assert.match(message, /profile "sub2" \(authMode "subscription"\) cannot be used/);
+    assert.match(message, /codex adapter\. Use a chatgpt profile for codex auth/);
+    assert.deepEqual(await listSessionRecordFiles(homeDir), []);
+  });
+});
+
 test("sessions ensure --resume-session loads ACP session when creating missing session", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
