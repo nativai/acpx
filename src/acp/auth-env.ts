@@ -840,12 +840,21 @@ export function resolveConfiguredAuthCredential(
  */
 // Validate that an explicit effort override is in the selected profile's valid
 // set; throws with a clear, user-facing error listing the valid levels.
+function normalizedReasoningEffortOverride(
+  effortOverride: string | null | undefined,
+): string | undefined {
+  const trimmedEffort = effortOverride?.trim();
+  // Persisted/UI state may use the literal "default" to mean "no override".
+  // Profile auth validation must not treat that sentinel as an effort level.
+  return trimmedEffort && trimmedEffort !== "default" ? trimmedEffort : undefined;
+}
+
 function validateProfileReasoningEffort(
   profileId: string,
   profile: ProfileEntry,
   effortOverride: string | null | undefined,
 ): void {
-  const trimmedEffort = effortOverride?.trim();
+  const trimmedEffort = normalizedReasoningEffortOverride(effortOverride);
   if (!trimmedEffort) {
     return;
   }
@@ -1057,7 +1066,7 @@ async function applyOpenRouterProfileAuth(
   }
 
   // Validate then resolve effort: per-session override > profile default.
-  const trimmedEffort = reasoningEffortOverride?.trim() || undefined;
+  const trimmedEffort = normalizedReasoningEffortOverride(reasoningEffortOverride);
   const resolvedEffort = trimmedEffort ?? profile.reasoningEffort;
 
   // Isolate Claude config in a per-session temp dir (no OAuth inheritance).

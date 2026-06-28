@@ -596,6 +596,25 @@ test("applyProfileAuth: subscription profile on the SDK agent stays byte-identic
   });
 });
 
+test("applyProfileAuth treats default reasoning effort as no override for subscription profiles", async () => {
+  await withProfilesHome(HYBRID_REGISTRY, async (ctx) => {
+    const subsDir = path.join(ctx.homeDir, ".acpx", "subscriptions");
+    await fs.mkdir(path.join(subsDir, "sub1"), { recursive: true });
+    const env: NodeJS.ProcessEnv = {};
+    const shim = await applyProfileAuth(
+      env,
+      "sub1",
+      "session-1",
+      "default",
+      ctx.lookupOptions,
+      SDK_CLAUDE_COMMAND,
+    );
+
+    assert.equal(shim, null);
+    assert.equal(env.CLAUDE_CONFIG_DIR, path.join(subsDir, "sub1"));
+  });
+});
+
 test("applyProfileAuth validates explicit reasoning effort against the selected profile type", async () => {
   await withProfilesHome(
     {

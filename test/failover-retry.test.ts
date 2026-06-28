@@ -286,7 +286,63 @@ test("attemptFailoverAndRetry throws AllSubscriptionsExhaustedError and restores
   );
 });
 
-test("attemptFailoverAndRetry rethrows a non-failover error from the retried turn", async () => {
+test("stale selected profile does not exclude the physically available target", async () => {
+  await withRig(
+    [
+      { id: "subA", token: "tok-a", account: "acct-a" },
+      { id: "subB", token: "tok-b", account: "acct-b" },
+    ],
+    "subA",
+    async ({ homeDir, registryPath, profileDir }) => {
+      const { server, url } = await startMockMessages(
+        new Map([["tok-b", { status: 200, util: 0.1 }]]),
+      );
+      const prevEndpoint = process.env.CLAUDE_MESSAGES_ENDPOINT;
+      const prevHome = process.env.HOME;
+      process.env.CLAUDE_MESSAGES_ENDPOINT = url;
+      process.env.HOME = homeDir;
+      try {
+        const record = makeRecord({ profile: "subB" });
+        record.acpx!.session_options!.account_switch = {
+          fromProfile: "subA",
+          toProfile: "subB",
+          fromAccount: "acct-a",
+          toAccount: "acct-b",
+          effectiveAccount: "acct-a",
+          effectiveProfile: "subA",
+          effectiveAuthMode: "subscription",
+          effectiveAnchor: profileDir("subA"),
+          effectiveResolutionMethod: "path",
+          reason: "failover",
+          at: "2026-06-28T21:27:56.391Z",
+        };
+
+        let turns = 0;
+        const out = await attemptFailoverAndRetry<string>({
+          record,
+          triggerError: rateLimitError("monthly spend limit", "acct-a"),
+          loadOpts: { homeDir, registryPath },
+          runTurn: async () => {
+            turns += 1;
+            return "subB-OK";
+          },
+        });
+
+        assert.equal(out.result, "subB-OK");
+        assert.equal(out.switchedTo, "subB");
+        assert.equal(turns, 1);
+        assert.equal(record.acpx?.session_options?.profile, "subB");
+        assert.equal(record.acpx?.session_options?.account_switch?.effectiveAccount, "acct-a");
+      } finally {
+        server.close();
+        process.env.CLAUDE_MESSAGES_ENDPOINT = prevEndpoint;
+        process.env.HOME = prevHome;
+      }
+    },
+  );
+});
+
+test("attemptFailoverAndRetry rethrows a non-failover error and restores selection", async () => {
   await withRig(
     [
       { id: "a", token: "tok-a" },
@@ -317,6 +373,9 @@ test("attemptFailoverAndRetry rethrows a non-failover error from the retried tur
             }),
           /model not found/,
         );
+        assert.equal(record.acpx?.session_options?.subscription, "a");
+        assert.equal(record.acpx?.session_options?.profile, undefined);
+        assert.equal(record.acpx?.session_options?.account_switch, undefined);
       } finally {
         server.close();
         process.env.CLAUDE_MESSAGES_ENDPOINT = prevEndpoint;

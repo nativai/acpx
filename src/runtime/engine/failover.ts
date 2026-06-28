@@ -22,7 +22,6 @@ import type { SessionRecord } from "../../types.js";
 import {
   getAccountHealth,
   markAccountDead,
-  siblingProfiles,
   switchSessionAccount,
   transcriptAnchorDir,
   type AccountHealth,
@@ -450,28 +449,71 @@ async function pickSubscriptionSibling(
   };
 }
 
+function effectiveSourceProfile(
+  registry: ReturnType<typeof loadProfileRegistry>,
+  current: ResolvedProfile,
+  context: EffectiveAccountMetadata,
+): { source: ResolvedProfile; failedAccount: string } {
+  const effectiveProfileId = context.effectiveProfile?.trim();
+  const byEffectiveProfile = effectiveProfileId
+    ? findProfile(effectiveProfileId, registry)
+    : undefined;
+  if (byEffectiveProfile) {
+    return { source: byEffectiveProfile, failedAccount: context.effectiveAccount };
+  }
+  const byEffectiveAccount = registry.profiles.find(
+    (profile) =>
+      profile.authMode === current.authMode && profile.account === context.effectiveAccount,
+  );
+  if (byEffectiveAccount) {
+    return { source: byEffectiveAccount, failedAccount: context.effectiveAccount };
+  }
+  return { source: current, failedAccount: current.account };
+}
+
+function failoverCandidates(
+  current: ResolvedProfile,
+  context: EffectiveAccountMetadata,
+  loadOpts?: SubscriptionLookupOptions,
+): { source: ResolvedProfile; siblings: ResolvedProfile[] } {
+  const registry = loadProfileRegistry(loadOpts);
+  const { source, failedAccount } = effectiveSourceProfile(registry, current, context);
+  return {
+    source,
+    // The selected profile can be stale after a failed target startup. Exclude the
+    // physically failed account, not the selected account, so that selected target
+    // remains eligible for a fresh-client retry.
+    siblings: registry.profiles.filter(
+      (profile) => profile.authMode === source.authMode && profile.account !== failedAccount,
+    ),
+  };
+}
+
 async function pickSibling(
   current: ResolvedProfile,
+  context: EffectiveAccountMetadata,
   triedAccounts: ReadonlySet<string>,
   loadOpts?: SubscriptionLookupOptions,
 ): Promise<{
+  source: ResolvedProfile;
   target?: ResolvedProfile;
   statuses: string[];
   siblingCount: number;
   portableCount: number;
 }> {
-  const siblings = await siblingProfiles(current.id, loadOpts);
-  const currentAnchor = transcriptAnchorDir(current);
+  const { source, siblings } = failoverCandidates(current, context, loadOpts);
+  const currentAnchor = transcriptAnchorDir(source);
   const portable =
     currentAnchor === null
       ? []
       : siblings.filter((profile) => transcriptAnchorDir(profile) !== null);
   const baseStatuses = await candidateStatuses(portable, triedAccounts);
   const picked =
-    current.authMode === "subscription"
+    source.authMode === "subscription"
       ? await pickSubscriptionSibling(baseStatuses, loadOpts)
       : { target: baseStatuses.find(accountHealthy)?.profile, statuses: baseStatuses };
   return {
+    source,
     target: picked.target,
     statuses: picked.statuses.map(describeStatus),
     siblingCount: siblings.length,
@@ -547,7 +589,6 @@ function enrichAccountSwitchBreadcrumb(
 
 async function requirePickedTarget(
   picked: PickedSibling,
-  current: ResolvedProfile,
   context: EffectiveAccountMetadata,
   restoreOriginalSelection: () => Promise<void>,
   initialTrigger: FailoverTrigger,
@@ -555,11 +596,19 @@ async function requirePickedTarget(
   if (picked.siblingCount === 0) {
     await restoreOriginalSelection();
     const health = await getAccountHealth(context.effectiveAccount);
-    throw makeExhaustedError(initialTrigger, [noSiblingMessage(current, context, health)], context);
+    throw makeExhaustedError(
+      initialTrigger,
+      [noSiblingMessage(picked.source, context, health)],
+      context,
+    );
   }
   if (picked.portableCount === 0) {
     await restoreOriginalSelection();
-    throw makeExhaustedError(initialTrigger, [noPortableSiblingMessage(current, context)], context);
+    throw makeExhaustedError(
+      initialTrigger,
+      [noPortableSiblingMessage(picked.source, context)],
+      context,
+    );
   }
   if (!picked.target) {
     await restoreOriginalSelection();
@@ -574,6 +623,20 @@ async function switchToFailoverTarget(params: {
   context: EffectiveAccountMetadata;
   loadOpts?: SubscriptionLookupOptions;
 }): Promise<void> {
+  if (storedSelectionId(params.record) === params.target.id) {
+    // Split-brain recovery: the record already names the target, but the live
+    // owner failed on a different effective account. Keep the selected target and
+    // let the caller's fresh-client retry bind to it.
+    const sessionOptions = params.record.acpx?.session_options;
+    if (sessionOptions) {
+      sessionOptions.profile = params.target.id;
+      delete sessionOptions.subscription;
+      delete sessionOptions.subscription_switch;
+    }
+    enrichAccountSwitchBreadcrumb(params.record, params.context);
+    await writeSessionRecord(params.record);
+    return;
+  }
   try {
     await switchSessionAccount(params.record, params.target.id, "failover", params.loadOpts);
   } catch (error) {
@@ -635,10 +698,9 @@ export async function attemptFailoverAndRetry<T>(args: {
   );
 
   for (let attempt = 0; ; attempt++) {
-    const picked = await pickSibling(current, tried, args.loadOpts);
+    const picked = await pickSibling(current, lastFailureContext, tried, args.loadOpts);
     const target = await requirePickedTarget(
       picked,
-      current,
       lastFailureContext,
       restoreOriginalSelection,
       initialTrigger,
@@ -663,7 +725,12 @@ export async function attemptFailoverAndRetry<T>(args: {
     } catch (retryError) {
       const trigger = classifyFailover(retryError);
       if (!trigger) {
-        throw attachEffectiveAccount(retryError, failureContext(retryError, target));
+        const effectiveRetryError = attachEffectiveAccount(
+          retryError,
+          failureContext(retryError, target),
+        );
+        await restoreOriginalSelection();
+        throw effectiveRetryError;
       }
       // The retried turn failed too. Charge the physically effective account
       // when the runtime stamped one; fall back to the selected target only for
