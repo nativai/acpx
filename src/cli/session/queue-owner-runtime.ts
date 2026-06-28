@@ -8,6 +8,7 @@ import { withTimeout } from "../../async-control.js";
 import { checkpointPerfMetricsCapture } from "../../perf-metrics-capture.js";
 import { incrementPerfCounter, setPerfGauge } from "../../perf-metrics.js";
 import { promptToDisplayText } from "../../prompt-content.js";
+import { bindRecordToDefaultAccount } from "../../runtime/engine/default-account-binding.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
 import {
   mergeSessionOptions,
@@ -430,6 +431,9 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   }
 
   const sessionRecord = await resolveSessionRecord(options.sessionId);
+  if (bindRecordToDefaultAccount(sessionRecord)) {
+    await writeSessionRecordAtBoundary(sessionRecord);
+  }
   // Mid-turn prompt injection (concurrent client.prompt() into an in-flight
   // turn) relies on adapter-specific support for accepting a new prompt while
   // another turn is active. Claude ACP and Codex ACP support that contract;
@@ -1044,6 +1048,9 @@ async function resolveAndPersistSendOwnerOptions(
   options: SessionSendOptions,
 ): Promise<SessionSendOptions> {
   const record = await resolveSessionRecord(options.sessionId);
+  if (bindRecordToDefaultAccount(record)) {
+    await writeSessionRecordAtBoundary(record);
+  }
   const ownerOptions = resolveSessionOwnerOptions(record, options, {
     permissionModeExplicit: options.permissionModeExplicit,
   });

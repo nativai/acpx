@@ -161,7 +161,7 @@ test("T4.3 BUG1 (exact bug shape): profileId=sub2 wins even when a legacy subscr
   );
 });
 
-test("T4.3 contrast (teeth): NO profileId → the synchronous default-home fallback STILL fires", async () => {
+test("T4.3 W14-01: NO profileId/subscriptionId → env builder no longer late-binds registry default", async () => {
   resetKnownDeadSubs();
   await withSubscriptionsHome(
     { registry: REGISTRY_DEFAULT_SUB1, existingDirs: ["sub1", "sub2"] },
@@ -172,10 +172,11 @@ test("T4.3 contrast (teeth): NO profileId → the synchronous default-home fallb
         { acpxRecordId: "rec" }, // no profileId, no subscriptionId
         ctx.lookupOptions,
       );
-      // Proves the gate is real: with profileId absent the legacy path resolves the
-      // registry default (sub1). So the ABSENT result in the tests above is caused
-      // by the profileId gate, not by the test failing to resolve anything at all.
-      assert.equal(options.env.CLAUDE_CONFIG_DIR, ctx.configDir("sub1"));
+      // W14-01 moved default selection out of buildAgentEnvironment. New and
+      // first-used sessions are bound to a concrete profile/subscription before
+      // spawn; an actually unbound context must stay raw here.
+      assert.equal(hasClaudeConfigDir(options.env), false);
+      assert.equal(options.env.ACPX_SUBSCRIPTION, undefined);
     },
   );
 });

@@ -910,7 +910,7 @@ test("buildAgentSpawnOptions (N1) explicit valid subscription → CLAUDE_CONFIG_
   );
 });
 
-test("buildAgentSpawnOptions (N2) unselected + usable default → CLAUDE_CONFIG_DIR is the default's configDir", async () => {
+test("buildAgentSpawnOptions (N2/W14-01) unselected + usable default → raw env, no late binding", async () => {
   await withSubscriptionsHome(
     { registry: TWO_SUB_REGISTRY, existingDirs: ["sub1", "sub2"] },
     async (ctx) => {
@@ -921,13 +921,9 @@ test("buildAgentSpawnOptions (N2) unselected + usable default → CLAUDE_CONFIG_
           { acpxRecordId: "rec" }, // no subscriptionId
           ctx.lookupOptions,
         );
-        assert.equal(options.env.CLAUDE_CONFIG_DIR, ctx.configDir("sub2"));
-        assert.equal(
-          writes.join(""),
-          `[acpx] no subscription selected; using registry default "sub2" (CLAUDE_CONFIG_DIR=${ctx.configDir(
-            "sub2",
-          )})\n`,
-        );
+        assert.equal(hasClaudeConfigDir(options.env), false);
+        assert.equal(options.env.ACPX_SUBSCRIPTION, undefined);
+        assert.deepEqual(writes, []);
       });
     },
   );
@@ -1066,19 +1062,20 @@ test("buildAgentSpawnOptions (S1) explicit sub → ACPX_SUBSCRIPTION = that id",
   );
 });
 
-test("buildAgentSpawnOptions (S2) unselected + default → ACPX_SUBSCRIPTION = the resolved default id", async () => {
+test("buildAgentSpawnOptions (S2/W14-01) unselected + default → ACPX_SUBSCRIPTION absent", async () => {
   resetKnownDeadSubs();
   await withSubscriptionsHome(
     { registry: TWO_SUB_REGISTRY, existingDirs: ["sub1", "sub2"] },
     async (ctx) => {
-      await withCapturedStderrWrites(async () => {
+      await withCapturedStderrWrites(async (writes) => {
         const options = buildAgentSpawnOptions(
           "/tmp/acpx-agent",
           undefined,
           { acpxRecordId: "rec" },
           ctx.lookupOptions,
         );
-        assert.equal(options.env.ACPX_SUBSCRIPTION, "sub2");
+        assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_SUBSCRIPTION"), false);
+        assert.deepEqual(writes, []);
       });
     },
   );

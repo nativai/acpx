@@ -18,6 +18,7 @@ import type {
   SessionRecord,
   SessionResumePolicy,
 } from "../../types.js";
+import { bindRecordToDefaultAccount } from "./default-account-binding.js";
 import { applyLifecycleSnapshotToRecord } from "./lifecycle.js";
 import { connectAndLoadSession, type ConnectedSessionController } from "./reconnect.js";
 import { sessionOptionsFromRecord } from "./session-options.js";
@@ -96,6 +97,9 @@ export async function withConnectedSession<T>(
   options: WithConnectedSessionOptions<T>,
 ): Promise<WithConnectedSessionResult<T>> {
   const record = await options.loadRecord(options.sessionRecordId);
+  if (bindRecordToDefaultAccount(record)) {
+    await options.saveRecord(record);
+  }
   const ownerOptions = resolveSessionOwnerOptions(record, {
     permissionMode: options.permissionMode ?? "approve-reads",
     nonInteractivePermissions: options.nonInteractivePermissions,

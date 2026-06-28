@@ -26,6 +26,7 @@ import {
 export { InterruptedError, TimeoutError } from "../../async-control.js";
 import { formatPerfMetric, measurePerf, startPerfTimer } from "../../perf-metrics.js";
 import { textPrompt } from "../../prompt-content.js";
+import { bindRecordToDefaultAccount } from "../../runtime/engine/default-account-binding.js";
 import {
   applyConversation,
   applyLifecycleSnapshotToRecord,
@@ -752,6 +753,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   // we don't auto-reopen on a successful turn.
   if (record.closed) {
     throw new SessionClosedError(record.acpxRecordId, record.name ?? undefined);
+  }
+  if (bindRecordToDefaultAccount(record)) {
+    await writeSessionRecord(record);
   }
 
   const conversation = cloneSessionConversation(record);

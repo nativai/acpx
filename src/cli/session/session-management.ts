@@ -6,6 +6,7 @@ import {
 } from "../../acp/client.js";
 import { formatErrorMessage } from "../../acp/error-normalization.js";
 import { withInterrupt, withTimeout } from "../../async-control.js";
+import { bindDefaultAccountToSessionOptions } from "../../runtime/engine/default-account-binding.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
 import { persistSessionOptions } from "../../runtime/engine/session-options.js";
 import { persistAndApplyRequestedEffort } from "../../session/config-option-application.js";
@@ -356,18 +357,25 @@ function creationSessionContext(options: SessionCreateOptions) {
 export async function createSessionWithClient(
   options: SessionCreateOptions,
 ): Promise<SessionCreateWithClientResult> {
+  const effectiveOptions: SessionCreateOptions = {
+    ...options,
+    sessionOptions: bindDefaultAccountToSessionOptions(
+      options.sessionOptions,
+      options.agentCommand,
+    ),
+  };
   const client = new AcpClient({
-    agentCommand: options.agentCommand,
-    cwd: absolutePath(options.cwd),
-    mcpServers: options.mcpServers,
-    permissionMode: options.permissionMode,
-    nonInteractivePermissions: options.nonInteractivePermissions,
-    permissionPolicy: options.permissionPolicy,
-    authCredentials: options.authCredentials,
-    authPolicy: options.authPolicy,
-    terminal: options.terminal,
-    verbose: options.verbose,
-    sessionOptions: options.sessionOptions,
+    agentCommand: effectiveOptions.agentCommand,
+    cwd: absolutePath(effectiveOptions.cwd),
+    mcpServers: effectiveOptions.mcpServers,
+    permissionMode: effectiveOptions.permissionMode,
+    nonInteractivePermissions: effectiveOptions.nonInteractivePermissions,
+    permissionPolicy: effectiveOptions.permissionPolicy,
+    authCredentials: effectiveOptions.authCredentials,
+    authPolicy: effectiveOptions.authPolicy,
+    terminal: effectiveOptions.terminal,
+    verbose: effectiveOptions.verbose,
+    sessionOptions: effectiveOptions.sessionOptions,
     // The CREATION spawn must resolve CLAUDE_CONFIG_DIR from the chosen
     // subscription, exactly like the prompt/recover/keepwarm spawns do
     // (connected-session.ts / runtime.ts). Without this the first turn ignores
@@ -376,12 +384,12 @@ export async function createSessionWithClient(
     // sessionContext fields are best-effort (each is guarded independently in
     // buildAgentEnvironment, so a null acpxRecordId only skips ACPX_SESSION_URL
     // on this one spawn — it is set on the next spawn from the persisted record).
-    sessionContext: creationSessionContext(options),
+    sessionContext: creationSessionContext(effectiveOptions),
   });
 
   try {
     const record = await withInterrupt(
-      async () => await createSessionRecordWithClient(client, options),
+      async () => await createSessionRecordWithClient(client, effectiveOptions),
       async () => {
         await client.close();
       },

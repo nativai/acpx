@@ -247,8 +247,9 @@ export type AgentSessionContext = {
   /**
    * Selected Claude subscription id (from ~/.acpx/subscriptions/registry.json).
    * When set and resolvable, buildAgentEnvironment points the adapter at that
-   * subscription's CLAUDE_CONFIG_DIR. Unset/unknown ⇒ today's behavior (global
-   * ~/.claude). Mirrors how per-session `model` flows from the session record.
+   * subscription's CLAUDE_CONFIG_DIR. Unset means raw global ~/.claude; registry
+   * defaults are resolved earlier by the session binding layer, not here.
+   * Mirrors how per-session `model` flows from the session record.
    */
   subscriptionId?: string | null;
   /**
@@ -315,18 +316,22 @@ function buildAgentEnvironment(
   // When a profileId is set the async applyProfileAuth path (called from
   // client.ts after this synchronous env build) handles all auth env setup.
   // Skip subscription resolution here to avoid clobbering what applyProfileAuth
-  // will write. Subscription-only sessions (no profileId) continue to use the
-  // existing synchronous path below, byte-identical to pre-profile behavior.
+  // will write. Subscription-only sessions (no profileId) continue to use this
+  // synchronous path, but ONLY when the record carries a concrete subscription.
+  // An unbound record deliberately stays raw here: registry defaults are
+  // snapshotted onto sessions by default-account-binding before spawn, not
+  // late-resolved inside the env builder.
   // For the claude-pty bridge agent, subscription configDir resolution does not
   // apply at all: an explicit --subscription is rejected (setup-tokens would
   // wedge interactive Claude at the login picker) and the unselected default
   // is skipped silently (no CLAUDE_CONFIG_DIR, no "no subscription selected"
   // banner — the bridge owns auth via its HOME selector).
   if (!sessionContext?.profileId?.trim()) {
+    const subscriptionId = sessionContext?.subscriptionId?.trim();
     if (agentCommand !== undefined && isClaudePtyAgentCommand(agentCommand)) {
-      rejectExplicitSubscriptionForClaudePty(sessionContext?.subscriptionId);
-    } else {
-      applySubscriptionConfigDir(env, sessionContext?.subscriptionId ?? null, lookupOptions);
+      rejectExplicitSubscriptionForClaudePty(subscriptionId);
+    } else if (subscriptionId) {
+      applySubscriptionConfigDir(env, subscriptionId, lookupOptions);
       ensureProvisioningForResolvedSubscription(env, lookupOptions, onProvisioningWarning);
     }
   }
@@ -641,19 +646,17 @@ function verifyAppliedSubscription(
   }
 }
 
-// Resolve which CLAUDE_CONFIG_DIR an adapter spawn should use and set it on the
-// env. This is the SINGLE resolution point — every spawn path (create / recover /
-// keepwarm) routes through buildAgentEnvironment, so they all inherit it. Order
-// (see chooseSubscriptionConfigDir): explicit valid id → registry default →
-// raw ~/.claude. An explicit id we can't honor logs the legacy line and falls
-// through the same default→raw chain instead of crashing the spawn. Also sets
-// ACPX_SUBSCRIPTION to the resolved id (E.2) and applies process-local
-// known-dead avoidance (§4.1.4) before committing the dir.
+// Resolve which CLAUDE_CONFIG_DIR a concrete subscription selection should use
+// and set it on the env. Normal spawn paths call this only with a stored
+// subscription id; unbound sessions are bound earlier by
+// default-account-binding. Also sets ACPX_SUBSCRIPTION to the resolved id (E.2)
+// and applies process-local known-dead avoidance (§4.1.4) before committing the
+// dir.
 //
-// BACKWARD SAFETY: on a box with no registry / no usable default, an UNSELECTED
-// spawn produces no configDir and ZERO stderr (byte-identical to pre-default
-// behavior); the legacy rejection lines for an explicit id are emitted verbatim.
-// The new default-applied note only ever fires on a box with a usable default.
+// BACKWARD SAFETY: the legacy rejection lines for an explicit id are emitted
+// verbatim. The default-applied note remains only for legacy direct callers that
+// still pass a null selection; buildAgentEnvironment no longer does that for an
+// unbound session.
 function applySubscriptionConfigDir(
   env: NodeJS.ProcessEnv,
   explicitId: string | null | undefined,
