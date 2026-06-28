@@ -529,19 +529,20 @@ function resolveEffectiveSpawnAgent(
 
 function inheritedProfileSelection(
   globalFlags: GlobalFlags,
+  sameAgentAsParent: boolean,
   parent: ResolvedParentSession | undefined,
 ): string | undefined {
   return withInheritedProfile(
     globalFlags.profile ?? globalFlags.subscription,
-    parent?.profile ?? parent?.subscription,
+    sameAgentAsParent ? (parent?.profile ?? parent?.subscription) : undefined,
   );
 }
 
 // Assemble the child's sessionOptions, layering parent inheritance over the
-// global flags. Model/effort inherit only when the child resolves to the SAME
-// agent (both are agent-namespaced); subscription always inherits. Explicit
-// child values win throughout. effort for a non-claude child is harmless here —
-// the creation sites only write/apply it when the session advertises `effort`.
+// global flags. Credential, model, and effort inheritance all require the child
+// to resolve to the SAME agent as its parent; explicit child values win
+// throughout. effort for a non-claude child is harmless here — the creation sites
+// only write/apply it when the session advertises `effort`.
 function inheritedSpawnSessionOptions(
   globalFlags: GlobalFlags,
   sameAgentAsParent: boolean,
@@ -554,7 +555,7 @@ function inheritedSpawnSessionOptions(
       globalFlags.reasoningEffort,
       sameAgentAsParent ? parent?.effort : undefined,
     ),
-    profile: inheritedProfileSelection(globalFlags, parent),
+    profile: inheritedProfileSelection(globalFlags, sameAgentAsParent, parent),
   };
 }
 

@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   withInheritedAgentCommand,
   withInheritedModel,
+  withInheritedProfile,
   withInheritedReasoningEffort,
   withInheritedSubscription,
   withInheritedTaskFolder,
@@ -72,6 +73,20 @@ test("withInheritedSubscription: a whitespace-only child is treated as absent â†
 
 test("withInheritedSubscription: a whitespace-only parent is treated as absent", () => {
   assert.equal(withInheritedSubscription(undefined, "   "), undefined);
+});
+
+test("withInheritedProfile: child inherits the parent profile when caller supplies one", () => {
+  assert.equal(withInheritedProfile(undefined, "sub2"), "sub2");
+});
+
+test("withInheritedProfile: an explicit child --profile wins over the parent", () => {
+  assert.equal(withInheritedProfile("chatgpt", "sub2"), "chatgpt");
+});
+
+test("withInheritedProfile: undefined-safe / whitespace-aware", () => {
+  assert.equal(withInheritedProfile(undefined, undefined), undefined);
+  assert.equal(withInheritedProfile("   ", "sub2"), "sub2");
+  assert.equal(withInheritedProfile(undefined, "   "), undefined);
 });
 
 const CLAUDE_CMD = "node /opt/claude-agent-acp/dist/index.js";
