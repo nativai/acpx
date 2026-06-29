@@ -58,11 +58,11 @@ export function isClaudeAcpCommand(command: string, args: readonly string[]): bo
   return args.some((arg) => arg.includes("claude-agent-acp"));
 }
 
-// The claude-pty bridge (independent-claude-acp). Matches both the bootstrapped
-// default (`node /opt/claude-pty-acp/acp-server-transcript.mjs`) and dev
-// overrides via ACPX_CLAUDE_PTY_ACP_COMMAND or a config.json `agents` entry
-// pointing at a checkout (any path containing the repo name or the server
-// script name). Deliberately does NOT overlap isClaudeAcpCommand
+// The claude-pty bridge (independent-claude-acp). Matches the bootstrapped
+// built default (`node /opt/claude-pty-acp/dist/index.js`), the root shim,
+// and dev overrides via ACPX_CLAUDE_PTY_ACP_COMMAND or a config.json `agents`
+// entry pointing at a checkout (any path containing the repo name or the
+// server script name). Deliberately does NOT overlap isClaudeAcpCommand
 // ("claude-agent-acp"), so the SDK-adapter-specific handling never applies.
 export function isClaudePtyAcpCommand(command: string, args: readonly string[]): boolean {
   return [command, ...args].some(

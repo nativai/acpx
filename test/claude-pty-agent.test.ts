@@ -41,7 +41,7 @@ const F1_ACTIVE_CONTROLLER: ConnectedSessionController = {
 };
 
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
-const DEFAULT_CLAUDE_PTY_COMMAND = "node /opt/claude-pty-acp/acp-server-transcript.mjs";
+const DEFAULT_CLAUDE_PTY_COMMAND = "node /opt/claude-pty-acp/dist/index.js";
 const SDK_CLAUDE_COMMAND = "node /opt/claude-agent-acp/dist/index.js";
 
 // ---------------------------------------------------------------------------
