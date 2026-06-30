@@ -5710,10 +5710,13 @@ test("sessions copy --prompt queues a non-blocking prompt handoff into the copie
         "--name",
         "handoff-child",
         "--prompt",
-        "sleep 1500",
+        "sleep 3000",
       ],
       homeDir,
-      { timeoutMs: 1_200 },
+      // Keep this below the injected prompt sleep so the assertion still proves
+      // copy returns without waiting for the handoff prompt to finish, while
+      // leaving enough headroom for full-suite process startup contention.
+      { timeoutMs: 2_000 },
     );
     assert.equal(result.code, 0, result.stderr);
     const payload = JSON.parse(result.stdout.trim()) as {
@@ -5745,8 +5748,8 @@ test("sessions copy --prompt queues a non-blocking prompt handoff into the copie
         entries?: Array<{ textPreview?: unknown }>;
       };
       const previews = read.entries?.map((entry) => entry.textPreview);
-      return previews?.includes("slept 1500ms") ? previews : null;
-    }, 6_000);
+      return previews?.includes("slept 3000ms") ? previews : null;
+    }, 8_000);
 
     const close = await runCli(["codex", "sessions", "close", "--session-id", childId], homeDir);
     assert.equal(close.code, 0, close.stderr);
