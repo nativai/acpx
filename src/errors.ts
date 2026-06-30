@@ -47,7 +47,7 @@ export class SessionClosedError extends AcpxOperationalError {
   constructor(sessionId: string, sessionName: string | undefined) {
     const label = sessionName ?? sessionId;
     super(
-      `Session '${label}' is closed. Reopen with \`acpx sessions reopen <name>\` (or via the UI) before sending prompts.`,
+      `Session '${label}' is closed. Reopen it in acpx-ui (Reopen button), or deliver a message to its session URL to reopen-and-deliver before sending CLI prompts.`,
       {
         outputCode: "RUNTIME",
         detailCode: "SESSION_CLOSED",

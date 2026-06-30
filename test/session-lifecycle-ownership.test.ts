@@ -450,7 +450,9 @@ test("runQueuedTask rejects a closed session with SESSION_CLOSED (queued-prompt 
 test("SessionClosedError formats the session name when available", () => {
   const withName = new SessionClosedError("some-id", "my-session");
   assert.match(withName.message, /'my-session'/);
-  assert.match(withName.message, /Reopen/);
+  assert.match(withName.message, /acpx-ui \(Reopen button\)/);
+  assert.match(withName.message, /session URL/);
+  assert.doesNotMatch(withName.message, /sessions reopen/);
   assert.equal(withName.detailCode, "SESSION_CLOSED");
   assert.equal(withName.outputCode, "RUNTIME");
 
