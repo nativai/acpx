@@ -56,6 +56,7 @@ import {
   resolvePermissionRequestWithDetails,
 } from "../permissions.js";
 import { getUnsupportedPromptContentMessage, textPrompt } from "../prompt-content.js";
+import { ACTIVITY_NEUTRAL_EVENT_METHOD } from "../session/events.js";
 import { extractRuntimeSessionId } from "../session/runtime-session-id.js";
 import { buildSpawnCommandOptions } from "../spawn-command-options.js";
 import type {
@@ -886,6 +887,22 @@ export class AcpClient {
           params: ReleaseTerminalRequest,
         ): Promise<ReleaseTerminalResponse> => {
           return this.handleReleaseTerminal(params);
+        },
+        // Generic ext-notification sink. The SDK's `Client.extNotification` is
+        // optional; with no handler the SDK answers every `_claude/*` ext
+        // notification (e.g. `_claude/sessionStatus`, `_claude/sdkMessage`) with
+        // `-32601 Method not found` + log noise. Accept all silently — these
+        // markers are already tapped into the stream via the wire-message path
+        // and treated activity-neutral, so nothing here needs to react.
+        extNotification: async (method: string, _params: Record<string, unknown>) => {
+          if (method === ACTIVITY_NEUTRAL_EVENT_METHOD) {
+            // Seam for future phase surfacing (DEFERRED to the separate feature
+            // task `surface-turn-phase-indicator`): params.phase carries the
+            // turn_no_activity / compaction / long-turn marker. Intentionally
+            // NOT wired through here — recognising the method is enough to keep
+            // this a clean extension point.
+          }
+          // All other ext notifications: accept and ignore.
         },
       }),
       stream,
