@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { SessionModelState, SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
+import { AGENT_REGISTRY } from "../src/agent-registry.js";
 import { AcpxOperationalError } from "../src/errors.js";
 import { AcpRuntimeManager } from "../src/runtime/engine/manager.js";
 import { persistSessionOptions } from "../src/runtime/engine/session-options.js";
@@ -10,6 +11,7 @@ import type {
   AcpRuntimeTurn,
   AcpRuntimeTurnResult,
 } from "../src/runtime/public/contract.js";
+import { DEFAULT_CODEX_MODEL } from "../src/session/default-model.js";
 import {
   createRuntimeOptions,
   InMemorySessionStore,
@@ -2785,6 +2787,45 @@ test("AcpRuntimeManager getStatus.models survives a save/reload cycle", async ()
   );
   const afterStatus = await reloaded.getStatus(handle);
   assert.deepEqual(afterStatus.models, beforeStatus.models);
+});
+
+test("AcpRuntimeManager applies the built-in codex default model on fresh create", async () => {
+  const store = new InMemorySessionStore();
+  const setModelCalls: Array<{ sessionId: string; modelId: string }> = [];
+  const manager = new AcpRuntimeManager(
+    createRuntimeOptions({
+      cwd: "/tmp",
+      sessionStore: store,
+      agentRegistry: {
+        resolve: () => AGENT_REGISTRY.codex,
+        list: () => ["codex"],
+      },
+    }),
+    {
+      clientFactory: createModelsClientFactory({
+        models: {
+          currentModelId: "default-model",
+          availableModels: [
+            { modelId: "default-model", name: "Default" },
+            { modelId: DEFAULT_CODEX_MODEL, name: DEFAULT_CODEX_MODEL },
+          ],
+        },
+        onSetSessionModel: (sessionId, modelId) => {
+          setModelCalls.push({ sessionId, modelId });
+        },
+      }) as never,
+    },
+  );
+
+  const record = await manager.ensureSession({
+    sessionKey: "runtime-codex-default",
+    agent: "codex",
+    mode: "persistent",
+  });
+
+  assert.deepEqual(setModelCalls, [{ sessionId: "models-session", modelId: DEFAULT_CODEX_MODEL }]);
+  assert.equal(record.acpx?.session_options?.model, DEFAULT_CODEX_MODEL);
+  assert.equal(record.acpx?.current_model_id, DEFAULT_CODEX_MODEL);
 });
 
 test("AcpRuntimeManager forwards sessionOptions to createClient on fresh session", async () => {

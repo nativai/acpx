@@ -12,6 +12,7 @@ import { persistSessionOptions } from "../../runtime/engine/session-options.js";
 import { persistAndApplyRequestedEffort } from "../../session/config-option-application.js";
 import { applyConfigOptionsToRecord } from "../../session/config-options.js";
 import { createSessionConversation } from "../../session/conversation-model.js";
+import { withDefaultModelForNewSession } from "../../session/default-model.js";
 import { defaultSessionEventLog } from "../../session/event-log.js";
 import { setCurrentModelId, syncAdvertisedModelState } from "../../session/mode-preference.js";
 import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
@@ -51,6 +52,7 @@ async function createSessionRecordWithClient(
   let sessionResult: SessionCreateResult | SessionLoadResult | SessionForkResult;
   let sessionModels: SessionCreateResult["models"];
   let requestedModelApplied = false;
+  let effectiveSessionOptions = options.sessionOptions;
   let forkContext:
     | {
         sourceRecord: SessionRecord;
@@ -77,6 +79,10 @@ async function createSessionRecordWithClient(
     requestedModelApplied = forked.requestedModelApplied;
     forkContext = forked.forkContext;
   } else {
+    effectiveSessionOptions = withDefaultModelForNewSession(
+      options.agentCommand,
+      options.sessionOptions,
+    );
     const createdSession = await withTimeout(client.createSession(cwd), options.timeoutMs);
     sessionId = createdSession.sessionId;
     acpSessionId = sessionId;
@@ -86,7 +92,7 @@ async function createSessionRecordWithClient(
     requestedModelApplied = await applyRequestedModelIfAdvertised({
       client,
       sessionId,
-      requestedModel: options.sessionOptions?.model,
+      requestedModel: effectiveSessionOptions?.model,
       models: sessionModels,
       agentCommand: options.agentCommand,
       timeoutMs: options.timeoutMs,
@@ -138,22 +144,22 @@ async function createSessionRecordWithClient(
   };
 
   applyLifecycleSnapshotToRecord(record, lifecycle);
-  persistSessionOptions(record, options.sessionOptions);
+  persistSessionOptions(record, effectiveSessionOptions);
   persistSessionOwnerOptions(record, options);
   applyConfigOptionsToRecord(record, sessionResult);
   await persistAndApplyRequestedEffort({
     client,
     sessionId,
     record,
-    reasoningEffort: options.sessionOptions?.reasoningEffort,
+    reasoningEffort: effectiveSessionOptions?.reasoningEffort,
     advertised: sessionResult.configOptions,
-    modelId: options.sessionOptions?.model,
+    modelId: effectiveSessionOptions?.model,
     timeoutMs: options.timeoutMs,
     verbose: options.verbose,
   });
   syncAdvertisedModelState(record, sessionModels);
   if (requestedModelApplied) {
-    setCurrentModelId(record, options.sessionOptions?.model);
+    setCurrentModelId(record, effectiveSessionOptions?.model);
   }
 
   // A fork inherits the source's (truncated) conversation in

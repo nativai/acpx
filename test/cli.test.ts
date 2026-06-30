@@ -17,6 +17,7 @@ import {
   parseTtlSeconds,
 } from "../src/cli.js";
 import { transcriptJsonlPath } from "../src/config/subscription-transcript.js";
+import { DEFAULT_CODEX_MODEL } from "../src/session/default-model.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence.js";
 import type { SessionRecord } from "../src/types.js";
 import {
@@ -67,6 +68,7 @@ const MOCK_AGENT_WITH_LOAD_FALLBACK_AND_MODE_FAILURE = `${MOCK_AGENT_COMMAND} --
 const MOCK_AGENT_WITH_FORK_SESSION = `${MOCK_AGENT_COMMAND} --supports-fork-session`;
 const MOCK_AGENT_WITH_SET_MODE_INVALID_PARAMS = `${MOCK_AGENT_COMMAND} --set-session-mode-invalid-params`;
 const MOCK_AGENT_WITH_SET_CONFIG_INVALID_PARAMS = `${MOCK_AGENT_COMMAND} --set-session-config-invalid-params`;
+const CODEX_SPARK_MODEL = "gpt-5.3-codex-spark[medium]";
 
 async function writeFakeClaudeAgentPackage(homeDir: string): Promise<string> {
   const packageRoot = path.join(homeDir, "fake-claude-agent-acp");
@@ -201,6 +203,183 @@ test("config commands accept command-local --format json", async () => {
     const initPayload = JSON.parse(init.stdout.trim()) as Record<string, unknown>;
     assert.equal(initPayload.created, true);
     assert.equal(typeof initPayload.path, "string");
+  });
+});
+
+test("codex exec without --model applies the built-in create-time default before prompt", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const operationLog = path.join(homeDir, "codex-default-ops.jsonl");
+    const codexCommand = mockCodexCommand(operationLog);
+    await fs.mkdir(cwd, { recursive: true });
+
+    const result = await runCli(
+      ["--cwd", cwd, "--approve-all", "--format", "quiet", "codex", "exec", "echo ok"],
+      homeDir,
+      { env: { ACPX_CODEX_ACP_COMMAND: codexCommand } },
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /ok/);
+    const operations = await readMockOperations(operationLog);
+    assert.deepEqual(
+      operations.map((operation) => operation.method),
+      ["session/new", "session/set_model", "session/prompt"],
+    );
+    assert.equal(operations[1]?.modelId, DEFAULT_CODEX_MODEL);
+  });
+});
+
+test("codex exec preserves an explicit --model over the create-time default", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const operationLog = path.join(homeDir, "codex-explicit-ops.jsonl");
+    const codexCommand = mockCodexCommand(operationLog);
+    await fs.mkdir(cwd, { recursive: true });
+
+    const result = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--approve-all",
+        "--format",
+        "quiet",
+        "--model",
+        CODEX_SPARK_MODEL,
+        "codex",
+        "exec",
+        "echo explicit",
+      ],
+      homeDir,
+      { env: { ACPX_CODEX_ACP_COMMAND: codexCommand } },
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /explicit/);
+    const operations = await readMockOperations(operationLog);
+    const setModel = operations.find((operation) => operation.method === "session/set_model");
+    assert.equal(setModel?.modelId, CODEX_SPARK_MODEL);
+  });
+});
+
+test("codex child session inherits parent model instead of the create-time default", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const operationLog = path.join(homeDir, "codex-inherit-ops.jsonl");
+    const codexCommand = mockCodexCommand(operationLog);
+    await fs.mkdir(cwd, { recursive: true });
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "codex-parent",
+      acpSessionId: "codex-parent",
+      agentCommand: codexCommand,
+      cwd,
+      acpx: {
+        current_model_id: CODEX_SPARK_MODEL,
+        available_models: [DEFAULT_CODEX_MODEL, CODEX_SPARK_MODEL],
+        session_options: {
+          model: CODEX_SPARK_MODEL,
+        },
+      },
+    });
+
+    const result = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "new", "--parent-id", "codex-parent"],
+      homeDir,
+      { env: { ACPX_CODEX_ACP_COMMAND: codexCommand } },
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    const payload = JSON.parse(result.stdout.trim()) as { acpxRecordId?: unknown };
+    assert.equal(typeof payload.acpxRecordId, "string");
+    const childId = String(payload.acpxRecordId);
+    const stored = JSON.parse(await fs.readFile(sessionFilePath(homeDir, childId), "utf8")) as {
+      parent_session_id?: unknown;
+      acpx?: {
+        current_model_id?: unknown;
+        session_options?: { model?: unknown };
+      };
+    };
+    assert.equal(stored.parent_session_id, "codex-parent");
+    assert.equal(stored.acpx?.session_options?.model, CODEX_SPARK_MODEL);
+    assert.equal(stored.acpx?.current_model_id, CODEX_SPARK_MODEL);
+
+    const setModel = (await readMockOperations(operationLog)).find(
+      (operation) => operation.method === "session/set_model",
+    );
+    assert.equal(setModel?.modelId, CODEX_SPARK_MODEL);
+  });
+});
+
+test("prompting an existing codex session without --model does not reset its model", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const operationLog = path.join(homeDir, "codex-existing-ops.jsonl");
+    const codexCommand = mockCodexCommand(operationLog, "--supports-load-session");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "existing-codex",
+      acpSessionId: "existing-codex",
+      agentCommand: codexCommand,
+      cwd,
+    });
+
+    const result = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--ttl",
+        "0.01",
+        "--format",
+        "quiet",
+        "codex",
+        "prompt",
+        "--session-id",
+        "existing-codex",
+        "echo existing",
+      ],
+      homeDir,
+      { env: { ACPX_CODEX_ACP_COMMAND: codexCommand } },
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /existing/);
+    assert.equal(
+      (await readMockOperations(operationLog)).some(
+        (operation) => operation.method === "session/set_model",
+      ),
+      false,
+    );
+  });
+});
+
+test("non-codex exec without --model does not apply the codex create-time default", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const operationLog = path.join(homeDir, "non-codex-ops.jsonl");
+    const agentCommand = mockCodexCommand(operationLog);
+    await fs.mkdir(cwd, { recursive: true });
+
+    const result = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--approve-all",
+        "--agent",
+        agentCommand,
+        "--format",
+        "quiet",
+        "exec",
+        "echo plain",
+      ],
+      homeDir,
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /plain/);
+    assert.deepEqual(
+      (await readMockOperations(operationLog)).map((operation) => operation.method),
+      ["session/new", "session/prompt"],
+    );
   });
 });
 
@@ -4904,6 +5083,32 @@ async function runCli(
       resolve({ code, stdout, stderr });
     });
   });
+}
+
+function mockCodexCommand(operationLog: string, extraArgs = ""): string {
+  const args = [
+    MOCK_AGENT_COMMAND,
+    "--advertise-models",
+    "--operation-log",
+    JSON.stringify(operationLog),
+    extraArgs,
+  ].filter((arg) => arg.length > 0);
+  return args.join(" ");
+}
+
+type MockOperation = {
+  method?: string;
+  sessionId?: string;
+  modelId?: string;
+  text?: string;
+};
+
+async function readMockOperations(operationLog: string): Promise<MockOperation[]> {
+  const raw = await fs.readFile(operationLog, "utf8");
+  return raw
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as MockOperation);
 }
 
 async function waitFor<T>(fn: () => Promise<T | null>, timeoutMs: number): Promise<T> {
