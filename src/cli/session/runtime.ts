@@ -290,6 +290,82 @@ function deliveryErrorFrom(error: unknown): DeliveryEventError {
   };
 }
 
+// Drain-backstop default: how long the turn waits for injected prompts to
+// settle before finalizing anyway. Generous on purpose (30 min) so a normal
+// long injected turn (the incident's was a normal ~10 min turn) is NEVER
+// truncated — truncating is the very bug this fix removes. Override via
+// ACPX_INJECTED_DRAIN_TIMEOUT_MS; explicit `0` ⇒ unbounded (rely on the
+// injected IIFE's error-isolation + rejection-on-owner-death alone).
+const DEFAULT_INJECTED_DRAIN_TIMEOUT_MS = 1_800_000;
+
+function resolveInjectedDrainTimeoutMs(): number {
+  const raw = process.env.ACPX_INJECTED_DRAIN_TIMEOUT_MS;
+  if (raw == null || raw.trim() === "") {
+    return DEFAULT_INJECTED_DRAIN_TIMEOUT_MS;
+  }
+  const parsed = Number(raw);
+  // Negative / NaN ⇒ fall back to the generous default rather than disabling
+  // the backstop by accident; only an explicit `0` means unbounded.
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_INJECTED_DRAIN_TIMEOUT_MS;
+  }
+  return parsed;
+}
+
+export type DrainInjectedPromptsResult = {
+  timedOut: boolean;
+  /** Injected prompts still unsettled when the backstop fired (0 if it didn't). */
+  pending: number;
+};
+
+/**
+ * Await a set of injected-prompt promises, bounded by a single shared backstop
+ * deadline. On `timeoutMs <= 0` the wait is unbounded. On expiry it resolves
+ * `{ timedOut: true, pending }` and invokes `onTimeout(pending)` once, leaving
+ * the still-pending injected prompts running (they remain error-isolated) so
+ * the turn can finalize instead of wedging the queue owner forever.
+ *
+ * The timer is cleared on normal settle (and `unref`'d while pending) so it can
+ * never hold the event loop open. The injected promises never reject (the
+ * injection IIFE wraps everything in try/catch/finally), but both settle paths
+ * are counted defensively.
+ */
+export async function drainInjectedPromptsWithBackstop(
+  injectedPromises: ReadonlyArray<Promise<void>>,
+  timeoutMs: number,
+  onTimeout: (pending: number) => void,
+): Promise<DrainInjectedPromptsResult> {
+  if (injectedPromises.length === 0) {
+    return { timedOut: false, pending: 0 };
+  }
+  const total = injectedPromises.length;
+  let settledCount = 0;
+  const markSettled = () => {
+    settledCount += 1;
+  };
+  const settleAll = Promise.allSettled(
+    injectedPromises.map((promise) => promise.then(markSettled, markSettled)),
+  );
+  if (timeoutMs <= 0) {
+    await settleAll;
+    return { timedOut: false, pending: 0 };
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = await new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(true), timeoutMs);
+    timer.unref?.();
+    void settleAll.then(() => resolve(false));
+  });
+  if (timer !== undefined) {
+    clearTimeout(timer);
+  }
+  const pending = total - settledCount;
+  if (timedOut) {
+    onTimeout(pending);
+  }
+  return { timedOut, pending };
+}
+
 function attachEffectiveAccountMetadata(
   error: unknown,
   metadata: EffectiveAccountMetadata | undefined,
@@ -1426,10 +1502,26 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // still running, pushing that next message into the injected turn's
     // context and cutting it short.
     options.setMidTurnHandler?.(undefined);
-    if (injectedPromises.length > 0) {
-      await Promise.allSettled(injectedPromises);
-      injectedPromises.length = 0;
+    if (injectedPromises.length === 0) {
+      return;
     }
+    // Bound the wait with a backstop so a pathological injected prompt that
+    // never settles can't wedge the queue owner forever — degrading to the
+    // pre-fix behavior for that one stuck prompt only (strictly no worse than
+    // the bug, and far rarer). Realistic "never resolves" triggers already
+    // resolve safely: rejections are isolated inside the IIFE, and an owner
+    // death rejects the pending client.prompt() (AgentDisconnectedError).
+    const drainTimeoutMs = resolveInjectedDrainTimeoutMs();
+    await drainInjectedPromptsWithBackstop(injectedPromises, drainTimeoutMs, (pending) => {
+      // Diagnosable, NON-verbose-gated → owner.log (mirrors the idle-release
+      // line at queue-owner-runtime.ts:784-786). The owner's stderr is its own
+      // owner.log fd, never a --json-strict client's JSON-RPC stream.
+      process.stderr.write(
+        `[acpx] injected-prompt drain backstop fired for session ${record.acpxRecordId} ` +
+          `after ${drainTimeoutMs}ms; finalizing with ${pending} injected prompt(s) still pending\n`,
+      );
+    });
+    injectedPromises.length = 0;
   };
 
   const runPromptAttempt = async (sessionId: string, attempt: number) => {
