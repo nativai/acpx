@@ -72,6 +72,7 @@ type MockAgentOptions = {
   loadReplayText: string;
   ignoreSigterm: boolean;
   envDumpFile?: string;
+  operationLogFile?: string;
   claudeAgentAcp: boolean;
   expectedForkMeta?: unknown;
 };
@@ -403,6 +404,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let ignoreSigterm = false;
   let hangOnNewSession = false;
   let envDumpFile: string | undefined;
+  let operationLogFile: string | undefined;
   let claudeAgentAcp = false;
   let expectedForkMeta: unknown;
 
@@ -531,6 +533,12 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    if (token === "--operation-log") {
+      operationLogFile = parseOptionValue(argv, index + 1, token);
+      index += 1;
+      continue;
+    }
+
     if (token === "--claude-agent-acp") {
       claudeAgentAcp = true;
       continue;
@@ -602,6 +610,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     loadReplayText,
     ignoreSigterm,
     envDumpFile,
+    operationLogFile,
     claudeAgentAcp,
     expectedForkMeta,
   };
@@ -612,6 +621,8 @@ const AVAILABLE_MODELS = [
   "default-model",
   "fast-model",
   "smart-model",
+  "gpt-5.5[xhigh]",
+  "gpt-5.3-codex-spark[medium]",
   "opus[1m]",
   "sonnet",
   "haiku",
@@ -825,6 +836,17 @@ class MockAgent implements Agent {
     this.options = options;
   }
 
+  private recordOperation(entry: Record<string, unknown>): void {
+    if (!this.options.operationLogFile) {
+      return;
+    }
+    writeFileSync(
+      this.options.operationLogFile,
+      `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`,
+      { flag: "a" },
+    );
+  }
+
   async initialize(): Promise<InitializeResponse> {
     const sessionCapabilities = {
       ...(this.options.supportsCloseSession ? { close: {} } : {}),
@@ -861,6 +883,7 @@ class MockAgent implements Agent {
       ? (modelFromNewSessionMeta(params) ?? DEFAULT_MODEL_ID)
       : DEFAULT_MODEL_ID;
     this.sessions.set(sessionId, createSessionState(false, requestedModel));
+    this.recordOperation({ method: "session/new", sessionId, modelId: requestedModel });
 
     const response: NewSessionResponse = { sessionId };
 
@@ -1038,6 +1061,7 @@ class MockAgent implements Agent {
     const promptAbort = new AbortController();
     session.pendingPrompt = promptAbort;
     const text = getPromptText(params.prompt);
+    this.recordOperation({ method: "session/prompt", sessionId: params.sessionId, text });
 
     if (text === "partial-retryable-error") {
       try {
@@ -1136,6 +1160,11 @@ class MockAgent implements Agent {
 
   async unstable_setSessionModel(params: SetSessionModelRequest): Promise<SetSessionModelResponse> {
     const session = this.ensureSession(params.sessionId);
+    this.recordOperation({
+      method: "session/set_model",
+      sessionId: params.sessionId,
+      modelId: params.modelId,
+    });
     if (this.options.setSessionModelInvalidParams) {
       const error = new Error("Invalid params") as Error & {
         code: number;
