@@ -7,6 +7,7 @@ import {
   isRetryablePromptError,
   normalizeOutputError,
 } from "../../acp/error-normalization.js";
+import { injectionReturnsTerminalResponse } from "../../acp/mid-turn-injection-support.js";
 import { assertRequestedModelSupported } from "../../acp/model-support.js";
 import { InterruptedError, withInterrupt, withTimeout } from "../../async-control.js";
 import { tailClaudeSubagentJsonl } from "../../claude-jsonl.js";
@@ -891,6 +892,12 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   // of them before the queue-owner loop starts the next sequential task —
   // otherwise a second concurrent client.prompt() would cut an injected turn short.
   const injectedPromises: Promise<void>[] = [];
+  // Backend is constant per session, so resolve once: whether an injected prompt
+  // to this backend returns a terminal response and can therefore be safely
+  // awaited (drained) even when waitForCompletion is false. True for Claude /
+  // claude-pty (both terminate); false for Codex (acts on the steer in-turn,
+  // returns no terminal) and unknown backends — they stay fire-and-forget.
+  const awaitInjectedPrompt = injectionReturnsTerminalResponse(record.agentCommand);
   let sawAcpMessage = false;
   let eventWriterClosed = false;
   const acceptedDeliveryKeys = new Set<string>();
@@ -1481,7 +1488,17 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
             injectedTask.close();
           }
         })();
-        if (injectedTask.waitForCompletion) {
+        // Track (await) this injected promise when EITHER the caller is waiting
+        // for completion (unchanged), OR the backend returns a terminal for an
+        // injected prompt (Claude / claude-pty). This is the root fix for the
+        // "stuck red" bug: a Claude `--no-wait` injection that outlives the
+        // primary must be awaited so its output folds into the record and its
+        // delivery terminal is written before the turn's `finally` tears down
+        // the event writer. A backend without a terminal (Codex / unknown)
+        // stays fire-and-forget — never pushed, so it can't hold the turn open.
+        // The result/error SEND gates above (the --no-wait contract) are
+        // unchanged; only this await-tracking gate widens.
+        if (injectedTask.waitForCompletion || awaitInjectedPrompt) {
           injectedPromises.push(injectedPromise);
         }
       });

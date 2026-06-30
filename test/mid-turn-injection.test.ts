@@ -582,6 +582,193 @@ async function runFireAndForgetInjectionWithoutTerminalResponseScenario(): Promi
   });
 }
 
+// #1 root fix (bugs/stuck-red-turn-end-not-persisted): a Claude backend's
+// `--no-wait` (waitForCompletion:false) injected prompt that returns a terminal
+// MUST now be AWAITED by the turn — so its output folds into the record and its
+// delivery terminal is written before the turn finalizes. Asserts the turn does
+// NOT finalize while the injected prompt is still in flight, and DOES once it
+// returns its terminal. (Pre-fix, the turn finalized immediately and the
+// injected output/terminal were lost — the "stuck red" bug.)
+async function runClaudeNoWaitInjectionIsAwaitedScenario(): Promise<void> {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      // Claude backend ⇒ injectionReturnsTerminalResponse ⇒ awaited.
+      const record = makeSessionRecord(homeDir, "node /opt/claude-agent-acp/dist/index.js");
+      await writeSessionRecordFile(homeDir, record);
+
+      const injectionInitiated = createDeferred<void>();
+      // The injected prompt resolves with a terminal only when the test releases
+      // it, so we can observe whether the turn waits for it.
+      const injectedRelease = createDeferred<PromptResponse>();
+
+      const control = makeMockClient({
+        onMainPrompt: async () => {
+          await injectionInitiated.promise;
+          return { stopReason: "end_turn" };
+        },
+        onInjectedPrompt: async () => {
+          injectionInitiated.resolve();
+          return await injectedRelease.promise;
+        },
+      });
+
+      const injectedSends: QueueOwnerMessage[] = [];
+      let injectedCloses = 0;
+      const midTurn = makeMidTurnControl((registration, ctrl) => {
+        if (registration === 1) {
+          const injectedTask = makeQueueTask(
+            "req-claude-nowait-injected",
+            INJECTED_PROMPT_TEXT,
+            (message) => injectedSends.push(message),
+            () => {
+              injectedCloses += 1;
+            },
+            false, // waitForCompletion:false — the UI/board --no-wait path.
+          );
+          queueMicrotask(() => {
+            ctrl.currentHandler?.(injectedTask);
+          });
+        }
+      });
+
+      const mainSends: QueueOwnerMessage[] = [];
+      let mainCloses = 0;
+      const mainTask = makeQueueTask(
+        "req-main-claude-nowait",
+        MAIN_PROMPT_TEXT,
+        (message) => mainSends.push(message),
+        () => {
+          mainCloses += 1;
+        },
+      );
+
+      const runPromise = runQueuedTask(record.acpxRecordId, mainTask, {
+        sharedClient: control.client,
+        setMidTurnHandler: midTurn.setMidTurnHandler,
+        suppressSdkConsoleErrors: true,
+      });
+
+      // With the injected prompt still in flight, the turn must NOT finalize —
+      // it is awaiting the drain. (250 ms is the same window the fire-and-forget
+      // scenario uses to prove the opposite for a non-awaited backend.)
+      const phase = await Promise.race([
+        runPromise.then(() => "finalized" as const),
+        new Promise<"still-draining">((resolve) =>
+          setTimeout(() => resolve("still-draining"), 250),
+        ),
+      ]);
+      assert.equal(
+        phase,
+        "still-draining",
+        "Claude --no-wait injected prompt is awaited: the turn must not finalize while it is in flight",
+      );
+
+      // Release the injected terminal — the drain completes and the turn closes.
+      injectedRelease.resolve({ stopReason: "end_turn" });
+      await runPromise;
+
+      assert.ok(
+        mainSends.find((m) => m.type === "result"),
+        "main task settled once the drain completed",
+      );
+      assert.equal(mainCloses, 1, "main task closed exactly once");
+      const injectedCalls = control.promptCalls.filter((c) => c.kind === "injected");
+      assert.equal(injectedCalls.length, 1, "injected prompt was sent exactly once");
+      assert.equal(injectedCloses, 1, "awaited injected task closed exactly once");
+      // waitForCompletion:false ⇒ the --no-wait contract is unchanged: no
+      // result/error is sent back to the injected caller even though we awaited it.
+      assert.deepEqual(
+        injectedSends,
+        [],
+        "no-wait injected task sent no result/error (the --no-wait SEND contract is preserved)",
+      );
+    });
+  });
+}
+
+// #1 non-regression (the regression the impl agent caught): a Codex backend
+// steered mid-turn via `--no-wait` acts on the steer in-turn and returns NO
+// terminal for the injected request, so it must STAY fire-and-forget — the turn
+// finalizes promptly without awaiting it, and the backstop never engages. Same
+// shape as runFireAndForgetInjectionWithoutTerminalResponseScenario but pinned
+// to a real Codex command (not the unknown mock), proving the gate is by backend.
+async function runCodexNoWaitInjectionStaysFireAndForgetScenario(): Promise<void> {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      // Codex backend ⇒ injectionReturnsTerminalResponse is false ⇒ not awaited.
+      const record = makeSessionRecord(homeDir, "codex-acp");
+      await writeSessionRecordFile(homeDir, record);
+
+      const injectionInitiated = createDeferred<void>();
+
+      const control = makeMockClient({
+        onMainPrompt: async () => {
+          await injectionInitiated.promise;
+          return { stopReason: "end_turn" };
+        },
+        onInjectedPrompt: async () => {
+          injectionInitiated.resolve();
+          // Codex never returns a terminal for the injected steer.
+          return await new Promise<PromptResponse>(() => {});
+        },
+      });
+
+      const injectedSends: QueueOwnerMessage[] = [];
+      let injectedCloses = 0;
+      const midTurn = makeMidTurnControl((registration, ctrl) => {
+        if (registration === 1) {
+          const injectedTask = makeQueueTask(
+            "req-codex-nowait-injected",
+            INJECTED_PROMPT_TEXT,
+            (message) => injectedSends.push(message),
+            () => {
+              injectedCloses += 1;
+            },
+            false,
+          );
+          queueMicrotask(() => {
+            ctrl.currentHandler?.(injectedTask);
+          });
+        }
+      });
+
+      const mainSends: QueueOwnerMessage[] = [];
+      let mainCloses = 0;
+      const mainTask = makeQueueTask(
+        "req-main-codex-nowait",
+        MAIN_PROMPT_TEXT,
+        (message) => mainSends.push(message),
+        () => {
+          mainCloses += 1;
+        },
+      );
+
+      await Promise.race([
+        runQueuedTask(record.acpxRecordId, mainTask, {
+          sharedClient: control.client,
+          setMidTurnHandler: midTurn.setMidTurnHandler,
+          suppressSdkConsoleErrors: true,
+        }),
+        new Promise<never>((_resolve, reject) => {
+          setTimeout(() => {
+            reject(new Error("Codex --no-wait steer must not block turn finalization"));
+          }, 250);
+        }),
+      ]);
+
+      assert.ok(
+        mainSends.find((m) => m.type === "result"),
+        "Codex turn finalized promptly despite the injected steer never returning a terminal",
+      );
+      assert.equal(mainCloses, 1, "main task closed exactly once");
+      const injectedCalls = control.promptCalls.filter((c) => c.kind === "injected");
+      assert.equal(injectedCalls.length, 1, "Codex injected steer was still sent");
+      assert.deepEqual(injectedSends, [], "Codex fire-and-forget steer sent no result/error");
+      assert.equal(injectedCloses, 0, "pending Codex steer was not awaited / double-closed");
+    });
+  });
+}
+
 // One standing test covering both injection scenarios: injection during the
 // active turn on attempt 0 (drained across a failed-then-retried turn),
 // injection during the retried attempt itself (the core fork guard), and a
@@ -592,6 +779,16 @@ test("mid-turn prompt injection fires and settles exactly once, including across
   await runAttempt0InjectionScenario();
   await runRetryInjectionScenario();
   await runFireAndForgetInjectionWithoutTerminalResponseScenario();
+});
+
+// #1 root fix + non-regression, gated by backend (bugs/stuck-red-turn-end-not-
+// persisted): a Claude `--no-wait` injected prompt (returns a terminal) is now
+// AWAITED so its output/terminal land before the turn finalizes; a Codex
+// `--no-wait` steer (returns no terminal) stays fire-and-forget so the turn
+// still finalizes promptly. Kept as one sequential test for isolation.
+test("backend-gated mid-turn injection: Claude --no-wait is awaited, Codex stays fire-and-forget", async () => {
+  await runClaudeNoWaitInjectionIsAwaitedScenario();
+  await runCodexNoWaitInjectionStaysFireAndForgetScenario();
 });
 
 // Gate wiring: the claude-pty bridge command must now opt a session into

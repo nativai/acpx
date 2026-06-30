@@ -18,3 +18,27 @@ export function supportsMidTurnPromptInjection(agentCommand: string): boolean {
     return false;
   }
 }
+
+// Whether an injected (mid-turn) prompt to this backend returns a terminal
+// JSON-RPC response, so the turn can safely AWAIT it (push it into the drained
+// set) without risking a turn that never closes. This is narrower than
+// supportsMidTurnPromptInjection: a backend can support injection yet not
+// return a terminal for the injected request.
+//   Claude ACP  → a separate concurrent client.prompt() that resolves with
+//                 result(stopReason) and can outlive the primary — the RCA bug;
+//                 awaiting it IS the fix.
+//   claude-pty  → injectSteer() always resolves with a terminal (steer-ack on a
+//                 landed paste, else the turn-end fallback) — safe to await.
+//   Codex       → acts on the steer WITHIN the active turn and returns NO
+//                 terminal for the injected request → must stay fire-and-forget
+//                 (awaiting it would hold the turn open until the backstop).
+//   unknown     → false (conservative: only await backends known to terminate,
+//                 so an unknown fire-and-forget steer can never wedge a turn).
+export function injectionReturnsTerminalResponse(agentCommand: string): boolean {
+  try {
+    const { command, args } = splitCommandLine(agentCommand);
+    return isClaudeAcpCommand(command, args) || isClaudePtyAcpCommand(command, args);
+  } catch {
+    return false;
+  }
+}
