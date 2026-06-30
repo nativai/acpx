@@ -16,6 +16,7 @@ import {
   recordSessionUpdate,
   trimConversationForRuntime,
 } from "../../session/conversation-model.js";
+import { withDefaultModelForNewSession } from "../../session/default-model.js";
 import { defaultSessionEventLog } from "../../session/event-log.js";
 import { LiveSessionCheckpoint } from "../../session/live-checkpoint.js";
 import {
@@ -322,6 +323,7 @@ type CreatedRuntimeSession = {
   sessionResult:
     | Awaited<ReturnType<AcpClient["createSession"]>>
     | Awaited<ReturnType<AcpClient["loadSession"]>>;
+  created: boolean;
 };
 
 type RuntimeTurnTaskState = {
@@ -372,6 +374,7 @@ async function createOrLoadRuntimeSession(
         sessionId: resumeSessionId,
         agentSessionId: resumed.agentSessionId,
         sessionResult: resumed,
+        created: false,
       };
     }
     if (!client.supportsLoadSession()) {
@@ -384,6 +387,7 @@ async function createOrLoadRuntimeSession(
       sessionId: resumeSessionId,
       agentSessionId: loaded.agentSessionId,
       sessionResult: loaded,
+      created: false,
     };
   }
 
@@ -392,7 +396,19 @@ async function createOrLoadRuntimeSession(
     sessionId: created.sessionId,
     agentSessionId: created.agentSessionId,
     sessionResult: created,
+    created: true,
   };
+}
+
+function sessionOptionsForCreatedRuntimeSession(
+  agentCommand: string,
+  sessionOptions: SessionAgentOptions | undefined,
+  session: CreatedRuntimeSession,
+): SessionAgentOptions | undefined {
+  if (!session.created) {
+    return sessionOptions;
+  }
+  return withDefaultModelForNewSession(agentCommand, sessionOptions);
 }
 
 export class AcpRuntimeManager {
@@ -595,10 +611,15 @@ export class AcpRuntimeManager {
     record.protocolVersion = client.initializeResult?.protocolVersion;
     record.agentCapabilities = client.initializeResult?.agentCapabilities;
     applyConfigOptionsToRecord(record, session.sessionResult);
+    const effectiveSessionOptions = sessionOptionsForCreatedRuntimeSession(
+      agentCommand,
+      input.sessionOptions,
+      session,
+    );
     const requestedModelApplied = await applyRequestedModelIfAdvertised({
       client,
       sessionId: session.sessionId,
-      requestedModel: input.sessionOptions?.model,
+      requestedModel: effectiveSessionOptions?.model,
       models: session.sessionResult.models,
       agentCommand,
       timeoutMs: this.options.timeoutMs,
@@ -607,18 +628,18 @@ export class AcpRuntimeManager {
       client,
       sessionId: session.sessionId,
       record,
-      reasoningEffort: input.sessionOptions?.reasoningEffort,
+      reasoningEffort: effectiveSessionOptions?.reasoningEffort,
       advertised: session.sessionResult.configOptions,
-      modelId: input.sessionOptions?.model,
+      modelId: effectiveSessionOptions?.model,
       timeoutMs: this.options.timeoutMs,
       verbose: this.options.verbose,
     });
     syncAdvertisedModelState(record, session.sessionResult.models);
     if (requestedModelApplied) {
-      setCurrentModelId(record, input.sessionOptions?.model);
+      setCurrentModelId(record, effectiveSessionOptions?.model);
     }
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
-    persistSessionOptions(record, input.sessionOptions);
+    persistSessionOptions(record, effectiveSessionOptions);
     persistSessionOwnerOptions(record, this.options);
     await this.options.sessionStore.save(record);
     return record;

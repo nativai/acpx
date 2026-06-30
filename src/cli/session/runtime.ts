@@ -49,6 +49,7 @@ import {
   stampSteerBoundaryUuid,
   trimConversationForRuntime,
 } from "../../session/conversation-model.js";
+import { withDefaultModelForNewSession } from "../../session/default-model.js";
 import {
   buildDeliveryEvent,
   type DeliveryEventError,
@@ -1857,10 +1858,14 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
           );
         });
         const sessionId = createdSession.sessionId;
+        const effectiveSessionOptions = withDefaultModelForNewSession(
+          options.agentCommand,
+          options.sessionOptions,
+        );
         await applyRequestedModelIfAdvertised({
           client,
           sessionId,
-          requestedModel: options.sessionOptions?.model,
+          requestedModel: effectiveSessionOptions?.model,
           models: createdSession.models,
           agentCommand: options.agentCommand,
           timeoutMs: options.timeoutMs,
@@ -1869,9 +1874,9 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
         await applyExecReasoningEffort({
           client,
           sessionId,
-          reasoningEffort: options.sessionOptions?.reasoningEffort,
+          reasoningEffort: effectiveSessionOptions?.reasoningEffort,
           advertised: createdSession.configOptions,
-          modelId: options.sessionOptions?.model,
+          modelId: effectiveSessionOptions?.model,
           timeoutMs: options.timeoutMs,
           verbose: options.verbose,
         });
