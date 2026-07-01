@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  injectionAbsorbsIntoActiveTurn,
   injectionReturnsTerminalResponse,
   supportsMidTurnPromptInjection,
 } from "../src/acp/mid-turn-injection-support.js";
@@ -63,4 +64,18 @@ test("injectionReturnsTerminalResponse is FALSE for Codex (no terminal) and unkn
   assert.equal(injectionReturnsTerminalResponse("node mock-agent.js"), false);
   assert.equal(injectionReturnsTerminalResponse("gemini --experimental-acp"), false);
   assert.equal(injectionReturnsTerminalResponse("node 'unterminated"), false);
+});
+
+test("injectionAbsorbsIntoActiveTurn is TRUE only for Codex", () => {
+  assert.equal(injectionAbsorbsIntoActiveTurn("codex-acp"), true);
+  assert.equal(
+    injectionAbsorbsIntoActiveTurn("npx -y @agentclientprotocol/codex-acp@^0.0.44"),
+    true,
+  );
+
+  assert.equal(injectionAbsorbsIntoActiveTurn("node /opt/claude-agent-acp/dist/index.js"), false);
+  assert.equal(injectionAbsorbsIntoActiveTurn("claude-agent-acp"), false);
+  assert.equal(injectionAbsorbsIntoActiveTurn("node /opt/claude-pty-acp/dist/index.js"), false);
+  assert.equal(injectionAbsorbsIntoActiveTurn("node mock-agent.js"), false);
+  assert.equal(injectionAbsorbsIntoActiveTurn("node 'unterminated"), false);
 });

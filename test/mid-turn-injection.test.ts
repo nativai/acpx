@@ -123,6 +123,21 @@ function turnPhases(events: unknown[]): unknown[] {
     .map((event) => eventParams(event).phase);
 }
 
+function deliveryEventParams(events: unknown[]): Record<string, unknown>[] {
+  return events
+    .filter((event) => eventMethod(event) === "acpx/delivery")
+    .map((event) => eventParams(event));
+}
+
+function deliveryEventSummaries(events: unknown[]): Record<string, unknown>[] {
+  return deliveryEventParams(events).map((event) => ({
+    messageId: event.messageId,
+    requestId: event.requestId,
+    phase: event.phase,
+    stopReason: event.stopReason,
+  }));
+}
+
 type MockClientControl = {
   client: AcpClient;
   promptCalls: PromptCall[];
@@ -700,6 +715,8 @@ async function runCodexNoWaitInjectionStaysFireAndForgetScenario(): Promise<void
       await writeSessionRecordFile(homeDir, record);
 
       const injectionInitiated = createDeferred<void>();
+      const mainMessageId = "55555555-5555-4555-8555-555555555555";
+      const injectedMessageId = "66666666-6666-4666-8666-666666666666";
 
       const control = makeMockClient({
         onMainPrompt: async () => {
@@ -725,6 +742,7 @@ async function runCodexNoWaitInjectionStaysFireAndForgetScenario(): Promise<void
               injectedCloses += 1;
             },
             false,
+            injectedMessageId,
           );
           queueMicrotask(() => {
             ctrl.currentHandler?.(injectedTask);
@@ -741,6 +759,8 @@ async function runCodexNoWaitInjectionStaysFireAndForgetScenario(): Promise<void
         () => {
           mainCloses += 1;
         },
+        true,
+        mainMessageId,
       );
 
       await Promise.race([
@@ -763,8 +783,267 @@ async function runCodexNoWaitInjectionStaysFireAndForgetScenario(): Promise<void
       assert.equal(mainCloses, 1, "main task closed exactly once");
       const injectedCalls = control.promptCalls.filter((c) => c.kind === "injected");
       assert.equal(injectedCalls.length, 1, "Codex injected steer was still sent");
+      assert.equal(injectedCalls[0]?.messageId, injectedMessageId);
       assert.deepEqual(injectedSends, [], "Codex fire-and-forget steer sent no result/error");
-      assert.equal(injectedCloses, 0, "pending Codex steer was not awaited / double-closed");
+      assert.equal(injectedCloses, 1, "absorbed Codex steer was closed exactly once");
+
+      const streamEvents = await listSessionEvents(record.acpxRecordId);
+      assert.deepEqual(turnPhases(streamEvents), ["active", "idle"]);
+      const deliveryEvents = deliveryEventParams(streamEvents);
+      assert.deepEqual(
+        deliveryEvents.map(({ at: _at, ...params }) => params),
+        [
+          {
+            messageId: mainMessageId,
+            requestId: "req-main-codex-nowait",
+            phase: "accepted",
+            stopReason: null,
+            error: { code: 0, message: "", detailCode: "" },
+          },
+          {
+            messageId: injectedMessageId,
+            requestId: "req-codex-nowait-injected",
+            phase: "accepted",
+            stopReason: null,
+            error: { code: 0, message: "", detailCode: "" },
+          },
+          {
+            messageId: injectedMessageId,
+            requestId: "req-codex-nowait-injected",
+            phase: "done",
+            stopReason: null,
+            error: { code: 0, message: "", detailCode: "" },
+          },
+          {
+            messageId: mainMessageId,
+            requestId: "req-main-codex-nowait",
+            phase: "done",
+            stopReason: "end_turn",
+            error: { code: 0, message: "", detailCode: "" },
+          },
+        ],
+      );
+      assert.equal(
+        deliveryEvents.every((event) => typeof event.at === "string"),
+        true,
+      );
+    });
+  });
+}
+
+async function runCodexStackedNoWaitInjectionsGetTerminalsScenario(): Promise<void> {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeSessionRecord(homeDir, "codex-acp");
+      await writeSessionRecordFile(homeDir, record);
+
+      const mainMessageId = "77777777-7777-4777-8777-777777777777";
+      const injectedMessageIdA = "88888888-8888-4888-8888-888888888888";
+      const injectedMessageIdB = "99999999-9999-4999-8999-999999999999";
+      const firstInjectionInitiated = createDeferred<void>();
+      const bothInjectionsInitiated = createDeferred<void>();
+      let injectedPromptCount = 0;
+
+      const control = makeMockClient({
+        onMainPrompt: async () => {
+          await bothInjectionsInitiated.promise;
+          return { stopReason: "end_turn" };
+        },
+        onInjectedPrompt: async () => {
+          injectedPromptCount += 1;
+          if (injectedPromptCount === 1) {
+            firstInjectionInitiated.resolve();
+          }
+          if (injectedPromptCount === 2) {
+            bothInjectionsInitiated.resolve();
+          }
+          return await new Promise<PromptResponse>(() => {});
+        },
+      });
+
+      let injectedCloses = 0;
+      const midTurn = makeMidTurnControl((registration, ctrl) => {
+        if (registration === 1) {
+          const firstInjectedTask = makeQueueTask(
+            "req-codex-stacked-a",
+            INJECTED_PROMPT_TEXT,
+            () => {},
+            () => {
+              injectedCloses += 1;
+            },
+            false,
+            injectedMessageIdA,
+          );
+          const secondInjectedTask = makeQueueTask(
+            "req-codex-stacked-b",
+            INJECTED_PROMPT_TEXT,
+            () => {},
+            () => {
+              injectedCloses += 1;
+            },
+            false,
+            injectedMessageIdB,
+          );
+          queueMicrotask(() => {
+            ctrl.currentHandler?.(firstInjectedTask);
+            void firstInjectionInitiated.promise.then(() => {
+              ctrl.currentHandler?.(secondInjectedTask);
+            });
+          });
+        }
+      });
+
+      const mainTask = makeQueueTask(
+        "req-main-codex-stacked",
+        MAIN_PROMPT_TEXT,
+        () => {},
+        () => {},
+        true,
+        mainMessageId,
+      );
+
+      await runQueuedTask(record.acpxRecordId, mainTask, {
+        sharedClient: control.client,
+        setMidTurnHandler: midTurn.setMidTurnHandler,
+        suppressSdkConsoleErrors: true,
+      });
+
+      const injectedCalls = control.promptCalls.filter((c) => c.kind === "injected");
+      assert.equal(injectedCalls.length, 2, "both stacked Codex steers were sent");
+      assert.equal(injectedCloses, 2, "both absorbed Codex steers were closed exactly once");
+
+      const streamEvents = await listSessionEvents(record.acpxRecordId);
+      assert.deepEqual(deliveryEventSummaries(streamEvents), [
+        {
+          messageId: mainMessageId,
+          requestId: "req-main-codex-stacked",
+          phase: "accepted",
+          stopReason: null,
+        },
+        {
+          messageId: injectedMessageIdA,
+          requestId: "req-codex-stacked-a",
+          phase: "accepted",
+          stopReason: null,
+        },
+        {
+          messageId: injectedMessageIdB,
+          requestId: "req-codex-stacked-b",
+          phase: "accepted",
+          stopReason: null,
+        },
+        {
+          messageId: injectedMessageIdA,
+          requestId: "req-codex-stacked-a",
+          phase: "done",
+          stopReason: null,
+        },
+        {
+          messageId: injectedMessageIdB,
+          requestId: "req-codex-stacked-b",
+          phase: "done",
+          stopReason: null,
+        },
+        {
+          messageId: mainMessageId,
+          requestId: "req-main-codex-stacked",
+          phase: "done",
+          stopReason: "end_turn",
+        },
+      ]);
+    });
+  });
+}
+
+async function runCodexNoWaitInjectionFailsWithContainingTurnScenario(): Promise<void> {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeSessionRecord(homeDir, "codex-acp");
+      await writeSessionRecordFile(homeDir, record);
+
+      const mainMessageId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      const injectedMessageId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      const injectionInitiated = createDeferred<void>();
+
+      const control = makeMockClient({
+        onMainPrompt: async () => {
+          await injectionInitiated.promise;
+          throw new Error("containing turn failed");
+        },
+        onInjectedPrompt: async () => {
+          injectionInitiated.resolve();
+          return await new Promise<PromptResponse>(() => {});
+        },
+      });
+
+      let injectedCloses = 0;
+      const midTurn = makeMidTurnControl((registration, ctrl) => {
+        if (registration === 1) {
+          const injectedTask = makeQueueTask(
+            "req-codex-failed-injected",
+            INJECTED_PROMPT_TEXT,
+            () => {},
+            () => {
+              injectedCloses += 1;
+            },
+            false,
+            injectedMessageId,
+          );
+          queueMicrotask(() => {
+            ctrl.currentHandler?.(injectedTask);
+          });
+        }
+      });
+
+      const mainSends: QueueOwnerMessage[] = [];
+      const mainTask = makeQueueTask(
+        "req-main-codex-failed",
+        MAIN_PROMPT_TEXT,
+        (message) => mainSends.push(message),
+        () => {},
+        true,
+        mainMessageId,
+      );
+
+      await runQueuedTask(record.acpxRecordId, mainTask, {
+        sharedClient: control.client,
+        setMidTurnHandler: midTurn.setMidTurnHandler,
+        suppressSdkConsoleErrors: true,
+      });
+
+      assert.equal(
+        mainSends.some((message) => message.type === "result"),
+        false,
+        "main task did not report success after the containing turn failed",
+      );
+      assert.equal(injectedCloses, 1, "failed containing turn closed the absorbed steer");
+      const streamEvents = await listSessionEvents(record.acpxRecordId);
+      assert.deepEqual(deliveryEventSummaries(streamEvents), [
+        {
+          messageId: mainMessageId,
+          requestId: "req-main-codex-failed",
+          phase: "accepted",
+          stopReason: null,
+        },
+        {
+          messageId: injectedMessageId,
+          requestId: "req-codex-failed-injected",
+          phase: "accepted",
+          stopReason: null,
+        },
+        {
+          messageId: injectedMessageId,
+          requestId: "req-codex-failed-injected",
+          phase: "failed",
+          stopReason: null,
+        },
+        {
+          messageId: mainMessageId,
+          requestId: "req-main-codex-failed",
+          phase: "failed",
+          stopReason: null,
+        },
+      ]);
     });
   });
 }
@@ -789,6 +1068,8 @@ test("mid-turn prompt injection fires and settles exactly once, including across
 test("backend-gated mid-turn injection: Claude --no-wait is awaited, Codex stays fire-and-forget", async () => {
   await runClaudeNoWaitInjectionIsAwaitedScenario();
   await runCodexNoWaitInjectionStaysFireAndForgetScenario();
+  await runCodexStackedNoWaitInjectionsGetTerminalsScenario();
+  await runCodexNoWaitInjectionFailsWithContainingTurnScenario();
 });
 
 // Gate wiring: the claude-pty bridge command must now opt a session into
@@ -1099,9 +1380,7 @@ test("mid-turn prompt injection threads messageId and emits delivery events", as
         "idle marker must be emitted after main and injected delivery events drain",
       );
 
-      const deliveryEvents = streamEvents
-        .filter((event) => (event as { method?: string }).method === "acpx/delivery")
-        .map((event) => (event as { params: Record<string, unknown> }).params);
+      const deliveryEvents = deliveryEventParams(streamEvents);
 
       assert.deepEqual(
         deliveryEvents.map(({ at: _at, ...params }) => params),

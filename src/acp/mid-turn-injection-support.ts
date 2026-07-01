@@ -42,3 +42,18 @@ export function injectionReturnsTerminalResponse(agentCommand: string): boolean 
     return false;
   }
 }
+
+// Whether a non-waiting injected prompt is known to be absorbed into the
+// already-active turn without producing an independent JSON-RPC terminal. For
+// these backends acpx must complete the delivery lifecycle it opens once the
+// containing turn ends, otherwise observers see accepted-with-no-terminal
+// forever. Keep this positive and narrow: unknown false means "do not invent
+// absorbed semantics."
+export function injectionAbsorbsIntoActiveTurn(agentCommand: string): boolean {
+  try {
+    const { command, args } = splitCommandLine(agentCommand);
+    return isCodexAcpCommand(command, args);
+  } catch {
+    return false;
+  }
+}

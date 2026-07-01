@@ -1,5 +1,6 @@
 import os from "node:os";
 import path from "node:path";
+import type { PromptResponse } from "@agentclientprotocol/sdk";
 import type { EffectiveAccountMetadata } from "../../acp/auth-env.js";
 import { AcpClient } from "../../acp/client.js";
 import {
@@ -7,7 +8,10 @@ import {
   isRetryablePromptError,
   normalizeOutputError,
 } from "../../acp/error-normalization.js";
-import { injectionReturnsTerminalResponse } from "../../acp/mid-turn-injection-support.js";
+import {
+  injectionAbsorbsIntoActiveTurn,
+  injectionReturnsTerminalResponse,
+} from "../../acp/mid-turn-injection-support.js";
 import { assertRequestedModelSupported } from "../../acp/model-support.js";
 import { InterruptedError, withInterrupt, withTimeout } from "../../async-control.js";
 import { tailClaudeSubagentJsonl } from "../../claude-jsonl.js";
@@ -206,6 +210,13 @@ function toPromptResult(
 type DeliveryContext = {
   messageId: string;
   requestId: string;
+};
+
+type AbsorbedInjectedDelivery = {
+  context: DeliveryContext;
+  task: QueueTask;
+  closed: boolean;
+  terminalWritten: boolean;
 };
 
 function deliveryContextFor(params: {
@@ -899,6 +910,11 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   // claude-pty (both terminate); false for Codex (acts on the steer in-turn,
   // returns no terminal) and unknown backends — they stay fire-and-forget.
   const awaitInjectedPrompt = injectionReturnsTerminalResponse(record.agentCommand);
+  // Codex no-wait steers are absorbed into the active turn and never produce a
+  // per-injection JSON-RPC terminal. Track their accepted delivery ids so the
+  // containing turn can close those exact lifecycles when it ends.
+  const completeAbsorbedInjectedNoWait = injectionAbsorbsIntoActiveTurn(record.agentCommand);
+  const absorbedInjectedDeliveries: AbsorbedInjectedDelivery[] = [];
   let sawAcpMessage = false;
   let eventWriterClosed = false;
   const acceptedDeliveryKeys = new Set<string>();
@@ -960,6 +976,197 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       ...params,
       terminal: true,
     });
+  };
+
+  const closeAbsorbedInjectedDelivery = (delivery: AbsorbedInjectedDelivery): void => {
+    if (delivery.closed) {
+      return;
+    }
+    delivery.closed = true;
+    delivery.task.close();
+  };
+
+  const completeAbsorbedInjectedDeliveries = async (
+    phase: Exclude<DeliveryPhase, "accepted">,
+    params: {
+      stopReason?: DeliveryStopReason;
+      error?: DeliveryEventError;
+    } = {},
+  ): Promise<void> => {
+    if (absorbedInjectedDeliveries.length === 0) {
+      return;
+    }
+    const deliveries = absorbedInjectedDeliveries.splice(0);
+    for (const delivery of deliveries) {
+      if (!delivery.terminalWritten) {
+        await appendDeliveryTerminal(delivery.context, phase, params);
+        delivery.terminalWritten = true;
+      }
+      closeAbsorbedInjectedDelivery(delivery);
+    }
+  };
+
+  const createAbsorbedInjectedDelivery = (
+    task: QueueTask,
+    context: DeliveryContext | undefined,
+  ): AbsorbedInjectedDelivery | undefined => {
+    if (!completeAbsorbedInjectedNoWait || task.waitForCompletion || !context) {
+      return undefined;
+    }
+    const delivery: AbsorbedInjectedDelivery = {
+      context,
+      task,
+      closed: false,
+      terminalWritten: false,
+    };
+    absorbedInjectedDeliveries.push(delivery);
+    return delivery;
+  };
+
+  const markAbsorbedDeliveryTerminalWritten = (
+    delivery: AbsorbedInjectedDelivery | undefined,
+  ): void => {
+    if (delivery) {
+      delivery.terminalWritten = true;
+    }
+  };
+
+  const maybeStampInjectedSteerBoundary = async (
+    injectedMessageId: string | undefined,
+    injectedResponse: PromptResponse,
+  ): Promise<void> => {
+    // Durable byway-fork provenance (A3): a mid-turn steer produces no
+    // distinct claude user record, so the bridge hands back the pre-steer
+    // transcript tail uuid in the steer ack `_meta.steerBoundaryUuid`.
+    // Stamp it onto the steer's User entry as the contract's primary
+    // signal. Note: `recordPromptStart` already finalized this entry
+    // to the append-only messages_log with its inherit-preceding value
+    // (= the preceding Agent's claudeUuid = the same pre-steer tail, equal
+    // by construction — see CONTRACT §2), so that inherited value is what
+    // the fork resolver durably reads. This stamp keeps the live record in
+    // sync with the bridge-authoritative uuid (and is picked up by a later
+    // log compaction rewrite); it does not rewrite the committed log line.
+    const steerBoundaryUuid = readSteerBoundaryUuid(injectedResponse._meta);
+    if (!injectedMessageId || !steerBoundaryUuid) {
+      return;
+    }
+    stampSteerBoundaryUuid(conversation, injectedMessageId, steerBoundaryUuid);
+    applyConversation(record, conversation);
+    await writeSessionRecordAtBoundary(record);
+  };
+
+  const sendInjectedResultIfWaiting = (
+    injectedTask: QueueTask,
+    injectedResponse: PromptResponse,
+  ): void => {
+    if (!injectedTask.waitForCompletion) {
+      return;
+    }
+    injectedTask.send({
+      type: "result",
+      requestId: injectedTask.requestId,
+      result: {
+        ...toPromptResult(injectedResponse.stopReason, record.acpxRecordId, client),
+        record,
+        resumed: true,
+      },
+    });
+  };
+
+  const sendInjectedErrorIfWaiting = (injectedTask: QueueTask, injectedError: unknown): void => {
+    if (!injectedTask.waitForCompletion) {
+      return;
+    }
+    const normalized = normalizeOutputError(injectedError, {
+      origin: "runtime",
+      detailCode: "MID_TURN_PROMPT_FAILED",
+    });
+    injectedTask.send({
+      type: "error",
+      requestId: injectedTask.requestId,
+      code: normalized.code,
+      detailCode: normalized.detailCode,
+      origin: normalized.origin,
+      message: normalized.message,
+      retryable: normalized.retryable,
+    });
+  };
+
+  const handleInjectedPromptResponse = async (
+    injectedTask: QueueTask,
+    injectedDeliveryContext: DeliveryContext | undefined,
+    injectedMessageId: string | undefined,
+    injectedResponse: PromptResponse,
+    absorbedDelivery: AbsorbedInjectedDelivery | undefined,
+  ): Promise<void> => {
+    await maybeStampInjectedSteerBoundary(injectedMessageId, injectedResponse);
+    await appendDeliveryTerminal(
+      injectedDeliveryContext,
+      deliveryPhaseForStopReason(injectedResponse.stopReason),
+      { stopReason: toDeliveryStopReason(injectedResponse.stopReason) },
+    );
+    markAbsorbedDeliveryTerminalWritten(absorbedDelivery);
+    sendInjectedResultIfWaiting(injectedTask, injectedResponse);
+  };
+
+  const handleInjectedPromptError = async (
+    injectedTask: QueueTask,
+    injectedDeliveryContext: DeliveryContext | undefined,
+    injectedError: unknown,
+    absorbedDelivery: AbsorbedInjectedDelivery | undefined,
+  ): Promise<void> => {
+    await appendDeliveryTerminal(injectedDeliveryContext, "failed", {
+      error: deliveryErrorFrom(injectedError),
+    }).catch(() => {});
+    markAbsorbedDeliveryTerminalWritten(absorbedDelivery);
+    sendInjectedErrorIfWaiting(injectedTask, injectedError);
+  };
+
+  const closeInjectedTask = (
+    injectedTask: QueueTask,
+    absorbedDelivery: AbsorbedInjectedDelivery | undefined,
+  ): void => {
+    if (absorbedDelivery) {
+      closeAbsorbedInjectedDelivery(absorbedDelivery);
+      return;
+    }
+    injectedTask.close();
+  };
+
+  const runInjectedPromptTask = async (
+    sessionId: string,
+    injectedTask: QueueTask,
+  ): Promise<void> => {
+    const injectedPrompt = injectedTask.prompt ?? textPrompt(injectedTask.message);
+    const injectedDeliveryContext = deliveryContextFor(injectedTask);
+    let absorbedDelivery: AbsorbedInjectedDelivery | undefined;
+    try {
+      const injectedMessageId = await recordPromptStart(injectedPrompt, injectedTask.messageId);
+      await appendDeliveryEvent(injectedDeliveryContext, "accepted");
+      const injectedResponsePromise = client.prompt(
+        sessionId,
+        injectedPrompt,
+        injectedTask.messageId !== undefined ? { messageId: injectedTask.messageId } : undefined,
+      );
+      absorbedDelivery = createAbsorbedInjectedDelivery(injectedTask, injectedDeliveryContext);
+      const injectedResponse = await injectedResponsePromise;
+      await handleInjectedPromptResponse(
+        injectedTask,
+        injectedDeliveryContext,
+        injectedMessageId,
+        injectedResponse,
+        absorbedDelivery,
+      );
+    } catch (injectedError) {
+      await handleInjectedPromptError(
+        injectedTask,
+        injectedDeliveryContext,
+        injectedError,
+        absorbedDelivery,
+      );
+    } finally {
+      closeInjectedTask(injectedTask, absorbedDelivery);
+    }
   };
 
   // Subagent tracking: map from agent_id (e.g. "poet-a@haiku-demo") to ACPX record id
@@ -1417,78 +1624,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       // rather than waiting for the current turn to end. Each injected promise
       // is tracked so the turn can await all of them once it finishes.
       options.setMidTurnHandler?.((injectedTask: QueueTask) => {
-        const injectedPromise = (async () => {
-          const injectedPrompt = injectedTask.prompt ?? textPrompt(injectedTask.message);
-          const injectedDeliveryContext = deliveryContextFor(injectedTask);
-          try {
-            const injectedMessageId = await recordPromptStart(
-              injectedPrompt,
-              injectedTask.messageId,
-            );
-            await appendDeliveryEvent(injectedDeliveryContext, "accepted");
-            const injectedResponse = await client.prompt(
-              sessionId,
-              injectedPrompt,
-              injectedTask.messageId !== undefined
-                ? { messageId: injectedTask.messageId }
-                : undefined,
-            );
-            // Durable byway-fork provenance (A3): a mid-turn steer produces no
-            // distinct claude user record, so the bridge hands back the pre-steer
-            // transcript tail uuid in the steer ack `_meta.steerBoundaryUuid`.
-            // Stamp it onto the steer's User entry as the contract's primary
-            // signal. Note: `recordPromptStart` above already finalized this entry
-            // to the append-only messages_log with its inherit-preceding value
-            // (= the preceding Agent's claudeUuid = the same pre-steer tail, equal
-            // by construction — see CONTRACT §2), so that inherited value is what
-            // the fork resolver durably reads. This stamp keeps the live record in
-            // sync with the bridge-authoritative uuid (and is picked up by a later
-            // log compaction rewrite); it does not rewrite the committed log line.
-            const steerBoundaryUuid = readSteerBoundaryUuid(injectedResponse._meta);
-            if (injectedMessageId && steerBoundaryUuid) {
-              stampSteerBoundaryUuid(conversation, injectedMessageId, steerBoundaryUuid);
-              applyConversation(record, conversation);
-              await writeSessionRecordAtBoundary(record);
-            }
-            await appendDeliveryTerminal(
-              injectedDeliveryContext,
-              deliveryPhaseForStopReason(injectedResponse.stopReason),
-              { stopReason: toDeliveryStopReason(injectedResponse.stopReason) },
-            );
-            if (injectedTask.waitForCompletion) {
-              injectedTask.send({
-                type: "result",
-                requestId: injectedTask.requestId,
-                result: {
-                  ...toPromptResult(injectedResponse.stopReason, record.acpxRecordId, client),
-                  record,
-                  resumed: true,
-                },
-              });
-            }
-          } catch (injectedError) {
-            await appendDeliveryTerminal(injectedDeliveryContext, "failed", {
-              error: deliveryErrorFrom(injectedError),
-            }).catch(() => {});
-            if (injectedTask.waitForCompletion) {
-              const normalized = normalizeOutputError(injectedError, {
-                origin: "runtime",
-                detailCode: "MID_TURN_PROMPT_FAILED",
-              });
-              injectedTask.send({
-                type: "error",
-                requestId: injectedTask.requestId,
-                code: normalized.code,
-                detailCode: normalized.detailCode,
-                origin: normalized.origin,
-                message: normalized.message,
-                retryable: normalized.retryable,
-              });
-            }
-          } finally {
-            injectedTask.close();
-          }
-        })();
+        const injectedPromise = runInjectedPromptTask(sessionId, injectedTask);
         // Track (await) this injected promise when EITHER the caller is waiting
         // for completion (unchanged), OR the backend returns a terminal for an
         // injected prompt (Claude / claude-pty). This is the root fix for the
@@ -1567,6 +1703,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // Stop injecting and await in-flight injected prompts before deciding
     // whether to retry or fail (mirrors the success path).
     await drainInjectedPrompts();
+    await completeAbsorbedInjectedDeliveries("failed", {
+      error: deliveryErrorFrom(error),
+    });
     const snapshot = client.getAgentLifecycleSnapshot();
     if (
       shouldRetryRuntimePrompt(
@@ -1674,6 +1813,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         await liveCheckpoint.checkpoint();
 
         const response = await savePromptSuccess(await runPromptWithRetries(activeSessionId));
+        await completeAbsorbedInjectedDeliveries(
+          deliveryPhaseForStopReason(response.stopReason),
+          response.stopReason === "cancelled" ? { stopReason: "cancelled" } : { stopReason: null },
+        );
         await appendDeliveryTerminal(
           mainDeliveryContext,
           deliveryPhaseForStopReason(response.stopReason),
@@ -1690,6 +1833,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       },
       async () => {
         const response = await client.cancelActivePrompt(INTERRUPT_CANCEL_WAIT_MS);
+        await completeAbsorbedInjectedDeliveries("cancelled", {
+          stopReason: "cancelled",
+        }).catch(() => {});
         if (response?.stopReason === "cancelled") {
           await appendDeliveryTerminal(mainDeliveryContext, "cancelled", {
             stopReason: "cancelled",
@@ -1715,10 +1861,16 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       client.getEffectiveAccountMetadata(),
     );
     if (error instanceof InterruptedError) {
+      await completeAbsorbedInjectedDeliveries("cancelled", {
+        stopReason: "cancelled",
+      }).catch(() => {});
       await appendDeliveryTerminal(mainDeliveryContext, "cancelled", {
         stopReason: "cancelled",
       }).catch(() => {});
     } else {
+      await completeAbsorbedInjectedDeliveries("failed", {
+        error: deliveryErrorFrom(annotatedError),
+      }).catch(() => {});
       await appendDeliveryTerminal(mainDeliveryContext, "failed", {
         error: deliveryErrorFrom(annotatedError),
       }).catch(() => {});
