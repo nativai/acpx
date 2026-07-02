@@ -70,7 +70,13 @@ function enrichedRecord(overrides: Partial<SessionRecord> = {}): SessionRecord {
     forkedFromSessionId: "src-1",
     forkedAtMessageIndex: 7,
     agentCapabilities: { promptCapabilities: { image: true } },
-    metadata: { task_folder: "/wisdom/x", byway: "1", byway_parent: "src-1", byway_at: "7" },
+    metadata: {
+      task_folder: "/wisdom/x",
+      brick: "11111111-2222-3333-4444-555555555555",
+      byway: "1",
+      byway_parent: "src-1",
+      byway_at: "7",
+    },
     template: {
       enabled: true,
       created_at: "2026-06-01T05:00:00.000Z",
@@ -92,6 +98,7 @@ test("toSessionIndexEntry projects every hot scalar from the record", () => {
   assert.equal(entry.forkedFromSessionId, "src-1");
   assert.equal(entry.forkedAtMessageIndex, 7);
   assert.equal(entry.metadataTaskFolder, "/wisdom/x");
+  assert.equal(entry.metadataBrick, "11111111-2222-3333-4444-555555555555");
   assert.equal(entry.byway, true);
   assert.equal(entry.currentModelId, "gpt-5.5[high]");
   assert.equal(entry.sessionModel, "gpt-5.5[high]");
@@ -164,6 +171,7 @@ test("toSessionIndexEntry omits absent optionals (no byway flag, no acpx block)"
   assert.equal("subscription" in onDisk, false);
   assert.equal("templateEnabled" in onDisk, false);
   assert.equal("forkedFromSessionId" in onDisk, false);
+  assert.equal("metadataBrick" in onDisk, false);
   // required fields always present
   assert.equal(onDisk.acpxRecordId, "plain");
 });
@@ -214,6 +222,7 @@ test("parseIndexEntry preserves enrichment across a write→read round-trip (unt
     assert.equal(back.promptImageSupported, true);
     assert.equal(back.byway, true);
     assert.equal(back.metadataTaskFolder, "/wisdom/x");
+    assert.equal(back.metadataBrick, "11111111-2222-3333-4444-555555555555");
     assert.equal(back.templateEnabled, true);
     assert.equal(back.templateCreatedAt, "2026-06-01T05:00:00.000Z");
     assert.equal(back.forkedFromSessionId, "src-1");
@@ -238,6 +247,7 @@ test("parseIndexEntry is lenient: a wrong-typed optional is dropped, entry still
     >;
     entry.favorite = "yes"; // wrong type
     entry.forkedAtMessageIndex = "seven"; // wrong type
+    entry.metadataBrick = 42; // wrong type
     await writeSessionIndex(dir, {
       files: ["enrich-1.json"],
       entries: [entry as unknown as SessionIndexEntry],
@@ -247,6 +257,7 @@ test("parseIndexEntry is lenient: a wrong-typed optional is dropped, entry still
     const back = reloaded.entries[0];
     assert.equal(back.favorite, undefined);
     assert.equal(back.forkedAtMessageIndex, undefined);
+    assert.equal(back.metadataBrick, undefined);
     // a good neighbour optional still comes through
     assert.equal(back.currentModelId, "gpt-5.5[high]");
   } finally {

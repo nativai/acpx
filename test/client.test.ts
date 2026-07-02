@@ -20,6 +20,9 @@ import {
   UnsupportedPromptContentError,
 } from "../src/errors.js";
 
+const BRICK_SHIM_DIR = path.join(process.cwd(), "test", "fixtures", "brick-shim");
+const BRICK_ID = "11111111-2222-3333-4444-555555555555";
+
 type ClientInternals = {
   selectAuthMethod?: (methods: Array<{ id: string }>) =>
     | {
@@ -746,6 +749,99 @@ test("AcpClient createSession forwards systemPrompt append in _meta alongside cl
         },
       },
       systemPrompt: { append: "always speak in spanish" },
+    },
+  });
+});
+
+test("AcpClient createSession injects brick context on the system-prompt channel", async () => {
+  const cwd = path.resolve("/tmp/acpx-client-brick-context");
+  const client = makeClient({
+    agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+    sessionContext: {
+      acpxRecordId: "child-id",
+      brick: BRICK_ID,
+    },
+    sessionOptions: {
+      systemPrompt: { append: "HUMAN" },
+    },
+  });
+
+  let capturedParams: Record<string, unknown> | undefined;
+  asInternals(client).connection = {
+    newSession: async (params: Record<string, unknown>) => {
+      capturedParams = params;
+      return { sessionId: "session-brick-context" };
+    },
+  };
+
+  await withEnv(
+    {
+      PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
+      BRICK_SHIM_MODE: "ok",
+      BRICK_SHIM_CONTEXT: "BRICK",
+      ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh",
+    },
+    async () => {
+      resetSessionPrimerMemoForTests();
+      try {
+        await client.createSession("/tmp/acpx-client-brick-context");
+      } finally {
+        resetSessionPrimerMemoForTests();
+      }
+    },
+  );
+
+  assert.deepEqual(capturedParams, {
+    cwd,
+    mcpServers: [],
+    _meta: {
+      systemPrompt: { append: "BRICK\n\n---\n\nHUMAN" },
+    },
+  });
+});
+
+test("AcpClient createSession skips brick context when --system-prompt replace is used", async () => {
+  const cwd = path.resolve("/tmp/acpx-client-brick-replace");
+  const client = makeClient({
+    agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+    sessionContext: {
+      acpxRecordId: "child-id",
+      brick: BRICK_ID,
+    },
+    sessionOptions: {
+      systemPrompt: "REPLACE",
+    },
+  });
+
+  let capturedParams: Record<string, unknown> | undefined;
+  asInternals(client).connection = {
+    newSession: async (params: Record<string, unknown>) => {
+      capturedParams = params;
+      return { sessionId: "session-brick-replace" };
+    },
+  };
+
+  await withEnv(
+    {
+      PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
+      BRICK_SHIM_MODE: "crash",
+      ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh",
+    },
+    async () => {
+      resetSessionPrimerMemoForTests();
+      try {
+        await client.createSession("/tmp/acpx-client-brick-replace");
+      } finally {
+        resetSessionPrimerMemoForTests();
+      }
+    },
+  );
+
+  assert.deepEqual(capturedParams, {
+    cwd,
+    mcpServers: [],
+    _meta: {
+      systemPrompt: "REPLACE",
     },
   });
 });

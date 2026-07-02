@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  applyBrickFlag,
+  withInheritedBrick,
   withInheritedAgentCommand,
   withInheritedModel,
   withInheritedProfile,
@@ -8,6 +10,9 @@ import {
   withInheritedSubscription,
   withInheritedTaskFolder,
 } from "../src/cli/session/inherited-metadata.js";
+
+const BRICK_X = "11111111-2222-3333-4444-555555555555";
+const BRICK_Y = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
 test("withInheritedTaskFolder inherits the parent task_folder when child metadata is absent", () => {
   assert.deepEqual(withInheritedTaskFolder(undefined, "/abs/task"), { task_folder: "/abs/task" });
@@ -53,6 +58,47 @@ test("withInheritedTaskFolder does not mutate the child metadata object", () => 
   const result = withInheritedTaskFolder(child, "/abs/task");
   assert.notEqual(result, child);
   assert.deepEqual(child, { other: "x" });
+});
+
+test("withInheritedBrick inherits parent brick when child metadata is absent", () => {
+  assert.deepEqual(withInheritedBrick(undefined, BRICK_X, false), { brick: BRICK_X });
+});
+
+test("withInheritedBrick inherits beside unrelated child metadata", () => {
+  assert.deepEqual(withInheritedBrick({ other: "x" }, BRICK_X, false), {
+    other: "x",
+    brick: BRICK_X,
+  });
+});
+
+test("withInheritedBrick leaves explicit child brick values alone, including empty", () => {
+  assert.deepEqual(withInheritedBrick({ brick: BRICK_Y }, BRICK_X, false), { brick: BRICK_Y });
+  assert.deepEqual(withInheritedBrick({ brick: "" }, BRICK_X, false), { brick: "" });
+});
+
+test("withInheritedBrick treats absent or whitespace parent brick as absent", () => {
+  assert.equal(withInheritedBrick(undefined, undefined, false), undefined);
+  assert.equal(withInheritedBrick(undefined, null, false), undefined);
+  assert.equal(withInheritedBrick(undefined, "   ", false), undefined);
+});
+
+test("withInheritedBrick trims inherited parent values", () => {
+  assert.deepEqual(withInheritedBrick(undefined, `  ${BRICK_X}  `, false), { brick: BRICK_X });
+});
+
+test("withInheritedBrick blocked strips brick and suppresses inheritance", () => {
+  assert.deepEqual(withInheritedBrick({ brick: BRICK_Y, other: "x" }, BRICK_X, true), {
+    other: "x",
+  });
+  assert.equal(withInheritedBrick(undefined, BRICK_X, true), undefined);
+});
+
+test("applyBrickFlag overwrites raw metadata brick when --brick resolved a value", () => {
+  assert.deepEqual(applyBrickFlag({ brick: BRICK_Y, other: "x" }, BRICK_X), {
+    brick: BRICK_X,
+    other: "x",
+  });
+  assert.deepEqual(applyBrickFlag({ brick: BRICK_Y }, false), { brick: BRICK_Y });
 });
 
 test("withInheritedSubscription: child inherits the parent sub when it has no explicit selection", () => {

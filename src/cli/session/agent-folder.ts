@@ -43,6 +43,11 @@ function isExistingDirectory(target: string): boolean {
   }
 }
 
+function usableBaseDirectory(candidate: string | null | undefined): string | null {
+  const trimmed = candidate?.trim();
+  return trimmed && path.isAbsolute(trimmed) && isExistingDirectory(trimmed) ? trimmed : null;
+}
+
 /**
  * Resolve (and create) the per-agent folder for a session:
  * `<task_folder>/agents/<sanitized-name>-<id8>/` (bare `<id8>` when the name is
@@ -54,15 +59,16 @@ function isExistingDirectory(target: string): boolean {
  * tree. Re-derived each spawn with an idempotent `mkdir -p`, so a later rename
  * or self-applied `task_folder` is picked up on the next spawn.
  */
-export function resolveAndEnsureAgentFolder(record: SessionRecord): string | null {
-  const taskFolder = record.metadata?.task_folder?.trim();
-  if (!taskFolder || !path.isAbsolute(taskFolder)) {
+export function resolveAndEnsureAgentFolder(
+  record: SessionRecord,
+  brickPath?: string | null,
+): string | null {
+  const baseDirectory =
+    usableBaseDirectory(brickPath) ?? usableBaseDirectory(record.metadata?.task_folder);
+  if (!baseDirectory) {
     return null;
   }
-  if (!isExistingDirectory(taskFolder)) {
-    return null;
-  }
-  const agentFolder = path.join(taskFolder, "agents", buildAgentFolderName(record));
+  const agentFolder = path.join(baseDirectory, "agents", buildAgentFolderName(record));
   fs.mkdirSync(agentFolder, { recursive: true });
   return agentFolder;
 }

@@ -1,6 +1,7 @@
 import path from "node:path";
 import { InvalidArgumentError } from "commander";
 import type { SessionRecord } from "../../types.js";
+import { isBrickUuid } from "./brick-link.js";
 
 /**
  * Validate a value for the self-apply `sessions set-metadata <key> <value>`
@@ -20,6 +21,15 @@ export function validateSessionMetadataValue(key: string, value: string): string
     throw new InvalidArgumentError(
       `task_folder must be an absolute path (got: ${JSON.stringify(value)})`,
     );
+  }
+  if (key === "brick") {
+    const normalized = trimmed.toLowerCase();
+    if (!isBrickUuid(normalized)) {
+      throw new InvalidArgumentError(
+        `brick must be a full uuid (got: ${JSON.stringify(value)}); resolve refs with: brick show <ref> --json`,
+      );
+    }
+    return normalized;
   }
   return trimmed;
 }

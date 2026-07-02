@@ -4799,6 +4799,9 @@ async function runCliWithEntry(
       "ACPX_SESSION_NAME",
       "ACPX_PARENT_SESSION_URL",
       "ACPX_TASK_FOLDER",
+      "ACPX_BRICK",
+      "ACPX_BRICK_PATH",
+      "ACPX_OWNER_LOG",
       "ACPX_SUBSCRIPTION",
     ]) {
       if (!Object.prototype.hasOwnProperty.call(options.env ?? {}, key)) {

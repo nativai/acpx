@@ -228,6 +228,8 @@ export type AcpClientOptions = {
     /** Full parent acpx-ui URL (host+id) for cross-machine lineage. (FW-19) */
     parentSessionUrl?: string | null;
     taskFolder?: string | null;
+    brick?: string | null;
+    brickPath?: string | null;
     agentFolder?: string | null;
     subscriptionId?: string | null;
     /** Profile id from session_options.profile — takes priority over subscriptionId. */

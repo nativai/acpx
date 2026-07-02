@@ -25,6 +25,9 @@ function runCli(args: string[], homeDir: string): Promise<CliResult> {
       "ACPX_SESSION_NAME",
       "ACPX_PARENT_SESSION_URL",
       "ACPX_TASK_FOLDER",
+      "ACPX_BRICK",
+      "ACPX_BRICK_PATH",
+      "ACPX_OWNER_LOG",
     ]) {
       delete env[key];
     }

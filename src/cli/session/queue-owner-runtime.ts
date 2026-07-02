@@ -42,6 +42,7 @@ import {
 import { refreshQueueOwnerLease } from "../queue/lease-store.js";
 import { QueueOwnerTurnController } from "../queue/owner-turn-controller.js";
 import { resolveAndEnsureAgentFolder } from "./agent-folder.js";
+import { resolveExistingBrickPath } from "./brick-link.js";
 import {
   DEFAULT_QUEUE_OWNER_TTL_MS,
   normalizeOwnerIdleReleaseMs,
@@ -147,12 +148,16 @@ async function submitToRunningOwner(
 
 // eslint-disable-next-line complexity -- mirrors the sessionContext shape from runtime.ts / connected-session.ts; the ?. chains are load-bearing and cannot be simplified further without losing null safety
 function sessionContextFromRecord(record: Awaited<ReturnType<typeof resolveSessionRecord>>) {
+  const brick = record.metadata?.brick?.trim() || null;
+  const brickPath = brick ? resolveExistingBrickPath(brick) : null;
   return {
     acpxRecordId: record.acpxRecordId,
     sessionName: record.name ?? null,
     parentSessionId: record.parentSessionId ?? null,
     taskFolder: record.metadata?.task_folder ?? null,
-    agentFolder: resolveAndEnsureAgentFolder(record),
+    brick,
+    brickPath,
+    agentFolder: resolveAndEnsureAgentFolder(record, brickPath),
     subscriptionId: record.acpx?.session_options?.subscription ?? null,
     profileId: record.acpx?.session_options?.profile ?? null,
   };

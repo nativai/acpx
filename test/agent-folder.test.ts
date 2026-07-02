@@ -90,6 +90,37 @@ test("resolveAndEnsureAgentFolder creates <task>/agents/<name>-<id8> and returns
   });
 });
 
+test("resolveAndEnsureAgentFolder prefers a usable brick path over task_folder", async () => {
+  await withTaskDir(async (taskDir) => {
+    const brickDir = await fsp.mkdtemp(path.join(os.tmpdir(), "acpx-agent-brick-"));
+    try {
+      const record = recordWith({
+        acpxRecordId: "f186ee80-aaaa-bbbb-cccc-dddddddddddd",
+        name: "Brick Agent",
+        metadata: { brick: "11111111-2222-3333-4444-555555555555", task_folder: taskDir },
+      });
+      const expected = path.join(brickDir, "agents", "brick-agent-f186ee80");
+      assert.equal(resolveAndEnsureAgentFolder(record, brickDir), expected);
+      assert.ok(fs.statSync(expected).isDirectory());
+    } finally {
+      await fsp.rm(brickDir, { recursive: true, force: true });
+    }
+  });
+});
+
+test("resolveAndEnsureAgentFolder falls back to task_folder when brick path is unusable", async () => {
+  await withTaskDir((taskDir) => {
+    const record = recordWith({
+      acpxRecordId: "abcdef01-2222-3333-4444-555555555555",
+      name: "fallback",
+      metadata: { brick: "11111111-2222-3333-4444-555555555555", task_folder: taskDir },
+    });
+    const expected = path.join(taskDir, "agents", "fallback-abcdef01");
+    assert.equal(resolveAndEnsureAgentFolder(record, "/missing/brick/path"), expected);
+    assert.ok(fs.statSync(expected).isDirectory());
+  });
+});
+
 test("resolveAndEnsureAgentFolder falls back to the bare id8 when the name is empty", async () => {
   await withTaskDir((taskDir) => {
     const record = recordWith({

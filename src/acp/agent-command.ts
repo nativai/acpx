@@ -126,23 +126,39 @@ export function buildPrimerSessionMeta(
   channel: PrimerChannel,
   primer: string | undefined,
   humanSystemPrompt?: unknown,
+  brickContext?: string | undefined,
 ): Record<string, unknown> | undefined {
-  if (channel === "none" || typeof primer !== "string" || primer.length === 0) {
+  if (channel === "none") {
     return undefined;
   }
+  const primerText = nonEmptyString(primer);
+  const brickText = nonEmptyString(brickContext);
 
   if (channel === "developer-instructions") {
-    return { codex: { developerInstructions: primer } };
+    const developerInstructions = joinPromptFragments([primerText, brickText]);
+    return developerInstructions ? { codex: { developerInstructions } } : undefined;
   }
 
   // system-prompt channel (claude, claude-pty).
   if (typeof humanSystemPrompt === "string" && humanSystemPrompt.length > 0) {
-    // Human `--system-prompt` replace wins — skip the auto-primer (Q4).
+    // Human `--system-prompt` replace wins — skip the auto-primer and brick context (Q4/W10).
     return undefined;
   }
   const humanAppend = readAppendString(humanSystemPrompt);
-  const primerPlus = humanAppend ? `${primer}\n\n---\n\n${humanAppend}` : primer;
+  const primerPlus = joinPromptFragments([primerText, brickText, humanAppend]);
+  if (!primerPlus) {
+    return undefined;
+  }
   return { systemPrompt: { append: primerPlus } };
+}
+
+function joinPromptFragments(parts: Array<string | undefined>): string | undefined {
+  const present = parts.filter((part): part is string => part !== undefined && part.length > 0);
+  return present.length > 0 ? present.join("\n\n---\n\n") : undefined;
+}
+
+function nonEmptyString(value: string | undefined): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 /** The `.append` string of a `{ append }` system-prompt value, if present. */

@@ -22,6 +22,49 @@ export function withInheritedTaskFolder(
   return { ...childMetadata, task_folder: inherit };
 }
 
+export function applyBrickFlag(
+  childMetadata: Record<string, string> | undefined,
+  resolvedBrick: string | false | undefined,
+): Record<string, string> | undefined {
+  if (typeof resolvedBrick === "string") {
+    return { ...childMetadata, brick: resolvedBrick };
+  }
+  return childMetadata;
+}
+
+function withoutBrickMetadata(
+  childMetadata: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (childMetadata?.brick == null) {
+    return childMetadata;
+  }
+  const { brick: _dropped, ...rest } = childMetadata;
+  return Object.keys(rest).length > 0 ? rest : undefined;
+}
+
+/**
+ * Spawn-time `brick` inheritance — pure, no IO. Mirrors task_folder inheritance,
+ * with an explicit `blocked` switch for --no-brick so callers can strip raw
+ * metadata and suppress parent inheritance in one place.
+ */
+export function withInheritedBrick(
+  childMetadata: Record<string, string> | undefined,
+  parentBrick: string | null | undefined,
+  blocked: boolean,
+): Record<string, string> | undefined {
+  if (blocked) {
+    return withoutBrickMetadata(childMetadata);
+  }
+  const inherit = parentBrick?.trim();
+  if (!inherit) {
+    return childMetadata;
+  }
+  if (childMetadata?.brick != null) {
+    return childMetadata; // explicit child brick wins, including an empty raw metadata value
+  }
+  return { ...childMetadata, brick: inherit };
+}
+
 /**
  * Spawn-time Claude `subscription` inheritance — pure, no IO. A child created
  * with no explicit `--subscription` inherits the parent's subscription only when

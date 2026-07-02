@@ -57,6 +57,7 @@ export type SessionIndexEntry = {
   forkedFromSessionId?: string;
   forkedAtMessageIndex?: number;
   metadataTaskFolder?: string;
+  metadataBrick?: string;
   // A byway is stored as a normal kind:"session" fork flagged metadata.byway==="1"
   // (acpx-ui convention). Projected so acpx-ui's kind resolution can run from the
   // entry without reading the record. Byway *lineage* (byway_parent/byway_at)
@@ -240,6 +241,7 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     forkedFromSessionId: optionalString(record.forkedFromSessionId),
     forkedAtMessageIndex: optionalFiniteNumber(record.forkedAtMessageIndex),
     metadataTaskFolder: optionalString(record.metadataTaskFolder),
+    metadataBrick: optionalString(record.metadataBrick),
     byway: optionalBoolean(record.byway),
     currentModelId: optionalString(record.currentModelId),
     sessionModel: optionalString(record.sessionModel),
@@ -323,6 +325,7 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     forkedFromSessionId: record.forkedFromSessionId,
     forkedAtMessageIndex: record.forkedAtMessageIndex,
     metadataTaskFolder: metadata?.task_folder,
+    metadataBrick: metadata?.brick,
     byway: metadata?.byway === "1" ? true : undefined,
     currentModelId: acpx?.current_model_id,
     sessionModel: sessionOptions?.model,

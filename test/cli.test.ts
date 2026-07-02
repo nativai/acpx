@@ -32,6 +32,9 @@ import {
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
+const BRICK_SHIM_DIR = path.join(process.cwd(), "test", "fixtures", "brick-shim");
+const BRICK_X = "11111111-2222-3333-4444-555555555555";
+const BRICK_Z = "99999999-8888-7777-6666-555555555555";
 function readPackageVersionForTest(): string {
   const candidates = [
     fileURLToPath(new URL("../package.json", import.meta.url)),
@@ -1709,6 +1712,292 @@ test("sessions new and ensure accept -s as shorthand for --name", async () => {
     assert.equal(ensuredPayload.action, "session_ensured");
     assert.equal(ensuredPayload.created, false);
     assert.equal(ensuredPayload.name, "ci");
+  });
+});
+
+test("sessions new --brick writes record/index, injects env, stamps, and resolves context", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const envDumpFile = path.join(homeDir, "adapter-env.json");
+    const brickLog = path.join(homeDir, "brick.log");
+    const brickPool = path.join(homeDir, "bricks");
+    const agentCommand =
+      `${MOCK_AGENT_COMMAND} --operation-log ${JSON.stringify(path.join(homeDir, "codex-acp-ops.jsonl"))} ` +
+      `--env-dump-file ${JSON.stringify(envDumpFile)}`;
+    await fs.mkdir(path.join(brickPool, BRICK_X), { recursive: true });
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, agentCommand);
+
+    const result = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "new", "--brick", "short-ref"],
+      homeDir,
+      {
+        env: {
+          PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
+          BRICK_SHIM_MODE: "ok",
+          BRICK_SHIM_ID: BRICK_X,
+          BRICK_SHIM_LOG: brickLog,
+          BRICK_SHIM_CONTEXT: "BRICK CONTEXT",
+          ACPX_BRICK_POOL_DIR: brickPool,
+          ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh",
+        },
+      },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const payload = JSON.parse(result.stdout.trim()) as { acpxRecordId?: unknown };
+    const childId = String(payload.acpxRecordId);
+
+    const stored = JSON.parse(await fs.readFile(sessionFilePath(homeDir, childId), "utf8")) as {
+      metadata?: Record<string, unknown>;
+    };
+    assert.equal(stored.metadata?.brick, BRICK_X);
+
+    const index = JSON.parse(
+      await fs.readFile(path.join(homeDir, ".acpx", "sessions", "index.json"), "utf8"),
+    ) as { entries?: Array<{ acpxRecordId?: unknown; metadataBrick?: unknown }> };
+    assert.equal(
+      index.entries?.find((entry) => entry.acpxRecordId === childId)?.metadataBrick,
+      BRICK_X,
+    );
+
+    const envDump = JSON.parse(await fs.readFile(envDumpFile, "utf8")) as Record<string, string>;
+    assert.equal(envDump.ACPX_BRICK, BRICK_X);
+    assert.equal(envDump.ACPX_BRICK_PATH, path.join(brickPool, BRICK_X));
+
+    const calls = await readJsonl<string[]>(brickLog);
+    assert.deepEqual(calls, [
+      ["show", "short-ref", "--json"],
+      ["context", BRICK_X, "--format", "inject"],
+      ["stamp", BRICK_X, "session-started", "--by", `session:${childId}`],
+    ]);
+  });
+});
+
+test("sessions new inherits parent brick and --no-brick blocks inheritance", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const brickLog = path.join(homeDir, "brick.log");
+    const agentCommand = `${MOCK_AGENT_COMMAND} --operation-log ${JSON.stringify(path.join(homeDir, "codex-acp-ops.jsonl"))}`;
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, agentCommand);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "parent-brick",
+      acpSessionId: "acp-parent-brick",
+      agentName: "codex",
+      agentCommand,
+      cwd,
+      metadata: { brick: BRICK_X },
+    });
+
+    const env = {
+      PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
+      BRICK_SHIM_MODE: "ok",
+      BRICK_SHIM_ID: BRICK_X,
+      BRICK_SHIM_LOG: brickLog,
+      ACPX_SESSION_URL: "https://test-ui.example/?session=parent-brick",
+      ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh",
+    };
+    const inherited = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "new", "--name", "child"],
+      homeDir,
+      { env },
+    );
+    assert.equal(inherited.code, 0, inherited.stderr);
+    const inheritedId = String(
+      (JSON.parse(inherited.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const inheritedRecord = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, inheritedId), "utf8"),
+    ) as { metadata?: Record<string, unknown> };
+    assert.equal(inheritedRecord.metadata?.brick, BRICK_X);
+
+    const blocked = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--format",
+        "json",
+        "codex",
+        "sessions",
+        "new",
+        "--name",
+        "blocked-child",
+        "--no-brick",
+      ],
+      homeDir,
+      { env },
+    );
+    assert.equal(blocked.code, 0, blocked.stderr);
+    const blockedId = String(
+      (JSON.parse(blocked.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const blockedRecord = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, blockedId), "utf8"),
+    ) as { metadata?: Record<string, unknown> };
+    assert.equal(blockedRecord.metadata?.brick, undefined);
+
+    const calls = await readJsonl<string[]>(brickLog);
+    assert.deepEqual(calls, [
+      ["context", BRICK_X, "--format", "inject"],
+      ["stamp", BRICK_X, "session-started", "--by", `session:${inheritedId}`],
+    ]);
+  });
+});
+
+test("sessions ensure --brick stamps create and reuse paths and can re-point the brick", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const brickLog = path.join(homeDir, "brick.log");
+    const agentCommand = `${MOCK_AGENT_COMMAND} --operation-log ${JSON.stringify(path.join(homeDir, "codex-acp-ops.jsonl"))}`;
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, agentCommand);
+    const env = {
+      PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
+      BRICK_SHIM_MODE: "ok",
+      BRICK_SHIM_ID: BRICK_X,
+      BRICK_SHIM_LOG: brickLog,
+      ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh",
+    };
+
+    const first = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "ensure", "--brick", "x"],
+      homeDir,
+      { env },
+    );
+    assert.equal(first.code, 0, first.stderr);
+    const firstPayload = JSON.parse(first.stdout.trim()) as {
+      acpxRecordId?: unknown;
+      created?: unknown;
+    };
+    const id = String(firstPayload.acpxRecordId);
+    assert.equal(firstPayload.created, true);
+
+    const second = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "ensure", "--brick", "x"],
+      homeDir,
+      { env },
+    );
+    assert.equal(second.code, 0, second.stderr);
+    assert.equal((JSON.parse(second.stdout.trim()) as { created?: unknown }).created, false);
+
+    const third = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "ensure", "--brick", "z"],
+      homeDir,
+      { env: { ...env, BRICK_SHIM_ID: BRICK_Z } },
+    );
+    assert.equal(third.code, 0, third.stderr);
+    const stored = JSON.parse(await fs.readFile(sessionFilePath(homeDir, id), "utf8")) as {
+      metadata?: Record<string, unknown>;
+    };
+    assert.equal(stored.metadata?.brick, BRICK_Z);
+
+    const stampCalls = (await readJsonl<string[]>(brickLog)).filter((call) => call[0] === "stamp");
+    assert.deepEqual(stampCalls, [
+      ["stamp", BRICK_X, "session-started", "--by", `session:${id}`],
+      ["stamp", BRICK_X, "session-started", "--by", `session:${id}`],
+      ["stamp", BRICK_Z, "session-started", "--by", `session:${id}`],
+    ]);
+  });
+});
+
+test("raw metadata brick is record-driven for stamp/context; set-metadata validates but does not stamp", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const brickLog = path.join(homeDir, "brick.log");
+    const agentCommand = `${MOCK_AGENT_COMMAND} --operation-log ${JSON.stringify(path.join(homeDir, "codex-acp-ops.jsonl"))}`;
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, agentCommand);
+    const env = {
+      PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
+      BRICK_SHIM_MODE: "ok",
+      BRICK_SHIM_ID: BRICK_X,
+      BRICK_SHIM_LOG: brickLog,
+      ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh",
+    };
+
+    const raw = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--format",
+        "json",
+        "codex",
+        "sessions",
+        "new",
+        "--name",
+        "raw-brick",
+        "--metadata",
+        `brick=${BRICK_X}`,
+      ],
+      homeDir,
+      { env },
+    );
+    assert.equal(raw.code, 0, raw.stderr);
+    const rawId = String(
+      (JSON.parse(raw.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+
+    const noBrick = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "new", "--name", "later-brick"],
+      homeDir,
+      { env },
+    );
+    assert.equal(noBrick.code, 0, noBrick.stderr);
+    const noBrickId = String(
+      (JSON.parse(noBrick.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const set = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--format",
+        "json",
+        "codex",
+        "sessions",
+        "set-metadata",
+        "--session-id",
+        noBrickId,
+        "brick",
+        BRICK_X.toUpperCase(),
+      ],
+      homeDir,
+      { env },
+    );
+    assert.equal(set.code, 0, set.stderr);
+    const setPayload = JSON.parse(set.stdout.trim()) as { value?: unknown };
+    assert.equal(setPayload.value, BRICK_X);
+
+    const bad = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--format",
+        "json",
+        "codex",
+        "sessions",
+        "set-metadata",
+        "--session-id",
+        noBrickId,
+        "brick",
+        "not-a-uuid",
+      ],
+      homeDir,
+      { env },
+    );
+    assert.equal(bad.code, 2);
+    const badError = parseSingleAcpErrorLine(bad.stdout);
+    assert.equal(badError.code, -32602);
+    assert.equal(badError.data?.acpxCode, "USAGE");
+    assert.match(badError.message ?? "", /brick must be a full uuid/);
+
+    const calls = await readJsonl<string[]>(brickLog);
+    assert.deepEqual(
+      calls.filter((call) => call[0] !== "show"),
+      [
+        ["context", BRICK_X, "--format", "inject"],
+        ["stamp", BRICK_X, "session-started", "--by", `session:${rawId}`],
+      ],
+    );
   });
 });
 
@@ -5032,6 +5321,9 @@ async function runCli(
       "ACPX_SESSION_NAME",
       "ACPX_PARENT_SESSION_URL",
       "ACPX_TASK_FOLDER",
+      "ACPX_BRICK",
+      "ACPX_BRICK_PATH",
+      "ACPX_OWNER_LOG",
     ]) {
       if (!Object.prototype.hasOwnProperty.call(options.env ?? {}, key)) {
         delete env[key];
@@ -5083,6 +5375,15 @@ async function runCli(
       resolve({ code, stdout, stderr });
     });
   });
+}
+
+async function readJsonl<T>(file: string): Promise<T[]> {
+  const raw = await fs.readFile(file, "utf8");
+  return raw
+    .trim()
+    .split("\n")
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line) as T);
 }
 
 function mockCodexCommand(operationLog: string, extraArgs = ""): string {

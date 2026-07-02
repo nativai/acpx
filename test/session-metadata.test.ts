@@ -26,6 +26,15 @@ test("validateSessionMetadataValue requires task_folder to be an absolute path",
   assert.equal(validateSessionMetadataValue("task_folder", "  /abs/task  "), "/abs/task");
 });
 
+test("validateSessionMetadataValue requires brick to be a full uuid and normalizes case", () => {
+  assert.equal(
+    validateSessionMetadataValue("brick", "  AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE  "),
+    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+  );
+  assert.throws(() => validateSessionMetadataValue("brick", "aaaaaaaa"), /full uuid/);
+  assert.throws(() => validateSessionMetadataValue("brick", "slug"), /brick show <ref> --json/);
+});
+
 test("validateSessionMetadataValue does not enforce absoluteness for other keys", () => {
   assert.equal(validateSessionMetadataValue("note", "relative/is/fine"), "relative/is/fine");
 });

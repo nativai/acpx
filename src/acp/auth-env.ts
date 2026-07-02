@@ -243,6 +243,8 @@ export type AgentSessionContext = {
    */
   parentSessionUrl?: string | null;
   taskFolder?: string | null;
+  brick?: string | null;
+  brickPath?: string | null;
   agentFolder?: string | null;
   /**
    * Selected Claude subscription id (from ~/.acpx/subscriptions/registry.json).
@@ -276,12 +278,17 @@ function buildAgentEnvironment(
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   promotePrefixedAuthEnvironment(env);
-  // FW-07: never inherit a stale ACPX_SESSION_URL/_PARENT from {...process.env} (e.g. a
-  // long-lived queue-owner that served a different session). Clear both, then set only from
-  // THIS spawn ids below so a bridge session can never carry another session identity.
+  // FW-07: never inherit stale acpx process context from {...process.env}
+  // (e.g. a long-lived queue-owner that served a different session). Clear these,
+  // then set only from THIS spawn context below so a bridge session can never
+  // carry another session identity.
   delete env.ACPX_SESSION_URL;
   delete env.ACPX_PARENT_SESSION_URL;
   delete env.ACPX_SESSION_NAME;
+  delete env.ACPX_TASK_FOLDER;
+  delete env.ACPX_BRICK;
+  delete env.ACPX_BRICK_PATH;
+  delete env.ACPX_OWNER_LOG;
   const baseUrl = resolveAcpxUiBaseUrl(env);
   if (sessionContext && typeof sessionContext.acpxRecordId === "string") {
     const trimmed = sessionContext.acpxRecordId.trim();
@@ -305,6 +312,18 @@ function buildAgentEnvironment(
     const trimmedTaskFolder = sessionContext.taskFolder.trim();
     if (trimmedTaskFolder.length > 0) {
       env.ACPX_TASK_FOLDER = trimmedTaskFolder;
+    }
+  }
+  if (sessionContext && typeof sessionContext.brick === "string") {
+    const trimmedBrick = sessionContext.brick.trim();
+    if (trimmedBrick.length > 0) {
+      env.ACPX_BRICK = trimmedBrick;
+      if (typeof sessionContext.brickPath === "string") {
+        const trimmedBrickPath = sessionContext.brickPath.trim();
+        if (trimmedBrickPath.length > 0) {
+          env.ACPX_BRICK_PATH = trimmedBrickPath;
+        }
+      }
     }
   }
   if (sessionContext && typeof sessionContext.agentFolder === "string") {

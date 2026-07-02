@@ -2,6 +2,7 @@ import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { AcpClient } from "../../acp/client.js";
 import { withInterrupt } from "../../async-control.js";
 import { resolveAndEnsureAgentFolder } from "../../cli/session/agent-folder.js";
+import { resolveExistingBrickPath } from "../../cli/session/brick-link.js";
 import {
   persistSessionOwnerOptions,
   resolveSessionOwnerOptions,
@@ -107,6 +108,8 @@ export async function withConnectedSession<T>(
     terminal: options.terminal,
   });
   persistSessionOwnerOptions(record, ownerOptionsToInput(ownerOptions));
+  const brick = record.metadata?.brick?.trim() || null;
+  const brickPath = brick ? resolveExistingBrickPath(brick) : null;
   const client =
     options.createClient?.({
       agentCommand: record.agentCommand,
@@ -124,7 +127,9 @@ export async function withConnectedSession<T>(
         sessionName: record.name ?? null,
         parentSessionId: record.parentSessionId ?? null,
         taskFolder: record.metadata?.task_folder ?? null,
-        agentFolder: resolveAndEnsureAgentFolder(record),
+        brick,
+        brickPath,
+        agentFolder: resolveAndEnsureAgentFolder(record, brickPath),
         subscriptionId: record.acpx?.session_options?.subscription ?? null,
         profileId: record.acpx?.session_options?.profile ?? null,
       },
@@ -146,7 +151,9 @@ export async function withConnectedSession<T>(
         sessionName: record.name ?? null,
         parentSessionId: record.parentSessionId ?? null,
         taskFolder: record.metadata?.task_folder ?? null,
-        agentFolder: resolveAndEnsureAgentFolder(record),
+        brick,
+        brickPath,
+        agentFolder: resolveAndEnsureAgentFolder(record, brickPath),
         subscriptionId: record.acpx?.session_options?.subscription ?? null,
         profileId: record.acpx?.session_options?.profile ?? null,
       },

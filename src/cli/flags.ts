@@ -83,6 +83,7 @@ export type SessionsNewFlags = {
   parentId?: string;
   parentSessionUrl?: string;
   metadata?: Record<string, string>;
+  brick?: string | false;
   fromTemplate?: string;
   // --from-template auto-fire (ignored outside the --from-template path). Commander
   // couples `--prompt <text>` and `--no-prompt` onto this one property:
@@ -99,6 +100,7 @@ export type SessionsCopyFlags = {
   parentId?: string;
   parentSessionUrl?: string;
   metadata?: Record<string, string>;
+  brick?: string | false;
   ephemeral?: boolean;
   prompt?: string;
   promptFile?: string;

@@ -91,8 +91,15 @@ import {
   resolveSessionTargetSelector,
   type SessionTargetSelector,
 } from "./session-selector.js";
+import {
+  maybeStampBrickLink,
+  resolveBrickFlagRef,
+  warnIfBrickDoesNotResolve,
+} from "./session/brick-link.js";
 import type { SessionListResult } from "./session/contracts.js";
 import {
+  applyBrickFlag,
+  withInheritedBrick,
   withInheritedAgentCommand,
   withInheritedModel,
   withInheritedProfile,
@@ -441,6 +448,7 @@ type ResolvedParentSession = {
   /** Full parent url (host+id) for cross-machine lineage, when known. (FW-19) */
   sessionUrl?: string;
   taskFolder?: string;
+  brick?: string;
   subscription?: string;
   profile?: string;
   agentCommand?: string;
@@ -452,11 +460,13 @@ type ResolvedParentSession = {
 // inheritance is gated on sameAgentAsParent in buildSessionStartOptions; effort
 // is the persisted desired intent (the single source of truth — the live
 // config_options snapshot can be stale).
+// eslint-disable-next-line complexity -- explicit optional-field projection keeps inheritance reviewable
 function parentInheritableFields(parent: SessionRecord): ResolvedParentSession {
   const sessionOptions = parent.acpx?.session_options;
   return {
     acpxRecordId: parent.acpxRecordId,
     taskFolder: parent.metadata?.task_folder,
+    brick: parent.metadata?.brick,
     subscription: sessionOptions?.subscription,
     profile: sessionOptions?.profile,
     agentCommand: parent.agentCommand,
@@ -567,6 +577,7 @@ function buildSessionStartOptions(params: {
   permissionMode: ReturnType<typeof resolvePermissionMode>;
   permissionPolicy?: PermissionPolicy;
   parent?: ResolvedParentSession;
+  resolvedBrick?: string | false;
 }): Parameters<SessionModule["createSession"]>[0] {
   return {
     agentCommand: params.agent.agentCommand,
@@ -576,7 +587,14 @@ function buildSessionStartOptions(params: {
     resumeSessionId: params.flags.resumeSession,
     parentSessionId: params.parent?.acpxRecordId,
     parentSessionUrl: params.parent?.sessionUrl,
-    metadata: withInheritedTaskFolder(params.flags.metadata, params.parent?.taskFolder),
+    metadata: withInheritedBrick(
+      applyBrickFlag(
+        withInheritedTaskFolder(params.flags.metadata, params.parent?.taskFolder),
+        params.resolvedBrick,
+      ),
+      params.parent?.brick,
+      params.resolvedBrick === false,
+    ),
     mcpServers: params.config.mcpServers,
     permissionMode: params.permissionMode,
     nonInteractivePermissions: params.globalFlags.nonInteractivePermissions,
@@ -592,6 +610,18 @@ function buildSessionStartOptions(params: {
       params.parent,
     ),
   };
+}
+
+async function resolveBrickFlagValue(
+  brick: string | false | undefined,
+): Promise<string | false | undefined> {
+  if (brick === false) {
+    return false;
+  }
+  if (typeof brick === "string") {
+    return await resolveBrickFlagRef(brick);
+  }
+  return undefined;
 }
 
 function optionValueSourceWithGlobals(command: Command, optionName: string): string | undefined {
@@ -1587,6 +1617,9 @@ export async function handleSessionsSetMetadata(
   if (key === "task_folder") {
     await warnIfTaskFolderMissing(trimmedValue);
   }
+  if (key === "brick") {
+    await warnIfBrickDoesNotResolve(trimmedValue);
+  }
   await writeSessionRecord(mergeSessionMetadata(record, key, trimmedValue));
   printSetMetadataResultByFormat(key, trimmedValue, record, globalFlags.format);
 }
@@ -1764,6 +1797,7 @@ async function handleSessionsNewFromTemplate(
       // template_source = the RESOLVED immutable id (not the raw arg) so a child
       // spawned by slug records the concrete version it actually came from.
       metadata: { ...flags.metadata, template_source: resolvedSource.acpxRecordId },
+      brick: flags.brick,
       parentId: flags.parentId,
       parentSessionUrl: flags.parentSessionUrl,
     },
@@ -1813,6 +1847,7 @@ export async function handleSessionsNew(
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const parent = await resolveAndValidateParentSessionId(flags);
+  const resolvedBrick = await resolveBrickFlagValue(flags.brick);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const effectiveAgent = resolveEffectiveSpawnAgent(
     agent,
@@ -1848,8 +1883,10 @@ export async function handleSessionsNew(
       permissionMode,
       permissionPolicy,
       parent,
+      resolvedBrick,
     }),
   );
+  await maybeStampBrickLink(created);
 
   printCreatedSessionBanner(
     created,
@@ -1956,6 +1993,7 @@ async function runSessionCopy(
   // /fork origin (forkFromSessionId) — the "both edges" write. With no parent
   // context the `?.` guards omit both fields → byte-identical to today.
   const parent = await resolveAndValidateParentSessionId(flags);
+  const resolvedBrick = await resolveBrickFlagValue(flags.brick);
 
   const [{ createSession }, { printCopiedSessionByFormat, printCreatedSessionBanner }] =
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
@@ -1964,9 +2002,16 @@ async function runSessionCopy(
     agentName: source.agentName ?? resolveAgentNameFromCommand(source.agentCommand, config.agents),
     cwd: resolveCopyDestinationCwd(command, globalFlags, source),
     name: flags.name ?? sourceDefaultForkName(source),
-    metadata: withInheritedTaskFolder(
-      copyMetadata(flags, source, forkAtMessageIndex),
-      parent?.taskFolder,
+    metadata: withInheritedBrick(
+      applyBrickFlag(
+        withInheritedTaskFolder(
+          copyMetadata(flags, source, forkAtMessageIndex),
+          parent?.taskFolder,
+        ),
+        resolvedBrick,
+      ),
+      parent?.brick,
+      resolvedBrick === false,
     ),
     parentSessionId: parent?.acpxRecordId,
     parentSessionUrl: parent?.sessionUrl,
@@ -1984,6 +2029,7 @@ async function runSessionCopy(
     sessionOptions: copySessionOptionsWithOverride(source, globalFlags),
     desiredConfigOptions: copyDesiredConfigOptionsWithOverride(source, globalFlags),
   });
+  await maybeStampBrickLink(created);
   const sourceType = agentTypeLabel(source.agentCommand, config);
   printCreatedSessionBanner(created, sourceType, globalFlags.format, globalFlags.jsonStrict);
   printCopiedSessionByFormat(created, source, globalFlags.format);
@@ -2151,6 +2197,7 @@ export async function handleSessionsEnsure(
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const parent = await resolveAndValidateParentSessionId(flags);
+  const resolvedBrick = await resolveBrickFlagValue(flags.brick);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const effectiveAgent = resolveEffectiveSpawnAgent(
     agent,
@@ -2184,8 +2231,10 @@ export async function handleSessionsEnsure(
       permissionMode,
       permissionPolicy,
       parent,
+      resolvedBrick,
     }),
   );
+  await maybeStampBrickLink(result.record);
 
   if (result.created) {
     printCreatedSessionBanner(

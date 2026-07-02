@@ -97,6 +97,7 @@ import {
   resolveConfiguredAuthCredential,
   type EffectiveAccountMetadata,
 } from "./auth-env.js";
+import { resolveBrickContext } from "./brick-context.js";
 import {
   materializeClaudeForkSession,
   resolveClaudeUuidForAcpxIndex,
@@ -1128,11 +1129,16 @@ export class AcpClient {
     if (channel === "none") {
       return undefined;
     }
-    const primer = await resolveSessionPrimer();
-    if (primer === undefined) {
+    if (
+      channel === "system-prompt" &&
+      typeof optionsMeta?.systemPrompt === "string" &&
+      optionsMeta.systemPrompt.length > 0
+    ) {
       return undefined;
     }
-    return buildPrimerSessionMeta(channel, primer, optionsMeta?.systemPrompt);
+    const primer = await resolveSessionPrimer();
+    const brickContext = await this.resolveBrickContext();
+    return buildPrimerSessionMeta(channel, primer, optionsMeta?.systemPrompt, brickContext);
   }
 
   /**
@@ -1148,12 +1154,18 @@ export class AcpClient {
     if (channel !== "system-prompt") {
       return undefined;
     }
-    const primer = await resolveSessionPrimer();
-    if (primer === undefined) {
+    const optionsMeta = buildClaudeCodeOptionsMeta(this.options.sessionOptions);
+    if (typeof optionsMeta?.systemPrompt === "string" && optionsMeta.systemPrompt.length > 0) {
       return undefined;
     }
-    const optionsMeta = buildClaudeCodeOptionsMeta(this.options.sessionOptions);
-    return buildPrimerSessionMeta(channel, primer, optionsMeta?.systemPrompt);
+    const primer = await resolveSessionPrimer();
+    const brickContext = await this.resolveBrickContext();
+    return buildPrimerSessionMeta(channel, primer, optionsMeta?.systemPrompt, brickContext);
+  }
+
+  private async resolveBrickContext(): Promise<string | undefined> {
+    const brick = this.options.sessionContext?.brick?.trim();
+    return brick ? await resolveBrickContext(brick) : undefined;
   }
 
   private buildHomeSelectorMeta(): Record<string, unknown> | undefined {

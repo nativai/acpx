@@ -68,21 +68,41 @@ test("buildPrimerSessionMeta: human --append-system-prompt composes primer FIRST
   });
 });
 
+test("buildPrimerSessionMeta: brick context composes after primer and before human append", () => {
+  assert.deepEqual(
+    buildPrimerSessionMeta("system-prompt", "PRIMER", { append: "HUMAN" }, "BRICK"),
+    {
+      systemPrompt: { append: `PRIMER${PRIMER_SEPARATOR}BRICK${PRIMER_SEPARATOR}HUMAN` },
+    },
+  );
+  assert.deepEqual(buildPrimerSessionMeta("system-prompt", undefined, undefined, "BRICK"), {
+    systemPrompt: { append: "BRICK" },
+  });
+});
+
 test("buildPrimerSessionMeta: human --system-prompt (replace string) skips the auto-primer (Q4)", () => {
   // Returning undefined leaves the human replace string untouched in optionsMeta.
   assert.equal(buildPrimerSessionMeta("system-prompt", "PRIMER", "REPLACE-ALL"), undefined);
+  assert.equal(
+    buildPrimerSessionMeta("system-prompt", "PRIMER", "REPLACE-ALL", "BRICK"),
+    undefined,
+  );
 });
 
 test("buildPrimerSessionMeta: codex channel emits developerInstructions and NOT systemPrompt", () => {
   const meta = buildPrimerSessionMeta("developer-instructions", "PRIMER", undefined);
   assert.deepEqual(meta, { codex: { developerInstructions: "PRIMER" } });
   assert.equal((meta as Record<string, unknown>).systemPrompt, undefined);
+  assert.deepEqual(buildPrimerSessionMeta("developer-instructions", "PRIMER", undefined, "BRICK"), {
+    codex: { developerInstructions: `PRIMER${PRIMER_SEPARATOR}BRICK` },
+  });
 });
 
 test("buildPrimerSessionMeta: none channel / empty primer yields no fragment", () => {
   assert.equal(buildPrimerSessionMeta("none", "PRIMER", undefined), undefined);
   assert.equal(buildPrimerSessionMeta("system-prompt", undefined, undefined), undefined);
   assert.equal(buildPrimerSessionMeta("system-prompt", "", undefined), undefined);
+  assert.equal(buildPrimerSessionMeta("none", "PRIMER", undefined, "BRICK"), undefined);
 });
 
 // ---------------------------------------------------------------------------

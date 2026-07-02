@@ -107,6 +107,7 @@ import {
 import { type QueueOwnerMessage, type QueueTask, waitMs } from "../queue/ipc.js";
 import { type QueueOwnerActiveSessionController } from "../queue/owner-turn-controller.js";
 import { resolveAndEnsureAgentFolder } from "./agent-folder.js";
+import { resolveExistingBrickPath } from "./brick-link.js";
 import type { RunOnceOptions, SessionSendOptions } from "./contracts.js";
 
 function claudeSubagentDir(cwd: string, acpSessionId: string): string {
@@ -1335,6 +1336,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   });
 
   const ownClient = options.client == null;
+  const brick = record.metadata?.brick?.trim() || null;
+  const brickPath = brick ? resolveExistingBrickPath(brick) : null;
   const client =
     options.client ??
     new AcpClient({
@@ -1354,7 +1357,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         sessionName: record.name ?? null,
         parentSessionId: record.parentSessionId ?? null,
         taskFolder: record.metadata?.task_folder ?? null,
-        agentFolder: resolveAndEnsureAgentFolder(record),
+        brick,
+        brickPath,
+        agentFolder: resolveAndEnsureAgentFolder(record, brickPath),
         subscriptionId: record.acpx?.session_options?.subscription ?? null,
         profileId: record.acpx?.session_options?.profile ?? null,
         reasoningEffort: sessionOptions?.reasoningEffort ?? null,

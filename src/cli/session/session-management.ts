@@ -29,6 +29,7 @@ import {
 } from "../../session/persistence.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
 import type { SessionEnsureResult, SessionRecord } from "../../types.js";
+import { resolveExistingBrickPath } from "./brick-link.js";
 import { DEFAULT_QUEUE_OWNER_TTL_MS } from "./contracts.js";
 import type {
   SessionCreateOptions,
@@ -344,6 +345,8 @@ async function forkSessionRecordWithClient(
 // the sessionContext shape in queue-owner-runtime.ts / connected-session.ts (trivial field-mapping).
 // eslint-disable-next-line complexity -- ?? null field-mapping; cannot simplify without losing null safety
 function creationSessionContext(options: SessionCreateOptions) {
+  const brick = options.metadata?.brick?.trim() || null;
+  const brickPath = brick ? resolveExistingBrickPath(brick) : null;
   return {
     acpxRecordId: "",
     sessionName: normalizeName(options.name) ?? null,
@@ -354,6 +357,8 @@ function creationSessionContext(options: SessionCreateOptions) {
     // (correct same-box; the bridge has the cross-box URL persisted already).
     parentSessionUrl: options.parentSessionUrl ?? null,
     taskFolder: options.metadata?.task_folder ?? null,
+    brick,
+    brickPath,
     agentFolder: null,
     subscriptionId: options.sessionOptions?.subscription ?? null,
     profileId: options.sessionOptions?.profile ?? null,

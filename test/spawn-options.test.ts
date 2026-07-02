@@ -371,6 +371,86 @@ test("buildAgentSpawnOptions omits ACPX_TASK_FOLDER when taskFolder is null/unde
   }
 });
 
+test("buildAgentSpawnOptions clears stale ACPX_TASK_FOLDER when this session has none", () => {
+  const previous = process.env.ACPX_TASK_FOLDER;
+  process.env.ACPX_TASK_FOLDER = "/stale/task";
+  try {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+    });
+    assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_TASK_FOLDER"), false);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.ACPX_TASK_FOLDER;
+    } else {
+      process.env.ACPX_TASK_FOLDER = previous;
+    }
+  }
+});
+
+test("buildAgentSpawnOptions injects ACPX_BRICK and ACPX_BRICK_PATH when present", () => {
+  const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+    acpxRecordId: "child-id",
+    brick: "11111111-2222-3333-4444-555555555555",
+    brickPath: "/wisdom/Operating System/Bricks/11111111-2222-3333-4444-555555555555",
+  });
+  assert.equal(options.env.ACPX_BRICK, "11111111-2222-3333-4444-555555555555");
+  assert.equal(
+    options.env.ACPX_BRICK_PATH,
+    "/wisdom/Operating System/Bricks/11111111-2222-3333-4444-555555555555",
+  );
+});
+
+test("buildAgentSpawnOptions trims brick env vars and omits path without a brick id", () => {
+  const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+    acpxRecordId: "child-id",
+    brick: "  11111111-2222-3333-4444-555555555555  ",
+    brickPath: "  /brick/path  ",
+  });
+  assert.equal(options.env.ACPX_BRICK, "11111111-2222-3333-4444-555555555555");
+  assert.equal(options.env.ACPX_BRICK_PATH, "/brick/path");
+
+  const noBrick = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+    acpxRecordId: "child-id",
+    brickPath: "/brick/path",
+  });
+  assert.equal(Object.prototype.hasOwnProperty.call(noBrick.env, "ACPX_BRICK"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(noBrick.env, "ACPX_BRICK_PATH"), false);
+});
+
+test("buildAgentSpawnOptions clears stale ACPX_BRICK vars and owner-log marker", () => {
+  const previousBrick = process.env.ACPX_BRICK;
+  const previousBrickPath = process.env.ACPX_BRICK_PATH;
+  const previousOwnerLog = process.env.ACPX_OWNER_LOG;
+  process.env.ACPX_BRICK = "stale";
+  process.env.ACPX_BRICK_PATH = "/stale";
+  process.env.ACPX_OWNER_LOG = "1";
+  try {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+    });
+    assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_BRICK"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_BRICK_PATH"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_OWNER_LOG"), false);
+  } finally {
+    if (previousBrick === undefined) {
+      delete process.env.ACPX_BRICK;
+    } else {
+      process.env.ACPX_BRICK = previousBrick;
+    }
+    if (previousBrickPath === undefined) {
+      delete process.env.ACPX_BRICK_PATH;
+    } else {
+      process.env.ACPX_BRICK_PATH = previousBrickPath;
+    }
+    if (previousOwnerLog === undefined) {
+      delete process.env.ACPX_OWNER_LOG;
+    } else {
+      process.env.ACPX_OWNER_LOG = previousOwnerLog;
+    }
+  }
+});
+
 test("buildAgentSpawnOptions: ACPX_TASK_FOLDER coexists with URL session + parent vars (no _ID vars)", () => {
   const previousSessionId = process.env.ACPX_SESSION_ID;
   const previousParentId = process.env.ACPX_PARENT_SESSION_ID;

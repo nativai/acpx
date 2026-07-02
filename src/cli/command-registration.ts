@@ -196,6 +196,12 @@ export function registerSessionsCommand(
       parseMetadataEntry,
     )
     .option(
+      "--brick <ref>",
+      "Link the session to a brick (full uuid, uuid8, slug, or slug__uuid8; non-uuid refs resolve via the brick CLI). Stored as metadata.brick; reaches the agent as $ACPX_BRICK / $ACPX_BRICK_PATH.",
+      (value: string) => parseNonEmptyValue("Brick ref", value),
+    )
+    .option("--no-brick", "Do not link, and do not inherit the spawning session's brick.")
+    .option(
       "--from-template <id>",
       "Instantiate from a saved template (acpx record id, ACP session id, or unique suffix). " +
         "Inherits the template's agent type + context; the new session is a normal open session. " +
@@ -237,6 +243,12 @@ export function registerSessionsCommand(
       "Set or merge a metadata entry (repeatable; merges into existing session metadata, per-key overwrite)",
       parseMetadataEntry,
     )
+    .option(
+      "--brick <ref>",
+      "Link the session to a brick (full uuid, uuid8, slug, or slug__uuid8; non-uuid refs resolve via the brick CLI). Stored as metadata.brick; reaches the agent as $ACPX_BRICK / $ACPX_BRICK_PATH.",
+      (value: string) => parseNonEmptyValue("Brick ref", value),
+    )
+    .option("--no-brick", "Do not link, and do not inherit the spawning session's brick.")
     .action(async function (this: Command, flags: SessionsNewFlags) {
       await handleSessionsEnsure(explicitAgentName, flags, this, config);
     });
@@ -280,6 +292,12 @@ export function registerSessionsCommand(
       "Set a metadata entry on the copied session (repeatable)",
       parseMetadataEntry,
     )
+    .option(
+      "--brick <ref>",
+      "Link the copied session to a brick (full uuid, uuid8, slug, or slug__uuid8; non-uuid refs resolve via the brick CLI). Stored as metadata.brick; reaches the agent as $ACPX_BRICK / $ACPX_BRICK_PATH.",
+      (value: string) => parseNonEmptyValue("Brick ref", value),
+    )
+    .option("--no-brick", "Do not link, and do not inherit the spawning session's brick.")
     .option("--ephemeral", "Mark the copy as a by-the-way ephemeral side-thread")
     .option(
       "--prompt <text>",
