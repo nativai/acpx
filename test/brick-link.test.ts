@@ -113,6 +113,41 @@ test("resolveBrickFlagRef degrades to full-uuid only when the CLI is unavailable
   });
 });
 
+test("resolveBrickFlagRef treats garbage, hanging, and non-uuid show output as unavailable", async () => {
+  await withEnv(
+    { PATH: `${SHIM_DIR}:${process.env.PATH ?? ""}`, BRICK_SHIM_MODE: "garbage" },
+    async () => {
+      assert.equal(await resolveBrickFlagRef(X), X);
+      await assert.rejects(() => resolveBrickFlagRef("slug"), /non-uuid refs need the brick CLI/);
+    },
+  );
+
+  await withEnv(
+    {
+      PATH: `${SHIM_DIR}:${process.env.PATH ?? ""}`,
+      BRICK_SHIM_MODE: "ok",
+      BRICK_SHIM_ID: "../../evil-path",
+    },
+    async () => {
+      assert.equal(await resolveBrickFlagRef(X), X);
+      await assert.rejects(() => resolveBrickFlagRef("slug"), /non-uuid refs need the brick CLI/);
+    },
+  );
+
+  await withEnv(
+    { PATH: `${SHIM_DIR}:${process.env.PATH ?? ""}`, BRICK_SHIM_MODE: "hang" },
+    async () => {
+      const started = Date.now();
+      assert.equal(await resolveBrickFlagRef(X, { timeoutMs: 25 }), X);
+      await assert.rejects(
+        () => resolveBrickFlagRef("slug", { timeoutMs: 25 }),
+        /non-uuid refs need the brick CLI/,
+      );
+      assert(Date.now() - started < 1_000);
+    },
+  );
+});
+
 test("resolveExistingBrickPath is a pure uuid join plus directory stat", async () => {
   await withTempDir("acpx-brick-pool-", async (pool) => {
     await fs.mkdir(path.join(pool, X));

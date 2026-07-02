@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
@@ -846,6 +848,191 @@ test("AcpClient createSession skips brick context when --system-prompt replace i
   });
 });
 
+test("AcpClient createSession does not call brick context when no brick is linked", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-client-no-brick-context-"));
+  try {
+    const cwd = path.resolve("/tmp/acpx-client-no-brick-context");
+    const logPath = path.join(dir, "brick.log");
+    const client = makeClient({
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+    });
+
+    let capturedParams: Record<string, unknown> | undefined;
+    asInternals(client).connection = {
+      newSession: async (params: Record<string, unknown>) => {
+        capturedParams = params;
+        return { sessionId: "session-no-brick-context" };
+      },
+    };
+
+    await withEnv(
+      {
+        PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
+        BRICK_SHIM_MODE: "ok",
+        BRICK_SHIM_LOG: logPath,
+        BRICK_SHIM_CONTEXT: "SHOULD NOT BE READ",
+        ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh",
+      },
+      async () => {
+        resetSessionPrimerMemoForTests();
+        try {
+          await client.createSession("/tmp/acpx-client-no-brick-context");
+        } finally {
+          resetSessionPrimerMemoForTests();
+        }
+      },
+    );
+
+    assert.deepEqual(capturedParams, {
+      cwd,
+      mcpServers: [],
+      _meta: undefined,
+    });
+    assert.deepEqual(await readJsonlIfExists<string[]>(logPath), []);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("AcpClient load/resume re-supplies fresh brick context on the system-prompt channel", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-client-brick-resume-"));
+  try {
+    const logPath = path.join(dir, "brick.log");
+    const client = makeClient({
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+      sessionContext: {
+        acpxRecordId: "child-id",
+        brick: BRICK_ID,
+      },
+    });
+
+    let capturedLoadParams: Record<string, unknown> | undefined;
+    let capturedResumeParams: Record<string, unknown> | undefined;
+    asInternals(client).connection = {
+      loadSession: async (params: Record<string, unknown>) => {
+        capturedLoadParams = params;
+        return {};
+      },
+      resumeSession: async (params: Record<string, unknown>) => {
+        capturedResumeParams = params;
+        return {};
+      },
+    };
+
+    await withEnv(
+      {
+        PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
+        BRICK_SHIM_MODE: "ok",
+        BRICK_SHIM_LOG: logPath,
+        BRICK_SHIM_CONTEXT: "LOAD CONTEXT",
+        ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh",
+      },
+      async () => {
+        resetSessionPrimerMemoForTests();
+        try {
+          await client.loadSessionWithOptions("session-load", "/tmp/acpx-client-load", {
+            replayIdleMs: 0,
+            replayDrainTimeoutMs: 1,
+          });
+          process.env.BRICK_SHIM_CONTEXT = "RESUME CONTEXT";
+          await client.resumeSession("session-resume", "/tmp/acpx-client-resume");
+        } finally {
+          resetSessionPrimerMemoForTests();
+        }
+      },
+    );
+
+    assert.deepEqual(capturedLoadParams, {
+      sessionId: "session-load",
+      cwd: path.resolve("/tmp/acpx-client-load"),
+      mcpServers: [],
+      _meta: {
+        systemPrompt: { append: "LOAD CONTEXT" },
+      },
+    });
+    assert.deepEqual(capturedResumeParams, {
+      sessionId: "session-resume",
+      cwd: path.resolve("/tmp/acpx-client-resume"),
+      mcpServers: [],
+      _meta: {
+        systemPrompt: { append: "RESUME CONTEXT" },
+      },
+    });
+    assert.deepEqual(
+      (await readJsonlIfExists<string[]>(logPath)).filter((call) => call[0] === "context"),
+      [
+        ["context", BRICK_ID, "--format", "inject"],
+        ["context", BRICK_ID, "--format", "inject"],
+      ],
+    );
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("AcpClient load/resume skips brick context on the codex channel", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-client-brick-codex-resume-"));
+  try {
+    const logPath = path.join(dir, "brick.log");
+    const client = makeClient({
+      agentCommand: "npx -y @agentclientprotocol/codex-acp",
+      sessionContext: {
+        acpxRecordId: "child-id",
+        brick: BRICK_ID,
+      },
+    });
+
+    let capturedLoadParams: Record<string, unknown> | undefined;
+    let capturedResumeParams: Record<string, unknown> | undefined;
+    asInternals(client).connection = {
+      loadSession: async (params: Record<string, unknown>) => {
+        capturedLoadParams = params;
+        return {};
+      },
+      resumeSession: async (params: Record<string, unknown>) => {
+        capturedResumeParams = params;
+        return {};
+      },
+    };
+
+    await withEnv(
+      {
+        PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
+        BRICK_SHIM_MODE: "ok",
+        BRICK_SHIM_LOG: logPath,
+        BRICK_SHIM_CONTEXT: "SHOULD NOT BE READ",
+        ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh",
+      },
+      async () => {
+        resetSessionPrimerMemoForTests();
+        try {
+          await client.loadSessionWithOptions("session-load", "/tmp/acpx-client-codex-load", {
+            replayIdleMs: 0,
+            replayDrainTimeoutMs: 1,
+          });
+          await client.resumeSession("session-resume", "/tmp/acpx-client-codex-resume");
+        } finally {
+          resetSessionPrimerMemoForTests();
+        }
+      },
+    );
+
+    assert.deepEqual(capturedLoadParams, {
+      sessionId: "session-load",
+      cwd: path.resolve("/tmp/acpx-client-codex-load"),
+      mcpServers: [],
+    });
+    assert.deepEqual(capturedResumeParams, {
+      sessionId: "session-resume",
+      cwd: path.resolve("/tmp/acpx-client-codex-resume"),
+      mcpServers: [],
+    });
+    assert.deepEqual(await readJsonlIfExists<string[]>(logPath), []);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("AcpClient createSession forwards codex model metadata without setting it explicitly", async () => {
   const cwd = path.resolve("/tmp/acpx-client-codex-model");
   const client = makeClient({
@@ -1373,6 +1560,22 @@ async function withEnv(
         process.env[key] = value;
       }
     }
+  }
+}
+
+async function readJsonlIfExists<T>(file: string): Promise<T[]> {
+  try {
+    const raw = await fs.readFile(file, "utf8");
+    return raw
+      .trim()
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as T);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return [];
+    }
+    throw error;
   }
 }
 

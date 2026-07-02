@@ -234,5 +234,8 @@ function describeExecError(error: unknown): string {
   if (code !== undefined) {
     return `exited with code ${code}${stderr ? `: ${stderr}` : ""}`;
   }
-  return typeof errorLike.message === "string" ? errorLike.message : String(error);
+  if (typeof errorLike.message === "string") {
+    return errorLike.message;
+  }
+  return JSON.stringify(error) ?? "unknown error";
 }

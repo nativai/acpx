@@ -126,7 +126,7 @@ export function buildPrimerSessionMeta(
   channel: PrimerChannel,
   primer: string | undefined,
   humanSystemPrompt?: unknown,
-  brickContext?: string | undefined,
+  brickContext?: string,
 ): Record<string, unknown> | undefined {
   if (channel === "none") {
     return undefined;
