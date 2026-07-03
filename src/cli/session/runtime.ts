@@ -1319,8 +1319,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       await flushPendingMessages(false);
       record.lastUsedAt = isoNow();
       applyConversation(record, conversation);
-      // Exactly ONE full record read per checkpoint (W2.4): this read feeds
-      // both the closed-state merge and the write's lifecycle preserve.
+      // One pre-read feeds the closed-state merge and lifecycle preserve; the
+      // write path separately rereads metadata so external metadata patches win
+      // over stale owner state (W11).
       const persisted = await readPersistedLifecycle(record.acpxRecordId);
       mergeLatestDurablePreferences(persisted);
       applyPersistedClosedState(persisted);

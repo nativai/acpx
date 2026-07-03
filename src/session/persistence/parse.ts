@@ -10,6 +10,7 @@ import { SESSION_RECORD_SCHEMA } from "../../types.js";
 import { defaultSessionEventLog } from "../event-log.js";
 import { normalizeSessionOwnerOptions } from "../owner-options.js";
 import { normalizeRuntimeSessionId } from "../runtime-session-id.js";
+import { rememberSessionMetadataBaseline } from "./metadata-merge.js";
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -1016,7 +1017,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     return null;
   }
 
-  return {
+  return rememberSessionMetadataBaseline({
     schema: SESSION_RECORD_SCHEMA,
     acpxRecordId: record.acpx_record_id,
     acpSessionId: record.acp_session_id,
@@ -1060,5 +1061,5 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     metadata,
     importedFrom: recordMetadata.importedFrom,
     template: parseTemplateState(record.template),
-  };
+  });
 }

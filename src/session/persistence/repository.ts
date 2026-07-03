@@ -30,6 +30,10 @@ import {
   toSessionIndexEntry,
   type SessionIndexEntry,
 } from "./index.js";
+import {
+  mergeRecordMetadataForPersist,
+  rememberSessionMetadataBaseline,
+} from "./metadata-merge.js";
 import { parseSessionRecord } from "./parse.js";
 import { serializeSessionRecordForDisk } from "./serialize.js";
 import {
@@ -138,6 +142,9 @@ export type PersistedSessionLifecycle = {
   template: SessionRecord["template"];
   /** Last on-disk updated_at — lets the flush keep updated_at monotonic (no stale regress). */
   updatedAt: string | undefined;
+  /** Current on-disk metadata; merged at write time so stale owner records do
+   * not clobber concurrent UI/CLI metadata patches. */
+  metadata: SessionRecord["metadata"];
   /** Extra fields the live-checkpoint closed-state merge needs — carried so
    * one read can serve both the preserve step and that merge (W2.4). */
   pid: number | undefined;
@@ -146,10 +153,9 @@ export type PersistedSessionLifecycle = {
 
 /**
  * Read the current on-disk <id>.json (if present) and return the persisted
- * lifecycle fields (closed/closedAt), the UI-owned favorite state
- * (favorite/favoritedAt), and the UI-owned display `name`. Returns undefined
- * if the file is missing or unreadable — callers should treat that as
- * "no prior state to preserve."
+ * lifecycle fields, UI-owned scalar state, and metadata snapshot. Returns
+ * undefined if the file is missing or unreadable — callers should treat that
+ * as "no prior state to preserve."
  */
 export async function readPersistedLifecycle(
   acpxRecordId: string,
@@ -168,6 +174,7 @@ export async function readPersistedLifecycle(
       name: parsed.name,
       template: parsed.template,
       updatedAt: parsed.updated_at,
+      metadata: parsed.metadata,
       pid: parsed.pid,
       acpx: parsed.acpx,
     };
@@ -236,11 +243,11 @@ export async function writeSessionRecordAtBoundaryWithLifecycle(
 
 /**
  * Preserving write variant for callers that already hold the persisted
- * lifecycle from a fresh `readPersistedLifecycle` read — the live-checkpoint
- * path, which previously parsed the same multi-MB record twice per
- * checkpoint (once for its closed-state merge, once inside the write).
- * Semantics are identical to `writeSessionRecord`; `persisted` may be
- * undefined when the file was missing ("no prior state to preserve").
+ * lifecycle from a fresh `readPersistedLifecycle` read. Metadata is still
+ * reread inside the write so external metadata patches survive stale owner
+ * checkpoints (W11). Semantics are otherwise identical to `writeSessionRecord`;
+ * `persisted` may be undefined when the file was missing ("no prior state to
+ * preserve").
  */
 export async function writeSessionRecordWithPersistedLifecycle(
   record: SessionRecord,
@@ -251,6 +258,36 @@ export async function writeSessionRecordWithPersistedLifecycle(
     preserveLifecycle: true,
     persisted: { value: persisted },
   });
+}
+
+function applyPersistedLifecycleForWrite(
+  record: SessionRecord,
+  persistedLifecycle: PersistedSessionLifecycle | undefined,
+): void {
+  if (!persistedLifecycle) {
+    return;
+  }
+  record.closed = persistedLifecycle.closed;
+  record.closedAt = persistedLifecycle.closedAt;
+  record.favorite = persistedLifecycle.favorite;
+  record.favoritedAt = persistedLifecycle.favoritedAt;
+  record.name = persistedLifecycle.name;
+  // `template` is an acpx-ui-owned marker the daemon/agent never authors, so the
+  // agent-exit checkpoint flush of a (possibly stale) in-memory record must adopt
+  // the on-disk value rather than overwrite it — same read-preserve contract as
+  // closed/favorite/name. Without this, marking a template while its agent is live
+  // then letting the agent gracefully disconnect (connection_close) clobbers the
+  // marker and the template silently vanishes from ?view=templates (FW-16).
+  record.template = persistedLifecycle.template;
+  // Keep updated_at monotonic: a stale in-memory flush must not roll it back below
+  // what is already on disk (e.g. the template-mark write). A genuinely newer
+  // in-memory value still wins.
+  if (
+    persistedLifecycle.updatedAt !== undefined &&
+    persistedLifecycle.updatedAt > record.updated_at
+  ) {
+    record.updated_at = persistedLifecycle.updatedAt;
+  }
 }
 
 async function writeSessionRecordInternal(
@@ -266,34 +303,17 @@ async function writeSessionRecordInternal(
   await measurePerf("session.write_record", async () => {
     await ensureSessionDir();
 
+    const persistedLifecycle = options.persisted
+      ? options.persisted.value
+      : await readPersistedLifecycle(record.acpxRecordId);
+    const persistedMetadata = options.persisted
+      ? (await readPersistedLifecycle(record.acpxRecordId))?.metadata
+      : persistedLifecycle?.metadata;
+
     if (options.preserveLifecycle) {
-      const persistedLifecycle = options.persisted
-        ? options.persisted.value
-        : await readPersistedLifecycle(record.acpxRecordId);
-      if (persistedLifecycle) {
-        record.closed = persistedLifecycle.closed;
-        record.closedAt = persistedLifecycle.closedAt;
-        record.favorite = persistedLifecycle.favorite;
-        record.favoritedAt = persistedLifecycle.favoritedAt;
-        record.name = persistedLifecycle.name;
-        // `template` is an acpx-ui-owned marker the daemon/agent never authors, so the
-        // agent-exit checkpoint flush of a (possibly stale) in-memory record must adopt
-        // the on-disk value rather than overwrite it — same read-preserve contract as
-        // closed/favorite/name. Without this, marking a template while its agent is live
-        // then letting the agent gracefully disconnect (connection_close) clobbers the
-        // marker and the template silently vanishes from ?view=templates (FW-16).
-        record.template = persistedLifecycle.template;
-        // Keep updated_at monotonic: a stale in-memory flush must not roll it back below
-        // what is already on disk (e.g. the template-mark write). A genuinely newer
-        // in-memory value still wins.
-        if (
-          persistedLifecycle.updatedAt !== undefined &&
-          persistedLifecycle.updatedAt > record.updated_at
-        ) {
-          record.updated_at = persistedLifecycle.updatedAt;
-        }
-      }
+      applyPersistedLifecycleForWrite(record, persistedLifecycle);
     }
+    mergeRecordMetadataForPersist(record, persistedMetadata);
 
     const sessionDir = sessionBaseDir();
     const logPath = messagesLogPath(sessionDir, record.acpxRecordId);
@@ -303,14 +323,14 @@ async function writeSessionRecordInternal(
       await clearMissingMessagesLogPointerForWrite(record, logPath);
     }
 
-    const persisted = serializeSessionRecordForDisk(record, { messages: "split-tail" });
-    assertPersistedKeyPolicy(persisted);
+    const persistedRecord = serializeSessionRecordForDisk(record, { messages: "split-tail" });
+    assertPersistedKeyPolicy(persistedRecord);
 
     const file = sessionFilePath(record.acpxRecordId);
     const tempFile = `${file}.${process.pid}.${Date.now()}.tmp`;
     // Compact JSON: parses identically everywhere, saves ~30-40% of bytes and
     // stringify CPU on every checkpoint of a multi-MB record.
-    const payload = JSON.stringify(persisted);
+    const payload = JSON.stringify(persistedRecord);
     await fs.writeFile(tempFile, `${payload}\n`, "utf8");
     await fs.rename(tempFile, file);
 
@@ -321,6 +341,7 @@ async function writeSessionRecordInternal(
     await updateSessionIndexForRecordWrite(sessionDir, toSessionIndexEntry(record, fileName), {
       immediate: !options.preserveLifecycle,
     });
+    rememberSessionMetadataBaseline(record);
   });
 }
 

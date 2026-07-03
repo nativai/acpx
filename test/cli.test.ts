@@ -2456,6 +2456,172 @@ test("raw metadata brick is record-driven for stamp/context; set-metadata valida
   });
 });
 
+test("external brick and task_folder metadata survives owner turn-end, next prompt, and index rebuild", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const taskDir = path.join(homeDir, "task");
+    const operationLog = path.join(homeDir, "codex-acp-ops.jsonl");
+    const brickLog = path.join(homeDir, "brick.log");
+    const agentCommand = mockCodexCommand(operationLog);
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(taskDir, { recursive: true });
+    await writeCodexAgentConfig(homeDir, agentCommand);
+
+    const created = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "new", "--name", "metadata-race"],
+      homeDir,
+      { env: { ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh" } },
+    );
+    assert.equal(created.code, 0, created.stderr);
+    const id = String(
+      (JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+
+    const ownerEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: homeDir,
+      PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
+      BRICK_SHIM_MODE: "ok",
+      BRICK_SHIM_ID: BRICK_X,
+      BRICK_SHIM_LOG: brickLog,
+      ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh",
+    };
+    for (const key of [
+      "ACPX_SESSION_URL",
+      "ACPX_SESSION_NAME",
+      "ACPX_PARENT_SESSION_URL",
+      "ACPX_TASK_FOLDER",
+      "ACPX_BRICK",
+      "ACPX_BRICK_PATH",
+      "ACPX_OWNER_LOG",
+    ]) {
+      delete ownerEnv[key];
+    }
+
+    const blocker = spawn(
+      process.execPath,
+      [
+        CLI_PATH,
+        "--cwd",
+        cwd,
+        "--format",
+        "quiet",
+        "codex",
+        "prompt",
+        "--session-id",
+        id,
+        "sleep 4000",
+      ],
+      {
+        env: ownerEnv,
+        stdio: ["ignore", "ignore", "ignore"],
+      },
+    );
+    const blockerClosed = new Promise<number | null>((resolve) => {
+      blocker.once("close", (code) => resolve(code));
+    });
+
+    const expectMetadata = async (label: string): Promise<void> => {
+      const stored = JSON.parse(await fs.readFile(sessionFilePath(homeDir, id), "utf8")) as {
+        metadata?: Record<string, unknown>;
+      };
+      assert.equal(stored.metadata?.brick, BRICK_X, `${label}: brick metadata`);
+      assert.equal(stored.metadata?.task_folder, taskDir, `${label}: task_folder metadata`);
+    };
+
+    try {
+      await waitFor(async () => {
+        const operations = await readMockOperations(operationLog);
+        return operations.some(
+          (entry) => entry.method === "session/prompt" && entry.text === "sleep 4000",
+        )
+          ? true
+          : null;
+      }, 10_000);
+
+      const env = {
+        PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
+        BRICK_SHIM_MODE: "ok",
+        BRICK_SHIM_ID: BRICK_X,
+        BRICK_SHIM_LOG: brickLog,
+        ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh",
+      };
+      const setBrick = await runCli(
+        [
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "codex",
+          "sessions",
+          "set-metadata",
+          "--session-id",
+          id,
+          "brick",
+          BRICK_X,
+        ],
+        homeDir,
+        { env },
+      );
+      assert.equal(setBrick.code, 0, setBrick.stderr);
+      const setTask = await runCli(
+        [
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "codex",
+          "sessions",
+          "set-metadata",
+          "--session-id",
+          id,
+          "task_folder",
+          taskDir,
+        ],
+        homeDir,
+        { env },
+      );
+      assert.equal(setTask.code, 0, setTask.stderr);
+
+      assert.equal(await blockerClosed, 0);
+      await expectMetadata("after owner turn-end");
+
+      const nextPrompt = await runCli(
+        ["--cwd", cwd, "--format", "json", "codex", "prompt", "--session-id", id, "after merge"],
+        homeDir,
+        { env, timeoutMs: 60_000 },
+      );
+      assert.equal(nextPrompt.code, 0, nextPrompt.stderr);
+      await expectMetadata("after next prompt");
+
+      const indexPath = path.join(homeDir, ".acpx", "sessions", "index.json");
+      await fs.rm(indexPath, { force: true });
+      const listed = await runCli(
+        ["--cwd", cwd, "--format", "json", "codex", "sessions", "--local"],
+        homeDir,
+        { env },
+      );
+      assert.equal(listed.code, 0, listed.stderr);
+      const rebuiltIndex = JSON.parse(await fs.readFile(indexPath, "utf8")) as {
+        entries?: Array<{
+          acpxRecordId?: unknown;
+          metadataBrick?: unknown;
+          metadataTaskFolder?: unknown;
+        }>;
+      };
+      const entry = rebuiltIndex.entries?.find((candidate) => candidate.acpxRecordId === id);
+      assert.ok(entry, "rebuilt index entry missing");
+      assert.equal(entry.metadataBrick, BRICK_X);
+      assert.equal(entry.metadataTaskFolder, taskDir);
+    } finally {
+      if (blocker.exitCode === null && blocker.signalCode == null) {
+        blocker.kill("SIGKILL");
+        await blockerClosed;
+      }
+    }
+  });
+});
+
 test("brick path wins agent folder while task_folder remains in env", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

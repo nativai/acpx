@@ -3,12 +3,11 @@ import test from "node:test";
 import type { SessionRecord } from "../src/types.js";
 import { makeSessionRecord, withTempHome } from "./runtime-test-helpers.js";
 
-// perf-loadfix W2.4 — the checkpoint path performs exactly one full record
-// read whose lifecycle fields feed both the closed-state merge and the
-// write's lifecycle preserve. These tests pin the pass-through write variant:
-// the lifecycle-clobber protection (another process's closed/favorite/name
-// write survives our checkpoint) must behave exactly like the re-reading
-// writeSessionRecord (annex D4).
+// perf-loadfix W2.4 — the checkpoint path passes one pre-read lifecycle
+// snapshot through to the write path. W11 intentionally rereads metadata inside
+// that write, but the lifecycle-clobber protection (another process's
+// closed/favorite/name write survives our checkpoint) must still behave exactly
+// like the re-reading writeSessionRecord (annex D4).
 
 type PersistenceModule = typeof import("../src/session/persistence.js");
 
