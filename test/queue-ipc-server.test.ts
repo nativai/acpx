@@ -395,3 +395,57 @@ test("SessionQueueOwner enqueues fire-and-forget prompts and rejects invalid own
     }
   });
 });
+
+test("SessionQueueOwner rejects stale-generation submit_prompt without enqueueing", async () => {
+  await withTempHome(async () => {
+    const sessionId = "owner-stale-generation-submit";
+    const lease = await tryAcquireQueueOwnerLease(sessionId);
+    assert(lease);
+
+    const owner = await SessionQueueOwner.start(lease, {
+      cancelPrompt: async () => false,
+      closeSession: async () => false,
+      setSessionMode: async () => {
+        // no-op
+      },
+      setSessionModel: async () => {
+        // no-op
+      },
+      setSessionConfigOption: async () =>
+        ({
+          configOptions: [],
+        }) as SetSessionConfigOptionResponse,
+      queryActiveTurn: () => false,
+    });
+
+    try {
+      const badSocket = await connectSocket(lease.socketPath);
+      const badLines = readline.createInterface({ input: badSocket });
+      const badIterator = badLines[Symbol.asyncIterator]();
+      badSocket.write(
+        `${JSON.stringify({
+          type: "submit_prompt",
+          requestId: "req-stale-generation-submit",
+          ownerGeneration: lease.ownerGeneration + 1,
+          messageId: "44444444-4444-4444-8444-444444444444",
+          message: "must not enqueue",
+          permissionMode: "approve-reads",
+          waitForCompletion: false,
+        })}\n`,
+      );
+
+      const mismatch = (await nextJsonLine(badIterator)) as {
+        type: string;
+        detailCode?: string;
+      };
+      assert.equal(mismatch.type, "error");
+      assert.equal(mismatch.detailCode, "QUEUE_OWNER_GENERATION_MISMATCH");
+      assert.equal(await owner.nextTask(25), undefined);
+      badLines.close();
+      badSocket.destroy();
+    } finally {
+      await owner.close();
+      await releaseQueueOwnerLease(lease);
+    }
+  });
+});

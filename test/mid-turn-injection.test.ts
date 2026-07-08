@@ -1422,3 +1422,83 @@ test("mid-turn prompt injection threads messageId and emits delivery events", as
     });
   });
 });
+
+test("runQueuedTask deduplicates a repeated messageId before invoking the agent", async () => {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeSessionRecord(homeDir);
+      await writeSessionRecordFile(homeDir, record);
+
+      const messageId = "33333333-3333-4333-8333-333333333333";
+      const control = makeMockClient({
+        onMainPrompt: async () => ({ stopReason: "end_turn" }),
+        onInjectedPrompt: async () => {
+          throw new Error("unexpected injected prompt");
+        },
+      });
+
+      const firstSends: QueueOwnerMessage[] = [];
+      const firstTask = makeQueueTask(
+        "req-first-delivery",
+        MAIN_PROMPT_TEXT,
+        (message) => firstSends.push(message),
+        () => {},
+        true,
+        messageId,
+      );
+      await runQueuedTask(record.acpxRecordId, firstTask, {
+        sharedClient: control.client,
+        suppressSdkConsoleErrors: true,
+      });
+
+      const duplicateSends: QueueOwnerMessage[] = [];
+      const duplicateTask = makeQueueTask(
+        "req-duplicate-delivery",
+        "duplicate should not run",
+        (message) => duplicateSends.push(message),
+        () => {},
+        true,
+        messageId,
+      );
+      await runQueuedTask(record.acpxRecordId, duplicateTask, {
+        sharedClient: control.client,
+        suppressSdkConsoleErrors: true,
+      });
+
+      assert.ok(firstSends.find((message) => message.type === "result"));
+      assert.ok(duplicateSends.find((message) => message.type === "result"));
+      assert.equal(control.promptCalls.filter((call) => call.kind === "main").length, 1);
+
+      const stored = await resolveSessionRecord(record.acpxRecordId);
+      const userIds = stored.messages.flatMap((message) => {
+        if (typeof message !== "object" || message === null || !("User" in message)) {
+          return [];
+        }
+        return [message.User.id];
+      });
+      assert.deepEqual(userIds, [messageId]);
+
+      const streamEvents = await listSessionEvents(record.acpxRecordId);
+      assert.deepEqual(deliveryEventSummaries(streamEvents), [
+        {
+          messageId,
+          requestId: "req-first-delivery",
+          phase: "accepted",
+          stopReason: null,
+        },
+        {
+          messageId,
+          requestId: "req-first-delivery",
+          phase: "done",
+          stopReason: "end_turn",
+        },
+        {
+          messageId,
+          requestId: "req-duplicate-delivery",
+          phase: "done",
+          stopReason: "deduplicated",
+        },
+      ]);
+    });
+  });
+});

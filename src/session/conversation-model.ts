@@ -793,6 +793,12 @@ export function recordPromptSubmission(
   return promptMessageId;
 }
 
+export function hasUserMessageId(conversation: SessionConversation, messageId: string): boolean {
+  return conversation.messages.some(
+    (message) => isUserMessage(message) && message.User.id === messageId,
+  );
+}
+
 function agentMessageHasObservedReply(message: SessionAgentMessage): boolean {
   return message.content.length > 0 || Object.keys(message.tool_results).length > 0;
 }

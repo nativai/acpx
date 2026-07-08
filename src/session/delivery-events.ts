@@ -4,7 +4,13 @@ export const DELIVERY_EVENT_METHOD = "acpx/delivery";
 
 export type DeliveryPhase = "accepted" | "done" | "failed" | "cancelled";
 
-export type DeliveryStopReason = "end_turn" | "max_tokens" | "max_turns" | "cancelled" | null;
+export type DeliveryStopReason =
+  | "end_turn"
+  | "max_tokens"
+  | "max_turns"
+  | "cancelled"
+  | "deduplicated"
+  | null;
 
 export type DeliveryEventError = {
   code: number;

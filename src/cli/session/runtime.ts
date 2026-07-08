@@ -47,6 +47,7 @@ import { applyExecReasoningEffort } from "../../session/config-option-applicatio
 import {
   cloneSessionAcpxState,
   cloneSessionConversation,
+  hasUserMessageId,
   recordClientOperation as recordConversationClientOperation,
   recordPromptSubmission,
   recordSessionUpdate as recordConversationSessionUpdate,
@@ -220,6 +221,12 @@ type AbsorbedInjectedDelivery = {
   terminalWritten: boolean;
 };
 
+type PromptStartResult = {
+  messageId: string | undefined;
+  deduplicated: boolean;
+  record?: SessionRecord;
+};
+
 function deliveryContextFor(params: {
   messageId?: string;
   requestId?: string;
@@ -267,6 +274,13 @@ function markDeliveryEvent(params: {
 
 const DELIVERY_STOP_REASONS = new Set(["end_turn", "max_tokens", "max_turns", "cancelled"]);
 
+const EMPTY_PERMISSION_STATS: RunPromptResult["permissionStats"] = {
+  requested: 0,
+  approved: 0,
+  denied: 0,
+  cancelled: 0,
+};
+
 function toDeliveryStopReason(stopReason: RunPromptResult["stopReason"]): DeliveryStopReason {
   return DELIVERY_STOP_REASONS.has(stopReason) ? (stopReason as DeliveryStopReason) : null;
 }
@@ -301,6 +315,48 @@ function deliveryErrorFrom(error: unknown): DeliveryEventError {
     ...(normalized.effectiveAccount?.effectiveAccount !== undefined
       ? { effectiveAccount: normalized.effectiveAccount.effectiveAccount }
       : {}),
+  };
+}
+
+async function resolveRecordIfPromptAlreadyPersisted(
+  sessionRecordId: string,
+  messageId: string,
+): Promise<SessionRecord | undefined> {
+  const latestRecord = await resolveSessionRecord(sessionRecordId);
+  return hasUserMessageId(cloneSessionConversation(latestRecord), messageId)
+    ? latestRecord
+    : undefined;
+}
+
+async function appendDeduplicatedDeliveryTerminal(
+  record: SessionRecord,
+  context: DeliveryContext | undefined,
+): Promise<void> {
+  if (!context) {
+    return;
+  }
+  const eventWriter = await SessionEventWriter.open(record);
+  try {
+    await eventWriter.appendMessage(
+      buildDeliveryEvent({
+        messageId: context.messageId,
+        requestId: context.requestId,
+        phase: "done",
+        stopReason: "deduplicated",
+      }),
+    );
+  } finally {
+    await eventWriter.close({ checkpoint: true });
+  }
+}
+
+function deduplicatedSessionSendResult(record: SessionRecord): SessionSendResult {
+  return {
+    stopReason: "end_turn",
+    sessionId: record.acpxRecordId,
+    permissionStats: { ...EMPTY_PERMISSION_STATS },
+    record,
+    resumed: true,
   };
 }
 
@@ -850,11 +906,22 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
 
   const conversation = cloneSessionConversation(record);
   let acpxState = cloneSessionAcpxState(record.acpx);
+  const mainDeliveryContext = deliveryContextFor(options);
 
   const recordPromptStart = async (
     prompt: PromptInput | string,
     messageId?: string,
-  ): Promise<string | undefined> => {
+  ): Promise<PromptStartResult> => {
+    if (messageId !== undefined) {
+      const deduplicatedRecord = await resolveRecordIfPromptAlreadyPersisted(
+        options.sessionRecordId,
+        messageId,
+      );
+      if (deduplicatedRecord) {
+        return { messageId, deduplicated: true, record: deduplicatedRecord };
+      }
+    }
+
     const promptStartedAt = isoNow();
     const promptMessageId = recordPromptSubmission(
       conversation,
@@ -868,14 +935,21 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     record.acpx = acpxState;
     await writeSessionRecordAtBoundary(record);
     copyLoggedMessageCount(record, conversation);
-    return promptMessageId;
+    return { messageId: promptMessageId, deduplicated: false };
   };
 
-  const promptMessageId = await recordPromptStart(options.prompt, options.messageId);
+  const promptStart = await recordPromptStart(options.prompt, options.messageId);
+  const promptMessageId = promptStart.messageId;
 
   output.setContext({
     sessionId: record.acpxRecordId,
   });
+
+  if (promptStart.deduplicated) {
+    const deduplicatedRecord = promptStart.record ?? record;
+    await appendDeduplicatedDeliveryTerminal(deduplicatedRecord, mainDeliveryContext);
+    return deduplicatedSessionSendResult(deduplicatedRecord);
+  }
 
   const eventWriter = await measurePerf("session.events.open", async () => {
     return await SessionEventWriter.open(record);
@@ -920,7 +994,6 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   let eventWriterClosed = false;
   const acceptedDeliveryKeys = new Set<string>();
   const terminalDeliveryKeys = new Set<string>();
-  const mainDeliveryContext = deliveryContextFor(options);
 
   const appendDeliveryEvent = async (
     context: DeliveryContext | undefined,
@@ -1074,6 +1147,24 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     });
   };
 
+  const sendInjectedDeduplicatedResultIfWaiting = (
+    injectedTask: QueueTask,
+    deduplicatedRecord: SessionRecord,
+  ): void => {
+    if (!injectedTask.waitForCompletion) {
+      return;
+    }
+    injectedTask.send({
+      type: "result",
+      requestId: injectedTask.requestId,
+      result: {
+        ...toPromptResult("end_turn", record.acpxRecordId, client),
+        record: deduplicatedRecord,
+        resumed: true,
+      },
+    });
+  };
+
   const sendInjectedErrorIfWaiting = (injectedTask: QueueTask, injectedError: unknown): void => {
     if (!injectedTask.waitForCompletion) {
       return;
@@ -1142,7 +1233,15 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     const injectedDeliveryContext = deliveryContextFor(injectedTask);
     let absorbedDelivery: AbsorbedInjectedDelivery | undefined;
     try {
-      const injectedMessageId = await recordPromptStart(injectedPrompt, injectedTask.messageId);
+      const injectedPromptStart = await recordPromptStart(injectedPrompt, injectedTask.messageId);
+      if (injectedPromptStart.deduplicated) {
+        await appendDeliveryTerminal(injectedDeliveryContext, "done", {
+          stopReason: "deduplicated",
+        });
+        sendInjectedDeduplicatedResultIfWaiting(injectedTask, injectedPromptStart.record ?? record);
+        return;
+      }
+      const injectedMessageId = injectedPromptStart.messageId;
       await appendDeliveryEvent(injectedDeliveryContext, "accepted");
       const injectedResponsePromise = client.prompt(
         sessionId,

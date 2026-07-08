@@ -4,6 +4,7 @@ import type { SessionNotification } from "@agentclientprotocol/sdk";
 import {
   cloneSessionAcpxState,
   createSessionConversation,
+  hasUserMessageId,
   recordClientOperation,
   recordPromptSubmission,
   recordSessionUpdate,
@@ -241,6 +242,16 @@ test("recordPromptSubmission preserves audio prompt content", () => {
       },
     },
   ]);
+});
+
+test("hasUserMessageId matches persisted user ids exactly", () => {
+  const conversation = createSessionConversation("2026-02-27T10:00:00.000Z");
+  const messageId = "11111111-1111-4111-8111-111111111111";
+
+  recordPromptSubmission(conversation, "hello", "2026-02-27T10:00:01.000Z", messageId);
+
+  assert.equal(hasUserMessageId(conversation, messageId), true);
+  assert.equal(hasUserMessageId(conversation, "22222222-2222-4222-8222-222222222222"), false);
 });
 
 test("recordClientOperation keeps state and advances timestamp", () => {
