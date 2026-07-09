@@ -14,7 +14,11 @@ import { applyConfigOptionsToRecord } from "../../session/config-options.js";
 import { createSessionConversation } from "../../session/conversation-model.js";
 import { withDefaultModelForNewSession } from "../../session/default-model.js";
 import { defaultSessionEventLog } from "../../session/event-log.js";
-import { setCurrentModelId, syncAdvertisedModelState } from "../../session/mode-preference.js";
+import {
+  setCurrentModelId,
+  setDesiredModelId,
+  syncAdvertisedModelState,
+} from "../../session/mode-preference.js";
 import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
 import { persistSessionOwnerOptions } from "../../session/owner-options.js";
 import {
@@ -53,6 +57,7 @@ async function createSessionRecordWithClient(
   let sessionResult: SessionCreateResult | SessionLoadResult | SessionForkResult;
   let sessionModels: SessionCreateResult["models"];
   let requestedModelApplied = false;
+  let deferForkModel: string | undefined;
   let effectiveSessionOptions = options.sessionOptions;
   let forkContext:
     | {
@@ -78,6 +83,7 @@ async function createSessionRecordWithClient(
     sessionResult = forked.sessionResult;
     sessionModels = forked.sessionModels;
     requestedModelApplied = forked.requestedModelApplied;
+    deferForkModel = forked.deferForkModel;
     forkContext = forked.forkContext;
   } else {
     effectiveSessionOptions = withDefaultModelForNewSession(
@@ -162,6 +168,16 @@ async function createSessionRecordWithClient(
   if (requestedModelApplied) {
     setCurrentModelId(record, effectiveSessionOptions?.model);
   }
+  // Durable Claude fork: the creation-time set_model was skipped (the durable id
+  // is not adapter-registered yet). Persist the inherited source model onto the
+  // record so the UI shows it immediately (current_model_id) and the open-time
+  // replay applies it on the first proper resume (desired via session_options.model,
+  // read by getDesiredModelId). Runs after syncAdvertisedModelState so it is not
+  // clobbered by the advertised default. Fork brick 29efbe0c.
+  if (deferForkModel) {
+    setDesiredModelId(record, deferForkModel);
+    setCurrentModelId(record, deferForkModel);
+  }
 
   // A fork inherits the source's (truncated) conversation in
   // `conversation.messages`. acpx-ui renders a session's conversation from the
@@ -201,6 +217,9 @@ type CreatedSessionState = {
 };
 
 type ForkedSessionState = CreatedSessionState & {
+  // Set when the eager creation-time set_model was skipped for a durable Claude
+  // fork; the source model to persist onto the record for open-time replay.
+  deferForkModel?: string;
   forkContext: {
     sourceRecord: SessionRecord;
     forkAtMessageIndex: number;
@@ -283,6 +302,44 @@ async function resolveForkSourceContext(options: SessionCreateOptions): Promise<
   return { sourceRecord, forkAtMessageIndex };
 }
 
+// Decide how a fork's model gets applied. Durable Claude forks return an
+// SDK-materialized transcript id the adapter has never registered (only the
+// random fork id from unstable_forkSession is). Driving `set_model` on it at
+// creation aborts the whole copy ("Session not found"). So for those we skip the
+// eager apply and defer the source model onto the record, letting the open-time
+// replay path (getDesiredModelId → replayDesiredModel) apply it on the first
+// proper resume — when the durable id IS registered. Every other fork (codex/pty,
+// or a Claude fork where no durable substitution ran) keeps the eager apply: its
+// returned id is already registered. Fork brick 29efbe0c.
+async function resolveForkModelApplication(
+  client: AcpClient,
+  options: SessionCreateOptions,
+  forkedSession: SessionCreateResult | SessionForkResult,
+  sessionModels: SessionCreateResult["models"],
+): Promise<{ requestedModelApplied: boolean; deferForkModel: string | undefined }> {
+  // Only forkSession (forkAtMessageIndex > 0) can carry the marker; the
+  // createSession branch (index 0) is a fresh empty session.
+  const durableClaudeForkApplied =
+    "durableClaudeForkApplied" in forkedSession && forkedSession.durableClaudeForkApplied === true;
+  if (durableClaudeForkApplied) {
+    // `sessionOptions.model` is the canonical model acpx already resolved for the
+    // copy (via copySessionOptionsWithOverride); the record setters normalize it,
+    // and it is the value the open-time replay + adapter model resolution agree on.
+    return { requestedModelApplied: false, deferForkModel: options.sessionOptions?.model };
+  }
+  return {
+    requestedModelApplied: await applyRequestedModelIfAdvertised({
+      client,
+      sessionId: forkedSession.sessionId,
+      requestedModel: options.sessionOptions?.model,
+      models: sessionModels,
+      agentCommand: options.agentCommand,
+      timeoutMs: options.timeoutMs,
+    }),
+    deferForkModel: undefined,
+  };
+}
+
 async function forkSessionRecordWithClient(
   client: AcpClient,
   options: SessionCreateOptions,
@@ -311,20 +368,20 @@ async function forkSessionRecordWithClient(
           );
     const sessionModels = forkedSession.models;
     const agentSessionId = normalizeRuntimeSessionId(forkedSession.agentSessionId);
+    const { requestedModelApplied, deferForkModel } = await resolveForkModelApplication(
+      client,
+      options,
+      forkedSession,
+      sessionModels,
+    );
     return {
       sessionId: forkedSession.sessionId,
       acpSessionId: forkedSession.sessionId,
       agentSessionId,
       sessionResult: forkedSession,
       sessionModels,
-      requestedModelApplied: await applyRequestedModelIfAdvertised({
-        client,
-        sessionId: forkedSession.sessionId,
-        requestedModel: options.sessionOptions?.model,
-        models: sessionModels,
-        agentCommand: options.agentCommand,
-        timeoutMs: options.timeoutMs,
-      }),
+      requestedModelApplied,
+      deferForkModel,
       forkContext: {
         sourceRecord,
         forkAtMessageIndex,

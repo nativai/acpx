@@ -228,6 +228,12 @@ export type SessionResumeResult = SessionLoadResult;
 
 export type SessionForkResult = SessionLoadResult & {
   sessionId: string;
+  // True when the Claude durable-fork id substitution ran: `sessionId` is then
+  // the SDK-materialized durable transcript id, which the adapter has NOT
+  // registered (only the random fork id from unstable_forkSession is). Callers
+  // must not drive a config-op (e.g. set_model) on it at creation time — it
+  // would fail to resolve; defer model application to the first open/resume.
+  durableClaudeForkApplied?: boolean;
 };
 
 type ReconnectedSessionResponse = LoadSessionResponse | ResumeSessionResponse;
@@ -1371,6 +1377,7 @@ export class AcpClient {
 
     result.sessionId = durableClaudeSessionId;
     result.agentSessionId = durableClaudeSessionId;
+    result.durableClaudeForkApplied = true;
   }
 
   private async buildForkRequestContext(
