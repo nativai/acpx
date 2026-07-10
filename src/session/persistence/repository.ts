@@ -34,6 +34,7 @@ import {
   mergeRecordMetadataForPersist,
   rememberSessionMetadataBaseline,
 } from "./metadata-merge.js";
+import { mergeRecordPinnedModelForPersist, rememberSessionModelBaseline } from "./model-merge.js";
 import { parseSessionRecord } from "./parse.js";
 import { serializeSessionRecordForDisk } from "./serialize.js";
 import {
@@ -306,14 +307,23 @@ async function writeSessionRecordInternal(
     const persistedLifecycle = options.persisted
       ? options.persisted.value
       : await readPersistedLifecycle(record.acpxRecordId);
-    const persistedMetadata = options.persisted
-      ? (await readPersistedLifecycle(record.acpxRecordId))?.metadata
-      : persistedLifecycle?.metadata;
+    // When the caller supplied a (possibly stale) lifecycle snapshot, reread the
+    // on-disk record ONCE so both metadata AND the pinned model merge against the
+    // freshest concurrent state rather than the caller's snapshot. Otherwise the
+    // fresh lifecycle read above already holds current disk state — no extra read.
+    const freshPersisted = options.persisted
+      ? await readPersistedLifecycle(record.acpxRecordId)
+      : persistedLifecycle;
+    const persistedMetadata = freshPersisted?.metadata;
 
     if (options.preserveLifecycle) {
       applyPersistedLifecycleForWrite(record, persistedLifecycle);
     }
     mergeRecordMetadataForPersist(record, persistedMetadata);
+    // Same baseline-diff protection metadata gets (2c848d3), extended to the
+    // pinned model: a stale/dropped write can't regress a record-pinned model,
+    // while a deliberate set-model/subscription-switch/new --model still wins.
+    mergeRecordPinnedModelForPersist(record, freshPersisted?.acpx);
 
     const sessionDir = sessionBaseDir();
     const logPath = messagesLogPath(sessionDir, record.acpxRecordId);
@@ -342,6 +352,7 @@ async function writeSessionRecordInternal(
       immediate: !options.preserveLifecycle,
     });
     rememberSessionMetadataBaseline(record);
+    rememberSessionModelBaseline(record);
   });
 }
 
