@@ -1,4 +1,5 @@
 import {
+  isSubscriptionProfileLocked,
   loadProfileRegistry,
   transcriptAnchorDir,
   type AccountId,
@@ -7,6 +8,7 @@ import {
 } from "../../config/profiles.js";
 import { ensureTranscriptAtConfigDir } from "../../config/subscription-transcript.js";
 import type { SubscriptionLookupOptions } from "../../config/subscriptions.js";
+import { SubscriptionLockedError } from "../../errors.js";
 import { isoNow } from "../../session/persistence/repository.js";
 import type { SessionRecord } from "../../types.js";
 import { sessionHasAgentMessages } from "./lifecycle.js";
@@ -90,7 +92,7 @@ function recordAccountSwitch(
   record: SessionRecord,
   fromProfile: ProfileEntry,
   toProfile: ProfileEntry,
-  reason: "manual" | "failover",
+  reason: "manual" | "failover" | "locked",
 ): void {
   const acpx = record.acpx ?? {};
   const sessionOptions = { ...acpx.session_options };
@@ -143,7 +145,7 @@ function missingTranscriptMessage(
 export async function switchSessionAccount(
   record: SessionRecord,
   toProfileId: ProfileId,
-  reason: "manual" | "failover",
+  reason: "manual" | "failover" | "locked",
   loadOpts?: SubscriptionLookupOptions,
 ): Promise<SwitchSessionAccountResult> {
   const targetId = toProfileId.trim();
@@ -158,7 +160,10 @@ export async function switchSessionAccount(
     "current",
   );
   const toProfile = requireProfile(registry.profiles, targetId, "target");
-  if (reason === "failover") {
+  if (isSubscriptionProfileLocked(toProfile, registry)) {
+    throw new SubscriptionLockedError(toProfile.id);
+  }
+  if (reason === "failover" || reason === "locked") {
     assertFailoverSibling(fromProfile, toProfile);
   }
 

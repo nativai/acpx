@@ -4,7 +4,11 @@ import {
   formatErrorMessage,
 } from "../../acp/error-normalization.js";
 import { extractAcpError } from "../../acp/error-shapes.js";
-import { findProfile, loadProfileRegistry } from "../../config/profiles.js";
+import {
+  findProfile,
+  isSubscriptionProfileLocked,
+  loadProfileRegistry,
+} from "../../config/profiles.js";
 import {
   getSubscriptionsUsage,
   maxUtilization,
@@ -16,7 +20,12 @@ import {
   type SubscriptionEntry,
   type SubscriptionLookupOptions,
 } from "../../config/subscriptions.js";
-import { AllSubscriptionsExhaustedError, BridgeAuthGatedError } from "../../errors.js";
+import {
+  AllSubscriptionsExhaustedError,
+  AllSubscriptionsLockedError,
+  BridgeAuthGatedError,
+  SubscriptionLockedError,
+} from "../../errors.js";
 import { writeSessionRecord } from "../../session/persistence/repository.js";
 import type { SessionRecord } from "../../types.js";
 import {
@@ -347,6 +356,12 @@ export function autoFailoverEnabledForRecord(record: SessionRecord): boolean {
   return record.acpx?.session_options?.auto_failover !== false;
 }
 
+export function isSubscriptionLockBlockError(
+  error: unknown,
+): error is SubscriptionLockedError | AllSubscriptionsLockedError {
+  return error instanceof SubscriptionLockedError || error instanceof AllSubscriptionsLockedError;
+}
+
 function cloneSessionOptions(
   options: NonNullable<NonNullable<SessionRecord["acpx"]>["session_options"]> | undefined,
 ): NonNullable<NonNullable<SessionRecord["acpx"]>["session_options"]> | undefined {
@@ -525,7 +540,10 @@ function failoverCandidates(
     // physically failed account, not the selected account, so that selected target
     // remains eligible for a fresh-client retry.
     siblings: registry.profiles.filter(
-      (profile) => profile.authMode === source.authMode && profile.account !== failedAccount,
+      (profile) =>
+        profile.authMode === source.authMode &&
+        profile.account !== failedAccount &&
+        !isSubscriptionProfileLocked(profile, registry),
     ),
   };
 }
@@ -584,6 +602,75 @@ function noPortableSiblingMessage(
     `failover unavailable - profile "${current.id}" (${current.authMode}) has no portable sibling account; ` +
     `account "${current.account}" resets unknown; effectiveAccount "${context.effectiveAccount}"`
   );
+}
+
+function lockBlockStatuses(current: ResolvedProfile, statuses: readonly string[]): string {
+  const prefix = `selected subscription "${current.id}" is locked`;
+  return statuses.length > 0 ? `${prefix}; ${statuses.join("; ")}` : prefix;
+}
+
+async function pickUnlockedTargetForLockedProfile(
+  current: ResolvedProfile,
+  loadOpts?: SubscriptionLookupOptions,
+): Promise<PickedSibling> {
+  const registry = loadProfileRegistry(loadOpts);
+  const siblings = registry.profiles.filter(
+    (profile) =>
+      profile.authMode === current.authMode &&
+      profile.account !== current.account &&
+      !isSubscriptionProfileLocked(profile, registry),
+  );
+  const currentAnchor = transcriptAnchorDir(current);
+  const portable =
+    currentAnchor === null
+      ? []
+      : siblings.filter((profile) => transcriptAnchorDir(profile) !== null);
+  const baseStatuses = await candidateStatuses(portable, new Set());
+  const picked =
+    current.authMode === "subscription"
+      ? await pickSubscriptionSibling(baseStatuses, loadOpts)
+      : { target: baseStatuses.find(accountHealthy)?.profile, statuses: baseStatuses };
+  return {
+    source: current,
+    target: picked.target,
+    statuses: picked.statuses.map(describeStatus),
+    siblingCount: siblings.length,
+    portableCount: portable.length,
+  };
+}
+
+export type SubscriptionLockEnforcementResult = {
+  switchedTo?: string;
+};
+
+export async function enforceSubscriptionLockBeforeTurn(
+  record: SessionRecord,
+  loadOpts?: SubscriptionLookupOptions,
+): Promise<SubscriptionLockEnforcementResult> {
+  const registry = loadProfileRegistry(loadOpts);
+  const current = currentProfile(record, loadOpts);
+  if (
+    !current ||
+    current.authMode !== "subscription" ||
+    !isSubscriptionProfileLocked(current, registry)
+  ) {
+    return {};
+  }
+  if (!autoFailoverEnabledForRecord(record)) {
+    throw new SubscriptionLockedError(current.id, { origin: "runtime", outputCode: "RUNTIME" });
+  }
+
+  const picked = await pickUnlockedTargetForLockedProfile(current, loadOpts);
+  if (picked.siblingCount === 0 || picked.portableCount === 0) {
+    throw new AllSubscriptionsLockedError(lockBlockStatuses(current, picked.statuses));
+  }
+  if (!picked.target) {
+    throw new AllSubscriptionsExhaustedError(lockBlockStatuses(current, picked.statuses));
+  }
+
+  await switchSessionAccount(record, picked.target.id, "locked", loadOpts);
+  await writeSessionRecord(record);
+  return { switchedTo: picked.target.id };
 }
 
 // Choose the terminal error class by the INITIAL trigger (the user's selected

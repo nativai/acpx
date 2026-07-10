@@ -25,8 +25,10 @@ import {
 import {
   attemptFailoverAndRetry,
   classifyFailover,
+  enforceSubscriptionLockBeforeTurn,
   failoverEnabled,
   failoverEnabledForRecord,
+  isSubscriptionLockBlockError,
 } from "../../runtime/engine/failover.js";
 export { InterruptedError, TimeoutError } from "../../async-control.js";
 import { formatPerfMetric, measurePerf, startPerfTimer } from "../../perf-metrics.js";
@@ -789,6 +791,7 @@ export async function runQueuedTask(
     // profile/account. The owner uses it to recycle its stale shared client so
     // subsequent turns cold-spawn on the new transcript anchor.
     onFailoverSwitched?: (newProfileId: string) => void;
+    onLockBlocked?: () => void;
   },
 ): Promise<void> {
   const outputFormatter = task.waitForCompletion
@@ -798,14 +801,19 @@ export async function runQueuedTask(
   try {
     let result: SessionSendResult;
     try {
-      result = await runSessionPrompt(
-        buildQueuedTaskRunOptions(sessionRecordId, task, options, outputFormatter),
-      );
+      const lockPolicy = await applyQueuedTaskSubscriptionLockPolicy(sessionRecordId, options);
+      result = await runSessionPrompt({
+        ...buildQueuedTaskRunOptions(sessionRecordId, task, options, outputFormatter),
+        ...(lockPolicy.useFreshClient ? { client: undefined } : {}),
+      });
     } catch (error) {
       result = await runQueuedTaskFailover(sessionRecordId, task, options, outputFormatter, error);
     }
     sendQueuedTaskResult(task, result);
   } catch (error) {
+    if (isSubscriptionLockBlockError(error)) {
+      options.onLockBlocked?.();
+    }
     sendQueuedTaskError(task, error);
     if (error instanceof InterruptedError) {
       throw error;
@@ -813,6 +821,29 @@ export async function runQueuedTask(
   } finally {
     task.close();
   }
+}
+
+async function applyQueuedTaskSubscriptionLockPolicy(
+  sessionRecordId: string,
+  options: QueuedTaskRuntimeOptions,
+): Promise<{ useFreshClient: boolean }> {
+  const record = await resolveSessionRecord(sessionRecordId);
+  if (bindRecordToDefaultAccount(record)) {
+    await writeSessionRecord(record);
+  }
+  try {
+    const outcome = await enforceSubscriptionLockBeforeTurn(record);
+    if (outcome.switchedTo) {
+      options.onFailoverSwitched?.(outcome.switchedTo);
+      return { useFreshClient: true };
+    }
+  } catch (error) {
+    if (isSubscriptionLockBlockError(error)) {
+      await persistTerminalTurnError(record, error).catch(() => {});
+    }
+    throw error;
+  }
+  return { useFreshClient: false };
 }
 
 // Failover eligibility gate: returns the session record when this turn error
@@ -874,7 +905,8 @@ async function runQueuedTaskFailover(
     // sendQueuedTaskError below.
     if (
       failoverError instanceof AllSubscriptionsExhaustedError ||
-      failoverError instanceof BridgeAuthGatedError
+      failoverError instanceof BridgeAuthGatedError ||
+      isSubscriptionLockBlockError(failoverError)
     ) {
       await persistTerminalTurnError(record, failoverError).catch(() => {});
     }
@@ -902,6 +934,14 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   }
   if (bindRecordToDefaultAccount(record)) {
     await writeSessionRecord(record);
+  }
+  try {
+    await enforceSubscriptionLockBeforeTurn(record);
+  } catch (error) {
+    if (isSubscriptionLockBlockError(error)) {
+      await persistTerminalTurnError(record, error).catch(() => {});
+    }
+    throw error;
   }
 
   const conversation = cloneSessionConversation(record);

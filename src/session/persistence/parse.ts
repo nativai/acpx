@@ -410,11 +410,11 @@ function assignParsedSessionOptions(state: SessionAcpxState, raw: unknown): void
 
 function isValidSubscriptionSwitch(
   record: Record<string, unknown>,
-): record is { from?: string; to: string; reason: "manual" | "failover"; at: string } {
+): record is { from?: string; to: string; reason: "manual" | "failover" | "locked"; at: string } {
   return (
     typeof record.to === "string" &&
     record.to.length > 0 &&
-    (record.reason === "manual" || record.reason === "failover") &&
+    (record.reason === "manual" || record.reason === "failover" || record.reason === "locked") &&
     typeof record.at === "string" &&
     record.at.length > 0
   );
@@ -436,6 +436,14 @@ function assignSessionOptionSubscriptionSwitch(
   };
 }
 
+function nonEmptyStringValue(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isAccountSwitchReason(value: unknown): value is "manual" | "failover" | "locked" {
+  return value === "manual" || value === "failover" || value === "locked";
+}
+
 function isValidAccountSwitch(record: Record<string, unknown>): record is {
   fromProfile?: string;
   toProfile: string;
@@ -446,17 +454,14 @@ function isValidAccountSwitch(record: Record<string, unknown>): record is {
   effectiveAuthMode?: string;
   effectiveAnchor?: string;
   effectiveResolutionMethod?: "path" | "selection";
-  reason: "manual" | "failover";
+  reason: "manual" | "failover" | "locked";
   at: string;
 } {
   return (
-    typeof record.toProfile === "string" &&
-    record.toProfile.length > 0 &&
-    typeof record.toAccount === "string" &&
-    record.toAccount.length > 0 &&
-    (record.reason === "manual" || record.reason === "failover") &&
-    typeof record.at === "string" &&
-    record.at.length > 0
+    nonEmptyStringValue(record.toProfile) &&
+    nonEmptyStringValue(record.toAccount) &&
+    isAccountSwitchReason(record.reason) &&
+    nonEmptyStringValue(record.at)
   );
 }
 

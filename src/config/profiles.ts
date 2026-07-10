@@ -46,6 +46,9 @@ export type SubscriptionProfileEntry = CommonProfileFields & {
   authMode: "subscription";
   adapter: "claude";
   credentialSource: string;
+  locked?: true;
+  lockedAt?: string;
+  lockedBy?: string;
 };
 
 export type OpenRouterProfileEntry = CommonProfileFields & {
@@ -190,6 +193,21 @@ function commonProfileFields(
   };
 }
 
+function lockFields(
+  raw: Record<string, unknown>,
+): Pick<SubscriptionProfileEntry, "locked" | "lockedAt" | "lockedBy"> {
+  if (raw.locked !== true) {
+    return {};
+  }
+  const lockedAt = nonEmptyString(raw.lockedAt);
+  const lockedBy = nonEmptyString(raw.lockedBy);
+  return {
+    locked: true,
+    ...(lockedAt !== undefined ? { lockedAt } : {}),
+    ...(lockedBy !== undefined ? { lockedBy } : {}),
+  };
+}
+
 type NormalizeProfileResult =
   | { profile: ProfileEntry }
   | { quarantine: QuarantinedProfileEntry; id?: string };
@@ -248,6 +266,7 @@ function normalizeSubscriptionProfile(
       adapter: "claude",
       credentialSource:
         nonEmptyString(raw.credentialSource) ?? path.join(subscriptionsDir(homeDir), common.id),
+      ...lockFields(raw),
     },
   };
 }
@@ -383,6 +402,7 @@ function profileFromV1Subscription(value: unknown, homeDir: string): ProfileEntr
   }
   const label = nonEmptyString(value.label) ?? id;
   const accountEmail = nonEmptyString(value.accountEmail);
+  const locked = lockFields(value);
   return {
     id,
     label,
@@ -394,6 +414,7 @@ function profileFromV1Subscription(value: unknown, homeDir: string): ProfileEntr
       nonEmptyString(value.configDir) ??
       nonEmptyString(value.credentialSource) ??
       path.join(subscriptionsDir(homeDir), id),
+    ...locked,
   };
 }
 
@@ -413,7 +434,13 @@ function serializeProfileForRegistry(profile: ProfileEntry): Record<string, unkn
     provisioning: profile.provisioning,
   };
   if (profile.authMode === "subscription") {
-    return { ...common, credentialSource: profile.credentialSource };
+    return {
+      ...common,
+      credentialSource: profile.credentialSource,
+      locked: profile.locked,
+      lockedAt: profile.lockedAt,
+      lockedBy: profile.lockedBy,
+    };
   }
   if (profile.authMode === "openrouter") {
     return {
@@ -541,6 +568,71 @@ function normalizeQuarantineArray(items: unknown): QuarantinedProfileEntry[] {
     .filter((entry): entry is QuarantinedProfileEntry => entry !== undefined);
 }
 
+type LegacyLockMetadata = { account: string; lockedAt?: string; lockedBy?: string };
+type LegacyLockAuditMetadata = Omit<LegacyLockMetadata, "account">;
+
+function legacySubscriptionLockFields(value: unknown): LegacyLockMetadata | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const id = nonEmptyString(value.id);
+  if (!id || value.locked !== true) {
+    return undefined;
+  }
+  const fields = lockFields(value);
+  return {
+    account: nonEmptyString(value.account) ?? id,
+    ...(fields.lockedAt !== undefined ? { lockedAt: fields.lockedAt } : {}),
+    ...(fields.lockedBy !== undefined ? { lockedBy: fields.lockedBy } : {}),
+  };
+}
+
+function collectLegacySubscriptionLocks(items: unknown): Map<string, LegacyLockAuditMetadata> {
+  const lockedByAccount = new Map<string, LegacyLockAuditMetadata>();
+  if (!Array.isArray(items)) {
+    return lockedByAccount;
+  }
+  for (const item of items) {
+    const lock = legacySubscriptionLockFields(item);
+    if (lock && !lockedByAccount.has(lock.account)) {
+      lockedByAccount.set(lock.account, {
+        ...(lock.lockedAt !== undefined ? { lockedAt: lock.lockedAt } : {}),
+        ...(lock.lockedBy !== undefined ? { lockedBy: lock.lockedBy } : {}),
+      });
+    }
+  }
+  return lockedByAccount;
+}
+
+function applyLockMetadataToProfile(
+  profile: SubscriptionProfileEntry,
+  lock: LegacyLockAuditMetadata | undefined,
+): void {
+  if (!lock) {
+    return;
+  }
+  profile.locked = true;
+  if (profile.lockedAt === undefined && lock.lockedAt !== undefined) {
+    profile.lockedAt = lock.lockedAt;
+  }
+  if (profile.lockedBy === undefined && lock.lockedBy !== undefined) {
+    profile.lockedBy = lock.lockedBy;
+  }
+}
+
+function applyLegacySubscriptionLocks(items: unknown, profiles: ProfileEntry[]): void {
+  const lockedByAccount = collectLegacySubscriptionLocks(items);
+  if (lockedByAccount.size === 0) {
+    return;
+  }
+  for (const profile of profiles) {
+    if (profile.authMode !== "subscription") {
+      continue;
+    }
+    applyLockMetadataToProfile(profile, lockedByAccount.get(profile.account || profile.id));
+  }
+}
+
 function buildRegistry(
   value: Record<string, unknown>,
   profiles: ProfileEntry[],
@@ -577,6 +669,7 @@ function normalizeRegistryDocument(
 
   addProfileArray(value.profiles, homeDir, profiles, seen, newQuarantined);
   addV1SubscriptionArray(value.subscriptions, homeDir, profiles, seen);
+  applyLegacySubscriptionLocks(value.subscriptions, profiles);
 
   const existingQuarantined = normalizeQuarantineArray(value.quarantined);
   const quarantined = [...existingQuarantined, ...newQuarantined];
@@ -653,6 +746,26 @@ export function findProfile(id: string, registry: ProfileRegistry): ProfileEntry
     return undefined;
   }
   return registry.profiles.find((entry) => entry.id === trimmed);
+}
+
+export function isSubscriptionProfileLocked(
+  profile: ProfileEntry,
+  registry: ProfileRegistry,
+): boolean {
+  if (profile.authMode !== "subscription") {
+    return false;
+  }
+  if (profile.locked === true) {
+    return true;
+  }
+  const account = profile.account || profile.id;
+  return registry.profiles.some(
+    (candidate) =>
+      candidate.authMode === "subscription" &&
+      candidate.id !== profile.id &&
+      candidate.locked === true &&
+      (candidate.account || candidate.id) === account,
+  );
 }
 
 /**

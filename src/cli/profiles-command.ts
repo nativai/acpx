@@ -1,5 +1,9 @@
 import { Command } from "commander";
-import { getValidEffortsForProfile, loadProfileRegistry } from "../config/profiles.js";
+import {
+  getValidEffortsForProfile,
+  isSubscriptionProfileLocked,
+  loadProfileRegistry,
+} from "../config/profiles.js";
 import type { ProfileEntry } from "../config/profiles.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import { parseOutputFormat, resolveGlobalFlags } from "./flags.js";
@@ -14,9 +18,14 @@ type ProfileDisplayEntry = {
   model: string | null;
   reasoningSupported: boolean;
   validEfforts: readonly string[] | null;
+  locked: boolean;
+  lockedAt?: string;
 };
 
-function toDisplayEntry(p: ProfileEntry): ProfileDisplayEntry {
+function toDisplayEntry(
+  p: ProfileEntry,
+  registry: ReturnType<typeof loadProfileRegistry>,
+): ProfileDisplayEntry {
   return {
     id: p.id,
     label: p.label,
@@ -27,6 +36,8 @@ function toDisplayEntry(p: ProfileEntry): ProfileDisplayEntry {
     model: p.model ?? null,
     reasoningSupported: p.authMode === "openrouter" ? (p.reasoningSupported ?? false) : false,
     validEfforts: getValidEffortsForProfile(p),
+    locked: isSubscriptionProfileLocked(p, registry),
+    ...(p.authMode === "subscription" && p.lockedAt !== undefined ? { lockedAt: p.lockedAt } : {}),
   };
 }
 
@@ -35,8 +46,9 @@ function renderProfileListEntry(entry: ProfileDisplayEntry, defaultId?: string):
   const efforts = entry.validEfforts ? entry.validEfforts.join("/") : "n/a";
   const model = entry.model ? `  model=${entry.model}` : "";
   const email = entry.accountEmail ? ` (${entry.accountEmail})` : "";
+  const locked = entry.locked ? "  locked" : "";
   return (
-    `  ${marker} ${entry.id}\t[${entry.adapter}/${entry.authMode}]\t${entry.label}${model}\n` +
+    `  ${marker} ${entry.id}\t[${entry.adapter}/${entry.authMode}]\t${entry.label}${model}${locked}\n` +
     `      account: ${entry.account}${email}\n` +
     `      reasoning: ${entry.reasoningSupported ? "supported" : "not supported"}  valid-efforts: ${efforts}\n`
   );
@@ -56,7 +68,7 @@ function renderProfilesListText(entries: ProfileDisplayEntry[], defaultId?: stri
 function handleProfilesList(command: Command, config: ResolvedAcpxConfig): void {
   const { format } = resolveGlobalFlags(command, config);
   const registry = loadProfileRegistry();
-  const entries = registry.profiles.map(toDisplayEntry);
+  const entries = registry.profiles.map((profile) => toDisplayEntry(profile, registry));
 
   if (format === "json") {
     process.stdout.write(
@@ -83,7 +95,7 @@ function handleProfileShow(command: Command, id: string, config: ResolvedAcpxCon
     process.exit(1);
   }
 
-  const entry = toDisplayEntry(profile);
+  const entry = toDisplayEntry(profile, registry);
 
   if (format === "json") {
     process.stdout.write(`${JSON.stringify(entry)}\n`);
@@ -98,6 +110,7 @@ function handleProfileShow(command: Command, id: string, config: ResolvedAcpxCon
       `  accountEmail:     ${entry.accountEmail ?? "-"}\n` +
       `  adapter:          ${entry.adapter}\n` +
       `  authMode:         ${entry.authMode}\n` +
+      `  locked:           ${entry.locked ? "true" : "false"}\n` +
       `  model:            ${entry.model ?? "-"}\n` +
       `  reasoningSupported: ${String(entry.reasoningSupported)}\n` +
       `  valid efforts:    ${efforts}\n`,

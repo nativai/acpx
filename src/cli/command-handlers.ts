@@ -9,17 +9,23 @@ import {
 } from "../agent-registry.js";
 import {
   findProfile,
+  isSubscriptionProfileLocked,
   loadProfileRegistry,
   type ProfileEntry,
   type ProfileRegistry,
 } from "../config/profiles.js";
-import { findSubscription, loadSubscriptionRegistry } from "../config/subscriptions.js";
+import {
+  findSubscription,
+  isSubscriptionLocked,
+  loadSubscriptionRegistry,
+} from "../config/subscriptions.js";
 import {
   AgentSpawnError,
   ProfileClassMismatchError,
   ProfileUnknownError,
   SessionNotFoundError,
   SubscriptionChangeRequiresSwitchError,
+  SubscriptionLockedError,
   SubscriptionUnknownError,
 } from "../errors.js";
 import { loadPermissionPolicySpec } from "../permission-policy.js";
@@ -279,7 +285,11 @@ function validateExplicitSubscriptionFlag(globalFlags: GlobalFlags): void {
   }
 
   const registry = loadSubscriptionRegistry();
-  if (findSubscription(subscriptionId, registry)) {
+  const subscription = findSubscription(subscriptionId, registry);
+  if (subscription) {
+    if (isSubscriptionLocked(subscription, registry)) {
+      throw new SubscriptionLockedError(subscriptionId);
+    }
     return;
   }
 
@@ -287,6 +297,44 @@ function validateExplicitSubscriptionFlag(globalFlags: GlobalFlags): void {
     subscriptionId,
     registry.subscriptions.map((entry) => entry.id),
   );
+}
+
+function validateExplicitProfileFlag(globalFlags: GlobalFlags): void {
+  const profileId = globalFlags.profile?.trim();
+  if (!profileId) {
+    return;
+  }
+  const registry = loadProfileRegistry();
+  const profile = findProfile(profileId, registry);
+  if (profile && isSubscriptionProfileLocked(profile, registry)) {
+    throw new SubscriptionLockedError(profileId);
+  }
+}
+
+function validateExplicitCredentialFlags(globalFlags: GlobalFlags): void {
+  validateExplicitSubscriptionFlag(globalFlags);
+  validateExplicitProfileFlag(globalFlags);
+}
+
+function selectionIsLocked(selection: string | undefined): boolean {
+  const id = selection?.trim();
+  if (!id) {
+    return false;
+  }
+  const profileRegistry = loadProfileRegistry();
+  const profile = findProfile(id, profileRegistry);
+  if (profile && isSubscriptionProfileLocked(profile, profileRegistry)) {
+    return true;
+  }
+  const subscriptionRegistry = loadSubscriptionRegistry();
+  const subscription = findSubscription(id, subscriptionRegistry);
+  return subscription !== undefined && isSubscriptionLocked(subscription, subscriptionRegistry);
+}
+
+function assertProfileUnlocked(profile: ProfileEntry, registry: ProfileRegistry): void {
+  if (isSubscriptionProfileLocked(profile, registry)) {
+    throw new SubscriptionLockedError(profile.id);
+  }
 }
 
 function existingSessionSubscriptionLabel(record: SessionRecord): string {
@@ -542,10 +590,18 @@ function inheritedProfileSelection(
   sameAgentAsParent: boolean,
   parent: ResolvedParentSession | undefined,
 ): string | undefined {
-  return withInheritedProfile(
-    globalFlags.profile ?? globalFlags.subscription,
-    sameAgentAsParent ? (parent?.profile ?? parent?.subscription) : undefined,
-  );
+  const explicitSelection = globalFlags.profile ?? globalFlags.subscription;
+  const inheritedSelection = sameAgentAsParent
+    ? (parent?.profile ?? parent?.subscription)
+    : undefined;
+  const selection = withInheritedProfile(explicitSelection, inheritedSelection);
+  if (explicitSelection !== undefined) {
+    return selection;
+  }
+  if (selectionIsLocked(selection)) {
+    return undefined;
+  }
+  return selection;
 }
 
 // Assemble the child's sessionOptions, layering parent inheritance over the
@@ -682,6 +738,35 @@ function sourceDesiredConfigOptions(source: SessionRecord): Record<string, strin
   return Object.keys(desired).length > 0 ? desired : undefined;
 }
 
+function applyCopyCredentialOverride(
+  merged: NonNullable<ReturnType<typeof sourceSessionOptions>>,
+  globalFlags: GlobalFlags,
+  inheritedCredential: string | undefined,
+): void {
+  const explicitCredential = globalFlags.profile ?? globalFlags.subscription;
+  if (explicitCredential !== undefined) {
+    merged.profile = explicitCredential;
+    delete merged.subscription;
+    return;
+  }
+  if (selectionIsLocked(inheritedCredential)) {
+    throw new SubscriptionLockedError(inheritedCredential as string);
+  }
+}
+
+function applyCopyModelOverrides(
+  merged: NonNullable<ReturnType<typeof sourceSessionOptions>>,
+  model: string | undefined,
+  reasoningEffort: string | undefined,
+): void {
+  if (model !== undefined) {
+    merged.model = model;
+  }
+  if (reasoningEffort !== undefined) {
+    merged.reasoningEffort = reasoningEffort;
+  }
+}
+
 // #3 — template params as defaults, explicit flag overrides. Precedence:
 // explicit `--model`/`--reasoning-effort` > template/source value > box default.
 // Layers the explicit global flag over the source's baked-in value via the same
@@ -701,12 +786,8 @@ function copySessionOptionsWithOverride(
     base?.reasoningEffort,
   );
   const merged = { ...base };
-  if (model !== undefined) {
-    merged.model = model;
-  }
-  if (reasoningEffort !== undefined) {
-    merged.reasoningEffort = reasoningEffort;
-  }
+  applyCopyCredentialOverride(merged, globalFlags, base?.profile ?? base?.subscription);
+  applyCopyModelOverrides(merged, model, reasoningEffort);
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
@@ -1037,7 +1118,7 @@ export async function handlePrompt(
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
-  validateExplicitSubscriptionFlag(globalFlags);
+  validateExplicitCredentialFlags(globalFlags);
   const outputPolicy = resolveRequestedOutputPolicy(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
@@ -1093,7 +1174,7 @@ export async function handleExec(
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
-  validateExplicitSubscriptionFlag(globalFlags);
+  validateExplicitCredentialFlags(globalFlags);
 
   if (config.disableExec) {
     const outputPolicy = resolveRequestedOutputPolicy(globalFlags);
@@ -1479,11 +1560,15 @@ export async function handleSetSubscription(
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const trimmedId = subscriptionId.trim();
   const registry = loadSubscriptionRegistry();
-  if (!findSubscription(trimmedId, registry)) {
+  const subscription = findSubscription(trimmedId, registry);
+  if (!subscription) {
     throw new SubscriptionUnknownError(
       trimmedId,
       registry.subscriptions.map((entry) => entry.id),
     );
+  }
+  if (isSubscriptionLocked(subscription, registry)) {
+    throw new SubscriptionLockedError(trimmedId);
   }
   const selector = resolveSessionTargetSelector({ flags, command });
   const record = await findRoutedTargetSessionOrThrow(agent, selector);
@@ -1589,6 +1674,7 @@ export async function handleSetProfile(
       registry.profiles.map((entry) => entry.id),
     );
   }
+  assertProfileUnlocked(target, registry);
   const selector = resolveSessionTargetSelector({ flags, command });
   const record = await findRoutedTargetSessionOrThrow(agent, selector);
   assertSameCredentialClass(record, target, registry);
@@ -1909,7 +1995,7 @@ export async function handleSessionsNew(
   }
 
   const globalFlags = resolveGlobalFlags(command, config);
-  validateExplicitSubscriptionFlag(globalFlags);
+  validateExplicitCredentialFlags(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const parent = await resolveAndValidateParentSessionId(flags);
@@ -2012,6 +2098,7 @@ async function deliverCopyHandoffPrompt(
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
+  validateExplicitCredentialFlags(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   await deliverPrompt({
@@ -2042,6 +2129,7 @@ async function runSessionCopy(
   source: SessionRecord;
 }> {
   const globalFlags = resolveGlobalFlags(command, config);
+  validateExplicitCredentialFlags(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const pathAgent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
@@ -2259,7 +2347,7 @@ export async function handleSessionsEnsure(
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
-  validateExplicitSubscriptionFlag(globalFlags);
+  validateExplicitCredentialFlags(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const parent = await resolveAndValidateParentSessionId(flags);

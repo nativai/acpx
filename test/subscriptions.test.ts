@@ -6,8 +6,10 @@ import test from "node:test";
 import {
   chooseSubscriptionConfigDir,
   findSubscription,
+  isSubscriptionLocked,
   loadSubscriptionRegistry,
   resolveSubscriptionConfigDir,
+  setSubscriptionLockState,
 } from "../src/config/subscriptions.js";
 import type { SubscriptionRegistry } from "../src/config/subscriptions.js";
 
@@ -176,6 +178,167 @@ test("chooseSubscriptionConfigDir: unselected, default valid → default dir, so
     chooseSubscriptionConfigDir("   ", resolverRegistry({ default: "sub2" }), resolverDirExists),
     expected,
   );
+});
+
+test("loadSubscriptionRegistry preserves lock fields and applies same-account effective locks", async () => {
+  await withTempDir(async (homeDir) => {
+    const registryPath = path.join(homeDir, "registry.json");
+    await fs.writeFile(
+      registryPath,
+      JSON.stringify({
+        subscriptions: [
+          {
+            id: "sub1",
+            label: "One",
+            configDir: "/cfg/sub1",
+            account: "acct",
+            locked: true,
+            lockedAt: "2026-07-10T00:00:00.000Z",
+            lockedBy: "test",
+          },
+          { id: "sub1-alias", label: "Alias", configDir: "/cfg/sub1-alias", account: "acct" },
+          { id: "sub2", label: "Two", configDir: "/cfg/sub2", account: "acct2" },
+        ],
+      }),
+    );
+
+    const registry = loadSubscriptionRegistry({ homeDir, registryPath });
+    const direct = findSubscription("sub1", registry);
+    const alias = findSubscription("sub1-alias", registry);
+    const other = findSubscription("sub2", registry);
+    assert.equal(direct?.locked, true);
+    assert.equal(direct?.lockedAt, "2026-07-10T00:00:00.000Z");
+    assert.equal(direct?.lockedBy, "test");
+    assert.equal(alias && isSubscriptionLocked(alias, registry), true);
+    assert.equal(other && isSubscriptionLocked(other, registry), false);
+  });
+});
+
+test("loadSubscriptionRegistry applies legacy subscription locks to duplicate v3 subscription profiles", async () => {
+  await withTempDir(async (homeDir) => {
+    const registryPath = path.join(homeDir, "registry.json");
+    await fs.writeFile(
+      registryPath,
+      JSON.stringify({
+        version: 3,
+        profiles: [
+          {
+            id: "sub1",
+            label: "One profile",
+            authMode: "subscription",
+            adapter: "claude",
+            credentialSource: "/cfg/sub1",
+            account: "acct",
+          },
+          {
+            id: "sub2",
+            label: "Two profile",
+            authMode: "subscription",
+            adapter: "claude",
+            credentialSource: "/cfg/sub2",
+            account: "acct2",
+          },
+        ],
+        subscriptions: [
+          {
+            id: "legacy-sub1",
+            label: "One legacy",
+            configDir: "/cfg/sub1",
+            account: "acct",
+            locked: true,
+            lockedAt: "2026-07-10T00:00:00.000Z",
+            lockedBy: "test",
+          },
+        ],
+      }),
+    );
+
+    const registry = loadSubscriptionRegistry({ homeDir, registryPath });
+    const profileBacked = findSubscription("sub1", registry);
+    const other = findSubscription("sub2", registry);
+    assert.equal(profileBacked?.locked, true);
+    assert.equal(profileBacked?.lockedAt, "2026-07-10T00:00:00.000Z");
+    assert.equal(profileBacked?.lockedBy, "test");
+    assert.equal(other && isSubscriptionLocked(other, registry), false);
+  });
+});
+
+test("setSubscriptionLockState writes additive lock fields to same-account profile and legacy entries", async () => {
+  await withTempDir(async (homeDir) => {
+    const registryPath = path.join(homeDir, "registry.json");
+    await fs.writeFile(
+      registryPath,
+      JSON.stringify(
+        {
+          version: 3,
+          profiles: [
+            {
+              id: "sub1",
+              label: "One",
+              authMode: "subscription",
+              adapter: "claude",
+              credentialSource: "/cfg/sub1",
+              account: "acct",
+            },
+          ],
+          subscriptions: [
+            { id: "sub1-legacy", label: "One legacy", configDir: "/cfg/sub1", account: "acct" },
+          ],
+        },
+        null,
+        2,
+      ),
+    );
+
+    const result = setSubscriptionLockState("sub1", true, {
+      homeDir,
+      registryPath,
+      lockedBy: "test-ui",
+    });
+    assert.equal(result?.action, "subscription_lock_set");
+    assert.deepEqual(result?.affected.toSorted(), ["sub1", "sub1-legacy"]);
+
+    const raw = JSON.parse(await fs.readFile(registryPath, "utf8")) as {
+      profiles: Array<Record<string, unknown>>;
+      subscriptions: Array<Record<string, unknown>>;
+    };
+    assert.equal(raw.profiles[0].locked, true);
+    assert.equal(typeof raw.profiles[0].lockedAt, "string");
+    assert.equal(raw.profiles[0].lockedBy, "test-ui");
+    assert.equal(raw.subscriptions[0].locked, true);
+
+    setSubscriptionLockState("sub1-legacy", false, { homeDir, registryPath });
+    const unlocked = JSON.parse(await fs.readFile(registryPath, "utf8")) as {
+      profiles: Array<Record<string, unknown>>;
+      subscriptions: Array<Record<string, unknown>>;
+    };
+    assert.equal("locked" in unlocked.profiles[0], false);
+    assert.equal("lockedAt" in unlocked.subscriptions[0], false);
+  });
+});
+
+test("chooseSubscriptionConfigDir rejects locked explicit ids and skips a locked default", () => {
+  const registry = resolverRegistry({
+    default: "sub1",
+    subscriptions: [
+      { id: "sub1", label: "One", configDir: "/cfg/sub1", account: "sub1", locked: true },
+      { id: "sub2", label: "Two", configDir: "/cfg/sub2", account: "sub2" },
+    ],
+  });
+
+  assert.deepEqual(chooseSubscriptionConfigDir("sub1", registry, resolverDirExists), {
+    configDir: "/cfg/sub2",
+    source: "default",
+    resolvedId: "sub2",
+    explicitRejection: { kind: "locked", id: "sub1" },
+    defaultUnusable: { kind: "locked", id: "sub1" },
+  });
+  assert.deepEqual(chooseSubscriptionConfigDir(undefined, registry, resolverDirExists), {
+    configDir: "/cfg/sub2",
+    source: "default",
+    resolvedId: "sub2",
+    defaultUnusable: { kind: "locked", id: "sub1" },
+  });
 });
 
 test("chooseSubscriptionConfigDir: unselected, no default → empty choice (no configDir, no rejection)", () => {

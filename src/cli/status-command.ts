@@ -1,4 +1,14 @@
 import { Command } from "commander";
+import {
+  findProfile,
+  isSubscriptionProfileLocked,
+  loadProfileRegistry,
+} from "../config/profiles.js";
+import {
+  findSubscription,
+  isSubscriptionLocked,
+  loadSubscriptionRegistry,
+} from "../config/subscriptions.js";
 import { findSession } from "../session/persistence.js";
 import type { SessionRecord } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
@@ -162,12 +172,60 @@ function createStatusPayload(
     reasoningEffort: acpx.reasoningEffort,
     reasoningEffortLive: acpx.reasoningEffortLive,
     autoFailover: acpx.autoFailover,
+    credential: statusCredential(record),
     uptime: running ? optionalStatusString(formatUptime(record.agentStartedAt)) : null,
     lastPromptTime: optionalStatusString(record.lastPromptAt),
     exitCode: running ? null : optionalStatusNumber(record.lastAgentExitCode),
     signal: running ? null : optionalStatusSignal(record.lastAgentExitSignal),
     ...agentSessionIdPayload(record.agentSessionId),
   };
+}
+
+type StatusCredentialPayload = {
+  id: string;
+  kind: "profile" | "subscription";
+  locked: boolean;
+  lockedAt?: string;
+};
+
+function profileStatusCredential(profileId: string): StatusCredentialPayload | null {
+  const registry = loadProfileRegistry();
+  const profile = findProfile(profileId, registry);
+  if (!profile) {
+    return null;
+  }
+  return {
+    id: profile.id,
+    kind: "profile",
+    locked: isSubscriptionProfileLocked(profile, registry),
+    ...(profile.authMode === "subscription" && profile.lockedAt !== undefined
+      ? { lockedAt: profile.lockedAt }
+      : {}),
+  };
+}
+
+function subscriptionStatusCredential(subscriptionId: string): StatusCredentialPayload | null {
+  const registry = loadSubscriptionRegistry();
+  const subscription = findSubscription(subscriptionId, registry);
+  if (!subscription) {
+    return null;
+  }
+  return {
+    id: subscription.id,
+    kind: "subscription",
+    locked: isSubscriptionLocked(subscription, registry),
+    ...(subscription.lockedAt !== undefined ? { lockedAt: subscription.lockedAt } : {}),
+  };
+}
+
+function statusCredential(record: SessionRecord): StatusCredentialPayload | null {
+  const options = record.acpx?.session_options;
+  const profileId = options?.profile?.trim();
+  if (profileId) {
+    return profileStatusCredential(profileId);
+  }
+  const subscriptionId = options?.subscription?.trim();
+  return subscriptionId ? subscriptionStatusCredential(subscriptionId) : null;
 }
 
 function statusAcpxFields(record: SessionRecord): {
@@ -257,6 +315,7 @@ type StatusPayload = {
   reasoningEffort: string | null;
   reasoningEffortLive: string | null;
   autoFailover: boolean;
+  credential: StatusCredentialPayload | null;
   uptime: string | null;
   lastPromptTime: string | null;
   exitCode: number | null;
@@ -297,6 +356,7 @@ function statusJsonPayload(
   assignDefinedJsonField(result, "reasoningEffort", payload.reasoningEffort);
   assignDefinedJsonField(result, "reasoningEffortLive", payload.reasoningEffortLive);
   assignDefinedJsonField(result, "autoFailover", payload.autoFailover);
+  assignDefinedJsonField(result, "credential", payload.credential);
   assignDefinedJsonField(result, "uptime", payload.uptime);
   assignDefinedJsonField(result, "lastPromptTime", payload.lastPromptTime);
   if (dead) {
@@ -338,6 +398,11 @@ function printTextStatus(payload: StatusPayload, dead: boolean): void {
   process.stdout.write(`reasoningEffort: ${orDash(payload.reasoningEffort)}\n`);
   process.stdout.write(`reasoningEffortLive: ${orDash(payload.reasoningEffortLive)}\n`);
   process.stdout.write(`autoFailover: ${payload.autoFailover ? "on" : "off"}\n`);
+  process.stdout.write(
+    `credentialLocked: ${
+      payload.credential ? (payload.credential.locked ? "locked" : "unlocked") : "-"
+    }\n`,
+  );
   process.stdout.write(`uptime: ${orDash(payload.uptime)}\n`);
   process.stdout.write(`lastPromptTime: ${orDash(payload.lastPromptTime)}\n`);
   if (dead) {
