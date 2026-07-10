@@ -661,8 +661,11 @@ export async function enforceSubscriptionLockBeforeTurn(
   }
 
   const picked = await pickUnlockedTargetForLockedProfile(current, loadOpts);
-  if (picked.siblingCount === 0 || picked.portableCount === 0 || !picked.target) {
+  if (picked.siblingCount === 0 || picked.portableCount === 0) {
     throw new AllSubscriptionsLockedError(lockBlockStatuses(current, picked.statuses));
+  }
+  if (!picked.target) {
+    throw new AllSubscriptionsExhaustedError(lockBlockStatuses(current, picked.statuses));
   }
 
   await switchSessionAccount(record, picked.target.id, "locked", loadOpts);

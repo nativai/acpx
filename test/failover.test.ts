@@ -9,7 +9,11 @@ import {
   pickFailoverTarget,
   type SubscriptionUsage,
 } from "../src/config/subscription-usage.js";
-import { AllSubscriptionsLockedError, SubscriptionLockedError } from "../src/errors.js";
+import {
+  AllSubscriptionsExhaustedError,
+  AllSubscriptionsLockedError,
+  SubscriptionLockedError,
+} from "../src/errors.js";
 import {
   classifyFailover,
   enforceSubscriptionLockBeforeTurn,
@@ -297,4 +301,25 @@ test("enforceSubscriptionLockBeforeTurn uses lock-specific all-locked error when
         error.detailCode === "all-subscriptions-locked",
     );
   });
+});
+
+test("enforceSubscriptionLockBeforeTurn preserves exhausted semantics when unlocked sibling is unusable", async () => {
+  await withLockedProfileRegistry(
+    [lockTestProfile("sub1", true), lockTestProfile("sub2")],
+    async (lookupOptions) => {
+      const record = makeSessionRecord({
+        acpxRecordId: "rec",
+        acpSessionId: "acp",
+        agentCommand: "node claude-agent.js",
+        cwd: "/tmp/project",
+        acpx: { session_options: { profile: "sub1" } },
+      });
+      await assert.rejects(
+        enforceSubscriptionLockBeforeTurn(record, lookupOptions),
+        (error) =>
+          error instanceof AllSubscriptionsExhaustedError &&
+          error.detailCode === "all-subscriptions-exhausted",
+      );
+    },
+  );
 });
