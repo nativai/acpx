@@ -190,6 +190,28 @@ export class SubscriptionUnknownError extends AcpxOperationalError {
   }
 }
 
+// A subscription/profile was requested while it is user-locked. Locks are not
+// quota exhaustion: they are operator intent and must render with lock-specific
+// recovery UI.
+export class SubscriptionLockedError extends AcpxOperationalError {
+  readonly subscriptionId: string;
+
+  constructor(
+    id: string,
+    options?: { origin?: "cli" | "runtime"; outputCode?: "USAGE" | "RUNTIME" },
+  ) {
+    super(
+      `subscription "${id}" is locked. Unlock it or select a different subscription before starting another turn.`,
+      {
+        outputCode: options?.outputCode ?? "USAGE",
+        detailCode: "subscription-locked",
+        origin: options?.origin ?? "cli",
+      },
+    );
+    this.subscriptionId = id;
+  }
+}
+
 export class SubscriptionChangeRequiresSwitchError extends AcpxOperationalError {
   constructor(params: {
     sessionLabel: string;
@@ -222,6 +244,18 @@ export class AllSubscriptionsExhaustedError extends AcpxOperationalError {
     super(`All subscriptions are exhausted or unavailable. ${statuses}`, {
       outputCode: "RUNTIME",
       detailCode: "all-subscriptions-exhausted",
+      origin: "runtime",
+    });
+  }
+}
+
+// Every same-family subscription target is locked by operator action. Distinct
+// from exhausted/quota so retry-exhausted semantics remain untouched.
+export class AllSubscriptionsLockedError extends AcpxOperationalError {
+  constructor(statuses: string) {
+    super(`All compatible subscriptions are locked. ${statuses}`, {
+      outputCode: "RUNTIME",
+      detailCode: "all-subscriptions-locked",
       origin: "runtime",
     });
   }

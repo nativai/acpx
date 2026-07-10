@@ -1,6 +1,6 @@
-import { existsSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import os from "node:os";
-import path from "node:path";
+import path, { dirname } from "node:path";
 
 // Per-subscription Claude credential registry. Each subscription is a
 // CLAUDE_CONFIG_DIR holding its own .credentials.json (and per-dir runtime
@@ -20,6 +20,10 @@ export type SubscriptionEntry = {
   account: string;
   /** Display/grouping metadata only. */
   accountEmail?: string;
+  /** User/operator lock: this Claude SDK subscription must not be selected or used. */
+  locked?: true;
+  lockedAt?: string;
+  lockedBy?: string;
 };
 
 export type SubscriptionRegistry = {
@@ -40,14 +44,18 @@ export type ConfigDirChoice = {
   configDir?: string;
   /** Which input produced `configDir` (only present when `configDir` is). */
   source?: "explicit" | "default";
+  /** Final subscription id that produced `configDir` when it is known. */
+  resolvedId?: string;
   /** A provided explicit id we could NOT honor (still emitted for logging). */
   explicitRejection?:
     | { kind: "unknown"; id: string }
-    | { kind: "missing-dir"; id: string; configDir: string };
+    | { kind: "missing-dir"; id: string; configDir: string }
+    | { kind: "locked"; id: string };
   /** A configured `default` that was itself unusable (set+unknown / set+dir-missing). */
   defaultUnusable?:
     | { kind: "unknown"; id: string }
-    | { kind: "missing-dir"; id: string; configDir: string };
+    | { kind: "missing-dir"; id: string; configDir: string }
+    | { kind: "locked"; id: string };
 };
 
 const SUBSCRIPTIONS_DIRNAME = "subscriptions";
@@ -131,9 +139,10 @@ export function subscriptionConfigDirExists(configDir: string): boolean {
 }
 
 type IdResolution =
-  | { kind: "ok"; configDir: string }
+  | { kind: "ok"; id: string; configDir: string }
   | { kind: "unknown"; id: string }
-  | { kind: "missing-dir"; id: string; configDir: string };
+  | { kind: "missing-dir"; id: string; configDir: string }
+  | { kind: "locked"; id: string };
 
 function resolveRegisteredDir(
   id: string,
@@ -144,10 +153,68 @@ function resolveRegisteredDir(
   if (!entry) {
     return { kind: "unknown", id };
   }
+  if (isSubscriptionLocked(entry, registry)) {
+    return { kind: "locked", id };
+  }
   if (!dirExists(entry.configDir)) {
     return { kind: "missing-dir", id, configDir: entry.configDir };
   }
-  return { kind: "ok", configDir: entry.configDir };
+  return { kind: "ok", id: entry.id, configDir: entry.configDir };
+}
+
+function applyDefaultResolution(result: ConfigDirChoice, resolved: IdResolution): boolean {
+  if (resolved.kind !== "ok") {
+    result.defaultUnusable = resolved;
+    return false;
+  }
+  result.configDir = resolved.configDir;
+  result.source = "default";
+  return true;
+}
+
+function firstUnlockedSubscription(
+  registry: SubscriptionRegistry,
+  dirExists: (dir: string) => boolean,
+): SubscriptionEntry | undefined {
+  return registry.subscriptions.find(
+    (entry) => !isSubscriptionLocked(entry, registry) && dirExists(entry.configDir),
+  );
+}
+
+function applyLockedDefaultFallback(
+  result: ConfigDirChoice,
+  registry: SubscriptionRegistry,
+  dirExists: (dir: string) => boolean,
+): boolean {
+  if (result.defaultUnusable?.kind !== "locked") {
+    return false;
+  }
+  const fallback = firstUnlockedSubscription(registry, dirExists);
+  if (!fallback) {
+    return false;
+  }
+  result.configDir = fallback.configDir;
+  result.source = "default";
+  result.resolvedId = fallback.id;
+  return true;
+}
+
+function resolveExplicitChoice(
+  result: ConfigDirChoice,
+  explicitId: string | null | undefined,
+  registry: SubscriptionRegistry,
+  dirExists: (dir: string) => boolean,
+): ConfigDirChoice | undefined {
+  const trimmedExplicit = explicitId?.trim();
+  if (!trimmedExplicit) {
+    return undefined;
+  }
+  const resolved = resolveRegisteredDir(trimmedExplicit, registry, dirExists);
+  if (resolved.kind === "ok") {
+    return { configDir: resolved.configDir, source: "explicit" };
+  }
+  result.explicitRejection = resolved;
+  return undefined;
 }
 
 /**
@@ -170,27 +237,40 @@ export function chooseSubscriptionConfigDir(
 ): ConfigDirChoice {
   const result: ConfigDirChoice = {};
 
-  const trimmedExplicit = explicitId?.trim();
-  if (trimmedExplicit) {
-    const resolved = resolveRegisteredDir(trimmedExplicit, registry, dirExists);
-    if (resolved.kind === "ok") {
-      return { configDir: resolved.configDir, source: "explicit" };
-    }
-    result.explicitRejection = resolved;
+  const explicitChoice = resolveExplicitChoice(result, explicitId, registry, dirExists);
+  if (explicitChoice) {
+    return explicitChoice;
   }
 
   const defaultId = registry.default?.trim();
   if (defaultId) {
     const resolved = resolveRegisteredDir(defaultId, registry, dirExists);
-    if (resolved.kind === "ok") {
-      result.configDir = resolved.configDir;
-      result.source = "default";
+    if (applyDefaultResolution(result, resolved)) {
       return result;
     }
-    result.defaultUnusable = resolved;
+  }
+
+  if (applyLockedDefaultFallback(result, registry, dirExists)) {
+    return result;
   }
 
   return result;
+}
+
+export function isSubscriptionLocked(
+  entry: SubscriptionEntry,
+  registry: SubscriptionRegistry,
+): boolean {
+  if (entry.locked === true) {
+    return true;
+  }
+  const account = entry.account || entry.id;
+  return registry.subscriptions.some(
+    (candidate) =>
+      candidate.id !== entry.id &&
+      candidate.locked === true &&
+      (candidate.account || candidate.id) === account,
+  );
 }
 
 type SubscriptionNormalizer = (entry: unknown, homeDir: string) => SubscriptionEntry | undefined;
@@ -207,12 +287,14 @@ function normalizeEntry(value: unknown, homeDir: string): SubscriptionEntry | un
   const configDir = nonEmptyString(value.configDir) ?? path.join(subscriptionsDir(homeDir), id);
   const account = nonEmptyString(value.account) ?? id;
   const accountEmail = nonEmptyString(value.accountEmail);
+  const locked = lockFields(value);
   return {
     id,
     label,
     configDir,
     account,
     ...(accountEmail !== undefined ? { accountEmail } : {}),
+    ...locked,
   };
 }
 
@@ -243,6 +325,71 @@ function collectSubscriptions(
   }
 }
 
+type LockMetadata = { account: string; lockedAt?: string; lockedBy?: string };
+type LockAuditMetadata = Omit<LockMetadata, "account">;
+
+function legacySubscriptionLockFields(value: unknown): LockMetadata | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const id = nonEmptyString(value.id);
+  if (id === undefined || value.locked !== true) {
+    return undefined;
+  }
+  const fields = lockFields(value);
+  return {
+    account: nonEmptyString(value.account) ?? id,
+    ...(fields.lockedAt !== undefined ? { lockedAt: fields.lockedAt } : {}),
+    ...(fields.lockedBy !== undefined ? { lockedBy: fields.lockedBy } : {}),
+  };
+}
+
+function collectLegacySubscriptionLocks(items: unknown): Map<string, LockAuditMetadata> {
+  const lockedByAccount = new Map<string, LockAuditMetadata>();
+  if (!Array.isArray(items)) {
+    return lockedByAccount;
+  }
+  for (const item of items) {
+    const lock = legacySubscriptionLockFields(item);
+    if (lock && !lockedByAccount.has(lock.account)) {
+      lockedByAccount.set(lock.account, {
+        ...(lock.lockedAt !== undefined ? { lockedAt: lock.lockedAt } : {}),
+        ...(lock.lockedBy !== undefined ? { lockedBy: lock.lockedBy } : {}),
+      });
+    }
+  }
+  return lockedByAccount;
+}
+
+function applyLockMetadataToSubscription(
+  subscription: SubscriptionEntry,
+  lock: LockAuditMetadata | undefined,
+): void {
+  if (!lock) {
+    return;
+  }
+  subscription.locked = true;
+  if (subscription.lockedAt === undefined && lock.lockedAt !== undefined) {
+    subscription.lockedAt = lock.lockedAt;
+  }
+  if (subscription.lockedBy === undefined && lock.lockedBy !== undefined) {
+    subscription.lockedBy = lock.lockedBy;
+  }
+}
+
+function applyLegacySubscriptionLocks(items: unknown, subscriptions: SubscriptionEntry[]): void {
+  const lockedByAccount = collectLegacySubscriptionLocks(items);
+  if (lockedByAccount.size === 0) {
+    return;
+  }
+  for (const subscription of subscriptions) {
+    applyLockMetadataToSubscription(
+      subscription,
+      lockedByAccount.get(subscription.account || subscription.id),
+    );
+  }
+}
+
 function isSubscriptionProfileRecord(value: unknown): value is Record<string, unknown> {
   if (!isRecord(value)) {
     return false;
@@ -268,12 +415,14 @@ function normalizeSubscriptionProfileEntry(
     path.join(subscriptionsDir(homeDir), id);
   const account = nonEmptyString(value.account) ?? id;
   const accountEmail = nonEmptyString(value.accountEmail);
+  const locked = lockFields(value);
   return {
     id,
     label,
     configDir,
     account,
     ...(accountEmail !== undefined ? { accountEmail } : {}),
+    ...locked,
   };
 }
 
@@ -298,11 +447,167 @@ function normalizeRegistry(value: unknown, homeDir: string): SubscriptionRegistr
     seen,
   );
   collectSubscriptions(value.subscriptions, homeDir, normalizeEntry, subscriptions, seen);
+  applyLegacySubscriptionLocks(value.subscriptions, subscriptions);
 
   const defaultId = nonEmptyString(value.default);
   return {
     subscriptions,
     ...(defaultId !== undefined ? { default: defaultId } : {}),
+  };
+}
+
+export type SubscriptionLockMutationResult = {
+  action: "subscription_lock_set";
+  subscription: string;
+  locked: boolean;
+  affected: string[];
+  lockedAt?: string;
+};
+
+function registryPathForOptions(options?: SubscriptionLookupOptions): string {
+  const homeDir = options?.homeDir ?? (process.env.ACPX_STATE_HOME || os.homedir());
+  return options?.registryPath ?? subscriptionRegistryPath(homeDir);
+}
+
+function readRegistryDocument(registryPath: string): Record<string, unknown> | undefined {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(registryPath, "utf8"));
+    return isRecord(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function lockFields(
+  value: Record<string, unknown>,
+): Pick<SubscriptionEntry, "locked" | "lockedAt" | "lockedBy"> {
+  if (value.locked !== true) {
+    return {};
+  }
+  const lockedAt = nonEmptyString(value.lockedAt);
+  const lockedBy = nonEmptyString(value.lockedBy);
+  return {
+    locked: true,
+    ...(lockedAt !== undefined ? { lockedAt } : {}),
+    ...(lockedBy !== undefined ? { lockedBy } : {}),
+  };
+}
+
+function updateLockFields(
+  entry: Record<string, unknown>,
+  locked: boolean,
+  lockedAt: string | undefined,
+  lockedBy: string | undefined,
+): void {
+  if (locked) {
+    entry.locked = true;
+    entry.lockedAt = lockedAt;
+    if (lockedBy !== undefined) {
+      entry.lockedBy = lockedBy;
+    } else {
+      delete entry.lockedBy;
+    }
+    return;
+  }
+  delete entry.locked;
+  delete entry.lockedAt;
+  delete entry.lockedBy;
+}
+
+function mutateLockFieldsInArray(
+  items: unknown,
+  affectedIds: ReadonlySet<string>,
+  locked: boolean,
+  lockedAt: string | undefined,
+  lockedBy: string | undefined,
+): void {
+  if (!Array.isArray(items)) {
+    return;
+  }
+  for (const item of items) {
+    if (!isRecord(item)) {
+      continue;
+    }
+    const id = nonEmptyString(item.id);
+    if (id === undefined || !affectedIds.has(id)) {
+      continue;
+    }
+    if (item.authMode !== undefined && item.authMode !== "subscription") {
+      continue;
+    }
+    updateLockFields(item, locked, lockedAt, lockedBy);
+  }
+}
+
+function writeRegistryDocument(registryPath: string, document: Record<string, unknown>): void {
+  mkdirSync(dirname(registryPath), { recursive: true });
+  const tempPath = `${registryPath}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tempPath, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 });
+  chmodSync(tempPath, 0o600);
+  renameSync(tempPath, registryPath);
+  chmodSync(registryPath, 0o600);
+}
+
+type LockMutationContext = {
+  registryPath: string;
+  document: Record<string, unknown>;
+  registry: SubscriptionRegistry;
+  target: SubscriptionEntry;
+};
+
+function loadLockMutationContext(
+  id: string,
+  options?: SubscriptionLookupOptions,
+): LockMutationContext | undefined {
+  const registryPath = registryPathForOptions(options);
+  const document = readRegistryDocument(registryPath);
+  if (!document) {
+    return undefined;
+  }
+  const homeDir = options?.homeDir ?? (process.env.ACPX_STATE_HOME || os.homedir());
+  const registry = normalizeRegistry(document, homeDir);
+  const target = findSubscription(id, registry);
+  if (!target) {
+    return undefined;
+  }
+  return { registryPath, document, registry, target };
+}
+
+function affectedSubscriptionIds(
+  target: SubscriptionEntry,
+  registry: SubscriptionRegistry,
+): string[] {
+  const targetAccount = target.account || target.id;
+  return registry.subscriptions
+    .filter((entry) => (entry.account || entry.id) === targetAccount)
+    .map((entry) => entry.id);
+}
+
+export function setSubscriptionLockState(
+  id: string,
+  locked: boolean,
+  options?: SubscriptionLookupOptions & { lockedBy?: string },
+): SubscriptionLockMutationResult | undefined {
+  const context = loadLockMutationContext(id, options);
+  if (!context) {
+    return undefined;
+  }
+
+  const affected = affectedSubscriptionIds(context.target, context.registry);
+  const affectedIds = new Set(affected);
+  const lockedAt = locked ? new Date().toISOString() : undefined;
+  const lockedBy = locked ? (options?.lockedBy ?? process.env.ACPX_LOCKED_BY ?? "acpx") : undefined;
+
+  mutateLockFieldsInArray(context.document.profiles, affectedIds, locked, lockedAt, lockedBy);
+  mutateLockFieldsInArray(context.document.subscriptions, affectedIds, locked, lockedAt, lockedBy);
+  writeRegistryDocument(context.registryPath, context.document);
+
+  return {
+    action: "subscription_lock_set",
+    subscription: context.target.id,
+    locked,
+    affected,
+    ...(lockedAt !== undefined ? { lockedAt } : {}),
   };
 }
 

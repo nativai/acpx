@@ -4,11 +4,13 @@ import { ensureTranscriptAtConfigDir } from "../../config/subscription-transcrip
 import {
   chooseSubscriptionConfigDir,
   findSubscription,
+  isSubscriptionLocked,
   loadSubscriptionRegistry,
   subscriptionConfigDirExists,
   type SubscriptionLookupOptions,
   type SubscriptionRegistry,
 } from "../../config/subscriptions.js";
+import { SubscriptionLockedError } from "../../errors.js";
 import { isoNow } from "../../session/persistence/repository.js";
 import type { SessionRecord } from "../../types.js";
 import { sessionHasAgentMessages } from "./lifecycle.js";
@@ -64,6 +66,9 @@ function resolveTargetConfigDir(targetSubId: string, registry: SubscriptionRegis
   if (!target) {
     throw new SubscriptionSwitchError(`subscription "${targetSubId}" not found in registry`);
   }
+  if (isSubscriptionLocked(target, registry)) {
+    throw new SubscriptionLockedError(targetSubId);
+  }
   if (!subscriptionConfigDirExists(target.configDir)) {
     throw new SubscriptionSwitchError(
       `subscription "${targetSubId}" configDir not found at ${target.configDir}`,
@@ -81,7 +86,7 @@ function recordSwitch(
   record: SessionRecord,
   from: string | undefined,
   to: string,
-  reason: "manual" | "failover",
+  reason: "manual" | "failover" | "locked",
 ): void {
   const acpx = record.acpx ?? {};
   const sessionOptions = { ...acpx.session_options };
@@ -98,7 +103,7 @@ function recordSwitch(
 export async function switchSessionSubscription(args: {
   record: SessionRecord;
   targetSubId: string;
-  reason: "manual" | "failover";
+  reason: "manual" | "failover" | "locked";
   loadOpts?: SubscriptionLookupOptions;
 }): Promise<SwitchSessionSubscriptionResult> {
   const targetSubId = args.targetSubId.trim();

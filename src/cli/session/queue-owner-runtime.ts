@@ -838,7 +838,15 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
                 recycleOwnerAfterTask = true;
                 if (options.verbose) {
                   process.stderr.write(
-                    `[acpx] account failover applied (→ ${newProfileId}); recycling queue owner for session ${options.sessionId} after this turn\n`,
+                    `[acpx] account switch applied (→ ${newProfileId}); recycling queue owner for session ${options.sessionId} after this turn\n`,
+                  );
+                }
+              },
+              onLockBlocked: () => {
+                recycleOwnerAfterTask = true;
+                if (options.verbose) {
+                  process.stderr.write(
+                    `[acpx] subscription lock blocked session ${options.sessionId}; recycling queue owner after this task\n`,
                   );
                 }
               },

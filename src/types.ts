@@ -456,7 +456,7 @@ export type SessionAcpxState = {
     subscription_switch?: {
       from?: string;
       to: string;
-      reason: "manual" | "failover";
+      reason: "manual" | "failover" | "locked";
       at: string;
     };
     /**
@@ -476,7 +476,7 @@ export type SessionAcpxState = {
       effectiveAuthMode?: string;
       effectiveAnchor?: string;
       effectiveResolutionMethod?: "path" | "selection";
-      reason: "manual" | "failover";
+      reason: "manual" | "failover" | "locked";
       at: string;
     };
     /**

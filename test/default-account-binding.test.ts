@@ -160,6 +160,93 @@ test("explicit profile or subscription is never overwritten by default binding",
   );
 });
 
+test("locked default subscription profile is skipped for an unlocked compatible profile", async () => {
+  await withRegistry(
+    {
+      defaultId: "sub1",
+      existingDirs: ["sub1", "sub2"],
+      profiles: [],
+    },
+    async (ctx) => {
+      await fs.writeFile(
+        ctx.lookupOptions.registryPath,
+        JSON.stringify({
+          version: 3,
+          default: "sub1",
+          profiles: [
+            { ...subscriptionProfile("sub1", ctx.configDir("sub1")), locked: true },
+            subscriptionProfile("sub2", ctx.configDir("sub2")),
+          ],
+        }),
+      );
+      assert.deepEqual(defaultAccountBindingForAgent(CLAUDE_AGENT, ctx.lookupOptions), {
+        profile: "sub2",
+      });
+    },
+  );
+});
+
+test("legacy subscription lock metadata applies to duplicate v3 subscription profile", async () => {
+  await withRegistry(
+    {
+      defaultId: "sub1",
+      existingDirs: ["sub1", "sub2"],
+      profiles: [],
+    },
+    async (ctx) => {
+      await fs.writeFile(
+        ctx.lookupOptions.registryPath,
+        JSON.stringify({
+          version: 3,
+          default: "sub1",
+          profiles: [
+            subscriptionProfile("sub1", ctx.configDir("sub1")),
+            subscriptionProfile("sub2", ctx.configDir("sub2")),
+          ],
+          subscriptions: [
+            {
+              id: "legacy-sub1",
+              label: "Legacy Sub 1",
+              configDir: ctx.configDir("sub1"),
+              account: "sub1",
+              locked: true,
+              lockedAt: "2026-07-10T00:00:00.000Z",
+              lockedBy: "test",
+            },
+          ],
+        }),
+      );
+      assert.deepEqual(defaultAccountBindingForAgent(CLAUDE_AGENT, ctx.lookupOptions), {
+        profile: "sub2",
+      });
+    },
+  );
+});
+
+test("locked default subscription profile fails when no unlocked compatible profile exists", async () => {
+  await withRegistry(
+    {
+      defaultId: "sub1",
+      existingDirs: ["sub1"],
+      profiles: [],
+    },
+    async (ctx) => {
+      await fs.writeFile(
+        ctx.lookupOptions.registryPath,
+        JSON.stringify({
+          version: 3,
+          default: "sub1",
+          profiles: [{ ...subscriptionProfile("sub1", ctx.configDir("sub1")), locked: true }],
+        }),
+      );
+      assert.throws(
+        () => defaultAccountBindingForAgent(CLAUDE_AGENT, ctx.lookupOptions),
+        /All compatible subscriptions are locked/u,
+      );
+    },
+  );
+});
+
 test("incompatible default profile is skipped for claude-pty bridge", async () => {
   await withRegistry(
     {

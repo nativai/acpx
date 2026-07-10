@@ -3,15 +3,20 @@ import { splitCommandLine } from "../../acp/client-process.js";
 import { isCodexAcpCommand } from "../../acp/codex-compat.js";
 import {
   findProfile,
+  isSubscriptionProfileLocked,
   loadProfileRegistry,
   type AdapterId,
   type ProfileEntry,
+  type ProfileRegistry,
 } from "../../config/profiles.js";
 import {
   chooseSubscriptionConfigDir,
+  findSubscription,
   loadSubscriptionRegistry,
+  isSubscriptionLocked,
   type SubscriptionLookupOptions,
 } from "../../config/subscriptions.js";
+import { AllSubscriptionsLockedError } from "../../errors.js";
 import type { SessionRecord } from "../../types.js";
 import {
   persistSessionOptions,
@@ -50,14 +55,31 @@ function profileCompatibleWithAgent(profile: ProfileEntry, agentCommand: string)
 
 function profileUsableForBinding(
   profile: ProfileEntry,
+  profileRegistry?: ProfileRegistry,
   lookupOptions?: SubscriptionLookupOptions,
 ): boolean {
   if (profile.authMode !== "subscription") {
     return true;
   }
+  if (profileRegistry && isSubscriptionProfileLocked(profile, profileRegistry)) {
+    return false;
+  }
   const registry = loadSubscriptionRegistry(lookupOptions);
   const choice = chooseSubscriptionConfigDir(profile.id, registry);
   return choice.source === "explicit" && choice.configDir !== undefined;
+}
+
+function firstCompatibleUnlockedSubscriptionProfile(
+  registry: ProfileRegistry,
+  agentCommand: string,
+  lookupOptions?: SubscriptionLookupOptions,
+): ProfileEntry | undefined {
+  return registry.profiles.find(
+    (profile) =>
+      profile.authMode === "subscription" &&
+      profileCompatibleWithAgent(profile, agentCommand) &&
+      profileUsableForBinding(profile, registry, lookupOptions),
+  );
 }
 
 function defaultProfileBindingForAgent(
@@ -70,14 +92,39 @@ function defaultProfileBindingForAgent(
     return undefined;
   }
   const profile = findProfile(defaultProfileId, registry);
-  if (
-    !profile ||
-    !profileCompatibleWithAgent(profile, agentCommand) ||
-    !profileUsableForBinding(profile, lookupOptions)
-  ) {
+  if (!profile || !profileCompatibleWithAgent(profile, agentCommand)) {
+    return undefined;
+  }
+  if (!profileUsableForBinding(profile, registry, lookupOptions)) {
+    if (profile.authMode === "subscription" && isSubscriptionProfileLocked(profile, registry)) {
+      const fallback = firstCompatibleUnlockedSubscriptionProfile(
+        registry,
+        agentCommand,
+        lookupOptions,
+      );
+      if (fallback) {
+        return { profile: fallback.id };
+      }
+      throw new AllSubscriptionsLockedError(
+        `default subscription profile "${profile.id}" is locked; no unlocked compatible subscription is available`,
+      );
+    }
     return undefined;
   }
   return { profile: profile.id };
+}
+
+function throwIfLockedLegacyDefaultHasNoFallback(
+  defaultSubscriptionId: string,
+  registry: ReturnType<typeof loadSubscriptionRegistry>,
+): void {
+  const defaultSubscription = findSubscription(defaultSubscriptionId, registry);
+  if (!defaultSubscription || !isSubscriptionLocked(defaultSubscription, registry)) {
+    return;
+  }
+  throw new AllSubscriptionsLockedError(
+    `default subscription "${defaultSubscriptionId}" is locked; no unlocked compatible subscription is available`,
+  );
 }
 
 function legacySubscriptionDefaultBindingForAgent(
@@ -94,9 +141,12 @@ function legacySubscriptionDefaultBindingForAgent(
   }
   const choice = chooseSubscriptionConfigDir(undefined, registry);
   if (!choice.configDir) {
+    if (choice.defaultUnusable?.kind === "locked") {
+      throwIfLockedLegacyDefaultHasNoFallback(defaultSubscriptionId, registry);
+    }
     return undefined;
   }
-  return { subscription: defaultSubscriptionId };
+  return { subscription: choice.resolvedId ?? defaultSubscriptionId };
 }
 
 export function defaultAccountBindingForAgent(

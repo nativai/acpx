@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import {
   maxedThreshold,
@@ -6,7 +9,13 @@ import {
   pickFailoverTarget,
   type SubscriptionUsage,
 } from "../src/config/subscription-usage.js";
-import { classifyFailover, FAILOVER_ERROR_KINDS } from "../src/runtime/engine/failover.js";
+import { AllSubscriptionsLockedError, SubscriptionLockedError } from "../src/errors.js";
+import {
+  classifyFailover,
+  enforceSubscriptionLockBeforeTurn,
+  FAILOVER_ERROR_KINDS,
+} from "../src/runtime/engine/failover.js";
+import { makeSessionRecord } from "./runtime-test-helpers.js";
 
 // Risk 4: pin the failover error-kind contract so any change is a deliberate,
 // reviewed edit (acpx cannot import the SDK union directly — see failover.ts).
@@ -174,6 +183,13 @@ test("pickFailoverTarget skips probe-error (401/probe-fail) subs", () => {
   assert.equal(target?.id, "ok");
 });
 
+test("pickFailoverTarget skips user-locked subs", () => {
+  const target = pickFailoverTarget([{ ...usage("locked", 0.1), locked: true }, usage("ok", 0.5)], {
+    exclude: new Set(),
+  });
+  assert.equal(target?.id, "ok");
+});
+
 test("pickFailoverTarget skips subs at/above the maxed threshold", () => {
   const target = pickFailoverTarget([usage("maxed", 0.99), usage("ok", 0.5)], {
     exclude: new Set(),
@@ -213,4 +229,72 @@ test("maxedThreshold defaults to 0.98 and honors the env override", () => {
       process.env.ACPX_SUBSCRIPTION_MAXED_THRESHOLD = prev;
     }
   }
+});
+
+async function withLockedProfileRegistry(
+  profiles: Array<Record<string, unknown>>,
+  run: (lookupOptions: { homeDir: string; registryPath: string }) => Promise<void>,
+): Promise<void> {
+  const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-lock-failover-"));
+  try {
+    const registryPath = path.join(homeDir, ".acpx", "subscriptions", "registry.json");
+    await fs.mkdir(path.dirname(registryPath), { recursive: true });
+    await fs.writeFile(
+      registryPath,
+      JSON.stringify({ version: 3, default: "sub1", profiles }, null, 2),
+    );
+    await run({ homeDir, registryPath });
+  } finally {
+    await fs.rm(homeDir, { recursive: true, force: true });
+  }
+}
+
+function lockTestProfile(id: string, locked = false): Record<string, unknown> {
+  return {
+    id,
+    label: id,
+    authMode: "subscription",
+    adapter: "claude",
+    account: id,
+    credentialSource: `/tmp/${id}`,
+    ...(locked ? { locked: true } : {}),
+  };
+}
+
+test("enforceSubscriptionLockBeforeTurn blocks locked current subscription when auto-failover is off", async () => {
+  await withLockedProfileRegistry(
+    [lockTestProfile("sub1", true), lockTestProfile("sub2")],
+    async (lookupOptions) => {
+      const record = makeSessionRecord({
+        acpxRecordId: "rec",
+        acpSessionId: "acp",
+        agentCommand: "node claude-agent.js",
+        cwd: "/tmp/project",
+        acpx: { session_options: { profile: "sub1", auto_failover: false } },
+      });
+      await assert.rejects(
+        enforceSubscriptionLockBeforeTurn(record, lookupOptions),
+        (error) =>
+          error instanceof SubscriptionLockedError && error.detailCode === "subscription-locked",
+      );
+    },
+  );
+});
+
+test("enforceSubscriptionLockBeforeTurn uses lock-specific all-locked error when no unlocked sibling exists", async () => {
+  await withLockedProfileRegistry([lockTestProfile("sub1", true)], async (lookupOptions) => {
+    const record = makeSessionRecord({
+      acpxRecordId: "rec",
+      acpSessionId: "acp",
+      agentCommand: "node claude-agent.js",
+      cwd: "/tmp/project",
+      acpx: { session_options: { profile: "sub1" } },
+    });
+    await assert.rejects(
+      enforceSubscriptionLockBeforeTurn(record, lookupOptions),
+      (error) =>
+        error instanceof AllSubscriptionsLockedError &&
+        error.detailCode === "all-subscriptions-locked",
+    );
+  });
 });

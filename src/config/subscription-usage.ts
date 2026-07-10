@@ -27,6 +27,9 @@ export type SubscriptionUsageWindow = {
 export type SubscriptionUsage = {
   id: string;
   label: string;
+  locked?: true;
+  lockedAt?: string;
+  lockedBy?: string;
   fiveHour: SubscriptionUsageWindow | null;
   sevenDay: SubscriptionUsageWindow | null;
   /** Present only when this subscription's probe failed; windows are null then. */
@@ -92,6 +95,9 @@ async function probeSubscriptionUsage(entry: SubscriptionEntry): Promise<Subscri
   const base: SubscriptionUsage = {
     id: entry.id,
     label: entry.label,
+    ...(entry.locked === true ? { locked: true } : {}),
+    ...(entry.lockedAt !== undefined ? { lockedAt: entry.lockedAt } : {}),
+    ...(entry.lockedBy !== undefined ? { lockedBy: entry.lockedBy } : {}),
     fiveHour: null,
     sevenDay: null,
   };
@@ -207,6 +213,9 @@ export function pickFailoverTarget(
   let bestUtil = Number.POSITIVE_INFINITY;
   for (const usage of usages) {
     if (options.exclude.has(usage.id)) {
+      continue;
+    }
+    if (usage.locked === true) {
       continue;
     }
     if (usage.error !== undefined) {

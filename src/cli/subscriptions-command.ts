@@ -1,6 +1,14 @@
 import { Command } from "commander";
 import { getSubscriptionsUsage, type SubscriptionUsage } from "../config/subscription-usage.js";
-import type { SubscriptionRegistry } from "../config/subscriptions.js";
+import {
+  findSubscription,
+  isSubscriptionLocked,
+  loadSubscriptionRegistry,
+  setSubscriptionLockState,
+  type SubscriptionLockMutationResult,
+  type SubscriptionRegistry,
+} from "../config/subscriptions.js";
+import { SubscriptionUnknownError } from "../errors.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import { parseOutputFormat, resolveGlobalFlags } from "./flags.js";
 
@@ -14,14 +22,15 @@ function renderSubscriptionsListText(registry: SubscriptionRegistry): string {
   let out = `Subscriptions (default: ${registry.default ?? "-"}):\n`;
   for (const entry of registry.subscriptions) {
     const marker = entry.id === registry.default ? "*" : " ";
-    out += `  ${marker} ${entry.id}\t${entry.label}\t${entry.configDir}\n`;
+    const locked = isSubscriptionLocked(entry, registry) ? "\tlocked" : "";
+    out += `  ${marker} ${entry.id}\t${entry.label}\t${entry.configDir}${locked}\n`;
   }
   return out;
 }
 
 function handleSubscriptionsList(command: Command, config: ResolvedAcpxConfig): void {
   const { format } = resolveGlobalFlags(command, config);
-  const registry = config.subscriptions;
+  const registry = loadSubscriptionRegistry();
 
   if (format === "json") {
     process.stdout.write(
@@ -87,7 +96,7 @@ async function handleSubscriptionsUsage(
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const { format } = resolveGlobalFlags(command, config);
-  const usage = await getSubscriptionsUsage(config.subscriptions.subscriptions);
+  const usage = await getSubscriptionsUsage(loadSubscriptionRegistry().subscriptions);
 
   if (format === "json") {
     process.stdout.write(`${JSON.stringify(usage)}\n`);
@@ -100,6 +109,49 @@ async function handleSubscriptionsUsage(
   }
 
   process.stdout.write(renderUsageText(usage));
+}
+
+function printSubscriptionLockResult(
+  result: SubscriptionLockMutationResult,
+  format: ReturnType<typeof resolveGlobalFlags>["format"],
+): void {
+  if (format === "json") {
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    return;
+  }
+  if (format === "quiet") {
+    process.stdout.write(`${result.subscription}\n`);
+    return;
+  }
+  const state = result.locked ? "locked" : "unlocked";
+  const affected = result.affected.length > 1 ? ` (${result.affected.length} linked entries)` : "";
+  process.stdout.write(`subscription ${state}: ${result.subscription}${affected}\n`);
+}
+
+function handleSubscriptionLockSet(
+  subscriptionId: string,
+  locked: boolean,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): void {
+  const { format } = resolveGlobalFlags(command, config);
+  const id = subscriptionId.trim();
+  const registry = loadSubscriptionRegistry();
+  if (!findSubscription(id, registry)) {
+    throw new SubscriptionUnknownError(
+      id,
+      registry.subscriptions.map((entry) => entry.id),
+    );
+  }
+  const lockedBy = process.env.ACPX_LOCKED_BY?.trim();
+  const result = setSubscriptionLockState(id, locked, (lockedBy ? { lockedBy } : {}));
+  if (!result) {
+    throw new SubscriptionUnknownError(
+      id,
+      registry.subscriptions.map((entry) => entry.id),
+    );
+  }
+  printSubscriptionLockResult(result, format);
 }
 
 export function registerSubscriptionsCommand(parent: Command, config: ResolvedAcpxConfig): void {
@@ -121,6 +173,24 @@ export function registerSubscriptionsCommand(parent: Command, config: ResolvedAc
     .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
     .action(async function (this: Command) {
       await handleSubscriptionsUsage(this, config);
+    });
+
+  subscriptionsCommand
+    .command("lock")
+    .description("Lock a Claude SDK subscription so new turns cannot use it")
+    .argument("<id>", "Subscription id")
+    .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
+    .action(function (this: Command, id: string) {
+      handleSubscriptionLockSet(id, true, this, config);
+    });
+
+  subscriptionsCommand
+    .command("unlock")
+    .description("Unlock a Claude SDK subscription")
+    .argument("<id>", "Subscription id")
+    .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
+    .action(function (this: Command, id: string) {
+      handleSubscriptionLockSet(id, false, this, config);
     });
 
   subscriptionsCommand.action(async function (this: Command) {

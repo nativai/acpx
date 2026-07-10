@@ -16,6 +16,7 @@ import {
   buildClaudeHomeMap,
   findProfile,
   getValidEffortsForProfile,
+  isSubscriptionProfileLocked,
   loadProfileRegistry,
   transcriptAnchorDir,
   type ChatGptProfileEntry,
@@ -29,6 +30,7 @@ import type { SubscriptionLookupOptions } from "../config/subscriptions.js";
 import {
   chooseSubscriptionConfigDir,
   findSubscription,
+  isSubscriptionLocked,
   loadSubscriptionRegistry,
   subscriptionConfigDirExists,
 } from "../config/subscriptions.js";
@@ -37,6 +39,7 @@ import type {
   SubscriptionEntry,
   SubscriptionRegistry,
 } from "../config/subscriptions.js";
+import { SubscriptionLockedError } from "../errors.js";
 import type { AcpClientOptions } from "../types.js";
 import { isClaudePtyAgentCommand } from "./agent-command.js";
 import { splitCommandLine } from "./client-process.js";
@@ -613,6 +616,9 @@ function resolveSubscriptionChoice(
     return undefined;
   }
   if (resolved.choice.explicitRejection) {
+    if (resolved.choice.explicitRejection.kind === "locked") {
+      throw new SubscriptionLockedError(resolved.choice.explicitRejection.id);
+    }
     throw new Error(formatExplicitRejection(resolved.choice.explicitRejection));
   }
   return resolved.choice.configDir === undefined ? undefined : resolved;
@@ -629,7 +635,8 @@ function applySubscriptionChoiceAvoidance(
   resolved: ResolvedSubscription,
 ): AppliedSubscriptionChoice {
   const baseResolvedId =
-    resolved.choice.source === "explicit" ? explicitId?.trim() : resolved.defaultId;
+    resolved.choice.resolvedId ??
+    (resolved.choice.source === "explicit" ? explicitId?.trim() : resolved.defaultId);
   return applyPreSpawnAvoidance(
     resolved.registry,
     baseResolvedId,
@@ -643,6 +650,12 @@ function maybeEmitDefaultApplied(
   applied: AppliedSubscriptionChoice,
 ): void {
   if (resolved.choice.source !== "default" || !resolved.defaultId || applied.substituted) {
+    return;
+  }
+  if (resolved.choice.resolvedId && resolved.choice.resolvedId !== resolved.defaultId) {
+    process.stderr.write(
+      `[acpx] registry default "${resolved.defaultId}" is locked; using unlocked subscription "${resolved.choice.resolvedId}" instead (CLAUDE_CONFIG_DIR=${resolved.choice.configDir})\n`,
+    );
     return;
   }
   emitDefaultApplied(
@@ -764,6 +777,7 @@ function firstHealthySubscription(
     if (
       entry.id === avoidId ||
       entry.account === avoidAccount ||
+      isSubscriptionLocked(entry, registry) ||
       isSubscriptionKnownDead(entry.id) ||
       isAccountKnownDead(entry.account)
     ) {
@@ -797,6 +811,9 @@ function formatExplicitRejection(
 ): string {
   if (rejection.kind === "unknown") {
     return `[acpx] subscription "${rejection.id}" not found in registry; refusing to spawn on a different account`;
+  }
+  if (rejection.kind === "locked") {
+    return `[acpx] subscription "${rejection.id}" is locked; refusing to spawn on a locked account`;
   }
   return `[acpx] subscription "${rejection.id}" configDir not found at ${rejection.configDir}; refusing to spawn on a different account`;
 }
@@ -1130,6 +1147,9 @@ export async function applyProfileAuth(
 
   validateProfileAgentCompatibility(trimmedId, profile, agentCommand);
   validateProfileReasoningEffort(trimmedId, profile, reasoningEffortOverride);
+  if (isSubscriptionProfileLocked(profile, registry)) {
+    throw new SubscriptionLockedError(trimmedId);
+  }
 
   if (profile.authMode === "claude-home") {
     applyClaudeHomeProfileAuth(env, registry);
