@@ -4651,6 +4651,61 @@ test("set returns an error when agent rejects unsupported session config params"
   });
 });
 
+test("set auto-failover updates durable policy and status json reports it", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const sessionId = "set-auto-failover-cli";
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: sessionId,
+      acpSessionId: `${sessionId}-acp`,
+      agentSessionId: `${sessionId}-agent`,
+      agentCommand: MOCK_AGENT_COMMAND,
+      cwd,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:00:00.000Z",
+      closed: false,
+    });
+
+    const setOff = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--format",
+        "json",
+        "codex",
+        "set",
+        "auto-failover",
+        "off",
+        "--session-id",
+        sessionId,
+      ],
+      homeDir,
+    );
+    assert.equal(setOff.code, 0, setOff.stderr);
+    const setPayload = JSON.parse(setOff.stdout.trim()) as Record<string, unknown>;
+    assert.equal(setPayload.action, "auto_failover_set");
+    assert.equal(setPayload.autoFailover, false);
+    assert.equal(setPayload.acpxRecordId, sessionId);
+    assert.equal(setPayload.acpxSessionId, `${sessionId}-acp`);
+    assert.equal(setPayload.agentSessionId, `${sessionId}-agent`);
+
+    const stored = JSON.parse(await fs.readFile(sessionFilePath(homeDir, sessionId), "utf8")) as {
+      acpx?: { session_options?: { auto_failover?: unknown } };
+    };
+    assert.equal(stored.acpx?.session_options?.auto_failover, false);
+
+    const status = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "status", "--session-id", sessionId],
+      homeDir,
+    );
+    assert.equal(status.code, 0, status.stderr);
+    const statusPayload = JSON.parse(status.stdout.trim()) as Record<string, unknown>;
+    assert.equal(statusPayload.action, "status_snapshot");
+    assert.equal(statusPayload.autoFailover, false);
+  });
+});
+
 test("--ttl flag is parsed for sessions commands", async () => {
   await withTempHome(async (homeDir) => {
     const ok = await runCli(["--ttl", "30", "--format", "json", "sessions", "--local"], homeDir);

@@ -161,6 +161,7 @@ function createStatusPayload(
     availableModels: acpx.availableModels,
     reasoningEffort: acpx.reasoningEffort,
     reasoningEffortLive: acpx.reasoningEffortLive,
+    autoFailover: acpx.autoFailover,
     uptime: running ? optionalStatusString(formatUptime(record.agentStartedAt)) : null,
     lastPromptTime: optionalStatusString(record.lastPromptAt),
     exitCode: running ? null : optionalStatusNumber(record.lastAgentExitCode),
@@ -175,26 +176,43 @@ function statusAcpxFields(record: SessionRecord): {
   availableModels: string[] | null;
   reasoningEffort: string | null;
   reasoningEffortLive: string | null;
+  autoFailover: boolean;
 } {
+  const acpx = record.acpx;
+  if (!acpx) {
+    return {
+      model: null,
+      mode: null,
+      availableModels: null,
+      reasoningEffort: null,
+      reasoningEffortLive: null,
+      autoFailover: true,
+    };
+  }
   return {
-    model: record.acpx?.current_model_id ?? null,
-    mode: record.acpx?.current_mode_id ?? null,
-    availableModels: record.acpx?.available_models ?? null,
+    model: optionalStatusString(acpx.current_model_id),
+    mode: optionalStatusString(acpx.current_mode_id),
+    availableModels: optionalStatusStringList(acpx.available_models),
     // Intent (the authoritative per-session signal) + the adapter's advertised
     // live value. NOTE: on the deployed claude adapter the live snapshot is the
     // model default and may not track a per-session set — prefer the intent.
-    reasoningEffort: desiredEffort(record),
-    reasoningEffortLive: liveEffortCurrentValue(record),
+    reasoningEffort: desiredEffort(acpx),
+    reasoningEffortLive: liveEffortCurrentValue(acpx),
+    autoFailover: autoFailoverStatus(acpx),
   };
 }
 
-function desiredEffort(record: SessionRecord): string | null {
-  return record.acpx?.desired_config_options?.effort ?? null;
+function desiredEffort(acpx: NonNullable<SessionRecord["acpx"]>): string | null {
+  return acpx.desired_config_options?.effort ?? null;
 }
 
-function liveEffortCurrentValue(record: SessionRecord): string | null {
-  const option = record.acpx?.config_options?.find((entry) => entry.id === "effort");
+function liveEffortCurrentValue(acpx: NonNullable<SessionRecord["acpx"]>): string | null {
+  const option = acpx.config_options?.find((entry) => entry.id === "effort");
   return option && option.type === "select" ? option.currentValue : null;
+}
+
+function autoFailoverStatus(acpx: NonNullable<SessionRecord["acpx"]>): boolean {
+  return acpx.session_options?.auto_failover !== false;
 }
 
 function statusPid(health: Awaited<ReturnType<typeof probeQueueOwnerHealth>>): number | null {
@@ -205,6 +223,10 @@ function statusPid(health: Awaited<ReturnType<typeof probeQueueOwnerHealth>>): n
 }
 
 function optionalStatusString(value: string | undefined | null): string | null {
+  return value ?? null;
+}
+
+function optionalStatusStringList(value: string[] | undefined | null): string[] | null {
   return value ?? null;
 }
 
@@ -234,6 +256,7 @@ type StatusPayload = {
   availableModels: string[] | null;
   reasoningEffort: string | null;
   reasoningEffortLive: string | null;
+  autoFailover: boolean;
   uptime: string | null;
   lastPromptTime: string | null;
   exitCode: number | null;
@@ -273,6 +296,7 @@ function statusJsonPayload(
   assignDefinedJsonField(result, "availableModels", payload.availableModels);
   assignDefinedJsonField(result, "reasoningEffort", payload.reasoningEffort);
   assignDefinedJsonField(result, "reasoningEffortLive", payload.reasoningEffortLive);
+  assignDefinedJsonField(result, "autoFailover", payload.autoFailover);
   assignDefinedJsonField(result, "uptime", payload.uptime);
   assignDefinedJsonField(result, "lastPromptTime", payload.lastPromptTime);
   if (dead) {
@@ -313,6 +337,7 @@ function printTextStatus(payload: StatusPayload, dead: boolean): void {
   process.stdout.write(`mode: ${orDash(payload.mode)}\n`);
   process.stdout.write(`reasoningEffort: ${orDash(payload.reasoningEffort)}\n`);
   process.stdout.write(`reasoningEffortLive: ${orDash(payload.reasoningEffortLive)}\n`);
+  process.stdout.write(`autoFailover: ${payload.autoFailover ? "on" : "off"}\n`);
   process.stdout.write(`uptime: ${orDash(payload.uptime)}\n`);
   process.stdout.write(`lastPromptTime: ${orDash(payload.lastPromptTime)}\n`);
   if (dead) {

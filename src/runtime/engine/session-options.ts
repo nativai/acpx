@@ -21,6 +21,9 @@ export type SessionAgentOptions = {
   // survives a same-session re-create. Opaque string (an advertised effort
   // level), validated at the flag boundary and again against the advertised set.
   reasoningEffort?: string;
+  // Per-session automatic same-family credential failover policy. undefined =
+  // enabled; explicit false is the only behavior-changing state.
+  autoFailover?: boolean;
 };
 
 export function mergeSessionOptions(
@@ -36,6 +39,7 @@ export function mergeSessionOptions(
     assignDefinedOption(merged, "subscription", preferred.subscription);
     assignDefinedOption(merged, "profile", preferred.profile);
     assignDefinedOption(merged, "reasoningEffort", preferred.reasoningEffort);
+    assignDefinedOption(merged, "autoFailover", preferred.autoFailover);
   }
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
@@ -144,6 +148,7 @@ export function sessionOptionsFromRecord(record: SessionRecord): SessionAgentOpt
   assignStoredOption(sessionOptions, "subscription", nonEmptyString(stored.subscription));
   assignStoredOption(sessionOptions, "profile", nonEmptyString(stored.profile));
   assignStoredOption(sessionOptions, "reasoningEffort", nonEmptyString(stored.effort));
+  assignStoredOption(sessionOptions, "autoFailover", storedBoolean(stored.auto_failover));
 
   return Object.keys(sessionOptions).length > 0 ? sessionOptions : undefined;
 }
@@ -161,6 +166,7 @@ function persistedSessionOptions(
     subscription: nonEmptyString(options.subscription),
     profile: nonEmptyString(options.profile),
     effort: nonEmptyString(options.reasoningEffort),
+    auto_failover: typeof options.autoFailover === "boolean" ? options.autoFailover : undefined,
   } satisfies PersistedSessionOptions;
   return hasPersistedSessionOptions(next) ? next : undefined;
 }
@@ -173,7 +179,8 @@ function hasPersistedSessionOptions(options: PersistedSessionOptions): boolean {
     options.system_prompt !== undefined ||
     options.subscription !== undefined ||
     options.profile !== undefined ||
-    options.effort !== undefined
+    options.effort !== undefined ||
+    options.auto_failover !== undefined
   );
 }
 
@@ -217,4 +224,8 @@ function storedSystemPromptOption(value: unknown): SystemPromptOption | undefine
 
 function nonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function storedBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
 }

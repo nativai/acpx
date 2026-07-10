@@ -72,6 +72,7 @@ export type SessionIndexEntry = {
   // (older record / capability not captured) → acpx-ui treats absent as off.
   promptImageSupported?: boolean;
   desiredEffort?: string;
+  autoFailover?: boolean;
   subscription?: string;
   profile?: string;
   subscriptionSwitch?: SessionIndexSubscriptionSwitch;
@@ -247,6 +248,7 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     sessionModel: optionalString(record.sessionModel),
     promptImageSupported: optionalBoolean(record.promptImageSupported),
     desiredEffort: optionalString(record.desiredEffort),
+    autoFailover: optionalBoolean(record.autoFailover),
     subscription: optionalString(record.subscription),
     profile: optionalString(record.profile),
     subscriptionSwitch: parseIndexSubscriptionSwitch(record.subscriptionSwitch),
@@ -331,6 +333,7 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     sessionModel: sessionOptions?.model,
     promptImageSupported: promptImageSupportedFromRecord(record),
     desiredEffort: acpx?.desired_config_options?.effort,
+    autoFailover: sessionOptions?.auto_failover,
     subscription: sessionOptions?.subscription,
     profile: sessionOptions?.profile,
     subscriptionSwitch: sessionOptions?.subscription_switch,

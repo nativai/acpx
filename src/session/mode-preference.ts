@@ -149,7 +149,10 @@ function mergeLatestDurableSessionOptions(
   pending: SessionAcpxState["session_options"],
   latest: SessionAcpxState["session_options"],
 ): SessionAcpxState["session_options"] {
-  if (!latest || (latest.model === undefined && latest.effort === undefined)) {
+  if (!latest) {
+    return pending;
+  }
+  if (!hasLatestDurableSessionOptions(latest)) {
     return pending;
   }
 
@@ -160,7 +163,18 @@ function mergeLatestDurableSessionOptions(
   if (latest.effort !== undefined) {
     merged.effort = latest.effort;
   }
+  if (latest.auto_failover !== undefined) {
+    merged.auto_failover = latest.auto_failover;
+  }
   return hasSessionOptions(merged) ? merged : undefined;
+}
+
+function hasLatestDurableSessionOptions(
+  latest: NonNullable<SessionAcpxState["session_options"]>,
+): boolean {
+  return (
+    latest.model !== undefined || latest.effort !== undefined || latest.auto_failover !== undefined
+  );
 }
 
 export function getDesiredModelId(state: SessionAcpxState | undefined): string | undefined {

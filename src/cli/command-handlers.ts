@@ -1366,6 +1366,10 @@ export async function handleSetConfigOption(
     await handleSetProfile(explicitAgentName, value, flags, command, config);
     return;
   }
+  if (isAutoFailoverConfigKey(configId)) {
+    await handleSetAutoFailover(explicitAgentName, value, flags, command, config);
+    return;
+  }
   const resolvedConfigId = resolveCompatibleConfigId(agent, configId);
   const { setSessionConfigOption } = await loadSessionModule();
   const selector = resolveSessionTargetSelector({ flags, command });
@@ -1396,6 +1400,68 @@ export async function handleSetConfigOption(
   }
 
   printSetConfigOptionResultByFormat(configId, value, result, globalFlags.format);
+}
+
+function isAutoFailoverConfigKey(configId: string): boolean {
+  const normalized = configId.trim();
+  return (
+    normalized === "auto-failover" ||
+    normalized === "auto_failover" ||
+    normalized === "autoFailover"
+  );
+}
+
+function parseAutoFailoverValue(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  if (["on", "true", "1", "enabled"].includes(normalized)) {
+    return true;
+  }
+  if (["off", "false", "0", "disabled"].includes(normalized)) {
+    return false;
+  }
+  throw new InvalidArgumentError(
+    "auto-failover value must be one of: on, off, true, false, 1, 0, enabled, disabled",
+  );
+}
+
+export async function handleSetAutoFailover(
+  explicitAgentName: string | undefined,
+  value: string,
+  flags: StatusFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const autoFailover = parseAutoFailoverValue(value);
+  const selector = resolveSessionTargetSelector({ flags, command });
+  const record = await findRoutedTargetSessionOrThrow(agent, selector);
+  const { setSessionAutoFailover } = await loadSessionModule();
+  const result = await setSessionAutoFailover({
+    sessionId: record.acpxRecordId,
+    autoFailover,
+    sessionName: selector.name ?? record.name,
+  });
+  printSetAutoFailoverResultByFormat(result, globalFlags.format);
+}
+
+function printSetAutoFailoverResultByFormat(
+  result: { record: SessionRecord; autoFailover: boolean },
+  format: OutputFormat,
+): void {
+  const label = result.autoFailover ? "on" : "off";
+  if (
+    emitJsonResult(format, {
+      action: "auto_failover_set",
+      autoFailover: result.autoFailover,
+      acpxRecordId: result.record.acpxRecordId,
+      acpxSessionId: result.record.acpSessionId,
+      agentSessionId: result.record.agentSessionId,
+    })
+  ) {
+    return;
+  }
+  process.stdout.write(format === "quiet" ? `${label}\n` : `auto-failover set: ${label}\n`);
 }
 
 // `acpx <agent> set subscription <id>` — change the session's Claude

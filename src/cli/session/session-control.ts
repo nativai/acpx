@@ -47,6 +47,8 @@ import {
 import type {
   SessionCancelOptions,
   SessionCancelResult,
+  SessionSetAutoFailoverOptions,
+  SessionSetAutoFailoverResult,
   SessionSetConfigOptionOptions,
   SessionSetModelOptions,
   SessionSetModeOptions,
@@ -116,6 +118,13 @@ export async function setSessionMode(
 // owner is simply mooted by the terminate that follows. Returns whether a live
 // owner exists, so the caller terminates it after the apply. A no-op when cold.
 async function refuseTurnInFlightForRecycle(
+  sessionId: string,
+  makeTurnInFlightError: () => Error,
+): Promise<boolean> {
+  return await refuseTurnInFlightForLiveOwner(sessionId, makeTurnInFlightError);
+}
+
+async function refuseTurnInFlightForLiveOwner(
   sessionId: string,
   makeTurnInFlightError: () => Error,
 ): Promise<boolean> {
@@ -340,6 +349,26 @@ export async function setSessionProfile(
   }
 
   return { record, from: fromProfile, to: toProfile, transcriptCopied, ownerRestarted };
+}
+
+export async function setSessionAutoFailover(
+  options: SessionSetAutoFailoverOptions,
+): Promise<SessionSetAutoFailoverResult> {
+  await refuseTurnInFlightForLiveOwner(
+    options.sessionId,
+    () => new ConfigOptionTurnInFlightError("auto-failover", options.sessionName),
+  );
+
+  const record = await resolveSessionRecord(options.sessionId);
+  const acpx: NonNullable<SessionRecord["acpx"]> = { ...record.acpx };
+  acpx.session_options = {
+    ...acpx.session_options,
+    auto_failover: options.autoFailover,
+  };
+  record.acpx = acpx;
+  await writeSessionRecord(record);
+
+  return { record, autoFailover: options.autoFailover };
 }
 
 function firstAgentCommandToken(command: string): string | undefined {
