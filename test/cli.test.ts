@@ -33,7 +33,6 @@ import {
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 const BRICK_SHIM_DIR = path.join(process.cwd(), "test", "fixtures", "brick-shim");
-const NODE_DIR = path.dirname(process.execPath);
 const BRICK_X = "11111111-2222-3333-4444-555555555555";
 const BRICK_Z = "99999999-8888-7777-6666-555555555555";
 function readPackageVersionForTest(): string {
@@ -1779,6 +1778,7 @@ test("sessions --brick degrades without brick CLI and survives context failure",
     const cwd = path.join(homeDir, "workspace");
     const envDumpFile = path.join(homeDir, "adapter-env.json");
     const emptyBin = path.join(homeDir, "empty-bin");
+    const nodeOnlyBin = await writeNodeOnlyPathBin(homeDir);
     const brickPool = path.join(homeDir, "pool");
     const agentCommand =
       `${MOCK_AGENT_COMMAND} --operation-log ${JSON.stringify(path.join(homeDir, "codex-acp-ops.jsonl"))} ` +
@@ -1789,7 +1789,7 @@ test("sessions --brick degrades without brick CLI and survives context failure",
     await writeCodexAgentConfig(homeDir, agentCommand);
 
     const baseEnv = {
-      PATH: `${emptyBin}:${NODE_DIR}`,
+      PATH: `${emptyBin}:${nodeOnlyBin}`,
       ACPX_BRICK_POOL_DIR: brickPool,
       ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh",
     };
@@ -1907,6 +1907,7 @@ test("sessions new --brick rejects unresolved refs before persistence", async ()
     const cwd = path.join(homeDir, "workspace");
     const brickLog = path.join(homeDir, "brick.log");
     const emptyBin = path.join(homeDir, "empty-bin");
+    const nodeOnlyBin = await writeNodeOnlyPathBin(homeDir);
     await fs.mkdir(cwd, { recursive: true });
     await fs.mkdir(emptyBin, { recursive: true });
     await writeCodexAgentConfig(
@@ -1949,7 +1950,7 @@ test("sessions new --brick rejects unresolved refs before persistence", async ()
       homeDir,
       {
         env: {
-          PATH: `${emptyBin}:${NODE_DIR}`,
+          PATH: `${emptyBin}:${nodeOnlyBin}`,
         },
       },
     );
@@ -6097,6 +6098,13 @@ async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<vo
   } finally {
     await fs.rm(tempHome, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
   }
+}
+
+async function writeNodeOnlyPathBin(homeDir: string): Promise<string> {
+  const binDir = path.join(homeDir, "node-only-bin");
+  await fs.mkdir(binDir, { recursive: true });
+  await fs.symlink(process.execPath, path.join(binDir, "node"));
+  return binDir;
 }
 
 type CliRunOptions = {

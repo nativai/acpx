@@ -16,7 +16,6 @@ import {
 import type { SessionRecord } from "../src/types.js";
 
 const SHIM_DIR = path.join(process.cwd(), "test", "fixtures", "brick-shim");
-const NODE_DIR = path.dirname(process.execPath);
 const X = "11111111-2222-3333-4444-555555555555";
 const Y = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
@@ -52,6 +51,10 @@ async function withTempDir(prefix: string, run: (dir: string) => Promise<void> |
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }
+}
+
+async function withNoBrickOnPath(run: (dir: string) => Promise<void> | void): Promise<void> {
+  await withTempDir("acpx-no-brick-path-", run);
 }
 
 async function readLog(logPath: string): Promise<string[][]> {
@@ -105,8 +108,8 @@ test("resolveBrickFlagRef refuses definitive not-found and ambiguous responses",
 });
 
 test("resolveBrickFlagRef degrades to full-uuid only when the CLI is unavailable", async () => {
-  await withTempDir("acpx-empty-path-", async (dir) => {
-    await withEnv({ PATH: `${dir}:${NODE_DIR}`, BRICK_SHIM_MODE: undefined }, async () => {
+  await withNoBrickOnPath(async (dir) => {
+    await withEnv({ PATH: dir, BRICK_SHIM_MODE: undefined }, async () => {
       assert.equal(await resolveBrickFlagRef(Y.toUpperCase()), Y);
       await assert.rejects(() => resolveBrickFlagRef("slug"), /non-uuid refs need the brick CLI/);
     });
@@ -187,8 +190,8 @@ test("stamp helpers call brick stamp only for usable brick ids and never throw",
     );
   });
 
-  await withTempDir("acpx-empty-path-", async (dir) => {
-    await withEnv({ PATH: `${dir}:${NODE_DIR}` }, async () => {
+  await withNoBrickOnPath(async (dir) => {
+    await withEnv({ PATH: dir }, async () => {
       await stampBrickSessionStarted(X, "rec-1");
     });
   });
