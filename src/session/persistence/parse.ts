@@ -397,6 +397,7 @@ function assignParsedSessionOptions(state: SessionAcpxState, raw: unknown): void
   assignSessionOptionSubscription(parsedSessionOptions, sessionOptions.subscription);
   assignSessionOptionProfile(parsedSessionOptions, sessionOptions.profile);
   assignSessionOptionEffort(parsedSessionOptions, sessionOptions.effort);
+  assignSessionOptionAutoFailover(parsedSessionOptions, sessionOptions.auto_failover);
   assignSessionOptionSubscriptionSwitch(parsedSessionOptions, sessionOptions.subscription_switch);
   assignSessionOptionAccountSwitch(parsedSessionOptions, sessionOptions.account_switch);
   assignSessionOptionProvisioningWarning(parsedSessionOptions, sessionOptions.provisioning_warning);
@@ -578,6 +579,15 @@ function assignSessionOptionEffort(
 ): void {
   if (typeof value === "string" && value.length > 0) {
     options.effort = value;
+  }
+}
+
+function assignSessionOptionAutoFailover(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+  value: unknown,
+): void {
+  if (typeof value === "boolean") {
+    options.auto_failover = value;
   }
 }
 

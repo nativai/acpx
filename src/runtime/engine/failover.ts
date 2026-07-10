@@ -336,8 +336,15 @@ export function failoverEnabledForRecord(
   record: SessionRecord,
   loadOpts?: SubscriptionLookupOptions,
 ): boolean {
+  if (!autoFailoverEnabledForRecord(record)) {
+    return false;
+  }
   const profile = currentProfile(record, loadOpts);
   return profile !== undefined && transcriptAnchorDir(profile) !== null;
+}
+
+export function autoFailoverEnabledForRecord(record: SessionRecord): boolean {
+  return record.acpx?.session_options?.auto_failover !== false;
 }
 
 function cloneSessionOptions(
@@ -354,6 +361,7 @@ function cloneSessionOptions(
     ...(options.account_switch !== undefined
       ? { account_switch: { ...options.account_switch } }
       : {}),
+    auto_failover: options.auto_failover,
   };
 }
 

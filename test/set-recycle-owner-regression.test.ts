@@ -35,7 +35,11 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { isProcessAlive, readQueueOwnerProcessIdentity } from "../src/cli/queue/lease-store.js";
-import { setSessionConfigOption, setSessionModel } from "../src/cli/session/session-control.js";
+import {
+  setSessionAutoFailover,
+  setSessionConfigOption,
+  setSessionModel,
+} from "../src/cli/session/session-control.js";
 import { resolveSessionRecord } from "../src/session/persistence/repository.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence/serialize.js";
 import type { SessionRecord } from "../src/types.js";
@@ -274,6 +278,38 @@ test("T5.4 TURN-IN-FLIGHT: set model with an active turn is refused; owner survi
       assert.equal(isProcessAlive(keeper.pid), true);
       const onDisk = await resolveSessionRecord(sessionId);
       assert.equal(onDisk.acpx?.session_options?.model, undefined);
+    } finally {
+      await closeServer(server);
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("T5.4b TURN-IN-FLIGHT: set auto-failover with an active turn is refused; owner survives", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "auto-failover-inflight";
+    const server = createMockOwnerServer(true);
+    const { keeper } = await plantLiveOwner(homeDir, sessionId, server);
+    await seedSessionJson(homeDir, seedRecord(homeDir, sessionId, {}));
+
+    try {
+      await assert.rejects(
+        async () =>
+          await setSessionAutoFailover({
+            sessionId,
+            autoFailover: false,
+            sessionName: "my-session",
+          }),
+        (error: unknown) => {
+          assert(error instanceof Error);
+          assert.equal(error.name, "ConfigOptionTurnInFlightError");
+          assert.equal((error as Error & { detailCode?: string }).detailCode, "TURN_IN_FLIGHT");
+          return true;
+        },
+      );
+      assert.equal(isProcessAlive(keeper.pid), true);
+      const onDisk = await resolveSessionRecord(sessionId);
+      assert.equal(onDisk.acpx?.session_options?.auto_failover, undefined);
     } finally {
       await closeServer(server);
       stopProcess(keeper);

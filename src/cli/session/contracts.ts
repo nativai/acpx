@@ -283,4 +283,16 @@ export type SessionSetProfileResult = {
   ownerRestarted: boolean;
 };
 
+export type SessionSetAutoFailoverOptions = {
+  sessionId: string;
+  autoFailover: boolean;
+  /** Used only for the turn-in-flight error message. */
+  sessionName?: string;
+};
+
+export type SessionSetAutoFailoverResult = {
+  record: SessionRecord;
+  autoFailover: boolean;
+};
+
 export type { SessionAgentOptions };

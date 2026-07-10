@@ -443,6 +443,11 @@ export type SessionAcpxState = {
      */
     effort?: string;
     /**
+     * Per-session automatic credential/subscription failover policy. Absent
+     * means enabled (the historical behavior); only explicit false opts out.
+     */
+    auto_failover?: boolean;
+    /**
      * Breadcrumb recorded when a session's subscription is changed in place
      * (manual switch or auto-failover). Drives the acpx-ui badge/notice and
      * survives restart. `from` is '' / undefined when the prior selection was
