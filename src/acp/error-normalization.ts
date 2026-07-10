@@ -321,7 +321,9 @@ export function isPostDeliveryAcpError(acp: OutputErrorAcpPayload): boolean {
   const lower = acp.message.toLowerCase();
   return (
     /\b429\b/u.test(acp.message) ||
-    ["rate limit", "quota exceeded", "usage limit", "weekly limit"].some((s) => lower.includes(s))
+    ["rate limit", "quota exceeded", "usage limit", "weekly limit", "session limit"].some((s) =>
+      lower.includes(s),
+    )
   );
 }
 

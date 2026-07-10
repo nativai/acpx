@@ -82,7 +82,9 @@ function matchesRateLimitText(message: string): boolean {
   const lower = message.toLowerCase();
   return (
     /\b429\b/u.test(message) ||
-    ["rate limit", "quota exceeded", "usage limit"].some((text) => lower.includes(text))
+    ["rate limit", "quota exceeded", "usage limit", "session limit"].some((text) =>
+      lower.includes(text),
+    )
   );
 }
 
@@ -194,7 +196,13 @@ const RESET_KEYS = new Set([
 ]);
 
 function resetIsoFromError(error: unknown): string | undefined {
-  return resetIsoFromValue(extractAcpError(error)?.data) ?? resetIsoFromValue(error);
+  const acp = extractAcpError(error);
+  return (
+    resetIsoFromValue(acp?.data) ??
+    parseResetTimestamp(acp?.message) ??
+    parseResetTimestamp(errorMessageText(error)) ??
+    resetIsoFromValue(error)
+  );
 }
 
 function resetIsoFromValue(value: unknown, depth = 0): string | undefined {
@@ -234,8 +242,33 @@ function parseResetTimestamp(value: unknown): string | undefined {
   if (/^\d+$/u.test(trimmed)) {
     return dateIsoFromEpoch(Number(trimmed));
   }
+  const textReset = parseTextualUtcReset(trimmed);
+  if (textReset !== undefined) {
+    return textReset;
+  }
   const time = Date.parse(trimmed);
   return Number.isNaN(time) ? undefined : new Date(time).toISOString();
+}
+
+function parseTextualUtcReset(message: string): string | undefined {
+  const match = /\bresets?\s+(\d{1,2}):(\d{2})\s*(am|pm)\s*\(UTC\)/iu.exec(message);
+  if (!match) {
+    return undefined;
+  }
+  const hour12 = Number(match[1]);
+  const minute = Number(match[2]);
+  if (hour12 < 1 || hour12 > 12 || minute < 0 || minute > 59) {
+    return undefined;
+  }
+  const hour = (hour12 % 12) + (match[3].toLowerCase() === "pm" ? 12 : 0);
+  const now = new Date(Date.now());
+  const next = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), hour, minute, 0, 0),
+  );
+  if (next.getTime() <= now.getTime()) {
+    next.setUTCDate(next.getUTCDate() + 1);
+  }
+  return next.toISOString();
 }
 
 function dateIsoFromEpoch(value: number): string | undefined {

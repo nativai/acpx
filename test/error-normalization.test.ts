@@ -236,6 +236,16 @@ test("isPostDeliveryAcpError detects 'usage limit' in message", () => {
   );
 });
 
+test("isPostDeliveryAcpError detects raw Claude session limit message text", () => {
+  assert.equal(
+    isPostDeliveryAcpError({
+      code: -32603,
+      message: "Internal error: You've hit your session limit · resets 11:20am (UTC)",
+    }),
+    true,
+  );
+});
+
 test("isPostDeliveryAcpError returns false for generic transient message", () => {
   assert.equal(
     isPostDeliveryAcpError({ code: -32603, message: "Internal adapter error — model API timeout" }),
@@ -273,6 +283,15 @@ test("isRetryablePromptError returns false for -32603 with weekly limit message 
   assert.equal(
     isRetryablePromptError(
       acpWrapped(-32603, "You've hit your weekly limit · resets Jun 8, 3am (UTC)"),
+    ),
+    false,
+  );
+});
+
+test("isRetryablePromptError returns false for -32603 with session limit message", () => {
+  assert.equal(
+    isRetryablePromptError(
+      acpWrapped(-32603, "Internal error: You've hit your session limit · resets 11:20am (UTC)"),
     ),
     false,
   );

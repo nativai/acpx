@@ -117,6 +117,12 @@ test("classifyFailover string-match fallback catches 429 / usage limit", () => {
   assert.equal(classifyFailover("quota exceeded for this account"), "rate_limit");
 });
 
+test("classifyFailover string-match fallback catches raw Claude session limit text", () => {
+  const message = "Internal error: You've hit your session limit · resets 11:20am (UTC)";
+  assert.equal(classifyFailover(new Error(message)), "rate_limit");
+  assert.equal(classifyFailover({ acp: { code: -32603, message, data: {} } }), "rate_limit");
+});
+
 test("classifyFailover returns null for non-sub errors", () => {
   assert.equal(classifyFailover(acpError({ errorKind: "invalid_request" })), null);
   assert.equal(classifyFailover(acpError({ errorKind: "max_output_tokens" })), null);

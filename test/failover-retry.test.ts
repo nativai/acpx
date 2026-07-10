@@ -172,6 +172,29 @@ function rateLimitError(
   return error;
 }
 
+function rawSessionLimitError(message: string): Error {
+  const error = new Error(message);
+  (error as { acp?: { code: number; message: string; data: Record<string, unknown> } }).acp = {
+    code: -32603,
+    message,
+    data: {},
+  };
+  return error;
+}
+
+function futureSessionLimitMessage(minutesFromNow: number): { message: string; resetIso: string } {
+  const reset = new Date(Date.now() + minutesFromNow * 60_000);
+  reset.setUTCSeconds(0, 0);
+  const hour24 = reset.getUTCHours();
+  const hour12 = hour24 % 12 || 12;
+  const minute = String(reset.getUTCMinutes()).padStart(2, "0");
+  const meridiem = hour24 < 12 ? "am" : "pm";
+  return {
+    message: `Internal error: You've hit your session limit · resets ${hour12}:${minute}${meridiem} (UTC)`,
+    resetIso: reset.toISOString(),
+  };
+}
+
 // The auth-gated bridge failure shape: a claude-pty AdapterHealthError carried to
 // acpx as a generic RequestError on the catch-all code -32000 with
 // data.reason/state === "auth-gated" (claude-pty-acp acp-server-transcript.mjs).
@@ -240,6 +263,52 @@ test("attemptFailoverAndRetry switches to a healthy sub and returns its result",
   );
 });
 
+test("attemptFailoverAndRetry switches on raw Claude session-limit text and uses textual reset time", async () => {
+  await withRig(
+    [
+      { id: "a", token: "tok-a" },
+      { id: "b", token: "tok-b" },
+    ],
+    "a",
+    async ({ homeDir, registryPath }) => {
+      const { server, url } = await startMockMessages(
+        new Map([
+          ["tok-a", { status: 401 }],
+          ["tok-b", { status: 200, util: 0.1 }],
+        ]),
+      );
+      const prevEndpoint = process.env.CLAUDE_MESSAGES_ENDPOINT;
+      const prevHome = process.env.HOME;
+      process.env.CLAUDE_MESSAGES_ENDPOINT = url;
+      process.env.HOME = homeDir;
+      try {
+        const record = makeRecord({ subscription: "a" });
+        const { message, resetIso } = futureSessionLimitMessage(90);
+        let turns = 0;
+        const out = await attemptFailoverAndRetry<string>({
+          record,
+          triggerError: rawSessionLimitError(message),
+          loadOpts: { homeDir, registryPath },
+          runTurn: async () => {
+            turns += 1;
+            return "SESSION-LIMIT-RECOVERED";
+          },
+        });
+
+        assert.equal(out.result, "SESSION-LIMIT-RECOVERED");
+        assert.equal(out.switchedTo, "b");
+        assert.equal(turns, 1);
+        assert.equal(record.acpx?.session_options?.profile, "b");
+        assert.equal((await getAccountHealth("a")).deadUntil, resetIso);
+      } finally {
+        server.close();
+        process.env.CLAUDE_MESSAGES_ENDPOINT = prevEndpoint;
+        process.env.HOME = prevHome;
+      }
+    },
+  );
+});
+
 test("attemptFailoverAndRetry throws AllSubscriptionsExhaustedError and restores selection when all dead", async () => {
   await withRig(
     [
@@ -275,6 +344,53 @@ test("attemptFailoverAndRetry throws AllSubscriptionsExhaustedError and restores
         );
         assert.equal(turns, 0, "no retry when nothing to fail over to");
         // Selection restored (unchanged) so a later turn re-probes.
+        assert.equal(record.acpx?.session_options?.subscription, "a");
+        assert.equal(record.acpx?.session_options?.account_switch, undefined);
+      } finally {
+        server.close();
+        process.env.CLAUDE_MESSAGES_ENDPOINT = prevEndpoint;
+        process.env.HOME = prevHome;
+      }
+    },
+  );
+});
+
+test("attemptFailoverAndRetry preserves exhausted contract for raw Claude session-limit text", async () => {
+  await withRig(
+    [
+      { id: "a", token: "tok-a" },
+      { id: "b", token: "tok-b" },
+    ],
+    "a",
+    async ({ homeDir, registryPath }) => {
+      const { server, url } = await startMockMessages(
+        new Map([
+          ["tok-a", { status: 401 }],
+          ["tok-b", { status: 401 }],
+        ]),
+      );
+      const prevEndpoint = process.env.CLAUDE_MESSAGES_ENDPOINT;
+      const prevHome = process.env.HOME;
+      process.env.CLAUDE_MESSAGES_ENDPOINT = url;
+      process.env.HOME = homeDir;
+      try {
+        const record = makeRecord({ subscription: "a" });
+        await assert.rejects(
+          () =>
+            attemptFailoverAndRetry<string>({
+              record,
+              triggerError: rawSessionLimitError(
+                "Internal error: You've hit your session limit · resets 11:20am (UTC)",
+              ),
+              loadOpts: { homeDir, registryPath },
+              runTurn: async () => "should-not-run",
+            }),
+          (err: unknown): boolean => {
+            assert.ok(err instanceof AllSubscriptionsExhaustedError);
+            assert.equal(err.detailCode, "all-subscriptions-exhausted");
+            return true;
+          },
+        );
         assert.equal(record.acpx?.session_options?.subscription, "a");
         assert.equal(record.acpx?.session_options?.account_switch, undefined);
       } finally {
