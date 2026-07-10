@@ -376,7 +376,6 @@ function cloneSessionOptions(
     ...(options.account_switch !== undefined
       ? { account_switch: { ...options.account_switch } }
       : {}),
-    auto_failover: options.auto_failover,
   };
 }
 

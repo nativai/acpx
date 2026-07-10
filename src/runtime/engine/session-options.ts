@@ -158,7 +158,7 @@ type PersistedSessionOptions = NonNullable<NonNullable<SessionRecord["acpx"]>["s
 function persistedSessionOptions(
   options: SessionAgentOptions,
 ): PersistedSessionOptions | undefined {
-  const next = {
+  const next: PersistedSessionOptions = {
     model: nonEmptyString(options.model),
     allowed_tools: Array.isArray(options.allowedTools) ? [...options.allowedTools] : undefined,
     max_turns: typeof options.maxTurns === "number" ? options.maxTurns : undefined,
@@ -166,8 +166,10 @@ function persistedSessionOptions(
     subscription: nonEmptyString(options.subscription),
     profile: nonEmptyString(options.profile),
     effort: nonEmptyString(options.reasoningEffort),
-    auto_failover: typeof options.autoFailover === "boolean" ? options.autoFailover : undefined,
-  } satisfies PersistedSessionOptions;
+  };
+  if (typeof options.autoFailover === "boolean") {
+    next.auto_failover = options.autoFailover;
+  }
   return hasPersistedSessionOptions(next) ? next : undefined;
 }
 

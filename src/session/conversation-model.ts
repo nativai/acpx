@@ -708,7 +708,7 @@ function cloneSessionOptions(
     subscription: options.subscription,
     profile: options.profile,
     effort: options.effort,
-    auto_failover: options.auto_failover,
+    ...(options.auto_failover !== undefined ? { auto_failover: options.auto_failover } : {}),
     ...(options.system_prompt !== undefined
       ? { system_prompt: cloneSystemPromptOption(options.system_prompt) }
       : {}),
