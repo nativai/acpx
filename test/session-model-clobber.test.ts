@@ -70,6 +70,20 @@ test("resolvePinnedModelForPersist lets a deliberate change win over the on-disk
   );
 });
 
+test("resolvePinnedModelForPersist self-heals when disk has already lost the pin", () => {
+  // A healthy writer still holds the pin (in-memory === baseline), but disk was
+  // clobbered to absent by a pre-fix write. The write must restore the pin, not
+  // propagate the loss.
+  assert.equal(
+    resolvePinnedModelForPersist({
+      inMemory: "claude-fable-5",
+      baseline: "claude-fable-5",
+      onDisk: undefined,
+    }),
+    "claude-fable-5",
+  );
+});
+
 test("resolvePinnedModelForPersist leaves an unpinned session unpinned", () => {
   assert.equal(
     resolvePinnedModelForPersist({ inMemory: undefined, baseline: undefined, onDisk: undefined }),
@@ -155,6 +169,36 @@ test("a deliberate model change still wins over the on-disk pin", async () => {
     const onDisk = await persistence.resolveSessionRecord("change-1");
     assert.equal(onDisk.acpx?.session_options?.model, "claude-opus-4-8");
     assert.equal(onDisk.acpx?.current_model_id, "claude-opus-4-8");
+  });
+});
+
+test("an unpinned session keeps its other session_options (effort) across writes", async () => {
+  // The merge must never call setDesiredModelId(undefined) on an unpinned write,
+  // which would drop the whole session_options block — including effort.
+  await withTempHome("acpx-model-effort-", async () => {
+    const persistence = await loadPersistence();
+
+    const unpinned = makeSessionRecord({
+      acpxRecordId: "effort-1",
+      acpSessionId: "acp-effort-1",
+      agentCommand: "agent",
+      cwd: "/tmp/model-clobber",
+      acpx: {
+        session_options: { effort: "max" },
+        desired_config_options: { effort: "max" },
+        current_model_id: "default",
+      },
+    });
+    await persistence.writeSessionRecord(unpinned);
+
+    // A subsequent no-op-ish checkpoint write of the resolved record must not
+    // drop effort while resolving the (absent) pinned model.
+    const writer = await persistence.resolveSessionRecord("effort-1");
+    await persistence.writeSessionRecord(writer);
+
+    const onDisk = await persistence.resolveSessionRecord("effort-1");
+    assert.equal(onDisk.acpx?.session_options?.effort, "max");
+    assert.equal(onDisk.acpx?.session_options?.model, undefined);
   });
 });
 

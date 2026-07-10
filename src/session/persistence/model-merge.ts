@@ -65,7 +65,11 @@ export function resolvePinnedModelForPersist(options: {
   if (inMemory !== undefined && inMemory !== baseline) {
     return inMemory; // deliberate change wins
   }
-  return onDisk; // unchanged or dropped → adopt the on-disk pin
+  // Unchanged from baseline, or dropped to absent by a transient reconnect state:
+  // adopt the on-disk pin. If disk itself has already lost the pin (e.g. a
+  // pre-fix clobber still on disk), self-heal from the baseline/in-memory pin
+  // rather than propagating the loss — a write must never regress a known pin.
+  return onDisk ?? baseline ?? inMemory;
 }
 
 /**
@@ -92,14 +96,25 @@ export function mergeRecordPinnedModelForPersist(
     return;
   }
 
+  const inMemory = pinnedModelOf(record.acpx);
   const resolved = resolvePinnedModelForPersist({
-    inMemory: pinnedModelOf(record.acpx),
+    inMemory,
     baseline: baseline.model,
     onDisk: pinnedModelOf(persistedAcpx),
   });
 
-  setDesiredModelId(record, resolved);
+  // Only rewrite session_options.model when the resolved pin actually differs
+  // from the in-memory value, and only ever to a concrete pin. This avoids
+  // calling setDesiredModelId with `undefined` (which would drop the whole
+  // session_options block — including effort/subscription) on an unpinned write.
+  // resolved can only differ from inMemory toward a defined value: when nothing
+  // is pinned anywhere, resolved === inMemory === undefined and this is skipped.
+  if (resolved !== inMemory && resolved !== undefined) {
+    setDesiredModelId(record, resolved);
+  }
   if (resolved !== undefined) {
+    // Realign current_model_id to the resolved pin so a transient advertised
+    // "default" (from syncAdvertisedModelState) can't be persisted over it.
     setCurrentModelId(record, resolved);
   }
 }
