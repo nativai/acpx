@@ -621,6 +621,7 @@ const AVAILABLE_MODELS = [
   "default-model",
   "fast-model",
   "smart-model",
+  "gpt-5.6-sol[medium]",
   "gpt-5.5[xhigh]",
   "gpt-5.3-codex-spark[medium]",
   "opus[1m]",

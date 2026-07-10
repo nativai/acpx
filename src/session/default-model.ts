@@ -1,7 +1,7 @@
 import { AGENT_REGISTRY } from "../agent-registry.js";
 import type { SessionAgentOptions } from "../runtime/engine/session-options.js";
 
-export const DEFAULT_CODEX_MODEL = "gpt-5.5[xhigh]";
+export const DEFAULT_CODEX_MODEL = "gpt-5.6-sol[medium]";
 
 function hasRequestedModel(sessionOptions: SessionAgentOptions | undefined): boolean {
   return typeof sessionOptions?.model === "string" && sessionOptions.model.trim().length > 0;
