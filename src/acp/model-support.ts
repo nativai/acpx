@@ -9,6 +9,18 @@ export class RequestedModelUnsupportedError extends Error {
   }
 }
 
+// A trailing `[Nm]` (e.g. `sonnet[1m]`, `opus[1m]`) is a context-window MODIFIER on a
+// base model, not a distinct model id. The adapter resolves it away before matching
+// (claude-agent-acp resolveModelPreference / MODEL_CONTEXT_HINT_PATTERN), so it advertises
+// only base names. Mirror that stripping here so the acpx gate is never stricter than the
+// agent it guards — otherwise a `[1m]`-pinned model throws on replay even though the
+// adapter would accept it.
+const MODEL_CONTEXT_HINT_PATTERN = /\[\d+m\]$/i;
+
+function stripModelContextHint(modelId: string): string {
+  return modelId.replace(MODEL_CONTEXT_HINT_PATTERN, "");
+}
+
 export function supportsLegacyClaudeCodeModelMetadata(agentCommand: string | undefined): boolean {
   if (!agentCommand) {
     return false;
@@ -42,7 +54,14 @@ export function assertRequestedModelSupported(params: {
   }
 
   const advertised = new Set(params.models.availableModels.map((model) => model.modelId));
-  if (!advertised.has(params.requestedModel)) {
+  // Accept the requested model if EITHER its exact id OR its context-hint-stripped base
+  // (`sonnet[1m]` -> `sonnet`) is advertised. The original alias is still what gets forwarded
+  // to setSessionModel by the callers; the adapter re-resolves the hint. A genuinely-unknown
+  // model (no advertised base, e.g. `gpt-9`) still throws.
+  if (
+    !advertised.has(params.requestedModel) &&
+    !advertised.has(stripModelContextHint(params.requestedModel))
+  ) {
     const action = params.context === "replay" ? "replay saved model" : "apply --model";
     throw new RequestedModelUnsupportedError(
       `Cannot ${action} "${params.requestedModel}": the ACP agent did not advertise that model. Available models: ${formatAvailableModelIds(params.models)}.`,

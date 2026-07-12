@@ -1416,6 +1416,83 @@ test("connectAndLoadSession replays desired model on a fresh session", async () 
   });
 });
 
+// Regression for brick bbdbd56d (live prod specimen b94c0828): a byway/fork session pinned
+// to a `[1m]` context alias (`sonnet[1m]`) reconnected and threw SESSION_MODEL_REPLAY_FAILED
+// because the adapter advertises only the base `sonnet`. The replay gate must now tolerate the
+// context hint AND forward the ORIGINAL alias unchanged (the adapter re-resolves it).
+test("connectAndLoadSession replays a [1m] context-alias model without throwing and forwards the original alias", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "context-alias-replay-record",
+      acpSessionId: "resume-session",
+      agentCommand: "agent",
+      cwd,
+      acpx: {
+        session_options: {
+          model: "sonnet[1m]",
+        },
+      },
+    });
+
+    // Adapter advertises BASE names only — never the `[1m]` variant.
+    const resumedModels: SessionModelState = {
+      currentModelId: "default",
+      availableModels: [
+        { modelId: "default", name: "default" },
+        { modelId: "sonnet", name: "sonnet" },
+        { modelId: "opus", name: "opus" },
+      ],
+    };
+    const modelCalls: Array<{ sessionId: string; modelId: string }> = [];
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({
+        running: true,
+      }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => true,
+      resumeSession: async (sessionId, resumeCwd) => {
+        assert.equal(sessionId, "resume-session");
+        assert.equal(resumeCwd, cwd);
+        return {
+          agentSessionId: "resumed-runtime-session",
+          models: resumedModels,
+        };
+      },
+      loadSessionWithOptions: async () => {
+        throw new Error("loadSessionWithOptions should not be called");
+      },
+      createSession: async () => {
+        throw new Error("createSession should not be called");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async (sessionId, modelId) => {
+        modelCalls.push({ sessionId, modelId });
+      },
+      setSessionConfigOption: async () => ({ configOptions: [] }),
+    };
+
+    const result = await connectAndLoadSession({
+      client: client as never,
+      record,
+      activeController: ACTIVE_CONTROLLER,
+    });
+
+    assert.equal(result.resumed, true);
+    // No SessionModelReplayError thrown, and the ORIGINAL alias is forwarded (not the base).
+    assert.deepEqual(modelCalls, [
+      {
+        sessionId: "resume-session",
+        modelId: "sonnet[1m]",
+      },
+    ]);
+  });
+});
+
 test("connectAndLoadSession replays desired model after cold session/resume and records it current", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
