@@ -59,12 +59,13 @@ import {
 import { withDefaultModelForNewSession } from "../../session/default-model.js";
 import {
   buildDeliveryEvent,
+  hasCompletedDeliveryFor,
   type DeliveryEventError,
   type DeliveryPhase,
   type DeliveryStopReason,
 } from "../../session/delivery-events.js";
 import { defaultSessionEventLog } from "../../session/event-log.js";
-import { SessionEventWriter } from "../../session/events.js";
+import { listSessionEvents, SessionEventWriter } from "../../session/events.js";
 import { LiveSessionCheckpoint } from "../../session/live-checkpoint.js";
 import { copyLoggedMessageCount } from "../../session/messages-log-bookkeeping.js";
 import {
@@ -325,9 +326,14 @@ async function resolveRecordIfPromptAlreadyPersisted(
   messageId: string,
 ): Promise<SessionRecord | undefined> {
   const latestRecord = await resolveSessionRecord(sessionRecordId);
-  return hasUserMessageId(cloneSessionConversation(latestRecord), messageId)
-    ? latestRecord
-    : undefined;
+  if (!hasUserMessageId(cloneSessionConversation(latestRecord), messageId)) {
+    return undefined;
+  }
+  // Persistence alone is not proof of delivery: recordPromptStart writes the User message
+  // BEFORE the turn runs, so a turn that failed/never-completed leaves an orphaned prompt.
+  // Only dedup when a real completion terminal exists for this messageId (Defect B, 182d241f).
+  const events = await listSessionEvents(latestRecord.acpxRecordId);
+  return hasCompletedDeliveryFor(events, messageId) ? latestRecord : undefined;
 }
 
 async function appendDeduplicatedDeliveryTerminal(

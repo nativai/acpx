@@ -25,6 +25,38 @@ export const EMPTY_DELIVERY_ERROR: DeliveryEventError = {
   detailCode: "",
 };
 
+/**
+ * True iff `events` contains a delivery terminal proving the prompt actually COMPLETED a
+ * turn: an `acpx/delivery` `phase:"done"` for `messageId` whose `stopReason` is a genuine
+ * completion (`end_turn`/`max_tokens`/`max_turns`) rather than a prior dedup echo
+ * (`stopReason:"deduplicated"`). A `failed`/`cancelled` terminal, or a persisted-but-never-run
+ * prompt, has no such `done` — so this returns false and dedup must not fire (Defect B).
+ */
+export function hasCompletedDeliveryFor(events: AcpJsonRpcMessage[], messageId: string): boolean {
+  for (const event of events) {
+    if ((event as { method?: unknown }).method !== DELIVERY_EVENT_METHOD) {
+      continue;
+    }
+    const params = (event as { params?: unknown }).params;
+    if (!params || typeof params !== "object") {
+      continue;
+    }
+    const {
+      messageId: eventMessageId,
+      phase,
+      stopReason,
+    } = params as {
+      messageId?: unknown;
+      phase?: unknown;
+      stopReason?: unknown;
+    };
+    if (eventMessageId === messageId && phase === "done" && stopReason !== "deduplicated") {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function buildDeliveryEvent(params: {
   messageId: string;
   requestId: string;

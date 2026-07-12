@@ -187,6 +187,8 @@ function makeMockClient(handlers: {
     setSessionConfigOption: async () => ({ configOptions: [] }),
     close: async () => {},
     waitForSessionUpdatesIdle: async () => {},
+    // Only touched on the terminal-failure path (failRuntimePrompt); undefined is fine.
+    getEffectiveAccountMetadata: () => undefined,
 
     prompt: (
       sessionId: string,
@@ -1499,6 +1501,91 @@ test("runQueuedTask deduplicates a repeated messageId before invoking the agent"
           stopReason: "deduplicated",
         },
       ]);
+    });
+  });
+});
+
+test("runQueuedTask does not deduplicate a messageId whose first turn failed before completing", async () => {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeSessionRecord(homeDir);
+      await writeSessionRecordFile(homeDir, record);
+
+      const messageId = "44444444-4444-4444-8444-444444444444";
+      const control = makeMockClient({
+        // First delivery (attempt 0) fails before producing output — the User
+        // message is persisted by recordPromptStart, but no real phase:"done" is
+        // written (the b94c0828 specimen). The resend (attempt 1) succeeds.
+        onMainPrompt: async (attempt) => {
+          if (attempt === 0) {
+            throw new Error("turn failed before output");
+          }
+          return { stopReason: "end_turn" };
+        },
+        onInjectedPrompt: async () => {
+          throw new Error("unexpected injected prompt");
+        },
+      });
+
+      const firstSends: QueueOwnerMessage[] = [];
+      const firstTask = makeQueueTask(
+        "req-first-delivery",
+        MAIN_PROMPT_TEXT,
+        (message) => firstSends.push(message),
+        () => {},
+        true,
+        messageId,
+      );
+      await runQueuedTask(record.acpxRecordId, firstTask, {
+        sharedClient: control.client,
+        suppressSdkConsoleErrors: true,
+      });
+
+      // The first turn failed: an error result was sent, not a success.
+      assert.ok(firstSends.find((message) => message.type === "error"));
+
+      const resendSends: QueueOwnerMessage[] = [];
+      const resendTask = makeQueueTask(
+        "req-resend-delivery",
+        MAIN_PROMPT_TEXT,
+        (message) => resendSends.push(message),
+        () => {},
+        true,
+        messageId,
+      );
+      await runQueuedTask(record.acpxRecordId, resendTask, {
+        sharedClient: control.client,
+        suppressSdkConsoleErrors: true,
+      });
+
+      // The resend actually re-ran the agent (2 main calls) — it was NOT deduped.
+      assert.equal(control.promptCalls.filter((call) => call.kind === "main").length, 2);
+      assert.ok(resendSends.find((message) => message.type === "result"));
+
+      const streamEvents = await listSessionEvents(record.acpxRecordId);
+      const deliveries = deliveryEventSummaries(streamEvents);
+      // The first delivery terminated failed; the resend terminated with a real
+      // completion — and NOTHING was reported as a dedup echo.
+      assert.ok(
+        deliveries.some(
+          (event) => event.requestId === "req-first-delivery" && event.phase === "failed",
+        ),
+        "first delivery must terminate failed",
+      );
+      assert.ok(
+        deliveries.some(
+          (event) =>
+            event.requestId === "req-resend-delivery" &&
+            event.phase === "done" &&
+            event.stopReason === "end_turn",
+        ),
+        "resend must run a real turn, not dedup to done",
+      );
+      assert.equal(
+        deliveries.some((event) => event.stopReason === "deduplicated"),
+        false,
+        "a failed-before-turn prompt must never be reported as deduplicated",
+      );
     });
   });
 });
