@@ -1,10 +1,22 @@
 import type { SessionModelState } from "@agentclientprotocol/sdk";
+import { AcpxOperationalError } from "../errors.js";
 import { isClaudeAcpCommand } from "./agent-command.js";
 import { splitCommandLine } from "./client-process.js";
 
-export class RequestedModelUnsupportedError extends Error {
+// A requested model/effort the ACP agent does not advertise (e.g. a codex
+// `gpt-5.6-luna[ultra]` when luna tops out at max, or a bare family). This is a
+// USER input error, not a runtime fault: classifying it USAGE (detailCode
+// MODEL_NOT_ADVERTISED) makes acpx emit -32602 with a friendly, actionable
+// message so acpx-ui renders a "model/effort not available — pick another"
+// notice instead of a scary -32603 RUNTIME internal-error card. Mirrors the
+// USAGE classification of SubscriptionUnknownError / ProfileUnknownError. (de290ae4)
+export class RequestedModelUnsupportedError extends AcpxOperationalError {
   constructor(message: string) {
-    super(message);
+    super(message, {
+      outputCode: "USAGE",
+      detailCode: "MODEL_NOT_ADVERTISED",
+      origin: "cli",
+    });
     this.name = "RequestedModelUnsupportedError";
   }
 }

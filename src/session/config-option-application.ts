@@ -284,11 +284,15 @@ function selectableValues(option: SessionConfigOption): Set<string> {
   if (option.type !== "select") {
     return values;
   }
-  for (const entry of option.options) {
+  // Defense-in-depth (de290ae4): a malformed/older adapter can advertise a
+  // `type:"select"` option with `options` absent — `for…of` over undefined would
+  // throw the raw "… is not iterable" TypeError (the exact symptom class from the
+  // codex version-skew crash). Treat a missing list as "no selectable values".
+  for (const entry of option.options ?? []) {
     if ("value" in entry) {
       values.add(entry.value);
     } else {
-      for (const grouped of entry.options) {
+      for (const grouped of entry.options ?? []) {
         values.add(grouped.value);
       }
     }

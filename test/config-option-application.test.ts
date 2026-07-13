@@ -367,3 +367,38 @@ test("applyExecReasoningEffort: no-op for codex (no effort advertised) and when 
   });
   assert.equal(unset.calls.length, 0);
 });
+
+// de290ae4 defense-in-depth: a malformed/older adapter can advertise a
+// `type:"select"` option with `options` absent. selectableValues() iterates that
+// list with `for…of`; over undefined it would throw the raw "… is not iterable"
+// TypeError (the exact symptom class from the codex version-skew crash). The
+// `?? []` guard turns that into "no selectable values", not a crash.
+test("selectableValues tolerates a select option with options undefined (no raw TypeError)", () => {
+  const malformed = {
+    id: "effort",
+    name: "Effort",
+    category: "thought_level",
+    type: "select",
+    currentValue: "high",
+    // options intentionally absent (malformed adapter shape)
+  } as unknown as SessionConfigOption;
+
+  assert.doesNotThrow(() => normalizeEffortLevelForAdvertisedOption("high", malformed));
+  // With no selectable values and no model context it resolves to "no mapping".
+  assert.equal(normalizeEffortLevelForAdvertisedOption("high", malformed), undefined);
+});
+
+// A select option whose GROUPED entries carry no nested `options` list must also
+// not raw-crash (the inner `for…of` is guarded the same way).
+test("selectableValues tolerates a grouped select entry with nested options undefined", () => {
+  const grouped = {
+    id: "effort",
+    name: "Effort",
+    category: "thought_level",
+    type: "select",
+    currentValue: "high",
+    options: [{ name: "group-with-no-options" }],
+  } as unknown as SessionConfigOption;
+
+  assert.doesNotThrow(() => normalizeEffortLevelForAdvertisedOption("high", grouped));
+});
