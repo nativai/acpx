@@ -105,6 +105,7 @@ import {
   type PromptInput,
   type RunPromptResult,
   SessionRecord,
+  type SessionNotification,
   SessionSendResult,
   SubagentRef,
 } from "../../types.js";
@@ -442,6 +443,168 @@ export async function drainInjectedPromptsWithBackstop(
     onTimeout(pending);
   }
   return { timedOut, pending };
+}
+
+// --- C1: turn-completion watchdog (G1) -------------------------------------
+// The adapter's own end-of-turn marker: the terminal `usage_update` carrying
+// `_meta._claude/lastTurnEndReason` (the same signal acpx-ui reads). It rides on
+// a REAL message and can appear on either the notification-level or the
+// update-level `_meta`. Seeing it proves the SDK turn ended; if the response is
+// then still overdue, the response was withheld (the adapter routing hole, RCA
+// §1.2) and the watchdog recovers — a turn with NO marker never triggers, so
+// genuinely long-running work can never be truncated.
+const CLAUDE_TURN_END_MARKER_META_KEY = "_claude/lastTurnEndReason";
+
+function readTurnEndReason(meta: unknown): string | undefined {
+  if (!meta || typeof meta !== "object") {
+    return undefined;
+  }
+  const value = (meta as Record<string, unknown>)[CLAUDE_TURN_END_MARKER_META_KEY];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function turnEndReasonFromNotification(notification: SessionNotification): string | undefined {
+  const update = (notification as { update?: unknown }).update as
+    | Record<string, unknown>
+    | undefined;
+  if (!update || update.sessionUpdate !== "usage_update") {
+    return undefined;
+  }
+  return (
+    readTurnEndReason((notification as { _meta?: unknown })._meta) ??
+    readTurnEndReason(update._meta)
+  );
+}
+
+// Genuine completions the end-marker can report. Used for the Q2 reconciliation:
+// when tier-1's cancel recovers a turn whose marker already reported one of these,
+// the delivery terminal reports that semantic truth rather than the `cancelled`
+// our own nudge produced.
+const COMPLETION_TURN_END_REASONS = new Set(["end_turn", "max_tokens", "max_turns"]);
+
+function reconcileStopReasonWithMarker(
+  rawStopReason: RunPromptResult["stopReason"],
+  endMarkerReason: string | undefined,
+): RunPromptResult["stopReason"] {
+  if (
+    rawStopReason === "cancelled" &&
+    endMarkerReason !== undefined &&
+    COMPLETION_TURN_END_REASONS.has(endMarkerReason)
+  ) {
+    return endMarkerReason as RunPromptResult["stopReason"];
+  }
+  return rawStopReason;
+}
+
+// Tier-2 turn-response timeout: retryable + a stable detailCode the UI (D-lane)
+// keys on. `normalizeOutputError` reads `detailCode`/`retryable` straight off the
+// error instance.
+export class TurnResponseTimeoutError extends Error {
+  readonly detailCode = "TURN_RESPONSE_TIMEOUT";
+  readonly retryable = true;
+  constructor(sessionId: string, totalMs: number) {
+    super(
+      `Turn response overdue for session ${sessionId}: end-of-turn marker seen but no response after ${totalMs}ms`,
+    );
+    this.name = "TurnResponseTimeoutError";
+  }
+}
+
+// Per-tier response-overdue bound (Q1 default 120 s ⇒ ~4 min worst case to a
+// tier-2 failure). Override via ACPX_TURN_RESPONSE_TIMEOUT_MS; a non-positive /
+// NaN value falls back to the default rather than disabling the watchdog.
+const DEFAULT_TURN_RESPONSE_TIMEOUT_MS = 120_000;
+
+function resolveTurnResponseTimeoutMs(): number {
+  const raw = process.env.ACPX_TURN_RESPONSE_TIMEOUT_MS;
+  if (raw == null || raw.trim() === "") {
+    return DEFAULT_TURN_RESPONSE_TIMEOUT_MS;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_TURN_RESPONSE_TIMEOUT_MS;
+  }
+  return parsed;
+}
+
+type TurnWatchdogOptions = {
+  timeoutMs: number;
+  sessionId: string;
+  // Tier 1 (nudge): the SDK turn ended but the response is overdue — cancel the
+  // active prompt so the withheld response/cancel result settles through the
+  // adapter's existing cancel path. No work is lost (the marker proved the turn
+  // already ended).
+  onTier1: () => void;
+  // Tier 2 (bound): still unsettled a second interval later — abandon the turn.
+  // Runs just before the guarded turn promise is rejected so late continuations
+  // can be suppressed.
+  onTier2Abandon: () => void;
+  log: (tier: 1 | 2, elapsedMs: number) => void;
+};
+
+/**
+ * Bounds a main-turn `client.prompt()` await once the adapter has emitted its
+ * end-of-turn marker. Two tiers, each `timeoutMs` apart: tier 1 nudges (cancel),
+ * tier 2 rejects the guarded promise with a retryable {@link TurnResponseTimeoutError}.
+ * The clock only starts when {@link noteEndMarker} is called from the production
+ * session-update tap — no marker, no timers, so live work is never truncated.
+ */
+class TurnWatchdog {
+  private endMarkerSeenAt: number | undefined;
+  private tier1Timer: ReturnType<typeof setTimeout> | undefined;
+  private tier2Timer: ReturnType<typeof setTimeout> | undefined;
+  private rejectTurn: ((error: unknown) => void) | undefined;
+  private disposed = false;
+
+  constructor(private readonly options: TurnWatchdogOptions) {}
+
+  noteEndMarker(): void {
+    if (this.disposed || this.endMarkerSeenAt !== undefined) {
+      return;
+    }
+    this.endMarkerSeenAt = Date.now();
+    const { timeoutMs } = this.options;
+    this.tier1Timer = setTimeout(() => {
+      this.options.log(1, timeoutMs);
+      this.options.onTier1();
+    }, timeoutMs);
+    this.tier1Timer.unref?.();
+    this.tier2Timer = setTimeout(() => {
+      this.options.log(2, timeoutMs * 2);
+      this.options.onTier2Abandon();
+      this.rejectTurn?.(new TurnResponseTimeoutError(this.options.sessionId, timeoutMs * 2));
+    }, timeoutMs * 2);
+    this.tier2Timer.unref?.();
+  }
+
+  async guard<T>(turnPromise: Promise<T>): Promise<T> {
+    return await new Promise<T>((resolve, reject) => {
+      this.rejectTurn = reject;
+      turnPromise.then(
+        (value) => {
+          this.dispose();
+          resolve(value);
+        },
+        (error) => {
+          this.dispose();
+          reject(error);
+        },
+      );
+    });
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    if (this.tier1Timer) {
+      clearTimeout(this.tier1Timer);
+      this.tier1Timer = undefined;
+    }
+    if (this.tier2Timer) {
+      clearTimeout(this.tier2Timer);
+      this.tier2Timer = undefined;
+    }
+    this.rejectTurn = undefined;
+  }
 }
 
 function attachEffectiveAccountMetadata(
@@ -1040,6 +1203,16 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   let eventWriterClosed = false;
   const acceptedDeliveryKeys = new Set<string>();
   const terminalDeliveryKeys = new Set<string>();
+  // C1 turn-completion watchdog. Backend-gated to the same set that returns a
+  // terminal per turn (Claude / claude-pty) — the `_claude/*`-namespaced marker
+  // only exists there. `activeTurnWatchdog` is the per-attempt instance the
+  // production session-update tap feeds; `turnAbandoned` suppresses a tier-2
+  // abandoned turn's late continuations; `endMarkerReasonThisTurn` carries the
+  // marker's reason for the Q2 stop-reason reconciliation.
+  const turnWatchdogEnabled = awaitInjectedPrompt;
+  let activeTurnWatchdog: TurnWatchdog | undefined;
+  let turnAbandoned = false;
+  let endMarkerReasonThisTurn: string | undefined;
 
   const appendDeliveryEvent = async (
     context: DeliveryContext | undefined,
@@ -1572,6 +1745,23 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     },
     // eslint-disable-next-line complexity -- fork integration handler; intentionally over budget, refactor would risk verified merge semantics
     onSessionUpdate: (notification) => {
+      // C1: the watchdog listens on the live session-update tap. The end-of-turn
+      // marker arriving here (during the main prompt's await) arms the response
+      // bound; nothing else in this handler changes for the common path.
+      if (turnWatchdogEnabled) {
+        const endReason = turnEndReasonFromNotification(notification);
+        if (endReason !== undefined) {
+          endMarkerReasonThisTurn = endReason;
+          activeTurnWatchdog?.noteEndMarker();
+        }
+      }
+      // A turn abandoned at tier 2 may still emit late updates when its withheld
+      // response finally settles. Drop them: the turn is already being failed, so
+      // folding its late output into the record or re-triggering a checkpoint
+      // would clobber the finalized state (the tier-2 late-response guard).
+      if (turnAbandoned) {
+        return;
+      }
       if (promptTurnActive) {
         promptTurnHadSideEffects = true;
       }
@@ -1831,9 +2021,12 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
 
   const runPromptAttempt = async (sessionId: string, attempt: number) => {
     const promptStartedAt = Date.now();
+    // Fresh watchdog state for this attempt (a retry re-arms cleanly).
+    turnAbandoned = false;
+    endMarkerReasonThisTurn = undefined;
     await appendDeliveryEvent(mainDeliveryContext, "accepted");
     const response = await measurePerf("runtime.prompt.agent_turn", async () => {
-      return await runPromptTurn({
+      const turnPromise = runPromptTurn({
         client,
         sessionId,
         prompt: options.prompt,
@@ -1843,6 +2036,41 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         messageId: options.messageId,
         onPromptStarted: buildPromptStartedHook(sessionId, attempt),
       });
+      if (!turnWatchdogEnabled) {
+        return await turnPromise;
+      }
+      // Bound the await against a withheld response. The watchdog only arms once
+      // the end-of-turn marker reaches the session-update tap above; until then
+      // this is a plain `await turnPromise`.
+      const watchdog = new TurnWatchdog({
+        timeoutMs: resolveTurnResponseTimeoutMs(),
+        sessionId: record.acpxRecordId,
+        onTier1: () => {
+          void client.requestCancelActivePrompt().catch(() => {
+            // Best effort: the nudge either settles the withheld prompt or tier 2
+            // bounds it. Never let the cancel's own failure escape the watchdog.
+          });
+        },
+        onTier2Abandon: () => {
+          turnAbandoned = true;
+        },
+        log: (tier, elapsedMs) => {
+          // Diagnosable, NON-verbose-gated → owner.log (mirrors the drain-backstop
+          // line). The owner's stderr is its own owner.log fd, never a client's
+          // JSON-RPC stream.
+          process.stderr.write(
+            `[acpx] turn-completion watchdog tier ${tier} for session ${record.acpxRecordId}: ` +
+              `end-of-turn marker seen, response overdue ${elapsedMs}ms\n`,
+          );
+        },
+      });
+      activeTurnWatchdog = watchdog;
+      try {
+        return await watchdog.guard(turnPromise);
+      } finally {
+        activeTurnWatchdog = undefined;
+        watchdog.dispose();
+      }
     });
     // First turn done — stop injecting and await any in-flight injected prompts.
     await drainInjectedPrompts();
@@ -1964,14 +2192,22 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         await liveCheckpoint.checkpoint();
 
         const response = await savePromptSuccess(await runPromptWithRetries(activeSessionId));
+        // Q2 (semantic truth): if tier-1's cancel recovered a turn whose marker
+        // already reported a genuine completion, the delivery terminal reports
+        // that completion — not the `cancelled` our own nudge produced. The raw
+        // stopReason still flows to the caller's RunPromptResult below.
+        const terminalStopReason = reconcileStopReasonWithMarker(
+          response.stopReason,
+          endMarkerReasonThisTurn,
+        );
         await completeAbsorbedInjectedDeliveries(
-          deliveryPhaseForStopReason(response.stopReason),
-          response.stopReason === "cancelled" ? { stopReason: "cancelled" } : { stopReason: null },
+          deliveryPhaseForStopReason(terminalStopReason),
+          terminalStopReason === "cancelled" ? { stopReason: "cancelled" } : { stopReason: null },
         );
         await appendDeliveryTerminal(
           mainDeliveryContext,
-          deliveryPhaseForStopReason(response.stopReason),
-          { stopReason: toDeliveryStopReason(response.stopReason) },
+          deliveryPhaseForStopReason(terminalStopReason),
+          { stopReason: toDeliveryStopReason(terminalStopReason) },
         );
         promptTurnActive = false;
 

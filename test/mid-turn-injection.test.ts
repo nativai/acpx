@@ -39,6 +39,12 @@ import { listSessionEvents } from "../src/session/events.js";
 import { resolveSessionRecord } from "../src/session/persistence.js";
 import type { SessionRecord } from "../src/types.js";
 import {
+  CLAUDE_AGENT_COMMAND,
+  cancelResolvesPrompt,
+  makePathologicalClient,
+  neverRespondIgnoresCancel,
+} from "./pathological-adapter-helpers.js";
+import {
   makeSessionRecord as makeSessionRecordFixture,
   withTempHome as withTempHomeFixture,
   writeSessionRecordFile,
@@ -1586,6 +1592,235 @@ test("runQueuedTask does not deduplicate a messageId whose first turn failed bef
         false,
         "a failed-before-turn prompt must never be reported as deduplicated",
       );
+    });
+  });
+});
+
+// --- C1: turn-completion watchdog (brick 87edf583, FIX-DESIGN §2.1) ----------
+// These extend the in-process mid-turn-injection harness with the scripted
+// pathological adapter (test/pathological-adapter-helpers.ts): a Claude backend
+// that emits its end-of-turn marker through the SAME production session-update
+// tap the watchdog listens on, while withholding the client.prompt() response —
+// the exact acpx-observable shape of the RCA §1.2 routing hole. The TE reuses
+// those helpers against the real adapter process (see TESTER-PLAN.md).
+
+async function withTurnResponseTimeout<T>(ms: number, run: () => Promise<T>): Promise<T> {
+  const previous = process.env.ACPX_TURN_RESPONSE_TIMEOUT_MS;
+  process.env.ACPX_TURN_RESPONSE_TIMEOUT_MS = String(ms);
+  try {
+    return await run();
+  } finally {
+    if (previous === undefined) {
+      delete process.env.ACPX_TURN_RESPONSE_TIMEOUT_MS;
+    } else {
+      process.env.ACPX_TURN_RESPONSE_TIMEOUT_MS = previous;
+    }
+  }
+}
+
+async function withRaceTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return await Promise.race([
+    promise,
+    new Promise<never>((_resolve, reject) => {
+      setTimeout(() => reject(new Error(message)), ms);
+    }),
+  ]);
+}
+
+function terminalsForMessage(events: unknown[], messageId: string): Record<string, unknown>[] {
+  return deliveryEventSummaries(events).filter(
+    (event) => event.messageId === messageId && event.phase !== "accepted",
+  );
+}
+
+// C1 tier-1: the SDK turn ended (marker seen) but the response is withheld; the
+// tier-1 cancel nudge settles it. Our own nudge yields `cancelled`, yet the
+// marker said end_turn, so the delivery terminal reconciles to the semantic
+// completion (Q2). Exactly one terminal for the messageId.
+test("C1 watchdog: tier-1 cancel recovers a withheld, marker-ended turn with Q2 semantic done/end_turn", async () => {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeSessionRecord(homeDir, CLAUDE_AGENT_COMMAND);
+      await writeSessionRecordFile(homeDir, record);
+
+      const mainMessageId = "c1a11111-1111-4111-8111-111111111111";
+      const control = makePathologicalClient({ acpSessionId: record.acpSessionId });
+      cancelResolvesPrompt(control, "cancelled");
+
+      const mainSends: QueueOwnerMessage[] = [];
+      const mainTask = makeQueueTask(
+        "req-c1-tier1",
+        MAIN_PROMPT_TEXT,
+        (message) => mainSends.push(message),
+        () => {},
+        true,
+        mainMessageId,
+      );
+
+      const run = withTurnResponseTimeout(40, () =>
+        runQueuedTask(record.acpxRecordId, mainTask, {
+          sharedClient: control.client,
+          suppressSdkConsoleErrors: true,
+        }),
+      );
+
+      await control.mainPromptInFlight;
+      await tick();
+      control.emitTurnEndMarker("end_turn");
+      await withRaceTimeout(run, 3_000, "tier-1 did not recover the withheld turn");
+
+      assert.ok(
+        mainSends.find((m) => m.type === "result"),
+        "turn finalized after tier-1 recovery",
+      );
+      assert.ok(control.cancelCount() >= 1, "tier-1 issued at least one cancel nudge");
+
+      const terminals = terminalsForMessage(
+        await listSessionEvents(record.acpxRecordId),
+        mainMessageId,
+      );
+      assert.equal(terminals.length, 1, "exactly one terminal for the received messageId");
+      assert.deepEqual(terminals[0], {
+        messageId: mainMessageId,
+        requestId: "req-c1-tier1",
+        phase: "done",
+        stopReason: "end_turn",
+      });
+    });
+  });
+});
+
+// C1 tier-2 + the design's mandatory late-response guard: an adapter that emits
+// the marker, never responds, and ignores cancel is bounded at tier 2 with a
+// retryable TURN_RESPONSE_TIMEOUT failed terminal; the owner survives. When the
+// abandoned client.prompt() finally settles AFTER tier-2, it must be inert — no
+// duplicate terminal, no record clobber, no crash / unhandled rejection.
+test("C1 watchdog: tier-2 bounds a never-responding turn (TURN_RESPONSE_TIMEOUT); a late response is inert", async () => {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeSessionRecord(homeDir, CLAUDE_AGENT_COMMAND);
+      await writeSessionRecordFile(homeDir, record);
+
+      const mainMessageId = "c1b22222-2222-4222-8222-222222222222";
+      const control = makePathologicalClient({ acpSessionId: record.acpSessionId });
+      neverRespondIgnoresCancel(control);
+
+      const mainSends: QueueOwnerMessage[] = [];
+      const mainTask = makeQueueTask(
+        "req-c1-tier2",
+        MAIN_PROMPT_TEXT,
+        (message) => mainSends.push(message),
+        () => {},
+        true,
+        mainMessageId,
+      );
+
+      const run = withTurnResponseTimeout(40, () =>
+        runQueuedTask(record.acpxRecordId, mainTask, {
+          sharedClient: control.client,
+          suppressSdkConsoleErrors: true,
+        }),
+      );
+
+      await control.mainPromptInFlight;
+      await tick();
+      control.emitTurnEndMarker("end_turn");
+      await withRaceTimeout(run, 3_000, "tier-2 did not bound the never-responding turn");
+
+      const errorMessage = mainSends.find((m) => m.type === "error") as
+        | { detailCode?: string; retryable?: boolean }
+        | undefined;
+      assert.ok(errorMessage, "turn failed at the tier-2 bound");
+      assert.equal(errorMessage?.detailCode, "TURN_RESPONSE_TIMEOUT");
+      assert.equal(errorMessage?.retryable, true);
+
+      const eventsBefore = await listSessionEvents(record.acpxRecordId);
+      const terminalsBefore = terminalsForMessage(eventsBefore, mainMessageId);
+      assert.equal(terminalsBefore.length, 1, "exactly one terminal at tier-2");
+      assert.equal(terminalsBefore[0]?.phase, "failed");
+      const recordBefore = await resolveSessionRecord(record.acpxRecordId);
+
+      // The abandoned prompt finally settles AFTER tier-2 — the guard.
+      control.resolveMainPrompt({ stopReason: "end_turn" });
+      await new Promise((resolve) => setTimeout(resolve, 60));
+
+      const terminalsAfter = terminalsForMessage(
+        await listSessionEvents(record.acpxRecordId),
+        mainMessageId,
+      );
+      assert.deepEqual(
+        terminalsAfter,
+        terminalsBefore,
+        "no duplicate terminal from the late response",
+      );
+      const recordAfter = await resolveSessionRecord(record.acpxRecordId);
+      assert.deepEqual(
+        recordAfter.messages,
+        recordBefore.messages,
+        "the late response did not clobber the finalized record",
+      );
+    });
+  });
+});
+
+// C1 safety: a turn that never emits an end-marker (genuinely long-running, live
+// work) is NEVER truncated — the watchdog is strictly marker-gated. The response
+// is withheld well past both tiers, yet the turn neither fails nor finalizes
+// until it actually responds.
+test("C1 watchdog: a turn with no end-marker is never truncated (marker-gated)", async () => {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeSessionRecord(homeDir, CLAUDE_AGENT_COMMAND);
+      await writeSessionRecordFile(homeDir, record);
+
+      const mainMessageId = "c1c33333-3333-4333-8333-333333333333";
+      const control = makePathologicalClient({ acpSessionId: record.acpSessionId });
+
+      const mainSends: QueueOwnerMessage[] = [];
+      const mainTask = makeQueueTask(
+        "req-c1-nomark",
+        MAIN_PROMPT_TEXT,
+        (message) => mainSends.push(message),
+        () => {},
+        true,
+        mainMessageId,
+      );
+
+      const run = withTurnResponseTimeout(40, () =>
+        runQueuedTask(record.acpxRecordId, mainTask, {
+          sharedClient: control.client,
+          suppressSdkConsoleErrors: true,
+        }),
+      );
+
+      await control.mainPromptInFlight;
+      await tick();
+      // Well past both tiers (2 x 40ms) with NO marker emitted.
+      await new Promise((resolve) => setTimeout(resolve, 240));
+      assert.equal(
+        mainSends.find((m) => m.type === "error"),
+        undefined,
+        "no premature failure without an end-marker",
+      );
+      assert.equal(
+        mainSends.find((m) => m.type === "result"),
+        undefined,
+        "still in flight — the watchdog never fired",
+      );
+
+      control.resolveMainPrompt({ stopReason: "end_turn" });
+      await run;
+
+      assert.ok(
+        mainSends.find((m) => m.type === "result"),
+        "turn completes normally once it responds",
+      );
+      const terminals = terminalsForMessage(
+        await listSessionEvents(record.acpxRecordId),
+        mainMessageId,
+      );
+      assert.equal(terminals.length, 1);
+      assert.equal(terminals[0]?.phase, "done");
     });
   });
 });
