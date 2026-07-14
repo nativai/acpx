@@ -1824,3 +1824,221 @@ test("C1 watchdog: a turn with no end-marker is never truncated (marker-gated)",
     });
   });
 });
+
+// --- C2 / C3: durable delivery terminals (FIX-DESIGN §2.2, §2.3) -------------
+
+async function withInjectedDrainTimeout<T>(ms: number, run: () => Promise<T>): Promise<T> {
+  const previous = process.env.ACPX_INJECTED_DRAIN_TIMEOUT_MS;
+  process.env.ACPX_INJECTED_DRAIN_TIMEOUT_MS = String(ms);
+  try {
+    return await run();
+  } finally {
+    if (previous === undefined) {
+      delete process.env.ACPX_INJECTED_DRAIN_TIMEOUT_MS;
+    } else {
+      process.env.ACPX_INJECTED_DRAIN_TIMEOUT_MS = previous;
+    }
+  }
+}
+
+function deliveryParamsForMessage(events: unknown[], messageId: string): Record<string, unknown>[] {
+  return deliveryEventParams(events).filter((event) => event.messageId === messageId);
+}
+
+async function waitForDeliveryTerminal(
+  sessionId: string,
+  messageId: string,
+  timeoutMs = 2_000,
+): Promise<Record<string, unknown> | undefined> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const events = await listSessionEvents(sessionId);
+    const terminal = deliveryParamsForMessage(events, messageId).find(
+      (event) => event.phase !== "accepted",
+    );
+    if (terminal || Date.now() > deadline) {
+      return terminal;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+// C3 (G2 completeness): a still-pending injected delivery gets an
+// INJECTED_RESPONSE_TIMEOUT `failed` terminal written at backstop time — so no
+// delivery is left accepted-forever. The main turn still ends `done`, and there
+// is exactly one terminal per messageId.
+test("C3: drain backstop writes an INJECTED_RESPONSE_TIMEOUT terminal for a still-pending injected delivery", async () => {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeSessionRecord(homeDir, CLAUDE_AGENT_COMMAND);
+      await writeSessionRecordFile(homeDir, record);
+
+      const mainMessageId = "c3aaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      const injectedMessageId = "c3bbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      // injected prompt hangs forever (default onInjectedPrompt).
+      const control = makePathologicalClient({ acpSessionId: record.acpSessionId });
+
+      let injectedCloses = 0;
+      const midTurn = makeMidTurnControl((registration, ctrl) => {
+        if (registration === 1) {
+          const injectedTask = makeQueueTask(
+            "req-c3-injected",
+            INJECTED_PROMPT_TEXT,
+            () => {},
+            () => {
+              injectedCloses += 1;
+            },
+            false,
+            injectedMessageId,
+          );
+          queueMicrotask(() => {
+            ctrl.currentHandler?.(injectedTask);
+          });
+        }
+      });
+
+      const mainSends: QueueOwnerMessage[] = [];
+      const mainTask = makeQueueTask(
+        "req-c3-main",
+        MAIN_PROMPT_TEXT,
+        (message) => mainSends.push(message),
+        () => {},
+        true,
+        mainMessageId,
+      );
+
+      const run = withInjectedDrainTimeout(40, () =>
+        runQueuedTask(record.acpxRecordId, mainTask, {
+          sharedClient: control.client,
+          setMidTurnHandler: midTurn.setMidTurnHandler,
+          suppressSdkConsoleErrors: true,
+        }),
+      );
+
+      await control.mainPromptInFlight;
+      // Let the injection register + fire (client.prompt for the injected task).
+      for (let i = 0; i < 5 && !control.promptCalls.some((c) => c.kind === "injected"); i += 1) {
+        await tick();
+      }
+      assert.ok(
+        control.promptCalls.some((c) => c.kind === "injected"),
+        "injected prompt is in flight before the main turn ends",
+      );
+      // Main turn ends; the injected prompt is left pending → drain backstop fires.
+      control.resolveMainPrompt({ stopReason: "end_turn" });
+      await withRaceTimeout(run, 3_000, "drain backstop did not finalize the turn");
+
+      const events = await listSessionEvents(record.acpxRecordId);
+      assert.deepEqual(terminalsForMessage(events, mainMessageId), [
+        {
+          messageId: mainMessageId,
+          requestId: "req-c3-main",
+          phase: "done",
+          stopReason: "end_turn",
+        },
+      ]);
+
+      const injectedTerminals = terminalsForMessage(events, injectedMessageId);
+      assert.equal(injectedTerminals.length, 1, "exactly one terminal for the injected messageId");
+      assert.equal(injectedTerminals[0]?.phase, "failed");
+      const injectedTerminalParams = deliveryParamsForMessage(events, injectedMessageId).find(
+        (event) => event.phase === "failed",
+      );
+      assert.equal(
+        (injectedTerminalParams?.error as { detailCode?: string } | undefined)?.detailCode,
+        "INJECTED_RESPONSE_TIMEOUT",
+      );
+      // The injected IIFE is still hung (its response never came), so its own
+      // finally never ran: C3 writes the terminal WITHOUT force-closing the hung
+      // task. The delivery lifecycle is complete on the stream regardless.
+      assert.equal(injectedCloses, 0, "the never-resolving injected IIFE remains pending");
+    });
+  });
+});
+
+// C2 (G2): a delivery terminal written AFTER the per-turn event writer closed
+// (a fire-and-forget injected prompt that returns its terminal late, once the
+// containing turn has finalized) must still land durably via a standalone
+// writer — not be swallowed into accepted-forever. Modeled on an unknown backend
+// (not awaited, not absorbed) so the late terminal is the injected IIFE's own
+// write, exercising appendDeliveryEvent's closed-writer fallback directly.
+test("C2: a delivery terminal written after the per-turn writer closed still lands (standalone-writer fallback)", async () => {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      // Default (unknown) backend ⇒ injected prompt is fire-and-forget: not
+      // awaited by the turn, so it settles after finalization.
+      const record = makeSessionRecord(homeDir);
+      await writeSessionRecordFile(homeDir, record);
+
+      const injectedMessageId = "c2cccccc-cccc-4ccc-8ccc-cccccccccccc";
+      const injectedRelease = createDeferred<{ stopReason: "end_turn" }>();
+      const control = makePathologicalClient({
+        acpSessionId: record.acpSessionId,
+        onInjectedPrompt: () => injectedRelease.promise as Promise<never>,
+      });
+
+      const midTurn = makeMidTurnControl((registration, ctrl) => {
+        if (registration === 1) {
+          const injectedTask = makeQueueTask(
+            "req-c2-injected",
+            INJECTED_PROMPT_TEXT,
+            () => {},
+            () => {},
+            false,
+            injectedMessageId,
+          );
+          queueMicrotask(() => {
+            ctrl.currentHandler?.(injectedTask);
+          });
+        }
+      });
+
+      const mainSends: QueueOwnerMessage[] = [];
+      const mainTask = makeQueueTask(
+        "req-c2-main",
+        MAIN_PROMPT_TEXT,
+        (message) => mainSends.push(message),
+        () => {},
+        true,
+        "c2mmmmmm-mmmm-4mmm-8mmm-mmmmmmmmmmmm",
+      );
+
+      const run = runQueuedTask(record.acpxRecordId, mainTask, {
+        sharedClient: control.client,
+        setMidTurnHandler: midTurn.setMidTurnHandler,
+        suppressSdkConsoleErrors: true,
+      });
+
+      await control.mainPromptInFlight;
+      for (let i = 0; i < 5 && !control.promptCalls.some((c) => c.kind === "injected"); i += 1) {
+        await tick();
+      }
+      assert.ok(
+        control.promptCalls.some((c) => c.kind === "injected"),
+        "injected prompt in flight",
+      );
+
+      // Main turn ends and finalizes (the fire-and-forget injected is NOT awaited),
+      // closing the per-turn event writer.
+      control.resolveMainPrompt({ stopReason: "end_turn" });
+      await run;
+      assert.ok(
+        mainSends.find((m) => m.type === "result"),
+        "main turn finalized",
+      );
+
+      // The injected prompt now returns its terminal — AFTER the writer closed.
+      injectedRelease.resolve({ stopReason: "end_turn" });
+
+      const terminal = await waitForDeliveryTerminal(record.acpxRecordId, injectedMessageId);
+      assert.ok(terminal, "the post-close injected terminal landed durably (not swallowed)");
+      assert.equal(terminal?.phase, "done");
+      assert.equal(terminal?.stopReason, "end_turn");
+      const terminals = terminalsForMessage(
+        await listSessionEvents(record.acpxRecordId),
+        injectedMessageId,
+      );
+      assert.equal(terminals.length, 1, "exactly one terminal for the injected messageId");
+    });
+  });
+});

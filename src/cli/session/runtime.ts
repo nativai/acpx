@@ -225,6 +225,15 @@ type AbsorbedInjectedDelivery = {
   terminalWritten: boolean;
 };
 
+// A tracked (awaited) mid-turn-injected prompt: its promise, its delivery
+// context, and whether it has settled — so the C3 drain backstop can write a
+// terminal for one still pending when the backstop fires.
+type TrackedInjectedDelivery = {
+  promise: Promise<void>;
+  context: DeliveryContext | undefined;
+  settled: boolean;
+};
+
 type PromptStartResult = {
   messageId: string | undefined;
   deduplicated: boolean;
@@ -335,6 +344,12 @@ async function resolveRecordIfPromptAlreadyPersisted(
   // Only dedup when a real completion terminal exists for this messageId (Defect B, 182d241f).
   const events = await listSessionEvents(latestRecord.acpxRecordId);
   return hasCompletedDeliveryFor(events, messageId) ? latestRecord : undefined;
+}
+
+// The sentinel SessionEventWriter throws once closed (src/session/events.ts).
+// C2 keys the standalone-writer fallback on it.
+function isClosedEventWriterError(error: unknown): boolean {
+  return error instanceof Error && error.message === "SessionEventWriter is closed";
 }
 
 async function appendDeduplicatedDeliveryTerminal(
@@ -1186,8 +1201,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   let promptTurnHadSideEffects = false;
   // Fork: in-flight mid-turn-injected prompts. Tracked so a turn awaits all
   // of them before the queue-owner loop starts the next sequential task —
-  // otherwise a second concurrent client.prompt() would cut an injected turn short.
-  const injectedPromises: Promise<void>[] = [];
+  // otherwise a second concurrent client.prompt() would cut an injected turn
+  // short. Each carries its delivery context + a settled flag so the drain
+  // backstop (C3) can write a terminal for one still pending when it fires.
+  const injectedDeliveries: TrackedInjectedDelivery[] = [];
   // Backend is constant per session, so resolve once: whether an injected prompt
   // to this backend returns a terminal response and can therefore be safely
   // awaited (drained) even when waitForCompletion is false. True for Claude /
@@ -1239,7 +1256,12 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     ) {
       return;
     }
-    await eventWriter.appendMessage(
+    // C2 (G2): a late-settling injected IIFE writes its terminal after the turn
+    // finalized and closed the per-turn writer. Rather than swallow that write
+    // (the accepted-forever bug), fall back to a fresh standalone writer — the
+    // exact precedent used by appendDeduplicatedDeliveryTerminal. The dedup
+    // bookkeeping below is unchanged, so the one-terminal invariant holds.
+    await writeDurableDeliveryEvent(
       buildDeliveryEvent({
         messageId: context.messageId,
         requestId: context.requestId,
@@ -1255,6 +1277,26 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       acceptedDeliveryKeys,
       terminalDeliveryKeys,
     });
+  };
+
+  const writeDurableDeliveryEvent = async (event: AcpJsonRpcMessage): Promise<void> => {
+    if (!eventWriterClosed) {
+      try {
+        await eventWriter.appendMessage(event);
+        return;
+      } catch (error) {
+        if (!isClosedEventWriterError(error)) {
+          throw error;
+        }
+        // Writer was closed under us — fall through to the standalone path.
+      }
+    }
+    const standalone = await SessionEventWriter.open(record);
+    try {
+      await standalone.appendMessage(event);
+    } finally {
+      await standalone.close({ checkpoint: true });
+    }
   };
 
   const appendDeliveryTerminal = async (
@@ -1341,6 +1383,14 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // log compaction rewrite); it does not rewrite the committed log line.
     const steerBoundaryUuid = readSteerBoundaryUuid(injectedResponse._meta);
     if (!injectedMessageId || !steerBoundaryUuid) {
+      return;
+    }
+    // C2 record-integrity guard (RCA §2): once the turn has finalized, `record`
+    // holds the dead turn's conversation snapshot. Stamping + persisting it here
+    // (a late injected settle) would clobber the finalized record with stale
+    // state. The stamp is best-effort provenance the log-compaction rewrite also
+    // recovers, so skip it rather than persist a stale snapshot.
+    if (eventWriterClosed) {
       return;
     }
     stampSteerBoundaryUuid(conversation, injectedMessageId, steerBoundaryUuid);
@@ -1977,7 +2027,15 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         // The result/error SEND gates above (the --no-wait contract) are
         // unchanged; only this await-tracking gate widens.
         if (injectedTask.waitForCompletion || awaitInjectedPrompt) {
-          injectedPromises.push(injectedPromise);
+          const tracked: TrackedInjectedDelivery = {
+            promise: injectedPromise,
+            context: deliveryContextFor(injectedTask),
+            settled: false,
+          };
+          void injectedPromise.finally(() => {
+            tracked.settled = true;
+          });
+          injectedDeliveries.push(tracked);
         }
       });
       if (attempt === 0 && options.onPromptActive) {
@@ -1997,7 +2055,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // still running, pushing that next message into the injected turn's
     // context and cutting it short.
     options.setMidTurnHandler?.(undefined);
-    if (injectedPromises.length === 0) {
+    if (injectedDeliveries.length === 0) {
       return;
     }
     // Bound the wait with a backstop so a pathological injected prompt that
@@ -2007,16 +2065,40 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // resolve safely: rejections are isolated inside the IIFE, and an owner
     // death rejects the pending client.prompt() (AgentDisconnectedError).
     const drainTimeoutMs = resolveInjectedDrainTimeoutMs();
-    await drainInjectedPromptsWithBackstop(injectedPromises, drainTimeoutMs, (pending) => {
-      // Diagnosable, NON-verbose-gated → owner.log (mirrors the idle-release
-      // line at queue-owner-runtime.ts:784-786). The owner's stderr is its own
-      // owner.log fd, never a --json-strict client's JSON-RPC stream.
-      process.stderr.write(
-        `[acpx] injected-prompt drain backstop fired for session ${record.acpxRecordId} ` +
-          `after ${drainTimeoutMs}ms; finalizing with ${pending} injected prompt(s) still pending\n`,
-      );
-    });
-    injectedPromises.length = 0;
+    const drainResult = await drainInjectedPromptsWithBackstop(
+      injectedDeliveries.map((delivery) => delivery.promise),
+      drainTimeoutMs,
+      (pending) => {
+        // Diagnosable, NON-verbose-gated → owner.log (mirrors the idle-release
+        // line at queue-owner-runtime.ts:784-786). The owner's stderr is its own
+        // owner.log fd, never a --json-strict client's JSON-RPC stream.
+        process.stderr.write(
+          `[acpx] injected-prompt drain backstop fired for session ${record.acpxRecordId} ` +
+            `after ${drainTimeoutMs}ms; finalizing with ${pending} injected prompt(s) still pending\n`,
+        );
+      },
+    );
+    // C3 (G2 completeness): the backstop fired with injected prompts still
+    // pending. Their own late terminal may never come (the response is withheld
+    // forever), so write one now — the exactly-one-terminal invariant is held by
+    // terminalDeliveryKeys, which suppresses any late IIFE terminal for the same
+    // delivery. Not a "completed" terminal by design (Defect-B dedup won't dedup
+    // a resend): the message may have run, hence the detailCode + copy (D3, Q3).
+    if (drainResult.timedOut) {
+      for (const delivery of injectedDeliveries) {
+        if (delivery.settled || !delivery.context) {
+          continue;
+        }
+        await appendDeliveryTerminal(delivery.context, "failed", {
+          error: {
+            code: 0,
+            message: "delivery outcome unknown — the message may have been processed",
+            detailCode: "INJECTED_RESPONSE_TIMEOUT",
+          },
+        });
+      }
+    }
+    injectedDeliveries.length = 0;
   };
 
   const runPromptAttempt = async (sessionId: string, attempt: number) => {
