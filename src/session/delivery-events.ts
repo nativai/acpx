@@ -2,7 +2,10 @@ import type { AcpJsonRpcMessage } from "../types.js";
 
 export const DELIVERY_EVENT_METHOD = "acpx/delivery";
 
-export type DeliveryPhase = "accepted" | "done" | "failed" | "cancelled";
+// `queued` (C4) is a non-terminal visibility phase: a mid-turn task buffered
+// during the capture window / re-queued after a turn, not yet accepted. Additive
+// — acpx-ui's parseDeliveryEvent whitelists phases and ignores unknown ones.
+export type DeliveryPhase = "accepted" | "queued" | "done" | "failed" | "cancelled";
 
 export type DeliveryStopReason =
   | "end_turn"

@@ -28,6 +28,7 @@ import {
 } from "../../session/persistence.js";
 import type { AcpJsonRpcMessage, SessionSendOutcome } from "../../types.js";
 import {
+  appendDeliveryStreamEvent,
   QUEUE_CONNECT_RETRY_MS,
   type QueueTask,
   SessionQueueOwner,
@@ -795,6 +796,11 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         }
         if (midTurnCaptureActive) {
           midTurnBuffer.push(task);
+          // C4 (G3): make the capture-window wait visible. Without this the task
+          // sat between `acpx/received` and acceptance with no delivery event for
+          // up to a full drain cycle (RCA §3). Additive: deployed acpx-ui's
+          // parseDeliveryEvent whitelists phases and ignores unknown ones.
+          appendDeliveryStreamEvent(options.sessionId, task, "queued");
           return true;
         }
         // Not in a turn — let the task land in the normal pending queue.
@@ -924,9 +930,15 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         activeMidTurnHandler = undefined;
         // Any buffered tasks that were never injected (e.g. the handler was
         // never registered because the turn failed before client.prompt())
-        // go back to the normal pending queue.
-        for (const leftover of midTurnBuffer.splice(0)) {
-          owner.requeue(leftover);
+        // go back to the normal pending queue — C4 (G3): order-preserving so the
+        // oldest is not starved (the old per-item requeue reversed the batch),
+        // and each stays visible as `queued` until it is accepted.
+        const leftovers = midTurnBuffer.splice(0);
+        if (leftovers.length > 0) {
+          owner.requeueAll(leftovers);
+          for (const leftover of leftovers) {
+            appendDeliveryStreamEvent(options.sessionId, leftover, "queued");
+          }
         }
       }
       // If the advertised pathname disappeared during a turn, restore it only

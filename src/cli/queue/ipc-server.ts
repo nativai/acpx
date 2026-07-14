@@ -4,6 +4,11 @@ import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { normalizeOutputError } from "../../acp/error-normalization.js";
 import { recordPerfDuration } from "../../perf-metrics.js";
 import { textPrompt } from "../../prompt-content.js";
+import {
+  buildDeliveryEvent,
+  type DeliveryEventError,
+  type DeliveryPhase,
+} from "../../session/delivery-events.js";
 import { sessionEventActivePath } from "../../session/event-log.js";
 import type {
   AcpClientOptions,
@@ -126,6 +131,33 @@ function writeQueueMessage(socket: net.Socket, message: QueueOwnerMessage): void
   socket.write(`${JSON.stringify(message)}\n`);
 }
 
+// C4 (G3): append a delivery lifecycle event straight to the session stream, the
+// same fire-and-forget direct-appendFile pattern as the `acpx/received` marker.
+// Used for the `queued` visibility event and the owner-exit `QUEUE_OWNER_SHUTDOWN`
+// terminal — points where no SessionEventWriter is held (the owner may be dying).
+// A task with no messageId has no delivery lifecycle to update, so it is skipped.
+export function appendDeliveryStreamEvent(
+  sessionId: string,
+  task: Pick<QueueTask, "messageId" | "requestId">,
+  phase: DeliveryPhase,
+  error?: DeliveryEventError,
+): void {
+  if (!task.messageId) {
+    return;
+  }
+  const event = buildDeliveryEvent({
+    messageId: task.messageId,
+    requestId: task.requestId,
+    phase,
+    ...(error !== undefined ? { error } : {}),
+  });
+  void appendFile(sessionEventActivePath(sessionId), `${JSON.stringify(event)}\n`, "utf8").catch(
+    () => {
+      // Best effort — the owner may be tearing down; never throw from a marker.
+    },
+  );
+}
+
 export type QueueTask = {
   requestId: string;
   messageId?: string;
@@ -236,6 +268,18 @@ export class SessionQueueOwner {
             },
           ),
         );
+      } else {
+        // C4 (G3): a deliver-now task's socket was already closed on acceptance,
+        // so there is no waiter to notify. Without a terminal it would sit
+        // accepted-forever once the owner dies. Write a retryable
+        // QUEUE_OWNER_SHUTDOWN terminal so acpx-ui's owner-gone re-drive/resend
+        // takes over. This class never reached the model (never accepted), so a
+        // resend is safe — no double-execution concern.
+        appendDeliveryStreamEvent(this.sessionId, task, "failed", {
+          code: 0,
+          message: "Queue owner shut down before the message was accepted",
+          detailCode: "QUEUE_OWNER_SHUTDOWN",
+        });
       }
       task.close();
     }
@@ -355,7 +399,22 @@ export class SessionQueueOwner {
   }
 
   requeue(task: QueueTask): void {
-    this.pending.unshift(task);
+    this.requeueAll([task]);
+  }
+
+  // C4 (G3): requeue a batch of previously-buffered mid-turn tasks WITHOUT
+  // reversing them. The old per-item `unshift` reversed each batch (newest
+  // first) and starved the oldest across successive drain cycles (RCA §3:
+  // a2520124). Prepend the batch as a block, then stable-sort the whole pending
+  // queue by arrival time so cross-batch order is the single invariant.
+  requeueAll(tasks: QueueTask[]): void {
+    if (tasks.length === 0) {
+      return;
+    }
+    this.pending.unshift(...tasks);
+    // Array.prototype.sort is stable (V8), so equal enqueuedAt keeps insertion
+    // order — arrival order becomes the one ordering invariant.
+    this.pending.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
     this.emitQueueDepth();
   }
 
