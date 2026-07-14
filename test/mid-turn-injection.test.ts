@@ -1875,8 +1875,16 @@ test("C3: drain backstop writes an INJECTED_RESPONSE_TIMEOUT terminal for a stil
 
       const mainMessageId = "c3aaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
       const injectedMessageId = "c3bbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-      // injected prompt hangs forever (default onInjectedPrompt).
-      const control = makePathologicalClient({ acpSessionId: record.acpSessionId });
+      // The injected prompt signals when it is actually in flight (deterministic,
+      // load-independent), then hangs forever.
+      const injectedInFlight = createDeferred<void>();
+      const control = makePathologicalClient({
+        acpSessionId: record.acpSessionId,
+        onInjectedPrompt: () => {
+          injectedInFlight.resolve();
+          return new Promise<never>(() => {});
+        },
+      });
 
       let injectedCloses = 0;
       const midTurn = makeMidTurnControl((registration, ctrl) => {
@@ -1916,14 +1924,8 @@ test("C3: drain backstop writes an INJECTED_RESPONSE_TIMEOUT terminal for a stil
       );
 
       await control.mainPromptInFlight;
-      // Let the injection register + fire (client.prompt for the injected task).
-      for (let i = 0; i < 5 && !control.promptCalls.some((c) => c.kind === "injected"); i += 1) {
-        await tick();
-      }
-      assert.ok(
-        control.promptCalls.some((c) => c.kind === "injected"),
-        "injected prompt is in flight before the main turn ends",
-      );
+      // Deterministically wait until the injected prompt is actually in flight.
+      await injectedInFlight.promise;
       // Main turn ends; the injected prompt is left pending → drain backstop fires.
       control.resolveMainPrompt({ stopReason: "end_turn" });
       await withRaceTimeout(run, 3_000, "drain backstop did not finalize the turn");
@@ -1972,9 +1974,13 @@ test("C2: a delivery terminal written after the per-turn writer closed still lan
 
       const injectedMessageId = "c2cccccc-cccc-4ccc-8ccc-cccccccccccc";
       const injectedRelease = createDeferred<{ stopReason: "end_turn" }>();
+      const injectedInFlight = createDeferred<void>();
       const control = makePathologicalClient({
         acpSessionId: record.acpSessionId,
-        onInjectedPrompt: () => injectedRelease.promise as Promise<never>,
+        onInjectedPrompt: () => {
+          injectedInFlight.resolve();
+          return injectedRelease.promise as Promise<never>;
+        },
       });
 
       const midTurn = makeMidTurnControl((registration, ctrl) => {
@@ -2010,13 +2016,8 @@ test("C2: a delivery terminal written after the per-turn writer closed still lan
       });
 
       await control.mainPromptInFlight;
-      for (let i = 0; i < 5 && !control.promptCalls.some((c) => c.kind === "injected"); i += 1) {
-        await tick();
-      }
-      assert.ok(
-        control.promptCalls.some((c) => c.kind === "injected"),
-        "injected prompt in flight",
-      );
+      // Deterministically wait until the injected prompt is actually in flight.
+      await injectedInFlight.promise;
 
       // Main turn ends and finalizes (the fire-and-forget injected is NOT awaited),
       // closing the per-turn event writer.
