@@ -557,10 +557,13 @@ export async function ensureOwnerIsUsable(
   owner: QueueOwnerRecord,
 ): Promise<boolean> {
   const state = await queueOwnerStateFromRecord(sessionId, owner);
-  if (state.state === "healthy" || state.state === "socket_unreachable") {
+  if (state.state === "healthy") {
     return true;
   }
 
+  // A live owner whose advertised socket is missing is not usable for delivery,
+  // but it is also not recoverable here: never signal or reap it. The owner-side
+  // continuity loop repairs the listener at its authoritative idle boundary.
   await cleanupRecoverableQueueOwner(sessionId, owner, state);
   return false;
 }

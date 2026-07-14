@@ -76,6 +76,10 @@ const QUEUE_OWNER_STARTUP_MAX_ATTEMPTS = 120;
 // one must still fail fast (W13-24-14 / RCA §3.5). One spawn + up to two re-spawns.
 const QUEUE_OWNER_MAX_SPAWN_ATTEMPTS = 3;
 const QUEUE_OWNER_HEARTBEAT_INTERVAL_MS = 5_000;
+// The submit transport retries a missing Unix socket for ~2s before surfacing
+// QUEUE_NOT_ACCEPTING_REQUESTS. Check comfortably inside that pre-write budget
+// so an idle owner can restore its listener without replaying the prompt.
+const QUEUE_OWNER_SOCKET_CONTINUITY_INTERVAL_MS = 500;
 
 // Path-1 deploy-staleness signal (W13-24-10). The default deployed-SHA record on
 // every dev-server; `refresh.sh` rewrites `.acpx.sha` here on every deploy.
@@ -298,6 +302,7 @@ async function closeQueueOwnerRuntime(params: {
   lease: QueueOwnerLease;
   owner: SessionQueueOwner | undefined;
   heartbeatTimer: NodeJS.Timeout | undefined;
+  socketContinuityTimer: NodeJS.Timeout | undefined;
   turnController: QueueOwnerTurnController;
   sharedClient: AcpClient;
   sessionId: string;
@@ -305,6 +310,9 @@ async function closeQueueOwnerRuntime(params: {
 }): Promise<void> {
   if (params.heartbeatTimer) {
     clearInterval(params.heartbeatTimer);
+  }
+  if (params.socketContinuityTimer) {
+    clearInterval(params.socketContinuityTimer);
   }
   params.turnController.beginClosing();
   await params.owner?.close();
@@ -447,6 +455,8 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   const midTurnInjectionSupported = supportsMidTurnPromptInjection(sessionRecord.agentCommand);
   let owner: SessionQueueOwner | undefined;
   let heartbeatTimer: NodeJS.Timeout | undefined;
+  let socketContinuityTimer: NodeJS.Timeout | undefined;
+  let socketContinuityCheck: Promise<void> | undefined;
   let idleDrain: { stop: () => Promise<void> } | undefined;
   // Set when a turn auto-failed-over to a new subscription. The shared client is
   // pinned to the OLD CLAUDE_CONFIG_DIR for the owner's lifetime, so we recycle
@@ -536,6 +546,44 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
     }
   };
 
+  const repairOwnerSocketIfQuiescent = async (): Promise<void> => {
+    const currentOwner = owner;
+    const canRepair = () => !turnController.hasActiveTurn() && currentOwner?.queueDepth() === 0;
+    if (!currentOwner || !canRepair()) {
+      return;
+    }
+
+    const repaired = await currentOwner.repairSocketIfMissing(canRepair);
+    if (!repaired) {
+      return;
+    }
+
+    await refreshQueueOwnerLease(lease, { queueDepth: currentOwner.queueDepth() }).catch(() => {
+      // Listener repair succeeded; a heartbeat write failure must not tear it down.
+    });
+    incrementPerfCounter("queue.owner.socket_repaired");
+    process.stderr.write(
+      `[acpx] queue owner restored missing socket for session ${options.sessionId}\n`,
+    );
+  };
+
+  const scheduleSocketContinuityCheck = (): void => {
+    if (socketContinuityCheck) {
+      return;
+    }
+    socketContinuityCheck = repairOwnerSocketIfQuiescent()
+      .catch((error) => {
+        if (options.verbose) {
+          process.stderr.write(
+            `[acpx] queue owner socket continuity check failed: ${formatErrorMessage(error)}\n`,
+          );
+        }
+      })
+      .finally(() => {
+        socketContinuityCheck = undefined;
+      });
+  };
+
   try {
     owner = await SessionQueueOwner.start(
       lease,
@@ -585,6 +633,11 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         // best effort heartbeat
       });
     }, QUEUE_OWNER_HEARTBEAT_INTERVAL_MS);
+    socketContinuityTimer = setInterval(
+      scheduleSocketContinuityCheck,
+      QUEUE_OWNER_SOCKET_CONTINUITY_INTERVAL_MS,
+    );
+    socketContinuityTimer.unref();
 
     // Idle stream drain: captures inter-turn teammate activity (session/update
     // notifications sent by the adapter background reader between prompts).
@@ -876,6 +929,16 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           owner.requeue(leftover);
         }
       }
+      // If the advertised pathname disappeared during a turn, restore it only
+      // after the authoritative local turn state is idle and no queued work
+      // remains. This never cancels, kills, or replays active work.
+      await repairOwnerSocketIfQuiescent().catch((error) => {
+        if (options.verbose) {
+          process.stderr.write(
+            `[acpx] queue owner socket continuity check failed: ${formatErrorMessage(error)}\n`,
+          );
+        }
+      });
       // Restart idle drain to capture teammate activity until next prompt
       idleDrain = await startIdleStreamDrain();
       // W13-24-14 Phase 2 — the owner just became idle: (re)start the
@@ -901,6 +964,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       lease,
       owner,
       heartbeatTimer,
+      socketContinuityTimer,
       turnController,
       sharedClient,
       sessionId: options.sessionId,

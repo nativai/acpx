@@ -230,6 +230,83 @@ test("SessionQueueOwner nextTask without ttl waits until a prompt arrives", asyn
   });
 });
 
+test("SessionQueueOwner coalesces concurrent repairs of an externally unlinked socket", async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+
+  await withTempHome(async () => {
+    const sessionId = "owner-socket-repair";
+    const lease = await tryAcquireQueueOwnerLease(sessionId);
+    assert(lease);
+
+    const owner = await SessionQueueOwner.start(lease, {
+      cancelPrompt: async () => false,
+      closeSession: async () => false,
+      setSessionMode: async () => {
+        // no-op
+      },
+      setSessionModel: async () => {
+        // no-op
+      },
+      setSessionConfigOption: async () =>
+        ({
+          configOptions: [],
+        }) as SetSessionConfigOptionResponse,
+      queryActiveTurn: () => false,
+    });
+
+    try {
+      await fs.unlink(lease.socketPath);
+      await assert.rejects(fs.access(lease.socketPath), { code: "ENOENT" });
+
+      const repairs = await Promise.all([
+        owner.repairSocketIfMissing(),
+        owner.repairSocketIfMissing(),
+        owner.repairSocketIfMissing(),
+      ]);
+      assert.equal(
+        repairs.filter(Boolean).length >= 1,
+        true,
+        "at least one coalesced caller observes the completed repair",
+      );
+      assert.equal((await fs.stat(lease.socketPath)).isSocket(), true);
+
+      const promptSocket = await connectSocket(lease.socketPath);
+      const promptLines = readline.createInterface({ input: promptSocket });
+      const promptIterator = promptLines[Symbol.asyncIterator]();
+      promptSocket.write(
+        `${JSON.stringify({
+          type: "submit_prompt",
+          requestId: "req-after-socket-repair",
+          ownerGeneration: lease.ownerGeneration,
+          messageId: "55555555-5555-4555-8555-555555555555",
+          message: "accepted exactly once",
+          permissionMode: "approve-reads",
+          waitForCompletion: false,
+        })}\n`,
+      );
+
+      const accepted = (await nextJsonLine(promptIterator)) as {
+        type: string;
+        ownerGeneration?: number;
+      };
+      assert.equal(accepted.type, "accepted");
+      assert.equal(accepted.ownerGeneration, lease.ownerGeneration);
+      const task = await owner.nextTask();
+      assert(task);
+      assert.equal(task.requestId, "req-after-socket-repair");
+      assert.equal(task.messageId, "55555555-5555-4555-8555-555555555555");
+      assert.equal(await owner.nextTask(25), undefined, "repair must not duplicate the task");
+      promptLines.close();
+      promptSocket.destroy();
+    } finally {
+      await owner.close();
+      await releaseQueueOwnerLease(lease);
+    }
+  });
+});
+
 test("SessionQueueOwner enqueues fire-and-forget prompts and rejects invalid owner generations", async () => {
   await withTempHome(async () => {
     const sessionId = "owner-prompt-success";

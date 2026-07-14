@@ -1,4 +1,4 @@
-import { appendFile } from "node:fs/promises";
+import { appendFile, stat } from "node:fs/promises";
 import net from "node:net";
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { normalizeOutputError } from "../../acp/error-normalization.js";
@@ -24,6 +24,53 @@ type QueueOwnerSocketLease = {
   socketPath: string;
   ownerGeneration?: number;
 };
+
+async function isSocketPathMissing(socketPath: string): Promise<boolean> {
+  if (process.platform === "win32") {
+    return false;
+  }
+
+  try {
+    await stat(socketPath);
+    return false;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === "ENOENT" || code === "ENOTDIR";
+  }
+}
+
+async function listenOnQueueSocket(server: net.Server, socketPath: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const onListening = () => {
+      server.off("error", onError);
+      resolve();
+    };
+    const onError = (error: Error) => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+
+    server.once("listening", onListening);
+    server.once("error", onError);
+    server.listen(socketPath);
+  });
+}
+
+async function closeQueueSocket(server: net.Server): Promise<void> {
+  if (!server.listening) {
+    return;
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
+}
 
 function makeQueueOwnerError(
   requestId: string,
@@ -124,12 +171,14 @@ export class SessionQueueOwner {
   private readonly server: net.Server;
   private readonly controlHandlers: QueueOwnerControlHandlers;
   private readonly sessionId: string;
+  private readonly socketPath: string;
   private readonly ownerGeneration?: number;
   private readonly maxQueueDepth: number;
   private readonly onQueueDepthChanged?: (queueDepth: number) => void;
   private readonly pending: QueueTask[] = [];
   private readonly waiters: Array<(task: QueueTask | undefined) => void> = [];
   private midTurnHandler?: (task: QueueTask) => boolean;
+  private socketRepair?: Promise<boolean>;
   private closed = false;
 
   private constructor(
@@ -141,6 +190,7 @@ export class SessionQueueOwner {
     this.server = server;
     this.controlHandlers = controlHandlers;
     this.sessionId = lease.sessionId;
+    this.socketPath = lease.socketPath;
     this.ownerGeneration = lease.ownerGeneration;
     this.maxQueueDepth = Math.max(1, Math.round(options.maxQueueDepth));
     this.onQueueDepthChanged = options.onQueueDepthChanged;
@@ -159,20 +209,7 @@ export class SessionQueueOwner {
     });
     ownerRef.current = new SessionQueueOwner(server, controlHandlers, lease, options);
 
-    await new Promise<void>((resolve, reject) => {
-      const onListening = () => {
-        server.off("error", onError);
-        resolve();
-      };
-      const onError = (error: Error) => {
-        server.off("listening", onListening);
-        reject(error);
-      };
-
-      server.once("listening", onListening);
-      server.once("error", onError);
-      server.listen(lease.socketPath);
-    });
+    await listenOnQueueSocket(server, lease.socketPath);
 
     return ownerRef.current;
   }
@@ -204,9 +241,66 @@ export class SessionQueueOwner {
     }
     this.emitQueueDepth();
 
-    await new Promise<void>((resolve) => {
-      this.server.close(() => resolve());
+    await this.socketRepair?.catch(() => {
+      // A failed repair already left the listener unavailable; shutdown still
+      // needs to release the owner lease and adapter process.
     });
+    await closeQueueSocket(this.server);
+  }
+
+  /**
+   * Restore this owner's advertised Unix socket after its pathname was removed.
+   *
+   * The queue-owner runtime calls this only at its authoritative idle/empty
+   * boundary. The existing listener is still alive on an unlinked inode, so it
+   * is closed and re-listened at the same path without changing pid, lease,
+   * owner generation, adapter, or session context. Concurrent continuity checks
+   * share one repair promise and therefore cannot create listener storms.
+   */
+  repairSocketIfMissing(canRepair: () => boolean = () => true): Promise<boolean> {
+    if (this.socketRepair) {
+      return this.socketRepair;
+    }
+
+    const repair = this.probeAndRepairMissingSocket(canRepair);
+    const trackedRepair = repair.finally(() => {
+      if (this.socketRepair === trackedRepair) {
+        this.socketRepair = undefined;
+      }
+    });
+    this.socketRepair = trackedRepair;
+    return trackedRepair;
+  }
+
+  private canRepairSocket(canRepair: () => boolean): boolean {
+    return !this.closed && process.platform !== "win32" && canRepair();
+  }
+
+  private async probeAndRepairMissingSocket(canRepair: () => boolean): Promise<boolean> {
+    if (!this.canRepairSocket(canRepair)) {
+      return false;
+    }
+    if (!(await isSocketPathMissing(this.socketPath))) {
+      return false;
+    }
+    // Re-check the runtime's authoritative quiescence gate after the async stat.
+    // This closes the only TOCTOU window where a turn could start while the
+    // missing-path probe was in flight.
+    if (!this.canRepairSocket(canRepair)) {
+      return false;
+    }
+
+    await closeQueueSocket(this.server);
+    if (this.closed) {
+      return false;
+    }
+
+    await listenOnQueueSocket(this.server, this.socketPath);
+    if (this.closed) {
+      await closeQueueSocket(this.server);
+      return false;
+    }
+    return true;
   }
 
   async nextTask(timeoutMs?: number): Promise<QueueTask | undefined> {
