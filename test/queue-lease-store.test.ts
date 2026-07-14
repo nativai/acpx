@@ -239,6 +239,48 @@ test("ensureOwnerIsUsable never reaps a stale-but-alive owner (W13-24-10 North S
   });
 });
 
+test("ensureOwnerIsUsable reports a live socket-unreachable owner as unusable without reaping it", async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+
+  await withTempHome(async (homeDir) => {
+    const sessionId = "live-owner-missing-socket";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    const processIdentity = keeper.pid
+      ? await readQueueOwnerProcessIdentity(keeper.pid)
+      : undefined;
+
+    try {
+      await writeQueueOwnerLock({
+        lockPath,
+        pid: keeper.pid,
+        sessionId,
+        socketPath,
+        processIdentity,
+      });
+      const owner = await readQueueOwnerRecord(sessionId);
+      assert(owner);
+
+      const before = await readQueueOwnerLiveness(sessionId);
+      assert.equal(before.state, "socket_unreachable");
+      assert.equal(before.pidAlive, true);
+      assert.equal(before.recoverable, false);
+      assert.equal(await ensureOwnerIsUsable(sessionId, owner), false);
+
+      const after = await readQueueOwnerLiveness(sessionId);
+      assert.equal(after.state, "socket_unreachable");
+      assert.equal(after.pid, keeper.pid);
+      assert.equal(isProcessAlive(keeper.pid), true, "usability check must not signal the owner");
+      await fs.access(lockPath);
+    } finally {
+      stopProcess(keeper);
+      await fs.rm(lockPath, { force: true });
+    }
+  });
+});
+
 test("recoverQueueOwnerForSession succeeds idempotently when no owner lease exists", async () => {
   await withTempHome(async () => {
     const result = await recoverQueueOwnerForSession("no-such-owner");
