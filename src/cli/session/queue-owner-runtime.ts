@@ -462,6 +462,22 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   if (bindRecordToDefaultAccount(sessionRecord)) {
     await writeSessionRecordAtBoundary(sessionRecord);
   }
+
+  // #2 Fail-loud identity assertion: the record we're about to serve MUST be the
+  // one whose id matches what the queue-owner was asked for. A mismatch means the
+  // spawned adapter would get the wrong ACPX_SESSION_URL and serve turns under a
+  // stale/parent identity — refuse the turn rather than silently misroute.
+  // This is a no-op on the healthy path (every current code path) since
+  // resolveSessionRecord(id) returns the record with that id.
+  if (sessionRecord.acpxRecordId !== options.sessionId) {
+    process.stderr.write(
+      `[acpx] IDENTITY MISMATCH — queue owner for session ${options.sessionId} resolved a record ` +
+        `with acpxRecordId=${sessionRecord.acpxRecordId}; refusing to serve (would misattribute turns). ` +
+        `This indicates a corrupted or misnamed session record file.\n`,
+    );
+    return;
+  }
+
   // Mid-turn prompt injection (concurrent client.prompt() into an in-flight
   // turn) relies on adapter-specific support for accepting a new prompt while
   // another turn is active. Claude ACP and Codex ACP support that contract;

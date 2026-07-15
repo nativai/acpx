@@ -32,6 +32,7 @@ import { loadPermissionPolicySpec } from "../permission-policy.js";
 import {
   mergePromptSourceWithText,
   parsePromptSource,
+  promptToDisplayText,
   PromptInputValidationError,
   textPrompt,
 } from "../prompt-content.js";
@@ -103,6 +104,7 @@ import {
   warnIfBrickDoesNotResolve,
 } from "./session/brick-link.js";
 import type { SessionListResult } from "./session/contracts.js";
+import { composeForkDivergenceNotice } from "./session/fork-handoff.js";
 import {
   applyBrickFlag,
   withInheritedBrick,
@@ -2062,11 +2064,38 @@ export async function handleSessionsCopy(
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const handoffPrompt = await resolveCopyHandoffPrompt(flags, command, config);
-  const { created } = await runSessionCopy(explicitAgentName, flags, command, config, false);
-  if (!handoffPrompt) {
+  const { created, source } = await runSessionCopy(
+    explicitAgentName,
+    flags,
+    command,
+    config,
+    false,
+  );
+
+  // #3 Fork notice: inject a divergence-handoff as turn 1 for every non-ephemeral
+  // (plain) fork so the forked agent self-identifies and does not act as the source.
+  // Byway (ephemeral) keeps its existing frontend handoff untouched.
+  const forkNotice = !flags.ephemeral
+    ? composeForkDivergenceNotice(created, source.acpxRecordId)
+    : undefined;
+
+  if (!forkNotice && !handoffPrompt) {
     return;
   }
-  await deliverCopyHandoffPrompt(created.acpxRecordId, handoffPrompt, command, config);
+
+  if (!forkNotice) {
+    // Byway / ephemeral path: no notice, deliver handoffPrompt as-is (may include images).
+    await deliverCopyHandoffPrompt(created.acpxRecordId, handoffPrompt!, command, config);
+    return;
+  }
+
+  // Plain fork path: combine notice + any CLI --prompt into a single text block
+  // so the transcript stores one content string the frontend can peel by
+  // FORK_NOTICE_MARKER. promptToDisplayText joins text blocks; image blocks are
+  // ignored (fork handoffs via --prompt don't carry images).
+  const handoffText = handoffPrompt ? promptToDisplayText(handoffPrompt) : "";
+  const deliverText = forkNotice + (handoffText ? handoffText : "");
+  await deliverCopyHandoffPrompt(created.acpxRecordId, textPrompt(deliverText), command, config);
 }
 
 async function resolveCopyHandoffPrompt(
@@ -2118,6 +2147,7 @@ async function deliverCopyHandoffPrompt(
 // Shared core for `sessions copy`/`fork` and `sessions new --from-template`.
 // `requireTemplate` gates the source to acpx-ui-marked templates; everything else
 // (native deep-copy, agent-type lock, cwd/lineage handling, output) is identical.
+// eslint-disable-next-line complexity -- three-tier withInheritedBrick precedence; cannot simplify without losing auditable ordering
 async function runSessionCopy(
   explicitAgentName: string | undefined,
   flags: SessionsCopyFlags,
@@ -2156,15 +2186,25 @@ async function runSessionCopy(
     agentName: source.agentName ?? resolveAgentNameFromCommand(source.agentCommand, config.agents),
     cwd: resolveCopyDestinationCwd(command, globalFlags, source),
     name: flags.name ?? sourceDefaultForkName(source),
+    // #1 metadata.brick carry: precedence = --brick flag > spawn-parent brick
+    // > source.metadata.brick (new) > none; --no-brick/false yields none at all tiers.
+    // task_folder mirrors the same three-tier fallback for consistency.
     metadata: withInheritedBrick(
-      applyBrickFlag(
-        withInheritedTaskFolder(
-          copyMetadata(flags, source, forkAtMessageIndex),
-          parent?.taskFolder,
+      withInheritedTaskFolder(
+        withInheritedBrick(
+          applyBrickFlag(
+            withInheritedTaskFolder(
+              copyMetadata(flags, source, forkAtMessageIndex),
+              parent?.taskFolder, // spawn-parent task_folder (existing)
+            ),
+            resolvedBrick,
+          ),
+          parent?.brick, // spawn-parent brick (existing)
+          resolvedBrick === false,
         ),
-        resolvedBrick,
+        source.metadata?.task_folder, // source task_folder fallback (new)
       ),
-      parent?.brick,
+      source.metadata?.brick, // source brick fallback (new)
       resolvedBrick === false,
     ),
     parentSessionId: parent?.acpxRecordId,
