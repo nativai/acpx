@@ -20,6 +20,7 @@ import type { PromptInput } from "../src/prompt-content.js";
 import type { SessionNotification } from "../src/types.js";
 
 export const CLAUDE_AGENT_COMMAND = "node /opt/claude-agent-acp/dist/index.js";
+export const CODEX_AGENT_COMMAND = "node /opt/codex-acp/dist/index.js";
 export const MAIN_PROMPT_TEXT = "main turn prompt";
 export const INJECTED_PROMPT_TEXT = "injected mid-turn prompt";
 
@@ -72,6 +73,25 @@ export function turnEndMarkerNotification(
   } as unknown as SessionNotification;
 }
 
+/**
+ * The codex-acp end-of-turn marker (493729fc F1): a `session_info_update`
+ * carrying `_meta._codex/lastTurnEndReason` on the update level, emitted by the
+ * adapter's turn/completed handler — constructed exactly as the adapter emits
+ * it so the production tap parses it the same way live.
+ */
+export function codexTurnEndMarkerNotification(
+  acpSessionId: string,
+  reason = "end_turn",
+): SessionNotification {
+  return {
+    sessionId: acpSessionId,
+    update: {
+      sessionUpdate: "session_info_update",
+      _meta: { "_codex/lastTurnEndReason": reason },
+    },
+  } as unknown as SessionNotification;
+}
+
 export type PathologicalControl = {
   client: AcpClient;
   promptCalls: PromptCall[];
@@ -79,6 +99,8 @@ export type PathologicalControl = {
   mainPromptInFlight: Promise<void>;
   /** Push the end-of-turn marker through the captured production tap. */
   emitTurnEndMarker: (reason?: string) => void;
+  /** Push the CODEX end-of-turn marker (493729fc F2) through the same tap. */
+  emitCodexTurnEndMarker: (reason?: string) => void;
   /** Settle the withheld MAIN prompt (models the adapter finally responding). */
   resolveMainPrompt: (response: PromptResponse) => void;
   rejectMainPrompt: (error: unknown) => void;
@@ -115,6 +137,14 @@ export function makePathologicalClient(config: {
   const emitTurnEndMarker = (reason = "end_turn"): void => {
     try {
       handlers.onSessionUpdate?.(turnEndMarkerNotification(config.acpSessionId, reason));
+    } catch {
+      // The real client swallows session-update handler errors (client.ts).
+    }
+  };
+
+  const emitCodexTurnEndMarker = (reason = "end_turn"): void => {
+    try {
+      handlers.onSessionUpdate?.(codexTurnEndMarkerNotification(config.acpSessionId, reason));
     } catch {
       // The real client swallows session-update handler errors (client.ts).
     }
@@ -174,6 +204,7 @@ export function makePathologicalClient(config: {
     promptCalls,
     mainPromptInFlight: mainInFlight.promise,
     emitTurnEndMarker,
+    emitCodexTurnEndMarker,
     resolveMainPrompt: (response) => mainRelease.resolve(response),
     rejectMainPrompt: (error) => mainRelease.reject(error),
     cancelCount: () => cancelCalls,

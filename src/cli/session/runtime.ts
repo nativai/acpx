@@ -9,6 +9,7 @@ import {
   normalizeOutputError,
 } from "../../acp/error-normalization.js";
 import {
+  emitsTurnEndMarker,
   injectionAbsorbsIntoActiveTurn,
   injectionReturnsTerminalResponse,
 } from "../../acp/mid-turn-injection-support.js";
@@ -30,6 +31,10 @@ import {
   failoverEnabledForRecord,
   isSubscriptionLockBlockError,
 } from "../../runtime/engine/failover.js";
+import {
+  registerAbsorbedDeliveries,
+  unregisterAbsorbedDeliveries,
+} from "./absorbed-delivery-registry.js";
 export { InterruptedError, TimeoutError } from "../../async-control.js";
 import { formatPerfMetric, measurePerf, startPerfTimer } from "../../perf-metrics.js";
 import { textPrompt } from "../../prompt-content.js";
@@ -461,28 +466,41 @@ export async function drainInjectedPromptsWithBackstop(
 }
 
 // --- C1: turn-completion watchdog (G1) -------------------------------------
-// The adapter's own end-of-turn marker: the terminal `usage_update` carrying
-// `_meta._claude/lastTurnEndReason` (the same signal acpx-ui reads). It rides on
-// a REAL message and can appear on either the notification-level or the
-// update-level `_meta`. Seeing it proves the SDK turn ended; if the response is
-// then still overdue, the response was withheld (the adapter routing hole, RCA
-// §1.2) and the watchdog recovers — a turn with NO marker never triggers, so
-// genuinely long-running work can never be truncated.
-const CLAUDE_TURN_END_MARKER_META_KEY = "_claude/lastTurnEndReason";
+// The adapter's own end-of-turn marker: for Claude / claude-pty the terminal
+// `usage_update` carrying `_meta._claude/lastTurnEndReason` (the same signal
+// acpx-ui reads); for codex-acp (493729fc F1) the `session_info_update` carrying
+// `_meta._codex/lastTurnEndReason` emitted on `turn/completed`. It rides on a
+// REAL message and can appear on either the notification-level or the
+// update-level `_meta`. Seeing it proves the adapter's turn ended; if the
+// response is then still overdue, the response was withheld (the Claude adapter
+// routing hole, or a codex minted-turn-id regression) and the watchdog recovers
+// — a turn with NO marker never triggers, so genuinely long-running work can
+// never be truncated.
+const TURN_END_MARKER_META_KEYS = [
+  "_claude/lastTurnEndReason",
+  "_codex/lastTurnEndReason",
+] as const;
+
+const TURN_END_MARKER_UPDATE_TYPES = new Set(["usage_update", "session_info_update"]);
 
 function readTurnEndReason(meta: unknown): string | undefined {
   if (!meta || typeof meta !== "object") {
     return undefined;
   }
-  const value = (meta as Record<string, unknown>)[CLAUDE_TURN_END_MARKER_META_KEY];
-  return typeof value === "string" && value.length > 0 ? value : undefined;
+  for (const key of TURN_END_MARKER_META_KEYS) {
+    const value = (meta as Record<string, unknown>)[key];
+    if (typeof value === "string" && value.length > 0) {
+      return value;
+    }
+  }
+  return undefined;
 }
 
 function turnEndReasonFromNotification(notification: SessionNotification): string | undefined {
   const update = (notification as { update?: unknown }).update as
     | Record<string, unknown>
     | undefined;
-  if (!update || update.sessionUpdate !== "usage_update") {
+  if (!update || !TURN_END_MARKER_UPDATE_TYPES.has(update.sessionUpdate as string)) {
     return undefined;
   }
   return (
@@ -1211,22 +1229,28 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   // claude-pty (both terminate); false for Codex (acts on the steer in-turn,
   // returns no terminal) and unknown backends — they stay fire-and-forget.
   const awaitInjectedPrompt = injectionReturnsTerminalResponse(record.agentCommand);
-  // Codex no-wait steers are absorbed into the active turn and never produce a
-  // per-injection JSON-RPC terminal. Track their accepted delivery ids so the
-  // containing turn can close those exact lifecycles when it ends.
-  const completeAbsorbedInjectedNoWait = injectionAbsorbsIntoActiveTurn(record.agentCommand);
+  // Codex steers are absorbed into the active turn and (pre-F1 adapters) never
+  // produce a per-injection JSON-RPC terminal. Track their accepted delivery ids
+  // so the containing turn can close those exact lifecycles when it ends — and
+  // register the live list so the owner-exit path can terminalize entries a
+  // never-settling turn would otherwise leave accepted-forever (493729fc F3).
+  const completeAbsorbedInjected = injectionAbsorbsIntoActiveTurn(record.agentCommand);
   const absorbedInjectedDeliveries: AbsorbedInjectedDelivery[] = [];
+  registerAbsorbedDeliveries(record.acpxRecordId, absorbedInjectedDeliveries);
   let sawAcpMessage = false;
   let eventWriterClosed = false;
   const acceptedDeliveryKeys = new Set<string>();
   const terminalDeliveryKeys = new Set<string>();
-  // C1 turn-completion watchdog. Backend-gated to the same set that returns a
-  // terminal per turn (Claude / claude-pty) — the `_claude/*`-namespaced marker
-  // only exists there. `activeTurnWatchdog` is the per-attempt instance the
+  // C1 turn-completion watchdog. Backend-gated to the set whose adapter emits
+  // an end-of-turn marker: Claude / claude-pty (`_claude/lastTurnEndReason`) and
+  // codex-acp (`_codex/lastTurnEndReason`, 493729fc F2 — bounds the wedged-main
+  // class instead of holding the turn open indefinitely). Arming is
+  // marker-driven, so a deployed codex adapter that predates its marker simply
+  // never triggers it. `activeTurnWatchdog` is the per-attempt instance the
   // production session-update tap feeds; `turnAbandoned` suppresses a tier-2
   // abandoned turn's late continuations; `endMarkerReasonThisTurn` carries the
   // marker's reason for the Q2 stop-reason reconciliation.
-  const turnWatchdogEnabled = awaitInjectedPrompt;
+  const turnWatchdogEnabled = emitsTurnEndMarker(record.agentCommand);
   let activeTurnWatchdog: TurnWatchdog | undefined;
   let turnAbandoned = false;
   let endMarkerReasonThisTurn: string | undefined;
@@ -1336,16 +1360,47 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       if (!delivery.terminalWritten) {
         await appendDeliveryTerminal(delivery.context, phase, params);
         delivery.terminalWritten = true;
+        answerWaitingAbsorbedCaller(delivery, phase, params.error);
       }
       closeAbsorbedInjectedDelivery(delivery);
     }
+  };
+
+  // 493729fc F4: a wait-mode absorbed injection has a caller still blocked on
+  // the IPC socket and the adapter never answered its prompt — respond when the
+  // containing turn settles. The steer content reached the model (steered into
+  // the active turn), so a settled turn is an explicit steer-accepted result,
+  // not an error.
+  const answerWaitingAbsorbedCaller = (
+    delivery: AbsorbedInjectedDelivery,
+    phase: Exclude<DeliveryPhase, "accepted">,
+    error: DeliveryEventError | undefined,
+  ): void => {
+    if (!delivery.task.waitForCompletion) {
+      return;
+    }
+    if (phase === "done") {
+      sendInjectedResultIfWaiting(delivery.task, { stopReason: "end_turn" });
+      return;
+    }
+    sendInjectedErrorIfWaiting(
+      delivery.task,
+      new Error(
+        error?.message ||
+          `containing turn ${phase === "cancelled" ? "was cancelled" : "failed"} before the injected prompt settled`,
+      ),
+    );
   };
 
   const createAbsorbedInjectedDelivery = (
     task: QueueTask,
     context: DeliveryContext | undefined,
   ): AbsorbedInjectedDelivery | undefined => {
-    if (!completeAbsorbedInjectedNoWait || task.waitForCompletion || !context) {
+    // Wait-mode tasks are tracked too (493729fc F4): a codex injection returns
+    // no terminal on pre-F1 adapters even when the caller waits, so its
+    // lifecycle must close with the containing turn like any other absorbed
+    // steer — not hang until the 30-min drain backstop.
+    if (!completeAbsorbedInjected || !context) {
       return undefined;
     }
     const delivery: AbsorbedInjectedDelivery = {
@@ -2026,7 +2081,12 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         // stays fire-and-forget — never pushed, so it can't hold the turn open.
         // The result/error SEND gates above (the --no-wait contract) are
         // unchanged; only this await-tracking gate widens.
-        if (injectedTask.waitForCompletion || awaitInjectedPrompt) {
+        // 493729fc F4: an absorb-backend (codex) injection is NEVER awaited,
+        // even in wait-mode — pre-F1 adapters return no terminal for it, so
+        // awaiting guaranteed a 30-min drain-backstop hit per occurrence. It is
+        // tracked as an absorbed delivery instead; the containing turn's end
+        // (or the owner-exit sweep) closes its lifecycle and answers the caller.
+        if (awaitInjectedPrompt || (injectedTask.waitForCompletion && !completeAbsorbedInjected)) {
           const tracked: TrackedInjectedDelivery = {
             promise: injectedPromise,
             context: deliveryContextFor(injectedTask),
@@ -2346,6 +2406,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     }
     throw annotatedError;
   } finally {
+    unregisterAbsorbedDeliveries(record.acpxRecordId, absorbedInjectedDeliveries);
     if (options.verbose) {
       process.stderr.write(`[acpx] ${formatPerfMetric("prompt.total", stopTotalTimer())}\n`);
     } else {

@@ -33,6 +33,7 @@ import type { AcpClient } from "../src/acp/client.js";
 import { supportsMidTurnPromptInjection } from "../src/acp/mid-turn-injection-support.js";
 import type { QueueTask } from "../src/cli/queue/ipc.js";
 import type { QueueOwnerMessage } from "../src/cli/queue/messages.js";
+import { terminalizeAbsorbedDeliveriesOnOwnerExit } from "../src/cli/session/absorbed-delivery-registry.js";
 import { runQueuedTask } from "../src/cli/session/runtime.js";
 import { type PromptInput, textPrompt } from "../src/prompt-content.js";
 import { listSessionEvents } from "../src/session/events.js";
@@ -40,6 +41,7 @@ import { resolveSessionRecord } from "../src/session/persistence.js";
 import type { SessionRecord } from "../src/types.js";
 import {
   CLAUDE_AGENT_COMMAND,
+  CODEX_AGENT_COMMAND,
   cancelResolvesPrompt,
   makePathologicalClient,
   neverRespondIgnoresCancel,
@@ -2048,6 +2050,298 @@ test("C2: a delivery terminal written after the per-turn writer closed still lan
         injectedMessageId,
       );
       assert.equal(terminals.length, 1, "exactly one terminal for the injected messageId");
+    });
+  });
+});
+
+// --- 493729fc F2/F3/F4: codex delivery-lifecycle hardening -------------------
+// The codex analogues of the C-lane: the adapter's minted-turn-id contract
+// violation (RCA 493729fc §3) wedges a main prompt forever and leaves absorbed
+// steers accepted-without-terminal. F1 (codex-acp) fixes the adapter; these pin
+// the acpx defense layers: the C1 watchdog armed by the codex end-of-turn
+// marker (F2), owner-exit terminals for absorbed deliveries (F3), and wait-mode
+// codex injections that no longer hold the turn open (F4).
+
+// F2 tier-2: a codex main prompt that never responds while the adapter's
+// `_codex/lastTurnEndReason` marker proves the turn ended is bounded at tier 2
+// with the retryable TURN_RESPONSE_TIMEOUT failure — the 8-hour wedge class.
+test("493729fc F2: codex watchdog tier-2 bounds a never-responding main turn via the _codex marker", async () => {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeSessionRecord(homeDir, CODEX_AGENT_COMMAND);
+      await writeSessionRecordFile(homeDir, record);
+
+      const mainMessageId = "f2a11111-1111-4111-8111-111111111111";
+      const control = makePathologicalClient({ acpSessionId: record.acpSessionId });
+      neverRespondIgnoresCancel(control);
+
+      const mainSends: QueueOwnerMessage[] = [];
+      const mainTask = makeQueueTask(
+        "req-f2-codex-tier2",
+        MAIN_PROMPT_TEXT,
+        (message) => mainSends.push(message),
+        () => {},
+        true,
+        mainMessageId,
+      );
+
+      const run = withTurnResponseTimeout(40, () =>
+        runQueuedTask(record.acpxRecordId, mainTask, {
+          sharedClient: control.client,
+          suppressSdkConsoleErrors: true,
+        }),
+      );
+
+      await control.mainPromptInFlight;
+      await tick();
+      control.emitCodexTurnEndMarker("end_turn");
+      await withRaceTimeout(run, 3_000, "tier-2 did not bound the wedged codex turn");
+
+      const errorMessage = mainSends.find((m) => m.type === "error") as
+        | { detailCode?: string; retryable?: boolean }
+        | undefined;
+      assert.ok(errorMessage, "wedged codex turn failed at the tier-2 bound");
+      assert.equal(errorMessage?.detailCode, "TURN_RESPONSE_TIMEOUT");
+      assert.equal(errorMessage?.retryable, true);
+
+      const terminals = terminalsForMessage(
+        await listSessionEvents(record.acpxRecordId),
+        mainMessageId,
+      );
+      assert.equal(terminals.length, 1, "exactly one terminal for the wedged main");
+      assert.equal(terminals[0]?.phase, "failed");
+    });
+  });
+});
+
+// F2 safety: a codex turn with NO marker is never truncated — arming is strictly
+// marker-driven, so a deployed pre-F1 adapter (which emits no marker) can never
+// have live long-running work cut short by the widened gate.
+test("493729fc F2: a codex turn with no end-marker is never truncated", async () => {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeSessionRecord(homeDir, CODEX_AGENT_COMMAND);
+      await writeSessionRecordFile(homeDir, record);
+
+      const control = makePathologicalClient({ acpSessionId: record.acpSessionId });
+
+      const mainSends: QueueOwnerMessage[] = [];
+      const mainTask = makeQueueTask(
+        "req-f2-codex-nomark",
+        MAIN_PROMPT_TEXT,
+        (message) => mainSends.push(message),
+        () => {},
+        true,
+        "f2b22222-2222-4222-8222-222222222222",
+      );
+
+      const run = withTurnResponseTimeout(40, () =>
+        runQueuedTask(record.acpxRecordId, mainTask, {
+          sharedClient: control.client,
+          suppressSdkConsoleErrors: true,
+        }),
+      );
+
+      await control.mainPromptInFlight;
+      await tick();
+      // Well past both tiers (2 x 40ms) with NO marker emitted.
+      await new Promise((resolve) => setTimeout(resolve, 240));
+      assert.equal(
+        mainSends.find((m) => m.type === "error"),
+        undefined,
+      );
+      assert.equal(
+        mainSends.find((m) => m.type === "result"),
+        undefined,
+      );
+
+      control.resolveMainPrompt({ stopReason: "end_turn" });
+      await run;
+      assert.ok(
+        mainSends.find((m) => m.type === "result"),
+        "codex turn completes normally once it responds",
+      );
+    });
+  });
+});
+
+// F4: a WAIT-mode codex injection must not be awaited (pre-F1 adapters return no
+// terminal for it — awaiting guaranteed a 30-min drain-backstop hit). It is
+// tracked as absorbed instead: the containing turn's end closes its delivery
+// (done) and answers the waiting caller with an explicit steer-accepted result.
+test("493729fc F4: codex wait-mode injection is absorbed — turn finalizes promptly, caller answered at turn end", async () => {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeSessionRecord(homeDir, "codex-acp");
+      await writeSessionRecordFile(homeDir, record);
+
+      const injectionInitiated = createDeferred<void>();
+      const mainMessageId = "f4a11111-1111-4111-8111-111111111111";
+      const injectedMessageId = "f4b22222-2222-4222-8222-222222222222";
+
+      const control = makeMockClient({
+        onMainPrompt: async () => {
+          await injectionInitiated.promise;
+          return { stopReason: "end_turn" };
+        },
+        onInjectedPrompt: async () => {
+          injectionInitiated.resolve();
+          // Pre-F1 codex adapter: the injected steer never returns a terminal.
+          return await new Promise<PromptResponse>(() => {});
+        },
+      });
+
+      const injectedSends: QueueOwnerMessage[] = [];
+      let injectedCloses = 0;
+      const midTurn = makeMidTurnControl((registration, ctrl) => {
+        if (registration === 1) {
+          const injectedTask = makeQueueTask(
+            "req-f4-wait-injected",
+            INJECTED_PROMPT_TEXT,
+            (message) => injectedSends.push(message),
+            () => {
+              injectedCloses += 1;
+            },
+            true, // waitForCompletion — the F4 class
+            injectedMessageId,
+          );
+          queueMicrotask(() => {
+            ctrl.currentHandler?.(injectedTask);
+          });
+        }
+      });
+
+      const mainSends: QueueOwnerMessage[] = [];
+      const mainTask = makeQueueTask(
+        "req-f4-main",
+        MAIN_PROMPT_TEXT,
+        (message) => mainSends.push(message),
+        () => {},
+        true,
+        mainMessageId,
+      );
+
+      await Promise.race([
+        runQueuedTask(record.acpxRecordId, mainTask, {
+          sharedClient: control.client,
+          setMidTurnHandler: midTurn.setMidTurnHandler,
+          suppressSdkConsoleErrors: true,
+        }),
+        new Promise<never>((_resolve, reject) => {
+          setTimeout(() => {
+            reject(new Error("codex WAIT-mode steer must not block turn finalization (F4)"));
+          }, 500);
+        }),
+      ]);
+
+      assert.ok(
+        mainSends.find((m) => m.type === "result"),
+        "main turn finalized promptly despite the wait-mode steer never returning a terminal",
+      );
+      // The waiting caller was answered at turn end with an explicit result.
+      const injectedResult = injectedSends.find((m) => m.type === "result");
+      assert.ok(injectedResult, "wait-mode caller received a result at turn end");
+      assert.equal(injectedCloses, 1, "absorbed wait-mode steer closed exactly once");
+
+      const terminals = terminalsForMessage(
+        await listSessionEvents(record.acpxRecordId),
+        injectedMessageId,
+      );
+      assert.equal(terminals.length, 1, "exactly one terminal for the wait-mode steer");
+      assert.equal(terminals[0]?.phase, "done");
+    });
+  });
+});
+
+// F3: the owner-exit sweep writes an outcome-unknown terminal for an absorbed
+// delivery whose containing turn never settled — the accepted-forever class.
+// Registration happens inside the production runSessionPrompt; the sweep is the
+// call the queue-owner close path makes. A later settle must not double-write.
+test("493729fc F3: owner-exit sweep terminalizes still-open absorbed deliveries exactly once", async () => {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeSessionRecord(homeDir, "codex-acp");
+      await writeSessionRecordFile(homeDir, record);
+
+      const injectionInFlight = createDeferred<void>();
+      const mainRelease = createDeferred<PromptResponse>();
+      const mainMessageId = "f3a11111-1111-4111-8111-111111111111";
+      const injectedMessageId = "f3b22222-2222-4222-8222-222222222222";
+
+      const control = makeMockClient({
+        onMainPrompt: async () => await mainRelease.promise,
+        onInjectedPrompt: async () => {
+          injectionInFlight.resolve();
+          return await new Promise<PromptResponse>(() => {});
+        },
+      });
+
+      const midTurn = makeMidTurnControl((registration, ctrl) => {
+        if (registration === 1) {
+          const injectedTask = makeQueueTask(
+            "req-f3-injected",
+            INJECTED_PROMPT_TEXT,
+            () => {},
+            () => {},
+            false,
+            injectedMessageId,
+          );
+          queueMicrotask(() => {
+            ctrl.currentHandler?.(injectedTask);
+          });
+        }
+      });
+
+      const mainTask = makeQueueTask(
+        "req-f3-main",
+        MAIN_PROMPT_TEXT,
+        () => {},
+        () => {},
+        true,
+        mainMessageId,
+      );
+
+      const run = runQueuedTask(record.acpxRecordId, mainTask, {
+        sharedClient: control.client,
+        setMidTurnHandler: midTurn.setMidTurnHandler,
+        suppressSdkConsoleErrors: true,
+      });
+
+      // The steer is absorbed while the main turn is (wedged) in flight.
+      await injectionInFlight.promise;
+      await tick();
+
+      // The owner exits while the turn never settled: the sweep must write the
+      // outcome-unknown terminal for the absorbed delivery.
+      const written = terminalizeAbsorbedDeliveriesOnOwnerExit(record.acpxRecordId);
+      assert.equal(written, 1, "sweep wrote exactly one absorbed terminal");
+      // The write is fire-and-forget; give it a beat to land.
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      const terminals = terminalsForMessage(
+        await listSessionEvents(record.acpxRecordId),
+        injectedMessageId,
+      );
+      assert.equal(terminals.length, 1, "exactly one terminal after the sweep");
+      assert.equal(terminals[0]?.phase, "failed");
+      const error = (await listSessionEvents(record.acpxRecordId))
+        .map((event) => (event as { params?: { error?: { detailCode?: string } } }).params)
+        .find((params) => params?.error?.detailCode === "ABSORBED_TURN_NEVER_ENDED");
+      assert.ok(error, "terminal carries detailCode ABSORBED_TURN_NEVER_ENDED");
+
+      // The turn later settles anyway (e.g. the client teardown rejects it) —
+      // the flag set by the sweep suppresses a duplicate terminal.
+      mainRelease.resolve({ stopReason: "end_turn" });
+      await run;
+      const terminalsAfter = terminalsForMessage(
+        await listSessionEvents(record.acpxRecordId),
+        injectedMessageId,
+      );
+      assert.equal(
+        terminalsAfter.length,
+        1,
+        "no duplicate terminal for the swept absorbed delivery after the turn settles",
+      );
     });
   });
 });

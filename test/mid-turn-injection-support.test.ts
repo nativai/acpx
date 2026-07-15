@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  emitsTurnEndMarker,
   injectionAbsorbsIntoActiveTurn,
   injectionReturnsTerminalResponse,
   supportsMidTurnPromptInjection,
@@ -78,4 +79,24 @@ test("injectionAbsorbsIntoActiveTurn is TRUE only for Codex", () => {
   assert.equal(injectionAbsorbsIntoActiveTurn("node /opt/claude-pty-acp/dist/index.js"), false);
   assert.equal(injectionAbsorbsIntoActiveTurn("node mock-agent.js"), false);
   assert.equal(injectionAbsorbsIntoActiveTurn("node 'unterminated"), false);
+});
+
+// emitsTurnEndMarker gates the C1 turn-completion watchdog (493729fc F2): true
+// for backends whose adapter emits an end-of-turn marker — Claude / claude-pty
+// (`_claude/lastTurnEndReason`) and codex-acp (`_codex/lastTurnEndReason`,
+// since the 493729fc F1 fix). Including codex is safe against older deployed
+// adapters: arming is marker-driven, no marker → no timers.
+test("emitsTurnEndMarker is TRUE for Claude ACP, claude-pty, and Codex ACP", () => {
+  assert.equal(emitsTurnEndMarker("node /opt/claude-agent-acp/dist/index.js"), true);
+  assert.equal(emitsTurnEndMarker("claude-agent-acp"), true);
+  assert.equal(emitsTurnEndMarker("node /opt/claude-pty-acp/dist/index.js"), true);
+  assert.equal(emitsTurnEndMarker("node /opt/codex-acp/dist/index.js"), true);
+  assert.equal(emitsTurnEndMarker("codex-acp"), true);
+  assert.equal(emitsTurnEndMarker("npx -y @agentclientprotocol/codex-acp@^0.0.44"), true);
+});
+
+test("emitsTurnEndMarker is FALSE for unknown backends and malformed commands", () => {
+  assert.equal(emitsTurnEndMarker("gemini --experimental-acp"), false);
+  assert.equal(emitsTurnEndMarker("node ./mock-agent.js --codex-compatible"), false);
+  assert.equal(emitsTurnEndMarker("node 'unterminated"), false);
 });

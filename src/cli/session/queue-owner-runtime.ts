@@ -42,6 +42,7 @@ import {
 } from "../queue/ipc.js";
 import { refreshQueueOwnerLease } from "../queue/lease-store.js";
 import { QueueOwnerTurnController } from "../queue/owner-turn-controller.js";
+import { terminalizeAbsorbedDeliveriesOnOwnerExit } from "./absorbed-delivery-registry.js";
 import { resolveAndEnsureAgentFolder } from "./agent-folder.js";
 import { resolveExistingBrickPath } from "./brick-link.js";
 import {
@@ -316,6 +317,19 @@ async function closeQueueOwnerRuntime(params: {
     clearInterval(params.socketContinuityTimer);
   }
   params.turnController.beginClosing();
+  // 493729fc F3: absorbed injected deliveries (codex steers folded into the
+  // active turn) whose containing turn never settled would otherwise die with
+  // this owner as accepted-forever. Sweep them to an outcome-unknown terminal
+  // BEFORE tearing down the client — the flag flip inside is synchronous, so a
+  // settle path racing the teardown can't double-write. The content may have
+  // reached the model, so the terminal must lead to a manual resend decision,
+  // never an auto-resend.
+  const absorbedTerminals = terminalizeAbsorbedDeliveriesOnOwnerExit(params.sessionId);
+  if (absorbedTerminals > 0) {
+    process.stderr.write(
+      `[acpx] queue owner exit wrote ${absorbedTerminals} ABSORBED_TURN_NEVER_ENDED terminal(s) for session ${params.sessionId}\n`,
+    );
+  }
   await params.owner?.close();
   await params.sharedClient.close().catch(() => {
     // best effort while queue owner is shutting down

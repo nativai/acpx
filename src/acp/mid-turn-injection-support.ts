@@ -43,6 +43,25 @@ export function injectionReturnsTerminalResponse(agentCommand: string): boolean 
   }
 }
 
+// Whether this backend's adapter emits an end-of-turn marker session update
+// (`_claude/lastTurnEndReason` for Claude / claude-pty; `_codex/lastTurnEndReason`
+// for codex-acp since the 493729fc F1 fix) that the C1 turn-completion watchdog
+// can arm on. Safe to include a backend whose DEPLOYED adapter predates its
+// marker: the watchdog only starts timers when a marker is actually seen, so
+// with no marker it never fires and long-running turns are never truncated.
+export function emitsTurnEndMarker(agentCommand: string): boolean {
+  try {
+    const { command, args } = splitCommandLine(agentCommand);
+    return (
+      isClaudeAcpCommand(command, args) ||
+      isClaudePtyAcpCommand(command, args) ||
+      isCodexAcpCommand(command, args)
+    );
+  } catch {
+    return false;
+  }
+}
+
 // Whether a non-waiting injected prompt is known to be absorbed into the
 // already-active turn without producing an independent JSON-RPC terminal. For
 // these backends acpx must complete the delivery lifecycle it opens once the
