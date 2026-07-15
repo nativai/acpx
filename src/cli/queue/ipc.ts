@@ -169,7 +169,7 @@ export { probeQueueOwnerHealth };
 export type { QueueOwnerHealth };
 export type { QueueOwnerMessage, QueueSubmitRequest } from "./messages.js";
 export type { QueueOwnerControlHandlers, QueueTask } from "./ipc-server.js";
-export { SessionQueueOwner } from "./ipc-server.js";
+export { appendDeliveryStreamEvent, SessionQueueOwner } from "./ipc-server.js";
 
 function assertOwnerGeneration(
   owner: QueueOwnerRecord,
