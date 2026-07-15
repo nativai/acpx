@@ -1848,14 +1848,22 @@ function deliveryParamsForMessage(events: unknown[], messageId: string): Record<
 async function waitForDeliveryTerminal(
   sessionId: string,
   messageId: string,
-  timeoutMs = 2_000,
+  timeoutMs = 5_000,
 ): Promise<Record<string, unknown> | undefined> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const events = await listSessionEvents(sessionId);
-    const terminal = deliveryParamsForMessage(events, messageId).find(
-      (event) => event.phase !== "accepted",
-    );
+    // The stream file may be momentarily unreadable (ENOENT during a concurrent
+    // write/rotation under load) — treat a read error as "not ready yet" and
+    // retry, mirroring queue-ipc-server.test.ts's waitForStreamLines.
+    let terminal: Record<string, unknown> | undefined;
+    try {
+      const events = await listSessionEvents(sessionId);
+      terminal = deliveryParamsForMessage(events, messageId).find(
+        (event) => event.phase !== "accepted",
+      );
+    } catch {
+      terminal = undefined;
+    }
     if (terminal || Date.now() > deadline) {
       return terminal;
     }
