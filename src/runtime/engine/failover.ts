@@ -91,9 +91,22 @@ function matchesRateLimitText(message: string): boolean {
   const lower = message.toLowerCase();
   return (
     /\b429\b/u.test(message) ||
-    ["rate limit", "quota exceeded", "usage limit", "session limit"].some((text) =>
-      lower.includes(text),
-    )
+    // Claude subscription-limit family: "You've hit your <session|weekly|monthly|usage> limit",
+    // "You've hit your limit", "monthly spend limit".
+    /\bhit your\b[\s\S]*\blimit\b/u.test(lower) ||
+    [
+      "rate limit",
+      "quota exceeded",
+      "usage limit",
+      "session limit",
+      "weekly limit",
+      "monthly limit",
+      "spend limit",
+      "out of usage",
+      "credit balance",
+      "insufficient credit",
+      "low balance",
+    ].some((text) => lower.includes(text))
   );
 }
 

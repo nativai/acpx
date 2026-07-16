@@ -136,6 +136,28 @@ test("classifyFailover string-match fallback catches raw Claude session limit te
   assert.equal(classifyFailover({ acp: { code: -32603, message, data: {} } }), "rate_limit");
 });
 
+test("classifyFailover string-match catches subscription-limit phrasings with NO errorKind", () => {
+  for (const m of [
+    "Internal error: You've hit your weekly limit · resets 12pm (UTC)",
+    "Internal error: You've hit your monthly spend limit · raise it at claude.ai/settings/usage",
+    "Internal error: You've hit your limit · resets Jul 7, 12pm (UTC)",
+    "The subscription is out of usage",
+    "Your credit balance is too low",
+  ]) {
+    assert.equal(classifyFailover(new Error(m)), "rate_limit", m);
+    assert.equal(
+      classifyFailover({ acp: { code: -32603, message: m, data: {} } }),
+      "rate_limit",
+      m,
+    );
+  }
+});
+
+test("classifyFailover does NOT over-match generic 'limit' text", () => {
+  assert.equal(classifyFailover(new Error("output exceeds the character limit")), null);
+  assert.equal(classifyFailover(new Error("tool call limit reached for this turn")), null);
+});
+
 test("classifyFailover returns null for non-sub errors", () => {
   assert.equal(classifyFailover(acpError({ errorKind: "invalid_request" })), null);
   assert.equal(classifyFailover(acpError({ errorKind: "max_output_tokens" })), null);
