@@ -2449,9 +2449,12 @@ test("raw metadata brick is record-driven for stamp/context; set-metadata valida
     assert.deepEqual(
       calls.filter((call) => call[0] !== "show"),
       [
+        // Create-time render for raw-brick: transient session context (acpxRecordId="") → no --session.
         ["context", BRICK_X, "--format", "inject"],
         ["stamp", BRICK_X, "session-started", "--by", `session:${rawId}`],
-        ["context", BRICK_X, "--format", "inject"],
+        // Prompt-turn render for noBrickId: served by its own owner → renders under its OWN id
+        // (fork-identity fix, brick://1113da9d), never the spawner's ambient $ACPX_SESSION_URL.
+        ["context", BRICK_X, "--session", noBrickId, "--format", "inject"],
       ],
     );
   });

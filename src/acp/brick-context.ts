@@ -10,6 +10,10 @@ const DEFAULT_BRICK_POOL_DIR = "/wisdom/Operating System/Bricks";
 
 type BrickContextOptions = {
   timeoutMs?: number;
+  // The child session's OWN acpx record id. When provided, it is passed to `brick context`
+  // as `--session <id>` so the rendered "Your workspace" line names the child's own agent
+  // folder — never the spawner's, which the queue-owner's ambient $ACPX_SESSION_URL carries.
+  sessionId?: string;
 };
 
 export async function resolveBrickContext(
@@ -20,14 +24,25 @@ export async function resolveBrickContext(
   if (!BRICK_UUID_RE.test(normalized)) {
     return undefined;
   }
-  return await execBrickContext(normalized, options.timeoutMs ?? BRICK_CONTEXT_TIMEOUT_MS);
+  return await execBrickContext(
+    normalized,
+    options.timeoutMs ?? BRICK_CONTEXT_TIMEOUT_MS,
+    options.sessionId,
+  );
 }
 
-function execBrickContext(brickId: string, timeoutMs: number): Promise<string | undefined> {
+function execBrickContext(
+  brickId: string,
+  timeoutMs: number,
+  sessionId?: string,
+): Promise<string | undefined> {
   return new Promise<string | undefined>((resolve) => {
     let child: ReturnType<typeof spawn>;
+    const args = sessionId
+      ? ["context", brickId, "--session", sessionId, "--format", "inject"]
+      : ["context", brickId, "--format", "inject"];
     try {
-      child = spawn("brick", ["context", brickId, "--format", "inject"], {
+      child = spawn("brick", args, {
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
       });
