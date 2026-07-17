@@ -2147,7 +2147,6 @@ async function deliverCopyHandoffPrompt(
 // Shared core for `sessions copy`/`fork` and `sessions new --from-template`.
 // `requireTemplate` gates the source to acpx-ui-marked templates; everything else
 // (native deep-copy, agent-type lock, cwd/lineage handling, output) is identical.
-// eslint-disable-next-line complexity -- three-tier withInheritedBrick precedence; cannot simplify without losing auditable ordering
 async function runSessionCopy(
   explicitAgentName: string | undefined,
   flags: SessionsCopyFlags,
@@ -2186,25 +2185,19 @@ async function runSessionCopy(
     agentName: source.agentName ?? resolveAgentNameFromCommand(source.agentCommand, config.agents),
     cwd: resolveCopyDestinationCwd(command, globalFlags, source),
     name: flags.name ?? sourceDefaultForkName(source),
-    // #1 metadata.brick carry: precedence = --brick flag > spawn-parent brick
-    // > source.metadata.brick (new) > none; --no-brick/false yields none at all tiers.
-    // task_folder mirrors the same three-tier fallback for consistency.
+    // metadata.brick carry: precedence = --brick flag > spawn-parent brick (--parent-id / byway)
+    // > none. A plain fork/copy carries NO brick by default (the 07-15 source.metadata.brick
+    // fallback was reversed, brick://1113da9d) so it does not impersonate the source's brick;
+    // task_folder mirrors the same two-tier precedence.
     metadata: withInheritedBrick(
-      withInheritedTaskFolder(
-        withInheritedBrick(
-          applyBrickFlag(
-            withInheritedTaskFolder(
-              copyMetadata(flags, source, forkAtMessageIndex),
-              parent?.taskFolder, // spawn-parent task_folder (existing)
-            ),
-            resolvedBrick,
-          ),
-          parent?.brick, // spawn-parent brick (existing)
-          resolvedBrick === false,
+      applyBrickFlag(
+        withInheritedTaskFolder(
+          copyMetadata(flags, source, forkAtMessageIndex),
+          parent?.taskFolder, // spawn-parent task_folder (byway via --parent-id) — KEEP
         ),
-        source.metadata?.task_folder, // source task_folder fallback (new)
+        resolvedBrick,
       ),
-      source.metadata?.brick, // source brick fallback (new)
+      parent?.brick, // spawn-parent brick (byway via --parent-id) — KEEP
       resolvedBrick === false,
     ),
     parentSessionId: parent?.acpxRecordId,

@@ -1171,7 +1171,14 @@ export class AcpClient {
 
   private async resolveBrickContext(): Promise<string | undefined> {
     const brick = this.options.sessionContext?.brick?.trim();
-    return brick ? await resolveBrickContext(brick) : undefined;
+    if (!brick) {
+      return undefined;
+    }
+    // Render the brick block from the child's OWN id, not the queue-owner's ambient
+    // $ACPX_SESSION_URL (the spawner's). Omitting the flag when we have no own id (the
+    // transient creation spawn, acpxRecordId="") falls back to env — harmless, serves no turn.
+    const sessionId = this.options.sessionContext?.acpxRecordId?.trim() || undefined;
+    return await resolveBrickContext(brick, { sessionId });
   }
 
   private buildHomeSelectorMeta(): Record<string, unknown> | undefined {

@@ -961,8 +961,10 @@ test("AcpClient load/resume re-supplies fresh brick context on the system-prompt
     assert.deepEqual(
       (await readJsonlIfExists<string[]>(logPath)).filter((call) => call[0] === "context"),
       [
-        ["context", BRICK_ID, "--format", "inject"],
-        ["context", BRICK_ID, "--format", "inject"],
+        // Both load and resume render under the client's OWN acpxRecordId ("child-id"),
+        // not the queue-owner's ambient $ACPX_SESSION_URL (fork-identity fix, brick://1113da9d).
+        ["context", BRICK_ID, "--session", "child-id", "--format", "inject"],
+        ["context", BRICK_ID, "--session", "child-id", "--format", "inject"],
       ],
     );
   } finally {
