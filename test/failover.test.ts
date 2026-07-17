@@ -8,6 +8,7 @@ import {
   maxUtilization,
   pickFailoverTarget,
   type SubscriptionUsage,
+  type SubscriptionUsageWindow,
 } from "../src/config/subscription-usage.js";
 import {
   AllSubscriptionsExhaustedError,
@@ -166,12 +167,24 @@ test("classifyFailover returns null for non-sub errors", () => {
   assert.equal(classifyFailover(undefined), null);
 });
 
-function usage(id: string, util: number, error?: string): SubscriptionUsage {
+function usage(
+  id: string,
+  util: number,
+  error?: string,
+  opts?: {
+    sevenDayReset?: string;
+    fiveHour?: SubscriptionUsageWindow | null;
+    sevenDay?: SubscriptionUsageWindow | null;
+  },
+): SubscriptionUsage {
   return {
     id,
     label: id,
-    fiveHour: { utilization: util, reset: null },
-    sevenDay: { utilization: util / 2, reset: null },
+    fiveHour: opts?.fiveHour !== undefined ? opts.fiveHour : { utilization: util, reset: null },
+    sevenDay:
+      opts?.sevenDay !== undefined
+        ? opts.sevenDay
+        : { utilization: util / 2, reset: opts?.sevenDayReset ?? null },
     ...(error ? { error } : {}),
   };
 }
@@ -188,11 +201,31 @@ test("maxUtilization picks the higher of the two windows", () => {
   );
 });
 
-test("pickFailoverTarget chooses lowest max-utilization (most headroom)", () => {
-  const target = pickFailoverTarget([usage("a", 0.8), usage("b", 0.1), usage("c", 0.4)], {
-    exclude: new Set(),
+test("pickFailoverTarget picks the soonest 7d reset among eligible subs", () => {
+  // Worked example from the brief (threshold 0.98):
+  //   A: 5h=0.5, 7d=0.9, reset=2026-07-17T00:00:00Z
+  //   B: 5h=0.99 → INELIGIBLE (5h maxed)
+  //   C: 5h=0.3, 7d=0.4, reset=2026-07-18T00:00:00Z
+  //   D: 5h=0.7, 7d=0.2, reset=2026-07-16T18:00:00Z  ← soonest reset wins
+  const a = usage("a", 0, undefined, {
+    fiveHour: { utilization: 0.5, reset: null },
+    sevenDay: { utilization: 0.9, reset: "2026-07-17T00:00:00Z" },
   });
-  assert.equal(target?.id, "b");
+  const b = usage("b", 0, undefined, {
+    fiveHour: { utilization: 0.99, reset: null },
+    sevenDay: { utilization: 0.1, reset: "2026-07-16T12:00:00Z" },
+  });
+  const c = usage("c", 0, undefined, {
+    fiveHour: { utilization: 0.3, reset: null },
+    sevenDay: { utilization: 0.4, reset: "2026-07-18T00:00:00Z" },
+  });
+  const d = usage("d", 0, undefined, {
+    fiveHour: { utilization: 0.7, reset: null },
+    sevenDay: { utilization: 0.2, reset: "2026-07-16T18:00:00Z" },
+  });
+  const target = pickFailoverTarget([a, b, c, d], { exclude: new Set(), threshold: 0.98 });
+  // D has the soonest reset (07-16 18:00) despite not having the most 5h headroom
+  assert.equal(target?.id, "d");
 });
 
 test("pickFailoverTarget excludes tried subs", () => {
@@ -232,11 +265,113 @@ test("pickFailoverTarget returns undefined when nothing qualifies (exhausted)", 
   assert.equal(target, undefined);
 });
 
-test("pickFailoverTarget breaks ties by input (registry) order", () => {
+test("pickFailoverTarget breaks ties by input (registry) order when 7d-reset and headroom are equal", () => {
+  // Both have the same 7d reset (null → +Infinity) and same 7d utilization;
+  // tertiary tiebreak is registry order — "first" (index 0) wins.
   const target = pickFailoverTarget([usage("first", 0.2), usage("second", 0.2)], {
     exclude: new Set(),
   });
   assert.equal(target?.id, "first");
+});
+
+// ── Regression matrix: 5h eligibility gate ────────────────────────────────
+
+test("pickFailoverTarget: 5h-maxed sub is excluded even if its 7d reset is soonest", () => {
+  const maxed5h = usage("maxed-5h", 0, undefined, {
+    fiveHour: { utilization: 0.99, reset: null },
+    sevenDay: { utilization: 0.0, reset: "2026-07-16T00:00:00Z" }, // soonest reset
+  });
+  const eligible = usage("eligible", 0, undefined, {
+    fiveHour: { utilization: 0.5, reset: null },
+    sevenDay: { utilization: 0.5, reset: "2026-07-20T00:00:00Z" },
+  });
+  const target = pickFailoverTarget([maxed5h, eligible], { exclude: new Set(), threshold: 0.98 });
+  assert.equal(target?.id, "eligible");
+});
+
+test("pickFailoverTarget: sub with fiveHour === null is excluded (5h header absent)", () => {
+  const noFiveHour = usage("no-5h", 0, undefined, { fiveHour: null });
+  const eligible = usage("eligible", 0.3);
+  const target = pickFailoverTarget([noFiveHour, eligible], {
+    exclude: new Set(),
+    threshold: 0.98,
+  });
+  assert.equal(target?.id, "eligible");
+});
+
+test("pickFailoverTarget: high 7d utilization alone does NOT exclude a sub", () => {
+  // 7d utilization at 0.95 but 5h utilization fine — still eligible
+  const highSevenDay = usage("high-7d", 0, undefined, {
+    fiveHour: { utilization: 0.4, reset: null },
+    sevenDay: { utilization: 0.95, reset: null },
+  });
+  const target = pickFailoverTarget([highSevenDay], { exclude: new Set(), threshold: 0.98 });
+  assert.equal(target?.id, "high-7d");
+});
+
+// ── Regression matrix: soonest-7d-reset ordering ──────────────────────────
+
+test("pickFailoverTarget: soonest 7d reset wins even when that sub lacks most 5h headroom", () => {
+  // soonest-reset sub (D) has less 5h headroom than others — reset is still primary
+  const c = usage("c", 0, undefined, {
+    fiveHour: { utilization: 0.3, reset: null },
+    sevenDay: { utilization: 0.4, reset: "2026-07-18T00:00:00Z" },
+  });
+  const d = usage("d", 0, undefined, {
+    fiveHour: { utilization: 0.7, reset: null }, // less 5h headroom than c
+    sevenDay: { utilization: 0.2, reset: "2026-07-16T18:00:00Z" }, // soonest
+  });
+  const a = usage("a", 0, undefined, {
+    fiveHour: { utilization: 0.5, reset: null },
+    sevenDay: { utilization: 0.9, reset: "2026-07-17T00:00:00Z" },
+  });
+  const target = pickFailoverTarget([a, c, d], { exclude: new Set(), threshold: 0.98 });
+  assert.equal(target?.id, "d");
+});
+
+// ── Regression matrix: tiebreaks ──────────────────────────────────────────
+
+test("pickFailoverTarget: equal 7d resets → lower 7d utilization wins", () => {
+  const sameReset = "2026-07-17T00:00:00Z";
+  const hi = usage("hi-util", 0, undefined, {
+    fiveHour: { utilization: 0.3, reset: null },
+    sevenDay: { utilization: 0.8, reset: sameReset },
+  });
+  const lo = usage("lo-util", 0, undefined, {
+    fiveHour: { utilization: 0.3, reset: null },
+    sevenDay: { utilization: 0.2, reset: sameReset },
+  });
+  const target = pickFailoverTarget([hi, lo], { exclude: new Set(), threshold: 0.98 });
+  assert.equal(target?.id, "lo-util");
+});
+
+test("pickFailoverTarget: sevenDay.reset === null sorts after any known reset", () => {
+  const knownReset = usage("known", 0, undefined, {
+    fiveHour: { utilization: 0.3, reset: null },
+    sevenDay: { utilization: 0.1, reset: "2026-07-20T00:00:00Z" },
+  });
+  const nullReset = usage("null-reset", 0, undefined, {
+    fiveHour: { utilization: 0.3, reset: null },
+    sevenDay: { utilization: 0.1, reset: null }, // no known reset → +Infinity
+  });
+  const target = pickFailoverTarget([nullReset, knownReset], {
+    exclude: new Set(),
+    threshold: 0.98,
+  });
+  assert.equal(target?.id, "known");
+});
+
+// ── Regression matrix: no eligible → undefined ────────────────────────────
+
+test("pickFailoverTarget: all 5h-maxed/errored/locked → undefined", () => {
+  const all = [
+    usage("maxed", 0, undefined, { fiveHour: { utilization: 0.99, reset: null } }),
+    usage("errored", 0.1, "probe fail"),
+    { ...usage("locked", 0.1), locked: true as const },
+    usage("no-5h", 0.1, undefined, { fiveHour: null }),
+  ];
+  const target = pickFailoverTarget(all, { exclude: new Set(), threshold: 0.98 });
+  assert.equal(target, undefined);
 });
 
 test("maxedThreshold defaults to 0.98 and honors the env override", () => {

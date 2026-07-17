@@ -197,11 +197,61 @@ export function maxedThreshold(): number {
   return parsed;
 }
 
+type IndexedUsage = { usage: SubscriptionUsage; index: number };
+
+function isEligibleForFailover(
+  usage: SubscriptionUsage,
+  exclude: ReadonlySet<string>,
+  threshold: number,
+): boolean {
+  if (exclude.has(usage.id)) {
+    return false;
+  }
+  if (usage.locked === true) {
+    return false;
+  }
+  if (usage.error !== undefined) {
+    return false;
+  }
+  // fiveHour === null means the 5h header was absent on a non-errored probe;
+  // treat as ineligible — we cannot confirm the 5h headroom requirement is met.
+  if (usage.fiveHour === null) {
+    return false;
+  }
+  return usage.fiveHour.utilization < threshold;
+}
+
+function sevenDayResetKey(usage: SubscriptionUsage): number {
+  const raw = Date.parse(usage.sevenDay?.reset ?? "");
+  return Number.isNaN(raw) ? Number.POSITIVE_INFINITY : raw;
+}
+
+function compareFailoverCandidates(a: IndexedUsage, b: IndexedUsage): number {
+  const resetDiff = sevenDayResetKey(a.usage) - sevenDayResetKey(b.usage);
+  if (resetDiff !== 0) {
+    return resetDiff;
+  }
+  const utilA = a.usage.sevenDay?.utilization ?? maxUtilization(a.usage);
+  const utilB = b.usage.sevenDay?.utilization ?? maxUtilization(b.usage);
+  if (utilA !== utilB) {
+    return utilA - utilB;
+  }
+  return a.index - b.index;
+}
+
 /**
- * Pick the best failover target from a set of probed usages: exclude already-
- * tried subs, any with a probe error (401/probe-fail), and any at/above the
- * maxed threshold; among the rest pick the lowest max-utilization (most
- * headroom). Ties resolve to input order (callers pass registry order).
+ * Pick the best failover target from a set of probed usages.
+ *
+ * Eligibility gate (all must hold):
+ *   - not in `options.exclude`, not user-locked, no probe error
+ *   - has 5h headroom: fiveHour !== null && fiveHour.utilization < threshold
+ *     (fiveHour === null = header absent on non-errored probe → conservatively ineligible)
+ *
+ * Selection order among eligible (deterministic; picks the first):
+ *   1. Soonest sevenDay.reset (null/unparseable → +Infinity, sorted last)
+ *   2. Lower sevenDay.utilization (or maxUtilization(u) when sevenDay is null)
+ *   3. Input (registry) order — index ascending
+ *
  * Returns undefined when nothing qualifies (→ all-subscriptions-exhausted).
  */
 export function pickFailoverTarget(
@@ -209,26 +259,11 @@ export function pickFailoverTarget(
   options: { exclude: ReadonlySet<string>; threshold?: number },
 ): SubscriptionUsage | undefined {
   const threshold = options.threshold ?? maxedThreshold();
-  let best: SubscriptionUsage | undefined;
-  let bestUtil = Number.POSITIVE_INFINITY;
-  for (const usage of usages) {
-    if (options.exclude.has(usage.id)) {
-      continue;
-    }
-    if (usage.locked === true) {
-      continue;
-    }
-    if (usage.error !== undefined) {
-      continue;
-    }
-    const util = maxUtilization(usage);
-    if (util >= threshold) {
-      continue;
-    }
-    if (util < bestUtil) {
-      best = usage;
-      bestUtil = util;
-    }
+  const eligible = usages
+    .map((usage, index) => ({ usage, index }))
+    .filter(({ usage }) => isEligibleForFailover(usage, options.exclude, threshold));
+  if (eligible.length === 0) {
+    return undefined;
   }
-  return best;
+  return eligible.toSorted(compareFailoverCandidates)[0].usage;
 }
