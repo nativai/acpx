@@ -1218,6 +1218,62 @@ test("runQueuedTask emits active before prompt execution and idle after completi
   });
 });
 
+test("runQueuedTask emits subscription and effort in acpx/turn params", async () => {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeSessionRecordFixture(
+        {
+          acpxRecordId: "turn-attribution-test",
+          acpSessionId: "turn-attribution-session",
+          agentCommand: "node mock-agent.js",
+          cwd: homeDir,
+          acpx: {
+            session_options: { profile: "sub2" },
+            desired_config_options: { effort: "high" },
+          },
+        },
+        { defaultName: false },
+      );
+      await writeSessionRecordFile(homeDir, record);
+
+      let activeSeenInsidePrompt = false;
+      const control = makeMockClient({
+        onMainPrompt: async () => {
+          const events = await listSessionEvents(record.acpxRecordId);
+          const activeEvent = events.find((event) => eventMethod(event) === "acpx/turn");
+          const turnParams = eventParams(activeEvent);
+          assert.equal(turnParams.subscription, "sub2");
+          assert.equal(turnParams.effort, "high");
+          activeSeenInsidePrompt = true;
+          return { stopReason: "end_turn" };
+        },
+        onInjectedPrompt: async () => ({ stopReason: "end_turn" }),
+      });
+
+      const mainTask = makeQueueTask(
+        "req-turn-attribution",
+        MAIN_PROMPT_TEXT,
+        () => {},
+        () => {},
+      );
+
+      await runQueuedTask(record.acpxRecordId, mainTask, {
+        sharedClient: control.client,
+        suppressSdkConsoleErrors: true,
+      });
+
+      assert.equal(activeSeenInsidePrompt, true);
+
+      const events = await listSessionEvents(record.acpxRecordId);
+      const idleParams = eventParams(
+        events.findLast((event) => eventMethod(event) === "acpx/turn"),
+      );
+      assert.equal(idleParams.subscription, "sub2");
+      assert.equal(idleParams.effort, "high");
+    });
+  });
+});
+
 test("idle marker waits for pending mid-turn injected prompt drain", async () => {
   await withNoUnhandledRejections(async () => {
     await withTempHome(async (homeDir) => {
