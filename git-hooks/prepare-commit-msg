@@ -1,0 +1,69 @@
+#!/bin/sh
+# acpx prepare-commit-msg hook — automatic commit attribution (brick fc36b374).
+#
+# Activated ONLY for acpx-spawned agent processes, via an env-scoped
+# core.hooksPath (GIT_CONFIG_* set in acpx's buildAgentEnvironment). Humans and
+# non-agent git never reach this hook. It appends two trailers:
+#   Session: <acpx-ui session URL>   — always (when ACPX_SESSION_URL is set)
+#   Message: <user-prompt turn K>    — only when a Claude transcript is locatable
+# It is idempotent (safe on amend/rebase) and must NEVER fail a commit: any error
+# in the optional Message computation is swallowed and the hook still exits 0.
+#
+# $1 = path to the commit message file; $2 = message source (message/template/...).
+
+MSG_FILE="${1:-}"
+
+# Env gate (defense in depth): only agent processes carry ACPX_SESSION_URL. A
+# stray core.hooksPath in a human's env must be a no-op.
+[ -n "${ACPX_SESSION_URL:-}" ] || exit 0
+[ -n "$MSG_FILE" ] && [ -f "$MSG_FILE" ] || exit 0
+
+# --- Session: trailer (idempotent) ---
+if ! grep -q '^Session:' "$MSG_FILE" 2>/dev/null; then
+  if ! git interpret-trailers --trailer "Session: $ACPX_SESSION_URL" --in-place "$MSG_FILE" 2>/dev/null; then
+    # Plain-append fallback with a preceding blank line to separate the trailer block.
+    printf '\nSession: %s\n' "$ACPX_SESSION_URL" >>"$MSG_FILE"
+  fi
+fi
+
+# --- Message: trailer (best-effort; never fails the commit) ---
+add_message_line() {
+  # Needs the Claude harness session id + config dir + jq to locate and parse the
+  # transcript. Absent for codex/pty/non-Claude agents → the Message line degrades
+  # away and only Session: remains.
+  [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] || return 0
+  [ -n "${CLAUDE_CONFIG_DIR:-}" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  # Idempotent: never add a second Message: line.
+  grep -q '^Message:' "$MSG_FILE" 2>/dev/null && return 0
+
+  TX=$(find "$CLAUDE_CONFIG_DIR/projects" -name "$CLAUDE_CODE_SESSION_ID.jsonl" 2>/dev/null | head -1)
+  [ -n "$TX" ] && [ -f "$TX" ] || return 0
+
+  # Count genuine user-prompt turns (matches acpx-ui's resolveClaudeUuidForAcpxIndex
+  # filter): real user messages, excluding meta/sidechain/compact-summary rows,
+  # tool_result carrier messages, and slash-command echoes. Includes the in-progress
+  # turn → K = "this commit happened during the Kth prompt/turn."
+  K=$(jq -s '[ .[]
+    | select(.type=="user" and .uuid!=null and (.isMeta!=true) and (.isSidechain!=true) and (.isCompactSummary!=true))
+    | select( (.message.content|type) as $t
+        | if $t=="array" then ([.message.content[]|select(.type=="tool_result")]|length==0)
+          elif $t=="string" then (.message.content|test("^<(command-name|local-command-stdout|local-command-stderr|command-message)>")|not)
+          else true end )
+  ] | length' "$TX" 2>/dev/null)
+
+  # Must be a positive integer, else skip silently.
+  case "$K" in
+    '' | *[!0-9]*) return 0 ;;
+  esac
+  [ "$K" -gt 0 ] 2>/dev/null || return 0
+
+  if ! git interpret-trailers --trailer "Message: $K" --in-place "$MSG_FILE" 2>/dev/null; then
+    printf 'Message: %s\n' "$K" >>"$MSG_FILE"
+  fi
+}
+
+add_message_line 2>/dev/null
+
+exit 0

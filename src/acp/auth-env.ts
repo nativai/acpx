@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve as resolvePath } from "node:path";
+import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   hasKnownDeadAccounts,
   hasKnownDeadSubs,
@@ -232,6 +233,76 @@ export function resolveAcpxUiBaseUrl(env: NodeJS.ProcessEnv): string {
   return base.replace(/\/+$/, "");
 }
 
+/**
+ * Absolute path to the acpx-shipped git hooks directory (repo-root `git-hooks/`),
+ * resolved relative to the bundled dist entry (dist/cli.js → ../git-hooks). The
+ * deployed acpx is a full git checkout, so the committed hook is present on disk.
+ * Returns undefined if resolution somehow yields a non-absolute path (guarded so
+ * we never activate core.hooksPath with a half-formed value).
+ */
+export function resolveAcpxHooksDir(): string | undefined {
+  try {
+    const dir = resolvePath(dirname(fileURLToPath(import.meta.url)), "..", "git-hooks");
+    return isAbsolute(dir) ? dir : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Append one git config override via the additive GIT_CONFIG_COUNT/KEY_n/VALUE_n
+ * env protocol (git ≥ 2.31), never clobbering a pre-existing count. This is the
+ * `-c key=value`-style path — unlike GIT_CONFIG_GLOBAL it preserves the user's
+ * global config (e.g. the `url.insteadOf` GitHub-token rewrite).
+ */
+function appendGitConfigEnv(env: NodeJS.ProcessEnv, key: string, value: string): void {
+  const parsed = Number.parseInt(env.GIT_CONFIG_COUNT ?? "", 10);
+  const count = Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
+  env[`GIT_CONFIG_KEY_${count}`] = key;
+  env[`GIT_CONFIG_VALUE_${count}`] = value;
+  env.GIT_CONFIG_COUNT = String(count + 1);
+}
+
+/**
+ * Automatic commit attribution (brick fc36b374): make every git commit an
+ * acpx-spawned agent authors carry the agent identity as the git author/committer,
+ * and activate the shipped prepare-commit-msg hook (which appends `Session:` /
+ * `Message:` trailers) via env-scoped core.hooksPath. Gated on a resolvable acpx
+ * record id; no-op-safe — if any input is missing we skip that piece rather than
+ * emit a half-formed value. Scope is exactly "processes acpx spawned": humans and
+ * non-agent git are untouched (no global config, no repo .git/hooks change).
+ */
+function applyGitCommitAttribution(
+  env: NodeJS.ProcessEnv,
+  sessionContext: AgentSessionContext,
+  baseUrl: string,
+): void {
+  const recordId = sessionContext.acpxRecordId?.trim();
+  if (!recordId) {
+    return;
+  }
+  let host: string;
+  try {
+    host = new URL(baseUrl).host;
+  } catch {
+    return;
+  }
+  if (!host) {
+    return;
+  }
+  const email = `${recordId}@${host}`;
+  const name =
+    nonEmptyEnvString(sessionContext.sessionName ?? undefined) ?? `acpx:${recordId.slice(0, 8)}`;
+  env.GIT_AUTHOR_NAME = name;
+  env.GIT_AUTHOR_EMAIL = email;
+  env.GIT_COMMITTER_NAME = name;
+  env.GIT_COMMITTER_EMAIL = email;
+  const hooksDir = resolveAcpxHooksDir();
+  if (hooksDir) {
+    appendGitConfigEnv(env, "core.hooksPath", hooksDir);
+  }
+}
+
 export type AgentSessionContext = {
   acpxRecordId: string;
   sessionName?: string | null;
@@ -334,6 +405,9 @@ function buildAgentEnvironment(
     if (trimmedAgentFolder.length > 0) {
       env.ACPX_AGENT_FOLDER = trimmedAgentFolder;
     }
+  }
+  if (sessionContext) {
+    applyGitCommitAttribution(env, sessionContext, baseUrl);
   }
   // When a profileId is set the async applyProfileAuth path (called from
   // client.ts after this synchronous env build) handles all auth env setup.
