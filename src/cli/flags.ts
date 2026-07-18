@@ -424,7 +424,8 @@ export function addGlobalFlags(command: Command): Command {
     )
     .option(
       "--subscription <id>",
-      "Claude subscription id from the subscriptions registry (sets CLAUDE_CONFIG_DIR per session)",
+      "Claude subscription id from the subscriptions registry (sets CLAUDE_CONFIG_DIR per session); " +
+        "pass 'auto' to let acpx pick the best-available unlocked subscription",
     )
     .option(
       "--profile <id>",

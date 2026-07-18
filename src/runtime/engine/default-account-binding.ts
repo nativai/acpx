@@ -18,6 +18,7 @@ import {
 } from "../../config/subscriptions.js";
 import { AllSubscriptionsLockedError } from "../../errors.js";
 import type { SessionRecord } from "../../types.js";
+import { isAutoSubscriptionSentinel, resolveAutoSubscription } from "./auto-subscription.js";
 import {
   persistSessionOptions,
   sessionOptionsFromRecord,
@@ -31,8 +32,51 @@ function nonEmpty(value: string | null | undefined): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
+// A concrete account is a profile or subscription id that is NOT the `auto`
+// sentinel. `auto` is deliberately non-concrete: it must be resolved to a real
+// id (or stripped) before it reaches env building, never treated as a literal
+// selection (which would fail the registry lookup and block the spawn). The CLI
+// folds `--subscription` into the unified `profile` slot, so `auto` normally
+// arrives there; the `subscription` slot is checked too for robustness.
 function hasConcreteAccount(options: SessionAgentOptions | undefined): boolean {
-  return nonEmpty(options?.profile) !== undefined || nonEmpty(options?.subscription) !== undefined;
+  const profile = nonEmpty(options?.profile);
+  if (profile !== undefined && !isAutoSubscriptionSentinel(profile)) {
+    return true;
+  }
+  const subscription = nonEmpty(options?.subscription);
+  return subscription !== undefined && !isAutoSubscriptionSentinel(subscription);
+}
+
+// Drop a literal `auto` sentinel from either selection slot so it can never be
+// persisted, resumed, or passed downstream as a concrete id. Returns the input
+// unchanged (same reference) when there is nothing to strip.
+function withoutAutoSelection(
+  options: SessionAgentOptions | undefined,
+): SessionAgentOptions | undefined {
+  if (options === undefined) {
+    return options;
+  }
+  const profileAuto = isAutoSubscriptionSentinel(options.profile);
+  const subscriptionAuto = isAutoSubscriptionSentinel(options.subscription);
+  if (!profileAuto && !subscriptionAuto) {
+    return options;
+  }
+  const next = { ...options };
+  if (profileAuto) {
+    delete next.profile;
+  }
+  if (subscriptionAuto) {
+    delete next.subscription;
+  }
+  return next;
+}
+
+// True when either selection slot carries the `auto` sentinel.
+function wantsAutoSelection(options: SessionAgentOptions | undefined): boolean {
+  return (
+    isAutoSubscriptionSentinel(options?.profile) ||
+    isAutoSubscriptionSentinel(options?.subscription)
+  );
 }
 
 function adapterForAgentCommand(agentCommand: string): AdapterId | undefined {
@@ -164,28 +208,69 @@ export function bindDefaultAccountToSessionOptions(
   agentCommand: string,
   lookupOptions?: SubscriptionLookupOptions,
 ): SessionAgentOptions | undefined {
-  if (hasConcreteAccount(options)) {
-    return options;
+  const base = withoutAutoSelection(options);
+  if (hasConcreteAccount(base)) {
+    return base;
   }
   const binding = defaultAccountBindingForAgent(agentCommand, lookupOptions);
   if (!binding) {
-    return options;
+    return base;
   }
-  return { ...options, ...binding };
+  return { ...base, ...binding };
+}
+
+/**
+ * Async binding for the creation seam: resolves `--subscription auto` to a
+ * concrete id (snapshot-once), then delegates to the synchronous default
+ * binding. Every other input keeps the exact synchronous behavior.
+ *
+ * The resolved id is written to the unified `profile` slot — byte-identical to a
+ * manual `--subscription <id>`, which the CLI also folds into that slot (a
+ * subscription id is always a profile in the normalized registry). A concrete
+ * `--profile` always wins (the CLI drops `auto` during unification), so `auto`
+ * only reaches here when no concrete selection was given.
+ */
+export async function bindDefaultAccountToSessionOptionsAsync(
+  options: SessionAgentOptions | undefined,
+  agentCommand: string,
+  lookupOptions?: SubscriptionLookupOptions,
+): Promise<SessionAgentOptions | undefined> {
+  if (!wantsAutoSelection(options)) {
+    return bindDefaultAccountToSessionOptions(options, agentCommand, lookupOptions);
+  }
+  const stripped = withoutAutoSelection(options);
+  const pickedId = await resolveAutoSubscription(agentCommand, lookupOptions);
+  if (pickedId) {
+    return { ...stripped, profile: pickedId };
+  }
+  return bindDefaultAccountToSessionOptions(stripped, agentCommand, lookupOptions);
 }
 
 export function bindRecordToDefaultAccount(
   record: SessionRecord,
   lookupOptions?: SubscriptionLookupOptions,
 ): boolean {
-  const current = sessionOptionsFromRecord(record);
+  const original = sessionOptionsFromRecord(record);
+  // Defense in depth: a record must never carry a literal `auto` (creation
+  // resolves it before persist). If one somehow does, strip it and bind the
+  // default here — never re-pick auto (resume must not re-select a subscription).
+  const hadAuto = wantsAutoSelection(original);
+  const current = withoutAutoSelection(original);
   if (hasConcreteAccount(current)) {
+    if (hadAuto) {
+      persistSessionOptions(record, current);
+      return true;
+    }
     return false;
   }
   const binding = defaultAccountBindingForAgent(record.agentCommand, lookupOptions);
-  if (!binding) {
-    return false;
+  if (binding) {
+    persistSessionOptions(record, { ...current, ...binding });
+    return true;
   }
-  persistSessionOptions(record, { ...current, ...binding });
-  return true;
+  if (hadAuto) {
+    persistSessionOptions(record, current);
+    return true;
+  }
+  return false;
 }

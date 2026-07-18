@@ -267,3 +267,20 @@ export function pickFailoverTarget(
   }
   return eligible.toSorted(compareFailoverCandidates)[0].usage;
 }
+
+/**
+ * Count how many usages pass the same eligibility gate `pickFailoverTarget`
+ * uses. Purely for observability (the `auto` selection reports how many subs
+ * were eligible); it applies no ranking and picks nothing.
+ */
+export function countEligibleFailoverTargets(
+  usages: SubscriptionUsage[],
+  options: { exclude: ReadonlySet<string>; threshold?: number },
+): number {
+  const threshold = options.threshold ?? maxedThreshold();
+  return usages.reduce(
+    (count, usage) =>
+      isEligibleForFailover(usage, options.exclude, threshold) ? count + 1 : count,
+    0,
+  );
+}
