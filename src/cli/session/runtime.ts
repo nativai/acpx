@@ -1204,7 +1204,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         phase: "active",
         sessionId: record.acpxRecordId,
         at: new Date().toISOString(),
-        subscription: record.acpx?.session_options?.subscription ?? record.acpx?.session_options?.profile,
+        subscription:
+          record.acpx?.session_options?.subscription ?? record.acpx?.session_options?.profile,
         effort: record.acpx?.desired_config_options?.effort ?? record.acpx?.session_options?.effort,
       },
     },
@@ -2447,8 +2448,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
             phase: "idle",
             sessionId: record.acpxRecordId,
             at: new Date().toISOString(),
-            subscription: record.acpx?.session_options?.subscription ?? record.acpx?.session_options?.profile,
-            effort: record.acpx?.desired_config_options?.effort ?? record.acpx?.session_options?.effort,
+            subscription:
+              record.acpx?.session_options?.subscription ?? record.acpx?.session_options?.profile,
+            effort:
+              record.acpx?.desired_config_options?.effort ?? record.acpx?.session_options?.effort,
           },
         },
         { checkpoint: false },

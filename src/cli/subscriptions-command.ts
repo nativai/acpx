@@ -144,7 +144,7 @@ function handleSubscriptionLockSet(
     );
   }
   const lockedBy = process.env.ACPX_LOCKED_BY?.trim();
-  const result = setSubscriptionLockState(id, locked, (lockedBy ? { lockedBy } : {}));
+  const result = setSubscriptionLockState(id, locked, lockedBy ? { lockedBy } : {});
   if (!result) {
     throw new SubscriptionUnknownError(
       id,

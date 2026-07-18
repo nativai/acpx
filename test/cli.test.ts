@@ -3452,9 +3452,9 @@ test("explicit claude subscription on codex child still rejects as incompatible"
 
     assert.notEqual(result.code, 0);
     const errorPayload = JSON.parse(result.stdout.trim()) as {
-      error?: { message?: unknown };
+      error?: { message?: string };
     };
-    const message = String(errorPayload.error?.message ?? "");
+    const message = errorPayload.error?.message ?? "";
     assert.match(message, /profile "sub2" \(authMode "subscription"\) cannot be used/);
     assert.match(message, /codex adapter\. Use a chatgpt profile for codex auth/);
     assert.deepEqual(await listSessionRecordFiles(homeDir), []);
