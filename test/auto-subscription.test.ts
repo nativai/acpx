@@ -10,15 +10,15 @@ import {
   type SubscriptionUsage,
 } from "../src/config/subscription-usage.js";
 import {
-  bindDefaultAccountToSessionOptions,
-  bindDefaultAccountToSessionOptionsAsync,
-  bindRecordToDefaultAccount,
-} from "../src/runtime/engine/default-account-binding.js";
-import {
   consumeAutoSubscriptionSelection,
   isAutoSubscriptionSentinel,
   resolveAutoSubscription,
 } from "../src/runtime/engine/auto-subscription.js";
+import {
+  bindDefaultAccountToSessionOptions,
+  bindDefaultAccountToSessionOptionsAsync,
+  bindRecordToDefaultAccount,
+} from "../src/runtime/engine/default-account-binding.js";
 import { makeSessionRecord } from "./runtime-test-helpers.js";
 
 const CLAUDE_AGENT = "node /opt/claude-agent-acp/dist/index.js";
@@ -192,32 +192,64 @@ test("isAutoSubscriptionSentinel matches auto case/space-insensitively, not ids"
 
 test("selector: among 5h-headroom subs, soonest 7d reset wins (§10.1)", () => {
   const usages = [
-    usage({ id: "a", fiveHour: { utilization: 0.1, reset: null }, sevenDay: { utilization: 0.4, reset: "2026-07-18T05:00:00.000Z" } }),
-    usage({ id: "b", fiveHour: { utilization: 0.1, reset: null }, sevenDay: { utilization: 0.4, reset: "2026-07-18T02:00:00.000Z" } }),
+    usage({
+      id: "a",
+      fiveHour: { utilization: 0.1, reset: null },
+      sevenDay: { utilization: 0.4, reset: "2026-07-18T05:00:00.000Z" },
+    }),
+    usage({
+      id: "b",
+      fiveHour: { utilization: 0.1, reset: null },
+      sevenDay: { utilization: 0.4, reset: "2026-07-18T02:00:00.000Z" },
+    }),
   ];
   assert.equal(pickFailoverTarget(usages, { exclude: new Set() })?.id, "b");
 });
 
 test("selector: a 5h-maxed sub is skipped for one with headroom (§10.2)", () => {
   const usages = [
-    usage({ id: "maxed", fiveHour: { utilization: 0.99, reset: null }, sevenDay: { utilization: 0.1, reset: "2026-07-18T02:00:00.000Z" } }),
-    usage({ id: "ok", fiveHour: { utilization: 0.2, reset: null }, sevenDay: { utilization: 0.5, reset: "2026-07-18T09:00:00.000Z" } }),
+    usage({
+      id: "maxed",
+      fiveHour: { utilization: 0.99, reset: null },
+      sevenDay: { utilization: 0.1, reset: "2026-07-18T02:00:00.000Z" },
+    }),
+    usage({
+      id: "ok",
+      fiveHour: { utilization: 0.2, reset: null },
+      sevenDay: { utilization: 0.5, reset: "2026-07-18T09:00:00.000Z" },
+    }),
   ];
   assert.equal(pickFailoverTarget(usages, { exclude: new Set() })?.id, "ok");
 });
 
 test("selector: excluded (account-locked) id is never picked even if best (§10.3/§10.4)", () => {
   const usages = [
-    usage({ id: "best", fiveHour: { utilization: 0.05, reset: null }, sevenDay: { utilization: 0.05, reset: "2026-07-18T01:00:00.000Z" } }),
-    usage({ id: "other", fiveHour: { utilization: 0.2, reset: null }, sevenDay: { utilization: 0.3, reset: "2026-07-18T03:00:00.000Z" } }),
+    usage({
+      id: "best",
+      fiveHour: { utilization: 0.05, reset: null },
+      sevenDay: { utilization: 0.05, reset: "2026-07-18T01:00:00.000Z" },
+    }),
+    usage({
+      id: "other",
+      fiveHour: { utilization: 0.2, reset: null },
+      sevenDay: { utilization: 0.3, reset: "2026-07-18T03:00:00.000Z" },
+    }),
   ];
   assert.equal(pickFailoverTarget(usages, { exclude: new Set(["best"]) })?.id, "other");
 });
 
 test("selector: deterministic tie-break on registry index (§10.8)", () => {
   const usages = [
-    usage({ id: "first", fiveHour: { utilization: 0.1, reset: null }, sevenDay: { utilization: 0.3, reset: "2026-07-18T02:00:00.000Z" } }),
-    usage({ id: "second", fiveHour: { utilization: 0.1, reset: null }, sevenDay: { utilization: 0.3, reset: "2026-07-18T02:00:00.000Z" } }),
+    usage({
+      id: "first",
+      fiveHour: { utilization: 0.1, reset: null },
+      sevenDay: { utilization: 0.3, reset: "2026-07-18T02:00:00.000Z" },
+    }),
+    usage({
+      id: "second",
+      fiveHour: { utilization: 0.1, reset: null },
+      sevenDay: { utilization: 0.3, reset: "2026-07-18T02:00:00.000Z" },
+    }),
   ];
   for (let i = 0; i < 5; i += 1) {
     assert.equal(pickFailoverTarget(usages, { exclude: new Set() })?.id, "first");
@@ -226,9 +258,18 @@ test("selector: deterministic tie-break on registry index (§10.8)", () => {
 
 test("countEligibleFailoverTargets counts only headroom, unexcluded, unlocked, error-free", () => {
   const usages = [
-    usage({ id: "ok", fiveHour: { utilization: 0.1, reset: null }, sevenDay: { utilization: 0.2, reset: null } }),
+    usage({
+      id: "ok",
+      fiveHour: { utilization: 0.1, reset: null },
+      sevenDay: { utilization: 0.2, reset: null },
+    }),
     usage({ id: "maxed", fiveHour: { utilization: 0.99, reset: null }, sevenDay: null }),
-    usage({ id: "locked", locked: true, fiveHour: { utilization: 0.1, reset: null }, sevenDay: null }),
+    usage({
+      id: "locked",
+      locked: true,
+      fiveHour: { utilization: 0.1, reset: null },
+      sevenDay: null,
+    }),
     usage({ id: "err", error: "boom", fiveHour: null, sevenDay: null }),
     usage({ id: "excl", fiveHour: { utilization: 0.1, reset: null }, sevenDay: null }),
   ];
@@ -297,7 +338,12 @@ test("resolveAutoSubscription excludes an account-locked sibling (DIR-2, §10.4)
     [
       // lockedSibling is the strategy-optimal one but its account is locked via itself;
       // openSibling shares the account and must be excluded too.
-      { id: lockedSibling, account: acct, locked: true, outcome: { util5h: 0.01, util7h: 0.01, reset7d: 1_000 } },
+      {
+        id: lockedSibling,
+        account: acct,
+        locked: true,
+        outcome: { util5h: 0.01, util7h: 0.01, reset7d: 1_000 },
+      },
       { id: openSibling, account: acct, outcome: { util5h: 0.02, util7h: 0.02, reset7d: 2_000 } },
       { id: uid("independent"), outcome: { util5h: 0.4, util7h: 0.5, reset7d: 9_000 } },
     ],
