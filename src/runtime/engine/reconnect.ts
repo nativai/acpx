@@ -594,17 +594,35 @@ async function loadRuntimeSession(params: {
   }
 }
 
+/** Fix A (brick 92a994a0): the resume `_meta` hint to restore the authoritative
+ *  context window learned by a prior run — the remembered size plus the model
+ *  it belongs to (so the adapter re-applies it when the resume replays that
+ *  model instead of clobbering it with the plain-alias heuristic). Empty when
+ *  there is nothing trustworthy to restore. */
+function contextWindowHintOptions(record: SessionRecord): {
+  contextWindowSizeHint?: number;
+  contextWindowSizeHintModel?: string;
+} {
+  const contextWindowSizeHint = resolveContextWindowHint(record.acpx);
+  if (contextWindowSizeHint === undefined) {
+    return {};
+  }
+  return {
+    contextWindowSizeHint,
+    contextWindowSizeHintModel: record.acpx?.context_window_model_id,
+  };
+}
+
 async function runResumeRuntimeSession(params: {
   client: AcpClient;
   record: SessionRecord;
   timeoutMs?: number;
 }): Promise<RuntimeSessionLoadState> {
-  const contextWindowSizeHint = resolveContextWindowHint(params.record.acpx);
   const resumeResult = await withTimeout(
     params.client.resumeSession(
       params.record.acpSessionId,
       params.record.cwd,
-      contextWindowSizeHint !== undefined ? { contextWindowSizeHint } : {},
+      contextWindowHintOptions(params.record),
     ),
     params.timeoutMs,
   );
@@ -624,11 +642,10 @@ async function runLoadRuntimeSession(params: {
   record: SessionRecord;
   timeoutMs?: number;
 }): Promise<RuntimeSessionLoadState> {
-  const contextWindowSizeHint = resolveContextWindowHint(params.record.acpx);
   const loadResult = await withTimeout(
     params.client.loadSessionWithOptions(params.record.acpSessionId, params.record.cwd, {
       suppressReplayUpdates: true,
-      ...(contextWindowSizeHint !== undefined ? { contextWindowSizeHint } : {}),
+      ...contextWindowHintOptions(params.record),
     }),
     params.timeoutMs,
   );

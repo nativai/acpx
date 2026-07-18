@@ -767,14 +767,20 @@ test("AcpClient resumeSession injects the context-window hint into _meta.claudeC
     },
   };
 
-  await client.resumeSession("session-resume-1", cwd, { contextWindowSizeHint: 1_000_000 });
+  await client.resumeSession("session-resume-1", cwd, {
+    contextWindowSizeHint: 1_000_000,
+    contextWindowSizeHintModel: "opus",
+  });
   // The mock agent uses the "none" primer channel, so the only _meta the resume
-  // carries is the restored context-window hint.
+  // carries is the restored context-window hint — size AND the model it was
+  // learned for (so the adapter re-applies it when the resume replays `opus`).
   assert.deepEqual(capturedParams, {
     sessionId: "session-resume-1",
     cwd,
     mcpServers: [],
-    _meta: { claudeCode: { contextWindowSizeHint: 1_000_000 } },
+    _meta: {
+      claudeCode: { contextWindowSizeHint: 1_000_000, contextWindowSizeHintModel: "opus" },
+    },
   });
 });
 
@@ -815,12 +821,15 @@ test("AcpClient loadSessionWithOptions injects the context-window hint into _met
     replayIdleMs: 0,
     replayDrainTimeoutMs: 0,
     contextWindowSizeHint: 1_000_000,
+    contextWindowSizeHintModel: "opus",
   });
   assert.deepEqual(capturedParams, {
     sessionId: "session-load-1",
     cwd,
     mcpServers: [],
-    _meta: { claudeCode: { contextWindowSizeHint: 1_000_000 } },
+    _meta: {
+      claudeCode: { contextWindowSizeHint: 1_000_000, contextWindowSizeHintModel: "opus" },
+    },
   });
 });
 

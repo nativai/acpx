@@ -116,3 +116,66 @@ test("cloneSessionAcpxState preserves the remembered context window (survives th
   // Round-trip through resolveContextWindowHint to prove the clone stays usable.
   assert.equal(resolveContextWindowHint(cloned), 1_000_000);
 });
+
+// Fix A disk round-trip (regression for the TE-caught gap, brick 92a994a0):
+// serialize persisted context_window_size/model_id via whole-object passthrough,
+// but parseAcpxState allowlisted fields and DROPPED them on read — so every cold
+// owner respawn reloaded the record WITHOUT the learned window, resolveContext-
+// WindowHint returned undefined, and the resume re-guessed 200k. This drives the
+// FULL serialize->parse disk round-trip that the in-memory clone test missed.
+import { parseSessionRecord, serializeSessionRecordForDisk } from "../src/session/persistence.js";
+import { makeSessionRecord } from "./runtime-test-helpers.js";
+
+function recordWithWindow(
+  size: number | undefined,
+  modelId: string,
+): ReturnType<typeof makeSessionRecord> {
+  return makeSessionRecord({
+    acpxRecordId: "ctxwin-roundtrip",
+    acpSessionId: "provider-session",
+    agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+    cwd: "/tmp/workspace",
+    messages: [{ Agent: { content: [{ Text: "prior response" }], tool_results: {} } }],
+    acpx: {
+      current_model_id: modelId,
+      ...(size !== undefined
+        ? { context_window_size: size, context_window_model_id: modelId }
+        : {}),
+    },
+  });
+}
+
+test("context window survives the full serialize->parse disk round-trip", () => {
+  const record = recordWithWindow(1_000_000, "opus");
+  const reloaded = parseSessionRecord(serializeSessionRecordForDisk(record));
+  assert.ok(reloaded, "record should parse");
+  assert.equal(reloaded?.acpx?.context_window_size, 1_000_000);
+  assert.equal(reloaded?.acpx?.context_window_model_id, "opus");
+  // The reload is exactly what a cold owner respawn sees — the hint must survive.
+  assert.equal(resolveContextWindowHint(reloaded?.acpx), 1_000_000);
+});
+
+test("disk round-trip drops the window when the model tag no longer matches (invalidation)", () => {
+  const record = recordWithWindow(1_000_000, "opus");
+  // Simulate a model switch after the window was learned: current model moved,
+  // the tag did not. Persist that, reload, and confirm the stale 1M is not restored.
+  if (record.acpx) {
+    record.acpx.current_model_id = "sonnet";
+  }
+  const reloaded = parseSessionRecord(serializeSessionRecordForDisk(record));
+  assert.equal(reloaded?.acpx?.context_window_size, 1_000_000);
+  assert.equal(reloaded?.acpx?.context_window_model_id, "opus");
+  assert.equal(reloaded?.acpx?.current_model_id, "sonnet");
+  assert.equal(resolveContextWindowHint(reloaded?.acpx), undefined);
+});
+
+test("disk round-trip ignores a non-positive persisted window", () => {
+  const record = recordWithWindow(0, "opus");
+  if (record.acpx) {
+    record.acpx.context_window_size = 0;
+    record.acpx.context_window_model_id = "opus";
+  }
+  const reloaded = parseSessionRecord(serializeSessionRecordForDisk(record));
+  assert.equal(reloaded?.acpx?.context_window_size, undefined);
+  assert.equal(resolveContextWindowHint(reloaded?.acpx), undefined);
+});
