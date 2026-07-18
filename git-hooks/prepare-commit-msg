@@ -3,9 +3,11 @@
 #
 # Activated ONLY for acpx-spawned agent processes, via an env-scoped
 # core.hooksPath (GIT_CONFIG_* set in acpx's buildAgentEnvironment). Humans and
-# non-agent git never reach this hook. It appends two trailers:
+# non-agent git never reach this hook. It appends up to three trailers:
 #   Session: <acpx-ui session URL>   — always (when ACPX_SESSION_URL is set)
+#   Brick: <acpx-ui brick URL>       — when ACPX_BRICK is set (session has a linked brick)
 #   Message: <user-prompt turn K>    — only when a Claude transcript is locatable
+# It also strips Co-Authored-By lines from the harness that reference anthropic.com.
 # It is idempotent (safe on amend/rebase) and must NEVER fail a commit: any error
 # in the optional Message computation is swallowed and the hook still exits 0.
 #
@@ -18,11 +20,29 @@ MSG_FILE="${1:-}"
 [ -n "${ACPX_SESSION_URL:-}" ] || exit 0
 [ -n "$MSG_FILE" ] && [ -f "$MSG_FILE" ] || exit 0
 
+# --- Strip harness-injected Co-Authored-By lines (e.g. "Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>") ---
+# These are added by the agent harness prompt and are not useful in commit history.
+sed -i '/^Co-Authored-By:.*anthropic\.com/d' "$MSG_FILE" 2>/dev/null || true
+
 # --- Session: trailer (idempotent) ---
 if ! grep -q '^Session:' "$MSG_FILE" 2>/dev/null; then
   if ! git interpret-trailers --trailer "Session: $ACPX_SESSION_URL" --in-place "$MSG_FILE" 2>/dev/null; then
     # Plain-append fallback with a preceding blank line to separate the trailer block.
     printf '\nSession: %s\n' "$ACPX_SESSION_URL" >>"$MSG_FILE"
+  fi
+fi
+
+# --- Brick: trailer (idempotent; only when session has a linked brick) ---
+if [ -n "${ACPX_BRICK:-}" ]; then
+  if ! grep -q '^Brick:' "$MSG_FILE" 2>/dev/null; then
+    # Construct the full brick URL by reusing the base URL from ACPX_SESSION_URL
+    # (e.g. https://acpx.devbox.nativai.de/ → https://acpx.devbox.nativai.de/?brick=<uuid>).
+    _BRICK_BASE="${ACPX_SESSION_URL%%\?*}"
+    _BRICK_URL="${_BRICK_BASE}?brick=${ACPX_BRICK}"
+    if ! git interpret-trailers --trailer "Brick: $_BRICK_URL" --in-place "$MSG_FILE" 2>/dev/null; then
+      printf 'Brick: %s\n' "$_BRICK_URL" >>"$MSG_FILE"
+    fi
+    unset _BRICK_BASE _BRICK_URL
   fi
 fi
 

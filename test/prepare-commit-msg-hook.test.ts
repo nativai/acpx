@@ -12,6 +12,9 @@ const REPO_ROOT = resolvePath(dirname(fileURLToPath(import.meta.url)), "..", "..
 const HOOK = join(REPO_ROOT, "git-hooks", "prepare-commit-msg");
 const SESSION_URL = "https://acpx.devbox.nativai.de/?session=740e3fbc-1024-481e-96bb-203ac5eefb1b";
 const SESSION_ID = "740e3fbc-1024-481e-96bb-203ac5eefb1b";
+const BRICK_ID = "49d4ba9c-8ac1-4253-b7dd-f46374efb796";
+// Expected Brick: URL = base URL (SESSION_URL up to '?') + ?brick=<uuid>
+const BRICK_URL = `https://acpx.devbox.nativai.de/?brick=${BRICK_ID}`;
 
 // Fixture transcript: exactly 3 genuine user-prompt turns amid noise the predicate
 // must reject (tool_result carrier, assistant, isMeta/isSidechain/isCompactSummary,
@@ -127,6 +130,7 @@ test("hook: idempotent — a second run adds no duplicate trailers", () => {
   for (const [k, v] of Object.entries({
     ...process.env,
     ACPX_SESSION_URL: SESSION_URL,
+    ACPX_BRICK: BRICK_ID,
     CLAUDE_CONFIG_DIR: configDir,
     CLAUDE_CODE_SESSION_ID: SESSION_ID,
   })) {
@@ -140,6 +144,7 @@ test("hook: idempotent — a second run adds no duplicate trailers", () => {
   execFileSync("sh", [HOOK, msgFile], { cwd: dir, env });
   const message = execFileSync("cat", [msgFile]).toString();
   assert.equal(countLines(message, "Session:"), 1, message);
+  assert.equal(countLines(message, "Brick:"), 1, message);
   assert.equal(countLines(message, "Message:"), 1, message);
   rmSync(dir, { recursive: true, force: true });
 });
@@ -180,6 +185,39 @@ test("hook: malformed transcript → never fails, Session only", () => {
   });
   assert.equal(countLines(message, "Session:"), 1);
   assert.equal(countLines(message, "Message:"), 0, message);
+});
+
+test("hook: Brick trailer injected as full URL when ACPX_BRICK is set", () => {
+  const { message } = runHookWithTranscript({
+    subject: "feat: brick-linked commit\n",
+    transcript: FIXTURE_LINES,
+    extraEnv: { ACPX_BRICK: BRICK_ID },
+  });
+  assert.equal(countLines(message, "Session:"), 1);
+  assert.equal(countLines(message, "Brick:"), 1);
+  assert.equal(message.match(/^Brick: (.+)$/m)?.[1], BRICK_URL);
+  assert.equal(countLines(message, "Message:"), 1);
+});
+
+test("hook: Brick trailer absent when ACPX_BRICK is unset", () => {
+  const { message } = runHookWithTranscript({
+    subject: "feat: no brick session\n",
+    transcript: FIXTURE_LINES,
+    extraEnv: { ACPX_BRICK: undefined },
+  });
+  assert.equal(countLines(message, "Session:"), 1);
+  assert.equal(countLines(message, "Brick:"), 0, message);
+  assert.equal(countLines(message, "Message:"), 1);
+});
+
+test("hook: Co-Authored-By anthropic.com lines stripped from commit message", () => {
+  const { message } = runHookWithTranscript({
+    // The Claude harness appends this line; the hook must remove it.
+    subject:
+      "feat: agent commit\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>\n",
+  });
+  assert.equal(countLines(message, "Session:"), 1);
+  assert.ok(!message.includes("Co-Authored-By:"), `Co-Authored-By must be stripped: ${message}`);
 });
 
 test("hook: jq missing → Session only (PATH without jq)", () => {
