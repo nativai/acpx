@@ -1299,6 +1299,14 @@ class MockAgent implements Agent {
   ): Promise<string> {
     assertNotCancelled(signal);
 
+    // Peel the fork divergence notice when a copy/fork handoff delivers it as a
+    // combined "notice\n\ncommand" block.  The notice always ends with \n\n; the
+    // actual command (if any) is the text that follows.
+    if (text.startsWith("⟦FORK-NOTICE⟧")) {
+      const noticeEnd = text.lastIndexOf("\n\n");
+      text = noticeEnd >= 0 ? text.slice(noticeEnd + 2) : "";
+    }
+
     if (text.startsWith("echo ")) {
       return text.slice("echo ".length);
     }
