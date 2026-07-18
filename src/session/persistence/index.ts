@@ -58,6 +58,13 @@ export type SessionIndexEntry = {
   forkedAtMessageIndex?: number;
   metadataTaskFolder?: string;
   metadataBrick?: string;
+  // Infra-label (brick 2ac729a4): metadata.infra projected as hot-path scalars so
+  // acpx-ui's fleet-list ⚙ infra badge renders without a per-record read. Additive,
+  // no schema bump — mirrors metadataBrick. Preserved across reconcile by
+  // parseIndexEntry below so an acpx-ui-written entry survives the daemon rewrite.
+  metadataInfra?: boolean;
+  metadataInfraPurpose?: string;
+  metadataInfraWakeupId?: string;
   // A byway is stored as a normal kind:"session" fork flagged metadata.byway==="1"
   // (acpx-ui convention). Projected so acpx-ui's kind resolution can run from the
   // entry without reading the record. Byway *lineage* (byway_parent/byway_at)
@@ -243,6 +250,9 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     forkedAtMessageIndex: optionalFiniteNumber(record.forkedAtMessageIndex),
     metadataTaskFolder: optionalString(record.metadataTaskFolder),
     metadataBrick: optionalString(record.metadataBrick),
+    metadataInfra: optionalBoolean(record.metadataInfra),
+    metadataInfraPurpose: optionalString(record.metadataInfraPurpose),
+    metadataInfraWakeupId: optionalString(record.metadataInfraWakeupId),
     byway: optionalBoolean(record.byway),
     currentModelId: optionalString(record.currentModelId),
     sessionModel: optionalString(record.sessionModel),
@@ -328,6 +338,10 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     forkedAtMessageIndex: record.forkedAtMessageIndex,
     metadataTaskFolder: metadata?.task_folder,
     metadataBrick: metadata?.brick,
+    // Infra label (brick 2ac729a4): flat string keys → hot-path index scalars.
+    metadataInfra: metadata?.infra === "1" ? true : undefined,
+    metadataInfraPurpose: metadata?.infra_purpose,
+    metadataInfraWakeupId: metadata?.infra_wakeup_id,
     byway: metadata?.byway === "1" ? true : undefined,
     currentModelId: acpx?.current_model_id,
     sessionModel: sessionOptions?.model,

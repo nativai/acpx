@@ -76,6 +76,9 @@ function enrichedRecord(overrides: Partial<SessionRecord> = {}): SessionRecord {
       byway: "1",
       byway_parent: "src-1",
       byway_at: "7",
+      infra: "1",
+      infra_purpose: "Intaker template nightly re-bake",
+      infra_wakeup_id: "01KXV9FD8RMQACSEPWTJ4DH93X",
     },
     template: {
       enabled: true,
@@ -99,6 +102,9 @@ test("toSessionIndexEntry projects every hot scalar from the record", () => {
   assert.equal(entry.forkedAtMessageIndex, 7);
   assert.equal(entry.metadataTaskFolder, "/wisdom/x");
   assert.equal(entry.metadataBrick, "11111111-2222-3333-4444-555555555555");
+  assert.equal(entry.metadataInfra, true);
+  assert.equal(entry.metadataInfraPurpose, "Intaker template nightly re-bake");
+  assert.equal(entry.metadataInfraWakeupId, "01KXV9FD8RMQACSEPWTJ4DH93X");
   assert.equal(entry.byway, true);
   assert.equal(entry.currentModelId, "gpt-5.5[high]");
   assert.equal(entry.sessionModel, "gpt-5.5[high]");
@@ -223,6 +229,11 @@ test("parseIndexEntry preserves enrichment across a write→read round-trip (unt
     assert.equal(back.byway, true);
     assert.equal(back.metadataTaskFolder, "/wisdom/x");
     assert.equal(back.metadataBrick, "11111111-2222-3333-4444-555555555555");
+    // Infra label (brick 2ac729a4): projected scalars survive the round-trip, so
+    // an acpx-ui-written infra entry isn't stripped on the daemon's next reconcile.
+    assert.equal(back.metadataInfra, true);
+    assert.equal(back.metadataInfraPurpose, "Intaker template nightly re-bake");
+    assert.equal(back.metadataInfraWakeupId, "01KXV9FD8RMQACSEPWTJ4DH93X");
     assert.equal(back.templateEnabled, true);
     assert.equal(back.templateCreatedAt, "2026-06-01T05:00:00.000Z");
     assert.equal(back.forkedFromSessionId, "src-1");
