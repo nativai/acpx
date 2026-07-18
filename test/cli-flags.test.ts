@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import os from "node:os";
 import test from "node:test";
 import { Command } from "commander";
 import type { ResolvedAcpxConfig } from "../src/cli/config.js";
 import {
   addGlobalFlags,
+  safeCwd,
   addPromptInputOption,
   addSessionNameOption,
   addSessionOption,
@@ -709,4 +711,38 @@ test("resolveSessionSelectorFromFlags tolerates missing Commander option scopes"
     resolveSessionSelectorFromFlags({}, { optsWithGlobals: () => undefined } as unknown as Command),
     { session: undefined, sessionId: undefined, sessionUrl: undefined },
   );
+});
+
+test("safeCwd returns the real cwd when it is valid", () => {
+  assert.equal(safeCwd(), process.cwd());
+});
+
+test("safeCwd falls back to os.homedir() when process.cwd() throws (deleted cwd)", () => {
+  const original = process.cwd;
+  try {
+    // Simulate a reaped worktree: the inherited OS cwd no longer exists, so
+    // process.cwd() throws uv_cwd/ENOENT.
+    process.cwd = () => {
+      throw new Error("ENOENT: uv_cwd");
+    };
+    assert.equal(safeCwd(), os.homedir());
+  } finally {
+    process.cwd = original;
+  }
+});
+
+test("addGlobalFlags registers --cwd without throwing even if process.cwd() throws", () => {
+  const original = process.cwd;
+  try {
+    process.cwd = () => {
+      throw new Error("ENOENT: uv_cwd");
+    };
+    // Option registration eagerly evaluates the default — this must NOT throw.
+    const command = addGlobalFlags(new Command());
+    const cwdOption = command.options.find((o) => o.long === "--cwd");
+    assert.ok(cwdOption, "--cwd option is registered");
+    assert.equal(cwdOption?.defaultValue, os.homedir());
+  } finally {
+    process.cwd = original;
+  }
 });

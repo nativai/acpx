@@ -9,6 +9,7 @@ import type {
   NonInteractivePermissionPolicy,
   PermissionMode,
 } from "../../types.js";
+import { safeCwd } from "../flags.js";
 
 export type QueueOwnerRuntimeOptions = {
   sessionId: string;
@@ -225,9 +226,15 @@ export function buildQueueOwnerSpawnOptions(
   stdio: "ignore" | ["ignore", number, number];
   env: NodeJS.ProcessEnv;
   windowsHide: true;
+  cwd: string;
 } {
   return {
     detached: true,
+    // P1 cwd-hardening (RCA Incident 1): the detached queue owner must NOT
+    // inherit the parent's (possibly deleted) working directory — a reaped
+    // worktree cwd makes the detached child crash on uv_cwd. Pin to a known-good
+    // dir (real cwd if valid, else os.homedir()).
+    cwd: safeCwd(),
     // stdin ignored; stdout+stderr → the per-session owner log when available
     // (so an owner/adapter crash is diagnosable), else the prior "ignore".
     stdio: logFd !== null ? ["ignore", logFd, logFd] : "ignore",

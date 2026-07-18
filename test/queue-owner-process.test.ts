@@ -6,6 +6,7 @@ import path from "node:path";
 import { describe, it } from "node:test";
 import {
   buildQueueOwnerArgOverride,
+  buildQueueOwnerSpawnOptions,
   queueOwnerRuntimeOptionsFromSend,
   resolveQueueOwnerSpawnArgs,
   sanitizeQueueOwnerExecArgv,
@@ -122,5 +123,31 @@ describe("queueOwnerRuntimeOptionsFromSend", () => {
     });
 
     assert.equal(options.terminal, false);
+  });
+});
+
+describe("buildQueueOwnerSpawnOptions cwd-hardening (P1)", () => {
+  it("pins an explicit cwd so the detached owner does not inherit a deleted cwd", () => {
+    const options = buildQueueOwnerSpawnOptions("{}");
+    // Normally the real cwd; the point is it is EXPLICIT (never undefined), so
+    // the detached child never inherits the parent's possibly-deleted cwd.
+    assert.equal(typeof options.cwd, "string");
+    assert.equal(options.cwd.length > 0, true);
+    assert.equal(options.cwd, process.cwd());
+    assert.equal(options.detached, true);
+    assert.equal(options.windowsHide, true);
+  });
+
+  it("falls back to os.homedir() when process.cwd() throws (reaped worktree)", () => {
+    const original = process.cwd;
+    try {
+      process.cwd = () => {
+        throw new Error("ENOENT: uv_cwd");
+      };
+      const options = buildQueueOwnerSpawnOptions("{}");
+      assert.equal(options.cwd, os.homedir());
+    } finally {
+      process.cwd = original;
+    }
   });
 });

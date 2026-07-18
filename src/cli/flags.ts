@@ -1,3 +1,4 @@
+import os from "node:os";
 import path from "node:path";
 import { InvalidArgumentError } from "commander";
 import type { Command } from "commander";
@@ -388,10 +389,26 @@ export function resolvePermissionMode(
   return defaultMode;
 }
 
+/**
+ * P1 cwd-hardening (RCA Incident 1): a `process.cwd()` that throws when the
+ * inherited working directory has been deleted (a reaped worktree) would crash
+ * at option-registration time — before any parse — blackholing a delivery/queue
+ * spawn. Fall back to os.homedir() (always valid for the running user; acpx's
+ * own store/lease/recover anchor). The delivery invocation always passes an
+ * explicit --cwd, so this default only guards the crash, never the real cwd.
+ */
+export function safeCwd(): string {
+  try {
+    return process.cwd();
+  } catch {
+    return os.homedir();
+  }
+}
+
 export function addGlobalFlags(command: Command): Command {
   return command
     .option("--agent <command>", "Raw ACP agent command (escape hatch)")
-    .option("--cwd <dir>", "Working directory", process.cwd())
+    .option("--cwd <dir>", "Working directory", safeCwd())
     .option(
       "--auth-policy <policy>",
       "Authentication policy: skip or fail when auth is required",
@@ -623,7 +640,7 @@ export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig)
 }
 
 function resolveCwdOption(value: unknown): string {
-  return stringOption(value) ?? process.cwd();
+  return stringOption(value) ?? safeCwd();
 }
 
 function resolveAuthPolicy(optsValue: unknown, config: ResolvedAcpxConfig): AuthPolicy {
