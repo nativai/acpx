@@ -37,6 +37,7 @@ import {
   textPrompt,
 } from "../prompt-content.js";
 import { getResolvedProfile } from "../runtime/engine/account-seam.js";
+import { isAutoSubscriptionSentinel } from "../runtime/engine/auto-subscription.js";
 import { sessionOptionsFromRecord } from "../runtime/engine/session-options.js";
 import { exportSession } from "../session/export.js";
 import { importSession } from "../session/import.js";
@@ -282,7 +283,10 @@ function sessionOptionsFromGlobalFlags(
 
 function validateExplicitSubscriptionFlag(globalFlags: GlobalFlags): void {
   const subscriptionId = globalFlags.subscription?.trim();
-  if (!subscriptionId) {
+  if (!subscriptionId || isAutoSubscriptionSentinel(subscriptionId)) {
+    // `auto` is the automatic-selection sentinel, not a registry id — it is
+    // resolved to a concrete id at the creation seam, so it must not be
+    // rejected here as unknown.
     return;
   }
 

@@ -6,7 +6,7 @@ import {
 } from "../../acp/client.js";
 import { formatErrorMessage } from "../../acp/error-normalization.js";
 import { withInterrupt, withTimeout } from "../../async-control.js";
-import { bindDefaultAccountToSessionOptions } from "../../runtime/engine/default-account-binding.js";
+import { bindDefaultAccountToSessionOptionsAsync } from "../../runtime/engine/default-account-binding.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
 import { persistSessionOptions } from "../../runtime/engine/session-options.js";
 import { persistAndApplyRequestedEffort } from "../../session/config-option-application.js";
@@ -427,7 +427,7 @@ export async function createSessionWithClient(
 ): Promise<SessionCreateWithClientResult> {
   const effectiveOptions: SessionCreateOptions = {
     ...options,
-    sessionOptions: bindDefaultAccountToSessionOptions(
+    sessionOptions: await bindDefaultAccountToSessionOptionsAsync(
       options.sessionOptions,
       options.agentCommand,
     ),

@@ -1,5 +1,6 @@
 import path from "node:path";
 import { resolveAcpxUiBaseUrl } from "../../acp/auth-env.js";
+import { consumeAutoSubscriptionSelection } from "../../runtime/engine/auto-subscription.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
 import type { AgentSessionListResult, OutputFormat, SessionRecord } from "../../types.js";
 import { probeQueueOwnerHealth } from "../queue/ipc.js";
@@ -149,6 +150,7 @@ export function printNewSessionByFormat(
   replaced: SessionRecord | undefined,
   format: OutputFormat,
 ): void {
+  const subscriptionSelection = consumeAutoSubscriptionSelection();
   if (
     emitJsonResult(format, {
       action: "session_ensured",
@@ -159,6 +161,7 @@ export function printNewSessionByFormat(
       name: record.name,
       replacedSessionId: replaced?.acpxRecordId,
       sessionUrl: composeSessionUrl(record),
+      ...(subscriptionSelection ? { subscriptionSelection } : {}),
     })
   ) {
     return;
@@ -182,6 +185,7 @@ export function printCopiedSessionByFormat(
   source: SessionRecord,
   format: OutputFormat,
 ): void {
+  const subscriptionSelection = consumeAutoSubscriptionSelection();
   if (
     emitJsonResult(format, {
       action: "session_copied",
@@ -195,6 +199,7 @@ export function printCopiedSessionByFormat(
       forkedAtMessageIndex: record.forkedAtMessageIndex,
       ephemeral: record.metadata?.byway === "1",
       sessionUrl: composeSessionUrl(record),
+      ...(subscriptionSelection ? { subscriptionSelection } : {}),
     })
   ) {
     return;
