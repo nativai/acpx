@@ -147,11 +147,21 @@ type LoadSessionOptions = {
    *  the restored adapter reports the correct window from its first
    *  post-resume usage_update instead of re-guessing 200k. */
   contextWindowSizeHint?: number;
+  /** The model the hint was learned for. A resume can advertise one model and
+   *  then replay the session's pinned model; tagging the restored window lets
+   *  the adapter re-apply it (instead of the heuristic) when the model settles
+   *  on this id, so the replay doesn't clobber a restored 1M back to 200k. */
+  contextWindowSizeHintModel?: string;
 };
 
 type ResumeSessionOptions = {
   contextWindowSizeHint?: number;
+  contextWindowSizeHintModel?: string;
 };
+
+function isPositiveFiniteNumber(value: number | undefined): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
 
 type ForkSessionOptions = LoadSessionOptions & {
   atIndex?: number;
@@ -1204,8 +1214,9 @@ export class AcpClient {
   private mergeContextWindowHint(
     meta: Record<string, unknown> | undefined,
     hint: number | undefined,
+    hintModel: string | undefined,
   ): Record<string, unknown> | undefined {
-    if (typeof hint !== "number" || !Number.isFinite(hint) || hint <= 0) {
+    if (!isPositiveFiniteNumber(hint)) {
       return meta;
     }
     const base = meta ?? {};
@@ -1213,7 +1224,14 @@ export class AcpClient {
       typeof base.claudeCode === "object" && base.claudeCode !== null
         ? (base.claudeCode as Record<string, unknown>)
         : {};
-    return { ...base, claudeCode: { ...existingClaudeCode, contextWindowSizeHint: hint } };
+    const modelField =
+      typeof hintModel === "string" && hintModel.length > 0
+        ? { contextWindowSizeHintModel: hintModel }
+        : {};
+    return {
+      ...base,
+      claudeCode: { ...existingClaudeCode, contextWindowSizeHint: hint, ...modelField },
+    };
   }
 
   async loadSession(sessionId: string, cwd = this.options.cwd): Promise<SessionLoadResult> {
@@ -1248,6 +1266,7 @@ export class AcpClient {
         this.mergeContextWindowHint(
           { ...homeSelectorMeta, ...primerMeta },
           options.contextWindowSizeHint,
+          options.contextWindowSizeHintModel,
         ) ?? {};
       response = await this.runConnectionRequest(() =>
         connection.loadSession({
@@ -1282,7 +1301,11 @@ export class AcpClient {
     // (CONCEPTION §4.5.2): a regenerated system prompt is dropped on rebuild
     // unless re-sent. Idempotent; codex returns undefined (restored from thread).
     const primerMeta = await this.buildResumePrimerMeta();
-    const resumeMeta = this.mergeContextWindowHint(primerMeta, options.contextWindowSizeHint);
+    const resumeMeta = this.mergeContextWindowHint(
+      primerMeta,
+      options.contextWindowSizeHint,
+      options.contextWindowSizeHintModel,
+    );
     const response = await this.runConnectionRequest(() =>
       connection.resumeSession({
         sessionId,

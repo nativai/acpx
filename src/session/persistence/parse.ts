@@ -322,6 +322,19 @@ function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
 
   assignStringState(state, "current_model_id", record.current_model_id);
 
+  // Fix A (brick 92a994a0): the persisted authoritative context window + its
+  // model tag MUST round-trip back on a cold disk reload, or every owner
+  // respawn loses them and resolveContextWindowHint returns undefined — so a
+  // resumed 1M session re-guesses 200k. Mirror serialize's passthrough here.
+  if (
+    typeof record.context_window_size === "number" &&
+    Number.isFinite(record.context_window_size) &&
+    record.context_window_size > 0
+  ) {
+    state.context_window_size = record.context_window_size;
+  }
+  assignStringState(state, "context_window_model_id", record.context_window_model_id);
+
   if (isStringArray(record.available_models)) {
     state.available_models = [...record.available_models];
   }
@@ -352,7 +365,7 @@ function assignBooleanTrue(
 
 function assignStringState(
   state: SessionAcpxState,
-  key: "current_mode_id" | "desired_mode_id" | "current_model_id",
+  key: "current_mode_id" | "desired_mode_id" | "current_model_id" | "context_window_model_id",
   value: unknown,
 ): void {
   if (typeof value === "string") {
