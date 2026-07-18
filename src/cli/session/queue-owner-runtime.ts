@@ -841,7 +841,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
     let isFirstTask = true;
     while (true) {
       const pollTimeoutMs = isFirstTask ? initialTaskPollTimeoutMs : defaultTaskPollTimeoutMs;
-      const task = await owner.nextTask(pollTimeoutMs);
+      let task = await owner.nextTask(pollTimeoutMs);
       if (!task) {
         // A full idle window elapsed; subsequent waits use the steady cadence.
         isFirstTask = false;
@@ -870,7 +870,22 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           // preserving the W13-24-10 short-circuit cost-ordering.
           deployDiffers: deployedBuildDiffersFromOwner,
         });
-        if (decision.release) {
+        if (!decision.release) {
+          // Current code & within the idle window, OR busy / active / relaying
+          // background work → re-arm, stay warm.
+          continue;
+        }
+        // P2d (brick c85d7737 §6) — defense-in-depth final poll before releasing.
+        // `decideIdleOwnerRelease` is async (it may read the deploy-diff file), so a
+        // task can be submitted into this owner's IPC queue in the TOCTOU window
+        // between the idle-check `nextTask` above and this release decision — and be
+        // enqueued into a dying owner. One last NON-BLOCKING `nextTask(0)` closes that
+        // window: if a task raced the decision, process it instead of releasing. This
+        // is owner-internal and NOT lease-gated; the executor's P2b re-drive remains
+        // the authoritative wake — this poll just spares the common case a cold
+        // respawn (TOCTOU at the process boundary is not perfectly avoidable here).
+        const lateTask = await owner.nextTask(0);
+        if (!lateTask) {
           // Diagnosable, NON-verbose-gated → owner.log (the RCA's "make the owner
           // lifecycle diagnosable" recommendation; the TE asserts this line + its
           // reason=). Safe to emit unconditionally: the owner's stderr is its own
@@ -894,9 +909,12 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           // context. No new kill primitive.
           break;
         }
-        // Current code & within the idle window, OR busy / active / relaying
-        // background work → re-arm, stay warm.
-        continue;
+        // A task raced the release decision — process it instead of releasing.
+        process.stderr.write(
+          `[acpx] queue owner deferring idle release for session ${options.sessionId}; a task arrived in the release window (P2d final-poll)\n`,
+        );
+        task = lateTask;
+        // fall through to the task-processing path below (do NOT release/continue).
       }
       isFirstTask = false;
 

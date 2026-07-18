@@ -716,3 +716,55 @@ test("SessionQueueOwner.close writes a QUEUE_OWNER_SHUTDOWN terminal for a dropp
     waitSocket.destroy();
   });
 });
+
+// P2d (brick c85d7737 §6) — the primitive the owner's final-poll-before-release relies
+// on: a task submitted in the release window is retrievable by a NON-BLOCKING
+// nextTask(0), and an empty queue returns undefined immediately (so releasing when
+// truly idle is not delayed).
+test("P2d: nextTask(0) is a non-blocking peek — returns a pending task at once, else undefined", async () => {
+  await withTempHome(async () => {
+    const lease = await tryAcquireQueueOwnerLease("owner-p2d-final-poll");
+    assert(lease);
+    const owner = await SessionQueueOwner.start(lease, {
+      cancelPrompt: async () => false,
+      closeSession: async () => false,
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+      setSessionConfigOption: async () => ({ configOptions: [] }) as SetSessionConfigOptionResponse,
+      queryActiveTurn: () => false,
+    });
+    try {
+      // Empty queue → the non-blocking peek returns undefined (release proceeds).
+      assert.equal(await owner.nextTask(0), undefined, "empty queue: nextTask(0) is undefined");
+
+      // A task raced into the queue (the TOCTOU window) → nextTask(0) returns it
+      // immediately, so the owner processes it instead of releasing.
+      const promptSocket = await connectSocket(lease.socketPath);
+      const promptLines = readline.createInterface({ input: promptSocket });
+      const promptIterator = promptLines[Symbol.asyncIterator]();
+      promptSocket.write(
+        `${JSON.stringify({
+          type: "submit_prompt",
+          requestId: "req-p2d-latetask",
+          ownerGeneration: lease.ownerGeneration,
+          message: "raced the release decision",
+          permissionMode: "approve-reads",
+          waitForCompletion: false,
+        })}\n`,
+      );
+      const accepted = (await nextJsonLine(promptIterator)) as { type: string };
+      assert.equal(accepted.type, "accepted");
+
+      const late = await owner.nextTask(0);
+      assert(late, "nextTask(0) returns the raced task without blocking");
+      assert.equal(late.requestId, "req-p2d-latetask");
+      // Consumed → a subsequent peek is empty again.
+      assert.equal(await owner.nextTask(0), undefined);
+      promptLines.close();
+      promptSocket.destroy();
+    } finally {
+      await owner.close();
+      await releaseQueueOwnerLease(lease);
+    }
+  });
+});
