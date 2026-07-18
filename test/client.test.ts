@@ -755,6 +755,75 @@ test("AcpClient createSession forwards systemPrompt append in _meta alongside cl
   });
 });
 
+test("AcpClient resumeSession injects the context-window hint into _meta.claudeCode (fix A)", async () => {
+  const cwd = path.resolve("/tmp/acpx-client-ctxwindow-resume");
+  const client = makeClient();
+
+  let capturedParams: Record<string, unknown> | undefined;
+  asInternals(client).connection = {
+    resumeSession: async (params: Record<string, unknown>) => {
+      capturedParams = params;
+      return {};
+    },
+  };
+
+  await client.resumeSession("session-resume-1", cwd, { contextWindowSizeHint: 1_000_000 });
+  // The mock agent uses the "none" primer channel, so the only _meta the resume
+  // carries is the restored context-window hint.
+  assert.deepEqual(capturedParams, {
+    sessionId: "session-resume-1",
+    cwd,
+    mcpServers: [],
+    _meta: { claudeCode: { contextWindowSizeHint: 1_000_000 } },
+  });
+});
+
+test("AcpClient resumeSession omits _meta entirely when there is no hint (fix A)", async () => {
+  const cwd = path.resolve("/tmp/acpx-client-ctxwindow-resume-none");
+  const client = makeClient();
+
+  let capturedParams: Record<string, unknown> | undefined;
+  asInternals(client).connection = {
+    resumeSession: async (params: Record<string, unknown>) => {
+      capturedParams = params;
+      return {};
+    },
+  };
+
+  await client.resumeSession("session-resume-2", cwd);
+  assert.deepEqual(capturedParams, {
+    sessionId: "session-resume-2",
+    cwd,
+    mcpServers: [],
+  });
+});
+
+test("AcpClient loadSessionWithOptions injects the context-window hint into _meta.claudeCode (fix A)", async () => {
+  const cwd = path.resolve("/tmp/acpx-client-ctxwindow-load");
+  const client = makeClient();
+
+  let capturedParams: Record<string, unknown> | undefined;
+  asInternals(client).connection = {
+    loadSession: async (params: Record<string, unknown>) => {
+      capturedParams = params;
+      return {};
+    },
+  };
+
+  await client.loadSessionWithOptions("session-load-1", cwd, {
+    suppressReplayUpdates: true,
+    replayIdleMs: 0,
+    replayDrainTimeoutMs: 0,
+    contextWindowSizeHint: 1_000_000,
+  });
+  assert.deepEqual(capturedParams, {
+    sessionId: "session-load-1",
+    cwd,
+    mcpServers: [],
+    _meta: { claudeCode: { contextWindowSizeHint: 1_000_000 } },
+  });
+});
+
 test("AcpClient createSession injects brick context on the system-prompt channel", async () => {
   const cwd = path.resolve("/tmp/acpx-client-brick-context");
   const client = makeClient({

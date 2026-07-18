@@ -686,6 +686,8 @@ export function cloneSessionAcpxState(
       ? { ...state.desired_config_options }
       : undefined,
     current_model_id: state.current_model_id,
+    context_window_size: state.context_window_size,
+    context_window_model_id: state.context_window_model_id,
     available_models: state.available_models ? [...state.available_models] : undefined,
     available_commands: state.available_commands ? [...state.available_commands] : undefined,
     progress: state.progress ? deepClone(state.progress) : undefined,
@@ -889,9 +891,10 @@ const SESSION_UPDATE_HANDLERS: Record<string, SessionUpdateHandler> = {
       stampAgentClaudeUuid(conversation, update);
     }
   },
-  usage_update: (conversation, _acpx, update) => {
+  usage_update: (conversation, acpx, update) => {
     if (update.sessionUpdate === "usage_update") {
       applyUsageUpdate(conversation, update);
+      rememberContextWindow(acpx, update);
     }
   },
   session_info_update: (conversation, _acpx, update) => {
@@ -952,6 +955,43 @@ function applyUsageUpdate(conversation: SessionConversation, update: UsageUpdate
   if (userId) {
     conversation.request_token_usage[userId] = usage;
   }
+}
+
+/** Fix A (brick 92a994a0): remember the context-window `size` the adapter just
+ *  reported, tagged with the session's current model, so it can be
+ *  round-tripped back to the adapter on resume (which otherwise re-guesses the
+ *  window from a heuristic and loses a learned 1M). A size-less update, a
+ *  non-positive size, or an as-yet-unknown model leaves the prior memory
+ *  untouched. */
+function rememberContextWindow(acpx: SessionAcpxState, update: UsageUpdate): void {
+  const size = (update as { size?: unknown }).size;
+  const modelId = acpx.current_model_id;
+  if (typeof size === "number" && Number.isFinite(size) && size > 0 && modelId) {
+    acpx.context_window_size = size;
+    acpx.context_window_model_id = modelId;
+  }
+}
+
+/** Fix A: the context-window hint to inject on resume — the remembered size,
+ *  but only while its model tag still matches the session's current model. A
+ *  model switch (which updates `current_model_id` but not the stale tag) makes
+ *  the tags diverge, so the stale window is dropped and the adapter falls back
+ *  to its heuristic for the new model. Returns undefined when there is nothing
+ *  trustworthy to restore. */
+export function resolveContextWindowHint(acpx: SessionAcpxState | undefined): number | undefined {
+  if (!acpx) {
+    return undefined;
+  }
+  const size = acpx.context_window_size;
+  const taggedModel = acpx.context_window_model_id;
+  const currentModel = acpx.current_model_id;
+  if (typeof size !== "number" || !Number.isFinite(size) || size <= 0) {
+    return undefined;
+  }
+  if (!taggedModel || !currentModel || taggedModel !== currentModel) {
+    return undefined;
+  }
+  return size;
 }
 
 function applySessionInfoUpdate(

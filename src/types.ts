@@ -419,6 +419,16 @@ export type SessionAcpxState = {
   desired_mode_id?: string;
   desired_config_options?: Record<string, string>;
   current_model_id?: string;
+  /** Fix A (brick 92a994a0): the context-window size (in tokens) the adapter
+   *  last reported for `context_window_model_id`, round-tripped back to the
+   *  adapter on resume as `_meta.claudeCode.contextWindowSizeHint` so a restored
+   *  session reports the correct window from its first post-resume usage_update
+   *  instead of re-guessing 200k. Tagged with the observing model so a model
+   *  switch invalidates it: a resume only injects the hint while the tag still
+   *  matches `current_model_id`, never carrying a stale 1M across a 1M→200k
+   *  switch. */
+  context_window_size?: number;
+  context_window_model_id?: string;
   available_models?: string[];
   available_commands?: string[];
   progress?: AgentProgress;

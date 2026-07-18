@@ -22,6 +22,7 @@ import {
 import { incrementPerfCounter } from "../../perf-metrics.js";
 import { normalizeEffortLevelForModel } from "../../session/config-option-application.js";
 import { applyConfigOptionsToRecord } from "../../session/config-options.js";
+import { resolveContextWindowHint } from "../../session/conversation-model.js";
 import {
   getDesiredConfigOptions,
   getDesiredModeId,
@@ -598,8 +599,13 @@ async function runResumeRuntimeSession(params: {
   record: SessionRecord;
   timeoutMs?: number;
 }): Promise<RuntimeSessionLoadState> {
+  const contextWindowSizeHint = resolveContextWindowHint(params.record.acpx);
   const resumeResult = await withTimeout(
-    params.client.resumeSession(params.record.acpSessionId, params.record.cwd),
+    params.client.resumeSession(
+      params.record.acpSessionId,
+      params.record.cwd,
+      contextWindowSizeHint !== undefined ? { contextWindowSizeHint } : {},
+    ),
     params.timeoutMs,
   );
   reconcileAgentSessionId(params.record, resumeResult.agentSessionId);
@@ -618,9 +624,11 @@ async function runLoadRuntimeSession(params: {
   record: SessionRecord;
   timeoutMs?: number;
 }): Promise<RuntimeSessionLoadState> {
+  const contextWindowSizeHint = resolveContextWindowHint(params.record.acpx);
   const loadResult = await withTimeout(
     params.client.loadSessionWithOptions(params.record.acpSessionId, params.record.cwd, {
       suppressReplayUpdates: true,
+      ...(contextWindowSizeHint !== undefined ? { contextWindowSizeHint } : {}),
     }),
     params.timeoutMs,
   );

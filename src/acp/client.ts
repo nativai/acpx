@@ -142,6 +142,15 @@ type LoadSessionOptions = {
   suppressReplayUpdates?: boolean;
   replayIdleMs?: number;
   replayDrainTimeoutMs?: number;
+  /** Fix A (brick 92a994a0): the authoritative context-window size a prior run
+   *  of this session learned, injected into the resume `_meta.claudeCode` so
+   *  the restored adapter reports the correct window from its first
+   *  post-resume usage_update instead of re-guessing 200k. */
+  contextWindowSizeHint?: number;
+};
+
+type ResumeSessionOptions = {
+  contextWindowSizeHint?: number;
 };
 
 type ForkSessionOptions = LoadSessionOptions & {
@@ -1185,6 +1194,28 @@ export class AcpClient {
     return buildClaudeHomeSelectorMeta(this.options.sessionContext?.profileId);
   }
 
+  /**
+   * Fix A (brick 92a994a0): fold an authoritative context-window hint into a
+   * resume `_meta` fragment as `claudeCode.contextWindowSizeHint`, so the
+   * restored adapter seeds the correct window instead of re-guessing. Deep-
+   * merges into any existing `claudeCode` object (rather than clobbering it)
+   * and is a no-op for a missing / non-positive hint.
+   */
+  private mergeContextWindowHint(
+    meta: Record<string, unknown> | undefined,
+    hint: number | undefined,
+  ): Record<string, unknown> | undefined {
+    if (typeof hint !== "number" || !Number.isFinite(hint) || hint <= 0) {
+      return meta;
+    }
+    const base = meta ?? {};
+    const existingClaudeCode =
+      typeof base.claudeCode === "object" && base.claudeCode !== null
+        ? (base.claudeCode as Record<string, unknown>)
+        : {};
+    return { ...base, claudeCode: { ...existingClaudeCode, contextWindowSizeHint: hint } };
+  }
+
   async loadSession(sessionId: string, cwd = this.options.cwd): Promise<SessionLoadResult> {
     this.getConnection();
     return await this.loadSessionWithOptions(sessionId, cwd, {});
@@ -1213,7 +1244,11 @@ export class AcpClient {
       // (CONCEPTION §4.5.2) so a restarted adapter regenerates it; codex returns
       // undefined here (its developer item is already in restored history).
       const primerMeta = await this.buildResumePrimerMeta();
-      const loadMeta = { ...homeSelectorMeta, ...primerMeta };
+      const loadMeta =
+        this.mergeContextWindowHint(
+          { ...homeSelectorMeta, ...primerMeta },
+          options.contextWindowSizeHint,
+        ) ?? {};
       response = await this.runConnectionRequest(() =>
         connection.loadSession({
           sessionId,
@@ -1236,19 +1271,24 @@ export class AcpClient {
     return toReconnectedSessionResult(response);
   }
 
-  async resumeSession(sessionId: string, cwd = this.options.cwd): Promise<SessionResumeResult> {
+  async resumeSession(
+    sessionId: string,
+    cwd = this.options.cwd,
+    options: ResumeSessionOptions = {},
+  ): Promise<SessionResumeResult> {
     const connection = this.getConnection();
     const sessionCwd = await resolveAgentSessionCwd(cwd, this.options.agentCommand);
     // Re-supply the primer on cold resume for the system-prompt channels
     // (CONCEPTION §4.5.2): a regenerated system prompt is dropped on rebuild
     // unless re-sent. Idempotent; codex returns undefined (restored from thread).
     const primerMeta = await this.buildResumePrimerMeta();
+    const resumeMeta = this.mergeContextWindowHint(primerMeta, options.contextWindowSizeHint);
     const response = await this.runConnectionRequest(() =>
       connection.resumeSession({
         sessionId,
         cwd: sessionCwd,
         mcpServers: this.options.mcpServers ?? [],
-        ...(primerMeta ? { _meta: primerMeta } : {}),
+        ...(resumeMeta && Object.keys(resumeMeta).length > 0 ? { _meta: resumeMeta } : {}),
       }),
     );
 
