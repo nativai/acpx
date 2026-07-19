@@ -813,3 +813,107 @@ test("S5: both bridges auth-gated → BridgeAuthGatedError (not AllSubscriptions
     },
   );
 });
+
+// Regression for 52906cf1: account-level lock exclusion in turn-failover.
+// Account-locked siblings are excluded UPSTREAM in failoverCandidates via
+// isSubscriptionProfileLocked, before they ever reach pickSubscriptionSibling.
+// This test exercises that upstream guarantee: sub-c (same account as the
+// directly-locked sub-b) must NOT be selected; sub-d (different account, healthy)
+// MUST be selected. The test goes RED if the isSubscriptionProfileLocked filter
+// in failoverCandidates is defeated.
+test("attemptFailoverAndRetry: account-level-locked sibling is skipped; valid sibling on different account is chosen", async () => {
+  resetKnownDeadSubs();
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fo-acct-lock-"));
+  const subsDir = path.join(home, ".acpx", "subscriptions");
+  const registryPath = path.join(subsDir, "registry.json");
+  const profileDir = (id: string) => path.join(subsDir, id);
+  const tokenOf = (id: string) => `tok-acct-lock-${id}`;
+
+  for (const id of ["sub-a", "sub-b", "sub-c", "sub-d"]) {
+    await fs.mkdir(profileDir(id), { recursive: true });
+    await fs.writeFile(
+      path.join(profileDir(id), ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: tokenOf(id) } }),
+    );
+  }
+  await fs.mkdir(path.dirname(registryPath), { recursive: true });
+  await fs.writeFile(
+    registryPath,
+    JSON.stringify({
+      version: 3,
+      default: "sub-a",
+      profiles: [
+        {
+          id: "sub-a",
+          label: "sub-a",
+          authMode: "subscription",
+          adapter: "claude",
+          account: "acct-a",
+          credentialSource: profileDir("sub-a"),
+        },
+        {
+          // sub-b is directly locked — its entire account ("acct-shared") is locked
+          id: "sub-b",
+          label: "sub-b",
+          authMode: "subscription",
+          adapter: "claude",
+          account: "acct-shared",
+          credentialSource: profileDir("sub-b"),
+          locked: true,
+        },
+        {
+          // sub-c shares the account of the locked sub-b → account-level locked;
+          // isSubscriptionProfileLocked must exclude it from failover candidates
+          id: "sub-c",
+          label: "sub-c",
+          authMode: "subscription",
+          adapter: "claude",
+          account: "acct-shared",
+          credentialSource: profileDir("sub-c"),
+        },
+        {
+          // sub-d has an independent account and is the only valid target
+          id: "sub-d",
+          label: "sub-d",
+          authMode: "subscription",
+          adapter: "claude",
+          account: "acct-d",
+          credentialSource: profileDir("sub-d"),
+        },
+      ],
+    }),
+  );
+
+  const { server, url } = await startMockMessages(
+    new Map([
+      [tokenOf("sub-c"), { status: 200, util: 0.1 }], // headroom, but must be excluded
+      [tokenOf("sub-d"), { status: 200, util: 0.2 }], // the correct target
+    ]),
+  );
+  const prevEndpoint = process.env.CLAUDE_MESSAGES_ENDPOINT;
+  const prevHome = process.env.HOME;
+  process.env.CLAUDE_MESSAGES_ENDPOINT = url;
+  process.env.HOME = home;
+  try {
+    const record = makeRecord({ profile: "sub-a" });
+    const out = await attemptFailoverAndRetry<string>({
+      record,
+      triggerError: rateLimitError("rate limit", "acct-a"),
+      loadOpts: { homeDir: home, registryPath },
+      runTurn: async () => "ok",
+    });
+    // sub-d must be selected; sub-c (account-level locked via sub-b) must not be
+    assert.equal(out.switchedTo, "sub-d", "account-level-locked sub-c must not be chosen");
+    assert.equal(out.result, "ok");
+  } finally {
+    server.close();
+    if (prevEndpoint === undefined) {
+      delete process.env.CLAUDE_MESSAGES_ENDPOINT;
+    } else {
+      process.env.CLAUDE_MESSAGES_ENDPOINT = prevEndpoint;
+    }
+    process.env.HOME = prevHome;
+    await fs.rm(home, { recursive: true, force: true });
+    resetKnownDeadSubs();
+  }
+});

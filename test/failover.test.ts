@@ -361,6 +361,23 @@ test("pickFailoverTarget: sevenDay.reset === null sorts after any known reset", 
   assert.equal(target?.id, "known");
 });
 
+test("pickFailoverTarget: all-unknown-7d-reset still applies lower-util tiebreak (NaN guard)", () => {
+  // All subs have sevenDay.reset === null → sevenDayResetKey returns +Infinity for
+  // both. Infinity - Infinity = NaN, which used to bypass the secondary tiebreak
+  // (NaN !== 0 is true → returned NaN instead of falling through). The NaN guard
+  // ensures the lower-util tiebreak still fires.
+  const hi = usage("hi-util", 0, undefined, {
+    fiveHour: { utilization: 0.3, reset: null },
+    sevenDay: { utilization: 0.8, reset: null }, // unknown reset → +Infinity
+  });
+  const lo = usage("lo-util", 0, undefined, {
+    fiveHour: { utilization: 0.3, reset: null },
+    sevenDay: { utilization: 0.2, reset: null }, // unknown reset → +Infinity
+  });
+  const target = pickFailoverTarget([hi, lo], { exclude: new Set(), threshold: 0.98 });
+  assert.equal(target?.id, "lo-util");
+});
+
 // ── Regression matrix: no eligible → undefined ────────────────────────────
 
 test("pickFailoverTarget: all 5h-maxed/errored/locked → undefined", () => {
