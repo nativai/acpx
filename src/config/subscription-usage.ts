@@ -228,7 +228,10 @@ function sevenDayResetKey(usage: SubscriptionUsage): number {
 
 function compareFailoverCandidates(a: IndexedUsage, b: IndexedUsage): number {
   const resetDiff = sevenDayResetKey(a.usage) - sevenDayResetKey(b.usage);
-  if (resetDiff !== 0) {
+  // Guard NaN: Infinity - Infinity = NaN when ALL eligible subs lack a known 7d
+  // reset. NaN !== 0 is true, which would return NaN and skip the secondary
+  // tiebreak. Treat NaN as a tie so the lower-util tiebreak still applies.
+  if (resetDiff !== 0 && !Number.isNaN(resetDiff)) {
     return resetDiff;
   }
   const utilA = a.usage.sevenDay?.utilization ?? maxUtilization(a.usage);

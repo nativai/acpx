@@ -813,3 +813,97 @@ test("S5: both bridges auth-gated → BridgeAuthGatedError (not AllSubscriptions
     },
   );
 });
+
+// Fix 52906cf1: account-level lock exclusion in turn-failover
+test("attemptFailoverAndRetry excludes account-level-locked sibling from failover target selection", async () => {
+  // sub-b is directly locked; sub-c shares the same account ("acct-shared") →
+  // account-level propagation via isSubscriptionLocked must exclude sub-c from
+  // the failover candidate set. Before the fix, sub-c would be selected (only
+  // usage.locked === true was checked); after the fix it is in the exclude set
+  // and the failover exhausts.
+  resetKnownDeadSubs();
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fo-acct-lock-"));
+  const subsDir = path.join(home, ".acpx", "subscriptions");
+  const registryPath = path.join(subsDir, "registry.json");
+  const profileDir = (id: string) => path.join(subsDir, id);
+  const tokenOf = (id: string) => `tok-acct-lock-${id}`;
+
+  for (const id of ["sub-a", "sub-b", "sub-c"]) {
+    await fs.mkdir(profileDir(id), { recursive: true });
+    await fs.writeFile(
+      path.join(profileDir(id), ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: tokenOf(id) } }),
+    );
+  }
+  await fs.mkdir(path.dirname(registryPath), { recursive: true });
+  await fs.writeFile(
+    registryPath,
+    JSON.stringify({
+      version: 3,
+      default: "sub-a",
+      profiles: [
+        {
+          id: "sub-a",
+          label: "sub-a",
+          authMode: "subscription",
+          adapter: "claude",
+          account: "acct-a",
+          credentialSource: profileDir("sub-a"),
+        },
+        {
+          id: "sub-b",
+          label: "sub-b",
+          authMode: "subscription",
+          adapter: "claude",
+          account: "acct-shared",
+          credentialSource: profileDir("sub-b"),
+          locked: true,
+        },
+        {
+          id: "sub-c",
+          label: "sub-c",
+          authMode: "subscription",
+          adapter: "claude",
+          account: "acct-shared",
+          credentialSource: profileDir("sub-c"),
+        },
+      ],
+    }),
+  );
+
+  const { server, url } = await startMockMessages(
+    new Map([
+      // sub-b is locked so its probe isn't even reached; sub-c has headroom
+      // but must be excluded via account-level lock propagation from sub-b.
+      [tokenOf("sub-c"), { status: 200, util: 0.1 }],
+    ]),
+  );
+  const prevEndpoint = process.env.CLAUDE_MESSAGES_ENDPOINT;
+  const prevHome = process.env.HOME;
+  process.env.CLAUDE_MESSAGES_ENDPOINT = url;
+  process.env.HOME = home;
+  try {
+    const record = makeRecord({ profile: "sub-a" });
+    await assert.rejects(
+      () =>
+        attemptFailoverAndRetry<string>({
+          record,
+          triggerError: rateLimitError("rate limit", "acct-a"),
+          loadOpts: { homeDir: home, registryPath },
+          runTurn: async () => "should-not-reach",
+        }),
+      AllSubscriptionsExhaustedError,
+      "account-level-locked sub-c must not be selected as failover target",
+    );
+  } finally {
+    server.close();
+    if (prevEndpoint === undefined) {
+      delete process.env.CLAUDE_MESSAGES_ENDPOINT;
+    } else {
+      process.env.CLAUDE_MESSAGES_ENDPOINT = prevEndpoint;
+    }
+    process.env.HOME = prevHome;
+    await fs.rm(home, { recursive: true, force: true });
+    resetKnownDeadSubs();
+  }
+});

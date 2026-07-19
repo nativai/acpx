@@ -16,6 +16,7 @@ import {
   type SubscriptionUsage,
 } from "../../config/subscription-usage.js";
 import {
+  isSubscriptionLocked,
   loadSubscriptionRegistry,
   type SubscriptionEntry,
   type SubscriptionLookupOptions,
@@ -492,7 +493,8 @@ async function pickSubscriptionSibling(
   statuses: CandidateStatus[],
   loadOpts?: SubscriptionLookupOptions,
 ): Promise<{ target?: ResolvedProfile; statuses: CandidateStatus[] }> {
-  const entryById = bySubscriptionId(loadSubscriptionRegistry(loadOpts).subscriptions);
+  const registry = loadSubscriptionRegistry(loadOpts);
+  const entryById = bySubscriptionId(registry.subscriptions);
   const entries = statuses
     .filter(accountHealthy)
     .map((status) => entryById.get(status.profile.id))
@@ -508,7 +510,13 @@ async function pickSubscriptionSibling(
       ? { missingSubscriptionEntry: true }
       : {}),
   }));
-  const picked = pickFailoverTarget(usages, { exclude: new Set() });
+  // Mirror the --subscription auto path (brick 523b6449): exclude account-level
+  // locked subs, not just directly-locked ones (isSubscriptionLocked propagates a
+  // direct lock to all sibling entries sharing the same account).
+  const exclude = new Set(
+    entries.filter((entry) => isSubscriptionLocked(entry, registry)).map((entry) => entry.id),
+  );
+  const picked = pickFailoverTarget(usages, { exclude });
   return {
     target: picked
       ? enriched.find((status) => status.profile.id === picked.id)?.profile
