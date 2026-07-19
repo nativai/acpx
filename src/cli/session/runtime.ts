@@ -1073,11 +1073,6 @@ async function resolveFailoverRecord(
   return record;
 }
 
-// On a failover-classified turn error (401/429/billing), switch the session to a
-// usable subscription and re-run the turn on a FRESH client (built from the
-// updated record → new CLAUDE_CONFIG_DIR, resuming the ported transcript). Not a
-// failover trigger, no registry, or exhausted → rethrow (the original error, or
-// AllSubscriptionsExhaustedError) for the normal failure path.
 // FIX-A: mirror a turn-ending failover-classified error that failover can't
 // recover HERE (disabled / no provider registry / no portable transcript anchor)
 // into `.messages.ndjson`, so the child + spawner are TOLD instead of reading the
@@ -1131,6 +1126,11 @@ async function surfaceFailoverTerminalError(
   }
 }
 
+// On a failover-classified turn error (401/429/billing), switch the session to a
+// usable subscription and re-run the turn on a FRESH client (built from the
+// updated record → new CLAUDE_CONFIG_DIR, resuming the ported transcript). Not a
+// failover trigger, no registry, or exhausted → rethrow (the original error, or
+// AllSubscriptionsExhaustedError) for the normal failure path.
 async function runQueuedTaskFailover(
   sessionRecordId: string,
   task: QueueTask,
