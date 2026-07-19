@@ -7,11 +7,50 @@ import test from "node:test";
 import { isAcpJsonRpcMessage } from "../src/acp/jsonrpc.js";
 import { resetKnownDeadSubs } from "../src/config/known-dead-subscriptions.js";
 import { AllSubscriptionsExhaustedError, BridgeAuthGatedError } from "../src/errors.js";
-import { attemptFailoverAndRetry } from "../src/runtime/engine/failover.js";
+import { attemptFailoverAndRetry, classifyFailover } from "../src/runtime/engine/failover.js";
 import { defaultSessionEventLog, sessionEventActivePath } from "../src/session/event-log.js";
-import { persistTerminalTurnError } from "../src/session/persist-terminal-error.js";
-import { writeSessionRecord } from "../src/session/persistence.js";
-import type { SessionRecord } from "../src/types.js";
+import { messagesLogPath } from "../src/session/messages-log.js";
+import {
+  buildTerminalTurnErrorMessage,
+  isTerminalTurnError,
+  mirrorTerminalTurnErrorToMessages,
+  persistTerminalTurnError,
+} from "../src/session/persist-terminal-error.js";
+import { sessionBaseDir, writeSessionRecord } from "../src/session/persistence.js";
+import type { SessionMessage, SessionRecord } from "../src/types.js";
+
+// Read the mirrored terminal-error entries acpx writes to a session's
+// `.messages.ndjson` sidecar (the conversation log spawner agents + the record's
+// `messages` read). FIX-A mirrors a terminal turn error here — in addition to the
+// `.stream.ndjson` write the UI reads — so a child that dies on a terminal error
+// AND its spawner are TOLD instead of seeing silence.
+async function readMirroredMessages(acpxRecordId: string): Promise<SessionMessage[]> {
+  const raw = await fs.readFile(messagesLogPath(sessionBaseDir(), acpxRecordId), "utf8");
+  return raw
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as SessionMessage);
+}
+
+// Narrow a mirrored entry to its synthetic Agent shape (content Text + the
+// structured `terminal_error` marker FIX-A stamps for programmatic classification).
+function asTerminalAgentEntry(message: SessionMessage): {
+  text: string;
+  detailCode?: string;
+  outputCode?: string;
+  message?: string;
+} {
+  assert.ok(typeof message === "object" && "Agent" in message, "entry is an Agent message");
+  const agent = message.Agent;
+  const first = agent.content[0];
+  assert.ok(first && "Text" in first, "Agent entry carries a Text block");
+  return {
+    text: first.Text,
+    detailCode: agent.terminal_error?.detail_code,
+    outputCode: agent.terminal_error?.output_code,
+    message: agent.terminal_error?.message,
+  };
+}
 
 // Mirrors acpx-ui's server/streamTail.ts terminal-error derivation EXACTLY (the
 // cross-repo contract this fix exists to satisfy): a stream line with NO `method`
@@ -176,6 +215,24 @@ test("a real exhausted turn persists the terminal error to .stream.ndjson with d
     const err = parsed.error as { code: unknown; message: unknown; data: { detailCode: unknown } };
     assert.equal(typeof err.code, "number");
     assert.equal(err.data.detailCode, "all-subscriptions-exhausted");
+
+    // FIX-A: the SAME terminal error must ALSO be mirrored into `.messages.ndjson`
+    // as an agent-visible entry — so a spawner polling the child's messages.ndjson
+    // is TOLD, not left reading the prompt then silence. Additive to the stream
+    // write asserted above (the two files are independent).
+    await mirrorTerminalTurnErrorToMessages(record, caught);
+    const mirrored = await readMirroredMessages("rec-exhausted");
+    assert.equal(mirrored.length, 1, "exactly one mirrored terminal-error entry");
+    const entry = asTerminalAgentEntry(mirrored[0]);
+    // Human-readable line a reader / UI renders.
+    assert.match(entry.text, /^⚠ turn failed: /);
+    assert.match(entry.text, /All subscriptions are exhausted or unavailable\./);
+    // Structured detailCode retained so a spawner can classify programmatically —
+    // the SAME cross-repo contract string as the stream line's data.detailCode.
+    assert.equal(entry.detailCode, "all-subscriptions-exhausted");
+    assert.match(entry.message ?? "", /All subscriptions are exhausted or unavailable\./);
+    // The broadened, class-agnostic routing predicate recognizes this error.
+    assert.equal(isTerminalTurnError(caught), true);
   } finally {
     server.close();
     process.env.CLAUDE_MESSAGES_ENDPOINT = prevEndpoint;
@@ -287,6 +344,16 @@ test("an auth-gated bridge turn persists a terminal error with detailCode 'auth-
     const err = parsed.error as { code: unknown; message: unknown; data: { detailCode: unknown } };
     assert.equal(typeof err.code, "number");
     assert.equal(err.data.detailCode, "auth-gated");
+
+    // FIX-A: the auth-gated terminal error also mirrors into `.messages.ndjson`
+    // with its detailCode retained, so the spawner is TOLD (not just the UI banner).
+    await mirrorTerminalTurnErrorToMessages(record, caught);
+    const mirrored = await readMirroredMessages("rec-authgated");
+    assert.equal(mirrored.length, 1, "exactly one mirrored terminal-error entry");
+    const entry = asTerminalAgentEntry(mirrored[0]);
+    assert.match(entry.text, /^⚠ turn failed: /);
+    assert.equal(entry.detailCode, "auth-gated");
+    assert.equal(isTerminalTurnError(caught), true);
   } finally {
     if (prevHome === undefined) {
       delete process.env.HOME;
@@ -296,4 +363,78 @@ test("an auth-gated bridge turn persists a terminal error with detailCode 'auth-
     await fs.rm(home, { recursive: true, force: true });
     resetKnownDeadSubs();
   }
+});
+
+// FIX-A — the turn-ending single-sub rate_limit path. A rate_limit that ends a
+// turn WITHOUT failover recovery (failover disabled / no sibling / no portable
+// anchor) is a terminal turn error: `classifyFailover` tags it `rate_limit`, so
+// the runtime's raw-exit mirror fires on it, and `isTerminalTurnError` is true so
+// the broadened failover-catch mirror fires too. Either way the child + spawner
+// must find an agent-visible entry (carrying the rate_limit detailCode) in
+// `.messages.ndjson`, not silence.
+test("a turn-ending rate_limit is mirrored into .messages.ndjson with its detailCode", async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-ratelimit-"));
+  const prevHome = process.env.HOME;
+  process.env.HOME = home;
+
+  try {
+    const record = makeRecord("rec-ratelimit");
+    await writeSessionRecord(record);
+
+    // The shape a turn-ending rate_limit surfaces with: the adapter tags
+    // data.errorKind = "rate_limit" (what classifyFailover keys on), and acpx's
+    // wrapping carries the top-level detailCode the normalizer reads.
+    const rateLimitError = new Error(
+      "Usage limit reached for this subscription — resets 2026-06-04T15:00:00Z",
+    ) as Error & {
+      acp?: { code: number; message: string; data: Record<string, unknown> };
+      detailCode?: string;
+    };
+    rateLimitError.acp = {
+      code: -32000,
+      message: rateLimitError.message,
+      data: { errorKind: "rate_limit" },
+    };
+    rateLimitError.detailCode = "rate_limit";
+
+    // Preconditions: this is exactly the classification the runtime routes on.
+    assert.equal(classifyFailover(rateLimitError), "rate_limit");
+    assert.equal(isTerminalTurnError(rateLimitError), true);
+
+    // Run the mirror the runtime chokepoints run on a terminal turn error.
+    await mirrorTerminalTurnErrorToMessages(record, rateLimitError);
+
+    const mirrored = await readMirroredMessages("rec-ratelimit");
+    assert.equal(mirrored.length, 1, "exactly one mirrored terminal-error entry");
+    const entry = asTerminalAgentEntry(mirrored[0]);
+    assert.match(entry.text, /^⚠ turn failed: Usage limit reached for this subscription/);
+    assert.equal(entry.detailCode, "rate_limit");
+    assert.match(entry.message ?? "", /Usage limit reached for this subscription/);
+
+    // A second terminal error appends a second entry (watermark honored, no clobber).
+    await mirrorTerminalTurnErrorToMessages(record, rateLimitError);
+    const after = await readMirroredMessages("rec-ratelimit");
+    assert.equal(after.length, 2, "second terminal error appends, not overwrites");
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
+// FIX-A — the mirror is class-agnostic. An error carrying NO detailCode is not a
+// terminal turn error for routing purposes (`isTerminalTurnError` false), but the
+// message builder still yields a legible, agent-visible line — so the mirror never
+// produces a blank entry even when a detailCode is absent.
+test("buildTerminalTurnErrorMessage always yields a legible line; detailCode gate is honest", () => {
+  const plain = new Error("something broke mid-turn");
+  assert.equal(isTerminalTurnError(plain), false);
+  const built = buildTerminalTurnErrorMessage(plain);
+  const entry = asTerminalAgentEntry(built);
+  assert.equal(entry.text, "⚠ turn failed: something broke mid-turn");
+  assert.equal(entry.detailCode, undefined);
+  assert.equal(entry.message, "something broke mid-turn");
 });
