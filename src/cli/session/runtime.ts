@@ -1178,6 +1178,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   } catch (error) {
     if (isSubscriptionLockBlockError(error)) {
       await persistTerminalTurnError(record, error).catch(() => {});
+      // FIX-A: additionally mirror into `.messages.ndjson` so the spawner sees the
+      // turn was refused (subscription locked) rather than silence. Best-effort.
+      await mirrorTerminalTurnErrorToMessages(record, error).catch(() => {});
     }
     throw error;
   }
