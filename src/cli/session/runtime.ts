@@ -84,7 +84,11 @@ import {
   persistSessionOwnerOptions,
   resolveSessionOwnerOptions,
 } from "../../session/owner-options.js";
-import { persistTerminalTurnError } from "../../session/persist-terminal-error.js";
+import {
+  isTerminalTurnError,
+  mirrorTerminalTurnErrorToMessages,
+  persistTerminalTurnError,
+} from "../../session/persist-terminal-error.js";
 import {
   absolutePath,
   isoNow,
@@ -1042,6 +1046,9 @@ async function applyQueuedTaskSubscriptionLockPolicy(
   } catch (error) {
     if (isSubscriptionLockBlockError(error)) {
       await persistTerminalTurnError(record, error).catch(() => {});
+      // FIX-A: additionally mirror into `.messages.ndjson` so the spawner sees the
+      // turn was refused (subscription locked) rather than silence. Best-effort.
+      await mirrorTerminalTurnErrorToMessages(record, error).catch(() => {});
     }
     throw error;
   }
@@ -1080,6 +1087,22 @@ async function runQueuedTaskFailover(
 ): Promise<SessionSendResult> {
   const record = await resolveFailoverRecord(sessionRecordId, error);
   if (!record) {
+    // A turn-ending failover-classified error (single-sub rate_limit / billing /
+    // auth) that failover can't recover HERE — failover disabled, no provider
+    // registry, or the record has no portable transcript anchor — still ends the
+    // turn with no agent reply. Mirror it into `.messages.ndjson` so the child +
+    // spawner are TOLD (FIX-A). Mirror-ONLY: unlike the acpx-synthesized
+    // exhaustion/auth-gated errors below, an adapter-surfaced rate_limit already
+    // reaches `.stream.ndjson` via the onAcpMessage tap, so re-writing the stream
+    // here would duplicate the UI's terminal line. Gated on `classifyFailover`
+    // (the exact rate_limit/billing/auth classifier the surrounding failover code
+    // uses) so interrupts and ordinary turn failures are NOT mirrored. Best-effort.
+    if (classifyFailover(error)) {
+      const terminalRecord = await resolveSessionRecord(sessionRecordId).catch(() => undefined);
+      if (terminalRecord) {
+        await mirrorTerminalTurnErrorToMessages(terminalRecord, error).catch(() => {});
+      }
+    }
     throw error;
   }
   let outcome: { result: SessionSendResult; switchedTo: string };
@@ -1111,6 +1134,19 @@ async function runQueuedTaskFailover(
       isSubscriptionLockBlockError(failoverError)
     ) {
       await persistTerminalTurnError(record, failoverError).catch(() => {});
+    }
+    // FIX-A: class-agnostic `.messages.ndjson` mirror, gated on
+    // `isTerminalTurnError` (ANY error that normalizes to a detailCode) rather
+    // than the specific classes above — so future terminal error kinds surface
+    // to the child + spawner with zero further changes at this routing site.
+    // ← EXTENSION POINT for w-fableshare: its forthcoming FableShareExhaustedError
+    //   (detailCode 'fable-share-exhausted') mirrors automatically once it
+    //   normalizes to that detailCode; to ALSO get the acpx-ui stream banner it
+    //   must be added to the narrow stream-write condition above (or subclass an
+    //   error already listed there). Additive + best-effort; never masks the
+    //   original error, which still reaches the CLI via sendQueuedTaskError.
+    if (isTerminalTurnError(failoverError)) {
+      await mirrorTerminalTurnErrorToMessages(record, failoverError).catch(() => {});
     }
     throw failoverError;
   }

@@ -346,6 +346,28 @@ export type SessionUserMessage = {
   claudeUuid?: string;
 };
 
+/**
+ * Structured terminal-turn-error marker (FIX-A). When a turn ends in a terminal
+ * error (all-subscriptions-exhausted / auth-gated / turn-ending rate_limit /
+ * future kinds), acpx mirrors it into the conversation as a synthetic Agent
+ * message so a child that dies on such an error AND its spawner are TOLD in
+ * `.messages.ndjson` (not only `.stream.ndjson`, which is human/UI-only). This
+ * marker carries the normalized cross-repo `detail_code` so an agent reading
+ * `messages.ndjson` can classify the failure programmatically; the human-readable
+ * message is also rendered as an Agent `Text` block ("⚠ turn failed: <message>").
+ *
+ * Snake_case throughout — the persisted-key policy (`persisted-key-policy.ts`)
+ * requires it, and the class-agnostic mirror maps `normalizeOutputError`'s camelCase
+ * fields onto these keys once at the write site.
+ */
+export type SessionTerminalError = {
+  message: string;
+  detail_code?: string;
+  output_code?: string;
+  origin?: string;
+  retryable?: boolean;
+};
+
 export type SessionAgentMessage = {
   content: SessionAgentContent[];
   tool_results: Record<string, SessionToolResult>;
@@ -356,6 +378,11 @@ export type SessionAgentMessage = {
    * `update._meta.claudeUuid`.
    */
   claudeUuid?: string;
+  /**
+   * Present only on a synthetic terminal-error entry (FIX-A). Absent on every
+   * normal streamed Agent turn.
+   */
+  terminal_error?: SessionTerminalError;
 };
 
 export type SessionMessage =
