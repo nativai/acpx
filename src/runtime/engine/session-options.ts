@@ -92,11 +92,12 @@ type SessionOptionBreadcrumbs = {
 };
 
 function sessionOptionBreadcrumbs(record: SessionRecord): SessionOptionBreadcrumbs {
+  const stored = record.acpx?.session_options;
   return {
-    subscriptionSwitch: record.acpx?.session_options?.subscription_switch,
-    accountSwitch: record.acpx?.session_options?.account_switch,
-    provisioningWarning: record.acpx?.session_options?.provisioning_warning,
-    autoFailover: record.acpx?.session_options?.auto_failover,
+    subscriptionSwitch: stored?.subscription_switch,
+    accountSwitch: stored?.account_switch,
+    provisioningWarning: stored?.provisioning_warning,
+    autoFailover: stored?.auto_failover,
   };
 }
 
