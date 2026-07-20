@@ -5,7 +5,10 @@ import {
   isAcpQueryClosedBeforeResponseError,
   isAcpResourceNotFoundError,
 } from "../../acp/error-normalization.js";
-import { assertRequestedModelSupported } from "../../acp/model-support.js";
+import {
+  assertRequestedModelSupported,
+  RequestedModelUnsupportedError,
+} from "../../acp/model-support.js";
 import { InterruptedError, TimeoutError, withTimeout } from "../../async-control.js";
 import { findProfile, loadProfileRegistry, transcriptAnchorDir } from "../../config/profiles.js";
 import {
@@ -14,6 +17,7 @@ import {
   type TranscriptRecoveryResult,
 } from "../../config/subscription-transcript.js";
 import {
+  ModelFloorUnmetError,
   SessionConfigOptionReplayError,
   SessionModeReplayError,
   SessionModelReplayError,
@@ -218,6 +222,24 @@ async function replayDesiredModel(params: {
     }
     return true;
   } catch (error) {
+    // Harden the "target can't serve the pinned model" case (brick://07dd62c9 §5A):
+    // when the reconnected/failed-over session does NOT advertise the pinned model,
+    // the desired model IS a pinned floor that the target cannot meet — surface it
+    // as a LOUD ModelFloorUnmetError (detailCode 'model-floor-unmet' → acpx-ui
+    // banner + parent-visible via the terminal mirror) instead of a generic
+    // SESSION_MODEL_REPLAY_FAILED that reads as an internal replay hiccup. The
+    // model the target IS serving becomes the observed served model. Retryable is
+    // preserved; the failover loop is already bounded (it terminates on all-siblings
+    // -exhausted), so this never deadlocks. Other replay failures (network/timeout)
+    // keep the generic retryable SessionModelReplayError.
+    if (error instanceof RequestedModelUnsupportedError) {
+      throw new ModelFloorUnmetError({
+        pinnedModel: params.desiredModelId,
+        servedModel: params.models?.currentModelId,
+        phase: "post-serve",
+        detail: `reconnected/failover target does not advertise the pinned model`,
+      });
+    }
     throw new SessionModelReplayError(
       `Failed to replay saved session model ${params.desiredModelId} on reconnected ACP session ${params.sessionId}: ${formatErrorMessage(error)}`,
       {

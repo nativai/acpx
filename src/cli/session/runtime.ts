@@ -1091,6 +1091,17 @@ async function mirrorUnrecoveredTerminalTurnError(
   sessionRecordId: string,
   error: unknown,
 ): Promise<void> {
+  // A ModelFloorUnmetError from the reconnect/failover model-replay (brick://07dd62c9
+  // C4) is a loud terminal that must reach BOTH sinks even when it is not a
+  // failover-classified error — surface its stream banner + messages mirror here.
+  if (isModelFloorUnmetError(error)) {
+    const record = await resolveSessionRecord(sessionRecordId).catch(() => undefined);
+    if (record) {
+      await persistTerminalTurnError(record, error).catch(() => {});
+      await mirrorTerminalTurnErrorToMessages(record, error).catch(() => {});
+    }
+    return;
+  }
   if (!classifyFailover(error)) {
     return;
   }
@@ -1123,6 +1134,7 @@ async function surfaceFailoverTerminalError(
     failoverError instanceof AllSubscriptionsExhaustedError ||
     failoverError instanceof BridgeAuthGatedError ||
     failoverError instanceof FableShareExhaustedError ||
+    isModelFloorUnmetError(failoverError) ||
     isSubscriptionLockBlockError(failoverError)
   ) {
     await persistTerminalTurnError(record, failoverError).catch(() => {});
