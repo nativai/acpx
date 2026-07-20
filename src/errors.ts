@@ -290,6 +290,7 @@ export class FableShareExhaustedError extends AcpxOperationalError {
 export class ModelFloorUnmetError extends AcpxOperationalError {
   readonly pinnedModel: string;
   readonly servedModel: string | undefined;
+  readonly phase: "pre-turn" | "post-serve";
 
   constructor(params: {
     pinnedModel: string;
@@ -315,7 +316,12 @@ export class ModelFloorUnmetError extends AcpxOperationalError {
     );
     this.pinnedModel = params.pinnedModel;
     this.servedModel = params.servedModel;
+    this.phase = params.phase;
   }
+}
+
+export function isModelFloorUnmetError(error: unknown): error is ModelFloorUnmetError {
+  return error instanceof ModelFloorUnmetError;
 }
 
 // Every same-family subscription target is locked by operator action. Distinct

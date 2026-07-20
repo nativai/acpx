@@ -8,6 +8,7 @@ import {
   type ModelFloorEvaluation,
   pinnedEffortFloor,
   pinnedModelFloor,
+  setFloorParked,
   stampServedBelowFloor,
 } from "./model-floor.js";
 import {
@@ -89,12 +90,17 @@ export async function enforceModelFloorPostServe(
     return { accept: true };
   }
 
-  // Hard mode: do NOT accept. Surface to both sinks and quarantine the content.
+  // Hard mode: do NOT accept. Surface to both sinks, PARK, and quarantine the
+  // content. Retry-across-time is the retryable error + the parent re-delivering:
+  // each re-delivered turn re-enters the pre-turn gate, and the next at-floor serve
+  // auto-clears the park. (We deliberately do NOT auto-re-run the agent turn from
+  // the runtime — the prompt was already consumed; re-running is unsafe.)
   const error = new ModelFloorUnmetError({
     pinnedModel: evaluation.pinnedModel,
     servedModel: evaluation.servedModel,
     phase: "post-serve",
   });
+  setFloorParked(record, evaluation.servedModel);
   await persistTerminalTurnError(record, error).catch(() => {});
   await mirrorTerminalTurnErrorToMessages(record, error).catch(() => {});
   await writeSessionRecordAtBoundary(record).catch(() => {});

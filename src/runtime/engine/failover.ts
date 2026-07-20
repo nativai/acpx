@@ -10,6 +10,7 @@ import {
   loadProfileRegistry,
 } from "../../config/profiles.js";
 import {
+  getSubscriptionsFableState,
   getSubscriptionsUsage,
   getSubscriptionsUsageWithFable,
   isFableModel,
@@ -28,8 +29,10 @@ import {
   AllSubscriptionsLockedError,
   BridgeAuthGatedError,
   FableShareExhaustedError,
+  ModelFloorUnmetError,
   SubscriptionLockedError,
 } from "../../errors.js";
+import { floorHardEnabled, pinnedModelFloor, setFloorParked } from "../../session/model-floor.js";
 import { writeSessionRecord } from "../../session/persistence/repository.js";
 import type { SessionRecord } from "../../types.js";
 import {
@@ -839,6 +842,52 @@ export async function enforceSubscriptionLockBeforeTurn(
   await switchSessionAccount(record, picked.target.id, "locked", loadOpts);
   await writeSessionRecord(record);
   return { switchedTo: picked.target.id };
+}
+
+// Pre-turn probe-gate for `--floor-hard` (brick://07dd62c9 §5b.a) — the
+// "never-SUBMIT-when-knowably-down" half. Mirrors enforceSubscriptionLockBeforeTurn:
+// runs before the prompt is submitted, and refuses UPFRONT (throwing a retryable
+// ModelFloorUnmetError, no prompt sent) when the pinned model is knowably
+// unservable. It is ADVISORY by construction (the fable-share probe flaps), so it
+// only fires on POSITIVE evidence of clean exhaustion on EVERY subscription — any
+// probe reading available OR unknown (a flap / probe error) proceeds and lets the
+// post-serve check be the airtight backstop. A no-op outside --floor-hard, for a
+// non-fable pin (no probe primitive exists), or with no registry. On a refusal
+// the session is PARKED (durable breadcrumb) and auto-recovers on the next
+// at-floor serve.
+export async function enforceModelFloorBeforeTurn(
+  record: SessionRecord,
+  loadOpts?: SubscriptionLookupOptions,
+): Promise<void> {
+  if (!floorHardEnabled(record)) {
+    return;
+  }
+  const pinnedModel = pinnedModelFloor(record);
+  if (!pinnedModel || !isFableModel(pinnedModel)) {
+    // The 1-token exhaustion probe exists only for the Fable share. A non-Fable
+    // pin (opus/sonnet) has no pre-turn signal — the post-serve check catches it.
+    return;
+  }
+  const entries = loadSubscriptionRegistry(loadOpts).subscriptions;
+  if (entries.length === 0) {
+    return;
+  }
+  // Fresh probe (bypass the 5-min cache) so a floor decision never acts on a stale
+  // "available". getSubscriptionsFableState never rejects; a probe ERROR is UNKNOWN.
+  const states = [...(await getSubscriptionsFableState(entries, true)).values()];
+  const anyAvailable = states.some((state) => state.available === true);
+  const anyUnknown = states.some((state) => state.error !== undefined);
+  if (anyAvailable || anyUnknown) {
+    return; // servable somewhere, or a flap/probe-miss — proceed; post-serve backstops.
+  }
+  // Clean 429 on every subscription: the pin is knowably unservable right now.
+  setFloorParked(record, pinnedModel);
+  await writeSessionRecord(record).catch(() => {});
+  throw new ModelFloorUnmetError({
+    pinnedModel,
+    phase: "pre-turn",
+    detail: "fable-share probed cleanly exhausted on all subscriptions",
+  });
 }
 
 // Choose the terminal error class by the INITIAL trigger (the user's selected

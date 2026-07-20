@@ -21,12 +21,14 @@ import {
   AllSubscriptionsExhaustedError,
   BridgeAuthGatedError,
   FableShareExhaustedError,
+  isModelFloorUnmetError,
   PermissionPromptUnavailableError,
   SessionClosedError,
 } from "../../errors.js";
 import {
   attemptFailoverAndRetry,
   classifyFailover,
+  enforceModelFloorBeforeTurn,
   enforceSubscriptionLockBeforeTurn,
   failoverEnabled,
   failoverEnabledForRecord,
@@ -1189,11 +1191,15 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   }
   try {
     await enforceSubscriptionLockBeforeTurn(record);
+    // Pre-turn model-floor gate (brick://07dd62c9 §5b.a): under --floor-hard,
+    // refuse UPFRONT (no prompt submitted) when the pinned model is knowably
+    // unservable, so no work is done at a knowably-down moment. No-op otherwise.
+    await enforceModelFloorBeforeTurn(record);
   } catch (error) {
-    if (isSubscriptionLockBlockError(error)) {
+    if (isSubscriptionLockBlockError(error) || isModelFloorUnmetError(error)) {
       await persistTerminalTurnError(record, error).catch(() => {});
-      // FIX-A: additionally mirror into `.messages.ndjson` so the spawner sees the
-      // turn was refused (subscription locked) rather than silence. Best-effort.
+      // Mirror into `.messages.ndjson` so the child + spawner see the turn was
+      // refused (subscription locked / below pinned floor) rather than silence.
       await mirrorTerminalTurnErrorToMessages(record, error).catch(() => {});
     }
     throw error;
