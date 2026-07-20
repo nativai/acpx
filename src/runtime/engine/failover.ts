@@ -875,7 +875,7 @@ export async function enforceModelFloorBeforeTurn(
   // Fresh probe (bypass the 5-min cache) so a floor decision never acts on a stale
   // "available". getSubscriptionsFableState never rejects; a probe ERROR is UNKNOWN.
   const states = [...(await getSubscriptionsFableState(entries, true)).values()];
-  const anyAvailable = states.some((state) => state.available === true);
+  const anyAvailable = states.some((state) => state.available);
   const anyUnknown = states.some((state) => state.error !== undefined);
   if (anyAvailable || anyUnknown) {
     return; // servable somewhere, or a flap/probe-miss — proceed; post-serve backstops.

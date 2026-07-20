@@ -101,15 +101,15 @@ type SessionOptionBreadcrumbs = {
 };
 
 function sessionOptionBreadcrumbs(record: SessionRecord): SessionOptionBreadcrumbs {
-  const stored = record.acpx?.session_options;
+  const stored = record.acpx?.session_options ?? {};
   return {
-    subscriptionSwitch: stored?.subscription_switch,
-    accountSwitch: stored?.account_switch,
-    provisioningWarning: stored?.provisioning_warning,
-    autoFailover: stored?.auto_failover,
-    floorHard: stored?.floor_hard,
-    model: stored?.model,
-    effort: stored?.effort,
+    subscriptionSwitch: stored.subscription_switch,
+    accountSwitch: stored.account_switch,
+    provisioningWarning: stored.provisioning_warning,
+    autoFailover: stored.auto_failover,
+    floorHard: stored.floor_hard,
+    model: stored.model,
+    effort: stored.effort,
   };
 }
 
@@ -144,29 +144,31 @@ function assignBreadcrumbs(
   if (breadcrumbs.provisioningWarning !== undefined) {
     target.provisioning_warning = breadcrumbs.provisioningWarning;
   }
-  // Only carry the persisted auto_failover when the rebuilt options did not
-  // already set it — an explicit options.autoFailover (persistedSessionOptions
-  // wrote it) is a deliberate policy change and must win over the prior value.
-  if (breadcrumbs.autoFailover !== undefined && target.auto_failover === undefined) {
+  carryDurableIfUnset(target, breadcrumbs);
+}
+
+// Carry the durable POLICY/PIN fields (auto_failover, floor_hard, model, effort)
+// from the prior record ONLY when the rebuilt options did not already set them —
+// an explicit spawn flag (already written into `target` by persistedSessionOptions)
+// is a deliberate change and must win. auto_failover: brick://71af1351; floor_hard:
+// brick://07dd62c9; model/effort record-loss gap: brick://dda08023 fold-in.
+// carryForwardPinnedFloor seeds these onto the record only when it carries no pin
+// of its own, so this never overwrites a live-applied pin. Assigning an undefined
+// breadcrumb leaves the field undefined (a no-op — dropped by JSON serialization).
+function carryDurableIfUnset(
+  target: PersistedSessionOptions,
+  breadcrumbs: SessionOptionBreadcrumbs,
+): void {
+  if (target.auto_failover === undefined) {
     target.auto_failover = breadcrumbs.autoFailover;
   }
-  // floor_hard rides the same carry-forward (brick://07dd62c9) — a durable
-  // per-session policy that must survive owner respawns rebuilding
-  // session_options from spawn flags; an explicit options.floorHard still wins.
-  if (breadcrumbs.floorHard !== undefined && target.floor_hard === undefined) {
+  if (target.floor_hard === undefined) {
     target.floor_hard = breadcrumbs.floorHard;
   }
-  // The pinned model/effort ride the same carry-forward (brick://07dd62c9 fold-in
-  // of brick://dda08023's fresh-create record-loss gap): when an owner respawn
-  // rebuilds session_options WITHOUT the pin (spawn flags omitted it), preserve
-  // the prior pin rather than dropping it — an explicit flag (already written into
-  // `target`) still wins. carryForwardPinnedFloor seeds these onto the record only
-  // when the rebuilt record carries no pin of its own, so this never overwrites a
-  // live-applied pin.
-  if (breadcrumbs.model !== undefined && target.model === undefined) {
+  if (target.model === undefined) {
     target.model = breadcrumbs.model;
   }
-  if (breadcrumbs.effort !== undefined && target.effort === undefined) {
+  if (target.effort === undefined) {
     target.effort = breadcrumbs.effort;
   }
 }
@@ -226,18 +228,20 @@ function persistedSessionOptions(
   return hasPersistedSessionOptions(next) ? next : undefined;
 }
 
+const PERSISTED_CONTENT_KEYS = [
+  "model",
+  "allowed_tools",
+  "max_turns",
+  "system_prompt",
+  "subscription",
+  "profile",
+  "effort",
+  "auto_failover",
+  "floor_hard",
+] as const satisfies ReadonlyArray<keyof PersistedSessionOptions>;
+
 function hasPersistedSessionOptions(options: PersistedSessionOptions): boolean {
-  return (
-    options.model !== undefined ||
-    options.allowed_tools !== undefined ||
-    options.max_turns !== undefined ||
-    options.system_prompt !== undefined ||
-    options.subscription !== undefined ||
-    options.profile !== undefined ||
-    options.effort !== undefined ||
-    options.auto_failover !== undefined ||
-    options.floor_hard !== undefined
-  );
+  return PERSISTED_CONTENT_KEYS.some((key) => options[key] !== undefined);
 }
 
 function normalizeSystemPromptOption(value: unknown): SystemPromptOption | undefined {

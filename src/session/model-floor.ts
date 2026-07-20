@@ -203,24 +203,30 @@ async function readLastAssistantModelFromJsonl(filePath: string): Promise<string
   }
 }
 
-function assistantModelFromJsonlLine(line: string): string | undefined {
+function parseJsonObject(line: string): Record<string, unknown> | undefined {
   if (!line) {
     return undefined;
   }
-  let parsed: unknown;
   try {
-    parsed = JSON.parse(line);
+    const parsed: unknown = JSON.parse(line);
+    return typeof parsed === "object" && parsed !== null
+      ? (parsed as Record<string, unknown>)
+      : undefined;
   } catch {
     return undefined;
   }
-  if (typeof parsed !== "object" || parsed === null) {
+}
+
+function assistantModelFromJsonlLine(line: string): string | undefined {
+  const entry = parseJsonObject(line);
+  if (!entry || entry.type !== "assistant") {
     return undefined;
   }
-  const entry = parsed as { type?: unknown; message?: unknown };
-  if (entry.type !== "assistant" || typeof entry.message !== "object" || entry.message === null) {
+  const message = entry.message;
+  if (typeof message !== "object" || message === null) {
     return undefined;
   }
-  const model = (entry.message as { model?: unknown }).model;
+  const model = (message as { model?: unknown }).model;
   return typeof model === "string" && model.trim().length > 0 ? model.trim() : undefined;
 }
 

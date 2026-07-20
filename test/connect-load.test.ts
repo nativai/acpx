@@ -1704,6 +1704,75 @@ test("connectAndLoadSession fails clearly when saved model cannot be replayed ge
   });
 });
 
+// brick://07dd62c9 C4: when the reconnected/failover target advertises a model
+// SET that LACKS the pinned model, that is a pinned FLOOR the target cannot meet —
+// the replay must surface a LOUD ModelFloorUnmetError (detailCode model-floor-unmet
+// → acpx-ui banner + parent-visible), NOT a generic SESSION_MODEL_REPLAY_FAILED
+// that reads as an internal hiccup. (Distinct from the "no model metadata at all"
+// case above, which stays SessionModelReplayError.)
+test("connectAndLoadSession surfaces a loud model-floor terminal when the resume target advertises a set lacking the pinned model", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "floor-crossing-record",
+      acpSessionId: "resume-session",
+      agentCommand: "agent",
+      cwd,
+      acpx: { session_options: { model: "fable" } },
+    });
+
+    // The target serves sonnet/opus but NOT the pinned fable → below floor.
+    const resumedModels: SessionModelState = {
+      currentModelId: "sonnet",
+      availableModels: [
+        { modelId: "sonnet", name: "sonnet" },
+        { modelId: "opus", name: "opus" },
+      ],
+    };
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({ running: true }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => true,
+      resumeSession: async () => ({
+        agentSessionId: "resumed-runtime-session",
+        models: resumedModels,
+      }),
+      loadSessionWithOptions: async () => {
+        throw new Error("loadSessionWithOptions should not be called");
+      },
+      createSession: async () => {
+        throw new Error("createSession should not be called");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async () => {
+        throw new Error("setSessionModel should not be called");
+      },
+      setSessionConfigOption: async () => ({ configOptions: [] }),
+    };
+
+    await assert.rejects(
+      async () =>
+        await connectAndLoadSession({
+          client: client as never,
+          record,
+          activeController: ACTIVE_CONTROLLER,
+        }),
+      (error: unknown) => {
+        assert(error instanceof Error);
+        assert.equal(error.name, "ModelFloorUnmetError");
+        assert.equal((error as Error & { detailCode?: string }).detailCode, "model-floor-unmet");
+        // Observed served model = what the target IS serving.
+        assert.equal((error as Error & { servedModel?: string }).servedModel, "sonnet");
+        return true;
+      },
+    );
+  });
+});
+
 test("connectAndLoadSession restores the original session when desired model replay fails", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

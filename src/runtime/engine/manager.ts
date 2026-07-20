@@ -239,6 +239,69 @@ function resumePolicyForSessionMode(mode: "persistent" | "oneshot"): SessionResu
   return mode === "persistent" ? "same-session-only" : "allow-new";
 }
 
+// The durable session_options fields carryForwardPinnedFloor seeds from a prior
+// record when the fresh-create spawn flags omit them (brick://07dd62c9 §8).
+type PersistedSessionOptions = NonNullable<NonNullable<SessionRecord["acpx"]>["session_options"]>;
+type SeedableSessionOptionField = "auto_failover" | "floor_hard" | "model" | "effort";
+
+// Which durable fields the incoming spawn options DON'T carry (so a prior value
+// must be seeded). model/effort are seeded ONLY when the record has no pin of its
+// own — the live-applied model/effort already wrote session_options when a flag
+// carried them; policy flags (auto_failover/floor_hard) are absent from the
+// live-apply path, so they seed whenever the spawn flag omits them.
+function pinnedFloorFieldsToSeed(
+  record: SessionRecord,
+  opts: SessionAgentOptions | undefined,
+): SeedableSessionOptionField[] {
+  return [...policyFieldsToSeed(opts), ...pinFieldsToSeed(record, opts)];
+}
+
+function policyFieldsToSeed(opts: SessionAgentOptions | undefined): SeedableSessionOptionField[] {
+  const provided = opts ?? {};
+  const fields: SeedableSessionOptionField[] = [];
+  if (provided.autoFailover === undefined) {
+    fields.push("auto_failover");
+  }
+  if (provided.floorHard === undefined) {
+    fields.push("floor_hard");
+  }
+  return fields;
+}
+
+function pinFieldsToSeed(
+  record: SessionRecord,
+  opts: SessionAgentOptions | undefined,
+): SeedableSessionOptionField[] {
+  const { model, effort } = record.acpx?.session_options ?? {};
+  const provided = opts ?? {};
+  const fields: SeedableSessionOptionField[] = [];
+  if (provided.model === undefined && model === undefined) {
+    fields.push("model");
+  }
+  if (provided.reasoningEffort === undefined && effort === undefined) {
+    fields.push("effort");
+  }
+  return fields;
+}
+
+// Copy one durable field from the prior options onto the carried options. Returns
+// true when a value was actually seeded (empty string / undefined are skipped).
+function seedSessionOptionField(
+  target: PersistedSessionOptions,
+  prior: PersistedSessionOptions,
+  field: SeedableSessionOptionField,
+): boolean {
+  const value = prior[field];
+  if (value === undefined || value === "") {
+    return false;
+  }
+  // `field` is a known key; the value's runtime type matches the target slot. The
+  // heterogeneous field union defeats a direct typed assignment, so index via an
+  // unknown-valued view (not `any`).
+  (target as Record<string, unknown>)[field] = value;
+  return true;
+}
+
 function legacyTerminalEventFromTurnResult(result: AcpRuntimeTurnResult): AcpRuntimeEvent {
   if (result.status === "failed") {
     return {
@@ -662,62 +725,31 @@ export class AcpRuntimeManager {
     record: SessionRecord,
     effectiveSessionOptions: SessionAgentOptions | undefined,
   ): Promise<void> {
-    const priorFields = this.priorSessionOptionsToCarry(record, effectiveSessionOptions);
-    if (priorFields === undefined) {
+    const fields = pinnedFloorFieldsToSeed(record, effectiveSessionOptions);
+    if (fields.length === 0) {
       return;
     }
-    const prior = await this.options.sessionStore.load(record.acpxRecordId).catch(() => undefined);
-    const priorOptions = prior?.acpx?.session_options;
+    const priorOptions = await this.loadPriorSessionOptions(record.acpxRecordId);
     if (!priorOptions) {
       return;
     }
-    const carried: NonNullable<SessionRecord["acpx"]>["session_options"] = {
-      ...record.acpx?.session_options,
-    };
+    const carried: PersistedSessionOptions = { ...record.acpx?.session_options };
     let changed = false;
-    if (priorFields.autoFailover && priorOptions.auto_failover !== undefined) {
-      carried.auto_failover = priorOptions.auto_failover;
-      changed = true;
-    }
-    if (priorFields.floorHard && priorOptions.floor_hard !== undefined) {
-      carried.floor_hard = priorOptions.floor_hard;
-      changed = true;
-    }
-    if (priorFields.model && typeof priorOptions.model === "string" && priorOptions.model !== "") {
-      carried.model = priorOptions.model;
-      changed = true;
-    }
-    if (
-      priorFields.effort &&
-      typeof priorOptions.effort === "string" &&
-      priorOptions.effort !== ""
-    ) {
-      carried.effort = priorOptions.effort;
-      changed = true;
+    for (const field of fields) {
+      if (seedSessionOptionField(carried, priorOptions, field)) {
+        changed = true;
+      }
     }
     if (changed) {
       record.acpx = { ...record.acpx, session_options: carried };
     }
   }
 
-  // Which durable fields the incoming spawn options DON'T carry (so a prior value
-  // must be seeded). undefined ⇒ every field is explicitly provided; nothing to do.
-  private priorSessionOptionsToCarry(
-    record: SessionRecord,
-    effectiveSessionOptions: SessionAgentOptions | undefined,
-  ): { autoFailover: boolean; floorHard: boolean; model: boolean; effort: boolean } | undefined {
-    const needs = {
-      autoFailover: effectiveSessionOptions?.autoFailover === undefined,
-      floorHard: effectiveSessionOptions?.floorHard === undefined,
-      // Only seed the pin when the current record has no pin of its own — the
-      // live-applied model/effort (applyRequestedModelIfAdvertised etc.) already
-      // wrote session_options.model when a flag carried it.
-      model: effectiveSessionOptions?.model === undefined && !record.acpx?.session_options?.model,
-      effort:
-        effectiveSessionOptions?.reasoningEffort === undefined &&
-        !record.acpx?.session_options?.effort,
-    };
-    return needs.autoFailover || needs.floorHard || needs.model || needs.effort ? needs : undefined;
+  private async loadPriorSessionOptions(
+    recordId: string,
+  ): Promise<PersistedSessionOptions | undefined> {
+    const prior = await this.options.sessionStore.load(recordId).catch(() => undefined);
+    return prior?.acpx?.session_options;
   }
 
   private async keepPersistentClient(

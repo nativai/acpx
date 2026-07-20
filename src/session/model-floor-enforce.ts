@@ -58,43 +58,62 @@ export async function enforceModelFloorPostServe(
   });
 
   if (evaluation.status !== "below-floor") {
-    // At floor (or served unreadable — do not fail a legitimate turn on a
-    // transient transcript-read miss, §9). Auto-recover: clear any open episode.
-    const recovered = clearFloorBreadcrumbs(record);
-    if (recovered) {
-      await writeSessionRecordAtBoundary(record).catch(() => {});
-      logFloor(
-        params.verbose,
-        `recovered — served ${evaluation.servedModel ?? "?"} at floor`,
-        record,
-      );
-    }
-    return { accept: true, recovered };
+    return await acceptAtFloor(record, evaluation, params.verbose);
   }
 
   const firstOfEpisode = !belowFloorEpisodeOpen(record);
   stampServedBelowFloor(record, evaluation);
 
-  if (!floorHardEnabled(record)) {
-    // Default mode: surface loudly but ACCEPT. Debounce the session-visible
-    // warning to once per contiguous below-floor episode.
-    if (firstOfEpisode) {
-      await mirrorFloorWarningToMessages(record, evaluation).catch(() => {});
-    }
-    await writeSessionRecordAtBoundary(record).catch(() => {});
-    logFloor(
-      params.verbose,
-      `served ${evaluation.servedModel ?? "?"} below pinned ${evaluation.pinnedModel} — accepted (detect+surface)`,
-      record,
-    );
-    return { accept: true };
-  }
+  return floorHardEnabled(record)
+    ? await refuseHardBelowFloor(record, evaluation, params.verbose)
+    : await acceptWithWarning(record, evaluation, firstOfEpisode, params.verbose);
+}
 
-  // Hard mode: do NOT accept. Surface to both sinks, PARK, and quarantine the
-  // content. Retry-across-time is the retryable error + the parent re-delivering:
-  // each re-delivered turn re-enters the pre-turn gate, and the next at-floor serve
-  // auto-clears the park. (We deliberately do NOT auto-re-run the agent turn from
-  // the runtime — the prompt was already consumed; re-running is unsafe.)
+// At floor (or served unreadable — do not fail a legitimate turn on a transient
+// transcript-read miss, §9). Auto-recover: clear any open below-floor episode.
+async function acceptAtFloor(
+  record: SessionRecord,
+  evaluation: ModelFloorEvaluation,
+  verbose: boolean | undefined,
+): Promise<ModelFloorVerdict> {
+  const recovered = clearFloorBreadcrumbs(record);
+  if (recovered) {
+    await writeSessionRecordAtBoundary(record).catch(() => {});
+    logFloor(verbose, `recovered — served ${evaluation.servedModel ?? "?"} at floor`, record);
+  }
+  return { accept: true, recovered };
+}
+
+// Default mode: surface loudly but ACCEPT. Debounce the session-visible warning to
+// once per contiguous below-floor episode.
+async function acceptWithWarning(
+  record: SessionRecord,
+  evaluation: ModelFloorEvaluation,
+  firstOfEpisode: boolean,
+  verbose: boolean | undefined,
+): Promise<ModelFloorVerdict> {
+  if (firstOfEpisode) {
+    await mirrorFloorWarningToMessages(record, evaluation).catch(() => {});
+  }
+  await writeSessionRecordAtBoundary(record).catch(() => {});
+  logFloor(
+    verbose,
+    `served ${evaluation.servedModel ?? "?"} below pinned ${evaluation.pinnedModel} — accepted (detect+surface)`,
+    record,
+  );
+  return { accept: true };
+}
+
+// Hard mode: do NOT accept. Surface to both sinks, PARK, and quarantine the
+// content. Retry-across-time is the retryable error + the parent re-delivering:
+// each re-delivered turn re-enters the pre-turn gate, and the next at-floor serve
+// auto-clears the park. (We deliberately do NOT auto-re-run the agent turn from
+// the runtime — the prompt was already consumed; re-running is unsafe.)
+async function refuseHardBelowFloor(
+  record: SessionRecord,
+  evaluation: ModelFloorEvaluation,
+  verbose: boolean | undefined,
+): Promise<ModelFloorVerdict> {
   const error = new ModelFloorUnmetError({
     pinnedModel: evaluation.pinnedModel,
     servedModel: evaluation.servedModel,
@@ -105,7 +124,7 @@ export async function enforceModelFloorPostServe(
   await mirrorTerminalTurnErrorToMessages(record, error).catch(() => {});
   await writeSessionRecordAtBoundary(record).catch(() => {});
   logFloor(
-    params.verbose,
+    verbose,
     `served ${evaluation.servedModel ?? "?"} below pinned ${evaluation.pinnedModel} — REFUSED (floor-hard)`,
     record,
   );

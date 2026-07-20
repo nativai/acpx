@@ -222,32 +222,53 @@ async function replayDesiredModel(params: {
     }
     return true;
   } catch (error) {
-    // Harden the "target can't serve the pinned model" case (brick://07dd62c9 §5A):
-    // when the reconnected/failed-over session does NOT advertise the pinned model,
-    // the desired model IS a pinned floor that the target cannot meet — surface it
-    // as a LOUD ModelFloorUnmetError (detailCode 'model-floor-unmet' → acpx-ui
-    // banner + parent-visible via the terminal mirror) instead of a generic
-    // SESSION_MODEL_REPLAY_FAILED that reads as an internal replay hiccup. The
-    // model the target IS serving becomes the observed served model. Retryable is
-    // preserved; the failover loop is already bounded (it terminates on all-siblings
-    // -exhausted), so this never deadlocks. Other replay failures (network/timeout)
-    // keep the generic retryable SessionModelReplayError.
-    if (error instanceof RequestedModelUnsupportedError) {
-      throw new ModelFloorUnmetError({
-        pinnedModel: params.desiredModelId,
-        servedModel: params.models?.currentModelId,
-        phase: "post-serve",
-        detail: `reconnected/failover target does not advertise the pinned model`,
-      });
-    }
-    throw new SessionModelReplayError(
-      `Failed to replay saved session model ${params.desiredModelId} on reconnected ACP session ${params.sessionId}: ${formatErrorMessage(error)}`,
-      {
-        cause: error instanceof Error ? error : undefined,
-        retryable: true,
-      },
-    );
+    throw toModelReplayError(error, {
+      desiredModelId: params.desiredModelId,
+      sessionId: params.sessionId,
+      servedModelId: params.models?.currentModelId,
+      // Only the "advertises a model SET that LACKS the pin" case is a floor
+      // violation (below). A target advertising NO model metadata at all is a
+      // capability mismatch, not a serving downgrade — keep the generic error.
+      hasAdvertisedModels: params.models !== undefined,
+    });
   }
+}
+
+// Map a failed desired-model replay to the right terminal. Harden the "target
+// can't serve the pinned model" case (brick://07dd62c9 §5A): when the reconnected
+// / failed-over session advertises a model set that does NOT include the pinned
+// model, the desired model IS a pinned floor the target cannot meet — surface it
+// as a LOUD ModelFloorUnmetError (detailCode 'model-floor-unmet' → acpx-ui banner
+// + parent-visible terminal mirror, observed served model = what the target IS
+// serving) instead of a generic SESSION_MODEL_REPLAY_FAILED that reads as an
+// internal replay hiccup. Retryable is preserved; the failover loop is already
+// bounded (terminates on all-siblings-exhausted), so this never deadlocks. A
+// target advertising NO model metadata (no generic model support) and other replay
+// failures (network/timeout) keep the generic retryable SessionModelReplayError.
+function toModelReplayError(
+  error: unknown,
+  params: {
+    desiredModelId: string;
+    sessionId: string;
+    servedModelId: string | undefined;
+    hasAdvertisedModels: boolean;
+  },
+): Error {
+  if (error instanceof RequestedModelUnsupportedError && params.hasAdvertisedModels) {
+    return new ModelFloorUnmetError({
+      pinnedModel: params.desiredModelId,
+      servedModel: params.servedModelId,
+      phase: "post-serve",
+      detail: "reconnected/failover target advertises a model set that lacks the pinned model",
+    });
+  }
+  return new SessionModelReplayError(
+    `Failed to replay saved session model ${params.desiredModelId} on reconnected ACP session ${params.sessionId}: ${formatErrorMessage(error)}`,
+    {
+      cause: error instanceof Error ? error : undefined,
+      retryable: true,
+    },
+  );
 }
 
 async function replayDesiredConfigOptions(params: {
