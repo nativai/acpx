@@ -14,6 +14,10 @@ function messagesEndpoint(): string {
 }
 
 const PROBE_MODEL = "claude-haiku-4-5-20251001";
+// The dedicated Fable-share probe model. A 1-token generation against this model
+// is the ONLY reliable per-subscription Fable-share exhaustion signal today
+// (200 ⇒ available, 429 ⇒ exhausted) — the 5h/7d unified windows do not track it.
+const FABLE_PROBE_MODEL = "claude-fable-5";
 const FETCH_TIMEOUT_MS = 10_000;
 const CACHE_TTL_MS = 5 * 60_000;
 
@@ -22,6 +26,39 @@ export type SubscriptionUsageWindow = {
   utilization: number;
   /** ISO-8601 reset time, or null when the header is absent/unparseable. */
   reset: string | null;
+};
+
+// The Fable/"fallback" ALLOCATION, read passively from a SUCCESSFUL probe-model
+// (haiku) response. Cheap — no extra request. Null when the probe errored or the
+// headers were absent (older API / non-unified account).
+export type SubscriptionFallbackAllocation = {
+  /** anthropic-ratelimit-unified-fallback-percentage in [0,1] (0.5 = "half your
+   *  usage for Fable"), or null when the header is absent/unparseable. */
+  percentage: number | null;
+  /** anthropic-ratelimit-unified-fallback raw availability string
+   *  ("available" seen on sub1), or null when absent. Advisory only — NOT a
+   *  reliable per-sub exhaustion signal (it was absent on most subs). */
+  availability: string | null;
+};
+
+// Result of a DEDICATED claude-fable-5 probe. `available` is the load-bearing
+// field. `utilization`/`reset` are best-effort: a 429 carries NO
+// anthropic-ratelimit-* headers, so on exhaustion they are null; on a 200 they
+// are populated IF the API exposes a fallback-utilization header (unconfirmed —
+// parseFallbackUtilization/parseFallbackReset return null until a 200-Fable
+// window is captured empirically).
+export type SubscriptionFableState = {
+  /** true ⇐ HTTP 200; false ⇐ HTTP 429 rate_limit_error. */
+  available: boolean;
+  /** Fallback utilization fraction [0,1] if a 200 response exposes it; else null. */
+  utilization: number | null;
+  /** Reset ISO if a 200 response exposes it; else null (429 carries none). */
+  reset: string | null;
+  /** Present only when the fable probe itself failed (network/auth/timeout) —
+   *  DISTINCT from a clean 429. When set, `available` is false and callers must
+   *  treat availability as UNKNOWN, not exhausted (do not raise the terminal
+   *  error off a probe error). */
+  error?: string;
 };
 
 export type SubscriptionUsage = {
@@ -34,6 +71,12 @@ export type SubscriptionUsage = {
   sevenDay: SubscriptionUsageWindow | null;
   /** Present only when this subscription's probe failed; windows are null then. */
   error?: string;
+  /** Fallback (Fable) allocation from the successful probe. Null on error/absent
+   *  headers. Populated automatically by usageFromResponse — always cheap. */
+  fallback?: SubscriptionFallbackAllocation | null;
+  /** Dedicated fable-probe result. Present ONLY when a fable probe ran for this
+   *  entry (undefined = not probed — the default for non-Fable paths). */
+  fable?: SubscriptionFableState;
 };
 
 type CacheEntry = { value: SubscriptionUsage; expiresAt: number };
@@ -65,6 +108,35 @@ function parseWindow(headers: Headers, key: "5h" | "7d"): SubscriptionUsageWindo
   return { utilization: clamp01(util), reset };
 }
 
+// The Fable-share ALLOCATION headers ride on every SUCCESSFUL haiku probe — read
+// them for free. Distinct from the dedicated fable probe: this tells you the
+// share SIZE (0.5 = half), NOT whether it is exhausted.
+function parseFallback(headers: Headers): SubscriptionFallbackAllocation | null {
+  const pctRaw = headers.get("anthropic-ratelimit-unified-fallback-percentage");
+  const availability = headers.get("anthropic-ratelimit-unified-fallback"); // e.g. "available"
+  if (pctRaw == null && availability == null) {
+    return null;
+  }
+  const pct = pctRaw == null ? null : Number(pctRaw);
+  return {
+    percentage: pct != null && Number.isFinite(pct) ? clamp01(pct) : null,
+    availability: availability ?? null,
+  };
+}
+
+// Fallback UTILIZATION / RESET on a 200-Fable response. The exact header names
+// are unconfirmed (all subs were Fable-exhausted when this was written, so no
+// 200-Fable window was capturable). Until a window is captured empirically these
+// return null (a safe default: the CLI then shows the boolean available/exhausted
+// instead of a percentage). Additive — fill in the header name when confirmed.
+function parseFallbackUtilization(_headers: Headers): number | null {
+  return null;
+}
+
+function parseFallbackReset(_headers: Headers): string | null {
+  return null;
+}
+
 async function readSubscriptionToken(configDir: string): Promise<string | null> {
   try {
     const raw = await readFile(path.join(configDir, ".credentials.json"), "utf8");
@@ -83,7 +155,7 @@ function usageFromResponse(res: Response, base: SubscriptionUsage): Subscription
   const fiveHour = parseWindow(res.headers, "5h");
   const sevenDay = parseWindow(res.headers, "7d");
   if (fiveHour || sevenDay) {
-    return { ...base, fiveHour, sevenDay };
+    return { ...base, fiveHour, sevenDay, fallback: parseFallback(res.headers) };
   }
   if (!res.ok) {
     return { ...base, error: `HTTP ${res.status}` };
@@ -110,15 +182,7 @@ async function probeSubscriptionUsage(entry: SubscriptionEntry): Promise<Subscri
   try {
     const res = await fetch(messagesEndpoint(), {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "anthropic-version": "2023-06-01",
-        // OAuth bearer tokens (the kind Claude Code writes to .credentials.json)
-        // require this beta header — without it the API returns 400.
-        "anthropic-beta": "oauth-2025-04-20",
-        "Content-Type": "application/json",
-        "User-Agent": "acpx/subscription-usage",
-      },
+      headers: probeRequestHeaders(token, "acpx/subscription-usage"),
       body: JSON.stringify({
         model: PROBE_MODEL,
         max_tokens: 1,
@@ -130,6 +194,153 @@ async function probeSubscriptionUsage(entry: SubscriptionEntry): Promise<Subscri
   } catch (err) {
     return { ...base, error: (err as Error).message || "network error" };
   }
+}
+
+// Shared 1-token /v1/messages probe request headers. OAuth bearer tokens (the
+// kind Claude Code writes to .credentials.json) require the anthropic-beta header
+// — without it the API returns 400.
+function probeRequestHeaders(token: string, userAgent: string): Record<string, string> {
+  return {
+    Authorization: `Bearer ${token}`,
+    "anthropic-version": "2023-06-01",
+    "anthropic-beta": "oauth-2025-04-20",
+    "Content-Type": "application/json",
+    "User-Agent": userAgent,
+  };
+}
+
+/** True when the model id names Fable (alias or full id), case-insensitive. This
+ *  is the ONLY gate that keeps non-Fable sessions from paying any fable-probe
+ *  cost. Substring match is robust to `fable` vs `claude-fable-5` vs
+ *  `claude-fable-5[1m]`; no non-Fable model carries the substring. */
+export function isFableModel(model: string | null | undefined): boolean {
+  return typeof model === "string" && model.toLowerCase().includes("fable");
+}
+
+const fableCache = new Map<string, { value: SubscriptionFableState; expiresAt: number }>();
+
+// A dedicated 1-token claude-fable-5 probe. A 429 is a CLEAN exhaustion signal
+// (rejected before generation → no Fable quota consumed); a 200 consumes a sliver
+// of the scarce Fable allocation. Never rejects: any failure yields `error` set
+// and `available: false` (which callers must treat as UNKNOWN, not exhausted).
+//
+// VOLATILITY: this is a POINT-IN-TIME signal only. The Fable-share limit FLAPS
+// near its boundary — a probe-429 does NOT mean a real turn will fail (real fable
+// turns have been observed succeeding while this probe returned 429). Treat the
+// probe as ADVISORY (visibility/steering); the AUTHORITATIVE exhaustion signal is
+// a real-turn 429 → FableShareExhaustedError (failover.ts short-circuit).
+async function probeFableAvailability(entry: SubscriptionEntry): Promise<SubscriptionFableState> {
+  const token = await readSubscriptionToken(entry.configDir);
+  if (!token) {
+    return {
+      available: false,
+      utilization: null,
+      reset: null,
+      error: `no credentials at ${entry.configDir}/.credentials.json`,
+    };
+  }
+  try {
+    const res = await fetch(messagesEndpoint(), {
+      method: "POST",
+      headers: probeRequestHeaders(token, "acpx/subscription-fable"),
+      body: JSON.stringify({
+        model: FABLE_PROBE_MODEL,
+        max_tokens: 1,
+        messages: [{ role: "user", content: "." }],
+      }),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+    if (res.status === 429) {
+      return { available: false, utilization: null, reset: null }; // CLEAN exhaustion
+    }
+    if (res.status === 401 || res.status === 403) {
+      return {
+        available: false,
+        utilization: null,
+        reset: null,
+        error: "authentication failed — re-run `claude` for this subscription",
+      };
+    }
+    if (res.ok) {
+      return {
+        available: true,
+        utilization: parseFallbackUtilization(res.headers),
+        reset: parseFallbackReset(res.headers),
+      };
+    }
+    return { available: false, utilization: null, reset: null, error: `HTTP ${res.status}` };
+  } catch (err) {
+    return {
+      available: false,
+      utilization: null,
+      reset: null,
+      error: (err as Error).message || "network error",
+    };
+  }
+}
+
+function cachedFable(id: string): SubscriptionFableState | undefined {
+  const hit = fableCache.get(id);
+  if (hit && hit.expiresAt > Date.now()) {
+    return hit.value;
+  }
+  return undefined;
+}
+
+async function fableForEntry(
+  entry: SubscriptionEntry,
+  forceRefresh: boolean,
+): Promise<SubscriptionFableState> {
+  if (!forceRefresh) {
+    const cached = cachedFable(entry.id);
+    if (cached) {
+      return cached;
+    }
+  }
+  const value = await probeFableAvailability(entry);
+  // Cache BOTH a clean 200 (available) and a clean 429 (exhausted) — both are
+  // definitive. Never cache network/auth errors, so a transient failure re-probes.
+  if (value.error === undefined) {
+    fableCache.set(entry.id, { value, expiresAt: Date.now() + CACHE_TTL_MS });
+  }
+  return value;
+}
+
+/**
+ * Fable availability per entry, 5-min cached in a SEPARATE map (a fable probe
+ * never evicts/serves a haiku entry), probed in parallel. Never rejects.
+ * `forceRefresh` bypasses the cache (a fresh read — for pre-spawn / failover
+ * decisions so a Fable decision never acts on a stale "available").
+ */
+export async function getSubscriptionsFableState(
+  entries: SubscriptionEntry[],
+  forceRefresh = false,
+): Promise<Map<string, SubscriptionFableState>> {
+  const results = await Promise.all(
+    entries.map(async (entry) => [entry.id, await fableForEntry(entry, forceRefresh)] as const),
+  );
+  return new Map(results);
+}
+
+/**
+ * Probe usage AND fable, stitching each fable state onto its SubscriptionUsage.
+ * Used by the CLI and by fable-aware selection so callers get one enriched list.
+ */
+export async function getSubscriptionsUsageWithFable(
+  entries: SubscriptionEntry[],
+  forceRefresh = false,
+): Promise<SubscriptionUsage[]> {
+  const [usages, fable] = await Promise.all([
+    getSubscriptionsUsage(entries, forceRefresh),
+    getSubscriptionsFableState(entries, forceRefresh),
+  ]);
+  for (const usage of usages) {
+    const state = fable.get(usage.id);
+    if (state !== undefined) {
+      usage.fable = state;
+    }
+  }
+  return usages;
 }
 
 function cachedUsage(id: string): SubscriptionUsage | undefined {

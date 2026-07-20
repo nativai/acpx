@@ -20,6 +20,7 @@ import { transcriptCwdHash } from "../../config/subscription-transcript.js";
 import {
   AllSubscriptionsExhaustedError,
   BridgeAuthGatedError,
+  FableShareExhaustedError,
   PermissionPromptUnavailableError,
   SessionClosedError,
 } from "../../errors.js";
@@ -1117,6 +1118,7 @@ async function surfaceFailoverTerminalError(
   if (
     failoverError instanceof AllSubscriptionsExhaustedError ||
     failoverError instanceof BridgeAuthGatedError ||
+    failoverError instanceof FableShareExhaustedError ||
     isSubscriptionLockBlockError(failoverError)
   ) {
     await persistTerminalTurnError(record, failoverError).catch(() => {});

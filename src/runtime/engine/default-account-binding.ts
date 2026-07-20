@@ -239,7 +239,9 @@ export async function bindDefaultAccountToSessionOptionsAsync(
     return bindDefaultAccountToSessionOptions(options, agentCommand, lookupOptions);
   }
   const stripped = withoutAutoSelection(options);
-  const pickedId = await resolveAutoSubscription(agentCommand, lookupOptions);
+  const pickedId = await resolveAutoSubscription(agentCommand, lookupOptions, {
+    model: stripped?.model,
+  });
   if (pickedId) {
     return { ...stripped, profile: pickedId };
   }

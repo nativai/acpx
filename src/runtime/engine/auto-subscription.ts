@@ -3,9 +3,12 @@ import { splitCommandLine } from "../../acp/client-process.js";
 import { isCodexAcpCommand } from "../../acp/codex-compat.js";
 import {
   countEligibleFailoverTargets,
+  getSubscriptionsFableState,
   getSubscriptionsUsage,
+  isFableModel,
   maxedThreshold,
   pickFailoverTarget,
+  type SubscriptionFableState,
   type SubscriptionUsage,
 } from "../../config/subscription-usage.js";
 import {
@@ -77,7 +80,12 @@ export type AutoSubscriptionSelectionSummary = {
   fellBack: boolean;
   /** Present only when the optional cross-HOME acpx-ui lock view diverged. */
   divergedFromUi?: true;
+  /** Present only when this was a Fable spawn (the fable probe ran). */
+  fable?: FableTally;
 };
+
+/** A small Fable-availability tally, surfaced when a Fable spawn is resolved. */
+type FableTally = { available: number; exhausted: number; probed: boolean };
 
 type LocalSelection = {
   /** The picked subscription id, or undefined when we fell back to the default. */
@@ -86,6 +94,8 @@ type LocalSelection = {
   reason: string;
   candidatesConsidered: number;
   eligible: number;
+  /** Present only when this was a Fable spawn (the fable probe ran). */
+  fable?: FableTally;
 };
 
 type Divergence = { origin: string };
@@ -134,23 +144,74 @@ function noEligibleReason(
 // pickFailoverTarget selector. Returns a binding on success, or the fallback
 // reason so the caller can log/degrade. Never throws; getSubscriptionsUsage
 // never rejects.
-async function selectLocal(registry: SubscriptionRegistry): Promise<LocalSelection> {
+// From already-probed fable states, add cleanly-429 subs to `exclude` (mutated in
+// place). A probe ERROR is UNKNOWN — not excluded. Returns the tally. Sync so the
+// fable probe can run CONCURRENTLY with the usage probe in selectLocal.
+function applyFableExclusions(
+  entries: SubscriptionRegistry["subscriptions"],
+  exclude: Set<string>,
+  states: Map<string, SubscriptionFableState>,
+): FableTally {
+  let available = 0;
+  let exhausted = 0;
+  for (const entry of entries) {
+    const state = states.get(entry.id);
+    if (state?.available === true) {
+      available += 1;
+    } else if (state?.available === false && state.error === undefined) {
+      exhausted += 1;
+      exclude.add(entry.id);
+    }
+  }
+  return { available, exhausted, probed: true };
+}
+
+// When nothing survived: a distinct reason if it was fleet-wide Fable exhaustion,
+// else the generic no-eligible reason. Checked before the generic (§3a).
+function fallbackReason(
+  usages: SubscriptionUsage[],
+  exclude: ReadonlySet<string>,
+  threshold: number,
+  fable: FableTally | undefined,
+): string {
+  if (fable && fable.available === 0 && fable.exhausted > 0) {
+    return "all-fable-exhausted";
+  }
+  return noEligibleReason(usages, exclude, threshold);
+}
+
+async function selectLocal(
+  registry: SubscriptionRegistry,
+  model?: string,
+): Promise<LocalSelection> {
   const entries = registry.subscriptions;
   if (entries.length === 0) {
     return { reason: "empty-registry", candidatesConsidered: 0, eligible: 0 };
   }
-  const usages = await getSubscriptionsUsage(entries);
+  // Fable spawn: probe usage AND fable CONCURRENTLY so cold latency is max(), not
+  // sum() — the sequential form (usage then fable) blew the default auto-select
+  // budget and degraded the signal to a generic 'timeout' instead of the designed
+  // 'all-fable-exhausted' + tally. A probe ERROR means UNKNOWN — do NOT exclude (§1
+  // key decision). Spawn NEVER hard-fails on fable exhaustion; it degrades to the
+  // default binding and the turn-level terminal error tells the agent (§4).
+  const isFable = isFableModel(model);
+  const [usages, fableStates] = await Promise.all([
+    getSubscriptionsUsage(entries),
+    isFable ? getSubscriptionsFableState(entries, true) : Promise.resolve(undefined),
+  ]);
   const threshold = maxedThreshold();
   const exclude = new Set(
     entries.filter((entry) => isSubscriptionLocked(entry, registry)).map((entry) => entry.id),
   );
+  const fable = fableStates ? applyFableExclusions(entries, exclude, fableStates) : undefined;
   const eligible = countEligibleFailoverTargets(usages, { exclude, threshold });
   const picked = pickFailoverTarget(usages, { exclude, threshold });
   if (!picked) {
     return {
-      reason: noEligibleReason(usages, exclude, threshold),
+      reason: fallbackReason(usages, exclude, threshold, fable),
       candidatesConsidered: usages.length,
       eligible,
+      ...(fable ? { fable } : {}),
     };
   }
   return {
@@ -159,6 +220,7 @@ async function selectLocal(registry: SubscriptionRegistry): Promise<LocalSelecti
     reason: "soonest-7d-reset",
     candidatesConsidered: usages.length,
     eligible,
+    ...(fable ? { fable } : {}),
   };
 }
 
@@ -305,6 +367,7 @@ function summarize(
     eligible: selection.eligible,
     fellBack: selection.pickedId === undefined,
     ...diverged,
+    ...(selection.fable ? { fable: selection.fable } : {}),
   };
 }
 
@@ -315,13 +378,31 @@ function formatPercent(fraction: number | null | undefined): string {
   return `${Math.round(fraction * 100)}%`;
 }
 
-function autoPickLine(picked: SubscriptionUsage, eligible: number): string {
+function fableSuffix(fable: FableTally | undefined): string {
+  return fable ? `; fable ${fable.available}/${fable.available + fable.exhausted} available` : "";
+}
+
+function autoPickLine(picked: SubscriptionUsage, eligible: number, fable?: FableTally): string {
   return (
     `[acpx] subscription auto → "${picked.label}" (${picked.id}) — ` +
     `7d ${formatPercent(picked.sevenDay?.utilization)}, ` +
     `5h ${formatPercent(picked.fiveHour?.utilization)}; ` +
-    `${eligible} eligible [soonest-7d-reset]\n`
+    `${eligible} eligible [soonest-7d-reset]${fableSuffix(fable)}\n`
   );
+}
+
+// The registry-default fallback line: a distinct message when the fallback was
+// caused specifically by fleet-wide Fable exhaustion, else the generic reason.
+function autoFallbackLine(selection: LocalSelection | undefined): string {
+  if (selection?.reason === "all-fable-exhausted") {
+    return (
+      `[acpx] subscription auto → registry default (all subscriptions Fable-exhausted; ` +
+      `the turn will report the Fable-share limit)\n`
+    );
+  }
+  return `[acpx] subscription auto → registry default (no eligible subscription: ${
+    selection?.reason ?? "timeout"
+  })\n`;
 }
 
 // One human line to stderr (same channel as the existing default-applied note),
@@ -331,13 +412,9 @@ function emitAutoSelection(
   divergence: Divergence | undefined,
 ): void {
   if (selection?.picked && selection.pickedId) {
-    process.stderr.write(autoPickLine(selection.picked, selection.eligible));
+    process.stderr.write(autoPickLine(selection.picked, selection.eligible, selection.fable));
   } else {
-    process.stderr.write(
-      `[acpx] subscription auto → registry default (no eligible subscription: ${
-        selection?.reason ?? "timeout"
-      })\n`,
-    );
+    process.stderr.write(autoFallbackLine(selection));
   }
   if (divergence) {
     process.stderr.write(
@@ -357,6 +434,7 @@ function emitAutoSelection(
 export async function resolveAutoSubscription(
   agentCommand: string,
   lookupOptions?: SubscriptionLookupOptions,
+  opts?: { model?: string },
 ): Promise<string | undefined> {
   if (!isClaudeAdapterCommand(agentCommand)) {
     return undefined;
@@ -366,7 +444,7 @@ export async function resolveAutoSubscription(
   const { signal, cancel } = deadline(budgetMs);
   try {
     const divergenceWork = crossHomeDivergence(registry, budgetMs);
-    const selection = await raceDeadline(selectLocal(registry), signal);
+    const selection = await raceDeadline(selectLocal(registry, opts?.model), signal);
     const divergence = await raceDeadline(divergenceWork, signal);
     captureAutoSelection(summarize(selection, divergence));
     emitAutoSelection(selection, divergence);
