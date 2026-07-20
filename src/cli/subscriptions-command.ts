@@ -1,5 +1,8 @@
 import { Command } from "commander";
-import { getSubscriptionsUsage, type SubscriptionUsage } from "../config/subscription-usage.js";
+import {
+  getSubscriptionsUsageWithFable,
+  type SubscriptionUsage,
+} from "../config/subscription-usage.js";
 import {
   findSubscription,
   isSubscriptionLocked,
@@ -57,6 +60,35 @@ export function formatPercent(window: SubscriptionUsage["fiveHour"]): string {
   return `${(window.utilization * 100).toFixed(1)}%`;
 }
 
+// Render the Fable-share cell for a subscription. `undefined` = not probed (the
+// CLI always probes, so this only appears for a subset that wasn't fetched);
+// `error` = probe failed (unknown, not exhausted); `!available` = clean 429.
+export function formatFable(entry: SubscriptionUsage): string {
+  const f = entry.fable;
+  if (!f) {
+    return "fable -";
+  }
+  if (f.error) {
+    return `fable ? (${f.error})`;
+  }
+  if (!f.available) {
+    const share =
+      entry.fallback?.percentage != null
+        ? ` (share ${Math.round(entry.fallback.percentage * 100)}%)`
+        : "";
+    return `fable EXHAUSTED${share}`;
+  }
+  return f.utilization != null ? `fable ${(f.utilization * 100).toFixed(1)}%` : "fable available";
+}
+
+/** The quiet fable field: `available` | `exhausted` | `-` (not probed). */
+function quietFable(entry: SubscriptionUsage): string {
+  if (!entry.fable) {
+    return "-";
+  }
+  return entry.fable.available ? "available" : "exhausted";
+}
+
 function renderUsageEntryText(entry: SubscriptionUsage): string {
   if (entry.error) {
     return `  ${entry.id}\t${entry.label}\tERROR: ${entry.error}\n`;
@@ -66,7 +98,8 @@ function renderUsageEntryText(entry: SubscriptionUsage): string {
   return (
     `  ${entry.id}\t${entry.label}` +
     `\t5h ${formatPercent(entry.fiveHour)}${fiveReset}` +
-    `\t7d ${formatPercent(entry.sevenDay)}${sevenReset}\n`
+    `\t7d ${formatPercent(entry.sevenDay)}${sevenReset}` +
+    `\t${formatFable(entry)}\n`
   );
 }
 
@@ -74,19 +107,19 @@ export function renderUsageText(usage: SubscriptionUsage[]): string {
   if (usage.length === 0) {
     return NO_REGISTRY_MESSAGE;
   }
-  let out = "Subscription usage (5h / 7d utilization):\n";
+  let out = "Subscription usage (5h / 7d / fable):\n";
   for (const entry of usage) {
     out += renderUsageEntryText(entry);
   }
   return out;
 }
 
-/** Quiet output for a subscription-usage list: one `id\t5h%\t7d%` line each. */
+/** Quiet output for a subscription-usage list: one `id\t5h%\t7d%\tfable:<state>` line each. */
 export function renderSubscriptionsUsageQuiet(usage: SubscriptionUsage[]): string {
   return usage
     .map(
       (entry) =>
-        `${entry.id}\t${formatPercent(entry.fiveHour)}\t${formatPercent(entry.sevenDay)}\n`,
+        `${entry.id}\t${formatPercent(entry.fiveHour)}\t${formatPercent(entry.sevenDay)}\tfable:${quietFable(entry)}\n`,
     )
     .join("");
 }
@@ -96,7 +129,9 @@ async function handleSubscriptionsUsage(
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const { format } = resolveGlobalFlags(command, config);
-  const usage = await getSubscriptionsUsage(loadSubscriptionRegistry().subscriptions);
+  // This command ALWAYS probes fable — the operator explicitly asked for usage,
+  // so the fable-probe cost is acceptable (§2d).
+  const usage = await getSubscriptionsUsageWithFable(loadSubscriptionRegistry().subscriptions);
 
   if (format === "json") {
     process.stdout.write(`${JSON.stringify(usage)}\n`);
