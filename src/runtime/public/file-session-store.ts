@@ -27,21 +27,33 @@ class FileSessionStore implements AcpSessionStore {
 
   async load(sessionId: string): Promise<AcpSessionRecord | undefined> {
     await this.ensureDir();
+    // Split the read from the parse (intent adopted from upstream 939e6be):
+    // genuine I/O faults (non-ENOENT) still throw, but ENOENT and
+    // corrupt/ill-shaped content return undefined — the documented
+    // no-usable-record signal — instead of surfacing a raw SyntaxError out of
+    // the public store. Every internal reader already recovers from this.
+    let payload: string;
     try {
-      const payload = await fs.readFile(this.filePath(sessionId), "utf8");
-      const record = parseSessionRecord(JSON.parse(payload));
-      return record
-        ? await hydrateSessionMessagesFromLog(
-            record,
-            messagesLogPath(this.sessionDir, record.acpxRecordId),
-          )
-        : undefined;
+      payload = await fs.readFile(this.filePath(sessionId), "utf8");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         return undefined;
       }
       throw error;
     }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      return undefined;
+    }
+    const record = parseSessionRecord(parsed);
+    return record
+      ? await hydrateSessionMessagesFromLog(
+          record,
+          messagesLogPath(this.sessionDir, record.acpxRecordId),
+        )
+      : undefined;
   }
 
   async save(record: AcpSessionRecord): Promise<void> {
