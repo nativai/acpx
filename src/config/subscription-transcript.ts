@@ -1,4 +1,4 @@
-import { access, copyFile, mkdir } from "node:fs/promises";
+import { access, copyFile, mkdir, open, rename, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { SessionRecord } from "../types.js";
@@ -56,6 +56,12 @@ export type TranscriptRecoveryResult =
       sourceConfigDir: string;
       sourcePath: string;
       searchedPaths: string[];
+      /**
+       * When the destination already held a (staler / divergent) transcript that
+       * was renamed aside before porting, the path of that preserved sidecar.
+       * Absent when the destination was missing (nothing to supersede).
+       */
+      supersededPath?: string;
     }
   | {
       status: "missing";
@@ -146,6 +152,28 @@ export async function ensureTranscriptAtActiveConfigDir(
   return await ensureTranscriptAtConfigDir(record, activeConfigDir, { ...options, registry });
 }
 
+/**
+ * Ensure the config dir a cold respawn will resume from holds the *freshest*
+ * transcript segment, not merely *a* segment.
+ *
+ * The original implementation short-circuited on destination *existence*: if any
+ * file already sat at the destination it was kept as the resume source, even when
+ * it was a days-stale copy frozen at the session's last stint on that account.
+ * That is the context-rollback ("thrown back in time") root cause (RCA
+ * brick://08ac840f): a switch/failover back onto a previously-used subscription
+ * cold-resumed its frozen segment and the model re-did settled work.
+ *
+ * The selection is now by content freshness: probe every candidate's last-entry
+ * timestamp and pick the newest. Candidates are the destination (if present),
+ * then the explicit `sourceConfigDirs` (switch source), then the same-HOME known
+ * config dirs — that order is also the tie-break (prefer the destination, then
+ * explicit source order), which additionally fixes the missing-destination
+ * registry-order port (RCA §2.5: port the freshest sibling, not the first in
+ * registry order). When the freshest source differs from an existing
+ * destination, the destination is renamed aside to a `.superseded-<ISO>.jsonl`
+ * sidecar before porting — a post-rollback destination is a *divergent branch*
+ * with unique content, never a prefix, so it must be preserved, never truncated.
+ */
 export async function ensureTranscriptAtConfigDir(
   record: TranscriptBearingRecord,
   dstConfigDir: string,
@@ -154,78 +182,276 @@ export async function ensureTranscriptAtConfigDir(
     sourceConfigDirs?: string[];
   },
 ): Promise<TranscriptRecoveryResult> {
-  const activePath = transcriptJsonlPath(dstConfigDir, record.cwd, record.acpSessionId);
-  if (await fileExists(activePath)) {
-    return {
-      status: "already-present",
-      activeConfigDir: dstConfigDir,
-      activePath,
-      searchedPaths: [],
-    };
+  const { cwd, acpSessionId } = record;
+  const activePath = transcriptJsonlPath(dstConfigDir, cwd, acpSessionId);
+
+  const { best, destProbe, searchedPaths } = await selectFreshestTranscript(
+    record,
+    dstConfigDir,
+    options,
+  );
+
+  // Nothing anywhere (missing destination + no source segments): unchanged.
+  if (!best) {
+    return { status: "missing", activeConfigDir: dstConfigDir, activePath, searchedPaths };
   }
 
-  const sourceConfigDirs = uniqueNonEmptyPaths([
-    ...(options?.sourceConfigDirs ?? []),
-    ...knownTranscriptConfigDirs({ ...options, activeConfigDir: dstConfigDir }),
-  ]);
-  const searchedPaths: string[] = [];
-  for (const sourceConfigDir of sourceConfigDirs) {
-    const ported = await tryPortTranscriptFromConfigDir({
-      record,
-      sourceConfigDir,
-      dstConfigDir,
-      activePath,
-      searchedPaths,
-    });
-    if (ported) {
-      return ported;
-    }
+  // The freshest segment already IS the destination — resume as-is.
+  if (best.isDest) {
+    return { status: "already-present", activeConfigDir: dstConfigDir, activePath, searchedPaths };
   }
+
+  // A source is fresher. Preserve any existing (staler / divergent) destination
+  // aside before overwriting it, then port the freshest source in.
+  const supersededPath = destProbe
+    ? await renameDestinationAside(activePath, acpSessionId)
+    : undefined;
+
+  const ported = await portTranscript({
+    srcConfigDir: best.configDir,
+    dstConfigDir,
+    cwd,
+    acpSessionId,
+  });
+  if (!ported.copied && !(await fileExists(activePath))) {
+    // Source vanished between probe and copy — the aside sidecar (if any) still
+    // preserves the destination's branch; report missing so callers can react.
+    return { status: "missing", activeConfigDir: dstConfigDir, activePath, searchedPaths };
+  }
+
+  logTranscriptPortDecision({
+    acpSessionId,
+    activePath,
+    chosenSource: best.jsonlPath,
+    dstLastEntry: destProbe?.freshness.iso,
+    srcLastEntry: best.freshness.iso,
+    supersededPath,
+  });
 
   return {
-    status: "missing",
+    status: "ported",
     activeConfigDir: dstConfigDir,
     activePath,
+    sourceConfigDir: best.configDir,
+    sourcePath: best.jsonlPath,
     searchedPaths,
+    supersededPath,
   };
 }
 
-async function tryPortTranscriptFromConfigDir(args: {
-  record: TranscriptBearingRecord;
-  sourceConfigDir: string;
-  dstConfigDir: string;
-  activePath: string;
+/**
+ * Probe every candidate config dir (destination first, then explicit switch
+ * sources, then same-HOME known dirs) and return the freshest existing segment,
+ * the destination's own probe (if it exists), and the searched source paths.
+ *
+ * The candidate ordering IS the tie-break: a candidate replaces the best only
+ * when *strictly* newer, so equal timestamps keep whichever came first
+ * (destination, then explicit source order, then registry order).
+ */
+async function selectFreshestTranscript(
+  record: TranscriptBearingRecord,
+  dstConfigDir: string,
+  options?: SubscriptionLookupOptions & {
+    registry?: SubscriptionRegistry;
+    sourceConfigDirs?: string[];
+  },
+): Promise<{
+  best: TranscriptCandidate | undefined;
+  destProbe: TranscriptCandidate | undefined;
   searchedPaths: string[];
-}): Promise<Extract<TranscriptRecoveryResult, { status: "ported" }> | undefined> {
-  const sourcePath = transcriptJsonlPath(
-    args.sourceConfigDir,
-    args.record.cwd,
-    args.record.acpSessionId,
+}> {
+  const { cwd, acpSessionId } = record;
+  const resolvedDst = path.resolve(dstConfigDir);
+  const orderedConfigDirs = candidateConfigDirs(dstConfigDir, options);
+
+  const searchedPaths: string[] = [];
+  let best: TranscriptCandidate | undefined;
+  let destProbe: TranscriptCandidate | undefined;
+  for (const configDir of orderedConfigDirs) {
+    const isDest = path.resolve(configDir) === resolvedDst;
+    const jsonlPath = transcriptJsonlPath(configDir, cwd, acpSessionId);
+    if (!isDest) {
+      searchedPaths.push(jsonlPath);
+    }
+    const candidate = await probeTranscriptCandidate(jsonlPath, configDir, isDest);
+    if (!candidate) {
+      continue;
+    }
+    if (isDest) {
+      destProbe = candidate;
+    }
+    if (!best || candidate.freshness.ms > best.freshness.ms) {
+      best = candidate;
+    }
+  }
+  return { best, destProbe, searchedPaths };
+}
+
+function candidateConfigDirs(
+  dstConfigDir: string,
+  options?: SubscriptionLookupOptions & {
+    registry?: SubscriptionRegistry;
+    sourceConfigDirs?: string[];
+  },
+): string[] {
+  return uniqueNonEmptyPaths([
+    dstConfigDir,
+    ...(options?.sourceConfigDirs ?? []),
+    ...knownTranscriptConfigDirs({ ...options, activeConfigDir: dstConfigDir }),
+  ]);
+}
+
+async function probeTranscriptCandidate(
+  jsonlPath: string,
+  configDir: string,
+  isDest: boolean,
+): Promise<TranscriptCandidate | undefined> {
+  if (!(await fileExists(jsonlPath))) {
+    return undefined;
+  }
+  const freshness = await lastEntryTimestamp(jsonlPath);
+  return { configDir, jsonlPath, isDest, freshness };
+}
+
+type FreshnessProbe = {
+  /** Epoch milliseconds used for comparison (content `.timestamp`, else fs mtime). */
+  ms: number;
+  /** Human-readable form of the chosen instant, for the observability breadcrumb. */
+  iso: string;
+  /** Which signal supplied `ms`. */
+  basis: "content" | "mtime";
+};
+
+type TranscriptCandidate = {
+  configDir: string;
+  jsonlPath: string;
+  isDest: boolean;
+  freshness: FreshnessProbe;
+};
+
+const TRANSCRIPT_TAIL_BYTES = 64 * 1024;
+
+/**
+ * Freshness of a transcript JSONL, measured by CONTENT — the `.timestamp` of the
+ * last complete JSONL entry — falling back to fs mtime only when unparseable.
+ *
+ * mtime alone is unsafe: `copyFile` stamps copy-time, so a stale-content copy
+ * looks mtime-fresh (that is precisely how the rollback bug hid). Reading the
+ * last real entry's timestamp compares the segments by actual conversation
+ * progress instead.
+ */
+async function lastEntryTimestamp(filePath: string): Promise<FreshnessProbe> {
+  const content = await contentTimestampFromTail(filePath);
+  if (content) {
+    return { ms: content.ms, iso: content.iso, basis: "content" };
+  }
+  const info = await stat(filePath);
+  return { ms: info.mtimeMs, iso: new Date(info.mtimeMs).toISOString(), basis: "mtime" };
+}
+
+async function contentTimestampFromTail(
+  filePath: string,
+): Promise<{ ms: number; iso: string } | undefined> {
+  const handle = await open(filePath, "r");
+  try {
+    const { size } = await handle.stat();
+    if (size === 0) {
+      return undefined;
+    }
+    const readLen = Math.min(size, TRANSCRIPT_TAIL_BYTES);
+    const start = size - readLen;
+    const buffer = Buffer.alloc(readLen);
+    await handle.read(buffer, 0, readLen, start);
+    let text = buffer.toString("utf8");
+    // If the window did not start at byte 0 its first line is a truncated
+    // partial (the entry began before the window) — drop it.
+    if (start > 0) {
+      const firstNewline = text.indexOf("\n");
+      text = firstNewline >= 0 ? text.slice(firstNewline + 1) : "";
+    }
+    const lines = text.split("\n");
+    // Walk backwards over trailing blank / unparseable lines to the last real entry.
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line) {
+        continue;
+      }
+      const parsed = timestampFromJsonlLine(line);
+      if (parsed) {
+        return parsed;
+      }
+    }
+    return undefined;
+  } finally {
+    await handle.close();
+  }
+}
+
+function timestampFromJsonlLine(line: string): { ms: number; iso: string } | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return undefined;
+  }
+  const timestamp = (parsed as { timestamp?: unknown }).timestamp;
+  if (typeof timestamp === "number" && Number.isFinite(timestamp)) {
+    return { ms: timestamp, iso: new Date(timestamp).toISOString() };
+  }
+  if (typeof timestamp === "string") {
+    const ms = Date.parse(timestamp);
+    if (!Number.isNaN(ms)) {
+      return { ms, iso: timestamp };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Rename an existing destination transcript aside to a
+ * `<acpSessionId>.superseded-<ISO>.jsonl` sidecar in the same dir, so its
+ * divergent branch is preserved (never truncated) before a fresher source ports
+ * over it. Uses a filesystem-safe ISO (colons replaced) and disambiguates a
+ * same-instant collision. Returns the sidecar path.
+ */
+async function renameDestinationAside(activePath: string, acpSessionId: string): Promise<string> {
+  const dir = path.dirname(activePath);
+  const stamp = new Date().toISOString().replace(/:/g, "-");
+  let target = path.join(dir, `${acpSessionId}.superseded-${stamp}.jsonl`);
+  let suffix = 1;
+  while (await fileExists(target)) {
+    target = path.join(dir, `${acpSessionId}.superseded-${stamp}-${suffix}.jsonl`);
+    suffix += 1;
+  }
+  await rename(activePath, target);
+  return target;
+}
+
+/**
+ * Emit one stderr breadcrumb per switch-time transcript port, so a transcript
+ * movement (and especially a superseded stale destination) is visible instead of
+ * silent — the previous `transcriptCopied:false` carried no reason. stderr is
+ * acpx's runtime log channel (matches `logTranscriptRecovery` in reconnect.ts).
+ */
+function logTranscriptPortDecision(info: {
+  acpSessionId: string;
+  activePath: string;
+  chosenSource: string;
+  dstLastEntry?: string;
+  srcLastEntry?: string;
+  supersededPath?: string;
+}): void {
+  const decision = info.supersededPath ? "ported-superseded" : "ported";
+  const superseded = info.supersededPath ? ` superseded=${info.supersededPath}` : "";
+  process.stderr.write(
+    `[acpx] transcript-port session=${info.acpSessionId} decision=${decision} ` +
+      `dst=${info.activePath} chosenSource=${info.chosenSource} ` +
+      `dstLastEntry=${info.dstLastEntry ?? "none"} srcLastEntry=${info.srcLastEntry ?? "none"}` +
+      `${superseded}\n`,
   );
-  if (sourcePath === args.activePath) {
-    return undefined;
-  }
-  args.searchedPaths.push(sourcePath);
-  if (!(await fileExists(sourcePath))) {
-    return undefined;
-  }
-  const result = await portTranscript({
-    srcConfigDir: args.sourceConfigDir,
-    dstConfigDir: args.dstConfigDir,
-    cwd: args.record.cwd,
-    acpSessionId: args.record.acpSessionId,
-  });
-  if (!result.copied && !(await fileExists(args.activePath))) {
-    return undefined;
-  }
-  return {
-    status: "ported",
-    activeConfigDir: args.dstConfigDir,
-    activePath: args.activePath,
-    sourceConfigDir: args.sourceConfigDir,
-    sourcePath,
-    searchedPaths: args.searchedPaths,
-  };
 }
 
 function isNotFound(error: unknown): boolean {
