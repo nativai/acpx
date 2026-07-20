@@ -264,7 +264,8 @@ export class FableShareExhaustedError extends AcpxOperationalError {
       `Fable-share limit reached on all subscriptions (per-model fallback cap; ` +
         `unified 5h/7d windows are healthy). ${statuses} — switch to a non-Fable ` +
         `model (e.g. \`--model opus\` / \`sessions set-model opus\`) or wait for the ` +
-        `Fable-share window to reset.`,
+        `Fable-share window to reset (this Fable-share limit is intermittent — a ` +
+        `later turn may succeed).`,
       {
         outputCode: "RUNTIME",
         detailCode: "fable-share-exhausted",

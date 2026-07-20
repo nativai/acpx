@@ -46,7 +46,8 @@ test("buildTerminalTurnErrorMessage carries the AC5 agent-visible entry shape", 
   assert.equal(msg.Agent.terminal_error?.detail_code, "fable-share-exhausted");
   assert.equal(msg.Agent.terminal_error?.output_code, "RUNTIME");
   assert.equal(msg.Agent.terminal_error?.origin, "runtime");
-  // the message states WHAT + the remedy
+  // the message states WHAT + the remedy + that the limit is intermittent
   assert.match(msg.Agent.terminal_error?.message ?? "", /unified 5h\/7d windows are healthy/);
   assert.match(msg.Agent.terminal_error?.message ?? "", /switch to a non-Fable/);
+  assert.match(msg.Agent.terminal_error?.message ?? "", /intermittent — a later turn may succeed/);
 });

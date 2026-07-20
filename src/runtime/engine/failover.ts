@@ -240,6 +240,11 @@ function accountForEntry(
 // fable-available subs. A probe ERROR is UNKNOWN — never counted available, never
 // seeded (degrades to normal failover; we only short-circuit on POSITIVE evidence
 // of a clean 429). Returns a status snapshot for the mid-loop boundary conversion.
+//
+// NOTE the probe is a VOLATILE point-in-time signal (the limit flaps near its
+// boundary). This is acceptable here because it runs ONLY after the session's OWN
+// real turn already 429'd — the AUTHORITATIVE signal — so the fresh probe is
+// corroborating that live failure, not predicting it in the abstract.
 async function fableRateLimitShortCircuit(params: {
   tried: Set<string>;
   restoreOriginalSelection: () => Promise<void>;

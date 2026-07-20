@@ -223,6 +223,12 @@ const fableCache = new Map<string, { value: SubscriptionFableState; expiresAt: n
 // (rejected before generation → no Fable quota consumed); a 200 consumes a sliver
 // of the scarce Fable allocation. Never rejects: any failure yields `error` set
 // and `available: false` (which callers must treat as UNKNOWN, not exhausted).
+//
+// VOLATILITY: this is a POINT-IN-TIME signal only. The Fable-share limit FLAPS
+// near its boundary — a probe-429 does NOT mean a real turn will fail (real fable
+// turns have been observed succeeding while this probe returned 429). Treat the
+// probe as ADVISORY (visibility/steering); the AUTHORITATIVE exhaustion signal is
+// a real-turn 429 → FableShareExhaustedError (failover.ts short-circuit).
 async function probeFableAvailability(entry: SubscriptionEntry): Promise<SubscriptionFableState> {
   const token = await readSubscriptionToken(entry.configDir);
   if (!token) {
