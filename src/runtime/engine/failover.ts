@@ -249,7 +249,11 @@ async function fableRateLimitShortCircuit(params: {
   const fable = await getSubscriptionsFableState(entries, true);
   const statusSnapshot = fableStatuses(entries, fable);
   const anyAvailable = entries.some((entry) => fable.get(entry.id)?.available === true);
-  if (!anyAvailable) {
+  // A probe ERROR = UNKNOWN. Short-circuit ONLY on POSITIVE evidence — every sub a
+  // clean 429 (no available, no unknown). If any probe errored we degrade to the
+  // normal loop so a real turn decides that sub (AC8), never a false terminal.
+  const anyUnknown = entries.some((entry) => fable.get(entry.id)?.error !== undefined);
+  if (!anyAvailable && !anyUnknown) {
     await params.restoreOriginalSelection();
     throw new FableShareExhaustedError(statusSnapshot);
   }
