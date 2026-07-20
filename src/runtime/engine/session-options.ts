@@ -24,6 +24,11 @@ export type SessionAgentOptions = {
   // Per-session automatic same-family credential failover policy. undefined =
   // enabled; explicit false is the only behavior-changing state.
   autoFailover?: boolean;
+  // Per-session hard model-floor policy (brick://07dd62c9). undefined/false =
+  // the default detect+surface+accept mode; true refuses/quarantines below-floor
+  // work. Durable like autoFailover — carried forward across owner respawns by
+  // carryForwardPinnedFloor.
+  floorHard?: boolean;
 };
 
 export function mergeSessionOptions(
@@ -40,6 +45,7 @@ export function mergeSessionOptions(
     assignDefinedOption(merged, "profile", preferred.profile);
     assignDefinedOption(merged, "reasoningEffort", preferred.reasoningEffort);
     assignDefinedOption(merged, "autoFailover", preferred.autoFailover);
+    assignDefinedOption(merged, "floorHard", preferred.floorHard);
   }
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
@@ -89,6 +95,9 @@ type SessionOptionBreadcrumbs = {
   accountSwitch: PersistedSessionOptions["account_switch"];
   provisioningWarning: PersistedSessionOptions["provisioning_warning"];
   autoFailover: PersistedSessionOptions["auto_failover"];
+  floorHard: PersistedSessionOptions["floor_hard"];
+  model: PersistedSessionOptions["model"];
+  effort: PersistedSessionOptions["effort"];
 };
 
 function sessionOptionBreadcrumbs(record: SessionRecord): SessionOptionBreadcrumbs {
@@ -98,6 +107,9 @@ function sessionOptionBreadcrumbs(record: SessionRecord): SessionOptionBreadcrum
     accountSwitch: stored?.account_switch,
     provisioningWarning: stored?.provisioning_warning,
     autoFailover: stored?.auto_failover,
+    floorHard: stored?.floor_hard,
+    model: stored?.model,
+    effort: stored?.effort,
   };
 }
 
@@ -138,6 +150,25 @@ function assignBreadcrumbs(
   if (breadcrumbs.autoFailover !== undefined && target.auto_failover === undefined) {
     target.auto_failover = breadcrumbs.autoFailover;
   }
+  // floor_hard rides the same carry-forward (brick://07dd62c9) — a durable
+  // per-session policy that must survive owner respawns rebuilding
+  // session_options from spawn flags; an explicit options.floorHard still wins.
+  if (breadcrumbs.floorHard !== undefined && target.floor_hard === undefined) {
+    target.floor_hard = breadcrumbs.floorHard;
+  }
+  // The pinned model/effort ride the same carry-forward (brick://07dd62c9 fold-in
+  // of brick://dda08023's fresh-create record-loss gap): when an owner respawn
+  // rebuilds session_options WITHOUT the pin (spawn flags omitted it), preserve
+  // the prior pin rather than dropping it — an explicit flag (already written into
+  // `target`) still wins. carryForwardPinnedFloor seeds these onto the record only
+  // when the rebuilt record carries no pin of its own, so this never overwrites a
+  // live-applied pin.
+  if (breadcrumbs.model !== undefined && target.model === undefined) {
+    target.model = breadcrumbs.model;
+  }
+  if (breadcrumbs.effort !== undefined && target.effort === undefined) {
+    target.effort = breadcrumbs.effort;
+  }
 }
 
 function breadcrumbSessionOptions(
@@ -167,6 +198,7 @@ export function sessionOptionsFromRecord(record: SessionRecord): SessionAgentOpt
   assignStoredOption(sessionOptions, "profile", nonEmptyString(stored.profile));
   assignStoredOption(sessionOptions, "reasoningEffort", nonEmptyString(stored.effort));
   assignStoredOption(sessionOptions, "autoFailover", storedBoolean(stored.auto_failover));
+  assignStoredOption(sessionOptions, "floorHard", storedBoolean(stored.floor_hard));
 
   return Object.keys(sessionOptions).length > 0 ? sessionOptions : undefined;
 }
@@ -188,6 +220,9 @@ function persistedSessionOptions(
   if (typeof options.autoFailover === "boolean") {
     next.auto_failover = options.autoFailover;
   }
+  if (typeof options.floorHard === "boolean") {
+    next.floor_hard = options.floorHard;
+  }
   return hasPersistedSessionOptions(next) ? next : undefined;
 }
 
@@ -200,7 +235,8 @@ function hasPersistedSessionOptions(options: PersistedSessionOptions): boolean {
     options.subscription !== undefined ||
     options.profile !== undefined ||
     options.effort !== undefined ||
-    options.auto_failover !== undefined
+    options.auto_failover !== undefined ||
+    options.floor_hard !== undefined
   );
 }
 

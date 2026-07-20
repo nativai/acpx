@@ -1,8 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Command, InvalidArgumentError } from "commander";
-import { isLegacyZedCodexAcpInvocation } from "../acp/codex-compat.js";
 import { acpAdapterKind } from "../acp/agent-command.js";
+import { isLegacyZedCodexAcpInvocation } from "../acp/codex-compat.js";
 import {
   listBuiltInAgents,
   resolveAgentCommand,
@@ -279,6 +279,7 @@ function sessionOptionsFromGlobalFlags(
     systemPrompt: globalFlags.systemPrompt,
     profile: unifiedSelection,
     reasoningEffort: globalFlags.reasoningEffort,
+    floorHard: globalFlags.floorHard,
   };
 }
 

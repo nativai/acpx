@@ -60,6 +60,9 @@ export type GlobalFlags = PermissionFlags & {
   systemPrompt?: SystemPromptOption;
   promptRetries?: number;
   permissionPolicy?: string;
+  /** `--floor-hard` (brick://07dd62c9): refuse/quarantine below-pinned-floor work
+   *  instead of the default detect+surface+accept. Durable per-session policy. */
+  floorHard?: boolean;
 };
 
 export type SessionSelectorFlags = {
@@ -470,6 +473,14 @@ export function addGlobalFlags(command: Command): Command {
       parsePromptRetries,
     )
     .option(
+      "--floor-hard",
+      "Hard model-floor mode: refuse/quarantine a turn served below the pinned " +
+        "model floor instead of the default detect+surface+accept. For hard-ruled " +
+        "agents where correctness > availability (e.g. max-Opus context-engineers). " +
+        "Durable per-session; a below-floor turn is never silently accepted, and " +
+        "the session auto-recovers once the pin is served again.",
+    )
+    .option(
       "--json-strict",
       "Strict JSON mode: requires --format json and suppresses non-JSON stderr output",
     )
@@ -633,6 +644,7 @@ export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig)
     maxTurns: numberOption(opts.maxTurns),
     systemPrompt: resolveSystemPromptFlag(opts),
     promptRetries: numberOption(opts.promptRetries),
+    floorHard: opts.floorHard === true ? true : undefined,
     approveAll: opts.approveAll ? true : undefined,
     approveReads: opts.approveReads ? true : undefined,
     denyAll: opts.denyAll ? true : undefined,

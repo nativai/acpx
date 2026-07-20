@@ -639,7 +639,7 @@ export class AcpRuntimeManager {
       setCurrentModelId(record, effectiveSessionOptions?.model);
     }
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
-    await this.carryForwardAutoFailoverPolicy(record, effectiveSessionOptions);
+    await this.carryForwardPinnedFloor(record, effectiveSessionOptions);
     persistSessionOptions(record, effectiveSessionOptions);
     persistSessionOwnerOptions(record, this.options);
     await this.options.sessionStore.save(record);
@@ -649,30 +649,75 @@ export class AcpRuntimeManager {
   // A persistent session that is re-created here (reset_on_next_ensure, recover,
   // or a resume-id/cwd/agent mismatch) is rebuilt from a FRESH record, so the
   // persistSessionOptions breadcrumb carry-forward has no prior session_options
-  // to read — an explicit `auto-failover off` would silently revert to default-on
-  // across the respawn (brick://71af1351). auto_failover is a durable per-session
-  // POLICY, not conversation state, so seed it from the prior on-disk record when
-  // the incoming spawn options don't carry it (an explicit options.autoFailover
-  // still wins). This makes the existing carry-forward preserve it on persist.
-  private async carryForwardAutoFailoverPolicy(
+  // to read — an explicit `auto-failover off` (or `--floor-hard`, or the pinned
+  // model/effort) would silently revert across the respawn (brick://71af1351 for
+  // auto_failover; generalized here for the pinned FLOOR — brick://07dd62c9, and
+  // the model/effort record-loss gap brick://dda08023's fresh-create attribution
+  // trace flags). These are durable per-session POLICY/PIN fields, not
+  // conversation state, so seed each from the prior on-disk record when the
+  // incoming spawn options omit it (an explicit option still wins). This is the
+  // SINGLE shared fresh-create carry-forward write-site — the breadcrumb layer of
+  // persistSessionOptions then preserves the seeded values on persist.
+  private async carryForwardPinnedFloor(
     record: SessionRecord,
     effectiveSessionOptions: SessionAgentOptions | undefined,
   ): Promise<void> {
-    if (effectiveSessionOptions?.autoFailover !== undefined) {
+    const priorFields = this.priorSessionOptionsToCarry(record, effectiveSessionOptions);
+    if (priorFields === undefined) {
       return;
     }
     const prior = await this.options.sessionStore.load(record.acpxRecordId).catch(() => undefined);
-    const priorAutoFailover = prior?.acpx?.session_options?.auto_failover;
-    if (priorAutoFailover === undefined) {
+    const priorOptions = prior?.acpx?.session_options;
+    if (!priorOptions) {
       return;
     }
-    record.acpx = {
-      ...record.acpx,
-      session_options: {
-        ...record.acpx?.session_options,
-        auto_failover: priorAutoFailover,
-      },
+    const carried: NonNullable<SessionRecord["acpx"]>["session_options"] = {
+      ...record.acpx?.session_options,
     };
+    let changed = false;
+    if (priorFields.autoFailover && priorOptions.auto_failover !== undefined) {
+      carried.auto_failover = priorOptions.auto_failover;
+      changed = true;
+    }
+    if (priorFields.floorHard && priorOptions.floor_hard !== undefined) {
+      carried.floor_hard = priorOptions.floor_hard;
+      changed = true;
+    }
+    if (priorFields.model && typeof priorOptions.model === "string" && priorOptions.model !== "") {
+      carried.model = priorOptions.model;
+      changed = true;
+    }
+    if (
+      priorFields.effort &&
+      typeof priorOptions.effort === "string" &&
+      priorOptions.effort !== ""
+    ) {
+      carried.effort = priorOptions.effort;
+      changed = true;
+    }
+    if (changed) {
+      record.acpx = { ...record.acpx, session_options: carried };
+    }
+  }
+
+  // Which durable fields the incoming spawn options DON'T carry (so a prior value
+  // must be seeded). undefined ⇒ every field is explicitly provided; nothing to do.
+  private priorSessionOptionsToCarry(
+    record: SessionRecord,
+    effectiveSessionOptions: SessionAgentOptions | undefined,
+  ): { autoFailover: boolean; floorHard: boolean; model: boolean; effort: boolean } | undefined {
+    const needs = {
+      autoFailover: effectiveSessionOptions?.autoFailover === undefined,
+      floorHard: effectiveSessionOptions?.floorHard === undefined,
+      // Only seed the pin when the current record has no pin of its own — the
+      // live-applied model/effort (applyRequestedModelIfAdvertised etc.) already
+      // wrote session_options.model when a flag carried it.
+      model: effectiveSessionOptions?.model === undefined && !record.acpx?.session_options?.model,
+      effort:
+        effectiveSessionOptions?.reasoningEffort === undefined &&
+        !record.acpx?.session_options?.effort,
+    };
+    return needs.autoFailover || needs.floorHard || needs.model || needs.effort ? needs : undefined;
   }
 
   private async keepPersistentClient(
