@@ -243,6 +243,33 @@ test("auto_failover defaults enabled and explicit false gates failover", async (
   });
 });
 
+test("integration: an owner-respawn re-persist keeps auto_failover:false across a disk round-trip", async () => {
+  await withTempHome("acpx-auto-fo-respawn-", async (homeDir) => {
+    const record = makeSessionRecord({
+      acpxRecordId: "respawn-auto-fo",
+      acpSessionId: "respawn-auto-fo-acp",
+      agentCommand: "claude",
+      cwd: homeDir,
+      acpx: { session_options: { auto_failover: false, model: "sonnet", profile: "sub6" } },
+    });
+    await writeSessionRecordFile(homeDir, record);
+
+    // A respawning owner reloads the record from disk, then re-persists
+    // session_options from the spawn-flag options (model/profile/effort) — which
+    // carry NO autoFailover. This is the exact rebuild that used to drop the
+    // explicit `off` policy.
+    const loaded = await resolveSessionRecord("respawn-auto-fo");
+    persistSessionOptions(loaded, { model: "opus", profile: "sub6", reasoningEffort: "high" });
+    await writeSessionRecordFile(homeDir, loaded);
+
+    const reloaded = await resolveSessionRecord("respawn-auto-fo");
+    assert.equal(reloaded.acpx?.session_options?.auto_failover, false);
+    assert.equal(autoFailoverEnabledForRecord(reloaded), false);
+    assert.equal(reloaded.acpx?.session_options?.model, "opus");
+    assert.equal(reloaded.acpx?.session_options?.effort, "high");
+  });
+});
+
 test("setSessionAutoFailover writes explicit policy without recycling a live-idle owner", async () => {
   await withTempHome("acpx-auto-fo-set-", async (homeDir) => {
     const record = makeSessionRecord({
