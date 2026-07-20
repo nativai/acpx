@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { Command, InvalidArgumentError } from "commander";
 import { isLegacyZedCodexAcpInvocation } from "../acp/codex-compat.js";
+import { acpAdapterKind } from "../acp/agent-command.js";
 import {
   listBuiltInAgents,
   resolveAgentCommand,
@@ -839,6 +840,23 @@ function assertCopyAgentLock(params: {
   const agentWasExplicit =
     params.explicitAgentName !== undefined || !!params.globalFlags.agent?.trim();
   if (!agentWasExplicit || params.pathAgent.agentCommand === params.source.agentCommand) {
+    return;
+  }
+  // Same ADAPTER TYPE under a different command spelling is NOT a cross-agent
+  // copy — the copy uses `source.agentCommand` verbatim regardless of the path
+  // agent, so the only thing to guard is a genuine agent-TYPE change. The
+  // exact-string check above is too strict: the claude-pty bridge's registry
+  // default (`.../dist/index.js`) and its `.../acp-server-transcript.mjs` root
+  // shim are the same program, and `ACPX_CLAUDE_PTY_ACP_COMMAND` / a config
+  // `agents` override can spell it a third way — so a session created under one
+  // spelling could not be forked/copied/byway-ed once the resolver yielded
+  // another (acpx-ui surfaced this as a 502 on byway-create over a claude-pty
+  // parent; brick://4dd3ee2c). Allow when both commands classify to the same
+  // adapter kind; fall through to the strict reject only for a raw/unknown
+  // command on either side (escape-hatch `--agent`).
+  const sourceKind = acpAdapterKind(params.source.agentCommand);
+  const pathKind = acpAdapterKind(params.pathAgent.agentCommand);
+  if (sourceKind !== undefined && sourceKind === pathKind) {
     return;
   }
   const sourceType = agentTypeLabel(params.source.agentCommand, params.config);

@@ -1502,6 +1502,58 @@ test("sessions copy rejects explicit agent type mismatch", async () => {
   });
 });
 
+// brick://4dd3ee2c — a claude-pty source copied via the explicit `claude-pty`
+// agent must NOT be rejected as a cross-agent copy just because the resolved
+// command spelling differs from the one the source was created under. The
+// staging repro: source created as `.../acp-server-transcript.mjs` (root shim),
+// resolver now yields `.../dist/index.js` (registry default) — the SAME program
+// — and the agent-lock's raw-string compare rejected the copy (→ acpx-ui 502).
+// Both spellings classify as the claude-pty adapter, so the copy must proceed.
+test("sessions copy allows a claude-pty source under a different command spelling", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    // Two DIFFERENT command strings that both classify as claude-pty (the arg
+    // substrings `acp-server-transcript` / `claude-pty-acp` are what the adapter
+    // detectors match); both are the fork-capable mock so the copy can complete.
+    const sourceCommand = `${MOCK_AGENT_WITH_FORK_SESSION} --acp-server-transcript`;
+    const pathCommand = `${MOCK_AGENT_WITH_FORK_SESSION} --claude-pty-acp`;
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify({ agents: { "claude-pty": { command: pathCommand } } }, null, 2)}\n`,
+      "utf8",
+    );
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "source-pty-spelling",
+      acpSessionId: "source-acp-pty-spelling",
+      agentCommand: sourceCommand,
+      cwd,
+      name: "pty-source",
+      messages: [{ User: { id: "user-1", content: [{ Text: "hi" }] } }],
+      lastSeq: 1,
+    });
+
+    const result = await runCli(
+      ["--format", "json", "claude-pty", "sessions", "copy", "--from", "source-pty-spelling"],
+      homeDir,
+    );
+
+    // The agent-lock must NOT fire — that raw-command-string reject is the exact
+    // regression under test (pre-fix it exits 1 with this message; post-fix the
+    // copy proceeds past the lock, since both spellings are the claude-pty
+    // adapter). We assert only the lock behaviour here; the full claude-pty copy
+    // needs claude-home profile/home infra a generic mock can't stand up, so
+    // completing the copy end-to-end is covered by the browser self-test on a
+    // real bridge, not this unit-level CLI test.
+    assert.doesNotMatch(
+      result.stderr,
+      /sessions copy preserves the source agent type/,
+      result.stderr,
+    );
+  });
+});
+
 test("sessions copy rejects adapters without fork capability", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
