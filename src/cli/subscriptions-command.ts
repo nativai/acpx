@@ -60,9 +60,12 @@ export function formatPercent(window: SubscriptionUsage["fiveHour"]): string {
   return `${(window.utilization * 100).toFixed(1)}%`;
 }
 
-// Render the Fable-share cell for a subscription. `undefined` = not probed (the
-// CLI always probes, so this only appears for a subset that wasn't fetched);
-// `error` = probe failed (unknown, not exhausted); `!available` = clean 429.
+// Render the Fable-share cell. The dedicated probe is a POINT-IN-TIME, VOLATILE
+// signal: this per-model limit flaps near its boundary, so a probe-429 does NOT
+// mean a real turn will fail (the AUTHORITATIVE exhaustion signal is a real-turn
+// 429 → FableShareExhaustedError). The human text therefore says "throttled
+// (probe)", never a permanent "EXHAUSTED". `undefined` = not probed; `error` =
+// probe failed (unknown, not exhausted).
 export function formatFable(entry: SubscriptionUsage): string {
   const f = entry.fable;
   if (!f) {
@@ -74,19 +77,20 @@ export function formatFable(entry: SubscriptionUsage): string {
   if (!f.available) {
     const share =
       entry.fallback?.percentage != null
-        ? ` (share ${Math.round(entry.fallback.percentage * 100)}%)`
+        ? `; share ${Math.round(entry.fallback.percentage * 100)}%`
         : "";
-    return `fable EXHAUSTED${share}`;
+    return `fable throttled (probe${share})`;
   }
   return f.utilization != null ? `fable ${(f.utilization * 100).toFixed(1)}%` : "fable available";
 }
 
-/** The quiet fable field: `available` | `exhausted` | `-` (not probed). */
+/** The quiet fable field: `ok` | `throttled` | `-` (not probed). Reflects the
+ *  probe INSTANT only — not a permanent verdict (the limit flaps). */
 function quietFable(entry: SubscriptionUsage): string {
   if (!entry.fable) {
     return "-";
   }
-  return entry.fable.available ? "available" : "exhausted";
+  return entry.fable.available ? "ok" : "throttled";
 }
 
 function renderUsageEntryText(entry: SubscriptionUsage): string {
@@ -108,6 +112,9 @@ export function renderUsageText(usage: SubscriptionUsage[]): string {
     return NO_REGISTRY_MESSAGE;
   }
   let out = "Subscription usage (5h / 7d / fable):\n";
+  out +=
+    "  (fable = point-in-time claude-fable-5 probe; this per-model limit flaps near its " +
+    "boundary, so a real turn may still succeed/fail independently)\n";
   for (const entry of usage) {
     out += renderUsageEntryText(entry);
   }

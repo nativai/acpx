@@ -22,11 +22,12 @@ test("formatFable: not probed / error / exhausted / available / utilization", ()
     ),
     "fable ? (network error)",
   );
+  // probe-429 → honest point-in-time "throttled (probe)", NOT a permanent verdict
   assert.equal(
     formatFable(usage({ id: "s", fable: { available: false, utilization: null, reset: null } })),
-    "fable EXHAUSTED",
+    "fable throttled (probe)",
   );
-  // exhausted + known allocation → secondary share suffix
+  // throttled + known allocation → secondary share suffix inside the same parens
   assert.equal(
     formatFable(
       usage({
@@ -35,7 +36,7 @@ test("formatFable: not probed / error / exhausted / available / utilization", ()
         fallback: { percentage: 0.5, availability: "available" },
       }),
     ),
-    "fable EXHAUSTED (share 50%)",
+    "fable throttled (probe; share 50%)",
   );
   assert.equal(
     formatFable(usage({ id: "s", fable: { available: true, utilization: null, reset: null } })),
@@ -58,7 +59,8 @@ test("renderUsageText: header names fable and each row carries a fable cell", ()
     }),
   ]);
   assert.match(out, /Subscription usage \(5h \/ 7d \/ fable\):/);
-  assert.match(out, /fable EXHAUSTED/);
+  assert.match(out, /point-in-time claude-fable-5 probe.*flaps/);
+  assert.match(out, /fable throttled \(probe\)/);
   assert.match(out, /5h 25\.0%/);
 });
 
@@ -82,7 +84,7 @@ test("renderSubscriptionsUsageQuiet: appends fable:<state> field per line", () =
       sevenDay: { utilization: 0.2, reset: null },
     }),
   ]);
-  assert.match(out, /^a\t10\.0%\t20\.0%\tfable:available$/m);
-  assert.match(out, /^b\t10\.0%\t20\.0%\tfable:exhausted$/m);
+  assert.match(out, /^a\t10\.0%\t20\.0%\tfable:ok$/m);
+  assert.match(out, /^b\t10\.0%\t20\.0%\tfable:throttled$/m);
   assert.match(out, /^c\t10\.0%\t20\.0%\tfable:-$/m);
 });
