@@ -58,6 +58,15 @@ export function isClaudeAcpCommand(command: string, args: readonly string[]): bo
   return args.some((arg) => arg.includes("claude-agent-acp"));
 }
 
+// String-level variant of isClaudeAcpCommand for callers that hold the unsplit
+// agentCommand (e.g. the model-floor served-transcript reader, which is only
+// meaningful for the SDK adapter that writes the `<acpSessionId>.jsonl` with
+// `assistant.message.model`).
+export function isClaudeAcpAgentCommand(agentCommand: string): boolean {
+  const { command, args } = splitCommandLine(agentCommand);
+  return isClaudeAcpCommand(command, args);
+}
+
 // The claude-pty bridge (independent-claude-acp). Matches the bootstrapped
 // built default (`node /opt/claude-pty-acp/dist/index.js`), the root shim,
 // and dev overrides via ACPX_CLAUDE_PTY_ACP_COMMAND or a config.json `agents`

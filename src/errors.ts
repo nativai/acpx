@@ -275,6 +275,49 @@ export class FableShareExhaustedError extends AcpxOperationalError {
   }
 }
 
+// The turn was served (or is knowably about to be served) BELOW a pinned model
+// floor — the API silently downgraded the pinned model (e.g. fable → sonnet)
+// under load, which acpx cannot PREVENT (the serving choice is the harness/API's,
+// not acpx's) but MUST refuse to silently ACCEPT. Raised in two places under
+// `--floor-hard`: (i) the pre-turn probe-gate, when the pinned model probes
+// cleanly unavailable (retryable, no prompt submitted); (ii) the post-serve
+// check, when the last served assistant model is not the pinned model (the turn
+// does NOT settle as end_turn — its content is quarantined behind this terminal).
+// detailCode 'model-floor-unmet' is the cross-repo contract string; acpx-ui maps
+// it to a dedicated "served below pinned floor" banner. Retryable so a bounded
+// auto-retry can re-probe; the record's desired pin is NEVER mutated by this
+// error, so a later at-floor serve auto-recovers.
+export class ModelFloorUnmetError extends AcpxOperationalError {
+  readonly pinnedModel: string;
+  readonly servedModel: string | undefined;
+
+  constructor(params: {
+    pinnedModel: string;
+    servedModel?: string;
+    phase: "pre-turn" | "post-serve";
+    detail?: string;
+  }) {
+    const servedClause =
+      params.phase === "pre-turn"
+        ? `the pinned model "${params.pinnedModel}" is not servable right now (probed cleanly unavailable)`
+        : `the turn was served "${params.servedModel ?? "unknown"}" instead of the pinned model "${params.pinnedModel}"`;
+    super(
+      `Model floor not met: ${servedClause}. Under --floor-hard, below-floor work is not accepted — ` +
+        `the pinned model+effort are unchanged and the session auto-recovers once the pin is served again` +
+        (params.detail ? ` (${params.detail})` : "") +
+        `.`,
+      {
+        outputCode: "RUNTIME",
+        detailCode: "model-floor-unmet",
+        origin: "runtime",
+        retryable: true,
+      },
+    );
+    this.pinnedModel = params.pinnedModel;
+    this.servedModel = params.servedModel;
+  }
+}
+
 // Every same-family subscription target is locked by operator action. Distinct
 // from exhausted/quota so retry-exhausted semantics remain untouched.
 export class AllSubscriptionsLockedError extends AcpxOperationalError {

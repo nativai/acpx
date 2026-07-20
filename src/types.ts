@@ -461,6 +461,49 @@ export type SessionAcpxState = {
   progress?: AgentProgress;
   config_options?: SessionConfigOption[];
   owner_options?: SessionOwnerOptions;
+  /**
+   * Per-turn SERVED truth (brick://07dd62c9): the model the harness/API actually
+   * served for the last turn — the last `assistant.message.model` in the Claude
+   * transcript — plus the effort that the served model implies, and when it was
+   * observed. LIVE observation, deliberately kept SEPARATE from the desired pin
+   * (`current_model_id` / `session_options.model`): under load the API can serve
+   * a cheaper model than the pin, and this field records that fact without ever
+   * mutating the pin. Absent for non-Claude agents (no transcript model) and
+   * until the first post-turn capture. `effort` is DERIVED from the served model
+   * (effort follows model — see config-option-application), not an independent
+   * observation; `source` labels where `model` came from.
+   */
+  served?: {
+    model?: string;
+    effort?: string;
+    at?: string;
+    source?: string;
+  };
+  /**
+   * Breadcrumb stamped when a turn was served below the pinned floor
+   * (brick://07dd62c9). Records the observed served model/effort alongside the
+   * pinned floor + when, so the dip is auditable after the fact. Auto-CLEARED on
+   * the next at-floor serve. The desired pin is NEVER mutated by this.
+   */
+  served_below_floor?: {
+    served_model?: string;
+    served_effort?: string;
+    pinned_model?: string;
+    pinned_effort?: string;
+    at: string;
+  };
+  /**
+   * Set under `--floor-hard` when a below-floor turn was refused/quarantined and
+   * bounded auto-retry did not recover (brick://07dd62c9). The session awaits an
+   * at-floor serve (auto-clears) or a parent/operator ack. Distinct from the
+   * `served_below_floor` audit breadcrumb: this one drives the parked state +
+   * debounced parent notification.
+   */
+  floor_parked?: {
+    at: string;
+    reason: string;
+    observed_model?: string;
+  };
   session_options?: {
     model?: string;
     allowed_tools?: string[];
@@ -484,6 +527,15 @@ export type SessionAcpxState = {
      * means enabled (the historical behavior); only explicit false opts out.
      */
     auto_failover?: boolean;
+    /**
+     * Per-session hard model-floor policy (brick://07dd62c9). When true, a turn
+     * that is served below the pinned model floor is NOT silently accepted: it is
+     * refused pre-turn when knowably-down and quarantined behind a loud terminal
+     * post-serve. Absent/false = the default "detect + surface + accept" mode.
+     * Durable per-session policy, carried forward across owner respawns by
+     * `carryForwardPinnedFloor` (same shape as `auto_failover`).
+     */
+    floor_hard?: boolean;
     /**
      * Breadcrumb recorded when a session's subscription is changed in place
      * (manual switch or auto-failover). Drives the acpx-ui badge/notice and

@@ -30,6 +30,19 @@ const ORDERED_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const
 const EFFORT_LEVEL_RANKS = new Map<string, number>(
   ORDERED_EFFORT_LEVELS.map((level, index) => [level, index]),
 );
+
+/**
+ * Ordinal rank of an effort level on the shared `low<medium<high<xhigh<max`
+ * ladder, or undefined for an unknown/opaque value (e.g. `default`). The single
+ * source of truth for effort ordering — the model-floor check reuses it so a
+ * "served effort ≥ pinned effort" comparison never re-hardcodes the ladder.
+ */
+export function effortRank(level: string | undefined): number | undefined {
+  if (typeof level !== "string") {
+    return undefined;
+  }
+  return EFFORT_LEVEL_RANKS.get(level.trim());
+}
 const SONNET_CLAUDE_EFFORT_LEVELS = new Set(["low", "medium", "high"]);
 const HAIKU_CLAUDE_EFFORT_LEVELS = new Set(["high"]);
 
