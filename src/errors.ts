@@ -249,6 +249,31 @@ export class AllSubscriptionsExhaustedError extends AcpxOperationalError {
   }
 }
 
+// Every Fable-eligible subscription rejects claude-fable-5 with 429 while the
+// unified 5h/7d windows are HEALTHY (the per-model "fallback" cap). A SEPARATE
+// terminal condition from AllSubscriptionsExhaustedError, whose unified-window
+// premise is FALSE here. detailCode 'fable-share-exhausted' is the cross-repo
+// contract string; normalizeOutputError reads outputCode+detailCode off the
+// AcpxOperationalError base, so it flows through the SAME builder + persist mirror
+// as the existing terminal errors with ZERO persist-path changes. Record
+// selection is left unchanged so a later turn re-probes and auto-recovers when
+// the Fable-share window resets. Only ever thrown when isFableModel(sessionModel).
+export class FableShareExhaustedError extends AcpxOperationalError {
+  constructor(statuses: string) {
+    super(
+      `Fable-share limit reached on all subscriptions (per-model fallback cap; ` +
+        `unified 5h/7d windows are healthy). ${statuses} — switch to a non-Fable ` +
+        `model (e.g. \`--model opus\` / \`sessions set-model opus\`) or wait for the ` +
+        `Fable-share window to reset.`,
+      {
+        outputCode: "RUNTIME",
+        detailCode: "fable-share-exhausted",
+        origin: "runtime",
+      },
+    );
+  }
+}
+
 // Every same-family subscription target is locked by operator action. Distinct
 // from exhausted/quota so retry-exhausted semantics remain untouched.
 export class AllSubscriptionsLockedError extends AcpxOperationalError {
