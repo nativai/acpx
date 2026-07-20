@@ -187,7 +187,7 @@ test("AC6: Fable session, all subs fable-429 → FableShareExhaustedError, NO th
           }),
         (err: unknown) => {
           assert.ok(err instanceof FableShareExhaustedError);
-          assert.equal((err as FableShareExhaustedError).detailCode, "fable-share-exhausted");
+          assert.equal(err.detailCode, "fable-share-exhausted");
           return true;
         },
       );
