@@ -80,6 +80,7 @@ import {
   setDesiredModelId,
 } from "../../session/mode-preference.js";
 import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
+import { captureServedState } from "../../session/model-floor.js";
 import {
   ownerOptionsToInput,
   persistSessionOwnerOptions,
@@ -2364,6 +2365,13 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     applyConversation(record, conversation);
     await mergeLatestDurablePreferencesFromDisk();
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
+    // Served-truth surface (brick://07dd62c9): stamp what the harness ACTUALLY
+    // served this turn (last assistant.message.model + derived effort) onto the
+    // LIVE `acpx.served` block — never the desired pin. Best-effort; no-op for
+    // non-Claude adapters. Re-sync acpxState so the finally re-merge (which bases
+    // off acpxState) preserves the served block through to the persisted write.
+    await captureServedState(record).catch(() => undefined);
+    acpxState = cloneSessionAcpxState(record.acpx);
     stopTotalTimer();
     return response;
   };

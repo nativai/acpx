@@ -292,3 +292,23 @@ export function clearFloorBreadcrumbs(record: SessionRecord): boolean {
 export function belowFloorEpisodeOpen(record: SessionRecord): boolean {
   return record.acpx?.served_below_floor !== undefined;
 }
+
+/**
+ * Read the served model from the transcript and stamp the per-turn served block
+ * (model + derived effort) onto the record. Returns the served model (or
+ * undefined when unreadable / non-Claude — the served block is then left as-is).
+ * Deliberately does NOT touch the desired pin.
+ */
+export async function captureServedState(record: SessionRecord): Promise<string | undefined> {
+  const servedModel = await readLastServedModel(record);
+  if (!servedModel) {
+    return undefined;
+  }
+  const servedEffort = deriveServedEffort(pinnedEffortFloor(record), servedModel);
+  setServedState(record, {
+    model: servedModel,
+    effort: servedEffort,
+    source: "claude-transcript",
+  });
+  return servedModel;
+}
