@@ -105,6 +105,47 @@ export function resolvePrimerChannel(agentCommand: string): PrimerChannel {
 }
 
 /**
+ * The canonical ADAPTER TYPE for an agent command, derived from the substring
+ * command detectors (NOT `resolveAgentNameFromCommand`, which requires an exact
+ * registry-string match). Two command spellings that drive the same adapter map
+ * to the same kind — most notably the claude-pty bridge, whose deployed
+ * `.../dist/index.js` (registry default) and `.../acp-server-transcript.mjs`
+ * root shim are byte-for-byte the same program (the shim just re-exports
+ * `dist/index.js`), plus any `ACPX_CLAUDE_PTY_ACP_COMMAND` / config `agents`
+ * override pointing at a checkout. Returns `undefined` for a raw/unknown command
+ * so callers can fall back to strict command-string identity for genuine escape
+ * hatches. Used by the copy/fork agent-lock so a same-adapter copy under a
+ * different command spelling is not misread as a cross-agent copy.
+ */
+export function acpAdapterKind(agentCommand: string): string | undefined {
+  // A record can carry an empty agent_command (e.g. a never-configured stub);
+  // splitCommandLine rejects an empty command, so short-circuit to unknown.
+  if (!agentCommand.trim()) {
+    return undefined;
+  }
+  const { command, args } = splitCommandLine(agentCommand);
+  // claude-pty before claude: the detectors are disjoint (acp-server-transcript
+  // / claude-pty-acp vs claude-agent-acp), but keep the PTY check first for
+  // clarity, matching the ordering convention elsewhere.
+  if (isClaudePtyAcpCommand(command, args)) {
+    return "claude-pty";
+  }
+  if (isClaudeAcpCommand(command, args)) {
+    return "claude";
+  }
+  if (isCodexAcpCommand(command, args)) {
+    return "codex";
+  }
+  if (isGeminiAcpCommand(command, args)) {
+    return "gemini";
+  }
+  if (isCopilotAcpCommand(command, args)) {
+    return "copilot";
+  }
+  return undefined;
+}
+
+/**
  * Compose the primer `_meta` fragment for a session request (CONCEPTION §4.4).
  * The fragment OWNS `systemPrompt` / `codex.developerInstructions`, so the
  * caller must merge it AFTER `optionsMeta` to win.
