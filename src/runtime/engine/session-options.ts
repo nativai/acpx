@@ -62,6 +62,15 @@ export function persistSessionOptions(
   // flag, so it is absent from SessionAgentOptions). Carry it forward across a
   // re-persist (e.g. a model change next turn) so a manual/failover switch
   // stays visible; a subsequent switch overwrites it via switchSessionSubscription.
+  //
+  // auto_failover rides the same carry-forward. Unlike the pure breadcrumbs it
+  // IS an explicit user policy (`set auto-failover off`), but it is NOT threaded
+  // through the spawn-flag options (model/profile/effort) that owner respawns
+  // rebuild session_options from. Without the carry-forward, every respawn would
+  // rebuild session_options without auto_failover and silently revert an explicit
+  // `off` back to default-on (brick://71af1351). Carrying the persisted value
+  // when options omit it — while letting an explicit options.autoFailover win —
+  // makes the policy durable across respawns.
   const breadcrumbs = sessionOptionBreadcrumbs(record);
   const next = persistedSessionOptionsWithBreadcrumbs(options, breadcrumbs);
   if (next !== undefined) {
@@ -79,6 +88,7 @@ type SessionOptionBreadcrumbs = {
   subscriptionSwitch: PersistedSessionOptions["subscription_switch"];
   accountSwitch: PersistedSessionOptions["account_switch"];
   provisioningWarning: PersistedSessionOptions["provisioning_warning"];
+  autoFailover: PersistedSessionOptions["auto_failover"];
 };
 
 function sessionOptionBreadcrumbs(record: SessionRecord): SessionOptionBreadcrumbs {
@@ -86,6 +96,7 @@ function sessionOptionBreadcrumbs(record: SessionRecord): SessionOptionBreadcrum
     subscriptionSwitch: record.acpx?.session_options?.subscription_switch,
     accountSwitch: record.acpx?.session_options?.account_switch,
     provisioningWarning: record.acpx?.session_options?.provisioning_warning,
+    autoFailover: record.acpx?.session_options?.auto_failover,
   };
 }
 
@@ -119,6 +130,12 @@ function assignBreadcrumbs(
   }
   if (breadcrumbs.provisioningWarning !== undefined) {
     target.provisioning_warning = breadcrumbs.provisioningWarning;
+  }
+  // Only carry the persisted auto_failover when the rebuilt options did not
+  // already set it — an explicit options.autoFailover (persistedSessionOptions
+  // wrote it) is a deliberate policy change and must win over the prior value.
+  if (breadcrumbs.autoFailover !== undefined && target.auto_failover === undefined) {
+    target.auto_failover = breadcrumbs.autoFailover;
   }
 }
 
