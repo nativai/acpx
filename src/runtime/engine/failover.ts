@@ -10,12 +10,12 @@ import {
   loadProfileRegistry,
 } from "../../config/profiles.js";
 import {
-  getSubscriptionsFableState,
   getSubscriptionsUsage,
+  getSubscriptionsUsageWithFable,
   isFableModel,
+  maxedThreshold,
   maxUtilization,
   pickFailoverTarget,
-  type SubscriptionFableState,
   type SubscriptionUsage,
 } from "../../config/subscription-usage.js";
 import {
@@ -201,24 +201,60 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-// A human status line per sub for the FableShareExhaustedError message, in the
-// describeUsage style.
-function fableStatuses(
+// "Unified healthy" = at least one sub can STILL serve non-Fable traffic (5h
+// present, no probe error, utilization < the maxed threshold). This is the
+// ISOLATING discriminator that a rate_limit is Fable-SPECIFIC (the per-model
+// fallback cap) rather than whole-account exhaustion — it is exactly the premise
+// FableShareExhaustedError asserts, so we must VERIFY it before raising that error.
+function unifiedUsageHealthy(usages: SubscriptionUsage[], threshold: number): boolean {
+  return usages.some(
+    (usage) =>
+      usage.error === undefined &&
+      usage.fiveHour !== null &&
+      usage.fiveHour.utilization < threshold,
+  );
+}
+
+// Evidence string for the FableShareExhaustedError message — carries the ACTUAL
+// unified figures just read (so "unified windows healthy" is backed by numbers,
+// not asserted) plus the fable-429 count.
+function fableShareEvidence(usages: SubscriptionUsage[], threshold: number): string {
+  const healthy = usages.find(
+    (usage) =>
+      usage.error === undefined &&
+      usage.fiveHour !== null &&
+      usage.fiveHour.utilization < threshold,
+  );
+  const unified = healthy
+    ? `unified 5h ${pctText(healthy.fiveHour?.utilization)}/7d ${pctText(healthy.sevenDay?.utilization)} — healthy on ${healthy.id}`
+    : "unified maxed everywhere";
+  const exhausted = usages.filter(
+    (usage) => usage.fable?.available === false && usage.fable.error === undefined,
+  ).length;
+  return `${unified}; fable 429 on ${exhausted}/${usages.length} subs`;
+}
+
+function pctText(fraction: number | null | undefined): string {
+  return fraction == null ? "n/a" : `${Math.round(fraction * 100)}%`;
+}
+
+// Seed `tried` with the fable-EXHAUSTED accounts (clean 429 only) so the failover
+// loop only fails over to fable-available subs — no wasted hops on known-429 subs.
+function seedFableExhaustedTried(
   entries: SubscriptionEntry[],
-  fable: Map<string, SubscriptionFableState>,
-): string {
-  return entries
-    .map((entry) => {
-      const state = fable.get(entry.id);
-      if (!state) {
-        return `${entry.label} (${entry.id}): fable not probed`;
+  usageById: Map<string, SubscriptionUsage>,
+  tried: Set<string>,
+  loadOpts?: SubscriptionLookupOptions,
+): void {
+  for (const entry of entries) {
+    const state = usageById.get(entry.id)?.fable;
+    if (state?.available === false && state.error === undefined) {
+      const account = accountForEntry(entry, loadOpts);
+      if (account) {
+        tried.add(account);
       }
-      if (state.error) {
-        return `${entry.label} (${entry.id}): fable ? (${state.error})`;
-      }
-      return `${entry.label} (${entry.id}): fable ${state.available ? "available" : "exhausted"}`;
-    })
-    .join("; ");
+    }
+  }
 }
 
 // The `tried`-set account key for a subscription entry (same profile.account key
@@ -245,33 +281,37 @@ function accountForEntry(
 // boundary). This is acceptable here because it runs ONLY after the session's OWN
 // real turn already 429'd — the AUTHORITATIVE signal — so the fresh probe is
 // corroborating that live failure, not predicting it in the abstract.
+//
+// CLASSIFICATION GATE: FableShareExhaustedError claims "unified 5h/7d windows are
+// healthy". So we VERIFY that before raising it — probe unified AND fable fresh in
+// one shot. If NOTHING can serve non-Fable traffic (unified maxed everywhere), the
+// 429 is GENERIC exhaustion, not the fable-share cap: return isFableRateLimit=false
+// so BOTH the pre-loop throw and the mid-loop conversion are bypassed and the
+// normal path raises AllSubscriptionsExhaustedError (correct cause + remedy).
 async function fableRateLimitShortCircuit(params: {
   tried: Set<string>;
   restoreOriginalSelection: () => Promise<void>;
   loadOpts?: SubscriptionLookupOptions;
-}): Promise<string> {
+}): Promise<{ isFableRateLimit: boolean; statusSnapshot?: string }> {
   const entries = loadSubscriptionRegistry(params.loadOpts).subscriptions;
-  const fable = await getSubscriptionsFableState(entries, true);
-  const statusSnapshot = fableStatuses(entries, fable);
-  const anyAvailable = entries.some((entry) => fable.get(entry.id)?.available === true);
+  const usages = await getSubscriptionsUsageWithFable(entries, true);
+  const threshold = maxedThreshold();
+  if (!unifiedUsageHealthy(usages, threshold)) {
+    return { isFableRateLimit: false }; // generic exhaustion, not fable-share
+  }
+  const statusSnapshot = fableShareEvidence(usages, threshold);
+  const anyAvailable = usages.some((usage) => usage.fable?.available === true);
   // A probe ERROR = UNKNOWN. Short-circuit ONLY on POSITIVE evidence — every sub a
   // clean 429 (no available, no unknown). If any probe errored we degrade to the
   // normal loop so a real turn decides that sub (AC8), never a false terminal.
-  const anyUnknown = entries.some((entry) => fable.get(entry.id)?.error !== undefined);
+  const anyUnknown = usages.some((usage) => usage.fable?.error !== undefined);
   if (!anyAvailable && !anyUnknown) {
     await params.restoreOriginalSelection();
     throw new FableShareExhaustedError(statusSnapshot);
   }
-  for (const entry of entries) {
-    const state = fable.get(entry.id);
-    if (state?.available === false && state.error === undefined) {
-      const account = accountForEntry(entry, params.loadOpts);
-      if (account) {
-        params.tried.add(account);
-      }
-    }
-  }
-  return statusSnapshot;
+  const usageById = new Map(usages.map((usage) => [usage.id, usage]));
+  seedFableExhaustedTried(entries, usageById, params.tried, params.loadOpts);
+  return { isFableRateLimit: true, statusSnapshot };
 }
 
 // Boundary conversion (§3b): when the fable-available subset ALSO exhausts
@@ -306,12 +346,11 @@ async function prepareFableShortCircuit(params: {
   if (!isFableModel(sessionModel) || params.initialTrigger !== "rate_limit") {
     return { isFableRateLimit: false };
   }
-  const statusSnapshot = await fableRateLimitShortCircuit({
+  return await fableRateLimitShortCircuit({
     tried: params.tried,
     restoreOriginalSelection: params.restoreOriginalSelection,
     loadOpts: params.loadOpts,
   });
-  return { isFableRateLimit: true, statusSnapshot };
 }
 
 function errorEffectiveAccount(error: unknown): EffectiveAccountMetadata | undefined {

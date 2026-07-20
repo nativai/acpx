@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { resetKnownDeadSubs } from "../src/config/known-dead-subscriptions.js";
-import { FableShareExhaustedError } from "../src/errors.js";
+import { AllSubscriptionsExhaustedError, FableShareExhaustedError } from "../src/errors.js";
 import { attemptFailoverAndRetry } from "../src/runtime/engine/failover.js";
 import type { SessionRecord } from "../src/types.js";
 
@@ -23,6 +23,7 @@ type ProbeHit = { model: string; token: string };
 // a test can assert the fable probe never fired for a non-Fable session.
 function startMockMessages(
   fableByToken: Map<string, FableOutcome>,
+  unifiedByToken: Map<string, number>,
   hits: ProbeHit[],
 ): Promise<{ server: Server; url: string }> {
   return new Promise((resolve) => {
@@ -51,11 +52,13 @@ function startMockMessages(
           }
           return;
         }
-        // Haiku usage probe: healthy so the sub is an eligible failover target.
+        // Haiku unified usage probe. Default 0.1 (healthy → eligible failover
+        // target); a high value models a genuinely 5h-maxed account.
+        const util = String(unifiedByToken.get(token) ?? 0.1);
         res
           .writeHead(200, {
-            "anthropic-ratelimit-unified-5h-utilization": "0.1",
-            "anthropic-ratelimit-unified-7d-utilization": "0.1",
+            "anthropic-ratelimit-unified-5h-utilization": util,
+            "anthropic-ratelimit-unified-7d-utilization": util,
           })
           .end("{}");
       });
@@ -71,7 +74,7 @@ function startMockMessages(
 let rigCounter = 0;
 
 async function withRig(
-  subs: Array<{ id: string; fable: FableOutcome }>,
+  subs: Array<{ id: string; fable: FableOutcome; unified?: number }>,
   defaultId: string,
   run: (ctx: {
     homeDir: string;
@@ -88,6 +91,7 @@ async function withRig(
   const profileDir = (id: string) => path.join(subsDir, id);
   const tokenOf = (id: string) => `tok-${rigCounter}-${id}`;
   const fableByToken = new Map<string, FableOutcome>();
+  const unifiedByToken = new Map<string, number>();
   const hits: ProbeHit[] = [];
   try {
     for (const sub of subs) {
@@ -97,6 +101,9 @@ async function withRig(
         JSON.stringify({ claudeAiOauth: { accessToken: tokenOf(sub.id) } }),
       );
       fableByToken.set(tokenOf(sub.id), sub.fable);
+      if (sub.unified !== undefined) {
+        unifiedByToken.set(tokenOf(sub.id), sub.unified);
+      }
     }
     await fs.writeFile(
       registryPath,
@@ -113,7 +120,7 @@ async function withRig(
         })),
       }),
     );
-    const { server, url } = await startMockMessages(fableByToken, hits);
+    const { server, url } = await startMockMessages(fableByToken, unifiedByToken, hits);
     const prevEndpoint = process.env.CLAUDE_MESSAGES_ENDPOINT;
     const prevHome = process.env.HOME;
     process.env.CLAUDE_MESSAGES_ENDPOINT = url;
@@ -287,6 +294,68 @@ test("distinctness: a NON-Fable session never fable-probes (byte-identical failo
         false,
         "a non-Fable session must never issue a claude-fable-5 probe",
       );
+    },
+  );
+});
+
+test("discrimination (a): all fable-429 + unified HEALTHY ⇒ FableShareExhaustedError w/ evidence", async () => {
+  await withRig(
+    [
+      { id: "a", fable: "exhausted", unified: 0.25 }, // can still serve non-fable
+      { id: "b", fable: "exhausted", unified: 0.08 },
+    ],
+    "a",
+    async ({ homeDir, registryPath }) => {
+      const record = sessionRecord("a", FABLE);
+      await assert.rejects(
+        () =>
+          attemptFailoverAndRetry<string>({
+            record,
+            triggerError: rateLimitError("a"),
+            loadOpts: { homeDir, registryPath },
+            runTurn: async () => "should-not-run",
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof FableShareExhaustedError);
+          // the "unified healthy" claim is EVIDENCED by the numbers just read
+          assert.match(err.message, /unified 5h \d+%\/7d \d+% — healthy/);
+          assert.match(err.message, /fable 429 on 2\/2 subs/);
+          return true;
+        },
+      );
+    },
+  );
+});
+
+test("discrimination (b): all fable-429 + unified ALSO maxed ⇒ generic exhaustion, NOT fable-share", async () => {
+  await withRig(
+    [
+      { id: "a", fable: "exhausted", unified: 0.99 }, // whole account maxed
+      { id: "b", fable: "exhausted", unified: 0.99 },
+    ],
+    "a",
+    async ({ homeDir, registryPath }) => {
+      const record = sessionRecord("a", FABLE);
+      let turns = 0;
+      await assert.rejects(
+        () =>
+          attemptFailoverAndRetry<string>({
+            record,
+            triggerError: rateLimitError("a"),
+            loadOpts: { homeDir, registryPath },
+            runTurn: async () => {
+              turns += 1;
+              return "should-not-run";
+            },
+          }),
+        (err: unknown) => {
+          // Must NOT mislabel a genuinely-maxed account as the fable-share cap.
+          assert.ok(!(err instanceof FableShareExhaustedError));
+          assert.ok(err instanceof AllSubscriptionsExhaustedError);
+          return true;
+        },
+      );
+      assert.equal(turns, 0, "nothing eligible → no thrash");
     },
   );
 });
