@@ -172,6 +172,22 @@ test("auto_failover:false is preserved against stale durable preference snapshot
   assert.equal(merged?.session_options?.auto_failover, false);
 });
 
+test("cross-session list readback surfaces a respawn-rebuilt auto_failover:false for OTHER sessions", () => {
+  // The brick's literal claim: a cross-session readback (the `acpx sessions`
+  // list / acpx-ui, which projects OTHER sessions from their index entries)
+  // must report the policy for a session that is not `self`. The index entry is
+  // projected straight from session_options.auto_failover, so it is only correct
+  // if the field survives the owner-respawn rebuild.
+  const other = recordWithAutoFailover(false);
+  // Simulate the respawn rebuild: session_options rebuilt from spawn flags only.
+  persistSessionOptions(other, { model: "opus", profile: "sub6", reasoningEffort: "high" });
+
+  const entry = toSessionIndexEntry(other, "other-session.json");
+  // Pre-fix the rebuild dropped auto_failover -> this projected to `undefined`
+  // (read cross-session as default-on); the carry-forward keeps it false.
+  assert.equal(entry.autoFailover, false);
+});
+
 test("session index projects and preserves autoFailover", async () => {
   await withTempDir("acpx-auto-fo-index-", async (dir) => {
     const entry = toSessionIndexEntry(recordWithAutoFailover(false), "auto-fo.json");

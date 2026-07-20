@@ -4762,6 +4762,59 @@ test("set auto-failover updates durable policy and status json reports it", asyn
   });
 });
 
+test("status reports auto_failover:off for a DIFFERENT session read cross-session by id and url", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionCwd = path.join(homeDir, "workspace", "project");
+    const otherCwd = path.join(homeDir, "elsewhere");
+    await fs.mkdir(sessionCwd, { recursive: true });
+    await fs.mkdir(otherCwd, { recursive: true });
+    const recordId = "55555555-5555-4555-8555-555555555555";
+    const sessionUrl = `https://acpx.devbox.nativai.de/?session=${recordId}`;
+
+    // A session that has explicitly disabled failover, persisted on its record.
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: recordId,
+      acpSessionId: `${recordId}-acp`,
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd: sessionCwd,
+      name: "failover-off-session",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:00:00.000Z",
+      closed: false,
+      acpx: { session_options: { auto_failover: false } },
+    });
+
+    // Cross-session read from an UNRELATED cwd (not the session's own) by id.
+    const statusById = await runCli(
+      ["--cwd", otherCwd, "--format", "json", "codex", "status", "--session-id", recordId],
+      homeDir,
+    );
+    assert.equal(statusById.code, 0, statusById.stderr);
+    const byIdPayload = JSON.parse(statusById.stdout.trim()) as Record<string, unknown>;
+    assert.equal(byIdPayload.acpxRecordId, recordId);
+    // The brick's literal claim: the OTHER session's policy is reported, not omitted.
+    assert.equal(byIdPayload.autoFailover, false);
+
+    // And by url selector, same result.
+    const statusByUrl = await runCli(
+      ["--cwd", otherCwd, "--format", "json", "codex", "status", "--session-url", sessionUrl],
+      homeDir,
+    );
+    assert.equal(statusByUrl.code, 0, statusByUrl.stderr);
+    const byUrlPayload = JSON.parse(statusByUrl.stdout.trim()) as Record<string, unknown>;
+    assert.equal(byUrlPayload.acpxRecordId, recordId);
+    assert.equal(byUrlPayload.autoFailover, false);
+
+    // Text surface too, so a human `status` read is unambiguous.
+    const statusText = await runCli(
+      ["--cwd", otherCwd, "codex", "status", "--session-id", recordId],
+      homeDir,
+    );
+    assert.equal(statusText.code, 0, statusText.stderr);
+    assert.match(statusText.stdout, /autoFailover: off/);
+  });
+});
+
 test("--ttl flag is parsed for sessions commands", async () => {
   await withTempHome(async (homeDir) => {
     const ok = await runCli(["--ttl", "30", "--format", "json", "sessions", "--local"], homeDir);
