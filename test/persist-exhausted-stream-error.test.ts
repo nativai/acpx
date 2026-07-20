@@ -4,6 +4,7 @@ import { createServer, type Server } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { normalizeOutputError } from "../src/acp/error-normalization.js";
 import { isAcpJsonRpcMessage } from "../src/acp/jsonrpc.js";
 import { resetKnownDeadSubs } from "../src/config/known-dead-subscriptions.js";
 import { AllSubscriptionsExhaustedError, BridgeAuthGatedError } from "../src/errors.js";
@@ -381,23 +382,33 @@ test("a turn-ending rate_limit is mirrored into .messages.ndjson with its detail
     const record = makeRecord("rec-ratelimit");
     await writeSessionRecord(record);
 
-    // The shape a turn-ending rate_limit surfaces with: the adapter tags
-    // data.errorKind = "rate_limit" (what classifyFailover keys on), and acpx's
-    // wrapping carries the top-level detailCode the normalizer reads.
+    // REALISTIC input — the shape a raw turn-ending rate_limit actually surfaces
+    // with: the adapter tags `data.errorKind = "rate_limit"` (what classifyFailover
+    // keys on) and carries NO top-level `detailCode`. This is deliberately NOT
+    // fixture-gamed with a bolted-on `.detailCode`: `normalizeOutputError` reads a
+    // top-level `.detailCode` (via readOutputErrorMeta) and finds none here, so the
+    // mirror MUST DERIVE `detail_code` from the failover classifier — otherwise the
+    // entry would carry the human line with an empty machine code. (Regression
+    // guard for the TE-found F8 defect: the earlier version of this test bolted on
+    // `.detailCode` and so passed without exercising the derivation.)
     const rateLimitError = new Error(
       "Usage limit reached for this subscription — resets 2026-06-04T15:00:00Z",
     ) as Error & {
       acp?: { code: number; message: string; data: Record<string, unknown> };
-      detailCode?: string;
     };
     rateLimitError.acp = {
       code: -32000,
       message: rateLimitError.message,
       data: { errorKind: "rate_limit" },
     };
-    rateLimitError.detailCode = "rate_limit";
 
-    // Preconditions: this is exactly the classification the runtime routes on.
+    // Preconditions: normalization yields NO detailCode on this raw shape, but the
+    // failover classifier does — exactly the gap the mirror's derivation fills.
+    assert.equal(
+      normalizeOutputError(rateLimitError, { origin: "runtime" }).detailCode,
+      undefined,
+      "raw adapter rate_limit has no normalized detailCode (the gap)",
+    );
     assert.equal(classifyFailover(rateLimitError), "rate_limit");
     assert.equal(isTerminalTurnError(rateLimitError), true);
 
@@ -408,6 +419,7 @@ test("a turn-ending rate_limit is mirrored into .messages.ndjson with its detail
     assert.equal(mirrored.length, 1, "exactly one mirrored terminal-error entry");
     const entry = asTerminalAgentEntry(mirrored[0]);
     assert.match(entry.text, /^⚠ turn failed: Usage limit reached for this subscription/);
+    // DERIVED from classifyFailover, not from the fixture — the crux of the fix.
     assert.equal(entry.detailCode, "rate_limit");
     assert.match(entry.message ?? "", /Usage limit reached for this subscription/);
 

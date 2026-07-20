@@ -1,5 +1,6 @@
 import { normalizeOutputError } from "../acp/error-normalization.js";
 import { buildJsonRpcErrorResponse } from "../acp/jsonrpc-error.js";
+import { classifyFailover } from "../runtime/engine/failover.js";
 import type {
   AcpJsonRpcMessage,
   SessionMessage,
@@ -51,30 +52,51 @@ export async function persistTerminalTurnError(
   }
 }
 
-// Class-agnostic terminal-turn-error predicate. TRUE for any error that
-// `normalizeOutputError` resolves to a cross-repo `detailCode` — the same
-// contract string acpx-ui keys its banners on. This is the routing gate for the
+// Resolve the machine-readable `detailCode` for a terminal turn error. Prefer the
+// normalized cross-repo detailCode — the acpx-synthesized classes (exhaustion →
+// `all-subscriptions-exhausted`, auth-gated → `auth-gated`) carry it, and it's the
+// exact string acpx-ui keys its banners on. When normalization yields NONE — the
+// case for a RAW adapter error that only carries `data.errorKind` and no top-level
+// `detailCode` (a single-sub turn-ending rate_limit is the canonical example) —
+// fall back to the failover classifier's verdict (`rate_limit` / `billing` /
+// `auth_failed` / `auth_gated`). Without this fallback the mirror would emit the
+// human "⚠ turn failed:" line with an EMPTY `terminal_error.detail_code`, leaving
+// a spawner unable to classify a real rate_limit programmatically. The normalized
+// value wins when present, so the acpx-error-class paths are unchanged; the
+// classifier only fills the gap.
+function resolveTerminalDetailCode(error: unknown): string | undefined {
+  const normalized = normalizeOutputError(error, { origin: "runtime" }).detailCode;
+  if (typeof normalized === "string" && normalized.trim().length > 0) {
+    return normalized;
+  }
+  return classifyFailover(error) ?? undefined;
+}
+
+// Class-agnostic terminal-turn-error predicate. TRUE for any error that resolves
+// to a machine-readable detailCode — via `normalizeOutputError` OR the failover
+// classifier (see `resolveTerminalDetailCode`). The routing gate for the
 // messages.ndjson mirror: it deliberately does NOT name error classes, so future
 // terminal error kinds (e.g. w-fableshare's forthcoming FableShareExhaustedError
 // / detailCode 'fable-share-exhausted') flow through with zero further changes at
-// the call sites. Errors with no detailCode (ordinary/uncaught turn failures,
-// interrupts) return false and are not mirrored.
+// the call sites. Errors with neither a detailCode nor a failover verdict
+// (ordinary/uncaught turn failures, interrupts) return false and are not mirrored.
 export function isTerminalTurnError(error: unknown): boolean {
-  const detailCode = normalizeOutputError(error, { origin: "runtime" }).detailCode;
-  return typeof detailCode === "string" && detailCode.trim().length > 0;
+  return resolveTerminalDetailCode(error) !== undefined;
 }
 
 // Build the agent-visible synthetic `SessionMessage` that mirrors a terminal turn
 // error into the conversation log. CLASS-AGNOSTIC: the error is run through the
-// SAME `normalizeOutputError` the stream/stdout paths use, and its normalized
-// `detailCode`/`message`/`code` are carried structurally in `Agent.terminal_error`
-// (snake_case, so a spawner can classify programmatically) plus a human-readable
+// SAME `normalizeOutputError` the stream/stdout paths use, and a machine-readable
+// `detail_code` (normalized, or classifier-derived for raw adapter errors),
+// `message`/`code` are carried structurally in `Agent.terminal_error` (snake_case,
+// so a spawner can classify programmatically) plus a human-readable
 // "⚠ turn failed: <message>" `Text` block. No per-error-class branching.
 export function buildTerminalTurnErrorMessage(error: unknown): SessionMessage {
   const normalized = normalizeOutputError(error, { origin: "runtime" });
+  const detailCode = resolveTerminalDetailCode(error);
   const terminalError: SessionTerminalError = {
     message: normalized.message,
-    ...(normalized.detailCode ? { detail_code: normalized.detailCode } : {}),
+    ...(detailCode ? { detail_code: detailCode } : {}),
     ...(normalized.code ? { output_code: normalized.code } : {}),
     ...(normalized.origin ? { origin: normalized.origin } : {}),
     ...(normalized.retryable !== undefined ? { retryable: normalized.retryable } : {}),
