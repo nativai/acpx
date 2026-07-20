@@ -639,10 +639,40 @@ export class AcpRuntimeManager {
       setCurrentModelId(record, effectiveSessionOptions?.model);
     }
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
+    await this.carryForwardAutoFailoverPolicy(record, effectiveSessionOptions);
     persistSessionOptions(record, effectiveSessionOptions);
     persistSessionOwnerOptions(record, this.options);
     await this.options.sessionStore.save(record);
     return record;
+  }
+
+  // A persistent session that is re-created here (reset_on_next_ensure, recover,
+  // or a resume-id/cwd/agent mismatch) is rebuilt from a FRESH record, so the
+  // persistSessionOptions breadcrumb carry-forward has no prior session_options
+  // to read — an explicit `auto-failover off` would silently revert to default-on
+  // across the respawn (brick://71af1351). auto_failover is a durable per-session
+  // POLICY, not conversation state, so seed it from the prior on-disk record when
+  // the incoming spawn options don't carry it (an explicit options.autoFailover
+  // still wins). This makes the existing carry-forward preserve it on persist.
+  private async carryForwardAutoFailoverPolicy(
+    record: SessionRecord,
+    effectiveSessionOptions: SessionAgentOptions | undefined,
+  ): Promise<void> {
+    if (effectiveSessionOptions?.autoFailover !== undefined) {
+      return;
+    }
+    const prior = await this.options.sessionStore.load(record.acpxRecordId).catch(() => undefined);
+    const priorAutoFailover = prior?.acpx?.session_options?.auto_failover;
+    if (priorAutoFailover === undefined) {
+      return;
+    }
+    record.acpx = {
+      ...record.acpx,
+      session_options: {
+        ...record.acpx?.session_options,
+        auto_failover: priorAutoFailover,
+      },
+    };
   }
 
   private async keepPersistentClient(
