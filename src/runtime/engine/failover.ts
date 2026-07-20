@@ -10,9 +10,12 @@ import {
   loadProfileRegistry,
 } from "../../config/profiles.js";
 import {
+  getSubscriptionsFableState,
   getSubscriptionsUsage,
+  isFableModel,
   maxUtilization,
   pickFailoverTarget,
+  type SubscriptionFableState,
   type SubscriptionUsage,
 } from "../../config/subscription-usage.js";
 import {
@@ -24,6 +27,7 @@ import {
   AllSubscriptionsExhaustedError,
   AllSubscriptionsLockedError,
   BridgeAuthGatedError,
+  FableShareExhaustedError,
   SubscriptionLockedError,
 } from "../../errors.js";
 import { writeSessionRecord } from "../../session/persistence/repository.js";
@@ -195,6 +199,110 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+// A human status line per sub for the FableShareExhaustedError message, in the
+// describeUsage style.
+function fableStatuses(
+  entries: SubscriptionEntry[],
+  fable: Map<string, SubscriptionFableState>,
+): string {
+  return entries
+    .map((entry) => {
+      const state = fable.get(entry.id);
+      if (!state) {
+        return `${entry.label} (${entry.id}): fable not probed`;
+      }
+      if (state.error) {
+        return `${entry.label} (${entry.id}): fable ? (${state.error})`;
+      }
+      return `${entry.label} (${entry.id}): fable ${state.available ? "available" : "exhausted"}`;
+    })
+    .join("; ");
+}
+
+// The `tried`-set account key for a subscription entry (same profile.account key
+// the failover loop keys on), so seeding it with fable-exhausted subs makes the
+// loop skip them. Returns undefined when no profile matches (leave it eligible).
+function accountForEntry(
+  entry: SubscriptionEntry,
+  loadOpts?: SubscriptionLookupOptions,
+): string | undefined {
+  return findProfile(entry.id, loadProfileRegistry(loadOpts))?.account;
+}
+
+// Fable rate_limit short-circuit (§3b) — the core value. The Fable-share limit is
+// invisible to 5h/7d tracking, so without this a Fable session that hits it hops
+// EVERY sub (each 429s on fable) with a full turn before any terminal fires.
+// Probe fable FRESH: if every sub is cleanly exhausted, restore selection and
+// throw FableShareExhaustedError immediately (skip the thrash loop). Otherwise
+// seed `tried` with the fable-EXHAUSTED accounts so the loop only fails over to
+// fable-available subs. A probe ERROR is UNKNOWN — never counted available, never
+// seeded (degrades to normal failover; we only short-circuit on POSITIVE evidence
+// of a clean 429). Returns a status snapshot for the mid-loop boundary conversion.
+async function fableRateLimitShortCircuit(params: {
+  tried: Set<string>;
+  restoreOriginalSelection: () => Promise<void>;
+  loadOpts?: SubscriptionLookupOptions;
+}): Promise<string> {
+  const entries = loadSubscriptionRegistry(params.loadOpts).subscriptions;
+  const fable = await getSubscriptionsFableState(entries, true);
+  const statusSnapshot = fableStatuses(entries, fable);
+  const anyAvailable = entries.some((entry) => fable.get(entry.id)?.available === true);
+  if (!anyAvailable) {
+    await params.restoreOriginalSelection();
+    throw new FableShareExhaustedError(statusSnapshot);
+  }
+  for (const entry of entries) {
+    const state = fable.get(entry.id);
+    if (state?.available === false && state.error === undefined) {
+      const account = accountForEntry(entry, params.loadOpts);
+      if (account) {
+        params.tried.add(account);
+      }
+    }
+  }
+  return statusSnapshot;
+}
+
+// Boundary conversion (§3b): when the fable-available subset ALSO exhausts
+// mid-loop, the loop throws AllSubscriptionsExhaustedError — the WRONG class for a
+// Fable session. Re-throw it as FableShareExhaustedError, carrying over the
+// effective-account metadata the exhausted error already attached. Every non-Fable
+// path and every other error class propagates byte-identically.
+function convertFableTerminal(
+  loopError: unknown,
+  fable: { isFableRateLimit: boolean; statusSnapshot?: string },
+): never {
+  if (fable.isFableRateLimit && loopError instanceof AllSubscriptionsExhaustedError) {
+    const converted = new FableShareExhaustedError(fable.statusSnapshot ?? loopError.message);
+    attachEffectiveAccount(converted, errorEffectiveAccount(loopError));
+    throw converted;
+  }
+  throw loopError;
+}
+
+// Compute whether this failover is a Fable rate_limit case and, if so, run the
+// short-circuit (throw-now-if-all-exhausted / seed `tried`). Keeps the model
+// lookup + gating out of attemptFailoverAndRetry.
+async function prepareFableShortCircuit(params: {
+  record: SessionRecord;
+  initialTrigger: FailoverTrigger;
+  tried: Set<string>;
+  restoreOriginalSelection: () => Promise<void>;
+  loadOpts?: SubscriptionLookupOptions;
+}): Promise<{ isFableRateLimit: boolean; statusSnapshot?: string }> {
+  const sessionModel =
+    params.record.acpx?.session_options?.model ?? params.record.acpx?.current_model_id;
+  if (!isFableModel(sessionModel) || params.initialTrigger !== "rate_limit") {
+    return { isFableRateLimit: false };
+  }
+  const statusSnapshot = await fableRateLimitShortCircuit({
+    tried: params.tried,
+    restoreOriginalSelection: params.restoreOriginalSelection,
+    loadOpts: params.loadOpts,
+  });
+  return { isFableRateLimit: true, statusSnapshot };
 }
 
 function errorEffectiveAccount(error: unknown): EffectiveAccountMetadata | undefined {
@@ -825,6 +933,18 @@ export async function attemptFailoverAndRetry<T>(args: {
   const tried = new Set<string>();
   tried.add(initialContext.effectiveAccount);
   const initialTrigger = classifyFailover(args.triggerError);
+
+  // Fable-share short-circuit: a Fable session hitting rate_limit must never
+  // thrash every sub. Probe fable and either throw the distinct terminal now (all
+  // exhausted) or seed `tried` so only fable-available subs are tried (§3b).
+  const fable = await prepareFableShortCircuit({
+    record: args.record,
+    initialTrigger,
+    tried,
+    restoreOriginalSelection,
+    loadOpts: args.loadOpts,
+  });
+
   // Non-quota triggers (auth-gated / 401) have no legitimate reset window, so the
   // bounded TTL takes precedence: it both prevents the process-lifetime sentinel
   // AND avoids resetIsoFromError misreading an incidental numeric field (e.g. the
@@ -837,51 +957,55 @@ export async function attemptFailoverAndRetry<T>(args: {
     nonQuotaDeadUntil(initialTrigger) ?? resetIsoFromError(args.triggerError),
   );
 
-  for (let attempt = 0; ; attempt++) {
-    const picked = await pickSibling(current, lastFailureContext, tried, args.loadOpts);
-    const target = await requirePickedTarget(
-      picked,
-      lastFailureContext,
-      restoreOriginalSelection,
-      initialTrigger,
-    );
-    await switchToFailoverTarget({
-      record: args.record,
-      target,
-      context: lastFailureContext,
-      loadOpts: args.loadOpts,
-    });
-    tried.add(target.account);
-
-    if (args.verbose) {
-      process.stderr.write(
-        `[acpx] account failover → profile "${target.id}" (failed account: ${lastFailureContext.effectiveAccount}); retrying turn\n`,
+  try {
+    for (let attempt = 0; ; attempt++) {
+      const picked = await pickSibling(current, lastFailureContext, tried, args.loadOpts);
+      const target = await requirePickedTarget(
+        picked,
+        lastFailureContext,
+        restoreOriginalSelection,
+        initialTrigger,
       );
-    }
+      await switchToFailoverTarget({
+        record: args.record,
+        target,
+        context: lastFailureContext,
+        loadOpts: args.loadOpts,
+      });
+      tried.add(target.account);
 
-    try {
-      const result = await args.runTurn();
-      return { result, switchedTo: target.id };
-    } catch (retryError) {
-      const trigger = classifyFailover(retryError);
-      if (!trigger) {
-        const effectiveRetryError = attachEffectiveAccount(
-          retryError,
-          failureContext(retryError, target),
+      if (args.verbose) {
+        process.stderr.write(
+          `[acpx] account failover → profile "${target.id}" (failed account: ${lastFailureContext.effectiveAccount}); retrying turn\n`,
         );
-        await restoreOriginalSelection();
-        throw effectiveRetryError;
       }
-      // The retried turn failed too. Charge the physically effective account
-      // when the runtime stamped one; fall back to the selected target only for
-      // direct unit harnesses that do not spawn an adapter.
-      lastFailureContext = failureContext(retryError, target);
-      tried.add(lastFailureContext.effectiveAccount);
-      await markAccountDead(
-        lastFailureContext.effectiveAccount,
-        `failover retry ${trigger}`,
-        nonQuotaDeadUntil(trigger),
-      );
+
+      try {
+        const result = await args.runTurn();
+        return { result, switchedTo: target.id };
+      } catch (retryError) {
+        const trigger = classifyFailover(retryError);
+        if (!trigger) {
+          const effectiveRetryError = attachEffectiveAccount(
+            retryError,
+            failureContext(retryError, target),
+          );
+          await restoreOriginalSelection();
+          throw effectiveRetryError;
+        }
+        // The retried turn failed too. Charge the physically effective account
+        // when the runtime stamped one; fall back to the selected target only for
+        // direct unit harnesses that do not spawn an adapter.
+        lastFailureContext = failureContext(retryError, target);
+        tried.add(lastFailureContext.effectiveAccount);
+        await markAccountDead(
+          lastFailureContext.effectiveAccount,
+          `failover retry ${trigger}`,
+          nonQuotaDeadUntil(trigger),
+        );
+      }
     }
+  } catch (loopError) {
+    return convertFableTerminal(loopError, fable);
   }
 }
