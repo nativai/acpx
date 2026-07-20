@@ -8,6 +8,7 @@ import {
   isFableModel,
   maxedThreshold,
   pickFailoverTarget,
+  type SubscriptionFableState,
   type SubscriptionUsage,
 } from "../../config/subscription-usage.js";
 import {
@@ -143,13 +144,14 @@ function noEligibleReason(
 // pickFailoverTarget selector. Returns a binding on success, or the fallback
 // reason so the caller can log/degrade. Never throws; getSubscriptionsUsage
 // never rejects.
-// Probe fable availability (fresh) and add cleanly-429 subs to `exclude` (mutated
-// in place). A probe ERROR is UNKNOWN — not excluded. Returns the tally.
-async function applyFableExclusions(
+// From already-probed fable states, add cleanly-429 subs to `exclude` (mutated in
+// place). A probe ERROR is UNKNOWN — not excluded. Returns the tally. Sync so the
+// fable probe can run CONCURRENTLY with the usage probe in selectLocal.
+function applyFableExclusions(
   entries: SubscriptionRegistry["subscriptions"],
   exclude: Set<string>,
-): Promise<FableTally> {
-  const states = await getSubscriptionsFableState(entries, true);
+  states: Map<string, SubscriptionFableState>,
+): FableTally {
   let available = 0;
   let exhausted = 0;
   for (const entry of entries) {
@@ -186,19 +188,22 @@ async function selectLocal(
   if (entries.length === 0) {
     return { reason: "empty-registry", candidatesConsidered: 0, eligible: 0 };
   }
-  const usages = await getSubscriptionsUsage(entries);
+  // Fable spawn: probe usage AND fable CONCURRENTLY so cold latency is max(), not
+  // sum() — the sequential form (usage then fable) blew the default auto-select
+  // budget and degraded the signal to a generic 'timeout' instead of the designed
+  // 'all-fable-exhausted' + tally. A probe ERROR means UNKNOWN — do NOT exclude (§1
+  // key decision). Spawn NEVER hard-fails on fable exhaustion; it degrades to the
+  // default binding and the turn-level terminal error tells the agent (§4).
+  const isFable = isFableModel(model);
+  const [usages, fableStates] = await Promise.all([
+    getSubscriptionsUsage(entries),
+    isFable ? getSubscriptionsFableState(entries, true) : Promise.resolve(undefined),
+  ]);
   const threshold = maxedThreshold();
   const exclude = new Set(
     entries.filter((entry) => isSubscriptionLocked(entry, registry)).map((entry) => entry.id),
   );
-  // Fable spawn: probe fable availability (fresh) and exclude cleanly-429 subs so
-  // selection steers toward a Fable-available sub. A probe ERROR means UNKNOWN —
-  // do NOT exclude (§1 key decision). Spawn NEVER hard-fails on fable exhaustion;
-  // it degrades to the default binding and the turn-level terminal error tells the
-  // agent (§4).
-  const fable = isFableModel(model)
-    ? await applyFableExclusions(registry.subscriptions, exclude)
-    : undefined;
+  const fable = fableStates ? applyFableExclusions(entries, exclude, fableStates) : undefined;
   const eligible = countEligibleFailoverTargets(usages, { exclude, threshold });
   const picked = pickFailoverTarget(usages, { exclude, threshold });
   if (!picked) {
