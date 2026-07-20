@@ -80,6 +80,7 @@ import {
   setDesiredModelId,
 } from "../../session/mode-preference.js";
 import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
+import { enforceModelFloorPostServe } from "../../session/model-floor-enforce.js";
 import { captureServedState } from "../../session/model-floor.js";
 import {
   ownerOptionsToInput,
@@ -2370,8 +2371,20 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // LIVE `acpx.served` block — never the desired pin. Best-effort; no-op for
     // non-Claude adapters. Re-sync acpxState so the finally re-merge (which bases
     // off acpxState) preserves the served block through to the persisted write.
-    await captureServedState(record).catch(() => undefined);
+    const servedModel = await captureServedState(record).catch(() => undefined);
     acpxState = cloneSessionAcpxState(record.acpx);
+    // Post-serve floor check (single path, both modes). Non-hard: warn + breadcrumb
+    // + ACCEPT. --floor-hard + below floor: throw a loud terminal so the served-down
+    // content is quarantined, never handed up as end_turn. The desired pin is never
+    // mutated; the catch block below surfaces the delivery-failed terminal.
+    const floorVerdict = await enforceModelFloorPostServe(record, {
+      servedModel,
+      verbose: options.verbose,
+    }).catch(() => ({ accept: true }) as const);
+    acpxState = cloneSessionAcpxState(record.acpx);
+    if (!floorVerdict.accept) {
+      throw floorVerdict.error;
+    }
     stopTotalTimer();
     return response;
   };
