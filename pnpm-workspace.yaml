@@ -11,3 +11,16 @@ onlyBuiltDependencies:
 
 # Auto-confirm node_modules purge instead of prompting (no TTY in CI / agents).
 confirmModulesPurge: false
+
+# Transitive-dependency version pins for CVE remediation (intent adopted from
+# upstream 2a8d714 "fix(security)" + abbb968 "fix(deps): remediate Dependabot
+# alerts"). pnpm 10.x no longer reads the "pnpm.overrides" field in package.json
+# (it emits a WARN and ignores it) — pnpm-workspace.yaml is the settings home, so
+# the overrides must live here to actually take effect in the resolved lockfile.
+#   qs 6.15.2         — CVE remediation (upstream 2a8d714)
+#   js-yaml 4.2.0     — Dependabot alert (upstream abbb968)
+#   markdown-it 14.2.0 — Dependabot alert (upstream abbb968)
+overrides:
+  qs: 6.15.2
+  js-yaml: 4.2.0
+  markdown-it: 14.2.0

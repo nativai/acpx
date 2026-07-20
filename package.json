@@ -125,10 +125,5 @@
   "engines": {
     "node": ">=22.13.0"
   },
-  "packageManager": "pnpm@10.33.2",
-  "pnpm": {
-    "overrides": {
-      "qs": "6.15.2"
-    }
-  }
+  "packageManager": "pnpm@10.33.2"
 }
