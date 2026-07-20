@@ -21,6 +21,7 @@ type ProbeHit = { model: string; token: string };
 function startMockMessages(
   fableByToken: Map<string, FableOutcome>,
   hits: ProbeHit[],
+  haikuDelayMs = 0,
 ): Promise<{ server: Server; url: string }> {
   return new Promise((resolve) => {
     const server = createServer((req, res) => {
@@ -41,12 +42,20 @@ function startMockMessages(
           res.writeHead(fableByToken.get(token) === "available" ? 200 : 429).end("{}");
           return;
         }
-        res
-          .writeHead(200, {
-            "anthropic-ratelimit-unified-5h-utilization": "0.1",
-            "anthropic-ratelimit-unified-7d-utilization": "0.1",
-          })
-          .end("{}");
+        // Haiku (unified usage) probe — optionally delayed to make the OVERALL
+        // select time out while the (fast) fable probe still completes.
+        const sendHaiku = () =>
+          res
+            .writeHead(200, {
+              "anthropic-ratelimit-unified-5h-utilization": "0.1",
+              "anthropic-ratelimit-unified-7d-utilization": "0.1",
+            })
+            .end("{}");
+        if (haikuDelayMs > 0) {
+          setTimeout(sendHaiku, haikuDelayMs);
+        } else {
+          sendHaiku();
+        }
       });
     });
     server.listen(0, "127.0.0.1", () => {
@@ -65,6 +74,7 @@ async function withRig(
     lookupOptions: { homeDir: string; registryPath: string };
     hits: ProbeHit[];
   }) => Promise<void>,
+  options: { haikuDelayMs?: number } = {},
 ): Promise<void> {
   rigCounter += 1;
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-autofable-"));
@@ -101,7 +111,7 @@ async function withRig(
         })),
       }),
     );
-    const { server, url } = await startMockMessages(fableByToken, hits);
+    const { server, url } = await startMockMessages(fableByToken, hits, options.haikuDelayMs ?? 0);
     process.env.CLAUDE_MESSAGES_ENDPOINT = url;
     delete process.env.ACPX_SESSION_URL;
     try {
@@ -176,4 +186,34 @@ test("non-Fable spawn: no fable probe, no fable tally", async () => {
       );
     },
   );
+});
+
+test("completed fable probe survives an outer-deadline TIMEOUT → still 'all-fable-exhausted'", async () => {
+  const prev = process.env.ACPX_SUBSCRIPTION_AUTO_TIMEOUT_MS;
+  process.env.ACPX_SUBSCRIPTION_AUTO_TIMEOUT_MS = "200"; // force the outer deadline to fire
+  try {
+    await withRig(
+      [
+        { id: "a", fable: "exhausted" },
+        { id: "b", fable: "exhausted" },
+      ],
+      async ({ lookupOptions }) => {
+        // Usage (haiku) is delayed 900ms so selectLocal loses the 200ms deadline
+        // race, but the fast fable probe completes → its verdict must NOT be
+        // discarded as a generic 'timeout'.
+        const picked = await resolveAutoSubscription(CLAUDE_AGENT, lookupOptions, { model: FABLE });
+        assert.equal(picked, undefined, "no pick (usage timed out) → default binding");
+        const summary = consumeAutoSubscriptionSelection();
+        assert.equal(summary?.reason, "all-fable-exhausted", "not degraded to 'timeout'");
+        assert.deepEqual(summary?.fable, { available: 0, exhausted: 2, probed: true });
+      },
+      { haikuDelayMs: 900 },
+    );
+  } finally {
+    if (prev === undefined) {
+      delete process.env.ACPX_SUBSCRIPTION_AUTO_TIMEOUT_MS;
+    } else {
+      process.env.ACPX_SUBSCRIPTION_AUTO_TIMEOUT_MS = prev;
+    }
+  }
 });

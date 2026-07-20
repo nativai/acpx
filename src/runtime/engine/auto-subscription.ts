@@ -34,21 +34,34 @@ export function isAutoSubscriptionSentinel(value: string | null | undefined): bo
 }
 
 const DEFAULT_AUTO_TIMEOUT_MS = 2500;
+// A Fable spawn inherently adds a second (fable) probe, so give it a modestly
+// wider default budget so the completed probe lands inside the window and the
+// spawn signal is 'all-fable-exhausted', not a generic 'timeout'. Belt to the
+// budget-INDEPENDENT fallback below (a completed fable probe is surfaced even if
+// the outer deadline passes).
+const DEFAULT_FABLE_AUTO_TIMEOUT_MS = 4000;
+// Bounded grace to let an in-flight fable probe LAND after the outer deadline
+// fired — a completed fable verdict is authoritative and the pick has already
+// fallen back to default (so the spawn is not blocked on a real decision). Only
+// ever incurred on a rare cold-probe spike past the budget; caps the extra wait.
+const FABLE_PROBE_GRACE_MS = 2500;
 
 /**
  * Hard budget for the whole `auto` resolution (usage probe + cross-HOME check).
  * On expiry the pick is treated as "no result" → default fallback, so `auto`
  * never adds more than this to a spawn. Env-tunable via
- * ACPX_SUBSCRIPTION_AUTO_TIMEOUT_MS (positive milliseconds).
+ * ACPX_SUBSCRIPTION_AUTO_TIMEOUT_MS (positive milliseconds); when unset, a Fable
+ * spawn uses the wider fable default.
  */
-function autoTimeoutMs(): number {
+function autoTimeoutMs(isFable: boolean): number {
   const raw = process.env.ACPX_SUBSCRIPTION_AUTO_TIMEOUT_MS?.trim();
+  const fallback = isFable ? DEFAULT_FABLE_AUTO_TIMEOUT_MS : DEFAULT_AUTO_TIMEOUT_MS;
   if (!raw) {
-    return DEFAULT_AUTO_TIMEOUT_MS;
+    return fallback;
   }
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed <= 0) {
-    return DEFAULT_AUTO_TIMEOUT_MS;
+    return fallback;
   }
   return parsed;
 }
@@ -144,12 +157,10 @@ function noEligibleReason(
 // pickFailoverTarget selector. Returns a binding on success, or the fallback
 // reason so the caller can log/degrade. Never throws; getSubscriptionsUsage
 // never rejects.
-// From already-probed fable states, add cleanly-429 subs to `exclude` (mutated in
-// place). A probe ERROR is UNKNOWN — not excluded. Returns the tally. Sync so the
-// fable probe can run CONCURRENTLY with the usage probe in selectLocal.
-function applyFableExclusions(
+// Pure tally over probed fable states: available (200), exhausted (clean 429). A
+// probe ERROR is UNKNOWN — counted as neither.
+function computeFableTally(
   entries: SubscriptionRegistry["subscriptions"],
-  exclude: Set<string>,
   states: Map<string, SubscriptionFableState>,
 ): FableTally {
   let available = 0;
@@ -160,10 +171,50 @@ function applyFableExclusions(
       available += 1;
     } else if (state?.available === false && state.error === undefined) {
       exhausted += 1;
-      exclude.add(entry.id);
     }
   }
   return { available, exhausted, probed: true };
+}
+
+// From already-probed fable states, add cleanly-429 subs to `exclude` (mutated in
+// place) and return the tally. Sync so the fable probe can run CONCURRENTLY with
+// the usage probe in selectLocal.
+function applyFableExclusions(
+  entries: SubscriptionRegistry["subscriptions"],
+  exclude: Set<string>,
+  states: Map<string, SubscriptionFableState>,
+): FableTally {
+  for (const entry of entries) {
+    const state = states.get(entry.id);
+    if (state?.available === false && state.error === undefined) {
+      exclude.add(entry.id);
+    }
+  }
+  return computeFableTally(entries, states);
+}
+
+// Budget-independent fallback: when the outer auto-select deadline fired but the
+// fable probe had already COMPLETED and every sub is cleanly exhausted, surface
+// 'all-fable-exhausted' + tally rather than discarding it as a generic 'timeout'.
+// Returns undefined when the probe didn't finish or some sub is still available
+// (then the pick truly could not be resolved → honest 'timeout').
+function fableTimeoutFallback(
+  registry: SubscriptionRegistry,
+  states: Map<string, SubscriptionFableState> | undefined,
+): LocalSelection | undefined {
+  if (!states) {
+    return undefined;
+  }
+  const fable = computeFableTally(registry.subscriptions, states);
+  if (fable.available === 0 && fable.exhausted > 0) {
+    return {
+      reason: "all-fable-exhausted",
+      candidatesConsidered: registry.subscriptions.length,
+      eligible: 0,
+      fable,
+    };
+  }
+  return undefined;
 }
 
 // When nothing survived: a distinct reason if it was fleet-wide Fable exhaustion,
@@ -182,23 +233,21 @@ function fallbackReason(
 
 async function selectLocal(
   registry: SubscriptionRegistry,
-  model?: string,
+  fableProbe: Promise<Map<string, SubscriptionFableState> | undefined>,
 ): Promise<LocalSelection> {
   const entries = registry.subscriptions;
   if (entries.length === 0) {
     return { reason: "empty-registry", candidatesConsidered: 0, eligible: 0 };
   }
-  // Fable spawn: probe usage AND fable CONCURRENTLY so cold latency is max(), not
-  // sum() — the sequential form (usage then fable) blew the default auto-select
-  // budget and degraded the signal to a generic 'timeout' instead of the designed
-  // 'all-fable-exhausted' + tally. A probe ERROR means UNKNOWN — do NOT exclude (§1
-  // key decision). Spawn NEVER hard-fails on fable exhaustion; it degrades to the
-  // default binding and the turn-level terminal error tells the agent (§4).
-  const isFable = isFableModel(model);
-  const [usages, fableStates] = await Promise.all([
-    getSubscriptionsUsage(entries),
-    isFable ? getSubscriptionsFableState(entries, true) : Promise.resolve(undefined),
-  ]);
+  // Probe usage AND fable CONCURRENTLY so cold latency is max(), not sum() — the
+  // sequential form blew the auto-select budget and degraded the signal to a
+  // generic 'timeout' instead of the designed 'all-fable-exhausted' + tally. The
+  // fable probe is owned by the caller (a shared promise) so a COMPLETED result
+  // survives an outer-deadline timeout (budget-independent fallback). A probe ERROR
+  // means UNKNOWN — do NOT exclude (§1). Spawn NEVER hard-fails on fable exhaustion;
+  // it degrades to the default binding and the turn-level terminal error tells the
+  // agent (§4).
+  const [usages, fableStates] = await Promise.all([getSubscriptionsUsage(entries), fableProbe]);
   const threshold = maxedThreshold();
   const exclude = new Set(
     entries.filter((entry) => isSubscriptionLocked(entry, registry)).map((entry) => entry.id),
@@ -439,22 +488,63 @@ export async function resolveAutoSubscription(
   if (!isClaudeAdapterCommand(agentCommand)) {
     return undefined;
   }
-  const budgetMs = autoTimeoutMs();
+  const isFable = isFableModel(opts?.model);
+  const budgetMs = autoTimeoutMs(isFable);
   const registry = loadSubscriptionRegistry(lookupOptions);
+  // The fable probe is owned HERE (not inside selectLocal) so a COMPLETED result
+  // survives an outer-deadline timeout: a completed probe is authoritative
+  // regardless of the wrapper deadline, so we still surface 'all-fable-exhausted'
+  // + tally instead of discarding it as a generic 'timeout'.
+  let completedFable: Map<string, SubscriptionFableState> | undefined;
+  const fableProbe: Promise<Map<string, SubscriptionFableState> | undefined> = isFable
+    ? getSubscriptionsFableState(registry.subscriptions, true).then((states) => {
+        completedFable = states;
+        return states;
+      })
+    : Promise.resolve(undefined);
   const { signal, cancel } = deadline(budgetMs);
   try {
     const divergenceWork = crossHomeDivergence(registry, budgetMs);
-    const selection = await raceDeadline(selectLocal(registry, opts?.model), signal);
+    const selection = await raceDeadline(selectLocal(registry, fableProbe), signal);
     const divergence = await raceDeadline(divergenceWork, signal);
-    captureAutoSelection(summarize(selection, divergence));
-    emitAutoSelection(selection, divergence);
-    return selection?.pickedId;
+    const resolved = await resolveWithFableGrace(registry, selection, isFable, fableProbe);
+    captureAutoSelection(summarize(resolved, divergence));
+    emitAutoSelection(resolved, divergence);
+    return resolved?.pickedId;
   } catch {
-    // Defensive: never let a surprising error block a spawn.
-    captureAutoSelection(summarize(undefined, undefined));
-    emitAutoSelection(undefined, undefined);
-    return undefined;
+    // Defensive: never let a surprising error block a spawn. Still prefer a
+    // completed fable verdict over a bare timeout.
+    const resolved = fableTimeoutFallback(registry, completedFable);
+    captureAutoSelection(summarize(resolved, undefined));
+    emitAutoSelection(resolved, undefined);
+    return resolved?.pickedId;
   } finally {
     cancel();
+  }
+}
+
+// Resolve the final selection: the raced result if any, else the fable verdict.
+// When the fable probe was still in flight at the deadline (a rare cold spike),
+// give it a BOUNDED grace to land so we surface 'all-fable-exhausted' rather than
+// a generic 'timeout' — a completed fable verdict is authoritative and the pick
+// already fell back to default, so the spawn is not blocked on a real decision.
+async function resolveWithFableGrace(
+  registry: SubscriptionRegistry,
+  selection: LocalSelection | undefined,
+  isFable: boolean,
+  fableProbe: Promise<Map<string, SubscriptionFableState> | undefined>,
+): Promise<LocalSelection | undefined> {
+  if (selection) {
+    return selection;
+  }
+  if (!isFable) {
+    return undefined;
+  }
+  const grace = deadline(FABLE_PROBE_GRACE_MS);
+  try {
+    const states = await Promise.race([fableProbe, grace.signal]);
+    return states instanceof Map ? fableTimeoutFallback(registry, states) : undefined;
+  } finally {
+    grace.cancel();
   }
 }
