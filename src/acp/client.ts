@@ -114,7 +114,11 @@ import {
 } from "./client-process.js";
 import { isCodexAcpCommand } from "./codex-compat.js";
 import { extractAcpError } from "./error-shapes.js";
-import { avoidBidirectionalJsonRpcIdCollisions, isSessionUpdateNotification } from "./jsonrpc.js";
+import {
+  avoidBidirectionalJsonRpcIdCollisions,
+  isAcpMessageObject,
+  isSessionUpdateNotification,
+} from "./jsonrpc.js";
 import type { ShimHandle } from "./openrouter-shim.js";
 import {
   formatSessionControlAcpSummary,
@@ -432,11 +436,22 @@ function enqueueNdJsonLine(
     return;
   }
   try {
-    const message = JSON.parse(trimmedLine) as AnyMessage;
-    controller.enqueue(message);
+    const message = parseAcpJsonMessageLine(trimmedLine);
+    if (message) {
+      controller.enqueue(message);
+    }
   } catch (err) {
     console.error("Failed to parse JSON message:", trimmedLine, err);
   }
+}
+
+// Parse an NDJSON line and only surface object-shaped ACP frames. Non-object
+// JSON values (primitives, arrays) from adapter stdout are dropped before
+// dispatch so a stray diagnostic line can't crash the SDK message path.
+// Intent adopted from upstream de042d1 (fix(acp): ignore non-object inbound frames).
+export function parseAcpJsonMessageLine(line: string): AnyMessage | undefined {
+  const message: unknown = JSON.parse(line);
+  return isAcpMessageObject(message) ? message : undefined;
 }
 
 function enqueueNdJsonLines(

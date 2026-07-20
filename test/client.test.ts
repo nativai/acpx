@@ -9,6 +9,7 @@ import {
   AcpClient,
   buildAgentSpawnOptions,
   buildQoderAcpCommandArgs,
+  parseAcpJsonMessageLine,
   resolveAgentCloseAfterStdinEndMs,
   shouldIgnoreNonJsonAgentOutputLine,
 } from "../src/acp/client.js";
@@ -24,6 +25,19 @@ import {
 
 const BRICK_SHIM_DIR = path.join(process.cwd(), "test", "fixtures", "brick-shim");
 const BRICK_ID = "11111111-2222-3333-4444-555555555555";
+
+test("parseAcpJsonMessageLine ignores non-object JSON values", () => {
+  for (const line of ["1", "null", '"diagnostic"', "[]", "[{}]"]) {
+    assert.equal(parseAcpJsonMessageLine(line), undefined);
+  }
+});
+
+test("parseAcpJsonMessageLine preserves object-shaped protocol values", () => {
+  assert.deepEqual(parseAcpJsonMessageLine('{"jsonrpc":"2.0","method":"session/update"}'), {
+    jsonrpc: "2.0",
+    method: "session/update",
+  });
+});
 
 type ClientInternals = {
   selectAuthMethod?: (methods: Array<{ id: string }>) =>

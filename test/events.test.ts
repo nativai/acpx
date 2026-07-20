@@ -4,11 +4,24 @@ import {
   ACPX_CLIENT_JSON_RPC_ID_FLOOR,
   avoidBidirectionalJsonRpcIdCollisions,
   isAcpJsonRpcMessage,
+  isAcpMessageObject,
   isJsonRpcNotification,
   isSessionUpdateNotification,
   parseJsonRpcErrorMessage,
   parsePromptStopReason,
 } from "../src/acp/jsonrpc.js";
+
+test("isAcpMessageObject rejects non-object JSON values", () => {
+  assert.equal(isAcpMessageObject(1), false);
+  assert.equal(isAcpMessageObject(null), false);
+  assert.equal(isAcpMessageObject("message"), false);
+  assert.equal(isAcpMessageObject([]), false);
+});
+
+test("isAcpMessageObject accepts object-shaped protocol values", () => {
+  assert.equal(isAcpMessageObject({}), true);
+  assert.equal(isAcpMessageObject({ jsonrpc: "2.0", method: "session/update" }), true);
+});
 
 test("isAcpJsonRpcMessage accepts JSON-RPC request", () => {
   assert.equal(
