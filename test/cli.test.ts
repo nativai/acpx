@@ -5359,6 +5359,59 @@ test("set resolves named session when -s is before subcommand", async () => {
   });
 });
 
+test("prompt resolves named session across session flag placements (upstream 0035ef3 / #355)", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+
+    const missingAgentCommand = "acpx-test-missing-agent-binary-3";
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          agents: {
+            codex: { command: missingAgentCommand },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "named-prompt-session",
+      acpSessionId: "named-prompt-session",
+      agentCommand: missingAgentCommand,
+      cwd,
+      name: "named",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:00:00.000Z",
+      closed: false,
+    });
+
+    // -s / --session must resolve the same named session whether it appears
+    // before OR after the `prompt` subcommand. (Our fork already routes prompt
+    // through the parent-aware resolveSessionTargetSelector; this locks it in.)
+    const cases = [
+      ["codex", "-s", "named", "prompt", "ping"],
+      ["codex", "--session", "named", "prompt", "ping"],
+      ["codex", "prompt", "-s", "named", "ping"],
+      ["codex", "prompt", "--session", "named", "ping"],
+    ];
+
+    for (const args of cases) {
+      const result = await runCli(["--cwd", cwd, ...args], homeDir);
+
+      // Session was resolved regardless of flag placement — failure is the
+      // missing agent binary downstream, not a lookup miss.
+      assert.equal(result.code, 1, args.join(" "));
+      assert.doesNotMatch(result.stderr, /No acpx session found/, args.join(" "));
+    }
+  });
+});
+
 test("prompt reads from stdin when no prompt argument is provided", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
