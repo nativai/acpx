@@ -31,6 +31,7 @@ function input(overrides: Partial<DecideIdleOwnerReleaseInput> = {}): DecideIdle
   return {
     ttlMs: 10_000,
     hasActiveTurn: false,
+    hasLiveBackgroundWork: false,
     now: BASE_NOW,
     lastIdleDrainActivityAt: 0,
     lastTaskCompletedAt: BASE_NOW,
@@ -65,6 +66,53 @@ test("P2 #1 INVARIANT: hasActiveTurn ⇒ never release (both reasons), clock far
     0,
     "the gate short-circuits before the deploy check — neither reason is reached",
   );
+});
+
+// #1b — THE BACKGROUND-WORK INVARIANT (brick c92f6bdc, Fix A). Live background
+// process-group work protects the owner EXACTLY as a live turn does: the gate
+// measures work liveness, not just turn liveness. A model that backgrounds a long
+// command and ends its turn (hasActiveTurn === false) must NOT have its owner
+// reaped while that job runs — the one surviving gap the RCA proved. Peer of #1:
+// hasLiveBackgroundWork === true ⇒ NEVER release, even with the idle clock far
+// past idleReleaseMs AND deployDiffers === true.
+test("P2 #1b INVARIANT: hasLiveBackgroundWork ⇒ never release (both reasons), clock far past + deploy-stale", async () => {
+  let deployConsulted = 0;
+  const decision = await decideIdleOwnerRelease(
+    input({
+      hasLiveBackgroundWork: true,
+      hasActiveTurn: false, // turn already ended — the exact backgrounded-work shape
+      now: BASE_NOW + 60 * 60_000, // 60 min idle on the clock — far past any timeout
+      lastTaskCompletedAt: BASE_NOW,
+      idleReleaseMs: 1, // memory timeout essentially zero
+      deployDiffers: () => {
+        deployConsulted += 1;
+        return true; // even outdated code
+      },
+    }),
+  );
+  assert.deepEqual(
+    decision,
+    { release: false },
+    "an owner with live background work is NEVER released",
+  );
+  assert.equal(
+    deployConsulted,
+    0,
+    "the gate short-circuits before the deploy check — neither reason is reached",
+  );
+});
+
+// #1c — The complement: with NO background work, the idle-memory path still fires
+// unchanged (the gate only adds a conjunct; it does not disturb the release path).
+test("P2 #1c: no background work + idle past the timeout ⇒ release idle-memory (path intact)", async () => {
+  const decision = await decideIdleOwnerRelease(
+    input({
+      hasLiveBackgroundWork: false,
+      now: BASE_NOW + 30_000,
+      lastTaskCompletedAt: BASE_NOW,
+    }),
+  );
+  assert.deepEqual(decision, { release: true, reason: "idle-memory" });
 });
 
 // #2 — A current-code idle owner re-arms across successive wakes, THEN releases
