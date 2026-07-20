@@ -73,6 +73,85 @@ test("auto_failover round-trips through parse, clone, session options, persist, 
   assert.equal(persisted.acpx?.session_options?.auto_failover, false);
 });
 
+test("persistSessionOptions carries a persisted auto_failover:false across an owner-respawn rebuild", () => {
+  // An owner respawn rebuilds session_options purely from the spawn flags
+  // (model/profile/effort). Those options carry NO autoFailover, so without the
+  // breadcrumb-style carry-forward the explicit `off` policy would be dropped
+  // and silently revert to default-on (brick://71af1351).
+  const record = recordWithAutoFailover(false);
+  persistSessionOptions(record, { model: "opus", profile: "sub6", reasoningEffort: "high" });
+
+  assert.equal(record.acpx?.session_options?.auto_failover, false);
+  // The rebuild still applies the incoming spawn flags.
+  assert.equal(record.acpx?.session_options?.model, "opus");
+  assert.equal(record.acpx?.session_options?.profile, "sub6");
+  assert.equal(record.acpx?.session_options?.effort, "high");
+  // And the gate honours the carried policy — the exact regression the fix targets.
+  assert.equal(autoFailoverEnabledForRecord(record), false);
+});
+
+test("an explicit options.autoFailover overrides the persisted policy in both directions", () => {
+  // off -> on: an explicit spawn/set that re-enables failover must win.
+  const reEnable = recordWithAutoFailover(false);
+  persistSessionOptions(reEnable, { model: "opus", autoFailover: true });
+  assert.equal(reEnable.acpx?.session_options?.auto_failover, true);
+
+  // (absent) -> off: an explicit disable persists even with no prior policy.
+  const disable = recordWithAutoFailover(undefined);
+  persistSessionOptions(disable, { model: "opus", autoFailover: false });
+  assert.equal(disable.acpx?.session_options?.auto_failover, false);
+});
+
+test("a fresh session with no prior auto_failover stays default (undefined -> enabled)", () => {
+  const record = makeSessionRecord(
+    {
+      acpxRecordId: "fresh-auto-fo",
+      acpSessionId: "fresh-auto-fo-acp",
+      agentCommand: "claude",
+      cwd: "/workspace/auto-fo",
+      acpx: {},
+    },
+    { resolveCwd: false },
+  );
+  persistSessionOptions(record, { model: "opus", profile: "sub6" });
+
+  assert.equal(record.acpx?.session_options?.auto_failover, undefined);
+  assert.equal(autoFailoverEnabledForRecord(record), true);
+});
+
+test("carry-forward preserves auto_failover AND the subscription_switch breadcrumb together", () => {
+  const record = makeSessionRecord(
+    {
+      acpxRecordId: "carry-both",
+      acpSessionId: "carry-both-acp",
+      agentCommand: "claude",
+      cwd: "/workspace/auto-fo",
+      acpx: {
+        session_options: {
+          auto_failover: false,
+          model: "sonnet",
+          subscription_switch: {
+            from: "sub6",
+            to: "sub2",
+            reason: "failover",
+            at: "2026-07-13T00:00:00.000Z",
+          },
+        },
+      },
+    },
+    { resolveCwd: false },
+  );
+  persistSessionOptions(record, { model: "opus", profile: "sub6", reasoningEffort: "high" });
+
+  assert.equal(record.acpx?.session_options?.auto_failover, false);
+  assert.deepEqual(record.acpx?.session_options?.subscription_switch, {
+    from: "sub6",
+    to: "sub2",
+    reason: "failover",
+    at: "2026-07-13T00:00:00.000Z",
+  });
+});
+
 test("auto_failover:false is preserved against stale durable preference snapshots", () => {
   const merged = mergeLatestDurableAcpxPreferences(
     {
