@@ -61,6 +61,54 @@ export function normalizeOwnerIdleReleaseMs(value: number | undefined): number {
   return Math.round(value);
 }
 
+// brick c92f6bdc, Fix A — the hard cap on how long live background process-group
+// work may keep a voluntary idle-release warm. The work-aware gate keeps an owner
+// warm while a model-backgrounded job runs; this cap ensures a hung/leaked job
+// cannot pin an owner warm FOREVER. Once background work has been observed idle for
+// this long, release proceeds (→ graceful drain) with a logged warning naming the
+// surviving pids — never a silent kill. Default 2 h: comfortably clears legitimate
+// long jobs (a full suite ≈ 20 min; builds/matrices ≤ ~1 h) while bounding a leak's
+// ~287 MB/owner cost; symmetric with acpx-ui's 2 h delivery retry ceiling. Tune per
+// box via ACPX_MAX_BACKGROUND_GRACE_MS (ms). Mirrors the pairs above.
+export const DEFAULT_MAX_BACKGROUND_GRACE_MS = 7_200_000; // 2 h
+
+export function normalizeMaxBackgroundGraceMs(value: number | undefined): number {
+  if (value == null) {
+    return DEFAULT_MAX_BACKGROUND_GRACE_MS;
+  }
+
+  if (!Number.isFinite(value) || value < 0) {
+    return DEFAULT_MAX_BACKGROUND_GRACE_MS;
+  }
+
+  // 0 is a valid value: it DISABLES the cap (unbounded warm while work runs) for an
+  // operator who prefers `--ttl`-style protection. `--ttl 0` remains the absolute
+  // opt-out regardless. Invalid/negative/unset → the 2 h default.
+  return Math.round(value);
+}
+
+// brick c92f6bdc, Fix A — the grace given to live process-group members (a
+// backgrounded job + the exiting adapter) to finish / checkpoint after SIGTERM,
+// before the final orphan-backstop group-SIGKILL, on the VOLUNTARY self-teardown
+// path (closeQueueOwnerRuntime). PROCESS_EXIT_GRACE_MS (1.5 s) is too short to let
+// a job checkpoint; 10 s is the recommended default. Tune via
+// ACPX_OWNER_DRAIN_GRACE_MS (ms). Mirrors the pairs above.
+export const DEFAULT_OWNER_DRAIN_GRACE_MS = 10_000; // 10 s
+
+export function normalizeOwnerDrainGraceMs(value: number | undefined): number {
+  if (value == null) {
+    return DEFAULT_OWNER_DRAIN_GRACE_MS;
+  }
+
+  if (!Number.isFinite(value) || value < 0) {
+    return DEFAULT_OWNER_DRAIN_GRACE_MS;
+  }
+
+  // 0 is a valid value: it restores the LEGACY immediate group-SIGKILL (no SIGTERM
+  // drain wait) — a clean rollback lever. Invalid/negative/unset → the 10 s default.
+  return Math.round(value);
+}
+
 export type RunOnceOptions = {
   agentCommand: string;
   agentName?: string;

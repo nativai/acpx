@@ -10,12 +10,15 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import fs from "node:fs/promises";
+import path from "node:path";
 import test from "node:test";
 import {
   drainProcessGroupExceptSelf,
   hasLiveProcessGroup,
   isProcessAlive,
 } from "../src/cli/queue/lease-store.js";
+import { withTempHome } from "./queue-test-helpers.js";
 
 async function waitUntilDead(pid: number, timeoutMs = 5_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -27,30 +30,48 @@ async function waitUntilDead(pid: number, timeoutMs = 5_000): Promise<void> {
   }
 }
 
-// A detached group leader that spawns one child running `script`, writing the
-// child pid to fd (we capture it from stdout). The leader itself just idles.
-async function startGroupWithChild(
-  childScript: string,
+async function readPidFile(file: string, timeoutMs = 5_000): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    try {
+      const raw = (await fs.readFile(file, "utf8")).trim();
+      const parsed = Number(raw);
+      if (Number.isInteger(parsed) && parsed > 0) {
+        return parsed;
+      }
+    } catch {
+      // not written yet
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return 0;
+}
+
+// A detached group LEADER that spawns one child in its group. The child registers
+// its SIGTERM disposition FIRST, THEN writes its pid to `readyFile` — so a test
+// that waits for readyFile is guaranteed the handler is installed before it drains
+// (no SIGTERM-vs-handler-registration race). `mode`:
+//   - "ignore" → an empty SIGTERM handler (stays alive on SIGTERM) → a survivor.
+//   - "exit"   → exits cleanly on SIGTERM → drained within grace, not a survivor.
+async function startLeaderWithChild(
+  mode: "ignore" | "exit",
+  readyFile: string,
 ): Promise<{ leader: ReturnType<typeof spawn>; childPid: number }> {
-  const wrapper =
+  const handler =
+    mode === "ignore"
+      ? "process.on('SIGTERM',()=>{});"
+      : "process.on('SIGTERM',()=>process.exit(0));";
+  const childCode = `${handler}require('node:fs').writeFileSync(process.argv[1],String(process.pid));setInterval(()=>{},1000);`;
+  const leaderCode =
     "const{spawn}=require('node:child_process');" +
-    `const c=spawn(process.execPath,['-e',${JSON.stringify(childScript)}],{stdio:'ignore'});` +
-    "process.stdout.write(String(c.pid)+'\\n');setInterval(()=>{},1000);";
-  const leader = spawn(process.execPath, ["-e", wrapper], {
-    stdio: ["ignore", "pipe", "ignore"],
+    `spawn(process.execPath,['-e',${JSON.stringify(childCode)},process.argv[1]],{stdio:'ignore'});` +
+    "setInterval(()=>{},1000);";
+  const leader = spawn(process.execPath, ["-e", leaderCode, readyFile], {
+    stdio: "ignore",
     detached: true,
   });
   await once(leader, "spawn");
-  let buffer = "";
-  const childPid: number = await new Promise((resolve) => {
-    leader.stdout?.on("data", (chunk: Buffer) => {
-      buffer += chunk.toString("utf8");
-      const nl = buffer.indexOf("\n");
-      if (nl >= 0) {
-        resolve(Number(buffer.slice(0, nl).trim()));
-      }
-    });
-  });
+  const childPid = await readPidFile(readyFile);
   return { leader, childPid };
 }
 
@@ -70,33 +91,36 @@ test("drainProcessGroupExceptSelf: a SIGTERM-honoring child exits in grace, no s
   if (process.platform === "win32") {
     return;
   }
-  const { leader, childPid } = await startGroupWithChild(
-    "process.on('SIGTERM',()=>process.exit(0));setInterval(()=>{},1000);",
-  );
-  const leaderPid = leader.pid;
-  try {
-    assert(leaderPid && Number.isInteger(leaderPid));
-    assert(childPid && Number.isInteger(childPid));
-    assert.equal(isProcessAlive(childPid), true);
-
-    let survivorsReported: number[] | undefined;
-    await drainProcessGroupExceptSelf(leaderPid, 3_000, (survivors) => {
-      survivorsReported = survivors;
-    });
-
-    await waitUntilDead(childPid);
-    assert.equal(isProcessAlive(childPid), false, "the child honored SIGTERM and exited");
-    assert.equal(
-      survivorsReported,
-      undefined,
-      "onSurvivors must NOT fire — the child exited within grace, no SIGKILL needed",
+  await withTempHome(async (homeDir) => {
+    const { leader, childPid } = await startLeaderWithChild(
+      "exit",
+      path.join(homeDir, "child.pid"),
     );
-    // The leader itself is untouched by the drain (drain excludes self).
-    assert.equal(isProcessAlive(leaderPid), true, "the leader is never signalled by the drain");
-  } finally {
-    killQuietly(childPid);
-    killQuietly(leaderPid);
-  }
+    const leaderPid = leader.pid;
+    try {
+      assert(leaderPid && Number.isInteger(leaderPid));
+      assert(childPid && Number.isInteger(childPid), "child pid captured");
+      assert.equal(isProcessAlive(childPid), true);
+
+      let survivorsReported: number[] | undefined;
+      await drainProcessGroupExceptSelf(leaderPid, 3_000, (survivors) => {
+        survivorsReported = survivors;
+      });
+
+      await waitUntilDead(childPid);
+      assert.equal(isProcessAlive(childPid), false, "the child honored SIGTERM and exited");
+      assert.equal(
+        survivorsReported,
+        undefined,
+        "onSurvivors must NOT fire — the child exited within grace, no SIGKILL needed",
+      );
+      // The leader itself is untouched by the drain (drain excludes self).
+      assert.equal(isProcessAlive(leaderPid), true, "the leader is never signalled by the drain");
+    } finally {
+      killQuietly(childPid);
+      killQuietly(leaderPid);
+    }
+  });
 });
 
 // A child that IGNORES SIGTERM → after grace it must be reported as a survivor,
@@ -107,39 +131,42 @@ test("drainProcessGroupExceptSelf: a SIGTERM-ignoring child is reported as a sur
   if (process.platform === "win32") {
     return;
   }
-  const { leader, childPid } = await startGroupWithChild(
-    "process.on('SIGTERM',()=>{});setInterval(()=>{},1000);",
-  );
-  const leaderPid = leader.pid;
-  try {
-    assert(leaderPid && Number.isInteger(leaderPid));
-    assert(childPid && Number.isInteger(childPid));
+  await withTempHome(async (homeDir) => {
+    const { leader, childPid } = await startLeaderWithChild(
+      "ignore",
+      path.join(homeDir, "child.pid"),
+    );
+    const leaderPid = leader.pid;
+    try {
+      assert(leaderPid && Number.isInteger(leaderPid));
+      assert(childPid && Number.isInteger(childPid), "child pid captured");
 
-    let survivorsReported: number[] | undefined;
-    const startedAt = Date.now();
-    await drainProcessGroupExceptSelf(leaderPid, 500, (survivors) => {
-      survivorsReported = survivors;
-    });
-    const elapsed = Date.now() - startedAt;
+      let survivorsReported: number[] | undefined;
+      const startedAt = Date.now();
+      await drainProcessGroupExceptSelf(leaderPid, 500, (survivors) => {
+        survivorsReported = survivors;
+      });
+      const elapsed = Date.now() - startedAt;
 
-    assert(survivorsReported, "onSurvivors fires for a child that outlived the grace");
-    assert(
-      survivorsReported.includes(childPid),
-      "the SIGTERM-ignoring child is named as a survivor",
-    );
-    assert(
-      elapsed >= 500,
-      `the drain waited the full grace before giving up (waited ${elapsed}ms)`,
-    );
-    assert.equal(
-      isProcessAlive(childPid),
-      true,
-      "the drain does NOT SIGKILL the survivor — that is the caller's final backstop",
-    );
-  } finally {
-    killQuietly(childPid);
-    killQuietly(leaderPid);
-  }
+      assert(survivorsReported, "onSurvivors fires for a child that outlived the grace");
+      assert(
+        survivorsReported.includes(childPid),
+        "the SIGTERM-ignoring child is named as a survivor",
+      );
+      assert(
+        elapsed >= 500,
+        `the drain waited the full grace before giving up (waited ${elapsed}ms)`,
+      );
+      assert.equal(
+        isProcessAlive(childPid),
+        true,
+        "the drain does NOT SIGKILL the survivor — that is the caller's final backstop",
+      );
+    } finally {
+      killQuietly(childPid);
+      killQuietly(leaderPid);
+    }
+  });
 });
 
 // graceMs === 0 → immediate: no SIGTERM wait. A SIGTERM-ignoring child is a
@@ -149,24 +176,28 @@ test("drainProcessGroupExceptSelf: graceMs 0 reports survivors immediately (lega
   if (process.platform === "win32") {
     return;
   }
-  const { leader, childPid } = await startGroupWithChild(
-    "process.on('SIGTERM',()=>{});setInterval(()=>{},1000);",
-  );
-  const leaderPid = leader.pid;
-  try {
-    assert(leaderPid && Number.isInteger(leaderPid));
-    let survivorsReported: number[] | undefined;
-    const startedAt = Date.now();
-    await drainProcessGroupExceptSelf(leaderPid, 0, (survivors) => {
-      survivorsReported = survivors;
-    });
-    const elapsed = Date.now() - startedAt;
-    assert(survivorsReported?.includes(childPid), "the child is a survivor with zero grace");
-    assert(elapsed < 400, `no grace wait with graceMs 0 (elapsed ${elapsed}ms)`);
-  } finally {
-    killQuietly(childPid);
-    killQuietly(leaderPid);
-  }
+  await withTempHome(async (homeDir) => {
+    const { leader, childPid } = await startLeaderWithChild(
+      "ignore",
+      path.join(homeDir, "child.pid"),
+    );
+    const leaderPid = leader.pid;
+    try {
+      assert(leaderPid && Number.isInteger(leaderPid));
+      assert(childPid && Number.isInteger(childPid), "child pid captured");
+      let survivorsReported: number[] | undefined;
+      const startedAt = Date.now();
+      await drainProcessGroupExceptSelf(leaderPid, 0, (survivors) => {
+        survivorsReported = survivors;
+      });
+      const elapsed = Date.now() - startedAt;
+      assert(survivorsReported?.includes(childPid), "the child is a survivor with zero grace");
+      assert(elapsed < 400, `no grace wait with graceMs 0 (elapsed ${elapsed}ms)`);
+    } finally {
+      killQuietly(childPid);
+      killQuietly(leaderPid);
+    }
+  });
 });
 
 // A clean group (only the leader, no other members) drains to no survivors fast.

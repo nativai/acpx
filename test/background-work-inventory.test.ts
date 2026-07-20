@@ -92,70 +92,91 @@ test("liveBackgroundWorkPids: an empty snapshot ⇒ no work (never throws)", () 
   assert.deepEqual(liveBackgroundWorkPids(OWNER, ADAPTER, []), []);
 });
 
-// Real-process end-to-end: a detached owner (group leader) -> adapter -> bg job,
-// three levels deep, in one process group. The real `ps` scan must enumerate them
-// and the classifier must return exactly the depth-3 bg job. Mirrors
-// queue-lease-store.test.ts's detached-group process helpers.
-test("listProcessGroupMembers + liveBackgroundWorkPids identify a real depth-3 background job", async () => {
+// Real-process end-to-end: a detached owner (group leader) → adapter → SDK → bg
+// job, FOUR levels deep in one process group — faithful to the real Claude spine
+// (owner → adapter → SDK binary → the /bin/sh -c tool job the model backgrounded).
+// The real `ps` scan must enumerate the whole group and the classifier must return
+// exactly the depth-4 bg job (child of the SDK, ∉ {owner, adapter}) while excluding
+// the resting owner→adapter→SDK spine. A recursive chain fixture builds the tree so
+// nothing false-passes on a too-shallow tree (the depth-3-vs-4 distinction is load
+// bearing: a job that IS a direct child of the adapter is the SDK position and must
+// be excluded). Mirrors queue-lease-store.test.ts's detached-group process helpers.
+test("listProcessGroupMembers + liveBackgroundWorkPids identify a real depth-4 background job", async () => {
   if (process.platform === "win32") {
     return;
   }
   await withTempHome(async (homeDir) => {
-    const adapterPidFile = path.join(homeDir, "adapter.pid");
-    const jobPidFile = path.join(homeDir, "job.pid");
-    // owner spawns "adapter"; "adapter" spawns "bg job". Each writes its child's pid.
-    const script =
+    // chain.cjs: at depth N>0 spawn a depth-(N-1) child (same group) and append
+    // "<N>:<childPid>" to the out file; at depth 0 just idle (the leaf bg job).
+    const chainPath = path.join(homeDir, "chain.cjs");
+    await fs.writeFile(
+      chainPath,
       "const{spawn}=require('node:child_process');const fs=require('node:fs');" +
-      "const adapter=spawn(process.execPath,['-e'," +
-      "\"const{spawn}=require('node:child_process');const fs=require('node:fs');" +
-      "const job=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});" +
-      'fs.writeFileSync(process.argv[1],String(job.pid));setInterval(()=>{},1000);"' +
-      ",process.argv[2]],{stdio:'ignore'});" +
-      "fs.writeFileSync(process.argv[1],String(adapter.pid));setInterval(()=>{},1000);";
-    const owner = spawn(process.execPath, ["-e", script, adapterPidFile, jobPidFile], {
+        "const depth=Number(process.argv[2]);const out=process.argv[3];" +
+        "if(depth>0){const c=spawn(process.execPath,[__filename,String(depth-1),out],{stdio:'ignore'});" +
+        "fs.appendFileSync(out,depth+':'+c.pid+'\\n');}" +
+        "setInterval(()=>{},1000);",
+      "utf8",
+    );
+    const outFile = path.join(homeDir, "chain.out");
+    // owner = depth-3 root: owner(3) → adapter(2) → sdk(1) → job(0/leaf).
+    const owner = spawn(process.execPath, [chainPath, "3", outFile], {
       stdio: "ignore",
       detached: true,
     });
     await once(owner, "spawn");
     const ownerPid = owner.pid;
 
-    const readPid = async (file: string): Promise<number> => {
-      for (let attempt = 0; attempt < 200; attempt += 1) {
+    // Wait until all three interior levels have logged their child pids.
+    const readChain = async (): Promise<Map<number, number>> => {
+      for (let attempt = 0; attempt < 300; attempt += 1) {
         try {
-          const raw = (await fs.readFile(file, "utf8")).trim();
-          const parsed = Number(raw);
-          if (Number.isInteger(parsed) && parsed > 0) {
-            return parsed;
+          const raw = await fs.readFile(outFile, "utf8");
+          const map = new Map<number, number>();
+          for (const line of raw.split("\n")) {
+            const m = line.trim().match(/^(\d+):(\d+)$/);
+            if (m) {
+              map.set(Number(m[1]), Number(m[2]));
+            }
+          }
+          if (map.has(3) && map.has(2) && map.has(1)) {
+            return map;
           }
         } catch {
-          // pid file not written yet
+          // not written yet
         }
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
-      return 0;
+      return new Map();
     };
 
     let adapterPid = 0;
+    let sdkPid = 0;
     let jobPid = 0;
     try {
       assert(ownerPid && Number.isInteger(ownerPid));
-      adapterPid = await readPid(adapterPidFile);
-      jobPid = await readPid(jobPidFile);
+      const chain = await readChain();
+      adapterPid = chain.get(3) ?? 0; // owner's child
+      sdkPid = chain.get(2) ?? 0; // adapter's child
+      jobPid = chain.get(1) ?? 0; // sdk's child — the depth-4 bg job
       assert(adapterPid > 0, "adapter pid captured");
+      assert(sdkPid > 0, "sdk pid captured");
       assert(jobPid > 0, "bg job pid captured");
 
       const members = listProcessGroupMembers(ownerPid);
       const memberPids = new Set(members.map((m) => m.pid));
       assert(memberPids.has(ownerPid), "owner is a group member");
       assert(memberPids.has(adapterPid), "adapter is a group member");
+      assert(memberPids.has(sdkPid), "sdk is a group member");
       assert(memberPids.has(jobPid), "bg job is a group member");
 
       const work = liveBackgroundWorkPids(ownerPid, adapterPid, members);
-      assert(work.includes(jobPid), "the depth-3 bg job is counted as work");
+      assert(work.includes(jobPid), "the depth-4 bg job is counted as work");
       assert(!work.includes(ownerPid), "the owner is not work");
       assert(!work.includes(adapterPid), "the adapter is not work");
+      assert(!work.includes(sdkPid), "the SDK binary (adapter's direct child) is not work");
     } finally {
-      for (const pid of [jobPid, adapterPid, ownerPid]) {
+      for (const pid of [jobPid, sdkPid, adapterPid, ownerPid]) {
         if (pid && pid > 0) {
           try {
             process.kill(pid, "SIGKILL");

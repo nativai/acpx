@@ -7,6 +7,7 @@ import { supportsMidTurnPromptInjection } from "../../acp/mid-turn-injection-sup
 import { withTimeout } from "../../async-control.js";
 import { checkpointPerfMetricsCapture } from "../../perf-metrics-capture.js";
 import { incrementPerfCounter, setPerfGauge } from "../../perf-metrics.js";
+import { listProcessGroupMembers, liveBackgroundWorkPids } from "../../process-group-inventory.js";
 import { promptToDisplayText } from "../../prompt-content.js";
 import { bindRecordToDefaultAccount } from "../../runtime/engine/default-account-binding.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
@@ -40,13 +41,15 @@ import {
   signalProcessGroup,
   waitMs,
 } from "../queue/ipc.js";
-import { refreshQueueOwnerLease } from "../queue/lease-store.js";
+import { drainProcessGroupExceptSelf, refreshQueueOwnerLease } from "../queue/lease-store.js";
 import { QueueOwnerTurnController } from "../queue/owner-turn-controller.js";
 import { terminalizeAbsorbedDeliveriesOnOwnerExit } from "./absorbed-delivery-registry.js";
 import { resolveAndEnsureAgentFolder } from "./agent-folder.js";
 import { resolveExistingBrickPath } from "./brick-link.js";
 import {
   DEFAULT_QUEUE_OWNER_TTL_MS,
+  normalizeMaxBackgroundGraceMs,
+  normalizeOwnerDrainGraceMs,
   normalizeOwnerIdleReleaseMs,
   normalizeQueueOwnerTtlMs,
   type SessionSendOptions,
@@ -308,6 +311,9 @@ async function closeQueueOwnerRuntime(params: {
   turnController: QueueOwnerTurnController;
   sharedClient: AcpClient;
   sessionId: string;
+  // brick c92f6bdc, Fix A — grace for the SIGTERM drain before the final orphan
+  // backstop SIGKILL on this voluntary self-teardown path. 0 = legacy immediate kill.
+  drainGraceMs: number;
   verbose?: boolean;
 }): Promise<void> {
   if (params.heartbeatTimer) {
@@ -344,9 +350,25 @@ async function closeQueueOwnerRuntime(params: {
   if (params.verbose) {
     process.stderr.write(`[acpx] queue owner stopped for session ${params.sessionId}\n`);
   }
-  // Final orphan backstop: adapter descendants share this owner's process group.
-  // The leader guard prevents sweeping an embedding parent's unrelated group.
+  // brick c92f6bdc, Fix A — graceful drain, then the SAME orphan backstop as its
+  // last act. Give live group members (background work + the exiting adapter) a
+  // bounded chance to finish / checkpoint via SIGTERM (every member EXCEPT this
+  // owner — a group SIGTERM would signal ourselves and abort mid-drain), poll until
+  // only self remains or the grace elapses, then hard-kill any survivors via the
+  // final group-SIGKILL. In the common no-work case the adapter (already closing
+  // above) exits within grace → the poll returns in ms → the SIGKILL is a near-no-op,
+  // so teardown stays fast. The final group-SIGKILL is UNCHANGED in semantics: it
+  // still hard-kills the whole group (including this owner as its last act),
+  // preserving the 1dda30b3/f22ad667 orphan-backstop guarantee — now merely
+  // preceded by a bounded drain.
   if (ownerIsGroupLeader() && hasLiveProcessGroup(process.pid)) {
+    await drainProcessGroupExceptSelf(process.pid, params.drainGraceMs, (survivorPids) => {
+      process.stderr.write(
+        `[acpx] queue owner ${params.sessionId} drain: SIGKILL ${survivorPids.length} ` +
+          `survivor(s) after ${params.drainGraceMs}ms grace (interrupted, not a clean exit): ` +
+          `pids=${survivorPids.join(",")}\n`,
+      );
+    });
     signalProcessGroup(process.pid, "SIGKILL");
   }
 }
@@ -387,6 +409,11 @@ export type IdleOwnerReleaseDecision =
 export type DecideIdleOwnerReleaseInput = {
   ttlMs: number;
   hasActiveTurn: boolean;
+  // brick c92f6bdc, Fix A — a "not idle" signal, PEER of hasActiveTurn: live
+  // background process-group work protects the owner exactly as a live turn does.
+  // Closes the RCA's surviving gap (a model backgrounds a long command and ends its
+  // turn → hasActiveTurn goes false → the owner was reaped, killing the job).
+  hasLiveBackgroundWork: boolean;
   now: number;
   lastIdleDrainActivityAt: number;
   lastTaskCompletedAt: number;
@@ -419,11 +446,20 @@ export async function decideIdleOwnerRelease(
   //   - !hasActiveTurn : the reliable local turn signal (starting/active or a live
   //                      prompt) — NEVER inFlight / heartbeat age. A long 15-20 min
   //                      tool call keeps the turn active → the owner is never idle.
+  //   - !hasLiveBackgroundWork : the FOREGROUND gate's peer for BACKGROUND work
+  //                      (brick c92f6bdc, Fix A). Live process-group work beyond the
+  //                      resting owner→adapter→SDK spine — a command the model
+  //                      backgrounded and left running after its turn ended — protects
+  //                      the owner exactly as a live turn does. The gate measures work
+  //                      liveness, not just turn liveness. A cheap boolean, evaluated
+  //                      before the deploy-file read so the cost-ordering short-circuit
+  //                      (deployDiffers only after the gate holds) is preserved.
   //   - quiescent      : no inter-turn idle-drain relay within the check cadence,
   //                      so an owner relaying background work is never torn down.
   const idleAndQuiescent =
     input.ttlMs !== 0 &&
     !input.hasActiveTurn &&
+    !input.hasLiveBackgroundWork &&
     input.now - input.lastIdleDrainActivityAt >= input.quiescenceWindowMs;
   if (!idleAndQuiescent) {
     return { release: false };
@@ -516,6 +552,20 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   const idleReleaseMs = normalizeOwnerIdleReleaseMs(
     parseEnvMs(process.env.ACPX_OWNER_IDLE_RELEASE_MS),
   );
+  // brick c92f6bdc, Fix A — the work-aware gate's cap (a hung/leaked background job
+  // cannot pin an owner warm forever) and the graceful-drain grace (SIGTERM→grace→
+  // SIGKILL on voluntary self-teardown). Read from env at owner start like
+  // idleReleaseMs; safe defaults (2 h / 10 s) when unset.
+  const maxBackgroundGraceMs = normalizeMaxBackgroundGraceMs(
+    parseEnvMs(process.env.ACPX_MAX_BACKGROUND_GRACE_MS),
+  );
+  const drainGraceMs = normalizeOwnerDrainGraceMs(
+    parseEnvMs(process.env.ACPX_OWNER_DRAIN_GRACE_MS),
+  );
+  // Wall-clock at which live background work was FIRST observed at an idle check;
+  // reset whenever the group is clear of work. Bounds the work-aware warm-hold to
+  // maxBackgroundGraceMs (the cap below), after which release proceeds via drain.
+  let backgroundWorkFirstSeenAt: number | undefined;
   const maxQueueDepth = Math.max(1, Math.round(options.maxQueueDepth ?? 16));
   const defaultTaskPollTimeoutMs: number | undefined = ttlMs === 0 ? undefined : ttlMs;
   const initialTaskPollTimeoutMs =
@@ -858,9 +908,41 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         // active owner. When ttl 0, `nextTask` never times out, so this branch is
         // structurally unreachable (the ttl!==0 term is belt-and-suspenders).
         const quiescenceWindowMs = pollTimeoutMs ?? 0;
+        // brick c92f6bdc, Fix A — the work-aware signal. Scan the owner's process
+        // group for live background work beyond the resting owner→adapter→SDK spine
+        // (a command the model backgrounded and left running after its turn ended).
+        // "Beyond the adapter resting footprint" = precisely liveBackgroundWorkPids
+        // (owner + adapter + their direct children excluded). The ps scan runs only
+        // at the idle-check cadence (every ttlMs, default 15 min) → negligible cost.
+        const workPids = liveBackgroundWorkPids(
+          process.pid,
+          sharedClient.getAgentPid(),
+          listProcessGroupMembers(process.pid),
+        );
+        let hasLiveBackgroundWork = workPids.length > 0;
+        if (hasLiveBackgroundWork) {
+          backgroundWorkFirstSeenAt ??= Date.now();
+          // Cap: a hung/leaked job cannot pin an owner warm forever. maxBackgroundGraceMs
+          // === 0 disables the cap (unbounded warm). Once exceeded, let the gate release
+          // (§4 graceful-drains the survivors) — NEVER silent: name the survivor pids.
+          if (
+            maxBackgroundGraceMs > 0 &&
+            Date.now() - backgroundWorkFirstSeenAt >= maxBackgroundGraceMs
+          ) {
+            process.stderr.write(
+              `[acpx] queue owner ${options.sessionId}: background work exceeded ` +
+                `${maxBackgroundGraceMs}ms grace; releasing with drain (survivor pids: ${workPids.join(",")})\n`,
+            );
+            incrementPerfCounter("queue.owner.background_grace_exceeded");
+            hasLiveBackgroundWork = false; // let the gate release; §4 drains it gracefully
+          }
+        } else {
+          backgroundWorkFirstSeenAt = undefined; // group clear of work → reset the cap clock
+        }
         const decision = await decideIdleOwnerRelease({
           ttlMs,
           hasActiveTurn: turnController.hasActiveTurn(),
+          hasLiveBackgroundWork,
           now: Date.now(),
           lastIdleDrainActivityAt,
           lastTaskCompletedAt,
@@ -1028,6 +1110,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       turnController,
       sharedClient,
       sessionId: options.sessionId,
+      drainGraceMs,
       verbose: options.verbose,
     });
   }

@@ -1,5 +1,6 @@
 import { randomInt } from "node:crypto";
 import fs from "node:fs/promises";
+import { type ProcessGroupMember, listProcessGroupMembers } from "../../process-group-inventory.js";
 import { isProcessAlive } from "../../process-liveness.js";
 import { queueBaseDir, queueLockFilePath, queueSocketBaseDir, queueSocketPath } from "./paths.js";
 
@@ -549,6 +550,62 @@ export function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
     process.kill(-pid, signal);
   } catch {
     // best-effort: process group cleanup races with members exiting on their own
+  }
+}
+
+// brick c92f6bdc, Fix A — the graceful-drain primitive for the VOLUNTARY
+// self-teardown path (closeQueueOwnerRuntime). SIGTERM every member of `pgid`'s
+// process group EXCEPT the leader (`pgid` itself) — a group SIGTERM would signal
+// ourselves and abort mid-drain — then poll until only the leader remains or
+// `graceMs` elapses, and report any survivors so the caller can hard-kill them via
+// the existing group-SIGKILL (the final orphan backstop). This is DISTINCT from the
+// R2 recovery sweep terminateConfirmedQueueOwnerProcessGroup, which stays an
+// immediate kill for genuinely dead/wedged owners (no healthy state to protect).
+// Best-effort throughout; swallows ESRCH/EPERM. `deps` is an injectable seam for
+// deterministic tests. graceMs === 0 restores the legacy immediate behavior (no
+// grace wait; every still-alive non-leader member is reported as a survivor).
+export async function drainProcessGroupExceptSelf(
+  pgid: number,
+  graceMs: number,
+  onSurvivors: (survivorPids: number[]) => void,
+  deps?: {
+    listMembers?: (pgid: number) => ProcessGroupMember[];
+    nowMs?: () => number;
+    sleep?: (ms: number) => Promise<void>;
+  },
+): Promise<void> {
+  if (process.platform === "win32" || !Number.isInteger(pgid) || pgid <= 0) {
+    return;
+  }
+  const listMembers = deps?.listMembers ?? ((id: number) => listProcessGroupMembers(id));
+  const nowMs = deps?.nowMs ?? Date.now;
+  const sleep = deps?.sleep ?? waitMs;
+
+  const nonLeaderPids = (): number[] =>
+    listMembers(pgid)
+      .map((member) => member.pid)
+      .filter((pid) => pid !== pgid);
+
+  // SIGTERM every non-leader member once, giving each a chance to finish / checkpoint.
+  for (const pid of nonLeaderPids()) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // best-effort: the member may already be gone (ESRCH) or unkillable (EPERM)
+    }
+  }
+
+  // Poll until only the leader remains or the grace elapses. graceMs <= 0 skips the
+  // wait entirely (legacy immediate behavior) and reports survivors straight away.
+  const deadline = nowMs() + Math.max(0, graceMs);
+  let survivors = nonLeaderPids();
+  while (survivors.length > 0 && nowMs() < deadline) {
+    await sleep(PROCESS_POLL_MS);
+    survivors = nonLeaderPids();
+  }
+
+  if (survivors.length > 0) {
+    onSurvivors(survivors);
   }
 }
 
