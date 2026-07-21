@@ -153,23 +153,30 @@ function assignBreadcrumbs(
 // is a deliberate change and must win. auto_failover: brick://71af1351; floor_hard:
 // brick://07dd62c9; model/effort record-loss gap: brick://dda08023 fold-in.
 // carryForwardPinnedFloor seeds these onto the record only when it carries no pin
-// of its own, so this never overwrites a live-applied pin. Assigning an undefined
-// breadcrumb leaves the field undefined (a no-op — dropped by JSON serialization).
+// of its own, so this never overwrites a live-applied pin.
 function carryDurableIfUnset(
   target: PersistedSessionOptions,
   breadcrumbs: SessionOptionBreadcrumbs,
 ): void {
-  if (target.auto_failover === undefined) {
-    target.auto_failover = breadcrumbs.autoFailover;
-  }
-  if (target.floor_hard === undefined) {
-    target.floor_hard = breadcrumbs.floorHard;
-  }
-  if (target.model === undefined) {
-    target.model = breadcrumbs.model;
-  }
-  if (target.effort === undefined) {
-    target.effort = breadcrumbs.effort;
+  carryIfUnset(target, "auto_failover", breadcrumbs.autoFailover);
+  carryIfUnset(target, "floor_hard", breadcrumbs.floorHard);
+  carryIfUnset(target, "model", breadcrumbs.model);
+  carryIfUnset(target, "effort", breadcrumbs.effort);
+}
+
+// Assign `value` to `target[key]` ONLY when the breadcrumb HAS a value AND the
+// target has not already set it. The `value !== undefined` guard matters: without
+// it, an assignment of `undefined` creates an OWN-KEY (`auto_failover: undefined`)
+// that is a no-op on disk (JSON drops it) but NOT for in-memory object identity —
+// deepStrictEqual / Object.keys see the extra key (TE Finding #2). Mirrors the old
+// assignDefinedOption / assignBreadcrumbs `!== undefined` semantics.
+function carryIfUnset<K extends keyof PersistedSessionOptions>(
+  target: PersistedSessionOptions,
+  key: K,
+  value: PersistedSessionOptions[K] | undefined,
+): void {
+  if (value !== undefined && target[key] === undefined) {
+    target[key] = value;
   }
 }
 
