@@ -33,8 +33,10 @@ import {
   getDesiredModelId,
   setDesiredConfigOption,
   setCurrentModelId,
+  setDesiredModelSource,
   syncAdvertisedModelState,
 } from "../../session/mode-preference.js";
+import { guardServedModel, stampModelGuardBreadcrumb } from "../../session/model-guard.js";
 import type { SessionRecord, SessionResumePolicy } from "../../types.js";
 import {
   applyLifecycleSnapshotToRecord,
@@ -201,23 +203,42 @@ async function replayDesiredModel(params: {
     return false;
   }
 
+  // brick://5bac5564 Layer B belt (grandfather legacy): a replay of an IMPLICIT
+  // Fable desired pin is force-redirected to the non-Fable default; absent
+  // provenance (legacy) is left alone. Post the resolution-tier guard this is a
+  // near-noop safety net for a Fable pin that slipped through non-explicit.
+  const guarded = guardServedModel({
+    requestedModel: params.desiredModelId,
+    modelSource: params.record.acpx?.session_options?.model_source,
+    availableModels: params.record.acpx?.available_models,
+  });
+  const desiredModelId = guarded.model ?? params.desiredModelId;
+
   try {
     assertRequestedModelSupported({
-      requestedModel: params.desiredModelId,
+      requestedModel: desiredModelId,
       models: params.models,
       agentCommand: params.record.agentCommand,
       context: "replay",
     });
-    if (!params.models || params.models.currentModelId === params.desiredModelId) {
+    if (guarded.forced && guarded.blocked) {
+      setDesiredModelSource(params.record, "guard-forced");
+      stampModelGuardBreadcrumb(params.record, {
+        blocked: guarded.blocked,
+        forcedTo: desiredModelId,
+        source: "reconnect-belt",
+      });
+    }
+    if (!params.models || params.models.currentModelId === desiredModelId) {
       return !!params.models;
     }
     await withTimeout(
-      params.client.setSessionModel(params.sessionId, params.desiredModelId),
+      params.client.setSessionModel(params.sessionId, desiredModelId),
       params.timeoutMs,
     );
     if (params.verbose) {
       process.stderr.write(
-        `[acpx] replayed desired model ${params.desiredModelId} on reconnected ACP session ${params.sessionId} (previous ${params.previousSessionId})\n`,
+        `[acpx] replayed desired model ${desiredModelId} on reconnected ACP session ${params.sessionId} (previous ${params.previousSessionId})\n`,
       );
     }
     return true;

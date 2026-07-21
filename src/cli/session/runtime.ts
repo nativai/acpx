@@ -80,8 +80,11 @@ import {
   mergeLatestDurableAcpxPreferences,
   setCurrentModelId,
   setDesiredModelId,
+  setDesiredModelSource,
 } from "../../session/mode-preference.js";
 import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
+import { isFableModel } from "../../config/subscription-usage.js";
+import { guardServedModel, stampModelGuardBreadcrumb } from "../../session/model-guard.js";
 import { enforceModelFloorPostServe } from "../../session/model-floor-enforce.js";
 import { captureServedState } from "../../session/model-floor.js";
 import {
@@ -687,11 +690,25 @@ async function applyPromptModelIfAdvertised(params: {
   requestedModel: string | undefined;
   record: SessionRecord;
   timeoutMs?: number;
+  verbose?: boolean;
 }): Promise<void> {
-  const requestedModel = requestedModelId(params.requestedModel);
-  if (!requestedModel) {
+  const rawRequested = requestedModelId(params.requestedModel);
+  if (!rawRequested) {
     return;
   }
+
+  // brick://5bac5564 Layer B belt (grandfather legacy, HoD Q4): if the pin to
+  // serve is Fable-family but its provenance says it was NOT explicitly requested,
+  // force the non-Fable default. Absent provenance = legacy ⇒ NOT forced (a
+  // deliberate legacy Fable pin is indistinguishable → left alone). Post the
+  // resolution-tier guard this rarely fires; it defends a Fable pin that slipped
+  // through with a non-explicit provenance.
+  const guarded = guardServedModel({
+    requestedModel: rawRequested,
+    modelSource: params.record.acpx?.session_options?.model_source,
+    availableModels: params.record.acpx?.available_models,
+  });
+  const requestedModel = guarded.model ?? rawRequested;
 
   const models = advertisedModelsForRecord(params.record);
   assertRequestedModelSupported({
@@ -703,7 +720,19 @@ async function applyPromptModelIfAdvertised(params: {
   if (!models) {
     return;
   }
-  if (params.record.acpx?.current_model_id === requestedModel) {
+  // brick://5bac5564 Layer A (M2): the record's current_model_id is
+  // adapter-live-synced by connectAndLoadSession right before this call, so the
+  // equality skip is normally an adapter-live compare. Force-apply anyway when the
+  // belt rewrote the model, OR (defensive) when a cold adapter is advertising a
+  // Fable current while this session is pinned non-Fable — never let a cold
+  // config-default Fable be served for a non-Fable pin.
+  const coldFableMismatch =
+    isFableModel(params.record.acpx?.current_model_id) && !isFableModel(requestedModel);
+  const skip =
+    !guarded.forced &&
+    !coldFableMismatch &&
+    params.record.acpx?.current_model_id === requestedModel;
+  if (skip) {
     setDesiredModelId(params.record, requestedModel);
     return;
   }
@@ -714,6 +743,19 @@ async function applyPromptModelIfAdvertised(params: {
   );
   setDesiredModelId(params.record, requestedModel);
   setCurrentModelId(params.record, requestedModel);
+  if (guarded.forced && guarded.blocked) {
+    setDesiredModelSource(params.record, "guard-forced");
+    stampModelGuardBreadcrumb(params.record, {
+      blocked: guarded.blocked,
+      forcedTo: requestedModel,
+      source: "apply-belt",
+    });
+    if (params.verbose) {
+      process.stderr.write(
+        `[acpx] model-guard session=${params.record.acpxRecordId} apply-belt blocked implicit Fable "${guarded.blocked}" → forced ${requestedModel}\n`,
+      );
+    }
+  }
 }
 
 function jsonRpcIdKey(value: unknown): string | undefined {
@@ -2417,6 +2459,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
           sessionId: activeSessionId,
           requestedModel: sessionOptions?.model,
           record,
+          verbose: options.verbose,
           timeoutMs: options.timeoutMs,
         });
         acpxState = cloneSessionAcpxState(record.acpx);

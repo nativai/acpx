@@ -2,6 +2,7 @@ import type { AcpClient, SessionCreateResult } from "../acp/client.js";
 import { assertRequestedModelSupported } from "../acp/model-support.js";
 import { withTimeout } from "../async-control.js";
 import type { SessionRecord } from "../types.js";
+import { guardServedModel } from "./model-guard.js";
 
 export async function applyRequestedModelIfAdvertised(params: {
   client: AcpClient;
@@ -10,12 +11,22 @@ export async function applyRequestedModelIfAdvertised(params: {
   models: SessionCreateResult["models"];
   agentCommand?: string;
   timeoutMs?: number;
+  /** brick://5bac5564 Layer B belt: the pin's provenance. When present and
+   *  non-explicit, a Fable pin is force-redirected to the non-Fable default;
+   *  absent (legacy / caller opted out) grandfathers it (HoD Q4). */
+  modelSource?: string;
 }): Promise<boolean> {
-  const requestedModel =
+  const rawRequested =
     typeof params.requestedModel === "string" ? params.requestedModel.trim() : "";
-  if (!requestedModel) {
+  if (!rawRequested) {
     return false;
   }
+  const guarded = guardServedModel({
+    requestedModel: rawRequested,
+    modelSource: params.modelSource,
+    availableModels: params.models?.availableModels.map((model) => model.modelId),
+  });
+  const requestedModel = guarded.model ?? rawRequested;
   assertRequestedModelSupported({
     requestedModel,
     models: params.models,
@@ -25,7 +36,7 @@ export async function applyRequestedModelIfAdvertised(params: {
   if (!params.models) {
     return false;
   }
-  if (params.models.currentModelId === requestedModel) {
+  if (!guarded.forced && params.models.currentModelId === requestedModel) {
     return true;
   }
 
