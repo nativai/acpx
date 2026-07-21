@@ -266,6 +266,16 @@ export function sessionOptionsFromRecord(record: SessionRecord): SessionAgentOpt
 
 type PersistedSessionOptions = NonNullable<NonNullable<SessionRecord["acpx"]>["session_options"]>;
 
+function assignBoolPersistedOption(
+  target: PersistedSessionOptions,
+  key: "auto_failover" | "floor_hard" | "auto_subscription" | "fable_degrade_ok",
+  value: unknown,
+): void {
+  if (typeof value === "boolean") {
+    target[key] = value;
+  }
+}
+
 function persistedSessionOptions(
   options: SessionAgentOptions,
 ): PersistedSessionOptions | undefined {
@@ -278,18 +288,10 @@ function persistedSessionOptions(
     profile: nonEmptyString(options.profile),
     effort: nonEmptyString(options.reasoningEffort),
   };
-  if (typeof options.autoFailover === "boolean") {
-    next.auto_failover = options.autoFailover;
-  }
-  if (typeof options.floorHard === "boolean") {
-    next.floor_hard = options.floorHard;
-  }
-  if (typeof options.autoSubscription === "boolean") {
-    next.auto_subscription = options.autoSubscription;
-  }
-  if (typeof options.fableDegradeOk === "boolean") {
-    next.fable_degrade_ok = options.fableDegradeOk;
-  }
+  assignBoolPersistedOption(next, "auto_failover", options.autoFailover);
+  assignBoolPersistedOption(next, "floor_hard", options.floorHard);
+  assignBoolPersistedOption(next, "auto_subscription", options.autoSubscription);
+  assignBoolPersistedOption(next, "fable_degrade_ok", options.fableDegradeOk);
   // model_source is subordinate to `model` (always co-persisted with it, never
   // alone) — so it is NOT a PERSISTED_CONTENT_KEY: it must not keep an otherwise
   // empty session_options block alive on its own.

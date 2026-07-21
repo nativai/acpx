@@ -128,15 +128,25 @@ function optionalFiniteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+const INDEX_SUBSCRIPTION_SWITCH_REASONS = new Set<string>([
+  "manual",
+  "failover",
+  "locked",
+  "selection",
+]);
+
+function isIndexSubscriptionSwitchReason(
+  value: unknown,
+): value is SessionIndexSubscriptionSwitch["reason"] {
+  return typeof value === "string" && INDEX_SUBSCRIPTION_SWITCH_REASONS.has(value);
+}
+
 function parseIndexSubscriptionSwitch(value: unknown): SessionIndexSubscriptionSwitch | undefined {
   const record = asRecord(value);
   if (
     !record ||
     typeof record.to !== "string" ||
-    (record.reason !== "manual" &&
-      record.reason !== "failover" &&
-      record.reason !== "locked" &&
-      record.reason !== "selection") ||
+    !isIndexSubscriptionSwitchReason(record.reason) ||
     typeof record.at !== "string"
   ) {
     return undefined;

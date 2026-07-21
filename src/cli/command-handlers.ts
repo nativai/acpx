@@ -1483,6 +1483,49 @@ export async function handleSetModel(
   printSetModelResultByFormat(modelId, result, globalFlags.format);
 }
 
+// Dispatch table for config keys that are handled outside the generic ACP config-option
+// path. Returns true if the key was handled. Extracted to keep handleSetConfigOption
+// under the lint complexity budget.
+async function tryHandleSpecialConfigKey(
+  configId: string,
+  explicitAgentName: string | undefined,
+  value: string,
+  flags: StatusFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<boolean> {
+  if (configId === "model") {
+    await handleSetModel(explicitAgentName, value, flags, command, config);
+    return true;
+  }
+  // `set subscription <id>` is a record edit (CLAUDE_CONFIG_DIR), not an ACP
+  // config option — route it like `model` above. acpx-ui shells exactly this.
+  if (configId === "subscription") {
+    await handleSetSubscription(explicitAgentName, value, flags, command, config);
+    return true;
+  }
+  // `set profile <id>` is the unified credential-move verb (SDK sub1↔sub2 AND
+  // claude-pty bridge1↔bridge2) — a record edit + transcript port, not an ACP
+  // config option. acpx-ui shells exactly this for the bridge case.
+  if (configId === "profile") {
+    await handleSetProfile(explicitAgentName, value, flags, command, config);
+    return true;
+  }
+  if (isAutoFailoverConfigKey(configId)) {
+    await handleSetAutoFailover(explicitAgentName, value, flags, command, config);
+    return true;
+  }
+  if (isAutoSubscriptionConfigKey(configId)) {
+    await handleSetAutoSubscription(explicitAgentName, value, flags, command, config);
+    return true;
+  }
+  if (isFableDegradeConfigKey(configId)) {
+    await handleSetFableDegrade(explicitAgentName, value, flags, command, config);
+    return true;
+  }
+  return false;
+}
+
 export async function handleSetConfigOption(
   explicitAgentName: string | undefined,
   configId: string,
@@ -1491,37 +1534,11 @@ export async function handleSetConfigOption(
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
+  if (await tryHandleSpecialConfigKey(configId, explicitAgentName, value, flags, command, config)) {
+    return;
+  }
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  if (configId === "model") {
-    await handleSetModel(explicitAgentName, value, flags, command, config);
-    return;
-  }
-  // `set subscription <id>` is a record edit (CLAUDE_CONFIG_DIR), not an ACP
-  // config option — route it like `model` above. acpx-ui shells exactly this.
-  if (configId === "subscription") {
-    await handleSetSubscription(explicitAgentName, value, flags, command, config);
-    return;
-  }
-  // `set profile <id>` is the unified credential-move verb (SDK sub1↔sub2 AND
-  // claude-pty bridge1↔bridge2) — a record edit + transcript port, not an ACP
-  // config option. acpx-ui shells exactly this for the bridge case.
-  if (configId === "profile") {
-    await handleSetProfile(explicitAgentName, value, flags, command, config);
-    return;
-  }
-  if (isAutoFailoverConfigKey(configId)) {
-    await handleSetAutoFailover(explicitAgentName, value, flags, command, config);
-    return;
-  }
-  if (isAutoSubscriptionConfigKey(configId)) {
-    await handleSetAutoSubscription(explicitAgentName, value, flags, command, config);
-    return;
-  }
-  if (isFableDegradeConfigKey(configId)) {
-    await handleSetFableDegrade(explicitAgentName, value, flags, command, config);
-    return;
-  }
   const resolvedConfigId = resolveCompatibleConfigId(agent, configId);
   const { setSessionConfigOption } = await loadSessionModule();
   const selector = resolveSessionTargetSelector({ flags, command });

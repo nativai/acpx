@@ -994,7 +994,7 @@ async function selectSubscriptionBeforeTurnUnsafe(
   }
 
   const currentIndex = usages.findIndex((usage) => usage.id === current.id);
-  const currentUsage = currentIndex >= 0 ? usages[currentIndex] : undefined;
+  const currentUsage = usages[currentIndex]; // undefined when currentIndex is -1 (not found)
   const targetIndex = usages.findIndex((usage) => usage.id === target.id);
   if (
     !shouldSwitchToSelectionTarget({

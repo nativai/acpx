@@ -727,6 +727,17 @@ function cloneSessionOptions(
     subscription: options.subscription,
     profile: options.profile,
     effort: options.effort,
+    ...cloneSessionOptionPolicyFlags(options),
+    ...cloneSessionOptionBreadcrumbs(options),
+  };
+}
+
+// Clone the durable policy flags and provenance fields. Extracted so cloneSessionOptions
+// stays under the lint complexity budget as new policy flags are added.
+function cloneSessionOptionPolicyFlags(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+): Partial<NonNullable<SessionAcpxState["session_options"]>> {
+  return {
     ...(options.auto_failover !== undefined ? { auto_failover: options.auto_failover } : {}),
     // brick://07dd62c9: floor_hard is a durable policy — it MUST survive the clone
     // (applyConfigOptionsToRecord → cloneSessionAcpxState → here on EVERY turn +
@@ -749,7 +760,6 @@ function cloneSessionOptions(
     ...(options.system_prompt !== undefined
       ? { system_prompt: cloneSystemPromptOption(options.system_prompt) }
       : {}),
-    ...cloneSessionOptionBreadcrumbs(options),
   };
 }
 
