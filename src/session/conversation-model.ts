@@ -733,6 +733,10 @@ function cloneSessionOptions(
     // sessions-new). Conditional spread mirrors auto_failover so an absent flag
     // never becomes an `undefined` own-key (TE Finding #2 discipline).
     ...(options.floor_hard !== undefined ? { floor_hard: options.floor_hard } : {}),
+    // brick://5bac5564 Layer C: model_source is a durable flat-string pin
+    // provenance — conditional-spread (mirror floor_hard) so it survives EVERY
+    // turn's clone and an absent value never becomes an `undefined` own-key.
+    ...(options.model_source !== undefined ? { model_source: options.model_source } : {}),
     ...(options.system_prompt !== undefined
       ? { system_prompt: cloneSystemPromptOption(options.system_prompt) }
       : {}),
@@ -755,6 +759,9 @@ function cloneSessionOptionBreadcrumbs(
     ...(options.provisioning_warning !== undefined
       ? { provisioning_warning: { ...options.provisioning_warning } }
       : {}),
+    // brick://5bac5564 Layer B: the model_guard breadcrumb rides the clone like
+    // the other breadcrumb objects so it survives every turn's applyConfig clone.
+    ...(options.model_guard !== undefined ? { model_guard: { ...options.model_guard } } : {}),
   };
 }
 

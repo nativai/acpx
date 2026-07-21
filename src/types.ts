@@ -537,6 +537,34 @@ export type SessionAcpxState = {
      */
     floor_hard?: boolean;
     /**
+     * Provenance of `session_options.model` — how the pin was chosen
+     * (brick://5bac5564 Layer C). A single FLAT STRING (one of the `ModelSource`
+     * values: explicit | inherited | default | failover | guard-forced); a nested
+     * value would fail the whole record load (brick://d4f7d808). Load-bearing for
+     * CORRECTNESS, not just audit: the `ensureSession` reuse branch consults it to
+     * avoid clobbering an explicit pin on a flagless re-ensure, and the apply-tier
+     * guard uses it to distinguish an explicit Fable (keep) from an implicit one
+     * (force) once the resolution context is gone. Threaded through EVERY
+     * session_options transform leg (parse/clone/merge/carry-forward) or it
+     * silently drops (brick://07dd62c9).
+     */
+    model_source?: string;
+    /**
+     * Loud breadcrumb recorded when the invariant guard rewrote an IMPLICIT
+     * Fable resolution to the non-Fable default (brick://5bac5564 Layer B).
+     * Validated + round-tripped exactly like `subscription_switch`. Absent unless
+     * the guard actually fired.
+     */
+    model_guard?: {
+      /** The implicit Fable value that was blocked (e.g. "fable"). */
+      blocked: string;
+      /** The non-Fable model forced in (e.g. "opus"). */
+      forced_to: string;
+      /** The pre-guard provenance that would have produced Fable. */
+      source: string;
+      at: string;
+    };
+    /**
      * Breadcrumb recorded when a session's subscription is changed in place
      * (manual switch or auto-failover). Drives the acpx-ui badge/notice and
      * survives restart. `from` is '' / undefined when the prior selection was

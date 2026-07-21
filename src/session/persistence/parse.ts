@@ -480,6 +480,8 @@ function assignParsedSessionOptions(state: SessionAcpxState, raw: unknown): void
   assignSessionOptionEffort(parsedSessionOptions, sessionOptions.effort);
   assignSessionOptionAutoFailover(parsedSessionOptions, sessionOptions.auto_failover);
   assignSessionOptionFloorHard(parsedSessionOptions, sessionOptions.floor_hard);
+  assignSessionOptionModelSource(parsedSessionOptions, sessionOptions.model_source);
+  assignSessionOptionModelGuard(parsedSessionOptions, sessionOptions.model_guard);
   assignSessionOptionSubscriptionSwitch(parsedSessionOptions, sessionOptions.subscription_switch);
   assignSessionOptionAccountSwitch(parsedSessionOptions, sessionOptions.account_switch);
   assignSessionOptionProvisioningWarning(parsedSessionOptions, sessionOptions.provisioning_warning);
@@ -689,6 +691,46 @@ function assignSessionOptionFloorHard(
   if (typeof value === "boolean") {
     options.floor_hard = value;
   }
+}
+
+// brick://5bac5564 Layer C: model_source is a durable flat-string provenance —
+// it MUST round-trip on a cold disk reload (mirror floor_hard), or the reuse
+// branch's clobber-guard and the apply-tier Fable guard lose the explicit-vs-
+// implicit distinction after a respawn.
+function assignSessionOptionModelSource(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+  value: unknown,
+): void {
+  if (typeof value === "string" && value.length > 0) {
+    options.model_source = value;
+  }
+}
+
+function isValidModelGuard(
+  record: Record<string, unknown>,
+): record is { blocked: string; forced_to: string; source: string; at: string } {
+  return (
+    nonEmptyStringValue(record.blocked) &&
+    nonEmptyStringValue(record.forced_to) &&
+    nonEmptyStringValue(record.source) &&
+    nonEmptyStringValue(record.at)
+  );
+}
+
+function assignSessionOptionModelGuard(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+  value: unknown,
+): void {
+  const record = asRecord(value);
+  if (!record || !isValidModelGuard(record)) {
+    return;
+  }
+  options.model_guard = {
+    blocked: record.blocked,
+    forced_to: record.forced_to,
+    source: record.source,
+    at: record.at,
+  };
 }
 
 function assignSessionOptionAllowedTools(

@@ -29,6 +29,11 @@ export type SessionAgentOptions = {
   // work. Durable like autoFailover — carried forward across owner respawns by
   // carryForwardPinnedFloor.
   floorHard?: boolean;
+  // Provenance of `model` (brick://5bac5564 Layer C) — one of the ModelSource
+  // flat-string values. Persisted as `session_options.model_source`; carried
+  // forward paired with `model` so the explicit-vs-implicit distinction survives
+  // owner respawns (load-bearing for the reuse-branch clobber-guard).
+  modelSource?: string;
 };
 
 export function mergeSessionOptions(
@@ -46,6 +51,7 @@ export function mergeSessionOptions(
     assignDefinedOption(merged, "reasoningEffort", preferred.reasoningEffort);
     assignDefinedOption(merged, "autoFailover", preferred.autoFailover);
     assignDefinedOption(merged, "floorHard", preferred.floorHard);
+    assignDefinedOption(merged, "modelSource", preferred.modelSource);
   }
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
@@ -94,9 +100,11 @@ type SessionOptionBreadcrumbs = {
   subscriptionSwitch: PersistedSessionOptions["subscription_switch"];
   accountSwitch: PersistedSessionOptions["account_switch"];
   provisioningWarning: PersistedSessionOptions["provisioning_warning"];
+  modelGuard: PersistedSessionOptions["model_guard"];
   autoFailover: PersistedSessionOptions["auto_failover"];
   floorHard: PersistedSessionOptions["floor_hard"];
   model: PersistedSessionOptions["model"];
+  modelSource: PersistedSessionOptions["model_source"];
   effort: PersistedSessionOptions["effort"];
 };
 
@@ -106,9 +114,11 @@ function sessionOptionBreadcrumbs(record: SessionRecord): SessionOptionBreadcrum
     subscriptionSwitch: stored.subscription_switch,
     accountSwitch: stored.account_switch,
     provisioningWarning: stored.provisioning_warning,
+    modelGuard: stored.model_guard,
     autoFailover: stored.auto_failover,
     floorHard: stored.floor_hard,
     model: stored.model,
+    modelSource: stored.model_source,
     effort: stored.effort,
   };
 }
@@ -144,6 +154,11 @@ function assignBreadcrumbs(
   if (breadcrumbs.provisioningWarning !== undefined) {
     target.provisioning_warning = breadcrumbs.provisioningWarning;
   }
+  // model_guard is a pure record-only breadcrumb (like subscription_switch) — carry
+  // it forward so the "implicit Fable blocked" signal stays visible across respawns.
+  if (breadcrumbs.modelGuard !== undefined) {
+    target.model_guard = breadcrumbs.modelGuard;
+  }
   carryDurableIfUnset(target, breadcrumbs);
 }
 
@@ -161,6 +176,10 @@ function carryDurableIfUnset(
   carryIfUnset(target, "auto_failover", breadcrumbs.autoFailover);
   carryIfUnset(target, "floor_hard", breadcrumbs.floorHard);
   carryIfUnset(target, "model", breadcrumbs.model);
+  // model_source rides forward paired with `model` (brick://5bac5564 Layer C): a
+  // respawn that carries the stored pin must carry its provenance too, or the
+  // reuse-branch clobber-guard/apply-guard lose the explicit-vs-implicit signal.
+  carryIfUnset(target, "model_source", breadcrumbs.modelSource);
   carryIfUnset(target, "effort", breadcrumbs.effort);
 }
 
@@ -208,6 +227,7 @@ export function sessionOptionsFromRecord(record: SessionRecord): SessionAgentOpt
   assignStoredOption(sessionOptions, "reasoningEffort", nonEmptyString(stored.effort));
   assignStoredOption(sessionOptions, "autoFailover", storedBoolean(stored.auto_failover));
   assignStoredOption(sessionOptions, "floorHard", storedBoolean(stored.floor_hard));
+  assignStoredOption(sessionOptions, "modelSource", nonEmptyString(stored.model_source));
 
   return Object.keys(sessionOptions).length > 0 ? sessionOptions : undefined;
 }
@@ -231,6 +251,13 @@ function persistedSessionOptions(
   }
   if (typeof options.floorHard === "boolean") {
     next.floor_hard = options.floorHard;
+  }
+  // model_source is subordinate to `model` (always co-persisted with it, never
+  // alone) — so it is NOT a PERSISTED_CONTENT_KEY: it must not keep an otherwise
+  // empty session_options block alive on its own.
+  const modelSource = nonEmptyString(options.modelSource);
+  if (modelSource !== undefined) {
+    next.model_source = modelSource;
   }
   return hasPersistedSessionOptions(next) ? next : undefined;
 }

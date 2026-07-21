@@ -160,6 +160,12 @@ function mergeLatestDurableSessionOptions(
   if (latest.model !== undefined) {
     merged.model = latest.model;
   }
+  // model_source rides the same durable overlay as `model` (brick://5bac5564
+  // Layer C): a disk-side model change (e.g. `set model`) carries its new
+  // provenance, so a stale in-flight turn snapshot must not resurrect the old one.
+  if (latest.model_source !== undefined) {
+    merged.model_source = latest.model_source;
+  }
   if (latest.effort !== undefined) {
     merged.effort = latest.effort;
   }
@@ -180,6 +186,7 @@ function hasLatestDurableSessionOptions(
 ): boolean {
   return (
     latest.model !== undefined ||
+    latest.model_source !== undefined ||
     latest.effort !== undefined ||
     latest.auto_failover !== undefined ||
     latest.floor_hard !== undefined
