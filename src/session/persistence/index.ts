@@ -80,6 +80,14 @@ export type SessionIndexEntry = {
   promptImageSupported?: boolean;
   desiredEffort?: string;
   autoFailover?: boolean;
+  // brick://4d517be2 — projected so acpx-ui's hot-path (record-skipping) session
+  // rebuild surfaces the two new policy toggles + the degrade marker in the chat
+  // header without a per-record read (mirrors autoFailover). `degradedFrom` is the
+  // pre-degrade Fable id, projected only while model_source==='explicit-degrade'.
+  autoSubscription?: boolean;
+  fableDegradeOk?: boolean;
+  modelSource?: string;
+  degradedFrom?: string;
   subscription?: string;
   profile?: string;
   subscriptionSwitch?: SessionIndexSubscriptionSwitch;
@@ -265,6 +273,10 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     promptImageSupported: optionalBoolean(record.promptImageSupported),
     desiredEffort: optionalString(record.desiredEffort),
     autoFailover: optionalBoolean(record.autoFailover),
+    autoSubscription: optionalBoolean(record.autoSubscription),
+    fableDegradeOk: optionalBoolean(record.fableDegradeOk),
+    modelSource: optionalString(record.modelSource),
+    degradedFrom: optionalString(record.degradedFrom),
     subscription: optionalString(record.subscription),
     profile: optionalString(record.profile),
     subscriptionSwitch: parseIndexSubscriptionSwitch(record.subscriptionSwitch),
@@ -354,6 +366,13 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     promptImageSupported: promptImageSupportedFromRecord(record),
     desiredEffort: acpx?.desired_config_options?.effort,
     autoFailover: sessionOptions?.auto_failover,
+    autoSubscription: sessionOptions?.auto_subscription,
+    fableDegradeOk: sessionOptions?.fable_degrade_ok,
+    modelSource: sessionOptions?.model_source,
+    degradedFrom:
+      sessionOptions?.model_source === "explicit-degrade"
+        ? sessionOptions?.fable_degrade?.from
+        : undefined,
     subscription: sessionOptions?.subscription,
     profile: sessionOptions?.profile,
     subscriptionSwitch: sessionOptions?.subscription_switch,
