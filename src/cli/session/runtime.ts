@@ -39,6 +39,7 @@ import {
   unregisterAbsorbedDeliveries,
 } from "./absorbed-delivery-registry.js";
 export { InterruptedError, TimeoutError } from "../../async-control.js";
+import { isFableModel } from "../../config/subscription-usage.js";
 import { formatPerfMetric, measurePerf, startPerfTimer } from "../../perf-metrics.js";
 import { textPrompt } from "../../prompt-content.js";
 import { bindRecordToDefaultAccount } from "../../runtime/engine/default-account-binding.js";
@@ -83,10 +84,9 @@ import {
   setDesiredModelSource,
 } from "../../session/mode-preference.js";
 import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
-import { isFableModel } from "../../config/subscription-usage.js";
-import { guardServedModel, stampModelGuardBreadcrumb } from "../../session/model-guard.js";
 import { enforceModelFloorPostServe } from "../../session/model-floor-enforce.js";
 import { captureServedState } from "../../session/model-floor.js";
+import { guardServedModel, stampModelGuardBreadcrumb } from "../../session/model-guard.js";
 import {
   ownerOptionsToInput,
   persistSessionOwnerOptions,
@@ -684,6 +684,53 @@ function advertisedModelsForRecord(record: SessionRecord):
   };
 }
 
+// brick://5bac5564 Layer B belt (grandfather legacy, HoD Q4): if the pin to serve
+// is Fable-family but its provenance says it was NOT explicitly requested, force
+// the non-Fable default. Absent provenance = legacy ⇒ NOT forced (a deliberate
+// legacy Fable pin is indistinguishable → left alone). Post the resolution-tier
+// guard this rarely fires; it defends a Fable pin that slipped through non-explicit.
+function resolveGuardedApplyModel(
+  record: SessionRecord,
+  rawRequested: string,
+): { model: string; forced: boolean; blocked?: string } {
+  const guarded = guardServedModel({
+    requestedModel: rawRequested,
+    modelSource: record.acpx?.session_options?.model_source,
+    availableModels: record.acpx?.available_models,
+  });
+  return { model: guarded.model ?? rawRequested, forced: guarded.forced, blocked: guarded.blocked };
+}
+
+// brick://5bac5564 Layer A (M2): current_model_id is adapter-live-synced by
+// connectAndLoadSession right before the apply, so the equality skip is normally an
+// adapter-live compare. Force-apply (do NOT skip) when the belt rewrote the model,
+// or (defensive) when a cold adapter advertises a Fable current under a non-Fable
+// pin — never serve a cold config-default Fable for a non-Fable pin.
+function shouldSkipModelApply(
+  record: SessionRecord,
+  requestedModel: string,
+  forced: boolean,
+): boolean {
+  const coldFableMismatch =
+    isFableModel(record.acpx?.current_model_id) && !isFableModel(requestedModel);
+  return !forced && !coldFableMismatch && record.acpx?.current_model_id === requestedModel;
+}
+
+function recordApplyBeltGuardForced(
+  record: SessionRecord,
+  blocked: string,
+  forcedTo: string,
+  verbose: boolean | undefined,
+): void {
+  setDesiredModelSource(record, "guard-forced");
+  stampModelGuardBreadcrumb(record, { blocked, forcedTo, source: "apply-belt" });
+  if (verbose) {
+    process.stderr.write(
+      `[acpx] model-guard session=${record.acpxRecordId} apply-belt blocked implicit Fable "${blocked}" → forced ${forcedTo}\n`,
+    );
+  }
+}
+
 async function applyPromptModelIfAdvertised(params: {
   client: AcpClient;
   sessionId: string;
@@ -696,19 +743,8 @@ async function applyPromptModelIfAdvertised(params: {
   if (!rawRequested) {
     return;
   }
-
-  // brick://5bac5564 Layer B belt (grandfather legacy, HoD Q4): if the pin to
-  // serve is Fable-family but its provenance says it was NOT explicitly requested,
-  // force the non-Fable default. Absent provenance = legacy ⇒ NOT forced (a
-  // deliberate legacy Fable pin is indistinguishable → left alone). Post the
-  // resolution-tier guard this rarely fires; it defends a Fable pin that slipped
-  // through with a non-explicit provenance.
-  const guarded = guardServedModel({
-    requestedModel: rawRequested,
-    modelSource: params.record.acpx?.session_options?.model_source,
-    availableModels: params.record.acpx?.available_models,
-  });
-  const requestedModel = guarded.model ?? rawRequested;
+  const guarded = resolveGuardedApplyModel(params.record, rawRequested);
+  const requestedModel = guarded.model;
 
   const models = advertisedModelsForRecord(params.record);
   assertRequestedModelSupported({
@@ -720,19 +756,7 @@ async function applyPromptModelIfAdvertised(params: {
   if (!models) {
     return;
   }
-  // brick://5bac5564 Layer A (M2): the record's current_model_id is
-  // adapter-live-synced by connectAndLoadSession right before this call, so the
-  // equality skip is normally an adapter-live compare. Force-apply anyway when the
-  // belt rewrote the model, OR (defensive) when a cold adapter is advertising a
-  // Fable current while this session is pinned non-Fable — never let a cold
-  // config-default Fable be served for a non-Fable pin.
-  const coldFableMismatch =
-    isFableModel(params.record.acpx?.current_model_id) && !isFableModel(requestedModel);
-  const skip =
-    !guarded.forced &&
-    !coldFableMismatch &&
-    params.record.acpx?.current_model_id === requestedModel;
-  if (skip) {
+  if (shouldSkipModelApply(params.record, requestedModel, guarded.forced)) {
     setDesiredModelId(params.record, requestedModel);
     return;
   }
@@ -744,17 +768,7 @@ async function applyPromptModelIfAdvertised(params: {
   setDesiredModelId(params.record, requestedModel);
   setCurrentModelId(params.record, requestedModel);
   if (guarded.forced && guarded.blocked) {
-    setDesiredModelSource(params.record, "guard-forced");
-    stampModelGuardBreadcrumb(params.record, {
-      blocked: guarded.blocked,
-      forcedTo: requestedModel,
-      source: "apply-belt",
-    });
-    if (params.verbose) {
-      process.stderr.write(
-        `[acpx] model-guard session=${params.record.acpxRecordId} apply-belt blocked implicit Fable "${guarded.blocked}" → forced ${requestedModel}\n`,
-      );
-    }
+    recordApplyBeltGuardForced(params.record, guarded.blocked, requestedModel, params.verbose);
   }
 }
 

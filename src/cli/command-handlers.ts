@@ -43,6 +43,7 @@ import { sessionOptionsFromRecord } from "../runtime/engine/session-options.js";
 import { exportSession } from "../session/export.js";
 import { importSession } from "../session/import.js";
 import { getDesiredConfigOptions } from "../session/mode-preference.js";
+import { guardImplicitFable, resolveSpawnModelSource } from "../session/model-guard.js";
 import {
   findGitRepositoryRoot,
   findSession,
@@ -117,7 +118,6 @@ import {
   withInheritedTaskFolder,
 } from "./session/inherited-metadata.js";
 import { mergeSessionMetadata, validateSessionMetadataValue } from "./session/session-metadata.js";
-import { guardImplicitFable, resolveSpawnModelSource } from "../session/model-guard.js";
 
 class NoSessionError extends Error {
   constructor(message: string) {
@@ -799,34 +799,41 @@ function applyCopyModelOverrides(
 // (assertCopyAgentLock), so no cross-agent gating is needed. When neither the
 // flag nor the source sets a field it is omitted → falls to the box default, and
 // with no explicit flag the result is byte-identical to `sourceSessionOptions`.
-function copySessionOptionsWithOverride(
-  source: SessionRecord,
+// brick://5bac5564 R2: a copy/fork inherits the SOURCE record's model. Guard it the
+// same way as a spawn — an implicit Fable copied from a Fable source is forced to the
+// non-Fable default; an explicit `--model fable` is preserved. Then stamp provenance.
+function applyGuardedCopyModel(
+  merged: NonNullable<ReturnType<typeof sourceSessionOptions>>,
   globalFlags: GlobalFlags,
-): ReturnType<typeof sourceSessionOptions> {
-  const base = sourceSessionOptions(source);
-  // brick://5bac5564 R2: a copy/fork inherits the SOURCE record's model. Guard it
-  // the same way as a spawn — an implicit Fable copied from a Fable source is
-  // forced to the non-Fable default; an explicit `--model fable` is preserved.
+  baseModel: string | undefined,
+): void {
   const explicitModel = globalFlags.model;
-  const resolvedModel = withInheritedModel(explicitModel, base?.model);
   const guarded = guardImplicitFable({
-    resolvedModel,
+    resolvedModel: withInheritedModel(explicitModel, baseModel),
     explicitModel,
-    source: resolveSpawnModelSource(explicitModel, base?.model),
+    source: resolveSpawnModelSource(explicitModel, baseModel),
   });
-  const reasoningEffort = withInheritedReasoningEffort(
-    globalFlags.reasoningEffort,
-    base?.reasoningEffort,
+  applyCopyModelOverrides(
+    merged,
+    guarded.model,
+    withInheritedReasoningEffort(globalFlags.reasoningEffort, merged.reasoningEffort),
   );
-  const merged = { ...base };
-  applyCopyCredentialOverride(merged, globalFlags, base?.profile ?? base?.subscription);
-  applyCopyModelOverrides(merged, guarded.model, reasoningEffort);
   if (guarded.model !== undefined) {
     merged.modelSource = guarded.source;
     if (guarded.forced) {
       merged.modelGuardBlocked = guarded.blocked;
     }
   }
+}
+
+function copySessionOptionsWithOverride(
+  source: SessionRecord,
+  globalFlags: GlobalFlags,
+): ReturnType<typeof sourceSessionOptions> {
+  const base = sourceSessionOptions(source);
+  const merged = { ...base };
+  applyCopyCredentialOverride(merged, globalFlags, base?.profile ?? base?.subscription);
+  applyGuardedCopyModel(merged, globalFlags, base?.model);
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 

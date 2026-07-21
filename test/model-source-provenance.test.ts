@@ -94,10 +94,17 @@ test("the model_guard breadcrumb survives parse → clone and rides carry-forwar
     session_options: {
       model: "opus",
       model_source: "guard-forced",
-      model_guard: { blocked: "fable", forced_to: "opus", source: "inherited", at: "2026-07-21T00:00:00Z" },
+      model_guard: {
+        blocked: "fable",
+        forced_to: "opus",
+        source: "inherited",
+        at: "2026-07-21T00:00:00Z",
+      },
     },
   };
-  const parsed = parseSessionRecord(serializeSessionRecordForDisk(recordWithProvenance(guardState)));
+  const parsed = parseSessionRecord(
+    serializeSessionRecordForDisk(recordWithProvenance(guardState)),
+  );
   assert.ok(parsed);
   assert.deepEqual(parsed.acpx?.session_options?.model_guard, {
     blocked: "fable",

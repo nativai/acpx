@@ -189,6 +189,27 @@ async function replayDesiredMode(params: {
   }
 }
 
+// brick://5bac5564 Layer B belt (grandfather legacy): a replay of an IMPLICIT Fable
+// desired pin is force-redirected to the non-Fable default (+ provenance/breadcrumb);
+// absent provenance (legacy) is left alone. Post the resolution-tier guard this is a
+// near-noop safety net for a Fable pin that slipped through non-explicit.
+function guardReplayDesiredModel(record: SessionRecord, desiredModelId: string): string {
+  const guarded = guardServedModel({
+    requestedModel: desiredModelId,
+    modelSource: record.acpx?.session_options?.model_source,
+    availableModels: record.acpx?.available_models,
+  });
+  if (guarded.forced && guarded.blocked) {
+    setDesiredModelSource(record, "guard-forced");
+    stampModelGuardBreadcrumb(record, {
+      blocked: guarded.blocked,
+      forcedTo: guarded.model ?? desiredModelId,
+      source: "reconnect-belt",
+    });
+  }
+  return guarded.model ?? desiredModelId;
+}
+
 async function replayDesiredModel(params: {
   client: AcpClient;
   sessionId: string;
@@ -203,16 +224,7 @@ async function replayDesiredModel(params: {
     return false;
   }
 
-  // brick://5bac5564 Layer B belt (grandfather legacy): a replay of an IMPLICIT
-  // Fable desired pin is force-redirected to the non-Fable default; absent
-  // provenance (legacy) is left alone. Post the resolution-tier guard this is a
-  // near-noop safety net for a Fable pin that slipped through non-explicit.
-  const guarded = guardServedModel({
-    requestedModel: params.desiredModelId,
-    modelSource: params.record.acpx?.session_options?.model_source,
-    availableModels: params.record.acpx?.available_models,
-  });
-  const desiredModelId = guarded.model ?? params.desiredModelId;
+  const desiredModelId = guardReplayDesiredModel(params.record, params.desiredModelId);
 
   try {
     assertRequestedModelSupported({
@@ -221,14 +233,6 @@ async function replayDesiredModel(params: {
       agentCommand: params.record.agentCommand,
       context: "replay",
     });
-    if (guarded.forced && guarded.blocked) {
-      setDesiredModelSource(params.record, "guard-forced");
-      stampModelGuardBreadcrumb(params.record, {
-        blocked: guarded.blocked,
-        forcedTo: desiredModelId,
-        source: "reconnect-belt",
-      });
-    }
     if (!params.models || params.models.currentModelId === desiredModelId) {
       return !!params.models;
     }

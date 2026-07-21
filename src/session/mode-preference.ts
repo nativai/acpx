@@ -157,12 +157,23 @@ function mergeLatestDurableSessionOptions(
   }
 
   const merged = { ...pending };
+  // Overlay each durable field from the latest disk state (brick://07dd62c9): a
+  // disk-side change (set model / policy toggle) during an in-flight turn must win
+  // over the stale turn snapshot. model_source rides alongside `model` so a
+  // provenance change carries too (brick://5bac5564 Layer C).
+  overlayDurableSessionOptionFields(merged, latest);
+  return hasSessionOptions(merged) ? merged : undefined;
+}
+
+type DurableSessionOptions = NonNullable<SessionAcpxState["session_options"]>;
+
+function overlayDurableSessionOptionFields(
+  merged: DurableSessionOptions,
+  latest: DurableSessionOptions,
+): void {
   if (latest.model !== undefined) {
     merged.model = latest.model;
   }
-  // model_source rides the same durable overlay as `model` (brick://5bac5564
-  // Layer C): a disk-side model change (e.g. `set model`) carries its new
-  // provenance, so a stale in-flight turn snapshot must not resurrect the old one.
   if (latest.model_source !== undefined) {
     merged.model_source = latest.model_source;
   }
@@ -172,13 +183,9 @@ function mergeLatestDurableSessionOptions(
   if (latest.auto_failover !== undefined) {
     merged.auto_failover = latest.auto_failover;
   }
-  // floor_hard rides the same durable overlay (brick://07dd62c9): a disk-side
-  // policy change during an in-flight turn must win over the stale turn snapshot,
-  // exactly like auto_failover. (The `{...pending}` base already preserves it.)
   if (latest.floor_hard !== undefined) {
     merged.floor_hard = latest.floor_hard;
   }
-  return hasSessionOptions(merged) ? merged : undefined;
 }
 
 function hasLatestDurableSessionOptions(
