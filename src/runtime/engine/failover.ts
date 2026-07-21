@@ -17,9 +17,11 @@ import {
   maxedThreshold,
   maxUtilization,
   pickFailoverTarget,
+  subscriptionRanksStrictlyBetter,
   type SubscriptionUsage,
 } from "../../config/subscription-usage.js";
 import {
+  isSubscriptionLocked,
   loadSubscriptionRegistry,
   type SubscriptionEntry,
   type SubscriptionLookupOptions,
@@ -32,6 +34,7 @@ import {
   ModelFloorUnmetError,
   SubscriptionLockedError,
 } from "../../errors.js";
+import { applyFableDegrade, fableDegradeOkForRecord } from "../../session/fable-degrade.js";
 import { floorHardEnabled, pinnedModelFloor, setFloorParked } from "../../session/model-floor.js";
 import { writeSessionRecord } from "../../session/persistence/repository.js";
 import type { SessionRecord } from "../../types.js";
@@ -292,6 +295,8 @@ function accountForEntry(
 // so BOTH the pre-loop throw and the mid-loop conversion are bypassed and the
 // normal path raises AllSubscriptionsExhaustedError (correct cause + remedy).
 async function fableRateLimitShortCircuit(params: {
+  record: SessionRecord;
+  sessionModel: string;
   tried: Set<string>;
   restoreOriginalSelection: () => Promise<void>;
   loadOpts?: SubscriptionLookupOptions;
@@ -309,6 +314,16 @@ async function fableRateLimitShortCircuit(params: {
   // normal loop so a real turn decides that sub (AC8), never a false terminal.
   const anyUnknown = usages.some((usage) => usage.fable?.error !== undefined);
   if (!anyAvailable && !anyUnknown) {
+    // brick://4d517be2 — every sub is cleanly fable-exhausted AND unified is
+    // healthy. If the session opted into fable→opus degrade, durably rewrite the
+    // model to Opus and let the normal failover loop pick a unified-healthy sibling
+    // and complete the turn on Opus (return isFableRateLimit:false so the fable
+    // seeding is skipped). Otherwise the behavior is byte-identical to before:
+    // restore the original selection and raise the loud terminal.
+    if (fableDegradeOkForRecord(params.record)) {
+      await applyFableDegrade(params.record, { from: params.sessionModel });
+      return { isFableRateLimit: false };
+    }
     await params.restoreOriginalSelection();
     throw new FableShareExhaustedError(statusSnapshot);
   }
@@ -350,6 +365,10 @@ async function prepareFableShortCircuit(params: {
     return { isFableRateLimit: false };
   }
   return await fableRateLimitShortCircuit({
+    record: params.record,
+    // Non-empty Fable string here (isFableModel is false for undefined/null); the
+    // `?? "fable"` is a defensive TS-narrowing default, never taken in practice.
+    sessionModel: sessionModel ?? "fable",
     tried: params.tried,
     restoreOriginalSelection: params.restoreOriginalSelection,
     loadOpts: params.loadOpts,
@@ -528,6 +547,42 @@ export function autoFailoverEnabledForRecord(record: SessionRecord): boolean {
   return record.acpx?.session_options?.auto_failover !== false;
 }
 
+// brick://4d517be2 — per-session autonomous-selection policy. Absent means enabled
+// (default-ON); only explicit false opts out. Mirrors autoFailoverEnabledForRecord.
+export function autoSubscriptionEnabledForRecord(record: SessionRecord): boolean {
+  return record.acpx?.session_options?.auto_subscription !== false;
+}
+
+// Global fleet-wide kill-switch for autonomous selection (belt-and-suspenders for a
+// fast rollback without touching sessions). Default ON; set falsy to disable. Mirrors
+// the ACPX_SUBSCRIPTION_MAXED_THRESHOLD env-parse discipline.
+function subscriptionAutoSelectEnabledGlobally(): boolean {
+  const raw = process.env.ACPX_SUBSCRIPTION_AUTO_SELECT?.trim().toLowerCase();
+  if (!raw) {
+    return true;
+  }
+  return raw !== "0" && raw !== "false" && raw !== "no" && raw !== "off";
+}
+
+// The proactive-selection thrash-guard cooldown (decision #3): the minimum dwell
+// before an OPTIMIZATION switch (rebalance toward a sooner-reset sub while the
+// current one is still healthy). Defaults to the 5-min probe-cache TTL so we never
+// re-optimize more often than the ranking can change. FORCED switches (current sub
+// <30% headroom / locked / errored) bypass this.
+const DEFAULT_SUBSCRIPTION_SELECT_COOLDOWN_MS = 300_000;
+
+function subscriptionSelectCooldownMs(): number {
+  const raw = process.env.ACPX_SUBSCRIPTION_SELECT_COOLDOWN_MS?.trim();
+  if (!raw) {
+    return DEFAULT_SUBSCRIPTION_SELECT_COOLDOWN_MS;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_SUBSCRIPTION_SELECT_COOLDOWN_MS;
+  }
+  return parsed;
+}
+
 export function isSubscriptionLockBlockError(
   error: unknown,
 ): error is SubscriptionLockedError | AllSubscriptionsLockedError {
@@ -563,10 +618,31 @@ function snapshotSelectionRestorer(record: SessionRecord): () => Promise<void> {
     if (!record.acpx) {
       return;
     }
-    if (originalOptions === undefined) {
+    // brick://4d517be2 — this restore undoes SELECTION (subscription/account) only,
+    // never a Fable→Opus degrade applied AFTER the snapshot was taken. The snapshot
+    // captured the pre-degrade Fable model; blindly restoring it would silently
+    // un-degrade a session that deliberately fell back to Opus (and leave the
+    // fable_degrade breadcrumb contradicting the model). Carry the live degrade
+    // (model/model_source + breadcrumb) forward. Gated on `explicit-degrade` so this
+    // is a strict no-op for every normal failover restore.
+    const live = record.acpx.session_options;
+    const degradeOverlay =
+      live?.model_source === "explicit-degrade"
+        ? {
+            model: live.model,
+            model_source: live.model_source,
+            ...(live.fable_degrade !== undefined
+              ? { fable_degrade: { ...live.fable_degrade } }
+              : {}),
+          }
+        : undefined;
+    if (originalOptions === undefined && degradeOverlay === undefined) {
       delete record.acpx.session_options;
     } else {
-      record.acpx.session_options = cloneSessionOptions(originalOptions);
+      record.acpx.session_options = {
+        ...cloneSessionOptions(originalOptions),
+        ...degradeOverlay,
+      };
     }
     await writeSessionRecord(record);
   };
@@ -842,6 +918,173 @@ export async function enforceSubscriptionLockBeforeTurn(
   await switchSessionAccount(record, picked.target.id, "locked", loadOpts);
   await writeSessionRecord(record);
   return { switchedTo: picked.target.id };
+}
+
+export type SubscriptionSelectionResult = {
+  switchedTo?: string;
+};
+
+// brick://4d517be2 — DEFAULT-ON autonomous subscription selection, a pre-turn
+// sibling of enforceSubscriptionLockBeforeTurn. Before every turn (both ingress
+// paths funnel here) auto-pick the best-headroom sub: ≥30% 5h headroom
+// (threshold 0.70) → soonest weekly reset. A thrash guard bounds turn-to-turn
+// switching (decision #3). NEVER-THROW / best-effort: any probe/registry/switch
+// failure is swallowed (keep the current sub) — a selection failure must never
+// block a turn (unlike the lock hook, which legitimately refuses).
+export async function selectSubscriptionBeforeTurn(
+  record: SessionRecord,
+  loadOpts?: SubscriptionLookupOptions,
+): Promise<SubscriptionSelectionResult> {
+  try {
+    return await selectSubscriptionBeforeTurnUnsafe(record, loadOpts);
+  } catch (error) {
+    // Best-effort: log and keep the current sub. Model on resolveAutoSubscription's
+    // "never throws — any failure degrades to the default" contract.
+    process.stderr.write(
+      `[acpx] proactive subscription selection skipped (best-effort): ${
+        error instanceof Error ? error.message : String(error)
+      }\n`,
+    );
+    return {};
+  }
+}
+
+// The no-op gates (decision #4): global kill-switch, per-session auto_subscription
+// opt-out, OR auto_failover:false (a session locked to its sub must not be
+// proactively moved either — this also makes "locked session" decision #7 fall out).
+function proactiveSelectionDisabled(record: SessionRecord): boolean {
+  return (
+    !subscriptionAutoSelectEnabledGlobally() ||
+    !autoSubscriptionEnabledForRecord(record) ||
+    !autoFailoverEnabledForRecord(record)
+  );
+}
+
+async function selectSubscriptionBeforeTurnUnsafe(
+  record: SessionRecord,
+  loadOpts?: SubscriptionLookupOptions,
+): Promise<SubscriptionSelectionResult> {
+  if (proactiveSelectionDisabled(record)) {
+    return {};
+  }
+  const current = currentProfile(record, loadOpts);
+  // Only subscription-auth sessions participate; non-subscription profiles have no
+  // headroom/reset probe to select on.
+  if (!current || current.authMode !== "subscription") {
+    return {};
+  }
+
+  const registry = loadSubscriptionRegistry(loadOpts);
+  const entries = registry.subscriptions;
+  if (entries.length === 0) {
+    return {};
+  }
+  // Account-propagated lock exclude (decision #7) — the correct primary, NOT the
+  // empty-exclude reactive-failover path. A locked sub is never picked as a target.
+  const exclude = new Set(
+    entries.filter((entry) => isSubscriptionLocked(entry, registry)).map((entry) => entry.id),
+  );
+  // Cached probe (≤5-min staleness tolerated for a best-effort optimization) →
+  // ≤1 probe-set / session / 5 min. Reactive failover uses forceRefresh; we do not.
+  const usages = await getSubscriptionsUsage(entries, false);
+
+  const target = pickSelectionTarget(usages, exclude);
+  if (!target || target.id === current.id) {
+    return {}; // already optimal / nothing eligible
+  }
+
+  const currentIndex = usages.findIndex((usage) => usage.id === current.id);
+  const currentUsage = currentIndex >= 0 ? usages[currentIndex] : undefined;
+  const targetIndex = usages.findIndex((usage) => usage.id === target.id);
+  if (
+    !shouldSwitchToSelectionTarget({
+      record,
+      target,
+      targetIndex,
+      currentUsage,
+      currentIndex,
+    })
+  ) {
+    return {};
+  }
+
+  await switchSessionAccount(record, target.id, "selection", loadOpts);
+  await writeSessionRecord(record);
+  return { switchedTo: target.id };
+}
+
+// The #2 fallback ladder: primary rule (≥30% 5h headroom → soonest reset), then the
+// least-maxed guard (0.98) when no sub clears 30%, then hold (undefined).
+function pickSelectionTarget(
+  usages: SubscriptionUsage[],
+  exclude: ReadonlySet<string>,
+): SubscriptionUsage | undefined {
+  const primary = pickFailoverTarget(usages, { exclude, threshold: 0.7 });
+  if (primary) {
+    return primary;
+  }
+  // Secondary: everyone's below 30% headroom — move off a maxed sub onto the
+  // least-maxed / soonest-reset one (strictly better than sitting maxed).
+  return pickFailoverTarget(usages, { exclude, threshold: maxedThreshold() });
+}
+
+// Thrash guard (decision #3): FORCED when the current sub is ineligible (locked /
+// errored / <30% headroom) — bypasses the cooldown; OPTIMIZATION when the current
+// sub is still healthy but the target ranks strictly better AND no auto-selection
+// switch happened within the cooldown.
+function shouldSwitchToSelectionTarget(params: {
+  record: SessionRecord;
+  target: SubscriptionUsage;
+  targetIndex: number;
+  currentUsage: SubscriptionUsage | undefined;
+  currentIndex: number;
+}): boolean {
+  const { currentUsage } = params;
+  // Current sub ineligible → FORCED switch (correctness floor; also covers a current
+  // sub missing from the probe set, i.e. no headroom evidence).
+  if (
+    !currentUsage ||
+    currentUsage.locked === true ||
+    currentUsage.error !== undefined ||
+    currentUsage.fiveHour === null ||
+    currentUsage.fiveHour.utilization >= 0.7
+  ) {
+    return true;
+  }
+  // Current sub still healthy → OPTIMIZATION, cooldown-gated + strictly-better only.
+  if (
+    !subscriptionRanksStrictlyBetter(
+      params.target,
+      currentUsage,
+      params.targetIndex,
+      params.currentIndex,
+    )
+  ) {
+    return false;
+  }
+  return !withinSelectionCooldown(params.record);
+}
+
+// Read the last auto-selection switch time from the switch breadcrumbs (reason
+// "selection") and test it against the cooldown. Absent / unparseable ⇒ not within
+// cooldown (allow the switch).
+function withinSelectionCooldown(record: SessionRecord): boolean {
+  const options = record.acpx?.session_options;
+  const candidates = [options?.subscription_switch, options?.account_switch].filter(
+    (breadcrumb): breadcrumb is NonNullable<typeof breadcrumb> =>
+      breadcrumb !== undefined && breadcrumb.reason === "selection",
+  );
+  let lastAt = Number.NEGATIVE_INFINITY;
+  for (const breadcrumb of candidates) {
+    const at = Date.parse(breadcrumb.at);
+    if (!Number.isNaN(at) && at > lastAt) {
+      lastAt = at;
+    }
+  }
+  if (lastAt === Number.NEGATIVE_INFINITY) {
+    return false;
+  }
+  return Date.now() - lastAt < subscriptionSelectCooldownMs();
 }
 
 // Pre-turn probe-gate for `--floor-hard` (brick://07dd62c9 §5b.a) — the

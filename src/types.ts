@@ -537,6 +537,21 @@ export type SessionAcpxState = {
      */
     floor_hard?: boolean;
     /**
+     * Per-session autonomous subscription-selection policy (brick://4d517be2).
+     * Absent means enabled (default-ON): before each turn acpx auto-picks the
+     * best-headroom subscription (≥30% 5h headroom → soonest weekly reset). Only
+     * explicit false opts out. Mirrors `auto_failover` exactly; durable per-session
+     * policy, carried forward across owner respawns.
+     */
+    auto_subscription?: boolean;
+    /**
+     * Per-session opt-in allowing a Fable session to degrade to Opus when no
+     * subscription has Fable available (brick://4d517be2). Absent/false = NOT
+     * allowed (the loud FableShareExhaustedError terminal is preserved). Only
+     * explicit true opts in. Mirrors `floor_hard` (default-false durable policy).
+     */
+    fable_degrade_ok?: boolean;
+    /**
      * Provenance of `session_options.model` — how the pin was chosen
      * (brick://5bac5564 Layer C). A single FLAT STRING (one of the `ModelSource`
      * values: explicit | inherited | default | failover | guard-forced); a nested
@@ -565,6 +580,20 @@ export type SessionAcpxState = {
       at: string;
     };
     /**
+     * Loud breadcrumb recorded when a Fable session was degraded to Opus because
+     * no subscription had Fable available and `fable_degrade_ok` was set
+     * (brick://4d517be2). Validated + round-tripped exactly like `model_guard`.
+     * `from` preserves the original Fable model id so a future auto-restore
+     * (v2) can flip back with no data migration. Absent unless a degrade fired.
+     */
+    fable_degrade?: {
+      /** The Fable model degraded away from (e.g. "claude-fable-5"). */
+      from: string;
+      /** The non-Fable model degraded to (e.g. "opus"). */
+      to: string;
+      at: string;
+    };
+    /**
      * Breadcrumb recorded when a session's subscription is changed in place
      * (manual switch or auto-failover). Drives the acpx-ui badge/notice and
      * survives restart. `from` is '' / undefined when the prior selection was
@@ -573,7 +602,7 @@ export type SessionAcpxState = {
     subscription_switch?: {
       from?: string;
       to: string;
-      reason: "manual" | "failover" | "locked";
+      reason: "manual" | "failover" | "locked" | "selection";
       at: string;
     };
     /**
@@ -593,7 +622,7 @@ export type SessionAcpxState = {
       effectiveAuthMode?: string;
       effectiveAnchor?: string;
       effectiveResolutionMethod?: "path" | "selection";
-      reason: "manual" | "failover" | "locked";
+      reason: "manual" | "failover" | "locked" | "selection";
       at: string;
     };
     /**

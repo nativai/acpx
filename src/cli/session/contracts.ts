@@ -295,4 +295,30 @@ export type SessionSetAutoFailoverResult = {
   autoFailover: boolean;
 };
 
+// brick://4d517be2 — the autonomous-selection disable knob.
+export type SessionSetAutoSubscriptionOptions = {
+  sessionId: string;
+  autoSubscription: boolean;
+  /** Used only for the turn-in-flight error message. */
+  sessionName?: string;
+};
+
+export type SessionSetAutoSubscriptionResult = {
+  record: SessionRecord;
+  autoSubscription: boolean;
+};
+
+// brick://4d517be2 — the fable→opus degrade opt-in.
+export type SessionSetFableDegradeOptions = {
+  sessionId: string;
+  fableDegradeOk: boolean;
+  /** Used only for the turn-in-flight error message. */
+  sessionName?: string;
+};
+
+export type SessionSetFableDegradeResult = {
+  record: SessionRecord;
+  fableDegradeOk: boolean;
+};
+
 export type { SessionAgentOptions };

@@ -172,6 +172,8 @@ function createStatusPayload(
     reasoningEffort: acpx.reasoningEffort,
     reasoningEffortLive: acpx.reasoningEffortLive,
     autoFailover: acpx.autoFailover,
+    autoSubscription: acpx.autoSubscription,
+    fableDegradeOk: acpx.fableDegradeOk,
     credential: statusCredential(record),
     uptime: running ? optionalStatusString(formatUptime(record.agentStartedAt)) : null,
     lastPromptTime: optionalStatusString(record.lastPromptAt),
@@ -235,6 +237,8 @@ function statusAcpxFields(record: SessionRecord): {
   reasoningEffort: string | null;
   reasoningEffortLive: string | null;
   autoFailover: boolean;
+  autoSubscription: boolean;
+  fableDegradeOk: boolean;
 } {
   const acpx = record.acpx;
   if (!acpx) {
@@ -245,6 +249,8 @@ function statusAcpxFields(record: SessionRecord): {
       reasoningEffort: null,
       reasoningEffortLive: null,
       autoFailover: true,
+      autoSubscription: true,
+      fableDegradeOk: false,
     };
   }
   return {
@@ -257,6 +263,8 @@ function statusAcpxFields(record: SessionRecord): {
     reasoningEffort: desiredEffort(acpx),
     reasoningEffortLive: liveEffortCurrentValue(acpx),
     autoFailover: autoFailoverStatus(acpx),
+    autoSubscription: autoSubscriptionStatus(acpx),
+    fableDegradeOk: fableDegradeStatus(acpx),
   };
 }
 
@@ -271,6 +279,16 @@ function liveEffortCurrentValue(acpx: NonNullable<SessionRecord["acpx"]>): strin
 
 function autoFailoverStatus(acpx: NonNullable<SessionRecord["acpx"]>): boolean {
   return acpx.session_options?.auto_failover !== false;
+}
+
+// brick://4d517be2 — autonomous selection: absent means ON (default). Degrade: absent
+// means OFF (opt-in).
+function autoSubscriptionStatus(acpx: NonNullable<SessionRecord["acpx"]>): boolean {
+  return acpx.session_options?.auto_subscription !== false;
+}
+
+function fableDegradeStatus(acpx: NonNullable<SessionRecord["acpx"]>): boolean {
+  return acpx.session_options?.fable_degrade_ok === true;
 }
 
 function statusPid(health: Awaited<ReturnType<typeof probeQueueOwnerHealth>>): number | null {
@@ -315,6 +333,8 @@ type StatusPayload = {
   reasoningEffort: string | null;
   reasoningEffortLive: string | null;
   autoFailover: boolean;
+  autoSubscription: boolean;
+  fableDegradeOk: boolean;
   credential: StatusCredentialPayload | null;
   uptime: string | null;
   lastPromptTime: string | null;
@@ -356,6 +376,8 @@ function statusJsonPayload(
   assignDefinedJsonField(result, "reasoningEffort", payload.reasoningEffort);
   assignDefinedJsonField(result, "reasoningEffortLive", payload.reasoningEffortLive);
   assignDefinedJsonField(result, "autoFailover", payload.autoFailover);
+  assignDefinedJsonField(result, "autoSubscription", payload.autoSubscription);
+  assignDefinedJsonField(result, "fableDegradeOk", payload.fableDegradeOk);
   assignDefinedJsonField(result, "credential", payload.credential);
   assignDefinedJsonField(result, "uptime", payload.uptime);
   assignDefinedJsonField(result, "lastPromptTime", payload.lastPromptTime);
@@ -398,6 +420,8 @@ function printTextStatus(payload: StatusPayload, dead: boolean): void {
   process.stdout.write(`reasoningEffort: ${orDash(payload.reasoningEffort)}\n`);
   process.stdout.write(`reasoningEffortLive: ${orDash(payload.reasoningEffortLive)}\n`);
   process.stdout.write(`autoFailover: ${payload.autoFailover ? "on" : "off"}\n`);
+  process.stdout.write(`autoSubscription: ${payload.autoSubscription ? "on" : "off"}\n`);
+  process.stdout.write(`fableDegradeOk: ${payload.fableDegradeOk ? "on" : "off"}\n`);
   process.stdout.write(
     `credentialLocked: ${
       payload.credential ? (payload.credential.locked ? "locked" : "unlocked") : "-"

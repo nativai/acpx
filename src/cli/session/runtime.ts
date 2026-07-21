@@ -33,6 +33,7 @@ import {
   failoverEnabled,
   failoverEnabledForRecord,
   isSubscriptionLockBlockError,
+  selectSubscriptionBeforeTurn,
 } from "../../runtime/engine/failover.js";
 import {
   registerAbsorbedDeliveries,
@@ -147,6 +148,10 @@ type RunSessionPromptOptions = Omit<
 > & {
   sessionRecordId: string;
   requestId?: string;
+  // brick://4d517be2: suppress proactive subscription selection on a failover-retry
+  // re-entry — the failover loop is already selecting reactively; a second proactive
+  // switch could fight its just-picked sibling. Set only on the retry runTurn closure.
+  skipProactiveSelection?: boolean;
   onClientAvailable?: (controller: ActiveSessionController) => void;
   onClientClosed?: () => void;
   onPromptActive?: () => Promise<void> | void;
@@ -1104,6 +1109,14 @@ async function applyQueuedTaskSubscriptionLockPolicy(
       options.onFailoverSwitched?.(outcome.switchedTo);
       return { useFreshClient: true };
     }
+    // brick://4d517be2: proactive selection runs after lock enforcement (skipped
+    // above when the lock hook already switched). Best-effort / never-throws; a
+    // switch means the next turn needs a fresh client to resolve the new dir.
+    const selection = await selectSubscriptionBeforeTurn(record);
+    if (selection.switchedTo) {
+      options.onFailoverSwitched?.(selection.switchedTo);
+      return { useFreshClient: true };
+    }
   } catch (error) {
     if (isSubscriptionLockBlockError(error)) {
       await persistTerminalTurnError(record, error).catch(() => {});
@@ -1228,6 +1241,9 @@ async function runQueuedTaskFailover(
         await runSessionPrompt({
           ...buildQueuedTaskRunOptions(sessionRecordId, task, options, outputFormatter),
           client: undefined,
+          // brick://4d517be2: the failover loop is already selecting reactively —
+          // suppress proactive selection on the retry so the two don't fight.
+          skipProactiveSelection: true,
         }),
     });
   } catch (failoverError) {
@@ -1258,7 +1274,14 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     await writeSessionRecord(record);
   }
   try {
-    await enforceSubscriptionLockBeforeTurn(record);
+    const lockOutcome = await enforceSubscriptionLockBeforeTurn(record);
+    // brick://4d517be2: DEFAULT-ON proactive subscription selection runs between the
+    // lock and floor hooks. Skipped when the lock hook already switched this turn
+    // (avoid double-porting the transcript) or on a failover-retry re-entry
+    // (skipProactiveSelection). Best-effort / never-throws.
+    if (!options.skipProactiveSelection && !lockOutcome.switchedTo) {
+      await selectSubscriptionBeforeTurn(record);
+    }
     // Pre-turn model-floor gate (brick://07dd62c9 §5b.a): under --floor-hard,
     // refuse UPFRONT (no prompt submitted) when the pinned model is knowably
     // unservable, so no work is done at a knowably-down moment. No-op otherwise.

@@ -9,7 +9,7 @@ const SESSION_INDEX_SCHEMA = "acpx.session-index.v1";
 export type SessionIndexSubscriptionSwitch = {
   from?: string;
   to: string;
-  reason: "manual" | "failover" | "locked";
+  reason: "manual" | "failover" | "locked" | "selection";
   at: string;
 };
 
@@ -23,7 +23,7 @@ export type SessionIndexAccountSwitch = {
   effectiveAuthMode?: string;
   effectiveAnchor?: string;
   effectiveResolutionMethod?: "path" | "selection";
-  reason: "manual" | "failover" | "locked";
+  reason: "manual" | "failover" | "locked" | "selection";
   at: string;
 };
 
@@ -125,7 +125,10 @@ function parseIndexSubscriptionSwitch(value: unknown): SessionIndexSubscriptionS
   if (
     !record ||
     typeof record.to !== "string" ||
-    (record.reason !== "manual" && record.reason !== "failover" && record.reason !== "locked") ||
+    (record.reason !== "manual" &&
+      record.reason !== "failover" &&
+      record.reason !== "locked" &&
+      record.reason !== "selection") ||
     typeof record.at !== "string"
   ) {
     return undefined;
@@ -148,13 +151,16 @@ function isValidIndexAccountSwitch(record: Record<string, unknown>): record is {
   effectiveAuthMode?: string;
   effectiveAnchor?: string;
   effectiveResolutionMethod?: "path" | "selection";
-  reason: "manual" | "failover" | "locked";
+  reason: "manual" | "failover" | "locked" | "selection";
   at: string;
 } {
   return (
     typeof record.toProfile === "string" &&
     typeof record.toAccount === "string" &&
-    (record.reason === "manual" || record.reason === "failover" || record.reason === "locked") &&
+    (record.reason === "manual" ||
+      record.reason === "failover" ||
+      record.reason === "locked" ||
+      record.reason === "selection") &&
     typeof record.at === "string"
   );
 }

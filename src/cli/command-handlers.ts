@@ -1514,6 +1514,14 @@ export async function handleSetConfigOption(
     await handleSetAutoFailover(explicitAgentName, value, flags, command, config);
     return;
   }
+  if (isAutoSubscriptionConfigKey(configId)) {
+    await handleSetAutoSubscription(explicitAgentName, value, flags, command, config);
+    return;
+  }
+  if (isFableDegradeConfigKey(configId)) {
+    await handleSetFableDegrade(explicitAgentName, value, flags, command, config);
+    return;
+  }
   const resolvedConfigId = resolveCompatibleConfigId(agent, configId);
   const { setSessionConfigOption } = await loadSessionModule();
   const selector = resolveSessionTargetSelector({ flags, command });
@@ -1606,6 +1614,122 @@ function printSetAutoFailoverResultByFormat(
     return;
   }
   process.stdout.write(format === "quiet" ? `${label}\n` : `auto-failover set: ${label}\n`);
+}
+
+// brick://4d517be2 — `set auto-subscription on|off` (mirror auto-failover).
+function isAutoSubscriptionConfigKey(configId: string): boolean {
+  const normalized = configId.trim();
+  return (
+    normalized === "auto-subscription" ||
+    normalized === "auto_subscription" ||
+    normalized === "autoSubscription"
+  );
+}
+
+function parseOnOffValue(value: string, optionLabel: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  if (["on", "true", "1", "enabled"].includes(normalized)) {
+    return true;
+  }
+  if (["off", "false", "0", "disabled"].includes(normalized)) {
+    return false;
+  }
+  throw new InvalidArgumentError(
+    `${optionLabel} value must be one of: on, off, true, false, 1, 0, enabled, disabled`,
+  );
+}
+
+export async function handleSetAutoSubscription(
+  explicitAgentName: string | undefined,
+  value: string,
+  flags: StatusFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const autoSubscription = parseOnOffValue(value, "auto-subscription");
+  const selector = resolveSessionTargetSelector({ flags, command });
+  const record = await findRoutedTargetSessionOrThrow(agent, selector);
+  const { setSessionAutoSubscription } = await loadSessionModule();
+  const result = await setSessionAutoSubscription({
+    sessionId: record.acpxRecordId,
+    autoSubscription,
+    sessionName: selector.name ?? record.name,
+  });
+  printOnOffResultByFormat(
+    {
+      action: "auto_subscription_set",
+      key: "autoSubscription",
+      value: result.autoSubscription,
+      record: result.record,
+    },
+    "auto-subscription",
+    globalFlags.format,
+  );
+}
+
+// brick://4d517be2 — `set fable-degrade on|off` (mirror auto-failover).
+function isFableDegradeConfigKey(configId: string): boolean {
+  const normalized = configId.trim();
+  return (
+    normalized === "fable-degrade" ||
+    normalized === "fable_degrade" ||
+    normalized === "fableDegrade" ||
+    normalized === "fable-degrade-ok" ||
+    normalized === "fable_degrade_ok" ||
+    normalized === "fableDegradeOk"
+  );
+}
+
+export async function handleSetFableDegrade(
+  explicitAgentName: string | undefined,
+  value: string,
+  flags: StatusFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const fableDegradeOk = parseOnOffValue(value, "fable-degrade");
+  const selector = resolveSessionTargetSelector({ flags, command });
+  const record = await findRoutedTargetSessionOrThrow(agent, selector);
+  const { setSessionFableDegrade } = await loadSessionModule();
+  const result = await setSessionFableDegrade({
+    sessionId: record.acpxRecordId,
+    fableDegradeOk,
+    sessionName: selector.name ?? record.name,
+  });
+  printOnOffResultByFormat(
+    {
+      action: "fable_degrade_set",
+      key: "fableDegradeOk",
+      value: result.fableDegradeOk,
+      record: result.record,
+    },
+    "fable-degrade",
+    globalFlags.format,
+  );
+}
+
+function printOnOffResultByFormat(
+  payload: { action: string; key: string; value: boolean; record: SessionRecord },
+  label: string,
+  format: OutputFormat,
+): void {
+  const state = payload.value ? "on" : "off";
+  if (
+    emitJsonResult(format, {
+      action: payload.action,
+      [payload.key]: payload.value,
+      acpxRecordId: payload.record.acpxRecordId,
+      acpxSessionId: payload.record.acpSessionId,
+      agentSessionId: payload.record.agentSessionId,
+    })
+  ) {
+    return;
+  }
+  process.stdout.write(format === "quiet" ? `${state}\n` : `${label} set: ${state}\n`);
 }
 
 // `acpx <agent> set subscription <id>` — change the session's Claude

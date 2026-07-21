@@ -29,6 +29,14 @@ export type SessionAgentOptions = {
   // work. Durable like autoFailover — carried forward across owner respawns by
   // carryForwardPinnedFloor.
   floorHard?: boolean;
+  // Per-session autonomous subscription-selection policy (brick://4d517be2).
+  // undefined = enabled (default-ON); explicit false opts out. Durable like
+  // autoFailover — carried forward across owner respawns.
+  autoSubscription?: boolean;
+  // Per-session opt-in allowing a Fable session to degrade to Opus when no
+  // subscription has Fable available (brick://4d517be2). undefined/false = NOT
+  // allowed; explicit true opts in. Durable like floorHard.
+  fableDegradeOk?: boolean;
   // Provenance of `model` (brick://5bac5564 Layer C) — one of the ModelSource
   // flat-string values. Persisted as `session_options.model_source`; carried
   // forward paired with `model` so the explicit-vs-implicit distinction survives
@@ -57,6 +65,8 @@ export function mergeSessionOptions(
     assignDefinedOption(merged, "reasoningEffort", preferred.reasoningEffort);
     assignDefinedOption(merged, "autoFailover", preferred.autoFailover);
     assignDefinedOption(merged, "floorHard", preferred.floorHard);
+    assignDefinedOption(merged, "autoSubscription", preferred.autoSubscription);
+    assignDefinedOption(merged, "fableDegradeOk", preferred.fableDegradeOk);
     assignDefinedOption(merged, "modelSource", preferred.modelSource);
   }
   return Object.keys(merged).length > 0 ? merged : undefined;
@@ -107,8 +117,11 @@ type SessionOptionBreadcrumbs = {
   accountSwitch: PersistedSessionOptions["account_switch"];
   provisioningWarning: PersistedSessionOptions["provisioning_warning"];
   modelGuard: PersistedSessionOptions["model_guard"];
+  fableDegrade: PersistedSessionOptions["fable_degrade"];
   autoFailover: PersistedSessionOptions["auto_failover"];
   floorHard: PersistedSessionOptions["floor_hard"];
+  autoSubscription: PersistedSessionOptions["auto_subscription"];
+  fableDegradeOk: PersistedSessionOptions["fable_degrade_ok"];
   model: PersistedSessionOptions["model"];
   modelSource: PersistedSessionOptions["model_source"];
   effort: PersistedSessionOptions["effort"];
@@ -121,8 +134,11 @@ function sessionOptionBreadcrumbs(record: SessionRecord): SessionOptionBreadcrum
     accountSwitch: stored.account_switch,
     provisioningWarning: stored.provisioning_warning,
     modelGuard: stored.model_guard,
+    fableDegrade: stored.fable_degrade,
     autoFailover: stored.auto_failover,
     floorHard: stored.floor_hard,
+    autoSubscription: stored.auto_subscription,
+    fableDegradeOk: stored.fable_degrade_ok,
     model: stored.model,
     modelSource: stored.model_source,
     effort: stored.effort,
@@ -165,6 +181,12 @@ function assignBreadcrumbs(
   if (breadcrumbs.modelGuard !== undefined) {
     target.model_guard = breadcrumbs.modelGuard;
   }
+  // fable_degrade is a pure record-only breadcrumb (like model_guard) — carry it
+  // forward so the "degraded from Fable to Opus" signal stays visible across
+  // respawns and preserves the original Fable id for a future auto-restore.
+  if (breadcrumbs.fableDegrade !== undefined) {
+    target.fable_degrade = breadcrumbs.fableDegrade;
+  }
   carryDurableIfUnset(target, breadcrumbs);
 }
 
@@ -181,6 +203,8 @@ function carryDurableIfUnset(
 ): void {
   carryIfUnset(target, "auto_failover", breadcrumbs.autoFailover);
   carryIfUnset(target, "floor_hard", breadcrumbs.floorHard);
+  carryIfUnset(target, "auto_subscription", breadcrumbs.autoSubscription);
+  carryIfUnset(target, "fable_degrade_ok", breadcrumbs.fableDegradeOk);
   carryIfUnset(target, "model", breadcrumbs.model);
   // model_source rides forward paired with `model` (brick://5bac5564 Layer C): a
   // respawn that carries the stored pin must carry its provenance too, or the
@@ -233,6 +257,8 @@ export function sessionOptionsFromRecord(record: SessionRecord): SessionAgentOpt
   assignStoredOption(sessionOptions, "reasoningEffort", nonEmptyString(stored.effort));
   assignStoredOption(sessionOptions, "autoFailover", storedBoolean(stored.auto_failover));
   assignStoredOption(sessionOptions, "floorHard", storedBoolean(stored.floor_hard));
+  assignStoredOption(sessionOptions, "autoSubscription", storedBoolean(stored.auto_subscription));
+  assignStoredOption(sessionOptions, "fableDegradeOk", storedBoolean(stored.fable_degrade_ok));
   assignStoredOption(sessionOptions, "modelSource", nonEmptyString(stored.model_source));
 
   return Object.keys(sessionOptions).length > 0 ? sessionOptions : undefined;
@@ -258,6 +284,12 @@ function persistedSessionOptions(
   if (typeof options.floorHard === "boolean") {
     next.floor_hard = options.floorHard;
   }
+  if (typeof options.autoSubscription === "boolean") {
+    next.auto_subscription = options.autoSubscription;
+  }
+  if (typeof options.fableDegradeOk === "boolean") {
+    next.fable_degrade_ok = options.fableDegradeOk;
+  }
   // model_source is subordinate to `model` (always co-persisted with it, never
   // alone) — so it is NOT a PERSISTED_CONTENT_KEY: it must not keep an otherwise
   // empty session_options block alive on its own.
@@ -278,6 +310,8 @@ const PERSISTED_CONTENT_KEYS = [
   "effort",
   "auto_failover",
   "floor_hard",
+  "auto_subscription",
+  "fable_degrade_ok",
 ] as const satisfies ReadonlyArray<keyof PersistedSessionOptions>;
 
 function hasPersistedSessionOptions(options: PersistedSessionOptions): boolean {

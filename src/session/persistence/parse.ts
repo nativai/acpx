@@ -480,8 +480,11 @@ function assignParsedSessionOptions(state: SessionAcpxState, raw: unknown): void
   assignSessionOptionEffort(parsedSessionOptions, sessionOptions.effort);
   assignSessionOptionAutoFailover(parsedSessionOptions, sessionOptions.auto_failover);
   assignSessionOptionFloorHard(parsedSessionOptions, sessionOptions.floor_hard);
+  assignSessionOptionAutoSubscription(parsedSessionOptions, sessionOptions.auto_subscription);
+  assignSessionOptionFableDegradeOk(parsedSessionOptions, sessionOptions.fable_degrade_ok);
   assignSessionOptionModelSource(parsedSessionOptions, sessionOptions.model_source);
   assignSessionOptionModelGuard(parsedSessionOptions, sessionOptions.model_guard);
+  assignSessionOptionFableDegrade(parsedSessionOptions, sessionOptions.fable_degrade);
   assignSessionOptionSubscriptionSwitch(parsedSessionOptions, sessionOptions.subscription_switch);
   assignSessionOptionAccountSwitch(parsedSessionOptions, sessionOptions.account_switch);
   assignSessionOptionProvisioningWarning(parsedSessionOptions, sessionOptions.provisioning_warning);
@@ -491,13 +494,19 @@ function assignParsedSessionOptions(state: SessionAcpxState, raw: unknown): void
   }
 }
 
-function isValidSubscriptionSwitch(
-  record: Record<string, unknown>,
-): record is { from?: string; to: string; reason: "manual" | "failover" | "locked"; at: string } {
+function isValidSubscriptionSwitch(record: Record<string, unknown>): record is {
+  from?: string;
+  to: string;
+  reason: "manual" | "failover" | "locked" | "selection";
+  at: string;
+} {
   return (
     typeof record.to === "string" &&
     record.to.length > 0 &&
-    (record.reason === "manual" || record.reason === "failover" || record.reason === "locked") &&
+    (record.reason === "manual" ||
+      record.reason === "failover" ||
+      record.reason === "locked" ||
+      record.reason === "selection") &&
     typeof record.at === "string" &&
     record.at.length > 0
   );
@@ -523,8 +532,10 @@ function nonEmptyStringValue(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
-function isAccountSwitchReason(value: unknown): value is "manual" | "failover" | "locked" {
-  return value === "manual" || value === "failover" || value === "locked";
+function isAccountSwitchReason(
+  value: unknown,
+): value is "manual" | "failover" | "locked" | "selection" {
+  return value === "manual" || value === "failover" || value === "locked" || value === "selection";
 }
 
 function isValidAccountSwitch(record: Record<string, unknown>): record is {
@@ -537,7 +548,7 @@ function isValidAccountSwitch(record: Record<string, unknown>): record is {
   effectiveAuthMode?: string;
   effectiveAnchor?: string;
   effectiveResolutionMethod?: "path" | "selection";
-  reason: "manual" | "failover" | "locked";
+  reason: "manual" | "failover" | "locked" | "selection";
   at: string;
 } {
   return (
@@ -693,6 +704,28 @@ function assignSessionOptionFloorHard(
   }
 }
 
+// brick://4d517be2: auto_subscription / fable_degrade_ok are durable policy
+// flags — they MUST round-trip on a cold disk reload (mirror floor_hard), or every
+// queue-owner delivery / owner respawn strips them → the disable/degrade opt-in
+// silently reverts to its default.
+function assignSessionOptionAutoSubscription(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+  value: unknown,
+): void {
+  if (typeof value === "boolean") {
+    options.auto_subscription = value;
+  }
+}
+
+function assignSessionOptionFableDegradeOk(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+  value: unknown,
+): void {
+  if (typeof value === "boolean") {
+    options.fable_degrade_ok = value;
+  }
+}
+
 // brick://5bac5564 Layer C: model_source is a durable flat-string provenance —
 // it MUST round-trip on a cold disk reload (mirror floor_hard), or the reuse
 // branch's clobber-guard and the apply-tier Fable guard lose the explicit-vs-
@@ -729,6 +762,34 @@ function assignSessionOptionModelGuard(
     blocked: record.blocked,
     forced_to: record.forced_to,
     source: record.source,
+    at: record.at,
+  };
+}
+
+// brick://4d517be2: fable_degrade is a record-only breadcrumb (mirror model_guard)
+// — it MUST round-trip on a cold disk reload so the "degraded from Fable to Opus"
+// provenance survives, preserving the original Fable id for a future auto-restore.
+function isValidFableDegrade(
+  record: Record<string, unknown>,
+): record is { from: string; to: string; at: string } {
+  return (
+    nonEmptyStringValue(record.from) &&
+    nonEmptyStringValue(record.to) &&
+    nonEmptyStringValue(record.at)
+  );
+}
+
+function assignSessionOptionFableDegrade(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+  value: unknown,
+): void {
+  const record = asRecord(value);
+  if (!record || !isValidFableDegrade(record)) {
+    return;
+  }
+  options.fable_degrade = {
+    from: record.from,
+    to: record.to,
     at: record.at,
   };
 }

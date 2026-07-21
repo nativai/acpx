@@ -86,7 +86,7 @@ function recordSwitch(
   record: SessionRecord,
   from: string | undefined,
   to: string,
-  reason: "manual" | "failover" | "locked",
+  reason: "manual" | "failover" | "locked" | "selection",
 ): void {
   const acpx = record.acpx ?? {};
   const sessionOptions = { ...acpx.session_options };
@@ -103,7 +103,7 @@ function recordSwitch(
 export async function switchSessionSubscription(args: {
   record: SessionRecord;
   targetSubId: string;
-  reason: "manual" | "failover" | "locked";
+  reason: "manual" | "failover" | "locked" | "selection";
   loadOpts?: SubscriptionLookupOptions;
 }): Promise<SwitchSessionSubscriptionResult> {
   const targetSubId = args.targetSubId.trim();

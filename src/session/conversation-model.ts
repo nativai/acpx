@@ -733,6 +733,15 @@ function cloneSessionOptions(
     // sessions-new). Conditional spread mirrors auto_failover so an absent flag
     // never becomes an `undefined` own-key (TE Finding #2 discipline).
     ...(options.floor_hard !== undefined ? { floor_hard: options.floor_hard } : {}),
+    // brick://4d517be2: auto_subscription / fable_degrade_ok are durable policy
+    // flags — conditional-spread (mirror floor_hard) so they survive EVERY turn's
+    // clone and an absent flag never becomes an `undefined` own-key.
+    ...(options.auto_subscription !== undefined
+      ? { auto_subscription: options.auto_subscription }
+      : {}),
+    ...(options.fable_degrade_ok !== undefined
+      ? { fable_degrade_ok: options.fable_degrade_ok }
+      : {}),
     // brick://5bac5564 Layer C: model_source is a durable flat-string pin
     // provenance — conditional-spread (mirror floor_hard) so it survives EVERY
     // turn's clone and an absent value never becomes an `undefined` own-key.
@@ -762,6 +771,9 @@ function cloneSessionOptionBreadcrumbs(
     // brick://5bac5564 Layer B: the model_guard breadcrumb rides the clone like
     // the other breadcrumb objects so it survives every turn's applyConfig clone.
     ...(options.model_guard !== undefined ? { model_guard: { ...options.model_guard } } : {}),
+    // brick://4d517be2: fable_degrade is a record-only breadcrumb (mirror
+    // model_guard) — rides the clone so the degrade provenance survives every turn.
+    ...(options.fable_degrade !== undefined ? { fable_degrade: { ...options.fable_degrade } } : {}),
   };
 }
 

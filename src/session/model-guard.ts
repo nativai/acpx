@@ -17,7 +17,18 @@ export const NON_FABLE_DEFAULT_MODEL = "opus";
 //  - default      : no explicit and no inheritable parent value
 //  - failover     : chosen by the failover retarget path
 //  - guard-forced : an implicit Fable was rewritten to the non-Fable default
-export type ModelSource = "explicit" | "inherited" | "default" | "failover" | "guard-forced";
+//  - explicit-degrade : a Fable session was deliberately degraded to Opus because
+//    no subscription had Fable available and `fable_degrade_ok` opted in
+//    (brick://4d517be2). The SANCTIONED exception to "Fable only via explicit
+//    request" — the marker lets audits distinguish a deliberate degrade from a
+//    silent `guard-forced`.
+export type ModelSource =
+  | "explicit"
+  | "inherited"
+  | "default"
+  | "failover"
+  | "guard-forced"
+  | "explicit-degrade";
 
 // Pick a CONCRETE advertised non-Fable model when the adapter's model set is
 // known. Skips the bare `default` alias (which can resolve to Fable server-side,

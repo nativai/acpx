@@ -437,7 +437,7 @@ function sevenDayResetKey(usage: SubscriptionUsage): number {
   return Number.isNaN(raw) ? Number.POSITIVE_INFINITY : raw;
 }
 
-function compareFailoverCandidates(a: IndexedUsage, b: IndexedUsage): number {
+export function compareFailoverCandidates(a: IndexedUsage, b: IndexedUsage): number {
   const resetDiff = sevenDayResetKey(a.usage) - sevenDayResetKey(b.usage);
   // Guard NaN: Infinity - Infinity = NaN when ALL eligible subs lack a known 7d
   // reset. NaN !== 0 is true, which would return NaN and skip the secondary
@@ -451,6 +451,26 @@ function compareFailoverCandidates(a: IndexedUsage, b: IndexedUsage): number {
     return utilA - utilB;
   }
   return a.index - b.index;
+}
+
+/**
+ * brick://4d517be2 — is `candidate` strictly better than `current` under the same
+ * (soonest 7d reset → lower 7d util → registry index) ordering `pickFailoverTarget`
+ * uses? Drives the proactive-selection OPTIMIZATION trigger (only rebalance toward a
+ * strictly-better sub). Reuses `compareFailoverCandidates` so ranking is identical.
+ */
+export function subscriptionRanksStrictlyBetter(
+  candidate: SubscriptionUsage,
+  current: SubscriptionUsage,
+  candidateIndex: number,
+  currentIndex: number,
+): boolean {
+  return (
+    compareFailoverCandidates(
+      { usage: candidate, index: candidateIndex },
+      { usage: current, index: currentIndex },
+    ) < 0
+  );
 }
 
 /**

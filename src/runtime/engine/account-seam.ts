@@ -92,7 +92,7 @@ function recordAccountSwitch(
   record: SessionRecord,
   fromProfile: ProfileEntry,
   toProfile: ProfileEntry,
-  reason: "manual" | "failover" | "locked",
+  reason: "manual" | "failover" | "locked" | "selection",
 ): void {
   const acpx = record.acpx ?? {};
   const sessionOptions = { ...acpx.session_options };
@@ -145,7 +145,7 @@ function missingTranscriptMessage(
 export async function switchSessionAccount(
   record: SessionRecord,
   toProfileId: ProfileId,
-  reason: "manual" | "failover" | "locked",
+  reason: "manual" | "failover" | "locked" | "selection",
   loadOpts?: SubscriptionLookupOptions,
 ): Promise<SwitchSessionAccountResult> {
   const targetId = toProfileId.trim();

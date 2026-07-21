@@ -242,7 +242,13 @@ function resumePolicyForSessionMode(mode: "persistent" | "oneshot"): SessionResu
 // The durable session_options fields carryForwardPinnedFloor seeds from a prior
 // record when the fresh-create spawn flags omit them (brick://07dd62c9 §8).
 type PersistedSessionOptions = NonNullable<NonNullable<SessionRecord["acpx"]>["session_options"]>;
-type SeedableSessionOptionField = "auto_failover" | "floor_hard" | "model" | "effort";
+type SeedableSessionOptionField =
+  | "auto_failover"
+  | "floor_hard"
+  | "auto_subscription"
+  | "fable_degrade_ok"
+  | "model"
+  | "effort";
 
 // Which durable fields the incoming spawn options DON'T carry (so a prior value
 // must be seeded). model/effort are seeded ONLY when the record has no pin of its
@@ -264,6 +270,12 @@ function policyFieldsToSeed(opts: SessionAgentOptions | undefined): SeedableSess
   }
   if (provided.floorHard === undefined) {
     fields.push("floor_hard");
+  }
+  if (provided.autoSubscription === undefined) {
+    fields.push("auto_subscription");
+  }
+  if (provided.fableDegradeOk === undefined) {
+    fields.push("fable_degrade_ok");
   }
   return fields;
 }

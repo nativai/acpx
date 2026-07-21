@@ -186,6 +186,12 @@ function overlayDurableSessionOptionFields(
   if (latest.floor_hard !== undefined) {
     merged.floor_hard = latest.floor_hard;
   }
+  if (latest.auto_subscription !== undefined) {
+    merged.auto_subscription = latest.auto_subscription;
+  }
+  if (latest.fable_degrade_ok !== undefined) {
+    merged.fable_degrade_ok = latest.fable_degrade_ok;
+  }
 }
 
 function hasLatestDurableSessionOptions(
@@ -196,7 +202,9 @@ function hasLatestDurableSessionOptions(
     latest.model_source !== undefined ||
     latest.effort !== undefined ||
     latest.auto_failover !== undefined ||
-    latest.floor_hard !== undefined
+    latest.floor_hard !== undefined ||
+    latest.auto_subscription !== undefined ||
+    latest.fable_degrade_ok !== undefined
   );
 }
 

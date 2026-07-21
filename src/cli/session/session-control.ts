@@ -50,7 +50,11 @@ import type {
   SessionCancelResult,
   SessionSetAutoFailoverOptions,
   SessionSetAutoFailoverResult,
+  SessionSetAutoSubscriptionOptions,
+  SessionSetAutoSubscriptionResult,
   SessionSetConfigOptionOptions,
+  SessionSetFableDegradeOptions,
+  SessionSetFableDegradeResult,
   SessionSetModelOptions,
   SessionSetModeOptions,
   SessionSetProfileOptions,
@@ -374,6 +378,50 @@ export async function setSessionAutoFailover(
   await writeSessionRecord(record);
 
   return { record, autoFailover: options.autoFailover };
+}
+
+// brick://4d517be2 — set the per-session autonomous-selection disable knob (mirror
+// setSessionAutoFailover). A pure record edit; the next turn's pre-turn hook reads it.
+export async function setSessionAutoSubscription(
+  options: SessionSetAutoSubscriptionOptions,
+): Promise<SessionSetAutoSubscriptionResult> {
+  await refuseTurnInFlightForLiveOwner(
+    options.sessionId,
+    () => new ConfigOptionTurnInFlightError("auto-subscription", options.sessionName),
+  );
+
+  const record = await resolveSessionRecord(options.sessionId);
+  const acpx: NonNullable<SessionRecord["acpx"]> = { ...record.acpx };
+  acpx.session_options = {
+    ...acpx.session_options,
+    auto_subscription: options.autoSubscription,
+  };
+  record.acpx = acpx;
+  await writeSessionRecord(record);
+
+  return { record, autoSubscription: options.autoSubscription };
+}
+
+// brick://4d517be2 — set the per-session fable→opus degrade opt-in (mirror
+// setSessionAutoFailover). A pure record edit; the fable short-circuit reads it.
+export async function setSessionFableDegrade(
+  options: SessionSetFableDegradeOptions,
+): Promise<SessionSetFableDegradeResult> {
+  await refuseTurnInFlightForLiveOwner(
+    options.sessionId,
+    () => new ConfigOptionTurnInFlightError("fable-degrade", options.sessionName),
+  );
+
+  const record = await resolveSessionRecord(options.sessionId);
+  const acpx: NonNullable<SessionRecord["acpx"]> = { ...record.acpx };
+  acpx.session_options = {
+    ...acpx.session_options,
+    fable_degrade_ok: options.fableDegradeOk,
+  };
+  record.acpx = acpx;
+  await writeSessionRecord(record);
+
+  return { record, fableDegradeOk: options.fableDegradeOk };
 }
 
 function firstAgentCommandToken(command: string): string | undefined {
