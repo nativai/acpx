@@ -166,6 +166,12 @@ function mergeLatestDurableSessionOptions(
   if (latest.auto_failover !== undefined) {
     merged.auto_failover = latest.auto_failover;
   }
+  // floor_hard rides the same durable overlay (brick://07dd62c9): a disk-side
+  // policy change during an in-flight turn must win over the stale turn snapshot,
+  // exactly like auto_failover. (The `{...pending}` base already preserves it.)
+  if (latest.floor_hard !== undefined) {
+    merged.floor_hard = latest.floor_hard;
+  }
   return hasSessionOptions(merged) ? merged : undefined;
 }
 
@@ -173,7 +179,10 @@ function hasLatestDurableSessionOptions(
   latest: NonNullable<SessionAcpxState["session_options"]>,
 ): boolean {
   return (
-    latest.model !== undefined || latest.effort !== undefined || latest.auto_failover !== undefined
+    latest.model !== undefined ||
+    latest.effort !== undefined ||
+    latest.auto_failover !== undefined ||
+    latest.floor_hard !== undefined
   );
 }
 
@@ -192,12 +201,12 @@ export function setDesiredModelId(record: SessionRecord, modelId: string | undef
     delete sessionOptions.model;
   }
 
-  if (
-    typeof sessionOptions.model === "string" ||
-    Array.isArray(sessionOptions.allowed_tools) ||
-    typeof sessionOptions.max_turns === "number" ||
-    sessionOptions.system_prompt !== undefined
-  ) {
+  // Keep session_options iff ANY field remains (brick://07dd62c9): the old
+  // hand-rolled guard checked only model/allowed_tools/max_turns/system_prompt, so
+  // clearing the model dropped the WHOLE block — silently discarding floor_hard /
+  // auto_failover / effort / subscription / profile / breadcrumbs. hasSessionOptions
+  // is the complete Object.values check and mirrors persist/merge emptiness logic.
+  if (hasSessionOptions(sessionOptions)) {
     acpx.session_options = sessionOptions;
   } else {
     delete acpx.session_options;

@@ -693,7 +693,24 @@ export function cloneSessionAcpxState(
     progress: state.progress ? deepClone(state.progress) : undefined,
     config_options: state.config_options ? deepClone(state.config_options) : undefined,
     owner_options: state.owner_options ? { ...state.owner_options } : undefined,
+    // brick://07dd62c9: the live served block + floor breadcrumbs MUST survive the
+    // clone. savePromptSuccess stamps `served` then re-bases acpxState off this
+    // clone; without these the served-truth surface + durable park are dropped on
+    // EVERY real turn. Flat objects (all string fields) → spread is a full clone.
+    ...cloneFloorState(state),
     session_options: cloneSessionOptions(state.session_options),
+  };
+}
+
+// Deep-clone the live served block + floor breadcrumbs (brick://07dd62c9). Kept a
+// helper so cloneSessionAcpxState stays under the lint complexity budget.
+function cloneFloorState(
+  state: SessionAcpxState,
+): Pick<SessionAcpxState, "served" | "served_below_floor" | "floor_parked"> {
+  return {
+    served: state.served ? { ...state.served } : undefined,
+    served_below_floor: state.served_below_floor ? { ...state.served_below_floor } : undefined,
+    floor_parked: state.floor_parked ? { ...state.floor_parked } : undefined,
   };
 }
 
@@ -711,9 +728,24 @@ function cloneSessionOptions(
     profile: options.profile,
     effort: options.effort,
     ...(options.auto_failover !== undefined ? { auto_failover: options.auto_failover } : {}),
+    // brick://07dd62c9: floor_hard is a durable policy — it MUST survive the clone
+    // (applyConfigOptionsToRecord → cloneSessionAcpxState → here on EVERY turn +
+    // sessions-new). Conditional spread mirrors auto_failover so an absent flag
+    // never becomes an `undefined` own-key (TE Finding #2 discipline).
+    ...(options.floor_hard !== undefined ? { floor_hard: options.floor_hard } : {}),
     ...(options.system_prompt !== undefined
       ? { system_prompt: cloneSystemPromptOption(options.system_prompt) }
       : {}),
+    ...cloneSessionOptionBreadcrumbs(options),
+  };
+}
+
+// Deep-clone the session_options breadcrumb objects. Extracted so cloneSessionOptions
+// stays under the lint complexity budget after floor_hard was added.
+function cloneSessionOptionBreadcrumbs(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+): Partial<NonNullable<SessionAcpxState["session_options"]>> {
+  return {
     ...(options.subscription_switch !== undefined
       ? { subscription_switch: { ...options.subscription_switch } }
       : {}),
