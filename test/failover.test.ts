@@ -300,13 +300,54 @@ test("pickFailoverTarget: sub with fiveHour === null is excluded (5h header abse
 });
 
 test("pickFailoverTarget: high 7d utilization alone does NOT exclude a sub", () => {
-  // 7d utilization at 0.95 but 5h utilization fine — still eligible
+  // 7d utilization at 0.95 but 5h utilization fine — still eligible (< maxedThreshold 0.98)
   const highSevenDay = usage("high-7d", 0, undefined, {
     fiveHour: { utilization: 0.4, reset: null },
     sevenDay: { utilization: 0.95, reset: null },
   });
   const target = pickFailoverTarget([highSevenDay], { exclude: new Set(), threshold: 0.98 });
   assert.equal(target?.id, "high-7d");
+});
+
+// ── Regression matrix: 7d exhaustion gate (brick://8021102c) ──────────────
+
+test("pickFailoverTarget: weekly-dead (7d=1.0) sub is INELIGIBLE even with fresh 5h", () => {
+  // A sub whose 5h just reset (0.10) but 7d is fully exhausted (1.0) must be
+  // rejected — picking it would cause 429s on the weekly-maxed account.
+  const weeklyDead = usage("weekly-dead", 0, undefined, {
+    fiveHour: { utilization: 0.1, reset: null },
+    sevenDay: { utilization: 1.0, reset: "2026-07-21T08:00:00Z" },
+  });
+  const target = pickFailoverTarget([weeklyDead], { exclude: new Set(), threshold: 0.7 });
+  assert.equal(target, undefined);
+});
+
+test("pickFailoverTarget: moderate 7d (0.75) is still ELIGIBLE — only weekly-dead rejected", () => {
+  // 7d at 0.75 is not exhausted (< maxedThreshold 0.98), so the sub remains eligible.
+  const moderate7d = usage("moderate-7d", 0, undefined, {
+    fiveHour: { utilization: 0.1, reset: null },
+    sevenDay: { utilization: 0.75, reset: null },
+  });
+  const target = pickFailoverTarget([moderate7d], { exclude: new Set(), threshold: 0.7 });
+  assert.equal(target?.id, "moderate-7d");
+});
+
+test("pickFailoverTarget: healthy sub wins over 7d-maxed sub with soonest reset", () => {
+  // The 7d-maxed sub has a SOONER weekly reset, so the old selector could pick it.
+  // With the 7d gate it must be excluded and the healthy sub selected instead.
+  const weeklyMaxedSoonReset = usage("maxed-soon", 0, undefined, {
+    fiveHour: { utilization: 0.1, reset: null },
+    sevenDay: { utilization: 1.0, reset: "2026-07-21T06:00:00Z" }, // soonest
+  });
+  const healthySub = usage("healthy", 0, undefined, {
+    fiveHour: { utilization: 0.1, reset: null },
+    sevenDay: { utilization: 0.3, reset: "2026-07-22T00:00:00Z" }, // later reset
+  });
+  const target = pickFailoverTarget([weeklyMaxedSoonReset, healthySub], {
+    exclude: new Set(),
+    threshold: 0.7,
+  });
+  assert.equal(target?.id, "healthy");
 });
 
 // ── Regression matrix: soonest-7d-reset ordering ──────────────────────────

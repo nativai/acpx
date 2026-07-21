@@ -429,6 +429,12 @@ function isEligibleForFailover(
   if (usage.fiveHour === null) {
     return false;
   }
+  // sevenDay === null means the 7d header was absent — absence ≠ exhausted, so
+  // do not reject. Only reject when the window is present and weekly-dead
+  // (≥ maxedThreshold, independent of the 5h `threshold` param).
+  if (usage.sevenDay !== null && usage.sevenDay.utilization >= maxedThreshold()) {
+    return false;
+  }
   return usage.fiveHour.utilization < threshold;
 }
 
