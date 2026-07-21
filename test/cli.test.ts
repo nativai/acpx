@@ -313,6 +313,285 @@ test("codex child session inherits parent model instead of the create-time defau
   });
 });
 
+// brick://5bac5564 — end-to-end record-level proof of the Fable invariant + the
+// general re-ensure clobber fix. Each runs the REAL built CLI against the mock
+// claude adapter and reads the outcome from the written session RECORD.
+const GUARD_CLAUDE_COMMAND = `${MOCK_AGENT_COMMAND} --claude-agent-acp`;
+
+async function writeGuardConfig(homeDir: string): Promise<string> {
+  const cwd = path.join(homeDir, "workspace");
+  await fs.mkdir(cwd, { recursive: true });
+  await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+  await fs.writeFile(
+    path.join(homeDir, ".acpx", "config.json"),
+    `${JSON.stringify({ agents: { claude: { command: GUARD_CLAUDE_COMMAND } } }, null, 2)}\n`,
+    "utf8",
+  );
+  return cwd;
+}
+
+type StoredModelState = {
+  acpx?: {
+    current_model_id?: unknown;
+    session_options?: {
+      model?: unknown;
+      model_source?: unknown;
+      model_guard?: { blocked?: unknown };
+    };
+  };
+};
+
+async function readStoredModel(homeDir: string, id: string): Promise<StoredModelState> {
+  return JSON.parse(await fs.readFile(sessionFilePath(homeDir, id), "utf8")) as StoredModelState;
+}
+
+test("R1 (brick://5bac5564): a bare child of a Fable-pinned parent is guarded to non-Fable", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await writeGuardConfig(homeDir);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "fable-parent",
+      acpSessionId: "fable-parent",
+      agentCommand: GUARD_CLAUDE_COMMAND,
+      cwd,
+      acpx: {
+        current_model_id: "fable",
+        available_models: ["fable", "opus", "sonnet"],
+        session_options: { model: "fable", model_source: "explicit" },
+      },
+    });
+
+    const result = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--approve-all",
+        "--format",
+        "json",
+        "claude",
+        "sessions",
+        "new",
+        "--parent-id",
+        "fable-parent",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const childId = String(
+      (JSON.parse(result.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const stored = await readStoredModel(homeDir, childId);
+
+    assert.equal(stored.acpx?.session_options?.model, "opus"); // NOT fable — the invariant
+    assert.equal(stored.acpx?.session_options?.model_source, "guard-forced");
+    assert.equal(stored.acpx?.session_options?.model_guard?.blocked, "fable");
+  });
+});
+
+test("R1-sonnet (brick://5bac5564): a bare child of a SONNET parent inherits sonnet (guard fires only on Fable)", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await writeGuardConfig(homeDir);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "sonnet-parent",
+      acpSessionId: "sonnet-parent",
+      agentCommand: GUARD_CLAUDE_COMMAND,
+      cwd,
+      acpx: {
+        current_model_id: "sonnet",
+        available_models: ["fable", "opus", "sonnet"],
+        session_options: { model: "sonnet", model_source: "explicit" },
+      },
+    });
+
+    const result = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--approve-all",
+        "--format",
+        "json",
+        "claude",
+        "sessions",
+        "new",
+        "--parent-id",
+        "sonnet-parent",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const childId = String(
+      (JSON.parse(result.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const stored = await readStoredModel(homeDir, childId);
+
+    assert.equal(stored.acpx?.session_options?.model, "sonnet"); // inherited, not touched
+    assert.equal(stored.acpx?.session_options?.model_source, "inherited");
+    assert.equal(stored.acpx?.session_options?.model_guard, undefined); // guard did not fire
+  });
+});
+
+test("R2 (brick://5bac5564): an explicit --model fable is preserved (guard does not interfere)", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await writeGuardConfig(homeDir);
+    const result = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--approve-all",
+        "--format",
+        "json",
+        "--model",
+        "fable",
+        "claude",
+        "sessions",
+        "new",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const childId = String(
+      (JSON.parse(result.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const stored = await readStoredModel(homeDir, childId);
+
+    assert.equal(stored.acpx?.session_options?.model, "fable"); // explicit request honored
+    assert.equal(stored.acpx?.session_options?.model_source, "explicit");
+    assert.equal(stored.acpx?.session_options?.model_guard, undefined); // guard did not fire
+  });
+});
+
+test("R7 (brick://5bac5564): a flagless re-ensure does NOT clobber an explicit --model pin", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await writeGuardConfig(homeDir);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "opus-parent",
+      acpSessionId: "opus-parent",
+      agentCommand: GUARD_CLAUDE_COMMAND,
+      cwd,
+      acpx: {
+        current_model_id: "opus",
+        available_models: ["fable", "opus", "sonnet"],
+        session_options: { model: "opus", model_source: "explicit" },
+      },
+    });
+
+    // Step 1: create the child with an EXPLICIT --model sonnet off the opus parent.
+    const created = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--approve-all",
+        "--format",
+        "json",
+        "--model",
+        "sonnet",
+        "claude",
+        "sessions",
+        "ensure",
+        "-s",
+        "r7child",
+        "--parent-id",
+        "opus-parent",
+      ],
+      homeDir,
+    );
+    assert.equal(created.code, 0, created.stderr);
+    const childId = String(
+      (JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    assert.equal((await readStoredModel(homeDir, childId)).acpx?.session_options?.model, "sonnet");
+
+    // Step 2: a FLAGLESS re-ensure of the SAME session (used to grab the id) — pre-fix
+    // this clobbered the pin to the inherited parent model (opus). It must stay sonnet.
+    const reensure = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--approve-all",
+        "--format",
+        "json",
+        "claude",
+        "sessions",
+        "ensure",
+        "-s",
+        "r7child",
+        "--parent-id",
+        "opus-parent",
+      ],
+      homeDir,
+    );
+    assert.equal(reensure.code, 0, reensure.stderr);
+    const stored = await readStoredModel(homeDir, childId);
+
+    assert.equal(stored.acpx?.session_options?.model, "sonnet"); // NOT clobbered to opus
+    assert.equal(stored.acpx?.session_options?.model_source, "explicit");
+  });
+});
+
+test("R7-fable (brick://5bac5564): a flagless re-ensure off a Fable parent keeps the explicit opus pin (never becomes fable)", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await writeGuardConfig(homeDir);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "fable-parent-r7",
+      acpSessionId: "fable-parent-r7",
+      agentCommand: GUARD_CLAUDE_COMMAND,
+      cwd,
+      acpx: {
+        current_model_id: "fable",
+        available_models: ["fable", "opus", "sonnet"],
+        session_options: { model: "fable", model_source: "explicit" },
+      },
+    });
+
+    const created = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--approve-all",
+        "--format",
+        "json",
+        "--model",
+        "opus",
+        "claude",
+        "sessions",
+        "ensure",
+        "-s",
+        "r7fchild",
+        "--parent-id",
+        "fable-parent-r7",
+      ],
+      homeDir,
+    );
+    assert.equal(created.code, 0, created.stderr);
+    const childId = String(
+      (JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    assert.equal((await readStoredModel(homeDir, childId)).acpx?.session_options?.model, "opus");
+
+    const reensure = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--approve-all",
+        "--format",
+        "json",
+        "claude",
+        "sessions",
+        "ensure",
+        "-s",
+        "r7fchild",
+        "--parent-id",
+        "fable-parent-r7",
+      ],
+      homeDir,
+    );
+    assert.equal(reensure.code, 0, reensure.stderr);
+    const stored = await readStoredModel(homeDir, childId);
+
+    assert.equal(stored.acpx?.session_options?.model, "opus"); // never became fable
+    assert.equal(stored.acpx?.session_options?.model_source, "explicit");
+  });
+});
+
 test("prompting an existing codex session without --model does not reset its model", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

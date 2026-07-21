@@ -625,6 +625,11 @@ const AVAILABLE_MODELS = [
   "gpt-5.5[xhigh]",
   "gpt-5.3-codex-spark[medium]",
   "opus[1m]",
+  // Base `opus` + `fable` advertised so the model-guard integration tests
+  // (brick://5bac5564) can exercise a real spawn/apply — a real Fable-capable
+  // claude profile advertises the base `opus` and `fable` ids.
+  "opus",
+  "fable",
   "sonnet",
   "haiku",
 ];
