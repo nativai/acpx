@@ -213,8 +213,7 @@ test("hook: Brick trailer absent when ACPX_BRICK is unset", () => {
 test("hook: Co-Authored-By anthropic.com lines stripped from commit message", () => {
   const { message } = runHookWithTranscript({
     // The Claude harness appends this line; the hook must remove it.
-    subject:
-      "feat: agent commit\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>\n",
+    subject: "feat: agent commit\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>\n",
   });
   assert.equal(countLines(message, "Session:"), 1);
   assert.ok(!message.includes("Co-Authored-By:"), `Co-Authored-By must be stripped: ${message}`);
