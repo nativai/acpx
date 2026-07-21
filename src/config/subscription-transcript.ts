@@ -486,14 +486,35 @@ function registryFromLookupOptions(
   return options?.registry ?? loadSubscriptionRegistry(options);
 }
 
+// Resolve the session's UNIFIED account-selection id — the id the adapter feeds
+// into chooseSubscriptionConfigDir to set CLAUDE_CONFIG_DIR. The CLI folds
+// `--subscription` into the unified `session_options.profile` slot for MOST
+// sessions (fleet: ~1655 store the sub in `.profile` vs ~62 in `.subscription`),
+// and `applyProfileAuth` (auth-env.ts) resolves a subscription-authMode profile by
+// calling `applySubscriptionConfigDir` with the PROFILE id — i.e. it feeds
+// `.profile` into the SAME `chooseSubscriptionConfigDir` this transcript resolver
+// uses. Reading `.subscription` ALONE therefore mis-resolved the transcript dir
+// for the profile-based majority (brick://07dd62c9 F#4): served-capture read the
+// wrong account's transcript → served never stamped → a --floor-hard CE on a
+// non-default sub was silently accepted. It ALSO latently broke
+// brick://08ac840f's transcript-porting for those sessions (ported to the default
+// sub dir while the adapter resumed from the profile's dir → context rollback).
+// Prefer `.profile` (canonical; matches the adapter's precedence — it uses
+// profileId when present). Validation is inherent: chooseSubscriptionConfigDir
+// looks the id up in the subscription registry, so a non-subscription profile id
+// finds no dir and falls back exactly as an unknown sub did before.
 function subscriptionIdFromRecord(
   record: Pick<TranscriptBearingRecord, "acpx">,
 ): string | undefined {
-  const subscription = record.acpx?.session_options?.subscription;
-  if (typeof subscription !== "string") {
+  const options = record.acpx?.session_options;
+  return nonEmptyTrimmed(options?.profile) ?? nonEmptyTrimmed(options?.subscription);
+}
+
+function nonEmptyTrimmed(value: unknown): string | undefined {
+  if (typeof value !== "string") {
     return undefined;
   }
-  const trimmed = subscription.trim();
+  const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
