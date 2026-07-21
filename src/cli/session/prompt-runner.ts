@@ -10,6 +10,7 @@ import {
   setDesiredConfigOption,
   setDesiredModeId,
   setDesiredModelId,
+  setDesiredModelSource,
 } from "../../session/mode-preference.js";
 import { assertRecordModelSupported } from "../../session/model-application.js";
 import { resolveSessionRecord, writeSessionRecord } from "../../session/persistence.js";
@@ -140,6 +141,8 @@ export async function runSessionSetModelDirect(
       await withTimeout(client.setSessionModel(sessionId, options.modelId), options.timeoutMs);
       setDesiredModelId(record, options.modelId);
       setCurrentModelId(record, options.modelId);
+      // brick://5bac5564 R5: an explicit acpx-level `set model` → provenance "explicit".
+      setDesiredModelSource(record, "explicit");
     }),
   );
 

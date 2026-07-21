@@ -117,6 +117,7 @@ import {
   withInheritedTaskFolder,
 } from "./session/inherited-metadata.js";
 import { mergeSessionMetadata, validateSessionMetadataValue } from "./session/session-metadata.js";
+import { guardImplicitFable, resolveSpawnModelSource } from "../session/model-guard.js";
 
 class NoSessionError extends Error {
   constructor(message: string) {
@@ -622,9 +623,24 @@ function inheritedSpawnSessionOptions(
   sameAgentAsParent: boolean,
   parent: ResolvedParentSession | undefined,
 ): NonNullable<Parameters<SessionModule["createSession"]>[0]["sessionOptions"]> {
+  // brick://5bac5564 R1: the PRIMARY Fable-leak site. A bare child of a Fable
+  // parent inherits `fable` here. Resolve, tag provenance, then run the invariant
+  // guard so an IMPLICIT Fable is rewritten to the non-Fable default while an
+  // explicit `--model fable` is preserved. modelSource is also load-bearing for
+  // the reuse-branch clobber-guard (RE-ENSURE-CLOBBER addendum).
+  const explicitModel = globalFlags.model;
+  const inheritedModel = sameAgentAsParent ? parent?.model : undefined;
+  const resolvedModel = withInheritedModel(explicitModel, inheritedModel);
+  const guarded = guardImplicitFable({
+    resolvedModel,
+    explicitModel,
+    source: resolveSpawnModelSource(explicitModel, inheritedModel),
+  });
   return {
     ...sessionOptionsFromGlobalFlags(globalFlags),
-    model: withInheritedModel(globalFlags.model, sameAgentAsParent ? parent?.model : undefined),
+    model: guarded.model,
+    modelSource: guarded.source,
+    ...(guarded.forced ? { modelGuardBlocked: guarded.blocked } : {}),
     reasoningEffort: withInheritedReasoningEffort(
       globalFlags.reasoningEffort,
       sameAgentAsParent ? parent?.effort : undefined,
@@ -788,14 +804,29 @@ function copySessionOptionsWithOverride(
   globalFlags: GlobalFlags,
 ): ReturnType<typeof sourceSessionOptions> {
   const base = sourceSessionOptions(source);
-  const model = withInheritedModel(globalFlags.model, base?.model);
+  // brick://5bac5564 R2: a copy/fork inherits the SOURCE record's model. Guard it
+  // the same way as a spawn — an implicit Fable copied from a Fable source is
+  // forced to the non-Fable default; an explicit `--model fable` is preserved.
+  const explicitModel = globalFlags.model;
+  const resolvedModel = withInheritedModel(explicitModel, base?.model);
+  const guarded = guardImplicitFable({
+    resolvedModel,
+    explicitModel,
+    source: resolveSpawnModelSource(explicitModel, base?.model),
+  });
   const reasoningEffort = withInheritedReasoningEffort(
     globalFlags.reasoningEffort,
     base?.reasoningEffort,
   );
   const merged = { ...base };
   applyCopyCredentialOverride(merged, globalFlags, base?.profile ?? base?.subscription);
-  applyCopyModelOverrides(merged, model, reasoningEffort);
+  applyCopyModelOverrides(merged, guarded.model, reasoningEffort);
+  if (guarded.model !== undefined) {
+    merged.modelSource = guarded.source;
+    if (guarded.forced) {
+      merged.modelGuardBlocked = guarded.blocked;
+    }
+  }
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 

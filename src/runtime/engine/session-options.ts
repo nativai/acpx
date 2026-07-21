@@ -34,6 +34,12 @@ export type SessionAgentOptions = {
   // forward paired with `model` so the explicit-vs-implicit distinction survives
   // owner respawns (load-bearing for the reuse-branch clobber-guard).
   modelSource?: string;
+  // CREATE-TIME TRANSIENT (never persisted, never carried): the implicit Fable
+  // value the resolution-tier guard blocked. Set only when modelSource is
+  // "guard-forced"; read once at record creation to stamp the model_guard
+  // breadcrumb + mirror the warning. Not a PERSISTED key and absent from every
+  // transform leg on purpose.
+  modelGuardBlocked?: string;
 };
 
 export function mergeSessionOptions(

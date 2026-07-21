@@ -20,6 +20,10 @@ import {
   syncAdvertisedModelState,
 } from "../../session/mode-preference.js";
 import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
+import {
+  mirrorModelGuardToMessages,
+  stampModelGuardBreadcrumb,
+} from "../../session/model-guard.js";
 import { persistSessionOwnerOptions } from "../../session/owner-options.js";
 import {
   absolutePath,
@@ -190,10 +194,43 @@ async function createSessionRecordWithClient(
   // writer so the fork's `messages_log` is populated (count == forkAtMessageIndex,
   // matching the truncated Claude resume transcript) and the sidecar exists —
   // making the fork store identically to its parent. FW-10 fork UI-empty fix.
+  // brick://5bac5564 Layer B: when the resolution-tier guard rewrote an implicit
+  // Fable, stamp the loud `model_guard` breadcrumb into the record and mirror a
+  // warning into `<id>.messages.ndjson` so BOTH the child and its spawner see it.
+  // The pre-guard provenance of a guard-forced spawn/copy is deterministically
+  // "inherited" (the guard can only fire when a Fable value arrived via
+  // inheritance; an explicit Fable is preserved, and "default" never yields Fable).
+  const guardBlocked =
+    effectiveSessionOptions?.modelSource === "guard-forced"
+      ? effectiveSessionOptions.modelGuardBlocked
+      : undefined;
+  const guardForcedTo = effectiveSessionOptions?.model;
+  if (guardBlocked && guardForcedTo) {
+    stampModelGuardBreadcrumb(record, {
+      blocked: guardBlocked,
+      forcedTo: guardForcedTo,
+      source: "inherited",
+      at: now,
+    });
+    if (options.verbose) {
+      process.stderr.write(
+        `[acpx] model-guard session=${record.acpxRecordId} implicit Fable "${guardBlocked}" blocked → forced ${guardForcedTo}\n`,
+      );
+    }
+  }
+
   if (forkContext) {
     await writeSessionRecordAtBoundary(record);
   } else {
     await writeSessionRecord(record);
+  }
+  if (guardBlocked && guardForcedTo) {
+    // Best-effort mirror (pushes the warning message + boundary-writes the
+    // sidecar) — a write failure must never fail the spawn.
+    await mirrorModelGuardToMessages(record, {
+      blocked: guardBlocked,
+      forcedTo: guardForcedTo,
+    }).catch(() => {});
   }
   return record;
 }
@@ -554,7 +591,16 @@ export async function ensureSession(options: SessionEnsureOptions): Promise<Sess
       await writeSessionRecord(working);
     }
     const requestedModel = options.sessionOptions?.model;
-    if (requestedModel) {
+    // brick://5bac5564 (RE-ENSURE-CLOBBER): a FLAGLESS re-ensure of an EXISTING
+    // session must NOT clobber its explicit pin. inheritedSpawnSessionOptions fills
+    // `model` with the INHERITED parent model on a flagless re-ensure, so applying
+    // it here would overwrite the child's real `--model` pin with the parent's
+    // (the general sonnet→opus / opus→fable clobber — the true M1). Apply ONLY when
+    // THIS invocation explicitly requested the model (model_source === "explicit");
+    // never for an inherited / default / guard-forced value. Inheritance is a
+    // CREATE-time concept; a reuse keeps the existing pin verbatim.
+    const modelExplicitlyRequested = options.sessionOptions?.modelSource === "explicit";
+    if (requestedModel && modelExplicitlyRequested) {
       // Internal ensure path — must NOT recycle the owner (the recycle flag is
       // left off). This runs as part of session ensure/spawn, which already
       // cold-reconnects; recycling here would thrash owners on ordinary prompts.

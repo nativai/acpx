@@ -222,6 +222,29 @@ export function setDesiredModelId(record: SessionRecord, modelId: string | undef
   record.acpx = acpx;
 }
 
+// brick://5bac5564 Layer C: set/clear the flat-string model provenance alongside
+// `session_options.model`. Mirrors setDesiredModelId's emptiness discipline so a
+// cleared source never resurrects (or strands) the session_options block.
+export function setDesiredModelSource(record: SessionRecord, source: string | undefined): void {
+  const acpx = ensureAcpxState(record.acpx);
+  const normalized = normalizeModelId(source);
+  const sessionOptions = { ...acpx.session_options };
+
+  if (normalized) {
+    sessionOptions.model_source = normalized;
+  } else {
+    delete sessionOptions.model_source;
+  }
+
+  if (hasSessionOptions(sessionOptions)) {
+    acpx.session_options = sessionOptions;
+  } else {
+    delete acpx.session_options;
+  }
+
+  record.acpx = acpx;
+}
+
 export function setCurrentModelId(record: SessionRecord, modelId: string | undefined): void {
   const acpx = ensureAcpxState(record.acpx);
   const normalized = normalizeModelId(modelId);

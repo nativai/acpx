@@ -13,6 +13,7 @@ import {
   setDesiredConfigOption,
   setDesiredModeId,
   setDesiredModelId,
+  setDesiredModelSource,
 } from "../../session/mode-preference.js";
 import { assertRecordModelSupported } from "../../session/model-application.js";
 import {
@@ -168,6 +169,10 @@ export async function setSessionModel(
   if (submittedToOwner) {
     setDesiredModelId(record, options.modelId);
     setCurrentModelId(record, options.modelId);
+    // brick://5bac5564 R5: a `set model` is an explicit acpx-level request →
+    // provenance "explicit" (so a deliberate `set model fable` is never guarded,
+    // and a later flagless re-ensure won't clobber this pin).
+    setDesiredModelSource(record, "explicit");
     await writeSessionRecord(record);
     result = { record, resumed: false };
   } else {
