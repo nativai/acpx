@@ -350,7 +350,74 @@ function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
   assignParsedOwnerOptions(state, record.owner_options);
   assignParsedSessionOptions(state, record.session_options);
 
+  // brick://07dd62c9: the live served block + floor breadcrumbs MUST round-trip on
+  // a cold disk reload (mirror context_window_size), or every queue-owner delivery
+  // / owner respawn strips them — the served-truth surface goes blank and the
+  // durable park (⭐ retry-across-time) does not survive a respawn.
+  assignServedState(state, record.served);
+  assignServedBelowFloor(state, record.served_below_floor);
+  assignFloorParked(state, record.floor_parked);
+
   return state;
+}
+
+// Copy the optional string fields of the live served block. Best-effort passthrough
+// of an acpx-authored object (mirror the lenient config_options passthrough).
+function assignServedState(state: SessionAcpxState, raw: unknown): void {
+  const served = asRecord(raw);
+  if (!served) {
+    return;
+  }
+  const parsed: Record<string, unknown> = {};
+  copyStringField(parsed, served, "model");
+  copyStringField(parsed, served, "effort");
+  copyStringField(parsed, served, "at");
+  copyStringField(parsed, served, "source");
+  if (Object.keys(parsed).length > 0) {
+    state.served = parsed as NonNullable<SessionAcpxState["served"]>;
+  }
+}
+
+function assignServedBelowFloor(state: SessionAcpxState, raw: unknown): void {
+  const crumb = asRecord(raw);
+  if (!crumb || typeof crumb.at !== "string" || crumb.at.length === 0) {
+    return;
+  }
+  const parsed: Record<string, unknown> = { at: crumb.at };
+  copyStringField(parsed, crumb, "served_model");
+  copyStringField(parsed, crumb, "served_effort");
+  copyStringField(parsed, crumb, "pinned_model");
+  copyStringField(parsed, crumb, "pinned_effort");
+  state.served_below_floor = parsed as NonNullable<SessionAcpxState["served_below_floor"]>;
+}
+
+function assignFloorParked(state: SessionAcpxState, raw: unknown): void {
+  const parked = asRecord(raw);
+  if (
+    !parked ||
+    typeof parked.at !== "string" ||
+    parked.at.length === 0 ||
+    typeof parked.reason !== "string" ||
+    parked.reason.length === 0
+  ) {
+    return;
+  }
+  const parsed: Record<string, unknown> = { at: parked.at, reason: parked.reason };
+  copyStringField(parsed, parked, "observed_model");
+  state.floor_parked = parsed as NonNullable<SessionAcpxState["floor_parked"]>;
+}
+
+// Copy `source[key]` onto `target[key]` when it is a non-empty string. A small
+// helper so the served/breadcrumb passthroughs stay flat (lint complexity ≤ 8).
+function copyStringField(
+  target: Record<string, unknown>,
+  source: Record<string, unknown>,
+  key: string,
+): void {
+  const value = source[key];
+  if (typeof value === "string" && value.length > 0) {
+    target[key] = value;
+  }
 }
 
 function assignBooleanTrue(
@@ -412,6 +479,7 @@ function assignParsedSessionOptions(state: SessionAcpxState, raw: unknown): void
   assignSessionOptionProfile(parsedSessionOptions, sessionOptions.profile);
   assignSessionOptionEffort(parsedSessionOptions, sessionOptions.effort);
   assignSessionOptionAutoFailover(parsedSessionOptions, sessionOptions.auto_failover);
+  assignSessionOptionFloorHard(parsedSessionOptions, sessionOptions.floor_hard);
   assignSessionOptionSubscriptionSwitch(parsedSessionOptions, sessionOptions.subscription_switch);
   assignSessionOptionAccountSwitch(parsedSessionOptions, sessionOptions.account_switch);
   assignSessionOptionProvisioningWarning(parsedSessionOptions, sessionOptions.provisioning_warning);
@@ -607,6 +675,19 @@ function assignSessionOptionAutoFailover(
 ): void {
   if (typeof value === "boolean") {
     options.auto_failover = value;
+  }
+}
+
+// brick://07dd62c9: floor_hard is a durable policy flag — it MUST round-trip back
+// on a cold disk reload (mirror auto_failover), or every queue-owner delivery /
+// owner respawn strips it → floorHardEnabled=false → the airtight quarantine
+// silently stops firing.
+function assignSessionOptionFloorHard(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+  value: unknown,
+): void {
+  if (typeof value === "boolean") {
+    options.floor_hard = value;
   }
 }
 
