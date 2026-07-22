@@ -12,10 +12,12 @@ import {
   loadProfileRegistry,
 } from "../../config/profiles.js";
 import {
+  EMPTY_EXCLUDE,
   getSubscriptionsFableState,
   getSubscriptionsUsage,
   getSubscriptionsUsageWithFable,
   isFableModel,
+  isSubscriptionEligible,
   maxedThreshold,
   maxUtilization,
   pickFailoverTarget,
@@ -1064,7 +1066,7 @@ function pickSelectionTarget(
 // errored / <30% headroom) — bypasses the cooldown; OPTIMIZATION when the current
 // sub is still healthy but the target ranks strictly better AND no auto-selection
 // switch happened within the cooldown.
-function shouldSwitchToSelectionTarget(params: {
+export function shouldSwitchToSelectionTarget(params: {
   record: SessionRecord;
   target: SubscriptionUsage;
   targetIndex: number;
@@ -1073,14 +1075,13 @@ function shouldSwitchToSelectionTarget(params: {
 }): boolean {
   const { currentUsage } = params;
   // Current sub ineligible → FORCED switch (correctness floor; also covers a current
-  // sub missing from the probe set, i.e. no headroom evidence).
-  if (
-    !currentUsage ||
-    currentUsage.locked === true ||
-    currentUsage.error !== undefined ||
-    currentUsage.fiveHour === null ||
-    currentUsage.fiveHour.utilization >= 0.7
-  ) {
+  // sub missing from the probe set, i.e. no headroom evidence). brick://67d2fd2f
+  // req1 (REPRO-REQ1 Mech1): reuse the SHARED eligibility predicate instead of a
+  // hand-rolled 5h-only test, so the forced trigger and target selection can never
+  // diverge on the weekly guard again. threshold 0.70 = the primary 5h bar; empty
+  // exclude (the current sub's own membership is irrelevant here). Now fires when
+  // current lacks 5h OR weekly headroom (or is locked/errored/probe-missing).
+  if (!currentUsage || !isSubscriptionEligible(currentUsage, EMPTY_EXCLUDE, 0.7)) {
     return true;
   }
   // Current sub still healthy → OPTIMIZATION, cooldown-gated + strictly-better only.

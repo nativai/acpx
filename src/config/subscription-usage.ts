@@ -408,7 +408,49 @@ export function maxedThreshold(): number {
   return parsed;
 }
 
+const DEFAULT_WEEKLY_HEADROOM_THRESHOLD = 0.9;
+
+/**
+ * Resolve the weekly (7d) headroom eligibility threshold. brick://67d2fd2f req1:
+ * a subscription must have REAL weekly headroom to be eligible — its 7d
+ * utilization must be BELOW this value (default 0.90 ⇒ ≥10% weekly headroom),
+ * not merely "not dead" (maxedThreshold, 0.98). Configurable via
+ * ACPX_SUBSCRIPTION_WEEKLY_THRESHOLD, same parse/clamp as maxedThreshold().
+ * The SAME constant drives the acpx-ui req5 binding-window ring (client
+ * WEEKLY_THRESHOLD_PCT=90) so selector and display always agree on "exhausted".
+ */
+export function weeklyHeadroomThreshold(): number {
+  const raw = process.env.ACPX_SUBSCRIPTION_WEEKLY_THRESHOLD?.trim();
+  if (!raw) {
+    return DEFAULT_WEEKLY_HEADROOM_THRESHOLD;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 1) {
+    return DEFAULT_WEEKLY_HEADROOM_THRESHOLD;
+  }
+  return parsed;
+}
+
+/** Empty exclude set for eligibility checks that don't exclude any sub. */
+const EMPTY_EXCLUDE: ReadonlySet<string> = new Set<string>();
+
 type IndexedUsage = { usage: SubscriptionUsage; index: number };
+
+/**
+ * Is `usage` an eligible subscription target? brick://67d2fd2f req1 exports this
+ * so the forced-switch trigger (`shouldSwitchToSelectionTarget`) reuses the SAME
+ * predicate as target selection — the two can never diverge on the weekly guard
+ * again (that divergence was REPRO-REQ1 Mech1).
+ */
+export function isSubscriptionEligible(
+  usage: SubscriptionUsage,
+  exclude: ReadonlySet<string>,
+  threshold: number,
+): boolean {
+  return isEligibleForFailover(usage, exclude, threshold);
+}
+
+export { EMPTY_EXCLUDE };
 
 function isEligibleForFailover(
   usage: SubscriptionUsage,
@@ -430,9 +472,11 @@ function isEligibleForFailover(
     return false;
   }
   // sevenDay === null means the 7d header was absent — absence ≠ exhausted, so
-  // do not reject. Only reject when the window is present and weekly-dead
-  // (≥ maxedThreshold, independent of the 5h `threshold` param).
-  if (usage.sevenDay !== null && usage.sevenDay.utilization >= maxedThreshold()) {
+  // do not reject. Only reject when the window is present and lacks REAL weekly
+  // headroom (≥ weeklyHeadroomThreshold, default 0.90 — brick://67d2fd2f req1,
+  // was maxedThreshold 0.98 "not-dead"; independent of the 5h `threshold` param,
+  // so a weekly-tight sub is never selected even in the relaxed fallback rung).
+  if (usage.sevenDay !== null && usage.sevenDay.utilization >= weeklyHeadroomThreshold()) {
     return false;
   }
   return usage.fiveHour.utilization < threshold;
