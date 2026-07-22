@@ -1066,7 +1066,7 @@ function pickSelectionTarget(
 // errored / <30% headroom) — bypasses the cooldown; OPTIMIZATION when the current
 // sub is still healthy but the target ranks strictly better AND no auto-selection
 // switch happened within the cooldown.
-function shouldSwitchToSelectionTarget(params: {
+export function shouldSwitchToSelectionTarget(params: {
   record: SessionRecord;
   target: SubscriptionUsage;
   targetIndex: number;
