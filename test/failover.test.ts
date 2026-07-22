@@ -4,11 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  EMPTY_EXCLUDE,
+  isSubscriptionEligible,
   maxedThreshold,
   maxUtilization,
   pickFailoverTarget,
   type SubscriptionUsage,
   type SubscriptionUsageWindow,
+  weeklyHeadroomThreshold,
 } from "../src/config/subscription-usage.js";
 import {
   AllSubscriptionsExhaustedError,
@@ -19,7 +22,9 @@ import {
   classifyFailover,
   enforceSubscriptionLockBeforeTurn,
   FAILOVER_ERROR_KINDS,
+  shouldSwitchToSelectionTarget,
 } from "../src/runtime/engine/failover.js";
+import type { SessionRecord } from "../src/types.js";
 import { makeSessionRecord } from "./runtime-test-helpers.js";
 
 // Risk 4: pin the failover error-kind contract so any change is a deliberate,
@@ -299,14 +304,16 @@ test("pickFailoverTarget: sub with fiveHour === null is excluded (5h header abse
   assert.equal(target?.id, "eligible");
 });
 
-test("pickFailoverTarget: high 7d utilization alone does NOT exclude a sub", () => {
-  // 7d utilization at 0.95 but 5h utilization fine — still eligible (< maxedThreshold 0.98)
+test("pickFailoverTarget: high 7d utilization (0.95) EXCLUDES a sub even with fine 5h (req1 real-headroom gate)", () => {
+  // brick://67d2fd2f req1 flipped this: the weekly gate moved from 0.98 (not-dead)
+  // to 0.90 (real headroom), so a 7d=0.95 sub with fine 5h is now INELIGIBLE — it
+  // has <10% real weekly headroom. (Was: eligible under the old 0.98 not-dead bar.)
   const highSevenDay = usage("high-7d", 0, undefined, {
     fiveHour: { utilization: 0.4, reset: null },
     sevenDay: { utilization: 0.95, reset: null },
   });
   const target = pickFailoverTarget([highSevenDay], { exclude: new Set(), threshold: 0.98 });
-  assert.equal(target?.id, "high-7d");
+  assert.equal(target, undefined);
 });
 
 // ── Regression matrix: 7d exhaustion gate (brick://8021102c) ──────────────
@@ -537,4 +544,194 @@ test("enforceSubscriptionLockBeforeTurn preserves exhausted semantics when unloc
       );
     },
   );
+});
+
+// ── brick://67d2fd2f req1: REAL weekly-headroom eligibility ────────────────
+// The gate moved from "not-dead" (maxedThreshold 0.98) to real headroom
+// (weeklyHeadroomThreshold 0.90). Same predicate now drives the forced-switch
+// leave-current trigger, so selection and forced-off can never diverge.
+
+function withWeeklyEnv<T>(value: string | undefined, run: () => T): T {
+  const prev = process.env.ACPX_SUBSCRIPTION_WEEKLY_THRESHOLD;
+  if (value === undefined) {
+    delete process.env.ACPX_SUBSCRIPTION_WEEKLY_THRESHOLD;
+  } else {
+    process.env.ACPX_SUBSCRIPTION_WEEKLY_THRESHOLD = value;
+  }
+  try {
+    return run();
+  } finally {
+    if (prev === undefined) {
+      delete process.env.ACPX_SUBSCRIPTION_WEEKLY_THRESHOLD;
+    } else {
+      process.env.ACPX_SUBSCRIPTION_WEEKLY_THRESHOLD = prev;
+    }
+  }
+}
+
+test("weeklyHeadroomThreshold defaults to 0.90", () => {
+  withWeeklyEnv(undefined, () => {
+    assert.equal(weeklyHeadroomThreshold(), 0.9);
+  });
+});
+
+test("weeklyHeadroomThreshold parses a valid env override", () => {
+  withWeeklyEnv("0.85", () => {
+    assert.equal(weeklyHeadroomThreshold(), 0.85);
+  });
+});
+
+test("weeklyHeadroomThreshold clamps invalid env overrides back to the default", () => {
+  for (const bad of ["0", "-0.5", "1.5", "2", "nonsense", ""]) {
+    withWeeklyEnv(bad, () => {
+      assert.equal(weeklyHeadroomThreshold(), 0.9, `override "${bad}" should fall back to 0.90`);
+    });
+  }
+});
+
+test("req1: a 7d=0.92 sub is INELIGIBLE when a 7d=0.88 sub exists (real headroom, not not-dead)", () => {
+  const tight = usage("tight", 0, undefined, {
+    fiveHour: { utilization: 0.0, reset: null },
+    sevenDay: { utilization: 0.92, reset: "2026-07-16T00:00:00Z" }, // soonest reset, but weekly-tight
+  });
+  const eligible = usage("eligible", 0, undefined, {
+    fiveHour: { utilization: 0.0, reset: null },
+    sevenDay: { utilization: 0.88, reset: "2026-07-20T00:00:00Z" },
+  });
+  const target = pickFailoverTarget([tight, eligible], { exclude: new Set(), threshold: 0.7 });
+  // Base build (0.98 gate) would have picked "tight" (soonest 7d reset). The 0.90
+  // gate excludes it despite the soonest reset — real weekly headroom wins.
+  assert.equal(target?.id, "eligible");
+});
+
+test("req1: a lone 7d=0.95 sub yields undefined (hold — never selected)", () => {
+  const target = pickFailoverTarget(
+    [
+      usage("full", 0, undefined, {
+        fiveHour: { utilization: 0.0, reset: null },
+        sevenDay: { utilization: 0.95, reset: "2026-07-16T00:00:00Z" },
+      }),
+    ],
+    { exclude: new Set(), threshold: 0.7 },
+  );
+  assert.equal(target, undefined);
+});
+
+test("req1: a 7d=0.88 sub is eligible (below the 0.90 bar)", () => {
+  const target = pickFailoverTarget(
+    [
+      usage("ok", 0, undefined, {
+        fiveHour: { utilization: 0.2, reset: null },
+        sevenDay: { utilization: 0.88, reset: "2026-07-20T00:00:00Z" },
+      }),
+    ],
+    { exclude: new Set(), threshold: 0.7 },
+  );
+  assert.equal(target?.id, "ok");
+});
+
+test("req1: the weekly bar is NOT relaxed in the secondary (0.98) fallback rung", () => {
+  // pickSelectionTarget's secondary rung relaxes the 5h threshold to maxedThreshold
+  // (0.98) but the weekly gate is independent of the threshold param, so a weekly-
+  // tight sub is still ineligible even at threshold 0.98.
+  const target = pickFailoverTarget(
+    [
+      usage("weekly-tight-fresh5h", 0, undefined, {
+        fiveHour: { utilization: 0.0, reset: null },
+        sevenDay: { utilization: 0.93, reset: "2026-07-16T00:00:00Z" },
+      }),
+    ],
+    { exclude: new Set(), threshold: 0.98 },
+  );
+  assert.equal(target, undefined);
+});
+
+test("isSubscriptionEligible: 7d at the 0.90 boundary is ineligible (>=), 0.89 eligible", () => {
+  const atBoundary = usage("at", 0, undefined, {
+    fiveHour: { utilization: 0.1, reset: null },
+    sevenDay: { utilization: 0.9, reset: null },
+  });
+  const justUnder = usage("under", 0, undefined, {
+    fiveHour: { utilization: 0.1, reset: null },
+    sevenDay: { utilization: 0.89, reset: null },
+  });
+  assert.equal(isSubscriptionEligible(atBoundary, EMPTY_EXCLUDE, 0.7), false);
+  assert.equal(isSubscriptionEligible(justUnder, EMPTY_EXCLUDE, 0.7), true);
+});
+
+test("isSubscriptionEligible: absent 7d window (sevenDay=null) is NOT treated as exhausted", () => {
+  const noWeekly = usage("noweekly", 0, undefined, {
+    fiveHour: { utilization: 0.1, reset: null },
+    sevenDay: null,
+  });
+  assert.equal(isSubscriptionEligible(noWeekly, EMPTY_EXCLUDE, 0.7), true);
+});
+
+// ── brick://67d2fd2f req1 Mech1: forced-switch leave-current fix ───────────
+
+function selectionRecord(): SessionRecord {
+  return makeSessionRecord({
+    acpxRecordId: "rec-forced",
+    acpSessionId: "acp",
+    agentCommand: "node claude-agent.js",
+    cwd: "/tmp/project",
+    acpx: { session_options: { profile: "current" } },
+  });
+}
+
+test("req1 Mech1: a session on a weekly-full sub (fresh 5h) is FORCED off it", () => {
+  // Current sub: 5h fresh (0.0) but weekly full (0.95) — on the base build the
+  // forced branch checked 5h only, so it would NOT switch and the session 429s.
+  const currentUsage = usage("current", 0, undefined, {
+    fiveHour: { utilization: 0.0, reset: null },
+    sevenDay: { utilization: 0.95, reset: "2026-07-16T00:00:00Z" },
+  });
+  const target = usage("alt", 0, undefined, {
+    fiveHour: { utilization: 0.1, reset: null },
+    sevenDay: { utilization: 0.3, reset: "2026-07-20T00:00:00Z" },
+  });
+  const forced = shouldSwitchToSelectionTarget({
+    record: selectionRecord(),
+    target,
+    targetIndex: 1,
+    currentUsage,
+    currentIndex: 0,
+  });
+  assert.equal(forced, true);
+});
+
+test("req1 Mech1: a session on a weekly-HEALTHY current sub is NOT force-switched (no thrash)", () => {
+  // Current sub healthy (5h fresh, weekly 0.10); target is NOT strictly better
+  // (worse 7d reset + higher util) → optimization branch returns false, no switch.
+  const currentUsage = usage("current", 0, undefined, {
+    fiveHour: { utilization: 0.0, reset: null },
+    sevenDay: { utilization: 0.1, reset: "2026-07-16T00:00:00Z" },
+  });
+  const target = usage("alt", 0, undefined, {
+    fiveHour: { utilization: 0.1, reset: null },
+    sevenDay: { utilization: 0.5, reset: "2026-07-25T00:00:00Z" },
+  });
+  const shouldSwitch = shouldSwitchToSelectionTarget({
+    record: selectionRecord(),
+    target,
+    targetIndex: 1,
+    currentUsage,
+    currentIndex: 0,
+  });
+  assert.equal(shouldSwitch, false);
+});
+
+test("req1 Mech1: a missing current-usage probe forces a switch (no headroom evidence)", () => {
+  const target = usage("alt", 0, undefined, {
+    fiveHour: { utilization: 0.1, reset: null },
+    sevenDay: { utilization: 0.3, reset: "2026-07-20T00:00:00Z" },
+  });
+  const forced = shouldSwitchToSelectionTarget({
+    record: selectionRecord(),
+    target,
+    targetIndex: 0,
+    currentUsage: undefined,
+    currentIndex: -1,
+  });
+  assert.equal(forced, true);
 });
