@@ -1668,6 +1668,7 @@ test("sessions copy materializes cross-cwd Claude forks in the destination proje
         "claude",
         "sessions",
         "copy",
+        "--ephemeral",
         "--from",
         "source-claude-cross-cwd",
         "--name",
