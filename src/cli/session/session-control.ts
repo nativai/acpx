@@ -360,10 +360,18 @@ export async function setSessionProfile(
   return { record, from: fromProfile, to: toProfile, transcriptCopied, ownerRestarted };
 }
 
+// brick://f1f0b3ea — recycle a live idle owner after the write, mirroring the rest
+// of the setter family (setSessionModel/ConfigOption/Subscription/Profile). Without
+// it, a warm owner survives the `set` and re-persists its stale spawn-time snapshot
+// on the next turn, clobbering the change back (independent staging TE, brick://a97a383f
+// defect #1; deterministic warm-owner repro verification/repro-warm-owner-clobber.sh).
+// refuseTurnInFlightForLiveOwner returns whether a live owner exists → recycle it.
+// Unconditional recycle is safe: this setter is called ONLY from the CLI-verb handler
+// handleSetAutoFailover (never an internal/replay path) — guarded by T5.1e.
 export async function setSessionAutoFailover(
   options: SessionSetAutoFailoverOptions,
 ): Promise<SessionSetAutoFailoverResult> {
-  await refuseTurnInFlightForLiveOwner(
+  const ownerAlive = await refuseTurnInFlightForLiveOwner(
     options.sessionId,
     () => new ConfigOptionTurnInFlightError("auto-failover", options.sessionName),
   );
@@ -377,15 +385,20 @@ export async function setSessionAutoFailover(
   record.acpx = acpx;
   await writeSessionRecord(record);
 
-  return { record, autoFailover: options.autoFailover };
+  const result: SessionSetAutoFailoverResult = { record, autoFailover: options.autoFailover };
+  if (ownerAlive) {
+    await terminateQueueOwnerForSession(options.sessionId);
+    result.ownerRestarted = true;
+  }
+  return result;
 }
 
 // brick://4d517be2 — set the per-session autonomous-selection disable knob (mirror
-// setSessionAutoFailover). A pure record edit; the next turn's pre-turn hook reads it.
+// setSessionAutoFailover). brick://f1f0b3ea — recycles the live idle owner (see above).
 export async function setSessionAutoSubscription(
   options: SessionSetAutoSubscriptionOptions,
 ): Promise<SessionSetAutoSubscriptionResult> {
-  await refuseTurnInFlightForLiveOwner(
+  const ownerAlive = await refuseTurnInFlightForLiveOwner(
     options.sessionId,
     () => new ConfigOptionTurnInFlightError("auto-subscription", options.sessionName),
   );
@@ -399,15 +412,24 @@ export async function setSessionAutoSubscription(
   record.acpx = acpx;
   await writeSessionRecord(record);
 
-  return { record, autoSubscription: options.autoSubscription };
+  const result: SessionSetAutoSubscriptionResult = {
+    record,
+    autoSubscription: options.autoSubscription,
+  };
+  if (ownerAlive) {
+    await terminateQueueOwnerForSession(options.sessionId);
+    result.ownerRestarted = true;
+  }
+  return result;
 }
 
 // brick://4d517be2 — set the per-session fable→opus degrade opt-in (mirror
-// setSessionAutoFailover). A pure record edit; the fable short-circuit reads it.
+// setSessionAutoFailover). brick://f1f0b3ea — recycles the live idle owner for
+// family-consistency (same stale-snapshot class; not yet field-reported).
 export async function setSessionFableDegrade(
   options: SessionSetFableDegradeOptions,
 ): Promise<SessionSetFableDegradeResult> {
-  await refuseTurnInFlightForLiveOwner(
+  const ownerAlive = await refuseTurnInFlightForLiveOwner(
     options.sessionId,
     () => new ConfigOptionTurnInFlightError("fable-degrade", options.sessionName),
   );
@@ -421,7 +443,12 @@ export async function setSessionFableDegrade(
   record.acpx = acpx;
   await writeSessionRecord(record);
 
-  return { record, fableDegradeOk: options.fableDegradeOk };
+  const result: SessionSetFableDegradeResult = { record, fableDegradeOk: options.fableDegradeOk };
+  if (ownerAlive) {
+    await terminateQueueOwnerForSession(options.sessionId);
+    result.ownerRestarted = true;
+  }
+  return result;
 }
 
 function firstAgentCommandToken(command: string): string | undefined {

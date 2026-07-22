@@ -293,6 +293,8 @@ export type SessionSetAutoFailoverOptions = {
 export type SessionSetAutoFailoverResult = {
   record: SessionRecord;
   autoFailover: boolean;
+  /** True when a live queue owner existed and was restarted to bind the change. */
+  ownerRestarted?: boolean;
 };
 
 // brick://4d517be2 — the autonomous-selection disable knob.
@@ -306,6 +308,8 @@ export type SessionSetAutoSubscriptionOptions = {
 export type SessionSetAutoSubscriptionResult = {
   record: SessionRecord;
   autoSubscription: boolean;
+  /** True when a live queue owner existed and was restarted to bind the change. */
+  ownerRestarted?: boolean;
 };
 
 // brick://4d517be2 — the fable→opus degrade opt-in.
@@ -319,6 +323,8 @@ export type SessionSetFableDegradeOptions = {
 export type SessionSetFableDegradeResult = {
   record: SessionRecord;
   fableDegradeOk: boolean;
+  /** True when a live queue owner existed and was restarted to bind the change. */
+  ownerRestarted?: boolean;
 };
 
 export type { SessionAgentOptions };

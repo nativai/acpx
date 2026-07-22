@@ -37,6 +37,7 @@ import { fileURLToPath } from "node:url";
 import { isProcessAlive, readQueueOwnerProcessIdentity } from "../src/cli/queue/lease-store.js";
 import {
   setSessionAutoFailover,
+  setSessionAutoSubscription,
   setSessionConfigOption,
   setSessionModel,
 } from "../src/cli/session/session-control.js";
@@ -57,6 +58,14 @@ import { makeSessionRecord } from "./runtime-test-helpers.js";
 
 // Repo-root/src — the committed TypeScript source the structural sentinels read.
 const SRC_DIR = fileURLToPath(new URL("../../src/", import.meta.url));
+
+// All *.ts source files under src/ (for the caller-set structural guard T5.1e).
+async function collectSrcTsFiles(root: string): Promise<string[]> {
+  const entries = await fs.readdir(root, { recursive: true, withFileTypes: true });
+  return entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".ts"))
+    .map((entry) => path.join(entry.parentPath, entry.name));
+}
 
 async function waitUntilDead(pid: number, timeoutMs = 2_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -315,6 +324,137 @@ test("T5.4b TURN-IN-FLIGHT: set auto-failover with an active turn is refused; ow
       stopProcess(keeper);
     }
   });
+});
+
+// ---------------------------------------------------------------------------
+// T5.1c / T5.1d — WARM recycle for the AUTO-POLICY setters (brick://f1f0b3ea).
+// The three auto-policy setters (auto-failover / auto-subscription / fable-degrade)
+// were added as "pure record edits" that OMITTED the family's owner-recycle, so a
+// warm idle owner survived the `set` and re-persisted its stale spawn-time snapshot
+// on the next turn — clobbering the change (independent staging TE, brick://a97a383f
+// defect #1; deterministic warm-owner repro verification/repro-warm-owner-clobber.sh).
+// These lock the recycle: a live idle owner is terminated, ownerRestarted=true, and
+// the new policy is persisted. Seeded PROFILE-based (the ~96% fleet-majority `.profile`
+// slot, brick://f5aabb1d) — NOT a default-subscription record.
+//   RED on base: the setter never terminates → keeper stays alive, ownerRestarted
+//     is undefined (first assertion fails).
+// Unlike model/effort these recycle UNCONDITIONALLY (no recycleOwner gate): the
+// setters are called ONLY from the CLI-verb handlers, never an internal/replay path
+// (structural guard T5.1e below).
+// ---------------------------------------------------------------------------
+
+test("T5.1c WARM: set auto-failover recycles a live idle owner — terminated, ownerRestarted, persisted", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "recycle-warm-auto-failover";
+    const server = createMockOwnerServer(false); // turn NOT in flight
+    const { keeper } = await plantLiveOwner(homeDir, sessionId, server);
+    // PROFILE-based record with the policy currently OFF (the pre-turn state a pin
+    // or an explicit `off` leaves; the `set on` below is the change that must stick).
+    await seedSessionJson(
+      homeDir,
+      seedRecord(homeDir, sessionId, {
+        session_options: { profile: "sub2", auto_failover: false },
+      }),
+    );
+
+    try {
+      const result = await setSessionAutoFailover({ sessionId, autoFailover: true });
+
+      // The live owner was recycled so its stale snapshot can't revert the change.
+      assert.equal(result.ownerRestarted, true);
+      await waitUntilDead(keeper.pid as number);
+      assert.equal(isProcessAlive(keeper.pid), false);
+
+      const onDisk = await resolveSessionRecord(sessionId);
+      assert.equal(onDisk.acpx?.session_options?.auto_failover, true);
+      // The profile slot is untouched (the setter is a scoped policy edit).
+      assert.equal(onDisk.acpx?.session_options?.profile, "sub2");
+    } finally {
+      await closeServer(server);
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("T5.1d WARM: set auto-subscription recycles a live idle owner — terminated, ownerRestarted, persisted", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "recycle-warm-auto-subscription";
+    const server = createMockOwnerServer(false);
+    const { keeper } = await plantLiveOwner(homeDir, sessionId, server);
+    await seedSessionJson(
+      homeDir,
+      seedRecord(homeDir, sessionId, {
+        session_options: { profile: "sub2", auto_subscription: false },
+      }),
+    );
+
+    try {
+      const result = await setSessionAutoSubscription({ sessionId, autoSubscription: true });
+
+      assert.equal(result.ownerRestarted, true);
+      await waitUntilDead(keeper.pid as number);
+      assert.equal(isProcessAlive(keeper.pid), false);
+
+      const onDisk = await resolveSessionRecord(sessionId);
+      assert.equal(onDisk.acpx?.session_options?.auto_subscription, true);
+      assert.equal(onDisk.acpx?.session_options?.profile, "sub2");
+    } finally {
+      await closeServer(server);
+      stopProcess(keeper);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T5.1e — MULTI-CALLER GUARD (structural; parity with T5.9). The auto-policy
+// recycle is UNCONDITIONAL, so its safety rests on the setters being called ONLY
+// from the CLI-verb handlers (handleSetAutoFailover/handleSetAutoSubscription/
+// handleSetFableDegrade) — never an internal/replay path (ensureSession,
+// prompt-runner, reconnect) that must not kill a warm owner. A future internal
+// caller would silently start recycling; this sentinel fails first.
+// ---------------------------------------------------------------------------
+
+test("T5.1e GUARD: the auto-policy setters are called ONLY from the CLI-verb handlers", async () => {
+  const handlers = await fs.readFile(path.join(SRC_DIR, "cli/command-handlers.ts"), "utf8");
+  // The CLI-verb handlers are the (only) authorized callers.
+  assert.match(
+    handlers,
+    /setSessionAutoFailover\(\{/,
+    "handleSetAutoFailover calls setSessionAutoFailover",
+  );
+  assert.match(
+    handlers,
+    /setSessionAutoSubscription\(\{/,
+    "handleSetAutoSubscription calls setSessionAutoSubscription",
+  );
+  assert.match(
+    handlers,
+    /setSessionFableDegrade\(\{/,
+    "handleSetFableDegrade calls setSessionFableDegrade",
+  );
+
+  // No OTHER src file may call them (an internal caller would recycle unguarded).
+  const files = await collectSrcTsFiles(SRC_DIR);
+  for (const file of files) {
+    if (
+      file.endsWith("cli/command-handlers.ts") ||
+      file.endsWith("cli/session/session-control.ts")
+    ) {
+      continue; // the handlers (callers) + the definitions themselves
+    }
+    const source = await fs.readFile(file, "utf8");
+    for (const fn of [
+      "setSessionAutoFailover",
+      "setSessionAutoSubscription",
+      "setSessionFableDegrade",
+    ]) {
+      assert.doesNotMatch(
+        source,
+        new RegExp(`${fn}\\(`),
+        `${path.relative(SRC_DIR, file)} must NOT call ${fn} — the unconditional owner-recycle is CLI-verb-only`,
+      );
+    }
+  }
 });
 
 // ---------------------------------------------------------------------------

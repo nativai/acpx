@@ -270,7 +270,10 @@ test("integration: an owner-respawn re-persist keeps auto_failover:false across 
   });
 });
 
-test("setSessionAutoFailover writes explicit policy without recycling a live-idle owner", async () => {
+// COLD path (no live owner): the write persists and ownerRestarted stays falsy —
+// there is no warm owner to recycle. The WARM recycle (brick://f1f0b3ea) is locked
+// by test/set-recycle-owner-regression.test.ts T5.1c.
+test("setSessionAutoFailover writes explicit policy on the cold path (no live owner to recycle)", async () => {
   await withTempHome("acpx-auto-fo-set-", async (homeDir) => {
     const record = makeSessionRecord({
       acpxRecordId: "set-auto-fo",
@@ -286,6 +289,8 @@ test("setSessionAutoFailover writes explicit policy without recycling a live-idl
       autoFailover: false,
     });
     assert.equal(off.autoFailover, false);
+    // No live owner planted → nothing to recycle (the WARM recycle is T5.1c).
+    assert.notEqual(off.ownerRestarted, true);
 
     const onDiskOff = JSON.parse(
       await fs.readFile(sessionFilePath(homeDir, "set-auto-fo"), "utf8"),
