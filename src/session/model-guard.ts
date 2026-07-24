@@ -151,6 +151,11 @@ function buildModelGuardMessage(params: { blocked: string; forcedTo: string }): 
         },
       ],
       tool_results: {},
+      // System breadcrumb, not a real model turn — must not count as
+      // irreplaceable history in the resume→session/new fallback gate
+      // (brick://de3645c6). Without this, a fresh guard-forced session whose
+      // cold first prompt hits a missing transcript is permanently unpromptable.
+      synthetic: true,
     },
   };
 }

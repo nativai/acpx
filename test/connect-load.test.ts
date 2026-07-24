@@ -1290,6 +1290,187 @@ test("connectAndLoadSession keeps a transcript-gone rejection LOUD after real tu
   });
 });
 
+test("connectAndLoadSession self-heals a guard-forced fresh session via session/new — synthetic breadcrumb must not gate the fallback (brick://de3645c6 repro C)", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const subscriptionDir = path.join(homeDir, ".acpx", "subscriptions", "paid");
+    await writeSubscriptionRegistry(homeDir, {
+      default: "paid",
+      subscriptions: [{ id: "paid", label: "Paid", configDir: subscriptionDir }],
+    });
+
+    // Incident specimen shape: a never-run session whose ONLY log entry is the
+    // implicit-Fable→opus guard breadcrumb acpx mirrors at CREATE time
+    // (Agent.synthetic:true). No real turn, no transcript on disk. Its cold first
+    // prompt issues session/resume → -32002; the transcript is genuinely missing.
+    // Before the fix the cosmetic breadcrumb tripped the has-agent-messages gate
+    // and the session was permanently unpromptable; now it must fall back to
+    // session/new and live.
+    const record = makeSessionRecord({
+      acpxRecordId: "guard-forced-record",
+      acpSessionId: "guard-session",
+      agentCommand: "agent",
+      cwd,
+      messages: [
+        {
+          Agent: {
+            content: [
+              {
+                Text:
+                  '⚠ implicit Fable blocked → forced opus: this session would have resolved to "fable" ' +
+                  "by inheritance/default, but Fable is never inherited automatically (brick://5bac5564).",
+              },
+            ],
+            tool_results: {},
+            synthetic: true,
+          },
+        },
+      ],
+      acpx: {
+        session_options: {
+          subscription: "paid",
+          model_source: "guard-forced",
+          model_guard: {
+            blocked: "fable",
+            forced_to: "opus",
+            source: "inherited",
+            at: "2026-01-01T00:00:00.000Z",
+          },
+        },
+      },
+    });
+
+    let createCalls = 0;
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({
+        running: true,
+      }),
+      supportsLoadSession: () => false,
+      supportsResumeSession: () => true,
+      resumeSession: async () => {
+        throw {
+          error: {
+            code: -32002,
+            message: "Resource not found: guard-session",
+          },
+        };
+      },
+      loadSessionWithOptions: async () => {
+        throw new Error("loadSessionWithOptions must not be called on the resume path");
+      },
+      createSession: async (createCwd) => {
+        createCalls += 1;
+        assert.equal(createCwd, cwd);
+        return {
+          sessionId: "healed-session",
+          agentSessionId: "healed-runtime",
+        };
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+    };
+
+    const result = await connectAndLoadSession({
+      client: client as never,
+      record,
+      activeController: ACTIVE_CONTROLLER,
+    });
+
+    assert.equal(createCalls, 1, "guard-forced fresh session must fall back to session/new");
+    assert.equal(result.resumed, false);
+    assert.equal(result.sessionId, "healed-session");
+    assert.equal(record.acpSessionId, "healed-session");
+    assert.equal(record.agentSessionId, "healed-runtime");
+  });
+});
+
+test("connectAndLoadSession keeps a missing-transcript resume LOUD when a real turn precedes the synthetic breadcrumb (gate not weakened) — brick://de3645c6", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const subscriptionDir = path.join(homeDir, ".acpx", "subscriptions", "paid");
+    await writeSubscriptionRegistry(homeDir, {
+      default: "paid",
+      subscriptions: [{ id: "paid", label: "Paid", configDir: subscriptionDir }],
+    });
+
+    // A real model turn DID happen (irreplaceable history), and a synthetic
+    // breadcrumb also sits in the log. A missing-transcript resume must still
+    // fail loudly — the synthetic-excluding gate must not swallow real history.
+    const record = makeSessionRecord({
+      acpxRecordId: "real-plus-synthetic-record",
+      acpSessionId: "history-session",
+      agentCommand: "agent",
+      cwd,
+      messages: [
+        {
+          Agent: {
+            content: [{ Text: "⚠ implicit Fable blocked → forced opus" }],
+            tool_results: {},
+            synthetic: true,
+          },
+        },
+        {
+          Agent: {
+            content: [{ Text: "real prior turn" }],
+            tool_results: {},
+          },
+        },
+      ],
+      acpx: {
+        session_options: {
+          subscription: "paid",
+        },
+      },
+    });
+
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({
+        running: true,
+      }),
+      supportsLoadSession: () => false,
+      supportsResumeSession: () => true,
+      resumeSession: async () => {
+        throw {
+          error: {
+            code: -32002,
+            message: "Resource not found: history-session",
+          },
+        };
+      },
+      loadSessionWithOptions: async () => {
+        throw new Error("loadSessionWithOptions must not be called on the resume path");
+      },
+      createSession: async () => {
+        throw new Error("createSession must not be called for a session with real history");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+    };
+
+    await assert.rejects(
+      async () =>
+        await connectAndLoadSession({
+          client: client as never,
+          record,
+          activeController: ACTIVE_CONTROLLER,
+        }),
+      (error: unknown) => {
+        assert(error instanceof Error);
+        assert.equal(error.name, "SessionResumeRequiredError");
+        assert.match(error.message, /missing transcript at/);
+        return true;
+      },
+    );
+    assert.equal(record.acpSessionId, "history-session");
+  });
+});
+
 test("connectAndLoadSession fails when desired mode replay cannot be restored on a fresh session", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

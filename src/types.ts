@@ -383,6 +383,16 @@ export type SessionAgentMessage = {
    * normal streamed Agent turn.
    */
   terminal_error?: SessionTerminalError;
+  /**
+   * Marks an Agent entry that acpx MIRRORED into the log as a system breadcrumb
+   * rather than a real model turn (e.g. the implicit-Fable→opus guard notice,
+   * brick://5bac5564). It carries NO conversation the adapter ever produced, so
+   * the fallback-safety gate must not treat it as irreplaceable history — see
+   * `sessionHasRealAgentTurn` (brick://de3645c6). Absent on every real streamed
+   * Agent turn. The FIX-A `terminal_error` mirror is deliberately NOT tagged: a
+   * terminal error reflects a real prompt attempt and must keep surfacing loudly.
+   */
+  synthetic?: true;
 };
 
 export type SessionMessage =
