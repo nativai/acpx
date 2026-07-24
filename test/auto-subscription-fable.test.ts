@@ -66,6 +66,25 @@ function startMockMessages(
   });
 }
 
+// A GET /api/oauth/usage mock that always 403s (no user:profile scope), so the
+// fable state degrades to the 1-token probe this rig drives. WITHOUT this, the new
+// pollFableUsage() would hit the LIVE api.anthropic.com with the rig's fake tokens
+// — a rate-limit-budget breach whose 429 also poisons the module-global back-off
+// and flakes the suite (brick://a319745e VERIFICATION). Deterministic 403 ⇒ no
+// back-off ever set.
+function startAlways403Usage(): Promise<{ server: Server; url: string }> {
+  return new Promise((resolve) => {
+    const server = createServer((_req, res) => {
+      res.writeHead(403).end("{}");
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      resolve({ server, url: `http://127.0.0.1:${port}/api/oauth/usage` });
+    });
+  });
+}
+
 let rigCounter = 0;
 
 async function withRig(
@@ -85,6 +104,7 @@ async function withRig(
   const fableByToken = new Map<string, FableOutcome>();
   const hits: ProbeHit[] = [];
   const prevEndpoint = process.env.CLAUDE_MESSAGES_ENDPOINT;
+  const prevUsage = process.env.CLAUDE_OAUTH_USAGE_ENDPOINT;
   const prevSessionUrl = process.env.ACPX_SESSION_URL;
   try {
     await fs.mkdir(subsDir, { recursive: true });
@@ -112,18 +132,26 @@ async function withRig(
       }),
     );
     const { server, url } = await startMockMessages(fableByToken, hits, options.haikuDelayMs ?? 0);
+    const usageServer = await startAlways403Usage();
     process.env.CLAUDE_MESSAGES_ENDPOINT = url;
+    process.env.CLAUDE_OAUTH_USAGE_ENDPOINT = usageServer.url;
     delete process.env.ACPX_SESSION_URL;
     try {
       await run({ lookupOptions: { homeDir: home, registryPath }, hits });
     } finally {
       server.close();
+      usageServer.server.close();
     }
   } finally {
     if (prevEndpoint === undefined) {
       delete process.env.CLAUDE_MESSAGES_ENDPOINT;
     } else {
       process.env.CLAUDE_MESSAGES_ENDPOINT = prevEndpoint;
+    }
+    if (prevUsage === undefined) {
+      delete process.env.CLAUDE_OAUTH_USAGE_ENDPOINT;
+    } else {
+      process.env.CLAUDE_OAUTH_USAGE_ENDPOINT = prevUsage;
     }
     if (prevSessionUrl === undefined) {
       delete process.env.ACPX_SESSION_URL;

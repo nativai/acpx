@@ -11,6 +11,22 @@ import type { SessionRecord } from "../src/types.js";
 
 const FABLE = "claude-fable-5";
 
+// A GET /api/oauth/usage mock that always 403s (no user:profile scope), so the
+// fable state degrades to the 1-token probe these tests drive. Keeps the suite off
+// the live endpoint (brick://a319745e RATE-LIMIT BUDGET: never poll in tests).
+function startAlways403Usage(): Promise<{ server: Server; url: string }> {
+  return new Promise((resolve) => {
+    const server = createServer((_req, res) => {
+      res.writeHead(403).end("{}");
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      resolve({ server, url: `http://127.0.0.1:${port}/api/oauth/usage` });
+    });
+  });
+}
+
 // Per-sub fable outcome: 200 (available), 429 (clean exhausted), or 500 (probe
 // error → UNKNOWN). Haiku always answers 200 healthy so the sub is a viable
 // non-fable failover target; only the fable dimension varies.
@@ -121,18 +137,30 @@ async function withRig(
       }),
     );
     const { server, url } = await startMockMessages(fableByToken, unifiedByToken, hits);
+    // /api/oauth/usage always 403s here (no user:profile scope) so the fable state
+    // DEGRADES to the 1-token probe these tests already mock — the pre-poll path.
+    // Pinned to a mock so the suite NEVER touches the live usage endpoint.
+    const usageServer = await startAlways403Usage();
     const prevEndpoint = process.env.CLAUDE_MESSAGES_ENDPOINT;
+    const prevUsage = process.env.CLAUDE_OAUTH_USAGE_ENDPOINT;
     const prevHome = process.env.HOME;
     process.env.CLAUDE_MESSAGES_ENDPOINT = url;
+    process.env.CLAUDE_OAUTH_USAGE_ENDPOINT = usageServer.url;
     process.env.HOME = home;
     try {
       await run({ homeDir: home, registryPath, hits, tokenOf });
     } finally {
       server.close();
+      usageServer.server.close();
       if (prevEndpoint === undefined) {
         delete process.env.CLAUDE_MESSAGES_ENDPOINT;
       } else {
         process.env.CLAUDE_MESSAGES_ENDPOINT = prevEndpoint;
+      }
+      if (prevUsage === undefined) {
+        delete process.env.CLAUDE_OAUTH_USAGE_ENDPOINT;
+      } else {
+        process.env.CLAUDE_OAUTH_USAGE_ENDPOINT = prevUsage;
       }
       if (prevHome === undefined) {
         delete process.env.HOME;

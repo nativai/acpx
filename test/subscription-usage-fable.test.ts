@@ -92,17 +92,79 @@ function startMockMessages(
   });
 }
 
+// The /api/oauth/usage outcome for a sub's token. Default (omitted) is 403 —
+// "no user:profile scope" — so the fable state DEGRADES to the 1-token probe and
+// the messages-endpoint outcomes drive the assertion, exactly as before the poll.
+type UsageOutcome = {
+  /** HTTP status to return (default 200 when `data` is set, else 403). */
+  status?: number;
+  /** The response body `data` array on a 200. */
+  data?: unknown[];
+  /** Retry-After header (seconds) on a 429. */
+  retryAfter?: number;
+};
+
+// A mock GET /api/oauth/usage keyed by token. Records every token that hit it so a
+// test can assert the poll replaced (or, on degrade, did NOT replace) the probe.
+function startMockUsage(
+  outcomes: Map<string, UsageOutcome>,
+  hits: string[],
+): Promise<{ server: Server; url: string }> {
+  return new Promise((resolve) => {
+    const server = createServer((req, res) => {
+      const token = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+      hits.push(token);
+      const outcome = outcomes.get(token) ?? { status: 403 };
+      const status = outcome.status ?? (outcome.data !== undefined ? 200 : 403);
+      if (status === 200) {
+        res
+          .writeHead(200, { "content-type": "application/json" })
+          .end(JSON.stringify({ data: outcome.data ?? [] }));
+        return;
+      }
+      const headers: Record<string, string> = {};
+      if (status === 429 && outcome.retryAfter !== undefined) {
+        headers["retry-after"] = String(outcome.retryAfter);
+      }
+      res.writeHead(status, headers).end("{}");
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      resolve({ server, url: `http://127.0.0.1:${port}/api/oauth/usage` });
+    });
+  });
+}
+
+// A weekly_scoped Fable window shaped per the FINDINGS §7 ground-truth schema
+// (brick://e0a1d05f): `kind`, `percent` (0..1), `resets_at` (epoch s), `is_enabled`,
+// `scope.model.display_name`. `resets_at` defaults to the FINDINGS sample epoch.
+function fableWeekly(percent: number, resetsAt = 1753441140): Record<string, unknown> {
+  return {
+    kind: "weekly_scoped",
+    percent,
+    resets_at: resetsAt,
+    is_enabled: true,
+    scope: { model: { display_name: "Fable 5" } },
+  };
+}
+
 const HAIKU = "claude-haiku-4-5-20251001";
 const FABLE = "claude-fable-5";
 
-type SubSpec = { id: string; outcomes: Map<string, ModelOutcome> };
+type SubSpec = { id: string; outcomes: Map<string, ModelOutcome>; usage?: UsageOutcome };
 
 async function withProbeRig(
   subs: SubSpec[],
-  run: (ctx: { entries: SubscriptionEntry[]; hits: ProbeHit[] }) => Promise<void>,
+  run: (ctx: {
+    entries: SubscriptionEntry[];
+    hits: ProbeHit[];
+    usageHits: string[];
+  }) => Promise<void>,
 ): Promise<void> {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fable-"));
   const outcomes = new Map<string, Map<string, ModelOutcome>>();
+  const usageOutcomes = new Map<string, UsageOutcome>();
   const entries: SubscriptionEntry[] = [];
   for (const sub of subs) {
     const configDir = path.join(home, sub.id);
@@ -113,20 +175,33 @@ async function withProbeRig(
       JSON.stringify({ claudeAiOauth: { accessToken: token } }),
     );
     outcomes.set(token, sub.outcomes);
+    if (sub.usage !== undefined) {
+      usageOutcomes.set(token, sub.usage);
+    }
     entries.push({ id: sub.id, label: sub.id, configDir, account: sub.id });
   }
   const hits: ProbeHit[] = [];
+  const usageHits: string[] = [];
   const { server, url } = await startMockMessages(outcomes, hits);
+  const { server: usageServer, url: usageUrl } = await startMockUsage(usageOutcomes, usageHits);
   const prev = process.env.CLAUDE_MESSAGES_ENDPOINT;
+  const prevUsage = process.env.CLAUDE_OAUTH_USAGE_ENDPOINT;
   process.env.CLAUDE_MESSAGES_ENDPOINT = url;
+  process.env.CLAUDE_OAUTH_USAGE_ENDPOINT = usageUrl;
   try {
-    await run({ entries, hits });
+    await run({ entries, hits, usageHits });
   } finally {
     server.close();
+    usageServer.close();
     if (prev === undefined) {
       delete process.env.CLAUDE_MESSAGES_ENDPOINT;
     } else {
       process.env.CLAUDE_MESSAGES_ENDPOINT = prev;
+    }
+    if (prevUsage === undefined) {
+      delete process.env.CLAUDE_OAUTH_USAGE_ENDPOINT;
+    } else {
+      process.env.CLAUDE_OAUTH_USAGE_ENDPOINT = prevUsage;
     }
     await fs.rm(home, { recursive: true, force: true });
   }
@@ -144,7 +219,11 @@ test("isFableModel: alias, full id, bracketed variant, case-insensitive", () => 
   assert.equal(isFableModel(""), false);
 });
 
-test("fable probe: HTTP 200 → available (no error), clean state cached", async () => {
+// ---- DEGRADE path: usage default is 403 (no user:profile scope), so the fable
+// state falls back to the 1-token claude-fable-5 probe — the pre-poll behavior,
+// preserved for sub1/4/6 until they are re-provisioned (brick://a319745e). ----
+
+test("degrade (403 no-scope) → probe HTTP 200 → available (no error), clean state cached", async () => {
   const id = uid("avail");
   await withProbeRig(
     [{ id, outcomes: new Map([[FABLE, { status: 200 }]]) }],
@@ -152,13 +231,13 @@ test("fable probe: HTTP 200 → available (no error), clean state cached", async
       const state = (await getSubscriptionsFableState(entries)).get(id);
       assert.equal(state?.available, true);
       assert.equal(state?.error, undefined);
-      assert.equal(state?.utilization, null); // no util header confirmed yet
+      assert.equal(state?.utilization, null); // probe carries no real % (poll does)
       assert.equal(state?.reset, null);
     },
   );
 });
 
-test("fable probe: HTTP 429 → clean exhaustion (available:false, NO error)", async () => {
+test("degrade (403 no-scope) → probe HTTP 429 → clean exhaustion (available:false, NO error)", async () => {
   const id = uid("exhausted");
   await withProbeRig(
     [{ id, outcomes: new Map([[FABLE, { status: 429 }]]) }],
@@ -170,7 +249,7 @@ test("fable probe: HTTP 429 → clean exhaustion (available:false, NO error)", a
   );
 });
 
-test("fable probe: HTTP 401 → error set (unknown, not exhausted)", async () => {
+test("degrade (403 no-scope) → probe HTTP 401 → error set (unknown, not exhausted)", async () => {
   const id = uid("auth");
   await withProbeRig(
     [{ id, outcomes: new Map([[FABLE, { status: 401 }]]) }],
@@ -182,7 +261,7 @@ test("fable probe: HTTP 401 → error set (unknown, not exhausted)", async () =>
   );
 });
 
-test("fable probe: missing credentials → error (never a false exhaustion)", async () => {
+test("fable state: missing credentials → error (never a false exhaustion)", async () => {
   const id = uid("nocreds");
   // Build an entry pointing at a dir with no .credentials.json.
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fable-nc-"));
@@ -256,6 +335,161 @@ test("getSubscriptionsUsage (no fable): issues NO claude-fable-5 request (AC2 ga
         hits.some((h) => h.model === HAIKU),
         true,
       );
+    },
+  );
+});
+
+// ---- POLL path: /api/oauth/usage 200 with a weekly_scoped Fable window is the
+// PRIMARY source — real %, real reset, and it REPLACES the 1-token probe. ----
+
+test("poll 200 (Fable window) → real utilization + reset, and NO fable probe issued", async () => {
+  const id = uid("poll200");
+  await withProbeRig(
+    [
+      {
+        id,
+        // A fable probe outcome exists but must NOT be reached — the poll serves.
+        outcomes: new Map([[FABLE, { status: 429 }]]),
+        usage: {
+          data: [
+            { kind: "five_hour", percent: 0.24, resets_at: 1753437600, is_enabled: true },
+            { kind: "seven_day", percent: 0.46, resets_at: 1753441140, is_enabled: true },
+            fableWeekly(0.3),
+          ],
+        },
+      },
+    ],
+    async ({ entries, hits, usageHits }) => {
+      const state = (await getSubscriptionsFableState(entries)).get(id);
+      assert.equal(state?.available, true); // 0.30 < 1 ⇒ headroom
+      assert.equal(state?.error, undefined);
+      assert.equal(state?.utilization, 0.3); // REAL % from the weekly_scoped window
+      assert.equal(state?.reset, new Date(1753441140 * 1000).toISOString());
+      // the poll replaced the probe: usage endpoint hit, claude-fable-5 NOT
+      assert.equal(usageHits.length, 1);
+      assert.equal(
+        hits.some((h) => h.model === FABLE),
+        false,
+        "a served poll must not fall back to the 1-token fable probe",
+      );
+    },
+  );
+});
+
+test("poll 200 (Fable window at 100%) → available:false (clean exhaustion, no error)", async () => {
+  const id = uid("pollmaxed");
+  await withProbeRig(
+    [{ id, outcomes: new Map(), usage: { data: [fableWeekly(1)] } }],
+    async ({ entries }) => {
+      const state = (await getSubscriptionsFableState(entries)).get(id);
+      assert.equal(state?.available, false);
+      assert.equal(state?.error, undefined);
+      assert.equal(state?.utilization, 1);
+    },
+  );
+});
+
+test("poll 200 (no Fable window) → available:true, utilization/reset null (absence ≠ exhausted)", async () => {
+  const id = uid("pollnowin");
+  await withProbeRig(
+    [
+      {
+        id,
+        outcomes: new Map(),
+        usage: {
+          data: [{ kind: "five_hour", percent: 0.5, resets_at: 1753437600, is_enabled: true }],
+        },
+      },
+    ],
+    async ({ entries }) => {
+      const state = (await getSubscriptionsFableState(entries)).get(id);
+      assert.equal(state?.available, true);
+      assert.equal(state?.utilization, null);
+      assert.equal(state?.reset, null);
+      assert.equal(state?.error, undefined);
+    },
+  );
+});
+
+test("poll caches for the window: a second read issues NO further usage call", async () => {
+  const id = uid("pollcache");
+  await withProbeRig(
+    [{ id, outcomes: new Map(), usage: { data: [fableWeekly(0.42)] } }],
+    async ({ entries, usageHits }) => {
+      const first = (await getSubscriptionsFableState(entries)).get(id);
+      const second = (await getSubscriptionsFableState(entries)).get(id);
+      assert.equal(first?.utilization, 0.42);
+      assert.equal(second?.utilization, 0.42);
+      assert.equal(usageHits.length, 1, "second read must be served from cache");
+    },
+  );
+});
+
+test("forceRefresh re-polls (outside any back-off)", async () => {
+  const id = uid("pollforce");
+  await withProbeRig(
+    [{ id, outcomes: new Map(), usage: { data: [fableWeekly(0.5)] } }],
+    async ({ entries, usageHits }) => {
+      await getSubscriptionsFableState(entries);
+      await getSubscriptionsFableState(entries, true); // forceRefresh
+      assert.equal(usageHits.length, 2, "forceRefresh must issue a fresh poll");
+    },
+  );
+});
+
+test("poll 429 (Retry-After) → degrades to probe AND back-off blocks a forced re-poll", async () => {
+  const id = uid("poll429");
+  await withProbeRig(
+    [
+      {
+        id,
+        // degrade target: a 200 fable probe so the degraded state is `available`
+        outcomes: new Map([[FABLE, { status: 200 }]]),
+        usage: { status: 429, retryAfter: 3578 },
+      },
+    ],
+    async ({ entries, hits, usageHits }) => {
+      const first = (await getSubscriptionsFableState(entries)).get(id);
+      assert.equal(first?.available, true); // degraded to the probe
+      assert.equal(usageHits.length, 1);
+      assert.equal(
+        hits.some((h) => h.model === FABLE),
+        true,
+        "a 429 poll with no cache degrades to the 1-token probe",
+      );
+      // forceRefresh must NOT re-poll inside the Retry-After window (rate-limit budget)
+      await getSubscriptionsFableState(entries, true);
+      assert.equal(usageHits.length, 1, "back-off must block a forced re-poll");
+    },
+  );
+});
+
+test("poll picks the weekly_scoped Fable window, not five_hour / a non-Fable weekly", async () => {
+  const id = uid("pollpick");
+  await withProbeRig(
+    [
+      {
+        id,
+        outcomes: new Map(),
+        usage: {
+          data: [
+            { kind: "five_hour", percent: 0.9, resets_at: 1753437600, is_enabled: true },
+            {
+              kind: "weekly_scoped",
+              percent: 0.99,
+              resets_at: 1753400000,
+              is_enabled: true,
+              scope: { model: { display_name: "Opus 4.8" } },
+            },
+            fableWeekly(0.12, 1753441140),
+          ],
+        },
+      },
+    ],
+    async ({ entries }) => {
+      const state = (await getSubscriptionsFableState(entries)).get(id);
+      assert.equal(state?.utilization, 0.12); // the Fable weekly window, not 0.9 / 0.99
+      assert.equal(state?.reset, new Date(1753441140 * 1000).toISOString());
     },
   );
 });
