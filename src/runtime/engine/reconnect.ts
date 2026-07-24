@@ -42,6 +42,7 @@ import {
   applyLifecycleSnapshotToRecord,
   reconcileAgentSessionId,
   sessionHasAgentMessages,
+  sessionHasRealAgentTurn,
 } from "./lifecycle.js";
 
 export type ConnectedSessionController = {
@@ -106,10 +107,10 @@ function shouldFallbackToNewSession(error: unknown, record: SessionRecord): bool
   }
   const acp = extractAcpError(error);
   if (isAcpResourceNotFoundError(error) || isUnsupportedSessionLoadAcpError(acp)) {
-    return !sessionHasAgentMessages(record);
+    return !sessionHasRealAgentTurn(record);
   }
 
-  return !sessionHasAgentMessages(record) && isFallbackSafeEmptySessionError(error, acp);
+  return !sessionHasRealAgentTurn(record) && isFallbackSafeEmptySessionError(error, acp);
 }
 
 function isHardReconnectFailure(error: unknown): boolean {
@@ -757,7 +758,7 @@ async function recoverMissingTranscriptAndRetry(
     }
   }
 
-  if (sessionHasAgentMessages(params.record)) {
+  if (sessionHasRealAgentTurn(params.record)) {
     throw makeSessionResumeRequiredError({
       record: params.record,
       reason: missingTranscriptReason(recovery),
@@ -896,7 +897,7 @@ async function recoverRuntimeSessionLoadFailure(
     });
   }
   if (!shouldFallbackToNewSession(error, params.record)) {
-    if (sessionHasAgentMessages(params.record)) {
+    if (sessionHasRealAgentTurn(params.record)) {
       throw makeSessionResumeRequiredError({
         record: params.record,
         reason: loadError,
