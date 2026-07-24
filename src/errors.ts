@@ -324,6 +324,10 @@ export function isModelFloorUnmetError(error: unknown): error is ModelFloorUnmet
   return error instanceof ModelFloorUnmetError;
 }
 
+export function isSessionResumeRequiredError(error: unknown): error is SessionResumeRequiredError {
+  return error instanceof SessionResumeRequiredError;
+}
+
 // Every same-family subscription target is locked by operator action. Distinct
 // from exhausted/quota so retry-exhausted semantics remain untouched.
 export class AllSubscriptionsLockedError extends AcpxOperationalError {

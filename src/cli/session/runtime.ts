@@ -22,6 +22,7 @@ import {
   BridgeAuthGatedError,
   FableShareExhaustedError,
   isModelFloorUnmetError,
+  isSessionResumeRequiredError,
   PermissionPromptUnavailableError,
   SessionClosedError,
 } from "../../errors.js";
@@ -1164,6 +1165,22 @@ async function mirrorUnrecoveredTerminalTurnError(
   // C4) is a loud terminal that must reach BOTH sinks even when it is not a
   // failover-classified error — surface its stream banner + messages mirror here.
   if (isModelFloorUnmetError(error)) {
+    const record = await resolveSessionRecord(sessionRecordId).catch(() => undefined);
+    if (record) {
+      await persistTerminalTurnError(record, error).catch(() => {});
+      await mirrorTerminalTurnErrorToMessages(record, error).catch(() => {});
+    }
+    return;
+  }
+  // A SessionResumeRequiredError means the turn died BEFORE any agent output —
+  // the session could not be resumed and there was nothing to fall back to
+  // (a genuinely-missing transcript on a session with real history). It is not
+  // failover-classified, so without this branch it went SILENT: the turn ended
+  // idle, nothing marked the session errored on the board, and the spawner only
+  // ever saw status:"queued" (brick://de3645c6). Surface it to BOTH sinks so the
+  // board renders lastError (SESSION_RESUME_REQUIRED) and the parent/spawner is
+  // TOLD via messages.ndjson — reusing the exact terminal-error plumbing above.
+  if (isSessionResumeRequiredError(error)) {
     const record = await resolveSessionRecord(sessionRecordId).catch(() => undefined);
     if (record) {
       await persistTerminalTurnError(record, error).catch(() => {});
