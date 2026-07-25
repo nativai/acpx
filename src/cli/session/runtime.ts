@@ -2279,15 +2279,26 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   };
 
   const drainInjectedPrompts = async () => {
-    // Clear the handler so no new concurrent calls are made, then await all
-    // in-flight injected prompts. Without this the queue-owner loop could
-    // start the next sequential task while an injected client.prompt() is
-    // still running, pushing that next message into the injected turn's
-    // context and cutting it short.
-    options.setMidTurnHandler?.(undefined);
-    if (injectedDeliveries.length === 0) {
-      return;
-    }
+    // 9beafe1c F1 — two decisions live here and must stay SEPARATE:
+    //   (1) AWAIT the in-flight injected prompts. Required, and the reason this
+    //       drain exists: a Claude injection returns its own terminal and can
+    //       outlive the primary, so the turn must fold its output in before the
+    //       `finally` tears the event writer down.
+    //   (2) STOP injecting. Only correct once the turn is genuinely closing.
+    // The old code did (2) first and then blocked on (1) for up to the full
+    // backstop, leaving the session injection-BLIND for that whole window. The
+    // adapter's promptQueueing hands the turn over to the injected prompt and
+    // returns a SYNTHETIC `end_turn` for the primary, so (1) cannot resolve
+    // until the REAL agent turn ends — up to the 30-min backstop. Every message
+    // arriving meanwhile was buffered (queue-owner-runtime.ts:827-834), emitted
+    // `queued`, and landed only at the turn's `finally`: 27.5 min late in the
+    // specimen, and racing acpx-ui's re-queued copy into a duplicate delivery.
+    // The early unregister's stated justification — "the queue-owner loop could
+    // start the next sequential task while an injected client.prompt() is still
+    // running" — does not hold: that loop cannot call nextTask() until
+    // runPromptTurn returns, which is strictly after this drain either way
+    // (queue-owner-runtime.ts:842-1015).
+    //
     // Bound the wait with a backstop so a pathological injected prompt that
     // never settles can't wedge the queue owner forever — degrading to the
     // pre-fix behavior for that one stuck prompt only (strictly no worse than
@@ -2295,26 +2306,64 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // resolve safely: rejections are isolated inside the IIFE, and an owner
     // death rejects the pending client.prompt() (AgentDisconnectedError).
     const drainTimeoutMs = resolveInjectedDrainTimeoutMs();
-    const drainResult = await drainInjectedPromptsWithBackstop(
-      injectedDeliveries.map((delivery) => delivery.promise),
-      drainTimeoutMs,
-      (pending) => {
-        // Diagnosable, NON-verbose-gated → owner.log (mirrors the idle-release
-        // line at queue-owner-runtime.ts:784-786). The owner's stderr is its own
-        // owner.log fd, never a --json-strict client's JSON-RPC stream.
-        process.stderr.write(
-          `[acpx] injected-prompt drain backstop fired for session ${record.acpxRecordId} ` +
-            `after ${drainTimeoutMs}ms; finalizing with ${pending} injected prompt(s) still pending\n`,
-        );
-      },
-    );
+    // ONE shared deadline, measured from the FIRST entry into the drain and
+    // never re-armed per iteration — otherwise a steady message stream could
+    // hold the turn open indefinitely. `0` ⇒ unbounded (existing contract).
+    const drainDeadlineAt = drainTimeoutMs > 0 ? Date.now() + drainTimeoutMs : undefined;
+    const emitDrainBackstopFired = (pending: number) => {
+      // Diagnosable, NON-verbose-gated → owner.log (mirrors the idle-release
+      // line at queue-owner-runtime.ts:784-786). The owner's stderr is its own
+      // owner.log fd, never a --json-strict client's JSON-RPC stream.
+      process.stderr.write(
+        `[acpx] injected-prompt drain backstop fired for session ${record.acpxRecordId} ` +
+          `after ${drainTimeoutMs}ms; finalizing with ${pending} injected prompt(s) still pending\n`,
+      );
+    };
+    let drainTimedOut = false;
+    while (true) {
+      const unsettled = injectedDeliveries.filter((delivery) => !delivery.settled);
+      if (unsettled.length === 0) {
+        break;
+      }
+      // Shared budget, not a fresh one per pass.
+      const remainingMs = drainDeadlineAt === undefined ? 0 : drainDeadlineAt - Date.now();
+      if (drainDeadlineAt !== undefined && remainingMs <= 0) {
+        // Budget already exhausted — a non-positive timeout would mean
+        // "unbounded" to the backstop, so finalize here instead.
+        emitDrainBackstopFired(unsettled.length);
+        drainTimedOut = true;
+        break;
+      }
+      const drainResult = await drainInjectedPromptsWithBackstop(
+        unsettled.map((delivery) => delivery.promise),
+        remainingMs,
+        emitDrainBackstopFired,
+      );
+      if (drainResult.timedOut) {
+        drainTimedOut = true;
+        break;
+      }
+      // That set settled — but the handler is still registered, so a NEW
+      // injection may have arrived while we waited. Loop and drain it too.
+      // This TERMINATES: each new injection makes the adapter hand the previous
+      // one off, so the set only fails to close while the real agent turn is
+      // still running — which is exactly when we want to keep injecting.
+    }
+    // The turn is genuinely closing now: stop injecting. Doing it here rather
+    // than before the await also FREEZES `injectedDeliveries` for the synthetic
+    // pass below, so nothing can be appended to it mid-iteration.
+    options.setMidTurnHandler?.(undefined);
     // C3 (G2 completeness): the backstop fired with injected prompts still
     // pending. Their own late terminal may never come (the response is withheld
     // forever), so write one now — the exactly-one-terminal invariant is held by
     // terminalDeliveryKeys, which suppresses any late IIFE terminal for the same
     // delivery. Not a "completed" terminal by design (Defect-B dedup won't dedup
     // a resend): the message may have run, hence the detailCode + copy (D3, Q3).
-    if (drainResult.timedOut) {
+    // F1 obligation: iterate the set CURRENT at backstop time, never the
+    // snapshot handed to the last backstop pass — an injection accepted after
+    // that snapshot would otherwise reach the writer teardown with no terminal
+    // at all, breaking exactly-one-terminal.
+    if (drainTimedOut) {
       for (const delivery of injectedDeliveries) {
         if (delivery.settled || !delivery.context) {
           continue;
@@ -2384,15 +2433,18 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         watchdog.dispose();
       }
     });
-    // First turn done — stop injecting and await any in-flight injected prompts.
+    // The primary ACP prompt resolved. That may be a real turn end OR the
+    // adapter handing the turn over to an injected prompt, so keep injecting
+    // while any injected prompt is still unsettled; stop only once they are
+    // (9beafe1c F1).
     await drainInjectedPrompts();
     emitPromptPerfMetric(promptStartedAt, options.verbose);
     return response;
   };
 
   const handlePromptFailure = async (error: unknown, attempt: number): Promise<"retry"> => {
-    // Stop injecting and await in-flight injected prompts before deciding
-    // whether to retry or fail (mirrors the success path).
+    // Drain in-flight injected prompts (and stop injecting once they settle)
+    // before deciding whether to retry or fail — mirrors the success path.
     await drainInjectedPrompts();
     await completeAbsorbedInjectedDeliveries("failed", {
       error: deliveryErrorFrom(error),
