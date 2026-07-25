@@ -2769,7 +2769,14 @@ test("F1: the backstop's synthetic terminals cover an injection added after the 
       // `stuck` keeps the first pass alive until the backstop; both it and
       // `settling` are therefore in that pass's snapshot.
       midTurn.currentHandler?.(
-        makeQueueTask("req-f1c-stuck", INJECTED_PROMPT_TEXT, () => {}, () => {}, false, stuckId),
+        makeQueueTask(
+          "req-f1c-stuck",
+          INJECTED_PROMPT_TEXT,
+          () => {},
+          () => {},
+          false,
+          stuckId,
+        ),
       );
       control.resolveMainPrompt({ stopReason: "end_turn" });
       // Release `settling` only once the drain has entered and snapshotted, so

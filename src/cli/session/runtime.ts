@@ -2278,6 +2278,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     };
   };
 
+  // eslint-disable-next-line complexity -- 9beafe1c F1 obligation A2 requires NO await between the loop's final unsettled-check and the unregister, so the loop and the unregister must stay in one contiguous function; extracting the loop would put an await boundary between them
   const drainInjectedPrompts = async () => {
     // 9beafe1c F1 — two decisions live here and must stay SEPARATE:
     //   (1) AWAIT the in-flight injected prompts. Required, and the reason this
