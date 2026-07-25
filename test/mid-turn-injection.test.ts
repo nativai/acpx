@@ -2401,3 +2401,728 @@ test("493729fc F3: owner-exit sweep terminalizes still-open absorbed deliveries 
     });
   });
 });
+
+// --- 9beafe1c F1: the drain must not switch injection off -------------------
+//
+// D1: `drainInjectedPrompts` used to clear the mid-turn handler FIRST and only
+// then block awaiting the in-flight injected prompts. Under claude-agent-acp's
+// promptQueueing the primary's `end_turn` is a HANDOFF, not a turn end, so that
+// await runs for the remainder of the REAL agent turn (bounded only by the
+// 30-min backstop) — with injection switched off. Every message arriving in
+// that window was buffered by the queue owner (queue-owner-runtime.ts:827-834),
+// emitted `phase:"queued"`, and landed only at the turn's `finally`: 27 min 39 s
+// late in specimen f4b8ca75, and racing acpx-ui's re-queued copy into a
+// duplicate delivery.
+//
+// F1 splits the two decisions: keep injecting while any injected prompt is
+// unsettled, drain in a loop, and unregister only once the turn is genuinely
+// closing — under ONE shared deadline measured from the first drain entry.
+
+// The shared fixture pins `max_segment_bytes: 1024` so ordinary tests exercise
+// segment rotation. These F1 scenarios deliberately settle several injected
+// prompts at once, and two concurrent terminal writes racing a rotation is a
+// pre-existing SessionEventWriter hazard (unserialized appendMessages) that has
+// nothing to do with what is under test here — so give the F1 records a segment
+// large enough that no rotation can happen mid-scenario.
+function makeF1SessionRecord(cwd: string): SessionRecord {
+  const record = makeSessionRecord(cwd, CLAUDE_AGENT_COMMAND);
+  record.eventLog.max_segment_bytes = 1_048_576;
+  return record;
+}
+
+// The core regression. Pre-F1 the handler was already `undefined` by the time a
+// second message arrived, so it could not be injected at all.
+test("F1: a message arriving while the drain awaits an injected prompt is still injected (no injection-blind window)", async () => {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeF1SessionRecord(homeDir);
+      await writeSessionRecordFile(homeDir, record);
+
+      const mainMessageId = "f1a00000-0000-4000-8000-00000000000a";
+      const firstInjectedId = "f1a00000-0000-4000-8000-000000000001";
+      const secondInjectedId = "f1a00000-0000-4000-8000-000000000002";
+
+      const firstRelease = createDeferred<PromptResponse>();
+      const secondRelease = createDeferred<PromptResponse>();
+      const firstInFlight = createDeferred<void>();
+      const secondInFlight = createDeferred<void>();
+
+      const control = makePathologicalClient({
+        acpSessionId: record.acpSessionId,
+        onInjectedPrompt: (messageId) => {
+          if (messageId === firstInjectedId) {
+            firstInFlight.resolve();
+            return firstRelease.promise;
+          }
+          secondInFlight.resolve();
+          return secondRelease.promise;
+        },
+      });
+
+      const midTurn = makeMidTurnControl((registration, ctrl) => {
+        if (registration !== 1) {
+          return;
+        }
+        queueMicrotask(() => {
+          ctrl.currentHandler?.(
+            makeQueueTask(
+              "req-f1a-injected-1",
+              INJECTED_PROMPT_TEXT,
+              () => {},
+              () => {},
+              false,
+              firstInjectedId,
+            ),
+          );
+        });
+      });
+
+      const mainTask = makeQueueTask(
+        "req-f1a-main",
+        MAIN_PROMPT_TEXT,
+        () => {},
+        () => {},
+        true,
+        mainMessageId,
+      );
+
+      const run = runQueuedTask(record.acpxRecordId, mainTask, {
+        sharedClient: control.client,
+        setMidTurnHandler: midTurn.setMidTurnHandler,
+        suppressSdkConsoleErrors: true,
+      });
+
+      await control.mainPromptInFlight;
+      await withRaceTimeout(firstInFlight.promise, 3_000, "the first injection never fired");
+      // The adapter hands the turn over to the injected prompt and returns a
+      // SYNTHETIC end_turn for the primary. The drain begins here while the
+      // injected prompt still owns the real agent turn.
+      control.resolveMainPrompt({ stopReason: "end_turn" });
+      // Drain entry costs only microtasks after the primary settles, so this
+      // sleep lands well inside the drain. (Landing early would only weaken the
+      // assertion, never fail it — the polarity is a false pass, not a flake.)
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // THE REGRESSION: pre-F1 the handler was cleared at drain entry, so this
+      // arrival was buffered and released only at the turn's `finally`.
+      const handlerDuringDrain = midTurn.currentHandler;
+      assert.ok(
+        handlerDuringDrain,
+        "the mid-turn handler must stay registered while injected prompts are unsettled",
+      );
+      assert.equal(midTurn.clears, 0, "the handler must not be cleared before the drain completes");
+      handlerDuringDrain(
+        makeQueueTask(
+          "req-f1a-injected-2",
+          INJECTED_PROMPT_TEXT,
+          () => {},
+          () => {},
+          false,
+          secondInjectedId,
+        ),
+      );
+
+      await withRaceTimeout(
+        secondInFlight.promise,
+        3_000,
+        "the message that arrived during the drain was never injected",
+      );
+      // Staggered for the same reason the injections are: two terminal writes
+      // landing in one microtask race the session-record rename.
+      firstRelease.resolve({ stopReason: "end_turn" });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      secondRelease.resolve({ stopReason: "end_turn" });
+      await withRaceTimeout(run, 5_000, "the turn never finalized after the drain loop");
+
+      const events = await listSessionEvents(record.acpxRecordId);
+      // The drain loop picked the second injection up even though it was added
+      // after the first pass's snapshot, and it settled normally.
+      for (const [label, messageId] of [
+        ["first", firstInjectedId],
+        ["second", secondInjectedId],
+      ] as const) {
+        const terminals = terminalsForMessage(events, messageId);
+        assert.equal(terminals.length, 1, `exactly one terminal for the ${label} injection`);
+        assert.equal(terminals[0]?.phase, "done", `the ${label} injection ends done`);
+        assert.equal(terminals[0]?.stopReason, "end_turn");
+      }
+      assert.ok(
+        deliveryParamsForMessage(events, secondInjectedId).some(
+          (event) => event.phase === "accepted",
+        ),
+        "the drain-window arrival was accepted, not buffered",
+      );
+      assert.deepEqual(terminalsForMessage(events, mainMessageId), [
+        {
+          messageId: mainMessageId,
+          requestId: "req-f1a-main",
+          phase: "done",
+          stopReason: "end_turn",
+        },
+      ]);
+      assert.equal(
+        deliveryEventParams(events).filter(
+          (event) =>
+            (event.error as { detailCode?: string } | undefined)?.detailCode ===
+            "INJECTED_RESPONSE_TIMEOUT",
+        ).length,
+        0,
+        "no false INJECTED_RESPONSE_TIMEOUT terminal — the backstop never fired",
+      );
+      // Unregistered exactly once, after the drain — never mid-turn.
+      assert.equal(midTurn.clears, 1, "the handler is cleared exactly once, once the turn closes");
+    });
+  });
+});
+
+// The loop must run under ONE shared deadline measured from the first drain
+// entry. Re-arming the backstop per iteration would let a continuous message
+// stream hold the turn open forever: every injection here settles well inside
+// the budget, so a re-armed deadline never expires and this test hangs.
+test("F1: the drain backstop deadline is shared across loop passes, not re-armed per pass", async () => {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeF1SessionRecord(homeDir);
+      await writeSessionRecordFile(homeDir, record);
+
+      const drainBudgetMs = 200;
+      const mainMessageId = "f1b00000-0000-4000-8000-00000000000a";
+      let injections = 0;
+      let stopped = false;
+
+      const control = makePathologicalClient({
+        acpSessionId: record.acpSessionId,
+        // Every injected prompt settles quickly — the stream, not any single
+        // prompt, is what would keep a re-armed deadline alive forever.
+        onInjectedPrompt: () =>
+          new Promise<PromptResponse>((resolve) => {
+            setTimeout(() => resolve({ stopReason: "end_turn" }), 20);
+          }),
+      });
+
+      // Injects the next message as soon as the previous one settles, so the
+      // unsettled set is non-empty at the top of every loop pass.
+      const injectNext = (ctrl: MidTurnControl): void => {
+        if (stopped || ctrl.currentHandler === undefined) {
+          return;
+        }
+        injections += 1;
+        const id = `f1b00000-0000-4000-8000-${String(injections).padStart(12, "0")}`;
+        ctrl.currentHandler(
+          makeQueueTask(
+            `req-f1b-injected-${injections}`,
+            INJECTED_PROMPT_TEXT,
+            () => {},
+            () => injectNext(ctrl),
+            false,
+            id,
+          ),
+        );
+      };
+
+      const midTurn = makeMidTurnControl((registration, ctrl) => {
+        if (registration !== 1) {
+          return;
+        }
+        queueMicrotask(() => injectNext(ctrl));
+      });
+
+      const mainTask = makeQueueTask(
+        "req-f1b-main",
+        MAIN_PROMPT_TEXT,
+        () => {},
+        () => {},
+        true,
+        mainMessageId,
+      );
+
+      const run = withInjectedDrainTimeout(drainBudgetMs, () =>
+        runQueuedTask(record.acpxRecordId, mainTask, {
+          sharedClient: control.client,
+          setMidTurnHandler: midTurn.setMidTurnHandler,
+          suppressSdkConsoleErrors: true,
+        }),
+      );
+
+      await control.mainPromptInFlight;
+      const drainStartedAt = Date.now();
+      control.resolveMainPrompt({ stopReason: "end_turn" });
+      try {
+        await withRaceTimeout(
+          run,
+          5_000,
+          "the drain never finalized — the deadline was re-armed per pass",
+        );
+      } finally {
+        stopped = true;
+      }
+      const elapsedMs = Date.now() - drainStartedAt;
+
+      assert.ok(
+        injections > 1,
+        `the stream produced more than one injection (got ${injections}) — the loop ran multiple passes`,
+      );
+      assert.ok(
+        elapsedMs >= drainBudgetMs - 50,
+        `the shared budget was actually spent (elapsed ${elapsedMs}ms, budget ${drainBudgetMs}ms)`,
+      );
+      assert.equal(
+        midTurn.clears,
+        1,
+        "the handler is cleared exactly once, when the shared deadline closes the turn",
+      );
+      // Let any prompt still in flight at backstop time settle inside the temp
+      // home rather than after it is torn down.
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    });
+  });
+});
+
+// The one new invariant obligation (CONCEPTION §4). The synthetic-failure pass
+// must iterate the set CURRENT at backstop time: an injection accepted after
+// the last pass's snapshot would otherwise reach the event-writer teardown with
+// no terminal at all, breaking exactly-one-terminal.
+test("F1: the backstop's synthetic terminals cover an injection added after the last snapshot", async () => {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeF1SessionRecord(homeDir);
+      await writeSessionRecordFile(homeDir, record);
+
+      const mainMessageId = "f1c00000-0000-4000-8000-00000000000a";
+      const settlingId = "f1c00000-0000-4000-8000-000000000001";
+      const stuckId = "f1c00000-0000-4000-8000-000000000002";
+      const lateId = "f1c00000-0000-4000-8000-000000000003";
+
+      const settlingRelease = createDeferred<PromptResponse>();
+      const settlingInFlight = createDeferred<void>();
+      const lateInFlight = createDeferred<void>();
+
+      const control = makePathologicalClient({
+        acpSessionId: record.acpSessionId,
+        onInjectedPrompt: (messageId) => {
+          if (messageId === settlingId) {
+            settlingInFlight.resolve();
+            return settlingRelease.promise;
+          }
+          if (messageId === lateId) {
+            lateInFlight.resolve();
+          }
+          // `stuck` and `late` never settle on their own.
+          return new Promise<PromptResponse>(() => {});
+        },
+      });
+
+      const midTurn = makeMidTurnControl((registration, ctrl) => {
+        if (registration !== 1) {
+          return;
+        }
+        queueMicrotask(() => {
+          // Injected one at a time on purpose: two injections started in the
+          // same microtask race each other's `recordPromptStart` record write
+          // (write-tmp + rename), which is a pre-existing acpx concurrency
+          // property and not what this test is about.
+          ctrl.currentHandler?.(
+            makeQueueTask(
+              "req-f1c-settling",
+              INJECTED_PROMPT_TEXT,
+              () => {},
+              // Fires when `settling` completes — i.e. mid-drain, strictly
+              // after the snapshot was taken. This is the late arrival.
+              () => {
+                ctrl.currentHandler?.(
+                  makeQueueTask(
+                    "req-f1c-late",
+                    INJECTED_PROMPT_TEXT,
+                    () => {},
+                    () => {},
+                    false,
+                    lateId,
+                  ),
+                );
+              },
+              false,
+              settlingId,
+            ),
+          );
+        });
+      });
+
+      const mainTask = makeQueueTask(
+        "req-f1c-main",
+        MAIN_PROMPT_TEXT,
+        () => {},
+        () => {},
+        true,
+        mainMessageId,
+      );
+
+      const run = withInjectedDrainTimeout(400, () =>
+        runQueuedTask(record.acpxRecordId, mainTask, {
+          sharedClient: control.client,
+          setMidTurnHandler: midTurn.setMidTurnHandler,
+          suppressSdkConsoleErrors: true,
+        }),
+      );
+
+      await control.mainPromptInFlight;
+      await withRaceTimeout(settlingInFlight.promise, 3_000, "`settling` never fired");
+      // `stuck` keeps the first pass alive until the backstop; both it and
+      // `settling` are therefore in that pass's snapshot.
+      midTurn.currentHandler?.(
+        makeQueueTask("req-f1c-stuck", INJECTED_PROMPT_TEXT, () => {}, () => {}, false, stuckId),
+      );
+      control.resolveMainPrompt({ stopReason: "end_turn" });
+      // Release `settling` only once the drain has entered and snapshotted, so
+      // the late arrival it triggers is provably outside that snapshot.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      settlingRelease.resolve({ stopReason: "end_turn" });
+      await withRaceTimeout(lateInFlight.promise, 3_000, "the late injection never fired");
+
+      await withRaceTimeout(run, 5_000, "the drain backstop never finalized the turn");
+
+      const events = await listSessionEvents(record.acpxRecordId);
+      const settlingTerminals = terminalsForMessage(events, settlingId);
+      assert.equal(settlingTerminals.length, 1, "the settled injection keeps its own terminal");
+      assert.equal(settlingTerminals[0]?.phase, "done");
+
+      for (const [label, messageId] of [
+        ["snapshotted", stuckId],
+        ["late (added after the snapshot)", lateId],
+      ] as const) {
+        const terminals = terminalsForMessage(events, messageId);
+        assert.equal(terminals.length, 1, `exactly one terminal for the ${label} injection`);
+        assert.equal(terminals[0]?.phase, "failed", `the ${label} injection is terminalized`);
+        const failed = deliveryParamsForMessage(events, messageId).find(
+          (event) => event.phase === "failed",
+        );
+        assert.equal(
+          (failed?.error as { detailCode?: string } | undefined)?.detailCode,
+          "INJECTED_RESPONSE_TIMEOUT",
+          `the ${label} injection carries the backstop detailCode (got ${JSON.stringify(failed?.error)})`,
+        );
+      }
+      assert.deepEqual(terminalsForMessage(events, mainMessageId), [
+        {
+          messageId: mainMessageId,
+          requestId: "req-f1c-main",
+          phase: "done",
+          stopReason: "end_turn",
+        },
+      ]);
+    });
+  });
+});
+
+// --- 9beafe1c F1 amendment: the FAILURE call site stays in scope ------------
+//
+// `drainInjectedPrompts` is shared by the success and failure call sites and
+// stays shared deliberately (CONCEPTION §4 "F1 amendment"). AC-8 pins the
+// common transient-turn-failure shape as unchanged (obligation A1); AC-9 pins
+// the case success-only scoping would have lost.
+
+// A transient pre-output `-32603` that acpx-ui's isTransientTurnFailure
+// recovers from. The classifier keys on the code + message pattern only.
+function makeTransientTurnError(): Error {
+  const error = new Error("session limit · resets 3pm");
+  (error as Error & { error?: unknown }).error = {
+    code: -32603,
+    message: "session limit · resets 3pm",
+  };
+  return error;
+}
+
+// AC-8, first half (obligation A1). The overwhelmingly common turn-failure
+// shape has NO injections in flight, so the drain must take its fast path and
+// behave byte-for-byte as it did before F1: unregister, return, nothing else.
+// This assertion is written to hold on the PRE-F1 code too — that equality is
+// the proof, so it must not be loosened to accommodate the new code.
+test("AC-8/A1: a transient turn failure with no injections in flight is unchanged by F1", async () => {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeF1SessionRecord(homeDir);
+      await writeSessionRecordFile(homeDir, record);
+
+      const mainMessageId = "ac800000-0000-4000-8000-00000000000a";
+      const transient = makeTransientTurnError();
+      const control = makeMockClient({
+        onMainPrompt: async () => {
+          // Defer past runPromptTurn attaching its handler (see `tick`).
+          await tick();
+          throw transient;
+        },
+        onInjectedPrompt: async () => {
+          throw new Error("no injection is expected in this scenario");
+        },
+      });
+
+      // Registered exactly as in production, but never invoked: the injected
+      // set stays empty, which is the shape under test.
+      const midTurn = makeMidTurnControl(() => {});
+      const mainSends: QueueOwnerMessage[] = [];
+      const mainTask = makeQueueTask(
+        "req-ac8a-main",
+        MAIN_PROMPT_TEXT,
+        (message) => mainSends.push(message),
+        () => {},
+        true,
+        mainMessageId,
+      );
+
+      await runQueuedTask(record.acpxRecordId, mainTask, {
+        sharedClient: control.client,
+        setMidTurnHandler: midTurn.setMidTurnHandler,
+        suppressSdkConsoleErrors: true,
+      });
+
+      // The handler is registered once and unregistered once — the empty-set
+      // fast path must NOT skip the unregister (A1).
+      assert.equal(midTurn.registrations, 1, "the mid-turn handler was registered");
+      assert.equal(midTurn.clears, 1, "the empty-set fast path still unregisters exactly once");
+
+      const events = await listSessionEvents(record.acpxRecordId);
+      // The full delivery sequence for the turn: accepted, then one failed
+      // terminal carrying the primary's own error shape. Nothing else — no
+      // backstop terminal, no injected events.
+      assert.deepEqual(
+        deliveryEventParams(events).map((event) => ({
+          messageId: event.messageId,
+          requestId: event.requestId,
+          phase: event.phase,
+          code: (event.error as { code?: number } | undefined)?.code,
+          message: (event.error as { message?: string } | undefined)?.message,
+        })),
+        [
+          {
+            messageId: mainMessageId,
+            requestId: "req-ac8a-main",
+            phase: "accepted",
+            code: 0,
+            message: "",
+          },
+          {
+            messageId: mainMessageId,
+            requestId: "req-ac8a-main",
+            phase: "failed",
+            code: -32603,
+            message: "session limit · resets 3pm",
+          },
+        ],
+      );
+      const errorMessage = mainSends.find((message) => message.type === "error") as
+        | { message?: string }
+        | undefined;
+      assert.equal(
+        errorMessage?.message,
+        "session limit · resets 3pm",
+        "the sender sees the primary's own error, unchanged",
+      );
+    });
+  });
+});
+
+// AC-8, second half. When an injection IS in flight, its terminal must carry
+// the SAME error shape as the primary's — `deliveryErrorFrom` is shared — so
+// acpx-ui's isTransientTurnFailure (which keys only on the code + message, never
+// on source/policy/injectedness) routes it down the same recoverable branch
+// instead of surfacing a failure to the sender.
+test("AC-8: an injected delivery failing with the primary carries a byte-identical error shape", async () => {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeF1SessionRecord(homeDir);
+      await writeSessionRecordFile(homeDir, record);
+
+      const mainMessageId = "ac810000-0000-4000-8000-00000000000a";
+      const injectedMessageId = "ac810000-0000-4000-8000-000000000001";
+      const transient = makeTransientTurnError();
+      const injectedInFlight = createDeferred<void>();
+      const injectedRelease = createDeferred<PromptResponse>();
+
+      const control = makeMockClient({
+        onMainPrompt: async () => {
+          await tick();
+          throw transient;
+        },
+        onInjectedPrompt: async () => {
+          injectedInFlight.resolve();
+          // The same underlying transport error reaches both prompts.
+          return await injectedRelease.promise;
+        },
+      });
+
+      const midTurn = makeMidTurnControl((registration, ctrl) => {
+        if (registration !== 1) {
+          return;
+        }
+        queueMicrotask(() => {
+          ctrl.currentHandler?.(
+            makeQueueTask(
+              "req-ac8b-injected",
+              INJECTED_PROMPT_TEXT,
+              () => {},
+              () => {},
+              false,
+              injectedMessageId,
+            ),
+          );
+        });
+      });
+
+      const mainTask = makeQueueTask(
+        "req-ac8b-main",
+        MAIN_PROMPT_TEXT,
+        () => {},
+        () => {},
+        true,
+        mainMessageId,
+      );
+
+      const run = withInjectedDrainTimeout(2_000, () =>
+        runQueuedTask(record.acpxRecordId, mainTask, {
+          sharedClient: control.client,
+          setMidTurnHandler: midTurn.setMidTurnHandler,
+          suppressSdkConsoleErrors: true,
+        }),
+      );
+      await withRaceTimeout(injectedInFlight.promise, 3_000, "the injection never fired");
+      injectedRelease.reject(transient);
+      await withRaceTimeout(run, 5_000, "the failure-path drain never finalized");
+
+      const events = await listSessionEvents(record.acpxRecordId);
+      const errorFor = (messageId: string): unknown =>
+        deliveryParamsForMessage(events, messageId).find((event) => event.phase === "failed")
+          ?.error;
+      assert.ok(errorFor(mainMessageId), "the primary has a failed terminal");
+      assert.deepEqual(
+        errorFor(injectedMessageId),
+        errorFor(mainMessageId),
+        "the injected delivery's error is byte-identical to the primary's, so acpx-ui classifies both the same",
+      );
+      // NOT the backstop's terminal — that would be the delivery-truth
+      // regression the amendment ruled out.
+      assert.notEqual(
+        (errorFor(injectedMessageId) as { detailCode?: string } | undefined)?.detailCode,
+        "INJECTED_RESPONSE_TIMEOUT",
+      );
+    });
+  });
+});
+
+// AC-9 — the regression sentinel for keeping the failure call site in scope.
+// TurnWatchdog tier 2 rejects with TurnResponseTimeoutError exactly when the
+// end-of-turn marker was seen but the response is overdue: the agent is ALIVE
+// and still working. That lands in handlePromptFailure with injected prompts
+// unsettled — the D1 shape on the failure path. If this regresses, the
+// success-only scoping question is back open; do not work around it.
+test("AC-9: the tier-2 watchdog path keeps injecting — an arriving message is injected, not buffered", async () => {
+  await withNoUnhandledRejections(async () => {
+    await withTempHome(async (homeDir) => {
+      const record = makeF1SessionRecord(homeDir);
+      await writeSessionRecordFile(homeDir, record);
+
+      const mainMessageId = "ac900000-0000-4000-8000-00000000000a";
+      const firstInjectedId = "ac900000-0000-4000-8000-000000000001";
+      const arrivingId = "ac900000-0000-4000-8000-000000000002";
+
+      const firstInFlight = createDeferred<void>();
+      const arrivingInFlight = createDeferred<void>();
+      const control = makePathologicalClient({
+        acpSessionId: record.acpSessionId,
+        onInjectedPrompt: (messageId) => {
+          if (messageId === firstInjectedId) {
+            firstInFlight.resolve();
+          } else {
+            arrivingInFlight.resolve();
+          }
+          // The agent is still working: neither injection answers.
+          return new Promise<PromptResponse>(() => {});
+        },
+      });
+      // Marker seen, response withheld, cancel ignored → tier-2 abandon.
+      neverRespondIgnoresCancel(control);
+
+      const midTurn = makeMidTurnControl((registration, ctrl) => {
+        if (registration !== 1) {
+          return;
+        }
+        queueMicrotask(() => {
+          ctrl.currentHandler?.(
+            makeQueueTask(
+              "req-ac9-injected-1",
+              INJECTED_PROMPT_TEXT,
+              () => {},
+              () => {},
+              false,
+              firstInjectedId,
+            ),
+          );
+        });
+      });
+
+      const mainSends: QueueOwnerMessage[] = [];
+      const mainTask = makeQueueTask(
+        "req-ac9-main",
+        MAIN_PROMPT_TEXT,
+        (message) => mainSends.push(message),
+        () => {},
+        true,
+        mainMessageId,
+      );
+
+      const run = withTurnResponseTimeout(40, () =>
+        withInjectedDrainTimeout(600, () =>
+          runQueuedTask(record.acpxRecordId, mainTask, {
+            sharedClient: control.client,
+            setMidTurnHandler: midTurn.setMidTurnHandler,
+            suppressSdkConsoleErrors: true,
+          }),
+        ),
+      );
+
+      await control.mainPromptInFlight;
+      await withRaceTimeout(firstInFlight.promise, 3_000, "the first injection never fired");
+      control.emitTurnEndMarker("end_turn");
+      // Tier 1 fires at timeoutMs, tier 2 at timeoutMs*2 (= 80 ms); the ensuing
+      // handlePromptFailure drain then runs to its 600 ms backstop. 200 ms lands
+      // squarely inside that drain.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      const handlerDuringFailureDrain = midTurn.currentHandler;
+      assert.ok(
+        handlerDuringFailureDrain,
+        "the mid-turn handler stays registered through the tier-2 failure drain",
+      );
+      handlerDuringFailureDrain(
+        makeQueueTask(
+          "req-ac9-arriving",
+          INJECTED_PROMPT_TEXT,
+          () => {},
+          () => {},
+          false,
+          arrivingId,
+        ),
+      );
+      await withRaceTimeout(
+        arrivingInFlight.promise,
+        3_000,
+        "the message arriving during the tier-2 failure drain was NOT injected",
+      );
+
+      await withRaceTimeout(run, 5_000, "the failure-path drain never finalized");
+
+      const events = await listSessionEvents(record.acpxRecordId);
+      assert.ok(
+        deliveryParamsForMessage(events, arrivingId).some((event) => event.phase === "accepted"),
+        "the arriving message was accepted (injected), not buffered for the turn boundary",
+      );
+      const mainError = mainSends.find((message) => message.type === "error") as
+        | { detailCode?: string }
+        | undefined;
+      assert.equal(
+        mainError?.detailCode,
+        "TURN_RESPONSE_TIMEOUT",
+        "the primary still fails at the tier-2 bound — F1 does not touch its lifecycle",
+      );
+      assert.equal(midTurn.clears, 1, "the handler is cleared exactly once, at the drain's end");
+    });
+  });
+});

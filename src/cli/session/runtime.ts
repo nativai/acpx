@@ -2299,60 +2299,87 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // runPromptTurn returns, which is strictly after this drain either way
     // (queue-owner-runtime.ts:842-1015).
     //
+    // This drain is SHARED by the success call site and the failure one
+    // (handlePromptFailure), and stays shared deliberately: TurnWatchdog tier 2
+    // rejects with TurnResponseTimeoutError exactly when the end-of-turn marker
+    // was seen but the response is overdue — the agent is alive and still
+    // working — so scoping F1 to the success path would re-create the full
+    // blind window there.
+    //
     // Bound the wait with a backstop so a pathological injected prompt that
     // never settles can't wedge the queue owner forever — degrading to the
     // pre-fix behavior for that one stuck prompt only (strictly no worse than
     // the bug, and far rarer). Realistic "never resolves" triggers already
     // resolve safely: rejections are isolated inside the IIFE, and an owner
     // death rejects the pending client.prompt() (AgentDisconnectedError).
-    const drainTimeoutMs = resolveInjectedDrainTimeoutMs();
-    // ONE shared deadline, measured from the FIRST entry into the drain and
-    // never re-armed per iteration — otherwise a steady message stream could
-    // hold the turn open indefinitely. `0` ⇒ unbounded (existing contract).
-    const drainDeadlineAt = drainTimeoutMs > 0 ? Date.now() + drainTimeoutMs : undefined;
-    const emitDrainBackstopFired = (pending: number) => {
-      // Diagnosable, NON-verbose-gated → owner.log (mirrors the idle-release
-      // line at queue-owner-runtime.ts:784-786). The owner's stderr is its own
-      // owner.log fd, never a --json-strict client's JSON-RPC stream.
-      process.stderr.write(
-        `[acpx] injected-prompt drain backstop fired for session ${record.acpxRecordId} ` +
-          `after ${drainTimeoutMs}ms; finalizing with ${pending} injected prompt(s) still pending\n`,
-      );
-    };
     let drainTimedOut = false;
-    while (true) {
-      const unsettled = injectedDeliveries.filter((delivery) => !delivery.settled);
-      if (unsettled.length === 0) {
-        break;
+    try {
+      // A1: with nothing in flight there is nothing to await — keep this fast
+      // path byte-for-byte today's behaviour (the `finally` still unregisters,
+      // exactly as the old unconditional unregister did). This is what leaves
+      // the common turn-failure shape, which has no injections in flight,
+      // completely unchanged.
+      if (injectedDeliveries.length === 0) {
+        return;
       }
-      // Shared budget, not a fresh one per pass.
-      const remainingMs = drainDeadlineAt === undefined ? 0 : drainDeadlineAt - Date.now();
-      if (drainDeadlineAt !== undefined && remainingMs <= 0) {
-        // Budget already exhausted — a non-positive timeout would mean
-        // "unbounded" to the backstop, so finalize here instead.
-        emitDrainBackstopFired(unsettled.length);
-        drainTimedOut = true;
-        break;
+      const drainTimeoutMs = resolveInjectedDrainTimeoutMs();
+      // ONE shared deadline, measured from the FIRST entry into the drain and
+      // never re-armed per iteration — otherwise a steady message stream could
+      // hold the turn open indefinitely. `0` ⇒ unbounded (existing contract).
+      const drainDeadlineAt = drainTimeoutMs > 0 ? Date.now() + drainTimeoutMs : undefined;
+      const emitDrainBackstopFired = (pending: number) => {
+        // Diagnosable, NON-verbose-gated → owner.log (mirrors the idle-release
+        // line at queue-owner-runtime.ts:784-786). The owner's stderr is its own
+        // owner.log fd, never a --json-strict client's JSON-RPC stream.
+        process.stderr.write(
+          `[acpx] injected-prompt drain backstop fired for session ${record.acpxRecordId} ` +
+            `after ${drainTimeoutMs}ms; finalizing with ${pending} injected prompt(s) still pending\n`,
+        );
+      };
+      while (true) {
+        const unsettled = injectedDeliveries.filter((delivery) => !delivery.settled);
+        if (unsettled.length === 0) {
+          // A2: the clean exit. NO await stands between this check and the
+          // unregister in the `finally`, so an injection cannot land in that
+          // gap and have its terminal written after the event writer tears
+          // down — the stuck-red bug the drain-await was built to fix.
+          break;
+        }
+        // Shared budget, not a fresh one per pass.
+        const remainingMs = drainDeadlineAt === undefined ? 0 : drainDeadlineAt - Date.now();
+        if (drainDeadlineAt !== undefined && remainingMs <= 0) {
+          // Budget already exhausted — a non-positive timeout would mean
+          // "unbounded" to the backstop, so finalize here instead.
+          emitDrainBackstopFired(unsettled.length);
+          drainTimedOut = true;
+          break;
+        }
+        const drainResult = await drainInjectedPromptsWithBackstop(
+          unsettled.map((delivery) => delivery.promise),
+          remainingMs,
+          emitDrainBackstopFired,
+        );
+        if (drainResult.timedOut) {
+          // The backstop path DOES have an await behind it, which is exactly
+          // why the synthetic pass below iterates the live set: an injection
+          // that landed during that await still gets its terminal.
+          drainTimedOut = true;
+          break;
+        }
+        // That set settled — but the handler is still registered, so a NEW
+        // injection may have arrived while we waited. Loop and drain it too.
+        // This TERMINATES: each new injection makes the adapter hand the previous
+        // one off, so the set only fails to close while the real agent turn is
+        // still running — which is exactly when we want to keep injecting.
       }
-      const drainResult = await drainInjectedPromptsWithBackstop(
-        unsettled.map((delivery) => delivery.promise),
-        remainingMs,
-        emitDrainBackstopFired,
-      );
-      if (drainResult.timedOut) {
-        drainTimedOut = true;
-        break;
-      }
-      // That set settled — but the handler is still registered, so a NEW
-      // injection may have arrived while we waited. Loop and drain it too.
-      // This TERMINATES: each new injection makes the adapter hand the previous
-      // one off, so the set only fails to close while the real agent turn is
-      // still running — which is exactly when we want to keep injecting.
+    } finally {
+      // A1: the turn is genuinely closing — stop injecting. Reached on EVERY
+      // exit path: the empty-set fast path, the clean drain, the backstop
+      // timeout, and a throw. Doing it here rather than before the await also
+      // FREEZES `injectedDeliveries` for the synthetic pass below, so nothing
+      // can be appended to it mid-iteration.
+      options.setMidTurnHandler?.(undefined);
     }
-    // The turn is genuinely closing now: stop injecting. Doing it here rather
-    // than before the await also FREEZES `injectedDeliveries` for the synthetic
-    // pass below, so nothing can be appended to it mid-iteration.
-    options.setMidTurnHandler?.(undefined);
     // C3 (G2 completeness): the backstop fired with injected prompts still
     // pending. Their own late terminal may never come (the response is withheld
     // forever), so write one now — the exactly-one-terminal invariant is held by
