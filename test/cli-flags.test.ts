@@ -530,7 +530,10 @@ test("session and prompt option registration parse command-local flags", () => {
 
 test("session selector flags document explicit identity options", () => {
   const promptSessionHelp = addSessionOption(new Command()).helpInformation().replace(/\s+/g, " ");
-  assert.match(promptSessionHelp, /Use named session instead of cwd default/);
+  assert.match(
+    promptSessionHelp,
+    /Use named session \(local first, then one exact global agent match\)/,
+  );
   assert.match(
     promptSessionHelp,
     /Resolve a session globally by acpx record id, ACP session id, or unique suffix/,
@@ -547,7 +550,10 @@ test("session selector flags document explicit identity options", () => {
   const namedSessionHelp = addSessionNameOption(new Command())
     .helpInformation()
     .replace(/\s+/g, " ");
-  assert.match(namedSessionHelp, /Use named session instead of cwd default/);
+  assert.match(
+    namedSessionHelp,
+    /Use named session \(local first, then one exact global agent match\)/,
+  );
   assert.match(
     namedSessionHelp,
     /Resolve a session globally by acpx record id, ACP session id, or unique suffix/,
