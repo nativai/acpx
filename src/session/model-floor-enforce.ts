@@ -163,6 +163,10 @@ function buildFloorWarningMessage(evaluation: ModelFloorEvaluation): SessionMess
         },
       ],
       tool_results: {},
+      // System breadcrumb, not a real model turn — must not count as
+      // irreplaceable history in the resume→session/new fallback gate
+      // (brick://de3645c6, extended by brick://509b4ee1).
+      synthetic: true,
     },
   };
 }

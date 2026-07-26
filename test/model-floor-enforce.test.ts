@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { ModelFloorUnmetError } from "../src/errors.js";
+import { sessionHasRealAgentTurn } from "../src/runtime/engine/lifecycle.js";
 import { enforceModelFloorPostServe } from "../src/session/model-floor-enforce.js";
 import type { SessionRecord } from "../src/types.js";
 import { makeSessionRecord, withTempHome, writeSessionRecordFile } from "./runtime-test-helpers.js";
@@ -71,6 +72,11 @@ test("below-floor, DEFAULT mode → ACCEPT + breadcrumb + session-visible warnin
     assert.equal(record.messages.length, before + 1);
     const warn = record.messages.at(-1);
     assert.ok(JSON.stringify(warn).includes("below pinned model floor"));
+    // The warning is a synthetic breadcrumb, not a real model turn — it must not
+    // block the resume→session/new fallback gate (brick://de3645c6 / brick://509b4ee1).
+    assert.ok(typeof warn === "object" && warn !== null && "Agent" in warn);
+    assert.equal(warn.Agent.synthetic, true);
+    assert.equal(sessionHasRealAgentTurn(record), false);
     // Desired pin is NEVER mutated.
     assert.equal(record.acpx?.session_options?.model, "fable");
     assert.equal(record.acpx?.session_options?.effort, "max");

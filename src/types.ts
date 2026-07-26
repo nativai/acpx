@@ -385,11 +385,16 @@ export type SessionAgentMessage = {
   terminal_error?: SessionTerminalError;
   /**
    * Marks an Agent entry that acpx MIRRORED into the log as a system breadcrumb
-   * rather than a real model turn (e.g. the implicit-Fable→opus guard notice,
-   * brick://5bac5564). It carries NO conversation the adapter ever produced, so
-   * the fallback-safety gate must not treat it as irreplaceable history — see
-   * `sessionHasRealAgentTurn` (brick://de3645c6). Absent on every real streamed
-   * Agent turn. The FIX-A `terminal_error` mirror is deliberately NOT tagged: a
+   * rather than a real model turn — the implicit-Fable→opus guard notice
+   * (brick://5bac5564), the fable→opus degrade notice (brick://4d517be2), and
+   * the below-floor serve warning. It carries NO conversation the adapter ever
+   * produced, so the fallback-safety gate must not treat it as irreplaceable
+   * history — see `sessionHasRealAgentTurn` (brick://de3645c6; breadcrumb set
+   * completed by brick://509b4ee1). Absent on every real streamed Agent turn.
+   * Every acpx-authored breadcrumb builder MUST set this — an untagged
+   * breadcrumb pushed before a fresh session's first successful turn makes that
+   * session permanently unpromptable on its cold resume (-32002 → fallback
+   * refused). The FIX-A `terminal_error` mirror is deliberately NOT tagged: a
    * terminal error reflects a real prompt attempt and must keep surfacing loudly.
    */
   synthetic?: true;

@@ -52,6 +52,12 @@ function buildFableDegradeMessage(params: { from: string; to: string }): Session
         },
       ],
       tool_results: {},
+      // System breadcrumb, not a real model turn — must not count as
+      // irreplaceable history in the resume→session/new fallback gate
+      // (brick://de3645c6, extended by brick://509b4ee1). Without this, a fresh
+      // session whose first turn degraded and then died before any transcript
+      // write is permanently unpromptable.
+      synthetic: true,
     },
   };
 }
