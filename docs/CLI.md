@@ -52,7 +52,7 @@ Additional built-in agent docs live in [the Agents page](agents.md).
 Prompt options:
 
 ```bash
--s, --session <name>   Use named session instead of cwd default
+-s, --session <name>   Use named session (local first, then one exact global agent match)
 --no-wait              Queue prompt and return immediately if session is busy
 -f, --file <path>      Read prompt text from file (`-` means stdin)
 ```
@@ -340,7 +340,7 @@ Behavior:
 - `sessions ensure` returns the nearest matching active session or creates one for cwd
 - `sessions ensure --name <name>` does the same for named sessions
 - `sessions close` soft-closes the current cwd default session
-- `sessions close <name>` soft-closes current cwd named session
+- `sessions close <name>` soft-closes the local named session first, then one exact global agent match
 - `sessions show [name]` displays stored session metadata
 - `sessions history [name]` displays stored turn history previews (default 20, configurable with `--limit`)
 - `sessions export [name] --output <path>` writes a portable JSON archive with session state and event history; `--cwd <dir>` selects a different source cwd relative to global `--cwd`
@@ -351,6 +351,12 @@ Behavior:
 - `sessions prune` deletes closed session records for the selected agent; add `--include-history` to delete event stream files too
 - `sessions prune --before <date>` and `--older-than <days>` filter by close time, falling back to last-used time for older records
 - close errors if the target session does not exist
+
+For commands that address an existing session, an explicit name first uses that
+command's local lookup behavior. If local lookup misses, one exact global match
+for the selected agent is used. Multiple matches fail closed and list record IDs
+and cwds; select one with `--session-id` or `--session-url`. Omitted/default
+names, `sessions new`, and `sessions ensure` remain cwd-scoped.
 
 ## `status` command
 
@@ -366,9 +372,9 @@ acpx [global_options] status --session-url <url>
 ```
 
 Shows local process status for the selected session. Name lookup (`-s/--session`)
-remains cwd-scoped. Explicit identity selectors (`--session-id` and
-`--session-url`) resolve the persisted session globally, so an agent can check
-its own URL-addressed session even when its current cwd or name is unavailable.
+checks the exact cwd first, then resolves one exact global match for the selected
+agent. Ambiguous names require `--session-id` or `--session-url`; those durable
+identity selectors always resolve the persisted session globally.
 
 - `running`, `idle`, `dead`, or `no-session`
 - session id, agent command, live queue-owner pid when available

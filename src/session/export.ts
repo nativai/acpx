@@ -16,6 +16,7 @@ import {
   findSession,
   listSessions,
   normalizeName,
+  resolveGlobalSessionByName,
   resolveSessionRecord,
   sessionBaseDir,
 } from "./persistence.js";
@@ -93,17 +94,22 @@ async function loadSessionRecord(
       return active;
     }
 
-    return (await listSessions()).find((session) => {
-      if (
-        !matchesAgentIdentity(session, agentCommand, sessionLookup.agentName) ||
-        session.cwd !== cwd
-      ) {
-        return false;
-      }
-      if (name == null) {
-        return session.name == null;
-      }
-      return session.name === name;
+    const localClosed = await findSession({
+      agentCommand,
+      agentName: sessionLookup.agentName,
+      cwd,
+      name,
+      includeClosed: true,
+    });
+    if (localClosed || name === undefined) {
+      return localClosed;
+    }
+
+    return await resolveGlobalSessionByName({
+      agentCommand,
+      agentName: sessionLookup.agentName,
+      name,
+      includeClosed: true,
     });
   }
 
@@ -122,17 +128,6 @@ async function loadSessionRecord(
   }
 
   return matches[0];
-}
-
-function matchesAgentIdentity(
-  session: Pick<SessionRecord, "agentCommand" | "agentName">,
-  agentCommand: string,
-  agentName: string | undefined,
-): boolean {
-  if (agentName && session.agentName) {
-    return session.agentName === agentName;
-  }
-  return session.agentCommand === agentCommand;
 }
 
 type EventLockPayload = {

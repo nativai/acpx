@@ -549,6 +549,79 @@ test("findSession and findSessionByDirectoryWalk resolve expected records", asyn
   });
 });
 
+test("explicit global name resolution is agent-scoped, index-first, and fails closed", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwdA = path.join(homeDir, "repo-a");
+    const cwdB = path.join(homeDir, "repo-b");
+    const cwdOtherAgent = path.join(homeDir, "repo-other-agent");
+    await fs.mkdir(cwdA, { recursive: true });
+    await fs.mkdir(cwdB, { recursive: true });
+    await fs.mkdir(cwdOtherAgent, { recursive: true });
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "global-a",
+        acpSessionId: "global-a",
+        agentName: "codex",
+        agentCommand: "old-codex-command",
+        cwd: cwdA,
+        name: "deploy",
+      }),
+    );
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "other-agent",
+        acpSessionId: "other-agent",
+        agentName: "claude",
+        agentCommand: "claude-command",
+        cwd: cwdOtherAgent,
+        name: "deploy",
+      }),
+    );
+
+    const unique = await session.resolveGlobalSessionByName({
+      agentName: "codex",
+      agentCommand: "new-codex-command",
+      name: "deploy",
+    });
+    assert.equal(unique?.acpxRecordId, "global-a");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "global-b",
+        acpSessionId: "global-b",
+        agentName: "codex",
+        agentCommand: "new-codex-command",
+        cwd: cwdB,
+        name: "deploy",
+      }),
+    );
+
+    await assert.rejects(
+      session.resolveGlobalSessionByName({
+        agentName: "codex",
+        agentCommand: "new-codex-command",
+        name: "deploy",
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /ambiguous/i);
+        assert.match(error.message, new RegExp(`cwd: ${cwdA.replaceAll("\\", "\\\\")}`));
+        assert.match(error.message, /record ID: global-a/);
+        assert.match(error.message, new RegExp(`cwd: ${cwdB.replaceAll("\\", "\\\\")}`));
+        assert.match(error.message, /record ID: global-b/);
+        assert.match(error.message, /--session-id <id>/);
+        assert.match(error.message, /--session-url <url>/);
+        return true;
+      },
+    );
+  });
+});
+
 test("findSession routes by stable agentName when command changes", async () => {
   await withTempHome(async (homeDir) => {
     const session = await loadSessionModule();

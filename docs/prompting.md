@@ -68,7 +68,7 @@ Available on `prompt`, the bare implicit form, and `exec`:
 
 | Option          | Description                                                                |
 | --------------- | -------------------------------------------------------------------------- |
-| `-s, --session` | Use a named session within the current cwd scope                           |
+| `-s, --session` | Use a local named session, or one exact global agent match after a miss    |
 | `--no-wait`     | Enqueue and return immediately if a prompt is already running              |
 | `-f, --file`    | Read prompt text from a file (`-` reads stdin and still allows extra args) |
 

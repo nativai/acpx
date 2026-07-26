@@ -147,7 +147,9 @@ Behavior:
 
 Prompt options:
 
-- `-s, --session <name>`: use a named session within the same cwd
+- `-s, --session <name>`: use the local named session, or one exact global
+  agent-matching session after the command's local lookup misses; ambiguous
+  names require `--session-id` or `--session-url`
 - `--no-wait`: enqueue and return immediately when session is already busy
 - `-f, --file <path>`: read prompt text from file (`-` means stdin)
 
@@ -232,9 +234,12 @@ Behavior:
 - when `new` replaces an existing open session in that scope, the old one is soft-closed
 - `ensure` returns the nearest matching active session for the scope, or creates one when none is open. Idempotent — safe to call before every prompt in scripts.
 - `close` targets current cwd default session
-- `close <name>` targets current cwd named session
-- `show [name]` prints stored metadata for that scoped session
-- `history [name]` prints stored turn history previews (default 20, use `--limit`)
+- `close <name>` targets the current cwd named session first, then one exact
+  global agent match
+- `show [name]` prints stored metadata for the local session first, then one
+  exact global agent match
+- `history [name]` prints stored turn history previews (default 20, use
+  `--limit`) with the same local-first explicit-name lookup
 - `export [name] --output <path>` writes a portable JSON archive containing session state and event history
 - `import <archive>` creates a fresh local record, reopens the copied session as idle, keeps the provider session id, and clears source-machine process metadata
 - imported sessions must resume that provider session; if the destination agent cannot load it, prompts fail clearly instead of starting an empty conversation
@@ -243,7 +248,9 @@ Behavior:
   - `--dry-run` previews what would be deleted without touching disk
   - `--older-than <days>` and `--before <date>` filter by close time, falling back to last-used time when a record was never explicitly closed
   - `--include-history` also removes per-session event stream files (otherwise only the JSON record is removed)
-- `status -s <name>` remains cwd-scoped, while `status --session-id <id>` and `status --session-url <url>` resolve persisted sessions globally
+- `status -s <name>` checks the exact cwd first, then one exact global agent
+  match; `status --session-id <id>` and `status --session-url <url>` resolve
+  persisted sessions globally by canonical identity
 - `status --format json` includes model and reasoning-effort fields when the adapter has reported them
 
 ## Global options

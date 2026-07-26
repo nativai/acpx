@@ -18,6 +18,9 @@ Repo: https://github.com/openclaw/acpx
   sessions skip subscription configDir resolution and subscription failover.
 - CLI/sessions: raise the default queue-owner idle TTL from 5 minutes to 90
   minutes while preserving `--ttl 0` as keep-alive forever.
+- CLI/sessions: let existing-session commands resolve one exact explicit name
+  across cwd boundaries after their existing local lookup misses, while
+  preserving scoped creation and failing closed on name collisions.
 
 ### Breaking
 

@@ -59,7 +59,11 @@ Prompt commands (`acpx codex 'fix tests'`, `acpx codex prompt …`) resume an ex
 2. If a git root exists, walk from `cwd` up to that root **inclusive**, checking each directory.
 3. If no git root is found, only check `cwd` exactly — no parent walk.
 4. At each directory, find the first **active** (non-closed) session matching `(agentCommand, dir, optionalName)`.
-5. If a match is found, use it. Otherwise exit with code `4` and tell you to run `sessions new`.
+5. If a local match is found, use it.
+6. If an explicit name was supplied and local lookup misses, use one exact
+   active global match for the selected agent. Multiple matches fail closed and
+   require `--session-id` or `--session-url`.
+7. Otherwise exit with code `4` and tell you to run `sessions new`.
 
 This means most workflows feel like "I was talking to codex in this repo", regardless of whether you happen to be in `src/` or `docs/` when the next prompt fires.
 
@@ -70,7 +74,8 @@ acpx codex 'remind me what we changed'   # resumes the session created at ~/repo
 
 ## Named sessions
 
-`-s, --session <name>` adds the name into the scope key:
+`-s, --session <name>` adds the name into the creation/default-selection scope
+key:
 
 ```bash
 acpx codex sessions new --name backend
@@ -79,7 +84,11 @@ acpx codex -s backend 'fix the API pagination bug'
 acpx codex -s docs    'rewrite the changelog'
 ```
 
-Named sessions are independent. They do not share state, queue owners, or history.
+Named sessions are independent. They do not share state, queue owners, or
+history. Names are mutable display labels, not canonical identity: an
+existing-session command keeps its local lookup precedence, then accepts one
+exact global match for the selected agent. If that label is reused in multiple
+cwds, use the immutable record ID or session URL.
 
 ## Sessions vs. ensure vs. new
 

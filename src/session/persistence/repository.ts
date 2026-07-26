@@ -62,6 +62,27 @@ type FindSessionByDirectoryWalkOptions = {
   boundary?: string;
 };
 
+type ResolveSessionByExactNameOptions = {
+  name: string;
+  agentCommand?: string;
+  agentName?: string;
+  cwd?: string;
+  includeClosed?: boolean;
+  excludeSubagents?: boolean;
+};
+
+export type SessionNameCandidate = {
+  acpxRecordId: string;
+  agentCommand: string;
+  agentName?: string;
+  cwd: string;
+};
+
+export type SessionNameResolution =
+  | { kind: "none" }
+  | { kind: "found"; record: SessionRecord }
+  | { kind: "ambiguous"; candidates: SessionNameCandidate[] };
+
 function sessionFilePath(acpxRecordId: string): string {
   const safeId = encodeURIComponent(acpxRecordId);
   return path.join(sessionBaseDir(), `${safeId}.json`);
@@ -1007,6 +1028,94 @@ export async function findSessionByDirectoryWalk(
     }
     current = parent;
   }
+}
+
+/**
+ * Resolve an explicitly supplied display name from index entries, hydrating
+ * only the unique exact candidate. Callers decide whether this query is local
+ * (pass cwd) or global (omit cwd).
+ */
+function exactSessionNameCandidates(
+  entries: SessionIndexEntry[],
+  options: ResolveSessionByExactNameOptions,
+  normalizedName: string,
+): SessionIndexEntry[] {
+  const normalizedCwd = options.cwd === undefined ? undefined : absolutePath(options.cwd);
+  let candidates = entries.filter(
+    (entry) => entry.name === normalizedName && (options.includeClosed || !entry.closed),
+  );
+  if (normalizedCwd !== undefined) {
+    candidates = candidates.filter((entry) => entry.cwd === normalizedCwd);
+  }
+  if (options.excludeSubagents) {
+    candidates = candidates.filter((entry) => entry.kind !== "subagent");
+  }
+  const agentCommand = options.agentCommand;
+  if (agentCommand !== undefined) {
+    candidates = candidates.filter((entry) =>
+      matchesAgentIdentity(entry, agentCommand, options.agentName),
+    );
+  }
+  return candidates.toSorted(
+    (a, b) => a.cwd.localeCompare(b.cwd) || a.acpxRecordId.localeCompare(b.acpxRecordId),
+  );
+}
+
+export async function resolveSessionByExactName(
+  options: ResolveSessionByExactNameOptions,
+): Promise<SessionNameResolution> {
+  const normalizedName = normalizeName(options.name);
+  if (normalizedName === undefined) {
+    return { kind: "none" };
+  }
+
+  const candidates = exactSessionNameCandidates(
+    await loadSessionIndexEntries(),
+    options,
+    normalizedName,
+  );
+
+  if (candidates.length === 0) {
+    return { kind: "none" };
+  }
+  if (candidates.length > 1) {
+    return {
+      kind: "ambiguous",
+      candidates: candidates.map(({ acpxRecordId, agentCommand, agentName, cwd }) => ({
+        acpxRecordId,
+        agentCommand,
+        agentName,
+        cwd,
+      })),
+    };
+  }
+
+  const record = await loadRecordFromIndexEntry(candidates[0]);
+  return record ? { kind: "found", record } : { kind: "none" };
+}
+
+export async function resolveGlobalSessionByName(options: {
+  agentCommand: string;
+  agentName?: string;
+  name: string;
+  includeClosed?: boolean;
+}): Promise<SessionRecord | undefined> {
+  const resolution = await resolveSessionByExactName(options);
+  if (resolution.kind === "none") {
+    return undefined;
+  }
+  if (resolution.kind === "found") {
+    return resolution.record;
+  }
+
+  const candidates = resolution.candidates
+    .map((candidate) => `  - cwd: ${candidate.cwd}; record ID: ${candidate.acpxRecordId}`)
+    .join("\n");
+  throw new SessionResolutionError(
+    `Session name "${normalizeName(options.name) ?? options.name}" is ambiguous across eligible sessions:\n` +
+      `${candidates}\n` +
+      "Use --session-id <id> or --session-url <url> to select one.",
+  );
 }
 
 function nextWalkParent(
