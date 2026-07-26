@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { sessionHasAgentMessages, sessionHasRealAgentTurn } from "../src/runtime/engine/lifecycle.js";
+import {
+  sessionHasAgentMessages,
+  sessionHasRealAgentTurn,
+} from "../src/runtime/engine/lifecycle.js";
 import { applyFableDegrade } from "../src/session/fable-degrade.js";
 import { makeSessionRecord, withTempHome, writeSessionRecordFile } from "./runtime-test-helpers.js";
 
