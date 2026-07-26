@@ -3973,6 +3973,48 @@ test("generic sessions show resolves a uniquely matching non-default agent sessi
   });
 });
 
+test("generic readable lookup preserves active default-agent precedence over a closed predecessor", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_COMMAND);
+
+    const first = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "new", "-s", "recreated"],
+      homeDir,
+    );
+    assert.equal(first.code, 0, first.stderr);
+    const firstId = String(
+      (JSON.parse(first.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+
+    const second = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "new", "-s", "recreated"],
+      homeDir,
+    );
+    assert.equal(second.code, 0, second.stderr);
+    const secondId = String(
+      (JSON.parse(second.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    assert.notEqual(secondId, firstId);
+
+    const firstRecord = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, firstId), "utf8"),
+    ) as { closed?: unknown };
+    assert.equal(firstRecord.closed, true);
+
+    const shown = await runCli(
+      ["--cwd", cwd, "--format", "json", "sessions", "show", "recreated"],
+      homeDir,
+    );
+    assert.equal(shown.code, 0, shown.stderr);
+    assert.equal(
+      (JSON.parse(shown.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+      secondId,
+    );
+  });
+});
+
 test("sessions show and read resolve session ids while preserving name lookup", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
