@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -358,7 +359,16 @@ async function writeSessionRecordInternal(
     assertPersistedKeyPolicy(persistedRecord);
 
     const file = sessionFilePath(record.acpxRecordId);
-    const tempFile = `${file}.${process.pid}.${Date.now()}.tmp`;
+    // The temp name must be unique PER CALL, not per millisecond: two writes
+    // from this process in the same millisecond used to build the identical
+    // path, so the first rename won and the second hit ENOENT — turning a
+    // concurrent record write into a thrown error. Reachable on the normal
+    // mid-turn injection path (queue-owner-runtime drains the whole
+    // midTurnBuffer synchronously, so several injections start in one tick and
+    // race each other's recordPromptStart). Uniqueness, not serialization:
+    // this is a filename collision, and ordering here is deliberately free.
+    // Same shape already used by src/flows/store.ts.
+    const tempFile = `${file}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
     // Compact JSON: parses identically everywhere, saves ~30-40% of bytes and
     // stringify CPU on every checkpoint of a multi-MB record.
     const payload = JSON.stringify(persistedRecord);
