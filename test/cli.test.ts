@@ -4540,18 +4540,17 @@ test("prompt resolves a unique explicit name across cwd boundaries", async () =>
   await withTempHome(async (homeDir) => {
     const sessionCwd = path.join(homeDir, "workspace", "project-a");
     const callerCwd = path.join(homeDir, "workspace", "project-b");
-    const sessionId = "cross-cwd-prompt";
     await fs.mkdir(sessionCwd, { recursive: true });
     await fs.mkdir(callerCwd, { recursive: true });
     await writeCodexAgentConfig(homeDir, MOCK_AGENT_WITH_LOAD_RUNTIME_SESSION_ID);
-    await writeSessionRecord(homeDir, {
-      acpxRecordId: sessionId,
-      acpSessionId: sessionId,
-      agentName: "codex",
-      agentCommand: MOCK_AGENT_WITH_LOAD_RUNTIME_SESSION_ID,
-      cwd: sessionCwd,
-      name: "infra-deploy",
-    });
+
+    const created = await runCli(
+      ["--cwd", sessionCwd, "--format", "json", "codex", "sessions", "new", "-s", "infra-deploy"],
+      homeDir,
+    );
+    assert.equal(created.code, 0, created.stderr);
+    const sessionId = (JSON.parse(created.stdout.trim()) as { acpxRecordId?: string }).acpxRecordId;
+    assert.equal(typeof sessionId, "string");
 
     const prompt = await runCli(
       [
@@ -4571,7 +4570,7 @@ test("prompt resolves a unique explicit name across cwd boundaries", async () =>
     assert.match(prompt.stdout, /cross-cwd-name-success/);
 
     const close = await runCli(
-      ["--cwd", callerCwd, "codex", "sessions", "close", "--session-id", sessionId],
+      ["--cwd", callerCwd, "codex", "sessions", "close", "--session-id", sessionId ?? ""],
       homeDir,
     );
     assert.equal(close.code, 0, close.stderr);
