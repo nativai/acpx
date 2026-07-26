@@ -16,6 +16,7 @@ import {
   parseMaxTurns,
   parseTtlSeconds,
 } from "../src/cli.js";
+import { FORK_NOTICE_MARKER } from "../src/cli/session/fork-handoff.js";
 import { transcriptJsonlPath } from "../src/config/subscription-transcript.js";
 import { DEFAULT_CODEX_MODEL } from "../src/session/default-model.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence.js";
@@ -1205,12 +1206,9 @@ test("sessions copy creates a full same-agent copy with lineage and metadata", a
       agent_command?: unknown;
       cwd?: unknown;
       name?: unknown;
-      last_seq?: unknown;
       forked_from_session_id?: unknown;
       forked_at_message_index?: unknown;
       metadata?: Record<string, unknown>;
-      messages?: unknown[];
-      messages_log?: { count?: unknown };
       acpx?: {
         session_options?: {
           subscription?: unknown;
@@ -1226,22 +1224,83 @@ test("sessions copy creates a full same-agent copy with lineage and metadata", a
     assert.equal(stored.agent_command, MOCK_AGENT_WITH_FORK_SESSION);
     assert.equal(stored.cwd, cwd);
     assert.equal(stored.name, "copied");
-    assert.equal(stored.last_seq, 0);
     assert.equal(stored.forked_from_session_id, "source-copy");
     assert.equal(stored.forked_at_message_index, messages.length);
     assert.equal(stored.metadata?.task_folder, "/wisdom/task");
-    // FW-10 fix: the inherited conversation is flushed to the messages-log
-    // sidecar (count == forkAtMessageIndex), leaving inline `messages` as the
-    // split-tail — the fork is now stored exactly like its parent.
-    assert.deepEqual(stored.messages, []);
-    assert.equal(stored.messages_log?.count, messages.length);
-    assert.deepEqual(await readForkMessagesLog(homeDir, String(payload.acpxRecordId)), messages);
     assert.equal(stored.acpx?.session_options?.subscription, "sub1");
     assert.deepEqual(stored.acpx?.session_options?.allowed_tools, ["Read", "Grep"]);
     assert.equal(stored.acpx?.session_options?.max_turns, 3);
     assert.equal(stored.acpx?.session_options?.system_prompt, "stay on task");
     assert.equal(stored.acpx?.desired_config_options?.effort, "high");
     assert.equal(stored.acpx?.desired_config_options?.custom, "keep-me");
+
+    // #3 Fork notice: a plain (non-ephemeral) copy deliberately queues a
+    // ⟦FORK-NOTICE⟧ divergence handoff as the fork's turn 1 and RETURNS WITHOUT
+    // WAITING for it (handleSessionsCopy → deliverCopyHandoffPrompt,
+    // waitForCompletion: false — spawn-style fire-and-return). The child's
+    // transcript therefore keeps growing after the CLI process exits, so reading
+    // a message count "right after copy returns" races that intended write and
+    // trips `3 !== 2` under concurrent load (brick://6b0c1df2). Assert the
+    // SETTLED end state instead — never a snapshot mid-delivery. The
+    // fire-and-return contract itself is unchanged and is proved separately by
+    // "sessions copy --prompt queues a non-blocking prompt handoff".
+    const childId = String(payload.acpxRecordId);
+    // 2 inherited messages + the notice + the fork's reply to it.
+    const settledCount = messages.length + 2;
+    const settled = await waitFor(async () => {
+      const record = JSON.parse(await fs.readFile(sessionFilePath(homeDir, childId), "utf8")) as {
+        last_seq?: unknown;
+        messages?: unknown[];
+        messages_log?: { count?: unknown; base_index?: unknown };
+      };
+      const log = await readForkMessagesLog(homeDir, childId);
+      // Both sides must have caught up before anything is asserted, so the
+      // record and the sidecar are read as one consistent settled state.
+      return record.messages_log?.count === settledCount && log.length === settledCount
+        ? { record, log }
+        : null;
+    }, 20_000);
+
+    // FW-10 fix: the whole conversation is flushed to the messages-log sidecar
+    // (base_index 0), leaving inline `messages` as the split-tail — the fork is
+    // stored exactly like its parent. The inherited prefix must survive the
+    // notice turn byte-exact, at exactly forkAtMessageIndex entries.
+    assert.deepEqual(settled.record.messages, []);
+    assert.equal(settled.record.messages_log?.base_index, 0);
+    assert.equal(settled.record.messages_log?.count, settledCount);
+    assert.deepEqual(settled.log.slice(0, messages.length), messages);
+
+    // Turn 1 of the fork is the divergence notice itself, addressed to the fork
+    // and naming the source it diverged from — followed by the fork's reply, so
+    // the queued turn is proven to have run rather than merely been persisted.
+    const notice = settled.log[messages.length];
+    const noticeText =
+      typeof notice === "object" && notice !== null && "User" in notice
+        ? notice.User.content.map((block) => ("Text" in block ? block.Text : "")).join("")
+        : "";
+    assert.ok(
+      noticeText.startsWith(FORK_NOTICE_MARKER),
+      `expected the fork's turn 1 to be the divergence notice, got ${JSON.stringify(notice)}`,
+    );
+    assert.match(noticeText, /You were forked from session source-copy\./);
+    const reply = settled.log[messages.length + 1];
+    assert.ok(
+      typeof reply === "object" && reply !== null && "Agent" in reply,
+      `expected the notice turn to complete with an Agent reply, got ${JSON.stringify(reply)}`,
+    );
+
+    // last_seq is the fork's OWN event counter: created at 0 (asserted race-free
+    // by the notice-free `--ephemeral` sibling below) and advanced only by this
+    // fork's own first turn — never carried over from the source's sequence.
+    assert.ok(
+      typeof settled.record.last_seq === "number" && settled.record.last_seq > 0,
+      `expected the notice turn to advance the fork's own last_seq, got ${String(settled.record.last_seq)}`,
+    );
+
+    // Close the child: the queued notice turn leaves a live queue owner behind,
+    // and this test must not strand one for the rest of the suite.
+    const close = await runCli(["codex", "sessions", "close", "--session-id", childId], homeDir);
+    assert.equal(close.code, 0, close.stderr);
   });
 });
 
