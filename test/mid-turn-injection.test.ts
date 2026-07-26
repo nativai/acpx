@@ -578,18 +578,15 @@ async function runFireAndForgetInjectionWithoutTerminalResponseScenario(): Promi
         },
       );
 
-      await Promise.race([
+      await withRaceTimeout(
         runQueuedTask(record.acpxRecordId, mainTask, {
           sharedClient: control.client,
           setMidTurnHandler: midTurn.setMidTurnHandler,
           suppressSdkConsoleErrors: true,
         }),
-        new Promise<never>((_resolve, reject) => {
-          setTimeout(() => {
-            reject(new Error("timed out waiting for fire-and-forget injected prompt drain"));
-          }, 250);
-        }),
-      ]);
+        TURN_MUST_NOT_BLOCK_MS,
+        "PRODUCT REGRESSION: the turn never finalized — it is still awaiting a fire-and-forget injected prompt that returns no terminal by design. A healthy turn finalizes in milliseconds; this is not a slow box.",
+      );
 
       assert.ok(
         mainSends.find((m) => m.type === "result"),
@@ -773,18 +770,15 @@ async function runCodexNoWaitInjectionStaysFireAndForgetScenario(): Promise<void
         mainMessageId,
       );
 
-      await Promise.race([
+      await withRaceTimeout(
         runQueuedTask(record.acpxRecordId, mainTask, {
           sharedClient: control.client,
           setMidTurnHandler: midTurn.setMidTurnHandler,
           suppressSdkConsoleErrors: true,
         }),
-        new Promise<never>((_resolve, reject) => {
-          setTimeout(() => {
-            reject(new Error("Codex --no-wait steer must not block turn finalization"));
-          }, 250);
-        }),
-      ]);
+        TURN_MUST_NOT_BLOCK_MS,
+        "PRODUCT REGRESSION: a Codex --no-wait steer BLOCKED turn finalization — the absorbed injection was awaited, and it never returns a terminal by design, so the turn is wedged until the drain backstop. A healthy turn finalizes in milliseconds; this is not a slow box.",
+      );
 
       assert.ok(
         mainSends.find((m) => m.type === "result"),
@@ -1677,13 +1671,42 @@ async function withTurnResponseTimeout<T>(ms: number, run: () => Promise<T>): Pr
 }
 
 async function withRaceTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
-  return await Promise.race([
-    promise,
-    new Promise<never>((_resolve, reject) => {
-      setTimeout(() => reject(new Error(message)), ms);
-    }),
-  ]);
+  // The timer is CLEARED once the awaited promise settles. Without that, every
+  // race leaves a live timer holding the event loop open for the rest of its
+  // window after the test has already passed — which is what forces deadlines
+  // to be chosen small, and small wall-clock deadlines are what make these
+  // tests load-sensitive. Clearing it makes a generous deadline free, so the
+  // deadline can be set where it only fires on real misbehaviour. It stays
+  // REF'd (not `unref`'d) on purpose: a genuinely wedged turn must fail the
+  // test, not let the process exit quietly with the assertions unrun.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
 }
+
+// "This turn must not block on an injected steer that never returns a terminal."
+//
+// That property is BINARY, not a continuum: a healthy turn finalizes in
+// milliseconds, while a regressed one awaits a promise that never settles and
+// so hangs until the 30-minute drain backstop. There is no legitimate middle
+// ground where a turn takes seconds for an honest reason, which means the
+// deadline should sit far above box noise rather than near it.
+//
+// It previously sat at 250 ms and reproduced ~1 failure in 20 runs on a box at
+// load 5-12 — a timeout-class red that says nothing about the product and
+// teaches the next agent to re-run instead of read. At 30 s, losing the race
+// genuinely means the turn is wedged.
+const TURN_MUST_NOT_BLOCK_MS = 30_000;
 
 function terminalsForMessage(events: unknown[], messageId: string): Record<string, unknown>[] {
   return deliveryEventSummaries(events).filter(
@@ -2277,18 +2300,15 @@ test("493729fc F4: codex wait-mode injection is absorbed — turn finalizes prom
         mainMessageId,
       );
 
-      await Promise.race([
+      await withRaceTimeout(
         runQueuedTask(record.acpxRecordId, mainTask, {
           sharedClient: control.client,
           setMidTurnHandler: midTurn.setMidTurnHandler,
           suppressSdkConsoleErrors: true,
         }),
-        new Promise<never>((_resolve, reject) => {
-          setTimeout(() => {
-            reject(new Error("codex WAIT-mode steer must not block turn finalization (F4)"));
-          }, 500);
-        }),
-      ]);
+        TURN_MUST_NOT_BLOCK_MS,
+        "PRODUCT REGRESSION (493729fc F4): a Codex WAIT-mode steer BLOCKED turn finalization — the absorbed injection was awaited instead of being answered at turn end, so the turn is wedged until the drain backstop. A healthy turn finalizes in milliseconds; this is not a slow box.",
+      );
 
       assert.ok(
         mainSends.find((m) => m.type === "result"),
