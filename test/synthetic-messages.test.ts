@@ -47,7 +47,10 @@ test("legacy untagged breadcrumbs are recognized by verbatim production content"
 
 test("real turns are never misclassified", () => {
   // Ordinary output.
-  assert.equal(isSyntheticAgentEntry(agentEntry({ content: [{ Text: "real prior turn" }] })), false);
+  assert.equal(
+    isSyntheticAgentEntry(agentEntry({ content: [{ Text: "real prior turn" }] })),
+    false,
+  );
   // A terminal-error mirror is a real prompt attempt — must stay loud.
   assert.equal(
     isSyntheticAgentEntry(
