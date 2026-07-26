@@ -83,9 +83,11 @@ Reports local process status for the selected session:
 Plus, when applicable: session id, agent command, live queue-owner pid, uptime,
 last prompt timestamp, and last known exit code or signal for `dead`.
 
-Name lookup (`-s/--session`) is cwd-scoped. `--session-url` and `--session-id`
-resolve persisted sessions globally, which is the durable path for an agent
-checking its own `$ACPX_SESSION_URL`.
+Name lookup (`-s/--session`) checks the exact cwd first, then uses one exact
+global match for the selected agent. Ambiguous names require `--session-url` or
+`--session-id`; those immutable identity selectors always resolve persisted
+sessions globally and remain the durable path for an agent checking its own
+`$ACPX_SESSION_URL`.
 
 Status output also includes model, available model ids, desired reasoning
 effort, and live advertised effort when the adapter has reported them.

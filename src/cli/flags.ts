@@ -518,7 +518,7 @@ export function addSessionOption(command: Command): Command {
   return addSessionIdentityOptions(
     command.option(
       "-s, --session <name>",
-      "Use named session instead of cwd default",
+      "Use named session (local first, then one exact global agent match)",
       parseSessionName,
     ),
   ).option(
@@ -531,7 +531,7 @@ export function addSessionNameOption(command: Command): Command {
   return addSessionIdentityOptions(
     command.option(
       "-s, --session <name>",
-      "Use named session instead of cwd default",
+      "Use named session (local first, then one exact global agent match)",
       parseSessionName,
     ),
   );

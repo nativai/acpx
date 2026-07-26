@@ -55,6 +55,8 @@ import {
   migrateTemplateSlugs,
   normalizeName,
   persistTemplateMark,
+  resolveGlobalSessionByName,
+  resolveSessionByExactName,
   resolveSessionRecord,
   resolveTemplateSelector,
   rollbackTemplateSlug,
@@ -992,13 +994,21 @@ async function findGenericReadableSessionOrThrow(
   }
 
   const normalizedName = normalizeName(sessionName);
+  if (normalizedName !== undefined) {
+    return await findExplicitGenericReadableSessionOrThrow(
+      agent,
+      normalizedName,
+      subcommand,
+      config,
+    );
+  }
+
   const candidates = (await listSessions()).filter(
     (record) =>
       record.kind !== "subagent" &&
       record.cwd === agent.cwd &&
       (normalizedName == null ? record.name == null : record.name === normalizedName),
   );
-
   if (candidates.length === 1) {
     return candidates[0];
   }
@@ -1025,6 +1035,81 @@ async function findGenericReadableSessionOrThrow(
   );
 }
 
+async function findExplicitGenericReadableSessionOrThrow(
+  agent: ResolvedAgentInvocation,
+  sessionName: string,
+  subcommand: string,
+  config: ResolvedAcpxConfig,
+): Promise<SessionRecord> {
+  const localResolution = await resolveSessionByExactName({
+    name: sessionName,
+    cwd: agent.cwd,
+    includeClosed: true,
+    excludeSubagents: true,
+  });
+  if (localResolution.kind === "found") {
+    return localResolution.record;
+  }
+  if (localResolution.kind === "ambiguous") {
+    const suggestions = localResolution.candidates
+      .map(
+        (candidate) =>
+          `  - ${explicitSessionCommand(candidate.agentCommand, sessionName, subcommand, config)}`,
+      )
+      .join("\n");
+    throw new Error(
+      `${missingScopedSessionMessage(agent, sessionName)}\n` +
+        `Searched default agent ${agent.agentName}. Multiple matching sessions exist across agents; use an explicit agent command:\n` +
+        suggestions,
+    );
+  }
+
+  const globalRecord = await resolveGlobalSessionByName({
+    agentCommand: agent.agentCommand,
+    agentName: agent.agentName,
+    name: sessionName,
+    includeClosed: true,
+  });
+  if (globalRecord) {
+    return globalRecord;
+  }
+
+  throw new Error(
+    `${missingScopedSessionMessage(agent, sessionName)}\n` +
+      `Searched default agent ${agent.agentName}. To inspect another agent, use \`acpx <agent> sessions ${subcommand} ${sessionName}\`.`,
+  );
+}
+
+async function findExplicitAgentReadableSessionOrThrow(
+  agent: ResolvedAgentInvocation,
+  sessionName: string | undefined,
+): Promise<SessionRecord> {
+  const localRecord = await findSession({
+    agentCommand: agent.agentCommand,
+    agentName: agent.agentName,
+    cwd: agent.cwd,
+    name: sessionName,
+    includeClosed: true,
+  });
+  if (localRecord) {
+    return localRecord;
+  }
+
+  if (sessionName !== undefined) {
+    const globalRecord = await resolveGlobalSessionByName({
+      agentCommand: agent.agentCommand,
+      agentName: agent.agentName,
+      name: sessionName,
+      includeClosed: true,
+    });
+    if (globalRecord) {
+      return globalRecord;
+    }
+  }
+
+  return await findScopedSessionOrThrow(agent, sessionName);
+}
+
 async function findReadableSessionOrThrow(params: {
   explicitAgentName: string | undefined;
   agent: ResolvedAgentInvocation;
@@ -1047,14 +1132,16 @@ async function findReadableSessionOrThrow(params: {
     }
   }
 
-  return params.explicitAgentName == null
-    ? await findGenericReadableSessionOrThrow(
-        params.agent,
-        params.selector.name,
-        params.subcommand,
-        params.config,
-      )
-    : await findScopedSessionOrThrow(params.agent, params.selector.name);
+  if (params.explicitAgentName == null) {
+    return await findGenericReadableSessionOrThrow(
+      params.agent,
+      params.selector.name,
+      params.subcommand,
+      params.config,
+    );
+  }
+
+  return await findExplicitAgentReadableSessionOrThrow(params.agent, params.selector.name);
 }
 
 async function findRoutedSessionOrThrow(
@@ -1076,6 +1163,17 @@ async function findRoutedSessionOrThrow(
 
   if (record) {
     return record;
+  }
+
+  if (sessionName !== undefined) {
+    const globalRecord = await resolveGlobalSessionByName({
+      agentCommand,
+      agentName,
+      name: sessionName,
+    });
+    if (globalRecord) {
+      return globalRecord;
+    }
   }
 
   const createCmd = sessionName
@@ -1113,12 +1211,21 @@ async function findOptionalRoutedTargetSession(
   }
 
   const gitRoot = findGitRepositoryRoot(agent.cwd);
-  return await findSessionByDirectoryWalk({
+  const localRecord = await findSessionByDirectoryWalk({
     agentCommand: agent.agentCommand,
     agentName: agent.agentName,
     cwd: agent.cwd,
     name: selector.name,
     boundary: gitRoot ?? agent.cwd,
+  });
+  if (localRecord || selector.name === undefined) {
+    return localRecord;
+  }
+
+  return await resolveGlobalSessionByName({
+    agentCommand: agent.agentCommand,
+    agentName: agent.agentName,
+    name: selector.name,
   });
 }
 
@@ -1954,7 +2061,8 @@ async function warnIfTaskFolderMissing(folder: string): Promise<void> {
 
 // Self-apply: let a running session set/update its OWN session-record metadata
 // (e.g. task_folder) without an ACP round-trip. Pure record edit: resolve the
-// cwd-scoped session, merge the key into a freshly-read record, and persist it.
+// locally-routed session (or one exact global name after a local miss), merge
+// the key into a freshly-read record, and persist it.
 // acpx-ui reflects the link on its next read; $ACPX_TASK_FOLDER reaches the agent
 // on its NEXT prompt/exec turn (a live process's env cannot be mutated in place).
 export async function handleSessionsSetMetadata(
@@ -2076,7 +2184,7 @@ export async function handleSessionsClose(
 
   const selector = resolveSessionTargetSelector({ flags, command, positionalName: sessionName });
   const explicitRecord = await resolveExplicitSessionRecord(selector);
-  const record =
+  const localRecord =
     explicitRecord ??
     (await findSession({
       agentCommand: agent.agentCommand,
@@ -2084,6 +2192,15 @@ export async function handleSessionsClose(
       cwd: agent.cwd,
       name: selector.name,
     }));
+  const record =
+    localRecord ??
+    (selector.name === undefined
+      ? undefined
+      : await resolveGlobalSessionByName({
+          agentCommand: agent.agentCommand,
+          agentName: agent.agentName,
+          name: selector.name,
+        }));
 
   if (!record) {
     throw new Error(missingScopedSessionMessage(agent, sessionName));

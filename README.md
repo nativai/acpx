@@ -165,7 +165,7 @@ acpx codex sessions new --name api # create fresh named session
 acpx codex sessions ensure       # return existing scoped session or create one
 acpx codex sessions ensure --name api # ensure named scoped session
 acpx codex sessions close        # close cwd-scoped default session
-acpx codex sessions close api    # close cwd-scoped named session
+acpx codex sessions close api    # close local named session, or one exact global match
 acpx codex status                # local process status for current session
 acpx codex status --session-url "$ACPX_SESSION_URL" # durable self-check by URL
 
@@ -393,7 +393,9 @@ spawns the ACP bridge directly without `pnpm` wrapper noise:
 - Prompt commands require an existing saved session record (created via `sessions new` or `sessions ensure`).
 - Prompts route by walking up from `cwd` (or `--cwd`) to the nearest git root (inclusive) and selecting the nearest active session matching `(agent command, dir, optional name)`.
 - If no git root is found, prompts only match an exact `cwd` session (no parent-directory walk).
-- `-s <name>` selects a parallel named session during that directory walk.
+- `-s <name>` first selects a parallel named session during that directory walk. After a
+  local miss, existing-session commands use one exact, agent-matching global name; collisions
+  fail closed and require `--session-id` or `--session-url`.
 - `sessions new [--name <name>]` creates a fresh session for that scope and soft-closes the prior one.
 - `sessions ensure [--name <name>]` is idempotent: it returns an existing scoped session or creates one when missing.
 - `sessions close [name]` soft-closes the session: queue owner/processes are terminated, record is kept with `closed: true`.

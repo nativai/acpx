@@ -4052,7 +4052,7 @@ test("sessions show and read resolve session ids while preserving name lookup", 
   });
 });
 
-test("explicit session selectors resolve records globally while name lookup stays cwd-scoped", async () => {
+test("explicit selectors stay global and a unique explicit name resolves across cwd", async () => {
   await withTempHome(async (homeDir) => {
     const sessionCwd = path.join(homeDir, "workspace", "project");
     const otherCwd = path.join(homeDir, "elsewhere");
@@ -4104,9 +4104,9 @@ test("explicit session selectors resolve records globally while name lookup stay
     );
     assert.equal(wrongCwdNameStatus.code, 0, wrongCwdNameStatus.stderr);
     const wrongCwdNamePayload = JSON.parse(wrongCwdNameStatus.stdout.trim()) as {
-      status?: unknown;
+      acpxRecordId?: unknown;
     };
-    assert.equal(wrongCwdNamePayload.status, "no-session");
+    assert.equal(wrongCwdNamePayload.acpxRecordId, recordId);
 
     const correctCwdNameStatus = await runCli(
       ["--cwd", sessionCwd, "--format", "json", "codex", "status", "-s", "mutable-label"],
@@ -4288,6 +4288,293 @@ test("explicit session selectors resolve records globally while name lookup stay
     };
     assert.equal(closePayload.action, "session_closed");
     assert.equal(closePayload.acpxRecordId, recordId);
+  });
+});
+
+test("explicit names preserve routed ancestor and exact-cwd local precedence", async () => {
+  await withTempHome(async (homeDir) => {
+    const repoRoot = path.join(homeDir, "workspace", "repo");
+    const childCwd = path.join(repoRoot, "packages", "app");
+    const remoteCwd = path.join(homeDir, "workspace", "remote");
+    await fs.mkdir(path.join(repoRoot, ".git"), { recursive: true });
+    await fs.mkdir(childCwd, { recursive: true });
+    await fs.mkdir(remoteCwd, { recursive: true });
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "ancestor-shared",
+      acpSessionId: "ancestor-shared",
+      agentName: "codex",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd: repoRoot,
+      name: "shared-local",
+    });
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "remote-shared",
+      acpSessionId: "remote-shared",
+      agentName: "codex",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd: remoteCwd,
+      name: "shared-local",
+    });
+
+    const routed = await runCli(
+      [
+        "--cwd",
+        childCwd,
+        "--format",
+        "json",
+        "codex",
+        "sessions",
+        "set-metadata",
+        "-s",
+        "shared-local",
+        "owner",
+        "ancestor",
+      ],
+      homeDir,
+    );
+    assert.equal(routed.code, 0, routed.stderr);
+    const ancestor = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, "ancestor-shared"), "utf8"),
+    ) as { metadata?: Record<string, unknown> };
+    assert.equal(ancestor.metadata?.owner, "ancestor");
+
+    const exactScopedMiss = await runCli(
+      ["--cwd", childCwd, "codex", "status", "-s", "shared-local"],
+      homeDir,
+    );
+    assert.equal(exactScopedMiss.code, 1);
+    assert.match(exactScopedMiss.stderr, /ambiguous/i);
+    assert.match(exactScopedMiss.stderr, /cwd: .*workspace\/repo; record ID: ancestor-shared/);
+    assert.match(exactScopedMiss.stderr, /cwd: .*workspace\/remote; record ID: remote-shared/);
+    assert.match(exactScopedMiss.stderr, /--session-id <id>/);
+    assert.match(exactScopedMiss.stderr, /--session-url <url>/);
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "exact-shared",
+      acpSessionId: "exact-shared",
+      agentName: "codex",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd: childCwd,
+      name: "shared-local",
+    });
+    const exactLocal = await runCli(
+      ["--cwd", childCwd, "--format", "json", "codex", "status", "-s", "shared-local"],
+      homeDir,
+    );
+    assert.equal(exactLocal.code, 0, exactLocal.stderr);
+    const exactPayload = JSON.parse(exactLocal.stdout.trim()) as { acpxRecordId?: unknown };
+    assert.equal(exactPayload.acpxRecordId, "exact-shared");
+  });
+});
+
+test("global explicit-name fallback is agent-scoped and command eligibility stays intact", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionCwd = path.join(homeDir, "workspace", "project-a");
+    const callerCwd = path.join(homeDir, "workspace", "project-b");
+    const otherAgentCwd = path.join(homeDir, "workspace", "project-c");
+    const archivePath = path.join(homeDir, "closed-export.json");
+    await fs.mkdir(sessionCwd, { recursive: true });
+    await fs.mkdir(callerCwd, { recursive: true });
+    await fs.mkdir(otherAgentCwd, { recursive: true });
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "codex-global",
+      acpSessionId: "codex-global",
+      agentName: "codex",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd: sessionCwd,
+      name: "agent-scoped",
+    });
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "claude-global",
+      acpSessionId: "claude-global",
+      agentName: "claude",
+      agentCommand: AGENT_REGISTRY.claude,
+      cwd: otherAgentCwd,
+      name: "agent-scoped",
+    });
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "closed-global",
+      acpSessionId: "closed-global",
+      agentName: "codex",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd: sessionCwd,
+      name: "closed-readable",
+      closed: true,
+      closedAt: "2026-01-02T00:00:00.000Z",
+    });
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "unnamed-global",
+      acpSessionId: "unnamed-global",
+      agentName: "codex",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd: sessionCwd,
+    });
+
+    const agentScoped = await runCli(
+      ["--cwd", callerCwd, "--format", "json", "codex", "status", "-s", "agent-scoped"],
+      homeDir,
+    );
+    assert.equal(agentScoped.code, 0, agentScoped.stderr);
+    assert.equal(
+      (JSON.parse(agentScoped.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+      "codex-global",
+    );
+
+    const closedStatus = await runCli(
+      ["--cwd", callerCwd, "--format", "json", "codex", "status", "-s", "closed-readable"],
+      homeDir,
+    );
+    assert.equal(closedStatus.code, 0, closedStatus.stderr);
+    assert.equal(
+      (JSON.parse(closedStatus.stdout.trim()) as { status?: unknown }).status,
+      "no-session",
+    );
+
+    const closedShow = await runCli(
+      ["--cwd", callerCwd, "--format", "json", "codex", "sessions", "show", "closed-readable"],
+      homeDir,
+    );
+    assert.equal(closedShow.code, 0, closedShow.stderr);
+    assert.equal(
+      (JSON.parse(closedShow.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+      "closed-global",
+    );
+
+    const closedExport = await runCli(
+      [
+        "--cwd",
+        callerCwd,
+        "--format",
+        "quiet",
+        "codex",
+        "sessions",
+        "export",
+        "closed-readable",
+        "--output",
+        archivePath,
+      ],
+      homeDir,
+    );
+    assert.equal(closedExport.code, 0, closedExport.stderr);
+    const archive = JSON.parse(await fs.readFile(archivePath, "utf8")) as {
+      session?: { record_id?: unknown };
+    };
+    assert.equal(archive.session?.record_id, "closed-global");
+
+    const omittedDefault = await runCli(
+      ["--cwd", callerCwd, "--format", "json", "codex", "status"],
+      homeDir,
+    );
+    assert.equal(omittedDefault.code, 0, omittedDefault.stderr);
+    assert.equal(
+      (JSON.parse(omittedDefault.stdout.trim()) as { status?: unknown }).status,
+      "no-session",
+    );
+
+    const missingExplicit = await runCli(
+      ["--cwd", callerCwd, "codex", "prompt", "-s", "does-not-exist", "hello"],
+      homeDir,
+    );
+    assert.equal(missingExplicit.code, 4);
+    assert.match(missingExplicit.stderr, /No acpx session found/);
+  });
+});
+
+test("sessions ensure and new keep explicit names scoped to their creation cwd", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwdA = path.join(homeDir, "workspace", "project-a");
+    const cwdB = path.join(homeDir, "workspace", "project-b");
+    const cwdC = path.join(homeDir, "workspace", "project-c");
+    await fs.mkdir(cwdA, { recursive: true });
+    await fs.mkdir(cwdB, { recursive: true });
+    await fs.mkdir(cwdC, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_COMMAND);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "existing-reusable",
+      acpSessionId: "existing-reusable",
+      agentName: "codex",
+      agentCommand: MOCK_AGENT_COMMAND,
+      cwd: cwdA,
+      name: "implementation",
+    });
+
+    const ensured = await runCli(
+      ["--cwd", cwdB, "--format", "json", "codex", "sessions", "ensure", "-s", "implementation"],
+      homeDir,
+    );
+    assert.equal(ensured.code, 0, ensured.stderr);
+    const ensuredPayload = JSON.parse(ensured.stdout.trim()) as {
+      acpxRecordId?: string;
+      created?: boolean;
+    };
+    assert.equal(ensuredPayload.created, true);
+    assert.notEqual(ensuredPayload.acpxRecordId, "existing-reusable");
+    const ensuredRecord = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, ensuredPayload.acpxRecordId ?? ""), "utf8"),
+    ) as { cwd?: string };
+    assert.equal(ensuredRecord.cwd, cwdB);
+
+    const created = await runCli(
+      ["--cwd", cwdC, "--format", "json", "codex", "sessions", "new", "-s", "implementation"],
+      homeDir,
+    );
+    assert.equal(created.code, 0, created.stderr);
+    const createdPayload = JSON.parse(created.stdout.trim()) as {
+      acpxRecordId?: string;
+      created?: boolean;
+    };
+    assert.equal(createdPayload.created, true);
+    assert.notEqual(createdPayload.acpxRecordId, "existing-reusable");
+    assert.notEqual(createdPayload.acpxRecordId, ensuredPayload.acpxRecordId);
+
+    const original = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, "existing-reusable"), "utf8"),
+    ) as { closed?: boolean };
+    assert.equal(original.closed, false);
+  });
+});
+
+test("prompt resolves a unique explicit name across cwd boundaries", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionCwd = path.join(homeDir, "workspace", "project-a");
+    const callerCwd = path.join(homeDir, "workspace", "project-b");
+    const sessionId = "cross-cwd-prompt";
+    await fs.mkdir(sessionCwd, { recursive: true });
+    await fs.mkdir(callerCwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_WITH_LOAD_RUNTIME_SESSION_ID);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: sessionId,
+      acpSessionId: sessionId,
+      agentName: "codex",
+      agentCommand: MOCK_AGENT_WITH_LOAD_RUNTIME_SESSION_ID,
+      cwd: sessionCwd,
+      name: "infra-deploy",
+    });
+
+    const prompt = await runCli(
+      [
+        "--cwd",
+        callerCwd,
+        "--format",
+        "quiet",
+        "codex",
+        "prompt",
+        "-s",
+        "infra-deploy",
+        "echo cross-cwd-name-success",
+      ],
+      homeDir,
+    );
+    assert.equal(prompt.code, 0, prompt.stderr);
+    assert.match(prompt.stdout, /cross-cwd-name-success/);
+
+    const close = await runCli(
+      ["--cwd", callerCwd, "codex", "sessions", "close", "--session-id", sessionId],
+      homeDir,
+    );
+    assert.equal(close.code, 0, close.stderr);
   });
 });
 

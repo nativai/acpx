@@ -9,7 +9,7 @@ import {
   isSubscriptionLocked,
   loadSubscriptionRegistry,
 } from "../config/subscriptions.js";
-import { findSession } from "../session/persistence.js";
+import { findSession, resolveGlobalSessionByName } from "../session/persistence.js";
 import type { SessionRecord } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import {
@@ -86,7 +86,7 @@ export async function handleStatus(
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const selector = resolveSessionTargetSelector({ flags, command });
   const explicitRecord = await resolveExplicitSessionRecord(selector);
-  const record =
+  const localRecord =
     explicitRecord ??
     (await findSession({
       agentCommand: agent.agentCommand,
@@ -94,6 +94,15 @@ export async function handleStatus(
       cwd: agent.cwd,
       name: selector.name,
     }));
+  const record =
+    localRecord ??
+    (selector.name === undefined
+      ? undefined
+      : await resolveGlobalSessionByName({
+          agentCommand: agent.agentCommand,
+          agentName: agent.agentName,
+          name: selector.name,
+        }));
 
   if (!record) {
     printMissingStatus(globalFlags.format, agent.agentCommand);

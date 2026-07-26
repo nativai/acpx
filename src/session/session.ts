@@ -11,6 +11,13 @@ export {
   listSessions,
   listSessionsForAgent,
   pruneSessions,
+  resolveGlobalSessionByName,
+  resolveSessionByExactName,
 } from "./persistence.js";
-export type { PruneOptions, PruneResult } from "./persistence.js";
+export type {
+  PruneOptions,
+  PruneResult,
+  SessionNameCandidate,
+  SessionNameResolution,
+} from "./persistence.js";
 export { isProcessAlive } from "../process-liveness.js";
