@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type {
@@ -527,7 +528,11 @@ export async function compactMessagesLog(
   const payload = Buffer.from(
     kept.length === 0 ? "" : `${kept.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
   );
-  const tempFile = `${logPath}.${process.pid}.${Date.now()}.tmp`;
+  // Unique per call, not per millisecond — same collision as the record write
+  // in persistence/repository.ts, and on the SAME call path (writeSessionRecord
+  // calls this immediately before writing the record), so fixing only one of
+  // the two would leave the reproducer alive.
+  const tempFile = `${logPath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
   await fs.writeFile(tempFile, payload);
   await fs.rename(tempFile, logPath);
 
