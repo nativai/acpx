@@ -16,6 +16,7 @@ import {
   parseMaxTurns,
   parseTtlSeconds,
 } from "../src/cli.js";
+import { FORK_NOTICE_MARKER } from "../src/cli/session/fork-handoff.js";
 import { transcriptJsonlPath } from "../src/config/subscription-transcript.js";
 import { DEFAULT_CODEX_MODEL } from "../src/session/default-model.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence.js";
@@ -1189,59 +1190,81 @@ test("sessions copy creates a full same-agent copy with lineage and metadata", a
       sourceSessionId?: unknown;
       forkedAtMessageIndex?: unknown;
     };
-    assert.equal(payload.action, "session_copied");
-    assert.equal(payload.sourceSessionId, "source-copy");
-    assert.equal(payload.forkedAtMessageIndex, messages.length);
-    assert.equal(typeof payload.acpxRecordId, "string");
-    assert.notEqual(payload.acpxSessionId, payload.agentSessionId);
-    assert.match(String(payload.acpxSessionId), /^[0-9a-f-]{36}$/);
-    assert.match(String(payload.agentSessionId), /^forked-runtime-/);
+    // The copy returned 0, so a child session now exists: derive its id before any
+    // further assertion and run every one of them inside the try, so the `finally`
+    // closes the child on the failure path too — see closeForkedChildSession.
+    const childId = String(payload.acpxRecordId);
+    try {
+      assert.equal(payload.action, "session_copied");
+      assert.equal(payload.sourceSessionId, "source-copy");
+      assert.equal(payload.forkedAtMessageIndex, messages.length);
+      assert.equal(typeof payload.acpxRecordId, "string");
+      assert.notEqual(payload.acpxSessionId, payload.agentSessionId);
+      assert.match(String(payload.acpxSessionId), /^[0-9a-f-]{36}$/);
+      assert.match(String(payload.agentSessionId), /^forked-runtime-/);
 
-    const stored = JSON.parse(
-      await fs.readFile(sessionFilePath(homeDir, String(payload.acpxRecordId)), "utf8"),
-    ) as {
-      acp_session_id?: unknown;
-      agent_session_id?: unknown;
-      agent_command?: unknown;
-      cwd?: unknown;
-      name?: unknown;
-      last_seq?: unknown;
-      forked_from_session_id?: unknown;
-      forked_at_message_index?: unknown;
-      metadata?: Record<string, unknown>;
-      messages?: unknown[];
-      messages_log?: { count?: unknown };
-      acpx?: {
-        session_options?: {
-          subscription?: unknown;
-          allowed_tools?: unknown;
-          max_turns?: unknown;
-          system_prompt?: unknown;
+      const stored = JSON.parse(await fs.readFile(sessionFilePath(homeDir, childId), "utf8")) as {
+        acp_session_id?: unknown;
+        agent_session_id?: unknown;
+        agent_command?: unknown;
+        cwd?: unknown;
+        name?: unknown;
+        forked_from_session_id?: unknown;
+        forked_at_message_index?: unknown;
+        metadata?: Record<string, unknown>;
+        acpx?: {
+          session_options?: {
+            subscription?: unknown;
+            allowed_tools?: unknown;
+            max_turns?: unknown;
+            system_prompt?: unknown;
+          };
+          desired_config_options?: Record<string, unknown>;
         };
-        desired_config_options?: Record<string, unknown>;
       };
-    };
-    assert.equal(stored.acp_session_id, payload.acpxSessionId);
-    assert.equal(stored.agent_session_id, payload.agentSessionId);
-    assert.equal(stored.agent_command, MOCK_AGENT_WITH_FORK_SESSION);
-    assert.equal(stored.cwd, cwd);
-    assert.equal(stored.name, "copied");
-    assert.equal(stored.last_seq, 0);
-    assert.equal(stored.forked_from_session_id, "source-copy");
-    assert.equal(stored.forked_at_message_index, messages.length);
-    assert.equal(stored.metadata?.task_folder, "/wisdom/task");
-    // FW-10 fix: the inherited conversation is flushed to the messages-log
-    // sidecar (count == forkAtMessageIndex), leaving inline `messages` as the
-    // split-tail — the fork is now stored exactly like its parent.
-    assert.deepEqual(stored.messages, []);
-    assert.equal(stored.messages_log?.count, messages.length);
-    assert.deepEqual(await readForkMessagesLog(homeDir, String(payload.acpxRecordId)), messages);
-    assert.equal(stored.acpx?.session_options?.subscription, "sub1");
-    assert.deepEqual(stored.acpx?.session_options?.allowed_tools, ["Read", "Grep"]);
-    assert.equal(stored.acpx?.session_options?.max_turns, 3);
-    assert.equal(stored.acpx?.session_options?.system_prompt, "stay on task");
-    assert.equal(stored.acpx?.desired_config_options?.effort, "high");
-    assert.equal(stored.acpx?.desired_config_options?.custom, "keep-me");
+      assert.equal(stored.acp_session_id, payload.acpxSessionId);
+      assert.equal(stored.agent_session_id, payload.agentSessionId);
+      assert.equal(stored.agent_command, MOCK_AGENT_WITH_FORK_SESSION);
+      assert.equal(stored.cwd, cwd);
+      assert.equal(stored.name, "copied");
+      assert.equal(stored.forked_from_session_id, "source-copy");
+      assert.equal(stored.forked_at_message_index, messages.length);
+      assert.equal(stored.metadata?.task_folder, "/wisdom/task");
+      assert.equal(stored.acpx?.session_options?.subscription, "sub1");
+      assert.deepEqual(stored.acpx?.session_options?.allowed_tools, ["Read", "Grep"]);
+      assert.equal(stored.acpx?.session_options?.max_turns, 3);
+      assert.equal(stored.acpx?.session_options?.system_prompt, "stay on task");
+      assert.equal(stored.acpx?.desired_config_options?.effort, "high");
+      assert.equal(stored.acpx?.desired_config_options?.custom, "keep-me");
+
+      // #3 Fork notice: reading a message count "right after copy returns" races
+      // the deliberately-queued notice turn and trips `3 !== 2` under concurrent
+      // load (brick://6b0c1df2). Assert the SETTLED end state instead — never a
+      // snapshot mid-delivery. See waitForSettledForkNotice.
+      const settledCount = messages.length + 2;
+      const settled = await waitForSettledForkNotice(homeDir, childId, messages.length);
+
+      // FW-10 fix: the whole conversation is flushed to the messages-log sidecar
+      // (base_index 0), leaving inline `messages` as the split-tail — the fork is
+      // stored exactly like its parent. The inherited prefix must survive the
+      // notice turn byte-exact, at exactly forkAtMessageIndex entries.
+      assert.deepEqual(settled.record.messages, []);
+      assert.equal(settled.record.messages_log?.base_index, 0);
+      assert.equal(settled.record.messages_log?.count, settledCount);
+      assert.deepEqual(settled.log.slice(0, messages.length), messages);
+
+      assertSettledForkNoticeTurn(settled.log, messages.length, "source-copy");
+
+      // last_seq is the fork's OWN event counter: created at 0 (asserted race-free
+      // by the notice-free `--ephemeral` sibling below) and advanced only by this
+      // fork's own first turn — never carried over from the source's sequence.
+      assert.ok(
+        typeof settled.record.last_seq === "number" && settled.record.last_seq > 0,
+        `expected the notice turn to advance the fork's own last_seq, got ${String(settled.record.last_seq)}`,
+      );
+    } finally {
+      await closeForkedChildSession(homeDir, "codex", childId);
+    }
   });
 });
 
@@ -1299,23 +1322,43 @@ test("sessions copy --at-index 0 creates an empty Claude copy with lineage", asy
       acpxRecordId?: unknown;
       forkedAtMessageIndex?: unknown;
     };
-    assert.equal(payload.forkedAtMessageIndex, 0);
-    assert.equal(typeof payload.acpxRecordId, "string");
+    // The copy returned 0, so a child session now exists: derive its id before any
+    // further assertion and run every one of them inside the try, so the `finally`
+    // closes the child on the failure path too — see closeForkedChildSession.
+    const childId = String(payload.acpxRecordId);
+    try {
+      assert.equal(payload.forkedAtMessageIndex, 0);
+      assert.equal(typeof payload.acpxRecordId, "string");
 
-    const stored = JSON.parse(
-      await fs.readFile(sessionFilePath(homeDir, String(payload.acpxRecordId)), "utf8"),
-    ) as {
-      forked_from_session_id?: unknown;
-      forked_at_message_index?: unknown;
-      messages?: unknown[];
-      messages_log?: { count?: unknown };
-    };
-    assert.equal(stored.forked_from_session_id, "source-claude-zero");
-    assert.equal(stored.forked_at_message_index, 0);
-    assert.deepEqual(stored.messages, []);
-    // An at-index-0 fork inherits no conversation, so there is no messages-log
-    // sidecar to write and `messages_log` stays absent.
-    assert.equal(stored.messages_log, undefined);
+      const stored = JSON.parse(await fs.readFile(sessionFilePath(homeDir, childId), "utf8")) as {
+        forked_from_session_id?: unknown;
+        forked_at_message_index?: unknown;
+        messages?: unknown[];
+      };
+      assert.equal(stored.forked_from_session_id, "source-claude-zero");
+      assert.equal(stored.forked_at_message_index, 0);
+      // Inline `messages` is the split-tail and is empty either side of the notice
+      // turn, so this one stays race-free on the immediate read.
+      assert.deepEqual(stored.messages, []);
+
+      // #3 Fork notice: `messages_log` is absent only until the deliberately-queued
+      // notice turn lands — it then becomes the notice + the fork's reply — so
+      // asserting `messages_log === undefined` right after copy returns raced that
+      // intended write (brick://5d72f693). Prove the at-index-0 truncation on the
+      // SETTLED state instead, and more strongly: the sidecar settles at exactly
+      // two entries whose FIRST is the notice, i.e. NOTHING was inherited ahead of
+      // it. A fork that wrongly copied the source's two messages would settle at
+      // four and fail the wait. See waitForSettledForkNotice.
+      const settled = await waitForSettledForkNotice(homeDir, childId, 0);
+      assert.deepEqual(settled.record.messages, []);
+      assert.equal(settled.record.messages_log?.base_index, 0);
+      assert.equal(settled.record.messages_log?.count, 2);
+      assert.equal(settled.log.length, 2);
+
+      assertSettledForkNoticeTurn(settled.log, 0, "source-claude-zero");
+    } finally {
+      await closeForkedChildSession(homeDir, "claude", childId);
+    }
   });
 });
 
@@ -1560,44 +1603,65 @@ test("sessions copy resolves Claude --at-index from source cwd and forwards copi
       acpxRecordId?: unknown;
       forkedAtMessageIndex?: unknown;
     };
-    assert.equal(payload.forkedAtMessageIndex, 2);
-    assert.equal(typeof payload.acpxRecordId, "string");
+    // The copy returned 0, so a child session now exists: derive its id before any
+    // further assertion and run every one of them inside the try, so the `finally`
+    // closes the child on the failure path too — see closeForkedChildSession.
+    const childId = String(payload.acpxRecordId);
+    try {
+      assert.equal(payload.forkedAtMessageIndex, 2);
+      assert.equal(typeof payload.acpxRecordId, "string");
 
-    const stored = JSON.parse(
-      await fs.readFile(sessionFilePath(homeDir, String(payload.acpxRecordId)), "utf8"),
-    ) as {
-      cwd?: unknown;
-      forked_from_session_id?: unknown;
-      forked_at_message_index?: unknown;
-      messages?: unknown[];
-      messages_log?: { count?: unknown };
-    };
-    assert.equal(stored.cwd, destinationCwd);
-    assert.equal(stored.forked_from_session_id, "source-claude-transcript");
-    assert.equal(stored.forked_at_message_index, 2);
-    // FW-10 fix: inherited conversation flushed to the messages-log sidecar.
-    assert.deepEqual(stored.messages, []);
-    assert.equal(stored.messages_log?.count, messages.length);
-    assert.deepEqual(await readForkMessagesLog(homeDir, String(payload.acpxRecordId)), messages);
+      const stored = JSON.parse(await fs.readFile(sessionFilePath(homeDir, childId), "utf8")) as {
+        cwd?: unknown;
+        forked_from_session_id?: unknown;
+        forked_at_message_index?: unknown;
+        messages?: unknown[];
+      };
+      assert.equal(stored.cwd, destinationCwd);
+      assert.equal(stored.forked_from_session_id, "source-claude-transcript");
+      assert.equal(stored.forked_at_message_index, 2);
+      // FW-10 fix: inherited conversation flushed to the messages-log sidecar,
+      // leaving inline `messages` as the split-tail — empty either side of the
+      // notice turn, so this one stays race-free on the immediate read.
+      assert.deepEqual(stored.messages, []);
 
-    const callLog = await fs.readFile(
-      path.join(homeDir, ".claude", "fork-sdk-calls.jsonl"),
-      "utf8",
-    );
-    const call = JSON.parse(callLog.trim()) as {
-      sessionId?: unknown;
-      dir?: unknown;
-      upToMessageId?: unknown;
-    };
-    assert.equal(call.sessionId, sourceAcpSessionId);
-    assert.equal(call.dir, destinationCwd);
-    assert.equal(call.upToMessageId, "assistant-uuid");
-    await assert.rejects(
-      fs.access(
-        transcriptJsonlPath(path.join(homeDir, ".claude"), destinationCwd, sourceAcpSessionId),
-      ),
-      { code: "ENOENT" },
-    );
+      const callLog = await fs.readFile(
+        path.join(homeDir, ".claude", "fork-sdk-calls.jsonl"),
+        "utf8",
+      );
+      const call = JSON.parse(callLog.trim()) as {
+        sessionId?: unknown;
+        dir?: unknown;
+        upToMessageId?: unknown;
+      };
+      assert.equal(call.sessionId, sourceAcpSessionId);
+      assert.equal(call.dir, destinationCwd);
+      assert.equal(call.upToMessageId, "assistant-uuid");
+      await assert.rejects(
+        fs.access(
+          transcriptJsonlPath(path.join(homeDir, ".claude"), destinationCwd, sourceAcpSessionId),
+        ),
+        { code: "ENOENT" },
+      );
+
+      // #3 Fork notice: the sidecar holds the inherited pair only until the
+      // deliberately-queued notice turn lands, so asserting `count === 2` and the
+      // exact two-entry log right after copy returns raced that intended write and
+      // tripped `3 !== 2` under concurrent load (brick://5d72f693). The inherited
+      // prefix is proved byte-exact on the SETTLED state instead — at exactly
+      // forkAtMessageIndex entries, ahead of the notice. See
+      // waitForSettledForkNotice.
+      const settledCount = messages.length + 2;
+      const settled = await waitForSettledForkNotice(homeDir, childId, messages.length);
+      assert.deepEqual(settled.record.messages, []);
+      assert.equal(settled.record.messages_log?.base_index, 0);
+      assert.equal(settled.record.messages_log?.count, settledCount);
+      assert.deepEqual(settled.log.slice(0, messages.length), messages);
+
+      assertSettledForkNoticeTurn(settled.log, messages.length, "source-claude-transcript");
+    } finally {
+      await closeForkedChildSession(homeDir, "claude", childId);
+    }
   });
 });
 
@@ -7219,6 +7283,85 @@ async function readForkMessagesLog(
     .split("\n")
     .filter((line) => line.length > 0)
     .map((line) => JSON.parse(line) as SessionRecord["messages"][number]);
+}
+
+// ── #3 Fork notice: settle it, never snapshot it ─────────────────────────────
+// A plain (non-ephemeral) `sessions copy` deliberately queues a ⟦FORK-NOTICE⟧
+// divergence handoff as the fork's turn 1 and RETURNS WITHOUT WAITING for it
+// (handleSessionsCopy → deliverCopyHandoffPrompt, waitForCompletion: false —
+// spawn-style fire-and-return). The child's transcript therefore keeps growing
+// after the CLI process exits, so any message/sidecar snapshot taken "right
+// after copy returns" races that intended write (brick://6b0c1df2 for the count,
+// brick://5d72f693 for the two siblings). Wait for the SETTLED end state
+// instead: the record and the sidecar are read together on every poll, so both
+// sides have caught up before anything is asserted. The fire-and-return contract
+// itself is unchanged and is proved separately by "sessions copy --prompt queues
+// a non-blocking prompt handoff".
+type SettledForkRecord = {
+  last_seq?: unknown;
+  messages?: unknown[];
+  messages_log?: { count?: unknown; base_index?: unknown };
+};
+
+async function waitForSettledForkNotice(
+  homeDir: string,
+  childId: string,
+  inheritedCount: number,
+): Promise<{ record: SettledForkRecord; log: SessionRecord["messages"] }> {
+  // the inherited prefix + the notice + the fork's reply to it.
+  const settledCount = inheritedCount + 2;
+  return await waitFor(async () => {
+    const record = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, childId), "utf8"),
+    ) as SettledForkRecord;
+    const log = await readForkMessagesLog(homeDir, childId);
+    return record.messages_log?.count === settledCount && log.length === settledCount
+      ? { record, log }
+      : null;
+  }, 20_000);
+}
+
+// Turn 1 of the fork is the divergence notice itself — keyed on the stable
+// FORK_NOTICE_MARKER (not on prose) and naming the source it diverged from —
+// followed by the fork's reply, so the queued turn is proven to have RUN rather
+// than merely been persisted. The fork index is asserted structurally by each
+// caller (record lineage + where the notice sits in the settled log), so nothing
+// here couples to the notice's wording beyond the marker and the source id.
+function assertSettledForkNoticeTurn(
+  log: SessionRecord["messages"],
+  inheritedCount: number,
+  sourceSessionId: string,
+): void {
+  const notice = log[inheritedCount];
+  const noticeText =
+    typeof notice === "object" && notice !== null && "User" in notice
+      ? notice.User.content.map((block) => ("Text" in block ? block.Text : "")).join("")
+      : "";
+  assert.ok(
+    noticeText.startsWith(FORK_NOTICE_MARKER),
+    `expected the fork's turn 1 to be the divergence notice, got ${JSON.stringify(notice)}`,
+  );
+  assert.match(
+    noticeText,
+    new RegExp(`You were forked from session ${escapeRegex(sourceSessionId)}\\.`),
+  );
+  const reply = log[inheritedCount + 1];
+  assert.ok(
+    typeof reply === "object" && reply !== null && "Agent" in reply,
+    `expected the notice turn to complete with an Agent reply, got ${JSON.stringify(reply)}`,
+  );
+}
+
+// The queued notice turn leaves a live queue owner (and its mock agent) behind.
+// Every caller runs this from a `finally` so that a failed assertion or a
+// timed-out settle wait cannot strand one for the rest of the suite either.
+async function closeForkedChildSession(
+  homeDir: string,
+  agentName: string,
+  childId: string,
+): Promise<void> {
+  const close = await runCli([agentName, "sessions", "close", "--session-id", childId], homeDir);
+  assert.equal(close.code, 0, close.stderr);
 }
 
 async function fileExists(filePath: string): Promise<boolean> {
