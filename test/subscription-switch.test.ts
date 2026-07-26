@@ -145,3 +145,39 @@ test("switchSessionSubscription rejects an unknown target id", async () => {
     );
   });
 });
+
+test("switchSessionSubscription proceeds for a breadcrumb-only session — nothing to port (brick://509b4ee1)", async () => {
+  await withTempHome(async ({ registryPath }) => {
+    // Twin of the account-seam case: a synthetic breadcrumb is not agent
+    // history, so a missing transcript must not refuse the switch — previously
+    // the has-agent-messages gate threw SubscriptionSwitchError here.
+    const record = makeRecord({
+      acpSessionId: "acp-breadcrumb-only",
+      messages: [
+        {
+          Agent: {
+            content: [
+              {
+                Text: "⚠ Fable share exhausted on all subscriptions — degraded to opus for this session (fable_degrade_ok). This turn and subsequent turns run on opus instead of failing. Re-select Fable to undo (brick://4d517be2).",
+              },
+            ],
+            tool_results: {},
+          },
+        },
+        { User: { id: "u-1", content: [{ Text: "first prompt" }] } },
+      ],
+      acpx: { session_options: { subscription: "subA" } },
+    });
+
+    const result = await switchSessionSubscription({
+      record,
+      targetSubId: "subB",
+      reason: "manual",
+      loadOpts: { registryPath },
+    });
+
+    assert.equal(result.transcriptCopied, false);
+    assert.equal(record.acpx?.session_options?.subscription, "subB");
+    assert.equal(record.acpx?.session_options?.subscription_switch?.to, "subB");
+  });
+});

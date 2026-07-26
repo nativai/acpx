@@ -11,7 +11,7 @@ import type { SubscriptionLookupOptions } from "../../config/subscriptions.js";
 import { SubscriptionLockedError } from "../../errors.js";
 import { isoNow } from "../../session/persistence/repository.js";
 import type { SessionRecord } from "../../types.js";
-import { sessionHasAgentMessages } from "./lifecycle.js";
+import { sessionHasRealAgentTurn } from "./lifecycle.js";
 
 export {
   getResolvedProfile,
@@ -126,7 +126,12 @@ async function portSwitchTranscript(args: {
     ...args.loadOpts,
     sourceConfigDirs: [args.srcAnchor],
   });
-  if (recovery.status === "missing" && sessionHasAgentMessages(args.record)) {
+  // Gate on REAL turns, not raw Agent entries: a breadcrumb-only session never
+  // produced a transcript, so there is nothing to port and the switch is safe —
+  // the next connect creates the transcript fresh on the target anchor
+  // (brick://509b4ee1; previously the guard breadcrumb made proactive selection
+  // skip with "missing transcript" on every fresh guard-forced session).
+  if (recovery.status === "missing" && sessionHasRealAgentTurn(args.record)) {
     throw new AccountSwitchError(
       `cannot switch session ${args.record.acpSessionId} to profile "${args.toProfile.id}": ${missingTranscriptMessage(recovery)}`,
     );

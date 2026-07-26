@@ -207,3 +207,46 @@ test("switchSessionAccount fails loudly when a non-fresh session has no portable
     assert.equal(record.acpx?.session_options?.account_switch, undefined);
   });
 });
+
+test("switchSessionAccount proceeds for a breadcrumb-only session — nothing to port (brick://509b4ee1)", async () => {
+  await withSeamRegistry(async (ctx) => {
+    // A fresh guard-forced session: its ONLY Agent entry is the (legacy,
+    // untagged) guard breadcrumb; no transcript exists anywhere. Previously the
+    // breadcrumb tripped the has-agent-messages port gate and proactive
+    // selection skipped with "missing transcript" on every such session
+    // (owner.log of production specimen c9ac2641). The switch must proceed —
+    // the next connect creates the transcript fresh on the target anchor.
+    const record = makeSessionRecord({
+      acpxRecordId: "rec-breadcrumb-only",
+      acpSessionId: "agent-session-breadcrumb",
+      agentCommand: "claude",
+      cwd: path.join(ctx.homeDir, "work"),
+      messages: [
+        {
+          Agent: {
+            content: [
+              {
+                Text:
+                  '⚠ implicit Fable blocked → forced opus: this session would have resolved to "fable" by ' +
+                  "inheritance/default, but Fable is never inherited automatically (brick://5bac5564). The model " +
+                  'was rewritten to "opus". Pass `--model fable` explicitly if a Fable session was actually intended.',
+              },
+            ],
+            tool_results: {},
+          },
+        },
+        { User: { id: "u-1", content: [{ Text: "first prompt" }] } },
+      ],
+      acpx: { session_options: { profile: "subA" } },
+    });
+
+    const result = await switchSessionAccount(record, "subB", "selection", {
+      homeDir: ctx.homeDir,
+      registryPath: ctx.registryPath,
+    });
+
+    assert.equal(result.transcriptCopied, false);
+    assert.equal(record.acpx?.session_options?.profile, "subB");
+    assert.equal(record.acpx?.session_options?.account_switch?.toProfile, "subB");
+  });
+});

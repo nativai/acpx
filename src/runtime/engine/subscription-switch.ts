@@ -13,7 +13,7 @@ import {
 import { SubscriptionLockedError } from "../../errors.js";
 import { isoNow } from "../../session/persistence/repository.js";
 import type { SessionRecord } from "../../types.js";
-import { sessionHasAgentMessages } from "./lifecycle.js";
+import { sessionHasRealAgentTurn } from "./lifecycle.js";
 
 // The switch primitive: change a session's active Claude subscription IN PLACE,
 // reused by both the manual `set subscription` CLI and auto-failover. PURE record
@@ -147,7 +147,9 @@ async function portSwitchTranscript(args: {
     registry: args.registry,
     sourceConfigDirs: [resolveCurrentConfigDir(args.record, args.registry)],
   });
-  if (recovery.status === "missing" && sessionHasAgentMessages(args.record)) {
+  // Gate on REAL turns, not raw Agent entries — twin of the account-seam port
+  // gate (brick://509b4ee1): breadcrumb-only records have no transcript to port.
+  if (recovery.status === "missing" && sessionHasRealAgentTurn(args.record)) {
     throw new SubscriptionSwitchError(
       `cannot switch session ${args.record.acpSessionId} to subscription "${args.targetSubId}": ${missingTranscriptMessage(recovery)}`,
     );

@@ -41,7 +41,6 @@ import type { SessionRecord, SessionResumePolicy } from "../../types.js";
 import {
   applyLifecycleSnapshotToRecord,
   reconcileAgentSessionId,
-  sessionHasAgentMessages,
   sessionHasRealAgentTurn,
 } from "./lifecycle.js";
 
@@ -773,7 +772,10 @@ async function ensurePendingSwitchTranscript(
   record: SessionRecord,
   verbose?: boolean,
 ): Promise<void> {
-  if (!record.acpSessionId.trim() || !sessionHasAgentMessages(record)) {
+  // Real turns only (brick://509b4ee1): a breadcrumb-only session has no
+  // transcript to ensure — proceed straight to connect, where the fixed
+  // fallback gate creates the session fresh on the new anchor.
+  if (!record.acpSessionId.trim() || !sessionHasRealAgentTurn(record)) {
     return;
   }
   if (record.acpx?.session_options?.account_switch) {

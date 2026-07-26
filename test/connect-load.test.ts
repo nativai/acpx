@@ -2353,3 +2353,178 @@ async function writeProfileRegistry(
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
   await withTempHomeFixture("acpx-connect-load-home-", run);
 }
+
+test("connectAndLoadSession self-heals a LEGACY pre-tag guard-forced session (untagged breadcrumb, production specimen b7d8d768) — brick://509b4ee1", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const subscriptionDir = path.join(homeDir, ".acpx", "subscriptions", "paid");
+    await writeSubscriptionRegistry(homeDir, {
+      default: "paid",
+      subscriptions: [{ id: "paid", label: "Paid", configDir: subscriptionDir }],
+    });
+
+    // Records written by acpx BEFORE the synthetic tag existed (2026-07-22 →
+    // 2026-07-26) carry the guard breadcrumb UNTAGGED, baked into the log.
+    // Proven live: specimen b7d8d768 still died loud after the tag-only fix
+    // deployed. Legacy content recognition must make these records self-heal
+    // too — text below is the VERBATIM production breadcrumb.
+    const record = makeSessionRecord({
+      acpxRecordId: "legacy-guard-forced-record",
+      acpSessionId: "legacy-guard-session",
+      agentCommand: "agent",
+      cwd,
+      messages: [
+        {
+          Agent: {
+            content: [
+              {
+                Text:
+                  '⚠ implicit Fable blocked → forced opus: this session would have resolved to "fable" by ' +
+                  "inheritance/default, but Fable is never inherited automatically (brick://5bac5564). The model " +
+                  'was rewritten to "opus". Pass `--model fable` explicitly if a Fable session was actually intended.',
+              },
+            ],
+            tool_results: {},
+          },
+        },
+        { User: { id: "u-probe", content: [{ Text: "Reply with exactly: PROBE-OK" }] } },
+      ],
+      acpx: {
+        session_options: {
+          subscription: "paid",
+          model_source: "guard-forced",
+          model_guard: {
+            blocked: "fable",
+            forced_to: "opus",
+            source: "inherited",
+            at: "2026-07-23T12:18:08.402Z",
+          },
+        },
+      },
+    });
+
+    let createCalls = 0;
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({
+        running: true,
+      }),
+      supportsLoadSession: () => false,
+      supportsResumeSession: () => true,
+      resumeSession: async () => {
+        throw {
+          error: {
+            code: -32002,
+            message: "Resource not found: legacy-guard-session",
+          },
+        };
+      },
+      loadSessionWithOptions: async () => {
+        throw new Error("loadSessionWithOptions must not be called on the resume path");
+      },
+      createSession: async (createCwd) => {
+        createCalls += 1;
+        assert.equal(createCwd, cwd);
+        return {
+          sessionId: "legacy-healed-session",
+          agentSessionId: "legacy-healed-runtime",
+        };
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+    };
+
+    const result = await connectAndLoadSession({
+      client: client as never,
+      record,
+      activeController: ACTIVE_CONTROLLER,
+    });
+
+    assert.equal(createCalls, 1, "legacy untagged breadcrumb must not gate the fallback");
+    assert.equal(result.resumed, false);
+    assert.equal(record.acpSessionId, "legacy-healed-session");
+  });
+});
+
+test("connectAndLoadSession keeps a terminal_error-only record LOUD — a failed real prompt attempt is not fallback-safe (design boundary, brick://509b4ee1)", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const subscriptionDir = path.join(homeDir, ".acpx", "subscriptions", "paid");
+    await writeSubscriptionRegistry(homeDir, {
+      default: "paid",
+      subscriptions: [{ id: "paid", label: "Paid", configDir: subscriptionDir }],
+    });
+
+    // A fresh session whose FIRST turn ended in a mirrored terminal error (e.g.
+    // exhaustion) before any transcript write: the FIX-A mirror is deliberately
+    // NOT synthetic — the failed attempt keeps surfacing loudly on retry rather
+    // than silently discarding the attempt via session/new (12a14c9 decision).
+    const record = makeSessionRecord({
+      acpxRecordId: "terminal-error-only-record",
+      acpSessionId: "terminal-error-session",
+      agentCommand: "agent",
+      cwd,
+      messages: [
+        { User: { id: "u-first", content: [{ Text: "do the thing" }] } },
+        {
+          Agent: {
+            content: [{ Text: "⚠ turn failed: all subscriptions exhausted" }],
+            tool_results: {},
+            terminal_error: {
+              message: "all subscriptions exhausted",
+              detail_code: "all-subscriptions-exhausted",
+            },
+          },
+        },
+      ],
+      acpx: {
+        session_options: {
+          subscription: "paid",
+        },
+      },
+    });
+
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({
+        running: true,
+      }),
+      supportsLoadSession: () => false,
+      supportsResumeSession: () => true,
+      resumeSession: async () => {
+        throw {
+          error: {
+            code: -32002,
+            message: "Resource not found: terminal-error-session",
+          },
+        };
+      },
+      loadSessionWithOptions: async () => {
+        throw new Error("loadSessionWithOptions must not be called on the resume path");
+      },
+      createSession: async () => {
+        throw new Error("createSession must not be called for a terminal_error record");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+    };
+
+    await assert.rejects(
+      async () =>
+        await connectAndLoadSession({
+          client: client as never,
+          record,
+          activeController: ACTIVE_CONTROLLER,
+        }),
+      (error: unknown) => {
+        assert(error instanceof Error);
+        assert.equal(error.name, "SessionResumeRequiredError");
+        return true;
+      },
+    );
+  });
+});

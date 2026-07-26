@@ -1,6 +1,7 @@
 import type { AgentLifecycleSnapshot } from "../../acp/client.js";
 import { copyLoggedMessageCount } from "../../session/messages-log-bookkeeping.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
+import { messagesHaveRealAgentTurn } from "../../session/synthetic-messages.js";
 import type { SessionConversation, SessionRecord } from "../../types.js";
 
 export function applyLifecycleSnapshotToRecord(
@@ -60,23 +61,19 @@ export function sessionHasAgentMessages(
 }
 
 // True only when a REAL model turn was ever produced — synthetic system
-// breadcrumbs mirrored by acpx (the implicit-Fable→opus guard notice, tagged
-// `Agent.synthetic:true`) are excluded (brick://de3645c6). This is the correct
-// signal for the "nothing to lose" fallback-safety gate: a never-run session
-// carrying only a cosmetic breadcrumb has no conversation to preserve, so a
+// breadcrumbs mirrored by acpx (the implicit-Fable→opus guard notice among
+// them) are excluded, whether tagged `Agent.synthetic:true` or recognized as a
+// legacy pre-tag breadcrumb by content (brick://de3645c6, legacy recognition
+// brick://509b4ee1 — see synthetic-messages.ts). This is the correct signal for
+// the "nothing to lose" fallback-safety gate: a never-run session carrying only
+// a cosmetic breadcrumb has no conversation to preserve, so a
 // resume→resource-not-found on a genuinely-missing transcript is safe to heal
 // via session/new — exactly as a freshly created session would. A session with
 // any real Agent turn still fails loudly (silent continuity loss is forbidden).
 export function sessionHasRealAgentTurn(
   recordOrConversation: Pick<SessionRecord, "messages"> | SessionConversation,
 ): boolean {
-  return recordOrConversation.messages.some(
-    (message) =>
-      typeof message === "object" &&
-      message !== null &&
-      "Agent" in message &&
-      message.Agent.synthetic !== true,
-  );
+  return messagesHaveRealAgentTurn(recordOrConversation.messages);
 }
 
 export function applyConversation(record: SessionRecord, conversation: SessionConversation): void {

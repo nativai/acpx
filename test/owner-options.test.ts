@@ -129,3 +129,36 @@ function makeHistoryRecord(
     },
   });
 }
+
+test("resolveSessionOwnerOptions takes the fresh-session path for a breadcrumb-only record (brick://509b4ee1)", () => {
+  // A guard-forced fresh session's only Agent entry is the (legacy, untagged)
+  // breadcrumb — that is not agent history, so a first prompt without a stored
+  // permission mode must NOT trip the restore-guard hard error.
+  const record = makeSessionRecord({
+    acpxRecordId: "breadcrumb-only",
+    acpSessionId: "provider-session",
+    agentCommand: "agent",
+    cwd: "/tmp/workspace",
+    messages: [
+      {
+        Agent: {
+          content: [
+            {
+              Text:
+                '⚠ implicit Fable blocked → forced opus: this session would have resolved to "fable" by ' +
+                "inheritance/default, but Fable is never inherited automatically (brick://5bac5564). The model " +
+                'was rewritten to "opus". Pass `--model fable` explicitly if a Fable session was actually intended.',
+            },
+          ],
+          tool_results: {},
+        },
+      },
+    ],
+    acpx: {},
+  });
+
+  const resolved = resolveSessionOwnerOptions(record, {
+    permissionMode: "approve-reads",
+  });
+  assert.equal(resolved.permission_mode, "approve-reads");
+});

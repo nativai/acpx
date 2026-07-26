@@ -9,6 +9,7 @@ import {
   type SessionOwnerOptions,
   type SessionRecord,
 } from "../types.js";
+import { messagesHaveRealAgentTurn } from "./synthetic-messages.js";
 
 export type SessionOwnerBehaviorInput = {
   permissionMode: PermissionMode;
@@ -150,7 +151,8 @@ function isAuthPolicy(value: unknown): value is AuthPolicy {
 }
 
 function sessionHasAgentMessages(record: Pick<SessionRecord, "messages">): boolean {
-  return record.messages.some(
-    (message) => typeof message === "object" && message !== null && "Agent" in message,
-  );
+  // Real turns only (brick://509b4ee1): synthetic acpx breadcrumbs (tagged or
+  // legacy-recognized) are not agent history — a breadcrumb-only fresh session
+  // must take the fresh-session path, not the restore-guard hard error.
+  return messagesHaveRealAgentTurn(record.messages);
 }
