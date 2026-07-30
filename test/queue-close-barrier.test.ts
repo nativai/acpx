@@ -48,12 +48,9 @@ type MockOwnerOptions = {
   // Emulate a wedged owner for the DRAIN only: accept the connection, never
   // answer `drain_deliveries`. Other verbs still answer.
   //
-  // Deliberately scoped to the drain. A server that is silent for EVERY verb
-  // hangs the close forever — but in PRE-EXISTING code, not in the barrier:
-  // `runQueueOwnerRequest` has no client-side timer at all, so step 1's
-  // `tryCloseSessionOnRunningOwner` waits indefinitely on a connectable-but-mute
-  // owner. That is a real defect (see IMPL-NOTES) and it is NOT this gate's
-  // subject; conflating them would let the gate claim a bound it does not own.
+  // Deliberately scoped to the drain, so the gate that uses it proves the
+  // BARRIER's bound specifically and nothing more. `silentAll` below is the
+  // separate, wider gate for the whole close path.
   silentDrain?: boolean;
   // Mute to EVERY verb — the wedged owner that used to hang a close forever.
   // The drain (step 0.5) and close_session (step 1) are both bounded now; the
@@ -287,11 +284,9 @@ test("L1.10/E3 an owner that does not know the drain verb degrades to reachedOwn
 // bound is asserted, not assumed: an unbounded drain would turn every close of a
 // stuck session into a hang, which is worse than the bug being fixed.
 //
-// SCOPE, stated so this gate is not over-read: it proves the BARRIER is bounded.
-// It does NOT prove the whole close is bounded — step 1
-// (`tryCloseSessionOnRunningOwner`) has no client-side timeout in pre-existing
-// code and will wait forever on an owner that is mute to every verb. See
-// IMPL-NOTES finding 9.
+// SCOPE, stated so this gate is not over-read: it proves the BARRIER's own bound
+// and nothing wider. The whole close path is covered separately by the
+// fully-mute-owner gate below.
 test("L1.10 a mute owner cannot hang the drain beyond its budget", async () => {
   await withTempHome(async (homeDir) => {
     const sessionId = "barrier-silent-owner";
