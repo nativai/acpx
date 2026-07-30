@@ -128,7 +128,12 @@ import {
   SessionSendResult,
   SubagentRef,
 } from "../../types.js";
-import { type QueueOwnerMessage, type QueueTask, waitMs } from "../queue/ipc.js";
+import {
+  appendDeliveryStreamEvent,
+  type QueueOwnerMessage,
+  type QueueTask,
+  waitMs,
+} from "../queue/ipc.js";
 import { type QueueOwnerActiveSessionController } from "../queue/owner-turn-controller.js";
 import { resolveAndEnsureAgentFolder } from "./agent-folder.js";
 import { resolveExistingBrickPath } from "./brick-link.js";
@@ -1017,6 +1022,45 @@ function sendQueuedTaskResult(task: QueueTask, result: SessionSendResult): void 
   });
 }
 
+// A11 (brick://53437107 §G2b, §12 E13): the acpx-ui Close button flips
+// `closed:true` on the record and never touches the queue owner, so a live owner
+// still pulls the pending deliver-now task and `runSessionPrompt` refuses it with
+// SessionClosedError — deliberately, per brick://8f3aaa73's no-auto-reopen rule.
+// That refusal stays. What did not exist was any record of it: `sendQueuedTaskError`
+// below returns immediately when there is no waiter, and every inter-agent
+// `/message` delivery is `waitForCompletion:false`, so the owner dropped the message
+// having written nothing at all. This is the same hole C4/G3 closed for the
+// owner-*close* path (ipc-server.ts close()), on the task-refused path.
+//
+// The wording is load-bearing, not decorative: deployed acpx-ui does not yet know
+// the SESSION_CLOSED_UNDELIVERED detail code, and its `isDefinitiveGiveUp`
+// (acpx-ui `server/senderNotify.ts`) falls back to a case-insensitive
+// `reason.includes('session closed')` substring rule. Drop that substring and the
+// sender is never notified — the fix would silently under-deliver. Pinned by the
+// classification gate in test/queue-closed-record-terminal.test.ts, which asserts
+// the property against the string read back off disk, never against a copy.
+const SESSION_CLOSED_UNDELIVERED_MESSAGE =
+  "session closed before delivery completed — the message was never delivered to the agent";
+
+function terminalizeDeliveryRefusedByClosedRecord(
+  sessionRecordId: string,
+  task: QueueTask,
+  error: unknown,
+): void {
+  // Scoped to the `record.closed` refusal only: the other pre-turn refusals
+  // (subscription lock, model floor) already call persistTerminalTurnError and
+  // mirror into `.messages.ndjson`, so they are not part of this defect.
+  if (!(error instanceof SessionClosedError) || task.waitForCompletion || task.terminalWritten) {
+    return;
+  }
+  task.terminalWritten = true;
+  appendDeliveryStreamEvent(sessionRecordId, task, "failed", {
+    code: 0,
+    message: SESSION_CLOSED_UNDELIVERED_MESSAGE,
+    detailCode: "SESSION_CLOSED_UNDELIVERED",
+  });
+}
+
 function sendQueuedTaskError(task: QueueTask, error: unknown): void {
   if (!task.waitForCompletion) {
     return;
@@ -1087,6 +1131,7 @@ export async function runQueuedTask(
     if (isSubscriptionLockBlockError(error)) {
       options.onLockBlocked?.();
     }
+    terminalizeDeliveryRefusedByClosedRecord(sessionRecordId, task, error);
     sendQueuedTaskError(task, error);
     if (error instanceof InterruptedError) {
       throw error;
