@@ -172,6 +172,12 @@ export type QueueTask = {
   promptRetries?: number;
   sessionOptions?: NonNullable<AcpClientOptions["sessionOptions"]>;
   waitForCompletion: boolean;
+  // A11 (brick://53437107 §G2b): set the instant any path writes this task's
+  // delivery terminal, so the owner-exit writer below and the closed-record
+  // refusal (runtime.ts `terminalizeDeliveryRefusedByClosedRecord`) cannot both
+  // terminalize the same task. One terminal per task, ever — the same flag
+  // discipline F3 uses for absorbed deliveries (absorbed-delivery-registry.ts).
+  terminalWritten?: boolean;
   // Keep-warm idle-TTL override (ms; 0 = keep alive forever) carried from the
   // submit request; the owner runtime adopts it as its new idle TTL. Absent =>
   // leave the owner's TTL unchanged.
@@ -268,13 +274,16 @@ export class SessionQueueOwner {
             },
           ),
         );
-      } else {
+      } else if (!task.terminalWritten) {
         // C4 (G3): a deliver-now task's socket was already closed on acceptance,
         // so there is no waiter to notify. Without a terminal it would sit
         // accepted-forever once the owner dies. Write a retryable
         // QUEUE_OWNER_SHUTDOWN terminal so acpx-ui's owner-gone re-drive/resend
         // takes over. This class never reached the model (never accepted), so a
         // resend is safe — no double-execution concern.
+        // A11: skipped when the task already carries a terminal (a task refused
+        // by a closed record and re-queued) — one terminal per task, ever.
+        task.terminalWritten = true;
         appendDeliveryStreamEvent(this.sessionId, task, "failed", {
           code: 0,
           message: "Queue owner shut down before the message was accepted",
