@@ -149,6 +149,15 @@ export type SessionsImportFlags = {
 
 export type StatusFlags = SessionSelectorFlags;
 
+// D1 (brick://53437107) — `sessions close` flags. `drain` is Commander's
+// `--no-drain` boolean: absent/true = the barrier runs, false = today's
+// destroy-on-close behaviour, chosen explicitly.
+export type SessionsCloseFlags = StatusFlags & {
+  drain?: boolean;
+  drainTimeout?: number;
+  failOnUndelivered?: boolean;
+};
+
 export type SessionsPruneFlags = {
   dryRun?: boolean;
   before?: Date;
@@ -284,6 +293,19 @@ export function parseDaysOlderThan(value: string): number {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed <= 0) {
     throw new InvalidArgumentError("--older-than must be a positive integer number of days");
+  }
+  return parsed;
+}
+
+// D1 (brick://53437107) — `--drain-timeout <ms>`. 0 is legal and meaningful: it
+// means "terminalize whatever is queued right now, do not wait out a running
+// turn". Negative or non-numeric is a usage error, not a silent fallback.
+export function parseDrainTimeoutMs(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new InvalidArgumentError(
+      "--drain-timeout must be a non-negative integer number of milliseconds",
+    );
   }
   return parsed;
 }

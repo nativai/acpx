@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
-import { withTimeout } from "../../async-control.js";
 import { QueueConnectionError, QueueProtocolError } from "../../errors.js";
 import { incrementPerfCounter } from "../../perf-metrics.js";
 import type {
@@ -287,6 +286,13 @@ function parseQueueOwnerResponseLine(
 async function runQueueOwnerRequest<TResult>(options: {
   owner: QueueOwnerRecord;
   request: QueueRequest;
+  // Optional client-side deadline. WITHOUT it this request waits forever on an
+  // owner that accepts the connection and then says nothing — there is no timer
+  // anywhere else in this path. Racing an external `withTimeout` around the
+  // returned promise is NOT equivalent: it abandons the socket still open, which
+  // leaks the connection and keeps the process alive. The deadline has to live
+  // in here, where the teardown is.
+  timeoutMs?: number;
   onAccepted?: (controls: QueueOwnerRequestControls<TResult>) => void;
   onMessage: (message: QueueOwnerMessage, controls: QueueOwnerRequestControls<TResult>) => void;
   onClose: (controls: QueueOwnerRequestControls<TResult>) => void;
@@ -304,12 +310,27 @@ async function runQueueOwnerRequest<TResult>(options: {
     const state: QueueOwnerRequestState = {
       acknowledged: false,
     };
+    const deadline =
+      options.timeoutMs != null && options.timeoutMs > 0
+        ? setTimeout(() => {
+            finishReject(
+              new QueueConnectionError("Queue owner did not respond before the deadline", {
+                detailCode: "QUEUE_REQUEST_TIMED_OUT",
+                origin: "queue",
+                retryable: true,
+              }),
+            );
+          }, options.timeoutMs)
+        : undefined;
 
     const finishResolve = (result: TResult) => {
       if (settled) {
         return;
       }
       settled = true;
+      if (deadline) {
+        clearTimeout(deadline);
+      }
       socket.removeAllListeners();
       if (!socket.destroyed) {
         socket.end();
@@ -322,6 +343,9 @@ async function runQueueOwnerRequest<TResult>(options: {
         return;
       }
       settled = true;
+      if (deadline) {
+        clearTimeout(deadline);
+      }
       socket.removeAllListeners();
       if (!socket.destroyed) {
         socket.destroy();
@@ -560,10 +584,12 @@ async function submitControlToQueueOwner<TResponse extends QueueOwnerMessage>(
   owner: QueueOwnerRecord,
   request: QueueRequest,
   isExpectedResponse: (message: QueueOwnerMessage) => message is TResponse,
+  timeoutMs?: number,
 ): Promise<TResponse | undefined> {
   return await runQueueOwnerRequest<TResponse>({
     owner,
     request,
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     onMessage: (message, { state, resolve, reject }) => {
       if (message.type === "error") {
         reject(
@@ -769,6 +795,11 @@ async function submitSetConfigOptionToQueueOwner(
   return response.response;
 }
 
+// Headroom on top of whatever budget the caller gave the owner for its ACP
+// shutdown. Generous, because a real `session/close` can legitimately take a
+// while — the point is that the wait TERMINATES, not that it is short.
+const CLOSE_SESSION_CLIENT_TIMEOUT_MS = 10_000;
+
 async function submitCloseSessionToQueueOwner(
   owner: QueueOwnerRecord,
   timeoutMs?: number,
@@ -784,6 +815,17 @@ async function submitCloseSessionToQueueOwner(
     request,
     (message): message is QueueOwnerCloseSessionResultMessage =>
       message.type === "close_session_result",
+    // brick://53437107 — the ONE control verb this brick bounds. Without a
+    // deadline, an owner that accepts the connection and then says nothing hangs
+    // `sessions close` forever, which does not merely coexist with this brick's
+    // purpose, it DEFEATS it: acceptance criterion #1 is that the closing agent
+    // is told, in its own shell, at that moment. A close that never returns
+    // prints no warning and yields no exit code.
+    //
+    // Scoped deliberately. The other five control verbs ride the same helper and
+    // keep today's unbounded behaviour; bounding them is a behaviour change in
+    // lanes this brick does not own, tracked as brick://11b83b47.
+    (timeoutMs ?? 0) + CLOSE_SESSION_CLIENT_TIMEOUT_MS,
   );
   if (!response) {
     return undefined;
@@ -819,6 +861,9 @@ async function submitDrainDeliveriesToQueueOwner(
     request,
     (message): message is QueueOwnerDrainResultMessage =>
       message.type === "drain_deliveries_result",
+    // The owner's own settle budget plus headroom for the socket round trip. A
+    // wedged owner therefore cannot hold a close open past --drain-timeout.
+    (timeoutMs ?? 0) + DRAIN_CLIENT_SLACK_MS,
   );
   if (!response) {
     return undefined;
@@ -860,10 +905,7 @@ export async function drainQueueOwnerForSession(options: {
 
   let report: QueueOwnerDrainResultMessage | undefined;
   try {
-    report = await withTimeout(
-      submitDrainDeliveriesToQueueOwner(owner, options.reason, options.timeoutMs),
-      (options.timeoutMs ?? 0) + DRAIN_CLIENT_SLACK_MS,
-    );
+    report = await submitDrainDeliveriesToQueueOwner(owner, options.reason, options.timeoutMs);
   } catch (error) {
     if (options.verbose) {
       process.stderr.write(

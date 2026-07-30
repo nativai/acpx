@@ -4,6 +4,7 @@ import { consumeAutoSubscriptionSelection } from "../../runtime/engine/auto-subs
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
 import type { AgentSessionListResult, OutputFormat, SessionRecord } from "../../types.js";
 import { probeQueueOwnerHealth } from "../queue/ipc.js";
+import type { SessionCloseDrainReport } from "../session/session-control.js";
 import { emitJsonResult } from "./json-output.js";
 
 function formatSessionLabel(record: SessionRecord): string {
@@ -126,13 +127,28 @@ function printTextAgentSessions(result: AgentSessionListResult): void {
   }
 }
 
-export function printClosedSessionByFormat(record: SessionRecord, format: OutputFormat): void {
+export function printClosedSessionByFormat(
+  record: SessionRecord,
+  drain: SessionCloseDrainReport,
+  format: OutputFormat,
+): void {
   if (
     emitJsonResult(format, {
       action: "session_closed",
       acpxRecordId: record.acpxRecordId,
       acpxSessionId: record.acpSessionId,
       agentSessionId: record.agentSessionId,
+      // D1 (brick://53437107). `reachedOwner:false` with `attempted:true` is the
+      // honest shape for an owner already gone or too old to know the verb — a
+      // caller must be able to tell "nothing was in flight" from "we could not
+      // ask". `turnSettled` is omitted rather than guessed when we never reached
+      // the owner.
+      drain: {
+        attempted: drain.attempted,
+        reachedOwner: drain.reachedOwner,
+        ...(drain.turnSettled !== undefined ? { turnSettled: drain.turnSettled } : {}),
+        undelivered: drain.undelivered,
+      },
     })
   ) {
     return;
@@ -143,6 +159,50 @@ export function printClosedSessionByFormat(record: SessionRecord, format: Output
   }
 
   process.stdout.write(`${record.acpxRecordId}\n`);
+}
+
+/**
+ * The loud, greppable block a closing agent sees when it lost custody
+ * (DESIGN §2.4). STDERR, always — including under `--format json`, whose consumer
+ * reads stdout — because the whole defect was that this loss was SILENT.
+ *
+ * EVERY LINE HERE STATES ONLY WHAT acpx WITNESSED. That constraint is not
+ * stylistic: this program exists because acpx-ui invented a terminal it never
+ * observed and stamped it with a borrowed timestamp, and corollary C-3 requires
+ * invented and witnessed outcomes to stay distinguishable forever. A warning that
+ * fabricated detail would reproduce the defect inside the feature meant to fix it.
+ *
+ * So this block deliberately does NOT say:
+ *   - WHO sent the message. That lives only in acpx-ui's delivery sidecar, which
+ *     acpx has no reader for and must never learn one (KD-1).
+ *   - that the sender HAS BEEN NOTIFIED. acpx cannot observe acpx-ui's downstream
+ *     behaviour, and for a plain CLI `prompt` submission (DESIGN §12 E10) there is
+ *     no sidecar row and so no sender to notify at all — the claim would not
+ *     merely be unwitnessed, it would be false.
+ *
+ * What acpx does know is the part that decides what the agent does next: these
+ * never reached the model, so resending is safe.
+ */
+export function warnUndeliveredCustody(sessionLabel: string, drain: SessionCloseDrainReport): void {
+  const count = drain.undelivered.length;
+  if (count === 0) {
+    return;
+  }
+  const lines = [
+    `⚠️  acpx: closed ${sessionLabel} while its queue owner still held ${count} undelivered message${
+      count === 1 ? "" : "s"
+    }.`,
+  ];
+  for (const item of drain.undelivered) {
+    lines.push(`    NOT delivered: ${item.messageId ?? `(request ${item.requestId})`}`);
+  }
+  lines.push(
+    `    ${count === 1 ? "It" : "They"} never reached the agent, so ${
+      count === 1 ? "it is" : "they are"
+    } safe to resend.`,
+    `    acpx cannot see who sent ${count === 1 ? "it" : "them"}; ask acpx-ui for a delivery's sender and status.`,
+  );
+  process.stderr.write(`${lines.join("\n")}\n`);
 }
 
 export function printNewSessionByFormat(

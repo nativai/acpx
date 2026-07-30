@@ -34,6 +34,7 @@ import {
   addSessionNameOption,
   addSessionOption,
   parseDaysOlderThan,
+  parseDrainTimeoutMs,
   parseForkAtIndex,
   parseMessageId,
   parseMetadataEntry,
@@ -41,6 +42,7 @@ import {
   parsePruneBeforeDate,
   parseSessionName,
   type PromptFlags,
+  type SessionsCloseFlags,
   type SessionsCopyFlags,
   type SessionsExportFlags,
   type SessionsHistoryFlags,
@@ -53,6 +55,7 @@ import {
   type StatusFlags,
 } from "./flags.js";
 import { registerProfilesCommand } from "./profiles-command.js";
+import { DEFAULT_CLOSE_DRAIN_TIMEOUT_MS } from "./session/contracts.js";
 import { registerStatusCommand } from "./status-command.js";
 import { registerSubscriptionsCommand } from "./subscriptions-command.js";
 
@@ -256,9 +259,28 @@ export function registerSessionsCommand(
   const closeCommand = sessionsCommand
     .command("close")
     .description("Close session for current cwd")
-    .argument("[name]", "Session name", parseSessionName);
+    .argument("[name]", "Session name", parseSessionName)
+    // D1 (brick://53437107) — the close-drain barrier's surface. Defaults keep a
+    // close of an idle worker indistinguishable from before.
+    .option(
+      "--drain-timeout <ms>",
+      `How long to wait for an in-flight turn to end before terminalizing the rest of the queue owner's custody (default ${DEFAULT_CLOSE_DRAIN_TIMEOUT_MS})`,
+      parseDrainTimeoutMs,
+    )
+    .option(
+      "--no-drain",
+      "Skip the close-drain barrier and terminate the queue owner immediately (the pre-barrier behaviour, chosen explicitly)",
+    )
+    .option(
+      "--fail-on-undelivered",
+      "Exit 3 instead of 0 when the close found undelivered messages in the queue owner's custody",
+    );
   addSessionIdentityOptions(closeCommand);
-  closeCommand.action(async function (this: Command, name: string | undefined, flags: StatusFlags) {
+  closeCommand.action(async function (
+    this: Command,
+    name: string | undefined,
+    flags: SessionsCloseFlags,
+  ) {
     await handleSessionsClose(explicitAgentName, name, flags, this, config);
   });
 

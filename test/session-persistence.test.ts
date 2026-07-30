@@ -748,11 +748,20 @@ test("closeSession soft-closes and terminates matching process", async () => {
     const filePath = sessionFilePath(homeDir, sessionId);
 
     try {
+      // D1 (brick://53437107): closeSession now returns {record, drain} so the
+      // CLI can report custody the close destroyed. The record half is verbatim
+      // the old return value — every assertion below is unchanged.
       const closed = await session.closeSession(sessionId);
-      assert.equal(closed.closed, true);
-      assert.equal(typeof closed.closedAt, "string");
-      assert.equal(closed.pid, undefined);
+      assert.equal(closed.record.closed, true);
+      assert.equal(typeof closed.record.closedAt, "string");
+      assert.equal(closed.record.pid, undefined);
       assert.equal(await fileExists(filePath), true);
+
+      // This session has no queue owner, so the barrier reports that it asked
+      // and could not reach one — distinct from "asked, nothing was in flight".
+      assert.equal(closed.drain.attempted, true);
+      assert.equal(closed.drain.reachedOwner, false);
+      assert.deepEqual(closed.drain.undelivered, []);
 
       const stored = JSON.parse(await fs.readFile(filePath, "utf8")) as Record<string, unknown>;
       assert.equal(stored.closed, true);
