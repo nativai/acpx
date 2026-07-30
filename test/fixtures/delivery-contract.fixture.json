@@ -1,0 +1,51 @@
+{
+  "$comment": "THE CROSS-REPO DELIVERY CONTRACT — brick://53437107, DESIGN KD-3 + KD-4, TESTER-PLAN L3.1. Single source of truth for the strings and semantics that acpx EMITS and acpx-ui CLASSIFIES. acpx-ui vendors a BYTE-IDENTICAL copy; both repos' tests assert the same sha256 over these bytes, so a one-sided edit reds one of the two suites instead of passing silently for six weeks — which is exactly how the class-C contract mismatch survived. DO NOT REFORMAT: the sha is over the file bytes, not the parsed value.",
+  "version": 1,
+  "quiesceRejection": {
+    "$comment": "What a submit_prompt gets at a draining owner. acpx asserts it emits exactly `message` with exactly `detailCode`/`retryable`. acpx-ui asserts isTerminalEnqueueFailure(message) === true. `requiredSubstringLowercased` is the rule both sides check the literal text against — assert the CLASSIFICATION, never a hand-copied string (TESTER-PLAN trap 4). Already-deployed acpx-ui satisfies this with no change, which is what lets acpx ship the barrier first.",
+    "detailCode": "QUEUE_OWNER_CLOSING",
+    "message": "Session is closed — the queue owner is draining for close and is not accepting new messages.",
+    "retryable": false,
+    "requiredSubstringLowercased": "session is closed",
+    "acpxUiPredicate": "isTerminalEnqueueFailure",
+    "acpxUiPredicateResult": true
+  },
+  "ownerExitTerminals": [
+    {
+      "$comment": "Owner exiting while the session is still OPEN — idle-memory release, TTL, deploy-staleness, crash, external kill. Never reached the model, so a resend is safe and acpx-ui re-drives it (D3/B5). `acpxUiDefinitiveGiveUp:false` is the POST-D3 target: today acpx-ui still buries this as definitive, which is the 48/48 defect B6 removes.",
+      "detailCode": "QUEUE_OWNER_SHUTDOWN",
+      "message": "Queue owner shut down before the message was accepted",
+      "phase": "failed",
+      "reachedModel": "no",
+      "retryable": true,
+      "notifiesSender": false,
+      "resendSafe": true,
+      "acpxUiDefinitiveGiveUp": false,
+      "requiredSubstringLowercased": null
+    },
+    {
+      "$comment": "Owner draining because the session is CLOSING. Definitive on purpose: a close-caused loss must never be auto-retried into a session that has to stay shut (brick://8f3aaa73). The substring is what acpx-ui's isDefinitiveGiveUp matches on the lower-cased reason.",
+      "detailCode": "SESSION_CLOSED_UNDELIVERED",
+      "message": "session closed before the message reached the agent — it was never delivered",
+      "phase": "failed",
+      "reachedModel": "no",
+      "retryable": false,
+      "notifiesSender": true,
+      "resendSafe": true,
+      "acpxUiDefinitiveGiveUp": true,
+      "requiredSubstringLowercased": "session closed"
+    },
+    {
+      "$comment": "Injected mid-turn, containing turn never settled (F3). The content MAY have reached the model, so this is outcome-unknown: never auto-resend, manual decision only.",
+      "detailCode": "ABSORBED_TURN_NEVER_ENDED",
+      "message": "delivery outcome unknown — the message may have been processed",
+      "phase": "failed",
+      "reachedModel": "maybe",
+      "retryable": false,
+      "notifiesSender": false,
+      "resendSafe": false,
+      "acpxUiDefinitiveGiveUp": false,
+      "requiredSubstringLowercased": null
+    }
+  ]
+}
