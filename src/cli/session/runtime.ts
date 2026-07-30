@@ -129,6 +129,7 @@ import {
   SubagentRef,
 } from "../../types.js";
 import {
+  ABSORBED_TURN_NEVER_ENDED_MESSAGE,
   SESSION_CLOSED_UNDELIVERED_DETAIL_CODE,
   SESSION_CLOSED_UNDELIVERED_MESSAGE,
 } from "../queue/delivery-terminals.js";
@@ -2461,7 +2462,13 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         await appendDeliveryTerminal(delivery.context, "failed", {
           error: {
             code: 0,
-            message: "delivery outcome unknown — the message may have been processed",
+            // The outcome-unknown wording is CONTRACTED and shared by the two
+            // codes that mean "may have reached the model" — this one and
+            // ABSORBED_TURN_NEVER_ENDED, which is where the constant takes its
+            // name. Read from the single source so a reword cannot land on one
+            // emitter and silently leave the other behind; the detail code here
+            // is unchanged and stays INJECTED_RESPONSE_TIMEOUT.
+            message: ABSORBED_TURN_NEVER_ENDED_MESSAGE,
             detailCode: "INJECTED_RESPONSE_TIMEOUT",
           },
         });
