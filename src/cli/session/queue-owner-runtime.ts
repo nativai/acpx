@@ -351,6 +351,102 @@ async function closeQueueOwnerRuntime(params: {
   }
 }
 
+// The catchable signals an external kill actually uses. `terminateProcess` sends
+// SIGTERM, waits PROCESS_EXIT_GRACE_MS = 1_500, then SIGKILL — which is
+// uncatchable by design and remains the irreducible residual (DESIGN §12 E6).
+const QUEUE_OWNER_FATAL_SIGNALS = ["SIGTERM", "SIGINT"] as const;
+// Conventional 128 + signum, so a supervisor still reads the death as signalled.
+const FATAL_SIGNAL_EXIT_CODES: Record<string, number> = { SIGTERM: 143, SIGINT: 130 };
+
+/**
+ * D1 / A6 (brick://53437107) — the SIGTERM/SIGINT custody sweep. The single
+ * riskiest change in this design, and the highest-value one.
+ *
+ * Until now the acpx tree had NO SIGTERM handler at all, so `sessions close`,
+ * `forceRestartQueueOwner`, a pod SIGTERM or an operator all killed the owner
+ * outright and `owner.close()` — the code that already writes honest terminals —
+ * never ran. Everything the owner still held was destroyed in silence. That is
+ * class B: 1–4 inter-agent messages lost per day, fleet-wide, for six weeks.
+ * This handler covers EVERY external kill, not just the drain verb we added.
+ *
+ * Three constraints, all load-bearing (risk R1):
+ *   - SYNCHRONOUS writes. An async `appendFile` does not flush before
+ *     `process.exit()`, so the terminals would be lost exactly when they matter
+ *     most. Everything below writes through the sync sibling.
+ *   - BOUNDED. PROCESS_EXIT_GRACE_MS = 1_500 ms is the whole window before
+ *     SIGKILL. Local sync appends only — no awaits, nothing that can block. A
+ *     hang here would mean the owner no longer dies on SIGTERM, i.e. we would
+ *     have made process teardown worse fleet-wide.
+ *   - RE-ENTRANT. A second signal during the handler exits immediately rather
+ *     than queueing behind the first.
+ *
+ * It also performs the orphan process-group reap that `closeQueueOwnerRuntime`
+ * does as its own final act. Before this, an externally-killed owner stranded
+ * its adapter descendants: the reap ran only on the graceful path, and only if
+ * that path won a race against the 1.5 s SIGKILL. Relocating the same guarded
+ * sweep here makes it deterministic on every signal path — on a shared box,
+ * stranded adapters are how load reaches 40+.
+ */
+export function installQueueOwnerFatalSignalHandlers(params: {
+  sessionId: string;
+  owner: SessionQueueOwner;
+}): () => void {
+  let handling = false;
+  // Resolved ONCE, here, not inside the signal path: `ownerIsGroupLeader()`
+  // reads /proc and, if that fails, shells out to `ps` — and the handler must do
+  // no I/O that can block inside the grace window. A process's group does not
+  // change after start, so the answer is stable for this owner's lifetime.
+  const isGroupLeader = ownerIsGroupLeader();
+
+  const onFatalSignal = (signal: NodeJS.Signals): void => {
+    const exitCode = FATAL_SIGNAL_EXIT_CODES[signal] ?? 143;
+    if (handling) {
+      process.exit(exitCode);
+    }
+    handling = true;
+
+    // THE ORDER BELOW IS LOAD-BEARING, NOT INCIDENTAL. The custody sweep must
+    // COMPLETE before the process-group reap, because when this owner leads the
+    // group that reap SIGKILLs *this process too*: nothing after it runs, and
+    // SIGKILL is uncatchable, so no exit hook can rescue a pending write. That
+    // is also why every write in the sweep is synchronous. Anything moved below
+    // the reap becomes dead code silently.
+    try {
+      const undelivered = params.owner.terminalizeCustodyOnSignal();
+      const absorbed = terminalizeAbsorbedDeliveriesOnOwnerExit(params.sessionId);
+      if (undelivered > 0 || absorbed > 0) {
+        process.stderr.write(
+          `[acpx] queue owner for session ${params.sessionId} took ${signal} while holding custody; ` +
+            `wrote ${undelivered} undelivered + ${absorbed} absorbed terminal(s)\n`,
+        );
+      }
+    } catch {
+      // Never throw from a signal handler: a lost terminal is bad, a teardown
+      // that wedges until SIGKILL is worse.
+    }
+
+    // Adapter descendants share this owner's process group. The leader guard is
+    // what stops an owner embedded in someone else's group from sweeping a group
+    // it does not own — the same guard the graceful path carries.
+    if (isGroupLeader && hasLiveProcessGroup(process.pid)) {
+      signalProcessGroup(process.pid, "SIGKILL");
+    }
+
+    // Reached only when this owner does not lead a live group. R1 is absolute:
+    // the owner always dies.
+    process.exit(exitCode);
+  };
+
+  for (const signal of QUEUE_OWNER_FATAL_SIGNALS) {
+    process.on(signal, onFatalSignal);
+  }
+  return () => {
+    for (const signal of QUEUE_OWNER_FATAL_SIGNALS) {
+      process.off(signal, onFatalSignal);
+    }
+  };
+}
+
 async function writeQueueOwnerLifecycleSnapshot(
   sessionId: string,
   sharedClient: AcpClient,
@@ -489,6 +585,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   let socketContinuityTimer: NodeJS.Timeout | undefined;
   let socketContinuityCheck: Promise<void> | undefined;
   let idleDrain: { stop: () => Promise<void> } | undefined;
+  let removeFatalSignalHandlers: (() => void) | undefined;
   // Set when a turn auto-failed-over to a new subscription. The shared client is
   // pinned to the OLD CLAUDE_CONFIG_DIR for the owner's lifetime, so we recycle
   // the owner (exit the loop, release the lease) after the current turn; the
@@ -818,6 +915,15 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
     const midTurnBuffer: QueueTask[] = [];
     let midTurnCaptureActive = false;
 
+    // D1 (brick://53437107) — custody lives in TWO places, so the drain and the
+    // signal handler must walk both (corollary C-1). The owner holds `pending`;
+    // the capture buffer lives here, so hand the owner an accessor that takes it.
+    owner.setMidTurnCustodySource(() => midTurnBuffer.splice(0));
+    removeFatalSignalHandlers = installQueueOwnerFatalSignalHandlers({
+      sessionId: options.sessionId,
+      owner,
+    });
+
     if (midTurnInjectionSupported) {
       owner.setMidTurnHandler((task: QueueTask): boolean => {
         if (activeMidTurnHandler) {
@@ -1019,6 +1125,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       owner.clearMidTurnHandler();
     }
   } finally {
+    removeFatalSignalHandlers?.();
     await idleDrain?.stop().catch(() => {});
     await closeQueueOwnerRuntime({
       lease,

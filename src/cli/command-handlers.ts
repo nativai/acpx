@@ -93,6 +93,7 @@ import {
   type SessionsOwnerStatusFlags,
   type SessionsPruneFlags,
   type SessionsTemplateFlags,
+  type SessionsCloseFlags,
   type StatusFlags,
 } from "./flags.js";
 import { emitJsonResult } from "./output/json-output.js";
@@ -2168,19 +2169,26 @@ export async function handleSessionsList(
   printAgentSessionsByFormat(result, globalFlags.format);
 }
 
+// D1 / KD-5 (brick://53437107) — the opt-in strict exit for `--fail-on-undelivered`.
+//
+// The DEFAULT stays 0 on a successful close even when custody was lost, and that
+// is an orchestrator decision rather than a preference: many fleet call-sites run
+// `sessions close` under `set -e` as their final act, so a non-zero default would
+// abort wrap-ups fleet-wide. A safety fix must not become an availability
+// regression — the thing that was missing here was SIGNAL, not exit status.
+const UNDELIVERED_CUSTODY_EXIT_CODE = 3;
+
 export async function handleSessionsClose(
   explicitAgentName: string | undefined,
   sessionName: string | undefined,
-  flags: StatusFlags,
+  flags: SessionsCloseFlags,
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const [{ closeSession }, { printClosedSessionByFormat }] = await Promise.all([
-    loadSessionModule(),
-    loadOutputRenderModule(),
-  ]);
+  const [{ closeSession }, { printClosedSessionByFormat, warnUndeliveredCustody }] =
+    await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
 
   const selector = resolveSessionTargetSelector({ flags, command, positionalName: sessionName });
   const explicitRecord = await resolveExplicitSessionRecord(selector);
@@ -2206,8 +2214,21 @@ export async function handleSessionsClose(
     throw new Error(missingScopedSessionMessage(agent, sessionName));
   }
 
-  const closed = await closeSession(record.acpxRecordId);
-  printClosedSessionByFormat(closed, globalFlags.format);
+  // Commander maps `--no-drain` onto `flags.drain === false`; absent means the
+  // barrier runs.
+  const closed = await closeSession(record.acpxRecordId, {
+    drain: flags.drain !== false,
+    drainTimeoutMs: flags.drainTimeout,
+    verbose: globalFlags.verbose,
+  });
+  printClosedSessionByFormat(closed.record, closed.drain, globalFlags.format);
+
+  if (closed.drain.undelivered.length > 0) {
+    warnUndeliveredCustody(record.name ?? record.acpxRecordId, closed.drain);
+    if (flags.failOnUndelivered) {
+      process.exitCode = UNDELIVERED_CUSTODY_EXIT_CODE;
+    }
+  }
 }
 
 // Resolve the prompt to auto-fire on a `--from-template` spawn. Commander couples
@@ -2341,6 +2362,9 @@ export async function handleSessionsNew(
   });
 
   if (replaced) {
+    // Deliberately takes the DEFAULT drain: every close entry point goes through
+    // the barrier, so it cannot be bypassed by an alternate route (DESIGN §6,
+    // and the precondition a future auto-close policy inherits).
     await closeSession(replaced.acpxRecordId);
     if (globalFlags.verbose) {
       process.stderr.write(`[acpx] soft-closed prior session: ${replaced.acpxRecordId}\n`);
@@ -2596,6 +2620,7 @@ async function markSessionAsTemplate(
 ): Promise<SessionRecord> {
   const initial = await resolveSessionRecord(sessionId);
   const { closeSession } = await loadSessionModule();
+  // Default drain here too — see the note at the soft-close site above.
   await closeSession(initial.acpxRecordId);
   const record = await resolveSessionRecord(sessionId);
   record.template = {

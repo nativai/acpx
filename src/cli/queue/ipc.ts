@@ -15,6 +15,7 @@ import type {
   SessionSendOutcome,
 } from "../../types.js";
 import { probeQueueOwnerHealth, type QueueOwnerHealth } from "./ipc-health.js";
+import type { QueueOwnerDrainReport } from "./ipc-server.js";
 import { connectToQueueOwner } from "./ipc-transport.js";
 import {
   type QueueOwnerRecord,
@@ -27,9 +28,12 @@ import {
   parseQueueOwnerMessage,
   type QueueCancelRequest,
   type QueueCloseSessionRequest,
+  type QueueDrainDeliveriesRequest,
+  type QueueDrainReason,
   type QueueOwnerActiveTurnResultMessage,
   type QueueOwnerCancelResultMessage,
   type QueueOwnerCloseSessionResultMessage,
+  type QueueOwnerDrainResultMessage,
   type QueueOwnerMessage,
   type QueueOwnerSetConfigOptionResultMessage,
   type QueueOwnerSetModelResultMessage,
@@ -168,8 +172,13 @@ async function maybeRecoverStaleOwnerAfterProtocolMismatch(params: {
 export { probeQueueOwnerHealth };
 export type { QueueOwnerHealth };
 export type { QueueOwnerMessage, QueueSubmitRequest } from "./messages.js";
-export type { QueueOwnerControlHandlers, QueueTask } from "./ipc-server.js";
-export { appendDeliveryStreamEvent, SessionQueueOwner } from "./ipc-server.js";
+export type { QueueOwnerControlHandlers, QueueOwnerDrainReport, QueueTask } from "./ipc-server.js";
+export {
+  appendDeliveryStreamEvent,
+  appendDeliveryStreamEventSync,
+  SessionQueueOwner,
+} from "./ipc-server.js";
+export type { QueueDrainedDelivery, QueueDrainReason } from "./messages.js";
 
 function assertOwnerGeneration(
   owner: QueueOwnerRecord,
@@ -277,6 +286,13 @@ function parseQueueOwnerResponseLine(
 async function runQueueOwnerRequest<TResult>(options: {
   owner: QueueOwnerRecord;
   request: QueueRequest;
+  // Optional client-side deadline. WITHOUT it this request waits forever on an
+  // owner that accepts the connection and then says nothing — there is no timer
+  // anywhere else in this path. Racing an external `withTimeout` around the
+  // returned promise is NOT equivalent: it abandons the socket still open, which
+  // leaks the connection and keeps the process alive. The deadline has to live
+  // in here, where the teardown is.
+  timeoutMs?: number;
   onAccepted?: (controls: QueueOwnerRequestControls<TResult>) => void;
   onMessage: (message: QueueOwnerMessage, controls: QueueOwnerRequestControls<TResult>) => void;
   onClose: (controls: QueueOwnerRequestControls<TResult>) => void;
@@ -294,12 +310,27 @@ async function runQueueOwnerRequest<TResult>(options: {
     const state: QueueOwnerRequestState = {
       acknowledged: false,
     };
+    const deadline =
+      options.timeoutMs != null && options.timeoutMs > 0
+        ? setTimeout(() => {
+            finishReject(
+              new QueueConnectionError("Queue owner did not respond before the deadline", {
+                detailCode: "QUEUE_REQUEST_TIMED_OUT",
+                origin: "queue",
+                retryable: true,
+              }),
+            );
+          }, options.timeoutMs)
+        : undefined;
 
     const finishResolve = (result: TResult) => {
       if (settled) {
         return;
       }
       settled = true;
+      if (deadline) {
+        clearTimeout(deadline);
+      }
       socket.removeAllListeners();
       if (!socket.destroyed) {
         socket.end();
@@ -312,6 +343,9 @@ async function runQueueOwnerRequest<TResult>(options: {
         return;
       }
       settled = true;
+      if (deadline) {
+        clearTimeout(deadline);
+      }
       socket.removeAllListeners();
       if (!socket.destroyed) {
         socket.destroy();
@@ -550,10 +584,12 @@ async function submitControlToQueueOwner<TResponse extends QueueOwnerMessage>(
   owner: QueueOwnerRecord,
   request: QueueRequest,
   isExpectedResponse: (message: QueueOwnerMessage) => message is TResponse,
+  timeoutMs?: number,
 ): Promise<TResponse | undefined> {
   return await runQueueOwnerRequest<TResponse>({
     owner,
     request,
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     onMessage: (message, { state, resolve, reject }) => {
       if (message.type === "error") {
         reject(
@@ -759,6 +795,11 @@ async function submitSetConfigOptionToQueueOwner(
   return response.response;
 }
 
+// Headroom on top of whatever budget the caller gave the owner for its ACP
+// shutdown. Generous, because a real `session/close` can legitimately take a
+// while — the point is that the wait TERMINATES, not that it is short.
+const CLOSE_SESSION_CLIENT_TIMEOUT_MS = 10_000;
+
 async function submitCloseSessionToQueueOwner(
   owner: QueueOwnerRecord,
   timeoutMs?: number,
@@ -774,6 +815,17 @@ async function submitCloseSessionToQueueOwner(
     request,
     (message): message is QueueOwnerCloseSessionResultMessage =>
       message.type === "close_session_result",
+    // brick://53437107 — the ONE control verb this brick bounds. Without a
+    // deadline, an owner that accepts the connection and then says nothing hangs
+    // `sessions close` forever, which does not merely coexist with this brick's
+    // purpose, it DEFEATS it: acceptance criterion #1 is that the closing agent
+    // is told, in its own shell, at that moment. A close that never returns
+    // prints no warning and yields no exit code.
+    //
+    // Scoped deliberately. The other five control verbs ride the same helper and
+    // keep today's unbounded behaviour; bounding them is a behaviour change in
+    // lanes this brick does not own, tracked as brick://11b83b47.
+    (timeoutMs ?? 0) + CLOSE_SESSION_CLIENT_TIMEOUT_MS,
   );
   if (!response) {
     return undefined;
@@ -786,6 +838,99 @@ async function submitCloseSessionToQueueOwner(
     });
   }
   return response.closed;
+}
+
+// Headroom on top of the owner's own settle budget, so a wedged owner cannot
+// hang a close beyond `--drain-timeout` by more than the socket round trip.
+const DRAIN_CLIENT_SLACK_MS = 2_000;
+
+async function submitDrainDeliveriesToQueueOwner(
+  owner: QueueOwnerRecord,
+  reason: QueueDrainReason,
+  timeoutMs: number | undefined,
+): Promise<QueueOwnerDrainResultMessage | undefined> {
+  const request: QueueDrainDeliveriesRequest = {
+    type: "drain_deliveries",
+    requestId: randomUUID(),
+    ownerGeneration: owner.ownerGeneration,
+    reason,
+    timeoutMs,
+  };
+  const response = await submitControlToQueueOwner(
+    owner,
+    request,
+    (message): message is QueueOwnerDrainResultMessage =>
+      message.type === "drain_deliveries_result",
+    // The owner's own settle budget plus headroom for the socket round trip. A
+    // wedged owner therefore cannot hold a close open past --drain-timeout.
+    (timeoutMs ?? 0) + DRAIN_CLIENT_SLACK_MS,
+  );
+  if (!response) {
+    return undefined;
+  }
+  if (response.requestId !== request.requestId) {
+    throw new QueueProtocolError("Queue owner returned mismatched drain_deliveries response", {
+      detailCode: "QUEUE_PROTOCOL_MALFORMED_MESSAGE",
+      origin: "queue",
+      retryable: true,
+    });
+  }
+  return response;
+}
+
+/**
+ * D1 / A7 (brick://53437107) — ask a live owner to drain its custody before it is
+ * terminated, and report what it lost.
+ *
+ * BEST-EFFORT BY CONSTRUCTION, exactly like `tryCloseSessionOnRunningOwner`: an
+ * owner that is already gone (E2), unreachable, or still running pre-drain code
+ * and therefore rejecting the verb as unknown (E3, the mixed fleet) all return
+ * `undefined` and the close proceeds. This is why stage 2 is safe to ship against
+ * a fleet of long-lived owners that a deploy does not restart — the barrier
+ * degrades to today's behaviour rather than blocking a close.
+ *
+ * `undefined` means "we could not ask"; an empty `undelivered` means "we asked
+ * and nothing was in flight". The caller must be able to tell those apart.
+ */
+export async function drainQueueOwnerForSession(options: {
+  sessionId: string;
+  reason: QueueDrainReason;
+  timeoutMs?: number;
+  verbose?: boolean;
+}): Promise<QueueOwnerDrainReport | undefined> {
+  const owner = await readQueueOwnerRecord(options.sessionId);
+  if (!owner) {
+    return undefined;
+  }
+
+  let report: QueueOwnerDrainResultMessage | undefined;
+  try {
+    report = await submitDrainDeliveriesToQueueOwner(owner, options.reason, options.timeoutMs);
+  } catch (error) {
+    if (options.verbose) {
+      process.stderr.write(
+        `[acpx] queue owner for session ${options.sessionId} did not drain ` +
+          `(${error instanceof Error ? error.message : String(error)}); closing anyway\n`,
+      );
+    }
+    return undefined;
+  }
+  if (!report) {
+    return undefined;
+  }
+
+  if (options.verbose) {
+    process.stderr.write(
+      `[acpx] drained queue owner pid ${owner.pid} for session ${options.sessionId} ` +
+        `(${report.drained} undelivered, turnSettled=${report.turnSettled})\n`,
+    );
+  }
+  return {
+    drained: report.drained,
+    undelivered: report.undelivered,
+    turnSettled: report.turnSettled,
+    activeTurnAtEntry: report.activeTurnAtEntry,
+  };
 }
 
 async function recoverRecoverableOwnerBeforeSubmit(

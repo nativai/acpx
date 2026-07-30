@@ -30,7 +30,9 @@ import type {
   SessionSetModeResult,
 } from "../../types.js";
 import {
+  drainQueueOwnerForSession,
   isProcessAlive,
+  type QueueDrainedDelivery,
   type QueueOwnerLiveness,
   type QueueOwnerRecoveryResult,
   readQueueOwnerLiveness,
@@ -45,6 +47,7 @@ import {
   trySetModelOnRunningOwner,
   trySetModeOnRunningOwner,
 } from "../queue/ipc.js";
+import { DEFAULT_CLOSE_DRAIN_TIMEOUT_MS } from "./contracts.js";
 import type {
   SessionCancelOptions,
   SessionCancelResult,
@@ -487,8 +490,76 @@ async function isLikelyMatchingProcess(pid: number, agentCommand: string): Promi
   }
 }
 
-export async function closeSession(sessionId: string): Promise<SessionRecord> {
+export type CloseSessionOptions = {
+  // Default true. `--no-drain` is the explicit escape hatch back to the old
+  // destroy-on-close behaviour.
+  drain?: boolean;
+  drainTimeoutMs?: number;
+  verbose?: boolean;
+};
+
+// What the close learned about the custody it was about to destroy.
+//
+// `attempted:true, reachedOwner:false` is the honest shape for an owner that was
+// already gone, unreachable, or still running pre-drain code. The caller has to
+// be able to tell "nothing was in flight" from "we could not ask" — collapsing
+// those two into one is how the fallback ended up guessing for six weeks.
+export type SessionCloseDrainReport = {
+  attempted: boolean;
+  reachedOwner: boolean;
+  turnSettled?: boolean;
+  activeTurnAtEntry?: boolean;
+  undelivered: QueueDrainedDelivery[];
+};
+
+export type SessionCloseResult = {
+  record: SessionRecord;
+  drain: SessionCloseDrainReport;
+};
+
+// D1 step 0.5 — THE BARRIER. Best-effort exactly like step 1
+// (`tryCloseSessionOnRunningOwner`): a drain that cannot happen never blocks a
+// close, because an orchestrator that cannot close a worker is a worse failure
+// than a lost FYI. What changes is that the loss is no longer SILENT.
+async function drainCustodyBeforeClose(
+  sessionId: string,
+  options: CloseSessionOptions,
+): Promise<SessionCloseDrainReport> {
+  if (options.drain === false) {
+    return { attempted: false, reachedOwner: false, undelivered: [] };
+  }
+
+  const report = await drainQueueOwnerForSession({
+    sessionId,
+    reason: "session-close",
+    timeoutMs: options.drainTimeoutMs ?? DEFAULT_CLOSE_DRAIN_TIMEOUT_MS,
+    verbose: options.verbose,
+  }).catch(() => undefined);
+
+  if (!report) {
+    return { attempted: true, reachedOwner: false, undelivered: [] };
+  }
+  return {
+    attempted: true,
+    reachedOwner: true,
+    turnSettled: report.turnSettled,
+    activeTurnAtEntry: report.activeTurnAtEntry,
+    undelivered: report.undelivered,
+  };
+}
+
+export async function closeSession(
+  sessionId: string,
+  options: CloseSessionOptions = {},
+): Promise<SessionCloseResult> {
   const record = await resolveSessionRecord(sessionId);
+
+  // Step 0.5 — ask the owner to give up its custody honestly BEFORE anything
+  // kills it. Until this existed, step 2 below actively killed the very process
+  // that was mid-handoff of an accepted message, and the only record of that
+  // message was a JavaScript array inside it.
+  const drain = await drainCustodyBeforeClose(record.acpxRecordId, options);
+
   await tryCloseSessionOnRunningOwner({ sessionId: record.acpxRecordId }).catch(() => {
     // Preserve local close semantics even if best-effort ACP session shutdown fails.
   });
@@ -510,7 +581,7 @@ export async function closeSession(sessionId: string): Promise<SessionRecord> {
   // See writeSessionRecord doc comment in repository.ts for the ownership rules.
   await writeSessionRecordAtBoundaryWithLifecycle(record);
 
-  return record;
+  return { record, drain };
 }
 
 export type SessionOwnerStatusClassification =

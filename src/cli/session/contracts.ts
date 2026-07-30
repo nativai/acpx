@@ -26,6 +26,12 @@ type TimedRunOptions = {
 
 export const DEFAULT_QUEUE_OWNER_TTL_MS = 900_000;
 
+// D1 (brick://53437107) — how long `sessions close` waits for an in-flight turn
+// to end before it terminalizes the rest of the owner's custody. Chosen so that
+// closing an idle worker (the overwhelmingly common case) is imperceptible and
+// closing a busy one never hangs an orchestrator.
+export const DEFAULT_CLOSE_DRAIN_TIMEOUT_MS = 5_000;
+
 export function normalizeQueueOwnerTtlMs(ttlMs: number | undefined): number {
   if (ttlMs == null) {
     return DEFAULT_QUEUE_OWNER_TTL_MS;

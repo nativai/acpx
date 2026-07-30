@@ -1,4 +1,8 @@
-import { appendDeliveryStreamEvent } from "../queue/ipc-server.js";
+import {
+  ABSORBED_TURN_NEVER_ENDED_DETAIL_CODE,
+  ABSORBED_TURN_NEVER_ENDED_MESSAGE,
+} from "../queue/delivery-terminals.js";
+import { appendDeliveryStreamEventSync } from "../queue/ipc-server.js";
 
 // F3 (493729fc): absorbed injected deliveries (codex steers folded into the
 // active turn) are tracked in-memory inside runSessionPrompt and terminalized
@@ -55,10 +59,14 @@ export function terminalizeAbsorbedDeliveriesOnOwnerExit(sessionId: string): num
     // Synchronous flag flip first: the settle paths racing this sweep (e.g. the
     // shared client's close rejecting the wedged prompt) check the same flag.
     delivery.terminalWritten = true;
-    appendDeliveryStreamEvent(sessionId, delivery.context, "failed", {
+    // D1 (brick://53437107): this is an owner-EXIT path, and it is now also
+    // reached from the SIGTERM handler — so the write must be synchronous or it
+    // does not survive the process (the same async-appendFile trap that lost
+    // every externally-killed owner's custody).
+    appendDeliveryStreamEventSync(sessionId, delivery.context, "failed", {
       code: 0,
-      message: "delivery outcome unknown — the message may have been processed",
-      detailCode: "ABSORBED_TURN_NEVER_ENDED",
+      message: ABSORBED_TURN_NEVER_ENDED_MESSAGE,
+      detailCode: ABSORBED_TURN_NEVER_ENDED_DETAIL_CODE,
     });
     written += 1;
   }

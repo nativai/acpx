@@ -92,6 +92,25 @@ export type QueueQueryActiveTurnRequest = {
   ownerGeneration?: number;
 };
 
+// D1 (brick://53437107) — the close-drain barrier's control verb. Asks a live
+// owner to quiesce (reject new submissions from that instant) and terminalize
+// everything it holds but has NOT handed to the agent, WITHOUT injecting any of
+// it (KD-2 / corollary C-2: injecting then killing the turn converts a
+// recoverable `not_delivered` into an unrecoverable `outcome_unknown`).
+//
+// `reason` is what lets the owner pick the right owner-exit detail code (KD-3):
+// a drain for close mints the definitive `SESSION_CLOSED_UNDELIVERED`, while
+// every other owner death keeps the retryable `QUEUE_OWNER_SHUTDOWN`.
+export type QueueDrainReason = "session-close";
+
+export type QueueDrainDeliveriesRequest = {
+  type: "drain_deliveries";
+  requestId: string;
+  ownerGeneration?: number;
+  reason: QueueDrainReason;
+  timeoutMs?: number;
+};
+
 export type QueueRequest =
   | QueueSubmitRequest
   | QueueCancelRequest
@@ -99,7 +118,8 @@ export type QueueRequest =
   | QueueSetModelRequest
   | QueueSetConfigOptionRequest
   | QueueCloseSessionRequest
-  | QueueQueryActiveTurnRequest;
+  | QueueQueryActiveTurnRequest
+  | QueueDrainDeliveriesRequest;
 
 export type QueueOwnerAcceptedMessage = {
   type: "accepted";
@@ -170,6 +190,25 @@ export type QueueOwnerActiveTurnResultMessage = {
   active: boolean;
 };
 
+// One item of custody the drain took off the owner and terminalized. `messageId`
+// is absent for a plain CLI `prompt` submission, which has no acpx-ui delivery
+// counterpart (DESIGN §12 E10) — the drain still reports it, because the closing
+// agent lost custody of it either way.
+export type QueueDrainedDelivery = {
+  requestId: string;
+  messageId?: string;
+};
+
+export type QueueOwnerDrainResultMessage = {
+  type: "drain_deliveries_result";
+  requestId: string;
+  ownerGeneration?: number;
+  drained: number;
+  undelivered: QueueDrainedDelivery[];
+  turnSettled: boolean;
+  activeTurnAtEntry: boolean;
+};
+
 export type QueueOwnerErrorMessage = {
   type: "error";
   requestId: string;
@@ -195,6 +234,7 @@ export type QueueOwnerMessage =
   | QueueOwnerSetConfigOptionResultMessage
   | QueueOwnerCloseSessionResultMessage
   | QueueOwnerActiveTurnResultMessage
+  | QueueOwnerDrainResultMessage
   | QueueOwnerErrorMessage;
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -441,6 +481,26 @@ function parseTypedQueueRequest(
   switch (request.type) {
     case "submit_prompt":
       return parseSubmitRequest(request, context);
+    case "drain_deliveries":
+      return parseDrainDeliveriesRequest(request, context);
+    case "set_mode":
+      return parseStringFieldRequest(request, context, "set_mode", "modeId");
+    case "set_model":
+      return parseStringFieldRequest(request, context, "set_model", "modelId");
+    case "set_config_option":
+      return parseSetConfigOptionRequest(request, context);
+    default:
+      return parsePayloadlessQueueRequest(request.type, context);
+  }
+}
+
+// Control verbs whose whole payload is the envelope. Split out purely to keep
+// the dispatcher above inside the complexity budget.
+function parsePayloadlessQueueRequest(
+  type: unknown,
+  context: QueueRequestContext,
+): QueueRequest | null {
+  switch (type) {
     case "cancel_prompt":
       return {
         type: "cancel_prompt",
@@ -455,12 +515,6 @@ function parseTypedQueueRequest(
         requestId: context.requestId,
         ownerGeneration: context.ownerGeneration,
       };
-    case "set_mode":
-      return parseStringFieldRequest(request, context, "set_mode", "modeId");
-    case "set_model":
-      return parseStringFieldRequest(request, context, "set_model", "modelId");
-    case "set_config_option":
-      return parseSetConfigOptionRequest(request, context);
     default:
       return null;
   }
@@ -573,6 +627,16 @@ function parseStringFieldRequest<TType extends "set_mode" | "set_model">(
     return null;
   }
   return { type, ...context, [field]: value } as Extract<QueueRequest, { type: TType }>;
+}
+
+function parseDrainDeliveriesRequest(
+  request: Record<string, unknown>,
+  context: QueueRequestContext,
+): QueueDrainDeliveriesRequest | null {
+  if (request.reason !== "session-close") {
+    return null;
+  }
+  return { type: "drain_deliveries", ...context, reason: "session-close" };
 }
 
 function parseSetConfigOptionRequest(
@@ -714,6 +778,7 @@ const QUEUE_OWNER_MESSAGE_PARSERS: Record<string, QueueOwnerMessageParser> = {
   set_model_result: (message, context) =>
     parseStringResultOwnerMessage(message, context, "set_model_result", "modelId"),
   set_config_option_result: parseSetConfigOptionOwnerMessage,
+  drain_deliveries_result: parseDrainResultOwnerMessage,
   error: parseErrorOwnerMessage,
 };
 
@@ -796,6 +861,48 @@ function parseSetConfigOptionOwnerMessage(
     type: "set_config_option_result",
     ...context,
     response: response as SetSessionConfigOptionResponse,
+  };
+}
+
+function parseDrainedDeliveries(value: unknown): QueueDrainedDelivery[] | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const drained: QueueDrainedDelivery[] = [];
+  for (const entry of value) {
+    const record = asRecord(entry);
+    if (!record || typeof record.requestId !== "string") {
+      return null;
+    }
+    drained.push({
+      requestId: record.requestId,
+      ...(typeof record.messageId === "string" ? { messageId: record.messageId } : {}),
+    });
+  }
+  return drained;
+}
+
+function parseDrainResultOwnerMessage(
+  message: Record<string, unknown>,
+  context: QueueOwnerMessageContext,
+): QueueOwnerDrainResultMessage | null {
+  const undelivered = parseDrainedDeliveries(message.undelivered);
+  if (
+    undelivered === null ||
+    typeof message.drained !== "number" ||
+    !Number.isInteger(message.drained) ||
+    typeof message.turnSettled !== "boolean" ||
+    typeof message.activeTurnAtEntry !== "boolean"
+  ) {
+    return null;
+  }
+  return {
+    type: "drain_deliveries_result",
+    ...context,
+    drained: message.drained,
+    undelivered,
+    turnSettled: message.turnSettled,
+    activeTurnAtEntry: message.activeTurnAtEntry,
   };
 }
 
