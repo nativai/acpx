@@ -65,11 +65,26 @@ export const ABSORBED_TURN_NEVER_ENDED_MESSAGE =
 // terminal, and self-corrects at the cost of one wasted retry. The opposite error
 // would bury a message that was still deliverable.
 //
-// DO NOT "FIX" THIS BY SETTING THE CAUSE ON THE CLI SIDE — it is impossible, not
-// merely awkward. `drainCause` is a field on the `SessionQueueOwner` instance,
-// which lives in the `acpx __queue-owner` PROCESS; `closeSession` runs in the
-// `sessions close` process, and the unix socket is the only channel between them.
-// The drain verb IS that channel, and `--no-drain` means "do not use it".
+// DO NOT "FIX" THIS BY SETTING THE CAUSE ON THE CLI SIDE. It is POSSIBLE — and it
+// is still wrong. Those are two separate claims and only the second one matters.
+//
+// POSSIBLE, because a second live channel does reach the owner on exactly this
+// path: `closeSession` calls `tryCloseSessionOnRunningOwner` unconditionally,
+// right after the drain's early return, and the owner handles `close_session` as
+// a control verb (`ipc-server.ts`) before anything terminates it. That verb
+// carries no cause today, but it could be taught to.
+//   (An earlier revision of this comment said "impossible". It was wrong, and
+//   falsifiable in one grep. A do-not-change comment whose stated reason a reader
+//   can disprove invites discarding the whole comment — including the part that
+//   is load-bearing and correct. Hence this rewrite.)
+//
+// WRONG, because reachability was never the constraint — honest reporting is.
+// `drainCause` records what the owner WITNESSED. Setting it from the CLI on a
+// path where nobody told the owner anything would make it assert a cause it did
+// not observe and that its own view of the record contradicts. The only verb that
+// legitimately tells it is the drain, which is exactly what `--no-drain` opts out
+// of. If you want the owner to report a close, TELL it — do not have someone else
+// write the answer on its behalf.
 export type OwnerExitCause = "session-close" | "owner-exit";
 
 export function ownerExitDeliveryError(cause: OwnerExitCause): DeliveryEventError {
