@@ -129,7 +129,11 @@ import {
   SubagentRef,
 } from "../../types.js";
 import {
-  appendDeliveryStreamEvent,
+  SESSION_CLOSED_UNDELIVERED_DETAIL_CODE,
+  SESSION_CLOSED_UNDELIVERED_MESSAGE,
+} from "../queue/delivery-terminals.js";
+import {
+  appendDeliveryStreamEventSync,
   type QueueOwnerMessage,
   type QueueTask,
   waitMs,
@@ -1039,8 +1043,15 @@ function sendQueuedTaskResult(task: QueueTask, result: SessionSendResult): void 
 // sender is never notified — the fix would silently under-deliver. Pinned by the
 // classification gate in test/queue-closed-record-terminal.test.ts, which asserts
 // the property against the string read back off disk, never against a copy.
-const SESSION_CLOSED_UNDELIVERED_MESSAGE =
-  "session closed before delivery completed — the message was never delivered to the agent";
+//
+// A1-A10 rebase: this used to be a SECOND local copy of the text, which is the
+// very defect this programme exists to fix — one detail code must not have two
+// wordings. It now comes from the single source both the emitters and the
+// cross-repo fixture read. The old local copy also opened with
+// "session closed before delivery completed", byte-identical to acpx-ui's
+// INVENTED fallback (delivery-terminal-fallback.ts) — which would have made an
+// owner-WITNESSED terminal indistinguishable from an acpx-ui-INFERRED one by
+// prefix, breaking corollary C-3's forensic separability.
 
 function terminalizeDeliveryRefusedByClosedRecord(
   sessionRecordId: string,
@@ -1054,10 +1065,16 @@ function terminalizeDeliveryRefusedByClosedRecord(
     return;
   }
   task.terminalWritten = true;
-  appendDeliveryStreamEvent(sessionRecordId, task, "failed", {
+  // SYNC (A4): an owner-exit-class terminal must not be handed to libuv. This
+  // particular write is not structurally losable today — runQueuedTask has one
+  // caller and several awaits follow it — but stage 6 (KD-8) widens it, because a
+  // UI close will start delegating to `acpx sessions close`, so a closed-record
+  // refusal can then coincide with a terminate. Sync is the destination
+  // regardless; the cost is a sub-millisecond local append.
+  appendDeliveryStreamEventSync(sessionRecordId, task, "failed", {
     code: 0,
     message: SESSION_CLOSED_UNDELIVERED_MESSAGE,
-    detailCode: "SESSION_CLOSED_UNDELIVERED",
+    detailCode: SESSION_CLOSED_UNDELIVERED_DETAIL_CODE,
   });
 }
 
