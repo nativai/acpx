@@ -379,12 +379,24 @@ const FATAL_SIGNAL_EXIT_CODES: Record<string, number> = { SIGTERM: 143, SIGINT: 
  *     have made process teardown worse fleet-wide.
  *   - RE-ENTRANT. A second signal during the handler exits immediately rather
  *     than queueing behind the first.
+ *
+ * It also performs the orphan process-group reap that `closeQueueOwnerRuntime`
+ * does as its own final act. Before this, an externally-killed owner stranded
+ * its adapter descendants: the reap ran only on the graceful path, and only if
+ * that path won a race against the 1.5 s SIGKILL. Relocating the same guarded
+ * sweep here makes it deterministic on every signal path — on a shared box,
+ * stranded adapters are how load reaches 40+.
  */
 export function installQueueOwnerFatalSignalHandlers(params: {
   sessionId: string;
   owner: SessionQueueOwner;
 }): () => void {
   let handling = false;
+  // Resolved ONCE, here, not inside the signal path: `ownerIsGroupLeader()`
+  // reads /proc and, if that fails, shells out to `ps` — and the handler must do
+  // no I/O that can block inside the grace window. A process's group does not
+  // change after start, so the answer is stable for this owner's lifetime.
+  const isGroupLeader = ownerIsGroupLeader();
 
   const onFatalSignal = (signal: NodeJS.Signals): void => {
     const exitCode = FATAL_SIGNAL_EXIT_CODES[signal] ?? 143;
@@ -392,6 +404,13 @@ export function installQueueOwnerFatalSignalHandlers(params: {
       process.exit(exitCode);
     }
     handling = true;
+
+    // THE ORDER BELOW IS LOAD-BEARING, NOT INCIDENTAL. The custody sweep must
+    // COMPLETE before the process-group reap, because when this owner leads the
+    // group that reap SIGKILLs *this process too*: nothing after it runs, and
+    // SIGKILL is uncatchable, so no exit hook can rescue a pending write. That
+    // is also why every write in the sweep is synchronous. Anything moved below
+    // the reap becomes dead code silently.
     try {
       const undelivered = params.owner.terminalizeCustodyOnSignal();
       const absorbed = terminalizeAbsorbedDeliveriesOnOwnerExit(params.sessionId);
@@ -405,6 +424,16 @@ export function installQueueOwnerFatalSignalHandlers(params: {
       // Never throw from a signal handler: a lost terminal is bad, a teardown
       // that wedges until SIGKILL is worse.
     }
+
+    // Adapter descendants share this owner's process group. The leader guard is
+    // what stops an owner embedded in someone else's group from sweeping a group
+    // it does not own — the same guard the graceful path carries.
+    if (isGroupLeader && hasLiveProcessGroup(process.pid)) {
+      signalProcessGroup(process.pid, "SIGKILL");
+    }
+
+    // Reached only when this owner does not lead a live group. R1 is absolute:
+    // the owner always dies.
     process.exit(exitCode);
   };
 

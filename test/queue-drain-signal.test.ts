@@ -33,6 +33,7 @@ const SIGNAL_EXIT_LATENCY_BUDGET_MS = 300;
 const PINNED_TASK_COUNT = 20;
 
 const OWNER_HARNESS = `
+import { spawn } from "node:child_process";
 import { installQueueOwnerFatalSignalHandlers } from "%RUNTIME%";
 import {
   appendDeliveryStreamEvent,
@@ -42,6 +43,13 @@ import {
 
 const sessionId = process.argv[2];
 const asyncWriterControl = process.argv[3] === "--async-writer";
+
+// A long-lived descendant in this process's group, standing in for the ACP
+// adapter and its SDK children — the processes that were being stranded.
+const adapterChild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  stdio: "ignore",
+});
+process.stdout.write("CHILD " + adapterChild.pid + "\\n");
 const lease = await tryAcquireQueueOwnerLease(sessionId);
 if (!lease) {
   process.stderr.write("harness: could not acquire lease\\n");
@@ -86,6 +94,7 @@ setInterval(() => {}, 1000);
 type OwnerHarness = {
   child: ReturnType<typeof spawn>;
   socketPath: string;
+  adapterChildPid: number;
 };
 
 async function startOwnerHarness(options: {
@@ -93,6 +102,11 @@ async function startOwnerHarness(options: {
   scriptPath: string;
   sessionId: string;
   asyncWriterControl?: boolean;
+  // `detached: true` makes the harness its own process-group LEADER, which is how
+  // the real queue owner is spawned (queue-owner-process.ts). Left false, the
+  // harness shares the test runner's group and is deliberately NOT a leader —
+  // that is the guard case.
+  groupLeader?: boolean;
 }): Promise<OwnerHarness> {
   const child = spawn(
     process.execPath,
@@ -104,6 +118,7 @@ async function startOwnerHarness(options: {
     {
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, HOME: options.homeDir },
+      detached: options.groupLeader === true,
     },
   );
   child.stderr?.setEncoding("utf8");
@@ -112,14 +127,59 @@ async function startOwnerHarness(options: {
     stderr += chunk;
   });
 
+  let adapterChildPid = 0;
   const lines = readline.createInterface({ input: child.stdout });
   for await (const line of lines) {
+    if (line.startsWith("CHILD ")) {
+      adapterChildPid = Number(line.slice("CHILD ".length).trim());
+      continue;
+    }
     if (line.startsWith("READY ")) {
       lines.close();
-      return { child, socketPath: line.slice("READY ".length).trim() };
+      return { child, socketPath: line.slice("READY ".length).trim(), adapterChildPid };
     }
   }
   throw new Error(`owner harness never became ready: ${stderr}`);
+}
+
+// Every harness now spawns an adapter stand-in. Any test whose owner does NOT
+// reap its own group must clean that child up itself, or this suite becomes the
+// orphan problem it exists to prevent.
+function killAdapterChild(harness: OwnerHarness): void {
+  if (!Number.isInteger(harness.adapterChildPid) || harness.adapterChildPid <= 0) {
+    return;
+  }
+  try {
+    process.kill(harness.adapterChildPid, "SIGKILL");
+  } catch {
+    // already gone
+  }
+}
+
+function isAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// The reap is asynchronous from this process's point of view: the SIGKILL lands
+// on the group, then the kernel reaps its members. Poll on the OBSERVABLE (the
+// pid is gone), never on a fixed sleep.
+async function waitForPidGone(pid: number, budgetMs = 5_000): Promise<boolean> {
+  const deadline = Date.now() + budgetMs;
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return !isAlive(pid);
 }
 
 // PIN CUSTODY — real submissions over the real socket that the harness never
@@ -250,6 +310,99 @@ test("L1.5/L1.6 a real SIGTERM writes pending custody terminals to disk, inside 
       }
     } finally {
       harness.child.kill("SIGKILL");
+      killAdapterChild(harness);
+    }
+  });
+});
+
+// DELTA 2(a) — the orphan-reap gate. A signal-killed owner must not strand its
+// adapter descendants. Before this handler existed, the reap ran ONLY on the
+// graceful path and only if it beat the 1.5 s SIGKILL, so an externally-killed
+// owner left its whole subtree behind. On a shared box that is how load reaches
+// 40+ (this lane stranded 26 such processes in one afternoon).
+//
+// The assertion is on the OUTCOME — custody durable AND no surviving group — not
+// on how the handler achieves it.
+test("Delta2a a group-leading owner reaps its adapter descendants on SIGTERM, after writing custody", async () => {
+  await withSignalHarnessHome(async ({ homeDir, scriptPath }) => {
+    const sessionId = "signal-group-reap";
+    await prepareSessionStreamDir(sessionId, homeDir);
+    const harness = await startOwnerHarness({
+      homeDir,
+      scriptPath,
+      sessionId,
+      groupLeader: true,
+    });
+
+    try {
+      assert.ok(harness.adapterChildPid > 0, "harness must report its adapter child pid");
+      assert.ok(isAlive(harness.adapterChildPid), "the adapter child starts alive");
+      await pinTasksInHarness(harness.socketPath, 3);
+
+      harness.child.kill("SIGTERM");
+      await once(harness.child, "exit");
+
+      // (i) Custody is durable — and this is the run where the reap SIGKILLs the
+      // handler mid-flight, so it proves the sweep completes BEFORE the reap.
+      // If a refactor ever moved the sweep below the reap, this goes red.
+      const terminals = await readDeliveryTerminals(sessionId, homeDir);
+      assert.equal(terminals.length, 3, "custody must be on disk even though the reap kills us");
+      for (const terminal of terminals) {
+        assert.equal(terminal.error?.detailCode, "QUEUE_OWNER_SHUTDOWN");
+      }
+
+      // (ii) No orphan survives.
+      assert.ok(
+        await waitForPidGone(harness.adapterChildPid),
+        `adapter child ${harness.adapterChildPid} survived the owner's death — orphan reap regressed`,
+      );
+    } finally {
+      harness.child.kill("SIGKILL");
+      killAdapterChild(harness);
+    }
+  });
+});
+
+// The NON-LEADER branch, which nothing else exercises: an owner embedded in
+// someone else's process group must not sweep it, and must still die.
+//
+// HONEST LIMIT OF THIS GATE: it asserts the OUTCOME (no collateral kill, owner
+// dies, custody durable) and cannot isolate WHICH protection produced it. Two
+// independent ones apply — `ownerIsGroupLeader()` is false, and
+// `hasLiveProcessGroup(process.pid)` is also false because no process group
+// carries this pid — so removing the leader guard alone would not turn this red.
+// That belt-and-braces is why a broken guard cannot take down the test runner's
+// own group, which is the failure mode worth being defensive about.
+test("Delta2a a NON-leader owner never sweeps the group it is embedded in, and still exits", async () => {
+  await withSignalHarnessHome(async ({ homeDir, scriptPath }) => {
+    const sessionId = "signal-non-leader";
+    await prepareSessionStreamDir(sessionId, homeDir);
+    // groupLeader omitted → the harness shares this test runner's process group.
+    const harness = await startOwnerHarness({ homeDir, scriptPath, sessionId });
+
+    try {
+      assert.ok(isAlive(harness.adapterChildPid), "the adapter child starts alive");
+      await pinTasksInHarness(harness.socketPath, 2);
+
+      harness.child.kill("SIGTERM");
+      const [code] = (await once(harness.child, "exit")) as [number | null, NodeJS.Signals | null];
+
+      // R1 still holds on this branch: no group to reap, so it exits explicitly.
+      assert.equal(code, 143, "a non-leader owner must still die on SIGTERM");
+
+      // Custody is still durable.
+      assert.equal((await readDeliveryTerminals(sessionId, homeDir)).length, 2);
+
+      // And it did NOT sweep. The child shares OUR group; killing that group
+      // would have taken down the test runner itself, so its survival is the
+      // proof the leader guard held.
+      assert.ok(
+        isAlive(harness.adapterChildPid),
+        "a non-leader owner must not reap a process group it does not own",
+      );
+    } finally {
+      harness.child.kill("SIGKILL");
+      killAdapterChild(harness);
     }
   });
 });
@@ -281,6 +434,7 @@ test("L1.5 control: the asynchronous writer loses every terminal on the same sig
       );
     } finally {
       harness.child.kill("SIGKILL");
+      killAdapterChild(harness);
     }
   });
 });
