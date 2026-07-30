@@ -377,8 +377,10 @@ export class SessionQueueOwner {
 
     // 1. Quiesce, before any await. From this instant `submit_prompt` is
     //    rejected, so nothing can arrive between here and the SIGTERM that
-    //    follows (E5) — which is what makes the signal handler's
-    //    QUEUE_OWNER_SHUTDOWN default provably correct.
+    //    follows (E5). That is what lets the signal handler trust its
+    //    QUEUE_OWNER_SHUTDOWN default — on every path where the drain ran. See
+    //    `OwnerExitCause` for the one path where it does not (`--no-drain`) and
+    //    why the default is still honest there.
     this.draining = true;
     this.drainCause = reason === "session-close" ? "session-close" : "owner-exit";
 
@@ -408,9 +410,12 @@ export class SessionQueueOwner {
    * no I/O that can block — so a SIGTERM handler finishes well inside the 1.5 s
    * PROCESS_EXIT_GRACE_MS window before SIGKILL. Returns the terminals written.
    *
-   * Defaults to QUEUE_OWNER_SHUTDOWN (retryable, session still open), which is
-   * correct for every external kill; only a drain that already ran for a close
-   * flips `drainCause`, and in that case there is nothing left to sweep anyway.
+   * Defaults to QUEUE_OWNER_SHUTDOWN (retryable, session still open). Only a drain
+   * that already ran for a close flips `drainCause`, and in that case there is
+   * nothing left to sweep anyway. On the `--no-drain` path no drain runs, so this
+   * default is what a close-caused loss reports — honestly, because the owner was
+   * never told and the record still reads open at that instant. `OwnerExitCause`
+   * has the full reasoning; do not "correct" it here.
    */
   terminalizeCustodyOnSignal(): number {
     const custody = [...this.pending.splice(0), ...(this.midTurnCustodySource?.() ?? [])];

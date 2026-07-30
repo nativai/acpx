@@ -44,9 +44,32 @@ export const ABSORBED_TURN_NEVER_ENDED_MESSAGE =
 
 // Why the owner is writing an exit terminal. `session-close` is reachable only
 // through the drain verb, which carries `reason:'session-close'`; every other
-// death — including the signal path — is `owner-exit`, because the quiesce flag
-// guarantees nothing new arrives between a drain and the SIGTERM that follows it
-// (DESIGN §12 E5), so the signal handler's default can never be wrong.
+// death — including the signal path — is `owner-exit`.
+//
+// THE INVARIANT, STATED HONESTLY: the `owner-exit` default is correct whenever the
+// owner WAS TOLD the session is closing, and the quiesce flag guarantees it was
+// told on every path except one — `--no-drain`, where the operator has explicitly
+// opted out of telling it (DESIGN §12 E5 covers the rest).
+//
+// `--no-drain` IS THE BOUNDARY OF THAT INVARIANT, NOT A COUNTEREXAMPLE TO BE
+// ELIMINATED. On that path the owner is killed from outside and the session record
+// STILL SAYS OPEN — `closeSession` stamps `closed:true` AFTER it terminates the
+// owner — so `QUEUE_OWNER_SHUTDOWN` (owner exiting, session open, retryable) is
+// what the owner actually witnessed. Emitting `SESSION_CLOSED_UNDELIVERED` there
+// would be the owner asserting a fact nobody told it and that its own view of the
+// record contradicts, which is the same fabrication this whole program exists to
+// remove (see `warnUndeliveredCustody` for the same rule applied to CLI output).
+//
+// It is also the SAFE direction to be wrong in: retryable causes a re-drive that
+// meets the closed-record refusal (`runtime.ts`), gets an honest definitive
+// terminal, and self-corrects at the cost of one wasted retry. The opposite error
+// would bury a message that was still deliverable.
+//
+// DO NOT "FIX" THIS BY SETTING THE CAUSE ON THE CLI SIDE — it is impossible, not
+// merely awkward. `drainCause` is a field on the `SessionQueueOwner` instance,
+// which lives in the `acpx __queue-owner` PROCESS; `closeSession` runs in the
+// `sessions close` process, and the unix socket is the only channel between them.
+// The drain verb IS that channel, and `--no-drain` means "do not use it".
 export type OwnerExitCause = "session-close" | "owner-exit";
 
 export function ownerExitDeliveryError(cause: OwnerExitCause): DeliveryEventError {
