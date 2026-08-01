@@ -1033,10 +1033,21 @@ export async function findSession(options: FindSessionOptions): Promise<SessionR
   if (matches.length === 0) {
     return undefined;
   }
-  if (matches.length > 1) {
-    throw ambiguousSessionResolutionError(normalizedName, matches);
+  // Ambiguity is judged among OPEN candidates only. Closed sessions are ranked
+  // below live ones rather than competing with them, and that ranking is a
+  // contract, not a convenience: `sessions new -s <name>` soft-closes the prior
+  // same-named session and creates a fresh one, so one closed predecessor beside
+  // one live session is the ordinary shape of any recreated name — treating it
+  // as ambiguous would break `sessions show <name>` after a single re-`new`.
+  // With no live candidate at all, the closed set keeps its documented
+  // newest-first archival fallback (index order is lastUsedAt desc), which
+  // `exportSession` relies on. Neither case can misdeliver: a closed session
+  // receives nothing.
+  const open = matches.filter((session) => !session.closed);
+  if (open.length > 1) {
+    throw ambiguousSessionResolutionError(normalizedName, open);
   }
-  return await loadRecordFromIndexEntry(matches[0]);
+  return await loadRecordFromIndexEntry(open[0] ?? matches[0]);
 }
 
 export async function findSessionByDirectoryWalk(

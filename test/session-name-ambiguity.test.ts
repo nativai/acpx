@@ -181,6 +181,94 @@ test("the ambiguity message names every candidate record id and cwd and the next
   });
 });
 
+test("a closed predecessor is ranked below a live session, not treated as ambiguous", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "repo");
+    await fs.mkdir(cwd, { recursive: true });
+
+    // The ordinary shape of any recreated name: `sessions new -s <name>`
+    // soft-closes the prior same-named session and creates a fresh one. If a
+    // closed predecessor made the name ambiguous, `sessions show <name>` would
+    // break after a single re-`new`.
+    await seedSession(homeDir, {
+      id: "predecessor",
+      cwd,
+      name: "recreated",
+      closed: true,
+      lastUsedAt: OLD_TS,
+    });
+    await seedSession(homeDir, { id: "live", cwd, name: "recreated", lastUsedAt: NEW_TS });
+
+    const found = await session.findSession({
+      agentCommand: AGENT,
+      cwd,
+      name: "recreated",
+      includeClosed: true,
+    });
+    assert.equal(found?.acpxRecordId, "live");
+  });
+});
+
+test("with no live candidate, closed sessions keep their newest-first fallback", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "repo");
+    await fs.mkdir(cwd, { recursive: true });
+
+    await seedSession(homeDir, {
+      id: "older-closed",
+      cwd,
+      name: "gone",
+      closed: true,
+      lastUsedAt: OLD_TS,
+    });
+    await seedSession(homeDir, {
+      id: "newer-closed",
+      cwd,
+      name: "gone",
+      closed: true,
+      lastUsedAt: NEW_TS,
+    });
+
+    // Archival reads (`sessions show`, `exportSession`) rely on this ordering,
+    // and nothing can be misdelivered to a closed session.
+    const found = await session.findSession({
+      agentCommand: AGENT,
+      cwd,
+      name: "gone",
+      includeClosed: true,
+    });
+    assert.equal(found?.acpxRecordId, "newer-closed");
+  });
+});
+
+test("two live candidates are ambiguous even beside a closed predecessor", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "repo");
+    await fs.mkdir(cwd, { recursive: true });
+
+    await seedSession(homeDir, { id: "closed-one", cwd, name: "shared", closed: true });
+    await seedSession(homeDir, { id: "live-one", cwd, name: "shared", lastUsedAt: NEW_TS });
+    await seedSession(homeDir, { id: "live-two", cwd, name: "shared", lastUsedAt: OLD_TS });
+
+    const error = await session
+      .findSession({ agentCommand: AGENT, cwd, name: "shared", includeClosed: true })
+      .then(
+        () => undefined,
+        (thrown: unknown) => thrown,
+      );
+
+    assert.ok(error instanceof Error, "two live candidates must not resolve");
+    assert.match(error.message, /record ID: live-one/);
+    assert.match(error.message, /record ID: live-two/);
+    // Only the live candidates are ambiguous — the closed predecessor is not a
+    // choice the operator has to make.
+    assert.doesNotMatch(error.message, /closed-one/);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // CLI level — the real binary against a real session store
 // ---------------------------------------------------------------------------
@@ -374,6 +462,7 @@ async function seedSession(
     name: string;
     agentCommand?: string;
     lastUsedAt?: string;
+    closed?: boolean;
   },
 ): Promise<void> {
   await fs.mkdir(options.cwd, { recursive: true });
@@ -387,6 +476,8 @@ async function seedSession(
         cwd: options.cwd,
         name: options.name,
         lastUsedAt: options.lastUsedAt ?? OLD_TS,
+        closed: options.closed ?? false,
+        closedAt: options.closed === true ? (options.lastUsedAt ?? OLD_TS) : undefined,
       },
       { defaultName: false, defaultAcpx: false },
     ),
