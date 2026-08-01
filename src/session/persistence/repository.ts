@@ -995,19 +995,48 @@ export async function listSubagentsForSession(
     .toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
 }
 
+/**
+ * The one ambiguous-name message shape for the whole repository: a name (or an
+ * unnamed cwd lookup) either resolves to exactly one session or errors — it
+ * never silently picks a winner. Names every candidate so the operator can act
+ * without reading source, and hands them the exact next selector to use.
+ */
+function ambiguousSessionResolutionError(
+  name: string | undefined,
+  candidates: readonly Pick<SessionIndexEntry, "acpxRecordId" | "cwd">[],
+): SessionResolutionError {
+  const subject = name === undefined ? "Unnamed session lookup" : `Session name "${name}"`;
+  const rendered = candidates
+    .toSorted((a, b) => a.cwd.localeCompare(b.cwd) || a.acpxRecordId.localeCompare(b.acpxRecordId))
+    .map((candidate) => `  - cwd: ${candidate.cwd}; record ID: ${candidate.acpxRecordId}`)
+    .join("\n");
+  return new SessionResolutionError(
+    `${subject} is ambiguous across eligible sessions:\n` +
+      `${rendered}\n` +
+      "Use --session-id <id> or --session-url <url> to select one.",
+  );
+}
+
 export async function findSession(options: FindSessionOptions): Promise<SessionRecord | undefined> {
   const normalizedCwd = absolutePath(options.cwd);
   const normalizedName = normalizeName(options.name);
   const entries = await loadSessionIndexEntries();
-  const match = entries.find(
+  // filter, not find: co-located duplicates have no principled winner, and the
+  // index is ordered by lastUsedAt desc — so `find` silently returns whichever
+  // session was touched most recently, and every misdelivery makes that winner
+  // stickier. Fail closed instead, like every sibling resolver in this file.
+  const matches = entries.filter(
     (session) =>
       matchesAgentIdentity(session, options.agentCommand, options.agentName) &&
       matchesSessionEntry(session, normalizedCwd, normalizedName, options.includeClosed),
   );
-  if (!match) {
+  if (matches.length === 0) {
     return undefined;
   }
-  return await loadRecordFromIndexEntry(match);
+  if (matches.length > 1) {
+    throw ambiguousSessionResolutionError(normalizedName, matches);
+  }
+  return await loadRecordFromIndexEntry(matches[0]);
 }
 
 export async function findSessionByDirectoryWalk(
@@ -1027,9 +1056,17 @@ export async function findSessionByDirectoryWalk(
   const walkRoot = path.parse(current).root;
 
   for (;;) {
-    const match = sessions.find((session) => matchesSessionEntry(session, current, normalizedName));
-    if (match) {
-      return await loadRecordFromIndexEntry(match);
+    // Ambiguity is judged at THIS directory level, never globally: a match in a
+    // deeper cwd legitimately shadows a shallower one — that is how nested
+    // worktrees resolve. Only co-located duplicates are ambiguous.
+    const matches = sessions.filter((session) =>
+      matchesSessionEntry(session, current, normalizedName),
+    );
+    if (matches.length > 1) {
+      throw ambiguousSessionResolutionError(normalizedName, matches);
+    }
+    if (matches.length === 1) {
+      return await loadRecordFromIndexEntry(matches[0]);
     }
 
     const parent = nextWalkParent(current, walkBoundary, walkRoot);
@@ -1118,13 +1155,9 @@ export async function resolveGlobalSessionByName(options: {
     return resolution.record;
   }
 
-  const candidates = resolution.candidates
-    .map((candidate) => `  - cwd: ${candidate.cwd}; record ID: ${candidate.acpxRecordId}`)
-    .join("\n");
-  throw new SessionResolutionError(
-    `Session name "${normalizeName(options.name) ?? options.name}" is ambiguous across eligible sessions:\n` +
-      `${candidates}\n` +
-      "Use --session-id <id> or --session-url <url> to select one.",
+  throw ambiguousSessionResolutionError(
+    normalizeName(options.name) ?? options.name,
+    resolution.candidates,
   );
 }
 
