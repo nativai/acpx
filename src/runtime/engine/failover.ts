@@ -281,24 +281,27 @@ function accountForEntry(
 // Fable rate_limit short-circuit (§3b) — the core value. The Fable-share limit is
 // invisible to 5h/7d tracking, so without this a Fable session that hits it hops
 // EVERY sub (each 429s on fable) with a full turn before any terminal fires.
-// Probe fable FRESH: if every sub is cleanly exhausted, restore selection and
+// Read the fable state: if every sub is cleanly exhausted, restore selection and
 // throw FableShareExhaustedError immediately (skip the thrash loop). Otherwise
 // seed `tried` with the fable-EXHAUSTED accounts so the loop only fails over to
-// fable-available subs. A probe ERROR is UNKNOWN — never counted available, never
+// fable-available subs. A reading ERROR is UNKNOWN — never counted available, never
 // seeded (degrades to normal failover; we only short-circuit on POSITIVE evidence
 // of a clean 429). Returns a status snapshot for the mid-loop boundary conversion.
 //
-// NOTE the probe is a VOLATILE point-in-time signal (the limit flaps near its
-// boundary). This is acceptable here because it runs ONLY after the session's OWN
-// real turn already 429'd — the AUTHORITATIVE signal — so the fresh probe is
-// corroborating that live failure, not predicting it in the abstract.
+// NOTE the fable reading is GATED (brick://1badc6f1), so it may be served from the
+// per-account snapshot rather than probed here — it is truthful but bounded by the
+// 2h cap, not live. That is acceptable because this runs ONLY after the session's
+// OWN real turn already 429'd — the AUTHORITATIVE signal — so the reading is
+// corroborating that live failure, not predicting it in the abstract; and this
+// session's own record was just written, so the activity gate trips for its account.
 //
 // CLASSIFICATION GATE: FableShareExhaustedError claims "unified 5h/7d windows are
-// healthy". So we VERIFY that before raising it — probe unified AND fable fresh in
-// one shot. If NOTHING can serve non-Fable traffic (unified maxed everywhere), the
-// 429 is GENERIC exhaustion, not the fable-share cap: return isFableRateLimit=false
-// so BOTH the pre-loop throw and the mid-loop conversion are bypassed and the
-// normal path raises AllSubscriptionsExhaustedError (correct cause + remedy).
+// healthy". So we VERIFY that before raising it — read unified FRESH and fable
+// GATED in one shot. If NOTHING can serve non-Fable traffic (unified maxed
+// everywhere), the 429 is GENERIC exhaustion, not the fable-share cap: return
+// isFableRateLimit=false so BOTH the pre-loop throw and the mid-loop conversion
+// are bypassed and the normal path raises AllSubscriptionsExhaustedError (correct
+// cause + remedy).
 async function fableRateLimitShortCircuit(params: {
   record: SessionRecord;
   sessionModel: string;
