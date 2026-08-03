@@ -11,7 +11,6 @@ import {
   handleSessionsHistory,
   handleSessionsImport,
   handleSessionsList,
-  handleSessionsMigrateMessages,
   handleSessionsNew,
   handleSessionsOwnerStatus,
   handleSessionsPrune,
@@ -484,14 +483,6 @@ export function registerSessionsCommand(
     )
     .action(async function (this: Command, archivePath: string, flags: SessionsImportFlags) {
       await handleSessionsImport(explicitAgentName, archivePath, flags, this, config);
-    });
-
-  sessionsCommand
-    .command("migrate-messages")
-    .description("Migrate closed or idle legacy session records to split message logs")
-    .option("--dry-run", "Preview migration counts without writing records")
-    .action(async function (this: Command, flags: { dryRun?: boolean }) {
-      await handleSessionsMigrateMessages(flags, this, config);
     });
 
   sessionsCommand

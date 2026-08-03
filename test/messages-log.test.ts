@@ -15,7 +15,6 @@ import {
   readPersistedLifecycle,
   resolveSessionRecord,
   serializeSessionRecordForDisk,
-  migrateSessionMessages,
   writeSessionRecord,
   writeSessionRecordAtBoundary,
 } from "../src/session/persistence.js";
@@ -443,54 +442,6 @@ test("boundary compaction rewrites the current window and advances base_index", 
       } else {
         process.env.ACPX_MESSAGES_LOG_COMPACT_BYTES = previousThreshold;
       }
-    }
-  });
-});
-
-test("migrateSessionMessages migrates closed legacy records and skips active owners", async () => {
-  await withTempHome("acpx-messages-log-", async (homeDir) => {
-    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
-      stdio: "ignore",
-    });
-    await once(child, "spawn");
-    assert.ok(child.pid);
-
-    const closedMessages = [userMessage(1), agentMessage(2)];
-    try {
-      await writeRawRecord(
-        homeDir,
-        sessionRecord("migrate-closed", structuredClone(closedMessages), {
-          closed: true,
-          closedAt: "2026-01-01T00:00:00.000Z",
-        }),
-      );
-      await writeRawRecord(
-        homeDir,
-        sessionRecord("migrate-active", [userMessage(3)], {
-          pid: child.pid,
-        }),
-      );
-
-      const result = await migrateSessionMessages();
-
-      assert.equal(result.scanned, 2);
-      assert.equal(result.migrated, 1);
-      assert.equal(result.skippedActive, 1);
-      assert.equal(result.skippedAlreadySplit, 0);
-      assert.equal(result.failed, 0);
-
-      const raw = await readRawRecord(homeDir, "migrate-closed");
-      assert.deepEqual(raw.messages, []);
-      assert.deepEqual(raw.messages_log, {
-        v: 1,
-        count: closedMessages.length,
-        base_index: 0,
-        bytes: Buffer.byteLength(serializeMessages(closedMessages)),
-      });
-      assert.deepEqual((await readRawRecord(homeDir, "migrate-active")).messages, [userMessage(3)]);
-    } finally {
-      child.kill("SIGTERM");
-      await once(child, "exit").catch(() => undefined);
     }
   });
 });

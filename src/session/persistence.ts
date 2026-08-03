@@ -13,7 +13,6 @@ export {
   listSessions,
   listSessionsForAgent,
   listSubagentsForSession,
-  migrateSessionMessages,
   migrateTemplateSlugs,
   normalizeName,
   persistTemplateMark,
@@ -32,8 +31,6 @@ export {
   writeSessionRecordWithPersistedLifecycle,
 } from "./persistence/repository.js";
 export type {
-  MigrateMessagesOptions,
-  MigrateMessagesResult,
   MigrateSlugsResult,
   PersistedSessionLifecycle,
   PruneOptions,
