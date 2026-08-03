@@ -925,7 +925,7 @@ test("sessions new command is present in help output", async () => {
     assert.match(result.stdout, /\bnew\b/);
     assert.match(result.stdout, /\bensure\b/);
     assert.match(result.stdout, /\bread\b/);
-    assert.match(result.stdout, /migrate-messages/);
+    assert.doesNotMatch(result.stdout, /migrate-messages/);
     assert.match(result.stdout, /\bprune\b/);
 
     const newHelp = await runCli(["sessions", "new", "--help"], homeDir);

@@ -6,7 +6,6 @@ import path from "node:path";
 import { SessionNotFoundError, SessionResolutionError } from "../../errors.js";
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { assertPersistedKeyPolicy } from "../../persisted-key-policy.js";
-import { isProcessAlive } from "../../process-liveness.js";
 import type { SessionRecord } from "../../types.js";
 import { getLoggedMessageCount, markAllMessagesLogged } from "../messages-log-bookkeeping.js";
 import {
@@ -1217,22 +1216,6 @@ export type PruneResult = {
   dryRun: boolean;
 };
 
-export type MigrateMessagesOptions = {
-  dryRun?: boolean;
-  includeActive?: boolean;
-};
-
-export type MigrateMessagesResult = {
-  scanned: number;
-  migrated: number;
-  skippedActive: number;
-  skippedAlreadySplit: number;
-  failed: number;
-  dryRun: boolean;
-};
-
-type MigrateMessagesEntryResult = "migrated" | "active" | "already-split" | "failed";
-
 function closedAtOrLastUsedAt(record: SessionRecord): string {
   return record.closedAt ?? record.lastUsedAt;
 }
@@ -1289,76 +1272,6 @@ export async function pruneSessions(options: PruneOptions = {}): Promise<PruneRe
   });
 
   return { pruned: records, bytesFreed, dryRun: false };
-}
-
-export async function migrateSessionMessages(
-  options: MigrateMessagesOptions = {},
-): Promise<MigrateMessagesResult> {
-  await ensureSessionDir();
-  const entries = await loadSessionIndexEntries();
-  const result: MigrateMessagesResult = {
-    scanned: 0,
-    migrated: 0,
-    skippedActive: 0,
-    skippedAlreadySplit: 0,
-    failed: 0,
-    dryRun: options.dryRun === true,
-  };
-
-  for (const entry of entries) {
-    result.scanned += 1;
-    tallyMigrateMessagesEntryResult(
-      result,
-      await migrateSessionMessagesEntry(entry, options, result.dryRun),
-    );
-  }
-
-  return result;
-}
-
-async function migrateSessionMessagesEntry(
-  entry: SessionIndexEntry,
-  options: MigrateMessagesOptions,
-  dryRun: boolean,
-): Promise<MigrateMessagesEntryResult> {
-  const record = await loadRecordFromIndexEntry(entry);
-  if (!record) {
-    return "failed";
-  }
-
-  if (record.messagesLog) {
-    return "already-split";
-  }
-
-  if (!record.closed && options.includeActive !== true && isProcessAlive(record.pid)) {
-    return "active";
-  }
-
-  if (dryRun) {
-    return "migrated";
-  }
-
-  try {
-    await writeSessionRecordAtBoundary(record);
-    return "migrated";
-  } catch {
-    return "failed";
-  }
-}
-
-function tallyMigrateMessagesEntryResult(
-  result: MigrateMessagesResult,
-  entryResult: MigrateMessagesEntryResult,
-): void {
-  if (entryResult === "migrated") {
-    result.migrated += 1;
-  } else if (entryResult === "active") {
-    result.skippedActive += 1;
-  } else if (entryResult === "already-split") {
-    result.skippedAlreadySplit += 1;
-  } else {
-    result.failed += 1;
-  }
 }
 
 function filterPruneCandidates(

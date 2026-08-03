@@ -51,7 +51,6 @@ import {
   isoNow,
   isTemplateRecord,
   listSessions,
-  migrateSessionMessages,
   migrateTemplateSlugs,
   normalizeName,
   persistTemplateMark,
@@ -3051,34 +3050,6 @@ export async function handleSessionsImport(
   process.stdout.write(`imported session ${result.record_id} at ${result.cwd}\n`);
 }
 
-export async function handleSessionsMigrateMessages(
-  flags: { dryRun?: boolean },
-  command: Command,
-  config: ResolvedAcpxConfig,
-): Promise<void> {
-  const globalFlags = resolveGlobalFlags(command, config);
-  const result = await migrateSessionMessages({ dryRun: flags.dryRun });
-
-  if (
-    emitJsonResult(globalFlags.format, {
-      action: "messages_migrated",
-      ...result,
-    })
-  ) {
-    return;
-  }
-
-  if (globalFlags.format === "quiet") {
-    process.stdout.write(`${result.migrated}\n`);
-    return;
-  }
-
-  const prefix = result.dryRun ? "would migrate" : "migrated";
-  process.stdout.write(
-    `${prefix} ${result.migrated} sessions (scanned ${result.scanned}, skipped active ${result.skippedActive}, already split ${result.skippedAlreadySplit}, failed ${result.failed})\n`,
-  );
-}
-
 // `acpx <agent> sessions templates rollback <slug> [--delete]` — retract the
 // current latest version of a slug. Default soft-retract (reversible); --delete
 // hard-removes. The slug is resolved GLOBALLY (D2), so the agent prefix is just
@@ -3119,8 +3090,7 @@ function printTemplateRollbackResult(result: TemplateRollbackResult, format: Out
 }
 
 // `acpx <agent> sessions templates migrate-slugs [--dry-run]` — idempotent
-// backfill of slug+version on existing templates (global, D2). Modeled on
-// migrate-messages.
+// backfill of slug+version on existing templates (global, D2).
 export async function handleSessionsTemplatesMigrateSlugs(
   flags: { dryRun?: boolean },
   command: Command,
