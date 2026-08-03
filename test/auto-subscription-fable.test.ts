@@ -39,7 +39,14 @@ function startMockMessages(
         }
         hits.push({ model, token });
         if (model === FABLE) {
-          res.writeHead(fableByToken.get(token) === "available" ? 200 : 429).end("{}");
+          // A clean exhaustion is a 429 that CARRIES unified rate-limit headers;
+          // a BARE 429 is the request-shape gate and means UNKNOWN, not exhausted.
+          const available = fableByToken.get(token) === "available";
+          res
+            .writeHead(available ? 200 : 429, {
+              "anthropic-ratelimit-unified-7d_oi-utilization": available ? "0.4" : "1",
+            })
+            .end("{}");
           return;
         }
         // Haiku (unified usage) probe — optionally delayed to make the OVERALL
@@ -66,25 +73,6 @@ function startMockMessages(
   });
 }
 
-// A GET /api/oauth/usage mock that always 403s (no user:profile scope), so the
-// fable state degrades to the 1-token probe this rig drives. WITHOUT this, the new
-// pollFableUsage() would hit the LIVE api.anthropic.com with the rig's fake tokens
-// — a rate-limit-budget breach whose 429 also poisons the module-global back-off
-// and flakes the suite (brick://a319745e VERIFICATION). Deterministic 403 ⇒ no
-// back-off ever set.
-function startAlways403Usage(): Promise<{ server: Server; url: string }> {
-  return new Promise((resolve) => {
-    const server = createServer((_req, res) => {
-      res.writeHead(403).end("{}");
-    });
-    server.listen(0, "127.0.0.1", () => {
-      const addr = server.address();
-      const port = typeof addr === "object" && addr ? addr.port : 0;
-      resolve({ server, url: `http://127.0.0.1:${port}/api/oauth/usage` });
-    });
-  });
-}
-
 let rigCounter = 0;
 
 async function withRig(
@@ -103,9 +91,16 @@ async function withRig(
   const tokenOf = (id: string) => `tok-${rigCounter}-${id}`;
   const fableByToken = new Map<string, FableOutcome>();
   const hits: ProbeHit[] = [];
-  const prevEndpoint = process.env.CLAUDE_MESSAGES_ENDPOINT;
-  const prevUsage = process.env.CLAUDE_OAUTH_USAGE_ENDPOINT;
-  const prevSessionUrl = process.env.ACPX_SESSION_URL;
+  const prevEnv = {
+    CLAUDE_MESSAGES_ENDPOINT: process.env.CLAUDE_MESSAGES_ENDPOINT,
+    ACPX_SESSION_URL: process.env.ACPX_SESSION_URL,
+    // Pin the persisted fable snapshot to this rig — the module refuses the real
+    // home under test, and fixture values must never reach the live store.
+    ACPX_FABLE_SNAPSHOT_DIR: process.env.ACPX_FABLE_SNAPSHOT_DIR,
+    // This rig drives the probe directly; the local activity gate would only add
+    // a session-index read it does not exercise.
+    ACPX_FABLE_ACTIVITY_GATE: process.env.ACPX_FABLE_ACTIVITY_GATE,
+  };
   try {
     await fs.mkdir(subsDir, { recursive: true });
     for (const sub of subs) {
@@ -132,31 +127,22 @@ async function withRig(
       }),
     );
     const { server, url } = await startMockMessages(fableByToken, hits, options.haikuDelayMs ?? 0);
-    const usageServer = await startAlways403Usage();
     process.env.CLAUDE_MESSAGES_ENDPOINT = url;
-    process.env.CLAUDE_OAUTH_USAGE_ENDPOINT = usageServer.url;
+    process.env.ACPX_FABLE_SNAPSHOT_DIR = path.join(home, "usage-fable");
+    process.env.ACPX_FABLE_ACTIVITY_GATE = "0";
     delete process.env.ACPX_SESSION_URL;
     try {
       await run({ lookupOptions: { homeDir: home, registryPath }, hits });
     } finally {
       server.close();
-      usageServer.server.close();
     }
   } finally {
-    if (prevEndpoint === undefined) {
-      delete process.env.CLAUDE_MESSAGES_ENDPOINT;
-    } else {
-      process.env.CLAUDE_MESSAGES_ENDPOINT = prevEndpoint;
-    }
-    if (prevUsage === undefined) {
-      delete process.env.CLAUDE_OAUTH_USAGE_ENDPOINT;
-    } else {
-      process.env.CLAUDE_OAUTH_USAGE_ENDPOINT = prevUsage;
-    }
-    if (prevSessionUrl === undefined) {
-      delete process.env.ACPX_SESSION_URL;
-    } else {
-      process.env.ACPX_SESSION_URL = prevSessionUrl;
+    for (const [key, value] of Object.entries(prevEnv)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
     }
     await fs.rm(home, { recursive: true, force: true });
   }
@@ -244,4 +230,25 @@ test("completed fable probe survives an outer-deadline TIMEOUT → still 'all-fa
       process.env.ACPX_SUBSCRIPTION_AUTO_TIMEOUT_MS = prev;
     }
   }
+});
+
+// AC5 (brick://1badc6f1): with truthful probes and every sub showing headroom the
+// tally must report N/N available — the observable that proves the fleet is no
+// longer reading a shape-gated 429 as fleet-wide Fable exhaustion.
+test("fable spawn, ALL subs available → tally N/N, no 'all-fable-exhausted' fallback", async () => {
+  await withRig(
+    [
+      { id: "a", fable: "available" },
+      { id: "b", fable: "available" },
+      { id: "c", fable: "available" },
+    ],
+    async ({ lookupOptions }) => {
+      const picked = await resolveAutoSubscription(CLAUDE_AGENT, lookupOptions, { model: FABLE });
+      assert.ok(picked !== undefined, "a fable-available sub must be picked, not the fallback");
+      const summary = consumeAutoSubscriptionSelection();
+      assert.notEqual(summary?.reason, "all-fable-exhausted");
+      assert.equal(summary?.fellBack, false);
+      assert.deepEqual(summary?.fable, { available: 3, exhausted: 0, probed: true });
+    },
+  );
 });

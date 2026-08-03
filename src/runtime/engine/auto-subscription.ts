@@ -497,7 +497,7 @@ export async function resolveAutoSubscription(
   // + tally instead of discarding it as a generic 'timeout'.
   let completedFable: Map<string, SubscriptionFableState> | undefined;
   const fableProbe: Promise<Map<string, SubscriptionFableState> | undefined> = isFable
-    ? getSubscriptionsFableState(registry.subscriptions, true).then((states) => {
+    ? getSubscriptionsFableState(registry.subscriptions, "gated", lookupOptions).then((states) => {
         completedFable = states;
         return states;
       })

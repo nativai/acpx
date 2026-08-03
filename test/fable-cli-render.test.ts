@@ -22,21 +22,21 @@ test("formatFable: not probed / error / exhausted / available / utilization", ()
     ),
     "fable ? (network error)",
   );
-  // probe-429 → honest point-in-time "throttled (probe)", NOT a permanent verdict
+  // Real exhaustion with no readable window (older/odd response).
   assert.equal(
     formatFable(usage({ id: "s", fable: { available: false, utilization: null, reset: null } })),
-    "fable throttled (probe)",
+    "fable exhausted",
   );
-  // throttled + known allocation → secondary share suffix inside the same parens
+  // A cleanly-EXHAUSTED sub still shows its percentage — the case where the
+  // number matters most (the old early-return dropped it).
   assert.equal(
     formatFable(
       usage({
         id: "s",
-        fable: { available: false, utilization: null, reset: null },
-        fallback: { percentage: 0.5, availability: "available" },
+        fable: { available: false, utilization: 1, reset: "2026-08-06T07:00:00.000Z" },
       }),
     ),
-    "fable throttled (probe; share 50%)",
+    "fable exhausted (100.0%, resets 2026-08-06T07:00:00.000Z)",
   );
   assert.equal(
     formatFable(usage({ id: "s", fable: { available: true, utilization: null, reset: null } })),
@@ -46,21 +46,33 @@ test("formatFable: not probed / error / exhausted / available / utilization", ()
     formatFable(usage({ id: "s", fable: { available: true, utilization: 0.42, reset: null } })),
     "fable 42.0%",
   );
+  assert.equal(
+    formatFable(
+      usage({
+        id: "s",
+        fable: { available: true, utilization: 0.33, reset: "2026-08-06T07:00:00.000Z" },
+      }),
+    ),
+    "fable 33.0%, resets 2026-08-06T07:00:00.000Z",
+  );
 });
 
-test("renderUsageText: header names fable and each row carries a fable cell", () => {
+test("renderUsageText: header names fable + the snapshot contract, rows carry a fable cell", () => {
   const out = renderUsageText([
     usage({
       id: "sub6",
       label: "work-6",
       fiveHour: { utilization: 0.25, reset: null },
       sevenDay: { utilization: 0.08, reset: null },
-      fable: { available: false, utilization: null, reset: null },
+      fable: { available: true, utilization: 0.33, reset: null },
     }),
   ]);
   assert.match(out, /Subscription usage \(5h \/ 7d \/ fable\):/);
-  assert.match(out, /point-in-time claude-fable-5 probe.*flaps/);
-  assert.match(out, /fable throttled \(probe\)/);
+  // The advisory "flaps near its boundary" doctrine is obsolete — the probe is
+  // truthful now; the header states the snapshot's freshness contract instead.
+  assert.doesNotMatch(out, /flaps/);
+  assert.match(out, /at most 2h old.*--reprobe/);
+  assert.match(out, /fable 33\.0%/);
   assert.match(out, /5h 25\.0%/);
 });
 
@@ -70,13 +82,13 @@ test("renderSubscriptionsUsageQuiet: appends fable:<state> field per line", () =
       id: "a",
       fiveHour: { utilization: 0.1, reset: null },
       sevenDay: { utilization: 0.2, reset: null },
-      fable: { available: true, utilization: null, reset: null },
+      fable: { available: true, utilization: 0.1, reset: null },
     }),
     usage({
       id: "b",
       fiveHour: { utilization: 0.1, reset: null },
       sevenDay: { utilization: 0.2, reset: null },
-      fable: { available: false, utilization: null, reset: null },
+      fable: { available: false, utilization: 1, reset: null },
     }),
     usage({
       id: "c",
@@ -85,6 +97,6 @@ test("renderSubscriptionsUsageQuiet: appends fable:<state> field per line", () =
     }),
   ]);
   assert.match(out, /^a\t10\.0%\t20\.0%\tfable:ok$/m);
-  assert.match(out, /^b\t10\.0%\t20\.0%\tfable:throttled$/m);
+  assert.match(out, /^b\t10\.0%\t20\.0%\tfable:exhausted$/m);
   assert.match(out, /^c\t10\.0%\t20\.0%\tfable:-$/m);
 });

@@ -11,25 +11,10 @@ import type { SessionRecord } from "../src/types.js";
 
 const FABLE = "claude-fable-5";
 
-// A GET /api/oauth/usage mock that always 403s (no user:profile scope), so the
-// fable state degrades to the 1-token probe these tests drive. Keeps the suite off
-// the live endpoint (brick://a319745e RATE-LIMIT BUDGET: never poll in tests).
-function startAlways403Usage(): Promise<{ server: Server; url: string }> {
-  return new Promise((resolve) => {
-    const server = createServer((_req, res) => {
-      res.writeHead(403).end("{}");
-    });
-    server.listen(0, "127.0.0.1", () => {
-      const addr = server.address();
-      const port = typeof addr === "object" && addr ? addr.port : 0;
-      resolve({ server, url: `http://127.0.0.1:${port}/api/oauth/usage` });
-    });
-  });
-}
-
-// Per-sub fable outcome: 200 (available), 429 (clean exhausted), or 500 (probe
-// error → UNKNOWN). Haiku always answers 200 healthy so the sub is a viable
-// non-fable failover target; only the fable dimension varies.
+// Per-sub fable outcome: 200 (available), a 429 CARRYING unified rate-limit
+// headers (clean exhausted — a BARE 429 is the request-shape gate and means
+// UNKNOWN), or 500 (probe error → UNKNOWN). Haiku always answers 200 healthy so
+// the sub is a viable non-fable failover target; only the fable dimension varies.
 type FableOutcome = "available" | "exhausted" | "error";
 
 type ProbeHit = { model: string; token: string };
@@ -60,11 +45,13 @@ function startMockMessages(
         if (model === FABLE) {
           const outcome = fableByToken.get(token) ?? "exhausted";
           if (outcome === "available") {
-            res.writeHead(200).end("{}");
+            res
+              .writeHead(200, { "anthropic-ratelimit-unified-7d_oi-utilization": "0.4" })
+              .end("{}");
           } else if (outcome === "error") {
             res.writeHead(500).end("{}");
           } else {
-            res.writeHead(429).end("{}");
+            res.writeHead(429, { "anthropic-ratelimit-unified-7d_oi-utilization": "1" }).end("{}");
           }
           return;
         }
@@ -137,35 +124,31 @@ async function withRig(
       }),
     );
     const { server, url } = await startMockMessages(fableByToken, unifiedByToken, hits);
-    // /api/oauth/usage always 403s here (no user:profile scope) so the fable state
-    // DEGRADES to the 1-token probe these tests already mock — the pre-poll path.
-    // Pinned to a mock so the suite NEVER touches the live usage endpoint.
-    const usageServer = await startAlways403Usage();
-    const prevEndpoint = process.env.CLAUDE_MESSAGES_ENDPOINT;
-    const prevUsage = process.env.CLAUDE_OAUTH_USAGE_ENDPOINT;
-    const prevHome = process.env.HOME;
+    const prevEnv = {
+      CLAUDE_MESSAGES_ENDPOINT: process.env.CLAUDE_MESSAGES_ENDPOINT,
+      HOME: process.env.HOME,
+      // The persisted fable snapshot resolves from the home dir — pin it to this
+      // rig so `pnpm test` can never write fixture values into the LIVE store real
+      // agents read (the snapshot module's guard refuses the real home outright).
+      ACPX_FABLE_SNAPSHOT_DIR: process.env.ACPX_FABLE_SNAPSHOT_DIR,
+      // These tests drive the probe directly; the local activity gate would only
+      // add a session-index read they don't exercise.
+      ACPX_FABLE_ACTIVITY_GATE: process.env.ACPX_FABLE_ACTIVITY_GATE,
+    };
     process.env.CLAUDE_MESSAGES_ENDPOINT = url;
-    process.env.CLAUDE_OAUTH_USAGE_ENDPOINT = usageServer.url;
     process.env.HOME = home;
+    process.env.ACPX_FABLE_SNAPSHOT_DIR = path.join(home, "usage-fable");
+    process.env.ACPX_FABLE_ACTIVITY_GATE = "0";
     try {
       await run({ homeDir: home, registryPath, hits, tokenOf });
     } finally {
       server.close();
-      usageServer.server.close();
-      if (prevEndpoint === undefined) {
-        delete process.env.CLAUDE_MESSAGES_ENDPOINT;
-      } else {
-        process.env.CLAUDE_MESSAGES_ENDPOINT = prevEndpoint;
-      }
-      if (prevUsage === undefined) {
-        delete process.env.CLAUDE_OAUTH_USAGE_ENDPOINT;
-      } else {
-        process.env.CLAUDE_OAUTH_USAGE_ENDPOINT = prevUsage;
-      }
-      if (prevHome === undefined) {
-        delete process.env.HOME;
-      } else {
-        process.env.HOME = prevHome;
+      for (const [key, value] of Object.entries(prevEnv)) {
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
       }
     }
   } finally {
@@ -384,6 +367,34 @@ test("discrimination (b): all fable-429 + unified ALSO maxed ⇒ generic exhaust
         },
       );
       assert.equal(turns, 0, "nothing eligible → no thrash");
+    },
+  );
+});
+
+// AC5 (brick://1badc6f1): a fable-available sub exists, so the short-circuit takes
+// the `anyAvailable` branch — the fable→opus degrade must NOT fire even though the
+// session opted into it. With the old shape-gated probes every sub read as
+// cleanly-exhausted and this session would have been silently downgraded to Opus.
+test("AC5: a fable-AVAILABLE sub keeps a degrade-opted session on Fable (no degrade fires)", async () => {
+  await withRig(
+    [
+      { id: "a", fable: "exhausted" }, // current/failed sub
+      { id: "b", fable: "available" },
+    ],
+    "a",
+    async ({ homeDir, registryPath }) => {
+      const record = sessionRecord("a", FABLE);
+      record.acpx!.session_options!.fable_degrade_ok = true;
+      const out = await attemptFailoverAndRetry<string>({
+        record,
+        triggerError: rateLimitError("a"),
+        loadOpts: { homeDir, registryPath },
+        runTurn: async () => "200-OK",
+      });
+      assert.equal(out.switchedTo, "b");
+      assert.equal(out.result, "200-OK");
+      assert.equal(record.acpx?.session_options?.model, FABLE, "must NOT degrade to opus");
+      assert.notEqual(record.acpx?.session_options?.model_source, "explicit-degrade");
     },
   );
 });

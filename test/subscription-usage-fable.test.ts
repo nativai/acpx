@@ -4,23 +4,27 @@ import { createServer, type Server } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { patchFableSnapshot, readFableSnapshot } from "../src/config/fable-snapshot.js";
 import {
   getSubscriptionsFableState,
   getSubscriptionsUsage,
   getSubscriptionsUsageWithFable,
   isFableModel,
+  stampFableRealTurnExhausted,
 } from "../src/config/subscription-usage.js";
 import type { SubscriptionEntry } from "../src/config/subscriptions.js";
 
-// getSubscriptions{Usage,FableState} cache by subscription id for 5 minutes, so
-// each seeded sub needs a distinct id or one test's reading leaks into the next.
+// The haiku half still caches by subscription id for 5 minutes, so each seeded
+// sub needs a distinct id or one test's reading leaks into the next. The FABLE
+// half is keyed by ACCOUNT in a per-rig ACPX_FABLE_SNAPSHOT_DIR, so it is already
+// isolated — but distinct ids keep the two halves aligned.
 let uidCounter = 0;
 function uid(tag: string): string {
   uidCounter += 1;
   return `${tag}-${uidCounter}`;
 }
 
-type ProbeHit = { model: string; token: string };
+type ProbeHit = { model: string; token: string; system: string | undefined };
 
 type ModelOutcome = {
   /** HTTP status to return (default 200). */
@@ -31,14 +35,24 @@ type ModelOutcome = {
   util7h?: number;
   /** unified-fallback-percentage header (haiku 200 only). */
   fallbackPct?: number;
-  /** unified-fallback availability header (haiku 200 only). */
+  /** unified-fallback availability string (haiku 200 only). */
   fallbackAvail?: string;
+  /** anthropic-ratelimit-unified-7d_oi-utilization — the REAL Fable weekly share. */
+  fableUtil?: number;
+  /** anthropic-ratelimit-unified-7d_oi-reset (epoch seconds). */
+  fableReset?: number;
+  /** anthropic-ratelimit-unified-7d_oi-status ("allowed", …). */
+  fableStatus?: string;
+  /** Hold the response open this long — lets a test ask again mid-probe. */
+  delayMs?: number;
+  /** Drop the connection instead of answering (network-error fixture). */
+  destroy?: true;
 };
 
 // A mock /v1/messages keyed by (token → model → outcome). Reads the request body
 // so it can return DIFFERENT results for the haiku probe vs the claude-fable-5
-// probe on the SAME token — the whole point of the fable dimension. Records every
-// hit so a test can assert which models were probed (AC2: non-Fable pays nothing).
+// probe on the SAME token — the whole point of the fable dimension — and so a
+// test can assert the CC system prefix actually rides on the fable probe.
 function startMockMessages(
   outcomes: Map<string, Map<string, ModelOutcome>>,
   hits: ProbeHit[],
@@ -52,20 +66,25 @@ function startMockMessages(
       });
       req.on("end", () => {
         let model = "";
+        let system: string | undefined;
         try {
-          model = (JSON.parse(body) as { model?: string }).model ?? "";
+          const parsed = JSON.parse(body) as {
+            model?: string;
+            system?: Array<{ text?: string }>;
+          };
+          model = parsed.model ?? "";
+          system = parsed.system?.[0]?.text;
         } catch {
           model = "";
         }
-        hits.push({ model, token });
+        hits.push({ model, token, system });
         const outcome = outcomes.get(token)?.get(model);
         if (!outcome) {
           res.writeHead(500).end("{}");
           return;
         }
-        const status = outcome.status ?? 200;
-        if (status !== 200) {
-          res.writeHead(status).end("{}");
+        if (outcome.destroy) {
+          req.destroy();
           return;
         }
         const headers: Record<string, string> = {};
@@ -81,7 +100,21 @@ function startMockMessages(
         if (outcome.fallbackAvail !== undefined) {
           headers["anthropic-ratelimit-unified-fallback"] = outcome.fallbackAvail;
         }
-        res.writeHead(200, headers).end("{}");
+        if (outcome.fableUtil !== undefined) {
+          headers["anthropic-ratelimit-unified-7d_oi-utilization"] = String(outcome.fableUtil);
+        }
+        if (outcome.fableReset !== undefined) {
+          headers["anthropic-ratelimit-unified-7d_oi-reset"] = String(outcome.fableReset);
+        }
+        if (outcome.fableStatus !== undefined) {
+          headers["anthropic-ratelimit-unified-7d_oi-status"] = outcome.fableStatus;
+        }
+        const send = () => res.writeHead(outcome.status ?? 200, headers).end("{}");
+        if (outcome.delayMs) {
+          setTimeout(send, outcome.delayMs);
+        } else {
+          send();
+        }
       });
     });
     server.listen(0, "127.0.0.1", () => {
@@ -92,79 +125,52 @@ function startMockMessages(
   });
 }
 
-// The /api/oauth/usage outcome for a sub's token. Default (omitted) is 403 —
-// "no user:profile scope" — so the fable state DEGRADES to the 1-token probe and
-// the messages-endpoint outcomes drive the assertion, exactly as before the poll.
-type UsageOutcome = {
-  /** HTTP status to return (default 200 when `data` is set, else 403). */
-  status?: number;
-  /** The response body `data` array on a 200. */
-  data?: unknown[];
-  /** Retry-After header (seconds) on a 429. */
-  retryAfter?: number;
-};
-
-// A mock GET /api/oauth/usage keyed by token. Records every token that hit it so a
-// test can assert the poll replaced (or, on degrade, did NOT replace) the probe.
-function startMockUsage(
-  outcomes: Map<string, UsageOutcome>,
-  hits: string[],
-): Promise<{ server: Server; url: string }> {
-  return new Promise((resolve) => {
-    const server = createServer((req, res) => {
-      const token = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
-      hits.push(token);
-      const outcome = outcomes.get(token) ?? { status: 403 };
-      const status = outcome.status ?? (outcome.data !== undefined ? 200 : 403);
-      if (status === 200) {
-        res
-          .writeHead(200, { "content-type": "application/json" })
-          .end(JSON.stringify({ data: outcome.data ?? [] }));
-        return;
-      }
-      const headers: Record<string, string> = {};
-      if (status === 429 && outcome.retryAfter !== undefined) {
-        headers["retry-after"] = String(outcome.retryAfter);
-      }
-      res.writeHead(status, headers).end("{}");
-    });
-    server.listen(0, "127.0.0.1", () => {
-      const addr = server.address();
-      const port = typeof addr === "object" && addr ? addr.port : 0;
-      resolve({ server, url: `http://127.0.0.1:${port}/api/oauth/usage` });
-    });
-  });
-}
-
-// A weekly_scoped Fable window shaped per the FINDINGS §7 ground-truth schema
-// (brick://e0a1d05f): `kind`, `percent` (0..1), `resets_at` (epoch s), `is_enabled`,
-// `scope.model.display_name`. `resets_at` defaults to the FINDINGS sample epoch.
-function fableWeekly(percent: number, resetsAt = 1753441140): Record<string, unknown> {
-  return {
-    kind: "weekly_scoped",
-    percent,
-    resets_at: resetsAt,
-    is_enabled: true,
-    scope: { model: { display_name: "Fable 5" } },
-  };
-}
-
 const HAIKU = "claude-haiku-4-5-20251001";
 const FABLE = "claude-fable-5";
+const CC_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude.";
+/** A weekly reset that is always in the future, so a served reading is never
+ *  stale-by-reset just because the suite is run on a later date. */
+const FUTURE_RESET = Math.floor(Date.now() / 1000) + 3 * 86_400;
+/** A CC-shaped fable 200 carrying the real weekly window, as measured live. */
+const FABLE_200 = (util: number, reset = FUTURE_RESET): ModelOutcome => ({
+  status: 200,
+  fableUtil: util,
+  fableReset: reset,
+  fableStatus: "allowed",
+});
+/** A 429 that DOES carry unified headers — real exhaustion. */
+const FABLE_429_EXHAUSTED: ModelOutcome = {
+  status: 429,
+  fableUtil: 1,
+  fableReset: FUTURE_RESET,
+  fableStatus: "rejected",
+};
+const HOUR_MS = 60 * 60_000;
+function isoAgo(ms: number): string {
+  return new Date(Date.now() - ms).toISOString();
+}
+/** A BARE 429 — the request-shape gate. UNKNOWN, never clean exhaustion. */
+const FABLE_429_BARE: ModelOutcome = { status: 429 };
 
-type SubSpec = { id: string; outcomes: Map<string, ModelOutcome>; usage?: UsageOutcome };
+type SubSpec = { id: string; outcomes: Map<string, ModelOutcome> };
 
-async function withProbeRig(
-  subs: SubSpec[],
-  run: (ctx: {
-    entries: SubscriptionEntry[];
-    hits: ProbeHit[];
-    usageHits: string[];
-  }) => Promise<void>,
-): Promise<void> {
+type RigContext = {
+  entries: SubscriptionEntry[];
+  hits: ProbeHit[];
+  /** The rig's isolated state home — its sessions index + registry live here. */
+  home: string;
+  /** Seed a fable-model session index entry so the activity gate can fire. */
+  seedFableActivity: (opts: { account: string; profile: string; at: Date }) => Promise<void>;
+};
+
+// Every fable read resolves its snapshot from ACPX_FABLE_SNAPSHOT_DIR and its
+// session index / profile registry from ACPX_STATE_HOME — both pinned to a
+// throwaway dir here. WITHOUT that, `pnpm test` would write fixture values into
+// the live /home/node/.acpx store that real agents read (the snapshot module's
+// real-home guard refuses that outright under NODE_TEST_CONTEXT).
+async function withProbeRig(subs: SubSpec[], run: (ctx: RigContext) => Promise<void>) {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fable-"));
   const outcomes = new Map<string, Map<string, ModelOutcome>>();
-  const usageOutcomes = new Map<string, UsageOutcome>();
   const entries: SubscriptionEntry[] = [];
   for (const sub of subs) {
     const configDir = path.join(home, sub.id);
@@ -175,36 +181,85 @@ async function withProbeRig(
       JSON.stringify({ claudeAiOauth: { accessToken: token } }),
     );
     outcomes.set(token, sub.outcomes);
-    if (sub.usage !== undefined) {
-      usageOutcomes.set(token, sub.usage);
-    }
     entries.push({ id: sub.id, label: sub.id, configDir, account: sub.id });
   }
   const hits: ProbeHit[] = [];
-  const usageHits: string[] = [];
   const { server, url } = await startMockMessages(outcomes, hits);
-  const { server: usageServer, url: usageUrl } = await startMockUsage(usageOutcomes, usageHits);
-  const prev = process.env.CLAUDE_MESSAGES_ENDPOINT;
-  const prevUsage = process.env.CLAUDE_OAUTH_USAGE_ENDPOINT;
+  const prev = {
+    endpoint: process.env.CLAUDE_MESSAGES_ENDPOINT,
+    snapshotDir: process.env.ACPX_FABLE_SNAPSHOT_DIR,
+    stateHome: process.env.ACPX_STATE_HOME,
+  };
   process.env.CLAUDE_MESSAGES_ENDPOINT = url;
-  process.env.CLAUDE_OAUTH_USAGE_ENDPOINT = usageUrl;
+  process.env.ACPX_FABLE_SNAPSHOT_DIR = path.join(home, "usage-fable");
+  process.env.ACPX_STATE_HOME = home;
+
+  const seedFableActivity = async (opts: { account: string; profile: string; at: Date }) => {
+    const sessionsDir = path.join(home, ".acpx", "sessions");
+    const subsDir = path.join(home, ".acpx", "subscriptions");
+    await fs.mkdir(sessionsDir, { recursive: true });
+    await fs.mkdir(subsDir, { recursive: true });
+    await fs.writeFile(
+      path.join(subsDir, "registry.json"),
+      JSON.stringify({
+        version: 3,
+        default: opts.profile,
+        profiles: [
+          {
+            id: opts.profile,
+            label: opts.profile,
+            authMode: "subscription",
+            adapter: "claude",
+            account: opts.account,
+            credentialSource: path.join(subsDir, opts.profile),
+          },
+        ],
+      }),
+    );
+    await fs.writeFile(
+      path.join(sessionsDir, "index.json"),
+      JSON.stringify({
+        schema: "acpx.session-index.v1",
+        files: ["s1.json"],
+        entries: [
+          {
+            file: "s1.json",
+            acpxRecordId: "s1",
+            acpSessionId: "s1",
+            agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+            cwd: "/workspace",
+            closed: false,
+            lastUsedAt: opts.at.toISOString(),
+            lastWriteAt: opts.at.toISOString(),
+            sessionModel: "fable",
+            profile: opts.profile,
+          },
+        ],
+      }),
+    );
+  };
+
   try {
-    await run({ entries, hits, usageHits });
+    await run({ entries, hits, home, seedFableActivity });
   } finally {
     server.close();
-    usageServer.close();
-    if (prev === undefined) {
-      delete process.env.CLAUDE_MESSAGES_ENDPOINT;
-    } else {
-      process.env.CLAUDE_MESSAGES_ENDPOINT = prev;
-    }
-    if (prevUsage === undefined) {
-      delete process.env.CLAUDE_OAUTH_USAGE_ENDPOINT;
-    } else {
-      process.env.CLAUDE_OAUTH_USAGE_ENDPOINT = prevUsage;
+    for (const [key, value] of [
+      ["CLAUDE_MESSAGES_ENDPOINT", prev.endpoint],
+      ["ACPX_FABLE_SNAPSHOT_DIR", prev.snapshotDir],
+      ["ACPX_STATE_HOME", prev.stateHome],
+    ] as const) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
     }
     await fs.rm(home, { recursive: true, force: true });
   }
+}
+
+function fableHits(hits: ProbeHit[]): ProbeHit[] {
+  return hits.filter((hit) => hit.model === FABLE);
 }
 
 test("isFableModel: alias, full id, bracketed variant, case-insensitive", () => {
@@ -219,63 +274,292 @@ test("isFableModel: alias, full id, bracketed variant, case-insensitive", () => 
   assert.equal(isFableModel(""), false);
 });
 
-// ---- DEGRADE path: usage default is 403 (no user:profile scope), so the fable
-// state falls back to the 1-token claude-fable-5 probe — the pre-poll behavior,
-// preserved for sub1/4/6 until they are re-provisioned (brick://a319745e). ----
+// ── Probe shape + classification ────────────────────────────────────────────
 
-test("degrade (403 no-scope) → probe HTTP 200 → available (no error), clean state cached", async () => {
-  const id = uid("avail");
+test("the fable probe carries the Claude-Code system prefix (the shape gate)", async () => {
+  const id = uid("shape");
+  await withProbeRig([{ id, outcomes: new Map([[FABLE, FABLE_200(0.33)]]) }], async (ctx) => {
+    await getSubscriptionsFableState(ctx.entries);
+    const [probe] = fableHits(ctx.hits);
+    assert.equal(probe?.system, CC_SYSTEM_PREFIX);
+  });
+});
+
+test("200 → available + REAL 7d_oi utilization/reset, persisted to the snapshot", async () => {
+  const id = uid("real200");
+  await withProbeRig([{ id, outcomes: new Map([[FABLE, FABLE_200(0.33)]]) }], async (ctx) => {
+    const state = (await getSubscriptionsFableState(ctx.entries)).get(id);
+    assert.equal(state?.available, true);
+    assert.equal(state?.error, undefined);
+    assert.equal(state?.utilization, 0.33);
+    assert.equal(state?.reset, new Date(FUTURE_RESET * 1000).toISOString());
+    assert.ok(state?.fetchedAt);
+
+    const snapshot = await readFableSnapshot(id);
+    assert.equal(snapshot?.utilization, 0.33);
+    assert.equal(snapshot?.status, "allowed");
+    assert.equal(snapshot?.available, true);
+    assert.equal(snapshot?.fetchedAt, state?.fetchedAt);
+  });
+});
+
+test("200 availability comes from res.ok ALONE — an unexpected status string cannot park it", async () => {
+  const id = uid("okwins");
   await withProbeRig(
-    [{ id, outcomes: new Map([[FABLE, { status: 200 }]]) }],
-    async ({ entries }) => {
-      const state = (await getSubscriptionsFableState(entries)).get(id);
+    [{ id, outcomes: new Map([[FABLE, { ...FABLE_200(0.7), fableStatus: "allowed_warning" }]]) }],
+    async (ctx) => {
+      const state = (await getSubscriptionsFableState(ctx.entries)).get(id);
       assert.equal(state?.available, true);
-      assert.equal(state?.error, undefined);
-      assert.equal(state?.utilization, null); // probe carries no real % (poll does)
-      assert.equal(state?.reset, null);
+      assert.equal(state?.utilization, 0.7);
     },
   );
 });
 
-test("degrade (403 no-scope) → probe HTTP 429 → clean exhaustion (available:false, NO error)", async () => {
+test("429 WITH unified headers → clean exhaustion (available:false, NO error, % kept)", async () => {
   const id = uid("exhausted");
-  await withProbeRig(
-    [{ id, outcomes: new Map([[FABLE, { status: 429 }]]) }],
-    async ({ entries }) => {
-      const state = (await getSubscriptionsFableState(entries)).get(id);
-      assert.equal(state?.available, false);
-      assert.equal(state?.error, undefined); // a clean 429 is NOT an error
-    },
-  );
+  await withProbeRig([{ id, outcomes: new Map([[FABLE, FABLE_429_EXHAUSTED]]) }], async (ctx) => {
+    const state = (await getSubscriptionsFableState(ctx.entries)).get(id);
+    assert.equal(state?.available, false);
+    assert.equal(state?.error, undefined);
+    assert.equal(state?.utilization, 1);
+  });
 });
 
-test("degrade (403 no-scope) → probe HTTP 401 → error set (unknown, not exhausted)", async () => {
+test("BARE 429 (shape gate) → UNKNOWN (error set), never a clean exhaustion", async () => {
+  const id = uid("bare429");
+  await withProbeRig([{ id, outcomes: new Map([[FABLE, FABLE_429_BARE]]) }], async (ctx) => {
+    const state = (await getSubscriptionsFableState(ctx.entries)).get(id);
+    assert.equal(state?.available, false);
+    assert.match(state?.error ?? "", /request-shape gate/);
+    // UNKNOWN is never persisted, so the next ask re-probes rather than inheriting it.
+    assert.equal((await readFableSnapshot(id))?.fetchedAt, undefined);
+  });
+});
+
+test("network error → UNKNOWN (error set), nothing persisted", async () => {
+  const id = uid("neterr");
+  await withProbeRig([{ id, outcomes: new Map([[FABLE, { destroy: true }]]) }], async (ctx) => {
+    const state = (await getSubscriptionsFableState(ctx.entries)).get(id);
+    assert.equal(state?.available, false);
+    assert.notEqual(state?.error, undefined);
+    assert.equal((await readFableSnapshot(id))?.fetchedAt, undefined);
+  });
+});
+
+test("HTTP 401 → error set (unknown, not exhausted)", async () => {
   const id = uid("auth");
-  await withProbeRig(
-    [{ id, outcomes: new Map([[FABLE, { status: 401 }]]) }],
-    async ({ entries }) => {
-      const state = (await getSubscriptionsFableState(entries)).get(id);
-      assert.equal(state?.available, false);
-      assert.match(state?.error ?? "", /authentication failed/);
-    },
-  );
+  await withProbeRig([{ id, outcomes: new Map([[FABLE, { status: 401 }]]) }], async (ctx) => {
+    const state = (await getSubscriptionsFableState(ctx.entries)).get(id);
+    assert.equal(state?.available, false);
+    assert.match(state?.error ?? "", /authentication failed/);
+  });
 });
 
 test("fable state: missing credentials → error (never a false exhaustion)", async () => {
   const id = uid("nocreds");
-  // Build an entry pointing at a dir with no .credentials.json.
-  const home = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fable-nc-"));
-  const entries: SubscriptionEntry[] = [
-    { id, label: id, configDir: path.join(home, "missing"), account: id },
-  ];
-  try {
+  await withProbeRig([{ id, outcomes: new Map() }], async (ctx) => {
+    const entries: SubscriptionEntry[] = [
+      { id, label: id, configDir: path.join(ctx.home, "missing"), account: id },
+    ];
     const state = (await getSubscriptionsFableState(entries)).get(id);
     assert.equal(state?.available, false);
     assert.match(state?.error ?? "", /no credentials/);
-  } finally {
-    await fs.rm(home, { recursive: true, force: true });
-  }
+  });
 });
+
+// ── Freshness / gating ──────────────────────────────────────────────────────
+
+test("AC2: a fresh snapshot is served with NO outbound fable probe", async () => {
+  const id = uid("fresh");
+  await withProbeRig([{ id, outcomes: new Map([[FABLE, FABLE_200(0.21)]]) }], async (ctx) => {
+    const first = (await getSubscriptionsFableState(ctx.entries)).get(id);
+    const second = (await getSubscriptionsFableState(ctx.entries)).get(id);
+    assert.equal(fableHits(ctx.hits).length, 1, "second read must serve the snapshot");
+    assert.equal(second?.utilization, 0.21);
+    assert.equal(second?.fetchedAt, first?.fetchedAt, "fetchedAt must not advance");
+  });
+});
+
+test("a reading older than the 2h cap is stale and re-probes", async () => {
+  const id = uid("maxage");
+  await withProbeRig([{ id, outcomes: new Map([[FABLE, FABLE_200(0.5)]]) }], async (ctx) => {
+    await getSubscriptionsFableState(ctx.entries);
+    // Age the reading past the cap; age the attempt so the min-interval guard is
+    // not what decides the outcome.
+    await patchFableSnapshot(id, {
+      fetchedAt: isoAgo(3 * HOUR_MS),
+      lastProbeAttemptAt: isoAgo(3 * HOUR_MS),
+    });
+    await getSubscriptionsFableState(ctx.entries);
+    assert.equal(fableHits(ctx.hits).length, 2);
+  });
+});
+
+test("a reading whose reset has passed is stale and re-probes", async () => {
+  const id = uid("reset");
+  await withProbeRig([{ id, outcomes: new Map([[FABLE, FABLE_200(0.5)]]) }], async (ctx) => {
+    await getSubscriptionsFableState(ctx.entries);
+    await patchFableSnapshot(id, {
+      resetsAt: isoAgo(60_000),
+      lastProbeAttemptAt: isoAgo(HOUR_MS),
+    });
+    await getSubscriptionsFableState(ctx.entries);
+    assert.equal(fableHits(ctx.hits).length, 2);
+  });
+});
+
+test("local fable activity since the reading makes it stale (gate keys off .profile)", async () => {
+  const id = uid("activity");
+  await withProbeRig([{ id, outcomes: new Map([[FABLE, FABLE_200(0.4)]]) }], async (ctx) => {
+    await getSubscriptionsFableState(ctx.entries);
+    assert.equal(fableHits(ctx.hits).length, 1);
+    // Reading taken an hour ago; a fable session on this ACCOUNT wrote since —
+    // reached through the registry's profiles[].account, because the index entry
+    // carries a PROFILE id and never an account.
+    await patchFableSnapshot(id, {
+      fetchedAt: isoAgo(HOUR_MS),
+      lastProbeAttemptAt: isoAgo(HOUR_MS),
+    });
+    await ctx.seedFableActivity({
+      account: id,
+      profile: `profile-${id}`,
+      at: new Date(Date.now() - 60_000),
+    });
+    await getSubscriptionsFableState(ctx.entries);
+    assert.equal(fableHits(ctx.hits).length, 2, "activity must invalidate the reading");
+  });
+});
+
+test("activity on ANOTHER account does not invalidate this one", async () => {
+  const id = uid("otheracct");
+  await withProbeRig([{ id, outcomes: new Map([[FABLE, FABLE_200(0.4)]]) }], async (ctx) => {
+    await getSubscriptionsFableState(ctx.entries);
+    await patchFableSnapshot(id, {
+      fetchedAt: isoAgo(HOUR_MS),
+      lastProbeAttemptAt: isoAgo(HOUR_MS),
+    });
+    await ctx.seedFableActivity({
+      account: "someone-else",
+      profile: `profile-${id}`,
+      at: new Date(Date.now() - 60_000),
+    });
+    await getSubscriptionsFableState(ctx.entries);
+    assert.equal(fableHits(ctx.hits).length, 1);
+  });
+});
+
+test("the activity gate can be switched off", async () => {
+  const id = uid("gateoff");
+  await withProbeRig([{ id, outcomes: new Map([[FABLE, FABLE_200(0.4)]]) }], async (ctx) => {
+    await getSubscriptionsFableState(ctx.entries);
+    await patchFableSnapshot(id, {
+      fetchedAt: isoAgo(HOUR_MS),
+      lastProbeAttemptAt: isoAgo(HOUR_MS),
+    });
+    await ctx.seedFableActivity({
+      account: id,
+      profile: `profile-${id}`,
+      at: new Date(Date.now() - 60_000),
+    });
+    process.env.ACPX_FABLE_ACTIVITY_GATE = "0";
+    try {
+      await getSubscriptionsFableState(ctx.entries);
+    } finally {
+      delete process.env.ACPX_FABLE_ACTIVITY_GATE;
+    }
+    assert.equal(fableHits(ctx.hits).length, 1, "gate off ⇒ activity does not invalidate");
+  });
+});
+
+test("the gated min-interval blocks a re-probe and serves the last reading instead", async () => {
+  const id = uid("mininterval");
+  await withProbeRig([{ id, outcomes: new Map([[FABLE, FABLE_200(0.4)]]) }], async (ctx) => {
+    await getSubscriptionsFableState(ctx.entries);
+    // Stale by the 2h cap, but the last attempt was 1 minute ago — inside the
+    // 5-minute gated interval, so the ask collapses onto the existing reading.
+    await patchFableSnapshot(id, {
+      fetchedAt: isoAgo(3 * HOUR_MS),
+      lastProbeAttemptAt: isoAgo(60_000),
+    });
+    const state = (await getSubscriptionsFableState(ctx.entries)).get(id);
+    assert.equal(fableHits(ctx.hits).length, 1);
+    assert.equal(state?.utilization, 0.4);
+  });
+});
+
+test("force bypasses freshness but still honors the 30s burst guard", async () => {
+  const id = uid("force");
+  await withProbeRig([{ id, outcomes: new Map([[FABLE, FABLE_200(0.6)]]) }], async (ctx) => {
+    await getSubscriptionsFableState(ctx.entries);
+    assert.equal(fableHits(ctx.hits).length, 1);
+    // Snapshot is FRESH; force re-probes it anyway (attempt aged past 30s).
+    await patchFableSnapshot(id, { lastProbeAttemptAt: isoAgo(60_000) });
+    await getSubscriptionsFableState(ctx.entries, "force");
+    assert.equal(fableHits(ctx.hits).length, 2, "force must bypass the freshness gate");
+    // A second force inside 30s collapses onto the reading just taken.
+    const state = (await getSubscriptionsFableState(ctx.entries, "force")).get(id);
+    assert.equal(fableHits(ctx.hits).length, 2, "burst collapse");
+    assert.equal(state?.utilization, 0.6);
+  });
+});
+
+test("the attempt stamp is claimed BEFORE the probe — an ask mid-flight does not re-probe", async () => {
+  const id = uid("burst");
+  await withProbeRig(
+    [{ id, outcomes: new Map([[FABLE, { ...FABLE_200(0.15), delayMs: 300 }]]) }],
+    async (ctx) => {
+      const inFlight = getSubscriptionsFableState(ctx.entries);
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      // The claim is already on disk even though no result exists yet — a second
+      // asker must collapse onto it. Stamped WITH the result instead, the whole
+      // request window would stay open for everyone to fire into.
+      assert.ok((await readFableSnapshot(id))?.lastProbeAttemptAt);
+      const second = (await getSubscriptionsFableState(ctx.entries)).get(id);
+      assert.equal(fableHits(ctx.hits).length, 1, "the claim-first stamp must collapse the burst");
+      assert.match(second?.error ?? "", /rate-limited/);
+      await inFlight;
+    },
+  );
+});
+
+// ── Real-turn exhaustion stamp ──────────────────────────────────────────────
+
+test("a real-turn stamp reports unavailable without advancing fetchedAt, and expires", async () => {
+  const id = uid("stamp");
+  await withProbeRig([{ id, outcomes: new Map([[FABLE, FABLE_200(0.2)]]) }], async (ctx) => {
+    const fresh = (await getSubscriptionsFableState(ctx.entries)).get(id);
+    assert.equal(fresh?.available, true);
+
+    await stampFableRealTurnExhausted(ctx.entries);
+    const snapshot = await readFableSnapshot(id);
+    assert.ok(snapshot?.exhaustedStampAt);
+    assert.equal(snapshot?.fetchedAt, fresh?.fetchedAt, "the stamp must not advance fetchedAt");
+    assert.equal(snapshot?.utilization, 0.2, "the stamp must not touch utilization");
+
+    const stamped = (await getSubscriptionsFableState(ctx.entries)).get(id);
+    assert.equal(stamped?.available, false);
+    assert.equal(fableHits(ctx.hits).length, 1, "the stamp is served, not re-probed");
+
+    // Past its 10-minute TTL the stamp is ignored and the normal rules resume —
+    // it must never become a box-wide sticky false negative for the full 2h cap.
+    await patchFableSnapshot(id, { exhaustedStampAt: isoAgo(30 * 60_000) });
+    const expired = (await getSubscriptionsFableState(ctx.entries)).get(id);
+    assert.equal(expired?.available, true, "an expired stamp must not stick");
+  });
+});
+
+test("a fresh reading supersedes an older real-turn stamp", async () => {
+  const id = uid("stampclear");
+  await withProbeRig([{ id, outcomes: new Map([[FABLE, FABLE_200(0.2)]]) }], async (ctx) => {
+    await stampFableRealTurnExhausted(ctx.entries);
+    await patchFableSnapshot(id, { exhaustedStampAt: isoAgo(30 * 60_000) });
+    const state = (await getSubscriptionsFableState(ctx.entries)).get(id);
+    assert.equal(state?.available, true);
+    assert.equal((await readFableSnapshot(id))?.exhaustedStampAt, undefined);
+  });
+});
+
+// ── Stitching + the non-fable cost gate ─────────────────────────────────────
 
 test("getSubscriptionsUsageWithFable: stitches fable onto usage + free fallback allocation", async () => {
   const id = uid("stitch");
@@ -294,14 +578,14 @@ test("getSubscriptionsUsageWithFable: stitches fable onto usage + free fallback 
               fallbackAvail: "available",
             },
           ],
-          [FABLE, { status: 429 }],
+          [FABLE, FABLE_200(0.11)],
         ]),
       },
     ],
-    async ({ entries }) => {
-      const [usage] = await getSubscriptionsUsageWithFable(entries);
-      // fable dimension stitched on
-      assert.equal(usage.fable?.available, false);
+    async (ctx) => {
+      const [usage] = await getSubscriptionsUsageWithFable(ctx.entries);
+      assert.equal(usage.fable?.available, true);
+      assert.equal(usage.fable?.utilization, 0.11);
       // free fallback ALLOCATION read from the haiku 200 (no extra request)
       assert.equal(usage.fallback?.percentage, 0.5);
       assert.equal(usage.fallback?.availability, "available");
@@ -312,7 +596,7 @@ test("getSubscriptionsUsageWithFable: stitches fable onto usage + free fallback 
   );
 });
 
-test("getSubscriptionsUsage (no fable): issues NO claude-fable-5 request (AC2 gate)", async () => {
+test("getSubscriptionsUsage (no fable): issues NO claude-fable-5 request (cost gate)", async () => {
   const id = uid("nofable");
   await withProbeRig(
     [
@@ -320,176 +604,17 @@ test("getSubscriptionsUsage (no fable): issues NO claude-fable-5 request (AC2 ga
         id,
         outcomes: new Map([
           [HAIKU, { status: 200, util5h: 0.1, util7h: 0.1 }],
-          [FABLE, { status: 429 }],
+          [FABLE, FABLE_200(0.1)],
         ]),
       },
     ],
-    async ({ entries, hits }) => {
-      await getSubscriptionsUsage(entries);
+    async (ctx) => {
+      await getSubscriptionsUsage(ctx.entries);
+      assert.equal(fableHits(ctx.hits).length, 0);
       assert.equal(
-        hits.some((h) => h.model === FABLE),
-        false,
-        "plain usage probe must never issue a claude-fable-5 request",
-      );
-      assert.equal(
-        hits.some((h) => h.model === HAIKU),
+        ctx.hits.some((hit) => hit.model === HAIKU),
         true,
       );
-    },
-  );
-});
-
-// ---- POLL path: /api/oauth/usage 200 with a weekly_scoped Fable window is the
-// PRIMARY source — real %, real reset, and it REPLACES the 1-token probe. ----
-
-test("poll 200 (Fable window) → real utilization + reset, and NO fable probe issued", async () => {
-  const id = uid("poll200");
-  await withProbeRig(
-    [
-      {
-        id,
-        // A fable probe outcome exists but must NOT be reached — the poll serves.
-        outcomes: new Map([[FABLE, { status: 429 }]]),
-        usage: {
-          data: [
-            { kind: "five_hour", percent: 0.24, resets_at: 1753437600, is_enabled: true },
-            { kind: "seven_day", percent: 0.46, resets_at: 1753441140, is_enabled: true },
-            fableWeekly(0.3),
-          ],
-        },
-      },
-    ],
-    async ({ entries, hits, usageHits }) => {
-      const state = (await getSubscriptionsFableState(entries)).get(id);
-      assert.equal(state?.available, true); // 0.30 < 1 ⇒ headroom
-      assert.equal(state?.error, undefined);
-      assert.equal(state?.utilization, 0.3); // REAL % from the weekly_scoped window
-      assert.equal(state?.reset, new Date(1753441140 * 1000).toISOString());
-      // the poll replaced the probe: usage endpoint hit, claude-fable-5 NOT
-      assert.equal(usageHits.length, 1);
-      assert.equal(
-        hits.some((h) => h.model === FABLE),
-        false,
-        "a served poll must not fall back to the 1-token fable probe",
-      );
-    },
-  );
-});
-
-test("poll 200 (Fable window at 100%) → available:false (clean exhaustion, no error)", async () => {
-  const id = uid("pollmaxed");
-  await withProbeRig(
-    [{ id, outcomes: new Map(), usage: { data: [fableWeekly(1)] } }],
-    async ({ entries }) => {
-      const state = (await getSubscriptionsFableState(entries)).get(id);
-      assert.equal(state?.available, false);
-      assert.equal(state?.error, undefined);
-      assert.equal(state?.utilization, 1);
-    },
-  );
-});
-
-test("poll 200 (no Fable window) → available:true, utilization/reset null (absence ≠ exhausted)", async () => {
-  const id = uid("pollnowin");
-  await withProbeRig(
-    [
-      {
-        id,
-        outcomes: new Map(),
-        usage: {
-          data: [{ kind: "five_hour", percent: 0.5, resets_at: 1753437600, is_enabled: true }],
-        },
-      },
-    ],
-    async ({ entries }) => {
-      const state = (await getSubscriptionsFableState(entries)).get(id);
-      assert.equal(state?.available, true);
-      assert.equal(state?.utilization, null);
-      assert.equal(state?.reset, null);
-      assert.equal(state?.error, undefined);
-    },
-  );
-});
-
-test("poll caches for the window: a second read issues NO further usage call", async () => {
-  const id = uid("pollcache");
-  await withProbeRig(
-    [{ id, outcomes: new Map(), usage: { data: [fableWeekly(0.42)] } }],
-    async ({ entries, usageHits }) => {
-      const first = (await getSubscriptionsFableState(entries)).get(id);
-      const second = (await getSubscriptionsFableState(entries)).get(id);
-      assert.equal(first?.utilization, 0.42);
-      assert.equal(second?.utilization, 0.42);
-      assert.equal(usageHits.length, 1, "second read must be served from cache");
-    },
-  );
-});
-
-test("forceRefresh re-polls (outside any back-off)", async () => {
-  const id = uid("pollforce");
-  await withProbeRig(
-    [{ id, outcomes: new Map(), usage: { data: [fableWeekly(0.5)] } }],
-    async ({ entries, usageHits }) => {
-      await getSubscriptionsFableState(entries);
-      await getSubscriptionsFableState(entries, true); // forceRefresh
-      assert.equal(usageHits.length, 2, "forceRefresh must issue a fresh poll");
-    },
-  );
-});
-
-test("poll 429 (Retry-After) → degrades to probe AND back-off blocks a forced re-poll", async () => {
-  const id = uid("poll429");
-  await withProbeRig(
-    [
-      {
-        id,
-        // degrade target: a 200 fable probe so the degraded state is `available`
-        outcomes: new Map([[FABLE, { status: 200 }]]),
-        usage: { status: 429, retryAfter: 3578 },
-      },
-    ],
-    async ({ entries, hits, usageHits }) => {
-      const first = (await getSubscriptionsFableState(entries)).get(id);
-      assert.equal(first?.available, true); // degraded to the probe
-      assert.equal(usageHits.length, 1);
-      assert.equal(
-        hits.some((h) => h.model === FABLE),
-        true,
-        "a 429 poll with no cache degrades to the 1-token probe",
-      );
-      // forceRefresh must NOT re-poll inside the Retry-After window (rate-limit budget)
-      await getSubscriptionsFableState(entries, true);
-      assert.equal(usageHits.length, 1, "back-off must block a forced re-poll");
-    },
-  );
-});
-
-test("poll picks the weekly_scoped Fable window, not five_hour / a non-Fable weekly", async () => {
-  const id = uid("pollpick");
-  await withProbeRig(
-    [
-      {
-        id,
-        outcomes: new Map(),
-        usage: {
-          data: [
-            { kind: "five_hour", percent: 0.9, resets_at: 1753437600, is_enabled: true },
-            {
-              kind: "weekly_scoped",
-              percent: 0.99,
-              resets_at: 1753400000,
-              is_enabled: true,
-              scope: { model: { display_name: "Opus 4.8" } },
-            },
-            fableWeekly(0.12, 1753441140),
-          ],
-        },
-      },
-    ],
-    async ({ entries }) => {
-      const state = (await getSubscriptionsFableState(entries)).get(id);
-      assert.equal(state?.utilization, 0.12); // the Fable weekly window, not 0.9 / 0.99
-      assert.equal(state?.reset, new Date(1753441140 * 1000).toISOString());
     },
   );
 });

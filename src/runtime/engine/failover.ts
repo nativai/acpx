@@ -21,6 +21,7 @@ import {
   maxedThreshold,
   maxUtilization,
   pickFailoverTarget,
+  stampFableRealTurnExhausted,
   subscriptionRanksStrictlyBetter,
   type SubscriptionUsage,
 } from "../../config/subscription-usage.js";
@@ -306,7 +307,14 @@ async function fableRateLimitShortCircuit(params: {
   loadOpts?: SubscriptionLookupOptions;
 }): Promise<{ isFableRateLimit: boolean; statusSnapshot?: string }> {
   const entries = loadSubscriptionRegistry(params.loadOpts).subscriptions;
-  const usages = await getSubscriptionsUsageWithFable(entries, true);
+  // Unified (haiku) is read FRESH — the classification gate below must not act on
+  // a stale "everything's fine". Fable is read GATED: this session's own record
+  // was just written, so the activity gate already trips for its account, and the
+  // 2h cap is the freshness contract for the rest (brick://1badc6f1).
+  const usages = await getSubscriptionsUsageWithFable(entries, {
+    forceUsageRefresh: true,
+    loadOpts: params.loadOpts,
+  });
   const threshold = maxedThreshold();
   if (!unifiedUsageHealthy(usages, threshold)) {
     return { isFableRateLimit: false }; // generic exhaustion, not fable-share
@@ -328,6 +336,7 @@ async function fableRateLimitShortCircuit(params: {
       await applyFableDegrade(params.record, { from: params.sessionModel });
       return { isFableRateLimit: false };
     }
+    await stampFableRealTurnExhausted(entries);
     await params.restoreOriginalSelection();
     throw new FableShareExhaustedError(statusSnapshot);
   }
@@ -341,11 +350,15 @@ async function fableRateLimitShortCircuit(params: {
 // Fable session. Re-throw it as FableShareExhaustedError, carrying over the
 // effective-account metadata the exhausted error already attached. Every non-Fable
 // path and every other error class propagates byte-identically.
-function convertFableTerminal(
+async function convertFableTerminal(
   loopError: unknown,
   fable: { isFableRateLimit: boolean; statusSnapshot?: string },
-): never {
+  loadOpts?: SubscriptionLookupOptions,
+): Promise<never> {
   if (fable.isFableRateLimit && loopError instanceof AllSubscriptionsExhaustedError) {
+    // REAL-TURN evidence (every fable-available sub 429'd on an actual turn) —
+    // stamp it so siblings on this box see the exhaustion without re-probing.
+    await stampFableRealTurnExhausted(loadSubscriptionRegistry(loadOpts).subscriptions);
     const converted = new FableShareExhaustedError(fable.statusSnapshot ?? loopError.message);
     attachEffectiveAccount(converted, errorEffectiveAccount(loopError));
     throw converted;
@@ -1148,9 +1161,12 @@ export async function enforceModelFloorBeforeTurn(
   if (entries.length === 0) {
     return;
   }
-  // Fresh probe (bypass the 5-min cache) so a floor decision never acts on a stale
-  // "available". getSubscriptionsFableState never rejects; a probe ERROR is UNKNOWN.
-  const states = [...(await getSubscriptionsFableState(entries, true)).values()];
+  // GATED read (brick://1badc6f1): the persisted snapshot's freshness contract —
+  // 2h hard cap, invalidated by this account's own fable activity — is what keeps
+  // a floor decision off a stale "available". This runs per TURN, so forcing here
+  // would probe every 30s forever for no added truth.
+  // getSubscriptionsFableState never rejects; a probe ERROR is UNKNOWN.
+  const states = [...(await getSubscriptionsFableState(entries, "gated", loadOpts)).values()];
   const anyAvailable = states.some((state) => state.available);
   const anyUnknown = states.some((state) => state.error !== undefined);
   if (anyAvailable || anyUnknown) {
@@ -1379,6 +1395,6 @@ export async function attemptFailoverAndRetry<T>(args: {
       }
     }
   } catch (loopError) {
-    return convertFableTerminal(loopError, fable);
+    return await convertFableTerminal(loopError, fable, args.loadOpts);
   }
 }

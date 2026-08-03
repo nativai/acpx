@@ -1,6 +1,10 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import type { SubscriptionEntry } from "./subscriptions.js";
+import { readSessionIndex, type SessionIndexEntry } from "../session/persistence/index.js";
+import { sessionBaseDir } from "../session/persistence/repository.js";
+import { patchFableSnapshot, readFableSnapshot, type FableSnapshot } from "./fable-snapshot.js";
+import { findProfile, loadProfileRegistry, type ProfileRegistry } from "./profiles.js";
+import type { SubscriptionEntry, SubscriptionLookupOptions } from "./subscriptions.js";
 
 // Native per-subscription usage probe. Mirrors acpx-ui/server/sessionUsage.ts
 // (kept independent — acpx must not depend on acpx-ui): for each subscription
@@ -41,23 +45,29 @@ export type SubscriptionFallbackAllocation = {
   availability: string | null;
 };
 
-// Per-account Fable state. PRIMARY source (brick://a319745e) is a poll of
-// GET /api/oauth/usage, which yields the REAL weekly Fable `utilization`/`reset`
-// from its response body. When that poll can't serve — the token lacks the
-// `user:profile` scope (403) or a rate-limit/network failure with no cache — the
-// state degrades to a 1-token claude-fable-5 probe (available boolean only;
-// utilization/reset null). `available` is the load-bearing field either way.
+// Per-account Fable state (brick://1badc6f1). The SOLE source is the 1-token
+// claude-fable-5 probe: its 200 carries the REAL Fable weekly window in the
+// `anthropic-ratelimit-unified-7d_oi-*` headers (the claude CLI's own label map
+// names `seven_day_overage_included` "Fable 5 limit"). `available` is the
+// load-bearing field; `utilization`/`reset` are the real numbers behind it.
 export type SubscriptionFableState = {
-  /** true ⇐ the weekly Fable window has headroom (poll percent < 1) or a 200 probe;
-   *  false ⇐ poll percent ≥ 1 or a 429 rate_limit_error. */
+  /** true ⇐ a 200 (Anthropic just SERVED fable — the strongest availability
+   *  evidence); false ⇐ a 429 that carried unified rate-limit headers (real
+   *  exhaustion) or a failed reading (then `error` is set — UNKNOWN, not
+   *  exhausted). */
   available: boolean;
-  /** REAL Fable utilization fraction [0,1] from /api/oauth/usage; null when the
-   *  poll didn't serve (degraded to the probe) or no Fable window was present. */
+  /** REAL Fable weekly utilization [0,1] from …-7d_oi-utilization; null when the
+   *  header was absent. */
   utilization: number | null;
-  /** REAL Fable reset (ISO-8601) from /api/oauth/usage; null when unavailable. */
+  /** REAL Fable weekly reset (ISO-8601) from …-7d_oi-reset; null when absent. */
   reset: string | null;
-  /** Present only when the reading itself failed (network/auth/timeout) — DISTINCT
-   *  from a clean exhaustion. When set, `available` is false and callers must treat
+  /** ISO time the served reading was taken. Present whenever the value came from
+   *  (or was written to) the persisted snapshot; acpx-ui maps it to `probedAt` so
+   *  the UI never has to guess a reading's age. */
+  fetchedAt?: string;
+  /** Present only when the reading itself failed (network/auth/timeout, or a BARE
+   *  429 carrying no rate-limit headers — the request-shape gate) — DISTINCT from
+   *  a clean exhaustion. When set, `available` is false and callers must treat
    *  availability as UNKNOWN, not exhausted (do not raise the terminal off it). */
   error?: string;
 };
@@ -125,47 +135,37 @@ function parseFallback(headers: Headers): SubscriptionFallbackAllocation | null 
   };
 }
 
-// One window object from the /api/oauth/usage `data` array. Ground-truth field
-// names from the binary-decompiled parser (brick://e0a1d05f FINDINGS §7): `kind`
-// (NOT `type`), `percent` (a 0.0–1.0 fraction despite the name), `resets_at`
-// (Unix epoch SECONDS, snake_case), and `scope.model.display_name` present on the
-// weekly_scoped windows only.
-type OAuthUsageWindow = {
-  kind?: string;
-  percent?: number;
-  resets_at?: number;
-  is_enabled?: boolean;
-  scope?: { model?: { display_name?: string } };
-};
-
-// The weekly-scoped Fable window from a /api/oauth/usage `data` array, or null:
-// `kind === "weekly_scoped"` AND a Fable model display name ("Fable 5"). Same
-// isFableModel substring gate the rest of the module keys on.
-function findFableWeeklyWindow(data: OAuthUsageWindow[]): OAuthUsageWindow | null {
-  return (
-    data.find(
-      (window) =>
-        window.kind === "weekly_scoped" && isFableModel(window.scope?.model?.display_name),
-    ) ?? null
-  );
+// The REAL Fable weekly window, read from a claude-fable-5 response's
+// `anthropic-ratelimit-unified-7d_oi-*` headers. `7d_oi` is
+// `seven_day_overage_included`, which the claude CLI's own label map names
+// "Fable 5 limit" — and it rides ONLY on fable-5 responses (a haiku 200 carries
+// 5h/7d but never 7d_oi). `-reset` equals the account's weekly 7d reset; the
+// UTILIZATION is the new information.
+function parseFableWindow(headers: Headers): {
+  utilization: number | null;
+  reset: string | null;
+  status: string | null;
+} {
+  const utilRaw = headers.get("anthropic-ratelimit-unified-7d_oi-utilization");
+  const util = utilRaw == null ? Number.NaN : Number(utilRaw);
+  const resetEpochSec = Number(headers.get("anthropic-ratelimit-unified-7d_oi-reset"));
+  return {
+    utilization: Number.isFinite(util) ? clamp01(util) : null,
+    reset: Number.isFinite(resetEpochSec) ? new Date(resetEpochSec * 1000).toISOString() : null,
+    status: headers.get("anthropic-ratelimit-unified-7d_oi-status"),
+  };
 }
 
-// Fable UTILIZATION from a /api/oauth/usage response `data` array: the
-// weekly_scoped Fable window's `percent` (clamped to [0,1]), or null when no such
-// window is present. Fills the former header stub (brick://a319745e) — the real %
-// now comes from the usage endpoint body, not a probe response header.
-function parseFallbackUtilization(data: OAuthUsageWindow[]): number | null {
-  const pct = findFableWeeklyWindow(data)?.percent;
-  return typeof pct === "number" && Number.isFinite(pct) ? clamp01(pct) : null;
-}
-
-// Fable RESET (ISO-8601) from a /api/oauth/usage response `data` array: the
-// weekly_scoped Fable window's `resets_at` (Unix epoch seconds → ISO), or null.
-function parseFallbackReset(data: OAuthUsageWindow[]): string | null {
-  const epoch = findFableWeeklyWindow(data)?.resets_at;
-  return typeof epoch === "number" && Number.isFinite(epoch)
-    ? new Date(epoch * 1000).toISOString()
-    : null;
+// Did this response carry ANY unified rate-limit header? It is the discriminator
+// between the two 429 classes: a 429 WITH unified headers is real exhaustion
+// (cacheable), a BARE 429 is the request-shape gate — UNKNOWN, never exhaustion.
+function hasUnifiedRateLimitHeaders(headers: Headers): boolean {
+  for (const [name] of headers) {
+    if (name.toLowerCase().startsWith("anthropic-ratelimit-unified-")) {
+      return true;
+    }
+  }
+  return false;
 }
 
 async function readSubscriptionToken(configDir: string): Promise<string | null> {
@@ -248,110 +248,104 @@ export function isFableModel(model: string | null | undefined): boolean {
   return typeof model === "string" && model.toLowerCase().includes("fable");
 }
 
-// Fable state cached by ACCOUNT (each subscription is its own Anthropic account;
-// /api/oauth/usage is per-account). Poll-sourced entries live for FABLE_POLL_TTL_MS
-// (1h); probe-degraded entries keep the shorter CACHE_TTL_MS.
-const fableCache = new Map<string, { value: SubscriptionFableState; expiresAt: number }>();
-// Per-account Retry-After back-off: never re-poll /api/oauth/usage before this
-// epoch-ms, even on forceRefresh — the endpoint is rate-limited to ~1 call/hr.
-const fablePollBackoffUntil = new Map<string, number>();
-
-// The dedicated per-model usage endpoint that powers the claude CLI `/usage`
-// screen's "Current week (Fable)" bar (brick://e0a1d05f). Returns real weekly
-// utilization %/reset for accounts whose OAuth token carries the `user:profile`
-// scope; others 403. Overridable so tests point it at a mock (never live).
-function oauthUsageEndpoint(): string {
-  return process.env.CLAUDE_OAUTH_USAGE_ENDPOINT ?? "https://api.anthropic.com/api/oauth/usage";
-}
-
-// ~1 call/hour/account rate limit ⇒ cache the derived state for an hour (a shorter
-// TTL just burns the single allowed call and gets 429s).
-const FABLE_POLL_TTL_MS = 60 * 60_000;
-
 // Each subscription is its own Anthropic account; fall back to id for legacy
-// registries where account defaults to id anyway.
+// registries where account defaults to id anyway. This is the snapshot key.
 function fableAccountKey(entry: SubscriptionEntry): string {
   return entry.account || entry.id;
 }
 
-type FablePollOutcome =
-  | { kind: "state"; value: SubscriptionFableState } // 200 → definitive reading
-  | { kind: "no-scope" } // 403 → token lacks user:profile; degrade to the probe
-  | { kind: "unavailable" }; // 429 / non-ok / network → serve cache or degrade
-
-// Back-off from a 429's Retry-After header (seconds → ms); falls back to the 1h
-// cache window when the header is absent/unparseable.
-function pollBackoffMs(res: Response): number {
-  const retryAfterSec = Number(res.headers.get("retry-after"));
-  return Number.isFinite(retryAfterSec) && retryAfterSec > 0
-    ? retryAfterSec * 1000
-    : FABLE_POLL_TTL_MS;
+function envMs(name: string, fallback: number): number {
+  const parsed = Number(process.env[name]?.trim());
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
-// Derive the fable state from a 200 /api/oauth/usage body. `available` = the weekly
-// Fable window still has headroom (percent < 1); NO Fable window ⇒ no separate
-// Fable cap detected ⇒ available (absence ≠ exhausted).
-function fableStateFromUsageBody(body: { data?: OAuthUsageWindow[] }): SubscriptionFableState {
-  const data = Array.isArray(body.data) ? body.data : [];
-  const utilization = parseFallbackUtilization(data);
+/** Hard freshness cap: a snapshot older than this is stale regardless of local
+ *  activity. It is the ONLY cover for cross-box spend on a shared account, so a
+ *  served reading is "real, and at most this old" — never "live". */
+function fableMaxAgeMs(): number {
+  return envMs("ACPX_FABLE_MAX_AGE_MS", 2 * 60 * 60_000);
+}
+
+/** Min interval between GATED probes for one account. Bounds steady-state probing
+ *  to ≤12/hr/account while fable runs continuously — without it the per-turn floor
+ *  check alone could drive ~120/hr. */
+function fableActivityMinIntervalMs(): number {
+  return envMs("ACPX_FABLE_ACTIVITY_MIN_INTERVAL_MS", 5 * 60_000);
+}
+
+/** Min interval between FORCED probes (`--reprobe`, the acpx-ui `?force=1` path).
+ *  Pure burst collapse: N simultaneous askers ⇒ one probe. */
+function fableForceMinIntervalMs(): number {
+  return envMs("ACPX_FABLE_FORCE_MIN_INTERVAL_MS", 30_000);
+}
+
+/** How long a REAL-TURN Fable exhaustion stays authoritative. Short by design: a
+ *  parked session stops producing fable activity, so nothing else would ever
+ *  invalidate the stamp and one boundary flap would park the whole box. */
+function fableExhaustedStampTtlMs(): number {
+  return envMs("ACPX_FABLE_EXHAUSTED_STAMP_TTL_MS", 10 * 60_000);
+}
+
+/** The local activity gate is on unless explicitly disabled (`0`/`false`/`off`). */
+function fableActivityGateEnabled(): boolean {
+  const raw = process.env.ACPX_FABLE_ACTIVITY_GATE?.trim().toLowerCase();
+  return raw !== "0" && raw !== "false" && raw !== "off";
+}
+
+// The Claude-Code system prefix. WITHOUT it Anthropic rejects every fable-5
+// request from a subscription OAuth token with a bare 429 carrying NO rate-limit
+// headers — a REQUEST-SHAPE gate, not quota. The prefix alone flips 429 → 200
+// (isolated live on sub7 2026-08-01 and sub4 2026-08-02); haiku probes are
+// unaffected. Every "fable throttled" the fleet showed before this line was a
+// false negative.
+const CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+type FableProbeResult = {
+  state: SubscriptionFableState;
+  /** Raw …-7d_oi-status, persisted as data; never read back into a decision. */
+  status: string | null;
+};
+
+function probeFailure(error: string): FableProbeResult {
+  return { state: { available: false, utilization: null, reset: null, error }, status: null };
+}
+
+/**
+ * Turn a fable-probe response into state. Deliberately asymmetric-safe:
+ *   - 200 ⇒ `available: true` from `res.ok` ALONE. Anthropic just served fable,
+ *     which is the strongest availability evidence there is; `7d_oi-status` and
+ *     utilization ride along as DATA and never flip `available` (a future
+ *     `allowed_warning`-style string must not park a working sub).
+ *   - 429 WITH unified rate-limit headers ⇒ real exhaustion (clean, no `error`).
+ *   - BARE 429 (no unified headers) ⇒ the request-shape gate, or anything else we
+ *     cannot read: `error` set ⇒ UNKNOWN, never a clean exhaustion.
+ */
+function classifyFableProbe(res: Response): FableProbeResult {
+  if (res.status === 401 || res.status === 403) {
+    return probeFailure("authentication failed — re-run `claude` for this subscription");
+  }
+  const clean = res.ok || (res.status === 429 && hasUnifiedRateLimitHeaders(res.headers));
+  if (!clean) {
+    return probeFailure(
+      res.status === 429
+        ? "fable probe rejected with no rate-limit headers (request-shape gate) — unknown"
+        : `HTTP ${res.status}`,
+    );
+  }
+  const window = parseFableWindow(res.headers);
   return {
-    available: utilization === null ? true : utilization < 1,
-    utilization,
-    reset: parseFallbackReset(data),
+    state: { available: res.ok, utilization: window.utilization, reset: window.reset },
+    status: window.status,
   };
 }
 
-// GET /api/oauth/usage for one account and derive its SubscriptionFableState from
-// the response BODY (brick://a319745e). A 429 records the Retry-After back-off.
-// Never throws — any failure degrades the caller to the 1-token probe.
-async function pollFableUsage(entry: SubscriptionEntry, token: string): Promise<FablePollOutcome> {
-  try {
-    const res = await fetch(oauthUsageEndpoint(), {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": "oauth-2025-04-20",
-        Accept: "application/json",
-      },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
-    if (res.status === 403) {
-      return { kind: "no-scope" };
-    }
-    if (res.status === 429) {
-      fablePollBackoffUntil.set(fableAccountKey(entry), Date.now() + pollBackoffMs(res));
-      return { kind: "unavailable" };
-    }
-    if (!res.ok) {
-      return { kind: "unavailable" };
-    }
-    return {
-      kind: "state",
-      value: fableStateFromUsageBody((await res.json()) as { data?: OAuthUsageWindow[] }),
-    };
-  } catch {
-    return { kind: "unavailable" };
-  }
-}
-
-// A dedicated 1-token claude-fable-5 probe. A 429 is a CLEAN exhaustion signal
-// (rejected before generation → no Fable quota consumed); a 200 consumes a sliver
-// of the scarce Fable allocation. Never rejects: any failure yields `error` set
-// and `available: false` (which callers must treat as UNKNOWN, not exhausted).
-// The DEGRADATION path (brick://a319745e): used for accounts whose token lacks the
-// `user:profile` scope /api/oauth/usage requires (403), preserving the pre-poll
-// behavior until they are re-provisioned. util/reset are null here — the real %
-// only comes from the usage endpoint body.
-//
-// VOLATILITY: this is a POINT-IN-TIME signal only. The Fable-share limit FLAPS
-// near its boundary — a probe-429 does NOT mean a real turn will fail (real fable
-// turns have been observed succeeding while this probe returned 429). Treat the
-// probe as ADVISORY (visibility/steering); the AUTHORITATIVE exhaustion signal is
-// a real-turn 429 → FableShareExhaustedError (failover.ts short-circuit).
-async function probeFableAvailability(
-  entry: SubscriptionEntry,
-  token: string,
-): Promise<SubscriptionFableState> {
+/**
+ * A dedicated 1-token claude-fable-5 probe — the ONLY tap on the real Fable
+ * weekly window (no passive source exists: a real turn's headers die inside the
+ * claude CLI process, and the transcript records only 429 error events). Cost:
+ * 31 input + 1 output tokens, quota-denominated. Never rejects.
+ */
+async function probeFableAvailability(token: string): Promise<FableProbeResult> {
   try {
     const res = await fetch(messagesEndpoint(), {
       method: "POST",
@@ -359,114 +353,234 @@ async function probeFableAvailability(
       body: JSON.stringify({
         model: FABLE_PROBE_MODEL,
         max_tokens: 1,
+        system: [{ type: "text", text: CLAUDE_CODE_SYSTEM_PREFIX }],
         messages: [{ role: "user", content: "." }],
       }),
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
-    if (res.status === 429) {
-      return { available: false, utilization: null, reset: null }; // CLEAN exhaustion
-    }
-    if (res.status === 401 || res.status === 403) {
-      return {
-        available: false,
-        utilization: null,
-        reset: null,
-        error: "authentication failed — re-run `claude` for this subscription",
-      };
-    }
-    if (res.ok) {
-      return { available: true, utilization: null, reset: null };
-    }
-    return { available: false, utilization: null, reset: null, error: `HTTP ${res.status}` };
+    return classifyFableProbe(res);
   } catch (err) {
-    return {
-      available: false,
-      utilization: null,
-      reset: null,
-      error: (err as Error).message || "network error",
-    };
+    return probeFailure((err as Error).message || "network error");
   }
 }
 
-function cachedFable(key: string): SubscriptionFableState | undefined {
-  const hit = fableCache.get(key);
-  if (hit && hit.expiresAt > Date.now()) {
-    return hit.value;
-  }
-  return undefined;
+/** How a caller wants the snapshot served. `gated` (the default everywhere,
+ *  including failover and auto-selection) probes only when the snapshot is stale;
+ *  `force` treats it as always stale, honoring only the 30s burst guard. Force is
+ *  reserved for the two explicit entry points: `--reprobe` and acpx-ui's
+ *  `?force=1`. */
+export type FableReadMode = "gated" | "force";
+
+/** Latest local fable ACTIVITY per account, in epoch ms — index-only, no
+ *  per-record read. An index entry counts when its model matches isFableModel
+ *  (the stored value is the alias "fable", which the substring match covers).
+ *
+ *  Account resolution reads `.profile` through the registry's `profiles[].account`
+ *  (exactly as failover's accountForEntry does), falling back to `.subscription`:
+ *  measured on the live index, 45/45 fable entries carry `.profile` and 0 carry
+ *  `.subscription`, so a `.subscription`-only gate is a total no-op. */
+/** The ACCOUNT a session-index entry runs on: `.profile` resolved through the
+ *  registry's `profiles[].account`, falling back to `.subscription`. */
+function accountForIndexEntry(
+  entry: SessionIndexEntry,
+  profiles: ProfileRegistry,
+): string | undefined {
+  const fromProfile = entry.profile ? findProfile(entry.profile, profiles)?.account : undefined;
+  return fromProfile ?? entry.subscription;
 }
 
-// Resolve the poll outcome, honoring the Retry-After back-off: inside the window we
-// must NOT re-poll (even on forceRefresh) — serve the last cached state if we have
-// one, else fall through to the probe (no-scope). Outside it, poll fresh.
-async function resolveFablePoll(
-  entry: SubscriptionEntry,
-  token: string,
-  key: string,
-): Promise<FablePollOutcome> {
-  if (Date.now() < (fablePollBackoffUntil.get(key) ?? 0)) {
-    const cached = fableCache.get(key);
-    return cached ? { kind: "state", value: cached.value } : { kind: "no-scope" };
+function fableActivityForEntry(
+  entry: SessionIndexEntry,
+  profiles: ProfileRegistry,
+): { account: string; at: number } | undefined {
+  if (!isFableModel(entry.sessionModel) && !isFableModel(entry.currentModelId)) {
+    return undefined;
   }
-  return pollFableUsage(entry, token);
+  const account = accountForIndexEntry(entry, profiles);
+  // lastWriteAt is the record-write time; lastUsedAt covers older index entries
+  // written before that projection existed.
+  const at = Date.parse(entry.lastWriteAt ?? entry.lastUsedAt);
+  return account === undefined || Number.isNaN(at) ? undefined : { account, at };
 }
 
-// Fable state for one entry: poll /api/oauth/usage first (real %, real reset), and
-// degrade to the 1-token claude-fable-5 probe when the poll can't serve — a 403
-// (no user:profile scope) or a rate-limit/network failure with no usable cache.
-// forceRefresh bypasses the value-cache TTL but NEVER the Retry-After back-off, so
-// failover's forced re-reads can't blow the ~1-call/hr endpoint budget.
-async function fableForEntry(
-  entry: SubscriptionEntry,
-  forceRefresh: boolean,
-): Promise<SubscriptionFableState> {
-  const key = fableAccountKey(entry);
-  if (!forceRefresh) {
-    const cached = cachedFable(key);
-    if (cached) {
-      return cached;
+async function fableActivityByAccount(
+  loadOpts?: SubscriptionLookupOptions,
+): Promise<Map<string, number>> {
+  const latest = new Map<string, number>();
+  const index = await readSessionIndex(sessionBaseDir()).catch(() => undefined);
+  if (!index) {
+    return latest;
+  }
+  const profiles = loadProfileRegistry(loadOpts);
+  for (const entry of index.entries) {
+    const activity = fableActivityForEntry(entry, profiles);
+    if (activity) {
+      latest.set(activity.account, Math.max(latest.get(activity.account) ?? 0, activity.at));
     }
   }
-  const token = await readSubscriptionToken(entry.configDir);
-  if (!token) {
-    return {
-      available: false,
-      utilization: null,
-      reset: null,
-      error: `no credentials at ${entry.configDir}/.credentials.json`,
-    };
-  }
+  return latest;
+}
 
-  const outcome = await resolveFablePoll(entry, token, key);
-  if (outcome.kind === "state") {
-    fableCache.set(key, { value: outcome.value, expiresAt: Date.now() + FABLE_POLL_TTL_MS });
-    return outcome.value;
+function snapshotState(snapshot: FableSnapshot): SubscriptionFableState | undefined {
+  if (snapshot.fetchedAt === undefined || snapshot.available === undefined) {
+    return undefined;
   }
+  return {
+    available: snapshot.available,
+    utilization: snapshot.utilization ?? null,
+    reset: snapshot.resetsAt ?? null,
+    fetchedAt: snapshot.fetchedAt,
+  };
+}
 
-  // Degrade to the 1-token probe. Cache BOTH a clean 200 (available) and a clean
-  // 429 (exhausted) — both definitive; never cache network/auth errors so a
-  // transient failure re-probes. Shorter TTL: the probe is near-real-time.
-  const probed = await probeFableAvailability(entry, token);
-  if (probed.error === undefined) {
-    fableCache.set(key, { value: probed, expiresAt: Date.now() + CACHE_TTL_MS });
+/** Is the snapshot's reading still servable without a probe? Stale ⇔ no reading ·
+ *  older than the hard cap · its reset has passed · local fable activity on this
+ *  account since it was taken. */
+function snapshotIsFresh(snapshot: FableSnapshot, now: number, activityAt: number): boolean {
+  const fetchedAt = Date.parse(snapshot.fetchedAt ?? "");
+  if (Number.isNaN(fetchedAt) || now - fetchedAt > fableMaxAgeMs()) {
+    return false;
   }
-  return probed;
+  const resetsAt = Date.parse(snapshot.resetsAt ?? "");
+  if (!Number.isNaN(resetsAt) && now >= resetsAt) {
+    return false;
+  }
+  return !(fableActivityGateEnabled() && activityAt > fetchedAt);
+}
+
+/** A real-turn exhaustion still inside its TTL. Reported as unavailable WITHOUT
+ *  utilization, because the stamp deliberately never advanced `fetchedAt`. */
+function activeExhaustedStamp(
+  snapshot: FableSnapshot,
+  now: number,
+): SubscriptionFableState | undefined {
+  const stampedAt = Date.parse(snapshot.exhaustedStampAt ?? "");
+  if (Number.isNaN(stampedAt) || now - stampedAt > fableExhaustedStampTtlMs()) {
+    return undefined;
+  }
+  return {
+    available: false,
+    utilization: snapshot.utilization ?? null,
+    reset: snapshot.resetsAt ?? null,
+    fetchedAt: snapshot.exhaustedStampAt,
+  };
+}
+
+function probeBlockedByMinInterval(
+  snapshot: FableSnapshot,
+  now: number,
+  mode: FableReadMode,
+): boolean {
+  const attemptedAt = Date.parse(snapshot.lastProbeAttemptAt ?? "");
+  const minInterval = mode === "force" ? fableForceMinIntervalMs() : fableActivityMinIntervalMs();
+  return !Number.isNaN(attemptedAt) && now - attemptedAt < minInterval;
 }
 
 /**
- * Fable state per entry, resolved in parallel and cached in a SEPARATE map (never
- * evicts/serves a haiku usage entry). Poll-sourced entries live 1h (the endpoint's
- * rate-limit window); probe-degraded entries keep the 5-min TTL. Never rejects.
- * `forceRefresh` bypasses the value-cache TTL (a fresh read — for pre-spawn /
- * failover decisions so a Fable decision never acts on a stale "available") but
- * still honors the per-account Retry-After back-off so it can't over-poll.
+ * Fable state for one entry, served from the persisted snapshot and probing only
+ * when it is stale. Order: a live real-turn exhaustion stamp wins → a fresh
+ * snapshot is served with NO outbound probe → otherwise probe, unless the
+ * applicable min-interval guard collapses this ask onto an in-flight/recent one
+ * (the guard only rate-limits probing; it never causes a refresh). There is no
+ * background poller anywhere.
+ */
+async function fableForEntry(
+  entry: SubscriptionEntry,
+  mode: FableReadMode,
+  activityAt: number,
+): Promise<SubscriptionFableState> {
+  const key = fableAccountKey(entry);
+  const snapshot = (await readFableSnapshot(key)) ?? {};
+  const now = Date.now();
+
+  const stamped = activeExhaustedStamp(snapshot, now);
+  if (stamped) {
+    return stamped;
+  }
+  const served = snapshotState(snapshot);
+  if (mode === "gated" && served && snapshotIsFresh(snapshot, now, activityAt)) {
+    return served;
+  }
+  if (probeBlockedByMinInterval(snapshot, now, mode)) {
+    return served ?? unknownFableState("fable probe rate-limited; no reading yet");
+  }
+
+  return await probeAndPersist(entry, key, now);
+}
+
+/** Claim the attempt, probe, and persist a clean reading. */
+async function probeAndPersist(
+  entry: SubscriptionEntry,
+  key: string,
+  now: number,
+): Promise<SubscriptionFableState> {
+  const token = await readSubscriptionToken(entry.configDir);
+  if (!token) {
+    return unknownFableState(`no credentials at ${entry.configDir}/.credentials.json`);
+  }
+  // Claim FIRST — stamping the attempt before the request is what makes the guard
+  // collapse N simultaneous askers; stamping it with the RESULT would leave the
+  // whole 10s request window open for everyone to fire into.
+  await patchFableSnapshot(key, { lastProbeAttemptAt: new Date(now).toISOString() });
+
+  const { state, status } = await probeFableAvailability(token);
+  if (state.error !== undefined) {
+    return state; // UNKNOWN — never persisted, so the next ask re-probes
+  }
+  const fetchedAt = new Date().toISOString();
+  await patchFableSnapshot(key, {
+    fetchedAt,
+    available: state.available,
+    utilization: state.utilization,
+    resetsAt: state.reset,
+    status,
+    // A fresh reading supersedes any real-turn stamp (JSON.stringify drops it).
+    exhaustedStampAt: undefined,
+  });
+  return { ...state, fetchedAt };
+}
+
+function unknownFableState(error: string): SubscriptionFableState {
+  return { available: false, utilization: null, reset: null, error };
+}
+
+/**
+ * Record a REAL-TURN Fable-share exhaustion for these accounts — the
+ * authoritative signal (FableShareExhaustedError), distinct from any probe.
+ * Deliberately does NOT advance `fetchedAt` or touch `utilization`, so it expires
+ * on its own short TTL instead of masquerading as a fresh reading for hours.
+ */
+export async function stampFableRealTurnExhausted(entries: SubscriptionEntry[]): Promise<void> {
+  const at = new Date().toISOString();
+  await Promise.all(
+    entries.map((entry) => patchFableSnapshot(fableAccountKey(entry), { exhaustedStampAt: at })),
+  );
+}
+
+/**
+ * Fable state per entry, resolved in parallel from the persisted per-account
+ * snapshot. Never rejects. `mode` defaults to `gated` — including on the failover
+ * and auto-selection paths, whose own session activity already trips the gate;
+ * `force` belongs only to `--reprobe` and acpx-ui's explicit `?force=1`.
  */
 export async function getSubscriptionsFableState(
   entries: SubscriptionEntry[],
-  forceRefresh = false,
+  mode: FableReadMode = "gated",
+  loadOpts?: SubscriptionLookupOptions,
 ): Promise<Map<string, SubscriptionFableState>> {
+  // One index read for the whole sweep, never one per entry.
+  const activity =
+    mode === "gated" && fableActivityGateEnabled()
+      ? await fableActivityByAccount(loadOpts)
+      : new Map<string, number>();
   const results = await Promise.all(
-    entries.map(async (entry) => [entry.id, await fableForEntry(entry, forceRefresh)] as const),
+    entries.map(
+      async (entry) =>
+        [
+          entry.id,
+          await fableForEntry(entry, mode, activity.get(fableAccountKey(entry)) ?? 0),
+        ] as const,
+    ),
   );
   return new Map(results);
 }
@@ -474,14 +588,21 @@ export async function getSubscriptionsFableState(
 /**
  * Probe usage AND fable, stitching each fable state onto its SubscriptionUsage.
  * Used by the CLI and by fable-aware selection so callers get one enriched list.
+ * The two halves are independent: `forceUsageRefresh` bypasses the 5-min haiku
+ * cache (failover's fresh-read requirement), while the fable half follows its own
+ * snapshot rules under `fableMode`.
  */
 export async function getSubscriptionsUsageWithFable(
   entries: SubscriptionEntry[],
-  forceRefresh = false,
+  options: {
+    forceUsageRefresh?: boolean;
+    fableMode?: FableReadMode;
+    loadOpts?: SubscriptionLookupOptions;
+  } = {},
 ): Promise<SubscriptionUsage[]> {
   const [usages, fable] = await Promise.all([
-    getSubscriptionsUsage(entries, forceRefresh),
-    getSubscriptionsFableState(entries, forceRefresh),
+    getSubscriptionsUsage(entries, options.forceUsageRefresh ?? false),
+    getSubscriptionsFableState(entries, options.fableMode ?? "gated", options.loadOpts),
   ]);
   for (const usage of usages) {
     const state = fable.get(usage.id);
