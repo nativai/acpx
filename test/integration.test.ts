@@ -1016,6 +1016,168 @@ test("integration: exec forwards model, allowed-tools, and max-turns in session/
   });
 });
 
+// ---------------------------------------------------------------------------
+// brick 589f0062 — the injected primer renders in the SESSION's environment.
+//
+// End-to-end because the defect lived in the WIRING, not in the renderer: the
+// guard engine was sound and its unit tests passed the whole time the primer was
+// being rendered under acpx's own env. What has to be exercised is the real path
+// — session record → agent spawn env → primer render → session/new `_meta` —
+// with a spawner env that CONTRADICTS the child's, in both directions.
+// ---------------------------------------------------------------------------
+
+/** Stand-in for agents.md's two `if_env=` includes, plus an unguarded control. */
+const GUARDED_PRIMER_BODY = [
+  "#!/bin/sh",
+  "printf 'HOST-BLOCK\\n'",
+  `[ -n "\${ACPX_PARENT_SESSION_URL:-}" ] && printf 'PARENT-BLOCK\\n'`,
+  `[ -n "\${ACPX_BRICK:-}" ] && printf 'BRICK-BLOCK\\n'`,
+  "exit 0",
+  "",
+].join("\n");
+
+const SPAWNER_PARENT_URL =
+  "https://acpx.example.test/?session=99999999-9999-9999-9999-999999999999";
+const SPAWNER_BRICK = "99999999-8888-7777-6666-555555555555";
+const CHILD_PARENT_URL = "https://acpx.example.test/?session=11111111-1111-1111-1111-111111111111";
+const CHILD_BRICK = "589f0062-9bc2-46cf-927d-dfec8c450683";
+
+async function writeGuardedPrimerScript(): Promise<string> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-primer-"));
+  const scriptPath = path.join(dir, "primer.sh");
+  await fs.writeFile(scriptPath, GUARDED_PRIMER_BODY, { mode: 0o755 });
+  return scriptPath;
+}
+
+/** The primer text acpx actually put on the wire for the session it created. */
+function injectedPrimerFromStdout(stdout: string): string {
+  const payloads = parseJsonRpcOutputLines(stdout);
+  const createRequest = payloads.find((payload) => payload.method === "session/new") as
+    | { params?: { _meta?: { systemPrompt?: { append?: string } } } }
+    | undefined;
+  assert(createRequest, `expected a session/new request in:\n${stdout}`);
+  return createRequest.params?._meta?.systemPrompt?.append ?? "";
+}
+
+test("integration: injected primer renders the CHILD's env — parent+brick fragments reach a child spawned from a spawner that has neither", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const claudeCompatibleAgentCommand = `${MOCK_AGENT_COMMAND} --claude-agent-acp`;
+    const scriptPath = await writeGuardedPrimerScript();
+    // runCli already strips ACPX_PARENT_SESSION_URL / ACPX_BRICK from the child
+    // CLI's env, so the spawning acpx process here genuinely has neither.
+    const spawnerEnv = { env: { ACPX_SESSION_PRIMER_COMMAND: scriptPath } };
+
+    try {
+      const created = await runCli(
+        [
+          "--agent",
+          claudeCompatibleAgentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "sessions",
+          "new",
+          "--parent-session-url",
+          CHILD_PARENT_URL,
+          "--brick",
+          CHILD_BRICK,
+        ],
+        homeDir,
+        spawnerEnv,
+      );
+      assert.equal(created.code, 0, created.stderr);
+
+      const result = await runCli(
+        [
+          "--agent",
+          claudeCompatibleAgentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "prompt",
+          "echo primer",
+        ],
+        homeDir,
+        spawnerEnv,
+      );
+      assert.equal(result.code, 0, result.stderr);
+
+      const primer = injectedPrimerFromStdout(result.stdout);
+      assert.match(primer, /HOST-BLOCK/);
+      assert.match(primer, /PARENT-BLOCK/, "child has a parent — parent-reporting must reach it");
+      assert.match(primer, /BRICK-BLOCK/, "child has a brick — brick priming must reach it");
+    } finally {
+      await fs.rm(path.dirname(scriptPath), { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: injected primer renders the CHILD's env — a parentless, brickless child gets neither fragment though the spawner has both", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const claudeCompatibleAgentCommand = `${MOCK_AGENT_COMMAND} --claude-agent-acp`;
+    const scriptPath = await writeGuardedPrimerScript();
+    // The spawning acpx process carries ITS OWN parent + brick, as a real agent
+    // shell does. Neither belongs to the session it is creating.
+    const spawnerEnv = {
+      env: {
+        ACPX_SESSION_PRIMER_COMMAND: scriptPath,
+        ACPX_PARENT_SESSION_URL: SPAWNER_PARENT_URL,
+        ACPX_BRICK: SPAWNER_BRICK,
+      },
+    };
+
+    try {
+      const created = await runCli(
+        [
+          "--agent",
+          claudeCompatibleAgentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "sessions",
+          "new",
+          "--no-brick",
+        ],
+        homeDir,
+        spawnerEnv,
+      );
+      assert.equal(created.code, 0, created.stderr);
+
+      const result = await runCli(
+        [
+          "--agent",
+          claudeCompatibleAgentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "prompt",
+          "echo primer",
+        ],
+        homeDir,
+        spawnerEnv,
+      );
+      assert.equal(result.code, 0, result.stderr);
+
+      const primer = injectedPrimerFromStdout(result.stdout);
+      // Positive control — the primer DID render, so the absences below are the
+      // guards answering "no", not a fail-open empty primer.
+      assert.match(primer, /HOST-BLOCK/);
+      assert.doesNotMatch(primer, /PARENT-BLOCK/, "the spawner's parent is not the child's");
+      assert.doesNotMatch(primer, /BRICK-BLOCK/, "the spawner's brick is not the child's");
+    } finally {
+      await fs.rm(path.dirname(scriptPath), { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: exec --no-terminal disables advertised terminal capability", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));

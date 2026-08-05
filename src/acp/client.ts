@@ -555,6 +555,16 @@ export class AcpClient {
   private lastKnownPid?: number;
   private latestProvisioningWarning?: ProvisioningWarningBreadcrumb;
   private lastEffectiveAccountMetadata?: EffectiveAccountMetadata;
+  /**
+   * The environment THIS session's agent process was spawned with — the exact
+   * `buildAgentSpawnOptions().env`, captured in `start()` after `applyProfileEnv`.
+   * The OS primer is rendered against it (`buildPrimerSessionMeta`) so an
+   * `if_env=` guard in agents.md sees the CHILD's environment, not the acpx
+   * process's own (== the SPAWNER's). Deliberately the whole env object rather
+   * than a copied subset: a var added to the child env, or a new guard added to
+   * agents.md, then reaches the primer with no change here.
+   */
+  private agentSpawnEnv?: NodeJS.ProcessEnv;
   private readonly promptPermissionFailures = new Map<string, PermissionPromptUnavailableError>();
   private readonly pendingConnectionRequests = new Set<PendingConnectionRequest>();
 
@@ -733,6 +743,7 @@ export class AcpClient {
     this.logAgentLaunch(launch);
     await this.ensureLaunchSupport(launch);
     this.lastEffectiveAccountMetadata = effectiveAccountMetadataFromEnv(launch.spawnOptions.env);
+    this.agentSpawnEnv = launch.spawnOptions.env;
     const child = await this.spawnAgentProcess(launch);
     this.closing = false;
     this.agentStartedAt = isoNow();
@@ -1176,7 +1187,7 @@ export class AcpClient {
     ) {
       return undefined;
     }
-    const primer = await resolveSessionPrimer();
+    const primer = await resolveSessionPrimer(this.agentSpawnEnv);
     const brickContext = await this.resolveBrickContext();
     return buildPrimerSessionMeta(channel, primer, optionsMeta?.systemPrompt, brickContext);
   }
@@ -1198,7 +1209,7 @@ export class AcpClient {
     if (typeof optionsMeta?.systemPrompt === "string" && optionsMeta.systemPrompt.length > 0) {
       return undefined;
     }
-    const primer = await resolveSessionPrimer();
+    const primer = await resolveSessionPrimer(this.agentSpawnEnv);
     const brickContext = await this.resolveBrickContext();
     return buildPrimerSessionMeta(channel, primer, optionsMeta?.systemPrompt, brickContext);
   }

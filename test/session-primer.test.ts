@@ -187,6 +187,108 @@ test("resolveSessionPrimer: fail-open (empty output) returns undefined", async (
   });
 });
 
+// ---------------------------------------------------------------------------
+// brick 589f0062 — the primer renders in the SESSION's environment
+//
+// agents.md gates fragments on `if_env="…"`, and those guards are evaluated by
+// whatever process renders the primer. acpx used to render under its OWN env, so
+// the guards answered for the SPAWNER: a child spawned WITH a parent lost the
+// parent-reporting fragment, and a brick-less child spawned FROM a brick-holding
+// parent was told to run `brick context "$ACPX_BRICK"` against an unset var.
+//
+// A unit test of the include guard itself passes either way — it did while the
+// defect was live. What has to be asserted is that the CHILD's values win over a
+// contradicting spawner env, in both directions.
+// ---------------------------------------------------------------------------
+
+/** Stand-in for agents.md's two env-guarded includes, with a positive control. */
+const GUARDED_PRIMER_SCRIPT = [
+  "printf 'HOST-BLOCK\\n'",
+  `[ -n "\${ACPX_PARENT_SESSION_URL:-}" ] && printf 'PARENT-BLOCK\\n'`,
+  `[ -n "\${ACPX_BRICK:-}" ] && printf 'BRICK-BLOCK\\n'`,
+  "exit 0",
+].join("\n");
+
+const CHILD_PARENT_URL = "https://acpx.example.test/?session=11111111-1111-1111-1111-111111111111";
+const CHILD_BRICK = "589f0062-9bc2-46cf-927d-dfec8c450683";
+
+async function withProcessEnv(
+  overrides: Record<string, string | undefined>,
+  run: () => Promise<void>,
+): Promise<void> {
+  const previous = new Map(Object.keys(overrides).map((key) => [key, process.env[key]]));
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+  try {
+    await run();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+}
+
+test("resolveSessionPrimer: a child WITH parent+brick gets both fragments though acpx's own env has neither", async () => {
+  await withPrimerScript(GUARDED_PRIMER_SCRIPT, async () => {
+    await withProcessEnv(
+      { ACPX_PARENT_SESSION_URL: undefined, ACPX_BRICK: undefined },
+      async () => {
+        const primer = await resolveSessionPrimer({
+          ...process.env,
+          ACPX_PARENT_SESSION_URL: CHILD_PARENT_URL,
+          ACPX_BRICK: CHILD_BRICK,
+        });
+        assert.match(primer ?? "", /HOST-BLOCK/);
+        assert.match(primer ?? "", /PARENT-BLOCK/);
+        assert.match(primer ?? "", /BRICK-BLOCK/);
+      },
+    );
+  });
+});
+
+test("resolveSessionPrimer: a child WITHOUT parent+brick gets neither fragment though acpx's own env has both", async () => {
+  await withPrimerScript(GUARDED_PRIMER_SCRIPT, async () => {
+    await withProcessEnv(
+      { ACPX_PARENT_SESSION_URL: CHILD_PARENT_URL, ACPX_BRICK: CHILD_BRICK },
+      async () => {
+        const childEnv = { ...process.env };
+        delete childEnv.ACPX_PARENT_SESSION_URL;
+        delete childEnv.ACPX_BRICK;
+        const primer = await resolveSessionPrimer(childEnv);
+        // Positive control: the primer DID render — the absences below are the
+        // guards answering "no", not a fail-open undefined.
+        assert.match(primer ?? "", /HOST-BLOCK/);
+        assert.doesNotMatch(primer ?? "", /PARENT-BLOCK/);
+        assert.doesNotMatch(primer ?? "", /BRICK-BLOCK/);
+      },
+    );
+  });
+});
+
+test("resolveSessionPrimer: the memo is keyed on the render env — a second session re-renders", async () => {
+  await withPrimerScript(GUARDED_PRIMER_SCRIPT, async () => {
+    const withBrick = await resolveSessionPrimer({ ...process.env, ACPX_BRICK: CHILD_BRICK });
+    assert.match(withBrick ?? "", /BRICK-BLOCK/);
+    // Same acpx process, second session, different env: an unkeyed memo would
+    // hand this session the previous one's fragments.
+    const withoutBrick = { ...process.env };
+    delete withoutBrick.ACPX_BRICK;
+    const second = await resolveSessionPrimer(withoutBrick);
+    assert.doesNotMatch(second ?? "", /BRICK-BLOCK/);
+    // …and an unchanged env still hits the memo (no re-exec).
+    assert.equal(await resolveSessionPrimer(withoutBrick), second);
+  });
+});
+
 test("resolveSessionPrimer: a failure is NOT memoized — a later success still resolves", async () => {
   const previous = process.env.ACPX_SESSION_PRIMER_COMMAND;
   resetSessionPrimerMemoForTests();
