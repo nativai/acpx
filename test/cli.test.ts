@@ -7440,9 +7440,11 @@ function parseCliJsonError(stdout: string): { message: string; detailCode: strin
   const parsed = JSON.parse(line) as {
     error?: { message?: unknown; data?: { detailCode?: unknown } };
   };
+  const message = parsed.error?.message;
+  const detailCode = parsed.error?.data?.detailCode;
   return {
-    message: String(parsed.error?.message ?? ""),
-    detailCode: String(parsed.error?.data?.detailCode ?? ""),
+    message: typeof message === "string" ? message : "",
+    detailCode: typeof detailCode === "string" ? detailCode : "",
   };
 }
 
