@@ -5,6 +5,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
+import { exportSession } from "../src/session/export.js";
+import { importSession } from "../src/session/import.js";
 import {
   appendFinalizedMessagesToLog,
   compactMessagesLog,
@@ -369,6 +371,114 @@ test("boundary migration renames a pointer-less pre-existing log before writing 
       base_index: 0,
       bytes: Buffer.byteLength(serializeMessages(freshMessages)),
     });
+  });
+});
+
+test("boundary writes converge a zero-message record to split form", async () => {
+  await withTempHome("acpx-messages-log-", async (homeDir) => {
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    await writeRawRecord(homeDir, sessionRecord("converge-empty", []));
+    // Positive control, same execution: a record WITH messages, driven through
+    // the identical harness. If the boundary write were dead, or the temp home
+    // were not wired up, this arm fails loudly on its own — so the empty arm's
+    // assertions below cannot pass vacuously.
+    const controlMessages = [userMessage(1), agentMessage(2)];
+    await writeRawRecord(
+      homeDir,
+      sessionRecord("converge-control", structuredClone(controlMessages)),
+    );
+
+    // Pre-state: both records are genuinely NOT split yet — no pointer, no log.
+    assert.equal((await readRawRecord(homeDir, "converge-empty")).messages_log, undefined);
+    assert.equal(await fileExists(messagesLogPath(sessionDir, "converge-empty")), false);
+
+    await writeSessionRecordAtBoundary(await resolveSessionRecord("converge-empty"));
+    await writeSessionRecordAtBoundary(await resolveSessionRecord("converge-control"));
+
+    const emptyLogPath = messagesLogPath(sessionDir, "converge-empty");
+    const emptyState = { v: 1, count: 0, base_index: 0, bytes: 0 };
+    const firstEmpty = await readRawRecord(homeDir, "converge-empty");
+    assert.deepEqual(firstEmpty.messages, []);
+    assert.deepEqual(firstEmpty.messages_log, emptyState);
+    assert.equal(await fs.readFile(emptyLogPath, "utf8"), "");
+
+    const firstControl = await readRawRecord(homeDir, "converge-control");
+    assert.deepEqual(firstControl.messages, []);
+    assert.deepEqual(firstControl.messages_log, {
+      v: 1,
+      count: controlMessages.length,
+      base_index: 0,
+      bytes: Buffer.byteLength(serializeMessages(controlMessages)),
+    });
+
+    // Convergence is the point: a SECOND boundary write must be a fixed point.
+    // Before the fix the empty record came back pointer-less on every write, so
+    // it re-migrated forever. The stderr assertion is load-bearing — writing the
+    // pointer without its log file would make prepareMessagesLogForBoundary
+    // self-heal it back to undefined here, warning as it goes, which is
+    // oscillation wearing convergence's clothes.
+    const { stderr } = await captureStderr(async () => {
+      await writeSessionRecordAtBoundary(await resolveSessionRecord("converge-empty"));
+      await writeSessionRecordAtBoundary(await resolveSessionRecord("converge-control"));
+    });
+    assert.doesNotMatch(stderr, /messages log missing/);
+
+    assert.deepEqual(await readRawRecord(homeDir, "converge-empty"), firstEmpty);
+    assert.deepEqual(await readRawRecord(homeDir, "converge-control"), firstControl);
+    assert.equal(await fs.readFile(emptyLogPath, "utf8"), "");
+
+    // The control's content survives the round trip; the empty record stays empty.
+    assert.deepEqual((await resolveSessionRecord("converge-control")).messages, controlMessages);
+    assert.deepEqual((await resolveSessionRecord("converge-empty")).messages, []);
+  });
+});
+
+// The one place converging empty records changes an on-disk artifact that OTHER
+// code consumes: an empty session's export archive now carries a messages_log
+// block (data: "") where it previously carried nothing at all. Read-of-source
+// said restoreImportedMessagesLog accepts it; this runs it.
+test("an empty record's converged split form round-trips through export and import", async () => {
+  await withTempHome("acpx-messages-log-", async (homeDir) => {
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const archivePath = path.join(homeDir, "empty-archive.json");
+    const emptyState = { v: 1, count: 0, base_index: 0, bytes: 0 };
+
+    await writeRawRecord(
+      homeDir,
+      sessionRecord("roundtrip-empty", [], { cwd, name: "roundtrip-empty" }),
+    );
+    await writeSessionRecordAtBoundary(await resolveSessionRecord("roundtrip-empty"));
+
+    await exportSession({ sessionId: "roundtrip-empty" }, archivePath);
+    const archive = JSON.parse(await fs.readFile(archivePath, "utf8")) as {
+      messages_log?: Record<string, unknown>;
+    };
+    assert.deepEqual(archive.messages_log, {
+      path: ".messages.ndjson",
+      state: emptyState,
+      data: "",
+      inline_count: 0,
+    });
+
+    await fs.rm(sessionFilePath(homeDir, "roundtrip-empty"));
+    await fs.rm(messagesLogPath(sessionDir, "roundtrip-empty"));
+
+    const imported = await importSession(archivePath, { name: "roundtrip-empty-imported" });
+    const importedRaw = await readRawRecord(homeDir, imported.record_id);
+    assert.deepEqual(importedRaw.messages, []);
+    assert.deepEqual(importedRaw.messages_log, emptyState);
+    assert.equal(await fs.readFile(messagesLogPath(sessionDir, imported.record_id), "utf8"), "");
+    assert.deepEqual((await resolveSessionRecord(imported.record_id)).messages, []);
+
+    // The imported record is itself already converged — no re-migration, and no
+    // self-heal warning that would mean the pointer and its log disagree.
+    const { stderr } = await captureStderr(async () => {
+      await writeSessionRecordAtBoundary(await resolveSessionRecord(imported.record_id));
+    });
+    assert.doesNotMatch(stderr, /messages log missing/);
+    assert.deepEqual(await readRawRecord(homeDir, imported.record_id), importedRaw);
   });
 });
 

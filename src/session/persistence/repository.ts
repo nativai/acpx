@@ -13,6 +13,7 @@ import {
   clearMissingMessagesLogPointerForWrite,
   compactMessagesLog,
   hydrateSessionMessagesFromLog,
+  initializeEmptyMessagesLog,
   messagesLogFileName,
   messagesLogPath,
   messagesLogStalePath,
@@ -394,6 +395,15 @@ async function writeMessagesLogBoundary(record: SessionRecord, logPath: string):
   await appendFinalizedMessagesToLog(record, logPath, messagesToAppend);
   if (messagesToAppend.length > 0) {
     markAllMessagesLogged(record);
+  }
+
+  // Converge the zero-message case. Guarded on `messages.length` rather than on
+  // "did the append set a pointer", so it cannot mis-fire on a record that has
+  // messages: with messages present there is always something to append here
+  // (a cleared pointer always resets the logged count to 0 alongside), so the
+  // append owns that case and this branch is unreachable for it.
+  if (!record.messagesLog && record.messages.length === 0) {
+    await initializeEmptyMessagesLog(record, logPath);
   }
 
   if (record.messagesLog) {

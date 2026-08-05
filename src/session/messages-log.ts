@@ -424,6 +424,31 @@ export async function prepareMessagesLogForBoundary(
   }
 }
 
+// A zero-message record never converges to split form on its own: it has
+// nothing to append, so `appendFinalizedMessagesToLog` returns at its
+// `messages.length === 0` guard without ever setting `messagesLog`, and the
+// record is re-serialized in pre-split form on every boundary write, forever.
+// (The `markAllMessagesLogged` call in writeMessagesLogBoundary is not what
+// sets the pointer — it only moves the logged-count WeakMap, and on an empty
+// record it is a no-op — so this is the level the fix has to sit at.)
+//
+// BOTH halves are required. Writing the pointer alone would not converge, it
+// would oscillate: `prepareMessagesLogForBoundary` above self-heals a pointer
+// whose log file is missing by warning and clearing it back to undefined, so
+// the next boundary write would undo this one and emit a warning per write.
+export async function initializeEmptyMessagesLog(
+  record: SessionRecord,
+  logPath: string,
+): Promise<void> {
+  await fs.mkdir(path.dirname(logPath), { recursive: true });
+  // Unconditional create-empty is safe here and not a clobber: the only caller
+  // reaches this after `prepareMessagesLogForBoundary` has already renamed any
+  // pre-existing log aside to `.stale` on exactly this `!messagesLog` branch.
+  await fs.writeFile(logPath, "");
+  record.messagesLog = { v: 1, count: 0, base_index: 0, bytes: 0 };
+  setLoggedMessageCount(record, 0);
+}
+
 export async function clearMissingMessagesLogPointerForWrite(
   record: SessionRecord,
   logPath: string,
