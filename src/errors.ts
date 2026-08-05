@@ -340,6 +340,87 @@ export class AllSubscriptionsLockedError extends AcpxOperationalError {
   }
 }
 
+// `subscriptions remove` targeted the registry's current default. Removing it
+// would silently drop every unselected spawn to the raw global ~/.claude, so the
+// operator must say what the new default is — `--set-default <id>` to repoint it
+// or `--clear-default` to accept the fallthrough deliberately.
+export class SubscriptionRemoveDefaultError extends AcpxOperationalError {
+  constructor(id: string, candidates: readonly string[]) {
+    const suggestion =
+      candidates.length > 0
+        ? ` Pass --set-default <id> (candidates: ${candidates.join(", ")}) or --clear-default.`
+        : " No other profile remains; pass --clear-default to remove it anyway.";
+    super(
+      `subscription "${id}" is the registry default; refusing to leave the default dangling.${suggestion}`,
+      {
+        outputCode: "USAGE",
+        detailCode: "SUBSCRIPTION_REMOVE_DEFAULT",
+        origin: "cli",
+      },
+    );
+  }
+}
+
+// A `subscriptions remove` flag that must name a DIFFERENT profile (--set-default,
+// --reassign) was pointed at the very profile being removed — it would re-point
+// straight back at the entry about to disappear.
+export class SubscriptionRemoveSelfReferenceError extends AcpxOperationalError {
+  constructor(flag: string, id: string, candidates: readonly string[]) {
+    const suggestion = candidates.length > 0 ? ` Candidates: ${candidates.join(", ")}.` : "";
+    super(
+      `${flag} cannot be "${id}" — that is the profile being removed; it needs a different id.${suggestion}`,
+      {
+        outputCode: "USAGE",
+        detailCode: "SUBSCRIPTION_REMOVE_SELF_REFERENCE",
+        origin: "cli",
+      },
+    );
+  }
+}
+
+// `--purge` was asked to delete a dir that is not strictly beneath
+// ~/.acpx/subscriptions. A registry entry is just a string on disk, so a
+// malformed or hand-edited credentialSource would otherwise turn a routine
+// removal into a recursive delete of something else. Refused BEFORE any
+// mutation so the operator can fix the entry or re-run without --purge.
+export class SubscriptionPurgeOutsideRootError extends AcpxOperationalError {
+  constructor(id: string, dir: string, root: string) {
+    super(
+      `refusing to --purge "${dir}" for "${id}": it is not inside ${root}. ` +
+        `Re-run without --purge to drop the registry entry only, then remove the directory yourself.`,
+      {
+        outputCode: "USAGE",
+        detailCode: "SUBSCRIPTION_PURGE_OUTSIDE_ROOT",
+        origin: "cli",
+      },
+    );
+  }
+}
+
+// `subscriptions remove` targeted a profile that live sessions are still pinned
+// to. Their persisted session_options.profile would dangle, and applyProfileAuth
+// throws on an unknown profile rather than silently spawning under another
+// account — so those sessions would fail at their next spawn. Refuse by default;
+// `--reassign <id>` re-pins them, `--force` accepts the breakage.
+export class SubscriptionRemoveInUseError extends AcpxOperationalError {
+  readonly openSessions: number;
+
+  constructor(id: string, openSessions: number, candidates: readonly string[]) {
+    const suggestion = candidates.length > 0 ? ` (candidates: ${candidates.join(", ")})` : "";
+    super(
+      `subscription "${id}" is still pinned by ${openSessions} open session(s); ` +
+        `they would fail to spawn once it is gone. ` +
+        `Pass --reassign <id> to re-pin them${suggestion}, or --force to remove anyway.`,
+      {
+        outputCode: "USAGE",
+        detailCode: "SUBSCRIPTION_REMOVE_IN_USE",
+        origin: "cli",
+      },
+    );
+    this.openSessions = openSessions;
+  }
+}
+
 // A claude-home (PTY bridge) turn failed because the bridge's Claude login is
 // gated/expired and no sibling bridge has a usable login. NOT quota — detailCode
 // 'auth-gated' so acpx-ui renders the existing AuthGatedBanner (keyed on

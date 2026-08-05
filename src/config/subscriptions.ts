@@ -611,6 +611,124 @@ export function setSubscriptionLockState(
   };
 }
 
+export type ProfileRemovalOptions = SubscriptionLookupOptions & {
+  /** Repoint the registry default here when the removed profile WAS the default. */
+  setDefault?: string;
+  /** Accept an unset default when the removed profile WAS the default. */
+  clearDefault?: boolean;
+};
+
+export type ProfileRemovalResult = {
+  action: "subscription_remove";
+  subscription: string;
+  wasDefault: boolean;
+  /** Registry default AFTER the removal; null ⇒ none set (raw ~/.claude fallthrough). */
+  newDefault: string | null;
+  /** Profile ids still registered after the removal. */
+  remaining: string[];
+};
+
+/** Drop every entry with `id` from a registry array. Returns true if any went. */
+function removeEntriesById(items: unknown, id: string): boolean {
+  if (!Array.isArray(items)) {
+    return false;
+  }
+  let removed = false;
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item: unknown = items[index];
+    if (isRecord(item) && nonEmptyString(item.id) === id) {
+      items.splice(index, 1);
+      removed = true;
+    }
+  }
+  return removed;
+}
+
+/** Point `default` at `replacement`, or drop the key when there is none. */
+function repointRegistryDefault(
+  document: Record<string, unknown>,
+  replacement: string | undefined,
+): void {
+  if (replacement !== undefined) {
+    document.default = replacement;
+    return;
+  }
+  delete document.default;
+}
+
+function profileIdsIn(items: unknown): string[] {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+  return items.flatMap((item: unknown) => {
+    const id = isRecord(item) ? nonEmptyString(item.id) : undefined;
+    return id === undefined ? [] : [id];
+  });
+}
+
+/**
+ * Delete a profile from the on-disk registry, whole-file read-modify-write so
+ * every sibling entry (and its lock metadata, and `quarantined`) survives
+ * byte-for-byte. Works on the raw document rather than the normalized
+ * `subscriptions` view, because that view is subscription-authMode-only — a
+ * claude-home bridge or an openrouter profile is invisible there but is still a
+ * removable registry entry.
+ *
+ * Optimistic concurrency, not a lock: acpx's registry writes are lockless
+ * temp+rename, so we snapshot the file before the read and re-check it just
+ * before the rename, ABORTING rather than clobbering a concurrent
+ * lock/unlock/add that landed in between. Returns undefined when there is no
+ * registry or no such id — the caller turns that into SubscriptionUnknownError.
+ */
+export function removeProfileFromRegistry(
+  id: string,
+  options?: ProfileRemovalOptions,
+): ProfileRemovalResult | undefined {
+  const registryPath = registryPathForOptions(options);
+  const before = readRegistrySnapshot(registryPath);
+  const document = readRegistryDocument(registryPath);
+  if (!document) {
+    return undefined;
+  }
+
+  const trimmed = id.trim();
+  const removedFromProfiles = removeEntriesById(document.profiles, trimmed);
+  const removedFromLegacy = removeEntriesById(document.subscriptions, trimmed);
+  if (!removedFromProfiles && !removedFromLegacy) {
+    return undefined;
+  }
+
+  const wasDefault = nonEmptyString(document.default) === trimmed;
+  if (wasDefault) {
+    repointRegistryDefault(document, nonEmptyString(options?.setDefault));
+  }
+
+  if (readRegistrySnapshot(registryPath) !== before) {
+    throw new Error(
+      `registry.json changed while removing "${trimmed}"; aborted rather than overwrite a ` +
+        `concurrent change. Re-run the command.`,
+    );
+  }
+  writeRegistryDocument(registryPath, document);
+
+  return {
+    action: "subscription_remove",
+    subscription: trimmed,
+    wasDefault,
+    newDefault: nonEmptyString(document.default) ?? null,
+    remaining: profileIdsIn(document.profiles),
+  };
+}
+
+/** Raw file text used as the compare-and-swap token; undefined when absent. */
+function readRegistrySnapshot(registryPath: string): string | undefined {
+  try {
+    return readFileSync(registryPath, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }

@@ -8,6 +8,18 @@ Repo: https://github.com/openclaw/acpx
 
 ### Changes
 
+- CLI/subscriptions: new `acpx subscriptions remove <id>` (alias `rm`) verb,
+  beside `lock`/`unlock`, for retiring a cancelled or dead account without
+  hand-editing `registry.json`. Removes any profile kind — including a
+  `claude-home` bridge, which the subscription-only `list` view never showed —
+  via a whole-file read-modify-write that preserves every sibling entry, its
+  lock metadata, and `quarantined`, with a compare-and-swap that aborts rather
+  than clobber a concurrent registry write. Refuses by default to strand state:
+  removing the registry `default` requires `--set-default <id>` or
+  `--clear-default`, and removing a profile that open sessions are still pinned
+  to requires `--reassign <id>` (re-pins them) or `--force`. `--purge` also
+  deletes the profile's credential dir, but only strictly beneath
+  `~/.acpx/subscriptions`. `--dry-run` reports the impact and writes nothing.
 - Agents: register the `claude-pty` bridge agent (independent-claude-acp) with
   the `ACPX_CLAUDE_PTY_ACP_COMMAND` override seam.
 - Profiles: new `authMode: "claude-home"` profile kind (`homePath`, optional
