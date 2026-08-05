@@ -90,21 +90,23 @@ function warnPrimer(command: string, reason: string): void {
  * non-zero exit, timeout, or empty output emits a structured warning and
  * returns `undefined` — never throws, never blocks session creation (AC8).
  *
- * `sessionEnv` is the environment the session's agent process was spawned with;
- * the primer renders in it. It is absent only before the agent has been launched
- * (no session can have been created yet), where the acpx process env is the only
- * environment there is — the pre-fix behavior, kept as the fail-open floor.
+ * `sessionEnv` — the environment the session's agent process was spawned with —
+ * is REQUIRED, deliberately. An optional parameter defaulting to `process.env`
+ * would mean that omitting it silently restores the very defect this plumbing
+ * exists to fix, with no type error, no test failure and no log line. Required,
+ * a missed call site is a compile error instead. Note this is NOT the fail-open
+ * behavior below wearing different clothes: a failed *render* warns and returns
+ * undefined; a missing *env argument* is not a runtime condition at all.
  */
 export async function resolveSessionPrimer(
-  sessionEnv?: NodeJS.ProcessEnv,
+  sessionEnv: NodeJS.ProcessEnv,
 ): Promise<string | undefined> {
   const command = resolveSessionPrimerCommand();
-  const env = sessionEnv ?? process.env;
-  const key = buildPrimerMemoKey(command, env);
+  const key = buildPrimerMemoKey(command, sessionEnv);
   if (memoizedPrimerKey === key) {
     return memoizedPrimer;
   }
-  const primer = await execSessionPrimer(command, env);
+  const primer = await execSessionPrimer(command, sessionEnv);
   if (primer !== undefined) {
     memoizedPrimer = primer;
     memoizedPrimerKey = key;

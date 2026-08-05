@@ -150,7 +150,7 @@ async function withPrimerCommand(command: string, run: () => Promise<void>): Pro
 
 test("resolveSessionPrimer: captures stdout of the configured command", async () => {
   await withPrimerScript("printf '# Current host\\nEND-OF-PRIMER\\n'", async () => {
-    const primer = await resolveSessionPrimer();
+    const primer = await resolveSessionPrimer(process.env);
     assert.ok(primer);
     assert.match(primer, /# Current host/);
     // The WHOLE output is carried (no truncation to a saved-to-path preview).
@@ -160,30 +160,30 @@ test("resolveSessionPrimer: captures stdout of the configured command", async ()
 
 test("resolveSessionPrimer: memoizes SUCCESS for the process lifetime", async () => {
   await withPrimerScript("printf 'FIRST\\n'", async (scriptPath) => {
-    const first = await resolveSessionPrimer();
+    const first = await resolveSessionPrimer(process.env);
     assert.match(first ?? "", /FIRST/);
     // Mutate the script: a memoized success must NOT re-exec.
     await fs.writeFile(scriptPath, "#!/bin/sh\nprintf 'SECOND\\n'\n", { mode: 0o755 });
-    const second = await resolveSessionPrimer();
+    const second = await resolveSessionPrimer(process.env);
     assert.equal(second, first);
   });
 });
 
 test("resolveSessionPrimer: fail-open (missing script) returns undefined, never throws", async () => {
   await withPrimerCommand("/nonexistent/acpx-test-primer.sh", async () => {
-    assert.equal(await resolveSessionPrimer(), undefined);
+    assert.equal(await resolveSessionPrimer(process.env), undefined);
   });
 });
 
 test("resolveSessionPrimer: fail-open (non-zero exit) returns undefined", async () => {
   await withPrimerScript("echo boom >&2; exit 3", async () => {
-    assert.equal(await resolveSessionPrimer(), undefined);
+    assert.equal(await resolveSessionPrimer(process.env), undefined);
   });
 });
 
 test("resolveSessionPrimer: fail-open (empty output) returns undefined", async () => {
   await withPrimerScript("exit 0", async () => {
-    assert.equal(await resolveSessionPrimer(), undefined);
+    assert.equal(await resolveSessionPrimer(process.env), undefined);
   });
 });
 
@@ -294,13 +294,13 @@ test("resolveSessionPrimer: a failure is NOT memoized — a later success still 
   resetSessionPrimerMemoForTests();
   try {
     process.env.ACPX_SESSION_PRIMER_COMMAND = "/nonexistent/acpx-test-primer.sh";
-    assert.equal(await resolveSessionPrimer(), undefined);
+    assert.equal(await resolveSessionPrimer(process.env), undefined);
 
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-primer-"));
     const scriptPath = path.join(dir, "primer.sh");
     await fs.writeFile(scriptPath, "#!/bin/sh\nprintf 'RECOVERED\\n'\n", { mode: 0o755 });
     process.env.ACPX_SESSION_PRIMER_COMMAND = scriptPath;
-    const primer = await resolveSessionPrimer();
+    const primer = await resolveSessionPrimer(process.env);
     assert.match(primer ?? "", /RECOVERED/);
     await fs.rm(dir, { recursive: true, force: true });
   } finally {
@@ -332,6 +332,10 @@ function makeClient(agentCommand: string, sessionOptions?: Record<string, unknow
 }
 
 function stubConnection(client: AcpClient, captured: CapturedConnection): void {
+  // `start()` is what captures the agent spawn env the primer renders in; these
+  // tests stub the connection instead of starting an agent, so stand it in — the
+  // primer requires it and skips (loudly) without it.
+  (client as unknown as { agentSpawnEnv: NodeJS.ProcessEnv }).agentSpawnEnv = { ...process.env };
   (client as unknown as { connection: unknown }).connection = {
     newSession: async (params: { _meta?: Record<string, unknown> }) => {
       captured.newSessionMeta = params._meta;
@@ -420,6 +424,22 @@ test("createSession: fail-open — session still builds when the primer is missi
     const result = await client.createSession("/tmp/acpx-primer-failopen");
     assert.equal(result.sessionId, "session-stub");
     assert.equal(systemPromptAppend(captured.newSessionMeta), undefined);
+  });
+});
+
+test("createSession: an unset agent spawn env SKIPS the primer — never falls back to acpx's own env", async () => {
+  await withPrimerScript(GUARDED_PRIMER_SCRIPT, async () => {
+    await withProcessEnv({ ACPX_BRICK: CHILD_BRICK }, async () => {
+      const captured: CapturedConnection = {};
+      const client = makeClient(SDK_CLAUDE_COMMAND);
+      stubConnection(client, captured);
+      // Model the state where start() has not captured a spawn env. The one
+      // thing this must NOT do is render the primer under acpx's own env —
+      // that silent inheritance IS the defect. No primer beats a wrong one.
+      delete (client as unknown as { agentSpawnEnv?: NodeJS.ProcessEnv }).agentSpawnEnv;
+      await client.createSession("/tmp/acpx-primer-no-spawn-env");
+      assert.equal(systemPromptAppend(captured.newSessionMeta), undefined);
+    });
   });
 });
 

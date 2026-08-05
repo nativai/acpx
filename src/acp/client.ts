@@ -1187,7 +1187,7 @@ export class AcpClient {
     ) {
       return undefined;
     }
-    const primer = await resolveSessionPrimer(this.agentSpawnEnv);
+    const primer = await this.resolvePrimerForSpawnEnv();
     const brickContext = await this.resolveBrickContext();
     return buildPrimerSessionMeta(channel, primer, optionsMeta?.systemPrompt, brickContext);
   }
@@ -1209,9 +1209,29 @@ export class AcpClient {
     if (typeof optionsMeta?.systemPrompt === "string" && optionsMeta.systemPrompt.length > 0) {
       return undefined;
     }
-    const primer = await resolveSessionPrimer(this.agentSpawnEnv);
+    const primer = await this.resolvePrimerForSpawnEnv();
     const brickContext = await this.resolveBrickContext();
     return buildPrimerSessionMeta(channel, primer, optionsMeta?.systemPrompt, brickContext);
+  }
+
+  /**
+   * Render the OS primer in THIS session's agent environment. Unreachable with
+   * `agentSpawnEnv` unset in production — every session op goes through
+   * `getConnection()`, which throws unless `start()` (the only writer of that
+   * field) has run — so the miss is REPORTED, never repaired by falling back to
+   * acpx's own env. That fallback is exactly the defect this plumbing fixes, and
+   * its failure mode is silent by construction: the agent is simply never told.
+   * Skipping the primer instead leaves a warning behind and keeps session
+   * creation fail-open, same as any other primer failure.
+   */
+  private async resolvePrimerForSpawnEnv(): Promise<string | undefined> {
+    if (!this.agentSpawnEnv) {
+      process.stderr.write(
+        "[acpx] session primer skipped: agent spawn environment unavailable (agent not started); continuing unprimed\n",
+      );
+      return undefined;
+    }
+    return await resolveSessionPrimer(this.agentSpawnEnv);
   }
 
   private async resolveBrickContext(): Promise<string | undefined> {
