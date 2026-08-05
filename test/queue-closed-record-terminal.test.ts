@@ -218,6 +218,62 @@ test("A11/HC-1: the terminal acpx actually emits is classified a definitive give
   });
 });
 
+// B3 (RCA b2ca4bd0 §B.6) — the same refusal, for a task with NO messageId.
+//
+// A11 above covers every inter-agent `/message` delivery, which always carries one.
+// A bare CLI `prompt --no-wait` does not, so `deliveryStreamLine`'s `!messageId`
+// early return meant this refusal wrote nothing at all — measured: `grep -c
+// SESSION_CLOSED` over the session's `.stream.ndjson` was 0.
+//
+// An already-closed session is now refused synchronously at the CLI enqueue
+// boundary, before `[queued]` is printed. What still reaches HERE is the residual
+// race — a record that closed between that check and this pull — which cannot be
+// prevented from the CLI side. It is made honest instead of silent.
+async function readRefusedEvents(sessionId: string): Promise<DeliveryEvent[]> {
+  let payload: string;
+  try {
+    payload = await fs.readFile(sessionEventActivePath(sessionId), "utf8");
+  } catch {
+    return [];
+  }
+  return payload
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as DeliveryEvent)
+    .filter((event) => event.method === "acpx/refused");
+}
+
+test("B3: a messageId-less task refused by a closed record leaves a durable trace, not silence", async () => {
+  const sessionId = "b3-closed-record-no-message-id";
+  await withClosedRecordOwner(sessionId, async ({ submit }) => {
+    const { task } = await submit({
+      requestId: "req-b3-no-message-id",
+      waitForCompletion: false,
+      // No messageId — this is what a bare CLI `prompt --no-wait` submits.
+    });
+
+    await runQueuedTask(sessionId, task, {});
+
+    const refused = await readRefusedEvents(sessionId);
+    assert.equal(refused.length, 1, "the refusal must leave exactly one trace, keyed on requestId");
+    assert.equal(refused[0].params.requestId, "req-b3-no-message-id");
+    assert.equal(refused[0].params.phase, "failed");
+    assert.equal(refused[0].params.error.detailCode, "SESSION_CLOSED_UNDELIVERED");
+
+    // The `acpx/delivery` writer must stay silent: there is no delivery lifecycle
+    // to update, and inventing one would put a phantom item in front of acpx-ui.
+    assert.deepEqual(await readDeliveryEvents(sessionId), []);
+
+    // Same classification gate as HC-1, over the NEW path, asserted against the
+    // string read back OFF DISK rather than a copy this test maintains.
+    const emittedReason = refused[0].params.error.message;
+    assert.ok(
+      isDefinitiveGiveUpByDeployedAcpxUi(emittedReason),
+      `the no-messageId trace must carry the same classifiable reason; got: ${emittedReason}`,
+    );
+  });
+});
+
 test("A11/HC-2: a task already terminalized by the closed-record refusal is not terminalized again on owner close", async () => {
   const sessionId = "a11-closed-record-single-terminal";
   await withClosedRecordOwner(sessionId, async ({ owner, submit }) => {

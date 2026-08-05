@@ -7420,6 +7420,282 @@ async function writeCodexAgentConfig(homeDir: string, command: string): Promise<
   );
 }
 
+// B3 (RCA b2ca4bd0 §B.6) — the true silent drop.
+//
+// MEASURED before the fix, on a real closed session driven by the real CLI:
+// `prompt --session-id <closed> --no-wait` returned rc=0 and printed
+// `{"action":"prompt_queued",...}`, and the prompt then existed NOWHERE — no
+// message, no delivery record, no `last_error`, no stream event, and no replay
+// after the session was reopened.
+//
+// The property under test is LOUDNESS, not absence. Asserting "the prompt did
+// not arrive" would pass against the broken behaviour too, since the broken
+// behaviour also does not deliver. So these assert the rc and the detail code.
+function parseCliJsonError(stdout: string): { message: string; detailCode: string } {
+  const line = stdout
+    .trim()
+    .split("\n")
+    .find((candidate) => candidate.includes('"error"'));
+  assert(line, `no JSON error line in CLI output:\n${stdout}`);
+  const parsed = JSON.parse(line) as {
+    error?: { message?: unknown; data?: { detailCode?: unknown } };
+  };
+  return {
+    message: String(parsed.error?.message ?? ""),
+    detailCode: String(parsed.error?.data?.detailCode ?? ""),
+  };
+}
+
+test("B3: prompt --no-wait to a closed session fails loudly, while an open session still queues", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_COMMAND);
+    const env = { ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh" };
+
+    const makeSession = async (name: string): Promise<string> => {
+      const created = await runCli(
+        ["--cwd", cwd, "--format", "json", "codex", "sessions", "new", "--name", name],
+        homeDir,
+        { env },
+      );
+      assert.equal(created.code, 0, created.stderr);
+      return String((JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId);
+    };
+
+    const openId = await makeSession("b3-open");
+    const closedId = await makeSession("b3-closed");
+
+    // POSITIVE CONTROL, same execution: the identical `--no-wait` prompt against
+    // an OPEN session. Without this, a fix that broke `--no-wait` outright — or a
+    // check that refused everything — would still show a green suite below.
+    const control = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--format",
+        "json",
+        "codex",
+        "prompt",
+        "--session-id",
+        openId,
+        "--no-wait",
+        "control ping",
+      ],
+      homeDir,
+      { env, timeoutMs: 60_000 },
+    );
+    assert.equal(control.code, 0, `open-session --no-wait must still queue:\n${control.stderr}`);
+    assert.match(control.stdout, /"action":"prompt_queued"/);
+
+    const closed = await runCli(
+      ["--cwd", cwd, "codex", "sessions", "close", "--session-id", closedId],
+      homeDir,
+      { env },
+    );
+    assert.equal(closed.code, 0, closed.stderr);
+
+    // THE DEFECT: this used to be rc=0 + `prompt_queued`.
+    const refused = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--format",
+        "json",
+        "codex",
+        "prompt",
+        "--session-id",
+        closedId,
+        "--no-wait",
+        "dropped ping",
+      ],
+      homeDir,
+      { env, timeoutMs: 60_000 },
+    );
+    assert.equal(refused.code, 1, `closed-session --no-wait must fail loudly:\n${refused.stdout}`);
+    assert.doesNotMatch(refused.stdout, /"action":"prompt_queued"/);
+    const error = parseCliJsonError(refused.stdout);
+    assert.equal(error.detailCode, "SESSION_CLOSED");
+    // The guidance names the surfaces that exist. `acpx sessions reopen` does not,
+    // and was removed in 2deef5c — it must not come back through this path.
+    assert.match(error.message, /Reopen it in acpx-ui/);
+    assert.doesNotMatch(error.message, /sessions reopen/);
+
+    // Blocking mode was already honest; it must stay that way, and identically.
+    const refusedBlocking = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--format",
+        "json",
+        "codex",
+        "prompt",
+        "--session-id",
+        closedId,
+        "blocking ping",
+      ],
+      homeDir,
+      { env, timeoutMs: 60_000 },
+    );
+    assert.equal(refusedBlocking.code, 1, refusedBlocking.stdout);
+    assert.equal(parseCliJsonError(refusedBlocking.stdout).detailCode, "SESSION_CLOSED");
+  });
+});
+
+// The scope of the refusal IS the cross-repo contract. acpx-ui always spawns
+// `prompt --no-wait --message-id <wireMessageId>`, and such a task already gets an
+// honest owner-side SESSION_CLOSED_UNDELIVERED terminal that acpx-ui's senderNotify
+// classifies as a definitive give-up. Refusing it here instead would swap a terminal
+// acpx-ui understands for a non-zero exit it does not. This pins that acpx-ui keeps
+// seeing exactly what it sees today.
+test("B3: a closed-session prompt carrying --message-id keeps the acpx-ui delivery contract", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_COMMAND);
+    const env = { ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh" };
+
+    const created = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "new", "--name", "b3-delivery"],
+      homeDir,
+      { env },
+    );
+    assert.equal(created.code, 0, created.stderr);
+    const id = String(
+      (JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const closed = await runCli(
+      ["--cwd", cwd, "codex", "sessions", "close", "--session-id", id],
+      homeDir,
+      { env },
+    );
+    assert.equal(closed.code, 0, closed.stderr);
+
+    const delivered = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--format",
+        "json",
+        "codex",
+        "prompt",
+        "--session-id",
+        id,
+        "--no-wait",
+        "--message-id",
+        "33333333-3333-4333-8333-333333333333",
+        "an inter-agent delivery",
+      ],
+      homeDir,
+      { env, timeoutMs: 60_000 },
+    );
+    assert.equal(
+      delivered.code,
+      0,
+      `acpx-ui deliveries must NOT be refused at the CLI — they carry their own terminal:\n${delivered.stderr}`,
+    );
+    assert.match(delivered.stdout, /"action":"prompt_queued"/);
+  });
+});
+
+// The closed-check sits at the single choke point for EVERY CLI submit. Two of its
+// three callers are safe BY CONSTRUCTION — `sessions new --from-template` auto-fire
+// and the `sessions copy` handoff both target a session created moments earlier,
+// which cannot be closed. That argument is true today and silently expires the day
+// either flow learns to target an EXISTING session, so it is pinned rather than
+// left as reasoning in a comment.
+test("B3 regression: the template auto-fire and copy handoff still submit through the closed-check", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, `${MOCK_AGENT_COMMAND} --supports-fork-session`);
+    const env = { ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh" };
+
+    const base = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "new", "--name", "b3-tpl-base"],
+      homeDir,
+      { env },
+    );
+    assert.equal(base.code, 0, base.stderr);
+    const baseId = String(
+      (JSON.parse(base.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+
+    // A template source is a CLOSED record by design — the auto-fire targets the
+    // fresh instance, not the template, so the closed-check must not trip on it.
+    const closedBase = await runCli(
+      ["--cwd", cwd, "codex", "sessions", "close", "--session-id", baseId],
+      homeDir,
+      { env },
+    );
+    assert.equal(closedBase.code, 0, closedBase.stderr);
+    const marked = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "template", baseId, "--enable"],
+      homeDir,
+      { env },
+    );
+    assert.equal(marked.code, 0, marked.stderr);
+
+    const instantiated = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--format",
+        "json",
+        "codex",
+        "sessions",
+        "new",
+        "--from-template",
+        baseId,
+        "--name",
+        "b3-tpl-instance",
+        "--prompt",
+        "TPL AUTO FIRE",
+      ],
+      homeDir,
+      { env, timeoutMs: 60_000 },
+    );
+    assert.equal(
+      instantiated.code,
+      0,
+      `template auto-fire must still submit:\n${instantiated.stderr}`,
+    );
+
+    const copySource = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "new", "--name", "b3-copy-source"],
+      homeDir,
+      { env },
+    );
+    assert.equal(copySource.code, 0, copySource.stderr);
+    // `--from` by RECORD ID, not by name: the by-name lookup has its own scoping
+    // rules that are not what this test is about.
+    const copySourceId = String(
+      (JSON.parse(copySource.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+
+    const copied = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--format",
+        "json",
+        "codex",
+        "sessions",
+        "copy",
+        "--from",
+        copySourceId,
+        "--name",
+        "b3-copy-dest",
+        "--prompt",
+        "COPY HANDOFF",
+      ],
+      homeDir,
+      { env, timeoutMs: 60_000 },
+    );
+    assert.equal(copied.code, 0, `copy handoff must still submit:\n${copied.stderr}`);
+  });
+});
+
 test("sessions templates lists only the agent's template records", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

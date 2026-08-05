@@ -135,6 +135,7 @@ import {
 } from "../queue/delivery-terminals.js";
 import {
   appendDeliveryStreamEventSync,
+  appendRefusedStreamEventSync,
   type QueueOwnerMessage,
   type QueueTask,
   waitMs,
@@ -1072,11 +1073,28 @@ function terminalizeDeliveryRefusedByClosedRecord(
   // UI close will start delegating to `acpx sessions close`, so a closed-record
   // refusal can then coincide with a terminate. Sync is the destination
   // regardless; the cost is a sub-millisecond local append.
-  appendDeliveryStreamEventSync(sessionRecordId, task, "failed", {
+  const terminalError = {
     code: 0,
     message: SESSION_CLOSED_UNDELIVERED_MESSAGE,
     detailCode: SESSION_CLOSED_UNDELIVERED_DETAIL_CODE,
-  });
+  };
+  appendDeliveryStreamEventSync(sessionRecordId, task, "failed", terminalError);
+  // B3 (RCA b2ca4bd0 §B.6): the line above writes nothing when the task has no
+  // messageId, which is every bare CLI `prompt --no-wait` — so this refusal used
+  // to leave the record, the stream and the message log all untouched.
+  //
+  // A CLI prompt to an ALREADY-closed session is now refused synchronously at
+  // the enqueue boundary (`sendSession`), before `[queued]` is ever printed,
+  // because with `--no-wait` this process is gone by the time we get here and no
+  // asynchronous terminal can reach it. What reaches here instead is the
+  // RESIDUAL RACE — a record that closed between that check and this pull. That
+  // one cannot be prevented from the CLI side, so it is made honest rather than
+  // silent: the same error, on the surface a messageId-less task does have.
+  //
+  // The two writers are mutually exclusive by construction (one requires a
+  // messageId, the other requires its absence), so exactly one line is written
+  // and `terminalWritten` still means one terminal per task.
+  appendRefusedStreamEventSync(sessionRecordId, task, terminalError);
 }
 
 function sendQueuedTaskError(task: QueueTask, error: unknown): void {

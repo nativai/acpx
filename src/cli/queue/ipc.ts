@@ -176,6 +176,7 @@ export type { QueueOwnerControlHandlers, QueueOwnerDrainReport, QueueTask } from
 export {
   appendDeliveryStreamEvent,
   appendDeliveryStreamEventSync,
+  appendRefusedStreamEventSync,
   SessionQueueOwner,
 } from "./ipc-server.js";
 export type { QueueDrainedDelivery, QueueDrainReason } from "./messages.js";

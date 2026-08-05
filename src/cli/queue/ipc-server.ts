@@ -196,6 +196,47 @@ export function appendDeliveryStreamEventSync(
   }
 }
 
+// B3 (RCA b2ca4bd0 §B.6) — the no-messageId companion to the two writers above.
+//
+// A bare CLI `prompt` carries no messageId, so `deliveryStreamLine` below
+// correctly declines to write an `acpx/delivery` event for it: there is no
+// delivery lifecycle to update, and inventing a messageId to fake one would put
+// a phantom item in front of acpx-ui's delivery classification. That early
+// return is right, and it is why the closed-record refusal left NO trace at all
+// — measured: `grep -c SESSION_CLOSED` in the session's `.stream.ndjson` was 0.
+//
+// So the trace goes to a parallel event keyed on `requestId`, the only id such a
+// task has. Same file, and deliberately so: the owner already writes an
+// `acpx/received` marker there at enqueue keyed on the same `requestId`, so
+// received-then-refused reads off one file in order.
+//
+// Sync, and never throws, for the same reason as `appendDeliveryStreamEventSync`
+// — the caller may be an owner on its way out.
+export function appendRefusedStreamEventSync(
+  sessionId: string,
+  task: Pick<QueueTask, "messageId" | "requestId">,
+  error: DeliveryEventError,
+): void {
+  if (task.messageId) {
+    return;
+  }
+  const line = `${JSON.stringify({
+    jsonrpc: "2.0",
+    method: "acpx/refused",
+    params: {
+      requestId: task.requestId,
+      phase: "failed",
+      error,
+      at: new Date().toISOString(),
+    },
+  })}\n`;
+  try {
+    appendFileSync(sessionEventActivePath(sessionId), line, "utf8");
+  } catch {
+    // Best effort — never throw from a marker.
+  }
+}
+
 // A task with no messageId has no delivery lifecycle to update, so it is skipped.
 function deliveryStreamLine(
   task: Pick<QueueTask, "messageId" | "requestId">,

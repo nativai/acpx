@@ -5,6 +5,7 @@ import { AcpClient } from "../../acp/client.js";
 import { formatErrorMessage } from "../../acp/error-normalization.js";
 import { supportsMidTurnPromptInjection } from "../../acp/mid-turn-injection-support.js";
 import { withTimeout } from "../../async-control.js";
+import { SessionClosedError } from "../../errors.js";
 import { checkpointPerfMetricsCapture } from "../../perf-metrics-capture.js";
 import { incrementPerfCounter, setPerfGauge } from "../../perf-metrics.js";
 import { promptToDisplayText } from "../../prompt-content.js";
@@ -26,7 +27,7 @@ import {
   resolveSessionRecord,
   writeSessionRecordAtBoundary,
 } from "../../session/persistence.js";
-import type { AcpJsonRpcMessage, SessionSendOutcome } from "../../types.js";
+import type { AcpJsonRpcMessage, SessionRecord, SessionSendOutcome } from "../../types.js";
 import {
   appendDeliveryStreamEvent,
   QUEUE_CONNECT_RETRY_MS,
@@ -1276,9 +1277,51 @@ export async function spawnAndAwaitQueueOwner(
   throw new Error(formatOwnerStartFailure(sessionId, lastExit, spawnsUsed, detail));
 }
 
+// B3 (RCA b2ca4bd0 §B.6) — the true silent drop, refused at the enqueue boundary.
+//
+// `--no-wait` resolves the instant the owner ACKs, so NO asynchronous terminal
+// can ever reach this caller: by the time `runSessionPrompt` refuses a closed
+// record, the CLI process has already printed `[queued]` and exited 0. The
+// honest failure therefore has to happen HERE, before the ack — a synchronous
+// refusal, identical in both wait modes. (Measured before the fix: rc=0 and
+// `[queued] <id>` for a closed target, with no message, no delivery record, no
+// `last_error`, nothing in `.messages.ndjson`, and no replay after reopen.)
+//
+// It also stops a pointless cold spawn. A closed session has no live owner — the
+// close killed it — so `submitToRunningOwner` misses and `spawnAndAwaitQueueOwner`
+// used to start a whole owner process purely to have it refuse the task.
+//
+// SCOPED TO PROMPTS WITH NO messageId, and that scope is a cross-repo contract,
+// not a shortcut. acpx-ui always spawns `prompt --no-wait --message-id <id>`,
+// and such a task already gets an honest owner-side terminal
+// (SESSION_CLOSED_UNDELIVERED, which acpx-ui's `senderNotify` classifies as a
+// definitive give-up and reports to the sender). Refusing those here would swap
+// a terminal acpx-ui understands for a non-zero exit it does not — a change that
+// belongs in acpx-ui, not in a unilateral acpx commit. A bare CLI prompt has no
+// delivery lifecycle at all, which is exactly why it vanished without trace.
+//
+// ADDITIVE, NEVER A REPLACEMENT. `runSessionPrompt`'s refusal stays, so this
+// check being wrong cannot open a new silent-drop path — only fail to close one.
+// The window between this read and the owner's pull is real and is not claimed
+// to be closed; it is the residual race, and
+// `terminalizeDeliveryRefusedByClosedRecord` is what makes it leave a trace. The
+// two directions are asymmetric and this fails in the cheap one: refusing a
+// session reopened since the read costs one loud, retryable error, while
+// accepting one closed since the read falls through to the owner refusal.
+function assertRecordOpenForCliPrompt(record: SessionRecord, options: SessionSendOptions): void {
+  if (options.messageId !== undefined || !record.closed) {
+    return;
+  }
+  throw new SessionClosedError(record.acpxRecordId, record.name ?? undefined);
+}
+
 export async function sendSession(options: SessionSendOptions): Promise<SessionSendOutcome> {
   const waitForCompletion = options.waitForCompletion !== false;
-  const effectiveOptions = await resolveAndPersistSendOwnerOptions(options);
+  // Resolved once, and checked BEFORE the owner-option persist below writes the
+  // record twice — a refused prompt must not mutate the session it was refused by.
+  const record = await resolveSessionRecord(options.sessionId);
+  assertRecordOpenForCliPrompt(record, options);
+  const effectiveOptions = await persistSendOwnerOptions(record, options);
 
   const queuedToOwner = await submitToRunningOwner(effectiveOptions, waitForCompletion);
   if (queuedToOwner) {
@@ -1288,10 +1331,13 @@ export async function sendSession(options: SessionSendOptions): Promise<SessionS
   return await spawnAndAwaitQueueOwner(effectiveOptions);
 }
 
-async function resolveAndPersistSendOwnerOptions(
+// Split from its former `resolveAndPersistSendOwnerOptions` shape so `sendSession`
+// can hold the resolved record and run the closed-record refusal above BEFORE any
+// of these writes happen. One read, not two.
+async function persistSendOwnerOptions(
+  record: SessionRecord,
   options: SessionSendOptions,
 ): Promise<SessionSendOptions> {
-  const record = await resolveSessionRecord(options.sessionId);
   if (bindRecordToDefaultAccount(record)) {
     await writeSessionRecordAtBoundary(record);
   }
