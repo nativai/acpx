@@ -541,6 +541,14 @@ function mutateLockFieldsInArray(
 
 function writeRegistryDocument(registryPath: string, document: Record<string, unknown>): void {
   mkdirSync(dirname(registryPath), { recursive: true });
+  // DELIBERATELY no randomUUID here, unlike the async write-tmp+rename sites
+  // (persistence/repository.ts, persistence/index.ts, runtime/public/file-session-store.ts,
+  // session/messages-log.ts, flows/store.ts). This function is fully SYNCHRONOUS:
+  // there is no await point between writeFileSync and renameSync, so two calls in
+  // this process cannot interleave — the first has already renamed the temp away
+  // before the second starts. Across processes the `${pid}` segment differs. So the
+  // same-millisecond collision that ENOENTs the async sites is unreachable here.
+  // If this is ever made async, it MUST gain the randomUUID segment.
   const tempPath = `${registryPath}.${process.pid}.${Date.now()}.tmp`;
   writeFileSync(tempPath, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 });
   chmodSync(tempPath, 0o600);

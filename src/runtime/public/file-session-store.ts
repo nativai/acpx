@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { assertPersistedKeyPolicy } from "../../persisted-key-policy.js";
@@ -62,7 +63,13 @@ class FileSessionStore implements AcpSessionStore {
     assertPersistedKeyPolicy(persisted);
 
     const file = this.filePath(record.acpxRecordId);
-    const tempFile = `${file}.${process.pid}.${Date.now()}.tmp`;
+    // Per-call randomUUID: `${pid}.${Date.now()}` alone is NOT unique. Two saves
+    // of the same record from this process in the same millisecond build the
+    // identical temp path, so the first rename wins and the second hits ENOENT
+    // — turning a concurrent save into a thrown error. Same shape and same fix
+    // as src/session/persistence/repository.ts. Uniqueness, not serialization:
+    // this is a filename collision, and ordering here is deliberately free.
+    const tempFile = `${file}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
     const payload = JSON.stringify(persisted, null, 2);
     await fs.writeFile(tempFile, `${payload}\n`, "utf8");
     await fs.rename(tempFile, file);

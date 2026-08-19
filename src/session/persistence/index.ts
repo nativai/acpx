@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { SessionRecord } from "../../types.js";
@@ -432,7 +433,16 @@ export async function writeSessionIndex(
   },
 ): Promise<void> {
   const filePath = sessionIndexPath(sessionDir);
-  const tempFile = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  // Per-call randomUUID: `${pid}.${Date.now()}` alone is NOT unique. Two writes
+  // from this process in the same millisecond build the identical temp path, so
+  // the first rename wins and the second hits ENOENT — turning a concurrent
+  // index write into a thrown error. Broader exposure than the per-session
+  // record (repository.ts): the temp path derives only from `sessionDir`, so
+  // EVERY concurrent index write in the store collides, not just same-record
+  // ones — and there are two independent async writers (reconcileSessionIndex
+  // below, and the index-update-queue flush). Uniqueness, not serialization:
+  // this is a filename collision, and ordering here is deliberately free.
+  const tempFile = `${filePath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
   // Compact JSON (no pretty-print): parses identically for every consumer,
   // saves ~30-40% of bytes and stringify CPU per rewrite.
   const payload = JSON.stringify({
