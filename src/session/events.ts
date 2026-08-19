@@ -110,6 +110,32 @@ async function resolveSessionMaxSegments(sessionId: string): Promise<number> {
   return DEFAULT_EVENT_MAX_SEGMENTS;
 }
 
+// Rename that treats a missing source as success — the same ENOENT tolerance
+// the overflow unlink in rotateSegments already applies, for the same reason.
+//
+// Rotators RACE. Two concurrent appendMessages calls can both enter the
+// rotation branch, because the size check there reads `activeSizeBytes` state
+// that the winner only resets AFTER its `await` — so both call rotateSegments.
+// The `pathExists`-then-rename guard this replaces could not close that window:
+// both guards resolve before either rename runs, so the loser renamed a file
+// the winner had already moved and threw ENOENT. That throw surfaced as a bogus
+// `failed` delivery terminal on a prompt that had in fact completed — and
+// because the write it aborted WAS the `done` terminal, it also disarmed the
+// duplicate-delivery guard, which keys on exactly that `done`
+// (hasCompletedDeliveryFor, cli/session/runtime.ts).
+//
+// Swallowing ENOENT is the CORRECT semantics here, not a workaround: a missing
+// source means another rotator already moved it, which is the outcome this call
+// wanted. It also covers cross-instance and cross-process rotators, which a
+// per-writer lock would not.
+async function renameTolerantOfMissingSource(from: string, to: string): Promise<void> {
+  await fs.rename(from, to).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+  });
+}
+
 async function rotateSegments(sessionId: string, maxSegments: number): Promise<void> {
   const active = activeEventPath(sessionId);
 
@@ -121,17 +147,13 @@ async function rotateSegments(sessionId: string, maxSegments: number): Promise<v
   });
 
   for (let segment = maxSegments - 1; segment >= 1; segment -= 1) {
-    const from = segmentEventPath(sessionId, segment);
-    const to = segmentEventPath(sessionId, segment + 1);
-    if (!(await pathExists(from))) {
-      continue;
-    }
-    await fs.rename(from, to);
+    await renameTolerantOfMissingSource(
+      segmentEventPath(sessionId, segment),
+      segmentEventPath(sessionId, segment + 1),
+    );
   }
 
-  if (await pathExists(active)) {
-    await fs.rename(active, segmentEventPath(sessionId, 1));
-  }
+  await renameTolerantOfMissingSource(active, segmentEventPath(sessionId, 1));
 }
 
 type LockHandle = {
