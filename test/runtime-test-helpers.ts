@@ -65,6 +65,7 @@ export function makeSessionRecord(
     request_token_usage: overrides.request_token_usage ?? {},
     acpx: overrides.acpx ?? (defaultAcpx ? {} : undefined),
     importedFrom: overrides.importedFrom,
+    template: overrides.template,
   };
 }
 

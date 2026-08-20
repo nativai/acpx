@@ -163,6 +163,7 @@ export type SessionsPruneFlags = {
   before?: Date;
   olderThan?: number;
   includeHistory?: boolean;
+  includeTemplates?: boolean;
 };
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

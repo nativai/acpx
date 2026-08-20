@@ -1,6 +1,7 @@
 import path from "node:path";
 import { resolveAcpxUiBaseUrl } from "../../acp/auth-env.js";
 import { consumeAutoSubscriptionSelection } from "../../runtime/engine/auto-subscription.js";
+import { effectiveTemplateSlug } from "../../session/persistence/template-slug.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
 import type { AgentSessionListResult, OutputFormat, SessionRecord } from "../../types.js";
 import { probeQueueOwnerHealth } from "../queue/ipc.js";
@@ -392,10 +393,14 @@ function formatBytes(bytes: number): string {
   return `${bytes} B`;
 }
 
-export function printPruneResultByFormat(
-  result: { pruned: SessionRecord[]; bytesFreed: number; dryRun: boolean },
-  format: OutputFormat,
-): void {
+type PruneRenderResult = {
+  pruned: SessionRecord[];
+  skippedTemplates: SessionRecord[];
+  bytesFreed: number;
+  dryRun: boolean;
+};
+
+export function printPruneResultByFormat(result: PruneRenderResult, format: OutputFormat): void {
   const count = result.pruned.length;
 
   if (emitPruneJsonResult(result, format, count)) {
@@ -406,6 +411,10 @@ export function printPruneResultByFormat(
     printQuietPruneResult(result.pruned);
     return;
   }
+
+  // Before the summary, not after: a run that prunes nothing still has to say it
+  // protected a blueprint, and "No sessions pruned" is otherwise the last word.
+  printSkippedTemplates(result.skippedTemplates);
 
   if (count === 0) {
     process.stdout.write(
@@ -425,7 +434,7 @@ export function printPruneResultByFormat(
 }
 
 function emitPruneJsonResult(
-  result: { pruned: SessionRecord[]; bytesFreed: number; dryRun: boolean },
+  result: PruneRenderResult,
   format: OutputFormat,
   count: number,
 ): boolean {
@@ -435,7 +444,25 @@ function emitPruneJsonResult(
     count,
     bytesFreed: result.bytesFreed,
     pruned: result.pruned.map((r) => r.acpxRecordId),
+    skippedTemplates: result.skippedTemplates.map((r) => ({
+      acpxRecordId: r.acpxRecordId,
+      slug: templateSkipSlug(r),
+    })),
   });
+}
+
+/** Same read-side derivation the template resolver uses, so the skip line names
+ *  the slug a `--from-template` call would actually have asked for. */
+function templateSkipSlug(record: SessionRecord): string {
+  return effectiveTemplateSlug(record.template?.slug, record.name) ?? record.acpxRecordId;
+}
+
+function printSkippedTemplates(skippedTemplates: SessionRecord[]): void {
+  for (const record of skippedTemplates) {
+    process.stdout.write(
+      `  skipped ${record.acpxRecordId} — template '${templateSkipSlug(record)}'\n`,
+    );
+  }
 }
 
 function printQuietPruneResult(pruned: SessionRecord[]): void {
