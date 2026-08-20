@@ -1217,14 +1217,37 @@ export type PruneOptions = {
   before?: Date;
   olderThanMs?: number;
   includeHistory?: boolean;
+  /** Opt in to deleting template blueprints too. Off by default — see isTemplateMarkedRecord. */
+  includeTemplates?: boolean;
   dryRun?: boolean;
 };
 
 export type PruneResult = {
   pruned: SessionRecord[];
+  /** Template blueprints that matched every prune criterion and were spared anyway. */
+  skippedTemplates: SessionRecord[];
   bytesFreed: number;
   dryRun: boolean;
 };
+
+/**
+ * Deliberately BROADER than `isTemplateRecord` above, and the two must not be
+ * merged. `isTemplateRecord` gates *resolution* (`enabled === true` — only a live
+ * template resolves under its slug); this gates *destruction*, where the safe
+ * answer is the wider one.
+ *
+ * ⚠️ DO NOT "unify" this with isTemplateRecord or narrow it to
+ * `template?.enabled === true`. It looks like the obvious cleanup and it is the
+ * bug: `softRetractTemplateRecord` retires a template by flipping `enabled:false`
+ * while KEEPING the block, precisely so the blueprint survives for rollback — so
+ * an enabled-gated test hands every soft-retracted blueprint straight back to
+ * prune, and `templates rollback` then has nothing to roll back to. The mark is
+ * the presence of the block, at any version, enabled or not. The disabled-template
+ * case in test/sessions-prune.test.ts goes red if this is narrowed.
+ */
+function isTemplateMarkedRecord(record: SessionRecord): boolean {
+  return record.template != null;
+}
 
 function closedAtOrLastUsedAt(record: SessionRecord): string {
   return record.closedAt ?? record.lastUsedAt;
@@ -1248,10 +1271,14 @@ export async function pruneSessions(options: PruneOptions = {}): Promise<PruneRe
     options.before ??
     (options.olderThanMs != null ? new Date(Date.now() - options.olderThanMs) : undefined);
 
-  const records = await loadPrunableRecords(eligible, cutoff);
+  const { prunable: records, skippedTemplates } = await loadPrunableRecords(
+    eligible,
+    cutoff,
+    options.includeTemplates === true,
+  );
 
   if (options.dryRun) {
-    return { pruned: records, bytesFreed: 0, dryRun: true };
+    return { pruned: records, skippedTemplates, bytesFreed: 0, dryRun: true };
   }
 
   const sessionDir = sessionBaseDir();
@@ -1281,7 +1308,7 @@ export async function pruneSessions(options: PruneOptions = {}): Promise<PruneRe
     // best effort cache rebuild
   });
 
-  return { pruned: records, bytesFreed, dryRun: false };
+  return { pruned: records, skippedTemplates, bytesFreed, dryRun: false };
 }
 
 function filterPruneCandidates(
@@ -1295,19 +1322,35 @@ function filterPruneCandidates(
   );
 }
 
+/**
+ * The template check deliberately runs HERE, on the fully-loaded record, and not
+ * up in filterPruneCandidates on the index entry. SessionIndexEntry.templateSlug
+ * & friends are optional hot-path enrichment: an old index, or an entry written
+ * by acpx-ui, simply lacks them. Filtering on a field that may be absent turns a
+ * missing projection into a deleted blueprint. `record.template` is the authority
+ * and is always present on a loaded record, so the guard cannot be out-run by a
+ * stale index.
+ */
 async function loadPrunableRecords(
   entries: SessionIndexEntry[],
   cutoff: Date | undefined,
-): Promise<SessionRecord[]> {
-  const records: SessionRecord[] = [];
+  includeTemplates: boolean,
+): Promise<{ prunable: SessionRecord[]; skippedTemplates: SessionRecord[] }> {
+  const prunable: SessionRecord[] = [];
+  const skippedTemplates: SessionRecord[] = [];
   const cutoffIso = cutoff?.toISOString();
   for (const entry of entries) {
     const record = await loadRecordFromIndexEntry(entry);
-    if (record && isBeforeCutoff(record, cutoffIso)) {
-      records.push(record);
+    if (!record || !isBeforeCutoff(record, cutoffIso)) {
+      continue;
     }
+    if (!includeTemplates && isTemplateMarkedRecord(record)) {
+      skippedTemplates.push(record);
+      continue;
+    }
+    prunable.push(record);
   }
-  return records;
+  return { prunable, skippedTemplates };
 }
 
 function isBeforeCutoff(record: SessionRecord, cutoffIso: string | undefined): boolean {

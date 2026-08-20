@@ -946,6 +946,7 @@ test("sessions new command is present in help output", async () => {
     assert.equal(pruneHelp.code, 0, pruneHelp.stderr);
     assert.match(pruneHelp.stdout, /--dry-run/);
     assert.match(pruneHelp.stdout, /--include-history/);
+    assert.match(pruneHelp.stdout, /--include-templates/);
   });
 });
 
@@ -6598,6 +6599,99 @@ test("sessions prune dry-run previews closed sessions without deleting", async (
   });
 });
 
+// ─── brick://a62de399: prune must not silently delete a template blueprint ────
+test("sessions prune skips template blueprints and says so per skip", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "tmpl-blueprint",
+      acpSessionId: "tmpl-blueprint",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:10:00.000Z",
+      closed: true,
+      closedAt: "2026-01-01T00:10:00.000Z",
+      template: {
+        enabled: true,
+        slug: "telegram-personal-assistant",
+        version: 1,
+        created_at: "2026-01-01T00:00:00.000Z",
+      },
+    });
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "tmpl-plain-closed",
+      acpSessionId: "tmpl-plain-closed",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:10:00.000Z",
+      closed: true,
+      closedAt: "2026-01-01T00:10:00.000Z",
+    });
+
+    const result = await runCli(["--cwd", cwd, "codex", "sessions", "prune"], homeDir);
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /skipped tmpl-blueprint — template 'telegram-personal-assistant'/);
+    assert.match(result.stdout, /Pruned 1 session/);
+    assert.ok(!(await fileExists(sessionFilePath(homeDir, "tmpl-plain-closed"))));
+    assert.ok(await fileExists(sessionFilePath(homeDir, "tmpl-blueprint")));
+
+    // The opt-in is the only way through, and it deletes the blueprint.
+    const forced = await runCli(
+      ["--cwd", cwd, "codex", "sessions", "prune", "--include-templates"],
+      homeDir,
+    );
+
+    assert.equal(forced.code, 0, forced.stderr);
+    assert.doesNotMatch(forced.stdout, /skipped tmpl-blueprint/);
+    assert.match(forced.stdout, /Pruned 1 session/);
+    assert.ok(!(await fileExists(sessionFilePath(homeDir, "tmpl-blueprint"))));
+  });
+});
+
+test("sessions prune reports skipped templates in json output", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "tmpl-json-bp",
+      acpSessionId: "tmpl-json-bp",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:10:00.000Z",
+      closed: true,
+      closedAt: "2026-01-01T00:10:00.000Z",
+      template: {
+        enabled: true,
+        slug: "intaker",
+        version: 7,
+        created_at: "2026-01-01T00:00:00.000Z",
+      },
+    });
+
+    const result = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "prune"],
+      homeDir,
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    const payload = JSON.parse(result.stdout) as {
+      count?: number;
+      pruned?: string[];
+      skippedTemplates?: { acpxRecordId: string; slug: string }[];
+    };
+    assert.equal(payload.count, 0);
+    assert.deepEqual(payload.skippedTemplates, [{ acpxRecordId: "tmpl-json-bp", slug: "intaker" }]);
+    assert.ok(await fileExists(sessionFilePath(homeDir, "tmpl-json-bp")));
+  });
+});
+
 test("sessions prune supports json output and include-history", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -7226,6 +7320,7 @@ function makeSessionRecord(
     forkedAtMessageIndex: record.forkedAtMessageIndex,
     metadata: record.metadata,
     importedFrom: record.importedFrom,
+    template: record.template,
   };
 }
 

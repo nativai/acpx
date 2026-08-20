@@ -403,3 +403,170 @@ test("pruneSessions without agentCommand prunes all closed sessions across all a
     assert.ok(await fileExists(sessionFilePath(homeDir, "all-open")));
   });
 });
+
+// ─── brick://a62de399: template blueprints must survive prune ────────────────
+// A blueprint is a CLOSED session by design, so it matched prune's only two
+// criteria (closed + agent) and was deleted silently — taking every consumer of
+// its slug with it. Real incident: the `telegram-personal-assistant` blueprint
+// was pruned, and every `sessions new --from-template telegram-personal-assistant`
+// then failed with "no template matches".
+
+async function writeTemplateRecord(
+  homeDir: string,
+  cwd: string,
+  overrides: { acpxRecordId: string; slug: string; enabled?: boolean; agentCommand?: string },
+): Promise<void> {
+  await writeSessionRecord(
+    homeDir,
+    makeSessionRecord({
+      acpxRecordId: overrides.acpxRecordId,
+      acpSessionId: overrides.acpxRecordId,
+      agentCommand: overrides.agentCommand ?? "agent-a",
+      cwd,
+      closed: true,
+      closedAt: "2026-01-01T00:00:00.000Z",
+      template: {
+        enabled: overrides.enabled ?? true,
+        slug: overrides.slug,
+        version: 1,
+        created_at: "2026-01-01T00:00:00.000Z",
+      },
+    }),
+  );
+}
+
+test("pruneSessions skips template-marked sessions and prunes plain closed ones", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeTemplateRecord(homeDir, cwd, {
+      acpxRecordId: "blueprint",
+      slug: "telegram-personal-assistant",
+    });
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "plain-closed",
+        acpSessionId: "plain-closed",
+        agentCommand: "agent-a",
+        cwd,
+        closed: true,
+        closedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    const result = await session.pruneSessions({ agentCommand: "agent-a" });
+
+    assert.deepEqual(
+      result.pruned.map((r) => r.acpxRecordId),
+      ["plain-closed"],
+    );
+    assert.deepEqual(
+      result.skippedTemplates.map((r) => r.acpxRecordId),
+      ["blueprint"],
+    );
+    assert.equal(result.skippedTemplates[0].template?.slug, "telegram-personal-assistant");
+    assert.ok(!(await fileExists(sessionFilePath(homeDir, "plain-closed"))));
+    assert.ok(await fileExists(sessionFilePath(homeDir, "blueprint")));
+  });
+});
+
+test("pruneSessions skips a soft-retracted (enabled:false) template", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    // softRetractTemplateRecord keeps the block and only flips enabled:false, so
+    // `templates rollback` can still reach this blueprint. Prune must respect the
+    // block, not `enabled` — narrowing the guard to enabled===true fails here.
+    await writeTemplateRecord(homeDir, cwd, {
+      acpxRecordId: "retracted-blueprint",
+      slug: "intaker",
+      enabled: false,
+    });
+
+    const result = await session.pruneSessions({ agentCommand: "agent-a" });
+
+    assert.equal(result.pruned.length, 0);
+    assert.deepEqual(
+      result.skippedTemplates.map((r) => r.acpxRecordId),
+      ["retracted-blueprint"],
+    );
+    assert.ok(await fileExists(sessionFilePath(homeDir, "retracted-blueprint")));
+  });
+});
+
+test("pruneSessions deletes templates only with the explicit includeTemplates opt-in", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeTemplateRecord(homeDir, cwd, { acpxRecordId: "doomed", slug: "some-template" });
+
+    const result = await session.pruneSessions({
+      agentCommand: "agent-a",
+      includeTemplates: true,
+    });
+
+    assert.deepEqual(
+      result.pruned.map((r) => r.acpxRecordId),
+      ["doomed"],
+    );
+    assert.equal(result.skippedTemplates.length, 0);
+    assert.ok(!(await fileExists(sessionFilePath(homeDir, "doomed"))));
+  });
+});
+
+test("pruneSessions dry-run reports templates as skipped, not as would-prune", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeTemplateRecord(homeDir, cwd, { acpxRecordId: "dry-blueprint", slug: "bp" });
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "dry-plain",
+        acpSessionId: "dry-plain",
+        agentCommand: "agent-a",
+        cwd,
+        closed: true,
+        closedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    const result = await session.pruneSessions({ agentCommand: "agent-a", dryRun: true });
+
+    assert.equal(result.dryRun, true);
+    assert.deepEqual(
+      result.pruned.map((r) => r.acpxRecordId),
+      ["dry-plain"],
+    );
+    assert.deepEqual(
+      result.skippedTemplates.map((r) => r.acpxRecordId),
+      ["dry-blueprint"],
+    );
+    assert.ok(await fileExists(sessionFilePath(homeDir, "dry-blueprint")));
+    assert.ok(await fileExists(sessionFilePath(homeDir, "dry-plain")));
+  });
+});
+
+test("pruneSessions leaves the template's stream sidecars alone under --include-history", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+
+    await writeTemplateRecord(homeDir, cwd, { acpxRecordId: "kept-bp", slug: "kept" });
+    const streamPath = path.join(sessionDir, `${encodeURIComponent("kept-bp")}.stream.ndjson`);
+    await fs.writeFile(streamPath, "event-data\n", "utf8");
+
+    const result = await session.pruneSessions({ agentCommand: "agent-a", includeHistory: true });
+
+    assert.equal(result.pruned.length, 0);
+    assert.equal(result.skippedTemplates.length, 1);
+    assert.ok(await fileExists(sessionFilePath(homeDir, "kept-bp")));
+    assert.ok(await fileExists(streamPath));
+  });
+});

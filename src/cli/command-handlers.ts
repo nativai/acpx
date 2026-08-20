@@ -3141,6 +3141,7 @@ export async function handleSessionsPrune(
     before: flags.before,
     olderThanMs,
     includeHistory: flags.includeHistory,
+    includeTemplates: flags.includeTemplates,
     dryRun: flags.dryRun,
   });
 
