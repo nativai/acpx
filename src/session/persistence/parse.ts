@@ -1215,6 +1215,11 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     return null;
   }
 
+  const parentSessionUrl = normalizeOptionalString(record.parent_session_url);
+  if (parentSessionUrl === null) {
+    return null;
+  }
+
   const forkedFromSessionId = normalizeOptionalString(record.forked_from_session_id);
   if (forkedFromSessionId === null) {
     return null;
@@ -1269,6 +1274,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
       acpx: parseAcpxState(record.acpx),
       kind,
       parentSessionId: parentSessionId ?? undefined,
+      parentSessionUrl: parentSessionUrl ?? undefined,
       forkedFromSessionId: forkedFromSessionId ?? undefined,
       forkedAtMessageIndex: forkedAtMessageIndex ?? undefined,
       subagents: parseSubagentRefs(record.subagents),

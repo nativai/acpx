@@ -192,7 +192,17 @@ async function createSessionRecordWithClient(
         }
       : {}),
     ...(options.parentSessionId
-      ? { kind: "session" as const, parentSessionId: options.parentSessionId }
+      ? {
+          kind: "session" as const,
+          parentSessionId: options.parentSessionId,
+          // Persist the parent's FULL url when we were given one. Without this the
+          // record keeps only the bare uuid, and a CROSS-BOX parent becomes
+          // unidentifiable the moment the spawn ends: the id resolves against
+          // whichever box happens to read it. (brick://c6e3618b)
+          ...(options.parentSessionUrl?.trim()
+            ? { parentSessionUrl: options.parentSessionUrl.trim() }
+            : {}),
+        }
       : {}),
     ...(options.metadata && Object.keys(options.metadata).length > 0
       ? { metadata: { ...options.metadata } }
@@ -472,10 +482,11 @@ function creationSessionContext(options: SessionCreateOptions) {
     acpxRecordId: "",
     sessionName: normalizeName(options.name) ?? null,
     parentSessionId: options.parentSessionId ?? null,
-    // FW-19: the full parent URL (real host) only needs to reach the bridge at
-    // session/new — the bridge persists it across reloads. Later (recover/keepwarm)
-    // spawns derive the URL from parentSessionId against the local base URL
-    // (correct same-box; the bridge has the cross-box URL persisted already).
+    // The full parent URL (real host) reaches the bridge at session/new AND becomes
+    // ACPX_PARENT_SESSION_URL for this spawn. It is also persisted onto the record
+    // (brick://c6e3618b), so later recover/keepwarm spawns reload the real host
+    // instead of re-deriving one against the LOCAL base URL — which silently
+    // re-hosts a cross-box parent onto this box. (FW-19)
     parentSessionUrl: options.parentSessionUrl ?? null,
     taskFolder: options.metadata?.task_folder ?? null,
     brick,

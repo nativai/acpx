@@ -2031,6 +2031,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         acpxRecordId: record.acpxRecordId,
         sessionName: record.name ?? null,
         parentSessionId: record.parentSessionId ?? null,
+        parentSessionUrl: record.parentSessionUrl ?? null,
         taskFolder: record.metadata?.task_folder ?? null,
         brick,
         brickPath,

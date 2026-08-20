@@ -740,6 +740,15 @@ export type SessionRecord = {
   acpx?: SessionAcpxState;
   kind?: "session" | "subagent";
   parentSessionId?: string;
+  /**
+   * The parent's FULL acpx-ui URL (host + id), persisted as `parent_session_url`.
+   * `parentSessionId` alone is a BARE UUID, and sessions never resolve cross-box —
+   * each box runs its own acpx-ui over its own store — so for a parent on another
+   * box the id identifies nothing locally and only the host makes it actionable.
+   * Absent for a same-box parent, where the local base URL reconstructs it exactly.
+   * Read by acpx-ui's relations tree to link out to a remote parent. (brick://c6e3618b)
+   */
+  parentSessionUrl?: string;
   forkedFromSessionId?: string;
   forkedAtMessageIndex?: number;
   subagents?: SubagentRef[];

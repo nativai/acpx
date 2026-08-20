@@ -532,11 +532,16 @@ function buildAgentEnvironment(
       env.ACPX_SESSION_NAME = trimmedName;
     }
   }
-  if (sessionContext && typeof sessionContext.parentSessionId === "string") {
-    const trimmedParent = sessionContext.parentSessionId.trim();
-    if (trimmedParent.length > 0) {
-      env.ACPX_PARENT_SESSION_URL = `${baseUrl}/?session=${trimmedParent}`;
-    }
+  // brick://c6e3618b — ONE composition, shared with the bridge's session/new `_meta`
+  // (buildClaudeParentSessionMeta). These two paths used to differ: the bridge
+  // preferred the explicit parentSessionUrl while this one always recomposed
+  // `${baseUrl}/?session=${parentId}` against the LOCAL base, silently re-hosting a
+  // cross-box parent onto this box — a well-formed URL for a session that does not
+  // exist here, which a child then reports back into. The FW-19 comment on
+  // resolveParentSessionUrl claimed the two were "byte-identical"; they now are.
+  const parentSessionUrl = resolveParentSessionUrl(sessionContext, baseUrl);
+  if (parentSessionUrl) {
+    env.ACPX_PARENT_SESSION_URL = parentSessionUrl;
   }
   if (sessionContext && typeof sessionContext.taskFolder === "string") {
     const trimmedTaskFolder = sessionContext.taskFolder.trim();
@@ -1270,19 +1275,27 @@ export function buildClaudeHomeSelectorMeta(
 }
 
 /**
- * FW-18/FW-19: the claude-pty bridge's session/new `_meta` fragment carrying the
- * parent session URL. ONLY for the bridge agent — the SDK claude adapter inherits
- * its parent from the spawn PROCESS env (ACPX_PARENT_SESSION_URL via
- * buildAgentEnvironment), but the bridge serves many ACP sessions per process and
- * must learn each session's parent per-`session/new`. Prefers the full
- * parentSessionUrl (carries the real host for a cross-box parent); otherwise
- * derives `${baseUrl}/?session=${parentSessionId}` against the LOCAL base URL
- * (correct for a same-box parent) — byte-identical to buildAgentEnvironment's
- * ACPX_PARENT_SESSION_URL. Returns undefined when there is no parent or the agent
- * is not the bridge (the namespaced key is harmless to other adapters, but gating
- * keeps the contract explicit).
+ * FW-18/FW-19: the parent session's acpx-ui URL for a spawn. Prefers the explicit
+ * full `parentSessionUrl`, which carries the REAL host for a cross-box parent;
+ * otherwise derives `${baseUrl}/?session=${parentSessionId}` against the local base
+ * URL, which is correct for a same-box parent and only for one.
+ *
+ * ⚠️ DO NOT "simplify" this back to always composing from `parentSessionId`. The id
+ * is a bare uuid and sessions never resolve cross-box, so recomposing it locally
+ * produces a well-formed URL for a session that does not exist on this box — and
+ * the child handed it sends its whole report-back contract into a 404 while
+ * believing it reported upward. That was brick://c6e3618b. `test/parent-session-url
+ * .test.ts` goes red if the preference is removed.
+ *
+ * Used by BOTH spawn paths, which is the point: the SDK claude adapter inherits its
+ * parent from the process env (ACPX_PARENT_SESSION_URL via buildAgentEnvironment),
+ * while the claude-pty bridge serves many ACP sessions per process and must learn
+ * each session's parent per-`session/new` via `_meta`. They previously disagreed.
  */
-function resolveParentMetaUrl(sessionContext: AgentSessionContext | undefined): string | undefined {
+function resolveParentSessionUrl(
+  sessionContext: AgentSessionContext | undefined,
+  baseUrl: string,
+): string | undefined {
   const explicitUrl = sessionContext?.parentSessionUrl?.trim();
   if (explicitUrl) {
     return explicitUrl;
@@ -1291,9 +1304,14 @@ function resolveParentMetaUrl(sessionContext: AgentSessionContext | undefined): 
   if (!parentId) {
     return undefined;
   }
-  return `${resolveAcpxUiBaseUrl(process.env)}/?session=${parentId}`;
+  return `${baseUrl}/?session=${parentId}`;
 }
 
+/**
+ * The bridge-only `_meta` fragment carrying the parent session URL. Returns
+ * undefined when there is no parent or the agent is not the bridge (the namespaced
+ * key is harmless to other adapters, but gating keeps the contract explicit).
+ */
 export function buildClaudeParentSessionMeta(
   sessionContext: AgentSessionContext | undefined,
   agentCommand: string | undefined,
@@ -1301,7 +1319,7 @@ export function buildClaudeParentSessionMeta(
   if (agentCommand === undefined || !isClaudePtyAgentCommand(agentCommand)) {
     return undefined;
   }
-  const url = resolveParentMetaUrl(sessionContext);
+  const url = resolveParentSessionUrl(sessionContext, resolveAcpxUiBaseUrl(process.env));
   return url ? { [INDEPENDENT_CLAUDE_PARENT_SESSION_URL_META_KEY]: url } : undefined;
 }
 
