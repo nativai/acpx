@@ -55,6 +55,14 @@ export type SessionIndexEntry = {
   title?: string | null;
   createdAt?: string;
   parentSessionId?: string;
+  /**
+   * Full parent acpx-ui URL (host+id) for a cross-box parent; absent for same-box
+   * parents. acpx-ui's own SessionIndexEntry already declares this field and its
+   * comment says it is "projected by acpx into index.json" — it reads it here to
+   * link a remote parent in the relations tree, so the LIST path needs it just as
+   * much as the record does. (brick://c6e3618b)
+   */
+  parentSessionUrl?: string;
   forkedFromSessionId?: string;
   forkedAtMessageIndex?: number;
   metadataTaskFolder?: string;
@@ -271,6 +279,7 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     title: typeof record.title === "string" ? record.title : undefined,
     createdAt: optionalString(record.createdAt),
     parentSessionId: optionalString(record.parentSessionId),
+    parentSessionUrl: optionalString(record.parentSessionUrl),
     forkedFromSessionId: optionalString(record.forkedFromSessionId),
     forkedAtMessageIndex: optionalFiniteNumber(record.forkedAtMessageIndex),
     metadataTaskFolder: optionalString(record.metadataTaskFolder),
@@ -363,6 +372,7 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     title: record.title ?? undefined,
     createdAt: record.createdAt,
     parentSessionId: record.parentSessionId,
+    parentSessionUrl: record.parentSessionUrl,
     forkedFromSessionId: record.forkedFromSessionId,
     forkedAtMessageIndex: record.forkedAtMessageIndex,
     metadataTaskFolder: metadata?.task_folder,
