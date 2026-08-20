@@ -121,12 +121,16 @@ async function requireClaudeBinary(t: TestContext, unverified: string): Promise<
     return false;
   }
 
-  assert.fail(
-    `the \`claude\` binary is not on PATH, so ${unverified} could not be observed against ` +
+  // Thrown rather than `assert.fail`-ed so this function has an explicit exit on
+  // every path (oxlint `consistent-return`); the observable behaviour — a failed
+  // test carrying this message — is identical.
+  throw new assert.AssertionError({
+    message:
+      `the \`claude\` binary is not on PATH, so ${unverified} could not be observed against ` +
       `Claude Code's real behaviour — which is the ONLY thing that makes this derivation ` +
       `trustworthy. This is a hard failure on purpose. If you genuinely intend to run this ` +
       `suite on a box without Claude Code, say so deliberately: ${ALLOW_NO_CLAUDE_ENV}=1.`,
-  );
+  });
 }
 
 /**
