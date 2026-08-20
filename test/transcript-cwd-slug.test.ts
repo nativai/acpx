@@ -330,46 +330,69 @@ test("FEATURE GOAL (live, end-to-end): a real dotted-cwd session's transcript is
 
 // ─── Rider 2: the fallback must not be able to mask a broken primary ─────────
 
+// ─────────────────────────────────────────────────────────────────────────────
+// The fleet's own exposure, with both slug forms written out as LITERALS.
+//
+// ⚠️ DO NOT replace these with calls to transcriptJsonlPath() /
+// legacyTranscriptJsonlPath(). That is precisely what made the two tests below
+// tautological: they wrote the fixture at transcriptJsonlPath() and then
+// asserted the resolver found it there, so both sides derived from the SAME
+// function and agreed by construction whatever it returned — they stayed GREEN
+// under a deliberately corrupted primary derivation, proving only that the pipe
+// was open. Building the fixture from a literal is what gives them teeth.
+//
+// Both values are observations: `.bare` → double hyphen is the RCA's measured
+// fleet evidence and GROUND-TRUTH.md batch 1 case 2.
+// ─────────────────────────────────────────────────────────────────────────────
+const DOTTED_CWD = "/workspace/projects/acpx-ui/.bare";
+const DOTTED_PRIMARY_SLUG = "-workspace-projects-acpx-ui--bare";
+const DOTTED_LEGACY_SLUG = "-workspace-projects-acpx-ui-.bare";
+
+function literalJsonlPath(configDir: string, slug: string, acpSessionId: string): string {
+  return path.join(configDir, "projects", slug, `${acpSessionId}.jsonl`);
+}
+
 test("PRIMARY carries new sessions: a primary-only transcript resolves, and the legacy path is NOT consulted for it", async () => {
   const root = await fs.mkdtemp(path.join(await liveRoot(), "primary-only-"));
   const configDir = path.join(root, "cfg");
-  const cwd = "/workspace/projects/acpx-ui/.bare";
   const acpSessionId = "11111111-2222-3333-4444-555555555555";
 
-  // Written ONLY at the primary path — exactly what a NEW session produces.
-  const primary = transcriptJsonlPath(configDir, cwd, acpSessionId);
+  // Written ONLY at the primary path — exactly what a NEW session produces —
+  // and placed there by LITERAL slug, not by the function under test.
+  const primary = literalJsonlPath(configDir, DOTTED_PRIMARY_SLUG, acpSessionId);
   await fs.mkdir(path.dirname(primary), { recursive: true });
   await fs.writeFile(primary, `{"type":"user","timestamp":"2026-08-20T10:00:00.000Z"}\n`);
 
   // The legacy location is deliberately EMPTY, so the fallback cannot rescue a
-  // wrong primary derivation. If transcriptCwdHash computed garbage, the
-  // resolver would find nothing and this test would go red — which is the whole
-  // point of it.
-  const legacy = legacyTranscriptJsonlPath(configDir, cwd, acpSessionId);
+  // wrong primary derivation. If transcriptCwdHash computed anything other than
+  // DOTTED_PRIMARY_SLUG, the resolver would look somewhere no file exists and
+  // this test would go red — which is the whole point of it.
+  const legacy = literalJsonlPath(configDir, DOTTED_LEGACY_SLUG, acpSessionId);
   assert.notEqual(legacy, primary, "this cwd must exercise a differing legacy form");
   await assert.rejects(() => fs.access(legacy));
 
-  const resolved = await resolveExistingTranscriptPath(configDir, cwd, acpSessionId);
-  assert.equal(resolved?.form, "primary");
+  const resolved = await resolveExistingTranscriptPath(configDir, DOTTED_CWD, acpSessionId);
+  assert.equal(resolved?.form, "primary", "the primary derivation did not find the real file");
   assert.equal(resolved?.path, primary);
 });
 
 test("the fallback CANNOT rescue a wrong primary: with only a primary-form file present, a legacy-form lookup finds nothing", async () => {
   const root = await fs.mkdtemp(path.join(await liveRoot(), "no-rescue-"));
   const configDir = path.join(root, "cfg");
-  const cwd = "/workspace/projects/acpx-ui/.bare";
   const acpSessionId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
-  const primary = transcriptJsonlPath(configDir, cwd, acpSessionId);
+  // Again by LITERAL slug: the ONLY file on disk sits where Claude Code really
+  // puts it, so a resolution can only succeed if our primary derivation agrees
+  // with Claude Code — the fallback has nothing to serve.
+  const primary = literalJsonlPath(configDir, DOTTED_PRIMARY_SLUG, acpSessionId);
   await fs.mkdir(path.dirname(primary), { recursive: true });
   await fs.writeFile(primary, `{"type":"user","timestamp":"2026-08-20T10:00:00.000Z"}\n`);
 
-  // Ask for the file under a DIFFERENT cwd whose legacy form collides with
-  // nothing: the legacy branch has no file to serve, so any success here must
-  // have come from the primary derivation.
-  const resolved = await resolveExistingTranscriptPath(configDir, cwd, acpSessionId);
-  assert.equal(resolved?.form, "primary");
+  const resolved = await resolveExistingTranscriptPath(configDir, DOTTED_CWD, acpSessionId);
+  assert.equal(resolved?.form, "primary", "the primary derivation did not find the real file");
+  assert.equal(resolved?.path, primary);
 
+  // A DIFFERENT dotted cwd must not resolve to this file under either form.
   const missing = await resolveExistingTranscriptPath(
     configDir,
     "/workspace/projects/acpx-ui/.other",
@@ -473,6 +496,85 @@ test("no legacy breadcrumb is emitted when the primary form served the lookup", 
 });
 
 // ─── The 200-char truncation branch ─────────────────────────────────────────
+
+// ─── The OBSERVED printable-ASCII population ────────────────────────────────
+//
+// These two strings ARE the spec's character classes, copied from
+// verification/GROUND-TRUTH.md BATCH 5 — which probed every printable-ASCII
+// character with its own dedicated cwd (`a<char>b`) and read back the directory
+// Claude Code actually created.
+//
+// ⚠️ Do NOT hand-edit these to match a change you made to the regex. They are
+// observations, not preferences. If you believe one is wrong, re-run
+// verification/probe-ascii.sh and change GROUND-TRUTH.md first.
+//
+// Why a POPULATION and not a handful of examples: sampling closes instances,
+// not the class. An independent test-engineer added ONE character to the
+// preserved set (`[^a-zA-Z0-9-]` -> `[^a-zA-Z0-9-~]`) and the entire 270-test
+// suite stayed green, because 29 characters observed to be replaced were
+// asserted nowhere. Every character below is now pinned in both directions.
+
+/** 30 chars Claude Code REPLACES with a single `-` (GROUND-TRUTH.md batch 5). */
+const OBSERVED_REPLACED = " !\"#$%&'()*+,.:;<=>?@[]^_`{|}~";
+
+/** 63 chars Claude Code PRESERVES verbatim (GROUND-TRUTH.md batch 5). */
+const OBSERVED_PRESERVED = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/**
+ * `/` is observed structurally (it is the separator — every case in every batch
+ * shows it becoming `-`), and `\` is UNOBSERVABLE: Claude Code refuses to start
+ * in a backslash-bearing cwd, exiting with `Can't access working directory`.
+ * We therefore assert nothing about `\` — predicting it would be exactly the
+ * "assert against a description instead of behaviour" trap this lane exists to
+ * avoid.
+ */
+const NOT_IN_POPULATION = "/\\";
+
+test("the observed population COVERS every printable-ASCII character — the table cannot be quietly shrunk", () => {
+  // This is the structural guard on the two tables above. Deleting a character
+  // from either one to make a broken regex pass would fail HERE, because the
+  // union must still account for all 95 printable-ASCII code points.
+  // `.split("")` rather than spread: it splits by UTF-16 CODE UNIT, which is the
+  // unit this derivation works in (and it satisfies oxlint's `no-misused-spread`,
+  // which objects to code-point iteration of strings — the very distinction the
+  // no-/u test below pins).
+  const accounted = new Set(
+    OBSERVED_REPLACED.split("")
+      .concat(OBSERVED_PRESERVED.split(""))
+      .concat(NOT_IN_POPULATION.split("")),
+  );
+  const missing: string[] = [];
+  for (let code = 0x20; code <= 0x7e; code++) {
+    const ch = String.fromCharCode(code);
+    if (!accounted.has(ch)) {
+      missing.push(JSON.stringify(ch));
+    }
+  }
+  assert.deepEqual(missing, [], "printable-ASCII characters accounted for by no table");
+  assert.equal(accounted.size, 95, "a character is listed in more than one table");
+  assert.equal(OBSERVED_REPLACED.length, 30);
+  assert.equal(OBSERVED_PRESERVED.length, 63);
+});
+
+for (const ch of OBSERVED_REPLACED.split("")) {
+  test(`observed population: ${JSON.stringify(ch)} (U+${ch.charCodeAt(0).toString(16).padStart(4, "0").toUpperCase()}) is REPLACED by a single dash`, () => {
+    assert.equal(
+      transcriptCwdHash(`/w/a${ch}b`),
+      "-w-a-b",
+      `Claude Code replaces ${JSON.stringify(ch)} (GROUND-TRUTH.md batch 5); our derivation must too`,
+    );
+  });
+}
+
+for (const ch of OBSERVED_PRESERVED.split("")) {
+  test(`observed population: ${JSON.stringify(ch)} (U+${ch.charCodeAt(0).toString(16).padStart(4, "0").toUpperCase()}) is PRESERVED verbatim`, () => {
+    assert.equal(
+      transcriptCwdHash(`/w/a${ch}b`),
+      `-w-a${ch}b`,
+      `Claude Code preserves ${JSON.stringify(ch)} (GROUND-TRUTH.md batch 5); our derivation must too`,
+    );
+  });
+}
 
 test("the substitution runs per UTF-16 CODE UNIT, not per code point — the derivation must NOT carry the /u flag", () => {
   // ⚠️ DO NOT "modernise" transcriptCwdHash's regex by adding the /u flag, and
