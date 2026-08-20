@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
-import test, { after } from "node:test";
+import test, { after, type TestContext } from "node:test";
 import {
   ensureTranscriptAtConfigDir,
   legacyTranscriptCwdHash,
@@ -71,6 +71,9 @@ type LiveProbe = {
   configDir: string;
 };
 
+/** Deliberate, written-down opt-out for boxes with no Claude Code installed. */
+const ALLOW_NO_CLAUDE_ENV = "ACPX_TEST_ALLOW_NO_CLAUDE";
+
 let claudeBinaryChecked = false;
 let claudeBinaryPresent = false;
 
@@ -85,6 +88,45 @@ async function hasClaudeBinary(): Promise<boolean> {
     probe.on("exit", (code) => resolve(code === 0));
   });
   return claudeBinaryPresent;
+}
+
+/**
+ * Gate for the live probes — a MISSING `claude` binary FAILS by default.
+ *
+ * ⚠️ DO NOT turn this back into an unconditional `t.skip()`. A skipped test is
+ * green in the summary line, so `# fail 0` would then be able to mean "the only
+ * tests pinning this derivation to reality never ran" — the vacuous-pass shape
+ * this whole lane exists to prevent (brick://ae715773). The pre-merge gate runs
+ * on a box where `claude` is present, so failing by default costs that gate
+ * nothing and makes its green mean something.
+ *
+ * Running somewhere without Claude Code is still allowed — but as a conscious
+ * act, not an accident: set `ACPX_TEST_ALLOW_NO_CLAUDE=1`. The skip then names
+ * exactly which property went unobserved.
+ */
+async function requireClaudeBinary(t: TestContext, unverified: string): Promise<boolean> {
+  if (await hasClaudeBinary()) {
+    return true;
+  }
+
+  if (process.env[ALLOW_NO_CLAUDE_ENV] === "1") {
+    process.stderr.write(
+      `[acpx-test] UNVERIFIED: ${unverified} — the \`claude\` binary is absent and ` +
+        `${ALLOW_NO_CLAUDE_ENV}=1 was set, so this property was NOT observed in this run.\n`,
+    );
+    t.skip(
+      `SKIPPED BY EXPLICIT OPT-OUT (${ALLOW_NO_CLAUDE_ENV}=1) WITHOUT VERIFYING ANYTHING: ` +
+        `${unverified} was not observed, because the \`claude\` binary is not on PATH.`,
+    );
+    return false;
+  }
+
+  assert.fail(
+    `the \`claude\` binary is not on PATH, so ${unverified} could not be observed against ` +
+      `Claude Code's real behaviour — which is the ONLY thing that makes this derivation ` +
+      `trustworthy. This is a hard failure on purpose. If you genuinely intend to run this ` +
+      `suite on a box without Claude Code, say so deliberately: ${ALLOW_NO_CLAUDE_ENV}=1.`,
+  );
 }
 
 /**
@@ -166,12 +208,12 @@ const LIVE_CASES: Array<{ dir: string; label: string; why: string }> = [
 
 for (const testCase of LIVE_CASES) {
   test(`GROUND TRUTH (live Claude Code): transcriptCwdHash matches the dir actually written for '${testCase.dir}' — ${testCase.why}`, async (t) => {
-    if (!(await hasClaudeBinary())) {
-      t.skip(
-        "SKIPPED WITHOUT VERIFYING ANYTHING: the `claude` binary is not on PATH, so the " +
-          "spec could not be observed. This test is the ONLY thing pinning our derivation to " +
-          "Claude Code's real behaviour — a green run that skipped it proves nothing.",
-      );
+    if (
+      !(await requireClaudeBinary(
+        t,
+        `that transcriptCwdHash matches the projects/ directory Claude Code really writes for a '${testCase.dir}' cwd`,
+      ))
+    ) {
       return;
     }
 
@@ -191,8 +233,12 @@ for (const testCase of LIVE_CASES) {
 }
 
 test("GROUND TRUTH (live Claude Code): the LEGACY slug is what was broken — it does NOT match reality for a dotted cwd", async (t) => {
-  if (!(await hasClaudeBinary())) {
-    t.skip("SKIPPED WITHOUT VERIFYING ANYTHING: `claude` is not on PATH.");
+  if (
+    !(await requireClaudeBinary(
+      t,
+      "that the PRE-FIX slug genuinely disagrees with reality for a dotted cwd (i.e. that this lane fixed a real bug)",
+    ))
+  ) {
     return;
   }
 
@@ -213,8 +259,12 @@ test("GROUND TRUTH (live Claude Code): the LEGACY slug is what was broken — it
 });
 
 test("FEATURE GOAL (live, end-to-end): a real dotted-cwd session's transcript is FOUND and PORTED across a subscription switch", async (t) => {
-  if (!(await hasClaudeBinary())) {
-    t.skip("SKIPPED WITHOUT VERIFYING ANYTHING: `claude` is not on PATH.");
+  if (
+    !(await requireClaudeBinary(
+      t,
+      "THE FEATURE'S GOAL — that a real dotted-cwd session's transcript survives a subscription switch instead of leaving the session unpromptable",
+    ))
+  ) {
     return;
   }
 
@@ -419,6 +469,30 @@ test("no legacy breadcrumb is emitted when the primary form served the lookup", 
 });
 
 // ─── The 200-char truncation branch ─────────────────────────────────────────
+
+test("the substitution runs per UTF-16 CODE UNIT, not per code point — the derivation must NOT carry the /u flag", () => {
+  // ⚠️ DO NOT "modernise" transcriptCwdHash's regex by adding the /u flag, and
+  // DO NOT swap the ASCII class for \p{L} or a unicode-aware \w. Both look like
+  // improvements and both are the bug: /u iterates CODE POINTS, so a
+  // supplementary-plane character would yield ONE hyphen instead of two, and a
+  // \p{L} class would PRESERVE non-ASCII letters instead of replacing them.
+  // Either change silently breaks every affected cwd — and, without the
+  // assertions below, passes the entire rest of this suite green.
+  //
+  // These are OBSERVED facts, not invented ones: verification/GROUND-TRUTH.md
+  // cases 28-32, from real Claude Code sessions in these cwd shapes.
+
+  // Case 32: U+1F680 is ONE code point but TWO UTF-16 code units, and Claude
+  // Code emitted TWO hyphens. This single assertion is what pins "no /u".
+  assert.equal(transcriptCwdHash("/w/emoji\u{1F680}x"), "-w-emoji--x");
+
+  // Cases 28-29: non-ASCII LETTERS are replaced, one hyphen each — never kept.
+  assert.equal(transcriptCwdHash("/w/café"), "-w-caf-");
+  assert.equal(transcriptCwdHash("/w/müller"), "-w-m-ller");
+
+  // Case 30: three CJK characters produce three hyphens.
+  assert.equal(transcriptCwdHash("/w/日本語"), "-w----");
+});
 
 test("the slug is truncated at 200 chars with a hash suffix, exactly as Claude Code does", () => {
   const short = "/workspace/projects/acpx/main";
