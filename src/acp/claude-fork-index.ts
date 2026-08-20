@@ -2,7 +2,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { transcriptJsonlPath } from "../config/subscription-transcript.js";
+import {
+  resolveExistingTranscriptPath,
+  transcriptJsonlPath,
+} from "../config/subscription-transcript.js";
 import { chooseSubscriptionConfigDir, loadSubscriptionRegistry } from "../config/subscriptions.js";
 import { splitCommandLine } from "./client-process.js";
 
@@ -53,9 +56,12 @@ async function readClaudeTranscript(
   subscriptionId: string | undefined,
 ): Promise<string | undefined> {
   const configDir = resolveClaudeConfigDir(subscriptionId);
-  const jsonlPath = transcriptJsonlPath(configDir, cwd, acpSessionId);
+  const resolved = await resolveExistingTranscriptPath(configDir, cwd, acpSessionId);
+  if (!resolved) {
+    return undefined;
+  }
   try {
-    return await fs.readFile(jsonlPath, "utf8");
+    return await fs.readFile(resolved.path, "utf8");
   } catch {
     return undefined;
   }
@@ -115,7 +121,18 @@ async function stageClaudeSourceTranscriptForDestination(args: {
     return async () => {};
   }
 
-  const sourcePath = transcriptJsonlPath(args.configDir, args.sourceCwd, args.sourceAcpSessionId);
+  // Source may still sit under the pre-fix slug (brick://ae715773); fall back to
+  // the primary path when neither exists so the readFile below fails naming the
+  // canonical location. The DESTINATION is always primary — Claude Code is about
+  // to read it, and it reads only that form.
+  const resolvedSource = await resolveExistingTranscriptPath(
+    args.configDir,
+    args.sourceCwd,
+    args.sourceAcpSessionId,
+  );
+  const sourcePath =
+    resolvedSource?.path ??
+    transcriptJsonlPath(args.configDir, args.sourceCwd, args.sourceAcpSessionId);
   const destinationPath = transcriptJsonlPath(
     args.configDir,
     args.destinationCwd,
