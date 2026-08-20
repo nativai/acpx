@@ -839,7 +839,7 @@ function disambiguateSlug(base: string, taken: ReadonlySet<string>): string {
 // Deterministic created_at-asc, then acpxRecordId-asc, via a single composite key
 // (NUL separator keeps the created_at boundary clean — neither field contains NUL).
 function templateCreatedAtSortKey(record: SessionRecord): string {
-  return `${record.template?.created_at ?? record.createdAt ?? ""} ${record.acpxRecordId}`;
+  return `${record.template?.created_at ?? record.createdAt ?? ""}\u0000${record.acpxRecordId}`;
 }
 
 function byTemplateCreatedAtThenId(a: SessionRecord, b: SessionRecord): number {
