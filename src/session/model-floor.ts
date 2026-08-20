@@ -2,7 +2,7 @@ import { open } from "node:fs/promises";
 import { isClaudeAcpAgentCommand } from "../acp/agent-command.js";
 import {
   activeTranscriptConfigDir,
-  transcriptJsonlPath,
+  resolveExistingTranscriptPath,
 } from "../config/subscription-transcript.js";
 import type { SessionAcpxState, SessionRecord } from "../types.js";
 import { effortRank, normalizeEffortLevelForModel } from "./config-option-application.js";
@@ -162,8 +162,11 @@ export async function readLastServedModel(record: SessionRecord): Promise<string
   } catch {
     return undefined;
   }
-  const jsonlPath = transcriptJsonlPath(configDir, record.cwd, record.acpSessionId);
-  return await readLastAssistantModelFromJsonl(jsonlPath);
+  const resolved = await resolveExistingTranscriptPath(configDir, record.cwd, record.acpSessionId);
+  if (!resolved) {
+    return undefined;
+  }
+  return await readLastAssistantModelFromJsonl(resolved.path);
 }
 
 async function readLastAssistantModelFromJsonl(filePath: string): Promise<string | undefined> {

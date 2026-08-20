@@ -24,11 +24,75 @@ import {
 // layer. Idempotent + overwrite-safe.
 
 /**
- * Derive the per-cwd directory segment Claude uses under `projects/`. This is
- * the single source of truth for the layout acpx already hard-codes in
+ * Longest slug Claude Code emits verbatim. Past this it truncates to exactly
+ * this many characters and appends `-<hash of the ORIGINAL cwd>`.
+ */
+const CLAUDE_SLUG_MAX_LENGTH = 200;
+
+/**
+ * Claude Code's own 32-bit string hash — `h = h * 31 + charCodeAt(i)`, kept in
+ * int32 by the `| 0`. `(h << 5) - h` IS `h * 31`; it is written that way here to
+ * mirror the shipped implementation exactly.
+ *
+ * `Act` can return -2147483648, and `Math.abs` of that is 2147483648 in JS (no
+ * two's-complement overflow — JS numbers are doubles), so the suffix is always
+ * positive. A port to a language with a 32-bit `abs` would break on that value.
+ */
+function claudeSlugOverflowHash(cwd: string): string {
+  let hash = 0;
+  for (let index = 0; index < cwd.length; index++) {
+    hash = ((hash << 5) - hash + cwd.charCodeAt(index)) | 0;
+  }
+  return Math.abs(hash).toString(36);
+}
+
+/**
+ * Derive the per-cwd directory segment Claude Code uses under `projects/`.
+ *
+ * ⚠️ DO NOT "simplify" this back to `cwd.replace(/\//g, "-")`. That was the bug
+ * (brick://ae715773): it maps the path separator and NOTHING ELSE, so for any
+ * cwd containing a `.`, `_`, space, or other non-`[A-Za-z0-9-]` character acpx
+ * computed a transcript path that CANNOT EXIST. A subscription switch then found
+ * no source transcript, the port never ran, and the session went unpromptable
+ * (before the fail-closed gate, it silently resumed with an EMPTY context).
+ * It looked correct for years because for a cwd made only of `[A-Za-z0-9/-]` —
+ * the overwhelming majority — the two derivations agree.
+ *
+ * The rule below is the SPEC, derived empirically from 34 real Claude Code
+ * sessions (v2.1.237) run in dot-, punctuation- and unicode-bearing cwds under
+ * isolated HOMEs, observing the directory name Claude Code actually wrote:
+ * brick://ae715773 `verification/GROUND-TRUTH.md`. Every character outside
+ * `[A-Za-z0-9-]` becomes one `-`; case and digits are preserved; nothing is
+ * collapsed or trimmed; then, past 200 characters, truncate-and-hash.
+ * `test/subscription-transcript.test.ts` pins the observed table — change this
+ * function and that table goes red.
+ *
+ * This is the single source of truth for the layout acpx also uses in
  * `src/cli/session/runtime.ts` (claudeSubagentDir) — keep them in lockstep.
  */
 export function transcriptCwdHash(cwd: string): string {
+  const substituted = cwd.replace(/[^a-zA-Z0-9-]/g, "-");
+  if (substituted.length <= CLAUDE_SLUG_MAX_LENGTH) {
+    return substituted;
+  }
+  return `${substituted.slice(0, CLAUDE_SLUG_MAX_LENGTH)}-${claudeSlugOverflowHash(cwd)}`;
+}
+
+/**
+ * The slug acpx computed BEFORE the fix above — separator-only substitution.
+ *
+ * Retained purely as a read-side fallback so sessions whose transcript acpx
+ * already filed under the wrong-but-consistent name are not orphaned by the
+ * switch. It is never used to WRITE: every destination path is the primary form,
+ * because the primary form is the only one Claude Code itself will ever read.
+ *
+ * For a cwd of only `[A-Za-z0-9/-]` this returns exactly what
+ * `transcriptCwdHash` returns, so the fallback is a no-op for most sessions.
+ * When it does fire it is logged (`transcript-slug-legacy-hit`) — see
+ * `resolveExistingTranscriptPath`. Delete this once those log lines stop
+ * appearing in the fleet.
+ */
+export function legacyTranscriptCwdHash(cwd: string): string {
   return cwd.replace(/\//g, "-");
 }
 
@@ -37,9 +101,49 @@ export function transcriptCwdHash(cwd: string): string {
  * Layout: <configDir>/projects/<cwdHash>/<acpSessionId>.jsonl (the `<acpSessionId>/`
  * dir holding `subagents/` is a sibling and is NOT load-bearing for top-level
  * resume).
+ *
+ * Always the PRIMARY (Claude-Code-correct) form — this is the canonical path and
+ * the only one anything writes to.
  */
 export function transcriptJsonlPath(configDir: string, cwd: string, acpSessionId: string): string {
   return path.join(configDir, "projects", transcriptCwdHash(cwd), `${acpSessionId}.jsonl`);
+}
+
+/** Same path under the pre-fix slug. Read-side fallback only — never a write target. */
+export function legacyTranscriptJsonlPath(
+  configDir: string,
+  cwd: string,
+  acpSessionId: string,
+): string {
+  return path.join(configDir, "projects", legacyTranscriptCwdHash(cwd), `${acpSessionId}.jsonl`);
+}
+
+export type TranscriptSlugForm = "primary" | "legacy";
+
+/**
+ * Locate an EXISTING transcript for this cwd, preferring the primary slug and
+ * falling back to the legacy one. Returns `undefined` when neither exists.
+ *
+ * A legacy hit is logged, deliberately: a silent fallback becomes permanent, and
+ * removing this one needs evidence that nothing still depends on it.
+ */
+export async function resolveExistingTranscriptPath(
+  configDir: string,
+  cwd: string,
+  acpSessionId: string,
+): Promise<{ path: string; form: TranscriptSlugForm } | undefined> {
+  const primary = transcriptJsonlPath(configDir, cwd, acpSessionId);
+  if (await fileExists(primary)) {
+    return { path: primary, form: "primary" };
+  }
+
+  const legacy = legacyTranscriptJsonlPath(configDir, cwd, acpSessionId);
+  if (legacy !== primary && (await fileExists(legacy))) {
+    logLegacyTranscriptSlugHit({ acpSessionId, cwd, legacyPath: legacy, primaryPath: primary });
+    return { path: legacy, form: "legacy" };
+  }
+
+  return undefined;
 }
 
 export type TranscriptRecoveryResult =
@@ -87,15 +191,27 @@ export async function portTranscript(args: {
 }): Promise<{ copied: boolean; reason?: string }> {
   const src = transcriptJsonlPath(args.srcConfigDir, args.cwd, args.acpSessionId);
   const dst = transcriptJsonlPath(args.dstConfigDir, args.cwd, args.acpSessionId);
+  return await copyTranscriptFile(src, dst);
+}
 
-  if (src === dst) {
+/**
+ * Copy one transcript JSONL to another absolute path. Split out from
+ * `portTranscript` so the recovery path can port from a source it has ALREADY
+ * located — which may sit under the legacy slug — rather than re-deriving the
+ * source path from a config dir and losing that.
+ */
+async function copyTranscriptFile(
+  srcPath: string,
+  dstPath: string,
+): Promise<{ copied: boolean; reason?: string }> {
+  if (srcPath === dstPath) {
     return { copied: false, reason: "same-dir" };
   }
 
-  await mkdir(path.dirname(dst), { recursive: true });
+  await mkdir(path.dirname(dstPath), { recursive: true });
 
   try {
-    await copyFile(src, dst);
+    await copyFile(srcPath, dstPath);
   } catch (error) {
     if (isNotFound(error)) {
       return { copied: false, reason: "no-source" };
@@ -207,12 +323,19 @@ export async function ensureTranscriptAtConfigDir(
     ? await renameDestinationAside(activePath, acpSessionId)
     : undefined;
 
-  const ported = await portTranscript({
-    srcConfigDir: best.configDir,
-    dstConfigDir,
-    cwd,
-    acpSessionId,
-  });
+  // Port from the path we ACTUALLY found, not from a re-derivation of it: the
+  // chosen source may sit under the legacy slug, and the destination is always
+  // the primary form — which is what makes this a migration rather than a
+  // permanent second home.
+  if (best.slugForm === "legacy") {
+    logLegacyTranscriptSlugHit({
+      acpSessionId,
+      cwd,
+      legacyPath: best.jsonlPath,
+      primaryPath: transcriptJsonlPath(best.configDir, cwd, acpSessionId),
+    });
+  }
+  const ported = await copyTranscriptFile(best.jsonlPath, activePath);
   if (!ported.copied && !(await fileExists(activePath))) {
     // Source vanished between probe and copy — the aside sidecar (if any) still
     // preserves the destination's branch; report missing so callers can react.
@@ -225,6 +348,7 @@ export async function ensureTranscriptAtConfigDir(
     chosenSource: best.jsonlPath,
     dstLastEntry: destProbe?.freshness.iso,
     srcLastEntry: best.freshness.iso,
+    srcSlugForm: best.slugForm,
     supersededPath,
   });
 
@@ -268,23 +392,72 @@ async function selectFreshestTranscript(
   let best: TranscriptCandidate | undefined;
   let destProbe: TranscriptCandidate | undefined;
   for (const configDir of orderedConfigDirs) {
-    const isDest = path.resolve(configDir) === resolvedDst;
-    const jsonlPath = transcriptJsonlPath(configDir, cwd, acpSessionId);
-    if (!isDest) {
-      searchedPaths.push(jsonlPath);
-    }
-    const candidate = await probeTranscriptCandidate(jsonlPath, configDir, isDest);
-    if (!candidate) {
-      continue;
-    }
-    if (isDest) {
-      destProbe = candidate;
-    }
-    if (!best || candidate.freshness.ms > best.freshness.ms) {
-      best = candidate;
+    const probed = await probeConfigDirSlugForms({
+      acpSessionId,
+      configDir,
+      cwd,
+      isDestDir: path.resolve(configDir) === resolvedDst,
+    });
+    searchedPaths.push(...probed.searchedPaths);
+    for (const candidate of probed.candidates) {
+      if (candidate.isDest) {
+        destProbe = candidate;
+      }
+      if (!best || candidate.freshness.ms > best.freshness.ms) {
+        best = candidate;
+      }
     }
   }
   return { best, destProbe, searchedPaths };
+}
+
+/**
+ * Probe one config dir under BOTH slug forms, primary first.
+ *
+ * The legacy form is skipped when it is the same string as the primary — for a
+ * cwd of plain `[A-Za-z0-9/-]` the two derivations agree, which is why this bug
+ * was invisible for most sessions.
+ *
+ * A legacy file is NEVER reported as `isDest`, even inside the destination
+ * config dir. That is deliberate: Claude Code reads only the primary path, so a
+ * legacy-named file at the destination is not "already present" — it is a
+ * stranded source. Treating it as a source is exactly what makes the next switch
+ * copy it onto the primary path and migrate the session.
+ */
+async function probeConfigDirSlugForms(args: {
+  acpSessionId: string;
+  configDir: string;
+  cwd: string;
+  isDestDir: boolean;
+}): Promise<{ candidates: TranscriptCandidate[]; searchedPaths: string[] }> {
+  const { acpSessionId, configDir, cwd, isDestDir } = args;
+  const primaryPath = transcriptJsonlPath(configDir, cwd, acpSessionId);
+  const legacyPath = legacyTranscriptJsonlPath(configDir, cwd, acpSessionId);
+
+  const forms: Array<{ form: TranscriptSlugForm; isDest: boolean; jsonlPath: string }> = [
+    { form: "primary", isDest: isDestDir, jsonlPath: primaryPath },
+  ];
+  if (legacyPath !== primaryPath) {
+    forms.push({ form: "legacy", isDest: false, jsonlPath: legacyPath });
+  }
+
+  const candidates: TranscriptCandidate[] = [];
+  const searchedPaths: string[] = [];
+  for (const entry of forms) {
+    if (!entry.isDest) {
+      searchedPaths.push(entry.jsonlPath);
+    }
+    const candidate = await probeTranscriptCandidate(
+      entry.jsonlPath,
+      configDir,
+      entry.isDest,
+      entry.form,
+    );
+    if (candidate) {
+      candidates.push(candidate);
+    }
+  }
+  return { candidates, searchedPaths };
 }
 
 function candidateConfigDirs(
@@ -305,12 +478,13 @@ async function probeTranscriptCandidate(
   jsonlPath: string,
   configDir: string,
   isDest: boolean,
+  slugForm: TranscriptSlugForm,
 ): Promise<TranscriptCandidate | undefined> {
   if (!(await fileExists(jsonlPath))) {
     return undefined;
   }
   const freshness = await lastEntryTimestamp(jsonlPath);
-  return { configDir, jsonlPath, isDest, freshness };
+  return { configDir, jsonlPath, isDest, freshness, slugForm };
 }
 
 type FreshnessProbe = {
@@ -327,6 +501,8 @@ type TranscriptCandidate = {
   jsonlPath: string;
   isDest: boolean;
   freshness: FreshnessProbe;
+  /** Which slug form located this file — `legacy` is a migration source. */
+  slugForm: TranscriptSlugForm;
 };
 
 const TRANSCRIPT_TAIL_BYTES = 64 * 1024;
@@ -442,6 +618,7 @@ function logTranscriptPortDecision(info: {
   chosenSource: string;
   dstLastEntry?: string;
   srcLastEntry?: string;
+  srcSlugForm: TranscriptSlugForm;
   supersededPath?: string;
 }): void {
   const decision = info.supersededPath ? "ported-superseded" : "ported";
@@ -449,8 +626,33 @@ function logTranscriptPortDecision(info: {
   process.stderr.write(
     `[acpx] transcript-port session=${info.acpSessionId} decision=${decision} ` +
       `dst=${info.activePath} chosenSource=${info.chosenSource} ` +
+      `srcSlugForm=${info.srcSlugForm} ` +
       `dstLastEntry=${info.dstLastEntry ?? "none"} srcLastEntry=${info.srcLastEntry ?? "none"}` +
       `${superseded}\n`,
+  );
+}
+
+/**
+ * Emit one stderr breadcrumb whenever a transcript was found ONLY under the
+ * pre-fix slug (brick://ae715773).
+ *
+ * Rider 1 of the fix charter: an unobservable fallback becomes permanent. Every
+ * line here is one session still filed under the old name; when the fleet stops
+ * producing them, `legacyTranscriptCwdHash` and its call sites can be deleted
+ * with evidence rather than hope. Same `[acpx] ` stderr idiom as
+ * `logTranscriptPortDecision` above and `logTranscriptRecovery` in reconnect.ts.
+ *
+ * Grep the fleet with: `transcript-slug-legacy-hit`
+ */
+function logLegacyTranscriptSlugHit(info: {
+  acpSessionId: string;
+  cwd: string;
+  legacyPath: string;
+  primaryPath: string;
+}): void {
+  process.stderr.write(
+    `[acpx] transcript-slug-legacy-hit session=${info.acpSessionId} cwd=${info.cwd} ` +
+      `resolved=${info.legacyPath} primaryMissing=${info.primaryPath}\n`,
   );
 }
 

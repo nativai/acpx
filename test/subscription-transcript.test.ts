@@ -68,9 +68,22 @@ async function withTempDir(run: (dir: string) => Promise<void>): Promise<void> {
   }
 }
 
-test("transcriptCwdHash replaces every slash with a dash", () => {
+test("transcriptCwdHash replaces every character outside [A-Za-z0-9-] with a dash", () => {
+  // Slash-only cwds — unchanged by the brick://ae715773 fix, and the reason the
+  // bug survived so long: for these the old and new derivations agree.
   assert.equal(transcriptCwdHash("/workspace/temp"), "-workspace-temp");
   assert.equal(transcriptCwdHash("/a/b/c"), "-a-b-c");
+
+  // The characters the old derivation dropped. Pinned against Claude Code's real
+  // behaviour by the live probes in test/transcript-cwd-slug.test.ts — that file
+  // is the authority; these are the fast regression guard.
+  assert.equal(transcriptCwdHash("/w/p/.bare"), "-w-p--bare");
+  assert.equal(transcriptCwdHash("/w/p/v1.2.3"), "-w-p-v1-2-3");
+  assert.equal(transcriptCwdHash("/w/p/under_score"), "-w-p-under-score");
+  assert.equal(transcriptCwdHash("/w/p/multi..dots"), "-w-p-multi--dots");
+
+  // Preserved: case, digits, and an existing hyphen.
+  assert.equal(transcriptCwdHash("/w/Proj-2/Main"), "-w-Proj-2-Main");
 });
 
 test("transcriptJsonlPath builds <configDir>/projects/<cwdHash>/<id>.jsonl", () => {

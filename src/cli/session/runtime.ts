@@ -149,6 +149,13 @@ function claudeSubagentDir(cwd: string, acpSessionId: string): string {
   const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
   // transcriptCwdHash is the single source of truth for the projects/<cwdHash>
   // layout (shared with subscription-transcript.ts's JSONL portability).
+  //
+  // ⚠️ NO legacy-slug fallback here, unlike the transcript JSONL lookups — and
+  // that asymmetry is deliberate, not an oversight. This `subagents/` tree is
+  // written by CLAUDE CODE and only ever read by acpx, so it has only ever
+  // existed under the primary slug; a legacy probe would be dead code that
+  // outlives the fallback it imitates. The JSONL lookups need the fallback
+  // because acpx itself WROTE those files, under the wrong name (brick://ae715773).
   return path.join(configDir, "projects", transcriptCwdHash(cwd), acpSessionId, "subagents");
 }
 
