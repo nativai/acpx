@@ -3,13 +3,16 @@ import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import test, { after, type TestContext } from "node:test";
+// NOTE: `transcriptJsonlPath` / `legacyTranscriptJsonlPath` are deliberately NOT
+// imported here. Every path this file asserts on is built from a LITERAL slug
+// (see the DOTTED_* block below) — importing the path builders is what let three
+// separate tests assert only self-consistency. Keeping them out of scope makes
+// the tautology hard to reintroduce by accident.
 import {
   ensureTranscriptAtConfigDir,
   legacyTranscriptCwdHash,
-  legacyTranscriptJsonlPath,
   resolveExistingTranscriptPath,
   transcriptCwdHash,
-  transcriptJsonlPath,
 } from "../src/config/subscription-transcript.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -407,11 +410,15 @@ test("a legacy-slug hit is LOGGED, and the transcript is migrated onto the prima
   const root = await fs.mkdtemp(path.join(await liveRoot(), "legacy-hit-"));
   const srcConfigDir = path.join(root, "src");
   const dstConfigDir = path.join(root, "dst");
-  const cwd = "/workspace/projects/acpx-ui/.bare";
   const acpSessionId = "99999999-8888-7777-6666-555555555555";
 
-  // A session stranded under the PRE-FIX name — what the fleet already has.
-  const legacy = legacyTranscriptJsonlPath(srcConfigDir, cwd, acpSessionId);
+  // A session stranded under the PRE-FIX name — what the fleet already has —
+  // placed by LITERAL slug. Deriving this from legacyTranscriptJsonlPath() made
+  // the test tautological: it filed the fixture wherever that function said and
+  // then found it there, so gutting `legacyTranscriptCwdHash` to `return "nope"`
+  // left it GREEN (it happily used `projects/nope/`). Rider 1's own test could
+  // not detect a broken legacy derivation.
+  const legacy = literalJsonlPath(srcConfigDir, DOTTED_LEGACY_SLUG, acpSessionId);
   await fs.mkdir(path.dirname(legacy), { recursive: true });
   await fs.writeFile(
     legacy,
@@ -427,19 +434,28 @@ test("a legacy-slug hit is LOGGED, and the transcript is migrated onto the prima
 
   let recovery: Awaited<ReturnType<typeof ensureTranscriptAtConfigDir>>;
   try {
-    recovery = await ensureTranscriptAtConfigDir({ acpSessionId, acpx: {}, cwd }, dstConfigDir, {
-      homeDir: root,
-      registry: { subscriptions: [] },
-      sourceConfigDirs: [srcConfigDir],
-    });
+    recovery = await ensureTranscriptAtConfigDir(
+      { acpSessionId, acpx: {}, cwd: DOTTED_CWD },
+      dstConfigDir,
+      {
+        homeDir: root,
+        registry: { subscriptions: [] },
+        sourceConfigDirs: [srcConfigDir],
+      },
+    );
   } finally {
     process.stderr.write = originalWrite;
   }
 
   assert.equal(recovery.status, "ported", "a stranded legacy transcript must still be recovered");
+  assert.equal(recovery.sourcePath, legacy, "it must have been the LEGACY file that was recovered");
 
   // Migration, not a second permanent home: the destination is the PRIMARY form.
-  assert.equal(recovery.activePath, transcriptJsonlPath(dstConfigDir, cwd, acpSessionId));
+  assert.equal(
+    recovery.activePath,
+    literalJsonlPath(dstConfigDir, DOTTED_PRIMARY_SLUG, acpSessionId),
+    "the port must land on the slug Claude Code actually reads",
+  );
   const ported = await fs.readFile(recovery.activePath, "utf8");
   assert.match(ported, /stranded/);
 
@@ -462,10 +478,10 @@ test("no legacy breadcrumb is emitted when the primary form served the lookup", 
   const root = await fs.mkdtemp(path.join(await liveRoot(), "no-breadcrumb-"));
   const srcConfigDir = path.join(root, "src");
   const dstConfigDir = path.join(root, "dst");
-  const cwd = "/workspace/projects/acpx-ui/.bare";
   const acpSessionId = "12121212-3434-5656-7878-909090909090";
 
-  const primary = transcriptJsonlPath(srcConfigDir, cwd, acpSessionId);
+  // LITERAL slug again — see the DOTTED_* block above for why.
+  const primary = literalJsonlPath(srcConfigDir, DOTTED_PRIMARY_SLUG, acpSessionId);
   await fs.mkdir(path.dirname(primary), { recursive: true });
   await fs.writeFile(primary, `{"type":"assistant","timestamp":"2026-08-20T11:00:00.000Z"}\n`);
 
@@ -477,7 +493,7 @@ test("no legacy breadcrumb is emitted when the primary form served the lookup", 
   }) as typeof process.stderr.write;
 
   try {
-    await ensureTranscriptAtConfigDir({ acpSessionId, acpx: {}, cwd }, dstConfigDir, {
+    await ensureTranscriptAtConfigDir({ acpSessionId, acpx: {}, cwd: DOTTED_CWD }, dstConfigDir, {
       homeDir: root,
       registry: { subscriptions: [] },
       sourceConfigDirs: [srcConfigDir],
@@ -601,19 +617,33 @@ test("the substitution runs per UTF-16 CODE UNIT, not per code point — the der
 });
 
 test("the slug is truncated at 200 chars with a hash suffix, exactly as Claude Code does", () => {
-  const short = "/workspace/projects/acpx/main";
-  assert.equal(transcriptCwdHash(short).length, short.length);
+  // OBSERVED pair, GROUND-TRUTH.md batch 4: a real Claude Code session in this
+  // 227-char cwd created exactly this 207-char directory (200 + "-" + 6-char
+  // base-36 hash of the ORIGINAL cwd).
+  //
+  // ⚠️ The expectation is a LITERAL, deliberately. It used to recompute the
+  // expected prefix with its own copy of `.replace(/[^a-zA-Z0-9-]/g,"-")`, which
+  // is the same self-consistency trap that made three other tests in this file
+  // unable to fail — and it would also have accepted ANY hash suffix, since it
+  // only checked that the tail matched /^[0-9a-z]+$/. The literal pins the hash
+  // function too.
+  const observedCwd = `/workspace/f1-probe/long/${"a".repeat(100)}.${"a".repeat(100)}x`;
+  const observedSlug = `-workspace-f1-probe-long-${"a".repeat(100)}-${"a".repeat(74)}-pw3dhh`;
 
-  const long = `/workspace/${"a".repeat(150)}/${"b".repeat(150)}`;
-  const slug = transcriptCwdHash(long);
-  assert.ok(long.length > 200, "fixture must actually exceed the cap");
-  assert.equal(slug.slice(0, 200), long.replace(/[^a-zA-Z0-9-]/g, "-").slice(0, 200));
-  assert.equal(slug[200], "-");
-  assert.match(slug.slice(201), /^[0-9a-z]+$/, "suffix must be base-36");
+  assert.equal(observedCwd.length, 227, "fixture drifted from the observed cwd");
+  assert.equal(observedSlug.length, 207, "fixture drifted from the observed slug");
+  assert.equal(transcriptCwdHash(observedCwd), observedSlug);
 
-  // Distinct long paths sharing a 200-char prefix must NOT collide.
-  const sibling = `${long}/different`;
-  assert.notEqual(transcriptCwdHash(long), transcriptCwdHash(sibling));
+  // Below the cap, the slug is the substitution and nothing else.
+  assert.equal(transcriptCwdHash("/workspace/projects/acpx/main"), "-workspace-projects-acpx-main");
+
+  // Distinct long paths sharing a 200-char prefix must NOT collide — the whole
+  // point of appending a hash rather than plain truncation.
+  assert.notEqual(
+    transcriptCwdHash(observedCwd),
+    transcriptCwdHash(`${observedCwd}/different`),
+    "two cwds sharing a 200-char prefix must not collide",
+  );
 });
 
 test("searchedPaths names BOTH slug forms, so a miss is diagnosable", async () => {
