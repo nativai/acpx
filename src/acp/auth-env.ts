@@ -1,5 +1,5 @@
 import { mkdirSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -181,55 +181,211 @@ function promotePrefixedAuthEnvironment(env: NodeJS.ProcessEnv): void {
 
 const DEFAULT_ACPX_UI_BASE_URL = "https://acpx.devbox.nativai.de";
 
+/** PID 1's environment — NUL-separated `KEY=value`. */
+export const PID1_ENVIRON_FILE = "/proc/1/environ";
+/** The in-pod authoritative namespace (`dev-<box>`). */
+export const SERVICE_ACCOUNT_NAMESPACE_FILE =
+  "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
+const RESOLV_CONF_FILE = "/etc/resolv.conf";
+
+/** `search dev-<box>.svc.cluster.local …` → the `<box>` token. */
+function boxTokenFromResolvConf(resolvConf: string): string | undefined {
+  const match = resolvConf.match(/^search\s+(\S+)/m);
+  if (!match) {
+    return undefined;
+  }
+  return match[1].match(/^dev-([a-z0-9-]+)\.svc\.cluster\.local$/i)?.[1];
+}
+
 /**
  * FW-20: derive the box's acpx-ui base URL from its K8s namespace. Each box runs
  * in namespace `dev-<box>` whose pods get a resolv.conf search domain
  * `dev-<box>.svc.cluster.local`; the box name maps to `https://acpx.<box>.nativai.de`.
  * Pure (content in, url out) so it is testable without touching the filesystem.
  * Returns undefined for non-cluster / unrecognized search domains.
+ *
+ * ⚠️ This yields the box's ALIAS host, not necessarily its canonical one — see the
+ * ladder note on `resolveAcpxUiBaseUrl`. It is the last-resort rung, not the truth.
  */
 export function parseBoxBaseUrlFromResolvConf(resolvConf: string): string | undefined {
-  const match = resolvConf.match(/^search\s+(\S+)/m);
-  if (!match) {
-    return undefined;
-  }
-  const nsMatch = match[1].match(/^dev-([a-z0-9-]+)\.svc\.cluster\.local$/i);
-  const box = nsMatch?.[1];
-  if (!box) {
-    return undefined;
-  }
-  return `https://acpx.${box}.nativai.de`;
+  const box = boxTokenFromResolvConf(resolvConf);
+  return box ? `https://acpx.${box}.nativai.de` : undefined;
 }
 
-// Cache the namespace-derived base URL: /etc/resolv.conf does not change within a
-// process. `null` = computed-and-absent (not-in-cluster); undefined = not computed.
+/** `search dev-konsiq.svc.cluster.local …` → `dev-konsiq`. Pure. */
+export function parseNamespaceFromResolvConf(resolvConf: string): string | undefined {
+  const box = boxTokenFromResolvConf(resolvConf);
+  return box ? `dev-${box}` : undefined;
+}
+
+/** `KEY=value\0KEY2=value2\0` → the value of `name`. Pure. */
+export function envValueFromEnviron(environ: string, name: string): string | undefined {
+  for (const pair of environ.split("\0")) {
+    const eq = pair.indexOf("=");
+    if (eq <= 0 || pair.slice(0, eq) !== name) {
+      continue;
+    }
+    const value = pair.slice(eq + 1).trim();
+    if (value.length > 0) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The box's CANONICAL public base URL from acpx-ui's hostmap cache — the entry
+ * matching this namespace whose `source` is not `"alias"`. Mirrors acpx-ui's
+ * `canonicalPublicBaseForNamespace` (`packages/hostmap/core/map.ts`), including
+ * its `source !== "alias"` test, so a sourceless entry still counts as canonical.
+ * acpx cannot import that package (different repo, no dependency on it), so the
+ * ~15 lines are duplicated here rather than shared. Pure; any malformed or
+ * unexpected shape is a miss, never a throw.
+ */
+function canonicalHostFromCacheEntry(entry: unknown, namespace: string): string | undefined {
+  if (typeof entry !== "object" || entry === null) {
+    return undefined;
+  }
+  const { host, namespace: entryNamespace, source } = entry as Record<string, unknown>;
+  if (entryNamespace !== namespace || source === "alias" || typeof host !== "string") {
+    return undefined;
+  }
+  return nonEmptyEnvString(host);
+}
+
+export function canonicalBaseUrlFromHostmapCache(
+  cacheJson: string,
+  namespace: string,
+): string | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cacheJson);
+  } catch {
+    return undefined;
+  }
+  const entries = (parsed as { entries?: unknown } | null)?.entries;
+  if (!Array.isArray(entries)) {
+    return undefined;
+  }
+  for (const entry of entries) {
+    const host = canonicalHostFromCacheEntry(entry, namespace);
+    if (host) {
+      return `https://${host}`;
+    }
+  }
+  return undefined;
+}
+
+/** The file contents each derivation rung consumes. Absent = that rung misses. */
+export type BoxBaseUrlSources = {
+  pid1Environ?: string;
+  namespaceFile?: string;
+  resolvConf?: string;
+  hostmapCache?: string;
+};
+
+/**
+ * Rungs 2–4 of the ladder on `resolveAcpxUiBaseUrl`, as a pure function of the
+ * file contents — so the ordering is testable without a filesystem or a box.
+ */
+/** This box's namespace: the service-account file if present, else resolv.conf. */
+function namespaceFromSources(sources: BoxBaseUrlSources): string | undefined {
+  return (
+    nonEmptyEnvString(sources.namespaceFile) ??
+    (sources.resolvConf ? parseNamespaceFromResolvConf(sources.resolvConf) : undefined)
+  );
+}
+
+export function deriveBoxBaseUrlFrom(sources: BoxBaseUrlSources): string | undefined {
+  const fromPid1 = sources.pid1Environ
+    ? envValueFromEnviron(sources.pid1Environ, "ACPX_UI_BASE_URL")
+    : undefined;
+  if (fromPid1) {
+    return fromPid1;
+  }
+  const namespace = namespaceFromSources(sources);
+  const fromHostmap =
+    namespace && sources.hostmapCache
+      ? canonicalBaseUrlFromHostmapCache(sources.hostmapCache, namespace)
+      : undefined;
+  if (fromHostmap) {
+    return fromHostmap;
+  }
+  return sources.resolvConf ? parseBoxBaseUrlFromResolvConf(sources.resolvConf) : undefined;
+}
+
+/** Read a file as UTF-8, or undefined when missing / unreadable. Never throws. */
+function readFileOrUndefined(filePath: string): string | undefined {
+  try {
+    return readFileSync(filePath, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * acpx-ui's hostmap cache. `ACPX_HOSTMAP_CACHE_FILE` overrides the default, matching
+ * the knob acpx-ui's own `resolveHostmapCacheFile` honours when it WRITES the file —
+ * if the two disagreed on the path we would read a cache nobody writes.
+ */
+function hostmapCacheFile(env: NodeJS.ProcessEnv): string {
+  const explicit = nonEmptyEnvString(env.ACPX_HOSTMAP_CACHE_FILE);
+  return explicit ? resolvePath(explicit) : join(homedir(), ".acpx", "hostmap-cache.json");
+}
+
+// Cache the derived base URL: none of its inputs change within a process, and this
+// runs on every spawn. `null` = computed-and-absent; undefined = not computed.
 let cachedBoxBaseUrl: string | null | undefined;
 
-function deriveBoxBaseUrl(): string | undefined {
+function deriveBoxBaseUrl(env: NodeJS.ProcessEnv): string | undefined {
   if (cachedBoxBaseUrl !== undefined) {
     return cachedBoxBaseUrl ?? undefined;
   }
-  let value: string | undefined;
-  try {
-    value = parseBoxBaseUrlFromResolvConf(readFileSync("/etc/resolv.conf", "utf8"));
-  } catch {
-    value = undefined;
-  }
+  const value = deriveBoxBaseUrlFrom({
+    pid1Environ: readFileOrUndefined(PID1_ENVIRON_FILE),
+    namespaceFile: readFileOrUndefined(SERVICE_ACCOUNT_NAMESPACE_FILE),
+    resolvConf: readFileOrUndefined(RESOLV_CONF_FILE),
+    hostmapCache: readFileOrUndefined(hostmapCacheFile(env)),
+  });
   cachedBoxBaseUrl = value ?? null;
   return value;
 }
 
 /**
- * The acpx-ui base URL for THIS box. Precedence (FW-20):
+ * The acpx-ui base URL for THIS box. Every session URL acpx composes funnels
+ * through here, so this is the single point that decides the host agents see.
+ * Precedence, first hit wins:
  *   1. explicit ACPX_UI_BASE_URL env (operator override / test seam)
- *   2. namespace-derived host (robust to restarts wiping per-box env — the bug:
- *      a missing ACPX_UI_BASE_URL on tubeyakker fell back to the devbox default,
- *      giving every agent the WRONG own/parent URL host)
- *   3. the hardcoded devbox default (non-cluster / unknown namespace)
+ *   2. ACPX_UI_BASE_URL out of /proc/1/environ — the box's OWN answer. `ssh` does
+ *      not carry the container env, so a shell reached as `ssh-remote <box> -- …`
+ *      sees an empty $ACPX_UI_BASE_URL while PID 1 still holds the real one.
+ *   3. the CANONICAL host for this namespace from acpx-ui's hostmap cache
+ *   4. the resolv.conf structural guess (rung 5 below is worse; see the warning)
+ *   5. the hardcoded devbox default (non-cluster / unknown namespace)
+ *
+ * ⚠️ Rungs 2 and 3 exist because rung 4 is STRUCTURALLY UNABLE to be right for
+ * three of the five boxes, and no rule of that shape ever can be. FW-20 added
+ * rung 4 to stop a missing ACPX_UI_BASE_URL falling through to the devbox default
+ * (rung 5), which gave agents on other boxes an outright WRONG-BOX host. It fixed
+ * that, but `https://acpx.<box>.nativai.de` is only the box's ALIAS: konsiq,
+ * labidio and tubeyakker are canonically served at `acpx.devbox.konsiq.de`,
+ * `acpx.devbox.labidio.de` and `acpx.devbox.tubeyakker.com` — a THIRD TLD, which
+ * is why no hostname rule can cover the fleet. The alias is servable, so rung 4
+ * yields a working-but-non-canonical URL whose host does not match the box's own
+ * identity. Measured on konsiq 2026-08-20 (deployed acpx ff1cc2e7, read-only):
+ * rung 4 alone → `https://acpx.konsiq.nativai.de`; rungs 2 and 3 both →
+ * `https://acpx.devbox.konsiq.de`. Rung 4 stays as the fallback — still correct
+ * for any future `*.nativai.de` box, and still better than rung 5.
+ *
+ * ⚠️ Kept SYNCHRONOUS deliberately: every rung is a `readFileSync`, and the call
+ * sites are synchronous. acpx-ui's equivalent ladder has a further
+ * `GET 127.0.0.1:3456/api/config` rung — do NOT port it here, it would force an
+ * async refactor of every caller for a case rungs 2–3 already cover on all five
+ * boxes.
  */
 export function resolveAcpxUiBaseUrl(env: NodeJS.ProcessEnv): string {
   const raw = env.ACPX_UI_BASE_URL?.trim();
-  const base = raw && raw.length > 0 ? raw : (deriveBoxBaseUrl() ?? DEFAULT_ACPX_UI_BASE_URL);
+  const base = raw && raw.length > 0 ? raw : (deriveBoxBaseUrl(env) ?? DEFAULT_ACPX_UI_BASE_URL);
   return base.replace(/\/+$/, "");
 }
 
