@@ -89,8 +89,26 @@ export function transcriptCwdHash(cwd: string): string {
  * For a cwd of only `[A-Za-z0-9/-]` this returns exactly what
  * `transcriptCwdHash` returns, so the fallback is a no-op for most sessions.
  * When it does fire it is logged (`transcript-slug-legacy-hit`) — see
- * `resolveExistingTranscriptPath`. Delete this once those log lines stop
- * appearing in the fleet.
+ * `resolveExistingTranscriptPath`.
+ *
+ * ⚠️ REMOVAL CRITERION — do NOT wait for the log lines to stop. They are
+ * expected NEVER to appear, so silence proves nothing and an engineer waiting
+ * for it waits forever. This fallback is not a migration mechanism.
+ *
+ * The reason is structural, not circumstantial. A legacy-form directory could
+ * only exist where the legacy slug DIFFERS from the primary one AND acpx had
+ * successfully WRITTEN there — but writing required first FINDING a source
+ * transcript, which for exactly those cwds is what acpx could not do. Claude
+ * Code always wrote the correct form; acpx only ever READ the wrong one. So the
+ * set of stranded legacy directories is empty by construction, not merely empty
+ * today. Measured independently: 0 of 267 live project directories contain any
+ * character outside `[A-Za-z0-9-]`, with a positive control confirming the scan
+ * could see a dotted name (brick://ae715773 test-engineer VERIFICATION.md).
+ *
+ * What it IS: cheap insurance for a case the argument above does not cover —
+ * a transcript tree produced by some other acpx build or carried between boxes.
+ * Removing it therefore has to rest on that structural argument (plus whatever
+ * cross-box paths exist at the time), NEVER on an absence of breadcrumbs.
  */
 export function legacyTranscriptCwdHash(cwd: string): string {
   return cwd.replace(/\//g, "-");
@@ -124,8 +142,9 @@ export type TranscriptSlugForm = "primary" | "legacy";
  * Locate an EXISTING transcript for this cwd, preferring the primary slug and
  * falling back to the legacy one. Returns `undefined` when neither exists.
  *
- * A legacy hit is logged, deliberately: a silent fallback becomes permanent, and
- * removing this one needs evidence that nothing still depends on it.
+ * A legacy hit is logged, deliberately: a silent fallback becomes permanent.
+ * See `legacyTranscriptCwdHash` for why a hit here should never actually occur
+ * in the wild, and why that silence is NOT the criterion for deleting it.
  */
 export async function resolveExistingTranscriptPath(
   configDir: string,
@@ -636,11 +655,17 @@ function logTranscriptPortDecision(info: {
  * Emit one stderr breadcrumb whenever a transcript was found ONLY under the
  * pre-fix slug (brick://ae715773).
  *
- * Rider 1 of the fix charter: an unobservable fallback becomes permanent. Every
- * line here is one session still filed under the old name; when the fleet stops
- * producing them, `legacyTranscriptCwdHash` and its call sites can be deleted
- * with evidence rather than hope. Same `[acpx] ` stderr idiom as
- * `logTranscriptPortDecision` above and `logTranscriptRecovery` in reconnect.ts.
+ * Rider 1 of the fix charter: an unobservable fallback becomes permanent. Same
+ * `[acpx] ` stderr idiom as `logTranscriptPortDecision` above and
+ * `logTranscriptRecovery` in reconnect.ts.
+ *
+ * ⚠️ Read a line here as a SURPRISE, not as migration progress. Per
+ * `legacyTranscriptCwdHash`'s removal criterion, no stranded legacy-form
+ * directory should exist on this box at all — so if one of these ever fires,
+ * something outside the model that predicted zero has happened (a transcript
+ * tree from another acpx build, or one carried across boxes) and is worth
+ * understanding rather than merely counting. Correspondingly, the ABSENCE of
+ * these lines is not evidence the fallback can be deleted.
  *
  * Grep the fleet with: `transcript-slug-legacy-hit`
  */
