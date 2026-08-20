@@ -2740,8 +2740,11 @@ test("integration: queued prompt honors per-request prompt retries on warm owner
           ...baseAgentArgs(cwd),
           "--format",
           "quiet",
+          // brick://113073b8 — 60, not 3600: `--ttl` is the idle-CHECK cadence, not a
+          // deadline, so a 3600 owner cannot even evaluate release for an hour and keeps
+          // a 60-minute floor after the run. 60 still keeps the owner warm across turns.
           "--ttl",
-          "3600",
+          "60",
           "prompt",
           "say exactly: warm-owner-no-retries",
         ],
@@ -2801,8 +2804,11 @@ test("integration: queued prompt without retry flag ignores warm owner startup r
           ...baseAgentArgs(cwd),
           "--format",
           "quiet",
+          // brick://113073b8 — 60, not 3600: `--ttl` is the idle-CHECK cadence, not a
+          // deadline, so a 3600 owner cannot even evaluate release for an hour and keeps
+          // a 60-minute floor after the run. 60 still keeps the owner warm across turns.
           "--ttl",
-          "3600",
+          "60",
           "--prompt-retries",
           "1",
           "prompt",
@@ -3672,8 +3678,11 @@ test("integration: prompt exits after done while detached owner stays warm", asy
           ...baseAgentArgs(cwd),
           "--format",
           "quiet",
+          // brick://113073b8 — 60, not 3600: `--ttl` is the idle-CHECK cadence, not a
+          // deadline, so a 3600 owner cannot even evaluate release for an hour and keeps
+          // a 60-minute floor after the run. 60 still keeps the owner warm across turns.
           "--ttl",
-          "3600",
+          "60",
           "prompt",
           "say exactly: warm-owner-ready",
         ],

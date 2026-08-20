@@ -129,7 +129,13 @@ async function withRealQueueOwner(
     const owner = spawnQueueOwnerProcess({
       sessionId,
       permissionMode: "approve-reads",
-      ttlMs: 0,
+      // brick://113073b8 — 60s, not 0. `ttlMs: 0` makes `nextTask` never time out,
+      // which makes the idle-release branch structurally unreachable: such an owner
+      // is IMMORTAL and, if this file process is killed before the `finally` below
+      // runs, survives until the box reboots. 60_000 keeps the test's premise intact
+      // — the first poll timeout is 60s, far past this test's ~4s runtime, so no
+      // idle check can fire mid-test and the owner is just as quiet as at ttl 0.
+      ttlMs: 60_000,
     });
 
     try {
