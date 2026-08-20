@@ -35,7 +35,16 @@ test("coverage script excludes generated package output", () => {
   assert.match(coverageScript, /dist-test\/src\/flows\/schema\.js/);
   assert.match(coverageScript, /dist-test\/src\/runtime\/public\/\*\*\/\*\.js/);
   assert.match(coverageScript, /dist-test\/src\/runtime\/engine\/manager\.js/);
-  assert.match(coverageScript, /node --test dist-test\/test\/\*\.test\.js && c8\b/);
+  // brick://113073b8 — this pins TWO properties, and the second is new.
+  // (1) the full suite still runs BEFORE the c8-instrumented subset, as always;
+  // (2) it runs THROUGH scripts/run-tests.mjs, the wrapper that tags and reaps the
+  //     `__queue-owner` daemons the suite spawns.
+  // ⚠ DO NOT "simplify" this back to a bare `node --test dist-test/test/*.test.js`.
+  // It looks equivalent and is not: a bare runner silently reintroduces the leak
+  // under `pnpm run check` — the suite strands ~26 owners from cli.test.js alone,
+  // each living 30 minutes, which is what evicted this box's pod three times on
+  // 2026-08-20. The leak is invisible to every other test in this repo.
+  assert.match(coverageScript, /scripts\/run-tests\.mjs dist-test\/test\/\*\.test\.js && c8\b/);
   assert.match(coverageScript, /dist-test\/test\/flows\.test\.js/);
   assert.match(coverageScript, /dist-test\/test\/runtime-manager\.test\.js/);
   assert.match(coverageScript, /--exclude ['"]?dist\/\*\*\/\*\.js['"]?/);
@@ -63,4 +72,21 @@ test("test scripts build packaged output before running package-bin smoke tests"
 
   assert.match(pkg.scripts?.test ?? "", /^pnpm run build && pnpm run build:test && /);
   assert.match(pkg.scripts?.["test:coverage"] ?? "", /^pnpm run build && pnpm run build:test && /);
+});
+
+test("the full suite runs through the owner-reaping wrapper (brick://113073b8)", () => {
+  const pkg = readPackageJson();
+
+  // Both entry points that run the WHOLE suite must go through the wrapper. It is
+  // what stamps ACPX_TEST_OWNER_TAG on every spawn, caps the owner idle-release
+  // deadline for the run, and sweeps the run's leftovers afterwards. Without it the
+  // suite leaks queue owners at a rate no drain matches (93 -> 111 live owners in
+  // five minutes, measured 2026-08-20), and nothing else in this repo would notice.
+  for (const script of ["test", "test:coverage"]) {
+    assert.match(
+      pkg.scripts?.[script] ?? "",
+      /node scripts\/run-tests\.mjs dist-test\/test\/\*\.test\.js/,
+      `${script} must run the full suite through scripts/run-tests.mjs`,
+    );
+  }
 });

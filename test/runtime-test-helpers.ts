@@ -4,6 +4,13 @@ import path from "node:path";
 import type { AcpAgentRegistry, AcpRuntimeOptions, AcpSessionStore } from "../src/runtime.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence.js";
 import type { SessionRecord } from "../src/types.js";
+import { installOwnerReaper } from "./owner-reaper.js";
+
+// brick://113073b8 — stamp this test-file process's unique owner tag and register
+// the teardown reap. MUST run at module load: every test file reaches this module
+// before any test body executes, so every `__queue-owner` the file later spawns —
+// in process or through a `runCli` subprocess — inherits the tag and is reapable.
+installOwnerReaper();
 
 export type MakeSessionRecordOptions = {
   defaultName?: boolean;
