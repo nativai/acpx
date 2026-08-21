@@ -970,3 +970,116 @@ test("the token rule is not satisfied by a line that merely survives the specime
   assert.match(shipped, SPECIMEN_FILTER);
   assertEveryStatusLineCarriesTheToken("control", shipped);
 });
+
+// ─── The all-or-nothing backstop, on the cases only IT can catch ─────────────
+//
+// Ids are validated twice, deliberately, and the two layers see different things:
+//
+//   1. an index pre-resolution, which is what can tell "no such session" from
+//      "it is still open" from "ambiguous" — distinctions the prunable-record set
+//      cannot draw, because an open or ambiguous session simply is not in it;
+//   2. the `onBeforeDelete` contract check, which is the BACKSTOP for everything
+//      the index cannot see: a record file that has gone missing, a record that
+//      turns out to be a protected blueprint, one the age filter excluded.
+//
+// ⚠️ Layer 2 is exercised by EXACTLY TWO tests here — the blueprint case and the
+// age-filter case. Every other id test in this file is short-circuited by layer 1,
+// so deleting the `onBeforeDelete` check leaves the rest green: measured, not
+// assumed, by disabling it (mutation M4, brick://dd4cb0e8) — the suite passed
+// 25/25 before these were written, and reds exactly 2 of 28 after.
+//
+// The "vanished record file" case below is NOT one of the two, and the reason is
+// worth knowing: removing a record file makes the index stale, the next load
+// rebuilds it, and the entry disappears — so layer 1 sees the id as unresolvable
+// and layer 2 is never reached. It is kept because it pins the observable
+// behaviour §E-f specifies, not because it covers the backstop.
+test("an id whose record file has vanished aborts the run instead of skipping it", async () => {
+  await withTempHome(async (homeDir) => {
+    const { workCwd } = await seedSpecimen(homeDir);
+
+    // Force the index to exist and list all seven, then remove one record file.
+    // The index entry survives; the record does not. loadPrunableRecords skips a
+    // record it cannot load, so the named id silently falls out of the plan.
+    const warm = await runCli(
+      ["--cwd", workCwd, "claude", "sessions", "prune", "--dry-run"],
+      homeDir,
+    );
+    assert.equal(warm.code, 0, warm.stderr);
+    await fs.rm(sessionFilePath(homeDir, "e600985f"));
+
+    const result = await runCli(
+      ["--cwd", workCwd, "claude", "sessions", "prune", "051458e5", "e600985f"],
+      homeDir,
+    );
+
+    assert.equal(result.code, 1);
+    assert.match(pruneOutput(result.stderr), /no closed claude session matches 'e600985f'/);
+    assert.ok(
+      await fileExists(sessionFilePath(homeDir, "051458e5")),
+      "the sibling named in the same command must survive — all or nothing",
+    );
+  });
+});
+
+test("naming a protected blueprint aborts the run instead of pruning its siblings", async () => {
+  await withTempHome(async (homeDir) => {
+    const workCwd = path.join(homeDir, "workspace");
+    await fs.mkdir(workCwd, { recursive: true });
+    await seedSession(homeDir, "plain-one", workCwd);
+    await seedSession(homeDir, "blueprint-one", workCwd, {
+      template: {
+        enabled: true,
+        slug: "telegram-personal-assistant",
+        version: 1,
+        created_at: "2026-01-01T00:00:00.000Z",
+      },
+    });
+
+    const result = await runCli(
+      ["--cwd", workCwd, "claude", "sessions", "prune", "plain-one", "blueprint-one"],
+      homeDir,
+    );
+
+    assert.equal(result.code, 1);
+    assert.ok(
+      await fileExists(sessionFilePath(homeDir, "blueprint-one")),
+      "the blueprint is protected, as before",
+    );
+    assert.ok(
+      await fileExists(sessionFilePath(homeDir, "plain-one")),
+      "and its co-named sibling is NOT deleted — the operator's sentence did not come true",
+    );
+
+    // Control: named alone, the plain session deletes normally.
+    const control = await runCli(
+      ["--cwd", workCwd, "claude", "sessions", "prune", "plain-one"],
+      homeDir,
+    );
+    assert.equal(control.code, 0, control.stderr);
+    assert.equal(await fileExists(sessionFilePath(homeDir, "plain-one")), false);
+  });
+});
+
+test("an id excluded by a combined age filter aborts rather than deleting a subset", async () => {
+  await withTempHome(async (homeDir) => {
+    const workCwd = path.join(homeDir, "workspace");
+    await fs.mkdir(workCwd, { recursive: true });
+    await seedSession(homeDir, "old-one", workCwd, { closedAt: "2020-01-01T00:00:00.000Z" });
+    await seedSession(homeDir, "new-one", workCwd, { closedAt: "2099-01-01T00:00:00.000Z" });
+
+    // Ids intersect with the age filter, so "new-one" is selected by name and then
+    // excluded by age — it never reaches plan.records.
+    const result = await runCli(
+      ["--cwd", workCwd, "claude", "sessions", "prune", "old-one", "new-one", "--older-than", "30"],
+      homeDir,
+    );
+
+    assert.equal(result.code, 1);
+    assert.match(pruneOutput(result.stderr), /no closed claude session matches 'new-one'/);
+    assert.ok(
+      await fileExists(sessionFilePath(homeDir, "old-one")),
+      "the age-matching sibling must not be deleted on its own",
+    );
+    assert.ok(await fileExists(sessionFilePath(homeDir, "new-one")));
+  });
+});
