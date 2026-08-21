@@ -392,6 +392,66 @@ test("the pre-flight count is printed before any per-record line or the summary"
   });
 });
 
+/**
+ * T5′ at the CLI — the half that actually catches M8.
+ *
+ * ⚠️ THE TEST ABOVE CANNOT CATCH M8, and that is the whole finding. A FAITHFUL
+ * M8 ("move the pre-flight print from onBeforeDelete to after the loop")
+ * satisfies all three of its index comparisons byte-identically, because moving
+ * the print to just after the `pruneSessions` await still leaves it ahead of the
+ * summary in stdout. The dd4cb0e8 TE measured that mutant at 213 tests, zero
+ * reds, after verifying the injection genuinely bit.
+ *
+ * What discriminates: force the run to ABORT between the announcement and the
+ * act. The manifest write sits exactly there, so with it failing:
+ *   - print inside onBeforeDelete (correct)  -> the pre-flight line IS on stdout,
+ *     the run exits 1, and nothing was deleted.
+ *   - print after the loop (M8)              -> the loop never runs, so the
+ *     line NEVER APPEARS.
+ *
+ * That is "the count precedes the act" as an observable, rather than as a
+ * position in a string.
+ */
+test("T5': the pre-flight count is printed even when the run aborts before deleting", async () => {
+  await withTempHome(async (homeDir) => {
+    const workCwd = path.join(homeDir, "workspace");
+    await fs.mkdir(workCwd, { recursive: true });
+    await seedSession(homeDir, "t5p-a", workCwd);
+    await seedSession(homeDir, "t5p-b", workCwd);
+
+    // Abort between the announcement and the unlink loop. A directory at the
+    // manifest path gives EISDIR for every uid, at the real seam.
+    await fs.mkdir(path.join(sessionDir(homeDir), "deletions.ndjson"), { recursive: true });
+
+    const aborted = await runCli(
+      ["--cwd", workCwd, "claude", "sessions", "prune", "--cwd"],
+      homeDir,
+    );
+
+    assert.equal(aborted.code, 1, "the abort must fire, or this test asserts nothing");
+    assert.match(
+      pruneOutput(aborted.stdout),
+      /^Will prune 2 closed claude sessions in /m,
+      "the count must be announced BEFORE the act, so an abort still shows it",
+    );
+    // And the act genuinely did not happen.
+    assert.equal(await fileExists(sessionFilePath(homeDir, "t5p-a")), true);
+    assert.equal(await fileExists(sessionFilePath(homeDir, "t5p-b")), true);
+
+    // Control: with the writer working, the same fixture prints the same line
+    // and DOES delete — so the assertion above is about ordering, not about a
+    // line that appears unconditionally on a broken store.
+    await fs.rm(path.join(sessionDir(homeDir), "deletions.ndjson"), {
+      recursive: true,
+      force: true,
+    });
+    const ok = await runCli(["--cwd", workCwd, "claude", "sessions", "prune", "--cwd"], homeDir);
+    assert.equal(ok.code, 0, ok.stderr);
+    assert.match(pruneOutput(ok.stdout), /^Will prune 2 closed claude sessions in /m);
+    assert.equal(await fileExists(sessionFilePath(homeDir, "t5p-a")), false);
+  });
+});
+
 // ─── T6 · positional ids are all-or-nothing ──────────────────────────────────
 test("prune with one unknown id among four good ones deletes nothing", async () => {
   await withTempHome(async (homeDir) => {
@@ -720,39 +780,89 @@ test("prune --cwd <id> binds the id as an id, never as --cwd's value", async () 
   });
 });
 
-// ─── T11 · stranding is visible, in both directions ──────────────────────────
-test("prune names the stream files it strands, and does not when --include-history", async () => {
+// ─── T11 / T-F1 / T-F3 · the flip, and stranding visible in both directions ──
+/**
+ * ⚠️ REWRITTEN, not merely re-worded, and the rewrite IS the change.
+ *
+ * Both halves of this test used to assert the opposite: that a BARE prune leaves
+ * the stream behind and prints a note about it. That was the default, and the
+ * default is what flipped — omitting `--include-history` permanently orphaned
+ * the streams, which are 82% of the store, so the flag that LOOKED conservative
+ * was the one that stranded. A bare prune now takes them.
+ *
+ * The note survives, inverted: it is no longer a warning about a default, it is
+ * a confirmation of a deliberate `--no-include-history`.
+ */
+test("T-F1: a bare prune deletes the stream, and says so", async () => {
   await withTempHome(async (homeDir) => {
     const workCwd = path.join(homeDir, "workspace");
     await fs.mkdir(workCwd, { recursive: true });
     await seedSession(homeDir, "with-stream", workCwd, { streamBytes: 2048 });
 
-    const stranding = await runCli(
-      ["--cwd", workCwd, "claude", "sessions", "prune", "--cwd"],
-      homeDir,
+    const bare = await runCli(["--cwd", workCwd, "claude", "sessions", "prune", "--cwd"], homeDir);
+    assert.equal(bare.code, 0, bare.stderr);
+    assert.equal(
+      await fileExists(streamPath(homeDir, "with-stream")),
+      false,
+      "a bare prune must not strand the stream any more",
     );
-    assert.equal(stranding.code, 0, stranding.stderr);
+    // Nothing is stranded, so nothing is announced as stranded.
+    assert.doesNotMatch(bare.stdout, /note: prune is keeping/);
+    // The pre-flight names what is actually destroyed.
     assert.match(
-      stranding.stdout,
-      /^ {2}note: prune leaves 1 stream file \(2\.0 KB\) behind, unreachable — no later prune$/m,
+      pruneOutput(bare.stdout),
+      /^Will prune 1 closed claude session in .* \(record \+ messages sidecar \+ event stream each\)\.$/m,
     );
-    assert.match(
-      stranding.stdout,
-      /^ {8}can reclaim them\. Add --include-history so prune removes them too\.$/m,
-    );
-    assert.equal(await fileExists(streamPath(homeDir, "with-stream")), true);
+  });
+});
 
-    // The other direction: with --include-history there is no note AND the stream
-    // is gone. Two-directional, so neither a never-firing nor an always-firing note
-    // passes.
+/** T-F2 — the documented flag still parses and still means "delete them". This
+ *  is the affirmative side of the Commander declaration-order trap: if the two
+ *  `.option()` calls are ever swapped, `--include-history` keeps working and
+ *  only the BARE case breaks, which is why T-F1 above is the one that catches
+ *  it. Both are needed; neither alone is enough. */
+test("T-F2: --include-history still parses and still deletes the stream", async () => {
+  await withTempHome(async (homeDir) => {
+    const workCwd = path.join(homeDir, "workspace");
+    await fs.mkdir(workCwd, { recursive: true });
     await seedSession(homeDir, "with-stream", workCwd, { streamBytes: 2048 });
+
     const including = await runCli(
       ["--cwd", workCwd, "claude", "sessions", "prune", "--cwd", "--include-history"],
       homeDir,
     );
     assert.equal(including.code, 0, including.stderr);
-    assert.doesNotMatch(including.stdout, /note: prune leaves/);
     assert.equal(await fileExists(streamPath(homeDir, "with-stream")), false);
+    assert.doesNotMatch(including.stdout, /note: prune is keeping/);
+  });
+});
+
+/** T-F3 — `--no-include-history` keeps them AND says so. Two-directional with
+ *  T-F1, so neither an always-firing nor a never-firing note passes. */
+test("T-F3: --no-include-history keeps the stream and names what it is leaving", async () => {
+  await withTempHome(async (homeDir) => {
+    const workCwd = path.join(homeDir, "workspace");
+    await fs.mkdir(workCwd, { recursive: true });
+    await seedSession(homeDir, "with-stream", workCwd, { streamBytes: 2048 });
+
+    const keeping = await runCli(
+      ["--cwd", workCwd, "claude", "sessions", "prune", "--cwd", "--no-include-history"],
+      homeDir,
+    );
+    assert.equal(keeping.code, 0, keeping.stderr);
+    assert.equal(await fileExists(streamPath(homeDir, "with-stream")), true);
+    assert.match(
+      keeping.stdout,
+      /^ {2}note: prune is keeping 1 stream file \(2\.0 KB\) — you passed --no-include-history, so$/m,
+    );
+    assert.match(
+      keeping.stdout,
+      /^ {8}prune leaves them unreachable and no later prune can reclaim them\.$/m,
+    );
+    assert.match(
+      pruneOutput(keeping.stdout),
+      /^Will prune 1 closed claude session in .* \(record \+ messages sidecar each; event streams kept\)\.$/m,
+    );
   });
 });
 
@@ -762,8 +872,20 @@ test("prune reports stranded stream totals in json", async () => {
     await fs.mkdir(workCwd, { recursive: true });
     await seedSession(homeDir, "json-stream", workCwd, { streamBytes: 100 });
 
+    // --no-include-history, because stranding is what this asserts and the
+    // default no longer strands.
     const result = await runCli(
-      ["--cwd", workCwd, "--format", "json", "claude", "sessions", "prune", "--cwd"],
+      [
+        "--cwd",
+        workCwd,
+        "--format",
+        "json",
+        "claude",
+        "sessions",
+        "prune",
+        "--cwd",
+        "--no-include-history",
+      ],
       homeDir,
     );
 
@@ -773,10 +895,40 @@ test("prune reports stranded stream totals in json", async () => {
       strandedStreamBytes?: number;
       scope?: Record<string, unknown>;
       skippedTemplates?: unknown;
+      auditEntries?: number;
     };
     assert.equal(payload.strandedStreamFiles, 1);
     assert.equal(payload.strandedStreamBytes, 100);
     assert.deepEqual(payload.scope, { cwd: workCwd });
+    // Additive, and the machine half of the audit disclosure.
+    assert.equal(payload.auditEntries, 1);
+  });
+});
+
+/** A3, on the JSON surface: the healthy-box outcome. A default prune strands
+ *  NOTHING and reports how many deletions it recorded. */
+test("T-F1/A3: a default prune reports strandedStreamFiles 0 and auditEntries == count", async () => {
+  await withTempHome(async (homeDir) => {
+    const workCwd = path.join(homeDir, "workspace");
+    await fs.mkdir(workCwd, { recursive: true });
+    await seedSession(homeDir, "a3-one", workCwd, { streamBytes: 100 });
+    await seedSession(homeDir, "a3-two", workCwd, { streamBytes: 100 });
+
+    const result = await runCli(
+      ["--cwd", workCwd, "--format", "json", "claude", "sessions", "prune", "--cwd"],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const payload = JSON.parse(result.stdout) as {
+      count?: number;
+      strandedStreamFiles?: number;
+      auditEntries?: number;
+    };
+    assert.equal(payload.count, 2);
+    assert.equal(payload.strandedStreamFiles, 0);
+    assert.equal(payload.auditEntries, 2);
+    assert.equal(await fileExists(streamPath(homeDir, "a3-one")), false);
+    assert.equal(await fileExists(streamPath(homeDir, "a3-two")), false);
   });
 });
 
@@ -974,7 +1126,11 @@ test("prune --help names the messages sidecar and the scope requirement", async 
 // A line is DATA (and exempt) when it is an enumerable id listing: the pruned-record
 // lines and the ambiguity match list. Each such block is introduced by a surviving
 // status line stating its count and followed by a surviving remedy line.
-const DATA_LINE = /^ {2}\S+( \([^)]*\))?\t/;
+// The `cause:` line of the audit-write refusal is DATA too — it carries a raw
+// errno message acpx does not author. It is bracketed above by a surviving line
+// stating what happened and below by a surviving remedy line, exactly as the
+// rule requires of any data block.
+const DATA_LINE = /^ {2}\S+( \([^)]*\))?\t|^ {2}cause: /;
 
 function statusLines(text: string): string[] {
   return text
@@ -1017,6 +1173,28 @@ test("every status line of every prune output path carries the literal token", a
       ["pre-flight older-than", ["claude", "sessions", "prune", "--older-than", "1"], workCwd],
       ["pre-flight before", ["claude", "sessions", "prune", "--before", "2099-01-01"], workCwd],
       ["dry run", ["claude", "sessions", "prune", "--dry-run"], workCwd],
+      // brick://401a6216's new and changed lines. Every one of these is a
+      // surface an operator reads through the incident's own pipeline.
+      [
+        "pre-flight no-include-history",
+        ["claude", "sessions", "prune", "--cwd", "--no-include-history"],
+        workCwd,
+      ],
+      [
+        "dry run no-include-history",
+        ["claude", "sessions", "prune", "--dry-run", "--no-include-history"],
+        workCwd,
+      ],
+      [
+        "pre-flight whole-box no-include-history",
+        ["claude", "sessions", "prune", "--whole-box", "--no-include-history"],
+        workCwd,
+      ],
+      [
+        "pre-flight include-history",
+        ["claude", "sessions", "prune", "--cwd", "--include-history"],
+        workCwd,
+      ],
     ];
 
     for (const [label, args, cwd] of paths) {
@@ -1041,6 +1219,165 @@ test("every status line of every prune output path carries the literal token", a
       homeDir,
     );
     assertEveryStatusLineCarriesTheToken("id open", pruneOutput(open.stderr));
+
+    // The audit-write refusal. Injected by making the manifest path a DIRECTORY
+    // (EISDIR for every uid, at the real seam) rather than by chmod, which can
+    // silently fail to fire when the suite runs as root.
+    await seedSession(homeDir, "audit-token", workCwd);
+    // Earlier prunes in this test have already created the manifest as a FILE,
+    // so clear it before planting the directory.
+    await fs.rm(path.join(sessionDir(homeDir), "deletions.ndjson"), {
+      recursive: true,
+      force: true,
+    });
+    await fs.mkdir(path.join(sessionDir(homeDir), "deletions.ndjson"), { recursive: true });
+    const auditFailed = await runCli(
+      ["--cwd", workCwd, "claude", "sessions", "prune", "audit-token"],
+      homeDir,
+    );
+    assert.equal(auditFailed.code, 1, "the injection must fire, or this asserts nothing");
+    assertEveryStatusLineCarriesTheToken("audit write failed", pruneOutput(auditFailed.stderr));
+    await fs.rm(path.join(sessionDir(homeDir), "deletions.ndjson"), {
+      recursive: true,
+      force: true,
+    });
+  });
+});
+
+/**
+ * T-D1 — the text dry run DISCLOSES stranding. e6f0ff53 finding 1.
+ *
+ * Before this, `printPrunePlan` was suppressed entirely on dry runs, so a text
+ * `--dry-run` computed the stranded total and printed the operator NONE of it,
+ * while JSON reported it and `repository.ts`'s own comment claimed it was
+ * "reported on every run, dry ones included". The operator deciding whether to
+ * run the real thing was the one person shown nothing.
+ *
+ * The counts are cross-checked against the JSON path from the same fixture, so
+ * the note cannot drift from the number the machine surface reports.
+ */
+test("T-D1: a text dry run discloses what it would strand, matching the JSON totals", async () => {
+  await withTempHome(async (homeDir) => {
+    const workCwd = path.join(homeDir, "workspace");
+    await fs.mkdir(workCwd, { recursive: true });
+    await seedSession(homeDir, "dry-strand", workCwd, { streamBytes: 2048 });
+
+    const text = await runCli(
+      [
+        "--cwd",
+        workCwd,
+        "claude",
+        "sessions",
+        "prune",
+        "--dry-run",
+        "--cwd",
+        "--no-include-history",
+      ],
+      homeDir,
+    );
+    assert.equal(text.code, 0, text.stderr);
+    assert.match(
+      text.stdout,
+      /^ {2}note: prune is keeping 1 stream file \(2\.0 KB\) — you passed --no-include-history, so$/m,
+    );
+    // AFTER the listing, not before: on a preview nothing is irreversible, so
+    // the note belongs below the data block as its remedy line.
+    const lines = pruneOutput(text.stdout)
+      .split("\n")
+      .filter((l) => l.length > 0);
+    const summaryAt = lines.findIndex((l) => l.startsWith("[DRY RUN] Would prune"));
+    const noteAt = lines.findIndex((l) => l.includes("note: prune is keeping"));
+    assert.ok(
+      summaryAt >= 0 && noteAt > summaryAt,
+      `note must follow the listing:\n${text.stdout}`,
+    );
+
+    const json = await runCli(
+      [
+        "--cwd",
+        workCwd,
+        "--format",
+        "json",
+        "claude",
+        "sessions",
+        "prune",
+        "--dry-run",
+        "--cwd",
+        "--no-include-history",
+      ],
+      homeDir,
+    );
+    const payload = JSON.parse(json.stdout) as {
+      strandedStreamFiles?: number;
+      strandedStreamBytes?: number;
+      auditEntries?: number;
+    };
+    assert.equal(payload.strandedStreamFiles, 1);
+    assert.equal(payload.strandedStreamBytes, 2048);
+    // A dry run destroys nothing, so it records nothing.
+    assert.equal(payload.auditEntries, 0);
+
+    // CONTROL: the same fixture WITHOUT stranding prints no note. Without it, a
+    // note that always fires would pass the assertion above.
+    await seedSession(homeDir, "dry-strand", workCwd, { streamBytes: 2048 });
+    const noStranding = await runCli(
+      ["--cwd", workCwd, "claude", "sessions", "prune", "--dry-run", "--cwd"],
+      homeDir,
+    );
+    assert.equal(noStranding.code, 0, noStranding.stderr);
+    assert.doesNotMatch(noStranding.stdout, /note: prune is keeping/);
+  });
+});
+
+/**
+ * T-D2 — the note is ONE renderer, shared by the real-run and dry-run call
+ * sites. Two copies would drift, and the preview would then disagree with what
+ * it is previewing. M-D2 changes one call site and must red both halves.
+ *
+ * Asserted by requiring the two outputs to be BYTE-IDENTICAL on the same
+ * fixture, which is a property only one renderer can have.
+ */
+test("T-D2: the stranding note is byte-identical between the dry run and the real run", async () => {
+  await withTempHome(async (homeDir) => {
+    const workCwd = path.join(homeDir, "workspace");
+    await fs.mkdir(workCwd, { recursive: true });
+
+    const noteLinesOf = (stdout: string): string[] =>
+      pruneOutput(stdout)
+        .split("\n")
+        .filter(
+          (line) =>
+            line.includes("note: prune is keeping") ||
+            line.includes("prune leaves them unreachable"),
+        );
+
+    await seedSession(homeDir, "one-note", workCwd, { streamBytes: 2048 });
+    const dry = await runCli(
+      [
+        "--cwd",
+        workCwd,
+        "claude",
+        "sessions",
+        "prune",
+        "--dry-run",
+        "--cwd",
+        "--no-include-history",
+      ],
+      homeDir,
+    );
+    const real = await runCli(
+      ["--cwd", workCwd, "claude", "sessions", "prune", "--cwd", "--no-include-history"],
+      homeDir,
+    );
+    assert.equal(dry.code, 0, dry.stderr);
+    assert.equal(real.code, 0, real.stderr);
+
+    const dryNote = noteLinesOf(dry.stdout);
+    const realNote = noteLinesOf(real.stdout);
+    // Both rendered something — otherwise "identical" is two empty arrays.
+    assert.equal(dryNote.length, 2, `dry run note:\n${dry.stdout}`);
+    assert.equal(realNote.length, 2, `real run note:\n${real.stdout}`);
+    assert.deepEqual(dryNote, realNote, "the two call sites have drifted apart");
   });
 });
 

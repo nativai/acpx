@@ -400,6 +400,7 @@ type PruneRenderResult = {
   dryRun: boolean;
   strandedStreamFiles: number;
   strandedStreamBytes: number;
+  auditEntries: number;
 };
 
 /** Only the applied keys are present. An object rather than an enum string so a
@@ -442,7 +443,13 @@ export type PruneRefusal =
       sessionId: string;
       matches: { acpxRecordId: string; name?: string; lastUsedAt: string }[];
     }
-  | { reason: "session_open"; agentName: string; sessionId: string };
+  | { reason: "session_open"; agentName: string; sessionId: string }
+  | {
+      reason: "audit_write_failed";
+      agentName: string;
+      manifestPath: string;
+      cause: string;
+    };
 
 /** The scopes the refusal names, echoed into JSON so a machine consumer sees the
  *  same menu the text does. */
@@ -509,6 +516,25 @@ function renderPruneRefusalText(refusal: PruneRefusal): string {
       `  acpx ${agent} sessions close --session-id ${refusal.sessionId}   # then re-run prune\n`
     );
   }
+  if (refusal.reason === "audit_write_failed") {
+    // Five status lines, every one carrying the token, bracketing one `cause:`
+    // data line. The remedy is RUNNABLE ADVICE THAT ACTUALLY WORKS, which is the
+    // bar the `session_open` fix above sets: at true zero free space, deleting
+    // any single file anywhere on the volume unblocks the prune.
+    //
+    // Why this refusal exists at all: the write is an APPEND, so it usually
+    // succeeds even with zero free blocks (it lands inside the last allocated
+    // one). The alternative to refusing is that on the box's unhealthiest day
+    // prune silently destroys sessions with no record of what it took — the
+    // exact incident this whole change exists to prevent, under a new trigger.
+    return (
+      `acpx sessions prune: could not record this deletion — nothing was pruned.\n` +
+      `prune writes one line per deleted session to ${refusal.manifestPath}\n` +
+      `before deleting anything, so a prune that cannot be recorded does not run.\n` +
+      `  cause: ${refusal.cause}\n` +
+      `Free a few bytes on that filesystem (any single file will do), then re-run prune.\n`
+    );
+  }
   if (refusal.reason === "session_ambiguous") {
     const count = refusal.matches.length;
     // The match lines are DATA and exempt from the token rule — which is exactly
@@ -566,26 +592,51 @@ export function printPrunePlan(
     scope: PruneScope;
     strandedStreamFiles: number;
     strandedStreamBytes: number;
+    includeHistory: boolean;
   },
   format: OutputFormat,
 ): void {
   if (format !== "text" || plan.count === 0) {
     return;
   }
-  process.stdout.write(`${formatPrunePlanLine(plan.count, plan.agentName, plan.scope)}\n`);
+  process.stdout.write(
+    `${formatPrunePlanLine(plan.count, plan.agentName, plan.scope, plan.includeHistory)}\n`,
+  );
   if (plan.strandedStreamFiles > 0) {
-    const files = `${plan.strandedStreamFiles} stream file${plan.strandedStreamFiles === 1 ? "" : "s"}`;
-    // Both physical lines carry the token: a wrapped line is two lines to a
-    // filter, so a message whose token sits only on line 1 delivers a headless
-    // fragment to the operator's pipe.
     process.stdout.write(
-      `  note: prune leaves ${files} (${formatBytes(plan.strandedStreamBytes)}) behind, unreachable — no later prune\n` +
-        `        can reclaim them. Add --include-history so prune removes them too.\n`,
+      formatStrandedStreamNote(plan.strandedStreamFiles, plan.strandedStreamBytes),
     );
   }
 }
 
-function formatPrunePlanLine(count: number, agent: string, scope: PruneScope): string {
+/**
+ * The stranding note, rendered by ONE function for BOTH call sites — the
+ * pre-flight (real run) and the dry-run result block. Two copies of this text
+ * would drift, and the two renderings would then disagree about what a preview
+ * is previewing. M-D2 changes one call site and must red both tests.
+ *
+ * The wording INVERTS from what shipped, because the meaning inverted: this is
+ * no longer a warning that the default is stranding, it is a confirmation of a
+ * deliberate `--no-include-history`.
+ *
+ * ⚠️ Both physical lines carry the `prune` token. A wrapped line is TWO lines to
+ * a filter, so a message whose token sits only on line 1 delivers a headless
+ * fragment into the operator's pipe.
+ */
+export function formatStrandedStreamNote(files: number, bytes: number): string {
+  const noun = `${files} stream file${files === 1 ? "" : "s"}`;
+  return (
+    `  note: prune is keeping ${noun} (${formatBytes(bytes)}) — you passed --no-include-history, so\n` +
+    `        prune leaves them unreachable and no later prune can reclaim them.\n`
+  );
+}
+
+function formatPrunePlanLine(
+  count: number,
+  agent: string,
+  scope: PruneScope,
+  includeHistory: boolean,
+): string {
   const noun = `session${count === 1 ? "" : "s"}`;
   // "named" is claimed ONLY when ids are the only selector. `ids + --cwd` is a
   // UNION (repository.ts:1454-1478), so the old `scope.sessionIds ? …` printed
@@ -601,9 +652,17 @@ function formatPrunePlanLine(count: number, agent: string, scope: PruneScope): s
   // The --whole-box line echoes the literal flag token so the box-wide sweep
   // leaves a greppable trace even when the command line was built by variable
   // interpolation (E3).
-  const parenthetical = scope.wholeBox
-    ? "(--whole-box; record + messages sidecar each)"
-    : "(record + messages sidecar each)";
+  //
+  // The parenthetical names what is actually DESTROYED, and it changes with the
+  // history tier — the number that belongs at a destructive decision point is
+  // WHAT will be destroyed, not how much space it frees. (No byte total here
+  // deliberately: totalling stream bytes would need a `stat` per stream file on
+  // the destructive path, re-importing the cost the stream index exists to
+  // remove. The summary line afterwards already reports `freed X`.)
+  const contents = includeHistory
+    ? "record + messages sidecar + event stream each"
+    : "record + messages sidecar each; event streams kept";
+  const parenthetical = scope.wholeBox ? `(--whole-box; ${contents})` : `(${contents})`;
   return `Will prune ${head}${tail} ${parenthetical}.`;
 }
 
@@ -652,11 +711,37 @@ export function printPruneResultByFormat(
   }
 
   process.stdout.write(`${formatPruneSummaryLine(result, count)}\n`);
+  printPrunedRecordLines(result.pruned);
+  printDryRunStrandingNote(result);
+}
 
-  for (const record of result.pruned) {
+function printPrunedRecordLines(pruned: SessionRecord[]): void {
+  for (const record of pruned) {
     const label = record.name ? ` (${record.name})` : "";
     process.stdout.write(
       `  ${record.acpxRecordId}${label}\t${record.closedAt ?? record.lastUsedAt}\n`,
+    );
+  }
+}
+
+/**
+ * e6f0ff53 finding 1. A text `--dry-run` used to print ZERO stranding lines
+ * while JSON reported them, because `printPrunePlan` is suppressed entirely on
+ * dry runs — so the operator deciding whether to run the real thing was the one
+ * person shown none of what it would strand.
+ *
+ * ⚠️ AFTER the listing, not before, and that is deliberate. On a real run the
+ * note must precede the irreversible act; on a preview nothing is irreversible,
+ * and placing it last makes it the REMEDY LINE BELOW THE DATA BLOCK — the
+ * structure the token rule requires (a data block introduced by a surviving
+ * count line and followed by a surviving remedy line). Above the
+ * `[DRY RUN] Would prune N` line it would state a consequence ahead of its
+ * count. T-D1 pins the ordering, not just the presence.
+ */
+function printDryRunStrandingNote(result: PruneRenderResult): void {
+  if (result.dryRun && result.strandedStreamFiles > 0) {
+    process.stdout.write(
+      formatStrandedStreamNote(result.strandedStreamFiles, result.strandedStreamBytes),
     );
   }
 }
@@ -692,6 +777,10 @@ function emitPruneJsonResult(
     scope,
     strandedStreamFiles: result.strandedStreamFiles,
     strandedStreamBytes: result.strandedStreamBytes,
+    // Additive. The machine half of the same disclosure the text path gets: it
+    // lets a scripted consumer assert the audit actually happened, rather than
+    // trusting that it did. 0 on a dry run.
+    auditEntries: result.auditEntries,
   });
 }
 

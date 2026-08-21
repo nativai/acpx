@@ -75,7 +75,7 @@ acpx [global_options] cancel [-s <name>]
 acpx [global_options] set-mode <mode> [-s <name>]
 acpx [global_options] set <key> <value> [-s <name>]
 acpx [global_options] status [-s <name> | --session-id <id> | --session-url <url>]
-acpx [global_options] sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [<id>...] [--cwd | --whole-box] [--older-than <days> | --before <date>] [--dry-run] [--include-history] [--include-templates]]
+acpx [global_options] sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [<id>...] [--cwd | --whole-box] [--older-than <days> | --before <date>] [--dry-run] [--no-include-history] [--include-templates]]
 acpx [global_options] config [show | init]
 acpx [global_options] flow run <file> [--input-json '<json>' | --input-file <path>] [--default-agent <name>]
 
@@ -86,7 +86,7 @@ acpx [global_options] <agent> cancel [-s <name>]
 acpx [global_options] <agent> set-mode <mode> [-s <name>]
 acpx [global_options] <agent> set <key> <value> [-s <name>]
 acpx [global_options] <agent> status [-s <name> | --session-id <id> | --session-url <url>]
-acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [<id>...] [--cwd | --whole-box] [--older-than <days> | --before <date>] [--dry-run] [--include-history] [--include-templates]]
+acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [<id>...] [--cwd | --whole-box] [--older-than <days> | --before <date>] [--dry-run] [--no-include-history] [--include-templates]]
 ```
 
 If prompt text is omitted and stdin is piped, `acpx` reads prompt text from stdin.
@@ -204,7 +204,7 @@ acpx sessions history --limit 20
 acpx sessions export backend --output backend-session.json
 acpx sessions import backend-session.json --name backend-restored
 acpx sessions prune --dry-run --older-than 7
-acpx sessions prune --older-than 30 --include-history
+acpx sessions prune --older-than 30
 acpx status
 acpx status --session-url "$ACPX_SESSION_URL"
 
@@ -216,7 +216,7 @@ acpx codex sessions show backend
 acpx codex sessions history backend --limit 20
 acpx codex sessions export backend --output backend-session.json
 acpx codex sessions import backend-session.json --name backend-restored
-acpx codex sessions prune --before 2026-04-01 --include-history
+acpx codex sessions prune --before 2026-04-01
 acpx codex status
 acpx codex status --session-id <id>
 ```
@@ -251,8 +251,10 @@ Behavior:
   - `--whole-box` is the box-wide sweep; it cannot be combined with ids or `--cwd`, and there is no `--all` alias
   - `--older-than <days>` and `--before <date>` filter by close time, falling back to last-used time when a record was never explicitly closed; each counts as a scope
   - `--dry-run` previews what would be deleted without touching disk and needs no scope — and it fails on a bad id exactly where the real run would
-  - `--include-history` also removes per-session event stream files. Without it those files are **stranded permanently** — selection walks the record index, so once the record is gone nothing can match them again. A destructive run says how many, and how many bytes, before deleting anything.
-  - `--include-history` and `--include-templates` are not scopes; they widen what a scope selects, so they still need one
+  - a prune deletes the session's **event stream files, its stream timestamp sidecar and its queue-owner log** along with the record and messages sidecar. Nothing is left behind. `--include-history` is the default and the flag is still accepted, so existing invocations keep working
+  - `--no-include-history` keeps the event streams and their timestamp sidecar. They are then **stranded permanently** — selection walks the record index, so once the record is gone nothing can match them again. A run that opts out says how many files, and how many bytes, before deleting anything (on a `--dry-run` too)
+  - every destructive prune appends one line per deleted session to `~/.acpx/sessions/deletions.ndjson` **before** deleting anything, and refuses (exit 1, nothing deleted) if it cannot. **If a session has vanished, grep that file first** — but read its `manifest_open` header: `at` and `covers` name the coverage boundary, and a deletion older than `at` will never appear there
+  - `--include-templates` is not a scope; it widens what a scope selects, so it still needs one
 - `status -s <name>` checks the exact cwd first, then one exact global agent
   match; `status --session-id <id>` and `status --session-url <url>` resolve
   persisted sessions globally by canonical identity
@@ -311,8 +313,8 @@ acpx codex sessions prune 4e25443c a1b2c3d4
 # This directory's closed sessions.
 acpx codex sessions prune --cwd
 
-# Remove records closed more than 30 days ago, including their event-stream files
-acpx codex sessions prune --older-than 30 --include-history
+# Remove records closed more than 30 days ago (event-stream files go too, by default)
+acpx codex sessions prune --older-than 30
 
 # Remove everything closed before a date
 acpx codex sessions prune --before 2026-04-01
@@ -323,7 +325,9 @@ acpx codex sessions prune --whole-box
 
 **A destructive prune needs a scope.** With none of `<id>...`, `--cwd`, `--whole-box`, `--older-than` or `--before` it refuses — exit 2, nothing deleted — and prints copy-pasteable alternatives carrying both the box-wide count and the count in this directory. Each pruned session loses its record **and its messages sidecar**, so its transcript can never be rebuilt; that is why the verb makes you say what you mean rather than defaulting to the whole box.
 
-Without `--include-history`, only the lightweight JSON record and the messages sidecar are removed; event-stream files are left on disk — but **unreachable**, since selection walks the record index and the record is now gone. Nothing reclaims them later. With `--include-history`, the per-session event log is deleted too.
+A prune takes everything acpx owns for that session: the JSON record, the messages sidecar, the queue-owner log, the event-stream files and the stream's timestamp sidecar. `--no-include-history` keeps the last two — they are then left on disk but **unreachable**, since selection walks the record index and the record is now gone, and nothing reclaims them later.
+
+⚠️ `bytesFreed` therefore reports roughly **5x** what it did before this default flipped: stream files are ~82% of a session store's bytes against the messages sidecar's ~17%. Same field, same meaning, much larger number.
 
 ## Config files
 
@@ -588,7 +592,7 @@ Periodic cleanup:
 
 ```bash
 acpx codex sessions prune --dry-run --older-than 14
-acpx codex sessions prune --older-than 30 --include-history
+acpx codex sessions prune --older-than 30
 ```
 
 Multi-agent triage flow:

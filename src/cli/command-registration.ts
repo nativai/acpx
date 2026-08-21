@@ -502,9 +502,29 @@ export function registerSessionsCommand(
     )
     .option("--before <date>", "Prune sessions closed before this date", parsePruneBeforeDate)
     .option("--older-than <days>", "Prune sessions closed more than N days ago", parseDaysOlderThan)
+    // ⚠️ DECLARATION ORDER IS LOAD-BEARING. `--no-include-history` MUST be
+    // registered FIRST, and no type check catches it if you swap them.
+    //
+    // Measured against the pinned Commander 14.0.3
+    // (brick 401a6216 conception/evidence/commander-probe.txt):
+    //
+    //   declared                          bare        --include-history  --no-include-history
+    //   --include-history then --no-...    {} (!!)     true               false
+    //   only --no-include-history          true        ERROR unknown      false
+    //   --no-... then --include-history    true        true               false
+    //
+    // Only the third gives all three required behaviours. The natural order —
+    // affirmative first — leaves the default UNDEFINED, which a core reading
+    // `=== true` silently treats as "keep stranding": the flip would look
+    // shipped and do nothing. That is why the handler reads `!== false`, and why
+    // a bare-invocation test is the only thing that can catch a swap.
+    .option(
+      "--no-include-history",
+      "Keep each session's event stream files (.stream.*) and its timestamp sidecar. They are then unreachable: prune selects off the record index, so once the record is gone no later prune can reclaim them.",
+    )
     .option(
       "--include-history",
-      "Also delete event stream files (.stream.*). Without this they are left behind unreachable and no later prune can reclaim them.",
+      "Also delete event stream files (.stream.*). This is the default; the flag is accepted so existing invocations keep working.",
     )
     .option(
       "--include-templates",

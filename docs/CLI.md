@@ -313,7 +313,7 @@ acpx [global_options] <agent> sessions history
 acpx [global_options] <agent> sessions history <name> [--limit <count>]
 acpx [global_options] <agent> sessions export [name] --output <path> [--cwd <dir>]
 acpx [global_options] <agent> sessions import <archive> [--name <name>] [--cwd <dir>]
-acpx [global_options] <agent> sessions prune [<id>...] [--cwd | --whole-box] [--older-than <days> | --before <date>] [--dry-run] [--include-history] [--include-templates]
+acpx [global_options] <agent> sessions prune [<id>...] [--cwd | --whole-box] [--older-than <days> | --before <date>] [--dry-run] [--no-include-history] [--include-templates]
 
 acpx [global_options] sessions ...   # defaults to codex
 ```
@@ -355,8 +355,11 @@ Behavior:
 - Ids and `--cwd` combine as a union ("this directory's, plus the ones I name"); an age filter then intersects the result
 - `sessions prune --before <date>` and `--older-than <days>` filter by close time, falling back to last-used time for older records, and each counts as a scope on its own
 - `sessions prune --dry-run` previews closed sessions that can be deleted and deletes nothing. It fails on a bad id exactly where the real run would, so the preview cannot promise what the real run refuses.
-- Before deleting anything, a destructive prune prints what it is about to destroy, including the stream files it will strand: without `--include-history` those are left behind unreachable and **no later prune can reclaim them**
-- `--include-history` and `--include-templates` are not scopes — they widen what a scope selects, so they still need one
+- Before deleting anything, a destructive prune prints what it is about to destroy. By default that is the record, the messages sidecar, the event stream, the stream's timestamp sidecar and the queue-owner log — a pruned session leaves nothing behind
+- `--no-include-history` keeps the event stream files and their timestamp sidecar. They are then **unreachable**: prune selects off the record index, so once the record is gone no later prune can reclaim them. A run that opts out says how many files and how many bytes it is leaving
+- **`--include-history` is now the default** and the flag is still accepted, so existing invocations keep working unchanged. Note that `bytesFreed` is consequently ~5x larger than before this default flipped — stream bytes now count toward it
+- Every destructive prune appends one line per deleted session to `~/.acpx/sessions/deletions.ndjson` **before** deleting anything, and refuses to run (exit 1, nothing deleted) if it cannot. `templates rollback --delete` writes to the same file
+- `--include-templates` is not a scope — it widens what a scope selects, so it still needs one
 - close errors if the target session does not exist
 
 For commands that address an existing session, an explicit name first uses that

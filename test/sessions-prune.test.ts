@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync as fsExistsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
@@ -442,6 +443,78 @@ test("pruneSessions counts stranded streams for a session id containing .stream.
 
     assert.equal(result.strandedStreamFiles, 1);
     assert.equal(result.strandedStreamBytes, 5);
+  });
+});
+
+/**
+ * T5′ — the count precedes the ACT, not merely the line's presence.
+ *
+ * e6f0ff53 finding 4. The shipped T5 asserts three within-stdout index
+ * comparisons, and a FAITHFUL M8 ("move the pre-flight print to after the
+ * loop") satisfies all three byte-identically — the dd4cb0e8 TE measured it at
+ * 213 tests, ZERO reds, having first verified the injection genuinely bit. Those
+ * assertions pin that the line appears earlier in a string; they cannot pin that
+ * it appears earlier than the DELETION, because the deletion leaves no mark in
+ * stdout.
+ *
+ * This pins it against the filesystem instead: at the moment the hook runs, the
+ * files must still be there, and a throw from the hook must leave them there.
+ * Deterministic, no fault injection, and it uses only the abort path the
+ * all-or-nothing id contract already depends on.
+ */
+test("T5': onBeforeDelete runs while the files still exist, and throwing leaves them all", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    for (const id of ["order-a", "order-b"]) {
+      await writeSessionRecord(
+        homeDir,
+        makeSessionRecord({
+          acpxRecordId: id,
+          acpSessionId: id,
+          agentCommand: "agent-a",
+          cwd,
+          closed: true,
+          closedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      );
+      await fs.writeFile(messagesLogPath(homeDir, id), `sidecar for ${id}\n`, "utf8");
+    }
+
+    const stdout: string[] = [];
+    let existedAtCallbackTime: boolean[] = [];
+
+    await assert.rejects(
+      session.pruneSessions({
+        agentCommand: "agent-a",
+        onBeforeDelete: (plan) => {
+          // The pre-flight line, as the CLI writes it.
+          stdout.push(`Will prune ${plan.records.length} closed agent-a sessions.`);
+          // The observation the string comparison cannot make: are they still here?
+          existedAtCallbackTime = ["order-a", "order-b"].map((id) =>
+            fsExistsSync(sessionFilePath(homeDir, id)),
+          );
+          throw new Error("abort after announcing");
+        },
+      }),
+      /abort after announcing/,
+    );
+
+    assert.deepEqual(stdout, ["Will prune 2 closed agent-a sessions."]);
+    assert.deepEqual(
+      existedAtCallbackTime,
+      [true, true],
+      "the count was announced AFTER something had already been destroyed",
+    );
+    // And the throw destroyed nothing.
+    for (const id of ["order-a", "order-b"]) {
+      assert.ok(
+        await fileExists(sessionFilePath(homeDir, id)),
+        `${id} was deleted despite the abort`,
+      );
+      assert.ok(await fileExists(messagesLogPath(homeDir, id)));
+    }
   });
 });
 

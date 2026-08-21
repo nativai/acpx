@@ -41,7 +41,7 @@ acpx codex sessions prune --dry-run
 acpx codex sessions prune 4e25443c a1b2c3d4   # the sessions you name
 acpx codex sessions prune --cwd               # this directory's
 acpx codex sessions prune --older-than 30
-acpx codex sessions prune --before 2026-01-01 --include-history
+acpx codex sessions prune --before 2026-01-01
 ```
 
 Top-level `acpx sessions …` defaults to `codex`.
@@ -155,8 +155,8 @@ acpx codex sessions prune --before 2026-01-01
 # Every closed session for this agent on this box — the box-wide sweep.
 acpx codex sessions prune --whole-box
 
-# Also remove the per-session event-stream files
-acpx codex sessions prune --cwd --include-history
+# Keep the per-session event-stream files (they become unreachable)
+acpx codex sessions prune --cwd --no-include-history
 ```
 
 ### Scope is required
@@ -166,9 +166,9 @@ A destructive prune with none of `<id>...`, `--cwd`, `--whole-box`,
 copy-pasteable alternatives carrying both the box-wide count and the count in
 this directory. `--dry-run` is exempt, so every preview workflow works unchanged.
 
-`--include-history` and `--include-templates` are **not** scopes. They widen what
-a scope selects — one deletes stream history, the other deletes template
-blueprints — so neither should ever be the only thing you typed.
+`--include-templates` is **not** a scope. It widens what a scope selects — it
+deletes template blueprints — so it should never be the only thing you typed.
+`--no-include-history` is not a scope either; it narrows what is deleted.
 
 ### Naming sessions is all-or-nothing
 
@@ -182,19 +182,92 @@ that quietly deletes three is the same failure as one that deletes seven.
 it will not span sibling worktrees of the same project. Ids and `--cwd` combine
 as a union; an age filter then intersects the result.
 
-### What it strands
+### What it deletes, and what it can strand
 
-Without `--include-history`, prune deletes the record and sidecar but leaves the
-session's `.stream.*` files behind. Selection walks the record index, so once the
-record is gone **nothing can ever match those files again and no later prune
-reclaims them**. A destructive run prints the file count and byte total it is
-about to strand, before deleting anything.
+By default a prune of a session takes **everything acpx owns or has made
+unreachable**: the record, the messages sidecar, the queue-owner log
+(`<id>.owner.log`), the event streams (`<id>.stream.*`) and the stream's
+timestamp sidecar (`<id>.timestamps.ndjson`). Nothing is left behind for a
+future reader to interpret.
+
+Two tiers decide what `--no-include-history` changes:
+
+| tier    | files                                                           | kept by `--no-include-history`? |
+| ------- | --------------------------------------------------------------- | ------------------------------- |
+| record  | `<id>.json`, `<id>.messages.ndjson`(`.stale`), `<id>.owner.log` | no — always deleted             |
+| history | `<id>.stream.*`, `<id>.timestamps.ndjson`                       | **yes**                         |
+
+The timestamp sidecar follows the _stream_ rather than the record because it is
+an index **of** the stream: acpx-ui derives its path from the stream path, so
+once the stream is gone the sidecar can never be opened again. Keep the stream
+and the index stays with it.
+
+**`--no-include-history` is the one way to strand files.** Selection walks the
+record index, so once the record is gone **nothing can ever match those stream
+files again and no later prune reclaims them**. A run that opts out prints the
+file count and byte total it is leaving unreachable, before deleting anything —
+on a `--dry-run` too.
+
+> ⚠️ One file survives every prune: `<id>.delivery.json`, acpx-ui's per-session
+> delivery queue. acpx does not write it, and unlike the timestamp sidecar it is
+> paired to nothing acpx owns, so acpx has no ownership hook to delete it on. A
+> lone `.delivery.json` is explained by the deletion manifest below, not by the
+> record having vanished on its own.
+
+### The deletion manifest — `~/.acpx/sessions/deletions.ndjson`
+
+Every destructive prune, and every `templates rollback --delete`, appends **one
+NDJSON line per destroyed session** to `~/.acpx/sessions/deletions.ndjson`:
+which deleter ran, when, against what scope, which acpx session ordered it, and
+the session's id, name and cwd. **If a session has vanished, grep that file
+first.**
+
+The line is written **before** the first unlink. If it cannot be written the run
+refuses — exit 1, nothing deleted — rather than destroying sessions it cannot
+account for. A `--dry-run` destroys nothing and so records nothing.
+
+> **An entry records a deletion that was authorised and begun. The session store
+> is the authority on whether it completed.**
+
+**Read the header line before concluding anything from an absence.** The file
+opens with a `manifest_open` line carrying `at` and `covers`:
+
+```json
+{
+  "v": 1,
+  "op": "manifest_open",
+  "at": "2026-08-21T13:22:04.115Z",
+  "box": "https://acpx.devbox.nativai.de",
+  "covers": ["sessions_prune", "templates_rollback_delete"]
+}
+```
+
+`at` dates the coverage boundary and `covers` names it, because **an absence
+from this file has three causes and they are not the same**: acpx did not delete
+that session; or it was deleted _before_ this file existed; or it was deleted by
+a path this manifest never covered. A session deleted before `at` will never
+appear here no matter how carefully you grep. Boxes are deployed independently,
+so the boundary is per box — which is exactly why `at` is recorded rather than
+assumed.
+
+Entries are additive-only: consumers must ignore unknown keys, and no key
+changes meaning or type. `invoker` is the one key that uses `null`, and there it
+is a positive assertion — _no acpx session in the environment_, i.e. a human at
+a terminal or a shell script — rather than a gap. Treat a `null` `invoker` and a
+missing one as different. There is no rotation: an entry is ~300 bytes, and
+recording every deletion this box has ever performed would come to ~537 KB.
 
 Output:
 
 - `text` — summary plus the pruned ids and close/last-used time
-- `json` — `{ action, dryRun, count, bytesFreed, pruned }`
+- `json` — `{ action, dryRun, count, bytesFreed, pruned, auditEntries }`
 - `quiet` — one pruned session id per line
+
+⚠️ `bytesFreed` keeps its exact name, type and meaning, but its **magnitude
+jumps roughly 5x** now that history is deleted by default: stream files are
+~82% of a session store's bytes against the messages sidecar's ~17%. That is the
+change working as designed, not a contract break — but two runs either side of a
+deploy will report very different numbers for the same work.
 
 ## Queue ownership
 

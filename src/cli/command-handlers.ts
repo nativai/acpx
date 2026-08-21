@@ -60,6 +60,8 @@ import {
   resolveSessionRecord,
   resolveTemplateSelector,
   rollbackTemplateSlug,
+  DeletionManifestWriteError,
+  describeManifestFailure,
   writeSessionRecord,
   writeSessionRecordWithLifecycle,
 } from "../session/persistence.js";
@@ -3064,8 +3066,67 @@ export async function handleSessionsTemplatesRollback(
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
-  const result = await rollbackTemplateSlug(slug, { delete: flags.delete });
+  let result: TemplateRollbackResult;
+  try {
+    result = await rollbackTemplateSlug(slug, { delete: flags.delete });
+  } catch (error) {
+    // ⚠️ THIS TYPE ONLY — see the same catch in handleSessionsPrune. Before this
+    // there was no try/catch here at all, so a manifest-write failure reached
+    // the operator as a raw stack trace.
+    if (error instanceof DeletionManifestWriteError) {
+      printTemplateRollbackAuditFailure(slug, error, globalFlags.format);
+      process.exitCode = EXIT_CODES.ERROR;
+      return;
+    }
+    throw error;
+  }
   printTemplateRollbackResult(result, globalFlags.format);
+}
+
+/**
+ * ⚠️ THE TOKEN RULE DOES NOT REACH THIS VERB. That rule is `prune`'s
+ * (brick://dd4cb0e8 §3.3), and manufacturing one here would put the word "prune"
+ * in front of an operator who is not running prune. What DOES carry over is the
+ * reason those strings are pinned at all: an operator pastes and retries
+ * whatever an error suggests, so this text is a control surface. It is asserted
+ * line-anchored by T-S4.
+ *
+ * ⚠️ DO NOT ADD "or re-run without --delete" AS THE DISK-FULL REMEDY. It is the
+ * natural-looking suggestion and it is WRONG: the soft-retract path calls
+ * `writeSessionRecordWithLifecycle`, which is itself a write and fails on the
+ * same full disk. Naming it would be a refusal teaching a remedy that does not
+ * work — the exact defect the `session_open` advice two functions away exists to
+ * fix. T-S4 asserts the substring `without --delete` is ABSENT; M-S3 adds it.
+ *
+ * Line 1 states the state of the world TWICE, and they are genuinely different
+ * facts: `rollbackTemplateSlug` runs find → retract → find-new-latest under ONE
+ * lock hold, so an operator seeing a mid-verb failure must learn both that no
+ * files were deleted AND that the slug registration did not move either.
+ */
+function printTemplateRollbackAuditFailure(
+  slug: string,
+  error: DeletionManifestWriteError,
+  format: OutputFormat,
+): void {
+  const cause = describeManifestFailure(error.cause);
+  if (
+    emitJsonResult(format, {
+      action: "template_rollback_failed",
+      reason: "audit_write_failed",
+      slug,
+      manifestPath: error.manifestPath,
+      cause,
+    })
+  ) {
+    return;
+  }
+  process.stderr.write(
+    `acpx sessions templates rollback: could not record this deletion — nothing was deleted, and template '${slug}' is unchanged.\n` +
+      `rollback --delete writes one line to ${error.manifestPath} before it removes\n` +
+      `anything, so a deletion that cannot be recorded does not happen.\n` +
+      `  cause: ${cause}\n` +
+      `Free space on that filesystem, then re-run — the slug is untouched, so nothing needs undoing first.\n`,
+  );
 }
 
 function formatRollbackTarget(target: {
@@ -3175,7 +3236,20 @@ export async function handleSessionsPrune(
       ...identity,
       before: flags.before,
       olderThanMs: flags.olderThan != null ? flags.olderThan * 24 * 60 * 60 * 1000 : undefined,
-      includeHistory: flags.includeHistory,
+      // ⚠️ `!== false`, NEVER `=== true`. An ABSENT flag must mean "delete the
+      // history", not "strand it". The default flipped here at the CLI rather
+      // than in the core deliberately: `PruneOptions.includeHistory` keeps its
+      // exact meaning, so every existing core test stays green unmodified and a
+      // programmatic caller is unaffected — and "what should the verb's user get
+      // by default" is a policy question, which is the CLI's to answer.
+      //
+      // The flag that LOOKS conservative is the one that strands: without it a
+      // prune deleted ~17% of a session's bytes and permanently orphaned the
+      // other 82%, because prune selects off the record index and the record is
+      // gone. Measured on devbox: 1,355 record-less ids own 2,157 stream files,
+      // 3.65 GB, that nothing can ever reclaim.
+      includeHistory: flags.includeHistory !== false,
+      auditScope: scope,
       includeTemplates: flags.includeTemplates,
       dryRun: flags.dryRun,
       sessionIds: scope.sessionIds,
@@ -3207,6 +3281,7 @@ export async function handleSessionsPrune(
               scope,
               strandedStreamFiles: plan.strandedStreamFiles,
               strandedStreamBytes: plan.strandedStreamBytes,
+              includeHistory: flags.includeHistory !== false,
             },
             globalFlags.format,
           );
@@ -3216,6 +3291,27 @@ export async function handleSessionsPrune(
   } catch (error) {
     if (error instanceof PruneAborted) {
       render.printPruneRefusalByFormat(error.refusal, globalFlags.format);
+      process.exitCode = EXIT_CODES.ERROR;
+      return;
+    }
+    // ⚠️ THIS TYPE ONLY, and everything else is re-thrown. A bare `catch` here
+    // would swallow an unrelated failure on a destructive path and tell the
+    // operator to free disk space when the real fault was something else —
+    // reporting a failure as something it is not. Same discipline as
+    // PruneAborted above. M-S5 injects a different error at the same seam and
+    // asserts it is re-thrown.
+    if (error instanceof DeletionManifestWriteError) {
+      render.printPruneRefusalByFormat(
+        {
+          reason: "audit_write_failed",
+          agentName: agent.agentName,
+          manifestPath: error.manifestPath,
+          cause: describeManifestFailure(error.cause),
+        },
+        globalFlags.format,
+      );
+      // ERROR (1), not USAGE (2): a runtime failure, not a malformed command —
+      // the same family as session_not_found.
       process.exitCode = EXIT_CODES.ERROR;
       return;
     }
