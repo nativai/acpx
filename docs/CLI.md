@@ -313,7 +313,7 @@ acpx [global_options] <agent> sessions history
 acpx [global_options] <agent> sessions history <name> [--limit <count>]
 acpx [global_options] <agent> sessions export [name] --output <path> [--cwd <dir>]
 acpx [global_options] <agent> sessions import <archive> [--name <name>] [--cwd <dir>]
-acpx [global_options] <agent> sessions prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]
+acpx [global_options] <agent> sessions prune [<id>...] [--cwd | --whole-box] [--older-than <days> | --before <date>] [--dry-run] [--include-history] [--include-templates]
 
 acpx [global_options] sessions ...   # defaults to codex
 ```
@@ -347,9 +347,16 @@ Behavior:
 - `sessions import <archive>` writes a fresh local record from a portable archive, reopens it as idle, keeps the provider session id, and clears source-machine process metadata
 - Imported sessions must resume that provider session; if the destination agent cannot load it, prompts fail clearly instead of starting an empty conversation
 - `sessions import --name <name>` and `--cwd <dir>` override the imported destination scope; import fails instead of creating a duplicate when an active session already exists for that `(agent, cwd, name)` scope or when another local record already uses the same provider session id
-- `sessions prune --dry-run` previews closed sessions that can be deleted
-- `sessions prune` deletes closed session records for the selected agent; add `--include-history` to delete event stream files too
-- `sessions prune --before <date>` and `--older-than <days>` filter by close time, falling back to last-used time for older records
+- `sessions prune` deletes each selected session's record **and its messages sidecar** — after which that session's transcript can never be rebuilt. Template blueprints are skipped unless `--include-templates`.
+- **A destructive prune requires a scope and refuses without one** (exit 2, nothing deleted), because unscoped it selects every closed session for the agent on the whole box. `--dry-run` needs no scope.
+- `sessions prune <id> [<id>...]` prunes exactly the sessions you name — the usual case. Ids are an acpx record id, an ACP session id, or a unique suffix. **All or nothing:** every id must resolve to exactly one closed session and every resolved session must be pruned, or the run aborts having deleted nothing.
+- `sessions prune --cwd` prunes closed sessions whose cwd is the current directory, by exact equality — not a subtree match, so it does not span sibling worktrees of the same project
+- `sessions prune --whole-box` is the box-wide sweep: every closed session for this agent on this box. It cannot be combined with ids or `--cwd`, and there is deliberately no `--all` alias — the long form is what makes an override greppable in a transcript later.
+- Ids and `--cwd` combine as a union ("this directory's, plus the ones I name"); an age filter then intersects the result
+- `sessions prune --before <date>` and `--older-than <days>` filter by close time, falling back to last-used time for older records, and each counts as a scope on its own
+- `sessions prune --dry-run` previews closed sessions that can be deleted and deletes nothing. It fails on a bad id exactly where the real run would, so the preview cannot promise what the real run refuses.
+- Before deleting anything, a destructive prune prints what it is about to destroy, including the stream files it will strand: without `--include-history` those are left behind unreachable and **no later prune can reclaim them**
+- `--include-history` and `--include-templates` are not scopes — they widen what a scope selects, so they still need one
 - close errors if the target session does not exist
 
 For commands that address an existing session, an explicit name first uses that
@@ -557,8 +564,9 @@ When `--format json` is used:
 - `sessions import` with `json`: object containing `action`, `record_id`, and `cwd`
 - `sessions import` with `quiet`: imported record id
 - `sessions prune` with `text`: summary plus pruned ids and close/last-used time
-- `sessions prune` with `json`: object containing `action`, `dryRun`, `count`, `bytesFreed`, and `pruned`
-- `sessions prune` with `quiet`: one pruned session id per line
+- `sessions prune` with `json`: object containing `action`, `dryRun`, `count`, `bytesFreed`, `pruned`, `skippedTemplates`, `scope`, `strandedStreamFiles`, and `strandedStreamBytes`
+- `sessions prune` refused for want of a scope with `json`: object on **stdout** with `action: "sessions_prune_refused"`, `reason`, `agentName`, `cwd`, `closedCandidates`, `closedCandidatesInCwd`, and `scopes`; exit 2. `reason` is one of `scope_required`, `scope_conflict`, `session_not_found`, `session_ambiguous`, `session_open`.
+- `sessions prune` with `quiet`: one pruned session id per line, and nothing else — a refusal goes to stderr so a quiet consumer's stdout parse is never handed prose
 - `status` with `text`: key/value process status lines
 
 ## Permission modes
