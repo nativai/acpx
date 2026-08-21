@@ -295,6 +295,98 @@ test("rider 3: the manifest name does not satisfy the sweeper's predicate", asyn
 });
 
 // ───────────────────────────────────────────────────────────────────────────
+// RIDER 2 — the Commander declaration-order trap, at the layer where it EXISTS
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * ⚠️ READ THIS BEFORE ASSUMING THE BEHAVIOURAL TESTS COVER THE FLAG SURFACE.
+ * THEY DO NOT COVER THE DECLARATION ORDER, AND THAT IS MEASURED.
+ *
+ * The conception specified two mitigations for the trap, "belt and braces, both
+ * required": register `--no-include-history` FIRST, and read `!== false` (never
+ * `=== true`) in the handler. Running each named mutation against the whole
+ * behavioural suite produced **ZERO reds**:
+ *
+ *   M-F1 (swap the two `.option()` calls)              -> 0 reds
+ *   M-F2 (`!== false` becomes `=== true`)              -> 0 reds
+ *   M-F1 + M-F2 together                               -> reds T-F1 (see below)
+ *
+ * The two mitigations are not independent — they are REDUNDANT, and either one
+ * alone is sufficient:
+ *
+ *   - correct order + `=== true`  : bare parses to `true`, `true === true`  -> delete
+ *   - swapped order + `!== false` : bare parses to `undefined`,
+ *                                   `undefined !== false`                   -> delete
+ *   - swapped order + `=== true`  : bare parses to `undefined`,
+ *                                   `undefined === true` is FALSE           -> STRAND
+ *
+ * So the behavioural suite genuinely can catch the real defect, but only when
+ * both mitigations are gone. Each alone is unobservable in behaviour, which is
+ * why the declaration order needs pinning at the layer where it actually
+ * exists: the parse.
+ *
+ * This is NOT an assertion about the order of two lines of source — that would
+ * be a convention check, and a convention is not a control. It drives the REAL
+ * `registerSessionsCommand` and asserts the OUTCOME the order exists to
+ * produce: a bare prune parses to `includeHistory === true`, not `undefined`.
+ * That is what protects a future reader who writes `=== true` — precisely the
+ * mistake the conception predicted an implementer would make.
+ */
+test("rider 2: a bare prune parses includeHistory as true, not undefined", async () => {
+  const { Command } = await import("commander");
+  const { registerSessionsCommand } = await import("../src/cli/command-registration.js");
+
+  const parseFlags = (argv: string[]): Record<string, unknown> => {
+    const program = new Command();
+    program.exitOverride();
+    let captured: Record<string, unknown> | undefined;
+    registerSessionsCommand(program, "claude", {
+      defaultAgent: "claude",
+      defaultPermissions: "approve-reads",
+      nonInteractivePermissions: "deny",
+      authPolicy: "skip",
+      ttlMs: 300_000,
+      queueMaxDepth: 16,
+      format: "text",
+      agents: {},
+      auth: {},
+      disableExec: false,
+      mcpServers: [],
+      subscriptions: { subscriptions: [] },
+      globalPath: "/tmp/global-config.json",
+      projectPath: "/tmp/project-config.json",
+      hasGlobalConfig: false,
+      hasProjectConfig: false,
+    });
+    const sessions = program.commands.find((c) => c.name() === "sessions");
+    assert.ok(sessions, "sessions command not registered");
+    const prune = sessions.commands.find((c) => c.name() === "prune");
+    assert.ok(prune, "prune command not registered");
+    // Replace the action so parsing never executes a real prune.
+    prune.action((_ids: string[], flags: Record<string, unknown>) => {
+      captured = flags;
+    });
+    // `from: "user"` means argv carries no node/script prefix.
+    program.parse(["sessions", "prune", ...argv], { from: "user" });
+    assert.ok(captured, "the prune action never ran");
+    return captured;
+  };
+
+  // THE ONE THAT REDS UNDER M-F1, and the only thing that does.
+  assert.equal(
+    parseFlags([]).includeHistory,
+    true,
+    "a bare prune must parse includeHistory as an explicit true — if this is " +
+      "undefined, the two .option() registrations have been swapped, and a " +
+      "future `=== true` reader will silently strand every stream",
+  );
+
+  // Both directions, so a registration that always yielded `true` could not pass.
+  assert.equal(parseFlags(["--include-history"]).includeHistory, true);
+  assert.equal(parseFlags(["--no-include-history"]).includeHistory, false);
+});
+
+// ───────────────────────────────────────────────────────────────────────────
 // T-M · the manifest
 // ───────────────────────────────────────────────────────────────────────────
 
