@@ -3243,6 +3243,27 @@ export async function handleSessionsPrune(
       // programmatic caller is unaffected — and "what should the verb's user get
       // by default" is a policy question, which is the CLI's to answer.
       //
+      // ⚠️ THIS READ AND THE `--no-include-history`-FIRST DECLARATION ORDER
+      // (command-registration.ts) ARE **REDUNDANT, NOT COMPLEMENTARY**. The
+      // conception (§4.2.1) called them "belt and braces, both required"; that
+      // is FALSE, and the correction is measured. Mutating each alone against
+      // the whole behavioural suite:
+      //
+      //   swap the two .option() calls -> 0 behavioural reds
+      //   `!== false` -> `=== true`    -> 0 reds
+      //   BOTH mutated together        -> 6 reds (T-F1 and others)
+      //
+      // Correct order makes a bare invocation parse to `true`, so even
+      // `=== true` deletes; a swapped order parses to `undefined`, so
+      // `undefined !== false` still deletes. Only BOTH wrong gives
+      // `undefined === true` -> false -> SILENT STRANDING of every stream.
+      //
+      // So changing this line alone will NOT red anything. That is not
+      // permission to change it: it is correct only while the declaration order
+      // is, and vice versa. Removing both is unguarded by any behavioural test.
+      // The declaration order is pinned at the parse layer by "rider 2: a bare
+      // prune parses includeHistory as true, not undefined".
+      //
       // The flag that LOOKS conservative is the one that strands: without it a
       // prune deleted ~17% of a session's bytes and permanently orphaned the
       // other 82%, because prune selects off the record index and the record is

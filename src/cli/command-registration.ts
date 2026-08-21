@@ -516,8 +516,33 @@ export function registerSessionsCommand(
     // Only the third gives all three required behaviours. The natural order —
     // affirmative first — leaves the default UNDEFINED, which a core reading
     // `=== true` silently treats as "keep stranding": the flip would look
-    // shipped and do nothing. That is why the handler reads `!== false`, and why
-    // a bare-invocation test is the only thing that can catch a swap.
+    // shipped and do nothing.
+    //
+    // ⚠️ THIS ORDER AND `!== false` IN THE HANDLER ARE **REDUNDANT, NOT
+    // COMPLEMENTARY**. The conception (§4.2.1) called them "belt and braces,
+    // both required"; that is FALSE and the correction is measured, not argued.
+    // Mutating each alone and running the whole behavioural suite:
+    //
+    //   swap these two .option() calls          -> 0 behavioural reds
+    //   handler `!== false` becomes `=== true`  -> 0 reds
+    //   BOTH mutated together                   -> 6 reds (T-F1 and others)
+    //
+    // Because: swapped + `!== false` parses `undefined`, and
+    // `undefined !== false` is true, so streams still get deleted. Correct order
+    // + `=== true` parses `true`, and `true === true`, so streams still get
+    // deleted. Only swapped + `=== true` gives `undefined === true` -> false ->
+    // SILENT STRANDING, with no test to catch it.
+    //
+    // So EITHER ONE ALONE YIELDS CORRECT BEHAVIOUR, and **no behavioural test
+    // can catch a swap here while the handler reads `!== false`**. Do not remove
+    // this order believing the handler covers you, and do not remove the
+    // handler's `!== false` believing this order covers you — each is true only
+    // while the other stands. Removing both strands every stream silently.
+    // The only pin that exists is at the PARSE layer: the test "rider 2: a bare
+    // prune parses includeHistory as true, not undefined"
+    // (test/deletion-manifest.test.ts), which is what reds if these two are
+    // swapped. A source-text check for the order was considered and rejected —
+    // a convention check is not a control.
     .option(
       "--no-include-history",
       "Keep each session's event stream files (.stream.*) and its timestamp sidecar. They are then unreachable: prune selects off the record index, so once the record is gone no later prune can reclaim them.",

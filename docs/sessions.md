@@ -222,6 +222,14 @@ which deleter ran, when, against what scope, which acpx session ordered it, and
 the session's id, name and cwd. **If a session has vanished, grep that file
 first.**
 
+⚠️ **Match on the `id` field, not on the bare id** — `grep '"id":"<id>"'`, not
+`grep <id>`. An entry's `scope` records the invocation's full id list verbatim,
+so a bare id also matches **every other entry from the same multi-id run**:
+`prune a b c d` writes four entries that each contain all four ids, and
+`grep a deletions.ndjson` returns four lines for a one-session question. The
+`id` field disambiguates correctly and `scope` recording the real invocation is
+right — it is the query that has to be precise.
+
 The line is written **before** the first unlink. If it cannot be written the run
 refuses — exit 1, nothing deleted — rather than destroying sessions it cannot
 account for. A `--dry-run` destroys nothing and so records nothing.
