@@ -172,7 +172,7 @@ blueprints — so neither should ever be the only thing you typed.
 
 ### Naming sessions is all-or-nothing
 
-Each positional id must resolve to exactly one *closed* session — by acpx record
+Each positional id must resolve to exactly one _closed_ session — by acpx record
 id, ACP session id, or unique suffix — and every session so resolved must
 actually be pruned. If any id is unknown, ambiguous, still open, or excluded by a
 combined age filter, the run aborts with **nothing deleted**. "Delete these four"
