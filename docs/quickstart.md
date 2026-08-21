@@ -97,9 +97,17 @@ acpx codex status                 # running / idle / dead / no-session
 To remove closed records once you are done:
 
 ```bash
-acpx codex sessions prune --dry-run
-acpx codex sessions prune --older-than 30
+acpx codex sessions prune --dry-run                    # preview everything; needs no scope
+acpx codex sessions prune 4e25443c a1b2c3d4            # just the ones you name — the usual case
+acpx codex sessions prune --cwd                        # this directory's
+acpx codex sessions prune --older-than 30              # retention sweep by age
 ```
+
+A destructive prune needs a scope and refuses without one — unscoped it would
+take every closed session on the box, and each pruned session loses its record
+**and its messages sidecar**, after which that transcript can never be rebuilt.
+`acpx codex sessions prune --whole-box` is the box-wide sweep, if that is really
+what you mean.
 
 ## 8. Pipe it into your tooling
 

@@ -164,6 +164,16 @@ export type SessionsPruneFlags = {
   olderThan?: number;
   includeHistory?: boolean;
   includeTemplates?: boolean;
+  /**
+   * `--cwd` is a pure boolean: "sessions whose cwd is the invocation cwd". No
+   * value form, deliberately — session ids are a variadic positional, and an
+   * optional-value option would swallow the first id (`prune --cwd 4e25443c`
+   * would bind cwd="4e25443c" and silently drop the id). See
+   * test/sessions-prune-scope.test.ts "binds the id, never --cwd's value".
+   */
+  cwd?: boolean;
+  /** The audit token. Deliberately long and distinctive; no `--all` alias. */
+  wholeBox?: boolean;
 };
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

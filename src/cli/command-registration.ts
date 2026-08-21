@@ -487,17 +487,31 @@ export function registerSessionsCommand(
 
   sessionsCommand
     .command("prune")
-    .description("Delete closed sessions and free disk space (template blueprints are skipped)")
-    .option("--dry-run", "Preview what would be pruned without deleting anything")
+    .description(
+      "Delete closed sessions: removes each session's record AND its messages sidecar (after which its transcript cannot be rebuilt). Requires a scope — session ids, --cwd, --whole-box, --older-than or --before — unless --dry-run. Template blueprints are skipped.",
+    )
+    .argument(
+      "[ids...]",
+      "Session ids to prune (acpx record id, ACP session id, or unique suffix). All must resolve to closed sessions or nothing is deleted.",
+    )
+    .option("--dry-run", "Preview what would be pruned without deleting anything (needs no scope)")
+    .option("--cwd", "Prune closed sessions whose cwd is the current directory")
+    .option(
+      "--whole-box",
+      "Prune EVERY closed session for this agent on this box (the box-wide sweep; cannot be combined with ids or --cwd)",
+    )
     .option("--before <date>", "Prune sessions closed before this date", parsePruneBeforeDate)
     .option("--older-than <days>", "Prune sessions closed more than N days ago", parseDaysOlderThan)
-    .option("--include-history", "Also delete event stream files (.stream.ndjson)")
+    .option(
+      "--include-history",
+      "Also delete event stream files (.stream.*). Without this they are left behind unreachable and no later prune can reclaim them.",
+    )
     .option(
       "--include-templates",
       "Also delete template blueprints (breaks every session spawned from their slug)",
     )
-    .action(async function (this: Command, flags: SessionsPruneFlags) {
-      await handleSessionsPrune(explicitAgentName, flags, this, config);
+    .action(async function (this: Command, ids: string[], flags: SessionsPruneFlags) {
+      await handleSessionsPrune(explicitAgentName, ids, flags, this, config);
     });
 }
 

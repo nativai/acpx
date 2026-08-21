@@ -38,6 +38,8 @@ acpx codex sessions import api-session.json --name api-restored
 acpx codex sessions close            # soft-close cwd default
 acpx codex sessions close api        # soft-close named session
 acpx codex sessions prune --dry-run
+acpx codex sessions prune 4e25443c a1b2c3d4   # the sessions you name
+acpx codex sessions prune --cwd               # this directory's
 acpx codex sessions prune --older-than 30
 acpx codex sessions prune --before 2026-01-01 --include-history
 ```
@@ -129,11 +131,20 @@ Imports keep the archive's provider session id, reopen the copied session as an 
 
 ## Prune
 
-`sessions prune` removes closed records once you actually want them gone:
+`sessions prune` removes closed records once you actually want them gone. It
+deletes each selected session's record **and its messages sidecar** — after which
+that session's transcript can never be rebuilt — so it makes you say what you
+mean:
 
 ```bash
-# Preview what would be deleted
+# Preview what would be deleted. Needs no scope.
 acpx codex sessions prune --dry-run
+
+# Just the ones you name — the usual case, and the operation most callers want.
+acpx codex sessions prune 4e25443c a1b2c3d4
+
+# This directory's closed sessions.
+acpx codex sessions prune --cwd
 
 # Delete closed sessions older than 30 days (by closeAt, falling back to lastUsedAt)
 acpx codex sessions prune --older-than 30
@@ -141,9 +152,43 @@ acpx codex sessions prune --older-than 30
 # Delete closed sessions whose close time is before a date
 acpx codex sessions prune --before 2026-01-01
 
+# Every closed session for this agent on this box — the box-wide sweep.
+acpx codex sessions prune --whole-box
+
 # Also remove the per-session event-stream files
-acpx codex sessions prune --include-history
+acpx codex sessions prune --cwd --include-history
 ```
+
+### Scope is required
+
+A destructive prune with none of `<id>...`, `--cwd`, `--whole-box`,
+`--older-than` or `--before` **refuses**: exit 2, nothing deleted, and it prints
+copy-pasteable alternatives carrying both the box-wide count and the count in
+this directory. `--dry-run` is exempt, so every preview workflow works unchanged.
+
+`--include-history` and `--include-templates` are **not** scopes. They widen what
+a scope selects — one deletes stream history, the other deletes template
+blueprints — so neither should ever be the only thing you typed.
+
+### Naming sessions is all-or-nothing
+
+Each positional id must resolve to exactly one _closed_ session — by acpx record
+id, ACP session id, or unique suffix — and every session so resolved must
+actually be pruned. If any id is unknown, ambiguous, still open, or excluded by a
+combined age filter, the run aborts with **nothing deleted**. "Delete these four"
+that quietly deletes three is the same failure as one that deletes seven.
+
+`--cwd` matches the invocation directory by exact equality, not as a subtree, so
+it will not span sibling worktrees of the same project. Ids and `--cwd` combine
+as a union; an age filter then intersects the result.
+
+### What it strands
+
+Without `--include-history`, prune deletes the record and sidecar but leaves the
+session's `.stream.*` files behind. Selection walks the record index, so once the
+record is gone **nothing can ever match those files again and no later prune
+reclaims them**. A destructive run prints the file count and byte total it is
+about to strand, before deleting anything.
 
 Output:
 

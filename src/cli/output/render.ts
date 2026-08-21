@@ -398,12 +398,212 @@ type PruneRenderResult = {
   skippedTemplates: SessionRecord[];
   bytesFreed: number;
   dryRun: boolean;
+  strandedStreamFiles: number;
+  strandedStreamBytes: number;
 };
 
-export function printPruneResultByFormat(result: PruneRenderResult, format: OutputFormat): void {
+/** Only the applied keys are present. An object rather than an enum string so a
+ *  combination needs no new vocabulary and a future selector is purely additive.
+ *  `wholeBox` (not `all`) so a JSON-log sweep carries the same distinctive audit
+ *  token as the command line. */
+export type PruneScope = {
+  wholeBox?: boolean;
+  sessionIds?: string[];
+  cwd?: string;
+  olderThanDays?: number;
+  before?: string;
+};
+
+/**
+ * ⚠️ This text is the CONTROL SURFACE, not a diagnostic. An agent pastes and
+ * retries whatever an error suggests, so whatever these lines suggest is what
+ * gets run next — a drifted suggestion becomes the new invocation pattern.
+ *
+ * DO NOT paraphrase, re-flow or "improve" the strings below, and in particular
+ * DO NOT move `--whole-box` into the four-command copy-paste block: a refusal
+ * whose remedy is the override has built a one-line bypass and is worse than no
+ * refusal. Every clause here is pinned by a literal assertion in
+ * test/sessions-prune-scope.test.ts (E2 (i)–(iv), the token rule); prose is not
+ * type-checked, which is exactly why those tests exist.
+ */
+export type PruneRefusal =
+  | {
+      reason: "scope_required";
+      agentName: string;
+      cwd: string;
+      closedCandidates: number;
+      closedCandidatesInCwd: number;
+    }
+  | { reason: "scope_conflict"; agentName: string }
+  | { reason: "session_not_found"; agentName: string; sessionId: string }
+  | {
+      reason: "session_ambiguous";
+      agentName: string;
+      sessionId: string;
+      matches: { acpxRecordId: string; name?: string; lastUsedAt: string }[];
+    }
+  | { reason: "session_open"; agentName: string; sessionId: string };
+
+/** The scopes the refusal names, echoed into JSON so a machine consumer sees the
+ *  same menu the text does. */
+const PRUNE_SCOPE_NAMES = ["<ids>", "--cwd", "--whole-box", "--older-than", "--before"];
+
+export function printPruneRefusalByFormat(refusal: PruneRefusal, format: OutputFormat): void {
+  if (emitJsonResult(format, pruneRefusalJsonPayload(refusal))) {
+    return;
+  }
+  // stderr under `quiet` too, deliberately: a quiet consumer parses pruned ids
+  // off stdout and must never be handed prose there.
+  process.stderr.write(renderPruneRefusalText(refusal));
+}
+
+function pruneRefusalJsonPayload(refusal: PruneRefusal): Record<string, unknown> {
+  const base = { action: "sessions_prune_refused", ...refusal };
+  if (refusal.reason === "scope_required") {
+    return { ...base, scopes: PRUNE_SCOPE_NAMES };
+  }
+  if (refusal.reason === "session_ambiguous") {
+    return { ...base, matches: refusal.matches.map((match) => match.acpxRecordId) };
+  }
+  return base;
+}
+
+function renderPruneRefusalText(refusal: PruneRefusal): string {
+  const agent = refusal.agentName;
+  if (refusal.reason === "scope_required") {
+    return renderScopeRequiredText(
+      refusal.agentName,
+      refusal.cwd,
+      refusal.closedCandidates,
+      refusal.closedCandidatesInCwd,
+    );
+  }
+  if (refusal.reason === "scope_conflict") {
+    return (
+      "acpx sessions prune: --whole-box cannot be combined with session ids or --cwd — nothing was deleted.\n" +
+      "prune --whole-box means the whole box; ids and --cwd mean a specific set. Pick one.\n"
+    );
+  }
+  if (refusal.reason === "session_open") {
+    return `acpx sessions prune: '${refusal.sessionId}' is still open — close it first, then prune. Nothing was deleted.\n`;
+  }
+  if (refusal.reason === "session_ambiguous") {
+    const count = refusal.matches.length;
+    // The match lines are DATA and exempt from the token rule — which is exactly
+    // why the line above states the count and the line below states the remedy:
+    // an operator whose pipe eats the list still learns how many there were and
+    // what to do next.
+    const header = `acpx sessions prune: '${refusal.sessionId}' is ambiguous — ${count} closed session${count === 1 ? "" : "s"} match, so prune deleted nothing.\n`;
+    const rows = refusal.matches
+      .map(
+        (match) =>
+          `  ${match.acpxRecordId}${match.name ? ` (${match.name})` : ""}\t${match.lastUsedAt}\n`,
+      )
+      .join("");
+    return `${header}${rows}Re-run prune with a longer suffix or the full id.\n`;
+  }
+  return `acpx sessions prune: no closed ${agent} session matches '${refusal.sessionId}' — nothing was deleted.\n`;
+}
+
+function renderScopeRequiredText(
+  agent: string,
+  cwd: string,
+  candidates: number,
+  candidatesInCwd: number,
+): string {
+  // "considers", never "deletes": both counts come off index entries only, so
+  // they are an upper bound (the template skip needs fully-loaded records, and
+  // this path deliberately loads none of them).
+  const cwdComment =
+    candidatesInCwd === 0
+      ? `# no closed sessions here (${cwd})`
+      : `# the ${candidatesInCwd} closed in ${cwd}`;
+  return (
+    `acpx sessions prune: refusing to run unscoped — nothing was deleted.\n` +
+    `\n` +
+    `Unscoped, prune considers ALL ${candidates} closed ${agent} sessions on this box, not just this\n` +
+    `directory's — and each pruned session loses its record AND its messages sidecar, so\n` +
+    `that transcript can never be rebuilt. prune needs a scope; copy one of these:\n` +
+    `\n` +
+    `  acpx ${agent} sessions prune <id> [<id>...]    # just the ones you name — the usual case\n` +
+    `  acpx ${agent} sessions prune --cwd             ${cwdComment}\n` +
+    `  acpx ${agent} sessions prune --older-than 30   # retention sweep by age\n` +
+    `  acpx ${agent} sessions prune --dry-run         # preview everything (no scope needed)\n` +
+    `\n` +
+    `prune --whole-box is every closed ${agent} session on this box (${candidates}) — only if you mean it.\n`
+  );
+}
+
+/** The blast radius, printed BEFORE the first unlink. Text format only — a JSON
+ *  or quiet consumer gets the same facts in the result payload, and prose on
+ *  their stdout would break the parse. */
+export function printPrunePlan(
+  plan: {
+    count: number;
+    agentName: string;
+    scope: PruneScope;
+    strandedStreamFiles: number;
+    strandedStreamBytes: number;
+  },
+  format: OutputFormat,
+): void {
+  if (format !== "text" || plan.count === 0) {
+    return;
+  }
+  process.stdout.write(`${formatPrunePlanLine(plan.count, plan.agentName, plan.scope)}\n`);
+  if (plan.strandedStreamFiles > 0) {
+    const files = `${plan.strandedStreamFiles} stream file${plan.strandedStreamFiles === 1 ? "" : "s"}`;
+    // Both physical lines carry the token: a wrapped line is two lines to a
+    // filter, so a message whose token sits only on line 1 delivers a headless
+    // fragment to the operator's pipe.
+    process.stdout.write(
+      `  note: prune leaves ${files} (${formatBytes(plan.strandedStreamBytes)}) behind, unreachable — no later prune\n` +
+        `        can reclaim them. Add --include-history so prune removes them too.\n`,
+    );
+  }
+}
+
+function formatPrunePlanLine(count: number, agent: string, scope: PruneScope): string {
+  const noun = `session${count === 1 ? "" : "s"}`;
+  const head = scope.wholeBox
+    ? `ALL ${count} closed ${agent} ${noun}`
+    : `${count} ${scope.sessionIds ? "named" : "closed"} ${agent} ${noun}`;
+  const clauses = prunePlanScopeClauses(scope);
+  const tail = clauses.length > 0 ? ` ${clauses.join(" ")}` : "";
+  // The --whole-box line echoes the literal flag token so the box-wide sweep
+  // leaves a greppable trace even when the command line was built by variable
+  // interpolation (E3).
+  const parenthetical = scope.wholeBox
+    ? "(--whole-box; record + messages sidecar each)"
+    : "(record + messages sidecar each)";
+  return `Will prune ${head}${tail} ${parenthetical}.`;
+}
+
+/** Clause order is fixed: `named` (in the head) → `in <dir>` → age → `on this box`. */
+function prunePlanScopeClauses(scope: PruneScope): string[] {
+  const clauses: string[] = [];
+  if (scope.cwd != null) {
+    clauses.push(`in ${scope.cwd}`);
+  }
+  if (scope.olderThanDays != null) {
+    clauses.push(`older than ${scope.olderThanDays} days`);
+  } else if (scope.before != null) {
+    clauses.push(`closed before ${scope.before}`);
+  }
+  if (scope.wholeBox) {
+    clauses.push("on this box");
+  }
+  return clauses;
+}
+
+export function printPruneResultByFormat(
+  result: PruneRenderResult,
+  format: OutputFormat,
+  scope: PruneScope,
+): void {
   const count = result.pruned.length;
 
-  if (emitPruneJsonResult(result, format, count)) {
+  if (emitPruneJsonResult(result, format, count, scope)) {
     return;
   }
 
@@ -433,10 +633,23 @@ export function printPruneResultByFormat(result: PruneRenderResult, format: Outp
   }
 }
 
+/**
+ * ⚠️ The JSON surface is a CONTRACT and contracts do not move under their
+ * consumers. `action`, `dryRun`, `count`, `bytesFreed`, `pruned` and
+ * `skippedTemplates` (shape `{acpxRecordId, slug}`, landed with brick a62de399)
+ * keep their exact names, types and meanings. `scope`, `strandedStreamFiles`
+ * and `strandedStreamBytes` are ADDITIVE, alongside.
+ *
+ * The division to hold for the whole verb: TEXT is for humans and pipes, so it
+ * is free to evolve and the token rule governs it; JSON is for scripts, so it
+ * does not move. In particular the token rule does NOT reach in here — do not
+ * "make skippedTemplates consistent" with the text line.
+ */
 function emitPruneJsonResult(
   result: PruneRenderResult,
   format: OutputFormat,
   count: number,
+  scope: PruneScope,
 ): boolean {
   return emitJsonResult(format, {
     action: result.dryRun ? "sessions_prune_dry_run" : "sessions_pruned",
@@ -448,6 +661,9 @@ function emitPruneJsonResult(
       acpxRecordId: r.acpxRecordId,
       slug: templateSkipSlug(r),
     })),
+    scope,
+    strandedStreamFiles: result.strandedStreamFiles,
+    strandedStreamBytes: result.strandedStreamBytes,
   });
 }
 
@@ -457,10 +673,20 @@ function templateSkipSlug(record: SessionRecord): string {
   return effectiveTemplateSlug(record.template?.slug, record.name) ?? record.acpxRecordId;
 }
 
+/**
+ * ⚠️ The leading `prune ` is load-bearing, not decoration — the token rule (§3.3).
+ * This line's job is to tell the operator a blueprint was PROTECTED, and it is read
+ * through pipelines like the one in the 2026-07-24 incident,
+ * `… 2>&1 | grep -iE "prune|delet|remov|…" | head`. Without the token the line is
+ * dropped and the protection is invisible at exactly the moment it mattered.
+ * PREFIXED rather than appended so the token leads and survives a truncating
+ * filter. Pinned line-anchored in test/cli.test.ts and
+ * test/sessions-prune-scope.test.ts.
+ */
 function printSkippedTemplates(skippedTemplates: SessionRecord[]): void {
   for (const record of skippedTemplates) {
     process.stdout.write(
-      `  skipped ${record.acpxRecordId} — template '${templateSkipSlug(record)}'\n`,
+      `  prune skipped ${record.acpxRecordId} — template '${templateSkipSlug(record)}'\n`,
     );
   }
 }

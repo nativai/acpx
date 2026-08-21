@@ -1220,6 +1220,30 @@ export type PruneOptions = {
   /** Opt in to deleting template blueprints too. Off by default — see isTemplateMarkedRecord. */
   includeTemplates?: boolean;
   dryRun?: boolean;
+  /** Exactly these sessions (acpx record id, ACP session id, or unique suffix). */
+  sessionIds?: string[];
+  /** Absolute, already-resolved. Exact equality against the record's cwd. */
+  cwd?: string;
+  /**
+   * Invoked once after record loading and BEFORE both the dry-run early return
+   * and the first unlink. Throwing aborts with nothing deleted.
+   *
+   * ⚠️ DO NOT move this call below the `if (options.dryRun)` early return. That
+   * is the obvious reading of "before the delete loop" and it is the bug: it
+   * would exempt --dry-run from the caller's all-or-nothing id contract, so
+   * `prune --dry-run <good-id> <typo>` would preview 1 session and report
+   * success while the real run it is previewing aborts. A preview that does not
+   * fail where the real run fails is worse than no preview. The callback gets
+   * `dryRun` and decides what to render.
+   * test/sessions-prune.test.ts "onBeforeDelete runs on a dry run too" goes red
+   * if this moves.
+   */
+  onBeforeDelete?: (plan: {
+    records: SessionRecord[];
+    strandedStreamFiles: number;
+    strandedStreamBytes: number;
+    dryRun: boolean;
+  }) => void;
 };
 
 export type PruneResult = {
@@ -1228,6 +1252,33 @@ export type PruneResult = {
   skippedTemplates: SessionRecord[];
   bytesFreed: number;
   dryRun: boolean;
+  /**
+   * Stream files owned by the pruned records that were NOT deleted (no
+   * --include-history). Nothing can ever match them again — prune selects off
+   * the record index, so once the record is gone no later prune reclaims them.
+   * Both are 0 when includeHistory is true.
+   */
+  strandedStreamFiles: number;
+  strandedStreamBytes: number;
+};
+
+/** Index-entry counts for the CLI's unscoped-prune refusal. Deliberately cheap:
+ *  index entries only, never a record load — the refusal's whole job is to cost
+ *  nothing on a path that deletes nothing. The numbers are therefore an upper
+ *  bound (the template skip needs loaded records), which is why the refusal says
+ *  "considers", not "deletes". */
+export type PruneCandidateCounts = {
+  total: number;
+  inCwd: number;
+};
+
+/** One positional id, resolved against the index for the CLI's all-or-nothing
+ *  contract. `openMatches` is what separates "no such session" from "close it
+ *  first" — a distinction the prunable-record set alone cannot make. */
+export type PruneIdResolution = {
+  id: string;
+  closedMatches: { acpxRecordId: string; name?: string; lastUsedAt: string }[];
+  openMatches: number;
 };
 
 /**
@@ -1265,7 +1316,13 @@ export async function pruneSessions(options: PruneOptions = {}): Promise<PruneRe
   await ensureSessionDir();
   const entries = await loadSessionIndexEntries();
 
-  const eligible = filterPruneCandidates(entries, options.agentCommand, options.agentName);
+  const eligible = filterPruneCandidates(
+    entries,
+    options.agentCommand,
+    options.agentName,
+    options.sessionIds,
+    options.cwd,
+  );
 
   const cutoff =
     options.before ??
@@ -1275,26 +1332,50 @@ export async function pruneSessions(options: PruneOptions = {}): Promise<PruneRe
     eligible,
     cutoff,
     options.includeTemplates === true,
+    options.cwd,
+    options.sessionIds,
   );
 
-  if (options.dryRun) {
-    return { pruned: records, skippedTemplates, bytesFreed: 0, dryRun: true };
-  }
-
   const sessionDir = sessionBaseDir();
-  let bytesFreed = 0;
 
-  // Read the directory once upfront so stream-file matching doesn't re-read
-  // it for every session in the loop.
+  // Read the directory once upfront so stream-file matching doesn't re-read it
+  // for every session in the loop. Unconditional now (it used to be gated on
+  // includeHistory) because the stranded-stream total is reported on every run,
+  // dry ones included — a preview that does not say what it would strand is
+  // hiding the verb's single worst measured behaviour.
   let dirEntries: string[] = [];
-  if (options.includeHistory) {
-    try {
-      dirEntries = await fs.readdir(sessionDir);
-    } catch {
-      // ignore
-    }
+  try {
+    dirEntries = await fs.readdir(sessionDir);
+  } catch {
+    // ignore
   }
 
+  const { files: strandedStreamFiles, bytes: strandedStreamBytes } = await measureStrandedStreams(
+    records,
+    sessionDir,
+    dirEntries,
+    options.includeHistory === true,
+  );
+
+  options.onBeforeDelete?.({
+    records,
+    strandedStreamFiles,
+    strandedStreamBytes,
+    dryRun: options.dryRun === true,
+  });
+
+  if (options.dryRun) {
+    return {
+      pruned: records,
+      skippedTemplates,
+      bytesFreed: 0,
+      dryRun: true,
+      strandedStreamFiles,
+      strandedStreamBytes,
+    };
+  }
+
+  let bytesFreed = 0;
   for (const record of records) {
     bytesFreed += await pruneSessionFiles(
       record,
@@ -1308,18 +1389,160 @@ export async function pruneSessions(options: PruneOptions = {}): Promise<PruneRe
     // best effort cache rebuild
   });
 
-  return { pruned: records, skippedTemplates, bytesFreed, dryRun: false };
+  return {
+    pruned: records,
+    skippedTemplates,
+    bytesFreed,
+    dryRun: false,
+    strandedStreamFiles,
+    strandedStreamBytes,
+  };
 }
 
+async function measureStrandedStreams(
+  records: SessionRecord[],
+  sessionDir: string,
+  dirEntries: string[],
+  includeHistory: boolean,
+): Promise<{ files: number; bytes: number }> {
+  let files = 0;
+  let bytes = 0;
+  if (includeHistory) {
+    // Nothing is stranded — the delete loop takes these files too.
+    return { files, bytes };
+  }
+  for (const record of records) {
+    const safeId = encodeURIComponent(record.acpxRecordId);
+    for (const name of dirEntries.filter((entry) => isSessionStreamFile(entry, safeId))) {
+      files += 1;
+      try {
+        bytes += (await fs.stat(path.join(sessionDir, name))).size;
+      } catch {
+        // raced away between readdir and stat — it is not ours to strand
+      }
+    }
+  }
+  return { files, bytes };
+}
+
+/**
+ * `sessionIds` and `cwd` are SELECTIVE predicates and so may read the index
+ * entry, where the template check above must not. The direction of failure is
+ * what separates them: a protective predicate that reads an absent projection
+ * turns a missing field into a deleted blueprint, whereas a selective predicate
+ * reading a stale one merely fails to select — nothing extra is deleted. Both
+ * fields it reads (`cwd`, `acpxRecordId`/`acpSessionId`) are required on
+ * SessionIndexEntry, not optional hot-path enrichment. `cwd` is re-confirmed on
+ * the loaded record in loadPrunableRecords anyway, closing the one direction in
+ * which a stale index could over-select.
+ */
 function filterPruneCandidates(
   entries: SessionIndexEntry[],
   agentCommand: string | undefined,
   agentName: string | undefined,
+  sessionIds: string[] | undefined,
+  cwd: string | undefined,
 ): SessionIndexEntry[] {
   return entries.filter(
     (entry) =>
-      entry.closed && (!agentCommand || matchesAgentIdentity(entry, agentCommand, agentName)),
+      entry.closed &&
+      (!agentCommand || matchesAgentIdentity(entry, agentCommand, agentName)) &&
+      matchesPruneSelectors(entry, sessionIds, cwd),
   );
+}
+
+/**
+ * Ids and `--cwd` are a UNION — "this directory's, plus the ones I name". Age
+ * filters then intersect the result, which is why they are applied separately in
+ * loadPrunableRecords rather than here.
+ *
+ * ⚠️ NOT an intersection. That looks like the obvious reading of "combine the
+ * filters" and it silently drops every named session that lives outside the
+ * invocation cwd — which, under the all-or-nothing id contract, turns a valid
+ * `prune --cwd <id-from-elsewhere>` into a whole-run abort.
+ * test/sessions-prune-scope.test.ts "binds the id as an id" goes red if this
+ * becomes an intersection.
+ */
+function matchesPruneSelectors(
+  entry: SessionIndexEntry,
+  sessionIds: string[] | undefined,
+  cwd: string | undefined,
+): boolean {
+  if (!sessionIds && cwd == null) {
+    return true;
+  }
+  if (cwd != null && entry.cwd === cwd) {
+    return true;
+  }
+  return sessionIds?.some((id) => matchesPruneSessionId(entry, id)) === true;
+}
+
+/**
+ * Suffix — deliberately not `includes` and not `startsWith`. "acpx record id,
+ * ACP session id, or unique SUFFIX" is the documented id contract everywhere
+ * else in this CLI (`recover`, `prompt -s`), and a looser match on a destructive
+ * verb selects sessions the operator did not name.
+ *
+ * Exported so the CLI's all-or-nothing contract check resolves ids by exactly the
+ * same rule the core selected them with. Two copies of a matcher that decides what
+ * gets deleted is one drift away from "I named four and it deleted three".
+ */
+export function matchesPruneSessionId(
+  target: Pick<SessionIndexEntry, "acpxRecordId" | "acpSessionId">,
+  id: string,
+): boolean {
+  return (
+    target.acpxRecordId === id ||
+    target.acpSessionId === id ||
+    target.acpxRecordId.endsWith(id) ||
+    target.acpSessionId.endsWith(id)
+  );
+}
+
+export async function countPruneCandidates(options: {
+  agentCommand?: string;
+  agentName?: string;
+  cwd: string;
+}): Promise<PruneCandidateCounts> {
+  await ensureSessionDir();
+  const entries = await loadSessionIndexEntries();
+  const eligible = filterPruneCandidates(
+    entries,
+    options.agentCommand,
+    options.agentName,
+    undefined,
+    undefined,
+  );
+  return {
+    total: eligible.length,
+    inCwd: eligible.filter((entry) => entry.cwd === options.cwd).length,
+  };
+}
+
+export async function resolvePruneSessionIds(
+  ids: string[],
+  options: { agentCommand?: string; agentName?: string },
+): Promise<PruneIdResolution[]> {
+  await ensureSessionDir();
+  const entries = await loadSessionIndexEntries();
+  const mine = entries.filter(
+    (entry) =>
+      !options.agentCommand || matchesAgentIdentity(entry, options.agentCommand, options.agentName),
+  );
+  return ids.map((id) => {
+    const matches = mine.filter((entry) => matchesPruneSessionId(entry, id));
+    return {
+      id,
+      closedMatches: matches
+        .filter((entry) => entry.closed)
+        .map((entry) => ({
+          acpxRecordId: entry.acpxRecordId,
+          name: entry.name,
+          lastUsedAt: entry.lastUsedAt,
+        })),
+      openMatches: matches.filter((entry) => !entry.closed).length,
+    };
+  });
 }
 
 /**
@@ -1335,6 +1558,8 @@ async function loadPrunableRecords(
   entries: SessionIndexEntry[],
   cutoff: Date | undefined,
   includeTemplates: boolean,
+  cwd: string | undefined,
+  sessionIds: string[] | undefined,
 ): Promise<{ prunable: SessionRecord[]; skippedTemplates: SessionRecord[] }> {
   const prunable: SessionRecord[] = [];
   const skippedTemplates: SessionRecord[] = [];
@@ -1348,9 +1573,36 @@ async function loadPrunableRecords(
       skippedTemplates.push(record);
       continue;
     }
+    if (isPruneCwdMismatch(record, cwd, sessionIds)) {
+      continue;
+    }
     prunable.push(record);
   }
   return { prunable, skippedTemplates };
+}
+
+/**
+ * Re-confirms `--cwd` on the LOADED record, which is the authority, exactly as
+ * the template check is. filterPruneCandidates already narrowed on `entry.cwd`;
+ * this is what stops a stale index entry pointing at the target directory from
+ * getting a record that lives elsewhere deleted. Exact equality, never a
+ * prefix/subtree match — `/w/p/sweep` must not select `/w/p/sweep-32002`.
+ * test/sessions-prune.test.ts "cwd is not out-run by a stale index entry" goes red
+ * if this is dropped.
+ *
+ * An explicitly NAMED session is exempt: ids and cwd are a union, so a named
+ * session is selected on its own merit and its cwd is irrelevant. The stale-index
+ * guard is unaffected — an id the operator did not type cannot reach this branch.
+ */
+function isPruneCwdMismatch(
+  record: SessionRecord,
+  cwd: string | undefined,
+  sessionIds: string[] | undefined,
+): boolean {
+  if (cwd == null || record.cwd === cwd) {
+    return false;
+  }
+  return sessionIds?.some((id) => matchesPruneSessionId(record, id)) !== true;
 }
 
 function isBeforeCutoff(record: SessionRecord, cutoffIso: string | undefined): boolean {

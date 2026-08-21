@@ -103,16 +103,24 @@ The replacement preserves the surrounding ACP message shape so json consumers ca
 
 Session-control query commands emit summarized JSON shapes (not ACP wire traffic) under `--format json`:
 
-| Command                 | `text`                             | `json`                                                                                                        | `quiet`                |
-| ----------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------- | ---------------------- |
-| `sessions list`         | TSV: `id title cwd updatedAt meta` | `{ _meta, source, sessions, cursor, cwd, nextCursor }` for ACP list, or local records with `--local`/fallback | one id per line        |
-| `sessions show`         | key/value lines                    | full session record object                                                                                    | record id              |
-| `sessions history`      | TSV: `timestamp role textPreview`  | `{ entries: [...] }`                                                                                          | record id              |
-| `sessions prune`        | summary + pruned ids and time      | `{ action, dryRun, count, bytesFreed, pruned }`                                                               | one pruned id per line |
-| `sessions new`/`ensure` | record id                          | record + `acpxRecordId`/`acpxSessionId`/(`agentSessionId`)                                                    | record id              |
-| `status`                | key/value lines                    | full status object                                                                                            | state token            |
+| Command                 | `text`                             | `json`                                                                                                             | `quiet`                |
+| ----------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------ | ---------------------- |
+| `sessions list`         | TSV: `id title cwd updatedAt meta` | `{ _meta, source, sessions, cursor, cwd, nextCursor }` for ACP list, or local records with `--local`/fallback      | one id per line        |
+| `sessions show`         | key/value lines                    | full session record object                                                                                         | record id              |
+| `sessions history`      | TSV: `timestamp role textPreview`  | `{ entries: [...] }`                                                                                               | record id              |
+| `sessions prune`        | pre-flight count, then summary     | `{ action, dryRun, count, bytesFreed, pruned, skippedTemplates, scope, strandedStreamFiles, strandedStreamBytes }` | one pruned id per line |
+| `sessions new`/`ensure` | record id                          | record + `acpxRecordId`/`acpxSessionId`/(`agentSessionId`)                                                         | record id              |
+| `status`                | key/value lines                    | full status object                                                                                                 | state token            |
 
 Closed sessions are marked `[closed]` in `text` and `quiet`.
+
+`sessions prune` has one further shape: when a destructive run is refused for want
+of a scope (or for a bad session id), `json` emits
+`{ action: "sessions_prune_refused", reason, ... }` on **stdout** with a non-zero
+exit — `2` for a scope problem, `1` for an id that does not resolve. `reason` is one
+of `scope_required`, `scope_conflict`, `session_not_found`, `session_ambiguous`,
+`session_open`. Under `text` and `quiet` the refusal goes to stderr instead, so a
+`quiet` consumer parsing pruned ids off stdout is never handed prose.
 
 ## Identity fields in JSON
 
