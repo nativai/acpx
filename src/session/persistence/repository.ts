@@ -1312,6 +1312,53 @@ function isSessionStreamFile(fileName: string, safeId: string): boolean {
   );
 }
 
+const STREAM_FILE_INFIX = ".stream.";
+
+/**
+ * Inverse of `isSessionStreamFile`: safeId → the stream files that id owns, in
+ * `dirEntries` order. Built ONCE per invocation and shared by every record,
+ * replacing a per-record `dirEntries.filter(isSessionStreamFile)` over the whole
+ * listing. On this box that filter was 2,362 records × 15,325 entries ≈ 36M
+ * predicate calls, measured at +821 ms / 1.17x on a box-wide run
+ * (brick://dd4cb0e8 verification/VERIFICATION.md §14) — and paid on EVERY prune,
+ * because exactly one of measureStrandedStreams / pruneSessionFiles runs on any
+ * given invocation.
+ *
+ * ⚠️ DO NOT narrow this to the FIRST `.stream.` in each filename. It looks like
+ * the obvious loop and it is a silent data-loss bug: a safeId may itself contain
+ * `.stream.`, and a first-occurrence-only index stops finding those sessions'
+ * files entirely — so their streams survive a prune that reports having taken
+ * them. The existing `stream-session.stream-neighbor` fixture CANNOT catch it
+ * (it contains `.stream-`, not `.stream.`); the test "a session id containing
+ * .stream. still owns its stream files" is the one that reds.
+ *
+ * The `at === 0` case (empty safeId) is kept rather than skipped so this is
+ * byte-for-byte the inverse of the predicate above, which also matches it.
+ */
+function indexStreamFilesBySafeId(dirEntries: string[]): Map<string, string[]> {
+  const bySafeId = new Map<string, string[]>();
+  for (const name of dirEntries) {
+    for (
+      let at = name.indexOf(STREAM_FILE_INFIX);
+      at !== -1;
+      at = name.indexOf(STREAM_FILE_INFIX, at + 1)
+    ) {
+      const safeId = name.slice(0, at);
+      const owned = bySafeId.get(safeId);
+      if (owned) {
+        owned.push(name);
+      } else {
+        bySafeId.set(safeId, [name]);
+      }
+    }
+  }
+  return bySafeId;
+}
+
+function streamFilesFor(streamFilesBySafeId: Map<string, string[]>, safeId: string): string[] {
+  return streamFilesBySafeId.get(safeId) ?? [];
+}
+
 export async function pruneSessions(options: PruneOptions = {}): Promise<PruneResult> {
   await ensureSessionDir();
   const entries = await loadSessionIndexEntries();
@@ -1349,11 +1396,12 @@ export async function pruneSessions(options: PruneOptions = {}): Promise<PruneRe
   } catch {
     // ignore
   }
+  const streamFilesBySafeId = indexStreamFilesBySafeId(dirEntries);
 
   const { files: strandedStreamFiles, bytes: strandedStreamBytes } = await measureStrandedStreams(
     records,
     sessionDir,
-    dirEntries,
+    streamFilesBySafeId,
     options.includeHistory === true,
   );
 
@@ -1380,7 +1428,7 @@ export async function pruneSessions(options: PruneOptions = {}): Promise<PruneRe
     bytesFreed += await pruneSessionFiles(
       record,
       sessionDir,
-      dirEntries,
+      streamFilesBySafeId,
       options.includeHistory === true,
     );
   }
@@ -1402,7 +1450,7 @@ export async function pruneSessions(options: PruneOptions = {}): Promise<PruneRe
 async function measureStrandedStreams(
   records: SessionRecord[],
   sessionDir: string,
-  dirEntries: string[],
+  streamFilesBySafeId: Map<string, string[]>,
   includeHistory: boolean,
 ): Promise<{ files: number; bytes: number }> {
   let files = 0;
@@ -1413,7 +1461,7 @@ async function measureStrandedStreams(
   }
   for (const record of records) {
     const safeId = encodeURIComponent(record.acpxRecordId);
-    for (const name of dirEntries.filter((entry) => isSessionStreamFile(entry, safeId))) {
+    for (const name of streamFilesFor(streamFilesBySafeId, safeId)) {
       files += 1;
       try {
         bytes += (await fs.stat(path.join(sessionDir, name))).size;
@@ -1612,7 +1660,7 @@ function isBeforeCutoff(record: SessionRecord, cutoffIso: string | undefined): b
 async function pruneSessionFiles(
   record: SessionRecord,
   sessionDir: string,
-  dirEntries: string[],
+  streamFilesBySafeId: Map<string, string[]>,
   includeHistory: boolean,
 ): Promise<number> {
   const safeId = encodeURIComponent(record.acpxRecordId);
@@ -1621,7 +1669,7 @@ async function pruneSessionFiles(
   bytesFreed += await unlinkCountingBytes(logPath);
   bytesFreed += await unlinkCountingBytes(messagesLogStalePath(logPath));
   if (includeHistory) {
-    for (const name of dirEntries.filter((entry) => isSessionStreamFile(entry, safeId))) {
+    for (const name of streamFilesFor(streamFilesBySafeId, safeId)) {
       bytesFreed += await unlinkCountingBytes(path.join(sessionDir, name));
     }
   }

@@ -356,6 +356,95 @@ test("pruneSessions --include-history deletes stream files", async () => {
   });
 });
 
+/**
+ * T-PERF-2's discriminating case. The stream-file lookup is an inverse index
+ * built once over the directory listing (indexStreamFilesBySafeId), and the one
+ * way to build it wrong is to key each filename on its FIRST `.stream.` only.
+ *
+ * The neighbour fixture above cannot catch that: `stream-session.stream-neighbor`
+ * contains `.stream-`, not `.stream.`, so its first `.stream.` is already the
+ * right one and a broken index looks correct. This id embeds a literal
+ * `.stream.`, so a first-occurrence-only index files the file under `edge`
+ * instead of `edge.stream.owner` and the stream SURVIVES a prune that reports
+ * having deleted it. A positive control passes here trivially — only this
+ * fixture discriminates.
+ */
+test("pruneSessions --include-history: a session id containing .stream. still owns its stream files", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+    const sessionsDir = path.join(homeDir, ".acpx", "sessions");
+    const trickyId = "edge.stream.owner";
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: trickyId,
+        acpSessionId: trickyId,
+        agentCommand: "agent-a",
+        cwd,
+        closed: true,
+        closedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    const safeId = encodeURIComponent(trickyId);
+    // Guard the fixture itself: if encodeURIComponent ever escaped the dots the
+    // id would no longer embed `.stream.` and this test would silently stop
+    // testing anything.
+    assert.ok(safeId.includes(".stream."), `fixture id lost its .stream. infix: ${safeId}`);
+    const streamFile = path.join(sessionsDir, `${safeId}.stream.ndjson`);
+    const streamLock = path.join(sessionsDir, `${safeId}.stream.lock`);
+    await fs.writeFile(streamFile, "edge-event-data\n", "utf8");
+    await fs.writeFile(streamLock, "", "utf8");
+
+    const result = await session.pruneSessions({
+      agentCommand: "agent-a",
+      includeHistory: true,
+    });
+
+    assert.equal(result.pruned.length, 1);
+    assert.ok(!(await fileExists(streamFile)), "stream file survived a prune that claimed it");
+    assert.ok(!(await fileExists(streamLock)), "stream lock survived a prune that claimed it");
+  });
+});
+
+/** The same id shape on the measurement half of the pair: a first-occurrence-only
+ *  index under-reports stranding, which is the direction that lies to the
+ *  operator about what a prune is about to leave behind. */
+test("pruneSessions counts stranded streams for a session id containing .stream.", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+    const sessionsDir = path.join(homeDir, ".acpx", "sessions");
+    const trickyId = "edge.stream.owner";
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: trickyId,
+        acpSessionId: trickyId,
+        agentCommand: "agent-a",
+        cwd,
+        closed: true,
+        closedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    const safeId = encodeURIComponent(trickyId);
+    await fs.writeFile(path.join(sessionsDir, `${safeId}.stream.ndjson`), "12345", "utf8");
+
+    const result = await session.pruneSessions({
+      agentCommand: "agent-a",
+      dryRun: true,
+      includeHistory: false,
+    });
+
+    assert.equal(result.strandedStreamFiles, 1);
+    assert.equal(result.strandedStreamBytes, 5);
+  });
+});
+
 test("pruneSessions without agentCommand prunes all closed sessions across all agents", async () => {
   await withTempHome(async (homeDir) => {
     const session = await loadSessionModule();
