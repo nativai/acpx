@@ -56,6 +56,7 @@ import {
   persistTemplateMark,
   resolveGlobalSessionByName,
   resolveSessionByExactName,
+  matchesPruneSessionId,
   resolveSessionRecord,
   resolveTemplateSelector,
   rollbackTemplateSlug,
@@ -3186,7 +3187,7 @@ export async function handleSessionsPrune(
         // whose record is a protected blueprint, or which the age filter
         // excluded — each of those leaves the id absent from plan.records.
         const unmatched = ids.find(
-          (id) => !plan.records.some((record) => matchesPrunedSessionId(record, id)),
+          (id) => !plan.records.some((record) => matchesPruneSessionId(record, id)),
         );
         if (unmatched != null) {
           throw new PruneAborted({
@@ -3294,16 +3295,6 @@ async function resolvePruneRefusal(
 
   const unresolvable = await findUnresolvableId(session, ids, identity, agent.agentName);
   return unresolvable ? { refusal: unresolvable, code: EXIT_CODES.ERROR } : undefined;
-}
-
-/** Same suffix contract the core uses, applied to a loaded record. */
-function matchesPrunedSessionId(record: SessionRecord, id: string): boolean {
-  return (
-    record.acpxRecordId === id ||
-    record.acpSessionId === id ||
-    record.acpxRecordId.endsWith(id) ||
-    record.acpSessionId.endsWith(id)
-  );
 }
 
 /** Index-based pre-resolution. Its whole reason for existing is the distinction

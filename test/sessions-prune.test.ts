@@ -570,3 +570,342 @@ test("pruneSessions leaves the template's stream sidecars alone under --include-
     assert.ok(await fileExists(streamPath));
   });
 });
+
+// ─── brick://dd4cb0e8: scope selectors at the core ───────────────────────────
+// The scope REQUIREMENT lives at the CLI (test/sessions-prune-scope.test.ts); the
+// scope FILTERS live here, next to the template skip they extend.
+
+test("pruneSessions sessionIds selects exactly the named sessions", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    for (const id of ["named-one", "named-two", "bystander"]) {
+      await writeSessionRecord(
+        homeDir,
+        makeSessionRecord({
+          acpxRecordId: id,
+          acpSessionId: id,
+          agentCommand: "agent-a",
+          cwd,
+          closed: true,
+          closedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      );
+    }
+
+    const result = await session.pruneSessions({
+      agentCommand: "agent-a",
+      sessionIds: ["named-one", "named-two"],
+    });
+
+    assert.deepEqual(result.pruned.map((r) => r.acpxRecordId).toSorted(), [
+      "named-one",
+      "named-two",
+    ]);
+    assert.ok(await fileExists(sessionFilePath(homeDir, "bystander")));
+  });
+});
+
+test("pruneSessions cwd selects by EXACT equality, never by path prefix", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const target = path.join(homeDir, "workspace", "sweep");
+    const sibling = path.join(homeDir, "workspace", "sweep-32002");
+
+    for (const [id, dir] of [
+      ["in-target", target],
+      ["in-sibling", sibling],
+    ] as const) {
+      await writeSessionRecord(
+        homeDir,
+        makeSessionRecord({
+          acpxRecordId: id,
+          acpSessionId: id,
+          agentCommand: "agent-a",
+          cwd: dir,
+          closed: true,
+          closedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      );
+    }
+
+    const result = await session.pruneSessions({ agentCommand: "agent-a", cwd: target });
+
+    assert.deepEqual(
+      result.pruned.map((r) => r.acpxRecordId),
+      ["in-target"],
+    );
+    assert.ok(
+      await fileExists(sessionFilePath(homeDir, "in-sibling")),
+      "a sibling whose path merely STARTS WITH the target must not be swept",
+    );
+  });
+});
+
+// The stale-index property, in the one direction a SELECTIVE predicate could
+// over-delete. Direct analogue of the a62de399 template check's reason for running
+// on the loaded record.
+test("pruneSessions cwd is not out-run by a stale index entry", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const target = path.join(homeDir, "workspace", "target");
+    const actual = path.join(homeDir, "workspace", "actual");
+    const indexPath = path.join(homeDir, ".acpx", "sessions", "index.json");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "drifted",
+        acpSessionId: "drifted",
+        agentCommand: "agent-a",
+        cwd: actual,
+        closed: true,
+        closedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    // Hand-write an index whose entry claims the target cwd while the record on
+    // disk says otherwise.
+    const staleIndex = {
+      schema: "acpx.session-index.v1",
+      files: ["drifted.json"],
+      entries: [
+        {
+          file: "drifted.json",
+          acpxRecordId: "drifted",
+          acpSessionId: "drifted",
+          agentCommand: "agent-a",
+          cwd: target,
+          closed: true,
+          lastUsedAt: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+    };
+    await fs.writeFile(indexPath, `${JSON.stringify(staleIndex)}\n`, "utf8");
+
+    const result = await session.pruneSessions({ agentCommand: "agent-a", cwd: target });
+
+    assert.equal(result.pruned.length, 0, "the loaded record's cwd is the authority");
+    assert.ok(await fileExists(sessionFilePath(homeDir, "drifted")));
+
+    // Control: with entry and record agreeing, the same call DOES delete it — so
+    // the assertion above is not passing because the harness selects nothing.
+    const agreed = await session.pruneSessions({ agentCommand: "agent-a", cwd: actual });
+    assert.deepEqual(
+      agreed.pruned.map((r) => r.acpxRecordId),
+      ["drifted"],
+    );
+    assert.ok(!(await fileExists(sessionFilePath(homeDir, "drifted"))));
+  });
+});
+
+// The a62de399 residual: sidecar survival for a protected blueprint was correct but
+// asserted nowhere — the landed tests covered only .stream.ndjson. The sidecar is
+// the transcript-index REBUILD source, so it is the dimension that matters most.
+test("a protected blueprint keeps its messages sidecar through a prune", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeTemplateRecord(homeDir, cwd, { acpxRecordId: "bp-sidecar", slug: "bp" });
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "plain-sidecar",
+        acpSessionId: "plain-sidecar",
+        agentCommand: "agent-a",
+        cwd,
+        closed: true,
+        closedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    await fs.mkdir(path.join(homeDir, ".acpx", "sessions"), { recursive: true });
+    await fs.writeFile(messagesLogPath(homeDir, "bp-sidecar"), "blueprint messages\n", "utf8");
+    await fs.writeFile(messagesLogPath(homeDir, "plain-sidecar"), "plain messages\n", "utf8");
+
+    // Stated as a TRANSITION, not an absence: present before, present after.
+    assert.ok(await fileExists(messagesLogPath(homeDir, "bp-sidecar")));
+    assert.ok(await fileExists(messagesLogPath(homeDir, "plain-sidecar")));
+
+    await session.pruneSessions({ agentCommand: "agent-a" });
+
+    assert.ok(
+      await fileExists(messagesLogPath(homeDir, "bp-sidecar")),
+      "the protected blueprint's transcript rebuild source must survive",
+    );
+    // POSITIVE CONTROL, same run, same helper: a non-template sidecar went
+    // present -> absent, so the instrument can see sidecars disappear.
+    assert.ok(
+      !(await fileExists(messagesLogPath(homeDir, "plain-sidecar"))),
+      "positive control: an unprotected sidecar must have been deleted in the same run",
+    );
+  });
+});
+
+// M12: filtering templates on the INDEX ENTRY instead of the loaded record turns a
+// missing projection into a deleted blueprint. The entry here carries no template
+// projection at all while the record does.
+test("a blueprint is skipped even when its index entry lacks template enrichment", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+    const indexPath = path.join(homeDir, ".acpx", "sessions", "index.json");
+
+    await writeTemplateRecord(homeDir, cwd, { acpxRecordId: "unenriched-bp", slug: "bp" });
+
+    const bareIndex = {
+      schema: "acpx.session-index.v1",
+      files: ["unenriched-bp.json"],
+      entries: [
+        {
+          file: "unenriched-bp.json",
+          acpxRecordId: "unenriched-bp",
+          acpSessionId: "unenriched-bp",
+          agentCommand: "agent-a",
+          cwd,
+          closed: true,
+          lastUsedAt: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+    };
+    await fs.writeFile(indexPath, `${JSON.stringify(bareIndex)}\n`, "utf8");
+
+    const result = await session.pruneSessions({ agentCommand: "agent-a" });
+
+    assert.equal(result.pruned.length, 0);
+    assert.deepEqual(
+      result.skippedTemplates.map((r) => r.acpxRecordId),
+      ["unenriched-bp"],
+    );
+    assert.ok(await fileExists(sessionFilePath(homeDir, "unenriched-bp")));
+  });
+});
+
+// ─── onBeforeDelete: the ordering guarantee, proved deterministically ────────
+//
+// The stronger form of "the count precedes the act": a callback that throws must
+// abort with ZERO files deleted. This uses only the abort path the all-or-nothing
+// id contract already depends on — no fault injection, so there is no injection
+// that can silently fail to fire.
+test("onBeforeDelete runs before the first unlink and a throw deletes nothing", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    for (const id of ["abort-one", "abort-two"]) {
+      await writeSessionRecord(
+        homeDir,
+        makeSessionRecord({
+          acpxRecordId: id,
+          acpSessionId: id,
+          agentCommand: "agent-a",
+          cwd,
+          closed: true,
+          closedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      );
+    }
+
+    let sawRecords = 0;
+    await assert.rejects(
+      session.pruneSessions({
+        agentCommand: "agent-a",
+        onBeforeDelete: (plan) => {
+          sawRecords = plan.records.length;
+          throw new Error("abort");
+        },
+      }),
+      /abort/,
+    );
+
+    assert.equal(sawRecords, 2, "the callback must see the full plan");
+    assert.ok(await fileExists(sessionFilePath(homeDir, "abort-one")));
+    assert.ok(await fileExists(sessionFilePath(homeDir, "abort-two")));
+
+    // Control: the same call WITHOUT the throw deletes both — so "nothing was
+    // deleted" above is the abort's doing, not a harness that deletes nothing.
+    const control = await session.pruneSessions({ agentCommand: "agent-a" });
+    assert.equal(control.pruned.length, 2);
+    assert.ok(!(await fileExists(sessionFilePath(homeDir, "abort-one"))));
+  });
+});
+
+// M15: moving the onBeforeDelete call BELOW the `if (options.dryRun)` early return
+// is the obvious misreading of "before the delete loop", and it would exempt
+// --dry-run from the id contract the CLI enforces in that callback.
+test("onBeforeDelete runs on a dry run too", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "dry-hook",
+        acpSessionId: "dry-hook",
+        agentCommand: "agent-a",
+        cwd,
+        closed: true,
+        closedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    let calls = 0;
+    let sawDryRun: boolean | undefined;
+    const result = await session.pruneSessions({
+      agentCommand: "agent-a",
+      dryRun: true,
+      onBeforeDelete: (plan) => {
+        calls += 1;
+        sawDryRun = plan.dryRun;
+      },
+    });
+
+    assert.equal(calls, 1, "a preview that skips the hook cannot fail where the real run fails");
+    assert.equal(sawDryRun, true);
+    assert.equal(result.dryRun, true);
+    assert.ok(await fileExists(sessionFilePath(homeDir, "dry-hook")));
+  });
+});
+
+// ─── stranded stream accounting ──────────────────────────────────────────────
+test("pruneSessions reports the stream files it strands, and none with includeHistory", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+
+    const seed = async (): Promise<string> => {
+      await writeSessionRecord(
+        homeDir,
+        makeSessionRecord({
+          acpxRecordId: "stranding",
+          acpSessionId: "stranding",
+          agentCommand: "agent-a",
+          cwd,
+          closed: true,
+          closedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      );
+      const streamPath = path.join(sessionDir, `${encodeURIComponent("stranding")}.stream.ndjson`);
+      await fs.writeFile(streamPath, "x".repeat(512), "utf8");
+      return streamPath;
+    };
+
+    const streamPath = await seed();
+    const stranded = await session.pruneSessions({ agentCommand: "agent-a" });
+    assert.equal(stranded.strandedStreamFiles, 1);
+    assert.equal(stranded.strandedStreamBytes, 512);
+    assert.ok(await fileExists(streamPath), "the stream is left behind, unreachable");
+
+    await seed();
+    const reclaimed = await session.pruneSessions({
+      agentCommand: "agent-a",
+      includeHistory: true,
+    });
+    assert.equal(reclaimed.strandedStreamFiles, 0);
+    assert.equal(reclaimed.strandedStreamBytes, 0);
+    assert.ok(!(await fileExists(streamPath)));
+  });
+});

@@ -85,23 +85,41 @@ export async function withTempDir<T>(prefix: string, fn: (dir: string) => Promis
   }
 }
 
+/**
+ * ⚠️ Pins BOTH `ACPX_STATE_HOME` and `HOME` to the same temp path, and both are
+ * required. `sessionBaseDir()` reads `process.env.ACPX_STATE_HOME || os.homedir()`
+ * — `ACPX_STATE_HOME` WINS — so a helper that pinned only `HOME` would run every
+ * test against whatever `ACPX_STATE_HOME` pointed at *while reading as isolated*.
+ * That was this helper until brick://dd4cb0e8: safe purely because the var happens
+ * to be unset on the dev boxes, i.e. isolated by luck rather than by construction,
+ * and the tests it isolates include a suite that DELETES session records.
+ * `assertTempHomePath` enforces the same pair, so a call site cannot get one
+ * without the other.
+ */
 export async function withTempHome<T>(
   prefix: string,
   run: (homeDir: string) => Promise<T>,
 ): Promise<T> {
   const originalHome = process.env.HOME;
+  const originalStateHome = process.env.ACPX_STATE_HOME;
   const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
   process.env.HOME = tempHome;
+  process.env.ACPX_STATE_HOME = tempHome;
 
   try {
     return await run(tempHome);
   } finally {
-    if (originalHome == null) {
-      delete process.env.HOME;
-    } else {
-      process.env.HOME = originalHome;
-    }
+    restoreEnv("HOME", originalHome);
+    restoreEnv("ACPX_STATE_HOME", originalStateHome);
     await fs.rm(tempHome, { recursive: true, force: true });
+  }
+}
+
+function restoreEnv(key: string, original: string | undefined): void {
+  if (original == null) {
+    delete process.env[key];
+  } else {
+    process.env[key] = original;
   }
 }
 
@@ -112,9 +130,26 @@ export function assertTempHomeActive(): string {
 }
 
 export function assertTempHomePath(homeDir: string | undefined): asserts homeDir is string {
-  if (!homeDir || !path.resolve(homeDir).startsWith(path.resolve(os.tmpdir()) + path.sep)) {
+  if (!isUnderTmpdir(homeDir)) {
     throw new Error("test attempted to touch the acpx session store without a temp HOME");
   }
+  // ACPX_STATE_HOME takes PRECEDENCE over HOME in sessionBaseDir(), so guarding
+  // only the HOME path leaves the store resolution unguarded. A test that pins
+  // HOME to a temp dir while ACPX_STATE_HOME still points at a real one reads as
+  // isolated and is not.
+  const stateHome = process.env.ACPX_STATE_HOME ?? "";
+  if (stateHome !== "" && !isUnderTmpdir(stateHome)) {
+    throw new Error(
+      `test attempted to touch the acpx session store with ACPX_STATE_HOME outside the temp dir (${stateHome}) — it overrides HOME in sessionBaseDir()`,
+    );
+  }
+}
+
+// Plain boolean, deliberately not a `dir is string` type predicate: as a predicate
+// its NEGATIVE branch narrows an already-`string` argument to `never`, which then
+// trips restrict-template-expressions in the error message below.
+function isUnderTmpdir(dir: string | undefined): boolean {
+  return Boolean(dir) && path.resolve(dir ?? "").startsWith(path.resolve(os.tmpdir()) + path.sep);
 }
 
 export function sessionFilePath(homeDir: string, acpxRecordId: string): string {

@@ -14,6 +14,7 @@ export {
   listSessions,
   listSessionsForAgent,
   listSubagentsForSession,
+  matchesPruneSessionId,
   migrateTemplateSlugs,
   normalizeName,
   persistTemplateMark,

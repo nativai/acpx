@@ -1333,6 +1333,7 @@ export async function pruneSessions(options: PruneOptions = {}): Promise<PruneRe
     cutoff,
     options.includeTemplates === true,
     options.cwd,
+    options.sessionIds,
   );
 
   const sessionDir = sessionBaseDir();
@@ -1446,23 +1447,55 @@ function filterPruneCandidates(
     (entry) =>
       entry.closed &&
       (!agentCommand || matchesAgentIdentity(entry, agentCommand, agentName)) &&
-      (!cwd || entry.cwd === cwd) &&
-      (!sessionIds || sessionIds.some((id) => entryMatchesSessionId(entry, id))),
+      matchesPruneSelectors(entry, sessionIds, cwd),
   );
+}
+
+/**
+ * Ids and `--cwd` are a UNION — "this directory's, plus the ones I name". Age
+ * filters then intersect the result, which is why they are applied separately in
+ * loadPrunableRecords rather than here.
+ *
+ * ⚠️ NOT an intersection. That looks like the obvious reading of "combine the
+ * filters" and it silently drops every named session that lives outside the
+ * invocation cwd — which, under the all-or-nothing id contract, turns a valid
+ * `prune --cwd <id-from-elsewhere>` into a whole-run abort.
+ * test/sessions-prune-scope.test.ts "binds the id as an id" goes red if this
+ * becomes an intersection.
+ */
+function matchesPruneSelectors(
+  entry: SessionIndexEntry,
+  sessionIds: string[] | undefined,
+  cwd: string | undefined,
+): boolean {
+  if (!sessionIds && cwd == null) {
+    return true;
+  }
+  if (cwd != null && entry.cwd === cwd) {
+    return true;
+  }
+  return sessionIds?.some((id) => matchesPruneSessionId(entry, id)) === true;
 }
 
 /**
  * Suffix — deliberately not `includes` and not `startsWith`. "acpx record id,
  * ACP session id, or unique SUFFIX" is the documented id contract everywhere
- * else in this CLI (`recover`, `prompt -s`), and a looser match on a
- * destructive verb selects sessions the operator did not name.
+ * else in this CLI (`recover`, `prompt -s`), and a looser match on a destructive
+ * verb selects sessions the operator did not name.
+ *
+ * Exported so the CLI's all-or-nothing contract check resolves ids by exactly the
+ * same rule the core selected them with. Two copies of a matcher that decides what
+ * gets deleted is one drift away from "I named four and it deleted three".
  */
-function entryMatchesSessionId(entry: SessionIndexEntry, id: string): boolean {
+export function matchesPruneSessionId(
+  target: Pick<SessionIndexEntry, "acpxRecordId" | "acpSessionId">,
+  id: string,
+): boolean {
   return (
-    entry.acpxRecordId === id ||
-    entry.acpSessionId === id ||
-    entry.acpxRecordId.endsWith(id) ||
-    entry.acpSessionId.endsWith(id)
+    target.acpxRecordId === id ||
+    target.acpSessionId === id ||
+    target.acpxRecordId.endsWith(id) ||
+    target.acpSessionId.endsWith(id)
   );
 }
 
@@ -1497,7 +1530,7 @@ export async function resolvePruneSessionIds(
       !options.agentCommand || matchesAgentIdentity(entry, options.agentCommand, options.agentName),
   );
   return ids.map((id) => {
-    const matches = mine.filter((entry) => entryMatchesSessionId(entry, id));
+    const matches = mine.filter((entry) => matchesPruneSessionId(entry, id));
     return {
       id,
       closedMatches: matches
@@ -1526,6 +1559,7 @@ async function loadPrunableRecords(
   cutoff: Date | undefined,
   includeTemplates: boolean,
   cwd: string | undefined,
+  sessionIds: string[] | undefined,
 ): Promise<{ prunable: SessionRecord[]; skippedTemplates: SessionRecord[] }> {
   const prunable: SessionRecord[] = [];
   const skippedTemplates: SessionRecord[] = [];
@@ -1539,7 +1573,7 @@ async function loadPrunableRecords(
       skippedTemplates.push(record);
       continue;
     }
-    if (isPruneCwdMismatch(record, cwd)) {
+    if (isPruneCwdMismatch(record, cwd, sessionIds)) {
       continue;
     }
     prunable.push(record);
@@ -1552,12 +1586,23 @@ async function loadPrunableRecords(
  * the template check is. filterPruneCandidates already narrowed on `entry.cwd`;
  * this is what stops a stale index entry pointing at the target directory from
  * getting a record that lives elsewhere deleted. Exact equality, never a
- * prefix/subtree match — `/w/p/repro` must not select `/w/p/repro-32002`.
- * test/sessions-prune.test.ts "does not delete a record whose own cwd differs
- * from the index entry" goes red if this is dropped.
+ * prefix/subtree match — `/w/p/sweep` must not select `/w/p/sweep-32002`.
+ * test/sessions-prune.test.ts "cwd is not out-run by a stale index entry" goes red
+ * if this is dropped.
+ *
+ * An explicitly NAMED session is exempt: ids and cwd are a union, so a named
+ * session is selected on its own merit and its cwd is irrelevant. The stale-index
+ * guard is unaffected — an id the operator did not type cannot reach this branch.
  */
-function isPruneCwdMismatch(record: SessionRecord, cwd: string | undefined): boolean {
-  return cwd != null && record.cwd !== cwd;
+function isPruneCwdMismatch(
+  record: SessionRecord,
+  cwd: string | undefined,
+  sessionIds: string[] | undefined,
+): boolean {
+  if (cwd == null || record.cwd === cwd) {
+    return false;
+  }
+  return sessionIds?.some((id) => matchesPruneSessionId(record, id)) !== true;
 }
 
 function isBeforeCutoff(record: SessionRecord, cutoffIso: string | undefined): boolean {

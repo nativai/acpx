@@ -6632,7 +6632,10 @@ test("sessions prune skips template blueprints and says so per skip", async () =
       closedAt: "2026-01-01T00:10:00.000Z",
     });
 
-    const result = await runCli(["--cwd", cwd, "codex", "sessions", "prune"], homeDir);
+    // --cwd added by brick://dd4cb0e8: a destructive prune now requires a scope,
+    // so the bare form this test used is refused (exit 2, nothing deleted). The
+    // template behaviour under test is unchanged.
+    const result = await runCli(["--cwd", cwd, "codex", "sessions", "prune", "--cwd"], homeDir);
 
     assert.equal(result.code, 0, result.stderr);
     assert.match(result.stdout, /skipped tmpl-blueprint — template 'telegram-personal-assistant'/);
@@ -6641,8 +6644,9 @@ test("sessions prune skips template blueprints and says so per skip", async () =
     assert.ok(await fileExists(sessionFilePath(homeDir, "tmpl-blueprint")));
 
     // The opt-in is the only way through, and it deletes the blueprint.
+    // (--include-templates WIDENS what a scope selects; it is not itself a scope.)
     const forced = await runCli(
-      ["--cwd", cwd, "codex", "sessions", "prune", "--include-templates"],
+      ["--cwd", cwd, "codex", "sessions", "prune", "--cwd", "--include-templates"],
       homeDir,
     );
 
@@ -6675,8 +6679,9 @@ test("sessions prune reports skipped templates in json output", async () => {
       },
     });
 
+    // --cwd added by brick://dd4cb0e8 — a destructive prune requires a scope.
     const result = await runCli(
-      ["--cwd", cwd, "--format", "json", "codex", "sessions", "prune"],
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "prune", "--cwd"],
       homeDir,
     );
 
@@ -6713,8 +6718,20 @@ test("sessions prune supports json output and include-history", async () => {
     const streamFile = path.join(sessionDir, `${safeId}.stream.ndjson`);
     await fs.writeFile(streamFile, "event-data\n", "utf8");
 
+    // --cwd added by brick://dd4cb0e8. --include-history is NOT a scope: it widens
+    // what a scope deletes (the stream files too), so it still needs one.
     const result = await runCli(
-      ["--cwd", cwd, "--format", "json", "codex", "sessions", "prune", "--include-history"],
+      [
+        "--cwd",
+        cwd,
+        "--format",
+        "json",
+        "codex",
+        "sessions",
+        "prune",
+        "--cwd",
+        "--include-history",
+      ],
       homeDir,
     );
 
@@ -7079,6 +7096,13 @@ async function runCli(
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       HOME: homeDir,
+      // ⚠️ ACPX_STATE_HOME must be pinned alongside HOME, not merely left alone.
+      // `sessionBaseDir()` reads `process.env.ACPX_STATE_HOME || os.homedir()`, so
+      // it WINS: inheriting a set ACPX_STATE_HOME would run every CLI test in this
+      // file against the real session store while reading as isolated — and the
+      // prune tests below DELETE session records. Isolated by construction, not by
+      // the luck of the var being unset on the dev boxes. (brick://dd4cb0e8)
+      ACPX_STATE_HOME: homeDir,
       ...options.env,
     };
     for (const key of [
