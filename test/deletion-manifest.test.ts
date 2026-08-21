@@ -575,32 +575,35 @@ test("T-M3: a manifest write failure aborts the prune with nothing deleted", asy
   });
 });
 
-/** T-M5 (M-S5's sibling) — an unrelated failure on the same path is RE-THROWN,
- *  not rendered as an audit failure. A bare `catch` would report a broken store
- *  as "free some disk space", sending the operator at the wrong problem. */
-test("M-S5 guard: a non-manifest failure is not reported as an audit failure", async () => {
-  await withTempHome(async (homeDir) => {
-    const workCwd = path.join(homeDir, "workspace");
-    await fs.mkdir(workCwd, { recursive: true });
-    await seedSession(homeDir, "unrelated-fail", workCwd);
-    // A directory where the RECORD file belongs: the failure is real, is on the
-    // destructive path, and is NOT a manifest failure.
-    await fs.rm(sessionFilePath(homeDir, "unrelated-fail"), { force: true });
-    await fs.mkdir(sessionFilePath(homeDir, "unrelated-fail"), { recursive: true });
-    await fs.rm(path.join(sessionDir(homeDir), "index.json"), { force: true });
-
-    const result = await runCli(["claude", "sessions", "prune", "--whole-box"], {
-      home: homeDir,
-      cwd: workCwd,
-    });
-    // Whatever happens, it must NOT be dressed up as an audit-write failure.
-    assert.doesNotMatch(
-      result.stderr,
-      /could not record this deletion/,
-      "an unrelated failure was reported as an audit failure",
-    );
-  });
-});
+/**
+ * ⚠️ M-S5 IS DELIBERATELY UNGUARDED, and this note is why — a vacuous test used
+ * to sit here.
+ *
+ * The claim M-S5 attacks is that both handlers must catch
+ * `DeletionManifestWriteError` BY TYPE and re-throw anything else, because a
+ * bare `catch` on a destructive path would report an unrelated failure as an
+ * audit failure and send the operator at the wrong problem.
+ *
+ * MEASURED: the mutation (`instanceof DeletionManifestWriteError` ->
+ * `instanceof Error`) builds cleanly and reds NOTHING, because within
+ * `handleSessionsPrune`'s try block the only reachable throws today are
+ * `PruneAborted` — handled by the branch above it — and
+ * `DeletionManifestWriteError` itself. Everything else on that path is already
+ * swallowed locally: `loadPrunableRecords` skips an unparseable record,
+ * `unlinkCountingBytes` catches every unlink error, `rebuildSessionIndex` is
+ * `.catch()`ed.
+ *
+ * The first attempt at a guard here replaced a record file with a DIRECTORY and
+ * asserted the output was not an audit failure. Probed directly, that injection
+ * produces NO ERROR AT ALL — the record is skipped and prune prints "No sessions
+ * pruned" — so the assertion held whatever the catch looked like. A fault
+ * injection that does not fire manufactures a green nobody earned, so the test
+ * was removed rather than kept as decoration.
+ *
+ * The typed catch stays because it is correct and costs one line; it is
+ * defence-in-depth against a FUTURE throw on this path, not a live guard. If
+ * you add one, this is the test to write.
+ */
 
 /** T-M4 — `invoker` distinguishes its two cases, in BOTH directions. A writer
  *  that always emits `null` and one that always emits the URL each pass one
