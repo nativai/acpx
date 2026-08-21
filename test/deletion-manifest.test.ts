@@ -745,6 +745,109 @@ test("F5: an unwritable manifest in a writable directory refuses, and its remedy
   });
 });
 
+/**
+ * F5 — THE DISK-FULL CASE, AND IT FAILS AT A DIFFERENT SEAM.
+ *
+ * ⚠️ THIS IS THE ONE THE OTHER TWO CANNOT REACH. EISDIR and EACCES both fail at
+ * `open`. True disk-full does NOT: `open(path,"ax")` returns EEXIST (the header
+ * is skipped, exactly as on any store whose manifest already exists), then
+ * `open(path,"a")` SUCCEEDS and the **write** returns ENOSPC. So a
+ * classification that only inspected open-time errors would miss the disk-full
+ * case entirely — and disk-full is the one class whose advice was already
+ * correct, so missing it would silently regress the only branch that worked.
+ *
+ * `appendDeletionManifest` wraps the open AND the write loop in one `try`, which
+ * is what makes the errno reach the remedy from either seam. That was true
+ * before this test existed and untested; this is the pin.
+ *
+ * Injection: a symlink to `/dev/full`, which accepts writes and reports ENOSPC.
+ * Measured here — `ax` -> EEXIST, `a` -> ok, `write` -> "ENOSPC: no space left
+ * on device, write".
+ *
+ * ⚠️ SCOPE OF THIS TEST, stated rather than implied: it pins CLASSIFICATION and
+ * NON-DESTRUCTION. It does NOT execute the printed remedy, because /dev/full
+ * cannot be "freed" — the literal advice is unperformable against this
+ * injection. That ENOSPC advice genuinely RECOVERS an operator is the TE's
+ * measurement on a real constrained filesystem (both verbs, recovered=YES); it
+ * is not re-derived here. The two F5 tests above execute their advice; this one
+ * cannot, and says so.
+ */
+test("F5: disk-full is classified from the WRITE seam, not just the open seam", async () => {
+  await withTempHome(async (homeDir) => {
+    const workCwd = path.join(homeDir, "workspace");
+    await fs.mkdir(workCwd, { recursive: true });
+    await seedSession(homeDir, "enospc-victim", workCwd);
+
+    await fs.symlink("/dev/full", manifestPath(homeDir));
+
+    const refused = await runCli(["claude", "sessions", "prune", "--whole-box"], {
+      home: homeDir,
+      cwd: workCwd,
+    });
+
+    assert.equal(refused.code, 1, `expected a refusal: ${refused.stderr}`);
+    // The injection fired, AND it fired at the write seam — the trailing
+    // ", write" is what distinguishes this from an open-time failure.
+    assert.match(
+      refused.stderr,
+      /ENOSPC: no space left on device, write/,
+      "the write seam did not fire",
+    );
+    // The disk-full remedy is the one that was already right. It must survive
+    // the introduction of branching unchanged.
+    assert.match(
+      refused.stderr,
+      /^Free a few bytes on that filesystem \(any single file will do\), then re-run prune\.$/m,
+    );
+    // Nothing destroyed.
+    assert.equal(await fileExists(sessionFilePath(homeDir, "enospc-victim")), true);
+    assert.equal(await fileExists(ownerLogPath(homeDir, "enospc-victim")), true);
+    assert.equal(await fileExists(streamPath(homeDir, "enospc-victim")), true);
+
+    // Control: the store is otherwise healthy, so the refusal is the manifest's
+    // doing and not a broken fixture.
+    await fs.unlink(manifestPath(homeDir));
+    const recovered = await runCli(["claude", "sessions", "prune", "--whole-box"], {
+      home: homeDir,
+      cwd: workCwd,
+    });
+    assert.equal(recovered.code, 0, recovered.stderr);
+    assert.equal(await fileExists(sessionFilePath(homeDir, "enospc-victim")), false);
+  });
+});
+
+/** The same seam on the rollback verb, since §4.5(h) carried the identical
+ *  assumption and the fix has to hold on both. */
+test("F5: the rollback verb also classifies disk-full from the write seam", async () => {
+  await withTempHome(async (homeDir) => {
+    const workCwd = path.join(homeDir, "workspace");
+    await fs.mkdir(workCwd, { recursive: true });
+    await seedSession(homeDir, "enospc-rb", workCwd, {
+      template: {
+        slug: "enospc-slug",
+        version: 1,
+        enabled: true,
+        created_at: "2026-07-24T04:30:00.000Z",
+      },
+    });
+    await fs.symlink("/dev/full", manifestPath(homeDir));
+
+    const refused = await runCli(
+      ["claude", "sessions", "templates", "rollback", "enospc-slug", "--delete"],
+      { home: homeDir, cwd: workCwd },
+    );
+    assert.equal(refused.code, 1, refused.stderr);
+    assert.match(refused.stderr, /ENOSPC: no space left on device, write/);
+    assert.ok(
+      refused.stderr.includes(
+        "Free a few bytes on that filesystem (any single file will do), then re-run the rollback. The slug is untouched, so nothing needs undoing first.",
+      ),
+      `wrong remedy for disk-full on the rollback path:\n${refused.stderr}`,
+    );
+    assert.equal(await fileExists(sessionFilePath(homeDir, "enospc-rb")), true);
+  });
+});
+
 /** The remedy selector itself, over the errno values the end-to-end tests above
  *  cannot deterministically produce (ENOSPC, EROFS) plus the unknown-errno
  *  fallback. Every branch must name the path, and none but ENOSPC may talk about
