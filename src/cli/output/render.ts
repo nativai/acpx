@@ -673,10 +673,20 @@ function templateSkipSlug(record: SessionRecord): string {
   return effectiveTemplateSlug(record.template?.slug, record.name) ?? record.acpxRecordId;
 }
 
+/**
+ * ⚠️ The leading `prune ` is load-bearing, not decoration — the token rule (§3.3).
+ * This line's job is to tell the operator a blueprint was PROTECTED, and it is read
+ * through pipelines like the one in the 2026-07-24 incident,
+ * `… 2>&1 | grep -iE "prune|delet|remov|…" | head`. Without the token the line is
+ * dropped and the protection is invisible at exactly the moment it mattered.
+ * PREFIXED rather than appended so the token leads and survives a truncating
+ * filter. Pinned line-anchored in test/cli.test.ts and
+ * test/sessions-prune-scope.test.ts.
+ */
 function printSkippedTemplates(skippedTemplates: SessionRecord[]): void {
   for (const record of skippedTemplates) {
     process.stdout.write(
-      `  skipped ${record.acpxRecordId} — template '${templateSkipSlug(record)}'\n`,
+      `  prune skipped ${record.acpxRecordId} — template '${templateSkipSlug(record)}'\n`,
     );
   }
 }

@@ -6638,7 +6638,17 @@ test("sessions prune skips template blueprints and says so per skip", async () =
     const result = await runCli(["--cwd", cwd, "codex", "sessions", "prune", "--cwd"], homeDir);
 
     assert.equal(result.code, 0, result.stderr);
-    assert.match(result.stdout, /skipped tmpl-blueprint — template 'telegram-personal-assistant'/);
+    // brick://dd4cb0e8 (O8): LINE-ANCHORED, and it must stay that way. The previous
+    // unanchored form `/skipped tmpl-blueprint — template '…'/` matched BOTH the old
+    // wording and the new one, because the new string contains the old substring —
+    // so it would have stayed green without ever verifying the token-carrying form,
+    // and a revert to the old wording would go undetected. This pins the `prune `
+    // prefix and the two-space indent, which is what makes it able to see the change
+    // it guards.
+    assert.match(
+      result.stdout,
+      /^ {2}prune skipped tmpl-blueprint — template 'telegram-personal-assistant'$/m,
+    );
     assert.match(result.stdout, /Pruned 1 session/);
     assert.ok(!(await fileExists(sessionFilePath(homeDir, "tmpl-plain-closed"))));
     assert.ok(await fileExists(sessionFilePath(homeDir, "tmpl-blueprint")));

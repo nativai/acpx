@@ -918,6 +918,54 @@ test("every status line of every prune output path carries the literal token", a
   });
 });
 
+/**
+ * The template-skip line predates the token rule (it landed with brick://a62de399)
+ * and originally failed it, so under the incident's own pipeline the operator was
+ * never told a blueprint had been protected. It is asserted POSITIVELY here, like
+ * every other status line — there is no exception list and so no exception
+ * machinery to leave orphaned. A token rule whose first line of real output carries
+ * an unexplained carve-out is a rule already rotting: the next reader takes the
+ * exception as permission.
+ */
+test("the template-skip line carries the token like every other status line", async () => {
+  await withTempHome(async (homeDir) => {
+    const workCwd = path.join(homeDir, "workspace");
+    await fs.mkdir(workCwd, { recursive: true });
+    await seedSession(homeDir, "protected-bp", workCwd, {
+      template: {
+        enabled: true,
+        slug: "telegram-personal-assistant",
+        version: 1,
+        created_at: "2026-01-01T00:00:00.000Z",
+      },
+    });
+    await seedSession(homeDir, "plain-two", workCwd);
+
+    const result = await runCli(
+      ["--cwd", workCwd, "claude", "sessions", "prune", "--cwd"],
+      homeDir,
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    // Literal and line-anchored: the `prune ` prefix and the two-space indent.
+    assert.match(
+      result.stdout,
+      /^ {2}prune skipped protected-bp — template 'telegram-personal-assistant'$/m,
+    );
+    assertEveryStatusLineCarriesTheToken("template skip", pruneOutput(result.stdout));
+
+    // And it survives the incident's own pipeline, which is the point of the rule.
+    assert.ok(
+      throughSpecimenPipeline(result).some((line) =>
+        line.includes("prune skipped protected-bp — template"),
+      ),
+      `the protection must be visible through the operator's own filter:\n${result.stdout}`,
+    );
+    assert.ok(await fileExists(sessionFilePath(homeDir, "protected-bp")));
+    assert.equal(await fileExists(sessionFilePath(homeDir, "plain-two")), false);
+  });
+});
+
 // POSITIVE CONTROL for the token rule: the instrument must be able to see a DROP.
 // Without it, "every line passed" is indistinguishable from "the filter matched
 // everything" or "nothing was captured".
