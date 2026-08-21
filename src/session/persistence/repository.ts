@@ -792,12 +792,19 @@ async function unlinkIfPresent(filePath: string): Promise<void> {
  * + the stream's timestamps index, then a rebuild to drop the now-missing index
  * entry (the same teardown prune uses).
  *
- * ⚠️ THIS IS THE SECOND OF acpx's ONLY TWO record-deleting paths, and it is the
- * one that motivated the manifest. The `29eaff14` RCA's three baker nights were
- * destroyed HERE, not by a prune — a manifest written only by `sessions prune`
- * would have recorded nothing about any of them and that RCA would have been
- * exactly as hard. If you add a third path that unlinks a session record, it
- * needs a manifest write too, and `MANIFEST_COVERS` needs its name.
+ * ⚠️ THIS IS THE SECOND OF THE acpx CLI's ONLY TWO record-deleting paths, and it
+ * is the one that motivated the manifest. The `29eaff14` RCA's three baker
+ * nights were destroyed HERE, not by a prune — a manifest written only by
+ * `sessions prune` would have recorded nothing about any of them and that RCA
+ * would have been exactly as hard. If you add a further record-deleting path TO
+ * THE CLI, it needs a manifest write too, and `MANIFEST_COVERS` needs its name.
+ *
+ * ⚠️ "THE CLI" is the honest scope and this comment used to omit it, claiming
+ * acpx's "ONLY TWO" outright. `scripts/cleanup-ghost-sessions.ts:403` already
+ * unlinks session records with no manifest line, so the old wording instructed
+ * the next maintainer from a false premise — and retroactively, warning about a
+ * third path that already existed. That script is OUT of manifest coverage on
+ * purpose (brick://aabc9336); do not add a manifest write to it here.
  *
  * Takes the INDEX ENTRY rather than a bare id because the manifest records the
  * session's identity and `SessionIndexEntry` carries no `createdAt`/`closedAt` —

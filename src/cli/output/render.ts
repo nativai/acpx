@@ -449,6 +449,10 @@ export type PruneRefusal =
       agentName: string;
       manifestPath: string;
       cause: string;
+      /** The errno-specific recovery sentence, from `manifestFailureRemedy`.
+       *  Carried on the refusal rather than rebuilt here so the prune and
+       *  rollback verbs render identical advice for an identical fault. */
+      remedy: string;
     };
 
 /** The scopes the refusal names, echoed into JSON so a machine consumer sees the
@@ -518,9 +522,16 @@ function renderPruneRefusalText(refusal: PruneRefusal): string {
   }
   if (refusal.reason === "audit_write_failed") {
     // Five status lines, every one carrying the token, bracketing one `cause:`
-    // data line. The remedy is RUNNABLE ADVICE THAT ACTUALLY WORKS, which is the
-    // bar the `session_open` fix above sets: at true zero free space, deleting
-    // any single file anywhere on the volume unblocks the prune.
+    // data line.
+    //
+    // ⚠️ THE LAST LINE IS LOAD-BEARING, NOT COSMETIC. Aborting the prune is only
+    // humane if the operator has a way out, so the remedy has to be advice that
+    // ACTUALLY RECOVERS THEM. It used to be hard-coded ENOSPC advice ("free a
+    // few bytes") for every failure; a test-engineer executed that from the
+    // refused state and measured rc=1 with nothing recovered. It now branches on
+    // the real errno via `manifestFailureRemedy`, shared with the rollback path
+    // so the two verbs cannot disagree about the same fault, and it is tested BY
+    // EXECUTION rather than by inspection. Abort stands; only the remedy changed.
     //
     // Why this refusal exists at all: the write is an APPEND, so it usually
     // succeeds even with zero free blocks (it lands inside the last allocated
@@ -532,7 +543,7 @@ function renderPruneRefusalText(refusal: PruneRefusal): string {
       `prune writes one line per deleted session to ${refusal.manifestPath}\n` +
       `before deleting anything, so a prune that cannot be recorded does not run.\n` +
       `  cause: ${refusal.cause}\n` +
-      `Free a few bytes on that filesystem (any single file will do), then re-run prune.\n`
+      `${refusal.remedy}\n`
     );
   }
   if (refusal.reason === "session_ambiguous") {

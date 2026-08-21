@@ -6,17 +6,33 @@ import { resolveAcpxUiBaseUrl } from "../../acp/auth-env.js";
 /**
  * The deletion manifest — acpx's record of its own destructive acts.
  *
- * Written WRITE-AHEAD by both paths that destroy a session record, and by no
- * other. It exists because the store's accidental leftovers were being read as
+ * Written WRITE-AHEAD by both CLI paths that destroy a session record, and by
+ * no other CLI path (see the scope note below — one maintenance script under
+ * `scripts/` is deliberately outside this). It exists because the store's accidental leftovers were being read as
  * evidence: three hard-deleted sessions that survived as a timestamps sidecar
  * plus an owner log were filed as records that had *vanished*, which seeded a
  * whole "record-loss platform class" investigation (brick://29eaff14). The
  * residue's shape is ambiguous between the two deleters; a manifest line is not.
  *
  * Scoped to the ACT, not the verb: `sessions prune` and `templates rollback
- * --delete` are the only two paths in acpx that unlink a session record, so a
- * manifest written by both covers every deletion acpx can perform. A
- * prune-only manifest would not have recorded the case that motivated it.
+ * --delete` are the only two paths in the acpx **CLI** that unlink a session
+ * record, so a manifest written by both covers every deletion the acpx CLI can
+ * perform. A prune-only manifest would not have recorded the case that
+ * motivated it.
+ *
+ * ⚠️ "THE CLI" IS THE HONEST SCOPE, and an earlier version of this comment
+ * over-claimed it as "every deletion acpx can perform". That was false:
+ * `scripts/cleanup-ghost-sessions.ts` (its `--apply` loop, `tryUnlink` on
+ * `c.jsonPath`) is a THIRD path that unlinks session records and writes NO
+ * manifest line. It is deliberately OUT of coverage here — a maintenance script
+ * whose obsolescence is being weighed separately (brick://aabc9336) — not an
+ * oversight to fix in passing.
+ *
+ * The DESIGN is unharmed by that: a manifest at both CLI call sites still covers
+ * every deletion the acpx CLI can perform, which is the claim the collapse
+ * argument actually needs. It was the SENTENCE that was over-scoped, not the
+ * mechanism. If you add a further record-deleting path TO THE CLI, it needs a
+ * manifest write and `MANIFEST_COVERS` needs its name.
  */
 
 /**
@@ -118,6 +134,64 @@ export function deletionManifestPath(sessionDir: string): string {
  *  part (`ENOSPC: no space left on device, ...`) on `message`. */
 export function describeManifestFailure(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** The `errno` string (`ENOSPC`, `EACCES`, …) if the failure carries one. The
+ *  remedy branches on this, so it is read off the error rather than guessed from
+ *  the message text. */
+export function manifestFailureCode(error: unknown): string | undefined {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === "string" ? code : undefined;
+}
+
+/**
+ * The remedy sentence for a manifest-write failure — ONE function, used by BOTH
+ * destructive verbs, so the two cannot drift into disagreeing about how to
+ * recover from the identical fault.
+ *
+ * ⚠️ THIS MUST BRANCH, and the reason is a measured defect rather than a
+ * preference. The refusal used to print ENOSPC advice — "free a few bytes" — for
+ * EVERY manifest failure. A test-engineer EXECUTED that advice from the refused
+ * state (created a file in the store, unlinked it, re-ran the prune) and
+ * measured rc=1 with all 15 files still present: THE PRINTED REMEDY DID NOT
+ * RECOVER THE OPERATOR. That is the third appearance of "a refusal teaching a
+ * remedy that does not work" in this lane, so it gets a shared function and a
+ * test that EXECUTES what it prints.
+ *
+ * The production-reachable case is EACCES, not disk-full. The manifest is
+ * long-lived: create it once under another uid — a root-run acpx, a bootstrap
+ * quirk — and EVERY later agent prune fails forever while being told to free
+ * space. Strictly worse than ENOSPC, which at least self-resolves.
+ *
+ * It also falsifies conception §4.1.1 reason #1, which argued the manifest could
+ * live beside the records because "a store where the manifest write fails for
+ * permission reasons is a store where prune could not have deleted anything
+ * anyway". FALSE: `unlink` needs write on the DIRECTORY, this write needs write
+ * on the FILE. An unwritable manifest inside a writable directory satisfies one
+ * and not the other, and the TE proved the directory writable in the same run
+ * that watched prune refuse. The manifest's LOCATION is still right; the premise
+ * offered for it was not.
+ *
+ * `verb` is the imperative the operator must re-run ("prune", "the rollback").
+ * EVERY branch NAMES THE PATH, because the path is what they have to act on.
+ */
+export function manifestFailureRemedy(error: unknown, manifestPath: string, verb: string): string {
+  switch (manifestFailureCode(error)) {
+    case "ENOSPC":
+      return `Free a few bytes on that filesystem (any single file will do), then re-run ${verb}.`;
+    case "EACCES":
+    case "EPERM":
+      return `Make ${manifestPath} writable by this user (check its owner and mode), then re-run ${verb}.`;
+    case "EISDIR":
+      return `${manifestPath} is a directory, not a file — remove it, then re-run ${verb}.`;
+    case "EROFS":
+      return `${manifestPath} is on a read-only filesystem — remount it read-write, then re-run ${verb}.`;
+    default:
+      // Deliberately generic and still actionable: name the path and say what
+      // must become true of it. NEVER assume disk-full for an unrecognised
+      // errno — that assumption is the defect this function exists to fix.
+      return `Make ${manifestPath} writable, then re-run ${verb}.`;
+  }
 }
 
 /**

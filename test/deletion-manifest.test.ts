@@ -549,10 +549,17 @@ test("T-M3: a manifest write failure aborts the prune with nothing deleted", asy
       failed.stderr,
       /^acpx sessions prune: could not record this deletion — nothing was pruned\.$/m,
     );
-    assert.match(
-      failed.stderr,
-      /^Free a few bytes on that filesystem \(any single file will do\), then re-run prune\.$/m,
+    // ⚠️ This assertion USED to demand the disk-full line here, and that was the
+    // F5 defect in miniature: the injection is EISDIR, and the refusal was
+    // telling the operator to free bytes. The remedy now branches on the real
+    // errno; the executable proof that it recovers them is in the F5 tests.
+    assert.ok(
+      failed.stderr.includes(
+        `${manifestPath(homeDir)} is a directory, not a file — remove it, then re-run prune.`,
+      ),
+      `wrong remedy for an EISDIR failure:\n${failed.stderr}`,
     );
+    assert.doesNotMatch(failed.stderr, /Free a few bytes/);
 
     // Nothing was destroyed. This is the claim.
     for (const id of ["abort-a", "abort-b"]) {
@@ -604,6 +611,175 @@ test("T-M3: a manifest write failure aborts the prune with nothing deleted", asy
  * defence-in-depth against a FUTURE throw on this path, not a live guard. If
  * you add one, this is the test to write.
  */
+
+/**
+ * F5 — THE REFUSAL'S REMEDY MUST ACTUALLY RECOVER THE OPERATOR.
+ *
+ * ⚠️ ASSERTED BY EXECUTION, NOT INSPECTION, because that is how the defect was
+ * found and it is the only method that could have found it. The refusal printed
+ * hard-coded ENOSPC advice ("Free a few bytes…") for EVERY manifest failure; a
+ * test-engineer followed that advice from the refused state — created a file in
+ * the store, unlinked it, re-ran — and measured rc=1 with all 15 files still
+ * present. Every string-shaped check passed the whole time. Aborting is only
+ * humane if the operator has a way out, so the way out is what gets tested.
+ *
+ * This is the THIRD instance of "a refusal teaching a remedy that does not work"
+ * in this lane (the `session_open` advice; the `without --delete` trap; this).
+ * If you add a fourth refusal, execute its advice here before believing it.
+ */
+test("F5: the manifest-failure remedy recovers the operator (EISDIR), executed not inspected", async () => {
+  await withTempHome(async (homeDir) => {
+    const workCwd = path.join(homeDir, "workspace");
+    await fs.mkdir(workCwd, { recursive: true });
+    await seedSession(homeDir, "remedy-eisdir", workCwd);
+    await fs.mkdir(manifestPath(homeDir), { recursive: true });
+
+    const refused = await runCli(["claude", "sessions", "prune", "--whole-box"], {
+      home: homeDir,
+      cwd: workCwd,
+    });
+    assert.equal(refused.code, 1);
+    assert.match(refused.stderr, /EISDIR/);
+    // It must NOT hand out the disk-full remedy for a non-disk-full fault.
+    assert.doesNotMatch(
+      refused.stderr,
+      /Free a few bytes/,
+      "ENOSPC advice was printed for a non-ENOSPC failure",
+    );
+    // And the remedy names the PATH the operator has to act on.
+    assert.ok(
+      refused.stderr.includes(
+        `${manifestPath(homeDir)} is a directory, not a file — remove it, then re-run prune.`,
+      ),
+      `remedy did not name the path:\n${refused.stderr}`,
+    );
+    assert.equal(await fileExists(sessionFilePath(homeDir, "remedy-eisdir")), true);
+
+    // EXECUTE THE PRINTED ADVICE, then re-run. This is the assertion.
+    await fs.rm(manifestPath(homeDir), { recursive: true, force: true });
+    const recovered = await runCli(["claude", "sessions", "prune", "--whole-box"], {
+      home: homeDir,
+      cwd: workCwd,
+    });
+    assert.equal(
+      recovered.code,
+      0,
+      `following the printed remedy did not recover the operator: ${recovered.stderr}`,
+    );
+    assert.equal(await fileExists(sessionFilePath(homeDir, "remedy-eisdir")), false);
+    assert.equal(entriesOf(await readManifest(homeDir)).length, 1);
+  });
+});
+
+/**
+ * F5's PRODUCTION-REACHABLE case: EACCES, not disk-full.
+ *
+ * The manifest is long-lived. Create it once under another uid — a root-run
+ * acpx, a bootstrap quirk — and EVERY later agent prune fails forever while
+ * being told to free space. Strictly worse than ENOSPC, which self-resolves.
+ *
+ * This also falsifies conception §4.1.1 reason #1 ("a store where the manifest
+ * write fails for permission reasons is a store where prune could not have
+ * deleted anything anyway"): `unlink` needs write on the DIRECTORY, this write
+ * needs write on the FILE. The test proves the directory writable in the same
+ * run that watches prune refuse, so the two permissions are visibly distinct
+ * rather than argued about. The manifest's LOCATION is still right; the premise
+ * offered for it was not.
+ *
+ * ⚠️ The `chmod` injection cannot fire as root — but it does not fail SILENTLY
+ * there: the prune would succeed and the `code === 1` assertion would go red,
+ * which is the direction to want. Measured at uid 1000: `open(0444, "a")` gives
+ * EACCES.
+ */
+test("F5: an unwritable manifest in a writable directory refuses, and its remedy recovers (EACCES)", async () => {
+  await withTempHome(async (homeDir) => {
+    const workCwd = path.join(homeDir, "workspace");
+    await fs.mkdir(workCwd, { recursive: true });
+    await seedSession(homeDir, "remedy-eacces", workCwd);
+
+    // A pre-existing manifest this user cannot append to.
+    await fs.writeFile(manifestPath(homeDir), `{"v":1,"op":"manifest_open"}\n`, "utf8");
+    await fs.chmod(manifestPath(homeDir), 0o444);
+
+    const refused = await runCli(["claude", "sessions", "prune", "--whole-box"], {
+      home: homeDir,
+      cwd: workCwd,
+    });
+    assert.equal(
+      refused.code,
+      1,
+      `expected a refusal — if this ran as root the chmod could not fire: ${refused.stderr}`,
+    );
+    assert.match(refused.stderr, /EACCES/, "the injection did not fire");
+    assert.doesNotMatch(
+      refused.stderr,
+      /Free a few bytes/,
+      "the operator was told to free disk space for a permissions fault",
+    );
+    assert.ok(
+      refused.stderr.includes(
+        `Make ${manifestPath(homeDir)} writable by this user (check its owner and mode), then re-run prune.`,
+      ),
+      `remedy did not name the path:\n${refused.stderr}`,
+    );
+    assert.equal(await fileExists(sessionFilePath(homeDir, "remedy-eacces")), true);
+
+    // THE DIRECTORY IS WRITABLE THROUGHOUT — so "prune could not have deleted
+    // anything anyway" is false, measured rather than asserted.
+    const probe = path.join(sessionDir(homeDir), "writability-probe.tmp");
+    await fs.writeFile(probe, "the directory is writable\n", "utf8");
+    await fs.rm(probe);
+
+    // EXECUTE THE PRINTED ADVICE: make it writable, re-run.
+    await fs.chmod(manifestPath(homeDir), 0o644);
+    const recovered = await runCli(["claude", "sessions", "prune", "--whole-box"], {
+      home: homeDir,
+      cwd: workCwd,
+    });
+    assert.equal(
+      recovered.code,
+      0,
+      `following the printed remedy did not recover the operator: ${recovered.stderr}`,
+    );
+    assert.equal(await fileExists(sessionFilePath(homeDir, "remedy-eacces")), false);
+  });
+});
+
+/** The remedy selector itself, over the errno values the end-to-end tests above
+ *  cannot deterministically produce (ENOSPC, EROFS) plus the unknown-errno
+ *  fallback. Every branch must name the path, and none but ENOSPC may talk about
+ *  free space — the default arm is the one that regressed. */
+test("F5: every remedy branch names the path, and only ENOSPC talks about free space", async () => {
+  const { manifestFailureRemedy } = await import("../src/session/persistence.js");
+  const target = "/home/node/.acpx/sessions/deletions.ndjson";
+  const err = (code: string): NodeJS.ErrnoException => Object.assign(new Error(code), { code });
+
+  assert.match(manifestFailureRemedy(err("ENOSPC"), target, "prune"), /Free a few bytes/);
+
+  for (const code of ["EACCES", "EPERM", "EISDIR", "EROFS", "ENOTSUP", "SOMETHING_NEW"]) {
+    const remedy = manifestFailureRemedy(err(code), target, "prune");
+    assert.ok(remedy.includes(target), `${code} remedy does not name the path: ${remedy}`);
+    assert.doesNotMatch(
+      remedy,
+      /Free a few bytes/,
+      `${code} was given the disk-full remedy — the exact defect F5 fixes`,
+    );
+    // Prune's token rule reaches every status line, remedies included.
+    assert.match(remedy, /prune/i, `${code} remedy loses the prune token: ${remedy}`);
+  }
+
+  // An error carrying no `code` at all still gets actionable, path-naming advice.
+  const bare = manifestFailureRemedy(new Error("something odd"), target, "prune");
+  assert.ok(bare.includes(target));
+  assert.doesNotMatch(bare, /Free a few bytes/);
+
+  // The verb is carried, so the rollback path cannot tell an operator to re-run
+  // prune — and no prune token is invented for a verb that has no token rule.
+  assert.match(
+    manifestFailureRemedy(err("EACCES"), target, "the rollback"),
+    /then re-run the rollback\./,
+  );
+});
 
 /** T-M4 — `invoker` distinguishes its two cases, in BOTH directions. A writer
  *  that always emits `null` and one that always emits the URL each pass one
@@ -889,6 +1065,33 @@ test("T-M1 sibling: templates rollback --delete leaves no owner log or timestamp
       false,
       "and as exactly this one",
     );
+    // The messages sidecar. Omitted originally, and that omission WAS the hole:
+    // dropping the two messages-log unlinks from `unlinkHardDeletedFiles` — the
+    // shape a "consolidate the messages-log handling" refactor produces — left
+    // this file on disk while the entry below still claimed "messages", and NO
+    // test in ANY suite went red. M-OC-B is that mutation.
+    assert.equal(
+      await fileExists(path.join(sessionDir(homeDir), "rb-victim.messages.ndjson")),
+      false,
+      "the messages sidecar survived a rollback that recorded having taken it",
+    );
+
+    // ⚠️ THE ENTRY'S `classes` MUST MATCH WHAT WAS ACTUALLY ATTEMPTED — asserted
+    // exactly, not by shape. §4.3.2 claims the manifest "never over-claims", and
+    // until this assertion existed that claim rested on the array and the unlink
+    // sequence happening to derive from one helper. That is a CONSTRUCTION, and
+    // a construction is only a control while it holds: a refactor separating
+    // them makes the manifest lie about a deletion it did not perform, which is
+    // the precise failure mode this brick exists to end.
+    //
+    // Both directions are pinned by mutation — M-OC-B makes the array OVER-claim
+    // (files survive, entry still lists them) and M-OC-A makes it UNDER-claim
+    // (`deletedFileClasses(false)`) — and a `length > 0` shape check passed
+    // both. This is the rollback-path counterpart of what T-F4 and T-F5 already
+    // assert for prune.
+    const entry = entriesOf(await readManifest(homeDir))[0];
+    assert.equal(entry?.op, "templates_rollback_delete");
+    assert.deepEqual(entry?.classes, ["record", "messages", "stream", "timestamps", "owner"]);
   });
 });
 
@@ -929,9 +1132,19 @@ test("T-S4: a rollback that cannot be recorded prints its refusal and changes no
       failed.stderr,
       /^acpx sessions templates rollback: could not record this deletion — nothing was deleted, and template 'ts4-slug' is unchanged\.$/m,
     );
-    assert.match(
+    // F5: the remedy branches on the real errno rather than assuming disk-full,
+    // and the trailing clause stays true whatever it was — nothing partial
+    // happened, so there is genuinely nothing to undo first.
+    assert.ok(
+      failed.stderr.includes(
+        `${manifestPath(homeDir)} is a directory, not a file — remove it, then re-run the rollback. The slug is untouched, so nothing needs undoing first.`,
+      ),
+      `rollback remedy did not branch on the errno:\n${failed.stderr}`,
+    );
+    assert.doesNotMatch(
       failed.stderr,
-      /^Free space on that filesystem, then re-run — the slug is untouched, so nothing needs undoing first\.$/m,
+      /Free space on that filesystem/,
+      "the rollback carried the same hard-coded ENOSPC assumption F5 removed from prune",
     );
     assert.match(failed.stderr, /EISDIR/);
     // Not a stack trace.

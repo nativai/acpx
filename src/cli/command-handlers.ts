@@ -62,6 +62,7 @@ import {
   rollbackTemplateSlug,
   DeletionManifestWriteError,
   describeManifestFailure,
+  manifestFailureRemedy,
   writeSessionRecord,
   writeSessionRecordWithLifecycle,
 } from "../session/persistence.js";
@@ -3109,6 +3110,13 @@ function printTemplateRollbackAuditFailure(
   format: OutputFormat,
 ): void {
   const cause = describeManifestFailure(error.cause);
+  // ⚠️ Same shared, errno-branching remedy as the prune refusal. This string used
+  // to hard-code "Free space on that filesystem" for EVERY failure — the
+  // identical defect measured on the prune path, and the third appearance of "a
+  // refusal teaching a remedy that does not work" in this lane. The trailing
+  // clause stays: nothing partial happened, so there IS nothing to undo first,
+  // and that remains true whatever the errno was.
+  const remedy = `${manifestFailureRemedy(error.cause, error.manifestPath, "the rollback")} The slug is untouched, so nothing needs undoing first.`;
   if (
     emitJsonResult(format, {
       action: "template_rollback_failed",
@@ -3116,6 +3124,7 @@ function printTemplateRollbackAuditFailure(
       slug,
       manifestPath: error.manifestPath,
       cause,
+      remedy,
     })
   ) {
     return;
@@ -3125,7 +3134,7 @@ function printTemplateRollbackAuditFailure(
       `rollback --delete writes one line to ${error.manifestPath} before it removes\n` +
       `anything, so a deletion that cannot be recorded does not happen.\n` +
       `  cause: ${cause}\n` +
-      `Free space on that filesystem, then re-run — the slug is untouched, so nothing needs undoing first.\n`,
+      `${remedy}\n`,
   );
 }
 
@@ -3319,8 +3328,18 @@ export async function handleSessionsPrune(
     // would swallow an unrelated failure on a destructive path and tell the
     // operator to free disk space when the real fault was something else —
     // reporting a failure as something it is not. Same discipline as
-    // PruneAborted above. M-S5 injects a different error at the same seam and
-    // asserts it is re-thrown.
+    // PruneAborted above.
+    //
+    // ⚠️ NOT TEST-COVERED, and this comment used to claim it was ("M-S5 injects
+    // a different error at the same seam and asserts it is re-thrown"). NO SUCH
+    // TEST EXISTS. It was written, MEASURED TO BE VACUOUS, and removed rather
+    // than kept as decoration — the reasoning is recorded at length in
+    // test/deletion-manifest.test.ts. Inside this `try` the only reachable
+    // throws today are `PruneAborted` (handled above) and
+    // `DeletionManifestWriteError`; every other failure is swallowed further
+    // down, so no injection reaches this branch to tell a typed catch from a
+    // bare one. The narrow catch is DEFENCE IN DEPTH against a future throw,
+    // not a tested property. Do not read it as covered.
     if (error instanceof DeletionManifestWriteError) {
       render.printPruneRefusalByFormat(
         {
@@ -3328,6 +3347,7 @@ export async function handleSessionsPrune(
           agentName: agent.agentName,
           manifestPath: error.manifestPath,
           cause: describeManifestFailure(error.cause),
+          remedy: manifestFailureRemedy(error.cause, error.manifestPath, "prune"),
         },
         globalFlags.format,
       );

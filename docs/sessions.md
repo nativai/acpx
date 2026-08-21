@@ -237,6 +237,13 @@ account for. A `--dry-run` destroys nothing and so records nothing.
 > **An entry records a deletion that was authorised and begun. The session store
 > is the authority on whether it completed.**
 
+⚠️ **On a first-ever prune into a fresh store, an entry's `at` can precede the
+`manifest_open` header's `at` by a millisecond or so.** The entries are stamped
+when the deletion is authorised; the header is stamped when the file is created,
+which happens fractionally later in the same call. That ordering is ordinary and
+expected — it is not a backdated record, and not evidence that an entry predates
+the manifest that contains it.
+
 **Read the header line before concluding anything from an absence.** The file
 opens with a `manifest_open` line carrying `at` and `covers`:
 

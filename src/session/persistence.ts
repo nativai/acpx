@@ -5,6 +5,8 @@ export {
   DeletionManifestWriteError,
   deletionManifestPath,
   describeManifestFailure,
+  manifestFailureCode,
+  manifestFailureRemedy,
 } from "./persistence/deletion-manifest.js";
 export { flushPendingSessionIndexUpdates } from "./persistence/index-update-queue.js";
 export {
