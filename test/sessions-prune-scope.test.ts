@@ -42,7 +42,12 @@ type CliResult = { code: number | null; stdout: string; stderr: string };
  * while reading as isolated. These tests DELETE session records — isolation is part
  * of the test, not setup.
  */
-function runCli(args: string[], homeDir: string, cwd?: string): Promise<CliResult> {
+function runCli(
+  args: string[],
+  homeDir: string,
+  cwd?: string,
+  extraEnv?: NodeJS.ProcessEnv,
+): Promise<CliResult> {
   return new Promise((resolve) => {
     const env: NodeJS.ProcessEnv = { ...process.env, HOME: homeDir, ACPX_STATE_HOME: homeDir };
     for (const key of [
@@ -56,6 +61,10 @@ function runCli(args: string[], homeDir: string, cwd?: string): Promise<CliResul
     ]) {
       delete env[key];
     }
+    // Applied AFTER the scrub so a test can put one of those vars back
+    // deliberately — the manifest's `invoker` needs both directions
+    // (ACPX_SESSION_URL present → the URL; absent → null, not missing).
+    Object.assign(env, extraEnv ?? {});
     const child = spawn(process.execPath, [CLI_PATH, ...args], {
       env,
       stdio: ["pipe", "pipe", "pipe"],
@@ -492,7 +501,8 @@ test("prune refuses an id naming an OPEN session and says to close it first", as
     assert.equal(result.code, 1);
     assert.equal(
       pruneOutput(result.stderr).trim(),
-      "acpx sessions prune: 'still-open' is still open — close it first, then prune. Nothing was deleted.",
+      "acpx sessions prune: 'still-open' is still open — nothing was deleted. Close it, then re-run prune:\n" +
+        "  acpx claude sessions close --session-id still-open   # then re-run prune",
     );
     assert.equal(await fileExists(sessionFilePath(homeDir, "still-open")), true);
 
@@ -507,6 +517,122 @@ test("prune refuses an id naming an OPEN session and says to close it first", as
     );
     assert.equal(closed.code, 0, closed.stderr);
     assert.equal(await fileExists(sessionFilePath(homeDir, "still-open")), false);
+  });
+});
+
+/**
+ * T-S1 — the refusal's advice is EXECUTED, not inspected. e6f0ff53 finding 2.
+ *
+ * ⚠️ This test must RUN the printed command. The defect it guards is precisely
+ * that the old advice PARSES and FAILS: `sessions close <id>` sends the id into
+ * a positional that is a NAME (command-registration.ts:261), while the id needs
+ * `--session-id` (flags.ts:539-542). Any check that reads the string — asserts a
+ * substring, matches a shape — passes on the defect, because the defect is not
+ * in how the string looks. Method inherited from the dd4cb0e8 TE
+ * (verification/VERIFICATION.md §6).
+ *
+ * The command is parsed out of stderr and executed verbatim, so a future edit
+ * that changes the advice to something unrunnable reds here rather than shipping.
+ */
+test("T-S1: the open-session refusal prints a command that actually runs", async () => {
+  await withTempHome(async (homeDir) => {
+    const workCwd = path.join(homeDir, "workspace");
+    await fs.mkdir(workCwd, { recursive: true });
+    await seedSession(homeDir, "advice-open", workCwd, { closed: false });
+
+    const refused = await runCli(
+      ["--cwd", workCwd, "claude", "sessions", "prune", "advice-open"],
+      homeDir,
+    );
+    assert.equal(refused.code, 1);
+    assert.equal(await fileExists(sessionFilePath(homeDir, "advice-open")), true);
+
+    // Take the advice off the wire rather than restating it here: a hand-written
+    // copy would drift from the string under test and quietly stop testing it.
+    const advice = pruneOutput(refused.stderr)
+      .split("\n")
+      .map((line) => line.trim())
+      .find((line) => line.startsWith("acpx ") && line.includes(" sessions close "));
+    assert.ok(advice, `no runnable close advice in the refusal:\n${refused.stderr}`);
+
+    // Strip the leading `acpx` and the trailing `# ...` comment — a shell would.
+    const argv = advice
+      .replace(/\s+#.*$/, "")
+      .split(/\s+/)
+      .slice(1);
+    assert.deepEqual(argv, ["claude", "sessions", "close", "--session-id", "advice-open"]);
+
+    const closed = await runCli(argv, homeDir, workCwd);
+    assert.equal(closed.code, 0, `the printed advice did not run:\n${closed.stderr}`);
+
+    // The whole point: after taking the advice, the original prune now works.
+    const retried = await runCli(
+      ["--cwd", workCwd, "claude", "sessions", "prune", "advice-open"],
+      homeDir,
+    );
+    assert.equal(retried.code, 0, retried.stderr);
+    assert.equal(await fileExists(sessionFilePath(homeDir, "advice-open")), false);
+  });
+});
+
+/**
+ * T-S3 — the scope wording is honest. e6f0ff53 finding 3.
+ *
+ * `ids + --cwd` is a UNION, so claiming "named" for the whole set overstates how
+ * much of it the operator actually spelled out, on the line that precedes an
+ * irreversible act. And `--older-than 1` used to say "1 days".
+ */
+test("T-S3: a combined ids + --cwd scope says 'closed', not 'named'", async () => {
+  await withTempHome(async (homeDir) => {
+    const workCwd = path.join(homeDir, "workspace", "temp", "sweep-32002");
+    await fs.mkdir(workCwd, { recursive: true });
+    for (const id of ["union-a", "union-b", "union-c", "union-d"]) {
+      await seedSession(homeDir, id, workCwd);
+    }
+
+    const combined = await runCli(
+      ["--cwd", workCwd, "claude", "sessions", "prune", "union-a", "--cwd"],
+      homeDir,
+      workCwd,
+    );
+    assert.equal(combined.code, 0, combined.stderr);
+    const plan = pruneOutput(combined.stdout)
+      .split("\n")
+      .find((line) => line.startsWith("Will prune "));
+    assert.ok(plan, `no pre-flight line:\n${combined.stdout}`);
+    // 1 was named; 4 are going. "named" would be a false claim about 3 of them.
+    assert.match(plan, /^Will prune 4 closed claude sessions in /);
+    assert.doesNotMatch(plan, /named/);
+  });
+});
+
+test("T-S3: ids alone still say 'named', and --older-than 1 says '1 day'", async () => {
+  await withTempHome(async (homeDir) => {
+    const workCwd = path.join(homeDir, "workspace", "temp", "sweep-32002");
+    await fs.mkdir(workCwd, { recursive: true });
+    await seedSession(homeDir, "solo-a", workCwd);
+    await seedSession(homeDir, "solo-b", workCwd);
+
+    // Control for the assertion above: with ids as the ONLY selector, "named" is
+    // true and must still be printed. Otherwise "not named" passes vacuously.
+    const named = await runCli(
+      ["--cwd", workCwd, "claude", "sessions", "prune", "solo-a", "solo-b"],
+      homeDir,
+      workCwd,
+    );
+    assert.equal(named.code, 0, named.stderr);
+    assert.match(pruneOutput(named.stdout), /^Will prune 2 named claude sessions /m);
+
+    await seedSession(homeDir, "aged-one", workCwd);
+    await fs.rm(path.join(sessionDir(homeDir), "index.json"), { force: true });
+    const aged = await runCli(
+      ["--cwd", workCwd, "claude", "sessions", "prune", "--older-than", "1"],
+      homeDir,
+      workCwd,
+    );
+    assert.equal(aged.code, 0, aged.stderr);
+    assert.match(pruneOutput(aged.stdout), /older than 1 day\b/);
+    assert.doesNotMatch(pruneOutput(aged.stdout), /older than 1 days/);
   });
 });
 

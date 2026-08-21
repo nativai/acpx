@@ -485,7 +485,29 @@ function renderPruneRefusalText(refusal: PruneRefusal): string {
     );
   }
   if (refusal.reason === "session_open") {
-    return `acpx sessions prune: '${refusal.sessionId}' is still open — close it first, then prune. Nothing was deleted.\n`;
+    // ⚠️ The command on line 2 must be RUNNABLE, and the trailing comment is
+    // load-bearing rather than decoration.
+    //
+    // The old wording said "close it first, then prune" and the naive paste —
+    // `sessions close <id>` — FAILS: that positional is a NAME
+    // (command-registration.ts:261) and `--session-id <id>` is what takes an id
+    // (flags.ts:539-542). An agent pastes and retries whatever an error
+    // suggests, so advice that parses and fails becomes the next invocation.
+    //
+    // `# then re-run prune` is what lets a `sessions close` line satisfy prune's
+    // token rule (dd4cb0e8 §3.3) — a status line is also "what to run instead",
+    // and this remedy necessarily names a different verb. It is also the second
+    // step the operator actually needs. Dropping it breaks the rule without
+    // breaking a compile; T-S2 is what catches that.
+    //
+    // Pinned by EXECUTION, not inspection, in test/sessions-prune-scope.test.ts
+    // (T-S1): the printed command is run verbatim as a subprocess. A check that
+    // reads the string rather than running it passes on the very defect this
+    // fixes.
+    return (
+      `acpx sessions prune: '${refusal.sessionId}' is still open — nothing was deleted. Close it, then re-run prune:\n` +
+      `  acpx ${agent} sessions close --session-id ${refusal.sessionId}   # then re-run prune\n`
+    );
   }
   if (refusal.reason === "session_ambiguous") {
     const count = refusal.matches.length;
@@ -565,9 +587,15 @@ export function printPrunePlan(
 
 function formatPrunePlanLine(count: number, agent: string, scope: PruneScope): string {
   const noun = `session${count === 1 ? "" : "s"}`;
+  // "named" is claimed ONLY when ids are the only selector. `ids + --cwd` is a
+  // UNION (repository.ts:1454-1478), so the old `scope.sessionIds ? …` printed
+  // "4 named … sessions in <dir>" when exactly 1 was named — overstating, on the
+  // line that precedes an irreversible act, how much of the set the operator
+  // actually spelled out. The count itself was and stays exact.
+  const namedOnly = scope.sessionIds != null && scope.cwd == null;
   const head = scope.wholeBox
     ? `ALL ${count} closed ${agent} ${noun}`
-    : `${count} ${scope.sessionIds ? "named" : "closed"} ${agent} ${noun}`;
+    : `${count} ${namedOnly ? "named" : "closed"} ${agent} ${noun}`;
   const clauses = prunePlanScopeClauses(scope);
   const tail = clauses.length > 0 ? ` ${clauses.join(" ")}` : "";
   // The --whole-box line echoes the literal flag token so the box-wide sweep
@@ -586,7 +614,7 @@ function prunePlanScopeClauses(scope: PruneScope): string[] {
     clauses.push(`in ${scope.cwd}`);
   }
   if (scope.olderThanDays != null) {
-    clauses.push(`older than ${scope.olderThanDays} days`);
+    clauses.push(`older than ${scope.olderThanDays} day${scope.olderThanDays === 1 ? "" : "s"}`);
   } else if (scope.before != null) {
     clauses.push(`closed before ${scope.before}`);
   }
