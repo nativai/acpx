@@ -1,5 +1,13 @@
 export { serializeSessionRecordForDisk } from "./persistence/serialize.js";
 export { parseSessionRecord } from "./persistence/parse.js";
+export {
+  DELETION_MANIFEST_FILE_NAME,
+  DeletionManifestWriteError,
+  deletionManifestPath,
+  describeManifestFailure,
+  manifestFailureCode,
+  manifestFailureRemedy,
+} from "./persistence/deletion-manifest.js";
 export { flushPendingSessionIndexUpdates } from "./persistence/index-update-queue.js";
 export {
   DEFAULT_HISTORY_LIMIT,

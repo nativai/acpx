@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync as fsExistsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
@@ -353,6 +354,167 @@ test("pruneSessions --include-history deletes stream files", async () => {
     assert.ok(!(await fileExists(streamSegment)));
     assert.ok(!(await fileExists(streamLock)));
     assert.ok(await fileExists(neighborStreamFile));
+  });
+});
+
+/**
+ * T-PERF-2's discriminating case. The stream-file lookup is an inverse index
+ * built once over the directory listing (indexStreamFilesBySafeId), and the one
+ * way to build it wrong is to key each filename on its FIRST `.stream.` only.
+ *
+ * The neighbour fixture above cannot catch that: `stream-session.stream-neighbor`
+ * contains `.stream-`, not `.stream.`, so its first `.stream.` is already the
+ * right one and a broken index looks correct. This id embeds a literal
+ * `.stream.`, so a first-occurrence-only index files the file under `edge`
+ * instead of `edge.stream.owner` and the stream SURVIVES a prune that reports
+ * having deleted it. A positive control passes here trivially — only this
+ * fixture discriminates.
+ */
+test("pruneSessions --include-history: a session id containing .stream. still owns its stream files", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+    const sessionsDir = path.join(homeDir, ".acpx", "sessions");
+    const trickyId = "edge.stream.owner";
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: trickyId,
+        acpSessionId: trickyId,
+        agentCommand: "agent-a",
+        cwd,
+        closed: true,
+        closedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    const safeId = encodeURIComponent(trickyId);
+    // Guard the fixture itself: if encodeURIComponent ever escaped the dots the
+    // id would no longer embed `.stream.` and this test would silently stop
+    // testing anything.
+    assert.ok(safeId.includes(".stream."), `fixture id lost its .stream. infix: ${safeId}`);
+    const streamFile = path.join(sessionsDir, `${safeId}.stream.ndjson`);
+    const streamLock = path.join(sessionsDir, `${safeId}.stream.lock`);
+    await fs.writeFile(streamFile, "edge-event-data\n", "utf8");
+    await fs.writeFile(streamLock, "", "utf8");
+
+    const result = await session.pruneSessions({
+      agentCommand: "agent-a",
+      includeHistory: true,
+    });
+
+    assert.equal(result.pruned.length, 1);
+    assert.ok(!(await fileExists(streamFile)), "stream file survived a prune that claimed it");
+    assert.ok(!(await fileExists(streamLock)), "stream lock survived a prune that claimed it");
+  });
+});
+
+/** The same id shape on the measurement half of the pair: a first-occurrence-only
+ *  index under-reports stranding, which is the direction that lies to the
+ *  operator about what a prune is about to leave behind. */
+test("pruneSessions counts stranded streams for a session id containing .stream.", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+    const sessionsDir = path.join(homeDir, ".acpx", "sessions");
+    const trickyId = "edge.stream.owner";
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: trickyId,
+        acpSessionId: trickyId,
+        agentCommand: "agent-a",
+        cwd,
+        closed: true,
+        closedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    const safeId = encodeURIComponent(trickyId);
+    await fs.writeFile(path.join(sessionsDir, `${safeId}.stream.ndjson`), "12345", "utf8");
+
+    const result = await session.pruneSessions({
+      agentCommand: "agent-a",
+      dryRun: true,
+      includeHistory: false,
+    });
+
+    assert.equal(result.strandedStreamFiles, 1);
+    assert.equal(result.strandedStreamBytes, 5);
+  });
+});
+
+/**
+ * T5′ — the count precedes the ACT, not merely the line's presence.
+ *
+ * e6f0ff53 finding 4. The shipped T5 asserts three within-stdout index
+ * comparisons, and a FAITHFUL M8 ("move the pre-flight print to after the
+ * loop") satisfies all three byte-identically — the dd4cb0e8 TE measured it at
+ * 213 tests, ZERO reds, having first verified the injection genuinely bit. Those
+ * assertions pin that the line appears earlier in a string; they cannot pin that
+ * it appears earlier than the DELETION, because the deletion leaves no mark in
+ * stdout.
+ *
+ * This pins it against the filesystem instead: at the moment the hook runs, the
+ * files must still be there, and a throw from the hook must leave them there.
+ * Deterministic, no fault injection, and it uses only the abort path the
+ * all-or-nothing id contract already depends on.
+ */
+test("T5': onBeforeDelete runs while the files still exist, and throwing leaves them all", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    for (const id of ["order-a", "order-b"]) {
+      await writeSessionRecord(
+        homeDir,
+        makeSessionRecord({
+          acpxRecordId: id,
+          acpSessionId: id,
+          agentCommand: "agent-a",
+          cwd,
+          closed: true,
+          closedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      );
+      await fs.writeFile(messagesLogPath(homeDir, id), `sidecar for ${id}\n`, "utf8");
+    }
+
+    const stdout: string[] = [];
+    let existedAtCallbackTime: boolean[] = [];
+
+    await assert.rejects(
+      session.pruneSessions({
+        agentCommand: "agent-a",
+        onBeforeDelete: (plan) => {
+          // The pre-flight line, as the CLI writes it.
+          stdout.push(`Will prune ${plan.records.length} closed agent-a sessions.`);
+          // The observation the string comparison cannot make: are they still here?
+          existedAtCallbackTime = ["order-a", "order-b"].map((id) =>
+            fsExistsSync(sessionFilePath(homeDir, id)),
+          );
+          throw new Error("abort after announcing");
+        },
+      }),
+      /abort after announcing/,
+    );
+
+    assert.deepEqual(stdout, ["Will prune 2 closed agent-a sessions."]);
+    assert.deepEqual(
+      existedAtCallbackTime,
+      [true, true],
+      "the count was announced AFTER something had already been destroyed",
+    );
+    // And the throw destroyed nothing.
+    for (const id of ["order-a", "order-b"]) {
+      assert.ok(
+        await fileExists(sessionFilePath(homeDir, id)),
+        `${id} was deleted despite the abort`,
+      );
+      assert.ok(await fileExists(messagesLogPath(homeDir, id)));
+    }
   });
 });
 

@@ -20,6 +20,7 @@ import {
   prepareMessagesLogForBoundary,
   resolveMessagesLogCompactBytes,
 } from "../messages-log.js";
+import { appendDeletionManifest, type DeletionManifestEntry } from "./deletion-manifest.js";
 import { withSessionIndexLock } from "./index-lock.js";
 import {
   flushPendingSessionIndexUpdates,
@@ -749,7 +750,7 @@ export async function rollbackTemplateSlug(
       return { slug, outcome: "noop" };
     }
     if (options.delete === true) {
-      await hardDeleteSessionRecord(target.acpxRecordId);
+      await hardDeleteSessionRecord(target);
     } else {
       await softRetractTemplateRecord(target.acpxRecordId);
     }
@@ -786,15 +787,87 @@ async function unlinkIfPresent(filePath: string): Promise<void> {
   }
 }
 
-// Hard delete: record JSON + messages-log sidecars + stream sidecars, then a
-// rebuild to drop the now-missing index entry (the same teardown prune uses).
-async function hardDeleteSessionRecord(acpxRecordId: string): Promise<void> {
+/**
+ * Hard delete: record JSON + messages-log sidecars + owner log + stream sidecars
+ * + the stream's timestamps index, then a rebuild to drop the now-missing index
+ * entry (the same teardown prune uses).
+ *
+ * ⚠️ THIS IS THE SECOND OF THE acpx CLI's ONLY TWO record-deleting paths, and it
+ * is the one that motivated the manifest. The `29eaff14` RCA's three baker
+ * nights were destroyed HERE, not by a prune — a manifest written only by
+ * `sessions prune` would have recorded nothing about any of them and that RCA
+ * would have been exactly as hard. If you add a further record-deleting path TO
+ * THE CLI, it needs a manifest write too, and `MANIFEST_COVERS` needs its name.
+ *
+ * ⚠️ "THE CLI" is the honest scope and this comment used to omit it, claiming
+ * acpx's "ONLY TWO" outright. `scripts/cleanup-ghost-sessions.ts:403` already
+ * unlinks session records with no manifest line, so the old wording instructed
+ * the next maintainer from a false premise — and retroactively, warning about a
+ * third path that already existed. That script is OUT of manifest coverage on
+ * purpose (brick://aabc9336); do not add a manifest write to it here.
+ *
+ * Takes the INDEX ENTRY rather than a bare id because the manifest records the
+ * session's identity and `SessionIndexEntry` carries no `createdAt`/`closedAt` —
+ * `pickLatestTemplate` already has the entry in hand, so the record is loaded
+ * from it. One ~2.7 KB read for a record that is about to be unlinked anyway,
+ * and it keeps the entry schema uniform across both `op` values.
+ *
+ * A throw from the manifest write is safe under the index lock, verified rather
+ * than assumed: `withSessionIndexLock` wraps `fn()` in nested `try/finally`, so
+ * the lock file is released in the inner one and the in-process queue gate in
+ * the outer. The failure propagates having deleted nothing — the same
+ * fail-closed shape as the prune path, for free.
+ */
+async function hardDeleteSessionRecord(entry: SessionIndexEntry): Promise<void> {
   const sessionDir = sessionBaseDir();
+  const acpxRecordId = entry.acpxRecordId;
   const safeId = encodeURIComponent(acpxRecordId);
+
+  // Loaded BEFORE anything is unlinked, for the manifest. If it cannot be read,
+  // fall back to the index entry's own projection — `name`/`cwd` are there, and
+  // `createdAt`/`closedAt` are then ABSENT from the entry, which per the schema
+  // means "we could not read it", never "it had none".
+  const record = await loadRecordFromIndexEntry(entry).catch(() => undefined);
+
+  // Write-ahead, exactly as the prune path: a failure here aborts having
+  // destroyed nothing.
+  await appendDeletionManifest(sessionDir, [
+    {
+      op: "templates_rollback_delete",
+      at: isoNow(),
+      id: acpxRecordId,
+      name: record?.name ?? entry.name,
+      cwd: record?.cwd ?? entry.cwd,
+      createdAt: record?.createdAt,
+      closedAt: record?.closedAt,
+      // This path has no --include-history: it always takes everything.
+      classes: deletedFileClasses(true),
+    },
+  ]);
+
+  await unlinkHardDeletedFiles(sessionDir, acpxRecordId, safeId);
+  await rebuildSessionIndex(sessionDir, "template-rollback-delete").catch(() => {
+    // best-effort cache rebuild; the record files are already gone
+  });
+}
+
+/**
+ * Every file class a hard delete takes — the same set `pruneSessionFiles` takes
+ * with history included, because this path has no `--include-history` to opt out
+ * of. It must stay in step with `deletedFileClasses(true)`, which is what the
+ * manifest entry above claims was destroyed.
+ */
+async function unlinkHardDeletedFiles(
+  sessionDir: string,
+  acpxRecordId: string,
+  safeId: string,
+): Promise<void> {
   await unlinkIfPresent(path.join(sessionDir, `${safeId}.json`));
   const logPath = path.join(sessionDir, messagesLogFileName(acpxRecordId));
   await unlinkIfPresent(logPath);
   await unlinkIfPresent(messagesLogStalePath(logPath));
+  await unlinkIfPresent(ownerLogPath(sessionDir, safeId));
+  await unlinkIfPresent(timestampsSidecarPath(sessionDir, safeId));
   try {
     const dirEntries = await fs.readdir(sessionDir);
     for (const name of dirEntries.filter((entry) => isSessionStreamFile(entry, safeId))) {
@@ -803,9 +876,6 @@ async function hardDeleteSessionRecord(acpxRecordId: string): Promise<void> {
   } catch {
     // dir vanished between operations — nothing left to clean
   }
-  await rebuildSessionIndex(sessionDir, "template-rollback-delete").catch(() => {
-    // best-effort cache rebuild; the record files are already gone
-  });
 }
 
 export type TemplateSlugAssignment = {
@@ -1225,6 +1295,14 @@ export type PruneOptions = {
   /** Absolute, already-resolved. Exact equality against the record's cwd. */
   cwd?: string;
   /**
+   * The resolved CLI scope (`PruneScope`), recorded verbatim in each deletion
+   * manifest entry so an investigator sees what the operator actually asked for,
+   * not just which sessions matched. Typed loosely on purpose: the shape is the
+   * CLI's, and the core has no business depending on a CLI type. Absent =>
+   * omitted from the entry.
+   */
+  auditScope?: unknown;
+  /**
    * Invoked once after record loading and BEFORE both the dry-run early return
    * and the first unlink. Throwing aborts with nothing deleted.
    *
@@ -1260,6 +1338,10 @@ export type PruneResult = {
    */
   strandedStreamFiles: number;
   strandedStreamBytes: number;
+  /** Lines this run appended to the deletion manifest — 0 on a dry run, because
+   *  a dry run destroys nothing and so records nothing. Lets a scripted consumer
+   *  assert the audit actually happened rather than trusting that it did. */
+  auditEntries: number;
 };
 
 /** Index-entry counts for the CLI's unscoped-prune refusal. Deliberately cheap:
@@ -1312,6 +1394,53 @@ function isSessionStreamFile(fileName: string, safeId: string): boolean {
   );
 }
 
+const STREAM_FILE_INFIX = ".stream.";
+
+/**
+ * Inverse of `isSessionStreamFile`: safeId → the stream files that id owns, in
+ * `dirEntries` order. Built ONCE per invocation and shared by every record,
+ * replacing a per-record `dirEntries.filter(isSessionStreamFile)` over the whole
+ * listing. On this box that filter was 2,362 records × 15,325 entries ≈ 36M
+ * predicate calls, measured at +821 ms / 1.17x on a box-wide run
+ * (brick://dd4cb0e8 verification/VERIFICATION.md §14) — and paid on EVERY prune,
+ * because exactly one of measureStrandedStreams / pruneSessionFiles runs on any
+ * given invocation.
+ *
+ * ⚠️ DO NOT narrow this to the FIRST `.stream.` in each filename. It looks like
+ * the obvious loop and it is a silent data-loss bug: a safeId may itself contain
+ * `.stream.`, and a first-occurrence-only index stops finding those sessions'
+ * files entirely — so their streams survive a prune that reports having taken
+ * them. The existing `stream-session.stream-neighbor` fixture CANNOT catch it
+ * (it contains `.stream-`, not `.stream.`); the test "a session id containing
+ * .stream. still owns its stream files" is the one that reds.
+ *
+ * The `at === 0` case (empty safeId) is kept rather than skipped so this is
+ * byte-for-byte the inverse of the predicate above, which also matches it.
+ */
+function indexStreamFilesBySafeId(dirEntries: string[]): Map<string, string[]> {
+  const bySafeId = new Map<string, string[]>();
+  for (const name of dirEntries) {
+    for (
+      let at = name.indexOf(STREAM_FILE_INFIX);
+      at !== -1;
+      at = name.indexOf(STREAM_FILE_INFIX, at + 1)
+    ) {
+      const safeId = name.slice(0, at);
+      const owned = bySafeId.get(safeId);
+      if (owned) {
+        owned.push(name);
+      } else {
+        bySafeId.set(safeId, [name]);
+      }
+    }
+  }
+  return bySafeId;
+}
+
+function streamFilesFor(streamFilesBySafeId: Map<string, string[]>, safeId: string): string[] {
+  return streamFilesBySafeId.get(safeId) ?? [];
+}
+
 export async function pruneSessions(options: PruneOptions = {}): Promise<PruneResult> {
   await ensureSessionDir();
   const entries = await loadSessionIndexEntries();
@@ -1338,22 +1467,30 @@ export async function pruneSessions(options: PruneOptions = {}): Promise<PruneRe
 
   const sessionDir = sessionBaseDir();
 
-  // Read the directory once upfront so stream-file matching doesn't re-read it
-  // for every session in the loop. Unconditional now (it used to be gated on
-  // includeHistory) because the stranded-stream total is reported on every run,
-  // dry ones included — a preview that does not say what it would strand is
-  // hiding the verb's single worst measured behaviour.
+  // Read the directory once upfront, then invert it once (indexStreamFilesBySafeId)
+  // so stream-file matching costs a Map lookup per session instead of a scan of
+  // the whole listing per session.
+  //
+  // Unconditional, and the justification is now TRUE where it used to overstate:
+  // the stranded-stream total really is reported on every run, dry ones
+  // included, in TEXT as well as JSON. It was not before — `printPrunePlan` is
+  // suppressed on dry runs, so a text `--dry-run` computed the total and showed
+  // the operator none of it, while this comment claimed otherwise and was the
+  // load-bearing justification for a cost paid on every invocation. A preview
+  // that does not say what it would strand is hiding the verb's single worst
+  // measured behaviour.
   let dirEntries: string[] = [];
   try {
     dirEntries = await fs.readdir(sessionDir);
   } catch {
     // ignore
   }
+  const streamFilesBySafeId = indexStreamFilesBySafeId(dirEntries);
 
   const { files: strandedStreamFiles, bytes: strandedStreamBytes } = await measureStrandedStreams(
     records,
     sessionDir,
-    dirEntries,
+    streamFilesBySafeId,
     options.includeHistory === true,
   );
 
@@ -1372,17 +1509,50 @@ export async function pruneSessions(options: PruneOptions = {}): Promise<PruneRe
       dryRun: true,
       strandedStreamFiles,
       strandedStreamBytes,
+      auditEntries: 0,
     };
   }
 
+  const includeHistory = options.includeHistory === true;
+
+  // ⚠️ WRITE-AHEAD, and its position between the two lines above and below is
+  // the whole design. Two ways to get it wrong, each of which type-checks:
+  //
+  //  - ABOVE the id-contract check in `onBeforeDelete` => `prune <good-id>
+  //    <typo>` records deletions that then never happen.
+  //  - ABOVE the `if (options.dryRun)` return => every `--dry-run` writes a
+  //    false audit trail. This is the EXACT INVERSE of the ⚠️ on
+  //    `onBeforeDelete` above, which forbids moving THAT call below the same
+  //    return. The two calls sit either side of one line and their correct
+  //    placements are opposite: the contract check must not be exempted from a
+  //    preview, and the audit record must not be written for one.
+  //
+  // A throw here aborts with NOTHING deleted, on the abort path the
+  // all-or-nothing id contract already depends on — so the failure mode is
+  // "nothing happened", and there is no such thing as destroyed-but-unrecorded.
+  // Abort costs zero new failure machinery; best-effort would cost a silently
+  // missing audit record on exactly the box that is already unhealthy.
+  const auditEntries = await appendDeletionManifest(
+    sessionDir,
+    records.map(
+      (record): DeletionManifestEntry => ({
+        op: "sessions_prune",
+        at: isoNow(),
+        agent: options.agentName,
+        scope: options.auditScope,
+        id: record.acpxRecordId,
+        name: record.name,
+        cwd: record.cwd,
+        createdAt: record.createdAt,
+        closedAt: record.closedAt,
+        classes: deletedFileClasses(includeHistory),
+      }),
+    ),
+  );
+
   let bytesFreed = 0;
   for (const record of records) {
-    bytesFreed += await pruneSessionFiles(
-      record,
-      sessionDir,
-      dirEntries,
-      options.includeHistory === true,
-    );
+    bytesFreed += await pruneSessionFiles(record, sessionDir, streamFilesBySafeId, includeHistory);
   }
 
   await rebuildSessionIndex(sessionDir, "prune").catch(() => {
@@ -1396,13 +1566,35 @@ export async function pruneSessions(options: PruneOptions = {}): Promise<PruneRe
     dryRun: false,
     strandedStreamFiles,
     strandedStreamBytes,
+    auditEntries,
   };
+}
+
+/**
+ * The two deletion tiers, as the manifest records them.
+ *
+ * RECORD tier (always): the session record, its messages sidecar, and the queue
+ * owner's log — acpx's own file, whose only reader takes a session id and is
+ * unreachable once the record is gone.
+ *
+ * HISTORY tier (unless `--no-include-history`): the event streams and the
+ * timestamps sidecar. The sidecar is acpx-ui's file, and acpx deletes it not as
+ * a tidy-up in someone else's data but because it is an INDEX OF THE STREAM and
+ * the stream is acpx's: acpx-ui derives its path from the stream path and only
+ * ever opens it that way, so deleting the stream makes it unreachable to its own
+ * owner in the same act. Keep the stream and the index stays with it — which is
+ * exactly what the tiering encodes.
+ */
+function deletedFileClasses(includeHistory: boolean): string[] {
+  return includeHistory
+    ? ["record", "messages", "stream", "timestamps", "owner"]
+    : ["record", "messages", "owner"];
 }
 
 async function measureStrandedStreams(
   records: SessionRecord[],
   sessionDir: string,
-  dirEntries: string[],
+  streamFilesBySafeId: Map<string, string[]>,
   includeHistory: boolean,
 ): Promise<{ files: number; bytes: number }> {
   let files = 0;
@@ -1413,7 +1605,7 @@ async function measureStrandedStreams(
   }
   for (const record of records) {
     const safeId = encodeURIComponent(record.acpxRecordId);
-    for (const name of dirEntries.filter((entry) => isSessionStreamFile(entry, safeId))) {
+    for (const name of streamFilesFor(streamFilesBySafeId, safeId)) {
       files += 1;
       try {
         bytes += (await fs.stat(path.join(sessionDir, name))).size;
@@ -1612,7 +1804,7 @@ function isBeforeCutoff(record: SessionRecord, cutoffIso: string | undefined): b
 async function pruneSessionFiles(
   record: SessionRecord,
   sessionDir: string,
-  dirEntries: string[],
+  streamFilesBySafeId: Map<string, string[]>,
   includeHistory: boolean,
 ): Promise<number> {
   const safeId = encodeURIComponent(record.acpxRecordId);
@@ -1620,12 +1812,59 @@ async function pruneSessionFiles(
   const logPath = path.join(sessionDir, messagesLogFileName(record.acpxRecordId));
   bytesFreed += await unlinkCountingBytes(logPath);
   bytesFreed += await unlinkCountingBytes(messagesLogStalePath(logPath));
+  bytesFreed += await unlinkCountingBytes(ownerLogPath(sessionDir, safeId));
   if (includeHistory) {
-    for (const name of dirEntries.filter((entry) => isSessionStreamFile(entry, safeId))) {
+    for (const name of streamFilesFor(streamFilesBySafeId, safeId)) {
       bytesFreed += await unlinkCountingBytes(path.join(sessionDir, name));
     }
+    bytesFreed += await unlinkCountingBytes(timestampsSidecarPath(sessionDir, safeId));
   }
   return bytesFreed;
+}
+
+/**
+ * The queue owner's log — RECORD tier, so it goes even under
+ * `--no-include-history`. acpx's own file, capped at 1 MiB; its only reader
+ * takes a session id and is unreachable once the record is gone.
+ *
+ * ⚠️ RESOLVED FROM `sessionDir`, NEVER FROM `homedir()`. The WRITER
+ * (`queue-owner-process.ts` `openQueueOwnerLogFd`) builds this path from a bare
+ * `homedir()` and its reader's comment records that as deliberate — *"the log is
+ * intentionally not state-home-isolated"*. So "delete it where it was written"
+ * is the obvious reading and it is FORBIDDEN: under `ACPX_STATE_HOME`
+ * isolation it would make every prune test reach OUT of its temp store and
+ * unlink real owner logs from the developer's `~/.acpx`. Deleting from
+ * `sessionDir` is a harmless no-op inside the temp store instead.
+ *
+ * Residual, stated rather than hidden: in a deployment where
+ * `ACPX_STATE_HOME !== HOME`, owner logs survive a prune. That fails SAFE
+ * (nothing wrongly deleted) and is consistent with the writer's own stated
+ * intent. Because the unlink is always ATTEMPTED, the manifest's `classes`
+ * carries `"owner"` either way and never over-claims about a file that was
+ * already absent — the same as every other class here, none of which is
+ * stat-confirmed.
+ *
+ * Pinned by the T-ISO-4 decoy test, which is the ONE test allowed to diverge
+ * `HOME` from `ACPX_STATE_HOME` (both to temp paths, neither ever the real `~`),
+ * because the property does not exist while they are equal.
+ */
+function ownerLogPath(sessionDir: string, safeId: string): string {
+  return path.join(sessionDir, `${safeId}.owner.log`);
+}
+
+/**
+ * acpx-ui's per-message `{offset, ts}` index for a session's event stream —
+ * HISTORY tier, because it is a SIDECAR OF THE STREAM and follows it.
+ *
+ * acpx neither writes nor reads this file; acpx-ui derives its path from the
+ * stream path by string replacement and only ever loads it with that derived
+ * path. Delete the stream and acpx-ui never opens this file again — so deleting
+ * it alongside is not acpx destroying another repo's data, it is acpx removing
+ * an index it just made unreachable. Keep the stream
+ * (`--no-include-history`) and the index stays with it.
+ */
+function timestampsSidecarPath(sessionDir: string, safeId: string): string {
+  return path.join(sessionDir, `${safeId}.timestamps.ndjson`);
 }
 
 async function unlinkCountingBytes(filePath: string): Promise<number> {

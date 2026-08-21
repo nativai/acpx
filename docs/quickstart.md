@@ -101,6 +101,7 @@ acpx codex sessions prune --dry-run                    # preview everything; nee
 acpx codex sessions prune 4e25443c a1b2c3d4            # just the ones you name — the usual case
 acpx codex sessions prune --cwd                        # this directory's
 acpx codex sessions prune --older-than 30              # retention sweep by age
+acpx codex sessions prune --cwd --no-include-history   # keep the event streams (they become unreachable)
 ```
 
 A destructive prune needs a scope and refuses without one — unscoped it would
@@ -108,6 +109,12 @@ take every closed session on the box, and each pruned session loses its record
 **and its messages sidecar**, after which that transcript can never be rebuilt.
 `acpx codex sessions prune --whole-box` is the box-wide sweep, if that is really
 what you mean.
+
+A prune deletes the session's event streams too, by default. Every deleted
+session is recorded as one line in `~/.acpx/sessions/deletions.ndjson` **before**
+anything is unlinked — **if a session has vanished, grep that file first** — and
+a prune that cannot write that line refuses to run rather than destroy something
+it cannot account for.
 
 ## 8. Pipe it into your tooling
 
