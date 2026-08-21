@@ -5,6 +5,7 @@ export * from "../cli/session/session-control.js";
 export * from "../cli/session/runtime.js";
 export {
   DEFAULT_HISTORY_LIMIT,
+  countPruneCandidates,
   findGitRepositoryRoot,
   findSession,
   findSessionByDirectoryWalk,
@@ -12,9 +13,12 @@ export {
   listSessionsForAgent,
   pruneSessions,
   resolveGlobalSessionByName,
+  resolvePruneSessionIds,
   resolveSessionByExactName,
 } from "./persistence.js";
 export type {
+  PruneCandidateCounts,
+  PruneIdResolution,
   PruneOptions,
   PruneResult,
   SessionNameCandidate,

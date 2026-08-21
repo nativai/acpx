@@ -96,6 +96,8 @@ import {
   type StatusFlags,
 } from "./flags.js";
 import { emitJsonResult } from "./output/json-output.js";
+// Type-only, so the render module stays lazily imported at runtime.
+import type { PruneRefusal, PruneScope } from "./output/render.js";
 import {
   explicitSessionIdFromSelector,
   parseSessionIdFromUrl,
@@ -3120,32 +3122,219 @@ function printMigrateSlugsResult(result: MigrateSlugsResult, format: OutputForma
   }
 }
 
+/** Thrown from `onBeforeDelete` to abort a prune between record loading and the
+ *  first unlink. It carries the refusal so the handler can render it — the throw
+ *  is what makes the all-or-nothing id contract (§3.4) enforceable at all: by the
+ *  time `pruneSessions` returns, the deletion has already happened. */
+class PruneAborted extends Error {
+  constructor(readonly refusal: PruneRefusal) {
+    super("prune aborted before deleting anything");
+    this.name = "PruneAborted";
+  }
+}
+
+/**
+ * `sessions prune` is the CLI's only destructive BULK verb, and until this guard
+ * it was the only destructive verb that did not make you name its target: bare
+ * `prune` selected every closed session on the box for the agent. On 2026-07-24 a
+ * lane meaning to delete the 4 sessions it had just created destroyed 7 and never
+ * learned which 3 others died (brick://dd4cb0e8, RCA brick://29eaff14).
+ *
+ * The scope REQUIREMENT lives here, at the CLI, while the scope FILTERS live in
+ * the core. That split is deliberate and load-bearing: "you must state what you
+ * mean" is an affordance about how intent is expressed, whereas a programmatic
+ * caller writing `pruneSessions({agentCommand})` has already stated box-wide
+ * scope unambiguously in code. Keeping it here is also why every existing core
+ * prune test stays green unmodified.
+ */
 export async function handleSessionsPrune(
   explicitAgentName: string | undefined,
+  ids: string[],
   flags: SessionsPruneFlags,
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const [{ pruneSessions }, { printPruneResultByFormat }] = await Promise.all([
-    loadSessionModule(),
-    loadOutputRenderModule(),
-  ]);
+  const [session, render] = await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
+  const identity = { agentCommand: agent.agentCommand, agentName: agent.agentName };
 
-  const olderThanMs = flags.olderThan != null ? flags.olderThan * 24 * 60 * 60 * 1000 : undefined;
+  const refusal = await resolvePruneRefusal(session, ids, flags, agent);
+  if (refusal) {
+    render.printPruneRefusalByFormat(refusal.refusal, globalFlags.format);
+    process.exitCode = refusal.code;
+    return;
+  }
 
-  const result = await pruneSessions({
-    agentCommand: agent.agentCommand,
-    agentName: agent.agentName,
-    before: flags.before,
-    olderThanMs,
-    includeHistory: flags.includeHistory,
-    includeTemplates: flags.includeTemplates,
-    dryRun: flags.dryRun,
-  });
+  const scope = buildPruneScope(ids, flags, agent.cwd);
 
-  printPruneResultByFormat(result, globalFlags.format);
+  let result: Awaited<ReturnType<typeof session.pruneSessions>>;
+  try {
+    result = await session.pruneSessions({
+      ...identity,
+      before: flags.before,
+      olderThanMs: flags.olderThan != null ? flags.olderThan * 24 * 60 * 60 * 1000 : undefined,
+      includeHistory: flags.includeHistory,
+      includeTemplates: flags.includeTemplates,
+      dryRun: flags.dryRun,
+      sessionIds: scope.sessionIds,
+      cwd: scope.cwd,
+      onBeforeDelete: (plan) => {
+        // The contract check runs here, not after pruneSessions returns, because
+        // by then the files are gone. It also catches what the index-based
+        // pre-resolution above cannot see: an id whose record file is missing,
+        // whose record is a protected blueprint, or which the age filter
+        // excluded — each of those leaves the id absent from plan.records.
+        const unmatched = ids.find(
+          (id) => !plan.records.some((record) => matchesPrunedSessionId(record, id)),
+        );
+        if (unmatched != null) {
+          throw new PruneAborted({
+            reason: "session_not_found",
+            agentName: agent.agentName,
+            sessionId: unmatched,
+          });
+        }
+        // Suppressed on a dry run — `[DRY RUN] Would prune N sessions` already
+        // leads there. The CONTRACT check above is not suppressed: a preview that
+        // does not fail where the real run fails is worse than no preview.
+        if (!plan.dryRun) {
+          render.printPrunePlan(
+            {
+              count: plan.records.length,
+              agentName: agent.agentName,
+              scope,
+              strandedStreamFiles: plan.strandedStreamFiles,
+              strandedStreamBytes: plan.strandedStreamBytes,
+            },
+            globalFlags.format,
+          );
+        }
+      },
+    });
+  } catch (error) {
+    if (error instanceof PruneAborted) {
+      render.printPruneRefusalByFormat(error.refusal, globalFlags.format);
+      process.exitCode = EXIT_CODES.ERROR;
+      return;
+    }
+    throw error;
+  }
+
+  render.printPruneResultByFormat(result, globalFlags.format, scope);
+}
+
+/**
+ * `--older-than` / `--before` COUNT AS A SCOPE. They are an affirmative
+ * statement of what to delete and they are the only documented usage of this
+ * verb, so refusing them would break the one legitimate documented workflow for
+ * zero safety gain — the incident involved no age filter. They are a weak scope
+ * (on a real box `--older-than 30` still selects thousands), which is what the
+ * pre-flight line exists to surface.
+ */
+function isPruneScopeStated(ids: string[], flags: SessionsPruneFlags): boolean {
+  return (
+    ids.length > 0 ||
+    flags.cwd === true ||
+    flags.wholeBox === true ||
+    flags.olderThan != null ||
+    flags.before != null
+  );
+}
+
+function buildPruneScope(
+  ids: string[],
+  flags: SessionsPruneFlags,
+  invocationCwd: string,
+): PruneScope {
+  return {
+    ...(flags.wholeBox === true ? { wholeBox: true } : {}),
+    ...(ids.length > 0 ? { sessionIds: ids } : {}),
+    ...(flags.cwd === true ? { cwd: invocationCwd } : {}),
+    ...(flags.olderThan != null ? { olderThanDays: flags.olderThan } : {}),
+    ...(flags.before ? { before: flags.before.toISOString() } : {}),
+  };
+}
+
+/** Every refusal that can be decided BEFORE `pruneSessions` is reached, i.e.
+ *  before a single record is loaded or a single file unlinked. Returns undefined
+ *  to let the prune proceed. */
+async function resolvePruneRefusal(
+  session: SessionModule,
+  ids: string[],
+  flags: SessionsPruneFlags,
+  agent: { agentCommand: string; agentName: string; cwd: string },
+): Promise<{ refusal: PruneRefusal; code: number } | undefined> {
+  const identity = { agentCommand: agent.agentCommand, agentName: agent.agentName };
+
+  if (flags.wholeBox === true && (ids.length > 0 || flags.cwd === true)) {
+    return {
+      refusal: { reason: "scope_conflict", agentName: agent.agentName },
+      code: EXIT_CODES.USAGE,
+    };
+  }
+
+  // --dry-run is deliberately exempt from the scope requirement: it deletes
+  // nothing, so gating it buys no safety, it IS the discovery affordance
+  // ("what is out there?"), and exempting it means every documented
+  // "--dry-run first" workflow keeps working verbatim.
+  if (!isPruneScopeStated(ids, flags) && flags.dryRun !== true) {
+    const counts = await session.countPruneCandidates({ ...identity, cwd: agent.cwd });
+    return {
+      refusal: {
+        reason: "scope_required",
+        agentName: agent.agentName,
+        cwd: agent.cwd,
+        closedCandidates: counts.total,
+        closedCandidatesInCwd: counts.inCwd,
+      },
+      code: EXIT_CODES.USAGE,
+    };
+  }
+
+  const unresolvable = await findUnresolvableId(session, ids, identity, agent.agentName);
+  return unresolvable ? { refusal: unresolvable, code: EXIT_CODES.ERROR } : undefined;
+}
+
+/** Same suffix contract the core uses, applied to a loaded record. */
+function matchesPrunedSessionId(record: SessionRecord, id: string): boolean {
+  return (
+    record.acpxRecordId === id ||
+    record.acpSessionId === id ||
+    record.acpxRecordId.endsWith(id) ||
+    record.acpSessionId.endsWith(id)
+  );
+}
+
+/** Index-based pre-resolution. Its whole reason for existing is the distinction
+ *  the prunable-record set cannot draw: "no such session" vs "it is still open,
+ *  close it first". Runs before pruneSessions, so nothing is loaded or deleted. */
+async function findUnresolvableId(
+  session: SessionModule,
+  ids: string[],
+  identity: { agentCommand: string; agentName: string },
+  agentName: string,
+): Promise<PruneRefusal | undefined> {
+  if (ids.length === 0) {
+    return undefined;
+  }
+  const resolutions = await session.resolvePruneSessionIds(ids, identity);
+  for (const resolution of resolutions) {
+    if (resolution.closedMatches.length > 1) {
+      return {
+        reason: "session_ambiguous",
+        agentName,
+        sessionId: resolution.id,
+        matches: resolution.closedMatches,
+      };
+    }
+    if (resolution.closedMatches.length === 0) {
+      return resolution.openMatches > 0
+        ? { reason: "session_open", agentName, sessionId: resolution.id }
+        : { reason: "session_not_found", agentName, sessionId: resolution.id };
+    }
+  }
+  return undefined;
 }
 
 // Force-restart (un-wedge) a session's queue owner. Takes a session id (the same
