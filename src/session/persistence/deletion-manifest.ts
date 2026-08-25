@@ -19,6 +19,10 @@ import { resolveAcpxUiBaseUrl } from "../../acp/auth-env.js";
  * perform. A prune-only manifest would not have recorded the case that
  * motivated it.
  *
+ * A record deleter written outside the CLI is out of manifest coverage by
+ * construction — do not write one; this file's --apply predecessor was retired
+ * for precisely that reason (brick://aabc9336).
+ *
  * If you add a further record-deleting path TO THE CLI, it needs a manifest
  * write and `MANIFEST_COVERS` needs its name.
  */
