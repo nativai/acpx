@@ -7,8 +7,7 @@ import { resolveAcpxUiBaseUrl } from "../../acp/auth-env.js";
  * The deletion manifest — acpx's record of its own destructive acts.
  *
  * Written WRITE-AHEAD by both CLI paths that destroy a session record, and by
- * no other CLI path (see the scope note below — one maintenance script under
- * `scripts/` is deliberately outside this). It exists because the store's accidental leftovers were being read as
+ * no other CLI path. It exists because the store's accidental leftovers were being read as
  * evidence: three hard-deleted sessions that survived as a timestamps sidecar
  * plus an owner log were filed as records that had *vanished*, which seeded a
  * whole "record-loss platform class" investigation (brick://29eaff14). The
@@ -20,19 +19,12 @@ import { resolveAcpxUiBaseUrl } from "../../acp/auth-env.js";
  * perform. A prune-only manifest would not have recorded the case that
  * motivated it.
  *
- * ⚠️ "THE CLI" IS THE HONEST SCOPE, and an earlier version of this comment
- * over-claimed it as "every deletion acpx can perform". That was false:
- * `scripts/cleanup-ghost-sessions.ts` (its `--apply` loop, `tryUnlink` on
- * `c.jsonPath`) is a THIRD path that unlinks session records and writes NO
- * manifest line. It is deliberately OUT of coverage here — a maintenance script
- * whose obsolescence is being weighed separately (brick://aabc9336) — not an
- * oversight to fix in passing.
+ * A record deleter written outside the CLI is out of manifest coverage by
+ * construction — do not write one; this file's --apply predecessor was retired
+ * for precisely that reason (brick://aabc9336).
  *
- * The DESIGN is unharmed by that: a manifest at both CLI call sites still covers
- * every deletion the acpx CLI can perform, which is the claim the collapse
- * argument actually needs. It was the SENTENCE that was over-scoped, not the
- * mechanism. If you add a further record-deleting path TO THE CLI, it needs a
- * manifest write and `MANIFEST_COVERS` needs its name.
+ * If you add a further record-deleting path TO THE CLI, it needs a manifest
+ * write and `MANIFEST_COVERS` needs its name.
  */
 
 /**

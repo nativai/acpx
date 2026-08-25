@@ -799,13 +799,6 @@ async function unlinkIfPresent(filePath: string): Promise<void> {
  * would have been exactly as hard. If you add a further record-deleting path TO
  * THE CLI, it needs a manifest write too, and `MANIFEST_COVERS` needs its name.
  *
- * ⚠️ "THE CLI" is the honest scope and this comment used to omit it, claiming
- * acpx's "ONLY TWO" outright. `scripts/cleanup-ghost-sessions.ts:403` already
- * unlinks session records with no manifest line, so the old wording instructed
- * the next maintainer from a false premise — and retroactively, warning about a
- * third path that already existed. That script is OUT of manifest coverage on
- * purpose (brick://aabc9336); do not add a manifest write to it here.
- *
  * Takes the INDEX ENTRY rather than a bare id because the manifest records the
  * session's identity and `SessionIndexEntry` carries no `createdAt`/`closedAt` —
  * `pickLatestTemplate` already has the entry in hand, so the record is loaded
