@@ -192,52 +192,51 @@ function mergeLatestDurableSessionOptions(
 
 type DurableSessionOptions = NonNullable<SessionAcpxState["session_options"]>;
 
+/**
+ * The durable session_options fields a disk-side write must be able to push past
+ * a stale in-flight-turn snapshot (brick://07dd62c9).
+ *
+ * ⚠️ ONE list, deliberately, feeding BOTH the overlay and the has-any predicate
+ * below. They are a matched pair: the predicate gates whether the overlay runs at
+ * all, so a field added to the overlay alone is a silent no-op for any change
+ * that touches ONLY that field — visible in exactly one state, which is the state
+ * nobody writes a test for (brick://67d2fd2f is this class). Sharing the list
+ * makes that divergence unrepresentable rather than merely discouraged.
+ *
+ * Adding a field here is the whole edit; there is no second place to update.
+ */
+const DURABLE_OVERLAY_FIELDS = [
+  "model",
+  // model_source rides alongside `model` so a provenance change carries too
+  // (brick://5bac5564 Layer C).
+  "model_source",
+  "effort",
+  // brick://874fee67: a disk-side `set outputStyle` during an in-flight turn must
+  // beat the stale turn snapshot, exactly as `effort` does.
+  "output_style",
+  "auto_failover",
+  "floor_hard",
+  "auto_subscription",
+  "fable_degrade_ok",
+] as const satisfies ReadonlyArray<keyof DurableSessionOptions>;
+
 function overlayDurableSessionOptionFields(
   merged: DurableSessionOptions,
   latest: DurableSessionOptions,
 ): void {
-  if (latest.model !== undefined) {
-    merged.model = latest.model;
-  }
-  if (latest.model_source !== undefined) {
-    merged.model_source = latest.model_source;
-  }
-  if (latest.effort !== undefined) {
-    merged.effort = latest.effort;
-  }
-  // brick://874fee67: a disk-side `set outputStyle` during an in-flight turn must
-  // beat the stale turn snapshot, exactly as `effort` does. Miss the paired
-  // predicate below and this overlay never runs for a style-only change.
-  if (latest.output_style !== undefined) {
-    merged.output_style = latest.output_style;
-  }
-  if (latest.auto_failover !== undefined) {
-    merged.auto_failover = latest.auto_failover;
-  }
-  if (latest.floor_hard !== undefined) {
-    merged.floor_hard = latest.floor_hard;
-  }
-  if (latest.auto_subscription !== undefined) {
-    merged.auto_subscription = latest.auto_subscription;
-  }
-  if (latest.fable_degrade_ok !== undefined) {
-    merged.fable_degrade_ok = latest.fable_degrade_ok;
+  for (const field of DURABLE_OVERLAY_FIELDS) {
+    const value = latest[field];
+    if (value !== undefined) {
+      // `field` is a known key and the value came from the same slot on `latest`,
+      // so the assignment is type-correct; the heterogeneous field union defeats a
+      // direct typed assignment, so index via an unknown-valued view (not `any`).
+      (merged as Record<string, unknown>)[field] = value;
+    }
   }
 }
 
-function hasLatestDurableSessionOptions(
-  latest: NonNullable<SessionAcpxState["session_options"]>,
-): boolean {
-  return (
-    latest.model !== undefined ||
-    latest.model_source !== undefined ||
-    latest.effort !== undefined ||
-    latest.output_style !== undefined ||
-    latest.auto_failover !== undefined ||
-    latest.floor_hard !== undefined ||
-    latest.auto_subscription !== undefined ||
-    latest.fable_degrade_ok !== undefined
-  );
+function hasLatestDurableSessionOptions(latest: DurableSessionOptions): boolean {
+  return DURABLE_OVERLAY_FIELDS.some((field) => latest[field] !== undefined);
 }
 
 export function getDesiredModelId(state: SessionAcpxState | undefined): string | undefined {

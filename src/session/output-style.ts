@@ -106,8 +106,10 @@ export function appliedOutputStyle(record: SessionRecord): string | undefined {
  * expressions disagree — which is the state nobody tests.
  */
 export function outputStyleChangePending(record: SessionRecord): boolean {
-  return normalizeOutputStyle(desiredOutputStyle(record)) !==
-    normalizeOutputStyle(appliedOutputStyle(record));
+  return (
+    normalizeOutputStyle(desiredOutputStyle(record)) !==
+    normalizeOutputStyle(appliedOutputStyle(record))
+  );
 }
 
 /**

@@ -2876,6 +2876,10 @@ test("AcpRuntimeManager forwards sessionOptions to createClient on fresh session
     subscription: undefined,
     profile: undefined,
     effort: undefined,
+    // brick://874fee67 — persistedSessionOptions builds one object literal, so
+    // every key it knows is an own-key regardless of whether a value was passed.
+    // These whole-object assertions exist to make a newly-persisted field visible.
+    output_style: undefined,
   });
 });
 
@@ -2949,6 +2953,10 @@ test("AcpRuntimeManager persists sessionOptions { append } and model/allowedTool
     subscription: undefined,
     profile: undefined,
     effort: undefined,
+    // brick://874fee67 — persistedSessionOptions builds one object literal, so
+    // every key it knows is an own-key regardless of whether a value was passed.
+    // These whole-object assertions exist to make a newly-persisted field visible.
+    output_style: undefined,
   });
 });
 
@@ -2970,6 +2978,10 @@ test("persistSessionOptions preserves an explicit empty allowedTools list", () =
     subscription: undefined,
     profile: undefined,
     effort: undefined,
+    // brick://874fee67 — persistedSessionOptions builds one object literal, so
+    // every key it knows is an own-key regardless of whether a value was passed.
+    // These whole-object assertions exist to make a newly-persisted field visible.
+    output_style: undefined,
   });
 });
 

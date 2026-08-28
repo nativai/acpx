@@ -377,9 +377,7 @@ function promptImageSupportedFromRecord(record: SessionRecord): boolean | undefi
 // a not-yet-updated adapter, where agent-type sniffing would say "claude →
 // supported" and show a control that does nothing (design §6). Absent
 // config_options is UNKNOWN (undefined), not "unsupported".
-function outputStyleSupportedFromRecord(
-  acpx: SessionRecord["acpx"],
-): boolean | undefined {
+function outputStyleSupportedFromRecord(acpx: SessionRecord["acpx"]): boolean | undefined {
   const advertised = acpx?.config_options;
   if (!Array.isArray(advertised)) {
     return undefined;

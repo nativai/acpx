@@ -79,6 +79,16 @@ export type ConnectAndLoadSessionOptions = {
   onClientAvailable?: (controller: ConnectedSessionController) => void;
   onConnectedRecord?: (record: SessionRecord) => void;
   onSessionIdResolved?: (sessionId: string) => void;
+  /**
+   * brick://874fee67 — the output style the client was CONSTRUCTED with, so this
+   * function can stamp `acpx.applied_output_style` with the same value the
+   * session/new + resume `_meta` were composed from.
+   *
+   * Passed in rather than read back off the client on purpose: the caller holds
+   * the one `sessionOptions` object it hands to both, so the two cannot diverge,
+   * and `AcpClient` keeps the surface its many test doubles already implement.
+   */
+  outputStyle?: string;
 };
 
 export type ConnectAndLoadSessionResult = {
@@ -451,7 +461,7 @@ export async function connectAndLoadSession(
   // owner resumes with `desired`, stamps it here as `applied`, and
   // `outputStyleChangePending` goes false — so the next turn boundary does not
   // recycle again.
-  stampAppliedOutputStyle(record, client.getSessionOutputStyle());
+  stampAppliedOutputStyle(record, options.outputStyle);
 
   const replayResult = await replayReconnectedSessionPreferences({
     client,

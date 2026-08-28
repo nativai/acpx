@@ -43,11 +43,11 @@ import { sessionOptionsFromRecord } from "../runtime/engine/session-options.js";
 import { exportSession } from "../session/export.js";
 import { importSession } from "../session/import.js";
 import { getDesiredConfigOptions } from "../session/mode-preference.js";
+import { guardImplicitFable, resolveSpawnModelSource } from "../session/model-guard.js";
 import {
   assertOutputStyleSupportedForRecord,
   OUTPUT_STYLE_CONFIG_ID,
 } from "../session/output-style.js";
-import { guardImplicitFable, resolveSpawnModelSource } from "../session/model-guard.js";
 import {
   findGitRepositoryRoot,
   findSession,
@@ -308,15 +308,11 @@ export async function handleListOutputStyles(
     return;
   }
   if (!result.supported) {
-    process.stderr.write(
-      `[acpx] agent "${agent.agentName}" does not support output styles\n`,
-    );
+    process.stderr.write(`[acpx] agent "${agent.agentName}" does not support output styles\n`);
     return;
   }
   for (const style of result.available) {
-    process.stdout.write(
-      `${style === result.current ? "* " : "  "}${style}\n`,
-    );
+    process.stdout.write(`${style === result.current ? "* " : "  "}${style}\n`);
   }
 }
 

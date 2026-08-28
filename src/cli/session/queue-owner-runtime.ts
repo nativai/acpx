@@ -16,12 +16,12 @@ import {
   sessionOptionsFromRecord,
 } from "../../runtime/engine/session-options.js";
 import { SessionEventWriter } from "../../session/events.js";
+import { outputStyleChangePending } from "../../session/output-style.js";
 import {
   ownerOptionsToInput,
   persistSessionOwnerOptions,
   resolveSessionOwnerOptions,
 } from "../../session/owner-options.js";
-import { outputStyleChangePending } from "../../session/output-style.js";
 import {
   absolutePath,
   flushPendingSessionIndexUpdates,
@@ -482,10 +482,7 @@ function parseEnvMs(raw: string | undefined): number | undefined {
 //     style is only honoured through the adapter's creation settings, so the only
 //     way to adopt a new one is to let this owner go and have the next prompt
 //     cold-spawn a fresh one that resumes with it.
-export type IdleOwnerReleaseReason =
-  | "output-style-change"
-  | "deploy-staleness"
-  | "idle-memory";
+export type IdleOwnerReleaseReason = "output-style-change" | "deploy-staleness" | "idle-memory";
 
 export type IdleOwnerReleaseDecision =
   | { release: false }

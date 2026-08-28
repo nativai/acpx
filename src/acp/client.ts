@@ -1288,16 +1288,6 @@ export class AcpClient {
     };
   }
 
-  /**
-   * The output style this client's queries are being BUILT with — the single
-   * value both the `session/new` `_meta` and the resume `_meta` are composed
-   * from. Read it to stamp `acpx.applied_output_style` so "applied" is, by
-   * construction, the same value that was sent rather than a re-derivation of it.
-   */
-  getSessionOutputStyle(): string | undefined {
-    return this.options.sessionOptions?.outputStyle;
-  }
-
   private mergeContextWindowHint(
     meta: Record<string, unknown> | undefined,
     hint: number | undefined,

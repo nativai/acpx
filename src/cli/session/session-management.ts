@@ -15,11 +15,6 @@ import {
   persistRequestedOutputStyle,
 } from "../../session/config-option-application.js";
 import { applyConfigOptionsToRecord } from "../../session/config-options.js";
-import {
-  availableOutputStyles,
-  findAdvertisedOutputStyleOption,
-  stampAppliedOutputStyle,
-} from "../../session/output-style.js";
 import { createSessionConversation } from "../../session/conversation-model.js";
 import { withDefaultModelForNewSession } from "../../session/default-model.js";
 import { defaultSessionEventLog } from "../../session/event-log.js";
@@ -33,6 +28,11 @@ import {
   mirrorModelGuardToMessages,
   stampModelGuardBreadcrumb,
 } from "../../session/model-guard.js";
+import {
+  availableOutputStyles,
+  findAdvertisedOutputStyleOption,
+  stampAppliedOutputStyle,
+} from "../../session/output-style.js";
 import { persistSessionOwnerOptions } from "../../session/owner-options.js";
 import {
   absolutePath,
@@ -614,7 +614,10 @@ export async function listAgentOutputStyles(
   });
   try {
     await withTimeout(client.start(), options.timeoutMs);
-    const created = await withTimeout(client.createSession(absolutePath(options.cwd)), options.timeoutMs);
+    const created = await withTimeout(
+      client.createSession(absolutePath(options.cwd)),
+      options.timeoutMs,
+    );
     return outputStyleListFromAdvertised(created.configOptions);
   } finally {
     await client.close().catch(() => {

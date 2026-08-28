@@ -244,7 +244,6 @@ test("P2 #7: normalizeOwnerIdleReleaseMs applies default and edge-case normaliza
   assert.equal(normalizeOwnerIdleReleaseMs(30_000), 30_000);
 });
 
-
 // brick://874fee67 — the output-style release reason. Path (B): an owner that is
 // idle and never receives another prompt would otherwise hold the stale style
 // forever, and the user's change would appear to have done nothing.

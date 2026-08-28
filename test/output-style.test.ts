@@ -13,11 +13,13 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import type { SessionConfigOption } from "@agentclientprotocol/sdk";
 import {
   withInheritedOutputStyle,
   withInheritedReasoningEffort,
 } from "../src/cli/session/inherited-metadata.js";
 import { createFileSessionStore } from "../src/runtime.js";
+import { AcpRuntimeManager } from "../src/runtime/engine/manager.js";
 import {
   mergeSessionOptions,
   persistSessionOptions,
@@ -43,9 +45,12 @@ import {
   toSessionIndexEntry,
   writeSessionIndex,
 } from "../src/session/persistence/index.js";
-import type { SessionConfigOption } from "@agentclientprotocol/sdk";
 import type { SessionAcpxState, SessionRecord } from "../src/types.js";
-import { makeSessionRecord } from "./runtime-test-helpers.js";
+import {
+  createRuntimeOptions,
+  InMemorySessionStore,
+  makeSessionRecord,
+} from "./runtime-test-helpers.js";
 
 const STYLE = "Operator Report";
 // A second style whose name contains a space AND non-uniform casing, so any
@@ -81,7 +86,7 @@ function styledRecord(overrides: Partial<SessionAcpxState> = {}): SessionRecord 
 // The derived predicate (the whole state model)
 // ---------------------------------------------------------------------------
 
-test("normalize: absent and the literal \"default\" are the SAME state", () => {
+test('normalize: absent and the literal "default" are the SAME state', () => {
   assert.equal(normalizeOutputStyle(undefined), normalizeOutputStyle("default"));
   // ...and neither is confused with a real style.
   assert.notEqual(normalizeOutputStyle(undefined), normalizeOutputStyle(STYLE));
@@ -117,7 +122,7 @@ test("pending is FALSE on a legacy record with neither field (back-compat)", () 
   assert.equal(outputStyleChangePending(record), false);
 });
 
-test("pending is FALSE for an unstyled session whose applied was stamped \"default\"", () => {
+test('pending is FALSE for an unstyled session whose applied was stamped "default"', () => {
   const record = styledRecord({
     session_options: { model: "opus" },
     applied_output_style: "default",
@@ -147,7 +152,7 @@ test("AC-TB5: a second change while pending simply replaces the desired value", 
   assert.equal(outputStyleChangePending(record), true);
 });
 
-test("stamp writes applied unconditionally, normalizing absent to \"default\"", () => {
+test('stamp writes applied unconditionally, normalizing absent to "default"', () => {
   const record = styledRecord();
   stampAppliedOutputStyle(record, undefined);
   // NOT left absent: an absent applied on a live session is indistinguishable
@@ -368,19 +373,14 @@ test("index projection: support is THREE-valued and derived from the advertiseme
   );
   // Advertises OTHER options but not this one → genuinely unsupported (codex).
   assert.equal(
-    toSessionIndexEntry(
-      styledRecord({ config_options: [advertisedOption("effort")] }),
-      "f.json",
-    ).outputStyleSupported,
+    toSessionIndexEntry(styledRecord({ config_options: [advertisedOption("effort")] }), "f.json")
+      .outputStyleSupported,
     false,
   );
   // Never captured config_options at all → UNKNOWN, and it must stay undefined.
   // Rendering unknown as "supported" gives a control that silently does nothing;
   // rendering it as "unsupported" hides a working feature.
-  assert.equal(
-    toSessionIndexEntry(styledRecord(), "f.json").outputStyleSupported,
-    undefined,
-  );
+  assert.equal(toSessionIndexEntry(styledRecord(), "f.json").outputStyleSupported, undefined);
 });
 
 // ---------------------------------------------------------------------------
@@ -543,4 +543,99 @@ test("inheritance: the helper behaves exactly like its effort sibling", () => {
       withInheritedReasoningEffort(child, parent),
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// The fresh-create seed leg (found UNCOVERED by the mutation probe, not by review)
+// ---------------------------------------------------------------------------
+//
+// A fresh-create respawn (reset_on_next_ensure / recover / resume-id mismatch)
+// rebuilds the record from scratch, so the persist-time breadcrumb carry-forward
+// has no prior session_options to read — the style has to be SEEDED from the
+// prior on-disk record. Without it a style set via `set outputStyle` silently
+// reverts across a TTL reap, which is the same class of silent revert the
+// carry-forward exists for.
+//
+// SCOPE: these drive the real `ensureSession` path but through an in-memory
+// store, so they prove the SEEDING DECISION only. The disk fidelity of the value
+// they seed is covered separately by the real FileSessionStore round-trip above —
+// an in-memory store never exercises parse and would false-pass that leg.
+
+function freshCreateManager(store: InMemorySessionStore): AcpRuntimeManager {
+  return new AcpRuntimeManager(createRuntimeOptions({ cwd: "/workspace", sessionStore: store }), {
+    clientFactory: () =>
+      ({
+        initializeResult: { protocolVersion: 1, agentCapabilities: { loadSession: true } },
+        start: async () => {},
+        close: async () => {},
+        createSession: async () => ({ sessionId: "os-new-sid", agentSessionId: "os-agent" }),
+        loadSession: async () => ({ agentSessionId: "unused" }),
+        hasReusableSession: () => false,
+        supportsLoadSession: () => true,
+        supportsResumeSession: () => false,
+        loadSessionWithOptions: async () => ({ agentSessionId: "unused" }),
+        getAgentLifecycleSnapshot: () => ({ running: true }),
+        prompt: async () => ({ stopReason: "end_turn" }),
+        requestCancelActivePrompt: async () => false,
+        hasActivePrompt: () => false,
+        setSessionMode: async () => {},
+        setSessionConfigOption: async () => {},
+        clearEventHandlers: () => {},
+        setEventHandlers: () => {},
+      }) as never,
+  });
+}
+
+function priorStyledRecord(
+  sessionOptions: NonNullable<SessionRecord["acpx"]>["session_options"],
+): SessionRecord {
+  return makeSessionRecord({
+    acpxRecordId: "os-respawn",
+    acpSessionId: "os-respawn-sid",
+    agentCommand: "codex --acp",
+    cwd: "/workspace",
+    acpx: { reset_on_next_ensure: true, session_options: sessionOptions },
+  });
+}
+
+function ensureRespawn(
+  manager: AcpRuntimeManager,
+  sessionOptions?: Parameters<AcpRuntimeManager["ensureSession"]>[0]["sessionOptions"],
+): Promise<SessionRecord> {
+  return manager.ensureSession({
+    sessionKey: "os-respawn",
+    agent: "codex",
+    mode: "persistent",
+    sessionOptions,
+  });
+}
+
+test("seed: a fresh-create respawn preserves output_style when the spawn flags omit it", async () => {
+  const store = new InMemorySessionStore([
+    priorStyledRecord({ output_style: STYLE, profile: "sub6" }),
+  ]);
+  const record = await ensureRespawn(freshCreateManager(store), { profile: "sub6" });
+  assert.equal(record.acpx?.session_options?.output_style, STYLE);
+  const saved = await store.load("os-respawn");
+  assert.equal(saved?.acpx?.session_options?.output_style, STYLE);
+});
+
+test("seed: an explicit spawn --output-style still wins over the prior pin", async () => {
+  const store = new InMemorySessionStore([
+    priorStyledRecord({ output_style: STYLE, profile: "sub6" }),
+  ]);
+  const record = await ensureRespawn(freshCreateManager(store), {
+    profile: "sub6",
+    outputStyle: OTHER_STYLE,
+  });
+  assert.equal(record.acpx?.session_options?.output_style, OTHER_STYLE);
+});
+
+test("seed: a genuinely NEW session gets no output_style (the cascade governs)", async () => {
+  const record = await ensureRespawn(freshCreateManager(new InMemorySessionStore()), {
+    profile: "sub6",
+  });
+  // Absent must stay absent — writing "default" here would convert unset into an
+  // explicit pin and permanently defeat any future box- or role-level default.
+  assert.equal(record.acpx?.session_options?.output_style, undefined);
 });

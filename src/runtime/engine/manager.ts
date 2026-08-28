@@ -288,19 +288,21 @@ function pinFieldsToSeed(
   record: SessionRecord,
   opts: SessionAgentOptions | undefined,
 ): SeedableSessionOptionField[] {
-  const { model, effort, output_style: outputStyle } = record.acpx?.session_options ?? {};
+  const stored = record.acpx?.session_options ?? {};
   const provided = opts ?? {};
-  const fields: SeedableSessionOptionField[] = [];
-  if (provided.model === undefined && model === undefined) {
-    fields.push("model");
-  }
-  if (provided.reasoningEffort === undefined && effort === undefined) {
-    fields.push("effort");
-  }
-  if (provided.outputStyle === undefined && outputStyle === undefined) {
-    fields.push("output_style");
-  }
-  return fields;
+  // Each row pairs the persisted key with the spawn-option that would supersede
+  // it. Table-driven so adding a pin is one row rather than another branch — and
+  // so the "seed only when BOTH are absent" rule is stated once instead of
+  // re-typed per field, where one copy could drift.
+  const pins = [
+    ["model", provided.model, stored.model],
+    ["effort", provided.reasoningEffort, stored.effort],
+    // brick://874fee67
+    ["output_style", provided.outputStyle, stored.output_style],
+  ] as const satisfies ReadonlyArray<readonly [SeedableSessionOptionField, unknown, unknown]>;
+  return pins.flatMap(([field, fromFlag, fromRecord]) =>
+    fromFlag === undefined && fromRecord === undefined ? [field] : [],
+  );
 }
 
 // Copy one durable field from the prior options onto the carried options. Returns

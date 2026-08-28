@@ -602,10 +602,11 @@ export class OutputStyleNotSupportedError extends AcpxOperationalError {
  */
 export class OutputStyleUnknownError extends AcpxOperationalError {
   constructor(requested: string, available: string[]) {
-    super(
-      `Unknown output style "${requested}"; this session offers: ${available.join(", ")}.`,
-      { outputCode: "USAGE", detailCode: "UNKNOWN_OUTPUT_STYLE", origin: "queue" },
-    );
+    super(`Unknown output style "${requested}"; this session offers: ${available.join(", ")}.`, {
+      outputCode: "USAGE",
+      detailCode: "UNKNOWN_OUTPUT_STYLE",
+      origin: "queue",
+    });
   }
 }
 

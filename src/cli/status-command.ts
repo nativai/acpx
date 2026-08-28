@@ -9,9 +9,9 @@ import {
   isSubscriptionLocked,
   loadSubscriptionRegistry,
 } from "../config/subscriptions.js";
+import { outputStyleChangePending } from "../session/output-style.js";
 import { findSession, resolveGlobalSessionByName } from "../session/persistence.js";
 import type { SessionRecord } from "../types.js";
-import { outputStyleChangePending } from "../session/output-style.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import {
   addSessionNameOption,
@@ -233,6 +233,23 @@ function subscriptionStatusCredential(subscriptionId: string): StatusCredentialP
     locked: isSubscriptionLocked(subscription, registry),
     ...(subscription.lockedAt !== undefined ? { lockedAt: subscription.lockedAt } : {}),
   };
+}
+
+// brick://874fee67 — DESIRED and APPLIED are printed as two separate lines on
+// purpose. Collapsing them into one would hide precisely the state this feature
+// has to be honest about: a change that is persisted but not yet in force,
+// because the query the agent is running was built with the old style.
+function printOutputStyleStatus(payload: {
+  outputStyle: string | null;
+  outputStyleApplied: string | null;
+  outputStylePending: boolean;
+}): void {
+  process.stdout.write(`outputStyle: ${orDash(payload.outputStyle)}\n`);
+  process.stdout.write(
+    `outputStyleApplied: ${orDash(payload.outputStyleApplied)}${
+      payload.outputStylePending ? " (pending: restarts at the end of this turn)" : ""
+    }\n`,
+  );
 }
 
 function statusCredential(record: SessionRecord): StatusCredentialPayload | null {
@@ -460,12 +477,7 @@ function printTextStatus(payload: StatusPayload, dead: boolean): void {
   process.stdout.write(`mode: ${orDash(payload.mode)}\n`);
   process.stdout.write(`reasoningEffort: ${orDash(payload.reasoningEffort)}\n`);
   process.stdout.write(`reasoningEffortLive: ${orDash(payload.reasoningEffortLive)}\n`);
-  process.stdout.write(`outputStyle: ${orDash(payload.outputStyle)}\n`);
-  process.stdout.write(
-    `outputStyleApplied: ${orDash(payload.outputStyleApplied)}${
-      payload.outputStylePending ? " (pending: restarts at the end of this turn)" : ""
-    }\n`,
-  );
+  printOutputStyleStatus(payload);
   process.stdout.write(`autoFailover: ${payload.autoFailover ? "on" : "off"}\n`);
   process.stdout.write(`autoSubscription: ${payload.autoSubscription ? "on" : "off"}\n`);
   process.stdout.write(`fableDegradeOk: ${payload.fableDegradeOk ? "on" : "off"}\n`);
