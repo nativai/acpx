@@ -52,6 +52,16 @@ export type GlobalFlags = PermissionFlags & {
   // minimal/low/medium/high). Typed as string (not ReasoningEffort) because OR
   // profiles add 'minimal' which is outside Claude's set.
   reasoningEffort?: string;
+  /**
+   * `--output-style <name>` (brick://874fee67): the Claude Code output style for
+   * this session. OPAQUE non-empty string at parse time — the style's `name:`
+   * frontmatter, which may contain spaces and is NOT uniformly cased (`default`
+   * is lowercase beside `Proactive`/`Explanatory`/`Learning`). Deliberately NOT
+   * an enum: custom/house styles are discovered at runtime, so the only valid
+   * list is the harness's own `available_output_styles`, checked at the
+   * advertised-option boundary — never here.
+   */
+  outputStyle?: string;
   subscription?: string;
   /** Profile id from `--profile <id>` — stored as session_options.profile. */
   profile?: string;
@@ -476,6 +486,15 @@ export function addGlobalFlags(command: Command): Command {
       parseReasoningEffort,
     )
     .option(
+      "--output-style <name>",
+      "Claude Code output style for the session (e.g. Explanatory, Learning, or a " +
+        "custom/house style name). Sets the agent's role, tone and default response " +
+        "format. Durable per-session and inherited by child sessions of the same " +
+        "agent type. (Ignored with a warning by agents that do not advertise an " +
+        "output-style option, e.g. codex.)",
+      (value: string) => parseNonEmptyValue("Output style", value),
+    )
+    .option(
       "--subscription <id>",
       "Claude subscription id from the subscriptions registry (sets CLAUDE_CONFIG_DIR per session); " +
         "pass 'auto' to let acpx pick the best-available unlocked subscription",
@@ -671,6 +690,7 @@ export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig)
     format,
     model: resolveModelOption(opts.model),
     reasoningEffort: resolveReasoningEffortOption(opts.reasoningEffort),
+    outputStyle: resolveOutputStyleOption(opts.outputStyle),
     subscription: resolveSubscriptionOption(opts.subscription),
     profile: resolveProfileOption(opts.profile),
     allowedTools: stringArrayOption(opts.allowedTools),
@@ -765,6 +785,15 @@ function resolveProfileOption(value: unknown): string | undefined {
 // any path that reads the option without the parser attached).
 function resolveReasoningEffortOption(value: unknown): string | undefined {
   return typeof value === "string" ? parseReasoningEffort(value) : undefined;
+}
+
+// The value domain is OPEN (custom + house styles are discovered at runtime), so
+// this only enforces non-emptiness. Validation against the real set happens where
+// the set actually exists — against the agent's advertised `available_output_styles`
+// (brick://874fee67 design §3.1/AC-5). Never lowercase or slugify here.
+function resolveOutputStyleOption(value: unknown): string | undefined {
+  const outputStyle = stringOption(value);
+  return outputStyle === undefined ? undefined : parseNonEmptyValue("Output style", outputStyle);
 }
 
 export function resolveOutputPolicy(format: OutputFormat, jsonStrict: boolean): OutputPolicy {

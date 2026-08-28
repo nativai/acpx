@@ -321,6 +321,11 @@ function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
   assignDesiredConfigOptions(state, record.desired_config_options);
 
   assignStringState(state, "current_model_id", record.current_model_id);
+  // brick://874fee67: applied_output_style is acpx-level runtime state (like
+  // current_model_id), NOT a session_option. It MUST round-trip on a cold reload:
+  // it is one half of the derived `pending` predicate, and an owner respawn that
+  // loses it reads as "unknown" and forces a spurious recycle.
+  assignStringState(state, "applied_output_style", record.applied_output_style);
 
   // Fix A (brick 92a994a0): the persisted authoritative context window + its
   // model tag MUST round-trip back on a cold disk reload, or every owner
@@ -432,7 +437,12 @@ function assignBooleanTrue(
 
 function assignStringState(
   state: SessionAcpxState,
-  key: "current_mode_id" | "desired_mode_id" | "current_model_id" | "context_window_model_id",
+  key:
+    | "current_mode_id"
+    | "desired_mode_id"
+    | "current_model_id"
+    | "context_window_model_id"
+    | "applied_output_style",
   value: unknown,
 ): void {
   if (typeof value === "string") {
@@ -478,6 +488,7 @@ function assignParsedSessionOptions(state: SessionAcpxState, raw: unknown): void
   assignSessionOptionSubscription(parsedSessionOptions, sessionOptions.subscription);
   assignSessionOptionProfile(parsedSessionOptions, sessionOptions.profile);
   assignSessionOptionEffort(parsedSessionOptions, sessionOptions.effort);
+  assignSessionOptionOutputStyle(parsedSessionOptions, sessionOptions.output_style);
   assignSessionOptionAutoFailover(parsedSessionOptions, sessionOptions.auto_failover);
   assignSessionOptionFloorHard(parsedSessionOptions, sessionOptions.floor_hard);
   assignSessionOptionAutoSubscription(parsedSessionOptions, sessionOptions.auto_subscription);
@@ -736,6 +747,23 @@ function assignSessionOptionModelSource(
 ): void {
   if (typeof value === "string" && value.length > 0) {
     options.model_source = value;
+  }
+}
+
+// brick://874fee67 (design brick://4d16ab8b): output_style is a durable flat
+// string — same shape as model_source/effort. It MUST round-trip on a cold disk
+// reload, because the style only ever reaches Claude Code through the adapter's
+// CREATION settings (at spawn and at resume); a dropped value silently reverts
+// the session to the harness default on the next owner respawn.
+// The value is OPAQUE and may contain spaces — never slugged, enumerated or
+// case-folded here (`default` is lowercase while `Proactive`/`Explanatory`/
+// `Learning` are capitalised; a case-folding validator breaks one end or the other).
+function assignSessionOptionOutputStyle(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+  value: unknown,
+): void {
+  if (typeof value === "string" && value.length > 0) {
+    options.output_style = value;
   }
 }
 

@@ -88,6 +88,27 @@ export type SessionIndexEntry = {
   // (older record / capability not captured) → acpx-ui treats absent as off.
   promptImageSupported?: boolean;
   desiredEffort?: string;
+  // brick://874fee67 — projected so acpx-ui's hot-path (record-skipping) session
+  // rebuild shows the real style in the chat header instead of a UI default
+  // (the brick://4d517be2 failure class: passes typecheck+build, fails only at
+  // runtime). `outputStyle` is the DURABLE session_options value, not the live
+  // desired_config_options one — the durable field is what a respawn re-applies.
+  outputStyle?: string;
+  // Whether this session's agent advertises the `outputStyle` config option.
+  // THREE-VALUED ON PURPOSE: true / false / undefined = UNKNOWN (the record never
+  // captured config_options — an old session, or an adapter that predates the
+  // feature). Collapsing unknown into either neighbour produces either a control
+  // that silently does nothing or a hidden working feature (design §6).
+  outputStyleSupported?: boolean;
+  // The style the session's CURRENT LIVE QUERY was built with (acpx-level
+  // `applied_output_style`). Projected alongside `outputStyle` (the DESIRED
+  // value) because the two together are what the header renders: equal =
+  // installed, differing = a change is pending until the owner recycles. Without
+  // this on the hot path the chip cannot distinguish those states without a
+  // per-record read on every ~2 Hz list rebuild.
+  // ⚠️ This is OUR action record, never the harness `output_style` readback —
+  // keep the two names distinct all the way to the client (spec §7).
+  appliedOutputStyle?: string;
   autoFailover?: boolean;
   // brick://4d517be2 — projected so acpx-ui's hot-path (record-skipping) session
   // rebuild surfaces the two new policy toggles + the degrade marker in the chat
@@ -292,6 +313,12 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     sessionModel: optionalString(record.sessionModel),
     promptImageSupported: optionalBoolean(record.promptImageSupported),
     desiredEffort: optionalString(record.desiredEffort),
+    // brick://874fee67: BOTH index legs. This parser reconstructs an entry from
+    // index.json on reconcile — miss it and an acpx-ui-written entry is stripped
+    // on the next daemon rewrite, exactly as autoSubscription is parsed above.
+    outputStyle: optionalString(record.outputStyle),
+    outputStyleSupported: optionalBoolean(record.outputStyleSupported),
+    appliedOutputStyle: optionalString(record.appliedOutputStyle),
     autoFailover: optionalBoolean(record.autoFailover),
     autoSubscription: optionalBoolean(record.autoSubscription),
     fableDegradeOk: optionalBoolean(record.fableDegradeOk),
@@ -345,6 +372,21 @@ function promptImageSupportedFromRecord(record: SessionRecord): boolean | undefi
   return typeof image === "boolean" ? image : undefined;
 }
 
+// brick://874fee67: support is derived from what the ADAPTER ADVERTISES, never
+// from the agent name — during a rollout an updated acpx-ui talks to sessions on
+// a not-yet-updated adapter, where agent-type sniffing would say "claude →
+// supported" and show a control that does nothing (design §6). Absent
+// config_options is UNKNOWN (undefined), not "unsupported".
+function outputStyleSupportedFromRecord(
+  acpx: SessionRecord["acpx"],
+): boolean | undefined {
+  const advertised = acpx?.config_options;
+  if (!Array.isArray(advertised)) {
+    return undefined;
+  }
+  return advertised.some((option) => option?.id === "outputStyle");
+}
+
 // eslint-disable-next-line complexity -- flat field-by-field projection of the optional hot-path enrichment scalars; linear, not branchy logic
 export function toSessionIndexEntry(record: SessionRecord, fileName: string): SessionIndexEntry {
   const acpx = record.acpx;
@@ -386,6 +428,9 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     sessionModel: sessionOptions?.model,
     promptImageSupported: promptImageSupportedFromRecord(record),
     desiredEffort: acpx?.desired_config_options?.effort,
+    outputStyle: sessionOptions?.output_style,
+    outputStyleSupported: outputStyleSupportedFromRecord(acpx),
+    appliedOutputStyle: acpx?.applied_output_style,
     autoFailover: sessionOptions?.auto_failover,
     autoSubscription: sessionOptions?.auto_subscription,
     fableDegradeOk: sessionOptions?.fable_degrade_ok,

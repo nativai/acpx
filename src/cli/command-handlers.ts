@@ -122,6 +122,7 @@ import {
   withInheritedAgentCommand,
   withInheritedModel,
   withInheritedProfile,
+  withInheritedOutputStyle,
   withInheritedReasoningEffort,
   withInheritedTaskFolder,
 } from "./session/inherited-metadata.js";
@@ -288,6 +289,7 @@ function sessionOptionsFromGlobalFlags(
     systemPrompt: globalFlags.systemPrompt,
     profile: unifiedSelection,
     reasoningEffort: globalFlags.reasoningEffort,
+    outputStyle: globalFlags.outputStyle,
     floorHard: globalFlags.floorHard,
   };
 }
@@ -460,6 +462,29 @@ function warnReasoningEffortIgnoredForNonClaude(
   );
 }
 
+// brick://874fee67: verbatim sibling of warnReasoningEffortIgnoredForNonClaude.
+// `--output-style` is meaningful only for agents that ADVERTISE an `outputStyle`
+// config option — claude and claude-pty today. On any other effective agent
+// (explicit codex, or a bare spawn that inherited a non-claude parent) nothing is
+// written and nothing is applied, so say so once on stderr — never an error, and
+// never a write (the advertisesConfigOption gate in the apply path enforces that).
+function warnOutputStyleIgnoredForNonClaude(
+  globalFlags: GlobalFlags,
+  effectiveAgentName: string,
+): void {
+  if (
+    !globalFlags.outputStyle ||
+    effectiveAgentName === "claude" ||
+    effectiveAgentName === "claude-pty" ||
+    globalFlags.jsonStrict
+  ) {
+    return;
+  }
+  process.stderr.write(
+    `[acpx] --output-style applies to claude; ignoring for agent "${effectiveAgentName}"\n`,
+  );
+}
+
 async function resolvePermissionPolicyFromFlags(
   globalFlags: GlobalFlags,
 ): Promise<PermissionPolicy | undefined> {
@@ -519,6 +544,13 @@ type ResolvedParentSession = {
   agentCommand?: string;
   model?: string;
   effort?: string;
+  /**
+   * brick://874fee67 — the parent's DURABLE `session_options.output_style`.
+   * Deliberately NOT `desired_config_options.outputStyle` (which is where
+   * `effort` above is snapshotted from): for output style the durable field is
+   * the settled truth and the live layer can be mid-flight (design #33).
+   */
+  outputStyle?: string;
 };
 
 // Snapshot the parent record's inheritable fields. Agent-type + model + effort
@@ -537,6 +569,7 @@ function parentInheritableFields(parent: SessionRecord): ResolvedParentSession {
     agentCommand: parent.agentCommand,
     model: sessionOptions?.model,
     effort: parent.acpx?.desired_config_options?.effort,
+    outputStyle: sessionOptions?.output_style,
   };
 }
 
@@ -653,6 +686,12 @@ function inheritedSpawnSessionOptions(
       globalFlags.reasoningEffort,
       sameAgentAsParent ? parent?.effort : undefined,
     ),
+    // brick://874fee67: same-agent gated exactly like model/effort — a Claude
+    // style must never reach a Codex child. An explicit --output-style always wins.
+    outputStyle: withInheritedOutputStyle(
+      globalFlags.outputStyle,
+      sameAgentAsParent ? parent?.outputStyle : undefined,
+    ),
     profile: inheritedProfileSelection(globalFlags, sameAgentAsParent, parent),
   };
 }
@@ -762,6 +801,14 @@ function sourceSessionOptions(source: SessionRecord) {
   if (reasoningEffort !== undefined) {
     sessionOptions.reasoningEffort = reasoningEffort;
   }
+  // brick://874fee67: sessionOptionsFromRecord already carries the DURABLE
+  // session_options.output_style. Overlay the live desired layer the same way
+  // effort does, so a style set on the source after its last persist still
+  // reaches the copy.
+  const outputStyle = getDesiredConfigOptions(source.acpx).outputStyle;
+  if (outputStyle !== undefined) {
+    sessionOptions.outputStyle = outputStyle;
+  }
   return Object.keys(sessionOptions).length > 0 ? sessionOptions : undefined;
 }
 
@@ -790,12 +837,16 @@ function applyCopyModelOverrides(
   merged: NonNullable<ReturnType<typeof sourceSessionOptions>>,
   model: string | undefined,
   reasoningEffort: string | undefined,
+  outputStyle: string | undefined,
 ): void {
   if (model !== undefined) {
     merged.model = model;
   }
   if (reasoningEffort !== undefined) {
     merged.reasoningEffort = reasoningEffort;
+  }
+  if (outputStyle !== undefined) {
+    merged.outputStyle = outputStyle;
   }
 }
 
@@ -825,6 +876,10 @@ function applyGuardedCopyModel(
     merged,
     guarded.model,
     withInheritedReasoningEffort(globalFlags.reasoningEffort, merged.reasoningEffort),
+    // brick://874fee67: an explicit --output-style must beat the template/source
+    // style on the copy path too, exactly as --reasoning-effort does. Without
+    // this the flag is silently swallowed by `sessions copy` / fork.
+    withInheritedOutputStyle(globalFlags.outputStyle, merged.outputStyle),
   );
   if (guarded.model !== undefined) {
     merged.modelSource = guarded.source;
@@ -855,9 +910,16 @@ function copyDesiredConfigOptionsWithOverride(
 ): Record<string, string> | undefined {
   const base = sourceDesiredConfigOptions(source);
   const effort = withInheritedReasoningEffort(globalFlags.reasoningEffort, base?.effort);
+  // brick://874fee67: mirror of the effort override — explicit --output-style
+  // wins over the template's baked-in style; byte-identical to the source when
+  // no flag is passed.
+  const outputStyle = withInheritedOutputStyle(globalFlags.outputStyle, base?.outputStyle);
   const merged = { ...base };
   if (effort !== undefined) {
     merged.effort = effort;
+  }
+  if (outputStyle !== undefined) {
+    merged.outputStyle = outputStyle;
   }
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
@@ -1300,6 +1362,7 @@ export async function handlePrompt(
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   warnReasoningEffortIgnoredForNonClaude(globalFlags, agent.agentName);
+  warnOutputStyleIgnoredForNonClaude(globalFlags, agent.agentName);
   const { printPromptSessionBanner, printQueuedPromptByFormat } = await loadOutputRenderModule();
   const selector = resolveSessionTargetSelector({ flags, command });
   const record = await findRoutedTargetSessionOrThrow(agent, selector);
@@ -1387,6 +1450,7 @@ export async function handleExec(
   });
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   warnReasoningEffortIgnoredForNonClaude(globalFlags, agent.agentName);
+  warnOutputStyleIgnoredForNonClaude(globalFlags, agent.agentName);
 
   const result = await runOnce({
     agentCommand: agent.agentCommand,
@@ -2356,6 +2420,7 @@ export async function handleSessionsNew(
     config,
   );
   warnReasoningEffortIgnoredForNonClaude(globalFlags, effectiveAgent.agentName);
+  warnOutputStyleIgnoredForNonClaude(globalFlags, effectiveAgent.agentName);
   const [{ createSession, closeSession }, { printCreatedSessionBanner, printNewSessionByFormat }] =
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
 
@@ -2743,6 +2808,7 @@ export async function handleSessionsEnsure(
     config,
   );
   warnReasoningEffortIgnoredForNonClaude(globalFlags, effectiveAgent.agentName);
+  warnOutputStyleIgnoredForNonClaude(globalFlags, effectiveAgent.agentName);
   const existing = await findSessionByDirectoryWalk({
     agentCommand: effectiveAgent.agentCommand,
     cwd: effectiveAgent.cwd,

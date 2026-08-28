@@ -248,7 +248,11 @@ type SeedableSessionOptionField =
   | "auto_subscription"
   | "fable_degrade_ok"
   | "model"
-  | "effort";
+  | "effort"
+  // brick://874fee67: output_style is a durable per-session pin — same seeding
+  // rule as model/effort (seed only when the spawn flag omits it AND the record
+  // carries no pin of its own).
+  | "output_style";
 
 // Which durable fields the incoming spawn options DON'T carry (so a prior value
 // must be seeded). model/effort are seeded ONLY when the record has no pin of its
@@ -284,7 +288,7 @@ function pinFieldsToSeed(
   record: SessionRecord,
   opts: SessionAgentOptions | undefined,
 ): SeedableSessionOptionField[] {
-  const { model, effort } = record.acpx?.session_options ?? {};
+  const { model, effort, output_style: outputStyle } = record.acpx?.session_options ?? {};
   const provided = opts ?? {};
   const fields: SeedableSessionOptionField[] = [];
   if (provided.model === undefined && model === undefined) {
@@ -292,6 +296,9 @@ function pinFieldsToSeed(
   }
   if (provided.reasoningEffort === undefined && effort === undefined) {
     fields.push("effort");
+  }
+  if (provided.outputStyle === undefined && outputStyle === undefined) {
+    fields.push("output_style");
   }
   return fields;
 }

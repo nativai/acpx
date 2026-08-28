@@ -83,6 +83,16 @@ export function setDesiredConfigOption(
     setSessionOptionEffort(acpx, value);
   }
 
+  // brick://874fee67: keep the DURABLE session_options.output_style in sync with
+  // the live desired_config_options.outputStyle, exactly as `effort` does above.
+  // Without this the live setter writes only the live layer and the next owner
+  // respawn — which rebuilds session_options from the spawn flags — silently
+  // reverts the style. The style reaches Claude Code ONLY through the adapter's
+  // creation settings, so that revert is a real behaviour change.
+  if (normalizedConfigId === "outputStyle") {
+    setSessionOptionOutputStyle(acpx, value);
+  }
+
   record.acpx = acpx;
 }
 
@@ -92,6 +102,21 @@ function setSessionOptionEffort(acpx: SessionAcpxState, value: string | undefine
     sessionOptions.effort = value;
   } else {
     delete sessionOptions.effort;
+  }
+
+  if (hasSessionOptions(sessionOptions)) {
+    acpx.session_options = sessionOptions;
+  } else {
+    delete acpx.session_options;
+  }
+}
+
+function setSessionOptionOutputStyle(acpx: SessionAcpxState, value: string | undefined): void {
+  const sessionOptions = { ...acpx.session_options };
+  if (typeof value === "string") {
+    sessionOptions.output_style = value;
+  } else {
+    delete sessionOptions.output_style;
   }
 
   if (hasSessionOptions(sessionOptions)) {
@@ -180,6 +205,12 @@ function overlayDurableSessionOptionFields(
   if (latest.effort !== undefined) {
     merged.effort = latest.effort;
   }
+  // brick://874fee67: a disk-side `set outputStyle` during an in-flight turn must
+  // beat the stale turn snapshot, exactly as `effort` does. Miss the paired
+  // predicate below and this overlay never runs for a style-only change.
+  if (latest.output_style !== undefined) {
+    merged.output_style = latest.output_style;
+  }
   if (latest.auto_failover !== undefined) {
     merged.auto_failover = latest.auto_failover;
   }
@@ -201,6 +232,7 @@ function hasLatestDurableSessionOptions(
     latest.model !== undefined ||
     latest.model_source !== undefined ||
     latest.effort !== undefined ||
+    latest.output_style !== undefined ||
     latest.auto_failover !== undefined ||
     latest.floor_hard !== undefined ||
     latest.auto_subscription !== undefined ||

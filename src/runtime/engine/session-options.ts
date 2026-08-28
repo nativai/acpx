@@ -21,6 +21,16 @@ export type SessionAgentOptions = {
   // survives a same-session re-create. Opaque string (an advertised effort
   // level), validated at the flag boundary and again against the advertised set.
   reasoningEffort?: string;
+  // Claude Code output style (the `outputStyle` config option), brick://874fee67
+  // (design brick://4d16ab8b). Persisted to disk as `session_options.output_style`
+  // (the durable end-to-end contract field a cold resume re-applies) AND, at the
+  // creation sites, as `acpx.desired_config_options.outputStyle` (live config +
+  // reconnect reapply). Carried forward across turns by mergeSessionOptions so a
+  // per-spawn style survives a same-session re-create. OPAQUE non-empty string —
+  // the style's `name:` frontmatter, which may contain spaces; validated at the
+  // flag boundary only against the harness's own `available_output_styles`, never
+  // against a hardcoded list and never case-folded.
+  outputStyle?: string;
   // Per-session automatic same-family credential failover policy. undefined =
   // enabled; explicit false is the only behavior-changing state.
   autoFailover?: boolean;
@@ -63,6 +73,7 @@ export function mergeSessionOptions(
     assignDefinedOption(merged, "subscription", preferred.subscription);
     assignDefinedOption(merged, "profile", preferred.profile);
     assignDefinedOption(merged, "reasoningEffort", preferred.reasoningEffort);
+    assignDefinedOption(merged, "outputStyle", preferred.outputStyle);
     assignDefinedOption(merged, "autoFailover", preferred.autoFailover);
     assignDefinedOption(merged, "floorHard", preferred.floorHard);
     assignDefinedOption(merged, "autoSubscription", preferred.autoSubscription);
@@ -125,6 +136,7 @@ type SessionOptionBreadcrumbs = {
   model: PersistedSessionOptions["model"];
   modelSource: PersistedSessionOptions["model_source"];
   effort: PersistedSessionOptions["effort"];
+  outputStyle: PersistedSessionOptions["output_style"];
 };
 
 function sessionOptionBreadcrumbs(record: SessionRecord): SessionOptionBreadcrumbs {
@@ -142,6 +154,7 @@ function sessionOptionBreadcrumbs(record: SessionRecord): SessionOptionBreadcrum
     model: stored.model,
     modelSource: stored.model_source,
     effort: stored.effort,
+    outputStyle: stored.output_style,
   };
 }
 
@@ -211,6 +224,13 @@ function carryDurableIfUnset(
   // reuse-branch clobber-guard/apply-guard lose the explicit-vs-implicit signal.
   carryIfUnset(target, "model_source", breadcrumbs.modelSource);
   carryIfUnset(target, "effort", breadcrumbs.effort);
+  // brick://874fee67: output_style is durable per-session policy — an owner
+  // respawn rebuilds session_options from the spawn flags, which do NOT carry a
+  // style set later via `set outputStyle`. Without this carry-forward the respawn
+  // silently reverts the session to the harness default, and because the style
+  // only reaches Claude Code through the adapter's creation settings that revert
+  // is a real behaviour change, not just a bookkeeping loss.
+  carryIfUnset(target, "output_style", breadcrumbs.outputStyle);
 }
 
 // Assign `value` to `target[key]` ONLY when the breadcrumb HAS a value AND the
@@ -255,6 +275,7 @@ export function sessionOptionsFromRecord(record: SessionRecord): SessionAgentOpt
   assignStoredOption(sessionOptions, "subscription", nonEmptyString(stored.subscription));
   assignStoredOption(sessionOptions, "profile", nonEmptyString(stored.profile));
   assignStoredOption(sessionOptions, "reasoningEffort", nonEmptyString(stored.effort));
+  assignStoredOption(sessionOptions, "outputStyle", nonEmptyString(stored.output_style));
   assignStoredOption(sessionOptions, "autoFailover", storedBoolean(stored.auto_failover));
   assignStoredOption(sessionOptions, "floorHard", storedBoolean(stored.floor_hard));
   assignStoredOption(sessionOptions, "autoSubscription", storedBoolean(stored.auto_subscription));
@@ -287,6 +308,7 @@ function persistedSessionOptions(
     subscription: nonEmptyString(options.subscription),
     profile: nonEmptyString(options.profile),
     effort: nonEmptyString(options.reasoningEffort),
+    output_style: nonEmptyString(options.outputStyle),
   };
   assignBoolPersistedOption(next, "auto_failover", options.autoFailover);
   assignBoolPersistedOption(next, "floor_hard", options.floorHard);
@@ -310,6 +332,10 @@ const PERSISTED_CONTENT_KEYS = [
   "subscription",
   "profile",
   "effort",
+  // brick://874fee67: output_style is a real user setting (not subordinate to
+  // another key like model_source), so it must keep a session_options block alive
+  // on its own — otherwise a style-only session drops the whole block on persist.
+  "output_style",
   "auto_failover",
   "floor_hard",
   "auto_subscription",
