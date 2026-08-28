@@ -1,3 +1,4 @@
+import type { SessionConfigOption } from "@agentclientprotocol/sdk";
 import {
   AcpClient,
   type SessionCreateResult,
@@ -11,10 +12,14 @@ import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.j
 import { persistSessionOptions } from "../../runtime/engine/session-options.js";
 import {
   persistAndApplyRequestedEffort,
-  persistAndApplyRequestedOutputStyle,
+  persistRequestedOutputStyle,
 } from "../../session/config-option-application.js";
 import { applyConfigOptionsToRecord } from "../../session/config-options.js";
-import { stampAppliedOutputStyle } from "../../session/output-style.js";
+import {
+  availableOutputStyles,
+  findAdvertisedOutputStyleOption,
+  stampAppliedOutputStyle,
+} from "../../session/output-style.js";
 import { createSessionConversation } from "../../session/conversation-model.js";
 import { withDefaultModelForNewSession } from "../../session/default-model.js";
 import { defaultSessionEventLog } from "../../session/event-log.js";
@@ -44,6 +49,8 @@ import type { SessionEnsureResult, SessionRecord } from "../../types.js";
 import { resolveExistingBrickPath } from "./brick-link.js";
 import { DEFAULT_QUEUE_OWNER_TTL_MS } from "./contracts.js";
 import type {
+  AgentOutputStyleListOptions,
+  AgentOutputStyleListResult,
   SessionCreateOptions,
   SessionCreateWithClientResult,
   SessionEnsureOptions,
@@ -227,18 +234,15 @@ async function createSessionRecordWithClient(
     timeoutMs: options.timeoutMs,
     verbose: options.verbose,
   });
-  // brick://874fee67: validate + persist the requested style. The style itself
-  // already reached the adapter in the creation `_meta` (that is what the query
-  // was BUILT with); this call is the advertised-gated validation + record write.
-  await persistAndApplyRequestedOutputStyle({
-    client,
-    sessionId,
+  // brick://874fee67: validate + persist the requested style. NOTE there is no
+  // apply step and that is deliberate (R-6 #1) — the style already reached the
+  // adapter in the creation `_meta`, which is what the query was BUILT with, so
+  // it is in force from turn 1. This is the advertised-gated validation + write.
+  persistRequestedOutputStyle({
     record,
     outputStyle: effectiveSessionOptions?.outputStyle,
     advertised: sessionResult.configOptions,
-    modelId: effectiveSessionOptions?.model,
-    timeoutMs: options.timeoutMs,
-    verbose: options.verbose,
+    agentLabel: options.agentName ?? options.agentCommand,
   });
   // brick://874fee67 turn-boundary spec §3: stamp what the query we just built
   // was handed — AFTER the create/resume/fork succeeded, and UNCONDITIONALLY
@@ -569,6 +573,70 @@ export async function createSessionWithClient(
     await client.close();
     throw error;
   }
+}
+
+/**
+ * brick://874fee67 §4.2 #40 — enumerate the output styles an agent offers.
+ *
+ * Exists for acpx-ui's CREATE dialog, which must offer a style before any
+ * session exists. Two paths, both cheap:
+ *
+ * - **With a session id** — read the record's own advertised `config_options`.
+ *   No process spawned at all.
+ * - **Without one** — open a transient ACP session, read what the adapter
+ *   advertises from the `initialize` handshake, and close. **No prompt is ever
+ *   sent**: the handshake carries `available_output_styles` before any turn, so
+ *   this costs no tokens and needs no auth. It also returns CUSTOM and house
+ *   styles, which no filesystem scan could produce for the built-ins — which is
+ *   why this asks the harness rather than reading `output-styles/` directories.
+ *
+ * ⚠️ NO RECORD IS WRITTEN on the transient path. The session is opened purely to
+ * read the advertisement and is closed in a `finally`.
+ */
+export async function listAgentOutputStyles(
+  options: AgentOutputStyleListOptions,
+): Promise<AgentOutputStyleListResult> {
+  if (options.sessionId) {
+    const record = await resolveSessionRecord(options.sessionId);
+    return outputStyleListFromAdvertised(record.acpx?.config_options);
+  }
+
+  const client = new AcpClient({
+    agentCommand: options.agentCommand,
+    cwd: absolutePath(options.cwd),
+    mcpServers: options.mcpServers,
+    // Read-only probe: no prompt is ever sent, so the most restrictive policy is
+    // correct — nothing can ask for a permission on this session.
+    permissionMode: "deny-all",
+    authCredentials: options.authCredentials,
+    authPolicy: options.authPolicy,
+    verbose: options.verbose,
+  });
+  try {
+    await withTimeout(client.start(), options.timeoutMs);
+    const created = await withTimeout(client.createSession(absolutePath(options.cwd)), options.timeoutMs);
+    return outputStyleListFromAdvertised(created.configOptions);
+  } finally {
+    await client.close().catch(() => {
+      // Enumeration is read-only; a close failure must not mask the answer.
+    });
+  }
+}
+
+function outputStyleListFromAdvertised(
+  advertised: SessionConfigOption[] | undefined,
+): AgentOutputStyleListResult {
+  const option = findAdvertisedOutputStyleOption(advertised);
+  if (!option) {
+    // Not advertised = genuinely unsupported by this agent (codex lands here with
+    // no special-casing). Distinct from "advertised but we know no values".
+    return { supported: false, current: undefined, available: [] };
+  }
+  return {
+    supported: true,
+    current: typeof option.currentValue === "string" ? option.currentValue : undefined,
+    available: availableOutputStyles(advertised),
+  };
 }
 
 export async function createSession(options: SessionCreateOptions): Promise<SessionRecord> {

@@ -21,6 +21,7 @@ import {
   handleSessionsTemplates,
   handleSessionsTemplatesMigrateSlugs,
   handleSessionsTemplatesRollback,
+  handleListOutputStyles,
   handleSetConfigOption,
   handleSetMode,
   parseHistoryLimit,
@@ -70,6 +71,7 @@ type SharedSubcommandDescriptions = {
   cancel: string;
   setMode: string;
   setConfig: string;
+  outputStyles: string;
   status: string;
 };
 
@@ -626,6 +628,18 @@ export function registerSharedAgentSubcommands(
     await handleSetConfigOption(explicitAgentName, key, value, flags, this, config);
   });
 
+  // brick://874fee67 §4.2 #40 — enumeration for acpx-ui's create dialog, where
+  // no session exists yet. Read-only: it opens a transient ACP session, reads the
+  // adapter's advertised style list from the initialize handshake, and closes.
+  // No prompt, no tokens, no record written.
+  const outputStylesCommand = parent
+    .command("output-styles")
+    .description(descriptions.outputStyles);
+  addSessionNameOption(outputStylesCommand);
+  outputStylesCommand.action(async function (this: Command, flags: StatusFlags) {
+    await handleListOutputStyles(explicitAgentName, flags, this, config);
+  });
+
   registerStatusCommand(parent, explicitAgentName, config, descriptions.status);
 }
 
@@ -654,7 +668,9 @@ export function registerAgentCommand(
     cancel: "Cooperatively cancel current in-flight prompt",
     setMode: "Set session mode",
     setConfig:
-      "Set session config option (special keys: `model`, `subscription` <id> — switch the Claude subscription in place; `profile` <id> — move the session to a different credential profile, SDK sub1↔sub2 or bridge1↔bridge2)",
+      "Set session config option (special keys: `model`, `subscription` <id> — switch the Claude subscription in place; `profile` <id> — move the session to a different credential profile, SDK sub1↔sub2 or bridge1↔bridge2; `outputStyle` <name> — set the Claude Code output style, accepted even mid-turn and bound when the turn ends)",
+    outputStyles:
+      "List the output styles this agent offers (pass --session-id to read a session's own advertised list instead of opening a transient one)",
     status: "Show local status of current session agent process",
   });
 
@@ -691,7 +707,8 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
     exec: `One-shot prompt using ${config.defaultAgent} by default`,
     cancel: `Cancel active prompt for ${config.defaultAgent} by default`,
     setMode: `Set session mode for ${config.defaultAgent} by default`,
-    setConfig: `Set session config option for ${config.defaultAgent} by default (special keys: \`model\`, \`subscription\` <id>, \`profile\` <id> — move the session's credential, SDK sub1↔sub2 or bridge1↔bridge2)`,
+    setConfig: `Set session config option for ${config.defaultAgent} by default (special keys: \`model\`, \`subscription\` <id>, \`profile\` <id> — move the session's credential, SDK sub1↔sub2 or bridge1↔bridge2; \`outputStyle\` <name>)`,
+    outputStyles: `List the output styles ${config.defaultAgent} offers`,
     status: `Show local status for ${config.defaultAgent} by default`,
   });
 

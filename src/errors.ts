@@ -548,6 +548,67 @@ export class ConfigOptionTurnInFlightError extends AcpxOperationalError {
   }
 }
 
+/**
+ * brick://874fee67 — refuse a config change that would recycle the owner while
+ * prompts are QUEUED BEHIND the active turn.
+ *
+ * Distinct from {@link ConfigOptionTurnInFlightError}: that one guards the turn
+ * currently RUNNING. This one guards work already handed to the owner and
+ * waiting. acpx has no persisted prompt queue — the owner's entire on-disk
+ * footprint is a `.lock` and a `.sock`, so anything the owner holds in memory
+ * dies with it. Deferring the recycle protects the active turn but not the
+ * queue, so a recycle here would silently drop a prompt the user already sent.
+ * Refusing turns that into a visible "try again when idle".
+ */
+export class ConfigOptionQueuedWorkError extends AcpxOperationalError {
+  constructor(configId: string, sessionName?: string) {
+    const label = sessionName ? ` '${sessionName}'` : "";
+    super(
+      `Cannot change config option "${configId}" while work is queued on session${label}; the change would restart the agent and drop the queued prompt(s) — try again once the queue has drained (queued-work).`,
+      {
+        outputCode: "USAGE",
+        detailCode: "QUEUED_WORK",
+        origin: "queue",
+      },
+    );
+  }
+}
+
+/**
+ * brick://874fee67 — the session's agent advertises no `outputStyle` config
+ * option, so a style would be persisted and then silently ignored.
+ *
+ * Support is derived from the live ADVERTISEMENT, never from the agent name: a
+ * name check would call a claude session on a not-yet-updated adapter
+ * "supported" and hand the user a control that does nothing. Codex lands here
+ * with no special-casing anywhere, which is the point.
+ */
+export class OutputStyleNotSupportedError extends AcpxOperationalError {
+  constructor(agent: string) {
+    super(
+      `Agent "${agent}" does not support output styles (it advertises no "outputStyle" config option).`,
+      { outputCode: "USAGE", detailCode: "UNSUPPORTED_ADAPTER", origin: "queue" },
+    );
+  }
+}
+
+/**
+ * brick://874fee67 — the requested style is not one the session's agent offers.
+ *
+ * ⚠️ This error exists because CLAUDE CODE ITSELF DOES NOT VALIDATE: it accepts
+ * any string and echoes it back as the active style (measured). Without this
+ * refusal a typo produces a session that reports a style it does not have, on
+ * every surface. Never relax it into a warning.
+ */
+export class OutputStyleUnknownError extends AcpxOperationalError {
+  constructor(requested: string, available: string[]) {
+    super(
+      `Unknown output style "${requested}"; this session offers: ${available.join(", ")}.`,
+      { outputCode: "USAGE", detailCode: "UNKNOWN_OUTPUT_STYLE", origin: "queue" },
+    );
+  }
+}
+
 export class SessionModeReplayError extends AcpxOperationalError {
   constructor(message: string, options?: AcpxErrorOptions) {
     super(message, {

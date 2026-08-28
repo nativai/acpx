@@ -3,7 +3,7 @@ import { withTimeout } from "../async-control.js";
 import type { SessionRecord } from "../types.js";
 import { applyConfigOptionsToRecord } from "./config-options.js";
 import { getDesiredConfigOptions, setDesiredConfigOption } from "./mode-preference.js";
-import { OUTPUT_STYLE_CONFIG_ID } from "./output-style.js";
+import { assertOutputStyleAdvertised, OUTPUT_STYLE_CONFIG_ID } from "./output-style.js";
 
 /** Minimal client surface so this is unit-testable with a stub. */
 export interface ConfigOptionApplyClient {
@@ -266,52 +266,43 @@ export async function persistAndApplyRequestedEffort(params: {
 
 /**
  * Creation-site entry point for the `--output-style` spawn flag (brick://874fee67).
- * Mirrors `persistAndApplyRequestedEffort` — including its `advertisesConfigOption`
- * gate, which is what makes the flag a silent no-op (plus a CLI stderr warning and
- * NO write) on an agent that has no output-style concept, e.g. codex.
  *
- * ⚠️ THE INVERSION (R-6 #1). The `applyRequestedConfigOptionsIfAdvertised` call
- * below is here for VALIDATION, not to apply the style to the running query.
- * Claude Code does not validate `outputStyle` — a bogus name is accepted and
- * echoed back as the session's active style — so the ACP round-trip to the
- * adapter, which DOES validate against `available_output_styles`, is how a typo
- * becomes a visible refusal instead of a session that lies about its style. The
- * adapter deliberately does not push the value into the live SDK query; the style
- * is honoured because it also travelled in the creation `_meta`
- * (`buildClaudeCodeOptionsMeta`), which is what the query was built from.
+ * ⚠️ NOT "persistAndApply" — and the missing half is the R-6 inversion, not an
+ * omission. `persistAndApplyRequestedEffort` performs a creation-time apply
+ * round-trip precisely BECAUSE the adapter applies effort to the live SDK query.
+ * Output style is already in force from the creation settings the query was
+ * BUILT with (it travelled in the session/new `_meta`), so there is nothing left
+ * to apply — and applying it would be the forbidden move. Do not "restore" an
+ * apply call here, and do not fix a perceived gap by making the adapter apply.
  *
- * Never add a live-apply path here. See `session/output-style.ts` for why the
- * half-applied state it would create is worse than a no-op.
+ * What IS kept from the effort sibling, and why each matters:
+ * - the `advertisesConfigOption` GATE — this gate IS the honest degradation. On
+ *   an agent with no output-style concept (codex) the flag writes NOTHING and
+ *   errors nothing; the CLI has already warned on stderr. Dropping it would
+ *   persist a style for a session that can never honour one.
+ * - the PERSIST via `setDesiredConfigOption`, which writes the live
+ *   `desired_config_options.outputStyle` and, through the mode-preference sync,
+ *   the durable `session_options.output_style` a respawn re-applies.
+ *
+ * Validation happens here rather than at the adapter because Claude Code accepts
+ * ANY string as a style name and echoes it back as active — so an unvalidated
+ * typo produces a session that reports a style it does not have.
  */
-export async function persistAndApplyRequestedOutputStyle(params: {
-  client: ConfigOptionApplyClient;
-  sessionId: string;
+export function persistRequestedOutputStyle(params: {
   record: SessionRecord;
   outputStyle: string | undefined;
   advertised: SessionConfigOption[] | undefined;
-  modelId?: string;
-  timeoutMs?: number;
-  verbose?: boolean;
-}): Promise<void> {
-  if (
-    !params.outputStyle ||
-    !advertisesConfigOption(params.advertised, OUTPUT_STYLE_CONFIG_ID)
-  ) {
+  agentLabel: string;
+}): void {
+  if (!params.outputStyle) {
     return;
   }
-  // Writes BOTH layers: the live `desired_config_options.outputStyle` and — via
-  // the mode-preference sync — the durable `session_options.output_style` a
-  // respawn re-applies.
+  if (!advertisesConfigOption(params.advertised, OUTPUT_STYLE_CONFIG_ID)) {
+    // Silent no-op by design (the CLI emits the user-facing "ignored" warning).
+    return;
+  }
+  assertOutputStyleAdvertised(params.advertised, params.outputStyle, params.agentLabel);
   setDesiredConfigOption(params.record, OUTPUT_STYLE_CONFIG_ID, params.outputStyle);
-  await applyRequestedConfigOptionsIfAdvertised({
-    client: params.client,
-    sessionId: params.sessionId,
-    record: params.record,
-    advertised: params.advertised,
-    modelId: params.modelId,
-    timeoutMs: params.timeoutMs,
-    verbose: params.verbose,
-  });
 }
 
 /**

@@ -1,3 +1,5 @@
+import type { SessionConfigOption } from "@agentclientprotocol/sdk";
+import { OutputStyleNotSupportedError, OutputStyleUnknownError } from "../errors.js";
 import type { SessionRecord } from "../types.js";
 
 /**
@@ -128,4 +130,86 @@ export function stampAppliedOutputStyle(
     ...record.acpx,
     applied_output_style: normalizeOutputStyle(outputStyle),
   };
+}
+
+/** The advertised `outputStyle` config option, or undefined when the agent never
+ *  advertised one. Support is derived from THIS and nothing else — never from
+ *  the agent name, which would call a claude session on a not-yet-updated
+ *  adapter "supported" and hand the user a control that does nothing. */
+export function findAdvertisedOutputStyleOption(
+  advertised: SessionConfigOption[] | undefined,
+): SessionConfigOption | undefined {
+  return (advertised ?? []).find((option) => option.id === OUTPUT_STYLE_CONFIG_ID);
+}
+
+/**
+ * The styles an agent actually offers, from its own advertisement.
+ *
+ * ⚠️ NEVER hardcode this list. The built-ins measured on this box are `default`,
+ * `Proactive`, `Explanatory`, `Learning` — FOUR, not the five the public doc
+ * lists (`Concise` is absent at claude 2.1.239 despite the doc's stated version
+ * gate). Custom and house styles appear here too. Any static list is wrong today
+ * and wrong differently after the next CLI bump.
+ */
+export function availableOutputStyles(advertised: SessionConfigOption[] | undefined): string[] {
+  const option = findAdvertisedOutputStyleOption(advertised);
+  if (!option || option.type !== "select") {
+    return [];
+  }
+  // A malformed/older adapter can advertise a select option with `options`
+  // absent; treat that as "no known values" rather than throwing.
+  return (option.options ?? []).flatMap((entry) => ("value" in entry ? [entry.value] : []));
+}
+
+/**
+ * Refuse a style this session's agent does not offer — **the AC-5 defence, and
+ * the criterion most likely to be skipped because it tests something Claude Code
+ * itself does not do.**
+ *
+ * Claude Code performs NO validation of `outputStyle`: a bogus name is accepted
+ * and echoed back as the session's active style, so every surface — the record,
+ * the header, `acpx status` — would then claim a style the session does not
+ * have. Validation is ours or it does not exist.
+ *
+ * Validating against the RECORD's advertisement rather than a live ACP
+ * round-trip is deliberate: it works with no owner running (the cold case a
+ * `set` on an idle session takes), and it needs no adapter call.
+ *
+ * A session that advertises the option but no value list is accepted rather than
+ * refused — an empty list means "this adapter did not tell us", not "no styles
+ * exist", and refusing everything on that basis would break a working feature.
+ */
+export function assertOutputStyleAdvertised(
+  advertised: SessionConfigOption[] | undefined,
+  outputStyle: string,
+  agentLabel: string,
+): void {
+  if (!findAdvertisedOutputStyleOption(advertised)) {
+    throw new OutputStyleNotSupportedError(agentLabel);
+  }
+  const available = availableOutputStyles(advertised);
+  if (available.length === 0) {
+    return;
+  }
+  // Exact match only — no case folding, no slugging. `default` is lowercase
+  // while `Proactive`/`Explanatory`/`Learning` are capitalised, and custom style
+  // names may contain spaces.
+  if (!available.includes(outputStyle.trim())) {
+    throw new OutputStyleUnknownError(outputStyle, available);
+  }
+}
+
+/** Record-backed wrapper over {@link assertOutputStyleAdvertised} — the form the
+ *  `set` verb uses, because it works with NO owner running (the cold case a set
+ *  on an idle session takes) and needs no adapter round-trip. One validator, two
+ *  entry points: the creation flag has its advertised list in hand already. */
+export function assertOutputStyleSupportedForRecord(
+  record: SessionRecord,
+  outputStyle: string,
+): void {
+  assertOutputStyleAdvertised(
+    record.acpx?.config_options,
+    outputStyle,
+    record.agentName ?? record.agentCommand,
+  );
 }

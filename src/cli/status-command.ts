@@ -11,6 +11,7 @@ import {
 } from "../config/subscriptions.js";
 import { findSession, resolveGlobalSessionByName } from "../session/persistence.js";
 import type { SessionRecord } from "../types.js";
+import { outputStyleChangePending } from "../session/output-style.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import {
   addSessionNameOption,
@@ -137,6 +138,8 @@ function printMissingStatus(format: ResolvedAcpxConfig["format"], agentCommand: 
   process.stdout.write("mode: -\n");
   process.stdout.write("reasoningEffort: -\n");
   process.stdout.write("reasoningEffortLive: -\n");
+  process.stdout.write("outputStyle: -\n");
+  process.stdout.write("outputStyleApplied: -\n");
   process.stdout.write("uptime: -\n");
   process.stdout.write("lastPromptTime: -\n");
 }
@@ -180,6 +183,9 @@ function createStatusPayload(
     availableModels: acpx.availableModels,
     reasoningEffort: acpx.reasoningEffort,
     reasoningEffortLive: acpx.reasoningEffortLive,
+    outputStyle: acpx.outputStyle,
+    outputStyleApplied: acpx.outputStyleApplied,
+    outputStylePending: acpx.outputStylePending,
     autoFailover: acpx.autoFailover,
     autoSubscription: acpx.autoSubscription,
     fableDegradeOk: acpx.fableDegradeOk,
@@ -245,6 +251,19 @@ function statusAcpxFields(record: SessionRecord): {
   availableModels: string[] | null;
   reasoningEffort: string | null;
   reasoningEffortLive: string | null;
+  // brick://874fee67. THREE values, and they must stay three distinct names:
+  //   outputStyle        — DESIRED (what was asked for)
+  //   outputStyleApplied — APPLIED (what the live query was actually BUILT with).
+  //                        OUR action record; this is what a UI labels a chip from.
+  //   outputStylePending — derived: desired !== applied, i.e. a change is waiting
+  //                        for the owner to recycle.
+  // There is deliberately no "outputStyleLive" sibling to reasoningEffortLive:
+  // the harness readback is unvalidated inbound and disconnected from behaviour
+  // outbound, so surfacing it beside these would invite exactly the confusion
+  // the separate names exist to prevent.
+  outputStyle: string | null;
+  outputStyleApplied: string | null;
+  outputStylePending: boolean;
   autoFailover: boolean;
   autoSubscription: boolean;
   fableDegradeOk: boolean;
@@ -257,6 +276,9 @@ function statusAcpxFields(record: SessionRecord): {
       availableModels: null,
       reasoningEffort: null,
       reasoningEffortLive: null,
+      outputStyle: null,
+      outputStyleApplied: null,
+      outputStylePending: false,
       autoFailover: true,
       autoSubscription: true,
       fableDegradeOk: false,
@@ -271,6 +293,10 @@ function statusAcpxFields(record: SessionRecord): {
     // model default and may not track a per-session set — prefer the intent.
     reasoningEffort: desiredEffort(acpx),
     reasoningEffortLive: liveEffortCurrentValue(acpx),
+    outputStyle: optionalStatusString(acpx.session_options?.output_style),
+    outputStyleApplied: optionalStatusString(acpx.applied_output_style),
+    // The ONE shared predicate — never re-derived inline here (brick://67d2fd2f).
+    outputStylePending: outputStyleChangePending(record),
     autoFailover: autoFailoverStatus(acpx),
     autoSubscription: autoSubscriptionStatus(acpx),
     fableDegradeOk: fableDegradeStatus(acpx),
@@ -341,6 +367,9 @@ type StatusPayload = {
   availableModels: string[] | null;
   reasoningEffort: string | null;
   reasoningEffortLive: string | null;
+  outputStyle: string | null;
+  outputStyleApplied: string | null;
+  outputStylePending: boolean;
   autoFailover: boolean;
   autoSubscription: boolean;
   fableDegradeOk: boolean;
@@ -384,6 +413,9 @@ function statusJsonPayload(
   assignDefinedJsonField(result, "availableModels", payload.availableModels);
   assignDefinedJsonField(result, "reasoningEffort", payload.reasoningEffort);
   assignDefinedJsonField(result, "reasoningEffortLive", payload.reasoningEffortLive);
+  assignDefinedJsonField(result, "outputStyle", payload.outputStyle);
+  assignDefinedJsonField(result, "outputStyleApplied", payload.outputStyleApplied);
+  assignDefinedJsonField(result, "outputStylePending", payload.outputStylePending);
   assignDefinedJsonField(result, "autoFailover", payload.autoFailover);
   assignDefinedJsonField(result, "autoSubscription", payload.autoSubscription);
   assignDefinedJsonField(result, "fableDegradeOk", payload.fableDegradeOk);
@@ -428,6 +460,12 @@ function printTextStatus(payload: StatusPayload, dead: boolean): void {
   process.stdout.write(`mode: ${orDash(payload.mode)}\n`);
   process.stdout.write(`reasoningEffort: ${orDash(payload.reasoningEffort)}\n`);
   process.stdout.write(`reasoningEffortLive: ${orDash(payload.reasoningEffortLive)}\n`);
+  process.stdout.write(`outputStyle: ${orDash(payload.outputStyle)}\n`);
+  process.stdout.write(
+    `outputStyleApplied: ${orDash(payload.outputStyleApplied)}${
+      payload.outputStylePending ? " (pending: restarts at the end of this turn)" : ""
+    }\n`,
+  );
   process.stdout.write(`autoFailover: ${payload.autoFailover ? "on" : "off"}\n`);
   process.stdout.write(`autoSubscription: ${payload.autoSubscription ? "on" : "off"}\n`);
   process.stdout.write(`fableDegradeOk: ${payload.fableDegradeOk ? "on" : "off"}\n`);

@@ -303,6 +303,57 @@ export type SessionSetAutoFailoverResult = {
   ownerRestarted?: boolean;
 };
 
+// brick://874fee67 — enumerate an agent's output styles (the create-dialog feed).
+export type AgentOutputStyleListOptions = {
+  agentCommand: string;
+  agentName: string;
+  cwd: string;
+  mcpServers?: SessionCreateOptions["mcpServers"];
+  authCredentials?: SessionCreateOptions["authCredentials"];
+  authPolicy?: SessionCreateOptions["authPolicy"];
+  timeoutMs?: number;
+  verbose?: boolean;
+  /** When set, read the advertisement off this session's record instead of
+   *  opening a transient one — no process spawned. */
+  sessionId?: string;
+};
+
+export type AgentOutputStyleListResult = {
+  /** Derived from the ADVERTISEMENT, never the agent name. */
+  supported: boolean;
+  /** The agent's currently-active style, per its own advertisement. Diagnostic
+   *  only — this is the harness readback, which is unvalidated inbound and
+   *  disconnected from behaviour outbound. Never label a UI chip from it. */
+  current?: string;
+  available: string[];
+};
+
+// brick://874fee67 — the per-session Claude Code output style.
+export type SessionSetOutputStyleOptions = {
+  sessionId: string;
+  /** Opaque non-empty style id, or the literal `"default"` to revert. Never null:
+   *  a null-shaped clear cannot reach the create-time flag slot our styles arrive
+   *  through, so "revert" is an ordinary set of the advertised `"default"` id. */
+  outputStyle: string;
+  /** Used only for the refusal error message. */
+  sessionName?: string;
+};
+
+export type SessionSetOutputStyleResult = {
+  record: SessionRecord;
+  outputStyle: string;
+  /** True when a live idle queue owner existed and was recycled immediately, so
+   *  the change binds on the next prompt. */
+  ownerRestarted?: boolean;
+  /**
+   * True when the write was ACCEPTED but the recycle was deferred because a turn
+   * was in flight. The change is durable and will bind at the turn boundary (or
+   * on the idle check); it is NOT lost and it is NOT an error. The style the
+   * session is running until then is `record.acpx.applied_output_style`.
+   */
+  pending?: boolean;
+};
+
 // brick://4d517be2 — the autonomous-selection disable knob.
 export type SessionSetAutoSubscriptionOptions = {
   sessionId: string;

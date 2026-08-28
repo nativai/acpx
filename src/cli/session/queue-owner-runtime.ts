@@ -21,6 +21,7 @@ import {
   persistSessionOwnerOptions,
   resolveSessionOwnerOptions,
 } from "../../session/owner-options.js";
+import { outputStyleChangePending } from "../../session/output-style.js";
 import {
   absolutePath,
   flushPendingSessionIndexUpdates,
@@ -476,7 +477,15 @@ function parseEnvMs(raw: string | undefined): number | undefined {
 // OR'd, that share one safety gate (see decideIdleOwnerRelease):
 //   - "deploy-staleness": the owner is running OUTDATED code (W13-24-10 Path 1).
 //   - "idle-memory":      the owner is provably idle past the memory timeout.
-export type IdleOwnerReleaseReason = "deploy-staleness" | "idle-memory";
+//   - "output-style-change": the record's DESIRED output style no longer matches
+//     the style this owner's live query was BUILT with (brick://874fee67). The
+//     style is only honoured through the adapter's creation settings, so the only
+//     way to adopt a new one is to let this owner go and have the next prompt
+//     cold-spawn a fresh one that resumes with it.
+export type IdleOwnerReleaseReason =
+  | "output-style-change"
+  | "deploy-staleness"
+  | "idle-memory";
 
 export type IdleOwnerReleaseDecision =
   | { release: false }
@@ -493,6 +502,11 @@ export type DecideIdleOwnerReleaseInput = {
   // Lazy so the deploy-file read happens ONLY after the safety gate already holds
   // (preserves the W13-24-10 short-circuit cost-ordering). Pure helper otherwise.
   deployDiffers: () => boolean | Promise<boolean>;
+  // brick://874fee67 — lazy for the same reason (it re-reads the session record).
+  // Without this input an owner that is idle and simply never receives another
+  // prompt holds the stale style indefinitely, and the user's change appears to
+  // have done nothing. Path (A), the turn boundary, cannot cover that case.
+  outputStyleDiffers: () => boolean | Promise<boolean>;
 };
 
 // THE LOAD-BEARING DECISION (W13-24-14 Phase 2). Pure (modulo the deployDiffers
@@ -527,7 +541,20 @@ export async function decideIdleOwnerRelease(
     return { release: false };
   }
 
-  // Deploy-staleness checked first: an owner that is BOTH outdated AND long-idle is
+  // brick://874fee67: ordered FIRST, ahead of deploy-staleness, by the same
+  // principle the comment below states — the more specific and more user-visible
+  // reason wins the label. A pending style change is something a human just asked
+  // for and is watching for. Evaluated only now, after the gate already holds, so
+  // the record re-read costs nothing on the common busy path.
+  //
+  // ⚠️ Sits BEHIND the shared gate deliberately: this must never release an owner
+  // with an active turn. Recycling mid-turn is the one thing the whole
+  // accept-anytime contract exists to avoid.
+  if (await input.outputStyleDiffers()) {
+    return { release: true, reason: "output-style-change" };
+  }
+
+  // Deploy-staleness checked second: an owner that is BOTH outdated AND long-idle is
   // reported under the more specific, more actionable reason. The deploy check (a
   // file read) is evaluated only now — after the gate already holds.
   if (await input.deployDiffers()) {
@@ -673,6 +700,24 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       return await run();
     } finally {
       turnController.endTurn();
+    }
+  };
+
+  // brick://874fee67 — the ONE predicate, evaluated against a FRESHLY READ
+  // record (re-reading inside the owner loop is established practice here; see
+  // closeActiveBackendSession above). Reading `sessionRecord` from the owner's
+  // own memory would defeat the entire design: that snapshot is exactly the
+  // stale view a style change written from outside this process must beat.
+  //
+  // Fail CLOSED on a read error — an unreadable record is not evidence of a
+  // pending change, and releasing the owner on a transient fs error would turn
+  // every such blip into a recycle. The turn boundary and the idle loop both
+  // re-evaluate, so a missed check costs at most one turn of latency.
+  const outputStyleChangeIsPending = async (): Promise<boolean> => {
+    try {
+      return outputStyleChangePending(await resolveSessionRecord(options.sessionId));
+    } catch {
+      return false;
     }
   };
 
@@ -977,6 +1022,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           // Lazy: the deploy-file read happens only after the gate already holds,
           // preserving the W13-24-10 short-circuit cost-ordering.
           deployDiffers: deployedBuildDiffersFromOwner,
+          outputStyleDiffers: outputStyleChangeIsPending,
         });
         if (!decision.release) {
           // Current code & within the idle window, OR busy / active / relaying
@@ -1117,7 +1163,17 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       // A failover this turn pinned the shared client to a now-stale transcript
       // anchor. Exit so the next prompt cold-spawns a fresh owner on the new
       // profile/account.
-      if (recycleOwnerAfterTask) {
+      //
+      // brick://874fee67 path (A), the PRIMARY one: the same exit, for a style
+      // change that arrived from OUTSIDE this process while the turn was running.
+      // Note the deliberate asymmetry with `recycleOwnerAfterTask` beside it —
+      // that flag is set by callbacks firing INSIDE the turn, in-process, so a
+      // boolean carries it safely. A style change is written by the CLI or
+      // acpx-ui, so a boolean would have to be delivered over IPC, and a lost
+      // message would leave the record holding the new style while this owner
+      // keeps serving the old one: the change silently forgotten, looking exactly
+      // like success. Re-reading the record instead has no such path.
+      if (recycleOwnerAfterTask || (await outputStyleChangeIsPending())) {
         break;
       }
     }
