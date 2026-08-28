@@ -9,8 +9,12 @@ import { withInterrupt, withTimeout } from "../../async-control.js";
 import { bindDefaultAccountToSessionOptionsAsync } from "../../runtime/engine/default-account-binding.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
 import { persistSessionOptions } from "../../runtime/engine/session-options.js";
-import { persistAndApplyRequestedEffort } from "../../session/config-option-application.js";
+import {
+  persistAndApplyRequestedEffort,
+  persistAndApplyRequestedOutputStyle,
+} from "../../session/config-option-application.js";
 import { applyConfigOptionsToRecord } from "../../session/config-options.js";
+import { stampAppliedOutputStyle } from "../../session/output-style.js";
 import { createSessionConversation } from "../../session/conversation-model.js";
 import { withDefaultModelForNewSession } from "../../session/default-model.js";
 import { defaultSessionEventLog } from "../../session/event-log.js";
@@ -223,6 +227,25 @@ async function createSessionRecordWithClient(
     timeoutMs: options.timeoutMs,
     verbose: options.verbose,
   });
+  // brick://874fee67: validate + persist the requested style. The style itself
+  // already reached the adapter in the creation `_meta` (that is what the query
+  // was BUILT with); this call is the advertised-gated validation + record write.
+  await persistAndApplyRequestedOutputStyle({
+    client,
+    sessionId,
+    record,
+    outputStyle: effectiveSessionOptions?.outputStyle,
+    advertised: sessionResult.configOptions,
+    modelId: effectiveSessionOptions?.model,
+    timeoutMs: options.timeoutMs,
+    verbose: options.verbose,
+  });
+  // brick://874fee67 turn-boundary spec §3: stamp what the query we just built
+  // was handed — AFTER the create/resume/fork succeeded, and UNCONDITIONALLY
+  // (including for the default). Skip it and `outputStyleChangePending` reads a
+  // brand-new unstyled session as already-pending, recycling its owner on the
+  // first turn for nothing.
+  stampAppliedOutputStyle(record, effectiveSessionOptions?.outputStyle);
   syncAdvertisedModelState(record, sessionModels);
   if (requestedModelApplied) {
     setCurrentModelId(record, effectiveSessionOptions?.model);

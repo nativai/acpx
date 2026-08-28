@@ -3,6 +3,7 @@ import { withTimeout } from "../async-control.js";
 import type { SessionRecord } from "../types.js";
 import { applyConfigOptionsToRecord } from "./config-options.js";
 import { getDesiredConfigOptions, setDesiredConfigOption } from "./mode-preference.js";
+import { OUTPUT_STYLE_CONFIG_ID } from "./output-style.js";
 
 /** Minimal client surface so this is unit-testable with a stub. */
 export interface ConfigOptionApplyClient {
@@ -252,6 +253,56 @@ export async function persistAndApplyRequestedEffort(params: {
     return;
   }
   setDesiredConfigOption(params.record, "effort", params.reasoningEffort);
+  await applyRequestedConfigOptionsIfAdvertised({
+    client: params.client,
+    sessionId: params.sessionId,
+    record: params.record,
+    advertised: params.advertised,
+    modelId: params.modelId,
+    timeoutMs: params.timeoutMs,
+    verbose: params.verbose,
+  });
+}
+
+/**
+ * Creation-site entry point for the `--output-style` spawn flag (brick://874fee67).
+ * Mirrors `persistAndApplyRequestedEffort` — including its `advertisesConfigOption`
+ * gate, which is what makes the flag a silent no-op (plus a CLI stderr warning and
+ * NO write) on an agent that has no output-style concept, e.g. codex.
+ *
+ * ⚠️ THE INVERSION (R-6 #1). The `applyRequestedConfigOptionsIfAdvertised` call
+ * below is here for VALIDATION, not to apply the style to the running query.
+ * Claude Code does not validate `outputStyle` — a bogus name is accepted and
+ * echoed back as the session's active style — so the ACP round-trip to the
+ * adapter, which DOES validate against `available_output_styles`, is how a typo
+ * becomes a visible refusal instead of a session that lies about its style. The
+ * adapter deliberately does not push the value into the live SDK query; the style
+ * is honoured because it also travelled in the creation `_meta`
+ * (`buildClaudeCodeOptionsMeta`), which is what the query was built from.
+ *
+ * Never add a live-apply path here. See `session/output-style.ts` for why the
+ * half-applied state it would create is worse than a no-op.
+ */
+export async function persistAndApplyRequestedOutputStyle(params: {
+  client: ConfigOptionApplyClient;
+  sessionId: string;
+  record: SessionRecord;
+  outputStyle: string | undefined;
+  advertised: SessionConfigOption[] | undefined;
+  modelId?: string;
+  timeoutMs?: number;
+  verbose?: boolean;
+}): Promise<void> {
+  if (
+    !params.outputStyle ||
+    !advertisesConfigOption(params.advertised, OUTPUT_STYLE_CONFIG_ID)
+  ) {
+    return;
+  }
+  // Writes BOTH layers: the live `desired_config_options.outputStyle` and — via
+  // the mode-preference sync — the durable `session_options.output_style` a
+  // respawn re-applies.
+  setDesiredConfigOption(params.record, OUTPUT_STYLE_CONFIG_ID, params.outputStyle);
   await applyRequestedConfigOptionsIfAdvertised({
     client: params.client,
     sessionId: params.sessionId,

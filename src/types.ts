@@ -248,6 +248,13 @@ export type AcpClientOptions = {
     systemPrompt?: string | { append: string };
     subscription?: string;
     profile?: string;
+    /**
+     * brick://874fee67 — the Claude Code output style this session's query must
+     * be BUILT with. Unlike every other option here it has no live-apply path at
+     * all: the style is only ever honoured through the adapter's creation
+     * settings, so it must travel in the `session/new` and resume `_meta`.
+     */
+    outputStyle?: string;
   };
   onAcpMessage?: (direction: AcpMessageDirection, message: AcpJsonRpcMessage) => void;
   onAcpOutputMessage?: (direction: AcpMessageDirection, message: AcpJsonRpcMessage) => void;

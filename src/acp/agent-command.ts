@@ -460,8 +460,27 @@ export function buildClaudeCodeOptionsMeta(
   assignClaudeCodeOptions(claudeCodeOptions, options);
 
   const meta: Record<string, unknown> = {};
+  const claudeCode: Record<string, unknown> = {};
   if (Object.keys(claudeCodeOptions).length > 0) {
-    meta.claudeCode = { options: claudeCodeOptions };
+    claudeCode.options = claudeCodeOptions;
+  }
+  // brick://874fee67: the output style travels as its OWN `_meta.claudeCode`
+  // field, a SIBLING of `options` — deliberately NOT inside
+  // `claudeCode.options.settings`. The adapter drops its own `creationSettings`
+  // entirely when the caller supplies `settings`, so routing the style that way
+  // would silently disable the reasoning-effort pin: a regression in an
+  // unrelated feature, with no error anywhere. The adapter folds this field into
+  // its own creationSettings instead (design §2.3(e)).
+  //
+  // This is the ONLY path by which a style reaches Claude Code. The adapter
+  // composes the system prompt when it builds the query, so a style that misses
+  // this `_meta` does not merely arrive late — it never arrives at all until the
+  // next query is built.
+  if (typeof options.outputStyle === "string" && options.outputStyle.trim().length > 0) {
+    claudeCode.outputStyle = options.outputStyle;
+  }
+  if (Object.keys(claudeCode).length > 0) {
+    meta.claudeCode = claudeCode;
   }
 
   assignClaudeCodeSystemPrompt(meta, options.systemPrompt);

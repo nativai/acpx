@@ -37,6 +37,7 @@ import {
   syncAdvertisedModelState,
 } from "../../session/mode-preference.js";
 import { guardServedModel, stampModelGuardBreadcrumb } from "../../session/model-guard.js";
+import { stampAppliedOutputStyle } from "../../session/output-style.js";
 import type { SessionRecord, SessionResumePolicy } from "../../types.js";
 import {
   applyLifecycleSnapshotToRecord,
@@ -439,6 +440,18 @@ export async function connectAndLoadSession(
   sessionId = loadState.sessionId;
   pendingAgentSessionId = loadState.pendingAgentSessionId;
   sessionModels = loadState.sessionModels;
+
+  // brick://874fee67 turn-boundary spec §3 — the primary stamp site. The query
+  // backing this session has just been (re)built, and `client.getSessionOutputStyle()`
+  // is the very value its `_meta` was composed from, so `applied` cannot drift
+  // from what was actually sent. Stamped AFTER success and UNCONDITIONALLY,
+  // including for the default.
+  //
+  // This is also what makes a recycle terminal rather than repeating: the fresh
+  // owner resumes with `desired`, stamps it here as `applied`, and
+  // `outputStyleChangePending` goes false — so the next turn boundary does not
+  // recycle again.
+  stampAppliedOutputStyle(record, client.getSessionOutputStyle());
 
   const replayResult = await replayReconnectedSessionPreferences({
     client,
