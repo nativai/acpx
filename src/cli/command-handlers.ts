@@ -1640,7 +1640,7 @@ function printSetOutputStyleResultByFormat(
       pending,
       // The style the CURRENT query was built with — what the session is really
       // running until the recycle lands. Never the harness readback.
-      appliedOutputStyle: result.record.acpx?.applied_output_style ?? null,
+      outputStyleApplied: result.record.acpx?.applied_output_style ?? null,
       acpxRecordId: result.record.acpxRecordId,
       acpxSessionId: result.record.acpSessionId,
       agentSessionId: result.record.agentSessionId,

@@ -138,7 +138,7 @@ function printMissingStatus(format: ResolvedAcpxConfig["format"], agentCommand: 
   process.stdout.write("mode: -\n");
   process.stdout.write("reasoningEffort: -\n");
   process.stdout.write("reasoningEffortLive: -\n");
-  process.stdout.write("outputStyle: -\n");
+  process.stdout.write("outputStyleDesired: -\n");
   process.stdout.write("outputStyleApplied: -\n");
   process.stdout.write("uptime: -\n");
   process.stdout.write("lastPromptTime: -\n");
@@ -244,7 +244,7 @@ function printOutputStyleStatus(payload: {
   outputStyleApplied: string | null;
   outputStylePending: boolean;
 }): void {
-  process.stdout.write(`outputStyle: ${orDash(payload.outputStyle)}\n`);
+  process.stdout.write(`outputStyleDesired: ${orDash(payload.outputStyle)}\n`);
   process.stdout.write(
     `outputStyleApplied: ${orDash(payload.outputStyleApplied)}${
       payload.outputStylePending ? " (pending: restarts at the end of this turn)" : ""
@@ -430,7 +430,7 @@ function statusJsonPayload(
   assignDefinedJsonField(result, "availableModels", payload.availableModels);
   assignDefinedJsonField(result, "reasoningEffort", payload.reasoningEffort);
   assignDefinedJsonField(result, "reasoningEffortLive", payload.reasoningEffortLive);
-  assignDefinedJsonField(result, "outputStyle", payload.outputStyle);
+  assignDefinedJsonField(result, "outputStyleDesired", payload.outputStyle);
   assignDefinedJsonField(result, "outputStyleApplied", payload.outputStyleApplied);
   assignDefinedJsonField(result, "outputStylePending", payload.outputStylePending);
   assignDefinedJsonField(result, "autoFailover", payload.autoFailover);

@@ -357,8 +357,8 @@ test("REAL session-index round-trip: projection and parser agree on EVERY field"
 
   // And the specific values, so a projection that silently emitted nothing at all
   // could not pass the structural check vacuously.
-  assert.equal(parsed.outputStyle, STYLE);
-  assert.equal(parsed.appliedOutputStyle, STYLE);
+  assert.equal(parsed.outputStyleDesired, STYLE);
+  assert.equal(parsed.outputStyleApplied, STYLE);
   assert.equal(parsed.outputStyleSupported, true);
 });
 

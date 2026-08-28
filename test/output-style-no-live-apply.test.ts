@@ -121,7 +121,7 @@ test("STRUCTURAL: the sweep's pattern demonstrably matches the shape it forbids"
   for (const innocent of [
     "persistRequestedOutputStyle({ record, outputStyle, advertised, agentLabel });",
     "setDesiredConfigOption(record, OUTPUT_STYLE_CONFIG_ID, value);",
-    "const applied = appliedOutputStyle(record);",
+    "const applied = outputStyleApplied(record);",
   ]) {
     assert.equal(LIVE_APPLY_SHAPE.test(innocent), false, `false positive on: ${innocent}`);
   }
