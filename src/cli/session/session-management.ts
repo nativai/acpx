@@ -32,6 +32,7 @@ import {
   availableOutputStyles,
   findAdvertisedOutputStyleOption,
   stampAppliedOutputStyle,
+  withSupportedOutputStyleOnly,
 } from "../../session/output-style.js";
 import { persistSessionOwnerOptions } from "../../session/owner-options.js";
 import {
@@ -221,6 +222,15 @@ async function createSessionRecordWithClient(
   };
 
   applyLifecycleSnapshotToRecord(record, lifecycle);
+  // brick://874fee67 F3 — strip a style this agent does not support BEFORE the
+  // first write. Every later write (persist, validate, stamp) reads this same
+  // filtered value, so the "no write on an unsupported agent" rule cannot be
+  // missed by one site while another honours it. All three creation branches
+  // above (new / copy-fork / resume) funnel through here.
+  effectiveSessionOptions = withSupportedOutputStyleOnly(
+    effectiveSessionOptions,
+    sessionResult.configOptions,
+  );
   persistSessionOptions(record, effectiveSessionOptions);
   persistSessionOwnerOptions(record, options);
   applyConfigOptionsToRecord(record, sessionResult);

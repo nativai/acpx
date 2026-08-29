@@ -201,6 +201,45 @@ export function assertOutputStyleAdvertised(
   }
 }
 
+/**
+ * Drop a requested output style the session's agent does not support, BEFORE any
+ * of it reaches the record (brick://874fee67 F3).
+ *
+ * ⚠️ THIS IS THE SINGLE GATE, and it has to be a strip rather than a per-write
+ * check. The shipped bug: `persistRequestedOutputStyle` was gated, but
+ * `persistSessionOptions` and `stampAppliedOutputStyle` each wrote from the raw
+ * requested options and ran either side of it — so `acpx sessions new
+ * --output-style X` against CODEX printed *"ignoring for agent codex"* and then
+ * persisted `output_style: X` **and** `applied_output_style: X` anyway. It said
+ * one thing to the operator and recorded another.
+ *
+ * That mattered far beyond untidiness because of WHICH field it corrupted:
+ * `applied_output_style` is defined as "the style the current live query was
+ * built with", and the design tells the UI to label its chip from it precisely
+ * because it is OUR OWN ACTION RECORD rather than an untrustworthy harness
+ * readback. On that path it asserted an action that never happened, with
+ * `pending: false` claiming the state was settled — the one field designed to
+ * stop the control lying was the one telling the lie.
+ *
+ * Stripping at the source makes every downstream write consistent BY
+ * CONSTRUCTION: persist, validate and stamp all read the same already-filtered
+ * value, so no future write site can miss a gate that no longer exists per-site.
+ *
+ * NOT stripped, deliberately: `applied_output_style: "default"` on an unstyled
+ * session of any agent. That is the spec's stamp-unconditionally rule and is
+ * correct — only a non-default, provably-never-applied value is the defect.
+ */
+export function withSupportedOutputStyleOnly<T extends { outputStyle?: string }>(
+  options: T | undefined,
+  advertised: SessionConfigOption[] | undefined,
+): T | undefined {
+  if (!options?.outputStyle || findAdvertisedOutputStyleOption(advertised)) {
+    return options;
+  }
+  const { outputStyle: _dropped, ...rest } = options;
+  return rest as T;
+}
+
 /** Record-backed wrapper over {@link assertOutputStyleAdvertised} — the form the
  *  `set` verb uses, because it works with NO owner running (the cold case a set
  *  on an idle session takes) and needs no adapter round-trip. One validator, two

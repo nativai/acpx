@@ -27,6 +27,10 @@ import {
   syncAdvertisedModelState,
 } from "../../session/mode-preference.js";
 import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
+import {
+  stampAppliedOutputStyle,
+  withSupportedOutputStyleOnly,
+} from "../../session/output-style.js";
 import { persistSessionOwnerOptions } from "../../session/owner-options.js";
 import type { ClientOperation, SessionRecord, SessionResumePolicy } from "../../types.js";
 import type {
@@ -321,6 +325,22 @@ function seedSessionOptionField(
   // unknown-valued view (not `any`).
   (target as Record<string, unknown>)[field] = value;
   return true;
+}
+
+// brick://874fee67 — record what this query was BUILT with, unconditionally and
+// after success, exactly as the CLI create path does. Without it a
+// manager-created session that HAS a style leaves `applied` absent, which
+// normalizes to "default", which makes outputStyleChangePending true — a
+// spurious owner recycle on the session's very first turn.
+//
+// The value is already strip-filtered at its declaration, so an agent that does
+// not advertise the option stamps the default rather than a style it will never
+// honour (F3).
+function stampCreatedRuntimeOutputStyle(
+  record: SessionRecord,
+  effectiveSessionOptions: SessionAgentOptions | undefined,
+): void {
+  stampAppliedOutputStyle(record, effectiveSessionOptions?.outputStyle);
 }
 
 function legacyTerminalEventFromTurnResult(result: AcpRuntimeTurnResult): AcpRuntimeEvent {
@@ -695,10 +715,13 @@ export class AcpRuntimeManager {
     record.protocolVersion = client.initializeResult?.protocolVersion;
     record.agentCapabilities = client.initializeResult?.agentCapabilities;
     applyConfigOptionsToRecord(record, session.sessionResult);
-    const effectiveSessionOptions = sessionOptionsForCreatedRuntimeSession(
-      agentCommand,
-      input.sessionOptions,
-      session,
+    // brick://874fee67 F3 — strip a style this agent does not advertise at the
+    // DECLARATION, so every read below is already filtered rather than only the
+    // ones that happen to sit after a strip. A style the agent cannot honour
+    // must not reach the record from ANY entry point.
+    const effectiveSessionOptions = withSupportedOutputStyleOnly(
+      sessionOptionsForCreatedRuntimeSession(agentCommand, input.sessionOptions, session),
+      session.sessionResult.configOptions,
     );
     const requestedModelApplied = await applyRequestedModelIfAdvertised({
       client,
@@ -724,6 +747,7 @@ export class AcpRuntimeManager {
     }
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
     await this.carryForwardPinnedFloor(record, effectiveSessionOptions);
+    stampCreatedRuntimeOutputStyle(record, effectiveSessionOptions);
     persistSessionOptions(record, effectiveSessionOptions);
     persistSessionOwnerOptions(record, this.options);
     await this.options.sessionStore.save(record);

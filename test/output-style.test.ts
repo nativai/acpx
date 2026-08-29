@@ -72,8 +72,11 @@ function styledRecord(overrides: Partial<SessionAcpxState> = {}): SessionRecord 
         output_style: STYLE,
         // A non-default profile: the CLI folds an explicit --subscription into
         // `.profile`, which is where the fleet majority of sessions store it, so
-        // a default-sub fixture exercises only the minority path.
-        profile: "sub6",
+        // a default-sub fixture exercises only the minority path. `sub7` is a
+        // REAL profile and the box default is `sub5` — verified with
+        // `acpx profiles list`, because a fixture whose comment claims a fact
+        // about the fleet should not invent the id (`sub6` does not exist).
+        profile: "sub7",
       },
       desired_config_options: { effort: "high", outputStyle: STYLE },
       applied_output_style: STYLE,
@@ -287,7 +290,7 @@ test("REAL FileSessionStore round-trip preserves output_style + applied_output_s
   assert.equal(loaded.acpx?.session_options?.output_style, STYLE);
   assert.equal(loaded.acpx?.applied_output_style, STYLE);
   assert.equal(loaded.acpx?.desired_config_options?.outputStyle, STYLE);
-  assert.equal(loaded.acpx?.session_options?.profile, "sub6"); // non-default-profile control
+  assert.equal(loaded.acpx?.session_options?.profile, "sub7"); // non-default-profile control
   assert.equal(loaded.acpx?.session_options?.effort, "high"); // control
 
   // And the predicate still reads correctly after a cold load — the property that
@@ -568,7 +571,25 @@ function freshCreateManager(store: InMemorySessionStore): AcpRuntimeManager {
         initializeResult: { protocolVersion: 1, agentCapabilities: { loadSession: true } },
         start: async () => {},
         close: async () => {},
-        createSession: async () => ({ sessionId: "os-new-sid", agentSessionId: "os-agent" }),
+        // Must ADVERTISE the option: support is derived from the advertisement,
+        // so a fake that advertises nothing is a fake of an agent that does not
+        // support styles — and the F3 strip would (correctly) drop the pin.
+        createSession: async () => ({
+          sessionId: "os-new-sid",
+          agentSessionId: "os-agent",
+          configOptions: [
+            {
+              id: "outputStyle",
+              name: "Output style",
+              type: "select",
+              currentValue: "default",
+              options: [
+                { value: STYLE, name: STYLE },
+                { value: OTHER_STYLE, name: OTHER_STYLE },
+              ],
+            },
+          ],
+        }),
         loadSession: async () => ({ agentSessionId: "unused" }),
         hasReusableSession: () => false,
         supportsLoadSession: () => true,
@@ -612,9 +633,9 @@ function ensureRespawn(
 
 test("seed: a fresh-create respawn preserves output_style when the spawn flags omit it", async () => {
   const store = new InMemorySessionStore([
-    priorStyledRecord({ output_style: STYLE, profile: "sub6" }),
+    priorStyledRecord({ output_style: STYLE, profile: "sub7" }),
   ]);
-  const record = await ensureRespawn(freshCreateManager(store), { profile: "sub6" });
+  const record = await ensureRespawn(freshCreateManager(store), { profile: "sub7" });
   assert.equal(record.acpx?.session_options?.output_style, STYLE);
   const saved = await store.load("os-respawn");
   assert.equal(saved?.acpx?.session_options?.output_style, STYLE);
@@ -622,10 +643,10 @@ test("seed: a fresh-create respawn preserves output_style when the spawn flags o
 
 test("seed: an explicit spawn --output-style still wins over the prior pin", async () => {
   const store = new InMemorySessionStore([
-    priorStyledRecord({ output_style: STYLE, profile: "sub6" }),
+    priorStyledRecord({ output_style: STYLE, profile: "sub7" }),
   ]);
   const record = await ensureRespawn(freshCreateManager(store), {
-    profile: "sub6",
+    profile: "sub7",
     outputStyle: OTHER_STYLE,
   });
   assert.equal(record.acpx?.session_options?.output_style, OTHER_STYLE);
@@ -633,9 +654,160 @@ test("seed: an explicit spawn --output-style still wins over the prior pin", asy
 
 test("seed: a genuinely NEW session gets no output_style (the cascade governs)", async () => {
   const record = await ensureRespawn(freshCreateManager(new InMemorySessionStore()), {
-    profile: "sub6",
+    profile: "sub7",
   });
   // Absent must stay absent — writing "default" here would convert unset into an
   // explicit pin and permanently defeat any future box- or role-level default.
   assert.equal(record.acpx?.session_options?.output_style, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// F3 — an unsupported agent must record NOTHING (the TE's own control shape)
+// ---------------------------------------------------------------------------
+//
+// THE SHIPPED BUG: `acpx sessions new --output-style X` against CODEX printed
+// "[acpx] --output-style applies to claude; ignoring for agent codex" and then
+// persisted output_style AND applied_output_style anyway. It said one thing to
+// the operator and recorded another.
+//
+// Worse than untidiness because of WHICH field it corrupted: applied is "the
+// style the current live query was built with" and is what the UI labels its
+// chip from, precisely because it is our own action record rather than an
+// untrustworthy harness readback. It asserted an action that never happened,
+// with pending:false claiming the state was settled.
+//
+// The TE's control: create WITH and WITHOUT the flag, everything else equal, and
+// assert the two records differ only where they legitimately should.
+
+function codexManager(store: InMemorySessionStore): AcpRuntimeManager {
+  return new AcpRuntimeManager(createRuntimeOptions({ cwd: "/workspace", sessionStore: store }), {
+    clientFactory: () =>
+      ({
+        initializeResult: { protocolVersion: 1, agentCapabilities: { loadSession: true } },
+        start: async () => {},
+        close: async () => {},
+        // Codex advertises NO outputStyle option — support is derived from this
+        // and nothing else, never from the agent name.
+        createSession: async () => ({
+          sessionId: "codex-sid",
+          agentSessionId: "codex-agent",
+          configOptions: [
+            { id: "effort", name: "effort", type: "select", currentValue: "high", options: [] },
+          ],
+        }),
+        loadSession: async () => ({ agentSessionId: "unused" }),
+        hasReusableSession: () => false,
+        supportsLoadSession: () => true,
+        supportsResumeSession: () => false,
+        loadSessionWithOptions: async () => ({ agentSessionId: "unused" }),
+        getAgentLifecycleSnapshot: () => ({ running: true }),
+        prompt: async () => ({ stopReason: "end_turn" }),
+        requestCancelActivePrompt: async () => false,
+        hasActivePrompt: () => false,
+        setSessionMode: async () => {},
+        setSessionConfigOption: async () => {},
+        clearEventHandlers: () => {},
+        setEventHandlers: () => {},
+      }) as never,
+  });
+}
+
+async function createCodexSession(withStyle: boolean): Promise<SessionRecord> {
+  const store = new InMemorySessionStore();
+  return await codexManager(store).ensureSession({
+    sessionKey: `codex-${withStyle ? "styled" : "plain"}`,
+    agent: "codex",
+    mode: "persistent",
+    sessionOptions: withStyle ? { outputStyle: STYLE } : {},
+  });
+}
+
+test("F3: a codex session does NOT persist a style it was told is being ignored", async () => {
+  const styled = await createCodexSession(true);
+  assert.equal(
+    styled.acpx?.session_options?.output_style,
+    undefined,
+    "acpx warned it was ignoring the flag — it must not then record it",
+  );
+});
+
+test("F3: applied_output_style must never claim an action that did not happen", async () => {
+  const styled = await createCodexSession(true);
+  // `applied` is THE trustworthy field — the one the UI labels its chip from.
+  // "default" is correct and expected here (stamp-unconditionally); the defect
+  // was the non-default, provably-never-applied value.
+  assert.equal(styled.acpx?.applied_output_style, "default");
+  assert.equal(
+    outputStyleChangePending(styled),
+    false,
+    "and pending must stay false — desired is absent, applied is the default",
+  );
+});
+
+test("F3 CONTROL: with-flag and without-flag codex records are identical", async () => {
+  const [withFlag, withoutFlag] = await Promise.all([
+    createCodexSession(true),
+    createCodexSession(false),
+  ]);
+  // The whole point of the control: passing a flag the agent cannot honour must
+  // leave NO trace at all, so the two records agree on every style field.
+  assert.equal(
+    withFlag.acpx?.session_options?.output_style,
+    withoutFlag.acpx?.session_options?.output_style,
+  );
+  assert.equal(withFlag.acpx?.applied_output_style, withoutFlag.acpx?.applied_output_style);
+  assert.equal(
+    withFlag.acpx?.desired_config_options?.outputStyle,
+    withoutFlag.acpx?.desired_config_options?.outputStyle,
+  );
+});
+
+test("F3: a CLAUDE session (which advertises the option) still persists normally", async () => {
+  // The negative half of the control — proving the strip is scoped to the
+  // unsupported case and has not simply broken the feature everywhere.
+  const store = new InMemorySessionStore();
+  const manager = new AcpRuntimeManager(
+    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+    {
+      clientFactory: () =>
+        ({
+          initializeResult: { protocolVersion: 1, agentCapabilities: { loadSession: true } },
+          start: async () => {},
+          close: async () => {},
+          createSession: async () => ({
+            sessionId: "claude-sid",
+            agentSessionId: "claude-agent",
+            configOptions: [
+              {
+                id: "outputStyle",
+                name: "Output style",
+                type: "select",
+                currentValue: "default",
+                options: [{ value: STYLE, name: STYLE }],
+              },
+            ],
+          }),
+          loadSession: async () => ({ agentSessionId: "unused" }),
+          hasReusableSession: () => false,
+          supportsLoadSession: () => true,
+          supportsResumeSession: () => false,
+          loadSessionWithOptions: async () => ({ agentSessionId: "unused" }),
+          getAgentLifecycleSnapshot: () => ({ running: true }),
+          prompt: async () => ({ stopReason: "end_turn" }),
+          requestCancelActivePrompt: async () => false,
+          hasActivePrompt: () => false,
+          setSessionMode: async () => {},
+          setSessionConfigOption: async () => {},
+          clearEventHandlers: () => {},
+          setEventHandlers: () => {},
+        }) as never,
+    },
+  );
+  const record = await manager.ensureSession({
+    sessionKey: "claude-styled",
+    agent: "claude",
+    mode: "persistent",
+    sessionOptions: { outputStyle: STYLE },
+  });
+  assert.equal(record.acpx?.session_options?.output_style, STYLE);
 });
