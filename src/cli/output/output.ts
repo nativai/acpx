@@ -321,6 +321,23 @@ function renderAuthRequiredHint(params: RenderableOutputError): string {
 export function getTextErrorRemediationHints(params: RenderableOutputError): string[] {
   const lowerMessage = params.message.toLowerCase();
 
+  // brick://874fee67 F2 — SHOW THE REASON INSTEAD OF POINTING AT A FLAG.
+  //
+  // Several rules below say "rerun with `--verbose` to capture the underlying ACP
+  // error details". On an ACP fault that advice is a dead end: the payload's
+  // `data.details` already holds the diagnosis and is sitting right here in
+  // `params.acp`, while `--verbose` adds nothing on these paths — a test-engineer
+  // followed the hint, reran, got no extra detail, and lost the time.
+  //
+  // A hint that does not work is worse than no hint, for the same reason a false
+  // comment is worse than none: the reader trusts it INSTEAD of investigating.
+  // So when we hold the details, print them; the verbose hints below then apply
+  // only to the case they are actually true for — an ACP error with no details.
+  const acpDetails = acpErrorDetails(params);
+  if (acpDetails && !params.message.includes(acpDetails)) {
+    return [`hint: the agent reported: ${acpDetails}`];
+  }
+
   if (params.detailCode === "AUTH_REQUIRED") {
     return [renderAuthRequiredHint(params)];
   }
@@ -380,6 +397,17 @@ const TEXT_ERROR_HINT_RULES: TextErrorHintRule[] = [
     hints: ["hint: rerun with `--verbose` to capture the underlying ACP error details."],
   },
 ];
+
+// The `data.details` string an adapter attaches to a JSON-RPC fault, whose
+// top-level `message` is the generic "Internal error".
+function acpErrorDetails(params: RenderableOutputError): string | undefined {
+  const data = params.acp?.data;
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return undefined;
+  }
+  const details = (data as { details?: unknown }).details;
+  return typeof details === "string" && details.trim().length > 0 ? details : undefined;
+}
 
 function matchingTextErrorRule(
   params: RenderableOutputError,

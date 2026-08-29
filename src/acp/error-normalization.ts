@@ -15,6 +15,8 @@ import {
 import type { EffectiveAccountMetadata } from "./auth-env.js";
 import {
   extractAcpError,
+  extractAcpErrorDetails,
+  formatAcpErrorMessage,
   formatUnknownErrorMessage,
   isAcpResourceNotFoundError,
 } from "./error-shapes.js";
@@ -215,7 +217,12 @@ export function formatErrorMessage(error: unknown): string {
   return formatUnknownErrorMessage(error);
 }
 
-export { extractAcpError, isAcpResourceNotFoundError };
+export {
+  extractAcpError,
+  extractAcpErrorDetails,
+  formatAcpErrorMessage,
+  isAcpResourceNotFoundError,
+};
 
 export function isAcpQueryClosedBeforeResponseError(error: unknown): boolean {
   const acp = extractAcpError(error);

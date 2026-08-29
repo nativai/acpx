@@ -128,6 +128,28 @@ export function extractAcpError(error: unknown): OutputErrorAcpPayload | undefin
   return extractAcpErrorInternal(error, 0);
 }
 
+/**
+ * The human-meaningful half of an ACP error — `data.details` — which the top-level
+ * `message` routinely does NOT contain (brick://874fee67 F2).
+ *
+ * JSON-RPC's `message` for a server-side fault is the generic `"Internal error"`,
+ * while the adapter puts the actual diagnosis in `data.details`. `formatErrorMessage`
+ * returns only `message`, so surfacing an ACP failure through it alone shows the
+ * user the word "Internal error" and DROPS the one string that says what went
+ * wrong. Compose the two instead of choosing between them.
+ */
+export function extractAcpErrorDetails(error: unknown): string | undefined {
+  const details = asRecord(extractAcpError(error)?.data)?.details;
+  return typeof details === "string" && details.trim().length > 0 ? details : undefined;
+}
+
+/** `message`, plus `data.details` when the payload carries one. */
+export function formatAcpErrorMessage(error: unknown): string {
+  const base = formatUnknownErrorMessage(error);
+  const details = extractAcpErrorDetails(error);
+  return details && !base.includes(details) ? `${base}: ${details}` : base;
+}
+
 export function isAcpResourceNotFoundError(error: unknown): boolean {
   const acp = extractAcpError(error);
   if (acp && RESOURCE_NOT_FOUND_ACP_CODES.has(acp.code)) {
