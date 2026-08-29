@@ -38,7 +38,7 @@ import {
   syncAdvertisedModelState,
 } from "../../session/mode-preference.js";
 import { guardServedModel, stampModelGuardBreadcrumb } from "../../session/model-guard.js";
-import { stampAppliedOutputStyle } from "../../session/output-style.js";
+import { recordAppliedOutputStyleOutcome } from "../../session/output-style.js";
 import type { SessionRecord, SessionResumePolicy } from "../../types.js";
 import {
   applyLifecycleSnapshotToRecord,
@@ -317,7 +317,8 @@ async function replayDesiredConfigOptions(params: {
   record: SessionRecord;
   timeoutMs?: number;
   verbose?: boolean;
-}): Promise<void> {
+}): Promise<string[]> {
+  const declined: string[] = [];
   const normalizedDesiredConfigOptions: Array<[configId: string, value: string]> = [];
   for (const [configId, value] of Object.entries(params.desiredConfigOptions)) {
     const replayValue = replayConfigOptionValue(configId, value, params.desiredModelId);
@@ -338,17 +339,25 @@ async function replayDesiredConfigOptions(params: {
       // A returning call means the agent DECLINED the option — degrade with a
       // visible warning and proceed with the turn. Only a transport failure
       // rethrows. See handleConfigOptionReplayError.
-      handleConfigOptionReplayError({
-        configId,
-        error,
-        sessionId: params.sessionId,
-        verbose: params.verbose,
-      });
+      // brick://874fee67 F6: a decline is an OUTCOME the record has to reflect.
+      // Swallowing it here and stamping `applied` from the REQUEST is how acpx
+      // came to log "rejected ... NOT in effect" and record the opposite.
+      if (
+        handleConfigOptionReplayError({
+          configId,
+          error,
+          sessionId: params.sessionId,
+          verbose: params.verbose,
+        })
+      ) {
+        declined.push(configId);
+      }
     }
   }
   for (const [configId, value] of normalizedDesiredConfigOptions) {
     setDesiredConfigOption(params.record, configId, value);
   }
+  return declined;
 }
 
 // Decide how a config-option replay failure is handled.
@@ -384,10 +393,10 @@ function handleConfigOptionReplayError(params: {
   error: unknown;
   sessionId: string;
   verbose?: boolean;
-}): void {
+}): boolean {
   if (extractAcpError(params.error)) {
     warnConfigOptionReplayDegraded(params);
-    return;
+    return true; // DECLINED by the agent — the caller must record that outcome
   }
   throw new SessionConfigOptionReplayError(
     // formatAcpErrorMessage, not formatErrorMessage: a JSON-RPC fault's `message`
@@ -496,18 +505,6 @@ export async function connectAndLoadSession(
   pendingAgentSessionId = loadState.pendingAgentSessionId;
   sessionModels = loadState.sessionModels;
 
-  // brick://874fee67 turn-boundary spec §3 — the primary stamp site. The query
-  // backing this session has just been (re)built, and `client.getSessionOutputStyle()`
-  // is the very value its `_meta` was composed from, so `applied` cannot drift
-  // from what was actually sent. Stamped AFTER success and UNCONDITIONALLY,
-  // including for the default.
-  //
-  // This is also what makes a recycle terminal rather than repeating: the fresh
-  // owner resumes with `desired`, stamps it here as `applied`, and
-  // `outputStyleChangePending` goes false — so the next turn boundary does not
-  // recycle again.
-  stampAppliedOutputStyle(record, options.outputStyle);
-
   const replayResult = await replayReconnectedSessionPreferences({
     client,
     record,
@@ -523,6 +520,20 @@ export async function connectAndLoadSession(
     timeoutMs: options.timeoutMs,
     verbose: options.verbose,
   });
+
+  // brick://874fee67 turn-boundary spec §3, corrected by F6 — the primary stamp
+  // site, and it runs AFTER the replay ON PURPOSE.
+  //
+  // It used to stamp `options.outputStyle` (the REQUEST) before the replay ran.
+  // That produced the exact failure this feature exists to forbid: on a failover
+  // to a subscription where the style does not exist, acpx logged
+  // "rejected ... NOT in effect for this turn" and recorded `applied = <the
+  // style>` anyway — so `pending` was false, nothing retried, nothing surfaced
+  // it, and the chip read "installed" on a session provably running default.
+  // A loud failure had been traded for a silent falsehood.
+  //
+  // `applied` is an OUTCOME field. Stamp it from what the agent ACCEPTED.
+  recordAppliedOutputStyleOutcome(record, options.outputStyle, replayResult.declinedConfigOptions);
 
   applyReconnectedModelState(
     record,
@@ -577,6 +588,9 @@ function logReconnectAttempt(
 
 type PreferenceReplayResult = {
   desiredModelRestored: boolean;
+  /** Config option ids the agent DECLINED on this (re)connect. brick://874fee67 F6:
+   *  the record must reflect the outcome, not the request. */
+  declinedConfigOptions: string[];
 };
 
 async function replayReconnectedSessionPreferences(params: {
@@ -595,10 +609,11 @@ async function replayReconnectedSessionPreferences(params: {
   verbose?: boolean;
 }): Promise<PreferenceReplayResult> {
   if (!params.shouldReplayPreferences) {
-    return { desiredModelRestored: false };
+    return { desiredModelRestored: false, declinedConfigOptions: [] };
   }
 
   let desiredModelRestored = false;
+  let declinedConfigOptions: string[] = [];
   try {
     await replayDesiredMode({
       client: params.client,
@@ -618,7 +633,7 @@ async function replayReconnectedSessionPreferences(params: {
       timeoutMs: params.timeoutMs,
       verbose: params.verbose,
     });
-    await replayDesiredConfigOptions({
+    declinedConfigOptions = await replayDesiredConfigOptions({
       client: params.client,
       sessionId: params.sessionId,
       desiredConfigOptions: params.desiredConfigOptions,
@@ -642,7 +657,7 @@ async function replayReconnectedSessionPreferences(params: {
 
   params.record.acpSessionId = params.sessionId;
   reconcileAgentSessionId(params.record, params.pendingAgentSessionId);
-  return { desiredModelRestored };
+  return { desiredModelRestored, declinedConfigOptions };
 }
 
 type RuntimeSessionLoadState = {

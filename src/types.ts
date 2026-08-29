@@ -493,6 +493,22 @@ export type SessionAcpxState = {
    * session is indistinguishable from "unknown" and would force a spurious recycle.
    */
   applied_output_style?: string;
+  /**
+   * brick://874fee67 F6 — an output style the agent DECLINED for the current
+   * query (e.g. a custom style that does not exist under the subscription this
+   * session failed over to). Runtime-observed, like `applied_output_style`.
+   *
+   * It exists so the record can be HONEST about a refusal without spinning: with
+   * only desired/applied, stamping the truthful `applied = "default"` after a
+   * decline leaves `desired != applied` forever, and the pending predicate would
+   * recycle the owner on every turn boundary trying to apply something the agent
+   * has already refused. Recording WHICH value was refused lets `pending`
+   * distinguish "not yet applied" from "applied-attempt refused".
+   *
+   * Cleared whenever a style is accepted, and bypassed the moment the user picks
+   * a DIFFERENT style — a new choice is always worth one attempt.
+   */
+  refused_output_style?: string;
   /** Fix A (brick 92a994a0): the context-window size (in tokens) the adapter
    *  last reported for `context_window_model_id`, round-tripped back to the
    *  adapter on resume as `_meta.claudeCode.contextWindowSizeHint` so a restored

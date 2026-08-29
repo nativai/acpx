@@ -690,6 +690,7 @@ export function cloneSessionAcpxState(
     // here would make every turn's clone report "no style applied", which the
     // derived pending predicate reads as a pending change → a recycle per turn.
     applied_output_style: state.applied_output_style,
+    refused_output_style: state.refused_output_style,
     context_window_size: state.context_window_size,
     context_window_model_id: state.context_window_model_id,
     available_models: state.available_models ? [...state.available_models] : undefined,

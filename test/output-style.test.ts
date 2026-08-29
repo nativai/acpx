@@ -811,3 +811,123 @@ test("F3: a CLAUDE session (which advertises the option) still persists normally
   });
   assert.equal(record.acpx?.session_options?.output_style, STYLE);
 });
+
+// ---------------------------------------------------------------------------
+// F5 — correctness pins must not survive the READ boundary
+// ---------------------------------------------------------------------------
+//
+// The config-option replay now DEGRADES on an agent decline rather than failing
+// the turn, and that is only safe because everything in desired_config_options
+// is a preference. `setDesiredConfigOption` refuses mode/model on the way IN —
+// but that is one write site, and the parser filtered only on the value being a
+// string, never inspecting the key. A record injected with {mode, model, effort}
+// parsed fine and kept all three, so a correctness-bearing option COULD reach
+// the degrade path. Discipline at one write site is not construction.
+
+test("F5: mode/model are stripped from desired_config_options on READ", async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-f5-"));
+  t.after(async () => {
+    await fs.rm(stateDir, { recursive: true, force: true });
+  });
+  const store = createFileSessionStore({ stateDir });
+  // Save a REAL record first, then inject the hostile keys into the JSON on
+  // disk — the same shape the TE used. Going through the store guarantees a
+  // schema-valid record, so a load failure cannot masquerade as a clean filter.
+  await store.save(
+    makeSessionRecord({
+      acpxRecordId: "f5-rec",
+      acpSessionId: "f5-sid",
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+      cwd: "/workspace",
+      acpx: { desired_config_options: { effort: "high" } },
+    }),
+  );
+  // The store nests its files under stateDir; find the record rather than
+  // assuming a layout (and assert exactly one, so this cannot silently patch
+  // the wrong file).
+  const found = (await fs.readdir(stateDir, { recursive: true, withFileTypes: true }))
+    .filter((entry) => entry.isFile() && entry.name === "f5-rec.json")
+    .map((entry) => path.join(entry.parentPath, entry.name));
+  assert.equal(found.length, 1, `expected exactly one f5-rec.json, got ${found.join(", ")}`);
+  const file = found[0];
+  const raw = JSON.parse(await fs.readFile(file, "utf8")) as {
+    acpx: { desired_config_options: Record<string, string> };
+  };
+  // The write-side guard would refuse these, which is exactly why the read side
+  // has to stand on its own.
+  raw.acpx.desired_config_options = {
+    mode: "bypassPermissions",
+    model: "opus",
+    Mode: "sneaky",
+    MODEL: "sneakier",
+    effort: "high",
+  };
+  await fs.writeFile(file, JSON.stringify(raw), "utf8");
+
+  const loaded = await createFileSessionStore({ stateDir }).load("f5-rec");
+  assert.ok(loaded, "record must load");
+  const desired = loaded.acpx?.desired_config_options ?? {};
+  // CONTROL: the preference survives, so this is a filter and not a wipe.
+  assert.equal(desired.effort, "high");
+  // Only the preference survives.
+  assert.deepEqual(Object.keys(desired), ["effort"]);
+  // Case-insensitive on purpose: the write-side guard compares after a trim
+  // only, so "Mode"/"MODEL" would slip past a case-sensitive read filter too.
+  assert.equal(desired.Mode, undefined);
+  assert.equal(desired.MODEL, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// The ensureSession applied-stamp (reported UNVERIFIED by the TE — pinned here)
+// ---------------------------------------------------------------------------
+
+test("ensureSession stamps applied for a STYLED session (no spurious first-turn recycle)", async () => {
+  const store = new InMemorySessionStore();
+  const manager = new AcpRuntimeManager(
+    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+    {
+      clientFactory: () =>
+        ({
+          initializeResult: { protocolVersion: 1, agentCapabilities: { loadSession: true } },
+          start: async () => {},
+          close: async () => {},
+          createSession: async () => ({
+            sessionId: "styled-sid",
+            agentSessionId: "styled-agent",
+            configOptions: [
+              {
+                id: "outputStyle",
+                name: "Output style",
+                type: "select",
+                currentValue: "default",
+                options: [{ value: STYLE, name: STYLE }],
+              },
+            ],
+          }),
+          loadSession: async () => ({ agentSessionId: "unused" }),
+          hasReusableSession: () => false,
+          supportsLoadSession: () => true,
+          supportsResumeSession: () => false,
+          loadSessionWithOptions: async () => ({ agentSessionId: "unused" }),
+          getAgentLifecycleSnapshot: () => ({ running: true }),
+          prompt: async () => ({ stopReason: "end_turn" }),
+          requestCancelActivePrompt: async () => false,
+          hasActivePrompt: () => false,
+          setSessionMode: async () => {},
+          setSessionConfigOption: async () => {},
+          clearEventHandlers: () => {},
+          setEventHandlers: () => {},
+        }) as never,
+    },
+  );
+  const record = await manager.ensureSession({
+    sessionKey: "styled-ensure",
+    agent: "claude",
+    mode: "persistent",
+    sessionOptions: { outputStyle: STYLE },
+  });
+  assert.equal(record.acpx?.applied_output_style, STYLE);
+  // The point of the stamp: without it applied is absent, normalizes to
+  // "default", and pending goes true — recycling the owner on the first turn.
+  assert.equal(outputStyleChangePending(record), false);
+});

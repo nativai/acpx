@@ -106,10 +106,55 @@ export function appliedOutputStyle(record: SessionRecord): string | undefined {
  * expressions disagree — which is the state nobody tests.
  */
 export function outputStyleChangePending(record: SessionRecord): boolean {
-  return (
-    normalizeOutputStyle(desiredOutputStyle(record)) !==
-    normalizeOutputStyle(appliedOutputStyle(record))
-  );
+  const desired = normalizeOutputStyle(desiredOutputStyle(record));
+  if (desired === normalizeOutputStyle(appliedOutputStyle(record))) {
+    return false;
+  }
+  // brick://874fee67 F6 — a style the agent has already REFUSED is not pending;
+  // it is unavailable. Without this the honest `applied = "default"` stamp after
+  // a decline would leave desired != applied forever and recycle the owner at
+  // every turn boundary, retrying something already refused. A DIFFERENT choice
+  // bypasses the marker, because a new choice is always worth one attempt.
+  const refused = record.acpx?.refused_output_style;
+  return refused === undefined || desired !== normalizeOutputStyle(refused);
+}
+
+/** The style the agent DECLINED for the current query, if any. */
+export function refusedOutputStyle(record: SessionRecord): string | undefined {
+  return record.acpx?.refused_output_style;
+}
+
+/**
+ * Record what the agent ACTUALLY ACCEPTED — the F6 fix, and the whole point of
+ * `applied` being an outcome field rather than an echo of the request.
+ *
+ * Call this AFTER the config-option replay, with the ids the agent declined.
+ *
+ * The bug this replaces: `applied` was stamped from the REQUEST before the
+ * replay ran, so on a failover to a subscription lacking the style acpx logged
+ * *"rejected … NOT in effect for this turn"* and recorded `applied = <style>`
+ * anyway. `pending` was then false, so nothing retried and nothing surfaced it,
+ * and the chip read "installed" on a session provably running default. That is
+ * the control-that-lies failure this feature exists to forbid — and it was a
+ * regression in KIND, trading a loud failure for a silent falsehood.
+ */
+export function recordAppliedOutputStyleOutcome(
+  record: SessionRecord,
+  requested: string | undefined,
+  declinedConfigIds: readonly string[],
+): void {
+  if (declinedConfigIds.includes(OUTPUT_STYLE_CONFIG_ID)) {
+    // Declined: the query is running the harness default, whatever we asked for.
+    stampAppliedOutputStyle(record, OUTPUT_STYLE_DEFAULT_ID);
+    record.acpx = { ...record.acpx, refused_output_style: normalizeOutputStyle(requested) };
+    return;
+  }
+  stampAppliedOutputStyle(record, requested);
+  if (record.acpx?.refused_output_style !== undefined) {
+    // Accepted — any prior refusal is stale and must not keep suppressing pending.
+    const { refused_output_style: _cleared, ...rest } = record.acpx;
+    record.acpx = rest;
+  }
 }
 
 /**

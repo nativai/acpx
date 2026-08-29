@@ -16,6 +16,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { getTextErrorRemediationHints } from "../src/cli/output/output.js";
 import { connectAndLoadSession } from "../src/runtime/engine/reconnect.js";
+import { setDesiredConfigOption } from "../src/session/mode-preference.js";
+import { outputStyleChangePending } from "../src/session/output-style.js";
 import type { SessionRecord } from "../src/types.js";
 import { makeSessionRecord } from "./runtime-test-helpers.js";
 
@@ -213,7 +215,7 @@ test("F2: the '--verbose' hint is replaced by the actual reason when we hold it"
   );
 });
 
-test("F2: with no details available, the verbose hint is still offered", () => {
+test("F2: with no details available, the hint points at the log rather than at --verbose", () => {
   // The verbose hints are only wrong when we HAVE the details. Keep them for the
   // case they are actually true for.
   const hints = getTextErrorRemediationHints({
@@ -222,9 +224,15 @@ test("F2: with no details available, the verbose hint is still offered", () => {
     message: "Internal error",
     acp: { code: -32603, message: "Internal error" },
   });
+  // It must NOT promise that --verbose adds detail — measured false on this path,
+  // where the reason lives in the queue-owner log instead. It must point there.
   assert.ok(
-    hints.some((hint) => hint.includes("--verbose")),
-    `expected the verbose hint to survive when there are no details, got: ${JSON.stringify(hints)}`,
+    hints.some((hint) => hint.includes("queue-owner log")),
+    `expected a hint pointing at the surface that HAS the reason, got: ${JSON.stringify(hints)}`,
+  );
+  assert.ok(
+    !hints.some((hint) => hint.includes("rerun with `--verbose` to capture")),
+    "must not promise detail that --verbose does not add on this path",
   );
 });
 
@@ -264,4 +272,114 @@ test("F1: effort stays quiet unless --verbose (known-benign, high-frequency)", a
   assert.equal(result.error, undefined);
   assert.deepEqual(result.calls, ["effort"], "subject witness: the replay ran");
   assert.equal(stderr, "", `effort must not warn by default, got: ${JSON.stringify(stderr)}`);
+});
+
+// ─── F6: the record must reflect the OUTCOME, never the request ─────────────
+//
+// THE MEASURED BUG, on ONE session simultaneously:
+//   owner.log : `config option "outputStyle" was rejected ... NOT in effect`
+//   record    : desired=nv-alpha  applied=nv-alpha
+//   status    : outputStylePending FALSE
+//   the agent : ran in DEFAULT
+//
+// acpx KNEW the style was refused, LOGGED exactly that, and RECORDED the
+// opposite — and because desired == applied, pending was false, so nothing
+// retried and nothing surfaced it. The chip would read "installed" on a session
+// provably running default.
+//
+// A regression in KIND, not degree: before the F1 degrade the turn died loudly;
+// after it, it succeeded while recording something untrue. Loud failure traded
+// for silent falsehood is the one direction this design exists to prevent.
+
+async function replayStyled(
+  desiredStyle: string,
+  reject: boolean,
+  seed: Partial<NonNullable<SessionRecord["acpx"]>> = {},
+): Promise<SessionRecord> {
+  const record = makeSessionRecord({
+    acpxRecordId: "f6-rec",
+    acpSessionId: "f6-sid",
+    agentName: "claude",
+    agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+    cwd: "/workspace",
+    acpx: {
+      desired_config_options: { outputStyle: desiredStyle },
+      session_options: { output_style: desiredStyle, profile: "sub7" },
+      ...seed,
+    },
+  });
+  await connectAndLoadSession({
+    client: fakeClient(
+      {
+        rejectConfigIds: reject
+          ? new Map([["outputStyle", acpRejection(`Unknown output style: ${desiredStyle}`)]])
+          : new Map(),
+      },
+      [],
+    ),
+    record,
+    outputStyle: desiredStyle,
+    activeController: {} as never,
+  });
+  return record;
+}
+
+test("F6: a REJECTED style is NOT stamped as applied", async () => {
+  const record = await replayStyled("nv-alpha", true);
+  assert.notEqual(
+    record.acpx?.applied_output_style,
+    "nv-alpha",
+    "acpx logged that the style was refused — it must not record it as applied",
+  );
+  // The query is running the harness default, so that is what `applied` says.
+  assert.equal(record.acpx?.applied_output_style, "default");
+});
+
+test("F6: a refused style is surfaced, not silently swallowed", async () => {
+  const record = await replayStyled("nv-alpha", true);
+  assert.equal(
+    record.acpx?.refused_output_style,
+    "nv-alpha",
+    "the refusal must be recorded so a consumer can say 'unavailable' rather than 'installed'",
+  );
+});
+
+test("F6: a refused style does NOT spin the owner in a recycle loop", async () => {
+  const record = await replayStyled("nv-alpha", true);
+  // Honest `applied` alone would leave desired != applied forever, recycling the
+  // owner at every turn boundary to retry something already refused.
+  assert.equal(
+    outputStyleChangePending(record),
+    false,
+    "refused is not pending — it is unavailable, and retrying cannot change that",
+  );
+});
+
+test("F6: choosing a DIFFERENT style after a refusal is still attempted", async () => {
+  // The marker must not become a permanent lockout: a new choice is always worth
+  // one attempt, so pending must go true again for a different value.
+  const record = await replayStyled("nv-alpha", true);
+  setDesiredConfigOption(record, "outputStyle", "Explanatory");
+  assert.equal(outputStyleChangePending(record), true);
+});
+
+test("F6: an ACCEPTED style clears a stale refusal", async () => {
+  const record = await replayStyled("Explanatory", false, {
+    refused_output_style: "Explanatory",
+  });
+  assert.equal(record.acpx?.applied_output_style, "Explanatory");
+  assert.equal(
+    record.acpx?.refused_output_style,
+    undefined,
+    "a stale refusal must not keep suppressing pending after the style is accepted",
+  );
+});
+
+test("F6 CONTROL: an accepted style IS stamped as applied", async () => {
+  // The negative half — proving the fix is scoped to the decline and has not
+  // simply stopped recording applied altogether.
+  const record = await replayStyled("Explanatory", false);
+  assert.equal(record.acpx?.applied_output_style, "Explanatory");
+  assert.equal(record.acpx?.refused_output_style, undefined);
+  assert.equal(outputStyleChangePending(record), false);
 });

@@ -360,6 +360,26 @@ type TextErrorHintRule = {
   hints: string[];
 };
 
+// brick://874fee67 F2 — these two rules used to say "rerun with `--verbose` to
+// capture the ACP error details". MEASURED FALSE: a test-engineer hit this
+// failure while ALREADY running `--verbose` and got no extra detail, then
+// followed the hint and lost the time again.
+//
+// The mechanism: the real reason lives in the ACP payload's `data.details`, and
+// the code that composes it runs INSIDE the queue owner, so it lands in
+// `owner.log`. The CLI foreground renders the same failure through a separate
+// path that never sees that payload — so `--verbose` on the foreground has
+// nothing extra to print, on this path, by construction.
+//
+// A hint that does not work is worse than no hint, for the same reason a false
+// comment is worse than none: the reader trusts it INSTEAD of investigating. So
+// point at the surface that demonstrably HAS the detail. When the payload does
+// reach us, `getTextErrorRemediationHints` prints the reason itself and this
+// never runs.
+const ACP_DETAIL_HINT =
+  "hint: the agent's own reason for this failure is recorded in the session's queue-owner log " +
+  "(`acpx sessions logs <session>`), not on this stream — `--verbose` does not add it here.";
+
 const TEXT_ERROR_HINT_RULES: TextErrorHintRule[] = [
   {
     matches: (_params, lowerMessage) => isUnsupportedSessionLoadError(lowerMessage),
@@ -388,13 +408,11 @@ const TEXT_ERROR_HINT_RULES: TextErrorHintRule[] = [
   },
   {
     matches: (_params, lowerMessage) => isSessionConfigMethodError(lowerMessage),
-    hints: [
-      "hint: rerun with `--verbose` to capture the ACP method/error details before retrying.",
-    ],
+    hints: [ACP_DETAIL_HINT],
   },
   {
     matches: isRuntimeAcpProtocolError,
-    hints: ["hint: rerun with `--verbose` to capture the underlying ACP error details."],
+    hints: [ACP_DETAIL_HINT],
   },
 ];
 
