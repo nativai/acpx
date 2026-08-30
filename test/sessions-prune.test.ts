@@ -930,7 +930,10 @@ test("pruneSessions treats a raw-read FAILURE on the guard's second read as prot
     // reason.
     assert.ok(faultFired, "expected the injected fault to fire on the target file's second read");
 
-    assert.deepEqual(result.pruned.map((r) => r.acpxRecordId), []);
+    assert.deepEqual(
+      result.pruned.map((r) => r.acpxRecordId),
+      [],
+    );
     assert.deepEqual(
       result.skippedTemplates.map((r) => r.acpxRecordId),
       ["fault-injected-bp"],
