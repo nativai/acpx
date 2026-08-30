@@ -733,6 +733,132 @@ test("pruneSessions leaves the template's stream sidecars alone under --include-
   });
 });
 
+// ─── brick://bbaa1ef4: the guard must fail safe on a MALFORMED-but-PRESENT
+// on-disk `template` block, not only a well-formed one ─────────────────────
+// The parser (parseTemplateState, src/session/persistence/parse.ts) leniently
+// drops a `template` block it cannot recognize — returns `undefined` — so
+// isTemplateMarkedRecord's PARSED-value check (`record.template != null`) is
+// blind to a present-but-malformed block from the very first read, and a
+// plain checkpoint write (readPersistedLifecycle re-parses, drops the same
+// way) then silently erases the block from disk entirely. Measured live
+// against origin/dev@b8c79f2 (brick bbaa1ef4 probe/FINDINGS.md): a malformed
+// block was NOT skipped by prune and a real scoped prune deleted it with no
+// warning. The fix guards on the RAW on-disk `template` key instead, which is
+// non-null whenever the block is present, well-formed or not.
+
+async function patchRawTemplateField(
+  homeDir: string,
+  acpxRecordId: string,
+  rawTemplate: unknown,
+): Promise<void> {
+  const filePath = sessionFilePath(homeDir, acpxRecordId);
+  const raw = JSON.parse(await fs.readFile(filePath, "utf8")) as Record<string, unknown>;
+  raw.template = rawTemplate;
+  await fs.writeFile(filePath, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+}
+
+test("pruneSessions skips a session whose on-disk template is present but non-object (malformed shape A)", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "malformed-a",
+        acpSessionId: "malformed-a",
+        agentCommand: "agent-a",
+        cwd,
+        closed: true,
+        closedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    // asRecord() (parse.ts) rejects a non-object `template` outright — the raw
+    // block parses to undefined even though it is clearly present on disk.
+    await patchRawTemplateField(homeDir, "malformed-a", "marked-as-template");
+
+    const result = await session.pruneSessions({ agentCommand: "agent-a" });
+
+    assert.deepEqual(
+      result.pruned.map((r) => r.acpxRecordId),
+      [],
+    );
+    assert.deepEqual(
+      result.skippedTemplates.map((r) => r.acpxRecordId),
+      ["malformed-a"],
+    );
+    assert.ok(await fileExists(sessionFilePath(homeDir, "malformed-a")));
+  });
+});
+
+test("pruneSessions skips a session whose on-disk template object has no recognized/type-matching field (malformed shape B)", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "malformed-b",
+        acpSessionId: "malformed-b",
+        agentCommand: "agent-a",
+        cwd,
+        closed: true,
+        closedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    // Every field is either unrecognized or fails its type check (`enabled`
+    // must be boolean, `created_at` must be string) — parseTemplateState's
+    // per-field guards all fail, the parsed object stays `{}`, and it returns
+    // undefined even though `raw.template` is a non-null object.
+    await patchRawTemplateField(homeDir, "malformed-b", {
+      enabled: "yes",
+      created_at: 123,
+      unknown_field: "x",
+    });
+
+    const result = await session.pruneSessions({ agentCommand: "agent-a" });
+
+    assert.deepEqual(
+      result.pruned.map((r) => r.acpxRecordId),
+      [],
+    );
+    assert.deepEqual(
+      result.skippedTemplates.map((r) => r.acpxRecordId),
+      ["malformed-b"],
+    );
+    assert.ok(await fileExists(sessionFilePath(homeDir, "malformed-b")));
+  });
+});
+
+test("pruneSessions still deletes a session with no template field at all (negative control, unaffected by the raw-key guard)", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "no-template",
+        acpSessionId: "no-template",
+        agentCommand: "agent-a",
+        cwd,
+        closed: true,
+        closedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    const result = await session.pruneSessions({ agentCommand: "agent-a" });
+
+    assert.deepEqual(
+      result.pruned.map((r) => r.acpxRecordId),
+      ["no-template"],
+    );
+    assert.equal(result.skippedTemplates.length, 0);
+    assert.ok(!(await fileExists(sessionFilePath(homeDir, "no-template"))));
+  });
+});
+
 // ─── brick://dd4cb0e8: scope selectors at the core ───────────────────────────
 // The scope REQUIREMENT lives at the CLI (test/sessions-prune-scope.test.ts); the
 // scope FILTERS live here, next to the template skip they extend.

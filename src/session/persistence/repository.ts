@@ -1280,7 +1280,7 @@ export type PruneOptions = {
   before?: Date;
   olderThanMs?: number;
   includeHistory?: boolean;
-  /** Opt in to deleting template blueprints too. Off by default — see isTemplateMarkedRecord. */
+  /** Opt in to deleting template blueprints too. Off by default — see isTemplateMarkedOnDisk. */
   includeTemplates?: boolean;
   dryRun?: boolean;
   /** Exactly these sessions (acpx record id, ACP session id, or unique suffix). */
@@ -1370,9 +1370,33 @@ export type PruneIdResolution = {
  * prune, and `templates rollback` then has nothing to roll back to. The mark is
  * the presence of the block, at any version, enabled or not. The disabled-template
  * case in test/sessions-prune.test.ts goes red if this is narrowed.
+ *
+ * ⚠️ Reads the RAW on-disk `template` field, not `record.template` (brick://bbaa1ef4).
+ * `record.template` is `parseTemplateState`'s output (parse.ts) — LOSSY by design:
+ * a `template` block the parser cannot recognize (unrecognized/mistyped fields, or
+ * a non-object value) leniently parses to `undefined`, since the daemon only
+ * round-trips the block and never authors it. That makes a check against the
+ * PARSED value blind to a block that is present-but-malformed on disk from the
+ * very first read — and a plain checkpoint write re-parses and re-serializes,
+ * so the malformed block then vanishes from disk too, deleting the evidence it
+ * was ever there. `raw.template != null` is a strict superset of
+ * `parseTemplateState(raw) != null` in the destruction-safe direction: every
+ * raw shape the parser accepts is also raw-non-null, so this only ever widens
+ * what gets protected, never narrows it. Measured against a real prune run:
+ * before this fix, a malformed-but-present block was NOT skipped and was
+ * deleted with no warning (bbaa1ef4 probe/FINDINGS.md).
  */
-function isTemplateMarkedRecord(record: SessionRecord): boolean {
-  return record.template != null;
+async function isTemplateMarkedOnDisk(entry: SessionIndexEntry): Promise<boolean> {
+  try {
+    const payload = await fs.readFile(path.join(sessionBaseDir(), entry.file), "utf8");
+    const raw = JSON.parse(payload) as unknown;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return false;
+    }
+    return (raw as Record<string, unknown>).template != null;
+  } catch {
+    return false;
+  }
 }
 
 function closedAtOrLastUsedAt(record: SessionRecord): string {
@@ -1735,9 +1759,16 @@ export async function resolvePruneSessionIds(
  * up in filterPruneCandidates on the index entry. SessionIndexEntry.templateSlug
  * & friends are optional hot-path enrichment: an old index, or an entry written
  * by acpx-ui, simply lacks them. Filtering on a field that may be absent turns a
- * missing projection into a deleted blueprint. `record.template` is the authority
- * and is always present on a loaded record, so the guard cannot be out-run by a
- * stale index.
+ * missing projection into a deleted blueprint.
+ *
+ * The destruction guard itself (`isTemplateMarkedOnDisk`) re-reads the entry's
+ * RAW on-disk JSON rather than trusting `record.template` — `record.template`
+ * is `parseTemplateState`'s lossy parsed output and is NOT the authority for
+ * this check (brick://bbaa1ef4; the loaded `record` is still the authority for
+ * every other prune decision here — cutoff, cwd, sessionIds). The raw re-read
+ * is deliberately scoped to prune's own load path, not threaded into
+ * `loadRecordFromIndexEntry` or the shared parser — those have a dozen other
+ * call sites this guard has no business widening into.
  */
 async function loadPrunableRecords(
   entries: SessionIndexEntry[],
@@ -1754,7 +1785,7 @@ async function loadPrunableRecords(
     if (!record || !isBeforeCutoff(record, cutoffIso)) {
       continue;
     }
-    if (!includeTemplates && isTemplateMarkedRecord(record)) {
+    if (!includeTemplates && (await isTemplateMarkedOnDisk(entry))) {
       skippedTemplates.push(record);
       continue;
     }
