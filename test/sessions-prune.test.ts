@@ -733,6 +733,215 @@ test("pruneSessions leaves the template's stream sidecars alone under --include-
   });
 });
 
+// ─── brick://bbaa1ef4: the guard must fail safe on a MALFORMED-but-PRESENT
+// on-disk `template` block, not only a well-formed one ─────────────────────
+// The parser (parseTemplateState, src/session/persistence/parse.ts) leniently
+// drops a `template` block it cannot recognize — returns `undefined` — so
+// isTemplateMarkedRecord's PARSED-value check (`record.template != null`) is
+// blind to a present-but-malformed block from the very first read, and a
+// plain checkpoint write (readPersistedLifecycle re-parses, drops the same
+// way) then silently erases the block from disk entirely. Measured live
+// against origin/dev@b8c79f2 (brick bbaa1ef4 probe/FINDINGS.md): a malformed
+// block was NOT skipped by prune and a real scoped prune deleted it with no
+// warning. The fix guards on the RAW on-disk `template` key instead, which is
+// non-null whenever the block is present, well-formed or not.
+
+async function patchRawTemplateField(
+  homeDir: string,
+  acpxRecordId: string,
+  rawTemplate: unknown,
+): Promise<void> {
+  const filePath = sessionFilePath(homeDir, acpxRecordId);
+  const raw = JSON.parse(await fs.readFile(filePath, "utf8")) as Record<string, unknown>;
+  raw.template = rawTemplate;
+  await fs.writeFile(filePath, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+}
+
+test("pruneSessions skips a session whose on-disk template is present but non-object (malformed shape A)", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "malformed-a",
+        acpSessionId: "malformed-a",
+        agentCommand: "agent-a",
+        cwd,
+        closed: true,
+        closedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    // asRecord() (parse.ts) rejects a non-object `template` outright — the raw
+    // block parses to undefined even though it is clearly present on disk.
+    await patchRawTemplateField(homeDir, "malformed-a", "marked-as-template");
+
+    const result = await session.pruneSessions({ agentCommand: "agent-a" });
+
+    assert.deepEqual(
+      result.pruned.map((r) => r.acpxRecordId),
+      [],
+    );
+    assert.deepEqual(
+      result.skippedTemplates.map((r) => r.acpxRecordId),
+      ["malformed-a"],
+    );
+    assert.ok(await fileExists(sessionFilePath(homeDir, "malformed-a")));
+  });
+});
+
+test("pruneSessions skips a session whose on-disk template object has no recognized/type-matching field (malformed shape B)", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "malformed-b",
+        acpSessionId: "malformed-b",
+        agentCommand: "agent-a",
+        cwd,
+        closed: true,
+        closedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    // Every field is either unrecognized or fails its type check (`enabled`
+    // must be boolean, `created_at` must be string) — parseTemplateState's
+    // per-field guards all fail, the parsed object stays `{}`, and it returns
+    // undefined even though `raw.template` is a non-null object.
+    await patchRawTemplateField(homeDir, "malformed-b", {
+      enabled: "yes",
+      created_at: 123,
+      unknown_field: "x",
+    });
+
+    const result = await session.pruneSessions({ agentCommand: "agent-a" });
+
+    assert.deepEqual(
+      result.pruned.map((r) => r.acpxRecordId),
+      [],
+    );
+    assert.deepEqual(
+      result.skippedTemplates.map((r) => r.acpxRecordId),
+      ["malformed-b"],
+    );
+    assert.ok(await fileExists(sessionFilePath(homeDir, "malformed-b")));
+  });
+});
+
+test("pruneSessions still deletes a session with no template field at all (negative control, unaffected by the raw-key guard)", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "no-template",
+        acpSessionId: "no-template",
+        agentCommand: "agent-a",
+        cwd,
+        closed: true,
+        closedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    const result = await session.pruneSessions({ agentCommand: "agent-a" });
+
+    assert.deepEqual(
+      result.pruned.map((r) => r.acpxRecordId),
+      ["no-template"],
+    );
+    assert.equal(result.skippedTemplates.length, 0);
+    assert.ok(!(await fileExists(sessionFilePath(homeDir, "no-template"))));
+  });
+});
+
+// ─── brick://bbaa1ef4 F1 (TE-caught): the guard's read-ERROR path must fail
+// CLOSED (preserve), not open (delete) ────────────────────────────────────
+// isTemplateMarkedOnDisk re-reads each candidate's raw JSON, a SECOND disk
+// read the pre-fix parsed-value guard never performed. Its first shipped
+// version routed any failure of that second read (`catch { return false }`)
+// to "not template-marked" -> prunable -> DELETED — so a transient EIO,
+// EMFILE under load, or a concurrent replace on an otherwise well-formed
+// blueprint silently destroyed it, sidecars included, with no warning. This
+// is exactly the failure class the raw-key fix exists to close, reopened by
+// the fix's own error path. Fault-injects a failure on the SECOND read of a
+// well-formed template's file only (the guard's read; the first read, via
+// loadRecordFromIndexEntry, must still succeed — otherwise `record` is
+// undefined and the loop `continue`s before ever reaching the guard, which
+// would test the wrong code path entirely) using node:test's per-test mock
+// on `fs.readFile` — no product code touched, no timing race.
+//
+// A single WARM `pruneSessions` call (index.json already up to date) reads
+// a given closed record's file up to THREE times, not once: the guard
+// (`isTemplateMarkedOnDisk`) is the SECOND read; loadRecordFromIndexEntry is
+// the first; and pruneSessions ends with its own unconditional
+// `rebuildSessionIndex(sessionDir, "prune")`, which re-reads every SURVIVING
+// file a third time as a best-effort cache refresh — harmless here (it runs
+// after the guard has already decided, and its own errors are swallowed).
+// On a COLD store (no index.json yet) there is a FOURTH, EARLIER read too —
+// index loading itself rebuilds from scratch — which would land the "second
+// read" fault on that unrelated rebuild instead of the guard. An unmocked
+// dry-run warm-up forces the store warm (and persists index.json) before the
+// mock is installed, so the two mocked reads are unambiguously
+// loadRecordFromIndexEntry then the guard. `faultFired` (not a raw
+// call-count assertion) is what then proves the fault actually reached the
+// guard call — a fixed count would be fragile against the trailing read.
+test("pruneSessions treats a raw-read FAILURE on the guard's second read as protected, not prunable (F1)", async (t) => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeTemplateRecord(homeDir, cwd, {
+      acpxRecordId: "fault-injected-bp",
+      slug: "fault-injected",
+    });
+
+    // Unmocked warm-up: forces the store's index.json to exist and be
+    // current so the real, mocked call below skips the cold-start rebuild
+    // read. dry-run only — no deletion risk regardless of guard state.
+    await session.pruneSessions({ agentCommand: "agent-a", dryRun: true });
+
+    const targetPath = sessionFilePath(homeDir, "fault-injected-bp");
+    const originalReadFile = fs.readFile;
+    let readsSoFar = 0;
+    let faultFired = false;
+    t.mock.method(fs, "readFile", async (...args: Parameters<typeof fs.readFile>) => {
+      if (args[0] === targetPath) {
+        readsSoFar += 1;
+        if (readsSoFar === 2) {
+          faultFired = true;
+          throw Object.assign(new Error("EIO: simulated transient read failure (F1 regression)"), {
+            code: "EIO",
+          });
+        }
+      }
+      return (originalReadFile as (...a: typeof args) => unknown).apply(fs, args);
+    });
+
+    const result = await session.pruneSessions({ agentCommand: "agent-a" });
+
+    // The fault must actually have fired on the guard's read — otherwise a
+    // change upstream (e.g. reordering the reads, or caching one of them)
+    // could silently turn this into a no-op test that passes for the wrong
+    // reason.
+    assert.ok(faultFired, "expected the injected fault to fire on the target file's second read");
+
+    assert.deepEqual(
+      result.pruned.map((r) => r.acpxRecordId),
+      [],
+    );
+    assert.deepEqual(
+      result.skippedTemplates.map((r) => r.acpxRecordId),
+      ["fault-injected-bp"],
+    );
+    assert.ok(await fileExists(targetPath));
+  });
+});
+
 // ─── brick://dd4cb0e8: scope selectors at the core ───────────────────────────
 // The scope REQUIREMENT lives at the CLI (test/sessions-prune-scope.test.ts); the
 // scope FILTERS live here, next to the template skip they extend.
