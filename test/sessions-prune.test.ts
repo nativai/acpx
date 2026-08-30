@@ -859,6 +859,86 @@ test("pruneSessions still deletes a session with no template field at all (negat
   });
 });
 
+// ─── brick://bbaa1ef4 F1 (TE-caught): the guard's read-ERROR path must fail
+// CLOSED (preserve), not open (delete) ────────────────────────────────────
+// isTemplateMarkedOnDisk re-reads each candidate's raw JSON, a SECOND disk
+// read the pre-fix parsed-value guard never performed. Its first shipped
+// version routed any failure of that second read (`catch { return false }`)
+// to "not template-marked" -> prunable -> DELETED — so a transient EIO,
+// EMFILE under load, or a concurrent replace on an otherwise well-formed
+// blueprint silently destroyed it, sidecars included, with no warning. This
+// is exactly the failure class the raw-key fix exists to close, reopened by
+// the fix's own error path. Fault-injects a failure on the SECOND read of a
+// well-formed template's file only (the guard's read; the first read, via
+// loadRecordFromIndexEntry, must still succeed — otherwise `record` is
+// undefined and the loop `continue`s before ever reaching the guard, which
+// would test the wrong code path entirely) using node:test's per-test mock
+// on `fs.readFile` — no product code touched, no timing race.
+//
+// A single WARM `pruneSessions` call (index.json already up to date) reads
+// a given closed record's file up to THREE times, not once: the guard
+// (`isTemplateMarkedOnDisk`) is the SECOND read; loadRecordFromIndexEntry is
+// the first; and pruneSessions ends with its own unconditional
+// `rebuildSessionIndex(sessionDir, "prune")`, which re-reads every SURVIVING
+// file a third time as a best-effort cache refresh — harmless here (it runs
+// after the guard has already decided, and its own errors are swallowed).
+// On a COLD store (no index.json yet) there is a FOURTH, EARLIER read too —
+// index loading itself rebuilds from scratch — which would land the "second
+// read" fault on that unrelated rebuild instead of the guard. An unmocked
+// dry-run warm-up forces the store warm (and persists index.json) before the
+// mock is installed, so the two mocked reads are unambiguously
+// loadRecordFromIndexEntry then the guard. `faultFired` (not a raw
+// call-count assertion) is what then proves the fault actually reached the
+// guard call — a fixed count would be fragile against the trailing read.
+test("pruneSessions treats a raw-read FAILURE on the guard's second read as protected, not prunable (F1)", async (t) => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeTemplateRecord(homeDir, cwd, {
+      acpxRecordId: "fault-injected-bp",
+      slug: "fault-injected",
+    });
+
+    // Unmocked warm-up: forces the store's index.json to exist and be
+    // current so the real, mocked call below skips the cold-start rebuild
+    // read. dry-run only — no deletion risk regardless of guard state.
+    await session.pruneSessions({ agentCommand: "agent-a", dryRun: true });
+
+    const targetPath = sessionFilePath(homeDir, "fault-injected-bp");
+    const originalReadFile = fs.readFile;
+    let readsSoFar = 0;
+    let faultFired = false;
+    t.mock.method(fs, "readFile", async (...args: Parameters<typeof fs.readFile>) => {
+      if (args[0] === targetPath) {
+        readsSoFar += 1;
+        if (readsSoFar === 2) {
+          faultFired = true;
+          throw Object.assign(new Error("EIO: simulated transient read failure (F1 regression)"), {
+            code: "EIO",
+          });
+        }
+      }
+      return (originalReadFile as (...a: typeof args) => unknown).apply(fs, args);
+    });
+
+    const result = await session.pruneSessions({ agentCommand: "agent-a" });
+
+    // The fault must actually have fired on the guard's read — otherwise a
+    // change upstream (e.g. reordering the reads, or caching one of them)
+    // could silently turn this into a no-op test that passes for the wrong
+    // reason.
+    assert.ok(faultFired, "expected the injected fault to fire on the target file's second read");
+
+    assert.deepEqual(result.pruned.map((r) => r.acpxRecordId), []);
+    assert.deepEqual(
+      result.skippedTemplates.map((r) => r.acpxRecordId),
+      ["fault-injected-bp"],
+    );
+    assert.ok(await fileExists(targetPath));
+  });
+});
+
 // ─── brick://dd4cb0e8: scope selectors at the core ───────────────────────────
 // The scope REQUIREMENT lives at the CLI (test/sessions-prune-scope.test.ts); the
 // scope FILTERS live here, next to the template skip they extend.

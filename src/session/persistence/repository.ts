@@ -1395,7 +1395,17 @@ async function isTemplateMarkedOnDisk(entry: SessionIndexEntry): Promise<boolean
     }
     return (raw as Record<string, unknown>).template != null;
   } catch {
-    return false;
+    // TE-caught (bbaa1ef4 F1): fail CLOSED toward preservation. This read can
+    // fail for reasons that have nothing to do with whether the record is a
+    // template — a transient EIO, EMFILE under box load, or the file being
+    // concurrently replaced or removed — and `false` here means "not
+    // template-marked" -> prunable -> DELETED. For a destruction guard the
+    // error path IS the guard: an unreadable file must read as "possibly a
+    // protected blueprint, skip it this run" (it can be re-evaluated on the
+    // next prune), never as "assume it's safe to delete." This is what makes
+    // "only ever widens what gets protected, never narrows it" (above) true
+    // of the function as implemented, not just of the raw!=null expression.
+    return true;
   }
 }
 
