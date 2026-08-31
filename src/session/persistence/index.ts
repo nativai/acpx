@@ -108,6 +108,16 @@ export type SessionIndexEntry = {
   // ⚠️ This is OUR action record, never the harness `output_style` readback —
   // keep the two names distinct all the way to the client (spec §7).
   outputStyleApplied?: string;
+  // REFUSED: a style the agent DECLINED because it does not exist under the
+  // subscription this session moved to (`refused_output_style`). We stamp
+  // `applied = "default"` and RETIRE THE RETRY, so `desired !== applied` stays true
+  // forever — which means a consumer that sees only that pair on the hot path
+  // renders the refusal as a pending install and promises it on every message,
+  // permanently. Projected for exactly that reason: it is the term that turns the
+  // promise off and lets the UI say "unavailable on this subscription" instead
+  // (brick://874fee67 TESTER-PLAN §R5; found live in acpx-ui as brick://31af5eaf
+  // F-2, where the field stopped dead at this boundary).
+  outputStyleRefused?: string;
   autoFailover?: boolean;
   // brick://4d517be2 — projected so acpx-ui's hot-path (record-skipping) session
   // rebuild surfaces the two new policy toggles + the degrade marker in the chat
@@ -318,6 +328,7 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     outputStyleDesired: optionalString(record.outputStyleDesired),
     outputStyleSupported: optionalBoolean(record.outputStyleSupported),
     outputStyleApplied: optionalString(record.outputStyleApplied),
+    outputStyleRefused: optionalString(record.outputStyleRefused),
     autoFailover: optionalBoolean(record.autoFailover),
     autoSubscription: optionalBoolean(record.autoSubscription),
     fableDegradeOk: optionalBoolean(record.fableDegradeOk),
@@ -428,6 +439,7 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     outputStyleDesired: sessionOptions?.output_style,
     outputStyleSupported: outputStyleSupportedFromRecord(acpx),
     outputStyleApplied: acpx?.applied_output_style,
+    outputStyleRefused: acpx?.refused_output_style,
     autoFailover: sessionOptions?.auto_failover,
     autoSubscription: sessionOptions?.auto_subscription,
     fableDegradeOk: sessionOptions?.fable_degrade_ok,
