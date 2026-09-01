@@ -289,7 +289,19 @@ test("text remediation hints cover missing session and ACP runtime failures", ()
         message: "Invalid params",
       },
     }),
-    ["hint: rerun with `--verbose` to capture the ACP method/error details before retrying."],
+    // brick://874fee67 F2 — UPDATED DELIBERATELY. This used to pin
+    // "rerun with `--verbose` to capture the ACP method/error details".
+    // MEASURED FALSE in the field: a test-engineer hit this failure while
+    // ALREADY running --verbose, got nothing extra, followed the hint, and lost
+    // the time again. The reason lives in the ACP payload's `data.details`,
+    // composed inside the queue owner and written to owner.log; the CLI
+    // foreground renders through a path that never sees it, so --verbose has
+    // nothing to add here by construction. The hint now points at the surface
+    // that demonstrably HAS the detail.
+    [
+      "hint: the agent's own reason for this failure is recorded in the session's queue-owner log " +
+        "(`acpx sessions logs <session>`), not on this stream — `--verbose` does not add it here.",
+    ],
   );
 });
 

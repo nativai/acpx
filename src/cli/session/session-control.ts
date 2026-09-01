@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
+  ConfigOptionQueuedWorkError,
   ConfigOptionTurnInFlightError,
   ModelTurnInFlightError,
   ProfileTurnInFlightError,
@@ -16,6 +17,7 @@ import {
   setDesiredModelSource,
 } from "../../session/mode-preference.js";
 import { assertRecordModelSupported } from "../../session/model-application.js";
+import { OUTPUT_STYLE_CONFIG_ID, outputStyleChangePending } from "../../session/output-style.js";
 import {
   resolveSessionRecord,
   listSessions,
@@ -59,6 +61,8 @@ import type {
   SessionSetFableDegradeOptions,
   SessionSetFableDegradeResult,
   SessionSetModelOptions,
+  SessionSetOutputStyleOptions,
+  SessionSetOutputStyleResult,
   SessionSetModeOptions,
   SessionSetProfileOptions,
   SessionSetProfileResult,
@@ -390,6 +394,116 @@ export async function setSessionAutoFailover(
 
   const result: SessionSetAutoFailoverResult = { record, autoFailover: options.autoFailover };
   if (ownerAlive) {
+    await terminateQueueOwnerForSession(options.sessionId);
+    result.ownerRestarted = true;
+  }
+  return result;
+}
+
+/**
+ * brick://874fee67 — set the per-session Claude Code output style.
+ *
+ * ⚠️ THIS SETTER DELIBERATELY BREAKS THE FAMILY PATTERN, in one direction only:
+ * **it does not refuse while a turn is in flight.** Every sibling above throws
+ * `ConfigOptionTurnInFlightError` there. Here the write is ACCEPTED at any time
+ * and only the RECYCLE is deferred:
+ *
+ *   validate → persist → idle?          → recycle now
+ *                      → turn in flight → PENDING; the owner recycles itself at
+ *                                         the turn boundary (or on its idle check)
+ *
+ * Why accepting mid-turn is safe here when it would not be for a live-applied
+ * option: the forbidden state this feature is designed around is *the live
+ * harness config moved while the system prompt is stale*. This setter never
+ * moves the live harness config at all — it writes OUR record, and the next
+ * query build reads it. `applyFlagSettings` is never called for output style
+ * anywhere in the codebase. So the forbidden state is unreachable by
+ * construction rather than by discipline, and the only window is an honest
+ * `pending` bounded by the current turn. Turns routinely run for minutes; the
+ * style is consumed only when the next query is built.
+ *
+ * ⚠️ THE QUEUED-BEHIND REFUSAL STAYS. It is a DIFFERENT hazard: an owner recycle
+ * discards the owner's IN-MEMORY prompt queue (acpx has no persisted prompt
+ * queue — the owner's whole on-disk footprint is a `.lock` and a `.sock`), so a
+ * prompt already handed to the owner and waiting behind the active turn can be
+ * dropped. The active turn is protected by deferring the recycle; work queued
+ * behind it is not. Refusing converts a silent prompt-drop into a visible
+ * "try again when idle". This exposure is pre-existing and shared with `set
+ * effort` / `subscription` / `profile` / `auto-failover` — tracked as
+ * https://acpx.devbox.nativai.de/?brick=47efa4ee; fixing it for the whole family
+ * is out of scope here.
+ *
+ * A second change while one is pending is LAST-WRITE-WINS, with no conflict
+ * logic, because `pending` is a comparison of two values and not a queue of
+ * intents: set B then C → the recycle builds with C. And setting the style back
+ * to what is already applied makes `pending` false again, so no recycle fires at
+ * all — which is correct, and is the behaviour an intent-queue implementation
+ * gets wrong.
+ */
+export async function setSessionOutputStyle(
+  options: SessionSetOutputStyleOptions,
+): Promise<SessionSetOutputStyleResult> {
+  const liveness = await readQueueOwnerLiveness(options.sessionId);
+  const ownerAlive = liveness.alive;
+
+  // Refuse ONLY for queued-behind work — never for the active turn itself.
+  if (ownerAlive && liveness.queueDepth > 0) {
+    throw new ConfigOptionQueuedWorkError(OUTPUT_STYLE_CONFIG_ID, options.sessionName);
+  }
+
+  const turnActive = ownerAlive
+    ? (await tryQueryActiveTurnOnRunningOwner(options.sessionId)) === true
+    : false;
+
+  const record = await resolveSessionRecord(options.sessionId);
+  const acpx: NonNullable<SessionRecord["acpx"]> = { ...record.acpx };
+  acpx.session_options = {
+    ...acpx.session_options,
+    output_style: options.outputStyle,
+  };
+  record.acpx = acpx;
+  // Keep the live layer in step with the durable one, exactly as the generic
+  // `set` path does — a reconnect replays `desired_config_options`.
+  setDesiredConfigOption(record, OUTPUT_STYLE_CONFIG_ID, options.outputStyle);
+  await writeSessionRecord(record);
+
+  const result: SessionSetOutputStyleResult = { record, outputStyle: options.outputStyle };
+
+  // Nothing to bind: the record already matched what the live query was built
+  // with. Recycling here would be a pointless restart — this is the change-back
+  // case (applied=A, set B, set A again), and performing a recycle anyway is the
+  // tell of an intent-queue implementation.
+  if (!outputStyleChangePending(record)) {
+    return result;
+  }
+
+  if (turnActive) {
+    // ACCEPTED, not applied. The owner discovers the mismatch itself at its turn
+    // boundary — we send it nothing, precisely so nothing can be lost in transit.
+    result.pending = true;
+    return result;
+  }
+
+  if (ownerAlive) {
+    // Path (C): idle owner, recycle now so the very next prompt cold-spawns and
+    // resumes with the new style. Which of the three paths runs is an
+    // optimisation; THAT ONE OF THEM RUNS IS NOT.
+    //
+    // ⚠️ THE RECYCLE IS LOAD-BEARING — do not "optimise" it away on the grounds
+    // that the adapter process is already right there (design brick://4d16ab8b;
+    // landmine found by the U1 adapter lane). The adapter's `getOrCreateSession`
+    // short-circuits on a session fingerprint and returns an ALREADY-LIVE session
+    // UNTOUCHED, so a `session/load` carrying a changed style into a still-running
+    // adapter process DOES NOTHING — silently. Killing the owner first is what
+    // guarantees the load always hits a fresh adapter; the recycle is not merely
+    // the mechanism by which the style takes effect, it is what makes the load
+    // path work at all.
+    //
+    // A shortcut here would fail in the worst available way: the record would show
+    // the new style AND the harness config readback would agree, and only the
+    // model's actual behaviour would disagree — the one signal no automated test
+    // reads by default. `test/output-style-no-live-apply.test.ts` pins the
+    // structural half of this.
     await terminateQueueOwnerForSession(options.sessionId);
     result.ownerRestarted = true;
   }

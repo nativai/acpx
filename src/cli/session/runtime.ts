@@ -2289,6 +2289,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         return await connectAndLoadSession({
           client,
           record,
+          // The SAME resolved `sessionOptions` object handed to the AcpClient
+          // above — so what we stamp as APPLIED is what was actually sent.
+          outputStyle: sessionOptions?.outputStyle,
           resumePolicy: options.resumePolicy,
           timeoutMs: options.timeoutMs,
           verbose: options.verbose,

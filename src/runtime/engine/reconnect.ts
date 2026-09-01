@@ -1,6 +1,7 @@
 import type { AcpClient } from "../../acp/client.js";
 import {
   extractAcpError,
+  formatAcpErrorMessage,
   formatErrorMessage,
   isAcpQueryClosedBeforeResponseError,
   isAcpResourceNotFoundError,
@@ -37,6 +38,7 @@ import {
   syncAdvertisedModelState,
 } from "../../session/mode-preference.js";
 import { guardServedModel, stampModelGuardBreadcrumb } from "../../session/model-guard.js";
+import { recordAppliedOutputStyleOutcome } from "../../session/output-style.js";
 import type { SessionRecord, SessionResumePolicy } from "../../types.js";
 import {
   applyLifecycleSnapshotToRecord,
@@ -78,6 +80,16 @@ export type ConnectAndLoadSessionOptions = {
   onClientAvailable?: (controller: ConnectedSessionController) => void;
   onConnectedRecord?: (record: SessionRecord) => void;
   onSessionIdResolved?: (sessionId: string) => void;
+  /**
+   * brick://874fee67 — the output style the client was CONSTRUCTED with, so this
+   * function can stamp `acpx.applied_output_style` with the same value the
+   * session/new + resume `_meta` were composed from.
+   *
+   * Passed in rather than read back off the client on purpose: the caller holds
+   * the one `sessionOptions` object it hands to both, so the two cannot diverge,
+   * and `AcpClient` keeps the surface its many test doubles already implement.
+   */
+  outputStyle?: string;
 };
 
 export type ConnectAndLoadSessionResult = {
@@ -305,7 +317,8 @@ async function replayDesiredConfigOptions(params: {
   record: SessionRecord;
   timeoutMs?: number;
   verbose?: boolean;
-}): Promise<void> {
+}): Promise<string[]> {
+  const declined: string[] = [];
   const normalizedDesiredConfigOptions: Array<[configId: string, value: string]> = [];
   for (const [configId, value] of Object.entries(params.desiredConfigOptions)) {
     const replayValue = replayConfigOptionValue(configId, value, params.desiredModelId);
@@ -323,51 +336,103 @@ async function replayDesiredConfigOptions(params: {
         );
       }
     } catch (error) {
-      // A returning call means a non-fatal effort rejection — proceed with the
-      // turn; any other failure rethrows. See handleConfigOptionReplayError.
-      handleConfigOptionReplayError({
-        configId,
-        error,
-        sessionId: params.sessionId,
-        verbose: params.verbose,
-      });
+      // A returning call means the agent DECLINED the option — degrade with a
+      // visible warning and proceed with the turn. Only a transport failure
+      // rethrows. See handleConfigOptionReplayError.
+      // brick://874fee67 F6: a decline is an OUTCOME the record has to reflect.
+      // Swallowing it here and stamping `applied` from the REQUEST is how acpx
+      // came to log "rejected ... NOT in effect" and record the opposite.
+      if (
+        handleConfigOptionReplayError({
+          configId,
+          error,
+          sessionId: params.sessionId,
+          verbose: params.verbose,
+        })
+      ) {
+        declined.push(configId);
+      }
     }
   }
   for (const [configId, value] of normalizedDesiredConfigOptions) {
     setDesiredConfigOption(params.record, configId, value);
   }
+  return declined;
 }
 
-// Decide how a config-option replay failure is handled. Effort is a best-effort
-// preference, never a turn-blocker: some models (e.g. haiku) advertise an
-// `effort` option at session/new yet have the adapter REJECT mutating it
-// (`Unknown config option: effort`), so a persisted/inherited effort cannot be
-// replayed onto the reconnected ACP session. The creation path already absorbs this via
-// setConfigOptionWithEffortFallback ("layer on top, never break"); mirror it here
-// so replay can't lose the turn. Returns (caller proceeds with the turn) only for
-// `effort` AND only when the agent actually returned a rejection (an ACP error
-// payload). Transport failures (timeout/interrupt — no ACP payload) and every
-// other config option rethrow fatally/retryably exactly as before.
+// Decide how a config-option replay failure is handled.
+//
+// ⚠️ THE RULE IS ABOUT THE KIND OF FAILURE, NOT THE NAME OF THE OPTION
+// (brick://874fee67 F1). It used to be scoped to `effort` alone, and that scoping
+// KILLED SESSIONS: a per-subscription custom output style is not resolvable after
+// an auto-failover moves the session to another `CLAUDE_CONFIG_DIR`, the adapter
+// honestly declines to advertise it, acpx replayed it anyway, and the rethrow
+// took the whole turn down — the user got NO REPLY AT ALL. Auto-failover is ON by
+// default and re-picks the subscription every turn, so that was the ordinary path
+// for any session carrying a custom style, not an edge case.
+//
+// WHY TOLERATING ANY OPTION IS SAFE, structurally rather than by hope: everything
+// in `desired_config_options` is a PREFERENCE, because the two things that are
+// correctness PINS cannot be in there. `setDesiredConfigOption`
+// (`session/mode-preference.ts`) early-returns for `mode` and `model`, so the
+// record slot this loop iterates can never hold them; they have their own replay
+// paths with their own error handling (`replayDesiredModel` /
+// `SessionModelReplayError`, and the model-floor check above). A preference that
+// the reconnected backend will not accept should degrade with a warning; it must
+// never cost the user their turn.
+//
+// The pin is KEPT in the record either way, so if a later turn lands back on a
+// subscription where the option resolves, the replay simply succeeds again.
+//
+// WHAT STILL RETHROWS: a transport failure — timeout or interrupt, i.e. no ACP
+// payload at all. That is not the agent declining; it is us not knowing what
+// happened, and proceeding would build a turn on an unverified assumption.
+// `extractAcpError` is the discriminator, and it is the one that matters here.
 function handleConfigOptionReplayError(params: {
   configId: string;
   error: unknown;
   sessionId: string;
   verbose?: boolean;
-}): void {
-  if (params.configId === "effort" && extractAcpError(params.error)) {
-    if (params.verbose) {
-      process.stderr.write(
-        `[acpx] effort replay rejected by the agent on reconnected ACP session ${params.sessionId} (${formatErrorMessage(params.error)}); continuing without it\n`,
-      );
-    }
-    return;
+}): boolean {
+  if (extractAcpError(params.error)) {
+    warnConfigOptionReplayDegraded(params);
+    return true; // DECLINED by the agent — the caller must record that outcome
   }
   throw new SessionConfigOptionReplayError(
-    `Failed to replay saved session config option ${params.configId} on reconnected ACP session ${params.sessionId}: ${formatErrorMessage(params.error)}`,
+    // formatAcpErrorMessage, not formatErrorMessage: a JSON-RPC fault's `message`
+    // is the generic "Internal error" while the actual diagnosis sits in
+    // `data.details`. Surfacing only the former is what made this failure
+    // undiagnosable in the field (F2).
+    `Failed to replay saved session config option ${params.configId} on reconnected ACP session ${params.sessionId}: ${formatAcpErrorMessage(params.error)}`,
     {
       cause: params.error instanceof Error ? params.error : undefined,
       retryable: true,
     },
+  );
+}
+
+// The degradation must be VISIBLE. A preference that silently stops applying is
+// the "control that lies" failure this feature is built to forbid — the user
+// would get a reply in the wrong style with nothing anywhere saying so.
+//
+// `effort` is the ONE carve-out, and only on VERBOSITY, never on tolerance: some
+// models (e.g. haiku) advertise an `effort` option at session/new yet have the
+// adapter reject mutating it, so this fires routinely for a case the creation
+// path already absorbs deliberately (`setConfigOptionWithEffortFallback` —
+// "layer on top, never break"). Warning unconditionally there would print noise
+// on every reconnect of every such session. Any other option reaching this branch
+// is a real, unexplained loss of a setting the user asked for.
+function warnConfigOptionReplayDegraded(params: {
+  configId: string;
+  error: unknown;
+  sessionId: string;
+  verbose?: boolean;
+}): void {
+  if (params.configId === "effort" && !params.verbose) {
+    return;
+  }
+  process.stderr.write(
+    `[acpx] config option "${params.configId}" was rejected by the agent on session ${params.sessionId} and is NOT in effect for this turn: ${formatAcpErrorMessage(params.error)}\n`,
   );
 }
 
@@ -456,6 +521,20 @@ export async function connectAndLoadSession(
     verbose: options.verbose,
   });
 
+  // brick://874fee67 turn-boundary spec §3, corrected by F6 — the primary stamp
+  // site, and it runs AFTER the replay ON PURPOSE.
+  //
+  // It used to stamp `options.outputStyle` (the REQUEST) before the replay ran.
+  // That produced the exact failure this feature exists to forbid: on a failover
+  // to a subscription where the style does not exist, acpx logged
+  // "rejected ... NOT in effect for this turn" and recorded `applied = <the
+  // style>` anyway — so `pending` was false, nothing retried, nothing surfaced
+  // it, and the chip read "installed" on a session provably running default.
+  // A loud failure had been traded for a silent falsehood.
+  //
+  // `applied` is an OUTCOME field. Stamp it from what the agent ACCEPTED.
+  recordAppliedOutputStyleOutcome(record, options.outputStyle, replayResult.declinedConfigOptions);
+
   applyReconnectedModelState(
     record,
     sessionModels,
@@ -509,6 +588,9 @@ function logReconnectAttempt(
 
 type PreferenceReplayResult = {
   desiredModelRestored: boolean;
+  /** Config option ids the agent DECLINED on this (re)connect. brick://874fee67 F6:
+   *  the record must reflect the outcome, not the request. */
+  declinedConfigOptions: string[];
 };
 
 async function replayReconnectedSessionPreferences(params: {
@@ -527,10 +609,11 @@ async function replayReconnectedSessionPreferences(params: {
   verbose?: boolean;
 }): Promise<PreferenceReplayResult> {
   if (!params.shouldReplayPreferences) {
-    return { desiredModelRestored: false };
+    return { desiredModelRestored: false, declinedConfigOptions: [] };
   }
 
   let desiredModelRestored = false;
+  let declinedConfigOptions: string[] = [];
   try {
     await replayDesiredMode({
       client: params.client,
@@ -550,7 +633,7 @@ async function replayReconnectedSessionPreferences(params: {
       timeoutMs: params.timeoutMs,
       verbose: params.verbose,
     });
-    await replayDesiredConfigOptions({
+    declinedConfigOptions = await replayDesiredConfigOptions({
       client: params.client,
       sessionId: params.sessionId,
       desiredConfigOptions: params.desiredConfigOptions,
@@ -574,7 +657,7 @@ async function replayReconnectedSessionPreferences(params: {
 
   params.record.acpSessionId = params.sessionId;
   reconcileAgentSessionId(params.record, params.pendingAgentSessionId);
-  return { desiredModelRestored };
+  return { desiredModelRestored, declinedConfigOptions };
 }
 
 type RuntimeSessionLoadState = {

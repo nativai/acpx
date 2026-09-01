@@ -321,6 +321,12 @@ function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
   assignDesiredConfigOptions(state, record.desired_config_options);
 
   assignStringState(state, "current_model_id", record.current_model_id);
+  // brick://874fee67: applied_output_style is acpx-level runtime state (like
+  // current_model_id), NOT a session_option. It MUST round-trip on a cold reload:
+  // it is one half of the derived `pending` predicate, and an owner respawn that
+  // loses it reads as "unknown" and forces a spurious recycle.
+  assignStringState(state, "applied_output_style", record.applied_output_style);
+  assignStringState(state, "refused_output_style", record.refused_output_style);
 
   // Fix A (brick 92a994a0): the persisted authoritative context window + its
   // model tag MUST round-trip back on a cold disk reload, or every owner
@@ -432,12 +438,39 @@ function assignBooleanTrue(
 
 function assignStringState(
   state: SessionAcpxState,
-  key: "current_mode_id" | "desired_mode_id" | "current_model_id" | "context_window_model_id",
+  key:
+    | "current_mode_id"
+    | "desired_mode_id"
+    | "current_model_id"
+    | "context_window_model_id"
+    | "applied_output_style"
+    | "refused_output_style",
   value: unknown,
 ): void {
   if (typeof value === "string") {
     state[key] = value;
   }
+}
+
+// brick://874fee67 F5 — `mode` and `model` must never appear in
+// `desired_config_options`, enforced at the READ boundary and not only at the write.
+//
+// The config-option REPLAY now degrades on an agent decline instead of failing
+// the turn, and that is only safe because everything in this record slot is a
+// PREFERENCE. `setDesiredConfigOption` refuses `mode`/`model` on the way in — but
+// that is one write site, and this parser previously filtered on the VALUE being
+// a string without ever inspecting the key. Measured: a record injected with
+// `{mode, model, effort}` parsed fine and retained all three, so a
+// correctness-bearing option COULD reach the degrade path. Not exploitable on
+// current data (a sweep of 2574 real records found `effort` as the only key ever
+// present), but "safe because nothing writes it today" is discipline, not
+// construction — the same lesson as F3: a per-site gate survives its own violation.
+//
+// Case-insensitive on purpose: the write-side guard compares after a trim only,
+// so `"Mode"` / `"MODEL"` would slip past it.
+function isCorrectnessPinConfigId(configId: string): boolean {
+  const normalized = configId.trim().toLowerCase();
+  return normalized === "mode" || normalized === "model";
 }
 
 function assignDesiredConfigOptions(state: SessionAcpxState, raw: unknown): void {
@@ -448,8 +481,8 @@ function assignDesiredConfigOptions(state: SessionAcpxState, raw: unknown): void
 
   const parsed = Object.fromEntries(
     Object.entries(desiredConfigOptions).filter((entry): entry is [string, string] => {
-      const [, value] = entry;
-      return typeof value === "string";
+      const [key, value] = entry;
+      return typeof value === "string" && !isCorrectnessPinConfigId(key);
     }),
   );
   if (Object.keys(parsed).length > 0) {
@@ -478,6 +511,7 @@ function assignParsedSessionOptions(state: SessionAcpxState, raw: unknown): void
   assignSessionOptionSubscription(parsedSessionOptions, sessionOptions.subscription);
   assignSessionOptionProfile(parsedSessionOptions, sessionOptions.profile);
   assignSessionOptionEffort(parsedSessionOptions, sessionOptions.effort);
+  assignSessionOptionOutputStyle(parsedSessionOptions, sessionOptions.output_style);
   assignSessionOptionAutoFailover(parsedSessionOptions, sessionOptions.auto_failover);
   assignSessionOptionFloorHard(parsedSessionOptions, sessionOptions.floor_hard);
   assignSessionOptionAutoSubscription(parsedSessionOptions, sessionOptions.auto_subscription);
@@ -736,6 +770,23 @@ function assignSessionOptionModelSource(
 ): void {
   if (typeof value === "string" && value.length > 0) {
     options.model_source = value;
+  }
+}
+
+// brick://874fee67 (design brick://4d16ab8b): output_style is a durable flat
+// string — same shape as model_source/effort. It MUST round-trip on a cold disk
+// reload, because the style only ever reaches Claude Code through the adapter's
+// CREATION settings (at spawn and at resume); a dropped value silently reverts
+// the session to the harness default on the next owner respawn.
+// The value is OPAQUE and may contain spaces — never slugged, enumerated or
+// case-folded here (`default` is lowercase while `Proactive`/`Explanatory`/
+// `Learning` are capitalised; a case-folding validator breaks one end or the other).
+function assignSessionOptionOutputStyle(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+  value: unknown,
+): void {
+  if (typeof value === "string" && value.length > 0) {
+    options.output_style = value;
   }
 }
 

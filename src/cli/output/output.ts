@@ -321,6 +321,23 @@ function renderAuthRequiredHint(params: RenderableOutputError): string {
 export function getTextErrorRemediationHints(params: RenderableOutputError): string[] {
   const lowerMessage = params.message.toLowerCase();
 
+  // brick://874fee67 F2 — SHOW THE REASON INSTEAD OF POINTING AT A FLAG.
+  //
+  // Several rules below say "rerun with `--verbose` to capture the underlying ACP
+  // error details". On an ACP fault that advice is a dead end: the payload's
+  // `data.details` already holds the diagnosis and is sitting right here in
+  // `params.acp`, while `--verbose` adds nothing on these paths — a test-engineer
+  // followed the hint, reran, got no extra detail, and lost the time.
+  //
+  // A hint that does not work is worse than no hint, for the same reason a false
+  // comment is worse than none: the reader trusts it INSTEAD of investigating.
+  // So when we hold the details, print them; the verbose hints below then apply
+  // only to the case they are actually true for — an ACP error with no details.
+  const acpDetails = acpErrorDetails(params);
+  if (acpDetails && !params.message.includes(acpDetails)) {
+    return [`hint: the agent reported: ${acpDetails}`];
+  }
+
   if (params.detailCode === "AUTH_REQUIRED") {
     return [renderAuthRequiredHint(params)];
   }
@@ -342,6 +359,26 @@ type TextErrorHintRule = {
   matches: (params: RenderableOutputError, lowerMessage: string) => boolean;
   hints: string[];
 };
+
+// brick://874fee67 F2 — these two rules used to say "rerun with `--verbose` to
+// capture the ACP error details". MEASURED FALSE: a test-engineer hit this
+// failure while ALREADY running `--verbose` and got no extra detail, then
+// followed the hint and lost the time again.
+//
+// The mechanism: the real reason lives in the ACP payload's `data.details`, and
+// the code that composes it runs INSIDE the queue owner, so it lands in
+// `owner.log`. The CLI foreground renders the same failure through a separate
+// path that never sees that payload — so `--verbose` on the foreground has
+// nothing extra to print, on this path, by construction.
+//
+// A hint that does not work is worse than no hint, for the same reason a false
+// comment is worse than none: the reader trusts it INSTEAD of investigating. So
+// point at the surface that demonstrably HAS the detail. When the payload does
+// reach us, `getTextErrorRemediationHints` prints the reason itself and this
+// never runs.
+const ACP_DETAIL_HINT =
+  "hint: the agent's own reason for this failure is recorded in the session's queue-owner log " +
+  "(`acpx sessions logs <session>`), not on this stream — `--verbose` does not add it here.";
 
 const TEXT_ERROR_HINT_RULES: TextErrorHintRule[] = [
   {
@@ -371,15 +408,24 @@ const TEXT_ERROR_HINT_RULES: TextErrorHintRule[] = [
   },
   {
     matches: (_params, lowerMessage) => isSessionConfigMethodError(lowerMessage),
-    hints: [
-      "hint: rerun with `--verbose` to capture the ACP method/error details before retrying.",
-    ],
+    hints: [ACP_DETAIL_HINT],
   },
   {
     matches: isRuntimeAcpProtocolError,
-    hints: ["hint: rerun with `--verbose` to capture the underlying ACP error details."],
+    hints: [ACP_DETAIL_HINT],
   },
 ];
+
+// The `data.details` string an adapter attaches to a JSON-RPC fault, whose
+// top-level `message` is the generic "Internal error".
+function acpErrorDetails(params: RenderableOutputError): string | undefined {
+  const data = params.acp?.data;
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return undefined;
+  }
+  const details = (data as { details?: unknown }).details;
+  return typeof details === "string" && details.trim().length > 0 ? details : undefined;
+}
 
 function matchingTextErrorRule(
   params: RenderableOutputError,

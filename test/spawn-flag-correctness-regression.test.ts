@@ -445,7 +445,30 @@ test("HAIKU-fix: effort replay rejected by the adapter (ACP error) is NON-FATAL 
   });
 });
 
-test("HAIKU-fix scope guard: a NON-effort config option rejection still throws fatally", async () => {
+// ⚠️ REVERSED DELIBERATELY, 2026-08-28 (brick://874fee67 F1). This test used to
+// assert the OPPOSITE — that a NON-effort config-option rejection still throws
+// fatally — as a scope guard keeping the haiku effort fix from over-broadening.
+// That conservatism was reasonable when written and the field has since falsified
+// it: the narrow scope KILLED SESSIONS.
+//
+// What happened: acpx auto-failover moved a session to another subscription on
+// its first turn. A custom output style resolves per `CLAUDE_CONFIG_DIR`, so it
+// did not exist under the new one; the adapter correctly declined to advertise
+// it; acpx replayed `set_config_option` anyway and this fatal rethrow took the
+// whole turn down — the user got NO REPLY AT ALL. Auto-failover is on by default
+// and re-picks the subscription every turn, so that was the ordinary path for any
+// session carrying a custom style.
+//
+// THE GUARD STILL EXISTS — it just guards the right axis. The discriminator was
+// never really "is this effort?"; it is "did the AGENT decline, or did the
+// TRANSPORT fail?". A decline is information and degrades; a transport failure
+// means we do not know the backend state and must still rethrow (pinned by the
+// sibling test below, which is unchanged and now carries the whole guard).
+//
+// Safe because `desired_config_options` structurally cannot hold a correctness
+// pin: `setDesiredConfigOption` early-returns for `mode` and `model`, which have
+// their own replay paths. Everything reaching this loop is a preference.
+test("F1: a NON-effort config option rejection DEGRADES rather than killing the turn", async () => {
   await withReconnectTempHome("acpx-haikufix-", async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
@@ -456,22 +479,18 @@ test("HAIKU-fix scope guard: a NON-effort config option rejection still throws f
       cwd,
       acpx: { desired_config_options: { thought_level: "deep" } },
     });
+    let attempted = false;
     const client = makeReconnectClient(async () => {
+      attempted = true;
       throw { error: { code: -32603, message: "rejected" } };
     });
-    await assert.rejects(
-      async () =>
-        await connectAndLoadSession({
-          client: client as never,
-          record,
-          activeController: RECONNECT_ACTIVE_CONTROLLER as never,
-        }),
-      (error: unknown) => {
-        assert(error instanceof Error);
-        assert.equal(error.name, "SessionConfigOptionReplayError");
-        return true;
-      },
-    );
+    const result = await connectAndLoadSession({
+      client: client as never,
+      record,
+      activeController: RECONNECT_ACTIVE_CONTROLLER as never,
+    });
+    assert.equal(attempted, true, "subject witness: the replay must have been attempted");
+    assert.equal(result.sessionId, "fresh-session", "the turn survives the declined option");
   });
 });
 

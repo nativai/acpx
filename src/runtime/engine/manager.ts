@@ -27,6 +27,10 @@ import {
   syncAdvertisedModelState,
 } from "../../session/mode-preference.js";
 import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
+import {
+  stampAppliedOutputStyle,
+  withSupportedOutputStyleOnly,
+} from "../../session/output-style.js";
 import { persistSessionOwnerOptions } from "../../session/owner-options.js";
 import type { ClientOperation, SessionRecord, SessionResumePolicy } from "../../types.js";
 import type {
@@ -248,7 +252,11 @@ type SeedableSessionOptionField =
   | "auto_subscription"
   | "fable_degrade_ok"
   | "model"
-  | "effort";
+  | "effort"
+  // brick://874fee67: output_style is a durable per-session pin — same seeding
+  // rule as model/effort (seed only when the spawn flag omits it AND the record
+  // carries no pin of its own).
+  | "output_style";
 
 // Which durable fields the incoming spawn options DON'T carry (so a prior value
 // must be seeded). model/effort are seeded ONLY when the record has no pin of its
@@ -284,16 +292,21 @@ function pinFieldsToSeed(
   record: SessionRecord,
   opts: SessionAgentOptions | undefined,
 ): SeedableSessionOptionField[] {
-  const { model, effort } = record.acpx?.session_options ?? {};
+  const stored = record.acpx?.session_options ?? {};
   const provided = opts ?? {};
-  const fields: SeedableSessionOptionField[] = [];
-  if (provided.model === undefined && model === undefined) {
-    fields.push("model");
-  }
-  if (provided.reasoningEffort === undefined && effort === undefined) {
-    fields.push("effort");
-  }
-  return fields;
+  // Each row pairs the persisted key with the spawn-option that would supersede
+  // it. Table-driven so adding a pin is one row rather than another branch — and
+  // so the "seed only when BOTH are absent" rule is stated once instead of
+  // re-typed per field, where one copy could drift.
+  const pins = [
+    ["model", provided.model, stored.model],
+    ["effort", provided.reasoningEffort, stored.effort],
+    // brick://874fee67
+    ["output_style", provided.outputStyle, stored.output_style],
+  ] as const satisfies ReadonlyArray<readonly [SeedableSessionOptionField, unknown, unknown]>;
+  return pins.flatMap(([field, fromFlag, fromRecord]) =>
+    fromFlag === undefined && fromRecord === undefined ? [field] : [],
+  );
 }
 
 // Copy one durable field from the prior options onto the carried options. Returns
@@ -312,6 +325,22 @@ function seedSessionOptionField(
   // unknown-valued view (not `any`).
   (target as Record<string, unknown>)[field] = value;
   return true;
+}
+
+// brick://874fee67 — record what this query was BUILT with, unconditionally and
+// after success, exactly as the CLI create path does. Without it a
+// manager-created session that HAS a style leaves `applied` absent, which
+// normalizes to "default", which makes outputStyleChangePending true — a
+// spurious owner recycle on the session's very first turn.
+//
+// The value is already strip-filtered at its declaration, so an agent that does
+// not advertise the option stamps the default rather than a style it will never
+// honour (F3).
+function stampCreatedRuntimeOutputStyle(
+  record: SessionRecord,
+  effectiveSessionOptions: SessionAgentOptions | undefined,
+): void {
+  stampAppliedOutputStyle(record, effectiveSessionOptions?.outputStyle);
 }
 
 function legacyTerminalEventFromTurnResult(result: AcpRuntimeTurnResult): AcpRuntimeEvent {
@@ -686,10 +715,13 @@ export class AcpRuntimeManager {
     record.protocolVersion = client.initializeResult?.protocolVersion;
     record.agentCapabilities = client.initializeResult?.agentCapabilities;
     applyConfigOptionsToRecord(record, session.sessionResult);
-    const effectiveSessionOptions = sessionOptionsForCreatedRuntimeSession(
-      agentCommand,
-      input.sessionOptions,
-      session,
+    // brick://874fee67 F3 — strip a style this agent does not advertise at the
+    // DECLARATION, so every read below is already filtered rather than only the
+    // ones that happen to sit after a strip. A style the agent cannot honour
+    // must not reach the record from ANY entry point.
+    const effectiveSessionOptions = withSupportedOutputStyleOnly(
+      sessionOptionsForCreatedRuntimeSession(agentCommand, input.sessionOptions, session),
+      session.sessionResult.configOptions,
     );
     const requestedModelApplied = await applyRequestedModelIfAdvertised({
       client,
@@ -715,6 +747,7 @@ export class AcpRuntimeManager {
     }
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
     await this.carryForwardPinnedFloor(record, effectiveSessionOptions);
+    stampCreatedRuntimeOutputStyle(record, effectiveSessionOptions);
     persistSessionOptions(record, effectiveSessionOptions);
     persistSessionOwnerOptions(record, this.options);
     await this.options.sessionStore.save(record);

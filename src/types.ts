@@ -248,6 +248,13 @@ export type AcpClientOptions = {
     systemPrompt?: string | { append: string };
     subscription?: string;
     profile?: string;
+    /**
+     * brick://874fee67 — the Claude Code output style this session's query must
+     * be BUILT with. Unlike every other option here it has no live-apply path at
+     * all: the style is only ever honoured through the adapter's creation
+     * settings, so it must travel in the `session/new` and resume `_meta`.
+     */
+    outputStyle?: string;
   };
   onAcpMessage?: (direction: AcpMessageDirection, message: AcpJsonRpcMessage) => void;
   onAcpOutputMessage?: (direction: AcpMessageDirection, message: AcpJsonRpcMessage) => void;
@@ -461,6 +468,47 @@ export type SessionAcpxState = {
   desired_mode_id?: string;
   desired_config_options?: Record<string, string>;
   current_model_id?: string;
+  /**
+   * brick://874fee67 — the output style THE CURRENT LIVE QUERY WAS BUILT WITH.
+   * RUNTIME-OBSERVED STATE, not a user option: it is written by the owner at the
+   * moment it hands the resolved options to the adapter (session/new or
+   * session/load), which is why it lives on `acpx` beside `current_model_id`
+   * rather than inside `session_options`.
+   *
+   * It exists so a style change is never SILENTLY FORGOTTEN. "A change is
+   * pending" is a DERIVED comparison — `normalize(session_options.output_style)
+   * !== normalize(applied_output_style)`, `normalize(x) = (x ?? "default").trim()`
+   * — never a remembered flag and never an IPC message to the owner. A lost
+   * message, a lost socket or a dead owner can then only make the recycle LATE,
+   * never make the change vanish: forgetting would require desired and applied to
+   * AGREE while the query was built with something else, and this field is
+   * written by the same code that builds the query.
+   *
+   * ⚠️ Do NOT label a UI chip from the harness's `output_style` readback and call
+   * it "applied" — that readback is unvalidated inbound and disconnected from
+   * behaviour outbound. `applied` is OUR action record; keep the names distinct
+   * all the way to the client (spec §7).
+   *
+   * Stamped UNCONDITIONALLY, including for the default: an absent value on a live
+   * session is indistinguishable from "unknown" and would force a spurious recycle.
+   */
+  applied_output_style?: string;
+  /**
+   * brick://874fee67 F6 — an output style the agent DECLINED for the current
+   * query (e.g. a custom style that does not exist under the subscription this
+   * session failed over to). Runtime-observed, like `applied_output_style`.
+   *
+   * It exists so the record can be HONEST about a refusal without spinning: with
+   * only desired/applied, stamping the truthful `applied = "default"` after a
+   * decline leaves `desired != applied` forever, and the pending predicate would
+   * recycle the owner on every turn boundary trying to apply something the agent
+   * has already refused. Recording WHICH value was refused lets `pending`
+   * distinguish "not yet applied" from "applied-attempt refused".
+   *
+   * Cleared whenever a style is accepted, and bypassed the moment the user picks
+   * a DIFFERENT style — a new choice is always worth one attempt.
+   */
+  refused_output_style?: string;
   /** Fix A (brick 92a994a0): the context-window size (in tokens) the adapter
    *  last reported for `context_window_model_id`, round-tripped back to the
    *  adapter on resume as `_meta.claudeCode.contextWindowSizeHint` so a restored
@@ -537,6 +585,24 @@ export type SessionAcpxState = {
      * effort level), validated at the flag boundary.
      */
     effort?: string;
+    /**
+     * Requested Claude Code output style (the `outputStyle` config option),
+     * persisted as the durable end-to-end contract field (brick://874fee67,
+     * design brick://4d16ab8b). Opaque non-empty string — the style's `name:`
+     * frontmatter, which MAY CONTAIN SPACES ("Nativai Probe Shared"); never a
+     * slug, enum, or filename. Kept alongside
+     * `acpx.desired_config_options.outputStyle`, the live-config /
+     * reconnect-reapply field, exactly as `effort` is.
+     *
+     * ⚠️ ABSENT means "whatever the settings cascade resolves" — never backfill
+     * `"default"`, which would convert unset into an explicit pin and defeat any
+     * future box- or role-level default (design §9).
+     *
+     * ⚠️ CLEARING writes the LITERAL `"default"` id, never null/undefined-as-clear:
+     * `applyFlagSettings({outputStyle:null})` cannot reach the create-time flag
+     * slot our styles arrive through (measured — design §8.6 / F5a).
+     */
+    output_style?: string;
     /**
      * Per-session automatic credential/subscription failover policy. Absent
      * means enabled (the historical behavior); only explicit false opts out.

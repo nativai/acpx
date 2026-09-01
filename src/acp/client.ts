@@ -1257,6 +1257,37 @@ export class AcpClient {
    * merges into any existing `claudeCode` object (rather than clobbering it)
    * and is a no-op for a missing / non-positive hint.
    */
+  /**
+   * brick://874fee67 — fold the session's output style into a RESUME/LOAD `_meta`
+   * fragment as `claudeCode.outputStyle`, deep-merging into any existing
+   * `claudeCode` object rather than clobbering it (same shape as the
+   * context-window hint below).
+   *
+   * This is what makes a live style change real. A resume rebuilds the system
+   * prompt with the new style WHILE PRESERVING THE CONVERSATION (measured, with
+   * a negative control: a resume without the style has no stylistic effect, so
+   * the effect comes from the style and not from the resume). Omit it here and a
+   * recycled owner faithfully resumes with the OLD style, which reads as "the
+   * change did nothing".
+   */
+  private mergeOutputStyleMeta(
+    meta: Record<string, unknown> | undefined,
+  ): Record<string, unknown> | undefined {
+    const outputStyle = this.options.sessionOptions?.outputStyle;
+    if (typeof outputStyle !== "string" || outputStyle.trim().length === 0) {
+      return meta;
+    }
+    const base = meta ?? {};
+    const existingClaudeCode =
+      typeof base.claudeCode === "object" && base.claudeCode !== null
+        ? (base.claudeCode as Record<string, unknown>)
+        : {};
+    return {
+      ...base,
+      claudeCode: { ...existingClaudeCode, outputStyle },
+    };
+  }
+
   private mergeContextWindowHint(
     meta: Record<string, unknown> | undefined,
     hint: number | undefined,
@@ -1309,10 +1340,12 @@ export class AcpClient {
       // undefined here (its developer item is already in restored history).
       const primerMeta = await this.buildResumePrimerMeta();
       const loadMeta =
-        this.mergeContextWindowHint(
-          { ...homeSelectorMeta, ...primerMeta },
-          options.contextWindowSizeHint,
-          options.contextWindowSizeHintModel,
+        this.mergeOutputStyleMeta(
+          this.mergeContextWindowHint(
+            { ...homeSelectorMeta, ...primerMeta },
+            options.contextWindowSizeHint,
+            options.contextWindowSizeHintModel,
+          ),
         ) ?? {};
       response = await this.runConnectionRequest(() =>
         connection.loadSession({
@@ -1347,10 +1380,12 @@ export class AcpClient {
     // (CONCEPTION §4.5.2): a regenerated system prompt is dropped on rebuild
     // unless re-sent. Idempotent; codex returns undefined (restored from thread).
     const primerMeta = await this.buildResumePrimerMeta();
-    const resumeMeta = this.mergeContextWindowHint(
-      primerMeta,
-      options.contextWindowSizeHint,
-      options.contextWindowSizeHintModel,
+    const resumeMeta = this.mergeOutputStyleMeta(
+      this.mergeContextWindowHint(
+        primerMeta,
+        options.contextWindowSizeHint,
+        options.contextWindowSizeHintModel,
+      ),
     );
     const response = await this.runConnectionRequest(() =>
       connection.resumeSession({

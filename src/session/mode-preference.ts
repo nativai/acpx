@@ -83,6 +83,16 @@ export function setDesiredConfigOption(
     setSessionOptionEffort(acpx, value);
   }
 
+  // brick://874fee67: keep the DURABLE session_options.output_style in sync with
+  // the live desired_config_options.outputStyle, exactly as `effort` does above.
+  // Without this the live setter writes only the live layer and the next owner
+  // respawn — which rebuilds session_options from the spawn flags — silently
+  // reverts the style. The style reaches Claude Code ONLY through the adapter's
+  // creation settings, so that revert is a real behaviour change.
+  if (normalizedConfigId === "outputStyle") {
+    setSessionOptionOutputStyle(acpx, value);
+  }
+
   record.acpx = acpx;
 }
 
@@ -92,6 +102,21 @@ function setSessionOptionEffort(acpx: SessionAcpxState, value: string | undefine
     sessionOptions.effort = value;
   } else {
     delete sessionOptions.effort;
+  }
+
+  if (hasSessionOptions(sessionOptions)) {
+    acpx.session_options = sessionOptions;
+  } else {
+    delete acpx.session_options;
+  }
+}
+
+function setSessionOptionOutputStyle(acpx: SessionAcpxState, value: string | undefined): void {
+  const sessionOptions = { ...acpx.session_options };
+  if (typeof value === "string") {
+    sessionOptions.output_style = value;
+  } else {
+    delete sessionOptions.output_style;
   }
 
   if (hasSessionOptions(sessionOptions)) {
@@ -167,45 +192,51 @@ function mergeLatestDurableSessionOptions(
 
 type DurableSessionOptions = NonNullable<SessionAcpxState["session_options"]>;
 
+/**
+ * The durable session_options fields a disk-side write must be able to push past
+ * a stale in-flight-turn snapshot (brick://07dd62c9).
+ *
+ * ⚠️ ONE list, deliberately, feeding BOTH the overlay and the has-any predicate
+ * below. They are a matched pair: the predicate gates whether the overlay runs at
+ * all, so a field added to the overlay alone is a silent no-op for any change
+ * that touches ONLY that field — visible in exactly one state, which is the state
+ * nobody writes a test for (brick://67d2fd2f is this class). Sharing the list
+ * makes that divergence unrepresentable rather than merely discouraged.
+ *
+ * Adding a field here is the whole edit; there is no second place to update.
+ */
+const DURABLE_OVERLAY_FIELDS = [
+  "model",
+  // model_source rides alongside `model` so a provenance change carries too
+  // (brick://5bac5564 Layer C).
+  "model_source",
+  "effort",
+  // brick://874fee67: a disk-side `set outputStyle` during an in-flight turn must
+  // beat the stale turn snapshot, exactly as `effort` does.
+  "output_style",
+  "auto_failover",
+  "floor_hard",
+  "auto_subscription",
+  "fable_degrade_ok",
+] as const satisfies ReadonlyArray<keyof DurableSessionOptions>;
+
 function overlayDurableSessionOptionFields(
   merged: DurableSessionOptions,
   latest: DurableSessionOptions,
 ): void {
-  if (latest.model !== undefined) {
-    merged.model = latest.model;
-  }
-  if (latest.model_source !== undefined) {
-    merged.model_source = latest.model_source;
-  }
-  if (latest.effort !== undefined) {
-    merged.effort = latest.effort;
-  }
-  if (latest.auto_failover !== undefined) {
-    merged.auto_failover = latest.auto_failover;
-  }
-  if (latest.floor_hard !== undefined) {
-    merged.floor_hard = latest.floor_hard;
-  }
-  if (latest.auto_subscription !== undefined) {
-    merged.auto_subscription = latest.auto_subscription;
-  }
-  if (latest.fable_degrade_ok !== undefined) {
-    merged.fable_degrade_ok = latest.fable_degrade_ok;
+  for (const field of DURABLE_OVERLAY_FIELDS) {
+    const value = latest[field];
+    if (value !== undefined) {
+      // `field` is a known key and the value came from the same slot on `latest`,
+      // so the assignment is type-correct; the heterogeneous field union defeats a
+      // direct typed assignment, so index via an unknown-valued view (not `any`).
+      (merged as Record<string, unknown>)[field] = value;
+    }
   }
 }
 
-function hasLatestDurableSessionOptions(
-  latest: NonNullable<SessionAcpxState["session_options"]>,
-): boolean {
-  return (
-    latest.model !== undefined ||
-    latest.model_source !== undefined ||
-    latest.effort !== undefined ||
-    latest.auto_failover !== undefined ||
-    latest.floor_hard !== undefined ||
-    latest.auto_subscription !== undefined ||
-    latest.fable_degrade_ok !== undefined
-  );
+function hasLatestDurableSessionOptions(latest: DurableSessionOptions): boolean {
+  return DURABLE_OVERLAY_FIELDS.some((field) => latest[field] !== undefined);
 }
 
 export function getDesiredModelId(state: SessionAcpxState | undefined): string | undefined {

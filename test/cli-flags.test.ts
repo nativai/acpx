@@ -273,6 +273,12 @@ test("resolveGlobalFlags validates and normalizes dynamic Commander options", ()
     format: "json",
     model: "opus",
     reasoningEffort: "high",
+    // brick://874fee67 — present as an undefined own-key like `profile` /
+    // `floorHard` below: resolveGlobalFlags builds one object literal, so every
+    // flag it knows appears whether or not it was passed. This assertion is a
+    // whole-object deepEqual precisely so a newly-added flag has to be declared
+    // here rather than sliding in unnoticed.
+    outputStyle: undefined,
     subscription: "sub1",
     allowedTools: ["Read", "Edit"],
     maxTurns: 3,

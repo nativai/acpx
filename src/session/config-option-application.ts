@@ -3,6 +3,7 @@ import { withTimeout } from "../async-control.js";
 import type { SessionRecord } from "../types.js";
 import { applyConfigOptionsToRecord } from "./config-options.js";
 import { getDesiredConfigOptions, setDesiredConfigOption } from "./mode-preference.js";
+import { assertOutputStyleAdvertised, OUTPUT_STYLE_CONFIG_ID } from "./output-style.js";
 
 /** Minimal client surface so this is unit-testable with a stub. */
 export interface ConfigOptionApplyClient {
@@ -261,6 +262,47 @@ export async function persistAndApplyRequestedEffort(params: {
     timeoutMs: params.timeoutMs,
     verbose: params.verbose,
   });
+}
+
+/**
+ * Creation-site entry point for the `--output-style` spawn flag (brick://874fee67).
+ *
+ * ⚠️ NOT "persistAndApply" — and the missing half is the R-6 inversion, not an
+ * omission. `persistAndApplyRequestedEffort` performs a creation-time apply
+ * round-trip precisely BECAUSE the adapter applies effort to the live SDK query.
+ * Output style is already in force from the creation settings the query was
+ * BUILT with (it travelled in the session/new `_meta`), so there is nothing left
+ * to apply — and applying it would be the forbidden move. Do not "restore" an
+ * apply call here, and do not fix a perceived gap by making the adapter apply.
+ *
+ * What IS kept from the effort sibling, and why each matters:
+ * - the `advertisesConfigOption` GATE — this gate IS the honest degradation. On
+ *   an agent with no output-style concept (codex) the flag writes NOTHING and
+ *   errors nothing; the CLI has already warned on stderr. Dropping it would
+ *   persist a style for a session that can never honour one.
+ * - the PERSIST via `setDesiredConfigOption`, which writes the live
+ *   `desired_config_options.outputStyle` and, through the mode-preference sync,
+ *   the durable `session_options.output_style` a respawn re-applies.
+ *
+ * Validation happens here rather than at the adapter because Claude Code accepts
+ * ANY string as a style name and echoes it back as active — so an unvalidated
+ * typo produces a session that reports a style it does not have.
+ */
+export function persistRequestedOutputStyle(params: {
+  record: SessionRecord;
+  outputStyle: string | undefined;
+  advertised: SessionConfigOption[] | undefined;
+  agentLabel: string;
+}): void {
+  if (!params.outputStyle) {
+    return;
+  }
+  if (!advertisesConfigOption(params.advertised, OUTPUT_STYLE_CONFIG_ID)) {
+    // Silent no-op by design (the CLI emits the user-facing "ignored" warning).
+    return;
+  }
+  assertOutputStyleAdvertised(params.advertised, params.outputStyle, params.agentLabel);
+  setDesiredConfigOption(params.record, OUTPUT_STYLE_CONFIG_ID, params.outputStyle);
 }
 
 /**

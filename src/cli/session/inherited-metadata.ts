@@ -153,3 +153,32 @@ export function withInheritedReasoningEffort(
   }
   return parentEffort?.trim() || childEffort;
 }
+
+/**
+ * Spawn-time Claude output-style inheritance — pure, no IO (brick://874fee67).
+ * Verbatim shape of `withInheritedReasoningEffort`: a child with no explicit
+ * `--output-style` inherits the parent's persisted `session_options.output_style`
+ * only when the caller passes a same-agent parent value; explicit child selection
+ * wins. The caller gates this on same-agent-as-parent so a Claude style never
+ * reaches a Codex child.
+ *
+ * Why inherit at all, when Claude Code says subagents do NOT inherit the style:
+ * that statement is about Task-tool subagents inside ONE session, which run their
+ * own system prompt. An ACPX child is a separate session with its own spawn — the
+ * analogous Claude Code concept is a FORK, which does inherit. Every other
+ * spawn-shaping property here already inherits with this exact rule (design §7).
+ *
+ * NOTE the deliberate source asymmetry vs effort: the parent value is snapshotted
+ * from the DURABLE `session_options.output_style`, not from
+ * `desired_config_options`, because the live layer can be mid-flight while the
+ * durable field is the settled truth (design #33).
+ */
+export function withInheritedOutputStyle(
+  childOutputStyle: string | undefined,
+  parentOutputStyle: string | undefined,
+): string | undefined {
+  if (childOutputStyle?.trim()) {
+    return childOutputStyle; // explicit child --output-style wins
+  }
+  return parentOutputStyle?.trim() || childOutputStyle;
+}

@@ -45,6 +45,10 @@ import { importSession } from "../session/import.js";
 import { getDesiredConfigOptions } from "../session/mode-preference.js";
 import { guardImplicitFable, resolveSpawnModelSource } from "../session/model-guard.js";
 import {
+  assertOutputStyleSupportedForRecord,
+  OUTPUT_STYLE_CONFIG_ID,
+} from "../session/output-style.js";
+import {
   findGitRepositoryRoot,
   findSession,
   findSessionByDirectoryWalk,
@@ -122,6 +126,7 @@ import {
   withInheritedAgentCommand,
   withInheritedModel,
   withInheritedProfile,
+  withInheritedOutputStyle,
   withInheritedReasoningEffort,
   withInheritedTaskFolder,
 } from "./session/inherited-metadata.js";
@@ -264,6 +269,53 @@ function isDepthConfigOption(configId: string): boolean {
   return configId === "effort" || configId === "reasoning_effort";
 }
 
+// brick://874fee67 §4.2 #40 — enumerate the output styles an agent offers, for a
+// caller (acpx-ui's create dialog) that has no session yet.
+//
+// Genuinely cheap: the harness returns `available_output_styles` in its
+// `initialize` handshake, BEFORE any prompt — no auth, no tokens, no turn. It
+// also returns CUSTOM and house styles, which no filesystem scan could produce
+// for the built-ins.
+export async function handleListOutputStyles(
+  explicitAgentName: string | undefined,
+  flags: StatusFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const { listAgentOutputStyles } = await loadSessionModule();
+  const result = await listAgentOutputStyles({
+    agentCommand: agent.agentCommand,
+    agentName: agent.agentName,
+    cwd: globalFlags.cwd,
+    mcpServers: config.mcpServers,
+    authCredentials: config.auth,
+    authPolicy: globalFlags.authPolicy,
+    timeoutMs: globalFlags.timeout,
+    verbose: globalFlags.verbose,
+    sessionId: resolveSessionTargetSelector({ flags, command }).sessionId,
+  });
+  if (
+    emitJsonResult(globalFlags.format, {
+      action: "output_styles_list",
+      agent: agent.agentName,
+      supported: result.supported,
+      current: result.current ?? null,
+      available: result.available,
+    })
+  ) {
+    return;
+  }
+  if (!result.supported) {
+    process.stderr.write(`[acpx] agent "${agent.agentName}" does not support output styles\n`);
+    return;
+  }
+  for (const style of result.available) {
+    process.stdout.write(`${style === result.current ? "* " : "  "}${style}\n`);
+  }
+}
+
 function resolveRequestedOutputPolicy(globalFlags: {
   format: OutputFormat;
   jsonStrict?: boolean;
@@ -288,6 +340,7 @@ function sessionOptionsFromGlobalFlags(
     systemPrompt: globalFlags.systemPrompt,
     profile: unifiedSelection,
     reasoningEffort: globalFlags.reasoningEffort,
+    outputStyle: globalFlags.outputStyle,
     floorHard: globalFlags.floorHard,
   };
 }
@@ -460,6 +513,29 @@ function warnReasoningEffortIgnoredForNonClaude(
   );
 }
 
+// brick://874fee67: verbatim sibling of warnReasoningEffortIgnoredForNonClaude.
+// `--output-style` is meaningful only for agents that ADVERTISE an `outputStyle`
+// config option — claude and claude-pty today. On any other effective agent
+// (explicit codex, or a bare spawn that inherited a non-claude parent) nothing is
+// written and nothing is applied, so say so once on stderr — never an error, and
+// never a write (the advertisesConfigOption gate in the apply path enforces that).
+function warnOutputStyleIgnoredForNonClaude(
+  globalFlags: GlobalFlags,
+  effectiveAgentName: string,
+): void {
+  if (
+    !globalFlags.outputStyle ||
+    effectiveAgentName === "claude" ||
+    effectiveAgentName === "claude-pty" ||
+    globalFlags.jsonStrict
+  ) {
+    return;
+  }
+  process.stderr.write(
+    `[acpx] --output-style applies to claude; ignoring for agent "${effectiveAgentName}"\n`,
+  );
+}
+
 async function resolvePermissionPolicyFromFlags(
   globalFlags: GlobalFlags,
 ): Promise<PermissionPolicy | undefined> {
@@ -519,6 +595,13 @@ type ResolvedParentSession = {
   agentCommand?: string;
   model?: string;
   effort?: string;
+  /**
+   * brick://874fee67 — the parent's DURABLE `session_options.output_style`.
+   * Deliberately NOT `desired_config_options.outputStyle` (which is where
+   * `effort` above is snapshotted from): for output style the durable field is
+   * the settled truth and the live layer can be mid-flight (design #33).
+   */
+  outputStyle?: string;
 };
 
 // Snapshot the parent record's inheritable fields. Agent-type + model + effort
@@ -537,6 +620,7 @@ function parentInheritableFields(parent: SessionRecord): ResolvedParentSession {
     agentCommand: parent.agentCommand,
     model: sessionOptions?.model,
     effort: parent.acpx?.desired_config_options?.effort,
+    outputStyle: sessionOptions?.output_style,
   };
 }
 
@@ -653,6 +737,12 @@ function inheritedSpawnSessionOptions(
       globalFlags.reasoningEffort,
       sameAgentAsParent ? parent?.effort : undefined,
     ),
+    // brick://874fee67: same-agent gated exactly like model/effort — a Claude
+    // style must never reach a Codex child. An explicit --output-style always wins.
+    outputStyle: withInheritedOutputStyle(
+      globalFlags.outputStyle,
+      sameAgentAsParent ? parent?.outputStyle : undefined,
+    ),
     profile: inheritedProfileSelection(globalFlags, sameAgentAsParent, parent),
   };
 }
@@ -762,6 +852,14 @@ function sourceSessionOptions(source: SessionRecord) {
   if (reasoningEffort !== undefined) {
     sessionOptions.reasoningEffort = reasoningEffort;
   }
+  // brick://874fee67: sessionOptionsFromRecord already carries the DURABLE
+  // session_options.output_style. Overlay the live desired layer the same way
+  // effort does, so a style set on the source after its last persist still
+  // reaches the copy.
+  const outputStyle = getDesiredConfigOptions(source.acpx).outputStyle;
+  if (outputStyle !== undefined) {
+    sessionOptions.outputStyle = outputStyle;
+  }
   return Object.keys(sessionOptions).length > 0 ? sessionOptions : undefined;
 }
 
@@ -790,12 +888,16 @@ function applyCopyModelOverrides(
   merged: NonNullable<ReturnType<typeof sourceSessionOptions>>,
   model: string | undefined,
   reasoningEffort: string | undefined,
+  outputStyle: string | undefined,
 ): void {
   if (model !== undefined) {
     merged.model = model;
   }
   if (reasoningEffort !== undefined) {
     merged.reasoningEffort = reasoningEffort;
+  }
+  if (outputStyle !== undefined) {
+    merged.outputStyle = outputStyle;
   }
 }
 
@@ -825,6 +927,10 @@ function applyGuardedCopyModel(
     merged,
     guarded.model,
     withInheritedReasoningEffort(globalFlags.reasoningEffort, merged.reasoningEffort),
+    // brick://874fee67: an explicit --output-style must beat the template/source
+    // style on the copy path too, exactly as --reasoning-effort does. Without
+    // this the flag is silently swallowed by `sessions copy` / fork.
+    withInheritedOutputStyle(globalFlags.outputStyle, merged.outputStyle),
   );
   if (guarded.model !== undefined) {
     merged.modelSource = guarded.source;
@@ -855,9 +961,16 @@ function copyDesiredConfigOptionsWithOverride(
 ): Record<string, string> | undefined {
   const base = sourceDesiredConfigOptions(source);
   const effort = withInheritedReasoningEffort(globalFlags.reasoningEffort, base?.effort);
+  // brick://874fee67: mirror of the effort override — explicit --output-style
+  // wins over the template's baked-in style; byte-identical to the source when
+  // no flag is passed.
+  const outputStyle = withInheritedOutputStyle(globalFlags.outputStyle, base?.outputStyle);
   const merged = { ...base };
   if (effort !== undefined) {
     merged.effort = effort;
+  }
+  if (outputStyle !== undefined) {
+    merged.outputStyle = outputStyle;
   }
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
@@ -1300,6 +1413,7 @@ export async function handlePrompt(
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   warnReasoningEffortIgnoredForNonClaude(globalFlags, agent.agentName);
+  warnOutputStyleIgnoredForNonClaude(globalFlags, agent.agentName);
   const { printPromptSessionBanner, printQueuedPromptByFormat } = await loadOutputRenderModule();
   const selector = resolveSessionTargetSelector({ flags, command });
   const record = await findRoutedTargetSessionOrThrow(agent, selector);
@@ -1387,6 +1501,7 @@ export async function handleExec(
   });
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   warnReasoningEffortIgnoredForNonClaude(globalFlags, agent.agentName);
+  warnOutputStyleIgnoredForNonClaude(globalFlags, agent.agentName);
 
   const result = await runOnce({
     agentCommand: agent.agentCommand,
@@ -1499,6 +1614,48 @@ function printSetConfigOptionResultByFormat(
     format === "quiet"
       ? `${value}\n`
       : `config set: ${configId}=${value} (${result.response.configOptions.length} options)\n`,
+  );
+}
+
+/**
+ * brick://874fee67 — report the outcome, and say the RESTART BEFORE it happens.
+ *
+ * `pending: true` is the NORMAL post-change state when the agent is working, not
+ * an error state: the write is durable and the agent rebinds at the turn
+ * boundary. The text says so plainly rather than claiming the style is already
+ * in force — the one thing this feature must never do is report a style as
+ * active when the running query was built without it.
+ */
+function printSetOutputStyleResultByFormat(
+  outputStyle: string,
+  result: { record: SessionRecord; ownerRestarted?: boolean; pending?: boolean },
+  format: OutputFormat,
+): void {
+  const pending = result.pending === true;
+  if (
+    emitJsonResult(format, {
+      action: "output_style_set",
+      outputStyle,
+      ownerRestarted: result.ownerRestarted ?? false,
+      pending,
+      // The style the CURRENT query was built with — what the session is really
+      // running until the recycle lands. Never the harness readback.
+      outputStyleApplied: result.record.acpx?.applied_output_style ?? null,
+      acpxRecordId: result.record.acpxRecordId,
+      acpxSessionId: result.record.acpSessionId,
+      agentSessionId: result.record.agentSessionId,
+    })
+  ) {
+    return;
+  }
+  if (format === "quiet") {
+    process.stdout.write(`${outputStyle}\n`);
+    return;
+  }
+  process.stdout.write(
+    pending
+      ? `output style set: ${outputStyle} (pending — the agent is mid-turn; it restarts at the end of this turn to pick it up, conversation preserved)\n`
+      : `output style set: ${outputStyle} (the agent restarts on your next message to pick this up; conversation preserved)\n`,
   );
 }
 
@@ -1624,6 +1781,18 @@ async function tryHandleSpecialConfigKey(
     await handleSetProfile(explicitAgentName, value, flags, command, config);
     return true;
   }
+  // brick://874fee67 — `set outputStyle <name>` is routed OUT of the generic ACP
+  // config path, like `subscription`/`profile` above, for one specific reason:
+  // the generic path refuses whenever a turn is in flight, and output style is
+  // the one option whose write is accepted at any time (only the owner RECYCLE
+  // waits for the turn boundary). Routing it generically would reject a change a
+  // user made while their agent was working — which, for turns that run minutes,
+  // is most of the time. The `set` verb itself stays generic at the CLI surface;
+  // only the dispatch is special.
+  if (isOutputStyleConfigKey(configId)) {
+    await handleSetOutputStyle(explicitAgentName, value, flags, command, config);
+    return true;
+  }
   if (isAutoFailoverConfigKey(configId)) {
     await handleSetAutoFailover(explicitAgentName, value, flags, command, config);
     return true;
@@ -1682,6 +1851,51 @@ export async function handleSetConfigOption(
   }
 
   printSetConfigOptionResultByFormat(configId, value, result, globalFlags.format);
+}
+
+// Accept the camelCase config id and the snake/kebab spellings a human is
+// likely to type. Deliberately NOT case-folding the VALUE anywhere — only the
+// key is normalized here; style names are opaque and case-sensitive.
+function isOutputStyleConfigKey(configId: string): boolean {
+  const normalized = configId.trim();
+  return (
+    normalized === OUTPUT_STYLE_CONFIG_ID ||
+    normalized === "output_style" ||
+    normalized === "output-style"
+  );
+}
+
+/**
+ * brick://874fee67 — `acpx <agent> set outputStyle <name>`.
+ *
+ * Validated against the session's OWN advertised style list (a record read, so
+ * it works with no owner running), then persisted. The owner is recycled
+ * immediately when it is idle; when a turn is in flight the write is still
+ * ACCEPTED and the owner recycles itself at the turn boundary. Refused only when
+ * work is queued behind the active turn, which a recycle would drop.
+ */
+export async function handleSetOutputStyle(
+  explicitAgentName: string | undefined,
+  value: string,
+  flags: StatusFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const selector = resolveSessionTargetSelector({ flags, command });
+  const record = await findRoutedTargetSessionOrThrow(agent, selector);
+  // Throws OutputStyleNotSupportedError / OutputStyleUnknownError. Claude Code
+  // itself validates nothing here, so this refusal is the only thing standing
+  // between a typo and a session that reports a style it does not have.
+  assertOutputStyleSupportedForRecord(record, value);
+  const { setSessionOutputStyle } = await loadSessionModule();
+  const result = await setSessionOutputStyle({
+    sessionId: record.acpxRecordId,
+    outputStyle: value,
+    sessionName: selector.name ?? record.name,
+  });
+  printSetOutputStyleResultByFormat(value, result, globalFlags.format);
 }
 
 function isAutoFailoverConfigKey(configId: string): boolean {
@@ -2356,6 +2570,7 @@ export async function handleSessionsNew(
     config,
   );
   warnReasoningEffortIgnoredForNonClaude(globalFlags, effectiveAgent.agentName);
+  warnOutputStyleIgnoredForNonClaude(globalFlags, effectiveAgent.agentName);
   const [{ createSession, closeSession }, { printCreatedSessionBanner, printNewSessionByFormat }] =
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
 
@@ -2743,6 +2958,7 @@ export async function handleSessionsEnsure(
     config,
   );
   warnReasoningEffortIgnoredForNonClaude(globalFlags, effectiveAgent.agentName);
+  warnOutputStyleIgnoredForNonClaude(globalFlags, effectiveAgent.agentName);
   const existing = await findSessionByDirectoryWalk({
     agentCommand: effectiveAgent.agentCommand,
     cwd: effectiveAgent.cwd,

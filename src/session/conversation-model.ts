@@ -686,6 +686,11 @@ export function cloneSessionAcpxState(
       ? { ...state.desired_config_options }
       : undefined,
     current_model_id: state.current_model_id,
+    // brick://874fee67: flat string, same class as current_model_id. Dropping it
+    // here would make every turn's clone report "no style applied", which the
+    // derived pending predicate reads as a pending change → a recycle per turn.
+    applied_output_style: state.applied_output_style,
+    refused_output_style: state.refused_output_style,
     context_window_size: state.context_window_size,
     context_window_model_id: state.context_window_model_id,
     available_models: state.available_models ? [...state.available_models] : undefined,
@@ -757,6 +762,10 @@ function cloneSessionOptionPolicyFlags(
     // provenance — conditional-spread (mirror floor_hard) so it survives EVERY
     // turn's clone and an absent value never becomes an `undefined` own-key.
     ...(options.model_source !== undefined ? { model_source: options.model_source } : {}),
+    // brick://874fee67: output_style is a durable flat-string per-session policy —
+    // conditional-spread (mirror model_source) so it survives EVERY turn's clone
+    // and an absent value never becomes an `undefined` own-key.
+    ...(options.output_style !== undefined ? { output_style: options.output_style } : {}),
     ...(options.system_prompt !== undefined
       ? { system_prompt: cloneSystemPromptOption(options.system_prompt) }
       : {}),
