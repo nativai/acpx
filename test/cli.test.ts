@@ -664,10 +664,17 @@ test("W7-L12 (c2): the explicit pin SURVIVES to turn two — a later flagless pr
       },
     });
 
+    // `--ttl 0.01` releases the queue owner right after the turn, so turn two
+    // COLD-RESPAWNS. That matters: a warm owner still holds `--model fable` in its
+    // spawn-time options and would keep serving fable for that reason alone, which
+    // would let this test pass without the pin ever having reached disk. Cold, the
+    // only place turn two can learn the pin is the RECORD.
     const turnOne = await runCli(
       [
         "--cwd",
         cwd,
+        "--ttl",
+        "0.01",
         "--approve-all",
         "--format",
         "json",
