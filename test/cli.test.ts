@@ -643,6 +643,73 @@ test("W7-L12 (c): a prompt-line --model fable PINS fable on an inherited-opus se
   });
 });
 
+// TURN TWO. A pin that serves one turn and is discarded is not a pin. The specimen
+// carried a SECOND defect superimposed on the first: the durable-overlay merge
+// reverted the model/provenance written during the turn from the pre-turn disk
+// copy, so even the apply-belt's own `guard-forced` write was lost and only its
+// `model_guard` breadcrumb (not a durable-overlay field) survived to be seen. A
+// single-turn assertion cannot fail on that; this one can.
+test("W7-L12 (c2): the explicit pin SURVIVES to turn two — a later flagless prompt keeps fable", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await writeGuardConfig(homeDir);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "l12-turn2",
+      acpSessionId: "l12-turn2",
+      agentCommand: GUARD_CLAUDE_COMMAND,
+      cwd,
+      acpx: {
+        current_model_id: "opus",
+        available_models: ["default", "opus[1m]", "fable", "sonnet", "haiku", "opus"],
+        session_options: { model: "opus", model_source: "inherited" },
+      },
+    });
+
+    const turnOne = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--approve-all",
+        "--format",
+        "json",
+        "--model",
+        "fable",
+        "claude",
+        "prompt",
+        "--session-id",
+        "l12-turn2",
+        "one",
+      ],
+      homeDir,
+    );
+    assert.equal(turnOne.code, 0, turnOne.stderr);
+
+    // Turn two names NO model. The pin must still be the one turn one set — if the
+    // provenance had not persisted as "explicit", the belt would re-block it here
+    // and the flag would have worked exactly once.
+    const turnTwo = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--approve-all",
+        "--format",
+        "json",
+        "claude",
+        "prompt",
+        "--session-id",
+        "l12-turn2",
+        "two",
+      ],
+      homeDir,
+    );
+    assert.equal(turnTwo.code, 0, turnTwo.stderr);
+    const stored = await readStoredModel(homeDir, "l12-turn2");
+
+    assert.equal(stored.acpx?.session_options?.model, "fable");
+    assert.equal(stored.acpx?.session_options?.model_source, "explicit");
+    assert.equal(stored.acpx?.session_options?.model_guard, undefined); // never re-blocked
+  });
+});
+
 test("W7-L12 (d): a prompt with NO --model changes nothing on an inherited-opus session", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await writeGuardConfig(homeDir);
