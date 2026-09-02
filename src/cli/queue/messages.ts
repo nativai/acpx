@@ -336,6 +336,13 @@ function parseSessionOptions(value: unknown): QueueSessionOptions | null | undef
   if (!assignSessionModel(sessionOptions, record.model)) {
     return null;
   }
+  // brick://ab3bf660 (W7-L12): the pin's provenance rides WITH the pin across the
+  // IPC enqueue boundary too. A prompt submitted to an ALREADY-RUNNING owner takes
+  // this path; dropping the provenance here leaves the owner pairing an explicit
+  // `--model` with the record's stale source, which is the silent-override defect.
+  if (!assignSessionModelSource(sessionOptions, record.modelSource)) {
+    return null;
+  }
   if (!assignSessionAllowedTools(sessionOptions, record.allowedTools)) {
     return null;
   }
@@ -371,6 +378,17 @@ function assignSessionModel(options: QueueSessionOptions, value: unknown): boole
     return false;
   }
   options.model = value;
+  return true;
+}
+
+function assignSessionModelSource(options: QueueSessionOptions, value: unknown): boolean {
+  if (value == null) {
+    return true;
+  }
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return false;
+  }
+  options.modelSource = value;
   return true;
 }
 

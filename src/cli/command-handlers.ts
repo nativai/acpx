@@ -335,6 +335,15 @@ function sessionOptionsFromGlobalFlags(
   const unifiedSelection = globalFlags.profile ?? globalFlags.subscription;
   return {
     model: globalFlags.model,
+    // brick://ab3bf660 (W7-L12): `--model` on THIS command line IS the explicit
+    // signal. Stamping the provenance here — paired with the value it describes,
+    // at the one place the flag is read — is what lets the apply-tier belt tell an
+    // operator-named Fable from an inherited one. Without it the belt could only
+    // consult the RECORD's stored provenance, which on a prompt to an existing
+    // session is the STALE creation-time value ("inherited"), and a prompt-line
+    // `--model fable` was silently force-redirected to opus. Undefined when no
+    // flag was passed, so `mergeSessionOptions` falls back to the stored pair.
+    modelSource: globalFlags.model?.trim() ? "explicit" : undefined,
     allowedTools: globalFlags.allowedTools,
     maxTurns: globalFlags.maxTurns,
     systemPrompt: globalFlags.systemPrompt,

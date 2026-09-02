@@ -593,6 +593,136 @@ test("R7-fable (brick://5bac5564): a flagless re-ensure off a Fable parent keeps
   });
 });
 
+// brick://ab3bf660 (W7-L12) — an explicit `--model` is a PIN whenever it is
+// stated, `sessions new` / a later `prompt` alike. Pre-fix, the apply-belt keyed
+// on the RECORD's stored `model_source` ("inherited" from creation) instead of
+// THIS invocation's provenance, so a prompt-line `--model fable` was silently
+// force-redirected to the non-Fable default while `--reasoning-effort` applied.
+
+test("W7-L12 (c): a prompt-line --model fable PINS fable on an inherited-opus session", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await writeGuardConfig(homeDir);
+    // The reported specimen exactly: a session created with NO --model, whose pin
+    // arrived by inheritance (`model_source: "inherited"`).
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "l12-inherited",
+      acpSessionId: "l12-inherited",
+      agentCommand: GUARD_CLAUDE_COMMAND,
+      cwd,
+      acpx: {
+        current_model_id: "opus",
+        available_models: ["default", "opus[1m]", "fable", "sonnet", "haiku", "opus"],
+        session_options: { model: "opus", model_source: "inherited" },
+      },
+    });
+
+    const result = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--approve-all",
+        "--format",
+        "json",
+        "--model",
+        "fable",
+        "claude",
+        "prompt",
+        "--session-id",
+        "l12-inherited",
+        "hi",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const stored = await readStoredModel(homeDir, "l12-inherited");
+
+    assert.equal(stored.acpx?.session_options?.model, "fable"); // the flag PINNED
+    assert.equal(stored.acpx?.session_options?.model_source, "explicit");
+    assert.equal(stored.acpx?.current_model_id, "fable");
+    assert.equal(stored.acpx?.session_options?.model_guard, undefined); // belt did not fire
+  });
+});
+
+test("W7-L12 (d): a prompt with NO --model changes nothing on an inherited-opus session", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await writeGuardConfig(homeDir);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "l12-noflag",
+      acpSessionId: "l12-noflag",
+      agentCommand: GUARD_CLAUDE_COMMAND,
+      cwd,
+      acpx: {
+        current_model_id: "opus",
+        available_models: ["default", "opus[1m]", "fable", "sonnet", "haiku", "opus"],
+        session_options: { model: "opus", model_source: "inherited" },
+      },
+    });
+
+    const result = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--approve-all",
+        "--format",
+        "json",
+        "claude",
+        "prompt",
+        "--session-id",
+        "l12-noflag",
+        "hi",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const stored = await readStoredModel(homeDir, "l12-noflag");
+
+    assert.equal(stored.acpx?.session_options?.model, "opus");
+    assert.equal(stored.acpx?.session_options?.model_source, "inherited");
+    assert.equal(stored.acpx?.session_options?.model_guard, undefined);
+  });
+});
+
+test("W7-L12: an IMPLICIT Fable pin on the prompt path is still belt-forced (no --model)", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await writeGuardConfig(homeDir);
+    // Provenance says the Fable pin was NOT asked for by name → the belt must
+    // still redirect it. This is the over-correction guard: the downgrade keys on
+    // PROVENANCE, and a non-explicit Fable keeps being downgraded.
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "l12-implicit-fable",
+      acpSessionId: "l12-implicit-fable",
+      agentCommand: GUARD_CLAUDE_COMMAND,
+      cwd,
+      acpx: {
+        current_model_id: "opus",
+        available_models: ["fable", "opus", "sonnet"],
+        session_options: { model: "fable", model_source: "inherited" },
+      },
+    });
+
+    const result = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--approve-all",
+        "--format",
+        "json",
+        "claude",
+        "prompt",
+        "--session-id",
+        "l12-implicit-fable",
+        "hi",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const stored = await readStoredModel(homeDir, "l12-implicit-fable");
+
+    assert.equal(stored.acpx?.session_options?.model, "opus"); // forced off Fable
+    assert.equal(stored.acpx?.session_options?.model_guard?.blocked, "fable");
+  });
+});
+
 test("prompting an existing codex session without --model does not reset its model", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

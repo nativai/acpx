@@ -120,6 +120,11 @@ function assignQueueOwnerSessionOptions(
 
   options.sessionOptions = {};
   assignSessionModel(options.sessionOptions, sessionOpts.model);
+  // brick://ab3bf660 (W7-L12): the provenance rides WITH the pin across the owner
+  // payload. Dropping it here re-creates the defect from the other side — the
+  // owner would receive an explicit `--model fable` carrying no provenance and
+  // fall back to the record's stale "inherited", which the belt then blocks.
+  assignSessionModelSource(options.sessionOptions, sessionOpts.modelSource);
   assignSessionAllowedTools(options.sessionOptions, sessionOpts.allowedTools);
   assignSessionMaxTurns(options.sessionOptions, sessionOpts.maxTurns);
   assignSessionSystemPrompt(options.sessionOptions, sessionOpts.systemPrompt);
@@ -141,6 +146,15 @@ function assignSessionModel(
 ): void {
   if (typeof value === "string" && value.trim().length > 0) {
     options.model = value;
+  }
+}
+
+function assignSessionModelSource(
+  options: NonNullable<QueueOwnerRuntimeOptions["sessionOptions"]>,
+  value: unknown,
+): void {
+  if (typeof value === "string" && value.trim().length > 0) {
+    options.modelSource = value;
   }
 }
 
