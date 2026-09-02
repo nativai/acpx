@@ -717,6 +717,65 @@ test("W7-L12 (c2): the explicit pin SURVIVES to turn two — a later flagless pr
   });
 });
 
+/**
+ * W7-L12 (g) — THE DEFECT IS PROVENANCE-CONDITIONAL, AND THAT IS A TRAP FOR
+ * WHOEVER TESTS IT NEXT.
+ *
+ * ⚠️ DO NOT BUILD A SUBJECT FOR THIS BUG WITH `model_source: "explicit"`.
+ * `guardServedModel` returns UNFORCED when `modelSource` is undefined OR
+ * "explicit", so a prompt-line `--model fable` was silently overridden ONLY when
+ * the target session's stored source was present and NON-explicit (inherited /
+ * default / guard-forced). Against an explicitly-pinned session the very same
+ * command APPEARED TO WORK before the fix — so a subject built that way
+ * reproduces nothing and reads as "there was no bug".
+ *
+ * This test therefore asserts a property that holds BOTH pre- and post-fix. It
+ * earns its place not by failing on the bug but by NAMING the condition, so the
+ * suite carries the discriminator instead of leaving it in a report nobody reads.
+ * The reproduction subjects are (c) / (c2), which stage `"inherited"`.
+ */
+test("W7-L12 (g): the override was conditional on NON-explicit stored provenance", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await writeGuardConfig(homeDir);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "l12-already-explicit",
+      acpSessionId: "l12-already-explicit",
+      agentCommand: GUARD_CLAUDE_COMMAND,
+      cwd,
+      // The WRONG subject for this bug: stored source already "explicit".
+      acpx: {
+        current_model_id: "sonnet",
+        available_models: ["default", "opus[1m]", "fable", "sonnet", "haiku", "opus"],
+        session_options: { model: "sonnet", model_source: "explicit" },
+      },
+    });
+
+    const result = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--approve-all",
+        "--format",
+        "json",
+        "--model",
+        "fable",
+        "claude",
+        "prompt",
+        "--session-id",
+        "l12-already-explicit",
+        "hi",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const stored = await readStoredModel(homeDir, "l12-already-explicit");
+
+    assert.equal(stored.acpx?.session_options?.model, "fable");
+    assert.equal(stored.acpx?.session_options?.model_source, "explicit");
+    assert.equal(stored.acpx?.session_options?.model_guard, undefined);
+  });
+});
+
 test("W7-L12 (d): a prompt with NO --model changes nothing on an inherited-opus session", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await writeGuardConfig(homeDir);
