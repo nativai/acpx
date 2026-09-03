@@ -8,18 +8,61 @@ import type { SessionAcpxState, SessionRecord } from "../types.js";
 import { effortRank, normalizeEffortLevelForModel } from "./config-option-application.js";
 import { isoNow } from "./persistence.js";
 
-// ─── Model-family comparison ────────────────────────────────────────────────
+// ─── Served-model vs pinned floor ───────────────────────────────────────────
 //
-// acpx has NO model-rank system (verified: the only model-family logic is
-// `isFableModel`, a substring check). A pinned model is EXACT — the floor is
-// "served == pinned" — and the harness only ever downgrades (never silently
-// serves a MORE expensive model), so "served family ≠ pinned family" is exactly
-// "below floor". We compare FAMILIES (fable / opus / sonnet / haiku) so an alias
-// pin ("fable") matches its served full id ("claude-fable-5"), mirroring how
-// `isFableModel` already treats "fable" as a substring family.
+// acpx has NO model-rank system, and deliberately does not gain one here. This
+// check answers ONE question — "is the served id the model that was pinned?" —
+// and never "is it better or worse", because nothing in acpx can ground that
+// ordering: the adapter advertises models without a rank, and cost is not
+// capability (Fable is the most expensive model; Opus 5 is the SDK's own
+// "Default (recommended)").
+//
+// ⚠️ DO NOT "fix" this by adding a capability ladder so an "upgrade" passes. It
+// looks like the obvious improvement and it is the bug, twice over:
+//   * a hand-written ladder rots on every model release — silently, and in the
+//     direction that REFUSES real turns under `--floor-hard`; and
+//   * it would make acpx silently accept a session served the most expensive
+//     model it never asked for. That is measured, not hypothetical: session
+//     b80f2910 (2026-09-01) was pinned `sonnet` and served `claude-fable-5-1`.
+//     Today that is at least recorded. Trading a mislabel for an invisible cost
+//     event is the worse deal.
+// `test/model-floor-served-id.test.ts` R6 goes red if that acceptance is added.
+//
+// CORRECTION (brick 8a54201e, 2026-09-03) — this comment used to assert that
+// "the harness only ever downgrades (never silently serves a MORE expensive
+// model), so 'served family ≠ pinned family' is exactly 'below floor'". That is
+// FALSE; the b80f2910 record above falsifies it. The `below-floor` status is
+// therefore WIDER than its name: it means "off pin", direction unknown.
+//
+// Satisfaction has exactly two clauses:
+//   * an ALIAS pin (`fable`/`opus`/`sonnet`/`haiku`) is a FAMILY-level request,
+//     so any served id in that family satisfies it. This must stay loose, and
+//     the reason is measured: the same `fable` alias resolved to
+//     `claude-fable-5` on adapter 0.3.219 and to `claude-fable-5-1` on 0.3.257,
+//     both on the wire within one day (brick 99ff393b, probe c5). Exact-matching
+//     aliases would refuse real turns fleet-wide.
+//   * a CONCRETE pin is EXACT — the user named a generation, so a different
+//     generation of the same family is off pin. Only a DATED SNAPSHOT of that
+//     same id refines it (`claude-haiku-4-5` → `claude-haiku-4-5-20251001`).
 
 const KNOWN_MODEL_FAMILIES = ["fable", "opus", "sonnet", "haiku"] as const;
 const MODEL_CONTEXT_HINT_PATTERN = /\[\d+m\]$/i;
+// ⚠️ The date SHAPE is load-bearing — do not relax this to "any component".
+// `served.startsWith(pinned + "-")` alone re-admits `claude-fable-5` served as
+// `claude-fable-5-1`: a generation bump wearing a snapshot's shape, i.e. exactly
+// the silent upgrade this file refuses to make above, through the back door.
+// R4 (snapshot must pass) and R4c (generation bump must be caught) pin both
+// directions, so the asymmetry stays a decision rather than a side effect.
+const MODEL_SNAPSHOT_SUFFIX_PATTERN = /^\d{8}$/;
+
+/** Lowercase + trim a model id and strip its `[Nm]` context hint. */
+function normalizeModelId(modelId: string | null | undefined): string | undefined {
+  if (typeof modelId !== "string") {
+    return undefined;
+  }
+  const normalized = modelId.trim().toLowerCase().replace(MODEL_CONTEXT_HINT_PATTERN, "");
+  return normalized.length > 0 ? normalized : undefined;
+}
 
 /**
  * Normalize a model id/alias to a comparable family token. Returns a known
@@ -28,11 +71,8 @@ const MODEL_CONTEXT_HINT_PATTERN = /\[\d+m\]$/i;
  * still compare by equality.
  */
 export function modelFamily(modelId: string | null | undefined): string | undefined {
-  if (typeof modelId !== "string") {
-    return undefined;
-  }
-  const normalized = modelId.trim().toLowerCase().replace(MODEL_CONTEXT_HINT_PATTERN, "");
-  if (normalized.length === 0) {
+  const normalized = normalizeModelId(modelId);
+  if (normalized === undefined) {
     return undefined;
   }
   for (const family of KNOWN_MODEL_FAMILIES) {
@@ -43,17 +83,35 @@ export function modelFamily(modelId: string | null | undefined): string | undefi
   return normalized;
 }
 
-/** True when the served model is the SAME family as the pinned model. */
+/** True when the pin is a bare family token (`fable`), not a concrete model id. */
+function isFamilyAliasPin(normalizedPin: string): boolean {
+  return (KNOWN_MODEL_FAMILIES as readonly string[]).includes(normalizedPin);
+}
+
+/**
+ * True when the served model SATISFIES the pinned floor: an alias pin is met by
+ * any served id of that family; a concrete pin is met only by itself or by a
+ * dated snapshot of itself. See the two clauses documented above.
+ */
 export function servedModelMatchesFloor(
   pinnedModel: string | undefined,
   servedModel: string | undefined,
 ): boolean {
-  const pinned = modelFamily(pinnedModel);
-  const served = modelFamily(servedModel);
+  const pinned = normalizeModelId(pinnedModel);
+  const served = normalizeModelId(servedModel);
   if (pinned === undefined || served === undefined) {
     return false;
   }
-  return pinned === served;
+  if (isFamilyAliasPin(pinned)) {
+    return modelFamily(served) === pinned;
+  }
+  if (served === pinned) {
+    return true;
+  }
+  if (!served.startsWith(`${pinned}-`)) {
+    return false;
+  }
+  return MODEL_SNAPSHOT_SUFFIX_PATTERN.test(served.slice(pinned.length + 1));
 }
 
 // ─── Effort derivation (effort follows model) ───────────────────────────────
@@ -89,8 +147,10 @@ export type ModelFloorEvaluation = {
 
 /**
  * Compare a served model+effort against the pinned floor. MODEL-FIRST (effort
- * follows model, §1/§9): a model-family mismatch is below-floor regardless of
- * effort. When the model is at floor, an OPTIONALLY-supplied served effort (only
+ * follows model, §1/§9): a served model that does not satisfy the pin is
+ * below-floor regardless of effort — and note `below-floor` names "off pin",
+ * NOT a proven downgrade (see the correction at the top of this file).
+ * When the model is at floor, an OPTIONALLY-supplied served effort (only
  * `$CLAUDE_EFFORT`, self-readable — the acpx runtime does not have it) below the
  * pinned effort is also below-floor. An unreadable served model ⇒ `unknown`
  * (the caller decides: non-hard accepts, hard fails closed only when it must).

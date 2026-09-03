@@ -93,6 +93,24 @@ test("R4b extension must be at a COMPONENT boundary, not any string prefix", () 
   assert.equal(e.status, "below-floor");
 });
 
+test("R4c a GENERATION BUMP must not ride in through the snapshot clause", () => {
+  // R4b does NOT cover this one — `claude-fable-5-1` IS at a component boundary
+  // after `claude-fable-5`, so a bare `startsWith(pin + "-")` accepts it and a
+  // session pinned to generation 5 is silently served the newer, pricier 5.1.
+  // That is the same silent-upgrade acceptance this module refuses when it
+  // declines to rank models, arriving through the back door of the snapshot
+  // clause. Requiring a DATE-shaped remainder is what separates the two — a
+  // generation bump and a dated snapshot are otherwise the same shape.
+  // R4 above is this test's other half: both directions are asserted, so the
+  // asymmetry is a decision and not a property of `startsWith`.
+  const e = evaluateModelFloor({
+    pinnedModel: "claude-fable-5",
+    servedModel: "claude-fable-5-1",
+  });
+  assert.equal(e.status, "below-floor");
+  assert.equal(e.reason, "model");
+});
+
 // ─── R5/R6 — the two real session records, end-to-end through the enforce path ─
 
 test("R5 real record b2330b79 (pin claude-fable-5-1, served claude-sonnet-5) is still caught", async () => {
