@@ -21,6 +21,21 @@ const PROBE_MODEL = "claude-haiku-4-5-20251001";
 // The dedicated Fable-share probe model. A 1-token generation against this model
 // is the ONLY reliable per-subscription Fable-share exhaustion signal today
 // (200 ⇒ available, 429 ⇒ exhausted) — the 5h/7d unified windows do not track it.
+//
+// Deliberately still generation 5.0 even though the `fable` alias now serves
+// claude-fable-5-1 (SDK ≥0.3.251). MEASURED 2026-09-03 on devbox, production
+// /v1/messages, 3 accounts (sub5/sub9/sub10), both probe orders: a 1-token
+// claude-fable-5 probe and a 1-token claude-fable-5-1 probe return BYTE-IDENTICAL
+// rate-limit header sets — same …-7d_oi-utilization, -reset and -status, and no
+// extra allocation key on 5.1. A haiku probe carries NO 7d_oi at all, so that
+// header is emitted because the REQUEST draws on the Fable share, not as a
+// standing account readout ⇒ both generations meter against ONE weekly window and
+// this probe predicts 5.1 availability. Do NOT "fix" this to 5.1 or probe both:
+// the alias `fable` is not resolvable server-side (404), and probing both would
+// double Fable spend for two identical answers. Scope: how Anthropic meters TODAY
+// — a future split of the allocations would not be visible here.
+// Evidence: brick https://acpx.devbox.nativai.de/?brick=982cf4f0
+//   → verification/FINDINGS.md (+ evidence/probe.sh, which regenerates it).
 const FABLE_PROBE_MODEL = "claude-fable-5";
 const FETCH_TIMEOUT_MS = 10_000;
 const CACHE_TTL_MS = 5 * 60_000;
