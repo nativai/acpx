@@ -1423,7 +1423,8 @@ export async function handlePrompt(
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   warnReasoningEffortIgnoredForNonClaude(globalFlags, agent.agentName);
   warnOutputStyleIgnoredForNonClaude(globalFlags, agent.agentName);
-  const { printPromptSessionBanner, printQueuedPromptByFormat } = await loadOutputRenderModule();
+  const { printPromptSessionBanner, printQueuedPromptByFormat, printServedBelowFloorWarning } =
+    await loadOutputRenderModule();
   const selector = resolveSessionTargetSelector({ flags, command });
   const record = await findRoutedTargetSessionOrThrow(agent, selector);
   await assertExplicitSubscriptionMatchesExistingSession({
@@ -1456,6 +1457,10 @@ export async function handlePrompt(
     outputPolicy,
     nonInteractivePermissions: globalFlags.nonInteractivePermissions,
   });
+  // brick://c327efb5: the turn's own record carries the floor verdict this turn
+  // stamped. Surface a served-vs-pinned mismatch HERE — the client process the
+  // user actually ran — because the owner-side stderr write never reaches them.
+  printServedBelowFloorWarning(result.record, outputPolicy.format, outputPolicy.jsonStrict);
   applyPermissionExitCode(result);
 
   if (globalFlags.verbose && result.loadError) {

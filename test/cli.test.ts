@@ -856,6 +856,134 @@ test("W7-L12: an IMPLICIT Fable pin on the prompt path is still belt-forced (no 
   });
 });
 
+/**
+ * brick://c327efb5 — RE-PIN AFTER A PER-TURN MODEL SWITCH.
+ *
+ * The reported defect: a per-turn `--model` moved the LIVE ACP session but left
+ * the record's `current_model_id` on the old value. `shouldSkipModelApply`
+ * compares the request against that record, so the next `--model <original>` saw
+ * "no change", issued NO `session/set_model` at all, and the user was served the
+ * PREVIOUS model — exit 0, no warning. Measured on dev@10b5086 with an opus/sonnet
+ * control: per-turn set_model counts 1, 1, **0**; wire `opus, sonnet, sonnet`.
+ *
+ * The drift itself was fixed by W7-L12's `persistChangedModelPin` (742a612) — a
+ * fix that landed for a DIFFERENT reason (pin provenance) and never named this
+ * property. Nothing tested it, so nothing would have caught it coming back.
+ * These two tests name it.
+ *
+ * ⚠️ ASSERT ON THE `session/set_model` OPS, NOT ON THE STORED RECORD. The record
+ * reads `model: opus` at the end of the buggy sequence too — that is exactly the
+ * stale value which caused the skip. A record-only assertion passes on the bug.
+ * The ops log is the wire: it says what the agent was actually TOLD.
+ */
+async function writeGuardConfigWithOpLog(homeDir: string, opLog: string): Promise<{ cwd: string }> {
+  const cwd = path.join(homeDir, "workspace");
+  await fs.mkdir(cwd, { recursive: true });
+  await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+  const command = `${GUARD_CLAUDE_COMMAND} --operation-log ${JSON.stringify(opLog)}`;
+  await fs.writeFile(
+    path.join(homeDir, ".acpx", "config.json"),
+    `${JSON.stringify({ agents: { claude: { command } } }, null, 2)}\n`,
+    "utf8",
+  );
+  return { cwd };
+}
+
+async function setModelIdsIssued(opLog: string): Promise<string[]> {
+  return (await readMockOperations(opLog))
+    .filter((operation) => operation.method === "session/set_model")
+    .map((operation) => String(operation.modelId));
+}
+
+/** Two prompts on one session, each naming a model. Returns the set_model ops. */
+async function runRepinSequence(params: {
+  recordId: string;
+  pin: string;
+  firstModel: string;
+  secondModel: string;
+}): Promise<string[]> {
+  // This file's `withTempHome` returns void (it shadows the generic one in
+  // runtime-test-helpers), so the result is captured out rather than returned.
+  let issued: string[] = [];
+  await withTempHome(async (homeDir) => {
+    const opLog = path.join(homeDir, "c327-ops.jsonl");
+    const { cwd } = await writeGuardConfigWithOpLog(homeDir, opLog);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: params.recordId,
+      acpSessionId: params.recordId,
+      agentCommand: `${GUARD_CLAUDE_COMMAND} --operation-log ${JSON.stringify(opLog)}`,
+      cwd,
+      acpx: {
+        current_model_id: params.pin,
+        available_models: ["default", "opus[1m]", "fable", "sonnet", "haiku", "opus"],
+        session_options: { model: params.pin, model_source: "explicit" },
+      },
+    });
+
+    for (const model of [params.firstModel, params.secondModel]) {
+      const turn = await runCli(
+        [
+          "--cwd",
+          cwd,
+          "--approve-all",
+          "--format",
+          "json",
+          "--model",
+          model,
+          "claude",
+          "prompt",
+          "--session-id",
+          params.recordId,
+          `say ${model}`,
+        ],
+        homeDir,
+      );
+      assert.equal(turn.code, 0, turn.stderr);
+    }
+
+    issued = await setModelIdsIssued(opLog);
+  });
+  return issued;
+}
+
+test("c327efb5 (a1): re-pinning to the RECORDED model after a per-turn switch still issues set_model", async () => {
+  // Session pinned `opus`; turn one switches to `sonnet`; turn two asks for `opus`
+  // again. Pre-fix the second turn issued NOTHING and the agent kept serving
+  // sonnet. Both switches must reach the agent.
+  const issued = await runRepinSequence({
+    recordId: "c327-repin-down",
+    pin: "opus",
+    firstModel: "sonnet",
+    secondModel: "opus",
+  });
+
+  assert.deepEqual(
+    issued,
+    ["sonnet", "opus"],
+    `expected both switches to reach the agent; got [${issued.join(", ")}]`,
+  );
+});
+
+test("c327efb5 (a2): the symmetric direction — a session drifted onto the MORE expensive model is re-pinned back down", async () => {
+  // The mirror case, and the one that costs money rather than quality: a session
+  // pinned `sonnet` is switched up to `opus` for one turn, then asked for `sonnet`
+  // again. If that re-pin is skipped, every later turn silently bills at opus
+  // while the record reads sonnet. (This is the direction that made the floor
+  // code's "the harness only ever downgrades" assumption falsifiable.)
+  const issued = await runRepinSequence({
+    recordId: "c327-repin-up",
+    pin: "sonnet",
+    firstModel: "opus",
+    secondModel: "sonnet",
+  });
+
+  assert.deepEqual(
+    issued,
+    ["opus", "sonnet"],
+    `expected both switches to reach the agent; got [${issued.join(", ")}]`,
+  );
+});
+
 test("prompting an existing codex session without --model does not reset its model", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

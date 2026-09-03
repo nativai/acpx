@@ -71,7 +71,10 @@ test("below-floor, DEFAULT mode → ACCEPT + breadcrumb + session-visible warnin
     // A session/parent-visible warning was mirrored into the conversation.
     assert.equal(record.messages.length, before + 1);
     const warn = record.messages.at(-1);
-    assert.ok(JSON.stringify(warn).includes("below pinned model floor"));
+    // brick://c327efb5 reworded this: acpx has no capability rank, so "below" was
+    // an unsupportable claim (a turn served MORE expensive than the pin was filed
+    // as below-floor). The record KEY `served_below_floor` keeps its name.
+    assert.ok(JSON.stringify(warn).includes("does not match the pinned floor"));
     // The warning is a synthetic breadcrumb, not a real model turn — it must not
     // block the resume→session/new fallback gate (brick://de3645c6 / brick://509b4ee1).
     assert.ok(typeof warn === "object" && warn !== null && "Agent" in warn);
