@@ -713,13 +713,28 @@ function advertisedModelsForRecord(record: SessionRecord):
 // the non-Fable default. Absent provenance = legacy ⇒ NOT forced (a deliberate
 // legacy Fable pin is indistinguishable → left alone). Post the resolution-tier
 // guard this rarely fires; it defends a Fable pin that slipped through non-explicit.
+//
+// brick://ab3bf660 (W7-L12): the provenance to judge by is THIS INVOCATION'S
+// (`requestedModelSource`, threaded from the merged sessionOptions — "explicit"
+// whenever `--model` was on the command line), NOT the record's stored value. The
+// record's value describes how the pin arrived AT CREATION, so on a prompt to an
+// existing session it is stale by construction: an operator naming `--model fable`
+// was judged "inherited" and silently force-redirected to opus. The pair
+// (model, modelSource) travels together through mergeSessionOptions, so a
+// flagless prompt still falls back to the stored pin AND its stored source, and
+// the Fable downgrade keeps applying to every model that arrived IMPLICITLY.
+//
+// ⚠️ DO NOT "simplify" this back to reading only `record.acpx.session_options
+// .model_source`. It looks equivalent — the flagless case reaches the same value
+// via the merge — and it is exactly the defect. The W7-L12 (c) test is the guard.
 function resolveGuardedApplyModel(
   record: SessionRecord,
   rawRequested: string,
+  requestedModelSource: string | undefined,
 ): { model: string; forced: boolean; blocked?: string } {
   const guarded = guardServedModel({
     requestedModel: rawRequested,
-    modelSource: record.acpx?.session_options?.model_source,
+    modelSource: requestedModelSource ?? record.acpx?.session_options?.model_source,
     availableModels: record.acpx?.available_models,
   });
   return { model: guarded.model ?? rawRequested, forced: guarded.forced, blocked: guarded.blocked };
@@ -759,6 +774,9 @@ async function applyPromptModelIfAdvertised(params: {
   client: AcpClient;
   sessionId: string;
   requestedModel: string | undefined;
+  /** brick://ab3bf660: provenance of THIS invocation's pin — "explicit" iff
+   *  `--model` was on the command line. See resolveGuardedApplyModel. */
+  requestedModelSource: string | undefined;
   record: SessionRecord;
   timeoutMs?: number;
   verbose?: boolean;
@@ -767,7 +785,12 @@ async function applyPromptModelIfAdvertised(params: {
   if (!rawRequested) {
     return;
   }
-  const guarded = resolveGuardedApplyModel(params.record, rawRequested);
+  const before = modelPinSnapshot(params.record);
+  const guarded = resolveGuardedApplyModel(
+    params.record,
+    rawRequested,
+    params.requestedModelSource,
+  );
   const requestedModel = guarded.model;
 
   const models = advertisedModelsForRecord(params.record);
@@ -782,6 +805,8 @@ async function applyPromptModelIfAdvertised(params: {
   }
   if (shouldSkipModelApply(params.record, requestedModel, guarded.forced)) {
     setDesiredModelId(params.record, requestedModel);
+    persistExplicitPromptModelSource(params.record, params.requestedModelSource);
+    await persistChangedModelPin(params.record, before);
     return;
   }
 
@@ -793,6 +818,74 @@ async function applyPromptModelIfAdvertised(params: {
   setCurrentModelId(params.record, requestedModel);
   if (guarded.forced && guarded.blocked) {
     recordApplyBeltGuardForced(params.record, guarded.blocked, requestedModel, params.verbose);
+  } else {
+    persistExplicitPromptModelSource(params.record, params.requestedModelSource);
+  }
+  await persistChangedModelPin(params.record, before);
+}
+
+type ModelPinSnapshot = {
+  model: string | undefined;
+  source: string | undefined;
+  current: string | undefined;
+};
+
+function modelPinSnapshot(record: SessionRecord): ModelPinSnapshot {
+  return {
+    model: record.acpx?.session_options?.model,
+    source: record.acpx?.session_options?.model_source,
+    current: record.acpx?.current_model_id,
+  };
+}
+
+/**
+ * brick://ab3bf660 (W7-L12): FLUSH a changed pin to disk the moment it is applied.
+ *
+ * ⚠️ DO NOT DELETE THIS AS A REDUNDANT WRITE — the turn's own checkpoint does NOT
+ * save it. `mergeLatestDurableAcpxPreferences` overlays the DISK copy of `model` /
+ * `model_source` over the in-flight snapshot (brick://07dd62c9, so an external
+ * `set model` beats a stale turn), and the disk copy here is the pre-turn record
+ * `recordPromptStart` wrote BEFORE this apply ran. Without this flush the overlay
+ * reverts the pin we just applied and the caller silently gets the old model back
+ * on the next turn. Measured on the specimen: apply wrote `fable`/`explicit`, the
+ * first checkpoint read `opus`/`inherited` off disk and overwrote it.
+ *
+ * This is the SECOND defect superimposed on brick://732816c8: the apply-belt's own
+ * `guard-forced` write was reverted the same way — the record showed
+ * `model_source: "inherited"` while its `model_guard` breadcrumb (not a durable-
+ * overlay field, so not clobbered) said the belt had forced `opus[1m]`. That
+ * surviving breadcrumb is the only reason either defect was visible at all.
+ *
+ * Writing here makes disk and memory agree, so the overlay becomes a no-op for
+ * this turn and keeps winning for genuine external writes. Skipped when nothing
+ * changed, so a flagless prompt costs no extra IO.
+ */
+async function persistChangedModelPin(
+  record: SessionRecord,
+  before: ModelPinSnapshot,
+): Promise<void> {
+  const after = modelPinSnapshot(record);
+  if (
+    after.model === before.model &&
+    after.source === before.source &&
+    after.current === before.current
+  ) {
+    return;
+  }
+  await writeSessionRecordAtBoundary(record);
+}
+
+// brick://ab3bf660 (W7-L12): an explicit prompt-time pin must OUTLIVE its turn.
+// The record still carries the creation-time provenance ("inherited"), so without
+// this the very next turn would read the stale source and the belt would block the
+// same pin again — the flag would work once and then silently stop working. Only
+// "explicit" is stamped: every other source already lives on the record.
+function persistExplicitPromptModelSource(
+  record: SessionRecord,
+  requestedModelSource: string | undefined,
+): void {
+  if (requestedModelSource === "explicit") {
+    setDesiredModelSource(record, "explicit");
   }
 }
 
@@ -2690,6 +2783,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
           client,
           sessionId: activeSessionId,
           requestedModel: sessionOptions?.model,
+          requestedModelSource: sessionOptions?.modelSource,
           record,
           verbose: options.verbose,
           timeoutMs: options.timeoutMs,

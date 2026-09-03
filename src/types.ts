@@ -243,6 +243,14 @@ export type AcpClientOptions = {
   };
   sessionOptions?: {
     model?: string;
+    /**
+     * brick://ab3bf660 (W7-L12) — provenance of `model` for THIS invocation, one
+     * of the `ModelSource` flat-string values ("explicit" iff `--model` was on the
+     * command line). Travels PAIRED with `model` so the apply-tier Fable belt can
+     * judge how the pin arrived NOW rather than reading the record's creation-time
+     * value, which on a prompt to an existing session is stale by construction.
+     */
+    modelSource?: string;
     allowedTools?: string[];
     maxTurns?: number;
     systemPrompt?: string | { append: string };

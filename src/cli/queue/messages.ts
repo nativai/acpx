@@ -323,6 +323,23 @@ function hasOptionalStringFields(
   return keys.every((key) => record[key] == null || typeof record[key] === "string");
 }
 
+// ONE list, so a field is carried across the IPC enqueue boundary by being named
+// here and nowhere else. brick://ab3bf660 (W7-L12): `modelSource` is on this list
+// because a pin whose PROVENANCE does not travel with it is the silent-override
+// defect — the owner would pair an explicit `--model` with the record's stale
+// source and the Fable belt would block it. Keep `model` and `modelSource`
+// ADJACENT: they are a pair, and the whole bug was them being separable.
+const SESSION_OPTION_PARSERS: ReadonlyArray<
+  readonly [string, (options: QueueSessionOptions, value: unknown) => boolean]
+> = [
+  ["model", assignSessionModel],
+  ["modelSource", assignSessionModelSource],
+  ["allowedTools", assignSessionAllowedTools],
+  ["maxTurns", assignSessionMaxTurns],
+  ["systemPrompt", assignSessionSystemPrompt],
+  ["subscription", assignSessionSubscription],
+];
+
 function parseSessionOptions(value: unknown): QueueSessionOptions | null | undefined {
   if (value == null) {
     return undefined;
@@ -333,20 +350,10 @@ function parseSessionOptions(value: unknown): QueueSessionOptions | null | undef
   }
 
   const sessionOptions: QueueSessionOptions = {};
-  if (!assignSessionModel(sessionOptions, record.model)) {
-    return null;
-  }
-  if (!assignSessionAllowedTools(sessionOptions, record.allowedTools)) {
-    return null;
-  }
-  if (!assignSessionMaxTurns(sessionOptions, record.maxTurns)) {
-    return null;
-  }
-  if (!assignSessionSystemPrompt(sessionOptions, record.systemPrompt)) {
-    return null;
-  }
-  if (!assignSessionSubscription(sessionOptions, record.subscription)) {
-    return null;
+  for (const [key, assign] of SESSION_OPTION_PARSERS) {
+    if (!assign(sessionOptions, record[key])) {
+      return null;
+    }
   }
 
   return sessionOptions;
@@ -371,6 +378,17 @@ function assignSessionModel(options: QueueSessionOptions, value: unknown): boole
     return false;
   }
   options.model = value;
+  return true;
+}
+
+function assignSessionModelSource(options: QueueSessionOptions, value: unknown): boolean {
+  if (value == null) {
+    return true;
+  }
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return false;
+  }
+  options.modelSource = value;
   return true;
 }
 
