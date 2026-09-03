@@ -12,6 +12,19 @@ import type { SessionAgentMessage, SessionMessage } from "../types.js";
 // builders in model-guard.ts / fable-degrade.ts / model-floor-enforce.ts (all
 // of which now always tag); this list is legacy-compat only and can be dropped
 // once pre-2026-07-26 never-run records stop mattering.
+//
+// ⚠️ DO NOT "SYNC" THESE STRINGS TO THE CURRENT BUILDERS. They are not a mirror
+// of today's wording — they are a description of BYTES ALREADY ON DISK in
+// pre-tag records, which no edit here can change. brick://c327efb5 reworded the
+// floor advisory to "⚠ served model does not match the pinned floor: " (acpx has
+// no capability rank, so "below" was an unsupportable claim), and deliberately
+// left the entry below on the OLD text. Updating it to match the new wording
+// would strand exactly the legacy records this list exists for: they would stop
+// being recognized as synthetic, and every pre-tag never-run session carrying
+// one becomes permanently unpromptable again — the brick://de3645c6 failure,
+// returned. A NEW advisory needs no entry at all; it is tagged `synthetic:true`
+// (see the c327efb5 test in test/synthetic-messages.test.ts, which pins that the
+// reworded message is still recognized — via the tag, not via this list).
 const LEGACY_SYNTHETIC_TEXT_PREFIXES = [
   "⚠ implicit Fable blocked → forced ",
   "⚠ Fable share exhausted on all subscriptions — degraded to ",

@@ -363,6 +363,79 @@ export async function printPromptSessionBanner(
   process.stderr.write(`${formatPromptSessionBannerLine(record, currentCwd, status)}\n`);
 }
 
+/**
+ * brick://c327efb5 — SURFACE a served-vs-pinned model mismatch at the point of use.
+ *
+ * The detection half already worked: `enforceModelFloorPostServe` evaluates every
+ * turn and persists `acpx.served_below_floor` on the record. What was missing is
+ * this line. The only other surfaces were `.messages.ndjson` (acpx-ui / the parent
+ * agent) and a `logFloor` stderr write gated on `--verbose` — and that one is
+ * written by the QUEUE OWNER process, so it never reaches the user's terminal even
+ * with the flag. Net effect: a user asked for model X, was served model Y, and read
+ * `[done] end_turn` + exit 0 with nothing to indicate it.
+ *
+ * ⚠️ DO NOT gate this on `--verbose`. "Only visible if you already suspected it"
+ * is precisely the silence this exists to remove; a wrong-model answer must be
+ * visible to a user who had no reason to look.
+ *
+ * Deliberately NOT debounced per below-floor episode, unlike the `.messages.ndjson`
+ * mirror. That mirror is read once per session by a parent agent, so debouncing it
+ * avoids repetition; this line is read by whoever ran THIS command. Debouncing
+ * across turns would mean the user whose turn happens to be the second of an
+ * episode sees nothing — the exact failure being fixed.
+ *
+ * Cannot fire on ordinary alias resolution (pin `opus` served `claude-opus-5`) or
+ * on an unreadable served model: `evaluateModelFloor` classifies those `at-floor`
+ * and `unknown`, and only a `below-floor` verdict stamps the breadcrumb this reads.
+ * A breadcrumb still present means the below-floor episode is still open — it is
+ * auto-cleared by the next at-floor serve.
+ */
+/**
+ * Whether human-facing `[acpx] …` stderr notices are suppressed for this output
+ * policy: `quiet` prints nothing, and STRICT json must not interleave non-JSON.
+ * Plain `--format json` still gets them — they go to stderr, so stdout stays
+ * machine-parseable either way.
+ *
+ * The same rule is inlined in `printPromptSessionBanner` /
+ * `printCreatedSessionBanner` above; those are left as they are rather than
+ * refactored in on this brick's diff. Keep all three in agreement.
+ */
+function stderrNoticesSuppressed(format: OutputFormat, jsonStrict: boolean): boolean {
+  return format === "quiet" || (jsonStrict && format === "json");
+}
+
+/** ` (effort max→high)` when the dip also authored effort down; empty otherwise. */
+function formatFloorEffortNote(pinned: string | undefined, served: string | undefined): string {
+  if (!pinned || !served || pinned === served) {
+    return "";
+  }
+  return ` (effort ${pinned}→${served})`;
+}
+
+export function printServedBelowFloorWarning(
+  record: SessionRecord,
+  format: OutputFormat,
+  jsonStrict = false,
+): void {
+  if (stderrNoticesSuppressed(format, jsonStrict)) {
+    return;
+  }
+
+  const below = record.acpx?.served_below_floor;
+  if (!below?.pinned_model) {
+    return;
+  }
+
+  const served = below.served_model ?? "unknown";
+  const effortNote = formatFloorEffortNote(below.pinned_effort, below.served_effort);
+  process.stderr.write(
+    `[acpx] ⚠ served-model mismatch: this turn was served "${served}" but the session is ` +
+      `pinned to "${below.pinned_model}"${effortNote}. The answer above came from ${served}. ` +
+      `Re-pin with \`acpx claude set model ${below.pinned_model} --session-id ${record.acpxRecordId}\`, ` +
+      `or use --floor-hard to refuse a mismatched turn instead of accepting it.\n`,
+  );
+}
+
 export function printCreatedSessionBanner(
   record: SessionRecord,
   agentName: string,

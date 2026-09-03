@@ -98,7 +98,7 @@ async function acceptWithWarning(
   await writeSessionRecordAtBoundary(record).catch(() => {});
   logFloor(
     verbose,
-    `served ${evaluation.servedModel ?? "?"} below pinned ${evaluation.pinnedModel} — accepted (detect+surface)`,
+    `served ${evaluation.servedModel ?? "?"} does not match pinned ${evaluation.pinnedModel} — accepted (detect+surface)`,
     record,
   );
   return { accept: true };
@@ -125,7 +125,7 @@ async function refuseHardBelowFloor(
   await writeSessionRecordAtBoundary(record).catch(() => {});
   logFloor(
     verbose,
-    `served ${evaluation.servedModel ?? "?"} below pinned ${evaluation.pinnedModel} — REFUSED (floor-hard)`,
+    `served ${evaluation.servedModel ?? "?"} does not match pinned ${evaluation.pinnedModel} — REFUSED (floor-hard)`,
     record,
   );
   return { accept: false, error, evaluation };
@@ -155,9 +155,15 @@ function buildFloorWarningMessage(evaluation: ModelFloorEvaluation): SessionMess
     Agent: {
       content: [
         {
+          // brick://c327efb5 (handed over from brick://8a54201e's lane): "below"
+          // is an assertion acpx cannot support — there is no capability rank,
+          // and record b80f2910 is a turn served MORE expensive than the pin yet
+          // filed as below-floor. "does not match" is what the check actually
+          // establishes. The record key `served_below_floor` deliberately keeps
+          // its name (acpx-ui reads it; renaming is a migration for a nicety).
           Text:
-            `⚠ served below pinned model floor: this turn was served "${served}" but the session ` +
-            `is pinned to "${evaluation.pinnedModel}"${effortNote}. The work was accepted, but a ` +
+            `⚠ served model does not match the pinned floor: this turn was served "${served}" ` +
+            `but the session is pinned to "${evaluation.pinnedModel}"${effortNote}. The work was accepted, but a ` +
             `hard-ruled agent should verify with \`whoami --require <effort>\` and flag its parent for ` +
             `a re-spawn at the pinned floor.`,
         },
