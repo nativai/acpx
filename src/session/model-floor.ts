@@ -44,6 +44,25 @@ import { isoNow } from "./persistence.js";
 //   * a CONCRETE pin is EXACT — the user named a generation, so a different
 //     generation of the same family is off pin. Only a DATED SNAPSHOT of that
 //     same id refines it (`claude-haiku-4-5` → `claude-haiku-4-5-20251001`).
+//
+// ⚠️ KNOWN LIMIT — the concrete clause recognises ONE canonical spelling, and
+// that is deliberate. An independent test-engineer enumerated three id shapes it
+// reads as off-pin which a human would call the same model (brick 8a54201e
+// verification §B, cases X1/X4/X5/X11):
+//   * a REVERSE snapshot — a dated pin served the undated id
+//     (`claude-haiku-4-5-20251001` → `claude-haiku-4-5`);
+//   * a PROVIDER-PREFIXED served id — `us.anthropic.claude-opus-4-5-…-v1:0`
+//     (Bedrock) or `anthropic/claude-opus-5` (Vertex). Claude Code genuinely
+//     supports those deployment modes; this box is simply not one of them;
+//   * a date PLUS an extra component — `claude-opus-4-5-20251101-v2`.
+// DO NOT widen the rule to cover them without a measured symptom. Every one
+// needs a CONCRETE pin (11 of 2813 live records, devbox 2026-09-03) AND a
+// non-canonical spelling, and is consequence-free while `--floor-hard` is on 0
+// records — a false alarm writes a breadcrumb, it does not refuse a turn. The
+// reasoning is the same one that rejects the capability ladder above: no
+// measured symptom, real blast radius, so record the limit rather than widen the
+// rule for cases nobody has hit. What would change this: hard mode being adopted
+// TOGETHER with a concrete pin.
 
 const KNOWN_MODEL_FAMILIES = ["fable", "opus", "sonnet", "haiku"] as const;
 const MODEL_CONTEXT_HINT_PATTERN = /\[\d+m\]$/i;

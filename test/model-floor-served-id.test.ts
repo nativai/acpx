@@ -111,6 +111,65 @@ test("R4c a GENERATION BUMP must not ride in through the snapshot clause", () =>
   assert.equal(e.reason, "model");
 });
 
+// ─── N1–N4 — the four surviving mutants an independent test-engineer found ───
+//
+// My own mutation probe (M1–M4) reproduced by red name, but it only gutted the
+// pieces I had thought to gut. A test-engineer ran four more and ALL FOUR
+// SURVIVED the suite, then proved each is a real behaviour change rather than an
+// equivalent mutant with a differ over 1824 (pin, served) combinations,
+// fire-tested both ways. Each case below is that mutant's own witness, so each
+// test kills exactly one gap. Verification §G.
+
+test("N1 the date pattern needs its END anchor — a dated component with a suffix is not a snapshot", () => {
+  // Mutant: /^\d{8}$/ -> /^\d{8}/  (16 differing combinations, survived the suite)
+  const e = evaluateModelFloor({
+    pinnedModel: "claude-fable-5",
+    servedModel: "claude-fable-5-20251001-v2",
+  });
+  assert.equal(e.status, "below-floor");
+});
+
+test("N2 the date pattern needs its START anchor — a date embedded in a component is not a snapshot", () => {
+  // Mutant: /^\d{8}$/ -> /\d{8}/  (38 differing combinations, survived the suite)
+  const e = evaluateModelFloor({
+    pinnedModel: "claude-fable-5",
+    servedModel: "claude-fable-5-v20251001",
+  });
+  assert.equal(e.status, "below-floor");
+});
+
+test("N3 comparison is CASE-INSENSITIVE — an alias pin must not false-alarm on a capitalised served id", () => {
+  // Mutant: normalizeModelId drops .toLowerCase()  (133 differing combinations).
+  // The worst of the four and the reason all four are worth tests: it breaks the
+  // ALIAS direction, which is the fleet-breaking one — 974 of 2813 live records
+  // carry an alias pin. `normalizeModelId` is new in this change (the old
+  // `modelFamily` lower-cased inline), so its `.toLowerCase()` became
+  // load-bearing for BOTH clauses here and nothing asserted it at either ref.
+  assert.equal(
+    evaluateModelFloor({ pinnedModel: "fable", servedModel: "Claude-Fable-5-1" }).status,
+    "at-floor",
+  );
+  // Load-bearing on the concrete clause too, and on the pin side as well as the
+  // served side — so assert both rather than only the witness the mutant named.
+  assert.equal(
+    evaluateModelFloor({ pinnedModel: "Claude-Fable-5-1", servedModel: "claude-fable-5-1" }).status,
+    "at-floor",
+  );
+  assert.equal(
+    evaluateModelFloor({ pinnedModel: "FABLE", servedModel: "claude-fable-5-1" }).status,
+    "at-floor",
+  );
+});
+
+test("N4 the refinement test needs the COMPONENT SEPARATOR — `.` is not a component boundary", () => {
+  // Mutant: startsWith(`${pinned}-`) -> startsWith(pinned)  (16 differing combinations)
+  const e = evaluateModelFloor({
+    pinnedModel: "claude-fable-5-1",
+    servedModel: "claude-fable-5-1.20251001",
+  });
+  assert.equal(e.status, "below-floor");
+});
+
 // ─── R5/R6 — the two real session records, end-to-end through the enforce path ─
 
 test("R5 real record b2330b79 (pin claude-fable-5-1, served claude-sonnet-5) is still caught", async () => {
