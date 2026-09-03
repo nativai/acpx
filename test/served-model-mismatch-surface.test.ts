@@ -58,14 +58,42 @@ async function serveAndRender(params: {
 
 // ─── The core property: the mismatch reaches the user ───────────────────────
 
-test("c327efb5 (b): a below-floor turn PRINTS a mismatch line naming both models", async () => {
+test("c327efb5 (b): a below-floor turn PRINTS the mismatch with each model in its OWN slot", async () => {
   const stderr = await serveAndRender({ pin: "opus", servedModel: "claude-sonnet-5" });
 
-  // Both models must appear: "served something else" without saying WHAT was
-  // served, or without the pin to compare against, is not actionable.
-  assert.match(stderr, /served-model mismatch/);
-  assert.match(stderr, /claude-sonnet-5/);
-  assert.match(stderr, /opus/);
+  // ⚠️ DO NOT WEAKEN THESE BACK TO `assert.match(stderr, /claude-sonnet-5/)` +
+  // `/opus/`. That shape is what this test used to be, and it is the whole
+  // failure it now exists to prevent: presence-only assertions cannot tell the
+  // two ids APART, so SWAPPING them in the message passes every one of them.
+  // An independent test-engineer's mutant did exactly that — printing
+  // `served "opus" but pinned to "claude-sonnet-5"` — and survived the entire
+  // suite, even though it names the wrong model as served and tells the user to
+  // re-pin to the model they were just served: the exact inverse of the recovery
+  // action. A message whose ONLY job is to say which model you got must be
+  // pinned by POSITION. (`/opus/` was doubly weak — it also matches inside
+  // `claude-opus-5`.)
+  assert.match(stderr, /was served "claude-sonnet-5"/);
+  assert.match(stderr, /pinned to "opus"/);
+  // The recovery action must name the PIN, never the served model — telling the
+  // user to re-pin to what they were just served is worse than saying nothing.
+  assert.match(stderr, /set model opus /);
+});
+
+test("c327efb5 (b): the rendered sentence is EXACT — every slot pinned at once", async () => {
+  // One full-string assertion, deliberately brittle. Slot regexes above catch a
+  // swap; this catches a slot being silently dropped or re-ordered in a way no
+  // individual regex covers. If a wording change makes this fail, read the new
+  // string and confirm each id is still in the slot it belongs in before
+  // updating it — do not update it reflexively.
+  const stderr = await serveAndRender({ pin: "opus", servedModel: "claude-sonnet-5" });
+
+  assert.equal(
+    stderr,
+    '[acpx] ⚠ served-model mismatch: this turn was served "claude-sonnet-5" but the session ' +
+      'is pinned to "opus". The answer above came from claude-sonnet-5. Re-pin with ' +
+      "`acpx claude set model opus --session-id c327-rec`, or use --floor-hard to refuse a " +
+      "mismatched turn instead of accepting it.\n",
+  );
 });
 
 test("c327efb5 (b): the printed line is NOT gated on --verbose", async () => {
