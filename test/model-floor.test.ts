@@ -82,10 +82,15 @@ test("evaluateModelFloor: unreadable served model is unknown (never a false belo
   assert.equal(e.status, "unknown");
 });
 
-test("evaluateModelFloor: a theoretical NOT-LOWER family (never happens — harness only downgrades) is flagged below-floor, not silently accepted", () => {
-  // Documented behavior: a pin is exact; any served/pinned family mismatch is
-  // below-floor. Flagging an off-pin serve loudly is safer than silently
-  // accepting it — the theoretical "served a higher family" case does not occur.
+test("evaluateModelFloor: a MORE expensive off-pin serve is flagged below-floor, not silently accepted", () => {
+  // This case was previously named "a theoretical NOT-LOWER family (never
+  // happens — harness only downgrades)". It happens: live acpx session record
+  // b80f2910 (2026-09-01) was pinned `sonnet` and served `claude-fable-5-1`,
+  // and got filed as below-floor. So `below-floor` means "off pin", direction
+  // unknown — acpx has no capability rank and cannot claim a direction.
+  // The ASSERTION is unchanged and deliberate (brick 8a54201e): flagging an
+  // off-pin serve is safer than silently accepting a session being served the
+  // most expensive model it never asked for.
   const e = evaluateModelFloor({ pinnedModel: "sonnet", servedModel: "claude-opus-4-8" });
   assert.equal(e.status, "below-floor");
   assert.equal(e.reason, "model");
