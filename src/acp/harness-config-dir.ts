@@ -553,6 +553,9 @@ export interface HarnessConfigDirInput {
   provisionModelId?: string;
   /** Overrides `tmpdir()`; tests use it to keep the directory inside a fixture. */
   rootDir?: string;
+  /** The session's working directory — pi namespaces its session store by it
+   *  (brick ac86eb34). Absent ⇒ pi's session dir is left alone. */
+  cwd?: string;
 }
 
 /**
@@ -806,8 +809,92 @@ function writePiConfigDir(dir: string, input: HarnessConfigDirInput): HarnessCon
   // Consequently `pi` stays out of ARBITRARY_MODEL_SUPPORT_ROUTED_BY_ACPX, so
   // `acceptsArbitraryModelIds` is false and the picker does not offer a band that
   // would fail at spawn. That is the descriptor working as designed.
+  // ⚠️ KEEP pi's SESSION STORE WHERE IT WAS — read BEFORE the re-point below,
+  // which is the last moment the box's own agent dir is still reachable through
+  // the variable we are about to overwrite (brick ac86eb34; same ordering as the
+  // F-13 discard warning).
+  const sessionDir = resolvePiSessionDir(input.env, input.cwd);
   input.env.PI_CODING_AGENT_DIR = dir;
-  return { harness: "pi", dir, envNames: ["PI_CODING_AGENT_DIR"], files };
+  const envNames = ["PI_CODING_AGENT_DIR"];
+  if (sessionDir) {
+    input.env.PI_CODING_AGENT_SESSION_DIR = sessionDir;
+    envNames.push("PI_CODING_AGENT_SESSION_DIR");
+  }
+  return { harness: "pi", dir, envNames, files };
+}
+
+/**
+ * Where pi's session JSONL should go once acpx has moved pi's agent dir
+ * (brick ac86eb34).
+ *
+ * ## The defect
+ *
+ * `PI_CODING_AGENT_DIR` is pi's **data** dir as well as its config dir, so
+ * re-pointing it for the primer took the session store with it. The JSONL was
+ * still written — measured, so do NOT record this as "pi stopped writing" — but
+ * into the throwaway per-session directory, which is removed at close. **pi's
+ * per-message JSONL is IR-3's SECOND authority for pi**, so every pi served-model
+ * claim was left resting on one leg.
+ *
+ * ## ⚠️ WHY THE OBVIOUS FIX IS WRONG, AND IT WOULD HAVE PASSED A PATH CHECK
+ *
+ * pi honours `PI_CODING_AGENT_SESSION_DIR` (`main.js:530`; precedence
+ * `--session-dir` > env > `settings.json.sessionDir`) — but it treats it as the
+ * **FINAL directory**, not as a root under which it appends `--<cwd>--`.
+ * Measured with real turns: pointed at a store ROOT, pi writes the JSONL **FLAT**
+ * into it. IR-3 reads at `<store>/sessions/--<cwd-with-slashes-as-dashes>--/`, so
+ * the root form leaves the authority just as dead while making the directory look
+ * correct.
+ *
+ * So the variable is pointed at the **cwd-mangled subdirectory** — the exact path
+ * an un-overridden pi would have used.
+ *
+ * ⚠️ **THE MANGLING IS A VERSION-PINNED MEASUREMENT, NOT A PROPERTY.** It is read
+ * from `@earendil-works/pi-agent-core` (bundled with pi-coding-agent **0.84.4**),
+ * `dist/harness/session/jsonl/repo.js:13-15`. Same class of fact as the
+ * `session/set_model` capability cell that was TRUE and WENT STALE, and as
+ * `piWireDepthValue`'s ladder. **RE-MEASURE TRIGGER: when the pinned pi version
+ * moves** — re-read `jsonlSessionDirectoryName` and confirm this still matches.
+ *
+ * ⚠️ **AND THE DIRECTORY MUST EXIST BEFORE pi STARTS.** Measured: with the
+ * variable naming a missing directory, pi **HANGS** — rc=124 on a 150 s timeout,
+ * **empty stdout AND empty stderr**, no error of any kind. A missing `mkdir` here
+ * does not degrade, it wedges the session, and it looks exactly like a slow model.
+ */
+function resolvePiSessionDir(env: NodeJS.ProcessEnv, cwd: string | undefined): string | undefined {
+  if (!cwd?.trim()) {
+    // No cwd, no mangled name. Better to leave pi's default alone than to invent
+    // a path: the session still runs, and the JSONL is merely where it is today.
+    return undefined;
+  }
+  const boxAgentDir = env.PI_CODING_AGENT_DIR?.trim()
+    ? env.PI_CODING_AGENT_DIR.trim()
+    : join(env.HOME?.trim() || homedir(), ".pi", "agent");
+  const target = join(boxAgentDir, "sessions", jsonlSessionDirectoryName(cwd.trim()));
+  try {
+    mkdirSync(target, { recursive: true });
+  } catch {
+    // Could not create it — so do NOT point pi at it. Pointing pi at a directory
+    // that does not exist is the hang described above; leaving the variable unset
+    // keeps today's behaviour, which is degraded but alive.
+    return undefined;
+  }
+  return target;
+}
+
+/**
+ * pi's own session-directory name for a cwd, transcribed from
+ * `pi-agent-core` `dist/harness/session/jsonl/repo.js:13-15` (pi 0.84.4):
+ *
+ * ```js
+ * `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`
+ * ```
+ *
+ * Transcribed rather than approximated, because a near-miss produces a directory
+ * that exists, is written to, and is not the one IR-3 reads.
+ */
+function jsonlSessionDirectoryName(cwd: string): string {
+  return `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
 }
 
 /**

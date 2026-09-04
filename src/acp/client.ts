@@ -946,6 +946,7 @@ export class AcpClient {
       env,
       agentCommand: this.options.agentCommand,
       sessionId: this.resolveConfigDirId(),
+      cwd: this.options.cwd,
       primer: await resolveSessionPrimer(env),
       model: this.options.sessionOptions?.model,
       // ⚠️ NO `provisionModelId`, DELIBERATELY — and the same asymmetry that kept
