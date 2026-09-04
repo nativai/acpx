@@ -228,7 +228,21 @@ test("pi does NOT get a generated models-store.json — the replace/merge risk",
     const written = readdirSync(env.PI_CODING_AGENT_DIR);
     // The absence assertion needs a non-empty listing to be meaningful: an empty
     // dir would satisfy "no models-store.json" vacuously.
-    assert.deepEqual(written, ["APPEND_SYSTEM.md"], "a models-store.json was generated");
+    //
+    // ⚠️ THIS ROW CAUGHT brick 4a6fdda0's CHANGE, which is why it still pins the
+    // WHOLE listing rather than only checking for models-store.json. The refcount
+    // added `.acpx-holders/` here, and the listing had to be widened by hand to
+    // admit it — deliberately, so that any OTHER new entry in a directory pi
+    // reads still fails this row. acpx's own bookkeeping is separated from what
+    // the harness consumes, so the two can be judged apart.
+    const acpxBookkeeping = written.filter((entry) => entry.startsWith("."));
+    const harnessVisible = written.filter((entry) => !entry.startsWith("."));
+    assert.deepEqual(harnessVisible, ["APPEND_SYSTEM.md"], "a models-store.json was generated");
+    assert.deepEqual(
+      acpxBookkeeping,
+      [".acpx-holders"],
+      "acpx wrote unexpected bookkeeping into a directory the harness reads",
+    );
   });
 });
 

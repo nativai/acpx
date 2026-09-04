@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -69,6 +70,115 @@ function configDirName(harness: HarnessId, sessionId: string): string {
 /**
  * Remove one spawn's config dir. Best-effort: a failure here must never surface
  * as a session-close error, because the orphan sweep below is the guarantee.
+ */
+/**
+ * Where a config dir records WHO is currently using it (brick 4a6fdda0).
+ *
+ * ⚠️ INSIDE the config dir, not beside it — deliberately, and the placement is
+ * MEASURED rather than assumed. A sibling directory would need its own cleanup
+ * and would either collide with the sweep's `acpx-` prefix or escape it
+ * entirely. Inside, it disappears with the directory it describes. The risk that
+ * buys is a harness tripping over an unexpected entry, so it was checked at
+ * source: pi-acp 0.0.33's ONLY recursive enumeration is `loadCommandsFromDir`
+ * over `~/.pi/agent/prompts` and `<cwd>/.pi/prompts`, reading `.md` files —
+ * never `PI_CODING_AGENT_DIR` itself. OpenCode is pointed at `<dir>/opencode`
+ * and reads that, so a dot-prefixed sibling of it is outside what it looks at.
+ */
+const HOLDERS_DIR = ".acpx-holders";
+
+/** What a release decided, so "nothing happened" is never silent. */
+export interface HarnessConfigDirReleaseResult {
+  /** True when this was the TERMINAL close and the directory was removed. */
+  removed: boolean;
+  /** Holders still registered after this one let go. */
+  remainingHolders: number;
+  /** True when the holder set could not be read, so no removal was attempted. */
+  notMeasured: boolean;
+}
+
+/**
+ * Claim a config dir for one client, returning the holder id it must release.
+ *
+ * The id carries the PID so a stale holder is diagnosable rather than anonymous,
+ * plus a random suffix because ONE process can hold the same directory twice —
+ * which is exactly the two-client case this brick is about.
+ */
+function registerConfigDirHolder(dir: string): string {
+  const holderId = `${process.pid}-${randomUUID().slice(0, 8)}`;
+  try {
+    mkdirSync(join(dir, HOLDERS_DIR), { recursive: true, mode: 0o700 });
+    writeFileSync(join(dir, HOLDERS_DIR, holderId), `${new Date().toISOString()}\n`, {
+      mode: 0o600,
+    });
+  } catch {
+    // A directory we cannot mark is one we must never remove on close; the
+    // release below reports `notMeasured` and leaves it to the orphan sweep.
+  }
+  return holderId;
+}
+
+/**
+ * Release ONE client's claim, and remove the directory only if it was the LAST.
+ *
+ * ## ⚠️ THE DEFECT THIS FIXES: CLOSE WAS NOT THE OWNER'S TO PERFORM
+ *
+ * Two `AcpClient`s of one session compute the SAME directory —
+ * `resolveConfigDirId()` returns the record id when it is present, by design, so
+ * repeated spawns reuse one directory instead of accumulating one per resume.
+ * But `close()` on EITHER client did an unconditional recursive `rmSync`. A
+ * transient client closing therefore deleted the primer and model pin out from
+ * under the client still serving a turn. **Removal belongs to the session's
+ * TERMINAL close, not to whichever client happens to finish first.**
+ *
+ * ## Why a filesystem refcount and not an in-process one
+ *
+ * The two clients are not necessarily in one process — a queue owner and a CLI
+ * invocation are separate processes reaching the same session. An in-memory
+ * counter would be blind to exactly the case that matters.
+ *
+ * ⚠️ AND IT IS HONEST ABOUT ITS RACE. Between the last holder's removal and the
+ * `rmSync`, a new client could claim the directory and lose it. The window is
+ * two syscalls wide and the loser re-creates on its next spawn; the alternative
+ * — a lock — buys less than it costs here. What is NOT left to chance is the
+ * unreadable case: a holder set that cannot be read removes NOTHING and says so.
+ */
+export function releaseHarnessConfigDir(
+  dir: string | undefined,
+  holderId: string | undefined,
+): HarnessConfigDirReleaseResult {
+  if (!dir || !basename(dir).startsWith(CONFIG_DIR_PREFIX)) {
+    return { removed: false, remainingHolders: 0, notMeasured: true };
+  }
+  const holders = join(dir, HOLDERS_DIR);
+  if (holderId) {
+    try {
+      rmSync(join(holders, holderId), { force: true });
+    } catch {
+      // Already gone; the count below is what decides, not this.
+    }
+  }
+  let remaining: string[];
+  try {
+    remaining = readdirSync(holders);
+  } catch {
+    // ⚠️ NOT "zero holders". An unreadable holder set is a NON-MEASUREMENT, and
+    // treating it as empty would restore precisely the unconditional delete this
+    // function exists to end. The orphan sweep collects it later.
+    return { removed: false, remainingHolders: 0, notMeasured: true };
+  }
+  if (remaining.length > 0) {
+    return { removed: false, remainingHolders: remaining.length, notMeasured: false };
+  }
+  removeHarnessConfigDir(dir);
+  return { removed: true, remainingHolders: 0, notMeasured: false };
+}
+
+/**
+ * Remove a config dir UNCONDITIONALLY, ignoring holders.
+ *
+ * ⚠️ NOT THE CLOSE PATH. `releaseHarnessConfigDir` is what a client calls; this
+ * is for the orphan sweep, which has already established through record state and
+ * a `/proc` census that nothing owns the directory.
  */
 export function removeHarnessConfigDir(dir: string | undefined): void {
   if (!dir) {
@@ -402,6 +512,9 @@ export interface HarnessConfigDirPlan {
   envNames: string[];
   /** Absolute paths written, for evidence. Never contains a credential. */
   files: string[];
+  /** This client's claim on the directory — hand it back to
+   *  {@link releaseHarnessConfigDir} at close. */
+  holderId?: string;
 }
 
 export interface HarnessConfigDirInput {
@@ -469,9 +582,14 @@ export function applyHarnessConfigDir(
     const root = input.rootDir ?? tmpdir();
     const dir = join(root, configDirName(harness, input.sessionId.trim()));
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    return harness === "opencode"
-      ? writeOpenCodeConfigDir(dir, input)
-      : writePiConfigDir(dir, input);
+    // ⚠️ REGISTER THIS HOLDER BEFORE WRITING ANYTHING. Between mkdir and the
+    // marker there is a window in which another client's close would see no
+    // holders and remove the directory underneath this one. Narrowing it to two
+    // syscalls is what makes the refcount worth having.
+    const holderId = registerConfigDirHolder(dir);
+    const plan =
+      harness === "opencode" ? writeOpenCodeConfigDir(dir, input) : writePiConfigDir(dir, input);
+    return { ...plan, holderId };
   } catch (error) {
     process.stderr.write(
       `[acpx] could not create the ${harness} config dir; continuing without primer/model pin: ` +

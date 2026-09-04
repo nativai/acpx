@@ -128,7 +128,7 @@ import {
 } from "./harness-capabilities.js";
 import {
   applyHarnessConfigDir,
-  removeHarnessConfigDir,
+  releaseHarnessConfigDir,
   reportHarnessConfigDir,
 } from "./harness-config-dir.js";
 import {
@@ -618,6 +618,9 @@ export class AcpClient {
    * one afternoon), so remove-on-close alone would still leak.
    */
   private harnessConfigDir?: string;
+  /** This client's claim on the shared config dir — released at close so the
+   *  directory survives until the session's TERMINAL close (brick 4a6fdda0). */
+  private harnessConfigHolderId?: string;
   /**
    * The most recent config-option advertisement this client has seen — from
    * `session/new`, `session/load`, `session/resume`, or a
@@ -966,6 +969,7 @@ export class AcpClient {
       // this field, once B5 measures the merge semantics.
     });
     this.harnessConfigDir = plan?.dir;
+    this.harnessConfigHolderId = plan?.holderId;
     reportHarnessConfigDir(plan, this.options.verbose);
   }
 
@@ -2166,8 +2170,16 @@ export class AcpClient {
     // ⚠️ THIS ALONE IS NOT THE FIX. Close is not guaranteed to run at all —
     // owner death, pod eviction, `kill -9` — so `sessions prune` also sweeps
     // orphans. Remove-on-close is the fast path, not the guarantee.
-    removeHarnessConfigDir(this.harnessConfigDir);
+    //
+    // ⚠️ AND IT RELEASES A CLAIM RATHER THAN DELETING (brick 4a6fdda0). Two
+    // clients of one session compute the SAME directory — `resolveConfigDirId()`
+    // returns the record id when present, so repeated spawns reuse one directory
+    // — and an unconditional `rmSync` here deleted the primer and model pin out
+    // from under the client still serving a turn. The directory goes only on the
+    // session's TERMINAL close.
+    releaseHarnessConfigDir(this.harnessConfigDir, this.harnessConfigHolderId);
     this.harnessConfigDir = undefined;
+    this.harnessConfigHolderId = undefined;
 
     await this.terminalManager.shutdown();
 
