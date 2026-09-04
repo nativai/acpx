@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -59,28 +59,41 @@ function withBoxConfig(
   }
 }
 
-test("F-13: a box-level key the session discards is NAMED in a spawn-time warning", () => {
+test("F-13 → 13f73472: box keys are CARRIED now, so the warning has nothing to say", () => {
+  // ⚠️ THIS ROW USED TO ASSERT THE OPPOSITE, AND THE INVERSION IS THE FIX.
+  // F-13's job was to make a silent discard LOUD. The overlay (brick 13f73472)
+  // removes the discard itself, so the loudness has nothing left to report: the
+  // warning is fed the COMPOSED key set, which contains every box key by
+  // construction.
+  //
+  // ⚠️ THE WARNING IS THEREFORE UNREACHABLE ON THE NORMAL PATH — and it is kept
+  // deliberately, because its role has CHANGED rather than ended: it is now a
+  // REGRESSION DETECTOR FOR THE OVERLAY. If composition ever stops carrying a box
+  // key, this warning is what says so, by name. The mutation probe for 13f73472
+  // demonstrates exactly that: with the overlay removed, the old F-13 behaviour
+  // returns and the keys are named again.
   withBoxConfig({ model: "openrouter/deepseek/deepseek-v4-pro", theme: "dark" }, (env, root) => {
     const warning = captureStderr(() => {
       applyHarnessConfigDir({
         env,
         agentCommand: AGENT_REGISTRY.opencode,
         sessionId: "ses-f13",
-        primer: "P", // no --model, so the box's `model` is discarded
+        primer: "P", // no --model — the case that used to discard the box's model
         rootDir: root,
       });
     });
 
-    // CONTROL: the spawn genuinely succeeded and re-pointed the env. Without this
-    // the warning could be firing on a path that never got as far as discarding
-    // anything.
-    assert.ok(env.OPENCODE_CONFIG_DIR, "the config dir was not created — nothing was discarded");
+    // CONTROL: the spawn genuinely ran and re-pointed the env, so silence here
+    // means "nothing was discarded" and not "nothing happened".
+    assert.ok(env.OPENCODE_CONFIG_DIR, "the config dir was not created — the row is vacuous");
+    assert.equal(warning, "", `box keys are still being discarded: ${warning}`);
 
-    assert.match(warning, /opencode/, "no opencode warning was emitted at all");
-    // ⚠️ IT MUST NAME THE KEYS. "some settings were ignored" sends the reader
-    // looking for something they cannot identify; naming them is the whole value.
-    assert.match(warning, /\bmodel\b/, "the discarded `model` key was not named");
-    assert.match(warning, /\btheme\b/, "the discarded `theme` key was not named");
+    // And the positive half: the keys the warning used to name are now SERVED.
+    const served = JSON.parse(
+      readFileSync(join(env.OPENCODE_CONFIG_DIR, "opencode.json"), "utf8"),
+    ) as Record<string, unknown>;
+    assert.equal(served.model, "openrouter/deepseek/deepseek-v4-pro");
+    assert.equal(served.theme, "dark");
   });
 });
 

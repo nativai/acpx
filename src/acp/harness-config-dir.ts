@@ -642,6 +642,99 @@ export function applyHarnessConfigDir(
  * directly would answer a different question on any box that sets XDG.
  */
 /**
+ * The box's `opencode.json` as the BASE, acpx's per-session keys as an OVERLAY
+ * (brick 13f73472 — the better half of the F-13 split).
+ *
+ * ## What this fixes
+ *
+ * acpx re-points BOTH `OPENCODE_CONFIG_DIR` and `XDG_CONFIG_HOME` at the
+ * per-session dir, so the box's own config was never read. Measured on the rig,
+ * reproduced on two sessions: with a box-level pin of
+ * `openrouter/deepseek/deepseek-v4-pro` and a session created with NO `--model`,
+ * the per-session config carried only `instructions` and OpenCode served its own
+ * default (`big-pickle`). **Every acpx-side assertion passed while the model the
+ * box configured was not what served.**
+ *
+ * Composing keeps BOTH properties that were in tension: sessions still get their
+ * own directory and cannot write into the box's or each other's (B3's
+ * isolation), and a setting configured once for the box is honoured by every
+ * session that does not explicitly override it.
+ *
+ * ## ⚠️ THREE COMPOSITION RULES, AND EACH ONE IS A DECISION
+ *
+ * 1. **Nested objects DEEP-merge.** A shallow overlay of
+ *    `provider.openrouter.models.<slug>` would drop every model the box had
+ *    declared under the same key — silently replacing a catalogue while looking
+ *    like an addition. This is the same replace-vs-merge hazard that keeps
+ *    `provisionModelId` switched off for pi.
+ * 2. **`instructions` UNIONS rather than replaces**, box entries first, acpx's
+ *    primer last. It is an array, and arrays normally replace — but replacing is
+ *    exactly the discard this brick exists to end, and a box that configured
+ *    instructions would lose them to any session that carries a primer. Order is
+ *    box-policy-then-acpx-context, and duplicates are dropped so a re-spawn
+ *    cannot accumulate.
+ * 3. **Everything else: acpx's value WINS where acpx set one.** An explicit
+ *    `--model` must override the box's model — that is the point of passing it —
+ *    while a session with no `--model` inherits the box's.
+ *
+ * ⚠️ **A LIMIT THIS CANNOT FIX, STATED RATHER THAN HIDDEN.** Any RELATIVE path
+ * inside the box config is resolved by OpenCode against the config dir, and the
+ * config dir has moved. Absolute paths (what acpx writes, and what the primer
+ * mechanism requires) are unaffected. Rewriting relative paths would need
+ * OpenCode's own resolution rules per key, which are not measured — so they are
+ * carried through unchanged, and this note is the warning.
+ */
+function composeOverBoxConfig(
+  env: NodeJS.ProcessEnv,
+  acpxKeys: Record<string, unknown>,
+): Record<string, unknown> {
+  const boxConfig = readBoxOpenCodeConfig(resolveBoxOpenCodeConfigDir(env));
+  if (!boxConfig) {
+    return acpxKeys; // no box config, or unreadable — today's behaviour exactly
+  }
+  const composed = deepMergeConfig(boxConfig, acpxKeys);
+  const boxInstructions = toStringArray(boxConfig.instructions);
+  const acpxInstructions = toStringArray(acpxKeys.instructions);
+  if (boxInstructions.length > 0 && acpxInstructions.length > 0) {
+    composed.instructions = [...new Set([...boxInstructions, ...acpxInstructions])];
+  }
+  return composed;
+}
+
+/** Plain objects merge; everything else takes the overlay's value. */
+function deepMergeConfig(
+  base: Record<string, unknown>,
+  overlay: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...base };
+  for (const [key, value] of Object.entries(overlay)) {
+    const existing = out[key];
+    out[key] =
+      isPlainObject(existing) && isPlainObject(value)
+        ? deepMergeConfig(existing, value)
+        : structuredCloneValue(value);
+  }
+  return out;
+}
+
+/** An object we may recurse into — NOT an array, which must replace wholesale. */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Defensive copy, so the composed config never aliases the caller's object. */
+function structuredCloneValue<T>(value: T): T {
+  return value === undefined || typeof value === "function" ? value : (structuredClone(value) as T);
+}
+
+/** Only the string entries — a malformed `instructions` must not poison the union. */
+function toStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string")
+    : [];
+}
+
+/**
  * Where the child WOULD have read its config, in OpenCode's own precedence
  * order. Resolved through the env acpx is ABOUT to overwrite, never from
  * `$HOME/.config` directly — on a box that sets XDG those are different
@@ -738,13 +831,21 @@ function writeOpenCodeConfigDir(dir: string, input: HarnessConfigDirInput): Harn
     };
   }
 
+  // ⚠️ COMPOSE, DO NOT REPLACE (brick 13f73472). Read BEFORE the re-point below —
+  // the last moment the box's own config is reachable through the variables acpx
+  // is about to overwrite.
+  const composed = composeOverBoxConfig(input.env, config);
+
   const configPath = join(configDir, "opencode.json");
-  writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+  writeFileSync(configPath, `${JSON.stringify(composed, null, 2)}\n`, { mode: 0o600 });
   files.push(configPath);
 
-  // ⚠️ WARN BEFORE THE RE-POINT — this is the LAST moment the box's own config is
-  // still reachable through the env we are about to overwrite (F-13).
-  warnDiscardedBoxConfigKeys(input.env, Object.keys(config));
+  // ⚠️ THE F-13 WARNING STAYS, AND IT SHOULD NOW BE SILENT. It is fed the
+  // COMPOSED key set, so a key the overlay carried through is not reported as
+  // discarded. It has not been defanged: anything the composition genuinely fails
+  // to carry still gets named. A warning that goes quiet because the defect is
+  // fixed is the correct end state for it.
+  warnDiscardedBoxConfigKeys(input.env, Object.keys(composed));
 
   input.env.XDG_CONFIG_HOME = dir;
   input.env.OPENCODE_CONFIG_DIR = configDir;
