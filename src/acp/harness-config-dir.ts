@@ -1,5 +1,5 @@
-import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import {
   harnessIdForAgentCommand,
@@ -251,6 +251,85 @@ export function applyHarnessConfigDir(
 }
 
 /**
+ * Warn when the per-session config DISCARDS keys the box's own `opencode.json`
+ * had set (F-13, brick 6d2ca570).
+ *
+ * ⚠️ THE SIGNATURE OF THIS DEFECT IS THAT EVERYTHING ELSE PASSES. acpx re-points
+ * BOTH `OPENCODE_CONFIG_DIR` and `XDG_CONFIG_HOME`, so the box's config is never
+ * read — and the directory still exists, the env is still correct, the primer
+ * still arrives, and the turn still works. Measured on the rig across two
+ * sessions: with a box-level pin of `deepseek-v4-pro` and a session created with
+ * NO `--model`, the per-session config carried only `instructions` and OpenCode's
+ * own store served OpenCode's default (`big-pickle`). Nothing failed; the pin
+ * simply evaporated.
+ *
+ * ⚠️ THIS MAKES THE DISCARD LOUD; IT DOES NOT MAKE IT STOP. Treating the box
+ * config as a base and acpx's keys as an overlay is B4's job (brick 13f73472).
+ * A per-session `--model` works today and is deliberately untouched here.
+ *
+ * It is read through the env acpx is ABOUT to overwrite, because that is the
+ * config the child would otherwise have inherited — reading `$HOME/.config`
+ * directly would answer a different question on any box that sets XDG.
+ */
+/**
+ * Where the child WOULD have read its config, in OpenCode's own precedence
+ * order. Resolved through the env acpx is ABOUT to overwrite, never from
+ * `$HOME/.config` directly — on a box that sets XDG those are different
+ * directories and only the former answers "what is being discarded".
+ */
+function resolveBoxOpenCodeConfigDir(env: NodeJS.ProcessEnv): string {
+  const explicit = env.OPENCODE_CONFIG_DIR?.trim();
+  if (explicit) {
+    return explicit;
+  }
+  const xdg = env.XDG_CONFIG_HOME?.trim();
+  if (xdg) {
+    return join(xdg, "opencode");
+  }
+  return join(env.HOME?.trim() || homedir(), ".config", "opencode");
+}
+
+/**
+ * The box's own `opencode.json`, or undefined when there is none, it is
+ * unreadable, or it is not a JSON object. The last case matters: a JSON array
+ * parses fine and `Object.keys` would then report array INDICES as discarded
+ * settings, which is a warning that names nothing real.
+ */
+function readBoxOpenCodeConfig(dir: string): Record<string, unknown> | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(join(dir, "opencode.json"), "utf8"));
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return undefined;
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function warnDiscardedBoxConfigKeys(env: NodeJS.ProcessEnv, sessionKeys: string[]): void {
+  const boxConfigDir = resolveBoxOpenCodeConfigDir(env);
+  const boxConfig = readBoxOpenCodeConfig(boxConfigDir);
+  if (!boxConfig) {
+    return; // no box config, or unreadable — nothing is being discarded
+  }
+  const kept = new Set(sessionKeys);
+  const discarded = Object.keys(boxConfig).filter((key) => !kept.has(key));
+  if (discarded.length === 0) {
+    return;
+  }
+  // ⚠️ NAME THE KEYS. "some settings were ignored" sends the reader to look for
+  // something they cannot identify; the whole value of this warning is that it
+  // says WHICH setting silently stopped applying.
+  process.stderr.write(
+    `[acpx] opencode: this session uses its own config dir, so ${discarded.length} ` +
+      `key(s) from ${join(boxConfigDir, "opencode.json")} are NOT applied: ` +
+      `${discarded.join(", ")}. Pass them per session (e.g. --model) if you need them.\n`,
+  );
+}
+
+/**
  * OpenCode (I1 R9, R15).
  *
  * ⚠️ **BOTH `XDG_CONFIG_HOME` AND `OPENCODE_CONFIG_DIR` ARE REQUIRED.** OpenCode
@@ -292,6 +371,10 @@ function writeOpenCodeConfigDir(dir: string, input: HarnessConfigDirInput): Harn
   const configPath = join(configDir, "opencode.json");
   writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
   files.push(configPath);
+
+  // ⚠️ WARN BEFORE THE RE-POINT — this is the LAST moment the box's own config is
+  // still reachable through the env we are about to overwrite (F-13).
+  warnDiscardedBoxConfigKeys(input.env, Object.keys(config));
 
   input.env.XDG_CONFIG_HOME = dir;
   input.env.OPENCODE_CONFIG_DIR = configDir;
