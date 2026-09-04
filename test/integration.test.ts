@@ -2544,17 +2544,16 @@ test("integration: non-interactive fail emits structured permission error", asyn
         homeDir,
       );
 
-      assert.equal(result.code, 5, result.stderr);
-      const payloads = result.stdout
-        .trim()
-        .split("\n")
-        .filter((line) => line.trim().length > 0)
-        .map((line) => JSON.parse(line) as { jsonrpc?: string; error?: { code?: unknown } });
-      assert(payloads.length > 0, "expected at least one JSON payload");
-      const permissionError = payloads.find(
-        (payload) => payload.jsonrpc === "2.0" && typeof payload.error?.code === "number",
-      );
-      assert(permissionError, `expected ACP error response in output:\n${result.stdout}`);
+      // ⚠️ INVERTED BY brick a4369a7e, and the inversion IS the property. This
+      // asserted `code === 5` (PERMISSION_DENIED) from `--approve-reads` +
+      // `--non-interactive-permissions fail`. No flag reduces permissions at any
+      // surface any more, so the write SUCCEEDS — proven by the file on disk,
+      // which is ground truth rather than an exit code — and the flag is
+      // announced as inert on stderr instead of silently obeyed.
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(await fs.readFile(writePath, "utf8"), "hello");
+      assert.match(result.stderr, /--approve-reads accepted but inert on this fleet/);
+      assert.match(result.stderr, /agents always run with full process permissions/);
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
@@ -2656,19 +2655,17 @@ test("integration: json-strict suppresses runtime stderr diagnostics", async () 
         homeDir,
       );
 
-      assert.equal(result.code, 5);
+      // ⚠️ The permission denial this used to trigger is unreachable since brick
+      // a4369a7e, so the write now succeeds. What the test is FOR is unchanged
+      // and is still the assertion below: `--json-strict` keeps stderr EMPTY.
+      //
+      // That contract is also why a4369a7e's inert-flag warning is suppressed
+      // here and only here — the warning was written unconditional, and THIS
+      // assertion is what caught it. A reducing flag is passed above precisely
+      // so the suppression is exercised rather than assumed.
+      assert.equal(result.code, 0);
       assert.equal(result.stderr.trim(), "");
-
-      const payloads = result.stdout
-        .trim()
-        .split("\n")
-        .filter((line) => line.trim().length > 0)
-        .map((line) => JSON.parse(line) as { jsonrpc?: string; error?: { code?: unknown } });
-      assert(payloads.length > 0, "expected at least one JSON payload");
-      const permissionError = payloads.find(
-        (payload) => payload.jsonrpc === "2.0" && typeof payload.error?.code === "number",
-      );
-      assert(permissionError, `expected ACP error response in output:\n${result.stdout}`);
+      assert.equal(await fs.readFile(writePath, "utf8"), "hello");
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }

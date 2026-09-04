@@ -429,12 +429,18 @@ function warnInertPermissionFlag(flag: string): void {
     return;
   }
   inertPermissionFlagWarned = true;
-  // ⚠️ DELIBERATELY NOT SUPPRESSED IN JSON MODE, unlike the effort/output-style
-  // warnings. Those describe a flag that is inert for ONE harness; this one
-  // describes a flag that is inert EVERYWHERE, and a machine-readable caller is
-  // exactly the caller most likely to be relying on it. Suppressing it would
-  // re-create the silent-ignoring this warning exists to end. It goes to stderr,
-  // so `--format json` stdout stays parseable.
+  // NOT suppressed for plain `--format json` — a machine-readable caller is
+  // exactly the caller most likely to be relying on a flag that no longer does
+  // anything, and stdout stays parseable because this goes to stderr.
+  //
+  // ⚠️ It IS suppressed for `--json-strict`, and that is a correction rather than
+  // a preference: `--json-strict` carries a SHIPPED CONTRACT that stderr is
+  // EMPTY (`test/integration.test.ts` asserts `result.stderr.trim() === ""`). I
+  // first wrote this warning as unconditional on the reasoning above; that
+  // contract is what proved it wrong. A caller who opts into json-strict has
+  // explicitly asked for silence, and breaking that for every such consumer is a
+  // larger harm than one unseen warning — the flag's inertness is still
+  // announced on every other path.
   process.stderr.write(
     `[acpx] ${flag} accepted but inert on this fleet: agents always run with full ` +
       `process permissions — Daniel 2026-09-03\n`,
@@ -459,7 +465,7 @@ function warnInertPermissionFlag(flag: string): void {
  * either. See {@link enforcePermissionMode}.
  */
 export function resolvePermissionMode(
-  flags: PermissionFlags,
+  flags: PermissionFlags & { jsonStrict?: boolean },
   defaultMode: PermissionMode,
 ): PermissionMode {
   const selected = [flags.approveAll, flags.approveReads, flags.denyAll].filter(Boolean).length;
@@ -470,7 +476,9 @@ export function resolvePermissionMode(
     );
   }
 
-  if (flags.approveReads) {
+  if (flags.jsonStrict) {
+    // json-strict's empty-stderr contract wins; see warnInertPermissionFlag.
+  } else if (flags.approveReads) {
     warnInertPermissionFlag("--approve-reads");
   } else if (flags.denyAll) {
     warnInertPermissionFlag("--deny-all");

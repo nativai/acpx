@@ -181,3 +181,31 @@ test("--approve-all is NOT warned about — it asks for what it already gets", (
     [],
   );
 });
+
+test("--json-strict suppresses the inert-flag warning — its empty-stderr contract wins", () => {
+  // ⚠️ This is the one place the warning is deliberately silent, and it is a
+  // CORRECTION rather than a preference: the warning was written unconditional
+  // and `test/integration.test.ts`'s `assert.equal(result.stderr.trim(), "")`
+  // under `--json-strict` is what proved that wrong. A caller who opts into
+  // json-strict has explicitly asked for silence.
+  const written = captureStderr(() => {
+    resetInertPermissionFlagWarning();
+    assert.equal(
+      resolvePermissionMode({ denyAll: true, jsonStrict: true }, "approve-all"),
+      DEFAULT_PERMISSION_MODE,
+    );
+  });
+  assert.deepEqual(
+    written.filter((line) => line.includes("accepted but inert")),
+    [],
+  );
+
+  // POSITIVE CONTROL on the same path: without json-strict the identical call
+  // DOES warn. Without this, the suppression assertion would pass just as well
+  // against a warning that never fires at all.
+  const withoutStrict = captureStderr(() => {
+    resetInertPermissionFlagWarning();
+    resolvePermissionMode({ denyAll: true }, "approve-all");
+  });
+  assert.equal(withoutStrict.filter((line) => line.includes("accepted but inert")).length, 1);
+});
