@@ -629,6 +629,11 @@ export class AcpClient {
    * hand-maintained-list failure mode that produced F-9 in the first place.
    */
   private latestConfigOptions?: SessionConfigOption[];
+  /**
+   * Set when this adapter answered `-32601 Method not found` for
+   * `session/set_model` — a durable capability fact, not a transient failure.
+   */
+  private modelSetMethodUnsupported = false;
   private lastEffectiveAccountMetadata?: EffectiveAccountMetadata;
   /**
    * The environment THIS session's agent process was spawned with — the exact
@@ -990,6 +995,26 @@ export class AcpClient {
    */
   get harnessConfigDirPath(): string | undefined {
     return this.harnessConfigDir;
+  }
+
+  /**
+   * Whether this adapter has proven it does not implement `session/set_model`.
+   * The caller persists it so the next process does not have to fail to find out.
+   */
+  get modelSetMethodIsUnsupported(): boolean {
+    return this.modelSetMethodUnsupported;
+  }
+
+  /**
+   * LEARN the capability from a failed `session/set_model` (F-12). A
+   * `-32601 Method not found` says the adapter has no such handler — it will not
+   * become true later for the same binary, so it is recorded rather than retried.
+   * Extracted so `setSessionModel` stays inside the complexity budget.
+   */
+  private learnModelSetCapabilityFrom(error: unknown): void {
+    if (extractAcpError(error)?.code === -32601) {
+      this.modelSetMethodUnsupported = true;
+    }
   }
 
   private resolveConfigDirId(): string {
@@ -1976,7 +2001,17 @@ export class AcpClient {
           modelId,
         }),
       );
+      // The adapter answered — whatever it did before, it implements the method
+      // NOW. Learning must run in BOTH directions or a restored capability stays
+      // invisible (see setModelSetMethodUnsupported).
+      this.modelSetMethodUnsupported = false;
     } catch (error) {
+      // ⚠️ LEARN THE CAPABILITY (F-12). `-32601 Method not found` says the adapter
+      // has no such handler — it will not become true later for the same binary,
+      // so it is recorded rather than retried. This is what lets a harness whose
+      // DECLARED mechanism its deployed adapter does not implement correct itself
+      // without anyone editing a table or citing a version.
+      this.learnModelSetCapabilityFrom(error);
       const wrapped = maybeWrapSessionControlError(
         "session/set_model",
         error,

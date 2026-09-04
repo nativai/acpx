@@ -695,6 +695,9 @@ export function cloneSessionAcpxState(
     // acpx-authored value the turn path re-bases off this clone. Lost here, the
     // primer modal silently falls back to a re-render after the first turn.
     harness_config_dir: state.harness_config_dir,
+    // Same allowlist that dropped depth_projection on every real turn. A learned
+    // capability fact lost here would be re-learned only by failing again.
+    model_set_unsupported_for: state.model_set_unsupported_for,
     refused_output_style: state.refused_output_style,
     context_window_size: state.context_window_size,
     context_window_model_id: state.context_window_model_id,

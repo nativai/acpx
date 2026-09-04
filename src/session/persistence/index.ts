@@ -6,6 +6,7 @@ import {
   resolveHarnessCapabilities,
 } from "../../acp/harness-capabilities.js";
 import type { SessionRecord } from "../../types.js";
+import { modelSetMethodKnownUnsupported } from "../mode-preference.js";
 import { withSessionIndexLock } from "./index-lock.js";
 import { parseSessionRecord } from "./parse.js";
 
@@ -469,6 +470,13 @@ function canSetModelLiveFromRecord(record: SessionRecord): boolean | undefined {
   const harness = harnessIdForAgentCommand(record.agentCommand);
   if (harness === undefined) {
     return undefined;
+  }
+  // ⚠️ A LEARNED REFUSAL BEATS ANY ADVERTISEMENT. pi ADVERTISES models (371 of
+  // them) and still answers `-32601 Method not found` for `session/set_model` on
+  // the pinned adapter, so no advertisement-based check can catch it. Once the
+  // adapter has proven the method absent, the control must not be offered again.
+  if (modelSetMethodKnownUnsupported(record)) {
+    return false;
   }
   const advertised = record.acpx?.config_options;
   return resolveHarnessCapabilities(harness, advertised ? { configOptions: advertised } : undefined)

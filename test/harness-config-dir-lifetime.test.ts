@@ -90,8 +90,12 @@ test("the recorded path points at the dir that actually exists", async () => {
   // the two agree for a real spawn rather than assuming they do.
   const s = await spawnOpenCodeClient();
   try {
-    assert.ok(s.dir, "no config dir");
-    assert.equal(existsSync(s.dir), true);
+    assert.ok(s.dir, `no config dir was planned; ${await describeTmpState(undefined)}`);
+    assert.equal(
+      existsSync(s.dir),
+      true,
+      `recorded dir is absent; ${await describeTmpState(s.dir)}`,
+    );
     // CONTROL: the path is not merely non-empty — it is under tmp and carries the
     // harness prefix, so a stray value could not satisfy this vacuously.
     assert.match(path.basename(s.dir), /^acpx-opencode-/);
@@ -117,4 +121,34 @@ async function client_roundTrip(client: AcpClient, sessionId: string): Promise<v
   await client.setSessionConfigOption(sessionId, "mode", "build").catch(() => {
     // The mock may not advertise `mode`; the point is the round-trip, not the set.
   });
+}
+
+/**
+ * State a failing config-dir assertion needs and cannot otherwise recover.
+ *
+ * ⚠️ THIS EXISTS BECAUSE A ROW WENT RED TWICE UNDER FULL-SUITE LOAD AND I COULD
+ * NEVER CAPTURE THE ASSERTION. Both times it passed in isolation and on the next
+ * full run, so there was nothing left to inspect — only a `not ok` line. A row
+ * that prints what it judged turns an unreproducible intermittent into a
+ * diagnosable one, which is the only form of "capture the detail first" that
+ * survives not being there when it happens.
+ */
+async function describeTmpState(dir: string | undefined): Promise<string> {
+  const parts = [`dir=${dir ?? "<none>"}`];
+  if (dir) {
+    parts.push(`exists=${existsSync(dir)}`);
+    try {
+      parts.push(`entries=${JSON.stringify(await fs.readdir(dir))}`);
+    } catch (error) {
+      parts.push(`readdir failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  try {
+    const siblings = (await fs.readdir(os.tmpdir())).filter((e) => e.startsWith("acpx-opencode-"));
+    parts.push(`tmp acpx-opencode-* population=${siblings.length}`);
+    parts.push(`sample=${JSON.stringify(siblings.slice(0, 5))}`);
+  } catch {
+    parts.push("tmp listing unavailable — NOT MEASURED");
+  }
+  return parts.join(" · ");
 }

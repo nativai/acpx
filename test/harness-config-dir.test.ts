@@ -16,6 +16,10 @@ import {
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
 import { cloneSessionAcpxState } from "../src/session/conversation-model.js";
 import { setHarnessConfigDir } from "../src/session/mode-preference.js";
+import {
+  modelSetMethodKnownUnsupported,
+  setModelSetMethodUnsupported,
+} from "../src/session/mode-preference.js";
 import { toSessionIndexEntry } from "../src/session/persistence/index.js";
 import type { SessionRecord } from "../src/types.js";
 
@@ -544,5 +548,85 @@ test("F-12 GUARDRAIL: claude and codex keep their declared answer", () => {
       deriveHarnessCapabilities(HARNESS_FACTS[id]).canSetModelLive,
       `${id}: the refinement changed a harness it must not touch`,
     );
+  }
+});
+
+// ── F-12: the LEARNED, KEYED capability fact ────────────────────────────────
+
+test("F-12: a -32601 learned on THIS adapter narrows canSetModelLive", () => {
+  // Measured on the rig with the adapter swapped under an identical acpx:
+  //   pi-acp 0.0.26 -> set model rc=0, record + current_model_id updated
+  //   pi-acp 0.0.33 -> set model rc=1, -32601 Method not found  (what ships)
+  // pi ADVERTISES 371 models and still has no such method, so NO advertisement
+  // check can catch this. Only the observed refusal can.
+  const record = {
+    acpxRecordId: "rec-f12-pi",
+    agentCommand: AGENT_REGISTRY.pi,
+    acpx: {},
+  } as unknown as SessionRecord;
+  // CONTROL: before learning, the declared answer stands.
+  assert.equal(toSessionIndexEntry(record, "x.json").canSetModelLive, true);
+
+  setModelSetMethodUnsupported(record, true);
+  assert.equal(
+    toSessionIndexEntry(record, "x.json").canSetModelLive,
+    false,
+    "a proven-absent method must not be offered as a live control",
+  );
+});
+
+test("F-12: ⚠️ THE RESTORATION CASE — a fact learned on ANOTHER adapter does not carry over", () => {
+  // ⚠️ THE ROW THAT MATTERS MOST, and the one a bare boolean would fail. The
+  // method EXISTED in 0.0.26, was REMOVED in 0.0.33, and our fork's job is to
+  // RESTORE it. An unkeyed learned fact would keep the capability switched off
+  // forever, the restoration would be INVISIBLE, and it would be blamed on the
+  // fork. So the fact is keyed by the adapter it was learned on and does NOT
+  // survive a change of adapter.
+  const record = {
+    acpxRecordId: "rec-f12-restore",
+    agentCommand: "npx pi-acp@^0.0.33",
+    acpx: {},
+  } as unknown as SessionRecord;
+  setModelSetMethodUnsupported(record, true);
+  assert.equal(record.acpx?.model_set_unsupported_for, "npx pi-acp@^0.0.33");
+  assert.equal(modelSetMethodKnownUnsupported(record), true, "control: it applies to its own key");
+
+  // The pin moves — a restored method ships. The stale fact must NOT apply.
+  record.agentCommand = "npx pi-acp@^0.0.34";
+  assert.equal(
+    modelSetMethodKnownUnsupported(record),
+    false,
+    "a refusal learned on a DIFFERENT adapter was carried over — the restoration is invisible",
+  );
+  assert.equal(
+    toSessionIndexEntry(record, "x.json").canSetModelLive,
+    true,
+    "the live control stayed hidden on an adapter that was never probed",
+  );
+});
+
+test("F-12: learning is TWO-WAY — a success clears a previous refusal", () => {
+  const record = {
+    acpxRecordId: "rec-f12-2way",
+    agentCommand: AGENT_REGISTRY.pi,
+    acpx: {},
+  } as unknown as SessionRecord;
+  setModelSetMethodUnsupported(record, true);
+  assert.equal(modelSetMethodKnownUnsupported(record), true, "control: it was learned");
+  setModelSetMethodUnsupported(record, false);
+  assert.equal(modelSetMethodKnownUnsupported(record), false);
+  // CLEARED means the KEY IS GONE, not set to false — a record that never learned
+  // anything must be byte-identical to one that learned and recovered.
+  assert.equal(record.acpx?.model_set_unsupported_for, undefined);
+});
+
+test("F-12: clearing on a record that never learned touches NOTHING", () => {
+  // RS-14's rule, applied to this field: claude/claude-pty/codex never learn it,
+  // and their record shape must not move.
+  for (const id of ["claude", "claude-pty", "codex"] as const) {
+    const record = { agentCommand: AGENT_REGISTRY[id] } as unknown as SessionRecord;
+    const before = JSON.stringify(record);
+    setModelSetMethodUnsupported(record, false);
+    assert.equal(JSON.stringify(record), before, `${id}: the record shape moved`);
   }
 });

@@ -356,3 +356,54 @@ export function setHarnessConfigDir(record: SessionRecord, dir: string | undefin
   }
   record.acpx = acpx;
 }
+
+/**
+ * Record — or CLEAR — the learned fact that this adapter does not implement
+ * `session/set_model` (F-12, brick 2dc93747).
+ *
+ * ⚠️ IT IS TWO-WAY ON PURPOSE, AND THAT IS THE LOAD-BEARING HALF. Measured on
+ * the rig with the adapter swapped under an identical acpx:
+ *
+ *   pi-acp 0.0.26 -> set model rc=0, record and current_model_id both updated
+ *   pi-acp 0.0.33 -> set model rc=1, -32601 Method not found   (this is what ships)
+ *
+ * So the capability EXISTED, REGRESSED OUT, and is expected to RETURN in our
+ * fork. A flag that could only ever subtract would make that restoration
+ * INVISIBLE: the session would keep hiding a control that had started working
+ * again. A successful `session/set_model` therefore clears it, on the same
+ * evidence standard that set it — the adapter answering.
+ *
+ * ⚠️ It is also why the static descriptor must NOT be hand-edited to `false`.
+ * The cell was TRUE when written and went stale; a permanent claim about a
+ * capability that comes and goes with the adapter build is wrong in both
+ * directions, and no version-citation discipline survives that sequence.
+ *
+ * The key is DELETED rather than set to `false` when clearing, so a record that
+ * never learned anything is byte-identical to one that learned and recovered.
+ */
+export function setModelSetMethodUnsupported(record: SessionRecord, unsupported: boolean): void {
+  if (!unsupported && record.acpx?.model_set_unsupported_for === undefined) {
+    return; // nothing to clear — leave the record shape untouched
+  }
+  const acpx = cloneSessionAcpxState(record.acpx) ?? {};
+  if (unsupported) {
+    // The KEY, not a flag: what was learned, and which adapter it was learned on.
+    acpx.model_set_unsupported_for = record.agentCommand;
+  } else {
+    delete acpx.model_set_unsupported_for;
+  }
+  record.acpx = acpx;
+}
+
+/**
+ * Whether this record's LEARNED refusal still applies to the adapter it would
+ * launch TODAY (F-12).
+ *
+ * ⚠️ A learned fact from a DIFFERENT adapter is not evidence about this one. When
+ * the key does not match, the answer is "unknown" and the capability is re-probed
+ * by simply trying — which is how a restored method becomes visible again.
+ */
+export function modelSetMethodKnownUnsupported(record: SessionRecord): boolean {
+  const learnedOn = record.acpx?.model_set_unsupported_for;
+  return typeof learnedOn === "string" && learnedOn === record.agentCommand;
+}

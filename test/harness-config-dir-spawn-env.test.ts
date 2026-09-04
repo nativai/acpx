@@ -181,9 +181,21 @@ test("the config dir opencode receives is REAL — the files exist where the env
   let checked = false;
   await spawnAndDumpEnv("opencode", async (dump) => {
     const configDir = dump.OPENCODE_CONFIG_DIR;
-    assert.ok(configDir, "OPENCODE_CONFIG_DIR unset");
+    assert.ok(
+      configDir,
+      `OPENCODE_CONFIG_DIR unset; captured names=${JSON.stringify(Object.keys(dump).slice(0, 40))}`,
+    );
     const configPath = path.join(configDir, "opencode.json");
-    const config = JSON.parse(await fs.readFile(configPath, "utf8")) as Record<string, unknown>;
+    // ⚠️ Read with the failure state attached: this row has gone red once under
+    // full-suite load and left only a `not ok` line to work from.
+    const raw = await fs.readFile(configPath, "utf8").catch(async (error: unknown) => {
+      const entries = await fs.readdir(configDir).catch(() => ["<readdir failed>"]);
+      throw new Error(
+        `cannot read ${configPath}: ${error instanceof Error ? error.message : String(error)} · ` +
+          `dirEntries=${JSON.stringify(entries)}`,
+      );
+    });
+    const config = JSON.parse(raw) as Record<string, unknown>;
     assert.ok(config, `opencode.json at ${configPath} did not parse`);
     // XDG_CONFIG_HOME must be the PARENT — OpenCode merges both, so a mismatch
     // silently de-isolates the session (I1 R15).

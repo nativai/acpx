@@ -11,6 +11,7 @@ import {
   setDesiredModeId,
   setDesiredModelId,
   setDesiredModelSource,
+  setModelSetMethodUnsupported,
 } from "../../session/mode-preference.js";
 import { assertRecordModelSupported } from "../../session/model-application.js";
 import { resolveSessionRecord, writeSessionRecord } from "../../session/persistence.js";
@@ -138,7 +139,24 @@ export async function runSessionSetModelDirect(
         requestedModel: options.modelId,
         context: "apply",
       });
-      await withTimeout(client.setSessionModel(sessionId, options.modelId), options.timeoutMs);
+      try {
+        await withTimeout(client.setSessionModel(sessionId, options.modelId), options.timeoutMs);
+        // UP as well as DOWN: a set that succeeds clears a previously learned
+        // refusal, so a restored adapter is not permanently hidden.
+        setModelSetMethodUnsupported(record, false);
+      } catch (error) {
+        // ⚠️ PERSIST THE LEARNED FACT BEFORE RE-THROWING. This is the verb path
+        // the UI drives, and it is where the adapter's `-32601` is first seen with
+        // a record in hand. Without the write the fact dies with the process and
+        // the next session offers the same control that has already been proven
+        // impossible. The write is best-effort: failing to record a capability
+        // must never replace the user's real error with a bookkeeping one.
+        if (client.modelSetMethodIsUnsupported) {
+          setModelSetMethodUnsupported(record, true);
+          await writeSessionRecord(record).catch(() => {});
+        }
+        throw error;
+      }
       setDesiredModelId(record, options.modelId);
       setCurrentModelId(record, options.modelId);
       // brick://5bac5564 R5: an explicit acpx-level `set model` → provenance "explicit".

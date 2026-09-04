@@ -373,6 +373,9 @@ function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
   // The config-dir CHANNEL must round-trip, or acpx-ui loses the primer path on
   // the first cold reload and silently falls back to a re-render.
   assignStringState(state, "harness_config_dir", record.harness_config_dir);
+  // A LEARNED capability fact must survive a cold reload, or the session
+  // re-offers a control it has already proven cannot work.
+  assignStringState(state, "model_set_unsupported_for", record.model_set_unsupported_for);
 
   return state;
 }
@@ -468,7 +471,8 @@ function assignStringState(
     | "context_window_model_id"
     | "applied_output_style"
     | "refused_output_style"
-    | "harness_config_dir",
+    | "harness_config_dir"
+    | "model_set_unsupported_for",
   value: unknown,
 ): void {
   if (typeof value === "string") {

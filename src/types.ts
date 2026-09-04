@@ -676,6 +676,37 @@ export type SessionAcpxState = {
    * modal then falls back to a re-render that drifts as the OS is edited.
    */
   harness_config_dir?: string;
+  /**
+   * LEARNED: this session's adapter answered `-32601 Method not found` for
+   * `session/set_model` (F-12, brick 2dc93747).
+   *
+   * ⚠️ IT IS LEARNED, NOT DECLARED, AND THAT IS THE WHOLE POINT. The static
+   * descriptor says pi's model mechanism is `set-model`, citing a measurement
+   * taken on pi-acp 0.0.26 — but the registry pins `^0.0.33`, whose adapter has
+   * no such handler. A static claim of this kind must cite the adapter version it
+   * was proven on, and that discipline decays the moment someone forgets it. A
+   * LEARNED fact cannot: any adapter missing any method self-corrects on first
+   * contact, with no table entry to go stale and no version to keep current.
+   *
+   * A `-32601` is a CAPABILITY fact about the adapter, not a transient error —
+   * "this method does not exist" does not become true later for the same binary.
+   * That is why it is persisted rather than retried.
+   *
+   * ⚠️ IT STORES THE ADAPTER KEY IT WAS LEARNED ON, NOT A BOOLEAN, AND THE KEY IS
+   * THE WHOLE POINT. Measured on the rig with the adapter swapped under an
+   * identical acpx: `session/set_model` EXISTED in pi-acp 0.0.26, is GONE in
+   * 0.0.33, and our fork's job is to RESTORE it. A bare flag would be wrong in
+   * the other direction — a `-32601` learned on 0.0.33 would keep the capability
+   * switched off FOREVER, the restoration would be invisible, and it would be
+   * blamed on the fork.
+   *
+   * The key is the resolved launch command, which carries the registry pin
+   * (`npx pi-acp@^0.0.33`). For a `0.0.x` range a caret pins exactly, so a
+   * restored method requires a pin bump — which changes this key, which re-probes.
+   * A `/proc`-resolved package version would be a stronger key still; the command
+   * is what the record already carries, so the comparison needs no new state.
+   */
+  model_set_unsupported_for?: string;
   depth_projection?: {
     requested: string;
     outcome: string;
