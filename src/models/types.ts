@@ -54,7 +54,21 @@ export type DepthDescriptor =
       /** True ⇒ there is no off-rung; the control omits its "Default" row. */
       mandatory: boolean;
     }
-  | { kind: "boolean"; defaultEnabled: boolean; mandatory: boolean }
+  | {
+      kind: "boolean";
+      /**
+       * ⚠️ THREE STATES, NOT TWO — `null` means UPSTREAM WAS SILENT, and it is not
+       * the same as `false`. Measured on the full live population: OpenRouter
+       * omits `reasoning.default_enabled` on 109 of the 146 boolean rows and
+       * states it on 37 (7 false, 30 true). Collapsing absent → `false` would
+       * make the depth switch render a preselected "Off" on 109 models where
+       * OpenRouter says NOTHING — a claim we would be inventing. Deriving
+       * server-side is worth doing precisely because the information reaches one
+       * place intact; the renderer decides what to show for `null`.
+       */
+      defaultEnabled: boolean | null;
+      mandatory: boolean;
+    }
   | { kind: "none" };
 
 export type BillingKind = "metered" | "plan" | "free" | "variable";

@@ -63,23 +63,33 @@ export function deriveDepthDescriptor(reasoning: OpenRouterReasoning | undefined
   if (levels.length === 0) {
     return {
       kind: "boolean",
-      defaultEnabled: reasoning.default_enabled === true,
+      // Absent stays absent — see the three-state note on DepthDescriptor.
+      defaultEnabled: reasoning.default_enabled ?? null,
       mandatory: reasoning.mandatory === true,
     };
   }
 
-  const rawDefault = reasoning.default_effort?.trim().toLowerCase();
-  const defaultLevel =
-    rawDefault !== undefined && isCanonicalDepthLevel(rawDefault) && levels.includes(rawDefault)
-      ? rawDefault
-      : null;
-
   return {
     kind: "ladder",
     levels,
-    default: defaultLevel,
+    default: defaultRungWithin(levels, reasoning.default_effort),
     mandatory: reasoning.mandatory === true,
   };
+}
+
+/**
+ * A `default_effort` outside the model's OWN ladder is not echoed back —
+ * trusting it would make the control preselect a rung the model rejects.
+ */
+function defaultRungWithin(
+  levels: CanonicalDepthLevel[],
+  rawDefault: string | undefined,
+): CanonicalDepthLevel | null {
+  const normalized = rawDefault?.trim().toLowerCase();
+  if (normalized === undefined || !isCanonicalDepthLevel(normalized)) {
+    return null;
+  }
+  return levels.includes(normalized) ? normalized : null;
 }
 
 /** One-line human summary of a descriptor — used by `acpx models` rows. */
@@ -88,6 +98,9 @@ export function describeDepth(depth: DepthDescriptor): string {
     return `${depth.levels.length} depths`;
   }
   if (depth.kind === "boolean") {
+    if (depth.defaultEnabled === null) {
+      return "on/off (unstated)";
+    }
     return depth.defaultEnabled ? "on/off (on)" : "on/off (off)";
   }
   return "no reasoning";

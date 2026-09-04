@@ -66,6 +66,39 @@ test("depth: a reasoning object with no ladder degrades to a boolean, not to a f
   assert.deepEqual(off, { kind: "boolean", defaultEnabled: false, mandatory: false });
 });
 
+/**
+ * ⚠️ THREE STATES, NOT TWO. Absent `default_enabled` is NOT `false`: upstream
+ * distinguishes them, so the payload must too, or phase 2's depth switch renders
+ * a preselected "Off" on 109 live models where OpenRouter says nothing.
+ */
+test("depth: an ABSENT default_enabled stays null — it is not collapsed to false", () => {
+  const silent = deriveDepthDescriptor({ mandatory: false });
+  assert.deepEqual(silent, { kind: "boolean", defaultEnabled: null, mandatory: false });
+  // The three states are mutually distinguishable, which is the whole property.
+  const states = [
+    deriveDepthDescriptor({ mandatory: false }),
+    deriveDepthDescriptor({ mandatory: false, default_enabled: false }),
+    deriveDepthDescriptor({ mandatory: false, default_enabled: true }),
+  ].map((depth) => (depth.kind === "boolean" ? depth.defaultEnabled : "wrong-kind"));
+  assert.deepEqual(states, [null, false, true]);
+  assert.equal(new Set(states).size, 3);
+});
+
+test("depth: the recorded roster carries all THREE boolean states, in the measured proportions", () => {
+  const catalogue = buildCatalogue(fixture().models, META);
+  const booleans = catalogue.models.filter((model) => model.depth.kind === "boolean");
+  const count = (value: boolean | null) =>
+    booleans.filter(
+      (model) => model.depth.kind === "boolean" && model.depth.defaultEnabled === value,
+    ).length;
+  // Measured on the recorded 2026-09-04 roster: 146 boolean rows, 109 silent.
+  assert.equal(booleans.length, 146);
+  assert.equal(count(null), 109);
+  assert.equal(count(false), 7);
+  assert.equal(count(true), 30);
+  assert.equal(count(null) + count(false) + count(true), booleans.length);
+});
+
 test("depth: no reasoning object at all derives kind=none", () => {
   assert.deepEqual(deriveDepthDescriptor(undefined), { kind: "none" });
 });

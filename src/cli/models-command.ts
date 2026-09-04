@@ -17,8 +17,8 @@
  * Everything printed is derived by `src/models/*`; this file only formats.
  */
 
-import os from "node:os";
 import { Command, InvalidArgumentError } from "commander";
+import { resolveAcpxUiBaseUrl } from "../acp/auth-env.js";
 import {
   decorateFavorites,
   findModelByKey,
@@ -85,6 +85,25 @@ async function readCatalogue(flags: ModelsFlags): Promise<ModelCatalogue> {
 
 function asMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Which box this store belongs to, for the user-facing lines.
+ *
+ * ⚠️ resolveAcpxUiBaseUrl, NEVER os.hostname() — the repo already ruled on this
+ * and the rule is carried at `src/session/persistence/deletion-manifest.ts:260`:
+ * on a dev box the hostname is the EPHEMERAL POD NAME and changes on every
+ * restart, and *"acpx calls os.hostname() nowhere in src/, which is itself the
+ * tell"*. I had seven calls to it here and every one of them printed
+ * `dev-server-85fcff8f94-wwl67`, which after a pod restart reads to a user as
+ * "my favorites moved" — from an event that changed nothing, on a store that is
+ * genuinely per-box. This resolver is the single point that decides the host
+ * agents see, survives the ssh-with-empty-env case, and covers the boxes served
+ * on a third TLD, which no hostname rule can. It is also self-describing
+ * off-box, so a line pasted elsewhere still names the box it came from.
+ */
+function boxLabel(): string {
+  return resolveAcpxUiBaseUrl(process.env);
 }
 
 // ── Formatting ───────────────────────────────────────────────────────────────
@@ -196,7 +215,7 @@ function renderFooter(
   flags: ModelsFlags,
   agentType: string | undefined,
 ): string {
-  const box = os.hostname();
+  const box = boxLabel();
   const agentNote = agentType
     ? ` · ${catalogue.models.filter((model) => isAvailableForAgent(model, agentType)).length} available to ${agentType}`
     : "";
@@ -251,10 +270,11 @@ function showDepthLines(model: CatalogueModel): string {
     return `  depths      ${depth.levels.join(", ")}${mandatory}\n  depth dflt  ${dflt}\n`;
   }
   if (depth.kind === "boolean") {
-    return (
-      `  depths      no ladder — reasoning is on/off only\n` +
-      `  depth dflt  ${depth.defaultEnabled ? "on" : "off"}\n`
-    );
+    // `null` is upstream silence, and saying "off" for it would be a claim
+    // OpenRouter never made on 109 of the 146 boolean rows.
+    const dflt =
+      depth.defaultEnabled === null ? "not stated upstream" : depth.defaultEnabled ? "on" : "off";
+    return `  depths      no ladder — reasoning is on/off only\n  depth dflt  ${dflt}\n`;
   }
   return `  depths      none — this model does not accept a reasoning setting\n  depth dflt  -\n`;
 }
@@ -385,7 +405,7 @@ async function handleFavList(flags: ModelsFlags): Promise<void> {
     return;
   }
   if (favorites.length === 0) {
-    out(`No favorite models on ${os.hostname()}. Star one: acpx models fav add <source>:<id>\n`);
+    out(`No favorite models on ${boxLabel()}. Star one: acpx models fav add <source>:<id>\n`);
     return;
   }
   for (const favorite of favorites) {
@@ -418,7 +438,7 @@ function handleLastUsedList(flags: ModelsFlags): void {
     return;
   }
   if (entries.length === 0) {
-    out(`No last-used model recorded on ${os.hostname()}.\n`);
+    out(`No last-used model recorded on ${boxLabel()}.\n`);
     return;
   }
   for (const entry of entries) {
@@ -443,7 +463,7 @@ function handleLastUsedSet(agentType: string, key: string): void {
     );
   }
   getUiPrefsStore().setLastUsedModel(agent, `${parsed.source}:${parsed.id}`);
-  out(`  last-used for ${agent} is now ${parsed.source}:${parsed.id} on ${os.hostname()}\n`);
+  out(`  last-used for ${agent} is now ${parsed.source}:${parsed.id} on ${boxLabel()}\n`);
 }
 
 async function handleFavWrite(
@@ -460,7 +480,7 @@ async function handleFavWrite(
   if (action === "rm" && parsed.source) {
     store.removeFavorite(parsed.source, parsed.id);
     out(
-      `  ☆ unstarred ${parsed.source}:${parsed.id} — ${store.listFavorites().length} favorites on ${os.hostname()}\n`,
+      `  ☆ unstarred ${parsed.source}:${parsed.id} — ${store.listFavorites().length} favorites on ${boxLabel()}\n`,
     );
     return;
   }
@@ -469,13 +489,11 @@ async function handleFavWrite(
   const model = resolveOne(catalogue, ref);
   if (action === "add") {
     store.addFavorite(model.source, model.id);
-    out(
-      `  ★ starred ${model.key} — ${store.listFavorites().length} favorites on ${os.hostname()}\n`,
-    );
+    out(`  ★ starred ${model.key} — ${store.listFavorites().length} favorites on ${boxLabel()}\n`);
   } else {
     store.removeFavorite(model.source, model.id);
     out(
-      `  ☆ unstarred ${model.key} — ${store.listFavorites().length} favorites on ${os.hostname()}\n`,
+      `  ☆ unstarred ${model.key} — ${store.listFavorites().length} favorites on ${boxLabel()}\n`,
     );
   }
 }

@@ -502,3 +502,63 @@ test("CLI: a metered OpenRouter row colliding with a plan id refuses, showing bo
   const sonnet = runCli(["models", "show", "claude-subscription:sonnet"], home);
   assert.equal(sonnet.status, 0, sonnet.stderr);
 });
+
+/**
+ * The box label is USER-VISIBLE and must be STABLE. On a dev box `os.hostname()`
+ * is the ephemeral pod name — it changes on every pod restart, and a favorites
+ * line stamped with it reads as "my favorites moved" after an event that changed
+ * nothing. The repo already ruled on this at
+ * `src/session/persistence/deletion-manifest.ts:260` ("acpx calls os.hostname()
+ * nowhere in src/, which is itself the tell").
+ */
+test("CLI: the box label is the stable acpx-ui host, never the ephemeral pod hostname", () => {
+  const home = stateHome();
+  const podHostname = os.hostname();
+  const lines = [
+    runCli(["models", "fav"], home).stdout,
+    runCli(["models", "last-used"], home).stdout,
+    runCli(["models", "fav", "add", "openrouter:moonshotai/kimi-k3"], home).stdout,
+  ];
+  for (const line of lines) {
+    assert.doesNotMatch(line, new RegExp(podHostname), `leaked the pod hostname: ${line}`);
+    assert.match(line, /acpx\./, `expected a stable acpx-ui host, got: ${line}`);
+  }
+
+  // And the resolver is honoured, so the label follows the BOX rather than the
+  // pod. A fresh state home, because the label only appears in the empty state.
+  const overridden = spawnSync(process.execPath, [CLI, "models", "fav"], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ACPX_STATE_HOME: stateHome(),
+      ACPX_UI_BASE_URL: "https://acpx.konsiq.example",
+    },
+    cwd: os.tmpdir(),
+  });
+  assert.match(overridden.stdout, /acpx\.konsiq\.example/);
+});
+
+test("CLI: `models show` reports an unstated boolean default as unstated, not as off", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-models-cli-"));
+  fs.mkdirSync(path.join(home, ".acpx"), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, ".acpx", "models-cache.json"),
+    JSON.stringify({
+      fetchedAt: new Date().toISOString(),
+      models: [
+        // Exactly the shape 109 live rows have: a reasoning object, no ladder,
+        // and NO default_enabled.
+        { id: "vendor/silent", name: "Silent", supported_parameters: ["tools"], reasoning: {} },
+      ],
+    }),
+  );
+  const show = runCli(["models", "show", "openrouter:vendor/silent"], home);
+  assert.equal(show.status, 0, show.stderr);
+  assert.match(show.stdout, /on\/off only/);
+  assert.match(show.stdout, /not stated upstream/);
+  assert.doesNotMatch(show.stdout, /depth dflt {2}off/);
+
+  const payload = JSON.parse(runCli(["models", "--json"], home).stdout) as ModelCatalogue;
+  const silent = payload.models.find((model) => model.id === "vendor/silent");
+  assert.equal(silent?.depth.kind === "boolean" ? silent.depth.defaultEnabled : "wrong", null);
+});

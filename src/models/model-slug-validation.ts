@@ -143,9 +143,9 @@ export function describeLadder(model: CatalogueModel): string {
     );
   }
   if (depth.kind === "boolean") {
-    return `${model.key} has no depth ladder — reasoning is on/off only (default: ${
-      depth.defaultEnabled ? "on" : "off"
-    })`;
+    const dflt =
+      depth.defaultEnabled === null ? "not stated upstream" : depth.defaultEnabled ? "on" : "off";
+    return `${model.key} has no depth ladder — reasoning is on/off only (default: ${dflt})`;
   }
   return `${model.key} does not accept a reasoning setting at all`;
 }
