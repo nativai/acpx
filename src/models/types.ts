@@ -153,7 +153,20 @@ export type CatalogueCounts = SelectabilityCounts & {
 
 export type ModelCatalogue = {
   /** ISO-8601 of the fetch the OpenRouter rows came from. */
-  fetchedAt: string;
+  /**
+   * ⚠️ WHEN THE ROWS WERE FETCHED, NOT WHEN A FETCH WAS LAST ATTEMPTED — and
+   * `null` when no successful fetch has ever happened.
+   *
+   * Stamping "now" on a FAILED attempt made the two freshness fields together
+   * say "fetched a second ago, and not stale" about a catalogue missing 426 of
+   * its 448 rows: the envelope failed in the REASSURING direction, with only
+   * `error` carrying the truth. A field named for when data was fetched must
+   * describe the data it travels with. The two failure modes now read
+   * coherently:
+   *   cache + failed refresh → the OLD successful time, `stale: true`, `error` set
+   *   no cache + failed      → `null`,                  `stale: false`, `error` set
+   */
+  fetchedAt: string | null;
   /** True when served from cache after a failed refresh. */
   stale: boolean;
   /** Human-readable when the upstream fetch failed. */

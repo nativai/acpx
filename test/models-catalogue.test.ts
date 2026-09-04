@@ -9,6 +9,7 @@ import {
   decorateFavorites,
   deriveBilling,
   deriveVendor,
+  loadCatalogue,
   unavailableReasonsFor,
 } from "../src/models/catalogue.js";
 import { deriveDepthDescriptor, toCanonicalLadder } from "../src/models/depth.js";
@@ -445,4 +446,72 @@ test("live: the derivation rules close on the CURRENT OpenRouter roster", async 
   t.diagnostic(
     `live roster at ${snapshot.fetchedAt}: total=${counts.total} selectable=${counts.selectable} unavailable=${counts.unavailable}`,
   );
+});
+
+/**
+ * ⚠️ `fetchedAt` DESCRIBES THE DATA IT TRAVELS WITH, NOT THE LAST ATTEMPT.
+ *
+ * Stamping "now" on a FAILED attempt made the two freshness fields together say
+ * "fetched a second ago, and not stale" about a catalogue missing 426 of its 448
+ * rows — the envelope failing in the REASSURING direction, with only `error`
+ * carrying the truth. The two failure modes must read coherently.
+ */
+test("envelope: no cache + failed fetch ⇒ fetchedAt null, stale false, error set", async () => {
+  const cachePath = tempCachePath("missing.json");
+  const catalogue = await loadCatalogue({
+    cachePath,
+    fetchModels: () => Promise.reject(new Error("fetch failed")),
+  });
+  assert.equal(
+    catalogue.fetchedAt,
+    null,
+    "nothing may claim a fetch time when nothing was fetched",
+  );
+  assert.equal(
+    catalogue.stale,
+    false,
+    "nothing was served from cache, so stale is literally false",
+  );
+  assert.match(catalogue.error ?? "", /fetch failed/);
+  // The behaviour is unchanged and correct: the harness rows still list, so the
+  // subscription path is never blocked on a third party.
+  assert.equal(catalogue.counts.openRouter.total, 0);
+  assert.equal(catalogue.counts.total, harnessNativeModels().length);
+});
+
+test("envelope: cache + failed refresh ⇒ fetchedAt is the OLD SUCCESSFUL time, stale true", async () => {
+  const cachePath = tempCachePath("cache.json");
+  fs.writeFileSync(
+    cachePath,
+    JSON.stringify({ fetchedAt: "2026-09-01T00:00:00.000Z", models: [{ id: "a/x" }] }),
+  );
+  const catalogue = await loadCatalogue({
+    cachePath,
+    fetchModels: () => Promise.reject(new Error("upstream down")),
+  });
+  // Not "now" — the time the rows in hand actually came from, which is what
+  // makes a "list 3 d old" banner true rather than a fiction.
+  assert.equal(catalogue.fetchedAt, "2026-09-01T00:00:00.000Z");
+  assert.equal(catalogue.stale, true);
+  assert.match(catalogue.error ?? "", /upstream down/);
+  assert.equal(catalogue.counts.openRouter.total, 1);
+});
+
+test("envelope: a degraded catalogue is distinguishable by error, which stale alone cannot do", async () => {
+  // C5 §4.9's two failure rows share `stale` values with healthy states, so a
+  // consumer keying a banner on `stale` alone renders healthy over a failure.
+  const noCache = await loadCatalogue({
+    cachePath: tempCachePath("missing.json"),
+    fetchModels: () => Promise.reject(new Error("dns")),
+  });
+  const healthy = await loadCatalogue({
+    cachePath: tempCachePath("fresh.json"),
+    fetchModels: async () => ({ fetchedAt: new Date().toISOString(), models: [{ id: "a/x" }] }),
+  });
+  assert.equal(
+    noCache.stale,
+    healthy.stale,
+    "stale cannot tell these two apart — that is the point",
+  );
+  assert.notEqual(noCache.error === null, healthy.error === null, "error can, and does");
 });

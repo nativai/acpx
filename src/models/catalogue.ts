@@ -250,7 +250,7 @@ export type BuildCatalogueOptions = {
 /** Merge the raw OpenRouter rows with the harness-native rows into ONE ordered list. */
 export function buildCatalogue(
   openRouterModels: OpenRouterRawModel[],
-  meta: { fetchedAt: string; stale: boolean; error: string | null },
+  meta: { fetchedAt: string | null; stale: boolean; error: string | null },
   options: BuildCatalogueOptions = {},
 ): ModelCatalogue {
   const now = options.now ?? Date.now();
@@ -286,7 +286,10 @@ export async function loadCatalogue(
   return buildCatalogue(
     result.snapshot?.models ?? [],
     {
-      fetchedAt: result.snapshot?.fetchedAt ?? new Date(now ?? Date.now()).toISOString(),
+      // No snapshot ⇒ no successful fetch has ever produced these rows, so there
+      // is no fetch time to report. `null`, never "now": see the note on
+      // ModelCatalogue.fetchedAt.
+      fetchedAt: result.snapshot?.fetchedAt ?? null,
       stale: result.stale,
       error: result.error,
     },

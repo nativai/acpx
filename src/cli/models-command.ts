@@ -220,13 +220,28 @@ function renderFooter(
     ? ` · ${catalogue.models.filter((model) => isAvailableForAgent(model, agentType)).length} available to ${agentType}`
     : "";
   const hidden = flags.all === true ? "" : " (acpx models --all to see them and why)";
-  const freshness = catalogue.stale
-    ? ` · catalogue STALE (fetched ${catalogue.fetchedAt}${catalogue.error ? `; last refresh failed: ${catalogue.error}` : ""})`
-    : ` · catalogue fetched ${catalogue.fetchedAt}`;
   return (
     `${catalogue.counts.selectable} selectable on ${box} · ${catalogue.counts.unavailable} unavailable${hidden}` +
-    `${agentNote}${freshness}\n`
+    `${agentNote}${describeFreshness(catalogue)}\n`
   );
+}
+
+/**
+ * ⚠️ A DEGRADED CATALOGUE IS `error != null`, NEVER `stale` ALONE. C5 §4.9 has
+ * two failure rows — fetch failed WITH a cache and fetch failed WITHOUT one —
+ * and `stale` cannot tell them apart, because it means only "served from cache
+ * after a failed refresh". Keying the warning on `stale` would print a healthy
+ * footer over a catalogue that never loaded.
+ */
+function describeFreshness(catalogue: ModelCatalogue): string {
+  if (catalogue.fetchedAt === null) {
+    return ` · ⚠ OpenRouter catalogue NOT LOADED${catalogue.error === null ? "" : ` (${catalogue.error})`} — harness models only`;
+  }
+  if (catalogue.stale) {
+    const why = catalogue.error === null ? "" : `; last refresh failed: ${catalogue.error}`;
+    return ` · catalogue STALE (fetched ${catalogue.fetchedAt}${why})`;
+  }
+  return ` · catalogue fetched ${catalogue.fetchedAt}`;
 }
 
 /**
