@@ -452,3 +452,53 @@ test("CLI: a search NAMES a model, so an unavailable match is shown with its rea
   assert.doesNotMatch(runCli(["models"], home).stdout, /only-batch/);
   assert.match(runCli(["models", "--all"], home).stdout, /only-batch/);
 });
+
+/**
+ * ⚠️ THE ONLY CASE D2 ACTUALLY CARES ABOUT, AND IT IS UNREACHABLE ON THE LIVE
+ * ROSTER — SO IT IS CONSTRUCTED HERE.
+ *
+ * Native ids are bare (`opus`, `sonnet`); OpenRouter ids are namespaced
+ * (`anthropic/claude-opus-5`), so no id collides across a billing-kind boundary
+ * on today's catalogue. An error shape with no test that can reach it is not
+ * shipped, it is hoped for — so this pins the plan-versus-metered refusal by
+ * pointing ACPX_MODELS_CACHE at a hand-written roster carrying a metered row
+ * whose id is exactly `opus`.
+ */
+test("CLI: a metered OpenRouter row colliding with a plan id refuses, showing both bills", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-models-cli-"));
+  fs.mkdirSync(path.join(home, ".acpx"), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, ".acpx", "models-cache.json"),
+    JSON.stringify({
+      fetchedAt: new Date().toISOString(),
+      models: [
+        {
+          id: "opus",
+          name: "Opus, metered through OpenRouter",
+          supported_parameters: ["tools"],
+          pricing: { prompt: "0.000005", completion: "0.000025" },
+        },
+      ],
+    }),
+  );
+
+  // The create path: the same weights through two doors that cost different
+  // money, so acpx refuses rather than picking one.
+  const create = spawnSync(
+    process.execPath,
+    [CLI, "--cwd", home, "--model", "opus", "claude", "sessions", "new", "--name", "probe"],
+    { encoding: "utf8", env: { ...process.env, ACPX_STATE_HOME: home }, cwd: os.tmpdir() },
+  );
+  assert.equal(create.status, 2, `expected USAGE(2), got ${create.status}: ${create.stderr}`);
+  assert.match(create.stderr, /claude-subscription:opus/);
+  assert.match(create.stderr, /openrouter:opus/);
+  assert.match(create.stderr, /on plan/);
+  assert.match(create.stderr, /\$5 \/ \$25/);
+  // No session was created, and nothing guessed on the caller's behalf.
+  assert.doesNotMatch(create.stderr, /using claude-subscription/);
+
+  // And with the same roster, a NON-colliding native alias still creates — the
+  // refusal is scoped to the collision, not to bare ids in general.
+  const sonnet = runCli(["models", "show", "claude-subscription:sonnet"], home);
+  assert.equal(sonnet.status, 0, sonnet.stderr);
+});
