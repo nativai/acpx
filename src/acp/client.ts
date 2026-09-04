@@ -60,6 +60,7 @@ import {
   resolvePermissionRequestWithDetails,
 } from "../permissions.js";
 import { getUnsupportedPromptContentMessage, textPrompt } from "../prompt-content.js";
+import { selectableConfigOptionValues } from "../session/config-option-application.js";
 import { ACTIVITY_NEUTRAL_EVENT_METHOD } from "../session/events.js";
 import { extractRuntimeSessionId } from "../session/runtime-session-id.js";
 import { buildSpawnCommandOptions } from "../spawn-command-options.js";
@@ -119,7 +120,12 @@ import {
 } from "./client-process.js";
 import { isCodexAcpCommand } from "./codex-compat.js";
 import { extractAcpError } from "./error-shapes.js";
-import { HARNESS_FACTS, harnessIdForAgentCommand } from "./harness-capabilities.js";
+import {
+  acpxRoutesModelMechanism,
+  HARNESS_FACTS,
+  harnessIdForAgentCommand,
+  modelMechanismForAgentCommand,
+} from "./harness-capabilities.js";
 import {
   applyHarnessConfigDir,
   removeHarnessConfigDir,
@@ -130,6 +136,7 @@ import {
   isAcpMessageObject,
   isSessionUpdateNotification,
 } from "./jsonrpc.js";
+import { RequestedModelUnsupportedError } from "./model-support.js";
 import type { ShimHandle } from "./openrouter-shim.js";
 import {
   formatSessionControlAcpSummary,
@@ -611,6 +618,17 @@ export class AcpClient {
    * one afternoon), so remove-on-close alone would still leak.
    */
   private harnessConfigDir?: string;
+  /**
+   * The most recent config-option advertisement this client has seen — from
+   * `session/new`, `session/load`, `session/resume`, or a
+   * `session/set_config_option` response.
+   *
+   * ⚠️ It exists so {@link setSessionModel} can DISPATCH without every caller
+   * having to carry the advertisement to it. Four call sites reached the wire
+   * directly (F-10), and asking each of them to thread an extra argument is the
+   * hand-maintained-list failure mode that produced F-9 in the first place.
+   */
+  private latestConfigOptions?: SessionConfigOption[];
   private lastEffectiveAccountMetadata?: EffectiveAccountMetadata;
   /**
    * The environment THIS session's agent process was spawned with — the exact
@@ -1305,7 +1323,9 @@ export class AcpClient {
 
     this.loadedSessionId = result.sessionId;
 
-    return toCreateSessionResult(result);
+    const created = toCreateSessionResult(result);
+    this.rememberConfigOptions(created.configOptions);
+    return created;
   }
 
   /**
@@ -1907,13 +1927,15 @@ export class AcpClient {
   ): Promise<SetSessionConfigOptionResponse> {
     const connection = this.getConnection();
     try {
-      return await this.runConnectionRequest(() =>
+      const response = await this.runConnectionRequest(() =>
         connection.setSessionConfigOption({
           sessionId,
           configId,
           value,
         }),
       );
+      this.rememberConfigOptions(response.configOptions ?? undefined);
+      return response;
     } catch (error) {
       throw maybeWrapSessionControlError(
         "session/set_config_option",
@@ -1923,7 +1945,29 @@ export class AcpClient {
     }
   }
 
+  /**
+   * Set the session's model, DISPATCHING ON THIS ADAPTER'S MECHANISM (F-10).
+   *
+   * ⚠️ THE DISPATCH LIVES HERE, NOT IN THE CALLERS, AND THAT IS THE FIX. F-9
+   * routed the create, replay and prompt-time paths and left FOUR call sites
+   * reaching this method directly — the CLI verb's live-owner path among them,
+   * which is how a `set model` on a live OpenCode session still emitted
+   * `session/set_model` and was rejected `-32602` while the descriptor said
+   * `mechanism=config-option`. Routing each caller in turn is the same
+   * hand-maintained-list failure that created F-9; this is the ONE boundary that
+   * turns "set the model" into a wire call, and it already knows which adapter it
+   * is talking to, so a caller that has never heard of mechanisms cannot get it
+   * wrong.
+   *
+   * claude / claude-pty / codex are untouched: their mechanism is not
+   * `config-option`, so they take the original path below unchanged.
+   */
   async setSessionModel(sessionId: string, modelId: string): Promise<void> {
+    if (this.routesModelAsConfigOption()) {
+      this.assertModelAdvertisedAsConfigOption(modelId);
+      await this.setSessionConfigOption(sessionId, "model", modelId);
+      return;
+    }
     const connection = this.getConnection();
     try {
       await this.runConnectionRequest(() =>
@@ -1955,6 +1999,51 @@ export class AcpClient {
       throw new Error(`Failed session/set_model for model "${modelId}": ${summary}`, {
         cause: error,
       });
+    }
+  }
+
+  /** Whether THIS adapter carries its model on a config option, and acpx routes it. */
+  private routesModelAsConfigOption(): boolean {
+    return (
+      modelMechanismForAgentCommand(this.options.agentCommand) === "config-option" &&
+      acpxRoutesModelMechanism("config-option")
+    );
+  }
+
+  /**
+   * ⚠️ VALIDATE BEFORE SENDING. A config-option harness resolves the slug against
+   * its own bundled catalogue and rejects an unknown one LOCALLY, behind an error
+   * that names nothing useful (I1: `{"name":"UnknownError"}`, the real cause only
+   * in its debug log). So acpx refuses first and writes nothing — the (b) floor
+   * F-9 restored, kept for the case that warrants it.
+   */
+  private assertModelAdvertisedAsConfigOption(modelId: string): void {
+    const option = (this.latestConfigOptions ?? []).find((entry) => entry.id === "model");
+    if (!option || option.type !== "select") {
+      throw new RequestedModelUnsupportedError(
+        `Cannot set the model to "${modelId}": this agent selects its model through ` +
+          `session/set_config_option, but it has advertised no selectable "model" option. ` +
+          `Nothing was written — the session is unchanged.`,
+      );
+    }
+    const advertised = selectableConfigOptionValues(option);
+    if (!advertised.has(modelId)) {
+      throw new RequestedModelUnsupportedError(
+        `Cannot set the model to "${modelId}": the agent did not advertise that model ` +
+          `(${advertised.size} advertised). Nothing was written — the session is unchanged.`,
+      );
+    }
+  }
+
+  /**
+   * Record an advertisement so {@link setSessionModel} can dispatch on it.
+   * An EMPTY or absent list is ignored rather than stored: an adapter that
+   * answers without options has not told us it has none, and forgetting a good
+   * advertisement would turn a routable set into a spurious refusal.
+   */
+  private rememberConfigOptions(options: SessionConfigOption[] | undefined): void {
+    if (options && options.length > 0) {
+      this.latestConfigOptions = options;
     }
   }
 
