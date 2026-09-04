@@ -88,7 +88,7 @@ export function describeDepth(depth: DepthDescriptor): string {
     return `${depth.levels.length} depths`;
   }
   if (depth.kind === "boolean") {
-    return depth.defaultEnabled ? "reasoning on/off (on)" : "reasoning on/off (off)";
+    return depth.defaultEnabled ? "on/off (on)" : "on/off (off)";
   }
   return "no reasoning";
 }

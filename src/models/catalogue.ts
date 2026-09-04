@@ -215,9 +215,7 @@ function availabilityFor(
     return {
       ok: false,
       reason: "agent-fixed-backend",
-      message:
-        capability.liveModelChangeReason ??
-        `${capability.id} sessions cannot be created with an arbitrary model id`,
+      message: `${capability.id} sessions cannot be created with an arbitrary model id`,
     };
   }
 

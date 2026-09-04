@@ -9,10 +9,16 @@
  * lands, `readHarnessCapabilities` starts returning it and the join in
  * `catalogue.ts` lights up with no other change.
  *
- * The type below is deliberately STRUCTURAL and minimal — only the two fields
- * the availability join actually reads. `HarnessCapabilities` from §8 satisfies
- * it, so pointing this at the real table is a one-line change and no field of
- * theirs is second-guessed here.
+ * ⚠️ THE TYPE BELOW IS A STRUCTURAL SUBTYPE, NOT A COPY OF THE §8 STRUCT — and
+ * that is deliberate, because §8's struct is still moving (its `fork.atIndex`
+ * gained a fourth value and its permission field was deleted on 2026-09-03
+ * evening). A hand-copied interface would compile while drifting, which is worse
+ * than no stub at all. So this declares ONLY the two fields the availability
+ * join reads, and every other field of the real table — fork, the derived
+ * live-switch booleans, the primer channel, usage reporting — is a no-op here by
+ * construction, because none of them bears on WHICH MODELS an agent can run,
+ * which is the only question this join answers. Widening it is a decision to
+ * take deliberately, not a convenience.
  */
 
 export type AvailabilityCapability = {
@@ -20,8 +26,6 @@ export type AvailabilityCapability = {
   id: string;
   /** False ⇒ the OpenRouter band is locked for this agent type (C5 §8.4). */
   acceptsArbitraryModelIds: boolean;
-  /** Shown beside the padlock when a control is refused; may be absent. */
-  liveModelChangeReason?: string | null;
 };
 
 let override: AvailabilityCapability[] | null = null;

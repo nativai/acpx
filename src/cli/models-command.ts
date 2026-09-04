@@ -18,7 +18,7 @@
  */
 
 import os from "node:os";
-import { Command } from "commander";
+import { Command, InvalidArgumentError } from "commander";
 import {
   decorateFavorites,
   findModelByKey,
@@ -32,15 +32,31 @@ import type { CatalogueModel, ModelCatalogue } from "../models/types.js";
 import { getUiPrefsStore } from "../models/ui-prefs-store.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 
-const KNOWN_SUBVERBS = ["list", "show", "fav", "star", "unstar"];
-
 type ModelsFlags = {
   search?: string;
   agent?: string;
   all?: boolean;
   json?: boolean;
+  format?: string;
   refresh?: boolean;
 };
+
+/**
+ * `--json` is shorthand for `--format json` — the same flag surface the sibling
+ * `acpx agents` verb uses, so a user who learns one has learned the other.
+ */
+function wantsJson(flags: ModelsFlags): boolean {
+  return flags.json === true || flags.format === "json";
+}
+
+/** Only the two formats this verb actually renders; `quiet` would have no meaning here. */
+function parseModelsFormat(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (normalized !== "json" && normalized !== "text") {
+    throw new InvalidArgumentError(`Invalid format "${value}". Expected one of: text, json`);
+  }
+  return normalized;
+}
 
 function out(text: string): void {
   process.stdout.write(text);
@@ -324,7 +340,7 @@ function resolveOne(catalogue: ModelCatalogue, ref: string): CatalogueModel {
 
 async function handleList(flags: ModelsFlags): Promise<void> {
   const catalogue = await readCatalogue(flags);
-  if (flags.json === true) {
+  if (wantsJson(flags)) {
     const payload = flags.search
       ? {
           ...catalogue,
@@ -344,7 +360,7 @@ async function handleList(flags: ModelsFlags): Promise<void> {
 async function handleShow(ref: string, flags: ModelsFlags): Promise<void> {
   const catalogue = await readCatalogue(flags);
   const model = resolveOne(catalogue, ref);
-  if (flags.json === true) {
+  if (wantsJson(flags)) {
     out(`${JSON.stringify(model)}\n`);
     return;
   }
@@ -353,7 +369,7 @@ async function handleShow(ref: string, flags: ModelsFlags): Promise<void> {
 
 async function handleFavList(flags: ModelsFlags): Promise<void> {
   const favorites = getUiPrefsStore().listFavorites();
-  if (flags.json === true) {
+  if (wantsJson(flags)) {
     out(`${JSON.stringify({ favorites })}\n`);
     return;
   }
@@ -364,6 +380,59 @@ async function handleFavList(flags: ModelsFlags): Promise<void> {
   for (const favorite of favorites) {
     out(`  ${favorite.key}\n`);
   }
+}
+
+/**
+ * `acpx models last-used` — the per-box sticky preselect (C5 §8.3 / §D9),
+ * spelled to mirror `fav`: the bare verb READS, the sub-verb WRITES.
+ *
+ * ⚠️ THE READ NEVER ERRORS. Nothing set is an empty map and exit 0 — a missing
+ * preselect must degrade the preselect, not take down the caller that also
+ * wanted the favorites list.
+ */
+function handleLastUsedList(flags: ModelsFlags): void {
+  let entries: { agentType: string; modelKey: string; updatedAt: string }[] = [];
+  try {
+    entries = getUiPrefsStore().listLastUsedModels();
+  } catch (error) {
+    diag(`[acpx] warning: could not read the preferences store: ${asMessage(error)}\n`);
+  }
+
+  if (wantsJson(flags)) {
+    const map: Record<string, string> = {};
+    for (const entry of entries) {
+      map[entry.agentType] = entry.modelKey;
+    }
+    out(`${JSON.stringify({ lastUsedModelKey: map, entries })}\n`);
+    return;
+  }
+  if (entries.length === 0) {
+    out(`No last-used model recorded on ${os.hostname()}.\n`);
+    return;
+  }
+  for (const entry of entries) {
+    out(`  ${pad(entry.agentType, 14)} ${entry.modelKey}   (${entry.updatedAt})\n`);
+  }
+}
+
+function handleLastUsedSet(agentType: string, key: string): void {
+  const agent = agentType.trim();
+  if (agent === "") {
+    failUsage(
+      "[acpx] an agent type is required: acpx models last-used set <agent-type> <source>:<id>",
+    );
+  }
+  // The key is (source, id) — the same unit of choice a favorite uses, and the
+  // reason a bare id is refused here as it is everywhere else.
+  const parsed = parseModelRef(key);
+  if (parsed.source === null || parsed.id.trim() === "") {
+    failUsage(
+      `[acpx] "${key}" is not a model key. The shape is <source>:<id>, where the id may contain "/" —\n` +
+        `  e.g. openrouter:moonshotai/kimi-k3, claude-subscription:opus, chatgpt:gpt-5.6-sol.`,
+    );
+  }
+  getUiPrefsStore().setLastUsedModel(agent, `${parsed.source}:${parsed.id}`);
+  out(`  last-used for ${agent} is now ${parsed.source}:${parsed.id} on ${os.hostname()}\n`);
 }
 
 async function handleFavWrite(
@@ -407,7 +476,8 @@ function addListFlags(command: Command): Command {
     .option("--search <query>", "Filter with the same matcher the picker uses (token-AND)")
     .option("--agent <type>", "Only what THIS agent type can run")
     .option("--all", "Include unavailable models, each with its reason (default: hidden)")
-    .option("--json", "Emit the machine-readable catalogue payload on stdout")
+    .option("--json", "Shorthand for --format json")
+    .option("--format <fmt>", "Output format: text, json", parseModelsFormat)
     .option("--refresh", "Force a catalogue fetch instead of serving the cache");
 }
 
@@ -439,7 +509,8 @@ export function registerModelsCommand(parent: Command, _config: ResolvedAcpxConf
   const favCommand = modelsCommand
     .command("fav")
     .description("List this box's favorite models (subcommands: add, rm)")
-    .option("--json", "Emit the favorites as JSON")
+    .option("--json", "Shorthand for --format json")
+    .option("--format <fmt>", "Output format: text, json", parseModelsFormat)
     .action(async function (this: Command, flags: ModelsFlags) {
       await handleFavList(flags);
     });
@@ -462,18 +533,38 @@ export function registerModelsCommand(parent: Command, _config: ResolvedAcpxConf
       await handleFavWrite("rm", ref, {});
     });
 
-  // Default action (no subcommand): behave like `models list`. A TYPO'd subverb
-  // must NOT reach this silently — before `models` existed it would have been
-  // parsed as a prompt to an agent named "models", and a create-a-delivery
-  // failure mode is exactly what a typo must not have.
-  modelsCommand.action(async function (this: Command, flags: ModelsFlags, command: Command) {
-    const extra = command.args.filter((arg) => !arg.startsWith("-"));
-    if (extra.length > 0) {
-      failUsage(
-        `[acpx] unknown "models" subcommand "${extra[0]}". Valid: ${KNOWN_SUBVERBS.join(", ")}.\n` +
-          `  try: acpx models --search ${extra[0]}`,
-      );
-    }
+  const lastUsedCommand = modelsCommand
+    .command("last-used")
+    .description(
+      "Show this box's last-used model per agent type (the sticky preselect); subcommand: set",
+    )
+    .option("--json", "Shorthand for --format json")
+    .option("--format <fmt>", "Output format: text, json", parseModelsFormat)
+    .action(function (this: Command, flags: ModelsFlags) {
+      handleLastUsedList(flags);
+    });
+
+  lastUsedCommand
+    .command("set")
+    .description("Record the last-used model for an agent type (idempotent)")
+    .argument("<agent-type>", "Agent type, e.g. claude / codex")
+    .argument("<key>", "<source>:<id>")
+    .action(function (this: Command, agentType: string, key: string) {
+      handleLastUsedSet(agentType, key);
+    });
+
+  // Default action (no subcommand): behave like `models list`.
+  //
+  // A TYPO'd subverb must NEVER reach this silently — before `models` existed,
+  // `acpx models bogusverb` was parsed as a PROMPT to an agent named "models",
+  // and a typo that turns into a delivery is the failure mode this command
+  // exists to close. MEASURED on this build: commander refuses the excess
+  // argument itself — `acpx models bogusverb` exits 1 with
+  // "error: too many arguments for 'models'" and prints the valid Commands list
+  // (list / show / fav). That is the loud failure, so there is deliberately no
+  // hand-rolled check here duplicating it; the test pins the behaviour, not this
+  // comment.
+  modelsCommand.action(async function (this: Command, flags: ModelsFlags) {
     await handleList(flags);
   });
 }

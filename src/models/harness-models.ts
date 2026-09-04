@@ -22,6 +22,26 @@ export type NativeModel = CatalogueModel & {
   agentTypes: string[];
 };
 
+/**
+ * Which agent types can spawn a harness-native source. This is acpx's OWN
+ * knowledge — it is what makes `--agent claude` hide the Codex families even
+ * before the harness-capability table exists, without guessing at any capability
+ * value. `null` = not a native source (i.e. OpenRouter), where the question is
+ * the capability table's to answer, not this module's.
+ */
+export function nativeAgentTypesForSource(source: ModelSource): string[] | null {
+  if (source === "claude-subscription" || source === "claude-home") {
+    return ["claude"];
+  }
+  if (source === "claude-pty") {
+    return ["claude-pty"];
+  }
+  if (source === "chatgpt") {
+    return ["codex"];
+  }
+  return null;
+}
+
 const CLAUDE_LADDER = toCanonicalLadder(["low", "medium", "high", "xhigh", "max"]);
 const CODEX_LADDER = toCanonicalLadder(["low", "medium", "high", "xhigh", "max", "ultra"]);
 

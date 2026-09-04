@@ -6,6 +6,7 @@
  * only testable if there is exactly one implementation of both.
  */
 
+import { nativeAgentTypesForSource } from "./harness-models.js";
 import type { CatalogueModel, ModelSource } from "./types.js";
 
 /** Ranking tiers, best first (C5 D4). */
@@ -168,8 +169,14 @@ export function isAvailableForAgent(model: CatalogueModel, agentType: string | u
   if (!model.selectable) {
     return false;
   }
-  if (!agentType) {
+  if (agentType === undefined) {
     return true;
+  }
+  // A harness-native row belongs to exactly the agent types that can spawn it —
+  // acpx's own knowledge, so this holds even with no capability table.
+  const nativeAgents = nativeAgentTypesForSource(model.source);
+  if (nativeAgents !== null) {
+    return nativeAgents.includes(agentType);
   }
   const availability = model.availability[agentType];
   // An EMPTY availability map means acpx has no capability table yet — that is

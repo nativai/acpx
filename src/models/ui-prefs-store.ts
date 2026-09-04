@@ -60,6 +60,8 @@ export type UiPrefsStore = {
   /** Idempotent. */
   removeFavorite(source: string, id: string): void;
   getLastUsedModel(agentType: string): LastUsedModel | undefined;
+  /** The whole per-agent-type map. Empty when nothing has been recorded yet. */
+  listLastUsedModels(): LastUsedModel[];
   /** Written on SUCCESSFUL session creation only (C4 §7.5). */
   setLastUsedModel(agentType: string, modelKey: string, updatedAt?: number): void;
   close(): void;
@@ -143,7 +145,18 @@ export function openUiPrefsStore(dbPath: string = defaultUiPrefsDbPath()): UiPre
     setLastUsed: db.prepare(
       "INSERT OR REPLACE INTO last_used_model (agent_type, model_key, updated_at) VALUES (?, ?, ?)",
     ),
+    listLastUsed: db.prepare(
+      "SELECT agent_type, model_key, updated_at FROM last_used_model ORDER BY agent_type ASC",
+    ),
   } satisfies Record<string, StatementSync>;
+
+  function toLastUsed(row: Record<string, unknown>): LastUsedModel {
+    return {
+      agentType: String(row.agent_type),
+      modelKey: String(row.model_key),
+      updatedAt: toIso(Number(row.updated_at)),
+    };
+  }
 
   function readFavorites(): FavoriteModel[] {
     return statements.listFavorites.all().map((row) => {
@@ -168,14 +181,10 @@ export function openUiPrefsStore(dbPath: string = defaultUiPrefsDbPath()): UiPre
     },
     getLastUsedModel(agentType) {
       const row = statements.getLastUsed.get(agentType);
-      if (!row) {
-        return undefined;
-      }
-      return {
-        agentType: String(row.agent_type),
-        modelKey: String(row.model_key),
-        updatedAt: toIso(Number(row.updated_at)),
-      };
+      return row === undefined ? undefined : toLastUsed(row);
+    },
+    listLastUsedModels() {
+      return statements.listLastUsed.all().map((row) => toLastUsed(row));
     },
     setLastUsedModel(agentType, modelKey, updatedAt = Date.now()) {
       statements.setLastUsed.run(agentType, modelKey, updatedAt);
