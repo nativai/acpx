@@ -58,6 +58,7 @@ import {
 } from "./flags.js";
 import { registerModelsCommand } from "./models-command.js";
 import { registerProfilesCommand } from "./profiles-command.js";
+import { registerProvidersCommand } from "./providers-command.js";
 import { DEFAULT_CLOSE_DRAIN_TIMEOUT_MS } from "./session/contracts.js";
 import { registerStatusCommand } from "./status-command.js";
 import { registerSubscriptionsCommand } from "./subscriptions-command.js";
@@ -165,8 +166,52 @@ export function registerSessionsCommand(
     .option("--dry-run", "List what would be repaired and write nothing")
     .option(
       "--backup-dir <dir>",
-      "Where to copy each record before rewriting it (default: ~/.acpx/backups/account-seam-repair-<ts>)",
+      "Where to copy each record before rewriting it. Default: " +
+        "<root>/.acpx/backups/account-seam-repair-<ts>, where <root> is $ACPX_STATE_HOME when " +
+        "that is set and $HOME otherwise — i.e. the HOME OF THE PROCESS THAT RAN THE SWEEP, " +
+        "which under an isolated HOME is NOT your own. The run prints the directory it actually " +
+        "used; read that, not this.",
       (value: string) => parseNonEmptyValue("Backup dir", value),
+    )
+    // ⚠️ THIS HELP TEXT IS A BUG FIX, NOT DOCUMENTATION POLISH. On 2026-09-04 TWO
+    // independent readers each concluded that a real, correct, fully-evidenced
+    // production sweep had NEVER RUN — because they looked in ~/.acpx/backups,
+    // found nothing, and the backups were elsewhere. The sweep was fine; its
+    // findability was not. Two readers making the identical wrong inference is a
+    // design signal, not two mistakes.
+    //
+    // MEASURED ON THIS BOX 2026-09-04, which is why the wording below says $HOME
+    // rather than "~": `/home/node/.acpx/backups` DOES NOT EXIST, while
+    // `/workspace/hp/home/.acpx/backups/account-seam-repair-<ts>` holds three
+    // real backup sets. `defaultBackupDir()` resolves
+    // `process.env.ACPX_STATE_HOME || os.homedir()`, and `os.homedir()` honours
+    // $HOME — so under any isolated HOME (every rig, every sandboxed slot) the
+    // old "(default: ~/.acpx/backups/…)" was simply false, and "~" is precisely
+    // the token a reader resolves against their OWN home.
+    // https://acpx.devbox.nativai.de/?brick=27cdb9fa
+    .addHelpText(
+      "after",
+      [
+        "",
+        "Backups:",
+        "  Every rewritten record is copied to the backup dir FIRST, and the copy is read back",
+        "  and compared before the rewrite — so a backup that did not land fails the record",
+        "  loudly instead of leaving it unrecoverable. The run prints `backups: <dir>`; that",
+        "  line is authoritative, the default above is only where it will be when you pass no flag.",
+        "",
+        "Restoring a record from a backup — a HAND COPY, and know what it does not give you:",
+        "    acpx sessions owner-status <record-id>      # MUST show no live owner first",
+        "    cp <backup-dir>/<urlencoded-record-id>.json <sessions-dir>/",
+        "  where <sessions-dir> is $ACPX_STATE_HOME/.acpx/sessions (or ~/.acpx/sessions), and the",
+        "  file name is the record id URL-encoded — the backup already carries the right name.",
+        "  ⚠️ THE SWEEP'S TWO SAFETY PROPERTIES DO NOT COME WITH THAT cp, AND THERE IS NO",
+        "  RESTORE MODE THAT WOULD GIVE THEM TO YOU. When the sweep writes a record it writes",
+        "  ATOMICALLY (unique tmp file + rename, so no reader ever sees a partial record) and it",
+        "  REFUSES any record with a live queue owner. A cp is neither: it can be read half-written,",
+        "  and against a live owner it will be silently overwritten by that owner's next checkpoint",
+        "  — the restore looks like it worked and is gone minutes later. Hence the owner-status",
+        "  check first; it is the only guard you get.",
+      ].join("\n"),
     )
     .action(async function (this: Command, flags: { dryRun?: boolean; backupDir?: string }) {
       await handleSessionsRepairAccountSeam(flags, this, config);
@@ -736,6 +781,7 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
   registerProfilesCommand(program, config);
   registerAgentsCommand(program, config);
   registerModelsCommand(program, config);
+  registerProvidersCommand(program, config);
   registerConfigCommand(program, config);
   registerFlowCommand(program, config);
 }

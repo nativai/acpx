@@ -39,6 +39,7 @@ import {
 import { resolveBuiltInAgentLaunch } from "../agent-registry.js";
 import { TimeoutError, withTimeout } from "../async-control.js";
 import type { ProvisioningWarningBreadcrumb } from "../config/os-harness-provisioning.js";
+import { applyBoxProviderEnv } from "../config/providers.js";
 import {
   AgentDisconnectedError,
   AgentSpawnError,
@@ -840,6 +841,11 @@ export class AcpClient {
         this.latestProvisioningWarning = warning;
       },
     );
+    // Box-scoped provider credentials (~/.acpx/providers.json) — adapter-agnostic,
+    // and a strict fallback: it never overwrites a variable that is already set.
+    // Deliberately BEFORE applyProfileEnv for predictable ordering; the two do not
+    // collide (see applyBoxProviderEnv's contract — on Claude the key is inert).
+    applyBoxProviderEnv(spawnOptions.env);
     await this.applyProfileEnv(spawnOptions.env);
     return {
       spawnCommand,

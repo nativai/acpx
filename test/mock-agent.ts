@@ -72,6 +72,13 @@ type MockAgentOptions = {
   loadReplayText: string;
   ignoreSigterm: boolean;
   envDumpFile?: string;
+  /**
+   * Extra environment variable NAMES to include in the env dump, beyond the
+   * ACPX_* / INDEPENDENT_CLAUDE_* / CLAUDE_CONFIG_DIR default. Needed because the
+   * default is an ALLOWLIST, so a test asserting on any other name silently
+   * reads `undefined` — which looks exactly like "acpx did not set it".
+   */
+  envDumpExtra?: string[];
   operationLogFile?: string;
   claudeAgentAcp: boolean;
   expectedForkMeta?: unknown;
@@ -404,6 +411,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let ignoreSigterm = false;
   let hangOnNewSession = false;
   let envDumpFile: string | undefined;
+  let envDumpExtra: string[] | undefined;
   let operationLogFile: string | undefined;
   let claudeAgentAcp = false;
   let expectedForkMeta: unknown;
@@ -533,6 +541,15 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    if (token === "--env-dump-extra") {
+      envDumpExtra = parseOptionValue(argv, index + 1, token)
+        .split(",")
+        .map((name) => name.trim())
+        .filter((name) => name.length > 0);
+      index += 1;
+      continue;
+    }
+
     if (token === "--operation-log") {
       operationLogFile = parseOptionValue(argv, index + 1, token);
       index += 1;
@@ -610,6 +627,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     loadReplayText,
     ignoreSigterm,
     envDumpFile,
+    ...(envDumpExtra !== undefined ? { envDumpExtra } : {}),
     operationLogFile,
     claudeAgentAcp,
     expectedForkMeta,
@@ -1601,12 +1619,14 @@ if (mockAgentOptions.envDumpFile) {
   // what acpx injected (ACPX_TASK_FOLDER, ACPX_AGENT_FOLDER, …). Also capture
   // the claude-pty bridge selector env (INDEPENDENT_CLAUDE_*) and
   // CLAUDE_CONFIG_DIR so tests can assert both presence AND absence.
+  const extra = new Set(mockAgentOptions.envDumpExtra ?? []);
   const acpxEnv: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
     const captured =
       key.startsWith("ACPX_") ||
       key.startsWith("INDEPENDENT_CLAUDE_") ||
-      key === "CLAUDE_CONFIG_DIR";
+      key === "CLAUDE_CONFIG_DIR" ||
+      extra.has(key);
     if (captured && typeof value === "string") {
       acpxEnv[key] = value;
     }
