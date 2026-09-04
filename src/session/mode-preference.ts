@@ -333,11 +333,25 @@ export function syncAdvertisedModelState(
  * that stops getting a config dir must not keep advertising a path.
  */
 export function setHarnessConfigDir(record: SessionRecord, dir: string | undefined): void {
-  const acpx = cloneSessionAcpxState(record.acpx) ?? {};
   const normalized = dir?.trim();
+  // ⚠️ NOTHING TO WRITE ⇒ TOUCH NOTHING (RS-14). Only opencode and pi ever get a
+  // config dir, so this runs with `undefined` on every claude / claude-pty /
+  // codex spawn — and those records must not gain the key, be it a value, a
+  // `null` or an `{}`. An unconditional `record.acpx = clone ?? {}` would give a
+  // record whose `acpx` was previously ABSENT an empty object, changing the
+  // record SHAPE for three harnesses the programme requires untouched. Record
+  // shape is consumed by parse, serialize, the index projection and the UI, so
+  // "we added a field but it is empty for you" is still a behaviour change.
+  if (!normalized && record.acpx?.harness_config_dir === undefined) {
+    return;
+  }
+  const acpx = cloneSessionAcpxState(record.acpx) ?? {};
   if (normalized) {
     acpx.harness_config_dir = normalized;
   } else {
+    // A spawn that wrote no dir CLEARS a previous value rather than leaving it:
+    // a stale path that still resolves is a silent wrong answer, which is worse
+    // than a miss (see AgentLifecycleSnapshot.harnessConfigDir).
     delete acpx.harness_config_dir;
   }
   record.acpx = acpx;

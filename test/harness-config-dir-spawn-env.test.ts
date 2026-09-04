@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -67,7 +68,16 @@ const EXPECTED: Record<string, string[]> = {
   pi: ["PI_CODING_AGENT_DIR"],
 };
 
-async function spawnAndDumpEnv(harness: string): Promise<Record<string, string>> {
+/**
+ * ⚠️ THE CONFIG DIR DOES NOT OUTLIVE THE CLIENT ANY MORE. `close()` removes it
+ * (brick 433f6bf8), so anything that inspects the directory must do so through
+ * `beforeClose`, while the spawn is still open. Two tests in this file failed
+ * exactly this way when remove-on-close landed — which is the fast path working.
+ */
+async function spawnAndDumpEnv(
+  harness: string,
+  beforeClose?: (dump: Record<string, string>) => void | Promise<void>,
+): Promise<Record<string, string>> {
   const scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "hp-b3-rs13-cwd-"));
   const envDumpPath = path.join(scratchDir, "env-dump.json");
   const linkDir = path.join(scratchDir, HARNESS_DIR_TOKENS[harness]);
@@ -87,7 +97,9 @@ async function spawnAndDumpEnv(harness: string): Promise<Record<string, string>>
   try {
     await client.start();
     await client.createSession();
-    return JSON.parse(await fs.readFile(envDumpPath, "utf8")) as Record<string, string>;
+    const dump = JSON.parse(await fs.readFile(envDumpPath, "utf8")) as Record<string, string>;
+    await beforeClose?.(dump);
+    return dump;
   } finally {
     await client.close().catch(() => {});
     await fs.rm(scratchDir, { recursive: true, force: true });
@@ -165,17 +177,20 @@ test("RS-13 control: the probe CAN see these names — a planted value is captur
 
 test("the config dir opencode receives is REAL — the files exist where the env points", async () => {
   // The env var alone proves a name was set, not that a primer was written.
-  const dump = await spawnAndDumpEnv("opencode");
-  const configDir = dump.OPENCODE_CONFIG_DIR;
-  assert.ok(configDir, "OPENCODE_CONFIG_DIR unset");
-  const configPath = path.join(configDir, "opencode.json");
-  const raw = await fs.readFile(configPath, "utf8");
-  const config = JSON.parse(raw) as Record<string, unknown>;
-  assert.ok(config, `opencode.json at ${configPath} did not parse`);
-  // XDG_CONFIG_HOME must be the PARENT — OpenCode merges both, so a mismatch
-  // silently de-isolates the session (I1 R15).
-  assert.equal(dump.XDG_CONFIG_HOME, path.dirname(configDir));
-  await fs.rm(path.dirname(configDir), { recursive: true, force: true });
+  // Inspected via beforeClose: close() now removes the directory.
+  let checked = false;
+  await spawnAndDumpEnv("opencode", async (dump) => {
+    const configDir = dump.OPENCODE_CONFIG_DIR;
+    assert.ok(configDir, "OPENCODE_CONFIG_DIR unset");
+    const configPath = path.join(configDir, "opencode.json");
+    const config = JSON.parse(await fs.readFile(configPath, "utf8")) as Record<string, unknown>;
+    assert.ok(config, `opencode.json at ${configPath} did not parse`);
+    // XDG_CONFIG_HOME must be the PARENT — OpenCode merges both, so a mismatch
+    // silently de-isolates the session (I1 R15).
+    assert.equal(dump.XDG_CONFIG_HOME, path.dirname(configDir));
+    checked = true;
+  });
+  assert.equal(checked, true, "beforeClose never ran — this row examined nothing");
 });
 
 test("acpx does NOT provision a catalogue entry for a pinned model today", async () => {
@@ -193,20 +208,81 @@ test("acpx does NOT provision a catalogue entry for a pinned model today", async
   //
   // Same asymmetry that kept Pi's models-store.json out: provisioning buys
   // nothing while arbitrary ids are declared unsupported, and risks that.
-  const dump = await spawnAndDumpEnv("opencode");
-  const configDir = dump.OPENCODE_CONFIG_DIR;
-  assert.ok(configDir, "OPENCODE_CONFIG_DIR unset — nothing to inspect");
-  const config = JSON.parse(
-    await fs.readFile(path.join(configDir, "opencode.json"), "utf8"),
-  ) as Record<string, unknown>;
+  let checked = false;
+  await spawnAndDumpEnv("opencode", async (dump) => {
+    const configDir = dump.OPENCODE_CONFIG_DIR;
+    assert.ok(configDir, "OPENCODE_CONFIG_DIR unset — nothing to inspect");
+    const config = JSON.parse(
+      await fs.readFile(path.join(configDir, "opencode.json"), "utf8"),
+    ) as Record<string, unknown>;
 
-  // CONTROL: the file is real and the writer ran, so `provider` being absent is
-  // a decision rather than an unwritten file.
-  assert.ok(config, "opencode.json did not parse");
-  assert.equal(
-    config.provider,
-    undefined,
-    "a catalogue fragment was written for an already-catalogued model",
-  );
-  await fs.rm(path.dirname(configDir), { recursive: true, force: true });
+    // CONTROL: the file is real and the writer ran, so `provider` being absent is
+    // a decision rather than an unwritten file.
+    assert.ok(config, "opencode.json did not parse");
+    assert.equal(
+      config.provider,
+      undefined,
+      "a catalogue fragment was written for an already-catalogued model",
+    );
+    checked = true;
+  });
+  assert.equal(checked, true, "beforeClose never ran — this row examined nothing");
+});
+
+test("F-8: a spawn with NO sessionContext still gets a UNIQUE dir, never a shared literal", async () => {
+  // ⚠️ THE CASE THE MERGED VERSION OF THIS FILE COULD NOT SEE. Every test above
+  // HAND-SUPPLIES `sessionContext: { acpxRecordId: … }`, so the suite only ever
+  // exercised the branch where the id IS present — the harness provided what the
+  // real run does not. On the real `sessions new` path `acpxRecordId` is EMPTY
+  // (`creationSessionContext` sets `""`, because the CLI record id IS the
+  // adapter's own session/new id), so the literal fallback fired on every create
+  // and two sessions shared `/tmp/acpx-<harness>-session`.
+  //
+  // The leaked `/tmp/acpx-pi-rec-b3-rs13-pi` from the old test is how we know it
+  // never ran the real path.
+  const dirs: string[] = [];
+  for (let i = 0; i < 2; i += 1) {
+    const scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "hp-b3-f8-nocontext-"));
+    const envDumpPath = path.join(scratchDir, "env-dump.json");
+    const linkDir = path.join(scratchDir, "opencode-ai");
+    await fs.mkdir(linkDir, { recursive: true });
+    const mockLink = path.join(linkDir, "mock-agent.js");
+    await fs.symlink(MOCK_AGENT_PATH, mockLink);
+
+    // NO sessionContext AT ALL — exactly what the create spawn effectively has.
+    const client = new AcpClient({
+      agentCommand:
+        `node ${JSON.stringify(mockLink)} ` +
+        `--env-dump-file ${JSON.stringify(envDumpPath)} ` +
+        `--env-dump-extra ${CONFIG_DIR_NAMES.join(",")}`,
+      cwd: scratchDir,
+      permissionMode: "approve-reads",
+    });
+    try {
+      await client.start();
+      await client.createSession();
+      const dump = JSON.parse(await fs.readFile(envDumpPath, "utf8")) as Record<string, string>;
+      assert.ok(Object.keys(dump).length > 5, "control: the child must have run");
+      const configDir = dump.OPENCODE_CONFIG_DIR;
+      assert.ok(configDir, "no config dir was created without a sessionContext");
+      dirs.push(path.dirname(configDir));
+    } finally {
+      await client.close().catch(() => {});
+      await fs.rm(scratchDir, { recursive: true, force: true });
+    }
+  }
+
+  // THE ASSERTION: two context-less spawns get DIFFERENT directories.
+  assert.notEqual(dirs[0], dirs[1], "two spawns shared a directory — the literal fallback is back");
+  for (const dir of dirs) {
+    assert.match(path.basename(dir), /^acpx-opencode-/, "the dir prefix changed");
+    assert.doesNotMatch(
+      path.basename(dir),
+      /^acpx-opencode-session$/,
+      "the shared literal directory name is back",
+    );
+    // close() removed it — remove-on-close is the fast path (the sweep is the
+    // guarantee), and this asserts the fast path actually fires.
+    assert.equal(existsSync(dir), false, `close() left ${dir} behind`);
+  }
 });

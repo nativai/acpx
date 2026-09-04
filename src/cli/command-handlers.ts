@@ -11,6 +11,7 @@ import {
   resolveEffectiveForkIndex,
   resolveHarnessCapabilities,
 } from "../acp/harness-capabilities.js";
+import { pruneOrphanHarnessConfigDirs } from "../acp/harness-config-dir.js";
 import {
   listBuiltInAgents,
   resolveAgentCommand,
@@ -3645,6 +3646,64 @@ export async function handleSessionsPrune(
   }
 
   render.printPruneResultByFormat(result, globalFlags.format, scope);
+  await sweepOrphanHarnessConfigDirs(session, flags.dryRun === true, globalFlags.verbose === true);
+}
+
+/**
+ * Sweep per-session harness config dirs whose session no longer exists
+ * (brick 433f6bf8), on the back of `sessions prune` — the verb that already
+ * means "clean up after closed sessions".
+ *
+ * ⚠️ WHY A SWEEP AND NOT JUST REMOVE-ON-CLOSE. `AcpClient.close()` removes the
+ * directory it wrote, but **close is not guaranteed to run**: an owner death, a
+ * pod eviction or a `kill -9` skips it entirely, and this programme saw two owner
+ * deaths in a single afternoon. Remove-on-close is the fast path; this is the
+ * guarantee. It matters more than it looks because the directory is per-SPAWN,
+ * not per-session — a resumed session writes another one.
+ *
+ * ⚠️ THE POPULATION IS ALWAYS PRINTED under `--verbose`, so a zero reads as
+ * NOT RUN rather than as clean. A sweep that reports "removed 0" having scanned
+ * nothing is indistinguishable from a sweep that found nothing to do, and only
+ * one of those is good news.
+ *
+ * ⚠️ A DRY RUN SWEEPS NOTHING. `--dry-run` promises no deletion, and a preview
+ * that deletes something the real run would is worse than no preview.
+ */
+async function sweepOrphanHarnessConfigDirs(
+  session: Awaited<ReturnType<typeof loadSessionModule>>,
+  dryRun: boolean,
+  verbose: boolean,
+): Promise<void> {
+  if (dryRun) {
+    return;
+  }
+  try {
+    // Every session acpx still knows about — closed ones included, because a
+    // closed record can still be resumed. Only ids with NO record are orphans.
+    const listed = await session.listSessions();
+    const live = new Set(
+      listed.flatMap((entry) =>
+        [entry.acpxRecordId, entry.acpSessionId].filter(
+          (id): id is string => typeof id === "string" && id.length > 0,
+        ),
+      ),
+    );
+    const swept = pruneOrphanHarnessConfigDirs({ liveSessionIds: live });
+    if (verbose) {
+      process.stderr.write(
+        `[acpx] harness config dirs: scanned=${swept.scanned} removed=${swept.removed.length} ` +
+          `retained=${swept.retained} (scanned=0 means NOT RUN, not clean)\n`,
+      );
+    }
+  } catch (error) {
+    // Never fail a prune because the tidy-up failed — the sessions are already
+    // deleted by this point and the sweep runs again next time.
+    if (verbose) {
+      process.stderr.write(
+        `[acpx] harness config dir sweep skipped: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
+  }
 }
 
 /**

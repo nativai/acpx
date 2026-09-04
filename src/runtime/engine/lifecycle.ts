@@ -1,5 +1,6 @@
 import type { AgentLifecycleSnapshot } from "../../acp/client.js";
 import { copyLoggedMessageCount } from "../../session/messages-log-bookkeeping.js";
+import { setHarnessConfigDir } from "../../session/mode-preference.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
 import { messagesHaveRealAgentTurn } from "../../session/synthetic-messages.js";
 import type { SessionConversation, SessionRecord } from "../../types.js";
@@ -14,6 +15,10 @@ export function applyLifecycleSnapshotToRecord(
 
   record.pid = snapshot.running ? snapshot.pid : undefined;
   record.agentStartedAt = snapshot.startedAt;
+  // The config-dir CHANNEL, refreshed at every spawn/reconnect (brick fa2e54ec).
+  // See AgentLifecycleSnapshot.harnessConfigDir for why it must not be written
+  // once at create.
+  setHarnessConfigDir(record, snapshot.harnessConfigDir);
   if (snapshot.provisioningWarning) {
     const acpx = record.acpx ?? {};
     const sessionOptions = { ...acpx.session_options };

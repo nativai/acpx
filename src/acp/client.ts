@@ -413,6 +413,21 @@ export type AgentExitInfo = {
 };
 
 export type AgentLifecycleSnapshot = {
+  /**
+   * The per-session harness config dir THIS spawn wrote (brick fa2e54ec).
+   *
+   * ⚠️ IT RIDES THE LIFECYCLE SNAPSHOT ON PURPOSE. The directory is per-SPAWN and
+   * is rewritten at create AND at every resume, so a path recorded only at create
+   * is STALE after the first resume — and it still EXISTS, so a reader resolves
+   * the wrong directory instead of missing. That silent-wrong-answer is worse
+   * than not finding it, and it is the same shape as the F-8 defect one level up.
+   *
+   * Every site that refreshes lifecycle state already runs at exactly the moments
+   * the dir is rewritten, so carrying it here means a new spawn site cannot forget
+   * it — as opposed to a hand-maintained list of call sites, which is the failure
+   * mode that ate `depth_projection` in the clone allowlist.
+   */
+  harnessConfigDir?: string;
   pid?: number;
   startedAt?: string;
   running: boolean;
@@ -677,6 +692,7 @@ export class AcpClient {
       provisioningWarning: this.latestProvisioningWarning
         ? { ...this.latestProvisioningWarning }
         : undefined,
+      harnessConfigDir: this.harnessConfigDir,
     };
   }
 

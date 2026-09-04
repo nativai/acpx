@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,8 +8,15 @@ import {
   HARNESS_FACTS,
   HARNESS_IDS,
 } from "../src/acp/harness-capabilities.js";
-import { applyHarnessConfigDir } from "../src/acp/harness-config-dir.js";
+import {
+  applyHarnessConfigDir,
+  pruneOrphanHarnessConfigDirs,
+  removeHarnessConfigDir,
+} from "../src/acp/harness-config-dir.js";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
+import { cloneSessionAcpxState } from "../src/session/conversation-model.js";
+import { setHarnessConfigDir } from "../src/session/mode-preference.js";
+import type { SessionRecord } from "../src/types.js";
 
 // B3 deliverable 5 — ONE per-session config dir serving primer + model pin +
 // catalogue fragment, GATED PER HARNESS off the descriptor.
@@ -269,3 +276,201 @@ test("two sessions get two different directories", () => {
     assert.notEqual(a.XDG_CONFIG_HOME, b.XDG_CONFIG_HOME);
   });
 });
+
+// ── F-8 (brick 161294ce): no shared literal, and a blank id is REFUSED ───────
+
+test("a BLANK session id is REFUSED — no dir, no env, no shared literal", () => {
+  // ⚠️ THE DEFECT THIS PINS SHIPPED. The call site read
+  // `acpxRecordId?.trim() || "session"`, and on the real `sessions new` path the
+  // record id is EMPTY at adapter-spawn time (`creationSessionContext` sets
+  // `acpxRecordId: ""`, because the CLI record id IS the adapter's own
+  // session/new id and cannot exist before the spawn that produces it). So the
+  // literal fired on EVERY create and two distinct sessions were handed the same
+  // `/tmp/acpx-<harness>-session`.
+  //
+  // A fallback that silently de-isolates is worse than an error, so there is no
+  // fallback: a blank id refuses.
+  withTempRoot((root) => {
+    for (const id of ["opencode", "pi"] as const) {
+      for (const blank of ["", "   "]) {
+        const env: NodeJS.ProcessEnv = {};
+        const plan = applyHarnessConfigDir({
+          env,
+          agentCommand: AGENT_REGISTRY[id],
+          sessionId: blank,
+          primer: "P",
+          rootDir: root,
+        });
+        assert.equal(plan, undefined, `${id}: a blank id produced a plan`);
+        assert.deepEqual(Object.keys(env), [], `${id}: a blank id set env vars`);
+      }
+    }
+    // NOTHING was written — and the directory listing is the evidence, not the
+    // absence of a return value.
+    assert.deepEqual(readdirSync(root), []);
+  });
+});
+
+test("two spawns of the SAME session id share a dir; different ids never do", () => {
+  withTempRoot((root) => {
+    const a: NodeJS.ProcessEnv = {};
+    const b: NodeJS.ProcessEnv = {};
+    const c: NodeJS.ProcessEnv = {};
+    const mk = (env: NodeJS.ProcessEnv, sessionId: string) =>
+      applyHarnessConfigDir({
+        env,
+        agentCommand: AGENT_REGISTRY.opencode,
+        sessionId,
+        primer: "P",
+        rootDir: root,
+      });
+    assert.equal(mk(a, "same-id")?.dir, mk(b, "same-id")?.dir);
+    assert.notEqual(mk(a, "same-id")?.dir, mk(c, "other-id")?.dir);
+    // The literal is GONE: no directory is named for a constant.
+    assert.equal(
+      readdirSync(root).some((entry) => entry.endsWith("-session")),
+      false,
+      "a shared literal directory was created",
+    );
+  });
+});
+
+// ── 433f6bf8: cleanup — remove-on-close and the orphan sweep ────────────────
+
+test("removeHarnessConfigDir deletes a config dir and REFUSES anything else", () => {
+  withTempRoot((root) => {
+    const env: NodeJS.ProcessEnv = {};
+    const plan = applyHarnessConfigDir({
+      env,
+      agentCommand: AGENT_REGISTRY.pi,
+      sessionId: "ses_rm",
+      primer: "P",
+      rootDir: root,
+    });
+    assert.ok(plan);
+    assert.equal(existsSync(plan.dir), true, "control: the dir must exist before removal");
+    removeHarnessConfigDir(plan.dir);
+    assert.equal(existsSync(plan.dir), false);
+
+    // A path this module could never have created is left ALONE — otherwise a
+    // caller passing the wrong string gets an arbitrary recursive delete.
+    const foreign = join(root, "not-ours");
+    mkdirSync(foreign, { recursive: true });
+    removeHarnessConfigDir(foreign);
+    assert.equal(existsSync(foreign), true, "a non-config directory was deleted");
+  });
+});
+
+test("the orphan sweep removes dead dirs, RETAINS live ones, and prints its population", () => {
+  withTempRoot((root) => {
+    for (const [harness, id] of [
+      ["opencode", "live-1"],
+      ["opencode", "dead-1"],
+      ["pi", "dead-2"],
+    ] as const) {
+      applyHarnessConfigDir({
+        env: {},
+        agentCommand: AGENT_REGISTRY[harness],
+        sessionId: id,
+        primer: "P",
+        rootDir: root,
+      });
+    }
+    // ⚠️ A DIRECTORY THAT IS NOT OURS. `cli/queue/paths.ts` creates
+    // `/tmp/acpx-<hash>` for queue sockets — found by ENUMERATING the consumers
+    // of this name, not by recalling them. The sweep must never touch it.
+    const queueDir = join(root, "acpx-0a1b2c3d4e");
+    mkdirSync(queueDir, { recursive: true });
+
+    const result = pruneOrphanHarnessConfigDirs({
+      liveSessionIds: new Set(["live-1"]),
+      rootDir: root,
+    });
+
+    // POPULATION FIRST: 0 scanned would mean NOT RUN, not clean.
+    assert.equal(result.scanned, 3, "scanned population is wrong — the sweep saw the wrong set");
+    assert.equal(result.removed.length, 2);
+    assert.equal(result.retained, 1);
+    assert.equal(existsSync(queueDir), true, "the queue socket dir was swept — it is not ours");
+    assert.equal(
+      readdirSync(root).some((entry) => entry.endsWith("-live-1")),
+      true,
+      "a LIVE session's dir was removed",
+    );
+  });
+});
+
+test("the sweep on an unreadable root reports scanned=0 — NOT RUN, not clean", () => {
+  const result = pruneOrphanHarnessConfigDirs({
+    liveSessionIds: new Set(),
+    rootDir: "/nonexistent-hp-b3-root-zzz9",
+  });
+  assert.equal(result.scanned, 0);
+  assert.deepEqual(result.removed, []);
+});
+
+// ── RS-14 (fa2e54ec): the recorded-path field, and its ABSENCE ──────────────
+
+test("RS-14: setHarnessConfigDir leaves a no-config-dir record COMPLETELY untouched", () => {
+  // ⚠️ ABSENT — not null, not {}. This runs with `undefined` on EVERY claude /
+  // claude-pty / codex spawn, because only opencode and pi get a config dir. An
+  // unconditional `record.acpx = clone ?? {}` would give a record whose `acpx`
+  // was previously absent an empty object, changing the record SHAPE for three
+  // harnesses the programme requires untouched — and record shape is consumed by
+  // parse, serialize, the index projection and the UI.
+  for (const acpx of [undefined, {}, { current_model_id: "x" }]) {
+    const record = { agentCommand: CLAUDE, ...(acpx ? { acpx } : {}) } as unknown as SessionRecord;
+    const before = JSON.stringify(record);
+    setHarnessConfigDir(record, undefined);
+    assert.equal(JSON.stringify(record), before, `record changed for acpx=${JSON.stringify(acpx)}`);
+  }
+  // The scan a tester runs: no key named harness_config_dir at ANY depth.
+  const record = { agentCommand: CLAUDE } as unknown as SessionRecord;
+  setHarnessConfigDir(record, undefined);
+  assert.equal(pathsContainKey(record, "harness_config_dir"), 0);
+  // PLANTED CONTROL, same scanner: it CAN see the key when it is there.
+  setHarnessConfigDir(record, "/tmp/acpx-opencode-planted");
+  assert.equal(pathsContainKey(record, "harness_config_dir"), 1, "the scanner is blind");
+});
+
+test("RS-14: a spawn that writes no dir CLEARS a stale recorded path", () => {
+  // A stale path that still resolves is a silent WRONG answer — worse than a
+  // miss — so it must not survive a spawn that produced no directory.
+  const record = { agentCommand: CLAUDE } as unknown as SessionRecord;
+  setHarnessConfigDir(record, "/tmp/acpx-opencode-old");
+  assert.equal(record.acpx?.harness_config_dir, "/tmp/acpx-opencode-old");
+  setHarnessConfigDir(record, undefined);
+  assert.equal(record.acpx?.harness_config_dir, undefined);
+  assert.equal(pathsContainKey(record, "harness_config_dir"), 0);
+});
+
+test("RS-14: the recorded path SURVIVES the per-turn acpx-state clone", () => {
+  // The leg that ate `depth_projection`. `cloneSessionAcpxState` is an allowlist
+  // the turn path re-bases `record.acpx` off, so a field it does not name is
+  // dropped on EVERY REAL TURN — silently, with typecheck and the unit suite
+  // green. Asserted as a PROPERTY, not as a source-text presence check.
+  const record = { agentCommand: AGENT_REGISTRY.opencode } as unknown as SessionRecord;
+  setHarnessConfigDir(record, "/tmp/acpx-opencode-survives");
+  const cloned = cloneSessionAcpxState(record.acpx);
+  assert.equal(cloned?.harness_config_dir, "/tmp/acpx-opencode-survives");
+});
+
+/** Count paths whose final key is `key`, at ANY depth — the `paths(..)` scan a
+ *  tester runs with jq, expressed in-process. Never a field probe: a wrong path
+ *  returns a silent undefined indistinguishable from the pass condition. */
+function pathsContainKey(value: unknown, key: string): number {
+  let hits = 0;
+  const walk = (node: unknown): void => {
+    if (node === null || typeof node !== "object") {
+      return;
+    }
+    for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+      if (k === key) {
+        hits += 1;
+      }
+      walk(v);
+    }
+  };
+  walk(value);
+  return hits;
+}
