@@ -253,6 +253,42 @@ test("merge: codex families are mandatory-depth, because a bare family is reject
   assert.ok(mini?.depth.kind === "ladder" && !mini.depth.levels.includes("ultra"));
 });
 
+/**
+ * 🔒 THE RE-MEASURE TRIGGER, MADE ENFORCEABLE.
+ *
+ * This is a change-detector ON PURPOSE. `CODEX_FAMILIES` is a frozen
+ * measurement, not a product list, so an edit to it must be a deliberate act
+ * that updates a cited expectation — never a name someone added from release
+ * notes. The list here carries the same scope as the constant: it is what
+ * `codex-acp 0.0.45` / `@openai/codex 0.144.1` advertised ON DEVBOX, ON THIS
+ * BOX'S CODEX CREDENTIAL, at 2026-09-04T22:36Z (brick://db554b05). codex's
+ * models-manager refreshes remotely, per account — so this is not a fleet fact.
+ *
+ * What it caught: `gpt-5.4`, `gpt-5.3-codex` and `gpt-5.2` were listed and are
+ * advertised at NEITHER 0.144.1 NOR 0.153.3 — phantom rows that `acpx models
+ * show` printed with a full ladder and that no `--model` form could spawn.
+ *
+ * At `0.153.3` the advertised set is these six PLUS `gpt-6-astra` (35 ids over
+ * seven families) — no family retired, none returned. So when the pin moves,
+ * this expectation gains a row; if it needs to LOSE one, something happened that
+ * is worth understanding before editing the constant.
+ */
+test("codex families are exactly the set the measured adapter advertises", () => {
+  assert.deepEqual(
+    harnessNativeModels()
+      .filter((model) => model.source === "chatgpt")
+      .map((model) => model.id),
+    [
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
+      "gpt-5.5",
+      "gpt-5.4-mini",
+      "gpt-5.3-codex-spark",
+    ],
+  );
+});
+
 test("merge: one id under two sources is two rows with two keys (C5 D2)", () => {
   const rows = harnessNativeModels().filter((m) => m.id === "opus");
   assert.deepEqual(rows.map((m) => m.key).toSorted(), [

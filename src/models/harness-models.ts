@@ -81,16 +81,48 @@ const CLAUDE_PTY_ALIASES: { id: string; name: string }[] = [
   { id: "haiku", name: "Haiku" },
 ];
 
+/**
+ * 🔒 A FROZEN MEASUREMENT WITH A RE-MEASURE TRIGGER — NOT A PRODUCT LIST.
+ *
+ * SCOPE OF THE MEASUREMENT, and all three parts are load-bearing:
+ *   ADAPTER    `codex-acp 0.0.45` → `@openai/codex 0.144.1` (six families, 29
+ *              composed ids) — MEASURED 2026-09-04T22:36Z from a real session's
+ *              ACP `available_models` (brick://db554b05 `reports/MEASUREMENT.md`).
+ *              At `0.153.3`: SEVEN families, 35 ids — the sole difference is
+ *              `gpt-6-astra`; no family retired and none returned.
+ *   BOX        devbox.
+ *   CREDENTIAL the account this box's codex auth resolves to.
+ *
+ * ⚠️ THE BOX AND CREDENTIAL ARE NOT DECORATION. codex's models-manager refreshes
+ * its catalogue REMOTELY, with an ETag/TTL, AND PER ACCOUNT — so this list is
+ * established for this box and this credential and is NOT proven universal. A
+ * reader on another box or another account who takes it as a fleet fact is wrong
+ * in a way nothing announces, which is the exact defect shape this block keeps
+ * finding.
+ *
+ * WHY THREE FAMILIES ARE ABSENT HERE. `gpt-5.4`, `gpt-5.3-codex` and `gpt-5.2`
+ * were listed until 2026-09-04 and the adapter advertises NONE of them — at
+ * `0.144.1` or at `0.153.3`. They were phantom rows: `acpx models show` printed
+ * a selectable model with a full ladder, and no `--model` form could spawn one,
+ * composed or bare. They are not "stale pending a bump"; they are absent at both
+ * measured versions.
+ *
+ * ⚠️ RE-MEASURE TRIGGER — DO NOT EDIT THIS LIST FROM RELEASE NOTES, A PRODUCT
+ * PAGE, OR A MODEL NAME YOU SAW. When the adapter pin moves, take a session's
+ * `available_models` off the wire and diff it against the two sets above. The
+ * citation exists so that the next delta is CLASSIFIABLE: an uncited list that
+ * changes is indistinguishable from a list that was always wrong.
+ *
+ * The structural fix — sourcing this from the advertisement instead of from a
+ * constant — is brick://8ca68c82, deliberately scoped after G3.
+ */
 const CODEX_FAMILIES: { id: string; name: string }[] = [
   { id: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
   { id: "gpt-5.6-terra", name: "GPT-5.6 Terra" },
   { id: "gpt-5.6-luna", name: "GPT-5.6 Luna" },
   { id: "gpt-5.5", name: "GPT-5.5" },
-  { id: "gpt-5.4", name: "GPT-5.4" },
   { id: "gpt-5.4-mini", name: "GPT-5.4 Mini" },
-  { id: "gpt-5.3-codex", name: "GPT-5.3 Codex" },
   { id: "gpt-5.3-codex-spark", name: "GPT-5.3 Codex Spark" },
-  { id: "gpt-5.2", name: "GPT-5.2" },
 ];
 
 /** Codex bakes the effort into the id and REJECTS a bare family, so its ladder has no "Default" rung. */
