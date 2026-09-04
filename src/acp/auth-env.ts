@@ -27,6 +27,7 @@ import {
   type ProfileRegistry,
   type SubscriptionProfileEntry,
 } from "../config/profiles.js";
+import { loadBoxProviders, resolveBoxProviderKey } from "../config/providers.js";
 import type { SubscriptionLookupOptions } from "../config/subscriptions.js";
 import {
   chooseSubscriptionConfigDir,
@@ -1349,11 +1350,43 @@ export function buildClaudeParentSessionMeta(
 }
 
 // Handles the openrouter authMode branch of applyProfileAuth.
-function resolveOpenRouterApiKey(profile: OpenRouterProfileEntry): string | undefined {
+//
+// Precedence, unchanged at the top and extended only at the bottom:
+//   1. `openRouterApiKeyEnv` resolved against THIS process's environment
+//   2. the box provider credential DECLARING that same variable name
+//   3. the literal `openRouterApiKey`
+//
+// ⚠️ STEP 2 IS WHY A PROFILE CAN POINT AT THE BOX KEY AT ALL, and without it the
+// indirection silently cannot reach it. `applyBoxProviderEnv` writes into the
+// CHILD spawn env; this function runs in the acpx PARENT and reads `process.env`,
+// which the child env never touches. So a profile carrying
+// `openRouterApiKeyEnv: "OPENROUTER_API_KEY"` on a box whose only copy of that
+// variable lives in providers.json would fall through to the literal — i.e. to
+// the second copy of the key that "one key on the box, one place it lives" exists
+// to eliminate. Matching on the provider's DECLARED `env` name (not on a
+// hardcoded provider id) keeps one convention: the profile names a VARIABLE, and
+// providers.json is what supplies that variable.
+//
+// Step 3 stays last so every profile that ships a literal today is untouched.
+//
+// Exported ONLY so `test/box-provider-profile-fallback.test.ts` can assert the
+// precedence directly. It is deliberately tested through its REAL resolution
+// (ACPX_STATE_HOME → providers.json) rather than through an injected path, so
+// the test cannot pass on a seam production does not use.
+export function resolveOpenRouterApiKey(profile: OpenRouterProfileEntry): string | undefined {
   if (profile.openRouterApiKeyEnv) {
     const envValue = process.env[profile.openRouterApiKeyEnv];
     if (typeof envValue === "string" && envValue.trim().length > 0) {
       return envValue;
+    }
+    const boxProvider = loadBoxProviders().providers.find(
+      (entry) => entry.env === profile.openRouterApiKeyEnv,
+    );
+    if (boxProvider) {
+      const boxKey = resolveBoxProviderKey(boxProvider);
+      if (boxKey) {
+        return boxKey;
+      }
     }
   }
   return profile.openRouterApiKey;

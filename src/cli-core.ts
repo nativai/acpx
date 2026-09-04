@@ -56,7 +56,14 @@ export const TOP_LEVEL_VERBS = new Set([
   //
   // `test/top-level-verbs.test.ts` enforces the set by ENUMERATING what
   // `registerDefaultCommands` actually registers, so a new top-level command is
-  // caught without anyone remembering to add it to a list.
+  // caught without anyone remembering to add it to a list. That check is now
+  // BIDIRECTIONAL: an entry here that no command answers is also a failure.
+  //
+  // ⚠️ `usage` USED TO BE IN THIS SET AND WAS DELETED
+  // (https://acpx.devbox.nativai.de/?brick=f99a1b30). It was a DEAD TOKEN — the
+  // real verb is `subscriptions usage` — and being claimed here meant it could
+  // never register as an agent name while no command answered it. Do not
+  // re-add it: the bidirectional pin now goes red on exactly that shape.
   "agents",
   "prompt",
   "exec",
@@ -72,7 +79,10 @@ export const TOP_LEVEL_VERBS = new Set([
   // this command existed: rc 4 "No acpx session found" in a session-free cwd,
   // and a PROMPT DELIVERY in a session-bearing one.
   "models",
-  "usage",
+  // `providers` — the box-scoped provider-credential read (~/.acpx/providers.json).
+  // Registered by `registerProvidersCommand`; this entry is the second half of
+  // the two registrations that verb needs.
+  "providers",
   "status",
   // `output-styles` is registered top-level by `registerSharedAgentSubcommands`
   // (command-registration.ts, called with `program` from `registerDefaultCommands`)

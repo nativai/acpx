@@ -44,6 +44,39 @@ function registeredTopLevelNames(): string[] {
   return program.commands.map((command) => command.name()).toSorted();
 }
 
+/**
+ * Is this verb ANSWERED by the CLI — measured, not looked up.
+ *
+ * ⚠️ WHY BEHAVIOURAL AND NOT `program.commands.includes(verb)`. `help` is absent
+ * from `program.commands` yet `acpx help` works, because commander supplies it.
+ * Counting it dead would be a false RED, and the usual fix for a false red is a
+ * second hand-written exception list — the exact failure this file exists to
+ * prevent. So the question is put to the parser instead: a token commander does
+ * not know throws `commander.unknownCommand`; anything else means something
+ * answered it. No private commander API, and it cannot drift when commander's
+ * internals move.
+ *
+ * ⚠️ Safe to parse: registered verbs short-circuit on the name check BEFORE any
+ * parse, so no command's action can fire. Only tokens that are NOT registered
+ * commands reach the parser, where commander rejects or handles them without
+ * running anything of ours.
+ */
+function isAnswered(verb: string): boolean {
+  const program = new Command();
+  program.exitOverride();
+  program.configureOutput({ writeOut: () => {}, writeErr: () => {} });
+  registerDefaultCommands(program, fakeConfig());
+  if (program.commands.some((command) => command.name() === verb)) {
+    return true;
+  }
+  try {
+    program.parse([verb], { from: "user" });
+    return true;
+  } catch (error) {
+    return (error as { code?: string }).code !== "commander.unknownCommand";
+  }
+}
+
 test("EVERY top-level command commander registers is present in TOP_LEVEL_VERBS", () => {
   // The discovering assertion. A command registered without its entry is
   // shadowed by an agent registration of the same name and fails SILENTLY —
@@ -61,27 +94,70 @@ test("EVERY top-level command commander registers is present in TOP_LEVEL_VERBS"
   );
 });
 
-// ⚠️ THIS CHECK IS DELIBERATELY ONE-DIRECTIONAL, and the missing direction is a
-// KNOWN, PRE-EXISTING defect rather than an oversight.
+// ⚠️ THE CHECK ABOVE IS ONE DIRECTION OF TWO, AND ON ITS OWN IT IS HALF A SWEEP.
+// REGISTERED ⊆ TOP_LEVEL_VERBS catches the eb9c1d1e shape (registered-but-unlisted
+// ⇒ shadowed by an agent registration of its own name). The inverse,
+// TOP_LEVEL_VERBS ⊆ REGISTERED, catches the OPPOSITE defect — a DEAD TOKEN:
+// claimed by the set, so it can never register as an agent name, while no command
+// answers it. Finding nothing in one direction says nothing about the other.
 //
-// It asserts REGISTERED ⊆ TOP_LEVEL_VERBS (the eb9c1d1e shape: a command that is
-// registered but unlisted gets shadowed by an agent registration of its name).
-// It does NOT assert the inverse, TOP_LEVEL_VERBS ⊆ REGISTERED — because `usage`
-// is in the set on `origin/dev` today and is NOT a top-level command: the real
-// verb is `subscriptions usage` (src/cli/subscriptions-command.ts). Measured on
-// this build from a session-free cwd, `acpx usage <anything>` is absorbed by the
-// `[prompt...]` catch-all and prints `No acpx session found` — byte-identically
-// to a nonsense token.
+// It was one-directional until brick https://acpx.devbox.nativai.de/?brick=f99a1b30
+// because `usage` was exactly such a dead token on `origin/dev` (the real verb is
+// `subscriptions usage`, src/cli/subscriptions-command.ts). B0.2 reported it
+// rather than fixing it, since deleting the entry lets an agent named `usage`
+// register — a behaviour change that was not B0.2's to make. That entry is now
+// deleted, which is what lets the inverse assertion exist.
 //
-// So `usage` is a DEAD TOKEN: claimed by the set (so it can never register as an
-// agent name) while no command answers it. The blast radius is small — it blocks
-// an agent literally named "usage" and gives a confusing message for `acpx usage`
-// — which is why B0.2 REPORTS it rather than fixing it: deleting the entry would
-// let an agent named `usage` register, a behaviour change nobody asked for, and
-// it is outside this brick. Filed with WS-core 2026-09-04.
-//
-// If that is fixed, add the inverse assertion here; it is a two-line change and
-// this comment is the reason it is not already present.
+// ⚠️ THE PIN IS THE POINT; THE DELETION WAS ONLY WHAT UNBLOCKED IT. Without the
+// pin the next dead token is added exactly as silently as `usage` was.
+test("EVERY entry in TOP_LEVEL_VERBS is a command that is actually answered", () => {
+  assert.ok(registeredTopLevelNames().length > 0, "nothing was registered — test is vacuous");
+
+  const dead = [...TOP_LEVEL_VERBS].filter((verb) => !isAnswered(verb)).toSorted();
+  assert.deepEqual(
+    dead,
+    [],
+    `these entries are claimed by TOP_LEVEL_VERBS but no command answers them, so each blocks ` +
+      `an agent of that name while doing nothing: ${dead.join(", ")}`,
+  );
+});
+
+test("the DEAD-TOKEN check can actually FAIL — mutation probe", () => {
+  // ⚠️ Same reason as the probe below: an empty `dead` list is otherwise
+  // indistinguishable from an enumeration that examined nothing. Present the
+  // check a set entry no command answers — the exact `usage` shape — and require
+  // it to be caught.
+  const verbs = [...TOP_LEVEL_VERBS, "zzz-dead-token"];
+  const dead = verbs.filter((verb) => !isAnswered(verb));
+  assert.deepEqual(dead, ["zzz-dead-token"]);
+});
+
+test("`isAnswered` discriminates — its own two-sided control", () => {
+  // ⚠️ The whole dead-token pin rests on this one predicate, so it is measured in
+  // BOTH directions rather than assumed: an instrument that returns `true` for
+  // everything would make the pin permanently green, and one that returns `false`
+  // for everything would make it permanently red. Neither is distinguishable
+  // from a working instrument by looking at the pin alone.
+  assert.equal(isAnswered("help"), true, "commander supplies `help` — it is answered");
+  assert.equal(isAnswered("sessions"), true, "a genuinely registered verb");
+  assert.equal(isAnswered("zzz-not-a-command"), false, "an unknown token must read as UNANSWERED");
+  assert.equal(
+    isAnswered("usage"),
+    false,
+    "`usage` is the dead token f99a1b30 removed — it must read as unanswered, which is what " +
+      "makes deleting it from TOP_LEVEL_VERBS correct rather than cosmetic",
+  );
+});
+
+test("`usage` specifically — the dead token f99a1b30 removed", () => {
+  // Named as well as discovered: the pin says WHETHER something is wrong, this
+  // says WHICH, faster than re-reading a diff.
+  assert.ok(!TOP_LEVEL_VERBS.has("usage"), "`usage` is a dead token — do not re-add it");
+  assert.ok(
+    !registeredTopLevelNames().includes("usage"),
+    "no top-level `usage` command exists; the real verb is `subscriptions usage`",
+  );
+});
 
 test("the discovering check can actually FAIL — mutation probe", () => {
   // ⚠️ Without this, "missing is empty" is indistinguishable from "the
