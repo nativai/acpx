@@ -376,9 +376,21 @@ type TextErrorHintRule = {
 // point at the surface that demonstrably HAS the detail. When the payload does
 // reach us, `getTextErrorRemediationHints` prints the reason itself and this
 // never runs.
+// ⚠️ THIS HINT NAMED A VERB THAT DOES NOT EXIST. It said `acpx sessions logs
+// <session>`; there is no `logs` subcommand anywhere in the CLI (zero
+// occurrences in command-registration.ts), so the token fell through to the
+// agent-name fallthrough and printed 3,819 bytes of HELP TEXT — 60 lines, none
+// of them mentioning the model. A reader following it got a wall of unrelated
+// output and no reason.
+//
+// That is precisely the failure the comment above this line warns about, written
+// into the very hint it was warning about: the reader trusts it INSTEAD of
+// investigating. So it now names the FILE, which demonstrably holds the payload
+// (`queue-owner-process.ts` opens `~/.acpx/sessions/<id>.owner.log` and routes the
+// owner's stdout+stderr into it).
 const ACP_DETAIL_HINT =
   "hint: the agent's own reason for this failure is recorded in the session's queue-owner log " +
-  "(`acpx sessions logs <session>`), not on this stream — `--verbose` does not add it here.";
+  "(`~/.acpx/sessions/<session-id>.owner.log`), not on this stream — `--verbose` does not add it here.";
 
 const TEXT_ERROR_HINT_RULES: TextErrorHintRule[] = [
   {
