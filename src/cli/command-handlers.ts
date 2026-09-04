@@ -37,6 +37,7 @@ import {
   SubscriptionLockedError,
   SubscriptionUnknownError,
 } from "../errors.js";
+import { validateSessionModelFlags } from "../models/model-slug-validation.js";
 import { loadPermissionPolicySpec } from "../permission-policy.js";
 import {
   mergePromptSourceWithText,
@@ -2622,8 +2623,23 @@ export async function handleSessionsNew(
     parent,
     config,
   );
+  // Both sides of this merge are kept. B0.2 renamed the two warnings when it moved
+  // them off the agent-NAME gate onto the capability descriptor; WS-picker added
+  // the catalogue-backed flag validation immediately after them. They are
+  // independent and complementary — the warnings say "acpx cannot route this flag
+  // to this harness at all", the validation says "this value is not in the
+  // harness's catalogue".
   warnReasoningEffortNotRoutable(globalFlags, effectiveAgent.agentName);
   warnOutputStyleNotSupported(globalFlags, effectiveAgent.agentName);
+  // Catalogue-backed `--model` / `--reasoning-effort` validation (C5 §6's three
+  // error shapes). Reads the CACHE only — a create is never blocked on a
+  // third-party fetch — and stands aside entirely when the cache is cold.
+  await validateSessionModelFlags({
+    agentName: effectiveAgent.agentName,
+    hasRawAgentOverride: globalFlags.agent !== undefined,
+    model: globalFlags.model,
+    reasoningEffort: globalFlags.reasoningEffort,
+  });
   const [{ createSession, closeSession }, { printCreatedSessionBanner, printNewSessionByFormat }] =
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
 

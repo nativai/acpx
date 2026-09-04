@@ -34,9 +34,29 @@ type SkillflagModule = typeof import("skillflag");
 
 export const TOP_LEVEL_VERBS = new Set([
   // ⚠️ A verb missing from this set is registered as an AGENT NAME instead
-  // (`configurePublicCli`), so it "runs", prints "No acpx session found
-  // (searched up to /tmp)" and exits 0. Adding a top-level command means adding
-  // it here in the same commit.
+  // (`configurePublicCli`), so a typo or a bogus subverb is not an error — it is
+  // absorbed by the agent catch-all. Adding a top-level command means adding it
+  // here IN THE SAME COMMIT.
+  //
+  // ⚠️ DO NOT ASSERT ON AN EXIT CODE TO TEST THIS. A previous version of this
+  // comment said the fall-through "exits 0"; it does not, and the correction
+  // matters more than the number. The rc reports WHICH FALLTHROUGH PATH WAS HIT,
+  // never whether the command exists, and it is CWD-DEPENDENT:
+  //   - in a session-free cwd the agent path finds no session (one rc),
+  //   - if the arg parser rejects a flag first, that is a different rc,
+  //   - and in a SESSION-BEARING cwd the token resolves a session and the
+  //     remaining words are parsed as a PROMPT — a real delivery, not an error.
+  // So no exit code is sound in either direction, and a guard written against
+  // one passes today against a completely unregistered verb. ⇒ **Assert on
+  // STDOUT CONTENT**, with `No acpx session found` as the control string that
+  // must be ABSENT once the verb is registered (program TEST-PLAN IR-2).
+  //
+  // ⚠️ And do not probe the session-bearing case to check any of this: that path
+  // sends a real delivery to whatever agent owns the cwd's session.
+  //
+  // `test/top-level-verbs.test.ts` enforces the set by ENUMERATING what
+  // `registerDefaultCommands` actually registers, so a new top-level command is
+  // caught without anyone remembering to add it to a list.
   "agents",
   "prompt",
   "exec",
@@ -47,8 +67,20 @@ export const TOP_LEVEL_VERBS = new Set([
   "sessions",
   "subscriptions",
   "profiles",
+  // Without this entry `acpx models …` falls through to the AGENT registry and
+  // is treated as an agent named "models" — measured on the deployed CLI before
+  // this command existed: rc 4 "No acpx session found" in a session-free cwd,
+  // and a PROMPT DELIVERY in a session-bearing one.
+  "models",
   "usage",
   "status",
+  // `output-styles` is registered top-level by `registerSharedAgentSubcommands`
+  // (command-registration.ts, called with `program` from `registerDefaultCommands`)
+  // and was MISSING here — brick https://acpx.devbox.nativai.de/?brick=eb9c1d1e.
+  // Its six siblings from the same call (prompt, exec, cancel, set-mode, set,
+  // status) were all present, which is exactly how a hand-maintained list goes
+  // wrong: correct enough to look complete.
+  "output-styles",
   "config",
   "help",
 ]);
