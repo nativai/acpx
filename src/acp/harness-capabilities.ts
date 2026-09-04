@@ -1,0 +1,689 @@
+import type { SessionConfigOption } from "@agentclientprotocol/sdk";
+
+/**
+ * The per-harness capability descriptor (CONCEPTION §8, Decision F).
+ *
+ * ONE table, in acpx, with two audiences: acpx-ui's create dialog / chat header
+ * (the C5 §8.4 field names) and acpx's own CLI + apply paths (the C4 mechanism
+ * fields). Daniel, 2026-09-03 22:58:57Z: *"we need some transparent mechanism
+ * backed by ACPX … ACPX needs to be the basis for all of this"* — the web app
+ * and the CLI only READ this; there is no UI-side table.
+ *
+ * ⛔ **There is deliberately no permission field of any kind.** CONCEPTION §8's
+ * draft struct carried `permissionModel`; Daniel's later ruling (2026-09-03
+ * 23:17:00Z, program DECISIONS.md row "7 (amended)") drops it: acpx
+ * short-circuits every permission request so every agent always runs with the
+ * process's full permissions, and neither the UI nor an agent has a permission
+ * concept to render. Adding one back is a decision to reverse, not a gap to fill.
+ *
+ * ## The rule that makes this table worth having
+ *
+ * Every field that states *what a user can do* is DERIVED from the field that
+ * states *how the mechanism works* — see {@link deriveHarnessCapabilities}. The
+ * hand-written half lives in {@link HARNESS_FACTS} as {@link HarnessCapabilityFacts},
+ * a type that does not contain the derived fields at all, so writing
+ * `canSetModelLive: true` into a row is a TYPE ERROR rather than something a
+ * reviewer has to catch. A hand-written `true` would offer a control that
+ * destroys the session; a hand-written `false` would outlive the fix.
+ *
+ * ## Every cell traces to a measurement
+ *
+ * Citations in this file are one of:
+ *   - `I1 R<n>` — FINDINGS-opencode, brick 13ef680d (measured 2026-09-03 on devbox)
+ *   - `I2 R<n>` — FINDINGS-pi, brick c239d784 (measured 2026-09-03 on devbox)
+ *   - `MAP §<n>` — CURRENT-STATE-capability-map, brick 2decfc57 (source reads, [V])
+ *   - a `file:line` in this repo or in a deployed adapter under `/opt`.
+ */
+
+export const HARNESS_IDS = ["claude", "claude-pty", "codex", "opencode", "pi"] as const;
+
+export type HarnessId = (typeof HARNESS_IDS)[number];
+
+/** How acpx makes a model selection reach the harness (CONCEPTION §5.2/§5.3). */
+export type ModelMechanism = "set-model" | "config-option" | "compose-into-id" | "none";
+
+/** How acpx makes a thinking-depth request reach the harness (CONCEPTION §5.2/§6). */
+export type DepthMechanism = "config-option" | "mode" | "compose-into-id" | "none";
+
+/**
+ * Where the harness's model list comes from.
+ *  - `acp`     — enumerable from the ACP handshake (`models`, or a `model` config option)
+ *  - `openrouter` — fetched from OpenRouter's live catalogue
+ *  - `static`  — a fixed list compiled into the adapter
+ */
+export type ModelCatalogue = "acp" | "openrouter" | "static";
+
+/**
+ * How the depth ladder is determined.
+ *  - `acp`       — whatever the adapter advertises for the session
+ *  - `per-model` — the advertised ladder depends on the CURRENTLY SELECTED model,
+ *                  so it must be re-read after a model change and may be absent
+ *                  entirely for a non-reasoning model (I1 R8)
+ *  - `static`    — a fixed list, identical for every model
+ */
+export type DepthLadder = "acp" | "per-model" | "static";
+
+/** What "any OpenRouter model" costs for this harness (CONCEPTION §7.4). */
+export type ArbitraryModelSupport = "none" | "native" | "provisioned" | "via-shim";
+
+/** Where this harness's credential comes from (CONCEPTION §5.1). */
+export type CredentialTier = "profile" | "box-provider" | "none";
+
+/**
+ * What a fork honouring `--at-index N` actually does.
+ *  - `exact`         — the fork is truncated at the requested point
+ *  - `turn-granular` — the fork IS truncated, but only at a coarser boundary, so
+ *                      a request between boundaries lands elsewhere. Carries
+ *                      {@link HarnessForkSupport.atIndexGranularityMessages} and
+ *                      {@link HarnessForkSupport.atIndexRounding} so a consumer
+ *                      can say WHERE it will land — see {@link resolveForkLandingIndex}.
+ *  - `ignored`       — the request is accepted and SILENTLY full-copies (I1 R4)
+ *  - `unsupported`   — refused loudly, so the caller knows
+ *
+ * The distinction `turn-granular` draws against `exact` is the whole reason this
+ * field exists: a truncation that silently lands somewhere other than where it
+ * was asked to is the same class of silent wrong answer as `ignored`, one notch
+ * quieter. (WS-core call, 2026-09-04, on the codex evidence below.)
+ */
+export type ForkAtIndexSupport = "exact" | "turn-granular" | "ignored" | "unsupported";
+
+/**
+ * Which channel acpx uses to deliver the OS primer. Wider than
+ * `PrimerChannel` in `./agent-command.ts` by one value: `config-file` is the
+ * measured-available path for OpenCode (`opencode.json` `instructions`, I1 R9)
+ * and Pi (`$PI_CODING_AGENT_DIR/APPEND_SYSTEM.md`, I2 R9). acpx does not write
+ * either file yet, so both harnesses declare `none` here today; the block that
+ * lands the per-session config dir moves those two cells.
+ */
+export type HarnessPrimerChannel =
+  | "system-prompt"
+  | "developer-instructions"
+  | "config-file"
+  | "none";
+
+/** A model's identity for the picker: the `(source, id)` pair (C5 §8.1). */
+export interface HarnessDefaultModel {
+  /** C5's model-source vocabulary: `openrouter | claude-subscription | claude-home | chatgpt | opencode-go`. */
+  source: string;
+  /**
+   * The model id, or the literal `default` when acpx pins nothing and the
+   * harness picks its own default.
+   */
+  id: string;
+}
+
+export interface HarnessModelSupport {
+  mechanism: ModelMechanism;
+  catalogue: ModelCatalogue;
+}
+
+export interface HarnessDepthSupport {
+  mechanism: DepthMechanism;
+  ladder: DepthLadder;
+  /**
+   * Whether an `effort` CONFIG OPTION is present in the adapter's `session/new`
+   * advertisement when the harness runs its own default model. `false` where
+   * depth is not a config option at all.
+   *
+   * This is not a detail — it is the single easiest thing in this program to get
+   * subtly wrong (CONCEPTION §5.2). acpx reads the advertised options from the
+   * `session/new` SNAPSHOT (src/session/config-option-application.ts:252), and
+   * OpenCode advertises `effort` only when the CURRENTLY SELECTED model reasons,
+   * which the default model does not (I1 R8). So a depth mechanism that is
+   * routed in general still never fires there, and every test that pins a
+   * reasoning model at creation would pass while the flag silently did nothing.
+   */
+  configOptionAdvertisedAtSessionNew: boolean;
+}
+
+export interface HarnessCredentialSupport {
+  tier: CredentialTier;
+  providers?: string[];
+}
+
+export interface HarnessForkSupport {
+  supported: boolean;
+  atIndex: ForkAtIndexSupport;
+  /**
+   * How many acpx message indices make up one truncation boundary. Present only
+   * for `turn-granular`; `resolveForkLandingIndex` needs it to answer "where
+   * will this fork actually land?" without the caller re-deriving the harness's
+   * arithmetic.
+   */
+  atIndexGranularityMessages?: number;
+  /** Which way a between-boundaries request is resolved. Present only for `turn-granular`. */
+  atIndexRounding?: "down" | "up";
+}
+
+/**
+ * Where a `--at-index <requested>` fork will ACTUALLY land for this harness.
+ *
+ * `undefined` means the question has no answer for that harness: an `ignored`
+ * fork lands nowhere (it full-copies) and an `unsupported` one never happens.
+ * For `exact` the answer is the request itself. For `turn-granular` it is the
+ * request snapped to the nearest boundary in the declared direction — which is
+ * what the UI must tell the user BEFORE the fork, not after.
+ */
+export function resolveForkLandingIndex(
+  fork: HarnessForkSupport,
+  requestedIndex: number,
+): number | undefined {
+  if (fork.atIndex === "exact") {
+    return requestedIndex;
+  }
+  if (fork.atIndex !== "turn-granular") {
+    return undefined;
+  }
+  const granularity = fork.atIndexGranularityMessages;
+  if (granularity === undefined || granularity <= 0) {
+    return undefined;
+  }
+  const boundaries = requestedIndex / granularity;
+  const snapped = fork.atIndexRounding === "up" ? Math.ceil(boundaries) : Math.floor(boundaries);
+  return snapped * granularity;
+}
+
+/** The full descriptor: hand-written facts plus the derived answers. */
+export interface HarnessCapabilities {
+  id: HarnessId;
+  label: string;
+
+  // ── C5 §8.4: what the picker and the header gate on. ALL DERIVED. ──
+  canSetModelLive: boolean;
+  canSetDepthLive: boolean;
+  /** Shown beside the padlock when `canSetModelLive` is false; null when it is true. */
+  liveModelChangeReason: string | null;
+  supportsProfiles: boolean;
+  supportsOutputStyles: boolean;
+  /** false ⇒ the OpenRouter band renders locked. Derived (CONCEPTION §7.4). */
+  acceptsArbitraryModelIds: boolean;
+  /** `"source:id"` — derived from {@link HarnessCapabilityFacts.defaultModel}. */
+  defaultModelKey: string;
+
+  // ── C4 additions: the mechanism, for the CLI and the apply paths ──
+  arbitraryModelSupport: ArbitraryModelSupport;
+  model: HarnessModelSupport;
+  depth: HarnessDepthSupport;
+  credential: HarnessCredentialSupport;
+  fork: HarnessForkSupport;
+  midTurnSteering: boolean;
+  primerChannel: HarnessPrimerChannel;
+  usageReporting: boolean;
+  promptImages: boolean;
+}
+
+/**
+ * The hand-written half. Deliberately `Omit`s every derived field: a row that
+ * tries to state `canSetModelLive` / `canSetDepthLive` / `liveModelChangeReason`
+ * / `acceptsArbitraryModelIds` / `defaultModelKey` fails to compile.
+ */
+export type HarnessCapabilityFacts = Omit<
+  HarnessCapabilities,
+  | "canSetModelLive"
+  | "canSetDepthLive"
+  | "liveModelChangeReason"
+  | "acceptsArbitraryModelIds"
+  | "defaultModelKey"
+> & {
+  defaultModel: HarnessDefaultModel;
+  /**
+   * The reason to show when the derivation says the model cannot be changed
+   * live. Never rendered while `canSetModelLive` is true, so it cannot go
+   * stale into the UI — {@link deriveHarnessCapabilities} returns null there.
+   */
+  liveModelChangeBlockedReason: string;
+};
+
+/**
+ * ⚠️ THE THREE LISTS BELOW ARE THE HINGE. They say what ACPX ITSELF ROUTES
+ * today — not what the harness is capable of. `HARNESS_FACTS` records the
+ * harness's mechanism (measured); these lists record whether acpx has an apply
+ * path for that mechanism. The derived booleans are the AND of the two, which is
+ * what makes a declared capability incapable of outliving — or preceding — the
+ * shipped code.
+ *
+ * ⚠️ DO NOT "simplify" a derived field to a literal in `HARNESS_FACTS`, and do
+ * not extend a list here without landing the apply-path branch in the SAME
+ * commit. `test/harness-capabilities.test.ts` pins both directions behaviourally:
+ * it calls acpx's real model gate with each harness's advertised shape and
+ * requires the answer to agree with `MODEL_MECHANISMS_ROUTED_BY_ACPX`, so
+ * adding the entry without the branch goes red, and adding the branch without
+ * the entry goes red too.
+ */
+export const MODEL_MECHANISMS_ROUTED_BY_ACPX: readonly ModelMechanism[] = [
+  // `applyRequestedModelIfAdvertised` → `assertRequestedModelSupported`
+  // (src/acp/model-support.ts:52-81): the generic path needs an advertised ACP
+  // `models` array plus `session/set_model`.
+  "set-model",
+  // The depth suffix rides inside the model id; acpx forwards the id opaquely
+  // and the adapter parses the bracket (MAP §4.2). A live re-pin is accepted and
+  // takes effect from the next turn.
+  "compose-into-id",
+  // NOT "config-option": routing `model` through `session/set_config_option` is
+  // the fix I1 recommends (CONCEPTION §5.2) and has NOT landed. Adding it here
+  // is what flips `opencode.canSetModelLive` to true, with no edit to the table.
+];
+
+export const DEPTH_MECHANISMS_ROUTED_BY_ACPX: readonly DepthMechanism[] = [
+  // `persistAndApplyRequestedEffort` gates on an advertised `effort` config
+  // option (src/session/config-option-application.ts:252) and
+  // `applyConfigOptionIfAdvertised` additionally requires `type === "select"`.
+  "config-option",
+  // NOT "mode": Pi exposes thinking level as the ACP MODE selector (I2 R8), and
+  // acpx's depth path has no mode arm, so `--reasoning-effort` can never reach
+  // it. (`acpx pi set-mode <level>` is a different verb and does work today.)
+];
+
+export const ARBITRARY_MODEL_SUPPORT_ROUTED_BY_ACPX: readonly ArbitraryModelSupport[] = [
+  // Empty on purpose. `provisioned` needs the per-session config dir that
+  // generates a catalogue fragment (I1 R6 / I2 R5); `via-shim` needs the
+  // OpenRouter shim to take a model from the picker rather than from the
+  // profile (CONCEPTION §7.4, §11 Q1). Neither has shipped, so
+  // `acceptsArbitraryModelIds` is false everywhere today — which is correct:
+  // the picker must not offer a band that fails at spawn.
+];
+
+/** Mechanisms that are a LIVE model change at all, once acpx routes them. */
+const LIVE_MODEL_MECHANISMS: readonly ModelMechanism[] = [
+  "set-model",
+  "config-option",
+  "compose-into-id",
+];
+
+/**
+ * Mechanisms that are a live DEPTH change. `compose-into-id` is excluded on
+ * purpose: for codex the depth is a property of the model id, so a depth control
+ * cannot move it — `set effort` is a silent no-op there because codex never
+ * advertises a selectable `effort` (MAP §4.4). Changing codex depth means
+ * changing the model id.
+ */
+const LIVE_DEPTH_MECHANISMS: readonly DepthMechanism[] = ["config-option", "mode"];
+
+/**
+ * Whether the model can be changed on a live session.
+ *
+ * Exported and parameterised so a test can hand it a synthetic routed-mechanism
+ * list and watch the answer flip — the property that proves this is a derivation
+ * and not a literal (program TEST-PLAN `G1-CFG-04`).
+ */
+export function deriveCanSetModelLive(
+  mechanism: ModelMechanism,
+  routedMechanisms: readonly ModelMechanism[] = MODEL_MECHANISMS_ROUTED_BY_ACPX,
+): boolean {
+  return LIVE_MODEL_MECHANISMS.includes(mechanism) && routedMechanisms.includes(mechanism);
+}
+
+/**
+ * Whether the thinking depth can be changed on a live session. Same shape as
+ * {@link deriveCanSetModelLive}, plus one term: a `config-option` mechanism is
+ * only live if the option is actually in the `session/new` advertisement acpx
+ * reads — see {@link HarnessDepthSupport.configOptionAdvertisedAtSessionNew}.
+ */
+export function deriveCanSetDepthLive(
+  depth: HarnessDepthSupport,
+  routedMechanisms: readonly DepthMechanism[] = DEPTH_MECHANISMS_ROUTED_BY_ACPX,
+): boolean {
+  if (!LIVE_DEPTH_MECHANISMS.includes(depth.mechanism)) {
+    return false;
+  }
+  if (!routedMechanisms.includes(depth.mechanism)) {
+    return false;
+  }
+  return depth.mechanism !== "config-option" || depth.configOptionAdvertisedAtSessionNew;
+}
+
+/** Whether an id outside the harness's own catalogue can be used (CONCEPTION §7.4). */
+export function deriveAcceptsArbitraryModelIds(
+  support: ArbitraryModelSupport,
+  routedSupport: readonly ArbitraryModelSupport[] = ARBITRARY_MODEL_SUPPORT_ROUTED_BY_ACPX,
+): boolean {
+  if (support === "none") {
+    return false;
+  }
+  return support === "native" || routedSupport.includes(support);
+}
+
+/** `(source, id)` → the `"source:id"` key the picker and the favorites store use (C5 §8.1). */
+export function deriveDefaultModelKey(defaultModel: HarnessDefaultModel): string {
+  return `${defaultModel.source}:${defaultModel.id}`;
+}
+
+/** Facts → the full descriptor. The only place the derived fields are produced. */
+export function deriveHarnessCapabilities(facts: HarnessCapabilityFacts): HarnessCapabilities {
+  const canSetModelLive = deriveCanSetModelLive(facts.model.mechanism);
+  return {
+    id: facts.id,
+    label: facts.label,
+    canSetModelLive,
+    canSetDepthLive: deriveCanSetDepthLive(facts.depth),
+    liveModelChangeReason: canSetModelLive ? null : facts.liveModelChangeBlockedReason,
+    supportsProfiles: facts.supportsProfiles,
+    supportsOutputStyles: facts.supportsOutputStyles,
+    acceptsArbitraryModelIds: deriveAcceptsArbitraryModelIds(facts.arbitraryModelSupport),
+    defaultModelKey: deriveDefaultModelKey(facts.defaultModel),
+    arbitraryModelSupport: facts.arbitraryModelSupport,
+    model: { ...facts.model },
+    depth: { ...facts.depth },
+    credential: {
+      tier: facts.credential.tier,
+      ...(facts.credential.providers ? { providers: [...facts.credential.providers] } : {}),
+    },
+    fork: { ...facts.fork },
+    midTurnSteering: facts.midTurnSteering,
+    primerChannel: facts.primerChannel,
+    usageReporting: facts.usageReporting,
+    promptImages: facts.promptImages,
+  };
+}
+
+/**
+ * The declared table. Hand-written facts only — every cell traces to a findings
+ * row or a `file:line`.
+ */
+export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
+  claude: {
+    id: "claude",
+    label: "claude",
+    supportsProfiles: true,
+    supportsOutputStyles: true, // MAP §3.1 — harness-sourced list, create/resume only
+    arbitraryModelSupport: "via-shim", // CONCEPTION §7.4 — the shim's model is fixed by the profile today
+    model: {
+      // `query.setModel(...)` on the SDK object, claude-agent-acp src/acp-agent.ts:1990-2019 (MAP §3.1)
+      mechanism: "set-model",
+      // SDK-queried `initializationResult.models` + two hardcoded injections (MAP §3.1)
+      catalogue: "acp",
+    },
+    depth: {
+      // `{id:"effort", category:"thought_level", type:"select"}`, claude-agent-acp :3939-3947 (MAP §3.1)
+      mechanism: "config-option",
+      // values = `default` + `ModelInfo.supportedEffortLevels` (MAP §3.1)
+      ladder: "per-model",
+      // Advertised unconditionally at `session/new` (MAP §3.1) — which is why
+      // acpx's `--reasoning-effort` works for claude today.
+      configOptionAdvertisedAtSessionNew: true,
+    },
+    // `subscription` and `openrouter` auth modes both force adapter `claude`
+    // (src/config/profiles.ts:145-156).
+    credential: { tier: "profile", providers: ["claude-subscription", "openrouter"] },
+    // `sessionCapabilities.fork` claude-agent-acp :839; acpx resolves the Claude
+    // transcript UUID for the requested index (src/acp/client.ts:204-218,
+    // src/acp/claude-fork-index.ts) and refuses loudly when it cannot.
+    fork: { supported: true, atIndex: "exact" },
+    midTurnSteering: true, // src/acp/mid-turn-injection-support.ts:5-20
+    primerChannel: "system-prompt", // `_meta.systemPrompt`, resolvePrimerChannel (src/acp/agent-command.ts)
+    usageReporting: true, // MAP §3.1 — `usage_update`
+    promptImages: true, // MAP §3.1 — `promptCapabilities.image: true`
+    defaultModel: { source: "claude-subscription", id: "default" }, // C5 §8.4's own example
+    liveModelChangeBlockedReason:
+      "acpx has no live model path for this harness; recreate the session with a different --model.",
+  },
+
+  "claude-pty": {
+    id: "claude-pty",
+    label: "claude-pty",
+    supportsProfiles: true,
+    supportsOutputStyles: true, // MAP §3.1 — create-time only, folded into the launch --settings JSON
+    arbitraryModelSupport: "none", // CONCEPTION §7.4 — hardcoded [opus, sonnet, haiku]
+    model: {
+      // types `/model <id>` into the live TUI via tmux keystrokes, claude-pty-acp :4648-4688 (MAP §3.1)
+      mechanism: "set-model",
+      // `SUPPORTED_MODELS = [opus, sonnet, haiku]`, claude-pty-acp :149-154 (MAP §3.1)
+      catalogue: "static",
+    },
+    depth: {
+      // the ONLY config option it advertises, claude-pty-acp :148,155,714-722 (MAP §3.1)
+      mechanism: "config-option",
+      // `SUPPORTED_EFFORTS = [low, medium, high, xhigh, max]`, model-independent (MAP §3.1)
+      ladder: "static",
+      configOptionAdvertisedAtSessionNew: true, // MAP §3.1 — its ONLY config option, default `high`
+    },
+    // `claude-home` forces adapter `claude-pty` (src/config/profiles.ts:145-156);
+    // `--subscription` is refused for it (src/acp/auth-env.ts:1152-1162).
+    credential: { tier: "profile", providers: ["claude-home"] },
+    // Physical transcript copy with INCLUSIVE truncation at a resolved Claude
+    // transcript UUID (`copyForkTranscript` :1605-1636, `claudeUuidForAcpxForkIndex`
+    // :1584-1604), and two loud refusals rather than a silent full copy (MAP §3.2).
+    fork: { supported: true, atIndex: "exact" },
+    midTurnSteering: true, // src/acp/mid-turn-injection-support.ts:5-20 (native TUI steering)
+    primerChannel: "system-prompt", // `_meta.systemPrompt` re-applied on every (re)launch, :1889-1893
+    usageReporting: true, // MAP §3.1 — same wire shape; cost derived from a pricing table
+    promptImages: true, // MAP §3.1 — `image:true`
+    defaultModel: { source: "claude-home", id: "default" },
+    liveModelChangeBlockedReason:
+      "acpx has no live model path for this harness; recreate the session with a different --model.",
+  },
+
+  codex: {
+    id: "codex",
+    label: "codex",
+    // A `chatgpt` profile is bound to codex (src/config/profiles.ts:145-156,
+    // re-asserted at spawn src/acp/auth-env.ts:1213-1226). Note acpx-ui's LIVE
+    // profile-switch route stays gated to claude/claude-pty (CONCEPTION §9.2).
+    supportsProfiles: true,
+    supportsOutputStyles: false, // MAP §3.1 — zero `outputStyle` references in codex-acp
+    arbitraryModelSupport: "none", // CONCEPTION §7.4 — fixed backend; ids are `family[effort]`
+    model: {
+      // app-server model × effort cross-product into `model[effort]` ids; acpx
+      // forwards the id opaquely and codex-acp parses the bracket (MAP §3.1, §4.2).
+      // The pin is stored for the NEXT turn (codex-acp CodexAcpServer.ts:406-447).
+      mechanism: "compose-into-id",
+      catalogue: "acp", // app-server-queried `listModels`, paginated (MAP §3.1)
+    },
+    depth: {
+      // No `effort` config option at all — only a `fastMode` boolean; effort
+      // rides inside the model id (MAP §3.1). So the depth CONTROL cannot move
+      // it: `set effort` is a silent no-op for codex (MAP §4.4).
+      mechanism: "compose-into-id",
+      // the cross-product is per model — `gpt-5.6-luna[ultra]` is rejected when
+      // luna tops out at max (src/acp/model-support.ts:9-11)
+      ladder: "per-model",
+      configOptionAdvertisedAtSessionNew: false, // MAP §3.1 — no `effort` option at all, only `fastMode`
+    },
+    credential: { tier: "profile", providers: ["chatgpt"] },
+    // ⚠️ MEASURED CORRECTION, and it contradicts CONCEPTION §8's prose ("Codex's
+    // loud refusal") and brick 276594c2's title. codex-acp DOES implement
+    // at-index truncation: app-server `thread/fork` followed by a
+    // `threadRollback({numTurns: totalTurns - turnsToKeep})` (MAP §3.2, commit
+    // 989a802). Verified on the DEPLOYED build this box's registry launches —
+    // `/opt/codex-acp/dist/index.js` contains `threadRollback({`,
+    // `numTurnsToDrop = totalTurns - turnsToKeep` and `numTurns: numTurnsToDrop`
+    // (2026-09-04, `grep -a`). The "fork-at-index is not supported yet" string in
+    // the same bundle belongs to `hasUnsupportedForkTruncation`, which rejects
+    // eight OTHER truncation vocabularies; the exact `_meta.acpx.forkAtMessageIndex`
+    // shape acpx sends (src/acp/client.ts:218) is the one it honours.
+    // ⚠️ It is NOT `exact`, and that distinction is the point of the field:
+    // the truncation is TURN-granular — `turnsToKeep = floor(forkAtMessageIndex
+    // / 2)` (2 acpx messages = 1 Codex turn, MAP §3.2), so a request to fork at
+    // message 7 silently lands at message 6. Encoding that as `exact` would
+    // reproduce, inside the table built to end silent-wrong-answer forks, the
+    // very bug it exists to end. `ignored` is equally false (a truncation DOES
+    // happen) and so is `unsupported` (nothing is refused). Fourth value added
+    // by WS-core's call, 2026-09-04, on this evidence; the rounding rule is
+    // carried as DATA so the UI can say where the fork will land.
+    fork: {
+      supported: true,
+      atIndex: "turn-granular",
+      atIndexGranularityMessages: 2,
+      atIndexRounding: "down",
+    },
+    midTurnSteering: true, // src/acp/mid-turn-injection-support.ts:5-20
+    primerChannel: "developer-instructions", // `_meta.codex.developerInstructions` (MAP §3.1)
+    usageReporting: true, // MAP §3.1 — from app-server `thread/tokenUsage/updated`
+    promptImages: true, // MAP §3.1 — `image:true`
+    defaultModel: { source: "chatgpt", id: "default" },
+    liveModelChangeBlockedReason:
+      "acpx has no live model path for this harness; recreate the session with a different --model.",
+  },
+
+  opencode: {
+    id: "opencode",
+    label: "opencode",
+    // No `AuthMode` maps to a fourth harness — the mapping is a closed switch,
+    // not a table (MAP §2.2). Credentials reach OpenCode as box-provider env.
+    supportsProfiles: false,
+    supportsOutputStyles: false, // not an OpenCode concept (I1 R11 — configOptions are model/mode/effort)
+    arbitraryModelSupport: "provisioned", // I1 R6 — declare `provider.openrouter.models.<id>` in opencode.json
+    model: {
+      // I1 R5/R11: model is an ACP config option (`configId: "model"`, 401
+      // options, `type: select`), set via `session/set_config_option`. NO ACP
+      // `models` array and NO `session/set_model`.
+      mechanism: "config-option",
+      catalogue: "acp", // the whole roster is enumerable from the handshake, with display names (I1 R11)
+    },
+    depth: {
+      // I1 R8: reasoning effort is OpenCode's "variant", exposed as the ACP
+      // config option `effort` (category `thought_level`).
+      mechanism: "config-option",
+      // I1 R8: the ladder differs per model (`low/high/max` vs `low/medium/high`)
+      // and is ABSENT for a non-reasoning model — and it is not advertised at
+      // `session/new` with the default model, which is why acpx must re-read the
+      // advertised options AFTER applying the model.
+      ladder: "per-model",
+      // I1 R8, and this is the cell that makes `opencode.canSetDepthLive` false
+      // today: at `session/new` with the default (non-reasoning) model the
+      // `effort` option is ABSENT, so acpx's gate — which reads that snapshot —
+      // is false and `--reasoning-effort` never applies. Flips to true when the
+      // apply path re-reads the advertised options after applying the model.
+      configOptionAdvertisedAtSessionNew: false,
+    },
+    credential: { tier: "box-provider", providers: ["openrouter"] }, // I1 R6 — OPENROUTER_API_KEY alone activates it
+    // I1 R4: `sessionCapabilities: {close, fork, list, resume}` — the full fork
+    // works today through acpx's generic path. But `--at-index N` is SILENTLY
+    // ignored: the probe recorded `forkedAtMessageIndex: 2` while OpenCode's own
+    // DB showed all 6 source messages copied. A truncation that did not happen.
+    fork: { supported: true, atIndex: "ignored" },
+    midTurnSteering: false, // src/acp/mid-turn-injection-support.ts:5-20 — not on the allow-list (I1 R3)
+    // I1 R9: `_meta.systemPrompt.append` is accepted and SILENTLY IGNORED. The
+    // working path is `opencode.json` `"instructions"` in a per-session config
+    // dir, which acpx does not write yet — so acpx delivers no primer today.
+    primerChannel: "none",
+    usageReporting: true, // I1 R12 — `usage_update` over ACP plus per-session cost/tokens in its store
+    promptImages: true, // I1 R11 — `promptCapabilities: {embeddedContext:true, image:true}`
+    // I1 R7: with no OpenRouter key the harness's own default is the Zen free
+    // tier (`opencode/big-pickle`); with the box key present the intended door
+    // is OpenRouter. acpx pins nothing, hence the `default` sentinel.
+    defaultModel: { source: "openrouter", id: "default" },
+    liveModelChangeBlockedReason:
+      "OpenCode selects its model through session/set_config_option, which acpx does not route yet. acpx's generic path persists a value it can never apply and leaves the session unrecoverable (FINDINGS-opencode D2).",
+  },
+
+  pi: {
+    id: "pi",
+    label: "pi",
+    supportsProfiles: false, // MAP §2.2 — no AuthMode maps to a fourth harness
+    supportsOutputStyles: false, // not a Pi concept (I2 R11)
+    arbitraryModelSupport: "provisioned", // I2 R5 — generate the `models-store.json` entry
+    model: {
+      // I2 R5: live via ACP `session/set_model`, proven three ways (acpx flag,
+      // Pi's own session JSONL, the OpenRouter generation API).
+      mechanism: "set-model",
+      catalogue: "acp", // `session/load` returns `models.availableModels` — 371 entries (I2 R5)
+    },
+    depth: {
+      // I2 R8: thinking level rides the ACP MODE selector; `configOptions` is
+      // null, so acpx's `--reasoning-effort` (gated on an advertised `effort`
+      // config option) can never apply. `acpx pi set-mode <level>` does work.
+      mechanism: "mode",
+      // `modes.availableModes` = off/minimal/low/medium/high/xhigh, read from the
+      // advertisement (I2 R8). Whether it varies per model was not measured, and
+      // `acp` deliberately claims neither way.
+      ladder: "acp",
+      configOptionAdvertisedAtSessionNew: false, // I2 R8/R11 — `configOptions` is null; depth rides `modes`
+    },
+    credential: { tier: "box-provider", providers: ["openrouter"] }, // I2 R6 — plain OPENROUTER_API_KEY
+    // I2 R4: pi-acp advertises `sessionCapabilities: {list:{}}` only and the
+    // string `fork` appears ZERO times in pi-acp 0.0.26 AND 0.0.33, so acpx
+    // refuses loudly: "does not advertise sessionCapabilities.fork; cannot copy
+    // session". Pi ITSELF can fork (`pi --fork`), and a mid-history fork is
+    // achievable by truncating its JSONL tree — the gap is the adapter's.
+    fork: { supported: false, atIndex: "unsupported" },
+    midTurnSteering: false, // src/acp/mid-turn-injection-support.ts:5-20 (I2 R3)
+    // I2 R9: pi-acp handles `_meta` only for `terminal-auth` and
+    // `piAcp.queueDepth` — there is no `_meta.systemPrompt` channel to bind to.
+    // The path that survives the ACP hop is `$PI_CODING_AGENT_DIR/APPEND_SYSTEM.md`,
+    // which acpx does not write yet.
+    primerChannel: "none",
+    // I2 R12: no usage/token field in any `session/update`; the `session/prompt`
+    // result is a bare `{"stopReason":"end_turn"}`. Pi's own JSONL has the data;
+    // pi-acp does not carry it over ACP.
+    usageReporting: false,
+    promptImages: true, // I2 R11 — `promptCapabilities: {image:true, audio:false, embeddedContext:false}`
+    defaultModel: { source: "openrouter", id: "default" },
+    liveModelChangeBlockedReason:
+      "acpx has no live model path for this harness; recreate the session with a different --model.",
+  },
+};
+
+/**
+ * What a session's adapter actually advertised, as it is already stored on the
+ * record (`acpx.config_options`, src/types.ts:533). Deliberately NOT a new
+ * persisted field — CONCEPTION §9.3's transform-leg checklist is a guard here,
+ * not a task.
+ */
+export interface HarnessRuntimeAdvertisement {
+  configOptions?: SessionConfigOption[];
+}
+
+/** A `select`-typed config option with the given id is advertised. */
+function advertisesSelectableOption(
+  advertised: SessionConfigOption[] | undefined,
+  configId: string,
+): boolean {
+  return (advertised ?? []).some((option) => option.id === configId && option.type === "select");
+}
+
+/**
+ * The declared descriptor for one harness, refined by what a session's adapter
+ * actually advertised when a session is supplied.
+ *
+ * The declared table is the answer for an agent type with NO SESSION YET — which
+ * is why a session-record-only design fails acpx-ui's create dialog (CONCEPTION
+ * §8). With a session in hand, the advertisement can only NARROW the answer,
+ * never widen it: a capability acpx cannot route does not become routable
+ * because an adapter mentioned it. `test/harness-capabilities.test.ts` asserts
+ * that one-way property across every harness and every advertisement shape.
+ */
+export function resolveHarnessCapabilities(
+  id: HarnessId,
+  advertisement?: HarnessRuntimeAdvertisement,
+): HarnessCapabilities {
+  const declared = deriveHarnessCapabilities(HARNESS_FACTS[id]);
+  if (!advertisement) {
+    return declared;
+  }
+
+  const options = advertisement.configOptions;
+  const capabilities: HarnessCapabilities = { ...declared };
+
+  // A config-option mechanism is only live if THIS session advertises the option
+  // it needs. OpenCode's `effort` is the load-bearing case: it is advertised
+  // only when the currently-selected model reasons, and it is absent at
+  // `session/new` with the default model (I1 R8).
+  if (
+    capabilities.canSetModelLive &&
+    HARNESS_FACTS[id].model.mechanism === "config-option" &&
+    !advertisesSelectableOption(options, "model")
+  ) {
+    capabilities.canSetModelLive = false;
+    capabilities.liveModelChangeReason = HARNESS_FACTS[id].liveModelChangeBlockedReason;
+  }
+  if (
+    capabilities.canSetDepthLive &&
+    HARNESS_FACTS[id].depth.mechanism === "config-option" &&
+    !advertisesSelectableOption(options, "effort")
+  ) {
+    capabilities.canSetDepthLive = false;
+  }
+
+  return capabilities;
+}
+
+/** The whole declared table, in `HARNESS_IDS` order. */
+export function listHarnessCapabilities(): HarnessCapabilities[] {
+  return HARNESS_IDS.map((id) => deriveHarnessCapabilities(HARNESS_FACTS[id]));
+}
+
+/** `true` when `value` names a harness this table declares. */
+export function isHarnessId(value: string): value is HarnessId {
+  return (HARNESS_IDS as readonly string[]).includes(value);
+}

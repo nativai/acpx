@@ -32,7 +32,12 @@ export { classifyConnectionStatus, formatPromptSessionBannerLine } from "./cli/o
 
 type SkillflagModule = typeof import("skillflag");
 
-const TOP_LEVEL_VERBS = new Set([
+export const TOP_LEVEL_VERBS = new Set([
+  // ⚠️ A verb missing from this set is registered as an AGENT NAME instead
+  // (`configurePublicCli`), so it "runs", prints "No acpx session found
+  // (searched up to /tmp)" and exits 0. Adding a top-level command means adding
+  // it here in the same commit.
+  "capabilities",
   "prompt",
   "exec",
   "cancel",
