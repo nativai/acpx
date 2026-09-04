@@ -21,6 +21,7 @@
  * never touches the network — it reads the cache or it stands aside.
  */
 
+import { depthMechanismForAgentCommand } from "../acp/harness-capabilities.js";
 import { AcpxOperationalError } from "../errors.js";
 import { findModelsById, loadCatalogue } from "./catalogue.js";
 import { nativeAgentTypesForSource } from "./harness-models.js";
@@ -171,6 +172,14 @@ export type ValidationInput = {
    * home, which is not a question the caller was asking.
    */
   agentName?: string;
+  /**
+   * Set only for a harness whose DESCRIPTOR fuses depth into the model id, where
+   * `gpt-5.6-sol[high]`'s bracket is an effort and must answer to the model's
+   * ladder. Left unset elsewhere because `sonnet[1m]`'s bracket is a
+   * context-window hint, and judging it against a depth ladder would refuse a
+   * form that works today.
+   */
+  assertBracketAsEffort?: boolean;
 };
 
 /**
@@ -205,6 +214,9 @@ export function validateModelSelection(
   }
   assertModelAvailable(model, ref, input.agentName);
   assertEffortInLadder(model, input.reasoningEffort);
+  if (input.assertBracketAsEffort === true) {
+    assertBracketInLadder(model, ref);
+  }
   return model;
 }
 
@@ -451,25 +463,133 @@ export function isModelValidatedAgent(agentName: string | undefined): boolean {
 }
 
 /**
- * Called on the `sessions new` path. Silent on success; throws one of the three
- * shapes (exit 2) otherwise. Skipped for the raw `--agent` escape hatch and for
- * harnesses whose models acpx does not enumerate.
+ * The id that actually goes to the harness — the SOURCE PREFIX RESOLVED AWAY and,
+ * for a harness that fuses depth into the id, the rung composed in.
+ *
+ * ⚠️ COMPOSE AFTER VALIDATE, NEVER INSTEAD OF IT. Every input here is a row
+ * `validateModelSelection` already admitted, so composition can only ever
+ * reshape a model this agent can run. Composing first would produce a
+ * well-formed `family[rung]` for a family the adapter never heard of — a string
+ * that looks right and fails later, which is a WORSE error than the one the user
+ * gets today, not a better one. (Three such families were live until 8ff8cfd.)
+ *
+ * ⚠️ THE RUNGS COME FROM THE MODEL'S OWN ADVERTISED LADDER (`depth.levels`),
+ * NEVER FROM A PER-FAMILY TABLE. `codexEffortCeiling` and friends are the
+ * catalogue's CONSTRUCTION of that ladder and are deliberately not consulted
+ * here: in Codex 0.153.x `ReasoningEffort` widened from a closed union to an
+ * open string, so a hardcoded rung list is wrong by construction going forward.
+ * Reading `depth.levels` means that when brick://8ca68c82 replaces the
+ * transcribed constant with the adapter's advertisement, this function follows
+ * with no edit.
+ *
+ * What each case produces, and the first three are the ones that MUST NOT MOVE:
+ *   `sonnet`                    → `sonnet`               (unchanged)
+ *   `opus[1m]`                  → `opus[1m]`             (a CONTEXT hint, not an
+ *                                                         effort — preserved verbatim)
+ *   `gpt-5.6-sol[medium]`       → `gpt-5.6-sol[medium]`  (byte-identical)
+ *   `claude-subscription:sonnet`→ `sonnet`               (prefix resolved away)
+ *   `gpt-5.6-sol` + effort high → `gpt-5.6-sol[high]`    (composed)
+ *   `chatgpt:gpt-5.6-sol`       → `gpt-5.6-sol[medium]`  (both, via the ladder default)
+ */
+export function composeEffectiveModelId(params: {
+  model: CatalogueModel;
+  ref: ParsedModelRef;
+  reasoningEffort: string | undefined;
+  /** From the DESCRIPTOR (`depth.mechanism === "compose-into-id"`), never from an agent name. */
+  depthFusedIntoId: boolean;
+}): string {
+  const { model, ref } = params;
+  const rung = params.depthFusedIntoId
+    ? fusedRung(model, ref, params.reasoningEffort)
+    : // Not a fused-depth harness: the bracket is whatever the caller wrote and
+      // means nothing to acpx (`[1m]` is a context window). Carry it through.
+      ref.bracket;
+  return rung === null ? model.id : `${model.id}[${rung}]`;
+}
+
+/**
+ * Precedence: an explicit `--reasoning-effort`, then the rung the caller already
+ * fused into the id, then the ladder's own default.
+ *
+ * `assertEffortInLadder` and `assertBracketInLadder` have already refused
+ * anything outside `depth.levels`, so no unverified rung reaches here — which is
+ * the whole reason composition is safe to do after validation and would not be
+ * before it.
+ */
+function fusedRung(
+  model: CatalogueModel,
+  ref: ParsedModelRef,
+  reasoningEffort: string | undefined,
+): string | null {
+  const depth = model.depth;
+  if (depth.kind !== "ladder") {
+    return null;
+  }
+  const requested = reasoningEffort?.trim().toLowerCase();
+  const explicit =
+    requested === undefined || requested === "" || requested === "default" ? null : requested;
+  return explicit ?? ref.bracket ?? depth.default;
+}
+
+/**
+ * For a fused-depth harness the BRACKET *is* the effort, so it answers to the
+ * same ladder `--reasoning-effort` does — otherwise `gpt-5.6-sol[bogus]` would
+ * compose straight back into itself and fail at the adapter.
+ *
+ * ⚠️ Gated on the mechanism, and that gate is load-bearing rather than tidy:
+ * on claude the bracket is a CONTEXT-WINDOW hint (`sonnet[1m]`), and checking it
+ * against a depth ladder would reject a form that works today.
+ */
+function assertBracketInLadder(model: CatalogueModel, ref: ParsedModelRef): void {
+  if (ref.bracket === null || ref.bracket === "") {
+    return;
+  }
+  const depth = model.depth;
+  if (depth.kind === "ladder" && (depth.levels as string[]).includes(ref.bracket.toLowerCase())) {
+    return;
+  }
+  throw new ModelSlugError(
+    `[acpx] --model "${ref.raw}" fuses the depth "${ref.bracket}" into the id, and that is not a ` +
+      `depth ${model.key} offers.\n  ${describeLadder(model)}`,
+    "MODEL_EFFORT_OUT_OF_LADDER",
+  );
+}
+
+/**
+ * Called on the `sessions new` path. Returns the id to actually spawn with —
+ * resolved and, where the harness fuses depth into the id, composed. `undefined`
+ * means "leave the flag exactly as the caller wrote it", which covers the raw
+ * `--agent` escape hatch, a harness acpx does not enumerate, and a cold cache.
+ * Throws one of the five shapes (exit 2) otherwise.
  */
 export async function validateSessionModelFlags(params: {
   agentName: string | undefined;
+  agentCommand: string | undefined;
   hasRawAgentOverride: boolean;
   model: string | undefined;
   reasoningEffort: string | undefined;
-}): Promise<void> {
+}): Promise<string | undefined> {
   if (params.hasRawAgentOverride) {
-    return;
+    return undefined;
   }
   if (!isModelValidatedAgent(params.agentName)) {
-    return;
+    return undefined;
   }
-  await validateModelSelectionFromCache({
+  const depthFusedIntoId = depthMechanismForAgentCommand(params.agentCommand) === "compose-into-id";
+  const ref = params.model?.trim() ? parseModelRef(params.model) : null;
+  const resolved = await validateModelSelectionFromCache({
     model: params.model,
     reasoningEffort: params.reasoningEffort,
     agentName: params.agentName,
+    ...(depthFusedIntoId ? { assertBracketAsEffort: true } : {}),
+  });
+  if (resolved === null || ref === null) {
+    return undefined;
+  }
+  return composeEffectiveModelId({
+    model: resolved,
+    ref,
+    reasoningEffort: params.reasoningEffort,
+    depthFusedIntoId,
   });
 }

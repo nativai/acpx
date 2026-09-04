@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { buildCatalogue } from "../src/models/catalogue.js";
 import {
+  composeEffectiveModelId,
   ModelSlugError,
   parseModelRef,
   validateModelSelection,
@@ -310,6 +311,142 @@ test("S2 GUARDRAIL — every native alias a claude session really serves still v
   assert.ok(validateModelSelection(catalogue, { model: "gpt-5.6-sol[high]", agentName: "codex" }));
 });
 
+// ── S3: composing the effective model id ─────────────────────────────────────
+//
+// One table, because the five constraints on this step are really five rows of
+// the same question — what exactly reaches the harness. The first three rows
+// MUST NOT MOVE; the last three are the new capability.
+
+const CODEX_CATALOGUE = () => catalogueWith();
+
+test("compose: the id that reaches the harness, across every input form", () => {
+  const catalogue = CODEX_CATALOGUE();
+  const cases: {
+    raw: string;
+    effort?: string;
+    fused: boolean;
+    agent: string;
+    expect: string;
+    why: string;
+  }[] = [
+    // ── unchanged forms (constraints 1 and 2) ──
+    { raw: "sonnet", fused: false, agent: "claude", expect: "sonnet", why: "native alias" },
+    {
+      raw: "opus[1m]",
+      fused: false,
+      agent: "claude",
+      expect: "opus[1m]",
+      why: "a CONTEXT hint, not an effort — must survive verbatim",
+    },
+    {
+      raw: "gpt-5.6-sol[medium]",
+      fused: true,
+      agent: "codex",
+      expect: "gpt-5.6-sol[medium]",
+      why: "the direct form that works today — byte-identical",
+    },
+    // ── new behaviour ──
+    {
+      raw: "claude-subscription:sonnet",
+      fused: false,
+      agent: "claude",
+      expect: "sonnet",
+      why: "the source prefix is resolved away, not forwarded raw",
+    },
+    {
+      raw: "gpt-5.6-sol",
+      effort: "high",
+      fused: true,
+      agent: "codex",
+      expect: "gpt-5.6-sol[high]",
+      why: "--reasoning-effort composed into the id",
+    },
+    {
+      raw: "chatgpt:gpt-5.6-sol",
+      fused: true,
+      agent: "codex",
+      expect: "gpt-5.6-sol[medium]",
+      why: "prefix resolved AND the ladder's own default composed in",
+    },
+  ];
+
+  for (const testCase of cases) {
+    const model = validateModelSelection(catalogue, {
+      model: testCase.raw,
+      reasoningEffort: testCase.effort,
+      agentName: testCase.agent,
+      ...(testCase.fused ? { assertBracketAsEffort: true } : {}),
+    });
+    assert.ok(model, `${testCase.raw} must validate`);
+    assert.equal(
+      composeEffectiveModelId({
+        model,
+        ref: parseModelRef(testCase.raw),
+        reasoningEffort: testCase.effort,
+        depthFusedIntoId: testCase.fused,
+      }),
+      testCase.expect,
+      `${testCase.raw} → ${testCase.expect} (${testCase.why})`,
+    );
+  }
+});
+
+test("compose: the RUNGS come from the model's own ladder, not from a shared list", () => {
+  // Constraint 5, and the reason it is not cosmetic: in Codex 0.153.x
+  // `ReasoningEffort` widened from a closed union to an open string, so any
+  // hardcoded rung list is wrong by construction. luna tops out at `max` and sol
+  // reaches `ultra` — the SAME harness, a different ladder — so a per-harness
+  // list cannot express this and a per-model one can.
+  const catalogue = CODEX_CATALOGUE();
+  const compose = (raw: string, effort?: string) => {
+    const model = validateModelSelection(catalogue, {
+      model: raw,
+      reasoningEffort: effort,
+      agentName: "codex",
+      assertBracketAsEffort: true,
+    });
+    assert.ok(model);
+    return composeEffectiveModelId({
+      model,
+      ref: parseModelRef(raw),
+      reasoningEffort: effort,
+      depthFusedIntoId: true,
+    });
+  };
+  assert.equal(compose("gpt-5.6-sol", "ultra"), "gpt-5.6-sol[ultra]");
+  // The same rung on luna is refused, by luna's OWN ladder — constraint 4.
+  const error = caught(() => compose("gpt-5.6-luna", "ultra"));
+  assert.equal(error.detailCode, "MODEL_EFFORT_OUT_OF_LADDER");
+  assert.match(error.message, /chatgpt:gpt-5\.6-luna accepts: low, medium, high, xhigh, max/);
+});
+
+test("compose: a bogus rung fused into the id is refused, and is NOT composed back", () => {
+  // Constraint 4 on the other input channel. Without this, `gpt-5.6-sol[bogus]`
+  // would compose straight back into itself and fail at the adapter — the exact
+  // "a well-formed string the adapter rejects" outcome the compose step must not
+  // create.
+  const error = caught(() =>
+    validateModelSelection(CODEX_CATALOGUE(), {
+      model: "gpt-5.6-sol[bogus]",
+      agentName: "codex",
+      assertBracketAsEffort: true,
+    }),
+  );
+  assert.equal(error.detailCode, "MODEL_EFFORT_OUT_OF_LADDER");
+  assert.match(error.message, /fuses the depth "bogus" into the id/);
+});
+
+test("compose: a claude bracket is NOT judged against a depth ladder", () => {
+  // The mirror of the test above, and why the check is gated on the MECHANISM
+  // rather than applied everywhere: `1m` is a context window, and refusing it
+  // would break `--model opus[1m]`, which works today.
+  const model = validateModelSelection(CODEX_CATALOGUE(), {
+    model: "opus[1m]",
+    agentName: "claude",
+  });
+  assert.equal(model?.id, "opus");
+});
+
 // ── The cold-cache rule ──────────────────────────────────────────────────────
 
 test("COLD CACHE: an unrecognised id passes through rather than blocking the create", () => {
@@ -337,18 +474,31 @@ test("COLD CACHE: a slug acpx DOES know is still validated", () => {
 test("validation is skipped for the raw --agent escape hatch and for unenumerated harnesses", async () => {
   // Neither of these may throw: acpx cannot judge a model id for a harness whose
   // catalogue it does not hold, and refusing on ignorance breaks a working create.
-  await validateSessionModelFlags({
-    agentName: "gemini",
-    hasRawAgentOverride: false,
-    model: "gemini-3-pro",
-    reasoningEffort: undefined,
-  });
-  await validateSessionModelFlags({
-    agentName: "claude",
-    hasRawAgentOverride: true,
-    model: "whatever-the-custom-server-takes",
-    reasoningEffort: undefined,
-  });
+  //
+  // S3 adds a second obligation to both: they must return `undefined`, meaning
+  // "leave the flag exactly as the caller wrote it". Returning a composed id for
+  // a harness acpx cannot judge would rewrite a working create's model on a
+  // guess — the compose step must only ever reshape a row validation admitted.
+  assert.equal(
+    await validateSessionModelFlags({
+      agentName: "gemini",
+      agentCommand: "gemini --acp",
+      hasRawAgentOverride: false,
+      model: "gemini-3-pro",
+      reasoningEffort: undefined,
+    }),
+    undefined,
+  );
+  assert.equal(
+    await validateSessionModelFlags({
+      agentName: "claude",
+      agentCommand: undefined,
+      hasRawAgentOverride: true,
+      model: "whatever-the-custom-server-takes",
+      reasoningEffort: undefined,
+    }),
+    undefined,
+  );
 });
 
 // ── The CLI itself, against the built artifact ───────────────────────────────

@@ -5,6 +5,7 @@ import { acpAdapterKind } from "../acp/agent-command.js";
 import { isLegacyZedCodexAcpInvocation } from "../acp/codex-compat.js";
 import {
   assertForkAtIndexHonoured,
+  depthMechanismForAgentCommand,
   depthRequestUnroutableReason,
   isDepthRequestRoutable,
   isHarnessId,
@@ -542,8 +543,26 @@ async function assertExplicitSubscriptionMatchesExistingSession(params: {
 function warnReasoningEffortNotRoutable(
   globalFlags: GlobalFlags,
   effectiveAgentName: string,
+  /**
+   * ⚠️ S3: on the CREATE path a `compose-into-id` harness now DOES honour the
+   * flag — the rung is composed into the model id (`gpt-5.6-sol` + `high` →
+   * `gpt-5.6-sol[high]`), so the value is not ignored and saying so would be the
+   * very contradiction this comment block was written about: measured
+   * 2026-09-04, `acpx --model gpt-5.6-sol --reasoning-effort high codex sessions
+   * new` printed "is ignored for agent codex" and then created the session on
+   * `gpt-5.6-sol[high]`.
+   *
+   * It stays a warning everywhere else, and that is not an oversight: a LIVE
+   * depth change on codex really is a no-op (no advertised `effort` option,
+   * MAP §4.4), and with no `--model` to compose into there is nothing for the
+   * rung to ride on either.
+   */
+  composedIntoModelId = false,
 ): void {
   if (!globalFlags.reasoningEffort || globalFlags.jsonStrict) {
+    return;
+  }
+  if (composedIntoModelId) {
     return;
   }
   if (isHarnessId(effectiveAgentName) && isDepthRequestRoutable(effectiveAgentName)) {
@@ -554,6 +573,23 @@ function warnReasoningEffortNotRoutable(
     : "acpx has no declared thinking-depth mechanism for it";
   process.stderr.write(
     `[acpx] --reasoning-effort is ignored for agent "${effectiveAgentName}": ${reason}\n`,
+  );
+}
+
+/**
+ * Whether `--reasoning-effort` will actually be honoured on the CREATE path by
+ * being composed into the model id.
+ *
+ * Descriptor, never the agent name — the same rule the two warnings above are
+ * built on. Both terms are required: the harness must fuse depth into the id,
+ * AND a `--model` must be present for the rung to ride on.
+ */
+function effortWillBeComposedIntoModelId(
+  agentCommand: string | undefined,
+  model: string | undefined,
+): boolean {
+  return (
+    depthMechanismForAgentCommand(agentCommand) === "compose-into-id" && Boolean(model?.trim())
   );
 }
 
@@ -2638,17 +2674,31 @@ export async function handleSessionsNew(
   // independent and complementary — the warnings say "acpx cannot route this flag
   // to this harness at all", the validation says "this value is not in the
   // harness's catalogue".
-  warnReasoningEffortNotRoutable(globalFlags, effectiveAgent.agentName);
+  warnReasoningEffortNotRoutable(
+    globalFlags,
+    effectiveAgent.agentName,
+    effortWillBeComposedIntoModelId(effectiveAgent.agentCommand, globalFlags.model),
+  );
   warnOutputStyleNotSupported(globalFlags, effectiveAgent.agentName);
   // Catalogue-backed `--model` / `--reasoning-effort` validation (C5 §6's three
   // error shapes). Reads the CACHE only — a create is never blocked on a
   // third-party fetch — and stands aside entirely when the cache is cold.
-  await validateSessionModelFlags({
+  // It also returns the id to actually spawn with: the `source:` prefix resolved
+  // away, and — for a harness whose DESCRIPTOR fuses depth into the id — the rung
+  // composed in, so `--model chatgpt:gpt-5.6-sol` reaches codex as
+  // `gpt-5.6-sol[medium]` instead of as a bare family it rejects. `undefined`
+  // means "leave the flag exactly as written" (raw --agent, an unenumerated
+  // harness, or a cold cache), which is why this is a substitution and not a
+  // rewrite: composition can only ever reshape a row validation just admitted.
+  const validatedModel = await validateSessionModelFlags({
     agentName: effectiveAgent.agentName,
+    agentCommand: effectiveAgent.agentCommand,
     hasRawAgentOverride: globalFlags.agent !== undefined,
     model: globalFlags.model,
     reasoningEffort: globalFlags.reasoningEffort,
   });
+  const spawnGlobalFlags =
+    validatedModel === undefined ? globalFlags : { ...globalFlags, model: validatedModel };
   const [{ createSession, closeSession }, { printCreatedSessionBanner, printNewSessionByFormat }] =
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
 
@@ -2673,7 +2723,7 @@ export async function handleSessionsNew(
     buildSessionStartOptions({
       agent: effectiveAgent,
       flags,
-      globalFlags,
+      globalFlags: spawnGlobalFlags,
       config,
       permissionMode,
       permissionPolicy,
