@@ -427,3 +427,28 @@ test("CLI: --format json is the long form of --json, on every verb that emits", 
   assert.notEqual(bad.status, 0);
   assert.match(bad.stderr, /Expected one of: text, json/);
 });
+
+test("CLI: a search NAMES a model, so an unavailable match is shown with its reason", () => {
+  // C5 D4: silently dropping a model the user typed the exact name of teaches
+  // them the picker is broken. `--all` governs the unsearched list, not this.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-models-cli-"));
+  fs.mkdirSync(path.join(home, ".acpx"), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, ".acpx", "models-cache.json"),
+    JSON.stringify({
+      fetchedAt: new Date().toISOString(),
+      models: [
+        { id: "vendor/only-batch:batch", name: "Only Batch", supported_parameters: ["tools"] },
+      ],
+    }),
+  );
+  const result = runCli(["models", "--search", "only-batch"], home);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /only-batch/);
+  assert.match(result.stdout, /batch endpoint/);
+  assert.doesNotMatch(result.stdout, /No model matches/);
+
+  // The unsearched list still hides it by default, and --all reveals it.
+  assert.doesNotMatch(runCli(["models"], home).stdout, /only-batch/);
+  assert.match(runCli(["models", "--all"], home).stdout, /only-batch/);
+});

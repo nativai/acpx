@@ -210,12 +210,23 @@ function renderFooter(
   );
 }
 
+/**
+ * ⚠️ SEARCH SHOWS UNAVAILABLE MATCHES, ALWAYS — `--all` governs the UNSEARCHED
+ * list, not this.
+ *
+ * The two specs each rule on their own surface and they do not conflict once
+ * scoped: C5 §6 says the CLI hides unavailable rows by default (that is the
+ * banded list), and C5 D4 says *"unavailable rows still appear in search
+ * results, ranked last — silently dropping a model the user typed the exact
+ * name of teaches them the picker is broken."* Someone who types a slug has
+ * named a specific model; answering "no match" when it exists and cannot be
+ * used is the one outcome that teaches the wrong lesson. The reason is printed
+ * under the row, so the constraint is taught where it bites.
+ */
 function renderSearch(catalogue: ModelCatalogue, flags: ModelsFlags): string {
   const agentType = flags.agent?.trim() || undefined;
   const favorites = new Set(catalogue.models.filter((model) => model.favorite).map((m) => m.key));
-  const matches = searchModels(catalogue.models, flags.search ?? "", favorites).filter(
-    (match) => flags.all === true || isAvailableForAgent(match.model, agentType),
-  );
+  const matches = searchModels(catalogue.models, flags.search ?? "", favorites);
 
   let text = "";
   for (const match of matches) {
