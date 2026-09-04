@@ -11,6 +11,7 @@ import {
   type DepthModeApplyClient,
   recordDepthOutcome,
 } from "./depth-application.js";
+import type { DepthProjection } from "./depth-projection.js";
 import { getDesiredConfigOptions, setDesiredConfigOption } from "./mode-preference.js";
 import { assertOutputStyleAdvertised, OUTPUT_STYLE_CONFIG_ID } from "./output-style.js";
 
@@ -112,7 +113,25 @@ export function normalizeEffortLevelForModel(
 type ConfigOptionApplyResult = {
   value: string;
   response?: { configOptions?: SessionConfigOption[] };
+  /**
+   * HOW `value` came to be — the difference between "the agent served this" and
+   * "acpx decided this and never asked" (F-14, brick 06ae06c1). Without it the
+   * two are indistinguishable downstream, which is exactly how a level that
+   * never left acpx came to be recorded as served exactly.
+   */
+  wire: ConfigOptionWireKind;
 };
+
+/** Where a served config-option value actually came from. */
+export type ConfigOptionWireKind =
+  /** acpx put it on the wire and the agent did not reject it. */
+  | "sent"
+  /** The agent already advertised it as current, so no set was performed. Still
+   *  a wire value: the agent is the one that said so. */
+  | "already-current"
+  /** The agent REJECTED the set and acpx fell back to the advertised default.
+   *  The fallback is acpx's inference, not the agent's word. */
+  | "rejected-fallback";
 
 type ConfigOptionApplyParams = {
   client: ConfigOptionApplyClient;
@@ -147,10 +166,11 @@ async function applyConfigOptionIfAdvertised(
     );
   }
   if (option.currentValue === value) {
-    return { value }; // already at the normalized value
+    // Already at the normalized value — still the AGENT's word, since
+    // `currentValue` came from its own advertisement, so it counts as wire.
+    return { value, wire: "already-current" };
   }
-  const response = await setConfigOptionWithEffortFallback(params, option, value);
-  return { value: response.value, response: response.response };
+  return await setConfigOptionWithEffortFallback(params, option, value);
 }
 
 async function setConfigOptionWithEffortFallback(
@@ -163,7 +183,7 @@ async function setConfigOptionWithEffortFallback(
       params.client.setSessionConfigOption(params.sessionId, params.configId, value),
       params.timeoutMs,
     );
-    return { value, response };
+    return { value, response, wire: "sent" };
   } catch (error) {
     if (params.configId !== "effort") {
       throw error;
@@ -188,7 +208,12 @@ function rejectedEffortFallback(
       `[acpx] config option effort=${value} was rejected by the agent; keeping ${fallback ?? "default"}\n`,
     );
   }
-  return { value: fallback ?? value };
+  // ⚠️ `fallback ?? value` CAN RETURN THE REQUESTED VALUE THE AGENT JUST
+  // REFUSED — when no advertised default resolves, the fallback is the rejected
+  // level itself. That is one of the two ways a level the agent said NO to used
+  // to be recorded as served exactly (F-14); `wire` is what keeps the two
+  // distinguishable downstream, because the VALUE alone cannot be.
+  return { value: fallback ?? value, wire: "rejected-fallback" };
 }
 
 /**
@@ -212,9 +237,10 @@ export async function applyRequestedConfigOptionsIfAdvertised(params: {
   modelId?: string;
   timeoutMs?: number;
   verbose?: boolean;
-}): Promise<void> {
+}): Promise<EffortWireOutcome | undefined> {
   const desired = getDesiredConfigOptions(params.record.acpx);
   const advertised = params.advertised ?? [];
+  let effortOutcome: EffortWireOutcome | undefined;
 
   for (const [configId, value] of Object.entries(desired)) {
     const result = await applyConfigOptionIfAdvertised({
@@ -227,6 +253,9 @@ export async function applyRequestedConfigOptionsIfAdvertised(params: {
       timeoutMs: params.timeoutMs,
       verbose: params.verbose,
     });
+    if (configId === "effort") {
+      effortOutcome = describeEffortWire(value, result);
+    }
     if (!result) {
       continue;
     }
@@ -237,6 +266,59 @@ export async function applyRequestedConfigOptionsIfAdvertised(params: {
       applyConfigOptionsToRecord(params.record, result.response);
     }
   }
+  return effortOutcome;
+}
+
+/**
+ * What actually happened to `effort` ON THE WIRE (F-14, brick 06ae06c1).
+ *
+ * ⚠️ THIS EXISTS BECAUSE THE RECORD CANNOT ANSWER THE QUESTION. The caller writes
+ * the REQUESTED level into `desired_config_options.effort` before applying it, so
+ * re-reading that field after the apply compares the request with itself and can
+ * only ever say "exact" — including on the two paths where nothing was served:
+ * the level was SKIPPED and never sent, or the agent REJECTED it and the fallback
+ * resolved back to the rejected level. Both look identical in the record.
+ */
+export interface EffortWireOutcome {
+  /** The level the caller asked for. */
+  requested: string;
+  /** What acpx put on the wire, or confirmed already current. Absent ⇒ nothing
+   *  reached the agent. */
+  sent?: string;
+  /**
+   * What the agent said it is now serving, taken from the SET-RESPONSE's own
+   * refreshed advertisement — the agent's word rather than acpx's.
+   *
+   * ⚠️ Absent for an agent that returns no refreshed options, which is NOT the
+   * same as "the agent confirmed the sent value". Do not treat it as agreement.
+   */
+  acknowledged?: string;
+  /** How `sent` came to be — see `ConfigOptionWireKind`. `skipped` ⇒ no wire
+   *  traffic at all for this option. */
+  wire: ConfigOptionWireKind | "skipped";
+}
+
+function describeEffortWire(
+  requested: string,
+  result: ConfigOptionApplyResult | undefined,
+): EffortWireOutcome {
+  if (!result) {
+    return { requested, wire: "skipped" };
+  }
+  return {
+    requested,
+    sent: result.value,
+    acknowledged: acknowledgedEffort(result.response),
+    wire: result.wire,
+  };
+}
+
+/** The `effort` level the agent advertises as current in its OWN set-response. */
+function acknowledgedEffort(
+  response: { configOptions?: SessionConfigOption[] } | undefined,
+): string | undefined {
+  const option = response?.configOptions?.find((entry) => entry.id === "effort");
+  return typeof option?.currentValue === "string" ? option.currentValue : undefined;
 }
 
 /**
@@ -300,7 +382,7 @@ export async function persistAndApplyRequestedEffort(params: {
     return;
   }
   setDesiredConfigOption(params.record, "effort", params.reasoningEffort);
-  await applyRequestedConfigOptionsIfAdvertised({
+  const wire = await applyRequestedConfigOptionsIfAdvertised({
     client: params.client,
     sessionId: params.sessionId,
     record: params.record,
@@ -322,28 +404,75 @@ export async function persistAndApplyRequestedEffort(params: {
   // exactly the harness the field was built for — measured on opencode by hp-te2:
   // the key missing after a turn that demonstrably ran.
   //
-  // The value is read back from the record rather than assumed, so what is
-  // recorded is what was actually applied. `recordDepthOutcome` is a no-op for
-  // the Claude family, so their records are untouched by this.
-  const servedEffort = getDesiredConfigOptions(params.record.acpx).effort;
-  recordDepthOutcome(
-    params.record,
-    servedEffort === undefined
-      ? {
-          kind: "unavailable",
-          requested: params.reasoningEffort,
-          reason:
-            "the agent advertises an `effort` option but declined this level for the current model",
-        }
-      : servedEffort === params.reasoningEffort
-        ? { kind: "exact", value: servedEffort, requested: params.reasoningEffort }
-        : {
-            kind: "projected",
-            value: servedEffort,
-            requested: params.reasoningEffort,
-            reason: `"${params.reasoningEffort}" is not a supported level for this model — applied "${servedEffort}"`,
-          },
-  );
+  // ⚠️ AND IT IS DERIVED FROM THE WIRE, NEVER RE-READ FROM THE RECORD (F-14,
+  // brick 06ae06c1). The line that stood here was
+  //
+  //     const servedEffort = getDesiredConfigOptions(params.record.acpx).effort;
+  //
+  // three statements after `setDesiredConfigOption` wrote the REQUESTED level
+  // into that very field. It compared the request with itself, so it could only
+  // ever return "exact" — and it did so on both paths where nothing was served:
+  // when the level was SKIPPED and never sent, and when the agent REJECTED it and
+  // the fallback resolved back to the rejected level. The comment above that line
+  // claimed "what is recorded is what was actually applied", which is the
+  // property the code did not have.
+  //
+  // `recordDepthOutcome` is a no-op for the Claude family, so their records are
+  // untouched by this.
+  recordDepthOutcome(params.record, depthOutcomeFromWire(params.reasoningEffort, wire));
+}
+
+/**
+ * Turn what happened on the wire into the recorded depth outcome.
+ *
+ * The rule, stated once: **`exact` requires positive evidence that the agent
+ * serves the requested level.** Anything less is `projected` (we know what it
+ * serves instead) or `unavailable` (we do not know that it serves anything).
+ */
+function depthOutcomeFromWire(
+  requested: string,
+  wire: EffortWireOutcome | undefined,
+): DepthProjection {
+  if (!wire || wire.wire === "skipped") {
+    return {
+      kind: "unavailable",
+      requested,
+      reason:
+        "the agent advertises an `effort` option but declined this level for the current model, so nothing was sent",
+    };
+  }
+  if (wire.wire === "rejected-fallback") {
+    // The agent said NO. Even when the fallback happens to equal the requested
+    // level, a rejection is not a service — recording `exact` here is the exact
+    // falsehood F-14 was filed for.
+    return {
+      kind: "unavailable",
+      requested,
+      reason: `the agent REJECTED "${requested}"; acpx kept "${wire.sent}" as the advertised fallback, which the agent has not confirmed`,
+    };
+  }
+  // `acknowledged` is the agent's own word and outranks what acpx sent; `sent`
+  // is the fallback for an agent that returns no refreshed advertisement.
+  const served = wire.acknowledged ?? wire.sent;
+  if (served === undefined) {
+    return {
+      kind: "unavailable",
+      requested,
+      reason: "the agent neither acknowledged nor was sent a level for this request",
+    };
+  }
+  if (served === requested) {
+    return { kind: "exact", value: served, requested };
+  }
+  return {
+    kind: "projected",
+    value: served,
+    requested,
+    reason:
+      wire.acknowledged !== undefined
+        ? `"${requested}" is not a supported level for this model — the agent reports serving "${served}"`
+        : `"${requested}" is not a supported level for this model — applied "${served}"`,
+  };
 }
 
 /**
