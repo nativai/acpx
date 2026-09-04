@@ -68,21 +68,39 @@ function configDirName(harness: HarnessId, sessionId: string): string {
 }
 
 /**
- * Remove one spawn's config dir. Best-effort: a failure here must never surface
- * as a session-close error, because the orphan sweep below is the guarantee.
- */
-/**
  * Where a config dir records WHO is currently using it (brick 4a6fdda0).
  *
- * ⚠️ INSIDE the config dir, not beside it — deliberately, and the placement is
- * MEASURED rather than assumed. A sibling directory would need its own cleanup
- * and would either collide with the sweep's `acpx-` prefix or escape it
- * entirely. Inside, it disappears with the directory it describes. The risk that
- * buys is a harness tripping over an unexpected entry, so it was checked at
- * source: pi-acp 0.0.33's ONLY recursive enumeration is `loadCommandsFromDir`
- * over `~/.pi/agent/prompts` and `<cwd>/.pi/prompts`, reading `.md` files —
- * never `PI_CODING_AGENT_DIR` itself. OpenCode is pointed at `<dir>/opencode`
- * and reads that, so a dot-prefixed sibling of it is outside what it looks at.
+ * ⚠️ INSIDE the config dir, not beside it — deliberately. A sibling directory
+ * would need its own cleanup and would either collide with the sweep's `acpx-`
+ * prefix or escape the sweep entirely, and a holders root no reaper can see is a
+ * leak with no reaper. Inside, it disappears with the directory it describes.
+ *
+ * ## ⚠️ THE RISK THAT BUYS, AND THE FROZEN MEASUREMENT THAT BOUNDS IT
+ *
+ * Putting acpx's bookkeeping inside a directory a HARNESS reads is only safe if
+ * the harness does not enumerate it. That was checked at source rather than
+ * assumed:
+ *
+ *   **pi-acp 0.0.33** — its ONLY recursive enumeration is `loadCommandsFromDir`,
+ *   over `~/.pi/agent/prompts` and `<cwd>/.pi/prompts`, reading `.md` files. It
+ *   never enumerates `PI_CODING_AGENT_DIR` itself.
+ *   **OpenCode** — pointed at `<dir>/opencode` and reads that, so a dot-prefixed
+ *   sibling of that path is outside what it looks at.
+ *
+ * ⚠️ **THAT IS A VERSION-PINNED MEASUREMENT, NOT A PROPERTY.** It is the same
+ * shape of fact as the `pi-acp` `session/set_model` capability cell, which was
+ * TRUE and WENT STALE between 0.0.26 and 0.0.33 with nothing failing to announce
+ * it — and as `piWireDepthValue`'s ladder, which carries the same warning. **A
+ * future pi-acp that enumerates its own agent dir turns this safe placement into
+ * a harness-visible artifact, silently.**
+ *
+ * **RE-MEASURE TRIGGER: when the pinned `pi-acp` version in `agent-registry.ts`
+ * moves.** Re-run the check — grep the adapter's dist for `readdirSync` and
+ * confirm no enumeration roots at `PI_CODING_AGENT_DIR` — and update the version
+ * named above. The `pi does NOT get a generated models-store.json` row pins pi's
+ * exact directory listing, acpx bookkeeping and harness-visible entries as two
+ * separate lists, so it fails on any NEW entry; it cannot, however, notice the
+ * harness starting to read an entry that was already there.
  */
 const HOLDERS_DIR = ".acpx-holders";
 
