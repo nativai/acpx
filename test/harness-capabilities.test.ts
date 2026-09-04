@@ -315,13 +315,52 @@ test("midTurnSteering agrees with acpx's own injection predicate", () => {
 });
 
 test("primerChannel agrees with the channel acpx actually resolves", () => {
+  // ⚠️ THESE TWO ANSWER DIFFERENT QUESTIONS, and B3 is where they stop coinciding.
+  //
+  //  - `resolvePrimerChannel` answers "which ACP `_meta` channel carries the
+  //    primer?" — `none` for opencode and pi is CORRECT and permanent: neither
+  //    adapter has a `_meta` primer channel to bind to (I1 R9 measured
+  //    `_meta.systemPrompt.append` accepted and SILENTLY IGNORED; pi-acp handles
+  //    `_meta` only for `terminal-auth` and `piAcp.queueDepth`).
+  //  - the descriptor cell answers "how does acpx DELIVER the primer?" — which
+  //    for those two is now `config-file`, because B3 writes it there.
+  //
+  // Asserting equality across all five would force one of the two to lie. The
+  // relationship that must hold is: a harness with a `_meta` channel declares
+  // exactly that channel; a harness without one declares `config-file` if acpx
+  // writes a config dir for it, and `none` only if acpx delivers no primer at all.
   for (const id of HARNESS_IDS) {
+    const declared = HARNESS_FACTS[id].primerChannel;
+    const metaChannel = resolvePrimerChannel(DEFAULT_AGENT_COMMANDS[id]);
+    if (metaChannel !== "none") {
+      assert.equal(
+        declared,
+        metaChannel,
+        `${id}: it HAS a _meta primer channel, so the descriptor must name that one`,
+      );
+      continue;
+    }
     assert.equal(
-      HARNESS_FACTS[id].primerChannel,
-      resolvePrimerChannel(DEFAULT_AGENT_COMMANDS[id]),
-      `${id}: the declared cell and resolvePrimerChannel disagree. A harness whose primer path ` +
-        "exists but is not wired declares `none` until acpx writes it.",
+      declared,
+      "config-file",
+      `${id}: no _meta channel, so the primer must come from the config dir — ` +
+        "declaring `none` here means acpx silently delivers no primer at all",
     );
+  }
+});
+
+test("the config-file cell is the GATE on adapter env, so its population is pinned", () => {
+  // This cell decides which harnesses' adapters gain environment variables
+  // (src/acp/harness-config-dir.ts). Pinned as a population so widening it is a
+  // deliberate, reviewed act rather than a side effect of editing one row —
+  // adding a harness here hands its adapter new env entries.
+  assert.deepEqual(
+    HARNESS_IDS.filter((id) => HARNESS_FACTS[id].primerChannel === "config-file"),
+    ["opencode", "pi"],
+  );
+  // And the three the program requires untouched are NOT in it.
+  for (const id of ["claude", "claude-pty", "codex"] as const) {
+    assert.notEqual(HARNESS_FACTS[id].primerChannel, "config-file", id);
   }
 });
 

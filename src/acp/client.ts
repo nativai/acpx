@@ -118,6 +118,8 @@ import {
 } from "./client-process.js";
 import { isCodexAcpCommand } from "./codex-compat.js";
 import { extractAcpError } from "./error-shapes.js";
+import { HARNESS_FACTS, harnessIdForAgentCommand } from "./harness-capabilities.js";
+import { applyHarnessConfigDir, reportHarnessConfigDir } from "./harness-config-dir.js";
 import {
   avoidBidirectionalJsonRpcIdCollisions,
   isAcpMessageObject,
@@ -847,6 +849,16 @@ export class AcpClient {
     // collide (see applyBoxProviderEnv's contract — on Claude the key is inert).
     applyBoxProviderEnv(spawnOptions.env);
     await this.applyProfileEnv(spawnOptions.env);
+    // B3: the per-session harness config dir — primer + model pin + catalogue
+    // fragment, one directory (CONCEPTION §5.3). GATED PER HARNESS off the
+    // descriptor's `primerChannel === "config-file"`, so only opencode and pi
+    // receive it and claude / claude-pty / codex adapter environments are
+    // untouched. Applied unconditionally here it would be a real behaviour change
+    // to three harnesses this program requires to stay identical.
+    //
+    // ⚠️ This is the ADAPTER boundary, one level downstream of the rig shim's
+    // capture — RS-01 cannot observe it in either direction. RS-13 is its evidence.
+    await this.applyHarnessConfigDirEnv(spawnOptions.env);
     return {
       spawnCommand,
       args,
@@ -856,6 +868,44 @@ export class AcpClient {
       claudeAcp: isClaudeAcpCommand(spawnCommand, args),
       spawnOptions,
     };
+  }
+
+  /**
+   * Write the per-session harness config dir and point the adapter at it.
+   *
+   * The primer is resolved with the SPAWN env (not `process.env`) for the same
+   * reason `resolveSessionPrimer` makes that argument required: the primer script
+   * reads the session's own environment, and passing the wrong one silently
+   * renders somebody else's context.
+   *
+   * ⚠️ Ordering: this runs AFTER `applyBoxProviderEnv` and `applyProfileEnv`, so
+   * the primer script sees the fully-built child environment — including the
+   * provider credential — exactly as the adapter will.
+   */
+  private async applyHarnessConfigDirEnv(env: NodeJS.ProcessEnv): Promise<void> {
+    if (!this.wantsHarnessConfigDir()) {
+      return; // the gate, checked before any work is done
+    }
+    const plan = applyHarnessConfigDir({
+      env,
+      agentCommand: this.options.agentCommand,
+      sessionId: this.options.sessionContext?.acpxRecordId?.trim() || "session",
+      primer: await resolveSessionPrimer(env),
+      model: this.options.sessionOptions?.model,
+      provisionModelId: this.options.sessionOptions?.model,
+    });
+    reportHarnessConfigDir(plan, this.options.verbose);
+  }
+
+  /**
+   * THE PER-HARNESS GATE, asked BEFORE any work is done — notably before
+   * `resolveSessionPrimer`, which spawns a process. Rendering a primer for an
+   * agent that will never be handed one is wasted work on every claude and codex
+   * spawn, and `applyHarnessConfigDir` re-checks the same cell anyway.
+   */
+  private wantsHarnessConfigDir(): boolean {
+    const harness = harnessIdForAgentCommand(this.options.agentCommand);
+    return harness !== undefined && HARNESS_FACTS[harness].primerChannel === "config-file";
   }
 
   /**

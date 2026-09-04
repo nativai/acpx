@@ -98,6 +98,22 @@ export type SessionIndexEntry = {
   // (older record / capability not captured) → acpx-ui treats absent as off.
   promptImageSupported?: boolean;
   desiredEffort?: string;
+  /**
+   * What the depth request ACTUALLY produced — the outcome kind, and the value
+   * served when one was (B3, CONCEPTION §6.2).
+   *
+   * ⚠️ Projected onto the INDEX ENTRY, not only into the detail view, and the
+   * reason is the same one `forkedAtMessageIndexRequested` documents above: the
+   * chat header reads its view from the entry on the enriched hot path (acpx-ui
+   * `projectEntryToRawView`, where `sessionData` is null), so a field that stops
+   * at the record fails only at RUNTIME while typecheck and build stay green.
+   *
+   * ⚠️ `desiredEffort` above is the REQUEST. Without these two the header can
+   * show a request that was never honoured with nothing to say so — which is the
+   * silent drop this block exists to end, relocated one layer up.
+   */
+  depthOutcome?: string;
+  depthServed?: string;
   // brick://874fee67 — projected so acpx-ui's hot-path (record-skipping) session
   // rebuild shows the real style in the chat header instead of a UI default
   // (the brick://4d517be2 failure class: passes typecheck+build, fails only at
@@ -333,6 +349,8 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     sessionModel: optionalString(record.sessionModel),
     promptImageSupported: optionalBoolean(record.promptImageSupported),
     desiredEffort: optionalString(record.desiredEffort),
+    depthOutcome: optionalString(record.depthOutcome),
+    depthServed: optionalString(record.depthServed),
     // brick://874fee67: BOTH index legs. This parser reconstructs an entry from
     // index.json on reconcile — miss it and an acpx-ui-written entry is stripped
     // on the next daemon rewrite, exactly as autoSubscription is parsed above.
@@ -448,6 +466,8 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     sessionModel: sessionOptions?.model,
     promptImageSupported: promptImageSupportedFromRecord(record),
     desiredEffort: acpx?.desired_config_options?.effort,
+    depthOutcome: acpx?.depth_projection?.outcome,
+    depthServed: acpx?.depth_projection?.served,
     outputStyleDesired: sessionOptions?.output_style,
     outputStyleSupported: outputStyleSupportedFromRecord(acpx),
     outputStyleApplied: acpx?.applied_output_style,

@@ -92,9 +92,14 @@ export type ForkAtIndexSupport = "exact" | "turn-granular" | "ignored" | "unsupp
  * Which channel acpx uses to deliver the OS primer. Wider than
  * `PrimerChannel` in `./agent-command.ts` by one value: `config-file` is the
  * measured-available path for OpenCode (`opencode.json` `instructions`, I1 R9)
- * and Pi (`$PI_CODING_AGENT_DIR/APPEND_SYSTEM.md`, I2 R9). acpx does not write
- * either file yet, so both harnesses declare `none` here today; the block that
- * lands the per-session config dir moves those two cells.
+ * and Pi (`$PI_CODING_AGENT_DIR/APPEND_SYSTEM.md`, I2 R9), and B3 writes both —
+ * see `src/acp/harness-config-dir.ts`.
+ *
+ * ⚠️ **THIS CELL IS A GATE, NOT ONLY A LABEL.** `applyHarnessConfigDir` gives a
+ * per-session config dir — and therefore adapter ENVIRONMENT VARIABLES — to
+ * exactly the harnesses whose value here is `config-file`. Changing a cell to
+ * `config-file` hands that harness's adapter new env entries; changing one away
+ * silently removes its primer. It is not a descriptive string.
  */
 export type HarnessPrimerChannel =
   | "system-prompt"
@@ -561,8 +566,11 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
     midTurnSteering: false, // src/acp/mid-turn-injection-support.ts:5-20 — not on the allow-list (I1 R3)
     // I1 R9: `_meta.systemPrompt.append` is accepted and SILENTLY IGNORED. The
     // working path is `opencode.json` `"instructions"` in a per-session config
-    // dir, which acpx does not write yet — so acpx delivers no primer today.
-    primerChannel: "none",
+    // dir — which B3 now writes (src/acp/harness-config-dir.ts), so the primer
+    // reaches OpenCode in turn 1 and across a resume. THIS CELL IS THE GATE: only
+    // a `config-file` harness is given a config dir, which is what keeps claude /
+    // claude-pty / codex adapter environments untouched.
+    primerChannel: "config-file",
     usageReporting: true, // I1 R12 — `usage_update` over ACP plus per-session cost/tokens in its store
     promptImages: true, // I1 R11 — `promptCapabilities: {embeddedContext:true, image:true}`
     // I1 R7: with no OpenRouter key the harness's own default is the Zen free
@@ -607,8 +615,9 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
     // I2 R9: pi-acp handles `_meta` only for `terminal-auth` and
     // `piAcp.queueDepth` — there is no `_meta.systemPrompt` channel to bind to.
     // The path that survives the ACP hop is `$PI_CODING_AGENT_DIR/APPEND_SYSTEM.md`,
-    // which acpx does not write yet.
-    primerChannel: "none",
+    // which B3 now writes (src/acp/harness-config-dir.ts). Measured by I2 to
+    // survive a SIGKILL of both pi and pi-acp followed by a resume.
+    primerChannel: "config-file",
     // I2 R12: no usage/token field in any `session/update`; the `session/prompt`
     // result is a bare `{"stopReason":"end_turn"}`. Pi's own JSONL has the data;
     // pi-acp does not carry it over ACP.

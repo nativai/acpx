@@ -363,6 +363,13 @@ function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
   assignServedState(state, record.served);
   assignServedBelowFloor(state, record.served_below_floor);
   assignFloorParked(state, record.floor_parked);
+  // B3: the depth-projection outcome MUST round-trip for the same reason the
+  // served block does. It is the ONLY record of what a --reasoning-effort request
+  // actually produced (three of its six outcomes send no value at all, so
+  // served.effort cannot carry them), and the invariant it serves is "a depth
+  // request is never silently dropped". Lost on a cold reload, the request is
+  // silently dropped again one owner respawn later — the defect wearing a fix.
+  assignDepthProjection(state, record.depth_projection);
 
   return state;
 }
@@ -382,6 +389,19 @@ function assignServedState(state: SessionAcpxState, raw: unknown): void {
   if (Object.keys(parsed).length > 0) {
     state.served = parsed as NonNullable<SessionAcpxState["served"]>;
   }
+}
+
+function assignDepthProjection(state: SessionAcpxState, raw: unknown): void {
+  const crumb = asRecord(raw);
+  // `requested` and `outcome` are REQUIRED: an outcome with neither names no
+  // request and no result, which is exactly the silence this field exists to end.
+  if (typeof crumb?.requested !== "string" || typeof crumb.outcome !== "string") {
+    return;
+  }
+  const parsed: Record<string, unknown> = { requested: crumb.requested, outcome: crumb.outcome };
+  copyStringField(parsed, crumb, "served");
+  copyStringField(parsed, crumb, "reason");
+  state.depth_projection = parsed as NonNullable<SessionAcpxState["depth_projection"]>;
 }
 
 function assignServedBelowFloor(state: SessionAcpxState, raw: unknown): void {

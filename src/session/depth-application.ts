@@ -102,6 +102,20 @@ function reportDepth(verbose: boolean | undefined, message: string | undefined):
  * stamp is durable. Verified before relying on it.
  */
 export function recordDepthOutcome(record: SessionRecord, projection: DepthProjection): void {
+  // ⚠️ NO DEPTH REQUEST ⇒ THE KEY IS ABSENT. Not `null`, not `{}` — absent.
+  //
+  // Every default claude / claude-pty / codex spawn makes no depth request, and
+  // their records must stay byte-comparable to today's. A record that gains a key
+  // has a CHANGED SHAPE, and record shape is consumed by parse, serialize, the
+  // index projection and the UI — so "we added a field but it is null for you" is
+  // a behaviour change wearing a reassuring value.
+  //
+  // This guard makes an empty write structurally impossible rather than trusting
+  // every caller to check first. `requested` is required on the outcome precisely
+  // so there is no valid shape for "an outcome with no request".
+  if (!projection.requested.trim()) {
+    return;
+  }
   if (isClaudeFamilyAgent(record.agentCommand)) {
     return;
   }
