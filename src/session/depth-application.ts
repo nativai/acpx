@@ -120,12 +120,25 @@ export function recordDepthOutcome(record: SessionRecord, projection: DepthProje
     return;
   }
   const acpx = record.acpx ?? (record.acpx = {});
-  acpx.served = {
-    ...acpx.served,
-    ...(projection.value ? { effort: projection.value } : {}),
-    source: DEPTH_PROJECTION_SERVED_SOURCE,
-    at: new Date().toISOString(),
-  };
+  // ⚠️ ONLY WHEN A VALUE WAS ACTUALLY SERVED. An `unavailable` or rejected
+  // outcome sends nothing, so writing a `served` block for it would assert a
+  // served truth that does not exist — the same dishonesty this whole block was
+  // built to end, one field over. It also matters because `served` is ABSENT for
+  // codex on this build (a MEASURED baseline the programme relies on in two
+  // places), and an `--reasoning-effort` on codex always lands in the
+  // `unavailable` arm: writing here unconditionally gave every such session a
+  // `served` block carrying only `{at, source}` and no model and no effort.
+  //
+  // The outcome is never lost by this — `depth_projection` below records it
+  // whether or not anything was served. That is exactly why that field exists.
+  if (projection.value) {
+    acpx.served = {
+      ...acpx.served,
+      effort: projection.value,
+      source: DEPTH_PROJECTION_SERVED_SOURCE,
+      at: new Date().toISOString(),
+    };
+  }
   acpx.depth_projection = {
     requested: projection.requested,
     outcome: projection.kind,

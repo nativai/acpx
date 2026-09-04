@@ -892,7 +892,25 @@ export class AcpClient {
       sessionId: this.options.sessionContext?.acpxRecordId?.trim() || "session",
       primer: await resolveSessionPrimer(env),
       model: this.options.sessionOptions?.model,
-      provisionModelId: this.options.sessionOptions?.model,
+      // ⚠️ NO `provisionModelId`, DELIBERATELY — and the same asymmetry that kept
+      // Pi's catalogue fragment out applies here, which the first version of this
+      // call got wrong by passing the pinned model unconditionally.
+      //
+      // Provisioning declares `provider.openrouter.models.<slug>: {}`. For a slug
+      // OUTSIDE OpenCode's bundled models.dev snapshot that is what makes it
+      // resolvable at all (I1 R6). For a slug ALREADY IN the snapshot — which is
+      // every model acpx can currently pin, since `acceptsArbitraryModelIds` is
+      // false for opencode — it declares an EMPTY config over an existing entry,
+      // and whether OpenCode deep-merges that or REPLACES the entry is NOT
+      // MEASURED. If it replaces, the model loses its bundled metadata including
+      // its `reasoning` support, which is precisely what the `effort` option is
+      // advertised from — so the post-model re-read would find no ladder and depth
+      // would silently stop working for every pinned model.
+      //
+      // Since acpx declares arbitrary model ids UNSUPPORTED for opencode today,
+      // provisioning buys nothing and risks that. The mechanism stays in
+      // `harness-config-dir.ts` and is unit-tested; it is switched on by passing
+      // this field, once B5 measures the merge semantics.
     });
     reportHarnessConfigDir(plan, this.options.verbose);
   }

@@ -310,3 +310,30 @@ test("the depth outcome SURVIVES the per-turn acpx-state clone", async () => {
   // mutation of the clone rewrite the record's own breadcrumb.
   assert.notEqual(cloned?.depth_projection, acpx.depth_projection);
 });
+
+test("an outcome that served NOTHING must not write a served block", async () => {
+  // ⚠️ FOUND AFTER MERGE, by asking "is anything unreported?" and re-reading the
+  // rig record instead of recalling it.
+  //
+  // `served` is ABSENT for codex on this build — a MEASURED baseline the
+  // programme relies on (RIG.md §9.4 finding 4; the B3 brief repeats it). And
+  // `--reasoning-effort` on codex ALWAYS lands in the `unavailable` arm, because
+  // codex depth is fused into the model id. Writing `served` unconditionally
+  // therefore gave every such session a block carrying only `{at, source}` — no
+  // model, no effort — i.e. an assertion of served truth where nothing was served.
+  const record = recordFor(AGENT_REGISTRY.codex);
+  recordDepthOutcome(record, projectDepthOntoLadder("xhigh", []));
+  assert.equal(record.acpx?.served, undefined, "a served block was written for an unserved depth");
+  // The outcome is NOT lost — that is the whole reason depth_projection exists.
+  assert.equal(record.acpx?.depth_projection?.outcome, "unavailable");
+  assert.equal(record.acpx?.depth_projection?.requested, "xhigh");
+  assert.ok(record.acpx?.depth_projection?.reason);
+
+  // POSITIVE CONTROL, same instrument: an outcome that DID serve a value still
+  // writes it. Without this, "no served block" would also pass if the writer were
+  // broken outright.
+  const served = recordFor(AGENT_REGISTRY.pi);
+  recordDepthOutcome(served, projectDepthOntoLadder("high", ["low", "medium", "high"]));
+  assert.equal(served.acpx?.served?.effort, "high");
+  assert.equal(served.acpx?.served?.source, "depth-projection");
+});

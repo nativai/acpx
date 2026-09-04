@@ -177,3 +177,36 @@ test("the config dir opencode receives is REAL — the files exist where the env
   assert.equal(dump.XDG_CONFIG_HOME, path.dirname(configDir));
   await fs.rm(path.dirname(configDir), { recursive: true, force: true });
 });
+
+test("acpx does NOT provision a catalogue entry for a pinned model today", async () => {
+  // ⚠️ FOUND AFTER MERGE. The first version passed the pinned model as
+  // `provisionModelId` unconditionally, so EVERY opencode session declared
+  // `provider.openrouter.models.<slug>: {}` — including for the 358 models
+  // already in OpenCode's bundled snapshot, which is all acpx can pin today
+  // (`acceptsArbitraryModelIds` is false for opencode).
+  //
+  // Declaring an EMPTY config over an EXISTING catalogue entry is unmeasured: if
+  // OpenCode replaces rather than deep-merges, the model loses its bundled
+  // metadata INCLUDING its reasoning support — and the `effort` option is
+  // advertised from exactly that, so the post-model re-read would find no ladder
+  // and depth would silently stop working for every pinned model.
+  //
+  // Same asymmetry that kept Pi's models-store.json out: provisioning buys
+  // nothing while arbitrary ids are declared unsupported, and risks that.
+  const dump = await spawnAndDumpEnv("opencode");
+  const configDir = dump.OPENCODE_CONFIG_DIR;
+  assert.ok(configDir, "OPENCODE_CONFIG_DIR unset — nothing to inspect");
+  const config = JSON.parse(
+    await fs.readFile(path.join(configDir, "opencode.json"), "utf8"),
+  ) as Record<string, unknown>;
+
+  // CONTROL: the file is real and the writer ran, so `provider` being absent is
+  // a decision rather than an unwritten file.
+  assert.ok(config, "opencode.json did not parse");
+  assert.equal(
+    config.provider,
+    undefined,
+    "a catalogue fragment was written for an already-catalogued model",
+  );
+  await fs.rm(path.dirname(configDir), { recursive: true, force: true });
+});
