@@ -54,6 +54,7 @@ import {
   type SessionsTemplateFlags,
   type StatusFlags,
 } from "./flags.js";
+import { registerModelsCommand } from "./models-command.js";
 import { registerProfilesCommand } from "./profiles-command.js";
 import { DEFAULT_CLOSE_DRAIN_TIMEOUT_MS } from "./session/contracts.js";
 import { registerStatusCommand } from "./status-command.js";
@@ -715,6 +716,7 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
   registerSessionsCommand(program, undefined, config);
   registerSubscriptionsCommand(program, config);
   registerProfilesCommand(program, config);
+  registerModelsCommand(program, config);
   registerConfigCommand(program, config);
   registerFlowCommand(program, config);
 }
