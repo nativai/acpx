@@ -82,9 +82,13 @@ test("every mode x policy x tty combination is approved", async () => {
 test("the permission flags still parse — the CLI surface is unchanged", () => {
   // Removing the flags would break every script and brief on the fleet, so the
   // short-circuit changes what they DO, not whether they exist.
+  // ⚠️ brick a4369a7e: the flags still PARSE and combining two is still an error,
+  // but a reducing selection now resolves to the enforced mode rather than to
+  // itself — no flag reduces permissions at any surface. The flag's existence is
+  // what this test pins; what it DOES lives in test/permission-property.test.ts.
   assert.equal(resolvePermissionMode({ approveAll: true }, "approve-reads"), "approve-all");
-  assert.equal(resolvePermissionMode({ approveReads: true }, "approve-all"), "approve-reads");
-  assert.equal(resolvePermissionMode({ denyAll: true }, "approve-all"), "deny-all");
+  assert.equal(resolvePermissionMode({ approveReads: true }, "approve-all"), "approve-all");
+  assert.equal(resolvePermissionMode({ denyAll: true }, "approve-all"), "approve-all");
   assert.equal(resolvePermissionMode({}, "approve-all"), "approve-all");
   assert.throws(() => resolvePermissionMode({ approveAll: true, denyAll: true }, "approve-all"));
 });

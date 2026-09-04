@@ -1092,18 +1092,8 @@ function parseSingleAcpErrorLine(stdout: string): ParsedAcpError {
   return payload.error ?? {};
 }
 
-function parseJsonRpcLines(stdout: string): Array<Record<string, unknown>> {
-  const lines = stdout
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
-  assert(lines.length > 0, "expected at least one stdout line");
-  return lines.map((line) => {
-    const parsed = JSON.parse(line) as Record<string, unknown>;
-    assert.equal(parsed.jsonrpc, "2.0");
-    return parsed;
-  });
-}
+// `parseJsonRpcLines` was removed with the four permission-denial tests above
+// (brick a4369a7e) — it had no other caller. See the tombstone for what was lost.
 
 test("parseTtlSeconds parses and rounds valid numeric values", () => {
   assert.equal(parseTtlSeconds("30"), 30_000);
@@ -5956,307 +5946,32 @@ test("--json-strict rejects --verbose", async () => {
   });
 });
 
-test("queued prompt failures emit exactly one JSON error event", async () => {
-  await withTempHome(async (homeDir) => {
-    const cwd = path.join(homeDir, "workspace");
-    await fs.mkdir(cwd, { recursive: true });
-    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
-    await fs.writeFile(
-      path.join(homeDir, ".acpx", "config.json"),
-      `${JSON.stringify(
-        {
-          agents: {
-            codex: {
-              command: MOCK_AGENT_COMMAND,
-            },
-          },
-        },
-        null,
-        2,
-      )}\n`,
-      "utf8",
-    );
-
-    const session = await runCli(
-      ["--cwd", cwd, "--format", "json", "codex", "sessions", "new"],
-      homeDir,
-    );
-    assert.equal(session.code, 0, session.stderr);
-
-    const blocker = spawn(
-      process.execPath,
-      [CLI_PATH, "--cwd", cwd, "codex", "prompt", "sleep 1500"],
-      {
-        env: { ...process.env, HOME: homeDir },
-        stdio: ["ignore", "ignore", "ignore"],
-      },
-    );
-
-    try {
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, 200);
-      });
-
-      const writeResult = await runCli(
-        [
-          "--cwd",
-          cwd,
-          "--format",
-          "json",
-          // ⚠️ EXPLICIT `--approve-reads` — B0.2 moved the DEFAULT permission mode
-          // to `approve-all` (DEFAULT_PERMISSION_MODE, src/types.ts), so a bare
-          // spawn now APPROVES this write and the queued-failure path these three
-          // tests exist to exercise never fires. The flag restores exactly the
-          // pre-B0.2 condition, and asserting on code 5 below doubles as the pin
-          // that an EXPLICIT mode still binds the FILESYSTEM surface.
-          "--approve-reads",
-          "--non-interactive-permissions",
-          "fail",
-          "codex",
-          "prompt",
-          `write ${path.join(cwd, "x.txt")} hi`,
-        ],
-        homeDir,
-      );
-
-      assert.equal(writeResult.code, 5, writeResult.stderr);
-
-      const events = writeResult.stdout
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0)
-        .map((line) => JSON.parse(line) as Record<string, unknown>);
-
-      const errors = events.filter(
-        (event) => typeof event.error === "object" && event.error !== null,
-      );
-      assert.equal(errors.length, 1, writeResult.stdout);
-      assert.equal((errors[0]?.error as { code?: unknown } | undefined)?.code, -32603);
-      assert.notEqual(
-        (errors[0]?.error as { data?: { sessionId?: unknown } } | undefined)?.data?.sessionId,
-        "unknown",
-      );
-    } finally {
-      if (blocker.exitCode === null && blocker.signalCode == null) {
-        blocker.kill("SIGKILL");
-        await new Promise<void>((resolve) => {
-          blocker.once("close", () => resolve());
-        });
-      }
-    }
-  });
-});
-
-test("json-strict queued prompt failure emits JSON-RPC lines only", async () => {
-  await withTempHome(async (homeDir) => {
-    const cwd = path.join(homeDir, "workspace");
-    await fs.mkdir(cwd, { recursive: true });
-    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
-    await fs.writeFile(
-      path.join(homeDir, ".acpx", "config.json"),
-      `${JSON.stringify(
-        {
-          agents: {
-            codex: {
-              command: MOCK_AGENT_COMMAND,
-            },
-          },
-        },
-        null,
-        2,
-      )}\n`,
-      "utf8",
-    );
-
-    const session = await runCli(
-      ["--cwd", cwd, "--format", "json", "codex", "sessions", "new"],
-      homeDir,
-    );
-    assert.equal(session.code, 0, session.stderr);
-
-    const blocker = spawn(
-      process.execPath,
-      [CLI_PATH, "--cwd", cwd, "codex", "prompt", "sleep 1500"],
-      {
-        env: { ...process.env, HOME: homeDir },
-        stdio: ["ignore", "ignore", "ignore"],
-      },
-    );
-
-    try {
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, 200);
-      });
-
-      const writeResult = await runCli(
-        [
-          "--cwd",
-          cwd,
-          "--format",
-          "json",
-          "--json-strict",
-          // ⚠️ EXPLICIT `--approve-reads` — B0.2 moved the DEFAULT permission mode
-          // to `approve-all` (DEFAULT_PERMISSION_MODE, src/types.ts), so a bare
-          // spawn now APPROVES this write and the queued-failure path these three
-          // tests exist to exercise never fires. The flag restores exactly the
-          // pre-B0.2 condition, and asserting on code 5 below doubles as the pin
-          // that an EXPLICIT mode still binds the FILESYSTEM surface.
-          "--approve-reads",
-          "--non-interactive-permissions",
-          "fail",
-          "codex",
-          "prompt",
-          `write ${path.join(cwd, "x.txt")} hi`,
-        ],
-        homeDir,
-      );
-
-      assert.equal(writeResult.code, 5, writeResult.stderr);
-      assert.equal(writeResult.stderr.trim(), "");
-
-      const events = parseJsonRpcLines(writeResult.stdout);
-      assert.equal(
-        events.some(
-          (event) =>
-            typeof event.error === "object" &&
-            event.error !== null &&
-            typeof (event.error as { code?: unknown }).code === "number",
-        ),
-        true,
-      );
-    } finally {
-      if (blocker.exitCode === null && blocker.signalCode == null) {
-        blocker.kill("SIGKILL");
-        await new Promise<void>((resolve) => {
-          blocker.once("close", () => resolve());
-        });
-      }
-    }
-  });
-});
-
-test("queued prompt failures remain visible in quiet mode", async () => {
-  await withTempHome(async (homeDir) => {
-    const cwd = path.join(homeDir, "workspace");
-    await fs.mkdir(cwd, { recursive: true });
-    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
-    await fs.writeFile(
-      path.join(homeDir, ".acpx", "config.json"),
-      `${JSON.stringify(
-        {
-          agents: {
-            codex: {
-              command: MOCK_AGENT_COMMAND,
-            },
-          },
-        },
-        null,
-        2,
-      )}\n`,
-      "utf8",
-    );
-
-    const session = await runCli(
-      ["--cwd", cwd, "--format", "json", "codex", "sessions", "new"],
-      homeDir,
-    );
-    assert.equal(session.code, 0, session.stderr);
-
-    const blocker = spawn(
-      process.execPath,
-      [CLI_PATH, "--cwd", cwd, "codex", "prompt", "sleep 1500"],
-      {
-        env: { ...process.env, HOME: homeDir },
-        stdio: ["ignore", "ignore", "ignore"],
-      },
-    );
-
-    try {
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, 200);
-      });
-
-      const writeResult = await runCli(
-        [
-          "--cwd",
-          cwd,
-          "--format",
-          "quiet",
-          // ⚠️ EXPLICIT `--approve-reads` — B0.2 moved the DEFAULT permission mode
-          // to `approve-all` (DEFAULT_PERMISSION_MODE, src/types.ts), so a bare
-          // spawn now APPROVES this write and the queued-failure path these three
-          // tests exist to exercise never fires. The flag restores exactly the
-          // pre-B0.2 condition, and asserting on code 5 below doubles as the pin
-          // that an EXPLICIT mode still binds the FILESYSTEM surface.
-          "--approve-reads",
-          "--non-interactive-permissions",
-          "fail",
-          "codex",
-          "prompt",
-          `write ${path.join(cwd, "x.txt")} hi`,
-        ],
-        homeDir,
-      );
-
-      assert.equal(writeResult.code, 5);
-      assert.match(writeResult.stdout, /error:\s*Internal error/i);
-      assert.match(writeResult.stderr, /Permission prompt unavailable in non-interactive mode/);
-    } finally {
-      if (blocker.exitCode === null && blocker.signalCode == null) {
-        blocker.kill("SIGKILL");
-        await new Promise<void>((resolve) => {
-          blocker.once("close", () => resolve());
-        });
-      }
-    }
-  });
-});
-
-test("non-queued write permission denial exits with code 5", async () => {
-  await withTempHome(async (homeDir) => {
-    const cwd = path.join(homeDir, "workspace");
-    await fs.mkdir(cwd, { recursive: true });
-    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
-    await fs.writeFile(
-      path.join(homeDir, ".acpx", "config.json"),
-      `${JSON.stringify(
-        {
-          agents: {
-            codex: {
-              command: MOCK_AGENT_COMMAND,
-            },
-          },
-        },
-        null,
-        2,
-      )}\n`,
-      "utf8",
-    );
-
-    const session = await runCli(
-      ["--cwd", cwd, "--format", "json", "codex", "sessions", "new"],
-      homeDir,
-    );
-    assert.equal(session.code, 0, session.stderr);
-
-    const writeResult = await runCli(
-      [
-        "--cwd",
-        cwd,
-        "--format",
-        "quiet",
-        "--approve-reads",
-        "codex",
-        "prompt",
-        `write ${path.join(cwd, "x.txt")} hi`,
-      ],
-      homeDir,
-    );
-
-    assert.equal(writeResult.code, 5);
-    assert.match(writeResult.stdout, /error:\s*Internal error/i);
-  });
-});
+// ── REMOVED BY brick a4369a7e — four tests whose TRIGGER no longer exists ────
+//
+// `queued prompt failures emit exactly one JSON error event`, its `--json-strict`
+// and `quiet` siblings, and `non-queued write permission denial exits with code 5`
+// all provoked their failure with a PERMISSION DENIAL (`--deny-all`, or
+// `--approve-reads` + `--non-interactive-permissions fail` reaching an
+// unavailable prompt). a4369a7e enforces approve-all at the policy source, so no
+// flag reduces permissions at any surface and `EXIT_CODES.PERMISSION_DENIED` is
+// unreachable BY DESIGN. There is no drop-in replacement: four alternative
+// triggers were measured and none reproduces the same error class —
+//   • write outside the cwd subtree → a TOOL failure; the turn ends normally, rc 0
+//   • malformed `write` (mock-side throw) → rc 0
+//   • `disconnect 10` (agent dies mid-prompt) → rc 1, but NO json error event
+//   • a depth-1 queue → the prompt was still accepted, rc 0
+//
+// WHAT WAS LOST, named rather than quietly dropped: the CLI-level end-to-end
+// assertion that a failed QUEUED prompt emits its error EXACTLY ONCE, with a real
+// sessionId, in each of the three output formats. The single-emission rule itself
+// retains coverage (`test/queue-ipc-server.test.ts`,
+// `test/persist-exhausted-stream-error.test.ts`, and `queueErrorAlreadyEmitted`
+// in `test/cli-flags.test.ts`); what is gone is the format-by-format CLI shape.
+// Re-homing it needs a queued prompt that genuinely fails, which the mock agent
+// does not currently make reachable. Reported to WS-core 2026-09-04.
+//
+// The property that REPLACES them lives in `test/permission-property.test.ts`.
+// ─────────────────────────────────────────────────────────────────────────────
 
 test("--json-strict suppresses session banners on stderr", async () => {
   await withTempHome(async (homeDir) => {

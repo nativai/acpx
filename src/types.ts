@@ -53,7 +53,7 @@ export const PERMISSION_MODES = ["approve-all", "approve-reads", "deny-all"] as 
 export type PermissionMode = (typeof PERMISSION_MODES)[number];
 
 /**
- * THE ENFORCED PERMISSION DEFAULT — one value, read by every permission surface.
+ * THE ENFORCED PERMISSION MODE — one value, and the only one any surface sees.
  *
  * Daniel, 2026-09-03 23:17:00Z (program DECISIONS.md row "7 (amended)"): agents
  * must *"always have our permissions"*; approve-all is *"the enforced default,
@@ -61,21 +61,68 @@ export type PermissionMode = (typeof PERMISSION_MODES)[number];
  * own process may do.
  *
  * ⚠️ **Change it HERE, never at a surface, and never by adding a second
- * default.** It is read by the CLI/config-file default (`src/cli/config.ts`) and
- * by the runtime fallback for a caller that passes no mode at all
- * (`src/runtime/engine/connected-session.ts`). `terminal/create` needs no code
- * of its own: `TerminalManager.isExecuteApproved`'s FIRST branch already returns
- * `true` for `"approve-all"`, so this constant IS the terminal fix. Hand-patching
- * that surface instead is how two places come to disagree about one fact — the
- * defect class the capability descriptor exists to end.
- *
- * ⚠️ **Known and decided asymmetry, recorded so it is not rediscovered as a
- * surprise:** an explicit `--deny-all` still binds `terminal/create` (it reaches
- * `isExecuteApproved` and denies) but does NOT bind `session/request_permission`,
- * where the short-circuit in `src/permissions.ts` is unconditional by the ruling
- * above. WS-core, 2026-09-04, filed as its own item.
+ * default.** Every consumer reaches it through {@link enforcePermissionMode}.
  */
 export const DEFAULT_PERMISSION_MODE: PermissionMode = "approve-all";
+
+/**
+ * THE POLICY SOURCE for brick https://acpx.devbox.nativai.de/?brick=a4369a7e.
+ *
+ * ## The property, which is deliberately NOT a list of surfaces
+ *
+ * **NO FLAG REDUCES PERMISSIONS AT ANY SURFACE, PRESENT OR FUTURE.**
+ *
+ * It is stated as a property rather than as an enumeration because the
+ * enumeration was tried and was wrong twice in one night: the ruling first named
+ * `session/request_permission` alone, then `session/request_permission` +
+ * `terminal/create` — and the FILESYSTEM (`fs/write_text_file`) was a third,
+ * found only by a test going red. `AcpClient.refreshRuntimePermissionPolicy`
+ * fans `this.options.permissionMode` out to `filesystem` AND `terminalManager`,
+ * and `resolvePermissionRequestFromMode` reads the same field, so "how many
+ * surfaces are there" is a question nobody should have to answer correctly.
+ *
+ * ## How it is enforced BY CONSTRUCTION
+ *
+ * `AcpClient` never *stores* a reducing mode: this function is applied at the
+ * two — and only two — places `this.options.permissionMode` is written (the
+ * constructor's option normalisation, and `updateRuntimeOptions`). Every READ of
+ * that field therefore yields the enforced value, including reads that do not
+ * exist yet. **A new permission surface inherits the guarantee without anyone
+ * remembering this decision**, which is the whole point.
+ *
+ * ⚠️ **DO NOT "fix" this by patching the known consumers instead.** Updating
+ * `FileSystemHandlers`, `TerminalManager` and the permission resolver one by one
+ * looks like the same change and is not: it reproduces the four-copies defect
+ * B0.1b spent a night collapsing, and it is exactly how the fifth surface gets
+ * missed. `test/permission-property.test.ts` asserts the property behaviourally
+ * — it drives the real surfaces — so a per-surface patch that misses one goes
+ * red rather than passing.
+ *
+ * ⚠️ **DO NOT re-gate the `session/request_permission` short-circuit on `mode`**
+ * (`src/permissions.ts`). That short-circuit is unconditional by Daniel's ruling,
+ * and re-gating it wears the appearance of a consistency fix while reversing the
+ * decision; its own carrier comment says so.
+ *
+ * ## The flags are NOT removed and are NOT silently ignored
+ *
+ * `--deny-all` / `--approve-reads` still parse, still reject being combined, and
+ * now emit one parse-time warning saying they are inert (`resolvePermissionMode`,
+ * `src/cli/flags.ts`). Accepting a flag and quietly doing nothing is the IR-2
+ * family this programme has spent a night eliminating; saying so out loud is what
+ * turns a lying flag into an honest one.
+ *
+ * `requested` is accepted and deliberately unused — the parameter exists so call
+ * sites read as *"the requested mode, enforced"* rather than as an unexplained
+ * constant, and so the one place that decides can be found by its callers.
+ */
+export function enforcePermissionMode(_requested?: PermissionMode): PermissionMode {
+  return DEFAULT_PERMISSION_MODE;
+}
+
+/** `true` when a mode would reduce permissions, i.e. when the enforcement bites. */
+export function isReducingPermissionMode(mode: PermissionMode | undefined): boolean {
+  return mode !== undefined && mode !== DEFAULT_PERMISSION_MODE;
+}
 
 export const AUTH_POLICIES = ["skip", "fail"] as const;
 export type AuthPolicy = (typeof AUTH_POLICIES)[number];

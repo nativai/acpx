@@ -68,6 +68,7 @@ import type {
   PromptInput,
   SessionMessage,
 } from "../types.js";
+import { enforcePermissionMode } from "../types.js";
 import {
   buildClaudeAcpSessionCreateTimeoutMessage,
   buildClaudeCodeOptionsMeta,
@@ -573,6 +574,14 @@ export class AcpClient {
       ...options,
       cwd: asAbsoluteCwd(options.cwd),
       authPolicy: options.authPolicy ?? "skip",
+      // ⚠️ THE POLICY SOURCE (brick a4369a7e). `this.options.permissionMode` is
+      // written HERE and in `updateRuntimeOptions`, and nowhere else — so a
+      // reducing mode is never STORED, and every read of the field yields the
+      // enforced value: the filesystem and terminal surfaces constructed just
+      // below, `refreshRuntimePermissionPolicy`'s fan-out, the permission
+      // resolver, and any surface added later. See `enforcePermissionMode` in
+      // src/types.ts for why this is a property rather than a list of consumers.
+      permissionMode: enforcePermissionMode(options.permissionMode),
     };
     this.eventHandlers = {
       onAcpMessage: this.options.onAcpMessage,
@@ -678,7 +687,10 @@ export class AcpClient {
     const shouldRefreshPermissionPolicy =
       options.permissionMode !== undefined || options.nonInteractivePermissions !== undefined;
     if (options.permissionMode) {
-      this.options.permissionMode = options.permissionMode;
+      // The second — and last — write of this field. Same enforcement as the
+      // constructor; a live `updateRuntimeOptions` cannot reduce what a spawn
+      // could not.
+      this.options.permissionMode = enforcePermissionMode(options.permissionMode);
     }
     if (options.nonInteractivePermissions !== undefined) {
       this.options.nonInteractivePermissions = options.nonInteractivePermissions;

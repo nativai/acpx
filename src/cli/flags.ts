@@ -17,6 +17,8 @@ import {
   type NonInteractivePermissionPolicy,
   type OutputFormat,
   type OutputPolicy,
+  enforcePermissionMode,
+  isReducingPermissionMode,
   type PermissionMode,
 } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
@@ -410,6 +412,52 @@ export function parsePromptRetries(value: string): number {
   return parsed;
 }
 
+/**
+ * Emitted at most ONCE per process. A user who passes `--deny-all` twice in one
+ * pipeline does not need to be told twice, and a repeated warning trains people
+ * to filter it — which is how an honest message becomes noise.
+ */
+let inertPermissionFlagWarned = false;
+
+/** Test seam: `resolvePermissionMode` warns once per process, so tests must reset it. */
+export function resetInertPermissionFlagWarning(): void {
+  inertPermissionFlagWarned = false;
+}
+
+function warnInertPermissionFlag(flag: string): void {
+  if (inertPermissionFlagWarned) {
+    return;
+  }
+  inertPermissionFlagWarned = true;
+  // ⚠️ DELIBERATELY NOT SUPPRESSED IN JSON MODE, unlike the effort/output-style
+  // warnings. Those describe a flag that is inert for ONE harness; this one
+  // describes a flag that is inert EVERYWHERE, and a machine-readable caller is
+  // exactly the caller most likely to be relying on it. Suppressing it would
+  // re-create the silent-ignoring this warning exists to end. It goes to stderr,
+  // so `--format json` stdout stays parseable.
+  process.stderr.write(
+    `[acpx] ${flag} accepted but inert on this fleet: agents always run with full ` +
+      `process permissions — Daniel 2026-09-03\n`,
+  );
+}
+
+/**
+ * Resolve the permission mode from the flags — and then ENFORCE the fleet policy
+ * over the result (brick https://acpx.devbox.nativai.de/?brick=a4369a7e).
+ *
+ * The flags are still fully parsed: combining two is still an error, and each is
+ * still recognised. What changed is that a REDUCING selection no longer reduces
+ * anything — it is announced as inert and the enforced mode is returned, so the
+ * value that flows into the session record, the queue-owner payload and the
+ * client is the one the surfaces will actually apply. Returning the requested
+ * mode instead would leave a record that disagrees with the behaviour, which is
+ * the dishonesty this programme keeps removing.
+ *
+ * ⚠️ This is the CLI half. It is NOT the guarantee — `AcpClient` enforces the
+ * same policy when it stores the mode, so a caller that never goes through this
+ * function (a test, a future non-CLI entry point) cannot reduce permissions
+ * either. See {@link enforcePermissionMode}.
+ */
 export function resolvePermissionMode(
   flags: PermissionFlags,
   defaultMode: PermissionMode,
@@ -422,17 +470,17 @@ export function resolvePermissionMode(
     );
   }
 
-  if (flags.approveAll) {
-    return "approve-all";
-  }
   if (flags.approveReads) {
-    return "approve-reads";
-  }
-  if (flags.denyAll) {
-    return "deny-all";
+    warnInertPermissionFlag("--approve-reads");
+  } else if (flags.denyAll) {
+    warnInertPermissionFlag("--deny-all");
+  } else if (!flags.approveAll && isReducingPermissionMode(defaultMode)) {
+    // A reducing default from config.json / .acpxrc.json is just as inert as a
+    // reducing flag, and just as deserving of being told so.
+    warnInertPermissionFlag(`defaultPermissions "${defaultMode}"`);
   }
 
-  return defaultMode;
+  return enforcePermissionMode(flags.approveAll ? "approve-all" : defaultMode);
 }
 
 /**

@@ -72,11 +72,16 @@ function parseCommand(command: Command, argv: string[]): Command {
   return command.parse(["node", "acpx", ...argv], { from: "node" });
 }
 
-test("resolvePermissionMode honors explicit approve-reads overrides", () => {
-  assert.equal(resolvePermissionMode({}, "approve-reads"), "approve-reads");
-  assert.equal(resolvePermissionMode({ approveReads: true }, "approve-all"), "approve-reads");
+test("resolvePermissionMode ENFORCES the fleet policy over every reducing selection", () => {
+  // ⚠️ THIS TEST'S EXPECTATIONS WERE INVERTED BY brick a4369a7e, and the
+  // inversion IS the change: no flag reduces permissions at any surface, so a
+  // reducing selection no longer resolves to a reducing mode. The flags still
+  // parse (see below and test/permission-property.test.ts) — they are announced
+  // as inert rather than silently obeyed.
   assert.equal(resolvePermissionMode({ approveAll: true }, "approve-reads"), "approve-all");
-  assert.equal(resolvePermissionMode({ denyAll: true }, "approve-all"), "deny-all");
+  assert.equal(resolvePermissionMode({ approveReads: true }, "approve-all"), "approve-all");
+  assert.equal(resolvePermissionMode({ denyAll: true }, "approve-all"), "approve-all");
+  assert.equal(resolvePermissionMode({}, "approve-reads"), "approve-all");
 });
 
 test("hasExplicitPermissionModeFlag detects explicit permission grants", () => {
