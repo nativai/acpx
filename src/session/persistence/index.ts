@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import {
+  harnessIdForAgentCommand,
+  resolveHarnessCapabilities,
+} from "../../acp/harness-capabilities.js";
 import type { SessionRecord } from "../../types.js";
 import { withSessionIndexLock } from "./index-lock.js";
 import { parseSessionRecord } from "./parse.js";
@@ -114,6 +118,14 @@ export type SessionIndexEntry = {
    */
   depthOutcome?: string;
   depthServed?: string;
+  /**
+   * The DESCRIPTOR's `canSetModelLive`, REFINED by this session's own
+   * advertisement (F-12). The UI's live-model control reads this, not the static
+   * table — see {@link canSetModelLiveFromRecord}.
+   *
+   * `undefined` means acpx cannot classify the adapter and makes no claim.
+   */
+  canSetModelLive?: boolean;
   // brick://874fee67 — projected so acpx-ui's hot-path (record-skipping) session
   // rebuild shows the real style in the chat header instead of a UI default
   // (the brick://4d517be2 failure class: passes typecheck+build, fails only at
@@ -351,6 +363,8 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     desiredEffort: optionalString(record.desiredEffort),
     depthOutcome: optionalString(record.depthOutcome),
     depthServed: optionalString(record.depthServed),
+    canSetModelLive:
+      typeof record.canSetModelLive === "boolean" ? record.canSetModelLive : undefined,
     // brick://874fee67: BOTH index legs. This parser reconstructs an entry from
     // index.json on reconcile — miss it and an acpx-ui-written entry is stripped
     // on the next daemon rewrite, exactly as autoSubscription is parsed above.
@@ -424,6 +438,43 @@ function outputStyleSupportedFromRecord(acpx: SessionRecord["acpx"]): boolean | 
   return advertised.some((option) => option?.id === "outputStyle");
 }
 
+/**
+ * Whether THIS SESSION can actually have its model changed live (F-12, brick
+ * 2dc93747) — the STATIC descriptor REFINED by what this session's adapter
+ * actually advertised.
+ *
+ * ⚠️ THE STATIC FLAG OVER-CLAIMS AND THE UI READS IT. Staging served opencode
+ * with `canSetModelLive: true` while its adapter had advertised NO selectable
+ * `model` option, so the live-model control would be offered on a session where
+ * it can only ever refuse. Daniel's requirement is "declared in acpx, REFINED by
+ * what the adapter advertises at runtime"; only the first half was reaching a
+ * consumer.
+ *
+ * ⚠️ IT IS PROJECTED ONTO THE INDEX ENTRY, not only into the detail view, for the
+ * same reason `forkedAtMessageIndexRequested` and `depthOutcome` are: the chat
+ * header reads its view from the entry on the enriched hot path (acpx-ui
+ * `projectEntryToRawView`, where `sessionData` is null), so a value that stops at
+ * the record fails only at RUNTIME while typecheck and build stay green.
+ *
+ * ⚠️ DERIVED AT PROJECTION, NOT PERSISTED. It is a function of the record's own
+ * `agent_command` + `config_options`, so it cannot go stale against them and it
+ * needs no round-trip, clone or parse leg — the three legs a new persisted field
+ * would have needed, one of which has already been missed once in this block.
+ *
+ * `undefined` when the descriptor cannot classify the agent: acpx has no claim to
+ * make about an adapter it has never seen, and answering `false` would hide a
+ * control that may work perfectly.
+ */
+function canSetModelLiveFromRecord(record: SessionRecord): boolean | undefined {
+  const harness = harnessIdForAgentCommand(record.agentCommand);
+  if (harness === undefined) {
+    return undefined;
+  }
+  const advertised = record.acpx?.config_options;
+  return resolveHarnessCapabilities(harness, advertised ? { configOptions: advertised } : undefined)
+    .canSetModelLive;
+}
+
 // eslint-disable-next-line complexity -- flat field-by-field projection of the optional hot-path enrichment scalars; linear, not branchy logic
 export function toSessionIndexEntry(record: SessionRecord, fileName: string): SessionIndexEntry {
   const acpx = record.acpx;
@@ -469,6 +520,7 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     depthOutcome: acpx?.depth_projection?.outcome,
     depthServed: acpx?.depth_projection?.served,
     outputStyleDesired: sessionOptions?.output_style,
+    canSetModelLive: canSetModelLiveFromRecord(record),
     outputStyleSupported: outputStyleSupportedFromRecord(acpx),
     outputStyleApplied: acpx?.applied_output_style,
     outputStyleRefused: acpx?.refused_output_style,

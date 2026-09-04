@@ -299,8 +299,15 @@ test("text remediation hints cover missing session and ACP runtime failures", ()
     // nothing to add here by construction. The hint now points at the surface
     // that demonstrably HAS the detail.
     [
+      // ⚠️ IT NAMES A FILE, NOT A VERB, AND THAT IS THE FIX. It used to say
+      // `acpx sessions logs <session>` — a subcommand that DOES NOT EXIST (zero
+      // `.command("logs")` in command-registration.ts). The token fell through to
+      // the agent-name fallthrough and printed 3,819 bytes of HELP TEXT, 60 lines,
+      // none of them mentioning the model. A hint that does not work is worse than
+      // no hint, because the reader trusts it INSTEAD of investigating — which is
+      // exactly what the comment above the hint already warned about.
       "hint: the agent's own reason for this failure is recorded in the session's queue-owner log " +
-        "(`acpx sessions logs <session>`), not on this stream — `--verbose` does not add it here.",
+        "(`~/.acpx/sessions/<session-id>.owner.log`), not on this stream — `--verbose` does not add it here.",
     ],
   );
 });

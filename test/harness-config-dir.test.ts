@@ -16,6 +16,7 @@ import {
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
 import { cloneSessionAcpxState } from "../src/session/conversation-model.js";
 import { setHarnessConfigDir } from "../src/session/mode-preference.js";
+import { toSessionIndexEntry } from "../src/session/persistence/index.js";
 import type { SessionRecord } from "../src/types.js";
 
 // B3 deliverable 5 — ONE per-session config dir serving primer + model pin +
@@ -474,3 +475,74 @@ function pathsContainKey(value: unknown, key: string): number {
   walk(value);
   return hits;
 }
+
+// ── F-12 (brick 2dc93747): the live flag REFINED per session ────────────────
+
+test("F-12: canSetModelLive is REFINED per session, not the static table", () => {
+  // ⚠️ THE OVER-CLAIM THIS FIXES. Staging served opencode with
+  // `canSetModelLive: true` while its adapter had advertised NO selectable
+  // `model` option — so the UI would offer a live model change that can only
+  // ever refuse. Daniel's requirement is "declared in acpx, REFINED by what the
+  // adapter advertises at runtime"; only the first half reached a consumer.
+  const withModelOption = {
+    acpxRecordId: "rec-f12-a",
+    agentCommand: AGENT_REGISTRY.opencode,
+    acpx: {
+      config_options: [
+        { id: "model", name: "Model", type: "select", currentValue: "a", options: [] },
+      ],
+    },
+  } as unknown as SessionRecord;
+  const withoutModelOption = {
+    acpxRecordId: "rec-f12-b",
+    agentCommand: AGENT_REGISTRY.opencode,
+    acpx: {
+      config_options: [
+        { id: "mode", name: "Mode", type: "select", currentValue: "build", options: [] },
+      ],
+    },
+  } as unknown as SessionRecord;
+
+  const a = toSessionIndexEntry(withModelOption, "rec-f12-a.json");
+  const b = toSessionIndexEntry(withoutModelOption, "rec-f12-b.json");
+
+  // TWO-SIDED, on the SAME harness: the only difference is the advertisement.
+  // Without both arms, "false" could come from opencode being disabled outright.
+  assert.equal(a.canSetModelLive, true, "a session that DOES advertise `model` must stay live");
+  assert.equal(
+    b.canSetModelLive,
+    false,
+    "a session with no selectable `model` option must NOT be offered a live change",
+  );
+  // And the static table still says true — proving the narrowing is the
+  // refinement rather than a change to the declared descriptor.
+  assert.equal(deriveHarnessCapabilities(HARNESS_FACTS.opencode).canSetModelLive, true);
+});
+
+test("F-12: an unclassifiable agent gets NO claim, not a false one", () => {
+  const unknown = {
+    acpxRecordId: "rec-f12-c",
+    agentCommand: "some-unknown-adapter --acp",
+    acpx: {},
+  } as unknown as SessionRecord;
+  assert.equal(
+    toSessionIndexEntry(unknown, "rec-f12-c.json").canSetModelLive,
+    undefined,
+    "acpx must make no claim about an adapter it cannot classify — `false` would hide a working control",
+  );
+});
+
+test("F-12 GUARDRAIL: claude and codex keep their declared answer", () => {
+  for (const id of ["claude", "claude-pty", "codex"] as const) {
+    const record = {
+      acpxRecordId: `rec-f12-${id}`,
+      agentCommand: AGENT_REGISTRY[id],
+      acpx: {},
+    } as unknown as SessionRecord;
+    assert.equal(
+      toSessionIndexEntry(record, "x.json").canSetModelLive,
+      deriveHarnessCapabilities(HARNESS_FACTS[id]).canSetModelLive,
+      `${id}: the refinement changed a harness it must not touch`,
+    );
+  }
+});
