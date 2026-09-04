@@ -236,18 +236,43 @@ export function rejectedDepthProjection(
  * the advertised mode id; Pi does the collapsing.
  */
 export function describePiWireDepthCollapse(modeId: string): string | undefined {
+  const served = piWireDepthValue(modeId);
+  if (served === undefined) {
+    return undefined;
+  }
+  if (modeId.trim().toLowerCase() === "off") {
+    return `Pi sends {"effort":"${served}"} for "off" — reasoning is NOT disabled (measured at the wire, I2 R8)`;
+  }
+  const group = PI_WIRE_DEPTH_LADDER.find((entry) => entry.served === served);
+  return `Pi collapses ${group?.advertised.join("/") ?? modeId} to {"effort":"${served}"} (measured at the wire, I2 R8)`;
+}
+
+/**
+ * Pi's WIRE ladder: the value it actually serves for a mode it ADVERTISES.
+ *
+ * ⚠️ THIS IS WHY A `depth_projection` ON THE MODE PATH CAN BE HONEST AT ALL.
+ * Pi advertises SIX rungs (`off/minimal/low/medium/high/xhigh`, read straight
+ * out of pi-acp's own dist) and serves THREE. A projection computed against the
+ * ADVERTISEMENT therefore reports `exact` for `minimal`, `medium` and `xhigh` —
+ * three levels Pi does not serve. The advertisement is a genuine wire artifact
+ * (the agent said those are its modes), so acpx cannot fix it; what acpx CAN do
+ * is stop recording `exact` for a level it knows is collapsed.
+ *
+ * ⚠️ IT IS A MEASUREMENT, NOT AN OBSERVATION. acpx does not watch the collapse
+ * happen per session — this table is I2 R8's wire measurement, frozen. It is the
+ * same shape of fact as the `pi-acp` `session/set_model` capability cell that was
+ * TRUE and WENT STALE between 0.0.26 and 0.0.33: correct when written, and
+ * capable of being wrong later without anything failing. Re-measure it when the
+ * pinned `pi-acp` moves.
+ */
+const PI_WIRE_DEPTH_LADDER: readonly { advertised: readonly string[]; served: string }[] = [
+  { advertised: ["off", "minimal", "low"], served: "low" },
+  { advertised: ["medium", "high"], served: "high" },
+  { advertised: ["xhigh", "max"], served: "max" },
+];
+
+/** What Pi actually serves for `modeId`, or undefined for a rung not measured. */
+export function piWireDepthValue(modeId: string): string | undefined {
   const id = modeId.trim().toLowerCase();
-  if (id === "off") {
-    return 'Pi sends {"effort":"low"} for "off" — reasoning is NOT disabled (measured at the wire, I2 R8)';
-  }
-  if (id === "minimal" || id === "low") {
-    return 'Pi collapses off/minimal/low to {"effort":"low"} (measured at the wire, I2 R8)';
-  }
-  if (id === "medium" || id === "high") {
-    return 'Pi collapses medium/high to {"effort":"high"} (measured at the wire, I2 R8)';
-  }
-  if (id === "xhigh" || id === "max") {
-    return 'Pi collapses xhigh/max to {"effort":"max"} (measured at the wire, I2 R8)';
-  }
-  return undefined;
+  return PI_WIRE_DEPTH_LADDER.find((entry) => entry.advertised.includes(id))?.served;
 }

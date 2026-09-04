@@ -2,6 +2,7 @@ import type { SessionConfigOption, SessionModeState } from "@agentclientprotocol
 import {
   acpxRoutesDepthMechanism,
   depthMechanismForAgentCommand,
+  harnessIdForAgentCommand,
 } from "../acp/harness-capabilities.js";
 import { withTimeout } from "../async-control.js";
 import type { SessionRecord } from "../types.js";
@@ -359,6 +360,7 @@ export async function persistAndApplyRequestedEffort(params: {
       sessionId: params.sessionId,
       requested: params.reasoningEffort,
       modes: params.modes,
+      harness: harnessIdForAgentCommand(params.agentCommand),
       timeoutMs: params.timeoutMs,
       verbose: params.verbose,
     });
@@ -544,6 +546,7 @@ export async function applyExecReasoningEffort(params: {
       sessionId: params.sessionId,
       requested: params.reasoningEffort,
       modes: params.modes,
+      harness: harnessIdForAgentCommand(params.agentCommand),
       timeoutMs: params.timeoutMs,
       verbose: params.verbose,
     });
