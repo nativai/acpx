@@ -707,15 +707,29 @@ export function cloneSessionAcpxState(
   };
 }
 
-// Deep-clone the live served block + floor breadcrumbs (brick://07dd62c9). Kept a
-// helper so cloneSessionAcpxState stays under the lint complexity budget.
+// Deep-clone the live served block + floor breadcrumbs (brick://07dd62c9) and the
+// depth-projection outcome (B3). Kept a helper so cloneSessionAcpxState stays
+// under the lint complexity budget.
+//
+// ⚠️ THIS FUNCTION IS AN ALLOWLIST INSIDE AN ALLOWLIST, AND THAT IS THE HAZARD.
+// `cloneSessionAcpxState` names every field it keeps, so a live acpx-authored
+// breadcrumb that is not listed is DROPPED ON EVERY REAL TURN — silently, with
+// typecheck and the whole unit suite green, because an in-memory test never runs
+// the turn path that re-bases `acpx` off this clone.
+//
+// B3 shipped `depth_projection` with its parse and index legs done and THIS one
+// missed, and only a real rig turn caught it: the field was present at
+// `sessions new` and NULL after one prompt, with the index entry null too. If you
+// add another field to `SessionAcpxState` that must outlive a turn, add it here in
+// the same commit and prove it with a REAL turn, not an in-memory record.
 function cloneFloorState(
   state: SessionAcpxState,
-): Pick<SessionAcpxState, "served" | "served_below_floor" | "floor_parked"> {
+): Pick<SessionAcpxState, "served" | "served_below_floor" | "floor_parked" | "depth_projection"> {
   return {
     served: state.served ? { ...state.served } : undefined,
     served_below_floor: state.served_below_floor ? { ...state.served_below_floor } : undefined,
     floor_parked: state.floor_parked ? { ...state.floor_parked } : undefined,
+    depth_projection: state.depth_projection ? { ...state.depth_projection } : undefined,
   };
 }
 

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { SessionModeState } from "@agentclientprotocol/sdk";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
+import { cloneSessionAcpxState } from "../src/session/conversation-model.js";
 import { applyDepthAsMode, recordDepthOutcome } from "../src/session/depth-application.js";
 import {
   CANONICAL_DEPTH_RUNGS,
@@ -271,4 +272,41 @@ test("the recorder MERGES into served and never destroys a sibling model write",
     "setServedState REPLACES the block; this recorder must MERGE",
   );
   assert.equal(record.acpx?.served?.effort, "high");
+});
+
+test("the depth outcome SURVIVES the per-turn acpx-state clone", async () => {
+  // ⚠️ THE LEG A REAL RIG TURN CAUGHT AND EVERY IN-MEMORY TEST MISSED.
+  //
+  // `cloneSessionAcpxState` is an explicit ALLOWLIST, and the turn path re-bases
+  // `record.acpx` off its result. A field it does not name is dropped on EVERY
+  // REAL TURN — silently, with typecheck and the unit suite green. B3 shipped
+  // with the parse and index legs done and this one missed: on the rig the field
+  // was present at `sessions new` and NULL after one prompt, and the index entry
+  // was null with it.
+  //
+  // This asserts the PROPERTY (the value survives a clone) rather than that a
+  // name appears in a source file — a source-text check survives its own
+  // violation, because a leftover comment keeps the string present.
+  const acpx = {
+    depth_projection: {
+      requested: "ultra",
+      outcome: "projected",
+      served: "high",
+      reason: "projected by position",
+    },
+    served: { effort: "high", source: "depth-projection" },
+  } as unknown as NonNullable<SessionRecord["acpx"]>;
+
+  const cloned = cloneSessionAcpxState(acpx);
+  assert.deepEqual(
+    cloned?.depth_projection,
+    acpx.depth_projection,
+    "the depth outcome was dropped by the per-turn clone",
+  );
+  // Its sibling must survive too — if `served` were also dropped this test would
+  // be measuring a broken clone rather than a missing field.
+  assert.deepEqual(cloned?.served, acpx.served, "control: served must survive the same clone");
+  // And it is a COPY, not the same object: a shared reference would let a later
+  // mutation of the clone rewrite the record's own breadcrumb.
+  assert.notEqual(cloned?.depth_projection, acpx.depth_projection);
 });
