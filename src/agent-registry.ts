@@ -3,10 +3,21 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 /**
- * ⚠️ THESE ARE EXACT PINS, NOT RANGES. Under npm semver a caret on a `0.0.x`
- * version allows **only that patch** — `^0.0.26` resolves to `0.0.26` and
- * nothing else — so a version here tracks nothing and every bump is a deliberate
- * code change. Read `^` as `==` in this table.
+ * ⚠️ THESE ARE EXACT PINS, NOT RANGES — **BUT THE CARET IS NOT WHAT MAKES THEM
+ * SO, AND COPYING IT ONTO A 1.x PACKAGE PRODUCES A RANGE.**
+ *
+ * Under npm semver a caret on a `0.0.x` version allows **only that patch**
+ * (`^0.0.26` resolves to `0.0.26` and nothing else), because npm treats
+ * `0.0.x` as fully pinned. On a `1.y.z` version the same caret allows **any
+ * later 1.x** — `^1.18.28` would accept `1.19.0`. So:
+ *
+ *   - `0.0.x` entries carry `^` and are exact. Read `^` as `==` for THOSE rows.
+ *   - **`1.x` entries carry a BARE version and no caret** (`opencode` below).
+ *     Adding a caret there silently converts the pin into a range while the row
+ *     still looks like its neighbours.
+ *
+ * A version here therefore tracks nothing and every bump is a deliberate code
+ * change.
  *
  * `pi`: bumped `0.0.26` → `0.0.33` (npm latest, published 2026-07-30) by B0.2.
  * ⚠️ **A bump is not progress on any other row.** I2 measured 0.0.33 fixing
@@ -20,6 +31,20 @@ import { fileURLToPath } from "node:url";
 const ACP_ADAPTER_PACKAGE_RANGES = {
   pi: "^0.0.33",
   codex: "^0.0.44",
+  /**
+   * ⚠️ BARE, NOT `^1.18.28` — see the caret rule above. opencode-ai is a 1.x
+   * package, so a caret here would accept every later 1.x and the row would read
+   * as a pin while behaving as a range.
+   *
+   * Pinned at the version the registry was ALREADY serving as `latest` on
+   * 2026-09-04, and which both npx caches on this box already held, so the pin
+   * FREEZES today's behaviour rather than moving it. Before this, the entry was
+   * `npx -y opencode-ai acp` with no version at all: every box resolved
+   * `latest` independently, at spawn, so two boxes could run different OpenCode
+   * builds while every descriptor claim about OpenCode read identically
+   * (brick 0ededc52).
+   */
+  opencode: "1.18.28",
 } as const;
 
 type BuiltInAgentPackageSpec = {
@@ -65,7 +90,7 @@ export const AGENT_REGISTRY: Record<string, string> = {
   kilocode: "npx -y @kilocode/cli acp",
   kimi: "kimi acp",
   kiro: "kiro-cli-chat acp",
-  opencode: "npx -y opencode-ai acp",
+  opencode: `npx -y opencode-ai@${ACP_ADAPTER_PACKAGE_RANGES.opencode} acp`,
   qoder: "qodercli --acp",
   qwen: "qwen --acp",
   trae: "traecli acp serve",
