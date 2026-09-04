@@ -14,6 +14,7 @@
 
 import { AcpxOperationalError } from "../errors.js";
 import { findModelsById, loadCatalogue } from "./catalogue.js";
+import { nativeAgentTypesForSource } from "./harness-models.js";
 import { searchModels } from "./matcher.js";
 import type { CatalogueModel, ModelCatalogue } from "./types.js";
 
@@ -154,6 +155,13 @@ export function describeLadder(model: CatalogueModel): string {
 export type ValidationInput = {
   model?: string;
   reasoningEffort?: string;
+  /**
+   * The agent type the session is being created for. It narrows the candidate
+   * set BEFORE ambiguity is judged — without it, `--model sonnet` on a claude
+   * session reads as ambiguous between the subscription and the independent
+   * home, which is not a question the caller was asking.
+   */
+  agentName?: string;
 };
 
 /**
@@ -171,7 +179,7 @@ export function validateModelSelection(
   }
 
   const ref = parseModelRef(raw);
-  const candidates = candidatesFor(catalogue, ref);
+  const candidates = candidatesFor(catalogue, ref, input.agentName);
 
   if (candidates.length === 0) {
     // COLD CACHE: with no OpenRouter rows loaded, acpx cannot tell an unknown
@@ -184,7 +192,7 @@ export function validateModelSelection(
     throw unknownSlugError(catalogue, ref);
   }
 
-  if (new Set(candidates.map((model) => model.source)).size > 1) {
+  if (isAmbiguous(candidates)) {
     throw ambiguousSlugError(candidates, ref);
   }
 
@@ -196,9 +204,48 @@ export function validateModelSelection(
   return model;
 }
 
-function candidatesFor(catalogue: ModelCatalogue, ref: ParsedModelRef): CatalogueModel[] {
+function candidatesFor(
+  catalogue: ModelCatalogue,
+  ref: ParsedModelRef,
+  agentName: string | undefined,
+): CatalogueModel[] {
   const byId = findModelsById(catalogue, ref.id);
-  return ref.source === null ? byId : byId.filter((model) => model.source === ref.source);
+  if (ref.source !== null) {
+    return byId.filter((model) => model.source === ref.source);
+  }
+  if (agentName === undefined) {
+    return byId;
+  }
+  // Rows another harness owns are not candidates for THIS create at all.
+  const reachable = byId.filter((model) => {
+    const owners = nativeAgentTypesForSource(model.source);
+    return owners === null || owners.includes(agentName);
+  });
+  return reachable.length > 0 ? reachable : byId;
+}
+
+/**
+ * ⚠️ AMBIGUITY IS ABOUT THE BILL, NOT ABOUT THE ROW COUNT — and getting this
+ * wrong is a REGRESSION, not a stricter check.
+ *
+ * MEASURED 2026-09-04T00:27Z, and it is why this function exists: a first cut
+ * refused on "more than one source", and `acpx claude sessions new --model
+ * sonnet` — which works on the deployed CLI today — exited 2, because `sonnet`
+ * is a row under BOTH `claude-subscription` and `claude-home`. Those two are
+ * the same weights on the same plan class reached through a different
+ * credential, and the credential is what `--profile` / `--subscription` select;
+ * `--model` has never meant a source. So a split that costs the same is not an
+ * ambiguity the caller must resolve.
+ *
+ * What D2 actually protects against is spending money you did not mean to —
+ * `opus` on plan versus the same weights metered on OpenRouter. So the test is
+ * a difference in BILLING KIND, which is exactly that case and not this one.
+ */
+function isAmbiguous(candidates: CatalogueModel[]): boolean {
+  if (candidates.length < 2) {
+    return false;
+  }
+  return new Set(candidates.map((model) => model.billing.kind)).size > 1;
 }
 
 /** Shape 1 — unknown slug: the three nearest matches by the SAME matcher. */
@@ -302,5 +349,6 @@ export async function validateSessionModelFlags(params: {
   await validateModelSelectionFromCache({
     model: params.model,
     reasoningEffort: params.reasoningEffort,
+    agentName: params.agentName,
   });
 }

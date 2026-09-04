@@ -86,14 +86,60 @@ test("SHAPE 1 — a typo still finds its target, because a typo shares no whole 
   assert.match(error.message, /deepseek\/deepseek-v4-pro/);
 });
 
-test("SHAPE 2 — an id under two sources exits USAGE listing BOTH keys with their billing", () => {
-  const error = caught(() => validateModelSelection(catalogueWith(), { model: "opus" }));
+/**
+ * ⚠️ AMBIGUITY IS ABOUT THE BILL. The case D2 protects against is the same
+ * weights reached through two doors that cost DIFFERENT money — `opus` on plan
+ * versus metered on OpenRouter. Two rows of the same billing kind are NOT that
+ * case, and treating them as one was a measured regression (see the next test).
+ */
+test("SHAPE 2 — an id served on plan AND metered exits USAGE listing both, guessing neither", () => {
+  const catalogue = buildCatalogue(
+    [
+      {
+        id: "opus",
+        name: "Opus, metered",
+        supported_parameters: ["tools"],
+        pricing: { prompt: "0.000005", completion: "0.000025" },
+      },
+    ],
+    META,
+  );
+  const error = caught(() => validateModelSelection(catalogue, { model: "opus" }));
   assert.equal(error.outputCode, "USAGE");
   assert.equal(error.detailCode, "MODEL_SLUG_AMBIGUOUS");
   assert.match(error.message, /claude-subscription:opus/);
-  assert.match(error.message, /claude-home:opus/);
+  assert.match(error.message, /openrouter:opus/);
+  // Both bills are shown, so the caller can see what the choice costs.
+  assert.match(error.message, /on plan/);
+  assert.match(error.message, /\$5 \/ \$25/);
   // It refuses to guess rather than picking the cheaper or the first.
   assert.doesNotMatch(error.message, /using claude-subscription/);
+});
+
+/**
+ * REGRESSION GUARD — measured 2026-09-04T00:27Z against the deployed CLI.
+ * `acpx claude sessions new --model sonnet` works today. `sonnet` is a row under
+ * BOTH claude-subscription and claude-home, so a naive "more than one source ⇒
+ * ambiguous" rule exited 2 on it. Those two are the same plan class reached
+ * through a different credential, and the credential is what --profile /
+ * --subscription select; --model has never meant a source.
+ */
+test("a bare native alias on its own agent is NOT ambiguous — the deployed CLI accepts it", () => {
+  const catalogue = catalogueWith();
+  for (const model of ["sonnet", "opus", "haiku", "fable", "default"]) {
+    const resolved = validateModelSelection(catalogue, { model, agentName: "claude" });
+    assert.ok(resolved, `--model ${model} must not be refused for a claude session`);
+    assert.equal(resolved.id, model);
+  }
+  // And the agent type is what excludes another harness's rows from the question.
+  assert.equal(
+    validateModelSelection(catalogue, { model: "opus", agentName: "claude" })?.source,
+    "claude-subscription",
+  );
+  assert.equal(
+    validateModelSelection(catalogue, { model: "opus", agentName: "claude-pty" })?.source,
+    "claude-pty",
+  );
 });
 
 test("SHAPE 2 — naming the source resolves it, and the create proceeds", () => {
@@ -163,12 +209,18 @@ test("COLD CACHE: an unrecognised id passes through rather than blocking the cre
 });
 
 test("COLD CACHE: a slug acpx DOES know is still validated", () => {
+  // Knowing less never means checking less about what IS known: with only the
+  // native rows loaded, an effort outside a native ladder is still refused.
   const coldCatalogue = buildCatalogue([], META);
-  assert.throws(
-    () => validateModelSelection(coldCatalogue, { model: "opus" }),
-    ModelSlugError,
-    "knowing less never means checking less about what IS known",
+  const error = caught(() =>
+    validateModelSelection(coldCatalogue, {
+      model: "sonnet",
+      reasoningEffort: "max",
+      agentName: "claude",
+    }),
   );
+  assert.equal(error.detailCode, "MODEL_EFFORT_OUT_OF_LADDER");
+  assert.match(error.message, /low, medium, high/);
 });
 
 test("validation is skipped for the raw --agent escape hatch and for unenumerated harnesses", async () => {
