@@ -15,6 +15,7 @@ import {
   type KillTerminalRequest,
   type KillTerminalResponse,
   type LoadSessionResponse,
+  type NewSessionResponse,
   type PromptResponse,
   type ReadTextFileRequest,
   type ReadTextFileResponse,
@@ -33,6 +34,7 @@ import {
   type WriteTextFileResponse,
   type SessionConfigOption,
   type SessionModelState,
+  type SessionModeState,
 } from "@agentclientprotocol/sdk";
 import { resolveBuiltInAgentLaunch } from "../agent-registry.js";
 import { TimeoutError, withTimeout } from "../async-control.js";
@@ -240,12 +242,22 @@ export type SessionCreateResult = {
   agentSessionId?: string;
   configOptions?: SessionConfigOption[];
   models?: SessionModelState;
+  /**
+   * The ACP MODE advertisement. Additive (B3): Pi carries thinking depth on the
+   * mode selector and advertises `configOptions: null` (I2 R8), so the mode
+   * depth arm has nothing to project onto without it. Every other harness is
+   * untouched — this field is simply the value the ACP response already carried
+   * and acpx previously discarded.
+   */
+  modes?: SessionModeState;
 };
 
 export type SessionLoadResult = {
   agentSessionId?: string;
   configOptions?: SessionConfigOption[];
   models?: SessionModelState;
+  /** See {@link SessionCreateResult.modes}. */
+  modes?: SessionModeState;
 };
 
 export type SessionResumeResult = SessionLoadResult;
@@ -269,6 +281,17 @@ function toReconnectedSessionResult(
     agentSessionId: extractRuntimeSessionId(response?._meta),
     configOptions: response?.configOptions ?? undefined,
     models: response?.models ?? undefined,
+    modes: response?.modes ?? undefined,
+  };
+}
+
+function toCreateSessionResult(response: NewSessionResponse): SessionCreateResult {
+  return {
+    sessionId: response.sessionId,
+    agentSessionId: extractRuntimeSessionId(response._meta),
+    configOptions: response.configOptions ?? undefined,
+    models: response.models ?? undefined,
+    modes: response.modes ?? undefined,
   };
 }
 
@@ -278,6 +301,7 @@ function toForkSessionResult(response: ForkSessionResponse): SessionForkResult {
     agentSessionId: extractRuntimeSessionId(response._meta),
     configOptions: response.configOptions ?? undefined,
     models: response.models ?? undefined,
+    modes: response.modes ?? undefined,
   };
 }
 
@@ -1144,12 +1168,7 @@ export class AcpClient {
 
     this.loadedSessionId = result.sessionId;
 
-    return {
-      sessionId: result.sessionId,
-      agentSessionId: extractRuntimeSessionId(result._meta),
-      configOptions: result.configOptions ?? undefined,
-      models: result.models ?? undefined,
-    };
+    return toCreateSessionResult(result);
   }
 
   /**

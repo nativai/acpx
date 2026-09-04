@@ -85,7 +85,10 @@ import {
   setDesiredModelId,
   setDesiredModelSource,
 } from "../../session/mode-preference.js";
-import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
+import {
+  advertisedAfterModelApply,
+  applyRequestedModelIfAdvertised,
+} from "../../session/model-application.js";
 import { enforceModelFloorPostServe } from "../../session/model-floor-enforce.js";
 import { captureServedState } from "../../session/model-floor.js";
 import { guardServedModel, stampModelGuardBreadcrumb } from "../../session/model-guard.js";
@@ -3010,20 +3013,27 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
           options.agentCommand,
           options.sessionOptions,
         );
-        await applyRequestedModelIfAdvertised({
+        const execModelApply = await applyRequestedModelIfAdvertised({
           client,
           sessionId,
           requestedModel: effectiveSessionOptions?.model,
           models: createdSession.models,
+          advertisedConfigOptions: createdSession.configOptions,
           agentCommand: options.agentCommand,
           timeoutMs: options.timeoutMs,
         });
         // One-shot: no persisted record, so apply effort live for this turn only.
+        // The post-model re-read applies here too — `acpx opencode exec --model
+        // <reasoning model> --reasoning-effort high` would otherwise read the
+        // `session/new` snapshot, in which `effort` is not yet advertised (I1 R8),
+        // and drop the depth for the one turn the whole command exists to run.
         await applyExecReasoningEffort({
           client,
           sessionId,
           reasoningEffort: effectiveSessionOptions?.reasoningEffort,
-          advertised: createdSession.configOptions,
+          advertised: advertisedAfterModelApply(execModelApply, createdSession.configOptions),
+          modes: createdSession.modes,
+          agentCommand: options.agentCommand,
           modelId: effectiveSessionOptions?.model,
           timeoutMs: options.timeoutMs,
           verbose: options.verbose,

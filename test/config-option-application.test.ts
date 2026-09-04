@@ -27,31 +27,51 @@ function effortOption(currentValue: string, levels = OPUS_EFFORT_LEVELS): Sessio
 }
 
 type Call = { sessionId: string; configId: string; value: string };
+type ModeCall = { sessionId: string; modeId: string };
 
+// B3: the depth path now dispatches on the harness's depth MECHANISM, so its
+// client surface is `ConfigOptionApplyClient & DepthModeApplyClient`. The stub
+// carries `setSessionMode` and RECORDS it, so a test can assert that the
+// config-option arm never reaches for the mode wire (and vice versa) rather than
+// merely that it compiled.
 function mockClient(responseOptions?: SessionConfigOption[]): {
   calls: Call[];
+  modeCalls: ModeCall[];
   setSessionConfigOption: (
     sessionId: string,
     configId: string,
     value: string,
   ) => Promise<{ configOptions?: SessionConfigOption[] }>;
+  setSessionMode: (sessionId: string, modeId: string) => Promise<void>;
 } {
   const calls: Call[] = [];
+  const modeCalls: ModeCall[] = [];
   return {
     calls,
+    modeCalls,
     setSessionConfigOption(sessionId, configId, value) {
       calls.push({ sessionId, configId, value });
       return Promise.resolve({ configOptions: responseOptions });
+    },
+    setSessionMode(sessionId, modeId) {
+      modeCalls.push({ sessionId, modeId });
+      return Promise.resolve();
     },
   };
 }
 
 function rejectingMockClient(error: Error): ReturnType<typeof mockClient> {
   const calls: Call[] = [];
+  const modeCalls: ModeCall[] = [];
   return {
     calls,
+    modeCalls,
     setSessionConfigOption(sessionId, configId, value) {
       calls.push({ sessionId, configId, value });
+      return Promise.reject(error);
+    },
+    setSessionMode(sessionId, modeId) {
+      modeCalls.push({ sessionId, modeId });
       return Promise.reject(error);
     },
   };

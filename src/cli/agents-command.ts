@@ -1,5 +1,6 @@
 import { Command, InvalidArgumentError } from "commander";
 import {
+  depthRequestUnroutableReason,
   HARNESS_IDS,
   type HarnessCapabilities,
   isHarnessId,
@@ -44,6 +45,14 @@ function renderTable(capabilities: HarnessCapabilities[]): string {
   for (const capability of capabilities) {
     if (capability.liveModelChangeReason) {
       footnotes.push(`  ${capability.id}: model is locked — ${capability.liveModelChangeReason}\n`);
+    }
+    // B3: the same courtesy for depth. A bare "DEPTH LIVE: no" column tells a
+    // human nothing about WHY, and after B3 the only remaining no is codex —
+    // whose depth is not missing but fused into the model id, so the actionable
+    // answer is a different flag rather than a missing feature.
+    const depthReason = depthRequestUnroutableReason(capability.id);
+    if (depthReason) {
+      footnotes.push(`  ${capability.id}: --reasoning-effort cannot reach it — ${depthReason}\n`);
     }
     if (capability.fork.atIndex === "turn-granular") {
       footnotes.push(

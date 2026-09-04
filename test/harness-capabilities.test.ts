@@ -13,6 +13,8 @@ import {
   HARNESS_FACTS,
   HARNESS_IDS,
   type HarnessId,
+  depthRequestUnroutableReason,
+  isDepthRequestRoutable,
   isHarnessId,
   listHarnessCapabilities,
   MODEL_MECHANISMS_ROUTED_BY_ACPX,
@@ -20,11 +22,9 @@ import {
   resolveHarnessCapabilities,
 } from "../src/acp/harness-capabilities.js";
 import { supportsMidTurnPromptInjection } from "../src/acp/mid-turn-injection-support.js";
-import {
-  assertRequestedModelSupported,
-  RequestedModelUnsupportedError,
-} from "../src/acp/model-support.js";
+import { RequestedModelUnsupportedError } from "../src/acp/model-support.js";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
+import { applyRequestedModelIfAdvertised } from "../src/session/model-application.js";
 
 // The command strings acpx's registry launches by default, written out here
 // rather than read from AGENT_REGISTRY for claude/codex/claude-pty: those three
@@ -142,34 +142,78 @@ const ADVERTISES_ACP_MODELS: Record<string, boolean> = {
   none: false,
 };
 
-function acpxRoutesAModelFor(id: HarnessId): boolean {
-  const advertisesAcpModels = ADVERTISES_ACP_MODELS[HARNESS_FACTS[id].model.mechanism];
+// ⚠️ THIS PROBES THE DISPATCHER, NOT ONE ARM — and that is the whole point.
+//
+// Before B3 it called `assertRequestedModelSupported` directly, which was then
+// the only gate. B3 gave `applyRequestedModelIfAdvertised` a `config-option` arm
+// that legitimately BYPASSES that assertion (OpenCode advertises no ACP `models`
+// array at all), so a probe aimed at the assertion would now report "not routed"
+// for a harness acpx routes perfectly well — a false RED produced by measuring a
+// neighbouring question. Call the entry point the product calls.
+async function acpxRoutesAModelFor(id: HarnessId): Promise<boolean> {
+  const mechanism = HARNESS_FACTS[id].model.mechanism;
+  const advertisesAcpModels = ADVERTISES_ACP_MODELS[mechanism];
+  const sent: string[] = [];
+  const client = {
+    setSessionModel: async (_sessionId: string, modelId: string) => {
+      sent.push(`set_model:${modelId}`);
+    },
+    setSessionConfigOption: async (_sessionId: string, configId: string, value: string) => {
+      sent.push(`set_config_option:${configId}=${value}`);
+      return {};
+    },
+  };
   try {
-    assertRequestedModelSupported({
+    const outcome = await applyRequestedModelIfAdvertised({
+      client,
+      sessionId: "probe-session",
       requestedModel: "probe-model",
       models: advertisesAcpModels
-        ? ({ availableModels: [{ modelId: "probe-model", name: "probe" }] } as never)
+        ? ({
+            currentModelId: "something-else",
+            availableModels: [{ modelId: "probe-model", name: "probe" }],
+          } as never)
         : undefined,
+      // The config-option arm validates against the advertised `model` option,
+      // so the probe must advertise one or it measures the validation, not the
+      // routing.
+      advertisedConfigOptions: [
+        {
+          id: "model",
+          name: "model",
+          type: "select",
+          currentValue: "something-else",
+          options: [{ value: "probe-model", name: "probe" }],
+        },
+      ] as never,
       agentCommand: DEFAULT_AGENT_COMMANDS[id],
-      context: "apply",
     });
+    // ⚠️ Assert the probe REACHED ITS SUBJECT. An outcome of `applied:false` with
+    // nothing sent looks identical to a routed apply if only the absence of a
+    // throw is checked — the "a control that stops short looks exactly like one
+    // that passed" trap. Routed means a wire call actually happened.
+    assert.ok(
+      outcome.applied && sent.length === 1,
+      `${id}: expected exactly one wire call, got ${JSON.stringify(sent)} (applied=${outcome.applied})`,
+    );
     return true;
   } catch (error) {
     assert.ok(
       error instanceof RequestedModelUnsupportedError,
       `unexpected error: ${String(error)}`,
     );
+    assert.equal(sent.length, 0, `${id}: refused, but a wire call was still made`);
     return false;
   }
 }
 
-test("acpx's real model gate agrees with MODEL_MECHANISMS_ROUTED_BY_ACPX for every harness", () => {
+test("acpx's real model gate agrees with MODEL_MECHANISMS_ROUTED_BY_ACPX for every harness", async () => {
   for (const id of HARNESS_IDS) {
     const declaredRouted = MODEL_MECHANISMS_ROUTED_BY_ACPX.includes(
       HARNESS_FACTS[id].model.mechanism,
     );
     assert.equal(
-      acpxRoutesAModelFor(id),
+      await acpxRoutesAModelFor(id),
       declaredRouted,
       `${id}: the routing list says routed=${declaredRouted} but acpx's model gate disagrees. ` +
         "Either the apply path grew a branch and the list was not updated, or the list gained a " +
@@ -182,14 +226,39 @@ test("the mechanism a harness needs and the mechanism acpx routes are separate f
   // OpenCode's HARNESS mechanism is config-option (I1 R5) — that is a measured
   // property of OpenCode and must not be edited to make a boolean come out.
   assert.equal(HARNESS_FACTS.opencode.model.mechanism, "config-option");
-  // acpx does NOT route it today; that is the reason the capability is false.
-  assert.equal(MODEL_MECHANISMS_ROUTED_BY_ACPX.includes("config-option"), false);
+  // B3 landed the apply branch, so acpx DOES route it now — and the capability
+  // followed on its own. Neither `HARNESS_FACTS` nor `deriveCanSetModelLive` was
+  // edited to achieve that; only the routing list gained an entry, in the same
+  // commit as the branch. That is the derivation doing its job.
+  assert.equal(MODEL_MECHANISMS_ROUTED_BY_ACPX.includes("config-option"), true);
   const opencode = deriveHarnessCapabilities(HARNESS_FACTS.opencode);
-  assert.equal(opencode.canSetModelLive, false);
-  assert.notEqual(opencode.liveModelChangeReason, null);
-  // The reason a user reads beside the padlock must name the situation, not be generic.
-  assert.match(String(opencode.liveModelChangeReason), /set_config_option/);
-  assert.match(String(opencode.liveModelChangeReason), /unrecoverable|D2/);
+  assert.equal(opencode.canSetModelLive, true);
+  // A live capability must not carry a stale padlock reason.
+  assert.equal(opencode.liveModelChangeReason, null);
+  // The reason is still THERE as a fact, ready if the routing is ever withdrawn —
+  // it is suppressed by the derivation, not deleted from the table.
+  assert.match(HARNESS_FACTS.opencode.liveModelChangeBlockedReason, /set_config_option/);
+  assert.match(HARNESS_FACTS.opencode.liveModelChangeBlockedReason, /unrecoverable|D2/);
+  // And the derivation genuinely depends on the list: hand it a list without
+  // `config-option` and the answer flips back. This is what proves the boolean
+  // is DERIVED and not a literal that happens to read true today.
+  assert.equal(deriveCanSetModelLive("config-option", ["set-model"]), false);
+  assert.equal(deriveCanSetModelLive("config-option", ["config-option"]), true);
+});
+
+test("the depth routing list and acpx's depth dispatcher agree for every harness", () => {
+  // Pi's depth mechanism is the ACP mode selector (I2 R8) — measured, not chosen.
+  assert.equal(HARNESS_FACTS.pi.depth.mechanism, "mode");
+  // B3 landed the mode arm and the list entry together.
+  assert.equal(DEPTH_MECHANISMS_ROUTED_BY_ACPX.includes("mode"), true);
+  // `isDepthRequestRoutable` is what the CLI's "ignored for agent X" warning
+  // dispatches on, so it must now say pi IS reachable — otherwise acpx applies
+  // the depth and tells the user on stderr that it did not.
+  assert.equal(isDepthRequestRoutable("pi"), true);
+  assert.equal(depthRequestUnroutableReason("pi"), null);
+  // codex is still unroutable, and for a reason that names the mechanism.
+  assert.equal(isDepthRequestRoutable("codex"), false);
+  assert.match(String(depthRequestUnroutableReason("codex")), /model id/);
 });
 
 test("a live capability never carries a stale reason string", () => {
@@ -386,7 +455,17 @@ test("the routed lists are the ones the shipped code has branches for", () => {
   // Pinned literally so a widening is a deliberate, visible change reviewed
   // alongside the apply-path branch that justifies it. The behavioural
   // agreement with the real gate is asserted above.
-  assert.deepEqual([...MODEL_MECHANISMS_ROUTED_BY_ACPX], ["set-model", "compose-into-id"]);
-  assert.deepEqual([...DEPTH_MECHANISMS_ROUTED_BY_ACPX], ["config-option"]);
+  // B3 widened both, each in the same commit as the apply-path branch behind it:
+  // `config-option` for the model (applyModelAsConfigOption -> session/set_config_option)
+  // and `mode` for depth (applyDepthAsMode -> session/set_mode).
+  assert.deepEqual(
+    [...MODEL_MECHANISMS_ROUTED_BY_ACPX],
+    ["set-model", "compose-into-id", "config-option"],
+  );
+  assert.deepEqual([...DEPTH_MECHANISMS_ROUTED_BY_ACPX], ["config-option", "mode"]);
+  // Still empty: `provisioned` needs the per-session config dir to GENERATE a
+  // catalogue fragment before an arbitrary slug can be advertised, and
+  // `via-shim` needs the OpenRouter shim to take a model from the picker. Until
+  // then the picker must not offer a band that fails at spawn.
   assert.deepEqual([...ARBITRARY_MODEL_SUPPORT_ROUTED_BY_ACPX], []);
 });

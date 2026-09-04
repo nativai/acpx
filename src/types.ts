@@ -605,22 +605,67 @@ export type SessionAcpxState = {
   config_options?: SessionConfigOption[];
   owner_options?: SessionOwnerOptions;
   /**
-   * Per-turn SERVED truth (brick://07dd62c9): the model the harness/API actually
-   * served for the last turn — the last `assistant.message.model` in the Claude
-   * transcript — plus the effort that the served model implies, and when it was
-   * observed. LIVE observation, deliberately kept SEPARATE from the desired pin
-   * (`current_model_id` / `session_options.model`): under load the API can serve
-   * a cheaper model than the pin, and this field records that fact without ever
-   * mutating the pin. Absent for non-Claude agents (no transcript model) and
-   * until the first post-turn capture. `effort` is DERIVED from the served model
-   * (effort follows model — see config-option-application), not an independent
-   * observation; `source` labels where `model` came from.
+   * Per-turn SERVED truth (brick://07dd62c9): what was actually served, as
+   * opposed to what was pinned. LIVE observation, deliberately kept SEPARATE
+   * from the desired pin (`current_model_id` / `session_options.model`): under
+   * load the API can serve a cheaper model than the pin, and this field records
+   * that fact without ever mutating the pin.
+   *
+   * ⚠️ **THERE ARE TWO PRODUCERS AND THEY MEAN DIFFERENT THINGS BY `effort`.**
+   * `source` is what tells them apart, and exactly one runs per record — the
+   * agent family is the gate that guarantees it:
+   *
+   * | `source` | producer | what `effort` means |
+   * |---|---|---|
+   * | `claude-transcript` | `captureServedState` (`src/session/model-floor.ts`), post-turn, from the last `assistant.message.model` in the Claude transcript | **DERIVED from the served model** (effort follows model), not an independent observation |
+   * | `depth-projection` | `recordDepthOutcome` (`src/session/depth-application.ts`), at apply time, from projecting a canonical depth request onto the target's ladder (B3, CONCEPTION §6.2) | **an INDEPENDENT observation** — the depth actually sent to the harness, which may differ from the request |
+   *
+   * The transcript producer is Claude-only by construction: `readLastServedModel`
+   * returns undefined unless `isClaudeAcpAgentCommand`. The depth producer is
+   * gated on `!isClaudeFamilyAgent` for the same reason from the other side. So
+   * this block is **no longer absent for non-Claude agents** — for OpenCode and
+   * Pi it carries the depth outcome and no model.
+   *
+   * ⚠️ `setServedState` REPLACES this whole block rather than merging.
+   * `recordDepthOutcome` therefore merges by hand instead of calling it. A third
+   * producer must respect that or it will silently destroy a sibling's write.
+   *
+   * ⚠️ `effort` here cannot express the outcomes that send NO value (a depth
+   * request that was unavailable, or an advertised-then-rejected mode). Those
+   * live in {@link depth_projection}, which is why that field exists.
    */
   served?: {
     model?: string;
     effort?: string;
     at?: string;
     source?: string;
+  };
+  /**
+   * What a `--reasoning-effort` request ACTUALLY produced (B3, CONCEPTION §6.2).
+   *
+   * **The invariant this exists for: a depth request is never silently dropped.**
+   * Before B3 it was — `persistAndApplyRequestedEffort` returned with no error
+   * and no persist when the `effort` option was not advertised, so the request
+   * sat in `session_options.effort` with nothing anywhere recording that it had
+   * not been honoured.
+   *
+   * ⚠️ `served.effort` alone CANNOT carry this, which is why the field exists
+   * rather than being folded into that block. Three of the six outcomes send no
+   * value at all (`unavailable`, `send-nothing`, a rejected mode), and a bare
+   * effort string cannot distinguish "served exactly what you asked" from
+   * "clamped because this model cannot disable reasoning". A field that can only
+   * express the satisfiable cases would leave precisely the dropped ones silent.
+   *
+   * `outcome` is a {@link DepthProjectionKind}; `reason` is present whenever the
+   * served value differs from the requested one or nothing was sent, and is the
+   * string a UI renders beside a control it must show as unavailable-with-a-reason
+   * rather than silently absent.
+   */
+  depth_projection?: {
+    requested: string;
+    outcome: string;
+    served?: string;
+    reason?: string;
   };
   /**
    * Breadcrumb stamped when a turn was served below the pinned floor

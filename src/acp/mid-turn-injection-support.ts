@@ -1,9 +1,34 @@
 import { isClaudeAcpCommand, isClaudePtyAcpCommand } from "./agent-command.js";
 import { splitCommandLine } from "./client-process.js";
 import { isCodexAcpCommand } from "./codex-compat.js";
+import { harnessIdForAgentCommand, HARNESS_FACTS } from "./harness-capabilities.js";
 
+/**
+ * Whether a mid-turn steer can be injected into this backend's active turn.
+ *
+ * B3: this was a hardcoded claude / codex / claude-pty name allow-list. It is now
+ * the capability descriptor's `midTurnSteering` cell, so the declared capability
+ * and the shipped behaviour cannot disagree — which is the entire failure mode
+ * the descriptor exists to end. `test/harness-capabilities.test.ts` pins the two
+ * against each other for every harness.
+ *
+ * ⚠️ The ANSWERS ARE UNCHANGED, deliberately. claude / claude-pty / codex declare
+ * `midTurnSteering: true` and opencode / pi declare `false` (I1 R3, I2 R3 — neither
+ * adapter supports it). This is a change of SOURCE, not of behaviour: it must stay
+ * that way, because widening steering to a harness that cannot absorb an injected
+ * prompt is how a turn wedges open with no terminal response.
+ *
+ * ⚠️ An agent command the descriptor does not classify falls back to the original
+ * predicate rather than to `false`. Returning `false` for an unrecognised adapter
+ * would silently disable steering for any custom `ACPX_*_ACP_COMMAND` override the
+ * detectors still recognise — a regression wearing a refactor's clothes.
+ */
 export function supportsMidTurnPromptInjection(agentCommand: string): boolean {
   try {
+    const harness = harnessIdForAgentCommand(agentCommand);
+    if (harness !== undefined) {
+      return HARNESS_FACTS[harness].midTurnSteering;
+    }
     const { command, args } = splitCommandLine(agentCommand);
     return (
       isClaudeAcpCommand(command, args) ||

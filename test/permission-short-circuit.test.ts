@@ -190,7 +190,15 @@ test("acpx agents show <id> --json prints one object, and rejects an unknown age
   assert.equal(Array.isArray(parsed), false);
   assert.equal(Object.hasOwn(parsed, "agents"), false, "the show form is NOT enveloped");
   assert.equal(parsed.id, "opencode");
-  assert.equal(parsed.canSetModelLive, false);
+  // B3 routed the config-option mechanism, so opencode's model IS live now.
+  // Before B3 this asserted false. The DERIVATION moved it — HARNESS_FACTS was
+  // not edited, only the routing list, in the same commit as the apply branch.
+  assert.equal(parsed.canSetModelLive, true);
+  assert.equal(
+    parsed.liveModelChangeReason,
+    null,
+    "a live capability must not carry a padlock reason",
+  );
 
   await assert.rejects(async () => await runAgents(["show", "gemini", "--json"]));
 });
@@ -207,8 +215,24 @@ test("the text form renders a table naming each harness and its mechanism", asyn
   }
   assert.ok(stdout.includes("FORK@INDEX"), "the text form is not a table");
   assert.ok(stdout.includes("turn-granular"), "the codex fork granularity is not surfaced");
-  // The two facts a human most needs are the ones a bare table would hide.
-  assert.ok(stdout.includes("model is locked"), "the locked-model reason is not surfaced");
+  // The facts a human most needs are the ones a bare table would hide.
+  //
+  // (WARNING) The locked-MODEL footnote no longer fires for ANY harness: after B3
+  // every declared model mechanism is routed, so liveModelChangeReason is null
+  // across the table. Asserting that string here would be asserting a regression.
+  // The renderer KEEPS the branch — it is correct the moment a mechanism is
+  // unrouted — and this row proves the absence is the honest one rather than a
+  // broken footnote path, by checking that the DEPTH footnote (same code path,
+  // still firing for codex) does appear.
+  assert.equal(
+    stdout.includes("model is locked"),
+    false,
+    "no harness is model-locked after B3 — a padlock here would be a stale reason",
+  );
+  assert.ok(
+    stdout.includes("--reasoning-effort cannot reach it"),
+    "the unroutable-depth reason is not surfaced — the footnote path itself is broken",
+  );
   assert.ok(
     stdout.includes("does NOT land where it was asked to"),
     "the turn-granular rounding is not explained",

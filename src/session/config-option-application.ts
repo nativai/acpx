@@ -1,7 +1,16 @@
-import type { SessionConfigOption } from "@agentclientprotocol/sdk";
+import type { SessionConfigOption, SessionModeState } from "@agentclientprotocol/sdk";
+import {
+  acpxRoutesDepthMechanism,
+  depthMechanismForAgentCommand,
+} from "../acp/harness-capabilities.js";
 import { withTimeout } from "../async-control.js";
 import type { SessionRecord } from "../types.js";
 import { applyConfigOptionsToRecord } from "./config-options.js";
+import {
+  applyDepthAsMode,
+  type DepthModeApplyClient,
+  recordDepthOutcome,
+} from "./depth-application.js";
 import { getDesiredConfigOptions, setDesiredConfigOption } from "./mode-preference.js";
 import { assertOutputStyleAdvertised, OUTPUT_STYLE_CONFIG_ID } from "./output-style.js";
 
@@ -240,16 +249,54 @@ export async function applyRequestedConfigOptionsIfAdvertised(params: {
  * user-facing "ignored" warning).
  */
 export async function persistAndApplyRequestedEffort(params: {
-  client: ConfigOptionApplyClient;
+  client: ConfigOptionApplyClient & DepthModeApplyClient;
   sessionId: string;
   record: SessionRecord;
   reasoningEffort: string | undefined;
   advertised: SessionConfigOption[] | undefined;
+  /** The ACP mode advertisement — the ladder for a `mode`-mechanism harness (I2 R8). */
+  modes?: SessionModeState;
+  /** Selects the depth mechanism. Absent ⇒ the pre-B3 config-option path, unchanged. */
+  agentCommand?: string;
   modelId?: string;
   timeoutMs?: number;
   verbose?: boolean;
 }): Promise<void> {
-  if (!params.reasoningEffort || !advertisesConfigOption(params.advertised, "effort")) {
+  if (!params.reasoningEffort) {
+    return;
+  }
+  // ── The mode arm (B3, CONCEPTION §5.2/§6.3) ──────────────────────────────
+  // Pi advertises `configOptions: null` and carries thinking level on
+  // `session/set_mode` (I2 R8), so the config-option gate below could never be
+  // true for it and `--reasoning-effort` silently never fired.
+  const mechanism = depthMechanismForAgentCommand(params.agentCommand);
+  if (mechanism === "mode" && acpxRoutesDepthMechanism(mechanism)) {
+    setDesiredConfigOption(params.record, "effort", params.reasoningEffort);
+    const projection = await applyDepthAsMode({
+      client: params.client,
+      sessionId: params.sessionId,
+      requested: params.reasoningEffort,
+      modes: params.modes,
+      timeoutMs: params.timeoutMs,
+      verbose: params.verbose,
+    });
+    recordDepthOutcome(params.record, projection);
+    return;
+  }
+
+  if (!advertisesConfigOption(params.advertised, "effort")) {
+    // ⚠️ THE SILENT DROP THIS BLOCK EXISTS TO END. This early return is still
+    // correct — there is genuinely nothing to send — but before B3 it was also
+    // SILENT, so a `--reasoning-effort` that never reached the harness was
+    // indistinguishable in the record from one that did. Now the outcome is
+    // recorded (and for the Claude family `recordDepthOutcome` is a no-op, so
+    // their behaviour is unchanged).
+    recordDepthOutcome(params.record, {
+      kind: "unavailable",
+      requested: params.reasoningEffort,
+      reason:
+        "this session advertises no selectable `effort` config option, so the depth request could not be applied",
+    });
     return;
   }
   setDesiredConfigOption(params.record, "effort", params.reasoningEffort);
@@ -311,15 +358,31 @@ export function persistRequestedOutputStyle(params: {
  * Same advertised/supported/differing guard, so codex `exec` is a no-op.
  */
 export async function applyExecReasoningEffort(params: {
-  client: ConfigOptionApplyClient;
+  client: ConfigOptionApplyClient & DepthModeApplyClient;
   sessionId: string;
   reasoningEffort: string | undefined;
   advertised: SessionConfigOption[] | undefined;
+  /** See {@link persistAndApplyRequestedEffort}. `exec` has no record to stamp,
+   *  so the outcome is reported on stderr under `--verbose` instead of persisted. */
+  modes?: SessionModeState;
+  agentCommand?: string;
   modelId?: string;
   timeoutMs?: number;
   verbose?: boolean;
 }): Promise<void> {
   if (!params.reasoningEffort) {
+    return;
+  }
+  const mechanism = depthMechanismForAgentCommand(params.agentCommand);
+  if (mechanism === "mode" && acpxRoutesDepthMechanism(mechanism)) {
+    await applyDepthAsMode({
+      client: params.client,
+      sessionId: params.sessionId,
+      requested: params.reasoningEffort,
+      modes: params.modes,
+      timeoutMs: params.timeoutMs,
+      verbose: params.verbose,
+    });
     return;
   }
   await applyConfigOptionIfAdvertised({
@@ -332,6 +395,19 @@ export async function applyExecReasoningEffort(params: {
     timeoutMs: params.timeoutMs,
     verbose: params.verbose,
   });
+}
+
+/**
+ * The set of values a `select` config option actually offers.
+ *
+ * Exported for the model apply path's `config-option` arm
+ * (`src/session/model-application.ts`), which validates a requested model id
+ * against the advertised `model` option. It reads the SAME shape from the SAME
+ * function rather than a second copy: an option-shape reader that drifts from
+ * this one would accept a value the apply path then rejects, or the reverse.
+ */
+export function selectableConfigOptionValues(option: SessionConfigOption): Set<string> {
+  return selectableValues(option);
 }
 
 function selectableValues(option: SessionConfigOption): Set<string> {

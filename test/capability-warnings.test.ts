@@ -47,8 +47,12 @@ test("depth routability is answered for EVERY declared harness, and in both dire
       // is the direction the old name gate got wrong — it warned while the apply
       // path applied the value.
       ["opencode", "config-option", true],
-      // pi: depth is an ACP MODE and acpx's depth path has no mode arm.
-      ["pi", "mode", false],
+      // ⚠️ pi: depth is an ACP MODE, and B3 gave acpx's depth path a mode arm
+      // (`applyDepthAsMode` -> `session/set_mode`), so the request now REACHES
+      // it and the warning must NOT fire. Flipped from false in the same commit
+      // as the arm — codex above stays false, which is what keeps this row a
+      // discriminating check rather than a blanket "everything is routable now".
+      ["pi", "mode", true],
     ],
   );
 });
@@ -67,7 +71,16 @@ test("the unroutable reason names the mechanism and the verb that DOES work", ()
   assert.equal(depthRequestUnroutableReason("claude"), null);
   assert.equal(depthRequestUnroutableReason("opencode"), null);
   assert.match(String(depthRequestUnroutableReason("codex")), /--model '<model>\[depth\]'/);
-  assert.match(String(depthRequestUnroutableReason("pi")), /acpx pi set-mode <level>/);
+  // ⚠️ pi is now ROUTABLE (B3's mode arm), so it must report NO reason. A stale
+  // "use acpx pi set-mode" hint here would tell the user to reach for a
+  // workaround for something --reasoning-effort now does.
+  assert.equal(depthRequestUnroutableReason("pi"), null);
+  // codex remains the positive control: exactly one harness still unroutable.
+  assert.equal(
+    HARNESS_IDS.filter((id) => !isDepthRequestRoutable(id)).length,
+    1,
+    "codex must be the ONLY unroutable depth harness — if this hits 0 the check was deleted, not fixed",
+  );
 });
 
 test("routability follows the ROUTED-MECHANISM list — it is a derivation, not a literal", () => {
@@ -76,7 +89,7 @@ test("routability follows the ROUTED-MECHANISM list — it is a derivation, not 
   // answer true. If the list is what decides, removing it from the list must flip
   // them — which is asserted by construction below rather than by re-reading the
   // same table the function reads.
-  assert.deepEqual([...DEPTH_MECHANISMS_ROUTED_BY_ACPX], ["config-option"]);
+  assert.deepEqual([...DEPTH_MECHANISMS_ROUTED_BY_ACPX], ["config-option", "mode"]);
   for (const id of HARNESS_IDS) {
     assert.equal(
       isDepthRequestRoutable(id),
@@ -113,13 +126,32 @@ function captureThrow(run: () => void): Error {
   throw new assert.AssertionError({ message: "expected a throw" });
 }
 
-test("a live model change is REFUSED on opencode, with the descriptor's own reason", () => {
-  // FINDINGS-opencode D2: acpx's generic path stored a model it can never apply
-  // and the session became unrecoverable — including by setting the model back,
-  // because the clear attempt replays the bad stored value first.
-  const error = captureThrow(() =>
-    assertLiveModelChangeRoutable(recordFor(AGENT_REGISTRY.opencode)),
-  );
+test("D2's protection MOVED from the gate to the apply arm — opencode is now routable", () => {
+  // ⚠️ READ THIS BEFORE "RESTORING" THE OLD REFUSAL. Before B3 this row asserted
+  // that `assertLiveModelChangeRoutable` THREW for opencode, because acpx had no
+  // way to apply a config-option model and persisting one bricked the session
+  // (FINDINGS-opencode D2). B3 gave it that way, so the gate now correctly
+  // passes — `canSetModelLive` derives true from the routed mechanism.
+  //
+  // The D2 protection is NOT gone; it moved to where it can be precise. The gate
+  // could only answer "this harness, ever"; the apply arm answers "this model,
+  // on this session, against what it actually advertises" — see
+  // `test/model-application.test.ts`. Asserting a throw here again would mean
+  // re-breaking live model selection for OpenCode.
+  assert.doesNotThrow(() => assertLiveModelChangeRoutable(recordFor(AGENT_REGISTRY.opencode)));
+  assert.equal(resolveHarnessCapabilities("opencode").canSetModelLive, true);
+});
+
+test("the gate still REFUSES a session whose adapter advertises no model option", () => {
+  // The surviving refusal, and the reason the gate was not simply deleted: an
+  // OpenCode session that advertises config options WITHOUT a selectable `model`
+  // cannot have one applied, and must fail before anything is persisted.
+  const noModelOption = recordFor(AGENT_REGISTRY.opencode, {
+    config_options: [
+      { id: "effort", name: "Effort", type: "select", currentValue: "low", options: [] },
+    ],
+  } as unknown as SessionRecord["acpx"]);
+  const error = captureThrow(() => assertLiveModelChangeRoutable(noModelOption));
   assert.match(error.message, /Cannot set the model on this opencode session/);
   assert.match(error.message, /session\/set_config_option/);
   // The user must be told the session is FINE — a loud failure that leaves them
@@ -143,13 +175,22 @@ test("an agent command the descriptor does not know is NOT refused", () => {
 });
 
 test("the refusal NARROWS with the session's own advertisement, and never widens", () => {
-  // A session that DOES advertise a selectable `model` option still cannot have
-  // it applied, because acpx does not route `config-option` for model yet — the
-  // advertisement can only make the answer more restrictive, never less.
-  const advertised = recordFor(AGENT_REGISTRY.opencode, {
+  // Both directions on the SAME harness, which is what makes this a narrowing
+  // check rather than two unrelated assertions:
+  //  - advertises a selectable `model`  -> allowed (the declared capability holds)
+  //  - advertises options but no `model` -> refused (narrowed by the session)
+  // The advertisement can make the answer more restrictive, never less.
+  const withModel = recordFor(AGENT_REGISTRY.opencode, {
     config_options: [
       { id: "model", name: "Model", type: "select", currentValue: "a", options: [] },
     ],
   } as unknown as SessionRecord["acpx"]);
-  assert.throws(() => assertLiveModelChangeRoutable(advertised));
+  assert.doesNotThrow(() => assertLiveModelChangeRoutable(withModel));
+
+  const withoutModel = recordFor(AGENT_REGISTRY.opencode, {
+    config_options: [
+      { id: "mode", name: "Mode", type: "select", currentValue: "build", options: [] },
+    ],
+  } as unknown as SessionRecord["acpx"]);
+  assert.throws(() => assertLiveModelChangeRoutable(withoutModel));
 });

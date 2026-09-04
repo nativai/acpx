@@ -27,7 +27,11 @@ import {
   setDesiredModelId,
   syncAdvertisedModelState,
 } from "../../session/mode-preference.js";
-import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
+import {
+  advertisedAfterModelApply,
+  applyRequestedModelIfAdvertised,
+  type ModelApplyOutcome,
+} from "../../session/model-application.js";
 import {
   mirrorModelGuardToMessages,
   stampModelGuardBreadcrumb,
@@ -120,7 +124,7 @@ async function createSessionRecordWithClient(
   let agentSessionId: string | undefined;
   let sessionResult: SessionCreateResult | SessionLoadResult | SessionForkResult;
   let sessionModels: SessionCreateResult["models"];
-  let requestedModelApplied = false;
+  let modelApply: ModelApplyOutcome = { applied: false };
   let deferForkModel: string | undefined;
   let effectiveSessionOptions = options.sessionOptions;
   let forkContext:
@@ -139,7 +143,7 @@ async function createSessionRecordWithClient(
     agentSessionId = resumed.agentSessionId;
     sessionResult = resumed.sessionResult;
     sessionModels = resumed.sessionModels;
-    requestedModelApplied = resumed.requestedModelApplied;
+    modelApply = resumed.modelApply;
   } else if (options.forkFromSessionId) {
     const forked = await forkSessionRecordWithClient(client, options, cwd);
     sessionId = forked.sessionId;
@@ -147,7 +151,7 @@ async function createSessionRecordWithClient(
     agentSessionId = forked.agentSessionId;
     sessionResult = forked.sessionResult;
     sessionModels = forked.sessionModels;
-    requestedModelApplied = forked.requestedModelApplied;
+    modelApply = forked.modelApply;
     deferForkModel = forked.deferForkModel;
     forkContext = forked.forkContext;
   } else {
@@ -161,16 +165,35 @@ async function createSessionRecordWithClient(
     agentSessionId = normalizeRuntimeSessionId(createdSession.agentSessionId);
     sessionResult = createdSession;
     sessionModels = createdSession.models;
-    requestedModelApplied = await applyRequestedModelIfAdvertised({
+    modelApply = await applyRequestedModelIfAdvertised({
       client,
       sessionId,
       requestedModel: effectiveSessionOptions?.model,
       modelSource: effectiveSessionOptions?.modelSource,
       models: sessionModels,
+      advertisedConfigOptions: createdSession.configOptions,
       agentCommand: options.agentCommand,
       timeoutMs: options.timeoutMs,
     });
   }
+  const requestedModelApplied = modelApply.applied;
+  // ⚠️ THE POST-MODEL RE-READ (CONCEPTION §5.2). Everything below that asks
+  // "what does this session advertise?" must ask it of the advertisement that
+  // exists AFTER the model was applied, never of the `session/new` snapshot.
+  //
+  // OpenCode advertises the `effort` option ONLY when the currently-selected
+  // model reasons, and at `session/new` with the default model it is ABSENT
+  // (I1 R8). Read the snapshot and `--reasoning-effort` silently never fires —
+  // and, because `session/set_config_option` answers with a refreshed
+  // advertisement, the corrected reading costs no extra round-trip.
+  //
+  // ⚠️ DO NOT "simplify" this to `modelApply.refreshedConfigOptions` alone. A
+  // `set-model` harness returns nothing to re-read, so `undefined` there means
+  // "keep the snapshot", not "nothing is advertised" — collapsing the two would
+  // delete claude's and claude-pty's working depth path. Test:
+  // `test/model-application.test.ts` → "a set-model harness keeps the
+  // session/new advertisement".
+  const advertisedAfterModel = advertisedAfterModelApply(modelApply, sessionResult.configOptions);
 
   const lifecycle = client.getAgentLifecycleSnapshot();
   const now = isoNow();
@@ -238,17 +261,24 @@ async function createSessionRecordWithClient(
   // above (new / copy-fork / resume) funnel through here.
   effectiveSessionOptions = withSupportedOutputStyleOnly(
     effectiveSessionOptions,
-    sessionResult.configOptions,
+    advertisedAfterModel,
   );
   persistSessionOptions(record, effectiveSessionOptions);
   persistSessionOwnerOptions(record, options);
-  applyConfigOptionsToRecord(record, sessionResult);
+  // Capture the POST-MODEL advertisement, not the `session/new` one: the record's
+  // `acpx.config_options` is what `resolveHarnessCapabilities` narrows the
+  // declared descriptor with, so storing the stale snapshot would show the depth
+  // control as unavailable on a session that had just been pinned to a reasoning
+  // model — the exact confusion the re-read exists to remove.
+  applyConfigOptionsToRecord(record, { configOptions: advertisedAfterModel });
   await persistAndApplyRequestedEffort({
     client,
     sessionId,
     record,
     reasoningEffort: effectiveSessionOptions?.reasoningEffort,
-    advertised: sessionResult.configOptions,
+    advertised: advertisedAfterModel,
+    modes: sessionResult.modes,
+    agentCommand: options.agentCommand,
     modelId: effectiveSessionOptions?.model,
     timeoutMs: options.timeoutMs,
     verbose: options.verbose,
@@ -260,7 +290,7 @@ async function createSessionRecordWithClient(
   persistRequestedOutputStyle({
     record,
     outputStyle: effectiveSessionOptions?.outputStyle,
-    advertised: sessionResult.configOptions,
+    advertised: advertisedAfterModel,
     agentLabel: options.agentName ?? options.agentCommand,
   });
   // brick://874fee67 turn-boundary spec §3: stamp what the query we just built
@@ -333,7 +363,7 @@ type CreatedSessionState = {
   agentSessionId: string | undefined;
   sessionResult: SessionCreateResult | SessionLoadResult | SessionForkResult;
   sessionModels: SessionCreateResult["models"];
-  requestedModelApplied: boolean;
+  modelApply: ModelApplyOutcome;
 };
 
 type ForkedSessionState = CreatedSessionState & {
@@ -389,11 +419,12 @@ async function resumeSessionRecordWithClient(
       agentSessionId: normalizeRuntimeSessionId(resumedSession.agentSessionId),
       sessionResult: resumedSession,
       sessionModels,
-      requestedModelApplied: await applyRequestedModelIfAdvertised({
+      modelApply: await applyRequestedModelIfAdvertised({
         client,
         sessionId: options.resumeSessionId,
         ...modelApplyParamsFromOptions(options),
         models: sessionModels,
+        advertisedConfigOptions: resumedSession.configOptions,
         agentCommand: options.agentCommand,
         timeoutMs: options.timeoutMs,
       }),
@@ -470,7 +501,7 @@ async function resolveForkModelApplication(
   options: SessionCreateOptions,
   forkedSession: SessionCreateResult | SessionForkResult,
   sessionModels: SessionCreateResult["models"],
-): Promise<{ requestedModelApplied: boolean; deferForkModel: string | undefined }> {
+): Promise<{ modelApply: ModelApplyOutcome; deferForkModel: string | undefined }> {
   // Only forkSession (forkAtMessageIndex > 0) can carry the marker; the
   // createSession branch (index 0) is a fresh empty session.
   const durableClaudeForkApplied =
@@ -479,14 +510,15 @@ async function resolveForkModelApplication(
     // `sessionOptions.model` is the canonical model acpx already resolved for the
     // copy (via copySessionOptionsWithOverride); the record setters normalize it,
     // and it is the value the open-time replay + adapter model resolution agree on.
-    return { requestedModelApplied: false, deferForkModel: options.sessionOptions?.model };
+    return { modelApply: { applied: false }, deferForkModel: options.sessionOptions?.model };
   }
   return {
-    requestedModelApplied: await applyRequestedModelIfAdvertised({
+    modelApply: await applyRequestedModelIfAdvertised({
       client,
       sessionId: forkedSession.sessionId,
       ...modelApplyParamsFromOptions(options),
       models: sessionModels,
+      advertisedConfigOptions: forkedSession.configOptions,
       agentCommand: options.agentCommand,
       timeoutMs: options.timeoutMs,
     }),
@@ -523,7 +555,7 @@ async function forkSessionRecordWithClient(
           );
     const sessionModels = forkedSession.models;
     const agentSessionId = normalizeRuntimeSessionId(forkedSession.agentSessionId);
-    const { requestedModelApplied, deferForkModel } = await resolveForkModelApplication(
+    const { modelApply, deferForkModel } = await resolveForkModelApplication(
       client,
       options,
       forkedSession,
@@ -535,7 +567,7 @@ async function forkSessionRecordWithClient(
       agentSessionId,
       sessionResult: forkedSession,
       sessionModels,
-      requestedModelApplied,
+      modelApply,
       deferForkModel,
       forkContext: {
         sourceRecord,

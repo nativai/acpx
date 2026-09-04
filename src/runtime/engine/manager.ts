@@ -26,7 +26,10 @@ import {
   setDesiredModeId,
   syncAdvertisedModelState,
 } from "../../session/mode-preference.js";
-import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
+import {
+  advertisedAfterModelApply,
+  applyRequestedModelIfAdvertised,
+} from "../../session/model-application.js";
 import {
   stampAppliedOutputStyle,
   withSupportedOutputStyleOnly,
@@ -723,26 +726,46 @@ export class AcpRuntimeManager {
       sessionOptionsForCreatedRuntimeSession(agentCommand, input.sessionOptions, session),
       session.sessionResult.configOptions,
     );
-    const requestedModelApplied = await applyRequestedModelIfAdvertised({
+    const modelApply = await applyRequestedModelIfAdvertised({
       client,
       sessionId: session.sessionId,
       requestedModel: effectiveSessionOptions?.model,
       models: session.sessionResult.models,
+      advertisedConfigOptions: session.sessionResult.configOptions,
       agentCommand,
       timeoutMs: this.options.timeoutMs,
     });
+    // The post-model re-read, same rule as the CLI creation path
+    // (src/cli/session/session-management.ts): a config-option harness answers
+    // `session/set_config_option` with a REFRESHED advertisement, and OpenCode
+    // advertises `effort` only once the selected model reasons (I1 R8).
+    // `undefined` means "this mechanism had nothing to re-read" — keep the
+    // session/new snapshot, never treat it as an empty advertisement.
+    const advertisedAfterModel = advertisedAfterModelApply(
+      modelApply,
+      session.sessionResult.configOptions,
+    );
+    applyConfigOptionsToRecord(record, { configOptions: advertisedAfterModel });
     await persistAndApplyRequestedEffort({
       client,
       sessionId: session.sessionId,
       record,
       reasoningEffort: effectiveSessionOptions?.reasoningEffort,
-      advertised: session.sessionResult.configOptions,
+      advertised: advertisedAfterModel,
+      modes: session.sessionResult.modes,
+      agentCommand,
       modelId: effectiveSessionOptions?.model,
       timeoutMs: this.options.timeoutMs,
       verbose: this.options.verbose,
     });
     syncAdvertisedModelState(record, session.sessionResult.models);
-    if (requestedModelApplied) {
+    // ⚠️ `.applied`, NOT the outcome object. `applyRequestedModelIfAdvertised`
+    // returned a bare boolean before B3; a bare `if (modelApply)` on the widened
+    // return is ALWAYS TRUE and would stamp `current_model_id` on every session
+    // whose model was never applied — on claude and codex too. The compiler
+    // cannot catch it (an inferred `const` in a truthiness test is legal), so it
+    // is called out here rather than left to a reader.
+    if (modelApply.applied) {
       setCurrentModelId(record, effectiveSessionOptions?.model);
     }
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());

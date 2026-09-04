@@ -260,19 +260,24 @@ export const MODEL_MECHANISMS_ROUTED_BY_ACPX: readonly ModelMechanism[] = [
   // and the adapter parses the bracket (MAP §4.2). A live re-pin is accepted and
   // takes effect from the next turn.
   "compose-into-id",
-  // NOT "config-option": routing `model` through `session/set_config_option` is
-  // the fix I1 recommends (CONCEPTION §5.2) and has NOT landed. Adding it here
-  // is what flips `opencode.canSetModelLive` to true, with no edit to the table.
+  // B3: `applyRequestedModelIfAdvertised` routes `model` through
+  // `session/set_config_option` — the path `mode` already takes successfully
+  // (I1 D2's own contrast) — for a harness whose model IS a config option.
+  // Landed in the SAME commit as the branch, per the rule above; it is what
+  // flips `opencode.canSetModelLive` to true with no edit to the table.
+  "config-option",
 ];
 
 export const DEPTH_MECHANISMS_ROUTED_BY_ACPX: readonly DepthMechanism[] = [
   // `persistAndApplyRequestedEffort` gates on an advertised `effort` config
-  // option (src/session/config-option-application.ts:252) and
+  // option (src/session/config-option-application.ts) and
   // `applyConfigOptionIfAdvertised` additionally requires `type === "select"`.
   "config-option",
-  // NOT "mode": Pi exposes thinking level as the ACP MODE selector (I2 R8), and
-  // acpx's depth path has no mode arm, so `--reasoning-effort` can never reach
-  // it. (`acpx pi set-mode <level>` is a different verb and does work today.)
+  // B3: `persistAndApplyRequestedEffort` dispatches to `applyDepthAsMode`, which
+  // projects the canonical rung onto the advertised ACP mode ladder and issues
+  // `session/set_mode` (I2 R8 — Pi advertises `configOptions: null` and carries
+  // thinking level on the mode selector). Landed in the SAME commit as the arm.
+  "mode",
 ];
 
 export const ARBITRARY_MODEL_SUPPORT_ROUTED_BY_ACPX: readonly ArbitraryModelSupport[] = [
@@ -852,4 +857,42 @@ export function harnessIdForAgentCommand(agentCommand: string | undefined): Harn
   }
   const kind = acpAdapterKind(agentCommand);
   return kind !== undefined && isHarnessId(kind) ? kind : undefined;
+}
+
+/**
+ * The MODEL mechanism acpx should dispatch on for a session's `agent_command`,
+ * or `undefined` for an adapter the descriptor does not classify.
+ *
+ * ⚠️ `undefined` means *"acpx cannot say"* and the caller must fall through to
+ * the pre-existing generic path — NOT substitute a default mechanism. An
+ * unrecognised adapter that got routed down OpenCode's config-option arm would
+ * be handed a `session/set_config_option` it never advertised.
+ */
+export function modelMechanismForAgentCommand(
+  agentCommand: string | undefined,
+): ModelMechanism | undefined {
+  const harness = harnessIdForAgentCommand(agentCommand);
+  return harness === undefined ? undefined : HARNESS_FACTS[harness].model.mechanism;
+}
+
+/** The DEPTH mechanism for a session's `agent_command`. Same `undefined` contract. */
+export function depthMechanismForAgentCommand(
+  agentCommand: string | undefined,
+): DepthMechanism | undefined {
+  const harness = harnessIdForAgentCommand(agentCommand);
+  return harness === undefined ? undefined : HARNESS_FACTS[harness].depth.mechanism;
+}
+
+/**
+ * Whether acpx has an apply path for `mechanism` today — the routing half of
+ * every derived capability, exposed so an apply path can ask the same question
+ * the descriptor asks rather than re-deriving it from a list membership test.
+ */
+export function acpxRoutesModelMechanism(mechanism: ModelMechanism | undefined): boolean {
+  return mechanism !== undefined && MODEL_MECHANISMS_ROUTED_BY_ACPX.includes(mechanism);
+}
+
+/** Depth twin of {@link acpxRoutesModelMechanism}. */
+export function acpxRoutesDepthMechanism(mechanism: DepthMechanism | undefined): boolean {
+  return mechanism !== undefined && DEPTH_MECHANISMS_ROUTED_BY_ACPX.includes(mechanism);
 }
