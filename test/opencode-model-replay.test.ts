@@ -124,8 +124,9 @@ test("F-9: a model the session does NOT advertise is refused with NOTHING writte
         context: "replay",
       }),
     (error: unknown) => {
-      assert.match(String((error as Error).message), /did not advertise that model/);
-      assert.match(String((error as Error).message), /Nothing was written/);
+      const message = (error as Error).message;
+      assert.match(message, /did not advertise that model/);
+      assert.match(message, /Nothing was written/);
       return true;
     },
   );

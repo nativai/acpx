@@ -7,10 +7,7 @@ import {
   isAcpQueryClosedBeforeResponseError,
   isAcpResourceNotFoundError,
 } from "../../acp/error-normalization.js";
-import {
-  assertRequestedModelSupported,
-  RequestedModelUnsupportedError,
-} from "../../acp/model-support.js";
+import { RequestedModelUnsupportedError } from "../../acp/model-support.js";
 import { InterruptedError, TimeoutError, withTimeout } from "../../async-control.js";
 import { findProfile, loadProfileRegistry, transcriptAnchorDir } from "../../config/profiles.js";
 import {

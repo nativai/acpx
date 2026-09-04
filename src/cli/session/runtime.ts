@@ -774,6 +774,41 @@ function recordApplyBeltGuardForced(
   }
 }
 
+/**
+ * The prompt-time config-option arm (F-9), extracted so
+ * `applyPromptModelIfAdvertised` stays inside the complexity budget. It is the
+ * SAME dispatcher the create and replay paths use — the whole point of F-9 is
+ * that there is one.
+ */
+async function applyPromptModelAsConfigOption(
+  params: {
+    client: AcpClient;
+    sessionId: string;
+    requestedModelSource: string | undefined;
+    record: SessionRecord;
+    timeoutMs?: number;
+  },
+  requestedModel: string,
+  before: ReturnType<typeof modelPinSnapshot>,
+): Promise<void> {
+  const outcome = await applyRequestedModelIfAdvertised({
+    client: params.client,
+    sessionId: params.sessionId,
+    requestedModel,
+    models: undefined,
+    advertisedConfigOptions: params.record.acpx?.config_options,
+    agentCommand: params.record.agentCommand,
+    timeoutMs: params.timeoutMs,
+    context: "apply",
+  });
+  if (!outcome.applied) {
+    return;
+  }
+  setDesiredModelId(params.record, requestedModel);
+  persistExplicitPromptModelSource(params.record, params.requestedModelSource);
+  await persistChangedModelPin(params.record, before);
+}
+
 async function applyPromptModelIfAdvertised(params: {
   client: AcpClient;
   sessionId: string;
@@ -804,21 +839,7 @@ async function applyPromptModelIfAdvertised(params: {
   // is undefined and the generic assert below would throw on a session whose
   // model IS settable — the prompt-time twin of the replay defect.
   if (modelMechanismForAgentCommand(params.record.agentCommand) === "config-option") {
-    const outcome = await applyRequestedModelIfAdvertised({
-      client: params.client,
-      sessionId: params.sessionId,
-      requestedModel,
-      models: undefined,
-      advertisedConfigOptions: params.record.acpx?.config_options,
-      agentCommand: params.record.agentCommand,
-      timeoutMs: params.timeoutMs,
-      context: "apply",
-    });
-    if (outcome.applied) {
-      setDesiredModelId(params.record, requestedModel);
-      persistExplicitPromptModelSource(params.record, params.requestedModelSource);
-      await persistChangedModelPin(params.record, before);
-    }
+    await applyPromptModelAsConfigOption(params, requestedModel, before);
     return;
   }
 
