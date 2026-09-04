@@ -70,6 +70,19 @@ interface ModelApplyParams {
    * D2 (a stored value acpx can never apply) from returning by a new door.
    */
   advertisedConfigOptions?: SessionConfigOption[];
+  /**
+   * Whether this is the FIRST application or a REPLAY onto a reconnected session.
+   * It only shapes the error wording — the DISPATCH is identical, deliberately.
+   *
+   * ⚠️ THIS PARAMETER EXISTS BECAUSE APPLY AND REPLAY DIVERGED ONCE AND IT COST A
+   * SILENT BRICK (F-9). B3 gave the APPLY path a config-option arm and left the
+   * REPLAY path on the generic check, so `acpx opencode set model` reported
+   * success, persisted the pin, and then every later turn died in
+   * `assertRequestedModelSupported` — WITH rc=0, so only the empty content showed
+   * it. Two code paths asking the same question two ways is what made that
+   * possible; they are ONE function now so they cannot answer differently again.
+   */
+  context?: "apply" | "replay";
 }
 
 /**
@@ -135,7 +148,7 @@ async function applyModelAsSetModel(
     requestedModel,
     models: params.models,
     agentCommand: params.agentCommand,
-    context: "apply",
+    context: params.context ?? "apply",
   });
   if (!params.models) {
     return { applied: false };

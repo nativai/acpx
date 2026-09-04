@@ -38,6 +38,7 @@ import {
   setDesiredModelSource,
   syncAdvertisedModelState,
 } from "../../session/mode-preference.js";
+import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
 import { guardServedModel, stampModelGuardBreadcrumb } from "../../session/model-guard.js";
 import { recordAppliedOutputStyleOutcome } from "../../session/output-style.js";
 import type { SessionRecord, SessionResumePolicy } from "../../types.js";
@@ -240,19 +241,33 @@ async function replayDesiredModel(params: {
   const desiredModelId = guardReplayDesiredModel(params.record, params.desiredModelId);
 
   try {
-    assertRequestedModelSupported({
+    // ⚠️ THE SAME DISPATCHER THE APPLY PATH USES — not a second implementation.
+    //
+    // F-9: B3 gave the APPLY path a config-option arm and left THIS path on the
+    // generic `assertRequestedModelSupported`, which throws whenever `models` is
+    // undefined — OpenCode’s exact shape (it advertises no ACP models at all;
+    // measured: the string "models" occurs ZERO times in its session stream). So
+    // `acpx opencode set model` reported success, persisted the pin, and every
+    // later turn then died here — returning rc=0 with EMPTY CONTENT, which is why
+    // the rc was not the evidence. That re-created brick 2efdf8b2 in a worse form
+    // than B0 shipped, because B0 at least refused loudly and wrote nothing.
+    //
+    // The advertisement comes off the record because `applyConfigOptionsToRecord`
+    // has already run for this resume/load (runReumeRuntimeSession /
+    // runLoadRuntimeSession), so it is THIS connection’s options, not a stale set.
+    const outcome = await applyRequestedModelIfAdvertised({
+      client: params.client,
+      sessionId: params.sessionId,
       requestedModel: desiredModelId,
       models: params.models,
+      advertisedConfigOptions: params.record.acpx?.config_options,
       agentCommand: params.record.agentCommand,
+      timeoutMs: params.timeoutMs,
       context: "replay",
     });
-    if (!params.models || params.models.currentModelId === desiredModelId) {
-      return !!params.models;
+    if (!outcome.applied) {
+      return false;
     }
-    await withTimeout(
-      params.client.setSessionModel(params.sessionId, desiredModelId),
-      params.timeoutMs,
-    );
     if (params.verbose) {
       process.stderr.write(
         `[acpx] replayed desired model ${desiredModelId} on reconnected ACP session ${params.sessionId} (previous ${params.previousSessionId})\n`,

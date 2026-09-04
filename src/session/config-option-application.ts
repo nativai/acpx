@@ -309,6 +309,41 @@ export async function persistAndApplyRequestedEffort(params: {
     timeoutMs: params.timeoutMs,
     verbose: params.verbose,
   });
+  // ⚠️ THE SUCCESS ARM MUST RECORD TOO — it did not, and that is the second half
+  // of the same defect the unavailable arm above fixes.
+  //
+  // The invariant is "a depth request is never silently dropped", and this arm
+  // could drop one in TWO ways while looking like success:
+  //   - `applyConfigOptionIfAdvertised` SKIPS when the requested level is not a
+  //     supported value for the current model (it returns undefined and only
+  //     warns under --verbose), and
+  //   - the level it does send may be a NORMALIZED one, not the one requested.
+  // Recording only in the not-advertised branch left `depth_projection` ABSENT on
+  // exactly the harness the field was built for — measured on opencode by hp-te2:
+  // the key missing after a turn that demonstrably ran.
+  //
+  // The value is read back from the record rather than assumed, so what is
+  // recorded is what was actually applied. `recordDepthOutcome` is a no-op for
+  // the Claude family, so their records are untouched by this.
+  const servedEffort = getDesiredConfigOptions(params.record.acpx).effort;
+  recordDepthOutcome(
+    params.record,
+    servedEffort === undefined
+      ? {
+          kind: "unavailable",
+          requested: params.reasoningEffort,
+          reason:
+            "the agent advertises an `effort` option but declined this level for the current model",
+        }
+      : servedEffort === params.reasoningEffort
+        ? { kind: "exact", value: servedEffort, requested: params.reasoningEffort }
+        : {
+            kind: "projected",
+            value: servedEffort,
+            requested: params.reasoningEffort,
+            reason: `"${params.reasoningEffort}" is not a supported level for this model — applied "${servedEffort}"`,
+          },
+  );
 }
 
 /**

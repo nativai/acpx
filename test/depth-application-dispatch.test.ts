@@ -208,3 +208,72 @@ test("no depth requested -> nothing happens anywhere, on every harness", async (
     assert.equal(JSON.stringify(record), before, `${id}: record changed with no request`);
   }
 });
+
+test("B3-04: the depth outcome IS recorded on the config-option SUCCESS arm", async () => {
+  // ⚠️ MEASURED ABSENT ON A REAL OPENCODE TURN by hp-te2 (B3-04 FAIL): the key
+  // was missing after a turn that demonstrably ran, and B3-07's negative control
+  // passed VACUOUSLY — 0 paths in both arms — which is what made the red real.
+  //
+  // Cause: only the NOT-ADVERTISED arm recorded. The success arm applied the
+  // level and recorded nothing, so `depth_projection` was absent on exactly the
+  // two harnesses the field was built for.
+  const c = client();
+  const record = recordFor(AGENT_REGISTRY.opencode);
+  await persistAndApplyRequestedEffort({
+    client: c,
+    sessionId: "ses_oc",
+    record,
+    reasoningEffort: "high",
+    advertised: [effortOption(["low", "high", "max"])],
+    agentCommand: AGENT_REGISTRY.opencode,
+  });
+  assert.deepEqual(c.configCalls, [{ configId: "effort", value: "high" }]);
+  assert.equal(record.acpx?.depth_projection?.outcome, "exact");
+  assert.equal(record.acpx?.depth_projection?.requested, "high");
+  assert.equal(record.acpx?.depth_projection?.served, "high");
+});
+
+test("B3-04: a level the model does not support is recorded, not silently normalised", async () => {
+  // The other way this arm could drop a request while looking like success:
+  // `applyConfigOptionIfAdvertised` sends a NORMALIZED level, or skips entirely.
+  const c = client();
+  const record = recordFor(AGENT_REGISTRY.opencode);
+  await persistAndApplyRequestedEffort({
+    client: c,
+    sessionId: "ses_oc",
+    record,
+    reasoningEffort: "xhigh", // not on this model's measured ladder (I1 R8)
+    advertised: [effortOption(["low", "high"])],
+    agentCommand: AGENT_REGISTRY.opencode,
+  });
+  const projection = record.acpx?.depth_projection;
+  assert.ok(projection, "the request vanished with no record of it");
+  assert.equal(projection.requested, "xhigh");
+  // Either it was projected onto a supported level, or it was unavailable — but
+  // it is NAMED either way, which is the invariant.
+  assert.ok(
+    projection.outcome === "projected" || projection.outcome === "unavailable",
+    `unexpected outcome ${projection.outcome}`,
+  );
+  assert.ok(projection.reason, "a non-exact outcome must carry its reason");
+});
+
+test("B3-04 GUARDRAIL: the Claude family still records NOTHING on the success arm", async () => {
+  // The new recording must not give claude/claude-pty a field they never had —
+  // their `served` block belongs to the transcript producer.
+  for (const id of ["claude", "claude-pty"] as const) {
+    const c = client();
+    const record = recordFor(AGENT_REGISTRY[id]);
+    await persistAndApplyRequestedEffort({
+      client: c,
+      sessionId: "ses_c",
+      record,
+      reasoningEffort: "high",
+      advertised: [effortOption(["low", "medium", "high", "xhigh", "max"])],
+      agentCommand: AGENT_REGISTRY[id],
+    });
+    assert.deepEqual(c.configCalls, [{ configId: "effort", value: "high" }], id);
+    assert.equal(record.acpx?.depth_projection, undefined, `${id}: record gained the key`);
+    assert.equal(record.acpx?.served, undefined, `${id}: record gained a served block`);
+  }
+});

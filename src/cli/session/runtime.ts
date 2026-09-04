@@ -8,6 +8,7 @@ import {
   isRetryablePromptError,
   normalizeOutputError,
 } from "../../acp/error-normalization.js";
+import { modelMechanismForAgentCommand } from "../../acp/harness-capabilities.js";
 import {
   emitsTurnEndMarker,
   injectionAbsorbsIntoActiveTurn,
@@ -797,6 +798,30 @@ async function applyPromptModelIfAdvertised(params: {
   const requestedModel = guarded.model;
 
   const models = advertisedModelsForRecord(params.record);
+
+  // ⚠️ F-9: THE SAME DISPATCHER THE CREATE PATH USES. A config-option harness
+  // (OpenCode) advertises no ACP models at all, so `advertisedModelsForRecord`
+  // is undefined and the generic assert below would throw on a session whose
+  // model IS settable — the prompt-time twin of the replay defect.
+  if (modelMechanismForAgentCommand(params.record.agentCommand) === "config-option") {
+    const outcome = await applyRequestedModelIfAdvertised({
+      client: params.client,
+      sessionId: params.sessionId,
+      requestedModel,
+      models: undefined,
+      advertisedConfigOptions: params.record.acpx?.config_options,
+      agentCommand: params.record.agentCommand,
+      timeoutMs: params.timeoutMs,
+      context: "apply",
+    });
+    if (outcome.applied) {
+      setDesiredModelId(params.record, requestedModel);
+      persistExplicitPromptModelSource(params.record, params.requestedModelSource);
+      await persistChangedModelPin(params.record, before);
+    }
+    return;
+  }
+
   assertRequestedModelSupported({
     requestedModel,
     models,
