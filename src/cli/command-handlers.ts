@@ -29,6 +29,7 @@ import {
   SubscriptionLockedError,
   SubscriptionUnknownError,
 } from "../errors.js";
+import { validateSessionModelFlags } from "../models/model-slug-validation.js";
 import { loadPermissionPolicySpec } from "../permission-policy.js";
 import {
   mergePromptSourceWithText,
@@ -2585,6 +2586,15 @@ export async function handleSessionsNew(
   );
   warnReasoningEffortIgnoredForNonClaude(globalFlags, effectiveAgent.agentName);
   warnOutputStyleIgnoredForNonClaude(globalFlags, effectiveAgent.agentName);
+  // Catalogue-backed `--model` / `--reasoning-effort` validation (C5 §6's three
+  // error shapes). Reads the CACHE only — a create is never blocked on a
+  // third-party fetch — and stands aside entirely when the cache is cold.
+  await validateSessionModelFlags({
+    agentName: effectiveAgent.agentName,
+    hasRawAgentOverride: globalFlags.agent !== undefined,
+    model: globalFlags.model,
+    reasoningEffort: globalFlags.reasoningEffort,
+  });
   const [{ createSession, closeSession }, { printCreatedSessionBanner, printNewSessionByFormat }] =
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
 

@@ -47,6 +47,11 @@ export const TOP_LEVEL_VERBS = new Set([
   "sessions",
   "subscriptions",
   "profiles",
+  // Without this entry `acpx models …` falls through to the AGENT registry and
+  // is treated as an agent named "models" — measured on the deployed CLI before
+  // this command existed: rc 4 "No acpx session found" in a session-free cwd,
+  // and a PROMPT DELIVERY in a session-bearing one.
+  "models",
   "usage",
   "status",
   "config",
