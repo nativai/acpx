@@ -61,6 +61,28 @@ test("EVERY top-level command commander registers is present in TOP_LEVEL_VERBS"
   );
 });
 
+// ⚠️ THIS CHECK IS DELIBERATELY ONE-DIRECTIONAL, and the missing direction is a
+// KNOWN, PRE-EXISTING defect rather than an oversight.
+//
+// It asserts REGISTERED ⊆ TOP_LEVEL_VERBS (the eb9c1d1e shape: a command that is
+// registered but unlisted gets shadowed by an agent registration of its name).
+// It does NOT assert the inverse, TOP_LEVEL_VERBS ⊆ REGISTERED — because `usage`
+// is in the set on `origin/dev` today and is NOT a top-level command: the real
+// verb is `subscriptions usage` (src/cli/subscriptions-command.ts). Measured on
+// this build from a session-free cwd, `acpx usage <anything>` is absorbed by the
+// `[prompt...]` catch-all and prints `No acpx session found` — byte-identically
+// to a nonsense token.
+//
+// So `usage` is a DEAD TOKEN: claimed by the set (so it can never register as an
+// agent name) while no command answers it. The blast radius is small — it blocks
+// an agent literally named "usage" and gives a confusing message for `acpx usage`
+// — which is why B0.2 REPORTS it rather than fixing it: deleting the entry would
+// let an agent named `usage` register, a behaviour change nobody asked for, and
+// it is outside this brick. Filed with WS-core 2026-09-04.
+//
+// If that is fixed, add the inverse assertion here; it is a two-line change and
+// this comment is the reason it is not already present.
+
 test("the discovering check can actually FAIL — mutation probe", () => {
   // ⚠️ Without this, "missing is empty" is indistinguishable from "the
   // enumeration found nothing to check". Prove the check has teeth by presenting
