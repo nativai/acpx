@@ -1,6 +1,7 @@
-import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { type LiveProcessScan, scanIsMeasured } from "../process-population.js";
 import {
   harnessIdForAgentCommand,
   HARNESS_FACTS,
@@ -85,67 +86,297 @@ export function removeHarnessConfigDir(dir: string | undefined): void {
   }
 }
 
-/** What an orphan sweep did — `scanned` is printed so 0 reads NOT RUN, not clean. */
+/** What an orphan sweep did — every population printed, so 0 reads NOT RUN. */
 export interface HarnessConfigDirPruneResult {
   /** Candidate directories examined. **0 means the sweep found nothing to look
    *  at — NOT RUN — not that everything was already clean.** */
   scanned: number;
   removed: string[];
-  /** Kept because a live session still owns them. */
+  /** Kept for any reason. Reported so caution is visible rather than silent. */
   retained: number;
+  /** Why each retention happened, so "retained 40" is diagnosable. */
+  retainedBy: {
+    /** A live process names this directory in its environment. */
+    liveProcess: number;
+    /** A record exists and is still OPEN. */
+    openRecord: number;
+    /** No record claims this id — never removed on a guess. */
+    unrecognised: number;
+    /** Unclaimed, but younger than `orphanMinAgeMs`. */
+    tooYoung: number;
+    /** The removal itself failed. */
+    removeFailed: number;
+  };
+  /** The oldest unclaimed directory retained, in ms — printed so a stuck orphan
+   *  is visible instead of accumulating silently. */
+  oldestUnclaimedAgeMs?: number;
+  /**
+   * True when the sweep REFUSED to remove anything because it could not measure
+   * live processes. ⚠️ A refusal and a clean sweep both remove nothing; this is
+   * what tells them apart.
+   */
+  notMeasured: boolean;
+}
+
+/** What the invoking HOME's store knows about one session id. */
+export interface KnownSessionRecord {
+  closed: boolean;
 }
 
 /**
- * Sweep config dirs whose session is gone (brick 433f6bf8).
+ * Sweep config dirs whose session is gone (brick 433f6bf8), on POSITIVE
+ * OWNERSHIP ONLY (brick cc9a5f25).
  *
  * ⚠️ WHY THIS EXISTS ALONGSIDE remove-on-close: **close is not guaranteed to
  * run.** An owner death, a pod eviction or a `kill -9` skips it entirely — this
  * programme saw two owner deaths in one afternoon — so remove-on-close is the
- * fast path and this is the guarantee. Shipping only the former would leak one
- * directory plus a full primer copy per killed session, forever.
+ * fast path and this is the guarantee.
  *
- * ⚠️ IT IS NOT A BLIND `rm`. A directory is removed only when its id appears in
- * neither `liveSessionIds` nor as a live spawn — an id it does not recognise is
- * RETAINED, because a sweep that guesses wrong deletes a running session's
- * primer mid-turn. `retained` is reported so that caution is visible rather than
- * silent.
+ * ## ⚠️ THE COMMENT THAT USED TO STAND HERE DESCRIBED A SAFETY PROPERTY THE CODE
+ * ## DID NOT HAVE, AND THAT IS THE DEFECT THIS FIXES
+ *
+ * It claimed a directory is removed only when its id appears in "neither
+ * `liveSessionIds` **nor as a live spawn**", and that "an id it does not
+ * recognise is **RETAINED**". Both were false. There was **no live-spawn check at
+ * all**, and the single branch was `if (liveSessionIds.has(id)) retain; else
+ * rm` — so an unrecognised id was **REMOVED**. A comment asserting a protection
+ * its code lacks is worse than no comment: it is what a reviewer reads instead of
+ * the branch. The comment was right about the design; the code never implemented
+ * it. **This implements the comment.**
+ *
+ * ## Removal now requires EVERY clause
+ *
+ *   1. the id **resolves to a record in the invoking HOME's store**, AND
+ *   2. **that record is CLOSED**, AND
+ *   3. **no live process references the directory** — `/proc`, with a
+ *      population control ({@link scanIsMeasured}); an unmeasurable scan removes
+ *      NOTHING rather than guessing.
+ *
+ * Anything else is RETAINED:
+ *
+ *   - an id **no record claims** — including the `randomUUID()` fallback dir a
+ *     session gets when `acpxRecordId` is absent, which is in no session list,
+ *     ever — unless it is **older than `orphanMinAgeMs` AND unreferenced**. Its
+ *     age and count are printed, so the caution is visible.
+ *
+ * ⚠️ THE ORDERING THIS DEPENDS ON. Clause 2 makes the sweep's correctness a
+ * function of RECORD state, so a store full of abandoned-open records makes a
+ * *correct* sweep retain forever. The record sweep that closes ownerless records
+ * must therefore run BEFORE this one (`sweepAbandonedSessionRecords`). That is a
+ * fix one layer up, deliberately NOT a relaxation of the rule here.
  */
 export function pruneOrphanHarnessConfigDirs(params: {
-  liveSessionIds: ReadonlySet<string>;
+  /** Records the invoking HOME's store knows about, id → state. Both the acpx
+   *  record id and the ACP session id should be keyed, since either can name a
+   *  directory. */
+  records: ReadonlyMap<string, KnownSessionRecord>;
+  /** The `/proc` census. Absent or unmeasured ⇒ nothing is removed. */
+  liveScan?: LiveProcessScan;
   rootDir?: string;
+  /** How old an UNCLAIMED directory must be before it may be removed. Stated,
+   *  never inferred. */
+  orphanMinAgeMs?: number;
+  /** Injectable clock, so the age rule is testable without waiting. */
+  now?: number;
 }): HarnessConfigDirPruneResult {
-  const root = params.rootDir ?? tmpdir();
+  const { root, now, orphanMinAgeMs } = resolvePruneDefaults(params);
+  const retainedBy = {
+    liveProcess: 0,
+    openRecord: 0,
+    unrecognised: 0,
+    tooYoung: 0,
+    removeFailed: 0,
+  };
   const gated = HARNESS_IDS.filter((id) => HARNESS_FACTS[id].primerChannel === "config-file");
-  let entries: string[];
-  try {
-    entries = readdirSync(root);
-  } catch {
-    return { scanned: 0, removed: [], retained: 0 };
+
+  const candidates = findConfigDirCandidates(root, gated);
+  if (candidates === undefined) {
+    // The root itself could not be read, so nothing was examined and nothing can
+    // be concluded — a non-measurement, reported as one.
+    return { scanned: 0, removed: [], retained: 0, retainedBy, notMeasured: true };
   }
+
+  // ⚠️ THE REFUSAL, BEFORE ANY WORK. Without a measured process census, clause 3
+  // cannot be evaluated, and a sweep that skips it is exactly the blind `rm` this
+  // function is not allowed to be. Note it still reports the CANDIDATE population:
+  // a refusal that also printed `scanned=0` would be indistinguishable from a
+  // sweep that found nothing to look at.
+  if (!scanIsMeasured(params.liveScan)) {
+    return {
+      scanned: candidates.length,
+      removed: [],
+      retained: candidates.length,
+      retainedBy: { ...retainedBy, liveProcess: candidates.length },
+      notMeasured: true,
+    };
+  }
+  const liveScan = params.liveScan;
 
   const removed: string[] = [];
   let scanned = 0;
   let retained = 0;
-  for (const entry of entries) {
-    const harness = gated.find((id) => entry.startsWith(`${CONFIG_DIR_PREFIX}${id}-`));
-    if (harness === undefined) {
-      continue; // not ours — never touched
-    }
+  let oldestUnclaimedAgeMs: number | undefined;
+  for (const { dir, sessionId } of candidates) {
     scanned += 1;
-    const sessionId = entry.slice(`${CONFIG_DIR_PREFIX}${harness}-`.length);
-    if (params.liveSessionIds.has(sessionId)) {
+    const verdict = classifyConfigDir(dir, sessionId, {
+      records: params.records,
+      liveScan,
+      now,
+      orphanMinAgeMs,
+    });
+    if (verdict.unclaimedAgeMs !== undefined) {
+      oldestUnclaimedAgeMs = Math.max(oldestUnclaimedAgeMs ?? 0, verdict.unclaimedAgeMs);
+    }
+    if (verdict.retain) {
       retained += 1;
+      retainedBy[verdict.reason] += 1;
       continue;
     }
-    const dir = join(root, entry);
-    try {
-      rmSync(dir, { recursive: true, force: true });
-      removed.push(dir);
-    } catch {
+    if (!removeDir(dir, removed)) {
       retained += 1;
+      retainedBy.removeFailed += 1;
     }
   }
-  return { scanned, removed, retained };
+  return { scanned, removed, retained, retainedBy, oldestUnclaimedAgeMs, notMeasured: false };
+}
+
+/**
+ * The directories this module could have created, with the session id each one
+ * carries. Anything else — a queue socket dir, a stray `acpx-*` — is never even a
+ * candidate, so it cannot be removed by any later branch.
+ */
+function findConfigDirCandidates(
+  root: string,
+  gated: readonly HarnessId[],
+): { dir: string; sessionId: string }[] | undefined {
+  let entries: string[];
+  try {
+    entries = readdirSync(root);
+  } catch {
+    // ⚠️ undefined, NOT an empty list. "I could not read the root" and "the root
+    // holds no config dirs" are different facts, and only the second is a clean
+    // sweep. Returning [] for both is the same silent-null this module keeps
+    // finding elsewhere.
+    return undefined;
+  }
+  const candidates: { dir: string; sessionId: string }[] = [];
+  for (const entry of entries) {
+    const harness = gated.find((id) => entry.startsWith(`${CONFIG_DIR_PREFIX}${id}-`));
+    if (harness !== undefined) {
+      candidates.push({
+        dir: join(root, entry),
+        sessionId: entry.slice(`${CONFIG_DIR_PREFIX}${harness}-`.length),
+      });
+    }
+  }
+  return candidates;
+}
+
+/** Defaults in one place, so the main function reads as the RULE rather than as
+ *  a list of fallbacks. */
+function resolvePruneDefaults(params: {
+  rootDir?: string;
+  now?: number;
+  orphanMinAgeMs?: number;
+}): { root: string; now: number; orphanMinAgeMs: number } {
+  return {
+    root: params.rootDir ?? tmpdir(),
+    now: params.now ?? Date.now(),
+    orphanMinAgeMs: params.orphanMinAgeMs ?? DEFAULT_ORPHAN_MIN_AGE_MS,
+  };
+}
+
+type ConfigDirVerdict = {
+  retain: boolean;
+  reason: "liveProcess" | "openRecord" | "unrecognised" | "tooYoung";
+  /** Set only for an unclaimed dir whose age could be read, so the caller can
+   *  report the oldest one it is sitting on. */
+  unclaimedAgeMs?: number;
+};
+
+/**
+ * Whether one directory may be removed. **Every clause of the removal rule lives
+ * here**, so the rule can be read in one place rather than reconstructed from a
+ * loop — which is how the previous version's comment and code drifted apart.
+ */
+function classifyConfigDir(
+  dir: string,
+  sessionId: string,
+  ctx: {
+    records: ReadonlyMap<string, KnownSessionRecord>;
+    liveScan: LiveProcessScan;
+    now: number;
+    orphanMinAgeMs: number;
+  },
+): ConfigDirVerdict {
+  // Clause 3 first: it is the only one that can be true of a directory whose
+  // record was already deleted, and it is the one whose failure mode is worst.
+  if (ctx.liveScan.referencedDirs.has(dir)) {
+    return { retain: true, reason: "liveProcess" };
+  }
+  const record = ctx.records.get(sessionId);
+  if (record === undefined) {
+    // Clause 1 fails. NOT ours to guess about — the fallback `randomUUID()` dir
+    // lands here and is in no session list, ever.
+    const age = directoryAgeMs(dir, ctx.now);
+    if (age === undefined) {
+      return { retain: true, reason: "unrecognised" };
+    }
+    if (age < ctx.orphanMinAgeMs) {
+      return { retain: true, reason: "tooYoung", unclaimedAgeMs: age };
+    }
+    return { retain: false, reason: "unrecognised", unclaimedAgeMs: age };
+  }
+  if (!record.closed) {
+    return { retain: true, reason: "openRecord" }; // Clause 2 fails.
+  }
+  return { retain: false, reason: "openRecord" };
+}
+
+/**
+ * How long an UNCLAIMED directory must sit before the sweep may remove it.
+ *
+ * ⚠️ STATED, NOT INFERRED. Six hours is longer than any turn this programme has
+ * observed and shorter than a working day, so a directory this old belongs to a
+ * process that is not coming back. It is deliberately generous: the cost of
+ * waiting is one directory; the cost of being wrong is a live session's primer.
+ */
+const DEFAULT_ORPHAN_MIN_AGE_MS = 6 * 60 * 60 * 1000;
+
+function removeDir(dir: string, removed: string[]): boolean {
+  try {
+    rmSync(dir, { recursive: true, force: true });
+    removed.push(dir);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Age from mtime, or undefined when it cannot be read — which is NOT zero. */
+function directoryAgeMs(dir: string, now: number): number | undefined {
+  try {
+    return Math.max(0, now - statSync(dir).mtimeMs);
+  } catch {
+    return undefined;
+  }
+}
+
+/** One line carrying every population and every retention reason, so "retained
+ *  40" is diagnosable rather than merely reassuring. */
+export function describeHarnessConfigDirSweep(result: HarnessConfigDirPruneResult): string {
+  const by = result.retainedBy;
+  return (
+    `[acpx] harness config dirs: scanned=${result.scanned} removed=${result.removed.length} ` +
+    `retained=${result.retained} (liveProcess=${by.liveProcess} openRecord=${by.openRecord} ` +
+    `unrecognised=${by.unrecognised} tooYoung=${by.tooYoung} removeFailed=${by.removeFailed}` +
+    (result.oldestUnclaimedAgeMs === undefined
+      ? ""
+      : ` oldestUnclaimedAgeMs=${result.oldestUnclaimedAgeMs}`) +
+    ")" +
+    (result.notMeasured ? " — REFUSED: /proc not measurable, nothing was removed" : "") +
+    " (scanned=0 means NOT RUN, not clean)\n"
+  );
 }
 
 /** Verbose breadcrumb for a written config dir. Never prints a file's CONTENT —

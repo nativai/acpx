@@ -387,8 +387,23 @@ test("the orphan sweep removes dead dirs, RETAINS live ones, and prints its popu
     const queueDir = join(root, "acpx-0a1b2c3d4e");
     mkdirSync(queueDir, { recursive: true });
 
+    // ⚠️ UPDATED FOR cc9a5f25: removal now requires POSITIVE ownership, so the
+    // sweep is told which records exist and whether they are CLOSED, and is given
+    // a measured /proc census. "live-1" is retained because its record is OPEN —
+    // previously it was retained merely by being in a set of ids.
     const result = pruneOrphanHarnessConfigDirs({
-      liveSessionIds: new Set(["live-1"]),
+      records: new Map([
+        ["live-1", { closed: false }],
+        ["dead-1", { closed: true }],
+        ["dead-2", { closed: true }],
+      ]),
+      liveScan: {
+        scanned: 40,
+        environRead: 9,
+        pids: new Set([1]),
+        referencedDirs: new Set<string>(),
+        referencedSessionIds: new Set<string>(),
+      },
       rootDir: root,
     });
 
@@ -396,6 +411,7 @@ test("the orphan sweep removes dead dirs, RETAINS live ones, and prints its popu
     assert.equal(result.scanned, 3, "scanned population is wrong — the sweep saw the wrong set");
     assert.equal(result.removed.length, 2);
     assert.equal(result.retained, 1);
+    assert.equal(result.retainedBy.openRecord, 1, "retained for the wrong reason");
     assert.equal(existsSync(queueDir), true, "the queue socket dir was swept — it is not ours");
     assert.equal(
       readdirSync(root).some((entry) => entry.endsWith("-live-1")),
@@ -407,11 +423,21 @@ test("the orphan sweep removes dead dirs, RETAINS live ones, and prints its popu
 
 test("the sweep on an unreadable root reports scanned=0 — NOT RUN, not clean", () => {
   const result = pruneOrphanHarnessConfigDirs({
-    liveSessionIds: new Set(),
+    records: new Map(),
+    liveScan: {
+      scanned: 40,
+      environRead: 9,
+      pids: new Set([1]),
+      referencedDirs: new Set<string>(),
+      referencedSessionIds: new Set<string>(),
+    },
     rootDir: "/nonexistent-hp-b3-root-zzz9",
   });
   assert.equal(result.scanned, 0);
   assert.deepEqual(result.removed, []);
+  // ⚠️ AND IT REPORTS THE REFUSAL (cc9a5f25). An unreadable root and a clean root
+  // both produce "removed 0"; `notMeasured` is what distinguishes them.
+  assert.equal(result.notMeasured, true);
 });
 
 // ── RS-14 (fa2e54ec): the recorded-path field, and its ABSENCE ──────────────

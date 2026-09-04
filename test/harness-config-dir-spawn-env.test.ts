@@ -73,11 +73,39 @@ const EXPECTED: Record<string, string[]> = {
  * (brick 433f6bf8), so anything that inspects the directory must do so through
  * `beforeClose`, while the spawn is still open. Two tests in this file failed
  * exactly this way when remove-on-close landed — which is the fast path working.
+ *
+ * ## ⚠️ AND IT IS ISOLATED FROM THE REAL /tmp (brick 08107add) — READ THIS BEFORE
+ * ## "SIMPLIFYING" THE TMPDIR DANCE BELOW
+ *
+ * Rows in this file went red intermittently FOUR times, always on a directory
+ * that had VANISHED mid-read (`dirEntries=["<readdir failed>"]`), always passing
+ * in isolation and on the next run. **It was blamed on load. That hypothesis was
+ * never evidence, and it was wrong.** The mechanism, once a row printed the state
+ * it judged:
+ *
+ *   1. this helper hard-coded `acpxRecordId: rec-b3-rs13-<harness>`, so the dir
+ *      was a FIXED path under the REAL `/tmp`;
+ *   2. `sessions prune` swept the real `/tmp` (it passed no `rootDir`, and the
+ *      sweep defaults to `tmpdir()`); and
+ *   3. `node --test` runs FILES in parallel, and four of them drive
+ *      `sessions prune` through the CLI.
+ *
+ * That id is in none of their session lists, so the sweep called it an orphan and
+ * deleted it while this file was reading it. **The row that printed its own
+ * captured context is what turned an unreproducible intermittent into a
+ * mechanism** — that instrument, not a reproduction, is the transferable part.
+ *
+ * The CAUSE is fixed in `pruneOrphanHarnessConfigDirs`, which no longer removes
+ * an unrecognised id at all (brick cc9a5f25). This scoping is the second layer:
+ * `os.tmpdir()` honours `TMPDIR` on POSIX and reads it per call, so pointing it
+ * at a per-run directory keeps these spawns out of any other file's reach WITHOUT
+ * inventing a test-only seam on `AcpClient`.
  */
 async function spawnAndDumpEnv(
   harness: string,
   beforeClose?: (dump: Record<string, string>) => void | Promise<void>,
 ): Promise<Record<string, string>> {
+  const restoreTmp = await scopeTmpDir();
   const scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "hp-b3-rs13-cwd-"));
   const envDumpPath = path.join(scratchDir, "env-dump.json");
   const linkDir = path.join(scratchDir, HARNESS_DIR_TOKENS[harness]);
@@ -103,7 +131,30 @@ async function spawnAndDumpEnv(
   } finally {
     await client.close().catch(() => {});
     await fs.rm(scratchDir, { recursive: true, force: true });
+    await restoreTmp();
   }
+}
+
+/**
+ * Point `os.tmpdir()` at a per-run directory for the duration of one spawn, and
+ * put it back afterwards. Returns the restore so it can sit in a `finally`.
+ *
+ * ⚠️ Top-level rows in a node:test FILE run SEQUENTIALLY, which is what makes
+ * mutating `process.env.TMPDIR` safe here; the parallelism that caused 08107add
+ * is BETWEEN files, in separate processes.
+ */
+async function scopeTmpDir(): Promise<() => Promise<void>> {
+  const previous = process.env.TMPDIR;
+  const scoped = await fs.mkdtemp(path.join(os.tmpdir(), "hp-b3-rs13-root-"));
+  process.env.TMPDIR = scoped;
+  return async () => {
+    if (previous === undefined) {
+      delete process.env.TMPDIR;
+    } else {
+      process.env.TMPDIR = previous;
+    }
+    await fs.rm(scoped, { recursive: true, force: true });
+  };
 }
 
 test("RS-13: config-dir vars reach opencode and pi ONLY — claude/claude-pty/codex EMPTY", async () => {

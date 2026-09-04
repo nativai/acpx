@@ -11,7 +11,10 @@ import {
   resolveEffectiveForkIndex,
   resolveHarnessCapabilities,
 } from "../acp/harness-capabilities.js";
-import { pruneOrphanHarnessConfigDirs } from "../acp/harness-config-dir.js";
+import {
+  describeHarnessConfigDirSweep,
+  pruneOrphanHarnessConfigDirs,
+} from "../acp/harness-config-dir.js";
 import {
   listBuiltInAgents,
   resolveAgentCommand,
@@ -40,6 +43,7 @@ import {
 } from "../errors.js";
 import { validateSessionModelFlags } from "../models/model-slug-validation.js";
 import { loadPermissionPolicySpec } from "../permission-policy.js";
+import { scanLiveProcesses } from "../process-population.js";
 import {
   mergePromptSourceWithText,
   parsePromptSource,
@@ -50,6 +54,10 @@ import {
 import { getResolvedProfile } from "../runtime/engine/account-seam.js";
 import { isAutoSubscriptionSentinel } from "../runtime/engine/auto-subscription.js";
 import { sessionOptionsFromRecord } from "../runtime/engine/session-options.js";
+import {
+  describeAbandonedRecordSweep,
+  sweepAbandonedSessionRecords,
+} from "../session/abandoned-record-sweep.js";
 import {
   formatAccountSeamRepairResult,
   repairAccountSeamRecords,
@@ -3669,6 +3677,25 @@ export async function handleSessionsPrune(
  * ⚠️ A DRY RUN SWEEPS NOTHING. `--dry-run` promises no deletion, and a preview
  * that deletes something the real run would is worse than no preview.
  */
+/**
+ * Index the store by EVERY id that can name a config directory — the acpx record
+ * id and the ACP session id both can, and a map keyed by only one of them would
+ * make the other look unrecognised.
+ */
+function knownRecordsById(
+  listed: readonly { acpxRecordId?: string; acpSessionId?: string; closed?: boolean }[],
+): Map<string, { closed: boolean }> {
+  const records = new Map<string, { closed: boolean }>();
+  for (const entry of listed) {
+    for (const id of [entry.acpxRecordId, entry.acpSessionId]) {
+      if (typeof id === "string" && id.length > 0) {
+        records.set(id, { closed: entry.closed === true });
+      }
+    }
+  }
+  return records;
+}
+
 async function sweepOrphanHarnessConfigDirs(
   session: Awaited<ReturnType<typeof loadSessionModule>>,
   dryRun: boolean,
@@ -3678,22 +3705,32 @@ async function sweepOrphanHarnessConfigDirs(
     return;
   }
   try {
-    // Every session acpx still knows about — closed ones included, because a
-    // closed record can still be resumed. Only ids with NO record are orphans.
-    const listed = await session.listSessions();
-    const live = new Set(
-      listed.flatMap((entry) =>
-        [entry.acpxRecordId, entry.acpSessionId].filter(
-          (id): id is string => typeof id === "string" && id.length > 0,
-        ),
-      ),
-    );
-    const swept = pruneOrphanHarnessConfigDirs({ liveSessionIds: live });
+    // ⚠️ ONE /proc CENSUS, SHARED BY BOTH SWEEPS. Taken once so the two cannot
+    // disagree about what is running, and so the cost is paid once.
+    const liveScan = scanLiveProcesses();
+
+    // ⚠️ RECORDS FIRST, DIRECTORIES SECOND — THE ORDER IS LOAD-BEARING.
+    // The directory sweep removes only on positive ownership, and one of its
+    // clauses is "the record is CLOSED". That makes its effectiveness a function
+    // of record state: a store full of ABANDONED-OPEN records makes a correct
+    // sweep retain every directory forever (measured on the rig: 206 records, 88
+    // still open, each pinning a config dir). The fix is to close the ownerless
+    // records — one layer up — NOT to relax the deletion rule below.
+    const recordSweep = await sweepAbandonedSessionRecords({
+      records: await session.listSessions(),
+      liveScan,
+      closeSession: (id) => session.closeSession(id),
+    });
     if (verbose) {
-      process.stderr.write(
-        `[acpx] harness config dirs: scanned=${swept.scanned} removed=${swept.removed.length} ` +
-          `retained=${swept.retained} (scanned=0 means NOT RUN, not clean)\n`,
-      );
+      process.stderr.write(describeAbandonedRecordSweep(recordSweep));
+    }
+
+    // Re-read AFTER the record sweep, so the directory pass sees the closes it
+    // just made rather than the state that preceded them.
+    const records = knownRecordsById(await session.listSessions());
+    const swept = pruneOrphanHarnessConfigDirs({ records, liveScan });
+    if (verbose) {
+      process.stderr.write(describeHarnessConfigDirSweep(swept));
     }
   } catch (error) {
     // Never fail a prune because the tidy-up failed — the sessions are already
