@@ -202,7 +202,19 @@ test("availability gate: a harness-native row belongs to its own agent type only
 test("availability gate: an OpenRouter row with NO capability table stays available", () => {
   // Absence of a capability table is absence of knowledge, not evidence of
   // unavailability — shrinking the list on ignorance is the failure C5 D6 names.
-  const catalogue = buildCatalogue([{ id: "a/x", supported_parameters: ["tools"] }], META);
+  //
+  // ⚠️ `capabilities: []` IS THE SUBJECT OF THIS TEST, NOT BOILERPLATE. Omitting
+  // it does not mean "no table": `buildCatalogue` defaults to
+  // `readHarnessCapabilities()`, which since S1 returns the REAL table. This
+  // test used to omit it and passed only because production had no table wired
+  // — so it was quietly asserting a production defect as its own setup, and it
+  // is the one test that went red when the accessor was pointed at the table
+  // (brick://db554b05). Stating the empty table explicitly is what keeps the
+  // property under test — an empty map means "offer it" — separate from
+  // whatever production happens to supply.
+  const catalogue = buildCatalogue([{ id: "a/x", supported_parameters: ["tools"] }], META, {
+    capabilities: [],
+  });
   const model = catalogue.models.find((m) => m.id === "a/x");
   assert.ok(model);
   assert.deepEqual(model.availability, {});
