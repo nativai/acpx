@@ -199,6 +199,117 @@ test("the existing Claude and Codex model ids still validate — no regression",
   assert.ok(validateModelSelection(catalogue, { model: "chatgpt:gpt-5.6-sol[high]" }));
 });
 
+// ── The two AVAILABILITY shapes (S2) ─────────────────────────────────────────
+//
+// Every case below was a MEASURED pass-then-fail-downstream at a5ba50fe
+// (brick://db554b05 `reports/MEASUREMENT.md`). The point of these shapes is not
+// that acpx refuses more — the create already failed — but that the refusal
+// moves from the adapter, where on claude it surfaces as an unclassified
+// `-32603 Internal error`, to the CLI boundary, where it says what to do next.
+
+test("SHAPE 4 — an id that belongs to ANOTHER harness is not an unknown slug", () => {
+  // MEASURED P3: `acpx --model gpt-5.6-luna claude sessions new` was ACCEPTED by
+  // validation and then died in claude-agent-acp 0.39.0.
+  const error = caught(() =>
+    validateModelSelection(catalogueWith(), { model: "gpt-5.6-luna", agentName: "claude" }),
+  );
+  assert.equal(error.outputCode, "USAGE"); // → exit 2
+  assert.equal(error.detailCode, "MODEL_NOT_REACHABLE_FROM_AGENT");
+  // It must NOT claim the slug is absent — that is the lie shape 1 would tell.
+  assert.doesNotMatch(error.message, /not in this box's model catalogue/);
+  assert.match(error.message, /belongs to: codex/);
+  assert.match(error.message, /acpx models --agent claude/);
+});
+
+test("SHAPE 4 — and the same in the other direction, which is what the deleted fallback hid", () => {
+  // MEASURED C2: `--model sonnet` was accepted on a CODEX session. The old
+  // `reachable.length > 0 ? reachable : byId` re-admitted exactly this.
+  const error = caught(() =>
+    validateModelSelection(catalogueWith(), { model: "sonnet", agentName: "codex" }),
+  );
+  assert.equal(error.detailCode, "MODEL_NOT_REACHABLE_FROM_AGENT");
+  assert.match(error.message, /belongs to: claude/);
+});
+
+test("SHAPE 5 — an OpenRouter row is refused for an agent that cannot take an arbitrary id", () => {
+  // MEASURED P1: `--model z-ai/glm-5.3` on claude reached the adapter and came
+  // back as `-32603 Internal error`, "not a recognized model id. Run /model…".
+  const error = caught(() =>
+    validateModelSelection(catalogueWith(), {
+      model: "moonshotai/kimi-k3",
+      agentName: "claude",
+    }),
+  );
+  assert.equal(error.outputCode, "USAGE");
+  assert.equal(error.detailCode, "MODEL_NOT_AVAILABLE_FOR_AGENT");
+  assert.match(error.message, /arbitrary model id/);
+  assert.match(error.message, /acpx models --agent claude/);
+});
+
+test("SHAPE 5 — a row the CATALOGUE blocks is refused with the catalogue's own reason", () => {
+  // MEASURED P4: a `:batch` row passed validation, because nothing read
+  // `selectable`. `acpx models` had been annotating it "a session cannot stream
+  // from it" the whole time.
+  const catalogue = buildCatalogue(
+    [{ id: "vendor/m:batch", name: "Batch M", supported_parameters: ["tools"] }],
+    META,
+  );
+  const error = caught(() =>
+    validateModelSelection(catalogue, { model: "vendor/m:batch", agentName: "claude" }),
+  );
+  assert.equal(error.detailCode, "MODEL_NOT_SELECTABLE");
+  assert.match(error.message, /a session cannot stream from it/);
+});
+
+test("SHAPE 5 — the selectability check does NOT depend on a capability table", () => {
+  // The ordering inside assertModelAvailable is the subject. With an empty
+  // table every `availability` map is `{}`, so the per-agent check stands aside
+  // — and a batch endpoint must STILL be refused, because selectability is a
+  // catalogue fact that never goes missing.
+  const catalogue = buildCatalogue(
+    [{ id: "vendor/m:batch", name: "Batch M", supported_parameters: ["tools"] }],
+    META,
+    { capabilities: [] },
+  );
+  const error = caught(() =>
+    validateModelSelection(catalogue, { model: "vendor/m:batch", agentName: "claude" }),
+  );
+  assert.equal(error.detailCode, "MODEL_NOT_SELECTABLE");
+});
+
+test("ABSENCE OF A TABLE IS NOT UNAVAILABILITY — an OpenRouter row still passes", () => {
+  // The guardrail on shape 5, and the reason it is `undefined`-tolerant: with no
+  // capability table acpx cannot answer the per-agent question, and refusing on
+  // ignorance would block creates that work today. Same rule
+  // `isAvailableForAgent` follows.
+  const catalogue = buildCatalogue(
+    [{ id: "vendor/ok", name: "OK", supported_parameters: ["tools"] }],
+    META,
+    { capabilities: [] },
+  );
+  const resolved = validateModelSelection(catalogue, {
+    model: "vendor/ok",
+    agentName: "claude",
+  });
+  assert.equal(resolved?.key, "openrouter:vendor/ok");
+});
+
+test("S2 GUARDRAIL — every native alias a claude session really serves still validates", () => {
+  // The six ids claude-agent-acp 0.39.0 advertised on the MEASURED probe
+  // session, minus the bracket form parseModelRef strips. If S2 ever refuses one
+  // of these it has broken the only class of create that works today.
+  const catalogue = catalogueWith();
+  for (const model of ["default", "opus", "opus[1m]", "sonnet", "haiku", "fable"]) {
+    assert.ok(
+      validateModelSelection(catalogue, { model, agentName: "claude" }),
+      `--model ${model} must still validate for a claude session`,
+    );
+  }
+  // And codex's own families stay reachable from codex.
+  assert.ok(validateModelSelection(catalogue, { model: "gpt-5.6-sol", agentName: "codex" }));
+  assert.ok(validateModelSelection(catalogue, { model: "gpt-5.6-sol[high]", agentName: "codex" }));
+});
+
 // ── The cold-cache rule ──────────────────────────────────────────────────────
 
 test("COLD CACHE: an unrecognised id passes through rather than blocking the create", () => {

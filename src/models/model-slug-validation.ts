@@ -1,10 +1,19 @@
 /**
- * `--model` validation at the CLI boundary — the three error shapes of
- * C5 `UI-DESIGN.md` §6.
+ * `--model` validation at the CLI boundary — C5 `UI-DESIGN.md` §6's three error
+ * shapes, plus the two AVAILABILITY shapes S2 added.
  *
  * "Errors are the design, not an afterthought." Each one exits 2 (USAGE) and
  * each one hands back the thing that makes it actionable: the nearest matches,
- * both `source:id` forms with their billing, or the model's own ladder.
+ * both `source:id` forms with their billing, the model's own ladder, the sources
+ * that DO own the id, or the reason this agent cannot run it.
+ *
+ * ⚠️ THE AVAILABILITY SHAPES ARE NOT "STRICTER VALIDATION" — THEY MOVE A REFUSAL
+ * THAT ALREADY HAPPENED SOMEWHERE WORSE. Before S2 a catalogue-valid row that the
+ * agent cannot run reached the adapter, and on claude the adapter refuses inside
+ * `session/new`, upstream of `assertRequestedModelSupported` — so acpx surfaced
+ * `-32603 Internal error`, the unclassified card `RequestedModelUnsupportedError`
+ * exists to prevent. Nothing that used to create a session stops creating one;
+ * what changes is which component says no, and how legibly (brick://db554b05).
  *
  * ⚠️ THE COLD-CACHE RULE IS LOAD-BEARING (C4 §7.1 option 3): with no cached
  * catalogue the id is passed through UNVALIDATED. A session creation must never
@@ -150,7 +159,7 @@ export function describeLadder(model: CatalogueModel): string {
   return `${model.key} does not accept a reasoning setting at all`;
 }
 
-// ── The three error shapes ───────────────────────────────────────────────────
+// ── The five error shapes ────────────────────────────────────────────────────
 
 export type ValidationInput = {
   model?: string;
@@ -166,7 +175,7 @@ export type ValidationInput = {
 
 /**
  * Returns the resolved model when the catalogue could answer, `null` when it
- * stood aside (cold cache, or nothing to validate). Throws one of the three
+ * stood aside (cold cache, or nothing to validate). Throws one of the five
  * shapes otherwise.
  */
 export function validateModelSelection(
@@ -179,17 +188,11 @@ export function validateModelSelection(
   }
 
   const ref = parseModelRef(raw);
-  const candidates = candidatesFor(catalogue, ref, input.agentName);
+  const byId = findModelsById(catalogue, ref.id);
+  const candidates = candidatesFor(byId, ref, input.agentName);
 
   if (candidates.length === 0) {
-    // COLD CACHE: with no OpenRouter rows loaded, acpx cannot tell an unknown
-    // slug from one it simply has not fetched — so it passes through rather than
-    // blocking the create (C4 §7.1 option 3). A slug it DOES recognise is still
-    // validated: knowing less never means checking less about what is known.
-    if (!catalogue.models.some((model) => model.source === "openrouter")) {
-      return null;
-    }
-    throw unknownSlugError(catalogue, ref);
+    return refuseOrStandAside(catalogue, byId, ref, input.agentName);
   }
 
   if (isAmbiguous(candidates)) {
@@ -200,16 +203,61 @@ export function validateModelSelection(
   if (model === undefined) {
     return null;
   }
+  assertModelAvailable(model, ref, input.agentName);
   assertEffortInLadder(model, input.reasoningEffort);
   return model;
 }
 
-function candidatesFor(
+/**
+ * Nothing this agent can reach answers to the id. There are three distinct
+ * reasons for that and they are NOT interchangeable — collapsing them is how the
+ * caller gets sent to look for a typo that is not there.
+ *
+ * Returns `null` only for the cold cache, where standing aside is the design.
+ */
+function refuseOrStandAside(
   catalogue: ModelCatalogue,
+  byId: CatalogueModel[],
+  ref: ParsedModelRef,
+  agentName: string | undefined,
+): null {
+  // The slug IS in the catalogue, it just belongs to another harness. Saying
+  // "not in this box's catalogue" here would be false.
+  if (byId.length > 0 && agentName !== undefined) {
+    throw otherHarnessError(byId, ref, agentName);
+  }
+  // COLD CACHE: with no OpenRouter rows loaded, acpx cannot tell an unknown slug
+  // from one it simply has not fetched — so it passes through rather than
+  // blocking the create (C4 §7.1 option 3). A slug it DOES recognise is still
+  // validated: knowing less never means checking less about what is known.
+  if (!catalogue.models.some((model) => model.source === "openrouter")) {
+    return null;
+  }
+  throw unknownSlugError(catalogue, ref);
+}
+
+/**
+ * ⚠️ DO NOT RESTORE `return reachable.length > 0 ? reachable : byId`. It reads
+ * like a safety net and it is the defect: when the ONLY candidates belong to
+ * another harness, `reachable` is empty and the fallback re-admits them —
+ * precisely the case the narrowing above exists to reject, so the filter did
+ * nothing exactly when it mattered.
+ *
+ * MEASURED at a5ba50fe, both directions (brick://db554b05
+ * `reports/MEASUREMENT.md` P3 / C2): `--model gpt-5.6-luna` was accepted on a
+ * `claude` session and `--model sonnet` on a `codex` session; each then died
+ * downstream — codex with acpx's own advertised-models error, claude with an
+ * unclassified `-32603 Internal error` out of the adapter.
+ *
+ * The empty result is now MEANINGFUL and the caller distinguishes it from a
+ * genuinely unknown slug (`otherHarnessError` vs `unknownSlugError`), which is
+ * what makes returning it safe rather than merely stricter.
+ */
+function candidatesFor(
+  byId: CatalogueModel[],
   ref: ParsedModelRef,
   agentName: string | undefined,
 ): CatalogueModel[] {
-  const byId = findModelsById(catalogue, ref.id);
   if (ref.source !== null) {
     return byId.filter((model) => model.source === ref.source);
   }
@@ -217,11 +265,10 @@ function candidatesFor(
     return byId;
   }
   // Rows another harness owns are not candidates for THIS create at all.
-  const reachable = byId.filter((model) => {
+  return byId.filter((model) => {
     const owners = nativeAgentTypesForSource(model.source);
     return owners === null || owners.includes(agentName);
   });
-  return reachable.length > 0 ? reachable : byId;
 }
 
 /**
@@ -277,6 +324,80 @@ function ambiguousSlugError(candidates: CatalogueModel[], ref: ParsedModelRef): 
     `[acpx] --model "${ref.raw}" exists under ${sources} sources — say which one:\n` +
       candidates.map((model) => `    --model ${describeRow(model)}`).join("\n"),
     "MODEL_SLUG_AMBIGUOUS",
+  );
+}
+
+/**
+ * Shape 4 — the id exists, under a source this agent cannot reach. Distinct from
+ * shape 1 on purpose: "not in this box's catalogue" would be FALSE here, and it
+ * sends the caller hunting for a typo that does not exist. Names the sources it
+ * did find and the one command that lists what this agent can actually run.
+ */
+function otherHarnessError(
+  byId: CatalogueModel[],
+  ref: ParsedModelRef,
+  agentName: string,
+): ModelSlugError {
+  const owners = [
+    ...new Set(byId.flatMap((model) => nativeAgentTypesForSource(model.source) ?? [])),
+  ];
+  const reachableBy = owners.length > 0 ? ` It belongs to: ${owners.join(", ")}.` : "";
+  return new ModelSlugError(
+    `[acpx] --model "${ref.raw}" is not a model a ${agentName} session can run.${reachableBy}\n` +
+      byId.map((model) => `    ${describeRow(model)}`).join("\n") +
+      `\n  try: acpx models --agent ${agentName}`,
+    "MODEL_NOT_REACHABLE_FROM_AGENT",
+  );
+}
+
+/**
+ * Shape 5 — the row is this agent's to reach, and still cannot be run: either the
+ * catalogue blocks it outright (a batch endpoint, no tool calling, an
+ * unpredictable price) or the harness cannot take an arbitrary model id.
+ *
+ * ⚠️ THE TWO CHECKS ARE NOT REDUNDANT, AND THE ORDER IS THE MESSAGE. A blocked
+ * row's `availability` entry already carries the catalogue's reason, so the
+ * second check alone would usually say the right thing — but `availability` is
+ * `{}` whenever the capability table is empty, and then a batch endpoint would
+ * validate clean. `selectable` is a catalogue fact that is always present, so it
+ * is checked first and independently; the per-agent question is only asked of a
+ * row the catalogue itself allows.
+ *
+ * MEASURED at a5ba50fe (brick://db554b05, P1 / P4): with neither check,
+ * `--model z-ai/glm-5.3` and `--model openrouter:openai/gpt-6-astra:batch` both
+ * passed validation on a `claude` session and died in the adapter as
+ * `-32603 Internal error` — the unclassified card `RequestedModelUnsupportedError`
+ * exists to prevent.
+ */
+function assertModelAvailable(
+  model: CatalogueModel,
+  ref: ParsedModelRef,
+  agentName: string | undefined,
+): void {
+  if (!model.selectable) {
+    throw new ModelSlugError(
+      `[acpx] --model "${ref.raw}" cannot be used for a session: ` +
+        `${model.unavailableReasons.map((reason) => reason.message).join(" · ")}\n` +
+        `  try: acpx models --search ${searchToken(ref.id)}`,
+      "MODEL_NOT_SELECTABLE",
+    );
+  }
+  if (agentName === undefined) {
+    return;
+  }
+  const availability = model.availability[agentName];
+  // `undefined` is "acpx has no capability table for this agent type", which is
+  // absence of knowledge, not evidence of unavailability — the same rule
+  // `isAvailableForAgent` follows, and refusing on it would block a create that
+  // works today.
+  if (availability === undefined || availability.ok) {
+    return;
+  }
+  throw new ModelSlugError(
+    `[acpx] --model "${ref.raw}" is not available for a ${agentName} session: ` +
+      `${availability.message ?? availability.reason}\n` +
+      `  try: acpx models --agent ${agentName}`,
+    "MODEL_NOT_AVAILABLE_FOR_AGENT",
   );
 }
 
