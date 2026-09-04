@@ -143,7 +143,7 @@ const ADVERTISES_ACP_MODELS: Record<string, boolean> = {
 };
 
 function acpxRoutesAModelFor(id: HarnessId): boolean {
-  const advertisesAcpModels = ADVERTISES_ACP_MODELS[HARNESS_FACTS[id].model.mechanism] === true;
+  const advertisesAcpModels = ADVERTISES_ACP_MODELS[HARNESS_FACTS[id].model.mechanism];
   try {
     assertRequestedModelSupported({
       requestedModel: "probe-model",
@@ -337,12 +337,33 @@ test("resolveForkLandingIndex answers where a fork will actually land", () => {
   const codex = HARNESS_FACTS.codex.fork;
   assert.equal(resolveForkLandingIndex(codex, 7), 6);
   assert.equal(resolveForkLandingIndex(codex, 6), 6);
-  assert.equal(resolveForkLandingIndex(codex, 1), 0);
   // claude: exact — the request is the answer
   assert.equal(resolveForkLandingIndex(HARNESS_FACTS.claude.fork, 7), 7);
   // opencode ignores the index and pi has no fork at all: the question has no answer
   assert.equal(resolveForkLandingIndex(HARNESS_FACTS.opencode.fork, 7), undefined);
   assert.equal(resolveForkLandingIndex(HARNESS_FACTS.pi.fork, 7), undefined);
+});
+
+test("resolveForkLandingIndex boundaries: 0 is a landing index, not an absent answer", () => {
+  const codex = HARNESS_FACTS.codex.fork;
+  // `0` and `undefined` mean opposite things and a caller acts on both: 0 is
+  // "the fork lands at the very start", undefined is "this harness cannot
+  // answer". Conflating them is the failure this asserts against.
+  assert.equal(resolveForkLandingIndex(codex, 0), 0);
+  assert.equal(resolveForkLandingIndex(codex, 1), 0);
+  assert.notEqual(resolveForkLandingIndex(codex, 1), undefined);
+  assert.equal(resolveForkLandingIndex(HARNESS_FACTS.claude.fork, 0), 0);
+  // An index past the end is still answered — clamping to the real message
+  // count is the caller's job (acpx already range-checks --at-index at
+  // src/cli/session/session-management.ts:409); this function only reports
+  // where the HARNESS would round it to.
+  assert.equal(resolveForkLandingIndex(codex, 999), 998);
+  assert.equal(resolveForkLandingIndex(HARNESS_FACTS.claude.fork, 999), 999);
+  // The no-answer harnesses stay undefined at every boundary, never 0.
+  for (const requested of [0, 1, 999]) {
+    assert.equal(resolveForkLandingIndex(HARNESS_FACTS.opencode.fork, requested), undefined);
+    assert.equal(resolveForkLandingIndex(HARNESS_FACTS.pi.fork, requested), undefined);
+  }
 });
 
 test("only a turn-granular harness carries the rounding data, and it carries all of it", () => {

@@ -37,7 +37,7 @@ export const TOP_LEVEL_VERBS = new Set([
   // (`configurePublicCli`), so it "runs", prints "No acpx session found
   // (searched up to /tmp)" and exits 0. Adding a top-level command means adding
   // it here in the same commit.
-  "capabilities",
+  "agents",
   "prompt",
   "exec",
   "cancel",

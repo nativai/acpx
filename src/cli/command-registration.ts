@@ -1,6 +1,6 @@
 import { Command, Option } from "commander";
 import { DEFAULT_HISTORY_LIMIT } from "../session/persistence.js";
-import { registerCapabilitiesCommand } from "./capabilities-command.js";
+import { registerAgentsCommand } from "./agents-command.js";
 import {
   handleCancel,
   handleExec,
@@ -716,7 +716,7 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
   registerSessionsCommand(program, undefined, config);
   registerSubscriptionsCommand(program, config);
   registerProfilesCommand(program, config);
-  registerCapabilitiesCommand(program, config);
+  registerAgentsCommand(program, config);
   registerConfigCommand(program, config);
   registerFlowCommand(program, config);
 }

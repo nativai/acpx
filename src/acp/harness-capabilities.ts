@@ -284,11 +284,11 @@ export const ARBITRARY_MODEL_SUPPORT_ROUTED_BY_ACPX: readonly ArbitraryModelSupp
 ];
 
 /** Mechanisms that are a LIVE model change at all, once acpx routes them. */
-const LIVE_MODEL_MECHANISMS: readonly ModelMechanism[] = [
+const LIVE_MODEL_MECHANISMS: ReadonlySet<ModelMechanism> = new Set([
   "set-model",
   "config-option",
   "compose-into-id",
-];
+]);
 
 /**
  * Mechanisms that are a live DEPTH change. `compose-into-id` is excluded on
@@ -297,7 +297,7 @@ const LIVE_MODEL_MECHANISMS: readonly ModelMechanism[] = [
  * advertises a selectable `effort` (MAP §4.4). Changing codex depth means
  * changing the model id.
  */
-const LIVE_DEPTH_MECHANISMS: readonly DepthMechanism[] = ["config-option", "mode"];
+const LIVE_DEPTH_MECHANISMS: ReadonlySet<DepthMechanism> = new Set(["config-option", "mode"]);
 
 /**
  * Whether the model can be changed on a live session.
@@ -310,7 +310,7 @@ export function deriveCanSetModelLive(
   mechanism: ModelMechanism,
   routedMechanisms: readonly ModelMechanism[] = MODEL_MECHANISMS_ROUTED_BY_ACPX,
 ): boolean {
-  return LIVE_MODEL_MECHANISMS.includes(mechanism) && routedMechanisms.includes(mechanism);
+  return LIVE_MODEL_MECHANISMS.has(mechanism) && routedMechanisms.includes(mechanism);
 }
 
 /**
@@ -323,7 +323,7 @@ export function deriveCanSetDepthLive(
   depth: HarnessDepthSupport,
   routedMechanisms: readonly DepthMechanism[] = DEPTH_MECHANISMS_ROUTED_BY_ACPX,
 ): boolean {
-  if (!LIVE_DEPTH_MECHANISMS.includes(depth.mechanism)) {
+  if (!LIVE_DEPTH_MECHANISMS.has(depth.mechanism)) {
     return false;
   }
   if (!routedMechanisms.includes(depth.mechanism)) {

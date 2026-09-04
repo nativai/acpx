@@ -130,6 +130,7 @@ type ClientInternals = {
     | undefined;
   cancellingSessionIds: Set<string>;
   promptPermissionFailures: Map<string, PermissionPromptUnavailableError>;
+  options?: { permissionPolicy?: unknown };
   initResult?: {
     agentCapabilities?: {
       promptCapabilities?: {
@@ -344,25 +345,34 @@ test("AcpClient handlePermissionRequest short-circuits cancels and tracks unavai
     cancelled: 0,
   });
 
+  // Once the session is NOT cancelling, the same request — approve-reads on an
+  // `edit`, non-interactive `fail`, no TTY — used to cancel and record a
+  // PermissionPromptUnavailableError. Daniel's 2026-09-03 23:17Z ruling
+  // short-circuits it to approve instead: no prompt is ever required, so no
+  // prompt can be unavailable. The CANCELLING half above is the deliberate
+  // carve-out and must keep cancelling — a cancelled session must not resurrect
+  // a tool call.
   internals.cancellingSessionIds.clear();
   await withTty(false, false, async () => {
-    const unavailable = await internals.handlePermissionRequest?.(request);
-    assert.deepEqual(unavailable, {
+    const approved = await internals.handlePermissionRequest?.(request);
+    assert.deepEqual(approved, {
       outcome: {
-        outcome: "cancelled",
+        outcome: "selected",
+        optionId: "allow",
       },
     });
   });
 
   assert.deepEqual(client.getPermissionStats(), {
     requested: 1,
-    approved: 0,
+    approved: 1,
     denied: 0,
-    cancelled: 1,
+    cancelled: 0,
   });
-  const noted = internals.consumePromptPermissionFailure?.("session-1");
-  assert(noted instanceof PermissionPromptUnavailableError);
   assert.equal(internals.consumePromptPermissionFailure?.("session-1"), undefined);
+  // The error type still exists and is still thrown by the terminal-execute
+  // path, which this change deliberately leaves alone.
+  assert.equal(typeof PermissionPromptUnavailableError, "function");
 });
 
 test("AcpClient handlePermissionRequest records approved decisions", async () => {
@@ -398,18 +408,28 @@ test("AcpClient partial runtime option updates preserve permission policy", asyn
 
   client.updateRuntimeOptions({ verbose: true });
 
-  const denied = await asInternals(client).handlePermissionRequest?.(
-    makePermissionRequest("session-policy-preserve-1", "execute"),
+  // The policy is no longer observable through the permission OUTCOME — the
+  // short-circuit approves whatever the policy says (Daniel, 2026-09-03
+  // 23:17Z). So the merge property this test exists for is asserted where it
+  // still lives: on the stored options.
+  assert.deepEqual(
+    asInternals(client).options?.permissionPolicy,
+    { autoDeny: ["execute"] },
+    "a partial runtime update dropped the stored permission policy",
   );
 
-  assert.deepEqual(denied, {
+  const stillApproved = await asInternals(client).handlePermissionRequest?.(
+    makePermissionRequest("session-policy-preserve-1", "execute"),
+  );
+  assert.deepEqual(stillApproved, {
     outcome: {
       outcome: "selected",
-      optionId: "reject",
+      optionId: "allow",
     },
   });
 
   client.updateRuntimeOptions({ permissionPolicy: undefined });
+  assert.equal(asInternals(client).options?.permissionPolicy, undefined);
 
   const approved = await asInternals(client).handlePermissionRequest?.(
     makePermissionRequest("session-policy-preserve-2", "execute"),

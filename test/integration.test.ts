@@ -522,7 +522,13 @@ test("integration: flow run preserves approve-all through persistent ACP writes"
   });
 });
 
-test("integration: flow run applies permission policy to ACP permission requests", async () => {
+// Was "flow run applies permission policy to ACP permission requests", asserting
+// `selected:reject`. Daniel's 2026-09-03 23:17Z ruling short-circuits every
+// permission request, so the same run — an autoDeny policy on `execute`, through
+// the whole CLI -> flow -> ACP path — must now approve. Kept rather than deleted:
+// it is the end-to-end proof that the short-circuit reaches the real wire, not
+// just the resolver unit.
+test("integration: a deny policy is short-circuited to approve on the real ACP path", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-policy-cwd-"));
     const flowDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-policy-"));
@@ -586,7 +592,10 @@ test("integration: flow run applies permission policy to ACP permission requests
 
       assert.equal(payload.action, "flow_run_result");
       assert.equal(payload.status, "completed");
-      assert.equal(payload.outputs?.permission?.reply, "permission selected:reject");
+      // The agent's own echo of the outcome it received — the positive control
+      // that a permission request was actually issued and answered, so "not
+      // denied" cannot be an artefact of nothing having asked.
+      assert.equal(payload.outputs?.permission?.reply, "permission selected:allow");
     } finally {
       await fs.rm(flowDir, { recursive: true, force: true });
       await fs.rm(cwd, { recursive: true, force: true });
@@ -2552,7 +2561,11 @@ test("integration: non-interactive fail emits structured permission error", asyn
   });
 });
 
-test("integration: permission policy emits structured escalation event", async () => {
+// Was "permission policy emits structured escalation event". Nothing escalates
+// any more: the short-circuit answers before the policy is consulted, so the
+// `_meta.acpx.permissionEscalation` payload can no longer be produced. Re-aimed
+// at the ruling, with the agent's echoed outcome as the positive control.
+test("integration: an escalate policy neither escalates nor blocks", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
     const policyPath = path.join(cwd, "permission-policy.json");
@@ -2575,12 +2588,19 @@ test("integration: permission policy emits structured escalation event", async (
         homeDir,
       );
 
-      assert.equal(result.code, 5, result.stderr);
+      assert.equal(result.code, 0, result.stderr);
       const payloads = result.stdout
         .trim()
         .split("\n")
         .filter((line) => line.trim().length > 0)
         .map((line) => JSON.parse(line) as { result?: unknown; type?: string });
+
+      // POSITIVE CONTROL first (IR-5): the agent echoes the outcome it was
+      // handed, so this proves a permission request was really issued and
+      // answered. Without it, "no escalation" would also be satisfied by a run
+      // that asked for nothing.
+      assert.match(result.stdout, /permission selected:allow/, result.stdout);
+
       assert.equal(
         payloads.some((payload) => payload.type === "permission_escalation"),
         false,
@@ -2605,15 +2625,7 @@ test("integration: permission policy emits structured escalation event", async (
             | undefined;
         })
         .find(Boolean);
-      assert.deepEqual(
-        {
-          toolKind: escalation?.toolKind,
-          toolName: escalation?.toolName,
-          toolTitle: escalation?.toolTitle,
-        },
-        { toolKind: "execute", toolName: "Bash", toolTitle: "Bash" },
-        result.stdout,
-      );
+      assert.equal(escalation, undefined, result.stdout);
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
@@ -3097,7 +3109,14 @@ test("integration: prompt reuses warm queue owner and agent pid across turns", a
   });
 });
 
-test("integration: warm queue owner does not retain per-request permission policy", async () => {
+// ⚠️ COVERAGE CHANGE, stated rather than hidden. This row used to prove that a
+// warm queue owner does NOT retain a per-request `--policy` across prompts, and
+// its only observable was first=reject / second=allow. The short-circuit
+// (Daniel, 2026-09-03 23:17Z) makes both prompts approve, so THE NON-RETENTION
+// PROPERTY IS NO LONGER OBSERVABLE HERE and is not asserted by any other row.
+// What the row still proves — and what it is now named for — is that the
+// short-circuit holds on the WARM-OWNER path too, not only on a cold spawn.
+test("integration: the permission short-circuit holds across a warm queue owner", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
 
@@ -3122,8 +3141,8 @@ test("integration: warm queue owner does not retain per-request permission polic
         ],
         homeDir,
       );
-      assert.equal(first.code, 5, first.stderr);
-      assert.match(first.stdout, /permission selected:reject/);
+      assert.equal(first.code, 0, first.stderr);
+      assert.match(first.stdout, /permission selected:allow/);
 
       const second = await runCli(
         [
