@@ -9,6 +9,7 @@ import {
   HARNESS_IDS,
   type HarnessId,
 } from "./harness-capabilities.js";
+import { type PluginCacheResult, seedOpenCodePluginInstall } from "./opencode-plugin-cache.js";
 
 /**
  * ONE per-session harness config dir, serving THREE purposes (CONCEPTION §5.3).
@@ -533,6 +534,9 @@ export interface HarnessConfigDirPlan {
   /** This client's claim on the directory — hand it back to
    *  {@link releaseHarnessConfigDir} at close. */
   holderId?: string;
+  /** What the shared OpenCode plugin install did, so `seeded`/`cache-miss` is
+   *  visible rather than inferred from a directory size (brick 9cd608d9). */
+  pluginCache?: PluginCacheResult;
 }
 
 export interface HarnessConfigDirInput {
@@ -847,6 +851,14 @@ function writeOpenCodeConfigDir(dir: string, input: HarnessConfigDirInput): Harn
   // fixed is the correct end state for it.
   warnDiscardedBoxConfigKeys(input.env, Object.keys(composed));
 
+  // ⚠️ SEED THE SHARED PLUGIN INSTALL BEFORE OpenCode STARTS (brick 9cd608d9).
+  // At `session/new` OpenCode installs `@opencode-ai/plugin` into this very
+  // directory — 63 MB per session, measured. Seeding a complete install by
+  // HARDLINK satisfies it and it no-ops, taking the per-session cost to directory
+  // entries. Best-effort: on any failure OpenCode installs for itself, which is
+  // exactly today's behaviour.
+  const pluginCache = seedOpenCodePluginInstall({ configDir, rootDir: input.rootDir });
+
   input.env.XDG_CONFIG_HOME = dir;
   input.env.OPENCODE_CONFIG_DIR = configDir;
   return {
@@ -854,6 +866,7 @@ function writeOpenCodeConfigDir(dir: string, input: HarnessConfigDirInput): Harn
     dir,
     envNames: ["XDG_CONFIG_HOME", "OPENCODE_CONFIG_DIR"],
     files,
+    pluginCache,
   };
 }
 

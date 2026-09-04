@@ -28,7 +28,7 @@ import { fileURLToPath } from "node:url";
  * `G1-PIN-01` verifies it by the SPAWN LINE — the registry string is the intent,
  * the spawn line is the fact.
  */
-const ACP_ADAPTER_PACKAGE_RANGES = {
+export const ACP_ADAPTER_PACKAGE_RANGES = {
   pi: "^0.0.33",
   codex: "^0.0.44",
   /**
