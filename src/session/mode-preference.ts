@@ -1,5 +1,6 @@
 import type { SessionModelState } from "@agentclientprotocol/sdk";
 import type { SessionAcpxState, SessionRecord } from "../types.js";
+import { cloneSessionAcpxState } from "./conversation-model.js";
 
 function ensureAcpxState(state: SessionAcpxState | undefined): SessionAcpxState {
   return state ?? {};
@@ -315,5 +316,29 @@ export function syncAdvertisedModelState(
   const acpx = ensureAcpxState(record.acpx);
   acpx.current_model_id = models.currentModelId;
   acpx.available_models = models.availableModels.map((model) => model.modelId);
+  record.acpx = acpx;
+}
+
+/**
+ * Record the per-session harness config dir this spawn wrote (brick fa2e54ec).
+ *
+ * ⚠️ It is REFRESHED ON EVERY SPAWN, not written once, because the directory is
+ * per-spawn: the create spawn names it with a freshly minted uuid (the record id
+ * does not exist until `session/new` returns), while later spawns name it with
+ * the record id. A stale value would point acpx-ui at a directory that was
+ * removed on close, which is a DETECTABLE error rather than a silent fallback —
+ * but only if the value is kept current.
+ *
+ * `undefined` CLEARS the field rather than leaving the previous value: a harness
+ * that stops getting a config dir must not keep advertising a path.
+ */
+export function setHarnessConfigDir(record: SessionRecord, dir: string | undefined): void {
+  const acpx = cloneSessionAcpxState(record.acpx) ?? {};
+  const normalized = dir?.trim();
+  if (normalized) {
+    acpx.harness_config_dir = normalized;
+  } else {
+    delete acpx.harness_config_dir;
+  }
   record.acpx = acpx;
 }

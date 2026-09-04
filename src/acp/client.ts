@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess, type ChildProcessByStdio } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
@@ -119,7 +120,11 @@ import {
 import { isCodexAcpCommand } from "./codex-compat.js";
 import { extractAcpError } from "./error-shapes.js";
 import { HARNESS_FACTS, harnessIdForAgentCommand } from "./harness-capabilities.js";
-import { applyHarnessConfigDir, reportHarnessConfigDir } from "./harness-config-dir.js";
+import {
+  applyHarnessConfigDir,
+  removeHarnessConfigDir,
+  reportHarnessConfigDir,
+} from "./harness-config-dir.js";
 import {
   avoidBidirectionalJsonRpcIdCollisions,
   isAcpMessageObject,
@@ -582,6 +587,15 @@ export class AcpClient {
   private lastAgentExit?: AgentExitInfo;
   private lastKnownPid?: number;
   private latestProvisioningWarning?: ProvisioningWarningBreadcrumb;
+  /**
+   * The per-session harness config dir this client created, so `close()` can
+   * remove it (brick 433f6bf8). Undefined for every harness that gets none.
+   *
+   * The dir is ALSO swept by `sessions prune` — close is not guaranteed to run
+   * (owner death, pod eviction, `kill -9`; this programme saw two owner deaths in
+   * one afternoon), so remove-on-close alone would still leak.
+   */
+  private harnessConfigDir?: string;
   private lastEffectiveAccountMetadata?: EffectiveAccountMetadata;
   /**
    * The environment THIS session's agent process was spawned with — the exact
@@ -889,7 +903,7 @@ export class AcpClient {
     const plan = applyHarnessConfigDir({
       env,
       agentCommand: this.options.agentCommand,
-      sessionId: this.options.sessionContext?.acpxRecordId?.trim() || "session",
+      sessionId: this.resolveConfigDirId(),
       primer: await resolveSessionPrimer(env),
       model: this.options.sessionOptions?.model,
       // ⚠️ NO `provisionModelId`, DELIBERATELY — and the same asymmetry that kept
@@ -912,7 +926,40 @@ export class AcpClient {
       // `harness-config-dir.ts` and is unit-tested; it is switched on by passing
       // this field, once B5 measures the merge semantics.
     });
+    this.harnessConfigDir = plan?.dir;
     reportHarnessConfigDir(plan, this.options.verbose);
+  }
+
+  /**
+   * The identity that namespaces this spawn's config dir (F-8, brick 161294ce).
+   *
+   * ⚠️ THERE IS NO CONSTANT FALLBACK, DELIBERATELY. This shipped as
+   * `acpxRecordId?.trim() || "session"`, and on the real `sessions new` path the
+   * record id is EMPTY at adapter-spawn time — `creationSessionContext` sets
+   * `acpxRecordId: ""` and says why: the CLI record id IS the adapter's own
+   * `session/new` id (`session-management.ts:163,207`), so it cannot exist before
+   * the spawn that produces it. The literal therefore fired on EVERY create, and
+   * two distinct sessions shared one `/tmp/acpx-<harness>-session`.
+   *
+   * ⚠️ PER-SPAWN UNIQUENESS IS THE CORRECT GRANULARITY, not a workaround for the
+   * missing id. The config dir is read by exactly ONE adapter PROCESS for that
+   * process's lifetime; a resumed session is a NEW process whose dir is written
+   * fresh before it starts. So each spawn reads the dir written for it, which is
+   * what the measured create-dir != resume-dir failure was really about.
+   *
+   * The record id is preferred when present purely so repeated spawns of the same
+   * session reuse one directory instead of accumulating one per resume.
+   */
+  /**
+   * The config dir this spawn wrote, so the record can carry it to acpx-ui.
+   * Undefined for every harness that gets none.
+   */
+  get harnessConfigDirPath(): string | undefined {
+    return this.harnessConfigDir;
+  }
+
+  private resolveConfigDirId(): string {
+    return this.options.sessionContext?.acpxRecordId?.trim() || randomUUID();
   }
 
   /**
@@ -1971,6 +2018,16 @@ export class AcpClient {
 
   async close(): Promise<void> {
     this.closing = true;
+
+    // Remove this spawn's harness config dir (brick 433f6bf8). Best-effort and
+    // deliberately BEFORE the agent teardown below, which can throw — a leaked
+    // directory must not depend on a clean shutdown of the adapter.
+    //
+    // ⚠️ THIS ALONE IS NOT THE FIX. Close is not guaranteed to run at all —
+    // owner death, pod eviction, `kill -9` — so `sessions prune` also sweeps
+    // orphans. Remove-on-close is the fast path, not the guarantee.
+    removeHarnessConfigDir(this.harnessConfigDir);
+    this.harnessConfigDir = undefined;
 
     await this.terminalManager.shutdown();
 

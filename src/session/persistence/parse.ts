@@ -370,6 +370,9 @@ function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
   // request is never silently dropped". Lost on a cold reload, the request is
   // silently dropped again one owner respawn later — the defect wearing a fix.
   assignDepthProjection(state, record.depth_projection);
+  // The config-dir CHANNEL must round-trip, or acpx-ui loses the primer path on
+  // the first cold reload and silently falls back to a re-render.
+  assignStringState(state, "harness_config_dir", record.harness_config_dir);
 
   return state;
 }
@@ -464,7 +467,8 @@ function assignStringState(
     | "current_model_id"
     | "context_window_model_id"
     | "applied_output_style"
-    | "refused_output_style",
+    | "refused_output_style"
+    | "harness_config_dir",
   value: unknown,
 ): void {
   if (typeof value === "string") {

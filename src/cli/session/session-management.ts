@@ -25,6 +25,7 @@ import { defaultSessionEventLog } from "../../session/event-log.js";
 import {
   setCurrentModelId,
   setDesiredModelId,
+  setHarnessConfigDir,
   syncAdvertisedModelState,
 } from "../../session/mode-preference.js";
 import {
@@ -254,6 +255,11 @@ async function createSessionRecordWithClient(
   };
 
   applyLifecycleSnapshotToRecord(record, lifecycle);
+  // The config-dir CHANNEL (brick fa2e54ec). Recorded from the client that wrote
+  // it, never re-derived: on THIS spawn the id is a freshly minted uuid, because
+  // the record id does not exist until session/new returns, so nothing downstream
+  // could reconstruct the path by guessing.
+  setHarnessConfigDir(record, client.harnessConfigDirPath);
   // brick://874fee67 F3 — strip a style this agent does not support BEFORE the
   // first write. Every later write (persist, validate, stamp) reads this same
   // filtered value, so the "no write on an unsupported agent" rule cannot be

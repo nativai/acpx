@@ -690,6 +690,11 @@ export function cloneSessionAcpxState(
     // here would make every turn's clone report "no style applied", which the
     // derived pending predicate reads as a pending change → a recycle per turn.
     applied_output_style: state.applied_output_style,
+    // ⚠️ THIS ALLOWLIST DROPPED depth_projection ON EVERY REAL TURN once already
+    // (see cloneFloorState). harness_config_dir is the same class: a live
+    // acpx-authored value the turn path re-bases off this clone. Lost here, the
+    // primer modal silently falls back to a re-render after the first turn.
+    harness_config_dir: state.harness_config_dir,
     refused_output_style: state.refused_output_style,
     context_window_size: state.context_window_size,
     context_window_model_id: state.context_window_model_id,

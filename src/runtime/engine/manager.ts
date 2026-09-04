@@ -24,6 +24,7 @@ import {
   setCurrentModelId,
   setDesiredConfigOption,
   setDesiredModeId,
+  setHarnessConfigDir,
   syncAdvertisedModelState,
 } from "../../session/mode-preference.js";
 import {
@@ -769,6 +770,7 @@ export class AcpRuntimeManager {
       setCurrentModelId(record, effectiveSessionOptions?.model);
     }
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
+    setHarnessConfigDir(record, client.harnessConfigDirPath);
     await this.carryForwardPinnedFloor(record, effectiveSessionOptions);
     stampCreatedRuntimeOutputStyle(record, effectiveSessionOptions);
     persistSessionOptions(record, effectiveSessionOptions);

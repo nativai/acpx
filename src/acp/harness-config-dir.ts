@@ -1,7 +1,12 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { harnessIdForAgentCommand, HARNESS_FACTS, type HarnessId } from "./harness-capabilities.js";
+import { basename, join } from "node:path";
+import {
+  harnessIdForAgentCommand,
+  HARNESS_FACTS,
+  HARNESS_IDS,
+  type HarnessId,
+} from "./harness-capabilities.js";
 
 /**
  * ONE per-session harness config dir, serving THREE purposes (CONCEPTION §5.3).
@@ -50,6 +55,98 @@ import { harnessIdForAgentCommand, HARNESS_FACTS, type HarnessId } from "./harne
  * delta for one that never ran. The evidence is RS-13: the adapter-boundary
  * differential, population printed in both arms.
  */
+
+/** The prefix every per-session harness config dir carries. One definition, used
+ *  by the writer, the remover and the orphan sweep, so they cannot disagree. */
+const CONFIG_DIR_PREFIX = "acpx-";
+
+/** `acpx-<harness>-<id>` — the only place this name is composed. */
+function configDirName(harness: HarnessId, sessionId: string): string {
+  return `${CONFIG_DIR_PREFIX}${harness}-${sessionId}`;
+}
+
+/**
+ * Remove one spawn's config dir. Best-effort: a failure here must never surface
+ * as a session-close error, because the orphan sweep below is the guarantee.
+ */
+export function removeHarnessConfigDir(dir: string | undefined): void {
+  if (!dir) {
+    return;
+  }
+  // Only ever remove a directory this module could have created. A caller that
+  // passed something else would otherwise get an arbitrary recursive delete.
+  if (!basename(dir).startsWith(CONFIG_DIR_PREFIX)) {
+    return;
+  }
+  try {
+    rmSync(dir, { recursive: true, force: true });
+  } catch {
+    // Swept later by pruneOrphanHarnessConfigDirs.
+  }
+}
+
+/** What an orphan sweep did — `scanned` is printed so 0 reads NOT RUN, not clean. */
+export interface HarnessConfigDirPruneResult {
+  /** Candidate directories examined. **0 means the sweep found nothing to look
+   *  at — NOT RUN — not that everything was already clean.** */
+  scanned: number;
+  removed: string[];
+  /** Kept because a live session still owns them. */
+  retained: number;
+}
+
+/**
+ * Sweep config dirs whose session is gone (brick 433f6bf8).
+ *
+ * ⚠️ WHY THIS EXISTS ALONGSIDE remove-on-close: **close is not guaranteed to
+ * run.** An owner death, a pod eviction or a `kill -9` skips it entirely — this
+ * programme saw two owner deaths in one afternoon — so remove-on-close is the
+ * fast path and this is the guarantee. Shipping only the former would leak one
+ * directory plus a full primer copy per killed session, forever.
+ *
+ * ⚠️ IT IS NOT A BLIND `rm`. A directory is removed only when its id appears in
+ * neither `liveSessionIds` nor as a live spawn — an id it does not recognise is
+ * RETAINED, because a sweep that guesses wrong deletes a running session's
+ * primer mid-turn. `retained` is reported so that caution is visible rather than
+ * silent.
+ */
+export function pruneOrphanHarnessConfigDirs(params: {
+  liveSessionIds: ReadonlySet<string>;
+  rootDir?: string;
+}): HarnessConfigDirPruneResult {
+  const root = params.rootDir ?? tmpdir();
+  const gated = HARNESS_IDS.filter((id) => HARNESS_FACTS[id].primerChannel === "config-file");
+  let entries: string[];
+  try {
+    entries = readdirSync(root);
+  } catch {
+    return { scanned: 0, removed: [], retained: 0 };
+  }
+
+  const removed: string[] = [];
+  let scanned = 0;
+  let retained = 0;
+  for (const entry of entries) {
+    const harness = gated.find((id) => entry.startsWith(`${CONFIG_DIR_PREFIX}${id}-`));
+    if (harness === undefined) {
+      continue; // not ours — never touched
+    }
+    scanned += 1;
+    const sessionId = entry.slice(`${CONFIG_DIR_PREFIX}${harness}-`.length);
+    if (params.liveSessionIds.has(sessionId)) {
+      retained += 1;
+      continue;
+    }
+    const dir = join(root, entry);
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      removed.push(dir);
+    } catch {
+      retained += 1;
+    }
+  }
+  return { scanned, removed, retained };
+}
 
 /** Verbose breadcrumb for a written config dir. Never prints a file's CONTENT —
  *  the primer can be long and the dir path is the useful handle for evidence. */
@@ -117,9 +214,29 @@ export function applyHarnessConfigDir(
   if (HARNESS_FACTS[harness].primerChannel !== "config-file") {
     return undefined;
   }
+  // ⚠️ REFUSE A BLANK ID — NEVER SUBSTITUTE A CONSTANT FOR IT (F-8, brick 161294ce).
+  //
+  // This shipped as `sessionId: record?.trim() || "session"` at the call site, and
+  // on the real `sessions new` path the record id is EMPTY at adapter-spawn time
+  // (`creationSessionContext` sets `acpxRecordId: ""` because the CLI record id IS
+  // the adapter's own session/new id, so it cannot exist before the spawn that
+  // produces it). The literal therefore fired on EVERY create: two distinct
+  // sessions were handed the SAME `/tmp/acpx-<harness>-session`, and the directory
+  // written at CREATE was not the one a RESUMED adapter read.
+  //
+  // A fallback that silently de-isolates is worse than an error, so there is no
+  // fallback here at all. The caller mints a unique id; if a future one ever
+  // passes blank again, this refuses loudly instead of quietly sharing a dir.
+  if (!input.sessionId.trim()) {
+    process.stderr.write(
+      `[acpx] refusing to create a ${harness} config dir with a blank session id — ` +
+        `a shared directory would de-isolate concurrent sessions. No primer/model pin applied.\n`,
+    );
+    return undefined;
+  }
   try {
     const root = input.rootDir ?? tmpdir();
-    const dir = join(root, `acpx-${harness}-${input.sessionId}`);
+    const dir = join(root, configDirName(harness, input.sessionId.trim()));
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     return harness === "opencode"
       ? writeOpenCodeConfigDir(dir, input)

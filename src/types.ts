@@ -661,6 +661,21 @@ export type SessionAcpxState = {
    * string a UI renders beside a control it must show as unavailable-with-a-reason
    * rather than silently absent.
    */
+  /**
+   * The per-session harness config dir acpx wrote for the CURRENT spawn
+   * (brick fa2e54ec + 161294ce). Absent for every harness that gets none.
+   *
+   * ⚠️ THIS IS A CHANNEL, NOT A BREADCRUMB. acpx-ui's injected-primer modal reads
+   * the primer out of this directory and reports it as an "actual stream block".
+   * Before this field it RE-DERIVED the location by scanning tmp for a name
+   * ending in the session id — which breaks the moment the directory is named
+   * with anything else (it is, on the create spawn, where no record id exists
+   * yet) and which also silently assumed both processes resolve the same
+   * `os.tmpdir()`. A recorded path that does not resolve is a DETECTABLE error;
+   * a failed scan is indistinguishable from "there was no config dir", and the
+   * modal then falls back to a re-render that drifts as the OS is edited.
+   */
+  harness_config_dir?: string;
   depth_projection?: {
     requested: string;
     outcome: string;
