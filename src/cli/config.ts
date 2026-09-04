@@ -4,6 +4,7 @@ import path from "node:path";
 import { DEFAULT_AGENT_NAME, normalizeAgentName } from "../agent-registry.js";
 import { loadSubscriptionRegistry, type SubscriptionRegistry } from "../config/subscriptions.js";
 import { parseMcpServers } from "../mcp-servers.js";
+import { DEFAULT_PERMISSION_MODE as ENFORCED_DEFAULT_PERMISSION_MODE } from "../types.js";
 import type {
   AuthPolicy,
   McpServer,
@@ -59,7 +60,7 @@ type ConfigFileLoadResult = {
 
 const DEFAULT_TIMEOUT_MS = undefined;
 const DEFAULT_TTL_MS = 900_000;
-const DEFAULT_PERMISSION_MODE: PermissionMode = "approve-reads";
+const DEFAULT_PERMISSION_MODE: PermissionMode = ENFORCED_DEFAULT_PERMISSION_MODE;
 const DEFAULT_NON_INTERACTIVE_PERMISSION_POLICY: NonInteractivePermissionPolicy = "deny";
 const DEFAULT_AUTH_POLICY: AuthPolicy = "skip";
 const DEFAULT_OUTPUT_FORMAT: OutputFormat = "text";

@@ -574,7 +574,12 @@ test("connectAndLoadSession completes a pending subscription switch by porting t
     const record = makeSessionRecord({
       acpxRecordId: "pending-switch-record",
       acpSessionId: sessionId,
-      agentCommand: "agent",
+      // ⚠️ A REAL claude command, not the file's generic "agent" fixture. B0.2
+      // gates `ensurePendingSwitchTranscript` on `isClaudeFamilyAgent`: the
+      // pending-switch transcript path resolves a Claude SDK transcript JSONL,
+      // which only a Claude-family adapter ever writes, so a non-Claude record
+      // now returns early and this test would exercise nothing.
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
       cwd,
       messages: [
         {
@@ -666,7 +671,12 @@ test("connectAndLoadSession completes a pending account switch by porting the pr
     const record = makeSessionRecord({
       acpxRecordId: "pending-account-switch-record",
       acpSessionId: sessionId,
-      agentCommand: "agent",
+      // ⚠️ A REAL claude command, not the file's generic "agent" fixture. B0.2
+      // gates `ensurePendingSwitchTranscript` on `isClaudeFamilyAgent`: the
+      // pending-switch transcript path resolves a Claude SDK transcript JSONL,
+      // which only a Claude-family adapter ever writes, so a non-Claude record
+      // now returns early and this test would exercise nothing.
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
       cwd,
       messages: [
         {
@@ -744,7 +754,12 @@ test("connectAndLoadSession fails a pending subscription switch loudly when no t
     const record = makeSessionRecord({
       acpxRecordId: "pending-switch-missing-record",
       acpSessionId: "switch-missing-session",
-      agentCommand: "agent",
+      // ⚠️ A REAL claude command, not the file's generic "agent" fixture. B0.2
+      // gates `ensurePendingSwitchTranscript` on `isClaudeFamilyAgent`: the
+      // pending-switch transcript path resolves a Claude SDK transcript JSONL,
+      // which only a Claude-family adapter ever writes, so a non-Claude record
+      // now returns early and this test would exercise nothing.
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
       cwd,
       messages: [
         {

@@ -2,8 +2,23 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+/**
+ * ⚠️ THESE ARE EXACT PINS, NOT RANGES. Under npm semver a caret on a `0.0.x`
+ * version allows **only that patch** — `^0.0.26` resolves to `0.0.26` and
+ * nothing else — so a version here tracks nothing and every bump is a deliberate
+ * code change. Read `^` as `==` in this table.
+ *
+ * `pi`: bumped `0.0.26` → `0.0.33` (npm latest, published 2026-07-30) by B0.2.
+ * ⚠️ **A bump is not progress on any other row.** I2 measured 0.0.33 fixing
+ * NONE of the four Pi gaps: still no `fork` capability (the string appears zero
+ * times in either version), still a hardcoded `~/.pi/pi-acp` session map, still
+ * no MCP, still no primer channel. The nativai fork is what closes those (B5).
+ * The bump's only claim is that acpx launches the newest published adapter, and
+ * `G1-PIN-01` verifies it by the SPAWN LINE — the registry string is the intent,
+ * the spawn line is the fact.
+ */
 const ACP_ADAPTER_PACKAGE_RANGES = {
-  pi: "^0.0.26",
+  pi: "^0.0.33",
   codex: "^0.0.44",
 } as const;
 

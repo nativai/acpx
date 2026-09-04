@@ -84,7 +84,7 @@ test("switchSessionAccount rewrites profile, ports transcript, and preserves acc
     const record = makeSessionRecord({
       acpxRecordId: "rec-1",
       acpSessionId,
-      agentCommand: "claude",
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
       cwd,
       acpx: { session_options: { profile: "subA", subscription: "legacy-sub" } },
     });
@@ -128,7 +128,7 @@ test("failover onto a previously-used STALE subscription ports the fresher segme
     const record = makeSessionRecord({
       acpxRecordId: "rec-rollback",
       acpSessionId,
-      agentCommand: "claude",
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
       cwd,
       messages: [{ Agent: { content: [{ Text: "prior response" }], tool_results: {} } }],
       acpx: { session_options: { profile: "subA" } },
@@ -175,7 +175,7 @@ test("switchSessionAccount fails loudly when a non-fresh session has no portable
     const record = makeSessionRecord({
       acpxRecordId: "rec-missing",
       acpSessionId: "agent-session-missing",
-      agentCommand: "claude",
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
       cwd: path.join(ctx.homeDir, "work"),
       messages: [
         {
@@ -219,7 +219,7 @@ test("switchSessionAccount proceeds for a breadcrumb-only session — nothing to
     const record = makeSessionRecord({
       acpxRecordId: "rec-breadcrumb-only",
       acpSessionId: "agent-session-breadcrumb",
-      agentCommand: "claude",
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
       cwd: path.join(ctx.homeDir, "work"),
       messages: [
         {

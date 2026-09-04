@@ -1,5 +1,12 @@
 import type { AcpClient, SessionCreateResult } from "../acp/client.js";
-import { assertRequestedModelSupported } from "../acp/model-support.js";
+import {
+  harnessIdForAgentCommand,
+  resolveHarnessCapabilities,
+} from "../acp/harness-capabilities.js";
+import {
+  assertRequestedModelSupported,
+  RequestedModelUnsupportedError,
+} from "../acp/model-support.js";
 import { withTimeout } from "../async-control.js";
 import type { SessionRecord } from "../types.js";
 import { guardServedModel } from "./model-guard.js";
@@ -45,6 +52,50 @@ export async function applyRequestedModelIfAdvertised(params: {
     params.timeoutMs,
   );
   return true;
+}
+
+/**
+ * THE LOUD-FAILURE GATE for a live model change acpx cannot apply (B0.2;
+ * FINDINGS-opencode **D2**, row `G1-OC-04`).
+ *
+ * It runs BEFORE anything is persisted, and the ordering is the entire fix. On
+ * OpenCode today the model is an ACP **config option** (`session/set_config_option`,
+ * I1 R5/R11) — there is no `models` array and no `session/set_model` — so acpx's
+ * generic path stored a `session_options.model` it can never apply, and the
+ * session then became **unrecoverable**: every later connect replayed the bad
+ * stored value first, so even setting the model *back* failed. A success message
+ * for a value the adapter rejected is the worst of both: the user believes the
+ * model changed, and the session is dead.
+ *
+ * The predicate is the descriptor's `canSetModelLive`, which is DERIVED from the
+ * harness's mechanism AND from whether acpx routes that mechanism today
+ * (`MODEL_MECHANISMS_ROUTED_BY_ACPX`). So when B3 lands the config-option apply
+ * path, this gate opens on its own, with no edit here and no edit to the table.
+ *
+ * ⚠️ It refuses only for a harness the descriptor KNOWS. An unrecognised agent
+ * command falls through to the pre-existing advertised-models check below — the
+ * gate must not start refusing model changes on adapters it has never classified.
+ */
+export function assertLiveModelChangeRoutable(record: SessionRecord): void {
+  const harness = harnessIdForAgentCommand(record.agentCommand);
+  if (harness === undefined) {
+    return;
+  }
+  // Pass the session's own advertisement so the answer can only NARROW, never
+  // widen — the descriptor's stated one-way property.
+  const advertised = record.acpx?.config_options;
+  const capabilities = resolveHarnessCapabilities(
+    harness,
+    advertised ? { configOptions: advertised } : undefined,
+  );
+  if (capabilities.canSetModelLive) {
+    return;
+  }
+  throw new RequestedModelUnsupportedError(
+    `Cannot set the model on this ${harness} session: ` +
+      `${capabilities.liveModelChangeReason ?? "acpx has no live model path for this harness."} ` +
+      `Nothing was written — the session is unchanged and still usable.`,
+  );
 }
 
 export function assertRecordModelSupported(params: {

@@ -91,6 +91,31 @@ export function isCopilotAcpCommand(command: string, args: readonly string[]): b
 }
 
 /**
+ * OpenCode's ACP adapter. The registry launches it as `npx -y opencode-ai acp`
+ * (`src/agent-registry.ts`) — unpinned, so the resolved version varies, but the
+ * package name does not. A local install spells it `opencode acp`.
+ */
+export function isOpenCodeAcpCommand(command: string, args: readonly string[]): boolean {
+  const parts = [command, ...args];
+  return (
+    parts.some((part) => part.includes("opencode-ai")) ||
+    (basenameToken(command) === "opencode" && args.includes("acp"))
+  );
+}
+
+/**
+ * Pi's ACP adapter, `pi-acp` — launched as `npx pi-acp@<exact pin>`
+ * (`ACP_ADAPTER_PACKAGE_RANGES.pi`). Matches on the package name so the pin can
+ * move without this detector following it.
+ */
+export function isPiAcpCommand(command: string, args: readonly string[]): boolean {
+  const parts = [command, ...args];
+  return parts.some(
+    (part) => part === "pi-acp" || part.includes("pi-acp@") || part.includes("/pi-acp"),
+  );
+}
+
+/**
  * Which `_meta` channel carries the OS primer for a given agent (CONCEPTION
  * §4.3). Routed by the substring command detectors — NOT
  * `resolveAgentNameFromCommand`, which requires an exact registry-string match
@@ -114,6 +139,31 @@ export function resolvePrimerChannel(agentCommand: string): PrimerChannel {
 }
 
 /**
+ * ORDER IS PART OF THE CONTRACT — first match wins.
+ *
+ * `claude-pty` sits before `claude`: the two detectors are disjoint today
+ * (`acp-server-transcript` / `claude-pty-acp` vs `claude-agent-acp`), but the
+ * PTY check stays first so a future spelling that satisfies both cannot silently
+ * resolve to the SDK adapter, whose per-adapter handling is different.
+ *
+ * `opencode` and `pi` were added by B0.2 so ONE classifier answers for all five
+ * harnesses the capability descriptor declares. Widening this table can only
+ * make the copy/fork agent-lock MORE permissive, and only between two spellings
+ * of the SAME adapter — precisely what that guard exists to allow.
+ */
+const ADAPTER_KIND_DETECTORS: ReadonlyArray<
+  [string, (command: string, args: readonly string[]) => boolean]
+> = [
+  ["claude-pty", isClaudePtyAcpCommand],
+  ["claude", isClaudeAcpCommand],
+  ["codex", isCodexAcpCommand],
+  ["gemini", isGeminiAcpCommand],
+  ["copilot", isCopilotAcpCommand],
+  ["opencode", isOpenCodeAcpCommand],
+  ["pi", isPiAcpCommand],
+];
+
+/**
  * The canonical ADAPTER TYPE for an agent command, derived from the substring
  * command detectors (NOT `resolveAgentNameFromCommand`, which requires an exact
  * registry-string match). Two command spellings that drive the same adapter map
@@ -124,7 +174,9 @@ export function resolvePrimerChannel(agentCommand: string): PrimerChannel {
  * override pointing at a checkout. Returns `undefined` for a raw/unknown command
  * so callers can fall back to strict command-string identity for genuine escape
  * hatches. Used by the copy/fork agent-lock so a same-adapter copy under a
- * different command spelling is not misread as a cross-agent copy.
+ * different command spelling is not misread as a cross-agent copy, and — since
+ * B0.2 — as the ONE classifier behind `isClaudeFamilyAgent` and the capability
+ * descriptor's `harnessIdForAgentCommand`.
  */
 export function acpAdapterKind(agentCommand: string): string | undefined {
   // A record can carry an empty agent_command (e.g. a never-configured stub);
@@ -133,25 +185,50 @@ export function acpAdapterKind(agentCommand: string): string | undefined {
     return undefined;
   }
   const { command, args } = splitCommandLine(agentCommand);
-  // claude-pty before claude: the detectors are disjoint (acp-server-transcript
-  // / claude-pty-acp vs claude-agent-acp), but keep the PTY check first for
-  // clarity, matching the ordering convention elsewhere.
-  if (isClaudePtyAcpCommand(command, args)) {
-    return "claude-pty";
+  return ADAPTER_KIND_DETECTORS.find(([, detect]) => detect(command, args))?.[0];
+}
+
+/** The adapter kinds whose credential IS a Claude account. Not a list to extend casually. */
+const CLAUDE_FAMILY_ADAPTER_KINDS: ReadonlySet<string> = new Set(["claude", "claude-pty"]);
+
+/**
+ * THE ONE PREDICATE for the account/subscription seam (CONCEPTION §5.5): *the
+ * account/subscription seam is Claude-family; the model/depth seam is generic.*
+ *
+ * Claude-family-only, and therefore gated on this: `session_options.profile`,
+ * `session_options.account_switch`, `subscription`, `auto_subscription`,
+ * `auto_failover`, and the model-floor group. **Generic, and never gated on
+ * this:** `model`, `effort`, `model_source`, `current_model_id`,
+ * `desired_config_options`, `config_options`, `served.*`.
+ *
+ * Used at BOTH ends of the seam, which is the whole point — the writer
+ * (`recordAccountSwitch` / `switchSessionAccount`, plus the pre-turn selector's
+ * default-profile fallback that reaches it) and the resume gate
+ * (`ensurePendingSwitchTranscript`). Gating only the resume leaves the
+ * meaningless fields being written; gating only the writer leaves
+ * already-wedged records unrecoverable.
+ *
+ * Derived from {@link acpAdapterKind} rather than from a second list of command
+ * spellings, so a dev override (`ACPX_CLAUDE_ACP_COMMAND`, a config `agents`
+ * entry pointing at a checkout) classifies the same way here as everywhere else.
+ *
+ * ⚠️ **An unrecognised or empty agent command is deliberately NOT Claude
+ * family, and that direction is load-bearing.** The failure this predicate
+ * exists to prevent is writing a Claude account switch onto a record whose
+ * harness can never hold a Claude SDK transcript — after which every later turn
+ * dies demanding that transcript (I1 D1 / I2 §5; the identical codex-only
+ * carve-out at `runtime/engine/failover.ts` cites brick://792ad0a4, where it
+ * killed every codex turn in ~13 ms). Defaulting an unknown adapter INTO the
+ * family reproduces exactly that, permanently and silently. Defaulting it OUT
+ * costs a genuinely-Claude custom command its auto-failover — visible, bounded,
+ * and recoverable by naming the command so a detector matches it.
+ */
+export function isClaudeFamilyAgent(agentCommand: string | undefined): boolean {
+  if (!agentCommand?.trim()) {
+    return false;
   }
-  if (isClaudeAcpCommand(command, args)) {
-    return "claude";
-  }
-  if (isCodexAcpCommand(command, args)) {
-    return "codex";
-  }
-  if (isGeminiAcpCommand(command, args)) {
-    return "gemini";
-  }
-  if (isCopilotAcpCommand(command, args)) {
-    return "copilot";
-  }
-  return undefined;
+  const kind = acpAdapterKind(agentCommand);
+  return kind !== undefined && CLAUDE_FAMILY_ADAPTER_KINDS.has(kind);
 }
 
 /**

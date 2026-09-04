@@ -1,4 +1,5 @@
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
+import { acpAdapterKind } from "./agent-command.js";
 
 /**
  * The per-harness capability descriptor (CONCEPTION §8, Decision F).
@@ -633,6 +634,102 @@ function advertisesSelectableOption(
 }
 
 /**
+ * A `--at-index` fork the harness would not honour (B0.2, brick
+ * https://acpx.devbox.nativai.de/?brick=276594c2). Carries the descriptor value
+ * so the caller sees WHICH honesty failure this is.
+ */
+export class ForkAtIndexUnsupportedError extends Error {
+  constructor(
+    readonly harness: HarnessId,
+    readonly atIndex: ForkAtIndexSupport,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ForkAtIndexUnsupportedError";
+  }
+}
+
+/**
+ * REFUSE a truncating fork the harness will not perform — and ONLY that.
+ *
+ * ⚠️ THE SCOPE OF THIS REFUSAL IS EXACTLY `'ignored'` AND `'unsupported'`. Do
+ * not widen it to `'turn-granular'`: codex DOES truncate, at a coarser boundary,
+ * and refusing it would ship a NEW defect under a bug-fix label. Codex proceeds
+ * and reports the effective landing index (see {@link resolveForkLandingIndex});
+ * that honesty is what the refusal is for here, not a refusal of its own.
+ * (Three `brick note`s on 276594c2, 2026-09-04, correcting that brick's own
+ * stale title, which still says codex is unsupported.)
+ *
+ * - `'ignored'` — **OpenCode**. `sessions copy --at-index N` returns success and
+ *   the adapter SILENTLY FULL-COPIES: I1 R4 measured acpx recording
+ *   `forkedAtMessageIndex: 2` while OpenCode's own DB held all 6 source
+ *   messages. A truncation that did not happen, displayed as if it had. Note the
+ *   PLAIN fork is fine and stays available (`fork.supported` is true) — only the
+ *   truncating variant lies.
+ * - `'unsupported'` — **Pi**. pi-acp advertises no fork capability at all (the
+ *   string `fork` occurs zero times in 0.0.26 and 0.0.33, I2 R4), so acpx
+ *   refuses the whole fork one layer down anyway; this makes the reason specific
+ *   instead of generic.
+ *
+ * A harness the descriptor does not know is NOT refused: acpx has no claim to
+ * make about it, and inventing one would be the same defect in the other
+ * direction.
+ */
+export function assertForkAtIndexHonoured(
+  agentCommand: string | undefined,
+  requestedIndex: number | undefined,
+): void {
+  if (requestedIndex === undefined) {
+    return; // no truncation requested; a full copy is honest for every harness
+  }
+  const harness = harnessIdForAgentCommand(agentCommand);
+  if (harness === undefined) {
+    return;
+  }
+  const fork = HARNESS_FACTS[harness].fork;
+  if (fork.atIndex !== "ignored" && fork.atIndex !== "unsupported") {
+    return;
+  }
+  const detail =
+    fork.atIndex === "ignored"
+      ? `its adapter accepts the index and silently full-copies, so the fork would carry the WHOLE source history while the record claimed a truncation at ${requestedIndex}`
+      : `its adapter advertises no fork capability at all`;
+  throw new ForkAtIndexUnsupportedError(
+    harness,
+    fork.atIndex,
+    `Refusing --at-index ${requestedIndex} for agent "${harness}": ` +
+      `fork.atIndex == "${fork.atIndex}" — ${detail}. ` +
+      (fork.supported
+        ? "A full copy (omit --at-index) is supported and honest."
+        : "This harness cannot fork at all."),
+  );
+}
+
+/**
+ * The index a `--at-index <requested>` fork will ACTUALLY land on for this
+ * agent command — the value that must be RECORDED and DISPLAYED, never the
+ * request (row `G1-FRK-01`).
+ *
+ * ⚠️ Every consumer calls this; nobody re-derives `floor(index / 2)`. The
+ * rounding rule is DATA in the descriptor precisely so the table and the
+ * behaviour cannot drift apart again, and a caller that recomputes it by hand is
+ * itself a consumer that has drifted.
+ *
+ * Falls back to the request when the harness is unknown or the rule does not
+ * apply — the request is then the best claim acpx can honestly make.
+ */
+export function resolveEffectiveForkIndex(
+  agentCommand: string | undefined,
+  requestedIndex: number,
+): number {
+  const harness = harnessIdForAgentCommand(agentCommand);
+  if (harness === undefined) {
+    return requestedIndex;
+  }
+  return resolveForkLandingIndex(HARNESS_FACTS[harness].fork, requestedIndex) ?? requestedIndex;
+}
+
+/**
  * The declared descriptor for one harness, refined by what a session's adapter
  * actually advertised when a session is supplied.
  *
@@ -678,6 +775,53 @@ export function resolveHarnessCapabilities(
   return capabilities;
 }
 
+/**
+ * Whether a `--reasoning-effort` request can reach this harness AT ALL — i.e.
+ * whether acpx has an apply path for the harness's depth mechanism.
+ *
+ * This is the predicate the CLI's "ignoring for agent X" warning dispatches on,
+ * replacing a hard-coded `name === "claude" || name === "claude-pty"` gate
+ * (CONCEPTION §9.1, §2.5). The name gate was wrong in both directions at once:
+ * the APPLY path is already capability-gated (an advertised `effort` config
+ * option, `src/session/config-option-application.ts:252`), so a harness that
+ * does advertise `effort` got the value applied **and** was told on stderr that
+ * it had been ignored.
+ *
+ * ⚠️ Deliberately **not** `canSetDepthLive`. That answers a narrower question —
+ * *can this SESSION change depth right now* — and is false for opencode purely
+ * because the default (non-reasoning) model does not advertise `effort` at
+ * `session/new`. Warning "ignored" on that basis would be wrong the moment a
+ * reasoning model is pinned, which is exactly the contradiction being removed.
+ * The question here is the mechanism's, not the session's.
+ *
+ * `false` for an id acpx cannot route: codex (`compose-into-id` — depth rides
+ * inside the model id, so the depth CONTROL cannot move it) and pi (`mode` —
+ * acpx's depth path has no mode arm; `acpx pi set-mode <level>` is the verb that
+ * does work).
+ */
+export function isDepthRequestRoutable(id: HarnessId): boolean {
+  return DEPTH_MECHANISMS_ROUTED_BY_ACPX.includes(HARNESS_FACTS[id].depth.mechanism);
+}
+
+/**
+ * The one-line reason `--reasoning-effort` cannot reach this harness, for the
+ * CLI warning. `null` when it can. Kept beside the mechanism table so the
+ * message cannot drift from the fact it explains.
+ */
+export function depthRequestUnroutableReason(id: HarnessId): string | null {
+  if (isDepthRequestRoutable(id)) {
+    return null;
+  }
+  const mechanism = HARNESS_FACTS[id].depth.mechanism;
+  if (mechanism === "compose-into-id") {
+    return "its depth rides inside the model id — set it via --model '<model>[depth]'";
+  }
+  if (mechanism === "mode") {
+    return `its depth is an ACP mode — set it via 'acpx ${id} set-mode <level>'`;
+  }
+  return "it declares no thinking-depth mechanism";
+}
+
 /** The whole declared table, in `HARNESS_IDS` order. */
 export function listHarnessCapabilities(): HarnessCapabilities[] {
   return HARNESS_IDS.map((id) => deriveHarnessCapabilities(HARNESS_FACTS[id]));
@@ -686,4 +830,26 @@ export function listHarnessCapabilities(): HarnessCapabilities[] {
 /** `true` when `value` names a harness this table declares. */
 export function isHarnessId(value: string): value is HarnessId {
   return (HARNESS_IDS as readonly string[]).includes(value);
+}
+
+/**
+ * The descriptor row for a session's stored `agent_command`, or `undefined` for
+ * a command no detector recognises.
+ *
+ * ⚠️ It delegates to {@link acpAdapterKind} rather than matching command strings
+ * itself. There is exactly ONE adapter classifier in acpx and this is not a
+ * second one — B0.1b spent a night collapsing four copies of that question, and
+ * a lookup that re-derived the answer here would be the fifth.
+ *
+ * `undefined` is the honest answer for an unknown adapter and callers must treat
+ * it as *"acpx cannot say"*, never as a default row: answering with a
+ * neighbouring harness's capabilities is how a control gets offered for a
+ * session that cannot honour it.
+ */
+export function harnessIdForAgentCommand(agentCommand: string | undefined): HarnessId | undefined {
+  if (!agentCommand?.trim()) {
+    return undefined;
+  }
+  const kind = acpAdapterKind(agentCommand);
+  return kind !== undefined && isHarnessId(kind) ? kind : undefined;
 }

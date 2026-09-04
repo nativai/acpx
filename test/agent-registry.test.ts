@@ -171,7 +171,12 @@ test("claude and codex are not built-in packages so the /opt fork commands spawn
 });
 
 test("pi built-in uses the current adapter package range", () => {
-  assert.equal(AGENT_REGISTRY.pi, "npx pi-acp@^0.0.26");
+  // ⚠️ `^0.0.33` is an EXACT pin under npm semver (a caret on 0.0.x allows only
+  // that patch), so this literal IS the version acpx launches, and changing it is
+  // a deliberate act. Bumped 0.0.26 → 0.0.33 by B0.2 (npm latest, published
+  // 2026-07-30). Verified on the rig by the SPAWN LINE, not by this string —
+  // program row `G1-PIN-01`.
+  assert.equal(AGENT_REGISTRY.pi, "npx pi-acp@^0.0.33");
 });
 
 test("resolveInstalledBuiltInAgentLaunch returns undefined now that no built-in packages remain", () => {

@@ -1,3 +1,4 @@
+import { isClaudeFamilyAgent } from "../../acp/agent-command.js";
 import type { AcpClient } from "../../acp/client.js";
 import {
   extractAcpError,
@@ -855,6 +856,21 @@ async function ensurePendingSwitchTranscript(
   record: SessionRecord,
   verbose?: boolean,
 ): Promise<void> {
+  // THE RESUME END of the Claude-family gate (CONCEPTION §5.5). Everything below
+  // resolves a Claude SDK transcript JSONL, which only a Claude-family adapter
+  // ever writes. A non-Claude record carrying `account_switch` — every OpenCode
+  // and Pi session created before this fix, plus 7 measured codex records on
+  // devbox (I2) — would otherwise be refused here forever, since the transcript
+  // it is asked for cannot come into existence.
+  //
+  // ⚠️ THIS IS WHAT FREES ALREADY-WEDGED RECORDS. The writer gate alone stops
+  // new damage and leaves every existing wedged session unrecoverable; this gate
+  // alone stops the refusal and leaves the meaningless fields being written. The
+  // conception is explicit that both ends are needed, and this is the end that
+  // makes the one-shot sweep a cleanup rather than a rescue.
+  if (!isClaudeFamilyAgent(record.agentCommand)) {
+    return;
+  }
   // Real turns only (brick://509b4ee1): a breadcrumb-only session has no
   // transcript to ensure — proceed straight to connect, where the fixed
   // fallback gate creates the session fresh on the new anchor.

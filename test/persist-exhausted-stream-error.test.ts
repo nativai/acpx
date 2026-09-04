@@ -111,7 +111,7 @@ function makeRecord(sessionId: string): SessionRecord {
     schema: "acpx.session.v1",
     acpxRecordId: sessionId,
     acpSessionId: sessionId,
-    agentCommand: "claude",
+    agentCommand: "node /opt/claude-agent-acp/dist/index.js",
     cwd: "/work/exhausted",
     createdAt: now,
     lastUsedAt: now,

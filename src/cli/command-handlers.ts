@@ -4,6 +4,14 @@ import { Command, InvalidArgumentError } from "commander";
 import { acpAdapterKind } from "../acp/agent-command.js";
 import { isLegacyZedCodexAcpInvocation } from "../acp/codex-compat.js";
 import {
+  assertForkAtIndexHonoured,
+  depthRequestUnroutableReason,
+  isDepthRequestRoutable,
+  isHarnessId,
+  resolveEffectiveForkIndex,
+  resolveHarnessCapabilities,
+} from "../acp/harness-capabilities.js";
+import {
   listBuiltInAgents,
   resolveAgentCommand,
   resolveAgentNameFromCommand,
@@ -40,6 +48,10 @@ import {
 import { getResolvedProfile } from "../runtime/engine/account-seam.js";
 import { isAutoSubscriptionSentinel } from "../runtime/engine/auto-subscription.js";
 import { sessionOptionsFromRecord } from "../runtime/engine/session-options.js";
+import {
+  formatAccountSeamRepairResult,
+  repairAccountSeamRecords,
+} from "../session/account-seam-repair.js";
 import { exportSession } from "../session/export.js";
 import { importSession } from "../session/import.js";
 import { getDesiredConfigOptions } from "../session/mode-preference.js";
@@ -498,50 +510,63 @@ async function assertExplicitSubscriptionMatchesExistingSession(params: {
   });
 }
 
-// `--reasoning-effort` applies to the effort-capable Claude agents: `claude`
-// and `claude-pty` (the claude-pty bridge advertises an `effort` config option
-// and acpx applies the requested level to it). When it's passed but the
-// effective agent is not effort-capable (explicit codex, or a bare spawn that
-// inherited a non-claude parent), it never writes effort — say so once on
-// stderr (never an error).
-function warnReasoningEffortIgnoredForNonClaude(
+/**
+ * ⚠️ THESE TWO WARNINGS DISPATCH ON THE CAPABILITY DESCRIPTOR, NOT ON THE AGENT
+ * NAME. Do not "simplify" either back to `name === "claude" || name ===
+ * "claude-pty"`; that is the defect, not the style (CONCEPTION §9.1, §2.5, row
+ * `G1-WRN-01`).
+ *
+ * The name gate was wrong in both directions simultaneously. The APPLY path is
+ * already capability-gated — `persistAndApplyRequestedEffort` requires an
+ * advertised `effort` config option (`src/session/config-option-application.ts:252`)
+ * — so a harness that DOES advertise one had the value applied and was told on
+ * stderr that it had been ignored. The message contradicted the behaviour, which
+ * is worse than either alone: a user who believes the warning stops using a flag
+ * that works, and a user who believes the behaviour stops trusting the warnings.
+ *
+ * An agent name the descriptor does not know keeps warning. That is the
+ * fail-safe direction here — acpx has no evidence it can route depth to an
+ * unknown adapter, and the cost of a spurious warning is a line of stderr,
+ * against a silent no-op for the other choice.
+ */
+function warnReasoningEffortNotRoutable(
   globalFlags: GlobalFlags,
   effectiveAgentName: string,
 ): void {
-  if (
-    !globalFlags.reasoningEffort ||
-    effectiveAgentName === "claude" ||
-    effectiveAgentName === "claude-pty" ||
-    globalFlags.jsonStrict
-  ) {
+  if (!globalFlags.reasoningEffort || globalFlags.jsonStrict) {
     return;
   }
+  if (isHarnessId(effectiveAgentName) && isDepthRequestRoutable(effectiveAgentName)) {
+    return;
+  }
+  const reason = isHarnessId(effectiveAgentName)
+    ? depthRequestUnroutableReason(effectiveAgentName)
+    : "acpx has no declared thinking-depth mechanism for it";
   process.stderr.write(
-    `[acpx] --reasoning-effort applies to claude; ignoring for agent "${effectiveAgentName}" ` +
-      `(codex depth is set via --model '<model>[depth]')\n`,
+    `[acpx] --reasoning-effort is ignored for agent "${effectiveAgentName}": ${reason}\n`,
   );
 }
 
-// brick://874fee67: verbatim sibling of warnReasoningEffortIgnoredForNonClaude.
-// `--output-style` is meaningful only for agents that ADVERTISE an `outputStyle`
-// config option — claude and claude-pty today. On any other effective agent
-// (explicit codex, or a bare spawn that inherited a non-claude parent) nothing is
-// written and nothing is applied, so say so once on stderr — never an error, and
-// never a write (the advertisesConfigOption gate in the apply path enforces that).
-function warnOutputStyleIgnoredForNonClaude(
-  globalFlags: GlobalFlags,
-  effectiveAgentName: string,
-): void {
+// brick://874fee67: sibling of the above, on the same descriptor rule.
+// `--output-style` is meaningful only for a harness that ADVERTISES an
+// `outputStyle` config option, which is what `supportsOutputStyles` records
+// (claude + claude-pty today; zero `outputStyle` references in codex-acp, and it
+// is not an OpenCode or Pi concept at all — I1 R11 / I2 R11). Never an error,
+// and never a write: the `advertisesConfigOption` gate in the apply path
+// enforces that independently.
+function warnOutputStyleNotSupported(globalFlags: GlobalFlags, effectiveAgentName: string): void {
+  if (!globalFlags.outputStyle || globalFlags.jsonStrict) {
+    return;
+  }
   if (
-    !globalFlags.outputStyle ||
-    effectiveAgentName === "claude" ||
-    effectiveAgentName === "claude-pty" ||
-    globalFlags.jsonStrict
+    isHarnessId(effectiveAgentName) &&
+    resolveHarnessCapabilities(effectiveAgentName).supportsOutputStyles
   ) {
     return;
   }
   process.stderr.write(
-    `[acpx] --output-style applies to claude; ignoring for agent "${effectiveAgentName}"\n`,
+    `[acpx] --output-style is ignored for agent "${effectiveAgentName}": ` +
+      `it advertises no outputStyle config option\n`,
   );
 }
 
@@ -990,13 +1015,27 @@ function assertCopyableSource(source: SessionRecord): void {
   }
 }
 
-function resolveForkAtMessageIndex(source: SessionRecord, atIndex: number | undefined): number {
+/**
+ * The EFFECTIVE fork index for the CLI's own use (the `byway_at` metadata).
+ *
+ * The same two rules `resolveForkSourceContext` applies, called here as well so
+ * a refusal happens BEFORE an adapter process is spawned — `resolveForkSourceContext`
+ * is the authoritative choke point (acpx-ui reaches it too) but runs after
+ * `client.start()`. Both call the ONE pair of descriptor functions; neither
+ * re-derives the rule.
+ */
+function resolveForkAtMessageIndex(
+  source: SessionRecord,
+  atIndex: number | undefined,
+  agentCommand: string,
+): number {
   const messageCount = source.messages.length;
-  const forkAtMessageIndex = atIndex ?? messageCount;
-  if (forkAtMessageIndex < 0 || forkAtMessageIndex > messageCount) {
+  assertForkAtIndexHonoured(agentCommand, atIndex);
+  const requested = atIndex ?? messageCount;
+  if (requested < 0 || requested > messageCount) {
     throw new InvalidArgumentError(`--at-index out of range (0-${messageCount})`);
   }
-  return forkAtMessageIndex;
+  return atIndex === undefined ? requested : resolveEffectiveForkIndex(agentCommand, requested);
 }
 
 function assertCopyAgentLock(params: {
@@ -1421,8 +1460,8 @@ export async function handlePrompt(
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  warnReasoningEffortIgnoredForNonClaude(globalFlags, agent.agentName);
-  warnOutputStyleIgnoredForNonClaude(globalFlags, agent.agentName);
+  warnReasoningEffortNotRoutable(globalFlags, agent.agentName);
+  warnOutputStyleNotSupported(globalFlags, agent.agentName);
   const { printPromptSessionBanner, printQueuedPromptByFormat, printServedBelowFloorWarning } =
     await loadOutputRenderModule();
   const selector = resolveSessionTargetSelector({ flags, command });
@@ -1514,8 +1553,8 @@ export async function handleExec(
     suppressReads: outputPolicy.suppressReads,
   });
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  warnReasoningEffortIgnoredForNonClaude(globalFlags, agent.agentName);
-  warnOutputStyleIgnoredForNonClaude(globalFlags, agent.agentName);
+  warnReasoningEffortNotRoutable(globalFlags, agent.agentName);
+  warnOutputStyleNotSupported(globalFlags, agent.agentName);
 
   const result = await runOnce({
     agentCommand: agent.agentCommand,
@@ -2583,8 +2622,8 @@ export async function handleSessionsNew(
     parent,
     config,
   );
-  warnReasoningEffortIgnoredForNonClaude(globalFlags, effectiveAgent.agentName);
-  warnOutputStyleIgnoredForNonClaude(globalFlags, effectiveAgent.agentName);
+  warnReasoningEffortNotRoutable(globalFlags, effectiveAgent.agentName);
+  warnOutputStyleNotSupported(globalFlags, effectiveAgent.agentName);
   const [{ createSession, closeSession }, { printCreatedSessionBanner, printNewSessionByFormat }] =
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
 
@@ -2744,7 +2783,7 @@ async function runSessionCopy(
   if (requireTemplate) {
     assertTemplateSource(source);
   }
-  const forkAtMessageIndex = resolveForkAtMessageIndex(source, flags.atIndex);
+  const forkAtMessageIndex = resolveForkAtMessageIndex(source, flags.atIndex, source.agentCommand);
   assertCopyAgentLock({ explicitAgentName, globalFlags, pathAgent, source, config });
 
   // GAP 1 — resolve the spawn parent the same way plain-`new` does (flag →
@@ -2971,8 +3010,8 @@ export async function handleSessionsEnsure(
     parent,
     config,
   );
-  warnReasoningEffortIgnoredForNonClaude(globalFlags, effectiveAgent.agentName);
-  warnOutputStyleIgnoredForNonClaude(globalFlags, effectiveAgent.agentName);
+  warnReasoningEffortNotRoutable(globalFlags, effectiveAgent.agentName);
+  warnOutputStyleNotSupported(globalFlags, effectiveAgent.agentName);
   const existing = await findSessionByDirectoryWalk({
     agentCommand: effectiveAgent.agentCommand,
     cwd: effectiveAgent.cwd,
@@ -3773,3 +3812,34 @@ export async function handleSessionsOwnerStatus(
 }
 
 export { parseHistoryLimit, NoSessionError, loadSessionModule };
+
+/**
+ * `acpx sessions repair-account-seam` — the one-shot sweep of records the
+ * Claude-family account seam already wedged (CONCEPTION §5.5, brick
+ * https://acpx.devbox.nativai.de/?brick=07bc257a).
+ *
+ * A SUBCOMMAND of `sessions`, deliberately, not a new top-level verb: a top-level
+ * verb needs two registrations (`registerDefaultCommands` AND `TOP_LEVEL_VERBS`
+ * in `src/cli-core.ts`) and adding only the first makes the token resolve as an
+ * AGENT NAME, so a typo becomes a prompt delivery. `sessions` is already in that
+ * set, so this cannot acquire that failure mode.
+ */
+export async function handleSessionsRepairAccountSeam(
+  flags: { dryRun?: boolean; backupDir?: string },
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const result = await repairAccountSeamRecords({
+    dryRun: flags.dryRun,
+    ...(flags.backupDir ? { backupDir: flags.backupDir } : {}),
+  });
+  if (emitJsonResult(globalFlags.format, { action: "account_seam_repaired", ...result })) {
+    return;
+  }
+  if (globalFlags.format === "quiet") {
+    process.stdout.write(`${result.repaired.length}\n`);
+    return;
+  }
+  process.stdout.write(`${formatAccountSeamRepairResult(result)}\n`);
+}

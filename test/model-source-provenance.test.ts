@@ -22,7 +22,7 @@ function recordWithProvenance(acpx: SessionAcpxState): SessionRecord {
     {
       acpxRecordId: "prov",
       acpSessionId: "prov-acp",
-      agentCommand: "claude",
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
       cwd: "/workspace/prov",
       acpx,
     },

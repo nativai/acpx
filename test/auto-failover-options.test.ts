@@ -35,7 +35,7 @@ function recordWithAutoFailover(value: boolean | undefined): SessionRecord {
     {
       acpxRecordId: "auto-fo",
       acpSessionId: "auto-fo-acp",
-      agentCommand: "claude",
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
       cwd: "/workspace/auto-fo",
       acpx: {
         session_options: {
@@ -65,7 +65,7 @@ test("auto_failover round-trips through parse, clone, session options, persist, 
   const persisted = makeSessionRecord({
     acpxRecordId: "persist-auto-fo",
     acpSessionId: "persist-auto-fo-acp",
-    agentCommand: "claude",
+    agentCommand: "node /opt/claude-agent-acp/dist/index.js",
     cwd: "/workspace/auto-fo",
     acpx: {},
   });
@@ -107,7 +107,7 @@ test("a fresh session with no prior auto_failover stays default (undefined -> en
     {
       acpxRecordId: "fresh-auto-fo",
       acpSessionId: "fresh-auto-fo-acp",
-      agentCommand: "claude",
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
       cwd: "/workspace/auto-fo",
       acpx: {},
     },
@@ -124,7 +124,7 @@ test("carry-forward preserves auto_failover AND the subscription_switch breadcru
     {
       acpxRecordId: "carry-both",
       acpSessionId: "carry-both-acp",
-      agentCommand: "claude",
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
       cwd: "/workspace/auto-fo",
       acpx: {
         session_options: {
@@ -224,14 +224,14 @@ test("auto_failover defaults enabled and explicit false gates failover", async (
     const enabledRecord = makeSessionRecord({
       acpxRecordId: "enabled-auto-fo",
       acpSessionId: "enabled-auto-fo-acp",
-      agentCommand: "claude",
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
       cwd: "/workspace/auto-fo",
       acpx: { session_options: { profile: "sub-a" } },
     });
     const disabledRecord = makeSessionRecord({
       acpxRecordId: "disabled-auto-fo",
       acpSessionId: "disabled-auto-fo-acp",
-      agentCommand: "claude",
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
       cwd: "/workspace/auto-fo",
       acpx: { session_options: { profile: "sub-a", auto_failover: false } },
     });
@@ -248,7 +248,7 @@ test("integration: an owner-respawn re-persist keeps auto_failover:false across 
     const record = makeSessionRecord({
       acpxRecordId: "respawn-auto-fo",
       acpSessionId: "respawn-auto-fo-acp",
-      agentCommand: "claude",
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
       cwd: homeDir,
       acpx: { session_options: { auto_failover: false, model: "sonnet", profile: "sub6" } },
     });
@@ -278,7 +278,7 @@ test("setSessionAutoFailover writes explicit policy on the cold path (no live ow
     const record = makeSessionRecord({
       acpxRecordId: "set-auto-fo",
       acpSessionId: "set-auto-fo-acp",
-      agentCommand: "claude",
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
       cwd: homeDir,
       acpx: {},
     });

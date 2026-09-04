@@ -161,7 +161,7 @@ function sessionRecord(subscription: string, model: string): SessionRecord {
   return {
     acpxRecordId: "rec-fable",
     cwd: "/work/fable",
-    agentCommand: "claude",
+    agentCommand: "node /opt/claude-agent-acp/dist/index.js",
     acpx: { session_options: { subscription, model } },
   } as SessionRecord;
 }

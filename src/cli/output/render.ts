@@ -257,7 +257,13 @@ export function printCopiedSessionByFormat(
       name: record.name,
       sourceSessionId: source.acpxRecordId,
       forkedFromSessionId: record.forkedFromSessionId,
+      // EFFECTIVE index. `forkedAtMessageIndexRequested` rides beside it only on
+      // a mismatch, so a consumer that reads one field is already correct and a
+      // consumer that reads both learns the fork moved.
       forkedAtMessageIndex: record.forkedAtMessageIndex,
+      ...(record.forkedAtMessageIndexRequested === undefined
+        ? {}
+        : { forkedAtMessageIndexRequested: record.forkedAtMessageIndexRequested }),
       ephemeral: record.metadata?.byway === "1",
       sessionUrl: composeSessionUrl(record),
       ...(subscriptionSelection ? { subscriptionSelection } : {}),
@@ -272,6 +278,18 @@ export function printCopiedSessionByFormat(
   }
 
   process.stdout.write(`${record.acpxRecordId}\n`);
+  // ⚠️ THE CLI MUST SAY WHERE THE FORK ACTUALLY LANDED. Recording the effective
+  // index without printing it leaves the user reading the number they typed
+  // (WS-core's acceptance condition on 276594c2: the honesty is end-to-end, not
+  // merely declared in the descriptor). Only on a mismatch — a fork that landed
+  // where it was asked to has nothing to report.
+  if (record.forkedAtMessageIndexRequested !== undefined) {
+    process.stderr.write(
+      `[acpx] fork landed at message ${record.forkedAtMessageIndex}, not the requested ` +
+        `${record.forkedAtMessageIndexRequested}: this agent truncates at turn boundaries, ` +
+        `so the request was snapped down to the nearest one.\n`,
+    );
+  }
 }
 
 export function printEnsuredSessionByFormat(

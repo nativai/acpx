@@ -44,7 +44,7 @@ function makeRecord(overrides: Partial<SessionRecord> = {}): SessionRecord {
   return {
     acpxRecordId: "rec-1",
     cwd: "/work/proj",
-    agentCommand: "claude",
+    agentCommand: "node /opt/claude-agent-acp/dist/index.js",
     ...overrides,
   } as SessionRecord;
 }

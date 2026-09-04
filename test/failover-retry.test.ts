@@ -133,7 +133,7 @@ function makeRecord(options: {
   return {
     acpxRecordId: "rec-fo",
     cwd: options.cwd ?? "/work/fo",
-    agentCommand: "claude",
+    agentCommand: "node /opt/claude-agent-acp/dist/index.js",
     ...(options.acpSessionId ? { acpSessionId: options.acpSessionId } : {}),
     ...(options.profile || options.subscription
       ? {

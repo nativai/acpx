@@ -107,7 +107,7 @@ async function withClosedRecordOwner(
       makeSessionRecord({
         acpxRecordId: sessionId,
         acpSessionId: `acp-${sessionId}`,
-        agentCommand: "claude",
+        agentCommand: "node /opt/claude-agent-acp/dist/index.js",
         cwd: homeDir,
         // Exactly what the acpx-ui Close button writes, and nothing else: the
         // record says closed while the owner below is very much alive.

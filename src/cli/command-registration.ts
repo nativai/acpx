@@ -16,6 +16,7 @@ import {
   handleSessionsOwnerStatus,
   handleSessionsPrune,
   handleSessionsRecover,
+  handleSessionsRepairAccountSeam,
   handleSessionsSetMetadata,
   handleSessionsShow,
   handleSessionsTemplate,
@@ -152,6 +153,22 @@ export function registerSessionsCommand(
     .option("--dry-run", "Preview slug/version assignments without writing records")
     .action(async function (this: Command, flags: { dryRun?: boolean }) {
       await handleSessionsTemplatesMigrateSlugs(flags, this, config);
+    });
+
+  sessionsCommand
+    .command("repair-account-seam")
+    .description(
+      "Clear Claude-family profile / account_switch from NON-Claude session records that the " +
+        "account seam wedged (idempotent; backs up every record it rewrites)",
+    )
+    .option("--dry-run", "List what would be repaired and write nothing")
+    .option(
+      "--backup-dir <dir>",
+      "Where to copy each record before rewriting it (default: ~/.acpx/backups/account-seam-repair-<ts>)",
+      (value: string) => parseNonEmptyValue("Backup dir", value),
+    )
+    .action(async function (this: Command, flags: { dryRun?: boolean; backupDir?: string }) {
+      await handleSessionsRepairAccountSeam(flags, this, config);
     });
 
   sessionsCommand

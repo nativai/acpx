@@ -109,18 +109,40 @@ test("claude session with no stored profile still inherits the subscription defa
   );
 });
 
-test("an explicit stored profile still wins for a codex record (guard only withholds the DEFAULT)", async () => {
+test("a stored CLAUDE-SUBSCRIPTION profile on a codex record no longer wins (B0.2 widened the guard)", async () => {
   await withRegistry(
     {
       defaultId: "sub1",
       profiles: [subscriptionProfile("sub1", "/home/node/.acpx/subscriptions/sub1")],
     },
     async (loadOpts) => {
-      // A codex record that explicitly stored a subscription profile still resolves it
-      // (storedSelectionId path is untouched) — the fix narrowly withholds only the
-      // registry-default fallback, it does not blanket-disable selection for codex.
-      const codexWithExplicit = recordFor(CODEX_AGENT, { profile: "sub1" });
-      assert.equal(failoverEnabledForRecord(codexWithExplicit, loadOpts), true);
+      // ⚠️ THIS TEST'S PROPERTY WAS DELIBERATELY INVERTED BY B0.2, and the reason
+      // is that the old property could only ever hold for a record that cannot
+      // spawn. It read: "an explicit stored profile still wins for a codex record
+      // (guard only withholds the DEFAULT)".
+      //
+      // The record it pinned is a codex record carrying a Claude *subscription*
+      // profile. `assertCodexProfileCompatibility` (src/acp/auth-env.ts) throws
+      // for exactly that combination — "profile ... cannot be used with the codex
+      // adapter" — so such a record is already refused at spawn. 56 of them were
+      // measured on devbox on 2026-09-04 (53 codex, 2 opencode, 1 pi); they are
+      // the wedged population `acpx sessions repair-account-seam` exists to free.
+      // Answering "yes, failover is enabled" for a record that can never take a
+      // turn is not a capability, it is the corruption being believed.
+      //
+      // ⚠️ NOTE WHAT DID **NOT** CHANGE, which is what keeps the codex guardrail
+      // intact: a LEGITIMATE codex record — no profile, or a `chatgpt` profile —
+      // is byte-identically unaffected. It already resolved to false, because
+      // `failoverEnabledForRecord` requires `transcriptAnchorDir(profile) !== null`
+      // and that is null for `chatgpt` (CONCEPTION §5.5). The two cases below pin
+      // both directions.
+      const codexWithClaudeSubscription = recordFor(CODEX_AGENT, { profile: "sub1" });
+      assert.equal(failoverEnabledForRecord(codexWithClaudeSubscription, loadOpts), false);
+
+      // The Claude-family control on the same registry and the same stored value:
+      // the guard is about the ADAPTER, not about the profile being stored.
+      const claudeWithSameProfile = recordFor(CLAUDE_AGENT, { profile: "sub1" });
+      assert.equal(failoverEnabledForRecord(claudeWithSameProfile, loadOpts), true);
     },
   );
 });

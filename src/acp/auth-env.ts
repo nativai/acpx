@@ -42,7 +42,7 @@ import type {
 } from "../config/subscriptions.js";
 import { SubscriptionLockedError } from "../errors.js";
 import type { AcpClientOptions } from "../types.js";
-import { isClaudePtyAgentCommand } from "./agent-command.js";
+import { isClaudeFamilyAgent, isClaudePtyAgentCommand } from "./agent-command.js";
 import { splitCommandLine } from "./client-process.js";
 import { isCodexAcpCommand } from "./codex-compat.js";
 import type { ShimHandle } from "./openrouter-shim.js";
@@ -587,6 +587,17 @@ function buildAgentEnvironment(
     const subscriptionId = sessionContext?.subscriptionId?.trim();
     if (agentCommand !== undefined && isClaudePtyAgentCommand(agentCommand)) {
       rejectExplicitSubscriptionForClaudePty(subscriptionId);
+    } else if (agentCommand !== undefined && subscriptionId && !isClaudeFamilyAgent(agentCommand)) {
+      // CONCEPTION §5.5 / §9.1, I3 §2.4: `subscription` is a Claude-family
+      // field. `CLAUDE_CONFIG_DIR` means nothing to a harness that does not read
+      // it, and setting it SILENTLY is the half of this defect that is easy to
+      // miss — nothing fails, so nothing says the selection was inert.
+      //
+      // Skipped when the caller cannot supply the agent command, matching
+      // `validateProfileAgentCompatibility`'s convention in this file: an absent
+      // command is "not told", not "not Claude". Every production spawn path
+      // passes it.
+      warnSubscriptionIgnoredForNonClaudeAgent(subscriptionId, agentCommand);
     } else if (subscriptionId) {
       applySubscriptionConfigDir(env, subscriptionId, lookupOptions);
       ensureProvisioningForResolvedSubscription(env, lookupOptions, onProvisioningWarning);
@@ -1158,6 +1169,20 @@ function rejectExplicitSubscriptionForClaudePty(subscriptionId: string | null | 
     `[acpx] subscription "${trimmed}" cannot be used with the claude-pty bridge agent: ` +
       `subscription configDirs hold headless setup-tokens, which interactive Claude does not accept. ` +
       `Use a claude-home profile instead (--profile <id>).`,
+  );
+}
+
+// The loud half of the `--subscription` family gate: say once, on stderr, that
+// the selection is not being applied. Never an error — a subscription id on a
+// non-Claude session is a no-op, not a configuration failure, and a throw would
+// break sessions that carry a leftover id from before this gate existed.
+function warnSubscriptionIgnoredForNonClaudeAgent(
+  subscriptionId: string,
+  agentCommand: string,
+): void {
+  process.stderr.write(
+    `[acpx] subscription "${subscriptionId}" is not applied for agent command "${agentCommand}": ` +
+      `subscriptions select a Claude account (CLAUDE_CONFIG_DIR), which this harness does not read.\n`,
   );
 }
 

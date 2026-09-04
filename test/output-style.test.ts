@@ -219,7 +219,7 @@ test("leg: persistSessionOptions writes output_style, and it alone keeps the blo
   const record = makeSessionRecord({
     acpxRecordId: "p",
     acpSessionId: "p",
-    agentCommand: "claude",
+    agentCommand: "node /opt/claude-agent-acp/dist/index.js",
     cwd: "/workspace",
     acpx: {},
   });

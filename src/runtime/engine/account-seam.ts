@@ -1,3 +1,4 @@
+import { isClaudeFamilyAgent } from "../../acp/agent-command.js";
 import {
   isSubscriptionProfileLocked,
   loadProfileRegistry,
@@ -88,6 +89,36 @@ function requireAnchor(profile: ProfileEntry, role: string): string {
   return anchor;
 }
 
+/**
+ * THE WRITER END of the Claude-family gate (CONCEPTION §5.5). Refuses before any
+ * work — before the transcript port, before `recordAccountSwitch` — so a
+ * non-Claude record can never acquire `session_options.profile` /
+ * `session_options.account_switch`. Those two fields are what
+ * `ensurePendingSwitchTranscript` (the resume end, `reconnect.ts`) then reads to
+ * demand a Claude SDK transcript JSONL that an OpenCode or Pi session can never
+ * have — the defect that kills every one of their sessions after turn 1
+ * (I1 D1 / I2 §5).
+ *
+ * ⚠️ This throws rather than no-opping ON PURPOSE. A silent no-op would let
+ * `switchSessionAccount` return a `SwitchSessionAccountResult` naming a switch
+ * that did not happen — the same class of silent wrong answer this programme
+ * exists to end. The automatic callers (`enforceSubscriptionLockBeforeTurn`,
+ * `selectSubscriptionBeforeTurn`, reactive failover) never reach it, because
+ * `selectedProfileId` in `failover.ts` withholds the default-profile fallback
+ * from a non-Claude record; the caller that DOES reach it is the manual
+ * `acpx <agent> set profile …`, which should indeed fail loudly.
+ */
+function assertClaudeFamilySeam(record: SessionRecord): void {
+  if (isClaudeFamilyAgent(record.agentCommand)) {
+    return;
+  }
+  throw new AccountSwitchError(
+    `session ${record.acpxRecordId} runs agent command "${record.agentCommand}", which is not a ` +
+      `Claude-family adapter: profiles and account switching are Claude-family only (its credential ` +
+      `is not a Claude account, and it has no Claude transcript to port).`,
+  );
+}
+
 function recordAccountSwitch(
   record: SessionRecord,
   fromProfile: ProfileEntry,
@@ -153,6 +184,7 @@ export async function switchSessionAccount(
   reason: "manual" | "failover" | "locked" | "selection",
   loadOpts?: SubscriptionLookupOptions,
 ): Promise<SwitchSessionAccountResult> {
+  assertClaudeFamilySeam(record);
   const targetId = toProfileId.trim();
   if (!targetId) {
     throw new AccountSwitchError("target profile id is empty");

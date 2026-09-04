@@ -70,6 +70,7 @@ export function serializeSessionRecordForDisk(
     parent_session_url: canonical.parentSessionUrl,
     forked_from_session_id: canonical.forkedFromSessionId,
     forked_at_message_index: canonical.forkedAtMessageIndex,
+    forked_at_message_index_requested: canonical.forkedAtMessageIndexRequested,
     subagents: canonical.subagents?.map(serializeSubagentRef),
     metadata: canonical.metadata,
     template: canonical.template,

@@ -6,6 +6,10 @@ import {
   type SessionLoadResult,
 } from "../../acp/client.js";
 import { formatErrorMessage } from "../../acp/error-normalization.js";
+import {
+  assertForkAtIndexHonoured,
+  resolveEffectiveForkIndex,
+} from "../../acp/harness-capabilities.js";
 import { withInterrupt, withTimeout } from "../../async-control.js";
 import { bindDefaultAccountToSessionOptionsAsync } from "../../runtime/engine/default-account-binding.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
@@ -123,6 +127,7 @@ async function createSessionRecordWithClient(
     | {
         sourceRecord: SessionRecord;
         forkAtMessageIndex: number;
+        requestedForkAtMessageIndex?: number;
         messages: SessionRecord["messages"];
       }
     | undefined;
@@ -200,7 +205,11 @@ async function createSessionRecordWithClient(
       ? {
           kind: "session" as const,
           forkedFromSessionId: forkContext.sourceRecord.acpxRecordId,
+          // EFFECTIVE, not requested — see resolveForkSourceContext.
           forkedAtMessageIndex: forkContext.forkAtMessageIndex,
+          ...(forkContext.requestedForkAtMessageIndex === undefined
+            ? {}
+            : { forkedAtMessageIndexRequested: forkContext.requestedForkAtMessageIndex }),
         }
       : {}),
     ...(options.parentSessionId
@@ -334,13 +343,17 @@ type ForkedSessionState = CreatedSessionState & {
   forkContext: {
     sourceRecord: SessionRecord;
     forkAtMessageIndex: number;
+    requestedForkAtMessageIndex?: number;
     messages: SessionRecord["messages"];
   };
 };
 
 type ForkSourceContext = {
   sourceRecord: SessionRecord;
+  /** The index the fork ACTUALLY lands on — what the record persists. */
   forkAtMessageIndex: number;
+  /** The index that was ASKED for, present only when it differs from the above. */
+  requestedForkAtMessageIndex?: number;
 };
 
 async function resumeSessionRecordWithClient(
@@ -405,12 +418,42 @@ async function resolveForkSourceContext(options: SessionCreateOptions): Promise<
     throw new Error("Cannot copy a subagent session");
   }
 
-  const forkAtMessageIndex = options.forkAtMessageIndex ?? sourceRecord.messages.length;
-  if (forkAtMessageIndex < 0 || forkAtMessageIndex > sourceRecord.messages.length) {
+  // THE CHOKE POINT both the CLI verb and acpx-ui's create route reach, which is
+  // why the refusal lives here rather than only in the handler: a truncating fork
+  // a harness will not perform is refused before any record exists.
+  assertForkAtIndexHonoured(options.agentCommand, options.forkAtMessageIndex);
+
+  const requested = options.forkAtMessageIndex ?? sourceRecord.messages.length;
+  if (requested < 0 || requested > sourceRecord.messages.length) {
     throw new Error(`--at-index out of range (0-${sourceRecord.messages.length})`);
   }
 
-  return { sourceRecord, forkAtMessageIndex };
+  // ⚠️ THE RECORD CARRIES THE EFFECTIVE INDEX, NOT THE REQUESTED ONE, and this
+  // is a CORRECTION of shipped behaviour, not a new field's default. Before B0.2
+  // this function returned the request and `session-management` persisted it as
+  // `forkedAtMessageIndex` — so on codex, whose rollback is TURN-granular
+  // (2 acpx messages = 1 turn, rounding down), an ODD index already produced a
+  // record asserting a truncation the adapter did not perform. The lie shipped;
+  // it is not being introduced. Correcting the field every consumer ALREADY
+  // reads fixes the display everywhere at once, which is why `requested` is the
+  // new field rather than `effective`.
+  //
+  // It also truncates the cloned message list at the same boundary
+  // (`messages.slice(0, forkAtMessageIndex)` in the caller), so the record's own
+  // message COUNT agrees with the index it reports — the ground truth
+  // `G1-FRK-01` checks the record against.
+  const forkAtMessageIndex =
+    options.forkAtMessageIndex === undefined
+      ? requested
+      : resolveEffectiveForkIndex(options.agentCommand, requested);
+
+  return {
+    sourceRecord,
+    forkAtMessageIndex,
+    // Populated ONLY on a mismatch, so the common case stays byte-identical to
+    // baseline and the field's mere presence means "these two differ".
+    ...(forkAtMessageIndex === requested ? {} : { requestedForkAtMessageIndex: requested }),
+  };
 }
 
 // Decide how a fork's model gets applied. Durable Claude forks return an
@@ -456,7 +499,8 @@ async function forkSessionRecordWithClient(
   options: SessionCreateOptions,
   cwd: string,
 ): Promise<ForkedSessionState> {
-  const { sourceRecord, forkAtMessageIndex } = await resolveForkSourceContext(options);
+  const { sourceRecord, forkAtMessageIndex, requestedForkAtMessageIndex } =
+    await resolveForkSourceContext(options);
 
   if (!client.supportsForkSession()) {
     throw new Error(
@@ -496,6 +540,9 @@ async function forkSessionRecordWithClient(
       forkContext: {
         sourceRecord,
         forkAtMessageIndex,
+        ...(requestedForkAtMessageIndex === undefined ? {} : { requestedForkAtMessageIndex }),
+        // Truncated at the EFFECTIVE boundary, so the record's own message count
+        // agrees with the index it reports (row `G1-FRK-01`).
         messages: sourceRecord.messages.slice(0, forkAtMessageIndex),
       },
     };

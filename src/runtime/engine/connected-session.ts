@@ -9,6 +9,7 @@ import {
   ownerOptionsToInput,
 } from "../../session/owner-options.js";
 import { absolutePath, isoNow } from "../../session/persistence.js";
+import { DEFAULT_PERMISSION_MODE } from "../../types.js";
 import type {
   AcpPermissionDecision,
   AcpPermissionRequest,
@@ -102,7 +103,11 @@ export async function withConnectedSession<T>(
     await options.saveRecord(record);
   }
   const ownerOptions = resolveSessionOwnerOptions(record, {
-    permissionMode: options.permissionMode ?? "approve-reads",
+    // The runtime fallback for a caller that supplied no mode at all. It reads
+    // the SAME constant as the CLI/config-file default rather than repeating the
+    // literal — see DEFAULT_PERMISSION_MODE in src/types.ts for the ruling, the
+    // surfaces that read it, and the one decided asymmetry.
+    permissionMode: options.permissionMode ?? DEFAULT_PERMISSION_MODE,
     nonInteractivePermissions: options.nonInteractivePermissions,
     authPolicy: options.authPolicy,
     terminal: options.terminal,

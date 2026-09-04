@@ -1,6 +1,5 @@
+import { isClaudeFamilyAgent } from "../../acp/agent-command.js";
 import type { EffectiveAccountMetadata } from "../../acp/auth-env.js";
-import { splitCommandLine } from "../../acp/client-process.js";
-import { isCodexAcpCommand } from "../../acp/codex-compat.js";
 import {
   effectiveAccountMetadataFromValue,
   formatErrorMessage,
@@ -518,39 +517,37 @@ function defaultProfileId(loadOpts?: SubscriptionLookupOptions): string | undefi
   return loadProfileRegistry(loadOpts).default?.trim() || undefined;
 }
 
-// A codex session authenticates from its native ~/.codex (a `chatgpt` profile, or
-// no profile at all — native auth). It is the only adapter that legitimately
-// carries no stored profile, so it is the only one that reaches the default
-// fallback below. The registry `default` is a Claude *subscription* profile; the
-// codex adapter rejects any non-chatgpt profile at turn auth. Detect codex records
-// so we can withhold that fallback rather than force an incompatible profile onto
-// them. (brick://792ad0a4)
-function recordUsesCodexAdapter(record: SessionRecord): boolean {
-  const agentCommand = record.agentCommand;
-  if (!agentCommand) {
-    return false;
-  }
-  const split = splitCommandLine(agentCommand);
-  return isCodexAcpCommand(split.command, split.args);
-}
-
 function selectedProfileId(
   record: SessionRecord,
   loadOpts?: SubscriptionLookupOptions,
 ): string | undefined {
+  // The Claude-family gate comes FIRST, ahead of the stored value, because a
+  // stored `profile` on a non-Claude record is exactly the corruption this
+  // programme is repairing: a record already wedged by the pre-fix selector
+  // must not keep being treated as subscription-backed on the strength of the
+  // wrong field it was given. Reading the record's own agent command is the
+  // authority; the stored profile is not.
+  //
+  // Resolving to `undefined` here leaves the session on its native auth:
+  // currentProfile() / failoverEnabledForRecord() / selectSubscriptionBeforeTurn()
+  // / enforceSubscriptionLockBeforeTurn() all no-op for it.
+  //
+  // ⚠️ THIS WAS A CODEX-ONLY CARVE-OUT (`recordUsesCodexAdapter`), and the
+  // generalisation is the fix, not a tidy-up. The registry `default` is a Claude
+  // *subscription* profile, so any profile-less record fell through to it and the
+  // pre-turn selector then treated the session as subscription-backed and
+  // persisted an incompatible profile. For codex that was measured killing every
+  // turn in ~13 ms (brick://792ad0a4). For OpenCode and Pi it is the same defect
+  // with a worse ending: the persisted `account_switch` makes the resume gate
+  // demand a Claude SDK transcript JSONL those harnesses can never produce, so
+  // the session is not merely failing — it is unusable for good (I1 D1 / I2 §5,
+  // CONCEPTION §5.5). One predicate, one place, every non-Claude adapter.
+  if (!isClaudeFamilyAgent(record.agentCommand)) {
+    return undefined;
+  }
   const stored = storedSelectionId(record);
   if (stored !== undefined) {
     return stored;
-  }
-  // Do NOT fall back to the registry default (a Claude subscription) for a codex
-  // session: that made the pre-turn subscription selector treat the session as
-  // subscription-backed and persist an incompatible profile, which the codex
-  // adapter then rejected at turn auth — killing every codex-session turn in ~13ms
-  // (brick://792ad0a4, regressed by the subauto pre-turn selector). Resolving to
-  // `undefined` leaves codex on native auth: currentProfile()/failoverEnabledForRecord/
-  // selectSubscriptionBeforeTurn all no-op for it, exactly as before subauto.
-  if (recordUsesCodexAdapter(record)) {
-    return undefined;
   }
   return defaultProfileId(loadOpts);
 }

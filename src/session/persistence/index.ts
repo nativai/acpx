@@ -64,7 +64,17 @@ export type SessionIndexEntry = {
    */
   parentSessionUrl?: string;
   forkedFromSessionId?: string;
+  /** The EFFECTIVE fork boundary (see SessionRecord.forkedAtMessageIndex). */
   forkedAtMessageIndex?: number;
+  /**
+   * The REQUESTED fork boundary, present only when it differs from the
+   * effective one. Projected onto the index entry — NOT only into the detail
+   * view — because the chat header reads its view from the entry on the enriched
+   * hot path (acpx-ui `projectEntryToRawView`, where `sessionData` is null), so a
+   * field that stops here fails only at RUNTIME while typecheck and build stay
+   * green. CONCEPTION 9.3 leg 4.
+   */
+  forkedAtMessageIndexRequested?: number;
   metadataTaskFolder?: string;
   metadataBrick?: string;
   // Infra-label (brick 2ac729a4): metadata.infra projected as hot-path scalars so
@@ -312,6 +322,7 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     parentSessionUrl: optionalString(record.parentSessionUrl),
     forkedFromSessionId: optionalString(record.forkedFromSessionId),
     forkedAtMessageIndex: optionalFiniteNumber(record.forkedAtMessageIndex),
+    forkedAtMessageIndexRequested: optionalFiniteNumber(record.forkedAtMessageIndexRequested),
     metadataTaskFolder: optionalString(record.metadataTaskFolder),
     metadataBrick: optionalString(record.metadataBrick),
     metadataInfra: optionalBoolean(record.metadataInfra),
@@ -425,6 +436,7 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     parentSessionUrl: record.parentSessionUrl,
     forkedFromSessionId: record.forkedFromSessionId,
     forkedAtMessageIndex: record.forkedAtMessageIndex,
+    forkedAtMessageIndexRequested: record.forkedAtMessageIndexRequested,
     metadataTaskFolder: metadata?.task_folder,
     metadataBrick: metadata?.brick,
     // Infra label (brick 2ac729a4): flat string keys → hot-path index scalars.

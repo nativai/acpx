@@ -52,6 +52,31 @@ export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 export const PERMISSION_MODES = ["approve-all", "approve-reads", "deny-all"] as const;
 export type PermissionMode = (typeof PERMISSION_MODES)[number];
 
+/**
+ * THE ENFORCED PERMISSION DEFAULT — one value, read by every permission surface.
+ *
+ * Daniel, 2026-09-03 23:17:00Z (program DECISIONS.md row "7 (amended)"): agents
+ * must *"always have our permissions"*; approve-all is *"the enforced default,
+ * NOT a per-spawn flag"*. The dev box is the boundary — an agent may do what its
+ * own process may do.
+ *
+ * ⚠️ **Change it HERE, never at a surface, and never by adding a second
+ * default.** It is read by the CLI/config-file default (`src/cli/config.ts`) and
+ * by the runtime fallback for a caller that passes no mode at all
+ * (`src/runtime/engine/connected-session.ts`). `terminal/create` needs no code
+ * of its own: `TerminalManager.isExecuteApproved`'s FIRST branch already returns
+ * `true` for `"approve-all"`, so this constant IS the terminal fix. Hand-patching
+ * that surface instead is how two places come to disagree about one fact — the
+ * defect class the capability descriptor exists to end.
+ *
+ * ⚠️ **Known and decided asymmetry, recorded so it is not rediscovered as a
+ * surprise:** an explicit `--deny-all` still binds `terminal/create` (it reaches
+ * `isExecuteApproved` and denies) but does NOT bind `session/request_permission`,
+ * where the short-circuit in `src/permissions.ts` is unconditional by the ruling
+ * above. WS-core, 2026-09-04, filed as its own item.
+ */
+export const DEFAULT_PERMISSION_MODE: PermissionMode = "approve-all";
+
 export const AUTH_POLICIES = ["skip", "fail"] as const;
 export type AuthPolicy = (typeof AUTH_POLICIES)[number];
 
@@ -824,7 +849,20 @@ export type SessionRecord = {
    */
   parentSessionUrl?: string;
   forkedFromSessionId?: string;
+  /**
+   * The message index the fork ACTUALLY landed on — the effective boundary, not
+   * the requested one. For a `turn-granular` harness (codex: 2 acpx messages =
+   * 1 turn, rounding down) an odd request lands lower, and this field reports
+   * where it landed. See `forkedAtMessageIndexRequested` below.
+   */
   forkedAtMessageIndex?: number;
+  /**
+   * The index that was ASKED for, present ONLY when it differs from
+   * `forkedAtMessageIndex` above. Its presence IS the signal that the fork did
+   * not land where it was asked to, so the common case stays byte-identical to a
+   * pre-B0.2 record and no consumer has to compare two always-present numbers.
+   */
+  forkedAtMessageIndexRequested?: number;
   subagents?: SubagentRef[];
   metadata?: Record<string, string>;
   importedFrom?: SessionImportedFrom;

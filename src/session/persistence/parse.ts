@@ -1281,6 +1281,13 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     return null;
   }
 
+  const forkedAtMessageIndexRequested = normalizeOptionalNonNegativeInteger(
+    record.forked_at_message_index_requested,
+  );
+  if (forkedAtMessageIndexRequested === null) {
+    return null;
+  }
+
   const metadata = parseMetadata(record.metadata);
   if (metadata === null) {
     return null;
@@ -1328,6 +1335,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
       parentSessionUrl: parentSessionUrl ?? undefined,
       forkedFromSessionId: forkedFromSessionId ?? undefined,
       forkedAtMessageIndex: forkedAtMessageIndex ?? undefined,
+      forkedAtMessageIndexRequested: forkedAtMessageIndexRequested ?? undefined,
       subagents: parseSubagentRefs(record.subagents),
       metadata,
       importedFrom: recordMetadata.importedFrom,

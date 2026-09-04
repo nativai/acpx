@@ -6003,6 +6003,13 @@ test("queued prompt failures emit exactly one JSON error event", async () => {
           cwd,
           "--format",
           "json",
+          // ⚠️ EXPLICIT `--approve-reads` — B0.2 moved the DEFAULT permission mode
+          // to `approve-all` (DEFAULT_PERMISSION_MODE, src/types.ts), so a bare
+          // spawn now APPROVES this write and the queued-failure path these three
+          // tests exist to exercise never fires. The flag restores exactly the
+          // pre-B0.2 condition, and asserting on code 5 below doubles as the pin
+          // that an EXPLICIT mode still binds the FILESYSTEM surface.
+          "--approve-reads",
           "--non-interactive-permissions",
           "fail",
           "codex",
@@ -6088,6 +6095,13 @@ test("json-strict queued prompt failure emits JSON-RPC lines only", async () => 
           "--format",
           "json",
           "--json-strict",
+          // ⚠️ EXPLICIT `--approve-reads` — B0.2 moved the DEFAULT permission mode
+          // to `approve-all` (DEFAULT_PERMISSION_MODE, src/types.ts), so a bare
+          // spawn now APPROVES this write and the queued-failure path these three
+          // tests exist to exercise never fires. The flag restores exactly the
+          // pre-B0.2 condition, and asserting on code 5 below doubles as the pin
+          // that an EXPLICIT mode still binds the FILESYSTEM surface.
+          "--approve-reads",
           "--non-interactive-permissions",
           "fail",
           "codex",
@@ -6168,6 +6182,13 @@ test("queued prompt failures remain visible in quiet mode", async () => {
           cwd,
           "--format",
           "quiet",
+          // ⚠️ EXPLICIT `--approve-reads` — B0.2 moved the DEFAULT permission mode
+          // to `approve-all` (DEFAULT_PERMISSION_MODE, src/types.ts), so a bare
+          // spawn now APPROVES this write and the queued-failure path these three
+          // tests exist to exercise never fires. The flag restores exactly the
+          // pre-B0.2 condition, and asserting on code 5 below doubles as the pin
+          // that an EXPLICIT mode still binds the FILESYSTEM surface.
+          "--approve-reads",
           "--non-interactive-permissions",
           "fail",
           "codex",

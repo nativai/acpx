@@ -494,7 +494,7 @@ test("enforceSubscriptionLockBeforeTurn blocks locked current subscription when 
       const record = makeSessionRecord({
         acpxRecordId: "rec",
         acpSessionId: "acp",
-        agentCommand: "node claude-agent.js",
+        agentCommand: "node /opt/claude-agent-acp/dist/index.js",
         cwd: "/tmp/project",
         acpx: { session_options: { profile: "sub1", auto_failover: false } },
       });
@@ -512,7 +512,7 @@ test("enforceSubscriptionLockBeforeTurn uses lock-specific all-locked error when
     const record = makeSessionRecord({
       acpxRecordId: "rec",
       acpSessionId: "acp",
-      agentCommand: "node claude-agent.js",
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
       cwd: "/tmp/project",
       acpx: { session_options: { profile: "sub1" } },
     });
@@ -532,7 +532,7 @@ test("enforceSubscriptionLockBeforeTurn preserves exhausted semantics when unloc
       const record = makeSessionRecord({
         acpxRecordId: "rec",
         acpSessionId: "acp",
-        agentCommand: "node claude-agent.js",
+        agentCommand: "node /opt/claude-agent-acp/dist/index.js",
         cwd: "/tmp/project",
         acpx: { session_options: { profile: "sub1" } },
       });
@@ -673,7 +673,7 @@ function selectionRecord(): SessionRecord {
   return makeSessionRecord({
     acpxRecordId: "rec-forced",
     acpSessionId: "acp",
-    agentCommand: "node claude-agent.js",
+    agentCommand: "node /opt/claude-agent-acp/dist/index.js",
     cwd: "/tmp/project",
     acpx: { session_options: { profile: "current" } },
   });
