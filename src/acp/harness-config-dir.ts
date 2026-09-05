@@ -876,18 +876,18 @@ function writePiModelsStore(
   modelId: string,
   files: string[],
 ): void {
-  const models = readBoxPiOpenRouterModels(env).map((model) =>
-    model.api === "anthropic-messages" && model.baseUrl === OPENROUTER_API_BASE_NO_V1
-      ? { ...model, baseUrl: OPENROUTER_API_BASE }
-      : model,
-  );
+  // The box's catalogue is parsed fresh from disk on every call, so mutating the
+  // entries here cannot reach anything else.
+  const models = readBoxPiOpenRouterModels(env);
+  for (const model of models) {
+    if (model.api === "anthropic-messages" && model.baseUrl === OPENROUTER_API_BASE_NO_V1) {
+      model.baseUrl = OPENROUTER_API_BASE;
+    }
+  }
 
-  const index = models.findIndex((model) => model.id === modelId);
-  if (index >= 0) {
-    // Already known: keep every field pi has for it. Only the baseUrl repair
-    // above may have touched it.
-    models[index] = { ...models[index] };
-  } else {
+  // A slug the catalogue already carries needs nothing: it keeps every field pi
+  // has for it, including the `thinkingLevelMap` the depth ladder is derived from.
+  if (!models.some((model) => model.id === modelId)) {
     models.push({
       id: modelId,
       name: modelId,

@@ -237,7 +237,7 @@ test("pi DOES get a generated models-store.json now that the merge semantics are
     // Same split as the row this replaces: acpx's own bookkeeping is judged apart
     // from what the harness consumes, so a NEW entry in either still fails here.
     const harnessVisible = written.filter((entry) => !entry.startsWith("."));
-    assert.deepEqual(harnessVisible.sort(), ["APPEND_SYSTEM.md", "models-store.json"]);
+    assert.deepEqual(harnessVisible.toSorted(), ["APPEND_SYSTEM.md", "models-store.json"]);
     assert.deepEqual(
       written.filter((entry) => entry.startsWith(".")),
       [".acpx-holders"],
