@@ -178,6 +178,15 @@ test("acpx agents --json prints the {agents: [...]} envelope", async () => {
       "primerChannel",
       "usageReporting",
       "promptImages",
+      // brick 82a2aafd — the six keys the consumer's three capability readers
+      // gate on. Present on EVERY block, always, so "the key is absent" stays a
+      // reliable signal for "this acpx is too old to answer".
+      "supportsSessionClear",
+      "sessionClearReason",
+      "canSetCredentialLive",
+      "credentialLiveReason",
+      "supportsModelDegrade",
+      "modelDegradeReason",
     ]) {
       assert.ok(Object.hasOwn(agent, field), `${String(agent.id)} is missing ${field}`);
     }
@@ -237,4 +246,36 @@ test("the text form renders a table naming each harness and its mechanism", asyn
     stdout.includes("does NOT land where it was asked to"),
     "the turn-granular rounding is not explained",
   );
+});
+
+test("the DETAIL text view carries the three brick-82a2aafd capabilities WITH their reasons", async () => {
+  // Why the text view is pinned at all: `renderDetail` enumerates fields
+  // explicitly, so a capability can reach `--json` and silently NOT the text
+  // view. A human then sees every other capability, does not see this one, and
+  // reads the absence as "acpx has nothing to say" — the half-satisfied form of
+  // the requirement that this be browsable for agents via the CLI.
+  const measured = await runAgents(["show", "claude"]);
+  for (const label of ["session clear:", "credential live:", "model degrade:"]) {
+    assert.ok(measured.includes(label), `claude detail view omits "${label}"`);
+  }
+  // claude answers true to all three, so it must carry NO why-not line: a
+  // capability that works must not display a denial.
+  for (const label of ["clear why-not:", "cred. why-not:", "degrade why-not:"]) {
+    assert.equal(measured.includes(label), false, `claude shows "${label}" for a true capability`);
+  }
+
+  // pi answers false to all three, and the reasons are the ONLY place a human can
+  // tell an unmeasured cell from a measured denial. A bare `false` here would
+  // recreate the confident-false defect in the text view.
+  const denied = await runAgents(["show", "pi"]);
+  for (const label of ["clear why-not:", "cred. why-not:", "degrade why-not:"]) {
+    assert.ok(denied.includes(label), `pi detail view omits "${label}" — the reason is not shown`);
+  }
+  assert.ok(
+    denied.includes("not measured:"),
+    "pi's unmeasured cell renders without its `not measured:` token, so it reads as a measured denial",
+  );
+  // Control: the assertions above must be examining a populated render, not an
+  // empty string that trivially satisfies the negative checks.
+  assert.ok(denied.includes("session clear:") && denied.length > 200);
 });

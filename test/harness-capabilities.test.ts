@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
-import { resolvePrimerChannel } from "../src/acp/agent-command.js";
+import { isClaudeFamilyAgent, resolvePrimerChannel } from "../src/acp/agent-command.js";
 import {
   ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR,
   ARBITRARY_MODEL_SUPPORT_ROUTED_BY_ACPX,
@@ -608,4 +608,328 @@ test("the SHIPPED per-harness provisioning list is what the derivation defaults 
   // ⇒ **When J2 answers MERGE, change this row and cite that measurement.** Do
   // not delete it because it is in the way; the list is deliberately narrow, and
   // an entry added without its measurement re-creates the bug B5 fixed.
+});
+
+// ── brick 82a2aafd (discharges 29b8ce8a): the three fields acpx-ui decided by NAME ─
+//
+// Context for whoever reads a red here: before this block, acpx-ui answered
+// `supportsSessionClear` / `canSetCredentialLive` / `supportsModelDegrade` with
+// `agentType === "claude"`-shaped checks while taking the descriptor and ignoring
+// it — so pi's and opencode's values were measured against NO adapter and no
+// adapter swap could ever change them. ZERO test files asserted these three;
+// `canSetModelLive` was asserted in two, as the control. These tests are what
+// makes the six keys a contract rather than a claim.
+
+const CLEAR_REASON_KEY = "sessionClearReason" as const;
+const CREDENTIAL_REASON_KEY = "credentialLiveReason" as const;
+const DEGRADE_REASON_KEY = "modelDegradeReason" as const;
+
+const CAPABILITY_REASON_PAIRS = [
+  ["supportsSessionClear", CLEAR_REASON_KEY],
+  ["canSetCredentialLive", CREDENTIAL_REASON_KEY],
+  ["supportsModelDegrade", DEGRADE_REASON_KEY],
+] as const;
+
+const NOT_MEASURED = "not measured:";
+
+test("all six keys are PRESENT on all five blocks, and every boolean is a real boolean", () => {
+  const capabilities = listHarnessCapabilities();
+
+  // POSITIVE CONTROL, in the same assertion and in the same shape as the
+  // permission-field test above: an instrument pointed at [] or at rows missing
+  // their populated cells would report "all present" while examining nothing.
+  assert.equal(capabilities.length, 5);
+  for (const capability of capabilities) {
+    assert.ok(
+      typeof capability.label === "string" && capability.label.length > 0,
+      `${capability.id}: the row itself is not populated — the presence checks below examine nothing`,
+    );
+
+    const row = capability as unknown as Record<string, unknown>;
+    for (const [booleanKey, reasonKey] of CAPABILITY_REASON_PAIRS) {
+      // ABSENCE SEMANTICS ARE FROZEN: the consumer distinguishes "acpx measured a
+      // denial" from "this acpx is too old to answer" by whether the KEY EXISTS.
+      // A missing key, a null boolean or a placeholder moves its token behaviour
+      // from correct to wrong SILENTLY — the only way this contract fails quietly.
+      assert.ok(Object.hasOwn(row, booleanKey), `${capability.id}: ${booleanKey} key is absent`);
+      assert.ok(Object.hasOwn(row, reasonKey), `${capability.id}: ${reasonKey} key is absent`);
+      assert.equal(
+        typeof row[booleanKey],
+        "boolean",
+        `${capability.id}: ${booleanKey} is ${String(row[booleanKey])}, not a boolean`,
+      );
+      const reason = row[reasonKey];
+      assert.ok(
+        reason === null || (typeof reason === "string" && reason.trim().length > 0),
+        `${capability.id}: ${reasonKey} must be null or a non-empty string, got ${JSON.stringify(reason)}`,
+      );
+    }
+  }
+
+  // And they SERIALIZE — the wire is JSON, and a key that survives an in-memory
+  // read but not `JSON.stringify` reaches the consumer as "descriptor absent".
+  const wire = JSON.parse(JSON.stringify(capabilities)) as Record<string, unknown>[];
+  for (const row of wire) {
+    for (const [booleanKey, reasonKey] of CAPABILITY_REASON_PAIRS) {
+      assert.ok(
+        Object.hasOwn(row, booleanKey),
+        `${String(row.id)}: ${booleanKey} lost on the wire`,
+      );
+      assert.ok(Object.hasOwn(row, reasonKey), `${String(row.id)}: ${reasonKey} lost on the wire`);
+    }
+  }
+});
+
+test("each reason is null IFF its boolean is true — the derivation, in both directions", () => {
+  for (const capability of listHarnessCapabilities()) {
+    const row = capability as unknown as Record<string, unknown>;
+    for (const [booleanKey, reasonKey] of CAPABILITY_REASON_PAIRS) {
+      if (row[booleanKey] === true) {
+        assert.equal(
+          row[reasonKey],
+          null,
+          `${capability.id}: ${reasonKey} is set while ${booleanKey} is true — a control that works must carry no denial`,
+        );
+      } else {
+        assert.ok(
+          typeof row[reasonKey] === "string" && row[reasonKey].length > 20,
+          `${capability.id}: ${booleanKey} is false with an empty or generic ${reasonKey} — a padlock with no reason is the silent dead control this table exists to replace`,
+        );
+      }
+    }
+  }
+});
+
+test("the null-IFF-true rule is the DERIVATION's, not the table's — flipping a fact flips the reason", () => {
+  // The regression pin for the structural invariant: `deriveHarnessCapabilities`
+  // is the only producer, so this must hold for a synthetic row too — otherwise
+  // a future edit could satisfy the table-wide test above by hand-writing nulls.
+  const facts = HARNESS_FACTS.pi;
+
+  const denied = deriveHarnessCapabilities({ ...facts, supportsSessionClear: false });
+  assert.equal(denied.supportsSessionClear, false);
+  assert.equal(denied.sessionClearReason, facts.sessionClearBlockedReason);
+
+  const allowed = deriveHarnessCapabilities({ ...facts, supportsSessionClear: true });
+  assert.equal(allowed.supportsSessionClear, true);
+  assert.equal(allowed.sessionClearReason, null);
+
+  const credentialAllowed = deriveHarnessCapabilities({ ...facts, canSetCredentialLive: true });
+  assert.equal(credentialAllowed.credentialLiveReason, null);
+  const degradeAllowed = deriveHarnessCapabilities({ ...facts, supportsModelDegrade: true });
+  assert.equal(degradeAllowed.modelDegradeReason, null);
+
+  // The BLOCKED reasons are internal: they must never reach the wire under their
+  // own names, or a consumer would read a denial that is not in force.
+  const wire = deriveHarnessCapabilities(facts) as unknown as Record<string, unknown>;
+  for (const internal of [
+    "sessionClearBlockedReason",
+    "credentialLiveBlockedReason",
+    "modelDegradeBlockedReason",
+  ]) {
+    assert.equal(Object.hasOwn(wire, internal), false, `${internal} leaked onto the wire`);
+  }
+});
+
+test("the `not measured:` token accompanies false, never true — and its cell is still a present, real boolean", () => {
+  let tokenCells = 0;
+  for (const capability of listHarnessCapabilities()) {
+    const row = capability as unknown as Record<string, unknown>;
+    for (const [booleanKey, reasonKey] of CAPABILITY_REASON_PAIRS) {
+      const reason = row[reasonKey];
+      if (typeof reason !== "string" || !reason.startsWith(NOT_MEASURED)) {
+        continue;
+      }
+      tokenCells += 1;
+      // An honest-unmeasured cell decaying into a confident denial — or worse,
+      // into an unmeasured `true` — is the failure mode this pins.
+      assert.equal(
+        row[booleanKey],
+        false,
+        `${capability.id}: ${booleanKey} is true while ${reasonKey} says "${NOT_MEASURED}"`,
+      );
+      assert.ok(
+        reason.length > NOT_MEASURED.length + 20,
+        `${capability.id}: "${NOT_MEASURED}" must be followed by WHAT is missing, not stand alone`,
+      );
+      // The token is a PREFIX, never a phrase buried mid-sentence: the consumer
+      // separates the three states with `startsWith`.
+      assert.equal(
+        reason.indexOf(NOT_MEASURED),
+        0,
+        `${capability.id}: the token must lead the reason`,
+      );
+    }
+  }
+  // Control: if nobody is using the token, the assertions above ran on nothing —
+  // and an all-measured table is a claim this brick deliberately did not make.
+  assert.ok(
+    tokenCells > 0,
+    "no cell carries the `not measured:` token — the loop asserted nothing",
+  );
+
+  // ⚠️ THE LOOP ABOVE CANNOT CATCH THE CASE THIS TEST IS NAMED FOR, AND THAT IS
+  // WHY THIS SECOND LOOP EXISTS. Measured, not reasoned: a mutation flipping
+  // `pi.supportsSessionClear` false→true left this test GREEN, because the
+  // derivation NULLS the reason when the boolean is true — so the `not measured:`
+  // string it inspects is exactly the thing that disappears. An honest-unmeasured
+  // cell decaying into a confident `true` is invisible on the wire and must be
+  // asserted on the FACTS, where the blocked reason is always present.
+  let factTokenCells = 0;
+  for (const id of HARNESS_IDS) {
+    const facts = HARNESS_FACTS[id] as unknown as Record<string, unknown>;
+    for (const [booleanKey, reasonKey] of CAPABILITY_REASON_PAIRS) {
+      const blockedKey = `${reasonKey.replace(/Reason$/, "")}BlockedReason`;
+      const blocked = facts[blockedKey];
+      assert.equal(typeof blocked, "string", `${id}: ${blockedKey} must be a plain string`);
+      if (!(blocked as string).startsWith(NOT_MEASURED)) {
+        continue;
+      }
+      factTokenCells += 1;
+      assert.equal(
+        facts[booleanKey],
+        false,
+        `${id}: ${booleanKey} is true while ${blockedKey} still says "${NOT_MEASURED}" — either measure it and rewrite the reason, or leave it false`,
+      );
+    }
+  }
+  assert.ok(
+    factTokenCells > 0,
+    "no FACTS cell carries the token — the second loop asserted nothing",
+  );
+
+  // `descriptor absent:` is the CONSUMER's token for an acpx too old to answer.
+  // acpx must never emit it: doing so would make a served descriptor
+  // indistinguishable from no descriptor at all.
+  assert.equal(
+    JSON.stringify(listHarnessCapabilities()).includes("descriptor absent:"),
+    false,
+    "acpx emitted the consumer's `descriptor absent:` token",
+  );
+});
+
+test("canSetCredentialLive agrees with the seam acpx actually enforces, per ADAPTER", () => {
+  // The behavioural pin, in the same shape as the model-gate test above: the cell
+  // is checked against the shipped predicate that would refuse the move, not
+  // against a remembered list. `switchSessionAccount` admits a record only through
+  // `assertClaudeFamilySeam` → `isClaudeFamilyAgent(record.agentCommand)`
+  // (src/runtime/engine/account-seam.ts:187, src/acp/agent-command.ts:226), so a
+  // harness declaring `true` that the seam refuses would ship a control that
+  // throws, and a harness declaring `false` that the seam admits would hide one
+  // that works.
+  for (const id of HARNESS_IDS) {
+    assert.equal(
+      HARNESS_FACTS[id].canSetCredentialLive,
+      isClaudeFamilyAgent(DEFAULT_AGENT_COMMANDS[id]),
+      `${id}: the declared credential-move capability disagrees with acpx's own seam predicate`,
+    );
+  }
+  // Control on the predicate itself, so a stubbed-out `isClaudeFamilyAgent`
+  // returning a constant cannot make the loop pass.
+  assert.equal(isClaudeFamilyAgent(DEFAULT_AGENT_COMMANDS.claude), true);
+  assert.equal(isClaudeFamilyAgent(DEFAULT_AGENT_COMMANDS.opencode), false);
+});
+
+test("canSetCredentialLive is NOT supportsProfiles — codex is the discriminator", () => {
+  // The single most likely wrong "simplification" of this field, and the reason
+  // the consumer's own note calls it out: `supportsProfiles` asks whether a
+  // profile can be bound AT CREATION. codex answers yes to that and no to this,
+  // because `transcriptAnchorDir` is null for `chatgpt` (src/config/profiles.ts)
+  // and `assertClaudeFamilySeam` refuses the adapter outright.
+  assert.equal(HARNESS_FACTS.codex.supportsProfiles, true);
+  assert.equal(HARNESS_FACTS.codex.canSetCredentialLive, false);
+  assert.match(
+    String(deriveHarnessCapabilities(HARNESS_FACTS.codex).credentialLiveReason),
+    /Claude-family/,
+  );
+});
+
+test("no non-Claude-family harness may declare supportsModelDegrade", () => {
+  // One-way behavioural pin against the shipped gate. The Fable→Opus degrade is
+  // reachable only inside the subscription failover engine, and
+  // `selectedProfileId` (src/runtime/engine/failover.ts:520-554) returns undefined
+  // for a non-Claude adapter BEFORE reading any stored profile — so
+  // `failoverEnabledForRecord` is false and the engine never runs. Declaring
+  // `true` there would advertise a degrade that cannot fire.
+  for (const id of HARNESS_IDS) {
+    if (HARNESS_FACTS[id].supportsModelDegrade) {
+      assert.equal(
+        isClaudeFamilyAgent(DEFAULT_AGENT_COMMANDS[id]),
+        true,
+        `${id}: declares a model degrade, but its adapter never enters the failover engine that owns it`,
+      );
+    }
+  }
+  assert.equal(HARNESS_FACTS.claude.supportsModelDegrade, true); // control: the loop had a subject
+});
+
+test("the three cells are per-harness FACTS, not one answer repeated", () => {
+  // The defect being fixed was that all three were `agentType === "claude"`. If a
+  // future edit collapses them back onto one answer, this goes red: the three
+  // fields must not agree across all five harnesses.
+  const rows = listHarnessCapabilities();
+  const clear = rows.map((row) => row.supportsSessionClear);
+  const credential = rows.map((row) => row.canSetCredentialLive);
+  const degrade = rows.map((row) => row.supportsModelDegrade);
+  assert.notDeepEqual(
+    clear,
+    credential,
+    "supportsSessionClear and canSetCredentialLive answer identically for all five harnesses — that is the collapsed name check returning",
+  );
+  assert.deepEqual(clear, degrade); // both are claude-only TODAY; see the row pins below
+
+  // And the per-harness pins, so a silent flip of any one cell is a red rather
+  // than a diff nobody reads. Each cites where its value comes from.
+  assert.deepEqual(
+    rows.map((row) => [row.id, row.supportsSessionClear] as const),
+    [
+      ["claude", true], // Claude Code 2.1.251 defines the `/clear` slash command
+      ["claude-pty", false], // not measured: prompt→TUI slash execution unprobed
+      ["codex", false], // not measured
+      ["opencode", false], // not measured
+      ["pi", false], // not measured, and fork-vs-upstream dependent
+    ],
+  );
+  assert.deepEqual(
+    rows.map((row) => [row.id, row.canSetCredentialLive] as const),
+    [
+      ["claude", true], // Claude-family seam + subscription anchor
+      ["claude-pty", true], // Claude-family seam + claude-home anchor
+      ["codex", false], // seam refuses; chatgpt has no transcript anchor
+      ["opencode", false], // box-provider credential; no AuthMode maps to it
+      ["pi", false], // box-provider credential; no AuthMode maps to it
+    ],
+  );
+  assert.deepEqual(
+    rows.map((row) => [row.id, row.supportsModelDegrade] as const),
+    [
+      ["claude", true], // brick://4d517be2, the harness the path was built for
+      ["claude-pty", false], // not measured: gate admits it, trigger looks unreachable
+      ["codex", false], // chatgpt profile never enters the failover engine
+      ["opencode", false], // non-Claude adapter never enters the failover engine
+      ["pi", false], // non-Claude adapter never enters the failover engine
+    ],
+  );
+});
+
+test("the reason-key NAMING RULE holds, and its one legacy exception is still the only one", () => {
+  // The rule: strip the capability prefix (`supports` / `canSet`), add `Reason`.
+  // Written as a test so the NEXT field answers itself instead of being guessed.
+  const row = deriveHarnessCapabilities(HARNESS_FACTS.opencode) as unknown as Record<
+    string,
+    unknown
+  >;
+  for (const [booleanKey, reasonKey] of CAPABILITY_REASON_PAIRS) {
+    const stripped = booleanKey.replace(/^(supports|canSet)/, "");
+    const expected = `${stripped.charAt(0).toLowerCase()}${stripped.slice(1)}Reason`;
+    assert.equal(reasonKey, expected, `${booleanKey}'s reason key breaks the naming rule`);
+    assert.ok(Object.hasOwn(row, expected));
+  }
+  // THE NAMED EXCEPTION: `canSetModelLive` would give `modelLiveReason` under the
+  // rule and is `liveModelChangeReason` instead — a legacy one-off, deliberately
+  // NOT renamed because it is on the wire and consumed. Pinned so the exception
+  // stays exactly one field wide: if a later edit "fixes" the name for symmetry,
+  // this goes red and the consumer is not broken silently.
+  assert.ok(Object.hasOwn(row, "liveModelChangeReason"));
+  assert.equal(Object.hasOwn(row, "modelLiveReason"), false);
 });
