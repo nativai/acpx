@@ -273,10 +273,16 @@ export interface HarnessCapabilities {
    *
    * The mechanism is a passthrough: acpx-ui posts the literal prompt text
    * `/clear` (`ChatView.tsx:5012-5024` at acpx-ui `6a45e58`) and acpx forwards it
-   * verbatim — **acpx itself has no `/clear` concept anywhere** (measured: zero
-   * occurrences in `src/`). So this cell asks whether the HARNESS executes
-   * `/clear` as a slash command rather than answering it as an ordinary user
-   * message.
+   * verbatim — **acpx has no `/clear` handling of its own**: measured on the
+   * PRE-state of this commit with `/bin/grep -ra` over `src/`, planted positive
+   * control fired and vanished on removal, zero occurrences outside a
+   * `set/clear` substring in `mode-preference.ts`. (Stated narrowly on purpose.
+   * An earlier draft of this comment said acpx has "no `/clear` concept
+   * anywhere", which over-reached: `isSlashCommandRecord`
+   * (`src/acp/claude-fork-index.ts:330-342`) is a slash-command concept — see the
+   * claude cell, where it is evidence.) So this cell asks whether the HARNESS
+   * executes `/clear` as a slash command rather than answering it as an ordinary
+   * user message.
    *
    * ⚠️ A wrong `true` here is the silent-wrong-answer class: the client draws the
    * context boundary from the presence of its own `/clear` message, so a harness
@@ -655,9 +661,18 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
     //   name:"clear",description:"Start a new session with empty context; previous
     //   session stays on disk (resumable with /resume)"
     // — so `/clear` is a real slash command of the harness, not text it answers.
-    // NOT measured: that the SDK path claude-agent-acp drives EXECUTES it (the
-    // adapter itself has ZERO `/clear` occurrences in /opt/claude-agent-acp/dist,
-    // control `session/new` = 6 — it forwards the text untouched). `true` is what
+    // PARTIALLY measured on the remaining link, and the evidence is inside acpx:
+    // `isSlashCommandRecord` (src/acp/claude-fork-index.ts:330-342) classifies
+    // Claude transcript records whose content begins `<command-name>` /
+    // `<local-command-stdout>` / `<local-command-stderr>` / `<command-message>` —
+    // the wrappers Claude Code writes when it EXECUTES a slash command, not when
+    // it answers text. acpx carries that classifier because such records occur on
+    // the very path this cell is about, so the SDK path demonstrably executes
+    // slash commands rather than prompting with them.
+    // STILL NOT measured: that `/clear` SPECIFICALLY is among them and that it
+    // clears context (the adapter has ZERO `/clear` occurrences in
+    // /opt/claude-agent-acp/dist, control `session/new` = 6 — it forwards the text
+    // untouched, so nothing acpx-side names the command). `true` is what
     // acpx-ui has shipped for claude since before this descriptor existed
     // (agentCapabilities.ts R1 at 6a45e58); this brick must not change claude
     // behaviour, and flipping it to false would remove a working control.
