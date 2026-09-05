@@ -17,7 +17,11 @@ import {
   type HarnessId,
 } from "./harness-capabilities.js";
 import { resolveHarnessConfigDirRoot } from "./harness-config-dir-root.js";
-import { type PluginCacheResult, seedOpenCodePluginInstall } from "./opencode-plugin-cache.js";
+import {
+  isOpenCodePluginCacheEntry,
+  type PluginCacheResult,
+  seedOpenCodePluginInstall,
+} from "./opencode-plugin-cache.js";
 
 /**
  * ONE per-session harness config dir, serving THREE purposes (CONCEPTION §5.3).
@@ -343,6 +347,18 @@ export interface HarnessConfigDirPruneResult {
    * rest of the line checkable.
    */
   root: string;
+  /**
+   * Directory entries the root actually held — the WALK, before any filtering.
+   *
+   * ⚠️ THIS IS THE CENSUS'S OWN COST, AND IT IS NOT `scanned`. Measured on devbox
+   * 2026-09-05: `/tmp` holds **25,316** `acpx*` directories of which **7** are
+   * candidates, so `scanned=7` describes a walk over four orders of magnitude more
+   * entries than it names. The listing is where the census's cost lives (116.74 ms
+   * against 2.76 ms for the `/proc` leg), and it scales with what ELSE happens to
+   * be in `/tmp` — the one variable nobody controls. Printing it means the cost is
+   * stated rather than discovered in production.
+   */
+  entriesRead: number;
   /** Candidate directories examined. **0 means the sweep found nothing to look
    *  at — NOT RUN — not that everything was already clean.** */
   scanned: number;
@@ -361,16 +377,56 @@ export interface HarnessConfigDirPruneResult {
     tooYoung: number;
     /** The removal itself failed. */
     removeFailed: number;
+    /**
+     * ⚠️ THE SWEEP COULD NOT MEASURE, SO IT REFUSED — ITS OWN VALUE, NOT FOLDED
+     * INTO `liveProcess` AND NOT INTO A CLEAN RESULT (CONCEPTION §6).
+     *
+     * The refusal path used to return `{ ...retainedBy, liveProcess: candidates.length }`,
+     * so a run that measured NOTHING reported `liveProcess: 6` — six directories
+     * confidently attributed to live holders that were never observed. The
+     * `notMeasured` flag beside it carried the truth and the attribution actively
+     * contradicted it; **the attribution is what a dashboard renders.**
+     *
+     * A refusal that reports itself as six live holds is worse than one that
+     * reports nothing, because it is confident.
+     */
+    unmeasured: number;
   };
+  /**
+   * What a DRY RUN would have removed. Empty on a real run.
+   *
+   * ⚠️ SEPARATE FROM `removed`, WHICH STAYS TRUTHFUL. `removed` is the field an
+   * operator greps and a dashboard totals; letting it mean "deleted" on one run and
+   * "considered" on another would make every historical reading ambiguous. A dry
+   * run removed nothing, so `removed` is `[]` and says so.
+   */
+  wouldRemove: string[];
+  /**
+   * Every candidate with its verdict and reason — what makes a dry run a PREVIEW
+   * rather than a count. Populated on real runs too, so the two modes are
+   * comparable line for line.
+   */
+  candidates: ConfigDirCandidateReport[];
   /** The oldest unclaimed directory retained, in ms — printed so a stuck orphan
    *  is visible instead of accumulating silently. */
   oldestUnclaimedAgeMs?: number;
+  /** True when this run classified without removing. */
+  dryRun: boolean;
   /**
    * True when the sweep REFUSED to remove anything because it could not measure
    * live processes. ⚠️ A refusal and a clean sweep both remove nothing; this is
    * what tells them apart.
    */
   notMeasured: boolean;
+}
+
+/** One candidate's verdict, as the dry-run preview prints it. */
+export interface ConfigDirCandidateReport {
+  dir: string;
+  retain: boolean;
+  reason: ConfigDirVerdict["reason"] | "removeFailed" | "unmeasured";
+  /** Present only for an unclaimed dir whose age could be read. */
+  ageMs?: number;
 }
 
 /** What the invoking HOME's store knows about one session id. */
@@ -433,23 +489,47 @@ export function pruneOrphanHarnessConfigDirs(params: {
   orphanMinAgeMs?: number;
   /** Injectable clock, so the age rule is testable without waiting. */
   now?: number;
+  /**
+   * CLASSIFY EVERYTHING AND REMOVE NOTHING (CONCEPTION §5).
+   *
+   * ⚠️ NOT the same as "return early", which is what `--dry-run` did before this:
+   * the mode that needs no scope was the mode that never swept, so the safest way
+   * to ask *"what would this remove?"* was the one way that could not answer — and
+   * it read as a clean preview. A dry run now walks the identical path, reaches the
+   * identical verdict for every candidate, and diverges only at `removeDir`.
+   */
+  dryRun?: boolean;
 }): HarnessConfigDirPruneResult {
   const { root, now, orphanMinAgeMs } = resolvePruneDefaults(params);
+  const dryRun = params.dryRun === true;
   const retainedBy = {
     liveProcess: 0,
     openRecord: 0,
     unrecognised: 0,
     tooYoung: 0,
     removeFailed: 0,
+    unmeasured: 0,
   };
   const gated = HARNESS_IDS.filter((id) => HARNESS_FACTS[id].primerChannel === "config-file");
 
-  const candidates = findConfigDirCandidates(root, gated);
-  if (candidates === undefined) {
+  const found = findConfigDirCandidates(root, gated);
+  if (found === undefined) {
     // The root itself could not be read, so nothing was examined and nothing can
     // be concluded — a non-measurement, reported as one.
-    return { root, scanned: 0, removed: [], retained: 0, retainedBy, notMeasured: true };
+    return {
+      root,
+      entriesRead: 0,
+      scanned: 0,
+      removed: [],
+      wouldRemove: [],
+      retained: 0,
+      retainedBy,
+      candidates: [],
+      dryRun,
+      notMeasured: true,
+    };
   }
+  const { entriesRead, candidates } = found;
 
   // ⚠️ THE REFUSAL, BEFORE ANY WORK. Without a measured process census, clause 3
   // cannot be evaluated, and a sweep that skips it is exactly the blind `rm` this
@@ -459,16 +539,28 @@ export function pruneOrphanHarnessConfigDirs(params: {
   if (!scanIsMeasured(params.liveScan)) {
     return {
       root,
+      entriesRead,
       scanned: candidates.length,
       removed: [],
+      wouldRemove: [],
       retained: candidates.length,
-      retainedBy: { ...retainedBy, liveProcess: candidates.length },
+      // §6: `unmeasured`, NOT `liveProcess`. Attributing an unmeasurable run to
+      // live holders is a confident lie about processes nobody observed.
+      retainedBy: { ...retainedBy, unmeasured: candidates.length },
+      candidates: candidates.map(({ dir }) => ({
+        dir,
+        retain: true,
+        reason: "unmeasured" as const,
+      })),
+      dryRun,
       notMeasured: true,
     };
   }
   const liveScan = params.liveScan;
 
   const removed: string[] = [];
+  const wouldRemove: string[] = [];
+  const details: ConfigDirCandidateReport[] = [];
   let scanned = 0;
   let retained = 0;
   let oldestUnclaimedAgeMs: number | undefined;
@@ -486,25 +578,83 @@ export function pruneOrphanHarnessConfigDirs(params: {
     if (verdict.retain) {
       retained += 1;
       retainedBy[verdict.reason] += 1;
+      details.push({ dir, retain: true, reason: verdict.reason, ageMs: verdict.unclaimedAgeMs });
       continue;
     }
-    if (!removeDir(dir, removed)) {
+    if (dryRun) {
+      // The ONLY divergence between a dry run and a real one.
+      wouldRemove.push(dir);
+      details.push({ dir, retain: false, reason: verdict.reason, ageMs: verdict.unclaimedAgeMs });
+      continue;
+    }
+    if (removeDir(dir, removed)) {
+      details.push({ dir, retain: false, reason: verdict.reason, ageMs: verdict.unclaimedAgeMs });
+    } else {
       retained += 1;
       retainedBy.removeFailed += 1;
+      details.push({ dir, retain: true, reason: "removeFailed", ageMs: verdict.unclaimedAgeMs });
     }
   }
-  return { root, scanned, removed, retained, retainedBy, oldestUnclaimedAgeMs, notMeasured: false };
+  return {
+    root,
+    entriesRead,
+    scanned,
+    removed,
+    wouldRemove,
+    retained,
+    retainedBy,
+    candidates: details,
+    oldestUnclaimedAgeMs,
+    dryRun,
+    notMeasured: false,
+  };
 }
 
 /**
  * The directories this module could have created, with the session id each one
  * carries. Anything else — a queue socket dir, a stray `acpx-*` — is never even a
  * candidate, so it cannot be removed by any later branch.
+ *
+ * ## 🛑 MEMBERSHIP IS A POSITIVE MATCH AGAINST `HARNESS_IDS`. NEVER PARSE THE SHAPE.
+ *
+ * Measured on devbox 2026-09-05 (`find /tmp -maxdepth 1 -type d`):
+ *
+ * ```
+ *   acpx*                                       25,553
+ *     acpx-<segment>-<id>   (candidate SHAPE)   12,199   <- of which config dirs: 7
+ *     acpx-<10hex>          (no segment)        13,354
+ * ```
+ *
+ * **12,199 directories carry the exact shape of a config dir and are not one.** Their
+ * second segment is a FIXTURE NAME, never a harness — `cli-test-home` (2,094),
+ * `flow-store` (2,037), `models-cli` (1,790), `ui-messages-log` (917), `models`,
+ * `hook`, `uiprefs`, `hostmap-test`, and 15+ more. **Not one is `claude`,
+ * `claude-pty`, `codex`, `opencode` or `pi`.**
+ *
+ * ⚠️ **AND THEY ARE LIVE.** The newest was created seconds before that measurement,
+ * by a suite that was running at the time. So a filter that admitted the shape would
+ * not merely enumerate 12,199 non-candidates — **it could target a fixture a test is
+ * using right now.**
+ *
+ * ⇒ The `gated.find(...)` test below is the guarantee: an entry is a candidate only
+ * if its segment IS a known config-file harness. **Do not "generalise" it to an
+ * `acpx-*-*` glob, a regex over the shape, or "everything under our own root is
+ * ours" — each of those is the same defect wearing a different hat**, and under a
+ * dedicated root (CONCEPTION §8.1) the last one is the tempting one.
+ * `test/config-dir-sweep-scope.test.ts` feeds this function that measured fixture
+ * population and requires **zero** candidates, so a broadening reds rather than ships.
+ *
+ * ## The ONE exclusion that must also be stated by name
+ *
+ * `.acpx-opencode-plugin-cache-<version>` — the shared plugin install every session
+ * hardlinks from. Unlike the fixtures, it is excluded today by a **naming accident**
+ * (its leading dot), not by the positive test, so it gets an explicit predicate:
+ * {@link isOpenCodePluginCacheEntry}. Redundant with the dot on purpose.
  */
 function findConfigDirCandidates(
   root: string,
   gated: readonly HarnessId[],
-): { dir: string; sessionId: string }[] | undefined {
+): { entriesRead: number; candidates: { dir: string; sessionId: string }[] } | undefined {
   let entries: string[];
   try {
     entries = readdirSync(root);
@@ -517,6 +667,9 @@ function findConfigDirCandidates(
   }
   const candidates: { dir: string; sessionId: string }[] = [];
   for (const entry of entries) {
+    if (isExcludedFromConfigDirSweep(entry)) {
+      continue;
+    }
     const harness = gated.find((id) => entry.startsWith(`${CONFIG_DIR_PREFIX}${id}-`));
     if (harness !== undefined) {
       candidates.push({
@@ -525,7 +678,34 @@ function findConfigDirCandidates(
       });
     }
   }
-  return candidates;
+  return { entriesRead: entries.length, candidates };
+}
+
+/**
+ * Entries this sweep must never consider, whatever the prefix test says.
+ *
+ * ⚠️ ONE ENTRY, AND IT EARNS ITS PLACE BY BEING PROTECTED BY AN ACCIDENT. The
+ * plugin cache is out of the candidate set today only because its name starts with
+ * a dot and so misses `acpx-<harness>-`. That is a naming convention, and a naming
+ * convention is what the next tidy-up removes — a rename, a broadened glob, or the
+ * dedicated root of CONCEPTION §8.1 (where the cache would sit inside the census's
+ * own walk with nothing but that dot between it and removal) each undo it silently,
+ * restoring the 63 MB-per-session cost the cache exists to prevent.
+ *
+ * ⚠️ **THE SUITE'S FIXTURE DIRECTORIES ARE DELIBERATELY *NOT* LISTED HERE**, and
+ * that is a decision, not an omission. There are 12,199 of them across 15+ fixture
+ * names; naming them would be a hand-maintained list that the 16th fixture silently
+ * escapes — the exact failure mode this brick keeps finding. They are excluded by
+ * the POSITIVE harness-set test instead, which needs no list because it enumerates
+ * what IS ours rather than what is not. See `findConfigDirCandidates`.
+ *
+ * ⚠️ **DO NOT "SIMPLIFY" THIS AWAY ON THE GROUNDS THAT THE PREFIX TEST ALREADY
+ * EXCLUDES THE CACHE.** It does, today, by the dot. `test/config-dir-sweep-scope.test.ts`
+ * fire-tests this predicate against a cache named WITHOUT its leading dot — the case
+ * the prefix test alone gets wrong.
+ */
+export function isExcludedFromConfigDirSweep(entry: string): boolean {
+  return isOpenCodePluginCacheEntry(entry);
 }
 
 /** Defaults in one place, so the main function reads as the RULE rather than as
@@ -627,9 +807,18 @@ export function describeHarnessConfigDirSweep(result: HarnessConfigDirPruneResul
   const by = result.retainedBy;
   return (
     `[acpx] harness config dirs: root=${result.root} ` +
-    `scanned=${result.scanned} removed=${result.removed.length} ` +
+    // `entriesRead` is the WALK; `scanned` is the candidate set. On this box those
+    // are 25,316 and 7 — printing only the second describes a walk four orders of
+    // magnitude larger than the number next to it.
+    `entriesRead=${result.entriesRead} scanned=${result.scanned} ` +
+    (result.dryRun
+      ? `wouldRemove=${result.wouldRemove.length} removed=0 (DRY RUN — nothing was removed) `
+      : `removed=${result.removed.length} `) +
     `retained=${result.retained} (liveProcess=${by.liveProcess} openRecord=${by.openRecord} ` +
-    `unrecognised=${by.unrecognised} tooYoung=${by.tooYoung} removeFailed=${by.removeFailed}` +
+    `unrecognised=${by.unrecognised} tooYoung=${by.tooYoung} removeFailed=${by.removeFailed} ` +
+    // §6: its OWN value. Folded into `liveProcess` it read as six confident live
+    // holds on a run that observed no processes at all.
+    `unmeasured=${by.unmeasured}` +
     (result.oldestUnclaimedAgeMs === undefined
       ? ""
       : ` oldestUnclaimedAgeMs=${result.oldestUnclaimedAgeMs}`) +
@@ -637,6 +826,30 @@ export function describeHarnessConfigDirSweep(result: HarnessConfigDirPruneResul
     (result.notMeasured ? " — REFUSED: /proc not measurable, nothing was removed" : "") +
     " (scanned=0 means NOT RUN, not clean)\n"
   );
+}
+
+/**
+ * The per-candidate preview — what `--dry-run` exists to show.
+ *
+ * ⚠️ A COUNT IS NOT A PREVIEW. "would remove 4" tells an operator on a shared box
+ * nothing about WHICH four, and the whole reason to preview is to check that the
+ * four are the four you meant. Every candidate is listed with its verdict, its
+ * reason and its age — including the RETAINED ones, because "why is this one still
+ * here" is the question a preview is most often opened to answer.
+ */
+export function describeHarnessConfigDirSweepPlan(result: HarnessConfigDirPruneResult): string {
+  if (result.candidates.length === 0) {
+    return (
+      `[acpx] harness config dirs: no candidates under ${result.root} ` +
+      `(${result.entriesRead} entries read)\n`
+    );
+  }
+  const lines = result.candidates.map((candidate) => {
+    const verdict = candidate.retain ? "KEEP  " : result.dryRun ? "REMOVE" : "REMOVED";
+    const age = candidate.ageMs === undefined ? "" : ` ageMs=${candidate.ageMs}`;
+    return `[acpx]   ${verdict} ${candidate.dir} (${candidate.reason}${age})`;
+  });
+  return `${lines.join("\n")}\n`;
 }
 
 /** Verbose breadcrumb for a written config dir. Never prints a file's CONTENT —

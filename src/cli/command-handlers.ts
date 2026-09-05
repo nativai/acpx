@@ -14,6 +14,7 @@ import {
 } from "../acp/harness-capabilities.js";
 import {
   describeHarnessConfigDirSweep,
+  describeHarnessConfigDirSweepPlan,
   pruneOrphanHarnessConfigDirs,
 } from "../acp/harness-config-dir.js";
 import {
@@ -3773,9 +3774,6 @@ async function sweepOrphanHarnessConfigDirs(
    */
   rootDir: string | undefined,
 ): Promise<void> {
-  if (dryRun) {
-    return;
-  }
   try {
     // ⚠️ ONE /proc CENSUS, SHARED BY BOTH SWEEPS. Taken once so the two cannot
     // disagree about what is running, and so the cost is paid once.
@@ -3788,21 +3786,43 @@ async function sweepOrphanHarnessConfigDirs(
     // sweep retain every directory forever (measured on the rig: 206 records, 88
     // still open, each pinning a config dir). The fix is to close the ownerless
     // records — one layer up — NOT to relax the deletion rule below.
+    //
+    // ⚠️ AND A DRY RUN MUST MODEL THAT ORDER, NOT SKIP IT (CONCEPTION §5). The
+    // record sweep is what makes further directories removable, so a preview that
+    // omitted it would under-report what the real run removes — wrong in the
+    // reassuring direction, which is the direction that gets a preview trusted.
+    // So the record pass still RUNS in dry-run, with `closeSession` replaced by a
+    // no-op: it closes nothing, and its `closed` list becomes "would close".
     const recordSweep = await sweepAbandonedSessionRecords({
       records: await session.listSessions(),
       liveScan,
-      closeSession: (id) => session.closeSession(id),
+      closeSession: dryRun ? async () => undefined : (id) => session.closeSession(id),
     });
     if (verbose) {
       process.stderr.write(describeAbandonedRecordSweep(recordSweep));
     }
 
     // Re-read AFTER the record sweep, so the directory pass sees the closes it
-    // just made rather than the state that preceded them.
+    // just made rather than the state that preceded them. In dry-run no close
+    // landed, so the ids it WOULD have closed are folded in here instead — the
+    // preview then classifies against the state the real run would have reached.
     const records = knownRecordsById(await session.listSessions());
-    const swept = pruneOrphanHarnessConfigDirs({ records, liveScan, rootDir });
-    if (verbose) {
-      process.stderr.write(describeHarnessConfigDirSweep(swept));
+    if (dryRun) {
+      for (const id of recordSweep.closed) {
+        records.set(id, { closed: true });
+      }
+    }
+    const swept = pruneOrphanHarnessConfigDirs({ records, liveScan, rootDir, dryRun });
+    // ⚠️ PRINTED BY DEFAULT, NOT UNDER `--verbose` (CONCEPTION §7). Every
+    // population this sweep reports — `scanned=0 means NOT RUN`, `unmeasured`
+    // separate from `liveProcess`, `retainedBy` — exists to be READ, and a census
+    // behind a flag is a census nobody sees. A sweep that removes things silently
+    // is the shape of every incident in this thread.
+    process.stderr.write(describeHarnessConfigDirSweep(swept));
+    // The per-candidate preview is the POINT of a dry run: a count cannot tell an
+    // operator whether the four it would remove are the four they meant.
+    if (dryRun) {
+      process.stderr.write(describeHarnessConfigDirSweepPlan(swept));
     }
   } catch (error) {
     // Never fail a prune because the tidy-up failed — the sessions are already
