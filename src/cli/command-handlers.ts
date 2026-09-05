@@ -42,6 +42,7 @@ import {
   SubscriptionLockedError,
   SubscriptionUnknownError,
 } from "../errors.js";
+import { warmCatalogueInBackground } from "../models/catalogue-warm.js";
 import { validateSessionModelFlags } from "../models/model-slug-validation.js";
 import { loadPermissionPolicySpec } from "../permission-policy.js";
 import { scanLiveProcesses } from "../process-population.js";
@@ -2699,6 +2700,14 @@ export async function handleSessionsNew(
   });
   const spawnGlobalFlags =
     validatedModel === undefined ? globalFlags : { ...globalFlags, model: validatedModel };
+  // brick://7a2d5c60 — a cold or stale cache makes the validation above stand
+  // aside, which is why it was a production no-op on a box nobody had run
+  // `acpx models` on. This kicks a refresh off and RETURNS IMMEDIATELY (detached
+  // child, `unref`ed, `void` return), so this create is unaffected and the NEXT
+  // one validates. It must stay after validation and before the spawn: awaiting
+  // it, here or anywhere, would trade a silent no-op for a latency regression on
+  // every first create (C4 §7.1).
+  warmCatalogueInBackground();
   const [{ createSession, closeSession }, { printCreatedSessionBanner, printNewSessionByFormat }] =
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
 
