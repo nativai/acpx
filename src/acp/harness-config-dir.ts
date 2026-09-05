@@ -2,7 +2,14 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { type LiveProcessScan, scanIsMeasured } from "../process-population.js";
+import {
+  type LivePidScan,
+  type LiveProcessScan,
+  pidObservedLive,
+  pidScanIsMeasured,
+  scanIsMeasured,
+  scanLivePids,
+} from "../process-population.js";
 import {
   harnessIdForAgentCommand,
   HARNESS_FACTS,
@@ -113,6 +120,14 @@ export interface HarnessConfigDirReleaseResult {
   remainingHolders: number;
   /** True when the holder set could not be read, so no removal was attempted. */
   notMeasured: boolean;
+  /** Holders dropped because their owning process is gone (brick c9b2520f). */
+  droppedStaleHolders: number;
+  /**
+   * Whether the STALE check ran at all. ⚠️ `false` means `/proc` was not
+   * enumerable, so no holder was judged — distinct from "every holder was live",
+   * which produces the same `droppedStaleHolders: 0`.
+   */
+  staleCheckMeasured?: boolean;
 }
 
 /**
@@ -164,9 +179,12 @@ function registerConfigDirHolder(dir: string): string {
 export function releaseHarnessConfigDir(
   dir: string | undefined,
   holderId: string | undefined,
+  /** The pid census. Injectable so a test can supply an UNMEASURABLE one; the
+   *  default is a real `/proc` enumeration, with no environ reads. */
+  pidScan: LivePidScan | undefined = scanLivePids(),
 ): HarnessConfigDirReleaseResult {
   if (!dir || !basename(dir).startsWith(CONFIG_DIR_PREFIX)) {
-    return { removed: false, remainingHolders: 0, notMeasured: true };
+    return { removed: false, remainingHolders: 0, notMeasured: true, droppedStaleHolders: 0 };
   }
   const holders = join(dir, HOLDERS_DIR);
   if (holderId) {
@@ -183,13 +201,108 @@ export function releaseHarnessConfigDir(
     // ⚠️ NOT "zero holders". An unreadable holder set is a NON-MEASUREMENT, and
     // treating it as empty would restore precisely the unconditional delete this
     // function exists to end. The orphan sweep collects it later.
-    return { removed: false, remainingHolders: 0, notMeasured: true };
+    return { removed: false, remainingHolders: 0, notMeasured: true, droppedStaleHolders: 0 };
   }
-  if (remaining.length > 0) {
-    return { removed: false, remainingHolders: remaining.length, notMeasured: false };
+
+  const stale = dropStaleHolders(holders, remaining, pidScan);
+  if (stale.remaining.length > 0) {
+    return {
+      removed: false,
+      remainingHolders: stale.remaining.length,
+      notMeasured: false,
+      droppedStaleHolders: stale.dropped,
+      staleCheckMeasured: stale.measured,
+    };
   }
   removeHarnessConfigDir(dir);
-  return { removed: true, remainingHolders: 0, notMeasured: false };
+  return {
+    removed: true,
+    remainingHolders: 0,
+    notMeasured: false,
+    droppedStaleHolders: stale.dropped,
+    staleCheckMeasured: stale.measured,
+  };
+}
+
+/**
+ * Drop holders whose OWNING PROCESS IS GONE, so one abandoned claim cannot pin a
+ * directory forever (brick c9b2520f).
+ *
+ * ## The defect
+ *
+ * A clean drained close left holder `346359-953c2e22` behind with `/proc/346359`
+ * gone. `releaseHarnessConfigDir` only ever removed the CALLER's own marker and
+ * then counted, so the set could never empty and the close path could never
+ * remove that directory. Nothing else collects it either: the orphan sweep is
+ * **holder-blind by design** and, measured, nothing on staging invokes it — so
+ * the leak is monotonic in sessions.
+ *
+ * ## ⚠️ WHY PID REUSE CANNOT HURT HERE — THE ARGUMENT, NOT THE CONCLUSION
+ *
+ * A pid can be recycled by an unrelated process, so this check can be wrong. It
+ * can only be wrong in ONE direction, and it is the safe one:
+ *
+ *   - a recycled pid makes a DEAD holder look ALIVE ⇒ the directory is
+ *     **RETAINED**. That is a leak — today's failure, made rarer.
+ *   - the reverse would require a LIVE holder's pid to be absent from `/proc`,
+ *     which cannot happen, **because each client registers its OWN holder**
+ *     (`registerConfigDirHolder` writes `${process.pid}-${uuid8}`). A holder's
+ *     pid being gone therefore means the client that made that claim is gone,
+ *     and a gone client holds nothing.
+ *
+ * **So do not "fix" the race.** Tightening it can only trade a rare leak for a
+ * deletion, which is the wrong direction on this path.
+ *
+ * ## ⚠️ AND IT IS GATED ON THE PID POPULATION, NOT THE FULL ONE
+ *
+ * `pidScanIsMeasured` — not `scanIsMeasured`. The question here is "is pid N
+ * alive?", which `/proc` enumeration answers; `scanIsMeasured` additionally
+ * requires readable ENVIRONMENTS, which govern a different question. Gating on
+ * the wider control would make this inert on any box where environments are
+ * unreadable: the fix would ship, drop nothing, and say nothing.
+ *
+ * An unmeasurable scan drops NOTHING and the directory is RETAINED — never the
+ * other way round, because "this pid does not exist" and "I cannot tell" are the
+ * same observation, and acting on the second is how an unconditional delete
+ * returns.
+ */
+function dropStaleHolders(
+  holdersDir: string,
+  holderIds: readonly string[],
+  pidScan: LivePidScan | undefined,
+): { remaining: string[]; dropped: number; measured: boolean } {
+  if (!pidScanIsMeasured(pidScan)) {
+    return { remaining: [...holderIds], dropped: 0, measured: false };
+  }
+  const remaining: string[] = [];
+  let dropped = 0;
+  for (const holderId of holderIds) {
+    const pid = holderPid(holderId);
+    // An id whose pid cannot be parsed is NOT ours to judge — retained, for the
+    // same reason the sweep retains an id it does not recognise.
+    if (pid === undefined || pidObservedLive(pidScan, pid)) {
+      remaining.push(holderId);
+      continue;
+    }
+    try {
+      rmSync(join(holdersDir, holderId), { force: true });
+      dropped += 1;
+    } catch {
+      remaining.push(holderId); // could not drop it, so it still counts
+    }
+  }
+  return { remaining, dropped, measured: true };
+}
+
+/** The pid a holder id carries. `${pid}-${uuid8}`, written by
+ *  {@link registerConfigDirHolder} — the reason that id shape is not cosmetic. */
+function holderPid(holderId: string): number | undefined {
+  const match = /^(\d+)-/.exec(holderId);
+  if (!match) {
+    return undefined;
+  }
+  const pid = Number(match[1]);
+  return Number.isInteger(pid) && pid > 0 ? pid : undefined;
 }
 
 /**

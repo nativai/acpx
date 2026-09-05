@@ -146,8 +146,63 @@ export function sessionOwnedByLiveProcess(
   );
 }
 
+/**
+ * The PID LEG ALONE — `/proc` enumerated, with no `environ` reads at all
+ * (brick c9b2520f).
+ *
+ * ⚠️ THIS EXISTS BECAUSE `scanIsMeasured` IS THE WRONG CONTROL FOR A PID
+ * QUESTION, and using it would make the stale-holder fix INERT exactly where it
+ * is needed. `scanIsMeasured` requires `environRead > 0`, because the question it
+ * governs — "does a live process reference this DIRECTORY?" — is answered from
+ * environments. "Is pid N alive?" is answered from the enumeration alone.
+ *
+ * On a box where `/proc` enumerates but environments are unreadable (an
+ * ordinary privilege boundary), `scanIsMeasured` is false while the pid answer is
+ * perfectly well measured. Gating the holder drop on it would retain every stale
+ * holder forever — the fix would ship, do nothing, and say nothing.
+ *
+ * ⚠️ Which is this module's own doctrine applied to itself: **two populations,
+ * and they fail independently.** A caller must ask the population that matches
+ * its question.
+ *
+ * It is also cheaper: a close path runs this on every session teardown, and
+ * reading ~3k environments to answer "is this pid alive?" is work nobody needs.
+ */
+export interface LivePidScan {
+  /** PIDs enumerated. ⚠️ **0 means NOT MEASURED** — never "nothing is running". */
+  scanned: number;
+  pids: ReadonlySet<number>;
+}
+
+/** Enumerate `/proc` for pids only. A full {@link LiveProcessScan} satisfies this. */
+export function scanLivePids(procRoot = "/proc"): LivePidScan {
+  const pids = new Set<number>();
+  let entries: string[];
+  try {
+    entries = readdirSync(procRoot);
+  } catch {
+    return { scanned: 0, pids };
+  }
+  for (const entry of entries) {
+    if (/^\d+$/.test(entry)) {
+      pids.add(Number(entry));
+    }
+  }
+  return { scanned: pids.size, pids };
+}
+
+/**
+ * Whether a pid census is trustworthy enough to DROP a holder on.
+ *
+ * ⚠️ Deliberately NOT {@link scanIsMeasured}: this asks only whether `/proc` was
+ * enumerable, because that is the population behind a liveness answer.
+ */
+export function pidScanIsMeasured(scan: LivePidScan | undefined): scan is LivePidScan {
+  return scan !== undefined && scan.scanned > 0;
+}
+
 /** Whether `pid` was OBSERVED live. Never call without checking `scanned` first. */
-export function pidObservedLive(scan: LiveProcessScan, pid: number | undefined): boolean {
+export function pidObservedLive(scan: LivePidScan, pid: number | undefined): boolean {
   return typeof pid === "number" && pid > 0 && scan.pids.has(pid);
 }
 
