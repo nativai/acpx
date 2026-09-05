@@ -807,31 +807,7 @@ function writePiConfigDir(dir: string, input: HarnessConfigDirInput): HarnessCon
   // carries `https://openrouter.ai/api/v1`, and because the merge is BY ID this
   // also repairs a bundled entry rather than merely adding new ones.
   if (input.provisionModelId) {
-    const id = stripProviderPrefix(input.provisionModelId);
-    const now = Date.now();
-    const store = {
-      openrouter: {
-        lastModified: now,
-        checkedAt: now,
-        models: [
-          {
-            id,
-            name: id,
-            api: "openai-completions",
-            baseUrl: "https://openrouter.ai/api/v1",
-            provider: "openrouter",
-            reasoning: true,
-            input: ["text"],
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: 128000,
-            maxTokens: 16384,
-          },
-        ],
-      },
-    };
-    const storePath = join(dir, "models-store.json");
-    writeFileSync(storePath, `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600 });
-    files.push(storePath);
+    writePiModelsStore(dir, input.env, stripProviderPrefix(input.provisionModelId), files);
   }
   // ⚠️ KEEP pi's SESSION STORE WHERE IT WAS — read BEFORE the re-point below,
   // which is the last moment the box's own agent dir is still reachable through
@@ -845,6 +821,128 @@ function writePiConfigDir(dir: string, input: HarnessConfigDirInput): HarnessCon
     envNames.push("PI_CODING_AGENT_SESSION_DIR");
   }
   return { harness: "pi", dir, envNames, files };
+}
+
+/**
+ * Generate pi's per-session `models-store.json` so an arbitrary OpenRouter slug
+ * resolves — and repair pi's broken Anthropic entries on the way past.
+ *
+ * ## The two measurements this is built on (pi 0.84.4, brick ef5999ca)
+ *
+ * **It MERGES, by id.** `mergeModels(baseline, dynamic)`
+ * (`dist/core/remote-catalog-provider.js:7-16`) replaces a same-id model and
+ * appends a new one. Measured: a one-entry file took the offered catalogue from
+ * 333 models to 334, the planted slug was offered, a pre-existing slug still
+ * resolved, and 333 came back after restore. The standing comment that said this
+ * might REPLACE the catalogue — and kept the capability switched off — was wrong.
+ *
+ * **But an entry is IGNORED without a fresh `lastModified`.** `remoteModels()`
+ * (`:31-38`) returns `[]` when the provider block's `lastModified` is absent or
+ * not newer than the bundled stamp. A well-formed entry without it changes
+ * nothing, with no error anywhere: measured 333 → 333, slug not offered.
+ *
+ * ## ⚠️ WHY THE BOX'S OWN CATALOGUE IS COPIED FORWARD RATHER THAN REPLACED
+ *
+ * Writing ONLY the requested slug is what a naive "generate a fragment" does, and
+ * it costs the session every model pi had cached: measured 374 offered → 334,
+ * because the per-session file REPLACES the box's remote-overlay block (the
+ * bundled 333 survive; the ~41 overlay-only models do not). Worse, if the slug is
+ * one the catalogue ALREADY has, the generated entry replaces a real one with
+ * guessed metadata — no `thinkingLevelMap` (so the depth ladder silently becomes
+ * wrong), a made-up context window, zero costs.
+ *
+ * So the box's overlay is read first and the slug is UPSERTED into it. A slug the
+ * catalogue already carries keeps its real metadata; only a genuinely new one gets
+ * a generic entry.
+ *
+ * ## The Anthropic repair rides along
+ *
+ * All 15 `anthropic-messages` entries ship `https://openrouter.ai/api` — no `/v1`
+ * — so the request goes out on the openai-completions route, which appends
+ * `/chat/completions` → `POST /api/chat/completions` → 404 (I2 R6, at the wire).
+ * Re-measured at the source: `GET https://pi.dev/api/models/providers/openrouter`
+ * still serves 15 such entries. Because the merge is by id, patching them in the
+ * copied overlay repairs them for the session rather than merely adding new ones.
+ *
+ * ⚠️ `checkedAt` is stamped NOW deliberately: pi refreshes the remote catalogue
+ * when that is older than 4 h, and a refresh REPLACES the whole `openrouter`
+ * block — provisioned slug and Anthropic repair included. A session running
+ * longer than 4 h can therefore lose both. Recorded rather than worked around;
+ * the fix belongs in pi's own merge, not in a second copy of it here.
+ */
+function writePiModelsStore(
+  dir: string,
+  env: NodeJS.ProcessEnv,
+  modelId: string,
+  files: string[],
+): void {
+  const models = readBoxPiOpenRouterModels(env).map((model) =>
+    model.api === "anthropic-messages" && model.baseUrl === OPENROUTER_API_BASE_NO_V1
+      ? { ...model, baseUrl: OPENROUTER_API_BASE }
+      : model,
+  );
+
+  const index = models.findIndex((model) => model.id === modelId);
+  if (index >= 0) {
+    // Already known: keep every field pi has for it. Only the baseUrl repair
+    // above may have touched it.
+    models[index] = { ...models[index] };
+  } else {
+    models.push({
+      id: modelId,
+      name: modelId,
+      api: "openai-completions",
+      baseUrl: OPENROUTER_API_BASE,
+      provider: "openrouter",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128000,
+      maxTokens: 16384,
+    });
+  }
+
+  const now = Date.now();
+  const storePath = join(dir, "models-store.json");
+  writeFileSync(
+    storePath,
+    `${JSON.stringify({ openrouter: { lastModified: now, checkedAt: now, models } }, null, 2)}\n`,
+    { mode: 0o600 },
+  );
+  files.push(storePath);
+}
+
+const OPENROUTER_API_BASE = "https://openrouter.ai/api/v1";
+const OPENROUTER_API_BASE_NO_V1 = "https://openrouter.ai/api";
+
+type PiCatalogueModel = {
+  id?: string;
+  api?: string;
+  baseUrl?: string;
+  [key: string]: unknown;
+};
+
+/**
+ * pi's cached OpenRouter catalogue from the BOX agent dir — read before the
+ * re-point, like the session store and the F-13 discard warning.
+ *
+ * An empty result is a legitimate state (pi has never run on this box), not an
+ * error: the bundled catalogue still resolves, so the session simply gets the
+ * provisioned slug on top of it.
+ */
+function readBoxPiOpenRouterModels(env: NodeJS.ProcessEnv): PiCatalogueModel[] {
+  const boxAgentDir = env.PI_CODING_AGENT_DIR?.trim()
+    ? env.PI_CODING_AGENT_DIR.trim()
+    : join(env.HOME?.trim() || homedir(), ".pi", "agent");
+  try {
+    const parsed = JSON.parse(readFileSync(join(boxAgentDir, "models-store.json"), "utf8")) as {
+      openrouter?: { models?: unknown };
+    };
+    const models = parsed.openrouter?.models;
+    return Array.isArray(models) ? (models as PiCatalogueModel[]) : [];
+  } catch {
+    return [];
+  }
 }
 
 /**

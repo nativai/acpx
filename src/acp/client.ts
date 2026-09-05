@@ -949,25 +949,27 @@ export class AcpClient {
       cwd: this.options.cwd,
       primer: await resolveSessionPrimer(env),
       model: this.options.sessionOptions?.model,
-      // ⚠️ NO `provisionModelId`, DELIBERATELY — and the same asymmetry that kept
-      // Pi's catalogue fragment out applies here, which the first version of this
-      // call got wrong by passing the pinned model unconditionally.
+      // ⚠️ PROVISIONING IS ON FOR PI AND OFF FOR OPENCODE, AND THE ASYMMETRY IS
+      // A MEASUREMENT, NOT CAUTION LEFT OVER FROM BEFORE.
       //
-      // Provisioning declares `provider.openrouter.models.<slug>: {}`. For a slug
-      // OUTSIDE OpenCode's bundled models.dev snapshot that is what makes it
-      // resolvable at all (I1 R6). For a slug ALREADY IN the snapshot — which is
-      // every model acpx can currently pin, since `acceptsArbitraryModelIds` is
-      // false for opencode — it declares an EMPTY config over an existing entry,
-      // and whether OpenCode deep-merges that or REPLACES the entry is NOT
-      // MEASURED. If it replaces, the model loses its bundled metadata including
-      // its `reasoning` support, which is precisely what the `effort` option is
-      // advertised from — so the post-model re-read would find no ladder and depth
-      // would silently stop working for every pinned model.
+      // The comment that stood here said provisioning stays off "once B5 measures
+      // the merge semantics". B5 measured them, for pi (brick ef5999ca):
+      // `models-store.json` merges BY ID with pi's catalogue — same id replaces,
+      // new id appends — and `writePiModelsStore` copies the box's own catalogue
+      // forward before upserting, so a slug pi already knows keeps its real
+      // metadata rather than being overwritten with guesses.
       //
-      // Since acpx declares arbitrary model ids UNSUPPORTED for opencode today,
-      // provisioning buys nothing and risks that. The mechanism stays in
-      // `harness-config-dir.ts` and is unit-tested; it is switched on by passing
-      // this field, once B5 measures the merge semantics.
+      // OPENCODE IS STILL OFF, and for the reason the old comment gave, which no
+      // pi measurement touches: `provider.openrouter.models.<slug>: {}` declares
+      // an EMPTY config over an existing entry, and whether OpenCode deep-merges
+      // that or REPLACES it is NOT MEASURED. If it replaces, the model loses its
+      // bundled metadata including the `reasoning` support the `effort` option is
+      // advertised from — depth would silently stop working for every pinned
+      // model. Two harnesses, two different config formats, two separate
+      // questions; answering one does not answer the other.
+      ...(harnessIdForAgentCommand(this.options.agentCommand) === "pi"
+        ? { provisionModelId: this.options.sessionOptions?.model }
+        : {}),
     });
     this.harnessConfigDir = plan?.dir;
     this.harnessConfigHolderId = plan?.holderId;

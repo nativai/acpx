@@ -286,18 +286,29 @@ export const DEPTH_MECHANISMS_ROUTED_BY_ACPX: readonly DepthMechanism[] = [
 ];
 
 export const ARBITRARY_MODEL_SUPPORT_ROUTED_BY_ACPX: readonly ArbitraryModelSupport[] = [
-  // `provisioned` is routed: the per-session config dir now generates the
-  // catalogue fragment for both harnesses that need one — opencode's
-  // `provider.openrouter.models.<id>` (I1 R6) and pi's `models-store.json`
-  // (B5, brick ef5999ca; the merge semantics and the mandatory `lastModified`
-  // stamp are measured in `harness-config-dir.ts`).
-  //
-  // `via-shim` is still NOT routed: it needs the OpenRouter shim to take a model
+  // Empty on purpose, and it must stay a KIND list rather than absorb the
+  // provisioning answer. `via-shim` needs the OpenRouter shim to take a model
   // from the picker rather than from the profile (CONCEPTION §7.4, §11 Q1), which
-  // has not shipped. Leaving it out is what keeps the picker from offering a band
-  // that fails at spawn.
-  "provisioned",
+  // has not shipped.
+  //
+  // ⚠️ `provisioned` IS NOT LISTED HERE EVEN THOUGH acpx NOW PROVISIONS FOR PI —
+  // and that is the correction, not an omission. Provisioning is answered PER
+  // HARNESS, because each harness has its own config format and its own merge
+  // semantics: pi's `models-store.json` is measured to merge by id (brick
+  // ef5999ca), while whether opencode deep-merges or REPLACES an existing
+  // `provider.openrouter.models.<slug>` entry is NOT measured. Listing the KIND
+  // switched BOTH on from one harness's measurement, and opencode's picker would
+  // then have offered a band acpx does not provision for.
 ];
+
+/**
+ * The harnesses acpx actually generates a catalogue fragment for.
+ *
+ * One measurement per harness, never one per kind — see the warning above. A
+ * harness enters this list when its config format's merge semantics have been
+ * measured AND `applyHarnessConfigDir` is passed `provisionModelId` for it.
+ */
+export const ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR: readonly HarnessId[] = ["pi"];
 
 /** Mechanisms that are a LIVE model change at all, once acpx routes them. */
 const LIVE_MODEL_MECHANISMS: ReadonlySet<ModelMechanism> = new Set([
@@ -351,10 +362,15 @@ export function deriveCanSetDepthLive(
 /** Whether an id outside the harness's own catalogue can be used (CONCEPTION §7.4). */
 export function deriveAcceptsArbitraryModelIds(
   support: ArbitraryModelSupport,
+  harness?: HarnessId,
   routedSupport: readonly ArbitraryModelSupport[] = ARBITRARY_MODEL_SUPPORT_ROUTED_BY_ACPX,
+  provisionedFor: readonly HarnessId[] = ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR,
 ): boolean {
   if (support === "none") {
     return false;
+  }
+  if (support === "provisioned") {
+    return harness !== undefined && provisionedFor.includes(harness);
   }
   return support === "native" || routedSupport.includes(support);
 }
@@ -375,7 +391,7 @@ export function deriveHarnessCapabilities(facts: HarnessCapabilityFacts): Harnes
     liveModelChangeReason: canSetModelLive ? null : facts.liveModelChangeBlockedReason,
     supportsProfiles: facts.supportsProfiles,
     supportsOutputStyles: facts.supportsOutputStyles,
-    acceptsArbitraryModelIds: deriveAcceptsArbitraryModelIds(facts.arbitraryModelSupport),
+    acceptsArbitraryModelIds: deriveAcceptsArbitraryModelIds(facts.arbitraryModelSupport, facts.id),
     defaultModelKey: deriveDefaultModelKey(facts.defaultModel),
     arbitraryModelSupport: facts.arbitraryModelSupport,
     model: { ...facts.model },
