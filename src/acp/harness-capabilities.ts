@@ -238,7 +238,56 @@ export type HarnessCapabilityFacts = Omit<
    * stale into the UI — {@link deriveHarnessCapabilities} returns null there.
    */
   liveModelChangeBlockedReason: string;
+  /**
+   * **The adapter build every claim in this block was measured against**
+   * (brick 4791a88c).
+   *
+   * ## ⚠️ WHY THIS IS A FIELD AND NOT A COMMENT
+   *
+   * Before this, not one cell in this table named the build it was proven on —
+   * measured: zero occurrences of any adapter version anywhere in the file,
+   * against 48 `mechanism` hits, so the file is deep and the absence was total.
+   * **A claim with no version cannot be shown to have EXPIRED, so it cannot be
+   * checked at all.**
+   *
+   * That is not hypothetical here. pi's `session/set_model` was **real in
+   * pi-acp 0.0.26 and gone in 0.0.33**, while this table's comment said it was
+   * "proven three ways" — true when written, false when read, and nothing in the
+   * file could tell the difference. A version is what turns a belief back into a
+   * falsifiable claim.
+   *
+   * Structured rather than prose so a TEST can require it: every harness must
+   * carry one, and the ones acpx pins must agree with `AGENT_REGISTRY`.
+   *
+   * ⚠️ **COMPLEMENTARY TO F-12's LEARNED FACT, NOT REDUNDANT WITH IT.** The
+   * citation makes a claim falsifiable; the runtime learning
+   * (`model_set_unsupported_for`) makes it self-correcting when it turns out to
+   * be wrong. Neither replaces the other: learning cannot tell you a claim was
+   * only ever true of an older build, and a citation cannot fix a live session.
+   */
+  measuredAgainst: HarnessMeasurementSource;
 };
+
+/** Where a harness block's claims come from, and how to re-derive it. */
+export interface HarnessMeasurementSource {
+  /**
+   * The ACP ADAPTER identity — the process acpx actually spawns. A package spec
+   * (`pi-acp@^0.0.33`) or a built artifact plus its commit.
+   */
+  adapter: string;
+  /**
+   * The UNDERLYING harness binary, where it differs from the adapter and has its
+   * own version. Two things go stale independently — pi-acp is not pi, and
+   * codex-acp is not the codex CLI — so conflating them would let one move while
+   * the citation still looked current.
+   */
+  harness?: string;
+  /**
+   * How to re-derive the identity above on any box, so the citation can be
+   * CHECKED rather than trusted.
+   */
+  source: string;
+}
 
 /**
  * ⚠️ THE THREE LISTS BELOW ARE THE HINGE. They say what ACPX ITSELF ROUTES
@@ -416,6 +465,14 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
   claude: {
     id: "claude",
     label: "claude",
+    measuredAgainst: {
+      // Built into the image, so the COMMIT is the identity — the package
+      // version (0.39.0) is not bumped per build and would not distinguish two
+      // images. Both read from the deployed artifact, not from a document.
+      adapter: "claude-agent-acp 0.39.0 @ commit 0d5ab3ab",
+      source:
+        "node -p require('/opt/claude-agent-acp/package.json').version + git -C /opt/claude-agent-acp rev-parse --short HEAD",
+    },
     supportsProfiles: true,
     supportsOutputStyles: true, // MAP §3.1 — harness-sourced list, create/resume only
     arbitraryModelSupport: "via-shim", // CONCEPTION §7.4 — the shim's model is fixed by the profile today
@@ -452,6 +509,15 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
 
   "claude-pty": {
     id: "claude-pty",
+    measuredAgainst: {
+      // ⚠️ The deployed package version is the literal string `0.0.0-private`,
+      // which distinguishes NOTHING between builds. The commit is the only
+      // identity this adapter has, and recording that limit is the point — a
+      // citation that cannot date a build should say so rather than look precise.
+      adapter: "claude-pty-acp 0.0.0-private @ commit ce2a2e6",
+      source:
+        "git -C /opt/claude-pty-acp rev-parse --short HEAD (the package version is a constant and cannot date a build)",
+    },
     label: "claude-pty",
     supportsProfiles: true,
     supportsOutputStyles: true, // MAP §3.1 — create-time only, folded into the launch --settings JSON
@@ -487,6 +553,28 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
 
   codex: {
     id: "codex",
+    measuredAgainst: {
+      // TWO versions, because they move independently: the adapter, and the
+      // codex CLI bundled UNDER it. Citing only one would let the other drift
+      // while the citation still read as current.
+      //
+      // ⚠️ THE FIRST RE-TAKE PROVED THE POINT OF THE COMMIT FIELD. At the
+      // 0.153.3 boundary the adapter's PACKAGE VERSION did not move — it is
+      // 0.0.45 before and after — while the commit went `bb17b22` → `42987b87`
+      // and the bundled CLI went 0.144.1 → 0.153.3. A citation carrying only the
+      // package version would have read as current across a bump that changed
+      // the harness's depth vocabulary. This is the same limit spelled out for
+      // claude-pty, arriving on a harness that does have a real version.
+      //
+      // ⚠️ The box's own `codex` on PATH is a DIFFERENT build from the one the
+      // adapter bundles (measured: 0.144.6 on PATH against 0.144.1 bundled,
+      // before the bump). Reading the CLI on PATH would cite a binary these
+      // claims were never measured against.
+      adapter: "codex-acp 0.0.45 @ commit 42987b87",
+      harness: "@openai/codex 0.153.3 (bundled at /opt/codex-acp/node_modules/@openai/codex)",
+      source:
+        "node -p require('/opt/codex-acp/package.json').version + node -p require('/opt/codex-acp/node_modules/@openai/codex/package.json').version",
+    },
     label: "codex",
     // A `chatgpt` profile is bound to codex (src/config/profiles.ts:145-156,
     // re-asserted at spawn src/acp/auth-env.ts:1213-1226). Note acpx-ui's LIVE
@@ -549,6 +637,15 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
 
   opencode: {
     id: "opencode",
+    measuredAgainst: {
+      // Pinned by brick 0ededc52; before that the command carried NO version and
+      // resolved `latest` at spawn on every box independently, so these claims
+      // named no build at all — the defect this field exists for, in its purest
+      // form. The pin is BARE, not `^1.18.28`: opencode-ai is a 1.x package and a
+      // caret there is a RANGE (see `ACP_ADAPTER_PACKAGE_RANGES`).
+      adapter: "opencode-ai@1.18.28",
+      source: "ACP_ADAPTER_PACKAGE_RANGES.opencode in src/agent-registry.ts",
+    },
     label: "opencode",
     // No `AuthMode` maps to a fourth harness — the mapping is a closed switch,
     // not a table (MAP §2.2). Credentials reach OpenCode as box-provider env.
@@ -604,6 +701,18 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
 
   pi: {
     id: "pi",
+    measuredAgainst: {
+      // ⚠️ THE BLOCK THAT PROVES WHY THIS FIELD EXISTS. `model.mechanism:
+      // "set-model"` below was measured on pi-acp 0.0.26 and is FALSE on 0.0.33,
+      // which answers `-32601 Method not found`. The comment said "proven three
+      // ways" and named no version, so nothing in the file could show the claim
+      // had expired. F-12's runtime learning is what corrects it live; this is
+      // what makes it checkable at all.
+      adapter: "pi-acp@^0.0.33",
+      harness: "@earendil-works/pi-coding-agent 0.84.4",
+      source:
+        "ACP_ADAPTER_PACKAGE_RANGES.pi in src/agent-registry.ts + the pi binary's own --version",
+    },
     label: "pi",
     // ⚠️ EVERY CELL BELOW DESCRIBES THE **nativai `pi-acp` FORK** (B5, brick
     // ef5999ca), which `agent-registry.ts` launches from `/opt/pi-acp` when the

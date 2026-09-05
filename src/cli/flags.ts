@@ -7,12 +7,12 @@ import {
   resolveAgentCommand as resolveAgentCommandFromRegistry,
 } from "../agent-registry.js";
 import type { SystemPromptOption } from "../runtime/engine/session-options.js";
+import { CANONICAL_DEPTH_VOCABULARY } from "../session/depth-projection.js";
 import { DEFAULT_QUEUE_OWNER_TTL_MS } from "../session/session.js";
 import {
   AUTH_POLICIES,
   NON_INTERACTIVE_PERMISSION_POLICIES,
   OUTPUT_FORMATS,
-  REASONING_EFFORTS,
   type AuthPolicy,
   type NonInteractivePermissionPolicy,
   type OutputFormat,
@@ -230,18 +230,39 @@ export function parseAuthPolicy(value: string): AuthPolicy {
   return value as AuthPolicy;
 }
 
-// Union of all valid effort values across all profile types. Profile-specific
-// validation (e.g. 'xhigh' rejected for openrouter) happens at execution time
-// inside applyProfileAuth where the profile is known.
-const ALL_KNOWN_EFFORTS = ["minimal", ...REASONING_EFFORTS] as const;
-
+/**
+ * ⚠️ THIS GATE IS HARNESS-AGNOSTIC, SO IT MUST NOT APPLY A HARNESS'S LADDER.
+ *
+ * `--reasoning-effort` is a GLOBAL flag, parsed before the agent is known — and
+ * two harnesses have now proved, from opposite directions, that a ladder fixed
+ * here is wrong:
+ *
+ *   - **codex** widened `ReasoningEffort` from a closed union to an OPEN STRING;
+ *     rungs are catalogue-driven per model, and `gpt-6-astra` carries **`ultra`**,
+ *     a rung acpx had never seen.
+ *   - **pi** advertises six rungs and serves three, so even a "correct" ladder
+ *     read from the harness can lie (brick f13fdceb).
+ *
+ * Measured before this change: of the NINE values in
+ * {@link CANONICAL_DEPTH_VOCABULARY}, this parser rejected **three** —
+ * `ultra`, and B3's two load-bearing sentinels `default` and `off` — so a valid
+ * rung on a catalogue-driven harness, and a request to disable reasoning, both
+ * died at acpx's own door before any harness saw them.
+ *
+ * The vocabulary is now the CANONICAL one, in one place, so the two cannot
+ * disagree again. **Narrowing still happens where the harness IS known** —
+ * `applyProfileAuth` for profile limits, `projectDepthOntoLadder` for the model's
+ * own ladder, and the config-option arm for what the agent advertises. This gate
+ * only rejects what is not depth vocabulary at all.
+ */
 export function parseReasoningEffort(value: string): string {
   const normalized = value.trim().toLowerCase();
-  if (!(ALL_KNOWN_EFFORTS as readonly string[]).includes(normalized)) {
+  if (!(CANONICAL_DEPTH_VOCABULARY as readonly string[]).includes(normalized)) {
     throw new InvalidArgumentError(
-      `Invalid reasoning effort "${value}". ` +
-        `Claude profiles: ${REASONING_EFFORTS.join(", ")}. ` +
-        `OpenRouter profiles: minimal, low, medium, high.`,
+      `Invalid reasoning effort "${value}". Expected one of: ` +
+        `${CANONICAL_DEPTH_VOCABULARY.join(", ")}. ` +
+        `Not every harness or model serves every rung — acpx projects onto what the ` +
+        `target actually advertises and records the outcome.`,
     );
   }
   return normalized;

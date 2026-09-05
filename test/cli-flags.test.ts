@@ -169,10 +169,26 @@ test("flag parsers reject invalid enum values with actionable messages", () => {
   assert.equal(parseReasoningEffort("xhigh"), "xhigh");
   assert.equal(parseReasoningEffort("max"), "max");
   assert.equal(parseReasoningEffort(" HIGH "), "high");
-  for (const bad of ["default", ""]) {
+
+  // ⚠️ `default` MOVED FROM REJECTED TO ACCEPTED, AND THAT IS THE FIX, NOT A
+  // WEAKENING. This row asserted `default` must be rejected — true while this
+  // parser served only Claude's ladder. B3 made `default` a load-bearing REQUEST
+  // value ("send nothing; the harness's own default applies"), distinct from
+  // `off` ("disable reasoning") because 97 catalogue models are
+  // `reasoning.mandatory` and cannot honour `off`. Verified downstream rather
+  // than assumed: `projectDepthOntoLadder("default", …)` returns
+  // `kind: "send-nothing"`, so the value is handled, not merely tolerated.
+  //
+  // Rejecting it here made that distinction unreachable from the CLI. The full
+  // vocabulary and its two-sided controls live in
+  // `test/reasoning-effort-vocabulary.test.ts`; this row keeps the enum-message
+  // shape it was written for.
+  assert.equal(parseReasoningEffort("default"), "default");
+  assert.equal(parseReasoningEffort("ultra"), "ultra");
+  for (const bad of ["", "banana"]) {
     assert.throws(
       () => parseReasoningEffort(bad),
-      /Invalid reasoning effort.*low, medium, high, xhigh, max/,
+      /Invalid reasoning effort.*low, medium, high, xhigh, max, ultra/,
       `expected ${JSON.stringify(bad)} to be rejected`,
     );
   }
