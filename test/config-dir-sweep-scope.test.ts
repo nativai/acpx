@@ -353,3 +353,80 @@ test("0bac6a00 §4: the spawn-time scoping touches nothing for `--help` or a non
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// §5 / §7 at the CLI — the preview previews, and the census is not behind a flag
+// ---------------------------------------------------------------------------
+
+test("0bac6a00 §7: the census prints WITHOUT --verbose", async () => {
+  // ⚠️ EVERY POPULATION THIS SWEEP REPORTS EXISTS TO BE READ — `scanned=0 means NOT
+  // RUN`, `unmeasured` separate from `liveProcess`, the root it walked. Behind
+  // `--verbose` none of them is seen, and a sweep that removes things silently is
+  // the shape of every incident in this thread.
+  await withTempHomeFixture("acpx-0bac6a00-census-", async (homeDir) => {
+    const isolated = isolatedHarnessConfigDirRoot();
+    plantAgedConfigDir(isolated, "acpx-opencode-0bac6a00-census");
+    const result = await runCliUnguarded(
+      ["claude", "sessions", "prune", "--whole-box"], // NO --verbose
+      homeDir,
+    );
+    const census = censusLine(result.stderr);
+    assert.ok(census.includes(`root=${isolated}`), census);
+    assert.match(census, /entriesRead=\d+/);
+    assert.match(census, /unmeasured=\d+/);
+  });
+});
+
+test("0bac6a00 §5: `sessions prune --dry-run` PREVIEWS the sweep instead of skipping it", async () => {
+  // ⚠️ THE DEFECT: `--dry-run` returned BEFORE the sweep, so the mode that needs no
+  // scope was the mode that never swept — and it read as a clean preview. An
+  // operator on a shared box reaching for the safest option got the one answer that
+  // could not be wrong because it was never computed.
+  await withTempHomeFixture("acpx-0bac6a00-dryrun-", async (homeDir) => {
+    const isolated = isolatedHarnessConfigDirRoot();
+    const orphan = plantAgedConfigDir(isolated, "acpx-opencode-0bac6a00-dryrun");
+    const result = await runCliUnguarded(["claude", "sessions", "prune", "--dry-run"], homeDir);
+    const census = censusLine(result.stderr);
+    assert.match(census, /DRY RUN — nothing was removed/);
+    assert.match(census, /wouldRemove=1/);
+    // The per-candidate plan, which is what makes it a preview and not a count.
+    assert.match(result.stderr, /REMOVE .*acpx-opencode-0bac6a00-dryrun \(unrecognised/);
+    // And it removed nothing.
+    assert.equal(existsSync(orphan), true, "a DRY RUN removed a directory");
+  });
+});
+
+test("0bac6a00: `sessions sweep-config-dirs` reaps WITHOUT deleting any session record", async () => {
+  // ⚠️ THE COUPLING THIS BREAKS. Before this verb the only caller of the sweep was
+  // `sessions prune`, which removes each record AND its messages sidecar — so
+  // reclaiming a leaked directory cost a transcript, which is why no agent was
+  // permitted to run it and why the backlog accumulated with no reaper.
+  await withTempHomeFixture("acpx-0bac6a00-verb-", async (homeDir) => {
+    const isolated = isolatedHarnessConfigDirRoot();
+    const orphan = plantAgedConfigDir(isolated, "acpx-opencode-0bac6a00-verb");
+    const before = await runCliUnguarded(["claude", "sessions", "list"], homeDir);
+
+    const result = await runCliUnguarded(["claude", "sessions", "sweep-config-dirs"], homeDir);
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(censusLine(result.stderr), /removed=1/);
+    assert.equal(existsSync(orphan), false, "the verb did not reap the orphan");
+
+    // The store is untouched — same listing before and after.
+    const after = await runCliUnguarded(["claude", "sessions", "list"], homeDir);
+    assert.equal(after.stdout, before.stdout, "the sweep verb changed the session store");
+  });
+});
+
+test("0bac6a00: `sessions sweep-config-dirs --dry-run` previews and removes nothing", async () => {
+  await withTempHomeFixture("acpx-0bac6a00-verbdry-", async (homeDir) => {
+    const isolated = isolatedHarnessConfigDirRoot();
+    const orphan = plantAgedConfigDir(isolated, "acpx-opencode-0bac6a00-verbdry");
+    const result = await runCliUnguarded(
+      ["claude", "sessions", "sweep-config-dirs", "--dry-run"],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stderr, /DRY RUN — nothing was removed/);
+    assert.equal(existsSync(orphan), true);
+  });
+});
