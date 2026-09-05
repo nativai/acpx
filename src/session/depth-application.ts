@@ -4,9 +4,9 @@ import type { HarnessId } from "../acp/harness-capabilities.js";
 import { withTimeout } from "../async-control.js";
 import type { SessionRecord } from "../types.js";
 import {
+  advertisedServedEffort,
   type DepthProjection,
-  describePiWireDepthCollapse,
-  piWireDepthValue,
+  describeAdvertisedServedEffort,
   projectDepthOntoLadder,
   rejectedDepthProjection,
 } from "./depth-projection.js";
@@ -51,7 +51,7 @@ export async function applyDepthAsMode(params: {
   if (params.modes?.currentModeId === projection.value) {
     // Already there; nothing to send. The mode is the agent's own word, but the
     // WIRE collapse applies just the same — so this arm is downgraded too.
-    return withWireCollapse(projection, params.harness);
+    return withWireCollapse(projection, params.harness, params.modes);
   }
   try {
     await withTimeout(
@@ -66,15 +66,15 @@ export async function applyDepthAsMode(params: {
     reportDepth(params.verbose, rejected.reason);
     return rejected;
   }
-  reportDepth(params.verbose, describePiWireDepthCollapse(projection.value));
-  const served = withWireCollapse(projection, params.harness);
+  reportDepth(params.verbose, describeAdvertisedServedEffort(params.modes, projection.value));
+  const served = withWireCollapse(projection, params.harness, params.modes);
   reportDepth(params.verbose, served.reason);
   return served;
 }
 
 /**
- * Fold the harness's WIRE collapse into the recorded outcome (F-14's rule, second
- * writer — brick 06ae06c1 as corrected).
+ * Fold the agent's OWN advertised wire value into the recorded outcome (F-14's
+ * rule, second writer — brick 06ae06c1 as corrected, then corrected again by B5).
  *
  * ⚠️ THIS REVERSES A DECISION I MADE IN THE ORIGINAL MODE ARM. The comment that
  * stood here said the collapse "is a property of Pi, not of acpx's projection, so
@@ -87,38 +87,48 @@ export async function applyDepthAsMode(params: {
  * same defect F-14 fixes on the config-option arm; the writer differs, the rule
  * does not.
  *
+ * 🛑 AND THE FIRST VERSION OF THIS FIX WAS ITSELF WRONG — worth stating, because
+ * it shipped. It folded in a FROZEN, MODEL-INDEPENDENT table of Pi's collapse.
+ * Pi's collapse is per MODEL (`thinkingLevelMap`), and measured against pi
+ * 0.84.4's catalogue **no model has the shape that table encoded** — so the
+ * "honest" record was a different wrong answer, with more confidence behind it.
+ * The served value is now read from the agent's own advertisement
+ * (`_meta.piAcp.servedEffort`, nativai `pi-acp` fork) and NOTHING is folded in
+ * when the adapter did not say. A missing served value is a gap; an invented one
+ * is a lie that reads like a measurement.
+ *
  * ⚠️ IT ONLY EVER DOWNGRADES. An `exact` can become `projected`; a `projected`
  * never becomes `exact`. So a request that acpx already had to move (e.g. `max`
  * onto a ladder topping out at `xhigh`) stays `projected` even where the collapse
  * happens to land back on the requested level — because acpx did not send what
  * was asked for, which is the fact the reader needs.
- *
- * The advertised-vs-served gap ITSELF is not fixable here — pi-acp advertises six
- * rungs and serves three, and the advertisement is a genuine wire artifact
- * (brick f13fdceb, B5). This makes the RECORD honest today without touching it.
  */
 function withWireCollapse(
   projection: DepthProjection,
   harness: HarnessId | undefined,
+  modes: SessionModeState | undefined,
 ): DepthProjection {
-  // ⚠️ GATED ON THE HARNESS, because the table is Pi's and only Pi's. `mode` is
-  // Pi's mechanism alone today, but an ungated table would silently attribute
-  // Pi's collapse to the next harness that adopts the mode selector — and it
-  // would look exactly like a correct record.
-  if (harness !== "pi" || projection.value === undefined) {
+  if (projection.value === undefined) {
     return projection;
   }
-  const served = piWireDepthValue(projection.value);
+  // The harness gate stays: a `_meta.piAcp` block is pi-acp's own vocabulary, and
+  // reading it from another agent's advertisement would attribute pi's semantics
+  // to something that never agreed to them.
+  if (harness !== "pi") {
+    return projection;
+  }
+  const served = advertisedServedEffort(modes, projection.value);
   if (served === undefined || served === projection.value) {
     return projection;
   }
   return {
     kind: "projected",
-    value: served,
+    value: served ?? "none",
     requested: projection.requested,
     reason:
-      `"${projection.requested}" is advertised by pi but not served: acpx sent mode "${projection.value}", ` +
-      `which pi collapses to "${served}" at the wire (measured, I2 R8)`,
+      served === null
+        ? `"${projection.requested}" was applied as mode "${projection.value}", but the agent advertises that this model sends NO reasoning parameter for it — reasoning is off`
+        : `"${projection.requested}" was applied as mode "${projection.value}", which the agent advertises it serves as effort "${served}" for this model`,
   };
 }
 

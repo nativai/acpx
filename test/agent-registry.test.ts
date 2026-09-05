@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import test from "node:test";
 import {
   AGENT_REGISTRY,
@@ -8,6 +9,8 @@ import {
   resolveBuiltInAgentLaunch,
   resolveInstalledBuiltInAgentLaunch,
   resolveAgentCommand,
+  resolvePiAcpCommand,
+  PI_ACP_FORK_PATH,
 } from "../src/agent-registry.js";
 
 test("resolveAgentCommand maps known agents to commands", () => {
@@ -170,13 +173,44 @@ test("claude and codex are not built-in packages so the /opt fork commands spawn
   assert.equal(resolveBuiltInAgentLaunch(AGENT_REGISTRY.codex), undefined);
 });
 
-test("pi built-in uses the current adapter package range", () => {
+test("pi built-in is the nativai fork when the box has it, the pinned upstream package otherwise", () => {
+  // ⚠️ THIS ASSERTION IS DELIBERATELY TWO-VALUED, AND THE PREVIOUS ONE-VALUED
+  // FORM WAS A TRAP. It read `assert.equal(AGENT_REGISTRY.pi, "npx pi-acp@^0.0.33")`,
+  // which passes on a box with no `/opt/pi-acp` and fails on every box where the
+  // fork IS installed — i.e. it would have gone red on exactly the boxes where
+  // the product is working as intended, as soon as the bootstrap rolled out.
+  //
   // ⚠️ `^0.0.33` is an EXACT pin under npm semver (a caret on 0.0.x allows only
-  // that patch), so this literal IS the version acpx launches, and changing it is
-  // a deliberate act. Bumped 0.0.26 → 0.0.33 by B0.2 (npm latest, published
-  // 2026-07-30). Verified on the rig by the SPAWN LINE, not by this string —
-  // program row `G1-PIN-01`.
-  assert.equal(AGENT_REGISTRY.pi, "npx pi-acp@^0.0.33");
+  // that patch), so that literal IS the upstream version acpx launches when it
+  // falls back. Which of the two actually ran is settled by the SPAWN LINE, never
+  // by this string — program rows `G1-PIN-01` / `G4-PI-01`.
+  const forkInstalled = existsSync("/opt/pi-acp/dist/index.js");
+  assert.equal(
+    AGENT_REGISTRY.pi,
+    forkInstalled ? "node /opt/pi-acp/dist/index.js" : "npx pi-acp@^0.0.33",
+    `/opt/pi-acp/dist/index.js ${forkInstalled ? "exists" : "does not exist"} on this box`,
+  );
+});
+
+test("pi command resolution: env seam wins, then the fork, then the pinned upstream", () => {
+  // The env seam is the one claude/codex/claude-pty already have; I2 recorded its
+  // absence for pi as a gap (no `ACPX_PI_ACP_COMMAND`, so the only overrides were
+  // editing this file or acpx config).
+  const present = () => true;
+  const absent = () => false;
+
+  assert.equal(
+    resolvePiAcpCommand({ ACPX_PI_ACP_COMMAND: "node /tmp/custom-pi-acp.js" }, present),
+    "node /tmp/custom-pi-acp.js",
+    "the env seam must win even when the fork is installed",
+  );
+  assert.equal(resolvePiAcpCommand({}, present), `node ${PI_ACP_FORK_PATH}`);
+  assert.equal(resolvePiAcpCommand({}, absent), "npx pi-acp@^0.0.33");
+  assert.equal(
+    resolvePiAcpCommand({ ACPX_PI_ACP_COMMAND: "   " }, absent),
+    "npx pi-acp@^0.0.33",
+    "a blank override is not an override",
+  );
 });
 
 test("resolveInstalledBuiltInAgentLaunch returns undefined now that no built-in packages remain", () => {

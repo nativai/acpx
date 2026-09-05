@@ -49,8 +49,46 @@ type BuiltInLaunchResolverOptions = {
   resolveNpmCliPath?: (execPath: string) => string;
 };
 
+/**
+ * Pi's adapter command — the nativai fork when the box has it, upstream's
+ * published package otherwise (B5, brick ef5999ca).
+ *
+ * ⚠️ THIS IS THE ONE REGISTRY ENTRY THAT IS NOT A CONSTANT, AND THE REASON IS A
+ * TRANSITION, NOT A PREFERENCE. `claude`/`codex`/`claude-pty` point at their
+ * `/opt` forks unconditionally because every box's bootstrap builds them. Pi's
+ * fork is new: a box whose bootstrap predates it has no `/opt/pi-acp`, and an
+ * unconditional path there would break `pi` outright on that box rather than
+ * degrade. So the fork is used when it is present and upstream when it is not —
+ * and **the spawn line, not this string, is what tells you which one ran**
+ * (`G4-PI-01`).
+ *
+ * The upstream fallback is REMOVABLE ONLY once every box in the fleet builds
+ * `/opt/pi-acp`; until then, deleting it silently converts "this box is behind"
+ * into "pi does not work here".
+ *
+ * ⚠️ The capability descriptor (`harness-capabilities.ts`) describes the FORK —
+ * `session/set_model`, `session/fork`, usage over ACP. On a box still falling
+ * back to upstream those three are advertised and refused at the wire, which is
+ * exactly the drift `G4-PI-01` exists to catch. The fallback is a safety net for
+ * a box mid-rollout, not a supported configuration.
+ */
+export const PI_ACP_FORK_PATH = "/opt/pi-acp/dist/index.js";
+
+export function resolvePiAcpCommand(
+  env: NodeJS.ProcessEnv = process.env,
+  existsSync: (path: string) => boolean = fs.existsSync,
+): string {
+  const override = env.ACPX_PI_ACP_COMMAND?.trim();
+  if (override) {
+    return override;
+  }
+  return existsSync(PI_ACP_FORK_PATH)
+    ? `node ${PI_ACP_FORK_PATH}`
+    : `npx pi-acp@${ACP_ADAPTER_PACKAGE_RANGES.pi}`;
+}
+
 export const AGENT_REGISTRY: Record<string, string> = {
-  pi: `npx pi-acp@${ACP_ADAPTER_PACKAGE_RANGES.pi}`,
+  pi: resolvePiAcpCommand(),
   openclaw: "openclaw acp",
   codex: process.env.ACPX_CODEX_ACP_COMMAND || `node /opt/codex-acp/dist/index.js`,
   claude: process.env.ACPX_CLAUDE_ACP_COMMAND || `node /opt/claude-agent-acp/dist/index.js`,
