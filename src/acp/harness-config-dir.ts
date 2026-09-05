@@ -547,58 +547,77 @@ export function pruneOrphanHarnessConfigDirs(params: {
   }
   const liveScan = params.liveScan;
 
+  const pass = sweepCandidatePass(candidates, retainedBy, {
+    records: params.records,
+    liveScan,
+    now,
+    orphanMinAgeMs,
+    dryRun,
+  });
+  return { root, dryRun, ...pass, retainedBy, notMeasured: false };
+}
+
+/**
+ * The per-candidate pass — every candidate classified once, and the ONLY place a
+ * removal is performed. Split out of {@link pruneOrphanHarnessConfigDirs} so the
+ * function above reads as *root, refusal, rule* rather than as a loop, and so the
+ * decision to delete lives in one small body a reviewer can hold entirely.
+ */
+function sweepCandidatePass(
+  candidates: readonly { dir: string; sessionId: string }[],
+  retainedBy: HarnessConfigDirPruneResult["retainedBy"],
+  ctx: {
+    records: ReadonlyMap<string, KnownSessionRecord>;
+    liveScan: LiveProcessScan;
+    now: number;
+    orphanMinAgeMs: number;
+    dryRun: boolean;
+  },
+): Omit<HarnessConfigDirPruneResult, "root" | "dryRun" | "retainedBy" | "notMeasured"> {
   const removed: string[] = [];
   const wouldRemove: string[] = [];
   const details: ConfigDirCandidateReport[] = [];
-  let scanned = 0;
   let retained = 0;
   let oldestUnclaimedAgeMs: number | undefined;
   for (const { dir, sessionId } of candidates) {
-    scanned += 1;
-    const verdict = classifyConfigDir(dir, sessionId, {
-      records: params.records,
-      liveScan,
-      now,
-      orphanMinAgeMs,
-    });
+    const verdict = classifyConfigDir(dir, sessionId, ctx);
     if (verdict.unclaimedAgeMs !== undefined) {
       oldestUnclaimedAgeMs = Math.max(oldestUnclaimedAgeMs ?? 0, verdict.unclaimedAgeMs);
     }
-    details.push({
-      dir,
-      retain: verdict.retain,
-      reason: verdict.reason,
-      ...(verdict.unclaimedAgeMs === undefined ? {} : { unclaimedAgeMs: verdict.unclaimedAgeMs }),
-    });
+    details.push(toCandidateReport(dir, verdict));
     if (verdict.retain) {
       retained += 1;
       retainedBy[verdict.reason] += 1;
-      continue;
-    }
-    if (dryRun) {
+    } else if (ctx.dryRun) {
       // ⚠️ NOT pushed into `removed`. That field is what an operator greps to answer
       // "what did this delete?", and a preview writing into it would make one field
       // mean two different things depending on a flag the reader may not have seen.
       wouldRemove.push(dir);
-      continue;
-    }
-    if (!removeDir(dir, removed)) {
+    } else if (!removeDir(dir, removed)) {
       retained += 1;
       retainedBy.removeFailed += 1;
     }
   }
   return {
-    root,
-    dryRun,
-    scanned,
+    scanned: candidates.length,
     removed,
     wouldRemove,
     candidates: details,
     retained,
-    retainedBy,
     oldestUnclaimedAgeMs,
-    notMeasured: false,
   };
+}
+
+/** Optional `unclaimedAgeMs` spread once, so the loop above stays a rule. */
+function toCandidateReport(dir: string, verdict: ConfigDirVerdict): ConfigDirCandidateReport {
+  return verdict.unclaimedAgeMs === undefined
+    ? { dir, retain: verdict.retain, reason: verdict.reason }
+    : {
+        dir,
+        retain: verdict.retain,
+        reason: verdict.reason,
+        unclaimedAgeMs: verdict.unclaimedAgeMs,
+      };
 }
 
 /**
@@ -781,8 +800,8 @@ export function describeHarnessConfigDirSweepPlan(result: HarnessConfigDirPruneR
     );
   }
   const verb = result.dryRun ? "would remove" : "removed";
-  const lines = [...result.candidates]
-    .sort((a, b) => (a.dir < b.dir ? -1 : a.dir > b.dir ? 1 : 0))
+  const lines = result.candidates
+    .toSorted((a, b) => (a.dir < b.dir ? -1 : a.dir > b.dir ? 1 : 0))
     .map((candidate) => {
       const decision = candidate.retain ? "RETAIN" : verb.toUpperCase();
       const age =

@@ -3761,6 +3761,27 @@ function knownRecordsById(
   return records;
 }
 
+/**
+ * Fold a DRY RUN's would-close ids into the records map as closed.
+ *
+ * ⚠️ WITHOUT THIS THE PREVIEW UNDER-REPORTS, AND IN THE REASSURING DIRECTION. A real
+ * prune closes ownerless records first, and only then does the directory pass see
+ * them as closed and become willing to remove their dirs. On a dry run nothing was
+ * actually closed, so the re-read returns the state that PRECEDED the record sweep
+ * and every such directory is retained as `openRecord` — the preview omits exactly
+ * the set the record sweep exists to release. Empty list on a real run, where the
+ * store already carries the closes.
+ */
+function withDryRunCloses(
+  records: Map<string, { closed: boolean }>,
+  wouldClose: readonly string[],
+): Map<string, { closed: boolean }> {
+  for (const id of wouldClose) {
+    records.set(id, { closed: true });
+  }
+  return records;
+}
+
 async function sweepOrphanHarnessConfigDirs(
   session: Awaited<ReturnType<typeof loadSessionModule>>,
   dryRun: boolean,
@@ -3806,18 +3827,10 @@ async function sweepOrphanHarnessConfigDirs(
 
     // Re-read AFTER the record sweep, so the directory pass sees the closes it
     // just made rather than the state that preceded them.
-    //
-    // ⚠️ ON A DRY RUN NOTHING WAS ACTUALLY CLOSED, so the re-read returns the state
-    // that PRECEDED the record sweep and the directory pass would retain every dir
-    // pinned by a still-open record — under-reporting the preview by exactly the
-    // set the record sweep exists to release. Overlaying the would-close ids is
-    // what makes the preview model the real run's ORDERING rather than its own.
-    const records = knownRecordsById(await session.listSessions());
-    if (dryRun) {
-      for (const id of recordSweep.closed) {
-        records.set(id, { closed: true });
-      }
-    }
+    const records = withDryRunCloses(
+      knownRecordsById(await session.listSessions()),
+      dryRun ? recordSweep.closed : [],
+    );
     const swept = pruneOrphanHarnessConfigDirs({ records, liveScan, rootDir, dryRun });
     // ⚠️ PRINTED BY DEFAULT, NOT UNDER --verbose (CONCEPTION §7). Every population
     // this carries — `scanned=0 means NOT RUN`, `retainedBy`, `unmeasured` — exists
