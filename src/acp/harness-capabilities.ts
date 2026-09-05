@@ -34,6 +34,50 @@ import { acpAdapterKind } from "./agent-command.js";
  *   - `I2 R<n>` — FINDINGS-pi, brick c239d784 (measured 2026-09-03 on devbox)
  *   - `MAP §<n>` — CURRENT-STATE-capability-map, brick 2decfc57 (source reads, [V])
  *   - a `file:line` in this repo or in a deployed adapter under `/opt`.
+ *
+ * ## The `<boolean>` / `<field>Reason` naming rule — so the NEXT field answers itself
+ *
+ * A capability boolean that can be denied carries a sibling reason string on the
+ * wire. **The reason key is the boolean with its capability PREFIX stripped, plus
+ * `Reason`** — `supports`/`canSet` is the prefix:
+ *
+ *   `supportsSessionClear`  → `sessionClearReason`
+ *   `canSetCredentialLive`  → `credentialLiveReason`
+ *   `supportsModelDegrade`  → `modelDegradeReason`
+ *
+ * **The one exception, named rather than hidden: `canSetModelLive`'s reason is
+ * `liveModelChangeReason`, not `modelLiveReason`.** It is a legacy one-off that
+ * predates the rule; it is on the wire and consumed by acpx-ui, and a breaking
+ * rename for symmetry is a bad trade (ruled by the descriptor owner, 2026-09-05).
+ * Two conventions, one stated rule and one named exception — write the next field
+ * to the rule.
+ *
+ * Every pair obeys the same invariant, and it is STRUCTURAL rather than
+ * conventional: the reason lives on {@link HarnessCapabilityFacts} as a plain
+ * `string` and {@link deriveHarnessCapabilities} is the ONLY thing that puts it on
+ * the wire, nulling it when its boolean is true. **A non-null reason therefore
+ * cannot accompany a `true`.**
+ *
+ * ## The three-state convention — mechanical, not a habit
+ *
+ * ⛔ **THERE IS NO THIRD STATE ON THE WIRE.** These keys are ALWAYS PRESENT on all
+ * five harness blocks and every boolean is a real boolean: never a placeholder,
+ * never a null boolean, never an omitted key. A consumer separates the three
+ * states it cares about by TOKEN, at the front of the reason string:
+ *
+ *   - `not measured: …`     — OURS. The key is present and the boolean is `false`,
+ *                             but the cell was never measured against this
+ *                             harness's ADAPTER. The reason names exactly what is
+ *                             missing. This is an honest deliverable, not a gap.
+ *   - `descriptor absent: …` — THE CONSUMER'S, never written here. An old acpx that
+ *                             serves no descriptor, or omits the key.
+ *   - a bare reason          — a REAL, MEASURED denial.
+ *
+ * ⚠️ **`not measured:` is the only defence against the defect this table exists to
+ * end.** A cell whose adapter was never probed must NOT be given a confident
+ * `false`: a confident false is indistinguishable from a measured denial, outlives
+ * whoever wrote it, and cannot be found again. If you measure such a cell, replace
+ * the token with the real reason and cite the build you measured it on.
  */
 
 export const HARNESS_IDS = ["claude", "claude-pty", "codex", "opencode", "pi"] as const;
@@ -206,6 +250,70 @@ export interface HarnessCapabilities {
   /** `"source:id"` — derived from {@link HarnessCapabilityFacts.defaultModel}. */
   defaultModelKey: string;
 
+  // ── C5 §8.4 continued: three HAND-WRITTEN measurements + their derived reasons ──
+  //
+  // ⚠️ THESE THREE BOOLEANS ARE NOT DERIVED, AND THE ASYMMETRY WITH
+  // `canSetModelLive` IS DELIBERATE — recorded rather than papered over. There is
+  // no mechanism field to derive them from, and inventing one to satisfy the
+  // "hand-written true is a TYPE ERROR" protection above would be a fabricated
+  // derivation: worse than an honest hand-written cell, because it would look
+  // checked. They are therefore ABSENT from the `Omit` in
+  // {@link HarnessCapabilityFacts} (their reasons are not), and their only
+  // defences are the `not measured:` token, an adapter-identity citation beside
+  // each cell, and `test/harness-capabilities.test.ts`.
+  //
+  // ⚠️ EACH IS A FACT ABOUT THE ADAPTER, NEVER ABOUT THE HARNESS'S NAME. That is
+  // the whole point: acpx-ui answered all three with `agentType === "claude"`, so
+  // pi's and opencode's values were "measured" against no adapter at all and no
+  // adapter swap could ever change them (brick 82a2aafd, discharging 29b8ce8a).
+
+  /**
+   * Can this harness clear a session's conversation IN PLACE, keeping the acpx
+   * session alive?
+   *
+   * The mechanism is a passthrough: acpx-ui posts the literal prompt text
+   * `/clear` (`ChatView.tsx:5012-5024` at acpx-ui `6a45e58`) and acpx forwards it
+   * verbatim — **acpx itself has no `/clear` concept anywhere** (measured: zero
+   * occurrences in `src/`). So this cell asks whether the HARNESS executes
+   * `/clear` as a slash command rather than answering it as an ordinary user
+   * message.
+   *
+   * ⚠️ A wrong `true` here is the silent-wrong-answer class: the client draws the
+   * context boundary from the presence of its own `/clear` message, so a harness
+   * that merely *replied* to the text produces an identical-looking boundary that
+   * hides history which is still in context.
+   */
+  supportsSessionClear: boolean;
+  /** Why not. `null` when {@link supportsSessionClear} is true. */
+  sessionClearReason: string | null;
+
+  /**
+   * Can this harness's CREDENTIAL be moved on an ALREADY-RUNNING session, without
+   * creating a new one?
+   *
+   * ⚠️ **NOT `supportsProfiles`**, which asks only whether a profile can be bound
+   * AT CREATION. codex is `supportsProfiles: true` and `canSetCredentialLive:
+   * false` — reusing the create-time answer here would unlock a live control the
+   * seam refuses at `account-seam.ts:187`.
+   */
+  canSetCredentialLive: boolean;
+  /** Why not. `null` when {@link canSetCredentialLive} is true. */
+  credentialLiveReason: string | null;
+
+  /**
+   * Does this harness support acpx's automatic model DEGRADE — the Fable→Opus
+   * rewrite that keeps a session running instead of raising a terminal when every
+   * subscription is cleanly Fable-exhausted (`src/session/fable-degrade.ts`,
+   * brick://4d517be2)?
+   *
+   * Gates the degrade footer in acpx-ui's model control. `false` does not mean the
+   * harness cannot change model — it means acpx has no degrade path that reaches
+   * this harness.
+   */
+  supportsModelDegrade: boolean;
+  /** Why not. `null` when {@link supportsModelDegrade} is true. */
+  modelDegradeReason: string | null;
+
   // ── C4 additions: the mechanism, for the CLI and the apply paths ──
   arbitraryModelSupport: ArbitraryModelSupport;
   model: HarnessModelSupport;
@@ -230,6 +338,12 @@ export type HarnessCapabilityFacts = Omit<
   | "liveModelChangeReason"
   | "acceptsArbitraryModelIds"
   | "defaultModelKey"
+  // The three REASONS are derived (nulled when their boolean is true); the three
+  // BOOLEANS above them are hand-written and stay in, per the note on
+  // `supportsSessionClear` in {@link HarnessCapabilities}.
+  | "sessionClearReason"
+  | "credentialLiveReason"
+  | "modelDegradeReason"
 > & {
   defaultModel: HarnessDefaultModel;
   /**
@@ -238,6 +352,18 @@ export type HarnessCapabilityFacts = Omit<
    * stale into the UI — {@link deriveHarnessCapabilities} returns null there.
    */
   liveModelChangeBlockedReason: string;
+  /**
+   * Why {@link HarnessCapabilities.supportsSessionClear} is false. Plain `string`,
+   * never null — the null-when-true is the derivation's job, exactly as for
+   * {@link liveModelChangeBlockedReason}. Begins with `not measured: ` when this
+   * harness's adapter has not been probed (see the three-state convention in the
+   * file header).
+   */
+  sessionClearBlockedReason: string;
+  /** Why {@link HarnessCapabilities.canSetCredentialLive} is false. Same contract. */
+  credentialLiveBlockedReason: string;
+  /** Why {@link HarnessCapabilities.supportsModelDegrade} is false. Same contract. */
+  modelDegradeBlockedReason: string;
   /**
    * **The adapter build every claim in this block was measured against**
    * (brick 4791a88c).
@@ -442,6 +568,15 @@ export function deriveHarnessCapabilities(facts: HarnessCapabilityFacts): Harnes
     supportsOutputStyles: facts.supportsOutputStyles,
     acceptsArbitraryModelIds: deriveAcceptsArbitraryModelIds(facts.arbitraryModelSupport, facts.id),
     defaultModelKey: deriveDefaultModelKey(facts.defaultModel),
+    // The three hand-written booleans ride through unchanged; only their reasons
+    // are derived — null IFF the boolean is true, the same rule
+    // `liveModelChangeReason` follows one line above.
+    supportsSessionClear: facts.supportsSessionClear,
+    sessionClearReason: facts.supportsSessionClear ? null : facts.sessionClearBlockedReason,
+    canSetCredentialLive: facts.canSetCredentialLive,
+    credentialLiveReason: facts.canSetCredentialLive ? null : facts.credentialLiveBlockedReason,
+    supportsModelDegrade: facts.supportsModelDegrade,
+    modelDegradeReason: facts.supportsModelDegrade ? null : facts.modelDegradeBlockedReason,
     arbitraryModelSupport: facts.arbitraryModelSupport,
     model: { ...facts.model },
     depth: { ...facts.depth },
@@ -502,6 +637,48 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
     primerChannel: "system-prompt", // `_meta.systemPrompt`, resolvePrimerChannel (src/acp/agent-command.ts)
     usageReporting: true, // MAP §3.1 — `usage_update`
     promptImages: true, // MAP §3.1 — `promptCapabilities.image: true`
+    // ⚠️ TRUE PRESERVES SHIPPED BEHAVIOUR AND ITS LAST LINK IS UNPROVEN — say so
+    // rather than let the cell read as fully measured. MEASURED in the harness
+    // binary both Claude adapters drive (`claude --version` = 2.1.251 at
+    // /home/node/.local/share/claude/versions/2.1.251; `grep -ao` 2026-09-05, with
+    // a positive control on "Claude Code" = 4427 hits and a planted negative = 0):
+    //   name:"clear",description:"Start a new session with empty context; previous
+    //   session stays on disk (resumable with /resume)"
+    // — so `/clear` is a real slash command of the harness, not text it answers.
+    // NOT measured: that the SDK path claude-agent-acp drives EXECUTES it (the
+    // adapter itself has ZERO `/clear` occurrences in /opt/claude-agent-acp/dist,
+    // control `session/new` = 6 — it forwards the text untouched). `true` is what
+    // acpx-ui has shipped for claude since before this descriptor existed
+    // (agentCapabilities.ts R1 at 6a45e58); this brick must not change claude
+    // behaviour, and flipping it to false would remove a working control.
+    supportsSessionClear: true,
+    sessionClearBlockedReason:
+      "This harness does not execute /clear as a slash command, so the text would be answered as an ordinary message and the context would stay.",
+    // MEASURED, and dispatched on the ADAPTER: `switchSessionAccount` — the one
+    // credential-move seam, reached by `acpx <agent> set profile` via
+    // `setSessionProfile` (src/cli/session/session-control.ts:343-377) — admits a
+    // record only through `assertClaudeFamilySeam`
+    // (src/runtime/engine/account-seam.ts:111-120 → `isClaudeFamilyAgent`,
+    // src/acp/agent-command.ts:226-232, whose set is {claude, claude-pty}). The move
+    // is a record edit + transcript port + owner restart, so the SESSION survives
+    // even though the adapter process does not — which is what "live" means here.
+    // A `subscription` profile has a transcript anchor (`credentialSource`,
+    // src/config/profiles.ts:854-865), so `requireAnchor` (:82-90) passes.
+    canSetCredentialLive: true,
+    credentialLiveBlockedReason:
+      "acpx's credential move is Claude-family only: this session's adapter has no Claude account to move and no Claude transcript to port.",
+    // MEASURED end to end in source at this commit: the degrade fires ONLY inside
+    // the subscription failover engine — `resolveFailoverRecord`
+    // (src/cli/session/runtime.ts:1367-1378) → `failoverEnabledForRecord`
+    // (src/runtime/engine/failover.ts:582-590, needs a profile with a non-null
+    // `transcriptAnchorDir`) → `prepareFableShortCircuit` (:372-393, needs
+    // `isFableModel` + a `rate_limit` trigger) → `applyFableDegrade` (:337-339,
+    // src/session/fable-degrade.ts:79-86). A `subscription` profile satisfies the
+    // anchor and Fable is offerable here, so claude is the harness the path was
+    // built for (brick://4d517be2).
+    supportsModelDegrade: true,
+    modelDegradeBlockedReason:
+      "acpx's Fable→Opus degrade runs only inside the Claude-subscription failover engine, which does not reach this harness.",
     defaultModel: { source: "claude-subscription", id: "default" }, // C5 §8.4's own example
     liveModelChangeBlockedReason:
       "acpx has no live model path for this harness; recreate the session with a different --model.",
@@ -546,6 +723,43 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
     primerChannel: "system-prompt", // `_meta.systemPrompt` re-applied on every (re)launch, :1889-1893
     usageReporting: true, // MAP §3.1 — same wire shape; cost derived from a pricing table
     promptImages: true, // MAP §3.1 — `image:true`
+    // ⚠️ NOT MEASURED, AND THE TEMPTING ANSWER IS THE DANGEROUS ONE. The harness
+    // binary is the SAME Claude Code 2.1.251 that defines `/clear` (see the claude
+    // block), and this adapter drives it as a LIVE TUI where slash commands
+    // certainly work — so "obviously true" is the reading that will suggest itself.
+    // What nobody has measured is the only link that matters: whether a PROMPT
+    // arrives at the TUI as typed input that the TUI then executes as a slash
+    // command, or is routed some other way. `sendSlashCommand` exists in
+    // claude-pty-acp for `/model` (MAP §3.1, :4648-4688) — which is evidence that a
+    // prompt is NOT automatically a slash command, since one had to be built.
+    // A wrong `true` here would show a "Clear context" button that draws a boundary
+    // over history the harness still holds.
+    supportsSessionClear: false,
+    sessionClearBlockedReason:
+      "not measured: no probe has sent /clear as a prompt through claude-pty-acp and checked whether the TUI executed it as a slash command or answered it as a message. The underlying Claude Code binary does define /clear.",
+    // MEASURED, same seam as claude: `claude-pty` is in `CLAUDE_FAMILY_ADAPTER_KINDS`
+    // (src/acp/agent-command.ts:192) so `assertClaudeFamilySeam` admits it, and a
+    // `claude-home` profile's anchor is `<homePath>/.claude`
+    // (src/config/profiles.ts:854-865), so `requireAnchor` passes. This is the
+    // "unified SDK-subscription + claude-pty-bridge move" the handler's own comment
+    // names (src/cli/command-handlers.ts:2283-2289).
+    canSetCredentialLive: true,
+    credentialLiveBlockedReason:
+      "acpx's credential move is Claude-family only: this session's adapter has no Claude account to move and no Claude transcript to port.",
+    // ⚠️ NOT MEASURED, AND THE TWO HALVES OF THE CHAIN DISAGREE — which is exactly
+    // why this is a token and not a confident false. The GATE admits claude-pty: it
+    // is Claude-family and a `claude-home` profile has a non-null anchor, so
+    // `failoverEnabledForRecord` is true. The TRIGGER looks unreachable: the
+    // degrade needs `isFableModel(session_options.model)`
+    // (src/runtime/engine/failover.ts:383) and this adapter's catalogue is the
+    // static [opus, sonnet, haiku] (MAP §3.1, claude-pty-acp:149-154), so no Fable
+    // model should be pinnable — but whether acpx can STORE an unadvertised model
+    // id on the record before the adapter rejects it is not measured, and the
+    // fable-share probe reads the SUBSCRIPTION registry regardless of this
+    // session's `claude-home` profile. Two readings, no probe: do not pick one.
+    supportsModelDegrade: false,
+    modelDegradeBlockedReason:
+      "not measured: no probe has run a Fable-pinned claude-pty session through a rate-limit failover. The gate admits claude-home profiles, but the adapter's static [opus, sonnet, haiku] catalogue offers no Fable model to degrade FROM.",
     defaultModel: { source: "claude-home", id: "default" },
     liveModelChangeBlockedReason:
       "acpx has no live model path for this harness; recreate the session with a different --model.",
@@ -630,6 +844,39 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
     primerChannel: "developer-instructions", // `_meta.codex.developerInstructions` (MAP §3.1)
     usageReporting: true, // MAP §3.1 — from app-server `thread/tokenUsage/updated`
     promptImages: true, // MAP §3.1 — `image:true`
+    // NOT MEASURED. codex-acp forwards the prompt to the app-server
+    // (CodexCli.ts / CodexJsonRpcConnection.ts, MAP §3.4); the codex CLI has its own
+    // slash-command surface, and nobody has sent `/clear` through this adapter to
+    // see whether it reaches it. ⚠️ The adapter bundle's one apparent `/clear` hit
+    // is a SUBSTRING FALSE POSITIVE — `case "thread/goal/cleared":`
+    // (/opt/codex-acp/dist/index.js, `grep -rao` 2026-09-05). It is recorded here
+    // because it reads as evidence at a glance and is not; the same probe's
+    // claude-pty "hit" was `set/clear ACPX_PARENT_SESSION_URL` in a sourcemap.
+    supportsSessionClear: false,
+    sessionClearBlockedReason:
+      "not measured: no probe has sent /clear as a prompt through codex-acp to the codex app-server to see whether it is executed as a slash command.",
+    // MEASURED, and it is the cell that proves `supportsProfiles` is a DIFFERENT
+    // question: codex is `supportsProfiles: true` (a `chatgpt` profile binds to it
+    // at creation) and still cannot move credential live, for two independent
+    // reasons. (1) `assertClaudeFamilySeam` (src/runtime/engine/account-seam.ts:111-120)
+    // refuses every non-{claude, claude-pty} adapter BEFORE any work, and throws
+    // rather than no-ops on purpose. (2) Even inside the seam, `requireAnchor`
+    // (:82-90) would refuse: `transcriptAnchorDir` returns null for `chatgpt`
+    // (src/config/profiles.ts:854-865) — there is no Claude transcript to port.
+    canSetCredentialLive: false,
+    credentialLiveBlockedReason:
+      "acpx's credential move is Claude-family only. A chatgpt profile binds at creation but has no portable transcript anchor, so it cannot be moved on a running session — recreate the session on the other profile.",
+    // MEASURED: the degrade lives only inside the failover engine, and codex never
+    // enters it. `failoverEnabledForRecord` (src/runtime/engine/failover.ts:582-590)
+    // requires a profile with a non-null `transcriptAnchorDir`, which is null for
+    // `chatgpt` (src/config/profiles.ts:854-865) — the same carve-out that once
+    // killed every codex turn in ~13 ms (brick://792ad0a4, now generalised at
+    // failover.ts:520-554). Independently, Fable is an Anthropic model and codex's
+    // catalogue is the OpenAI app-server cross-product, so there is nothing to
+    // degrade from.
+    supportsModelDegrade: false,
+    modelDegradeBlockedReason:
+      "acpx's Fable→Opus degrade runs only inside the Claude-subscription failover engine, which a chatgpt-profile session never enters; and Fable is not in this harness's catalogue.",
     defaultModel: { source: "chatgpt", id: "default" },
     liveModelChangeBlockedReason:
       "acpx has no live model path for this harness; recreate the session with a different --model.",
@@ -694,6 +941,42 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
     // I1 R7: with no OpenRouter key the harness's own default is the Zen free
     // tier (`opencode/big-pickle`); with the box key present the intended door
     // is OpenRouter. acpx pins nothing, hence the `default` sentinel.
+    // NOT MEASURED. OpenCode has its own slash-command surface in its TUI, but over
+    // ACP acpx sends prompt text and nobody has checked whether the adapter routes
+    // `/clear` to it or passes it to the model as a message. I1 R3/R11 enumerated
+    // OpenCode's ACP surface (configOptions model/mode/effort) and no session-clear
+    // method appeared, which is an absence in an enumeration made for another
+    // question — not a probe of this one.
+    supportsSessionClear: false,
+    sessionClearBlockedReason:
+      "not measured: no probe has sent /clear as a prompt through the opencode ACP adapter to see whether OpenCode executes it as a slash command.",
+    // MEASURED, and it is a fact about the CREDENTIAL MECHANISM, not the name:
+    // OpenCode's credential is the BOX's provider key in the adapter's environment
+    // (`credential.tier: "box-provider"`, OPENROUTER_API_KEY alone activates it,
+    // I1 R6) — there is no per-session credential object for acpx to move. Two
+    // independent refusals confirm it: no `AuthMode` maps to this adapter at all
+    // (`adapterForAuthMode` is a closed switch over {claude, claude-pty, codex},
+    // src/config/profiles.ts:145-156, MAP §2.2 "a fourth harness cannot be given a
+    // credential today"), and `assertClaudeFamilySeam`
+    // (src/runtime/engine/account-seam.ts:111-120) refuses the record before any
+    // work. I1 D1 measured what happens when that gate is missing: a Claude
+    // account_switch written onto an OpenCode record makes the resume gate demand a
+    // Claude SDK transcript JSONL that OpenCode can never produce, and every turn
+    // after the first dies.
+    canSetCredentialLive: false,
+    credentialLiveBlockedReason:
+      "OpenCode authenticates from the box's provider key in the adapter environment, not from a per-session credential acpx can move; changing it means a new session on a box configured with the other key.",
+    // MEASURED at this commit: an OpenCode record never enters the failover engine,
+    // so the degrade cannot reach it. `selectedProfileId`
+    // (src/runtime/engine/failover.ts:520-554) returns undefined for a non-Claude
+    // adapter BEFORE reading any stored profile, so `currentProfile` is undefined
+    // and `failoverEnabledForRecord` (:582-590) is false. ⚠️ This is a POST-FIX
+    // claim: I1 D1 measured the opposite on an older acpx, where the codex-only
+    // carve-out had not been generalised and the registry-default Claude
+    // subscription leaked onto OpenCode records. Cite the commit, not the finding.
+    supportsModelDegrade: false,
+    modelDegradeBlockedReason:
+      "acpx's Fable→Opus degrade runs only inside the Claude-subscription failover engine, which a non-Claude adapter never enters.",
     defaultModel: { source: "openrouter", id: "default" },
     liveModelChangeBlockedReason:
       "OpenCode selects its model through session/set_config_option, which acpx does not route yet. acpx's generic path persists a value it can never apply and leaves the session unrecoverable (FINDINGS-opencode D2).",
@@ -798,6 +1081,42 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
     // (I2 R12).
     usageReporting: true,
     promptImages: true, // I2 R11 — `promptCapabilities: {image:true, audio:false, embeddedContext:false}`
+    // NOT MEASURED, AND ITS TRUTH DEPENDS ON WHICH pi-acp IS RUNNING — say that
+    // rather than pick one. ⚠️ A VERSION FIELD CANNOT SETTLE IT: the nativai fork
+    // and upstream BOTH report `0.0.33`, so no version read separates them;
+    // identity is the spawn path resolved to a commit. Measured 2026-09-05 on
+    // devbox: `/opt/pi-acp` DOES NOT EXIST here, so this box resolves the
+    // registry-pinned upstream `pi-acp@^0.0.33` — the fallback the `measuredAgainst`
+    // warning above describes. Pi's own TUI has slash commands, but nobody has sent
+    // `/clear` as a PROMPT through either adapter, and the fork could add handling
+    // upstream does not have. I2 R3/R11 enumerated pi's ACP surface for a different
+    // question (`configOptions: null`, depth on `modes`) and no session-clear method
+    // appeared; that is an absence in someone else's enumeration, not a probe.
+    supportsSessionClear: false,
+    sessionClearBlockedReason:
+      "not measured: no probe has sent /clear as a prompt through pi-acp, and the answer may differ between the nativai fork and upstream — which no version read distinguishes, since both report 0.0.33.",
+    // MEASURED, and — unlike the cell above — INDEPENDENT of which pi-acp is
+    // running, because the gate dispatches on the ADAPTER KIND, which is `pi` for
+    // the fork and for upstream alike (`acpAdapterKind`, the one classifier). Pi's
+    // credential is the box's OpenRouter key in the adapter environment
+    // (`credential.tier: "box-provider"`, I2 R6): no `AuthMode` maps to this adapter
+    // (src/config/profiles.ts:145-156), so there is no profile to move to, and
+    // `assertClaudeFamilySeam` (src/runtime/engine/account-seam.ts:111-120) refuses
+    // the record before any work. I2 §5 measured the damage when that gate was
+    // missing: a persisted Claude `account_switch` made every turn after the first
+    // die demanding a Claude transcript pi can never produce.
+    canSetCredentialLive: false,
+    credentialLiveBlockedReason:
+      "Pi authenticates from the box's OpenRouter key in the adapter environment, not from a per-session credential acpx can move; changing it means a new session on a box configured with the other key.",
+    // MEASURED at this commit, and likewise fork-independent: `selectedProfileId`
+    // (src/runtime/engine/failover.ts:520-554) returns undefined for a non-Claude
+    // adapter before reading any stored profile, so `failoverEnabledForRecord`
+    // (:582-590) is false and the engine that owns the degrade never runs for a pi
+    // record. ⚠️ POST-FIX claim — I2 §5 measured the pre-generalisation behaviour,
+    // where the registry-default Claude subscription leaked onto pi records.
+    supportsModelDegrade: false,
+    modelDegradeBlockedReason:
+      "acpx's Fable→Opus degrade runs only inside the Claude-subscription failover engine, which a non-Claude adapter never enters.",
     defaultModel: { source: "openrouter", id: "default" },
     // Never rendered while `canSetModelLive` is true (which it is, for the fork —
     // the mechanism is `set-model`). It is what a box still on the upstream
