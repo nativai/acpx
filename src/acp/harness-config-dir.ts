@@ -339,7 +339,7 @@ export interface ConfigDirCandidateReport {
   retain: boolean;
   /** `unmeasured` appears only on the REFUSAL path, where no per-directory
    *  decision was reached at all — it is the absence of a verdict, not one. */
-  reason: ConfigDirVerdict["reason"] | "unmeasured";
+  reason: ConfigDirRetainReason | ConfigDirRemoveReason | "unmeasured";
   /** Present only for an unclaimed directory whose age could be read. */
   unclaimedAgeMs?: number;
 }
@@ -681,13 +681,43 @@ function resolvePruneDefaults(params: {
   };
 }
 
-type ConfigDirVerdict = {
-  retain: boolean;
-  reason: "liveProcess" | "openRecord" | "unrecognised" | "tooYoung";
-  /** Set only for an unclaimed dir whose age could be read, so the caller can
-   *  report the oldest one it is sitting on. */
-  unclaimedAgeMs?: number;
-};
+/** Why a directory was KEPT. The only values `retainedBy` can count. */
+type ConfigDirRetainReason = "liveProcess" | "openRecord" | "unrecognised" | "tooYoung";
+
+/**
+ * Why a directory was REMOVED — a SEPARATE vocabulary, and the separation is the fix.
+ *
+ * ## ⚠️ `openRecord` USED TO MEAN BOTH, AND ON THE REMOVE BRANCH IT SAID THE OPPOSITE
+ * ## OF WHAT HAPPENED
+ *
+ * `classifyConfigDir` returned `reason: "openRecord"` for **both** *"kept, because the
+ * record is still OPEN"* and *"removed, because the record is CLOSED"*. The preview line
+ * therefore read **"WOULD REMOVE …(openRecord)"** — *"I am deleting this, and the reason is
+ * that its record is open."* Measured on staging 2026-09-05 against four real leaked dirs.
+ *
+ * That is precisely the defect CONCEPTION §6 removes from `retainedBy` — an attribution
+ * that contradicts the state it describes — arriving on the *other* branch. §6's
+ * `unmeasured` fixed the refusal path; this fixes the removal path.
+ *
+ * ⚠️ **WHY IT SURVIVED EVERY TEST AND EVERY REHEARSAL:** on devbox every candidate was
+ * `tooYoung`, so the remove-because-closed branch never executed. **A label validated only
+ * on data that never exercised its other branch.** Only real staging data ran it.
+ *
+ * Two separate types are what stop it recurring: `retainedBy` is keyed by
+ * {@link ConfigDirRetainReason} alone, so a removal cannot be attributed to a retention
+ * reason and a retention cannot be counted under a removal reason.
+ */
+type ConfigDirRemoveReason = "closedRecord" | "unrecognised";
+
+type ConfigDirVerdict =
+  | {
+      retain: true;
+      reason: ConfigDirRetainReason;
+      /** Set only for an unclaimed dir whose age could be read, so the caller can
+       *  report the oldest one it is sitting on. */
+      unclaimedAgeMs?: number;
+    }
+  | { retain: false; reason: ConfigDirRemoveReason; unclaimedAgeMs?: number };
 
 /**
  * Whether one directory may be removed. **Every clause of the removal rule lives
@@ -725,7 +755,9 @@ function classifyConfigDir(
   if (!record.closed) {
     return { retain: true, reason: "openRecord" }; // Clause 2 fails.
   }
-  return { retain: false, reason: "openRecord" };
+  // Every clause satisfied: a record exists AND it is CLOSED. Reported as
+  // `closedRecord`, never as `openRecord` — see ConfigDirRemoveReason.
+  return { retain: false, reason: "closedRecord" };
 }
 
 /**

@@ -311,3 +311,80 @@ test("0bac6a00 §10.1: the exclusion does not swallow a real session dir with a 
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("0bac6a00 §6b: a REMOVED dir reports `closedRecord`, never `openRecord`", () => {
+  // ⚠️ THE LINE THIS PINS ONCE READ "WOULD REMOVE …(openRecord)" — "I am deleting
+  // this, and the reason is that its record is open." Measured on staging against
+  // four real leaked directories. Same defect §6 removed from the refusal path,
+  // arriving on the removal path.
+  //
+  // It survived every test because on devbox every candidate was `tooYoung`, so the
+  // remove-because-closed branch never executed. Both branches are asserted here.
+  const root = freshRoot("acpx-0bac6a00-closedreason-");
+  try {
+    const closedDir = plantAged(root, "acpx-opencode-closed-one");
+    const openDir = plantAged(root, "acpx-opencode-open-one");
+    const records = new Map<string, KnownSessionRecord>([
+      ["closed-one", { closed: true }],
+      ["open-one", { closed: false }],
+    ]);
+
+    const result = pruneOrphanHarnessConfigDirs({
+      records,
+      liveScan: measuredScan(),
+      rootDir: root,
+      dryRun: true,
+    });
+
+    const byDir = new Map(result.candidates.map((c) => [c.dir, c]));
+    assert.equal(byDir.get(closedDir)?.retain, false, "a closed record must release its dir");
+    assert.equal(
+      byDir.get(closedDir)?.reason,
+      "closedRecord",
+      "a removal must not be attributed to the record being OPEN",
+    );
+    // The other branch, so "it says closedRecord" is not simply "it says that always".
+    assert.equal(byDir.get(openDir)?.retain, true);
+    assert.equal(byDir.get(openDir)?.reason, "openRecord");
+
+    // And the rendered preview — the thing a human actually reads.
+    const plan = describeHarnessConfigDirSweepPlan(result);
+    assert.match(plan, /WOULD REMOVE .*acpx-opencode-closed-one \(closedRecord\)/);
+    assert.match(plan, /RETAIN .*acpx-opencode-open-one \(openRecord\)/);
+    assert.equal(
+      /WOULD REMOVE .*\(openRecord\)/.test(plan),
+      false,
+      "no removal line may be attributed to openRecord",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("0bac6a00 §6b: `retainedBy` still counts only RETENTIONS, and closedRecord is not one", () => {
+  // The two vocabularies are separate types so a removal reason cannot be counted as
+  // a retention. This asserts the arithmetic that separation protects.
+  const root = freshRoot("acpx-0bac6a00-tally-");
+  try {
+    plantAged(root, "acpx-opencode-closed-a");
+    plantAged(root, "acpx-opencode-open-b");
+    const result = pruneOrphanHarnessConfigDirs({
+      records: new Map<string, KnownSessionRecord>([
+        ["closed-a", { closed: true }],
+        ["open-b", { closed: false }],
+      ]),
+      liveScan: measuredScan(),
+      rootDir: root,
+      dryRun: true,
+    });
+    assert.equal(result.scanned, 2);
+    assert.equal(result.retained, 1, "only the open-record dir is retained");
+    assert.equal(result.retainedBy.openRecord, 1);
+    assert.deepEqual(result.wouldRemove.length, 1);
+    // Every retention is accounted for by exactly one reason — no double-count, no gap.
+    const tally = Object.values(result.retainedBy).reduce((a, b) => a + b, 0);
+    assert.equal(tally, result.retained, "retainedBy must sum to retained");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
