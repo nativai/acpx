@@ -400,13 +400,116 @@ export type HarnessCapabilityFacts = Omit<
   measuredAgainst: HarnessMeasurementSource;
 };
 
+/**
+ * The ADAPTER IDENTITY a claim was proven against.
+ *
+ * ## ⚠️ WHY THIS IS A UNION AND NOT A STRING (brick 4791a88c)
+ *
+ * It **was** a string, and the string permitted the one value this whole
+ * mechanism exists to reject: **`"pi-acp@^0.0.33"`**. The nativai `pi-acp` FORK
+ * and UPSTREAM both publish `0.0.33`, so **no version read distinguishes them** —
+ * a citation naming only that spec is as unfalsifiable as no citation at all,
+ * one level less obvious.
+ *
+ * That is not a hypothetical about this field; it is its measured history. The
+ * guard written to prevent it — *"a citation names a VERSION or a COMMIT, not
+ * just a package"* — used `/(\d+\.\d+\.\d+|commit\s+[0-9a-f]{7,})/`, which
+ * **rejects `pi-acp` and PASSES `pi-acp@^0.0.33`**. It caught one level and
+ * stopped one short of the next. Before that, J1 put the same reconciliation in
+ * a **prose comment** beside the field, and *a prose comment is not the field a
+ * checker reads*.
+ *
+ * ⇒ **The remedy is a type, not a stricter regex.** Each arm below makes its own
+ * blind spot a REQUIRED field, so the honest-but-ambiguous citation stays
+ * expressible — it is sometimes exactly what acpx resolves — but **can no longer
+ * be written silently.**
+ *
+ * ## Ruling v3, which this encodes
+ *
+ * *A version field is not identity on any harness; identity is the spawn path
+ * RESOLVED TO A COMMIT (`/workspace/.runtime/info.json`, or a lane build record:
+ * commit + sha256 of the entry file). The spawning line is the pointer, never the
+ * identity.* Corroborated rather than asserted: `initialize.agentInfo` reported
+ * codex-acp `0.0.45` **unchanged** across `bb17b22 → 42987b87` (CLI 0.144.1 →
+ * 0.153.3), so believing the adapter's own version report re-creates this defect
+ * one layer down.
+ *
+ * ⚠️ **Every arm is PLAIN SERIALISABLE DATA on purpose.** Whether this belongs on
+ * the exposed descriptor is deferred (brick `86984522`); projecting it later must
+ * stay **one line** in {@link deriveHarnessCapabilities}, never a reshaping. Do
+ * not add a method, a `symbol`, or a class instance to any arm.
+ */
+export type HarnessAdapterIdentity =
+  /**
+   * The strong form: the spawn path resolves to a commit. This is what
+   * `/workspace/.runtime/info.json` gives for every BOOTSTRAPPED adapter.
+   */
+  | {
+      kind: "resolved-commit";
+      /** How the artifact is spoken about, e.g. `codex-acp 0.0.45`. */
+      spec: string;
+      /** The commit the spawn path resolves to. */
+      commit: string;
+      /** sha256 of the entry file, where a lane built the adapter itself. */
+      entrySha256?: string;
+    }
+  /**
+   * The honest-but-ambiguous form, and **NOT a lesser citation**: pi and opencode
+   * are not bootstrapped components — they are npx-resolved at spawn, so there is
+   * **no commit to cite**. Measured: `info.json` carries `acpx`, `acpx-ui`,
+   * `claude-agent-acp`, `claude-pty-acp`, `codex-acp` and neither `pi-acp` nor
+   * `opencode` (control: `has("codex-acp")` → true).
+   *
+   * ⇒ This arm is CORRECT for those two. What was wrong before was that its blind
+   * spot went unstated, so {@link cannotDistinguish} is REQUIRED.
+   */
+  | {
+      kind: "package-range";
+      /** The spec acpx resolves, e.g. `pi-acp@^0.0.33`. Must match the registry. */
+      spec: string;
+      /**
+       * **What this spec does NOT separate.** Required, because a range that
+       * cannot name its own ambiguity is the defect this union replaced.
+       */
+      cannotDistinguish: string;
+    }
+  /**
+   * Never measured on any build. Shares the file's existing vocabulary: the
+   * reason begins `not measured:` and names the probe nobody ran.
+   */
+  | { kind: "not-measured"; reason: string };
+
+/**
+ * The nativai `pi-acp` FORK's build record — the identity of the adapter five of
+ * pi's cells were actually proven on (brick ef5999ca / B5).
+ *
+ * ⚠️ **NOT what any box launches today.** `/opt/pi-acp` exists on neither devbox
+ * nor staging (measured 2026-09-05), so `resolvePiAcpCommand` falls back to the
+ * npx range and every box resolves UPSTREAM. That is precisely why the fork needs
+ * its own citation rather than being folded into pi's block: **the block names
+ * what acpx resolves; these five cells name what the claim was proven on, and
+ * today those are different builds.**
+ *
+ * Cited by BUILD RECORD because there is no `info.json` entry to resolve against
+ * — the fork is a lane artifact at `/workspace/projects/pi-acp/b5-fork`, not a
+ * bootstrapped component. Commit plus the entry file's sha256 is what ruling v3
+ * prescribes for exactly that case, and it is what a version string cannot do
+ * here: **the fork's `package.json` says `0.0.33`, identical to upstream's.**
+ */
+const PI_FORK_BUILD: HarnessAdapterIdentity = {
+  kind: "resolved-commit",
+  spec: "nativai/pi-acp fork (publishes 0.0.33, indistinguishable from upstream by version)",
+  commit: "eb17203",
+  entrySha256: "e296b0705630ffe1",
+};
+
 /** Where a harness block's claims come from, and how to re-derive it. */
 export interface HarnessMeasurementSource {
   /**
-   * The ACP ADAPTER identity — the process acpx actually spawns. A package spec
-   * (`pi-acp@^0.0.33`) or a built artifact plus its commit.
+   * The ADAPTER IDENTITY the block's claims were proven against — **what acpx
+   * RESOLVES**, which is the question the anti-drift check asks.
    */
-  adapter: string;
+  adapter: HarnessAdapterIdentity;
   /**
    * The UNDERLYING harness binary, where it differs from the adapter and has its
    * own version. Two things go stale independently — pi-acp is not pi, and
@@ -419,6 +522,25 @@ export interface HarnessMeasurementSource {
    * CHECKED rather than trusted.
    */
   source: string;
+  /**
+   * Cells whose claim was proven on a **DIFFERENT build** than {@link adapter},
+   * keyed by dotted path into this block (`"model.mechanism"`, `"fork.supported"`).
+   *
+   * ## ⚠️ THIS EXISTS BECAUSE A BLOCK-LEVEL CITATION IS RIGHT BY ACCIDENT
+   *
+   * J1, measured: pi's block cites upstream's spec while the comment above its
+   * cells says *"EVERY CELL BELOW DESCRIBES THE nativai pi-acp FORK"*. The
+   * machine-readable field named one build, the cells described another, and only
+   * prose reconciled them. **A per-cell claim carries a per-cell citation.**
+   *
+   * ⚠️ **Add one ONLY where the cell's proving build genuinely differs.** An
+   * override equal to its block is dead weight that goes stale silently — and a
+   * cell whose *commentary* is build-specific but whose *value* is not does NOT
+   * get one (`primerChannel` is the worked example: the fork changes the
+   * mechanism, but `config-file` is the correct coarse category on both builds).
+   * **A citation tracks the CLAIM, not the commentary.**
+   */
+  cellOverrides?: Readonly<Record<string, HarnessAdapterIdentity>>;
 }
 
 /**
@@ -655,7 +777,11 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
       // Built into the image, so the COMMIT is the identity — the package
       // version (0.39.0) is not bumped per build and would not distinguish two
       // images. Both read from the deployed artifact, not from a document.
-      adapter: "claude-agent-acp 0.39.0 @ commit 0d5ab3ab",
+      adapter: {
+        kind: "resolved-commit",
+        spec: "claude-agent-acp 0.39.0",
+        commit: "0d5ab3ab",
+      },
       source:
         "node -p require('/opt/claude-agent-acp/package.json').version + git -C /opt/claude-agent-acp rev-parse --short HEAD",
     },
@@ -761,7 +887,11 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
       // which distinguishes NOTHING between builds. The commit is the only
       // identity this adapter has, and recording that limit is the point — a
       // citation that cannot date a build should say so rather than look precise.
-      adapter: "claude-pty-acp 0.0.0-private @ commit ce2a2e6",
+      adapter: {
+        kind: "resolved-commit",
+        spec: "claude-pty-acp 0.0.0-private",
+        commit: "ce2a2e6",
+      },
       source:
         "git -C /opt/claude-pty-acp rev-parse --short HEAD (the package version is a constant and cannot date a build)",
     },
@@ -854,7 +984,11 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
       // adapter bundles (measured: 0.144.6 on PATH against 0.144.1 bundled,
       // before the bump). Reading the CLI on PATH would cite a binary these
       // claims were never measured against.
-      adapter: "codex-acp 0.0.45 @ commit 42987b87",
+      adapter: {
+        kind: "resolved-commit",
+        spec: "codex-acp 0.0.45",
+        commit: "42987b87",
+      },
       harness: "@openai/codex 0.153.3 (bundled at /opt/codex-acp/node_modules/@openai/codex)",
       source:
         "node -p require('/opt/codex-acp/package.json').version + node -p require('/opt/codex-acp/node_modules/@openai/codex/package.json').version",
@@ -960,7 +1094,18 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
       // named no build at all — the defect this field exists for, in its purest
       // form. The pin is BARE, not `^1.18.28`: opencode-ai is a 1.x package and a
       // caret there is a RANGE (see `ACP_ADAPTER_PACKAGE_RANGES`).
-      adapter: "opencode-ai@1.18.28",
+      adapter: {
+        kind: "package-range",
+        spec: "opencode-ai@1.18.28",
+        // ⚠️ NOT A LESSER CITATION — opencode is not a bootstrapped component.
+        // Measured: `/workspace/.runtime/info.json` carries acpx, acpx-ui,
+        // claude-agent-acp, claude-pty-acp and codex-acp, and NEITHER opencode
+        // NOR pi-acp (control: `has("codex-acp")` -> true). It is npx-resolved at
+        // spawn, so there is no commit to resolve to and `package-range` is the
+        // honest form for what acpx actually resolves.
+        cannotDistinguish:
+          "the exact published tarball behind the pin — npx resolves 1.18.28 from the registry at spawn, so two boxes agreeing on this spec are not thereby proven to have run identical bytes. A commit becomes citable only if opencode is ever bootstrapped into /opt like the adapters above.",
+      },
       source: "ACP_ADAPTER_PACKAGE_RANGES.opencode in src/agent-registry.ts",
     },
     label: "opencode",
@@ -1061,10 +1206,49 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
       // ways" and named no version, so nothing in the file could show the claim
       // had expired. F-12's runtime learning is what corrects it live; this is
       // what makes it checkable at all.
-      adapter: "pi-acp@^0.0.33",
+      adapter: {
+        kind: "package-range",
+        spec: "pi-acp@^0.0.33",
+        // ⚠️⚠️ THIS IS THE FIELD THE WHOLE UNION EXISTS FOR. `^0.0.33` on a 0.0.x
+        // range pins exactly, and it STILL does not identify a build: the nativai
+        // fork and upstream BOTH publish 0.0.33. Measured on 8af293e, both arms in
+        // one run, the resolved adapter command printed first: the FORK answers
+        // `session/set_model` rc=0 and forks; UPSTREAM answers -32601 to both — and
+        // NO VERSION READ SEPARATES THEM. Under the old `adapter: string` this spec
+        // satisfied the guard; the required field below is what stops that.
+        cannotDistinguish:
+          "the nativai pi-acp FORK from UPSTREAM pi-acp — both publish 0.0.33, so no version read separates them. Which one runs is decided by resolvePiAcpCommand (src/agent-registry.ts): `node /opt/pi-acp/dist/index.js` when that path exists, else this npx range. Measured 2026-09-05 on devbox: /opt/pi-acp DOES NOT EXIST, so this box resolves UPSTREAM. Cells whose truth differs between the two carry their own cellOverrides.",
+      },
       harness: "@earendil-works/pi-coding-agent 0.84.4",
       source:
         "ACP_ADAPTER_PACKAGE_RANGES.pi in src/agent-registry.ts + the pi binary's own --version",
+      // ⚠️ THE FIVE CELLS J1 CAUGHT. The block citation above names what acpx
+      // RESOLVES on this box — UPSTREAM. These five were proven on the nativai
+      // FORK, and are FALSE upstream. Before this they were reconciled only by
+      // the prose comment below `label`, and "a prose comment is not the field a
+      // checker reads": the machine-readable field said upstream while the cells
+      // described the fork — right by accident and wrong by intent.
+      //
+      // ⚠️ FIVE, NOT "the pi block". `primerChannel` is deliberately absent: the
+      // fork does change the mechanism (it reads PI_ACP_APPEND_SYSTEM_PROMPT_FILE
+      // instead of re-pointing PI_CODING_AGENT_DIR, brick ac86eb34) but
+      // `config-file` stays the correct coarse category on BOTH builds, so the
+      // VALUE does not diverge. `canSetCredentialLive` and `supportsModelDegrade`
+      // are likewise absent — their own comments record that they dispatch on
+      // adapter KIND, which is `pi` for the fork and upstream alike. An override
+      // equal to its block is dead weight that goes stale silently.
+      //
+      // ⚠️ THIS IS A LANE BUILD, NOT A DEPLOYED ONE. No box installs the fork
+      // today (`/opt/pi-acp` absent on devbox and staging), so it is cited by its
+      // BUILD RECORD — commit plus the sha256 of the entry file — exactly as
+      // ruling v3 requires when there is no `info.json` entry to resolve.
+      cellOverrides: {
+        "model.mechanism": PI_FORK_BUILD,
+        "fork.supported": PI_FORK_BUILD,
+        "fork.atIndex": PI_FORK_BUILD,
+        usageReporting: PI_FORK_BUILD,
+        liveModelChangeBlockedReason: PI_FORK_BUILD,
+      },
     },
     label: "pi",
     // ⚠️ EVERY CELL BELOW DESCRIBES THE **nativai `pi-acp` FORK** (B5, brick
