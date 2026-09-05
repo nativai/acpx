@@ -99,13 +99,38 @@ const CLAUDE_PTY_ALIASES: { id: string; name: string }[] = [
  * 🔒 A FROZEN MEASUREMENT WITH A RE-MEASURE TRIGGER — NOT A PRODUCT LIST.
  *
  * SCOPE OF THE MEASUREMENT, and all three parts are load-bearing:
- *   ADAPTER    `codex-acp 0.0.45` → `@openai/codex 0.144.1` (six families, 29
+ *   ADAPTER    `codex-acp 42987b87` → `@openai/codex ^0.153.3`: SEVEN families,
+ *              35 composed ids. The sole delta from the prior reading is
+ *              `gpt-6-astra`; no family was retired and none returned.
+ *   PRIOR      `codex-acp 0.0.45` → `@openai/codex 0.144.1` (six families, 29
  *              composed ids) — MEASURED 2026-09-04T22:36Z from a real session's
  *              ACP `available_models` (brick://db554b05 `reports/MEASUREMENT.md`).
- *              At `0.153.3`: SEVEN families, 35 ids — the sole difference is
- *              `gpt-6-astra`; no family retired and none returned.
+ *              Kept, not deleted: it is what makes the delta classifiable.
  *   BOX        devbox.
  *   CREDENTIAL the account this box's codex auth resolves to.
+ *
+ * ⚠️ WHO MEASURED WHAT, because this block's whole point is that a citation
+ * names a measurement rather than a belief. The 0.144.1 reading is db554b05's,
+ * off the wire. The SEVEN-families / 35-ids reading at 0.153.3 is the codex-acp
+ * bump lane's, from the same `available_models` channel, RELAYED HERE AND NOT
+ * RE-DERIVED by the author of this stamp. `gpt-6-astra`'s SIX-rung ladder
+ * (low…ultra) is the Astra lane's, measured on the ACP wire; OpenAI's published
+ * page lists five and omits `ultra`, and the wire is authoritative here because
+ * acpx gates against what the adapter advertises.
+ *   ⚠️ NOT MEASURED BY ANYONE IN THIS PROGRAMME: astra's rung COUNT was never
+ *   independently re-derived — it is relayed from the bump lane throughout. No
+ *   shipped behaviour depends on the count, only on `ultra` existing, which IS
+ *   measured. Stated so a later reader does not promote it to a fact.
+ *
+ * 🛑 THIS BLOCK'S OWN TRIGGER FIRED ONCE AND NOTHING WATCHED IT. The bump to
+ * `42987b87` merged into the program branch at 2026-09-05T01:22Z. This block
+ * already SAID that 0.153.3 carried a seventh family and named it. The table
+ * was not updated, `acpx --model 'gpt-6-astra[…]'` failed with -32602
+ * MODEL_SLUG_UNKNOWN on every box, and the UI 502'd on a model it offered —
+ * because acpx gates `--model` against this table BEFORE any adapter is
+ * reached. A re-measure trigger written in a comment has a reader, never an
+ * agent. That is why brick://8ca68c82 (sourcing this from the advertisement)
+ * is the real fix and this stamp is only an interim.
  *
  * ⚠️ THE BOX AND CREDENTIAL ARE NOT DECORATION. codex's models-manager refreshes
  * its catalogue REMOTELY, with an ETag/TTL, AND PER ACCOUNT — so this list is
