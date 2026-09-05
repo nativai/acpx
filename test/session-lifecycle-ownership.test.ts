@@ -450,9 +450,14 @@ test("runQueuedTask rejects a closed session with SESSION_CLOSED (queued-prompt 
 test("SessionClosedError formats the session name when available", () => {
   const withName = new SessionClosedError("some-id", "my-session");
   assert.match(withName.message, /'my-session'/);
-  assert.match(withName.message, /acpx-ui \(Reopen button\)/);
-  assert.match(withName.message, /session URL/);
-  assert.doesNotMatch(withName.message, /sessions reopen/);
+  assert.match(withName.message, /acpx-ui/i);
+  // brick://16712ece — this assertion used to read
+  // `assert.doesNotMatch(withName.message, /sessions reopen/)`, PINNING the era
+  // when no reopen verb existed, so the message could only go staler. `sessions
+  // reopen` now exists and the refusal must name it; the routes the text
+  // promises are asserted in full (and checked against `sessions --help`) in
+  // test/session-closed-recovery.test.ts.
+  assert.match(withName.message, /sessions reopen/);
   assert.equal(withName.detailCode, "SESSION_CLOSED");
   assert.equal(withName.outputCode, "RUNTIME");
 
