@@ -488,8 +488,53 @@ export const ARBITRARY_MODEL_SUPPORT_ROUTED_BY_ACPX: readonly ArbitraryModelSupp
  * One measurement per harness, never one per kind — see the warning above. A
  * harness enters this list when its config format's merge semantics have been
  * measured AND `applyHarnessConfigDir` is passed `provisionModelId` for it.
+ *
+ * ## ⚠️ EDITING THIS ARRAY CHANGES WHAT ACPX SHIPS, NOT ONLY WHAT IT DECLARES
+ *
+ * Two things read it, and they used to be independent (brick cba6fa92):
+ *
+ *   1. **the DECLARATION** — {@link deriveAcceptsArbitraryModelIds}, i.e. whether
+ *      the picker offers an arbitrary-slug band for the harness; and
+ *   2. **the ROUTING** — `applyHarnessConfigDirEnv` in `src/acp/client.ts`, i.e.
+ *      whether a spawn is actually handed `provisionModelId` and a catalogue
+ *      fragment is actually written.
+ *
+ * The routing used to be a hardcoded `harnessIdForAgentCommand(…) === "pi"`
+ * literal in `client.ts`, so the two could disagree: this array said the picker
+ * offers the band while the spawn wrote nothing, or the reverse — a harness added
+ * here got a red row and no shipped behaviour change. **Both now go through
+ * {@link harnessProvisionsModelCatalogue}, so this array is the single place such
+ * an edit lands.** That is the whole point; do not re-inline either read.
+ *
+ * ⇒ **An entry added here PROVISIONS AT SPAWN TIME immediately.** It needs its own
+ * merge-vs-replace measurement first — the argument, and the exact measurement
+ * that licenses `"opencode"`, is in the block above and in
+ * `test/harness-capabilities.test.ts`'s "the SHIPPED per-harness provisioning
+ * list …" row. Pinned in BOTH directions, on the shipped defaults and through a
+ * real adapter spawn, by `test/harness-config-dir-spawn-env.test.ts` →
+ * *"the SHIPPED provisioning list is what the spawn routes on"*.
  */
 export const ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR: readonly HarnessId[] = ["pi"];
+
+/**
+ * Whether acpx generates a catalogue fragment for this harness — the ONE read of
+ * {@link ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR}, shared by the declaration and
+ * the spawn-time routing so the two cannot drift apart (brick cba6fa92).
+ *
+ * `undefined` is `false`: an adapter acpx cannot classify is not a harness whose
+ * config format has been measured, and provisioning writes a harness-specific
+ * file — there is nothing to write it into.
+ *
+ * Parameterised on the list, like {@link deriveCanSetModelLive}, so a test can
+ * hand it a synthetic one and watch the answer flip — the property that proves
+ * every consumer is a derivation and not a literal.
+ */
+export function harnessProvisionsModelCatalogue(
+  harness: HarnessId | undefined,
+  provisionedFor: readonly HarnessId[] = ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR,
+): boolean {
+  return harness !== undefined && provisionedFor.includes(harness);
+}
 
 /** Mechanisms that are a LIVE model change at all, once acpx routes them. */
 const LIVE_MODEL_MECHANISMS: ReadonlySet<ModelMechanism> = new Set([
@@ -551,7 +596,7 @@ export function deriveAcceptsArbitraryModelIds(
     return false;
   }
   if (support === "provisioned") {
-    return harness !== undefined && provisionedFor.includes(harness);
+    return harnessProvisionsModelCatalogue(harness, provisionedFor);
   }
   return support === "native" || routedSupport.includes(support);
 }
