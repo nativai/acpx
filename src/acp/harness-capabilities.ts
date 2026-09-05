@@ -743,10 +743,15 @@ export class ForkAtIndexUnsupportedError extends Error {
  *   messages. A truncation that did not happen, displayed as if it had. Note the
  *   PLAIN fork is fine and stays available (`fork.supported` is true) — only the
  *   truncating variant lies.
- * - `'unsupported'` — **Pi**. pi-acp advertises no fork capability at all (the
- *   string `fork` occurs zero times in 0.0.26 and 0.0.33, I2 R4), so acpx
- *   refuses the whole fork one layer down anyway; this makes the reason specific
- *   instead of generic.
+ * - `'unsupported'` — **no harness today.** ⚠️ Pi occupied this branch while
+ *   acpx launched UPSTREAM pi-acp, which advertises no fork capability at all
+ *   (the string `fork` occurs zero times in 0.0.26 and 0.0.33, I2 R4). The
+ *   nativai fork implements `session/fork` on pi's JSONL session tree and
+ *   honours `_meta.acpx.forkAtMessageIndex`, so pi is `'exact'` now (brick
+ *   ef5999ca). **The branch is kept because the descriptor value still exists and
+ *   a harness can re-enter it** — including pi itself on a box that has not yet
+ *   installed the fork, which is why the message names the adapter rather than
+ *   the harness.
  *
  * A harness the descriptor does not know is NOT refused: acpx has no claim to
  * make about it, and inventing one would be the same defect in the other
@@ -770,7 +775,7 @@ export function assertForkAtIndexHonoured(
   const detail =
     fork.atIndex === "ignored"
       ? `its adapter accepts the index and silently full-copies, so the fork would carry the WHOLE source history while the record claimed a truncation at ${requestedIndex}`
-      : `its adapter advertises no fork capability at all`;
+      : `its adapter advertises no fork capability at all`; // e.g. pi on a box still running upstream pi-acp
   throw new ForkAtIndexUnsupportedError(
     harness,
     fork.atIndex,
