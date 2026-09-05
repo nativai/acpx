@@ -3713,7 +3713,12 @@ export async function handleSessionsPrune(
   }
 
   render.printPruneResultByFormat(result, globalFlags.format, scope);
-  await sweepOrphanHarnessConfigDirs(session, flags.dryRun === true, globalFlags.verbose === true);
+  await sweepOrphanHarnessConfigDirs(
+    session,
+    flags.dryRun === true,
+    globalFlags.verbose === true,
+    flags.configDirRoot,
+  );
 }
 
 /**
@@ -3759,6 +3764,14 @@ async function sweepOrphanHarnessConfigDirs(
   session: Awaited<ReturnType<typeof loadSessionModule>>,
   dryRun: boolean,
   verbose: boolean,
+  /**
+   * ⚠️ THE PARAMETER THIS SIGNATURE USED TO LACK ENTIRELY (brick 0bac6a00).
+   * `pruneOrphanHarnessConfigDirs` has taken a `rootDir` since it was written, and
+   * no CLI path could reach it — not because a call site forgot to pass one, but
+   * because there was nowhere to pass it FROM. A missing parameter, not a missing
+   * argument. Undefined here keeps the real root, which is the correct default.
+   */
+  rootDir: string | undefined,
 ): Promise<void> {
   if (dryRun) {
     return;
@@ -3787,7 +3800,7 @@ async function sweepOrphanHarnessConfigDirs(
     // Re-read AFTER the record sweep, so the directory pass sees the closes it
     // just made rather than the state that preceded them.
     const records = knownRecordsById(await session.listSessions());
-    const swept = pruneOrphanHarnessConfigDirs({ records, liveScan });
+    const swept = pruneOrphanHarnessConfigDirs({ records, liveScan, rootDir });
     if (verbose) {
       process.stderr.write(describeHarnessConfigDirSweep(swept));
     }

@@ -30,6 +30,7 @@ import {
   stopProcess,
   writeQueueOwnerLock,
 } from "./queue-test-helpers.js";
+import { assertHarnessConfigDirRootIsolated } from "./config-dir-root-isolation.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
@@ -7230,6 +7231,11 @@ async function runCli(
   options: CliRunOptions = {},
 ): Promise<CliRunResult> {
   return await new Promise<CliRunResult>((resolve) => {
+    // ⚠️ SPAWN-TIME GUARD (brick 0bac6a00). A prune sweeps harness config dirs
+    // under a root NO HOME scopes, so an isolated store is not isolation here.
+    // Throws if this invocation would walk the box's real /tmp.
+    assertHarnessConfigDirRootIsolated(args);
+
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       HOME: homeDir,

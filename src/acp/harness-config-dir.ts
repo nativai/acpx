@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import {
   type LivePidScan,
@@ -16,6 +16,7 @@ import {
   HARNESS_IDS,
   type HarnessId,
 } from "./harness-capabilities.js";
+import { resolveHarnessConfigDirRoot } from "./harness-config-dir-root.js";
 import { type PluginCacheResult, seedOpenCodePluginInstall } from "./opencode-plugin-cache.js";
 
 /**
@@ -330,6 +331,18 @@ export function removeHarnessConfigDir(dir: string | undefined): void {
 
 /** What an orphan sweep did — every population printed, so 0 reads NOT RUN. */
 export interface HarnessConfigDirPruneResult {
+  /**
+   * The directory this sweep actually walked.
+   *
+   * ⚠️ REPORTED, NOT ASSUMED. The root is resolved from three sources
+   * (`harness-config-dir-root.ts`) and the two that are not the default are
+   * invisible at the call site — an ambient `ACPX_HARNESS_CONFIG_DIR_ROOT` most of
+   * all. A census that omits its root is unfalsifiable: `scanned=0 removed=0` reads
+   * identically for "the box is clean" and "I was pointed at an empty directory
+   * while the population sat somewhere else". Naming the root is what makes the
+   * rest of the line checkable.
+   */
+  root: string;
   /** Candidate directories examined. **0 means the sweep found nothing to look
    *  at — NOT RUN — not that everything was already clean.** */
   scanned: number;
@@ -435,7 +448,7 @@ export function pruneOrphanHarnessConfigDirs(params: {
   if (candidates === undefined) {
     // The root itself could not be read, so nothing was examined and nothing can
     // be concluded — a non-measurement, reported as one.
-    return { scanned: 0, removed: [], retained: 0, retainedBy, notMeasured: true };
+    return { root, scanned: 0, removed: [], retained: 0, retainedBy, notMeasured: true };
   }
 
   // ⚠️ THE REFUSAL, BEFORE ANY WORK. Without a measured process census, clause 3
@@ -445,6 +458,7 @@ export function pruneOrphanHarnessConfigDirs(params: {
   // sweep that found nothing to look at.
   if (!scanIsMeasured(params.liveScan)) {
     return {
+      root,
       scanned: candidates.length,
       removed: [],
       retained: candidates.length,
@@ -479,7 +493,7 @@ export function pruneOrphanHarnessConfigDirs(params: {
       retainedBy.removeFailed += 1;
     }
   }
-  return { scanned, removed, retained, retainedBy, oldestUnclaimedAgeMs, notMeasured: false };
+  return { root, scanned, removed, retained, retainedBy, oldestUnclaimedAgeMs, notMeasured: false };
 }
 
 /**
@@ -522,7 +536,10 @@ function resolvePruneDefaults(params: {
   orphanMinAgeMs?: number;
 }): { root: string; now: number; orphanMinAgeMs: number } {
   return {
-    root: params.rootDir ?? tmpdir(),
+    // Shared with the WRITER and the plugin cache (`harness-config-dir-root.ts`).
+    // A sweep resolving its root independently of the writer is a sweep that can
+    // report a clean census over a directory nothing was ever written to.
+    root: resolveHarnessConfigDirRoot(params.rootDir),
     now: params.now ?? Date.now(),
     orphanMinAgeMs: params.orphanMinAgeMs ?? DEFAULT_ORPHAN_MIN_AGE_MS,
   };
@@ -609,7 +626,8 @@ function directoryAgeMs(dir: string, now: number): number | undefined {
 export function describeHarnessConfigDirSweep(result: HarnessConfigDirPruneResult): string {
   const by = result.retainedBy;
   return (
-    `[acpx] harness config dirs: scanned=${result.scanned} removed=${result.removed.length} ` +
+    `[acpx] harness config dirs: root=${result.root} ` +
+    `scanned=${result.scanned} removed=${result.removed.length} ` +
     `retained=${result.retained} (liveProcess=${by.liveProcess} openRecord=${by.openRecord} ` +
     `unrecognised=${by.unrecognised} tooYoung=${by.tooYoung} removeFailed=${by.removeFailed}` +
     (result.oldestUnclaimedAgeMs === undefined
@@ -668,7 +686,8 @@ export interface HarnessConfigDirInput {
    * network call (I1 R6, I2 R5).
    */
   provisionModelId?: string;
-  /** Overrides `tmpdir()`; tests use it to keep the directory inside a fixture. */
+  /** Overrides the resolved root (`ACPX_HARNESS_CONFIG_DIR_ROOT`, else `tmpdir()`);
+   *  tests use it to keep the directory inside a fixture. */
   rootDir?: string;
   /** The session's working directory — pi namespaces its session store by it
    *  (brick ac86eb34). Absent ⇒ pi's session dir is left alone. */
@@ -717,7 +736,9 @@ export function applyHarnessConfigDir(
     return undefined;
   }
   try {
-    const root = input.rootDir ?? tmpdir();
+    // Same resolver the SWEEP uses, so the writer and its reaper cannot disagree
+    // about where the directory is (`harness-config-dir-root.ts`).
+    const root = resolveHarnessConfigDirRoot(input.rootDir);
     const dir = join(root, configDirName(harness, input.sessionId.trim()));
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     // ⚠️ REGISTER THIS HOLDER BEFORE WRITING ANYTHING. Between mkdir and the

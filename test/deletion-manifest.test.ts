@@ -13,6 +13,7 @@ import {
   withTempHome as withTempHomeFixture,
   writeSessionRecordFile,
 } from "./runtime-test-helpers.js";
+import { assertHarnessConfigDirRootIsolated } from "./config-dir-root-isolation.js";
 
 /**
  * brick://401a6216 — the deletion manifest, the `--include-history` flip, and
@@ -52,6 +53,11 @@ type RunOptions = {
 
 function runCli(args: string[], options: RunOptions): Promise<CliResult> {
   return new Promise((resolve) => {
+    // ⚠️ SPAWN-TIME GUARD (brick 0bac6a00). A prune sweeps harness config dirs
+    // under a root NO HOME scopes, so an isolated store is not isolation here.
+    // Throws if this invocation would walk the box's real /tmp.
+    assertHarnessConfigDirRootIsolated(args);
+
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       HOME: options.home,

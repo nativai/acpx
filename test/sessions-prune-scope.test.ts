@@ -12,6 +12,7 @@ import {
   withTempHome as withTempHomeFixture,
   writeSessionRecordFile,
 } from "./runtime-test-helpers.js";
+import { assertHarnessConfigDirRootIsolated } from "./config-dir-root-isolation.js";
 
 /**
  * brick://dd4cb0e8 — `acpx sessions prune` scope-first hardening.
@@ -49,6 +50,11 @@ function runCli(
   extraEnv?: NodeJS.ProcessEnv,
 ): Promise<CliResult> {
   return new Promise((resolve) => {
+    // ⚠️ SPAWN-TIME GUARD (brick 0bac6a00). A prune sweeps harness config dirs
+    // under a root NO HOME scopes, so an isolated store is not isolation here.
+    // Throws if this invocation would walk the box's real /tmp.
+    assertHarnessConfigDirRootIsolated(args);
+
     const env: NodeJS.ProcessEnv = { ...process.env, HOME: homeDir, ACPX_STATE_HOME: homeDir };
     for (const key of [
       "ACPX_SESSION_URL",
