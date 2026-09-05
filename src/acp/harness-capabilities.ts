@@ -537,11 +537,20 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
       // codex CLI bundled UNDER it. Citing only one would let the other drift
       // while the citation still read as current.
       //
-      // ⚠️ The box's own `codex` on PATH is 0.144.6 — a DIFFERENT build from the
-      // 0.144.1 the adapter bundles. Reading the CLI on PATH would cite a binary
-      // these claims were never measured against.
-      adapter: "codex-acp 0.0.45 @ commit bb17b22",
-      harness: "@openai/codex 0.144.1 (bundled at /opt/codex-acp/node_modules/@openai/codex)",
+      // ⚠️ THE FIRST RE-TAKE PROVED THE POINT OF THE COMMIT FIELD. At the
+      // 0.153.3 boundary the adapter's PACKAGE VERSION did not move — it is
+      // 0.0.45 before and after — while the commit went `bb17b22` → `42987b87`
+      // and the bundled CLI went 0.144.1 → 0.153.3. A citation carrying only the
+      // package version would have read as current across a bump that changed
+      // the harness's depth vocabulary. This is the same limit spelled out for
+      // claude-pty, arriving on a harness that does have a real version.
+      //
+      // ⚠️ The box's own `codex` on PATH is a DIFFERENT build from the one the
+      // adapter bundles (measured: 0.144.6 on PATH against 0.144.1 bundled,
+      // before the bump). Reading the CLI on PATH would cite a binary these
+      // claims were never measured against.
+      adapter: "codex-acp 0.0.45 @ commit 42987b87",
+      harness: "@openai/codex 0.153.3 (bundled at /opt/codex-acp/node_modules/@openai/codex)",
       source:
         "node -p require('/opt/codex-acp/package.json').version + node -p require('/opt/codex-acp/node_modules/@openai/codex/package.json').version",
     },
