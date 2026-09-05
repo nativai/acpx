@@ -435,6 +435,31 @@ export interface KnownSessionRecord {
 }
 
 /**
+ * Index the store by EVERY id that can name a config directory — the acpx record
+ * id and the ACP session id both can, and a map keyed by only one of them would
+ * make the other look unrecognised.
+ *
+ * ⚠️ IT LIVES HERE, BESIDE THE SWEEP THAT CONSUMES IT, BECAUSE IT HAS TWO CALLERS
+ * NOW: the `sessions prune` path and the prompt/startup trigger
+ * (`config-dir-sweep-trigger.ts`). Two copies of this mapping would be two chances
+ * to key on only one id — and the failure mode of that is a directory whose session
+ * is alive being read as UNRECOGNISED, which is the branch that removes on age.
+ */
+export function knownRecordsById(
+  listed: readonly { acpxRecordId?: string; acpSessionId?: string; closed?: boolean }[],
+): Map<string, KnownSessionRecord> {
+  const records = new Map<string, KnownSessionRecord>();
+  for (const entry of listed) {
+    for (const id of [entry.acpxRecordId, entry.acpSessionId]) {
+      if (typeof id === "string" && id.length > 0) {
+        records.set(id, { closed: entry.closed === true });
+      }
+    }
+  }
+  return records;
+}
+
+/**
  * Sweep config dirs whose session is gone (brick 433f6bf8), on POSITIVE
  * OWNERSHIP ONLY (brick cc9a5f25).
  *
@@ -575,25 +600,12 @@ export function pruneOrphanHarnessConfigDirs(params: {
     if (verdict.unclaimedAgeMs !== undefined) {
       oldestUnclaimedAgeMs = Math.max(oldestUnclaimedAgeMs ?? 0, verdict.unclaimedAgeMs);
     }
-    if (verdict.retain) {
+    const outcome = applyConfigDirVerdict(dir, verdict, { dryRun, removed, wouldRemove });
+    if (outcome.retain) {
       retained += 1;
-      retainedBy[verdict.reason] += 1;
-      details.push({ dir, retain: true, reason: verdict.reason, ageMs: verdict.unclaimedAgeMs });
-      continue;
+      retainedBy[outcome.reason] += 1;
     }
-    if (dryRun) {
-      // The ONLY divergence between a dry run and a real one.
-      wouldRemove.push(dir);
-      details.push({ dir, retain: false, reason: verdict.reason, ageMs: verdict.unclaimedAgeMs });
-      continue;
-    }
-    if (removeDir(dir, removed)) {
-      details.push({ dir, retain: false, reason: verdict.reason, ageMs: verdict.unclaimedAgeMs });
-    } else {
-      retained += 1;
-      retainedBy.removeFailed += 1;
-      details.push({ dir, retain: true, reason: "removeFailed", ageMs: verdict.unclaimedAgeMs });
-    }
+    details.push(outcome);
   }
   return {
     root,
@@ -679,6 +691,36 @@ function findConfigDirCandidates(
     }
   }
   return { entriesRead: entries.length, candidates };
+}
+
+/**
+ * Carry out one candidate's verdict and report what actually happened to it.
+ *
+ * ⚠️ THE DRY-RUN BRANCH IS THE ONLY DIVERGENCE BETWEEN A PREVIEW AND A REAL RUN,
+ * and it lives here, in one place, on purpose. Every other step — the candidate
+ * filter, the classification, the age gate, the ordering — is shared, which is what
+ * lets `test/config-dir-sweep-report.test.ts` assert that the preview PREDICTS the
+ * run. A second dry-run check anywhere upstream would break that property silently.
+ */
+function applyConfigDirVerdict(
+  dir: string,
+  verdict: ConfigDirVerdict,
+  sink: { dryRun: boolean; removed: string[]; wouldRemove: string[] },
+): ConfigDirCandidateReport {
+  const ageMs = verdict.unclaimedAgeMs;
+  if (verdict.retain) {
+    return { dir, retain: true, reason: verdict.reason, ageMs };
+  }
+  if (sink.dryRun) {
+    sink.wouldRemove.push(dir);
+    return { dir, retain: false, reason: verdict.reason, ageMs };
+  }
+  if (removeDir(dir, sink.removed)) {
+    return { dir, retain: false, reason: verdict.reason, ageMs };
+  }
+  // A removal that FAILED is a retention, and it is reported as its own reason —
+  // "I decided to remove it and could not" is a different fact from "I kept it".
+  return { dir, retain: true, reason: "removeFailed", ageMs };
 }
 
 /**

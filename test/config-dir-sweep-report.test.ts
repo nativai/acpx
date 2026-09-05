@@ -187,14 +187,21 @@ test("0bac6a00 §5: the dry run PREDICTS the real run — same verdicts, same se
     });
 
     const rel = (root: string) => (dir: string) => dir.slice(root.length);
+    const byText = (a: string, z: string) => (a < z ? -1 : a > z ? 1 : 0);
+    // Compared as text so the assertion message names the offending entry rather
+    // than printing two object graphs.
+    const verdicts = (result: typeof preview, root: string) =>
+      result.candidates
+        .map((c) => `${rel(root)(c.dir)} retain=${c.retain} reason=${c.reason}`)
+        .toSorted(byText);
     assert.deepEqual(
-      preview.wouldRemove.map(rel(dryRoot)).sort(),
-      real.removed.map(rel(realRoot)).sort(),
+      preview.wouldRemove.map(rel(dryRoot)).toSorted(byText),
+      real.removed.map(rel(realRoot)).toSorted(byText),
       "the preview and the real run disagree about what gets removed",
     );
     assert.deepEqual(
-      preview.candidates.map((c) => [rel(dryRoot)(c.dir), c.retain, c.reason]).sort(),
-      real.candidates.map((c) => [rel(realRoot)(c.dir), c.retain, c.reason]).sort(),
+      verdicts(preview, dryRoot),
+      verdicts(real, realRoot),
       "the preview and the real run disagree about a verdict",
     );
     // Sanity: the comparison is not vacuous — something really was removed.

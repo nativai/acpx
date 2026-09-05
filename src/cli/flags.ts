@@ -199,6 +199,18 @@ export type SessionsPruneFlags = {
   configDirRoot?: string;
 };
 
+/**
+ * `sessions sweep-config-dirs` — the NON-DESTRUCTIVE sweep. Deliberately carries
+ * no session-selection flags at all: it deletes no records, so it needs no scope,
+ * and adding one would invite the reading that it prunes sessions under a root.
+ */
+export type SessionsSweepConfigDirsFlags = {
+  /** Classify and print every candidate; remove nothing. */
+  dryRun?: boolean;
+  /** Bound the sweep to this directory instead of the system temp dir. */
+  configDirRoot?: string;
+};
+
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)

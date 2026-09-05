@@ -3,12 +3,14 @@ import path from "node:path";
 import type { PromptResponse } from "@agentclientprotocol/sdk";
 import type { EffectiveAccountMetadata } from "../../acp/auth-env.js";
 import { AcpClient } from "../../acp/client.js";
+import { maybeSweepHarnessConfigDirs } from "../../acp/config-dir-sweep-trigger.js";
 import {
   formatErrorMessage,
   isRetryablePromptError,
   normalizeOutputError,
 } from "../../acp/error-normalization.js";
 import { modelMechanismForAgentCommand } from "../../acp/harness-capabilities.js";
+import { knownRecordsById } from "../../acp/harness-config-dir.js";
 import {
   emitsTurnEndMarker,
   injectionAbsorbsIntoActiveTurn,
@@ -106,6 +108,7 @@ import {
 import {
   absolutePath,
   isoNow,
+  listSessions,
   readPersistedLifecycle,
   resolveSessionRecord,
   writeSessionRecord,
@@ -1504,6 +1507,23 @@ async function runQueuedTaskFailover(
 // eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
 async function runSessionPrompt(options: RunSessionPromptOptions): Promise<SessionSendResult> {
   const stopTotalTimer = startPerfTimer("runtime.prompt.total");
+  // TRIGGER C (brick 0bac6a00) — THE PROMPT, NOT THE CREATE, AND NOT THE CLOSE.
+  //
+  // ⚠️ `close` is measured ABSENT on the paths that leak, so it cannot be the
+  // trigger. `create` was the intuitive choice and is measured WRONG: a create-only
+  // session materialises no config dir (3 create+close pairs added 0 candidates),
+  // so a create-triggered sweep fires before the thing it sweeps exists. The
+  // directory appears HERE, during a prompt.
+  //
+  // ⚠️ NOT AWAITED, DELIBERATELY. The census must never sit in front of a user's
+  // turn; `maybeSweepHarnessConfigDirs` never throws, and its interval gate costs
+  // one `Date.now()` comparison on every prompt but the first of each interval.
+  // The current session cannot be swept out from under itself: its directory is
+  // referenced by a live process, and its record is open — either clause alone
+  // retains it.
+  void maybeSweepHarnessConfigDirs({
+    loadRecords: async () => knownRecordsById(await listSessions()),
+  });
   const output = options.outputFormatter;
   const record = await measurePerf("session.resolve_prompt_record", async () => {
     return await resolveSessionRecord(options.sessionRecordId);

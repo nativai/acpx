@@ -3,6 +3,7 @@ import path from "node:path";
 import { Command, InvalidArgumentError } from "commander";
 import { acpAdapterKind } from "../acp/agent-command.js";
 import { isLegacyZedCodexAcpInvocation } from "../acp/codex-compat.js";
+import { sweepHarnessConfigDirsNow } from "../acp/config-dir-sweep-trigger.js";
 import {
   assertForkAtIndexHonoured,
   depthMechanismForAgentCommand,
@@ -15,6 +16,7 @@ import {
 import {
   describeHarnessConfigDirSweep,
   describeHarnessConfigDirSweepPlan,
+  knownRecordsById,
   pruneOrphanHarnessConfigDirs,
 } from "../acp/harness-config-dir.js";
 import {
@@ -124,6 +126,7 @@ import {
   type SessionsNewFlags,
   type SessionsOwnerStatusFlags,
   type SessionsPruneFlags,
+  type SessionsSweepConfigDirsFlags,
   type SessionsTemplateFlags,
   type SessionsCloseFlags,
   type StatusFlags,
@@ -3743,20 +3746,61 @@ export async function handleSessionsPrune(
  * that deletes something the real run would is worse than no preview.
  */
 /**
- * Index the store by EVERY id that can name a config directory — the acpx record
- * id and the ACP session id both can, and a map keyed by only one of them would
- * make the other look unrecognised.
+ * `acpx sessions sweep-config-dirs` — reclaim leaked harness config dirs WITHOUT
+ * deleting a single session record (brick 0bac6a00).
+ *
+ * ## ⚠️ WHY THIS VERB HAD TO EXIST BEFORE THE SWEEP COULD BE TRIGGERED AT ALL
+ *
+ * Until now the ONLY thing that invoked the sweep was `sessions prune`, which
+ * removes each session's record **and its messages sidecar**, after which its
+ * transcript cannot be rebuilt. So reclaiming a leaked directory was coupled to
+ * destroying history — which is exactly why no agent on this fleet was permitted to
+ * run it, and therefore why nothing reaped the backlog.
+ *
+ * A trigger at server start or on a prompt could not possibly be `sessions prune`.
+ * This is the same sweep with the destruction removed: it closes no records, deletes
+ * no sessions, and touches nothing but orphaned directories under its own root.
+ *
+ * ⚠️ IT IS ALSO THE PREVIEW AN OPERATOR SHOULD REACH FOR FIRST on a shared box:
+ * `--dry-run` here classifies and prints every candidate and removes nothing, and it
+ * needs no scope argument to be safe.
  */
-function knownRecordsById(
-  listed: readonly { acpxRecordId?: string; acpSessionId?: string; closed?: boolean }[],
+export async function handleSessionsSweepConfigDirs(
+  explicitAgentName: string | undefined,
+  flags: SessionsSweepConfigDirsFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const session = await loadSessionModule();
+  // Ungated: the operator asking for it IS the "once". The trigger's interval gate
+  // exists to keep the census off a hot path, not to second-guess an explicit ask.
+  await sweepHarnessConfigDirsNow({
+    loadRecords: async () => knownRecordsById(await session.listSessions()),
+    rootDir: flags.configDirRoot,
+    dryRun: flags.dryRun === true,
+  });
+}
+
+/**
+ * In a DRY RUN the record pass closed nothing, so the ids it WOULD have closed are
+ * folded in here before the directory pass classifies.
+ *
+ * ⚠️ WITHOUT THIS THE PREVIEW UNDER-REPORTS, WHICH IS THE REASSURING DIRECTION.
+ * The real run closes ownerless records FIRST, and a directory becomes removable
+ * precisely when its record is closed — so a preview that skipped the fold would
+ * show a strictly smaller set than the run it is previewing, and an operator would
+ * check the small set and approve the large one.
+ *
+ * On a real run `wouldClose` is empty and this is the identity function.
+ */
+function foldWouldCloseIntoRecords(
+  records: Map<string, { closed: boolean }>,
+  wouldClose: readonly string[],
 ): Map<string, { closed: boolean }> {
-  const records = new Map<string, { closed: boolean }>();
-  for (const entry of listed) {
-    for (const id of [entry.acpxRecordId, entry.acpSessionId]) {
-      if (typeof id === "string" && id.length > 0) {
-        records.set(id, { closed: entry.closed === true });
-      }
-    }
+  for (const id of wouldClose) {
+    records.set(id, { closed: true });
   }
   return records;
 }
@@ -3806,12 +3850,10 @@ async function sweepOrphanHarnessConfigDirs(
     // just made rather than the state that preceded them. In dry-run no close
     // landed, so the ids it WOULD have closed are folded in here instead — the
     // preview then classifies against the state the real run would have reached.
-    const records = knownRecordsById(await session.listSessions());
-    if (dryRun) {
-      for (const id of recordSweep.closed) {
-        records.set(id, { closed: true });
-      }
-    }
+    const records = foldWouldCloseIntoRecords(
+      knownRecordsById(await session.listSessions()),
+      dryRun ? recordSweep.closed : [],
+    );
     const swept = pruneOrphanHarnessConfigDirs({ records, liveScan, rootDir, dryRun });
     // ⚠️ PRINTED BY DEFAULT, NOT UNDER `--verbose` (CONCEPTION §7). Every
     // population this sweep reports — `scanned=0 means NOT RUN`, `unmeasured`

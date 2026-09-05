@@ -15,6 +15,7 @@ import {
   handleSessionsNew,
   handleSessionsOwnerStatus,
   handleSessionsPrune,
+  handleSessionsSweepConfigDirs,
   handleSessionsRecover,
   handleSessionsRepairAccountSeam,
   handleSessionsSetMetadata,
@@ -53,6 +54,7 @@ import {
   type SessionsNewFlags,
   type SessionsOwnerStatusFlags,
   type SessionsPruneFlags,
+  type SessionsSweepConfigDirsFlags,
   type SessionsTemplateFlags,
   type StatusFlags,
 } from "./flags.js";
@@ -640,6 +642,25 @@ export function registerSessionsCommand(
     )
     .action(async function (this: Command, ids: string[], flags: SessionsPruneFlags) {
       await handleSessionsPrune(explicitAgentName, ids, flags, this, config);
+    });
+
+  // ⚠️ A SEPARATE VERB FROM `prune`, AND THAT SEPARATION IS THE POINT (brick 0bac6a00).
+  // `prune` deletes session records and their messages sidecars; this deletes only
+  // orphaned harness config directories. Coupling the two is what made reclaiming a
+  // leaked directory cost a transcript, and therefore what stopped anyone reaping.
+  sessionsCommand
+    .command("sweep-config-dirs")
+    .description(
+      "Reclaim orphaned per-session harness config dirs. Deletes NO session records and NO transcripts. Removes a directory only when its id resolves to a CLOSED record in this home AND no live process references it; anything else is retained and reported. Use --dry-run to preview.",
+    )
+    .option("--dry-run", "Classify and print every candidate without removing anything")
+    .option(
+      "--config-dir-root <path>",
+      "Sweep this directory instead of the system temp dir. Also settable as ACPX_HARNESS_CONFIG_DIR_ROOT; the flag wins.",
+      (value: string) => parseNonEmptyValue("Config dir root", value),
+    )
+    .action(async function (this: Command, flags: SessionsSweepConfigDirsFlags) {
+      await handleSessionsSweepConfigDirs(explicitAgentName, flags, this, config);
     });
 }
 
