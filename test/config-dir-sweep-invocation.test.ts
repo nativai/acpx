@@ -73,6 +73,31 @@ function runCliUnguarded(args: string[], homeDir: string): Promise<CliResult> {
  * from "the sweep correctly spared it". Measured while writing these tests: a
  * hand-written record made the CONTROL below pass for the wrong reason.
  */
+/**
+ * A CLOSED record, which since `unrecognised` became retain-and-report is the ONLY
+ * thing that makes a config dir removable. A planted directory with no record is now
+ * retained, so a reap fixture without one would assert nothing.
+ */
+async function seedClosedSession(homeDir: string, id: string): Promise<void> {
+  await writeSessionRecordFile(
+    homeDir,
+    makeSessionRecord(
+      {
+        acpxRecordId: id,
+        acpSessionId: id,
+        agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+        agentName: "claude",
+        cwd: homeDir,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        lastUsedAt: "2026-01-01T00:00:00.000Z",
+        closed: true,
+        closedAt: "2026-01-02T00:00:00.000Z",
+      },
+      { defaultName: false, defaultAcpx: false },
+    ),
+  );
+}
+
 async function seedIdleOpenSession(homeDir: string, id: string): Promise<void> {
   await writeSessionRecordFile(
     homeDir,
@@ -210,6 +235,7 @@ test("0bac6a00 gate: the stamp is never itself a sweep CANDIDATE", () => {
 test("0bac6a00 A: `sessions sweep-config-dirs` reaps a directory and prints its census", async () => {
   await withTempHomeFixture("acpx-0bac6a00-verb-", async (homeDir) => {
     const root = process.env[HARNESS_CONFIG_DIR_ROOT_ENV] as string;
+    await seedClosedSession(homeDir, "verb-orphan");
     const dir = plantAged(root, "acpx-opencode-verb-orphan");
 
     const result = await runCliUnguarded(["claude", "sessions", "sweep-config-dirs"], homeDir);
@@ -226,6 +252,7 @@ test("0bac6a00 A: `sessions sweep-config-dirs` reaps a directory and prints its 
 test("0bac6a00 A: `sessions sweep-config-dirs --dry-run` previews and removes nothing", async () => {
   await withTempHomeFixture("acpx-0bac6a00-verbdry-", async (homeDir) => {
     const root = process.env[HARNESS_CONFIG_DIR_ROOT_ENV] as string;
+    await seedClosedSession(homeDir, "verb-preview");
     const dir = plantAged(root, "acpx-opencode-verb-preview");
 
     const result = await runCliUnguarded(
@@ -290,6 +317,7 @@ test("0bac6a00 C: a PROMPT triggers the sweep, and does so before the session lo
   // must not depend on the turn succeeding.
   await withTempHomeFixture("acpx-0bac6a00-trigger-", async (homeDir) => {
     const root = process.env[HARNESS_CONFIG_DIR_ROOT_ENV] as string;
+    await seedClosedSession(homeDir, "trigger-orphan");
     const dir = plantAged(root, "acpx-opencode-trigger-orphan");
 
     const result = await runCliUnguarded(

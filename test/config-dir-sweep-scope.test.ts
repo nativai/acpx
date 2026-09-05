@@ -14,7 +14,11 @@ import {
   isolatedHarnessConfigDirRoot,
   scopeHarnessConfigDirRootForCli,
 } from "./config-dir-root-isolation.js";
-import { withTempHome as withTempHomeFixture } from "./runtime-test-helpers.js";
+import {
+  makeSessionRecord,
+  withTempHome as withTempHomeFixture,
+  writeSessionRecordFile,
+} from "./runtime-test-helpers.js";
 
 /**
  * brick 0bac6a00 §4 — THE CONFIG-DIR SWEEP'S ROOT IS REACHABLE FROM THE CLI, AND
@@ -85,7 +89,31 @@ function runCliUnguarded(args: string[], homeDir: string): Promise<CliResult> {
   });
 }
 
-/** An aged, unclaimed config dir — the shape the sweep is allowed to remove. */
+/**
+ * A CLOSED record for `id`. Since `unrecognised` became retain-and-report this is
+ * the ONLY thing that makes a config dir removable, so every reap fixture needs one.
+ */
+async function seedClosedSession(homeDir: string, id: string): Promise<void> {
+  await writeSessionRecordFile(
+    homeDir,
+    makeSessionRecord(
+      {
+        acpxRecordId: id,
+        acpSessionId: id,
+        agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+        agentName: "claude",
+        cwd: homeDir,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        lastUsedAt: "2026-01-01T00:00:00.000Z",
+        closed: true,
+        closedAt: "2026-01-02T00:00:00.000Z",
+      },
+      { defaultName: false, defaultAcpx: false },
+    ),
+  );
+}
+
+/** An aged config dir. Removable only when a CLOSED record claims its id. */
 function plantAgedConfigDir(root: string, name: string): string {
   const dir = join(root, name);
   mkdirSync(dir, { recursive: true });
@@ -143,11 +171,16 @@ test("0bac6a00 §4: `sessions prune` sweeps the ISOLATED root and leaves an iden
       // Same name, same age, same emptiness — the ONLY difference is which root
       // it sits in. That is what makes this a scoping measurement rather than a
       // classification one.
+      await seedClosedSession(homeDir, "0bac6a00-inside");
       const inside = plantAgedConfigDir(isolated, "acpx-opencode-0bac6a00-inside");
       const beyond = plantAgedConfigDir(outside, "acpx-opencode-0bac6a00-inside");
 
       const result = await runCliUnguarded(
-        ["--verbose", "claude", "sessions", "prune", "--whole-box"],
+        // ⚠️ THE VERB, NOT `prune`. `prune` DELETES the closed record first, and since
+        // `unrecognised` became retain-and-report a dir whose record is gone is always
+        // RETAINED — so prune can no longer reap its own deletions. This test is about
+        // WHERE the sweep looks, so it uses the reaper that can still act.
+        ["--verbose", "claude", "sessions", "sweep-config-dirs"],
         homeDir,
       );
 
@@ -176,10 +209,13 @@ test("0bac6a00 §4: `--config-dir-root` reaches the sweep and OUTRANKS the envir
     const flagRoot = mkdtempSync(join(tmpdir(), "acpx-0bac6a00-flag-root-"));
     try {
       const viaEnv = plantAgedConfigDir(envRoot, "acpx-opencode-0bac6a00-env");
+      await seedClosedSession(homeDir, "0bac6a00-flag");
       const viaFlag = plantAgedConfigDir(flagRoot, "acpx-opencode-0bac6a00-flag");
 
       const result = await runCliUnguarded(
-        ["--verbose", "claude", "sessions", "prune", "--whole-box", "--config-dir-root", flagRoot],
+        // The VERB, not prune: prune deletes the record first and the dir then reads
+        // unrecognised, which is now always retained. This test is about which ROOT wins.
+        ["--verbose", "claude", "sessions", "sweep-config-dirs", "--config-dir-root", flagRoot],
         homeDir,
       );
 

@@ -707,7 +707,7 @@ type ConfigDirRetainReason = "liveProcess" | "openRecord" | "unrecognised" | "to
  * {@link ConfigDirRetainReason} alone, so a removal cannot be attributed to a retention
  * reason and a retention cannot be counted under a removal reason.
  */
-type ConfigDirRemoveReason = "closedRecord" | "unrecognised";
+type ConfigDirRemoveReason = "closedRecord";
 
 type ConfigDirVerdict =
   | {
@@ -743,6 +743,28 @@ function classifyConfigDir(
   if (record === undefined) {
     // Clause 1 fails. NOT ours to guess about — the fallback `randomUUID()` dir
     // lands here and is in no session list, ever.
+    //
+    // ## 🛑 UNRECOGNISED IS RETAIN-AND-REPORT. IT IS NEVER REMOVED.
+    //
+    // This branch used to remove an unclaimed directory once it aged past
+    // `orphanMinAgeMs`. **That inverted the posture the whole sweep rests on: it
+    // REMOVED WHAT IT COULD NOT NAME.** An unrecognised directory is the category
+    // the sweep understands LEAST, so it must get the MOST conservative treatment,
+    // not the most permissive one. Kept, reported with its age and reason, counted
+    // separately — and left for a human who can find out what it is.
+    //
+    // ⚠️ THE INCONSISTENCY THIS RESOLVES, measured on staging 2026-09-05: the census
+    // summary printed `unrecognised=0` as a RETAIN tally in the very same run that
+    // removed `/tmp/acpx-opencode-session` with reason `unrecognised`. **One token
+    // named both a retain bucket and a remove path**, so the counter could read zero
+    // while that exact reason was deleting things. Now `unrecognised` means one
+    // thing, and the counter means what it says.
+    //
+    // ⚠️ AND THE AGE GATE NO LONGER AUTHORISES ANY DELETION. It now only separates
+    // two RETAIN reasons — `tooYoung` (recently written, may still be in use) from
+    // `unrecognised` (old enough to be worth a human's attention). Both are kept.
+    // The distinction is preserved because losing it would flatten "just created"
+    // into "sitting here for a week", and the second is the one worth looking at.
     const age = directoryAgeMs(dir, ctx.now);
     if (age === undefined) {
       return { retain: true, reason: "unrecognised" };
@@ -750,7 +772,7 @@ function classifyConfigDir(
     if (age < ctx.orphanMinAgeMs) {
       return { retain: true, reason: "tooYoung", unclaimedAgeMs: age };
     }
-    return { retain: false, reason: "unrecognised", unclaimedAgeMs: age };
+    return { retain: true, reason: "unrecognised", unclaimedAgeMs: age };
   }
   if (!record.closed) {
     return { retain: true, reason: "openRecord" }; // Clause 2 fails.
@@ -761,12 +783,19 @@ function classifyConfigDir(
 }
 
 /**
- * How long an UNCLAIMED directory must sit before the sweep may remove it.
+ * How long an UNCLAIMED directory must sit before it is reported as
+ * `unrecognised` rather than `tooYoung`.
+ *
+ * ⚠️ **IT NO LONGER AUTHORISES ANY REMOVAL, AND THIS COMMENT IS CORRECTED RATHER
+ * THAN LEFT TO ROT.** It used to read "before the sweep may remove it", which was
+ * true until unrecognised became retain-and-report. A comment describing a
+ * behaviour the code has stopped having is what the next reader trusts INSTEAD of
+ * reading the branch — this file has already been corrected twice for that class.
  *
  * ⚠️ STATED, NOT INFERRED. Six hours is longer than any turn this programme has
- * observed and shorter than a working day, so a directory this old belongs to a
- * process that is not coming back. It is deliberately generous: the cost of
- * waiting is one directory; the cost of being wrong is a live session's primer.
+ * observed and shorter than a working day, so a directory older than this is worth
+ * a human's attention rather than a shrug. Both sides of the line are RETAINED;
+ * the line only decides which of two retain reasons is reported.
  */
 const DEFAULT_ORPHAN_MIN_AGE_MS = 6 * 60 * 60 * 1000;
 

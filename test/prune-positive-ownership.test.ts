@@ -146,7 +146,21 @@ test("cc9a5f25: an OPEN record retains its dir; a CLOSED one releases it", async
   }
 });
 
-test("cc9a5f25: an unclaimed dir is removed only once it is OLDER than the stated age", async () => {
+test("0bac6a00: an UNCLAIMED dir is NEVER removed — the age only picks which retain reason", async () => {
+  // ⚠️ THIS TEST PINNED THE OPPOSITE BEHAVIOUR UNTIL 2026-09-05, AND IT WAS RIGHT ABOUT
+  // THE CODE AND WRONG ABOUT THE POLICY. It asserted that an unclaimed directory IS
+  // removed once older than `orphanMinAgeMs` — i.e. that the sweep REMOVES WHAT IT
+  // CANNOT NAME. That inverts the conservative posture the whole mechanism rests on:
+  // an unrecognised directory is the category the sweep understands LEAST, so it must
+  // get the MOST conservative treatment.
+  //
+  // It is rewritten rather than deleted because the ORIGINAL PROPERTY still matters —
+  // the age is still read, still reported, and still distinguishes the two cases. What
+  // changed is that BOTH sides of the line are now kept.
+  //
+  // ⚠️ The inconsistency that forced it, measured on staging: the census summary printed
+  // `unrecognised=0` as a RETAIN tally in the same run that removed a candidate whose
+  // reason was `unrecognised`. One token named a retain bucket AND a remove path.
   const root = fixture([
     { name: "acpx-opencode-orphan-young", ageMs: 1 * HOUR },
     { name: "acpx-opencode-orphan-old", ageMs: 48 * HOUR },
@@ -158,11 +172,26 @@ test("cc9a5f25: an unclaimed dir is removed only once it is OLDER than the state
       rootDir: root,
       orphanMinAgeMs: 6 * HOUR,
     });
-    assert.deepEqual(
-      result.removed.map((d) => d.split("/").pop()),
-      ["acpx-opencode-orphan-old"],
-    );
-    assert.equal(result.retainedBy.tooYoung, 1);
+
+    // NOTHING is removed, however old it is.
+    assert.deepEqual(result.removed, [], "an unclaimed dir was removed");
+    assert.equal(result.retained, 2);
+    assert.equal(existsSync(join(root, "acpx-opencode-orphan-old")), true);
+    assert.equal(existsSync(join(root, "acpx-opencode-orphan-young")), true);
+
+    // ...but the age still SEPARATES them, so "sitting here for two days" does not read
+    // the same as "written a minute ago". Both counters are asserted, so a change that
+    // collapsed the two into one bucket would red here.
+    assert.equal(result.retainedBy.tooYoung, 1, "the young one must report tooYoung");
+    assert.equal(result.retainedBy.unrecognised, 1, "the old one must report unrecognised");
+
+    // And the reason travels per candidate, not just as a tally — the per-candidate
+    // line is what an operator reads.
+    const old = result.candidates.find((c) => c.dir.endsWith("acpx-opencode-orphan-old"));
+    assert.equal(old?.retain, true);
+    assert.equal(old?.reason, "unrecognised");
+    assert.ok((old?.unclaimedAgeMs ?? 0) >= 47 * HOUR, "the age must be reported with it");
+
     // The age is PRINTED, so a stuck orphan is visible instead of accumulating.
     assert.ok(
       (result.oldestUnclaimedAgeMs ?? 0) >= 47 * HOUR,

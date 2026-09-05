@@ -90,8 +90,12 @@ test("0bac6a00 §5: a dry run CLASSIFIES, reports wouldRemove, and deletes nothi
   const root = freshRoot("acpx-0bac6a00-dry-");
   try {
     const dir = plantAged(root, "acpx-opencode-orphan-1");
+    // ⚠️ A CLOSED RECORD, not an empty store. Since `unrecognised` became
+    // retain-and-report, an unclaimed directory is never removable — so a preview
+    // fixture with no record would preview nothing and this test would assert the
+    // absence of a removal rather than the preview of one.
     const result = pruneOrphanHarnessConfigDirs({
-      records: new Map<string, KnownSessionRecord>(),
+      records: new Map<string, KnownSessionRecord>([["orphan-1", { closed: true }]]),
       liveScan: measuredScan(),
       rootDir: root,
       dryRun: true,
@@ -106,7 +110,7 @@ test("0bac6a00 §5: a dry run CLASSIFIES, reports wouldRemove, and deletes nothi
     assert.equal(existsSync(dir), true, "the directory was deleted by a preview");
     assert.deepEqual(
       result.candidates.map((c) => ({ dir: c.dir, retain: c.retain, reason: c.reason })),
-      [{ dir, retain: false, reason: "unrecognised" }],
+      [{ dir, retain: false, reason: "closedRecord" }],
       "the preview must carry a per-candidate verdict, not just a count",
     );
   } finally {
@@ -121,7 +125,7 @@ test("0bac6a00 §5: the SAME fixture without --dry-run really is removed (the pr
   try {
     const dir = plantAged(root, "acpx-opencode-orphan-1");
     const result = pruneOrphanHarnessConfigDirs({
-      records: new Map<string, KnownSessionRecord>(),
+      records: new Map<string, KnownSessionRecord>([["orphan-1", { closed: true }]]),
       liveScan: measuredScan(),
       rootDir: root,
     });
@@ -277,7 +281,7 @@ test("0bac6a00 §10.1: a plugin cache WITHOUT its leading dot is still excluded"
     const ordinary = plantAged(root, "acpx-opencode-ordinary-orphan");
 
     const result = pruneOrphanHarnessConfigDirs({
-      records: new Map<string, KnownSessionRecord>(),
+      records: new Map<string, KnownSessionRecord>([["ordinary-orphan", { closed: true }]]),
       liveScan: measuredScan(),
       rootDir: root,
     });
@@ -302,7 +306,7 @@ test("0bac6a00 §10.1: the exclusion does not swallow a real session dir with a 
   try {
     const lookalike = plantAged(root, "acpx-opencode-plugin-x", 8 * HOUR);
     const result = pruneOrphanHarnessConfigDirs({
-      records: new Map<string, KnownSessionRecord>(),
+      records: new Map<string, KnownSessionRecord>([["plugin-x", { closed: true }]]),
       liveScan: measuredScan(),
       rootDir: root,
     });
@@ -384,6 +388,49 @@ test("0bac6a00 §6b: `retainedBy` still counts only RETENTIONS, and closedRecord
     // Every retention is accounted for by exactly one reason — no double-count, no gap.
     const tally = Object.values(result.retainedBy).reduce((a, b) => a + b, 0);
     assert.equal(tally, result.retained, "retainedBy must sum to retained");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("0bac6a00: `prune` CANNOT reap the dirs of the sessions it just deleted — the verb can", async () => {
+  // ⚠️ A REAL CONSEQUENCE OF MAKING `unrecognised` RETAIN-AND-REPORT, pinned so it is a
+  // known property rather than a surprise. `sessions prune` DELETES each closed record
+  // and only then sweeps, so by the time the directory pass runs, the id that would
+  // have identified the dir is GONE — the dir reads `unrecognised` and is now kept.
+  //
+  // That is the conservative answer and it is arguably correct: prune has destroyed the
+  // evidence needed to attribute the directory, so refusing to delete it is the honest
+  // outcome. But it means prune's tidy-up is a NO-OP FOR ITS OWN DELETIONS, and the
+  // record-preserving verb is the reaper that actually works — precisely BECAUSE it
+  // preserves the record it needs to read.
+  //
+  // Measured 2026-09-05 with the fixture asserted in both arms:
+  //   prune --whole-box      -> record after 0, dir RETAINED (unrecognised=1)
+  //   sweep-config-dirs      -> record after 1, dir REMOVED  (removed=1)
+  const root = freshRoot("acpx-0bac6a00-prunegap-");
+  try {
+    const dir = plantAged(root, "acpx-opencode-gap-one");
+
+    // Arm 1: the record is GONE, as it is after prune has deleted it.
+    const afterPrune = pruneOrphanHarnessConfigDirs({
+      records: new Map<string, KnownSessionRecord>(),
+      liveScan: measuredScan(),
+      rootDir: root,
+    });
+    assert.deepEqual(afterPrune.removed, [], "a dir with no record must be RETAINED");
+    assert.equal(afterPrune.retainedBy.unrecognised, 1);
+    assert.equal(existsSync(dir), true);
+
+    // Arm 2: the record SURVIVES, as it does under sweep-config-dirs. Same directory,
+    // same age — the only difference is whether the record is still there to read.
+    const afterVerb = pruneOrphanHarnessConfigDirs({
+      records: new Map<string, KnownSessionRecord>([["gap-one", { closed: true }]]),
+      liveScan: measuredScan(),
+      rootDir: root,
+    });
+    assert.deepEqual(afterVerb.removed, [dir], "a CLOSED record must release its dir");
+    assert.equal(existsSync(dir), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
