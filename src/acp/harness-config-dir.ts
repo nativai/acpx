@@ -779,36 +779,36 @@ function writePiConfigDir(dir: string, input: HarnessConfigDirInput): HarnessCon
     writeFileSync(appendSystemPath, input.primer, { mode: 0o600 });
     files.push(appendSystemPath);
   }
-  // ⚠️ NO `models-store.json` IS WRITTEN HERE, AND THAT IS DELIBERATE — DO NOT
-  // "COMPLETE" THIS BY ADDING ONE WITHOUT MEASURING FIRST.
+  // ⚠️ WRITING `models-store.json` HERE IS SAFE, AND THE COMMENT THAT STOOD HERE
+  // SAYING OTHERWISE WAS WRONG. It read: *"What is NOT established is whether a
+  // file in `PI_CODING_AGENT_DIR` merges with or REPLACES the bundled catalogue…
+  // if the semantics are REPLACE, writing one entry here silently removes the
+  // other ~370 models from every Pi session."* Measured 2026-09-04 against pi
+  // 0.84.4 (brick ef5999ca, B5): **it MERGES, by id.**
   //
-  // Pi resolves models from a bundled `models-store.json` with ~371 entries and
-  // will not take a free-text slug (I2 R5), so provisioning an arbitrary slug
-  // does mean writing that file. What is NOT established is whether a file in
-  // `PI_CODING_AGENT_DIR` **merges with** or **REPLACES** the bundled catalogue.
-  // I2 proved only that EDITING existing entries is honoured (it rewrote three
-  // entries' `baseUrl` in place) — which says nothing about a fresh one-entry
-  // file. If the semantics are REPLACE, writing one entry here silently removes
-  // the other ~370 models from every Pi session, breaking sessions that never
-  // asked for provisioning to fix one that did.
+  //   `mergeModels(baseline, dynamic)` — `dist/core/remote-catalog-provider.js:7-16`
+  //   — walks the stored entry and REPLACES a same-id model or APPENDS a new one.
+  //   Planting a one-entry file took the offered catalogue from 333 models to
+  //   **334**, with the planted slug offered, a pre-existing slug still offered,
+  //   and 333 again after restore.
   //
-  // The asymmetry decides it: not writing costs an unprovisioned slug failing
-  // honestly (the model apply path already refuses loudly); writing wrongly costs
-  // every Pi session its catalogue. OpenCode is different and IS provisioned
-  // above, because `provider.openrouter.models.<id>` is a documented ADDITIVE
-  // config key and I1 R6 measured a declared slug reaching OpenRouter while the
-  // rest of the catalogue kept resolving.
+  // ⚠️ THE REAL HAZARD IS THE OPPOSITE ONE, AND IT IS SILENT: an entry is IGNORED
+  // unless the provider block carries a `lastModified` GREATER than the bundled
+  // catalogue's generation stamp — `remoteModels()` returns `[]` when it is
+  // absent (`remote-catalog-provider.js:31-38`). A well-formed entry without it
+  // changes nothing at all, with no error anywhere; measured 333 → 333, slug not
+  // offered. That is why the stamp below is `Date.now()` and not optional.
   //
-  // ⚠️ When someone does measure this, the fix carries a second trap: Pi's own
-  // catalogue ships `https://openrouter.ai/api` (no `/v1`) for all 15
-  // `anthropic-messages` entries, so the request goes out on the
-  // openai-completions route, which appends `/chat/completions` → `POST
-  // /api/chat/completions` → 404. I2 root-caused that at the wire; any generated
-  // entry must carry `https://openrouter.ai/api/v1`.
-  //
-  // Consequently `pi` stays out of ARBITRARY_MODEL_SUPPORT_ROUTED_BY_ACPX, so
-  // `acceptsArbitraryModelIds` is false and the picker does not offer a band that
-  // would fail at spawn. That is the descriptor working as designed.
+  // ⚠️ THE SECOND TRAP, ALSO MEASURED: pi's own catalogue ships
+  // `https://openrouter.ai/api` (NO `/v1`) for all 15 `anthropic-messages`
+  // entries, so an Anthropic model's request goes out on the openai-completions
+  // route, which appends `/chat/completions` → `POST /api/chat/completions` →
+  // 404 (I2 R6, root-caused at the wire). Every entry generated here therefore
+  // carries `https://openrouter.ai/api/v1`, and because the merge is BY ID this
+  // also repairs a bundled entry rather than merely adding new ones.
+  if (input.provisionModelId) {
+    writePiModelsStore(dir, input.env, stripProviderPrefix(input.provisionModelId), files);
+  }
   // ⚠️ KEEP pi's SESSION STORE WHERE IT WAS — read BEFORE the re-point below,
   // which is the last moment the box's own agent dir is still reachable through
   // the variable we are about to overwrite (brick ac86eb34; same ordering as the
@@ -821,6 +821,128 @@ function writePiConfigDir(dir: string, input: HarnessConfigDirInput): HarnessCon
     envNames.push("PI_CODING_AGENT_SESSION_DIR");
   }
   return { harness: "pi", dir, envNames, files };
+}
+
+/**
+ * Generate pi's per-session `models-store.json` so an arbitrary OpenRouter slug
+ * resolves — and repair pi's broken Anthropic entries on the way past.
+ *
+ * ## The two measurements this is built on (pi 0.84.4, brick ef5999ca)
+ *
+ * **It MERGES, by id.** `mergeModels(baseline, dynamic)`
+ * (`dist/core/remote-catalog-provider.js:7-16`) replaces a same-id model and
+ * appends a new one. Measured: a one-entry file took the offered catalogue from
+ * 333 models to 334, the planted slug was offered, a pre-existing slug still
+ * resolved, and 333 came back after restore. The standing comment that said this
+ * might REPLACE the catalogue — and kept the capability switched off — was wrong.
+ *
+ * **But an entry is IGNORED without a fresh `lastModified`.** `remoteModels()`
+ * (`:31-38`) returns `[]` when the provider block's `lastModified` is absent or
+ * not newer than the bundled stamp. A well-formed entry without it changes
+ * nothing, with no error anywhere: measured 333 → 333, slug not offered.
+ *
+ * ## ⚠️ WHY THE BOX'S OWN CATALOGUE IS COPIED FORWARD RATHER THAN REPLACED
+ *
+ * Writing ONLY the requested slug is what a naive "generate a fragment" does, and
+ * it costs the session every model pi had cached: measured 374 offered → 334,
+ * because the per-session file REPLACES the box's remote-overlay block (the
+ * bundled 333 survive; the ~41 overlay-only models do not). Worse, if the slug is
+ * one the catalogue ALREADY has, the generated entry replaces a real one with
+ * guessed metadata — no `thinkingLevelMap` (so the depth ladder silently becomes
+ * wrong), a made-up context window, zero costs.
+ *
+ * So the box's overlay is read first and the slug is UPSERTED into it. A slug the
+ * catalogue already carries keeps its real metadata; only a genuinely new one gets
+ * a generic entry.
+ *
+ * ## The Anthropic repair rides along
+ *
+ * All 15 `anthropic-messages` entries ship `https://openrouter.ai/api` — no `/v1`
+ * — so the request goes out on the openai-completions route, which appends
+ * `/chat/completions` → `POST /api/chat/completions` → 404 (I2 R6, at the wire).
+ * Re-measured at the source: `GET https://pi.dev/api/models/providers/openrouter`
+ * still serves 15 such entries. Because the merge is by id, patching them in the
+ * copied overlay repairs them for the session rather than merely adding new ones.
+ *
+ * ⚠️ `checkedAt` is stamped NOW deliberately: pi refreshes the remote catalogue
+ * when that is older than 4 h, and a refresh REPLACES the whole `openrouter`
+ * block — provisioned slug and Anthropic repair included. A session running
+ * longer than 4 h can therefore lose both. Recorded rather than worked around;
+ * the fix belongs in pi's own merge, not in a second copy of it here.
+ */
+function writePiModelsStore(
+  dir: string,
+  env: NodeJS.ProcessEnv,
+  modelId: string,
+  files: string[],
+): void {
+  // The box's catalogue is parsed fresh from disk on every call, so mutating the
+  // entries here cannot reach anything else.
+  const models = readBoxPiOpenRouterModels(env);
+  for (const model of models) {
+    if (model.api === "anthropic-messages" && model.baseUrl === OPENROUTER_API_BASE_NO_V1) {
+      model.baseUrl = OPENROUTER_API_BASE;
+    }
+  }
+
+  // A slug the catalogue already carries needs nothing: it keeps every field pi
+  // has for it, including the `thinkingLevelMap` the depth ladder is derived from.
+  if (!models.some((model) => model.id === modelId)) {
+    models.push({
+      id: modelId,
+      name: modelId,
+      api: "openai-completions",
+      baseUrl: OPENROUTER_API_BASE,
+      provider: "openrouter",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128000,
+      maxTokens: 16384,
+    });
+  }
+
+  const now = Date.now();
+  const storePath = join(dir, "models-store.json");
+  writeFileSync(
+    storePath,
+    `${JSON.stringify({ openrouter: { lastModified: now, checkedAt: now, models } }, null, 2)}\n`,
+    { mode: 0o600 },
+  );
+  files.push(storePath);
+}
+
+const OPENROUTER_API_BASE = "https://openrouter.ai/api/v1";
+const OPENROUTER_API_BASE_NO_V1 = "https://openrouter.ai/api";
+
+type PiCatalogueModel = {
+  id?: string;
+  api?: string;
+  baseUrl?: string;
+  [key: string]: unknown;
+};
+
+/**
+ * pi's cached OpenRouter catalogue from the BOX agent dir — read before the
+ * re-point, like the session store and the F-13 discard warning.
+ *
+ * An empty result is a legitimate state (pi has never run on this box), not an
+ * error: the bundled catalogue still resolves, so the session simply gets the
+ * provisioned slug on top of it.
+ */
+function readBoxPiOpenRouterModels(env: NodeJS.ProcessEnv): PiCatalogueModel[] {
+  const boxAgentDir = env.PI_CODING_AGENT_DIR?.trim()
+    ? env.PI_CODING_AGENT_DIR.trim()
+    : join(env.HOME?.trim() || homedir(), ".pi", "agent");
+  try {
+    const parsed = JSON.parse(readFileSync(join(boxAgentDir, "models-store.json"), "utf8")) as {
+      openrouter?: { models?: unknown };
+    };
+    const models = parsed.openrouter?.models;
+    return Array.isArray(models) ? (models as PiCatalogueModel[]) : [];
+  } catch {
+    return [];
+  }
 }
 
 /**

@@ -1,5 +1,13 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -204,13 +212,12 @@ test("pi gets PI_CODING_AGENT_DIR and an APPEND_SYSTEM.md primer", () => {
   });
 });
 
-test("pi does NOT get a generated models-store.json — the replace/merge risk", () => {
-  // ⚠️ This asserts an ABSENCE ON PURPOSE. It is not an unfinished feature: it is
-  // unknown whether a file in PI_CODING_AGENT_DIR merges with or REPLACES Pi's
-  // ~371-entry bundled catalogue. I2 proved only that EDITING existing entries is
-  // honoured. If the semantics are REPLACE, writing one entry silently removes
-  // the rest from every Pi session. Not writing costs one unprovisioned slug
-  // failing honestly; writing wrongly costs every session its catalogue.
+test("pi DOES get a generated models-store.json now that the merge semantics are measured", () => {
+  // ⚠️ THIS ROW REPLACES ONE THAT ASSERTED THE ABSENCE, AND THE REVERSAL IS THE
+  // POINT. The old row said writing the file risked REPLACING pi's ~371-entry
+  // catalogue. Measured against pi 0.84.4 (brick ef5999ca): it MERGES BY ID —
+  // 333 offered models became 334 with a one-entry file planted, a pre-existing
+  // slug still resolved, and 333 came back after restore.
   withTempRoot((root) => {
     const env: NodeJS.ProcessEnv = {};
     applyHarnessConfigDir({
@@ -218,37 +225,132 @@ test("pi does NOT get a generated models-store.json — the replace/merge risk",
       agentCommand: AGENT_REGISTRY.pi,
       sessionId: "ses_pi2",
       primer: "P",
-      provisionModelId: "openrouter/z-ai/glm-5.3-flash",
+      provisionModelId: "openrouter/zzz/not-in-any-catalogue",
       rootDir: root,
     });
     assert.ok(
       env.PI_CODING_AGENT_DIR,
-      "PI_CODING_AGENT_DIR unset — the listing below would be of nothing",
+      "PI_CODING_AGENT_DIR unset — the reads below would be of nothing",
     );
+
     const written = readdirSync(env.PI_CODING_AGENT_DIR);
-    // The absence assertion needs a non-empty listing to be meaningful: an empty
-    // dir would satisfy "no models-store.json" vacuously.
-    //
-    // ⚠️ THIS ROW CAUGHT brick 4a6fdda0's CHANGE, which is why it still pins the
-    // WHOLE listing rather than only checking for models-store.json. The refcount
-    // added `.acpx-holders/` here, and the listing had to be widened by hand to
-    // admit it — deliberately, so that any OTHER new entry in a directory pi
-    // reads still fails this row. acpx's own bookkeeping is separated from what
-    // the harness consumes, so the two can be judged apart.
-    const acpxBookkeeping = written.filter((entry) => entry.startsWith("."));
+    // Same split as the row this replaces: acpx's own bookkeeping is judged apart
+    // from what the harness consumes, so a NEW entry in either still fails here.
     const harnessVisible = written.filter((entry) => !entry.startsWith("."));
-    assert.deepEqual(harnessVisible, ["APPEND_SYSTEM.md"], "a models-store.json was generated");
+    assert.deepEqual(harnessVisible.toSorted(), ["APPEND_SYSTEM.md", "models-store.json"]);
     assert.deepEqual(
-      acpxBookkeeping,
+      written.filter((entry) => entry.startsWith(".")),
       [".acpx-holders"],
       "acpx wrote unexpected bookkeeping into a directory the harness reads",
     );
+
+    const store = JSON.parse(
+      readFileSync(join(env.PI_CODING_AGENT_DIR, "models-store.json"), "utf8"),
+    ) as { openrouter: { lastModified: number; models: { id: string; baseUrl: string }[] } };
+
+    // ⚠️ THE FIELD THAT MAKES THE FILE DO ANYTHING AT ALL. Without a
+    // `lastModified` newer than the bundled stamp, `remoteModels()` returns []
+    // and the entry is IGNORED — measured 333 → 333, slug not offered, no error
+    // anywhere. A test that only checked the slug is present in the file would
+    // pass on a file pi silently discards.
+    assert.ok(
+      store.openrouter.lastModified > Date.now() - 60_000,
+      "the store carries no fresh lastModified — pi would ignore it entirely",
+    );
+    assert.deepEqual(
+      store.openrouter.models.map((m) => m.id),
+      ["zzz/not-in-any-catalogue"],
+    );
+    assert.equal(store.openrouter.models[0].baseUrl, "https://openrouter.ai/api/v1");
   });
 });
 
-test("pi's arbitrary-model support stays UNROUTED, so the picker offers no failing band", () => {
-  // The descriptor consequence of the row above, asserted rather than assumed.
-  assert.equal(deriveHarnessCapabilities(HARNESS_FACTS.pi).acceptsArbitraryModelIds, false);
+test("provisioning COPIES the box catalogue forward and repairs the Anthropic baseUrl by id", () => {
+  // Two failures in one row, both measured:
+  //  1. writing ONLY the slug costs the session every model pi had cached
+  //     (374 offered → 334 — the per-session file replaces the box's overlay
+  //     block), and overwrites a KNOWN slug's real metadata with guesses.
+  //  2. pi's 15 `anthropic-messages` entries carry `https://openrouter.ai/api`
+  //     with no `/v1`, so the request 404s. Because the merge is BY ID, patching
+  //     the copied entry repairs it instead of adding a second one.
+  withTempRoot((root) => {
+    const boxAgentDir = join(root, "box-pi-agent");
+    mkdirSync(boxAgentDir, { recursive: true });
+    writeFileSync(
+      join(boxAgentDir, "models-store.json"),
+      JSON.stringify({
+        openrouter: {
+          lastModified: 1,
+          models: [
+            {
+              id: "anthropic/claude-opus-5",
+              api: "anthropic-messages",
+              baseUrl: "https://openrouter.ai/api",
+              contextWindow: 1_000_000,
+            },
+            {
+              id: "z-ai/glm-5.3-flash",
+              api: "openai-completions",
+              baseUrl: "https://openrouter.ai/api/v1",
+              thinkingLevelMap: { off: null },
+              contextWindow: 262_144,
+            },
+          ],
+        },
+      }),
+    );
+
+    const env: NodeJS.ProcessEnv = { PI_CODING_AGENT_DIR: boxAgentDir };
+    applyHarnessConfigDir({
+      env,
+      agentCommand: AGENT_REGISTRY.pi,
+      sessionId: "ses_pi3",
+      provisionModelId: "openrouter/z-ai/glm-5.3-flash",
+      rootDir: root,
+    });
+
+    const store = JSON.parse(
+      readFileSync(join(env.PI_CODING_AGENT_DIR as string, "models-store.json"), "utf8"),
+    ) as {
+      openrouter: {
+        models: {
+          id: string;
+          baseUrl: string;
+          contextWindow?: number;
+          thinkingLevelMap?: unknown;
+        }[];
+      };
+    };
+    const byId = new Map(store.openrouter.models.map((m) => [m.id, m]));
+
+    assert.equal(store.openrouter.models.length, 2, "the box catalogue was not carried forward");
+    assert.equal(
+      byId.get("anthropic/claude-opus-5")?.baseUrl,
+      "https://openrouter.ai/api/v1",
+      "the Anthropic entry was not repaired",
+    );
+    // The requested model was ALREADY in the catalogue: it must keep pi's own
+    // metadata, not be replaced by a generic entry. `thinkingLevelMap` is the
+    // one that matters most — the depth ladder is derived from it.
+    assert.equal(byId.get("z-ai/glm-5.3-flash")?.contextWindow, 262_144);
+    assert.deepEqual(byId.get("z-ai/glm-5.3-flash")?.thinkingLevelMap, { off: null });
+  });
+});
+
+test("pi's arbitrary-model support is ROUTED now, opencode's is not — PER HARNESS", () => {
+  // The descriptor consequence of the rows above, asserted rather than assumed.
+  //
+  // ⚠️ THE TWO-SIDEDNESS IS THE ROW. Both harnesses declare
+  // `arbitraryModelSupport: "provisioned"`, so routing the KIND switched BOTH on
+  // from ONE harness's measurement — which this row caught. Opencode's config
+  // format asks a different question (does an empty
+  // `provider.openrouter.models.<slug>: {}` deep-merge or REPLACE the bundled
+  // entry?) that pi's `models-store.json` measurement does not answer, and acpx
+  // does not pass `provisionModelId` for it. A descriptor claiming otherwise
+  // would put a failing band in the picker.
+  assert.equal(HARNESS_FACTS.pi.arbitraryModelSupport, "provisioned");
+  assert.equal(HARNESS_FACTS.opencode.arbitraryModelSupport, "provisioned");
+  assert.equal(deriveHarnessCapabilities(HARNESS_FACTS.pi).acceptsArbitraryModelIds, true);
   assert.equal(deriveHarnessCapabilities(HARNESS_FACTS.opencode).acceptsArbitraryModelIds, false);
 });
 

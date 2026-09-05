@@ -286,13 +286,29 @@ export const DEPTH_MECHANISMS_ROUTED_BY_ACPX: readonly DepthMechanism[] = [
 ];
 
 export const ARBITRARY_MODEL_SUPPORT_ROUTED_BY_ACPX: readonly ArbitraryModelSupport[] = [
-  // Empty on purpose. `provisioned` needs the per-session config dir that
-  // generates a catalogue fragment (I1 R6 / I2 R5); `via-shim` needs the
-  // OpenRouter shim to take a model from the picker rather than from the
-  // profile (CONCEPTION §7.4, §11 Q1). Neither has shipped, so
-  // `acceptsArbitraryModelIds` is false everywhere today — which is correct:
-  // the picker must not offer a band that fails at spawn.
+  // Empty on purpose, and it must stay a KIND list rather than absorb the
+  // provisioning answer. `via-shim` needs the OpenRouter shim to take a model
+  // from the picker rather than from the profile (CONCEPTION §7.4, §11 Q1), which
+  // has not shipped.
+  //
+  // ⚠️ `provisioned` IS NOT LISTED HERE EVEN THOUGH acpx NOW PROVISIONS FOR PI —
+  // and that is the correction, not an omission. Provisioning is answered PER
+  // HARNESS, because each harness has its own config format and its own merge
+  // semantics: pi's `models-store.json` is measured to merge by id (brick
+  // ef5999ca), while whether opencode deep-merges or REPLACES an existing
+  // `provider.openrouter.models.<slug>` entry is NOT measured. Listing the KIND
+  // switched BOTH on from one harness's measurement, and opencode's picker would
+  // then have offered a band acpx does not provision for.
 ];
+
+/**
+ * The harnesses acpx actually generates a catalogue fragment for.
+ *
+ * One measurement per harness, never one per kind — see the warning above. A
+ * harness enters this list when its config format's merge semantics have been
+ * measured AND `applyHarnessConfigDir` is passed `provisionModelId` for it.
+ */
+export const ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR: readonly HarnessId[] = ["pi"];
 
 /** Mechanisms that are a LIVE model change at all, once acpx routes them. */
 const LIVE_MODEL_MECHANISMS: ReadonlySet<ModelMechanism> = new Set([
@@ -346,10 +362,15 @@ export function deriveCanSetDepthLive(
 /** Whether an id outside the harness's own catalogue can be used (CONCEPTION §7.4). */
 export function deriveAcceptsArbitraryModelIds(
   support: ArbitraryModelSupport,
+  harness?: HarnessId,
   routedSupport: readonly ArbitraryModelSupport[] = ARBITRARY_MODEL_SUPPORT_ROUTED_BY_ACPX,
+  provisionedFor: readonly HarnessId[] = ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR,
 ): boolean {
   if (support === "none") {
     return false;
+  }
+  if (support === "provisioned") {
+    return harness !== undefined && provisionedFor.includes(harness);
   }
   return support === "native" || routedSupport.includes(support);
 }
@@ -370,7 +391,7 @@ export function deriveHarnessCapabilities(facts: HarnessCapabilityFacts): Harnes
     liveModelChangeReason: canSetModelLive ? null : facts.liveModelChangeBlockedReason,
     supportsProfiles: facts.supportsProfiles,
     supportsOutputStyles: facts.supportsOutputStyles,
-    acceptsArbitraryModelIds: deriveAcceptsArbitraryModelIds(facts.arbitraryModelSupport),
+    acceptsArbitraryModelIds: deriveAcceptsArbitraryModelIds(facts.arbitraryModelSupport, facts.id),
     defaultModelKey: deriveDefaultModelKey(facts.defaultModel),
     arbitraryModelSupport: facts.arbitraryModelSupport,
     model: { ...facts.model },
@@ -584,48 +605,96 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
   pi: {
     id: "pi",
     label: "pi",
+    // ⚠️ EVERY CELL BELOW DESCRIBES THE **nativai `pi-acp` FORK** (B5, brick
+    // ef5999ca), which `agent-registry.ts` launches from `/opt/pi-acp` when the
+    // box has it. Against UPSTREAM `pi-acp@0.0.33` the `fork`, `set-model` and
+    // `usageReporting` cells are all FALSE — measured, in one run, on one
+    // session: `session/set_model` and `session/fork` both answer
+    // `-32601 Method not found` there. A box still falling back to upstream
+    // therefore advertises three capabilities its adapter refuses at the wire;
+    // that drift is what `G4-PI-01` (the SPAWN LINE, not the registry string)
+    // exists to catch.
     supportsProfiles: false, // MAP §2.2 — no AuthMode maps to a fourth harness
     supportsOutputStyles: false, // not a Pi concept (I2 R11)
-    arbitraryModelSupport: "provisioned", // I2 R5 — generate the `models-store.json` entry
+    // B5: pi's `models-store.json` MERGES BY ID with the bundled catalogue and a
+    // generated entry is honoured (measured, pi 0.84.4: 333 → 334 offered models,
+    // planted slug served, catalogue intact). The generator lives in
+    // `harness-config-dir.ts` and carries the mandatory `lastModified` stamp.
+    arbitraryModelSupport: "provisioned",
     model: {
-      // I2 R5: live via ACP `session/set_model`, proven three ways (acpx flag,
-      // Pi's own session JSONL, the OpenRouter generation API).
+      // Live via ACP `session/set_model`. ⚠️ THE HISTORY OF THIS CELL IS THE
+      // REASON IT NOW NAMES A BUILD: it was TRUE for pi-acp 0.0.26, went FALSE at
+      // 0.0.33 with nothing failing, and is TRUE again in the fork — because the
+      // ACP SDK dropped `session/set_model` from `AGENT_METHODS` between 0.12 and
+      // 0.26, orphaning the adapter's handler, and the fork re-routes it through
+      // the SDK's `extMethod` seam. Measured end to end on the fork (pi 0.84.4,
+      // SDK 0.26.0): the call returns, and the session's context window moves
+      // 262,144 → 1,024,000 across the switch, which is what proves the MODEL
+      // changed rather than the call merely returning.
       mechanism: "set-model",
-      catalogue: "acp", // `session/load` returns `models.availableModels` — 371 entries (I2 R5)
+      catalogue: "acp", // `session/new`/`session/load` return `models.availableModels`
     },
     depth: {
       // I2 R8: thinking level rides the ACP MODE selector; `configOptions` is
       // null, so acpx's `--reasoning-effort` (gated on an advertised `effort`
       // config option) can never apply. `acpx pi set-mode <level>` does work.
       mechanism: "mode",
-      // `modes.availableModes` = off/minimal/low/medium/high/xhigh, read from the
-      // advertisement (I2 R8). Whether it varies per model was not measured, and
-      // `acp` deliberately claims neither way.
+      // ⚠️ `acp` IS NOW LOAD-BEARING, NOT A HEDGE. Pi's ladder is per MODEL: pi
+      // resolves a level through the catalogue entry's `thinkingLevelMap`
+      // (`effort = map[level] === undefined ? level : map[level]`, an explicit
+      // `null` meaning NO reasoning parameter is sent), and measured across pi
+      // 0.84.4's 374-model OpenRouter catalogue, 185 models carry no map at all
+      // while the rest collapse differently — no two-line table can describe it.
+      // The fork advertises one rung per DISTINCT served value and states that
+      // value on `_meta.piAcp.servedEffort`; `depth-projection.ts` READS it
+      // instead of remembering it.
       ladder: "acp",
       configOptionAdvertisedAtSessionNew: false, // I2 R8/R11 — `configOptions` is null; depth rides `modes`
     },
     credential: { tier: "box-provider", providers: ["openrouter"] }, // I2 R6 — plain OPENROUTER_API_KEY
-    // I2 R4: pi-acp advertises `sessionCapabilities: {list:{}}` only and the
-    // string `fork` appears ZERO times in pi-acp 0.0.26 AND 0.0.33, so acpx
-    // refuses loudly: "does not advertise sessionCapabilities.fork; cannot copy
-    // session". Pi ITSELF can fork (`pi --fork`), and a mid-history fork is
-    // achievable by truncating its JSONL tree — the gap is the adapter's.
-    fork: { supported: false, atIndex: "unsupported" },
+    // B5: the fork implements `session/fork` on pi's JSONL session tree (the SDK
+    // already dispatched it; upstream simply had no handler), and honours
+    // `_meta.acpx.forkAtMessageIndex` by truncating the copied JSONL after the
+    // nth message record. Proven two-way on real turns: the source recalls both
+    // planted facts, the fork truncated at index 2 recalls the first and answers
+    // UNKNOWN for the second — from a SEPARATE adapter process that resolved it
+    // by `session/load`, so it is the file that carries the history.
+    // ⚠️ THE INDEX MAPPING IS VERIFIED ON BOTH SIDES, because "exact" is a claim
+    // about two counts agreeing. acpx's side: `ensureAgentMessage`
+    // (src/session/conversation-model.ts:358-369) REUSES the last entry when it is
+    // already an Agent entry, so a whole turn — text, tool uses, tool results —
+    // accumulates into ONE Agent entry until a User entry intervenes.
+    //
+    // `exact` is claimed on a MEASURED basis, not on the fork returning success:
+    // the fork counts the index in CLIENT messages (a `user` record, or an
+    // `assistant` record that closes a turn), because pi's JSONL writes THREE
+    // records for one tool-using turn — assistant(toolCall), toolResult,
+    // assistant — where the client counts one. Counting records instead would
+    // land three records early on a session with one tool call and still report
+    // success.
+    fork: { supported: true, atIndex: "exact" },
     midTurnSteering: false, // src/acp/mid-turn-injection-support.ts:5-20 (I2 R3)
-    // I2 R9: pi-acp handles `_meta` only for `terminal-auth` and
-    // `piAcp.queueDepth` — there is no `_meta.systemPrompt` channel to bind to.
-    // The path that survives the ACP hop is `$PI_CODING_AGENT_DIR/APPEND_SYSTEM.md`,
-    // which B3 now writes (src/acp/harness-config-dir.ts). Measured by I2 to
-    // survive a SIGKILL of both pi and pi-acp followed by a resume.
+    // ⚠️ THE FORK ADDS A PRIMER CHANNEL THAT DOES NOT MOVE pi's DATA DIR, and
+    // that distinction is the whole point: `PI_CODING_AGENT_DIR` is pi's DATA dir
+    // as well as its config dir, so re-pointing it for a primer took the session
+    // store with it (brick ac86eb34). The fork reads
+    // `PI_ACP_APPEND_SYSTEM_PROMPT_FILE` and passes `--append-system-prompt` to
+    // pi. `config-file` remains correct as the descriptor's coarse category —
+    // acpx still writes a file and points the adapter at it — and the file it
+    // writes (`APPEND_SYSTEM.md`) keeps working on upstream.
     primerChannel: "config-file",
-    // I2 R12: no usage/token field in any `session/update`; the `session/prompt`
-    // result is a bare `{"stopReason":"end_turn"}`. Pi's own JSONL has the data;
-    // pi-acp does not carry it over ACP.
-    usageReporting: false,
+    // B5: the fork carries pi's own per-message accounting over ACP — live
+    // `usage_update` notifications (cumulative cost) and `session/prompt.usage`
+    // per turn. Upstream carries none of it although pi's JSONL has it all
+    // (I2 R12).
+    usageReporting: true,
     promptImages: true, // I2 R11 — `promptCapabilities: {image:true, audio:false, embeddedContext:false}`
     defaultModel: { source: "openrouter", id: "default" },
+    // Never rendered while `canSetModelLive` is true (which it is, for the fork —
+    // the mechanism is `set-model`). It is what a box still on the upstream
+    // fallback would need to say, so it names the cause rather than the symptom.
     liveModelChangeBlockedReason:
-      "acpx has no live model path for this harness; recreate the session with a different --model.",
+      "This session is running the upstream pi-acp, whose session/set_model is not reachable by the current ACP SDK. The nativai fork restores it; recreate the session once the box has /opt/pi-acp.",
   },
 };
 
@@ -680,10 +749,15 @@ export class ForkAtIndexUnsupportedError extends Error {
  *   messages. A truncation that did not happen, displayed as if it had. Note the
  *   PLAIN fork is fine and stays available (`fork.supported` is true) — only the
  *   truncating variant lies.
- * - `'unsupported'` — **Pi**. pi-acp advertises no fork capability at all (the
- *   string `fork` occurs zero times in 0.0.26 and 0.0.33, I2 R4), so acpx
- *   refuses the whole fork one layer down anyway; this makes the reason specific
- *   instead of generic.
+ * - `'unsupported'` — **no harness today.** ⚠️ Pi occupied this branch while
+ *   acpx launched UPSTREAM pi-acp, which advertises no fork capability at all
+ *   (the string `fork` occurs zero times in 0.0.26 and 0.0.33, I2 R4). The
+ *   nativai fork implements `session/fork` on pi's JSONL session tree and
+ *   honours `_meta.acpx.forkAtMessageIndex`, so pi is `'exact'` now (brick
+ *   ef5999ca). **The branch is kept because the descriptor value still exists and
+ *   a harness can re-enter it** — including pi itself on a box that has not yet
+ *   installed the fork, which is why the message names the adapter rather than
+ *   the harness.
  *
  * A harness the descriptor does not know is NOT refused: acpx has no claim to
  * make about it, and inventing one would be the same defect in the other
@@ -707,7 +781,7 @@ export function assertForkAtIndexHonoured(
   const detail =
     fork.atIndex === "ignored"
       ? `its adapter accepts the index and silently full-copies, so the fork would carry the WHOLE source history while the record claimed a truncation at ${requestedIndex}`
-      : `its adapter advertises no fork capability at all`;
+      : `its adapter advertises no fork capability at all`; // e.g. pi on a box still running upstream pi-acp
   throw new ForkAtIndexUnsupportedError(
     harness,
     fork.atIndex,

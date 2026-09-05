@@ -59,7 +59,14 @@ test("EVERY declared harness is covered by exactly one of {refuse, proceed} — 
     // ⚠️ FALSE, and deliberately so. See the file header.
     ["codex", false, "turn-granular"],
     ["opencode", true, "ignored"],
-    ["pi", true, "unsupported"],
+    // ⚠️ PI MOVED FROM {refuse, "unsupported"} TO {proceed, "exact"} WHEN THE
+    // nativai pi-acp FORK LANDED (brick ef5999ca). Upstream pi-acp implements no
+    // fork handler at all, so acpx refused; the fork implements session/fork on
+    // pi's JSONL tree and truncates at a real index. THIS ROW IS THE POPULATION
+    // ROW, so the flip had to be made here rather than anywhere else — and the
+    // refusal branch keeps a member (opencode), which is what stops this from
+    // becoming a test that only exercises "proceed".
+    ["pi", false, "exact"],
   ]);
 });
 
@@ -74,9 +81,11 @@ test("the refusal names the descriptor value and what it means — a bare 'unsup
   // And what they can do instead: opencode's PLAIN fork works (fork.supported).
   assert.match(error.message, /omit --at-index/);
 
-  const piError = captureThrow(() => assertForkAtIndexHonoured(COMMANDS.pi, 2));
-  assert.match(piError.message, /advertises no fork capability at all/);
-  assert.match(piError.message, /cannot fork at all/);
+  // ⚠️ pi USED TO PROVIDE THE SECOND REFUSAL CASE HERE and no longer does — the
+  // fork honours --at-index. Asserting the POSITIVE in its place keeps the row
+  // two-sided: without it, a change that made assertForkAtIndexHonoured refuse
+  // everything would still pass on the opencode half alone.
+  assert.doesNotThrow(() => assertForkAtIndexHonoured(COMMANDS.pi, 2));
 });
 
 test("NO --at-index is never refused, for any harness — a full copy is honest everywhere", () => {

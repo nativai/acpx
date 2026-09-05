@@ -218,61 +218,61 @@ export function rejectedDepthProjection(
 }
 
 /**
- * Pi's advertised ladder is a 3-VALUE WIRE LADDER, and `off` is not off.
+ * What the agent said it will actually SEND for a mode it advertises.
  *
- * Measured at the wire by I2 (R8), through a logging proxy reading the outgoing
- * request body's `reasoning` field:
+ * ⚠️ THIS REPLACES A FROZEN TABLE THAT WAS WRONG, AND THE WAY IT WAS WRONG IS
+ * WORTH KEEPING. The previous `PI_WIRE_DEPTH_LADDER` hard-coded one collapse for
+ * all of Pi — `off/minimal/low → low`, `medium/high → high`, `xhigh/max → max` —
+ * as a model-independent property. Measured 2026-09-04 against pi 0.84.4's own
+ * OpenRouter catalogue (374 models): **the collapse is per MODEL, declared in
+ * each catalogue entry's `thinkingLevelMap`, and NOT ONE MODEL IN THAT CATALOGUE
+ * HAS THE HARD-CODED SHAPE.** 185 of 374 carry no map at all (every rung passes
+ * through distinctly, no collapse whatever), and the rest vary. pi resolves it as
+ * `effort = map[level] === undefined ? level : map[level]`, where an explicit
+ * `null` means *no reasoning parameter is sent at all* — so on some models the
+ * TOP rung sends less reasoning than the middle one.
  *
- * | requested | wire |
- * |---|---|
- * | `off`, `minimal`, `low` | `{"effort":"low"}` |
- * | `medium`, `high`        | `{"effort":"high"}` |
- * | `xhigh`, `max`          | `{"effort":"max"}` |
+ * Folding that table into the recorded outcome (F-14's second writer) therefore
+ * recorded a served value that was wrong for most Pi sessions. The fix is not a
+ * better table: it is to stop guessing. The nativai `pi-acp` fork advertises one
+ * rung per DISTINCT served value and states the value on
+ * `_meta.piAcp.servedEffort` (`null` = nothing sent), so acpx now READS what the
+ * agent will send instead of remembering it.
  *
- * So a Pi session **cannot disable reasoning through the depth control at all**,
- * and six advertised rungs are three distinct behaviours. This function makes
- * that visible instead of letting a UI imply six levels exist. It is a
- * DESCRIPTION of a measured collapse, not a mapping acpx applies — acpx sends
- * the advertised mode id; Pi does the collapsing.
+ * ⚠️ `undefined` means THE ADAPTER DID NOT SAY — an upstream `pi-acp`, or any
+ * other agent. Callers must record no served value in that case rather than
+ * substituting one; that is the whole point of the change.
  */
-export function describePiWireDepthCollapse(modeId: string): string | undefined {
-  const served = piWireDepthValue(modeId);
+export function advertisedServedEffort(
+  modes: { availableModes?: readonly { id: string; _meta?: unknown }[] } | undefined,
+  modeId: string,
+): string | null | undefined {
+  const id = modeId.trim().toLowerCase();
+  const mode = modes?.availableModes?.find((entry) => entry.id.trim().toLowerCase() === id);
+  if (!mode?._meta) {
+    return undefined;
+  }
+  const served = (mode._meta as { piAcp?: { servedEffort?: unknown } }).piAcp?.servedEffort;
+  if (served === null) {
+    return null;
+  }
+  return typeof served === "string" ? served : undefined;
+}
+
+/** Human-readable form of {@link advertisedServedEffort}, for `--verbose`. */
+export function describeAdvertisedServedEffort(
+  modes: { availableModes?: readonly { id: string; _meta?: unknown }[] } | undefined,
+  modeId: string,
+): string | undefined {
+  const served = advertisedServedEffort(modes, modeId);
   if (served === undefined) {
     return undefined;
   }
-  if (modeId.trim().toLowerCase() === "off") {
-    return `Pi sends {"effort":"${served}"} for "off" — reasoning is NOT disabled (measured at the wire, I2 R8)`;
+  if (served === null) {
+    return `mode "${modeId}" sends NO reasoning parameter for this model — reasoning is off, whatever the rung is called (the agent's own advertisement)`;
   }
-  const group = PI_WIRE_DEPTH_LADDER.find((entry) => entry.served === served);
-  return `Pi collapses ${group?.advertised.join("/") ?? modeId} to {"effort":"${served}"} (measured at the wire, I2 R8)`;
-}
-
-/**
- * Pi's WIRE ladder: the value it actually serves for a mode it ADVERTISES.
- *
- * ⚠️ THIS IS WHY A `depth_projection` ON THE MODE PATH CAN BE HONEST AT ALL.
- * Pi advertises SIX rungs (`off/minimal/low/medium/high/xhigh`, read straight
- * out of pi-acp's own dist) and serves THREE. A projection computed against the
- * ADVERTISEMENT therefore reports `exact` for `minimal`, `medium` and `xhigh` —
- * three levels Pi does not serve. The advertisement is a genuine wire artifact
- * (the agent said those are its modes), so acpx cannot fix it; what acpx CAN do
- * is stop recording `exact` for a level it knows is collapsed.
- *
- * ⚠️ IT IS A MEASUREMENT, NOT AN OBSERVATION. acpx does not watch the collapse
- * happen per session — this table is I2 R8's wire measurement, frozen. It is the
- * same shape of fact as the `pi-acp` `session/set_model` capability cell that was
- * TRUE and WENT STALE between 0.0.26 and 0.0.33: correct when written, and
- * capable of being wrong later without anything failing. Re-measure it when the
- * pinned `pi-acp` moves.
- */
-const PI_WIRE_DEPTH_LADDER: readonly { advertised: readonly string[]; served: string }[] = [
-  { advertised: ["off", "minimal", "low"], served: "low" },
-  { advertised: ["medium", "high"], served: "high" },
-  { advertised: ["xhigh", "max"], served: "max" },
-];
-
-/** What Pi actually serves for `modeId`, or undefined for a rung not measured. */
-export function piWireDepthValue(modeId: string): string | undefined {
-  const id = modeId.trim().toLowerCase();
-  return PI_WIRE_DEPTH_LADDER.find((entry) => entry.advertised.includes(id))?.served;
+  if (served === modeId.trim().toLowerCase()) {
+    return undefined;
+  }
+  return `mode "${modeId}" is served as effort "${served}" for this model (the agent's own advertisement)`;
 }

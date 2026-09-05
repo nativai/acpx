@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { SessionModeState } from "@agentclientprotocol/sdk";
 import { applyDepthAsMode } from "../src/session/depth-application.js";
-import { piWireDepthValue } from "../src/session/depth-projection.js";
+import { advertisedServedEffort } from "../src/session/depth-projection.js";
 
 // F-14, SECOND WRITER (brick 06ae06c1 as corrected) — the MODE path must obey the
 // same rule as the config-option arm: `exact` requires positive evidence that the
@@ -17,26 +17,65 @@ import { piWireDepthValue } from "../src/session/depth-projection.js";
 // right; the code it pointed at was not the code that produced it. THIS is the
 // writer that ran.
 //
-// ⚠️ THE FACT THAT MAKES AN HONEST RECORD POSSIBLE AT ALL: pi advertises SIX
-// rungs (off/minimal/low/medium/high/xhigh) and serves THREE. acpx already KNEW
-// this — it printed "Pi collapses off/minimal/low to {effort: low}" under
-// --verbose in the same run in which it recorded `outcome:"exact"`,
-// `served:"minimal"`. Two surfaces of one process contradicting each other, with
-// the trusted one wrong.
+// 🛑 AND THE FIRST VERSION OF THIS FILE ASSERTED A FACT THAT IS FALSE (B5, brick
+// f13fdceb, measured 2026-09-04 against pi 0.84.4). It encoded pi's collapse as a
+// FROZEN, MODEL-INDEPENDENT table — `off/minimal/low → low`, `medium/high →
+// high`, `xhigh/max → max` — and tested the production table against a hand-copy
+// of itself. The collapse is per MODEL, declared in each catalogue entry's
+// `thinkingLevelMap`, and **not one of the 374 models in pi 0.84.4's OpenRouter
+// catalogue has that shape**: 185 carry no map at all (every rung distinct), and
+// the rest vary. So the "honest record" this file was written to produce was a
+// different wrong answer wearing a measurement's clothes.
 //
-// ⚠️ WHAT IS NOT FIXED HERE, DELIBERATELY: pi ADVERTISING six rungs while
-// serving three. The advertisement is a genuine wire artifact — the agent said
-// those are its modes — so acpx cannot correct it. That is brick f13fdceb (B5).
-// This file only stops acpx recording `exact` for a level it knows is collapsed.
+// ⚠️ WHAT REPLACED IT: acpx reads the served value out of the agent's OWN
+// advertisement (`_meta.piAcp.servedEffort` on each advertised mode — the nativai
+// `pi-acp` fork states it per model, `null` meaning no reasoning parameter is
+// sent at all). When the adapter does not say, acpx folds in NOTHING and records
+// no served value. A gap is a gap; an invented served value is a lie that reads
+// like a measurement.
 
 const PI_ADVERTISED = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
-function modes(currentModeId: string, ids = PI_ADVERTISED): SessionModeState {
+/**
+ * `served` maps an advertised mode id to what the agent says it will SEND.
+ * Omit it entirely to model an adapter that advertises no `_meta` at all — an
+ * upstream `pi-acp`, which is the case that must fold in nothing.
+ */
+function modes(
+  currentModeId: string,
+  served?: Record<string, string | null>,
+  ids = PI_ADVERTISED,
+): SessionModeState {
   return {
     currentModeId,
-    availableModes: ids.map((id) => ({ id, name: `Thinking: ${id}`, description: null })),
+    availableModes: ids.map((id) => ({
+      id,
+      name: `Thinking: ${id}`,
+      description: null,
+      ...(served && id in served ? { _meta: { piAcp: { servedEffort: served[id] } } } : {}),
+    })),
   } as unknown as SessionModeState;
 }
+
+/** The shape measured for `~google/gemini-flash-latest` in pi 0.84.4. */
+const GEMINI_FLASH: Record<string, string | null> = {
+  off: null,
+  minimal: null,
+  low: "low",
+  medium: "medium",
+  high: "high",
+  xhigh: null,
+};
+
+/** A model that collapses, in the shape the old frozen table assumed. */
+const COLLAPSING: Record<string, string | null> = {
+  off: "low",
+  minimal: "low",
+  low: "low",
+  medium: "high",
+  high: "high",
+  xhigh: "max",
+};
 
 function client(): { sent: string[]; setSessionMode: (s: string, m: string) => Promise<void> } {
   const sent: string[] = [];
@@ -49,7 +88,7 @@ function client(): { sent: string[]; setSessionMode: (s: string, m: string) => P
   };
 }
 
-test("F-14/mode: `minimal` is recorded as PROJECTED to low, not exact", async () => {
+test("F-14/mode: a collapsed rung is recorded as PROJECTED, not exact", async () => {
   // hp-te2's row, verbatim: recorded {"requested":"minimal","outcome":"exact",
   // "served":"minimal"} while the wire carried {"effort":"low"}.
   const c = client();
@@ -57,73 +96,111 @@ test("F-14/mode: `minimal` is recorded as PROJECTED to low, not exact", async ()
     client: c,
     sessionId: "s1",
     requested: "minimal",
-    modes: modes("high"),
+    modes: modes("high", COLLAPSING),
     harness: "pi",
   });
 
   assert.deepEqual(c.sent, ["minimal"], "control: the advertised rung must still be SENT");
-  assert.equal(p.kind, "projected", `recorded ${p.kind} for a level pi collapses`);
+  assert.equal(p.kind, "projected", `recorded ${p.kind} for a level the agent says it collapses`);
   assert.equal(p.value, "low");
-  assert.match(String(p.reason), /collapses to "low"/);
+  assert.match(String(p.reason), /serves as effort "low"/);
 });
 
-test("F-14/mode: `off` does not claim reasoning was disabled", async () => {
-  // The most consequential rung: pi advertises `off`, and sends {"effort":"low"}
-  // for it. Recording `exact` here asserts reasoning is off on a session that is
-  // still reasoning.
-  const c = client();
-  const p = await applyDepthAsMode({
-    client: c,
-    sessionId: "s1",
-    requested: "off",
-    modes: modes("high"),
-    harness: "pi",
-  });
-  assert.equal(p.kind, "projected", "`off` was recorded as served exactly");
-  assert.equal(p.value, "low");
+test("F-14/mode: a rung the model sends NOTHING for does not claim to have been served", async () => {
+  // The most consequential rung, and on this real model shape it is not only
+  // `off`: `xhigh` — the TOP advertised rung — also sends no reasoning parameter.
+  for (const rung of ["off", "xhigh"]) {
+    const c = client();
+    const p = await applyDepthAsMode({
+      client: c,
+      sessionId: "s1",
+      requested: rung,
+      modes: modes("high", GEMINI_FLASH),
+      harness: "pi",
+    });
+    assert.equal(p.kind, "projected", `"${rung}" was recorded as served exactly`);
+    assert.equal(p.value, "none");
+    assert.match(String(p.reason), /NO reasoning parameter/);
+  }
 });
 
-test("F-14/mode: `high` KEEPS its exact — B3-04's PASS still stands", async () => {
+test("F-14/mode: a rung the model serves as itself KEEPS its exact — B3-04's PASS still stands", async () => {
   // The two-sided control, and it is load-bearing for the programme: B3-04
-  // passed using `high`, which IS a wire value (pi collapses medium/high → high).
-  // A fix that downgraded everything would invalidate a banked result.
-  const c = client();
-  const p = await applyDepthAsMode({
-    client: c,
-    sessionId: "s1",
-    requested: "high",
-    modes: modes("low"),
-    harness: "pi",
-  });
-  assert.deepEqual(c.sent, ["high"]);
-  assert.equal(p.kind, "exact", "a genuinely served rung lost its exact");
-  assert.equal(p.value, "high");
+  // passed using `high`. A fix that downgraded everything would invalidate a
+  // banked result.
+  for (const spec of [COLLAPSING, GEMINI_FLASH]) {
+    const c = client();
+    const p = await applyDepthAsMode({
+      client: c,
+      sessionId: "s1",
+      requested: "high",
+      modes: modes("low", spec),
+      harness: "pi",
+    });
+    assert.deepEqual(c.sent, ["high"]);
+    assert.equal(p.kind, "exact", "a genuinely served rung lost its exact");
+    assert.equal(p.value, "high");
+  }
 });
 
-test("F-14/mode: `low` keeps its exact too", async () => {
-  const c = client();
-  const p = await applyDepthAsMode({
-    client: c,
-    sessionId: "s1",
-    requested: "low",
-    modes: modes("high"),
-    harness: "pi",
-  });
-  assert.equal(p.kind, "exact");
-  assert.equal(p.value, "low");
+test("F-14/mode REGRESSION: a model with NO collapse keeps every rung exact", async () => {
+  // ⚠️ THE ROW THAT WOULD HAVE CAUGHT THE SHIPPED DEFECT. 185 of pi 0.84.4's 374
+  // OpenRouter models carry no `thinkingLevelMap` at all — every rung passes
+  // through untouched. The frozen table recorded `minimal` as served `low` on
+  // those models too, which was simply false.
+  const passthrough = Object.fromEntries(PI_ADVERTISED.map((id) => [id, id]));
+  for (const rung of PI_ADVERTISED) {
+    const p = await applyDepthAsMode({
+      client: client(),
+      sessionId: "s1",
+      requested: rung,
+      modes: modes("high", passthrough),
+      harness: "pi",
+    });
+    // `off` has its own outcome kind (the ladder advertises an off rung, so the
+    // request is honoured rather than projected) — what matters here is that
+    // NOTHING was downgraded and the served value is the rung itself.
+    assert.equal(
+      p.kind,
+      rung === "off" ? "off" : "exact",
+      `"${rung}" was downgraded on a model that serves it exactly`,
+    );
+    assert.equal(p.value, rung);
+  }
 });
 
-test("F-14/mode: the collapse applies even when NO set is sent", async () => {
-  // The agent already advertises the mode as current, so acpx sends nothing. The
-  // mode is the agent's own word — but the wire collapse is unchanged by that, so
-  // this arm must be downgraded identically. A fix applied only to the send path
-  // would leave a second route to a false `exact`.
+test("F-14/mode: an adapter that advertises no served value gets NOTHING folded in", async () => {
+  // Upstream `pi-acp`. The old code substituted a table here; substituting
+  // anything is the defect. The projection stands on its own, unembellished.
   const c = client();
   const p = await applyDepthAsMode({
     client: c,
     sessionId: "s1",
     requested: "minimal",
-    modes: modes("minimal"),
+    modes: modes("high"),
+    harness: "pi",
+  });
+  assert.deepEqual(c.sent, ["minimal"]);
+  assert.equal(p.kind, "exact", "a served value was invented for an adapter that said nothing");
+  assert.equal(p.value, "minimal");
+  assert.equal(
+    advertisedServedEffort(modes("high"), "minimal"),
+    undefined,
+    "control: the reader must report 'did not say', not a guess",
+  );
+});
+
+test("F-14/mode: the collapse applies even when NO set is sent", async () => {
+  // The agent already advertises the mode as current, so acpx sends nothing. The
+  // mode is the agent's own word — but the collapse is unchanged by that, so this
+  // arm must be downgraded identically. A fix applied only to the send path would
+  // leave a second route to a false `exact`.
+  const c = client();
+  const p = await applyDepthAsMode({
+    client: c,
+    sessionId: "s1",
+    requested: "minimal",
+    modes: modes("minimal", COLLAPSING),
     harness: "pi",
   });
   assert.deepEqual(c.sent, [], "control: nothing should have been sent");
@@ -135,13 +212,12 @@ test("F-14/mode: `max` off the advertised ladder stays projected", async () => {
   // `max` is not among pi's advertised modes, so the projection-by-position layer
   // moves it — to `high`, not `xhigh`: the canonical vocabulary has SEVEN rungs
   // and `max` is index 5, so `round(5/6 × 5) = 4` and pi's ladder[4] is `high`.
-  // (I expected `xhigh` here and the test caught me, not the code.)
   const c = client();
   const p = await applyDepthAsMode({
     client: c,
     sessionId: "s1",
     requested: "max",
-    modes: modes("low"),
+    modes: modes("low", COLLAPSING),
     harness: "pi",
   });
   assert.deepEqual(c.sent, ["high"], "control: acpx must have had to move the request");
@@ -153,16 +229,13 @@ test("F-14/mode: a projection is never UPGRADED, even when the collapse lands on
   // ⚠️ THE LADDER HERE IS SYNTHETIC, and deliberately so. The hazard is real —
   // acpx sends X, the harness collapses X back to exactly what was requested, and
   // a naive "served === requested ⇒ exact" would UPGRADE a projection into a
-  // claim acpx cannot make, because it never sent what was asked for. Pi's own
-  // 6-rung ladder happens not to produce that alignment, so isolating the
-  // invariant needs a ladder that does. Two rungs put `max` (canonical index 5)
-  // at `round(5/6 × 1) = 1` → `xhigh`, which pi collapses back to `max`.
+  // claim acpx cannot make, because it never sent what was asked for.
   const c = client();
   const p = await applyDepthAsMode({
     client: c,
     sessionId: "s1",
     requested: "max",
-    modes: modes("low", ["low", "xhigh"]),
+    modes: modes("low", { low: "low", xhigh: "max" }, ["low", "xhigh"]),
     harness: "pi",
   });
   assert.deepEqual(c.sent, ["xhigh"], "control: the alignment this row exists for did not occur");
@@ -170,37 +243,37 @@ test("F-14/mode: a projection is never UPGRADED, even when the collapse lands on
   assert.equal(p.kind, "projected", "a collapse landing on the request was UPGRADED to exact");
 });
 
-test("F-14/mode ORACLE: every rung recorded `exact` IS on pi's three-value wire ladder", async () => {
-  // The per-rung regression, with the WIRE ladder as the oracle — the same shape
-  // as the opencode oracle, against the writer that actually ran for pi.
-  const wireLadder = new Set(["low", "high", "max"]);
+test("F-14/mode ORACLE: every recorded served value is one the AGENT declared", async () => {
+  // The per-rung regression, with the ADVERTISEMENT as the oracle — the same
+  // shape as the opencode oracle, against the writer that actually ran for pi,
+  // and now against a source that cannot go stale the way a frozen table did.
+  const declared = new Set<string>(["none", ...Object.values(COLLAPSING).map((v) => v ?? "none")]);
   const rungs = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
   const seen: Record<string, string> = {};
   let checked = 0;
 
   for (const rung of rungs) {
-    const c = client();
     const p = await applyDepthAsMode({
-      client: c,
+      client: client(),
       sessionId: "s1",
       requested: rung,
-      modes: modes("low"),
+      modes: modes("low", COLLAPSING),
       harness: "pi",
     });
     checked += 1;
     seen[rung] = `${p.kind}/${String(p.value)}`;
     if (p.kind === "exact") {
-      assert.ok(
-        wireLadder.has(String(p.value)),
-        `${rung}: recorded exact with served="${String(p.value)}", NOT on pi's wire ladder low/high/max`,
-      );
       assert.equal(p.value, rung, `${rung}: exact must mean the REQUESTED rung is served`);
+      assert.equal(
+        COLLAPSING[rung],
+        rung,
+        `${rung}: recorded exact although the agent declared it serves "${String(COLLAPSING[rung])}"`,
+      );
     }
-    // Whatever the outcome, a recorded served value must be something pi serves.
     if (p.value !== undefined) {
       assert.ok(
-        wireLadder.has(p.value),
-        `${rung}: recorded served="${p.value}", which pi does not serve (${JSON.stringify(seen)})`,
+        declared.has(p.value),
+        `${rung}: recorded served="${p.value}", which the agent never declared (${JSON.stringify(seen)})`,
       );
     }
   }
@@ -208,8 +281,8 @@ test("F-14/mode ORACLE: every rung recorded `exact` IS on pi's three-value wire 
   // ⚠️ POPULATION FIRST — 0 rungs would satisfy every assertion above vacuously.
   assert.equal(checked, rungs.length, `only ${checked} of ${rungs.length} rungs were exercised`);
   const exacts = Object.values(seen).filter((v) => v.startsWith("exact")).length;
-  // Two-sided: neither "everything exact" (the defect) nor "nothing exact" (a
-  // fix that just stopped saying it).
+  // Two-sided: neither "everything exact" (the defect) nor "nothing exact" (a fix
+  // that just stopped saying it).
   assert.ok(
     exacts > 0,
     `no rung kept its exact — the fix downgrades everything: ${JSON.stringify(seen)}`,
@@ -220,19 +293,18 @@ test("F-14/mode ORACLE: every rung recorded `exact` IS on pi's three-value wire 
   );
 });
 
-test("F-14/mode GUARDRAIL: the collapse table is NOT applied to another harness", async () => {
-  // The table is pi's measurement. `mode` is pi's mechanism alone today, but an
-  // ungated table would silently attribute pi's collapse to the next harness that
-  // adopts the mode selector — and it would look exactly like a correct record.
-  const c = client();
+test("F-14/mode GUARDRAIL: pi's `_meta` vocabulary is NOT read for another harness", async () => {
+  // `_meta.piAcp` is pi-acp's own namespace. Reading it from another agent's
+  // advertisement would attribute pi's semantics to something that never agreed
+  // to them — and it would look exactly like a correct record.
   const p = await applyDepthAsMode({
-    client: c,
+    client: client(),
     sessionId: "s1",
     requested: "minimal",
-    modes: modes("high"),
+    modes: modes("high", COLLAPSING),
     harness: "opencode",
   });
-  assert.equal(p.kind, "exact", "pi's wire collapse was applied to a different harness");
+  assert.equal(p.kind, "exact", "pi's advertised collapse was applied to a different harness");
   assert.equal(p.value, "minimal");
 
   // And with no harness named at all, nothing is folded in either.
@@ -240,25 +312,23 @@ test("F-14/mode GUARDRAIL: the collapse table is NOT applied to another harness"
     client: client(),
     sessionId: "s1",
     requested: "minimal",
-    modes: modes("high"),
+    modes: modes("high", COLLAPSING),
   });
   assert.equal(p2.kind, "exact", "an unnamed harness inherited pi's collapse");
 });
 
-test("F-14/mode: the collapse table and its human description cannot disagree", async () => {
-  // They are one source of truth now. Before, the message was a separate ladder
-  // of string literals — two hand-maintained copies of one measurement, which is
-  // how a description keeps claiming something the code stopped doing.
-  assert.equal(piWireDepthValue("off"), "low");
-  assert.equal(piWireDepthValue("minimal"), "low");
-  assert.equal(piWireDepthValue("low"), "low");
-  assert.equal(piWireDepthValue("medium"), "high");
-  assert.equal(piWireDepthValue("high"), "high");
-  assert.equal(piWireDepthValue("xhigh"), "max");
-  assert.equal(piWireDepthValue("max"), "max");
+test("advertisedServedEffort: reads the agent's word, and distinguishes null from silence", async () => {
+  const advertised = modes("low", GEMINI_FLASH);
+  assert.equal(advertisedServedEffort(advertised, "low"), "low");
+  assert.equal(advertisedServedEffort(advertised, "off"), null, "null = sends no reasoning");
   assert.equal(
-    piWireDepthValue("nonsense-zzz9"),
+    advertisedServedEffort(advertised, "not-a-rung"),
     undefined,
-    "an unmeasured rung must not be guessed",
+    "a rung that is not advertised has no declared value",
+  );
+  assert.equal(
+    advertisedServedEffort(modes("low"), "low"),
+    undefined,
+    "an adapter that advertises no _meta said nothing — never a guess",
   );
 });

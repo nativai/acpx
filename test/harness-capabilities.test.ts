@@ -97,14 +97,30 @@ test("canSetDepthLive flips with the routed list AND with the session/new advert
   );
 });
 
-test("acceptsArbitraryModelIds flips with the routed provisioning list", () => {
-  assert.equal(deriveAcceptsArbitraryModelIds("provisioned", []), false);
-  assert.equal(deriveAcceptsArbitraryModelIds("provisioned", ["provisioned"]), true);
-  assert.equal(deriveAcceptsArbitraryModelIds("via-shim", []), false);
-  assert.equal(deriveAcceptsArbitraryModelIds("via-shim", ["via-shim"]), true);
+test("acceptsArbitraryModelIds: `provisioned` is answered PER HARNESS, every other kind by kind", () => {
+  // ⚠️ THE SIGNATURE CHANGED AND SO DID THE MEANING. `provisioned` used to be
+  // routed as a KIND, which switched it on for every harness declaring it from a
+  // single harness's measurement. Each harness has its own config format and its
+  // own merge semantics, so it is one measurement per harness.
+  assert.equal(deriveAcceptsArbitraryModelIds("provisioned", "pi", [], ["pi"]), true);
+  assert.equal(deriveAcceptsArbitraryModelIds("provisioned", "opencode", [], ["pi"]), false);
+  assert.equal(
+    deriveAcceptsArbitraryModelIds("provisioned", undefined, [], ["pi"]),
+    false,
+    "an unnamed harness cannot inherit another's provisioning",
+  );
+  assert.equal(
+    deriveAcceptsArbitraryModelIds("provisioned", "pi", ["provisioned"], []),
+    false,
+    "the KIND list must not be able to switch provisioning on behind the per-harness list",
+  );
+
+  // Every other kind is still answered by kind.
+  assert.equal(deriveAcceptsArbitraryModelIds("via-shim", "pi", [], ["pi"]), false);
+  assert.equal(deriveAcceptsArbitraryModelIds("via-shim", "pi", ["via-shim"], []), true);
   // `native` needs no acpx work by definition; `none` can never be true.
-  assert.equal(deriveAcceptsArbitraryModelIds("native", []), true);
-  assert.equal(deriveAcceptsArbitraryModelIds("none", ["none"]), false);
+  assert.equal(deriveAcceptsArbitraryModelIds("native", undefined, [], []), true);
+  assert.equal(deriveAcceptsArbitraryModelIds("none", "pi", ["none"], ["pi"]), false);
 });
 
 test("defaultModelKey is composed from the (source, id) pair, never hand-written", () => {
@@ -290,11 +306,19 @@ test("per-harness mechanism cells match the findings they cite", () => {
   // I1 R4 — the fork silently full-copies while acpx records a truncation
   assert.equal(HARNESS_FACTS.opencode.fork.atIndex, "ignored");
   assert.equal(HARNESS_FACTS.opencode.fork.supported, true);
-  // I2 R4 — `fork` occurs zero times in pi-acp 0.0.26 AND 0.0.33
-  assert.equal(HARNESS_FACTS.pi.fork.supported, false);
-  assert.equal(HARNESS_FACTS.pi.fork.atIndex, "unsupported");
-  // I2 R12 — pi-acp carries no usage over ACP
-  assert.equal(HARNESS_FACTS.pi.usageReporting, false);
+  // ⚠️ THREE PI CELLS FLIPPED WITH THE ADAPTER, AND THE CITATION IS WHAT MAKES
+  // THAT LEGIBLE. I2 R4 measured `fork` occurring ZERO times in pi-acp 0.0.26 and
+  // 0.0.33, and I2 R12 measured no usage over ACP — both true of UPSTREAM and
+  // both false of the nativai fork acpx now launches (brick ef5999ca), which
+  // implements session/fork on pi's JSONL tree and carries pi's per-message
+  // accounting. A cell whose value depends on which adapter is installed must
+  // name the adapter, which is why these lines cite the fork rather than a finding
+  // number alone.
+  assert.equal(HARNESS_FACTS.pi.fork.supported, true);
+  // `exact`, because the fork counts the index in CLIENT messages — one
+  // tool-using turn writes three pi JSONL records where a client counts one.
+  assert.equal(HARNESS_FACTS.pi.fork.atIndex, "exact");
+  assert.equal(HARNESS_FACTS.pi.usageReporting, true);
   // MAP §3.1 — codex has zero outputStyle references
   assert.equal(HARNESS_FACTS.codex.supportsOutputStyles, false);
   // MAP §2.2 — no AuthMode maps to a fourth harness
@@ -447,9 +471,10 @@ test("resolveForkLandingIndex answers where a fork will actually land", () => {
   assert.equal(resolveForkLandingIndex(codex, 6), 6);
   // claude: exact — the request is the answer
   assert.equal(resolveForkLandingIndex(HARNESS_FACTS.claude.fork, 7), 7);
-  // opencode ignores the index and pi has no fork at all: the question has no answer
+  // pi: `exact` too, since the fork implements a real index truncation.
+  assert.equal(resolveForkLandingIndex(HARNESS_FACTS.pi.fork, 7), 7);
+  // opencode ignores the index: the question has no answer there.
   assert.equal(resolveForkLandingIndex(HARNESS_FACTS.opencode.fork, 7), undefined);
-  assert.equal(resolveForkLandingIndex(HARNESS_FACTS.pi.fork, 7), undefined);
 });
 
 test("resolveForkLandingIndex boundaries: 0 is a landing index, not an absent answer", () => {
@@ -467,10 +492,13 @@ test("resolveForkLandingIndex boundaries: 0 is a landing index, not an absent an
   // where the HARNESS would round it to.
   assert.equal(resolveForkLandingIndex(codex, 999), 998);
   assert.equal(resolveForkLandingIndex(HARNESS_FACTS.claude.fork, 999), 999);
-  // The no-answer harnesses stay undefined at every boundary, never 0.
+  assert.equal(resolveForkLandingIndex(HARNESS_FACTS.pi.fork, 0), 0);
+  // The no-answer harness stays undefined at every boundary, never 0. ⚠️ pi used
+  // to provide a second one and no longer does — one `ignored` harness is the
+  // whole population for this arm now, so losing opencode's row would leave it
+  // asserting nothing.
   for (const requested of [0, 1, 999]) {
     assert.equal(resolveForkLandingIndex(HARNESS_FACTS.opencode.fork, requested), undefined);
-    assert.equal(resolveForkLandingIndex(HARNESS_FACTS.pi.fork, requested), undefined);
   }
 });
 
