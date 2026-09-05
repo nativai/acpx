@@ -3,6 +3,7 @@ import test from "node:test";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
 import { resolvePrimerChannel } from "../src/acp/agent-command.js";
 import {
+  ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR,
   ARBITRARY_MODEL_SUPPORT_ROUTED_BY_ACPX,
   DEPTH_MECHANISMS_ROUTED_BY_ACPX,
   deriveAcceptsArbitraryModelIds,
@@ -561,4 +562,50 @@ test("the routed lists are the ones the shipped code has branches for", () => {
   // take a model from the picker rather than from the profile (CONCEPTION §7.4,
   // §11 Q1) — so that half of the old rationale still holds.
   assert.deepEqual([...ARBITRARY_MODEL_SUPPORT_ROUTED_BY_ACPX], []);
+});
+
+test("the SHIPPED per-harness provisioning list is what the derivation defaults to", () => {
+  // ⚠️ WHAT THIS ADDS, AND WHAT IT DELIBERATELY DOES NOT DUPLICATE. The row above
+  // (`acceptsArbitraryModelIds: …`) already exercises the per-harness derivation
+  // thoroughly, in both directions — but it INJECTS its lists on every call. So
+  // nothing exercised the SHIPPED defaults: a change to
+  // `ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR` itself moved no assertion, because
+  // every existing row supplies its own list. Adding `"opencode"` to the real
+  // constant left the suite green.
+  //
+  // That matters because the constant is the one the product actually runs on:
+  // `deriveHarnessCapabilities` calls the two-argument form, so the shipped list
+  // is what reaches the picker. This row calls that same two-argument form.
+  //
+  // ⚠️ THE BUG IT GUARDS HAS ALREADY BEEN MADE ONCE HERE: a KIND-keyed list
+  // switching opencode on from a PI measurement. B5 corrected it by splitting the
+  // answer per harness; leaving the replacement list unpinned made the corrected
+  // bug re-enterable by hand.
+  assert.equal(deriveAcceptsArbitraryModelIds("provisioned", "pi"), true);
+  assert.equal(deriveAcceptsArbitraryModelIds("provisioned", "opencode"), false);
+  assert.equal(
+    deriveAcceptsArbitraryModelIds("provisioned", undefined),
+    false,
+    "the kind alone is never enough — that is the whole point of the split",
+  );
+  assert.deepEqual([...ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR], ["pi"]);
+
+  // ⚠️⚠️ THIS GUARD NAMES ITS OWN EXIT CONDITION, ON PURPOSE, so it reads as a
+  // CONTRACT rather than an obstacle — and so it cannot go stale the way the
+  // rationale two rows above did.
+  //
+  // pi is listed because its `models-store.json` is MEASURED to merge BY ID
+  // (brick ef5999ca): same id replaces, new id appends, and `writePiModelsStore`
+  // copies the box's catalogue forward before upserting.
+  //
+  // **THE ONE MEASUREMENT THAT LICENSES ADDING `"opencode"` IS J2's
+  // MERGE-VS-REPLACE ANSWER:** does an empty
+  // `provider.openrouter.models.<slug>: {}` DEEP-MERGE with OpenCode's bundled
+  // entry, or REPLACE it? If it replaces, the model loses the `reasoning` support
+  // its `effort` option is advertised from, and depth silently stops working for
+  // every pinned model.
+  //
+  // ⇒ **When J2 answers MERGE, change this row and cite that measurement.** Do
+  // not delete it because it is in the way; the list is deliberately narrow, and
+  // an entry added without its measurement re-creates the bug B5 fixed.
 });
