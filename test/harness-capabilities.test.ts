@@ -671,7 +671,10 @@ test("all six keys are PRESENT on all five blocks, and every boolean is a real b
   const wire = JSON.parse(JSON.stringify(capabilities)) as Record<string, unknown>[];
   for (const row of wire) {
     for (const [booleanKey, reasonKey] of CAPABILITY_REASON_PAIRS) {
-      assert.ok(Object.hasOwn(row, booleanKey), `${String(row.id)}: ${booleanKey} lost on the wire`);
+      assert.ok(
+        Object.hasOwn(row, booleanKey),
+        `${String(row.id)}: ${booleanKey} lost on the wire`,
+      );
       assert.ok(Object.hasOwn(row, reasonKey), `${String(row.id)}: ${reasonKey} lost on the wire`);
     }
   }
@@ -689,7 +692,7 @@ test("each reason is null IFF its boolean is true — the derivation, in both di
         );
       } else {
         assert.ok(
-          typeof row[reasonKey] === "string" && (row[reasonKey] as string).length > 20,
+          typeof row[reasonKey] === "string" && row[reasonKey].length > 20,
           `${capability.id}: ${booleanKey} is false with an empty or generic ${reasonKey} — a padlock with no reason is the silent dead control this table exists to replace`,
         );
       }
@@ -760,7 +763,10 @@ test("the `not measured:` token accompanies false, never true — and its cell i
   }
   // Control: if nobody is using the token, the assertions above ran on nothing —
   // and an all-measured table is a claim this brick deliberately did not make.
-  assert.ok(tokenCells > 0, "no cell carries the `not measured:` token — the loop asserted nothing");
+  assert.ok(
+    tokenCells > 0,
+    "no cell carries the `not measured:` token — the loop asserted nothing",
+  );
 
   // ⚠️ THE LOOP ABOVE CANNOT CATCH THE CASE THIS TEST IS NAMED FOR, AND THAT IS
   // WHY THIS SECOND LOOP EXISTS. Measured, not reasoned: a mutation flipping
@@ -787,13 +793,16 @@ test("the `not measured:` token accompanies false, never true — and its cell i
       );
     }
   }
-  assert.ok(factTokenCells > 0, "no FACTS cell carries the token — the second loop asserted nothing");
+  assert.ok(
+    factTokenCells > 0,
+    "no FACTS cell carries the token — the second loop asserted nothing",
+  );
 
   // `descriptor absent:` is the CONSUMER's token for an acpx too old to answer.
   // acpx must never emit it: doing so would make a served descriptor
   // indistinguishable from no descriptor at all.
   assert.equal(
-    /descriptor absent:/.test(JSON.stringify(listHarnessCapabilities())),
+    JSON.stringify(listHarnessCapabilities()).includes("descriptor absent:"),
     false,
     "acpx emitted the consumer's `descriptor absent:` token",
   );
