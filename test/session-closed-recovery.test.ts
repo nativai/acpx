@@ -249,10 +249,24 @@ test("every `sessions <verb>` the SESSION_CLOSED text names exists in the CLI", 
     assert.ok(named.length > 0, "the refusal must name at least one CLI verb");
 
     for (const verb of named) {
+      // ⚠️ THE VERB MUST BE FOLLOWED BY WHITESPACE OR END-OF-LINE, NOT MERELY A
+      // WORD BOUNDARY. This assertion first read `^\\s*${verb}\\b`, and `\\b`
+      // matches before a hyphen — so a CLI listing `reopen-DISABLED` satisfied a
+      // message naming `reopen`. Measured: mutation m2 renamed
+      // `.command("reopen")` to `.command("reopen-DISABLED")` and THIS TEST STAYED
+      // GREEN (the behavioural tests caught it instead). The discriminator fired
+      // on a verb REMOVED but not on a verb RENAMED to a prefix-extension, which
+      // is weaker than the guarantee this test's name claims.
+      //
+      // The general form, and the reason this comment is long: a probe whose
+      // negative control you never ran is not a probe. m2 WAS the negative
+      // control for this assertion; it went red on two other tests, and reading
+      // "m2 is red" instead of "which tests did m2 red, and which SHOULD it have"
+      // is what hid this for a whole gate cycle.
       assert.match(
         help.stdout,
-        new RegExp(`^\\s*${verb}\\b`, "m"),
-        `SESSION_CLOSED names \`acpx sessions ${verb}\`, which \`sessions --help\` does not list:\n${help.stdout}`,
+        new RegExp(`^\\s+${verb}(\\s|$)`, "m"),
+        `SESSION_CLOSED names \`acpx sessions ${verb}\`, which \`sessions --help\` does not list as a verb of exactly that name:\n${help.stdout}`,
       );
     }
   });
