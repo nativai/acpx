@@ -659,6 +659,12 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
     // planted facts, the fork truncated at index 2 recalls the first and answers
     // UNKNOWN for the second — from a SEPARATE adapter process that resolved it
     // by `session/load`, so it is the file that carries the history.
+    // ⚠️ THE INDEX MAPPING IS VERIFIED ON BOTH SIDES, because "exact" is a claim
+    // about two counts agreeing. acpx's side: `ensureAgentMessage`
+    // (src/session/conversation-model.ts:358-369) REUSES the last entry when it is
+    // already an Agent entry, so a whole turn — text, tool uses, tool results —
+    // accumulates into ONE Agent entry until a User entry intervenes.
+    //
     // `exact` is claimed on a MEASURED basis, not on the fork returning success:
     // the fork counts the index in CLIENT messages (a `user` record, or an
     // `assistant` record that closes a turn), because pi's JSONL writes THREE
