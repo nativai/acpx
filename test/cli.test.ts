@@ -21,6 +21,7 @@ import { transcriptJsonlPath } from "../src/config/subscription-transcript.js";
 import { DEFAULT_CODEX_MODEL } from "../src/session/default-model.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence.js";
 import type { SessionRecord } from "../src/types.js";
+import { scopeHarnessConfigDirRootForCli } from "./config-dir-root-isolation.js";
 import {
   cleanupOwnerArtifacts,
   closeServer,
@@ -7255,6 +7256,11 @@ async function runCli(
         delete env[key];
       }
     }
+    // ⚠️ SCOPE THE CHILD'S OWN ENV, then verify it (brick 0bac6a00). A prune
+    // sweeps harness config dirs under a root NO HOME scopes, so an isolated
+    // store is not isolation here. Checking process.env instead would measure
+    // the runner, one inheritance step away from the process that sweeps.
+    scopeHarnessConfigDirRootForCli(args, env, homeDir);
     const child = spawn(process.execPath, [CLI_PATH, ...args], {
       env,
       cwd: options.cwd,

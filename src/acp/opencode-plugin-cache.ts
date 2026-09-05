@@ -8,9 +8,9 @@ import {
   renameSync,
   rmSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ACP_ADAPTER_PACKAGE_RANGES } from "../agent-registry.js";
+import { resolveHarnessConfigDirRoot } from "./harness-config-dir-root.js";
 
 /**
  * ONE shared OpenCode plugin install, HARDLINKED into every session's config dir
@@ -81,7 +81,8 @@ export interface PluginCacheResult {
 export function seedOpenCodePluginInstall(params: {
   /** `<sessionDir>/opencode` — where OpenCode writes package.json. */
   configDir: string;
-  /** Overrides `tmpdir()`; tests keep the cache inside a fixture. */
+  /** Overrides the resolved root (`ACPX_HARNESS_CONFIG_DIR_ROOT`, else `tmpdir()`);
+   *  tests keep the cache inside a fixture. */
   rootDir?: string;
   /** Overrides the pinned version, for tests. */
   version?: string;
@@ -109,9 +110,36 @@ function resolveCacheTarget(params: { rootDir?: string; version?: string }): {
   version: string;
   cacheDir: string;
 } {
-  const root = params.rootDir ?? tmpdir();
+  // The SAME resolver the config-dir writer and the orphan sweep use
+  // (`harness-config-dir-root.ts`), so the cache always lands in the root the
+  // sweep walks — never beside it in a directory nothing reaps.
+  const root = resolveHarnessConfigDirRoot(params.rootDir);
   const version = params.version ?? ACP_ADAPTER_PACKAGE_RANGES.opencode;
   return { root, version, cacheDir: join(root, `${CACHE_PREFIX}${version}`) };
+}
+
+/**
+ * Is `entry` (a bare directory name, as `readdirSync` yields it) the shared
+ * plugin cache?
+ *
+ * ## ⚠️ WHY THE SWEEP ASKS THIS EXPLICITLY INSTEAD OF RELYING ON THE PREFIX
+ *
+ * `.acpx-opencode-plugin-cache-<version>` misses the sweep's `acpx-<harness>-`
+ * candidate filter **only because of its leading dot**. That is a naming
+ * convention, and a naming convention is exactly the kind of guard the next
+ * tidy-up removes — renaming the cache, broadening the candidate glob, or moving
+ * the config dirs under a dedicated root (CONCEPTION §8.1) each restore the 63
+ * MB-per-session cost this cache exists to prevent, silently and with nothing
+ * failing to announce it.
+ *
+ * ⚠️ **DO NOT DELETE THIS AND LEAN ON THE DOT.** The dot is a second, independent
+ * reason the cache is safe today; this predicate is the one that survives a
+ * rename or a root move. The two are redundant on purpose — see the sweep's
+ * candidate filter, and `test/opencode-plugin-cache.test.ts`, which fire-tests
+ * this predicate against a cache name that has NO leading dot.
+ */
+export function isOpenCodePluginCacheEntry(entry: string): boolean {
+  return entry.startsWith(CACHE_PREFIX) || entry.startsWith(CACHE_PREFIX.slice(1));
 }
 
 /**

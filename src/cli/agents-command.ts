@@ -71,6 +71,18 @@ function renderTable(capabilities: HarnessCapabilities[]): string {
   );
 }
 
+/**
+ * The reason line for a denied capability, or nothing when it is granted.
+ *
+ * A helper rather than three inline ternaries only because `renderDetail` is at
+ * the lint's complexity ceiling — but it also makes the pairing single-sourced:
+ * a boolean rendered WITHOUT its reason is the defect (see the block that calls
+ * this), so the two cannot drift apart line by line.
+ */
+function whyNot(label: string, reason: string | null): string {
+  return reason === null ? "" : `  ${label} ${reason}\n`;
+}
+
 function renderDetail(capability: HarnessCapabilities): string {
   const providers = capability.credential.providers?.join(", ") ?? "-";
   const forkIndex =
@@ -93,6 +105,26 @@ function renderDetail(capability: HarnessCapabilities): string {
     `  fork:             supported=${capability.fork.supported}  at-index=${forkIndex}\n` +
     `  primer:           ${capability.primerChannel}\n` +
     `  mid-turn steer:   ${capability.midTurnSteering}\n` +
+    // brick 82a2aafd. ⚠️ THESE THREE MUST BE RENDERED WITH THEIR REASONS, NOT AS
+    // BARE BOOLEANS. The reason is the ONLY place the three-state convention is
+    // visible to a human: `not measured:` (acpx never probed this adapter) reads
+    // identically to a measured denial once the string is dropped. A bare `false`
+    // here would recreate, in the text view, exactly the confident-false defect
+    // this table exists to end.
+    //
+    // ⚠️ AND THIS BLOCK IS WHY `renderDetail` MUST BE EXTENDED WHENEVER A FIELD IS
+    // ADDED: it enumerates fields explicitly, so a new capability reaches
+    // `--json` and SILENTLY not the text view — a human then sees every other
+    // capability and reads the absence as "acpx has nothing to say". That is the
+    // half-satisfied form of Daniel's requirement that this be "browsable for
+    // agents via the ACPX CLI" (DECISIONS, 2026-09-03 23:00:02).
+    // `test/permission-short-circuit.test.ts` pins all three labels + the token.
+    `  session clear:    ${capability.supportsSessionClear}\n` +
+    whyNot("clear why-not:   ", capability.sessionClearReason) +
+    `  credential live:  ${capability.canSetCredentialLive}\n` +
+    whyNot("cred. why-not:   ", capability.credentialLiveReason) +
+    `  model degrade:    ${capability.supportsModelDegrade}\n` +
+    whyNot("degrade why-not: ", capability.modelDegradeReason) +
     `  profiles=${capability.supportsProfiles}  output-styles=${capability.supportsOutputStyles}  usage=${capability.usageReporting}  images=${capability.promptImages}\n`
   );
 }
