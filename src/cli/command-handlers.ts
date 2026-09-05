@@ -12,6 +12,8 @@ import {
   resolveEffectiveForkIndex,
   resolveHarnessCapabilities,
 } from "../acp/harness-capabilities.js";
+import { resolveHarnessConfigDirRoot } from "../acp/harness-config-dir-root.js";
+import { claimHarnessConfigDirSweep } from "../acp/harness-config-dir-sweep-gate.js";
 import {
   describeHarnessConfigDirSweep,
   describeHarnessConfigDirSweepPlan,
@@ -1503,6 +1505,10 @@ export async function handlePrompt(
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
+  // C — the first-prompt trigger. Interval-gated, so the common case is one
+  // `statSync`; see maybeSweepHarnessConfigDirsOnPrompt for why a PROMPT and not
+  // a create, and why this cannot fail the turn.
+  await maybeSweepHarnessConfigDirsOnPrompt(globalFlags.verbose === true);
   validateExplicitCredentialFlags(globalFlags);
   const outputPolicy = resolveRequestedOutputPolicy(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
@@ -3759,6 +3765,71 @@ function knownRecordsById(
     }
   }
   return records;
+}
+
+/**
+ * ⚠️ C — THE FIRST-PROMPT TRIGGER (CONCEPTION §3, ruled A + C(first-prompt)).
+ *
+ * ## Why a PROMPT and not a CREATE, which is what the note originally recommended
+ *
+ * Measured, not stylistic: **a create-only session materialises no config dir**
+ * (3 create+close pairs added 0 candidates; 0 vs 110 sightings measured both
+ * ways). The directory appears when the ADAPTER SPAWNS, which happens on the first
+ * prompt — so a create-triggered sweep fires before the thing it sweeps exists and
+ * finds nothing on a create-then-idle box. It would look like it was working.
+ *
+ * ## Why this can sit on a latency-sensitive path at all
+ *
+ * It cannot, ungated — which is what {@link claimHarnessConfigDirSweep} is for. The
+ * common case is one `statSync` and a return; the census runs at most once per
+ * interval, ACROSS PROCESSES (each `acpx prompt` is a fresh one).
+ *
+ * ## ⚠️ IT NEVER FAILS A PROMPT
+ *
+ * Every failure is swallowed. A prompt that dies because the tidy-up threw would be
+ * a strictly worse outcome than a directory that survives another interval.
+ */
+async function maybeSweepHarnessConfigDirsOnPrompt(verbose: boolean): Promise<void> {
+  try {
+    if (!claimHarnessConfigDirSweep({ root: resolveHarnessConfigDirRoot() })) {
+      return;
+    }
+    const session = await loadSessionModule();
+    await sweepOrphanHarnessConfigDirs(session, false, verbose, undefined);
+  } catch {
+    // Deliberately silent: this is opportunistic tidy-up on someone else's turn,
+    // and the census the sweep itself prints is where its outcome is reported.
+  }
+}
+
+/**
+ * ⚠️ A — THE RECORD-PRESERVING SWEEP, AS ITS OWN VERB.
+ *
+ * Until this existed the ONLY thing that invoked the sweep was `sessions prune`,
+ * which deletes each session's record AND its messages sidecar — so reclaiming a
+ * leaked directory was coupled to destroying transcripts, and the fleet's answer
+ * was to forbid the command outright. This verb breaks that coupling: it removes
+ * DIRECTORIES only.
+ *
+ * ⚠️ IT DOES CLOSE OWNERLESS RECORDS, and that is stated rather than buried. The
+ * directory pass removes only on positive ownership, one clause of which is "the
+ * record is CLOSED", so a store full of abandoned-open records makes a *correct*
+ * sweep retain everything forever. Closing is reversible and destroys nothing;
+ * DELETING is what this verb never does.
+ */
+export async function handleSessionsSweepConfigDirs(
+  flags: { dryRun?: boolean; configDirRoot?: string },
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const session = await loadSessionModule();
+  await sweepOrphanHarnessConfigDirs(
+    session,
+    flags.dryRun === true,
+    globalFlags.verbose === true,
+    flags.configDirRoot,
+  );
 }
 
 /**

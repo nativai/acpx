@@ -18,6 +18,7 @@ import {
   handleSessionsRecover,
   handleSessionsRepairAccountSeam,
   handleSessionsSetMetadata,
+  handleSessionsSweepConfigDirs,
   handleSessionsShow,
   handleSessionsTemplate,
   handleSessionsTemplates,
@@ -549,6 +550,24 @@ export function registerSessionsCommand(
     )
     .action(async function (this: Command, archivePath: string, flags: SessionsImportFlags) {
       await handleSessionsImport(explicitAgentName, archivePath, flags, this, config);
+    });
+
+  sessionsCommand
+    .command("sweep-config-dirs")
+    .description(
+      "Reap orphaned per-session harness config dirs. Deletes DIRECTORIES ONLY — no session record and no transcript is ever removed, unlike `prune`. Closes ownerless records first (reversible; the directory rule requires a CLOSED record). Prints its census by default.",
+    )
+    .option(
+      "--dry-run",
+      "Classify and print every candidate with its verdict, and remove nothing. Unlike prune's old --dry-run, this really does run the sweep.",
+    )
+    .option(
+      "--config-dir-root <path>",
+      "Sweep this directory instead of the system temp dir. Also settable as ACPX_HARNESS_CONFIG_DIR_ROOT; the flag wins.",
+      (value: string) => parseNonEmptyValue("Config dir root", value),
+    )
+    .action(async function (this: Command, flags: { dryRun?: boolean; configDirRoot?: string }) {
+      await handleSessionsSweepConfigDirs(flags, this, config);
     });
 
   sessionsCommand
