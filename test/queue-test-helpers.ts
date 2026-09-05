@@ -5,6 +5,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { queueLockFilePath, queueSocketPath } from "../src/cli/queue/paths.js";
+import { beginIsolatedHarnessConfigDirRoot } from "./config-dir-root-isolation.js";
 
 export type QueuePaths = {
   lockPath: string;
@@ -22,6 +23,12 @@ export async function withTempHome(run: (homeDir: string) => Promise<void>): Pro
   const originalHome = process.env.HOME;
   const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-test-home-"));
   process.env.HOME = tempHome;
+  // ⚠️ Same reason as the sibling fixture in `runtime-test-helpers.ts`: a pinned
+  // HOME does NOT scope the harness config-dir sweep, which resolves `tmpdir()`.
+  // `cli.test.ts` reaches the sweep through THIS fixture, so both need the line —
+  // and that is precisely why the scoping is paired with a spawn-time guard
+  // (`assertHarnessConfigDirRootIsolated`) rather than left to two call sites.
+  const restoreConfigDirRoot = beginIsolatedHarnessConfigDirRoot(tempHome);
 
   try {
     await run(tempHome);
@@ -31,6 +38,7 @@ export async function withTempHome(run: (homeDir: string) => Promise<void>): Pro
     } else {
       process.env.HOME = originalHome;
     }
+    restoreConfigDirRoot();
     await fs.rm(tempHome, { recursive: true, force: true });
   }
 }

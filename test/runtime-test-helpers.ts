@@ -4,6 +4,7 @@ import path from "node:path";
 import type { AcpAgentRegistry, AcpRuntimeOptions, AcpSessionStore } from "../src/runtime.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence.js";
 import type { SessionRecord } from "../src/types.js";
+import { beginIsolatedHarnessConfigDirRoot } from "./config-dir-root-isolation.js";
 import { installOwnerReaper } from "./owner-reaper.js";
 
 // brick://113073b8 — stamp this test-file process's unique owner tag and register
@@ -105,12 +106,18 @@ export async function withTempHome<T>(
   const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
   process.env.HOME = tempHome;
   process.env.ACPX_STATE_HOME = tempHome;
+  // ⚠️ THE STORE AND THE CONFIG-DIR ROOT ARE TWO SEPARATE ISOLATIONS, and pinning
+  // the store does not scope the sweep: `sessions prune` sweeps `tmpdir()`, which
+  // no HOME reaches. Without this line every prune the suite runs walks the box's
+  // real /tmp (brick 0bac6a00, `config-dir-root-isolation.ts`).
+  const restoreConfigDirRoot = beginIsolatedHarnessConfigDirRoot(tempHome);
 
   try {
     return await run(tempHome);
   } finally {
     restoreEnv("HOME", originalHome);
     restoreEnv("ACPX_STATE_HOME", originalStateHome);
+    restoreConfigDirRoot();
     await fs.rm(tempHome, { recursive: true, force: true });
   }
 }

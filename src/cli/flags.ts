@@ -186,6 +186,17 @@ export type SessionsPruneFlags = {
   cwd?: boolean;
   /** The audit token. Deliberately long and distinctive; no `--all` alias. */
   wholeBox?: boolean;
+  /**
+   * Where the orphan HARNESS CONFIG DIR sweep looks — NOT a scope on which
+   * sessions are pruned.
+   *
+   * ⚠️ NAMED `--config-dir-root`, NOT `--root-dir`, DELIBERATELY. On a verb that
+   * deletes session records, a bare `--root-dir` reads as "prune the store rooted
+   * here" — the one misreading that would be destructive. This flag never widens
+   * or narrows the set of sessions deleted; it only bounds the directory tree the
+   * post-prune config-dir sweep walks.
+   */
+  configDirRoot?: string;
 };
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

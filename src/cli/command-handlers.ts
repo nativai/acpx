@@ -12,8 +12,11 @@ import {
   resolveEffectiveForkIndex,
   resolveHarnessCapabilities,
 } from "../acp/harness-capabilities.js";
+import { resolveHarnessConfigDirRoot } from "../acp/harness-config-dir-root.js";
+import { claimHarnessConfigDirSweep } from "../acp/harness-config-dir-sweep-gate.js";
 import {
   describeHarnessConfigDirSweep,
+  describeHarnessConfigDirSweepPlan,
   pruneOrphanHarnessConfigDirs,
 } from "../acp/harness-config-dir.js";
 import {
@@ -1502,6 +1505,10 @@ export async function handlePrompt(
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
+  // C — the first-prompt trigger. Interval-gated, so the common case is one
+  // `statSync`; see maybeSweepHarnessConfigDirsOnPrompt for why a PROMPT and not
+  // a create, and why this cannot fail the turn.
+  await maybeSweepHarnessConfigDirsOnPrompt(globalFlags.verbose === true);
   validateExplicitCredentialFlags(globalFlags);
   const outputPolicy = resolveRequestedOutputPolicy(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
@@ -3713,7 +3720,15 @@ export async function handleSessionsPrune(
   }
 
   render.printPruneResultByFormat(result, globalFlags.format, scope);
-  await sweepOrphanHarnessConfigDirs(session, flags.dryRun === true, globalFlags.verbose === true);
+  // `true` — prune is the verb that already means "clean up after closed sessions",
+  // so closing ownerless records is what the operator asked for here.
+  await sweepOrphanHarnessConfigDirs(
+    session,
+    flags.dryRun === true,
+    globalFlags.verbose === true,
+    flags.configDirRoot,
+    true,
+  );
 }
 
 /**
@@ -3755,14 +3770,171 @@ function knownRecordsById(
   return records;
 }
 
+/**
+ * ⚠️ C — THE FIRST-PROMPT TRIGGER (CONCEPTION §3, ruled A + C(first-prompt)).
+ *
+ * ## Why a PROMPT and not a CREATE, which is what the note originally recommended
+ *
+ * Measured, not stylistic: **a create-only session materialises no config dir**
+ * (3 create+close pairs added 0 candidates; 0 vs 110 sightings measured both
+ * ways). The directory appears when the ADAPTER SPAWNS, which happens on the first
+ * prompt — so a create-triggered sweep fires before the thing it sweeps exists and
+ * finds nothing on a create-then-idle box. It would look like it was working.
+ *
+ * ## Why this can sit on a latency-sensitive path at all
+ *
+ * It cannot, ungated — which is what {@link claimHarnessConfigDirSweep} is for. The
+ * common case is one `statSync` and a return; the census runs at most once per
+ * interval, ACROSS PROCESSES (each `acpx prompt` is a fresh one).
+ *
+ * ## ⚠️ IT NEVER FAILS A PROMPT
+ *
+ * Every failure is swallowed. A prompt that dies because the tidy-up threw would be
+ * a strictly worse outcome than a directory that survives another interval.
+ */
+async function maybeSweepHarnessConfigDirsOnPrompt(verbose: boolean): Promise<void> {
+  try {
+    if (!claimHarnessConfigDirSweep({ root: resolveHarnessConfigDirRoot() })) {
+      return;
+    }
+    const session = await loadSessionModule();
+    // `false` — READ-ONLY WITH RESPECT TO SESSION STATE. See the parameter's own
+    // comment: closing records from the prompt path delivered a prompt the CLI
+    // was supposed to refuse.
+    await sweepOrphanHarnessConfigDirs(session, false, verbose, undefined, false);
+  } catch {
+    // Deliberately silent: this is opportunistic tidy-up on someone else's turn,
+    // and the census the sweep itself prints is where its outcome is reported.
+  }
+}
+
+/**
+ * ⚠️ A — THE RECORD-PRESERVING SWEEP, AS ITS OWN VERB.
+ *
+ * Until this existed the ONLY thing that invoked the sweep was `sessions prune`,
+ * which deletes each session's record AND its messages sidecar — so reclaiming a
+ * leaked directory was coupled to destroying transcripts, and the fleet's answer
+ * was to forbid the command outright. This verb breaks that coupling: it removes
+ * DIRECTORIES only.
+ *
+ * ⚠️ IT DOES CLOSE OWNERLESS RECORDS, and that is stated rather than buried. The
+ * directory pass removes only on positive ownership, one clause of which is "the
+ * record is CLOSED", so a store full of abandoned-open records makes a *correct*
+ * sweep retain everything forever. Closing is reversible and destroys nothing;
+ * DELETING is what this verb never does.
+ */
+export async function handleSessionsSweepConfigDirs(
+  flags: { dryRun?: boolean; configDirRoot?: string },
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const session = await loadSessionModule();
+  await sweepOrphanHarnessConfigDirs(
+    session,
+    flags.dryRun === true,
+    globalFlags.verbose === true,
+    flags.configDirRoot,
+    true,
+  );
+}
+
+/**
+ * Fold a DRY RUN's would-close ids into the records map as closed.
+ *
+ * ⚠️ WITHOUT THIS THE PREVIEW UNDER-REPORTS, AND IN THE REASSURING DIRECTION. A real
+ * prune closes ownerless records first, and only then does the directory pass see
+ * them as closed and become willing to remove their dirs. On a dry run nothing was
+ * actually closed, so the re-read returns the state that PRECEDED the record sweep
+ * and every such directory is retained as `openRecord` — the preview omits exactly
+ * the set the record sweep exists to release. Empty list on a real run, where the
+ * store already carries the closes.
+ */
+function withDryRunCloses(
+  records: Map<string, { closed: boolean }>,
+  wouldClose: readonly string[],
+): Map<string, { closed: boolean }> {
+  for (const id of wouldClose) {
+    records.set(id, { closed: true });
+  }
+  return records;
+}
+
+/**
+ * The abandoned-RECORD stage, lifted out so the sweep above reads as its two
+ * stages rather than as a conditional. Returns `undefined` when the caller is not
+ * permitted to close records — see `closeAbandonedRecords`, which is `false` for
+ * the prompt trigger and `true` for the two explicit verbs.
+ */
+async function maybeSweepAbandonedRecords(params: {
+  session: Awaited<ReturnType<typeof loadSessionModule>>;
+  liveScan: ReturnType<typeof scanLiveProcesses>;
+  dryRun: boolean;
+  verbose: boolean;
+  enabled: boolean;
+}): Promise<Awaited<ReturnType<typeof sweepAbandonedSessionRecords>> | undefined> {
+  if (!params.enabled) {
+    return undefined;
+  }
+  const result = await sweepAbandonedSessionRecords({
+    records: await params.session.listSessions(),
+    liveScan: params.liveScan,
+    // ⚠️ A DRY RUN MUST NOT CLOSE RECORDS EITHER — but it must still MODEL the
+    // closes, or the preview under-reports. `closed` is populated from the verdicts
+    // regardless of what this callback does, so a no-op yields exactly "the ids a
+    // real run would have closed".
+    closeSession: params.dryRun ? async () => undefined : (id) => params.session.closeSession(id),
+  });
+  if (params.verbose) {
+    process.stderr.write(describeAbandonedRecordSweep(result));
+  }
+  return result;
+}
+
 async function sweepOrphanHarnessConfigDirs(
   session: Awaited<ReturnType<typeof loadSessionModule>>,
   dryRun: boolean,
   verbose: boolean,
+  /**
+   * ⚠️ THE PARAMETER THIS SIGNATURE USED TO LACK ENTIRELY (brick 0bac6a00).
+   * `pruneOrphanHarnessConfigDirs` has taken a `rootDir` since it was written, and
+   * no CLI path could reach it — not because a call site forgot to pass one, but
+   * because there was nowhere to pass it FROM. A missing parameter, not a missing
+   * argument. Undefined here keeps the real root, which is the correct default.
+   */
+  rootDir: string | undefined,
+  /**
+   * ⚠️ FALSE FOR THE OPPORTUNISTIC PROMPT TRIGGER, AND THAT DEFAULT IS A SAFETY
+   * PROPERTY, NOT A PERFORMANCE ONE — it is the fix for a regression this brick's
+   * own gate caught at 2e10e4e, and the failure was worse than a red test.
+   *
+   * The record sweep CLOSES ownerless records. That is correct for `prune` and for
+   * `sweep-config-dirs`, where the operator asked for a tidy-up. Running it from
+   * the PROMPT path made a prompt MUTATE SESSION STATE AS A SIDE EFFECT, and two
+   * gate failures showed what that costs:
+   *
+   *   - `cli.test.ts` W7-L12(c): the trigger closed the very session being prompted
+   *     (fixture records are long-idle by construction), so the prompt exited 1.
+   *   - `session-name-ambiguity.test.ts`: two sessions shared a name, the trigger
+   *     closed ONE of them, the ambiguity DISSOLVED, and **a prompt the CLI must
+   *     refuse was delivered to the agent — exit 0, sentinel payload through.**
+   *
+   * The second is the one that matters: an opportunistic tidy-up silently changed
+   * the outcome of a REFUSAL. A reap that runs on someone else's turn may read
+   * state; it may not write it.
+   *
+   * The cost of `false` is that the prompt trigger reaps less — only directories
+   * whose record is already closed, or unrecognised and past the age gate. That is
+   * the whole leak class it is aimed at, and the explicit verb still does the full
+   * two-stage job.
+   */
+  closeAbandonedRecords: boolean,
 ): Promise<void> {
-  if (dryRun) {
-    return;
-  }
+  // ⚠️ A DRY RUN NO LONGER RETURNS HERE (CONCEPTION §5). It used to, which meant
+  // the mode that needs no scope was the mode that never swept: the safest way to
+  // ask "what would this remove?" was the one way that could not answer, and a
+  // preview showing nothing reads as a clean preview. It now walks the same
+  // candidates under the same rule and removes none of them.
   try {
     // ⚠️ ONE /proc CENSUS, SHARED BY BOTH SWEEPS. Taken once so the two cannot
     // disagree about what is running, and so the cost is paid once.
@@ -3775,30 +3947,42 @@ async function sweepOrphanHarnessConfigDirs(
     // sweep retain every directory forever (measured on the rig: 206 records, 88
     // still open, each pinning a config dir). The fix is to close the ownerless
     // records — one layer up — NOT to relax the deletion rule below.
-    const recordSweep = await sweepAbandonedSessionRecords({
-      records: await session.listSessions(),
+    const recordSweep = await maybeSweepAbandonedRecords({
+      session,
       liveScan,
-      closeSession: (id) => session.closeSession(id),
+      dryRun,
+      verbose,
+      enabled: closeAbandonedRecords,
     });
-    if (verbose) {
-      process.stderr.write(describeAbandonedRecordSweep(recordSweep));
-    }
 
     // Re-read AFTER the record sweep, so the directory pass sees the closes it
     // just made rather than the state that preceded them.
-    const records = knownRecordsById(await session.listSessions());
-    const swept = pruneOrphanHarnessConfigDirs({ records, liveScan });
-    if (verbose) {
-      process.stderr.write(describeHarnessConfigDirSweep(swept));
+    const records = withDryRunCloses(
+      knownRecordsById(await session.listSessions()),
+      dryRun && recordSweep !== undefined ? recordSweep.closed : [],
+    );
+    const swept = pruneOrphanHarnessConfigDirs({ records, liveScan, rootDir, dryRun });
+    // ⚠️ PRINTED BY DEFAULT, NOT UNDER --verbose (CONCEPTION §7). Every population
+    // this carries — `scanned=0 means NOT RUN`, `retainedBy`, `unmeasured` — exists
+    // to be READ, and a census behind a flag is a census nobody sees. A sweep that
+    // removes things silently is the shape of every incident in this thread.
+    process.stderr.write(describeHarnessConfigDirSweep(swept));
+    // The per-candidate preview is the point of a dry run; on a real run the
+    // one-line census is enough unless the operator asked for detail.
+    if (dryRun || verbose) {
+      process.stderr.write(describeHarnessConfigDirSweepPlan(swept));
     }
   } catch (error) {
     // Never fail a prune because the tidy-up failed — the sessions are already
     // deleted by this point and the sweep runs again next time.
-    if (verbose) {
-      process.stderr.write(
-        `[acpx] harness config dir sweep skipped: ${error instanceof Error ? error.message : String(error)}\n`,
-      );
-    }
+    //
+    // ⚠️ BUT SAY SO BY DEFAULT. With the census now unconditional (§7), leaving this
+    // behind --verbose would mean the ONE outcome that prints nothing at all is the
+    // one where the sweep threw — silence reading as "it ran and found nothing",
+    // which is the exact ambiguity §7 exists to remove.
+    process.stderr.write(
+      `[acpx] harness config dir sweep skipped: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
   }
 }
 

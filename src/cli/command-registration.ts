@@ -18,6 +18,7 @@ import {
   handleSessionsRecover,
   handleSessionsRepairAccountSeam,
   handleSessionsSetMetadata,
+  handleSessionsSweepConfigDirs,
   handleSessionsShow,
   handleSessionsTemplate,
   handleSessionsTemplates,
@@ -552,6 +553,24 @@ export function registerSessionsCommand(
     });
 
   sessionsCommand
+    .command("sweep-config-dirs")
+    .description(
+      "Reap orphaned per-session harness config dirs. Deletes DIRECTORIES ONLY — no session record and no transcript is ever removed, unlike `prune`. Closes ownerless records first (reversible; the directory rule requires a CLOSED record). Prints its census by default.",
+    )
+    .option(
+      "--dry-run",
+      "Classify and print every candidate with its verdict, and remove nothing. Unlike prune's old --dry-run, this really does run the sweep.",
+    )
+    .option(
+      "--config-dir-root <path>",
+      "Sweep this directory instead of the system temp dir. Also settable as ACPX_HARNESS_CONFIG_DIR_ROOT; the flag wins.",
+      (value: string) => parseNonEmptyValue("Config dir root", value),
+    )
+    .action(async function (this: Command, flags: { dryRun?: boolean; configDirRoot?: string }) {
+      await handleSessionsSweepConfigDirs(flags, this, config);
+    });
+
+  sessionsCommand
     .command("prune")
     .description(
       "Delete closed sessions: removes each session's record AND its messages sidecar (after which its transcript cannot be rebuilt). Requires a scope — session ids, --cwd, --whole-box, --older-than or --before — unless --dry-run. Template blueprints are skipped.",
@@ -568,6 +587,23 @@ export function registerSessionsCommand(
     )
     .option("--before <date>", "Prune sessions closed before this date", parsePruneBeforeDate)
     .option("--older-than <days>", "Prune sessions closed more than N days ago", parseDaysOlderThan)
+    // ⚠️ THIS BOUNDS THE CONFIG-DIR SWEEP, NOT THE SESSION SELECTION. It exists
+    // because the sweep's `rootDir` was, until now, a function parameter no CLI
+    // path could supply: this handler's signature took none, so
+    // `params.rootDir ?? tmpdir()` resolved the REAL SHARED `/tmp` from every
+    // invocation, in every HOME — an isolated HOME does not scope it. That made
+    // the fleet safety rule ("prune only with an explicit root") impossible to
+    // comply with, which is the whole of brick 0bac6a00.
+    //
+    // ⚠️ THE DEFAULT STAYS `tmpdir()` ON PURPOSE (CONCEPTION §4): every directory
+    // that has actually leaked is at `/tmp/acpx-<harness>-<id>`, so a default
+    // pointed anywhere else would give a clean, cheap, truthful census over an
+    // empty root while the entire backlog sat invisible one level up.
+    .option(
+      "--config-dir-root <path>",
+      "Bound the post-prune harness config-dir sweep to this directory instead of the system temp dir. Does NOT affect which sessions are pruned. Also settable as ACPX_HARNESS_CONFIG_DIR_ROOT; the flag wins.",
+      (value: string) => parseNonEmptyValue("Config dir root", value),
+    )
     // ⚠️ DECLARATION ORDER IS LOAD-BEARING. `--no-include-history` MUST be
     // registered FIRST, and no type check catches it if you swap them.
     //
