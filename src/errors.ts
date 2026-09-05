@@ -53,6 +53,16 @@ export class SessionResolutionError extends AcpxOperationalError {}
  * of which one (acpx-ui's button) needs a browser and the other simply did not
  * work — measured, and it is the defect this brick is named for.
  *
+ * ⚠️ THIS IS THE SECOND TIME, IN THE OPPOSITE DIRECTION. Before `2deef5c`
+ * (2026-06-30) the message named ``acpx sessions reopen <name>`` — a verb that,
+ * settled with `git log -S` over all refs, **never existed in this repo**. That
+ * commit fixed the lie by DELETING the mention and pinning its absence
+ * (`doesNotMatch(/sessions reopen/)`) in two test files. The replacement text
+ * then went stale in its turn, and those pins actively forbade the honest fix.
+ * The loop only ends by BUILDING the verb the message wants to name — which is
+ * what this change does. If you are about to make this text name a route again,
+ * make sure the route EXISTS first; that is the whole lesson, twice over.
+ *
  * It survived because NOTHING TESTED THE TEXT; worse, the one assertion that
  * touched it PINNED THE OLD REALITY (`assert.doesNotMatch(message,
  * /sessions reopen/)`), so the message could only ever go staler. The guard is

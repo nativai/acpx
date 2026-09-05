@@ -214,6 +214,21 @@ test("SESSION_CLOSED names the reopen routes that EXIST and not the removed one"
   assert.equal(error.detailCode, "SESSION_CLOSED");
   assert.equal(error.outputCode, "RUNTIME");
 
+  // CROSS-REPO GUARD. acpx-ui's `isTerminalEnqueueFailure`
+  // (acpx-ui server/delivery-runner.ts:109-114) lower-cases the failure text and
+  // classifies it TERMINAL if it contains "session is closed", "read-only" or
+  // "template". This message is classified by its `detailCode`, NOT by those
+  // substrings — measured 2026-09-05, neither the old nor the new text contains
+  // any of them, so this edit changed no classification. Acquiring one by
+  // accident in a later reword would silently reroute delivery retries, and
+  // nothing in THIS repo would notice. Note the substring is "session is closed"
+  // with no name between the words — this message always has one, which is
+  // exactly why it never matched.
+  const normalized = error.message.toLowerCase();
+  assert.doesNotMatch(normalized, /session is closed/);
+  assert.doesNotMatch(normalized, /read-only/);
+  assert.doesNotMatch(normalized, /template/);
+
   const withoutName = new SessionClosedError("raw-id", undefined);
   assert.match(withoutName.message, /'raw-id'/);
   assert.match(withoutName.message, /acpx sessions reopen raw-id/);

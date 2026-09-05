@@ -7774,10 +7774,27 @@ test("B3: prompt --no-wait to a closed session fails loudly, while an open sessi
     assert.doesNotMatch(refused.stdout, /"action":"prompt_queued"/);
     const error = parseCliJsonError(refused.stdout);
     assert.equal(error.detailCode, "SESSION_CLOSED");
-    // The guidance names the surfaces that exist. `acpx sessions reopen` does not,
-    // and was removed in 2deef5c — it must not come back through this path.
-    assert.match(error.message, /Reopen it in acpx-ui/);
-    assert.doesNotMatch(error.message, /sessions reopen/);
+    // The guidance names the surfaces that exist — still the rule; the SET changed.
+    //
+    // ⚠️ The comment here used to read "`acpx sessions reopen` ... was removed in
+    // 2deef5c". That was WRONG ABOUT ITS OWN HISTORY, and the error it protected
+    // is the one brick://16712ece is named for. Settled with `git log -S` over all
+    // refs: `command("reopen")` and `handleSessionsReopen` appear in exactly one
+    // commit in this repo's history — the one that ADDED them. **The verb never
+    // existed.** 2deef5c deleted a FALSE ADVERTISEMENT (the message named a verb
+    // nobody had built) and pinned its absence here and in
+    // test/session-lifecycle-ownership.test.ts.
+    //
+    // That pin then became the trap: the replacement text promised
+    // "reopen-and-deliver", which was later removed from the delivery path, so the
+    // message went stale AGAIN — and this assertion actively forbade the honest
+    // fix. Same defect twice, in opposite directions. It is resolved by BUILDING
+    // the verb the message wanted to name, so the text and the CLI can both be
+    // true. `acpx sessions reopen` now exists; assert the routes, not a sentence.
+    assert.match(error.message, /acpx sessions reopen/);
+    assert.match(error.message, /acpx-ui/i);
+    assert.match(error.message, /--reopen/);
+    assert.doesNotMatch(error.message, /reopen-and-deliver/);
 
     // Blocking mode was already honest; it must stay that way, and identically.
     const refusedBlocking = await runCli(
