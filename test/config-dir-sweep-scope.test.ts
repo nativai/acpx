@@ -237,14 +237,20 @@ test("0bac6a00 §4: the spawn-time guard REFUSES an unscoped prune", () => {
   }
 });
 
-test("0bac6a00 §4: the guard PASSES what it should — scoped prunes, `--help`, and non-prune verbs", () => {
+test("0bac6a00 §4: the guard PASSES what it should — scoped invocations and `--help`", () => {
   const saved = process.env[HARNESS_CONFIG_DIR_ROOT_ENV];
   try {
     // A guard that threw on everything would pass the test above and be useless;
     // the negative cases are what make the positive one evidence.
+    //
+    // ⚠️ `sessions list` IS NO LONGER EXEMPT, and that is deliberate. The exemption
+    // used to be "not a prune"; brick 0bac6a00 added a prompt trigger, which widened
+    // the surface that sweeps without widening the surface that was scoped — and the
+    // gate caught a prompt sweeping the box's real /tmp. The rule is now inclusive:
+    // only `--help` is exempt, because it prints and exits.
     delete process.env[HARNESS_CONFIG_DIR_ROOT_ENV];
     assertHarnessConfigDirRootIsolated(["claude", "sessions", "prune", "--help"]);
-    assertHarnessConfigDirRootIsolated(["claude", "sessions", "list"]);
+    assertHarnessConfigDirRootIsolated(["claude", "sessions", "list", "--help"]);
     const scoped = mkdtempSync(join(tmpdir(), "acpx-0bac6a00-guard-"));
     try {
       assertHarnessConfigDirRootIsolated([
@@ -338,12 +344,12 @@ test("0bac6a00 §4: the spawn-time scoping leaves an EXPLICIT --config-dir-root 
   }
 });
 
-test("0bac6a00 §4: the spawn-time scoping touches nothing for `--help` or a non-prune verb", () => {
+test("0bac6a00 §4: the spawn-time scoping touches nothing for `--help`", () => {
   const home = mkdtempSync(join(tmpdir(), "acpx-0bac6a00-noop-"));
   try {
     for (const args of [
       ["claude", "sessions", "prune", "--help"],
-      ["claude", "sessions", "list"],
+      ["claude", "sessions", "list", "--help"],
     ]) {
       const env: NodeJS.ProcessEnv = {};
       scopeHarnessConfigDirRootForCli(args, env, home);

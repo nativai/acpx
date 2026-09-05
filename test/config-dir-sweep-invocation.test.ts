@@ -9,6 +9,7 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
+import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -18,7 +19,13 @@ import {
   claimHarnessConfigDirSweep,
   DEFAULT_SWEEP_INTERVAL_MS,
 } from "../src/acp/harness-config-dir-sweep-gate.js";
-import { withTempHome as withTempHomeFixture } from "./runtime-test-helpers.js";
+import { assertHarnessConfigDirRootIsolated } from "./config-dir-root-isolation.js";
+import {
+  makeSessionRecord,
+  sessionFilePath,
+  withTempHome as withTempHomeFixture,
+  writeSessionRecordFile,
+} from "./runtime-test-helpers.js";
 
 /**
  * brick 0bac6a00 — THE INVOCATION: A + C(first-prompt), form 2 (interval timestamp).
@@ -57,6 +64,39 @@ function runCliUnguarded(args: string[], homeDir: string): Promise<CliResult> {
     child.stdin.end();
     child.once("close", (code) => resolve({ code, stdout, stderr }));
   });
+}
+
+/**
+ * ⚠️ WRITE RECORDS THROUGH THE FIXTURE, NEVER BY HAND. A hand-rolled JSON record
+ * missing a field `parseRecord` requires is dropped WHOLE, so `listSessions()`
+ * returns nothing and the sweep reports `scanned=0` — which is indistinguishable
+ * from "the sweep correctly spared it". Measured while writing these tests: a
+ * hand-written record made the CONTROL below pass for the wrong reason.
+ */
+async function seedIdleOpenSession(homeDir: string, id: string): Promise<void> {
+  await writeSessionRecordFile(
+    homeDir,
+    makeSessionRecord(
+      {
+        acpxRecordId: id,
+        acpSessionId: id,
+        agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+        agentName: "claude",
+        cwd: homeDir,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        lastUsedAt: "2026-01-01T00:00:00.000Z",
+        closed: false,
+      },
+      { defaultName: false, defaultAcpx: false },
+    ),
+  );
+}
+
+async function readClosed(homeDir: string, id: string): Promise<boolean | undefined> {
+  const raw = JSON.parse(await fs.readFile(sessionFilePath(homeDir, id), "utf8")) as {
+    closed?: boolean;
+  };
+  return raw.closed;
 }
 
 function plantAged(root: string, name: string): string {
@@ -287,4 +327,75 @@ test("0bac6a00 C: a SECOND prompt inside the interval does NOT sweep again", asy
       `the second prompt swept again — the interval gate is not on the path:\n${second.stderr}`,
     );
   });
+});
+
+// ---------------------------------------------------------------------------
+// REGRESSIONS THIS BRICK'S OWN GATE CAUGHT AT 2e10e4e — both from the trigger
+// ---------------------------------------------------------------------------
+
+test("0bac6a00 C: the prompt trigger NEVER closes a session record", async () => {
+  // ⚠️ THE REGRESSION, AND IT WAS WORSE THAN A RED TEST. The trigger originally ran
+  // the abandoned-RECORD sweep too, so a prompt MUTATED SESSION STATE as a side
+  // effect. Two gate failures showed the cost: it closed the very session being
+  // prompted (exit 1), and — the one that matters — with two sessions sharing a
+  // name it closed ONE, the ambiguity DISSOLVED, and a prompt the CLI must REFUSE
+  // was delivered to the agent at exit 0.
+  //
+  // A reap that runs on someone else's turn may READ state. It may not WRITE it.
+  await withTempHomeFixture("acpx-0bac6a00-noclose-", async (homeDir) => {
+    const root = process.env[HARNESS_CONFIG_DIR_ROOT_ENV] as string;
+    plantAged(root, "acpx-opencode-noclose-orphan");
+    await seedIdleOpenSession(homeDir, "idle-open");
+
+    await runCliUnguarded(["claude", "prompt", "--session", "no-such-session-zz", "hi"], homeDir);
+
+    assert.equal(
+      await readClosed(homeDir, "idle-open"),
+      false,
+      "the PROMPT path closed a session record",
+    );
+  });
+});
+
+test("0bac6a00 A: the explicit VERB still does close it — the control that keeps the test above honest", async () => {
+  // Without this, "the record stayed open" would also be true of a sweep that never
+  // ran at all, and the test above would pass against a completely broken trigger.
+  await withTempHomeFixture("acpx-0bac6a00-doesclose-", async (homeDir) => {
+    await seedIdleOpenSession(homeDir, "idle-open");
+
+    await runCliUnguarded(["claude", "sessions", "sweep-config-dirs"], homeDir);
+
+    assert.equal(
+      await readClosed(homeDir, "idle-open"),
+      true,
+      "the explicit verb did NOT close an ownerless record",
+    );
+  });
+});
+
+test("0bac6a00: a PROMPT is now guarded as sweep-capable, not just a prune", () => {
+  // ⚠️ THE OTHER HALF OF THE SAME MISTAKE. The scoping guard originally fired only
+  // on args containing "prune", because prune was the only verb that swept. Adding
+  // the trigger widened the surface that SWEEPS without widening the surface that
+  // is SCOPED — and the gate immediately drove a cli.test.ts prompt against
+  // `root=/tmp`, scanning the box's seven real acpx-pi-* directories. It removed
+  // nothing only because cc9a5f25's retention rule held: saved by the safety net is
+  // not the same as safe.
+  const saved = process.env[HARNESS_CONFIG_DIR_ROOT_ENV];
+  try {
+    delete process.env[HARNESS_CONFIG_DIR_ROOT_ENV];
+    assert.throws(
+      () => assertHarnessConfigDirRootIsolated(["claude", "prompt", "hello"]),
+      /no scoped config-dir root/,
+      "a prompt must be guarded — it reaches the sweep too",
+    );
+    // Still exempt, still for the same reason: it prints and exits.
+    assertHarnessConfigDirRootIsolated(["claude", "prompt", "--help"]);
+  } finally {
+    if (saved === undefined) {
+      delete process.env[HARNESS_CONFIG_DIR_ROOT_ENV];
+    } else {
+      process.env[HARNESS_CONFIG_DIR_ROOT_ENV] = saved;
+    }
+  }
 });

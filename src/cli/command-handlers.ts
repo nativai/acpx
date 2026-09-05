@@ -3720,11 +3720,14 @@ export async function handleSessionsPrune(
   }
 
   render.printPruneResultByFormat(result, globalFlags.format, scope);
+  // `true` — prune is the verb that already means "clean up after closed sessions",
+  // so closing ownerless records is what the operator asked for here.
   await sweepOrphanHarnessConfigDirs(
     session,
     flags.dryRun === true,
     globalFlags.verbose === true,
     flags.configDirRoot,
+    true,
   );
 }
 
@@ -3795,7 +3798,10 @@ async function maybeSweepHarnessConfigDirsOnPrompt(verbose: boolean): Promise<vo
       return;
     }
     const session = await loadSessionModule();
-    await sweepOrphanHarnessConfigDirs(session, false, verbose, undefined);
+    // `false` — READ-ONLY WITH RESPECT TO SESSION STATE. See the parameter's own
+    // comment: closing records from the prompt path delivered a prompt the CLI
+    // was supposed to refuse.
+    await sweepOrphanHarnessConfigDirs(session, false, verbose, undefined, false);
   } catch {
     // Deliberately silent: this is opportunistic tidy-up on someone else's turn,
     // and the census the sweep itself prints is where its outcome is reported.
@@ -3829,6 +3835,7 @@ export async function handleSessionsSweepConfigDirs(
     flags.dryRun === true,
     globalFlags.verbose === true,
     flags.configDirRoot,
+    true,
   );
 }
 
@@ -3853,6 +3860,37 @@ function withDryRunCloses(
   return records;
 }
 
+/**
+ * The abandoned-RECORD stage, lifted out so the sweep above reads as its two
+ * stages rather than as a conditional. Returns `undefined` when the caller is not
+ * permitted to close records — see `closeAbandonedRecords`, which is `false` for
+ * the prompt trigger and `true` for the two explicit verbs.
+ */
+async function maybeSweepAbandonedRecords(params: {
+  session: Awaited<ReturnType<typeof loadSessionModule>>;
+  liveScan: ReturnType<typeof scanLiveProcesses>;
+  dryRun: boolean;
+  verbose: boolean;
+  enabled: boolean;
+}): Promise<Awaited<ReturnType<typeof sweepAbandonedSessionRecords>> | undefined> {
+  if (!params.enabled) {
+    return undefined;
+  }
+  const result = await sweepAbandonedSessionRecords({
+    records: await params.session.listSessions(),
+    liveScan: params.liveScan,
+    // ⚠️ A DRY RUN MUST NOT CLOSE RECORDS EITHER — but it must still MODEL the
+    // closes, or the preview under-reports. `closed` is populated from the verdicts
+    // regardless of what this callback does, so a no-op yields exactly "the ids a
+    // real run would have closed".
+    closeSession: params.dryRun ? async () => undefined : (id) => params.session.closeSession(id),
+  });
+  if (params.verbose) {
+    process.stderr.write(describeAbandonedRecordSweep(result));
+  }
+  return result;
+}
+
 async function sweepOrphanHarnessConfigDirs(
   session: Awaited<ReturnType<typeof loadSessionModule>>,
   dryRun: boolean,
@@ -3865,6 +3903,32 @@ async function sweepOrphanHarnessConfigDirs(
    * argument. Undefined here keeps the real root, which is the correct default.
    */
   rootDir: string | undefined,
+  /**
+   * ⚠️ FALSE FOR THE OPPORTUNISTIC PROMPT TRIGGER, AND THAT DEFAULT IS A SAFETY
+   * PROPERTY, NOT A PERFORMANCE ONE — it is the fix for a regression this brick's
+   * own gate caught at 2e10e4e, and the failure was worse than a red test.
+   *
+   * The record sweep CLOSES ownerless records. That is correct for `prune` and for
+   * `sweep-config-dirs`, where the operator asked for a tidy-up. Running it from
+   * the PROMPT path made a prompt MUTATE SESSION STATE AS A SIDE EFFECT, and two
+   * gate failures showed what that costs:
+   *
+   *   - `cli.test.ts` W7-L12(c): the trigger closed the very session being prompted
+   *     (fixture records are long-idle by construction), so the prompt exited 1.
+   *   - `session-name-ambiguity.test.ts`: two sessions shared a name, the trigger
+   *     closed ONE of them, the ambiguity DISSOLVED, and **a prompt the CLI must
+   *     refuse was delivered to the agent — exit 0, sentinel payload through.**
+   *
+   * The second is the one that matters: an opportunistic tidy-up silently changed
+   * the outcome of a REFUSAL. A reap that runs on someone else's turn may read
+   * state; it may not write it.
+   *
+   * The cost of `false` is that the prompt trigger reaps less — only directories
+   * whose record is already closed, or unrecognised and past the age gate. That is
+   * the whole leak class it is aimed at, and the explicit verb still does the full
+   * two-stage job.
+   */
+  closeAbandonedRecords: boolean,
 ): Promise<void> {
   // ⚠️ A DRY RUN NO LONGER RETURNS HERE (CONCEPTION §5). It used to, which meant
   // the mode that needs no scope was the mode that never swept: the safest way to
@@ -3883,24 +3947,19 @@ async function sweepOrphanHarnessConfigDirs(
     // sweep retain every directory forever (measured on the rig: 206 records, 88
     // still open, each pinning a config dir). The fix is to close the ownerless
     // records — one layer up — NOT to relax the deletion rule below.
-    const recordSweep = await sweepAbandonedSessionRecords({
-      records: await session.listSessions(),
+    const recordSweep = await maybeSweepAbandonedRecords({
+      session,
       liveScan,
-      // ⚠️ A DRY RUN MUST NOT CLOSE RECORDS EITHER — but it must still MODEL the
-      // closes, or the preview under-reports. `closed` is populated from the
-      // verdicts regardless of what this callback does, so a no-op yields exactly
-      // "the ids a real run would have closed".
-      closeSession: dryRun ? async () => undefined : (id) => session.closeSession(id),
+      dryRun,
+      verbose,
+      enabled: closeAbandonedRecords,
     });
-    if (verbose) {
-      process.stderr.write(describeAbandonedRecordSweep(recordSweep));
-    }
 
     // Re-read AFTER the record sweep, so the directory pass sees the closes it
     // just made rather than the state that preceded them.
     const records = withDryRunCloses(
       knownRecordsById(await session.listSessions()),
-      dryRun ? recordSweep.closed : [],
+      dryRun && recordSweep !== undefined ? recordSweep.closed : [],
     );
     const swept = pruneOrphanHarnessConfigDirs({ records, liveScan, rootDir, dryRun });
     // ⚠️ PRINTED BY DEFAULT, NOT UNDER --verbose (CONCEPTION §7). Every population

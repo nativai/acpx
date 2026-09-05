@@ -8,15 +8,19 @@ import { HARNESS_CONFIG_DIR_ROOT_ENV } from "../src/acp/harness-config-dir-root.
  *
  * ## ⚠️ THE EXPOSURE THIS CLOSES, MEASURED RATHER THAN ASSERTED
  *
- * Every `acpx sessions prune` that is not `--dry-run` or `--help` ends by sweeping
- * per-session harness config dirs. Measured on this tree with a balanced-paren
- * scan of `test/` (positive-controlled against a planted fixture): **87 `runCli`
- * invocations carry `"prune"`, 10 are `--dry-run` and 2 are `--help`, so 75 reach
- * the sweep, 17 of them at `--whole-box`** — the broadest scope the verb has.
- * Until this module existed, all 75 resolved the root to the REAL SHARED `/tmp` of
- * whatever box the gate ran on: the sweep's `rootDir` was a function parameter the
- * CLI had no way to supply. **An isolated `HOME` does not scope it** — the root
- * comes from `tmpdir()`, not from the store.
+ * `acpx sessions prune` ends by sweeping per-session harness config dirs. Measured
+ * on this tree with a balanced-paren scan of `test/` (positive-controlled against a
+ * planted fixture): **87 `runCli` invocations carry `"prune"`, 10 are `--dry-run`
+ * and 2 are `--help`, so 75 reach the sweep, 17 of them at `--whole-box`** — the
+ * broadest scope the verb has. Until this module existed, all 75 resolved the root
+ * to the REAL SHARED `/tmp` of whatever box the gate ran on: the sweep's `rootDir`
+ * was a function parameter the CLI had no way to supply. **An isolated `HOME` does
+ * not scope it** — the root comes from `tmpdir()`, not from the store.
+ *
+ * ⚠️ **AND PRUNE IS NO LONGER THE ONLY SWEEPING VERB** — brick 0bac6a00 added the
+ * C(first-prompt) trigger and `sessions sweep-config-dirs`, so the count above is a
+ * FLOOR, not the population. See {@link reachesTheSweep}, which is why this module
+ * now treats every non-`--help` invocation as capable of sweeping.
  *
  * ## Why an ENV VAR and not a flag on each call site
  *
@@ -32,7 +36,7 @@ import { HARNESS_CONFIG_DIR_ROOT_ENV } from "../src/acp/harness-config-dir-root.
  *   - {@link beginIsolatedHarnessConfigDirRoot} — the SCOPING. Called by both
  *     temp-home fixtures, so anything spawned inside a temp home inherits it.
  *   - {@link assertHarnessConfigDirRootIsolated} — the GUARD. Called by the CLI-spawn
- *     helper of every file that invokes `prune`, so a prune added OUTSIDE a temp
+ *     helper of every file that drives the CLI, so an invocation made OUTSIDE a temp
  *     home fails loudly instead of quietly sweeping the box.
  *
  * The scoping alone would be silent when it stopped applying, which is the failure
@@ -95,9 +99,8 @@ export function isolatedHarnessConfigDirRoot(): string {
  * That is why the scoping is done HERE, from the isolated home the helper already
  * holds, rather than left to whichever fixture the file happens to use.
  *
- * `--help` is exempt (it never reaches the sweep). `--dry-run` is **not** exempt: a
- * dry run still reads the root, and after brick 0bac6a00 §5 it classifies
- * everything in it.
+ * `--help` is exempt (it prints and exits). `--dry-run` is **not** exempt: a dry run
+ * still reads the root, and after brick 0bac6a00 §5 it classifies everything in it.
  *
  * @param args    argv about to be spawned
  * @param env     the child's env object, MUTATED to carry an isolated root
@@ -109,7 +112,7 @@ export function scopeHarnessConfigDirRootForCli(
   env: NodeJS.ProcessEnv,
   homeDir: string,
 ): void {
-  if (!args.includes("prune") || args.includes("--help")) {
+  if (!reachesTheSweep(args)) {
     return;
   }
   // An explicit --config-dir-root on the invocation is the scoping, and it beats
@@ -131,7 +134,7 @@ export function assertHarnessConfigDirRootIsolated(
   args: readonly string[],
   env: NodeJS.ProcessEnv = process.env,
 ): void {
-  if (!args.includes("prune") || args.includes("--help")) {
+  if (!reachesTheSweep(args)) {
     return;
   }
   const explicitAt = args.indexOf("--config-dir-root");
@@ -139,17 +142,39 @@ export function assertHarnessConfigDirRootIsolated(
   const root = explicit ?? env[HARNESS_CONFIG_DIR_ROOT_ENV];
   if (root === undefined || root.trim().length === 0) {
     throw new Error(
-      `test invoked 'sessions prune' with no scoped config-dir root: the sweep would run against ` +
+      `test invoked '${args.join(" ")}' with no scoped config-dir root: the sweep would run against ` +
         `the box's real ${os.tmpdir()}. Spawn it through a runCli helper that calls ` +
         `scopeHarnessConfigDirRootForCli, or pass --config-dir-root.`,
     );
   }
   if (!isIsolatedRoot(root)) {
     throw new Error(
-      `test invoked 'sessions prune' with a config-dir root that is not an isolated temp path: ` +
+      `test invoked '${args.join(" ")}' with a config-dir root that is not an isolated temp path: ` +
         `${path.resolve(root)}. It must live UNDER ${path.resolve(os.tmpdir())}, never be it.`,
     );
   }
+}
+
+/**
+ * Which invocations can reach the config-dir sweep.
+ *
+ * ## ⚠️ THIS LIST GREW, AND THE WAY IT GREW IS THE LESSON
+ *
+ * It began as `prune` alone, because `prune` was the only verb that swept. Then
+ * brick 0bac6a00 added the C(first-prompt) trigger — and **widened the surface that
+ * sweeps without widening the surface that is scoped.** The gate found it
+ * immediately: a `cli.test.ts` prompt swept `root=/tmp`, the box's REAL temp dir,
+ * `scanned=7` against the seven live `acpx-pi-*` directories on this machine. It
+ * removed nothing only because `cc9a5f25`'s positive-ownership rule retained them
+ * all as `tooYoung` — i.e. it was saved by the safety net, which is not the same
+ * as being safe.
+ *
+ * ⇒ **Adding a trigger is adding an entry here.** The default is therefore
+ * deliberately INCLUSIVE: anything that is not provably incapable of sweeping is
+ * treated as capable. `--help` is the one exemption, because it prints and exits.
+ */
+function reachesTheSweep(args: readonly string[]): boolean {
+  return !args.includes("--help");
 }
 
 /**
