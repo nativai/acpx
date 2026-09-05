@@ -72,37 +72,97 @@ export function isolatedHarnessConfigDirRoot(): string {
 }
 
 /**
- * Refuse to spawn a `prune` that would sweep an unscoped root.
+ * Scope a CLI invocation about to be spawned, then verify it — the ONE call a
+ * `runCli` helper makes.
  *
- * ⚠️ THIS IS A BEHAVIOURAL GUARD, NOT A CONVENTION CHECK. It runs on the argv
- * about to be handed to `spawn`, so it cannot be satisfied by a comment, a naming
- * scheme or a file being present in someone's list. `--help` is exempt because it
- * never reaches the sweep; `--dry-run` is NOT exempt, because a dry run still
- * READS the root (and, after brick 0bac6a00's §5, classifies everything in it).
+ * ## ⚠️ IT CHECKS THE CHILD'S ENV, NOT THE PARENT'S, AND THAT DISTINCTION IS THE
+ * ## WHOLE POINT
+ *
+ * The sweep runs in the CHILD. An assertion about `process.env` measures the test
+ * runner, which is one inheritance step away from the process whose behaviour is at
+ * stake — and the step is exactly where it can go wrong: a helper that builds an env
+ * from scratch, drops the variable, or is written by someone who never read this
+ * file. So the argument here is the very object handed to `spawn`.
+ *
+ * ## The first thing this caught, on its first full run
+ *
+ * `cli.test.ts` has its **own local `withTempHome`**, a third one beside the two
+ * shared fixtures. Four prune tests there spawned with no scoped root, and
+ * `deletion-manifest.test.ts`'s T-ISO-4 — which deliberately pins HOME and
+ * ACPX_STATE_HOME to two *distinct* temp paths, outside any fixture — made five.
+ * **A version of this that only set the variable in the two fixtures I had found
+ * would have shipped, silently, with five unscoped sweeps of the real `/tmp`.**
+ * That is why the scoping is done HERE, from the isolated home the helper already
+ * holds, rather than left to whichever fixture the file happens to use.
+ *
+ * `--help` is exempt (it never reaches the sweep). `--dry-run` is **not** exempt: a
+ * dry run still reads the root, and after brick 0bac6a00 §5 it classifies
+ * everything in it.
+ *
+ * @param args    argv about to be spawned
+ * @param env     the child's env object, MUTATED to carry an isolated root
+ * @param homeDir the isolated home this invocation runs against — the root is
+ *                created inside it, so it is reaped with it
  */
-export function assertHarnessConfigDirRootIsolated(args: readonly string[]): void {
+export function scopeHarnessConfigDirRootForCli(
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+  homeDir: string,
+): void {
   if (!args.includes("prune") || args.includes("--help")) {
     return;
   }
   // An explicit --config-dir-root on the invocation is the scoping, and it beats
   // the environment in the resolver — so honour the same precedence here rather
   // than demanding both.
+  if (!args.includes("--config-dir-root") && !isIsolatedRoot(env[HARNESS_CONFIG_DIR_ROOT_ENV])) {
+    const root = path.join(homeDir, ISOLATED_ROOT_DIRNAME);
+    mkdirSync(root, { recursive: true });
+    env[HARNESS_CONFIG_DIR_ROOT_ENV] = root;
+  }
+  assertHarnessConfigDirRootIsolated(args, env);
+}
+
+/**
+ * The verification half, separable so it can be fire-tested in both directions
+ * without a spawn. Throws unless this invocation is provably scoped.
+ */
+export function assertHarnessConfigDirRootIsolated(
+  args: readonly string[],
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  if (!args.includes("prune") || args.includes("--help")) {
+    return;
+  }
   const explicitAt = args.indexOf("--config-dir-root");
   const explicit = explicitAt === -1 ? undefined : args[explicitAt + 1];
-  const root = explicit ?? process.env[HARNESS_CONFIG_DIR_ROOT_ENV];
+  const root = explicit ?? env[HARNESS_CONFIG_DIR_ROOT_ENV];
   if (root === undefined || root.trim().length === 0) {
     throw new Error(
       `test invoked 'sessions prune' with no scoped config-dir root: the sweep would run against ` +
-        `the box's real ${os.tmpdir()}. Run it inside withTempHome (which sets ` +
-        `${HARNESS_CONFIG_DIR_ROOT_ENV}) or pass --config-dir-root.`,
+        `the box's real ${os.tmpdir()}. Spawn it through a runCli helper that calls ` +
+        `scopeHarnessConfigDirRootForCli, or pass --config-dir-root.`,
     );
+  }
+  if (!isIsolatedRoot(root)) {
+    throw new Error(
+      `test invoked 'sessions prune' with a config-dir root that is not an isolated temp path: ` +
+        `${path.resolve(root)}. It must live UNDER ${path.resolve(os.tmpdir())}, never be it.`,
+    );
+  }
+}
+
+/**
+ * Under the real temp dir, and not the real temp dir itself.
+ *
+ * ⚠️ THE SECOND CLAUSE IS THE LOAD-BEARING ONE. `tmpdir()` is the exact value the
+ * defect resolved to, so accepting it would make the guard agree with the bug.
+ */
+function isIsolatedRoot(root: string | undefined): boolean {
+  if (root === undefined || root.trim().length === 0) {
+    return false;
   }
   const resolved = path.resolve(root);
   const realTmp = path.resolve(os.tmpdir());
-  if (resolved === realTmp || !resolved.startsWith(`${realTmp}${path.sep}`)) {
-    throw new Error(
-      `test invoked 'sessions prune' with a config-dir root that is not an isolated temp path: ` +
-        `${resolved}. It must live UNDER ${realTmp}, never be ${realTmp} itself.`,
-    );
-  }
+  return resolved !== realTmp && resolved.startsWith(`${realTmp}${path.sep}`);
 }

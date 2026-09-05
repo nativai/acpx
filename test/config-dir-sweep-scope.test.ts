@@ -12,6 +12,7 @@ import {
 import {
   assertHarnessConfigDirRootIsolated,
   isolatedHarnessConfigDirRoot,
+  scopeHarnessConfigDirRootForCli,
 } from "./config-dir-root-isolation.js";
 import { withTempHome as withTempHomeFixture } from "./runtime-test-helpers.js";
 
@@ -286,4 +287,69 @@ test("0bac6a00 §4: the temp-home fixture is what scopes the suite, and it scope
       "the CLI child did not inherit the fixture's config-dir root",
     );
   });
+});
+
+test("0bac6a00 §4: the spawn-time scoping writes an isolated root INTO THE CHILD'S env", () => {
+  // ⚠️ THIS IS THE CASE THE FIRST FULL GATE FOUND. `cli.test.ts` has its own local
+  // withTempHome, and deletion-manifest's T-ISO-4 runs outside any fixture — five
+  // prunes that a fixture-only scoping left pointed at the real /tmp. Scoping from
+  // the helper's own isolated home covers all of them, whatever fixture they use.
+  const home = mkdtempSync(join(tmpdir(), "acpx-0bac6a00-child-"));
+  const saved = process.env[HARNESS_CONFIG_DIR_ROOT_ENV];
+  try {
+    delete process.env[HARNESS_CONFIG_DIR_ROOT_ENV];
+    const env: NodeJS.ProcessEnv = { HOME: home };
+    scopeHarnessConfigDirRootForCli(["claude", "sessions", "prune", "--whole-box"], env, home);
+    const root = env[HARNESS_CONFIG_DIR_ROOT_ENV];
+    assert.ok(root !== undefined, "the child env carries no root");
+    assert.ok(root.startsWith(`${home}${sep}`), `root ${root} is not inside the isolated home`);
+    assert.ok(existsSync(root), "the root was set but never created — the sweep would not measure");
+    // The PARENT is deliberately untouched: scoping the child is the property,
+    // and a helper that leaked into process.env would make sibling tests depend
+    // on execution order.
+    assert.equal(process.env[HARNESS_CONFIG_DIR_ROOT_ENV], undefined);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    if (saved === undefined) {
+      delete process.env[HARNESS_CONFIG_DIR_ROOT_ENV];
+    } else {
+      process.env[HARNESS_CONFIG_DIR_ROOT_ENV] = saved;
+    }
+  }
+});
+
+test("0bac6a00 §4: the spawn-time scoping leaves an EXPLICIT --config-dir-root alone", () => {
+  const home = mkdtempSync(join(tmpdir(), "acpx-0bac6a00-explicit-"));
+  const chosen = mkdtempSync(join(tmpdir(), "acpx-0bac6a00-chosen-"));
+  try {
+    const env: NodeJS.ProcessEnv = {};
+    scopeHarnessConfigDirRootForCli(
+      ["claude", "sessions", "prune", "--config-dir-root", chosen],
+      env,
+      home,
+    );
+    // The flag outranks the env in the resolver; silently adding a second root
+    // here would make the child's behaviour depend on a precedence the caller
+    // never asked about.
+    assert.equal(env[HARNESS_CONFIG_DIR_ROOT_ENV], undefined);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(chosen, { recursive: true, force: true });
+  }
+});
+
+test("0bac6a00 §4: the spawn-time scoping touches nothing for `--help` or a non-prune verb", () => {
+  const home = mkdtempSync(join(tmpdir(), "acpx-0bac6a00-noop-"));
+  try {
+    for (const args of [
+      ["claude", "sessions", "prune", "--help"],
+      ["claude", "sessions", "list"],
+    ]) {
+      const env: NodeJS.ProcessEnv = {};
+      scopeHarnessConfigDirRootForCli(args, env, home);
+      assert.equal(env[HARNESS_CONFIG_DIR_ROOT_ENV], undefined, args.join(" "));
+    }
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
