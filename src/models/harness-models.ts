@@ -51,10 +51,24 @@ function claudeEffortCeiling(alias: string): CanonicalDepthLevel {
   return !a || a === "default" || a.includes("opus") || a.includes("fable") ? "max" : "high";
 }
 
-/** acpx-ui `codexEffortCeiling` (:371). An unknown family falls to the conservative `xhigh` floor. */
+/**
+ * acpx-ui `codexEffortCeiling` (:371). An unknown family falls to the conservative `xhigh` floor.
+ *
+ * ⚠️ THAT FLOOR IS WHY A NEW FAMILY MUST BE ADDED HERE AND IN {@link CODEX_FAMILIES} AS ONE CHANGE.
+ * Adding the family alone is WORSE than omitting it: the model becomes selectable and then silently
+ * caps at `xhigh`, so a rung the adapter genuinely advertises is unreachable with nothing erroring.
+ * Omitting it entirely at least fails LOUD (`MODEL_SLUG_UNKNOWN` at the `--model` gate). Over-ask is
+ * loud, under-ask is silent — so "when unsure, cap lower" is the direction that quietly deletes
+ * capability, which inverts the usual instinct this map otherwise teaches.
+ */
 function codexEffortCeiling(family: string): CanonicalDepthLevel {
   const f = family.trim().toLowerCase();
-  if (f === "gpt-5.6-sol" || f === "gpt-5.6-terra") {
+  // gpt-6-astra advertises SIX rungs (low…ultra) — measured on the ACP wire against
+  // codex-acp 42987b87 / @openai/codex 0.153.3, which advertises 7 families / 35 ids with astra
+  // as the sole delta from 0.144.1. OpenAI's published model page lists only FIVE and omits
+  // `ultra`; the docs are WRONG and the wire is authoritative here, because acpx gates against
+  // what the adapter advertises. Do NOT "correct" astra back to `max` on the strength of the docs.
+  if (f === "gpt-5.6-sol" || f === "gpt-5.6-terra" || f === "gpt-6-astra") {
     return "ultra";
   }
   if (f === "gpt-5.6-luna") {
@@ -118,6 +132,12 @@ const CLAUDE_PTY_ALIASES: { id: string; name: string }[] = [
  */
 const CODEX_FAMILIES: { id: string; name: string }[] = [
   { id: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
+  // gpt-6-astra — an OpenAI FLAGSHIP model, not a Codex-branded one (there is no `codex-astra`
+  // slug; the Codex-branded line is gpt-5.3-codex*). Requires codex >= 0.153.1; our adapter pins
+  // 0.153.3. Its ceiling arm in codexEffortCeiling() above is part of THIS entry — see the warning
+  // there before adding any future family. Deliberately NOT first: acpx-ui's mirror of this table
+  // treats index 0 as the client-side create-time default, and Astra is opt-in.
+  { id: "gpt-6-astra", name: "GPT-6 Astra" },
   { id: "gpt-5.6-terra", name: "GPT-5.6 Terra" },
   { id: "gpt-5.6-luna", name: "GPT-5.6 Luna" },
   { id: "gpt-5.5", name: "GPT-5.5" },
