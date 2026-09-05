@@ -530,9 +530,35 @@ test("the routed lists are the ones the shipped code has branches for", () => {
     ["set-model", "compose-into-id", "config-option"],
   );
   assert.deepEqual([...DEPTH_MECHANISMS_ROUTED_BY_ACPX], ["config-option", "mode"]);
-  // Still empty: `provisioned` needs the per-session config dir to GENERATE a
-  // catalogue fragment before an arbitrary slug can be advertised, and
-  // `via-shim` needs the OpenRouter shim to take a model from the picker. Until
-  // then the picker must not offer a band that fails at spawn.
+  // ⚠️ EMPTY IS THE MECHANISM HERE, NOT A LEFTOVER — and nothing superseded this
+  // list. It must STAY empty, which is why the assertion below is a guard rather
+  // than a snapshot.
+  //
+  // The reason it once gave for `provisioned` is now FALSE: it said the
+  // per-session config dir had to GENERATE a catalogue fragment first, and B5
+  // shipped exactly that — acpx DOES provision for pi today. What did not change
+  // is that `provisioned` must not be listed HERE, because this is a list of
+  // KINDS and provisioning is answered PER HARNESS:
+  //
+  //   - `ARBITRARY_MODEL_SUPPORT_ROUTED_BY_ACPX` (harness-capabilities.ts:337)
+  //     stays empty by design; its own comment at :338-350 carries the argument.
+  //   - `ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR = ["pi"]` (:360) is a SECOND,
+  //     per-harness constant added beside it, and is what actually says acpx
+  //     provisions for pi.
+  //   - the derivation at :421-423 consults that second list, so the question is
+  //     answered per harness rather than per kind.
+  //
+  // ⚠️ WHY THE SPLIT EXISTS AT ALL, since it is what a future reader would
+  // "simplify": each harness has its own config format and its own merge
+  // semantics. pi's `models-store.json` is MEASURED to merge by id; whether
+  // opencode deep-merges or REPLACES an existing
+  // `provider.openrouter.models.<slug>` entry is NOT measured. Listing the KIND
+  // would switch BOTH on from one harness's measurement, and opencode's picker
+  // would then offer a band acpx does not provision for. That is the bug the
+  // split corrected.
+  //
+  // `via-shim` is still genuinely unshipped — the OpenRouter shim would have to
+  // take a model from the picker rather than from the profile (CONCEPTION §7.4,
+  // §11 Q1) — so that half of the old rationale still holds.
   assert.deepEqual([...ARBITRARY_MODEL_SUPPORT_ROUTED_BY_ACPX], []);
 });
