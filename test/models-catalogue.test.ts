@@ -268,10 +268,27 @@ test("merge: codex families are mandatory-depth, because a bare family is reject
  * advertised at NEITHER 0.144.1 NOR 0.153.3 — phantom rows that `acpx models
  * show` printed with a full ladder and that no `--model` form could spawn.
  *
- * At `0.153.3` the advertised set is these six PLUS `gpt-6-astra` (35 ids over
- * seven families) — no family retired, none returned. So when the pin moves,
- * this expectation gains a row; if it needs to LOSE one, something happened that
- * is worth understanding before editing the constant.
+ * THE PIN HAS MOVED, AND THIS EXPECTATION GAINED ITS ROW — 2026-09-05, adapter
+ * `codex-acp 42987b87` / `@openai/codex ^0.153.3`: the advertised set is those
+ * six PLUS `gpt-6-astra` (35 ids over seven families), no family retired and
+ * none returned. `gpt-6-astra` sits at index 1 because the constant places it
+ * there deliberately — acpx-ui's mirror treats index 0 as the create-time
+ * default and Astra is opt-in — so this list asserts ORDER as well as membership.
+ *
+ * ⚠️ THIS ROW WENT RED FOR THE RIGHT REASON AND ITS OWN TEXT SAID WHAT TO DO.
+ * The previous version of this comment ended "so when the pin moves, this
+ * expectation gains a row". The pin moved at 2026-09-05T01:22Z (the bump merged
+ * into the program branch) and nothing added the row: the constant was corrected
+ * on `main` by a different lane, and this expectation — which encodes the SAME
+ * measurement — was not, so the two contradicted until the composition was gated.
+ * A rule written into a comment has a reader, never an agent. If a future reader
+ * finds this list disagreeing with the constant again, the constant is not
+ * automatically right: BOTH are transcriptions of one wire measurement, and
+ * brick://8ca68c82 (sourcing the catalogue from the advertisement) is the fix
+ * that removes the second copy.
+ *
+ * If it ever needs to LOSE a row, something happened that is worth understanding
+ * before editing the constant.
  */
 test("codex families are exactly the set the measured adapter advertises", () => {
   assert.deepEqual(
@@ -280,6 +297,7 @@ test("codex families are exactly the set the measured adapter advertises", () =>
       .map((model) => model.id),
     [
       "gpt-5.6-sol",
+      "gpt-6-astra",
       "gpt-5.6-terra",
       "gpt-5.6-luna",
       "gpt-5.5",
