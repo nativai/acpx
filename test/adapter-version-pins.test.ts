@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { HARNESS_IDS } from "../src/acp/harness-capabilities.js";
-import { AGENT_REGISTRY } from "../src/agent-registry.js";
+import { ACP_ADAPTER_PACKAGE_RANGES, AGENT_REGISTRY } from "../src/agent-registry.js";
 
 // 0ededc52 — every npx-launched adapter names a version.
 //
@@ -99,6 +99,24 @@ test("0ededc52: a caret pin appears ONLY on 0.0.x, where npm makes it exact", ()
       `${agent} (${pkg}) pins "${spec}" — a caret is only exact on 0.0.x; use a bare version`,
     );
   }
+});
+
+test("0ededc52: the pin table holds ONLY adapters the registry actually launches by npx", () => {
+  // ⚠️ THE ROW A DEAD ENTRY WOULD HAVE FAILED. `codex: "^0.0.44"` sat here
+  // referenced by nothing, naming a version the deployed build was already past
+  // (`/opt/codex-acp` is 0.0.45) — a version claim that governed no behaviour and
+  // could not be shown to have expired, in the pinning table itself. claude,
+  // claude-pty and codex are `/opt` builds; a row for any of them reads as a pin
+  // while pinning nothing, which is exactly how that entry arose.
+  const npxLaunched = new Set<string>();
+  for (const [agent, command] of Object.entries(AGENT_REGISTRY)) {
+    if (/\bnpx\b/.test(command)) {
+      npxLaunched.add(agent);
+    }
+  }
+  assert.ok(npxLaunched.size > 0, "population: no npx-launched agents — the matcher is broken");
+  const orphans = Object.keys(ACP_ADAPTER_PACKAGE_RANGES).filter((key) => !npxLaunched.has(key));
+  assert.deepEqual(orphans, [], `these pin-table rows govern nothing: ${orphans.join(", ")}`);
 });
 
 test("0ededc52: the pinned opencode version is the one the descriptor claims were measured on", () => {

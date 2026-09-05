@@ -30,7 +30,22 @@ import { fileURLToPath } from "node:url";
  */
 export const ACP_ADAPTER_PACKAGE_RANGES = {
   pi: "^0.0.33",
-  codex: "^0.0.44",
+  // ⚠️ `codex: "^0.0.44"` WAS HERE AND IS REMOVED — it was a stale pin that
+  // pinned nothing. It was referenced NOWHERE (codex launches from the built
+  // `/opt/codex-acp`, not from npm), and it named a version the deployed build
+  // was already past: `/opt/codex-acp` is `0.0.45`. So it was a version claim
+  // that governed no behaviour and could not be shown to have expired — exactly
+  // what `measuredAgainst` (brick 4791a88c) exists to eliminate, sitting in the
+  // pinning table itself.
+  //
+  // It is REMOVED rather than corrected because there is nothing to correct it
+  // TO: no npm spec governs a container-built artifact. Codex's version claim
+  // lives where it can be checked — `HARNESS_FACTS.codex.measuredAgainst`, which
+  // names the commit and the bundled CLI and says how to re-derive both.
+  //
+  // ⚠️ THIS TABLE IS FOR npx-LAUNCHED ADAPTERS ONLY. claude, claude-pty and codex
+  // are `/opt` builds and must not gain rows here; a row for one of them would
+  // read as a pin while governing nothing, which is how this entry arose.
   /**
    * ⚠️ BARE, NOT `^1.18.28` — see the caret rule above. opencode-ai is a 1.x
    * package, so a caret here would accept every later 1.x and the row would read
