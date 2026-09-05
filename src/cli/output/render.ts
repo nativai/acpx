@@ -3,7 +3,12 @@ import { resolveAcpxUiBaseUrl } from "../../acp/auth-env.js";
 import { consumeAutoSubscriptionSelection } from "../../runtime/engine/auto-subscription.js";
 import { effectiveTemplateSlug } from "../../session/persistence/template-slug.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
-import type { AgentSessionListResult, OutputFormat, SessionRecord } from "../../types.js";
+import type {
+  AgentSessionListResult,
+  OutputFormat,
+  SessionEnsureResult,
+  SessionRecord,
+} from "../../types.js";
 import { probeQueueOwnerHealth } from "../queue/ipc.js";
 import type { SessionCloseDrainReport } from "../session/session-control.js";
 import { emitJsonResult } from "./json-output.js";
@@ -16,7 +21,11 @@ function formatSessionLabel(record: SessionRecord): string {
 // spawning agent gets the child's address directly. Reuses the box-base resolver
 // the rest of the CLI uses (env override → namespace-derived → devbox default).
 function composeSessionUrl(record: SessionRecord): string {
-  return `${resolveAcpxUiBaseUrl(process.env)}/?session=${record.acpxRecordId}`;
+  return composeSessionUrlForId(record.acpxRecordId);
+}
+
+function composeSessionUrlForId(acpxRecordId: string): string {
+  return `${resolveAcpxUiBaseUrl(process.env)}/?session=${acpxRecordId}`;
 }
 
 function formatRoutedFrom(sessionCwd: string, currentCwd: string): string | undefined {
@@ -292,10 +301,42 @@ export function printCopiedSessionByFormat(
   }
 }
 
+// brick://16712ece — `sessions reopen`. `reopened:false` is the idempotent
+// "already open" outcome, not a failure, and must stay distinguishable from a
+// real revive so a script can tell whether it changed anything.
+export function printReopenedSessionByFormat(
+  record: SessionRecord,
+  reopened: boolean,
+  format: OutputFormat,
+): void {
+  if (
+    emitJsonResult(format, {
+      action: "session_reopened",
+      reopened,
+      acpxRecordId: record.acpxRecordId,
+      acpxSessionId: record.acpSessionId,
+      agentSessionId: record.agentSessionId,
+      name: record.name,
+      closed: record.closed === true,
+    })
+  ) {
+    return;
+  }
+
+  if (format === "quiet") {
+    process.stdout.write(`${record.acpxRecordId}\n`);
+    return;
+  }
+
+  const action = reopened ? "reopened" : "already open";
+  process.stdout.write(`${record.acpxRecordId}\t(${action})\n`);
+}
+
 export function printEnsuredSessionByFormat(
   record: SessionRecord,
   created: boolean,
   format: OutputFormat,
+  createdBecauseClosed?: SessionEnsureResult["createdBecauseClosed"],
 ): void {
   if (
     emitJsonResult(format, {
@@ -305,6 +346,11 @@ export function printEnsuredSessionByFormat(
       acpxSessionId: record.acpSessionId,
       agentSessionId: record.agentSessionId,
       name: record.name,
+      // brick://16712ece — ADDITIVE. Absent on every pre-existing shape, so the
+      // `--format json` consumers this feature exists to protect (the nightly
+      // intaker re-bake among them) keep parsing unchanged; a script that wants
+      // the signal reads one new key instead of scraping stderr.
+      ...(createdBecauseClosed ? { createdBecauseClosed } : {}),
     })
   ) {
     return;
@@ -317,6 +363,41 @@ export function printEnsuredSessionByFormat(
 
   const action = created ? "created" : "existing";
   process.stdout.write(`${record.acpxRecordId}\t(${action})\n`);
+}
+
+/**
+ * brick://16712ece — `sessions ensure` created a NEW session while a CLOSED one
+ * of the same name/cwd/agent existed.
+ *
+ * STDERR, always — including under `--format json`. That is a hard constraint,
+ * not a style choice: the caller this warning protects most (the nightly
+ * intaker re-bake, `sessions ensure -s tmpl:intaker-bake --format json`) PARSES
+ * stdout, so putting the warning there would break the legitimate caller in the
+ * name of protecting the illegitimate one.
+ *
+ * ⚠️ EVERY ROUTE NAMED HERE MUST EXIST. This whole brick is the fallout of a
+ * closed-session message that kept naming `reopen-and-deliver` behaviour after
+ * it was removed; a "helpful" pointer at a verb nobody built costs an operator
+ * more than silence. The regression guard is the TEXT assertion in
+ * test/session-closed-recovery.test.ts — if you change the wording, change it
+ * there too, and if you add a route, add it only once it ships.
+ */
+export function warnEnsureCreatedOverClosed(
+  record: SessionRecord,
+  closed: NonNullable<SessionEnsureResult["createdBecauseClosed"]>,
+): void {
+  const label = closed.nearestName ?? closed.nearestRecordId;
+  const others = closed.count > 1 ? ` (${closed.count} closed matches; newest shown)` : "";
+  const lines = [
+    `⚠️  acpx: created a NEW EMPTY session ${record.acpxRecordId} — a CLOSED session of the same name/cwd already existed${others}.`,
+    `    Its history is NOT carried over. Closed session: ${label} (${closed.nearestRecordId}).`,
+    `    If you meant to REVIVE that one instead of starting over, reopen it:`,
+    `      acpx sessions reopen ${closed.nearestRecordId}`,
+    `      # or, to reopen AND deliver in one step:`,
+    `      send-message.sh --reopen ${composeSessionUrlForId(closed.nearestRecordId)} '<text>'`,
+    `    If a fresh session was what you wanted, nothing is wrong — this is only a notice.`,
+  ];
+  process.stderr.write(`${lines.join("\n")}\n`);
 }
 
 export function printQueuedPromptByFormat(

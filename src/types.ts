@@ -1046,6 +1046,25 @@ export type SessionSetModelResult = {
 export type SessionEnsureResult = {
   record: SessionRecord;
   created: boolean;
+  /**
+   * brick://16712ece — present ONLY when `created` is true AND the directory
+   * walk had CLOSED same-scope matches it could not see.
+   *
+   * `ensure` cannot tell "recover my session" from "give me a fresh one" apart:
+   * the nightly intaker re-bake legitimately ensures a fixed name whose previous
+   * record is closed and MUST get a new session, while an operator recovering a
+   * closed worker must NOT silently land in an empty one. So `ensure` keeps
+   * creating and reports the ambiguity instead of guessing — additive, so the
+   * `--format json` consumers this protects keep parsing unchanged.
+   */
+  createdBecauseClosed?: {
+    /** How many closed same-scope records the walk skipped. */
+    count: number;
+    /** The newest of them — the one an operator most likely meant to revive. */
+    nearestRecordId: string;
+    /** Its display name, when it had one. */
+    nearestName?: string;
+  };
 };
 
 export type AgentSessionListResult = {

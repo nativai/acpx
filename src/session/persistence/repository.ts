@@ -1161,6 +1161,63 @@ export async function findSessionByDirectoryWalk(
 }
 
 /**
+ * The CLOSED counterpart of {@link findSessionByDirectoryWalk}: walk the same
+ * path and report the CLOSED entries that would have matched, newest first.
+ *
+ * Exists for `ensureSession`'s create-because-closed warning (brick://16712ece).
+ * `findSessionByDirectoryWalk` filters closed entries out at
+ * {@link matchesSessionEntry} (`includeClosed` defaults false), so a closed
+ * match is invisible to `ensureSession` and it falls through to `createSession`
+ * with rc=0 and no signal — an operator who meant RECOVERY silently lands in a
+ * fresh empty session with the history abandoned.
+ *
+ * ⚠️ DO NOT "improve" this into a resolution that throws on multiple matches
+ * the way the open walk does. It reports a COUNT, and a fixed name accumulating
+ * many closed records is the ORDINARY shape of legitimate automation, not an
+ * ambiguity: measured 2026-09-05 on devbox's production index, the nightly
+ * intaker re-bake (`intaker-refresh-charter.md` step 2, which ensures
+ * `-s tmpl:intaker-bake` in a fixed cwd) had left 38 same-name records, all 38
+ * closed and 0 open. Throwing here would abort that job every night — which is
+ * exactly why `ensure` warns instead of refusing. The regression guard is
+ * "warns and still creates with MANY closed same-name matches" in
+ * test/session-closed-recovery.test.ts.
+ */
+export async function findClosedSessionsByDirectoryWalk(
+  options: FindSessionByDirectoryWalkOptions,
+): Promise<SessionIndexEntry[]> {
+  const normalizedName = normalizeName(options.name);
+  const normalizedStart = absolutePath(options.cwd);
+  const normalizedBoundary = absolutePath(options.boundary ?? normalizedStart);
+  const walkBoundary = isWithinBoundary(normalizedBoundary, normalizedStart)
+    ? normalizedBoundary
+    : normalizedStart;
+  const sessions = (await loadSessionIndexEntries()).filter((session) =>
+    matchesAgentIdentity(session, options.agentCommand, options.agentName),
+  );
+
+  let current = normalizedStart;
+  const walkRoot = path.parse(current).root;
+
+  for (;;) {
+    // Same shadowing rule as the open walk: the DEEPEST level with a match wins,
+    // so a closed session in an ancestor cwd is not reported when a nearer one
+    // exists.
+    const matches = sessions.filter(
+      (session) => session.closed && matchesSessionEntry(session, current, normalizedName, true),
+    );
+    if (matches.length > 0) {
+      return matches.toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
+    }
+
+    const parent = nextWalkParent(current, walkBoundary, walkRoot);
+    if (!parent) {
+      return [];
+    }
+    current = parent;
+  }
+}
+
+/**
  * Resolve an explicitly supplied display name from index entries, hydrating
  * only the unique exact candidate. Callers decide whether this query is local
  * (pass cwd) or global (omit cwd).

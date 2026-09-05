@@ -40,6 +40,27 @@ export class SessionNotFoundError extends AcpxOperationalError {
 
 export class SessionResolutionError extends AcpxOperationalError {}
 
+/**
+ * brick://16712ece — ⚠️ THIS MESSAGE IS TESTED, WORD BY ROUTE. Every route it
+ * names must EXIST, and every route that exists and an operator can reach from
+ * a CLI must be named.
+ *
+ * The text this replaced said *"deliver a message to its session URL to
+ * **reopen-and-deliver**"* — a behaviour that had already been REMOVED
+ * (brick://8f3aaa73's no-auto-reopen rule): a plain delivery to a closed session
+ * is now rejected `409 SESSION_CLOSED`, and reopening needs `--reopen`, which
+ * the old text never mentioned. So the refusal handed the operator two routes,
+ * of which one (acpx-ui's button) needs a browser and the other simply did not
+ * work — measured, and it is the defect this brick is named for.
+ *
+ * It survived because NOTHING TESTED THE TEXT; worse, the one assertion that
+ * touched it PINNED THE OLD REALITY (`assert.doesNotMatch(message,
+ * /sessions reopen/)`), so the message could only ever go staler. The guard is
+ * now the other way round in test/session-closed-recovery.test.ts: the message
+ * must name `sessions reopen` and `--reopen`, and must NOT re-acquire the
+ * removed `reopen-and-deliver` promise. If you change a recovery route, change
+ * it here and there in the same commit.
+ */
 export class SessionClosedError extends AcpxOperationalError {
   readonly sessionId: string;
   readonly sessionName: string | undefined;
@@ -47,7 +68,10 @@ export class SessionClosedError extends AcpxOperationalError {
   constructor(sessionId: string, sessionName: string | undefined) {
     const label = sessionName ?? sessionId;
     super(
-      `Session '${label}' is closed. Reopen it in acpx-ui (Reopen button), or deliver a message to its session URL to reopen-and-deliver before sending CLI prompts.`,
+      `Session '${label}' is closed; prompts are rejected until it is reopened. ` +
+        `Reopen it with \`acpx sessions reopen ${sessionId}\`, or click Reopen in acpx-ui. ` +
+        `To reopen and deliver in one step, use \`send-message.sh --reopen <session-url> '<text>'\` — ` +
+        `a plain delivery to a closed session does NOT reopen it, it is rejected with 409 SESSION_CLOSED.`,
       {
         outputCode: "RUNTIME",
         detailCode: "SESSION_CLOSED",

@@ -45,6 +45,7 @@ import {
 import { persistSessionOwnerOptions } from "../../session/owner-options.js";
 import {
   absolutePath,
+  findClosedSessionsByDirectoryWalk,
   findGitRepositoryRoot,
   findSessionByDirectoryWalk,
   isoNow,
@@ -841,6 +842,19 @@ export async function ensureSession(options: SessionEnsureOptions): Promise<Sess
     };
   }
 
+  // brick://16712ece — the walk above filters CLOSED entries out, so a closed
+  // same-scope session is invisible here and we are about to create a fresh one
+  // over the top of it. Probe for what it could not see BEFORE creating, so the
+  // caller can say so; creating first would let the new record's own entry
+  // muddy the answer.
+  const closedMatches = await findClosedSessionsByDirectoryWalk({
+    agentCommand: options.agentCommand,
+    agentName: options.agentName,
+    cwd,
+    name: options.name,
+    boundary: walkBoundary,
+  });
+
   const record = await createSession({
     agentCommand: options.agentCommand,
     agentName: options.agentName,
@@ -862,9 +876,19 @@ export async function ensureSession(options: SessionEnsureOptions): Promise<Sess
     sessionOptions: options.sessionOptions,
   });
 
+  const nearest = closedMatches[0];
   return {
     record,
     created: true,
+    ...(nearest
+      ? {
+          createdBecauseClosed: {
+            count: closedMatches.length,
+            nearestRecordId: nearest.acpxRecordId,
+            ...(nearest.name === undefined ? {} : { nearestName: nearest.name }),
+          },
+        }
+      : {}),
   };
 }
 

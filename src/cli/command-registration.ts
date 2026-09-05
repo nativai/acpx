@@ -16,6 +16,7 @@ import {
   handleSessionsOwnerStatus,
   handleSessionsPrune,
   handleSessionsRecover,
+  handleSessionsReopen,
   handleSessionsRepairAccountSeam,
   handleSessionsSetMetadata,
   handleSessionsShow,
@@ -398,6 +399,24 @@ export function registerSessionsCommand(
     )
     .action(async function (this: Command, flags: SessionsCopyFlags) {
       await handleSessionsCopy(explicitAgentName, flags, this, config);
+    });
+
+  // brick://16712ece — the CLI-reachable inverse of `sessions close`. Registered
+  // beside `recover` on purpose: they read as synonyms and are not. `recover`
+  // kills a wedged queue owner and leaves `closed` untouched; `reopen` flips the
+  // lifecycle bit and spawns nothing.
+  sessionsCommand
+    .command("reopen")
+    .description(
+      "Reopen a CLOSED session so prompts are accepted again (the inverse of `sessions close`; the next prompt cold-respawns its owner). Idempotent — an already-open session exits 0 with reopened=false. NOT `sessions recover`, which restarts a wedged owner and leaves the session closed.",
+    )
+    .argument(
+      "<id>",
+      "Session id (acpx record id, ACP session id, or unique suffix)",
+      (value: string) => parseNonEmptyValue("Session id", value),
+    )
+    .action(async function (this: Command, id: string) {
+      await handleSessionsReopen(explicitAgentName, id, this, config);
     });
 
   sessionsCommand

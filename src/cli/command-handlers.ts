@@ -3109,8 +3109,10 @@ export async function handleSessionsEnsure(
       agentName: effectiveAgent.agentName,
     });
   }
-  const [{ ensureSession }, { printCreatedSessionBanner, printEnsuredSessionByFormat }] =
-    await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
+  const [
+    { ensureSession },
+    { printCreatedSessionBanner, printEnsuredSessionByFormat, warnEnsureCreatedOverClosed },
+  ] = await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
   const result = await ensureSession(
     buildSessionStartOptions({
       agent: effectiveAgent,
@@ -3134,7 +3136,21 @@ export async function handleSessionsEnsure(
     );
   }
 
-  printEnsuredSessionByFormat(result.record, result.created, globalFlags.format);
+  printEnsuredSessionByFormat(
+    result.record,
+    result.created,
+    globalFlags.format,
+    result.createdBecauseClosed,
+  );
+
+  // brick://16712ece — (c) "create, but say so". `ensure` cannot distinguish an
+  // operator recovering a closed session from automation that legitimately wants
+  // a fresh one under a fixed name, so it keeps creating and reports the
+  // ambiguity on STDERR. Emitted AFTER the stdout result so a `--format json`
+  // consumer's parse is never interleaved.
+  if (result.createdBecauseClosed) {
+    warnEnsureCreatedOverClosed(result.record, result.createdBecauseClosed);
+  }
 }
 
 function userContentToText(content: SessionUserContent): string {
@@ -3903,6 +3919,31 @@ async function findUnresolvableId(
     }
   }
   return undefined;
+}
+
+// brick://16712ece — revive a CLOSED session from the CLI. Takes a session id
+// (the same id `prompt -s` accepts), so like `recover` the agent prefix is
+// incidental: reopening is purely id-scoped. Idempotent — reopening an already
+// open session exits 0 with `reopened:false`.
+//
+// ⚠️ NOT the same verb as `sessions recover`, and the confusion is the whole
+// reason this exists: `recover` un-wedges a live-but-stuck queue OWNER and
+// leaves `closed` exactly as it found it (rc=0, `state:"no_owner"` on a closed
+// session, still closed). Reopening is a LIFECYCLE change, not a process one.
+export async function handleSessionsReopen(
+  _explicitAgentName: string | undefined,
+  sessionId: string,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const [{ reopenSession }, { printReopenedSessionByFormat }] = await Promise.all([
+    loadSessionModule(),
+    loadOutputRenderModule(),
+  ]);
+
+  const result = await reopenSession(sessionId);
+  printReopenedSessionByFormat(result.record, result.reopened, globalFlags.format);
 }
 
 // Force-restart (un-wedge) a session's queue owner. Takes a session id (the same

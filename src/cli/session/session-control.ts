@@ -26,6 +26,7 @@ import {
   listSessions,
   writeSessionRecord,
   writeSessionRecordAtBoundaryWithLifecycle,
+  writeSessionRecordWithLifecycle,
   isoNow,
 } from "../../session/persistence.js";
 import type {
@@ -705,6 +706,52 @@ export async function closeSession(
   await writeSessionRecordAtBoundaryWithLifecycle(record);
 
   return { record, drain };
+}
+
+export type SessionReopenResult = {
+  record: SessionRecord;
+  /** false ⇒ the session was already open and nothing was written (idempotent). */
+  reopened: boolean;
+};
+
+/**
+ * brick://16712ece — the CLI-reachable inverse of {@link closeSession}.
+ *
+ * Until this existed, a closed session had NO acpx verb that revived it:
+ * `sessions recover` returns `{"ownerFound":false,"state":"no_owner"}` at rc=0
+ * and leaves `closed` true (it force-restarts a WEDGED owner, which is a
+ * different problem), and `sessions ensure` creates a fresh empty session
+ * instead — so the only route was acpx-ui's Reopen button or `send-message.sh
+ * --reopen`, i.e. nothing an operator sitting at the CLI that PRINTED the
+ * refusal could run. {@link SessionClosedError} now names this verb; the CLI and
+ * its own error text have to keep agreeing, which is what
+ * test/session-closed-recovery.test.ts pins.
+ *
+ * Deliberately narrow — it flips the lifecycle bits and nothing else:
+ * - No owner is spawned. A reopened session cold-respawns on its next prompt,
+ *   exactly as an idle-reclaimed one does.
+ * - **Subagents are NOT cascaded open.** `closeSession` closes them because a
+ *   close is an operational teardown of live processes; reopening one session is
+ *   not a request to write N other records the operator never named. Pinned by
+ *   "reopen does not cascade to subagents" in the test file above.
+ *
+ * Uses the privileged lifecycle write for the same reason `closeSession` does:
+ * the ordinary daemon write READ-PRESERVES `closed`/`closed_at` from disk (see
+ * `writeSessionRecord`'s doc comment), so a plain write here would report
+ * success and leave the record closed.
+ */
+export async function reopenSession(sessionId: string): Promise<SessionReopenResult> {
+  const record = await resolveSessionRecord(sessionId);
+  if (record.closed !== true) {
+    return { record, reopened: false };
+  }
+
+  record.closed = false;
+  record.closedAt = undefined;
+  record.lastUsedAt = isoNow();
+  await writeSessionRecordWithLifecycle(record);
+
+  return { record, reopened: true };
 }
 
 export type SessionOwnerStatusClassification =

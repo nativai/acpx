@@ -14,6 +14,7 @@ export {
   absolutePath,
   closeSession,
   countPruneCandidates,
+  findClosedSessionsByDirectoryWalk,
   findGitRepositoryRoot,
   findSession,
   findSessionByDirectoryWalk,
