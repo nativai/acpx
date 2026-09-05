@@ -152,7 +152,7 @@ test("0bac6a00 gate: the stamp is never itself a sweep CANDIDATE", () => {
     claimHarnessConfigDirSweep({ root });
     const entries = readdirSync(root);
     assert.equal(entries.length, 1, `expected only the stamp: ${entries.join(", ")}`);
-    const stamp = entries[0] as string;
+    const stamp = entries[0];
     assert.equal(
       stamp.startsWith("acpx-"),
       false,
