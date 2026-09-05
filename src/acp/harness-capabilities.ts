@@ -637,8 +637,18 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
     primerChannel: "system-prompt", // `_meta.systemPrompt`, resolvePrimerChannel (src/acp/agent-command.ts)
     usageReporting: true, // MAP §3.1 — `usage_update`
     promptImages: true, // MAP §3.1 — `promptCapabilities.image: true`
-    // ⚠️ TRUE PRESERVES SHIPPED BEHAVIOUR AND ITS LAST LINK IS UNPROVEN — say so
-    // rather than let the cell read as fully measured. MEASURED in the harness
+    // ⚠️ STATED RESIDUAL — THIS `true` IS NOT FULLY MEASURED, AND THE CONTRACT
+    // CANNOT SAY SO ON THE WIRE. `<field>Reason` is null IFF its boolean is true,
+    // so a `false` carries provenance and a `true` carries none. That asymmetry is
+    // real, it is the descriptor owner's recorded ruling (2026-09-05: emit `true`,
+    // do not change the six keys — the consumer is already coding against
+    // null-IFF-true, and moving it for one cell's provenance would break a contract
+    // two lanes have built on), and the fix belongs to the adapter-identity
+    // citation work in brick 4791a88c, not here. Which is why the split is written
+    // HERE, at the cell, and not only in a report: this is where the next reader
+    // looks.
+    //
+    // MEASURED in the harness
     // binary both Claude adapters drive (`claude --version` = 2.1.251 at
     // /home/node/.local/share/claude/versions/2.1.251; `grep -ao` 2026-09-05, with
     // a positive control on "Claude Code" = 4427 hits and a planted negative = 0):
