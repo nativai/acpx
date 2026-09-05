@@ -975,9 +975,42 @@ export function applyHarnessConfigDir(
  * own store served OpenCode's default (`big-pickle`). Nothing failed; the pin
  * simply evaporated.
  *
- * ⚠️ THIS MAKES THE DISCARD LOUD; IT DOES NOT MAKE IT STOP. Treating the box
- * config as a base and acpx's keys as an overlay is B4's job (brick 13f73472).
- * A per-session `--model` works today and is deliberately untouched here.
+ * ⚠️ **THE DISCARD HAS SINCE BEEN STOPPED, AND THIS WARNING WAS RE-AIMED RATHER
+ * THAN DELETED.** Treating the box config as a BASE and acpx's keys as an
+ * OVERLAY landed as {@link composeOverBoxConfig} (brick 13f73472), called from
+ * `writeOpenCodeConfigDir` before the env re-point. `warnDiscardedBoxConfigKeys`
+ * is now fed the **COMPOSED** key set, so a key the overlay carried through is
+ * not reported, and **it should normally be silent**; anything the composition
+ * genuinely fails to carry still gets named.
+ *
+ * ⚠️ READ THE NAMES, NOT THE PROXIMITY: this block is a FLOATING doc comment, not
+ * attached to the function it describes. The next declaration below it is
+ * `composeOverBoxConfig`; `warnDiscardedBoxConfigKeys` is further down with its
+ * own doc block. Every reference here is deliberately by NAME for that reason —
+ * a "this function" or a "below" would resolve to the wrong one.
+ *
+ * ⚠️ SILENT IS THE PASS CONDITION HERE, WHICH IS WHY THE CALL WAS KEPT. A
+ * warning deleted alongside its defect leaves nothing to notice a regression; one
+ * re-aimed at the new invariant does. `opencode-config-overlay.test.ts` pins both
+ * halves — that the box's model survives a session pinning none, and that this
+ * warning goes quiet.
+ *
+ * ⚠️ IT DETECTS A MISSING KEY, NOT AN OVERWRITTEN VALUE. A box key whose VALUE
+ * the overlay replaced is present in the composed set and is therefore NOT
+ * reported. Today the only such case is `model`, and only when the caller passed
+ * `--model` — a user-requested override, where a warning would be noise rather
+ * than visibility. It is a deliberate boundary, not an oversight; widen it if a
+ * key acpx writes UNBIDDEN ever collides with a box value.
+ *
+ * ⚠️ AND THE SENTENCE THIS REPLACES IS WHY THE PARAGRAPH ABOVE IS EXPLICIT. It
+ * read *"…is B4's job (brick 13f73472)"* and stayed there after B4 shipped, six
+ * lines above the function that does the job — so a reader was told the
+ * composition was future work while standing next to it, and it cost a full
+ * assignment cycle to disprove. **A comment asserting a FUTURE STATE expires the
+ * moment the state arrives, and nothing fails when it does.** This file has now
+ * been corrected twice for that class; see also the note at
+ * {@link composeOverBoxConfig} recording a prior comment whose *"both halves were
+ * false"*.
  *
  * It is read through the env acpx is ABOUT to overwrite, because that is the
  * config the child would otherwise have inherited — reading `$HOME/.config`
