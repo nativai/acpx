@@ -782,8 +782,32 @@ export function applyHarnessConfigDir(
  * 1. **Nested objects DEEP-merge.** A shallow overlay of
  *    `provider.openrouter.models.<slug>` would drop every model the box had
  *    declared under the same key — silently replacing a catalogue while looking
- *    like an addition. This is the same replace-vs-merge hazard that keeps
- *    `provisionModelId` switched off for pi.
+ *    like an addition.
+ *
+ *    ⚠️ **THIS IS NOT THE SAME QUESTION AS THE ONE THAT KEEPS PROVISIONING OFF,
+ *    AND IT IS NOT PI THAT IT IS OFF FOR** (brick b4da4a48). This comment
+ *    previously said "the same replace-vs-merge hazard that keeps
+ *    `provisionModelId` switched off for pi", and both halves were false:
+ *
+ *      - **PI IS SWITCHED ON.** `ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR` is
+ *        `["pi"]` and `client.ts` provisions for it. **OPENCODE is the harness
+ *        provisioning is off for.**
+ *      - **TWO LAYERS, TWO QUESTIONS.** The rule here is about **acpx's own**
+ *        compose of the box `opencode.json` into the per-session one — acpx's
+ *        code, acpx's format, and answered by the merge written below. What
+ *        keeps provisioning off for opencode is whether **OPENCODE ITSELF**
+ *        deep-merges an empty `provider.openrouter.models.<slug>: {}` over its
+ *        BUNDLED catalogue entry — opencode's code, opencode's format. As
+ *        `client.ts` puts it: *"Two harnesses, two different config formats, two
+ *        separate questions; answering one does not answer the other."*
+ *
+ *    **THE MEASUREMENT THAT WOULD MOVE THAT SWITCH** — named here so this
+ *    justification cannot go stale the same way twice: does OpenCode DEEP-MERGE
+ *    or REPLACE a bundled entry given an empty declaration? If it replaces, the
+ *    model loses the `reasoning` support its `effort` ladder is advertised from
+ *    and depth silently stops working for every pinned model. **When that is
+ *    answered MERGE, cite it — do not infer it from this rule, which answers a
+ *    different layer.**
  * 2. **`instructions` UNIONS rather than replaces**, box entries first, acpx's
  *    primer last. It is an array, and arrays normally replace — but replacing is
  *    exactly the discard this brick exists to end, and a box that configured
