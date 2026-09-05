@@ -307,6 +307,8 @@ acpx [global_options] <agent> sessions ensure
 acpx [global_options] <agent> sessions ensure --name <name>
 acpx [global_options] <agent> sessions close
 acpx [global_options] <agent> sessions close <name>
+acpx [global_options] <agent> sessions reopen <id>
+acpx [global_options] <agent> sessions reopen <id>
 acpx [global_options] <agent> sessions show
 acpx [global_options] <agent> sessions show <name>
 acpx [global_options] <agent> sessions history
@@ -341,6 +343,8 @@ Behavior:
 - `sessions ensure --name <name>` does the same for named sessions
 - `sessions close` soft-closes the current cwd default session
 - `sessions close <name>` soft-closes the local named session first, then one exact global agent match
+- `sessions reopen <id>` reopens a closed session so prompts are accepted again — the inverse of `sessions close`. Idempotent (an already-open session exits 0 with `reopened:false`), spawns nothing (the next prompt cold-respawns the owner), and does NOT cascade to subagents. **Not `sessions recover`**, which force-restarts a wedged queue owner and leaves the session closed.
+- `sessions reopen <id>` reopens a closed session so prompts are accepted again — the inverse of `sessions close`. Idempotent (an already-open session exits 0 with `reopened:false`), spawns nothing (the next prompt cold-respawns the owner), and does NOT cascade to subagents. Not `sessions recover`, which restarts a wedged queue owner and leaves the session closed.
 - `sessions show [name]` displays stored session metadata
 - `sessions history [name]` displays stored turn history previews (default 20, configurable with `--limit`)
 - `sessions export [name] --output <path>` writes a portable JSON archive with session state and event history; `--cwd <dir>` selects a different source cwd relative to global `--cwd`

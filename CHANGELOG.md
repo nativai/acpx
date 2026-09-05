@@ -8,6 +8,38 @@ Repo: https://github.com/openclaw/acpx
 
 ### Changes
 
+- CLI/sessions: new `acpx sessions reopen <id>` verb — the lifecycle inverse
+  of `sessions close`. Until now nothing in the CLI reopened a closed session:
+  `sessions recover` force-restarts a wedged queue owner and leaves `closed`
+  untouched (returning `{"ownerFound":false,"state":"no_owner"}` at exit 0 on a
+  closed session), and `sessions ensure` created a fresh empty one — so the only
+  routes were acpx-ui's Reopen button or a message delivered with `--reopen`,
+  neither reachable from the shell that printed the refusal. `reopen` is
+  idempotent (an already-open session exits 0 with `reopened: false`), spawns
+  nothing (the next prompt cold-respawns the owner) and does not cascade to
+  subagents. It uses the privileged lifecycle write, because the ordinary
+  daemon write read-preserves `closed`/`closed_at` from disk and would have
+  reported success while leaving the record closed.
+- CLI/sessions: `sessions ensure` no longer creates over a **closed** same-scope
+  session in silence. The directory walk skips closed entries, so a closed
+  session was invisible and `ensure` fell through to create at exit 0 with no
+  signal — an operator meaning to recover landed in a fresh empty session with
+  the history abandoned. It still creates (recurring automation legitimately
+  ensures a fixed name whose previous record is closed and needs a new session
+  each run), but now reports it: a warning on **stderr** — never stdout, so
+  `--format json` consumers keep parsing — naming what happened, that the
+  history is not carried over, and how to revive the old session instead; plus
+  an additive `createdBecauseClosed: { count, nearestRecordId, nearestName }`
+  key in the JSON result for scripted callers.
+- CLI/errors: the `SESSION_CLOSED` refusal stopped telling the truth. It
+  promised that delivering a message to the session URL would
+  "reopen-and-deliver", a behaviour that had been removed — a plain delivery to
+  a closed session is rejected `409 SESSION_CLOSED` and reopening requires
+  `--reopen`, which the text never mentioned. It now names only routes that
+  exist (`acpx sessions reopen`, the acpx-ui Reopen button, `send-message.sh
+--reopen`) and states the 409. The text is asserted directly, and every
+  `acpx sessions <verb>` it names is checked against the CLI's own
+  `sessions --help`, so the CLI and its error text cannot drift apart again.
 - CLI/subscriptions: new `acpx subscriptions remove <id>` (alias `rm`) verb,
   beside `lock`/`unlock`, for retiring a cancelled or dead account without
   hand-editing `registry.json`. Removes any profile kind — including a

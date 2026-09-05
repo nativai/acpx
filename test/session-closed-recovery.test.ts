@@ -264,7 +264,11 @@ test("sessions reopen flips a closed record open, proven by reading the record b
       { cwd },
     );
     assert.equal(closed.code, 0, closed.stderr);
-    assert.equal((await readRecordJson(homeDir, id)).closed, true, "precondition: record is closed");
+    assert.equal(
+      (await readRecordJson(homeDir, id)).closed,
+      true,
+      "precondition: record is closed",
+    );
 
     const reopened = await runCli(
       ["--format", "json", "codex", "sessions", "reopen", id],

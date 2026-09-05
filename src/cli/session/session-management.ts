@@ -54,6 +54,7 @@ import {
   writeSessionRecord,
   writeSessionRecordAtBoundary,
 } from "../../session/persistence.js";
+import type { SessionIndexEntry } from "../../session/persistence/index.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
 import type { SessionEnsureResult, SessionRecord } from "../../types.js";
 import { resolveExistingBrickPath } from "./brick-link.js";
@@ -796,6 +797,27 @@ export async function listAgentSessions(options: SessionListOptions): Promise<Se
   }
 }
 
+// brick://16712ece — `closedMatches` is the walk's newest-first list of CLOSED
+// same-scope entries it could not see. Returns the `SessionEnsureResult` slice
+// to spread, or `undefined` when there was nothing to report, so the caller
+// spreads unconditionally and `createdBecauseClosed` is ABSENT (not `undefined`)
+// on the ordinary path.
+function describeClosedMatches(
+  closedMatches: readonly SessionIndexEntry[],
+): Pick<SessionEnsureResult, "createdBecauseClosed"> | undefined {
+  const nearest = closedMatches[0];
+  if (!nearest) {
+    return undefined;
+  }
+  return {
+    createdBecauseClosed: {
+      count: closedMatches.length,
+      nearestRecordId: nearest.acpxRecordId,
+      ...(nearest.name === undefined ? {} : { nearestName: nearest.name }),
+    },
+  };
+}
+
 export async function ensureSession(options: SessionEnsureOptions): Promise<SessionEnsureResult> {
   const cwd = absolutePath(options.cwd);
   const gitRoot = findGitRepositoryRoot(cwd);
@@ -876,19 +898,10 @@ export async function ensureSession(options: SessionEnsureOptions): Promise<Sess
     sessionOptions: options.sessionOptions,
   });
 
-  const nearest = closedMatches[0];
   return {
     record,
     created: true,
-    ...(nearest
-      ? {
-          createdBecauseClosed: {
-            count: closedMatches.length,
-            nearestRecordId: nearest.acpxRecordId,
-            ...(nearest.name === undefined ? {} : { nearestName: nearest.name }),
-          },
-        }
-      : {}),
+    ...describeClosedMatches(closedMatches),
   };
 }
 

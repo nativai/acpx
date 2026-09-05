@@ -166,6 +166,7 @@ acpx codex sessions ensure       # return existing scoped session or create one
 acpx codex sessions ensure --name api # ensure named scoped session
 acpx codex sessions close        # close cwd-scoped default session
 acpx codex sessions close api    # close local named session, or one exact global match
+acpx codex sessions reopen <id>  # reopen a closed session (inverse of close; NOT `sessions recover`)
 acpx codex status                # local process status for current session
 acpx codex status --session-url "$ACPX_SESSION_URL" # durable self-check by URL
 
@@ -399,6 +400,8 @@ spawns the ACP bridge directly without `pnpm` wrapper noise:
 - `sessions new [--name <name>]` creates a fresh session for that scope and soft-closes the prior one.
 - `sessions ensure [--name <name>]` is idempotent: it returns an existing scoped session or creates one when missing.
 - `sessions close [name]` soft-closes the session: queue owner/processes are terminated, record is kept with `closed: true`.
+- `sessions reopen <id>` clears `closed` so prompts are accepted again — the inverse of `close`. Idempotent, spawns nothing (the next prompt cold-respawns the owner), does not cascade to subagents, and is **not** `sessions recover` (which restarts a wedged queue owner and leaves the session closed).
+- `sessions ensure` over a **closed** same-scope session creates a fresh, empty one — closed sessions are invisible to auto-resume by scope. It warns on **stderr** and reports `createdBecauseClosed` in the JSON result so that is never silent; use `sessions reopen` when you meant to revive the old session.
 - `sessions list` uses agent-side ACP `session/list` when available; use
   `--cursor`, `--filter-cwd`, or `--local` for pagination, cwd filtering, or
   saved-record inspection.

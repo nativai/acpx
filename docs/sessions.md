@@ -94,11 +94,13 @@ cwds, use the immutable record ID or session URL.
 
 ## Sessions vs. ensure vs. new
 
-| Command           | If a matching session exists  | If not                                       |
-| ----------------- | ----------------------------- | -------------------------------------------- |
-| `sessions new`    | Soft-close it, create a fresh | Create a fresh one                           |
-| `sessions ensure` | Return it                     | Create a fresh one                           |
-| (prompt commands) | Resume it                     | Exit `4` with guidance to run `sessions new` |
+| Command           | If a matching OPEN session exists | If not                                       |
+| ----------------- | --------------------------------- | -------------------------------------------- |
+| `sessions new`    | Soft-close it, create a fresh     | Create a fresh one                           |
+| `sessions ensure` | Return it                         | Create a fresh one                           |
+| (prompt commands) | Resume it                         | Exit `4` with guidance to run `sessions new` |
+
+**A CLOSED session is not "a matching session" to any of them, and `ensure` is NOT a reopen.** Auto-resume by scope skips closed sessions, so `sessions ensure -s <name>` over a closed `<name>` creates a **fresh, empty** session — the closed one's history is not carried over. That is deliberate: recurring automation legitimately ensures a fixed name every night and needs a new session each time. Because `ensure` cannot tell that intent from an operator trying to _recover_ a closed session, it creates **and says so**: a warning on **stderr** (never stdout, so `--format json` consumers keep parsing) plus an additive `createdBecauseClosed` key in the JSON result naming how many closed matches it skipped and the newest one's id. To revive the closed session instead, use `sessions reopen <id>`.
 
 `new` is the explicit "I want to start over" verb. `ensure` is the idempotent "give me a session" verb for scripts. Bare prompt is conservative: it never auto-creates so you do not accidentally fork a session by running from the wrong directory.
 
@@ -110,6 +112,20 @@ cwds, use the immutable record ID or session URL.
 - Auto-resume by scope skips closed sessions.
 - Closed sessions can still be loaded explicitly through embedding APIs.
 - `sessions prune` is the explicit way to delete closed records.
+
+## Reopen
+
+`sessions reopen <id>` is the inverse of `sessions close`: it clears `closed`/`closedAt` so prompts are accepted again. The full transcript, `acp_session_id` and message log survive a close, so a reopened session answers its next turn from its whole prior context — reopen rather than respawn a replacement.
+
+```bash
+acpx sessions reopen <id>          # id: acpx record id, ACP session id, or unique suffix
+```
+
+- Idempotent: reopening an already-open session exits `0` with `reopened: false` and writes nothing.
+- It spawns nothing. The next prompt cold-respawns the queue owner, exactly as it does for an idle-reclaimed one.
+- It does **not** cascade to subagents. `close` cascades because it tears down live processes; reopening one session is not a request to rewrite records you did not name.
+- **`sessions recover` is a different verb.** It force-restarts a _wedged queue owner_ and leaves `closed` exactly as it found it — on a closed session it returns `{"ownerFound":false,"state":"no_owner"}` at exit 0 and the session stays closed.
+- To reopen **and** deliver a message in one step from an agent, use the fleet helper `send-message.sh --reopen <session-url> '<text>'`. A plain delivery to a closed session does not reopen it — it is rejected with `409 SESSION_CLOSED`.
 
 ## Export / import
 

@@ -199,6 +199,7 @@ acpx sessions ensure
 acpx sessions ensure --name backend
 acpx sessions close
 acpx sessions close backend
+acpx sessions reopen <id>
 acpx sessions show
 acpx sessions history --limit 20
 acpx sessions export backend --output backend-session.json
@@ -212,6 +213,7 @@ acpx codex sessions
 acpx codex sessions new --name backend
 acpx codex sessions ensure --name backend
 acpx codex sessions close backend
+acpx codex sessions reopen <id>
 acpx codex sessions show backend
 acpx codex sessions history backend --limit 20
 acpx codex sessions export backend --output backend-session.json
