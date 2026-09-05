@@ -14,6 +14,7 @@ import {
 } from "../acp/harness-capabilities.js";
 import {
   describeHarnessConfigDirSweep,
+  describeHarnessConfigDirSweepPlan,
   pruneOrphanHarnessConfigDirs,
 } from "../acp/harness-config-dir.js";
 import {
@@ -3773,9 +3774,11 @@ async function sweepOrphanHarnessConfigDirs(
    */
   rootDir: string | undefined,
 ): Promise<void> {
-  if (dryRun) {
-    return;
-  }
+  // ⚠️ A DRY RUN NO LONGER RETURNS HERE (CONCEPTION §5). It used to, which meant
+  // the mode that needs no scope was the mode that never swept: the safest way to
+  // ask "what would this remove?" was the one way that could not answer, and a
+  // preview showing nothing reads as a clean preview. It now walks the same
+  // candidates under the same rule and removes none of them.
   try {
     // ⚠️ ONE /proc CENSUS, SHARED BY BOTH SWEEPS. Taken once so the two cannot
     // disagree about what is running, and so the cost is paid once.
@@ -3791,7 +3794,11 @@ async function sweepOrphanHarnessConfigDirs(
     const recordSweep = await sweepAbandonedSessionRecords({
       records: await session.listSessions(),
       liveScan,
-      closeSession: (id) => session.closeSession(id),
+      // ⚠️ A DRY RUN MUST NOT CLOSE RECORDS EITHER — but it must still MODEL the
+      // closes, or the preview under-reports. `closed` is populated from the
+      // verdicts regardless of what this callback does, so a no-op yields exactly
+      // "the ids a real run would have closed".
+      closeSession: dryRun ? async () => undefined : (id) => session.closeSession(id),
     });
     if (verbose) {
       process.stderr.write(describeAbandonedRecordSweep(recordSweep));
@@ -3799,19 +3806,40 @@ async function sweepOrphanHarnessConfigDirs(
 
     // Re-read AFTER the record sweep, so the directory pass sees the closes it
     // just made rather than the state that preceded them.
+    //
+    // ⚠️ ON A DRY RUN NOTHING WAS ACTUALLY CLOSED, so the re-read returns the state
+    // that PRECEDED the record sweep and the directory pass would retain every dir
+    // pinned by a still-open record — under-reporting the preview by exactly the
+    // set the record sweep exists to release. Overlaying the would-close ids is
+    // what makes the preview model the real run's ORDERING rather than its own.
     const records = knownRecordsById(await session.listSessions());
-    const swept = pruneOrphanHarnessConfigDirs({ records, liveScan, rootDir });
-    if (verbose) {
-      process.stderr.write(describeHarnessConfigDirSweep(swept));
+    if (dryRun) {
+      for (const id of recordSweep.closed) {
+        records.set(id, { closed: true });
+      }
+    }
+    const swept = pruneOrphanHarnessConfigDirs({ records, liveScan, rootDir, dryRun });
+    // ⚠️ PRINTED BY DEFAULT, NOT UNDER --verbose (CONCEPTION §7). Every population
+    // this carries — `scanned=0 means NOT RUN`, `retainedBy`, `unmeasured` — exists
+    // to be READ, and a census behind a flag is a census nobody sees. A sweep that
+    // removes things silently is the shape of every incident in this thread.
+    process.stderr.write(describeHarnessConfigDirSweep(swept));
+    // The per-candidate preview is the point of a dry run; on a real run the
+    // one-line census is enough unless the operator asked for detail.
+    if (dryRun || verbose) {
+      process.stderr.write(describeHarnessConfigDirSweepPlan(swept));
     }
   } catch (error) {
     // Never fail a prune because the tidy-up failed — the sessions are already
     // deleted by this point and the sweep runs again next time.
-    if (verbose) {
-      process.stderr.write(
-        `[acpx] harness config dir sweep skipped: ${error instanceof Error ? error.message : String(error)}\n`,
-      );
-    }
+    //
+    // ⚠️ BUT SAY SO BY DEFAULT. With the census now unconditional (§7), leaving this
+    // behind --verbose would mean the ONE outcome that prints nothing at all is the
+    // one where the sweep threw — silence reading as "it ran and found nothing",
+    // which is the exact ambiguity §7 exists to remove.
+    process.stderr.write(
+      `[acpx] harness config dir sweep skipped: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
   }
 }
 
