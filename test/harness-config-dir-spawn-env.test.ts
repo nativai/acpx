@@ -6,6 +6,9 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { AcpClient } from "../src/acp/client.js";
+import { ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR } from "../src/acp/harness-capabilities.js";
+import type { HarnessId } from "../src/acp/harness-capabilities.js";
+import type { AcpClientOptions } from "../src/types.js";
 
 // B3 deliverable 5 — RS-13's in-repo half: THE ADAPTER-BOUNDARY DIFFERENTIAL.
 //
@@ -104,6 +107,7 @@ const EXPECTED: Record<string, string[]> = {
 async function spawnAndDumpEnv(
   harness: string,
   beforeClose?: (dump: Record<string, string>) => void | Promise<void>,
+  sessionOptions?: AcpClientOptions["sessionOptions"],
 ): Promise<Record<string, string>> {
   const restoreTmp = await scopeTmpDir();
   const scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "hp-b3-rs13-cwd-"));
@@ -121,6 +125,7 @@ async function spawnAndDumpEnv(
     cwd: scratchDir,
     permissionMode: "approve-reads",
     sessionContext: { acpxRecordId: `rec-b3-rs13-${harness}` },
+    ...(sessionOptions ? { sessionOptions } : {}),
   });
   try {
     await client.start();
@@ -348,4 +353,167 @@ test("F-8: a spawn with NO sessionContext still gets a UNIQUE dir, never a share
     // guarantee), and this asserts the fast path actually fires.
     assert.equal(existsSync(dir), false, `close() left ${dir} behind`);
   }
+});
+
+/**
+ * An OpenRouter slug no harness ships in its bundled catalogue, so its presence
+ * in a written config file can only have come from acpx provisioning it.
+ */
+const PROVISIONED_SLUG = "openrouter/zzz-acpx-cba6fa92/routing-probe";
+
+/** What `PROVISIONED_SLUG` looks like once `stripProviderPrefix` has run. */
+const PROVISIONED_SLUG_STRIPPED = "zzz-acpx-cba6fa92/routing-probe";
+
+/**
+ * Swap the SHIPPED provisioning list, in place, for the duration of one probe.
+ *
+ * ⚠️ THE SHIPPED ARRAY IS THE SUBJECT, WHICH IS WHY THIS MUTATES IT RATHER THAN
+ * INJECTING A PARAMETER. `harnessProvisionsModelCatalogue` is parameterised and a
+ * test could hand it any list — but that measures the HELPER. The claim under
+ * test is about `client.ts`: that the spawn ROUTES on the constant instead of on
+ * a `=== "pi"` literal, and a literal and a `["pi"]` list are behaviourally
+ * identical on the shipped defaults. Varying the constant underneath a real spawn
+ * is the only runtime observable that separates them. `client.ts` reaches the
+ * array through a default parameter, evaluated per call, so a splice is visible
+ * to the very next spawn.
+ *
+ * Top-level rows in a node:test FILE run SEQUENTIALLY (see `scopeTmpDir`), and
+ * the restore is in a `finally`, so no other row ever sees the swapped list.
+ */
+async function withProvisioningList<T>(
+  next: readonly HarnessId[],
+  run: () => Promise<T>,
+): Promise<T> {
+  const shipped = ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR as HarnessId[];
+  const original = [...shipped];
+  shipped.splice(0, shipped.length, ...next);
+  try {
+    return await run();
+  } finally {
+    shipped.splice(0, shipped.length, ...original);
+  }
+}
+
+/**
+ * Spawn `harness` with `PROVISIONED_SLUG` pinned and report whether the spawn
+ * actually wrote a catalogue fragment for it.
+ *
+ * Each arm carries its OWN control, because "no fragment" and "the config dir was
+ * never written" are the same observation otherwise: the config dir must exist,
+ * and for opencode the config file must parse. So a `false` here means acpx
+ * DECIDED not to provision, never that nothing ran.
+ */
+async function observeProvisioning(harness: "opencode" | "pi"): Promise<boolean> {
+  let observed: boolean | undefined;
+  await spawnAndDumpEnv(
+    harness,
+    async (dump) => {
+      assert.ok(
+        Object.keys(dump).length > 5,
+        `${harness}: env dump has ${Object.keys(dump).length} entries — the child never ran, so this arm is NOT RUN, not clean`,
+      );
+      if (harness === "pi") {
+        const dir = dump.PI_CODING_AGENT_DIR;
+        assert.ok(dir, "pi: PI_CODING_AGENT_DIR unset — no config dir was written at all");
+        // CONTROL: the directory is real and reachable, so a missing
+        // models-store.json is a routing decision rather than an absent dir.
+        const entries = await fs.readdir(dir);
+        assert.ok(entries.length > 0, `pi: ${dir} is empty — the writer never ran`);
+        const storePath = path.join(dir, "models-store.json");
+        if (!existsSync(storePath)) {
+          observed = false;
+          return;
+        }
+        const store = JSON.parse(await fs.readFile(storePath, "utf8")) as {
+          openrouter?: { models?: { id?: string }[] };
+        };
+        // Pin what the artifact CONTAINS, not merely that a file exists.
+        observed = (store.openrouter?.models ?? []).some(
+          (model) => model.id === PROVISIONED_SLUG_STRIPPED,
+        );
+        return;
+      }
+      const configDir = dump.OPENCODE_CONFIG_DIR;
+      assert.ok(
+        configDir,
+        "opencode: OPENCODE_CONFIG_DIR unset — no config dir was written at all",
+      );
+      // CONTROL: the file is real and parses, so `provider` being absent is a
+      // routing decision rather than an unwritten file.
+      const config = JSON.parse(
+        await fs.readFile(path.join(configDir, "opencode.json"), "utf8"),
+      ) as { provider?: { openrouter?: { models?: Record<string, unknown> } } };
+      assert.ok(config, "opencode: opencode.json did not parse");
+      observed = config.provider?.openrouter?.models?.[PROVISIONED_SLUG_STRIPPED] !== undefined;
+    },
+    { model: PROVISIONED_SLUG },
+  );
+  assert.notEqual(
+    observed,
+    undefined,
+    `${harness}: beforeClose never ran — this arm examined nothing`,
+  );
+  return observed === true;
+}
+
+test("the SHIPPED provisioning list is what the spawn routes on — both directions (brick cba6fa92)", async () => {
+  // ⚠️ WHAT WAS WRONG, AND WHY BOTH HALVES OF THIS ROW ARE LOAD-BEARING.
+  //
+  // "pi is provisioned" was asserted in TWO independent places and only ONE was
+  // defended. `test/harness-capabilities.test.ts` pins the DECLARED list
+  // (`ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR`), but the SHIPPED routing was a
+  // hardcoded `harnessIdForAgentCommand(…) === "pi"` literal in `client.ts` that
+  // no test reached. So editing the declaration redded a row while editing the
+  // routing moved nothing — the guard sat on the wrong side of the seam.
+  //
+  // ## PART 1 — the shipped defaults, in BOTH directions
+  //
+  // One harness that IS on the list and one that is NOT, measured through a real
+  // adapter spawn. A row that pinned only the positive would be the same
+  // one-sided defence being removed here.
+  const shippedPi = await observeProvisioning("pi");
+  const shippedOpencode = await observeProvisioning("opencode");
+  process.stderr.write(
+    `[cba6fa92] shipped list=${JSON.stringify([...ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR])} ` +
+      `pi=${shippedPi} opencode=${shippedOpencode}\n`,
+  );
+  assert.equal(shippedPi, true, "pi is on the shipped list and the spawn must provision for it");
+  assert.equal(
+    shippedOpencode,
+    false,
+    "opencode is NOT on the shipped list and the spawn must not provision for it — " +
+      "the empty-declaration merge-vs-replace question is still unmeasured (J2)",
+  );
+
+  // ## PART 2 — the routing is a DERIVATION, not a literal
+  //
+  // ⚠️ PART 1 ALONE CANNOT SEE THE DEFECT. `["pi"]` and `=== "pi"` agree on every
+  // shipped input, so restoring the literal leaves Part 1 green. Only varying the
+  // constant underneath the same real spawn separates them: with the list swapped
+  // to `["opencode"]`, a literal keeps provisioning pi and keeps refusing
+  // opencode, and BOTH assertions below go red.
+  //
+  // It is also a two-sided control for Part 1: the same instrument that reported
+  // `pi=true, opencode=false` must be able to report the exact opposite, which is
+  // what makes Part 1's `false` an observation rather than a blind spot.
+  const [flippedPi, flippedOpencode] = await withProvisioningList(["opencode"], async () => [
+    await observeProvisioning("pi"),
+    await observeProvisioning("opencode"),
+  ]);
+  process.stderr.write(
+    `[cba6fa92] swapped list=["opencode"] pi=${flippedPi} opencode=${flippedOpencode}\n`,
+  );
+  assert.equal(
+    flippedPi,
+    false,
+    "the spawn still provisioned for pi with pi OFF the list — the routing is hardcoded, not derived",
+  );
+  assert.equal(
+    flippedOpencode,
+    true,
+    "the spawn refused to provision for opencode with opencode ON the list — the routing is hardcoded, not derived",
+  );
+
+  // The restore actually happened, so nothing downstream inherits the swap.
+  assert.deepEqual([...ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR], ["pi"]);
 });

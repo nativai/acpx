@@ -124,6 +124,7 @@ import {
   acpxRoutesModelMechanism,
   HARNESS_FACTS,
   harnessIdForAgentCommand,
+  harnessProvisionsModelCatalogue,
   modelMechanismForAgentCommand,
 } from "./harness-capabilities.js";
 import {
@@ -967,7 +968,17 @@ export class AcpClient {
       // advertised from — depth would silently stop working for every pinned
       // model. Two harnesses, two different config formats, two separate
       // questions; answering one does not answer the other.
-      ...(harnessIdForAgentCommand(this.options.agentCommand) === "pi"
+      //
+      // ⚠️ THIS ASKS THE CONSTANT, NOT A LITERAL — DO NOT "SIMPLIFY" IT BACK TO
+      // `=== "pi"` (brick cba6fa92). It shipped as that literal, and the effect
+      // was that the two halves of "pi is provisioned" could disagree: the
+      // DECLARED list (`ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR`, which the
+      // picker's arbitrary-slug band derives from) was pinned, while the SHIPPED
+      // routing here was not reached by any test — so adding a harness to the
+      // list changed what acpx OFFERS and nothing about what it WRITES. The
+      // guard therefore belongs where the value is written; the array's own
+      // comment carries it, and this call is what makes that true.
+      ...(harnessProvisionsModelCatalogue(harnessIdForAgentCommand(this.options.agentCommand))
         ? { provisionModelId: this.options.sessionOptions?.model }
         : {}),
     });
