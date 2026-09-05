@@ -129,27 +129,78 @@ function markWarmAttempt(cachePath: string, now: number): void {
 }
 
 /**
- * Every reason NOT to warm, in one place. Each returns false and none of them
- * ever throws — a create must not fail over the decision not to refresh a list.
+ * 🛑 THE ENTRY WE ARE ABOUT TO RE-INVOKE MUST ACTUALLY BE acpx's CLI. `process.argv[1]`
+ * IS NOT ALWAYS acpx — AND ASSUMING IT WAS COST A RED GATE (116 failures).
+ *
+ * MEASURED 2026-09-05: inside a `node --test` worker `process.argv[1]` is **the
+ * TEST FILE**, not the CLI. So the first version of this module spawned
+ * `node <some>.test.js models --refresh --format json` — RE-RUNNING AN ENTIRE
+ * TEST FILE as a detached child, inheriting the parent's env including its
+ * scratch `ACPX_STATE_HOME`. Under the full parallel suite that is dozens of
+ * duplicate test processes racing the real ones over the same scratch stores:
+ * the suite's own guard fired ("test attempted to touch the acpx session store
+ * with ACPX_STATE_HOME outside the temp dir"), plus 'session not found',
+ * timeouts and missing rejections across 12 files. It did NOT reproduce when a
+ * file was run alone, which is why only the full gate caught it.
+ *
+ * The unit tests could not catch it either, because they INJECT `argv` — the
+ * harness supplying what the real run does not (verification-soundness §7).
+ * `test/models-catalogue-warm.test.ts` now passes a realistic `.test.js` path
+ * and asserts NOTHING is spawned.
+ *
+ * ⚠️ Failing CLOSED is free here and failing open is not: a warm that does not
+ * happen costs one unvalidated create, which is exactly the pre-existing
+ * behaviour. A wrong process spawned costs a corrupted test run — or, in the
+ * field, an arbitrary program re-invoked with `models --refresh` appended.
+ *
+ * ⚠️ AND THE CHECK MUST RUN ON THE RESOLVED PATH, NOT ON `argv[1]` AS WRITTEN —
+ * getting that backwards disables the warm on the ONE build where it matters.
+ * MEASURED on this box: the installed bin is a SYMLINK,
+ * `/usr/local/bin/acpx → ../lib/node_modules/acpx/dist/cli.js`, so a real
+ * `acpx …` invocation has `argv[1]` basename **`acpx`** and only its realpath is
+ * `cli.js`. A raw-basename test would fail closed on the deployed CLI and pass
+ * only in a source worktree — silently reinstating the cold-cache no-op in
+ * production, which is the exact bug this module exists to fix.
+ *
+ * Returns the resolved entry to spawn, or `null` when this process is not acpx.
  */
-function shouldWarmNow(params: {
+function resolveAcpxCliEntry(entry: string | undefined): string | null {
+  if (entry === undefined || entry.trim() === "") {
+    return null;
+  }
+  let resolved: string;
+  try {
+    resolved = realpathSync(entry.trim());
+  } catch {
+    return null;
+  }
+  return path.basename(resolved) === "cli.js" ? resolved : null;
+}
+
+/**
+ * Every reason NOT to warm, in one place — it returns the resolved CLI entry to
+ * spawn, or null. None of these ever throws: a create must not fail over the
+ * decision not to refresh a list.
+ */
+function resolveWarmTarget(params: {
   env: NodeJS.ProcessEnv;
   cachePath: string;
   now: number;
   entry: string | undefined;
   deps: WarmDeps;
-}): boolean {
+}): string | null {
   if (params.env[DISABLE_ENV]) {
-    return false;
+    return null;
   }
-  // No self-entry to re-invoke — nothing to do, and nothing worth reporting.
-  if (params.entry === undefined || params.entry.trim() === "") {
-    return false;
+  // Not acpx, or no self-entry to re-invoke — nothing to do, nothing to report.
+  const cliEntry = resolveAcpxCliEntry(params.entry);
+  if (cliEntry === null) {
+    return null;
   }
   if (!catalogueNeedsWarm({ ...params.deps, cachePath: params.cachePath, now: () => params.now })) {
-    return false;
+    return null;
   }
-  return !warmedRecently(params.cachePath, params.now);
+  return warmedRecently(params.cachePath, params.now) ? null : cliEntry;
 }
 
 /**
@@ -164,12 +215,12 @@ export function warmCatalogueInBackground(deps: WarmDeps = {}): void {
   const cachePath = deps.cachePath ?? defaultCatalogueCachePath();
   const now = (deps.now ?? Date.now)();
   const entry = (deps.argv ?? process.argv)[1];
-  if (!shouldWarmNow({ env, cachePath, now, entry, deps })) {
+  const cliEntry = resolveWarmTarget({ env, cachePath, now, entry, deps });
+  if (cliEntry === null) {
     return;
   }
-
   markWarmAttempt(cachePath, now);
-  detachRefreshChild(deps.spawn ?? nodeSpawn, entry, env);
+  detachRefreshChild(deps.spawn ?? nodeSpawn, cliEntry, env);
 }
 
 /**
@@ -186,21 +237,17 @@ function detachRefreshChild(
   env: NodeJS.ProcessEnv,
 ): void {
   try {
-    const child = spawnFn(
-      process.execPath,
-      [realpathSync(entry), "models", "--refresh", "--format", "json"],
-      {
-        detached: true,
-        // Nothing is read back — the child's product is the cache file on disk.
-        // Inheriting stdout would also corrupt a `--format json` parent.
-        stdio: "ignore",
-        // Same hardening as the queue owner: never inherit a cwd that may have
-        // been reaped, or the detached child dies on `uv_cwd`.
-        cwd: safeSpawnCwd(),
-        env,
-        windowsHide: true,
-      },
-    );
+    const child = spawnFn(process.execPath, [entry, "models", "--refresh", "--format", "json"], {
+      detached: true,
+      // Nothing is read back — the child's product is the cache file on disk.
+      // Inheriting stdout would also corrupt a `--format json` parent.
+      stdio: "ignore",
+      // Same hardening as the queue owner: never inherit a cwd that may have
+      // been reaped, or the detached child dies on `uv_cwd`.
+      cwd: safeSpawnCwd(),
+      env,
+      windowsHide: true,
+    });
     // THE LINE THAT MAKES THE PARENT ABLE TO EXIT. Without it the child's handle
     // holds this process's event loop open until the fetch finishes — exactly
     // the latency regression this whole design exists to avoid.

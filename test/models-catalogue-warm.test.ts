@@ -24,6 +24,20 @@ function tempCacheDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "acpx-warm-test-"));
 }
 
+/**
+ * A realistic acpx CLI entry. NOT `process.execPath` — the guard requires the
+ * resolved entry to be acpx's own `cli.js`, because `process.argv[1]` is the TEST
+ * FILE under `node --test` and re-invoking that is what produced a 116-failure
+ * gate. Tests that expect a spawn must therefore look like acpx.
+ */
+function fakeCliEntry(dir: string): string {
+  const distDir = path.join(dir, "dist");
+  fs.mkdirSync(distDir, { recursive: true });
+  const entry = path.join(distDir, "cli.js");
+  fs.writeFileSync(entry, "");
+  return entry;
+}
+
 /** A spawn stub that records the call and hands back a minimal child. */
 function recordingSpawn() {
   const calls: { command: string; args: string[]; options: Record<string, unknown> }[] = [];
@@ -104,7 +118,7 @@ test("NEVER AWAITED: it returns void, and the child is detached AND unref()'d", 
   const returned: unknown = warmCatalogueInBackground({
     cachePath,
     spawn: spawner.spawn,
-    argv: ["node", process.execPath],
+    argv: ["node", fakeCliEntry(dir)],
     env: {},
   });
 
@@ -123,7 +137,7 @@ test("the child re-invokes acpx's OWN refresh path — no second fetch implement
   warmCatalogueInBackground({
     cachePath: path.join(dir, "models-cache.json"),
     spawn: spawner.spawn,
-    argv: ["node", process.execPath],
+    argv: ["node", fakeCliEntry(dir)],
     env: {},
   });
   const call = spawner.calls[0];
@@ -147,7 +161,7 @@ test("a FRESH cache spawns nothing", () => {
     cachePath,
     now: () => now,
     spawn: spawner.spawn,
-    argv: ["node", process.execPath],
+    argv: ["node", fakeCliEntry(dir)],
     env: {},
   });
   assert.equal(spawner.calls.length, 0);
@@ -165,7 +179,7 @@ test("the cooldown stops N concurrent creates each spawning their own refresh", 
       cachePath,
       now: () => at,
       spawn: spawner.spawn,
-      argv: ["node", process.execPath],
+      argv: ["node", fakeCliEntry(dir)],
       env: {},
     });
 
@@ -184,7 +198,7 @@ test("the disable env var suppresses it entirely", () => {
   warmCatalogueInBackground({
     cachePath: path.join(dir, "models-cache.json"),
     spawn: spawner.spawn,
-    argv: ["node", process.execPath],
+    argv: ["node", fakeCliEntry(dir)],
     env: { ACPX_NO_CATALOGUE_WARM: "1" },
   });
   assert.equal(spawner.calls.length, 0);
@@ -198,7 +212,7 @@ test("a spawn that throws is swallowed — a create must never fail over a refre
       spawn: () => {
         throw new Error("EMFILE");
       },
-      argv: ["node", process.execPath],
+      argv: ["node", fakeCliEntry(dir)],
       env: {},
     }),
   );
@@ -216,4 +230,62 @@ test("no self-entry to re-invoke: nothing spawns and nothing throws", () => {
     }),
   );
   assert.equal(spawner.calls.length, 0);
+});
+
+/**
+ * 🛑 THE REGRESSION TEST FOR THE 116-FAILURE GATE. This is the case every other
+ * test in this file could not see, because they all INJECT an `argv` that
+ * happens to be acpx — the harness supplying what the real run does not
+ * (verification-soundness §7).
+ *
+ * MEASURED: inside a `node --test` worker `process.argv[1]` is the TEST FILE.
+ * The first version of this module therefore spawned
+ * `node <file>.test.js models --refresh --format json`, re-running whole test
+ * files as detached children against the parent's scratch `ACPX_STATE_HOME`.
+ * It was invisible when a file ran alone and catastrophic under the parallel
+ * suite.
+ */
+test("a NON-acpx argv[1] (a test file) must spawn NOTHING", () => {
+  const dir = tempCacheDir();
+  for (const entry of [
+    "/workspace/projects/acpx/p2-cli/dist-test/test/integration.test.js",
+    "/usr/local/bin/some-other-tool",
+    "/tmp/whatever.mjs",
+  ]) {
+    const spawner = recordingSpawn();
+    warmCatalogueInBackground({
+      cachePath: path.join(dir, `${path.basename(entry)}-cache.json`),
+      spawn: spawner.spawn,
+      argv: ["node", entry],
+      env: {},
+    });
+    assert.equal(spawner.calls.length, 0, `${entry} must not be re-invoked`);
+  }
+});
+
+test("the REAL installed entry shape — a symlink to cli.js — still warms", () => {
+  // The mirror of the test above, and it is what stops the guard from failing
+  // closed everywhere: on this box `/usr/local/bin/acpx` is a SYMLINK to
+  // `…/dist/cli.js`, so a real invocation's `argv[1]` basename is `acpx` and
+  // only its realpath is `cli.js`. A raw-basename check would pass in a source
+  // worktree and silently disable the warm on the deployed CLI — reinstating
+  // the very no-op this module exists to fix.
+  const dir = tempCacheDir();
+  const realCli = path.join(dir, "dist");
+  fs.mkdirSync(realCli, { recursive: true });
+  const cliPath = path.join(realCli, "cli.js");
+  fs.writeFileSync(cliPath, "");
+  const linkPath = path.join(dir, "acpx");
+  fs.symlinkSync(cliPath, linkPath);
+
+  const spawner = recordingSpawn();
+  warmCatalogueInBackground({
+    cachePath: path.join(dir, "models-cache.json"),
+    spawn: spawner.spawn,
+    argv: ["node", linkPath],
+    env: {},
+  });
+  assert.equal(spawner.calls.length, 1, "the symlinked bin must still warm");
+  // And the child is spawned with the RESOLVED path, not the symlink.
+  assert.equal(spawner.calls[0]?.args[0], fs.realpathSync(cliPath));
 });
