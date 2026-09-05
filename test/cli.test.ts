@@ -21,6 +21,7 @@ import { transcriptJsonlPath } from "../src/config/subscription-transcript.js";
 import { DEFAULT_CODEX_MODEL } from "../src/session/default-model.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence.js";
 import type { SessionRecord } from "../src/types.js";
+import { assertHarnessConfigDirRootIsolated } from "./config-dir-root-isolation.js";
 import {
   cleanupOwnerArtifacts,
   closeServer,
@@ -30,7 +31,6 @@ import {
   stopProcess,
   writeQueueOwnerLock,
 } from "./queue-test-helpers.js";
-import { assertHarnessConfigDirRootIsolated } from "./config-dir-root-isolation.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));

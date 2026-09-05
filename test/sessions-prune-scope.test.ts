@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import type { SessionRecord } from "../src/types.js";
+import { assertHarnessConfigDirRootIsolated } from "./config-dir-root-isolation.js";
 import {
   fileExists,
   makeSessionRecord,
@@ -12,7 +13,6 @@ import {
   withTempHome as withTempHomeFixture,
   writeSessionRecordFile,
 } from "./runtime-test-helpers.js";
-import { assertHarnessConfigDirRootIsolated } from "./config-dir-root-isolation.js";
 
 /**
  * brick://dd4cb0e8 — `acpx sessions prune` scope-first hardening.
