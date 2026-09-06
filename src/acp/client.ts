@@ -80,6 +80,7 @@ import {
   buildGeminiAcpStartupTimeoutMessage,
   buildPrimerSessionMeta,
   buildQoderAcpCommandArgs,
+  composePrimerWithBrickContext,
   ensureCopilotAcpSupport,
   isClaudeAcpCommand,
   isCopilotAcpCommand,
@@ -938,6 +939,16 @@ export class AcpClient {
    * ⚠️ Ordering: this runs AFTER `applyBoxProviderEnv` and `applyProfileEnv`, so
    * the primer script sees the fully-built child environment — including the
    * provider credential — exactly as the adapter will.
+   *
+   * ⚠️ THE BRICK BLOCK BELONGS HERE TOO, AND ITS ABSENCE IS SILENT (brick
+   * 968519c3). This leg is the ONLY primer path opencode and pi have, so a block
+   * folded in on the stream leg alone reaches neither of them. It shipped that
+   * way: `ACPX_BRICK` was set in the adapter env and `agents.md` rendered in
+   * full, so every surface that could have shown the gap looked healthy while
+   * the primer TEXT carried no brick at all — leaving a brick-linked agent to
+   * invent its own frame, which is indistinguishable from a read one in its
+   * output. Composed through `composePrimerWithBrickContext`, the SAME function
+   * the stream leg uses, so the two channels cannot drift.
    */
   private async applyHarnessConfigDirEnv(env: NodeJS.ProcessEnv): Promise<void> {
     if (!this.wantsHarnessConfigDir()) {
@@ -948,7 +959,10 @@ export class AcpClient {
       agentCommand: this.options.agentCommand,
       sessionId: this.resolveConfigDirId(),
       cwd: this.options.cwd,
-      primer: await resolveSessionPrimer(env),
+      primer: composePrimerWithBrickContext(
+        await resolveSessionPrimer(env),
+        await this.resolveBrickContext(),
+      ),
       model: this.options.sessionOptions?.model,
       // ⚠️ PROVISIONING IS ON FOR PI AND OFF FOR OPENCODE, AND THE ASYMMETRY IS
       // A MEASUREMENT, NOT CAUTION LEFT OVER FROM BEFORE.

@@ -942,3 +942,160 @@ test("importSession rejects provider session collisions across built-in command 
     );
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// brick://4d0cbdfa — THE DEPLOYED `/opt` FORK COMMAND, REACHING THE CLASSIFIER.
+//
+// ⚠️ READ THIS BEFORE ADDING A ROW HERE. The two drift tests above put
+// `AGENT_REGISTRY.codex` — which IS `node /opt/codex-acp/dist/index.js` on a box
+// where the fork is installed — into the archive, but on the **expected** side,
+// where it is settled by the byte-identity check at `import.ts:224` one line
+// BEFORE `commandLooksLikeBuiltInAgent` is ever consulted. So the `/opt` string
+// was in this file all along and **never reached the code under test**. It greps
+// exactly like coverage and is none: measured 2026-09-06, the classifier's only
+// input from this suite was the npx codex spec, for one adapter.
+//
+// The rows below put the deployed `/opt` command on the **ARCHIVED** side, which
+// is the only side that reaches the classifier. That is the production case: a
+// pi session exported from a box records `agent_command = "node
+// /opt/pi-acp/dist/index.js"`, and pre-fix the classifier answered NO to it.
+test("importSession accepts a pi archive whose command is the DEPLOYED /opt fork path", async () => {
+  await withTempHome("acpx-export-import-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const archivePath = path.join(homeDir, "archive.json");
+    await fs.mkdir(cwd, { recursive: true });
+
+    // The expected command is a DIFFERENT spelling of the same adapter, so the
+    // byte-identity short-circuit cannot fire and the classifier must answer.
+    const expectedAgentCommand = "npx pi-acp@^0.0.33";
+    const deployedForkCommand = "node /opt/pi-acp/dist/index.js";
+    assert.notEqual(
+      deployedForkCommand,
+      expectedAgentCommand,
+      "the two spellings must differ, or this row never reaches the classifier at all",
+    );
+
+    const source = makeSessionRecord({
+      acpxRecordId: "source-record",
+      acpSessionId: "provider-session",
+      agentCommand: expectedAgentCommand,
+      cwd,
+      name: "debug",
+    });
+    await writeSessionRecordFile(homeDir, source);
+    await exportSession(
+      { agentName: "pi", agentCommand: expectedAgentCommand, cwd, name: "debug" },
+      archivePath,
+    );
+    await fs.rm(sessionFilePath(homeDir, source.acpxRecordId));
+
+    const archive = JSON.parse(await fs.readFile(archivePath, "utf8")) as {
+      session: { agent?: string; agent_name?: string; state: { agent_command?: string } };
+    };
+    archive.session.agent = deployedForkCommand;
+    archive.session.agent_name = "pi";
+    archive.session.state.agent_command = deployedForkCommand;
+    await fs.writeFile(archivePath, `${JSON.stringify(archive, null, 2)}\n`, "utf8");
+
+    const imported = await importSession(archivePath, {
+      expectedAgentName: "pi",
+      expectedAgentCommand,
+    });
+    const record = await resolveSessionRecord(imported.record_id);
+
+    assert.equal(record.agentCommand, expectedAgentCommand);
+  });
+});
+
+// The same shape for claude and codex, whose old patterns could not match the
+// deployed command AT ALL (they looked for `@agentclientprotocol/…`, absent from
+// the `/opt` path) — so a boundary-class widening would have fixed pi and left
+// these two exactly as broken. Table-driven so the fifth adapter cannot be
+// forgotten the way pi and opencode were.
+for (const [agentName, expectedAgentCommand, deployedForkCommand] of [
+  ["claude", "npx -y @agentclientprotocol/claude-agent-acp@^0.4.4", "node /opt/claude-agent-acp/dist/index.js"],
+  ["codex", "npx -y @agentclientprotocol/codex-acp@^0.0.1", "node /opt/codex-acp/dist/index.js"],
+  ["claude-pty", "npx -y @agentclientprotocol/claude-pty-acp@^0.1.0", "node /opt/claude-pty-acp/dist/index.js"],
+  ["opencode", "npx -y opencode-ai@1.18.28 acp", "node /opt/opencode-ai/dist/index.js"],
+] as const) {
+  test(`importSession accepts a ${agentName} archive whose command is the deployed /opt fork path`, async () => {
+    await withTempHome("acpx-export-import-", async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      const archivePath = path.join(homeDir, "archive.json");
+      await fs.mkdir(cwd, { recursive: true });
+
+      const source = makeSessionRecord({
+        acpxRecordId: "source-record",
+        acpSessionId: "provider-session",
+        agentCommand: expectedAgentCommand,
+        cwd,
+        name: "debug",
+      });
+      await writeSessionRecordFile(homeDir, source);
+      await exportSession({ agentName, agentCommand: expectedAgentCommand, cwd, name: "debug" }, archivePath);
+      await fs.rm(sessionFilePath(homeDir, source.acpxRecordId));
+
+      const archive = JSON.parse(await fs.readFile(archivePath, "utf8")) as {
+        session: { agent?: string; agent_name?: string; state: { agent_command?: string } };
+      };
+      archive.session.agent = deployedForkCommand;
+      archive.session.agent_name = agentName;
+      archive.session.state.agent_command = deployedForkCommand;
+      await fs.writeFile(archivePath, `${JSON.stringify(archive, null, 2)}\n`, "utf8");
+
+      const imported = await importSession(archivePath, {
+        expectedAgentName: agentName,
+        expectedAgentCommand,
+      });
+      const record = await resolveSessionRecord(imported.record_id);
+
+      assert.equal(record.agentCommand, expectedAgentCommand);
+    });
+  });
+}
+
+// ⚠️ THE DIRECTION TO FEAR ON THIS PATH IS A WRONG **YES** — it would accept one
+// adapter's archive into another adapter's session. `rapi-acp` is the adversarial
+// case: it ENDS in `pi-acp`, and `npx rapi-acp@1.0.0` classified as pi before the
+// token boundary landed. Without this row a build that always answers YES passes
+// every accept row above.
+for (const adversarialCommand of ["npx rapi-acp", "npx rapi-acp@1.0.0"]) {
+  test(`importSession REJECTS an archive whose command only looks like pi (${adversarialCommand})`, async () => {
+    await withTempHome("acpx-export-import-", async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      const archivePath = path.join(homeDir, "archive.json");
+      await fs.mkdir(cwd, { recursive: true });
+
+      const expectedAgentCommand = "npx pi-acp@^0.0.33";
+      const source = makeSessionRecord({
+        acpxRecordId: "source-record",
+        acpSessionId: "provider-session",
+        agentCommand: expectedAgentCommand,
+        cwd,
+        name: "debug",
+      });
+      await writeSessionRecordFile(homeDir, source);
+      await exportSession(
+        { agentName: "pi", agentCommand: expectedAgentCommand, cwd, name: "debug" },
+        archivePath,
+      );
+      await fs.rm(sessionFilePath(homeDir, source.acpxRecordId));
+
+      const archive = JSON.parse(await fs.readFile(archivePath, "utf8")) as {
+        session: { agent?: string; agent_name?: string; state: { agent_command?: string } };
+      };
+      archive.session.agent = adversarialCommand;
+      archive.session.agent_name = "pi";
+      archive.session.state.agent_command = adversarialCommand;
+      await fs.writeFile(archivePath, `${JSON.stringify(archive, null, 2)}\n`, "utf8");
+
+      await assert.rejects(
+        importSession(archivePath, { expectedAgentName: "pi", expectedAgentCommand }),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, "agent-mismatch");
+          return true;
+        },
+      );
+    });
+  });
+}

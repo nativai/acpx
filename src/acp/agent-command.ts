@@ -106,14 +106,30 @@ export function isOpenCodeAcpCommand(command: string, args: readonly string[]): 
 
 /**
  * Pi's ACP adapter, `pi-acp` — launched as `npx pi-acp@<exact pin>`
- * (`ACP_ADAPTER_PACKAGE_RANGES.pi`). Matches on the package name so the pin can
- * move without this detector following it.
+ * (`ACP_ADAPTER_PACKAGE_RANGES.pi`) or, where the Nativai fork is installed, as
+ * `node /opt/pi-acp/dist/index.js`. Matches on the package name so the pin can
+ * move without this detector following it, and so the registry spec, the `/opt`
+ * fork and a dev checkout all classify alike.
+ *
+ * ⚠️ `pi-acp` MUST SIT ON A TOKEN BOUNDARY — this is the shortest adapter name
+ * acpx knows, and it is a suffix of real package names. The clause here was
+ * `part.includes("pi-acp@")`, under which **`npx rapi-acp@1.0.0` classified as
+ * pi** — a wrong YES in the one classifier that gates the copy/fork agent-lock,
+ * `harnessIdForAgentCommand`, and (via `commandLooksLikeBuiltInAgent`) whether
+ * an imported session's command counts as a built-in agent. On every one of
+ * those a wrong YES is worse than a wrong NO, so the boundary is required, not
+ * cosmetic. `/(?:^|[\s/])pi-acp(?:@|[\s/]|$)/` accepts the same forms the old
+ * clauses did — a bare `pi-acp` part, `pi-acp@<range>`, and any `…/pi-acp/…`
+ * path — and rejects a name that merely ENDS in `pi-acp`.
+ *
+ * A plain `includes("pi-acp")` is not an option and never was: it classifies
+ * `rapi-acp` as pi.
  */
+const PI_ACP_TOKEN_RE = /(?:^|[\s/])pi-acp(?:@|[\s/]|$)/;
+
 export function isPiAcpCommand(command: string, args: readonly string[]): boolean {
   const parts = [command, ...args];
-  return parts.some(
-    (part) => part === "pi-acp" || part.includes("pi-acp@") || part.includes("/pi-acp"),
-  );
+  return parts.some((part) => PI_ACP_TOKEN_RE.test(part));
 }
 
 /**
@@ -259,12 +275,10 @@ export function buildPrimerSessionMeta(
   if (channel === "none") {
     return undefined;
   }
-  const primerText = nonEmptyString(primer);
-  const brickText = nonEmptyString(brickContext);
+  const primerPlusBrick = composePrimerWithBrickContext(primer, brickContext);
 
   if (channel === "developer-instructions") {
-    const developerInstructions = joinPromptFragments([primerText, brickText]);
-    return developerInstructions ? { codex: { developerInstructions } } : undefined;
+    return primerPlusBrick ? { codex: { developerInstructions: primerPlusBrick } } : undefined;
   }
 
   // system-prompt channel (claude, claude-pty).
@@ -273,11 +287,43 @@ export function buildPrimerSessionMeta(
     return undefined;
   }
   const humanAppend = readAppendString(humanSystemPrompt);
-  const primerPlus = joinPromptFragments([primerText, brickText, humanAppend]);
+  const primerPlus = joinPromptFragments([primerPlusBrick, humanAppend]);
   if (!primerPlus) {
     return undefined;
   }
   return { systemPrompt: { append: primerPlus } };
+}
+
+/**
+ * THE one composition of "the OS primer, plus this session's brick block" —
+ * shared by BOTH primer assembly paths so the two can never drift in wording or
+ * in separator (brick 968519c3).
+ *
+ *  - the STREAM leg: {@link buildPrimerSessionMeta} above, for the harnesses
+ *    whose primer rides an ACP `_meta` channel (claude, claude-pty, codex);
+ *  - the CONFIG-DIR leg: `applyHarnessConfigDirEnv` in `src/acp/client.ts`,
+ *    for the harnesses whose only working primer path is a file in a per-session
+ *    config dir (opencode, pi — `primerChannel === "config-file"`).
+ *
+ * ⚠️ The config-dir leg shipped WITHOUT this join, and nothing caught it: the
+ * agents.md render arrived complete, `ACPX_BRICK` was correctly set in the
+ * adapter env, and only the brick BLOCK was missing from the primer text — so a
+ * brick-linked opencode/pi agent was never told its brick and had to
+ * reconstruct the frame itself. Measured on the production evidence run: claude
+ * 37,803 ch with the block, pi and opencode 32,999 ch with zero brick tokens.
+ * A composer that only one caller uses is how that recurs, which is why this is
+ * a shared function and not a second copy of the wording.
+ *
+ * Order is part of the contract — primer FIRST (foundational, cacheable), brick
+ * block LAST (most salient), with the same `"\n\n---\n\n"` separator every other
+ * prompt fragment uses. Returns `undefined` when BOTH parts are absent, so a
+ * caller can treat "nothing to inject" as one case.
+ */
+export function composePrimerWithBrickContext(
+  primer: string | undefined,
+  brickContext: string | undefined,
+): string | undefined {
+  return joinPromptFragments([nonEmptyString(primer), nonEmptyString(brickContext)]);
 }
 
 function joinPromptFragments(parts: Array<string | undefined>): string | undefined {

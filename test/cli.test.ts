@@ -8943,3 +8943,86 @@ test("sessions template on an unknown id errors cleanly", async () => {
     assert.notEqual(result.code, 0);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// brick://4d0cbdfa — THE COPY/FORK AGENT-LOCK ON THE DEPLOYED `/opt` pi SHAPE.
+//
+// ⚠️ WHY THIS ROW EXISTS AND A CLASSIFIER UNIT TEST DOES NOT COVER IT. The
+// `pi-acp` token boundary in `isPiAcpCommand` is a NARROWING, and a narrowing's
+// failure mode is turning a correct YES into a NO. In `assertCopyAgentLock` that
+// NO does not surface as a classifier fault — it surfaces as **"fork is refused
+// on a pi session"**, i.e. requirement #1 of this programme (fork + by-the-way)
+// broken by a fix aimed at an import-path display bug. The lock is a separate
+// consumer with its own call path; only exercising it answers for it.
+//
+// Both spellings below carry `/pi-acp/` as a PATH SEGMENT — the shape of the
+// deployed `node /opt/pi-acp/dist/index.js`, and precisely the shape the npx-only
+// patterns could not see. They are different strings, so the lock's byte-identity
+// short-circuit cannot fire and `acpAdapterKind` must be what admits the copy.
+//
+// Symlinking the mock under a `pi-acp`-named directory is the same device
+// `harness-config-dir-spawn-env.test.ts` uses: the argument string carries the
+// token while Node still resolves the module from the real location, so this
+// drives acpx's REAL classification path with an adapter that actually answers.
+async function linkMockUnderPiAcpDir(root: string, label: string): Promise<string> {
+  const dir = path.join(root, label, "pi-acp");
+  await fs.mkdir(dir, { recursive: true });
+  const link = path.join(dir, "mock-agent.js");
+  await fs.symlink(MOCK_AGENT_PATH, link);
+  return `node ${JSON.stringify(link)} --supports-fork-session`;
+}
+
+for (const [label, extraArgs] of [
+  ["fork", [] as string[]],
+  ["by-the-way", ["--ephemeral"]],
+] as const) {
+  test(`sessions copy (${label}) is ALLOWED across pi command spellings incl. the deployed /opt path shape`, async () => {
+    await withTempHome(async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      await fs.mkdir(cwd, { recursive: true });
+      await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+
+      // The SOURCE carries the deployed path shape; the PATH AGENT is a second,
+      // different pi spelling — exactly the drift the lock must tolerate.
+      const sourceCommand = await linkMockUnderPiAcpDir(homeDir, "deployed");
+      const pathCommand = await linkMockUnderPiAcpDir(homeDir, "registry");
+      assert.notEqual(
+        sourceCommand,
+        pathCommand,
+        "the two spellings must differ, or the lock short-circuits and this row proves nothing",
+      );
+
+      await fs.writeFile(
+        path.join(homeDir, ".acpx", "config.json"),
+        `${JSON.stringify({ agents: { pi: { command: pathCommand } } }, null, 2)}\n`,
+        "utf8",
+      );
+      await writeSessionRecord(homeDir, {
+        acpxRecordId: `source-pi-${label}`,
+        acpSessionId: `source-acp-pi-${label}`,
+        agentCommand: sourceCommand,
+        cwd,
+        name: `pi-source-${label}`,
+        messages: [{ User: { id: "user-1", content: [{ Text: "hi" }] } }],
+        lastSeq: 1,
+      });
+
+      const result = await runCli(
+        ["--format", "json", "pi", "sessions", "copy", "--from", `source-pi-${label}`, ...extraArgs],
+        homeDir,
+      );
+
+      // THE assertion: the agent-lock must not fire. Stated as its own check so a
+      // failure names the lock rather than whatever the copy did afterwards.
+      assert.doesNotMatch(
+        result.stderr,
+        /sessions copy preserves the source agent type/,
+        `the agent-lock rejected a same-adapter pi copy — ${result.stderr}`,
+      );
+      // And the copy must actually COMPLETE, not merely get past the lock: a
+      // lock-message-only assertion passes just as well on a copy that died one
+      // line later, which is how "past the lock" gets mistaken for "fork works".
+      assert.equal(result.code, 0, result.stderr);
+    });
+  });
+}

@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { z, ZodError } from "zod";
+import { acpAdapterKind } from "../acp/agent-command.js";
 import { AcpxOperationalError } from "../errors.js";
 import type { AcpJsonRpcMessage, SessionRecord } from "../types.js";
 import { defaultSessionEventLog, sessionEventActivePath } from "./event-log.js";
@@ -228,18 +229,42 @@ function agentCommandMatchesExpected(
     : false;
 }
 
+/**
+ * Does an ARCHIVED agent command name the same built-in adapter the import is
+ * destined for? Asked only when the two command strings are not byte-identical
+ * (see {@link agentCommandMatchesExpected}), i.e. the adapter's launch spelling
+ * drifted between export and import.
+ *
+ * ⚠️ KEYED ON THE ADAPTER NAME, NEVER ON A LAUNCH PATH (brick 4d0cbdfa). This
+ * shipped as three per-name regexes over the npm package specs, and **every
+ * command the boxes actually run failed its own classifier**: the deployed
+ * adapters are `/opt` forks —
+ *
+ *     node /opt/pi-acp/dist/index.js
+ *     node /opt/codex-acp/dist/index.js
+ *     node /opt/claude-agent-acp/dist/index.js
+ *
+ * — and the codex/claude patterns looked for `@agentclientprotocol/…`, a string
+ * those commands do not contain **at all**. So widening a boundary class could
+ * never have fixed them; they needed a predicate that asks *which adapter is
+ * this*, and lets the answer come from whichever surface carries the name —
+ * registry spec, `/opt` fork, or a dev checkout.
+ *
+ * {@link acpAdapterKind} is that predicate, and is already THE one classifier
+ * behind `isClaudeFamilyAgent`, the capability descriptor's
+ * `harnessIdForAgentCommand`, and the copy/fork agent-lock. Deriving from it
+ * rather than from a fourth private table is the point: a new adapter, or a new
+ * spelling of an existing one, is taught to acpx once. The next adapter that
+ * moves to `/opt` must not reopen this.
+ *
+ * ⚠️ A WRONG **YES** IS THE DIRECTION TO FEAR — it accepts an archive from one
+ * adapter into another adapter's session. An unrecognised command yields
+ * `undefined`, which matches no agent name, so an unknown command is rejected
+ * exactly as the old `default:` branch rejected it.
+ */
 function commandLooksLikeBuiltInAgent(command: string, agentName: string): boolean {
-  const normalized = command.trim();
-  switch (agentName) {
-    case "pi":
-      return /(?:^|\s)pi-acp(?:@|\s|$)/.test(normalized);
-    case "codex":
-      return /(?:^|\s)@agentclientprotocol\/codex-acp(?:@|\s|$)/.test(normalized);
-    case "claude":
-      return /(?:^|\s)@agentclientprotocol\/claude-agent-acp(?:@|\s|$)/.test(normalized);
-    default:
-      return false;
-  }
+  const kind = acpAdapterKind(command);
+  return kind !== undefined && kind === agentName.trim().toLowerCase();
 }
 
 async function assertDestinationScopeAvailable(record: SessionRecord): Promise<void> {
