@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { AcpClient } from "../src/acp/client.js";
 import { ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR } from "../src/acp/harness-capabilities.js";
 import type { HarnessId } from "../src/acp/harness-capabilities.js";
+import { resetSessionPrimerMemoForTests } from "../src/acp/session-primer.js";
 import type { AcpClientOptions } from "../src/types.js";
 
 // B3 deliverable 5 — RS-13's in-repo half: THE ADAPTER-BOUNDARY DIFFERENTIAL.
@@ -517,3 +518,177 @@ test("the SHIPPED provisioning list is what the spawn routes on — both directi
   // The restore actually happened, so nothing downstream inherits the swap.
   assert.deepEqual([...ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR], ["pi"]);
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// brick://968519c3 — THE BRICK BLOCK ON THE CONFIG-DIR CHANNEL.
+//
+// acpx assembles the primer on TWO paths and only one folded the brick block in:
+//
+//   STREAM leg      client.ts buildPrimerSessionMeta / buildResumePrimerMeta
+//                   -> agent-command.ts buildPrimerSessionMeta(.., brickContext)
+//   CONFIG-DIR leg  client.ts applyHarnessConfigDirEnv
+//                   -> primer: resolveSessionPrimer(env)          <- bare render
+//
+// The config-dir leg is the ONLY primer path opencode and pi have, so the block
+// reached neither. Measured on the production evidence run: claude 37,803 ch
+// WITH the block, pi and opencode 32,999 ch with ZERO brick tokens. agents.md was
+// complete in all three — never truncation — and `ACPX_BRICK` was correctly set
+// in the adapter env throughout, so every surface that could have shown the gap
+// looked healthy while a brick-linked agent was left to invent its own frame.
+//
+// ⚠️ THIS FILE IS THE ONLY BOUNDARY THAT CAN SEE IT. The composer is shared with
+// the stream leg, so a composer unit test proves the WORDING and says nothing
+// about the WIRING — and the wiring, one missing argument at `client.ts:951`, was
+// the entire defect. These rows drive a real spawn and read the file acpx wrote.
+//
+// ⚠️ AND THE ABSENCE ARM IS NOT OPTIONAL. A build that injects the block
+// unconditionally passes every presence assertion here. `no brick -> no block` is
+// what separates "the block is carried for a brick-linked session" from "the
+// block is always there".
+// ⚠️ SOURCE-TREE PATH, NOT `import.meta.url`. The shim is an extensionless
+// executable, so `tsgo` does not copy it into `dist-test/` — resolving it
+// relative to the COMPILED file yields a path that does not exist, `brick`
+// falls off PATH, and `resolveBrickContext` fail-opens to undefined. That reads
+// as "the product never injected the block" and would have made this row a
+// FALSE RED against a correct fix. `test/brick-link.test.ts` resolves it from
+// `process.cwd()` for the same reason.
+const BRICK_SHIM_DIR = path.join(process.cwd(), "test", "fixtures", "brick-shim");
+const PRIMER_MARKER = "PRIMER-AGENTS-MD-MARKER";
+const BRICK_MARKER = "BRICK-BLOCK-MARKER-968519c3";
+const TEST_BRICK_UUID = "11111111-2222-3333-4444-555555555555";
+
+/** Where each config-file harness writes the rendered primer. */
+const PRIMER_FILE: Record<string, { envName: string; fileName: string }> = {
+  // ⚠️ opencode is XDG_CONFIG_HOME, NOT OPENCODE_CONFIG_DIR. The writer puts the
+  // primer at `join(dir, "acpx-primer.md")` and sets XDG_CONFIG_HOME=dir while
+  // OPENCODE_CONFIG_DIR=dir/opencode — so reading the latter finds no file and
+  // is indistinguishable from a primer that was never written.
+  opencode: { envName: "XDG_CONFIG_HOME", fileName: "acpx-primer.md" },
+  pi: { envName: "PI_CODING_AGENT_DIR", fileName: "APPEND_SYSTEM.md" },
+};
+
+/**
+ * Spawn `harness` with a stubbed `agents.md` renderer and a stubbed `brick` CLI,
+ * and return the primer text acpx actually WROTE to the config dir (or undefined
+ * when it wrote no primer file at all).
+ *
+ * `brick` is stubbed via PATH rather than mocked: `resolveBrickContext` spawns
+ * the real binary and inherits `process.env`, so the shim is what the product
+ * would have executed. The primer renderer is stubbed the same way through the
+ * `ACPX_SESSION_PRIMER_COMMAND` seam.
+ */
+async function readWrittenPrimer(
+  harness: string,
+  options: { brick?: string },
+): Promise<string | undefined> {
+  const { envName, fileName } = PRIMER_FILE[harness];
+  const restoreTmp = await scopeTmpDir();
+  const scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "hp-968519c3-"));
+  const primerScript = path.join(scratchDir, "primer.sh");
+  await fs.writeFile(primerScript, `#!/bin/sh\nprintf '${PRIMER_MARKER}\\n'\n`, { mode: 0o755 });
+
+  const saved = {
+    PATH: process.env.PATH,
+    ACPX_SESSION_PRIMER_COMMAND: process.env.ACPX_SESSION_PRIMER_COMMAND,
+    BRICK_SHIM_MODE: process.env.BRICK_SHIM_MODE,
+    BRICK_SHIM_CONTEXT: process.env.BRICK_SHIM_CONTEXT,
+  };
+  process.env.PATH = `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`;
+  process.env.ACPX_SESSION_PRIMER_COMMAND = primerScript;
+  process.env.BRICK_SHIM_MODE = "ok";
+  process.env.BRICK_SHIM_CONTEXT = BRICK_MARKER;
+  // The primer render is memoized per env for the process lifetime; without this
+  // the second arm would reuse the first arm's render and prove nothing.
+  resetSessionPrimerMemoForTests();
+
+  const linkDir = path.join(scratchDir, HARNESS_DIR_TOKENS[harness]);
+  await fs.mkdir(linkDir, { recursive: true });
+  const mockLink = path.join(linkDir, "mock-agent.js");
+  await fs.symlink(MOCK_AGENT_PATH, mockLink);
+  const envDumpPath = path.join(scratchDir, "env-dump.json");
+
+  const client = new AcpClient({
+    agentCommand:
+      `node ${JSON.stringify(mockLink)} ` +
+      `--env-dump-file ${JSON.stringify(envDumpPath)} ` +
+      `--env-dump-extra ${CONFIG_DIR_NAMES.join(",")}`,
+    cwd: scratchDir,
+    permissionMode: "approve-reads",
+    sessionContext: {
+      acpxRecordId: `rec-968519c3-${harness}-${options.brick ? "brick" : "nobrick"}`,
+      ...(options.brick ? { brick: options.brick } : {}),
+    },
+  });
+  try {
+    await client.start();
+    await client.createSession();
+    const dump = JSON.parse(await fs.readFile(envDumpPath, "utf8")) as Record<string, string>;
+    // POPULATION FIRST — a dump the child never wrote satisfies every "is absent"
+    // assertion below vacuously, which is the whole failure mode this guards.
+    assert.ok(
+      Object.keys(dump).length > 5,
+      `${harness}: env dump has ${Object.keys(dump).length} entries — the child never ran; NOT RUN, not clean`,
+    );
+    const configDir = dump[envName];
+    assert.ok(configDir, `${harness}: ${envName} was never set — the config dir never happened`);
+    // Read the file INSIDE the spawn: close() removes the directory (brick 433f6bf8).
+    return await fs.readFile(path.join(configDir, fileName), "utf8").catch(() => undefined);
+  } finally {
+    await client.close().catch(() => {});
+    await fs.rm(scratchDir, { recursive: true, force: true });
+    await restoreTmp();
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+    resetSessionPrimerMemoForTests();
+  }
+}
+
+for (const harness of ["opencode", "pi"]) {
+  test(`968519c3: the ${harness} config-dir primer carries the brick block for a brick-linked session — and NOT without a brick`, async () => {
+    const withBrick = await readWrittenPrimer(harness, { brick: TEST_BRICK_UUID });
+    const withoutBrick = await readWrittenPrimer(harness, {});
+
+    // Printed so the row's evidence is the measurement, not the verdict.
+    process.stderr.write(
+      `[968519c3] ${harness}: withBrick=${JSON.stringify(withBrick)} withoutBrick=${JSON.stringify(withoutBrick)}\n`,
+    );
+
+    // POSITIVE CONTROL on the very path under assertion: the primer marker must
+    // be in BOTH arms. Without it, "no brick marker" cannot be told apart from
+    // "acpx wrote no primer file at all" / "the renderer never ran".
+    assert.match(
+      withBrick ?? "",
+      new RegExp(PRIMER_MARKER),
+      `${harness}: the agents.md render is missing from the brick-linked arm — this arm measured nothing`,
+    );
+    assert.match(
+      withoutBrick ?? "",
+      new RegExp(PRIMER_MARKER),
+      `${harness}: the agents.md render is missing from the no-brick arm — this arm measured nothing`,
+    );
+
+    // THE FIX.
+    assert.match(
+      withBrick ?? "",
+      new RegExp(BRICK_MARKER),
+      `${harness}: the brick block is absent from the config-dir primer — the defect is live`,
+    );
+    // THE ABSENCE CONTROL — this is what makes the row above mean something.
+    assert.doesNotMatch(
+      withoutBrick ?? "",
+      new RegExp(BRICK_MARKER),
+      `${harness}: a session with NO brick received a brick block — the block is being injected unconditionally`,
+    );
+    // Order is part of the contract: primer first, brick block last.
+    const text = withBrick ?? "";
+    assert.ok(
+      text.indexOf(PRIMER_MARKER) < text.indexOf(BRICK_MARKER),
+      `${harness}: primer must precede the brick block`,
+    );
+  });
+}

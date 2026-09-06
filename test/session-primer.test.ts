@@ -5,7 +5,9 @@ import path from "node:path";
 import test from "node:test";
 import { buildPrimerSessionMeta, resolvePrimerChannel } from "../src/acp/agent-command.js";
 import { AcpClient } from "../src/acp/client.js";
+import { HARNESS_FACTS, HARNESS_IDS } from "../src/acp/harness-capabilities.js";
 import { resetSessionPrimerMemoForTests, resolveSessionPrimer } from "../src/acp/session-primer.js";
+import { AGENT_REGISTRY } from "../src/agent-registry.js";
 
 // Unified OS-primer injection at the acpx layer (CONCEPTION §4). acpx runs the
 // session-context primer once per process and routes it to the right `_meta`
@@ -465,4 +467,101 @@ test("resumeSession (codex): attaches NO _meta (developer item restored from thr
     await client.resumeSession("session-stub", "/tmp/acpx-primer-resume-codex");
     assert.equal(captured.resumeMeta, "absent");
   });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// brick://968519c3 — THE TWO PRIMER CHANNELS, PINNED AGAINST EACH OTHER.
+//
+// The defect was the brick block reaching the STREAM leg and not the CONFIG-DIR
+// leg. Fixing it by routing both through `composePrimerWithBrickContext` means
+// the two legs now share a composer — so the risk shifts from "one leg was never
+// wired" to "the fix MOVED the block instead of adding it". A test that covers
+// only the repaired path cannot tell those apart.
+//
+// The config-dir half lives in `harness-config-dir-spawn-env.test.ts` (it needs a
+// real spawn to read the file acpx wrote). THIS row is the other half: the stream
+// leg must still carry the block, on a brick-linked session, after the change.
+test("createSession (claude): the brick block STILL rides the stream leg after the config-dir fix", async () => {
+  const brickShimDir = path.join(process.cwd(), "test", "fixtures", "brick-shim");
+  const saved = {
+    PATH: process.env.PATH,
+    BRICK_SHIM_MODE: process.env.BRICK_SHIM_MODE,
+    BRICK_SHIM_CONTEXT: process.env.BRICK_SHIM_CONTEXT,
+  };
+  process.env.PATH = `${brickShimDir}:${process.env.PATH ?? ""}`;
+  process.env.BRICK_SHIM_MODE = "ok";
+  process.env.BRICK_SHIM_CONTEXT = "STREAM-BRICK-BLOCK";
+  try {
+    await withPrimerScript("printf 'PRIMER-STREAM\\n'", async () => {
+      const captured: CapturedConnection = {};
+      const client = new AcpClient({
+        agentCommand: SDK_CLAUDE_COMMAND,
+        cwd: process.cwd(),
+        permissionMode: "approve-reads",
+        sessionContext: {
+          acpxRecordId: "rec-968519c3-stream",
+          brick: "11111111-2222-3333-4444-555555555555",
+        },
+      } as ConstructorParameters<typeof AcpClient>[0]);
+      stubConnection(client, captured);
+      await client.createSession("/tmp/acpx-primer-stream-brick");
+      const append = systemPromptAppend(captured.newSessionMeta) ?? "";
+      // Positive control on the same path: without the primer marker this row
+      // measured nothing and its brick assertion would be vacuous.
+      assert.match(append, /PRIMER-STREAM/, "the agents.md render is missing — this row is NOT RUN");
+      assert.match(append, /STREAM-BRICK-BLOCK/, "the brick block was MOVED off the stream leg");
+      assert.ok(
+        append.indexOf("PRIMER-STREAM") < append.indexOf("STREAM-BRICK-BLOCK"),
+        "primer must precede the brick block",
+      );
+      assert.ok(append.includes(PRIMER_SEPARATOR), "the shared separator must be used");
+    });
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+});
+
+// ⚠️ THE DISJOINTNESS IS WHAT MAKES THE SHARED COMPOSER SAFE, AND NOTHING
+// ENFORCED IT. Folding the brick block into both legs can only avoid
+// double-injecting because the two legs are mutually exclusive per harness:
+// `resolvePrimerChannel` answers `none` for opencode and pi, and
+// `applyHarnessConfigDirEnv` fires only for `primerChannel === "config-file"`,
+// which only opencode and pi declare. That is a property of TWO INDEPENDENT
+// FUNCTIONS AGREEING — an agreement that held by construction and by nobody's
+// assertion. A sixth harness declared `config-file` while also matching a stream
+// detector would receive the primer TWICE, and no existing row would notice.
+test("968519c3: every harness carries its primer on EXACTLY ONE channel — stream XOR config-dir", () => {
+  const routing: Record<string, { stream: string; declared: string }> = {};
+  for (const id of HARNESS_IDS) {
+    routing[id] = {
+      stream: resolvePrimerChannel(AGENT_REGISTRY[id] ?? ""),
+      declared: HARNESS_FACTS[id].primerChannel,
+    };
+  }
+  // Printed so the row's evidence is the measurement, not the verdict.
+  process.stderr.write(`[968519c3] primer routing = ${JSON.stringify(routing)}\n`);
+
+  for (const id of HARNESS_IDS) {
+    const onStream = routing[id].stream !== "none";
+    const onConfigDir = routing[id].declared === "config-file";
+    assert.notEqual(
+      onStream,
+      onConfigDir,
+      `${id}: primer channels are not disjoint (stream=${routing[id].stream}, declared=${routing[id].declared}) — ` +
+        `this harness would receive the primer twice, or not at all`,
+    );
+  }
+  // TWO-SIDED CONTROL: the run must contain BOTH kinds. All-stream or
+  // all-config-dir would satisfy the XOR above while proving nothing.
+  const streamCount = HARNESS_IDS.filter((id) => routing[id].stream !== "none").length;
+  const configDirCount = HARNESS_IDS.filter((id) => routing[id].declared === "config-file").length;
+  assert.ok(streamCount > 0, "no harness routes to the stream leg — the table is degenerate");
+  assert.ok(configDirCount > 0, "no harness routes to the config-dir leg — the table is degenerate");
+  assert.equal(streamCount + configDirCount, HARNESS_IDS.length);
 });
