@@ -1071,30 +1071,38 @@ export function applyHarnessConfigDir(
  *    declared under the same key — silently replacing a catalogue while looking
  *    like an addition.
  *
- *    ⚠️ **THIS IS NOT THE SAME QUESTION AS THE ONE THAT KEEPS PROVISIONING OFF,
- *    AND IT IS NOT PI THAT IT IS OFF FOR** (brick b4da4a48). This comment
- *    previously said "the same replace-vs-merge hazard that keeps
- *    `provisionModelId` switched off for pi", and both halves were false:
+ *    ⚠️ **THIS IS A DIFFERENT LAYER FROM OPENCODE'S OWN MERGE SEMANTICS — TWO
+ *    QUESTIONS, TWO ANSWERS, AND NEITHER SETTLES THE OTHER** (brick b4da4a48).
+ *    The rule here is about **acpx's own** compose of the box `opencode.json`
+ *    into the per-session one: acpx's code, acpx's format, answered by the merge
+ *    written below. Whether **OPENCODE ITSELF** deep-merges an empty
+ *    `provider.openrouter.models.<slug>: {}` over an entry it already has is
+ *    opencode's code and opencode's format. As `client.ts` puts it: *"Two
+ *    harnesses, two different config formats, two separate questions; answering
+ *    one does not answer the other."*
  *
- *      - **PI IS SWITCHED ON.** `ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR` is
- *        `["pi"]` and `client.ts` provisions for it. **OPENCODE is the harness
- *        provisioning is off for.**
- *      - **TWO LAYERS, TWO QUESTIONS.** The rule here is about **acpx's own**
- *        compose of the box `opencode.json` into the per-session one — acpx's
- *        code, acpx's format, and answered by the merge written below. What
- *        keeps provisioning off for opencode is whether **OPENCODE ITSELF**
- *        deep-merges an empty `provider.openrouter.models.<slug>: {}` over its
- *        BUNDLED catalogue entry — opencode's code, opencode's format. As
- *        `client.ts` puts it: *"Two harnesses, two different config formats, two
- *        separate questions; answering one does not answer the other."*
+ *    **THAT SECOND QUESTION IS NOW ANSWERED, AND THE ANSWER IS MERGE** — measured
+ *    2026-09-06 against OpenCode 1.18.28 on a scratch rig, brick 4c7a38b2,
+ *    `verification/evidence/B4-M1-opencode-config-merge-vs-replace.md`. An empty
+ *    declaration preserved `capabilities.reasoning: true` (the support the
+ *    `effort` ladder is advertised from — the loss this paragraph used to warn
+ *    about) along with name, family, cost and limit, and a pre-existing
+ *    PROJECT-level entry survived it as well. `ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR`
+ *    accordingly now carries `"opencode"` beside `"pi"`.
  *
- *    **THE MEASUREMENT THAT WOULD MOVE THAT SWITCH** — named here so this
- *    justification cannot go stale the same way twice: does OpenCode DEEP-MERGE
- *    or REPLACE a bundled entry given an empty declaration? If it replaces, the
- *    model loses the `reasoning` support its `effort` ladder is advertised from
- *    and depth silently stops working for every pinned model. **When that is
- *    answered MERGE, cite it — do not infer it from this rule, which answers a
- *    different layer.**
+ *    ⚠️ **THE TWO ANSWERS AGREEING IS NOT A LICENCE TO CONFLATE THE LAYERS.**
+ *    Cite the measurement, not this rule, for anything about opencode's own
+ *    loader — and cite this rule, not the measurement, for anything about what
+ *    acpx composes.
+ *
+ *    ⚠️ **AND THE CATALOGUE IS LIVE-REFRESHED, NOT A BUNDLED SNAPSHOT.** The
+ *    entry a declaration merges over comes from a ~4.5 MB `models.json` OpenCode
+ *    fetches from models.dev at runtime and caches under
+ *    `$XDG_CACHE_HOME/opencode/`. It CHURNS: across three rig runs minutes apart
+ *    the openrouter row count moved 359 → 362 → 361 with a set diff of +5/−2
+ *    while exactly one slug was planted. Anyone reasoning from "bundled" will get
+ *    the caching and the failure modes wrong — and will read catalogue drift as
+ *    their own change doing something.
  * 2. **`instructions` UNIONS rather than replaces**, box entries first, acpx's
  *    primer last. It is an array, and arrays normally replace — but replacing is
  *    exactly the discard this brick exists to end, and a box that configured

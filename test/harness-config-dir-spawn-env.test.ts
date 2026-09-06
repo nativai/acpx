@@ -472,6 +472,11 @@ test("the SHIPPED provisioning list is what the spawn routes on — both directi
   // One harness that IS on the list and one that is NOT, measured through a real
   // adapter spawn. A row that pinned only the positive would be the same
   // one-sided defence being removed here.
+  // ⚠️ BOTH SHIPPED ENTRIES ARE NOW `true`, SO PART 1 ON ITS OWN IS ONE-SIDED —
+  // and saying so is the point. `opencode` used to be this part's negative;
+  // routing it (brick 4c7a38b2, the merge-vs-replace measurement) took that away.
+  // Part 2's EMPTY-LIST arm is what restores the negative direction through the
+  // very same instrument, which is why it is not optional decoration here.
   const shippedPi = await observeProvisioning("pi");
   const shippedOpencode = await observeProvisioning("opencode");
   process.stderr.write(
@@ -481,42 +486,64 @@ test("the SHIPPED provisioning list is what the spawn routes on — both directi
   assert.equal(shippedPi, true, "pi is on the shipped list and the spawn must provision for it");
   assert.equal(
     shippedOpencode,
-    false,
-    "opencode is NOT on the shipped list and the spawn must not provision for it — " +
-      "the empty-declaration merge-vs-replace question is still unmeasured (J2)",
+    true,
+    "opencode is on the shipped list (brick 4c7a38b2: OpenCode DEEP-MERGES an empty " +
+      "`provider.openrouter.models.<slug>: {}`) and the spawn must provision for it",
   );
 
   // ## PART 2 — the routing is a DERIVATION, not a literal
   //
-  // ⚠️ PART 1 ALONE CANNOT SEE THE DEFECT. `["pi"]` and `=== "pi"` agree on every
-  // shipped input, so restoring the literal leaves Part 1 green. Only varying the
-  // constant underneath the same real spawn separates them: with the list swapped
-  // to `["opencode"]`, a literal keeps provisioning pi and keeps refusing
-  // opencode, and BOTH assertions below go red.
+  // ⚠️ PART 1 ALONE CANNOT SEE THE DEFECT. A re-inlined `=== "pi"` literal agrees
+  // with the shipped list on pi, so Part 1's pi row would stay green. Only varying
+  // the constant underneath the same real spawn separates them.
   //
-  // It is also a two-sided control for Part 1: the same instrument that reported
-  // `pi=true, opencode=false` must be able to report the exact opposite, which is
-  // what makes Part 1's `false` an observation rather than a blind spot.
-  const [flippedPi, flippedOpencode] = await withProvisioningList(["opencode"], async () => [
+  // ### 2a — the EMPTY list: everything must go OFF
+  //
+  // This is also the two-sided control Part 1 no longer carries itself: the same
+  // instrument that reported `pi=true, opencode=true` must be able to report
+  // `false` for both, or those `true`s are a blind spot rather than observations.
+  const [emptyPi, emptyOpencode] = await withProvisioningList([], async () => [
+    await observeProvisioning("pi"),
+    await observeProvisioning("opencode"),
+  ]);
+  process.stderr.write(`[cba6fa92] swapped list=[] pi=${emptyPi} opencode=${emptyOpencode}\n`);
+  assert.equal(
+    emptyPi,
+    false,
+    "the spawn still provisioned for pi with the list EMPTY — the routing is hardcoded, not derived",
+  );
+  assert.equal(
+    emptyOpencode,
+    false,
+    "the spawn still provisioned for opencode with the list EMPTY — the routing is hardcoded, not derived",
+  );
+
+  // ### 2b — a list naming only OPENCODE: the answer must be PER HARNESS
+  //
+  // 2a alone cannot distinguish a per-harness derivation from an all-or-nothing
+  // one — an `if (list.length > 0)` bug passes it in both directions. Naming one
+  // harness and not the other is what forces the two answers apart, and it is
+  // also the arm that a restored `=== "pi"` literal reds twice over.
+  const [onlyOcPi, onlyOcOpencode] = await withProvisioningList(["opencode"], async () => [
     await observeProvisioning("pi"),
     await observeProvisioning("opencode"),
   ]);
   process.stderr.write(
-    `[cba6fa92] swapped list=["opencode"] pi=${flippedPi} opencode=${flippedOpencode}\n`,
+    `[cba6fa92] swapped list=["opencode"] pi=${onlyOcPi} opencode=${onlyOcOpencode}\n`,
   );
   assert.equal(
-    flippedPi,
+    onlyOcPi,
     false,
     "the spawn still provisioned for pi with pi OFF the list — the routing is hardcoded, not derived",
   );
   assert.equal(
-    flippedOpencode,
+    onlyOcOpencode,
     true,
     "the spawn refused to provision for opencode with opencode ON the list — the routing is hardcoded, not derived",
   );
 
   // The restore actually happened, so nothing downstream inherits the swap.
-  assert.deepEqual([...ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR], ["pi"]);
+  assert.deepEqual([...ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR], ["pi", "opencode"]);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════

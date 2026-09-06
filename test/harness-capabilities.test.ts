@@ -543,20 +543,25 @@ test("the routed lists are the ones the shipped code has branches for", () => {
   //
   //   - `ARBITRARY_MODEL_SUPPORT_ROUTED_BY_ACPX` (harness-capabilities.ts:337)
   //     stays empty by design; its own comment at :338-350 carries the argument.
-  //   - `ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR = ["pi"]` (:360) is a SECOND,
-  //     per-harness constant added beside it, and is what actually says acpx
-  //     provisions for pi.
+  //   - `ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR = ["pi", "opencode"]` is a
+  //     SECOND, per-harness constant added beside it, and is what actually says
+  //     which harnesses acpx provisions for.
   //   - the derivation at :421-423 consults that second list, so the question is
   //     answered per harness rather than per kind.
   //
   // ⚠️ WHY THE SPLIT EXISTS AT ALL, since it is what a future reader would
   // "simplify": each harness has its own config format and its own merge
-  // semantics. pi's `models-store.json` is MEASURED to merge by id; whether
-  // opencode deep-merges or REPLACES an existing
-  // `provider.openrouter.models.<slug>` entry is NOT measured. Listing the KIND
-  // would switch BOTH on from one harness's measurement, and opencode's picker
-  // would then offer a band acpx does not provision for. That is the bug the
-  // split corrected.
+  // semantics. pi's `models-store.json` is MEASURED to merge by id (brick
+  // ef5999ca); OpenCode's `provider.openrouter.models.<slug>` is SEPARATELY
+  // measured to deep-merge (brick 4c7a38b2). Listing the KIND would have
+  // switched BOTH on from whichever measurement landed first, and one harness's
+  // picker would then have offered a band acpx does not provision for. That is
+  // the bug the split corrected.
+  //
+  // ⚠️ BOTH ANSWERS NOW BEING `merge` IS EXACTLY WHEN THIS GUARD LOOKS
+  // REDUNDANT, AND IT IS NOT. The next harness to declare `provisioned` would be
+  // switched on by a measurement taken against a config format it does not share.
+  // Two agreeing data points do not retire the seam.
   //
   // `via-shim` is still genuinely unshipped — the OpenRouter shim would have to
   // take a model from the picker rather than from the profile (CONCEPTION §7.4,
@@ -582,13 +587,23 @@ test("the SHIPPED per-harness provisioning list is what the derivation defaults 
   // answer per harness; leaving the replacement list unpinned made the corrected
   // bug re-enterable by hand.
   assert.equal(deriveAcceptsArbitraryModelIds("provisioned", "pi"), true);
-  assert.equal(deriveAcceptsArbitraryModelIds("provisioned", "opencode"), false);
+  assert.equal(deriveAcceptsArbitraryModelIds("provisioned", "opencode"), true);
+  // ⚠️ THE NEGATIVE DIRECTION MOVED, IT WAS NOT DROPPED. `opencode` used to be
+  // this row's `false`; now that it is provisioned, a harness that is genuinely
+  // NOT on the list has to carry that half, or the row becomes one-sided and
+  // "everything is true" would pass it. `codex` is on no provisioning list and
+  // is not going to be — its ids are `family[effort]` against a fixed backend.
+  assert.equal(
+    deriveAcceptsArbitraryModelIds("provisioned", "codex"),
+    false,
+    "a harness absent from the shipped list must derive false — otherwise this row only ever says yes",
+  );
   assert.equal(
     deriveAcceptsArbitraryModelIds("provisioned", undefined),
     false,
     "the kind alone is never enough — that is the whole point of the split",
   );
-  assert.deepEqual([...ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR], ["pi"]);
+  assert.deepEqual([...ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR], ["pi", "opencode"]);
 
   // ⚠️⚠️ THIS GUARD NAMES ITS OWN EXIT CONDITION, ON PURPOSE, so it reads as a
   // CONTRACT rather than an obstacle — and so it cannot go stale the way the
@@ -598,16 +613,25 @@ test("the SHIPPED per-harness provisioning list is what the derivation defaults 
   // (brick ef5999ca): same id replaces, new id appends, and `writePiModelsStore`
   // copies the box's catalogue forward before upserting.
   //
-  // **THE ONE MEASUREMENT THAT LICENSES ADDING `"opencode"` IS J2's
-  // MERGE-VS-REPLACE ANSWER:** does an empty
-  // `provider.openrouter.models.<slug>: {}` DEEP-MERGE with OpenCode's bundled
-  // entry, or REPLACE it? If it replaces, the model loses the `reasoning` support
-  // its `effort` option is advertised from, and depth silently stops working for
-  // every pinned model.
+  // opencode is listed because J2's MERGE-VS-REPLACE QUESTION IS ANSWERED, and
+  // the answer is MERGE — brick 4c7a38b2, measured 2026-09-06 against OpenCode
+  // 1.18.28 on a scratch rig, both layers with their own controls:
   //
-  // ⇒ **When J2 answers MERGE, change this row and cite that measurement.** Do
-  // not delete it because it is in the way; the list is deliberately narrow, and
-  // an entry added without its measurement re-creates the bug B5 fixed.
+  //   - over OpenCode's own catalogue entry, an empty
+  //     `provider.openrouter.models.<slug>: {}` preserved
+  //     `capabilities.reasoning: true` — the support the `effort` option is
+  //     advertised from, and the loss this row used to guard against — plus name,
+  //     family, cost and limit; removing the config again restored the baseline;
+  //   - over a pre-existing PROJECT-level entry, a user-set `name` SURVIVED the
+  //     same declaration, so a spawn does not clobber a user's provider config;
+  //   - and the REPLACE outcome was rendered, not merely asserted to be
+  //     reachable: the same empty `{}` on a slug OpenCode does not know produces
+  //     a visible stub (`reasoning: false`, cost 0, `limit.context` 0).
+  //
+  // ⇒ **THE EXIT CONDITION STILL STANDS FOR THE NEXT HARNESS.** This list is
+  // narrow on purpose; an entry added without its own measurement re-creates the
+  // bug B5 fixed, and the fact that two harnesses in a row answered `merge` is
+  // not evidence about a third.
 });
 
 // ── brick 82a2aafd (discharges 29b8ce8a): the three fields acpx-ui decided by NAME ─

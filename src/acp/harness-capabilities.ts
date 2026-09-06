@@ -594,14 +594,21 @@ export const ARBITRARY_MODEL_SUPPORT_ROUTED_BY_ACPX: readonly ArbitraryModelSupp
   // from the picker rather than from the profile (CONCEPTION §7.4, §11 Q1), which
   // has not shipped.
   //
-  // ⚠️ `provisioned` IS NOT LISTED HERE EVEN THOUGH acpx NOW PROVISIONS FOR PI —
-  // and that is the correction, not an omission. Provisioning is answered PER
-  // HARNESS, because each harness has its own config format and its own merge
-  // semantics: pi's `models-store.json` is measured to merge by id (brick
-  // ef5999ca), while whether opencode deep-merges or REPLACES an existing
-  // `provider.openrouter.models.<slug>` entry is NOT measured. Listing the KIND
-  // switched BOTH on from one harness's measurement, and opencode's picker would
-  // then have offered a band acpx does not provision for.
+  // ⚠️ `provisioned` IS NOT LISTED HERE EVEN THOUGH acpx NOW PROVISIONS FOR BOTH
+  // HARNESSES THAT DECLARE IT — and that is the correction, not an omission.
+  // Provisioning is answered PER HARNESS, because each harness has its own config
+  // format and its own merge semantics: pi's `models-store.json` merges by id
+  // (brick ef5999ca) and OpenCode's `provider.openrouter.models.<slug>`
+  // deep-merges (brick 4c7a38b2) — two separate measurements, taken separately,
+  // months of reasoning apart. Listing the KIND would have switched BOTH on from
+  // whichever measurement landed first, and one of opencode's pickers would have
+  // offered a band acpx did not provision for.
+  //
+  // ⚠️ THE FACT THAT BOTH ANSWERS CAME BACK `merge` IS NOT A REASON TO COLLAPSE
+  // THIS BACK INTO A KIND LIST. The next harness to declare `provisioned` would
+  // be switched on by a measurement taken against a config format it does not
+  // share. The per-harness array is the seam; two agreeing data points do not
+  // retire it.
 ];
 
 /**
@@ -636,7 +643,32 @@ export const ARBITRARY_MODEL_SUPPORT_ROUTED_BY_ACPX: readonly ArbitraryModelSupp
  * real adapter spawn, by `test/harness-config-dir-spawn-env.test.ts` →
  * *"the SHIPPED provisioning list is what the spawn routes on"*.
  */
-export const ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR: readonly HarnessId[] = ["pi"];
+export const ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR: readonly HarnessId[] = [
+  // pi — `models-store.json` is measured to merge BY ID (brick ef5999ca): same id
+  // replaces, new id appends, and `writePiModelsStore` copies the box's own
+  // catalogue forward before upserting.
+  "pi",
+  // opencode — MEASURED 2026-09-06, brick 4c7a38b2,
+  // `verification/evidence/B4-M1-opencode-config-merge-vs-replace.md`. OpenCode
+  // 1.18.28 DEEP-MERGES `provider.openrouter.models.<slug>: {}`; it does not
+  // replace. Both layers, on a scratch rig, each with its own control:
+  //
+  //   - over OPENCODE'S OWN catalogue entry: `moonshotai/kimi-k2-thinking` kept
+  //     `capabilities.reasoning: true` (the field whose loss would have silently
+  //     broken the advertised `effort` ladder — the exact hazard this array's
+  //     previous comment named), plus name, family, cost, limit, release_date. A
+  //     restore run with the config removed again returned the baseline exactly.
+  //   - over a PRE-EXISTING USER ENTRY: a project-level `opencode.json` setting
+  //     `name: "USER-MARKER-KIMI"` SURVIVED a session config declaring the same
+  //     slug as `{}`. So provisioning at spawn time does not clobber a user's
+  //     own provider config.
+  //
+  // The REPLACE outcome was not merely "reachable in principle" — it was rendered:
+  // a bare `{}` on a slug OpenCode does not know produces a visible stub
+  // (`reasoning: false`, cost 0, `limit.context` 0, empty family), which is
+  // exactly what a replace would have made of the subject. It did not.
+  "opencode",
+];
 
 /**
  * Whether acpx generates a catalogue fragment for this harness — the ONE read of

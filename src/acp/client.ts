@@ -964,24 +964,27 @@ export class AcpClient {
         await this.resolveBrickContext(),
       ),
       model: this.options.sessionOptions?.model,
-      // ⚠️ PROVISIONING IS ON FOR PI AND OFF FOR OPENCODE, AND THE ASYMMETRY IS
-      // A MEASUREMENT, NOT CAUTION LEFT OVER FROM BEFORE.
+      // ⚠️ PROVISIONING IS ON FOR PI AND FOR OPENCODE, AND EACH `on` IS ITS OWN
+      // MEASUREMENT — NOT ONE ANSWER GENERALISED TO TWO HARNESSES.
       //
-      // The comment that stood here said provisioning stays off "once B5 measures
-      // the merge semantics". B5 measured them, for pi (brick ef5999ca):
-      // `models-store.json` merges BY ID with pi's catalogue — same id replaces,
-      // new id appends — and `writePiModelsStore` copies the box's own catalogue
-      // forward before upserting, so a slug pi already knows keeps its real
-      // metadata rather than being overwritten with guesses.
+      // pi (brick ef5999ca): `models-store.json` merges BY ID with pi's catalogue
+      // — same id replaces, new id appends — and `writePiModelsStore` copies the
+      // box's own catalogue forward before upserting, so a slug pi already knows
+      // keeps its real metadata rather than being overwritten with guesses.
       //
-      // OPENCODE IS STILL OFF, and for the reason the old comment gave, which no
-      // pi measurement touches: `provider.openrouter.models.<slug>: {}` declares
-      // an EMPTY config over an existing entry, and whether OpenCode deep-merges
-      // that or REPLACES it is NOT MEASURED. If it replaces, the model loses its
-      // bundled metadata including the `reasoning` support the `effort` option is
-      // advertised from — depth would silently stop working for every pinned
-      // model. Two harnesses, two different config formats, two separate
-      // questions; answering one does not answer the other.
+      // opencode (brick 4c7a38b2, measured 2026-09-06 against 1.18.28 on a
+      // scratch rig): `provider.openrouter.models.<slug>: {}` declares an EMPTY
+      // config over an existing entry, and OpenCode DEEP-MERGES it. The subject
+      // kept `capabilities.reasoning: true` — the support the `effort` option is
+      // advertised from, and the thing whose loss would have silently killed
+      // depth for every pinned model — plus name, family, cost and limit; and a
+      // pre-existing PROJECT-level entry survived the same declaration, so a
+      // spawn does not clobber a user's own provider config.
+      //
+      // Two harnesses, two different config formats, two separate questions;
+      // answering one does not answer the other. That both answers came back
+      // `merge` is a coincidence of two measurements, not one fact — which is why
+      // the list below is keyed by HARNESS and not by `arbitraryModelSupport`.
       //
       // ⚠️ THIS ASKS THE CONSTANT, NOT A LITERAL — DO NOT "SIMPLIFY" IT BACK TO
       // `=== "pi"` (brick cba6fa92). It shipped as that literal, and the effect
