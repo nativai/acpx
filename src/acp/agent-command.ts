@@ -91,9 +91,10 @@ export function isCopilotAcpCommand(command: string, args: readonly string[]): b
 }
 
 /**
- * OpenCode's ACP adapter. The registry launches it as `npx -y opencode-ai acp`
- * (`src/agent-registry.ts`) — unpinned, so the resolved version varies, but the
- * package name does not. A local install spells it `opencode acp`.
+ * OpenCode's ACP adapter, launched as `npx -y opencode-ai@<exact pin> acp`
+ * (`ACP_ADAPTER_PACKAGE_RANGES.opencode`). Matches on the package name so the
+ * pin can move without this detector following it. A local install spells it
+ * `opencode acp`.
  */
 export function isOpenCodeAcpCommand(command: string, args: readonly string[]): boolean {
   const parts = [command, ...args];
