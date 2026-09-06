@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  deriveAcceptsArbitraryModelIds,
   deriveHarnessCapabilities,
   HARNESS_FACTS,
   HARNESS_IDS,
@@ -337,21 +338,38 @@ test("provisioning COPIES the box catalogue forward and repairs the Anthropic ba
   });
 });
 
-test("pi's arbitrary-model support is ROUTED now, opencode's is not — PER HARNESS", () => {
+test("pi's AND opencode's arbitrary-model support are ROUTED — but still PER HARNESS", () => {
   // The descriptor consequence of the rows above, asserted rather than assumed.
   //
-  // ⚠️ THE TWO-SIDEDNESS IS THE ROW. Both harnesses declare
-  // `arbitraryModelSupport: "provisioned"`, so routing the KIND switched BOTH on
-  // from ONE harness's measurement — which this row caught. Opencode's config
-  // format asks a different question (does an empty
-  // `provider.openrouter.models.<slug>: {}` deep-merge or REPLACE the bundled
-  // entry?) that pi's `models-store.json` measurement does not answer, and acpx
-  // does not pass `provisionModelId` for it. A descriptor claiming otherwise
-  // would put a failing band in the picker.
+  // ⚠️ THIS ROW IS WHY A NAME-BASED SWEEP IS NOT A PROPERTY SWEEP. Routing
+  // opencode (brick 4c7a38b2) was done after grepping for
+  // `ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR` and `harnessProvisionsModelCatalogue`
+  // across src/ and test/. That found two files. It did NOT find this one, because
+  // this row asserts the DERIVED PROPERTY and never names the constant — so it
+  // went red in the gate rather than in the edit. Keep it that way: a guard that
+  // is only reachable by running it is doing work the greps cannot.
+  //
+  // ⚠️ BOTH ARE NOW true, WHICH IS EXACTLY WHEN THE TWO-SIDEDNESS LOOKS
+  // REDUNDANT. It is not. Both harnesses declare `arbitraryModelSupport:
+  // "provisioned"`, and the original defect was routing the KIND — which switched
+  // BOTH on from ONE harness's measurement. Today both are on from TWO separate
+  // measurements taken against two different config formats:
+  //   - pi: `models-store.json` merges BY ID (brick ef5999ca);
+  //   - opencode: `provider.openrouter.models.<slug>: {}` DEEP-MERGES, over its own
+  //     catalogue entry and over a pre-existing user entry alike (brick 4c7a38b2).
+  // Agreement between two independent answers is not one answer. The final
+  // assertion is what still separates "provisioned is enough" from "this harness
+  // was measured": with a list naming only pi, opencode's identical KIND derives
+  // false. Delete that and the row can no longer tell the two apart.
   assert.equal(HARNESS_FACTS.pi.arbitraryModelSupport, "provisioned");
   assert.equal(HARNESS_FACTS.opencode.arbitraryModelSupport, "provisioned");
   assert.equal(deriveHarnessCapabilities(HARNESS_FACTS.pi).acceptsArbitraryModelIds, true);
-  assert.equal(deriveHarnessCapabilities(HARNESS_FACTS.opencode).acceptsArbitraryModelIds, false);
+  assert.equal(deriveHarnessCapabilities(HARNESS_FACTS.opencode).acceptsArbitraryModelIds, true);
+  assert.equal(
+    deriveAcceptsArbitraryModelIds("provisioned", "opencode", [], ["pi"]),
+    false,
+    "the KIND alone must never decide it — with only pi provisioned, opencode's identical kind is false",
+  );
 });
 
 // ── Degradation ──────────────────────────────────────────────────────────────
