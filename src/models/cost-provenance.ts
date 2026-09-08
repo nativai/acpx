@@ -81,47 +81,68 @@ export type SessionCostFigure = {
   coverage: CostCoverage | null;
 };
 
-/** Per-1M USD rates for one model, as `ModelBilling` states them. */
+/**
+ * Per-1M USD rates for one model, as `ModelBilling` states them.
+ *
+ * ⚠️ snake_case BECAUSE THIS IS PERSISTED, AND IT IS NOT COSMETIC. `UnitRates`
+ * and {@link CostUnit} are stored verbatim under `acpx.cost_units` — there is no
+ * serializer mapping in between — so a camelCase key here makes
+ * `assertPersistedKeyPolicy` throw inside the session-record write, before
+ * `fs.writeFile`. The first shape of this type did exactly that, and the result
+ * was not "cost is missing": the whole record stopped being written, silently,
+ * taking `context_window_size` — an unrelated shipped field — with it, with no
+ * exception and a green suite. brick://48aca560 has the measurement.
+ *
+ * The IN-MEMORY inputs stay camelCase (`UsageObservation` in
+ * `src/session/cost-ingest.ts`), matching how `SessionRecord` works: camelCase
+ * in memory, snake_case on disk. The line is "does this object reach the record".
+ */
 export type UnitRates = {
-  inPerM: number | null;
-  outPerM: number | null;
-  cacheReadPerM: number | null;
-  cacheWritePerM: number | null;
+  in_per_m: number | null;
+  out_per_m: number | null;
+  cache_read_per_m: number | null;
+  cache_write_per_m: number | null;
   /** True only when a catalogue row EXISTS and quotes zero (see the header). */
-  measuredFree: boolean;
+  measured_free: boolean;
 };
 
 /** One priceable usage event: token counts plus the rates in force for it. */
 export type CostUnit = {
   input: number;
   output: number;
-  cacheRead: number;
-  cacheWrite: number;
+  cache_read: number;
+  cache_write: number;
   /** `null` ⇔ no catalogue row was found ⇒ this unit is unpriceable. */
   rates: UnitRates | null;
 };
+
+/**
+ * An unquoted cache rate is NOT a zero rate; but a session with no cached tokens
+ * is unaffected by it, so only charge the absence when it would actually matter.
+ */
+function cacheRateMissingWhereItMatters(unit: CostUnit, rates: UnitRates): boolean {
+  return (
+    (unit.cache_read > 0 && rates.cache_read_per_m === null) ||
+    (unit.cache_write > 0 && rates.cache_write_per_m === null)
+  );
+}
 
 function priceUnit(unit: CostUnit): number | null {
   const r = unit.rates;
   if (!r) {
     return null;
   }
-  if (r.inPerM === null || r.outPerM === null) {
+  if (r.in_per_m === null || r.out_per_m === null) {
     return null;
   }
-  // An unquoted cache rate is NOT a zero rate; but a session with no cached
-  // tokens is unaffected by it, so only charge the absence when it would matter.
-  if (unit.cacheRead > 0 && r.cacheReadPerM === null) {
-    return null;
-  }
-  if (unit.cacheWrite > 0 && r.cacheWritePerM === null) {
+  if (cacheRateMissingWhereItMatters(unit, r)) {
     return null;
   }
   return (
-    (r.inPerM * unit.input +
-      r.outPerM * unit.output +
-      (r.cacheReadPerM ?? 0) * unit.cacheRead +
-      (r.cacheWritePerM ?? 0) * unit.cacheWrite) /
+    (r.in_per_m * unit.input +
+      r.out_per_m * unit.output +
+      (r.cache_read_per_m ?? 0) * unit.cache_read +
+      (r.cache_write_per_m ?? 0) * unit.cache_write) /
     1_000_000
   );
 }
@@ -163,7 +184,7 @@ export function deriveCostFigure(units: CostUnit[], currency = "USD"): SessionCo
     // and it is what distinguishes this from a source with no units at all.
     return { amount: null, currency, provenance: "unpriced", coverage };
   }
-  if (priced === units.length && units.every((unit) => unit.rates?.measuredFree === true)) {
+  if (priced === units.length && units.every((unit) => unit.rates?.measured_free === true)) {
     return { amount: 0, currency, provenance: "free", coverage };
   }
   return { amount: sum, currency, provenance: "computed", coverage };

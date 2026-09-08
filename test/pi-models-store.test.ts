@@ -580,10 +580,16 @@ test("billing carries the CACHE rates, and an unquoted rate is null — not zero
 // ── Layer 2 (inert): the stored cost shape ───────────────────────────────────
 
 test("cost figure: coverage is COUNTS, and a partial total is kept, never nulled", () => {
-  const rates = { inPerM: 1, outPerM: 2, cacheReadPerM: 0, cacheWritePerM: 0, measuredFree: false };
+  const rates = {
+    in_per_m: 1,
+    out_per_m: 2,
+    cache_read_per_m: 0,
+    cache_write_per_m: 0,
+    measured_free: false,
+  };
   const units: CostUnit[] = [
-    { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, rates },
-    { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, rates: null },
+    { input: 1_000_000, output: 0, cache_read: 0, cache_write: 0, rates },
+    { input: 1_000_000, output: 0, cache_read: 0, cache_write: 0, rates: null },
   ];
   const figure = deriveCostFigure(units);
   assert.equal(figure.provenance, "computed");
@@ -593,26 +599,38 @@ test("cost figure: coverage is COUNTS, and a partial total is kept, never nulled
 });
 
 test("cost figure: `free` requires EVERY unit measured-free, and can never be partial", () => {
-  const free = { inPerM: 0, outPerM: 0, cacheReadPerM: 0, cacheWritePerM: 0, measuredFree: true };
-  const paid = { inPerM: 1, outPerM: 1, cacheReadPerM: 0, cacheWritePerM: 0, measuredFree: false };
+  const free = {
+    in_per_m: 0,
+    out_per_m: 0,
+    cache_read_per_m: 0,
+    cache_write_per_m: 0,
+    measured_free: true,
+  };
+  const paid = {
+    in_per_m: 1,
+    out_per_m: 1,
+    cache_read_per_m: 0,
+    cache_write_per_m: 0,
+    measured_free: false,
+  };
   const allFree = deriveCostFigure([
-    { input: 10, output: 10, cacheRead: 0, cacheWrite: 0, rates: free },
-    { input: 10, output: 10, cacheRead: 0, cacheWrite: 0, rates: free },
+    { input: 10, output: 10, cache_read: 0, cache_write: 0, rates: free },
+    { input: 10, output: 10, cache_read: 0, cache_write: 0, rates: free },
   ]);
   assert.equal(allFree.provenance, "free");
   assert.equal(allFree.amount, 0, "a MEASURED zero — $0.00 is correct for it");
 
   const mixed = deriveCostFigure([
-    { input: 10, output: 10, cacheRead: 0, cacheWrite: 0, rates: free },
-    { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, rates: paid },
+    { input: 10, output: 10, cache_read: 0, cache_write: 0, rates: free },
+    { input: 1_000_000, output: 0, cache_read: 0, cache_write: 0, rates: paid },
   ]);
   assert.equal(mixed.provenance, "computed", "a partial `free` would absorb the missing entries");
 });
 
 test("cost figure: nothing priceable ⇒ `unpriced` with amount null, and it still ships the counts", () => {
   const figure = deriveCostFigure([
-    { input: 5, output: 5, cacheRead: 0, cacheWrite: 0, rates: null },
-    { input: 5, output: 5, cacheRead: 0, cacheWrite: 0, rates: null },
+    { input: 5, output: 5, cache_read: 0, cache_write: 0, rates: null },
+    { input: 5, output: 5, cache_read: 0, cache_write: 0, rates: null },
   ]);
   assert.equal(figure.provenance, "unpriced");
   assert.equal(figure.amount, null, "unpriced must NEVER be rendered as $0.00");

@@ -25,6 +25,7 @@ import type {
   SessionToolUse,
   SessionUserContent,
 } from "../types.js";
+import { rememberSessionCost } from "./cost-ingest.js";
 import { copyLoggedMessageCount, dropLoggedMessagesFromHead } from "./messages-log-bookkeeping.js";
 
 export type LegacyHistoryEntry = {
@@ -56,6 +57,19 @@ function deepClone<T>(value: T): T {
   } catch {
     return value;
   }
+}
+
+/**
+ * Clone an optional field, preserving `undefined`.
+ *
+ * ⚠️ Exists so a new leg of `cloneSessionAcpxState` costs ZERO cyclomatic
+ * complexity. That function is one branch under the lint ceiling and is the
+ * allowlist that has already eaten three persisted fields — the next author
+ * must be able to add their line without the linter pushing them toward
+ * omitting it, which is exactly how a field gets left out.
+ */
+function cloneOptional<T>(value: T | undefined): T | undefined {
+  return value === undefined ? undefined : deepClone(value);
 }
 
 function hasOwn(source: object, key: string): boolean {
@@ -706,6 +720,14 @@ export function cloneSessionAcpxState(
     progress: state.progress ? deepClone(state.progress) : undefined,
     config_options: state.config_options ? deepClone(state.config_options) : undefined,
     owner_options: state.owner_options ? { ...state.owner_options } : undefined,
+    // ⚠️ brick://5026423b — AND THIS FUNCTION IS THE ALLOWLIST THAT HAS ALREADY
+    // EATEN THREE FIELDS (`applied_output_style` 874fee67, `served` 07dd62c9,
+    // `depth_projection`). A field missing here is present at `sessions new` and
+    // NULL AFTER ONE PROMPT, with typecheck, lint and the whole unit suite green,
+    // because the turn path re-bases `record.acpx` off this clone. Both cost
+    // fields are proven through a REAL TURN, not an in-memory test.
+    cost: cloneOptional(state.cost),
+    cost_units: cloneOptional(state.cost_units),
     // brick://07dd62c9: the live served block + floor breadcrumbs MUST survive the
     // clone. savePromptSuccess stamps `served` then re-bases acpxState off this
     // clone; without these the served-truth surface + durable park are dropped on
@@ -1044,6 +1066,32 @@ const SESSION_UPDATE_HANDLERS: Record<string, SessionUpdateHandler> = {
     if (update.sessionUpdate === "usage_update") {
       applyUsageUpdate(conversation, update);
       rememberContextWindow(acpx, update);
+      // ⚠️ GUARDED BECAUSE COST IS ENRICHMENT — it must never be able to cost the
+      // caller its update. Kept deliberately, but note the correction below.
+      //
+      // ⚠️ THIS GUARD DID NOT, AND COULD NOT, PREVENT THE FAILURE IT WAS WRITTEN
+      // FOR. The note here used to claim an unguarded call "took the WHOLE update
+      // with it when it threw", citing `context_window_size` going 262144 → null.
+      // That observation was real; the attribution was not. Nothing threw here at
+      // all — the handler completed and the value WAS correct in memory. The loss
+      // was downstream, in the record write: `CostUnit`'s camelCase keys made
+      // `assertPersistedKeyPolicy` throw before `fs.writeFile`, and
+      // `LiveSessionCheckpoint` swallowed it, so the record froze at its pre-turn
+      // state. brick://48aca560 — measured, with controls.
+      //
+      // ⇒ A `try` around the ingest cannot protect persistence, and reading this
+      // guard as the thing that made cost safe would be reading it backwards.
+      // What protects persistence is the key policy, now asserted inside
+      // `serializeSessionRecordForDisk` and mirrored at typecheck.
+      //
+      // 🛑 IT REPORTS RATHER THAN SWALLOWING. A silent catch would leave the
+      // feature inert while looking healthy — the exact defect this brick exists
+      // to fix (a module with no caller, nothing persisted, nothing said).
+      try {
+        rememberCostFromUsageUpdate(acpx, update);
+      } catch (error) {
+        reportCostIngestFailure(error);
+      }
     }
   },
   session_info_update: (conversation, _acpx, update) => {
@@ -1104,6 +1152,66 @@ function applyUsageUpdate(conversation: SessionConversation, update: UsageUpdate
   if (userId) {
     conversation.request_token_usage[userId] = usage;
   }
+}
+
+let costIngestFailureReported = false;
+
+/** Say it ONCE per process: enough to be discovered, not enough to flood a turn. */
+function reportCostIngestFailure(error: unknown): void {
+  if (costIngestFailureReported) {
+    return;
+  }
+  costIngestFailureReported = true;
+  process.stderr.write(
+    `[acpx] session cost not recorded (the turn is unaffected): ` +
+      `${error instanceof Error ? error.message : String(error)}\n`,
+  );
+}
+
+/**
+ * brick://5026423b — fold this usage event into the session's cost.
+ *
+ * ⚠️ THE COUNTS COME FROM THE PER-MESSAGE BLOCK, NOT FROM `used`. `used` is the
+ * CONTEXT FILL (a level), not a delta: summing it would multiply-count the whole
+ * conversation on every message. The per-message deltas live in the adapter's
+ * `_meta` — measured on pi 2026-09-08:
+ *
+ *     _meta.piAcp.message = { input, output, reasoning, cacheRead, cacheWrite, ... }
+ *
+ * ⚠️ `reasoning` IS NOT ADDED TO `output`. Reconciled against the catalogue on a
+ * real session (`01a08095`, kimi-k2.6): input 9499 x $0.00000095 + output 47 x
+ * $0.000004 + cacheRead 512 x $0.00000016 = 0.00929397, matching the adapter's own
+ * figure to the last digit — and only with `output` alone. Folding `reasoning` in
+ * would over-charge every reasoning model, quietly and plausibly.
+ *
+ * An update with no per-message block contributes NOTHING rather than a zero unit:
+ * a zero unit would count toward `coverage.total` and dilute a real figure.
+ */
+function rememberCostFromUsageUpdate(acpx: SessionAcpxState, update: UsageUpdate): void {
+  const message = perMessageUsageBlock(update);
+  if (!message) {
+    return;
+  }
+  const reported = asRecord(asRecord(update)?.cost)?.amount;
+  rememberSessionCost(acpx, {
+    // camelCase here is pi's OWN wire vocabulary, not ours — see `UnitRates`
+    // for where the naming has to change on the way to disk.
+    input: countField(message, "input"),
+    output: countField(message, "output"),
+    cacheRead: countField(message, "cacheRead"),
+    cacheWrite: countField(message, "cacheWrite"),
+    reportedAmount: typeof reported === "number" ? reported : null,
+  });
+}
+
+/** pi's per-message usage block, or `undefined` when this update carries none. */
+function perMessageUsageBlock(update: UsageUpdate): Record<string, unknown> | undefined {
+  return asRecord(asRecord(asRecord(asRecord(update)?._meta)?.piAcp)?.message);
+}
+
+/** A token count off the per-message block; a missing count contributes zero. */
+function countField(message: Record<string, unknown>, key: string): number {
+  return numberField(message, [key]) ?? 0;
 }
 
 /** Fix A (brick 92a994a0): remember the context-window `size` the adapter just

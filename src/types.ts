@@ -10,6 +10,7 @@ import type {
   StopReason,
   ToolKind,
 } from "@agentclientprotocol/sdk";
+import type { CostUnit, SessionCostFigure } from "./models/cost-provenance.js";
 export type { McpServer, SessionNotification } from "@agentclientprotocol/sdk";
 import type { EffectiveAccountMetadata } from "./acp/auth-env.js";
 import type { PromptInput } from "./prompt-content.js";
@@ -604,6 +605,25 @@ export type SessionAcpxState = {
   progress?: AgentProgress;
   config_options?: SessionConfigOption[];
   owner_options?: SessionOwnerOptions;
+  /**
+   * The session's cost, with its PROVENANCE (brick 5026423b).
+   *
+   * ⚠️ `amount === 0` and "free" are INDEPENDENT facts and the type permits any
+   * pairing — a consumer must key on `provenance`, never on `amount === 0`. A
+   * `$0.00` that is really `unpriced` is the defect this field exists to make
+   * impossible to render as free.
+   */
+  cost?: SessionCostFigure;
+  /**
+   * The priced units behind {@link cost}, one per assistant message, each
+   * carrying THE RATES IN FORCE WHEN IT WAS OBSERVED.
+   *
+   * ⚠️ The rates are stored rather than looked up at read time on purpose: a cold
+   * catalogue cache makes every model look price-less, so re-pricing on read
+   * would flap a correctly-`computed` session to `unpriced` and back with cache
+   * weather. See `src/session/cost-ingest.ts`.
+   */
+  cost_units?: CostUnit[];
   /**
    * Per-turn SERVED truth (brick://07dd62c9): what was actually served, as
    * opposed to what was pinned. LIVE observation, deliberately kept SEPARATE
