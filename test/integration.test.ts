@@ -1265,7 +1265,10 @@ test("integration: exec --model fails when agent does not advertise models", asy
         homeDir,
       );
       assert.notEqual(result.code, 0, "expected non-zero exit");
-      assert.match(`${result.stderr}\n${result.stdout}`, /did not advertise model support/);
+      assert.match(
+        `${result.stderr}\n${result.stdout}`,
+        /this session carries no ACP `models` advertisement/,
+      );
 
       const payloads = parseJsonRpcOutputLines(result.stdout);
 

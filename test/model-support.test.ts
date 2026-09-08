@@ -125,3 +125,52 @@ test("an unadvertised codex effort normalizes to USAGE, not RUNTIME (de290ae4)",
   assert.equal(response.error.code, OUTPUT_ERROR_JSONRPC_CODES.USAGE);
   assert.equal(response.error.code, -32602);
 });
+
+// bricks 8320bedc / a82f6833 — THE `!models` REFUSAL MUST DESCRIBE A RESPONSE,
+// NOT A CAPABILITY.
+//
+// It read "the ACP agent did not advertise model support", which is a claim about
+// the ADAPTER. pi-acp's `unstable_forkSession` omitted `models` while its own
+// `session/new` and `session/load` returned it, so the sentence was false about an
+// adapter that implements `session/set_model` and serves OpenRouter models on every
+// turn — and it sent an investigation at the wrong repo for an hour while Daniel
+// could not fork a pi session. This is the executable half of the carrier comment
+// at `src/acp/model-support.ts`: the capability claim must stay out, the
+// response-scoped wording must stay in.
+test("the no-catalogue refusal blames the RESPONSE, not the agent (8320bedc)", () => {
+  for (const context of ["apply", "replay"] as const) {
+    let thrown: unknown;
+    try {
+      assertRequestedModelSupported({
+        requestedModel: "openrouter/z-ai/glm-5.3-flash",
+        models: undefined,
+        context,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    assert.ok(thrown instanceof RequestedModelUnsupportedError, `${context} must still refuse`);
+
+    assert.doesNotMatch(
+      thrown.message,
+      /agent did not advertise model support/,
+      `${context}: the capability claim must not come back — it was false about pi-acp`,
+    );
+    assert.match(
+      thrown.message,
+      /this session carries no ACP `models` advertisement/,
+      `${context}: the refusal must state what was actually observed`,
+    );
+    // All three candidate seams are named, because which one produced the
+    // `undefined` is not knowable at that function.
+    for (const seam of ["session/new", "session/load", "session/fork"]) {
+      assert.ok(thrown.message.includes(seam), `${context}: message must name ${seam}`);
+    }
+    // And it must still say what a working setup needs.
+    assert.match(
+      thrown.message,
+      /session\/set_model/,
+      `${context}: keep the actionable requirement`,
+    );
+  }
+});

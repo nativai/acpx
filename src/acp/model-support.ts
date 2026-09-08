@@ -60,8 +60,28 @@ export function assertRequestedModelSupported(params: {
       return;
     }
     const action = params.context === "replay" ? "replay saved model" : "apply --model";
+    // ⚠️ THIS MESSAGE DESCRIBES A RESPONSE, NOT A CAPABILITY. DO NOT SHORTEN IT
+    // BACK TO "the ACP agent did not advertise model support" — that wording is
+    // punchier, it is what shipped, and it cost a night. pi-acp's
+    // `unstable_forkSession` returned `{sessionId, modes, configOptions, _meta}`
+    // and omitted `models`, while its OWN `session/new` and `session/load` both
+    // returned it. `models` therefore arrived here `undefined`, this branch fired,
+    // and the sentence asserted that the ADAPTER lacks model support — about an
+    // adapter that implements `session/set_model` and serves OpenRouter models on
+    // every turn. Daniel could not fork a pi session, and the message sent the
+    // investigation at acpx for an hour before anyone read the adapter's fork
+    // handler. (bricks 8320bedc / a82f6833; fixed in nativai/pi-acp 73f2e39.)
+    //
+    // ⚠️ `undefined` here means ONE RESPONSE CARRIED NO `models`, and WHICH
+    // response is not knowable at this seam: the three direct callers are the
+    // apply path (create/fork), the replay path and the prompt path. So the
+    // message names all three candidates rather than guessing one — naming a
+    // single seam would read better and would be wrong two times in three.
+    //
+    // `test/model-support.test.ts` pins both halves: the capability claim must
+    // stay absent, and the response-scoped wording must stay present.
     throw new RequestedModelUnsupportedError(
-      `Cannot ${action} "${params.requestedModel}": the ACP agent did not advertise model support. Generic model selection requires ACP models plus session/set_model support, or an adapter-specific startup model flag.`,
+      `Cannot ${action} "${params.requestedModel}": this session carries no ACP \`models\` advertisement — the agent's session/new, session/load or session/fork response did not include one. That describes THAT RESPONSE, not the agent's capability: an adapter can implement session/set_model and still omit \`models\` from one of them. Generic model selection needs an advertised \`models\` list plus session/set_model support, or an adapter-specific startup model flag.`,
     );
   }
 

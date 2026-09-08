@@ -1891,7 +1891,7 @@ test("connectAndLoadSession fails clearly when saved model cannot be replayed ge
       (error: unknown) => {
         assert(error instanceof Error);
         assert.equal(error.name, "SessionModelReplayError");
-        assert.match(error.message, /did not advertise model support/);
+        assert.match(error.message, /this session carries no ACP `models` advertisement/);
         return true;
       },
     );
