@@ -47,8 +47,12 @@ import type { SessionAcpxState } from "../types.js";
 
 /** What one usage event contributes, as observed. `null` rates ⇔ unpriceable. */
 export type UsageObservation = {
+  /** Actual model for this request; session model is only a legacy fallback. */
+  model?: string;
   input: number;
   output: number;
+  /** Informational subset of output, never an additional billable counter. */
+  reasoning?: number;
   cacheRead: number;
   cacheWrite: number;
   /** The adapter's OWN figure for the session so far, when it reports one. */
@@ -165,6 +169,7 @@ function stampedUnit(
   lookupRates: RateLookup,
   now: () => Date,
 ): CostUnit {
+  modelId = observation.model ?? modelId;
   // ⚠️ `ts` IS THE OBSERVATION TIME, NOT THE TURN'S START OR THE RECORD'S
   // `last_used_at`. This function runs on the `usage_update` that reports the
   // message, so "now" is the truthful instant for it — and it is the only instant
@@ -200,6 +205,7 @@ function stampedUnit(
   };
   return {
     ...priceable,
+    reasoning: observation.reasoning,
     ts: now().toISOString(),
     model: modelId ?? null,
     cost_usd: priceUnit(priceable),

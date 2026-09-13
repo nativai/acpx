@@ -131,6 +131,8 @@ export type UnitRates = {
 export type CostUnit = {
   input: number;
   output: number;
+  /** Informational subset of output; excluded from priceUnit arithmetic. */
+  reasoning?: number;
   cache_read: number;
   cache_write: number;
   /** `null` ⇔ no catalogue row was found ⇒ this unit is unpriceable. */

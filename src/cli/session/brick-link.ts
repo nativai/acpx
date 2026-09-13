@@ -2,11 +2,29 @@ import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { InvalidArgumentError } from "commander";
+import { brickChildEnv } from "../../bricks-credential.js";
 import type { SessionRecord } from "../../types.js";
 
 export const BRICK_CLI_TIMEOUT_MS = 3_000;
 export const BRICK_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-export const DEFAULT_BRICK_POOL_DIR = "/wisdom/Operating System/Bricks";
+/**
+ * The brick pool's default location — the value `acpx-ui` has used all along
+ * (`brick/module/types.ts` → `DEFAULT_BRICK_POOL_DIR`).
+ *
+ * ⚠️ THE PREVIOUS VALUE WAS NOT "A DIFFERENT POOL". IT WAS A PATH THAT NO LONGER EXISTS.
+ * Until this change both acpx sites read `"/wisdom/Operating System/Bricks"`, and that directory was
+ * REMOVED on 2026-07-22. Measured 2026-09-12: `ls -d '/wisdom/Operating System/Bricks'` → *No such
+ * file or directory*, while `/wisdom/Bricks` holds 12,618 entries. So with `ACPX_BRICK_POOL_DIR`
+ * unset, acpx resolved the pool to nothing at all while acpx-ui resolved it correctly — and the
+ * failure is SILENT: a `stat` on a missing path just returns null, which reads as "no such brick"
+ * rather than "wrong pool". That distinction is why this is stated here rather than fixed quietly.
+ *
+ * ⚠️ THIS IS THE SINGLE DEFINITION FOR acpx, AND IT WAS NOT BEFORE. `src/acp/brick-context.ts` held
+ * its OWN PRIVATE copy of the same string — not an import of this one — so repairing only the
+ * exported constant would have left that file resolving the dead path with nothing failing. It now
+ * imports from here. Do not re-introduce a second copy.
+ */
+export const DEFAULT_BRICK_POOL_DIR = "/wisdom/Bricks";
 
 type BrickExecOptions = {
   timeoutMs?: number;
@@ -185,6 +203,10 @@ function execBrick(
         encoding: "utf8",
         timeout: options.timeoutMs,
         windowsHide: true,
+        // ⚠️ SEE brick-context.ts. Until B1 this passed no `env`, so the brick CLI inherited
+        // `process.env` wholesale including the realm credential — silently, successfully, and
+        // out of reach of `auth-env.ts`'s delete list, which this path never touches.
+        env: brickChildEnv(),
       },
       (error, stdout, stderr) => {
         if (error) {

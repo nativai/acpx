@@ -1,12 +1,17 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { TextDecoder } from "node:util";
+import { brickChildEnv } from "../bricks-credential.js";
+// ONE definition of the pool default for this repo. This file used to carry its own PRIVATE copy of
+// the string — so the two acpx sites could (and did) drift together onto a path removed 2026-07-22,
+// and fixing either one alone would have left the other resolving the dead path with nothing
+// failing. See the note on the constant itself.
+import { brickPoolDir } from "../cli/session/brick-link.js";
 
 export const BRICK_CONTEXT_TIMEOUT_MS = 5_000;
 export const BRICK_CONTEXT_MAX_BYTES = 32_768;
 
 const BRICK_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const DEFAULT_BRICK_POOL_DIR = "/wisdom/Operating System/Bricks";
 
 type BrickContextOptions = {
   timeoutMs?: number;
@@ -45,6 +50,12 @@ function execBrickContext(
       child = spawn("brick", args, {
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
+        // ⚠️ THIS `env` IS NOT OPTIONAL, AND ITS ABSENCE LOOKED LIKE NOTHING. Until B1 this spawn
+        // passed no `env` at all, so the brick CLI — and everything it spawns — inherited
+        // `process.env` WHOLESALE, realm credential included. There was no error and no warning;
+        // the child worked perfectly. This path never reaches `auth-env.ts`'s delete list, so the
+        // contract's prefix-strip remedy could not cover it: the list is never consulted here.
+        env: brickChildEnv(),
       });
     } catch (error) {
       warnBrickContext(brickId, `spawn failed: ${describeError(error)}`);
@@ -125,10 +136,8 @@ function decodeUtf8Prefix(buffer: Buffer, maxBytes: number): string {
   return "";
 }
 
-function brickPoolDir(): string {
-  const override = process.env.ACPX_BRICK_POOL_DIR?.trim();
-  return override && override.length > 0 ? override : DEFAULT_BRICK_POOL_DIR;
-}
+// `brickPoolDir` is imported from brick-link.ts, not redefined here. It used to be a second copy
+// of the same four lines - the very duplication that let the dead pool path live in two places.
 
 function warnBrickContext(brickId: string, reason: string): void {
   process.stderr.write(

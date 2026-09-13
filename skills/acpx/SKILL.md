@@ -29,6 +29,7 @@ Core capabilities:
 - Prompt input via stdin or `--file`
 - Config files with global+project merge and `config show|init`
 - Session metadata/history inspection (`sessions show`, `sessions history`)
+- Request usage persistence from adapter `_meta.acpxUsage.unit` updates (legacy Pi fallback), with per-request models, informational reasoning, and null prices for unpriced models
 - Local agent process checks via `status`
 - Stable ACP client methods for filesystem and terminal requests
 - Stable ACP `authenticate` handshake via env/config credentials

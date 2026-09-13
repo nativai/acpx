@@ -98,6 +98,7 @@ export const PERSISTED_ACPX_SENTINEL = {
     {
       input: 11,
       output: 22,
+      reasoning: 7,
       cache_read: 33,
       cache_write: 44,
       rates: null,

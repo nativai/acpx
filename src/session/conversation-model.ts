@@ -1229,12 +1229,14 @@ function rememberCostFromUsageUpdate(acpx: SessionAcpxState, update: UsageUpdate
   const reported = asRecord(asRecord(update)?.cost)?.amount;
   const attribution = attributionFromUpdate(update);
   rememberSessionCost(acpx, {
-    // camelCase here is pi's OWN wire vocabulary, not ours — see `UnitRates`
+    // camelCase here is the adapter wire vocabulary — see `UnitRates`
     // for where the naming has to change on the way to disk.
     input: countField(message, "input"),
     output: countField(message, "output"),
     cacheRead: countField(message, "cacheRead"),
     cacheWrite: countField(message, "cacheWrite"),
+    model: typeof message.model === "string" ? message.model : undefined,
+    reasoning: numberField(message, ["reasoning"]),
     reportedAmount: typeof reported === "number" ? reported : null,
     ...(attribution ? { attribution } : {}),
   });
@@ -1287,9 +1289,10 @@ function attributionFromUpdate(update: UsageUpdate): TurnAttribution | undefined
   };
 }
 
-/** pi's per-message usage block, or `undefined` when this update carries none. */
+/** Prefer the neutral unit contract; retain Pi's legacy per-message fallback. */
 function perMessageUsageBlock(update: UsageUpdate): Record<string, unknown> | undefined {
-  return asRecord(asRecord(asRecord(asRecord(update)?._meta)?.piAcp)?.message);
+  const meta = asRecord(asRecord(update)?._meta);
+  return asRecord(asRecord(meta?.acpxUsage)?.unit) ?? asRecord(asRecord(meta?.piAcp)?.message);
 }
 
 /** A token count off the per-message block; a missing count contributes zero. */

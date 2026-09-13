@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
+import { deleteBricksCredentialEnv } from "../bricks-credential.js";
 import {
   hasKnownDeadAccounts,
   hasKnownDeadSubs,
@@ -59,6 +60,10 @@ export const ACPX_EFFECTIVE_ACCOUNT_ENV = "ACPX_EFFECTIVE_ACCOUNT";
 export const ACPX_EFFECTIVE_ADAPTER_ENV = "ACPX_EFFECTIVE_ADAPTER";
 export const ACPX_EFFECTIVE_AUTH_MODE_ENV = "ACPX_EFFECTIVE_AUTH_MODE";
 export const ACPX_EFFECTIVE_ANCHOR_ENV = "ACPX_EFFECTIVE_ANCHOR";
+// The bricks-realm credential family and its strip live in ONE place for this repo — and they have
+// to, because this file is only LAYER 2 of three. The two sites that spawn the brick CLI itself
+// never reach this file at all. See src/bricks-credential.ts.
+export { ACPX_BRICKS_CREDENTIAL_ENV_PREFIX } from "../bricks-credential.js";
 
 export type EffectiveAccountMetadata = {
   effectiveAccount: string;
@@ -601,6 +606,27 @@ function buildAgentEnvironment(
   delete env.ACPX_TASK_FOLDER;
   delete env.ACPX_BRICK;
   delete env.ACPX_BRICK_PATH;
+  // ── THE BRICKS-REALM CREDENTIAL — STRIPPED BY PREFIX, NOT BY NAME ────────────────────────────
+  //
+  // ⚠️ A NEW NAME ADDED TO THE LIST ABOVE WOULD NOT BE GOOD ENOUGH, AND THIS FILE IS ITS OWN
+  // EVIDENCE. The list is ALLOW-BY-OMISSION: a variable nobody names is inherited. Three separate
+  // bricks have now fixed variables it missed — brick://6530d3b4 (the account stamp),
+  // brick://1820be37 (CLAUDE_CONFIG_DIR) and brick://cb214e48 — each one a name someone had to
+  // think of first. A prefix rule cannot be defeated by a SECOND credential variable added later,
+  // which a name list can, and historically does.
+  //
+  // 🛑 THE `S` IS WHAT MAKES THIS SAFE, AND WIDENING IT TO `ACPX_BRICK` IS A FLEET-WIDE OUTAGE.
+  // `ACPX_BRICKS_*` (with the S) is the credential family — `ACPX_BRICKS_CREDENTIAL_FILE` today.
+  // `ACPX_BRICK_*` (no S) is ordinary, legitimately-inherited configuration: ACPX_BRICK_POOL_DIR,
+  // ACPX_BRICK_DB_PATH, ACPX_BRICK_DB_EXPORT_DIR, ACPX_BRICK_REALM. Stripping on `ACPX_BRICK`
+  // would take the pool dir out of every agent on every box and break `brick context` everywhere.
+  // The two families were named apart deliberately so that this rule could be a prefix.
+  //
+  // Stated boundary, kept honest: this guarantees NO AGENT'S ENVIRONMENT CARRIES THE TOKEN. It does
+  // NOT guarantee no agent can obtain it — every agent runs as the same uid and the credential is a
+  // mounted file, so a same-uid process can read it. That is an accidental-cross-realm tripwire, not
+  // adversarial isolation, and claiming the stronger property would be false.
+  deleteBricksCredentialEnv(env);
   delete env.ACPX_OWNER_LOG;
   delete env.ACPX_AGENT_TYPE;
   // brick://6530d3b4 — the ACCOUNT stamp is spawn context too, and was missing

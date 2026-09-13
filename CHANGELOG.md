@@ -79,6 +79,10 @@ Repo: https://github.com/openclaw/acpx
   across cwd boundaries after their existing local lookup misses, while
   preserving scoped creation and failing closed on name collisions.
 
+- Usage: persist vendor-neutral request units from `_meta.acpxUsage.unit`, including
+  the observed model and informational reasoning count, with legacy Pi fallback.
+  Unknown prices remain null and reasoning is not charged twice.
+
 ### Breaking
 
 - CLI: remove the agent-facing `acpx usage` and `acpx sessions tree` commands;
