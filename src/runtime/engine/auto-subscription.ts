@@ -8,6 +8,7 @@ import {
   isFableModel,
   maxedThreshold,
   pickFailoverTarget,
+  refreshNearConfiguredWeeklyCeilings,
   type SubscriptionFableState,
   type SubscriptionUsage,
 } from "../../config/subscription-usage.js";
@@ -247,7 +248,11 @@ async function selectLocal(
   // means UNKNOWN — do NOT exclude (§1). Spawn NEVER hard-fails on fable exhaustion;
   // it degrades to the default binding and the turn-level terminal error tells the
   // agent (§4).
-  const [usages, fableStates] = await Promise.all([getSubscriptionsUsage(entries), fableProbe]);
+  const [cachedUsages, fableStates] = await Promise.all([
+    getSubscriptionsUsage(entries),
+    fableProbe,
+  ]);
+  const usages = await refreshNearConfiguredWeeklyCeilings(entries, cachedUsages);
   const threshold = maxedThreshold();
   const exclude = new Set(
     entries.filter((entry) => isSubscriptionLocked(entry, registry)).map((entry) => entry.id),

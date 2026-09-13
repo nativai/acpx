@@ -30,6 +30,7 @@ Core capabilities:
 - Config files with global+project merge and `config show|init`
 - Session metadata/history inspection (`sessions show`, `sessions history`)
 - Request usage persistence from adapter `_meta.acpxUsage.unit` updates (legacy Pi fallback), with per-request models, informational reasoning, and null prices for unpriced models
+- Account-scoped Claude automation ceilings with policy-aware routing, hard turn-boundary reserves, and safe set/show/clear commands
 - Local agent process checks via `status`
 - Stable ACP client methods for filesystem and terminal requests
 - Stable ACP `authenticate` handshake via env/config credentials
@@ -78,6 +79,11 @@ acpx [global_options] set <key> <value> [-s <name>]
 acpx [global_options] status [-s <name> | --session-id <id> | --session-url <url>]
 acpx [global_options] sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [<id>...] [--cwd | --whole-box] [--older-than <days> | --before <date>] [--dry-run] [--no-include-history] [--include-templates]]
 acpx [global_options] config [show | init]
+acpx [global_options] subscriptions ceiling show [profile:<id> | account:<id>]
+acpx [global_options] subscriptions ceiling set <profile:id | account:id> <90% | 0.90 | 1.00>
+acpx [global_options] subscriptions ceiling set-default <90% | 0.90 | 1.00>
+acpx [global_options] subscriptions ceiling clear <profile:id | account:id>
+acpx [global_options] subscriptions ceiling clear-default
 acpx [global_options] flow run <file> [--input-json '<json>' | --input-file <path>] [--default-agent <name>]
 
 acpx [global_options] <agent> [prompt_options] [prompt_text...]
@@ -91,6 +97,14 @@ acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--n
 ```
 
 If prompt text is omitted and stdin is piped, `acpx` reads prompt text from stdin.
+
+### Claude automation ceilings
+
+Ceilings are stored by functional Claude `account`, so profiles that share an account also share one policy. `ceiling set` accepts only an explicit percent (`90%`) or fraction (`0.90`, `1.00`); bare `90` and bare `1` are rejected. Use `profile:` or `account:` prefixes whenever the two namespaces could collide.
+
+An explicitly configured account override or registry default is a hard automatic turn-boundary policy: at known weekly utilization greater than or equal to the ceiling, acpx switches to an eligible account or returns `automation-capacity-reserved` before submitting the prompt. Manual/pinned sessions may override the reserve, but account locks remain stronger. Missing policy (including the legacy environment fallback) retains the old soft 0.90 selection behavior for rollout compatibility. `clear` and `clear-default` restore the next fallback layer; `ACPX_SUBSCRIPTION_AUTO_SELECT=off` disables both automatic switching and hard admission as the emergency rollback lever.
+
+`subscriptions usage --format json` exposes each account's `eligibility` verdict, including vendor availability, automation eligibility, effective ceiling, policy provenance, reason, and telemetry freshness. Unknown weekly telemetry is reported and does not count as a known ceiling hit.
 
 ## Built-in agent registry
 

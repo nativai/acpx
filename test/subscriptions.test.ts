@@ -4,11 +4,16 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  clearDefaultSubscriptionAutoWeeklyCeiling,
+  clearSubscriptionAutoWeeklyCeiling,
   chooseSubscriptionConfigDir,
   findSubscription,
   isSubscriptionLocked,
   loadSubscriptionRegistry,
+  resolveEffectiveWeeklyCeiling,
   resolveSubscriptionConfigDir,
+  setDefaultSubscriptionAutoWeeklyCeiling,
+  setSubscriptionAutoWeeklyCeiling,
   setSubscriptionLockState,
 } from "../src/config/subscriptions.js";
 import type { SubscriptionRegistry } from "../src/config/subscriptions.js";
@@ -39,12 +44,23 @@ test("loadSubscriptionRegistry parses entries and default, applying configDir de
     const registry = loadSubscriptionRegistry({ homeDir, registryPath });
     assert.equal(registry.default, "sub2");
     assert.deepEqual(registry.subscriptions, [
-      { id: "sub1", label: "One", configDir: "/custom/sub1", account: "sub1" },
+      {
+        id: "sub1",
+        label: "One",
+        configDir: "/custom/sub1",
+        account: "sub1",
+        effectiveWeeklyCeiling: 0.9,
+        weeklyCeilingSource: "built-in",
+        weeklyCeilingHard: false,
+      },
       {
         id: "sub2",
         label: "Two",
         configDir: path.join(homeDir, ".acpx", "subscriptions", "sub2"),
         account: "sub2",
+        effectiveWeeklyCeiling: 0.9,
+        weeklyCeilingSource: "built-in",
+        weeklyCeilingHard: false,
       },
     ]);
   });
@@ -385,6 +401,211 @@ test("chooseSubscriptionConfigDir: default dirExists arg falls back to real fs c
       configDir: present,
       source: "default",
       explicitRejection: { kind: "missing-dir", id: "x", configDir: path.join(dir, "absent") },
+    });
+  });
+});
+
+test("weekly ceiling normalization is account-scoped and absent policy stays legacy-soft", async () => {
+  await withTempDir(async (homeDir) => {
+    const registryPath = path.join(homeDir, "registry.json");
+    await fs.writeFile(
+      registryPath,
+      JSON.stringify({
+        version: 3,
+        profiles: [
+          {
+            id: "alias-a",
+            label: "Alias A",
+            authMode: "subscription",
+            adapter: "claude",
+            account: "shared-account",
+            credentialSource: "/cfg/a",
+          },
+          {
+            id: "alias-b",
+            label: "Alias B",
+            authMode: "subscription",
+            adapter: "claude",
+            account: "shared-account",
+            credentialSource: "/cfg/b",
+          },
+        ],
+      }),
+    );
+
+    const previous = process.env.ACPX_SUBSCRIPTION_WEEKLY_THRESHOLD;
+    delete process.env.ACPX_SUBSCRIPTION_WEEKLY_THRESHOLD;
+    try {
+      const builtIn = loadSubscriptionRegistry({ homeDir, registryPath });
+      assert.deepEqual(
+        builtIn.subscriptions.map((entry) => [
+          entry.id,
+          entry.effectiveWeeklyCeiling,
+          entry.weeklyCeilingSource,
+          entry.weeklyCeilingHard,
+        ]),
+        [
+          ["alias-a", 0.9, "built-in", false],
+          ["alias-b", 0.9, "built-in", false],
+        ],
+      );
+
+      process.env.ACPX_SUBSCRIPTION_WEEKLY_THRESHOLD = "0.85";
+      const legacyEnv = loadSubscriptionRegistry({ homeDir, registryPath });
+      assert.deepEqual(
+        legacyEnv.subscriptions.map((entry) => [
+          entry.effectiveWeeklyCeiling,
+          entry.weeklyCeilingSource,
+          entry.weeklyCeilingHard,
+        ]),
+        [
+          [0.85, "legacy-env", false],
+          [0.85, "legacy-env", false],
+        ],
+      );
+    } finally {
+      if (previous === undefined) {
+        delete process.env.ACPX_SUBSCRIPTION_WEEKLY_THRESHOLD;
+      } else {
+        process.env.ACPX_SUBSCRIPTION_WEEKLY_THRESHOLD = previous;
+      }
+    }
+  });
+});
+
+test("account override wins over registry default for every alias", async () => {
+  await withTempDir(async (homeDir) => {
+    const registryPath = path.join(homeDir, "registry.json");
+    await fs.writeFile(
+      registryPath,
+      JSON.stringify({
+        version: 3,
+        subscriptionPolicy: {
+          defaultAutoWeeklyCeiling: 0.95,
+          accounts: { shared: { autoWeeklyCeiling: 0.9 } },
+        },
+        profiles: [
+          { id: "a", authMode: "subscription", account: "shared", credentialSource: "/a" },
+          { id: "b", authMode: "subscription", account: "shared", credentialSource: "/b" },
+          { id: "c", authMode: "subscription", account: "other", credentialSource: "/c" },
+        ],
+      }),
+    );
+    const registry = loadSubscriptionRegistry({ homeDir, registryPath });
+    assert.deepEqual(
+      registry.subscriptions.map((entry) => [
+        entry.id,
+        entry.effectiveWeeklyCeiling,
+        entry.weeklyCeilingSource,
+        entry.weeklyCeilingHard,
+      ]),
+      [
+        ["a", 0.9, "account", true],
+        ["b", 0.9, "account", true],
+        ["c", 0.95, "registry-default", true],
+      ],
+    );
+  });
+});
+
+test("invalid or non-canonical policy values never become effective", async () => {
+  await withTempDir(async (homeDir) => {
+    const registryPath = path.join(homeDir, "registry.json");
+    await fs.writeFile(
+      registryPath,
+      JSON.stringify({
+        version: 3,
+        subscriptionPolicy: {
+          defaultAutoWeeklyCeiling: 0,
+          accounts: {
+            acct: { autoWeeklyCeiling: 1.01 },
+            " acct ": { autoWeeklyCeiling: 0.8 },
+          },
+        },
+        profiles: [
+          { id: "sub", authMode: "subscription", account: "acct", credentialSource: "/sub" },
+        ],
+      }),
+    );
+    const registry = loadSubscriptionRegistry({ homeDir, registryPath });
+    assert.equal(registry.subscriptionPolicy, undefined);
+    assert.equal(registry.subscriptions[0]?.effectiveWeeklyCeiling, 0.9);
+    assert.equal(registry.subscriptions[0]?.weeklyCeilingSource, "built-in");
+    assert.equal(registry.subscriptions[0]?.weeklyCeilingHard, false);
+  });
+});
+
+test("ceiling writers preserve unrelated registry fields and support explicit rollback", async () => {
+  await withTempDir(async (homeDir) => {
+    const registryPath = path.join(homeDir, "registry.json");
+    const raw = {
+      version: 3,
+      opaqueTopLevel: { preserve: true },
+      provisioning: { osHarness: { sourceDir: "/safe/path" } },
+      subscriptionPolicy: { accounts: { shared: { futurePolicy: "keep" } } },
+      profiles: [
+        {
+          id: "alias-a",
+          label: "Alias A",
+          authMode: "subscription",
+          adapter: "claude",
+          account: "shared",
+          credentialSource: "/cfg/a",
+          opaqueProfileField: "keep",
+        },
+        {
+          id: "alias-b",
+          label: "Alias B",
+          authMode: "subscription",
+          adapter: "claude",
+          account: "shared",
+          credentialSource: "/cfg/b",
+        },
+        {
+          id: "or-secret",
+          authMode: "openrouter",
+          model: "anthropic/test",
+          openRouterApiKey: "secret-must-not-be-returned-or-lost",
+        },
+      ],
+    };
+    await fs.writeFile(registryPath, JSON.stringify(raw));
+    const options = { homeDir, registryPath };
+
+    const defaultSet = setDefaultSubscriptionAutoWeeklyCeiling(0.95, options);
+    assert.equal(defaultSet?.source, "registry-default");
+    const accountSet = setSubscriptionAutoWeeklyCeiling("alias-b", 0.9, options);
+    assert.equal(accountSet?.account, "shared");
+    assert.deepEqual(accountSet?.affected, ["alias-a", "alias-b"]);
+
+    const afterSet = JSON.parse(await fs.readFile(registryPath, "utf8")) as Record<string, unknown>;
+    assert.deepEqual(afterSet.opaqueTopLevel, raw.opaqueTopLevel);
+    assert.deepEqual(afterSet.provisioning, raw.provisioning);
+    assert.deepEqual(afterSet.profiles, raw.profiles);
+    assert.deepEqual(afterSet.subscriptionPolicy, {
+      defaultAutoWeeklyCeiling: 0.95,
+      accounts: { shared: { futurePolicy: "keep", autoWeeklyCeiling: 0.9 } },
+    });
+
+    const accountClear = clearSubscriptionAutoWeeklyCeiling("shared", options);
+    assert.equal(accountClear?.source, "registry-default");
+    assert.equal(accountClear?.hard, true);
+    const defaultClear = clearDefaultSubscriptionAutoWeeklyCeiling(options);
+    assert.equal(defaultClear?.source, "built-in");
+    assert.equal(defaultClear?.hard, false);
+    const afterClear = JSON.parse(await fs.readFile(registryPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    assert.deepEqual(afterClear.subscriptionPolicy, {
+      accounts: { shared: { futurePolicy: "keep" } },
+    });
+    assert.deepEqual(afterClear.opaqueTopLevel, raw.opaqueTopLevel);
+    assert.deepEqual(afterClear.profiles, raw.profiles);
+    assert.deepEqual(resolveEffectiveWeeklyCeiling("shared", loadSubscriptionRegistry(options)), {
+      value: 0.9,
+      source: "built-in",
+      hard: false,
     });
   });
 });

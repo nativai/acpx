@@ -1,4 +1,9 @@
-import type { OutputErrorAcpPayload, OutputErrorCode, OutputErrorOrigin } from "../types.js";
+import type {
+  AutomationCapacityReservedDetail,
+  OutputErrorAcpPayload,
+  OutputErrorCode,
+  OutputErrorOrigin,
+} from "../types.js";
 import type { EffectiveAccountMetadata } from "./auth-env.js";
 
 export const OUTPUT_ERROR_JSONRPC_CODES: Record<OutputErrorCode, number> = {
@@ -45,6 +50,7 @@ export type BuildJsonRpcErrorParams = {
   sessionId?: string;
   acp?: OutputErrorAcpPayload;
   effectiveAccount?: EffectiveAccountMetadata;
+  automationCapacityReserved?: AutomationCapacityReservedDetail;
 };
 
 function hasValidAcpError(
@@ -68,6 +74,9 @@ function buildFallbackData(params: BuildJsonRpcErrorParams): Record<string, unkn
     sessionId: params.sessionId,
   };
   assignEffectiveAccountData(data, params.effectiveAccount);
+  if (params.automationCapacityReserved !== undefined) {
+    Object.assign(data, params.automationCapacityReserved);
+  }
 
   for (const [key, value] of Object.entries(data)) {
     if (value === undefined) {

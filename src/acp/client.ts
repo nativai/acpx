@@ -2226,6 +2226,11 @@ export class AcpClient {
         acpSessionId: sourceAcpSessionId,
         forkAtIndex: atIndex,
         subscriptionId: this.claudeCopySubscriptionSelection(),
+        // brick://4d6cb66d — atIndex is a WINDOW index into the record's capped
+        // runtime message list; hand the window length down so the transcript
+        // resolver can remap it onto the transcript tail instead of counting
+        // from the session start (long sessions cut ~5x too early otherwise).
+        recordMessageTotal: sourceMessages?.length,
       });
       if (!uuid) {
         throw new Error(

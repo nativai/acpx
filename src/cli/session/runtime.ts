@@ -21,6 +21,7 @@ import { tailClaudeSubagentJsonl } from "../../claude-jsonl.js";
 import { transcriptCwdHash } from "../../config/subscription-transcript.js";
 import {
   AllSubscriptionsExhaustedError,
+  AutomationCapacityReservedError,
   BridgeAuthGatedError,
   FableShareExhaustedError,
   isModelFloorUnmetError,
@@ -31,6 +32,7 @@ import {
 import {
   attemptFailoverAndRetry,
   classifyFailover,
+  enforceAutomationWeeklyCeilingBeforeTurn,
   enforceModelFloorBeforeTurn,
   enforceSubscriptionLockBeforeTurn,
   failoverEnabled,
@@ -118,6 +120,7 @@ import {
   SESSION_RECORD_SCHEMA,
   type AcpJsonRpcMessage,
   type AcpMessageDirection,
+  type AutomationCapacityReservedDetail,
   type AuthPolicy,
   type McpServer,
   type NonInteractivePermissionPolicy,
@@ -215,6 +218,7 @@ class QueueTaskOutputFormatter implements OutputFormatter {
     message: string;
     retryable?: boolean;
     acp?: OutputErrorAcpPayload;
+    automationCapacityReserved?: AutomationCapacityReservedDetail;
     timestamp?: string;
   }): void {
     this.send({
@@ -226,6 +230,7 @@ class QueueTaskOutputFormatter implements OutputFormatter {
       message: params.message,
       retryable: params.retryable,
       acp: params.acp,
+      automationCapacityReserved: params.automationCapacityReserved,
     });
   }
 
@@ -1298,6 +1303,28 @@ function terminalizeDeliveryRefusedByClosedRecord(
   appendRefusedStreamEventSync(sessionRecordId, task, terminalError);
 }
 
+function terminalizeDeliveryRefusedByReservedCapacity(
+  sessionRecordId: string,
+  task: QueueTask,
+  error: unknown,
+): void {
+  // The top-level JSON-RPC terminal is persisted by runSessionPrompt's
+  // pre-submit catch and remains the session's structured lastError. A queued
+  // no-wait delivery also needs its own correlated terminal, though: there is no
+  // socket waiter to receive sendQueuedTaskError, and the UI folds delivery
+  // state exclusively by messageId. Mark the task first so owner shutdown cannot
+  // append a second terminal for the same delivery.
+  if (
+    !(error instanceof AutomationCapacityReservedError) ||
+    !task.messageId ||
+    task.terminalWritten
+  ) {
+    return;
+  }
+  task.terminalWritten = true;
+  appendDeliveryStreamEventSync(sessionRecordId, task, "failed", deliveryErrorFrom(error));
+}
+
 function sendQueuedTaskError(task: QueueTask, error: unknown): void {
   if (!task.waitForCompletion) {
     return;
@@ -1318,6 +1345,7 @@ function sendQueuedTaskError(task: QueueTask, error: unknown): void {
     retryable: normalizedError.retryable,
     acp: normalizedError.acp,
     effectiveAccount: normalizedError.effectiveAccount,
+    automationCapacityReserved: normalizedError.automationCapacityReserved,
     outputAlreadyEmitted: alreadyEmitted,
   });
 }
@@ -1368,6 +1396,7 @@ export async function runQueuedTask(
     if (isSubscriptionLockBlockError(error)) {
       options.onLockBlocked?.();
     }
+    terminalizeDeliveryRefusedByReservedCapacity(sessionRecordId, task, error);
     terminalizeDeliveryRefusedByClosedRecord(sessionRecordId, task, error);
     sendQueuedTaskError(task, error);
     if (error instanceof InterruptedError) {
@@ -1376,6 +1405,31 @@ export async function runQueuedTask(
   } finally {
     task.close();
   }
+}
+
+function isPreSubmitTerminalError(error: unknown): boolean {
+  return (
+    isSubscriptionLockBlockError(error) ||
+    isModelFloorUnmetError(error) ||
+    error instanceof AutomationCapacityReservedError ||
+    error instanceof AllSubscriptionsExhaustedError
+  );
+}
+
+async function persistPreSubmitTerminalError(record: SessionRecord, error: unknown): Promise<void> {
+  if (!isPreSubmitTerminalError(error)) {
+    return;
+  }
+  await persistTerminalTurnError(record, error).catch(() => {});
+  await mirrorTerminalTurnErrorToMessages(record, error).catch(() => {});
+}
+
+function queuedSwitchResult(
+  profile: string,
+  options: QueuedTaskRuntimeOptions,
+): { useFreshClient: true } {
+  options.onFailoverSwitched?.(profile);
+  return { useFreshClient: true };
 }
 
 async function applyQueuedTaskSubscriptionLockPolicy(
@@ -1389,24 +1443,18 @@ async function applyQueuedTaskSubscriptionLockPolicy(
   try {
     const outcome = await enforceSubscriptionLockBeforeTurn(record);
     if (outcome.switchedTo) {
-      options.onFailoverSwitched?.(outcome.switchedTo);
-      return { useFreshClient: true };
+      return queuedSwitchResult(outcome.switchedTo, options);
     }
     // brick://4d517be2: proactive selection runs after lock enforcement (skipped
     // above when the lock hook already switched). Best-effort / never-throws; a
     // switch means the next turn needs a fresh client to resolve the new dir.
     const selection = await selectSubscriptionBeforeTurn(record);
     if (selection.switchedTo) {
-      options.onFailoverSwitched?.(selection.switchedTo);
-      return { useFreshClient: true };
+      return queuedSwitchResult(selection.switchedTo, options);
     }
+    await enforceAutomationWeeklyCeilingBeforeTurn(record);
   } catch (error) {
-    if (isSubscriptionLockBlockError(error)) {
-      await persistTerminalTurnError(record, error).catch(() => {});
-      // FIX-A: additionally mirror into `.messages.ndjson` so the spawner sees the
-      // turn was refused (subscription locked) rather than silence. Best-effort.
-      await mirrorTerminalTurnErrorToMessages(record, error).catch(() => {});
-    }
+    await persistPreSubmitTerminalError(record, error);
     throw error;
   }
   return { useFreshClient: false };
@@ -1500,6 +1548,7 @@ async function surfaceFailoverTerminalError(
 ): Promise<void> {
   if (
     failoverError instanceof AllSubscriptionsExhaustedError ||
+    failoverError instanceof AutomationCapacityReservedError ||
     failoverError instanceof BridgeAuthGatedError ||
     failoverError instanceof FableShareExhaustedError ||
     isModelFloorUnmetError(failoverError) ||
@@ -1578,20 +1627,19 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // lock and floor hooks. Skipped when the lock hook already switched this turn
     // (avoid double-porting the transcript) or on a failover-retry re-entry
     // (skipProactiveSelection). Best-effort / never-throws.
+    let selectionSwitched = false;
     if (!options.skipProactiveSelection && !lockOutcome.switchedTo) {
-      await selectSubscriptionBeforeTurn(record);
+      selectionSwitched = (await selectSubscriptionBeforeTurn(record)).switchedTo !== undefined;
+    }
+    if (!lockOutcome.switchedTo && !selectionSwitched && !options.skipProactiveSelection) {
+      await enforceAutomationWeeklyCeilingBeforeTurn(record);
     }
     // Pre-turn model-floor gate (brick://07dd62c9 §5b.a): under --floor-hard,
     // refuse UPFRONT (no prompt submitted) when the pinned model is knowably
     // unservable, so no work is done at a knowably-down moment. No-op otherwise.
     await enforceModelFloorBeforeTurn(record);
   } catch (error) {
-    if (isSubscriptionLockBlockError(error) || isModelFloorUnmetError(error)) {
-      await persistTerminalTurnError(record, error).catch(() => {});
-      // Mirror into `.messages.ndjson` so the child + spawner see the turn was
-      // refused (subscription locked / below pinned floor) rather than silence.
-      await mirrorTerminalTurnErrorToMessages(record, error).catch(() => {});
-    }
+    await persistPreSubmitTerminalError(record, error);
     throw error;
   }
 

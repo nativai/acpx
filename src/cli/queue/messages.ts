@@ -16,6 +16,7 @@ import {
 } from "../../types.js";
 import type {
   AcpJsonRpcMessage,
+  AutomationCapacityReservedDetail,
   NonInteractivePermissionPolicy,
   PermissionMode,
   PromptInput,
@@ -220,6 +221,7 @@ export type QueueOwnerErrorMessage = {
   retryable?: boolean;
   acp?: OutputErrorAcpPayload;
   effectiveAccount?: EffectiveAccountMetadata;
+  automationCapacityReserved?: AutomationCapacityReservedDetail;
   outputAlreadyEmitted?: boolean;
 };
 
@@ -935,6 +937,9 @@ function parseErrorOwnerMessage(
   const outputAlreadyEmitted =
     typeof message.outputAlreadyEmitted === "boolean" ? message.outputAlreadyEmitted : undefined;
   const effectiveAccount = effectiveAccountMetadataFromValue(message.effectiveAccount);
+  const automationCapacityReserved = parseAutomationCapacityReservedDetail(
+    message.automationCapacityReserved,
+  );
 
   return {
     type: "error",
@@ -946,8 +951,54 @@ function parseErrorOwnerMessage(
     retryable: typeof message.retryable === "boolean" ? message.retryable : undefined,
     acp: toAcpErrorPayload(message.acp),
     ...(effectiveAccount === undefined ? {} : { effectiveAccount }),
+    ...(automationCapacityReserved == null ? {} : { automationCapacityReserved }),
     ...(outputAlreadyEmitted === undefined ? {} : { outputAlreadyEmitted }),
   };
+}
+
+function hasReservedCapacityRequiredFields(value: Record<string, unknown>): boolean {
+  const strings = [value.accountId, value.accountLabel, value.lastCheckedAt];
+  const numbers = [value.weeklyPercentUsed, value.effectiveWeeklyCeiling, value.reservedPercent];
+  return (
+    value.code === "automation-capacity-reserved" &&
+    value.providerSubmitted === false &&
+    strings.every((entry) => typeof entry === "string" && entry.length > 0) &&
+    numbers.every((entry) => typeof entry === "number" && Number.isFinite(entry))
+  );
+}
+
+function validNextEligibilitySource(value: unknown): boolean {
+  return (
+    value === undefined ||
+    value === "five-hour-reset" ||
+    value === "weekly-reset" ||
+    value === "unlock" ||
+    value === "policy-change"
+  );
+}
+
+function parseAutomationCapacityReservedDetail(
+  value: unknown,
+): AutomationCapacityReservedDetail | null | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const detail = asRecord(value);
+  if (!detail || !hasReservedCapacityRequiredFields(detail)) {
+    return null;
+  }
+  if (
+    !hasOptionalStringFields(detail, [
+      "weeklyResetAt",
+      "nextAutomationEligibleAt",
+      "nextEligibilityAccountId",
+      "nextEligibilityAccountLabel",
+    ]) ||
+    !validNextEligibilitySource(detail.nextEligibilitySource)
+  ) {
+    return null;
+  }
+  return detail as AutomationCapacityReservedDetail;
 }
 
 function isValidOwnerErrorCore(message: Record<string, unknown>): message is Record<
@@ -961,6 +1012,7 @@ function isValidOwnerErrorCore(message: Record<string, unknown>): message is Rec
   return (
     typeof message.message === "string" &&
     isOutputErrorCode(message.code) &&
-    isOutputErrorOrigin(message.origin)
+    isOutputErrorOrigin(message.origin) &&
+    parseAutomationCapacityReservedDetail(message.automationCapacityReserved) !== null
   );
 }
