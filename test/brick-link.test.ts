@@ -167,7 +167,7 @@ test("resolveExistingBrickPath is a pure uuid join plus directory stat", async (
   });
 });
 
-test("stamp helpers call brick stamp only for usable brick ids and never throw", async () => {
+test("brick links await attach for usable ids and propagate failure", async () => {
   await withTempDir("acpx-brick-log-", async (dir) => {
     const log = path.join(dir, "brick.log");
     await withEnv(
@@ -183,8 +183,8 @@ test("stamp helpers call brick stamp only for usable brick ids and never throw",
           metadata: { brick: "garbage" },
         } as unknown as SessionRecord);
         assert.deepEqual(await readLog(log), [
-          ["stamp", X, "session-started", "--by", "session:rec-1"],
-          ["stamp", X, "session-started", "--by", "session:rec-2"],
+          ["attach", X, "--session", "rec-1"],
+          ["attach", X, "--session", "rec-2"],
         ]);
       },
     );
@@ -192,7 +192,10 @@ test("stamp helpers call brick stamp only for usable brick ids and never throw",
 
   await withNoBrickOnPath(async (dir) => {
     await withEnv({ PATH: dir }, async () => {
-      await stampBrickSessionStarted(X, "rec-1");
+      await assert.rejects(
+        stampBrickSessionStarted(X, "rec-1"),
+        /Session rec-1 was created, but linking brick .* failed/,
+      );
     });
   });
 });

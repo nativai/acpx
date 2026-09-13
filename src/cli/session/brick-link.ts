@@ -76,12 +76,14 @@ export async function stampBrickSessionStarted(
     return;
   }
   try {
-    await execBrick(["stamp", normalized, "session-started", "--by", `session:${acpxRecordId}`], {
-      timeoutMs: options.timeoutMs ?? BRICK_CLI_TIMEOUT_MS,
+    // Shared-DB link delivery is synchronous through this box's acpx-ui. The
+    // server stamps history after recording the link; no warning-only success.
+    await execBrick(["attach", normalized, "--session", acpxRecordId], {
+      timeoutMs: options.timeoutMs ?? 15_000,
     });
   } catch (error) {
-    process.stderr.write(
-      `[acpx] warning: brick stamp failed for ${normalized}: ${describeExecError(error)}\n`,
+    throw new Error(
+      `Session ${acpxRecordId} was created, but linking brick ${normalized} failed: ${describeExecError(error)}`, { cause: error },
     );
   }
 }
@@ -185,6 +187,11 @@ function execBrick(
         encoding: "utf8",
         timeout: options.timeoutMs,
         windowsHide: true,
+        // Preserve the non-secret ACPX_UI_BASE_URL proxy marker, never pass the
+        // server credential namespace to the brick child.
+        env: Object.fromEntries(
+          Object.entries(process.env).filter(([name]) => !name.startsWith("ACPX_BRICKS_")),
+        ),
       },
       (error, stdout, stderr) => {
         if (error) {

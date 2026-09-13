@@ -31,7 +31,7 @@ if (mode === "hang") {
   const id = process.env.BRICK_SHIM_ID ?? "11111111-2222-3333-4444-555555555555";
   const brickPath = process.env.BRICK_SHIM_PATH ?? `/tmp/brick-shim/${id}`;
   process.stdout.write(JSON.stringify({ ok: true, data: { brick: { id, path: brickPath } } }));
-} else if (verb === "stamp") {
+} else if (verb === "stamp" || verb === "attach") {
   process.exit(0);
 } else if (verb === "context") {
   if (process.env.BRICK_SHIM_CONTEXT_FILE) {
