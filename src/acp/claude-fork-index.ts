@@ -300,11 +300,33 @@ export function resolveClaudeForkCut(
   forkAtIndex: number,
   recordMessageTotal: number | undefined,
 ): ResolvedClaudeForkCut {
-  const useWindow =
-    typeof recordMessageTotal === "number" &&
-    Number.isFinite(recordMessageTotal) &&
-    recordMessageTotal > 0;
+  const { uuidBySlot, transcriptMessageTotal, firstPostCompactionPosition } =
+    indexClaudeTranscript(content);
+  const cutPosition = resolveTranscriptCutPosition(
+    forkAtIndex,
+    recordMessageTotal,
+    transcriptMessageTotal,
+  );
 
+  if (firstPostCompactionPosition !== undefined && cutPosition < firstPostCompactionPosition) {
+    throw new Error(
+      `Cannot fork at --at-index ${forkAtIndex}: that point lies before the session's last context compaction, so Claude Code can no longer resume from it. Fork at a later point in the conversation, or copy the whole session (no cut).`,
+    );
+  }
+
+  return {
+    uuid: uuidBySlot.get(cutPosition),
+    transcriptMessageTotal,
+    cutPosition,
+    firstPostCompactionPosition,
+  };
+}
+
+function indexClaudeTranscript(content: string): {
+  uuidBySlot: Map<number, string>;
+  transcriptMessageTotal: number;
+  firstPostCompactionPosition: number | undefined;
+} {
   // Single pass: assign reconstructed indices (user starts at 0 / steps by 2 on
   // each real user entry, assistant entries fill the odd slot), remember each
   // entry's uuid by index, and note where the last compaction boundary sits.
@@ -336,9 +358,7 @@ export function resolveClaudeForkCut(
       continue;
     }
     acpxIndex = indexed.nextAcpxIndex;
-    if (indexed.recordAcpxIndex > topSlot) {
-      topSlot = indexed.recordAcpxIndex;
-    }
+    topSlot = Math.max(topSlot, indexed.recordAcpxIndex);
     // First entry per slot wins: for an agent turn spanning several assistant
     // entries, the turn-leading entry is the resume boundary Claude Code sees.
     if (!uuidBySlot.has(indexed.recordAcpxIndex)) {
@@ -346,64 +366,33 @@ export function resolveClaudeForkCut(
     }
   }
 
-  const transcriptMessageTotal = topSlot + 1;
-  const cutPosition =
-    useWindow && transcriptMessageTotal > (recordMessageTotal as number)
-      ? // Window semantics: forkAtIndex counts from the conversation tail.
-        transcriptMessageTotal - (recordMessageTotal as number) + (forkAtIndex - 1)
-      : // Legacy absolute semantics (no window info, or the transcript IS the window).
-        forkAtIndex - 1;
-
-  if (
-    firstPostCompactionPosition !== undefined &&
-    cutPosition < firstPostCompactionPosition
-  ) {
-    throw new Error(
-      `Cannot fork at --at-index ${forkAtIndex}: that point lies before the session's last context compaction, so Claude Code can no longer resume from it. Fork at a later point in the conversation, or copy the whole session (no cut).`,
-    );
-  }
-
   return {
-    uuid: uuidBySlot.get(cutPosition),
-    transcriptMessageTotal,
-    cutPosition,
+    uuidBySlot,
+    transcriptMessageTotal: topSlot + 1,
     firstPostCompactionPosition,
   };
 }
 
-function isCompactionBoundary(record: ClaudeJsonlRecord): boolean {
-  return record.type === "system" && record.subtype === "compact_boundary";
+function resolveTranscriptCutPosition(
+  forkAtIndex: number,
+  recordMessageTotal: number | undefined,
+  transcriptMessageTotal: number,
+): number {
+  if (
+    typeof recordMessageTotal === "number" &&
+    Number.isFinite(recordMessageTotal) &&
+    recordMessageTotal > 0 &&
+    transcriptMessageTotal > recordMessageTotal
+  ) {
+    // Window semantics: forkAtIndex counts from the conversation tail.
+    return transcriptMessageTotal - recordMessageTotal + (forkAtIndex - 1);
+  }
+  // Legacy absolute semantics (no window info, or the transcript IS the window).
+  return forkAtIndex - 1;
 }
 
-function lastClaudeUuidBeforeAcpxIndex(
-  content: string,
-  targetAcpxIndex: number,
-): string | undefined {
-  let acpxIndex = -1;
-  let lastUuid: string | undefined;
-
-  for (const line of content.split("\n")) {
-    if (line.trim().length === 0) {
-      continue;
-    }
-    const record = parseClaudeJsonlRecord(line);
-    if (!record || !isIndexableClaudeRecord(record)) {
-      continue;
-    }
-
-    const indexed = indexClaudeRecord(record, acpxIndex);
-    if (!indexed) {
-      continue;
-    }
-    acpxIndex = indexed.nextAcpxIndex;
-
-    if (indexed.recordAcpxIndex > targetAcpxIndex) {
-      break;
-    }
-    lastUuid = record.uuid;
-  }
-
-  return lastUuid;
+function isCompactionBoundary(record: ClaudeJsonlRecord): boolean {
+  return record.type === "system" && record.subtype === "compact_boundary";
 }
 
 function indexClaudeRecord(

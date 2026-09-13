@@ -39,7 +39,9 @@ function boundaryLine(): string {
 /** n user/assistant pairs, alternating user,assistant,user,assistant,... */
 function transcript(n: number): string {
   const lines: string[] = [];
-  for (let i = 0; i < n; i++) lines.push(...pair());
+  for (let i = 0; i < n; i++) {
+    lines.push(...pair());
+  }
   return lines.join("\n") + "\n";
 }
 
@@ -80,11 +82,15 @@ test("legacy absolute semantics when the transcript fits inside the window", () 
 });
 
 test("a cut before the last compaction boundary is refused with an actionable message", () => {
-  // 5 pairs, boundary, 5 pairs -> 20 slots; the boundary sits before slot 8.
+  // 5 pairs, boundary, 5 pairs -> 20 slots; the boundary sits before slot 10.
   const lines: string[] = [];
-  for (let i = 0; i < 5; i++) lines.push(...pair());
+  for (let i = 0; i < 5; i++) {
+    lines.push(...pair());
+  }
   lines.push(boundaryLine());
-  for (let i = 0; i < 5; i++) lines.push(...pair());
+  for (let i = 0; i < 5; i++) {
+    lines.push(...pair());
+  }
   const content = lines.join("\n") + "\n";
 
   // Post-boundary cut: reports the reachable floor and resolves normally.
@@ -120,15 +126,29 @@ test("non-message entries (sidechain, meta, compact summary, tool results, slash
   const lines: string[] = [
     userLine(),
     assistantLine(),
-    JSON.stringify({ type: "user", uuid: "sidechain1", isSidechain: true, message: { content: "side" } }),
+    JSON.stringify({
+      type: "user",
+      uuid: "sidechain1",
+      isSidechain: true,
+      message: { content: "side" },
+    }),
     JSON.stringify({ type: "user", uuid: "meta1", isMeta: true, message: { content: "meta" } }),
     JSON.stringify({
       type: "user",
       uuid: "toolresult1",
       message: { content: [{ type: "tool_result", content: "r" }] },
     }),
-    JSON.stringify({ type: "user", uuid: "slash1", message: { content: "<command-name>/clear</command-name>" } }),
-    JSON.stringify({ type: "user", uuid: "summary1", isCompactSummary: true, message: { content: "summary" } }),
+    JSON.stringify({
+      type: "user",
+      uuid: "slash1",
+      message: { content: "<command-name>/clear</command-name>" },
+    }),
+    JSON.stringify({
+      type: "user",
+      uuid: "summary1",
+      isCompactSummary: true,
+      message: { content: "summary" },
+    }),
     userLine(),
     assistantLine(),
   ];
@@ -151,7 +171,9 @@ function uuidAt(content: string, position: number): string | undefined {
   let acpxIndex = -1;
   let found: string | undefined;
   for (const line of content.split("\n")) {
-    if (!line.trim()) continue;
+    if (!line.trim()) {
+      continue;
+    }
     const record: {
       type?: string;
       uuid?: string;
@@ -161,29 +183,184 @@ function uuidAt(content: string, position: number): string | undefined {
       message?: { content?: unknown };
       subtype?: string;
     } = JSON.parse(line);
-    if (record.type === "system" && record.subtype === "compact_boundary") continue;
+    if (record.type === "system" && record.subtype === "compact_boundary") {
+      continue;
+    }
     const indexable =
       (record.type === "user" || record.type === "assistant") &&
       typeof record.uuid === "string" &&
       record.isMeta !== true &&
       record.isSidechain !== true &&
       record.isCompactSummary !== true;
-    if (!indexable) continue;
+    if (!indexable) {
+      continue;
+    }
+    const messageContent = record.message?.content;
     const isRealUser =
       record.type === "user" &&
-      !(Array.isArray(record.message?.content) &&
-        (record.message?.content as Array<{ type?: string }>).some((e) => e.type === "tool_result")) &&
-      !(typeof record.message?.content === "string" &&
-        ["<command-name>", "<local-command-stdout>", "<local-command-stderr>", "<command-message>"].some((p) =>
-          (record.message?.content as string).trimStart().startsWith(p),
-        ));
+      !(
+        Array.isArray(messageContent) &&
+        (messageContent as Array<{ type?: string }>).some((e) => e.type === "tool_result")
+      ) &&
+      !(
+        typeof messageContent === "string" &&
+        [
+          "<command-name>",
+          "<local-command-stdout>",
+          "<local-command-stderr>",
+          "<command-message>",
+        ].some((p) => messageContent.trimStart().startsWith(p))
+      );
     const slot = isRealUser ? (acpxIndex < 0 ? 0 : acpxIndex + 2) : acpxIndex + 1;
-    if (!isRealUser && acpxIndex < 0) continue;
+    if (!isRealUser && acpxIndex < 0) {
+      continue;
+    }
     if (slot === position) {
       found = record.uuid;
       break;
     }
-    if (isRealUser) acpxIndex = slot;
+    if (isRealUser) {
+      acpxIndex = slot;
+    }
   }
   return found;
 }
+
+test("adjacent window cuts select exact Claude boundaries before and after compaction", () => {
+  for (const compacted of [false, true]) {
+    const content = [
+      JSON.stringify({ type: "user", uuid: "old-user" }),
+      JSON.stringify({ type: "assistant", uuid: "old-assistant" }),
+      ...(compacted ? [boundaryLine()] : []),
+      JSON.stringify({ type: "user", uuid: "tail-user" }),
+      JSON.stringify({ type: "assistant", uuid: "tail-assistant-first" }),
+      JSON.stringify({ type: "assistant", uuid: "tail-assistant-later" }),
+      JSON.stringify({ type: "user", uuid: "pending-user" }),
+    ].join("\n");
+
+    for (const [index, position, uuid] of [
+      [1, 2, "tail-user"],
+      [2, 3, "tail-assistant-first"],
+      [3, 4, "pending-user"],
+    ] as const) {
+      assert.deepEqual(resolveClaudeForkCut(content, index, 3), {
+        uuid,
+        cutPosition: position,
+        transcriptMessageTotal: 5,
+        firstPostCompactionPosition: compacted ? 2 : undefined,
+      });
+    }
+    if (compacted) {
+      assert.throws(() => resolveClaudeForkCut(content, 0, 3), /last context compaction/);
+    } else {
+      assert.equal(resolveClaudeForkCut(content, 0, 3).uuid, "old-assistant");
+    }
+    assert.equal(resolveClaudeForkCut(content, 4, 3).uuid, undefined);
+  }
+});
+
+test("only the last compaction boundary sets the reachable floor, including a trailing boundary", () => {
+  const content = [
+    JSON.stringify({ type: "user", uuid: "first" }),
+    JSON.stringify({ type: "assistant", uuid: "first-reply" }),
+    boundaryLine(),
+    JSON.stringify({ type: "user", uuid: "middle" }),
+    JSON.stringify({ type: "assistant", uuid: "middle-reply" }),
+    boundaryLine(),
+    JSON.stringify({ type: "user", uuid: "last" }),
+  ].join("\n");
+  assert.throws(() => resolveClaudeForkCut(content, 4, undefined), /last context compaction/);
+  assert.deepEqual(resolveClaudeForkCut(content, 5, undefined), {
+    uuid: "last",
+    cutPosition: 4,
+    transcriptMessageTotal: 5,
+    firstPostCompactionPosition: 4,
+  });
+  const trailing = `${content}\n${boundaryLine()}`;
+  assert.throws(() => resolveClaudeForkCut(trailing, 5, undefined), /last context compaction/);
+  assert.equal(resolveClaudeForkCut(trailing, 6, undefined).uuid, undefined);
+});
+
+test("missing and optional message content retains user slots and ignores malformed transcript rows", () => {
+  const content = [
+    "",
+    "  ",
+    "{broken json",
+    "null",
+    "[]",
+    JSON.stringify({ type: "assistant", uuid: "orphan" }),
+    JSON.stringify({ type: "user" }),
+    JSON.stringify({ type: "user", uuid: "" }),
+    JSON.stringify({ type: "user", uuid: "no-message" }),
+    JSON.stringify({ type: "assistant", uuid: "no-content-reply", message: {} }),
+    JSON.stringify({ type: "user", uuid: "no-content", message: {} }),
+    JSON.stringify({ type: "assistant", uuid: "null-content-reply", message: { content: null } }),
+    JSON.stringify({ type: "user", uuid: "null-content", message: { content: null } }),
+    JSON.stringify({ type: "assistant", uuid: "array-reply", message: { content: [] } }),
+    JSON.stringify({
+      type: "user",
+      uuid: "mixed-content",
+      message: { content: [null, {}, "text"] },
+    }),
+  ].join("\n");
+  for (const [index, uuid] of [
+    [1, "no-message"],
+    [2, "no-content-reply"],
+    [3, "no-content"],
+    [4, "null-content-reply"],
+    [5, "null-content"],
+    [6, "array-reply"],
+    [7, "mixed-content"],
+  ] as const) {
+    const cut = resolveClaudeForkCut(content, index, undefined);
+    assert.equal(cut.uuid, uuid);
+    assert.equal(cut.transcriptMessageTotal, 7);
+  }
+});
+
+test("test oracle handles missing message and content without unsafe optional chaining", () => {
+  const content = [
+    JSON.stringify({ type: "user", uuid: "missing" }),
+    JSON.stringify({ type: "assistant", uuid: "empty", message: {} }),
+  ].join("\n");
+  assert.equal(uuidAt(content, 0), "missing");
+  assert.equal(uuidAt(content, 1), "empty");
+});
+
+test("invalid window metadata keeps absolute semantics and unmapped cuts have no UUID", () => {
+  const content = [
+    JSON.stringify({ type: "user", uuid: "first" }),
+    JSON.stringify({ type: "user", uuid: "second" }),
+  ].join("\n");
+  for (const window of [undefined, 0, -1, Number.NaN, Infinity, -Infinity, 3, 20]) {
+    assert.equal(resolveClaudeForkCut(content, 1, window).uuid, "first");
+    assert.equal(resolveClaudeForkCut(content, 3, window).uuid, "second");
+    for (const index of [-1, 0, 2, 4, 1.5, Number.NaN, Infinity]) {
+      assert.equal(resolveClaudeForkCut(content, index, window).uuid, undefined);
+    }
+  }
+});
+
+test("tool results and slash echoes occupy the assistant slot without replacing its leading entry", () => {
+  const content = [
+    JSON.stringify({ type: "user", uuid: "prompt" }),
+    JSON.stringify({
+      type: "user",
+      uuid: "tool-first",
+      message: { content: [null, { type: "tool_result" }] },
+    }),
+    JSON.stringify({ type: "assistant", uuid: "reply-later" }),
+    ...[
+      "<command-name>",
+      "<local-command-stdout>",
+      "<local-command-stderr>",
+      "<command-message>",
+    ].map((prefix) =>
+      JSON.stringify({ type: "user", uuid: prefix, message: { content: `  ${prefix}ignored` } }),
+    ),
+    JSON.stringify({ type: "user", uuid: "next-prompt" }),
+  ].join("\n");
+  assert.equal(resolveClaudeForkCut(content, 2, undefined).uuid, "tool-first");
+  assert.equal(resolveClaudeForkCut(content, 3, undefined).uuid, "next-prompt");
+  assert.equal(resolveClaudeForkCut(content, 3, undefined).transcriptMessageTotal, 3);
+});
