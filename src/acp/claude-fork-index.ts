@@ -11,6 +11,7 @@ import { splitCommandLine } from "./client-process.js";
 
 type ClaudeJsonlRecord = {
   type?: string;
+  subtype?: string;
   uuid?: string;
   isMeta?: boolean;
   isSidechain?: boolean;
@@ -37,6 +38,30 @@ export async function resolveClaudeUuidForAcpxIndex(args: {
   acpSessionId: string;
   forkAtIndex: number;
   subscriptionId?: string;
+  /**
+   * brick://4d6cb66d — the source record's runtime message-window length
+   * (`sourceRecord.messages.length`, capped at MAX_RUNTIME_MESSAGES=200).
+   *
+   * THE INDEX SPACES MUST NOT BE CONFUSED: `--at-index` is range-checked against
+   * the record's message list, which is a TAIL WINDOW of the conversation, while
+   * the transcript walk below reconstructs indices from the START of the JSONL.
+   * On any session whose transcript holds more messages than the window cap
+   * (long-lived sessions; measured 1064 transcript slots vs window 200 on the
+   * brick's specimen) the two diverge by the dropped prefix and the resolved cut
+   * lands ~5x too early — on a compacted session typically BEFORE the last
+   * compaction boundary, where Claude Code's resume-at refuses with the
+   * unclassified `-32603 Internal error` (the user-visible "internal error").
+   *
+   * When the window length is known and SMALLER than the transcript's
+   * reconstructed count, forkAtIndex is therefore treated as a WINDOW index and
+   * remapped onto the tail: transcript target = total - window + (forkAtIndex-1).
+   * Tail alignment is 1:1 because the record window IS the conversation's tail
+   * (verified against the brick's specimen: the record's last message and the
+   * transcript's last real user entry are the same prompt). Without window info
+   * the legacy absolute semantics apply (short sessions, where the spaces
+   * coincide anyway).
+   */
+  recordMessageTotal?: number;
 }): Promise<string | undefined> {
   if (args.forkAtIndex < 0) {
     return undefined;
@@ -47,7 +72,8 @@ export async function resolveClaudeUuidForAcpxIndex(args: {
     return undefined;
   }
 
-  return lastClaudeUuidBeforeAcpxIndex(content, args.forkAtIndex - 1);
+  const resolved = resolveClaudeForkCut(content, args.forkAtIndex, args.recordMessageTotal);
+  return resolved.uuid;
 }
 
 async function readClaudeTranscript(
@@ -245,6 +271,108 @@ function asClaudeForkSessionModule(value: unknown): ClaudeForkSessionModule | un
   }
 
   return value as ClaudeForkSessionModule;
+}
+
+type ResolvedClaudeForkCut = {
+  uuid: string | undefined;
+  /** Reconstructed transcript message count (the absolute index space's size). */
+  transcriptMessageTotal: number;
+  /** The transcript-space position the requested cut resolved to. */
+  cutPosition: number;
+  /** Position of the first message after the LAST compaction boundary, when the transcript has one. */
+  firstPostCompactionPosition: number | undefined;
+};
+
+/**
+ * Resolve WHERE in the transcript a `--at-index k` cut sits, and whether Claude
+ * Code can resume from there at all.
+ *
+ * Returns the uuid of the last INCLUDED message (record index k-1 — the cut
+ * boundary sits before message k), or `undefined` when no entry maps to that
+ * position. Throws when the position is provably unreachable for Claude Code's
+ * resume-at: anything at or before the last `compact_boundary` is compacted
+ * away, and Claude Code reconstructs the resume chain from the transcript tail,
+ * which stops at that boundary — so such a cut can never materialize and would
+ * surface as the unclassified `-32603 Internal error`.
+ */
+export function resolveClaudeForkCut(
+  content: string,
+  forkAtIndex: number,
+  recordMessageTotal: number | undefined,
+): ResolvedClaudeForkCut {
+  const useWindow =
+    typeof recordMessageTotal === "number" &&
+    Number.isFinite(recordMessageTotal) &&
+    recordMessageTotal > 0;
+
+  // Single pass: assign reconstructed indices (user starts at 0 / steps by 2 on
+  // each real user entry, assistant entries fill the odd slot), remember each
+  // entry's uuid by index, and note where the last compaction boundary sits.
+  const uuidBySlot = new Map<number, string>();
+  let acpxIndex = -1;
+  let topSlot = -1;
+  let firstPostCompactionPosition: number | undefined;
+
+  for (const line of content.split("\n")) {
+    if (line.trim().length === 0) {
+      continue;
+    }
+    const record = parseClaudeJsonlRecord(line);
+    if (!record) {
+      continue;
+    }
+    if (isCompactionBoundary(record)) {
+      // The boundary itself carries no uuid; the first slot AFTER it is the
+      // earliest one Claude Code's tail-reconstructed resume chain can reach.
+      firstPostCompactionPosition = topSlot + 1;
+      continue;
+    }
+    if (!isIndexableClaudeRecord(record)) {
+      continue;
+    }
+
+    const indexed = indexClaudeRecord(record, acpxIndex);
+    if (!indexed) {
+      continue;
+    }
+    acpxIndex = indexed.nextAcpxIndex;
+    if (indexed.recordAcpxIndex > topSlot) {
+      topSlot = indexed.recordAcpxIndex;
+    }
+    // First entry per slot wins: for an agent turn spanning several assistant
+    // entries, the turn-leading entry is the resume boundary Claude Code sees.
+    if (!uuidBySlot.has(indexed.recordAcpxIndex)) {
+      uuidBySlot.set(indexed.recordAcpxIndex, record.uuid);
+    }
+  }
+
+  const transcriptMessageTotal = topSlot + 1;
+  const cutPosition =
+    useWindow && transcriptMessageTotal > (recordMessageTotal as number)
+      ? // Window semantics: forkAtIndex counts from the conversation tail.
+        transcriptMessageTotal - (recordMessageTotal as number) + (forkAtIndex - 1)
+      : // Legacy absolute semantics (no window info, or the transcript IS the window).
+        forkAtIndex - 1;
+
+  if (
+    firstPostCompactionPosition !== undefined &&
+    cutPosition < firstPostCompactionPosition
+  ) {
+    throw new Error(
+      `Cannot fork at --at-index ${forkAtIndex}: that point lies before the session's last context compaction, so Claude Code can no longer resume from it. Fork at a later point in the conversation, or copy the whole session (no cut).`,
+    );
+  }
+
+  return {
+    uuid: uuidBySlot.get(cutPosition),
+    transcriptMessageTotal,
+    cutPosition,
+    firstPostCompactionPosition,
+  };
+}
+
+function isCompactionBoundary(record: ClaudeJsonlRecord): boolean {
+  return record.type === "system" && record.subtype === "compact_boundary";
 }
 
 function lastClaudeUuidBeforeAcpxIndex(
