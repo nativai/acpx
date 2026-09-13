@@ -57,67 +57,43 @@ type LoadedExtension = {
 let importCounter = 0;
 
 /**
- * Write the template to disk and import it FRESH, with `PI_CODING_AGENT_DIR`
- * and `ACPX_UI_SETTINGS_FILE` bound to this fixture — both are read at module
- * load (the openrouter id set and the settings path), exactly as in a real
- * seeded session.
+ * Write the template to disk and import it FRESH, with the settings path bound
+ * to this fixture — read at module load, exactly as in a real seeded session.
+ *
+ * Scoping is LIVE per request (ctx.model.provider), so NO config-dir fixture is
+ * needed — that is the brick-5fee840d fix: the first version scoped on a
+ * config-dir id snapshot built at load, which was EMPTY for a first child
+ * spawned before any policy/models-store existed and could never engage
+ * mid-session (reproduced live; see the extension header).
  */
-async function loadExtension(opts: {
-  configDir: string;
-  settingsFile: string;
-}): Promise<LoadedExtension> {
+async function loadExtension(opts: { settingsFile: string }): Promise<LoadedExtension> {
   const dir = mkdtempSync(join(tmpdir(), "acpx-pi-routing-ext-"));
   const path = join(dir, `ext-${importCounter++}.mjs`);
   writeFileSync(path, PI_ROUTING_EXTENSION_CODE, "utf8");
-  const previous = {
-    dir: process.env.PI_CODING_AGENT_DIR,
-    settings: process.env.ACPX_UI_SETTINGS_FILE,
-  };
-  process.env.PI_CODING_AGENT_DIR = opts.configDir;
+  const previous = process.env.ACPX_UI_SETTINGS_FILE;
   process.env.ACPX_UI_SETTINGS_FILE = opts.settingsFile;
   try {
     return (await import(`${pathToFileURL(path).href}?v=${importCounter}`)) as LoadedExtension;
   } finally {
-    if (previous.dir === undefined) {
-      delete process.env.PI_CODING_AGENT_DIR;
-    } else {
-      process.env.PI_CODING_AGENT_DIR = previous.dir;
-    }
-    if (previous.settings === undefined) {
+    if (previous === undefined) {
       delete process.env.ACPX_UI_SETTINGS_FILE;
     } else {
-      process.env.ACPX_UI_SETTINGS_FILE = previous.settings;
+      process.env.ACPX_UI_SETTINGS_FILE = previous;
     }
   }
 }
 
-function writeOpenrouterConfigDir(root: string): string {
-  const configDir = join(root, "cfg");
-  mkdirSync(configDir, { recursive: true });
-  writeFileSync(
-    join(configDir, "models-store.json"),
-    JSON.stringify({
-      openrouter: {
-        lastModified: 1,
-        checkedAt: 1,
-        models: [{ id: MODEL }, { id: "moonshotai/kimi-k2-thinking" }],
-      },
-    }),
-    "utf8",
-  );
-  writeFileSync(
-    join(configDir, "models.json"),
-    JSON.stringify({
-      providers: {
-        openrouter: { baseUrl: "https://openrouter.ai/api/v1" },
-      },
-    }),
-    "utf8",
-  );
-  return configDir;
-}
+/** ctx stub the way pi passes it: the LIVE model of this request. */
+type Ctx = { model: { provider: string; id: string; baseUrl: string } | undefined };
 
-type Handler = (event: { payload: Record<string, unknown> }) => unknown;
+const OPENROUTER_CTX: Ctx = {
+  model: { provider: "openrouter", id: MODEL, baseUrl: "https://openrouter.ai/api/v1" },
+};
+const NON_OPENROUTER_CTX: Ctx = {
+  model: { provider: "anthropic", id: "claude-sonnet-4-5", baseUrl: "https://api.anthropic.com" },
+};
+
+type Handler = (event: { payload: Record<string, unknown> }, ctx: Ctx) => unknown;
 
 async function handlerFor(ext: LoadedExtension): Promise<Handler> {
   const registered: Record<string, Handler> = {};
@@ -170,7 +146,7 @@ const INVALID_POLICIES: unknown[] = [
 ];
 
 test("parity · the extension's validator agrees with acpx's on the whole matrix", async () => {
-  const ext = await loadExtension({ configDir: noConfigDir(), settingsFile: noSettingsFile() });
+  const ext = await loadExtension({ settingsFile: noSettingsFile() });
   for (const policy of VALID_POLICIES) {
     assert.deepEqual(
       validateRoutingPolicy(policy),
@@ -196,12 +172,6 @@ test("parity · the extension's validator agrees with acpx's on the whole matrix
   }
 });
 
-// Minimal env targets for the pure-function parity rows: the module reads the
-// id set and settings path at load, and both may legitimately be empty here.
-function noConfigDir(): string {
-  const dir = mkdtempSync(join(tmpdir(), "acpx-pi-routing-nocfg-"));
-  return dir;
-}
 function noSettingsFile(): string {
   const file = join(mkdtempSync(join(tmpdir(), "acpx-pi-routing-noset-")), "ui-settings.json");
   writeFileSync(file, JSON.stringify({ version: 1 }), "utf8");
@@ -209,7 +179,7 @@ function noSettingsFile(): string {
 }
 
 test("parity · the extension's resolver agrees with resolveProviderObject on every valid policy", async () => {
-  const ext = await loadExtension({ configDir: noConfigDir(), settingsFile: noSettingsFile() });
+  const ext = await loadExtension({ settingsFile: noSettingsFile() });
   for (const policy of VALID_POLICIES) {
     for (const slug of [MODEL, `openrouter/${MODEL}`, "moonshotai/kimi-k2-thinking", undefined]) {
       assert.deepEqual(
@@ -225,7 +195,7 @@ test("parity · the extension's resolver agrees with resolveProviderObject on ev
 });
 
 test("parity · the quantization ladder expansion agrees rung by rung", async () => {
-  const ext = await loadExtension({ configDir: noConfigDir(), settingsFile: noSettingsFile() });
+  const ext = await loadExtension({ settingsFile: noSettingsFile() });
   // acpx does not export expandQuantizationFloor's inputs as data; re-derive
   // the agreement through resolveProviderObject, which embeds the same ladder.
   for (const floor of ["fp4", "fp6", "fp8", "bf16", "fp32"]) {
@@ -246,11 +216,10 @@ test("parity · the quantization ladder expansion agrees rung by rung", async ()
 
 test("handler · a policy saved mid-session reaches the NEXT request of a running session", async () => {
   const root = mkdtempSync(join(tmpdir(), "acpx-pi-routing-live-"));
-  const configDir = writeOpenrouterConfigDir(root);
   const settingsFile = join(root, "ui-settings.json");
   // The policy did not exist when the session spawned…
   writeFileSync(settingsFile, JSON.stringify({ version: 1 }), "utf8");
-  const ext = await loadExtension({ configDir, settingsFile });
+  const ext = await loadExtension({ settingsFile });
   const handler = await handlerFor(ext);
 
   const payload: Record<string, unknown> = {
@@ -258,7 +227,7 @@ test("handler · a policy saved mid-session reaches the NEXT request of a runnin
     messages: [{ role: "user", content: "hi" }],
     stream: true,
   };
-  assert.equal(handler({ payload }), undefined, "no policy ⇒ payload untouched");
+  assert.equal(handler({ payload }, OPENROUTER_CTX), undefined, "no policy ⇒ payload untouched");
 
   // …the order is saved while the session is running…
   writeFileSync(
@@ -272,7 +241,7 @@ test("handler · a policy saved mid-session reaches the NEXT request of a runnin
   utimesSync(settingsFile, new Date(), new Date());
 
   // …and the next request carries it — byte-for-byte what acpx would resolve.
-  const routed = handler({ payload }) as Record<string, unknown>;
+  const routed = handler({ payload }, OPENROUTER_CTX) as Record<string, unknown>;
   assert.deepEqual(
     routed?.provider,
     resolveProviderObject({ perModel: { [MODEL]: { order: ["coreweave", "baseten"] } } }, MODEL),
@@ -283,7 +252,6 @@ test("handler · a policy saved mid-session reaches the NEXT request of a runnin
 
 test("handler · a CLEARED policy stops steering the running session", async () => {
   const root = mkdtempSync(join(tmpdir(), "acpx-pi-routing-clear-"));
-  const configDir = writeOpenrouterConfigDir(root);
   const settingsFile = join(root, "ui-settings.json");
   writeFileSync(
     settingsFile,
@@ -293,13 +261,13 @@ test("handler · a CLEARED policy stops steering the running session", async () 
     }),
     "utf8",
   );
-  const ext = await loadExtension({ configDir, settingsFile });
+  const ext = await loadExtension({ settingsFile });
   const handler = await handlerFor(ext);
   const payload: Record<string, unknown> = {
     model: MODEL,
     provider: { order: ["baseten"], allow_fallbacks: true },
   };
-  const routed = handler({ payload }) as Record<string, unknown>;
+  const routed = handler({ payload }, OPENROUTER_CTX) as Record<string, unknown>;
   assert.ok(routed?.provider, "policy in force ⇒ provider set");
   assert.deepEqual(
     routed?.provider,
@@ -308,7 +276,7 @@ test("handler · a CLEARED policy stops steering the running session", async () 
 
   writeFileSync(settingsFile, JSON.stringify({ version: 1 }), "utf8");
   utimesSync(settingsFile, new Date(), new Date());
-  const cleared = handler({ payload }) as Record<string, unknown>;
+  const cleared = handler({ payload }, OPENROUTER_CTX) as Record<string, unknown>;
   assert.equal(
     "provider" in (cleared ?? {}),
     false,
@@ -320,7 +288,6 @@ test("handler · a CLEARED policy stops steering the running session", async () 
 
 test("handler · a policy that becomes INVALID is dropped WHOLE, never partially applied", async () => {
   const root = mkdtempSync(join(tmpdir(), "acpx-pi-routing-invalid-"));
-  const configDir = writeOpenrouterConfigDir(root);
   const settingsFile = join(root, "ui-settings.json");
   writeFileSync(
     settingsFile,
@@ -330,7 +297,7 @@ test("handler · a policy that becomes INVALID is dropped WHOLE, never partially
     }),
     "utf8",
   );
-  const ext = await loadExtension({ configDir, settingsFile });
+  const ext = await loadExtension({ settingsFile });
   const handler = await handlerFor(ext);
   const payload: Record<string, unknown> = { model: MODEL, provider: { order: ["baseten"] } };
 
@@ -343,7 +310,7 @@ test("handler · a policy that becomes INVALID is dropped WHOLE, never partially
     "utf8",
   );
   utimesSync(settingsFile, new Date(), new Date());
-  const routed = handler({ payload }) as Record<string, unknown>;
+  const routed = handler({ payload }, OPENROUTER_CTX) as Record<string, unknown>;
   assert.equal("provider" in (routed ?? {}), false, "invalid policy ⇒ no routing in force");
 
   rmSync(root, { recursive: true, force: true });
@@ -351,14 +318,13 @@ test("handler · a policy that becomes INVALID is dropped WHOLE, never partially
 
 test("handler · an UNREADABLE settings file leaves the payload untouched (fail-open)", async () => {
   const root = mkdtempSync(join(tmpdir(), "acpx-pi-routing-gone-"));
-  const configDir = writeOpenrouterConfigDir(root);
   const settingsFile = join(root, "ui-settings.json");
   writeFileSync(
     settingsFile,
     JSON.stringify({ version: 1, openrouterRouting: { ignore: ["wafer"] } }),
     "utf8",
   );
-  const ext = await loadExtension({ configDir, settingsFile });
+  const ext = await loadExtension({ settingsFile });
   const handler = await handlerFor(ext);
   const payload: Record<string, unknown> = {
     model: MODEL,
@@ -366,7 +332,7 @@ test("handler · an UNREADABLE settings file leaves the payload untouched (fail-
   };
   rmSync(settingsFile);
   assert.equal(
-    handler({ payload }),
+    handler({ payload }, OPENROUTER_CTX),
     undefined,
     "unreadable file ⇒ no opinion, spawn-time routing stands",
   );
@@ -376,7 +342,6 @@ test("handler · an UNREADABLE settings file leaves the payload untouched (fail-
 
 test("handler · non-openrouter models are never touched, box-wide policy or not", async () => {
   const root = mkdtempSync(join(tmpdir(), "acpx-pi-routing-scope-"));
-  const configDir = writeOpenrouterConfigDir(root);
   const settingsFile = join(root, "ui-settings.json");
   writeFileSync(
     settingsFile,
@@ -386,13 +351,66 @@ test("handler · non-openrouter models are never touched, box-wide policy or not
     }),
     "utf8",
   );
-  const ext = await loadExtension({ configDir, settingsFile });
+  const ext = await loadExtension({ settingsFile });
   const handler = await handlerFor(ext);
-  // An id in neither models-store.json nor models.json: the extension has no
-  // basis to call it an openrouter model, and Anthropic-shaped bodies 400 on
-  // unknown top-level fields — so the only safe answer is no-op.
-  assert.equal(handler({ payload: { model: "claude-sonnet-4-5", max_tokens: 1024 } }), undefined);
-  assert.equal(handler({ payload: { model: "moonshotai/kimi-k2-thinking" } }) !== undefined, true);
+  // Scoping is the request's LIVE model provider: an anthropic-model request
+  // (Anthropic-shaped bodies 400 on unknown top-level fields) must never carry
+  // OpenRouter routing, whatever the policy says.
+  assert.equal(
+    handler({ payload: { model: "claude-sonnet-4-5", max_tokens: 1024 } }, NON_OPENROUTER_CTX),
+    undefined,
+  );
+  // And a missing/undefined model (never expected from pi) is a no-op too.
+  assert.equal(handler({ payload: { model: MODEL } }, { model: undefined }), undefined);
+
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("handler · the FIRST-CHILD anomaly regression: engagement does NOT depend on a spawn-time snapshot — brick 5fee840d", async () => {
+  // The defect this row pins: the first version scoped on an id set built ONCE
+  // at module load from the config dir's models-store.json + models.json. For
+  // the first pi child of a session spawned BEFORE the policy existed, acpx
+  // writes NEITHER file (pi knows the slug from its bundled catalogue so no
+  // entry is fabricated; the box cache can be empty), the set was empty, and a
+  // policy saved mid-session never engaged for that child's lifetime —
+  // reproduced live (turn 2 succeeded where an engaged extension would have
+  // forced an OpenRouter 404). The fix scopes on ctx.model.provider, so the
+  // config-dir state at load is IRRELEVANT — asserted here with an EMPTY
+  // config dir.
+  const root = mkdtempSync(join(tmpdir(), "acpx-pi-routing-firstchild-"));
+  const emptyConfigDir = join(root, "cfg-empty");
+  mkdirSync(emptyConfigDir, { recursive: true }); // no models-store.json, no models.json content
+  const settingsFile = join(root, "ui-settings.json");
+  writeFileSync(
+    settingsFile,
+    JSON.stringify({
+      version: 1,
+      openrouterRouting: {
+        perModel: {
+          [MODEL]: { order: ["definitely-not-a-real-provider-xyz"], allowFallbacks: false },
+        },
+      },
+    }),
+    "utf8",
+  );
+  const ext = await loadExtension({ settingsFile });
+  const handler = await handlerFor(ext);
+  const routed = handler(
+    { payload: { model: MODEL, messages: [], stream: true } },
+    OPENROUTER_CTX,
+  ) as Record<string, unknown>;
+  assert.deepEqual(
+    routed?.provider,
+    resolveProviderObject(
+      {
+        perModel: {
+          [MODEL]: { order: ["definitely-not-a-real-provider-xyz"], allowFallbacks: false },
+        },
+      },
+      MODEL,
+    ),
+    "a first child with NO spawn-time catalogue files must still engage once the policy is saved",
+  );
 
   rmSync(root, { recursive: true, force: true });
 });

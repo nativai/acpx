@@ -43,11 +43,10 @@
 //
 // ## Scoping — only OpenRouter bodies are touched
 //
-// The event payload does not name the provider, so the extension builds, once
-// at load, the set of openrouter model ids this config dir serves
-// (`models-store.json` + `models.json` models/modelOverrides) and acts only
-// when the request's `model` is in that set. An id in neither file no-ops —
-// the stale-models.json fallback, bounded to the models acpx never wrote.
+// The scope decision is the request's LIVE model provider (ctx.model.provider
+// === "openrouter"), the same id pi itself keys compat.openRouterRouting on —
+// see the block above the handler for why a spawn-time snapshot was a real,
+// live-reproduced defect.
 //
 // Reads config from env, same resolution rule as acpx's `uiSettingsPath`:
 // ACPX_UI_SETTINGS_FILE || (ACPX_STATE_HOME || HOME)/.acpx/ui-settings.json.
@@ -242,48 +241,32 @@ function readPolicy() {
   return cachedPolicy
 }
 
-// The openrouter model ids this config dir serves, read ONCE at load: the
-// spawn-time projection is static for the session's lifetime, and the payload
-// event does not name the provider. An id in neither file never gets routing
-// applied by this extension — it keeps whatever models.json already merged.
-const OPENROUTER_MODEL_IDS = (() => {
-  const ids = new Set()
-  const dir = (process.env.PI_CODING_AGENT_DIR || '').trim()
-  if (!dir) return ids
-  const readJson = (path) => {
-    try {
-      return JSON.parse(fs.readFileSync(path, 'utf8'))
-    } catch {
-      return null
-    }
-  }
-  const store = readJson(dir + '/models-store.json')
-  if (isRecord(store) && isRecord(store.openrouter) && Array.isArray(store.openrouter.models)) {
-    for (const model of store.openrouter.models) {
-      if (model && typeof model.id === 'string') ids.add(model.id)
-    }
-  }
-  const config = readJson(dir + '/models.json')
-  const openrouter = isRecord(config) && isRecord(config.providers) ? config.providers.openrouter : undefined
-  if (isRecord(openrouter)) {
-    if (Array.isArray(openrouter.models)) {
-      for (const model of openrouter.models) {
-        if (model && typeof model.id === 'string') ids.add(model.id)
-      }
-    }
-    if (isRecord(openrouter.modelOverrides)) {
-      for (const id of Object.keys(openrouter.modelOverrides)) ids.add(id)
-    }
-  }
-  return ids
-})()
-
+// Scoping: the LIVE model of THIS request (ctx.model), not a spawn-time
+// snapshot. pi keys compat.openRouterRouting on the model's provider id
+// ("openrouter") — the extension mirrors exactly that predicate.
+//
+// 🛑 THE SNAPSHOT THIS REPLACED WAS A REAL DEFECT, REPRODUCED LIVE
+// (brick 5fee840d, TE finding, 2026-09-13): the first version built an
+// openrouter-id set ONCE at module load from this config dir's
+// models-store.json + models.json. For the FIRST pi child of a session spawned
+// BEFORE the policy existed, acpx writes NEITHER file (pi already knows the
+// slug from its bundled catalogue so no entry is fabricated, and the box cache
+// can be empty), so the set was EMPTY at load — and a policy saved
+// mid-session never engaged for that child's whole lifetime. pi's own cache
+// refresh writes a full models-store.json ~1 s after spawn, but the extension
+// never re-read it. Reproduced live: turn 2 of a persistent session, policy
+// saved in between (order=[bogus], allow_fallbacks:false), turn SUCCEEDED —
+// the provider object never reached OpenRouter. Later children regenerate
+// models.json with modelOverrides and engaged — exactly the TE signature
+// (first child never engaged, every other child did).
+//
 export default function (pi) {
-  pi.on('before_provider_request', (event) => {
+  pi.on('before_provider_request', (event, ctx) => {
     try {
       const payload = event && event.payload
       if (!isRecord(payload) || typeof payload.model !== 'string') return undefined
-      if (!OPENROUTER_MODEL_IDS.has(payload.model)) return undefined
+      const model = ctx && ctx.model
+      if (!model || model.provider !== 'openrouter') return undefined
       const policy = readPolicy()
       if (policy === undefined) return undefined // unreadable file: no opinion
       const resolved = resolveProviderObject(policy, payload.model)
