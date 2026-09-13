@@ -71,6 +71,24 @@ async function readStreamEvents(sessionId: string): Promise<AcpJsonRpcMessage[]>
   return await listSessionEvents(sessionId);
 }
 
+async function waitForResponsiveIdleOwner(sessionId: string): Promise<void> {
+  await waitUntil(
+    "responsive idle queue owner",
+    async () => {
+      try {
+        return await tryQueryActiveTurnOnRunningOwner(sessionId);
+      } catch {
+        // A listener being rebound may have created its pathname before the
+        // server has reached its listening callback. File liveness is therefore
+        // not yet IPC readiness; retry within the same bounded startup/repair
+        // budget and let the PID/generation assertions below prove continuity.
+        return undefined;
+      }
+    },
+    (active) => active === false,
+  );
+}
+
 function assertCompletedOutcome(outcome: SessionSendOutcome): void {
   assert.equal("queued" in outcome, false, "wait-for-completion submit must return a turn result");
   if (!("queued" in outcome)) {
@@ -144,6 +162,11 @@ async function withRealQueueOwner(
         async () => await readQueueOwnerLiveness(sessionId),
         (state) => state.state === "healthy" && state.pidAlive && state.socketReachable === true,
       );
+      // `healthy` above deliberately means the advertised path exists; it does
+      // not claim the server's listening callback has run. Start each scenario
+      // only after one real IPC round trip so scheduler pressure cannot turn
+      // that documented distinction into a false owner-acceptance failure.
+      await waitForResponsiveIdleOwner(sessionId);
       await run({ sessionId, owner });
     } finally {
       await recoverQueueOwnerForSession(sessionId).catch(() => {
@@ -197,16 +220,21 @@ test("an idle live owner restores an externally unlinked socket before the submi
     assert(beforeFault.ownerGeneration);
 
     await fs.unlink(beforeFault.socketPath);
-    const fault = await waitUntil(
-      "live socket-unreachable owner",
-      async () => await readQueueOwnerLiveness(sessionId),
-      (state) => state.state === "socket_unreachable",
-    );
-    assert.equal(fault.pidAlive, true);
-    assert.equal(fault.alive, true);
-    assert.equal(fault.recoverable, false);
-    assert.equal(fault.pid, beforeFault.pid);
-    assert.equal(fault.ownerGeneration, beforeFault.ownerGeneration);
+    const faultOrFastRepair = await readQueueOwnerLiveness(sessionId);
+    if (faultOrFastRepair.state === "socket_unreachable") {
+      assert.equal(faultOrFastRepair.pidAlive, true);
+      assert.equal(faultOrFastRepair.alive, true);
+      assert.equal(faultOrFastRepair.recoverable, false);
+    } else {
+      // The owner checks every 500 ms. Under scheduler pressure it may repair
+      // the path before this observer runs; that is success, not a required
+      // intermediate state. No other state is acceptable.
+      assert.equal(faultOrFastRepair.state, "healthy");
+      assert.equal(faultOrFastRepair.socketReachable, true);
+    }
+    assert.equal(faultOrFastRepair.pid, beforeFault.pid);
+    assert.equal(faultOrFastRepair.ownerGeneration, beforeFault.ownerGeneration);
+    await waitForResponsiveIdleOwner(sessionId);
 
     const repairedCapture = createCapturingFormatter();
     const repairedMessageId = "22222222-2222-4222-8222-222222222222";
@@ -281,11 +309,13 @@ test("socket continuity never interrupts active work and repairs at the idle bou
     assertCompletedOutcome(activeOutcome);
     assertCapturedText(activeCapture, "slept 1500ms");
 
-    const restored = await waitUntil(
-      "socket restoration after active turn",
-      async () => await readQueueOwnerLiveness(sessionId),
-      (state) => state.state === "healthy" && state.socketReachable === true,
-    );
+    // Path creation precedes the listening callback during a Unix-socket
+    // rebind. Wait for actual IPC readiness before the follow-up prompt; merely
+    // polling fs.stat() is the race this integration test is meant to catch.
+    await waitForResponsiveIdleOwner(sessionId);
+    const restored = await readQueueOwnerLiveness(sessionId);
+    assert.equal(restored.state, "healthy");
+    assert.equal(restored.socketReachable, true);
     assert.equal(restored.pid, beforeFault.pid);
     assert.equal(restored.ownerGeneration, beforeFault.ownerGeneration);
 
