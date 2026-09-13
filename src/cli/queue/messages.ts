@@ -851,6 +851,7 @@ const QUEUE_OWNER_MESSAGE_PARSERS: Record<string, QueueOwnerMessageParser> = {
   set_model_result: (message, context) =>
     parseStringResultOwnerMessage(message, context, "set_model_result", "modelId"),
   set_config_option_result: parseSetConfigOptionOwnerMessage,
+  set_depth_result: parseSetDepthResultOwnerMessage,
   drain_deliveries_result: parseDrainResultOwnerMessage,
   error: parseErrorOwnerMessage,
 };
@@ -934,6 +935,48 @@ function parseSetConfigOptionOwnerMessage(
     type: "set_config_option_result",
     ...context,
     response: response as SetSessionConfigOptionResponse,
+  };
+}
+
+/**
+ * brick a3c65f0f (TE red) — the owner's answer to a live depth change.
+ *
+ * ⚠️ THIS PARSER AND THE OWNER'S EMITTER ARE ONE CHANGE, BY CONSTRUCTION: the
+ * emitter lives in `ipc-server.ts`'s `set_depth` branch and builds its payload
+ * from `controlHandlers.setDepth` — the SAME shape this parser validates. The
+ * first deploy shipped the emitter WITHOUT this parser, and the client-side
+ * parse then failed every reply as malformed (`-32603 "Queue owner sent
+ * malformed message"`) on exactly the normally-used case — a live owner — while
+ * every socket-level test stayed green, because those assert the bytes the
+ * OWNER writes, not the bytes the CLIENT can read. If you touch the payload
+ * shape, touch both ends in the same commit.
+ *
+ * `kind` + `requested` are the required core (every DepthProjection carries
+ * them); `value` / `appliedId` / `reason` are carried through only when string —
+ * a projection that sent nothing legitimately omits them.
+ */
+function parseSetDepthResultOwnerMessage(
+  message: Record<string, unknown>,
+  context: QueueOwnerMessageContext,
+): QueueOwnerSetDepthResultMessage | null {
+  const projection = asRecord(message.projection);
+  if (
+    !projection ||
+    typeof projection.kind !== "string" ||
+    typeof projection.requested !== "string"
+  ) {
+    return null;
+  }
+  return {
+    type: "set_depth_result",
+    ...context,
+    projection: {
+      kind: projection.kind,
+      requested: projection.requested,
+      ...(typeof projection.value === "string" ? { value: projection.value } : {}),
+      ...(typeof projection.appliedId === "string" ? { appliedId: projection.appliedId } : {}),
+      ...(typeof projection.reason === "string" ? { reason: projection.reason } : {}),
+    },
   };
 }
 

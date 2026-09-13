@@ -937,9 +937,10 @@ export async function drainQueueOwnerForSession(options: {
   };
 }
 
-async function recoverRecoverableOwnerBeforeSubmit(
-  options: SubmitToQueueOwnerOptions,
-): Promise<boolean> {
+async function recoverRecoverableOwnerBeforeSubmit(options: {
+  sessionId: string;
+  verbose?: boolean;
+}): Promise<boolean> {
   const ownerState = await readQueueOwnerState(options.sessionId);
   if (!ownerState.ownerFound || !ownerState.recoverable) {
     return false;
@@ -1262,6 +1263,16 @@ export async function trySetDepthOnRunningOwner(
 ): Promise<DepthProjection | undefined> {
   const owner = await readQueueOwnerRecord(sessionId);
   if (!owner) {
+    return undefined;
+  }
+
+  // brick a3c65f0f (TE red) — a DEAD or STALE owner record must fall through to
+  // the direct-connect arm, not surface a connection failure. Same recovery the
+  // submit path runs before every attempt: a recoverable record (owner gone,
+  // generation stale) is CLEARED here, and returning undefined sends the caller
+  // down the fallback that spawns a fresh connection. Without this, the first
+  // depth change after an owner crash reported the crash instead of applying.
+  if (await recoverRecoverableOwnerBeforeSubmit({ sessionId, verbose })) {
     return undefined;
   }
 
