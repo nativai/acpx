@@ -10,6 +10,7 @@ import {
 } from "../../errors.js";
 import { switchSessionAccount } from "../../runtime/engine/account-seam.js";
 import { switchSessionSubscription } from "../../runtime/engine/subscription-switch.js";
+import { applyDepthOutcomeToRecord } from "../../session/depth-application.js";
 import {
   setCurrentModelId,
   setDesiredConfigOption,
@@ -33,6 +34,7 @@ import {
 import type {
   SessionRecord,
   SessionSetConfigOptionResult,
+  SessionSetDepthResult,
   SessionSetModelResult,
   SessionSetModeResult,
 } from "../../types.js";
@@ -51,6 +53,7 @@ import {
   tryCloseSessionOnRunningOwner,
   tryQueryActiveTurnOnRunningOwner,
   trySetConfigOptionOnRunningOwner,
+  trySetDepthOnRunningOwner,
   trySetModelOnRunningOwner,
   trySetModeOnRunningOwner,
 } from "../queue/ipc.js";
@@ -63,6 +66,7 @@ import type {
   SessionSetAutoSubscriptionOptions,
   SessionSetAutoSubscriptionResult,
   SessionSetConfigOptionOptions,
+  SessionSetDepthOptions,
   SessionSetFableDegradeOptions,
   SessionSetFableDegradeResult,
   SessionSetModelOptions,
@@ -76,6 +80,7 @@ import type {
 } from "./contracts.js";
 import {
   runSessionSetConfigOptionDirect,
+  runSessionSetDepthDirect,
   runSessionSetModelDirect,
   runSessionSetModeDirect,
 } from "./prompt-runner.js";
@@ -281,6 +286,54 @@ export async function setSessionConfigOption(
   }
 
   return result;
+}
+
+/**
+ * Live thinking-depth change on a `mode`-mechanism harness (brick a3c65f0f).
+ *
+ * ⚠️ Mechanism-gated by the CALLER (`handleSetConfigOption` dispatches here only
+ * when the session's depth mechanism is `mode`) — this function never inspects the
+ * harness itself, so a future mode-mechanism harness works without edits here.
+ *
+ * Owner-first, direct-connect fallback — the same shape as {@link setSessionMode}.
+ * The PROJECTION runs at whichever seat holds the live advertisement (owner-side on
+ * the IPC arm, connection-side on the direct arm); this function only persists the
+ * outcome ({@link applyDepthOutcomeToRecord}) so both arms leave identical record
+ * state. Deliberately NO owner recycle and NO turn-in-flight refusal: the change
+ * rides `session/set_mode`, which the harness accepts mid-turn, and an owner
+ * restart replays `desired_mode_id` (parity with the `set-mode` verb).
+ */
+export async function setSessionDepth(
+  options: SessionSetDepthOptions,
+): Promise<SessionSetDepthResult> {
+  const ownerProjection = await trySetDepthOnRunningOwner(
+    options.sessionId,
+    options.requested,
+    options.timeoutMs,
+    options.verbose,
+  );
+  if (ownerProjection) {
+    const record = await resolveSessionRecord(options.sessionId);
+    applyDepthOutcomeToRecord(record, ownerProjection);
+    await writeSessionRecord(record);
+    return {
+      record,
+      projection: ownerProjection,
+      resumed: false,
+    };
+  }
+
+  return await runSessionSetDepthDirect({
+    sessionRecordId: options.sessionId,
+    requested: options.requested,
+    mcpServers: options.mcpServers,
+    nonInteractivePermissions: options.nonInteractivePermissions,
+    authCredentials: options.authCredentials,
+    authPolicy: options.authPolicy,
+    terminal: options.terminal,
+    timeoutMs: options.timeoutMs,
+    verbose: options.verbose,
+  });
 }
 
 // Change a session's active Claude subscription in place. Unlike set-mode/model

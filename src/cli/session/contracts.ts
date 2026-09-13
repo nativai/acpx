@@ -246,6 +246,22 @@ export type SessionSetConfigOptionOptions = {
   sessionName?: string;
 } & TimedRunOptions;
 
+/**
+ * Live thinking-depth change on a `mode`-mechanism harness (brick a3c65f0f).
+ * `requested` is the CANONICAL rung (`low` / `high` / `max` / …) — the projection
+ * onto the harness's advertised ladder happens inside acpx, never at the caller.
+ */
+export type SessionSetDepthOptions = {
+  sessionId: string;
+  requested: string;
+  mcpServers?: McpServer[];
+  nonInteractivePermissions?: NonInteractivePermissionPolicy;
+  authCredentials?: Record<string, string>;
+  authPolicy?: AuthPolicy;
+  terminal?: boolean;
+  verbose?: boolean;
+} & TimedRunOptions;
+
 export type SessionCreateWithClientResult = {
   record: SessionRecord;
   client: AcpClient;

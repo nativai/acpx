@@ -63,6 +63,7 @@ const owner = await SessionQueueOwner.start(
     setSessionMode: async () => {},
     setSessionModel: async () => {},
     setSessionConfigOption: async () => ({ configOptions: [] }),
+    setDepth: async (requested) => ({ kind: "send-nothing", requested }),
     queryActiveTurn: () => false,
   },
   { maxQueueDepth: 64 },

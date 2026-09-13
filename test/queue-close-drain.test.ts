@@ -27,6 +27,7 @@ import {
   terminalizeAbsorbedDeliveriesOnOwnerExit,
 } from "../src/cli/session/absorbed-delivery-registry.js";
 import { textPrompt } from "../src/prompt-content.js";
+import type { DepthProjection } from "../src/session/depth-projection.js";
 import { sessionEventActivePath } from "../src/session/event-log.js";
 import { connectSocket, nextJsonLine, withTempHome } from "./queue-test-helpers.js";
 
@@ -82,6 +83,10 @@ function stubControlHandlers(
     setSessionMode: async () => {},
     setSessionModel: async () => {},
     setSessionConfigOption: async () => ({ configOptions: [] }) as SetSessionConfigOptionResponse,
+    setDepth: async (requested: string): Promise<DepthProjection> => ({
+      kind: "send-nothing",
+      requested,
+    }),
     queryActiveTurn: () => false,
     ...overrides,
   };

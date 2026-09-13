@@ -11,6 +11,7 @@ import type {
   ToolKind,
 } from "@agentclientprotocol/sdk";
 import type { CostUnit, SessionCostFigure } from "./models/cost-provenance.js";
+import type { DepthProjection } from "./session/depth-projection.js";
 export type { McpServer, SessionNotification } from "@agentclientprotocol/sdk";
 import type { EffectiveAccountMetadata } from "./acp/auth-env.js";
 import type { LastTurnProviderBreadcrumb } from "./acp/openrouter-attribution.js";
@@ -1170,6 +1171,22 @@ export type SessionSetConfigOptionResult = {
   loadError?: string;
   /** True when a live queue owner existed and was recycled to bind the change. */
   ownerRestarted?: boolean;
+};
+
+/**
+ * Live thinking-depth change on a `mode`-mechanism harness (brick a3c65f0f).
+ *
+ * `projection` is what actually happened — the canonical request, the outcome kind,
+ * the served value and (when a mode was sent) the id that was sent. The record
+ * carries the same facts (`desired_config_options.effort`, `desired_mode_id`,
+ * `depth_projection`); the result surfaces them so the CLI can print and acpx-ui's
+ * failure/observability parsing can read them without re-reading the record.
+ */
+export type SessionSetDepthResult = {
+  record: SessionRecord;
+  projection: DepthProjection;
+  resumed: boolean;
+  loadError?: string;
 };
 
 export type SessionSetModelResult = {

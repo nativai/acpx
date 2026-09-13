@@ -11,6 +11,7 @@ import {
   releaseQueueOwnerLease,
   tryAcquireQueueOwnerLease,
 } from "../src/cli/queue/ipc.js";
+import type { DepthProjection } from "../src/session/depth-projection.js";
 import { sessionEventActivePath } from "../src/session/event-log.js";
 import { connectSocket, nextJsonLine, withTempHome } from "./queue-test-helpers.js";
 
@@ -68,6 +69,20 @@ test("SessionQueueOwner handles control requests and nextTask timeouts", async (
           configOptions: [],
         } as SetSessionConfigOptionResponse;
       },
+      // brick a3c65f0f — the projection runs owner-side in production; this stub
+      // returns the MEASURED outcome for rung `max` on glm-5.3-flash's [low, high]
+      // ladder so the wire round-trip asserts a real payload shape.
+      setDepth: async (requested: string): Promise<DepthProjection> =>
+        requested === "max"
+          ? {
+              kind: "projected",
+              requested,
+              value: "high",
+              appliedId: "high",
+              reason:
+                '"max" is not on this model\'s ladder (low, high) — projected by position to "high"',
+            }
+          : { kind: "exact", requested, value: requested, appliedId: requested },
       queryActiveTurn: () => false,
     });
 
@@ -139,6 +154,41 @@ test("SessionQueueOwner handles control requests and nextTask timeouts", async (
       configLines.close();
       configSocket.destroy();
 
+      // brick a3c65f0f — live thinking-depth change: the request carries the
+      // CANONICAL rung; the owner answers with the projection OUTCOME verbatim.
+      const depthSocket = await connectSocket(lease.socketPath);
+      const depthLines = readline.createInterface({ input: depthSocket });
+      const depthIterator = depthLines[Symbol.asyncIterator]();
+      depthSocket.write(
+        `${JSON.stringify({
+          type: "set_depth",
+          requestId: "req-depth",
+          requested: "max",
+          timeoutMs: 250,
+        })}\n`,
+      );
+
+      const depthAccepted = (await nextJsonLine(depthIterator)) as { type: string };
+      const depthResult = (await nextJsonLine(depthIterator)) as {
+        type: string;
+        projection: {
+          kind: string;
+          requested: string;
+          value?: string;
+          appliedId?: string;
+          reason?: string;
+        };
+      };
+      assert.equal(depthAccepted.type, "accepted");
+      assert.equal(depthResult.type, "set_depth_result");
+      assert.equal(depthResult.projection.kind, "projected");
+      assert.equal(depthResult.projection.requested, "max");
+      assert.equal(depthResult.projection.value, "high");
+      assert.equal(depthResult.projection.appliedId, "high");
+      assert.ok(depthResult.projection.reason);
+      depthLines.close();
+      depthSocket.destroy();
+
       const closeSocket = await connectSocket(lease.socketPath);
       const closeLines = readline.createInterface({ input: closeSocket });
       const closeIterator = closeLines[Symbol.asyncIterator]();
@@ -191,6 +241,10 @@ test("SessionQueueOwner nextTask without ttl waits until a prompt arrives", asyn
         ({
           configOptions: [],
         }) as SetSessionConfigOptionResponse,
+      setDepth: async (requested: string): Promise<DepthProjection> => ({
+        kind: "send-nothing",
+        requested,
+      }),
       queryActiveTurn: () => false,
     });
 
@@ -255,6 +309,10 @@ test("SessionQueueOwner coalesces concurrent repairs of an externally unlinked s
         ({
           configOptions: [],
         }) as SetSessionConfigOptionResponse,
+      setDepth: async (requested: string): Promise<DepthProjection> => ({
+        kind: "send-nothing",
+        requested,
+      }),
       queryActiveTurn: () => false,
     });
 
@@ -333,6 +391,10 @@ test("SessionQueueOwner enqueues fire-and-forget prompts and rejects invalid own
           ({
             configOptions: [],
           }) as SetSessionConfigOptionResponse,
+        setDepth: async (requested: string): Promise<DepthProjection> => ({
+          kind: "send-nothing",
+          requested,
+        }),
         queryActiveTurn: () => false,
       },
       {
@@ -494,6 +556,10 @@ test("SessionQueueOwner rejects stale-generation submit_prompt without enqueuein
         ({
           configOptions: [],
         }) as SetSessionConfigOptionResponse,
+      setDepth: async (requested: string): Promise<DepthProjection> => ({
+        kind: "send-nothing",
+        requested,
+      }),
       queryActiveTurn: () => false,
     });
 
@@ -537,6 +603,10 @@ const NOOP_CONTROL_HANDLERS = {
   setSessionMode: async () => {},
   setSessionModel: async () => {},
   setSessionConfigOption: async () => ({ configOptions: [] }) as SetSessionConfigOptionResponse,
+  setDepth: async (requested: string): Promise<DepthProjection> => ({
+    kind: "send-nothing",
+    requested,
+  }),
   queryActiveTurn: () => false,
 };
 
@@ -731,6 +801,10 @@ test("P2d: nextTask(0) is a non-blocking peek — returns a pending task at once
       setSessionMode: async () => {},
       setSessionModel: async () => {},
       setSessionConfigOption: async () => ({ configOptions: [] }) as SetSessionConfigOptionResponse,
+      setDepth: async (requested: string): Promise<DepthProjection> => ({
+        kind: "send-nothing",
+        requested,
+      }),
       queryActiveTurn: () => false,
     });
     try {
