@@ -136,6 +136,7 @@ function makeQueueOwnerErrorFromUnknown(
     message: normalized.message,
     retryable: normalized.retryable,
     acp: normalized.acp,
+    automationCapacityReserved: normalized.automationCapacityReserved,
   };
 }
 
@@ -273,9 +274,11 @@ export type QueueTask = {
   // the instant any path writes this task's delivery terminal — the same flag
   // discipline F3 uses for absorbed deliveries (absorbed-delivery-registry.ts).
   //
-  // Four writers now share it, which is exactly why it is one flag and not a
+  // Five writers now share it, which is exactly why it is one flag and not a
   // guard duplicated per call site:
   //   - the closed-record refusal  (runtime.ts terminalizeDeliveryRefusedByClosedRecord)
+  //   - the reserved-capacity refusal
+  //     (runtime.ts terminalizeDeliveryRefusedByReservedCapacity)
   //   - the close-drain barrier    (drainDeliveries)
   //   - the SIGTERM/SIGINT sweep   (terminalizeCustodyOnSignal)
   //   - owner exit                 (close)

@@ -24,12 +24,36 @@ export type SubscriptionEntry = {
   locked?: true;
   lockedAt?: string;
   lockedBy?: string;
+  /** Resolved account policy; always populated by loadSubscriptionRegistry. */
+  effectiveWeeklyCeiling?: number;
+  /** Provenance determines whether the ceiling is a hard admission policy. */
+  weeklyCeilingSource?: WeeklyCeilingSource;
+  /** True only for an explicit registry account/default policy. */
+  weeklyCeilingHard?: boolean;
+};
+
+export type WeeklyCeilingSource = "account" | "registry-default" | "legacy-env" | "built-in";
+
+export type SubscriptionAccountPolicy = {
+  autoWeeklyCeiling: number;
+};
+
+export type SubscriptionPolicy = {
+  defaultAutoWeeklyCeiling?: number;
+  accounts: Record<string, SubscriptionAccountPolicy>;
+};
+
+export type EffectiveWeeklyCeiling = {
+  value: number;
+  source: WeeklyCeilingSource;
+  hard: boolean;
 };
 
 export type SubscriptionRegistry = {
   /** Default subscription id. Governs spawns with no explicit selection. */
   default?: string;
   subscriptions: SubscriptionEntry[];
+  subscriptionPolicy?: SubscriptionPolicy;
 };
 
 /**
@@ -61,6 +85,8 @@ export type ConfigDirChoice = {
 const SUBSCRIPTIONS_DIRNAME = "subscriptions";
 const REGISTRY_FILENAME = "registry.json";
 
+export const DEFAULT_AUTO_WEEKLY_CEILING = 0.9;
+
 const EMPTY_REGISTRY: SubscriptionRegistry = { subscriptions: [] };
 
 export type SubscriptionLookupOptions = {
@@ -80,6 +106,85 @@ export function subscriptionRegistryPath(
   homeDir: string = process.env.ACPX_STATE_HOME || os.homedir(),
 ): string {
   return path.join(subscriptionsDir(homeDir), REGISTRY_FILENAME);
+}
+
+function validAutoWeeklyCeiling(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 && value <= 1
+    ? value
+    : undefined;
+}
+
+function normalizeAccountPolicy(value: unknown): SubscriptionAccountPolicy | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const autoWeeklyCeiling = validAutoWeeklyCeiling(value.autoWeeklyCeiling);
+  return autoWeeklyCeiling === undefined ? undefined : { autoWeeklyCeiling };
+}
+
+function normalizeAccountPolicies(value: unknown): Record<string, SubscriptionAccountPolicy> {
+  const accounts: Record<string, SubscriptionAccountPolicy> = {};
+  if (!isRecord(value)) {
+    return accounts;
+  }
+  for (const [account, rawPolicy] of Object.entries(value)) {
+    if (!account || account !== account.trim()) {
+      continue;
+    }
+    const policy = normalizeAccountPolicy(rawPolicy);
+    if (policy !== undefined) {
+      accounts[account] = policy;
+    }
+  }
+  return accounts;
+}
+
+/** Parse the persisted account-scoped policy, dropping invalid values safely. */
+export function normalizeSubscriptionPolicy(value: unknown): SubscriptionPolicy | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const defaultAutoWeeklyCeiling = validAutoWeeklyCeiling(value.defaultAutoWeeklyCeiling);
+  const accounts = normalizeAccountPolicies(value.accounts);
+  if (defaultAutoWeeklyCeiling === undefined && Object.keys(accounts).length === 0) {
+    return undefined;
+  }
+  return {
+    ...(defaultAutoWeeklyCeiling !== undefined ? { defaultAutoWeeklyCeiling } : {}),
+    accounts,
+  };
+}
+
+function legacyWeeklyCeiling(): number | undefined {
+  const raw = process.env.ACPX_SUBSCRIPTION_WEEKLY_THRESHOLD?.trim();
+  if (!raw) {
+    return undefined;
+  }
+  return validAutoWeeklyCeiling(Number(raw));
+}
+
+/**
+ * Resolve the sole effective automatic weekly ceiling for a functional account.
+ * Only persisted registry policy is hard; env/built-in fallbacks retain the
+ * pre-policy soft no-target behavior for an engine-first rollout.
+ */
+export function resolveEffectiveWeeklyCeiling(
+  account: string,
+  registry?: Pick<SubscriptionRegistry, "subscriptionPolicy">,
+): EffectiveWeeklyCeiling {
+  const policy = registry?.subscriptionPolicy;
+  const override = policy?.accounts[account]?.autoWeeklyCeiling;
+  if (override !== undefined) {
+    return { value: override, source: "account", hard: true };
+  }
+  if (policy?.defaultAutoWeeklyCeiling !== undefined) {
+    return { value: policy.defaultAutoWeeklyCeiling, source: "registry-default", hard: true };
+  }
+  const legacy = legacyWeeklyCeiling();
+  if (legacy !== undefined) {
+    return { value: legacy, source: "legacy-env", hard: false };
+  }
+  return { value: DEFAULT_AUTO_WEEKLY_CEILING, source: "built-in", hard: false };
 }
 
 /**
@@ -450,9 +555,20 @@ function normalizeRegistry(value: unknown, homeDir: string): SubscriptionRegistr
   applyLegacySubscriptionLocks(value.subscriptions, subscriptions);
 
   const defaultId = nonEmptyString(value.default);
+  const subscriptionPolicy = normalizeSubscriptionPolicy(value.subscriptionPolicy);
+  const registryPolicy = subscriptionPolicy !== undefined ? { subscriptionPolicy } : undefined;
+  for (const entry of subscriptions) {
+    const effective = resolveEffectiveWeeklyCeiling(entry.account, registryPolicy);
+    Object.assign(entry, {
+      effectiveWeeklyCeiling: effective.value,
+      weeklyCeilingSource: effective.source,
+      weeklyCeilingHard: effective.hard,
+    });
+  }
   return {
     subscriptions,
     ...(defaultId !== undefined ? { default: defaultId } : {}),
+    ...(subscriptionPolicy !== undefined ? { subscriptionPolicy } : {}),
   };
 }
 
@@ -589,6 +705,283 @@ function affectedSubscriptionIds(
   return registry.subscriptions
     .filter((entry) => (entry.account || entry.id) === targetAccount)
     .map((entry) => entry.id);
+}
+
+export type SubscriptionSubjectResolution =
+  | {
+      kind: "found";
+      account: string;
+      entries: SubscriptionEntry[];
+      profile?: SubscriptionEntry;
+    }
+  | {
+      kind: "ambiguous";
+      profile: SubscriptionEntry;
+      accountEntries: SubscriptionEntry[];
+    }
+  | { kind: "missing" };
+
+export type ResolvedSubscriptionSubject = Extract<SubscriptionSubjectResolution, { kind: "found" }>;
+
+function entriesForAccount(account: string, registry: SubscriptionRegistry): SubscriptionEntry[] {
+  return registry.subscriptions.filter((entry) => entry.account === account);
+}
+
+function resolvedProfileSubject(
+  profile: SubscriptionEntry,
+  registry: SubscriptionRegistry,
+): ResolvedSubscriptionSubject {
+  return {
+    kind: "found",
+    account: profile.account,
+    entries: entriesForAccount(profile.account, registry),
+    profile,
+  };
+}
+
+function policyHasAccount(account: string, registry: SubscriptionRegistry): boolean {
+  return Object.prototype.hasOwnProperty.call(registry.subscriptionPolicy?.accounts ?? {}, account);
+}
+
+function resolvePrefixedSubscriptionSubject(
+  subject: string,
+  registry: SubscriptionRegistry,
+): SubscriptionSubjectResolution | undefined {
+  const trimmed = subject.trim();
+  if (trimmed.startsWith("profile:")) {
+    const entry = findSubscription(trimmed.slice("profile:".length), registry);
+    return entry ? resolvedProfileSubject(entry, registry) : { kind: "missing" };
+  }
+  if (trimmed.startsWith("account:")) {
+    const account = trimmed.slice("account:".length).trim();
+    const entries = entriesForAccount(account, registry);
+    return entries.length > 0 || policyHasAccount(account, registry)
+      ? { kind: "found", account, entries }
+      : { kind: "missing" };
+  }
+  return undefined;
+}
+
+function isAmbiguousBareSubject(
+  profile: SubscriptionEntry | undefined,
+  accountKnown: boolean,
+  subject: string,
+): profile is SubscriptionEntry {
+  return profile !== undefined && accountKnown && profile.account !== subject;
+}
+
+export function resolveSubscriptionSubject(
+  subject: string,
+  registry: SubscriptionRegistry,
+): SubscriptionSubjectResolution {
+  const prefixed = resolvePrefixedSubscriptionSubject(subject, registry);
+  if (prefixed) {
+    return prefixed;
+  }
+  const trimmed = subject.trim();
+  if (!trimmed) {
+    return { kind: "missing" };
+  }
+  const profile = findSubscription(trimmed, registry);
+  const accountEntries = entriesForAccount(trimmed, registry);
+  const accountKnown = accountEntries.length > 0 || policyHasAccount(trimmed, registry);
+  if (isAmbiguousBareSubject(profile, accountKnown, trimmed)) {
+    return { kind: "ambiguous", profile, accountEntries };
+  }
+  if (profile) {
+    return resolvedProfileSubject(profile, registry);
+  }
+  return accountKnown
+    ? { kind: "found", account: trimmed, entries: accountEntries }
+    : { kind: "missing" };
+}
+
+export type SubscriptionCeilingMutationResult = {
+  action:
+    | "subscription_ceiling_set"
+    | "subscription_ceiling_default_set"
+    | "subscription_ceiling_cleared"
+    | "subscription_ceiling_default_cleared";
+  account: string | null;
+  affected: string[];
+  effectiveWeeklyCeiling: number;
+  effectiveWeeklyCeilingPercent: number;
+  source: WeeklyCeilingSource;
+  hard: boolean;
+};
+
+function mutableSubscriptionPolicy(document: Record<string, unknown>): Record<string, unknown> {
+  const existing = isRecord(document.subscriptionPolicy) ? document.subscriptionPolicy : {};
+  document.subscriptionPolicy = existing;
+  return existing;
+}
+
+function mutableAccountPolicies(policy: Record<string, unknown>): Record<string, unknown> {
+  const existing = isRecord(policy.accounts) ? policy.accounts : {};
+  policy.accounts = existing;
+  return existing;
+}
+
+function assertValidAutoWeeklyCeiling(value: number): void {
+  if (validAutoWeeklyCeiling(value) === undefined) {
+    throw new RangeError(
+      "automation weekly ceiling must be a finite fraction greater than 0 and at most 1",
+    );
+  }
+}
+
+function percentageFromFraction(value: number): number {
+  return Number((value * 100).toFixed(10));
+}
+
+/** Set an account override by either profile id or functional account id. */
+export function setSubscriptionAutoWeeklyCeiling(
+  subject: string,
+  ceiling: number,
+  options?: SubscriptionLookupOptions,
+): SubscriptionCeilingMutationResult | undefined {
+  assertValidAutoWeeklyCeiling(ceiling);
+  const registryPath = registryPathForOptions(options);
+  const document = readRegistryDocument(registryPath);
+  if (!document) {
+    return undefined;
+  }
+  const homeDir = options?.homeDir ?? (process.env.ACPX_STATE_HOME || os.homedir());
+  const registry = normalizeRegistry(document, homeDir);
+  const target = resolveSubscriptionSubject(subject, registry);
+  if (target.kind !== "found") {
+    return undefined;
+  }
+  const account = target.account;
+  const policy = mutableSubscriptionPolicy(document);
+  const accounts = mutableAccountPolicies(policy);
+  const accountPolicy = isRecord(accounts[account]) ? accounts[account] : {};
+  accountPolicy.autoWeeklyCeiling = ceiling;
+  accounts[account] = accountPolicy;
+  writeRegistryDocument(registryPath, document);
+  return {
+    action: "subscription_ceiling_set",
+    account,
+    affected: target.entries.map((entry) => entry.id),
+    effectiveWeeklyCeiling: ceiling,
+    effectiveWeeklyCeilingPercent: percentageFromFraction(ceiling),
+    source: "account",
+    hard: true,
+  };
+}
+
+/** Set the registry-wide explicit default used by accounts without an override. */
+export function setDefaultSubscriptionAutoWeeklyCeiling(
+  ceiling: number,
+  options?: SubscriptionLookupOptions,
+): SubscriptionCeilingMutationResult | undefined {
+  assertValidAutoWeeklyCeiling(ceiling);
+  const registryPath = registryPathForOptions(options);
+  const document = readRegistryDocument(registryPath);
+  if (!document) {
+    return undefined;
+  }
+  const policy = mutableSubscriptionPolicy(document);
+  policy.defaultAutoWeeklyCeiling = ceiling;
+  writeRegistryDocument(registryPath, document);
+  return {
+    action: "subscription_ceiling_default_set",
+    account: null,
+    affected: [],
+    effectiveWeeklyCeiling: ceiling,
+    effectiveWeeklyCeilingPercent: percentageFromFraction(ceiling),
+    source: "registry-default",
+    hard: true,
+  };
+}
+
+function pruneEmptySubscriptionPolicy(
+  document: Record<string, unknown>,
+  policy: Record<string, unknown>,
+): void {
+  if (isRecord(policy.accounts) && Object.keys(policy.accounts).length === 0) {
+    delete policy.accounts;
+  }
+  if (Object.keys(policy).length === 0) {
+    delete document.subscriptionPolicy;
+  }
+}
+
+function removeAccountWeeklyCeiling(document: Record<string, unknown>, account: string): void {
+  const policy = isRecord(document.subscriptionPolicy) ? document.subscriptionPolicy : undefined;
+  if (!policy || !isRecord(policy.accounts)) {
+    return;
+  }
+  const accountPolicy = isRecord(policy.accounts[account]) ? policy.accounts[account] : undefined;
+  if (!accountPolicy) {
+    return;
+  }
+  delete accountPolicy.autoWeeklyCeiling;
+  if (Object.keys(accountPolicy).length === 0) {
+    delete policy.accounts[account];
+  }
+  pruneEmptySubscriptionPolicy(document, policy);
+}
+
+/** Clear one account override and reveal the next resolver layer. */
+export function clearSubscriptionAutoWeeklyCeiling(
+  subject: string,
+  options?: SubscriptionLookupOptions,
+): SubscriptionCeilingMutationResult | undefined {
+  const registryPath = registryPathForOptions(options);
+  const document = readRegistryDocument(registryPath);
+  if (!document) {
+    return undefined;
+  }
+  const homeDir = options?.homeDir ?? (process.env.ACPX_STATE_HOME || os.homedir());
+  const registry = normalizeRegistry(document, homeDir);
+  const target = resolveSubscriptionSubject(subject, registry);
+  if (target.kind !== "found") {
+    return undefined;
+  }
+  const account = target.account;
+  removeAccountWeeklyCeiling(document, account);
+  writeRegistryDocument(registryPath, document);
+  const nextRegistry = normalizeRegistry(document, homeDir);
+  const effective = resolveEffectiveWeeklyCeiling(account, nextRegistry);
+  return {
+    action: "subscription_ceiling_cleared",
+    account,
+    affected: target.entries.map((entry) => entry.id),
+    effectiveWeeklyCeiling: effective.value,
+    effectiveWeeklyCeilingPercent: percentageFromFraction(effective.value),
+    source: effective.source,
+    hard: effective.hard,
+  };
+}
+
+/** Clear the registry default and reveal the legacy env/built-in soft layer. */
+export function clearDefaultSubscriptionAutoWeeklyCeiling(
+  options?: SubscriptionLookupOptions,
+): SubscriptionCeilingMutationResult | undefined {
+  const registryPath = registryPathForOptions(options);
+  const document = readRegistryDocument(registryPath);
+  if (!document) {
+    return undefined;
+  }
+  const policy = isRecord(document.subscriptionPolicy) ? document.subscriptionPolicy : undefined;
+  if (policy) {
+    delete policy.defaultAutoWeeklyCeiling;
+    pruneEmptySubscriptionPolicy(document, policy);
+  }
+  writeRegistryDocument(registryPath, document);
+  const homeDir = options?.homeDir ?? (process.env.ACPX_STATE_HOME || os.homedir());
+  const nextRegistry = normalizeRegistry(document, homeDir);
+  const effective = resolveEffectiveWeeklyCeiling("", nextRegistry);
+  return {
+    action: "subscription_ceiling_default_cleared",
+    account: null,
+    affected: [],
+    effectiveWeeklyCeiling: effective.value,
+    effectiveWeeklyCeilingPercent: percentageFromFraction(effective.value),
+    source: effective.source,
+    hard: effective.hard,
+  };
 }
 
 export function setSubscriptionLockState(

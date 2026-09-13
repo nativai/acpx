@@ -82,6 +82,13 @@ Repo: https://github.com/openclaw/acpx
 - Usage: persist vendor-neutral request units from `_meta.acpxUsage.unit`, including
   the observed model and informational reasoning count, with legacy Pi fallback.
   Unknown prices remain null and reasoning is not charged twice.
+- CLI/subscriptions: add account-scoped automatic weekly ceilings with
+  `subscriptions ceiling show|set|set-default|clear|clear-default`. Explicit
+  registry policy enforces a hard automatic turn boundary (switch or typed
+  `automation-capacity-reserved` before provider submission), while absent and
+  legacy-environment policy retains the previous soft 0.90 behavior. Usage JSON
+  now exposes vendor availability, automation eligibility, the effective ceiling,
+  reason, provenance, and telemetry freshness.
 
 ### Breaking
 

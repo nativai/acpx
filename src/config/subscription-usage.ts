@@ -2,9 +2,15 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { readSessionIndex, type SessionIndexEntry } from "../session/persistence/index.js";
 import { sessionBaseDir } from "../session/persistence/repository.js";
+import type { AutomationEligibilitySource } from "../types.js";
 import { patchFableSnapshot, readFableSnapshot, type FableSnapshot } from "./fable-snapshot.js";
 import { findProfile, loadProfileRegistry, type ProfileRegistry } from "./profiles.js";
-import type { SubscriptionEntry, SubscriptionLookupOptions } from "./subscriptions.js";
+import {
+  resolveEffectiveWeeklyCeiling,
+  type SubscriptionEntry,
+  type SubscriptionLookupOptions,
+  type WeeklyCeilingSource,
+} from "./subscriptions.js";
 
 // Native per-subscription usage probe. Mirrors acpx-ui/server/sessionUsage.ts
 // (kept independent — acpx must not depend on acpx-ui): for each subscription
@@ -90,6 +96,10 @@ export type SubscriptionFableState = {
 export type SubscriptionUsage = {
   id: string;
   label: string;
+  /** Functional quota identity. Equal accounts share policy and provider usage. */
+  account?: string;
+  /** Shared display label fallback for the functional account. */
+  accountLabel?: string;
   locked?: true;
   lockedAt?: string;
   lockedBy?: string;
@@ -97,12 +107,49 @@ export type SubscriptionUsage = {
   sevenDay: SubscriptionUsageWindow | null;
   /** Present only when this subscription's probe failed; windows are null then. */
   error?: string;
+  /** Resolved from the registry account policy (or legacy compatibility fallback). */
+  effectiveWeeklyCeiling?: number;
+  weeklyCeilingSource?: WeeklyCeilingSource;
+  weeklyCeilingHard?: boolean;
+  /** When the unified-window probe that produced this reading completed. */
+  fetchedAt?: string;
+  /** Whether this call obtained telemetry from the five-minute cache. */
+  cacheStatus?: "fresh" | "cached";
+  /** Shared engine/UI policy verdict at the normal 0.98 five-hour target bar. */
+  eligibility?: SubscriptionEligibilityVerdict;
   /** Fallback (Fable) allocation from the successful probe. Null on error/absent
    *  headers. Populated automatically by usageFromResponse — always cheap. */
   fallback?: SubscriptionFallbackAllocation | null;
   /** Dedicated fable-probe result. Present ONLY when a fable probe ran for this
    *  entry (undefined = not probed — the default for non-Fable paths). */
   fable?: SubscriptionFableState;
+};
+
+export type SubscriptionEligibilityReason =
+  | "locked"
+  | "usage-error"
+  | "five-hour-full"
+  | "weekly-ceiling"
+  | "provider-exhausted";
+
+export type SubscriptionEligibilityVerdict = {
+  accountId: string;
+  accountLabel: string;
+  vendorAvailable: boolean;
+  automationEligible: boolean;
+  effectiveWeeklyCeiling: number;
+  reservedPercent: number;
+  weeklyCeilingSource: WeeklyCeilingSource;
+  hardCeiling: boolean;
+  weeklyUsageKnown: boolean;
+  usageFetchedAt: string | null;
+  usageCacheStatus: "fresh" | "cached" | "unknown";
+  reason: SubscriptionEligibilityReason | null;
+  constrainingWindow?: "five-hour" | "seven-day";
+  nextAutomationEligibleAt?: string;
+  nextEligibilityAccountId?: string;
+  nextEligibilityAccountLabel?: string;
+  nextEligibilitySource?: AutomationEligibilitySource;
 };
 
 type CacheEntry = { value: SubscriptionUsage; expiresAt: number };
@@ -213,9 +260,6 @@ async function probeSubscriptionUsage(entry: SubscriptionEntry): Promise<Subscri
   const base: SubscriptionUsage = {
     id: entry.id,
     label: entry.label,
-    ...(entry.locked === true ? { locked: true } : {}),
-    ...(entry.lockedAt !== undefined ? { lockedAt: entry.lockedAt } : {}),
-    ...(entry.lockedBy !== undefined ? { lockedBy: entry.lockedBy } : {}),
     fiveHour: null,
     sevenDay: null,
   };
@@ -636,6 +680,39 @@ function cachedUsage(id: string): SubscriptionUsage | undefined {
   return undefined;
 }
 
+function decorateUsageForEntry(
+  usage: SubscriptionUsage,
+  entry: SubscriptionEntry,
+  cacheStatus: "fresh" | "cached",
+): SubscriptionUsage {
+  const fallback = resolveEffectiveWeeklyCeiling(entry.account);
+  const value: SubscriptionUsage = {
+    ...usage,
+    id: entry.id,
+    label: entry.label,
+    account: entry.account,
+    accountLabel: entry.label,
+    effectiveWeeklyCeiling: entry.effectiveWeeklyCeiling ?? fallback.value,
+    weeklyCeilingSource: entry.weeklyCeilingSource ?? fallback.source,
+    weeklyCeilingHard: entry.weeklyCeilingHard ?? fallback.hard,
+    cacheStatus,
+  };
+  delete value.locked;
+  delete value.lockedAt;
+  delete value.lockedBy;
+  if (entry.locked === true) {
+    value.locked = true;
+  }
+  if (entry.lockedAt !== undefined) {
+    value.lockedAt = entry.lockedAt;
+  }
+  if (entry.lockedBy !== undefined) {
+    value.lockedBy = entry.lockedBy;
+  }
+  value.eligibility = subscriptionEligibilityVerdict(value, maxedThreshold());
+  return value;
+}
+
 async function usageForEntry(
   entry: SubscriptionEntry,
   forceRefresh = false,
@@ -643,15 +720,186 @@ async function usageForEntry(
   if (!forceRefresh) {
     const cached = cachedUsage(entry.id);
     if (cached) {
-      return cached;
+      return decorateUsageForEntry(cached, entry, "cached");
     }
   }
-  const value = await probeSubscriptionUsage(entry);
+  const probed = await probeSubscriptionUsage(entry);
+  probed.fetchedAt = new Date().toISOString();
+  const value = decorateUsageForEntry(probed, entry, "fresh");
   // Only cache successful probes so transient failures retry on the next call.
   if (value.error === undefined) {
     cache.set(entry.id, { value, expiresAt: Date.now() + CACHE_TTL_MS });
   }
   return value;
+}
+
+type UsageWindowKey = "fiveHour" | "sevenDay";
+
+function resetSortValue(reset: string | null): number {
+  const parsed = Date.parse(reset ?? "");
+  return Number.isNaN(parsed) ? Number.POSITIVE_INFINITY : parsed;
+}
+
+function compareConservativeWindows(
+  left: SubscriptionUsageWindow,
+  right: SubscriptionUsageWindow,
+): number {
+  if (left.utilization !== right.utilization) {
+    return right.utilization - left.utilization;
+  }
+  const leftReset = resetSortValue(left.reset);
+  const rightReset = resetSortValue(right.reset);
+  if (leftReset === rightReset || (!Number.isFinite(leftReset) && !Number.isFinite(rightReset))) {
+    return 0;
+  }
+  return rightReset - leftReset;
+}
+
+function aggregateAccountWindow(
+  usages: readonly SubscriptionUsage[],
+  key: UsageWindowKey,
+): SubscriptionUsageWindow | null {
+  const windows = usages
+    .filter((usage) => usage.error === undefined)
+    .map((usage) => usage[key])
+    .filter((window): window is SubscriptionUsageWindow => window !== null);
+  const selected = windows.toSorted(compareConservativeWindows)[0];
+  return selected ? { ...selected } : null;
+}
+
+function oldestUsageFetchedAt(usages: readonly SubscriptionUsage[]): string | undefined {
+  const candidates = usages
+    .map((usage) => usage.fetchedAt)
+    .filter((value): value is string => value !== undefined)
+    .map((value) => ({ value, time: Date.parse(value) }))
+    .filter((candidate) => !Number.isNaN(candidate.time))
+    .toSorted((left, right) => left.time - right.time);
+  return candidates[0]?.value;
+}
+
+function accountCacheStatus(
+  usages: readonly SubscriptionUsage[],
+): SubscriptionUsage["cacheStatus"] {
+  if (usages.some((usage) => usage.cacheStatus === "cached")) {
+    return "cached";
+  }
+  return usages.some((usage) => usage.cacheStatus === "fresh") ? "fresh" : undefined;
+}
+
+type AccountUsageProjection = {
+  accountLabel: string;
+  fiveHour: SubscriptionUsageWindow | null;
+  sevenDay: SubscriptionUsageWindow | null;
+  fetchedAt?: string;
+  cacheStatus?: "fresh" | "cached";
+  locked: boolean;
+  lockedAt?: string;
+  lockedBy?: string;
+};
+
+function accountUsageLabel(usages: readonly SubscriptionUsage[]): string {
+  const first = usages[0];
+  if (!first) {
+    return "unknown";
+  }
+  const account = first.account ?? first.id;
+  return usages.find((usage) => usage.id === account)?.label ?? first.label;
+}
+
+function assignProjectionFreshness(
+  projection: AccountUsageProjection,
+  usages: readonly SubscriptionUsage[],
+): void {
+  const fetchedAt = oldestUsageFetchedAt(usages);
+  const cacheStatus = accountCacheStatus(usages);
+  if (fetchedAt !== undefined) {
+    projection.fetchedAt = fetchedAt;
+  }
+  if (cacheStatus !== undefined) {
+    projection.cacheStatus = cacheStatus;
+  }
+}
+
+function assignProjectionLock(
+  projection: AccountUsageProjection,
+  lockedUsage: SubscriptionUsage | undefined,
+): void {
+  if (!lockedUsage) {
+    return;
+  }
+  projection.locked = true;
+  if (lockedUsage.lockedAt !== undefined) {
+    projection.lockedAt = lockedUsage.lockedAt;
+  }
+  if (lockedUsage.lockedBy !== undefined) {
+    projection.lockedBy = lockedUsage.lockedBy;
+  }
+}
+
+function accountUsageProjection(usages: readonly SubscriptionUsage[]): AccountUsageProjection {
+  const lockedUsage = usages.find((usage) => usage.locked === true);
+  const projection: AccountUsageProjection = {
+    accountLabel: accountUsageLabel(usages),
+    fiveHour: aggregateAccountWindow(usages, "fiveHour"),
+    sevenDay: aggregateAccountWindow(usages, "sevenDay"),
+    locked: false,
+  };
+  assignProjectionFreshness(projection, usages);
+  assignProjectionLock(projection, lockedUsage);
+  return projection;
+}
+
+function applyAccountUsageProjection(
+  usage: SubscriptionUsage,
+  projection: AccountUsageProjection,
+): SubscriptionUsage {
+  const projected: SubscriptionUsage = {
+    ...usage,
+    accountLabel: projection.accountLabel,
+    fiveHour: projection.fiveHour,
+    sevenDay: projection.sevenDay,
+    ...(projection.fetchedAt !== undefined ? { fetchedAt: projection.fetchedAt } : {}),
+    ...(projection.cacheStatus !== undefined ? { cacheStatus: projection.cacheStatus } : {}),
+  };
+  delete projected.locked;
+  delete projected.lockedAt;
+  delete projected.lockedBy;
+  if (projection.locked) {
+    projected.locked = true;
+  }
+  if (projection.lockedAt !== undefined) {
+    projected.lockedAt = projection.lockedAt;
+  }
+  if (projection.lockedBy !== undefined) {
+    projected.lockedBy = projection.lockedBy;
+  }
+  projected.eligibility = subscriptionEligibilityVerdict(projected, maxedThreshold());
+  return projected;
+}
+
+/**
+ * Produce one conservative quota reading per functional account and project it
+ * onto every alias. Successful aliases contribute the maximum utilization for
+ * each window; an alias-local probe error remains attached so that credential
+ * is not selected when the shared account itself is otherwise eligible.
+ */
+export function projectAccountSubscriptionUsage(usages: SubscriptionUsage[]): SubscriptionUsage[] {
+  const groups = new Map<string, SubscriptionUsage[]>();
+  for (const usage of usages) {
+    const account = usage.account ?? usage.id;
+    const group = groups.get(account) ?? [];
+    group.push(usage);
+    groups.set(account, group);
+  }
+  const projections = new Map(
+    [...groups].map(([account, group]) => [account, accountUsageProjection(group)]),
+  );
+  return usages.map((usage) =>
+    applyAccountUsageProjection(
+      usage,
+      projections.get(usage.account ?? usage.id) ?? accountUsageProjection([usage]),
+    ),
+  );
 }
 
 /**
@@ -665,7 +913,65 @@ export async function getSubscriptionsUsage(
   entries: SubscriptionEntry[],
   forceRefresh = false,
 ): Promise<SubscriptionUsage[]> {
-  return await Promise.all(entries.map((entry) => usageForEntry(entry, forceRefresh)));
+  const usages = await Promise.all(entries.map((entry) => usageForEntry(entry, forceRefresh)));
+  return projectAccountSubscriptionUsage(usages);
+}
+
+export const CONFIGURED_WEEKLY_CEILING_REFRESH_MARGIN = 0.05;
+export const CONFIGURED_WEEKLY_CEILING_MAX_CACHE_AGE_MS = 30_000;
+
+function reserveReadingIsStale(usage: SubscriptionUsage): boolean {
+  if (usage.cacheStatus !== "cached" || usage.fetchedAt === undefined) {
+    return usage.cacheStatus === "cached";
+  }
+  const fetchedAt = Date.parse(usage.fetchedAt);
+  return (
+    Number.isNaN(fetchedAt) || Date.now() - fetchedAt >= CONFIGURED_WEEKLY_CEILING_MAX_CACHE_AGE_MS
+  );
+}
+
+function shouldRefreshNearConfiguredCeiling(
+  entry: SubscriptionEntry,
+  usage: SubscriptionUsage | undefined,
+): boolean {
+  if (!usage || !reserveReadingIsStale(usage) || usage.sevenDay === null) {
+    return false;
+  }
+  const ceiling =
+    entry.effectiveWeeklyCeiling !== undefined && entry.weeklyCeilingHard !== undefined
+      ? { value: entry.effectiveWeeklyCeiling, hard: entry.weeklyCeilingHard }
+      : resolveEffectiveWeeklyCeiling(entry.account);
+  return (
+    ceiling.hard &&
+    ceiling.value < 1 &&
+    usage.sevenDay.utilization >=
+      Math.max(0, ceiling.value - CONFIGURED_WEEKLY_CEILING_REFRESH_MARGIN)
+  );
+}
+
+/**
+ * Replace near-reserve cached readings with bounded fresh probes before making
+ * an automatic routing/admission decision. Fresh and non-reserve readings pass
+ * through unchanged, so the normal five-minute cache still bounds probe load.
+ */
+export async function refreshNearConfiguredWeeklyCeilings(
+  entries: SubscriptionEntry[],
+  usages: SubscriptionUsage[],
+): Promise<SubscriptionUsage[]> {
+  const projectedUsages = projectAccountSubscriptionUsage(usages);
+  const usageById = new Map(projectedUsages.map((usage) => [usage.id, usage]));
+  const refreshEntries = entries.filter((entry) =>
+    shouldRefreshNearConfiguredCeiling(entry, usageById.get(entry.id)),
+  );
+  if (refreshEntries.length === 0) {
+    return projectedUsages;
+  }
+  const refreshedById = new Map(
+    (await getSubscriptionsUsage(refreshEntries, true)).map((usage) => [usage.id, usage]),
+  );
+  return projectAccountSubscriptionUsage(
+    projectedUsages.map((usage) => refreshedById.get(usage.id) ?? usage),
+  );
 }
 
 /** Highest of the two windows' utilization (the binding constraint), or 0. */
@@ -693,27 +999,13 @@ export function maxedThreshold(): number {
   return parsed;
 }
 
-const DEFAULT_WEEKLY_HEADROOM_THRESHOLD = 0.9;
-
 /**
- * Resolve the weekly (7d) headroom eligibility threshold. brick://67d2fd2f req1:
- * a subscription must have REAL weekly headroom to be eligible — its 7d
- * utilization must be BELOW this value (default 0.90 ⇒ ≥10% weekly headroom),
- * not merely "not dead" (maxedThreshold, 0.98). Configurable via
- * ACPX_SUBSCRIPTION_WEEKLY_THRESHOLD, same parse/clamp as maxedThreshold().
- * The SAME constant drives the acpx-ui req5 binding-window ring (client
- * WEEKLY_THRESHOLD_PCT=90) so selector and display always agree on "exhausted".
+ * Legacy compatibility accessor. Account-aware production paths receive their
+ * resolved value on SubscriptionUsage; direct callers without registry context
+ * retain the environment/built-in 0.90 behavior.
  */
 export function weeklyHeadroomThreshold(): number {
-  const raw = process.env.ACPX_SUBSCRIPTION_WEEKLY_THRESHOLD?.trim();
-  if (!raw) {
-    return DEFAULT_WEEKLY_HEADROOM_THRESHOLD;
-  }
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 1) {
-    return DEFAULT_WEEKLY_HEADROOM_THRESHOLD;
-  }
-  return parsed;
+  return resolveEffectiveWeeklyCeiling("").value;
 }
 
 /** Empty exclude set for eligibility checks that don't exclude any sub. */
@@ -737,6 +1029,270 @@ export function isSubscriptionEligible(
 
 export { EMPTY_EXCLUDE };
 
+function ceilingFromUsage(usage: SubscriptionUsage): EffectiveUsageCeiling {
+  if (
+    usage.effectiveWeeklyCeiling !== undefined &&
+    usage.weeklyCeilingSource !== undefined &&
+    usage.weeklyCeilingHard !== undefined
+  ) {
+    return {
+      value: usage.effectiveWeeklyCeiling,
+      source: usage.weeklyCeilingSource,
+      hard: usage.weeklyCeilingHard,
+    };
+  }
+  return resolveEffectiveWeeklyCeiling(usage.account ?? usage.id);
+}
+
+type EffectiveUsageCeiling = ReturnType<typeof resolveEffectiveWeeklyCeiling>;
+
+function providerExhausted(usage: SubscriptionUsage): boolean {
+  return (usage.fiveHour?.utilization ?? 0) >= 1 || (usage.sevenDay?.utilization ?? 0) >= 1;
+}
+
+function telemetryUsable(usage: SubscriptionUsage): boolean {
+  return usage.error === undefined && usage.fiveHour !== null;
+}
+
+function weeklyCeilingReached(usage: SubscriptionUsage, ceiling: number): boolean {
+  return usage.sevenDay !== null && usage.sevenDay.utilization >= ceiling;
+}
+
+function fiveHourThresholdReached(usage: SubscriptionUsage, threshold: number): boolean {
+  return usage.fiveHour !== null && usage.fiveHour.utilization >= threshold;
+}
+
+function eligibilityReason(
+  usage: SubscriptionUsage,
+  ceiling: number,
+  fiveHourThreshold: number,
+): SubscriptionEligibilityReason | undefined {
+  if (usage.locked === true) {
+    return "locked";
+  }
+  if (providerExhausted(usage)) {
+    return "provider-exhausted";
+  }
+  if (weeklyCeilingReached(usage, ceiling)) {
+    return "weekly-ceiling";
+  }
+  if (!telemetryUsable(usage)) {
+    return "usage-error";
+  }
+  if (fiveHourThresholdReached(usage, fiveHourThreshold)) {
+    return "five-hour-full";
+  }
+  return undefined;
+}
+
+function constrainingWindow(
+  usage: SubscriptionUsage,
+  reason: SubscriptionEligibilityReason | undefined,
+): "five-hour" | "seven-day" | undefined {
+  if (reason === "five-hour-full") {
+    return "five-hour";
+  }
+  if (reason === "weekly-ceiling") {
+    return "seven-day";
+  }
+  if (reason !== "provider-exhausted") {
+    return undefined;
+  }
+  return providerBindingWindow(fullProviderWindows(usage))?.window;
+}
+
+function resetEligibilityProjection(
+  usage: SubscriptionUsage,
+  window: "five-hour" | "seven-day",
+  reset: string | null | undefined,
+): Pick<
+  SubscriptionEligibilityVerdict,
+  | "nextAutomationEligibleAt"
+  | "nextEligibilityAccountId"
+  | "nextEligibilityAccountLabel"
+  | "nextEligibilitySource"
+> {
+  if (!reset || Number.isNaN(Date.parse(reset))) {
+    return {};
+  }
+  return {
+    nextAutomationEligibleAt: reset,
+    nextEligibilityAccountId: usage.account ?? usage.id,
+    nextEligibilityAccountLabel: usage.accountLabel ?? usage.label,
+    nextEligibilitySource: window === "five-hour" ? "five-hour-reset" : "weekly-reset",
+  };
+}
+
+type FullProviderWindow = {
+  window: "five-hour" | "seven-day";
+  reset: string | null;
+};
+
+function fullProviderWindow(
+  window: SubscriptionUsageWindow | null,
+  name: "five-hour" | "seven-day",
+): FullProviderWindow | undefined {
+  if (!window || window.utilization < 1) {
+    return undefined;
+  }
+  return { window: name, reset: window.reset };
+}
+
+function fullProviderWindows(usage: SubscriptionUsage): FullProviderWindow[] {
+  return [
+    fullProviderWindow(usage.fiveHour, "five-hour"),
+    fullProviderWindow(usage.sevenDay, "seven-day"),
+  ].filter((window): window is FullProviderWindow => window !== undefined);
+}
+
+function providerResetUnknown(entry: FullProviderWindow): boolean {
+  return !entry.reset || Number.isNaN(Date.parse(entry.reset));
+}
+
+function providerBindingWindow(
+  full: readonly FullProviderWindow[],
+): FullProviderWindow | undefined {
+  if (full.length < 2) {
+    return full[0];
+  }
+  if (full.some(providerResetUnknown)) {
+    // Both windows are physically full, but at least one reset is unknown. Use
+    // seven-day as the deterministic broader-window label; the executable
+    // providerEligibilityProjection guard omits the time tuple in this case.
+    return full.find((entry) => entry.window === "seven-day") ?? full[0];
+  }
+  return full.toSorted(
+    (left, right) => Date.parse(right.reset ?? "") - Date.parse(left.reset ?? ""),
+  )[0];
+}
+
+function providerEligibilityProjection(
+  usage: SubscriptionUsage,
+): ReturnType<typeof resetEligibilityProjection> {
+  const full = fullProviderWindows(usage);
+  if (full.length === 0 || full.some(providerResetUnknown)) {
+    return {};
+  }
+  const binding = providerBindingWindow(full);
+  return binding ? resetEligibilityProjection(usage, binding.window, binding.reset) : {};
+}
+
+function nextEligibilityProjection(
+  usage: SubscriptionUsage,
+  reason: SubscriptionEligibilityReason | undefined,
+): ReturnType<typeof resetEligibilityProjection> {
+  if (reason === "five-hour-full") {
+    return resetEligibilityProjection(usage, "five-hour", usage.fiveHour?.reset);
+  }
+  if (reason === "weekly-ceiling") {
+    return resetEligibilityProjection(usage, "seven-day", usage.sevenDay?.reset);
+  }
+  return reason === "provider-exhausted" ? providerEligibilityProjection(usage) : {};
+}
+
+function accountIdForUsage(usage: SubscriptionUsage): string {
+  return usage.account ?? usage.id;
+}
+
+function accountLabelForUsage(usage: SubscriptionUsage): string {
+  return usage.accountLabel ?? usage.label;
+}
+
+function usageFetchedAtOrNull(usage: SubscriptionUsage): string | null {
+  return usage.fetchedAt ?? null;
+}
+
+function usageCacheStatusOrUnknown(
+  usage: SubscriptionUsage,
+): SubscriptionEligibilityVerdict["usageCacheStatus"] {
+  return usage.cacheStatus ?? "unknown";
+}
+
+function nullableEligibilityReason(
+  reason: SubscriptionEligibilityReason | undefined,
+): SubscriptionEligibilityReason | null {
+  return reason ?? null;
+}
+
+function vendorAvailableForUsage(usage: SubscriptionUsage): boolean {
+  return telemetryUsable(usage) && !providerExhausted(usage);
+}
+
+export function subscriptionEligibilityVerdict(
+  usage: SubscriptionUsage,
+  fiveHourThreshold: number = maxedThreshold(),
+): SubscriptionEligibilityVerdict {
+  const ceiling = ceilingFromUsage(usage);
+  const weeklyUsageKnown = usage.sevenDay !== null;
+  const reason = eligibilityReason(usage, ceiling.value, fiveHourThreshold);
+  const window = constrainingWindow(usage, reason);
+
+  const verdict: SubscriptionEligibilityVerdict = {
+    accountId: accountIdForUsage(usage),
+    accountLabel: accountLabelForUsage(usage),
+    vendorAvailable: vendorAvailableForUsage(usage),
+    automationEligible: reason === undefined,
+    effectiveWeeklyCeiling: ceiling.value,
+    reservedPercent: Number(((1 - ceiling.value) * 100).toFixed(10)),
+    weeklyCeilingSource: ceiling.source,
+    hardCeiling: ceiling.hard,
+    weeklyUsageKnown,
+    usageFetchedAt: usageFetchedAtOrNull(usage),
+    usageCacheStatus: usageCacheStatusOrUnknown(usage),
+    reason: nullableEligibilityReason(reason),
+    ...nextEligibilityProjection(usage, reason),
+  };
+  if (window !== undefined) {
+    verdict.constrainingWindow = window;
+  }
+  return verdict;
+}
+
+export type NextKnownAutomationEligibility = {
+  at: string;
+  accountId: string;
+  accountLabel: string;
+  source: AutomationEligibilitySource;
+};
+
+function accountUsageRepresentatives(usages: readonly SubscriptionUsage[]): SubscriptionUsage[] {
+  const representatives = new Map<string, SubscriptionUsage>();
+  for (const usage of usages) {
+    const account = usage.account ?? usage.id;
+    const current = representatives.get(account);
+    if (!current || (current.error !== undefined && usage.error === undefined)) {
+      representatives.set(account, usage);
+    }
+  }
+  return [...representatives.values()];
+}
+
+function nextKnownForUsage(usage: SubscriptionUsage): NextKnownAutomationEligibility | undefined {
+  const verdict = subscriptionEligibilityVerdict(usage, maxedThreshold());
+  const at = verdict.nextAutomationEligibleAt;
+  const source = verdict.nextEligibilitySource;
+  if (!at || !source || Number.isNaN(Date.parse(at))) {
+    return undefined;
+  }
+  return {
+    at,
+    accountId: verdict.nextEligibilityAccountId ?? verdict.accountId,
+    accountLabel: verdict.nextEligibilityAccountLabel ?? verdict.accountLabel,
+    source,
+  };
+}
+
+/** Earliest known policy-eligible time across distinct functional accounts. */
+export function earliestKnownAutomationEligibility(
+  usages: readonly SubscriptionUsage[],
+): NextKnownAutomationEligibility | undefined {
+  const candidates = accountUsageRepresentatives(usages)
+    .map((usage) => nextKnownForUsage(usage))
+    .filter((candidate): candidate is NextKnownAutomationEligibility => candidate !== undefined)
+    .toSorted((left, right) => Date.parse(left.at) - Date.parse(right.at));
+  return candidates[0];
+}
+
 function isEligibleForFailover(
   usage: SubscriptionUsage,
   exclude: ReadonlySet<string>,
@@ -745,26 +1301,7 @@ function isEligibleForFailover(
   if (exclude.has(usage.id)) {
     return false;
   }
-  if (usage.locked === true) {
-    return false;
-  }
-  if (usage.error !== undefined) {
-    return false;
-  }
-  // fiveHour === null means the 5h header was absent on a non-errored probe;
-  // treat as ineligible — we cannot confirm the 5h headroom requirement is met.
-  if (usage.fiveHour === null) {
-    return false;
-  }
-  // sevenDay === null means the 7d header was absent — absence ≠ exhausted, so
-  // do not reject. Only reject when the window is present and lacks REAL weekly
-  // headroom (≥ weeklyHeadroomThreshold, default 0.90 — brick://67d2fd2f req1,
-  // was maxedThreshold 0.98 "not-dead"; independent of the 5h `threshold` param,
-  // so a weekly-tight sub is never selected even in the relaxed fallback rung).
-  if (usage.sevenDay !== null && usage.sevenDay.utilization >= weeklyHeadroomThreshold()) {
-    return false;
-  }
-  return usage.fiveHour.utilization < threshold;
+  return subscriptionEligibilityVerdict(usage, threshold).automationEligible;
 }
 
 function sevenDayResetKey(usage: SubscriptionUsage): number {
@@ -847,9 +1384,11 @@ export function countEligibleFailoverTargets(
   options: { exclude: ReadonlySet<string>; threshold?: number },
 ): number {
   const threshold = options.threshold ?? maxedThreshold();
-  return usages.reduce(
-    (count, usage) =>
-      isEligibleForFailover(usage, options.exclude, threshold) ? count + 1 : count,
-    0,
-  );
+  const accounts = new Set<string>();
+  for (const usage of usages) {
+    if (isEligibleForFailover(usage, options.exclude, threshold)) {
+      accounts.add(usage.account ?? usage.id);
+    }
+  }
+  return accounts.size;
 }

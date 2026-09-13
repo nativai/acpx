@@ -12,6 +12,7 @@ import {
 } from "../../config/profiles.js";
 import {
   EMPTY_EXCLUDE,
+  earliestKnownAutomationEligibility,
   getSubscriptionsFableState,
   getSubscriptionsUsage,
   getSubscriptionsUsageWithFable,
@@ -20,8 +21,11 @@ import {
   maxedThreshold,
   maxUtilization,
   pickFailoverTarget,
+  refreshNearConfiguredWeeklyCeilings,
   stampFableRealTurnExhausted,
+  subscriptionEligibilityVerdict,
   subscriptionRanksStrictlyBetter,
+  type NextKnownAutomationEligibility,
   type SubscriptionUsage,
 } from "../../config/subscription-usage.js";
 import {
@@ -33,6 +37,7 @@ import {
 import {
   AllSubscriptionsExhaustedError,
   AllSubscriptionsLockedError,
+  AutomationCapacityReservedError,
   BridgeAuthGatedError,
   FableShareExhaustedError,
   ModelFloorUnmetError,
@@ -967,6 +972,120 @@ export async function enforceSubscriptionLockBeforeTurn(
   return { switchedTo: picked.target.id };
 }
 
+export type AutomationWeeklyCeilingEnforcementResult = {
+  verdict?: ReturnType<typeof subscriptionEligibilityVerdict>;
+};
+
+function hardAdmissionEnabled(record: SessionRecord): boolean {
+  return (
+    subscriptionAutoSelectEnabledGlobally() &&
+    autoSubscriptionEnabledForRecord(record) &&
+    autoFailoverEnabledForRecord(record)
+  );
+}
+
+function isSubscriptionProfile(
+  profile: ResolvedProfile | undefined,
+): profile is Extract<ResolvedProfile, { authMode: "subscription" }> {
+  return profile?.authMode === "subscription";
+}
+
+function currentSubscriptionEntry(
+  current: Extract<ResolvedProfile, { authMode: "subscription" }>,
+  entries: readonly SubscriptionEntry[],
+): SubscriptionEntry | undefined {
+  return (
+    entries.find((entry) => entry.id === current.id) ??
+    entries.find((entry) => entry.account === current.account)
+  );
+}
+
+function reservedCapacityError(
+  current: Extract<ResolvedProfile, { authMode: "subscription" }>,
+  usage: SubscriptionUsage,
+  verdict: ReturnType<typeof subscriptionEligibilityVerdict>,
+  nextEligibility: NextKnownAutomationEligibility | undefined,
+): AutomationCapacityReservedError | undefined {
+  if (verdict.reason !== "weekly-ceiling") {
+    return undefined;
+  }
+  const weekly = usage.sevenDay;
+  if (!weekly) {
+    return undefined;
+  }
+  return new AutomationCapacityReservedError({
+    account: current.account,
+    accountLabel: usage.accountLabel ?? current.label,
+    profile: current.id,
+    effectiveWeeklyCeiling: verdict.effectiveWeeklyCeiling,
+    utilization: weekly.utilization,
+    lastCheckedAt: usage.fetchedAt ?? new Date().toISOString(),
+    ...(weekly.reset ? { reset: weekly.reset } : {}),
+    ...(nextEligibility
+      ? {
+          nextAutomationEligibleAt: nextEligibility.at,
+          nextEligibilityAccountId: nextEligibility.accountId,
+          nextEligibilityAccountLabel: nextEligibility.accountLabel,
+          nextEligibilitySource: nextEligibility.source,
+        }
+      : {}),
+  });
+}
+
+function configuredCapacityError(
+  current: Extract<ResolvedProfile, { authMode: "subscription" }>,
+  usage: SubscriptionUsage,
+  verdict: ReturnType<typeof subscriptionEligibilityVerdict>,
+  nextEligibility: NextKnownAutomationEligibility | undefined,
+): AutomationCapacityReservedError | undefined {
+  if (!verdict.hardCeiling) {
+    return undefined;
+  }
+  return reservedCapacityError(current, usage, verdict, nextEligibility);
+}
+
+/**
+ * Authoritative turn-boundary admission guard. Call only after proactive
+ * selection has had a chance to switch. Legacy fallback provenance stays soft;
+ * explicit registry policy stops a known over-ceiling automatic turn before
+ * adapter/provider submission. Unknown telemetry deliberately proceeds.
+ */
+export async function enforceAutomationWeeklyCeilingBeforeTurn(
+  record: SessionRecord,
+  loadOpts?: SubscriptionLookupOptions,
+): Promise<AutomationWeeklyCeilingEnforcementResult> {
+  if (!hardAdmissionEnabled(record)) {
+    return {};
+  }
+  const current = currentProfile(record, loadOpts);
+  if (!isSubscriptionProfile(current)) {
+    return {};
+  }
+  const registry = loadSubscriptionRegistry(loadOpts);
+  const currentEntry = currentSubscriptionEntry(current, registry.subscriptions);
+  if (!currentEntry) {
+    return {};
+  }
+  const entries = registry.subscriptions;
+  const initial = await getSubscriptionsUsage(entries, false);
+  const refreshed = await refreshNearConfiguredWeeklyCeilings(entries, initial);
+  const usage = refreshed.find((entry) => entry.id === currentEntry.id);
+  if (!usage) {
+    return {};
+  }
+  const verdict = subscriptionEligibilityVerdict(usage, maxedThreshold());
+  const error = configuredCapacityError(
+    current,
+    usage,
+    verdict,
+    earliestKnownAutomationEligibility(refreshed),
+  );
+  if (error) {
+    throw error;
+  }
+  return { verdict };
+}
+
 export type SubscriptionSelectionResult = {
   switchedTo?: string;
 };
@@ -1029,11 +1148,18 @@ async function selectSubscriptionBeforeTurnUnsafe(
   // Account-propagated lock exclude (decision #7) — the correct primary, NOT the
   // empty-exclude reactive-failover path. A locked sub is never picked as a target.
   const exclude = new Set(
-    entries.filter((entry) => isSubscriptionLocked(entry, registry)).map((entry) => entry.id),
+    entries
+      .filter(
+        (entry) =>
+          isSubscriptionLocked(entry, registry) ||
+          (entry.account === current.account && entry.id !== current.id),
+      )
+      .map((entry) => entry.id),
   );
   // Cached probe (≤5-min staleness tolerated for a best-effort optimization) →
   // ≤1 probe-set / session / 5 min. Reactive failover uses forceRefresh; we do not.
-  const usages = await getSubscriptionsUsage(entries, false);
+  const cachedUsages = await getSubscriptionsUsage(entries, false);
+  const usages = await refreshNearConfiguredWeeklyCeilings(entries, cachedUsages);
 
   const target = pickSelectionTarget(usages, exclude);
   if (!target || target.id === current.id) {

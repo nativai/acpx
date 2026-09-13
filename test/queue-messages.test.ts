@@ -217,6 +217,49 @@ test("parseQueueOwnerMessage rejects untyped queue error payload", () => {
   assert.equal(parsed, null);
 });
 
+test("parseQueueOwnerMessage preserves typed reserved-capacity detail and rejects malformed detail", () => {
+  const detail = {
+    code: "automation-capacity-reserved",
+    accountId: "acct",
+    accountLabel: "Claude account",
+    weeklyPercentUsed: 90,
+    effectiveWeeklyCeiling: 0.9,
+    reservedPercent: 10,
+    providerSubmitted: false,
+    lastCheckedAt: "2030-01-01T00:00:00.000Z",
+    nextAutomationEligibleAt: "2030-01-02T00:00:00.000Z",
+    nextEligibilityAccountId: "other",
+    nextEligibilityAccountLabel: "Other account",
+    nextEligibilitySource: "five-hour-reset",
+  } as const;
+  const parsed = parseQueueOwnerMessage({
+    type: "error",
+    requestId: "req-reserved",
+    code: "RUNTIME",
+    detailCode: "automation-capacity-reserved",
+    origin: "runtime",
+    message: "reserved",
+    automationCapacityReserved: detail,
+  });
+  assert.equal(parsed?.type, "error");
+  assert.deepEqual(
+    parsed?.type === "error" ? parsed.automationCapacityReserved : undefined,
+    detail,
+  );
+
+  assert.equal(
+    parseQueueOwnerMessage({
+      type: "error",
+      requestId: "req-reserved-invalid",
+      code: "RUNTIME",
+      origin: "runtime",
+      message: "reserved",
+      automationCapacityReserved: { ...detail, providerSubmitted: true },
+    }),
+    null,
+  );
+});
+
 test("parseQueueRequest rejects invalid owner generation", () => {
   const parsed = parseQueueRequest({
     type: "cancel_prompt",
