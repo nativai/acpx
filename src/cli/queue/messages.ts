@@ -77,6 +77,26 @@ export type QueueSetConfigOptionRequest = {
   timeoutMs?: number;
 };
 
+/**
+ * Live thinking-DEPTH change on a `mode`-mechanism harness (brick a3c65f0f).
+ *
+ * The payload is the CANONICAL rung (`low` / `high` / `max` / …), never a mode id:
+ * the projection onto the harness's advertised ladder happens OWNER-SIDE, because
+ * the owner's live client holds the only CURRENT advertisement — the record's
+ * `session/new` snapshot describes whichever model was default at creation, and a
+ * session re-pinned to another model must project onto the model it runs now
+ * (measured: glm-5.3-flash advertises `thought_level` values `["low","high"]` while
+ * its creation snapshot said `off…high`). The owner answers with the full
+ * projection outcome so the CLI can record it verbatim.
+ */
+export type QueueSetDepthRequest = {
+  type: "set_depth";
+  requestId: string;
+  ownerGeneration?: number;
+  requested: string;
+  timeoutMs?: number;
+};
+
 export type QueueCloseSessionRequest = {
   type: "close_session";
   requestId: string;
@@ -117,6 +137,7 @@ export type QueueRequest =
   | QueueSetModeRequest
   | QueueSetModelRequest
   | QueueSetConfigOptionRequest
+  | QueueSetDepthRequest
   | QueueCloseSessionRequest
   | QueueQueryActiveTurnRequest
   | QueueDrainDeliveriesRequest;
@@ -176,6 +197,25 @@ export type QueueOwnerSetConfigOptionResultMessage = {
   response: SetSessionConfigOptionResponse;
 };
 
+/**
+ * The owner's answer to a live depth change: the projection OUTCOME, verbatim.
+ * `kind`/`value`/`appliedId`/`reason` mirror {@link DepthProjection} so the CLI can
+ * persist (`applyDepthOutcomeToRecord`) and print without re-deriving anything —
+ * one projection, computed once, at the only seat holding the live ladder.
+ */
+export type QueueOwnerSetDepthResultMessage = {
+  type: "set_depth_result";
+  requestId: string;
+  ownerGeneration?: number;
+  projection: {
+    kind: string;
+    value?: string;
+    appliedId?: string;
+    requested: string;
+    reason?: string;
+  };
+};
+
 export type QueueOwnerCloseSessionResultMessage = {
   type: "close_session_result";
   requestId: string;
@@ -232,6 +272,7 @@ export type QueueOwnerMessage =
   | QueueOwnerSetModeResultMessage
   | QueueOwnerSetModelResultMessage
   | QueueOwnerSetConfigOptionResultMessage
+  | QueueOwnerSetDepthResultMessage
   | QueueOwnerCloseSessionResultMessage
   | QueueOwnerActiveTurnResultMessage
   | QueueOwnerDrainResultMessage
@@ -507,6 +548,8 @@ function parseTypedQueueRequest(
       return parseStringFieldRequest(request, context, "set_model", "modelId");
     case "set_config_option":
       return parseSetConfigOptionRequest(request, context);
+    case "set_depth":
+      return parseSetDepthRequest(request, context);
     default:
       return parsePayloadlessQueueRequest(request.type, context);
   }
@@ -645,6 +688,18 @@ function parseStringFieldRequest<TType extends "set_mode" | "set_model">(
     return null;
   }
   return { type, ...context, [field]: value } as Extract<QueueRequest, { type: TType }>;
+}
+
+/** brick a3c65f0f — the whole payload is the canonical rung string. */
+function parseSetDepthRequest(
+  request: Record<string, unknown>,
+  context: QueueRequestContext,
+): QueueSetDepthRequest | null {
+  const requested = parseNonEmptyString(request.requested);
+  if (!requested) {
+    return null;
+  }
+  return { type: "set_depth", ...context, requested };
 }
 
 function parseDrainDeliveriesRequest(

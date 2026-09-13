@@ -10,6 +10,7 @@ import {
   projectDepthOntoLadder,
   rejectedDepthProjection,
 } from "./depth-projection.js";
+import { setDesiredConfigOption, setDesiredModeId } from "./mode-preference.js";
 
 /** Minimal client surface for the mode arm, so it is unit-testable with a stub. */
 export interface DepthModeApplyClient {
@@ -139,6 +140,43 @@ function reportDepth(verbose: boolean | undefined, message: string | undefined):
   if (verbose && message) {
     process.stderr.write(`[acpx] thinking depth: ${message}\n`);
   }
+}
+
+/**
+ * Persist a live depth outcome onto the record — the shared writer for BOTH live
+ * arms (owner IPC + direct connect, brick a3c65f0f).
+ *
+ * Writes exactly the three legs the CREATE-time mode arm writes
+ * (`persistAndApplyRequestedEffort`, the block that survived the 2026-09-08
+ * "gone by the first turn" measurement):
+ *
+ *  1. `desired_config_options.effort` — the durable REQUEST. `setDesiredConfigOption`
+ *     also syncs `session_options.effort`, which is what the acpx-ui header displays
+ *     and what a fresh owner reads into its session context.
+ *  2. `desired_mode_id` = `appliedId` — the field the reconnect path ALREADY replays
+ *     (`replayDesiredMode`) and `cloneSessionAcpxState` already carries, so the live
+ *     set survives an owner restart with no new record field. `appliedId`, never
+ *     `projection.value` — `value` may name a served EFFORT, which is not a mode id.
+ *  3. `depth_projection` via {@link recordDepthOutcome} — the recorded clamp. A live
+ *     `max` on a `[low, high]` pi ladder is APPLIED as `high` and the record must say
+ *     so; a silent success here would be the e6e74bf5 defect one layer down.
+ *
+ * A projection that sent nothing (`unavailable`, `send-nothing`) still persists 1 and
+ * 3 — the request is durable intent, and the outcome is the honest record of why
+ * nothing was served. Only `appliedId` is skipped, because there is no mode id.
+ */
+export function applyDepthOutcomeToRecord(
+  record: SessionRecord,
+  projection: DepthProjection,
+): void {
+  if (!projection.requested.trim()) {
+    return;
+  }
+  setDesiredConfigOption(record, "effort", projection.requested);
+  if (projection.appliedId) {
+    setDesiredModeId(record, projection.appliedId);
+  }
+  recordDepthOutcome(record, projection);
 }
 
 /**

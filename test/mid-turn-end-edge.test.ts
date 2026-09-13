@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 // END-EDGE regression for mid-turn steering (brick 7daa105e, HoD standing caution):
 // a deliver-now steer that races the turn's END edge must land as a QUEUED post-turn
 // turn — never dropped, never lost.
@@ -19,14 +20,13 @@
 // synchronous, so custody is a state, not a window). The runtime-side half of the
 // edge — the handler is cleared exactly once at the drain's end — is pinned in
 // mid-turn-injection.test.ts (midTurn.clears assertions).
-
-import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import type net from "node:net";
 import path from "node:path";
 import readline from "node:readline";
 import test from "node:test";
 import { SessionQueueOwner, tryAcquireQueueOwnerLease } from "../src/cli/queue/ipc.js";
+import type { DepthProjection } from "../src/session/depth-projection.js";
 import { sessionEventActivePath } from "../src/session/event-log.js";
 import { connectSocket } from "./queue-test-helpers.js";
 import { withTempHome as withTempHomeFixture } from "./runtime-test-helpers.js";
@@ -42,6 +42,10 @@ function stubControlHandlers(): Parameters<typeof SessionQueueOwner.start>[1] {
     setSessionMode: async () => {},
     setSessionModel: async () => {},
     setSessionConfigOption: async () => ({ configOptions: [] }),
+    setDepth: async (requested: string): Promise<DepthProjection> => ({
+      kind: "send-nothing",
+      requested,
+    }),
     queryActiveTurn: () => false,
   };
 }

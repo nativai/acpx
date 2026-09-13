@@ -5,6 +5,7 @@ import {
   type WithConnectedSessionOptions,
   type WithConnectedSessionResult,
 } from "../../runtime/engine/connected-session.js";
+import { applyDepthAsMode, applyDepthOutcomeToRecord } from "../../session/depth-application.js";
 import {
   setCurrentModelId,
   setDesiredConfigOption,
@@ -13,6 +14,7 @@ import {
   setDesiredModelSource,
   setModelSetMethodUnsupported,
 } from "../../session/mode-preference.js";
+import { advertisedDepthLadderFromConfigOptions } from "../../session/model-application.js";
 import { assertRecordModelSupported } from "../../session/model-application.js";
 import { resolveSessionRecord, writeSessionRecord } from "../../session/persistence.js";
 import type {
@@ -20,6 +22,7 @@ import type {
   McpServer,
   NonInteractivePermissionPolicy,
   SessionSetConfigOptionResult,
+  SessionSetDepthResult,
   SessionSetModelResult,
   SessionSetModeResult,
 } from "../../types.js";
@@ -30,6 +33,20 @@ export type ActiveSessionController = QueueOwnerActiveSessionController;
 export type RunSessionSetModeDirectOptions = {
   sessionRecordId: string;
   modeId: string;
+  mcpServers?: McpServer[];
+  nonInteractivePermissions?: NonInteractivePermissionPolicy;
+  authCredentials?: Record<string, string>;
+  authPolicy?: AuthPolicy;
+  terminal?: boolean;
+  timeoutMs?: number;
+  verbose?: boolean;
+  onClientAvailable?: (controller: ActiveSessionController) => void;
+  onClientClosed?: () => void;
+};
+
+export type RunSessionSetDepthDirectOptions = {
+  sessionRecordId: string;
+  requested: string;
   mcpServers?: McpServer[];
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
   authCredentials?: Record<string, string>;
@@ -127,6 +144,46 @@ export async function runSessionSetModeDirect(
   );
 
   return toSessionMutationResult(result);
+}
+
+/**
+ * Direct (no-owner) apply of a live thinking-depth request on a `mode`-mechanism
+ * harness (brick a3c65f0f).
+ *
+ * The projection runs HERE, not at the caller: this connection's advertisement is
+ * the only CURRENT ladder (`client.getAdvertisedConfigOptions()`, folded forward on
+ * every pushed `config_option_update` — including the one a model change pushes).
+ * The record's stored `config_options` describes the last PERSISTED connect, and a
+ * `session/new` `modes` block describes whichever model was default at creation;
+ * either can be a ladder the session no longer sits on. The outcome is persisted
+ * through the shared writer (`applyDepthOutcomeToRecord`) so both live arms leave
+ * identical record state; `withConnectedSession` saves the mutated record itself.
+ */
+export async function runSessionSetDepthDirect(
+  options: RunSessionSetDepthDirectOptions,
+): Promise<SessionSetDepthResult> {
+  const result = await withConnectedSession(
+    buildDirectConnectedSessionOptions(options, async ({ client, sessionId, record }) => {
+      const modes = advertisedDepthLadderFromConfigOptions(client.getAdvertisedConfigOptions());
+      const projection = await applyDepthAsMode({
+        client,
+        sessionId,
+        requested: options.requested,
+        modes,
+        timeoutMs: options.timeoutMs,
+        verbose: options.verbose,
+      });
+      applyDepthOutcomeToRecord(record, projection);
+      return projection;
+    }),
+  );
+
+  return {
+    record: result.record,
+    projection: result.value,
+    resumed: result.resumed,
+    loadError: result.loadError,
+  };
 }
 
 export async function runSessionSetModelDirect(

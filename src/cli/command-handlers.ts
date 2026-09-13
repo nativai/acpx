@@ -5,6 +5,7 @@ import { acpAdapterKind } from "../acp/agent-command.js";
 import { isLegacyZedCodexAcpInvocation } from "../acp/codex-compat.js";
 import {
   assertForkAtIndexHonoured,
+  acpxRoutesDepthMechanism,
   depthMechanismForAgentCommand,
   depthRequestUnroutableReason,
   isDepthRequestRoutable,
@@ -104,6 +105,7 @@ import type {
   OutputPolicy,
   SessionAgentContent,
   SessionRecord,
+  SessionSetDepthResult,
   SessionUserContent,
   PermissionPolicy,
 } from "../types.js";
@@ -1871,21 +1873,12 @@ async function tryHandleSpecialConfigKey(
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<boolean> {
-  if (configId === "model") {
-    await handleSetModel(explicitAgentName, value, flags, command, config);
-    return true;
-  }
-  // `set subscription <id>` is a record edit (CLAUDE_CONFIG_DIR), not an ACP
-  // config option — route it like `model` above. acpx-ui shells exactly this.
-  if (configId === "subscription") {
-    await handleSetSubscription(explicitAgentName, value, flags, command, config);
-    return true;
-  }
-  // `set profile <id>` is the unified credential-move verb (SDK sub1↔sub2 AND
-  // claude-pty bridge1↔bridge2) — a record edit + transcript port, not an ACP
-  // config option. acpx-ui shells exactly this for the bridge case.
-  if (configId === "profile") {
-    await handleSetProfile(explicitAgentName, value, flags, command, config);
+  // The record-edit keys — handled outside the generic ACP config path entirely
+  // (each is its own handler). Extracted to keep this dispatcher under the lint
+  // complexity budget.
+  if (
+    await tryHandleRecordEditConfigKey(configId, explicitAgentName, value, flags, command, config)
+  ) {
     return true;
   }
   // brick://874fee67 — `set outputStyle <name>` is routed OUT of the generic ACP
@@ -1899,6 +1892,11 @@ async function tryHandleSpecialConfigKey(
   if (isOutputStyleConfigKey(configId)) {
     await handleSetOutputStyle(explicitAgentName, value, flags, command, config);
     return true;
+  }
+  if (isDepthConfigOption(configId)) {
+    // brick a3c65f0f — depth on a `mode`-mechanism harness. Extracted to keep this
+    // dispatcher under the complexity budget (same pattern as the outputStyle note).
+    return await tryHandleDepthConfigKey(explicitAgentName, value, flags, command, config);
   }
   if (isAutoFailoverConfigKey(configId)) {
     await handleSetAutoFailover(explicitAgentName, value, flags, command, config);
@@ -1958,6 +1956,140 @@ export async function handleSetConfigOption(
   }
 
   printSetConfigOptionResultByFormat(configId, value, result, globalFlags.format);
+}
+
+/**
+ * `acpx <agent> set effort <rung>` on a `mode`-mechanism harness (brick a3c65f0f).
+ *
+ * The record is already resolved (the dispatch needed it to read the mechanism),
+ * so this takes it directly. The value is the canonical rung, passed through
+ * UNMODIFIED — case-folding a depth value here would mask a caller that disagrees
+ * with the vocabulary; the projection refuses non-canonical requests with a reason
+ * instead of guessing. The outcome is printed in full because it may legitimately
+ * differ from the request (`max` applied as mode `high` on a `[low, high]` ladder
+ * is a SUCCESS with a recorded substitution, not an error).
+ */
+/**
+ * `set effort` on a `mode`-mechanism harness (pi) routes here instead of the
+ * generic config-option path (brick a3c65f0f). The generic path sends
+ * `session/set_config_option {configId:"effort"}`, which pi answers `-32602
+ * "Unknown config option: effort"` for, on every rung — the defect the TE
+ * measured. The projection lives HERE in acpx — the descriptor declares
+ * `depth.mechanism` + `ladder:"acp"`, and the ladder itself is the agent's own
+ * advertisement — so acpx-ui only passes the rung through.
+ *
+ * Config-option harnesses (claude family) and compose-into-id ones (codex) return
+ * `false` UNCHANGED: their `set effort` semantics, recycle behaviour and error
+ * surface are exactly what they were.
+ */
+/**
+ * The keys that are NOT ACP config options at all: `model` / `subscription` /
+ * `profile`. `set subscription <id>` is a record edit (CLAUDE_CONFIG_DIR); `set
+ * profile <id>` is the unified credential-move verb (SDK sub1↔sub2 AND claude-pty
+ * bridge1↔bridge2). acpx-ui shells exactly these.
+ */
+async function tryHandleRecordEditConfigKey(
+  configId: string,
+  explicitAgentName: string | undefined,
+  value: string,
+  flags: StatusFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<boolean> {
+  if (configId === "model") {
+    await handleSetModel(explicitAgentName, value, flags, command, config);
+    return true;
+  }
+  if (configId === "subscription") {
+    await handleSetSubscription(explicitAgentName, value, flags, command, config);
+    return true;
+  }
+  if (configId === "profile") {
+    await handleSetProfile(explicitAgentName, value, flags, command, config);
+    return true;
+  }
+  return false;
+}
+
+async function tryHandleDepthConfigKey(
+  explicitAgentName: string | undefined,
+  value: string,
+  flags: StatusFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<boolean> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const selector = resolveSessionTargetSelector({ flags, command });
+  const record = await findRoutedTargetSessionOrThrow(agent, selector);
+  const mechanism = depthMechanismForAgentCommand(record.agentCommand);
+  if (mechanism !== "mode" || !acpxRoutesDepthMechanism(mechanism)) {
+    return false;
+  }
+  await handleSetDepth(record, value, flags, command, config);
+  return true;
+}
+
+async function handleSetDepth(
+  record: SessionRecord,
+  value: string,
+  flags: StatusFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const { setSessionDepth } = await loadSessionModule();
+  const result = await setSessionDepth({
+    sessionId: record.acpxRecordId,
+    requested: value.trim(),
+    mcpServers: config.mcpServers,
+    nonInteractivePermissions: globalFlags.nonInteractivePermissions,
+    authCredentials: config.auth,
+    authPolicy: globalFlags.authPolicy,
+    terminal: globalFlags.terminal,
+    timeoutMs: globalFlags.timeout,
+    verbose: globalFlags.verbose,
+  });
+
+  if (globalFlags.verbose && result.loadError) {
+    process.stderr.write(
+      `[acpx] session reconnect failed, started fresh session: ${result.loadError}\n`,
+    );
+  }
+
+  printSetDepthResultByFormat(result, globalFlags.format);
+}
+
+function printSetDepthResultByFormat(result: SessionSetDepthResult, format: OutputFormat): void {
+  const projection = result.projection;
+  if (emitJsonResult(format, depthSetJsonPayload(result))) {
+    return;
+  }
+  const served =
+    projection.value !== undefined && projection.value !== projection.requested
+      ? ` (served as "${projection.value}")`
+      : "";
+  process.stdout.write(
+    format === "quiet"
+      ? `${projection.value ?? projection.requested}\n`
+      : `thinking depth set: ${projection.requested}${served}${projection.reason ? ` — ${projection.reason}` : ""}\n`,
+  );
+}
+
+/** The `depth_set` JSON payload — extracted so the printer stays under the lint complexity budget. */
+function depthSetJsonPayload(result: SessionSetDepthResult): Record<string, unknown> {
+  const projection = result.projection;
+  return {
+    action: "depth_set",
+    requested: projection.requested,
+    outcome: projection.kind,
+    ...(projection.value !== undefined ? { served: projection.value } : {}),
+    ...(projection.appliedId !== undefined ? { appliedModeId: projection.appliedId } : {}),
+    ...(projection.reason !== undefined ? { reason: projection.reason } : {}),
+    acpxRecordId: result.record.acpxRecordId,
+    acpSessionId: result.record.acpSessionId,
+    agentSessionId: result.record.agentSessionId,
+  };
 }
 
 // Accept the camelCase config id and the snake/kebab spellings a human is

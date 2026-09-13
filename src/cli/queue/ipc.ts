@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { QueueConnectionError, QueueProtocolError } from "../../errors.js";
 import { incrementPerfCounter } from "../../perf-metrics.js";
+import type { DepthProjection } from "../../session/depth-projection.js";
 import type {
   AcpClientOptions,
   NonInteractivePermissionPolicy,
@@ -36,11 +37,13 @@ import {
   type QueueOwnerDrainResultMessage,
   type QueueOwnerMessage,
   type QueueOwnerSetConfigOptionResultMessage,
+  type QueueOwnerSetDepthResultMessage,
   type QueueOwnerSetModelResultMessage,
   type QueueOwnerSetModeResultMessage,
   type QueueQueryActiveTurnRequest,
   type QueueRequest,
   type QueueSetConfigOptionRequest,
+  type QueueSetDepthRequest,
   type QueueSetModelRequest,
   type QueueSetModeRequest,
   type QueueSubmitRequest,
@@ -1203,6 +1206,82 @@ export async function trySetConfigOptionOnRunningOwner(
 
   throw new QueueConnectionError(
     "Session queue owner is running but not accepting set_config_option requests",
+    {
+      detailCode: "QUEUE_NOT_ACCEPTING_REQUESTS",
+      origin: "queue",
+      retryable: true,
+    },
+  );
+}
+
+async function submitSetDepthToQueueOwner(
+  owner: QueueOwnerRecord,
+  requested: string,
+  timeoutMs?: number,
+): Promise<DepthProjection | undefined> {
+  const request: QueueSetDepthRequest = {
+    type: "set_depth",
+    requestId: randomUUID(),
+    ownerGeneration: owner.ownerGeneration,
+    requested,
+    timeoutMs,
+  };
+  const response = await submitControlToQueueOwner(
+    owner,
+    request,
+    (message): message is QueueOwnerSetDepthResultMessage => message.type === "set_depth_result",
+  );
+  if (!response) {
+    return undefined;
+  }
+  if (response.requestId !== request.requestId) {
+    throw new QueueProtocolError("Queue owner returned mismatched set_depth response", {
+      detailCode: "QUEUE_PROTOCOL_MALFORMED_MESSAGE",
+      origin: "queue",
+      retryable: true,
+    });
+  }
+  return response.projection as DepthProjection;
+}
+
+/**
+ * Live thinking-depth change on a RUNNING owner (brick a3c65f0f).
+ *
+ * Returns the projection OUTCOME (what the owner applied, and how it differs from
+ * the request), or `undefined` when no owner is running — the caller then falls
+ * back to the direct connect path. The projection itself runs owner-side: the
+ * owner's live client holds the only CURRENT advertisement, and a rung projected
+ * against the creation snapshot would target a ladder the session may no longer be
+ * on (see {@link submitSetDepthToQueueOwner}).
+ */
+export async function trySetDepthOnRunningOwner(
+  sessionId: string,
+  requested: string,
+  timeoutMs: number | undefined,
+  verbose: boolean | undefined,
+): Promise<DepthProjection | undefined> {
+  const owner = await readQueueOwnerRecord(sessionId);
+  if (!owner) {
+    return undefined;
+  }
+
+  const projection = await submitSetDepthToQueueOwner(owner, requested, timeoutMs);
+  if (projection) {
+    if (verbose) {
+      process.stderr.write(
+        `[acpx] requested live depth "${requested}" on owner pid ${owner.pid} for session ${sessionId} → ${projection.kind}${projection.value ? ` (${projection.value})` : ""}\n`,
+      );
+    }
+    return projection;
+  }
+
+  const health = await probeQueueOwnerHealth(sessionId);
+  if (!health.hasLease) {
+    return undefined;
+  }
+
+  throw new QueueConnectionError(
+    "Session queue owner is running but not accepting set_depth requests",
     {
       detailCode: "QUEUE_NOT_ACCEPTING_REQUESTS",
       origin: "queue",
