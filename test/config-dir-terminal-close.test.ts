@@ -227,7 +227,11 @@ test("074a1bd9 REAL SPAWN: a session/new that names a seeded extension names the
       await fs.writeFile(boxExtension, "export const notAFactory = 1\n");
 
       const client = new AcpClient({
-        agentCommand: `node ${JSON.stringify(mockLink)} --fail-new-session-on-seeded-extension`,
+        // brick 5fee840d: the mock used to die on the alphabetically first
+        // extension; acpx's own live-routing builtin (acpx-openrouter-routing.js)
+        // now sorts first and LOADS fine. pi dies on the UNLOADABLE one, so
+        // name it — the simulation stays exact.
+        agentCommand: `node ${JSON.stringify(mockLink)} --fail-new-session-on-seeded-extension half-written.js`,
         cwd: scratch,
         permissionMode: "approve-reads",
         sessionContext: { acpxRecordId: `rec-074a1bd9-${path.basename(scratch)}` },
