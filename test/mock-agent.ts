@@ -47,8 +47,12 @@ type ParsedCommand = {
 
 type MockAgentOptions = {
   hangOnNewSession: boolean;
-  /** brick 074a1bd9 — fail `session/new` the way a pi-acp with a dead pi does. */
+  /** brick 074a1bd9 — fail `session/new` the way a pi-acp with a dead pi does.
+   *  The string, when set, names the extension file pi dies on — pi loads every
+   *  extension and aborts on the unloadable one, which is not necessarily the
+   *  alphabetically first (acpx's own builtin sorts before most box files). */
   failNewSessionOnSeededExtension: boolean;
+  failNewSessionExtensionName?: string;
   newSessionMeta?: Record<string, string>;
   loadSessionMeta?: Record<string, string>;
   resumeSessionMeta?: Record<string, string>;
@@ -413,6 +417,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let ignoreSigterm = false;
   let hangOnNewSession = false;
   let failNewSessionOnSeededExtension = false;
+  let failNewSessionExtensionName: string | undefined;
   let envDumpFile: string | undefined;
   let envDumpExtra: string[] | undefined;
   let operationLogFile: string | undefined;
@@ -540,6 +545,13 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
 
     if (token === "--fail-new-session-on-seeded-extension") {
       failNewSessionOnSeededExtension = true;
+      // Optional value: names the extension file pi dies on (see the option
+      // type). Absent ⇒ the alphabetical-first stand-in, as before.
+      const next = argv[index + 1];
+      if (typeof next === "string" && next.trim().length > 0 && !next.startsWith("--")) {
+        failNewSessionExtensionName = next.trim();
+        index += 1;
+      }
       continue;
     }
 
@@ -610,6 +622,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   return {
     hangOnNewSession,
     failNewSessionOnSeededExtension,
+    failNewSessionExtensionName,
     newSessionMeta: Object.keys(newSessionMeta).length > 0 ? { ...newSessionMeta } : undefined,
     loadSessionMeta: Object.keys(loadSessionMeta).length > 0 ? { ...loadSessionMeta } : undefined,
     resumeSessionMeta:
@@ -919,7 +932,7 @@ class MockAgent implements Agent {
       // source, because acpx generates the provisioned directory at runtime.
       const { readdirSync } = await import("node:fs");
       const extDir = path.join(process.env.PI_CODING_AGENT_DIR ?? "", "extensions");
-      const named = readdirSync(extDir).toSorted()[0];
+      const named = this.options.failNewSessionExtensionName ?? readdirSync(extDir).toSorted()[0];
       const target = path.join(extDir, named);
       throw RequestError.internalError(
         {},

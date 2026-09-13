@@ -316,7 +316,14 @@ test("pi extension seeding: no box-level dir is a silent no-op, never an error",
       rootDir: root,
     });
     assert.ok(plan);
-    assert.equal(existsSync(join(env.PI_CODING_AGENT_DIR!, "extensions")), false);
+    // brick 5fee840d: the dir now also carries acpx's OWN live-routing
+    // extension, so "no box dir" no longer means "no extensions dir" — the
+    // invariant that survives is "no box junk was seeded, and nothing errored":
+    // exactly one seeded entry, the builtin.
+    assert.deepEqual(
+      plan.piExtensions?.map((entry) => entry.target.endsWith("acpx-openrouter-routing.js")),
+      [true],
+    );
   });
 });
 
@@ -491,7 +498,14 @@ test("074a1bd9: a NON-LOADABLE box extension is still seeded — and RECORDED wi
     assert.ok(plan);
     const target = join(env.PI_CODING_AGENT_DIR!, "extensions", "half-written.js");
     assert.equal(existsSync(target), true, "the entry was not seeded");
-    assert.deepEqual(plan.piExtensions, [{ source: join(extDir, "half-written.js"), target }]);
+    // brick 5fee840d: acpx's own live-routing extension is seeded alongside
+    // every box extension, so the recorded list is the box pair PLUS the
+    // builtin. The box pair's source stays the assertion — that is the
+    // traceability this row exists for.
+    assert.deepEqual(
+      plan.piExtensions?.filter((entry) => entry.source.endsWith("half-written.js")),
+      [{ source: join(extDir, "half-written.js"), target }],
+    );
   });
 });
 
@@ -627,6 +641,8 @@ test("pi DOES get a generated models-store.json now that the merge semantics are
     // harness reads, so it is UPDATED here rather than loosened.
     assert.deepEqual(harnessVisible.toSorted(), [
       "APPEND_SYSTEM.md",
+      // brick 5fee840d: acpx's own live-routing extension now lives here too.
+      "extensions",
       "models-store.json",
       "models.json",
       "settings.json",
@@ -981,7 +997,8 @@ test("no primer and no model still yields a dir and the env vars", () => {
       readdirSync(env.PI_CODING_AGENT_DIR)
         .filter((entry) => !entry.startsWith("."))
         .toSorted(),
-      ["models.json", "settings.json"],
+      // brick 5fee840d: the live-routing extension joins the unconditional set.
+      ["extensions", "models.json", "settings.json"],
     );
     // …and with nothing to provision it carries ONLY the repair, never a
     // fabricated `models[]` that would shadow a real row.
