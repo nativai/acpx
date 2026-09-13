@@ -1,4 +1,4 @@
-import { randomInt } from "node:crypto";
+import { randomInt, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import { isProcessAlive } from "../../process-liveness.js";
 import { queueBaseDir, queueLockFilePath, queueSocketBaseDir, queueSocketPath } from "./paths.js";
@@ -682,9 +682,27 @@ export async function refreshQueueOwnerLease(
     null,
     2,
   );
-  await fs.writeFile(lease.lockPath, `${payload}\n`, {
-    encoding: "utf8",
-  });
+  // Readers use a malformed/missing lease as the machine signal for
+  // `no_owner`. Rewriting the live pathname with writeFile() truncates it before
+  // the new JSON is complete, so a concurrent submit or liveness probe can see
+  // an empty/partial document and falsely abandon a healthy owner. Publish a
+  // complete sibling inode in one rename instead. A unique name is required:
+  // heartbeat and queue-depth refreshes may overlap inside one owner process.
+  const tempPath = `${lease.lockPath}.${String(process.pid)}.${randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(tempPath, `${payload}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    await fs.rename(tempPath, lease.lockPath);
+  } finally {
+    await fs.unlink(tempPath).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+    });
+  }
 }
 
 export async function releaseQueueOwnerLease(lease: QueueOwnerLease): Promise<void> {

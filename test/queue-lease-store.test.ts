@@ -83,6 +83,59 @@ test("tryAcquireQueueOwnerLease creates a lease that can be refreshed and releas
   });
 });
 
+test("concurrent heartbeat refreshes never expose a missing or partial live lease", async () => {
+  await withTempHome(async () => {
+    const sessionId = "lease-atomic-refresh";
+    const lease = await tryAcquireQueueOwnerLease(sessionId);
+    assert(lease);
+    // Widen the payload so the old truncate-then-write implementation exposes
+    // its partial-file window deterministically even on a fast local disk.
+    const wideLease = {
+      ...lease,
+      processIdentity: {
+        kind: "linux-proc-stat-starttime" as const,
+        startTimeTicks: "1".repeat(256 * 1024),
+      },
+    };
+
+    let reads = 0;
+    const missingReads: number[] = [];
+    const readers = Array.from({ length: 8 }, async () => {
+      for (let sample = 0; sample < 100; sample += 1) {
+        const record = await readQueueOwnerRecord(sessionId);
+        reads += 1;
+        if (!record) {
+          missingReads.push(reads);
+        }
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    });
+
+    await Promise.all([
+      Promise.all(
+        Array.from({ length: 100 }, (_, index) =>
+          refreshQueueOwnerLease(wideLease, { queueDepth: index }, () =>
+            new Date(1_800_000_000_000 + index).toISOString(),
+          ),
+        ),
+      ),
+      ...readers,
+    ]);
+
+    assert(reads > 0, "the reader control must overlap the refresh burst");
+    assert.deepEqual(missingReads, [], "a live lease must always parse as old or new JSON");
+    const siblings = await fs.readdir(path.dirname(lease.lockPath));
+    assert.equal(
+      siblings.some(
+        (name) => name.startsWith(`${path.basename(lease.lockPath)}.`) && name.endsWith(".tmp"),
+      ),
+      false,
+      "atomic refresh must not strand temporary lease files",
+    );
+    await releaseQueueOwnerLease(lease);
+  });
+});
+
 test("tryAcquireQueueOwnerLease assigns collision-resistant owner generations", async () => {
   await withTempHome(async () => {
     const originalDateNow = Date.now;
