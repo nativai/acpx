@@ -27,7 +27,9 @@ export function openRecordOutbox(
   _metadata: Record<string, string> | undefined,
   directory = path.join(os.homedir(), ".acpx", "sessions"),
 ): BrickOutbox | undefined {
-  if (!isCanonicalSessionDirectory(directory)) {return undefined;}
+  if (!isCanonicalSessionDirectory(directory)) {
+    return undefined;
+  }
   // C0 §1.4/§7.1: exclusion applies to canonical writers even before projection binding.
   // Opening unconditionally removes the existence-check race with a concurrent drain entry.
   return new BrickOutbox();
@@ -38,7 +40,9 @@ export function isCanonicalSessionDirectory(directory: string): boolean {
   try {
     canonical = fs.realpathSync(path.join(os.homedir(), ".acpx", "sessions"));
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {throw error;}
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
     return false;
   }
   return actual === canonical;
@@ -282,6 +286,11 @@ function receiptConflicts(run: SpawnRun, receipt: CentralRunReceipt): boolean {
     receipt.status === "spawned" && run.session_id && receipt.session_id !== run.session_id,
   );
 }
+function initialPromptContent(payload: Record<string, unknown>): Record<string, unknown> {
+  const content = { ...payload };
+  delete content.sessionId;
+  return JSON.parse(JSON.stringify(content)) as Record<string, unknown>;
+}
 function projectionReplyAcknowledges(
   status: number,
   body: { code?: string; results?: Array<{ outbox_id: string; disposition: string }> },
@@ -348,13 +357,16 @@ function preserveStaleProjectionMetadata(
   }
 }
 function assertDeletionSnapshot(expected: DiskRecord, current: DiskRecord | undefined): void {
-  if (!current) {return;}
+  if (!current) {
+    return;
+  }
   const fields = ["closed", "closed_at", "last_used_at", "updated_at", "template"];
   for (const key of fields) {
     const before = JSON.parse(JSON.stringify(expected[key] ?? null));
     const after = JSON.parse(JSON.stringify(current[key] ?? null));
-    if (!isDeepStrictEqual(before, after))
-      {throw new OutboxError("record-changed", "record changed since deletion selection; retry");}
+    if (!isDeepStrictEqual(before, after)) {
+      throw new OutboxError("record-changed", "record changed since deletion selection; retry");
+    }
   }
   if (
     metadataValue(expected, "brick_projection_revision") !==
@@ -821,12 +833,29 @@ export class BrickOutbox {
       const key = `initial_prompt:${runId}`;
       const existing = this.meta(key);
       if (existing) {
-        return (JSON.parse(existing) as { delivery_id: string }).delivery_id;
+        const stored = JSON.parse(existing) as {
+          delivery_id: string;
+          payload: Record<string, unknown>;
+        };
+        if (
+          !isDeepStrictEqual(initialPromptContent(stored.payload), initialPromptContent(payload))
+        ) {
+          throw new OutboxError(
+            "initial-prompt-conflict",
+            "run already owns different initial prompt content",
+          );
+        }
+        return stored.delivery_id;
       }
       const deliveryId = randomUUID();
       this.setMeta(
         key,
-        JSON.stringify({ run_id: runId, delivery_id: deliveryId, payload, released_at: null }),
+        JSON.stringify({
+          run_id: runId,
+          delivery_id: deliveryId,
+          payload: initialPromptContent(payload),
+          released_at: null,
+        }),
       );
       return deliveryId;
     });
@@ -877,8 +906,9 @@ export class BrickOutbox {
     if (run.receipt_conflict) {
       throw new Error("initial prompt refused for receipt-conflict orphan");
     }
+    if (!run.session_id) {throw new Error("adopted run has no initial prompt target");}
     // The existing delivery store deduplicates this persisted id; a lost return may safely retry.
-    await submit(item.payload, item.delivery_id);
+    await submit({ ...item.payload, sessionId: run.session_id }, item.delivery_id);
     this.locked(() => {
       this.setMeta(`initial_prompt:${runId}`, JSON.stringify({ ...item, released_at: now() }));
     });
@@ -991,7 +1021,9 @@ export class BrickOutbox {
     }
   }
   recordPath(id: string): string {
-    if (!id) {throw new OutboxError("invalid-record-id", "local record id is required");}
+    if (!id) {
+      throw new OutboxError("invalid-record-id", "local record id is required");
+    }
     return path.join(this.sessionsDir, `${encodeURIComponent(id)}.json`);
   }
   readRecord(id: string): DiskRecord | undefined {

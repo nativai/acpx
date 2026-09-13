@@ -269,6 +269,7 @@ try {
         assert.equal(prompts.length, 1);
         let submitted = 0;
         await outbox.releaseInitialPrompt("run-1", async (_payload, deliveryId) => {
+          assert.equal(_payload.sessionId, id);
           assert.equal(deliveryId, prompts[0]?.delivery_id);
           submitted++;
         });
