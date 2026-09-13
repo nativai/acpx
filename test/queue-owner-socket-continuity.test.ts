@@ -106,17 +106,29 @@ async function submitPrompt(params: {
   message: string;
   capture: CapturingFormatter;
 }): Promise<SessionSendOutcome> {
-  return await trySubmitToRunningOwner({
+  const outcome = await trySubmitToRunningOwner({
     sessionId: params.sessionId,
     messageId: params.messageId,
     message: params.message,
     permissionMode: "approve-reads",
     outputFormatter: params.capture.formatter,
     waitForCompletion: true,
-  }).then((outcome) => {
-    assert(outcome, "the live owner must accept the prompt");
-    return outcome;
   });
+  if (!outcome) {
+    const state = await readQueueOwnerLiveness(params.sessionId);
+    assert.fail(
+      `the live owner must accept the prompt; observed ${JSON.stringify({
+        state: state.state,
+        ownerFound: state.ownerFound,
+        pid: state.pid,
+        pidAlive: state.pidAlive,
+        socketReachable: state.socketReachable,
+        processIdentityMatched: state.processIdentityMatched,
+        recoverable: state.recoverable,
+      })}`,
+    );
+  }
+  return outcome;
 }
 
 async function withRealQueueOwner(
