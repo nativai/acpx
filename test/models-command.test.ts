@@ -746,10 +746,10 @@ test("the validated set is PINNED against the capability table — a new harness
 
 const CLI = path.resolve(process.cwd(), "dist/cli.js");
 
-function runCli(args: string[], stateHome: string) {
+function runCli(args: string[], stateHome: string, extraEnv?: Record<string, string>) {
   return spawnSync(process.execPath, [CLI, ...args], {
     encoding: "utf8",
-    env: { ...process.env, ACPX_STATE_HOME: stateHome },
+    env: { ...process.env, ACPX_STATE_HOME: stateHome, ...extraEnv },
     cwd: os.tmpdir(),
   });
 }
@@ -1014,16 +1014,26 @@ test("CLI: a metered OpenRouter row colliding with a plan id refuses, showing bo
  * nowhere in src/, which is itself the tell").
  */
 test("CLI: the box label is the stable acpx-ui host, never the ephemeral pod hostname", () => {
-  const home = stateHome();
   const podHostname = os.hostname();
+  // The label comes from resolveAcpxUiBaseUrl — the emit side hardcodes NO host,
+  // so the test CONTROLS the resolver's rung-1 input with a fixture URL instead
+  // of asserting a fleet label that can move (the old `acpx.` expectation was
+  // stale the moment the service was renamed `atrium.`). The rig-independent
+  // contract being pinned: the label is the resolved acpx-ui host, and it is
+  // never the ephemeral pod hostname.
+  const fixtureHost = "atrium.devbox.example";
   const lines = [
-    runCli(["models", "fav"], home).stdout,
-    runCli(["models", "last-used"], home).stdout,
-    runCli(["models", "fav", "add", "openrouter:moonshotai/kimi-k3"], home).stdout,
+    runCli(["models", "fav"], stateHome(), { ACPX_UI_BASE_URL: `https://${fixtureHost}` }).stdout,
+    runCli(["models", "last-used"], stateHome(), {
+      ACPX_UI_BASE_URL: `https://${fixtureHost}`,
+    }).stdout,
+    runCli(["models", "fav", "add", "openrouter:moonshotai/kimi-k3"], stateHome(), {
+      ACPX_UI_BASE_URL: `https://${fixtureHost}`,
+    }).stdout,
   ];
   for (const line of lines) {
     assert.doesNotMatch(line, new RegExp(podHostname), `leaked the pod hostname: ${line}`);
-    assert.match(line, /acpx\./, `expected a stable acpx-ui host, got: ${line}`);
+    assert.match(line, new RegExp(fixtureHost), `expected the resolved acpx-ui host, got: ${line}`);
   }
 
   // And the resolver is honoured, so the label follows the BOX rather than the
