@@ -97,6 +97,32 @@ function sleepSync(ms: number): void {
 const OUTBOX_RETRY_BUDGET_MS = 4_000;
 const OUTBOX_RETRY_CAP_MS = 250;
 
+/**
+ * Retry `op` on SQLITE_BUSY only, jittered exponential backoff (10-25 ms start,
+ * 250 ms cap) inside a 4 s budget; every other failure propagates immediately.
+ * Measured busy sites: BEGIN IMMEDIATE acquisition and the constructor's PRAGMA
+ * exec (journal_mode=WAL re-assertion hits a concurrent writer's lock).
+ */
+function retryOnBusy<T>(op: () => T): T {
+  const started = Date.now();
+  let delay = 10 + Math.floor(Math.random() * 16); // jittered 10-25 ms start
+  for (;;) {
+    try {
+      return op();
+    } catch (error) {
+      const waited = Date.now() - started;
+      if (!isBusyAcquisitionError(error) || waited >= OUTBOX_RETRY_BUDGET_MS) {
+        throw error; // translate() maps an exhausted busy to outbox-busy, as before
+      }
+      sleepSync(Math.min(OUTBOX_RETRY_CAP_MS, delay));
+      delay = Math.min(
+        OUTBOX_RETRY_CAP_MS,
+        Math.ceil(delay * 1.7) + Math.floor(Math.random() * 25),
+      );
+    }
+  }
+}
+
 export type DiskRecord = Record<string, unknown> & { metadata?: Record<string, string> };
 export type OutboxState = "prepared" | "applied" | "acknowledged" | "superseded" | "abandoned";
 export interface ProjectionPayload {
@@ -552,7 +578,13 @@ export class BrickOutbox {
     this.dbPath = path.join(directory, "brick-outbox.db");
     this.db = new (requireSqlite().DatabaseSync)(this.dbPath);
     try {
-      this.db.exec("PRAGMA busy_timeout=0; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;");
+      // busy_timeout=0: every busy site is retried by retryOnBusy (measured sites:
+      // BEGIN IMMEDIATE acquisition, and this PRAGMA exec — journal_mode=WAL
+      // re-assertion hits a concurrent writer's lock), so the loop owns the
+      // waiting and the budget accounting stays exact.
+      retryOnBusy(() =>
+        this.db.exec("PRAGMA busy_timeout=0; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;"),
+      );
       this.locked(() => {
         const exists = this.db
           .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='meta'")
@@ -1131,24 +1163,9 @@ export class BrickOutbox {
    * loop owns the waiting and the budget accounting stays exact.
    */
   private beginImmediateWithRetry(): void {
-    const started = Date.now();
-    let delay = 10 + Math.floor(Math.random() * 16); // jittered 10-25 ms start
-    for (;;) {
-      try {
-        this.db.exec("BEGIN IMMEDIATE");
-        return;
-      } catch (error) {
-        const waited = Date.now() - started;
-        if (!isBusyAcquisitionError(error) || waited >= OUTBOX_RETRY_BUDGET_MS) {
-          throw error; // translate() maps an exhausted busy to outbox-busy, as before
-        }
-        sleepSync(Math.min(OUTBOX_RETRY_CAP_MS, delay));
-        delay = Math.min(
-          OUTBOX_RETRY_CAP_MS,
-          Math.ceil(delay * 1.7) + Math.floor(Math.random() * 25),
-        );
-      }
-    }
+    return retryOnBusy(() => {
+      this.db.exec("BEGIN IMMEDIATE");
+    });
   }
 
   private async withAsyncMutation<T>(action: () => Promise<T>): Promise<T> {
