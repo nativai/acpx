@@ -17,6 +17,7 @@ for (const scenario of [
   "receipt-conflict",
   "initial-prompt",
   "ownership",
+  "identity-guard",
 ]) {
   test(`B14 ${scenario}`, () => {
     const root = "/workspace/bricksdb-b14-selftest";

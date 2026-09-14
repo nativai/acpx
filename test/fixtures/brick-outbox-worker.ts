@@ -238,6 +238,22 @@ try {
       outbox.applyProjection(intent.id);
       assert.equal(outbox.getIntent(intent.id)?.state, "applied");
       assert.equal(outbox.readRecord(id)?.metadata?.spawn_state, "published");
+    } else if (scenario === "identity-guard") {
+      // Pins the re-scoped identity guard (aac5a3b): a RESERVED destination
+      // (spawn_key) must refuse a writer carrying a different acp_session_id,
+      // while a legacy unbound record must still accept the load-fallback
+      // rebind the adapter issues (pre-branch behavior).
+      const rebinder: DiskRecord = { ...pending, acp_session_id: "rebound-adapter-id" };
+      assert.throws(
+        () => outbox.writeOwnedRecord(id, rebinder, () => rebinder),
+        /belongs to another ACP session/,
+      );
+      const legacyId = "22222222-2222-4222-8222-222222222229";
+      const legacyFirst: DiskRecord = { ...record, acpx_record_id: legacyId, metadata: {} };
+      outbox.writeOwnedRecord(legacyId, legacyFirst, () => legacyFirst);
+      const legacyRebound: DiskRecord = { ...legacyFirst, acp_session_id: "fresh-adapter-id" };
+      outbox.writeOwnedRecord(legacyId, legacyRebound, () => legacyRebound);
+      assert.equal(outbox.readRecord(legacyId)?.acp_session_id, "fresh-adapter-id");
     } else if (scenario === "ownership") {
       outbox.transitionSpawn("run-1", 1, "revoked");
       assert.throws(() => outbox.writeOwnedRecord(id, pending, () => pending), /refused/);
