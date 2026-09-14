@@ -47,6 +47,20 @@ export function isCanonicalSessionDirectory(directory: string): boolean {
   }
   return actual === canonical;
 }
+const BUSY_ERROR_PATTERN = /database is locked|SQLITE_BUSY/;
+
+function isBusyAcquisitionError(error: unknown): boolean {
+  return error instanceof Error && BUSY_ERROR_PATTERN.test(error.message);
+}
+
+/** Synchronous sleep via Atomics.wait — the retry loop owns the waiting, no timers. */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+const OUTBOX_RETRY_BUDGET_MS = 4_000;
+const OUTBOX_RETRY_CAP_MS = 250;
+
 export type DiskRecord = Record<string, unknown> & { metadata?: Record<string, string> };
 export type OutboxState = "prepared" | "applied" | "acknowledged" | "superseded" | "abandoned";
 export interface ProjectionPayload {
@@ -965,7 +979,7 @@ export class BrickOutbox {
   private locked<T>(action: () => T): T {
     let acquired = false;
     try {
-      this.db.exec("BEGIN IMMEDIATE");
+      this.beginImmediateWithRetry();
       acquired = true;
       const result = action();
       if (result instanceof Promise) {
@@ -1063,10 +1077,43 @@ export class BrickOutbox {
     });
   }
 
+  /**
+   * BEGIN IMMEDIATE with a bounded jittered-backoff retry. Only SQLITE_BUSY is
+   * retried (a competing writer holds the lock); any other failure propagates
+   * immediately. Under parallel box load this ABSORBS contention instead of
+   * rejecting: real writers hold the lock for ~ms, so a retrying contender gets
+   * it within a few backoff steps. The budget (4s) deliberately sits BELOW the
+   * 5s live-holder acceptance line (b14-lock-proof): a contender must still fail
+   * with outbox-busy while another process provably holds the lock, and the
+   * lock can never be taken over — SQLite releases it only on the holder's
+   * commit or death. busy_timeout stays 0: each attempt fails in ~0 ms, so this
+   * loop owns the waiting and the budget accounting stays exact.
+   */
+  private beginImmediateWithRetry(): void {
+    const started = Date.now();
+    let delay = 10 + Math.floor(Math.random() * 16); // jittered 10-25 ms start
+    for (;;) {
+      try {
+        this.db.exec("BEGIN IMMEDIATE");
+        return;
+      } catch (error) {
+        const waited = Date.now() - started;
+        if (!isBusyAcquisitionError(error) || waited >= OUTBOX_RETRY_BUDGET_MS) {
+          throw error; // translate() maps an exhausted busy to outbox-busy, as before
+        }
+        sleepSync(Math.min(OUTBOX_RETRY_CAP_MS, delay));
+        delay = Math.min(
+          OUTBOX_RETRY_CAP_MS,
+          Math.ceil(delay * 1.7) + Math.floor(Math.random() * 25),
+        );
+      }
+    }
+  }
+
   private async withAsyncMutation<T>(action: () => Promise<T>): Promise<T> {
     let acquired = false;
     try {
-      this.db.exec("BEGIN IMMEDIATE");
+      this.beginImmediateWithRetry();
       acquired = true;
       this.refuseDrain();
       const result = await action();
