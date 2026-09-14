@@ -91,6 +91,7 @@ export type RunOnceOptions = {
 } & TimedRunOptions;
 
 export type SessionCreateOptions = {
+  recordId?: string;
   agentCommand: string;
   agentName?: string;
   cwd: string;

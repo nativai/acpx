@@ -245,6 +245,10 @@ export function registerSessionsCommand(
 
   sessionsCommand
     .command("new")
+    .option(
+      "--record-id <uuid>",
+      "Use this local record UUID (distinct from the adapter session id)",
+    )
     .description("Create a new session for current cwd (optionally from a template)")
     .option("-s, --name <name>", "Session name", parseSessionName)
     .option("--resume-session <id>", "Resume existing ACP session id", (value: string) =>
@@ -353,6 +357,7 @@ export function registerSessionsCommand(
 
   sessionsCommand
     .command("copy")
+    .option("--record-id <uuid>", "Use this local destination record UUID")
     .alias("fork")
     .description("Copy/fork a session with the source agent type")
     .requiredOption(
