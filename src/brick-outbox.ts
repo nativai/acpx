@@ -371,7 +371,12 @@ function assertRecordIdentity(
   if (metadataValue(current, "spawn_key") !== metadataValue(writer, "spawn_key")) {
     throw new OutboxError("record-ownership", "destination belongs to another spawn attempt");
   }
-  if (current.acp_session_id !== writer.acp_session_id) {
+  // acp_session_id is protected ONLY on reserved destinations (spawn_key): the
+  // spawn/idempotency semantics must not let a delayed child rebind a record an
+  // attempt owns. Legacy records (no spawn_key) legitimately rebind when the
+  // adapter returns a fresh session id on load-fallback/session/new — the
+  // pre-branch behavior main's own suite depends on (W7-L12 family reds).
+  if (metadataValue(current, "spawn_key") && current.acp_session_id !== writer.acp_session_id) {
     throw new OutboxError("record-ownership", "destination belongs to another ACP session");
   }
 }
