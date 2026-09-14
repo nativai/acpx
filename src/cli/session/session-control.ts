@@ -57,6 +57,7 @@ import {
   trySetModelOnRunningOwner,
   trySetModeOnRunningOwner,
 } from "../queue/ipc.js";
+import { readQueueOwnerRecord } from "../queue/lease-store.js";
 import { DEFAULT_CLOSE_DRAIN_TIMEOUT_MS } from "./contracts.js";
 import type {
   SessionCancelOptions,
@@ -732,6 +733,12 @@ export async function closeSession(
 ): Promise<SessionCloseResult> {
   const record = await resolveSessionRecord(sessionId);
 
+  // Self-close detection FIRST — it decides which of the two arms runs.
+  const selfOwnerPid = await detectSelfOwnedOwnerPid(record.acpxRecordId);
+  if (selfOwnerPid !== undefined) {
+    return await closeSelfOwnedSession(record, selfOwnerPid, options);
+  }
+
   // Step 0.5 — ask the owner to give up its custody honestly BEFORE anything
   // kills it. Until this existed, step 2 below actively killed the very process
   // that was mid-handoff of an accepted message, and the only record of that
@@ -762,6 +769,163 @@ export async function closeSession(
   releaseConfigDirOnTerminalClose(record);
 
   return { record, drain };
+}
+
+// ---------------------------------------------------------------------------
+// brick://f4f1fa54 — SELF-CLOSE. A session may be closed BY ITSELF: the agent
+// running inside the session executes `acpx sessions close <own id>` (or an
+// equivalent UI-driven request), so the CLI process performing the close is a
+// DESCENDANT of the very queue owner the close must terminate (owner → ACP
+// adapter → agent → this CLI). The non-self sequence above — drain, ACP
+// shutdown, terminate the owner (waits for its exit), and only THEN write
+// `closed: true` — kills the caller's own process tree mid-close, and whether
+// the terminal write ever lands is a race the close loses exactly when it
+// matters. Observed live: a session that self-closed stayed `closed:false`.
+//
+// The self arm therefore INVERTS the order: persist the terminal record FIRST
+// (privileged write, same as the non-self path — nothing can un-close it
+// afterwards), and terminate the own owner pid as the FINAL act. The drain and
+// the best-effort ACP shutdown are SKIPPED in this arm: both target the owner
+// being terminated, and the in-flight turn IS the close call itself — there is
+// nothing honest to drain. The adapter (`record.pid`) kill is skipped too: the
+// adapter sits on the doomed owner→caller path and taking it down kills the
+// caller before it can return. The config-dir release is skipped as well — with
+// the owner still ALIVE at that point, `dropStaleHolders` would retain the
+// directory anyway (see the 433f6bf8 block above); the orphan sweep remains the
+// guarantee, and it collects the dir once the owner is gone. The lease/socket
+// tidy-up is likewise left to the next cold spawn: a dead-owner lease is the
+// `recoverable` state, auto-cleaned on the next submit (North Star invariant —
+// cleanup never signals), so no work is skipped that would not be redone.
+// ---------------------------------------------------------------------------
+
+// Bounded walk so a corrupt /proc entry can never spin the close. Deeper than
+// any real owner→adapter→agent→CLI chain, with headroom for containers.
+const MAX_SELF_ANCESTOR_WALK_DEPTH = 64;
+
+// Field 4 of /proc/<pid>/stat is the parent pid. `comm` (field 2) may contain
+// spaces and parens, so parse everything after the LAST `)` — same convention
+// as parseLinuxProcStatStartTime in lease-store.ts.
+function parseLinuxProcStatParentPid(payload: string): number | undefined {
+  const endCommandIndex = payload.lastIndexOf(")");
+  if (endCommandIndex < 0) {
+    return undefined;
+  }
+  const fieldsFromState = payload
+    .slice(endCommandIndex + 1)
+    .trim()
+    .split(/\s+/);
+  const parentPid = Number(fieldsFromState[1]);
+  return Number.isInteger(parentPid) && parentPid > 0 ? parentPid : undefined;
+}
+
+/**
+ * The PPid chain above `startPid` (default: this process), innermost first.
+ * /proc-based, so Linux-only — the fleet's deployment target — and bounded by
+ * {@link MAX_SELF_ANCESTOR_WALK_DEPTH}. Stops before pid 1: an ancestry claim
+ * against init proves nothing (every containerized process descends from it).
+ * Exported for tests, which prove the walk against REAL spawned processes.
+ */
+export async function readSelfAncestorPids(startPid: number = process.pid): Promise<number[]> {
+  const ancestors: number[] = [];
+  if (process.platform !== "linux") {
+    return ancestors;
+  }
+  let current = startPid;
+  for (let depth = 0; depth < MAX_SELF_ANCESTOR_WALK_DEPTH; depth += 1) {
+    let parentPid: number | undefined;
+    try {
+      parentPid = parseLinuxProcStatParentPid(await fs.readFile(`/proc/${current}/stat`, "utf8"));
+    } catch {
+      return ancestors;
+    }
+    if (parentPid === undefined || parentPid <= 1) {
+      return ancestors;
+    }
+    ancestors.push(parentPid);
+    current = parentPid;
+  }
+  return ancestors;
+}
+
+/**
+ * True when `pid` is this process itself or one of its ancestors — the
+ * self-close signal that the session's queue owner would be terminating the
+ * caller's own process tree. The direct-parent check is cross-platform
+ * (`process.ppid`); deeper ancestry needs the /proc walk. A stale lease whose
+ * pid was REUSED cannot reach a self-close verdict through this alone: the
+ * caller additionally requires the lease's process identity to still match
+ * (see {@link detectSelfOwnedOwnerPid}), mirroring `canSignalQueueOwner`.
+ */
+export async function isPidSelfOrAncestor(pid: number): Promise<boolean> {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  if (pid === process.pid || pid === process.ppid) {
+    return true;
+  }
+  return (await readSelfAncestorPids()).includes(pid);
+}
+
+/**
+ * The session's owner pid when terminating it would terminate THIS process
+ * tree — i.e. a self-close — and the pid is safe to signal (alive, lease
+ * identity still matching). The identity guard mirrors `canSignalQueueOwner`
+ * in lease-store.ts: a dead owner has nothing to terminate, and a pid-reused
+ * lease must never cause this process to signal an unrelated process that
+ * happens to sit in its ancestry.
+ */
+async function detectSelfOwnedOwnerPid(sessionId: string): Promise<number | undefined> {
+  const owner = await readQueueOwnerRecord(sessionId);
+  if (owner?.pid === undefined || !(await isPidSelfOrAncestor(owner.pid))) {
+    return undefined;
+  }
+  const ownerState = await readQueueOwnerState(sessionId);
+  if (!ownerState.pidAlive || ownerState.processIdentityMatched === false) {
+    return undefined;
+  }
+  return owner.pid;
+}
+
+/**
+ * The SELF-CLOSE arm (brick://f4f1fa54): the session being closed owns the
+ * process tree this CLI is running in, so the terminal record is written FIRST
+ * and the own owner pid is terminated as the FINAL act. See the block above
+ * {@link closeSession} for why each non-self step is skipped here.
+ *
+ * The ordering IS the fix: a process killed after the privileged write cannot
+ * un-close the record, so even a caller that dies mid-return leaves a
+ * `closed: true` session behind — the observed failure (self-close declared,
+ * record stayed open) becomes structurally impossible.
+ */
+async function closeSelfOwnedSession(
+  record: SessionRecord,
+  ownerPid: number,
+  options: CloseSessionOptions,
+): Promise<SessionCloseResult> {
+  record.pid = undefined;
+  record.closed = true;
+  record.closedAt = isoNow();
+  // Privileged write: same daemon-authorized close as the non-self path —
+  // bypass the read-preserve-lifecycle step so `closed: true` lands on disk.
+  await writeSessionRecordAtBoundaryWithLifecycle(record);
+
+  if (options.verbose) {
+    process.stderr.write(
+      `[acpx] self-close: terminal record persisted; terminating own owner pid ${ownerPid}\n`,
+    );
+  }
+  // THE FINAL ACT. Single-pid terminate (SIGTERM → grace → SIGKILL), mirroring
+  // terminateQueueOwnerForSession's kill of a confirmed owner — but the wait
+  // here is best-effort by construction: the caller may be torn down as part of
+  // the owner's shutdown cascade before the wait resolves, and the record is
+  // already on disk. No process-group sweep: the caller itself is a group
+  // member, and sweeping would be self-destruction beyond the close's mandate.
+  await terminateProcess(ownerPid);
+
+  return {
+    record,
+    drain: { attempted: false, reachedOwner: false, undelivered: [] },
+  };
 }
 
 /**
