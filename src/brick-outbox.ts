@@ -1,8 +1,44 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
+import { isSqliteExperimentalWarning } from "./models/ui-prefs-store.js";
+
+type SqliteModule = { DatabaseSync: new (path: string) => DatabaseSync };
+let sqliteModule: SqliteModule | undefined;
+
+/**
+ * node:sqlite must NOT load at CLI-module time: importing it emits an
+ * ExperimentalWarning on stderr, and --version/--help/non-writing commands
+ * promise clean stderr. The module is required lazily, on first BrickOutbox
+ * construction — i.e. only on a path that actually opens the outbox. The
+ * filter installed around the require drops exactly the one SQLite
+ * ExperimentalWarning (name+message matched by the shared, tested predicate
+ * in ui-prefs-store) and is removed immediately; every other warning flows
+ * to the original handler. NEVER widen this to --no-warnings or
+ * removeAllListeners — the ui-prefs-store comment explains the blast radius.
+ */
+function requireSqlite(): SqliteModule {
+  if (sqliteModule) {
+    return sqliteModule;
+  }
+  const original = process.emitWarning.bind(process);
+  const filtered = (warning: unknown, ...rest: unknown[]): void => {
+    if (isSqliteExperimentalWarning(warning, rest)) {
+      return;
+    }
+    (original as (...args: unknown[]) => void)(warning, ...rest);
+  };
+  process.emitWarning = filtered as typeof process.emitWarning;
+  try {
+    sqliteModule = createRequire(import.meta.url)("node:sqlite") as SqliteModule;
+  } finally {
+    process.emitWarning = original;
+  }
+  return sqliteModule;
+}
 import { isDeepStrictEqual } from "node:util";
 import type {
   CentralRunReceipt,
@@ -509,7 +545,7 @@ export class BrickOutbox {
     this.sessionsDir = path.join(directory, "sessions");
     fs.mkdirSync(this.sessionsDir, { recursive: true });
     this.dbPath = path.join(directory, "brick-outbox.db");
-    this.db = new DatabaseSync(this.dbPath);
+    this.db = new (requireSqlite().DatabaseSync)(this.dbPath);
     try {
       this.db.exec("PRAGMA busy_timeout=0; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;");
       this.locked(() => {
