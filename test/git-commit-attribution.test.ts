@@ -49,16 +49,20 @@ const CLEAN_GIT_ENV: Record<string, string | undefined> = {
 };
 
 test("git attribution: sets author/committer identity from name + recordId + base-URL host", () => {
-  withEnv(CLEAN_GIT_ENV, () => {
+  // The emit side derives the host from resolveAcpxUiBaseUrl and hardcodes NO
+  // host itself, so the test CONTROLS the resolver's rung-1 input with a fixture
+  // URL — the old "default box host" expectation depended on this rig's own
+  // rung-2/3 resolution and carried the stale `acpx.` literal.
+  withEnv({ ...CLEAN_GIT_ENV, ACPX_UI_BASE_URL: "https://atrium.devbox.nativai.de" }, () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
       acpxRecordId: "11111111-2222-3333-4444-555555555555",
       sessionName: "  w13-42-dev  ",
     });
-    // Host is derived from the resolved acpx-ui base URL (default box host here).
+    // Host is derived from the resolved acpx-ui base URL (rung-1 fixture above).
     assert.equal(options.env.GIT_AUTHOR_NAME, "w13-42-dev");
     assert.equal(
       options.env.GIT_AUTHOR_EMAIL,
-      "11111111-2222-3333-4444-555555555555@acpx.devbox.nativai.de",
+      "11111111-2222-3333-4444-555555555555@atrium.devbox.nativai.de",
     );
     // Committer pair is identical to the author pair.
     assert.equal(options.env.GIT_COMMITTER_NAME, options.env.GIT_AUTHOR_NAME);
