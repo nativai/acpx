@@ -1997,7 +1997,9 @@ async function withCanonicalDeletion<T>(
   action: () => Promise<T>,
 ): Promise<T> {
   const outbox = openRecordOutbox(expected.metadata, sessionDir);
-  if (!outbox) {return action();}
+  if (!outbox) {
+    return action();
+  }
   try {
     return await outbox.withRecordDeletion(String(expected.acpx_record_id), expected, action);
   } finally {

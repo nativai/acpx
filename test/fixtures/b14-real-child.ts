@@ -70,8 +70,9 @@ await new Promise<void>((resolve, reject) => {
 let acted = 0;
 try {
   const deadline = Date.now() + 10000;
-  while (!fs.existsSync(marker) && Date.now() < deadline && child.exitCode === null)
-    {await new Promise((resolve) => setTimeout(resolve, 20));}
+  while (!fs.existsSync(marker) && Date.now() < deadline && child.exitCode === null) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
   if (!fs.existsSync(marker)) {
     console.error(`EXAMINED NOTHING: adapter did not reach barrier\n${stdout}\n${stderr}`);
     process.exitCode = 2;
@@ -80,7 +81,9 @@ try {
     console.log("ACTORS=1");
     assert.equal(outbox.readRecord(target), undefined);
     assert.equal(outbox.spawnChildLiveness("real-run", 1), "alive");
-    if (revoked) {outbox.transitionSpawn("real-run", 1, "revoked");}
+    if (revoked) {
+      outbox.transitionSpawn("real-run", 1, "revoked");
+    }
     fs.writeFileSync(release, "release");
     const code = await exited;
     if (revoked) {

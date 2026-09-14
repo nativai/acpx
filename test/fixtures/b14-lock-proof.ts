@@ -15,8 +15,9 @@ const exit = new Promise((resolve) => holder.once("exit", resolve));
 let acted = 0;
 try {
   const deadline = Date.now() + 5000;
-  while (!fs.existsSync(marker) && Date.now() < deadline && holder.exitCode === null)
-    {await new Promise((resolve) => setTimeout(resolve, 10));}
+  while (!fs.existsSync(marker) && Date.now() < deadline && holder.exitCode === null) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
   if (!fs.existsSync(marker)) {
     console.error("EXAMINED NOTHING");
     process.exitCode = 2;

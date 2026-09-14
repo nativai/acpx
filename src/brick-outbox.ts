@@ -27,7 +27,9 @@ export function openRecordOutbox(
   _metadata: Record<string, string> | undefined,
   directory = path.join(os.homedir(), ".acpx", "sessions"),
 ): BrickOutbox | undefined {
-  if (!isCanonicalSessionDirectory(directory)) {return undefined;}
+  if (!isCanonicalSessionDirectory(directory)) {
+    return undefined;
+  }
   // C0 §1.4/§7.1: exclusion applies to canonical writers even before projection binding.
   // Opening unconditionally removes the existence-check race with a concurrent drain entry.
   return new BrickOutbox();
@@ -38,7 +40,9 @@ export function isCanonicalSessionDirectory(directory: string): boolean {
   try {
     canonical = fs.realpathSync(path.join(os.homedir(), ".acpx", "sessions"));
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {throw error;}
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
     return false;
   }
   return actual === canonical;
@@ -194,7 +198,7 @@ function tuple(record: DiskRecord | undefined): [number, number] {
   if (!Number.isSafeInteger(epoch) || !Number.isSafeInteger(revision)) {
     throw new OutboxError("invalid-projection-revision", "unsafe record projection tuple");
   }
-  return [epoch!, revision!];
+  return [epoch, revision];
 }
 function historyId(): string {
   const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -230,7 +234,9 @@ function readLocalIdentity(): { instance_id: string; home: string } {
   return identity;
 }
 function projectionAgentType(record: DiskRecord): string | null {
-  const command = String(record.agent_command ?? "").trim();
+  // agent_command is a string in every real session record; non-strings stringify to a
+  // value no agent-type prefix regex below can match, so "" is the same observable result.
+  const command = (typeof record.agent_command === "string" ? record.agent_command : "").trim();
   const matches: Array<[string, RegExp]> = [
     [
       "claude-pty",
@@ -348,13 +354,16 @@ function preserveStaleProjectionMetadata(
   }
 }
 function assertDeletionSnapshot(expected: DiskRecord, current: DiskRecord | undefined): void {
-  if (!current) {return;}
+  if (!current) {
+    return;
+  }
   const fields = ["closed", "closed_at", "last_used_at", "updated_at", "template"];
   for (const key of fields) {
-    const before = JSON.parse(JSON.stringify(expected[key] ?? null));
-    const after = JSON.parse(JSON.stringify(current[key] ?? null));
-    if (!isDeepStrictEqual(before, after))
-      {throw new OutboxError("record-changed", "record changed since deletion selection; retry");}
+    const before: unknown = JSON.parse(JSON.stringify(expected[key] ?? null));
+    const after: unknown = JSON.parse(JSON.stringify(current[key] ?? null));
+    if (!isDeepStrictEqual(before, after)) {
+      throw new OutboxError("record-changed", "record changed since deletion selection; retry");
+    }
   }
   if (
     metadataValue(expected, "brick_projection_revision") !==
@@ -778,7 +787,7 @@ export class BrickOutbox {
     }
     return {
       examined: heads.length,
-      last_session_id: heads.length ? String(heads[heads.length - 1]!.session_id) : null,
+      last_session_id: heads.length ? String(heads[heads.length - 1].session_id) : null,
       prepared,
     };
   }
@@ -991,7 +1000,9 @@ export class BrickOutbox {
     }
   }
   recordPath(id: string): string {
-    if (!id) {throw new OutboxError("invalid-record-id", "local record id is required");}
+    if (!id) {
+      throw new OutboxError("invalid-record-id", "local record id is required");
+    }
     return path.join(this.sessionsDir, `${encodeURIComponent(id)}.json`);
   }
   readRecord(id: string): DiskRecord | undefined {

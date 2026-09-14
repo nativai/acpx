@@ -52,7 +52,7 @@ for (const scenario of ["positive", "revoked"]) {
         timeout: 20000,
       },
     );
-    if (!/ACTORS=1/.test(result.stdout)) {
+    if (!result.stdout.includes("ACTORS=1")) {
       console.error("EXAMINED NOTHING");
       process.exitCode = 2;
       assert.fail(`real-child proof had no observed actor: ${result.stderr}`);

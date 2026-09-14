@@ -69,7 +69,9 @@ try {
     await save(stale);
   } catch (error) {
     refused = (error as { code?: string }).code === "maintenance";
-    if (!refused) {throw error;}
+    if (!refused) {
+      throw error;
+    }
   }
   operations++;
   const observed = outbox.readRecord(id);
