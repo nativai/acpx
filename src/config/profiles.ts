@@ -10,8 +10,10 @@ import {
 import os from "node:os";
 import path from "node:path";
 import {
+  normalizeSubscriptionPolicy,
   subscriptionRegistryPath,
   subscriptionsDir,
+  type SubscriptionPolicy,
   type SubscriptionLookupOptions,
 } from "./subscriptions.js";
 
@@ -115,6 +117,8 @@ export interface ProfileRegistry {
   quarantined?: QuarantinedProfileEntry[];
   /** ANNEX W2 schema slot. No behavior in W5. */
   provisioning?: ProvisioningOverride;
+  /** Account-scoped automatic weekly-capacity policy shared with subscription routing. */
+  subscriptionPolicy?: SubscriptionPolicy;
 }
 
 function emptyProfileRegistry(): ProfileRegistry {
@@ -640,20 +644,26 @@ function buildRegistry(
 ): ProfileRegistry {
   const defaultId = nonEmptyString(value.default);
   const provisioning = isRecord(value.provisioning) ? value.provisioning : undefined;
+  const subscriptionPolicy = normalizeSubscriptionPolicy(value.subscriptionPolicy);
   return {
     version: 3,
     ...(defaultId !== undefined ? { default: defaultId } : {}),
     profiles,
     ...(quarantined.length > 0 ? { quarantined } : {}),
     ...(provisioning !== undefined ? { provisioning } : {}),
+    ...(subscriptionPolicy !== undefined ? { subscriptionPolicy } : {}),
   };
 }
 
-function migratedRegistryJson(registry: ProfileRegistry): Record<string, unknown> {
+function migratedRegistryJson(
+  registry: ProfileRegistry,
+  rawSubscriptionPolicy: unknown,
+): Record<string, unknown> {
   return {
     version: 3,
     ...(registry.default !== undefined ? { default: registry.default } : {}),
     ...(registry.provisioning !== undefined ? { provisioning: registry.provisioning } : {}),
+    ...(isRecord(rawSubscriptionPolicy) ? { subscriptionPolicy: rawSubscriptionPolicy } : {}),
     profiles: registry.profiles.map(serializeProfileForRegistry),
     ...(registry.quarantined !== undefined ? { quarantined: registry.quarantined } : {}),
   };
@@ -680,7 +690,11 @@ function normalizeRegistryDocument(
     return { registry, migrationMessages };
   }
 
-  return { registry, migratedJson: migratedRegistryJson(registry), migrationMessages };
+  return {
+    registry,
+    migratedJson: migratedRegistryJson(registry, value.subscriptionPolicy),
+    migrationMessages,
+  };
 }
 
 /** Read and JSON-parse the registry file, returning null on any error. */

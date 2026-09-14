@@ -252,6 +252,7 @@ function emitQueueOwnerError(
       retryable: message.retryable,
       acp: message.acp,
       effectiveAccount: message.effectiveAccount,
+      automationCapacityReserved: message.automationCapacityReserved,
     });
     formatter.flush();
   }

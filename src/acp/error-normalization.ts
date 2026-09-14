@@ -1,4 +1,5 @@
 import {
+  AutomationCapacityReservedError,
   AuthPolicyError,
   PermissionDeniedError,
   PermissionPromptUnavailableError,
@@ -8,6 +9,7 @@ import {
   OUTPUT_ERROR_CODES,
   OUTPUT_ERROR_ORIGINS,
   type ExitCode,
+  type AutomationCapacityReservedDetail,
   type OutputErrorAcpPayload,
   type OutputErrorCode,
   type OutputErrorOrigin,
@@ -31,6 +33,7 @@ type ErrorMeta = {
   retryable?: boolean;
   acp?: OutputErrorAcpPayload;
   effectiveAccount?: EffectiveAccountMetadata;
+  automationCapacityReserved?: AutomationCapacityReservedDetail;
 };
 
 export type NormalizedOutputError = {
@@ -41,6 +44,7 @@ export type NormalizedOutputError = {
   retryable?: boolean;
   acp?: OutputErrorAcpPayload;
   effectiveAccount?: EffectiveAccountMetadata;
+  automationCapacityReserved?: AutomationCapacityReservedDetail;
 };
 
 export type NormalizeOutputErrorOptions = {
@@ -50,6 +54,7 @@ export type NormalizeOutputErrorOptions = {
   retryable?: boolean;
   acp?: OutputErrorAcpPayload;
   effectiveAccount?: EffectiveAccountMetadata;
+  automationCapacityReserved?: AutomationCapacityReservedDetail;
 };
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -166,6 +171,14 @@ function isOutputErrorOrigin(value: unknown): value is OutputErrorOrigin {
   return typeof value === "string" && OUTPUT_ERROR_ORIGINS.includes(value as OutputErrorOrigin);
 }
 
+function automationCapacityReservedFromError(
+  error: unknown,
+): AutomationCapacityReservedDetail | undefined {
+  return error instanceof AutomationCapacityReservedError
+    ? error.automationCapacityReserved
+    : undefined;
+}
+
 function readOutputErrorMeta(error: unknown): ErrorMeta {
   const record = asRecord(error);
   if (!record) {
@@ -184,6 +197,7 @@ function readOutputErrorMeta(error: unknown): ErrorMeta {
   );
 
   const acp = extractAcpError(record.acp);
+  const automationCapacityReserved = automationCapacityReservedFromError(error);
   return {
     outputCode,
     detailCode,
@@ -191,6 +205,7 @@ function readOutputErrorMeta(error: unknown): ErrorMeta {
     retryable,
     acp,
     effectiveAccount,
+    automationCapacityReserved,
   };
 }
 
@@ -273,6 +288,8 @@ export function normalizeOutputError(
     retryable: meta.retryable ?? options.retryable,
     acp,
     effectiveAccount: meta.effectiveAccount ?? options.effectiveAccount,
+    automationCapacityReserved:
+      meta.automationCapacityReserved ?? options.automationCapacityReserved,
   };
 }
 

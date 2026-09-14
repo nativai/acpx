@@ -204,6 +204,29 @@ export type OutputErrorAcpPayload = {
   data?: unknown;
 };
 
+export type AutomationEligibilitySource =
+  | "five-hour-reset"
+  | "weekly-reset"
+  | "unlock"
+  | "policy-change";
+
+/** Additive JSON-RPC data for the pre-provider automatic-capacity terminal. */
+export type AutomationCapacityReservedDetail = {
+  code: "automation-capacity-reserved";
+  accountId: string;
+  accountLabel: string;
+  weeklyPercentUsed: number;
+  effectiveWeeklyCeiling: number;
+  reservedPercent: number;
+  providerSubmitted: false;
+  lastCheckedAt: string;
+  weeklyResetAt?: string;
+  nextAutomationEligibleAt?: string;
+  nextEligibilityAccountId?: string;
+  nextEligibilityAccountLabel?: string;
+  nextEligibilitySource?: AutomationEligibilitySource;
+};
+
 export type PermissionStats = {
   requested: number;
   approved: number;
@@ -279,6 +302,7 @@ export interface OutputFormatter {
     retryable?: boolean;
     acp?: OutputErrorAcpPayload;
     effectiveAccount?: EffectiveAccountMetadata;
+    automationCapacityReserved?: AutomationCapacityReservedDetail;
     timestamp?: string;
   }): void;
   onPermissionEscalation(event: PermissionEscalationEvent): void;

@@ -1,6 +1,7 @@
 import type { EffectiveAccountMetadata } from "../../acp/auth-env.js";
 import { buildJsonRpcErrorResponse } from "../../acp/jsonrpc-error.js";
 import type {
+  AutomationCapacityReservedDetail,
   OutputErrorAcpPayload,
   OutputErrorCode,
   OutputErrorOrigin,
@@ -240,6 +241,7 @@ class JsonOutputFormatter implements OutputFormatter {
     retryable?: boolean;
     acp?: OutputErrorAcpPayload;
     effectiveAccount?: EffectiveAccountMetadata;
+    automationCapacityReserved?: AutomationCapacityReservedDetail;
     timestamp?: string;
   }): void {
     this.stdout.write(
@@ -254,6 +256,7 @@ class JsonOutputFormatter implements OutputFormatter {
           sessionId: this.sessionId,
           acp: params.acp,
           effectiveAccount: params.effectiveAccount,
+          automationCapacityReserved: params.automationCapacityReserved,
         }),
       )}\n`,
     );

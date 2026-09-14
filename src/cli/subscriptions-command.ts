@@ -1,19 +1,27 @@
 import { rmSync } from "node:fs";
 import path from "node:path";
-import { Command } from "commander";
+import { Command, InvalidArgumentError } from "commander";
 import { findProfile, loadProfileRegistry, type ProfileEntry } from "../config/profiles.js";
 import {
   getSubscriptionsUsageWithFable,
   type SubscriptionUsage,
 } from "../config/subscription-usage.js";
 import {
+  clearDefaultSubscriptionAutoWeeklyCeiling,
+  clearSubscriptionAutoWeeklyCeiling,
   findSubscription,
   isSubscriptionLocked,
   loadSubscriptionRegistry,
   removeProfileFromRegistry,
+  resolveEffectiveWeeklyCeiling,
+  resolveSubscriptionSubject,
+  setDefaultSubscriptionAutoWeeklyCeiling,
+  setSubscriptionAutoWeeklyCeiling,
   setSubscriptionLockState,
   subscriptionsDir,
+  type ResolvedSubscriptionSubject,
   type SubscriptionLockMutationResult,
+  type SubscriptionCeilingMutationResult,
   type SubscriptionRegistry,
 } from "../config/subscriptions.js";
 import {
@@ -67,6 +75,257 @@ function handleSubscriptionsList(command: Command, config: ResolvedAcpxConfig): 
   }
 
   process.stdout.write(renderSubscriptionsListText(registry));
+}
+
+function parseExplicitPercent(value: string): number | undefined {
+  if (!/^(?:\d+(?:\.\d+)?|\.\d+)%$/u.test(value)) {
+    return undefined;
+  }
+  const percent = Number(value.slice(0, -1));
+  return Number.isFinite(percent) && percent > 0 && percent <= 100 ? percent / 100 : undefined;
+}
+
+function parseExplicitFraction(value: string): number | undefined {
+  if (!/^(?:0?\.\d+|1\.0+)$/u.test(value)) {
+    return undefined;
+  }
+  const fraction = Number(value);
+  return Number.isFinite(fraction) && fraction > 0 && fraction <= 1 ? fraction : undefined;
+}
+
+export function parseAutoWeeklyCeiling(value: string): number {
+  const normalized = value.trim();
+  const parsed = normalized.endsWith("%")
+    ? parseExplicitPercent(normalized)
+    : parseExplicitFraction(normalized);
+  if (parsed !== undefined) {
+    return parsed;
+  }
+  throw new InvalidArgumentError(
+    `Invalid automation weekly ceiling "${value}". Use an explicit percent (for example 90%) ` +
+      `or fraction (for example 0.90 or 1.00); expected greater than 0% and at most 100%.`,
+  );
+}
+
+type SubscriptionCeilingView = {
+  account: string;
+  subscriptions: string[];
+  effectiveWeeklyCeiling: number;
+  effectiveWeeklyCeilingPercent: number;
+  reservedWeeklyFraction: number;
+  reservedWeeklyPercent: number;
+  source: ReturnType<typeof resolveEffectiveWeeklyCeiling>["source"];
+  hard: boolean;
+};
+
+function ceilingViewForAccount(
+  account: string,
+  registry: SubscriptionRegistry,
+): SubscriptionCeilingView {
+  const effective = resolveEffectiveWeeklyCeiling(account, registry);
+  const reserved = Number((1 - effective.value).toFixed(10));
+  return {
+    account,
+    subscriptions: registry.subscriptions
+      .filter((entry) => entry.account === account)
+      .map((entry) => entry.id),
+    effectiveWeeklyCeiling: effective.value,
+    effectiveWeeklyCeilingPercent: Number((effective.value * 100).toFixed(10)),
+    reservedWeeklyFraction: reserved,
+    reservedWeeklyPercent: Number((reserved * 100).toFixed(10)),
+    source: effective.source,
+    hard: effective.hard,
+  };
+}
+
+function renderCeilingValue(value: number): string {
+  return `${(value * 100).toFixed(1)}% (fraction ${value.toFixed(4)})`;
+}
+
+function renderCeilingView(view: SubscriptionCeilingView): string {
+  return (
+    `Account: ${view.account}\n` +
+    `  subscriptions: ${view.subscriptions.join(", ") || "-"}\n` +
+    `  automation weekly ceiling: ${renderCeilingValue(view.effectiveWeeklyCeiling)}\n` +
+    `  reserved weekly capacity: ${renderCeilingValue(view.reservedWeeklyFraction)}\n` +
+    `  source: ${view.source}\n` +
+    `  enforcement: ${view.hard ? "hard automatic turn boundary" : "legacy soft fallback"}\n`
+  );
+}
+
+function knownCeilingSubjects(registry: SubscriptionRegistry): string[] {
+  return [
+    ...new Set([
+      ...registry.subscriptions.flatMap((entry) => [
+        `profile:${entry.id}`,
+        `account:${entry.account}`,
+      ]),
+      ...Object.keys(registry.subscriptionPolicy?.accounts ?? {}).map(
+        (account) => `account:${account}`,
+      ),
+    ]),
+  ];
+}
+
+function requireCeilingSubject(
+  subject: string,
+  registry: SubscriptionRegistry,
+): ResolvedSubscriptionSubject {
+  const resolved = resolveSubscriptionSubject(subject, registry);
+  if (resolved.kind === "ambiguous") {
+    const accountProfiles =
+      resolved.accountEntries.map((entry) => entry.id).join(", ") ||
+      "configured policy with no enrolled profile";
+    throw new InvalidArgumentError(
+      `Ambiguous ceiling subject "${subject.trim()}": profile:${resolved.profile.id} maps to ` +
+        `account "${resolved.profile.account}", while account:${subject.trim()} names profile(s) ` +
+        `${accountProfiles}. Use the explicit profile: or account: prefix.`,
+    );
+  }
+  if (resolved.kind === "missing") {
+    throw new SubscriptionUnknownError(subject.trim(), knownCeilingSubjects(registry));
+  }
+  return resolved;
+}
+
+function printCeilingPayload(
+  payload: SubscriptionCeilingView | SubscriptionCeilingMutationResult,
+  format: ReturnType<typeof resolveGlobalFlags>["format"],
+): void {
+  if (format === "json") {
+    process.stdout.write(`${JSON.stringify(payload)}\n`);
+    return;
+  }
+  if (format === "quiet") {
+    process.stdout.write(`${payload.effectiveWeeklyCeilingPercent}%\n`);
+    return;
+  }
+  if ("subscriptions" in payload) {
+    process.stdout.write(renderCeilingView(payload));
+    return;
+  }
+  const target = payload.account ?? "registry default";
+  const verb = payload.action.endsWith("cleared") ? "cleared; effective fallback" : "set";
+  process.stdout.write(
+    `automation weekly ceiling ${verb} for ${target}: ${renderCeilingValue(payload.effectiveWeeklyCeiling)} (${payload.source}; ${payload.hard ? "hard" : "legacy soft"})\n`,
+  );
+}
+
+function allCeilingViews(registry: SubscriptionRegistry): SubscriptionCeilingView[] {
+  const accounts = new Set([
+    ...registry.subscriptions.map((entry) => entry.account),
+    ...Object.keys(registry.subscriptionPolicy?.accounts ?? {}),
+  ]);
+  return [...accounts].map((account) => ceilingViewForAccount(account, registry));
+}
+
+function printCeilingOverview(
+  registry: SubscriptionRegistry,
+  format: ReturnType<typeof resolveGlobalFlags>["format"],
+): void {
+  const accounts = allCeilingViews(registry);
+  const fallback = resolveEffectiveWeeklyCeiling("", registry);
+  const payload = {
+    configuredDefault: registry.subscriptionPolicy?.defaultAutoWeeklyCeiling ?? null,
+    fallback: {
+      effectiveWeeklyCeiling: fallback.value,
+      effectiveWeeklyCeilingPercent: Number((fallback.value * 100).toFixed(10)),
+      source: fallback.source,
+      hard: fallback.hard,
+    },
+    accounts,
+  };
+  if (format === "json") {
+    process.stdout.write(`${JSON.stringify(payload)}\n`);
+    return;
+  }
+  if (format === "quiet") {
+    process.stdout.write(
+      accounts
+        .map((entry) => `${entry.account}\t${entry.effectiveWeeklyCeilingPercent}%\n`)
+        .join(""),
+    );
+    return;
+  }
+  process.stdout.write(
+    `Registry default: ${renderCeilingValue(fallback.value)} (${fallback.source}; ` +
+      `${fallback.hard ? "hard" : "legacy soft"})\n`,
+  );
+  for (const account of accounts) {
+    process.stdout.write(renderCeilingView(account));
+  }
+}
+
+function handleSubscriptionCeilingShow(
+  subject: string | undefined,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): void {
+  const { format } = resolveGlobalFlags(command, config);
+  const registry = loadSubscriptionRegistry();
+  if (subject !== undefined) {
+    const resolved = requireCeilingSubject(subject, registry);
+    printCeilingPayload(ceilingViewForAccount(resolved.account, registry), format);
+    return;
+  }
+  printCeilingOverview(registry, format);
+}
+
+function handleSubscriptionCeilingSet(
+  subject: string,
+  ceiling: number,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): void {
+  const { format } = resolveGlobalFlags(command, config);
+  const registry = loadSubscriptionRegistry();
+  requireCeilingSubject(subject, registry);
+  const result = setSubscriptionAutoWeeklyCeiling(subject, ceiling);
+  if (!result) {
+    throw new SubscriptionUnknownError(subject.trim(), knownCeilingSubjects(registry));
+  }
+  printCeilingPayload(result, format);
+}
+
+function handleSubscriptionCeilingDefaultSet(
+  ceiling: number,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): void {
+  const { format } = resolveGlobalFlags(command, config);
+  const result = setDefaultSubscriptionAutoWeeklyCeiling(ceiling);
+  if (!result) {
+    throw new Error(
+      "Cannot set an automation weekly ceiling: subscription registry is absent or malformed",
+    );
+  }
+  printCeilingPayload(result, format);
+}
+
+function handleSubscriptionCeilingClear(
+  subject: string,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): void {
+  const { format } = resolveGlobalFlags(command, config);
+  const registry = loadSubscriptionRegistry();
+  requireCeilingSubject(subject, registry);
+  const result = clearSubscriptionAutoWeeklyCeiling(subject);
+  if (!result) {
+    throw new SubscriptionUnknownError(subject.trim(), knownCeilingSubjects(registry));
+  }
+  printCeilingPayload(result, format);
+}
+
+function handleSubscriptionCeilingDefaultClear(command: Command, config: ResolvedAcpxConfig): void {
+  const { format } = resolveGlobalFlags(command, config);
+  const result = clearDefaultSubscriptionAutoWeeklyCeiling();
+  if (!result) {
+    throw new Error(
+      "Cannot clear the automation weekly ceiling: subscription registry is absent or malformed",
+    );
+  }
+  printCeilingPayload(result, format);
 }
 
 export function formatPercent(window: SubscriptionUsage["fiveHour"]): string {
@@ -585,6 +844,57 @@ export function registerSubscriptionsCommand(parent: Command, config: ResolvedAc
     )
     .action(async function (this: Command) {
       await handleSubscriptionsUsage(this, config);
+    });
+
+  const ceilingCommand = subscriptionsCommand
+    .command("ceiling")
+    .description("Show or configure account-scoped automatic weekly ceilings");
+
+  ceilingCommand
+    .command("show")
+    .description("Show effective ceilings (optionally for one subscription/account)")
+    .argument("[subscription-or-account]", "profile:<id>, account:<id>, or an unambiguous bare id")
+    .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
+    .action(function (this: Command, subject?: string) {
+      handleSubscriptionCeilingShow(subject, this, config);
+    });
+
+  ceilingCommand
+    .command("set")
+    .description("Set a hard automatic weekly ceiling for one functional account")
+    .argument("<subscription-or-account>", "profile:<id>, account:<id>, or an unambiguous bare id")
+    .argument("<ceiling>", "Explicit percent (90%) or fraction (0.90/1.00)", parseAutoWeeklyCeiling)
+    .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
+    .action(function (this: Command, subject: string, ceiling: number) {
+      handleSubscriptionCeilingSet(subject, ceiling, this, config);
+    });
+
+  ceilingCommand
+    .command("set-default")
+    .description("Set the hard default for accounts without an override")
+    .argument("<ceiling>", "Explicit percent (90%) or fraction (0.90/1.00)", parseAutoWeeklyCeiling)
+    .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
+    .action(function (this: Command, ceiling: number) {
+      handleSubscriptionCeilingDefaultSet(ceiling, this, config);
+    });
+
+  ceilingCommand
+    .command("clear")
+    .description("Clear one account override and reveal the default/legacy fallback")
+    .argument("<subscription-or-account>", "profile:<id>, account:<id>, or an unambiguous bare id")
+    .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
+    .action(function (this: Command, subject: string) {
+      handleSubscriptionCeilingClear(subject, this, config);
+    });
+
+  ceilingCommand
+    .command("clear-default")
+    .description(
+      "Clear the configured default and return unoverridden accounts to legacy soft policy",
+    )
+    .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
+    .action(function (this: Command) {
+      handleSubscriptionCeilingDefaultClear(this, config);
     });
 
   subscriptionsCommand

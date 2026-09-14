@@ -61,6 +61,10 @@ test("W5 migration: v1-only registry writes v3 profiles, backup, and 0600 perms"
   await withRegistryFile(
     {
       default: "sub2",
+      subscriptionPolicy: {
+        defaultAutoWeeklyCeiling: 0.95,
+        accounts: { sub1: { autoWeeklyCeiling: 0.9, futurePolicy: "keep" } },
+      },
       subscriptions: [
         { id: "sub1", label: "One" },
         { id: "sub2", label: "Two" },
@@ -89,6 +93,10 @@ test("W5 migration: v1-only registry writes v3 profiles, backup, and 0600 perms"
       const migrated = await readRegistryJson(ctx.registryPath);
       assert.equal(migrated.version, 3);
       assert.equal("subscriptions" in migrated, false);
+      assert.deepEqual(migrated.subscriptionPolicy, {
+        defaultAutoWeeklyCeiling: 0.95,
+        accounts: { sub1: { autoWeeklyCeiling: 0.9, futurePolicy: "keep" } },
+      });
       assert.equal(await fileMode(ctx.registryPath), 0o600);
       assert.equal(await fileMode(`${ctx.registryPath}.pre-v3.bak`), 0o600);
 

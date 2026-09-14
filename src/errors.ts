@@ -1,4 +1,9 @@
-import type { OutputErrorAcpPayload, OutputErrorCode, OutputErrorOrigin } from "./types.js";
+import type {
+  AutomationCapacityReservedDetail,
+  OutputErrorAcpPayload,
+  OutputErrorCode,
+  OutputErrorOrigin,
+} from "./types.js";
 
 type AcpxErrorOptions = ErrorOptions & {
   outputCode?: OutputErrorCode;
@@ -280,6 +285,75 @@ export class AllSubscriptionsExhaustedError extends AcpxOperationalError {
       detailCode: "all-subscriptions-exhausted",
       origin: "runtime",
     });
+  }
+}
+
+/**
+ * An automatic turn reached an explicitly configured weekly reserve and no
+ * eligible account could take it. This is policy capacity, not vendor
+ * exhaustion; the turn is retryable after usage resets or policy changes.
+ */
+export class AutomationCapacityReservedError extends AcpxOperationalError {
+  readonly account: string;
+  readonly profile: string;
+  readonly effectiveWeeklyCeiling: number;
+  readonly automationCapacityReserved: AutomationCapacityReservedDetail;
+
+  constructor(params: {
+    account: string;
+    accountLabel: string;
+    profile: string;
+    effectiveWeeklyCeiling: number;
+    utilization: number;
+    lastCheckedAt: string;
+    reset?: string;
+    nextAutomationEligibleAt?: string;
+    nextEligibilityAccountId?: string;
+    nextEligibilityAccountLabel?: string;
+    nextEligibilitySource?: AutomationCapacityReservedDetail["nextEligibilitySource"];
+  }) {
+    const ceilingPercent = (params.effectiveWeeklyCeiling * 100).toFixed(1);
+    const utilizationPercent = (params.utilization * 100).toFixed(1);
+    const reset = params.reset ? ` Weekly capacity resets ${params.reset}.` : "";
+    super(
+      `Automatic work is parked before provider submission: account "${params.account}" ` +
+        `(profile "${params.profile}") is at ${utilizationPercent}% weekly utilization, ` +
+        `at or above its configured ${ceilingPercent}% automation ceiling, and no eligible ` +
+        `account switch completed.${reset} Pin the session manually to override the automation ` +
+        `reserve, or wait for eligible capacity.`,
+      {
+        outputCode: "RUNTIME",
+        detailCode: "automation-capacity-reserved",
+        origin: "runtime",
+        retryable: true,
+      },
+    );
+    this.account = params.account;
+    this.profile = params.profile;
+    this.effectiveWeeklyCeiling = params.effectiveWeeklyCeiling;
+    this.automationCapacityReserved = {
+      code: "automation-capacity-reserved",
+      accountId: params.account,
+      accountLabel: params.accountLabel,
+      weeklyPercentUsed: Number((params.utilization * 100).toFixed(10)),
+      effectiveWeeklyCeiling: params.effectiveWeeklyCeiling,
+      reservedPercent: Number(((1 - params.effectiveWeeklyCeiling) * 100).toFixed(10)),
+      providerSubmitted: false,
+      lastCheckedAt: params.lastCheckedAt,
+      ...(params.reset ? { weeklyResetAt: params.reset } : {}),
+      ...(params.nextAutomationEligibleAt
+        ? { nextAutomationEligibleAt: params.nextAutomationEligibleAt }
+        : {}),
+      ...(params.nextEligibilityAccountId
+        ? { nextEligibilityAccountId: params.nextEligibilityAccountId }
+        : {}),
+      ...(params.nextEligibilityAccountLabel
+        ? { nextEligibilityAccountLabel: params.nextEligibilityAccountLabel }
+        : {}),
+      ...(params.nextEligibilitySource
+        ? { nextEligibilitySource: params.nextEligibilitySource }
+        : {}),
+    };
   }
 }
 
