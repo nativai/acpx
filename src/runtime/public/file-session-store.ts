@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { openRecordOutbox, type DiskRecord } from "../../brick-outbox.js";
 import { hydrateSessionMessagesFromLog, messagesLogPath } from "../../session/messages-log.js";
 import { parseSessionRecord } from "../../session/persistence/parse.js";
 import { serializeSessionRecordForDisk } from "../../session/persistence/serialize.js";
@@ -62,6 +63,16 @@ class FileSessionStore implements AcpSessionStore {
     const persisted = serializeSessionRecordForDisk(record);
 
     const file = this.filePath(record.acpxRecordId);
+    const outbox = openRecordOutbox(record.metadata, this.sessionDir);
+    if (outbox) {
+      try {
+        const raw = persisted as DiskRecord;
+        outbox.saveRecord(raw);
+      } finally {
+        outbox.close();
+      }
+      return;
+    }
     // Per-call randomUUID: `${pid}.${Date.now()}` alone is NOT unique. Two saves
     // of the same record from this process in the same millisecond build the
     // identical temp path, so the first rename wins and the second hits ENOENT

@@ -43,5 +43,9 @@ if (isCliEntrypoint(process.argv)) {
     process.env.ACPX_QUEUE_OWNER_ARGS ??= queueOwnerArgOverride;
   }
 
-  void main(process.argv);
+  if (process.argv.length === 3 && process.argv[2] === "__brick-outbox-module") {
+    process.stdout.write(`${new URL("./brick-outbox.js", import.meta.url).href}\n`);
+  } else {
+    void main(process.argv);
+  }
 }

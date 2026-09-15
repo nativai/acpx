@@ -3,6 +3,7 @@ import { statSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { BrickOutbox, openRecordOutbox, type DiskRecord } from "../../brick-outbox.js";
 import { SessionNotFoundError, SessionResolutionError } from "../../errors.js";
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import type { SessionAcpxState, SessionRecord } from "../../types.js";
@@ -388,43 +389,84 @@ async function writeSessionRecordInternal(
 
     const sessionDir = sessionBaseDir();
     const logPath = messagesLogPath(sessionDir, record.acpxRecordId);
-    if (options.messagePersistence === "boundary") {
-      await writeMessagesLogBoundary(record, logPath);
-    } else {
-      await clearMissingMessagesLogPointerForWrite(record, logPath);
+    const ownedOutbox = outboxForRecord(record);
+    const writeLog = async (current?: DiskRecord) => {
+      if (current) {
+        mergeRecordMetadataForPersist(record, current.metadata);
+      }
+      if (options.messagePersistence === "boundary") {
+        await writeMessagesLogBoundary(record, logPath);
+      } else {
+        await clearMissingMessagesLogPointerForWrite(record, logPath);
+      }
+    };
+    try {
+      await guardedMessagesWrite(ownedOutbox, record, writeLog);
+
+      // The snake_case key policy is asserted INSIDE serializeSessionRecordForDisk
+      // (brick://48aca560) so test fixtures cannot bypass it; do not re-walk here.
+      const persistedRecord = serializeSessionRecordForDisk(record, { messages: "split-tail" });
+
+      const file = sessionFilePath(record.acpxRecordId);
+      // The temp name must be unique PER CALL, not per millisecond: two writes
+      // from this process in the same millisecond used to build the identical
+      // path, so the first rename won and the second hit ENOENT — turning a
+      // concurrent record write into a thrown error. Reachable on the normal
+      // mid-turn injection path (queue-owner-runtime drains the whole
+      // midTurnBuffer synchronously, so several injections start in one tick and
+      // race each other's recordPromptStart). Uniqueness, not serialization:
+      // this is a filename collision, and ordering here is deliberately free.
+      // Same shape already used by src/flows/store.ts.
+      // Compact JSON: parses identically everywhere, saves ~30-40% of bytes and
+      // stringify CPU on every checkpoint of a multi-MB record.
+      record.metadata = (
+        await persistRecordFile(file, persistedRecord as DiskRecord, ownedOutbox)
+      ).metadata;
+
+      const fileName = path.basename(file);
+      // Membership-immediate / scalar-throttled index update (W2.3). The
+      // privileged lifecycle path (close/favorite/name) always writes
+      // immediately — human-frequency and freshness-sensitive.
+      await updateSessionIndexForRecordWrite(sessionDir, toSessionIndexEntry(record, fileName), {
+        immediate: !options.preserveLifecycle,
+      });
+      rememberSessionMetadataBaseline(record);
+      rememberSessionModelBaseline(record);
+    } finally {
+      ownedOutbox?.close();
     }
-
-    // The snake_case key policy is asserted INSIDE serializeSessionRecordForDisk
-    // (brick://48aca560) so test fixtures cannot bypass it; do not re-walk here.
-    const persistedRecord = serializeSessionRecordForDisk(record, { messages: "split-tail" });
-
-    const file = sessionFilePath(record.acpxRecordId);
-    // The temp name must be unique PER CALL, not per millisecond: two writes
-    // from this process in the same millisecond used to build the identical
-    // path, so the first rename won and the second hit ENOENT — turning a
-    // concurrent record write into a thrown error. Reachable on the normal
-    // mid-turn injection path (queue-owner-runtime drains the whole
-    // midTurnBuffer synchronously, so several injections start in one tick and
-    // race each other's recordPromptStart). Uniqueness, not serialization:
-    // this is a filename collision, and ordering here is deliberately free.
-    // Same shape already used by src/flows/store.ts.
-    const tempFile = `${file}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
-    // Compact JSON: parses identically everywhere, saves ~30-40% of bytes and
-    // stringify CPU on every checkpoint of a multi-MB record.
-    const payload = JSON.stringify(persistedRecord);
-    await fs.writeFile(tempFile, `${payload}\n`, "utf8");
-    await fs.rename(tempFile, file);
-
-    const fileName = path.basename(file);
-    // Membership-immediate / scalar-throttled index update (W2.3). The
-    // privileged lifecycle path (close/favorite/name) always writes
-    // immediately — human-frequency and freshness-sensitive.
-    await updateSessionIndexForRecordWrite(sessionDir, toSessionIndexEntry(record, fileName), {
-      immediate: !options.preserveLifecycle,
-    });
-    rememberSessionMetadataBaseline(record);
-    rememberSessionModelBaseline(record);
   });
+}
+
+async function guardedMessagesWrite(
+  outbox: BrickOutbox | undefined,
+  record: SessionRecord,
+  action: (current?: DiskRecord) => Promise<void>,
+): Promise<void> {
+  if (!outbox) {
+    return await action();
+  }
+  await outbox.withOwnedSidecarWrite(
+    record.acpxRecordId,
+    serializeSessionRecordForDisk(record, { messages: "split-tail" }) as DiskRecord,
+    action,
+  );
+}
+function outboxForRecord(record: SessionRecord): BrickOutbox | undefined {
+  return openRecordOutbox(record.metadata, sessionBaseDir());
+}
+async function persistRecordFile(
+  file: string,
+  raw: DiskRecord,
+  outbox: BrickOutbox | undefined,
+): Promise<DiskRecord> {
+  if (outbox) {
+    return outbox.saveRecord(raw);
+  }
+  const temporary = `${file}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
+  await fs.writeFile(temporary, `${JSON.stringify(raw)}\n`, "utf8");
+  await fs.rename(temporary, file);
+  return raw;
 }
 
 async function writeMessagesLogBoundary(record: SessionRecord, logPath: string): Promise<void> {
@@ -877,7 +919,12 @@ async function hardDeleteSessionRecord(entry: SessionIndexEntry): Promise<void> 
     },
   ]);
 
-  await unlinkHardDeletedFiles(sessionDir, acpxRecordId, safeId);
+  const expected = record
+    ? (serializeSessionRecordForDisk(record) as DiskRecord)
+    : { acpx_record_id: acpxRecordId, acp_session_id: entry.acpSessionId };
+  await withCanonicalDeletion(sessionDir, expected, () =>
+    unlinkHardDeletedFiles(sessionDir, acpxRecordId, safeId),
+  );
   await rebuildSessionIndex(sessionDir, "template-rollback-delete").catch(() => {
     // best-effort cache rebuild; the record files are already gone
   });
@@ -1932,6 +1979,35 @@ function isBeforeCutoff(record: SessionRecord, cutoffIso: string | undefined): b
 }
 
 async function pruneSessionFiles(
+  record: SessionRecord,
+  sessionDir: string,
+  streamFilesBySafeId: Map<string, string[]>,
+  includeHistory: boolean,
+): Promise<number> {
+  return withCanonicalDeletion(
+    sessionDir,
+    serializeSessionRecordForDisk(record) as DiskRecord,
+    () => unlinkPrunedSessionFiles(record, sessionDir, streamFilesBySafeId, includeHistory),
+  );
+}
+
+async function withCanonicalDeletion<T>(
+  sessionDir: string,
+  expected: DiskRecord,
+  action: () => Promise<T>,
+): Promise<T> {
+  const outbox = openRecordOutbox(expected.metadata, sessionDir);
+  if (!outbox) {
+    return action();
+  }
+  try {
+    return await outbox.withRecordDeletion(String(expected.acpx_record_id), expected, action);
+  } finally {
+    outbox.close();
+  }
+}
+
+async function unlinkPrunedSessionFiles(
   record: SessionRecord,
   sessionDir: string,
   streamFilesBySafeId: Map<string, string[]>,

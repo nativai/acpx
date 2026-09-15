@@ -845,6 +845,7 @@ function buildSessionStartOptions(params: {
 }): Parameters<SessionModule["createSession"]>[0] {
   return {
     agentCommand: params.agent.agentCommand,
+    recordId: params.flags.recordId,
     agentName: params.agent.agentName,
     cwd: params.agent.cwd,
     name: params.flags.name,
@@ -2740,6 +2741,7 @@ async function handleSessionsNewFromTemplate(
     explicitAgentName,
     {
       from: resolvedSource.acpxRecordId,
+      recordId: flags.recordId,
       name: flags.name,
       // Mark this child as a template-spawn (vs a plain fork): a normal
       // `sessions copy`/`fork` writes the same parent_session_id +
@@ -2758,7 +2760,7 @@ async function handleSessionsNewFromTemplate(
     true,
   );
   const autoPromptText = resolveTemplateAutoPrompt(flags, source);
-  if (!autoPromptText) {
+  if (!autoPromptText || created.metadata?.spawn_state === "pending") {
     return;
   }
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
@@ -3020,6 +3022,7 @@ async function runSessionCopy(
   const [{ createSession }, { printCopiedSessionByFormat, printCreatedSessionBanner }] =
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
   const created = await createSession({
+    recordId: flags.recordId,
     agentCommand: source.agentCommand,
     agentName: source.agentName ?? resolveAgentNameFromCommand(source.agentCommand, config.agents),
     cwd: resolveCopyDestinationCwd(command, globalFlags, source),

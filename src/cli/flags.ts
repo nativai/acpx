@@ -94,6 +94,7 @@ export type ExecFlags = {
 };
 
 export type SessionsNewFlags = {
+  recordId?: string;
   name?: string;
   resumeSession?: string;
   parentId?: string;
@@ -110,6 +111,7 @@ export type SessionsNewFlags = {
 };
 
 export type SessionsCopyFlags = {
+  recordId?: string;
   from: string;
   atIndex?: number;
   name?: string;

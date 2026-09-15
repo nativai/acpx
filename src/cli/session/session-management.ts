@@ -11,6 +11,7 @@ import {
   resolveEffectiveForkIndex,
 } from "../../acp/harness-capabilities.js";
 import { withInterrupt, withTimeout } from "../../async-control.js";
+import { BrickOutbox } from "../../brick-outbox.js";
 import { bindDefaultAccountToSessionOptionsAsync } from "../../runtime/engine/default-account-binding.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
 import { persistSessionOptions } from "../../runtime/engine/session-options.js";
@@ -121,6 +122,18 @@ async function createSessionRecordWithClient(
   options: SessionCreateOptions,
 ): Promise<SessionRecord> {
   const cwd = absolutePath(options.cwd);
+  if (options.recordId) {
+    const outbox = new BrickOutbox();
+    try {
+      if (outbox.readRecord(options.recordId)) {
+        throw new Error(
+          "record-id destination already exists; refusing to create another ACP session",
+        );
+      }
+    } finally {
+      outbox.close();
+    }
+  }
   await withTimeout(client.start(), options.timeoutMs);
   let sessionId: string;
   let acpSessionId: string;
@@ -207,7 +220,7 @@ async function createSessionRecordWithClient(
   }
   const record: SessionRecord = {
     schema: "acpx.session.v1",
-    acpxRecordId: sessionId,
+    acpxRecordId: options.recordId ?? sessionId,
     acpSessionId,
     agentSessionId,
     agentName: options.agentName,
@@ -218,7 +231,7 @@ async function createSessionRecordWithClient(
     lastUsedAt: now,
     lastSeq: 0,
     lastRequestId: undefined,
-    eventLog: defaultSessionEventLog(sessionId),
+    eventLog: defaultSessionEventLog(options.recordId ?? sessionId),
     closed: false,
     closedAt: undefined,
     pid: lifecycle.running ? lifecycle.pid : undefined,
@@ -255,6 +268,10 @@ async function createSessionRecordWithClient(
       ? { metadata: { ...options.metadata } }
       : {}),
   };
+
+  if (record.metadata?.spawn_key) {
+    record.metadata.spawn_state = "pending";
+  }
 
   // NOTE: the config-dir channel (brick fa2e54ec) is written by
   // applyLifecycleSnapshotToRecord itself, from the snapshot — deliberately NOT
