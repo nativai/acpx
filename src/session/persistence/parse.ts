@@ -579,6 +579,8 @@ function assignParsedSessionOptions(state: SessionAcpxState, raw: unknown): void
   const parsedSessionOptions: NonNullable<SessionAcpxState["session_options"]> = {};
   assignSessionOptionModel(parsedSessionOptions, sessionOptions.model);
   assignSessionOptionAllowedTools(parsedSessionOptions, sessionOptions.allowed_tools);
+  assignSessionOptionDisallowedTools(parsedSessionOptions, sessionOptions.disallowed_tools);
+  assignSessionOptionSkills(parsedSessionOptions, sessionOptions.skills);
   assignSessionOptionMaxTurns(parsedSessionOptions, sessionOptions.max_turns);
   assignSessionOptionSystemPrompt(parsedSessionOptions, sessionOptions.system_prompt);
   assignSessionOptionSubscription(parsedSessionOptions, sessionOptions.subscription);
@@ -1017,6 +1019,24 @@ function assignSessionOptionAllowedTools(
 ): void {
   if (isStringArray(value)) {
     options.allowed_tools = [...value];
+  }
+}
+
+function assignSessionOptionDisallowedTools(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+  value: unknown,
+): void {
+  if (isStringArray(value)) {
+    options.disallowed_tools = [...value];
+  }
+}
+
+function assignSessionOptionSkills(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+  value: unknown,
+): void {
+  if (isStringArray(value)) {
+    options.skills = [...value];
   }
 }
 
