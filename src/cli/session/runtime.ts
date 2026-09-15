@@ -53,7 +53,7 @@ import {
   applyConversation,
   applyLifecycleSnapshotToRecord,
 } from "../../runtime/engine/lifecycle.js";
-import { runPromptTurn } from "../../runtime/engine/prompt-turn.js";
+import { runPromptTurn, steeredFromMeta } from "../../runtime/engine/prompt-turn.js";
 import { connectAndLoadSession } from "../../runtime/engine/reconnect.js";
 import {
   mergeSessionOptions,
@@ -75,6 +75,7 @@ import { withDefaultModelForNewSession } from "../../session/default-model.js";
 import {
   buildDeliveryEvent,
   hasCompletedDeliveryFor,
+  zeroAgentOutputWarning,
   type DeliveryEventError,
   type DeliveryPhase,
   type DeliveryStopReason,
@@ -268,6 +269,15 @@ function toPromptResult(
 type DeliveryContext = {
   messageId: string;
   requestId: string;
+  /**
+   * brick ddd76838 — the global session/update frame count at the moment this
+   * delivery's `accepted` event was written. Read back at terminal time to
+   * detect a delivery whose ENTIRE window observed zero frames. In-memory
+   * only — never serialized; the terminal's `warning` field is the durable
+   * residue. `undefined` = no accepted event was seen for this context (the
+   * window is unknown and the zero-output detector must stay silent).
+   */
+  framesAtStart?: number;
 };
 
 type AbsorbedInjectedDelivery = {
@@ -1744,6 +1754,11 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   const absorbedInjectedDeliveries: AbsorbedInjectedDelivery[] = [];
   registerAbsorbedDeliveries(record.acpxRecordId, absorbedInjectedDeliveries);
   let sawAcpMessage = false;
+  // brick ddd76838 — total `session/update` frames observed on this client since
+  // connect, counted in the onSessionUpdate tap below. Never reset: each
+  // delivery's observation window is the DELTA between its `accepted` snapshot
+  // (DeliveryContext.framesAtStart) and the count at its terminal.
+  let sessionUpdateFrameCount = 0;
   let eventWriterClosed = false;
   const acceptedDeliveryKeys = new Set<string>();
   const terminalDeliveryKeys = new Set<string>();
@@ -1767,6 +1782,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     params: {
       stopReason?: DeliveryStopReason;
       error?: DeliveryEventError;
+      /** brick ddd76838 — forward the adapter's steer-ack flag onto the terminal. */
+      steered?: boolean;
       terminal?: boolean;
     } = {},
   ): Promise<void> => {
@@ -1786,6 +1803,24 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     ) {
       return;
     }
+    // brick ddd76838 — an `accepted` event OPENS this delivery's observation
+    // window: snapshot the global frame count. The terminal below reads the
+    // delta. (Written after the skip check so a suppressed duplicate accepted
+    // does not rewind an already-open window.)
+    if (phase === "accepted") {
+      context.framesAtStart = sessionUpdateFrameCount;
+    }
+    // Zero-output detection — the SINGLE decision every terminal path shares
+    // (zeroAgentOutputWarning in delivery-events.ts; full narrowness rationale
+    // lives there). A `done` terminal for a genuine completion whose window
+    // observed ZERO session/update frames is the 5.5 h wedge signature.
+    const warning = zeroAgentOutputWarning({
+      terminal,
+      phase,
+      stopReason: params.stopReason,
+      framesAtStart: context.framesAtStart,
+      framesAtTerminal: sessionUpdateFrameCount,
+    });
     // C2 (G2): a late-settling injected IIFE writes its terminal after the turn
     // finalized and closed the per-turn writer. Rather than swallow that write
     // (the accepted-forever bug), fall back to a fresh standalone writer — the
@@ -1798,6 +1833,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         phase,
         stopReason: params.stopReason,
         error: params.error,
+        ...(params.steered ? { steered: true } : {}),
+        ...(warning ? { warning } : {}),
       }),
     );
     markDeliveryEvent({
@@ -2025,7 +2062,12 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     await appendDeliveryTerminal(
       injectedDeliveryContext,
       deliveryPhaseForStopReason(injectedResponse.stopReason),
-      { stopReason: toDeliveryStopReason(injectedResponse.stopReason) },
+      {
+        stopReason: toDeliveryStopReason(injectedResponse.stopReason),
+        // brick ddd76838 — a pi steer-ack (`end_turn` + `_meta.piAcp.steered`)
+        // is recorded on the delivery record, not reduced to a bare end_turn.
+        ...(steeredFromMeta(injectedResponse._meta) ? { steered: true } : {}),
+      },
     );
     markAbsorbedDeliveryTerminalWritten(absorbedDelivery);
     sendInjectedResultIfWaiting(injectedTask, injectedResponse);
@@ -2355,6 +2397,11 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     },
     // eslint-disable-next-line complexity -- fork integration handler; intentionally over budget, refactor would risk verified merge semantics
     onSessionUpdate: (notification) => {
+      // brick ddd76838 — every observed session/update frame counts toward the
+      // delivery windows opened since connect. Incremented BEFORE anything else
+      // so even a frame this handler later drops (turnAbandoned) still proves
+      // "the delivery was not silent".
+      sessionUpdateFrameCount += 1;
       // C1: the watchdog listens on the live session-update tap. The end-of-turn
       // marker arriving here (during the main prompt's await) arms the response
       // bound; nothing else in this handler changes for the common path.
@@ -3005,6 +3052,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
           deliveryPhaseForStopReason(terminalStopReason),
           {
             stopReason: toDeliveryStopReason(terminalStopReason),
+            // brick ddd76838 — forward the adapter's steer-ack flag so the
+            // delivery record says "absorbed steer", not a bare end_turn.
+            ...(response.steered ? { steered: true } : {}),
             ...(turnErrorForTerminal
               ? { error: { code: 0, message: turnErrorForTerminal, detailCode: "" } }
               : {}),

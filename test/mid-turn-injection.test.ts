@@ -824,6 +824,11 @@ async function runCodexNoWaitInjectionStaysFireAndForgetScenario(): Promise<void
             phase: "done",
             stopReason: "end_turn",
             error: { code: 0, message: "", detailCode: "" },
+            // brick ddd76838 — this scenario fires no session/update frames, so
+            // the main delivery's window observed zero: the warning is expected
+            // here (the mock injected prompt is a different messageId whose own
+            // terminal carries stopReason null by design and never warns).
+            warning: "completed with no agent output",
           },
         ],
       );
@@ -1465,6 +1470,10 @@ test("mid-turn prompt injection threads messageId and emits delivery events", as
             phase: "done",
             stopReason: "end_turn",
             error: { code: 0, message: "", detailCode: "" },
+            // brick ddd76838 — no session/update frames fire in this scenario, so
+            // BOTH done terminals observed zero-frame windows: the warnings are
+            // expected (the overlapping-window rule under-counts, never over-counts).
+            warning: "completed with no agent output",
           },
           {
             messageId: mainMessageId,
@@ -1472,6 +1481,7 @@ test("mid-turn prompt injection threads messageId and emits delivery events", as
             phase: "done",
             stopReason: "end_turn",
             error: { code: 0, message: "", detailCode: "" },
+            warning: "completed with no agent output",
           },
         ],
       );

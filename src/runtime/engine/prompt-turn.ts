@@ -43,6 +43,23 @@ function turnErrorFromMeta(meta: unknown): string | undefined {
 }
 
 /**
+ * brick ddd76838 — the STEER-ACK the adapter reports OUT OF BAND.
+ *
+ * The nativai `pi-acp` fork acks a mid-turn steer with an instant `end_turn`
+ * PLUS `_meta.piAcp.steered` (the machine contract that prevents auto-resends).
+ * Without reading that flag here, the delivery terminal records a bare
+ * `end_turn` and an observer cannot tell an absorbed steer from a completed
+ * turn of its own. Same shape and discipline as {@link turnErrorFromMeta}:
+ * absent / ill-typed ⇒ `false`, never a substituted value.
+ */
+export function steeredFromMeta(meta: unknown): boolean {
+  if (!meta || typeof meta !== "object") {
+    return false;
+  }
+  return (meta as { piAcp?: { steered?: unknown } }).piAcp?.steered === true;
+}
+
+/**
  * Wait for late `session/update` notifications to go quiet, best effort.
  *
  * Both legs of {@link runPromptTurn} drain identically — the success leg keeps its
@@ -73,6 +90,7 @@ export async function runPromptTurn(params: {
   stopReason: RunPromptResult["stopReason"];
   source: "rpc" | "session";
   turnError?: string;
+  steered?: boolean;
 }> {
   try {
     const promptPromise = params.client.prompt(params.sessionId, params.prompt, {
@@ -82,10 +100,12 @@ export async function runPromptTurn(params: {
     const response = await withTimeout(promptPromise, params.timeoutMs);
     await drainLateSessionUpdates(params.client);
     const turnError = turnErrorFromMeta(response._meta);
+    const steered = steeredFromMeta(response._meta);
     return {
       stopReason: response.stopReason,
       source: "rpc",
       ...(turnError !== undefined ? { turnError } : {}),
+      ...(steered ? { steered: true } : {}),
     };
   } catch (error) {
     if (!(error instanceof TimeoutError) || !params.promptMessageId) {
