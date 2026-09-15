@@ -15,6 +15,7 @@ import {
   trySubmitToRunningOwner,
 } from "../src/cli/queue/ipc.js";
 import { QueueConnectionError, QueueProtocolError } from "../src/errors.js";
+import type { DepthProjection } from "../src/session/depth-projection.js";
 import type { OutputFormatter } from "../src/types.js";
 import {
   cleanupOwnerArtifacts,
@@ -595,6 +596,10 @@ test("SessionQueueOwner emits typed invalid request payload errors", async () =>
         ({
           configOptions: [],
         }) as SetSessionConfigOptionResponse,
+      setDepth: async (requested: string): Promise<DepthProjection> => ({
+        kind: "send-nothing",
+        requested,
+      }),
       queryActiveTurn: () => false,
     });
 
@@ -644,6 +649,10 @@ test("SessionQueueOwner emits typed shutdown errors for pending prompts", async 
         ({
           configOptions: [],
         }) as SetSessionConfigOptionResponse,
+      setDepth: async (requested: string): Promise<DepthProjection> => ({
+        kind: "send-nothing",
+        requested,
+      }),
       queryActiveTurn: () => false,
     });
 
@@ -714,6 +723,10 @@ test("SessionQueueOwner rejects prompts when queue depth exceeds the configured 
           ({
             configOptions: [],
           }) as SetSessionConfigOptionResponse,
+        setDepth: async (requested: string): Promise<DepthProjection> => ({
+          kind: "send-nothing",
+          requested,
+        }),
         queryActiveTurn: () => false,
       },
       {

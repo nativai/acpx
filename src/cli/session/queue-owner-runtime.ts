@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { AcpClient } from "../../acp/client.js";
 import { formatErrorMessage } from "../../acp/error-normalization.js";
+import { harnessIdForAgentCommand } from "../../acp/harness-capabilities.js";
 import { supportsMidTurnPromptInjection } from "../../acp/mid-turn-injection-support.js";
 import { withTimeout } from "../../async-control.js";
 import { SessionClosedError } from "../../errors.js";
@@ -15,7 +16,9 @@ import {
   mergeSessionOptions,
   sessionOptionsFromRecord,
 } from "../../runtime/engine/session-options.js";
+import { applyDepthAsMode } from "../../session/depth-application.js";
 import { SessionEventWriter } from "../../session/events.js";
+import { advertisedDepthLadderFromConfigOptions } from "../../session/model-application.js";
 import { outputStyleChangePending } from "../../session/output-style.js";
 import {
   ownerOptionsToInput,
@@ -810,6 +813,26 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         },
         setSessionConfigOption: async (configId: string, value: string, timeoutMs?: number) => {
           return await turnController.setSessionConfigOption(configId, value, timeoutMs);
+        },
+        setDepth: async (requested: string, timeoutMs?: number) => {
+          const record = await resolveSessionRecord(options.sessionId);
+          // The LIVE advertisement is the only current source for the depth ladder:
+          // `latestConfigOptions` is folded forward on every pushed
+          // `config_option_update` (model changes included), so a session re-pinned
+          // to another model projects onto THAT model's ladder — the record's
+          // creation snapshot would project onto a stale one (brick a3c65f0f).
+          const modes = advertisedDepthLadderFromConfigOptions(
+            sharedClient.getAdvertisedConfigOptions(),
+          );
+          return await applyDepthAsMode({
+            client: sharedClient,
+            sessionId: record.acpSessionId,
+            requested,
+            modes,
+            harness: harnessIdForAgentCommand(record.agentCommand),
+            timeoutMs,
+            verbose: options.verbose,
+          });
         },
         queryActiveTurn: () => turnController.hasActiveTurn(),
       },

@@ -2414,6 +2414,22 @@ export class AcpClient {
     }
   }
 
+  /**
+   * The CURRENT config-option advertisement of the live session — what the adapter
+   * last advertised at `session/new` and in every pushed `config_option_update` since
+   * (a `session/set_model` refresh arrives ONLY as that push; the response body is
+   * empty on the pi fork, measured 2026-09-13).
+   *
+   * This is where a live DEPTH projection must read its ladder: for a `mode`
+   * harness the `thought_level` select in THIS advertisement is the CURRENT model's
+   * depth ladder, whereas the `session/new` `modes` block describes whichever model
+   * was default at creation. `undefined` means the adapter advertised nothing (or
+   * only an empty list) — callers record an honest outcome, never a guessed ladder.
+   */
+  getAdvertisedConfigOptions(): SessionConfigOption[] | undefined {
+    return this.latestConfigOptions;
+  }
+
   async setSessionConfigOption(
     sessionId: string,
     configId: string,

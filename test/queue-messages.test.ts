@@ -660,3 +660,111 @@ test("parseQueueOwnerMessage rejects invalid structured owner message payloads",
     null,
   );
 });
+
+// ── brick a3c65f0f (TE red): the CLIENT-side parse of a set_depth_result ─────
+//
+// THE GAP THIS CLOSES: the first deploy shipped the owner's set_depth emitter
+// without this parser. Every socket-level test asserted the bytes the OWNER
+// writes and stayed green, while the CLIENT-side parse (parseQueueOwnerMessage,
+// the queue every try*OnRunningOwner actually reads) failed the reply as
+// malformed → -32603 "Queue owner sent malformed message" → the header 502'd on
+// exactly the normally-used case (a live owner). The wire and the parse layer
+// are two surfaces; a test on one says nothing about the other.
+
+test("parseQueueOwnerMessage accepts a set_depth_result with a full projection", () => {
+  assert.deepEqual(
+    parseQueueOwnerMessage({
+      type: "set_depth_result",
+      requestId: "req-depth",
+      ownerGeneration: 4,
+      projection: {
+        kind: "projected",
+        requested: "max",
+        value: "high",
+        appliedId: "high",
+        reason:
+          '"max" is not on this model\'s ladder (low, high) — projected by position to "high"',
+      },
+    }),
+    {
+      type: "set_depth_result",
+      requestId: "req-depth",
+      ownerGeneration: 4,
+      projection: {
+        kind: "projected",
+        requested: "max",
+        value: "high",
+        appliedId: "high",
+        reason:
+          '"max" is not on this model\'s ladder (low, high) — projected by position to "high"',
+      },
+    },
+  );
+});
+
+test("parseQueueOwnerMessage accepts a minimal set_depth_result — optional fields are omitted, not invented", () => {
+  // A projection that sent nothing (send-nothing / unavailable) carries only
+  // kind + requested. The parser must not fabricate value/appliedId/reason.
+  assert.deepEqual(
+    parseQueueOwnerMessage({
+      type: "set_depth_result",
+      requestId: "req-depth-min",
+      projection: { kind: "send-nothing", requested: "default" },
+    }),
+    {
+      type: "set_depth_result",
+      requestId: "req-depth-min",
+      ownerGeneration: undefined,
+      projection: { kind: "send-nothing", requested: "default" },
+    },
+  );
+});
+
+test("parseQueueOwnerMessage degrades on a malformed set_depth_result — null, never a throw", () => {
+  // No projection at all.
+  assert.equal(
+    parseQueueOwnerMessage({ type: "set_depth_result", requestId: "req-depth-bad" }),
+    null,
+  );
+  // Missing the required core (kind / requested).
+  assert.equal(
+    parseQueueOwnerMessage({
+      type: "set_depth_result",
+      requestId: "req-depth-bad",
+      projection: { requested: "max" },
+    }),
+    null,
+  );
+  assert.equal(
+    parseQueueOwnerMessage({
+      type: "set_depth_result",
+      requestId: "req-depth-bad",
+      projection: { kind: 7, requested: "max" },
+    }),
+    null,
+  );
+  // Non-string optional fields are DROPPED, not fatal.
+  assert.deepEqual(
+    parseQueueOwnerMessage({
+      type: "set_depth_result",
+      requestId: "req-depth-partial",
+      projection: { kind: "exact", requested: "low", value: 42, reason: false },
+    }),
+    {
+      type: "set_depth_result",
+      requestId: "req-depth-partial",
+      ownerGeneration: undefined,
+      projection: { kind: "exact", requested: "low" },
+    },
+  );
+});
+
+test("parseQueueOwnerMessage degrades on an UNKNOWN owner message type — the house pattern", () => {
+  // An owner newer than this client must produce null (the caller's
+  // malformed-message path), never a throw that escapes the read loop.
+  assert.equal(
+    parseQueueOwnerMessage({ type: "set_something_new_result", requestId: "req-future" }),
+    null,
+  );
+  assert.equal(parseQueueOwnerMessage({ requestId: "req-typeless" }), null);
+});

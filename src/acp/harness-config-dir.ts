@@ -13,6 +13,10 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
+import {
+  PI_ROUTING_EXTENSION_CODE,
+  PI_ROUTING_EXTENSION_FILENAME,
+} from "../config/pi-routing-extension-code.js";
 import { deriveBilling } from "../models/catalogue.js";
 import {
   defaultCatalogueCachePath,
@@ -1278,7 +1282,8 @@ export function reportHarnessConfigDir(
 /** What was written, so a caller can log or evidence it without re-deriving. */
 /** One pi extension acpx copied into a session's config dir, and where it came from. */
 export interface SeededPiExtension {
-  /** The file or directory in the BOX-level pi extensions dir. */
+  /** The file or directory in the BOX-level pi extensions dir — or, for an
+   *  acpx built-in, a non-path description of where the code lives. */
   source: string;
   /** The copy under this spawn's provisioned `extensions/` — what pi actually reads. */
   target: string;
@@ -1496,6 +1501,7 @@ function writePiConfigDir(dir: string, input: HarnessConfigDirInput): HarnessCon
   );
   writePiStallPolicy(dir, files);
   const piExtensions = seedPiExtensions(dir, boxAgentDir, input.env, files);
+  writePiLiveRoutingExtension(dir, input.env, files, piExtensions);
   // KEEP pi's SESSION STORE IN THE BOX STORE (brick ac86eb34, corrected by
   // brick://cb214e48): the target is derived from `boxAgentDir` above, so it is
   // immune to the re-point on the next line — and to whatever an ancestor pi
@@ -1632,6 +1638,49 @@ function seedPiExtensions(
     seedPiExtensionEntry(source, target, name, files, seeded);
   }
   return seeded;
+}
+
+/**
+ * Seed the session's `extensions/` with acpx's own OpenRouter LIVE-ROUTING
+ * extension (brick 5fee840d), so a provider-routing policy saved while a pi
+ * session is running takes effect on its next request instead of waiting for a
+ * respawn. See {@link PI_ROUTING_EXTENSION_CODE} for the semantics and the
+ * fail-open contract.
+ *
+ * Honours the SAME kill switch as the box-extension seed
+ * (`ACPX_PI_EXTENSIONS_SEED=off`): one switch, one meaning — "do not put
+ * extensions into this pi session's config dir". A write failure warns and
+ * continues: the session keeps today's spawn-time routing, which is strictly
+ * better than a failed session creation.
+ */
+function writePiLiveRoutingExtension(
+  dir: string,
+  env: NodeJS.ProcessEnv,
+  files: string[],
+  seeded: SeededPiExtension[],
+): void {
+  if ((env.ACPX_PI_EXTENSIONS_SEED ?? "").trim().toLowerCase() === "off") {
+    return;
+  }
+  const target = join(dir, "extensions");
+  try {
+    mkdirSync(target, { recursive: true });
+    const path = join(target, PI_ROUTING_EXTENSION_FILENAME);
+    writeFileSync(path, PI_ROUTING_EXTENSION_CODE, { mode: 0o600 });
+    files.push(path);
+    // In the seeded list with a NON-path source: if pi refuses this file, the
+    // failure hint must still say what it is and where it comes from — the
+    // target is a generated path an operator has never seen.
+    seeded.push({
+      source: "acpx built-in (src/config/pi-routing-extension-code.ts)",
+      target: path,
+    });
+  } catch (error) {
+    warnPiExtensionsSeed(
+      "could not seed the acpx OpenRouter live-routing extension; continuing with spawn-time routing only",
+      error,
+    );
+  }
 }
 
 /**

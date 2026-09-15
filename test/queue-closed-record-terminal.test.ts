@@ -25,6 +25,7 @@ import {
   tryAcquireQueueOwnerLease,
 } from "../src/cli/queue/ipc.js";
 import { runQueuedTask } from "../src/cli/session/runtime.js";
+import type { DepthProjection } from "../src/session/depth-projection.js";
 import { sessionEventActivePath } from "../src/session/event-log.js";
 import { connectSocket, nextJsonLine, withTempHome } from "./queue-test-helpers.js";
 import { makeSessionRecord, writeSessionRecordFile } from "./runtime-test-helpers.js";
@@ -124,6 +125,10 @@ async function withClosedRecordOwner(
       setSessionMode: async () => {},
       setSessionModel: async () => {},
       setSessionConfigOption: async () => ({ configOptions: [] }),
+      setDepth: async (requested: string): Promise<DepthProjection> => ({
+        kind: "send-nothing",
+        requested,
+      }),
       queryActiveTurn: () => false,
     });
 

@@ -10,6 +10,7 @@ import {
   type DeliveryEventError,
   type DeliveryPhase,
 } from "../../session/delivery-events.js";
+import type { DepthProjection } from "../../session/depth-projection.js";
 import { sessionEventActivePath } from "../../session/event-log.js";
 import type {
   AcpClientOptions,
@@ -314,6 +315,9 @@ export type QueueOwnerControlHandlers = {
     value: string,
     timeoutMs?: number,
   ) => Promise<SetSessionConfigOptionResponse>;
+  /** Live thinking-depth change (brick a3c65f0f): project the canonical rung onto
+   *  the live advertisement and apply it. Returns the outcome for the CLI to record. */
+  setDepth: (requested: string, timeoutMs?: number) => Promise<DepthProjection>;
   queryActiveTurn: () => boolean;
 };
 
@@ -900,6 +904,18 @@ export class SessionQueueOwner {
             request.value,
             request.timeoutMs,
           ),
+        }),
+      });
+      return true;
+    }
+    if (request.type === "set_depth") {
+      this.handleControlRequest({
+        socket,
+        requestId: request.requestId,
+        run: async () => ({
+          type: "set_depth_result",
+          requestId: request.requestId,
+          projection: await this.controlHandlers.setDepth(request.requested, request.timeoutMs),
         }),
       });
       return true;

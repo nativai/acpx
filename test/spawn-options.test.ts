@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { resolveClaudeCodeExecutable } from "../src/acp/agent-command.js";
+import { resolveAcpxUiBaseUrl } from "../src/acp/auth-env.js";
 import { resolveAgentSessionCwd } from "../src/acp/client-process.js";
 import { buildAgentSpawnOptions, buildSpawnCommandOptions } from "../src/acp/client.js";
 import { buildTerminalSpawnOptions } from "../src/acp/terminal-manager.js";
@@ -35,14 +36,21 @@ test("buildAgentSpawnOptions never injects ACPX_SESSION_ID (URL-only identity co
   const previous = process.env.ACPX_SESSION_ID;
   delete process.env.ACPX_SESSION_ID;
   try {
-    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
-      acpxRecordId: "11111111-2222-3333-4444-555555555555",
+    // The base URL is a CONTROLLED INPUT here (rung 1 of the resolver ladder) —
+    // the emit side deliberately hardcodes no host (resolveAcpxUiBaseUrl reads
+    // $ACPX_UI_BASE_URL, then /proc/1/environ, then the hostmap cache), so the
+    // exact URL below pins the composition without depending on this rig's own
+    // resolution.
+    withAcpxUiBaseUrlEnv("https://atrium.devbox.nativai.de", () => {
+      const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        acpxRecordId: "11111111-2222-3333-4444-555555555555",
+      });
+      assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_SESSION_ID"), false);
+      assert.equal(
+        options.env.ACPX_SESSION_URL,
+        "https://atrium.devbox.nativai.de/?session=11111111-2222-3333-4444-555555555555",
+      );
     });
-    assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_SESSION_ID"), false);
-    assert.equal(
-      options.env.ACPX_SESSION_URL,
-      "https://acpx.devbox.nativai.de/?session=11111111-2222-3333-4444-555555555555",
-    );
   } finally {
     if (previous === undefined) {
       delete process.env.ACPX_SESSION_ID;
@@ -56,18 +64,20 @@ test("buildAgentSpawnOptions never injects ACPX_PARENT_SESSION_ID (URL-only iden
   const previous = process.env.ACPX_PARENT_SESSION_ID;
   delete process.env.ACPX_PARENT_SESSION_ID;
   try {
-    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
-      acpxRecordId: "child-id",
-      parentSessionId: "parent-id-abc",
+    withAcpxUiBaseUrlEnv("https://atrium.devbox.nativai.de", () => {
+      const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        acpxRecordId: "child-id",
+        parentSessionId: "parent-id-abc",
+      });
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(options.env, "ACPX_PARENT_SESSION_ID"),
+        false,
+      );
+      assert.equal(
+        options.env.ACPX_PARENT_SESSION_URL,
+        "https://atrium.devbox.nativai.de/?session=parent-id-abc",
+      );
     });
-    assert.equal(
-      Object.prototype.hasOwnProperty.call(options.env, "ACPX_PARENT_SESSION_ID"),
-      false,
-    );
-    assert.equal(
-      options.env.ACPX_PARENT_SESSION_URL,
-      "https://acpx.devbox.nativai.de/?session=parent-id-abc",
-    );
   } finally {
     if (previous === undefined) {
       delete process.env.ACPX_PARENT_SESSION_ID;
@@ -78,14 +88,16 @@ test("buildAgentSpawnOptions never injects ACPX_PARENT_SESSION_ID (URL-only iden
 });
 
 test("buildAgentSpawnOptions trims whitespace around parentSessionId into ACPX_PARENT_SESSION_URL", () => {
-  const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
-    acpxRecordId: "child-id",
-    parentSessionId: "  parent-id-xyz  ",
+  withAcpxUiBaseUrlEnv("https://atrium.devbox.nativai.de", () => {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+      parentSessionId: "  parent-id-xyz  ",
+    });
+    assert.equal(
+      options.env.ACPX_PARENT_SESSION_URL,
+      "https://atrium.devbox.nativai.de/?session=parent-id-xyz",
+    );
   });
-  assert.equal(
-    options.env.ACPX_PARENT_SESSION_URL,
-    "https://acpx.devbox.nativai.de/?session=parent-id-xyz",
-  );
 });
 
 function withAcpxUiBaseUrlEnv<T>(value: string | undefined, fn: () => T): T {
@@ -106,15 +118,38 @@ function withAcpxUiBaseUrlEnv<T>(value: string | undefined, fn: () => T): T {
   }
 }
 
-test("buildAgentSpawnOptions injects ACPX_SESSION_URL with default base URL when acpxRecordId is set", () => {
+/**
+ * The URL the production resolver ladder yields for THIS rig under the currently
+ * controlled env, composed exactly the way buildAgentSpawnOptions composes it.
+ *
+ * The emit side deliberately hardcodes NO host — resolveAcpxUiBaseUrl reads
+ * $ACPX_UI_BASE_URL (rung 1), then /proc/1/environ (rung 2), then acpx-ui's
+ * hostmap cache (rung 3), and returns UNDEFINED when every rung misses (which is
+ * an answer, not a failure: the caller must omit the URL rather than invent a
+ * host). So a test that leaves rung 1 unset cannot assert a host LITERAL — it
+ * asserts against the same resolver the code uses, pinning the exact
+ * composition (`<base>/?session=<trimmed id>`) on any rig. Returns undefined
+ * when nothing resolves; callers then assert the URL var is ABSENT.
+ */
+function expectedSessionUrl(sessionId: string): string | undefined {
+  const base = resolveAcpxUiBaseUrl(process.env);
+  return base === undefined ? undefined : `${base}/?session=${sessionId}`;
+}
+
+test("buildAgentSpawnOptions composes ACPX_SESSION_URL from the box's resolved base URL when acpxRecordId is set", () => {
   withAcpxUiBaseUrlEnv(undefined, () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
       acpxRecordId: "11111111-2222-3333-4444-555555555555",
     });
-    assert.equal(
-      options.env.ACPX_SESSION_URL,
-      "https://acpx.devbox.nativai.de/?session=11111111-2222-3333-4444-555555555555",
-    );
+    // With rung 1 unset, the emit side falls through to the box ladder (rung 2
+    // /proc/1/environ, rung 3 hostmap cache) — it hardcodes NO host, and when no
+    // rung resolves it must OMIT the URL rather than invent one.
+    const expected = expectedSessionUrl("11111111-2222-3333-4444-555555555555");
+    if (expected === undefined) {
+      assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_SESSION_URL"), false);
+    } else {
+      assert.equal(options.env.ACPX_SESSION_URL, expected);
+    }
   });
 });
 
@@ -141,10 +176,15 @@ test("buildAgentSpawnOptions injects ACPX_PARENT_SESSION_URL when parentSessionI
       acpxRecordId: "child-id",
       parentSessionId: "parent-id-abc",
     });
-    assert.equal(
-      options.env.ACPX_PARENT_SESSION_URL,
-      "https://acpx.devbox.nativai.de/?session=parent-id-abc",
-    );
+    const expected = expectedSessionUrl("parent-id-abc");
+    if (expected === undefined) {
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(options.env, "ACPX_PARENT_SESSION_URL"),
+        false,
+      );
+    } else {
+      assert.equal(options.env.ACPX_PARENT_SESSION_URL, expected);
+    }
   });
 });
 
@@ -206,20 +246,30 @@ test("buildAgentSpawnOptions normalizes a trailing slash on ACPX_UI_BASE_URL", (
   });
 });
 
-test("buildAgentSpawnOptions falls through to default when ACPX_UI_BASE_URL is empty/whitespace", () => {
-  withAcpxUiBaseUrlEnv("   ", () => {
-    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
-      acpxRecordId: "child-id",
-    });
-    assert.equal(options.env.ACPX_SESSION_URL, "https://acpx.devbox.nativai.de/?session=child-id");
-  });
+test("buildAgentSpawnOptions falls through to the box ladder when ACPX_UI_BASE_URL is empty/whitespace", () => {
+  // The unset-env answer is what blank values must fall through to. It is NOT a
+  // host literal — the resolver ladder decides it per rig — so it is computed
+  // from the same resolver the emit side uses (undefined when nothing resolves).
+  const unsetUrl = withAcpxUiBaseUrlEnv(
+    undefined,
+    () =>
+      buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        acpxRecordId: "child-id",
+      }).env.ACPX_SESSION_URL,
+  );
 
-  withAcpxUiBaseUrlEnv("", () => {
-    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
-      acpxRecordId: "child-id",
+  for (const blank of ["   ", ""]) {
+    withAcpxUiBaseUrlEnv(blank, () => {
+      const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        acpxRecordId: "child-id",
+      });
+      if (unsetUrl === undefined) {
+        assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_SESSION_URL"), false);
+      } else {
+        assert.equal(options.env.ACPX_SESSION_URL, unsetUrl);
+      }
     });
-    assert.equal(options.env.ACPX_SESSION_URL, "https://acpx.devbox.nativai.de/?session=child-id");
-  });
+  }
 });
 
 test("buildAgentSpawnOptions reflects trimmed UUIDs in URL vars", () => {
@@ -228,11 +278,8 @@ test("buildAgentSpawnOptions reflects trimmed UUIDs in URL vars", () => {
       acpxRecordId: "  child-id  ",
       parentSessionId: "  parent-id-xyz  ",
     });
-    assert.equal(options.env.ACPX_SESSION_URL, "https://acpx.devbox.nativai.de/?session=child-id");
-    assert.equal(
-      options.env.ACPX_PARENT_SESSION_URL,
-      "https://acpx.devbox.nativai.de/?session=parent-id-xyz",
-    );
+    assert.equal(options.env.ACPX_SESSION_URL, expectedSessionUrl("child-id"));
+    assert.equal(options.env.ACPX_PARENT_SESSION_URL, expectedSessionUrl("parent-id-xyz"));
   });
 });
 
@@ -252,14 +299,8 @@ test("buildAgentSpawnOptions: URL is the only identity surface — no _ID vars e
         Object.prototype.hasOwnProperty.call(options.env, "ACPX_PARENT_SESSION_ID"),
         false,
       );
-      assert.equal(
-        options.env.ACPX_SESSION_URL,
-        "https://acpx.devbox.nativai.de/?session=child-id",
-      );
-      assert.equal(
-        options.env.ACPX_PARENT_SESSION_URL,
-        "https://acpx.devbox.nativai.de/?session=parent-id",
-      );
+      assert.equal(options.env.ACPX_SESSION_URL, expectedSessionUrl("child-id"));
+      assert.equal(options.env.ACPX_PARENT_SESSION_URL, expectedSessionUrl("parent-id"));
     });
   } finally {
     if (previousSessionId === undefined) {
@@ -469,14 +510,8 @@ test("buildAgentSpawnOptions: ACPX_TASK_FOLDER coexists with URL session + paren
         Object.prototype.hasOwnProperty.call(options.env, "ACPX_PARENT_SESSION_ID"),
         false,
       );
-      assert.equal(
-        options.env.ACPX_SESSION_URL,
-        "https://acpx.devbox.nativai.de/?session=child-id",
-      );
-      assert.equal(
-        options.env.ACPX_PARENT_SESSION_URL,
-        "https://acpx.devbox.nativai.de/?session=parent-id",
-      );
+      assert.equal(options.env.ACPX_SESSION_URL, expectedSessionUrl("child-id"));
+      assert.equal(options.env.ACPX_PARENT_SESSION_URL, expectedSessionUrl("parent-id"));
       assert.equal(options.env.ACPX_TASK_FOLDER, "/task/abs");
     });
   } finally {
@@ -560,7 +595,7 @@ test("buildAgentSpawnOptions: ACPX_AGENT_FOLDER coexists with task folder + URL 
     });
     assert.equal(options.env.ACPX_TASK_FOLDER, "/task/abs");
     assert.equal(options.env.ACPX_AGENT_FOLDER, "/task/abs/agents/child-id");
-    assert.equal(options.env.ACPX_SESSION_URL, "https://acpx.devbox.nativai.de/?session=child-id");
+    assert.equal(options.env.ACPX_SESSION_URL, expectedSessionUrl("child-id"));
   });
 });
 

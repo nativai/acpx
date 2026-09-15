@@ -303,6 +303,50 @@ export function modesAfterModelApply(
   };
 }
 
+/**
+ * The CURRENT model's depth ladder, read off a live advertisement (brick a3c65f0f).
+ *
+ * {@link modesAfterModelApply} answers the CREATE-time question: which ladder should
+ * a `--reasoning-effort` request project onto, given the `session/new` snapshot plus
+ * the post-model re-read. THIS function answers the LIVE question: a `set effort`
+ * on an already-running session has no `session/new` snapshot of its own — and the
+ * snapshot it could reach (the record's) describes whichever model was default at
+ * creation, not the model the session runs now (measured 2026-09-13: a session
+ * re-pinned to `openrouter/z-ai/glm-5.3-flash` advertises `thought_level` values
+ * `["low","high"]` while its `session/new` modes said `off…high` for the default
+ * model — projecting `max` onto the stale ladder and the live one both land on
+ * `high` here, but they diverge for any model whose default ladder differs from its
+ * own). The live advertisement — `AcpClient.getAdvertisedConfigOptions()`, kept
+ * current by every pushed `config_option_update` — is the one source that tracks the
+ * session.
+ *
+ * Same derivation rules as {@link modesAfterModelApply}, stated there: matched on
+ * `category` (never the option id), `_meta` carried through per rung, an option with
+ * no values yields `undefined` rather than an empty ladder — here the caller records
+ * `unavailable` with a reason instead of silently disabling a live control.
+ */
+export function advertisedDepthLadderFromConfigOptions(
+  advertised: readonly SessionConfigOption[] | undefined,
+): SessionModeState | undefined {
+  const option = advertised?.find(
+    (entry) => entry.category === "thought_level" && entry.type === "select",
+  );
+  if (option?.type !== "select") {
+    return undefined;
+  }
+  const availableModes = flattenSelectValues(option.options).map(toAdvertisedMode);
+  if (availableModes.length === 0) {
+    return undefined;
+  }
+  return {
+    currentModeId:
+      typeof option.currentValue === "string" && option.currentValue.trim()
+        ? option.currentValue
+        : availableModes[0].id,
+    availableModes,
+  };
+}
+
 /** The selector's own current value, else the `session/new` mode, else the ladder's foot. */
 function currentModeIdFrom(
   currentValue: unknown,

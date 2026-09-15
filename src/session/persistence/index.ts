@@ -82,6 +82,7 @@ export type SessionIndexEntry = {
   forkedAtMessageIndexRequested?: number;
   metadataTaskFolder?: string;
   metadataBrick?: string;
+  metadataSpawnState?: string;
   // Infra-label (brick 2ac729a4): metadata.infra projected as hot-path scalars so
   // acpx-ui's fleet-list ⚙ infra badge renders without a per-record read. Additive,
   // no schema bump — mirrors metadataBrick. Preserved across reconcile by
@@ -372,6 +373,7 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     forkedAtMessageIndexRequested: optionalFiniteNumber(record.forkedAtMessageIndexRequested),
     metadataTaskFolder: optionalString(record.metadataTaskFolder),
     metadataBrick: optionalString(record.metadataBrick),
+    metadataSpawnState: optionalString(record.metadataSpawnState),
     metadataInfra: optionalBoolean(record.metadataInfra),
     metadataInfraPurpose: optionalString(record.metadataInfraPurpose),
     metadataInfraWakeupId: optionalString(record.metadataInfraWakeupId),
@@ -540,6 +542,7 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     forkedAtMessageIndexRequested: record.forkedAtMessageIndexRequested,
     metadataTaskFolder: metadata?.task_folder,
     metadataBrick: metadata?.brick,
+    metadataSpawnState: metadata?.spawn_state,
     // Infra label (brick 2ac729a4): flat string keys → hot-path index scalars.
     metadataInfra: metadata?.infra === "1" ? true : undefined,
     metadataInfraPurpose: metadata?.infra_purpose,

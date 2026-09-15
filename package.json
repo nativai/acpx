@@ -31,13 +31,14 @@
   "exports": {
     ".": "./dist/cli.js",
     "./runtime": "./dist/runtime.js",
+    "./brick-outbox": "./dist/brick-outbox.js",
     "./flows": "./dist/flows.js",
     "./dist/*": "./dist/*",
     "./package.json": "./package.json"
   },
   "scripts": {
-    "build": "tsdown src/cli.ts src/flows.ts src/runtime.ts --format esm --dts --clean --platform node --target node22 --no-fixedExtension",
-    "build:quiet": "tsdown --logLevel silent src/cli.ts src/flows.ts src/runtime.ts --format esm --dts --clean --platform node --target node22 --no-fixedExtension",
+    "build": "tsdown src/cli.ts src/flows.ts src/runtime.ts src/brick-outbox.ts --format esm --dts --clean --platform node --target node22 --no-fixedExtension",
+    "build:quiet": "tsdown --logLevel silent src/cli.ts src/flows.ts src/runtime.ts src/brick-outbox.ts --format esm --dts --clean --platform node --target node22 --no-fixedExtension",
     "build:test": "node -e \"require('node:fs').rmSync('dist-test',{recursive:true,force:true})\" && tsgo -p tsconfig.test.json",
     "check": "pnpm run format:check && pnpm run typecheck && pnpm run lint && pnpm run build && pnpm run viewer:typecheck && pnpm run viewer:build && pnpm run test:coverage && pnpm run mutate",
     "check:changed": "pnpm run check",
@@ -62,7 +63,7 @@
     "mutate": "stryker run",
     "perf:report": "tsx scripts/perf-report.ts",
     "precommit": "pnpm exec lint-staged && pnpm run -s build",
-    "prepack": "tsdown --logLevel silent src/cli.ts src/flows.ts src/runtime.ts --format esm --dts --clean --platform node --target node22 --no-fixedExtension",
+    "prepack": "tsdown --logLevel silent src/cli.ts src/flows.ts src/runtime.ts src/brick-outbox.ts --format esm --dts --clean --platform node --target node22 --no-fixedExtension",
     "prepare": "husky",
     "test": "pnpm run build && pnpm run build:test && node scripts/run-tests.mjs dist-test/test/*.test.js",
     "test:changed": "pnpm run test:coverage",
