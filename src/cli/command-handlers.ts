@@ -374,6 +374,8 @@ function sessionOptionsFromGlobalFlags(
     // flag was passed, so `mergeSessionOptions` falls back to the stored pair.
     modelSource: globalFlags.model?.trim() ? "explicit" : undefined,
     allowedTools: globalFlags.allowedTools,
+    disallowedTools: globalFlags.disallowedTools,
+    skills: globalFlags.skills,
     maxTurns: globalFlags.maxTurns,
     systemPrompt: globalFlags.systemPrompt,
     profile: unifiedSelection,

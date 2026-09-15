@@ -68,6 +68,10 @@ export type GlobalFlags = PermissionFlags & {
   /** Profile id from `--profile <id>` — stored as session_options.profile. */
   profile?: string;
   allowedTools?: string[];
+  /** `--disallowed-tools <list>` — tool names to block regardless of `allowedTools`. */
+  disallowedTools?: string[];
+  /** `--skills <list>` — skill names exposed to the model as a context filter. */
+  skills?: string[];
   maxTurns?: number;
   systemPrompt?: SystemPromptOption;
   promptRetries?: number;
@@ -395,7 +399,7 @@ export function parsePruneBeforeDate(value: string): Date {
   return date;
 }
 
-export function parseAllowedTools(value: string): string[] {
+function parseCommaSeparatedList(label: string, value: string): string[] {
   const trimmed = value.trim();
   if (trimmed.length === 0) {
     return [];
@@ -403,12 +407,22 @@ export function parseAllowedTools(value: string): string[] {
 
   const items = trimmed.split(",").map((item) => item.trim());
   if (items.some((item) => item.length === 0)) {
-    throw new InvalidArgumentError(
-      "Allowed tools must be a comma-separated list without empty entries",
-    );
+    throw new InvalidArgumentError(`${label} must be a comma-separated list without empty entries`);
   }
 
   return items;
+}
+
+export function parseAllowedTools(value: string): string[] {
+  return parseCommaSeparatedList("Allowed tools", value);
+}
+
+export function parseDisallowedTools(value: string): string[] {
+  return parseCommaSeparatedList("Disallowed tools", value);
+}
+
+export function parseSkills(value: string): string[] {
+  return parseCommaSeparatedList("Skills", value);
 }
 
 export function parseMaxTurns(value: string): number {
@@ -598,6 +612,16 @@ export function addGlobalFlags(command: Command): Command {
       'Allowed tool names as a comma-separated list (use "" for no tools)',
       parseAllowedTools,
     )
+    .option(
+      "--disallowed-tools <list>",
+      'Tool names to block regardless of --allowed-tools, comma-separated (use "" for none)',
+      parseDisallowedTools,
+    )
+    .option(
+      "--skills <list>",
+      'Skill names exposed to the model as a context filter, comma-separated (use "" for none)',
+      parseSkills,
+    )
     .option("--max-turns <count>", "Maximum turns for the session", parseMaxTurns)
     .option(
       "--system-prompt <text>",
@@ -784,6 +808,8 @@ export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig)
     subscription: resolveSubscriptionOption(opts.subscription),
     profile: resolveProfileOption(opts.profile),
     allowedTools: stringArrayOption(opts.allowedTools),
+    disallowedTools: stringArrayOption(opts.disallowedTools),
+    skills: stringArrayOption(opts.skills),
     maxTurns: numberOption(opts.maxTurns),
     systemPrompt: resolveSystemPromptFlag(opts),
     promptRetries: numberOption(opts.promptRetries),

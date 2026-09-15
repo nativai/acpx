@@ -27,6 +27,8 @@ describe("parseQueueOwnerPayload", () => {
         sessionOptions: {
           model: "fast-model",
           allowedTools: ["Read"],
+          disallowedTools: ["Skill", "ScheduleWakeup"],
+          skills: [],
           maxTurns: 3,
           systemPrompt: "stay concise",
         },
@@ -57,6 +59,8 @@ describe("parseQueueOwnerPayload", () => {
     assert.deepEqual(parsed.sessionOptions, {
       model: "fast-model",
       allowedTools: ["Read"],
+      disallowedTools: ["Skill", "ScheduleWakeup"],
+      skills: [],
       maxTurns: 3,
       systemPrompt: "stay concise",
     });

@@ -5,6 +5,10 @@ export type SystemPromptOption = string | { append: string };
 export type SessionAgentOptions = {
   model?: string;
   allowedTools?: string[];
+  /** See the doc comment on `AcpClientOptions["sessionOptions"].disallowedTools` in types.ts. */
+  disallowedTools?: string[];
+  /** See the doc comment on `AcpClientOptions["sessionOptions"].skills` in types.ts. */
+  skills?: string[];
   maxTurns?: number;
   systemPrompt?: SystemPromptOption;
   subscription?: string;
@@ -68,6 +72,8 @@ export function mergeSessionOptions(
   if (preferred) {
     assignDefinedOption(merged, "model", preferred.model);
     assignDefinedOption(merged, "allowedTools", preferred.allowedTools);
+    assignDefinedOption(merged, "disallowedTools", preferred.disallowedTools);
+    assignDefinedOption(merged, "skills", preferred.skills);
     assignDefinedOption(merged, "maxTurns", preferred.maxTurns);
     assignDefinedOption(merged, "systemPrompt", preferred.systemPrompt);
     assignDefinedOption(merged, "subscription", preferred.subscription);
@@ -310,7 +316,9 @@ export function sessionOptionsFromRecord(record: SessionRecord): SessionAgentOpt
 
   const sessionOptions: SessionAgentOptions = {};
   assignStoredOption(sessionOptions, "model", nonEmptyString(stored.model));
-  assignStoredOption(sessionOptions, "allowedTools", storedAllowedTools(stored.allowed_tools));
+  assignStoredOption(sessionOptions, "allowedTools", storedStringArray(stored.allowed_tools));
+  assignStoredOption(sessionOptions, "disallowedTools", storedStringArray(stored.disallowed_tools));
+  assignStoredOption(sessionOptions, "skills", storedStringArray(stored.skills));
   assignStoredOption(sessionOptions, "maxTurns", storedMaxTurns(stored.max_turns));
   assignStoredOption(
     sessionOptions,
@@ -348,6 +356,10 @@ function persistedSessionOptions(
   const next: PersistedSessionOptions = {
     model: nonEmptyString(options.model),
     allowed_tools: Array.isArray(options.allowedTools) ? [...options.allowedTools] : undefined,
+    disallowed_tools: Array.isArray(options.disallowedTools)
+      ? [...options.disallowedTools]
+      : undefined,
+    skills: Array.isArray(options.skills) ? [...options.skills] : undefined,
     max_turns: typeof options.maxTurns === "number" ? options.maxTurns : undefined,
     system_prompt: normalizeSystemPromptOption(options.systemPrompt),
     subscription: nonEmptyString(options.subscription),
@@ -372,6 +384,8 @@ function persistedSessionOptions(
 const PERSISTED_CONTENT_KEYS = [
   "model",
   "allowed_tools",
+  "disallowed_tools",
+  "skills",
   "max_turns",
   "system_prompt",
   "subscription",
@@ -415,7 +429,7 @@ function assignStoredOption<Key extends keyof SessionAgentOptions>(
   assignDefinedOption(target, key, value);
 }
 
-function storedAllowedTools(value: unknown): string[] | undefined {
+function storedStringArray(value: unknown): string[] | undefined {
   return Array.isArray(value) && value.every((item) => typeof item === "string")
     ? [...value]
     : undefined;

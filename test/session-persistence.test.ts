@@ -202,6 +202,8 @@ test("listSessions preserves acpx session_options", async () => {
           session_options: {
             model: "sonnet",
             allowed_tools: ["Read", "Grep"],
+            disallowed_tools: ["Skill", "ScheduleWakeup"],
+            skills: [],
             max_turns: 7,
             subscription: "sub1",
           },
@@ -215,6 +217,8 @@ test("listSessions preserves acpx session_options", async () => {
     assert.deepEqual(record.acpx?.session_options, {
       model: "sonnet",
       allowed_tools: ["Read", "Grep"],
+      disallowed_tools: ["Skill", "ScheduleWakeup"],
+      skills: [],
       max_turns: 7,
       subscription: "sub1",
     });

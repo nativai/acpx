@@ -60,6 +60,8 @@ export async function handleFlowRun(
     sessionOptions: {
       model: globalFlags.model,
       allowedTools: globalFlags.allowedTools,
+      disallowedTools: globalFlags.disallowedTools,
+      skills: globalFlags.skills,
       maxTurns: globalFlags.maxTurns,
       subscription: globalFlags.subscription,
     },

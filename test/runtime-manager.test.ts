@@ -2871,6 +2871,8 @@ test("AcpRuntimeManager forwards sessionOptions to createClient on fresh session
   assert.deepEqual(record.acpx?.session_options, {
     model: undefined,
     allowed_tools: undefined,
+    disallowed_tools: undefined,
+    skills: undefined,
     max_turns: undefined,
     system_prompt: "Be terse.",
     subscription: undefined,
@@ -2932,6 +2934,8 @@ test("AcpRuntimeManager persists sessionOptions { append } and model/allowedTool
     systemPrompt: { append: "Also review tests." },
     model: "fast",
     allowedTools: ["read", "edit"],
+    disallowedTools: ["Skill", "ScheduleWakeup"],
+    skills: [],
     maxTurns: 5,
   };
   const record = await manager.ensureSession({
@@ -2948,6 +2952,8 @@ test("AcpRuntimeManager persists sessionOptions { append } and model/allowedTool
   assert.deepEqual(record.acpx?.session_options, {
     model: "fast",
     allowed_tools: ["read", "edit"],
+    disallowed_tools: ["Skill", "ScheduleWakeup"],
+    skills: [],
     max_turns: 5,
     system_prompt: { append: "Also review tests." },
     subscription: undefined,
@@ -2973,6 +2979,8 @@ test("persistSessionOptions preserves an explicit empty allowedTools list", () =
   assert.deepEqual(record.acpx?.session_options, {
     model: undefined,
     allowed_tools: [],
+    disallowed_tools: undefined,
+    skills: undefined,
     max_turns: undefined,
     system_prompt: undefined,
     subscription: undefined,
@@ -2981,6 +2989,47 @@ test("persistSessionOptions preserves an explicit empty allowedTools list", () =
     // brick://874fee67 — persistedSessionOptions builds one object literal, so
     // every key it knows is an own-key regardless of whether a value was passed.
     // These whole-object assertions exist to make a newly-persisted field visible.
+    output_style: undefined,
+  });
+});
+
+test("persistSessionOptions preserves an explicit empty disallowedTools/skills list", () => {
+  const record = makeSessionRecord({
+    acpxRecordId: "empty-disallowed-skills-session",
+    acpSessionId: "empty-disallowed-skills-sid",
+    agentCommand: "codex --acp",
+    cwd: "/workspace",
+  });
+
+  persistSessionOptions(record, {
+    disallowedTools: [
+      "Skill",
+      "ScheduleWakeup",
+      "CronCreate",
+      "CronList",
+      "CronDelete",
+      "RemoteTrigger",
+    ],
+    skills: [],
+  });
+
+  assert.deepEqual(record.acpx?.session_options, {
+    model: undefined,
+    allowed_tools: undefined,
+    disallowed_tools: [
+      "Skill",
+      "ScheduleWakeup",
+      "CronCreate",
+      "CronList",
+      "CronDelete",
+      "RemoteTrigger",
+    ],
+    skills: [],
+    max_turns: undefined,
+    system_prompt: undefined,
+    subscription: undefined,
+    profile: undefined,
+    effort: undefined,
     output_style: undefined,
   });
 });
