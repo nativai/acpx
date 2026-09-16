@@ -326,6 +326,12 @@ function readLocalIdentity(): { instance_id: string; home: string } {
  * state, because acpx-ui mints the record before it starts the trigger owner and leaves the owner
  * OFF when the mint fails (acpx-ui `server/index.ts` → `bootInstanceRecord()`).
  */
+/**
+ * The meta rows that decide which instance owns an outbox. Writing either of these IS the bind;
+ * `BrickOutbox.setMeta` refuses both unless `admitInstanceIdentity` has checked them first.
+ */
+const IDENTITY_META_KEYS = new Set(["instance_id", "projection_identity"]);
+
 function admittedInstanceId(): string {
   try {
     return readLocalIdentity().instance_id;
@@ -600,6 +606,8 @@ export class BrickOutbox {
   readonly sessionsDir: string;
   private readonly db: DatabaseSync;
   private userGateDepth = 0;
+  /** Open only inside `admitInstanceIdentity`, after its check has passed. See `setMeta`. */
+  private admittingIdentity = false;
 
   constructor() {
     const directory = path.join(os.homedir(), ".acpx");
@@ -716,9 +724,14 @@ export class BrickOutbox {
         `refusing to bind ${instanceId} into ${this.dbPath}: ${path.join(os.homedir(), ".acpx", "instance.json")} admits ${admitted}. An outbox under a HOME may only carry that HOME's own instance identity — mint an isolated HOME for this process instead of writing into the box's own (brick 42b4fb28).`,
       );
     }
-    this.setMeta("instance_id", instanceId);
-    if (projection) {
-      this.setMeta("projection_identity", JSON.stringify(projection));
+    this.admittingIdentity = true;
+    try {
+      this.setMeta("instance_id", instanceId);
+      if (projection) {
+        this.setMeta("projection_identity", JSON.stringify(projection));
+      }
+    } finally {
+      this.admittingIdentity = false;
     }
   }
   identityForRecord(record: DiskRecord): ProjectionIdentity {
@@ -1139,6 +1152,18 @@ export class BrickOutbox {
     return row ? String(row.value) : null;
   }
   private setMeta(key: string, value: string): void {
+    // The identity rows are not ordinary meta. Anything that writes one decides which instance
+    // this outbox belongs to, so it must have been checked against this HOME's instance.json
+    // first — `admitInstanceIdentity` is the only caller allowed to open this door, and it opens
+    // it only after the check passes. A future writer that spells the key some other way
+    // (computed, aliased, destructured) still lands here, so this refuses by construction rather
+    // than by anyone remembering the rule. Brick 42b4fb28.
+    if (!this.admittingIdentity && IDENTITY_META_KEYS.has(key)) {
+      throw new OutboxError(
+        "outbox-identity-meta-bypass",
+        `meta.${key} decides which instance owns ${this.dbPath} and may only be written through admitInstanceIdentity(), which checks it against this HOME's instance.json (brick 42b4fb28)`,
+      );
+    }
     this.db
       .prepare(
         "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
