@@ -111,6 +111,17 @@ let outcome: { threw: boolean; code: string | null; message: string } = {
   message: "",
 };
 let outbox: BrickOutbox;
+/**
+ * Set only by the reentrant-tojson scenario: what the re-entrant write did. Read through
+ * `reentryResult()` rather than directly — the only assignment is inside a `toJSON` closure, which
+ * control-flow analysis does not track, so a direct read at the bottom of this file narrows to
+ * `null` and then to `never`. `build:test` catches that; `pnpm run typecheck` does NOT (different
+ * tsconfig), and the stale `dist-test/` left behind then reports a green tally for code nobody has.
+ */
+let reentry: { threw: boolean; code: string | null; message: string } | null = null;
+function reentryResult(): { threw: boolean; code: string | null; message: string } | null {
+  return reentry;
+}
 
 if (scenario === "local-bind") {
   // The production shape: the id handed to bindIdentity is READ BACK from the record acpx-ui
@@ -203,6 +214,35 @@ if (scenario === "local-bind") {
   mintInstanceRecord(FIXTURE.instance_id);
   outbox = new BrickOutbox();
   outcome = attempt(() => outbox.bindIdentity(FIXTURE));
+} else if (scenario === "reentrant-tojson") {
+  // RE-ENTRY: the admission window is a per-instance boolean, so anything that runs caller code
+  // INSIDE it can write an unchecked identity. `JSON.stringify(projection)` is the only such
+  // evaluation there was — `toJSON` is caller code. The bind's own identity is LOCAL, so the
+  // check passes and the window genuinely opens; only the ORDER of the serialisation decides
+  // whether the re-entrant write lands.
+  mintInstanceRecord();
+  outbox = new BrickOutbox();
+  const write = (outbox as unknown as Record<string, (k: string, v: string) => void>).setMeta.bind(
+    outbox,
+  );
+  const hostile = {
+    instance_id: LOCAL_INSTANCE,
+    box: "devbox.nativai.de",
+    public_base_url: "https://atrium.devbox.nativai.de",
+    toJSON(): Record<string, string> {
+      reentry = attempt(() => write("instance_id", FIXTURE.instance_id));
+      return {
+        instance_id: LOCAL_INSTANCE,
+        box: "devbox.nativai.de",
+        public_base_url: "https://atrium.devbox.nativai.de",
+      };
+    },
+  };
+  outcome = attempt(() =>
+    outbox.bindIdentity(
+      hostile as unknown as { instance_id: string; box: string; public_base_url: string },
+    ),
+  );
 } else if (scenario === "setmeta-ordinary-key") {
   // CONTROL for setmeta-bypass: an ORDINARY meta key must still be writable, or the previous
   // scenario's refusal would prove only that the probe was broken.
@@ -230,6 +270,8 @@ console.log(
     message: outcome.message,
     meta,
     ordinary_key: ordinaryRow ? String(ordinaryRow.value) : null,
+    reentry_refused: reentryResult()?.threw ?? null,
+    reentry_code: reentryResult()?.code ?? null,
     db: outbox.dbPath,
   })}`,
 );

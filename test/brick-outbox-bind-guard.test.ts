@@ -35,6 +35,8 @@ interface Observation {
   message: string;
   meta: { instance_id: string | null; projection_identity: string | null };
   ordinary_key: string | null;
+  reentry_refused: boolean | null;
+  reentry_code: string | null;
   db: string;
 }
 
@@ -124,6 +126,23 @@ test("42b4fb28 bind: the identity meta rows refuse a writer that names neither m
   assert.equal(observed.threw, true);
   assert.equal(observed.code, "outbox-identity-meta-bypass");
   assert.equal(observed.meta.instance_id, null);
+});
+
+test("42b4fb28 bind: caller code cannot re-enter the admission window", () => {
+  // The window is a per-instance boolean, so anything that runs CALLER CODE while it is open can
+  // write an unchecked identity. `JSON.stringify(projection)` was that: `toJSON` is caller code.
+  // The bind's own identity is LOCAL here, so the check passes and the window genuinely opens —
+  // only the ORDER of the serialisation decides whether the re-entrant write lands.
+  //
+  // ⚠️ DO NOT MOVE THE `JSON.stringify` BACK INSIDE THE `try`. It reads as a harmless tidy-up and
+  // it re-opens this exact hole: measured at acpx 4c2f5e5, the re-entrant write SUCCEEDED and the
+  // outbox ended up carrying `i-twin0000001` — the 2026-09-15 outage identity — while the bind
+  // itself reported success.
+  const observed = probe("reentrant-tojson");
+  assert.equal(observed.threw, false, observed.message);
+  assert.equal(observed.reentry_refused, true);
+  assert.equal(observed.reentry_code, "outbox-identity-meta-bypass");
+  assert.equal(observed.meta.instance_id, "i-aaaaaaaaaaaa");
 });
 
 test("42b4fb28 bind: BOUNDARY — a FORGED instance.json in the target HOME is permitted", () => {

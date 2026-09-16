@@ -724,11 +724,16 @@ export class BrickOutbox {
         `refusing to bind ${instanceId} into ${this.dbPath}: ${path.join(os.homedir(), ".acpx", "instance.json")} admits ${admitted}. An outbox under a HOME may only carry that HOME's own instance identity — mint an isolated HOME for this process instead of writing into the box's own (brick 42b4fb28).`,
       );
     }
+    // ⚠️ SERIALISE BEFORE OPENING THE WINDOW, NOT INSIDE IT. `projection` is the caller's object,
+    // so `JSON.stringify` can run caller code via `toJSON` — and run it while the door is open,
+    // which is exactly the re-entry that would let an unchecked identity through. Below the
+    // assignment, nothing but two `setMeta` calls executes, and neither evaluates caller code.
+    const encoded = projection === undefined ? null : JSON.stringify(projection);
     this.admittingIdentity = true;
     try {
       this.setMeta("instance_id", instanceId);
-      if (projection) {
-        this.setMeta("projection_identity", JSON.stringify(projection));
+      if (encoded !== null) {
+        this.setMeta("projection_identity", encoded);
       }
     } finally {
       this.admittingIdentity = false;
