@@ -148,13 +148,46 @@ export type ManifestFoldEntry = {
   at: string;
   wave: string;
   reason: string;
+  /** Column 7, as it stood AT ARCHIVE TIME. Empty on a restore row. */
+  closedAt: string;
+  /** Column 8, as it stood AT ARCHIVE TIME. Empty on a restore row. */
+  lastUsedAt: string;
 };
 
+/** The immutable end-of-life anchor for one id — see `firstArchiveById`. */
+export type ManifestEndOfLife = { closedAt: string; lastUsedAt: string; at: string };
+
+/**
+ * 🛑 THIS STRUCTURE HOLDS **TWO FOLDS OVER ONE FILE IN OPPOSITE DIRECTIONS**. Pin
+ * the distinction or it WILL be got backwards — the two answer different questions
+ * about different keys:
+ *
+ * | Question | Key | Rows | Direction |
+ * |---|---|---|---|
+ * | **residency** — where is this FILE now? | file | BOTH actions | **LAST** row wins |
+ * | **end-of-life** — when did this SESSION end? | id | `archive` rows ONLY | **FIRST** row wins |
+ */
 export type ManifestFold = {
-  /** Current expected side of every file named in the manifest, last row wins. */
+  /** RESIDENCY: current expected side of every file, LAST row in file order wins. */
   lastByFile: Map<string, ManifestFoldEntry>;
-  /** The last `archive` row per id, for `archivedAt` recovery during a reindex. */
+  /** The LAST `archive` row per id, for `archivedAt` recovery during a reindex. */
   lastArchivedAtById: Map<string, string>;
+  /**
+   * END-OF-LIFE: the FIRST `archive` row per id, and never overwritten.
+   *
+   * ⚠️ FIRST-WINS IS THE WHOLE POINT, AND LATEST-WINS IS THE DEFECT IT FIXES.
+   * `closed_at` is a live lifecycle field, so a restore-to-consult followed by a
+   * legitimate re-close RE-STAMPS it — and retention keyed on the current value
+   * therefore measures "when did someone last CLOSE this", not "when did this
+   * session END". A session consulted periodically would never return to the
+   * archive at all. First-wins makes this value IMMUTABLE ONCE WRITTEN, which
+   * converts retention from a deferrable clock into a monotone one; latest-wins
+   * would re-set the clock on every archive → restore → re-close cycle, i.e. the
+   * same defect one level up and harder to see.
+   */
+  firstArchiveById: Map<string, ManifestEndOfLife>;
+  /** The LAST `restore` row per id — drives the restore grace period. */
+  lastRestoredAtById: Map<string, string>;
   totalRows: number;
   /** Rows skipped: wrong column count, or a truncated final line. */
   skippedRows: number;
@@ -175,6 +208,8 @@ export async function foldArchiveManifest(archiveDir: string): Promise<ManifestF
   const fold: ManifestFold = {
     lastByFile: new Map(),
     lastArchivedAtById: new Map(),
+    firstArchiveById: new Map(),
+    lastRestoredAtById: new Map(),
     totalRows: 0,
     skippedRows: 0,
     absent: false,
@@ -213,15 +248,26 @@ export async function foldArchiveManifest(archiveDir: string): Promise<ManifestF
 }
 
 function foldRow(fold: ManifestFold, entry: ManifestFoldEntry): void {
-  // "Current state of a FILE = its LAST ROW IN FILE ORDER" (formats §3.5) — not
-  // the row with the greatest `at`. Concurrent runs interleave whole lines and
-  // `at` is NOT monotonic across the file, so sorting by `at` would resolve an
-  // archive/restore pair the wrong way round.
+  // RESIDENCY — "current state of a FILE = its LAST ROW IN FILE ORDER"
+  // (formats §3.5), not the row with the greatest `at`. Concurrent runs interleave
+  // whole lines and `at` is NOT monotonic across the file, so sorting by `at`
+  // would resolve an archive/restore pair the wrong way round.
   fold.lastByFile.set(entry.file, entry);
-  if (entry.action === "archive") {
-    fold.lastArchivedAtById.set(entry.id, entry.at);
-  } else {
+  if (entry.action === "restore") {
     fold.lastArchivedAtById.delete(entry.id);
+    fold.lastRestoredAtById.set(entry.id, entry.at);
+    return;
+  }
+  fold.lastArchivedAtById.set(entry.id, entry.at);
+  // END-OF-LIFE — FIRST archive row per id, written once and never overwritten.
+  // The opposite direction from every other fold in this function; see the table
+  // on `ManifestFold`.
+  if (!fold.firstArchiveById.has(entry.id)) {
+    fold.firstArchiveById.set(entry.id, {
+      closedAt: entry.closedAt,
+      lastUsedAt: entry.lastUsedAt,
+      at: entry.at,
+    });
   }
 }
 
@@ -244,5 +290,7 @@ function parseManifestLine(line: string): ManifestFoldEntry | undefined {
     at: columns[0],
     wave: columns[1],
     reason: columns[4],
+    closedAt: columns[6],
+    lastUsedAt: columns[7],
   };
 }

@@ -176,19 +176,48 @@ export async function readArchiveRecord(
  * OPPOSITE SIDES of the boundary precisely so that substitution flips the verdict
  * instead of merely shifting it.
  *
- * ⚠️ THIS IS THE SINGLE PLACE RETENTION READS AN AGE OFF A RECORD, AND IT IS KEPT
- * THAT WAY ON PURPOSE — A SPEC AMENDMENT IS PENDING HERE. A restore-to-consult
- * followed by a re-close RE-STAMPS `closed_at`, so a session someone actually
- * reaches for stays hot for another full retention window, and one consulted
- * periodically never returns to the archive at all. `closed_at` is a live
- * lifecycle field, so the re-stamp is legitimate; what is wrong is retention
- * asking it "when did this session END" when it answers "when did someone last
- * CLOSE this". The endorsed fix direction is to key retention on the ORIGINAL
- * `closed_at` recorded in `MANIFEST.tsv` at archive time, with the record's
- * current value used only for never-archived sessions. ⚠️ DO NOT IMPROVISE THAT —
- * which field wins, and what a second archive row means for the first row's value,
- * are being settled by conception. This function is where the amendment lands.
+ * ⚠️ THIS IS THE RECORD LEG ONLY. Retention does NOT call it directly — it calls
+ * `effectiveEndedAt` below, which prefers the manifest. See that function for why.
  */
 export function recordAgeAnchor(view: ArchiveRecordView): string | undefined {
   return view.closedAt ?? view.lastUsedAt ?? view.updatedAt ?? view.createdAt;
+}
+
+/** The FIRST `archive` row's state columns for an id, from `MANIFEST.tsv`. */
+export type ManifestEndOfLifeAnchor = { closedAt: string; lastUsedAt: string };
+
+/**
+ * THE age anchor retention uses: **when did this session actually END** —
+ * the manifest's ORIGINAL value if this id has ever been archived, the record's
+ * current value otherwise.
+ *
+ * ⚠️ THE MANIFEST WINS, AND NOT MERELY AS A FALLBACK ORDERING. `closed_at` is a
+ * live lifecycle field: a restore-to-consult followed by a legitimate re-close
+ * RE-STAMPS it. Retention keyed on the record's current value therefore measures
+ * "when did someone last CLOSE this", not "when did this session END" — so
+ * consulting an archived session un-archives it for a further full retention
+ * window, and a session consulted periodically NEVER returns to the archive at
+ * all. That defeats retention for exactly the sessions people actually reach for.
+ *
+ * ⚠️ AND THE MANIFEST VALUE IS **FIRST-ROW-WINS PER ID**, which is what makes this
+ * work. First-wins is immutable once written, converting retention from a
+ * deferrable clock into a MONOTONE one. Latest-wins would re-set the clock on
+ * every archive → restore → re-close cycle — the same defect one level up, and
+ * harder to see because it hides behind a fold that looks correct.
+ *
+ * Rejected alternatives, recorded so they are not re-proposed: an `ARCHIVE-INDEX`
+ * field (the entry is REMOVED on restore, so a restored session has none — it
+ * would need a forever-growing tombstone), and a record field written at restore
+ * (mutates the record, breaking the §6.6 byte-identity guarantee).
+ *
+ * ⚠️ NO FORMAT CHANGE WAS NEEDED: `MANIFEST.tsv` already carries `closed_at` and
+ * `last_used_at` on every archive row. And on a never-archived box the manifest
+ * does not exist, so this degrades to the record with no read in front of it.
+ */
+export function effectiveEndedAt(
+  view: ArchiveRecordView,
+  manifestAnchor: ManifestEndOfLifeAnchor | undefined,
+): string | undefined {
+  const fromManifest = manifestAnchor?.closedAt || manifestAnchor?.lastUsedAt;
+  return fromManifest != null && fromManifest.length > 0 ? fromManifest : recordAgeAnchor(view);
 }

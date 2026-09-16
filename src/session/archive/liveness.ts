@@ -155,12 +155,15 @@ export function verdictFromStatusBody(body: {
  * The PRIMARY signal (BRIEF §6.5): `GET <base>/api/sessions/<id>/status` must not
  * report `ownerAlive: true`, nor a `state` of `working` / `red` / `interrupted`.
  *
- * ⚠️ PREFER THIS OVER RE-DERIVING LIVENESS. It is the same judgement acpx-ui
- * itself makes, so the retention job cannot drift from what the UI shows a human —
- * and it is the ONLY channel through which the two signals the CLI cannot see
- * (acpx-ui's executor lease and its live hub set) reach this gate. There is
- * deliberately no `--exclude-ids` escape hatch: acpx-ui owns the schedule and
- * injects its live-state knowledge here, by being reachable.
+ * ⚠️ PREFER THIS OVER RE-DERIVING LIVENESS. It is the same judgement acpx-ui itself
+ * makes, so the retention job cannot drift from what the UI shows a human.
+ *
+ * It is ONE of two channels for live state the CLI cannot see for itself; the other
+ * is `--exclude-ids <file>` (`LivenessGateOptions.excludedIds`), which the acpx-ui
+ * scheduler uses to pass the same knowledge when it invokes the mechanism directly.
+ * This probe covers the case where acpx-ui is merely REACHABLE rather than the
+ * caller; `--exclude-ids` covers the case where it IS the caller. Neither replaces
+ * the on-disk blockers, which run either way.
  */
 export function createHttpLivenessProbe(baseUrl: string, timeoutMs = 2_000): PrimaryLivenessProbe {
   return async (id: string) => {
@@ -199,6 +202,29 @@ export function createHttpLivenessProbe(baseUrl: string, timeoutMs = 2_000): Pri
 export type LivenessGateOptions = {
   primary?: PrimaryLivenessProbe;
   wakeups: WakeupLiveness;
+  /**
+   * Live-state exclusions supplied by the CALLER — `--exclude-ids <file>`, one id
+   * per line. The acpx-ui scheduler's channel into this gate.
+   *
+   * 🛑 THE DIVISION OF LABOUR IS THE LOAD-BEARING HALF, because this is exactly the
+   * seam where each side would assume the other handled it:
+   *
+   * - **acpx-ui owns ONLY what needs a LIVE PROCESS** — owner liveness, the
+   *   executor lease, non-terminal `wakeups.db` rows, `GET /api/sessions/:id/status`.
+   *   Those are unavailable to a CLI invocation, which is the entire reason this
+   *   flag exists.
+   * - **The CLI owns everything derivable from ON-DISK state** — the manifest fold,
+   *   `effectiveEndedAt`, the `recently-restored` grace period, templates,
+   *   favorites, the delivery family for T1-T3, the 60-minute quiet window,
+   *   `record-unparseable`. NONE of that may be taken from the caller: two sources
+   *   of truth for one on-disk fact is how they drift.
+   *
+   * ⚠️ AN ABSENT FLAG MEANS "NO LIVE-STATE EXCLUSIONS KNOWN", NOT "NO EXCLUSIONS
+   * APPLY". Every on-disk blocker above still runs — which is what makes
+   * `acpx sessions archive` fully usable standalone with no scheduler behind it,
+   * as D1 requires.
+   */
+  excludedIds?: ReadonlySet<string>;
 };
 
 /**
@@ -216,23 +242,47 @@ export async function evaluateLiveness(
   files: readonly string[],
   pid: number | undefined,
   options: LivenessGateOptions,
+  /**
+   * ⚠️ GATES THE ACTIVE-SIDECAR SIGNAL, AND IT IS NOT OPTIONAL POLISH. An ORPHAN
+   * has no record, so nothing can ever deliver to it — a `.delivery.json` beside an
+   * orphan is reseeding something unresumable. Counting it as liveness makes those
+   * ids permanently unarchivable (measured: 113 orphans carry one), which is the
+   * same carve-out `staticBlockerFor` makes for the `active-delivery-sidecar`
+   * blocker. FIXING ONLY ONE OF THE TWO SITES LEAVES THE IDS BLOCKED BY THE OTHER,
+   * which is exactly how this would survive a partial fix.
+   */
+  hasRecord = true,
 ): Promise<LivenessVerdict> {
-  // A reachable acpx-ui that says "live" ends it. One that says "not live" is
-  // authoritative only for the two signals only it can see (executor lease, live
-  // hub set); the filesystem fallbacks below still run, because they are cheap and
-  // they cover the window between acpx-ui's view and disk.
-  const primary = await options.primary?.(id);
-  if (primary != null && primary !== "unavailable" && primary.live) {
-    return primary;
+  const reported = await reportedLiveness(id, options);
+  if (reported) {
+    return reported;
   }
-
   if (pid != null && isPidAlive(pid)) {
     return { live: true, signal: "pid-alive" };
   }
-  if (hasActiveSidecar(safeId, files)) {
+  if (hasRecord && hasActiveSidecar(safeId, files)) {
     return { live: true, signal: "active-sidecar" };
   }
   return wakeupVerdict(id, options.wakeups);
+}
+
+/** The two signals that come from OUTSIDE this process: the caller's exclusion
+ *  list and acpx-ui's status endpoint. */
+async function reportedLiveness(
+  id: string,
+  options: LivenessGateOptions,
+): Promise<LivenessVerdict | undefined> {
+  // The caller's live-state exclusions win outright: acpx-ui knows things about a
+  // running process that no filesystem read can recover.
+  if (options.excludedIds?.has(id) === true) {
+    return { live: true, signal: "excluded-by-caller" };
+  }
+  // A reachable acpx-ui that says "live" ends it. One that says "not live" is
+  // authoritative only for the two signals only it can see (executor lease, live
+  // hub set); the filesystem fallbacks still run afterwards, because they are cheap
+  // and they cover the window between acpx-ui's view and disk.
+  const primary = await options.primary?.(id);
+  return primary != null && primary !== "unavailable" && primary.live ? primary : undefined;
 }
 
 function wakeupVerdict(id: string, wakeups: WakeupLiveness): LivenessVerdict {

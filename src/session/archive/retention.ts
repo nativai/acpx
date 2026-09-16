@@ -6,11 +6,18 @@ import {
   encodeSessionSafeId,
   findRecordFile,
   hasActiveSidecar,
+  isDeliveryFamilyFile,
   isHostileFileName,
+  isRecordWriteArtifact,
   recordFileNameFor,
 } from "./identity.js";
 import { evaluateLiveness, type LivenessGateOptions } from "./liveness.js";
-import { projectArchiveRecord, recordAgeAnchor, type ArchiveRecordView } from "./record-view.js";
+import {
+  effectiveEndedAt,
+  projectArchiveRecord,
+  type ArchiveRecordView,
+  type ManifestEndOfLifeAnchor,
+} from "./record-view.js";
 
 /**
  * The retention predicate and the plan it produces — BRIEF §6.
@@ -26,7 +33,27 @@ export type ArchiveBlocker =
   | "touched-recently"
   | "hostile-filename"
   | "live"
+  | "recently-restored"
   | "anchor-of-blocked-companion";
+
+/**
+ * What retention needs from `MANIFEST.tsv`, pre-folded.
+ *
+ * ⚠️ ON A NEVER-ARCHIVED BOX THIS IS EMPTY AND NO FOLD RUNS — the manifest does
+ * not exist, so the common path keeps no manifest read in front of it: candidates
+ * come from the hot dir, and the end-of-life anchor comes from the record.
+ */
+export type ManifestRetentionView = {
+  /** FIRST `archive` row per id — the immutable end-of-life anchor (A1). */
+  endOfLifeById: ReadonlyMap<string, ManifestEndOfLifeAnchor>;
+  /** LAST `restore` row per id — drives the restore grace period. */
+  lastRestoredAtById: ReadonlyMap<string, string>;
+};
+
+export const EMPTY_MANIFEST_VIEW: ManifestRetentionView = {
+  endOfLifeById: new Map(),
+  lastRestoredAtById: new Map(),
+};
 
 export type ArchiveCandidate = {
   /** `$.acpx_record_id` when a record exists; the filename token otherwise. */
@@ -74,6 +101,20 @@ export type ArchivePlan = {
   boundaries: RetentionBoundaries;
   /** True when the wakeups store exists but could not be read — every id is LIVE. */
   livenessDegraded: boolean;
+  /**
+   * Ids blocked by `touched-recently` this run.
+   *
+   * ⚠️ REPORTED, NOT TRACKED — AND THAT SPLIT IS DELIBERATE. Conception wants a
+   * tripwire on an id blocked here on THREE CONSECUTIVE DAILY RUNS, as the
+   * detector if a future periodic record-rewrite reintroduces the bug class that
+   * killed the 45-day mtime leg. "Consecutive daily runs" is knowledge the CLI does
+   * not have and must not invent: a run is stateless, and the only place to persist
+   * a counter would be the archive dir, whose contents are a FROZEN contract both
+   * lanes fork off (formats §1 R1.4 enumerates every legal name). So the CLI emits
+   * the list and acpx-ui — which owns the schedule, and therefore owns the meaning
+   * of "consecutive" — correlates it.
+   */
+  touchedRecentlyIds: string[];
 };
 
 export type RetentionBoundaries = {
@@ -82,6 +123,8 @@ export type RetentionBoundaries = {
   staleBeforeMs: number;
   orphansBeforeMs: number;
   quietMs: number;
+  /** A1: how long a just-restored id is protected from being re-archived. */
+  restoreGraceMs: number;
   nowMs: number;
 };
 
@@ -97,6 +140,7 @@ export const DEFAULT_SUBAGENT_DAYS = 14;
 export const DEFAULT_STALE_DAYS = 45;
 export const DEFAULT_ORPHAN_DAYS = 14;
 export const DEFAULT_QUIET_MINUTES = 60;
+export const DEFAULT_RESTORE_GRACE_DAYS = 7;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -108,6 +152,7 @@ export function resolveBoundaries(
     staleBefore?: number | string;
     orphansBefore?: number | string;
     quietMinutes?: number;
+    restoreGraceDays?: number;
   } = {},
 ): RetentionBoundaries {
   return {
@@ -117,6 +162,7 @@ export function resolveBoundaries(
     staleBeforeMs: resolveBoundary(nowMs, overrides.staleBefore, DEFAULT_STALE_DAYS),
     orphansBeforeMs: resolveBoundary(nowMs, overrides.orphansBefore, DEFAULT_ORPHAN_DAYS),
     quietMs: (overrides.quietMinutes ?? DEFAULT_QUIET_MINUTES) * 60 * 1000,
+    restoreGraceMs: (overrides.restoreGraceDays ?? DEFAULT_RESTORE_GRACE_DAYS) * DAY_MS,
   };
 }
 
@@ -351,6 +397,7 @@ export async function scanSessionDir(hotDir: string): Promise<{
 export function staticBlockerFor(
   candidate: ArchiveCandidate,
   boundaries: RetentionBoundaries,
+  manifest: ManifestRetentionView = EMPTY_MANIFEST_VIEW,
 ): { blocker: ArchiveBlocker; detail?: string } | undefined {
   if (candidate.files.some(isHostileFileName)) {
     // ⚠️ REFUSE, DO NOT ESCAPE. `MANIFEST.tsv`'s `file` column is the one column
@@ -369,18 +416,65 @@ export function staticBlockerFor(
   if (recordBlocker) {
     return { blocker: recordBlocker };
   }
-  if (hasActiveSidecar(candidate.safeId, candidate.files)) {
+  return dynamicBlockerFor(candidate, boundaries, manifest);
+}
+
+function dynamicBlockerFor(
+  candidate: ArchiveCandidate,
+  boundaries: RetentionBoundaries,
+  manifest: ManifestRetentionView,
+): { blocker: ArchiveBlocker; detail?: string } | undefined {
+  // ⚠️ THE DELIVERY FAMILY BLOCKS T1-T3 AND **NEVER T4**, AND THE GATE IS RECORD
+  // PRESENCE. An orphan has no record, so NOTHING CAN EVER DELIVER to it — a
+  // `.delivery.json` there is reseeding something unresumable. Blocking on it
+  // (the natural implementation, and what §6.3 originally said) makes those ids
+  // PERMANENTLY UNARCHIVABLE: measured, **113 orphans carry one**. This is the
+  // case where the old spec text and the obvious code agree with each other and
+  // are both wrong. The liveness gate carries the same carve-out — fixing only
+  // one of the two sites leaves the ids blocked by the other.
+  if (candidate.record != null && hasActiveSidecar(candidate.safeId, candidate.files)) {
     return { blocker: "active-delivery-sidecar" };
+  }
+  const restoreBlocker = restoreGraceBlockerFor(candidate, boundaries, manifest);
+  if (restoreBlocker) {
+    return restoreBlocker;
   }
   // ⚠️ THE QUIET WINDOW IS A DIFFERENT QUESTION FROM AGE, and it legitimately
   // counts EVERY file including the record: "has anything at all touched this id
-  // in the last hour" is exactly what a pre-move quiet period should ask. Do not
-  // fold it into `retentionMtimeAnchorMs` — that function answers "was this
-  // session USED", which is a claim about the user, not about the process.
+  // in the last hour" is exactly what a pre-move quiet period should ask. Do NOT
+  // fold it into `retentionMtimeAnchorMs` — that answers "was this session USED",
+  // a claim about the user rather than about the process. It is safe at this
+  // timescale where the 45-day version was not: measured, 122 of 1,433 hot ids
+  // have a file touched in the last hour, 103 of them record/delivery-only, so
+  // contamination costs a 60-MINUTE DEFERRAL RE-EVALUATED NEXT RUN, never a
+  // permanent one.
   if (boundaries.nowMs - candidate.newestMtimeMs < boundaries.quietMs) {
     return { blocker: "touched-recently" };
   }
   return undefined;
+}
+
+/**
+ * ⚠️ WITHOUT THIS, A RESTORE IS UNDONE 60 MINUTES LATER. A restored session is
+ * still `closed:true` and its end-of-life anchor is the manifest's immutable
+ * original, so the moment its files fall out of the quiet window it qualifies for
+ * the closed tier again. The grace period is what makes "restore to consult"
+ * actually usable.
+ */
+function restoreGraceBlockerFor(
+  candidate: ArchiveCandidate,
+  boundaries: RetentionBoundaries,
+  manifest: ManifestRetentionView,
+): { blocker: ArchiveBlocker; detail?: string } | undefined {
+  const restoredAt = manifest.lastRestoredAtById.get(candidate.id);
+  if (restoredAt == null) {
+    return undefined;
+  }
+  const restoredMs = Date.parse(restoredAt);
+  if (!Number.isFinite(restoredMs) || boundaries.nowMs - restoredMs >= boundaries.restoreGraceMs) {
+    return undefined;
+  }
+  return { blocker: "recently-restored", detail: restoredAt };
 }
 
 function recordBlockerFor(record: ArchiveRecordView | undefined): ArchiveBlocker | undefined {
@@ -400,41 +494,54 @@ function recordBlockerFor(record: ArchiveRecordView | undefined): ArchiveBlocker
 }
 
 /**
- * 🛑 THE FILE-MTIME LEG OF THE AGE PREDICATE, ISOLATED ON PURPOSE — IT IS UNDER
- * ACTIVE AMENDMENT AND MUST NOT BE INLINED AT ANY CALL SITE.
+ * 🛑 THE FILE-MTIME LEG OF THE AGE PREDICATE — **T4 (ORPHANS) ONLY**. T1, T2 and
+ * T3 HAVE NO MTIME LEG AT ALL. This is settled (amendment A3), not configurable,
+ * and the leg is REMOVED from the record tiers rather than left switched off: a
+ * removed leg a build can still carry is a leg that comes back.
  *
- * BRIEF §6.4 as written says age is `now − max(mtime over the id's ENTIRE file
- * set)` AND the record field, both past the boundary. Implemented here as written.
+ * ⚠️ WHY IT WAS DROPPED, MEASURED OFF THE REAL MANIFEST. BRIEF §6.4 as first
+ * written made age `now − max(mtime over the id's ENTIRE file set)` AND the record
+ * field. Of wave 2's 275 not-closed ids, 170 had a file newer than the cutoff —
+ * the young file being the RECORD `<id>.json` in 167 cases, `.delivery.json` in 7,
+ * and a stream/messages/timestamps sidecar in **ZERO**. Wave 1's closed tier: 122
+ * of 1,060 young, 114 via `<id>.json`, again zero via a transcript sidecar. So
+ * `max(mtime)` is dominated by PRODUCT-SIDE RECORD REWRITES — index projections,
+ * cost/usage fields, `served`, favorites, close cascades — on sessions nobody has
+ * used for 45-90 days. Taken literally it would have kept 62% of wave 2 and 12%
+ * of wave 1 hot for no user-facing reason, and since those records keep being
+ * rewritten they would NEVER age out. It measured "did acpx-ui touch this record",
+ * not "was this session used".
  *
- * ⚠️ BUT THE "ENTIRE FILE SET" PART IS MEASURED WRONG, and the measurement is the
- * parent brick's, off the real manifest. Of wave 2's 275 not-closed ids, 170 had
- * some file newer than the cutoff — and the young file was the RECORD `<id>.json`
- * in 167 cases, `.delivery.json` in 7, and a stream/messages/timestamps sidecar in
- * ZERO. Wave 1's closed tier: 122 of 1,060 young, 114 of them via `<id>.json`,
- * again zero via a transcript sidecar. `max(mtime)` is therefore dominated by
- * PRODUCT-SIDE RECORD REWRITES — index projections, cost/usage fields, `served`,
- * favorites, close cascades — on sessions nobody has used for 45-90 days. Taken
- * literally this leg would keep 62% of wave 2 and 12% of wave 1 hot for no
- * user-facing reason, and because those records keep being rewritten they would
- * NEVER age out. It measures "did acpx-ui touch this record", not "was this
- * session used".
+ * ⚠️ T4 KEEPS A LEG BECAUSE IT HAS NO ALTERNATIVE. An orphan has no record by
+ * definition, so there is no record field to read instead — and by the same
+ * definition the contaminating file class is absent by construction: of the 1,792
+ * `orphan-sidecars` ids in the manifest, **0 carry a bare `<id>.json`**.
  *
- * The two corrections conception is choosing between: restrict this to TRANSCRIPT
- * SIDECARS only (`.stream*`, `.messages.ndjson`, `.timestamps.ndjson`,
- * `.owner.log`, excluding `.json` and `.delivery.json`), or drop the mtime leg
- * entirely and rely on the record field plus the run-time liveness gate. Either
- * way `.delivery.json` will not be a youth signal — it is already an
- * `ACTIVE_SIDECAR_SUFFIX` exclusion, and letting it also make a session look young
- * double-counts one fact through two mechanisms.
+ * ⚠️ AND THE RULE IS AN **EXCLUSION**, NOT AN ALLOWLIST — see
+ * `isRecordWriteArtifact` for the 49 orphan ids carrying `.json.<pid>.<ts>.tmp`
+ * record temps that a transcript-sidecar allowlist would miss.
  *
- * ⚠️ AND DO NOT DESIGN AGAINST THE RIG'S `AGE-AND-mtime-young` FIXTURE AS IT
+ * ⚠️ DO NOT VALIDATE THIS AGAINST THE RIG'S `AGE-AND-mtime-young` FIXTURE AS IT
  * STANDS: it is built from the RECORD's mtime, i.e. from exactly the signal this
- * note says is invalid. It is being rebuilt from a transcript sidecar mtime.
- *
- * When the amendment lands it is a change to THIS FUNCTION and nothing else.
+ * note says is invalid, and it is being rebuilt.
  */
 export function retentionMtimeAnchorMs(candidate: ArchiveCandidate): number | undefined {
-  return candidate.newestMtimeMs === 0 ? undefined : candidate.newestMtimeMs;
+  // Never consulted for a record tier. Guarded here as well as at the call site so
+  // a future caller cannot reintroduce the leg by reaching for this function.
+  if (candidate.record != null) {
+    return undefined;
+  }
+  let newest = 0;
+  for (const [file, mtimeMs] of candidate.fileMtimes) {
+    if (
+      isDeliveryFamilyFile(candidate.safeId, file) ||
+      isRecordWriteArtifact(candidate.safeId, file)
+    ) {
+      continue;
+    }
+    newest = Math.max(newest, mtimeMs);
+  }
+  return newest === 0 ? undefined : newest;
 }
 
 /**
@@ -451,12 +558,16 @@ export function tierFor(
   candidate: ArchiveCandidate,
   boundaries: RetentionBoundaries,
   includeOrphans: boolean,
+  manifest: ManifestRetentionView = EMPTY_MANIFEST_VIEW,
 ): { tier: ArchiveTier; reason: string } | undefined {
   const record = candidate.record;
   if (!record) {
     return orphanTierFor(candidate, boundaries, includeOrphans);
   }
-  const anchor = recordAgeAnchor(record);
+  // ⚠️ `effectiveEndedAt`, NOT `recordAgeAnchor`: the manifest's FIRST archive row
+  // wins over the record's current `closed_at`, which a restore-and-re-close
+  // re-stamps. See `record-view.ts` for why that distinction is the whole of A1.
+  const anchor = effectiveEndedAt(record, manifest.endOfLifeById.get(candidate.id));
   if (record.closed) {
     return isOldEnough(candidate, anchor, boundaries.closedBeforeMs)
       ? { tier: "closed", reason: `closed-before-${boundaryDateToken(boundaries.closedBeforeMs)}` }
@@ -488,21 +599,25 @@ function orphanTierFor(
     : undefined;
 }
 
+/**
+ * ⚠️ TWO DISJOINT PATHS, NOT AN `AND`. A record tier (T1/T2/T3) is decided by the
+ * end-of-life anchor ALONE; an orphan (T4) by the mtime anchor ALONE. The
+ * `max(mtime)` AND that BRIEF §6.4 originally specified is gone — see
+ * `retentionMtimeAnchorMs` for the measurement that removed it.
+ */
 function isOldEnough(
   candidate: ArchiveCandidate,
   anchor: string | undefined,
   boundaryMs: number,
 ): boolean {
-  const mtimeAnchorMs = retentionMtimeAnchorMs(candidate);
-  if (mtimeAnchorMs != null && mtimeAnchorMs >= boundaryMs) {
-    return false;
+  if (candidate.record == null) {
+    const mtimeAnchorMs = retentionMtimeAnchorMs(candidate);
+    return mtimeAnchorMs != null && mtimeAnchorMs < boundaryMs;
   }
   if (anchor == null) {
-    // No record field to check: an orphan is decided by the mtime leg alone (and
-    // an id with no usable mtime at all cannot have its age established either
-    // way). A RECORD with no usable timestamp is not old — same direction as
-    // `record-unparseable`: unknown age is not old age.
-    return candidate.record == null && mtimeAnchorMs != null;
+    // A record with no usable timestamp at all cannot have its age established.
+    // Same direction as `record-unparseable`: unknown age is not old age.
+    return false;
   }
   const anchorMs = Date.parse(anchor);
   return Number.isFinite(anchorMs) && anchorMs < boundaryMs;
@@ -539,6 +654,7 @@ export type PlanInput = {
   explicitIds?: readonly string[];
   limit?: number;
   liveness: LivenessGateOptions;
+  manifest?: ManifestRetentionView;
 };
 
 type PlanState = {
@@ -576,12 +692,13 @@ function considerCandidate(
   candidate: ArchiveCandidate,
   isExplicit: boolean,
 ): void {
-  const staticBlocker = staticBlockerFor(candidate, input.boundaries);
+  const manifest = input.manifest ?? EMPTY_MANIFEST_VIEW;
+  const staticBlocker = staticBlockerFor(candidate, input.boundaries, manifest);
   if (staticBlocker) {
     block(state, candidate, staticBlocker.blocker, staticBlocker.detail);
     return;
   }
-  const tier = tierFor(candidate, input.boundaries, input.includeOrphans || isExplicit);
+  const tier = tierFor(candidate, input.boundaries, input.includeOrphans || isExplicit, manifest);
   if (tier) {
     state.selected.set(candidate.id, { candidate, ...tier });
     return;
@@ -655,7 +772,7 @@ function pullCompanion(
   if (!companion) {
     return false;
   }
-  const staticBlocker = staticBlockerFor(companion, input.boundaries);
+  const staticBlocker = staticBlockerFor(companion, input.boundaries, input.manifest);
   if (staticBlocker) {
     block(state, companion, staticBlocker.blocker, staticBlocker.detail);
     return false;
@@ -710,6 +827,7 @@ async function applyLivenessGate(state: PlanState, input: PlanInput): Promise<vo
       planned.candidate.files,
       planned.candidate.record?.pid,
       input.liveness,
+      planned.candidate.record != null,
     );
     if (verdict.live) {
       state.selected.delete(id);
@@ -749,6 +867,9 @@ export async function buildArchivePlan(input: PlanInput): Promise<ArchivePlan> {
     orphanAggregate: aggregateOrphans(selected),
     boundaries: input.boundaries,
     livenessDegraded: input.liveness.wakeups.status === "unevaluable",
+    touchedRecentlyIds: state.blocked
+      .filter((entry) => entry.blocker === "touched-recently")
+      .map((entry) => entry.candidate.id),
   };
 }
 

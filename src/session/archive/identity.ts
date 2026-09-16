@@ -71,6 +71,8 @@ const ACTIVE_SIDECAR_SUFFIXES: readonly string[] = [
   ".inflight.json",
 ];
 
+const DELIVERY_FAMILY_PREFIXES: readonly string[] = [".delivery.", ".queue.", ".inflight."];
+
 /** The id part of a filename under the first-dot split — orphans only. */
 function idPartOf(fileName: string): string {
   const dot = fileName.indexOf(".");
@@ -123,6 +125,33 @@ export function hasActiveSidecar(safeId: string, files: readonly string[]): bool
   return files.some((file) =>
     ACTIVE_SIDECAR_SUFFIXES.some((suffix) => file === `${safeId}${suffix}`),
   );
+}
+
+/**
+ * The delivery FAMILY — the three active sidecars plus everything hanging off
+ * them, notably the base64 delivery locks (`<id>.delivery.json.<b64>.delivery.lock`).
+ *
+ * A prefix match, not a suffix allowlist, for the reason conception gave for the
+ * unit of archiving generally: a hand-written list misses the variants that
+ * actually exist on disk.
+ */
+export function isDeliveryFamilyFile(safeId: string, file: string): boolean {
+  return DELIVERY_FAMILY_PREFIXES.some((prefix) => file.startsWith(`${safeId}${prefix}`));
+}
+
+/**
+ * `<id>.json` and every record-write artifact hanging off it —
+ * `<id>.json.bak-mig-<TS>`, `<id>.json.<pid>.<ts>.tmp`.
+ *
+ * ⚠️ THE `.tmp` CASE IS WHY THIS IS AN EXCLUSION AND NOT AN ALLOWLIST, and it is
+ * measured: 49 orphan ids carry `<id>.json.<pid>.<ts>.tmp` record-write temps.
+ * Those are record machinery with record-like mtimes, so a "transcript sidecars
+ * only" ALLOWLIST would silently miss them while an exclusion catches them. The
+ * allowlist-vs-exclusion question dissolves rather than being answered.
+ */
+export function isRecordWriteArtifact(safeId: string, file: string): boolean {
+  const recordFile = recordFileNameFor(safeId);
+  return file === recordFile || file.startsWith(`${recordFile}.`);
 }
 
 /** TAB/CR/LF in a filename — formats §2 C2.5. */
