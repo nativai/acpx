@@ -32,6 +32,8 @@ const FIXTURE = {
   public_base_url: "https://fixture.invalid",
 };
 const LOCAL_INSTANCE = "i-aaaaaaaaaaaa";
+/** A foreign id that PASSES readLocalIdentity's `i-` + 12-hex shape check. See the boundary rows. */
+const WELL_FORMED_FOREIGN = "i-bbbbbbbbbbbb";
 const RECORD_ID = "11111111-1111-4111-8111-111111111111";
 const BRICK_ID = "22222222-2222-4222-8222-222222222222";
 
@@ -167,6 +169,40 @@ if (scenario === "local-bind") {
   );
   const key = ["instance", "id"].join("_");
   outcome = attempt(() => write(key, FIXTURE.instance_id));
+} else if (scenario === "forged-instance-record") {
+  // BOUNDARY, MEASURED RATHER THAN INFERRED: the guard compares the bind against instance.json,
+  // so something that FORGES instance.json in the HOME it is binding against is PERMITTED. That
+  // is a different and worse attack — it corrupts the box's identity record itself — and this
+  // brick does not defend against it. Recorded so no reader infers a guarantee that was not made.
+  // ⚠️ The forged id is WELL-FORMED (i- + 12 hex) on purpose. A first version of this probe forged
+  // `i-twin0000001` and was refused — by readLocalIdentity's SHAPE check, not by anything to do
+  // with the boundary — which would have recorded a guarantee that does not exist.
+  mintInstanceRecord(WELL_FORMED_FOREIGN);
+  outbox = new BrickOutbox();
+  outcome = attempt(() => outbox.bindIdentity({ ...FIXTURE, instance_id: WELL_FORMED_FOREIGN }));
+} else if (scenario === "copied-instance-record") {
+  // The near neighbour of the above, and it does NOT get through: a record COPIED from another
+  // box carries that box's `home`, and readLocalIdentity refuses on the home mismatch. The id is
+  // well-formed here so the refusal is attributable to the HOME alone.
+  const dir = path.join(os.homedir(), ".acpx");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "instance.json"),
+    JSON.stringify({
+      instance_id: WELL_FORMED_FOREIGN,
+      created_at: new Date().toISOString(),
+      home: "/home/node",
+      machine_id: "f".repeat(64),
+    }),
+  );
+  outbox = new BrickOutbox();
+  outcome = attempt(() => outbox.bindIdentity({ ...FIXTURE, instance_id: WELL_FORMED_FOREIGN }));
+} else if (scenario === "malformed-instance-record") {
+  // Why the outage's OWN identity cannot be laundered through a forgery: `i-twin0000001` is not
+  // `i-` + 12 hex, so readLocalIdentity refuses the record itself before any comparison happens.
+  mintInstanceRecord(FIXTURE.instance_id);
+  outbox = new BrickOutbox();
+  outcome = attempt(() => outbox.bindIdentity(FIXTURE));
 } else if (scenario === "setmeta-ordinary-key") {
   // CONTROL for setmeta-bypass: an ORDINARY meta key must still be writable, or the previous
   // scenario's refusal would prove only that the probe was broken.

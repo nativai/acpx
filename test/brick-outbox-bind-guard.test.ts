@@ -126,6 +126,39 @@ test("42b4fb28 bind: the identity meta rows refuse a writer that names neither m
   assert.equal(observed.meta.instance_id, null);
 });
 
+test("42b4fb28 bind: BOUNDARY — a FORGED instance.json in the target HOME is permitted", () => {
+  // ⚠️ THIS ROW PINS A NON-GUARANTEE, and it is green on purpose. The guard's whole comparison is
+  // against `<HOME>/.acpx/instance.json`, so anything that WRITES that file and then binds a
+  // matching identity is admitted. That is a strictly worse and different attack — it corrupts
+  // the box's own identity record, which every projection afterwards reads — and brick 42b4fb28
+  // does not defend against it. If this row ever goes red, the guard's scope GREW; find out why
+  // before changing the row, because a reader is relying on this boundary being where it says.
+  const observed = probe("forged-instance-record");
+  assert.equal(observed.threw, false, observed.message);
+  assert.equal(observed.meta.instance_id, "i-bbbbbbbbbbbb");
+});
+
+test("42b4fb28 bind: a COPIED instance.json from another HOME is refused", () => {
+  // The near neighbour of the row above, and the reason that boundary is narrower than it looks:
+  // a record copied rather than forged still carries the ORIGINAL `home`, and readLocalIdentity
+  // refuses on it. The forgery has to be deliberate, not a stray `cp -r`. The id here is
+  // well-formed, so this refusal is attributable to the HOME and to nothing else.
+  const observed = probe("copied-instance-record");
+  assert.equal(observed.threw, true);
+  assert.equal(observed.code, "instance-identity-moved");
+  assert.equal(observed.meta.instance_id, null);
+});
+
+test("42b4fb28 bind: the outage's own identity cannot be laundered through a forgery", () => {
+  // `i-twin0000001` is not `i-` + 12 hex, so readLocalIdentity refuses the RECORD before the
+  // comparison happens. This row is also the discriminator for the boundary row above: without
+  // it, that row's first version read a shape refusal as evidence about the forgery boundary.
+  const observed = probe("malformed-instance-record");
+  assert.equal(observed.threw, true);
+  assert.equal(observed.code, "instance-identity-moved");
+  assert.equal(observed.meta.instance_id, null);
+});
+
 test("42b4fb28 bind: CONTROL — an ordinary meta key is still writable", () => {
   // Without this row, the refusal above would be consistent with a guard that refuses every
   // setMeta call, i.e. with a probe that proves nothing about the identity rows specifically.
