@@ -329,8 +329,16 @@ export function projectionIdentity(
   bound?: { instance_id: string; box: string; public_base_url: string },
 ): ProjectionIdentity {
   const identity = readLocalIdentity();
-  const base =
-    bound?.public_base_url ?? process.env.ACPX_UI_BASE_URL ?? process.env.ACPX_SESSION_URL;
+  // ⚠️ NEVER fall back to `process.env.ACPX_SESSION_URL`. That is an IDENTITY variable (names the
+  // CALLING agent's own session) forwarded by ssh-remote, never a box LOCATOR — ssh-remote
+  // deliberately withholds `ACPX_UI_BASE_URL` for exactly this reason. Only the ORIGIN of `base`
+  // is used below, so on a box reached remotely with no `ACPX_UI_BASE_URL` of its own, this used to
+  // silently fall through to the CALLER's session URL and mint a projection naming the ORIGINATING
+  // box rather than the box the work actually happened on — a cross-box corruption vector (97c158ed,
+  // ownership split from 42b4fb28: this fixes LOCATOR RESOLUTION; bind AUTHORIZATION is that
+  // brick's). `ACPX_UI_BASE_URL` remains a legitimate fallback — it is a deliberately-set box marker
+  // (the same role it plays in acpx-ui's own CLI), never a per-session accident.
+  const base = bound?.public_base_url ?? process.env.ACPX_UI_BASE_URL;
   if (!base) {
     throw new OutboxError("instance-url-missing", "projection requires ACPX_UI_BASE_URL");
   }
@@ -341,7 +349,11 @@ export function projectionIdentity(
   url.searchParams.set("session", String(record.acpx_record_id));
   return {
     instance_id: identity.instance_id,
-    box: bound?.box ?? process.env.ACPX_BOX ?? null,
+    // Same reasoning as `base`: `ACPX_BOX` is not a deliberately-bound box locator, and reading it
+    // as one previously produced `null` silently on every unbound projection anyway (measured:
+    // 1,863 of 1,863 session_link rows) — so dropping it changes no observed behavior while closing
+    // the same accident channel `base` had.
+    box: bound?.box ?? null,
     session_url: url.href,
     agent_type: projectionAgentType(record),
   };
