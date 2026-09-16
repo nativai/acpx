@@ -729,6 +729,24 @@ export class BrickOutbox {
     // which is exactly the re-entry that would let an unchecked identity through. Below the
     // assignment, nothing but two `setMeta` calls executes, and neither evaluates caller code.
     const encoded = projection === undefined ? null : JSON.stringify(projection);
+    // 🛑 AND THEN CHECK THE BYTES, NOT THE ARGUMENT. `projection_identity` — not the scalar above —
+    // is the row `identityForRecord` compares against instance.json, so it is the row whose
+    // poisoning wedges the box. `toJSON` can return an identity that has nothing to do with the
+    // `instanceId` just admitted: measured at acpx 6a0ab15, a `toJSON` returning
+    // `i-twin0000001`/`f32-twin`/`https://fixture.invalid` made bindIdentity SUCCEED while writing
+    // exactly the 2026-09-15 payload, and the very next `identityForRecord` threw
+    // `identity binding differs from instance.json` — the outage error, straight through the guard.
+    // ⚠️ DO NOT "SIMPLIFY" THIS TO A CHECK ON `projection.instance_id`. That is the argument again,
+    // and it is the bug: the argument and the serialised bytes are not the same value.
+    if (encoded !== null) {
+      const written = JSON.parse(encoded) as { instance_id?: unknown };
+      if (written.instance_id !== admitted) {
+        throw new OutboxError(
+          "outbox-foreign-bind",
+          `refusing to write a projection identity for ${String(written.instance_id)} into ${this.dbPath}: ${path.join(os.homedir(), ".acpx", "instance.json")} admits ${admitted}. The serialised identity disagrees with the one that was checked (brick 42b4fb28).`,
+        );
+      }
+    }
     this.admittingIdentity = true;
     try {
       this.setMeta("instance_id", instanceId);

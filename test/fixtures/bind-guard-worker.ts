@@ -214,6 +214,28 @@ if (scenario === "local-bind") {
   mintInstanceRecord(FIXTURE.instance_id);
   outbox = new BrickOutbox();
   outcome = attempt(() => outbox.bindIdentity(FIXTURE));
+} else if (scenario === "tojson-payload-swap") {
+  // THE ROW THAT ACTUALLY DECIDES. `projection_identity` — not the scalar — is what
+  // `identityForRecord` compares against instance.json, so it is the row whose poisoning wedges
+  // the box. The scalar handed to the guard is LOCAL and passes honestly; `toJSON` then returns a
+  // completely different identity, so the ARGUMENT and the SERIALISED BYTES disagree.
+  // Found by an independent test-engineer attacking the guard, and it reproduced the outage error
+  // exactly: measured at acpx 6a0ab15 the bind SUCCEEDED, `projection_identity` held
+  // i-twin0000001/f32-twin/https://fixture.invalid, and the next identityForRecord threw
+  // "identity binding differs from instance.json".
+  mintInstanceRecord();
+  outbox = new BrickOutbox();
+  const swapped = {
+    instance_id: LOCAL_INSTANCE,
+    box: "devbox.nativai.de",
+    public_base_url: "https://atrium.devbox.nativai.de",
+    toJSON: () => FIXTURE,
+  };
+  outcome = attempt(() =>
+    outbox.bindIdentity(
+      swapped as unknown as { instance_id: string; box: string; public_base_url: string },
+    ),
+  );
 } else if (scenario === "reentrant-tojson") {
   // RE-ENTRY: the admission window is a per-instance boolean, so anything that runs caller code
   // INSIDE it can write an unchecked identity. `JSON.stringify(projection)` is the only such

@@ -128,6 +128,23 @@ test("42b4fb28 bind: the identity meta rows refuse a writer that names neither m
   assert.equal(observed.meta.instance_id, null);
 });
 
+test("42b4fb28 bind: the SERIALISED identity is checked, not the argument", () => {
+  // `projection_identity` — not the scalar — is the row `identityForRecord` compares against
+  // instance.json, so it is the row whose poisoning wedges the box. Here the scalar is LOCAL and
+  // passes honestly, while `toJSON` returns the 2026-09-15 fixture identity: the argument and the
+  // bytes disagree. Measured at acpx 6a0ab15 (before this check) the bind SUCCEEDED, the row held
+  // i-twin0000001, and the next identityForRecord threw "identity binding differs from
+  // instance.json" — the outage error, straight through the guard.
+  //
+  // ⚠️ DO NOT "SIMPLIFY" THE PRODUCTION CHECK TO `projection.instance_id`. That is the argument
+  // again, and it is the bug this row exists to catch.
+  const observed = probe("tojson-payload-swap");
+  assert.equal(observed.threw, true);
+  assert.equal(observed.code, "outbox-foreign-bind");
+  assert.equal(observed.meta.instance_id, null);
+  assert.equal(observed.meta.projection_identity, null);
+});
+
 test("42b4fb28 bind: caller code cannot re-enter the admission window", () => {
   // The window is a per-instance boolean, so anything that runs CALLER CODE while it is open can
   // write an unchecked identity. `JSON.stringify(projection)` was that: `toJSON` is caller code.
