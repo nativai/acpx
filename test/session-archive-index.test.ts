@@ -56,7 +56,12 @@ test("🛑 AC-11 is ENTRY-identity: two rebuilds agree on `.entries`, and the FI
   const first = await fs.readFile(path.join(dir, "ARCHIVE-INDEX", "2026-09.json"), "utf8");
 
   // Same input, different order, different generatedAt — i.e. a rebuild.
-  await writeArchiveIndexShard(dir, "2026-09", [...entries].toReversed(), "2026-09-16T19:00:00.000Z");
+  await writeArchiveIndexShard(
+    dir,
+    "2026-09",
+    [...entries].toReversed(),
+    "2026-09-16T19:00:00.000Z",
+  );
   const second = await fs.readFile(path.join(dir, "ARCHIVE-INDEX", "2026-09.json"), "utf8");
 
   const entriesOf = (payload: string): string =>
