@@ -309,6 +309,37 @@ function readLocalIdentity(): { instance_id: string; home: string } {
   }
   return identity;
 }
+
+/**
+ * The instance id this HOME admits — the only identity an outbox living under this HOME may carry.
+ *
+ * ⚠️ TAKES NO ARGUMENT, AND THAT IS THE WHOLE POINT. `BrickOutbox`'s constructor derives `dbPath`
+ * from `os.homedir()`; `readLocalIdentity()` derives the admitted id from the same `os.homedir()`.
+ * Both sides of the comparison therefore come from the environment the process is actually running
+ * in, and a caller cannot make them agree by handing one of them in. A version of this that
+ * accepted the local id as a parameter would agree with whatever a test injected and could never
+ * fail — the shape that let 13 green tests sit on top of an open hole in the sibling fix.
+ *
+ * A missing / unreadable `instance.json` is a REFUSAL, not a permit: this HOME has not been
+ * admitted, so nothing may bind an outbox under it (brick 42b4fb28; the ladder in 507a1c38 —
+ * missing or unresolved locator ⇒ hard error, never a fallback). Production never reaches this
+ * state, because acpx-ui mints the record before it starts the trigger owner and leaves the owner
+ * OFF when the mint fails (acpx-ui `server/index.ts` → `bootInstanceRecord()`).
+ */
+function admittedInstanceId(): string {
+  try {
+    return readLocalIdentity().instance_id;
+  } catch (error) {
+    if (error instanceof OutboxError) {
+      throw error;
+    }
+    throw new OutboxError(
+      "outbox-home-unadmitted",
+      `this HOME has no admitted instance identity at ${path.join(os.homedir(), ".acpx", "instance.json")}, so nothing may bind an outbox under it: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 function projectionAgentType(record: DiskRecord): string | null {
   // agent_command is a string in every real session record; non-strings stringify to a
   // value no agent-type prefix regex below can match, so "" is the same observable result.
@@ -652,9 +683,43 @@ export class BrickOutbox {
       if (previous && previous !== identity.instance_id) {
         throw new OutboxError("outbox-instance-mismatch", "outbox belongs to another instance");
       }
-      this.setMeta("instance_id", identity.instance_id);
-      this.setMeta("projection_identity", JSON.stringify(identity));
+      this.admitInstanceIdentity(identity.instance_id, identity);
     });
+  }
+
+  /**
+   * ⚠️ THE ONLY WRITER of this outbox's two identity meta rows (`instance_id`,
+   * `projection_identity`) — and therefore the only place the HOME check has to live. Guarding
+   * `bindIdentity` alone would guard an IDENTIFIER; the capability is *writing an identity into
+   * the meta of the outbox under this HOME*, and `checkProjectionInstance` reaches it too, from
+   * the PUBLIC `prepareProjection(id, record, identity)` whose identity is caller-supplied.
+   *
+   * ⚠️ DO NOT ADD A `setMeta("instance_id", …)` OR `setMeta("projection_identity", …)` ANYWHERE
+   * ELSE IN THIS CLASS. It looks like a harmless shortcut and it is the bug: on 2026-09-15 an
+   * acpx-ui test bound the fixture identity `i-twin0000001` into devbox's real outbox and every
+   * session-mutating operation on the box failed for ~80 minutes with `identity binding differs
+   * from instance.json` (bricks 507a1c38 / 42b4fb28). `test/brick-outbox-bind-guard.test.ts`
+   * enumerates the occurrences and goes red on a second writer.
+   *
+   * The refusal is ABSENCE-PROOF: `admittedInstanceId()` derives the admitted id from
+   * `os.homedir()` and throws when it cannot, so there is no configuration whose absence turns
+   * this into a permit, and no environment variable selects the permissive branch.
+   */
+  private admitInstanceIdentity(
+    instanceId: string,
+    projection?: { instance_id: string; box: string; public_base_url: string },
+  ): void {
+    const admitted = admittedInstanceId();
+    if (instanceId !== admitted) {
+      throw new OutboxError(
+        "outbox-foreign-bind",
+        `refusing to bind ${instanceId} into ${this.dbPath}: ${path.join(os.homedir(), ".acpx", "instance.json")} admits ${admitted}. An outbox under a HOME may only carry that HOME's own instance identity — mint an isolated HOME for this process instead of writing into the box's own (brick 42b4fb28).`,
+      );
+    }
+    this.setMeta("instance_id", instanceId);
+    if (projection) {
+      this.setMeta("projection_identity", JSON.stringify(projection));
+    }
   }
   identityForRecord(record: DiskRecord): ProjectionIdentity {
     const encoded = this.meta("projection_identity");
@@ -1289,7 +1354,7 @@ export class BrickOutbox {
     if (stored && stored !== id) {
       throw new OutboxError("outbox-instance-mismatch", "outbox belongs to another instance");
     }
-    this.setMeta("instance_id", id);
+    this.admitInstanceIdentity(id);
   }
   private nextProjectionCounter(
     id: string,
