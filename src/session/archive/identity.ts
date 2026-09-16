@@ -154,6 +154,17 @@ export function isRecordWriteArtifact(safeId: string, file: string): boolean {
   return file === recordFile || file.startsWith(`${recordFile}.`);
 }
 
+/**
+ * A filename token that is really a delivery sidecar's name minus `.json`.
+ *
+ * Deliberately a SUFFIX test on the token rather than a prefix test against a
+ * known id: the archive-side claimer does not yet know the id when it builds its
+ * candidate set — that is the whole ordering problem this guards.
+ */
+function isDeliveryFamilyToken(token: string): boolean {
+  return DELIVERY_FAMILY_PREFIXES.some((prefix) => token.endsWith(prefix.slice(0, -1)));
+}
+
 /** TAB/CR/LF in a filename — formats §2 C2.5. */
 export function isHostileFileName(fileName: string): boolean {
   return /[\t\r\n]/.test(fileName);
@@ -262,16 +273,10 @@ export function claimOrphanFileSets(unclaimed: readonly string[]): {
  * implementation loses.
  */
 export function claimArchiveFileSets(files: readonly string[]): Map<string, string[]> {
-  // Archive-side candidates come from the record files that are actually there,
-  // which is the same record-driven enumeration as the hot side — just without
-  // the ingest guards.
-  const candidates = new Set<string>();
-  for (const file of files) {
-    if (file.endsWith(".json") && !RESERVED_ID_PARTS.has(idPartOf(file))) {
-      candidates.add(file.slice(0, -".json".length));
-    }
-  }
-  const { claimed, unclaimed } = claimFileSets(files, candidates);
+  const { claimed, unclaimed } = claimFileSets(files, archiveCandidateTokens(files));
+  // Leftovers fall back to the first-dot split. For a pure ORPHAN this is the only
+  // available rule — it has no record to enumerate an id from — and it is what
+  // keeps an orphan's whole file set together on restore.
   for (const file of unclaimed) {
     const idPart = idPartOf(file);
     if (idPart === file || RESERVED_ID_PARTS.has(idPart)) {
@@ -286,6 +291,42 @@ export function claimArchiveFileSets(files: readonly string[]): Map<string, stri
     }
   }
   return claimed;
+}
+
+/**
+ * Archive-side candidate ids, taken from FILENAMES rather than from parsed records.
+ *
+ * ⚠️ NO SHAPE GUARD AND NO RESERVED FILTER BEYOND THE LITERAL NAMES — this is the
+ * lenient half of formats §2 C2.4 and it is NOT an oversight. See
+ * `INGEST_ORPHAN_ID_SHAPE` for the specimen already on disk (`mid-turn-injection`)
+ * that a symmetric implementation loses.
+ */
+function archiveCandidateTokens(files: readonly string[]): Set<string> {
+  const candidates = new Set<string>();
+  for (const file of files) {
+    if (!file.endsWith(".json") || RESERVED_ID_PARTS.has(idPartOf(file))) {
+      continue;
+    }
+    const token = file.slice(0, -".json".length);
+    // ⚠️ A DELIVERY SIDECAR IS NOT A RECORD, AND ADMITTING ITS TOKEN AS A CANDIDATE
+    // SILENTLY SPLITS AN ID'S FILE SET.
+    //
+    // On the HOT side this cannot happen: candidates there are `<x>.json` files
+    // that PARSE as a session record, and `<id>.delivery.json` does not. The
+    // archive side cannot afford that parse (13,944 files), so it takes the
+    // filename — and `<id>.delivery.json` then yields the token `<id>.delivery`,
+    // which by the longest-prefix rule claims the file away from `<id>` itself.
+    //
+    // Measured, and it is a RESTORE-SIDE DATA BUG rather than a cosmetic one: three
+    // orphan ids archived with their `.delivery.json` restored WITHOUT it, leaving
+    // the file stranded in the archive with nothing pointing at it. It passed the
+    // plan check, the applied-directory check and `--verify`; only a byte-level
+    // round trip caught it.
+    if (!isDeliveryFamilyToken(token)) {
+      candidates.add(token);
+    }
+  }
+  return candidates;
 }
 
 export { ACTIVE_SIDECAR_SUFFIXES, encodeSessionSafeId, RESERVED_ID_PARTS };

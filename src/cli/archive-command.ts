@@ -267,6 +267,20 @@ function archiveRunJson(context: ArchiveContext, result: ArchiveRunResult): unkn
     applied: result.applied,
     firstRunGated: result.firstRunGated,
     selected: result.plan.selected.length,
+    // The per-id plan. Counts alone are a summary; this is the reviewable artifact
+    // — and the only form a checker can diff against an expectation per id.
+    plan: result.plan.selected.map((entry) => ({
+      id: entry.candidate.id,
+      reason: entry.reason,
+      tier: entry.tier,
+      files: entry.candidate.files.length,
+      bytes: entry.candidate.bytes,
+    })),
+    blockedIds: result.plan.blocked.map((entry) => ({
+      id: entry.candidate.id,
+      blocker: entry.blocker,
+      detail: entry.detail,
+    })),
     byTier: planSummary(result.plan),
     blocked: blockerSummary(result.plan),
     droppedAnchors: result.plan.droppedAnchors,

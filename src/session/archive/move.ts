@@ -243,7 +243,16 @@ export async function revalidateBeforeApply(
     return revalidatedRecord;
   }
 
-  const activeSuffix = await findActiveSidecarOnDisk(hotDir, safeId);
+  // ⚠️ GATED ON `hadRecord` — THE THIRD SITE OF THE SAME CARVE-OUT, AND THE ONE
+  // THAT FAILS LATEST AND QUIETEST. The delivery family blocks T1-T3 and NEVER T4:
+  // an orphan has no record, so nothing can ever deliver to it. Ungated, this line
+  // lets an orphan be SELECTED by a correct plan and then silently skipped here at
+  // apply time — so `--dry-run` reports it as archivable forever while no run ever
+  // moves it. Measured against the rig: 3 of 3 `T4-ORPHAN-delivery-present`
+  // fixtures (113 such ids in the real store) planned correctly and were dropped
+  // at this line. Fixing the blocker and the liveness gate without this one leaves
+  // the behaviour unchanged and the bug harder to see.
+  const activeSuffix = hadRecord ? await findActiveSidecarOnDisk(hotDir, safeId) : undefined;
   if (activeSuffix) {
     return { ok: false, reason: "active-delivery-sidecar", detail: activeSuffix };
   }
