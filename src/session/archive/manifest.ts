@@ -43,10 +43,16 @@ export type ArchiveManifestRow = {
  * so escaping it would silently break restore — which is why a hostile filename is
  * a REFUSAL (`hostile-filename`) and not an escaping problem.
  */
-export function cleanManifestText(value: unknown): string {
-  return String(value ?? "")
-    .replace(/[\t\r\n]+/g, " ")
-    .slice(0, 120);
+export function cleanManifestText(value: string | undefined | null): string {
+  // ⚠️ TYPED `string | undefined | null`, NOT `unknown`, DELIBERATELY. The
+  // normative rule (formats §3.3) is written as `String(s ?? '')` — JS, where the
+  // coercion is free. In TypeScript an `unknown` parameter makes `String(value)`
+  // silently stringify an object as `[object Object]` INTO A TAB-SEPARATED AUDIT
+  // COLUMN, which is both useless and, for a value containing a tab, corrupting.
+  // Narrowing the type moves that from a runtime accident to a compile error at
+  // the call site. Behaviour for every value the product actually passes —
+  // strings and absent fields — is identical to the normative rule.
+  return (value ?? "").replace(/[\t\r\n]+/g, " ").slice(0, 120);
 }
 
 export function serializeManifestRow(row: ArchiveManifestRow): string {
