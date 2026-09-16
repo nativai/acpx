@@ -769,9 +769,21 @@ export class BrickOutbox {
     };
     const basic = projectionIdentity(record, bound);
     if (bound.instance_id !== basic.instance_id) {
+      const instanceJsonPath = path.join(os.homedir(), ".acpx", "instance.json");
       throw new OutboxError(
         "outbox-instance-mismatch",
-        "identity binding differs from instance.json",
+        `${this.dbPath} is bound to instance ${bound.instance_id}, but ${instanceJsonPath} now ` +
+          `reports ${basic.instance_id} — every session-mutating operation on this HOME will keep ` +
+          `failing until the stale binding is cleared (brick 7d03eca1). This means either ` +
+          `instance.json was re-minted under an outbox that survived it (a HOME wipe, a restore ` +
+          `from a mismatched backup, or a fresh provision onto a PVC that already carries this ` +
+          `outbox) or the outbox was bound to the wrong identity by mistake — read the ` +
+          `\`meta\` table before acting either way. Recovery (verified 2026-09-15, incident ` +
+          `507a1c38): back up ${this.dbPath}, confirm the mismatch by reading its \`meta\` table, ` +
+          `then run \`DELETE FROM meta WHERE key IN ('instance_id','projection_identity')\` — this ` +
+          `returns the outbox to its pristine unbound state and the next write re-adopts the live ` +
+          `identity. Full procedure: acpx skill → "Recovering a wedged outbox after an ` +
+          `instance.json re-mint".`,
       );
     }
     const url = new URL(bound.public_base_url);
