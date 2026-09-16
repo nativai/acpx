@@ -4,9 +4,14 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { BrickOutbox, openRecordOutbox, type DiskRecord } from "../../brick-outbox.js";
-import { SessionNotFoundError, SessionResolutionError } from "../../errors.js";
+import {
+  SessionArchivedError,
+  SessionNotFoundError,
+  SessionResolutionError,
+} from "../../errors.js";
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import type { SessionAcpxState, SessionRecord } from "../../types.js";
+import { sessionArchiveDirFor } from "../archive/paths.js";
 import { getLoggedMessageCount, markAllMessagesLogged } from "../messages-log-bookkeeping.js";
 import {
   appendFinalizedMessagesToLog,
@@ -92,6 +97,53 @@ function sessionFilePath(acpxRecordId: string): string {
 
 export function sessionBaseDir(): string {
   return path.join(process.env.ACPX_STATE_HOME || os.homedir(), ".acpx", "sessions");
+}
+
+/**
+ * Records this process loaded from the COLD ARCHIVE rather than the hot dir.
+ *
+ * ⚠️ A `WeakSet`, NOT A FIELD ON `SessionRecord`, AND THAT IS DELIBERATE. A new
+ * top-level record field would have to survive `serializeSessionRecord`,
+ * `parseSessionRecord` and every allowlist-style rebuild in the codebase — and
+ * acpx has lost THREE fields exactly that way already (`applied_output_style`,
+ * `served`, `depth_projection`), each silently, each with the whole unit suite
+ * green. A field that must never reach disk has no business being on the shape
+ * that gets written to disk. This also means an archived record cannot
+ * accidentally be persisted WITH an `archived: true` marker on it.
+ */
+const archivedRecords = new WeakSet<SessionRecord>();
+
+/** True when this record was resolved out of the archive dir (read-only). */
+export function isArchivedRecord(record: SessionRecord): boolean {
+  return archivedRecords.has(record);
+}
+
+/**
+ * The archive fallback leg — the fix for `acpx sessions show --session-id
+ * <archived>` answering "Session not found".
+ *
+ * ⚠️ EXACT ID ONLY, AND SUFFIX/NAME RESOLUTION IS DELIBERATELY NOT EXTENDED HERE.
+ * `findSession` and `findSessionByDirectoryWalk` search index entries; adding a
+ * cold-dir scan to them would put an O(archive) readdir — 13,944 files today — on
+ * ORDINARY CLI PATHS that have nothing to do with the archive. Browsing is served
+ * by the shard index instead (`acpx sessions archive --list`).
+ */
+async function resolveArchivedSessionRecord(sessionId: string): Promise<SessionRecord | undefined> {
+  const archiveDir = sessionArchiveDirFor(sessionBaseDir());
+  const filePath = path.join(archiveDir, `${encodeURIComponent(sessionId)}.json`);
+  try {
+    const record = parseSessionRecord(JSON.parse(await fs.readFile(filePath, "utf8")));
+    if (!record) {
+      return undefined;
+    }
+    archivedRecords.add(record);
+    return await hydrateSessionMessagesFromLog(
+      record,
+      messagesLogPath(archiveDir, record.acpxRecordId),
+    );
+  } catch {
+    return undefined;
+  }
 }
 
 async function ensureSessionDir(): Promise<void> {
@@ -341,6 +393,19 @@ async function writeSessionRecordInternal(
     persisted?: { value: PersistedSessionLifecycle | undefined };
   },
 ): Promise<void> {
+  // ⚠️ THE ARCHIVED-RECORD WRITE GUARD, PLACED HERE **BY CONSTRUCTION**. All four
+  // exported write entrypoints (`writeSessionRecord`, `...AtBoundary`,
+  // `...WithLifecycle`, `...AtBoundaryWithLifecycle`) funnel through this one
+  // function, so guarding it covers every mutating path without enumerating them —
+  // and a fifth entrypoint added later inherits the guard instead of forgetting it.
+  //
+  // Without it the failure is silent and wrong rather than loud: every write path
+  // computes its target from `sessionFilePath()`, which is the HOT dir, so writing
+  // a record resolved out of the archive would RE-CREATE it hot while its sidecars
+  // stayed archived — a session listed with a truncated transcript, and no error.
+  if (isArchivedRecord(record)) {
+    throw new SessionArchivedError(record.acpxRecordId);
+  }
   await measurePerf("session.write_record", async () => {
     await ensureSessionDir();
 
@@ -537,6 +602,14 @@ export async function resolveSessionRecord(sessionId: string): Promise<SessionRe
   }
   if (suffixRecords.length > 1) {
     throw new SessionResolutionError(`Session id is ambiguous: ${sessionId}`);
+  }
+
+  // LAST leg, tried only after every hot-dir leg above has failed. Ordering
+  // matters: an id present in both directories must resolve to the HOT one, and
+  // the archiver's record-moves-last rule guarantees that window never exists.
+  const archived = await resolveArchivedSessionRecord(sessionId);
+  if (archived) {
+    return archived;
   }
 
   incrementPerfCounter("session.resolve_miss");

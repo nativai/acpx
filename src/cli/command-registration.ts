@@ -2,6 +2,11 @@ import { Command, Option } from "commander";
 import { DEFAULT_HISTORY_LIMIT } from "../session/persistence.js";
 import { registerAgentsCommand } from "./agents-command.js";
 import {
+  handleSessionsArchive,
+  handleSessionsRestore,
+  type SessionsArchiveFlags,
+} from "./archive-command.js";
+import {
   handleCancel,
   handleExec,
   handlePrompt,
@@ -217,6 +222,84 @@ export function registerSessionsCommand(
     )
     .action(async function (this: Command, flags: { dryRun?: boolean; backupDir?: string }) {
       await handleSessionsRepairAccountSeam(flags, this, config);
+    });
+
+  sessionsCommand
+    .command("archive")
+    .description(
+      "Move cold sessions to the archive tier (NEVER deletes — every move is a rename). " +
+        "Default is a dry run: pass --no-dry-run to apply. Also hosts --status, --list, " +
+        "--verify, --repair and --reindex.",
+    )
+    // ⚠️ `--no-dry-run` IS DECLARED FIRST AND THE ORDER IS LOAD-BEARING. Measured
+    // against this repo's pinned Commander 14.0.3 (see the identical note on
+    // `--no-include-history` under `prune`): declaring the affirmative first leaves
+    // the default UNDEFINED, and a handler reading `=== true` then silently APPLIES
+    // on a bare invocation. For this verb that is the difference between a preview
+    // and a thousand-id bulk move, so the safe parse must be the one that survives
+    // a mistake. With this order a bare `acpx sessions archive` parses
+    // `dryRun: true`.
+    .option("--no-dry-run", "Apply the plan (default is a dry run that writes nothing)")
+    .option("--dry-run", "Preview the plan without moving anything (the default)")
+    .option("--closed-before <N|YYYY-MM-DD>", "Closed-session tier boundary (default 14 days)")
+    .option(
+      "--stale-before <N|YYYY-MM-DD>",
+      "Not-closed tier boundary (default 45 days — NOT 14; see conception §6.4's cliff)",
+    )
+    .option("--subagents-before <N|YYYY-MM-DD>", "Subagent tier boundary (default 14 days)")
+    .option("--orphans", "Also sweep record-less sidecar sets (the plurality of the corpus)")
+    .option("--quiet-minutes <N>", "Skip ids with any file touched within N minutes (default 60)")
+    .option(
+      "--restore-grace-days <N>",
+      "Skip ids restored within the last N days (default 7). Without this a restore is undone as soon as the quiet window elapses.",
+    )
+    .option("--limit <N>", "Stop after N ids")
+    .option(
+      "--ids <id...>",
+      "Archive exactly these ids (bypasses the age tiers; every blocker still applies)",
+    )
+    .option(
+      "--exclude-ids <file>",
+      "File of ids to treat as LIVE, one per line. The acpx-ui scheduler's channel for live-state only a running process can see. An absent flag means 'no live-state exclusions known' — every on-disk blocker still applies.",
+    )
+    .option(
+      "--allow-first-run",
+      "Permit the first run on a box with no archive dir to APPLY. Without it that run is dry-run only (also settable as ACPX_ARCHIVE_ALLOW_FIRST_RUN=1).",
+    )
+    .option("--wave <token>", "Override the manifest wave id (default cli-<ts>)")
+    .option("--status", "Counts and bytes for both directories, plus the orphan aggregate")
+    .option("--list", "List archived sessions from the shard index")
+    .option("--list-orphans", "List archived orphan ids (normally reported only in aggregate)")
+    .option("--month <YYYY-MM>", "Restrict --list or --reindex to one shard")
+    .option("--verify", "Check MANIFEST.tsv against both directories")
+    .option("--repair", "Complete interrupted renames recorded in MANIFEST.tsv")
+    .option("--reindex", "Rebuild ARCHIVE-INDEX shards from the archive directory")
+    .option("--json", "Machine-readable output")
+    .addHelpText(
+      "after",
+      [
+        "",
+        "⚠️ This frees ZERO bytes of disk. Every move is a same-device rename(2), so",
+        "   not one byte is reclaimed — it bounds acpx-ui's memory and CPU only.",
+        "   Deletion is `acpx sessions prune`, a separate and explicitly destructive verb.",
+        "",
+        "Exit codes: 0 ok · 1 completed with reported problems · 2 refused before acting.",
+      ].join("\n"),
+    )
+    .action(async function (this: Command, flags: SessionsArchiveFlags) {
+      await handleSessionsArchive(flags, this);
+    });
+
+  sessionsCommand
+    .command("restore")
+    .description("Move archived sessions back to the hot directory (the true inverse of archive)")
+    .argument(
+      "<ids...>",
+      "Session ids to restore (exact ids only — archived ids do not resolve by suffix)",
+    )
+    .option("--json", "Machine-readable output")
+    .action(async function (this: Command, ids: string[], flags: { json?: boolean }) {
+      await handleSessionsRestore(ids, flags);
     });
 
   sessionsCommand

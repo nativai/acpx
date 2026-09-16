@@ -76,6 +76,29 @@ export class SessionResolutionError extends AcpxOperationalError {}
  * removed `reopen-and-deliver` promise. If you change a recovery route, change
  * it here and there in the same commit.
  */
+/**
+ * A read reached an ARCHIVED session and the caller then tried to mutate it.
+ *
+ * ⚠️ THIS MUST NEVER SILENTLY RESTORE. Restoring is a state change with disk and
+ * hot-set consequences, so it is the operator's call — the same discipline as
+ * `SESSION_CLOSED`, where reopen is an explicit opt-in and a plain delivery to a
+ * closed session is rejected rather than quietly reopening it. The message names
+ * the remedy because the alternative is a user who cannot tell an archived id from
+ * a typo.
+ */
+export class SessionArchivedError extends AcpxOperationalError {
+  readonly sessionId: string;
+
+  constructor(sessionId: string) {
+    super(`session ${sessionId} is archived — run: acpx sessions restore ${sessionId}`, {
+      outputCode: "RUNTIME",
+      detailCode: "SESSION_ARCHIVED",
+      origin: "runtime",
+    });
+    this.sessionId = sessionId;
+  }
+}
+
 export class SessionClosedError extends AcpxOperationalError {
   readonly sessionId: string;
   readonly sessionName: string | undefined;
