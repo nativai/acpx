@@ -42,6 +42,7 @@ export const ARCHIVE_EXIT_REFUSED = 2;
 
 export type SessionsArchiveFlags = {
   dryRun?: boolean;
+  apply?: boolean;
   closedBefore?: string;
   staleBefore?: string;
   subagentsBefore?: string;
@@ -171,7 +172,6 @@ export async function handleSessionsArchive(
 }
 
 async function dispatchArchive(flags: SessionsArchiveFlags, command: Command): Promise<number> {
-  void command;
   const context = createContext(sessionBaseDir(), flags.wave ?? "cli");
   warnIfDetached(context);
 
@@ -190,15 +190,103 @@ async function dispatchArchive(flags: SessionsArchiveFlags, command: Command): P
   if (flags.reindex) {
     return await runReindexVerb(context, flags);
   }
-  return await runArchiveVerb(context, flags);
+  // ⚠️ EVERY READ-ONLY VERB HAS ALREADY RETURNED ABOVE, and that ordering is what
+  // scopes the intent gate correctly. `--status`, `--list`, `--list-orphans`,
+  // `--verify`, `--repair` and `--reindex` are FLAGS ON THIS SAME COMMAND, not
+  // sub-commands, so a gate placed in `dispatchArchive` would refuse all of them.
+  // None is dry-run-able, so none has an intent to state.
+  return await runArchiveVerb(context, flags, command);
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Declare the three intent options on a command, in the order that makes them work.
+ *
+ * ⚠️ THIS EXISTS SO THE TEST PARSES THROUGH THE SAME DECLARATION THE PRODUCT USES.
+ * A test that rebuilds these options by hand is a REPLICA, and a replica cannot
+ * notice the product drifting away from it — which is precisely how the acpx-ui
+ * test that missed this P0 failed: it asserted against a fake and encoded the
+ * defect as its success condition. Single declaration, two callers, no drift.
+ *
+ * ⚠️ `--no-dry-run` MUST BE DECLARED FIRST AND NO TYPE CHECK CATCHES IT IF YOU
+ * SWAP THEM. Measured against the pinned commander 14.0.3: with this order a bare
+ * invocation parses `dryRun: true` with source `"default"`; declared the other way
+ * the value is `undefined`, and every `=== true` read downstream silently flips.
+ * `resolveRunIntent` reads the SOURCE rather than the value precisely because the
+ * value cannot distinguish a bare run from an explicit `--dry-run`.
+ */
+export function addArchiveRunIntentOptions(command: Command): Command {
+  return command
+    .option("--no-dry-run", "Exact synonym of --apply, kept for compatibility")
+    .option("--dry-run", "Preview the plan and move nothing. Must be stated explicitly.")
+    .option("--apply", "Actually move the selected files. Must be stated explicitly.");
+}
+
+export type RunIntent = "dry-run" | "apply" | "unstated" | "contradictory";
+
+/**
+ * Resolve what the caller ASKED FOR, refusing to guess when they did not say.
+ *
+ * 🛑 `flags.dryRun` ALONE CANNOT ANSWER THIS, AND A FIX THAT TRIES IS ITSELF A
+ * SILENT NO-OP. A bare invocation and an explicit `--dry-run` BOTH parse to
+ * `dryRun: true`, because `--no-dry-run` is declared first (see the load-bearing
+ * ordering note in `command-registration.ts`). The only thing that separates them
+ * is WHERE the value came from, which is why `command` is read here and is no
+ * longer the unused parameter it used to be.
+ *
+ * ⚠️ THE KEY IS camelCase. Measured on the pinned commander 14.0.3:
+ * `getOptionValueSource("dryRun")` returns `"default"` for a bare run and `"cli"`
+ * for an explicit one, while the kebab form `getOptionValueSource("dry-run")`
+ * returns `undefined` for BOTH. Using the kebab spelling would make every
+ * invocation look unstated — this whole guard reduced to a constant, which is the
+ * same class of defect it exists to prevent.
+ */
+export function resolveRunIntent(flags: SessionsArchiveFlags, command: Command): RunIntent {
+  // `"cli"` means the user typed it; `"default"` means commander supplied it.
+  const stated = command.getOptionValueSource?.("dryRun") === "cli";
+  const dryStated = stated && flags.dryRun === true;
+  // `--apply` and `--no-dry-run` are exact synonyms. The second is kept because it
+  // is the spelling already measured working end to end; the first is the one to
+  // write, because a double negative in a scheduler's log is unreadable.
+  const applyStated = flags.apply === true || (stated && flags.dryRun === false);
+
+  if (applyStated) {
+    return dryStated ? "contradictory" : "apply";
+  }
+  return dryStated ? "dry-run" : "unstated";
+}
+
+/**
+ * ⚠️ THIS MESSAGE IS A PRIMARY UX SURFACE, NOT AN ERROR STRING. It is the first
+ * thing every human and every agent meets on this verb from now on, and a
+ * diagnostic that misdescribes the situation costs more than the bug it reports.
+ * Name BOTH flags, say which does what, and keep both lines copy-pasteable.
+ */
+const UNSTATED_INTENT_MESSAGE = [
+  "`acpx sessions archive` needs you to state what you want; it will not guess.",
+  "  preview (moves nothing):  acpx sessions archive --dry-run",
+  "  actually move files:      acpx sessions archive --apply",
+  "Silence used to mean a dry run. It now means neither, so a caller cannot omit",
+  "the intent and get a plausible wrong answer. (`--no-dry-run` still means --apply.)",
+].join("\n");
+
 async function runArchiveVerb(
   context: ArchiveContext,
   flags: SessionsArchiveFlags,
+  command: Command,
 ): Promise<number> {
+  const intent = resolveRunIntent(flags, command);
+  if (intent === "unstated") {
+    throw new ArchiveRefusal(UNSTATED_INTENT_MESSAGE, "intent-unstated");
+  }
+  if (intent === "contradictory") {
+    throw new ArchiveRefusal(
+      "--apply and --dry-run were both given. A contradiction is as ambiguous as silence; pass exactly one.",
+      "intent-contradictory",
+    );
+  }
+
   const boundaries = resolveBoundaries(context.nowMs, {
     closedBefore: parseBoundary(flags.closedBefore, "--closed-before"),
     staleBefore: parseBoundary(flags.staleBefore, "--stale-before"),
@@ -221,9 +309,8 @@ async function runArchiveVerb(
     context,
     boundaries,
     plan,
-    // ⚠️ DRY RUN IS THE DEFAULT-SAFE PATH AND MUST PRINT THE FULL PLAN — it is the
-    // operator's ONLY review surface before an irreversible-looking bulk move.
-    dryRun: flags.dryRun === true,
+    // Resolved from the STATED intent, never from a default — see resolveRunIntent.
+    dryRun: intent === "dry-run",
     allowFirstRun: flags.allowFirstRun === true || process.env.ACPX_ARCHIVE_ALLOW_FIRST_RUN === "1",
   });
 

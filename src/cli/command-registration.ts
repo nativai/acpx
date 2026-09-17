@@ -2,6 +2,7 @@ import { Command, Option } from "commander";
 import { DEFAULT_HISTORY_LIMIT } from "../session/persistence.js";
 import { registerAgentsCommand } from "./agents-command.js";
 import {
+  addArchiveRunIntentOptions,
   handleSessionsArchive,
   handleSessionsRestore,
   type SessionsArchiveFlags,
@@ -224,23 +225,27 @@ export function registerSessionsCommand(
       await handleSessionsRepairAccountSeam(flags, this, config);
     });
 
-  sessionsCommand
-    .command("archive")
+  // ⚠️ THIS VERB REQUIRES AN EXPLICIT INTENT AND REFUSES SILENCE (exit 2). It is the
+  // only one of the five dry-run-bearing verbs on this surface that ever had an
+  // INVERTED polarity: `prune`, `templates migrate-slugs`, `repair-account-seam`
+  // and `sweep-config-dirs` all declare only an affirmative `--dry-run`, so a bare
+  // invocation means APPLY for every one of them. acpx-ui's scheduler generalised
+  // that — reasonably — to archive, emitted nothing to mean apply, and therefore
+  // never archived anything in any configuration. Refusing silence removes this
+  // verb from the inconsistency rather than adding a sixth variant to it, and
+  // `sessions prune` already refuses an under-specified invocation ("Requires a
+  // scope ... unless --dry-run"), so this is the surface's existing idiom.
+  //
+  // The three intent options are declared by `addArchiveRunIntentOptions` so the
+  // test parses through the SAME declaration rather than a replica — see its
+  // comment for why that matters and for the load-bearing declaration order.
+  addArchiveRunIntentOptions(sessionsCommand.command("archive"))
     .description(
       "Move cold sessions to the archive tier (NEVER deletes — every move is a rename). " +
-        "Default is a dry run: pass --no-dry-run to apply. Also hosts --status, --list, " +
-        "--verify, --repair and --reindex.",
+        "Requires an explicit intent — --dry-run or --apply — and refuses without one. " +
+        "Also hosts --status, --list, --list-orphans, --verify, --repair and --reindex, " +
+        "none of which needs an intent.",
     )
-    // ⚠️ `--no-dry-run` IS DECLARED FIRST AND THE ORDER IS LOAD-BEARING. Measured
-    // against this repo's pinned Commander 14.0.3 (see the identical note on
-    // `--no-include-history` under `prune`): declaring the affirmative first leaves
-    // the default UNDEFINED, and a handler reading `=== true` then silently APPLIES
-    // on a bare invocation. For this verb that is the difference between a preview
-    // and a thousand-id bulk move, so the safe parse must be the one that survives
-    // a mistake. With this order a bare `acpx sessions archive` parses
-    // `dryRun: true`.
-    .option("--no-dry-run", "Apply the plan (default is a dry run that writes nothing)")
-    .option("--dry-run", "Preview the plan without moving anything (the default)")
     .option("--closed-before <N|YYYY-MM-DD>", "Closed-session tier boundary (default 14 days)")
     .option(
       "--stale-before <N|YYYY-MM-DD>",
