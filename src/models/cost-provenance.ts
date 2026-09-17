@@ -161,6 +161,24 @@ export type CostUnit = {
    */
   cost_usd?: number | null;
   /**
+   * Where `cost_usd` came from, when it is NOT a catalogue computation.
+   *
+   * Absent (the only shape units written before brick ccef550f can have) ⇒
+   * `cost_usd` is `priceUnit`'s catalogue figure. `'adapter'` ⇒ `cost_usd` is
+   * the harness's own AS-BILLED per-message figure, recorded verbatim
+   * (brick ccef550f): OpenRouter routes a model across serving endpoints whose
+   * real prices differ from the catalogue's single list row — measured on pi
+   * 2026-09-17, a session the catalogue priced at $0.3365 was billed $0.904 —
+   * so when the adapter hands us its own non-zero per-message figure beside
+   * non-zero tokens, THAT is the better price and it is stamped here, marker
+   * included, rather than silently re-priced.
+   *
+   * ⚠️ snake_case like every key here — this object reaches the session record
+   * verbatim ({@link UnitRates} for why a camelCase key stops the whole record
+   * write).
+   */
+  cost_source?: "adapter";
+  /**
    * The provider that ACTUALLY SERVED this message, verbatim from OpenRouter's
    * response (`"Modal"`), or `null` (brick 4c272cab §8).
    *
@@ -254,20 +272,53 @@ export function reportedCost(amount: number, currency = "USD"): SessionCostFigur
  * `free` would silently absorb the missing entries, which is the same collapse
  * this brick exists to remove, one level up.
  */
-export function deriveCostFigure(units: CostUnit[], currency = "USD"): SessionCostFigure {
-  if (units.length === 0) {
-    return { amount: null, currency, provenance: "unpriced", coverage: null };
-  }
+/**
+ * One unit's contribution to the session figure, BY ITS OWN PROVENANCE: an
+ * adapter-stamped unit (`cost_source: "adapter"`) IS its price — `cost_usd` is
+ * the as-billed figure recorded verbatim (brick ccef550f), and re-pricing it
+ * from the catalogue would recreate the under-pricing this field exists to
+ * remove. It prices even when `rates` is null (cold cache) — a billed figure
+ * owes the catalogue nothing. Every other unit is catalogue-priced via
+ * `priceUnit`, the only implementation of that rule.
+ */
+function unitContribution(unit: CostUnit): number | null {
+  return unit.cost_source === "adapter"
+    ? typeof unit.cost_usd === "number"
+      ? unit.cost_usd
+      : null
+    : priceUnit(unit);
+}
+
+/** `free` is asserted only when EVERY unit could be priced and is measured-free. */
+function fullyMeasuredFree(units: CostUnit[], priced: number): boolean {
+  return priced === units.length && units.every((unit) => unit.rates?.measured_free === true);
+}
+
+/** The running fold over the units: the sum and how many units were priced, of
+ *  which how many came from the adapter's own figure (brick ccef550f). */
+function foldUnits(units: CostUnit[]): { sum: number; priced: number; adapterPriced: number } {
   let sum = 0;
   let priced = 0;
+  let adapterPriced = 0;
   for (const unit of units) {
-    const usd = priceUnit(unit);
+    const usd = unitContribution(unit);
     if (usd === null) {
       continue;
     }
     sum += usd;
     priced += 1;
+    if (unit.cost_source === "adapter") {
+      adapterPriced += 1;
+    }
   }
+  return { sum, priced, adapterPriced };
+}
+
+export function deriveCostFigure(units: CostUnit[], currency = "USD"): SessionCostFigure {
+  if (units.length === 0) {
+    return { amount: null, currency, provenance: "unpriced", coverage: null };
+  }
+  const { sum, priced, adapterPriced } = foldUnits(units);
   const coverage: CostCoverage = { unit: "message", priced, total: units.length };
 
   if (priced === 0) {
@@ -275,7 +326,15 @@ export function deriveCostFigure(units: CostUnit[], currency = "USD"): SessionCo
     // and it is what distinguishes this from a source with no units at all.
     return { amount: null, currency, provenance: "unpriced", coverage };
   }
-  if (priced === units.length && units.every((unit) => unit.rates?.measured_free === true)) {
+  if (adapterPriced === priced) {
+    // Every priced unit is an adapter figure — `reported`: acpx passed the
+    // adapter's own numbers through untouched. A MIXED figure (billed +
+    // catalogue-estimated) falls through to `computed` below, deliberately:
+    // `reported` would claim adapter trust for units acpx priced itself, and
+    // there is no fifth provenance to say "partly both".
+    return { amount: sum, currency, provenance: "reported", coverage };
+  }
+  if (fullyMeasuredFree(units, priced)) {
     return { amount: 0, currency, provenance: "free", coverage };
   }
   return { amount: sum, currency, provenance: "computed", coverage };

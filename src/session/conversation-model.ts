@@ -1240,6 +1240,16 @@ function rememberCostFromUsageUpdate(acpx: SessionAcpxState, update: UsageUpdate
     model: typeof message.model === "string" ? message.model : undefined,
     reasoning: numberField(message, ["reasoning"]),
     reportedAmount: typeof reported === "number" ? reported : null,
+    // brick ccef550f — the AS-BILLED per-message figure, read off the SAME block
+    // the counts come from. ⚠️ THIS IS NOT `update.cost.amount`: that is the
+    // adapter's SESSION accumulator (pi-acp emits it as `sessionUsage.costUsd`,
+    // a running total), while `message.costUsd` is THIS message's own price —
+    // stamping the accumulator onto per-message units would sum a cumulative
+    // counter once per message. The zero-check lives in `rememberSessionCost`
+    // (`billedAmount` doc): a zero here is the 2026-09-08 zeroed-catalogue shape
+    // and falls through to the catalogue path. A future neutral adapter
+    // (`_meta.acpxUsage.unit`) needs only the same `costUsd` key.
+    billedAmount: numberField(message, ["costUsd"]) ?? null,
     ...(attribution ? { attribution } : {}),
   });
 }
