@@ -261,6 +261,115 @@ test("a stale checkpoint write does NOT revert a re-parent (criterion 4)", async
   });
 });
 
+test("criterion 4 on a FORKED child — the case where the strip is VISIBLE", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "fork-source");
+    await seed(homeDir, "new-parent");
+    // ⚠️ THE FIRE-TEST FOR CRITERION 4 MUST USE A FORKED CHILD, AND THE NON-FORKED
+    // VERSION ABOVE IS NOT A SUBSTITUTE. Measured cross-lane on this brick: when a
+    // writer strips `parent_set_at`, the two cases diverge —
+    //   plain spawn child → LOOKS FINE. Lineage branch 4 resolves to the same
+    //                       parent, so losing the marker changes no edge and a
+    //                       test here PASSES ON A BROKEN BUILD.
+    //   FORKED child      → REVERTS. Without the marker, fork-wins returns and the
+    //                       edge goes back to the fork source; the board moves the
+    //                       tile back.
+    // So this test, not its sibling, is the one that can see the hole.
+    await seed(homeDir, "forked-child", {
+      parentSessionId: "fork-source",
+      forkedFromSessionId: "fork-source",
+    });
+
+    const persistence = await loadPersistenceModule();
+    const ownerInMemoryRecord = await persistence.resolveSessionRecord("forked-child");
+
+    const moved = await runCli(
+      [
+        "claude",
+        "sessions",
+        "set-parent",
+        "--session-id",
+        "forked-child",
+        "--parent-id",
+        "new-parent",
+      ],
+      homeDir,
+    );
+    assert.equal(moved.code, 0, moved.stderr);
+
+    ownerInMemoryRecord.lastUsedAt = new Date().toISOString();
+    await persistence.writeSessionRecord(ownerInMemoryRecord);
+
+    const record = await readRecordJson(homeDir, "forked-child");
+    // The MARKER is what decides the edge for a forked child. Its loss is the whole
+    // defect, and `parent_session_id` surviving is NOT enough to call this green.
+    assert.equal(
+      typeof record.parent_set_at,
+      "string",
+      "the marker was stripped — a forked child silently reverts to its fork source",
+    );
+    assert.equal(record.parent_session_id, "new-parent");
+    assert.equal(record.spawned_by_session_id, "fork-source");
+    assert.equal(record.forked_from_session_id, "fork-source");
+
+    const entry = await readIndexEntry(homeDir, "forked-child");
+    assert.equal(
+      typeof entry.parentSetAt,
+      "string",
+      "the marker was stripped from the INDEX ENTRY",
+    );
+    assert.equal(entry.parentSessionId, "new-parent");
+  });
+});
+
+test("PROVENANCE AFTER A STRIP: re-applying re-captures from the CURRENT parent", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "spawner-a");
+    await seed(homeDir, "adopter-b");
+    await seed(homeDir, "child", { parentSessionId: "spawner-a" });
+
+    await runCli(
+      ["claude", "sessions", "set-parent", "--session-id", "child", "--parent-id", "adopter-b"],
+      homeDir,
+    );
+    assert.equal((await readRecordJson(homeDir, "child")).spawned_by_session_id, "spawner-a");
+
+    // Simulate an OUT-OF-VERSION writer: an acpx build that predates these two
+    // fields drops them on parse and never writes them back. Measured directly
+    // against the deployed `main` build, which strips exactly `parent_set_at` and
+    // `spawned_by_session_id` while keeping `parent_session_id` / `parent_session_url`.
+    const recordPath = sessionFilePath(homeDir, "child");
+    const stripped = JSON.parse(await fs.readFile(recordPath, "utf8")) as Record<string, unknown>;
+    delete stripped.parent_set_at;
+    delete stripped.spawned_by_session_id;
+    await fs.writeFile(recordPath, `${JSON.stringify(stripped, null, 2)}\n`, "utf8");
+
+    await runCli(
+      ["claude", "sessions", "set-parent", "--session-id", "child", "--parent-id", "adopter-b"],
+      homeDir,
+    );
+
+    // 🛑 THIS ASSERTION PINS A LIE, DELIBERATELY, AND IT IS NOT A BUG TO "FIX" HERE.
+    // The edge recovers; the PROVENANCE does not. After a strip both fields are
+    // absent, and absence is the ONLY signal the write-once rule has — by design,
+    // because absence also legitimately means "this session was a root". Nothing on
+    // the record can tell "never had provenance" from "provenance was stripped", so
+    // no guard here can decide it:
+    //   - refusing to capture when previousParent === newParent would break the
+    //     legitimate no-op re-parent of a child that really was spawned by that
+    //     parent, which is the fork-onto-its-existing-parent case;
+    //   - back-filling a sentinel would destroy "was a root", which §0.2 requires.
+    // THE CURE IS DEPLOYMENT ORDERING: no writer that predates these fields may
+    // touch the store. This test exists so the corruption is documented and visible
+    // rather than discovered again from a wrong provenance value in the field.
+    assert.equal(
+      (await readRecordJson(homeDir, "child")).spawned_by_session_id,
+      "adopter-b",
+      "if this now reads spawner-a, the write-once rule gained a way to tell the two absences apart — update this comment, it is good news",
+    );
+  });
+});
+
 // ─── 3. Self-clobber — leg (b) ────────────────────────────────────────────────
 
 test("set-parent on an existing on-disk record actually changes it (leg b)", async () => {
