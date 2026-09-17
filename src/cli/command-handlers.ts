@@ -4454,6 +4454,18 @@ function printSetParentResult(result: SetParentResult, format: OutputFormat): vo
   for (const entry of result.moved) {
     process.stdout.write(`${setParentMovedLine(entry)}\n`);
   }
+  // ⚠️ THE FOOTNOTE IS PRINTED WHERE THE HINT IS, NOT ONLY IN `--help`. The
+  // `[fork edge → spawn]` label is this CLI's hand-written copy of a rule that
+  // lives in acpx-ui, and it has been MEASURED WRONG (a byway carrying a fork
+  // source reports not-a-fork while the edge genuinely is one). Whoever reads that
+  // label is mid-handover — exactly the moment they are least able to second-guess
+  // it — so the caveat travels with it rather than waiting in help text nobody
+  // opens then.
+  if (result.moved.some((entry) => entry.wasForkEdge)) {
+    process.stdout.write(
+      "Note: [fork edge → spawn] is an advisory label and can be wrong (e.g. on a byway). The move itself is not affected; ask acpx-ui for the real edge.\n",
+    );
+  }
   printSetParentSkippedAndWarnings(result);
 }
 

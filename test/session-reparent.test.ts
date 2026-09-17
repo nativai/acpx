@@ -861,6 +861,29 @@ test("--dry-run text output is visibly a preview, and shows the fork override", 
     // edge. This is the one behaviour a user can be surprised by, so the preview
     // shows it happening instead of leaving it to --help.
     assert.match(result.stdout, /\[fork edge → spawn\]/);
+    // The caveat travels WITH the hint. It is a hand-written mirror of a rule that
+    // lives in acpx-ui and has been measured wrong on a byway carrying a fork
+    // source; whoever reads the label is mid-handover, which is exactly when they
+    // cannot second-guess it, so `--help` alone is not where this belongs.
+    assert.match(result.stdout, /advisory label and can be wrong/);
+  });
+});
+
+test("no fork annotation ⇒ no advisory footnote", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "a");
+    await seed(homeDir, "b");
+    await seed(homeDir, "plain-child", { parentSessionId: "a" });
+
+    const result = await runCli(
+      ["claude", "sessions", "set-parent", "--children-of", "a", "--parent-id", "b", "--dry-run"],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, /\[fork edge → spawn\]/);
+    // The footnote is scoped to the hint it qualifies — printing it unconditionally
+    // would train readers to skip it.
+    assert.doesNotMatch(result.stdout, /advisory label and can be wrong/);
   });
 });
 

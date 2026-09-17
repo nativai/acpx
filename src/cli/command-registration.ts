@@ -622,6 +622,13 @@ AN EXPLICITLY SET PARENT OVERRIDES A FORK EDGE.
   fork source. Its \`forked_from_session_id\` is left intact, so the fork provenance
   badge still renders. \`--dry-run\` marks such a child \`[fork edge -> spawn]\`.
 
+  ⚠️ THAT HINT IS ADVISORY AND CAN BE WRONG — the MOVE is not. \`wasForkEdge\` /
+  \`[fork edge -> spawn]\` is this CLI's own copy of a rule that lives in acpx-ui, so
+  it can disagree with the real edge; it has been measured wrong for a BYWAY that
+  carries a fork source, reported as not-a-fork while the edge genuinely was one.
+  Read it as a courtesy label, never as the graph. If you need the edge itself, ask
+  acpx-ui (\`/api/session-tree\`), not this hint.
+
 WARNING: GIVING A PARENT TO A SESSION THAT HAD NONE STRIPS ITS USER-FACING FACET.
   The \`user-facing-via-acpx-ui\` facet is gated \`unless_env="ACPX_PARENT_SESSION_URL"\`,
   so a previously top-level session that acquires a parent loses its ability to hand

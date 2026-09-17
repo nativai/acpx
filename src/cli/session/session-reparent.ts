@@ -60,6 +60,13 @@ export type SetParentMovedSession = {
    * move — i.e. the re-parent overrode a fork edge. Decision 1 is the one
    * behaviour a user can be surprised by, so it is reported rather than left to
    * `--help`.
+   *
+   * ⚠️ ADVISORY, AND MEASURED WRONG IN AT LEAST ONE SHAPE. It is a hand-written
+   * mirror of a rule that lives in another repo (`acpx-ui/shared/lineage.ts`), so
+   * it can disagree with the real edge: verified by the test-engineer on a BYWAY
+   * carrying a fork source, where this reported `false` while `relations` held a
+   * genuine fork edge. **The move itself was fully correct in every case** — this
+   * field labels, it never decides. Do not read it as the edge.
    */
   wasForkEdge: boolean;
   /** Queue-owner classification at the moment of the move, so a caller can see it
@@ -106,11 +113,18 @@ export type SetParentOptions = {
  * on the `relations` surface, evaluated against the record as it stands BEFORE
  * the move.
  *
- * ⚠️ ADVISORY ONLY. Nothing in the graph depends on this: it annotates `moved[]`
- * and the dry-run preview so an operator can see decision 1 (an explicit parent
- * beats a derived fork edge) actually happening. acpx cannot import acpx-ui's
- * module, so if that rule changes this annotation goes stale — a wrong label, never
- * a wrong write. The rule itself lives in `acpx-ui/shared/lineage.ts`.
+ * ⚠️ ADVISORY ONLY, AND IT HAS ALREADY BEEN MEASURED WRONG. Nothing in the graph
+ * depends on this: it annotates `moved[]` and the dry-run preview so an operator
+ * can see decision 1 (an explicit parent beats a derived fork edge) actually
+ * happening. acpx cannot import acpx-ui's module, so when that rule moves this
+ * annotation goes stale — a wrong label, never a wrong write.
+ *
+ * Confirmed stale for a **byway carrying a fork source**: this returns `false`
+ * while `relations` holds a genuine fork edge (test-engineer, brick c99f9994 §6.1).
+ * The re-parent was correct in every measured case. **Do not "fix" it by making
+ * the CLI authoritative about edges** — the rule belongs in
+ * `acpx-ui/shared/lineage.ts` and this is a courtesy label; the honest repair is to
+ * keep saying so, which the `--help` text and the dry-run footnote both now do.
  */
 function hadForkEdge(record: SessionRecord): boolean {
   // A byway's graph edge is deliberately its parent spawn edge, not its fork
