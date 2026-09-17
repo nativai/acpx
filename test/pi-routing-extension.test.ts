@@ -415,6 +415,164 @@ test("handler · the FIRST-CHILD anomaly regression: engagement does NOT depend 
   rmSync(root, { recursive: true, force: true });
 });
 
+// ── Sticky session affinity (brick c2df657e) ────────────────────────────────
+
+// The extension reads the record id PER REQUEST, so the fixture toggles
+// process.env around each handler call — no re-import needed.
+function withStickyEnv(value: string | undefined, run: () => void): void {
+  const previous = process.env.ACPX_SESSION_RECORD_ID;
+  if (value === undefined) {
+    delete process.env.ACPX_SESSION_RECORD_ID;
+  } else {
+    process.env.ACPX_SESSION_RECORD_ID = value;
+  }
+  try {
+    run();
+  } finally {
+    if (previous === undefined) {
+      delete process.env.ACPX_SESSION_RECORD_ID;
+    } else {
+      process.env.ACPX_SESSION_RECORD_ID = previous;
+    }
+  }
+}
+
+const RECORD_ID = "11111111-2222-3333-4444-555555555555";
+
+test("sticky · an openrouter request carries the acpx record id as a TOP-LEVEL session_id", async () => {
+  const handler = await handlerFor(await loadExtension({ settingsFile: noSettingsFile() }));
+  const payload: Record<string, unknown> = {
+    model: MODEL,
+    messages: [{ role: "user", content: "hi" }],
+    stream: true,
+  };
+  withStickyEnv(RECORD_ID, () => {
+    const routed = handler({ payload }, OPENROUTER_CTX) as Record<string, unknown>;
+    assert.ok(routed, "a set record id ⇒ the handler has an opinion, even with no policy");
+    assert.equal(routed.session_id, RECORD_ID);
+    // Top-level, NOT inside provider — OpenRouter validates the provider object
+    // strictly and would 400 on an unknown field there.
+    assert.equal("provider" in routed, false);
+    assert.equal(routed.model, MODEL, "everything else rides unchanged");
+  });
+});
+
+test("sticky · no record id in the env ⇒ no opinion (payload untouched)", async () => {
+  const handler = await handlerFor(await loadExtension({ settingsFile: noSettingsFile() }));
+  withStickyEnv(undefined, () => {
+    assert.equal(
+      handler({ payload: { model: MODEL, messages: [] } }, OPENROUTER_CTX),
+      undefined,
+      "a creation spawn / non-acpx pi run has no key to send — today's behaviour",
+    );
+  });
+});
+
+test("sticky · a differing pre-existing session_id is overridden with the record id", async () => {
+  const handler = await handlerFor(await loadExtension({ settingsFile: noSettingsFile() }));
+  const payload: Record<string, unknown> = {
+    model: MODEL,
+    session_id: "someone-elses-key",
+  };
+  withStickyEnv(RECORD_ID, () => {
+    const routed = handler({ payload }, OPENROUTER_CTX) as Record<string, unknown>;
+    assert.equal(
+      routed.session_id,
+      RECORD_ID,
+      "the record id is THE stable key — a per-spawn or per-branch id must not ride",
+    );
+  });
+});
+
+test("sticky · non-openrouter models never carry it, record id or not", async () => {
+  const handler = await handlerFor(await loadExtension({ settingsFile: noSettingsFile() }));
+  withStickyEnv(RECORD_ID, () => {
+    assert.equal(
+      handler({ payload: { model: "claude-sonnet-4-5", max_tokens: 1024 } }, NON_OPENROUTER_CTX),
+      undefined,
+      "an Anthropic-shaped body 400s on unknown top-level fields — never touch it",
+    );
+  });
+});
+
+test("sticky · composes with a routing policy — session_id AND provider both land", async () => {
+  const root = mkdtempSync(join(tmpdir(), "acpx-pi-routing-sticky-policy-"));
+  const settingsFile = join(root, "ui-settings.json");
+  writeFileSync(
+    settingsFile,
+    JSON.stringify({
+      version: 1,
+      openrouterRouting: { perModel: { [MODEL]: { order: ["baseten"], allowFallbacks: false } } },
+    }),
+    "utf8",
+  );
+  const handler = await handlerFor(await loadExtension({ settingsFile }));
+  const payload: Record<string, unknown> = { model: MODEL, messages: [], stream: true };
+  withStickyEnv(RECORD_ID, () => {
+    const routed = handler({ payload }, OPENROUTER_CTX) as Record<string, unknown>;
+    assert.equal(routed.session_id, RECORD_ID);
+    assert.deepEqual(
+      routed.provider,
+      resolveProviderObject(
+        { perModel: { [MODEL]: { order: ["baseten"], allowFallbacks: false } } },
+        MODEL,
+      ),
+    );
+  });
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("sticky · an UNREADABLE settings file still carries the sticky key (affinity is not policy-conditional)", async () => {
+  const root = mkdtempSync(join(tmpdir(), "acpx-pi-routing-sticky-gone-"));
+  const settingsFile = join(root, "ui-settings.json");
+  writeFileSync(settingsFile, JSON.stringify({ version: 1 }), "utf8");
+  const handler = await handlerFor(await loadExtension({ settingsFile }));
+  rmSync(settingsFile);
+  const payload: Record<string, unknown> = { model: MODEL, messages: [] };
+  withStickyEnv(RECORD_ID, () => {
+    const routed = handler({ payload }, OPENROUTER_CTX) as Record<string, unknown>;
+    assert.ok(routed, "unreadable file ⇒ no opinion on ROUTING, but the key must ride");
+    assert.equal(routed.session_id, RECORD_ID);
+  });
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("sticky · a CLEARED policy strips the stale provider but keeps the sticky key", async () => {
+  const root = mkdtempSync(join(tmpdir(), "acpx-pi-routing-sticky-clear-"));
+  const settingsFile = join(root, "ui-settings.json");
+  writeFileSync(
+    settingsFile,
+    JSON.stringify({
+      version: 1,
+      openrouterRouting: { perModel: { [MODEL]: { order: ["baseten"] } } },
+    }),
+    "utf8",
+  );
+  const handler = await handlerFor(await loadExtension({ settingsFile }));
+  const payload: Record<string, unknown> = {
+    model: MODEL,
+    provider: { order: ["baseten"], allow_fallbacks: true },
+  };
+  writeFileSync(settingsFile, JSON.stringify({ version: 1 }), "utf8");
+  utimesSync(settingsFile, new Date(), new Date());
+  withStickyEnv(RECORD_ID, () => {
+    const routed = handler({ payload }, OPENROUTER_CTX) as Record<string, unknown>;
+    assert.equal("provider" in (routed ?? {}), false, "cleared policy ⇒ no provider block");
+    assert.equal(routed?.session_id, RECORD_ID, "but affinity holds");
+  });
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("sticky · an overlong record id is clamped to OpenRouter's 256-char bound", async () => {
+  const handler = await handlerFor(await loadExtension({ settingsFile: noSettingsFile() }));
+  const oversized = `x`.repeat(400);
+  const payload: Record<string, unknown> = { model: MODEL, messages: [] };
+  withStickyEnv(oversized, () => {
+    const routed = handler({ payload }, OPENROUTER_CTX) as Record<string, unknown>;
+    assert.equal((routed.session_id as string).length, 256);
+  });
+});
+
 // ── The seed itself ──────────────────────────────────────────────────────────
 
 function configDirFixture(envHome: string): { root: string; env: NodeJS.ProcessEnv } {

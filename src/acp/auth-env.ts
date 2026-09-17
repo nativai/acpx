@@ -599,6 +599,11 @@ function buildAgentEnvironment(
   // then set only from THIS spawn context below so a bridge session can never
   // carry another session identity.
   delete env.ACPX_SESSION_URL;
+  // brick c2df657e — the OpenRouter sticky-routing key the seeded pi extension
+  // reads (PI_ROUTING_EXTENSION_CODE). Session identity, same reasoning as
+  // ACPX_SESSION_URL: a stale value would pin another session's provider cache
+  // key onto this adapter's requests.
+  delete env.ACPX_SESSION_RECORD_ID;
   delete env.ACPX_PARENT_SESSION_URL;
   delete env.ACPX_SESSION_NAME;
   delete env.ACPX_TASK_FOLDER;
@@ -792,6 +797,20 @@ function buildAgentEnvironment(
     const trimmed = sessionContext.acpxRecordId.trim();
     if (trimmed.length > 0) {
       env.ACPX_SESSION_URL = `${baseUrl}/?session=${trimmed}`;
+    }
+  }
+  // brick c2df657e — hand the RECORD id to the adapter on its own, WITHOUT the
+  // ACPX_SESSION_URL gate: the pi sticky-routing extension needs the stable key
+  // even where no UI base URL resolves (the URL is a nicety here; the record id
+  // is the payload). The record id is stable across queue-owner respawns while
+  // the ACP session id is per-spawn, so turn-serving spawns (runtime.ts /
+  // connected-session.ts / queue-owner-runtime.ts all pass record.acpxRecordId)
+  // yield one cache key per conversation; the transient creation spawn (serves
+  // no turn) carries "" and is skipped by the trim guard.
+  if (sessionContext && typeof sessionContext.acpxRecordId === "string") {
+    const trimmedRecordId = sessionContext.acpxRecordId.trim();
+    if (trimmedRecordId.length > 0) {
+      env.ACPX_SESSION_RECORD_ID = trimmedRecordId;
     }
   }
   if (sessionContext && typeof sessionContext.sessionName === "string") {

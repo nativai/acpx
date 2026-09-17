@@ -30,14 +30,26 @@
 // `ACPX_PI_BOX_AGENT_DIR`), and widening the sweep onto pi-native names is a separate
 // decision from removing acpx's own box overrides — so it is named here rather than
 // done silently.
+//
+// brick c2df657e — SESSION-IDENTITY SCRUB, same mechanism, different category.
+// `ACPX_SESSION_RECORD_ID` is set on every acpx-spawned agent (buildAgentEnvironment)
+// and those agents run THIS suite through workbench-exec with their whole env — so
+// once the OpenRouter sticky-routing extension ships, the handler rows that assert
+// "payload untouched" would red on the box for an env the repo never wrote. Same
+// poisoning-by-inheritance mechanism as the `ACPX_PI_*` sweep, so the same remedy.
+// A list of one, by name: there is exactly one variable that changes test behaviour
+// today, and the `ACPX_PI_` prefix cannot cover it.
 
 /** The prefix every BOX-level acpx pi override shares. */
 export const BOX_PI_ENV_PREFIX = "ACPX_PI_";
 
+/** Session-identity variables the PRODUCT sets on agents that then run this suite. */
+export const SESSION_IDENTITY_ENV = ["ACPX_SESSION_RECORD_ID"] as const;
+
 /**
- * Delete every box-level `ACPX_PI_*` override from `env`, returning the names removed
- * (sorted) so a caller can assert on what actually happened rather than on the absence
- * of a complaint.
+ * Delete every box-level `ACPX_PI_*` override and every session-identity variable
+ * from `env`, returning the names removed (sorted) so a caller can assert on what
+ * actually happened rather than on the absence of a complaint.
  *
  * Called once from the `--import` bootstrap (`install-owner-reaper.ts`), before any
  * test module body runs and therefore before any row spawns a CLI child — the children
@@ -46,7 +58,10 @@ export const BOX_PI_ENV_PREFIX = "ACPX_PI_";
 export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env): string[] {
   const removed: string[] = [];
   for (const name of Object.keys(env)) {
-    if (name.startsWith(BOX_PI_ENV_PREFIX)) {
+    if (
+      name.startsWith(BOX_PI_ENV_PREFIX) ||
+      (SESSION_IDENTITY_ENV as readonly string[]).includes(name)
+    ) {
       delete env[name];
       removed.push(name);
     }
