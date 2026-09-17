@@ -390,10 +390,29 @@ export async function writeSessionRecordWithPersistedLifecycle(
  * write path reads as a list of the properties it protects and a refactor tidying
  * the block above cannot quietly drop it.
  *
+ * 🛑 CALLED OUTSIDE THE `preserveLifecycle` BRANCH, AND THAT PLACEMENT IS THE FIX —
+ * exactly as `preserveLastTurnProviderForPersist` documents one field over. It sat
+ * INSIDE that branch when this shipped, which looked right and left the real
+ * clobberer untouched: `session-control.ts`'s `closeSession` reads the record at
+ * entry, then runs the whole owner-termination sequence (drain → ask the owner to
+ * close → SIGTERM, grace, SIGKILL, grace → terminate the adapter) and only THEN
+ * writes that now-multi-second-stale record through
+ * `writeSessionRecordAtBoundaryWithLifecycle`, i.e. `preserveLifecycle: false`. A
+ * `set-parent` landing inside that window was completely undone — record, index
+ * entry and derived edge — while the CLI exited 0 reporting the child under
+ * `moved[]`. (Found by the test-engineer with a positive control, brick c99f9994
+ * F2; the window is ≥2 s and GROWS with how long the owner takes to die, i.e. it
+ * is widest exactly when a handover is most likely.)
+ *
+ * ⚠️ NOT the same function as `repository.ts`'s own `closeSession`, which reads and
+ * writes adjacently and never was stale. TWO SAME-NAMED FUNCTIONS — this file's is
+ * safe, `session-control.ts`'s is not, and reasoning about the wrong one is what
+ * let this ship.
+ *
  * ⚠️ UNCONDITIONAL — disk wins, it does NOT merely fill an absence. The
  * `last_turn_provider` style ("disk only fills an absence") is wrong here: the
- * lost update being closed IS a live owner's stale in-memory record carrying the
- * OLD parent, which a fill-an-absence preserve would let through unchanged.
+ * lost update being closed IS a stale in-memory record carrying the OLD parent,
+ * which a fill-an-absence preserve would let through unchanged.
  *
  * ⚠️ And that is safe only because NOTHING assigns a parent outside record
  * CONSTRUCTION (`session-management.ts:254-263,629,909`,
@@ -407,8 +426,15 @@ export async function writeSessionRecordWithPersistedLifecycle(
  */
 function preserveParentLinkageForPersist(
   record: SessionRecord,
-  persistedLifecycle: PersistedSessionLifecycle,
+  persistedLifecycle: PersistedSessionLifecycle | undefined,
+  authoritative: WriteAuthoritativeFields | undefined,
 ): void {
+  // The gates live INSIDE the named function, not at the call site, so the write
+  // path carries one unconditional call that a refactor cannot quietly re-gate on
+  // `preserveLifecycle` — which is precisely how F2 shipped.
+  if (!persistedLifecycle || authoritative?.parent === true) {
+    return;
+  }
   record.parentSessionId = persistedLifecycle.parentSessionId;
   record.parentSessionUrl = persistedLifecycle.parentSessionUrl;
   record.parentSetAt = persistedLifecycle.parentSetAt;
@@ -418,13 +444,9 @@ function preserveParentLinkageForPersist(
 function applyPersistedLifecycleForWrite(
   record: SessionRecord,
   persistedLifecycle: PersistedSessionLifecycle | undefined,
-  authoritative: WriteAuthoritativeFields | undefined,
 ): void {
   if (!persistedLifecycle) {
     return;
-  }
-  if (authoritative?.parent !== true) {
-    preserveParentLinkageForPersist(record, persistedLifecycle);
   }
   record.closed = persistedLifecycle.closed;
   record.closedAt = persistedLifecycle.closedAt;
@@ -509,8 +531,22 @@ async function writeSessionRecordInternal(
     const persistedMetadata = freshPersisted?.metadata;
 
     if (options.preserveLifecycle) {
-      applyPersistedLifecycleForWrite(record, persistedLifecycle, options.authoritative);
+      applyPersistedLifecycleForWrite(record, persistedLifecycle);
     }
+    // 🛑 THE PARENT LINKAGE, PRESERVED UNCONDITIONALLY — OUTSIDE the branch above,
+    // and that placement IS the fix (see `preserveParentLinkageForPersist`). The
+    // write that clobbers a re-parent is the PRIVILEGED one — `session-control.ts`'s
+    // `closeSession`, which bypasses that branch by design and writes a record it
+    // read seconds earlier, before the owner-termination wait. `freshPersisted`, not
+    // the caller's snapshot: disk is the authority for who the parent is, and a
+    // caller-supplied lifecycle can predate the re-parent by a whole turn.
+    //
+    // ⚠️ The ONE writer that must beat this is `set-parent` itself, and it does so
+    // by NAME through `authoritative.parent` — not by being privileged. Remove that
+    // gate and the verb becomes a silent no-op (§1.2 leg b); remove this call and a
+    // close in flight silently undoes a re-parent (F2). One test pins BOTH
+    // directions together, because fixing either one alone still looks green.
+    preserveParentLinkageForPersist(record, freshPersisted, options.authoritative);
     mergeRecordMetadataForPersist(record, persistedMetadata);
     // Same baseline-diff protection metadata gets (2c848d3), extended to the
     // pinned model: a stale/dropped write can't regress a record-pinned model,

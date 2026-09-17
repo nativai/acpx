@@ -370,6 +370,132 @@ test("PROVENANCE AFTER A STRIP: re-applying re-captures from the CURRENT parent"
   });
 });
 
+// ─── F2 — the PRIVILEGED write path (brick c99f9994 finding F2) ──────────────
+
+// Both exported privileged writers, by name. They set `preserveLifecycle: false`,
+// so they SKIP the lifecycle preserve entirely — which is why the parent preserve
+// must live OUTSIDE that branch. Enumerated here so a fifth privileged entrypoint
+// added later is a visible omission from this list rather than silent coverage loss.
+const PRIVILEGED_WRITERS = [
+  "writeSessionRecordWithLifecycle",
+  "writeSessionRecordAtBoundaryWithLifecycle",
+] as const;
+
+for (const writerName of PRIVILEGED_WRITERS) {
+  test(`F2: a stale record written through ${writerName} cannot undo a re-parent`, async () => {
+    await withTempHome(async (homeDir) => {
+      await seed(homeDir, "old-parent");
+      await seed(homeDir, "new-parent");
+      await seed(homeDir, "forked-child", {
+        parentSessionId: "old-parent",
+        // FORKED on purpose: for a plain spawn child, losing only the MARKER leaves
+        // the edge unchanged and the damage is invisible. Here the whole linkage
+        // reverts, but the fork case is the one that also moves the rendered edge.
+        forkedFromSessionId: "old-parent",
+      });
+
+      const persistence = await loadPersistenceModule();
+
+      // ⚠️ THIS IS THE PRODUCTION SHAPE, MADE DETERMINISTIC — NOT A WEAKER MODEL OF
+      // IT. `session-control.ts`'s closeSession reads the record at entry, then
+      // waits out the ENTIRE owner-termination sequence (drain → ask the owner to
+      // close → SIGTERM, grace, SIGKILL, grace → terminate the adapter) before
+      // writing what it read. Measured window ≥2 s, and it GROWS with how long the
+      // owner takes to die — widest exactly when a handover is most likely. The
+      // staleness is the fixture here so the test is not a race-timed flake; the
+      // reachability was proven separately by the test-engineer.
+      const recordReadBeforeTheReparent = await persistence.resolveSessionRecord("forked-child");
+      assert.equal(recordReadBeforeTheReparent.parentSessionId, "old-parent");
+
+      const moved = await runCli(
+        [
+          "claude",
+          "sessions",
+          "set-parent",
+          "--session-id",
+          "forked-child",
+          "--parent-id",
+          "new-parent",
+        ],
+        homeDir,
+      );
+      assert.equal(moved.code, 0, moved.stderr);
+
+      // …and now the close lands, writing the record it read seconds ago.
+      recordReadBeforeTheReparent.pid = undefined;
+      recordReadBeforeTheReparent.closed = true;
+      recordReadBeforeTheReparent.closedAt = new Date().toISOString();
+      await persistence[writerName](recordReadBeforeTheReparent);
+
+      const record = await readRecordJson(homeDir, "forked-child");
+      assert.equal(
+        record.parent_session_id,
+        "new-parent",
+        `${writerName} reverted the parent — the preserve is inside the preserveLifecycle branch again`,
+      );
+      assert.equal(typeof record.parent_set_at, "string", "the marker was reverted");
+      assert.equal(record.spawned_by_session_id, "old-parent", "provenance was reverted");
+      // The privileged write must still do its OWN job.
+      assert.equal(record.closed, true, "the close itself was suppressed — too much is preserved");
+
+      // The index entry is what acpx-ui reads; a revert there moves the board back
+      // even if the record survives.
+      const entry = await readIndexEntry(homeDir, "forked-child");
+      assert.equal(entry.parentSessionId, "new-parent");
+      assert.equal(typeof entry.parentSetAt, "string");
+    });
+  });
+}
+
+test("BOTH DIRECTIONS AT ONCE: the preserve beats a stale write, and set-parent beats the preserve", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "old-parent");
+    await seed(homeDir, "new-parent");
+    await seed(homeDir, "later-parent");
+    await seed(homeDir, "child", { parentSessionId: "old-parent" });
+
+    const persistence = await loadPersistenceModule();
+
+    // 🛑 THESE TWO ASSERTIONS ARE IN ONE TEST DELIBERATELY. They pull in OPPOSITE
+    // directions through the same seam, and each has a passing test of its own
+    // elsewhere — so fixing one by breaking the other leaves the suite GREEN:
+    //   • make the preserve unconditional but drop the `authoritative` gate
+    //     → direction B fails, set-parent silently writes nothing (§1.2 leg b);
+    //   • keep the gate but move the preserve back inside `preserveLifecycle`
+    //     → direction A fails, a close in flight silently undoes a re-parent (F2).
+    // Held together, neither repair can be made at the other's expense unnoticed.
+
+    // ── DIRECTION A: disk wins over a stale privileged write ──────────────────
+    const staleRecord = await persistence.resolveSessionRecord("child");
+    await runCli(
+      ["claude", "sessions", "set-parent", "--session-id", "child", "--parent-id", "new-parent"],
+      homeDir,
+    );
+    staleRecord.closed = true;
+    staleRecord.closedAt = new Date().toISOString();
+    await persistence.writeSessionRecordAtBoundaryWithLifecycle(staleRecord);
+    assert.equal(
+      (await readRecordJson(homeDir, "child")).parent_session_id,
+      "new-parent",
+      "DIRECTION A FAILED: a stale privileged write undid the re-parent",
+    );
+
+    // ── DIRECTION B: set-parent's OWN write beats that same preserve ──────────
+    const second = await runCli(
+      ["claude", "sessions", "set-parent", "--session-id", "child", "--parent-id", "later-parent"],
+      homeDir,
+    );
+    assert.equal(second.code, 0, second.stderr);
+    assert.equal(
+      (await readRecordJson(homeDir, "child")).parent_session_id,
+      "later-parent",
+      "DIRECTION B FAILED: the preserve swallowed set-parent's own write — the verb is a silent no-op",
+    );
+    // Provenance stays the SPAWNER across both directions.
+    assert.equal((await readRecordJson(homeDir, "child")).spawned_by_session_id, "old-parent");
+  });
+});
+
 // ─── 3. Self-clobber — leg (b) ────────────────────────────────────────────────
 
 test("set-parent on an existing on-disk record actually changes it (leg b)", async () => {
