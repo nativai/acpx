@@ -638,6 +638,173 @@ test("--children-of moves open direct children only; subagent is skipped by name
   });
 });
 
+// ─── F4 — a child TORN ACROSS THE TWO STORES ─────────────────────────────────
+
+/**
+ * Tear a session across the two stores the way a kill mid-`--children-of` does:
+ * the RECORD write landed, the INDEX update did not.
+ *
+ * ⚠️ CONSTRUCTED DETERMINISTICALLY, NOT BY RACING A SIGKILL. The window is real but
+ * small, and a race-timed fixture is a flake generator; the test-engineer already
+ * proved reachability against a live batch. What must be deterministic is the STATE.
+ *
+ * ⚠️ AND THE TORN STATE IS THE ONLY THING THAT DISTINGUISHES THE TWO PREDICATES.
+ * Record-only and union selection agree on every child whose stores agree — so a
+ * fixture built from an ordinary child PASSES EITHER WAY and proves nothing at all.
+ */
+async function tearAcrossStores(
+  homeDir: string,
+  childId: string,
+  recordParent: string,
+): Promise<void> {
+  const recordPath = sessionFilePath(homeDir, childId);
+  const record = JSON.parse(await fs.readFile(recordPath, "utf8")) as Record<string, unknown>;
+  record.parent_session_id = recordParent;
+  record.parent_set_at = new Date().toISOString();
+  await fs.writeFile(recordPath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+  // …and the index entry is deliberately left naming the OLD parent.
+}
+
+test("F4: --children-of HEALS a child whose record arrived but whose index did not", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "old-parent");
+    await seed(homeDir, "new-parent");
+    await seed(homeDir, "torn-child", { parentSessionId: "old-parent" });
+    await seed(homeDir, "ordinary-child", { parentSessionId: "old-parent" });
+    // Materialise index.json with BOTH children under old-parent.
+    await runCli(["claude", "sessions", "list", "--local"], homeDir);
+    assert.equal((await readIndexEntry(homeDir, "torn-child")).parentSessionId, "old-parent");
+
+    // The tear: record says new-parent, index still says old-parent.
+    await tearAcrossStores(homeDir, "torn-child", "new-parent");
+
+    const result = await runCli(
+      [
+        "claude",
+        "sessions",
+        "set-parent",
+        "--children-of",
+        "old-parent",
+        "--parent-id",
+        "new-parent",
+        "--format",
+        "json",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const payload = parseJsonLine(result.stdout);
+
+    // BEFORE this fix the torn child was in NEITHER array and the run said ok:true.
+    const moved = payload.moved as Record<string, unknown>[];
+    const movedIds = new Set(moved.map((entry) => entry.acpxRecordId));
+    assert.ok(
+      movedIds.has("torn-child"),
+      `the torn child was not moved — it is invisible again: ${result.stdout}`,
+    );
+    assert.ok(movedIds.has("ordinary-child"));
+
+    // …and the heal is AUDITABLE, not indistinguishable from an ordinary move.
+    const tornEntry = moved.find((entry) => entry.acpxRecordId === "torn-child");
+    const divergence = tornEntry?.healedStoreDivergence as Record<string, unknown> | undefined;
+    assert.ok(divergence, "a healed child must carry the two values that disagreed");
+    assert.equal(divergence?.recordParentSessionId, "new-parent");
+    assert.equal(divergence?.indexParentSessionId, "old-parent");
+    assert.ok(
+      (payload.warnings as string[]).some((warning) =>
+        warning.includes("SPLIT across the two stores"),
+      ),
+      "the heal must be visible in warnings, not only in a nested field",
+    );
+    // An ordinary child must NOT be labelled as healed.
+    const ordinary = moved.find((entry) => entry.acpxRecordId === "ordinary-child");
+    assert.equal(ordinary?.healedStoreDivergence, undefined);
+
+    // BOTH stores now agree.
+    assert.equal((await readRecordJson(homeDir, "torn-child")).parent_session_id, "new-parent");
+    assert.equal((await readIndexEntry(homeDir, "torn-child")).parentSessionId, "new-parent");
+  });
+});
+
+test("F4: a torn child whose record names a THIRD session is REPORTED, never moved", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "old-parent");
+    await seed(homeDir, "new-parent");
+    await seed(homeDir, "third-parent");
+    await seed(homeDir, "torn-child", { parentSessionId: "old-parent" });
+    await runCli(["claude", "sessions", "list", "--local"], homeDir);
+
+    // The child was already deliberately moved to a THIRD session; only its stale
+    // index still calls it a child of old-parent.
+    await tearAcrossStores(homeDir, "torn-child", "third-parent");
+
+    const result = await runCli(
+      [
+        "claude",
+        "sessions",
+        "set-parent",
+        "--children-of",
+        "old-parent",
+        "--parent-id",
+        "new-parent",
+        "--format",
+        "json",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const payload = parseJsonLine(result.stdout);
+
+    // 🛑 REFUSING TO GUESS IS THE POINT. Moving it would silently override a
+    // COMPLETED deliberate re-parent — F4's own failure mode wearing a different
+    // hat. Nothing here can tell whether the operator means the record or the index.
+    assert.deepEqual(payload.moved, [], "a third-session divergence must NOT be moved");
+    const diverged = payload.diverged as Record<string, unknown>[];
+    assert.equal(diverged.length, 1);
+    assert.equal(diverged[0]?.acpxRecordId, "torn-child");
+    assert.equal(diverged[0]?.recordParentSessionId, "third-parent");
+    assert.equal(diverged[0]?.indexParentSessionId, "old-parent");
+    assert.ok(
+      (payload.warnings as string[]).some((warning) => warning.includes("was NOT moved")),
+      "a refusal that is not reported is the defect, not the refusal",
+    );
+    // Untouched: the deliberate move to the third session stands.
+    assert.equal((await readRecordJson(homeDir, "torn-child")).parent_session_id, "third-parent");
+  });
+});
+
+test("F4: set-parent writes the index entry IMMEDIATELY, not through the coalescing queue", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "old-parent");
+    await seed(homeDir, "new-parent");
+    await seed(homeDir, "child", { parentSessionId: "old-parent" });
+
+    const session = await loadSessionModule();
+    // In-process, so the coalescing queue's per-file state is LIVE — the case a CLI
+    // subprocess cannot exercise, because a fresh process always has
+    // elapsed=Infinity and takes the immediate branch by accident.
+    await session.setSessionParent({
+      target: { kind: "session", sessionId: "child" },
+      parent: { id: "new-parent" },
+    });
+
+    // Read index.json straight off disk, WITHOUT going through any acpx API that
+    // would flush the queue for us — that flush is exactly what would hide a
+    // throttled write.
+    const raw = JSON.parse(
+      await fs.readFile(path.join(homeDir, ".acpx", "sessions", "index.json"), "utf8"),
+    ) as { entries?: Record<string, unknown>[] };
+    const entry = (raw.entries ?? []).find((candidate) => candidate.acpxRecordId === "child");
+    assert.ok(entry, "no index entry for child");
+    assert.equal(
+      entry?.parentSessionId,
+      "new-parent",
+      "the index write was throttled — the board follows the index, and a re-parent is human-frequency",
+    );
+    assert.equal(typeof entry?.parentSetAt, "string");
+  });
+});
+
 // ─── 9. Zero children is a SUCCESS ────────────────────────────────────────────
 
 test("--children-of matching zero children exits 0 with moved: []", async () => {

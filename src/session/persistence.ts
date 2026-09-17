@@ -21,6 +21,7 @@ export {
   isArchivedRecord,
   isTemplateRecord,
   isoNow,
+  listSessionIndexEntries,
   listSessions,
   listSessionsForAgent,
   listSubagentsForSession,

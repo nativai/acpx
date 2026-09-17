@@ -178,6 +178,20 @@ async function loadSessionIndexEntries(): Promise<SessionIndexEntry[]> {
   return index.entries;
 }
 
+/**
+ * The index entries as they stand on disk — MEMBERSHIP AND ENTRY FIELDS, not the
+ * hydrated records `listSessions()` returns.
+ *
+ * Exported additively for `sessions set-parent`, whose `--children-of` selection has
+ * to compare the record's parent against the INDEX ENTRY's parent to notice a session
+ * torn across the two stores (brick c99f9994 F4). `listSessions()` cannot serve that:
+ * it is a hybrid — membership from the index, every FIELD from the record — so the
+ * entry's own `parentSessionId` is discarded before any caller sees it.
+ */
+export async function listSessionIndexEntries(): Promise<SessionIndexEntry[]> {
+  return await loadSessionIndexEntries();
+}
+
 function matchesSessionEntry(
   session: SessionIndexEntry,
   normalizedCwd: string,
@@ -346,6 +360,20 @@ type WriteAuthoritativeFields = { parent?: true };
  * `set-parent` that mutates the record and calls plain `writeSessionRecord` writes
  * the record it started from — exit 0, correct-looking output, nothing changed.
  *
+ * The index half is written IMMEDIATELY rather than through the coalescing queue.
+ * That is not an optimisation: `immediate: !preserveLifecycle` classifies this as an
+ * ordinary throttled write, when a re-parent is squarely the human-frequency,
+ * freshness-sensitive class the close/favorite/name comment at the call site
+ * describes — and acceptance criterion 2 asks the board to follow within ~1 s. It is
+ * prompt today only BY ACCIDENT, because a fresh CLI process has no `lastWrittenAt`
+ * for the file (`elapsed = Infinity`) and takes the immediate branch anyway; any
+ * long-lived in-process caller would get the real throttle and a
+ * record/index split window the width of the flush interval (brick c99f9994 F4).
+ *
+ * ⚠️ Scoped to THIS write. Do not express it by flipping the general
+ * `!preserveLifecycle` rule, which would silently make every lifecycle-preserving
+ * write in the repo immediate.
+ *
  * ⚠️ DO NOT "simplify" this to `writeSessionRecordWithLifecycle`. That bypass
  * disables preservation for EVERY lifecycle field, so a concurrent rename, close or
  * favourite-toggle landing in the read→write window is lost — a bigger hole than
@@ -360,6 +388,7 @@ export async function writeSessionRecordAuthorizingParent(record: SessionRecord)
     messagePersistence: "checkpoint",
     preserveLifecycle: true,
     authoritative: { parent: true },
+    immediateIndexUpdate: true,
   });
 }
 
@@ -488,6 +517,16 @@ function preserveLastTurnProviderForPersist(
   }
 }
 
+/** Membership-immediate / scalar-throttled (W2.3), plus the per-write opt-in a
+ *  re-parent needs — see `writeSessionRecordAuthorizingParent`. Named rather than
+ *  inlined so the opt-in cannot be mistaken for a tweak of the general rule. */
+function indexWriteIsImmediate(options: {
+  preserveLifecycle: boolean;
+  immediateIndexUpdate?: true;
+}): boolean {
+  return options.immediateIndexUpdate === true || !options.preserveLifecycle;
+}
+
 async function writeSessionRecordInternal(
   record: SessionRecord,
   options: {
@@ -500,6 +539,10 @@ async function writeSessionRecordInternal(
      * field, taken from the in-memory record for these. See
      * `writeSessionRecordAuthorizingParent`. */
     authoritative?: WriteAuthoritativeFields;
+    /** Bypass the coalescing index queue for this write only. See
+     * `writeSessionRecordAuthorizingParent` for why a re-parent needs it and why
+     * it is NOT expressed by changing the general rule below. */
+    immediateIndexUpdate?: true;
   },
 ): Promise<void> {
   // ⚠️ THE ARCHIVED-RECORD WRITE GUARD, PLACED HERE **BY CONSTRUCTION**. All four
@@ -616,7 +659,7 @@ async function writeSessionRecordInternal(
       // privileged lifecycle path (close/favorite/name) always writes
       // immediately — human-frequency and freshness-sensitive.
       await updateSessionIndexForRecordWrite(sessionDir, toSessionIndexEntry(record, fileName), {
-        immediate: !options.preserveLifecycle,
+        immediate: indexWriteIsImmediate(options),
       });
       rememberSessionMetadataBaseline(record);
       rememberSessionModelBaseline(record);

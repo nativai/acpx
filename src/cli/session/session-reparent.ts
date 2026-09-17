@@ -2,6 +2,7 @@ import { SessionArchivedError, SessionNotFoundError } from "../../errors.js";
 import {
   isArchivedRecord,
   isoNow,
+  listSessionIndexEntries,
   listSessions,
   resolveSessionRecord,
   writeSessionRecordAuthorizingParent,
@@ -72,6 +73,26 @@ export type SetParentMovedSession = {
   /** Queue-owner classification at the moment of the move, so a caller can see it
    *  re-parented a session whose owner is live. */
   ownerState: string;
+  /**
+   * Present ONLY when this child's two stores disagreed at selection time and this
+   * run rewrote both — i.e. an interrupted re-parent finished. Carries the two
+   * values that disagreed, so the heal is auditable after the fact rather than
+   * indistinguishable from an ordinary move.
+   */
+  healedStoreDivergence?: { recordParentSessionId?: string; indexParentSessionId?: string };
+};
+
+/**
+ * A child whose RECORD and INDEX ENTRY disagree about its parent, reported instead
+ * of moved. See `selectTargets` for the three-branch rule and why this branch
+ * refuses rather than guessing. (brick c99f9994 F4)
+ */
+export type SetParentDivergedSession = {
+  acpxRecordId: string;
+  name?: string;
+  recordParentSessionId?: string;
+  indexParentSessionId?: string;
+  reason: string;
 };
 
 export type SetParentSkippedSession = {
@@ -93,6 +114,14 @@ export type SetParentResult = {
    */
   moved: SetParentMovedSession[];
   skipped: SetParentSkippedSession[];
+  /**
+   * ⚠️ THE POINT OF THIS ARRAY IS THAT `ok:true` MUST NEVER AGAIN BE THE WHOLE
+   * STORY. A child torn across the two stores used to appear in NEITHER `moved` NOR
+   * `skipped` — a clean success over a split store, with nothing for an operator to
+   * pull on. It is the only part of the F4 repair that helps someone whose store is
+   * ALREADY split, because it needs no re-run to have gone right.
+   */
+  diverged: SetParentDivergedSession[];
   warnings: string[];
 };
 
@@ -217,13 +246,23 @@ async function resolveNewParent(parent: { id: string; url?: string }): Promise<{
   }
 }
 
+type ChildSelection = {
+  targets: SessionRecord[];
+  /** Torn children this run refuses to move — reported, never guessed at. */
+  diverged: SetParentDivergedSession[];
+  /** acpxRecordId → the two disagreeing values, for children we DO move (the heal). */
+  healed: Map<string, { recordParentSessionId?: string; indexParentSessionId?: string }>;
+};
+
 async function selectTargets(
   target: SetParentTarget,
   allRecords: SessionRecord[],
-): Promise<SessionRecord[]> {
+  newParentId: string,
+): Promise<ChildSelection> {
+  const empty = { diverged: [], healed: new Map() };
   if (target.kind === "session") {
     try {
-      return [await resolveSessionRecord(target.sessionId)];
+      return { targets: [await resolveSessionRecord(target.sessionId)], ...empty };
     } catch (error) {
       if (error instanceof SessionNotFoundError) {
         throw new SetParentRefusalError(
@@ -251,16 +290,132 @@ async function selectTargets(
     }
     throw error;
   }
-  // OPEN DIRECT children only: never transitive (a grandchild keeps its own
-  // parent), and never closed (a handover moves live work; a closed child is
-  // re-parentable one at a time via --session-id).
-  return allRecords.filter(
-    (record) => record.parentSessionId === oldParent.acpxRecordId && record.closed !== true,
+  return selectChildrenOf(oldParent.acpxRecordId, newParentId, allRecords, await indexParents());
+}
+
+/** acpxRecordId → the parent the INDEX ENTRY names, which can differ from the record. */
+async function indexParents(): Promise<Map<string, string | undefined>> {
+  return new Map(
+    (await listSessionIndexEntries()).map((entry) => [entry.acpxRecordId, entry.parentSessionId]),
   );
 }
 
-// The branches below ARE the envelope's absent-vs-present contract; inlining them
-// keeps the whole emitted shape readable in one place.
+/**
+ * Which children `--children-of <OLD>` acts on, over BOTH stores.
+ *
+ * ⚠️ THE PREDICATE READS THE INDEX ENTRY AS WELL AS THE RECORD, AND THAT IS THE WHOLE
+ * F4 REPAIR. `listSessions()` is a hybrid — membership from the index, every FIELD
+ * from the record — so a child whose record write landed and whose index update did
+ * not (a kill between the two) was still ENUMERATED and simply failed the predicate.
+ * It appeared in neither `moved` nor `skipped`, the run said `ok:true`, and the
+ * documented "just re-run it, the operation is idempotent" did not touch it.
+ *
+ * Three branches, over open direct children matched by EITHER store:
+ *   record == OLD                  → ordinary move.
+ *   record == the REQUESTED NEW    → HEAL. The record already arrived; finish the
+ *                                    interrupted index write. Idempotent by nature.
+ *   record == a THIRD session      → DIVERGED. Report, do NOT move.
+ *
+ * ⚠️ WHY THE THIRD BRANCH REFUSES INSTEAD OF MOVING, and do not "simplify" it into a
+ * flat union: the record naming a third session means this child has ALREADY been
+ * deliberately moved somewhere else, and only its stale index still calls it OLD.
+ * Moving it would silently override a completed re-parent — F4's own failure mode
+ * wearing a different hat. Nothing here can tell whether the operator means the
+ * record or the index, and picking one silently is how F4 was born.
+ *
+ * ⚠️ AND WHY THERE ARE THREE CASES AND NOT FOUR — the next reader will wonder.
+ * `record == OLD, index == something else` is UNREACHABLE: every writer of this pair
+ * writes the RECORD first and the INDEX second (acpx `repository.ts` persistRecordFile
+ * → updateSessionIndexForRecordWrite; acpx-ui's parent PATCH writeFileSync+rename →
+ * updateSessionIndexUnderLock), the index-only writers touch `closed`/`favorite`
+ * only, and the reconcile derives entries FROM records so it can only move the index
+ * TOWARD the record. A tear can therefore only run index-behind-record. Selecting on
+ * the union anyway costs nothing and means an unchecked writer in the other order
+ * would be reported rather than silently skipped.
+ */
+function selectChildrenOf(
+  oldParentId: string,
+  newParentId: string,
+  allRecords: SessionRecord[],
+  indexParentById: Map<string, string | undefined>,
+): ChildSelection {
+  const targets: SessionRecord[] = [];
+  const diverged: SetParentDivergedSession[] = [];
+  const healed: ChildSelection["healed"] = new Map();
+
+  for (const record of allRecords) {
+    // OPEN DIRECT children only: never transitive (a grandchild keeps its own
+    // parent), and never closed (a handover moves live work; a closed child is
+    // re-parentable one at a time via --session-id).
+    if (record.closed === true) {
+      continue;
+    }
+    const indexParent = indexParentById.get(record.acpxRecordId);
+    const verdict = classifyChild(record, oldParentId, newParentId, indexParent);
+    if (verdict === "move") {
+      targets.push(record);
+    } else if (verdict === "heal") {
+      targets.push(record);
+      healed.set(record.acpxRecordId, divergenceOf(record.parentSessionId, indexParent));
+    } else if (verdict === "diverged") {
+      diverged.push({
+        acpxRecordId: record.acpxRecordId,
+        ...(record.name ? { name: record.name } : {}),
+        ...divergenceOf(record.parentSessionId, indexParent),
+        reason:
+          "record and index entry disagree about this session's parent, and the record names a third session — re-assert it explicitly with --session-id if you want it moved",
+      });
+    }
+  }
+  return { targets, diverged, healed };
+}
+
+function divergedWarning(entry: SetParentDivergedSession): string {
+  return `${entry.name ?? entry.acpxRecordId} is SPLIT across the two stores (record: ${entry.recordParentSessionId ?? "none"}, index: ${entry.indexParentSessionId ?? "none"}) and was NOT moved`;
+}
+
+function divergenceOf(
+  recordParentSessionId: string | undefined,
+  indexParentSessionId: string | undefined,
+): { recordParentSessionId?: string; indexParentSessionId?: string } {
+  return {
+    ...(recordParentSessionId ? { recordParentSessionId } : {}),
+    ...(indexParentSessionId ? { indexParentSessionId } : {}),
+  };
+}
+
+/** Stamp the heal onto the moved entry and say so out loud. A healed child must not
+ *  read as an ordinary move — that silence is the whole of F4. */
+function noteHealedDivergence(
+  entry: SetParentMovedSession,
+  divergence: { recordParentSessionId?: string; indexParentSessionId?: string } | undefined,
+): string[] {
+  if (!divergence) {
+    return [];
+  }
+  entry.healedStoreDivergence = divergence;
+  return [
+    `${entry.name ?? entry.acpxRecordId} was SPLIT across the two stores (record: ${divergence.recordParentSessionId ?? "none"}, index: ${divergence.indexParentSessionId ?? "none"}) — this run rewrote both`,
+  ];
+}
+
+/** The three-branch rule of `selectChildrenOf`, as one decision. */
+function classifyChild(
+  record: SessionRecord,
+  oldParentId: string,
+  newParentId: string,
+  indexParent: string | undefined,
+): "move" | "heal" | "diverged" | "ignore" {
+  const recordParent = record.parentSessionId;
+  if (recordParent !== oldParentId && indexParent !== oldParentId) {
+    return "ignore";
+  }
+  if (recordParent === oldParentId) {
+    return "move";
+  }
+  return recordParent === newParentId ? "heal" : "diverged";
+}
+
 // eslint-disable-next-line complexity -- explicit optional-field projection
 function applyParentToRecord(
   record: SessionRecord,
@@ -340,7 +495,7 @@ export async function setSessionParent(options: SetParentOptions): Promise<SetPa
   const dryRun = options.dryRun === true;
   const allRecords = await listSessions();
   const parent = await resolveNewParent(options.parent);
-  const targets = await selectTargets(options.target, allRecords);
+  const selection = await selectTargets(options.target, allRecords, parent.acpxRecordId);
 
   const warnings: string[] = [];
   // Allowed, not refused: the board hides closed sessions as tiles but walks
@@ -354,12 +509,14 @@ export async function setSessionParent(options: SetParentOptions): Promise<SetPa
   const nameById = new Map(allRecords.map((r) => [r.acpxRecordId, r.name]));
   const nameOf = (sessionId: string): string | undefined => nameById.get(sessionId);
 
-  const outcome = await moveTargets(targets, parent, allRecords, {
+  const outcome = await moveTargets(selection.targets, parent, allRecords, {
     single: options.target.kind === "session",
     dryRun,
     nameOf,
+    healed: selection.healed,
   });
   warnings.push(...outcome.warnings);
+  warnings.push(...selection.diverged.map(divergedWarning));
 
   return {
     ok: true,
@@ -372,6 +529,7 @@ export async function setSessionParent(options: SetParentOptions): Promise<SetPa
     },
     moved: outcome.moved,
     skipped: outcome.skipped,
+    diverged: selection.diverged,
     warnings,
   };
 }
@@ -384,6 +542,8 @@ type MoveContext = {
   single: boolean;
   dryRun: boolean;
   nameOf: (sessionId: string) => string | undefined;
+  /** Children whose two stores disagreed and that this run is healing. */
+  healed: ChildSelection["healed"];
 };
 
 async function moveTargets(
@@ -421,6 +581,7 @@ async function moveTargets(
     }
     const ownerState = (await readSessionOwnerStatus(record.acpxRecordId)).classification;
     const entry = applyParentToRecord(record, parent, now, ownerState, context.nameOf);
+    warnings.push(...noteHealedDivergence(entry, context.healed.get(record.acpxRecordId)));
     if (!context.dryRun && !(await persistReparentedRecord(record, refuse))) {
       continue;
     }

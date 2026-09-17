@@ -4435,7 +4435,14 @@ function setParentMovedLine(entry: SetParentResult["moved"][number]): string {
   // derived fork edge — so the run SHOWS it happening rather than leaving it to
   // `--help`, which nobody reads at the moment they do the thing.
   const forkNote = entry.wasForkEdge ? "   [fork edge → spawn]" : "";
-  return `  ${describeSetParentSession(entry.name, entry.acpxRecordId)}${was}${forkNote}`;
+  // A healed child is NOT an ordinary move and must not read as one: its two stores
+  // disagreed and this run rewrote both. Saying so on the line is the difference
+  // between an operator seeing an interrupted re-parent finished and an operator
+  // seeing nothing at all, which is the whole of F4.
+  const healed = entry.healedStoreDivergence
+    ? `   [healed split store: record=${shortOrNone(entry.healedStoreDivergence.recordParentSessionId)} index=${shortOrNone(entry.healedStoreDivergence.indexParentSessionId)}]`
+    : "";
+  return `  ${describeSetParentSession(entry.name, entry.acpxRecordId)}${was}${forkNote}${healed}`;
 }
 
 function printSetParentResult(result: SetParentResult, format: OutputFormat): void {
@@ -4469,7 +4476,19 @@ function printSetParentResult(result: SetParentResult, format: OutputFormat): vo
   printSetParentSkippedAndWarnings(result);
 }
 
+function shortOrNone(sessionId: string | undefined): string {
+  return sessionId ? shortSessionId(sessionId) : "none";
+}
+
 function printSetParentSkippedAndWarnings(result: SetParentResult): void {
+  if (result.diverged.length > 0) {
+    process.stdout.write(`Diverged ${result.diverged.length} — NOT moved:\n`);
+    for (const entry of result.diverged) {
+      process.stdout.write(
+        `  ${describeSetParentSession(entry.name, entry.acpxRecordId)}   record=${shortOrNone(entry.recordParentSessionId)} index=${shortOrNone(entry.indexParentSessionId)} — ${entry.reason}\n`,
+      );
+    }
+  }
   if (result.skipped.length > 0) {
     process.stdout.write(`Skipped ${result.skipped.length}:\n`);
     for (const entry of result.skipped) {
