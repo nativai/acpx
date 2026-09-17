@@ -978,6 +978,167 @@ test("every refusal emits its own code and exit status", async () => {
   });
 });
 
+test("a DRY-RUN heal says WOULD rewrite, never rewrote — and writes nothing", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "old-parent");
+    await seed(homeDir, "new-parent");
+    await seed(homeDir, "torn-child", { parentSessionId: "old-parent" });
+    await runCli(["claude", "sessions", "list", "--local"], homeDir);
+    await tearAcrossStores(homeDir, "torn-child", "new-parent");
+
+    const recordPath = sessionFilePath(homeDir, "torn-child");
+    const indexPath = path.join(homeDir, ".acpx", "sessions", "index.json");
+    const recordBefore = await fs.readFile(recordPath, "utf8");
+    const indexBefore = await fs.readFile(indexPath, "utf8");
+
+    const result = await runCli(
+      [
+        "claude",
+        "sessions",
+        "set-parent",
+        "--children-of",
+        "old-parent",
+        "--parent-id",
+        "new-parent",
+        "--dry-run",
+        "--format",
+        "json",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const warnings = parseJsonLine(result.stdout).warnings as string[];
+
+    // ⚠️ THE PAST TENSE IS A FACTUAL CLAIM, AND IN A DRY RUN IT IS FALSE. The same
+    // run prints "DRY RUN — no changes written"; an operator mid-handover reading
+    // "rewrote" believes the store has already moved, which is the one thing
+    // --dry-run exists to let them avoid.
+    assert.ok(
+      warnings.some((warning) => warning.includes("WOULD rewrite both")),
+      `expected a conditional tense, got ${JSON.stringify(warnings)}`,
+    );
+    assert.ok(
+      !warnings.some((warning) => warning.includes("rewrote both")),
+      `a dry run must not claim it rewrote anything: ${JSON.stringify(warnings)}`,
+    );
+
+    // …and the claim is true: nothing moved, asserted byte-for-byte rather than assumed.
+    assert.equal(await fs.readFile(recordPath, "utf8"), recordBefore);
+    assert.equal(await fs.readFile(indexPath, "utf8"), indexBefore);
+  });
+});
+
+test("a REAL heal still says rewrote — the conditional tense must not leak into it", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "old-parent");
+    await seed(homeDir, "new-parent");
+    await seed(homeDir, "torn-child", { parentSessionId: "old-parent" });
+    await runCli(["claude", "sessions", "list", "--local"], homeDir);
+    await tearAcrossStores(homeDir, "torn-child", "new-parent");
+
+    const result = await runCli(
+      [
+        "claude",
+        "sessions",
+        "set-parent",
+        "--children-of",
+        "old-parent",
+        "--parent-id",
+        "new-parent",
+        "--format",
+        "json",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const warnings = parseJsonLine(result.stdout).warnings as string[];
+    assert.ok(
+      warnings.some((warning) => warning.includes("this run rewrote both")),
+      `a real run must state it plainly: ${JSON.stringify(warnings)}`,
+    );
+    assert.ok(!warnings.some((warning) => warning.includes("WOULD rewrite")));
+  });
+});
+
+test("--session-id REPORTS the split it repairs, exactly as --children-of does", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "old-parent");
+    await seed(homeDir, "third-parent");
+    await seed(homeDir, "new-parent");
+    await seed(homeDir, "torn-child", { parentSessionId: "old-parent" });
+    await runCli(["claude", "sessions", "list", "--local"], homeDir);
+    // The shape the `diverged` advice produces: record and index disagree, and the
+    // operator is told to re-assert explicitly with --session-id.
+    await tearAcrossStores(homeDir, "torn-child", "third-parent");
+
+    const result = await runCli(
+      [
+        "claude",
+        "sessions",
+        "set-parent",
+        "--session-id",
+        "torn-child",
+        "--parent-id",
+        "new-parent",
+        "--format",
+        "json",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const moved = (parseJsonLine(result.stdout).moved as Record<string, unknown>[])[0];
+
+    // ⚠️ THIS PATH IS WHERE THE `diverged` ADVICE SENDS THE OPERATOR, so it is the
+    // run most likely to be repairing a torn store — and it used to report
+    // healedStoreDivergence:null while demonstrably fixing one. The two target forms
+    // must not describe the same repair differently.
+    const divergence = moved?.healedStoreDivergence as Record<string, unknown> | undefined;
+    assert.ok(divergence, "--session-id repaired a split and said nothing about it");
+    assert.equal(divergence?.recordParentSessionId, "third-parent");
+    assert.equal(divergence?.indexParentSessionId, "old-parent");
+    assert.ok(
+      (parseJsonLine(result.stdout).warnings as string[]).some((warning) =>
+        warning.includes("SPLIT across the two stores"),
+      ),
+    );
+    // Both stores end up agreeing on the requested parent.
+    assert.equal((await readRecordJson(homeDir, "torn-child")).parent_session_id, "new-parent");
+    assert.equal((await readIndexEntry(homeDir, "torn-child")).parentSessionId, "new-parent");
+  });
+});
+
+test("--session-id on an UNTORN session reports no divergence — absence must stay meaningful", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "old-parent");
+    await seed(homeDir, "new-parent");
+    await seed(homeDir, "child", { parentSessionId: "old-parent" });
+    await runCli(["claude", "sessions", "list", "--local"], homeDir);
+
+    const result = await runCli(
+      [
+        "claude",
+        "sessions",
+        "set-parent",
+        "--session-id",
+        "child",
+        "--parent-id",
+        "new-parent",
+        "--format",
+        "json",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const moved = (parseJsonLine(result.stdout).moved as Record<string, unknown>[])[0];
+    // If an ordinary move reported a divergence, the field would stop meaning
+    // anything — and a never-indexed session (absent from index.json entirely) must
+    // not read as a split either, which is why the detection uses has() rather than
+    // comparing against undefined.
+    assert.equal(moved?.healedStoreDivergence, undefined);
+    assert.deepEqual(parseJsonLine(result.stdout).warnings, []);
+  });
+});
+
 // ─── SESSION_ARCHIVED — the one refusal no live rig can reach ────────────────
 
 test("SESSION_ARCHIVED: an archived record refuses, exit 1, and is not resurrected", async () => {

@@ -74,10 +74,16 @@ export type SetParentMovedSession = {
    *  re-parented a session whose owner is live. */
   ownerState: string;
   /**
-   * Present ONLY when this child's two stores disagreed at selection time and this
-   * run rewrote both — i.e. an interrupted re-parent finished. Carries the two
-   * values that disagreed, so the heal is auditable after the fact rather than
-   * indistinguishable from an ordinary move.
+   * Present ONLY when this child's two stores disagreed at selection time — i.e. an
+   * interrupted re-parent that this run finishes (or, under `--dry-run`, WOULD
+   * finish). Carries the two values that disagreed, so the heal is auditable
+   * afterwards rather than indistinguishable from an ordinary move.
+   *
+   * Set by BOTH target forms. `--children-of` sets it on the heal branch;
+   * `--session-id` sets it whenever the named session's index entry disagrees with
+   * its record — that path is where the `diverged` advice sends an operator, so it
+   * is the one most likely to be repairing a split, and it must not describe the
+   * same repair differently from the batch path.
    */
   healedStoreDivergence?: { recordParentSessionId?: string; indexParentSessionId?: string };
 };
@@ -259,10 +265,10 @@ async function selectTargets(
   allRecords: SessionRecord[],
   newParentId: string,
 ): Promise<ChildSelection> {
-  const empty = { diverged: [], healed: new Map() };
   if (target.kind === "session") {
+    let record: SessionRecord;
     try {
-      return { targets: [await resolveSessionRecord(target.sessionId)], ...empty };
+      record = await resolveSessionRecord(target.sessionId);
     } catch (error) {
       if (error instanceof SessionNotFoundError) {
         throw new SetParentRefusalError(
@@ -272,6 +278,21 @@ async function selectTargets(
       }
       throw error;
     }
+    // ⚠️ THE EXPLICIT PATH MUST REPORT A SPLIT IT REPAIRS, EXACTLY AS THE BATCH
+    // PATH DOES. `--session-id` is where the `diverged` advice SENDS an operator
+    // ("re-assert it explicitly with --session-id"), so this is the run most likely
+    // to be resolving a torn store — and it used to report
+    // `healedStoreDivergence: null` while demonstrably fixing one, i.e. the two
+    // paths described the same repair differently.
+    //
+    // Unlike `--children-of` there is no three-branch choice here: the operator
+    // named this session AND this parent, so it always moves. The only question is
+    // whether the two stores disagreed on the way in.
+    return {
+      targets: [record],
+      diverged: [],
+      healed: divergenceForOne(record, await indexParents()),
+    };
   }
   // ⚠️ `--children-of` REQUIRES A LOCAL SESSION, and this resolve is why. It
   // enumerates the local index, so a non-resolving id would otherwise match zero
@@ -291,6 +312,29 @@ async function selectTargets(
     throw error;
   }
   return selectChildrenOf(oldParent.acpxRecordId, newParentId, allRecords, await indexParents());
+}
+
+/**
+ * The one-target equivalent of `selectChildrenOf`'s heal detection.
+ *
+ * ⚠️ `has()`, NOT a value comparison against `undefined`. A session with NO index
+ * entry at all (never indexed yet) is absent from the map, and `undefined !==
+ * "old-parent"` would report it as a split — noise on a brand-new session. Only an
+ * entry that EXISTS and disagrees is a divergence.
+ */
+function divergenceForOne(
+  record: SessionRecord,
+  indexParentById: Map<string, string | undefined>,
+): ChildSelection["healed"] {
+  const healed: ChildSelection["healed"] = new Map();
+  if (!indexParentById.has(record.acpxRecordId)) {
+    return healed;
+  }
+  const indexParent = indexParentById.get(record.acpxRecordId);
+  if (indexParent !== record.parentSessionId) {
+    healed.set(record.acpxRecordId, divergenceOf(record.parentSessionId, indexParent));
+  }
+  return healed;
 }
 
 /** acpxRecordId → the parent the INDEX ENTRY names, which can differ from the record. */
@@ -384,18 +428,28 @@ function divergenceOf(
   };
 }
 
-/** Stamp the heal onto the moved entry and say so out loud. A healed child must not
- *  read as an ordinary move — that silence is the whole of F4. */
+/**
+ * Stamp the heal onto the moved entry and say so out loud. A healed child must not
+ * read as an ordinary move — that silence is the whole of F4.
+ *
+ * ⚠️ THE TENSE IS CONDITIONAL ON THE MODE, AND THAT IS NOT STYLE. This message used
+ * to say "this run rewrote both" unconditionally — printed by a run that also says
+ * "DRY RUN — no changes written", to an operator mid-handover, about a store it had
+ * not touched. `--dry-run` exists precisely so someone can look without having
+ * acted; a preview claiming it already wrote destroys that.
+ */
 function noteHealedDivergence(
   entry: SetParentMovedSession,
   divergence: { recordParentSessionId?: string; indexParentSessionId?: string } | undefined,
+  dryRun: boolean,
 ): string[] {
   if (!divergence) {
     return [];
   }
   entry.healedStoreDivergence = divergence;
+  const outcome = dryRun ? "this run WOULD rewrite both" : "this run rewrote both";
   return [
-    `${entry.name ?? entry.acpxRecordId} was SPLIT across the two stores (record: ${divergence.recordParentSessionId ?? "none"}, index: ${divergence.indexParentSessionId ?? "none"}) — this run rewrote both`,
+    `${entry.name ?? entry.acpxRecordId} was SPLIT across the two stores (record: ${divergence.recordParentSessionId ?? "none"}, index: ${divergence.indexParentSessionId ?? "none"}) — ${outcome}`,
   ];
 }
 
@@ -581,7 +635,9 @@ async function moveTargets(
     }
     const ownerState = (await readSessionOwnerStatus(record.acpxRecordId)).classification;
     const entry = applyParentToRecord(record, parent, now, ownerState, context.nameOf);
-    warnings.push(...noteHealedDivergence(entry, context.healed.get(record.acpxRecordId)));
+    warnings.push(
+      ...noteHealedDivergence(entry, context.healed.get(record.acpxRecordId), context.dryRun),
+    );
     if (!context.dryRun && !(await persistReparentedRecord(record, refuse))) {
       continue;
     }
