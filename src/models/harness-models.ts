@@ -81,8 +81,25 @@ function capLadder(ladder: CanonicalDepthLevel[], ceiling: CanonicalDepthLevel) 
   return ladder.filter((level) => depthRank(level) <= depthRank(ceiling));
 }
 
-const CLAUDE_ALIASES: { id: string; name: string }[] = [
-  { id: "default", name: "Default (Opus 5, 1M context)" },
+// `default` is the ONE Claude alias whose id is not itself a family name — its
+// `aliasTarget` is what lets `model-floor.ts` resolve a `"default"` pin to a
+// comparable family instead of comparing the literal string "default" against
+// a served id (brick://ac931199). It is co-located with the `name` string that
+// already documents the same fact ("Opus 5") so the two can never drift apart
+// silently the way an aliasTarget derived from an external adapter reading
+// could (contrast the fable cross-adapter-version note in model-floor.ts) —
+// this mapping is ours, not observed off the wire, and we update both fields
+// together the day acpx's own "default" choice changes.
+const CLAUDE_ALIASES: {
+  id: string;
+  name: string;
+  aliasTarget?: { id: string; name: string | null };
+}[] = [
+  {
+    id: "default",
+    name: "Default (Opus 5, 1M context)",
+    aliasTarget: { id: "opus", name: "Opus" },
+  },
   { id: "opus", name: "Opus" },
   { id: "sonnet", name: "Sonnet 5" },
   { id: "haiku", name: "Haiku 4.5" },
@@ -182,6 +199,7 @@ function nativeRow(params: {
   depth: DepthDescriptor;
   account: string;
   agentTypes: string[];
+  aliasTarget?: { id: string; name: string | null } | null;
 }): NativeModel {
   return {
     key: `${params.source}:${params.id}`,
@@ -205,7 +223,7 @@ function nativeRow(params: {
     },
     depth: params.depth,
     badges: [],
-    aliasTarget: null,
+    aliasTarget: params.aliasTarget ?? null,
     equivalentTo: [],
     createdAt: null,
     selectable: true,
@@ -250,6 +268,7 @@ export function harnessNativeModels(): NativeModel[] {
           },
           account: source,
           agentTypes: ["claude"],
+          aliasTarget: alias.aliasTarget ?? null,
         }),
       );
     }

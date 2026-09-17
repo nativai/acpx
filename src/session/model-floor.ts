@@ -4,6 +4,7 @@ import {
   activeTranscriptConfigDir,
   resolveExistingTranscriptPath,
 } from "../config/subscription-transcript.js";
+import { harnessNativeModels } from "../models/harness-models.js";
 import type { SessionAcpxState, SessionRecord } from "../types.js";
 import { effortRank, normalizeEffortLevelForModel } from "./config-option-application.js";
 import { isoNow } from "./persistence.js";
@@ -84,15 +85,37 @@ function normalizeModelId(modelId: string | null | undefined): string | undefine
 }
 
 /**
+ * Resolve a harness-NATIVE alias id (e.g. `"default"`) to its documented
+ * target model id, via the same `harnessNativeModels()` catalogue rows
+ * `model-ladder.ts` resolves spawn-time pins against — a plain in-memory
+ * lookup over acpx's own static alias table, no cache/network I/O, so this
+ * stays safe to call from the per-turn `enforceModelFloorPostServe` hot path.
+ * `undefined` for anything that isn't a native alias carrying an
+ * `aliasTarget` (a bare family token, a concrete id, or an unrecognized
+ * string) — those fall through to the existing comparison below unchanged.
+ */
+function nativeAliasTargetId(normalizedId: string): string | undefined {
+  return harnessNativeModels().find(
+    (model) => model.aliasTarget !== null && model.id.toLowerCase() === normalizedId,
+  )?.aliasTarget?.id;
+}
+
+/**
  * Normalize a model id/alias to a comparable family token. Returns a known
  * family (`fable`/`opus`/`sonnet`/`haiku`) when the id contains it, else the
  * lowercased, context-hint-stripped id so two spellings of an unknown model
- * still compare by equality.
+ * still compare by equality. A native alias id (`"default"`) is resolved to
+ * its target's family first, so a served id is never compared against the
+ * literal alias string.
  */
 export function modelFamily(modelId: string | null | undefined): string | undefined {
   const normalized = normalizeModelId(modelId);
   if (normalized === undefined) {
     return undefined;
+  }
+  const aliasTargetId = nativeAliasTargetId(normalized);
+  if (aliasTargetId !== undefined) {
+    return modelFamily(aliasTargetId);
   }
   for (const family of KNOWN_MODEL_FAMILIES) {
     if (normalized.includes(family)) {
@@ -102,9 +125,18 @@ export function modelFamily(modelId: string | null | undefined): string | undefi
   return normalized;
 }
 
-/** True when the pin is a bare family token (`fable`), not a concrete model id. */
-function isFamilyAliasPin(normalizedPin: string): boolean {
-  return (KNOWN_MODEL_FAMILIES as readonly string[]).includes(normalizedPin);
+/**
+ * True when the pin is a FAMILY-LEVEL request rather than a concrete model
+ * id — either a bare family token (`fable`) or a native alias that resolves
+ * to one (`default` → `opus`). Both are satisfied by any served id of that
+ * family (see the file-level comment's two clauses).
+ */
+function familyAliasPinTarget(normalizedPin: string): string | undefined {
+  if ((KNOWN_MODEL_FAMILIES as readonly string[]).includes(normalizedPin)) {
+    return normalizedPin;
+  }
+  const aliasTargetId = nativeAliasTargetId(normalizedPin);
+  return aliasTargetId !== undefined ? modelFamily(aliasTargetId) : undefined;
 }
 
 /**
@@ -121,8 +153,9 @@ export function servedModelMatchesFloor(
   if (pinned === undefined || served === undefined) {
     return false;
   }
-  if (isFamilyAliasPin(pinned)) {
-    return modelFamily(served) === pinned;
+  const familyTarget = familyAliasPinTarget(pinned);
+  if (familyTarget !== undefined) {
+    return modelFamily(served) === familyTarget;
   }
   if (served === pinned) {
     return true;
