@@ -317,10 +317,19 @@ async function selectTargets(
 /**
  * The one-target equivalent of `selectChildrenOf`'s heal detection.
  *
- * ⚠️ `has()`, NOT a value comparison against `undefined`. A session with NO index
- * entry at all (never indexed yet) is absent from the map, and `undefined !==
- * "old-parent"` would report it as a split — noise on a brand-new session. Only an
- * entry that EXISTS and disagrees is a divergence.
+ * `has()` rather than a value comparison against `undefined`: a session with NO index
+ * entry at all is absent from the map, and `undefined !== "old-parent"` would report
+ * it as a split.
+ *
+ * ⚠️ THAT GUARD IS DEFENSIVE AND IS NOT COVERED BY A TEST — said plainly because I
+ * tried to cover it and could not. Dropping it leaves the suite green, and the
+ * reason is that the case cannot be constructed: BOTH index reads on this path
+ * (`listSessions()` and `listSessionIndexEntries()`) reconcile the index before
+ * returning, so every record file on disk has an entry by the time this runs. An
+ * archived record does resolve without one, but is refused before anything is
+ * emitted. Keep the guard — it costs nothing and is correct — but do NOT read it as
+ * load-bearing, and do not add a test that appears to pin it: a fixture built
+ * through the normal path always has the entry, so such a test would pass either way.
  */
 function divergenceForOne(
   record: SessionRecord,
