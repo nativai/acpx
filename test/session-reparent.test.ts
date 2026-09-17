@@ -4,8 +4,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { serializeSessionRecordForDisk } from "../src/session/persistence.js";
 import type { SessionRecord } from "../src/types.js";
 import {
+  fileExists,
   makeSessionRecord as makeSessionRecordFixture,
   sessionFilePath,
   withTempHome as withTempHomeFixture,
@@ -973,6 +975,76 @@ test("every refusal emits its own code and exit status", async () => {
 
     // Nothing above may have written anything.
     assert.equal((await readRecordJson(homeDir, "child")).parent_session_id, "a");
+  });
+});
+
+// ─── SESSION_ARCHIVED — the one refusal no live rig can reach ────────────────
+
+test("SESSION_ARCHIVED: an archived record refuses, exit 1, and is not resurrected", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "new-parent");
+
+    // ⚠️ THE RECORD MUST LIVE IN THE COLD DIR AND NOWHERE ELSE. `isArchivedRecord`
+    // is a WeakSet populated only by the archive-fallback resolve, so a record that
+    // also exists hot resolves hot, is never marked, and this test would assert a
+    // refusal that cannot happen. Placing the file ONLY in the archive dir is what
+    // drives the real classification instead of a fixture flag.
+    const archived = makeSessionRecordFixture({
+      acpxRecordId: "archived-child",
+      acpSessionId: "archived-child-acp",
+      agentCommand: "node mock",
+      agentName: "claude",
+      cwd: path.join(homeDir, "workspace"),
+      name: "archived-child",
+      parentSessionId: "old-parent",
+    });
+    const archiveDir = path.join(homeDir, ".acpx", "sessions-archive");
+    await fs.mkdir(archiveDir, { recursive: true });
+    const archivedPath = path.join(archiveDir, "archived-child.json");
+    await fs.writeFile(
+      archivedPath,
+      `${JSON.stringify(serializeSessionRecordForDisk(archived), null, 2)}\n`,
+      "utf8",
+    );
+
+    const result = await runCli(
+      [
+        "claude",
+        "sessions",
+        "set-parent",
+        "--session-id",
+        "archived-child",
+        "--parent-id",
+        "new-parent",
+        "--format",
+        "json",
+      ],
+      homeDir,
+    );
+
+    const payload = parseJsonLine(result.stdout);
+    assert.equal(payload.ok, false);
+    assert.equal(payload.code, "SESSION_ARCHIVED");
+    // ERROR, not USAGE: an archived record is not a mistyped flag, it is a real
+    // record in a state that must not be resurrected hot. This is the one refusal
+    // row with a non-2 exit and the only one a live rig cannot reach.
+    assert.equal(result.code, 1);
+
+    // 🛑 AND IT MUST NOT HAVE BEEN RE-CREATED HOT. Every write path computes its
+    // target from sessionFilePath(), which is the HOT dir — so a write that slipped
+    // past the guard would leave a session listed with a truncated transcript and no
+    // error at all. Asserting only the exit code would miss exactly that.
+    assert.equal(
+      await fileExists(sessionFilePath(homeDir, "archived-child")),
+      false,
+      "the archived record was re-created in the hot dir",
+    );
+    const stillArchived = JSON.parse(await fs.readFile(archivedPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    assert.equal(stillArchived.parent_session_id, "old-parent");
+    assert.equal(stillArchived.parent_set_at, undefined);
   });
 });
 
