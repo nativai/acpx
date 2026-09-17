@@ -604,12 +604,7 @@ export async function archiveStatus(context: ArchiveContext): Promise<ArchiveSta
     ? claimArchiveFileSets(await fs.readdir(context.archiveDir))
     : new Map<string, string[]>();
 
-  let orphanIds = 0;
-  for (const [safeId, files] of fileSets) {
-    if (findRecordFile(safeId, files) == null) {
-      orphanIds += 1;
-    }
-  }
+  const orphanIds = collectOrphanFileSets(fileSets).length;
 
   return {
     hotDir: context.hotDir,
@@ -623,6 +618,63 @@ export async function archiveStatus(context: ArchiveContext): Promise<ArchiveSta
     orphans: { ids: orphanIds },
     manifest: { rows: fold.totalRows, skippedRows: fold.skippedRows, absent: fold.absent },
     shards: archiveExists ? await listArchiveIndexShardKeys(context.archiveDir) : [],
+  };
+}
+
+export type ArchivedOrphan = { id: string; files: string[] };
+
+/**
+ * THE orphan test on the archive side: an archived id with NO record file.
+ *
+ * ⚠️ ONE FUNCTION, TWO CALLERS, ON PURPOSE. `--status` reports the orphan COUNT
+ * and `--list-orphans` reports the IDS; if those two derived the population
+ * separately they could disagree, and the count is exactly what sends an operator
+ * looking for the ids. Orphan membership goes through `findRecordFile` — the same
+ * single record-presence predicate the ingest path uses.
+ */
+function collectOrphanFileSets(fileSets: ReadonlyMap<string, string[]>): ArchivedOrphan[] {
+  const orphans: ArchivedOrphan[] = [];
+  for (const [safeId, files] of fileSets) {
+    if (findRecordFile(safeId, files) == null) {
+      orphans.push({ id: safeId, files });
+    }
+  }
+  return orphans.toSorted((a, b) => a.id.localeCompare(b.id));
+}
+
+/**
+ * The ids behind `--status`'s orphan count.
+ *
+ * 🛑 THIS CANNOT BE SERVED FROM THE SHARD INDEX, AND THAT IS WHY THE FLAG WAS DEAD.
+ * An orphan has no record to project, so by design it gets NO `ARCHIVE-INDEX`
+ * entry (formats §4.3). `listArchived` reads the shards — so routing
+ * `--list-orphans` through it returned the list of everything that is NOT an
+ * orphan, exited 0, and named no orphan ever. It has to read the DIRECTORY.
+ *
+ * Ids only, deliberately: there is no record, therefore no name, kind, cwd or
+ * closed state to table. The one thing an operator can do with an orphan is
+ * restore it by exact id, and `acpx sessions restore` takes exactly that — so
+ * this output pipes straight into it.
+ */
+export async function listArchivedOrphans(
+  context: ArchiveContext,
+  options: { limit?: number } = {},
+): Promise<{ orphans: ArchivedOrphan[]; totalIds: number; files: number; bytes: number }> {
+  const fileSets = claimArchiveFileSets(await fs.readdir(context.archiveDir));
+  const all = collectOrphanFileSets(fileSets);
+  const stats = await Promise.all(
+    all.map(async (orphan) => await statFileSet(context.archiveDir, orphan.files)),
+  );
+  return {
+    orphans: options.limit == null ? all : all.slice(0, options.limit),
+    // ⚠️ The totals cover EVERY orphan, not just the page `--limit` returned —
+    // otherwise `--limit 10` would silently redefine what the archive contains.
+    totalIds: all.length,
+    files: stats.reduce((sum, fileStats) => sum + fileStats.length, 0),
+    bytes: stats.reduce(
+      (sum, fileStats) => sum + fileStats.reduce((inner, stat) => inner + stat.bytes, 0),
+      0,
+    ),
   };
 }
 

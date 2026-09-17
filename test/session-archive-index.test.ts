@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { handleSessionsArchive } from "../src/cli/archive-command.js";
 import {
   ARCHIVE_INDEX_SCHEMA,
   buildArchiveIndexEntry,
@@ -14,6 +15,12 @@ import {
   type ArchiveIndexEntry,
 } from "../src/session/archive/archive-index.js";
 import { findClobbers, moveFileSet, statFileSet } from "../src/session/archive/move.js";
+import {
+  archiveStatus,
+  createContext,
+  listArchived,
+  listArchivedOrphans,
+} from "../src/session/archive/operations.js";
 import { isDetachedArchiveDir, sessionArchiveDirFor } from "../src/session/archive/paths.js";
 
 /**
@@ -238,5 +245,139 @@ test("the archive dir is a sibling of whatever hot dir THIS process resolved", (
     } else {
       process.env.ACPX_SESSIONS_ARCHIVE_DIR = previous;
     }
+  }
+});
+
+// ── `--list-orphans` vs `--list` ────────────────────────────────────────────────
+
+test("🛑 `--list-orphans` and `--list` return DISJOINT populations", async () => {
+  // ⚠️ THE TEST THAT WOULD HAVE CAUGHT A SHIPPED DEFECT, AND IT IS ONE ASSERTION.
+  // `--list-orphans` was declared and routed but never read, so it fell through to
+  // the shard-index list — which by design holds every id EXCEPT an orphan. It
+  // exited 0, returned byte-identical output to `--list` (2,223 B, `cmp` IDENTICAL)
+  // and named no orphan ever, while `--status` advertised it. Nothing asserted the
+  // two outputs DIFFER, which is the whole reason it survived two lanes'
+  // verification plus an integration gate.
+  const dir = await tempDir();
+  const archiveDir = path.join(dir, "sessions-archive");
+  await fs.mkdir(archiveDir, { recursive: true });
+  // `archiveStatus` measures BOTH directories, so the hot dir has to exist.
+  await fs.mkdir(path.join(dir, "sessions"), { recursive: true });
+
+  const withRecord = "11111111-1111-4111-8111-111111111111";
+  const orphan = "22222222-2222-4222-8222-222222222222";
+  await fs.writeFile(
+    path.join(archiveDir, `${withRecord}.json`),
+    JSON.stringify({ acpx_record_id: withRecord, closed: true }),
+    "utf8",
+  );
+  await fs.writeFile(path.join(archiveDir, `${withRecord}.messages.ndjson`), "x", "utf8");
+  // An orphan is exactly "sidecars, no record" — the plurality of the real corpus
+  // (1,792 of 3,693), not a corner case.
+  await fs.writeFile(path.join(archiveDir, `${orphan}.messages.ndjson`), "yy", "utf8");
+  await fs.writeFile(path.join(archiveDir, `${orphan}.stream.ndjson`), "zzz", "utf8");
+
+  await writeArchiveIndexShard(archiveDir, "2026-09", [entry(withRecord, { closed: true })], AT);
+
+  const context = createContext(path.join(dir, "sessions"), "test", Date.parse(AT));
+  const listed = (await listArchived(context)).entries.map((e) => e.id);
+  const orphaned = (await listArchivedOrphans(context)).orphans.map((o) => o.id);
+
+  assert.deepEqual(listed, [withRecord], "--list serves the shard index");
+  assert.deepEqual(orphaned, [orphan], "--list-orphans must read the DIRECTORY, not the shards");
+  assert.notDeepEqual(
+    orphaned,
+    listed,
+    "if these ever match, --list-orphans has fallen back to the ordinary list again",
+  );
+  // The count `--status` reports and the ids `--list-orphans` prints must come
+  // from one population — the count is exactly what sends an operator looking.
+  assert.equal((await archiveStatus(context)).orphans.ids, orphaned.length);
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("`--list-orphans` totals cover every orphan, not just the --limit page", async () => {
+  const dir = await tempDir();
+  const archiveDir = path.join(dir, "sessions-archive");
+  await fs.mkdir(archiveDir, { recursive: true });
+  for (const n of [1, 2, 3]) {
+    await fs.writeFile(path.join(archiveDir, `3333333${n}-orphan.messages.ndjson`), "ab", "utf8");
+  }
+  const context = createContext(path.join(dir, "sessions"), "test", Date.parse(AT));
+  const limited = await listArchivedOrphans(context, { limit: 1 });
+  assert.equal(limited.orphans.length, 1, "the page is limited");
+  assert.equal(limited.totalIds, 3, "the TOTAL is not — a page must not redefine the archive");
+  assert.equal(limited.bytes, 6);
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("🛑 the CLI VERB honours --list-orphans — the defect's actual location", async () => {
+  // ⚠️ THE OPERATIONS-LEVEL TEST ABOVE WOULD NOT HAVE CAUGHT THE SHIPPED DEFECT,
+  // AND SAYING SO IS THE POINT. The bug was not in the data layer — both list
+  // functions were correct — it was in `runListVerb` never READING the flag. A
+  // test one layer below the defect passes while the defect ships, which is how
+  // this survived two lanes plus an integration gate. So this one drives the
+  // exported CLI handler and asserts on what an operator actually receives.
+  const dir = await tempDir();
+  await fs.mkdir(path.join(dir, ".acpx", "sessions"), { recursive: true });
+  const archiveDir = path.join(dir, ".acpx", "sessions-archive");
+  await fs.mkdir(archiveDir, { recursive: true });
+
+  const withRecord = "44444444-4444-4444-8444-444444444444";
+  const orphan = "55555555-5555-4555-8555-555555555555";
+  await fs.writeFile(
+    path.join(archiveDir, `${withRecord}.json`),
+    JSON.stringify({ acpx_record_id: withRecord, closed: true }),
+    "utf8",
+  );
+  await fs.writeFile(path.join(archiveDir, `${orphan}.messages.ndjson`), "yy", "utf8");
+  await writeArchiveIndexShard(archiveDir, "2026-09", [entry(withRecord, { closed: true })], AT);
+
+  const previousHome = process.env.ACPX_STATE_HOME;
+  const previousExit = process.exitCode;
+  const originalWrite = process.stdout.write.bind(process.stdout);
+  process.env.ACPX_STATE_HOME = dir;
+
+  const capture = async (flags: Record<string, unknown>): Promise<string> => {
+    let captured = "";
+    process.stdout.write = ((chunk: string | Uint8Array): boolean => {
+      captured += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      await handleSessionsArchive(flags as never, {} as never);
+    } finally {
+      process.stdout.write = originalWrite;
+    }
+    return captured;
+  };
+
+  try {
+    const ordinary = await capture({ list: true, json: true });
+    const orphans = await capture({ listOrphans: true, json: true });
+
+    // The assertion that would have caught it, and it is one line.
+    assert.notEqual(
+      orphans,
+      ordinary,
+      "--list-orphans returned output identical to --list: the flag is dead again",
+    );
+    assert.match(orphans, new RegExp(orphan), "--list-orphans must NAME the orphan");
+    assert.doesNotMatch(
+      orphans,
+      new RegExp(withRecord),
+      "--list-orphans must not name a session that HAS a record",
+    );
+    assert.match(ordinary, new RegExp(withRecord));
+    assert.doesNotMatch(ordinary, new RegExp(orphan), "an orphan has no shard entry to list");
+  } finally {
+    process.stdout.write = originalWrite;
+    process.exitCode = previousExit;
+    if (previousHome == null) {
+      delete process.env.ACPX_STATE_HOME;
+    } else {
+      process.env.ACPX_STATE_HOME = previousHome;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
   }
 });

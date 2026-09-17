@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import type { Command } from "commander";
 import { resolveAcpxUiBaseUrl } from "../acp/auth-env.js";
+import type { ArchiveIndexEntry } from "../session/archive/archive-index.js";
 import {
   createHttpLivenessProbe,
   loadWakeupLiveness,
@@ -13,6 +14,7 @@ import {
   createContext,
   directoryExists,
   listArchived,
+  listArchivedOrphans,
   planArchiveRun,
   reindexArchive,
   repairArchive,
@@ -411,6 +413,16 @@ async function runListVerb(context: ArchiveContext, flags: SessionsArchiveFlags)
   if (!(await directoryExists(context.archiveDir))) {
     throw new ArchiveRefusal(`no archive directory at ${context.archiveDir}`, "no-archive");
   }
+  // ⚠️ THIS BRANCH IS THE WHOLE FLAG, AND ITS ABSENCE WAS A LIE RATHER THAN A GAP.
+  // `--list-orphans` was declared and routed here but never read, so it fell
+  // through to the shard-index list below — which by design contains every id
+  // EXCEPT an orphan. It exited 0 with well-formed output that named no orphan
+  // ever, while `--status` actively advertised it ("use --list-orphans for ids").
+  // Exit 0 + plausible + wrong is the worst ratio of confidence to correctness
+  // this tool can produce.
+  if (flags.listOrphans) {
+    return await runListOrphansVerb(context, flags);
+  }
   const { entries, shards, warnings } = await listArchived(context, {
     month: flags.month,
     limit: parseCount(flags.limit, "--limit"),
@@ -418,16 +430,53 @@ async function runListVerb(context: ArchiveContext, flags: SessionsArchiveFlags)
   if (flags.json) {
     writeJson({ shards, entries, warnings });
   } else {
-    for (const entry of entries) {
-      process.stdout.write(
-        `${entry.archivedAt}  ${entry.id}  ${entry.reason}  ${entry.closed === true ? "closed" : "open"}  ${entry.name ?? ""}\n`,
-      );
-    }
-    for (const warning of warnings) {
-      process.stderr.write(`[acpx] ⚠ ${warning}\n`);
-    }
+    writeArchivedListText(entries, warnings);
   }
   return warnings.length > 0 ? ARCHIVE_EXIT_PROBLEMS : ARCHIVE_EXIT_OK;
+}
+
+function writeArchivedListText(
+  entries: readonly ArchiveIndexEntry[],
+  warnings: readonly string[],
+): void {
+  for (const entry of entries) {
+    const state = entry.closed === true ? "closed" : "open";
+    process.stdout.write(
+      `${entry.archivedAt}  ${entry.id}  ${entry.reason}  ${state}  ${entry.name ?? ""}\n`,
+    );
+  }
+  for (const warning of warnings) {
+    process.stderr.write(`[acpx] ⚠ ${warning}\n`);
+  }
+}
+
+/**
+ * `--list-orphans` — the ids behind `--status`'s orphan count.
+ *
+ * Ids only: an orphan has no record, so there is no name, kind, cwd or closed
+ * state to show. The one action available on one is `acpx sessions restore <id>`,
+ * which takes exact ids — so the text form is one bare id per line and pipes
+ * straight into it.
+ */
+async function runListOrphansVerb(
+  context: ArchiveContext,
+  flags: SessionsArchiveFlags,
+): Promise<number> {
+  const { orphans, totalIds, files, bytes } = await listArchivedOrphans(context, {
+    limit: parseCount(flags.limit, "--limit"),
+  });
+  if (flags.json) {
+    writeJson({ ids: orphans.map((orphan) => orphan.id), totalIds, files, bytes });
+    return ARCHIVE_EXIT_OK;
+  }
+  for (const orphan of orphans) {
+    process.stdout.write(`${orphan.id}\n`);
+  }
+  // On stderr so stdout stays a clean id list for a pipe.
+  process.stderr.write(
+    `[acpx] ${orphans.length} of ${totalIds} orphan id(s); ${files} files / ${formatBytes(bytes)} total\n`,
+  );
+  return ARCHIVE_EXIT_OK;
 }
 
 async function runVerifyVerb(
