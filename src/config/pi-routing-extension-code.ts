@@ -23,6 +23,16 @@
 // pi built it", i.e. the spawn-time models.json compat still applies, which is
 // today's behaviour.
 //
+// ## Sticky session affinity — brick c2df657e
+//
+// The same handler also sets a top-level `session_id` body field on every
+// OpenRouter-model request, taken from `ACPX_SESSION_RECORD_ID` (seeded by
+// `buildAgentEnvironment`): OpenRouter's explicit sticky-routing key, which
+// pins provider prompt-cache routing from the FIRST successful request and
+// survives compaction/resume — where pi-ai's own affinity path would key on
+// pi's session uuid (unstable) or nothing at all. `sendSessionAffinityHeaders`
+// stays false everywhere: the header route keys on the wrong id.
+//
 // ## Semantics — a deliberate MIRROR of `resolveProviderObject`
 //
 // The extension runs inside the pi process; there is no channel back to acpx,
@@ -60,6 +70,22 @@ import fs from 'node:fs'
 // ui-settings.json before every provider request, so a policy saved while the
 // session is running takes effect. Fail-open: on any surprise the payload pi
 // built (spawn-time models.json compat) is left untouched.
+//
+// brick c2df657e — STICKY SESSION AFFINITY. OpenRouter's provider sticky
+// routing keeps consecutive requests on one provider endpoint to maximise
+// prompt-cache hits, but WITHOUT an explicit routing key it derives one by
+// hashing the first system + first non-system message and only engages after
+// a first cache hit — both defeated by agent sessions (compaction and
+// system-prompt regeneration change the hash; early turns go unpinned). So
+// every OpenRouter-model request here carries an EXPLICIT top-level
+// \`session_id\` body field (NOT inside provider — OpenRouter validates the
+// provider object strictly and a bad field there 400s every turn) set to
+// \`ACPX_SESSION_RECORD_ID\`: the acpx session RECORD id, handed in through
+// buildAgentEnvironment. The record id — not the per-spawn ACP session id and
+// not pi's own session uuid — is the key that survives a session resume, so
+// one conversation keeps one cache key. It is read per request so a
+// late-spawned child picks it up without a restart. Absent env ⇒ no opinion:
+// the payload is left untouched (fail-open, same contract as the policy).
 const SETTINGS_PATH = (() => {
   const explicit = (process.env.ACPX_UI_SETTINGS_FILE || '').trim()
   if (explicit) return explicit
@@ -267,17 +293,36 @@ export default function (pi) {
       if (!isRecord(payload) || typeof payload.model !== 'string') return undefined
       const model = ctx && ctx.model
       if (!model || model.provider !== 'openrouter') return undefined
+
+      // brick c2df657e — explicit sticky-routing key, INDEPENDENT of the policy
+      // below: affinity should hold whether or not any routing policy is in
+      // force, and also when the settings file is unreadable. Top-level body
+      // field, never inside provider. pi-ai's own header path
+      // (compat.sendSessionAffinityHeaders) is deliberately NOT used: it keys
+      // on pi's own session uuid, which changes on compaction/branching and
+      // per resume — the record id is the stable key.
+      const recordId = (process.env.ACPX_SESSION_RECORD_ID || '').trim().slice(0, 256)
+      let next = payload
+      if (recordId && payload.session_id !== recordId) {
+        next = Object.assign({}, payload, { session_id: recordId })
+      }
+
       const policy = readPolicy()
-      if (policy === undefined) return undefined // unreadable file: no opinion
+      if (policy === undefined) {
+        // Unreadable file: no opinion on ROUTING — but the sticky key, if it
+        // was added above, must still reach OpenRouter.
+        return next === payload ? undefined : next
+      }
       const resolved = resolveProviderObject(policy, payload.model)
       if (resolved) {
-        return Object.assign({}, payload, { provider: resolved })
+        return Object.assign({}, next, { provider: resolved })
       }
       // A valid policy that resolves to nothing for this model means no
       // routing is in force NOW — strip the spawn-time compat so a cleared
-      // policy does not keep riding on models.json.
-      if (payload.provider === undefined) return undefined
-      const stripped = Object.assign({}, payload)
+      // policy does not keep riding on models.json. (The sticky key, if
+      // added, is preserved either way.)
+      if (next.provider === undefined) return next === payload ? undefined : next
+      const stripped = Object.assign({}, next)
       delete stripped.provider
       return stripped
     } catch {

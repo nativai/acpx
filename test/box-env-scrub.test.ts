@@ -34,6 +34,30 @@ test("3b1ec678: the scrub removes every ACPX_PI_* override and leaves the rest a
   assert.deepEqual(Object.keys(env).toSorted(), ["ACPX_SESSION_URL", "HOME"]);
 });
 
+test("c2df657e: the scrub removes ACPX_SESSION_RECORD_ID (product-set session identity)", () => {
+  const env: NodeJS.ProcessEnv = {
+    ACPX_SESSION_RECORD_ID: "11111111-2222-3333-4444-555555555555",
+    ACPX_SESSION_URL: "https://acpx.devbox.nativai.de/?session=fixture",
+    HOME: "/home/node",
+  };
+
+  const removed = scrubBoxHarnessEnvOverrides(env);
+
+  assert.deepEqual(removed, ["ACPX_SESSION_RECORD_ID"]);
+  assert.deepEqual(Object.keys(env).toSorted(), ["ACPX_SESSION_URL", "HOME"]);
+});
+
+test("c2df657e: the suite starts with no ACPX_SESSION_RECORD_ID in process.env", () => {
+  // The sticky-routing extension reads this var per request; an inherited value
+  // would flip the "payload untouched" handler rows on a box where the suite runs
+  // inside an acpx agent that carries it.
+  assert.equal(
+    process.env.ACPX_SESSION_RECORD_ID,
+    undefined,
+    "the suite's bootstrap must scrub the product-set session-identity variable",
+  );
+});
+
 test("3b1ec678: the suite starts with no box-level ACPX_PI_* override in process.env", () => {
   const leaked = Object.keys(process.env)
     .filter((name) => name.startsWith(BOX_PI_ENV_PREFIX))

@@ -60,6 +60,62 @@ test("buildAgentSpawnOptions never injects ACPX_SESSION_ID (URL-only identity co
   }
 });
 
+// brick c2df657e — the sticky-routing key handoff. The seeded pi extension reads
+// ACPX_SESSION_RECORD_ID per request; the record id (not the per-spawn ACP
+// session id) is the only key that survives a session resume, so it is what the
+// env carries.
+test("adapter env carries the acpx RECORD id for the pi sticky-routing seam", () => {
+  const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+    acpxRecordId: "11111111-2222-3333-4444-555555555555",
+  });
+  assert.equal(options.env.ACPX_SESSION_RECORD_ID, "11111111-2222-3333-4444-555555555555");
+});
+
+test("adapter env: the sticky-routing key rides even where no base URL resolves", () => {
+  // The record id is handed over UNCONDITIONALLY (unlike ACPX_SESSION_URL, which
+  // is gated on a resolvable UI base URL): the id alone is enough to pin the
+  // provider cache, and a box where the resolver ladder misses everything must
+  // not silently lose cache affinity too. The ladder's lower rungs read
+  // /proc/1/environ, so whether the URL answers here is box-dependent — asserted
+  // hermetically as the pairing rule instead.
+  withAcpxUiBaseUrlEnv(undefined, () => {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "11111111-2222-3333-4444-555555555555",
+    });
+    assert.equal(options.env.ACPX_SESSION_RECORD_ID, "11111111-2222-3333-4444-555555555555");
+    const urlId = options.env.ACPX_SESSION_URL?.split("session=")[1];
+    if (urlId !== undefined) {
+      assert.equal(
+        urlId,
+        options.env.ACPX_SESSION_RECORD_ID,
+        "URL and sticky key must name the SAME record id when both are handed over",
+      );
+    }
+  });
+});
+
+test("adapter env: a STALE ACPX_SESSION_RECORD_ID never leaks into a spawn with no context", () => {
+  // The FW-07 hazard, brick-shaped: a long-lived queue-owner that served session A
+  // spawns for session B — a leftover record id would pin A's provider-cache key
+  // onto B's requests. Scrubbed before set, like every session-identity variable.
+  const previous = process.env.ACPX_SESSION_RECORD_ID;
+  process.env.ACPX_SESSION_RECORD_ID = "stale-record-id";
+  try {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, undefined);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(options.env, "ACPX_SESSION_RECORD_ID"),
+      false,
+      "no sessionContext ⇒ no key, not an inherited one",
+    );
+  } finally {
+    if (previous === undefined) {
+      delete process.env.ACPX_SESSION_RECORD_ID;
+    } else {
+      process.env.ACPX_SESSION_RECORD_ID = previous;
+    }
+  }
+});
+
 test("buildAgentSpawnOptions never injects ACPX_PARENT_SESSION_ID (URL-only identity contract)", () => {
   const previous = process.env.ACPX_PARENT_SESSION_ID;
   delete process.env.ACPX_PARENT_SESSION_ID;
