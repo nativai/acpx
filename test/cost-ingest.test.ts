@@ -438,6 +438,16 @@ test("19693941: the stamped keys satisfy the PERSISTED KEY POLICY", () => {
     clock,
   );
   assert.doesNotThrow(() => assertPersistedKeyPolicy({ acpx }));
+  // The billed path's key (brick ccef550f) rides the same object — checked
+  // through the real policy too, not by eye.
+  const billed = state();
+  rememberSessionCost(
+    billed,
+    { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, billedAmount: 0.01 },
+    () => PRICED,
+    clock,
+  );
+  assert.doesNotThrow(() => assertPersistedKeyPolicy({ acpx: billed }));
   // Control: the policy must actually be capable of rejecting, or the line above
   // proves nothing (a guard that cannot fail is not a guard).
   assert.throws(
@@ -464,4 +474,190 @@ test("19693941: stamping is ADDITIVE — a pre-change unit without the fields st
   assert.equal(units[1].ts, "2026-09-09T14:03:02.125Z");
   assert.equal(acpx.cost!.coverage!.total, 2, "both units still count toward coverage");
   assert.equal(acpx.cost!.provenance, "computed");
+});
+
+// ─── brick ccef550f: the billed path ────────────────────────────────────────
+//
+// The catalogue's single list row is ONE serving endpoint's price; OpenRouter
+// routes across providers at materially different tiers, so the computed figure
+// under-prices what was actually charged (measured 2026-09-17: $0.3365 computed
+// vs $0.904 billed on one session). When the adapter hands us its own non-zero
+// per-message figure beside real tokens, THAT is recorded verbatim with the
+// `cost_source: "adapter"` marker. The zero-figure guard — the 2026-09-08
+// zeroed-catalogue landmine — is KEPT, at the right granularity.
+
+test("ccef550f THE BILLED RULE: a NON-ZERO per-message figure beside tokens is recorded verbatim", () => {
+  const acpx = state();
+  // Deliberately WIDER than the catalogue: the whole point is that the adapter
+  // figure must win, not average in. priceUnit would say 0.95 for these tokens.
+  rememberSessionCost(
+    acpx,
+    { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, billedAmount: 2.5 },
+    () => PRICED,
+    clock,
+  );
+  const unit = unitsOf(acpx)[0];
+  assert.equal(unit.cost_usd, 2.5, "the catalogue figure must not replace the billed one");
+  assert.equal(unit.cost_source, "adapter", "a billed unit must carry the adapter marker");
+  assert.equal(acpx.cost!.amount, 2.5);
+  assert.equal(acpx.cost!.provenance, "reported");
+  assert.deepEqual(acpx.cost!.coverage, { unit: "message", priced: 1, total: 1 });
+  // The rates stay stamped: they are still the record of what the catalogue
+  // SAID, which is what makes the billed-vs-computed gap auditable later.
+  assert.deepEqual(unit.rates, PRICED);
+});
+
+test("ccef550f THE GUARD, KEPT: a ZERO billed figure beside NON-ZERO tokens falls back to the catalogue", () => {
+  // The 2026-09-08 shape, now arriving as billedAmount: a harness with a zeroed
+  // catalogue row reports 0 TRUTHFULLY beside real tokens. Zero goes to the
+  // catalogue path exactly as if no figure had arrived — this row is why the
+  // guard could be refined rather than deleted.
+  const acpx = state();
+  rememberSessionCost(
+    acpx,
+    { input: 7838, output: 68, cacheRead: 0, cacheWrite: 0, billedAmount: 0 },
+    () => PRICED,
+    clock,
+  );
+  const unit = unitsOf(acpx)[0];
+  assert.equal(unit.cost_usd, (7838 * 0.95 + 68 * 4) / 1_000_000, "priced from the catalogue");
+  assert.equal(unit.cost_source, undefined, "no adapter marker on a catalogue-priced unit");
+  assert.equal(acpx.cost!.provenance, "computed");
+
+  // Same on the unpriced arm: no row + zero figure stays honestly unpriced.
+  const absent = state();
+  rememberSessionCost(
+    absent,
+    { input: 7838, output: 68, cacheRead: 0, cacheWrite: 0, billedAmount: 0 },
+    () => null,
+    clock,
+  );
+  assert.equal(absent.cost!.provenance, "unpriced");
+  assert.equal(absent.cost!.amount, null);
+});
+
+test("ccef550f: a billed unit prices even with a COLD catalogue (rates null)", () => {
+  // A billed figure owes the catalogue nothing — the cold-cache flap that made
+  // ingest resolve rates eagerly (see this module's header) must not downgrade
+  // an as-billed number to `unpriced`.
+  const acpx = state();
+  rememberSessionCost(
+    acpx,
+    { input: 5000, output: 50, cacheRead: 0, cacheWrite: 0, billedAmount: 0.017 },
+    () => null,
+    clock,
+  );
+  const unit = unitsOf(acpx)[0];
+  assert.equal(unit.cost_usd, 0.017);
+  assert.equal(unit.rates, null);
+  assert.equal(acpx.cost!.provenance, "reported");
+  assert.deepEqual(acpx.cost!.coverage, { unit: "message", priced: 1, total: 1 });
+});
+
+test("ccef550f THE INVARIANT, billed arm: the adapter figures SUM to cost.amount", () => {
+  const acpx = state();
+  rememberSessionCost(
+    acpx,
+    { input: 1000, output: 10, cacheRead: 0, cacheWrite: 0, billedAmount: 0.01 },
+    () => PRICED,
+    clock,
+  );
+  rememberSessionCost(
+    acpx,
+    { input: 2000, output: 20, cacheRead: 0, cacheWrite: 0, billedAmount: 0.02 },
+    () => PRICED,
+    clock,
+  );
+  const units = unitsOf(acpx);
+  assert.equal(units.length, 2);
+  const summed = units.reduce((a, u) => a + (u.cost_usd ?? 0), 0);
+  assert.equal(summed, acpx.cost!.amount, "per-unit billed prices must reconcile with the figure");
+  assert.equal(summed, 0.03);
+  assert.equal(acpx.cost!.provenance, "reported");
+});
+
+test("ccef550f: MIXED billed + catalogue units read `computed`, never `reported`", () => {
+  // `reported` claims adapter trust for the whole figure; a session that mixed
+  // billed units with catalogue-estimated ones (model switch to a model whose
+  // adapter carries no per-message cost) must not borrow that trust.
+  const acpx = state();
+  rememberSessionCost(
+    acpx,
+    { input: 1000, output: 10, cacheRead: 0, cacheWrite: 0, billedAmount: 0.01 },
+    () => PRICED,
+    clock,
+  );
+  rememberSessionCost(
+    acpx,
+    { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0 },
+    () => PRICED,
+    clock,
+  );
+  assert.equal(acpx.cost!.amount, 0.01 + 0.95);
+  assert.equal(acpx.cost!.provenance, "computed");
+  assert.deepEqual(acpx.cost!.coverage, { unit: "message", priced: 2, total: 2 });
+});
+
+test("ccef550f: a billed figure with NO units contributes nothing (no-units is the claude shape)", () => {
+  // The no-units branch prices `reportedAmount` — the harness's SESSION total.
+  // A per-message figure has no meaning there (and pi, the only adapter that
+  // sends one, never reaches this branch: its updates always carry the counts).
+  const acpx = state();
+  rememberSessionCost(acpx, {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    billedAmount: 0.5,
+  });
+  assert.equal(acpx.cost, undefined, "nothing was written from an orphaned per-message figure");
+  assert.equal(acpx.cost_units, undefined);
+});
+
+test("ccef550f THE WIRE: the real envelope's message.costUsd lands as the billed unit through recordSessionUpdate", async () => {
+  // Same verbatim envelope shape as the 5026423b row above (real pi turn,
+  // session 01a081b5) — but now asserting the BILLED leg: `costUsd` rides
+  // `_meta.piAcp.message` beside the counts, and that is what must be stamped.
+  const { createSessionConversation, recordSessionUpdate } =
+    await import("../src/session/conversation-model.js");
+  const conversation = createSessionConversation();
+  const acpx = { current_model_id: "openrouter/moonshotai/kimi-k2.6" } as SessionAcpxState;
+
+  const notification = {
+    sessionId: "01a081b5-5254-7c68-855f-f12efa0d0bb3",
+    update: {
+      sessionUpdate: "usage_update",
+      used: 7927,
+      size: 262144,
+      cost: { amount: 0.00386535, currency: "USD" },
+      _meta: {
+        piAcp: {
+          message: {
+            input: 3161,
+            output: 26,
+            reasoning: 21,
+            cacheRead: 4740,
+            cacheWrite: 0,
+            totalTokens: 7927,
+            costUsd: 0.00386535,
+          },
+        },
+      },
+    },
+  } as unknown as Parameters<typeof recordSessionUpdate>[2];
+
+  const out = recordSessionUpdate(conversation, acpx, notification, "2026-09-17T00:00:00.000Z", {
+    promptEverSubmitted: true,
+  });
+
+  const unit = out.cost_units?.[0];
+  assert.ok(unit, "the envelope produced no unit");
+  assert.equal(unit.cost_source, "adapter", "the per-message figure was not taken as billed");
+  assert.equal(
+    unit.cost_usd,
+    0.00386535,
+    "the unit must carry the wire figure, not a catalogue price",
+  );
+  assert.equal(out.cost?.provenance, "reported");
+  assert.equal(out.cost?.amount, 0.00386535);
 });

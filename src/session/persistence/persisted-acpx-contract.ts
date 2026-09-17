@@ -105,6 +105,11 @@ export const PERSISTED_ACPX_SENTINEL = {
       ts: "2026-09-10T00:00:01.000Z",
       model: "sentinel-unit-model",
       cost_usd: 1.5,
+      // brick ccef550f — a NESTED key needs its sentinel value to be proven
+      // through the round trip (same lesson as `last_turn_provider.response_id`):
+      // the compiler half only forces TOP-LEVEL keys, so omitting it here would
+      // let a parse/clone leg silently stop carrying it with every row green.
+      cost_source: "adapter",
       provider_name: "SentinelProvider",
       native_finish_reason: "sentinel-native-finish",
       response_id: "sentinel-unit-response-id",

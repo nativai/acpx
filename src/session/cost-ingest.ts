@@ -55,8 +55,40 @@ export type UsageObservation = {
   reasoning?: number;
   cacheRead: number;
   cacheWrite: number;
-  /** The adapter's OWN figure for the session so far, when it reports one. */
+  /** The adapter's OWN figure for the session so far, when it reports one.
+   *
+   * ⚠️ A SESSION ACCUMULATOR, not a per-message figure — on pi this is
+   * `update.cost.amount` = the running billed total, so it must never be
+   * stamped onto a unit (units are per-message deltas; a cumulative total
+   * stamped per message SUMS to nonsense). It reaches `reported` only in the
+   * no-units branch below, which is the claude shape: a harness total with no
+   * token breakdown.
+   */
   reportedAmount?: number | null;
+  /**
+   * The adapter's AS-BILLED price for THIS message — the wire's per-message
+   * figure (`_meta.piAcp.message.costUsd` on pi, brick ccef550f).
+   *
+   * 🛑 THE BILLED RULE, at the granularity it was always meant to have:
+   *
+   *   - **A NON-ZERO figure beside units is recorded verbatim** as the unit's
+   *     `cost_usd`, marked `cost_source: "adapter"`. pi adopts OpenRouter's
+   *     in-band `usage.cost` (`costSource: "billed"`) — the serving endpoint's
+   *     real prices, which the catalogue's single list row routinely
+   *     understates 1.7–5x (measured 2026-09-17: billed $0.904 vs catalogue
+   *     $0.3365 on one session, because OpenRouter routed across $0.15/M and
+   *     $0.45/M tiers while the row quoted Relace's $0.09/M).
+   *   - **A ZERO figure beside NON-ZERO tokens is NEVER trusted.** It goes to
+   *     the catalogue path exactly as if no figure had arrived. Measured on pi
+   *     2026-09-08: a harness with a zeroed catalogue row computed
+   *     `cost.total = 0` beside 7,906 real tokens and reported it
+   *     TRUTHFULLY. The zero is the fingerprint of that failure; the old rule
+   *     ("never trust the wire") was one layer too strict — the correct
+   *     granularity is this zero-check, not a blanket refusal of every wire
+   *     figure.
+   *   - `null`/absent ⇒ no billed path; the unit is catalogue-priced as before.
+   */
+  billedAmount?: number | null;
   /**
    * Who SERVED this message, when the path can observe it (brick 4c272cab §8).
    * Absent ⇒ the unit records `null`, which means "not recorded" and must never
@@ -104,13 +136,21 @@ export function lookupUnitRates(
  *
  * ## 🛑 THE `reported` RULE — this function DEFINES it, it does not inherit it
  *
- * `deriveCostFigure` emits only `unpriced`, `free` and `computed`; `reported` had
- * no producer anywhere in the tree, so the ingest is where its contract is set:
+ * `deriveCostFigure` emits only `unpriced`, `free`, `computed` and — since
+ * brick ccef550f — `reported` for adapter-billed units; the ingest is where the
+ * contract is set:
  *
  *   - **A zero adapter figure beside NON-ZERO tokens is NEVER `reported`.** It
  *     goes to the unit path, which answers `computed` when a catalogue price
  *     exists and `unpriced` when none does.
  *   - `reported` requires a non-zero adapter figure, or a zero with zero tokens.
+ *   - **The per-message billed figure (`billedAmount`) is the SAME rule at the
+ *     granularity it was meant to have** (brick ccef550f): non-zero ⇒ the unit
+ *     records the adapter's own price, `cost_source: "adapter"`, and the
+ *     session figure reads `reported`; zero ⇒ the catalogue path, exactly as
+ *     above. The 2026-09-08 guard survives — it moved from "refuse every wire
+ *     figure" to "refuse the zero", which is the only shape the wire figure
+ *     ever lied in.
  *
  * **Why this is the load-bearing rule and not a nicety:** a harness handed a
  * fabricated catalogue entry with zeroed rates computes `cost.total = 0` and
@@ -118,6 +158,13 @@ export function lookupUnitRates(
  * 7,906 real tokens. If ingest trusted that as `reported`, Daniel's original bug
  * would return through the one provenance whose contract is "trust the adapter":
  * a confident `$0.00` on a session that was never priced.
+ *
+ * **And why the billed arm exists anyway:** the catalogue's list price is ONE
+ * endpoint's price. OpenRouter routes across providers at materially different
+ * tiers, so the catalogue-computed figure under-prices what was actually
+ * charged — measured 2026-09-17, $0.3365 computed vs $0.904 billed on one
+ * session. Refusing every wire figure over-corrects: it keeps a truthful,
+ * better-grounded number out of the store forever.
  */
 export function rememberSessionCost(
   acpx: SessionAcpxState,
@@ -178,22 +225,32 @@ function stampedUnit(
   // reasoning, totalTokens). Deriving it from the record's `last_used_at` instead
   // would stamp every unit of a turn with the same moving value.
   //
-  // 🛑 `cost_usd` IS THE COMPUTED FIGURE FROM `priceUnit`. IT IS **NOT** THE WIRE'S
-  // `costUsd`, AND THE TWO SHARE A NAME WHILE HAVING OPPOSITE PROVENANCE.
+  // 🛑 `cost_usd` IS THE CATALOGUE FIGURE FROM `priceUnit` — UNLESS the adapter
+  // handed us its own non-zero per-message figure, in which case THAT is
+  // recorded verbatim and marked `cost_source: "adapter"` (brick ccef550f).
+  // THE TWO SHARE A NAME WHILE HAVING OPPOSITE PROVENANCE.
   //
   // pi's per-message block carries its own `costUsd` — measured, it is right there
   // beside the counts (`cacheRead, cacheWrite, costUsd, input, output, reasoning,
-  // totalTokens`). Reading it instead of computing looks like an obvious
-  // simplification: same name, same units, one less call. **It is the defect this
-  // module's `reported` rule exists to refuse.** A harness whose catalogue row
-  // quotes zeroed rates computes zero and reports it TRUTHFULLY — measured on pi
-  // 2026-09-08: `cost.amount 0` beside 7,906 real tokens. Taking the wire value
-  // would put a confident `$0.00` on a session that was never priced, through the
-  // one field a reader is least likely to doubt.
+  // totalTokens`). Reading it instead of computing WAS the defect this module's
+  // `reported` rule existed to refuse: a harness whose catalogue row quotes zeroed
+  // rates computes zero and reports it TRUTHFULLY — measured on pi 2026-09-08:
+  // `cost.amount 0` beside 7,906 real tokens. Taking the wire value would put a
+  // confident `$0.00` on a session that was never priced, through the one field a
+  // reader is least likely to doubt.
   //
-  // ⇒ If you are here to "simplify this to the adapter's own number", that is the
-  // bug. `priceUnit` is the only source, and `cost-ingest.test.ts` pins that the
-  // non-null `cost_usd` values sum to `cost.amount` on the computed path.
+  // 🛑 **DO NOT NOW DELETE THE GUARD BECAUSE THE BILLED PATH EXISTS.** The 2026-09-08
+  // failure and the 2026-09-17 under-pricing are the SAME wire figure in two
+  // worlds: when it is zero beside real tokens it is a lie (zeroed catalogue),
+  // and when it is non-zero it is the best price we have (OpenRouter routes
+  // across endpoints the catalogue's single row cannot represent — $0.3365
+  // computed vs $0.904 billed on one session). The guard is therefore the ZERO
+  // check, not a blanket refusal: `billedAmount > 0` beside units takes the
+  // adapter's figure with the `cost_source: "adapter"` marker so every consumer
+  // can tell billed from computed; zero falls through to `priceUnit` exactly as
+  // before. `cost-ingest.test.ts` pins BOTH arms — the billed path AND the
+  // zero-figure fallback — and the computed-path sum invariant stays pinned for
+  // the fallback.
   const priceable: CostUnit = {
     input: observation.input,
     output: observation.output,
@@ -203,14 +260,37 @@ function stampedUnit(
     cache_write: observation.cacheWrite,
     rates: modelId ? lookupRates(modelId) : null,
   };
+  const billed = billedPrice(observation);
   return {
     ...priceable,
     reasoning: observation.reasoning,
     ts: now().toISOString(),
     model: modelId ?? null,
-    cost_usd: priceUnit(priceable),
+    cost_usd: billed ?? priceUnit(priceable),
+    ...(billed !== null ? { cost_source: "adapter" as const } : {}),
     ...attributionFields(observation.attribution),
   };
+}
+
+/**
+ * The adapter's as-billed per-message price, or `null` when it must NOT be
+ * trusted (brick ccef550f).
+ *
+ * 🛑 THE GUARD IS THE ZERO CHECK, NOT A BLANKET REFUSAL. The 2026-09-08
+ * failure and the 2026-09-17 under-pricing are the SAME wire figure in two
+ * worlds: when it is zero beside real tokens it is a lie (a zeroed catalogue
+ * row, reported truthfully — `cost.amount 0` beside 7,906 real tokens), and
+ * when it is non-zero it is the best price we have (OpenRouter routes across
+ * endpoints the catalogue's single row cannot represent — $0.3365 computed vs
+ * $0.904 billed on one session). So a POSITIVE finite figure is taken
+ * verbatim and marked `cost_source: "adapter"`; zero or anything malformed
+ * falls through to `priceUnit` exactly as before. `cost-ingest.test.ts` pins
+ * BOTH arms — the billed path AND the zero-figure fallback — and the
+ * computed-path sum invariant stays pinned for the fallback.
+ */
+function billedPrice(observation: UsageObservation): number | null {
+  const billed = observation.billedAmount;
+  return typeof billed === "number" && Number.isFinite(billed) && billed > 0 ? billed : null;
 }
 
 /**
