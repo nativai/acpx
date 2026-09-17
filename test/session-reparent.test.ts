@@ -775,22 +775,35 @@ test("F4: a torn child whose record names a THIRD session is REPORTED, never mov
 
 test("F4: set-parent writes the index entry IMMEDIATELY, not through the coalescing queue", async () => {
   await withTempHome(async (homeDir) => {
-    await seed(homeDir, "old-parent");
-    await seed(homeDir, "new-parent");
+    await seed(homeDir, "parent-b");
+    await seed(homeDir, "parent-c");
     await seed(homeDir, "child", { parentSessionId: "old-parent" });
 
+    // ⚠️ GETTING THIS FIXTURE WRONG MAKES THE TEST UNABLE TO FAIL, AND MY FIRST
+    // VERSION DID. The coalescing queue only throttles a file it has ALREADY
+    // written in this process and written RECENTLY: `updateSessionIndexForRecordWrite`
+    // takes the immediate branch when the file is membership-unknown OR when
+    // `elapsed >= SCALAR_FLUSH_INTERVAL_MS` (5 s), and a first touch is both. So a
+    // single set-parent flushes promptly whether or not the immediate flag exists —
+    // measured: removing the flag left that version 23/23 green.
+    //
+    // Hence TWO writes to the SAME file from the SAME module instance, back to back:
+    // the first primes `knownFiles` + `lastWrittenAt`, and only the second can be
+    // throttled. This is also the shape a long-lived in-process caller (acpx-ui) has
+    // and a fresh CLI process never does.
     const session = await loadSessionModule();
-    // In-process, so the coalescing queue's per-file state is LIVE — the case a CLI
-    // subprocess cannot exercise, because a fresh process always has
-    // elapsed=Infinity and takes the immediate branch by accident.
     await session.setSessionParent({
       target: { kind: "session", sessionId: "child" },
-      parent: { id: "new-parent" },
+      parent: { id: "parent-b" },
+    });
+    await session.setSessionParent({
+      target: { kind: "session", sessionId: "child" },
+      parent: { id: "parent-c" },
     });
 
-    // Read index.json straight off disk, WITHOUT going through any acpx API that
-    // would flush the queue for us — that flush is exactly what would hide a
-    // throttled write.
+    // Read index.json straight off disk — NOT through an acpx API, because every
+    // index read flushes the queue first (read-your-writes) and would hide exactly
+    // the throttling this asserts against.
     const raw = JSON.parse(
       await fs.readFile(path.join(homeDir, ".acpx", "sessions", "index.json"), "utf8"),
     ) as { entries?: Record<string, unknown>[] };
@@ -798,10 +811,11 @@ test("F4: set-parent writes the index entry IMMEDIATELY, not through the coalesc
     assert.ok(entry, "no index entry for child");
     assert.equal(
       entry?.parentSessionId,
-      "new-parent",
-      "the index write was throttled — the board follows the index, and a re-parent is human-frequency",
+      "parent-c",
+      "the second re-parent's index write was THROTTLED — the board follows the index, and a re-parent is human-frequency, freshness-sensitive work",
     );
-    assert.equal(typeof entry?.parentSetAt, "string");
+    // The record is not in question; only the index half is throttled.
+    assert.equal((await readRecordJson(homeDir, "child")).parent_session_id, "parent-c");
   });
 });
 
