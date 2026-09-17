@@ -18,8 +18,10 @@ export {
   findGitRepositoryRoot,
   findSession,
   findSessionByDirectoryWalk,
+  isArchivedRecord,
   isTemplateRecord,
   isoNow,
+  listSessionIndexEntries,
   listSessions,
   listSessionsForAgent,
   listSubagentsForSession,
@@ -39,6 +41,7 @@ export {
   writeSessionRecord,
   writeSessionRecordAtBoundary,
   writeSessionRecordAtBoundaryWithLifecycle,
+  writeSessionRecordAuthorizingParent,
   writeSessionRecordWithLifecycle,
   writeSessionRecordWithPersistedLifecycle,
 } from "./persistence/repository.js";

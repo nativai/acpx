@@ -178,6 +178,20 @@ async function loadSessionIndexEntries(): Promise<SessionIndexEntry[]> {
   return index.entries;
 }
 
+/**
+ * The index entries as they stand on disk — MEMBERSHIP AND ENTRY FIELDS, not the
+ * hydrated records `listSessions()` returns.
+ *
+ * Exported additively for `sessions set-parent`, whose `--children-of` selection has
+ * to compare the record's parent against the INDEX ENTRY's parent to notice a session
+ * torn across the two stores (brick c99f9994 F4). `listSessions()` cannot serve that:
+ * it is a hybrid — membership from the index, every FIELD from the record — so the
+ * entry's own `parentSessionId` is discarded before any caller sees it.
+ */
+export async function listSessionIndexEntries(): Promise<SessionIndexEntry[]> {
+  return await loadSessionIndexEntries();
+}
+
 function matchesSessionEntry(
   session: SessionIndexEntry,
   normalizedCwd: string,
@@ -216,6 +230,13 @@ export type PersistedSessionLifecycle = {
   /** acpx-ui-owned template marker — read-preserved like closed/favorite/name so a
    * stale agent-exit checkpoint flush can't clobber an externally-set template (FW-16). */
   template: SessionRecord["template"];
+  /** The parent linkage — read-preserved as a group so an externally-set parent
+   * (`sessions set-parent`, acpx-ui's PATCH) survives a live owner's next
+   * checkpoint. See `preserveParentLinkageForPersist`. (brick c99f9994) */
+  parentSessionId: string | undefined;
+  parentSessionUrl: string | undefined;
+  parentSetAt: string | undefined;
+  spawnedBySessionId: string | undefined;
   /** Last on-disk updated_at — lets the flush keep updated_at monotonic (no stale regress). */
   updatedAt: string | undefined;
   /** Current on-disk metadata; merged at write time so stale owner records do
@@ -249,6 +270,10 @@ export async function readPersistedLifecycle(
       favoritedAt: parsed.favoritedAt,
       name: parsed.name,
       template: parsed.template,
+      parentSessionId: parsed.parentSessionId,
+      parentSessionUrl: parsed.parentSessionUrl,
+      parentSetAt: parsed.parentSetAt,
+      spawnedBySessionId: parsed.spawnedBySessionId,
       updatedAt: parsed.updated_at,
       metadata: parsed.metadata,
       pid: parsed.pid,
@@ -318,6 +343,56 @@ export async function writeSessionRecordAtBoundaryWithLifecycle(
 }
 
 /**
+ * The field groups a write may declare itself AUTHORITATIVE for: every other
+ * preserved field still read-preserves from disk, these are taken from the
+ * in-memory record. Mirrors `closeSession`'s privilege, scoped to one group
+ * instead of all of them. (brick c99f9994)
+ */
+type WriteAuthoritativeFields = { parent?: true };
+
+/**
+ * The ONE authorised writer of the parent linkage — `sessions set-parent` and any
+ * future in-process caller that deliberately re-parents a session.
+ *
+ * ⚠️ WITHOUT THIS THE VERB IS A SILENT NO-OP, and that is not obvious from the
+ * call site. `writeSessionRecordInternal` re-reads `<id>.json` and
+ * `preserveParentLinkageForPersist` puts the OLD parent straight back, so a
+ * `set-parent` that mutates the record and calls plain `writeSessionRecord` writes
+ * the record it started from — exit 0, correct-looking output, nothing changed.
+ *
+ * The index half is written IMMEDIATELY rather than through the coalescing queue.
+ * That is not an optimisation: `immediate: !preserveLifecycle` classifies this as an
+ * ordinary throttled write, when a re-parent is squarely the human-frequency,
+ * freshness-sensitive class the close/favorite/name comment at the call site
+ * describes — and acceptance criterion 2 asks the board to follow within ~1 s. It is
+ * prompt today only BY ACCIDENT, because a fresh CLI process has no `lastWrittenAt`
+ * for the file (`elapsed = Infinity`) and takes the immediate branch anyway; any
+ * long-lived in-process caller would get the real throttle and a
+ * record/index split window the width of the flush interval (brick c99f9994 F4).
+ *
+ * ⚠️ Scoped to THIS write. Do not express it by flipping the general
+ * `!preserveLifecycle` rule, which would silently make every lifecycle-preserving
+ * write in the repo immediate.
+ *
+ * ⚠️ DO NOT "simplify" this to `writeSessionRecordWithLifecycle`. That bypass
+ * disables preservation for EVERY lifecycle field, so a concurrent rename, close or
+ * favourite-toggle landing in the read→write window is lost — a bigger hole than
+ * the one this closes. Nor pass a doctored snapshot through
+ * `writeSessionRecordWithPersistedLifecycle`: that works only by feeding the
+ * preserve mechanism a lie, and a later refactor pointing
+ * `applyPersistedLifecycleForWrite` at `freshPersisted` — which reads like a bug
+ * fix — would silently revert set-parent to a no-op.
+ */
+export async function writeSessionRecordAuthorizingParent(record: SessionRecord): Promise<void> {
+  await writeSessionRecordInternal(record, {
+    messagePersistence: "checkpoint",
+    preserveLifecycle: true,
+    authoritative: { parent: true },
+    immediateIndexUpdate: true,
+  });
+}
+
+/**
  * Preserving write variant for callers that already hold the persisted
  * lifecycle from a fresh `readPersistedLifecycle` read. Metadata is still
  * reread inside the write so external metadata patches survive stale owner
@@ -334,6 +409,65 @@ export async function writeSessionRecordWithPersistedLifecycle(
     preserveLifecycle: true,
     persisted: { value: persisted },
   });
+}
+
+/**
+ * Read-preserve the four parent-linkage fields — the group `sessions set-parent`
+ * and acpx-ui's `PATCH /api/sessions/:id/parent` own (brick c99f9994).
+ *
+ * Kept a NAMED function, like `preserveLastTurnProviderForPersist` below, so the
+ * write path reads as a list of the properties it protects and a refactor tidying
+ * the block above cannot quietly drop it.
+ *
+ * 🛑 CALLED OUTSIDE THE `preserveLifecycle` BRANCH, AND THAT PLACEMENT IS THE FIX —
+ * exactly as `preserveLastTurnProviderForPersist` documents one field over. It sat
+ * INSIDE that branch when this shipped, which looked right and left the real
+ * clobberer untouched: `session-control.ts`'s `closeSession` reads the record at
+ * entry, then runs the whole owner-termination sequence (drain → ask the owner to
+ * close → SIGTERM, grace, SIGKILL, grace → terminate the adapter) and only THEN
+ * writes that now-multi-second-stale record through
+ * `writeSessionRecordAtBoundaryWithLifecycle`, i.e. `preserveLifecycle: false`. A
+ * `set-parent` landing inside that window was completely undone — record, index
+ * entry and derived edge — while the CLI exited 0 reporting the child under
+ * `moved[]`. (Found by the test-engineer with a positive control, brick c99f9994
+ * F2; the window is ≥2 s and GROWS with how long the owner takes to die, i.e. it
+ * is widest exactly when a handover is most likely.)
+ *
+ * ⚠️ NOT the same function as `repository.ts`'s own `closeSession`, which reads and
+ * writes adjacently and never was stale. TWO SAME-NAMED FUNCTIONS — this file's is
+ * safe, `session-control.ts`'s is not, and reasoning about the wrong one is what
+ * let this ship.
+ *
+ * ⚠️ UNCONDITIONAL — disk wins, it does NOT merely fill an absence. The
+ * `last_turn_provider` style ("disk only fills an absence") is wrong here: the
+ * lost update being closed IS a stale in-memory record carrying the OLD parent,
+ * which a fill-an-absence preserve would let through unchanged.
+ *
+ * ⚠️ And that is safe only because NOTHING assigns a parent outside record
+ * CONSTRUCTION (`session-management.ts:254-263,629,909`,
+ * `command-handlers.ts:855-856,3047-3048`, `runtime.ts:2421`) — at which point no
+ * `<id>.json` exists yet, `readPersistedLifecycle` returns undefined, and this is a
+ * no-op. There is no legitimate daemon write for it to suppress. **Add a parent
+ * write anywhere else and this analysis expires — re-run that grep.**
+ *
+ * The one authorised writer bypasses it through `authoritative.parent`; see
+ * `writeSessionRecordAuthorizingParent`.
+ */
+function preserveParentLinkageForPersist(
+  record: SessionRecord,
+  persistedLifecycle: PersistedSessionLifecycle | undefined,
+  authoritative: WriteAuthoritativeFields | undefined,
+): void {
+  // The gates live INSIDE the named function, not at the call site, so the write
+  // path carries one unconditional call that a refactor cannot quietly re-gate on
+  // `preserveLifecycle` — which is precisely how F2 shipped.
+  if (!persistedLifecycle || authoritative?.parent === true) {
+    return;
+  }
+  record.parentSessionId = persistedLifecycle.parentSessionId;
+  record.parentSessionUrl = persistedLifecycle.parentSessionUrl;
+  record.parentSetAt = persistedLifecycle.parentSetAt;
+  record.spawnedBySessionId = persistedLifecycle.spawnedBySessionId;
 }
 
 function applyPersistedLifecycleForWrite(
@@ -383,6 +517,16 @@ function preserveLastTurnProviderForPersist(
   }
 }
 
+/** Membership-immediate / scalar-throttled (W2.3), plus the per-write opt-in a
+ *  re-parent needs — see `writeSessionRecordAuthorizingParent`. Named rather than
+ *  inlined so the opt-in cannot be mistaken for a tweak of the general rule. */
+function indexWriteIsImmediate(options: {
+  preserveLifecycle: boolean;
+  immediateIndexUpdate?: true;
+}): boolean {
+  return options.immediateIndexUpdate === true || !options.preserveLifecycle;
+}
+
 async function writeSessionRecordInternal(
   record: SessionRecord,
   options: {
@@ -391,6 +535,14 @@ async function writeSessionRecordInternal(
     /** Wrapper distinguishes "caller provided a read result (possibly
      * undefined)" from "not provided — read from disk here". */
     persisted?: { value: PersistedSessionLifecycle | undefined };
+    /** Field groups this write is AUTHORITATIVE for — preserved for every other
+     * field, taken from the in-memory record for these. See
+     * `writeSessionRecordAuthorizingParent`. */
+    authoritative?: WriteAuthoritativeFields;
+    /** Bypass the coalescing index queue for this write only. See
+     * `writeSessionRecordAuthorizingParent` for why a re-parent needs it and why
+     * it is NOT expressed by changing the general rule below. */
+    immediateIndexUpdate?: true;
   },
 ): Promise<void> {
   // ⚠️ THE ARCHIVED-RECORD WRITE GUARD, PLACED HERE **BY CONSTRUCTION**. All four
@@ -424,6 +576,20 @@ async function writeSessionRecordInternal(
     if (options.preserveLifecycle) {
       applyPersistedLifecycleForWrite(record, persistedLifecycle);
     }
+    // 🛑 THE PARENT LINKAGE, PRESERVED UNCONDITIONALLY — OUTSIDE the branch above,
+    // and that placement IS the fix (see `preserveParentLinkageForPersist`). The
+    // write that clobbers a re-parent is the PRIVILEGED one — `session-control.ts`'s
+    // `closeSession`, which bypasses that branch by design and writes a record it
+    // read seconds earlier, before the owner-termination wait. `freshPersisted`, not
+    // the caller's snapshot: disk is the authority for who the parent is, and a
+    // caller-supplied lifecycle can predate the re-parent by a whole turn.
+    //
+    // ⚠️ The ONE writer that must beat this is `set-parent` itself, and it does so
+    // by NAME through `authoritative.parent` — not by being privileged. Remove that
+    // gate and the verb becomes a silent no-op (§1.2 leg b); remove this call and a
+    // close in flight silently undoes a re-parent (F2). One test pins BOTH
+    // directions together, because fixing either one alone still looks green.
+    preserveParentLinkageForPersist(record, freshPersisted, options.authoritative);
     mergeRecordMetadataForPersist(record, persistedMetadata);
     // Same baseline-diff protection metadata gets (2c848d3), extended to the
     // pinned model: a stale/dropped write can't regress a record-pinned model,
@@ -493,7 +659,7 @@ async function writeSessionRecordInternal(
       // privileged lifecycle path (close/favorite/name) always writes
       // immediately — human-frequency and freshness-sensitive.
       await updateSessionIndexForRecordWrite(sessionDir, toSessionIndexEntry(record, fileName), {
-        immediate: !options.preserveLifecycle,
+        immediate: indexWriteIsImmediate(options),
       });
       rememberSessionMetadataBaseline(record);
       rememberSessionModelBaseline(record);
