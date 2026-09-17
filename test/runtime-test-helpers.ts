@@ -72,6 +72,21 @@ export function makeSessionRecord(
     cumulative_token_usage: overrides.cumulative_token_usage ?? {},
     request_token_usage: overrides.request_token_usage ?? {},
     acpx: overrides.acpx ?? (defaultAcpx ? {} : undefined),
+    // ⚠️ THIS PROJECTION IS AN ALLOWLIST, AND AN OVERRIDE MISSING FROM IT IS
+    // SILENTLY DROPPED — the fixture compiles, the test runs, and the field the
+    // test is ABOUT is simply not there. The lineage block below was added
+    // (brick c99f9994) after a set of re-parent tests seeded `parentSessionId`
+    // and every one of them measured a parentless record instead. Adding a field
+    // to `SessionRecord`? Add it HERE too, or no test can ever seed it.
+    kind: overrides.kind,
+    parentSessionId: overrides.parentSessionId,
+    parentSessionUrl: overrides.parentSessionUrl,
+    parentSetAt: overrides.parentSetAt,
+    spawnedBySessionId: overrides.spawnedBySessionId,
+    forkedFromSessionId: overrides.forkedFromSessionId,
+    forkedAtMessageIndex: overrides.forkedAtMessageIndex,
+    forkedAtMessageIndexRequested: overrides.forkedAtMessageIndexRequested,
+    metadata: overrides.metadata,
     importedFrom: overrides.importedFrom,
     template: overrides.template,
   };
