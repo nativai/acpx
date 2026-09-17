@@ -1106,7 +1106,15 @@ function childrenByParentSessionId(records: SessionRecord[]): Map<string, Sessio
   return childrenByParent;
 }
 
-function descendantRecords(rootSessionId: string, records: SessionRecord[]): SessionRecord[] {
+/**
+ * Transitive local descendants of `rootSessionId` in the `parentSessionId` graph,
+ * newest-first. The `seen` set IS the cycle guard, which is why
+ * `sessions set-parent` reuses this as its cycle check rather than walking again.
+ */
+export function descendantRecords(
+  rootSessionId: string,
+  records: SessionRecord[],
+): SessionRecord[] {
   const childrenByParent = childrenByParentSessionId(records);
   const descendants: SessionRecord[] = [];
   const queue = [...(childrenByParent.get(rootSessionId) ?? [])];

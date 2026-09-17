@@ -25,6 +25,7 @@ import {
   handleSessionsReopen,
   handleSessionsRepairAccountSeam,
   handleSessionsSetMetadata,
+  handleSessionsSetParent,
   handleSessionsSweepConfigDirs,
   handleSessionsShow,
   handleSessionsTemplate,
@@ -35,6 +36,7 @@ import {
   handleSetConfigOption,
   handleSetMode,
   parseHistoryLimit,
+  type SessionsSetParentFlags,
 } from "./command-handlers.js";
 import { registerConfigCommand } from "./config-command.js";
 import type { ResolvedAcpxConfig } from "./config.js";
@@ -49,6 +51,7 @@ import {
   parseMessageId,
   parseMetadataEntry,
   parseNonEmptyValue,
+  parseOutputFormat,
   parsePruneBeforeDate,
   parseSessionName,
   type PromptFlags,
@@ -578,6 +581,65 @@ export function registerSessionsCommand(
   ) {
     await handleSessionsSetMetadata(explicitAgentName, key, value, flags, this, config);
   });
+
+  sessionsCommand
+    .command("set-parent")
+    .description(
+      "Change which session is recorded as a session's parent — one session via --session-id, or EVERY open direct child of a session via --children-of (the agent-handover form). Moves the session graph only.",
+    )
+    // ⚠️ NONE of the four id/url options gets `parseNonEmptyValue`, and that is
+    // deliberate: an EMPTY value must reach the handler so it can refuse BY NAME
+    // (`PARENT_DETACH_UNSUPPORTED` for `--parent-id ''`) instead of dying in the
+    // option parser with a generic "must not be empty" that says nothing about why
+    // detaching is unsupported.
+    .option(
+      "--session-id <id>",
+      "Re-parent this ONE session (acpx record id, ACP session id, or unique suffix)",
+    )
+    .option(
+      "--children-of <id>",
+      "Re-parent every OPEN DIRECT child of this session. Must resolve locally — a typo refuses rather than matching zero children. Closed children and Task-tool subagents are not moved.",
+    )
+    .option("--parent-id <uuid>", "The new parent, by local acpx record id")
+    .option(
+      "--parent-session-url <url>",
+      "The new parent, by full acpx-ui URL — the form that also accepts a parent on ANOTHER box",
+    )
+    .option("--dry-run", "Preview the move and write nothing")
+    .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
+    .addHelpText(
+      "after",
+      `
+THIS MOVES THE SESSION GRAPH. IT DOES NOT REDIRECT A RUNNING CHILD'S REPORTS.
+  The board and \`session-tree.sh --descendants\` follow immediately. A running
+  child's $ACPX_PARENT_SESSION_URL is composed at PROCESS SPAWN TIME and stays
+  frozen in its process env until its queue owner respawns — as does the OS primer
+  text it was started with. Message each child as well: see the \`agent-handover\`
+  skill, section 4.
+
+AN EXPLICITLY SET PARENT OVERRIDES A FORK EDGE.
+  A forked session re-parented with this verb renders under its NEW parent, not its
+  fork source. Its \`forked_from_session_id\` is left intact, so the fork provenance
+  badge still renders. \`--dry-run\` marks such a child \`[fork edge -> spawn]\`.
+
+WARNING: GIVING A PARENT TO A SESSION THAT HAD NONE STRIPS ITS USER-FACING FACET.
+  The \`user-facing-via-acpx-ui\` facet is gated \`unless_env="ACPX_PARENT_SESSION_URL"\`,
+  so a previously top-level session that acquires a parent loses its ability to hand
+  work to Daniel when its owner next respawns. Reported in \`warnings\` at runtime too.
+
+OTHER THINGS WORTH KNOWING.
+  - Clearing a parent is not supported and refuses by name (PARENT_DETACH_UNSUPPORTED).
+  - A cross-box parent (given by --parent-session-url and absent locally) is NOT
+    cycle-checked: the remote graph is unwalkable from here.
+  - --children-of is N separate writes, not a transaction. A crash midway leaves some
+    moved; the operation is idempotent, so re-running finishes it.
+  - --children-of matching zero children is a SUCCESS (exit 0, moved: []). A handover
+    from an agent with no live children is a normal outcome.
+`,
+    )
+    .action(async function (this: Command, flags: SessionsSetParentFlags) {
+      await handleSessionsSetParent(flags, this, config);
+    });
 
   const historyCommand = sessionsCommand
     .command("history")

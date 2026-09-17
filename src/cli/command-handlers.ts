@@ -160,6 +160,11 @@ import {
   withInheritedTaskFolder,
 } from "./session/inherited-metadata.js";
 import { mergeSessionMetadata, validateSessionMetadataValue } from "./session/session-metadata.js";
+import type {
+  SetParentRefusalCode,
+  SetParentResult,
+  SetParentTarget,
+} from "./session/session-reparent.js";
 
 class NoSessionError extends Error {
   constructor(message: string) {
@@ -646,8 +651,18 @@ type ParentSessionRef = { id: string; url?: string; fromUrlFlag: boolean };
 // resolver accepts either (used by plain `new` and by the copy/template path).
 type ParentFlagSource = { parentSessionUrl?: string; parentId?: string };
 
+/**
+ * ⚠️ `allowEnvFallback: false` IS A SAFETY GATE, NOT A TIDINESS OPTION. The env
+ * fallback below is right for a SPAWN (a child inherits its spawner) and wrong for
+ * `sessions set-parent`, where it would mean an agent running the verb with a
+ * typo'd flag SILENTLY ADOPTS THE CHILD ITSELF. Measured on the rig for this brick:
+ * `sessions new`/`copy` already do exactly this and it produced real orphan parent
+ * edges nobody noticed, because nothing in the output says so. `set-parent` with no
+ * parent flag is a usage error, never an env-derived default.
+ */
 function resolveParentSessionRefFromFlagOrEnv(
   flags: ParentFlagSource,
+  options: { allowEnvFallback?: boolean } = {},
 ): ParentSessionRef | undefined {
   // --parent-session-url <url> wins over --parent-id <uuid>; both override env.
   const flagUrl = flags.parentSessionUrl?.trim();
@@ -661,15 +676,16 @@ function resolveParentSessionRefFromFlagOrEnv(
   if (flagValue) {
     return { id: flagValue, fromUrlFlag: false };
   }
-  // Env fallback: ACPX_SESSION_URL is the spawning agent's OWN url (its real host).
-  // Preserve the full url so an agent on box A spawning a child on box B records A's
-  // host as the parent identity, not B's local base url.
+  return options.allowEnvFallback === false ? undefined : parentSessionRefFromEnv();
+}
+
+// Env fallback: ACPX_SESSION_URL is the spawning agent's OWN url (its real host).
+// Preserve the full url so an agent on box A spawning a child on box B records A's
+// host as the parent identity, not B's local base url.
+function parentSessionRefFromEnv(): ParentSessionRef | undefined {
   const envUrl = process.env.ACPX_SESSION_URL?.trim();
   const envFromUrl = parseSessionIdFromUrl(envUrl);
-  if (envFromUrl) {
-    return { id: envFromUrl, url: envUrl, fromUrlFlag: false };
-  }
-  return undefined;
+  return envFromUrl ? { id: envFromUrl, url: envUrl, fromUrlFlag: false } : undefined;
 }
 
 type ResolvedParentSession = {
@@ -4366,6 +4382,205 @@ export async function handleSessionsOwnerStatus(
 
   const status = await readSessionOwnerStatus(sessionId);
   process.stdout.write(`${JSON.stringify(status)}\n`);
+}
+
+export type SessionsSetParentFlags = {
+  sessionId?: string;
+  childrenOf?: string;
+  parentSessionUrl?: string;
+  parentId?: string;
+  dryRun?: boolean;
+};
+
+const SET_PARENT_EXIT_CODES: Record<SetParentRefusalCode | "USAGE", number> = {
+  USAGE: EXIT_CODES.USAGE,
+  SESSION_NOT_FOUND: EXIT_CODES.NO_SESSION,
+  PARENT_NOT_FOUND: EXIT_CODES.USAGE,
+  PARENT_SELF: EXIT_CODES.USAGE,
+  PARENT_CYCLE: EXIT_CODES.USAGE,
+  SUBAGENT_PARENT_IMMUTABLE: EXIT_CODES.USAGE,
+  PARENT_DETACH_UNSUPPORTED: EXIT_CODES.USAGE,
+  // An archived record is not a usage mistake — it is a real record in a state
+  // that must not be resurrected hot. ERROR, matching the write guard it comes from.
+  SESSION_ARCHIVED: EXIT_CODES.ERROR,
+};
+
+function emitSetParentRefusal(
+  code: SetParentRefusalCode | "USAGE",
+  message: string,
+  format: OutputFormat,
+): void {
+  if (!emitJsonResult(format, { ok: false, code, error: message })) {
+    if (format !== "quiet") {
+      process.stderr.write(`set-parent: ${code}: ${message}\n`);
+    }
+  }
+  process.exitCode = SET_PARENT_EXIT_CODES[code];
+}
+
+function shortSessionId(sessionId: string): string {
+  return sessionId.slice(0, 8);
+}
+
+function describeSetParentSession(name: string | undefined, sessionId: string): string {
+  return name ? `${name} (${shortSessionId(sessionId)})` : shortSessionId(sessionId);
+}
+
+function setParentMovedLine(entry: SetParentResult["moved"][number]): string {
+  const was = entry.previousParentSessionId
+    ? `   was: ${describeSetParentSession(entry.previousParentName, entry.previousParentSessionId)}`
+    : "   was: (root)";
+  // The `[fork edge → spawn]` annotation IS decision 1 rendered. It is the one
+  // behaviour a user can be surprised by — an explicitly set parent overriding a
+  // derived fork edge — so the run SHOWS it happening rather than leaving it to
+  // `--help`, which nobody reads at the moment they do the thing.
+  const forkNote = entry.wasForkEdge ? "   [fork edge → spawn]" : "";
+  return `  ${describeSetParentSession(entry.name, entry.acpxRecordId)}${was}${forkNote}`;
+}
+
+function printSetParentResult(result: SetParentResult, format: OutputFormat): void {
+  if (emitJsonResult(format, result)) {
+    return;
+  }
+  if (format === "quiet") {
+    return;
+  }
+  const destination = describeSetParentSession(result.parent.name, result.parent.acpxRecordId);
+  if (result.dryRun) {
+    process.stdout.write("DRY RUN — no changes written.\n");
+  }
+  const verb = result.dryRun ? "Would re-parent" : "Re-parented";
+  process.stdout.write(`${verb} ${result.moved.length} session(s) onto  ${destination}\n`);
+  for (const entry of result.moved) {
+    process.stdout.write(`${setParentMovedLine(entry)}\n`);
+  }
+  printSetParentSkippedAndWarnings(result);
+}
+
+function printSetParentSkippedAndWarnings(result: SetParentResult): void {
+  if (result.skipped.length > 0) {
+    process.stdout.write(`Skipped ${result.skipped.length}:\n`);
+    for (const entry of result.skipped) {
+      process.stdout.write(
+        `  ${describeSetParentSession(entry.name, entry.acpxRecordId)}   ${entry.reason}\n`,
+      );
+    }
+  }
+  for (const warning of result.warnings) {
+    process.stderr.write(`Warning: ${warning}\n`);
+  }
+}
+
+/**
+ * Detach detection, and it runs BEFORE the "exactly one" check on purpose:
+ * `--parent-id ''` must refuse BY NAME (`PARENT_DETACH_UNSUPPORTED`) rather than
+ * arrive as "neither flag given" (USAGE) or, worse, silently no-op. Clearing a
+ * parent would require DELETING a relations row, and that table's contract is
+ * "edges are lineage history" with deletion deliberately absent — a relations-model
+ * decision, not a re-parent feature (DECISION 5).
+ */
+function setParentDetachAttempted(flags: SessionsSetParentFlags): boolean {
+  return (
+    (flags.parentId !== undefined && flags.parentId.trim() === "") ||
+    (flags.parentSessionUrl !== undefined && flags.parentSessionUrl.trim() === "")
+  );
+}
+
+function resolveSetParentTarget(flags: SessionsSetParentFlags): SetParentTarget | string {
+  const hasSessionId = (flags.sessionId ?? "").trim() !== "";
+  const hasChildrenOf = (flags.childrenOf ?? "").trim() !== "";
+  if (hasSessionId && hasChildrenOf) {
+    return "--session-id and --children-of are mutually exclusive";
+  }
+  if (hasSessionId) {
+    return { kind: "session", sessionId: (flags.sessionId as string).trim() };
+  }
+  if (hasChildrenOf) {
+    return { kind: "children-of", parentSessionId: (flags.childrenOf as string).trim() };
+  }
+  return "set-parent requires exactly one of --session-id <id> or --children-of <id>";
+}
+
+/**
+ * `acpx sessions set-parent` — change which session is recorded as the parent, for
+ * one session or for every open direct child of a session (the handover form).
+ *
+ * ⚠️ BOTH parent flags given is a USAGE ERROR here, deliberately UNLIKE the spawn
+ * path, where `--parent-session-url` quietly wins. There that precedence exists to
+ * resolve an env/flag mix; here both are explicit and disagreeing about who the new
+ * parent is can only be a mistake.
+ */
+export async function handleSessionsSetParent(
+  flags: SessionsSetParentFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const { setSessionParent, SetParentRefusalError } = await loadSessionModule();
+
+  const inputs = resolveSetParentInputs(flags);
+  if ("code" in inputs) {
+    emitSetParentRefusal(inputs.code, inputs.message, globalFlags.format);
+    return;
+  }
+
+  try {
+    const result = await setSessionParent({
+      target: inputs.target,
+      parent: inputs.parent,
+      dryRun: flags.dryRun === true,
+    });
+    printSetParentResult(result, globalFlags.format);
+  } catch (error) {
+    if (error instanceof SetParentRefusalError) {
+      emitSetParentRefusal(error.code, error.message, globalFlags.format);
+      return;
+    }
+    throw error;
+  }
+}
+
+/** Every flag-level refusal, decided before the session store is touched. */
+function resolveSetParentInputs(
+  flags: SessionsSetParentFlags,
+):
+  | { target: SetParentTarget; parent: { id: string; url?: string } }
+  | { code: SetParentRefusalCode | "USAGE"; message: string } {
+  if (setParentDetachAttempted(flags)) {
+    return {
+      code: "PARENT_DETACH_UNSUPPORTED",
+      message:
+        "clearing a parent is not supported; pass a real --parent-id or --parent-session-url",
+    };
+  }
+  const target = resolveSetParentTarget(flags);
+  if (typeof target === "string") {
+    return { code: "USAGE", message: target };
+  }
+  const parent = resolveSetParentNewParent(flags);
+  return typeof parent === "string" ? { code: "USAGE", message: parent } : { target, parent };
+}
+
+/**
+ * The new parent, from flags ONLY.
+ *
+ * ⚠️ BOTH flags given is a usage error here, deliberately UNLIKE the spawn path
+ * where `--parent-session-url` quietly wins. There that precedence resolves an
+ * env/flag mix; here both are explicit and disagreeing can only be a mistake.
+ */
+function resolveSetParentNewParent(
+  flags: SessionsSetParentFlags,
+): { id: string; url?: string } | string {
+  if (flags.parentId?.trim() && flags.parentSessionUrl?.trim()) {
+    return "--parent-id and --parent-session-url are mutually exclusive";
+  }
+  // NO ENV FALLBACK — see resolveParentSessionRefFromFlagOrEnv. A missing parent
+  // flag is a usage error, never "adopt the caller".
+  const parentRef = resolveParentSessionRefFromFlagOrEnv(flags, { allowEnvFallback: false });
+  if (!parentRef) {
+    return "set-parent requires exactly one of --parent-id <uuid> or --parent-session-url <url>";
+  }
+  return { id: parentRef.id, ...(parentRef.url ? { url: parentRef.url } : {}) };
 }
 
 export { parseHistoryLimit, NoSessionError, loadSessionModule };

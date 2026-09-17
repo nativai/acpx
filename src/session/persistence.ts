@@ -18,6 +18,7 @@ export {
   findGitRepositoryRoot,
   findSession,
   findSessionByDirectoryWalk,
+  isArchivedRecord,
   isTemplateRecord,
   isoNow,
   listSessions,
