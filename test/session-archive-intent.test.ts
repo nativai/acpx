@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { Command } from "commander";
 import {
   addArchiveRunIntentOptions,
+  handleSessionsArchive,
   resolveRunIntent,
   type RunIntent,
   type SessionsArchiveFlags,
@@ -134,4 +138,69 @@ test("a command without the option declared does not crash the resolver", () => 
   const bare = new Command();
   assert.equal(resolveRunIntent({}, bare), "unstated");
   assert.equal(resolveRunIntent({ apply: true }, bare), "apply");
+});
+
+test("🛑 the VERB enforces the intent gate — refuses a bare vector with exit 2", async () => {
+  // ⚠️ THE RESOLVER TESTS ABOVE DO NOT COVER THIS, AND A MUTATION PROBE IS WHAT
+  // PROVED IT: deleting the `intent === "unstated"` branch from `runArchiveVerb`
+  // reddened ZERO tests, because every test above exercises `resolveRunIntent` —
+  // one layer BELOW where the refusal actually lives. That is the same shape as
+  // the P0 this file closes, and as the `--list-orphans` defect before it: a test
+  // beside the seam is green in exactly the case that matters. Asking "would this
+  // have caught the bug I am fixing?" is what surfaced it, not the test passing.
+  const previousHome = process.env.ACPX_STATE_HOME;
+  const previousExit = process.exitCode;
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-archive-intent-"));
+  await fs.mkdir(path.join(dir, ".acpx", "sessions"), { recursive: true });
+  await fs.mkdir(path.join(dir, ".acpx", "sessions-archive"), { recursive: true });
+  process.env.ACPX_STATE_HOME = dir;
+
+  const originalErr = process.stderr.write.bind(process.stderr);
+  const originalOut = process.stdout.write.bind(process.stdout);
+
+  const run = async (argv: readonly string[]): Promise<{ exit: number; err: string }> => {
+    const command = new Command();
+    command.exitOverride();
+    addArchiveRunIntentOptions(command);
+    command.parse([...argv], { from: "user" });
+    let err = "";
+    process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+      err += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+      return true;
+    }) as typeof process.stderr.write;
+    process.stdout.write = (() => true) as typeof process.stdout.write;
+    process.exitCode = 0;
+    try {
+      await handleSessionsArchive(command.opts<SessionsArchiveFlags>(), command);
+    } finally {
+      process.stderr.write = originalErr;
+      process.stdout.write = originalOut;
+    }
+    return { exit: Number(process.exitCode ?? 0), err };
+  };
+
+  try {
+    const bare = await run([]);
+    assert.equal(bare.exit, 2, "a bare run must REFUSE, not quietly dry-run");
+    // The refusal is a primary UX surface: it must name BOTH flags, copy-pasteably.
+    assert.match(bare.err, /--dry-run/);
+    assert.match(bare.err, /--apply/);
+
+    const contradictory = await run(["--apply", "--dry-run"]);
+    assert.equal(contradictory.exit, 2);
+
+    // …and a stated intent must still be honoured, or the gate is just a wall.
+    assert.equal((await run(["--dry-run"])).exit, 0);
+    assert.equal((await run(["--apply"])).exit, 0);
+  } finally {
+    process.stderr.write = originalErr;
+    process.stdout.write = originalOut;
+    process.exitCode = previousExit;
+    if (previousHome == null) {
+      delete process.env.ACPX_STATE_HOME;
+    } else {
+      process.env.ACPX_STATE_HOME = previousHome;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
