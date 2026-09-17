@@ -219,9 +219,92 @@ test("R7 an at-floor serve after a mismatch clears the breadcrumb", async () => 
   });
 });
 
+// ─── R8/R9 — the `"default"` alias pin (brick 8a54201e's fix left this open;
+// brick ac931199 closes it) ───────────────────────────────────────────────────
+//
+// `session_options.model === "default"` is not an invented fixture value — it
+// is exactly what the acpx-ui model picker's "Default (Opus 5, 1M context)" row
+// writes, and it is the LITERAL string `modelFamily`/`servedModelMatchesFloor`
+// used to compare against the served id before this fix — "default" contains
+// none of fable/opus/sonnet/haiku, so it always read as a concrete pin the
+// served id could never match. Measured live on this box 2026-09-17: 64 of 70
+// sessions pinned literally to `"default"` already carried a stale
+// `served_below_floor` breadcrumb from this. Both records below are real, read
+// verbatim off `~/.acpx/sessions/` (not hand-built):
+//   02d69833-fce5-4a19-983a-0152aa53ec97 — default pin, non-hard, served
+//     claude-opus-5 (`acpx.session_options`/`acpx.served` copied below).
+//   82dd5bdb-affc-4a72-8cbe-07266278855c — default pin, `floor_hard: true`,
+//     served claude-opus-5, and the record on disk carries BOTH
+//     `served_below_floor` AND `floor_parked` (reason "model-floor-unmet") —
+//     a REAL turn this bug refused under --floor-hard, not a hypothetical.
+
+test('R8 alias pin "default" satisfied by its resolved target (record 02d69833, non-hard)', async () => {
+  await withTempHome("acpx-floor-servedid-", async () => {
+    const record = recordPinned("default", { effort: "default" });
+    const verdict = await enforceModelFloorPostServe(record, {
+      servedModel: "claude-opus-5",
+      // "default" pin, so `deriveServedEffort` also authors the pin's effort
+      // down; only the MODEL axis is under test here.
+    });
+    assert.equal(verdict.accept, true);
+    assert.equal(
+      record.acpx?.served_below_floor,
+      undefined,
+      '"default" pinned + opus served must NOT stamp a false-alarm breadcrumb',
+    );
+  });
+});
+
+test('R9 alias pin "default" under --floor-hard does NOT refuse a turn served the resolved target (record 82dd5bdb)', async () => {
+  await withTempHome("acpx-floor-servedid-", async () => {
+    // Same shape as the real 82dd5bdb record: default + floor_hard + max effort.
+    const record = recordPinned("default", { floorHard: true, effort: "max" });
+    const verdict = await enforceModelFloorPostServe(record, { servedModel: "claude-opus-5" });
+    assert.equal(
+      verdict.accept,
+      true,
+      'a floor-hard session pinned "default" and served the alias\'s own resolved target must complete the turn, not throw ModelFloorUnmetError',
+    );
+    assert.equal(
+      record.acpx?.floor_parked,
+      undefined,
+      "must not stamp floor_parked — that is model-floor-enforce's own hard-mode quarantine breadcrumb, and this turn was never below floor",
+    );
+    assert.equal(record.acpx?.served_below_floor, undefined);
+  });
+});
+
+test('R10 do-not-regress: alias-to-concrete pin "sonnet" still resolves without going through the alias table (records 6c3d6a29, 3b98a12c)', async () => {
+  await withTempHome("acpx-floor-servedid-", async () => {
+    const record = recordPinned("sonnet", { effort: "high" });
+    const verdict = await enforceModelFloorPostServe(record, { servedModel: "claude-sonnet-5" });
+    assert.equal(verdict.accept, true);
+    assert.equal(record.acpx?.served_below_floor, undefined);
+  });
+});
+
+test("R11 do-not-regress: a genuinely UNSET pin is still skipped, never asserted (record 01a14b21)", async () => {
+  await withTempHome("acpx-floor-servedid-", async () => {
+    const record = makeSessionRecord({
+      acpxRecordId: "rec-unset",
+      acpSessionId: "sid-unset",
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+      cwd: "/workspace/projects/temp/te-unset",
+      acpx: { session_options: {} },
+    });
+    const verdict = await enforceModelFloorPostServe(record, { servedModel: "claude-opus-5" });
+    assert.equal(verdict.accept, true);
+    assert.equal(record.acpx?.served_below_floor, undefined);
+  });
+});
+
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
-function recordPinned(model: string, opts?: { floorHard?: boolean }): SessionRecord {
+function recordPinned(
+  model: string,
+  opts?: { floorHard?: boolean; effort?: string },
+): SessionRecord {
+  const effort = opts?.effort ?? "max";
   return makeSessionRecord({
     acpxRecordId: `rec-${model}`,
     acpSessionId: `sid-${model}`,
@@ -230,10 +313,10 @@ function recordPinned(model: string, opts?: { floorHard?: boolean }): SessionRec
     acpx: {
       session_options: {
         model,
-        effort: "max",
+        effort,
         ...(opts?.floorHard ? { floor_hard: true } : {}),
       },
-      desired_config_options: { effort: "max" },
+      desired_config_options: { effort },
     },
   });
 }
