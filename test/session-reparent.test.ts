@@ -174,7 +174,7 @@ test("set-parent round-trips all four fields onto the record AND the index entry
   });
 });
 
-test("the index PARSER preserves the new fields across a reconcile rewrite", async () => {
+test("the index PARSER preserves the new fields across a DRIFT reconcile", async () => {
   await withTempHome(async (homeDir) => {
     await seed(homeDir, "old-parent");
     await seed(homeDir, "new-parent");
@@ -183,12 +183,34 @@ test("the index PARSER preserves the new fields across a reconcile rewrite", asy
       ["claude", "sessions", "set-parent", "--session-id", "child", "--parent-id", "new-parent"],
       homeDir,
     );
+    assert.equal((await readIndexEntry(homeDir, "child")).parentSetAt !== undefined, true);
 
-    // A SECOND process re-reads index.json through parseIndexEntry and rewrites it.
-    // A field absent from that parser is stripped here even though the projection
-    // is right — the exact leg `lastTurnProvider` documents.
-    const second = await runCli(["claude", "sessions", "list", "--local"], homeDir);
-    assert.equal(second.code, 0, second.stderr);
+    // ⚠️ THE DRIFT PATH IS THE ONLY ONE THAT EXERCISES `parseIndexEntry`, AND
+    // GETTING THAT WRONG MAKES THIS TEST UNABLE TO FAIL. A full rebuild
+    // (`index.json` missing/unparseable) re-derives every entry FROM ITS RECORD
+    // through the projection, so a field the PARSER drops is silently restored and
+    // the test passes against a broken parser — measured, this test's first version
+    // did exactly that: deleting both parser lines left it green.
+    //
+    // So: drop a NEW record file straight onto disk to make index.files drift, then
+    // run a WRITE. reconcileDriftedEntries parses only the new file and carries
+    // every other entry over FROM index.json — i.e. through parseIndexEntry — and
+    // the write persists the result. `child`'s entry makes that round trip without
+    // its record ever being re-read.
+    await seed(homeDir, "late-arrival");
+    const write = await runCli(
+      [
+        "claude",
+        "sessions",
+        "set-parent",
+        "--session-id",
+        "late-arrival",
+        "--parent-id",
+        "new-parent",
+      ],
+      homeDir,
+    );
+    assert.equal(write.code, 0, write.stderr);
 
     const entry = await readIndexEntry(homeDir, "child");
     assert.equal(entry.parentSessionId, "new-parent");
