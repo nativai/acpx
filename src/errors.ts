@@ -602,10 +602,10 @@ export class ProfileUnknownError extends AcpxOperationalError {
 }
 
 // A `set profile` move was requested across credential classes (e.g. an SDK
-// subscription session → a claude-pty bridge profile, or → an openrouter API-key
-// profile). The auth layer requires a move to stay within the session's
-// adapter/authMode class (claude-home⟺claude-pty vs subscription⟺SDK), so the
-// move is refused before it can wedge the next turn's auth.
+// subscription session → a claude-pty bridge profile). The auth layer requires
+// a move to stay within the session's adapter/authMode class (claude-home⟺claude-pty
+// vs subscription⟺SDK), so the move is refused before it can wedge the next
+// turn's auth.
 export class ProfileClassMismatchError extends AcpxOperationalError {
   constructor(params: {
     targetId: string;

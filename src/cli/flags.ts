@@ -50,9 +50,7 @@ export type GlobalFlags = PermissionFlags & {
   format: OutputFormat;
   model?: string;
   // Opaque string at parse time — validated against the profile's valid set at
-  // execution time (subscription: low/medium/high/xhigh/max; openrouter:
-  // minimal/low/medium/high). Typed as string (not ReasoningEffort) because OR
-  // profiles add 'minimal' which is outside Claude's set.
+  // execution time (subscription/claude-home: low/medium/high/xhigh/max).
   reasoningEffort?: string;
   /**
    * `--output-style <name>` (brick://874fee67): the Claude Code output style for
@@ -582,9 +580,7 @@ export function addGlobalFlags(command: Command): Command {
     .option("--model <id>", "Agent model id")
     .option(
       "--reasoning-effort <level>",
-      "Thinking depth: Claude profiles accept low/medium/high/xhigh/max; " +
-        "OpenRouter profiles with reasoningSupported accept minimal/low/medium/high. " +
-        "Overrides the profile's default reasoningEffort. " +
+      "Thinking depth: Claude profiles accept low/medium/high/xhigh/max. " +
         "Out-of-range values for the active profile are rejected with a clear error. " +
         "(Ignored by codex — set codex depth via --model '<model>[depth]'.)",
       parseReasoningEffort,
@@ -605,7 +601,7 @@ export function addGlobalFlags(command: Command): Command {
     )
     .option(
       "--profile <id>",
-      "Profile id from the profiles registry (supports subscription and openrouter auth modes)",
+      "Profile id from the profiles registry (subscription, claude-home, or chatgpt auth mode)",
     )
     .option(
       "--allowed-tools <list>",

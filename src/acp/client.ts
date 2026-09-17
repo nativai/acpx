@@ -767,12 +767,12 @@ export class AcpClient {
   private closing = false;
   /**
    * ⚠️ **ASSIGN ONLY THROUGH {@link AcpClient.setShimHandle}** (brick://a89c3cd4).
-   * Every assignment must also record that this session was shim-served, and
-   * there is more than one shim-start site — the picker route and, far less
-   * obviously, `applyProfileAuth` for an `openrouter`-authMode profile.
-   * Recording at the call sites instead of at the assignment is how a
-   * picker-only implementation gets written that looks complete:
-   * `openRouterRouteModelId` below is exactly that, and its own comment says so.
+   * Every assignment must also record that this session was shim-served. Today
+   * only the picker route starts a shim; `applyProfileAuth` used to be a second,
+   * far-less-obvious shim-start site for an `openrouter`-authMode profile, before
+   * that profile kind was retired (brick 777b4be7). Recording at the assignment
+   * rather than at each call site is what keeps a future second site from being
+   * able to forget this.
    */
   private shimHandle?: ShimHandle;
   /**
@@ -1327,20 +1327,20 @@ export class AcpClient {
   /**
    * Apply the async portion of OpenRouter auth to the spawn env in place.
    *
-   * TWO ROUTES, AND THE MODEL CHOOSES (brick 007eaac8 — Daniel's founding item 6):
+   * THE MODEL CHOOSES THE ROUTE (brick 007eaac8 — Daniel's founding item 6):
    *
-   *   - a session carrying an openrouter PROFILE takes the LEGACY route: the
-   *     profile's model on the profile's own account, byte for byte as before;
    *   - a session whose picked MODEL is an OpenRouter slug takes the PICKER route:
    *     that slug, on the BOX key in `~/.acpx/providers.json`, with no profile
    *     involved at all — which is what makes "any OpenRouter model" true for
    *     claude without pre-registering one profile per model;
-   *   - naming BOTH is refused loudly, because they are two accounts with two
-   *     budgets and there is no defensible silent winner.
+   *   - any other session with a profile attached (`kind: "profile"`) takes
+   *     `applyProfileAuth`'s normal, non-shim path — subscription, claude-home or
+   *     chatgpt. (The `openrouter`-authMode profile kind that used to be a second
+   *     shim-starting route here was retired, brick 777b4be7.)
    *
-   * For subscription / neither: no-op. On a RECONNECT (`shimHandle` already set)
-   * both routes reinject the running shim's port identically — the shim process,
-   * and therefore the served model, survives the reconnect.
+   * No-op for neither. On a RECONNECT (`shimHandle` already set) the picker route
+   * reinjects the running shim's port identically — the shim process, and
+   * therefore the served model, survives the reconnect.
    */
   private async applyProfileEnv(env: NodeJS.ProcessEnv): Promise<void> {
     if (this.shimHandle) {
@@ -1419,11 +1419,9 @@ export class AcpClient {
    * shim rewrites every outbound request to — or `undefined` when acpx is not
    * serving this session's model that way.
    *
-   * ⚠️ SET ONLY FOR THE PICKER ROUTE, DELIBERATELY. The legacy profile route also
-   * serves its model out of band, and today a `--model` on such a session is
-   * silently ignored by the shim — a real wart, filed separately (2026-09-06).
-   * Widening this flag to cover it would change behaviour on a path this brick is
-   * required to leave byte-identical, so it is reported rather than fixed here.
+   * ⚠️ SET ONLY FOR THE PICKER ROUTE. The `openrouter`-authMode profile that used
+   * to be the other out-of-band caller was retired (brick 777b4be7), so the
+   * picker route is now the only one.
    */
   get outOfBandModelId(): string | undefined {
     return this.openRouterRouteModelId;
@@ -1476,14 +1474,11 @@ export class AcpClient {
   /**
    * THE ONLY assignment path for {@link shimHandle} (brick://a89c3cd4).
    *
-   * A shim can be started from two places — the picker route and
-   * `applyProfileAuth` for an `openrouter`-authMode profile — and a fix that
-   * recorded the fact at the sites rather than here would look complete while
-   * missing one. That is not hypothetical: `outOfBandModelId`'s own comment
-   * records the identical asymmetry (*"SET ONLY FOR THE PICKER ROUTE,
-   * DELIBERATELY. The legacy profile route also serves its model out of band"*),
-   * filed 2026-09-06 and still open. Routing every assignment through here makes
-   * a third shim-start site inherit the fact instead of forgetting it.
+   * Today only the picker route starts a shim — the `openrouter`-authMode
+   * profile that used to be a second shim-starting caller (`applyProfileAuth`)
+   * was retired (brick 777b4be7); `startProfileShim` now always clears the
+   * handle. Routing every assignment through here, rather than at each call
+   * site, is what keeps a future second caller from being able to forget this.
    *
    * ⚠️ The recorded fact is STICKY and this is deliberate: a handle of
    * `undefined` (teardown, idle reap) clears the live handle and leaves

@@ -280,49 +280,13 @@ test("getValidEffortsForProfile: claude-home uses the interactive Claude effort 
   });
 });
 
-test("getValidEffortsForProfile: subscription and OpenRouter profiles expose distinct effort ladders", async () => {
-  await withProfilesHome(
-    {
-      ...HYBRID_REGISTRY,
-      profiles: [
-        ...HYBRID_REGISTRY.profiles,
-        {
-          id: "or-reasoning",
-          label: "OpenRouter reasoning",
-          harness: "claude",
-          authMode: "openrouter",
-          model: "deepseek/deepseek-chat",
-          openRouterApiKey: "test-key-never-logged",
-          reasoningSupported: true,
-        },
-        {
-          id: "or-plain",
-          label: "OpenRouter plain",
-          harness: "claude",
-          authMode: "openrouter",
-          model: "anthropic/claude-3-5-sonnet",
-          openRouterApiKey: "test-key-never-logged",
-        },
-      ],
-    },
-    async (ctx) => {
-      const registry = loadProfileRegistry(ctx.lookupOptions);
-      const sub1 = registry.profiles.find((p) => p.id === "sub1");
-      const orReasoning = registry.profiles.find((p) => p.id === "or-reasoning");
-      const orPlain = registry.profiles.find((p) => p.id === "or-plain");
-      assert.ok(sub1);
-      assert.ok(orReasoning);
-      assert.ok(orPlain);
-      assert.deepEqual(getValidEffortsForProfile(sub1), ["low", "medium", "high", "xhigh", "max"]);
-      assert.deepEqual(getValidEffortsForProfile(orReasoning), [
-        "minimal",
-        "low",
-        "medium",
-        "high",
-      ]);
-      assert.equal(getValidEffortsForProfile(orPlain), null);
-    },
-  );
+test("getValidEffortsForProfile: subscription profiles use the Claude effort ladder", async () => {
+  await withProfilesHome(HYBRID_REGISTRY, async (ctx) => {
+    const registry = loadProfileRegistry(ctx.lookupOptions);
+    const sub1 = registry.profiles.find((p) => p.id === "sub1");
+    assert.ok(sub1);
+    assert.deepEqual(getValidEffortsForProfile(sub1), ["low", "medium", "high", "xhigh", "max"]);
+  });
 });
 
 test("buildClaudeHomeSelectorMeta emits the bridge's published _meta key for claude-home profiles only", async () => {
@@ -583,45 +547,20 @@ test("applyProfileAuth rejects a claude-home profile on a NON-bridge agent (fail
   });
 });
 
-test("applyProfileAuth rejects subscription and openrouter profiles on the bridge agent (setup-token gate)", async () => {
-  await withProfilesHome(
-    {
-      ...HYBRID_REGISTRY,
-      profiles: [
-        ...HYBRID_REGISTRY.profiles,
-        {
-          id: "or-deepseek",
-          authMode: "openrouter",
-          model: "deepseek/deepseek-chat",
-          openRouterApiKey: "test-key-never-logged",
-        },
-      ],
-    },
-    async (ctx) => {
-      await assert.rejects(
-        applyProfileAuth(
-          {},
-          "sub1",
-          "session-1",
-          null,
-          ctx.lookupOptions,
-          DEFAULT_CLAUDE_PTY_COMMAND,
-        ),
-        /cannot be used with the claude-pty bridge agent/,
-      );
-      await assert.rejects(
-        applyProfileAuth(
-          {},
-          "or-deepseek",
-          "session-1",
-          null,
-          ctx.lookupOptions,
-          "node /workspace/projects/claude-pty-acp/main/acp-server-transcript.mjs",
-        ),
-        /cannot be used with the claude-pty bridge agent/,
-      );
-    },
-  );
+test("applyProfileAuth rejects a subscription profile on the bridge agent (setup-token gate)", async () => {
+  await withProfilesHome(HYBRID_REGISTRY, async (ctx) => {
+    await assert.rejects(
+      applyProfileAuth(
+        {},
+        "sub1",
+        "session-1",
+        null,
+        ctx.lookupOptions,
+        DEFAULT_CLAUDE_PTY_COMMAND,
+      ),
+      /cannot be used with the claude-pty bridge agent/,
+    );
+  });
 });
 
 test("applyProfileAuth: vanished profile + bridge agent fails the spawn (no silent box-default HOME run)", async () => {
@@ -693,44 +632,15 @@ test("applyProfileAuth treats default reasoning effort as no override for subscr
 });
 
 test("applyProfileAuth validates explicit reasoning effort against the selected profile type", async () => {
-  await withProfilesHome(
-    {
-      ...HYBRID_REGISTRY,
-      profiles: [
-        ...HYBRID_REGISTRY.profiles,
-        {
-          id: "or-reasoning",
-          label: "OpenRouter reasoning",
-          harness: "claude",
-          authMode: "openrouter",
-          model: "deepseek/deepseek-chat",
-          openRouterApiKey: "test-key-never-logged",
-          reasoningSupported: true,
-        },
-      ],
-    },
-    async (ctx) => {
-      const subsDir = path.join(ctx.homeDir, ".acpx", "subscriptions");
-      await fs.mkdir(path.join(subsDir, "sub1"), { recursive: true });
+  await withProfilesHome(HYBRID_REGISTRY, async (ctx) => {
+    const subsDir = path.join(ctx.homeDir, ".acpx", "subscriptions");
+    await fs.mkdir(path.join(subsDir, "sub1"), { recursive: true });
 
-      await assert.rejects(
-        applyProfileAuth({}, "sub1", "session-1", "minimal", ctx.lookupOptions, SDK_CLAUDE_COMMAND),
-        /--reasoning-effort "minimal" is not valid for profile "sub1" \(subscription\).*low, medium, high, xhigh, max/s,
-      );
-
-      await assert.rejects(
-        applyProfileAuth(
-          {},
-          "or-reasoning",
-          "session-1",
-          "max",
-          ctx.lookupOptions,
-          SDK_CLAUDE_COMMAND,
-        ),
-        /--reasoning-effort "max" is not valid for profile "or-reasoning" \(openrouter\).*minimal, low, medium, high/s,
-      );
-    },
-  );
+    await assert.rejects(
+      applyProfileAuth({}, "sub1", "session-1", "minimal", ctx.lookupOptions, SDK_CLAUDE_COMMAND),
+      /--reasoning-effort "minimal" is not valid for profile "sub1" \(subscription\).*low, medium, high, xhigh, max/s,
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------

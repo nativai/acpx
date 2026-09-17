@@ -34,7 +34,7 @@ function toDisplayEntry(
     adapter: p.adapter,
     authMode: p.authMode,
     model: p.model ?? null,
-    reasoningSupported: p.authMode === "openrouter" ? (p.reasoningSupported ?? false) : false,
+    reasoningSupported: false,
     validEfforts: getValidEffortsForProfile(p),
     locked: isSubscriptionProfileLocked(p, registry),
     ...(p.authMode === "subscription" && p.lockedAt !== undefined ? { lockedAt: p.lockedAt } : {}),

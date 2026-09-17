@@ -9,11 +9,7 @@ import {
   buildAgentSpawnOptions,
 } from "../src/acp/auth-env.js";
 import { AcpClient } from "../src/acp/client.js";
-import {
-  ensureProfileOsHarnessProvisioning,
-  type ProvisioningWarningBreadcrumb,
-} from "../src/config/os-harness-provisioning.js";
-import { findProfile, loadProfileRegistry } from "../src/config/profiles.js";
+import type { ProvisioningWarningBreadcrumb } from "../src/config/os-harness-provisioning.js";
 import type { SubscriptionLookupOptions } from "../src/config/subscriptions.js";
 import { applyLifecycleSnapshotToRecord } from "../src/runtime/engine/lifecycle.js";
 import { makeSessionRecord } from "./runtime-test-helpers.js";
@@ -400,41 +396,6 @@ test(
     });
   },
 );
-
-test("W2 provisioning: openrouter temp config dir uses acpx-owned symlinks", async () => {
-  await withHarnessFixture(async (fixture) => {
-    const tempConfigDir = path.join(fixture.root, "or-session");
-    await fs.mkdir(tempConfigDir);
-    await writeRegistry(
-      fixture.registryPath,
-      registryWithProvisioning(fixture.sourceDir, [
-        {
-          id: "or1",
-          label: "OpenRouter",
-          authMode: "openrouter",
-          model: "anthropic/claude-3-5-sonnet",
-          openRouterApiKey: "test-key",
-        },
-      ]),
-    );
-    const registry = loadProfileRegistry(fixture.lookup);
-    const profile = findProfile("or1", registry);
-    assert.ok(profile);
-
-    ensureProfileOsHarnessProvisioning({
-      registry,
-      profile,
-      env: { CLAUDE_CONFIG_DIR: tempConfigDir },
-    });
-
-    for (const entry of ["settings.json", "skills", "commands", "plugins"]) {
-      await assertSymlinkTarget(
-        path.join(tempConfigDir, entry),
-        path.join(fixture.sourceDir, entry),
-      );
-    }
-  });
-});
 
 test("W2 provisioning: claude-home merges settings hook and leaves human-owned directories untouched", async () => {
   await withHarnessFixture(async (fixture) => {

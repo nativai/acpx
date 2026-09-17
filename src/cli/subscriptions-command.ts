@@ -509,9 +509,8 @@ export type SubscriptionRemovePlan = {
 
 /**
  * The directory that physically holds this profile's credentials — the only
- * thing --purge may delete. openrouter keys live inline in the registry and a
- * chatgpt profile's codexHome is normally the SHARED ~/.codex, so neither owns a
- * dir we may remove.
+ * thing --purge may delete. A chatgpt profile's codexHome is normally the
+ * SHARED ~/.codex, so it does not own a dir we may remove.
  */
 function ownedConfigDir(profile: ProfileEntry): string | null {
   switch (profile.authMode) {
@@ -519,7 +518,6 @@ function ownedConfigDir(profile: ProfileEntry): string | null {
       return profile.credentialSource;
     case "claude-home":
       return profile.homePath;
-    case "openrouter":
     case "chatgpt":
       return null;
   }
