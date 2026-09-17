@@ -216,6 +216,13 @@ export type PersistedSessionLifecycle = {
   /** acpx-ui-owned template marker — read-preserved like closed/favorite/name so a
    * stale agent-exit checkpoint flush can't clobber an externally-set template (FW-16). */
   template: SessionRecord["template"];
+  /** The parent linkage — read-preserved as a group so an externally-set parent
+   * (`sessions set-parent`, acpx-ui's PATCH) survives a live owner's next
+   * checkpoint. See `preserveParentLinkageForPersist`. (brick c99f9994) */
+  parentSessionId: string | undefined;
+  parentSessionUrl: string | undefined;
+  parentSetAt: string | undefined;
+  spawnedBySessionId: string | undefined;
   /** Last on-disk updated_at — lets the flush keep updated_at monotonic (no stale regress). */
   updatedAt: string | undefined;
   /** Current on-disk metadata; merged at write time so stale owner records do
@@ -249,6 +256,10 @@ export async function readPersistedLifecycle(
       favoritedAt: parsed.favoritedAt,
       name: parsed.name,
       template: parsed.template,
+      parentSessionId: parsed.parentSessionId,
+      parentSessionUrl: parsed.parentSessionUrl,
+      parentSetAt: parsed.parentSetAt,
+      spawnedBySessionId: parsed.spawnedBySessionId,
       updatedAt: parsed.updated_at,
       metadata: parsed.metadata,
       pid: parsed.pid,
@@ -318,6 +329,41 @@ export async function writeSessionRecordAtBoundaryWithLifecycle(
 }
 
 /**
+ * The field groups a write may declare itself AUTHORITATIVE for: every other
+ * preserved field still read-preserves from disk, these are taken from the
+ * in-memory record. Mirrors `closeSession`'s privilege, scoped to one group
+ * instead of all of them. (brick c99f9994)
+ */
+type WriteAuthoritativeFields = { parent?: true };
+
+/**
+ * The ONE authorised writer of the parent linkage — `sessions set-parent` and any
+ * future in-process caller that deliberately re-parents a session.
+ *
+ * ⚠️ WITHOUT THIS THE VERB IS A SILENT NO-OP, and that is not obvious from the
+ * call site. `writeSessionRecordInternal` re-reads `<id>.json` and
+ * `preserveParentLinkageForPersist` puts the OLD parent straight back, so a
+ * `set-parent` that mutates the record and calls plain `writeSessionRecord` writes
+ * the record it started from — exit 0, correct-looking output, nothing changed.
+ *
+ * ⚠️ DO NOT "simplify" this to `writeSessionRecordWithLifecycle`. That bypass
+ * disables preservation for EVERY lifecycle field, so a concurrent rename, close or
+ * favourite-toggle landing in the read→write window is lost — a bigger hole than
+ * the one this closes. Nor pass a doctored snapshot through
+ * `writeSessionRecordWithPersistedLifecycle`: that works only by feeding the
+ * preserve mechanism a lie, and a later refactor pointing
+ * `applyPersistedLifecycleForWrite` at `freshPersisted` — which reads like a bug
+ * fix — would silently revert set-parent to a no-op.
+ */
+export async function writeSessionRecordAuthorizingParent(record: SessionRecord): Promise<void> {
+  await writeSessionRecordInternal(record, {
+    messagePersistence: "checkpoint",
+    preserveLifecycle: true,
+    authoritative: { parent: true },
+  });
+}
+
+/**
  * Preserving write variant for callers that already hold the persisted
  * lifecycle from a fresh `readPersistedLifecycle` read. Metadata is still
  * reread inside the write so external metadata patches survive stale owner
@@ -336,12 +382,49 @@ export async function writeSessionRecordWithPersistedLifecycle(
   });
 }
 
+/**
+ * Read-preserve the four parent-linkage fields — the group `sessions set-parent`
+ * and acpx-ui's `PATCH /api/sessions/:id/parent` own (brick c99f9994).
+ *
+ * Kept a NAMED function, like `preserveLastTurnProviderForPersist` below, so the
+ * write path reads as a list of the properties it protects and a refactor tidying
+ * the block above cannot quietly drop it.
+ *
+ * ⚠️ UNCONDITIONAL — disk wins, it does NOT merely fill an absence. The
+ * `last_turn_provider` style ("disk only fills an absence") is wrong here: the
+ * lost update being closed IS a live owner's stale in-memory record carrying the
+ * OLD parent, which a fill-an-absence preserve would let through unchanged.
+ *
+ * ⚠️ And that is safe only because NOTHING assigns a parent outside record
+ * CONSTRUCTION (`session-management.ts:254-263,629,909`,
+ * `command-handlers.ts:855-856,3047-3048`, `runtime.ts:2421`) — at which point no
+ * `<id>.json` exists yet, `readPersistedLifecycle` returns undefined, and this is a
+ * no-op. There is no legitimate daemon write for it to suppress. **Add a parent
+ * write anywhere else and this analysis expires — re-run that grep.**
+ *
+ * The one authorised writer bypasses it through `authoritative.parent`; see
+ * `writeSessionRecordAuthorizingParent`.
+ */
+function preserveParentLinkageForPersist(
+  record: SessionRecord,
+  persistedLifecycle: PersistedSessionLifecycle,
+): void {
+  record.parentSessionId = persistedLifecycle.parentSessionId;
+  record.parentSessionUrl = persistedLifecycle.parentSessionUrl;
+  record.parentSetAt = persistedLifecycle.parentSetAt;
+  record.spawnedBySessionId = persistedLifecycle.spawnedBySessionId;
+}
+
 function applyPersistedLifecycleForWrite(
   record: SessionRecord,
   persistedLifecycle: PersistedSessionLifecycle | undefined,
+  authoritative: WriteAuthoritativeFields | undefined,
 ): void {
   if (!persistedLifecycle) {
     return;
+  }
+  if (authoritative?.parent !== true) {
+    preserveParentLinkageForPersist(record, persistedLifecycle);
   }
   record.closed = persistedLifecycle.closed;
   record.closedAt = persistedLifecycle.closedAt;
@@ -391,6 +474,10 @@ async function writeSessionRecordInternal(
     /** Wrapper distinguishes "caller provided a read result (possibly
      * undefined)" from "not provided — read from disk here". */
     persisted?: { value: PersistedSessionLifecycle | undefined };
+    /** Field groups this write is AUTHORITATIVE for — preserved for every other
+     * field, taken from the in-memory record for these. See
+     * `writeSessionRecordAuthorizingParent`. */
+    authoritative?: WriteAuthoritativeFields;
   },
 ): Promise<void> {
   // ⚠️ THE ARCHIVED-RECORD WRITE GUARD, PLACED HERE **BY CONSTRUCTION**. All four
@@ -422,7 +509,7 @@ async function writeSessionRecordInternal(
     const persistedMetadata = freshPersisted?.metadata;
 
     if (options.preserveLifecycle) {
-      applyPersistedLifecycleForWrite(record, persistedLifecycle);
+      applyPersistedLifecycleForWrite(record, persistedLifecycle, options.authoritative);
     }
     mergeRecordMetadataForPersist(record, persistedMetadata);
     // Same baseline-diff protection metadata gets (2c848d3), extended to the

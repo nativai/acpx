@@ -1168,6 +1168,30 @@ export type SessionRecord = {
    * Read by acpx-ui's relations tree to link out to a remote parent. (brick://c6e3618b)
    */
   parentSessionUrl?: string;
+  /**
+   * ISO-8601 stamp of the last `sessions set-parent`, persisted as `parent_set_at`.
+   * Its PRESENCE is the marker "this parent was set by an operator AFTER creation",
+   * which acpx-ui's lineage derivation reads to let an explicit re-parent override a
+   * derived fork edge. Absent on every spawn-time parent. Overwritten on each
+   * re-parent (it answers *when*, at the same cost as a boolean).
+   *
+   * ⚠️ NOT session metadata, deliberately: metadata cannot reach acpx-ui's hot-path
+   * derivation without a per-record read (`metadataTemplateSource` is the specimen).
+   * It is a top-level record field, projected onto the index entry. (brick c99f9994)
+   */
+  parentSetAt?: string;
+  /**
+   * WRITE-ONCE provenance, persisted as `spawned_by_session_id`: who spawned this
+   * session, captured from `parentSessionId` immediately before the FIRST re-parent.
+   * Never overwritten (after A→B→C it still reads A), never cleared.
+   *
+   * ⚠️ ABSENT means "was a root when first adopted" — do NOT back-fill a sentinel.
+   * It exists because the relations upsert overwrites the edge in place, so the
+   * original spawn parent is otherwise unrecoverable. Provenance, not a foreign key:
+   * it may name an archived or pruned session and nothing dereferences it.
+   * (brick c99f9994)
+   */
+  spawnedBySessionId?: string;
   forkedFromSessionId?: string;
   /**
    * The message index the fork ACTUALLY landed on — the effective boundary, not

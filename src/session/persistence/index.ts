@@ -68,6 +68,18 @@ export type SessionIndexEntry = {
    * much as the record does. (brick://c6e3618b)
    */
   parentSessionUrl?: string;
+  /**
+   * Marker for "this parent was set after creation" (see SessionRecord.parentSetAt).
+   *
+   * ⚠️ Projected onto the INDEX ENTRY, not only the record, and that is the whole
+   * point of the field: acpx-ui's hot path never opens `<id>.json` — `buildOneSession`
+   * synthesises its view from this entry — so a marker that stops at the record leaves
+   * the board's lineage derivation unable to see it while typecheck, build and the unit
+   * suite all stay green. (brick c99f9994)
+   */
+  parentSetAt?: string;
+  /** Write-once spawn provenance (see SessionRecord.spawnedBySessionId). */
+  spawnedBySessionId?: string;
   forkedFromSessionId?: string;
   /** The EFFECTIVE fork boundary (see SessionRecord.forkedAtMessageIndex). */
   forkedAtMessageIndex?: number;
@@ -368,6 +380,11 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     createdAt: optionalString(record.createdAt),
     parentSessionId: optionalString(record.parentSessionId),
     parentSessionUrl: optionalString(record.parentSessionUrl),
+    // BOTH index legs (brick://874fee67, brick c99f9994): this parser reconstructs
+    // an entry from index.json on reconcile, so a field missing HERE is stripped on
+    // the next daemon rewrite even though the projection below is correct.
+    parentSetAt: optionalString(record.parentSetAt),
+    spawnedBySessionId: optionalString(record.spawnedBySessionId),
     forkedFromSessionId: optionalString(record.forkedFromSessionId),
     forkedAtMessageIndex: optionalFiniteNumber(record.forkedAtMessageIndex),
     forkedAtMessageIndexRequested: optionalFiniteNumber(record.forkedAtMessageIndexRequested),
@@ -537,6 +554,8 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     createdAt: record.createdAt,
     parentSessionId: record.parentSessionId,
     parentSessionUrl: record.parentSessionUrl,
+    parentSetAt: record.parentSetAt,
+    spawnedBySessionId: record.spawnedBySessionId,
     forkedFromSessionId: record.forkedFromSessionId,
     forkedAtMessageIndex: record.forkedAtMessageIndex,
     forkedAtMessageIndexRequested: record.forkedAtMessageIndexRequested,
