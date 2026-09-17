@@ -158,7 +158,7 @@ test("🛑 the VERB enforces the intent gate — refuses a bare vector with exit
   const originalErr = process.stderr.write.bind(process.stderr);
   const originalOut = process.stdout.write.bind(process.stdout);
 
-  const run = async (argv: readonly string[]): Promise<{ exit: number; err: string }> => {
+  const run = async (argv: readonly string[]): Promise<{ exit: number | string; err: string }> => {
     const command = new Command();
     command.exitOverride();
     addArchiveRunIntentOptions(command);
@@ -176,7 +176,7 @@ test("🛑 the VERB enforces the intent gate — refuses a bare vector with exit
       process.stderr.write = originalErr;
       process.stdout.write = originalOut;
     }
-    return { exit: Number(process.exitCode ?? 0), err };
+    return { exit: process.exitCode ?? 0, err };
   };
 
   try {
