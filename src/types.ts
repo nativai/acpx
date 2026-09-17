@@ -352,6 +352,22 @@ export type AcpClientOptions = {
      */
     modelSource?: string;
     allowedTools?: string[];
+    /**
+     * Tool names the Claude Code adapter must refuse regardless of `allowedTools`
+     * (e.g. blocking self-scheduling tools like `ScheduleWakeup`/`CronCreate` at
+     * the spawn caller — the adapter and acpx cannot tell "the model chose this"
+     * from "the operator typed this", only the spawn site can). Forwarded
+     * verbatim to `claude-agent-acp`, which merges it with its own hardcoded
+     * `["AskUserQuestion"]` — acpx never hardcodes a block list of its own.
+     */
+    disallowedTools?: string[];
+    /**
+     * Skill names the Claude Agent SDK exposes to the model as a context filter
+     * (NOT a sandbox — omitting this is not "skills off"). `skills: []` is the
+     * documented way to strip skill descriptions from context; pair it with
+     * `disallowedTools: ["Skill"]` to also block the Skill tool itself.
+     */
+    skills?: string[];
     maxTurns?: number;
     systemPrompt?: string | { append: string };
     subscription?: string;
@@ -837,6 +853,10 @@ export type SessionAcpxState = {
   session_options?: {
     model?: string;
     allowed_tools?: string[];
+    /** Persisted twin of sessionOptions.disallowedTools — see its doc comment above. */
+    disallowed_tools?: string[];
+    /** Persisted twin of sessionOptions.skills — see its doc comment above. */
+    skills?: string[];
     max_turns?: number;
     system_prompt?: string | { append: string };
     subscription?: string;

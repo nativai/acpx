@@ -115,6 +115,8 @@ test("parseQueueRequest accepts prompt session options", () => {
     sessionOptions: {
       model: "fast-model",
       allowedTools: ["Read", "Grep"],
+      disallowedTools: ["Skill", "ScheduleWakeup"],
+      skills: [],
       maxTurns: 4,
       systemPrompt: { append: "keep it brief" },
     },
@@ -134,6 +136,8 @@ test("parseQueueRequest accepts prompt session options", () => {
     sessionOptions: {
       model: "fast-model",
       allowedTools: ["Read", "Grep"],
+      disallowedTools: ["Skill", "ScheduleWakeup"],
+      skills: [],
       maxTurns: 4,
       systemPrompt: { append: "keep it brief" },
     },
@@ -162,6 +166,32 @@ test("parseQueueRequest rejects invalid prompt session options", () => {
       permissionMode: "approve-reads",
       sessionOptions: {
         allowedTools: ["Read", 123],
+      },
+      waitForCompletion: true,
+    }),
+    null,
+  );
+  assert.equal(
+    parseQueueRequest({
+      type: "submit_prompt",
+      requestId: "req-session-options-invalid-disallowed-tools",
+      message: "hello",
+      permissionMode: "approve-reads",
+      sessionOptions: {
+        disallowedTools: ["Skill", 123],
+      },
+      waitForCompletion: true,
+    }),
+    null,
+  );
+  assert.equal(
+    parseQueueRequest({
+      type: "submit_prompt",
+      requestId: "req-session-options-invalid-skills",
+      message: "hello",
+      permissionMode: "approve-reads",
+      sessionOptions: {
+        skills: ["planning", 123],
       },
       waitForCompletion: true,
     }),

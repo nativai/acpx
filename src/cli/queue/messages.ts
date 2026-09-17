@@ -378,6 +378,8 @@ const SESSION_OPTION_PARSERS: ReadonlyArray<
   ["model", assignSessionModel],
   ["modelSource", assignSessionModelSource],
   ["allowedTools", assignSessionAllowedTools],
+  ["disallowedTools", assignSessionDisallowedTools],
+  ["skills", assignSessionSkills],
   ["maxTurns", assignSessionMaxTurns],
   ["systemPrompt", assignSessionSystemPrompt],
   ["subscription", assignSessionSubscription],
@@ -443,6 +445,28 @@ function assignSessionAllowedTools(options: QueueSessionOptions, value: unknown)
     return false;
   }
   options.allowedTools = value;
+  return true;
+}
+
+function assignSessionDisallowedTools(options: QueueSessionOptions, value: unknown): boolean {
+  if (value == null) {
+    return true;
+  }
+  if (!Array.isArray(value) || value.some((tool) => typeof tool !== "string")) {
+    return false;
+  }
+  options.disallowedTools = value;
+  return true;
+}
+
+function assignSessionSkills(options: QueueSessionOptions, value: unknown): boolean {
+  if (value == null) {
+    return true;
+  }
+  if (!Array.isArray(value) || value.some((skill) => typeof skill !== "string")) {
+    return false;
+  }
+  options.skills = value;
   return true;
 }
 

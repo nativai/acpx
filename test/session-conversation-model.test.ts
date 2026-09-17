@@ -288,6 +288,8 @@ test("cloneSessionAcpxState preserves desired mode id", () => {
     session_options: {
       model: "sonnet",
       allowed_tools: ["Read", "Grep"],
+      disallowed_tools: ["Skill", "ScheduleWakeup"],
+      skills: [],
       max_turns: 7,
       subscription: "sub1",
     },
@@ -307,6 +309,8 @@ test("cloneSessionAcpxState preserves desired mode id", () => {
   assert.deepEqual(cloned?.session_options, {
     model: "sonnet",
     allowed_tools: ["Read", "Grep"],
+    disallowed_tools: ["Skill", "ScheduleWakeup"],
+    skills: [],
     max_turns: 7,
     subscription: "sub1",
     profile: undefined,

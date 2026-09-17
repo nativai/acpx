@@ -789,6 +789,8 @@ function cloneSessionOptions(
   return {
     model: options.model,
     allowed_tools: options.allowed_tools ? [...options.allowed_tools] : undefined,
+    disallowed_tools: options.disallowed_tools ? [...options.disallowed_tools] : undefined,
+    skills: options.skills ? [...options.skills] : undefined,
     max_turns: options.max_turns,
     subscription: options.subscription,
     profile: options.profile,

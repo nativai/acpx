@@ -270,6 +270,8 @@ test("resolveGlobalFlags validates and normalizes dynamic Commander options", ()
       reasoningEffort: "high",
       subscription: " sub1 ",
       allowedTools: ["Read", "Edit"],
+      disallowedTools: ["Bash", "ScheduleWakeup"],
+      skills: [],
       maxTurns: 3,
       systemPrompt: "replace",
       promptRetries: 2,
@@ -302,6 +304,8 @@ test("resolveGlobalFlags validates and normalizes dynamic Commander options", ()
     outputStyle: undefined,
     subscription: "sub1",
     allowedTools: ["Read", "Edit"],
+    disallowedTools: ["Bash", "ScheduleWakeup"],
+    skills: [],
     maxTurns: 3,
     systemPrompt: "replace",
     profile: undefined,
@@ -322,6 +326,8 @@ test("resolveGlobalFlags ignores malformed dynamic options and keeps typed confi
       ttl: "34000",
       format: undefined,
       allowedTools: ["Read", 7],
+      disallowedTools: ["Bash", 9],
+      skills: ["planning", 3],
       maxTurns: "3",
       promptRetries: "2",
     }),
@@ -342,6 +348,8 @@ test("resolveGlobalFlags ignores malformed dynamic options and keeps typed confi
   assert.equal(flags.ttl, 6000);
   assert.equal(flags.format, "quiet");
   assert.equal(flags.allowedTools, undefined);
+  assert.equal(flags.disallowedTools, undefined);
+  assert.equal(flags.skills, undefined);
   assert.equal(flags.maxTurns, undefined);
   assert.equal(flags.promptRetries, undefined);
 });
@@ -470,6 +478,10 @@ test("global flag registration parses each supported option", () => {
     "sonnet",
     "--allowed-tools",
     "Read,Edit",
+    "--disallowed-tools",
+    "Skill,ScheduleWakeup",
+    "--skills",
+    "",
     "--max-turns",
     "4",
     "--system-prompt",
@@ -496,6 +508,8 @@ test("global flag registration parses each supported option", () => {
     suppressReads: true,
     model: "sonnet",
     allowedTools: ["Read", "Edit"],
+    disallowedTools: ["Skill", "ScheduleWakeup"],
+    skills: [],
     maxTurns: 4,
     systemPrompt: "be precise",
     promptRetries: 2,

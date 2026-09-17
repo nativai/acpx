@@ -731,6 +731,59 @@ test("AcpClient createSession forwards claudeCode options in _meta", async () =>
   });
 });
 
+test("AcpClient createSession forwards disallowedTools + skills in _meta alongside allowedTools", async () => {
+  const cwd = path.resolve("/tmp/acpx-client-meta-block");
+  const client = makeClient({
+    sessionOptions: {
+      model: "sonnet",
+      allowedTools: ["Read", "Grep"],
+      disallowedTools: [
+        "Skill",
+        "ScheduleWakeup",
+        "CronCreate",
+        "CronList",
+        "CronDelete",
+        "RemoteTrigger",
+      ],
+      skills: [],
+      maxTurns: 12,
+    },
+  });
+
+  let capturedParams: Record<string, unknown> | undefined;
+  asInternals(client).connection = {
+    newSession: async (params: Record<string, unknown>) => {
+      capturedParams = params;
+      return { sessionId: "session-456" };
+    },
+  };
+
+  const result = await client.createSession("/tmp/acpx-client-meta-block");
+  assert.equal(result.sessionId, "session-456");
+  assert.deepEqual(capturedParams, {
+    cwd,
+    mcpServers: [],
+    _meta: {
+      claudeCode: {
+        options: {
+          model: "sonnet",
+          allowedTools: ["Read", "Grep"],
+          disallowedTools: [
+            "Skill",
+            "ScheduleWakeup",
+            "CronCreate",
+            "CronList",
+            "CronDelete",
+            "RemoteTrigger",
+          ],
+          skills: [],
+          maxTurns: 12,
+        },
+      },
+    },
+  });
+});
+
 test("AcpClient createSession forwards systemPrompt string in _meta", async () => {
   const cwd = path.resolve("/tmp/acpx-client-system-prompt");
   const client = makeClient({

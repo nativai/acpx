@@ -85,7 +85,7 @@ async function withSubscriptionsHome(
       configDir: (id) => path.join(subsDir, id),
     });
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true });
+    await fs.rm(homeDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     if (previousClaudeConfigDir === undefined) {
       delete process.env.CLAUDE_CONFIG_DIR;
     } else {
@@ -268,7 +268,7 @@ async function withSubscriptionHome(
     );
     await run(homeDir, cwd);
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true });
+    await fs.rm(homeDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 }
 

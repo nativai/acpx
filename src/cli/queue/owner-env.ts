@@ -126,6 +126,8 @@ function assignQueueOwnerSessionOptions(
   // fall back to the record's stale "inherited", which the belt then blocks.
   assignSessionModelSource(options.sessionOptions, sessionOpts.modelSource);
   assignSessionAllowedTools(options.sessionOptions, sessionOpts.allowedTools);
+  assignSessionDisallowedTools(options.sessionOptions, sessionOpts.disallowedTools);
+  assignSessionSkills(options.sessionOptions, sessionOpts.skills);
   assignSessionMaxTurns(options.sessionOptions, sessionOpts.maxTurns);
   assignSessionSystemPrompt(options.sessionOptions, sessionOpts.systemPrompt);
   assignSessionSubscription(options.sessionOptions, sessionOpts.subscription);
@@ -164,6 +166,24 @@ function assignSessionAllowedTools(
 ): void {
   if (Array.isArray(value)) {
     options.allowedTools = value.filter((tool): tool is string => typeof tool === "string");
+  }
+}
+
+function assignSessionDisallowedTools(
+  options: NonNullable<QueueOwnerRuntimeOptions["sessionOptions"]>,
+  value: unknown,
+): void {
+  if (Array.isArray(value)) {
+    options.disallowedTools = value.filter((tool): tool is string => typeof tool === "string");
+  }
+}
+
+function assignSessionSkills(
+  options: NonNullable<QueueOwnerRuntimeOptions["sessionOptions"]>,
+  value: unknown,
+): void {
+  if (Array.isArray(value)) {
+    options.skills = value.filter((skill): skill is string => typeof skill === "string");
   }
 }
 

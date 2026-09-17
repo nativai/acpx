@@ -309,6 +309,43 @@ function readLocalIdentity(): { instance_id: string; home: string } {
   }
   return identity;
 }
+
+/**
+ * The instance id this HOME admits — the only identity an outbox living under this HOME may carry.
+ *
+ * ⚠️ TAKES NO ARGUMENT, AND THAT IS THE WHOLE POINT. `BrickOutbox`'s constructor derives `dbPath`
+ * from `os.homedir()`; `readLocalIdentity()` derives the admitted id from the same `os.homedir()`.
+ * Both sides of the comparison therefore come from the environment the process is actually running
+ * in, and a caller cannot make them agree by handing one of them in. A version of this that
+ * accepted the local id as a parameter would agree with whatever a test injected and could never
+ * fail — the shape that let 13 green tests sit on top of an open hole in the sibling fix.
+ *
+ * A missing / unreadable `instance.json` is a REFUSAL, not a permit: this HOME has not been
+ * admitted, so nothing may bind an outbox under it (brick 42b4fb28; the ladder in 507a1c38 —
+ * missing or unresolved locator ⇒ hard error, never a fallback). Production never reaches this
+ * state, because acpx-ui mints the record before it starts the trigger owner and leaves the owner
+ * OFF when the mint fails (acpx-ui `server/index.ts` → `bootInstanceRecord()`).
+ */
+/**
+ * The meta rows that decide which instance owns an outbox. Writing either of these IS the bind;
+ * `BrickOutbox.setMeta` refuses both unless `admitInstanceIdentity` has checked them first.
+ */
+const IDENTITY_META_KEYS = new Set(["instance_id", "projection_identity"]);
+
+function admittedInstanceId(): string {
+  try {
+    return readLocalIdentity().instance_id;
+  } catch (error) {
+    if (error instanceof OutboxError) {
+      throw error;
+    }
+    throw new OutboxError(
+      "outbox-home-unadmitted",
+      `this HOME has no admitted instance identity at ${path.join(os.homedir(), ".acpx", "instance.json")}, so nothing may bind an outbox under it: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 function projectionAgentType(record: DiskRecord): string | null {
   // agent_command is a string in every real session record; non-strings stringify to a
   // value no agent-type prefix regex below can match, so "" is the same observable result.
@@ -569,6 +606,8 @@ export class BrickOutbox {
   readonly sessionsDir: string;
   private readonly db: DatabaseSync;
   private userGateDepth = 0;
+  /** Open only inside `admitInstanceIdentity`, after its check has passed. See `setMeta`. */
+  private admittingIdentity = false;
 
   constructor() {
     const directory = path.join(os.homedir(), ".acpx");
@@ -652,9 +691,71 @@ export class BrickOutbox {
       if (previous && previous !== identity.instance_id) {
         throw new OutboxError("outbox-instance-mismatch", "outbox belongs to another instance");
       }
-      this.setMeta("instance_id", identity.instance_id);
-      this.setMeta("projection_identity", JSON.stringify(identity));
+      this.admitInstanceIdentity(identity.instance_id, identity);
     });
+  }
+
+  /**
+   * ⚠️ THE ONLY WRITER of this outbox's two identity meta rows (`instance_id`,
+   * `projection_identity`) — and therefore the only place the HOME check has to live. Guarding
+   * `bindIdentity` alone would guard an IDENTIFIER; the capability is *writing an identity into
+   * the meta of the outbox under this HOME*, and `checkProjectionInstance` reaches it too, from
+   * the PUBLIC `prepareProjection(id, record, identity)` whose identity is caller-supplied.
+   *
+   * ⚠️ DO NOT ADD A `setMeta("instance_id", …)` OR `setMeta("projection_identity", …)` ANYWHERE
+   * ELSE IN THIS CLASS. It looks like a harmless shortcut and it is the bug: on 2026-09-15 an
+   * acpx-ui test bound the fixture identity `i-twin0000001` into devbox's real outbox and every
+   * session-mutating operation on the box failed for ~80 minutes with `identity binding differs
+   * from instance.json` (bricks 507a1c38 / 42b4fb28). `test/brick-outbox-bind-guard.test.ts`
+   * enumerates the occurrences and goes red on a second writer.
+   *
+   * The refusal is ABSENCE-PROOF: `admittedInstanceId()` derives the admitted id from
+   * `os.homedir()` and throws when it cannot, so there is no configuration whose absence turns
+   * this into a permit, and no environment variable selects the permissive branch.
+   */
+  private admitInstanceIdentity(
+    instanceId: string,
+    projection?: { instance_id: string; box: string; public_base_url: string },
+  ): void {
+    const admitted = admittedInstanceId();
+    if (instanceId !== admitted) {
+      throw new OutboxError(
+        "outbox-foreign-bind",
+        `refusing to bind ${instanceId} into ${this.dbPath}: ${path.join(os.homedir(), ".acpx", "instance.json")} admits ${admitted}. An outbox under a HOME may only carry that HOME's own instance identity — mint an isolated HOME for this process instead of writing into the box's own (brick 42b4fb28).`,
+      );
+    }
+    // ⚠️ SERIALISE BEFORE OPENING THE WINDOW, NOT INSIDE IT. `projection` is the caller's object,
+    // so `JSON.stringify` can run caller code via `toJSON` — and run it while the door is open,
+    // which is exactly the re-entry that would let an unchecked identity through. Below the
+    // assignment, nothing but two `setMeta` calls executes, and neither evaluates caller code.
+    const encoded = projection === undefined ? null : JSON.stringify(projection);
+    // 🛑 AND THEN CHECK THE BYTES, NOT THE ARGUMENT. `projection_identity` — not the scalar above —
+    // is the row `identityForRecord` compares against instance.json, so it is the row whose
+    // poisoning wedges the box. `toJSON` can return an identity that has nothing to do with the
+    // `instanceId` just admitted: measured at acpx 6a0ab15, a `toJSON` returning
+    // `i-twin0000001`/`f32-twin`/`https://fixture.invalid` made bindIdentity SUCCEED while writing
+    // exactly the 2026-09-15 payload, and the very next `identityForRecord` threw
+    // `identity binding differs from instance.json` — the outage error, straight through the guard.
+    // ⚠️ DO NOT "SIMPLIFY" THIS TO A CHECK ON `projection.instance_id`. That is the argument again,
+    // and it is the bug: the argument and the serialised bytes are not the same value.
+    if (encoded !== null) {
+      const written = JSON.parse(encoded) as { instance_id?: unknown };
+      if (written.instance_id !== admitted) {
+        throw new OutboxError(
+          "outbox-foreign-bind",
+          `refusing to write a projection identity for ${String(written.instance_id)} into ${this.dbPath}: ${path.join(os.homedir(), ".acpx", "instance.json")} admits ${admitted}. The serialised identity disagrees with the one that was checked (brick 42b4fb28).`,
+        );
+      }
+    }
+    this.admittingIdentity = true;
+    try {
+      this.setMeta("instance_id", instanceId);
+      if (encoded !== null) {
+        this.setMeta("projection_identity", encoded);
+      }
+    } finally {
+      this.admittingIdentity = false;
+    }
   }
   identityForRecord(record: DiskRecord): ProjectionIdentity {
     const encoded = this.meta("projection_identity");
@@ -668,9 +769,21 @@ export class BrickOutbox {
     };
     const basic = projectionIdentity(record, bound);
     if (bound.instance_id !== basic.instance_id) {
+      const instanceJsonPath = path.join(os.homedir(), ".acpx", "instance.json");
       throw new OutboxError(
         "outbox-instance-mismatch",
-        "identity binding differs from instance.json",
+        `${this.dbPath} is bound to instance ${bound.instance_id}, but ${instanceJsonPath} now ` +
+          `reports ${basic.instance_id} — every session-mutating operation on this HOME will keep ` +
+          `failing until the stale binding is cleared (brick 7d03eca1). This means either ` +
+          `instance.json was re-minted under an outbox that survived it (a HOME wipe, a restore ` +
+          `from a mismatched backup, or a fresh provision onto a PVC that already carries this ` +
+          `outbox) or the outbox was bound to the wrong identity by mistake — read the ` +
+          `\`meta\` table before acting either way. Recovery (verified 2026-09-15, incident ` +
+          `507a1c38): back up ${this.dbPath}, confirm the mismatch by reading its \`meta\` table, ` +
+          `then run \`DELETE FROM meta WHERE key IN ('instance_id','projection_identity')\` — this ` +
+          `returns the outbox to its pristine unbound state and the next write re-adopts the live ` +
+          `identity. Full procedure: acpx skill → "Recovering a wedged outbox after an ` +
+          `instance.json re-mint".`,
       );
     }
     const url = new URL(bound.public_base_url);
@@ -1074,6 +1187,18 @@ export class BrickOutbox {
     return row ? String(row.value) : null;
   }
   private setMeta(key: string, value: string): void {
+    // The identity rows are not ordinary meta. Anything that writes one decides which instance
+    // this outbox belongs to, so it must have been checked against this HOME's instance.json
+    // first — `admitInstanceIdentity` is the only caller allowed to open this door, and it opens
+    // it only after the check passes. A future writer that spells the key some other way
+    // (computed, aliased, destructured) still lands here, so this refuses by construction rather
+    // than by anyone remembering the rule. Brick 42b4fb28.
+    if (!this.admittingIdentity && IDENTITY_META_KEYS.has(key)) {
+      throw new OutboxError(
+        "outbox-identity-meta-bypass",
+        `meta.${key} decides which instance owns ${this.dbPath} and may only be written through admitInstanceIdentity(), which checks it against this HOME's instance.json (brick 42b4fb28)`,
+      );
+    }
     this.db
       .prepare(
         "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -1289,7 +1414,7 @@ export class BrickOutbox {
     if (stored && stored !== id) {
       throw new OutboxError("outbox-instance-mismatch", "outbox belongs to another instance");
     }
-    this.setMeta("instance_id", id);
+    this.admitInstanceIdentity(id);
   }
   private nextProjectionCounter(
     id: string,

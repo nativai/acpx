@@ -130,7 +130,22 @@ export async function withSessionIndexLock<T>(
   sessionDir: string,
   fn: () => Promise<T>,
 ): Promise<T> {
-  const lockPath = sessionIndexLockPath(sessionDir);
+  return await withAdvisoryLock(sessionIndexLockPath(sessionDir), fn);
+}
+
+/**
+ * The protocol above, at an arbitrary lock path.
+ *
+ * Extracted so the cold-archive tier's `ARCHIVE-INDEX/.lock` can REUSE this
+ * implementation rather than re-derive it (conception `archive-formats.md` §4.4.1
+ * is explicit: "Reuse, do not re-derive"). Every property documented at the top of
+ * this file — `O_CREAT|O_EXCL` create, the `{"pid","ts"}` body, 5 s stale
+ * takeover, ~2 s max wait then PROCEED UNLOCKED, in-process queueing and
+ * AsyncLocalStorage re-entrancy — is the same code for both callers, which is the
+ * only way "the exact protocol of index.json.lock" stays true as this file
+ * changes.
+ */
+export async function withAdvisoryLock<T>(lockPath: string, fn: () => Promise<T>): Promise<T> {
   const held = heldLockPaths.getStore();
   if (held?.has(lockPath)) {
     return await fn();

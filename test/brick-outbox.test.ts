@@ -74,7 +74,14 @@ test("B14 live holder beyond 5 seconds and owner-death recovery", () => {
       cwd: process.cwd(),
       env: { PATH: process.env.PATH, HOME: home },
       encoding: "utf8",
-      timeout: 15000,
+      // The proof is FOUR deliberate >5s liveness waits, so the child takes ~14.1s BY DESIGN.
+      // Measured quiet (env -i, idle box, 10 runs/arm): median 14073ms on dev, 14109ms with the
+      // 42b4fb28 bind guard — a 0.59% delta, five times smaller than one arm's own 421ms spread.
+      // Against the old 15000ms that left ~4% headroom, so under suite load this timed out
+      // intermittently forever: spawnSync kills the child and returns status null, surfacing as
+      // a bare "null !== 0" with empty output. Do NOT "fix" this by shortening the waits —
+      // the waits are the thing under test. 60s is ~4x the measured duration.
+      timeout: 60000,
     },
   );
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);

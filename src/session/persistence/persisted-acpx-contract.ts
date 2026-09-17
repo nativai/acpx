@@ -154,6 +154,8 @@ export const PERSISTED_ACPX_SENTINEL = {
   session_options: {
     model: "sentinel-option-model",
     allowed_tools: ["sentinel-allowed-tool"],
+    disallowed_tools: ["sentinel-disallowed-tool"],
+    skills: ["sentinel-skill"],
     max_turns: 7,
     system_prompt: "sentinel-system-prompt",
     subscription: "sentinel-subscription",
