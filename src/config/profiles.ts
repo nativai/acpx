@@ -2,7 +2,6 @@ import {
   chmodSync,
   copyFileSync,
   existsSync,
-  mkdirSync,
   readFileSync,
   realpathSync,
   writeFileSync,
@@ -18,14 +17,9 @@ import {
 } from "./subscriptions.js";
 
 export type AdapterId = "claude" | "claude-pty" | "codex";
-export type AuthMode = "subscription" | "openrouter" | "chatgpt" | "claude-home";
+export type AuthMode = "subscription" | "chatgpt" | "claude-home";
 export type ProfileId = string;
 export type AccountId = string;
-
-/** Effort levels valid for OpenRouter profiles with reasoningSupported=true. */
-export const OPENROUTER_REASONING_EFFORTS = ["minimal", "low", "medium", "high"] as const;
-export type OpenRouterReasoningEffort = (typeof OPENROUTER_REASONING_EFFORTS)[number];
-export type ReasoningEffort = OpenRouterReasoningEffort;
 
 export type ProvisioningOverride = Record<string, unknown>;
 
@@ -53,17 +47,6 @@ export type SubscriptionProfileEntry = CommonProfileFields & {
   lockedBy?: string;
 };
 
-export type OpenRouterProfileEntry = CommonProfileFields & {
-  authMode: "openrouter";
-  adapter: "claude";
-  model: string;
-  credentialSource: null;
-  openRouterApiKeyEnv?: string;
-  openRouterApiKey?: string;
-  reasoningEffort?: OpenRouterReasoningEffort;
-  reasoningSupported?: boolean;
-};
-
 export type ClaudeHomeProfileEntry = CommonProfileFields & {
   authMode: "claude-home";
   adapter: "claude-pty";
@@ -79,11 +62,7 @@ export type ChatGptProfileEntry = CommonProfileFields & {
   codexHome: string;
 };
 
-export type ProfileEntry =
-  | SubscriptionProfileEntry
-  | OpenRouterProfileEntry
-  | ClaudeHomeProfileEntry
-  | ChatGptProfileEntry;
+export type ProfileEntry = SubscriptionProfileEntry | ClaudeHomeProfileEntry | ChatGptProfileEntry;
 export type ResolvedProfile = ProfileEntry;
 
 export type EffectiveResolution = {
@@ -134,22 +113,12 @@ function nonEmptyString(value: unknown): string | undefined {
 }
 
 function isValidAuthMode(value: unknown): value is AuthMode {
-  return (
-    value === "subscription" ||
-    value === "openrouter" ||
-    value === "chatgpt" ||
-    value === "claude-home"
-  );
-}
-
-function isValidOpenRouterReasoningEffort(value: unknown): value is OpenRouterReasoningEffort {
-  return (OPENROUTER_REASONING_EFFORTS as readonly unknown[]).includes(value);
+  return value === "subscription" || value === "chatgpt" || value === "claude-home";
 }
 
 export function adapterForAuthMode(authMode: AuthMode): AdapterId {
   switch (authMode) {
     case "subscription":
-    case "openrouter":
       return "claude";
     case "claude-home":
       return "claude-pty";
@@ -275,71 +244,6 @@ function normalizeSubscriptionProfile(
   };
 }
 
-function normalizeOpenRouterProfile(
-  raw: Record<string, unknown>,
-  common: CommonProfileFields,
-): NormalizeProfileResult {
-  const model = nonEmptyString(raw.model);
-  if (!model) {
-    return quarantine(raw, `profile "${common.id}" openrouter auth requires model`, common.id);
-  }
-  const credentials = openRouterCredentialFields(raw, common.id);
-  if ("quarantine" in credentials) {
-    return credentials;
-  }
-  const reasoning = openRouterReasoningFields(raw, common.id);
-  if ("quarantine" in reasoning) {
-    return reasoning;
-  }
-  return {
-    profile: {
-      ...common,
-      authMode: "openrouter",
-      adapter: "claude",
-      credentialSource: null,
-      model,
-      ...credentials,
-      ...reasoning,
-    },
-  };
-}
-
-function openRouterCredentialFields(
-  raw: Record<string, unknown>,
-  id: string,
-):
-  | Pick<OpenRouterProfileEntry, "openRouterApiKey" | "openRouterApiKeyEnv">
-  | NormalizeProfileQuarantine {
-  const openRouterApiKey = nonEmptyString(raw.openRouterApiKey);
-  const openRouterApiKeyEnv = nonEmptyString(raw.openRouterApiKeyEnv);
-  if (!openRouterApiKey && !openRouterApiKeyEnv) {
-    return quarantine(
-      raw,
-      `profile "${id}" openrouter auth requires openRouterApiKey or openRouterApiKeyEnv`,
-      id,
-    );
-  }
-  return {
-    ...(openRouterApiKey !== undefined ? { openRouterApiKey } : {}),
-    ...(openRouterApiKeyEnv !== undefined ? { openRouterApiKeyEnv } : {}),
-  };
-}
-
-function openRouterReasoningFields(
-  raw: Record<string, unknown>,
-  id: string,
-):
-  | Pick<OpenRouterProfileEntry, "reasoningEffort" | "reasoningSupported">
-  | NormalizeProfileQuarantine {
-  if (raw.reasoningEffort !== undefined && !isValidOpenRouterReasoningEffort(raw.reasoningEffort)) {
-    return quarantine(raw, `profile "${id}" has invalid OpenRouter reasoningEffort`, id);
-  }
-  return {
-    ...(raw.reasoningEffort !== undefined ? { reasoningEffort: raw.reasoningEffort } : {}),
-    ...(raw.reasoningSupported === true ? { reasoningSupported: true } : {}),
-  };
-}
-
 function normalizeClaudeHomeProfile(
   raw: Record<string, unknown>,
   common: CommonProfileFields,
@@ -386,8 +290,6 @@ function normalizeProfileEntry(value: unknown, homeDir: string): NormalizeProfil
   switch (envelope.authMode) {
     case "subscription":
       return normalizeSubscriptionProfile(envelope.raw, homeDir, common);
-    case "openrouter":
-      return normalizeOpenRouterProfile(envelope.raw, common);
     case "claude-home":
       return normalizeClaudeHomeProfile(envelope.raw, common);
     case "chatgpt":
@@ -444,16 +346,6 @@ function serializeProfileForRegistry(profile: ProfileEntry): Record<string, unkn
       locked: profile.locked,
       lockedAt: profile.lockedAt,
       lockedBy: profile.lockedBy,
-    };
-  }
-  if (profile.authMode === "openrouter") {
-    return {
-      ...common,
-      model: profile.model,
-      openRouterApiKeyEnv: profile.openRouterApiKeyEnv,
-      openRouterApiKey: profile.openRouterApiKey,
-      reasoningSupported: profile.reasoningSupported,
-      reasoningEffort: profile.reasoningEffort,
     };
   }
   if (profile.authMode === "claude-home") {
@@ -786,15 +678,11 @@ export function isSubscriptionProfileLocked(
  * Return the valid effort levels for a profile, or null when reasoning is not
  * applicable (used by CLI validation and the `profiles` discovery command).
  * - subscription / claude-home -> Claude set: low/medium/high/xhigh/max
- * - openrouter + reasoningSupported -> OR set: minimal/low/medium/high
- * - openrouter without reasoningSupported -> null
+ * - chatgpt -> null
  */
 export function getValidEffortsForProfile(profile: ProfileEntry): readonly string[] | null {
   if (profile.authMode === "subscription" || profile.authMode === "claude-home") {
     return ["low", "medium", "high", "xhigh", "max"];
-  }
-  if (profile.authMode === "openrouter" && profile.reasoningSupported) {
-    return OPENROUTER_REASONING_EFFORTS;
   }
   return null;
 }
@@ -831,13 +719,6 @@ export function isClaudeHomeProfileId(
   return findProfile(trimmed, loadProfileRegistry(options))?.authMode === "claude-home";
 }
 
-/** Ensure the temp config dir for an openrouter session exists and return its path. */
-export function ensureOpenRouterConfigDir(sessionId: string): string {
-  const dir = path.join(os.tmpdir(), `or-${sessionId}`);
-  mkdirSync(dir, { recursive: true });
-  return dir;
-}
-
 export async function loadResolvedProfiles(
   options?: SubscriptionLookupOptions,
 ): Promise<ResolvedProfile[]> {
@@ -871,7 +752,6 @@ export function transcriptAnchorDir(profile: ResolvedProfile): string | null {
       return profile.credentialSource;
     case "claude-home":
       return path.join(profile.homePath, ".claude");
-    case "openrouter":
     case "chatgpt":
       return null;
   }
@@ -954,9 +834,6 @@ function effectiveResolutionForProfile(
   physicalDir: string,
   registry: ProfileRegistry,
 ): Pick<EffectiveResolution, "effectiveAccount" | "method"> {
-  if (selectedProfile?.authMode === "openrouter") {
-    return { effectiveAccount: selectedProfile.account, method: "selection" };
-  }
   if (selectedProfile?.authMode === "chatgpt") {
     return {
       effectiveAccount: resolveChatGptPhysicalAccountFromRegistry(physicalDir, registry),

@@ -125,14 +125,11 @@ test("W5 migration: hybrid registry unions v1 subscriptions and quarantines clau
       profiles: [
         { id: "sub1", label: "One", harness: "claude", authMode: "subscription" },
         {
-          id: "openrouter-test",
-          label: "OR",
+          id: "home-test",
+          label: "Home",
           harness: "claude",
-          authMode: "openrouter",
-          model: "anthropic/claude-3-5-sonnet",
-          openRouterApiKey: "test-key-never-logged",
-          reasoningSupported: true,
-          reasoningEffort: "minimal",
+          authMode: "claude-home",
+          homePath: "/workspace/projects/temp/w5-selftest/home-test",
         },
         {
           id: "claude-deepseek",
@@ -155,7 +152,7 @@ test("W5 migration: hybrid registry unions v1 subscriptions and quarantines clau
         });
         assert.deepEqual(
           registry.profiles.map((profile) => profile.id),
-          ["sub1", "openrouter-test", "sub2"],
+          ["sub1", "home-test", "sub2"],
         );
         assert.equal(registry.quarantined?.length, 1);
         assert.match(registry.quarantined?.[0]?.reason ?? "", /legacy harness conflicts/);
@@ -327,14 +324,6 @@ test("W5 seam contract: siblings, transcript anchors, and physical account verif
           homePath: "__HOME2__",
         },
         {
-          id: "openrouter1",
-          label: "OpenRouter One",
-          authMode: "openrouter",
-          account: "or-a",
-          model: "anthropic/claude-3-5-sonnet",
-          openRouterApiKey: "test-key",
-        },
-        {
           id: "codex1",
           label: "Codex One",
           authMode: "chatgpt",
@@ -384,7 +373,6 @@ test("W5 seam contract: siblings, transcript anchors, and physical account verif
           ["sub3-same-account", "claude"],
           ["home1", "claude-pty"],
           ["home2", "claude-pty"],
-          ["openrouter1", "claude"],
           ["codex1", "codex"],
         ],
       );
@@ -421,15 +409,6 @@ test("W5 seam contract: siblings, transcript anchors, and physical account verif
       assert.equal(mismatch.effectiveAccount, "acct-a");
       assert.equal(mismatch.method, "path");
       assert.equal(mismatch.verified, false);
-
-      const openrouter = await verifyEffectiveResolution(
-        { acpx: { session_options: { profile: "openrouter1" } } },
-        { CLAUDE_CONFIG_DIR: path.join(ctx.homeDir, "tmp", "or-session") },
-        lookup,
-      );
-      assert.equal(openrouter.effectiveAccount, "or-a");
-      assert.equal(openrouter.method, "selection");
-      assert.equal(openrouter.verified, true);
 
       const chatgpt = await verifyEffectiveResolution(
         { acpx: { session_options: { profile: "codex1" } } },

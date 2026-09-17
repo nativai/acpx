@@ -558,8 +558,6 @@ function profileAnchor(profile: ProfileEntry, env: NodeJS.ProcessEnv): string | 
   switch (profile.authMode) {
     case "subscription":
       return env.CLAUDE_CONFIG_DIR ?? profile.credentialSource;
-    case "openrouter":
-      return env.CLAUDE_CONFIG_DIR;
     case "claude-home":
       return path.join(profile.homePath, ".claude");
     case "chatgpt":

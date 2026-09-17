@@ -340,7 +340,13 @@ function refuseOrStandAside(
  * genuinely unknown slug (`otherHarnessError` vs `unknownSlugError`), which is
  * what makes returning it safe rather than merely stricter.
  */
-function candidatesFor(
+/**
+ * Exported for {@link "../session/model-ladder.js"}'s READ-side reuse (`acpx
+ * status --json`'s catalogue-derived effort ceiling): the exact same
+ * source/agent-type narrowing the create-path gate uses, so the two can never
+ * disagree about which rows are candidates for a given pin.
+ */
+export function candidatesFor(
   byId: CatalogueModel[],
   ref: ParsedModelRef,
   agentName: string | undefined,

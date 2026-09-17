@@ -1457,6 +1457,16 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     return null;
   }
 
+  const parentSetAt = normalizeOptionalString(record.parent_set_at);
+  if (parentSetAt === null) {
+    return null;
+  }
+
+  const spawnedBySessionId = normalizeOptionalString(record.spawned_by_session_id);
+  if (spawnedBySessionId === null) {
+    return null;
+  }
+
   const forkedFromSessionId = normalizeOptionalString(record.forked_from_session_id);
   if (forkedFromSessionId === null) {
     return null;
@@ -1519,6 +1529,8 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
       kind,
       parentSessionId: parentSessionId ?? undefined,
       parentSessionUrl: parentSessionUrl ?? undefined,
+      parentSetAt: parentSetAt ?? undefined,
+      spawnedBySessionId: spawnedBySessionId ?? undefined,
       forkedFromSessionId: forkedFromSessionId ?? undefined,
       forkedAtMessageIndex: forkedAtMessageIndex ?? undefined,
       forkedAtMessageIndexRequested: forkedAtMessageIndexRequested ?? undefined,

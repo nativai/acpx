@@ -5,7 +5,6 @@ import path from "node:path";
 import test from "node:test";
 import { ARBITRARY_MODEL_SUPPORT_ROUTED_BY_ACPX } from "../src/acp/harness-capabilities.js";
 import {
-  assertNoOpenRouterProfileConflict,
   harnessRoutesModelViaShim,
   openRouterBoxCredentialMissing,
   resolveOpenRouterBoxCredential,
@@ -274,45 +273,18 @@ test("with no provider entry the ambient variable is the last resort, then it re
   assert.equal(refusal.detailCode, "OPENROUTER_BOX_CREDENTIAL_MISSING");
 });
 
-// ── The conflict ─────────────────────────────────────────────────────────────
-
-test("a profile AND a picker-chosen OpenRouter model is refused, naming both accounts", () => {
-  // A5. Two accounts, two budgets, no defensible silent winner. USAGE, not
-  // RUNTIME: it is a caller input error, so acpx-ui renders an actionable notice
-  // rather than an internal-error card.
-  assert.throws(
-    () =>
-      assertNoOpenRouterProfileConflict({
-        profileId: "openrouter-deepseek",
-        routeModel: "some-vendor/some-model",
-      }),
-    (error: Error & { outputCode?: string; detailCode?: string }) => {
-      assert.equal(error.outputCode, "USAGE");
-      assert.equal(error.detailCode, "OPENROUTER_ROUTE_CONFLICT");
-      assert.match(error.message, /openrouter-deepseek/);
-      assert.match(error.message, /some-vendor\/some-model/);
-      assert.match(error.message, /providers\.json/, "the box key must be named, not implied");
-      return true;
-    },
-  );
-});
-
 // ── The DECISION — the composition, not the pieces ───────────────────────────
 
 /**
- * te-live's three probes, plus the two name-shaped decoys.
+ * te-live's probe fixture (brick 069fdebe), trimmed of the `openrouter`-authMode
+ * rows brick 777b4be7 retired: no profile kind can be an OpenRouter account
+ * anymore, so the two-accounts refusal this fixture used to also exercise is
+ * gone, and with it the need for decoy ids that looked like one kind and
+ * recorded another.
  *
- * ⚠️ THE REGISTRY IS INJECTED, NEVER READ FROM THE BOX. The profile's KIND is
- * what the two-accounts guard turns on, so a test that fell back to the real
- * `~/.acpx/subscriptions/` registry would be asserting a fact about this box —
- * and would go green or red as someone else edited their profiles.
- *
- * ⚠️ `sub-that-is-openrouter` AND `openrouter-that-is-a-subscription` ARE THE
- * POINT. On this box `sub3`/`sub5` happen to look like subscriptions and
- * `openrouter-deepseek` happens to look like OpenRouter, so a NAME-shaped
- * implementation passes all three real probes and breaks on the first profile
- * someone names differently. These two rows are the only ones that can tell a
- * kind-shaped implementation from a name-shaped one.
+ * ⚠️ THE REGISTRY IS INJECTED, NEVER READ FROM THE BOX. A test that fell back to
+ * the real `~/.acpx/subscriptions/` registry would be asserting a fact about
+ * this box — and would go green or red as someone else edited their profiles.
  */
 function profileFixture(): ProfileRegistry {
   const common = { account: "acct", adapter: "claude" as const };
@@ -322,30 +294,6 @@ function profileFixture(): ProfileRegistry {
     profiles: [
       { ...common, id: "sub3", label: "sub3", authMode: "subscription", credentialSource: "a" },
       { ...common, id: "sub5", label: "sub5", authMode: "subscription", credentialSource: "b" },
-      {
-        ...common,
-        id: "openrouter-deepseek",
-        label: "OpenRouter — DeepSeek V4 Pro",
-        authMode: "openrouter",
-        model: "deepseek/deepseek-v4-pro",
-        credentialSource: null,
-      },
-      // The decoys: name says one kind, record says the other.
-      {
-        ...common,
-        id: "sub-that-is-openrouter",
-        label: "decoy",
-        authMode: "openrouter",
-        model: "deepseek/deepseek-v4-pro",
-        credentialSource: null,
-      },
-      {
-        ...common,
-        id: "openrouter-that-is-a-subscription",
-        label: "decoy",
-        authMode: "subscription",
-        credentialSource: "c",
-      },
     ],
   };
 }
@@ -372,10 +320,10 @@ test("the route decision: profile, picker, none — and the ORDER that decides t
     await resolveOpenRouterRoute({
       agentCommand: "claude-agent-acp",
       model: undefined,
-      profileId: "openrouter-deepseek",
+      profileId: "sub5",
       options,
     }),
-    { kind: "profile", profileId: "openrouter-deepseek" },
+    { kind: "profile", profileId: "sub5" },
     "a profile with no picked model keeps the LEGACY route, unchanged",
   );
   assert.deepEqual(
@@ -395,18 +343,14 @@ test("the route decision: profile, picker, none — and the ORDER that decides t
     await resolveOpenRouterRoute({
       agentCommand: "claude-agent-acp",
       model: "sonnet",
-      profileId: "openrouter-deepseek",
+      profileId: "sub5",
       options,
     }),
-    { kind: "profile", profileId: "openrouter-deepseek" },
+    { kind: "profile", profileId: "sub5" },
   );
 });
 
-// ── te-live's three probes, one test each ────────────────────────────────────
-//
-// ⚠️ ALL THREE ROWS ARE HERE, NOT JUST THE ONE THAT WAS WRONG. A test that only
-// covered the fixed case could not tell "predicate narrowed" from "guard
-// deleted" — probe 3's refusal is what proves the guard still exists.
+// ── te-live's probe, still true post-retirement ──────────────────────────────
 
 test("PROBE 1 — a SUBSCRIPTION profile plus an OpenRouter model MUST PASS (the dead end)", async () => {
   // THE DEFECT. Measured by te-live on the deployed build: `sub3`
@@ -437,74 +381,6 @@ test("PROBE 1 — a SUBSCRIPTION profile plus an OpenRouter model MUST PASS (the
       `${profileId} is a subscription — it must not be read as a second OpenRouter account`,
     );
   }
-});
-
-test("PROBE 2 — an OpenRouter profile with NO model keeps the legacy route", async () => {
-  // te-live measured 200 on the deployed build; this must stay true.
-  assert.deepEqual(
-    await resolveOpenRouterRoute({
-      agentCommand: "claude-agent-acp",
-      model: undefined,
-      profileId: "openrouter-deepseek",
-      options: { catalogue: catalogue(), profileRegistry: profileFixture() },
-    }),
-    { kind: "profile", profileId: "openrouter-deepseek" },
-  );
-});
-
-test("PROBE 3 — an OpenRouter profile PLUS an OpenRouter model is still REFUSED", async () => {
-  // ⚠️ THE ROW THAT PROVES THE PREDICATE WAS NARROWED RATHER THAN DELETED. And it
-  // asserts the REASON, not merely that something threw: a refusal for an
-  // unrelated cause would otherwise read as a pass.
-  await assert.rejects(
-    resolveOpenRouterRoute({
-      agentCommand: "claude-agent-acp",
-      model: anOpenRouterId(),
-      profileId: "openrouter-deepseek",
-      options: { catalogue: catalogue(), profileRegistry: profileFixture() },
-    }),
-    (error: Error & { detailCode?: string; outputCode?: string }) => {
-      assert.equal(error.detailCode, "OPENROUTER_ROUTE_CONFLICT");
-      assert.equal(error.outputCode, "USAGE");
-      return true;
-    },
-  );
-});
-
-test("the KIND decides, not the NAME — both decoys, in both directions", async () => {
-  // The two rows a name-shaped implementation fails and the three real probes
-  // cannot catch. Without these, "does it read the record?" is untested.
-  const options = { catalogue: catalogue(), profileRegistry: profileFixture() };
-  const model = anOpenRouterId();
-
-  await assert.rejects(
-    resolveOpenRouterRoute({
-      agentCommand: "claude-agent-acp",
-      model,
-      profileId: "sub-that-is-openrouter",
-      options,
-    }),
-    (error: Error & { detailCode?: string }) => {
-      assert.equal(error.detailCode, "OPENROUTER_ROUTE_CONFLICT");
-      return true;
-    },
-  );
-  assert.deepEqual(
-    await resolveOpenRouterRoute({
-      agentCommand: "claude-agent-acp",
-      model,
-      profileId: "openrouter-that-is-a-subscription",
-      options,
-    }),
-    {
-      kind: "picker",
-      model,
-      profileBypass: {
-        profileId: "openrouter-that-is-a-subscription",
-        reason: "not-an-openrouter-account",
-      },
-    },
-  );
 });
 
 test("an UNRESOLVABLE profile does not refuse on a guess — it takes the picker route", async () => {

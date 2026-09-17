@@ -4630,7 +4630,15 @@ test("explicit selectors stay global and a unique explicit name resolves across 
     assert.equal(statusByUrlPayload.acpxRecordId, recordId);
     assert.equal(statusByUrlPayload.model, "default");
     assert.deepEqual(statusByUrlPayload.availableModels, ["default", "opus"]);
-    assert.equal(statusByUrlPayload.reasoningEffort, "max");
+    // brick 3c018a4b Move A: reasoningEffort is now derived per-harness. This
+    // fixture's `agentCommand` is codex, so the correct source is the `[effort]`
+    // bracket on the model id — `desired_config_options.effort` (this fixture's
+    // "max") is a claude-shaped field a real codex record never sets, and is no
+    // longer read for codex. This fixture's `current_model_id` ("default") has
+    // no bracket, so the honestly-derivable answer is null (omitted from the
+    // JSON by assignDefinedJsonField, hence `undefined` once parsed), not the
+    // stale "max".
+    assert.equal(statusByUrlPayload.reasoningEffort, undefined);
     assert.equal(statusByUrlPayload.reasoningEffortLive, "high");
 
     const statusByIdSuffix = await runCli(
@@ -4643,7 +4651,8 @@ test("explicit selectors stay global and a unique explicit name resolves across 
       reasoningEffort?: unknown;
     };
     assert.equal(statusByIdSuffixPayload.acpxRecordId, recordId);
-    assert.equal(statusByIdSuffixPayload.reasoningEffort, "max");
+    // Same codex-bracket derivation as above — see the comment there.
+    assert.equal(statusByIdSuffixPayload.reasoningEffort, undefined);
 
     const showByUrl = await runCli(
       [

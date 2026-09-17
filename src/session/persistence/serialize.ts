@@ -85,6 +85,8 @@ export function serializeSessionRecordForDisk(
     kind: canonical.kind,
     parent_session_id: canonical.parentSessionId,
     parent_session_url: canonical.parentSessionUrl,
+    parent_set_at: canonical.parentSetAt,
+    spawned_by_session_id: canonical.spawnedBySessionId,
     forked_from_session_id: canonical.forkedFromSessionId,
     forked_at_message_index: canonical.forkedAtMessageIndex,
     forked_at_message_index_requested: canonical.forkedAtMessageIndexRequested,

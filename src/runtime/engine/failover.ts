@@ -573,7 +573,7 @@ function metadataFromProfile(profile: ResolvedProfile): EffectiveAccountMetadata
     effectiveAdapter: profile.adapter,
     effectiveAuthMode: profile.authMode,
     ...(anchor !== null ? { effectiveAnchor: anchor } : {}),
-    effectiveResolutionMethod: profile.authMode === "openrouter" ? "selection" : "path",
+    effectiveResolutionMethod: "path",
   };
 }
 

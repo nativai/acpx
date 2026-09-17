@@ -23,12 +23,10 @@ import {
   transcriptAnchorDir,
   type ChatGptProfileEntry,
   type ClaudeHomeProfileEntry,
-  type OpenRouterProfileEntry,
   type ProfileEntry,
   type ProfileRegistry,
   type SubscriptionProfileEntry,
 } from "../config/profiles.js";
-import { loadBoxProviders, resolveBoxProviderKey } from "../config/providers.js";
 import type { SubscriptionLookupOptions } from "../config/subscriptions.js";
 import {
   chooseSubscriptionConfigDir,
@@ -1110,8 +1108,6 @@ function verifyProfileEffectiveAccount(
       return verifyClaudeHomeProfileEffectiveAccount(env, expectedProfile, registry);
     case "chatgpt":
       return verifyChatGptProfileEffectiveAccount(env, expectedProfile, registry);
-    case "openrouter":
-      return stampProfileEffectiveAccount(env, expectedProfile, env.CLAUDE_CONFIG_DIR ?? "");
   }
 }
 
@@ -1381,17 +1377,15 @@ export function resolveConfiguredAuthCredential(
 }
 
 /**
- * Apply profile-based authentication to the env dict and return a ShimHandle
- * for openrouter profiles (caller must stop it when the session closes), or
- * null for subscription profiles. Called asynchronously after the synchronous
- * env build so the shim port is known before the adapter process spawns.
+ * Apply profile-based authentication to the env dict. Always returns null —
+ * every remaining profile kind (subscription, claude-home, chatgpt) authenticates
+ * by config-dir/env wiring, not a shim. (The OpenRouter picker route starts its
+ * own shim separately, via `startOpenRouterShimForSession` — untouched by this
+ * function.)
  *
- * reasoningEffortOverride: per-session effort from --reasoning-effort; overrides
- * the profile's default reasoningEffort for openrouter profiles. Validated
+ * reasoningEffortOverride: per-session effort from --reasoning-effort; validated
  * against the profile's valid effort set — throws on mismatch so the caller
  * gets a clear error rather than a silently wrong effort level.
- *
- * Constraint: openRouterApiKey must never appear in logs or process output.
  */
 // Validate that an explicit effort override is in the selected profile's valid
 // set; throws with a clear, user-facing error listing the valid levels.
@@ -1624,71 +1618,6 @@ export function buildClaudeParentSessionMeta(
   return url ? { [INDEPENDENT_CLAUDE_PARENT_SESSION_URL_META_KEY]: url } : undefined;
 }
 
-// Handles the openrouter authMode branch of applyProfileAuth.
-//
-// Precedence, unchanged at the top and extended only at the bottom:
-//   1. `openRouterApiKeyEnv` resolved against THIS process's environment
-//   2. the box provider credential DECLARING that same variable name
-//   3. the literal `openRouterApiKey`
-//
-// ⚠️ STEP 2 IS WHY A PROFILE CAN POINT AT THE BOX KEY AT ALL, and without it the
-// indirection silently cannot reach it. `applyBoxProviderEnv` writes into the
-// CHILD spawn env; this function runs in the acpx PARENT and reads `process.env`,
-// which the child env never touches. So a profile carrying
-// `openRouterApiKeyEnv: "OPENROUTER_API_KEY"` on a box whose only copy of that
-// variable lives in providers.json would fall through to the literal — i.e. to
-// the second copy of the key that "one key on the box, one place it lives" exists
-// to eliminate. Matching on the provider's DECLARED `env` name (not on a
-// hardcoded provider id) keeps one convention: the profile names a VARIABLE, and
-// providers.json is what supplies that variable.
-//
-// Step 3 stays last so every profile that ships a literal today is untouched.
-//
-// Exported ONLY so `test/box-provider-profile-fallback.test.ts` can assert the
-// precedence directly. It is deliberately tested through its REAL resolution
-// (ACPX_STATE_HOME → providers.json) rather than through an injected path, so
-// the test cannot pass on a seam production does not use.
-export function resolveOpenRouterApiKey(profile: OpenRouterProfileEntry): string | undefined {
-  if (profile.openRouterApiKeyEnv) {
-    const envValue = process.env[profile.openRouterApiKeyEnv];
-    if (typeof envValue === "string" && envValue.trim().length > 0) {
-      return envValue;
-    }
-    const boxProvider = loadBoxProviders().providers.find(
-      (entry) => entry.env === profile.openRouterApiKeyEnv,
-    );
-    if (boxProvider) {
-      const boxKey = resolveBoxProviderKey(boxProvider);
-      if (boxKey) {
-        return boxKey;
-      }
-    }
-  }
-  return profile.openRouterApiKey;
-}
-
-async function applyOpenRouterProfileAuth(
-  env: NodeJS.ProcessEnv,
-  profileId: string,
-  sessionId: string,
-  profile: OpenRouterProfileEntry,
-  reasoningEffortOverride: string | null | undefined,
-): Promise<ShimHandle | null> {
-  const apiKey = resolveOpenRouterApiKey(profile);
-  const model = profile.model;
-  if (!apiKey || !model) {
-    throw new Error(
-      `[acpx] profile "${profileId}" is missing OpenRouter credentials or model; refusing to spawn under a different account`,
-    );
-  }
-
-  // Validate then resolve effort: per-session override > profile default.
-  const trimmedEffort = normalizedReasoningEffortOverride(reasoningEffortOverride);
-  const resolvedEffort = trimmedEffort ?? profile.reasoningEffort;
-
-  return await startOpenRouterShimForSession(env, sessionId, apiKey, model, resolvedEffort);
-}
-
 /**
  * Start the OpenRouter shim for a session and shape the spawn env around it.
  *
@@ -1880,24 +1809,6 @@ export async function applyProfileAuth(
       onWarning: onProvisioningWarning,
     });
     return null;
-  }
-
-  if (profile.authMode === "openrouter") {
-    const shim = await applyOpenRouterProfileAuth(
-      env,
-      trimmedId,
-      sessionId,
-      profile,
-      reasoningEffortOverride,
-    );
-    verifyProfileEffectiveAccount(env, profile, registry);
-    ensureProfileOsHarnessProvisioning({
-      registry,
-      profile,
-      env,
-      onWarning: onProvisioningWarning,
-    });
-    return shim;
   }
 
   if (profile.authMode === "chatgpt") {
