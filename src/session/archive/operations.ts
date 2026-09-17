@@ -191,7 +191,11 @@ export async function applyArchiveRun(options: ArchiveRunOptions): Promise<Archi
   if (firstRun && !options.allowFirstRun) {
     result.firstRunGated = true;
     result.warnings.push(
-      `no archive directory exists yet at ${context.archiveDir} — this is a FIRST RUN on this box, so nothing was applied. Review the plan above, then re-run with --allow-first-run (or set ACPX_ARCHIVE_ALLOW_FIRST_RUN=1) to apply.`,
+      // ⚠️ AN OPERATOR WHO STATED `--apply` AND GOT A DRY RUN WILL REASONABLY THINK
+      // THE FLAG IS BROKEN. D2 is doing exactly its job here, but the output has to
+      // say SO, and name the second opt-in — otherwise closing one
+      // confident-wrong-impression opens another.
+      `--apply was honoured, but D2 first-run gating held it: no archive directory exists yet at ${context.archiveDir}, so this is this box's FIRST run and nothing was moved. The plan above is what WOULD move. Re-run with --apply --allow-first-run (or set ACPX_ARCHIVE_ALLOW_FIRST_RUN=1) to apply it.`,
     );
     return result;
   }
