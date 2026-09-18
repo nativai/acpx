@@ -108,10 +108,7 @@ function nonEmptyEnvString(value: string | undefined): string | undefined {
 }
 
 function effectiveResolutionMethod(authMode: string | undefined): "path" | "selection" | undefined {
-  if (authMode === undefined) {
-    return undefined;
-  }
-  return authMode === "openrouter" ? "selection" : "path";
+  return authMode === undefined ? undefined : "path";
 }
 
 export function effectiveAccountMetadataFromEnv(
