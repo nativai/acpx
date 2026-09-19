@@ -620,7 +620,6 @@ also injects session identity variables when a saved session is involved:
 - `ACPX_SESSION_URL`: acpx-ui URL for this session, including `?session=<id>`.
 - `ACPX_PARENT_SESSION_URL`: parent session URL when lineage is known.
 - `ACPX_SESSION_NAME`: set only for named sessions; unset for unnamed sessions.
-- `ACPX_TASK_FOLDER`: task folder metadata when present on the session.
 - `ACPX_AGENT_FOLDER`: per-agent working folder when acpx creates one.
 
 Session storage path is derived from the OS home directory

@@ -92,7 +92,6 @@ export type SessionIndexEntry = {
    * green. CONCEPTION 9.3 leg 4.
    */
   forkedAtMessageIndexRequested?: number;
-  metadataTaskFolder?: string;
   metadataBrick?: string;
   metadataSpawnState?: string;
   // Infra-label (brick 2ac729a4): metadata.infra projected as hot-path scalars so
@@ -388,7 +387,6 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     forkedFromSessionId: optionalString(record.forkedFromSessionId),
     forkedAtMessageIndex: optionalFiniteNumber(record.forkedAtMessageIndex),
     forkedAtMessageIndexRequested: optionalFiniteNumber(record.forkedAtMessageIndexRequested),
-    metadataTaskFolder: optionalString(record.metadataTaskFolder),
     metadataBrick: optionalString(record.metadataBrick),
     metadataSpawnState: optionalString(record.metadataSpawnState),
     metadataInfra: optionalBoolean(record.metadataInfra),
@@ -559,7 +557,6 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     forkedFromSessionId: record.forkedFromSessionId,
     forkedAtMessageIndex: record.forkedAtMessageIndex,
     forkedAtMessageIndexRequested: record.forkedAtMessageIndexRequested,
-    metadataTaskFolder: metadata?.task_folder,
     metadataBrick: metadata?.brick,
     metadataSpawnState: metadata?.spawn_state,
     // Infra label (brick 2ac729a4): flat string keys → hot-path index scalars.

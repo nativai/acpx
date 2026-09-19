@@ -17,7 +17,7 @@ function recordWith(fields: Partial<SessionRecord>): SessionRecord {
   } as unknown as SessionRecord;
 }
 
-async function withTaskDir(run: (taskDir: string) => Promise<void> | void): Promise<void> {
+async function withBaseDir(run: (baseDir: string) => Promise<void> | void): Promise<void> {
   const taskDir = await fsp.mkdtemp(path.join(os.tmpdir(), "acpx-agent-folder-"));
   try {
     await run(taskDir);
@@ -55,43 +55,59 @@ test("sanitizeAgentFolderName caps the length at 64 characters", () => {
 
 // --- resolveAndEnsureAgentFolder ---
 
-test("resolveAndEnsureAgentFolder returns null when there is no usable task_folder", () => {
+test("resolveAndEnsureAgentFolder returns null when there is no usable brick path", () => {
   assert.equal(resolveAndEnsureAgentFolder(recordWith({})), null);
   assert.equal(resolveAndEnsureAgentFolder(recordWith({ metadata: {} })), null);
-  assert.equal(resolveAndEnsureAgentFolder(recordWith({ metadata: { task_folder: "   " } })), null);
+  assert.equal(resolveAndEnsureAgentFolder(recordWith({}), "   "), null);
 });
 
-test("resolveAndEnsureAgentFolder returns null for a non-absolute task_folder (no mkdir)", () => {
-  assert.equal(
-    resolveAndEnsureAgentFolder(recordWith({ metadata: { task_folder: "relative/task" } })),
-    null,
-  );
+test("resolveAndEnsureAgentFolder returns null for a non-absolute brick path (no mkdir)", () => {
+  assert.equal(resolveAndEnsureAgentFolder(recordWith({}), "relative/brick"), null);
 });
 
-test("resolveAndEnsureAgentFolder returns null and creates nothing when the task dir is missing", () => {
+test("resolveAndEnsureAgentFolder returns null and creates nothing when the brick dir is missing", () => {
   const missing = path.join(os.tmpdir(), "acpx-agent-folder-missing-7f3a1b9c2d");
-  assert.equal(
-    resolveAndEnsureAgentFolder(recordWith({ metadata: { task_folder: missing } })),
-    null,
-  );
+  assert.equal(resolveAndEnsureAgentFolder(recordWith({}), missing), null);
   assert.equal(fs.existsSync(missing), false);
 });
 
-test("resolveAndEnsureAgentFolder creates <task>/agents/<name>-<id8> and returns the absolute path", async () => {
-  await withTaskDir((taskDir) => {
+test("resolveAndEnsureAgentFolder creates <brick>/agents/<name>-<id8> and returns the absolute path", async () => {
+  await withBaseDir((brickDir) => {
     const record = recordWith({
       acpxRecordId: "f186ee80-aaaa-bbbb-cccc-dddddddddddd",
       name: "Conception Agent",
-      metadata: { task_folder: taskDir },
+      metadata: { brick: "11111111-2222-3333-4444-555555555555" },
     });
-    const expected = path.join(taskDir, "agents", "conception-agent-f186ee80");
-    assert.equal(resolveAndEnsureAgentFolder(record), expected);
+    const expected = path.join(brickDir, "agents", "conception-agent-f186ee80");
+    assert.equal(resolveAndEnsureAgentFolder(record, brickDir), expected);
     assert.ok(fs.statSync(expected).isDirectory());
   });
 });
 
-test("resolveAndEnsureAgentFolder prefers a usable brick path over task_folder", async () => {
-  await withTaskDir(async (taskDir) => {
+// brick b11f98fb — the legacy `metadata.task_folder` fallback is GONE. This is the
+// specimen the removal has to be proven against: a pre-removal record that still
+// carries the key, pointing at a directory that really exists. Before the removal
+// this returned `<taskDir>/agents/...` and created it; now it must return null and
+// create NOTHING, while the record itself loads and its live keys are untouched.
+test("resolveAndEnsureAgentFolder ignores a legacy metadata.task_folder entirely", async () => {
+  await withBaseDir((taskDir) => {
+    const record = recordWith({
+      acpxRecordId: "f186ee80-aaaa-bbbb-cccc-dddddddddddd",
+      name: "Legacy Agent",
+      metadata: { task_folder: taskDir },
+    });
+    assert.equal(resolveAndEnsureAgentFolder(record), null);
+    assert.equal(resolveAndEnsureAgentFolder(record, null), null);
+    assert.equal(fs.existsSync(path.join(taskDir, "agents")), false);
+    // The orphan key survives on the record — nothing migrates or strips it.
+    assert.equal((record.metadata as Record<string, string>).task_folder, taskDir);
+  });
+});
+
+// A live brick path still wins on a record that ALSO carries the legacy key, and the
+// folder lands under the brick — never under the stale task folder.
+test("resolveAndEnsureAgentFolder uses the brick path on a record that still has task_folder", async () => {
+  await withBaseDir(async (taskDir) => {
     const brickDir = await fsp.mkdtemp(path.join(os.tmpdir(), "acpx-agent-brick-"));
     try {
       const record = recordWith({
@@ -102,56 +118,9 @@ test("resolveAndEnsureAgentFolder prefers a usable brick path over task_folder",
       const expected = path.join(brickDir, "agents", "brick-agent-f186ee80");
       assert.equal(resolveAndEnsureAgentFolder(record, brickDir), expected);
       assert.ok(fs.statSync(expected).isDirectory());
+      assert.equal(fs.existsSync(path.join(taskDir, "agents")), false);
     } finally {
       await fsp.rm(brickDir, { recursive: true, force: true });
     }
-  });
-});
-
-test("resolveAndEnsureAgentFolder falls back to task_folder when brick path is unusable", async () => {
-  await withTaskDir((taskDir) => {
-    const record = recordWith({
-      acpxRecordId: "abcdef01-2222-3333-4444-555555555555",
-      name: "fallback",
-      metadata: { brick: "11111111-2222-3333-4444-555555555555", task_folder: taskDir },
-    });
-    const expected = path.join(taskDir, "agents", "fallback-abcdef01");
-    assert.equal(resolveAndEnsureAgentFolder(record, "/missing/brick/path"), expected);
-    assert.ok(fs.statSync(expected).isDirectory());
-  });
-});
-
-test("resolveAndEnsureAgentFolder falls back to the bare id8 when the name is empty", async () => {
-  await withTaskDir((taskDir) => {
-    const record = recordWith({
-      acpxRecordId: "abcdef01-2222-3333-4444-555555555555",
-      name: "   ",
-      metadata: { task_folder: taskDir },
-    });
-    const expected = path.join(taskDir, "agents", "abcdef01");
-    assert.equal(resolveAndEnsureAgentFolder(record), expected);
-    assert.ok(fs.statSync(expected).isDirectory());
-  });
-});
-
-test("resolveAndEnsureAgentFolder gives same-named sibling sessions distinct folders", async () => {
-  await withTaskDir((taskDir) => {
-    const a = resolveAndEnsureAgentFolder(
-      recordWith({
-        acpxRecordId: "11111111-aaaa-bbbb-cccc-dddddddddddd",
-        name: "conception",
-        metadata: { task_folder: taskDir },
-      }),
-    );
-    const b = resolveAndEnsureAgentFolder(
-      recordWith({
-        acpxRecordId: "22222222-aaaa-bbbb-cccc-dddddddddddd",
-        name: "conception",
-        metadata: { task_folder: taskDir },
-      }),
-    );
-    assert.equal(a, path.join(taskDir, "agents", "conception-11111111"));
-    assert.equal(b, path.join(taskDir, "agents", "conception-22222222"));
-    assert.notEqual(a, b);
   });
 });

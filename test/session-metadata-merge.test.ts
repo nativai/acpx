@@ -25,6 +25,10 @@ function record(id: string, overrides: Partial<SessionRecord> = {}): SessionReco
   };
 }
 
+// brick b11f98fb: `task_folder` here is the REMOVED legacy key, kept deliberately as
+// the specimen "unknown key sharing the bag with a live one". These cases are what
+// guarantee that an external metadata write never drops it — and, more importantly,
+// never drops the live `brick` key sitting beside it.
 test("mergeMetadataForPersist keeps persisted keys the owner did not change", () => {
   const baseline: MetadataBaseline = {
     metadata: { brick: "owner-brick", task_folder: "/owner/task" },

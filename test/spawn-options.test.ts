@@ -372,14 +372,6 @@ test("buildAgentSpawnOptions: URL is the only identity surface — no _ID vars e
   }
 });
 
-test("buildAgentSpawnOptions injects ACPX_TASK_FOLDER when sessionContext.taskFolder is non-empty", () => {
-  const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
-    acpxRecordId: "child-id",
-    taskFolder: "/abs/path/to/task",
-  });
-  assert.equal(options.env.ACPX_TASK_FOLDER, "/abs/path/to/task");
-});
-
 test("buildAgentSpawnOptions injects ACPX_SESSION_NAME when sessionContext.sessionName is non-empty", () => {
   const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
     acpxRecordId: "child-id",
@@ -420,56 +412,12 @@ test("buildAgentSpawnOptions omits ACPX_SESSION_NAME for unnamed sessions and cl
   }
 });
 
-test("buildAgentSpawnOptions trims whitespace around taskFolder before injecting ACPX_TASK_FOLDER", () => {
-  const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
-    acpxRecordId: "child-id",
-    taskFolder: "   /abs/path  ",
-  });
-  assert.equal(options.env.ACPX_TASK_FOLDER, "/abs/path");
-});
-
-test("buildAgentSpawnOptions omits ACPX_TASK_FOLDER when taskFolder is null/undefined/empty/whitespace", () => {
-  const previous = process.env.ACPX_TASK_FOLDER;
-  delete process.env.ACPX_TASK_FOLDER;
-  try {
-    const undefinedCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
-      acpxRecordId: "child-id",
-    });
-    assert.equal(
-      Object.prototype.hasOwnProperty.call(undefinedCase.env, "ACPX_TASK_FOLDER"),
-      false,
-    );
-
-    const nullCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
-      acpxRecordId: "child-id",
-      taskFolder: null,
-    });
-    assert.equal(Object.prototype.hasOwnProperty.call(nullCase.env, "ACPX_TASK_FOLDER"), false);
-
-    const emptyCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
-      acpxRecordId: "child-id",
-      taskFolder: "",
-    });
-    assert.equal(Object.prototype.hasOwnProperty.call(emptyCase.env, "ACPX_TASK_FOLDER"), false);
-
-    const whitespaceCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
-      acpxRecordId: "child-id",
-      taskFolder: "   ",
-    });
-    assert.equal(
-      Object.prototype.hasOwnProperty.call(whitespaceCase.env, "ACPX_TASK_FOLDER"),
-      false,
-    );
-  } finally {
-    if (previous === undefined) {
-      delete process.env.ACPX_TASK_FOLDER;
-    } else {
-      process.env.ACPX_TASK_FOLDER = previous;
-    }
-  }
-});
-
-test("buildAgentSpawnOptions clears stale ACPX_TASK_FOLDER when this session has none", () => {
+// brick b11f98fb — the legacy task-folder mechanism is removed: nothing SETS
+// ACPX_TASK_FOLDER any more. What remains is the tombstone strip in auth-env.ts,
+// and this is the test that holds it: an agent process started BEFORE the removal
+// still carries the variable, and it must be ERASED rather than inherited into
+// every session it spawns. Deleting this test would silently re-open that leak.
+test("buildAgentSpawnOptions clears a stale inherited ACPX_TASK_FOLDER", () => {
   const previous = process.env.ACPX_TASK_FOLDER;
   process.env.ACPX_TASK_FOLDER = "/stale/task";
   try {
@@ -549,7 +497,7 @@ test("buildAgentSpawnOptions clears stale ACPX_BRICK vars and owner-log marker",
   }
 });
 
-test("buildAgentSpawnOptions: ACPX_TASK_FOLDER coexists with URL session + parent vars (no _ID vars)", () => {
+test("buildAgentSpawnOptions: URL session + parent vars replace the _ID vars", () => {
   const previousSessionId = process.env.ACPX_SESSION_ID;
   const previousParentId = process.env.ACPX_PARENT_SESSION_ID;
   delete process.env.ACPX_SESSION_ID;
@@ -559,7 +507,6 @@ test("buildAgentSpawnOptions: ACPX_TASK_FOLDER coexists with URL session + paren
       const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
         acpxRecordId: "child-id",
         parentSessionId: "parent-id",
-        taskFolder: "/task/abs",
       });
       assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_SESSION_ID"), false);
       assert.equal(
@@ -568,7 +515,6 @@ test("buildAgentSpawnOptions: ACPX_TASK_FOLDER coexists with URL session + paren
       );
       assert.equal(options.env.ACPX_SESSION_URL, expectedSessionUrl("child-id"));
       assert.equal(options.env.ACPX_PARENT_SESSION_URL, expectedSessionUrl("parent-id"));
-      assert.equal(options.env.ACPX_TASK_FOLDER, "/task/abs");
     });
   } finally {
     if (previousSessionId === undefined) {
@@ -641,15 +587,13 @@ test("buildAgentSpawnOptions omits ACPX_AGENT_FOLDER when agentFolder is null/un
   }
 });
 
-test("buildAgentSpawnOptions: ACPX_AGENT_FOLDER coexists with task folder + URL session vars", () => {
+test("buildAgentSpawnOptions: ACPX_AGENT_FOLDER coexists with the URL session vars", () => {
   withAcpxUiBaseUrlEnv(undefined, () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
       acpxRecordId: "child-id",
       parentSessionId: "parent-id",
-      taskFolder: "/task/abs",
       agentFolder: "/task/abs/agents/child-id",
     });
-    assert.equal(options.env.ACPX_TASK_FOLDER, "/task/abs");
     assert.equal(options.env.ACPX_AGENT_FOLDER, "/task/abs/agents/child-id");
     assert.equal(options.env.ACPX_SESSION_URL, expectedSessionUrl("child-id"));
   });

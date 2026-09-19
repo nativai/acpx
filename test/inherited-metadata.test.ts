@@ -8,57 +8,10 @@ import {
   withInheritedProfile,
   withInheritedReasoningEffort,
   withInheritedSubscription,
-  withInheritedTaskFolder,
 } from "../src/cli/session/inherited-metadata.js";
 
 const BRICK_X = "11111111-2222-3333-4444-555555555555";
 const BRICK_Y = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-
-test("withInheritedTaskFolder inherits the parent task_folder when child metadata is absent", () => {
-  assert.deepEqual(withInheritedTaskFolder(undefined, "/abs/task"), { task_folder: "/abs/task" });
-});
-
-test("withInheritedTaskFolder inherits when child metadata has other keys but no task_folder", () => {
-  assert.deepEqual(withInheritedTaskFolder({ other: "x" }, "/abs/task"), {
-    other: "x",
-    task_folder: "/abs/task",
-  });
-});
-
-test("withInheritedTaskFolder: an explicit child task_folder always wins", () => {
-  assert.deepEqual(withInheritedTaskFolder({ task_folder: "/child/task" }, "/parent/task"), {
-    task_folder: "/child/task",
-  });
-});
-
-test("withInheritedTaskFolder: an explicit empty child task_folder still wins (not overwritten)", () => {
-  assert.deepEqual(withInheritedTaskFolder({ task_folder: "" }, "/parent/task"), {
-    task_folder: "",
-  });
-});
-
-test("withInheritedTaskFolder: a parent without a task_folder leaves the child unchanged", () => {
-  assert.equal(withInheritedTaskFolder(undefined, undefined), undefined);
-  assert.equal(withInheritedTaskFolder(undefined, null), undefined);
-  assert.deepEqual(withInheritedTaskFolder({ a: "1" }, undefined), { a: "1" });
-});
-
-test("withInheritedTaskFolder: a whitespace-only parent task_folder is treated as absent", () => {
-  assert.equal(withInheritedTaskFolder(undefined, "   "), undefined);
-});
-
-test("withInheritedTaskFolder trims the inherited parent value", () => {
-  assert.deepEqual(withInheritedTaskFolder(undefined, "  /abs/task  "), {
-    task_folder: "/abs/task",
-  });
-});
-
-test("withInheritedTaskFolder does not mutate the child metadata object", () => {
-  const child = { other: "x" };
-  const result = withInheritedTaskFolder(child, "/abs/task");
-  assert.notEqual(result, child);
-  assert.deepEqual(child, { other: "x" });
-});
 
 test("withInheritedBrick inherits parent brick when child metadata is absent", () => {
   assert.deepEqual(withInheritedBrick(undefined, BRICK_X, false), { brick: BRICK_X });

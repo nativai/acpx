@@ -8,7 +8,7 @@
 import "./install-owner-reaper.js";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
@@ -3384,7 +3384,12 @@ test("raw metadata brick is record-driven for stamp/context; set-metadata valida
   });
 });
 
-test("external brick and task_folder metadata survives owner turn-end, next prompt, and index rebuild", async () => {
+// brick b11f98fb: `task_folder` is the REMOVED legacy key, kept here deliberately as
+// the specimen unknown key. The contract it now proves is the one the removal rests
+// on: an orphan key round-trips through a concurrent owner turn-end, a next prompt
+// and a full index rebuild WITHOUT being dropped — and without taking the live
+// sibling key (`brick`) down with it. It is no longer projected onto the index entry.
+test("external brick metadata and an unknown legacy key survive owner turn-end, next prompt, and index rebuild", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     const taskDir = path.join(homeDir, "task");
@@ -3454,7 +3459,7 @@ test("external brick and task_folder metadata survives owner turn-end, next prom
         metadata?: Record<string, unknown>;
       };
       assert.equal(stored.metadata?.brick, BRICK_X, `${label}: brick metadata`);
-      assert.equal(stored.metadata?.task_folder, taskDir, `${label}: task_folder metadata`);
+      assert.equal(stored.metadata?.task_folder, taskDir, `${label}: legacy key round-trips`);
     };
 
     try {
@@ -3540,7 +3545,8 @@ test("external brick and task_folder metadata survives owner turn-end, next prom
       const entry = rebuiltIndex.entries?.find((candidate) => candidate.acpxRecordId === id);
       assert.ok(entry, "rebuilt index entry missing");
       assert.equal(entry.metadataBrick, BRICK_X);
-      assert.equal(entry.metadataTaskFolder, taskDir);
+      // No longer projected — the legacy key lives on the record only.
+      assert.equal(entry.metadataTaskFolder, undefined);
     } finally {
       if (blocker.exitCode === null && blocker.signalCode == null) {
         blocker.kill("SIGKILL");
@@ -3550,7 +3556,7 @@ test("external brick and task_folder metadata survives owner turn-end, next prom
   });
 });
 
-test("brick path wins agent folder while task_folder remains in env", async () => {
+test("a legacy task_folder reaches neither the agent env nor the agent folder", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     const envDumpFile = path.join(homeDir, "adapter-env.json");
@@ -3598,7 +3604,9 @@ test("brick path wins agent folder while task_folder remains in env", async () =
     const firstEnv = JSON.parse(await fs.readFile(envDumpFile, "utf8")) as Record<string, string>;
     assert.equal(firstEnv.ACPX_BRICK, BRICK_X);
     assert.equal(firstEnv.ACPX_BRICK_PATH, path.join(brickPool, BRICK_X));
-    assert.equal(firstEnv.ACPX_TASK_FOLDER, taskDir);
+    // brick b11f98fb: the record carries task_folder, but nothing projects it into
+    // the adapter environment any more.
+    assert.equal(Object.prototype.hasOwnProperty.call(firstEnv, "ACPX_TASK_FOLDER"), false);
     assert.equal(Object.prototype.hasOwnProperty.call(firstEnv, "ACPX_AGENT_FOLDER"), false);
 
     const prompted = await runCli(
@@ -3610,8 +3618,16 @@ test("brick path wins agent folder while task_folder remains in env", async () =
     const secondEnv = JSON.parse(await fs.readFile(envDumpFile, "utf8")) as Record<string, string>;
     const expectedAgentFolder = path.join(brickPool, BRICK_X, "agents", `both-${id.slice(0, 8)}`);
     assert.equal(secondEnv.ACPX_AGENT_FOLDER, expectedAgentFolder);
-    assert.equal(secondEnv.ACPX_TASK_FOLDER, taskDir);
+    assert.equal(Object.prototype.hasOwnProperty.call(secondEnv, "ACPX_TASK_FOLDER"), false);
     await fs.access(expectedAgentFolder);
+    // The agent folder lands under the BRICK; the legacy task dir is never touched.
+    assert.equal(existsSync(path.join(taskDir, "agents")), false);
+    // ...and the orphan key itself survives on the record, unmigrated.
+    const record = JSON.parse(await fs.readFile(sessionFilePath(homeDir, id), "utf8")) as {
+      metadata?: Record<string, unknown>;
+    };
+    assert.equal(record.metadata?.task_folder, taskDir);
+    assert.equal(record.metadata?.brick, BRICK_X);
   });
 });
 
@@ -8295,13 +8311,14 @@ test("sessions new --from-template instantiates a normal open session from a tem
 // /fork origin (forkedFromSessionId). With no parent context the record is
 // byte-identical to today (parent fields omitted).
 
-test("sessions new --from-template records the env-fallback parent AND the template origin (both edges + task_folder inherit)", async () => {
+test("sessions new --from-template records the env-fallback parent AND the template origin (both edges)", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
     await writeCodexAgentConfig(homeDir, MOCK_AGENT_WITH_FORK_SESSION);
 
-    // A real local parent so its task_folder is inheritable (matches plain-`new`).
+    // A real local parent. brick b11f98fb: it carries the legacy task_folder key,
+    // which must NOT be inherited by the child any more (the inheritance leg is gone).
     await writeSessionRecord(homeDir, {
       acpxRecordId: "parent-s",
       acpSessionId: "acp-parent-s",
@@ -8350,8 +8367,8 @@ test("sessions new --from-template records the env-fallback parent AND the templ
     assert.equal(stored.forked_from_session_id, "tmpl-src");
     // The instantiated session is itself a normal session, not a template.
     assert.equal(stored.template, undefined);
-    // task_folder inherited from the spawner (matches plain-`new`).
-    assert.equal(stored.metadata?.task_folder, "/wisdom/task-x");
+    // brick b11f98fb: the spawner's legacy task_folder is NOT inherited.
+    assert.equal(stored.metadata?.task_folder, undefined);
     // Template-spawn discriminator: lets the board place this under its creator
     // with a "from template" badge, distinct from a plain fork (which has the
     // same parent_session_id + forked_from_session_id but NO template_source).

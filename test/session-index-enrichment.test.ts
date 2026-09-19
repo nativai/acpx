@@ -100,7 +100,10 @@ test("toSessionIndexEntry projects every hot scalar from the record", () => {
   assert.equal(entry.parentSessionId, "parent-1");
   assert.equal(entry.forkedFromSessionId, "src-1");
   assert.equal(entry.forkedAtMessageIndex, 7);
-  assert.equal(entry.metadataTaskFolder, "/wisdom/x");
+  // brick b11f98fb: the legacy key stays on the RECORD (see enrichedRecord) but is
+  // no longer projected onto the index entry at all — the property is GONE, not
+  // merely undefined, so assert its absence structurally.
+  assert.equal(Object.prototype.hasOwnProperty.call(entry, "metadataTaskFolder"), false);
   assert.equal(entry.metadataBrick, "11111111-2222-3333-4444-555555555555");
   assert.equal(entry.metadataInfra, true);
   assert.equal(entry.metadataInfraPurpose, "Intaker template nightly re-bake");
@@ -227,7 +230,7 @@ test("parseIndexEntry preserves enrichment across a write→read round-trip (unt
     // daemon write that rebuilds ONE entry strips the capability off all others.
     assert.equal(back.promptImageSupported, true);
     assert.equal(back.byway, true);
-    assert.equal(back.metadataTaskFolder, "/wisdom/x");
+    assert.equal(Object.prototype.hasOwnProperty.call(back, "metadataTaskFolder"), false);
     assert.equal(back.metadataBrick, "11111111-2222-3333-4444-555555555555");
     // Infra label (brick 2ac729a4): projected scalars survive the round-trip, so
     // an acpx-ui-written infra entry isn't stripped on the daemon's next reconcile.

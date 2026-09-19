@@ -1,4 +1,3 @@
-import path from "node:path";
 import { InvalidArgumentError } from "commander";
 import type { SessionRecord } from "../../types.js";
 import { isBrickUuid } from "./brick-link.js";
@@ -7,20 +6,12 @@ import { isBrickUuid } from "./brick-link.js";
  * Validate a value for the self-apply `sessions set-metadata <key> <value>`
  * command. Generic keys accept any non-empty (trimmed) string — parity with the
  * `--metadata key=value` flag on `sessions new`/`ensure`. The one key with
- * semantics, `task_folder`, must additionally be an absolute path (mirrors
- * acpx-ui's `PATCH /metadata` contract and the `--metadata` example). Existence
- * is intentionally NOT checked here — a non-existent absolute path is accepted,
- * matching `--metadata` (the caller may emit a soft warning).
+ * semantics, `brick`, must additionally be a full uuid.
  */
 export function validateSessionMetadataValue(key: string, value: string): string {
   const trimmed = value.trim();
   if (trimmed.length === 0) {
     throw new InvalidArgumentError("Metadata value must not be empty");
-  }
-  if (key === "task_folder" && !path.isAbsolute(trimmed)) {
-    throw new InvalidArgumentError(
-      `task_folder must be an absolute path (got: ${JSON.stringify(value)})`,
-    );
   }
   if (key === "brick") {
     const normalized = trimmed.toLowerCase();

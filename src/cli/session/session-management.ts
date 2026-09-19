@@ -633,7 +633,6 @@ function creationSessionContext(options: SessionCreateOptions) {
     // instead of re-deriving one against the LOCAL base URL — which silently
     // re-hosts a cross-box parent onto this box. (FW-19)
     parentSessionUrl: options.parentSessionUrl ?? null,
-    taskFolder: options.metadata?.task_folder ?? null,
     brick,
     brickPath,
     agentFolder: null,

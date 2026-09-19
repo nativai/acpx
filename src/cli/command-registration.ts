@@ -357,7 +357,7 @@ export function registerSessionsCommand(
     )
     .option(
       "--metadata <key=value>",
-      "Set a metadata entry on the session (repeatable; e.g. --metadata task_folder=/abs/path)",
+      "Set a metadata entry on the session (repeatable; e.g. --metadata brick=<uuid>)",
       parseMetadataEntry,
     )
     .option(
@@ -566,7 +566,7 @@ export function registerSessionsCommand(
   const setMetadataCommand = sessionsCommand
     .command("set-metadata")
     .description(
-      "Set/update a metadata entry on this cwd's session in place (e.g. task_folder) — no agent connection. task_folder must be absolute; $ACPX_TASK_FOLDER reaches the agent on its next prompt/exec turn, not the in-flight one",
+      "Set/update a metadata entry on this cwd's session in place (e.g. brick) — no agent connection. An env-projected key reaches the agent on its next prompt/exec turn, not the in-flight one",
     )
     .argument("<key>", "Metadata key", (value: string) => parseNonEmptyValue("Metadata key", value))
     .argument("<value>", "Metadata value", (value: string) =>

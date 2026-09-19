@@ -18,12 +18,13 @@ test("validateSessionMetadataValue trims and returns a generic value", () => {
 
 test("validateSessionMetadataValue rejects empty / whitespace-only values", () => {
   assert.throws(() => validateSessionMetadataValue("k", ""), /must not be empty/);
-  assert.throws(() => validateSessionMetadataValue("task_folder", "   "), /must not be empty/);
+  assert.throws(() => validateSessionMetadataValue("note", "   "), /must not be empty/);
 });
 
-test("validateSessionMetadataValue requires task_folder to be an absolute path", () => {
-  assert.throws(() => validateSessionMetadataValue("task_folder", "relative/path"), /absolute/);
-  assert.equal(validateSessionMetadataValue("task_folder", "  /abs/task  "), "/abs/task");
+// brick b11f98fb: `task_folder` used to be the one key with absolute-path semantics.
+// The mechanism is gone, so it is now an ordinary generic key like any other.
+test("validateSessionMetadataValue treats the legacy task_folder key as generic", () => {
+  assert.equal(validateSessionMetadataValue("task_folder", "  relative/path  "), "relative/path");
 });
 
 test("validateSessionMetadataValue requires brick to be a full uuid and normalizes case", () => {

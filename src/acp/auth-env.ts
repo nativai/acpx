@@ -515,7 +515,6 @@ export type AgentSessionContext = {
    * (correct same-box). Carried into the bridge's session/new `_meta`. (FW-19)
    */
   parentSessionUrl?: string | null;
-  taskFolder?: string | null;
   brick?: string | null;
   brickPath?: string | null;
   agentFolder?: string | null;
@@ -603,6 +602,11 @@ function buildAgentEnvironment(
   delete env.ACPX_SESSION_RECORD_ID;
   delete env.ACPX_PARENT_SESSION_URL;
   delete env.ACPX_SESSION_NAME;
+  // TOMBSTONE STRIP (brick b11f98fb). The legacy task-folder mechanism is gone and
+  // nothing sets ACPX_TASK_FOLDER any more — but an agent process started BEFORE the
+  // removal still carries it, and would otherwise leak it into every session it
+  // spawns. The list is allow-by-omission (see the prefix-rule note below), so this
+  // stays to erase the dead variable rather than inherit it.
   delete env.ACPX_TASK_FOLDER;
   delete env.ACPX_BRICK;
   delete env.ACPX_BRICK_PATH;
@@ -826,12 +830,6 @@ function buildAgentEnvironment(
   const parentSessionUrl = resolveParentSessionUrl(sessionContext, baseUrl);
   if (parentSessionUrl) {
     env.ACPX_PARENT_SESSION_URL = parentSessionUrl;
-  }
-  if (sessionContext && typeof sessionContext.taskFolder === "string") {
-    const trimmedTaskFolder = sessionContext.taskFolder.trim();
-    if (trimmedTaskFolder.length > 0) {
-      env.ACPX_TASK_FOLDER = trimmedTaskFolder;
-    }
   }
   if (sessionContext && typeof sessionContext.brick === "string") {
     const trimmedBrick = sessionContext.brick.trim();
@@ -1233,7 +1231,7 @@ function applySubscriptionConfigDir(
 
   env.CLAUDE_CONFIG_DIR = applied.configDir;
   // Export the RESOLVED subscription id so the agent (and its children) can read
-  // its own sub and inherit it (ACPX_SUBSCRIPTION, beside ACPX_TASK_FOLDER).
+  // its own sub and inherit it (ACPX_SUBSCRIPTION, beside ACPX_BRICK).
   if (applied.resolvedId) {
     env.ACPX_SUBSCRIPTION = applied.resolvedId;
   }

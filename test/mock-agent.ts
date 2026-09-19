@@ -1656,7 +1656,7 @@ const mockAgentOptions = parseMockAgentOptions(process.argv.slice(2));
 
 if (mockAgentOptions.envDumpFile) {
   // Capture the ACPX_* env the adapter was spawned with, so an E2E can assert
-  // what acpx injected (ACPX_TASK_FOLDER, ACPX_AGENT_FOLDER, …). Also capture
+  // what acpx injected (ACPX_BRICK, ACPX_AGENT_FOLDER, …). Also capture
   // the claude-pty bridge selector env (INDEPENDENT_CLAUDE_*) and
   // CLAUDE_CONFIG_DIR so tests can assert both presence AND absence.
   const extra = new Set(mockAgentOptions.envDumpExtra ?? []);

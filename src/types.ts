@@ -327,7 +327,6 @@ export type AcpClientOptions = {
     parentSessionId?: string | null;
     /** Full parent acpx-ui URL (host+id) for cross-machine lineage. (FW-19) */
     parentSessionUrl?: string | null;
-    taskFolder?: string | null;
     brick?: string | null;
     brickPath?: string | null;
     agentFolder?: string | null;

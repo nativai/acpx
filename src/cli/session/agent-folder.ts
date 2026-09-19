@@ -50,21 +50,23 @@ function usableBaseDirectory(candidate: string | null | undefined): string | nul
 
 /**
  * Resolve (and create) the per-agent folder for a session:
- * `<task_folder>/agents/<sanitized-name>-<id8>/` (bare `<id8>` when the name is
- * empty). Returns the absolute path, or `null` when there is no usable task
+ * `<brick_path>/agents/<sanitized-name>-<id8>/` (bare `<id8>` when the name is
+ * empty). Returns the absolute path, or `null` when there is no usable brick
  * folder.
  *
- * Defensive: only acts when `task_folder` is absolute and already exists as a
- * directory, so an inherited junk/typo path never materializes a bogus task
- * tree. Re-derived each spawn with an idempotent `mkdir -p`, so a later rename
- * or self-applied `task_folder` is picked up on the next spawn.
+ * Defensive: only acts when the brick path is absolute and already exists as a
+ * directory, so a junk/typo path never materializes a bogus tree. Re-derived
+ * each spawn with an idempotent `mkdir -p`, so a later rename or re-link is
+ * picked up on the next spawn.
+ *
+ * brick b11f98fb: the legacy `metadata.task_folder` fallback was removed here;
+ * the brick path is now the sole base.
  */
 export function resolveAndEnsureAgentFolder(
   record: SessionRecord,
   brickPath?: string | null,
 ): string | null {
-  const baseDirectory =
-    usableBaseDirectory(brickPath) ?? usableBaseDirectory(record.metadata?.task_folder);
+  const baseDirectory = usableBaseDirectory(brickPath);
   if (!baseDirectory) {
     return null;
   }

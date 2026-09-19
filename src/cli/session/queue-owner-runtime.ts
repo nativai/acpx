@@ -166,7 +166,6 @@ function sessionContextFromRecord(record: Awaited<ReturnType<typeof resolveSessi
     sessionName: record.name ?? null,
     parentSessionId: record.parentSessionId ?? null,
     parentSessionUrl: record.parentSessionUrl ?? null,
-    taskFolder: record.metadata?.task_folder ?? null,
     brick,
     brickPath,
     agentFolder: resolveAndEnsureAgentFolder(record, brickPath),

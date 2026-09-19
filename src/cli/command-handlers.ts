@@ -157,7 +157,6 @@ import {
   withInheritedProfile,
   withInheritedOutputStyle,
   withInheritedReasoningEffort,
-  withInheritedTaskFolder,
 } from "./session/inherited-metadata.js";
 import { mergeSessionMetadata, validateSessionMetadataValue } from "./session/session-metadata.js";
 import type {
@@ -692,7 +691,6 @@ type ResolvedParentSession = {
   acpxRecordId: string;
   /** Full parent url (host+id) for cross-machine lineage, when known. (FW-19) */
   sessionUrl?: string;
-  taskFolder?: string;
   brick?: string;
   subscription?: string;
   profile?: string;
@@ -717,7 +715,6 @@ function parentInheritableFields(parent: SessionRecord): ResolvedParentSession {
   const sessionOptions = parent.acpx?.session_options;
   return {
     acpxRecordId: parent.acpxRecordId,
-    taskFolder: parent.metadata?.task_folder,
     brick: parent.metadata?.brick,
     subscription: sessionOptions?.subscription,
     profile: sessionOptions?.profile,
@@ -871,10 +868,7 @@ function buildSessionStartOptions(params: {
     parentSessionId: params.parent?.acpxRecordId,
     parentSessionUrl: params.parent?.sessionUrl,
     metadata: withInheritedBrick(
-      applyBrickFlag(
-        withInheritedTaskFolder(params.flags.metadata, params.parent?.taskFolder),
-        params.resolvedBrick,
-      ),
+      applyBrickFlag(params.flags.metadata, params.resolvedBrick),
       params.parent?.brick,
       params.resolvedBrick === false,
     ),
@@ -2529,20 +2523,13 @@ function printSetMetadataResultByFormat(
   process.stdout.write(format === "quiet" ? `${value}\n` : `metadata set: ${key}=${value}\n`);
 }
 
-async function warnIfTaskFolderMissing(folder: string): Promise<void> {
-  try {
-    await fs.access(folder);
-  } catch {
-    process.stderr.write(`[acpx] warning: task_folder does not exist yet: ${folder}\n`);
-  }
-}
-
 // Self-apply: let a running session set/update its OWN session-record metadata
-// (e.g. task_folder) without an ACP round-trip. Pure record edit: resolve the
+// (e.g. brick) without an ACP round-trip. Pure record edit: resolve the
 // locally-routed session (or one exact global name after a local miss), merge
 // the key into a freshly-read record, and persist it.
-// acpx-ui reflects the link on its next read; $ACPX_TASK_FOLDER reaches the agent
-// on its NEXT prompt/exec turn (a live process's env cannot be mutated in place).
+// acpx-ui reflects the change on its next read; an env-projected key (e.g. $ACPX_BRICK)
+// reaches the agent on its NEXT prompt/exec turn (a live process's env cannot be
+// mutated in place).
 export async function handleSessionsSetMetadata(
   explicitAgentName: string | undefined,
   key: string,
@@ -2556,9 +2543,6 @@ export async function handleSessionsSetMetadata(
   const trimmedValue = validateSessionMetadataValue(key, value);
   const selector = resolveSessionTargetSelector({ flags, command });
   const record = await findRoutedTargetSessionOrThrow(agent, selector);
-  if (key === "task_folder") {
-    await warnIfTaskFolderMissing(trimmedValue);
-  }
   if (key === "brick") {
     await warnIfBrickDoesNotResolve(trimmedValue);
   }
@@ -3047,16 +3031,9 @@ async function runSessionCopy(
     name: flags.name ?? sourceDefaultForkName(source),
     // metadata.brick carry: precedence = --brick flag > spawn-parent brick (--parent-id / byway)
     // > none. A plain fork/copy carries NO brick by default (the 07-15 source.metadata.brick
-    // fallback was reversed, brick://1113da9d) so it does not impersonate the source's brick;
-    // task_folder mirrors the same two-tier precedence.
+    // fallback was reversed, brick://1113da9d) so it does not impersonate the source's brick.
     metadata: withInheritedBrick(
-      applyBrickFlag(
-        withInheritedTaskFolder(
-          copyMetadata(flags, source, forkAtMessageIndex),
-          parent?.taskFolder, // spawn-parent task_folder (byway via --parent-id) — KEEP
-        ),
-        resolvedBrick,
-      ),
+      applyBrickFlag(copyMetadata(flags, source, forkAtMessageIndex), resolvedBrick),
       parent?.brick, // spawn-parent brick (byway via --parent-id) — KEEP
       resolvedBrick === false,
     ),
