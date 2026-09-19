@@ -336,9 +336,66 @@ test("invalid window metadata keeps absolute semantics and unmapped cuts have no
     assert.equal(resolveClaudeForkCut(content, 1, window).uuid, "first");
     assert.equal(resolveClaudeForkCut(content, 3, window).uuid, "second");
     for (const index of [-1, 0, 2, 4, 1.5, Number.NaN, Infinity]) {
+      // brick://24dba400 — window=20 is a real, known record total that
+      // genuinely exceeds transcriptMessageTotal (3): exactly the
+      // record/transcript divergence this brick fixes. index=4's legacy-
+      // absolute cut (position 3) now clamps to the nearest resolvable slot
+      // instead of throwing. Every other window value here is 0, negative,
+      // or non-finite — not a usable record total — so those stay unmapped.
+      if (window === 20 && index === 4) {
+        assert.equal(resolveClaudeForkCut(content, index, window).uuid, "second");
+        continue;
+      }
       assert.equal(resolveClaudeForkCut(content, index, window).uuid, undefined);
     }
   }
+});
+
+// brick://24dba400 — real production shape: a delivery arriving mid-turn
+// (e.g. a `send-message.sh` relay) lands in the transcript as a
+// `type:"attachment"` queued-command row, invisible to `isIndexableClaudeRecord`
+// (it only counts `user`/`assistant`), while the acpx record still gives it
+// its own message entry. recordMessageTotal (the record's own message-window
+// length) then legitimately exceeds transcriptMessageTotal, and a legacy-
+// absolute forkAtIndex that is perfectly valid in record space can resolve
+// past the transcript's own reconstructed bounds. Measured on session
+// 178ee3e4-9670-4c81-8d29-5b9507084e89: recordMessageTotal 96 vs
+// transcriptMessageTotal 72, crashing `acpx sessions copy` with "no Claude
+// transcript UUID could be resolved". This must now clamp instead of throw.
+test("record/transcript divergence from invisible mid-turn deliveries clamps instead of crashing", () => {
+  const attachmentLine = (id: string) =>
+    JSON.stringify({
+      type: "attachment",
+      uuid: `attachment-${id}`,
+      attachment: { type: "queued_command", prompt: [{ type: "text", text: "queued" }] },
+    });
+  // 3 real pairs -> 6 transcript slots (0-5), with 2 invisible attachment rows
+  // interspersed exactly as measured in production.
+  const content = [...pair(), attachmentLine("a"), ...pair(), ...pair(), attachmentLine("b")].join(
+    "\n",
+  );
+
+  // Before this fix: cutPosition (legacy-absolute, forkAtIndex 7 -> position 6)
+  // was >= transcriptMessageTotal (6), so uuidBySlot.get(6) was undefined and
+  // the CLI layer threw "no Claude transcript UUID could be resolved".
+  const recordMessageTotal = 8; // 3 pairs (6 entries) + 2 invisible deliveries
+  const cut = resolveClaudeForkCut(content, 7, recordMessageTotal);
+  assert.equal(cut.transcriptMessageTotal, 6);
+  assert.equal(cut.cutPosition, 5); // clamped down from the requested 6
+  assert.equal(cut.uuid, uuidAt(content, 5));
+  assert.notEqual(cut.uuid, undefined);
+
+  // A record total that does NOT exceed the transcript's own count is not the
+  // divergence case -- out-of-range requests there keep resolving to nothing
+  // (see "invalid window metadata..." above).
+  const noDivergence = resolveClaudeForkCut(content, 7, 6);
+  assert.equal(noDivergence.cutPosition, 6);
+  assert.equal(noDivergence.uuid, undefined);
+
+  // Empty transcript: nothing to clamp to, must still surface no uuid.
+  const empty = resolveClaudeForkCut("", 1, 5);
+  assert.equal(empty.transcriptMessageTotal, 0);
+  assert.equal(empty.uuid, undefined);
 });
 
 test("tool results and slash echoes occupy the assistant slot without replacing its leading entry", () => {

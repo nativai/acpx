@@ -2056,6 +2056,143 @@ test("sessions copy resolves Claude --at-index from source cwd and forwards copi
   });
 });
 
+test("sessions copy clamps Claude --at-index instead of crashing when the record diverges from a shorter transcript", async () => {
+  // brick://24dba400 — reproduces the record/transcript divergence measured on
+  // real production data (session 178ee3e4-9670-4c81-8d29-5b9507084e89): a
+  // delivery arriving mid-turn lands in the transcript as a `type:"attachment"`
+  // queued-command row, invisible to `isIndexableClaudeRecord` (it only counts
+  // `user`/`assistant`), while the acpx record still gives it its own message
+  // entry. The record ends up LONGER than the transcript's reconstructed count,
+  // so a legacy-absolute `--at-index` that is perfectly valid in record space
+  // can resolve past the transcript's own bounds. Before the fix this threw
+  // "no Claude transcript UUID could be resolved"; it must now clamp to the
+  // last resolvable transcript entry instead of crashing the copy.
+  await withTempHome(async (homeDir) => {
+    const sourceCwd = path.join(homeDir, "source-workspace");
+    const destinationCwd = path.join(homeDir, "destination-workspace");
+    const sourceAcpSessionId = "source-acp-claude-divergence";
+    const packageIndexPath = await writeFakeClaudeAgentPackage(homeDir);
+    const claudeCommand = `node ${JSON.stringify(packageIndexPath)} --claude-agent-acp --supports-fork-session`;
+
+    await fs.mkdir(sourceCwd, { recursive: true });
+    await fs.mkdir(destinationCwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify({ agents: { claude: { command: claudeCommand } } }, null, 2)}\n`,
+      "utf8",
+    );
+
+    // 3 real pairs -> 6 indexable transcript slots (0-5). Two `attachment`
+    // queued-command rows are interspersed (measured real shape) and MUST NOT
+    // advance the slot counter — each has its own acpx record entry below but
+    // no transcript counterpart at all.
+    const attachmentRow = (deliveryId: string) =>
+      JSON.stringify({
+        type: "attachment",
+        uuid: `attachment-${deliveryId}`,
+        attachment: {
+          type: "queued_command",
+          prompt: [{ type: "text", text: `[message from acpx session (delivery ${deliveryId})]` }],
+        },
+      });
+    const transcriptPath = transcriptJsonlPath(
+      path.join(homeDir, ".claude"),
+      sourceCwd,
+      sourceAcpSessionId,
+    );
+    await fs.mkdir(path.dirname(transcriptPath), { recursive: true });
+    await fs.writeFile(
+      transcriptPath,
+      [
+        JSON.stringify({ type: "user", uuid: "user1-uuid", message: { content: "turn 1" } }),
+        JSON.stringify({
+          type: "assistant",
+          uuid: "assistant1-uuid",
+          message: { content: [{ type: "text", text: "reply 1" }] },
+        }),
+        attachmentRow("mid-turn-a"),
+        JSON.stringify({ type: "user", uuid: "user2-uuid", message: { content: "turn 2" } }),
+        JSON.stringify({
+          type: "assistant",
+          uuid: "assistant2-uuid",
+          message: { content: [{ type: "text", text: "reply 2" }] },
+        }),
+        JSON.stringify({ type: "user", uuid: "user3-uuid", message: { content: "turn 3" } }),
+        JSON.stringify({
+          type: "assistant",
+          uuid: "assistant3-uuid",
+          message: { content: [{ type: "text", text: "reply 3" }] },
+        }),
+        attachmentRow("mid-turn-b"),
+      ].join("\n"),
+      "utf8",
+    );
+
+    // 8 acpx-record entries: the 3 real pairs (6) plus the 2 mid-turn
+    // deliveries, each carrying its own record entry despite being invisible
+    // to the transcript above — this is the measured divergence mechanism.
+    const messages: SessionRecord["messages"] = [
+      { User: { id: "u1", content: [{ Text: "turn 1" }] } },
+      { Agent: { content: [{ Text: "reply 1" }], tool_results: {} } },
+      { User: { id: "mid-turn-a", content: [{ Text: "[message from acpx session]" }] } },
+      { User: { id: "u2", content: [{ Text: "turn 2" }] } },
+      { Agent: { content: [{ Text: "reply 2" }], tool_results: {} } },
+      { User: { id: "u3", content: [{ Text: "turn 3" }] } },
+      { Agent: { content: [{ Text: "reply 3" }], tool_results: {} } },
+      { User: { id: "mid-turn-b", content: [{ Text: "[message from acpx session]" }] } },
+    ];
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "source-claude-divergence",
+      acpSessionId: sourceAcpSessionId,
+      agentCommand: claudeCommand,
+      cwd: sourceCwd,
+      messages,
+      lastSeq: messages.length,
+    });
+
+    // --at-index 7 is a perfectly valid record-space cut (message 7 of 8), but
+    // legacy-absolute maps it to transcript position 6 -- one past the
+    // transcript's own reconstructed bound (transcriptMessageTotal = 6). It
+    // must clamp to slot 5 (assistant3-uuid), not crash.
+    const result = await runCli(
+      [
+        "--cwd",
+        destinationCwd,
+        "--format",
+        "json",
+        "claude",
+        "sessions",
+        "copy",
+        "--from",
+        "source-claude-divergence",
+        "--at-index",
+        "7",
+      ],
+      homeDir,
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    const payload = JSON.parse(result.stdout.trim()) as {
+      acpxRecordId?: unknown;
+      forkedAtMessageIndex?: unknown;
+    };
+    const childId = String(payload.acpxRecordId);
+    try {
+      assert.equal(payload.forkedAtMessageIndex, 7);
+
+      const callLog = await fs.readFile(
+        path.join(homeDir, ".claude", "fork-sdk-calls.jsonl"),
+        "utf8",
+      );
+      const call = JSON.parse(callLog.trim()) as { upToMessageId?: unknown };
+      assert.equal(call.upToMessageId, "assistant3-uuid");
+    } finally {
+      await closeForkedChildSession(homeDir, "claude", childId);
+    }
+  });
+});
+
 test("sessions copy materializes cross-cwd Claude forks in the destination project path", async () => {
   await withTempHome(async (homeDir) => {
     const sourceCwd = path.join(homeDir, "source-workspace");

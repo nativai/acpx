@@ -302,10 +302,16 @@ export function resolveClaudeForkCut(
 ): ResolvedClaudeForkCut {
   const { uuidBySlot, transcriptMessageTotal, firstPostCompactionPosition } =
     indexClaudeTranscript(content);
-  const cutPosition = resolveTranscriptCutPosition(
+  const requestedCutPosition = resolveTranscriptCutPosition(
     forkAtIndex,
     recordMessageTotal,
     transcriptMessageTotal,
+  );
+  const cutPosition = clampToResolvableTranscriptPosition(
+    requestedCutPosition,
+    recordMessageTotal,
+    transcriptMessageTotal,
+    uuidBySlot,
   );
 
   if (firstPostCompactionPosition !== undefined && cutPosition < firstPostCompactionPosition) {
@@ -320,6 +326,75 @@ export function resolveClaudeForkCut(
     cutPosition,
     firstPostCompactionPosition,
   };
+}
+
+/**
+ * brick://24dba400 — a delivery arriving while a turn is in progress (e.g. a
+ * `send-message.sh` relay landing mid-turn) gets its own entry in the acpx
+ * session record, but Claude Code doesn't open a fresh top-level turn for it
+ * (measured shape: a `type:"attachment"` queued-command JSONL row, invisible
+ * to `isIndexableClaudeRecord`'s `type === "user" | "assistant"` check — not
+ * the tool_result-content guess this was first suspected to be). The record
+ * and transcript counts diverge monotonically from the first such delivery
+ * onward, so `recordMessageTotal` (the record's own message-window length)
+ * can legitimately exceed `transcriptMessageTotal` on exactly the sessions
+ * that receive frequent child status updates (`hod-*`/orchestrator-style).
+ *
+ * When that's the known cause of the gap, a legacy-absolute `forkAtIndex`
+ * that was perfectly valid in record space can resolve past the transcript's
+ * own reconstructed bounds. Clamp DOWN to the nearest slot Claude Code can
+ * actually resume from — per the "clamp, don't crash, never later" principle
+ * this codebase already applies one layer up (acpx-ui's record-cut
+ * translator) — instead of surfacing `undefined` and crashing the copy.
+ *
+ * Deliberately scoped to the case where `recordMessageTotal` is known AND
+ * exceeds `transcriptMessageTotal`: that's the one situation where the gap is
+ * attributable to this mechanism rather than to a genuinely out-of-range
+ * request (no window info, or a `forkAtIndex` past even the record's own
+ * length) — which must keep resolving to nothing, not to an invented cut.
+ *
+ * `uuidBySlot` is NOT guaranteed dense: two real user entries with nothing
+ * indexable between them (transcript starts mid-turn, or both are queued
+ * "attachment" deliveries) leave the slot between them unset. So this walks
+ * backward for the nearest populated slot rather than assuming
+ * `transcriptMessageTotal - 1` itself is populated.
+ */
+function clampToResolvableTranscriptPosition(
+  requestedCutPosition: number,
+  recordMessageTotal: number | undefined,
+  transcriptMessageTotal: number,
+  uuidBySlot: Map<number, string>,
+): number {
+  if (
+    !isKnownRecordTotalDiverging(recordMessageTotal, transcriptMessageTotal) ||
+    !Number.isFinite(requestedCutPosition) ||
+    requestedCutPosition < transcriptMessageTotal
+  ) {
+    return requestedCutPosition;
+  }
+
+  for (let position = transcriptMessageTotal - 1; position >= 0; position -= 1) {
+    if (uuidBySlot.has(position)) {
+      return position;
+    }
+  }
+  // No resolvable slot at all (e.g. an empty transcript) — fall through
+  // unclamped so the caller's existing "no uuid" handling applies unchanged.
+  return requestedCutPosition;
+}
+
+/** recordMessageTotal is a real, known message count and genuinely exceeds
+ * what the transcript reconstructs — the specific divergence this clamps. */
+function isKnownRecordTotalDiverging(
+  recordMessageTotal: number | undefined,
+  transcriptMessageTotal: number,
+): boolean {
+  return (
+    typeof recordMessageTotal === "number" &&
+    Number.isFinite(recordMessageTotal) &&
+    recordMessageTotal > 0 &&
+    recordMessageTotal > transcriptMessageTotal
+  );
 }
 
 function indexClaudeTranscript(content: string): {
