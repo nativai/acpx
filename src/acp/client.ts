@@ -259,6 +259,37 @@ export function resolvePtyForkMeta(
   return { acpx: { forkAtMessageIndex: atIndex } };
 }
 
+/**
+ * Resolve the Claude-ACP fork `resumeSessionAt` uuid (A6 — completes the
+ * durable-provenance mechanism for the mainstream Claude adapter path,
+ * mirroring the PTY-bridge branch above). Prefers `sourceMessages[atIndex-1]
+ * .claudeUuid` directly, immune to record/transcript index divergence, and
+ * falls back to `resolveClaudeUuidForAcpxIndex`'s index-arithmetic
+ * reconstruction only when the entry carries no provenance (pre-provenance
+ * sessions/entries — currently ALL Claude-ACP entries, since the adapter does
+ * not yet stamp `_meta.claudeUuid`; this makes the branch a no-op until it
+ * does).
+ */
+export async function resolveClaudeForkResumeAt(args: {
+  cwd: string;
+  acpSessionId: string;
+  atIndex: number;
+  sourceMessages: readonly SessionMessage[] | undefined;
+  subscriptionId?: string;
+}): Promise<string | undefined> {
+  const provenanceUuid = forkEntryClaudeUuid(args.sourceMessages?.[args.atIndex - 1]);
+  if (provenanceUuid) {
+    return provenanceUuid;
+  }
+  return resolveClaudeUuidForAcpxIndex({
+    cwd: args.cwd,
+    acpSessionId: args.acpSessionId,
+    forkAtIndex: args.atIndex,
+    subscriptionId: args.subscriptionId,
+    recordMessageTotal: args.sourceMessages?.length,
+  });
+}
+
 export type AcpPromptOptions = {
   messageId?: string;
 };
@@ -2216,16 +2247,12 @@ export class AcpClient {
     }
 
     if (isClaudeAcpCommand(command, args)) {
-      const uuid = await resolveClaudeUuidForAcpxIndex({
+      const uuid = await resolveClaudeForkResumeAt({
         cwd,
         acpSessionId: sourceAcpSessionId,
-        forkAtIndex: atIndex,
+        atIndex,
+        sourceMessages,
         subscriptionId: this.claudeCopySubscriptionSelection(),
-        // brick://4d6cb66d — atIndex is a WINDOW index into the record's capped
-        // runtime message list; hand the window length down so the transcript
-        // resolver can remap it onto the transcript tail instead of counting
-        // from the session start (long sessions cut ~5x too early otherwise).
-        recordMessageTotal: sourceMessages?.length,
       });
       if (!uuid) {
         throw new Error(

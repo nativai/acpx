@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import type { SessionNotification } from "@agentclientprotocol/sdk";
-import { resolvePtyForkMeta } from "../src/acp/client.js";
+import { resolveClaudeForkResumeAt, resolvePtyForkMeta } from "../src/acp/client.js";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
+import { transcriptJsonlPath } from "../src/config/subscription-transcript.js";
 import {
   createSessionConversation,
   recordPromptSubmission,
@@ -159,6 +161,151 @@ test("(c) an entry lacking claudeUuid resolves to the legacy forkAtMessageIndex 
 
   // undefined source messages → legacy path (defensive).
   assert.deepEqual(resolvePtyForkMeta(undefined, 3), { acpx: { forkAtMessageIndex: 3 } });
+});
+
+// A6 — the Claude-ACP branch of buildForkRequestContext (client.ts). Mirrors
+// the resolvePtyForkMeta tests above (A5), but for `resolveClaudeForkResumeAt`,
+// which is the Claude-adapter counterpart: same provenance-first, index-
+// arithmetic-fallback shape, proven against a REAL on-disk transcript so the
+// "bypasses the transcript walk entirely" claim isn't just an inline return.
+
+/** A minimal, valid Claude transcript JSONL: `count` user/assistant pairs. */
+function claudeTranscript(uuids: readonly string[]): string {
+  const lines: string[] = [];
+  for (let i = 0; i < uuids.length; i++) {
+    const isUser = i % 2 === 0;
+    lines.push(
+      JSON.stringify({
+        type: isUser ? "user" : "assistant",
+        uuid: uuids[i],
+        message: isUser
+          ? { content: `message ${i}` }
+          : { content: [{ type: "text", text: `reply ${i}` }] },
+        timestamp: "2026-09-19T10:00:00.000Z",
+      }),
+    );
+  }
+  return lines.join("\n") + "\n";
+}
+
+async function writeClaudeTranscript(
+  homeDir: string,
+  cwd: string,
+  acpSessionId: string,
+  uuids: readonly string[],
+): Promise<void> {
+  const configDir = path.join(homeDir, ".claude");
+  const transcriptPath = transcriptJsonlPath(configDir, cwd, acpSessionId);
+  await fs.mkdir(path.dirname(transcriptPath), { recursive: true });
+  await fs.writeFile(transcriptPath, claudeTranscript(uuids), "utf8");
+}
+
+test("(A6) resolveClaudeForkResumeAt: provenance present resolves DIRECTLY, bypassing the transcript walk entirely", async () => {
+  await withTempHome("acpx-claude-fork-provenance-", async (homeDir) => {
+    const cwd = path.join(homeDir, "project");
+    const acpSessionId = "session-a6";
+    // Transcript slot 1 (0-based) genuinely carries "transcript-a1" — if the
+    // resolver fell through to the index-arithmetic path, legacy-absolute
+    // semantics (record fits inside the window) would resolve at-index 2 to
+    // exactly that uuid.
+    await writeClaudeTranscript(homeDir, cwd, acpSessionId, [
+      "transcript-u0",
+      "transcript-a1",
+      "transcript-u2",
+      "transcript-a3",
+    ]);
+
+    const sourceMessages: SessionMessage[] = [
+      { User: { id: "u0", content: [{ Text: "hi" }] } },
+      { Agent: { content: [{ Text: "hello" }], tool_results: {}, claudeUuid: "provenance-a1" } },
+      { User: { id: "u2", content: [{ Text: "again" }] } },
+      { Agent: { content: [{ Text: "reply" }], tool_results: {} } },
+    ];
+
+    const resolved = await resolveClaudeForkResumeAt({
+      cwd,
+      acpSessionId,
+      atIndex: 2,
+      sourceMessages,
+    });
+
+    // Provenance wins — NOT the transcript's own slot-1 uuid.
+    assert.equal(resolved, "provenance-a1");
+    assert.notEqual(resolved, "transcript-a1");
+  });
+});
+
+test("(A6) resolveClaudeForkResumeAt: no provenance on the entry falls back to the UNCHANGED index-arithmetic resolution", async () => {
+  await withTempHome("acpx-claude-fork-provenance-", async (homeDir) => {
+    const cwd = path.join(homeDir, "project");
+    const acpSessionId = "session-a6-fallback";
+    await writeClaudeTranscript(homeDir, cwd, acpSessionId, [
+      "transcript-u0",
+      "transcript-a1",
+      "transcript-u2",
+      "transcript-a3",
+    ]);
+
+    const sourceMessages: SessionMessage[] = [
+      { User: { id: "u0", content: [{ Text: "hi" }] } },
+      { Agent: { content: [{ Text: "hello" }], tool_results: {} } }, // no claudeUuid
+      { User: { id: "u2", content: [{ Text: "again" }] } },
+      { Agent: { content: [{ Text: "reply" }], tool_results: {} } },
+    ];
+
+    const resolved = await resolveClaudeForkResumeAt({
+      cwd,
+      acpSessionId,
+      atIndex: 2,
+      sourceMessages,
+    });
+
+    // Falls back to the pre-existing index-arithmetic resolution — the
+    // transcript's own slot-1 uuid, exactly as resolveClaudeUuidForAcpxIndex
+    // resolved it before this change.
+    assert.equal(resolved, "transcript-a1");
+  });
+});
+
+test("(A6) resolveClaudeForkResumeAt: a fully pre-provenance session (no sourceMessages) is unaffected — legacy path throughout", async () => {
+  await withTempHome("acpx-claude-fork-provenance-", async (homeDir) => {
+    const cwd = path.join(homeDir, "project");
+    const acpSessionId = "session-a6-legacy";
+    await writeClaudeTranscript(homeDir, cwd, acpSessionId, [
+      "transcript-u0",
+      "transcript-a1",
+      "transcript-u2",
+      "transcript-a3",
+    ]);
+
+    const resolved = await resolveClaudeForkResumeAt({
+      cwd,
+      acpSessionId,
+      atIndex: 2,
+      sourceMessages: undefined,
+    });
+
+    assert.equal(resolved, "transcript-a1");
+  });
+});
+
+test("(A6) resolveClaudeForkResumeAt: no transcript on disk and no provenance resolves to undefined (unchanged failure shape)", async () => {
+  await withTempHome("acpx-claude-fork-provenance-", async (homeDir) => {
+    const cwd = path.join(homeDir, "project");
+    const acpSessionId = "session-a6-missing";
+
+    const resolved = await resolveClaudeForkResumeAt({
+      cwd,
+      acpSessionId,
+      atIndex: 2,
+      sourceMessages: [
+        { User: { id: "u0", content: [{ Text: "hi" }] } },
+        { Agent: { content: [{ Text: "hello" }], tool_results: {} } },
+      ],
+    });
+
+    assert.equal(resolved, undefined);
+  });
 });
 
 test("(A4) claudeUuid survives the messages_log round-trip", async () => {
