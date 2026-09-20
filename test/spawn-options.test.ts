@@ -413,10 +413,17 @@ test("buildAgentSpawnOptions omits ACPX_SESSION_NAME for unnamed sessions and cl
 });
 
 // brick b11f98fb — the legacy task-folder mechanism is removed: nothing SETS
-// ACPX_TASK_FOLDER any more. What remains is the tombstone strip in auth-env.ts,
-// and this is the test that holds it: an agent process started BEFORE the removal
-// still carries the variable, and it must be ERASED rather than inherited into
-// every session it spawns. Deleting this test would silently re-open that leak.
+// ACPX_TASK_FOLDER any more. What remains is the tombstone strip in auth-env.ts
+// (`delete env.ACPX_TASK_FOLDER`), and this is the test that holds it: an agent
+// process started BEFORE the removal still carries the variable, and it must be
+// ERASED rather than inherited into every session it spawns. Deleting this test
+// alone would silently re-open that leak.
+//
+// RETIREMENT IS PAIRED, AND THE CONDITION LIVES AT THE STRIP. This test and that
+// `delete` retire together — never one without the other. The condition (no agent
+// process predating 2026-09-19 can still be running anywhere) is stated in full in
+// the TOMBSTONE STRIP comment in src/acp/auth-env.ts; read it there before removing
+// either half.
 test("buildAgentSpawnOptions clears a stale inherited ACPX_TASK_FOLDER", () => {
   const previous = process.env.ACPX_TASK_FOLDER;
   process.env.ACPX_TASK_FOLDER = "/stale/task";

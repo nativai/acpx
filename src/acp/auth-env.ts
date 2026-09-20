@@ -602,11 +602,27 @@ function buildAgentEnvironment(
   delete env.ACPX_SESSION_RECORD_ID;
   delete env.ACPX_PARENT_SESSION_URL;
   delete env.ACPX_SESSION_NAME;
-  // TOMBSTONE STRIP (brick b11f98fb). The legacy task-folder mechanism is gone and
-  // nothing sets ACPX_TASK_FOLDER any more — but an agent process started BEFORE the
-  // removal still carries it, and would otherwise leak it into every session it
-  // spawns. The list is allow-by-omission (see the prefix-rule note below), so this
-  // stays to erase the dead variable rather than inherit it.
+  // ── TOMBSTONE STRIP (brick b11f98fb, 2026-09-19) — HAS A RETIREMENT CONDITION ──
+  //
+  // WHAT: the legacy task-folder mechanism is removed. NOTHING in this codebase sets
+  // ACPX_TASK_FOLDER any more — this line only ERASES it, it never populates it.
+  //
+  // WHY IT STILL EXISTS: an agent process started BEFORE the removal still carries the
+  // variable in its live environment, and a live process's env cannot be mutated in
+  // place. The list above is ALLOW-BY-OMISSION (see the prefix-rule note below), so
+  // without this line that dead value would be inherited into every session such a
+  // process spawns — and long-lived sessions here routinely outlive a deploy.
+  //
+  // WHEN TO DELETE IT: once no agent process predating 2026-09-19 can still be running
+  // on any box — i.e. after every box has been re-rolled since then, which a pod
+  // restart guarantees. At that point there is no source for the variable and this line
+  // is pure dead code: delete it and the paired test below.
+  //   test/spawn-options.test.ts → "buildAgentSpawnOptions clears a stale inherited
+  //   ACPX_TASK_FOLDER" is the ONLY thing holding this line. They retire together.
+  //
+  // Do NOT preserve this out of caution once that condition is met, and do NOT delete
+  // it before: both failure modes are why this paragraph names the condition instead of
+  // leaving a bare `delete` for the next sweep to guess at.
   delete env.ACPX_TASK_FOLDER;
   delete env.ACPX_BRICK;
   delete env.ACPX_BRICK_PATH;
