@@ -3,25 +3,48 @@ import { join } from "node:path";
 
 /**
  * `ACPX_SESSION_TMP` — a per-session scratch directory, one per `acpxRecordId`
- * (SPEC.md, brick 41e47c11 / ceca191f).
+ * (SPEC.md v2, brick 41e47c11 / ceca191f).
  *
- * ## ⚠️ WHY THE ROOT IS `/workspace`, NEVER `os.tmpdir()`
+ * ## ⚠️ WHY THE ROOT IS `/tmp` — A DELIBERATE CHOICE, TRADING AWAY CROSS-POD
+ * ## VISIBILITY ON PURPOSE (v2; v1 rooted this in `/workspace` — see below)
  *
- * A dev box is two pods sharing exactly `/workspace` (and `/wisdom`) at the same
- * path — `/tmp` is per-pod. `workbench-exec` forwards the spawning process's
- * WHOLE environment to the workbench, so a `/tmp`-rooted value would arrive
- * there naming a directory that pod never wrote to: the agent's own file
- * invisible, a read silently creating an empty one. Rooting in `/workspace`
- * makes that forwarding correct instead of merely harmless — same path, same
- * file, both pods. It also means the directory survives a control-plane pod
- * restart for free, since `/workspace` is PVC-backed.
+ * Three reasons, from SPEC.md's "Why `/tmp`":
+ *
+ *   1. **Self-cleaning.** `/tmp` is pod-local and wiped on pod restart, so a
+ *      session's scratch directory cannot accumulate — that is the ENTIRE
+ *      reason no reaper exists or is needed for this variable.
+ *   2. **Room.** `/tmp` (overlay) has ~342 GB free on this box; `/workspace`
+ *      (PVC) has 16 GB at 88% used. Scratch belongs on the roomy volume, not
+ *      the tight permanent one.
+ *   3. **Not shared with the workbench pod, and that is ACCEPTED, not a
+ *      regression to work around.** `workbench-exec` forwards the whole
+ *      environment, so the variable arrives on the workbench too — naming
+ *      THAT pod's own `/tmp`, harmlessly: each pod gets its own scratch. An
+ *      agent that genuinely needs a payload visible on both pods writes it
+ *      under `/workspace` or the brick folder explicitly; that is a
+ *      documented exception, not the default this variable provides.
+ *
+ * ⚠️ **DO NOT "FIX" THIS BACK TO `/workspace`.** That was v1's design, and it
+ * is what CREATED the accumulation problem this variable's reaper was built to
+ * solve — Daniel then measured the real footprint (0.27 GB across this box's
+ * entire 6,844-session lifetime, against 16 GB free) and found the reaper was
+ * solving a problem that did not exist at the cost it was built at. Moving
+ * the root back to `/workspace` reintroduces that problem from nothing.
  *
  * `harness-config-dir-root.ts` is the sibling precedent for a per-session
- * directory root, and it deliberately falls back to `tmpdir()` — that is
- * correct THERE because that root need not be cross-pod. It is exactly the
- * wrong default here, which is why this module does not reuse that one.
+ * directory root, and it ALSO defaults to `tmpdir()` (i.e. `/tmp`) for exactly
+ * the reasons above — the two modules now agree, where v1 deliberately
+ * diverged from that precedent for a cross-pod need this spec no longer asks
+ * for.
  */
-export const SESSION_TMP_DEFAULT_ROOT = "/workspace/.tmp";
+export const SESSION_TMP_DEFAULT_ROOT = "/tmp";
+
+/** The prefix every `ACPX_SESSION_TMP` directory carries under `/tmp` — unlike
+ *  v1's `/workspace/.tmp` root, which was acpx-only territory, `/tmp` is a
+ *  generic, heavily-shared scratch space, so the directory name itself must
+ *  self-identify to avoid colliding with (or being mistaken for) anything
+ *  else living there. */
+const SESSION_TMP_DIR_PREFIX = "acpx-";
 
 /**
  * Test/operator override, mirroring `ACPX_HARNESS_CONFIG_DIR_ROOT`
@@ -58,49 +81,42 @@ export function resolveSessionTmpRoot(
 }
 
 /**
- * `<root>/<sessionId>` — the only place this path is composed. A companion
- * reaper (brick 7a89ec64, split from this one — SPEC.md's "ship the reaper
- * with the feature" clause was withdrawn by Daniel on measurement: this box's
- * full lifetime session count projects to a negligible worst-case scratch
- * footprint against `/workspace`'s free space) lives on its own branch and
- * must compose this SAME path the same way; keep this function as the one
- * place that composition happens, exported, so a future reaper (in this repo
- * or that branch) has no reason to duplicate it.
+ * `<root>/acpx-<sessionId>` — the only place this path is composed, so a
+ * future reader has no reason to duplicate it. No reaper exists or is needed
+ * (SPEC.md v2): `/tmp` is pod-local and wiped on pod restart, which is the
+ * entire cleanup mechanism.
  */
 export function sessionTmpDirFor(sessionId: string, root: string): string {
-  return join(root, sessionId);
+  return join(root, `${SESSION_TMP_DIR_PREFIX}${sessionId}`);
 }
 
 /**
  * Create THIS session's scratch directory, mode `0700`, and return its path.
  *
- * ⚠️ BEST-EFFORT ON PURPOSE. A `mkdir` failure (disk full — `/workspace` runs at
- * 88%, though Daniel's own measurement of this box's full lifetime session
- * count found the worst-case scratch footprint negligible against its free
- * space, which is why the reaper is a separate, unblocked, no-rush brick
- * rather than a release condition for this variable — brick 7a89ec64) is
- * reported to stderr rather than thrown: failing session creation itself over
- * a scratch directory would be a strictly worse outcome than a session that
- * starts without one. `ACPX_SESSION_TMP` is still set to the intended path
- * either way — a write against a directory that never got created fails
- * LOUDLY at the point of use (ENOENT), which is the failure mode SPEC.md
- * wants, not a silent fallback to `/tmp`.
+ * ⚠️ BEST-EFFORT ON PURPOSE. A `mkdir` failure is reported to stderr rather
+ * than thrown: failing session creation itself over a scratch directory would
+ * be a strictly worse outcome than a session that starts without one.
+ * `ACPX_SESSION_TMP` is still set to the intended path either way — a write
+ * against a directory that never got created fails LOUDLY at the point of use
+ * (ENOENT), which is the failure mode SPEC.md wants, not a silent fallback to
+ * some other path.
  *
- * ⚠️ `chmodSync` AFTER `mkdirSync`, NOT `mode` ALONE — measured against a REAL
- * spawn on devbox, not assumed. `/workspace` carries the setgid bit (`2775`),
- * and Linux directories INHERIT their parent's setgid bit on creation
- * regardless of the `mode` passed to `mkdir(2)` — `mkdirSync(dir, { mode:
- * 0o700 })` under such a parent produced `stat -c %a` `2700`, not `700`
- * (acceptance criterion 1 is the literal `%a` value). The setgid bit does not
- * by itself widen access — group permission bits are still 0 — but the
- * criterion is exact, so an explicit `chmodSync(dir, 0o700)` (which sets the
- * mode exactly, clearing any inherited special bits) is not belt-and-braces
- * here, it is the fix for a real, measured mismatch.
+ * ⚠️ `chmodSync` AFTER `mkdirSync`, NOT `mode` ALONE — SPEC.md is explicit
+ * about this ("set explicitly — mkdir's mode argument does not override an
+ * inherited setgid bit"), and it is not a hypothetical: measured against a
+ * REAL spawn under v1's `/workspace`-rooted design (which carried the setgid
+ * bit, `2775`), `mkdirSync(dir, { mode: 0o700 })` alone produced `stat -c %a`
+ * `2700`, not `700` — Linux directories INHERIT their parent's setgid bit on
+ * creation regardless of the `mode` passed to `mkdir(2)`. `/tmp` on this box
+ * is `1777` (no setgid) today, so the specific failure mode is not currently
+ * reproducible here — but the code must not rely on that: a caller-supplied
+ * `rootDir`, or a future box, can carry the same bit, and `chmodSync` (which
+ * sets the mode exactly, clearing any inherited special bit) costs nothing to
+ * keep unconditional.
  *
  * Idempotent and safe to call on every spawn of a resumed session: re-running
  * `chmod` on an already-0700 directory is a no-op, so this also self-heals a
- * directory whose mode drifted (or whose parent's setgid got re-inherited by
- * some other means) under a still-open session.
+ * directory whose mode drifted under a still-open session.
  */
 export function ensureSessionTmpDir(
   sessionId: string,

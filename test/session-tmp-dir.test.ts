@@ -27,7 +27,7 @@ test("resolveSessionTmpRoot precedence: explicit arg > env > default", () => {
     assert.equal(resolveSessionTmpRoot(undefined), "/from/env");
     assert.equal(resolveSessionTmpRoot("   "), "/from/env", "whitespace-only arg is ABSENT");
     delete process.env[SESSION_TMP_ROOT_ENV];
-    assert.equal(resolveSessionTmpRoot(undefined), "/workspace/.tmp");
+    assert.equal(resolveSessionTmpRoot(undefined), "/tmp");
   } finally {
     if (previous === undefined) {
       delete process.env[SESSION_TMP_ROOT_ENV];
@@ -37,14 +37,14 @@ test("resolveSessionTmpRoot precedence: explicit arg > env > default", () => {
   }
 });
 
-test("sessionTmpDirFor composes exactly <root>/<sessionId>", () => {
-  assert.equal(sessionTmpDirFor("abc-123", "/workspace/.tmp"), "/workspace/.tmp/abc-123");
+test("sessionTmpDirFor composes exactly <root>/acpx-<sessionId>", () => {
+  assert.equal(sessionTmpDirFor("abc-123", "/tmp"), "/tmp/acpx-abc-123");
 });
 
 test("ensureSessionTmpDir creates the directory at mode 0700 exactly", () => {
   withScopedRoot((root) => {
     const dir = ensureSessionTmpDir("11111111-2222-3333-4444-555555555555", root);
-    assert.equal(dir, join(root, "11111111-2222-3333-4444-555555555555"));
+    assert.equal(dir, join(root, "acpx-11111111-2222-3333-4444-555555555555"));
     const stat = statSync(dir);
     assert.equal(stat.isDirectory(), true);
     // The FULL mode, special bits included — %a in `stat -c %a` reads this,
@@ -53,15 +53,17 @@ test("ensureSessionTmpDir creates the directory at mode 0700 exactly", () => {
   });
 });
 
-// brick ceca191f — measured against a REAL spawn on devbox: `/workspace` itself
-// carries the setgid bit (`2775`), and Linux directories INHERIT their
-// parent's setgid bit on creation REGARDLESS of the `mode` passed to
-// `mkdir(2)`. A plain `mkdirSync(dir, { mode: 0o700 })` under such a parent
-// produces `stat -c %a` `2700`, not `700` — this row is the regression guard
-// for the `chmodSync` fix that followed that measurement.
+// brick ceca191f — measured against a REAL spawn under v1's `/workspace`-rooted
+// design: that parent carried the setgid bit (`2775`), and Linux directories
+// INHERIT their parent's setgid bit on creation REGARDLESS of the `mode`
+// passed to `mkdir(2)`. A plain `mkdirSync(dir, { mode: 0o700 })` under such a
+// parent produces `stat -c %a` `2700`, not `700` — this row is the regression
+// guard for the `chmodSync` fix that followed that measurement, kept even
+// though `/tmp` (v2's root) does not itself carry setgid, since a
+// caller-supplied `rootDir` or a future box's `/tmp` still could.
 test("ensureSessionTmpDir strips an inherited setgid bit from a setgid-parent root", () => {
   withScopedRoot((root) => {
-    chmodSync(root, 0o2775); // simulate a /workspace-shaped parent (rwxrwsr-x)
+    chmodSync(root, 0o2775); // simulate a setgid-carrying parent (rwxrwsr-x)
     const before = statSync(root);
     assert.equal(before.mode & 0o7000, 0o2000, "setup sanity: the fixture root must carry setgid");
 
