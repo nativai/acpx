@@ -1224,6 +1224,51 @@ export type SessionRecord = {
   importedFrom?: SessionImportedFrom;
   /** acpx-ui-owned template marker; daemon round-trips it untouched. */
   template?: SessionTemplateState;
+  /**
+   * SEATS (brick 5ad22d5d, contract C1/C2). UUID identity of the durable
+   * "seat" this record is a holder of — minted independently of
+   * `acpxRecordId`'s id shape. Every creation path (normal create,
+   * fork/copy, subagent shadow) mints a FRESH seat: a fork never inherits
+   * the source's seat (Daniel, 2026-09-22 — "the easiest way ... no matter
+   * what kind of fork"). Persisted `seat_id`. Absent on a pre-Seat record —
+   * a record with no `seatId` IS its own seat (skew/back-compat contract,
+   * never an error state).
+   */
+  seatId?: string;
+  /**
+   * Creation-assigned position of this holder within its seat's history —
+   * never renumbered (so a displayed ordinal survives an earlier holder
+   * being archived). Persisted `holder_ordinal`. B1 mints exactly one
+   * holder per seat, so every record B1 creates carries `1`; B2's
+   * succession verb assigns `max(existing for seat) + 1` when creating an
+   * additional holder into an EXISTING seat.
+   */
+  holderOrdinal?: number;
+  /**
+   * True iff this holder is its seat's current ACTIVE holder. At most one
+   * record per `seatId` may carry `true` at any time — B1 mints one holder
+   * per seat so this holds trivially; B2's activation write owns enforcing
+   * it across a succession (the same unconditional-preserve discipline as
+   * `preserveParentLinkageForPersist`, per brick c99f9994's precedent).
+   * Persisted `holder_active`. Projected onto the index entry — NOT only
+   * the record — because acpx-ui's hot path never opens `<id>.json` and
+   * synthesises its view from the index entry instead (see
+   * `SessionIndexEntry.holderActive` below); a marker that stopped at the
+   * record would be a routing misroute, not a cosmetic one.
+   */
+  holderActive?: boolean;
+  /**
+   * The PARENT session's seat id, captured at THIS record's creation from
+   * the parent record then in hand (same-box only — a cross-box parent,
+   * known only by URL, has no locally resolvable seat). Used solely to
+   * compose `ACPX_PARENT_SEAT_URL` at every subsequent spawn of THIS
+   * record (mirrors `parentSessionUrl`'s role for `ACPX_PARENT_SESSION_URL`).
+   * Persisted `parent_seat_id`. ⚠️ NOT kept live across a `set-parent`
+   * re-parent — that verb updates `parentSessionId`/`parentSessionUrl` but
+   * intentionally does not re-resolve this field (B1 scope boundary; see
+   * `B1-SHAPE-AS-SHIPPED.md`).
+   */
+  parentSeatId?: string;
 };
 
 export type RunPromptResult = {

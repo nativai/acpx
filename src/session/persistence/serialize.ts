@@ -93,6 +93,10 @@ export function serializeSessionRecordForDisk(
     subagents: canonical.subagents?.map(serializeSubagentRef),
     metadata: canonical.metadata,
     template: canonical.template,
+    seat_id: canonical.seatId,
+    holder_ordinal: canonical.holderOrdinal,
+    holder_active: canonical.holderActive,
+    parent_seat_id: canonical.parentSeatId,
     imported_from: canonical.importedFrom
       ? {
           record_id: canonical.importedFrom.recordId,

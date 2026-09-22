@@ -240,6 +240,18 @@ async function createSessionRecordWithClient(
     agentCapabilities: client.initializeResult?.agentCapabilities,
     ...conversation,
     acpx: desiredConfigOptions ? { desired_config_options: desiredConfigOptions } : {},
+    // SEATS (brick 5ad22d5d, D-B1-6/D-B1-7). This literal is the SHARED seam
+    // for BOTH the normal-create path AND the fork/copy path (forkContext is
+    // set above when options.forkFromSessionId was given) — so minting here
+    // unconditionally covers seat-creation paths 1 and 2 with one edit. A
+    // fork NEVER inherits the source's seat (Daniel, 2026-09-22: every fork
+    // mints a new seat, no exceptions) — hence unconditional, not gated on
+    // `forkContext`. B1 mints exactly one holder per seat, so holderOrdinal
+    // is always 1 and holderActive is always true here; B2's succession verb
+    // is the only place that ever creates holderOrdinal > 1.
+    seatId: crypto.randomUUID(),
+    holderOrdinal: 1,
+    holderActive: true,
     ...(forkContext
       ? {
           kind: "session" as const,
@@ -262,6 +274,12 @@ async function createSessionRecordWithClient(
           ...(options.parentSessionUrl?.trim()
             ? { parentSessionUrl: options.parentSessionUrl.trim() }
             : {}),
+          // Mirrors parentSessionUrl immediately above, for the seat sibling
+          // (C3/D-B1-9): captured once at creation from the parent record then
+          // in hand (same-box only — see ResolvedParentSession.seatId in
+          // command-handlers.ts), used to compose ACPX_PARENT_SEAT_URL on
+          // every subsequent spawn of THIS record.
+          ...(options.parentSeatId?.trim() ? { parentSeatId: options.parentSeatId.trim() } : {}),
         }
       : {}),
     ...(options.metadata && Object.keys(options.metadata).length > 0
@@ -633,6 +651,16 @@ function creationSessionContext(options: SessionCreateOptions) {
     // instead of re-deriving one against the LOCAL base URL — which silently
     // re-hosts a cross-box parent onto this box. (FW-19)
     parentSessionUrl: options.parentSessionUrl ?? null,
+    // SEATS (C3/D-B1-9). This session's OWN seatId is deliberately NOT set
+    // here: it does not exist yet at this point (minted inside
+    // createSessionRecordWithClient's record literal, which runs AFTER this
+    // context is built) — same reasoning as acpxRecordId:"" above; it is set
+    // from the persisted record on the NEXT spawn. The PARENT's seat id is
+    // already resolvable at this point (same-box parent, resolved before
+    // createSession was called — see ResolvedParentSession.seatId in
+    // command-handlers.ts), so it is available even on this transient spawn,
+    // mirroring parentSessionUrl immediately above.
+    parentSeatId: options.parentSeatId ?? null,
     brick,
     brickPath,
     agentFolder: null,
@@ -907,6 +935,7 @@ export async function ensureSession(options: SessionEnsureOptions): Promise<Sess
     resumeSessionId: options.resumeSessionId,
     parentSessionId: options.parentSessionId,
     parentSessionUrl: options.parentSessionUrl,
+    parentSeatId: options.parentSeatId,
     metadata: options.metadata,
     mcpServers: options.mcpServers,
     permissionMode: options.permissionMode,

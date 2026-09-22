@@ -539,6 +539,23 @@ export type AgentSessionContext = {
    * shim's OR_REASONING_EFFORT env var. Must be in the profile's valid effort set.
    */
   reasoningEffort?: string | null;
+  /**
+   * SEATS (C3/D-B1-9, brick 5ad22d5d). This session's OWN seat id — composed
+   * into ACPX_SEAT_URL exactly as acpxRecordId is composed into
+   * ACPX_SESSION_URL. Absent on the transient creation spawn (mirrors
+   * acpxRecordId's own "" on that spawn — see creationSessionContext in
+   * session-management.ts), present on every subsequent spawn once the
+   * record carries it.
+   */
+  seatId?: string | null;
+  /**
+   * The PARENT's seat id — composed into ACPX_PARENT_SEAT_URL exactly as
+   * parentSessionId/parentSessionUrl are composed into
+   * ACPX_PARENT_SESSION_URL. Unlike parentSessionUrl there is no separate
+   * "explicit URL" form here: a seat is box-scoped by design (C1), so this
+   * is only ever populated from a SAME-BOX parent's own record.
+   */
+  parentSeatId?: string | null;
 };
 
 /**
@@ -596,6 +613,16 @@ function buildAgentEnvironment(
   // then set only from THIS spawn context below so a bridge session can never
   // carry another session identity.
   delete env.ACPX_SESSION_URL;
+  // SEATS (C3/D-B1-8, brick 5ad22d5d). SAME reasoning as ACPX_SESSION_URL
+  // immediately above, and the two MUST move together: adding these only to
+  // the write block below would reintroduce FW-07 for seat identity — a
+  // long-lived queue owner that served a different session would leak a
+  // STALE ACPX_SEAT_URL into a child whenever the write path's guards don't
+  // fire, and the symptom is a child reporting into someone else's seat, the
+  // exact failure this delete block exists to prevent, wearing the costume
+  // of the feature working.
+  delete env.ACPX_SEAT_URL;
+  delete env.ACPX_PARENT_SEAT_URL;
   // brick c2df657e — the OpenRouter sticky-routing key the seeded pi extension
   // reads (PI_ROUTING_EXTENSION_CODE). Session identity, same reasoning as
   // ACPX_SESSION_URL: a stale value would pin another session's provider cache
@@ -822,6 +849,16 @@ function buildAgentEnvironment(
       env.ACPX_SESSION_URL = `${baseUrl}/?session=${trimmed}`;
     }
   }
+  // SEATS (C3/D-B1-9, brick 5ad22d5d). Composed EXACTLY like ACPX_SESSION_URL
+  // immediately above, substituting ?seat= for ?session= — same trim guard,
+  // same "absent on the transient creation spawn" behaviour (seatId is "" /
+  // unset there; see creationSessionContext).
+  if (baseUrl && sessionContext && typeof sessionContext.seatId === "string") {
+    const trimmedSeat = sessionContext.seatId.trim();
+    if (trimmedSeat.length > 0) {
+      env.ACPX_SEAT_URL = `${baseUrl}/?seat=${trimmedSeat}`;
+    }
+  }
   // brick c2df657e — hand the RECORD id to the adapter on its own, WITHOUT the
   // ACPX_SESSION_URL gate: the pi sticky-routing extension needs the stable key
   // even where no UI base URL resolves (the URL is a nicety here; the record id
@@ -857,6 +894,20 @@ function buildAgentEnvironment(
   const parentSessionUrl = resolveParentSessionUrl(sessionContext, baseUrl);
   if (parentSessionUrl) {
     env.ACPX_PARENT_SESSION_URL = parentSessionUrl;
+  }
+  // SEATS (C3/D-B1-9, brick 5ad22d5d). No "explicit URL" preference here,
+  // unlike resolveParentSessionUrl above — a seat is box-scoped by design
+  // (C1: "seats inherit box-scoping"), so parentSeatId is only ever known
+  // for a SAME-BOX parent (ResolvedParentSession.seatId in
+  // command-handlers.ts never resolves it for a cross-box parent), and
+  // composing it against this box's own baseUrl is therefore always correct
+  // when present — never the c6e3618b re-hosting hazard resolveParentSessionUrl
+  // exists to avoid.
+  if (baseUrl && sessionContext && typeof sessionContext.parentSeatId === "string") {
+    const trimmedParentSeat = sessionContext.parentSeatId.trim();
+    if (trimmedParentSeat.length > 0) {
+      env.ACPX_PARENT_SEAT_URL = `${baseUrl}/?seat=${trimmedParentSeat}`;
+    }
   }
   if (sessionContext && typeof sessionContext.brick === "string") {
     const trimmedBrick = sessionContext.brick.trim();

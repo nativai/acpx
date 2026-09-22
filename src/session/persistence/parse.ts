@@ -1489,6 +1489,25 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     return null;
   }
 
+  // SEATS (brick 5ad22d5d, C2) — top-level, additive under acpx.session.v1.
+  // Absent on a pre-Seat record; never rejects the record (skew contract).
+  const seatId = normalizeOptionalString(record.seat_id);
+  if (seatId === null) {
+    return null;
+  }
+  const holderOrdinal = normalizeOptionalNonNegativeInteger(record.holder_ordinal);
+  if (holderOrdinal === null) {
+    return null;
+  }
+  const holderActive = normalizeOptionalBooleanField(record.holder_active);
+  if (holderActive === null) {
+    return null;
+  }
+  const parentSeatId = normalizeOptionalString(record.parent_seat_id);
+  if (parentSeatId === null) {
+    return null;
+  }
+
   return rememberSessionModelBaseline(
     rememberSessionMetadataBaseline({
       schema: SESSION_RECORD_SCHEMA,
@@ -1538,6 +1557,10 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
       metadata,
       importedFrom: recordMetadata.importedFrom,
       template: parseTemplateState(record.template),
+      seatId: seatId ?? undefined,
+      holderOrdinal: holderOrdinal ?? undefined,
+      holderActive: holderActive ?? undefined,
+      parentSeatId: parentSeatId ?? undefined,
     }),
   );
 }

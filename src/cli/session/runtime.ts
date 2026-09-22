@@ -2324,6 +2324,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         subscriptionId: record.acpx?.session_options?.subscription ?? null,
         profileId: record.acpx?.session_options?.profile ?? null,
         reasoningEffort: sessionOptions?.reasoningEffort ?? null,
+        seatId: record.seatId ?? null,
+        parentSeatId: record.parentSeatId ?? null,
       },
       sessionOptions,
     });
@@ -2467,6 +2469,16 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
               request_token_usage: {},
               kind: "subagent",
               parentSessionId: record.acpxRecordId,
+              // SEATS (D-B1-6/D-B1-7, brick 5ad22d5d) — creation path 3, the
+              // one NOT reached through createSessionRecordWithClient. No
+              // carve-out for kind:"subagent" (DECISIONS-HOD §D1): every
+              // session record has exactly one seat. Same unconditional mint
+              // as the other two paths — a subagent shadow record is its own
+              // new seat, never joins its parent's.
+              seatId: crypto.randomUUID(),
+              holderOrdinal: 1,
+              holderActive: true,
+              parentSeatId: record.seatId,
             };
             subagentIdToAcpxRecordId.set(agentId, childAcpxRecordId);
             subagentRecordsById.set(childAcpxRecordId, childRecord);

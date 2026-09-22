@@ -102,6 +102,8 @@ export type SessionCreateOptions = {
   parentSessionId?: string;
   /** Full parent acpx-ui URL (host+id) for cross-machine lineage. (FW-19) */
   parentSessionUrl?: string;
+  /** The parent's seat id, resolved same-box only (C3/D-B1-9, brick 5ad22d5d). */
+  parentSeatId?: string;
   metadata?: Record<string, string>;
   mcpServers?: McpServer[];
   permissionMode: PermissionMode;
@@ -153,6 +155,8 @@ export type SessionEnsureOptions = {
   parentSessionId?: string;
   /** Full parent acpx-ui URL (host+id) for cross-machine lineage. (FW-19) */
   parentSessionUrl?: string;
+  /** The parent's seat id, resolved same-box only (C3/D-B1-9, brick 5ad22d5d). */
+  parentSeatId?: string;
   metadata?: Record<string, string>;
   mcpServers?: McpServer[];
   permissionMode: PermissionMode;

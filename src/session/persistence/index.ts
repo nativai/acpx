@@ -209,6 +209,20 @@ export type SessionIndexEntry = {
   // uses templateVersion/templateCreatedAt to pick the latest.
   templateSlug?: string;
   templateVersion?: number;
+  /**
+   * SEATS (brick 5ad22d5d, C2). Mirrors `SessionRecord.seatId` — see its
+   * doc comment in `types.ts`. MANDATORY on this leg, not merely additive
+   * enrichment: `holderActive` (below) routes delivery, and
+   * `SessionRecord.parentSetAt`'s own comment above documents the exact
+   * hazard a routing field stopping at the record creates — acpx-ui's hot
+   * path never opens `<id>.json`, it synthesises its view from THIS entry.
+   */
+  seatId?: string;
+  /** Mirrors `SessionRecord.holderOrdinal`. */
+  holderOrdinal?: number;
+  /** Mirrors `SessionRecord.holderActive`. See `seatId` above: this is the
+   * field the hazard is about. */
+  holderActive?: boolean;
 };
 
 type SessionIndex = {
@@ -428,6 +442,9 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     templateAutoPrompt: optionalString(record.templateAutoPrompt),
     templateSlug: optionalString(record.templateSlug),
     templateVersion: optionalFiniteNumber(record.templateVersion),
+    seatId: optionalString(record.seatId),
+    holderOrdinal: optionalFiniteNumber(record.holderOrdinal),
+    holderActive: optionalBoolean(record.holderActive),
   };
 }
 
@@ -597,6 +614,9 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     templateAutoPrompt: record.template?.auto_prompt,
     templateSlug: record.template?.slug,
     templateVersion: record.template?.version,
+    seatId: record.seatId,
+    holderOrdinal: record.holderOrdinal,
+    holderActive: record.holderActive,
   };
 }
 

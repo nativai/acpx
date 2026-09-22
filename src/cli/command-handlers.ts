@@ -691,6 +691,14 @@ type ResolvedParentSession = {
   acpxRecordId: string;
   /** Full parent url (host+id) for cross-machine lineage, when known. (FW-19) */
   sessionUrl?: string;
+  /**
+   * The parent's seat id (C3/D-B1-9, brick 5ad22d5d) — set only when the
+   * parent record was resolved LOCALLY (same-box; see the SessionNotFoundError
+   * branch in resolveAndValidateParentSessionId below, which only ever learns
+   * a cross-box parent's URL, never its record). Feeds ACPX_PARENT_SEAT_URL;
+   * absent means "unknown", never "no seat".
+   */
+  seatId?: string;
   brick?: string;
   subscription?: string;
   profile?: string;
@@ -715,6 +723,7 @@ function parentInheritableFields(parent: SessionRecord): ResolvedParentSession {
   const sessionOptions = parent.acpx?.session_options;
   return {
     acpxRecordId: parent.acpxRecordId,
+    seatId: parent.seatId,
     brick: parent.metadata?.brick,
     subscription: sessionOptions?.subscription,
     profile: sessionOptions?.profile,
@@ -900,6 +909,7 @@ function buildSessionStartOptions(params: {
     resumeSessionId: params.flags.resumeSession,
     parentSessionId: params.parent?.acpxRecordId,
     parentSessionUrl: params.parent?.sessionUrl,
+    parentSeatId: params.parent?.seatId,
     metadata: withInheritedBrick(
       applyBrickFlag(params.flags.metadata, params.resolvedBrick),
       params.parent?.brick,
@@ -3079,6 +3089,7 @@ async function runSessionCopy(
     ),
     parentSessionId: parent?.acpxRecordId,
     parentSessionUrl: parent?.sessionUrl,
+    parentSeatId: parent?.seatId,
     forkFromSessionId: source.acpxRecordId,
     forkAtMessageIndex: flags.atIndex,
     mcpServers: config.mcpServers,
