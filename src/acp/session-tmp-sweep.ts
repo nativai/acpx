@@ -14,13 +14,46 @@ import { resolveSessionTmpRoot } from "./session-tmp-dir.js";
  *      some live process's command line) is retained, full stop — this is the
  *      one clause nothing below may override, mirroring
  *      `pruneOrphanHarnessConfigDirs`'s "positive ownership" discipline.
- *   2. Past a HARD CEILING of directory age (default 30 days), a directory is
- *      removed unconditionally — the disk-safety net SPEC.md asks for,
- *      independent of record state, still subject to clause 1.
- *   3. Below the hard ceiling: no known record ⇒ retain (`unrecognised`); an
- *      OPEN record ⇒ retain (`openRecord`) — a session's own age tells you
- *      nothing about whether it is still wanted; a CLOSED record ⇒ removed once
- *      idle past the GRACE period (default 7 days), else retained (`tooYoung`).
+ *   2. A directory whose record lookup could not be CONFIRMED either way (the
+ *      caller tried and failed, distinct from a confirmed absence) is retained
+ *      — `unresolved`, never eligible for clause 4 below no matter its age.
+ *   3. A CONFIRMED record decides it, fully, with no age override: OPEN ⇒
+ *      retain (`openRecord`) — regardless of directory age, see the warning
+ *      below; CLOSED ⇒ removed once idle past the GRACE period (default 7
+ *      days), else retained (`tooYoung`).
+ *   4. Only when there is NO record at all (a genuinely unclaimed directory,
+ *      confirmed by a lookup that positively found nothing) does a HARD
+ *      CEILING of directory age (default 30 days) apply — the disk-safety net
+ *      SPEC.md asks for, for the one case that has no record to trust.
+ *
+ * ## ⚠️ WHY AN OPEN RECORD BEATS THE HARD CEILING, UNCONDITIONALLY (brick
+ * ## ceca191f, TE finding — this was NOT the original design)
+ *
+ * The first shipped version put the hard ceiling BEFORE the record check, so
+ * ANY directory past 30 days was removed regardless of record state —
+ * including a genuinely OPEN, still-in-use session. That is exactly backwards:
+ * a session's own age says nothing about whether it is still wanted, and the
+ * hard ceiling exists to clean up directories NOBODY can vouch for, not to
+ * second-guess a record that says otherwise. It was caught by a test-engineer
+ * running the real CLI against a real, large session store on this box:
+ * `session.listSessions()` (pre-existing code, not this module) OOM-crashes
+ * when parsing this box's real ~1400-record store, so the CLI could only
+ * complete via `workbench-exec` — which cannot see the control-plane pod's
+ * session records OR live processes at all (both are per-pod). A directory
+ * swept from there therefore had NO WAY to ever resolve a record, so every
+ * real session fell through to `unrecognised`, and once one crossed 30 days
+ * old it would have been removed unconditionally, live or not.
+ *
+ * The fix has two parts, both required: (a) the CALLER (`command-handlers.ts`)
+ * now resolves records with a TARGETED per-candidate lookup
+ * (`resolveSessionRecord`), never a full-store parse, so it no longer depends
+ * on the pod being able to see the whole store, and can safely run on the
+ * control plane, where live sessions' records and processes actually live;
+ * (b) this module no longer lets ANY age threshold override a record it
+ * actually has — the hard ceiling is scoped to the no-record case alone, and a
+ * lookup that FAILED (as opposed to confirmed nothing) is retained
+ * unconditionally via clause 2, never silently treated as "no record" and fed
+ * to the hard ceiling.
  *
  * ## ⚠️ WHY THE LIVE-PROCESS CHECK NEEDS ONLY THE PID POPULATION
  *
@@ -38,8 +71,10 @@ import { resolveSessionTmpRoot } from "./session-tmp-dir.js";
 /** One week. */
 export const DEFAULT_SESSION_TMP_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** One month — the safety-net ceiling past which a directory is removed
- *  regardless of record state, still subject to the live-process check. */
+/** One month — the safety-net ceiling past which a genuinely UNCLAIMED
+ *  directory (no record at all) is removed. Never overrides a record the
+ *  sweep actually has — see "why an open record beats the hard ceiling" above
+ *  — and still subject to the live-process check. */
 export const DEFAULT_SESSION_TMP_HARD_CEILING_MS = 30 * 24 * 60 * 60 * 1000;
 
 /** A session-tmp directory's name IS the session id — no prefix, no suffix.
@@ -57,7 +92,12 @@ export interface KnownSessionTmpRecord {
 }
 
 /** Why a directory was KEPT. */
-type SessionTmpRetainReason = "liveProcess" | "openRecord" | "unrecognised" | "tooYoung";
+type SessionTmpRetainReason =
+  | "liveProcess"
+  | "openRecord"
+  | "unrecognised"
+  | "tooYoung"
+  | "unresolved";
 
 /** One candidate and what the rule decided, for a dry-run preview or a report. */
 export interface SessionTmpCandidateReport {
@@ -89,6 +129,9 @@ export interface SessionTmpSweepResult {
     /** No usable timestamp AND no readable directory stat — never guessed. */
     ageUnknown: number;
     unmeasured: number;
+    /** The caller's record lookup FAILED for this id (distinct from a
+     *  confirmed absence) — never eligible for the hard-ceiling clause. */
+    unresolved: number;
   };
   oldestRetainedAgeMs?: number;
   /** True when the sweep REFUSED because `/proc` was not enumerable. */
@@ -97,8 +140,16 @@ export interface SessionTmpSweepResult {
 
 export function sweepSessionTmpDirs(params: {
   /** Records keyed by `acpxRecordId` — the only id a session-tmp directory is
-   *  ever named after (`session-tmp-dir.ts`). */
+   *  ever named after (`session-tmp-dir.ts`). A CONFIRMED absence (the caller
+   *  positively looked and found nothing) is the id simply not being a key
+   *  here; see {@link unresolvedIds} for "the lookup itself failed", which is
+   *  a DIFFERENT thing and must not be represented by omission from this map. */
   records: ReadonlyMap<string, KnownSessionTmpRecord>;
+  /** Ids whose record lookup FAILED (an I/O error, not a confirmed miss) —
+   *  retained unconditionally, never eligible for the hard-ceiling clause.
+   *  Omit entirely (or pass an empty set) only when the caller can guarantee
+   *  every lookup was either a confirmed hit or a confirmed absence. */
+  unresolvedIds?: ReadonlySet<string>;
   /** The `/proc` census. Absent or unmeasured ⇒ nothing is removed. */
   liveScan?: LiveProcessScan;
   rootDir?: string;
@@ -114,6 +165,7 @@ export function sweepSessionTmpDirs(params: {
   const graceMs = params.graceMs ?? DEFAULT_SESSION_TMP_GRACE_MS;
   const hardCeilingMs = params.hardCeilingMs ?? DEFAULT_SESSION_TMP_HARD_CEILING_MS;
   const now = params.now ?? Date.now();
+  const unresolvedIds = params.unresolvedIds ?? new Set<string>();
   const retainedBy = {
     liveProcess: 0,
     openRecord: 0,
@@ -122,6 +174,7 @@ export function sweepSessionTmpDirs(params: {
     removeFailed: 0,
     ageUnknown: 0,
     unmeasured: 0,
+    unresolved: 0,
   };
 
   const sessionIds = findSessionTmpCandidates(root);
@@ -161,6 +214,7 @@ export function sweepSessionTmpDirs(params: {
   }
   const pass = sweepCandidatePass(root, sessionIds, retainedBy, {
     records: params.records,
+    unresolvedIds,
     liveScan: params.liveScan,
     now,
     graceMs,
@@ -183,6 +237,7 @@ function sweepCandidatePass(
   retainedBy: SessionTmpSweepResult["retainedBy"],
   ctx: {
     records: ReadonlyMap<string, KnownSessionTmpRecord>;
+    unresolvedIds: ReadonlySet<string>;
     liveScan: LiveProcessScan;
     now: number;
     graceMs: number;
@@ -258,6 +313,7 @@ function classify(
   sessionId: string,
   ctx: {
     records: ReadonlyMap<string, KnownSessionTmpRecord>;
+    unresolvedIds: ReadonlySet<string>;
     liveScan: LiveProcessScan;
     now: number;
     graceMs: number;
@@ -273,24 +329,46 @@ function classify(
     // Unreadable stat — never guessed as either young or old.
     return { retain: true, reason: "ageUnknown" };
   }
-  // Clause 2 — the disk-safety net, independent of record state.
+  // Clause 2 — a FAILED lookup (not a confirmed absence) is never eligible
+  // for the hard ceiling below, no matter how old the directory is.
+  if (ctx.unresolvedIds.has(sessionId)) {
+    return { retain: true, reason: "unresolved", dirAgeMs };
+  }
+  // Clause 3 — a CONFIRMED record decides it, fully, with no age override.
+  const record = ctx.records.get(sessionId);
+  if (record) {
+    return classifyByRecord(record, dirAgeMs, ctx.graceMs);
+  }
+  // Clause 4 — NO record at all (confirmed absence, not a failed lookup): the
+  // hard ceiling is the disk-safety net for exactly this case, and only this
+  // case.
   if (dirAgeMs >= ctx.hardCeilingMs) {
     return { retain: false, dirAgeMs };
   }
-  // Clause 3 — record-driven, below the hard ceiling.
-  const record = ctx.records.get(sessionId);
-  if (!record) {
-    return { retain: true, reason: "unrecognised", dirAgeMs };
-  }
+  return { retain: true, reason: "unrecognised", dirAgeMs };
+}
+
+/**
+ * A CONFIRMED record's own verdict — no age override, ever. Split out of
+ * {@link classify} purely to keep that function's branching within budget; the
+ * rule itself is unchanged: an OPEN session is never reaped by age alone (see
+ * the module header "why an open record beats the hard ceiling"), and a
+ * CLOSED one is removed once idle past the grace period, else retained.
+ */
+function classifyByRecord(
+  record: KnownSessionTmpRecord,
+  dirAgeMs: number,
+  graceMs: number,
+): Verdict {
   if (!record.closed) {
     return { retain: true, reason: "openRecord", dirAgeMs };
   }
   // Fall back to directory age when the record itself carries no usable
   // timestamp — the directory's own mtime is a sound proxy for "last touched"
-  // and is already known-good at this point (the ageUnknown branch above would
-  // have returned first if it weren't).
+  // and is already known-good at this point (`classify`'s `ageUnknown` branch
+  // would have returned first if it weren't).
   const idleMs = record.idleMs ?? dirAgeMs;
-  if (idleMs >= ctx.graceMs) {
+  if (idleMs >= graceMs) {
     return { retain: false, dirAgeMs };
   }
   return { retain: true, reason: "tooYoung", dirAgeMs };
@@ -308,10 +386,17 @@ function directoryAgeMs(dir: string, now: number): number | undefined {
   }
 }
 
-/** Every directory this module could have created — an exact UUID-shaped
- *  basename, nothing else. `undefined` means the root itself could not be
- *  read, which is not the same fact as "the root holds nothing". */
-function findSessionTmpCandidates(root: string): string[] | undefined {
+/**
+ * Every directory this module could have created — an exact UUID-shaped
+ * basename, nothing else. `undefined` means the root itself could not be
+ * read, which is not the same fact as "the root holds nothing".
+ *
+ * Exported so the CALLER (`command-handlers.ts`) can enumerate the SAME
+ * candidate set before building its records map — a TARGETED per-id lookup
+ * needs to know which ids to look up, and duplicating this filter at the call
+ * site is exactly the kind of second spelling that lets the two drift apart.
+ */
+export function findSessionTmpCandidates(root: string): string[] | undefined {
   let entries: string[];
   try {
     entries = readdirSync(root);

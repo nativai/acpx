@@ -90,10 +90,9 @@ test("sweepSessionTmpDirs retains an OPEN session's directory regardless of idle
       [OPEN_SESSION, { closed: false, idleMs: DEFAULT_SESSION_TMP_HARD_CEILING_MS + 1000 }],
     ]);
     // Even past the record-idle grace period, an OPEN record is retained — age
-    // alone never justifies removal. Only the (record-independent) hard
-    // ceiling on DIRECTORY age could remove it, and that is exercised below
-    // with a fresh (near-zero-age) directory precisely so this row is not
-    // accidentally passing via that other clause.
+    // alone never justifies removal. The far-past-the-hard-ceiling variant
+    // (with a synthetic `now`, so it cannot pass merely by the directory being
+    // young) lives in its own dedicated row below.
     const result = sweepSessionTmpDirs({ records, liveScan: emptyLiveScan(), rootDir: root });
     assert.deepEqual(result.removed, []);
     assert.equal(existsSync(dir), true);
@@ -140,7 +139,12 @@ test("sweepSessionTmpDirs retains an unrecognised (no-record) directory below th
   });
 });
 
-test("sweepSessionTmpDirs removes ANY directory — even an open record's — past the hard ceiling, when unreferenced", () => {
+// brick ceca191f — TE finding: the FIRST shipped version of this rule put the
+// hard ceiling BEFORE the record check, so this exact scenario — an OPEN,
+// still-in-use session whose directory happened to be old — was removed
+// unconditionally. This row is the regression guard for that fix: the hard
+// ceiling must NEVER override a record the sweep actually has.
+test("sweepSessionTmpDirs NEVER removes an OPEN record's directory, even far past the hard ceiling", () => {
   withRoot((root) => {
     const dir = makeDir(root, OPEN_SESSION);
     const records = new Map<string, KnownSessionTmpRecord>([[OPEN_SESSION, { closed: false }]]);
@@ -148,10 +152,47 @@ test("sweepSessionTmpDirs removes ANY directory — even an open record's — pa
       records,
       liveScan: emptyLiveScan(),
       rootDir: root,
+      now: Date.now() + DEFAULT_SESSION_TMP_HARD_CEILING_MS * 3,
+    });
+    assert.deepEqual(result.removed, []);
+    assert.equal(existsSync(dir), true, "an OPEN record must never be reaped by age alone");
+    assert.equal(result.retainedBy.openRecord, 1);
+  });
+});
+
+test("sweepSessionTmpDirs removes a genuinely UNCLAIMED (no-record) directory once past the hard ceiling", () => {
+  withRoot((root) => {
+    const dir = makeDir(root, UNRECOGNISED_SESSION);
+    const result = sweepSessionTmpDirs({
+      records: new Map(),
+      liveScan: emptyLiveScan(),
+      rootDir: root,
       now: Date.now() + DEFAULT_SESSION_TMP_HARD_CEILING_MS + 1000,
     });
     assert.deepEqual(result.removed, [dir]);
     assert.equal(existsSync(dir), false);
+  });
+});
+
+// brick ceca191f — the other half of the same fix: a record lookup that
+// FAILED (as opposed to confirmed nothing) must never be silently treated as
+// "no record" and fed to the hard ceiling — that is exactly how a transient
+// I/O error during the caller's targeted lookup could look identical to a
+// genuinely unclaimed directory and get reaped.
+test("sweepSessionTmpDirs NEVER removes a directory whose record lookup FAILED, even far past the hard ceiling", () => {
+  withRoot((root) => {
+    const dir = makeDir(root, UNRECOGNISED_SESSION);
+    const result = sweepSessionTmpDirs({
+      records: new Map(),
+      unresolvedIds: new Set([UNRECOGNISED_SESSION]),
+      liveScan: emptyLiveScan(),
+      rootDir: root,
+      now: Date.now() + DEFAULT_SESSION_TMP_HARD_CEILING_MS * 3,
+    });
+    assert.deepEqual(result.removed, []);
+    assert.equal(existsSync(dir), true);
+    assert.equal(result.retainedBy.unresolved, 1);
+    assert.equal(result.retainedBy.unrecognised, 0, "must not double-count as unrecognised too");
   });
 });
 
