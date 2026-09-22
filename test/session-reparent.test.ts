@@ -176,6 +176,91 @@ test("set-parent round-trips all four fields onto the record AND the index entry
   });
 });
 
+// SEATS (C3, brick 5ad22d5d) — THE INVARIANT: parentSeatId is ALWAYS the seat
+// of the record named by parentSessionId. Whatever writes one writes the
+// other, in the same write — this is the falsifiable form of that rule,
+// through the REAL set-parent verb (the handover mechanism seats exist to
+// retire), not a unit call on the mutator.
+test("set-parent keeps parentSeatId in lockstep with parentSessionId (both record and index)", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "old-parent", { seatId: "old-parent-seat" });
+    await seed(homeDir, "new-parent", { seatId: "new-parent-seat" });
+    await seed(homeDir, "child", {
+      parentSessionId: "old-parent",
+      parentSeatId: "old-parent-seat",
+    });
+
+    const result = await runCli(
+      [
+        "claude",
+        "sessions",
+        "set-parent",
+        "--session-id",
+        "child",
+        "--parent-id",
+        "new-parent",
+        "--format",
+        "json",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+
+    // Record leg.
+    const record = await readRecordJson(homeDir, "child");
+    assert.equal(record.parent_session_id, "new-parent");
+    assert.equal(
+      record.parent_seat_id,
+      "new-parent-seat",
+      "parentSeatId did not follow parentSessionId onto the new parent — a " +
+        "re-parented child would keep composing ACPX_PARENT_SEAT_URL from its " +
+        "OLD parent's seat, the exact frozen-parent bug seats exist to fix.",
+    );
+
+    // Index leg — same reasoning as parentSessionId's own index assertion above:
+    // the F4 divergence-healing mechanism in session-reparent.ts compares the
+    // record's parentSessionId against the INDEX ENTRY's, so parentSeatId needs
+    // the same leg or it is invisible to that hazard class.
+    const entry = await readIndexEntry(homeDir, "child");
+    assert.equal(entry.parentSeatId, "new-parent-seat");
+  });
+});
+
+test("set-parent to a CROSS-BOX parent clears parentSeatId, never leaves a stale same-box one", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "old-parent", { seatId: "old-parent-seat" });
+    await seed(homeDir, "child", {
+      parentSessionId: "old-parent",
+      parentSeatId: "old-parent-seat",
+    });
+
+    const result = await runCli(
+      [
+        "claude",
+        "sessions",
+        "set-parent",
+        "--session-id",
+        "child",
+        "--parent-session-url",
+        "https://another-box.example.com/?session=unknown-remote-parent",
+        "--format",
+        "json",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+
+    const record = await readRecordJson(homeDir, "child");
+    assert.equal(record.parent_session_id, "unknown-remote-parent");
+    assert.equal(
+      record.parent_seat_id,
+      undefined,
+      "a cross-box parent's seat is unknowable locally — parentSeatId must be " +
+        "CLEARED, not left pointing at the old (now wrong) same-box parent's seat",
+    );
+  });
+});
+
 test("the index PARSER preserves the new fields across a DRIFT reconcile", async () => {
   await withTempHome(async (homeDir) => {
     await seed(homeDir, "old-parent");

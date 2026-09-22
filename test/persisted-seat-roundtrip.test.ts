@@ -31,12 +31,12 @@ import { makeSessionRecord } from "./runtime-test-helpers.js";
 /** Every key the contract registers — the population under test, not a hand list. */
 const SEAT_KEYS = Object.keys(PERSISTED_SEAT_SENTINEL) as (keyof PersistedSeatFields)[];
 
-/** Keys projected onto the index entry — a DELIBERATE subset of SEAT_KEYS.
- * `parentSeatId` is spawn/env-composition-only (feeds ACPX_PARENT_SEAT_URL)
- * and is never read on the acpx-ui hot path, so it has no index leg to guard
- * — unlike `seatId`/`holderOrdinal`/`holderActive`, which route delivery and
- * MUST survive the index round trip (SessionIndexEntry's own doc comment). */
-const INDEXED_SEAT_KEYS = ["seatId", "holderOrdinal", "holderActive"] as const;
+/** Keys projected onto the index entry — currently ALL of SEAT_KEYS.
+ * `parentSeatId` joined this set so the F4 divergence-healing mechanism in
+ * session-reparent.ts (which compares the record's parentSessionId against
+ * the index entry's) has a parentSeatId to compare too — see its own doc
+ * comment on SessionIndexEntry.parentSeatId in index.ts. */
+const INDEXED_SEAT_KEYS = ["seatId", "holderOrdinal", "holderActive", "parentSeatId"] as const;
 
 function sentinelRecord(): SessionRecord {
   return {
@@ -139,24 +139,26 @@ test("guard 4 · every seat field the index entry PROJECTS survives its own pars
   }
 });
 
-test("guard 5 · parentSeatId is deliberately NOT on the index entry", () => {
-  // Negative control for guard 4's scope statement: if a future edit adds
-  // parentSeatId to the index projection without updating INDEXED_SEAT_KEYS
-  // above, this row is the one that would need updating too — it exists so
-  // that decision is visible and intentional, not an accidental omission.
-  const entry = toSessionIndexEntry(sentinelRecord(), "seat-guard-1.json");
-  assert.equal(
-    "parentSeatId" in entry,
-    false,
-    "parentSeatId now appears on the index entry — update INDEXED_SEAT_KEYS above " +
-      "and guard 4 to cover it, and state why in persisted-seat-contract.ts's header.",
+test("guard 5 · every seat field the RECORD carries also survives via the index-entry legs (guard 4's full population)", () => {
+  // guard 4 already proves this for the fields toSessionIndexEntry projects —
+  // this row is the belt: SEAT_KEYS and INDEXED_SEAT_KEYS must agree, so a
+  // future field added to one without the other is caught HERE by name,
+  // rather than discovered later as a silent gap in guard 4's coverage.
+  assert.deepEqual(
+    [...SEAT_KEYS].toSorted(),
+    [...INDEXED_SEAT_KEYS].toSorted(),
+    "SEAT_KEYS and INDEXED_SEAT_KEYS have diverged — every seat field is " +
+      "currently expected on both the record AND the index entry (per " +
+      "SessionIndexEntry.parentSeatId's doc comment in index.ts); if a NEW " +
+      "seat field genuinely has no index leg, narrow INDEXED_SEAT_KEYS " +
+      "deliberately and say why in persisted-seat-contract.ts's header.",
   );
 });
 
 test("guard 6 · the contract itself is non-trivial — every sentinel is DISTINCT", () => {
-  const strings = Object.values(PERSISTED_SEAT_SENTINEL).filter(
-    (v): v is string => typeof v === "string",
-  );
+  const strings: string[] = Object.values<string | number | boolean>(
+    PERSISTED_SEAT_SENTINEL,
+  ).filter((v) => typeof v === "string");
   assert.ok(strings.length >= 2, `expected at least 2 string sentinels, found ${strings.length}`);
   assert.equal(
     new Set(strings).size,

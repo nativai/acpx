@@ -223,6 +223,14 @@ export type SessionIndexEntry = {
   /** Mirrors `SessionRecord.holderActive`. See `seatId` above: this is the
    * field the hazard is about. */
   holderActive?: boolean;
+  /**
+   * Mirrors `SessionRecord.parentSeatId`. Projected here for the SAME reason
+   * `parentSessionId`/`parentSessionUrl` are (above): `session-reparent.ts`'s
+   * F4 divergence-healing compares the record's `parentSessionId` against
+   * this entry's, so a `parentSeatId` that stopped at the record would be
+   * invisible to that same torn-write hazard class.
+   */
+  parentSeatId?: string;
 };
 
 type SessionIndex = {
@@ -445,6 +453,7 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     seatId: optionalString(record.seatId),
     holderOrdinal: optionalFiniteNumber(record.holderOrdinal),
     holderActive: optionalBoolean(record.holderActive),
+    parentSeatId: optionalString(record.parentSeatId),
   };
 }
 
@@ -617,6 +626,7 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     seatId: record.seatId,
     holderOrdinal: record.holderOrdinal,
     holderActive: record.holderActive,
+    parentSeatId: record.parentSeatId,
   };
 }
 

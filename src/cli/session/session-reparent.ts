@@ -227,6 +227,11 @@ function refusalForChild(
 async function resolveNewParent(parent: { id: string; url?: string }): Promise<{
   acpxRecordId: string;
   sessionUrl?: string;
+  /** SEATS (C3, brick 5ad22d5d) — the new parent's OWN seat, same-box only
+   * (mirrors ResolvedParentSession.seatId in command-handlers.ts). Kept live
+   * across set-parent so ACPX_PARENT_SEAT_URL never goes stale under a
+   * handover — see applyParentToRecord below. */
+  seatId?: string;
   crossBox: boolean;
   record?: SessionRecord;
 }> {
@@ -235,6 +240,7 @@ async function resolveNewParent(parent: { id: string; url?: string }): Promise<{
     return {
       acpxRecordId: record.acpxRecordId,
       ...(parent.url ? { sessionUrl: parent.url } : {}),
+      seatId: record.seatId,
       crossBox: false,
       record,
     };
@@ -482,7 +488,7 @@ function classifyChild(
 // eslint-disable-next-line complexity -- explicit optional-field projection
 function applyParentToRecord(
   record: SessionRecord,
-  parent: { acpxRecordId: string; sessionUrl?: string },
+  parent: { acpxRecordId: string; sessionUrl?: string; seatId?: string },
   now: string,
   ownerState: string,
   nameOf: (sessionId: string) => string | undefined,
@@ -503,6 +509,16 @@ function applyParentToRecord(
   // left behind would keep pointing at the wrong host.
   record.parentSessionUrl = parent.sessionUrl;
   record.parentSetAt = now;
+  // SEATS (C3, brick 5ad22d5d). THE INVARIANT: parentSeatId is ALWAYS the seat
+  // of the record named by parentSessionId — whatever writes one writes the
+  // other, in the same write. Cleared, not merged, same reasoning as
+  // parentSessionUrl above: a cross-box new parent (seatId unknown) must not
+  // leave a stale same-box seat pointing at the WRONG parent. Without this,
+  // `set-parent --children-of` — the handover verb seats exist to retire —
+  // would reintroduce the frozen-parent bug it is meant to fix: every
+  // re-parented child would keep composing ACPX_PARENT_SEAT_URL from its OLD
+  // parent's seat while parentSessionId correctly named the new one.
+  record.parentSeatId = parent.seatId;
 
   return {
     acpxRecordId: record.acpxRecordId,
@@ -611,7 +627,7 @@ type MoveContext = {
 
 async function moveTargets(
   targets: SessionRecord[],
-  parent: { acpxRecordId: string; sessionUrl?: string; crossBox: boolean },
+  parent: { acpxRecordId: string; sessionUrl?: string; seatId?: string; crossBox: boolean },
   allRecords: SessionRecord[],
   context: MoveContext,
 ): Promise<{

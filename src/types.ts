@@ -339,6 +339,11 @@ export type AcpClientOptions = {
      * valid effort set inside applyProfileAuth.
      */
     reasoningEffort?: string | null;
+    /** SEATS (C3/D-B1-9, brick 5ad22d5d) — mirrors AgentSessionContext.seatId
+     * in auth-env.ts (a separately-declared, structurally-identical type). */
+    seatId?: string | null;
+    /** Mirrors AgentSessionContext.parentSeatId in auth-env.ts. */
+    parentSeatId?: string | null;
   };
   sessionOptions?: {
     model?: string;
@@ -1239,9 +1244,45 @@ export type SessionRecord = {
    * Creation-assigned position of this holder within its seat's history —
    * never renumbered (so a displayed ordinal survives an earlier holder
    * being archived). Persisted `holder_ordinal`. B1 mints exactly one
-   * holder per seat, so every record B1 creates carries `1`; B2's
-   * succession verb assigns `max(existing for seat) + 1` when creating an
-   * additional holder into an EXISTING seat.
+   * holder per seat, so every record B1 creates carries `1`.
+   *
+   * B2's succession verb, when creating an additional holder into an
+   * EXISTING seat, must NOT assign a bare `max(existing hot holders) + 1` —
+   * that re-issues a number whenever the current max is archived, a
+   * prepared-but-never-activated holder was discarded, or the seat is fully
+   * cold (no hot holder to take a max over). The specified rule (dated,
+   * B9-completed residual — see B1-SHAPE-AS-SHIPPED.md "The holder ordinal's
+   * single atomic home"):
+   *
+   *   next = max({h.holderOrdinal : h in the seat's HOT holders} ∪
+   *              {predecessor.holderOrdinal}) + 1
+   *
+   * assigned INSIDE the existing index lock (index-lock.ts:171-213) —
+   * atomically with the activation flip, not as a separate read. A seat with
+   * ZERO hot holders refuses loudly ("seat has no hot holder — restore one
+   * first") rather than restarting at 1 or scanning the cold tier
+   * (sessionArchive.ts:8-12 forbids ambient archive scans).
+   *
+   * ⚠️ KNOWN, ACCEPTED LIMITATION (D-B1-14) — this rule protects against
+   * RENUMBERING (a displayed #5 silently becoming #4), which it fully closes.
+   * It does NOT fully close RE-ISSUE: two rare shapes (the max-holder was
+   * archived; a prepared-but-never-activated holder was discarded) can still
+   * hand out a number a seat already used once. Re-issue is much smaller
+   * than renumbering — nothing already displayed ever changes — and is dated:
+   * B9 extends the archive projections to carry seat/holder ids, after which
+   * the max is exact over hot ∪ archive-index by a targeted read and this
+   * leak closes for good.
+   *
+   * 🛑 THE ORDINAL IS A DISPLAY LABEL AND MUST NEVER BE A KEY. This is what
+   * makes the re-issue residual harmless rather than a live correctness bug:
+   * no lookup, join, filter, sort-key, URL segment, filename, cache key, map
+   * key, dedupe key or identity/equality test may resolve a holder BY its
+   * ordinal — the session id is the only identifier. Ordering a holder list
+   * BY ordinal for display (AC8) is fine; using it to FIND one is not. The
+   * one-line test: "if two holders in this seat shared an ordinal, would
+   * this code do the wrong thing?" — rendering two `#3` rows is cosmetic;
+   * deduping or looking up "holder #3" returns the wrong holder and is
+   * forbidden.
    */
   holderOrdinal?: number;
   /**

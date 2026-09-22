@@ -89,6 +89,14 @@ export function makeSessionRecord(
     metadata: overrides.metadata,
     importedFrom: overrides.importedFrom,
     template: overrides.template,
+    // SEATS (C2, brick 5ad22d5d) — same allowlist hazard the comment above
+    // names; this exact miss (fields silently dropped by this fixture helper,
+    // not by production code) cost a false-negative on the set-parent
+    // parentSeatId invariant test during B1's own implementation.
+    seatId: overrides.seatId,
+    holderOrdinal: overrides.holderOrdinal,
+    holderActive: overrides.holderActive,
+    parentSeatId: overrides.parentSeatId,
   };
 }
 
