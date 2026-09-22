@@ -233,8 +233,8 @@ export type PersistedRecordSubtreeKeysAreSnakeCase = RequireNoOffendingKeys<
  * ⚠️ ADDING A NAME HERE OPTS THAT SUBTREE OUT OF THE ONLY CHECK THAT FIRES
  * BEFORE THE CHANGE SHIPS. If you are here because a new field made the guard
  * red, the fix is almost always to spell the field snake_case — not to land it
- * here. Both current entries are exempt for a reason that makes the interior
- * genuinely unreachable from disk in camelCase:
+ * here. All three current entries are exempt for a reason that makes the
+ * interior genuinely unreachable from disk in camelCase:
  *
  * - `subagents` / `importedFrom` — `serialize.ts` maps their fields ONE BY ONE
  *   (`serializeSubagentRef`, the `imported_from` literal), so the in-memory
