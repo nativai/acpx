@@ -134,6 +134,65 @@ test("`sessions sweep-config-dirs` leaves an OPEN session's ACPX_SESSION_TMP dir
   });
 });
 
+const CLOSED_BUT_LIVE = "66666666-6666-6666-6666-666666666666";
+
+test("`sessions sweep-config-dirs` retains a CLOSED-and-ancient session's dir while a REAL process is still live, then reaps it once that process is gone", async () => {
+  // ⚠️ THE POINT OF THIS ROW: a record alone cannot prove the live-process clause
+  // works — a test that only injects `{closed:true, idleMs: huge}` and checks
+  // retention could pass even if the liveness check were deleted from the code,
+  // AS LONG AS something else also happened to retain it. This spawns an ACTUAL
+  // process (not a simulated LiveProcessScan) whose cmdline carries the session's
+  // uuid, and lets the CLI's REAL `scanLiveProcesses()` (real /proc, box-wide, no
+  // injected fixture) find it — then proves the DIFFERENTIAL: same closed+ancient
+  // record, sweep run twice, retained while live and reaped once it is not.
+  await withTempHomeFixture("acpx-ceca191f-tmp-sweep-live-", async (homeDir) => {
+    await withScopedSessionTmpRoot(async (root) => {
+      await seedSession(homeDir, CLOSED_BUT_LIVE, { closed: true }); // ancient + closed
+      const dir = plantSessionTmpDir(root, CLOSED_BUT_LIVE);
+
+      // A real, live process whose argv carries the session id — exactly the
+      // shape `readSessionIdsFromCmdline` (process-population.ts) scans for.
+      const liveHolder = spawn(
+        process.execPath,
+        ["-e", "setTimeout(()=>{},60000)", CLOSED_BUT_LIVE],
+        {
+          stdio: "ignore",
+        },
+      );
+      try {
+        // Give /proc a moment to reflect the new process before the CLI scans it.
+        await new Promise((resolve) => setTimeout(resolve, 300));
+
+        const whileLive = await runCli(["claude", "sessions", "sweep-config-dirs"], homeDir, root);
+        assert.equal(whileLive.code, 0, `${whileLive.stdout}\n${whileLive.stderr}`);
+        assert.equal(
+          existsSync(dir),
+          true,
+          "a REAL live process naming this session must block the reap, even though the " +
+            "record is closed and ancient",
+        );
+        assert.match(whileLive.stderr, /liveProcess=1/, whileLive.stderr);
+      } finally {
+        liveHolder.kill("SIGKILL");
+        await new Promise((resolve) => {
+          liveHolder.once("exit", resolve);
+        });
+      }
+
+      // Same record, same directory, same sweep invocation — the ONLY thing that
+      // changed is that the live process is now gone. This is the differential
+      // that proves retention above was caused by liveness, not by luck.
+      const afterExit = await runCli(["claude", "sessions", "sweep-config-dirs"], homeDir, root);
+      assert.equal(afterExit.code, 0, `${afterExit.stdout}\n${afterExit.stderr}`);
+      assert.equal(
+        existsSync(dir),
+        false,
+        "once the live process is gone, the same closed+ancient session must be reaped",
+      );
+    });
+  });
+});
+
 test("`sessions sweep-config-dirs --dry-run` previews the session-tmp reap and removes nothing", async () => {
   await withTempHomeFixture("acpx-ceca191f-tmp-sweep-dry-", async (homeDir) => {
     await withScopedSessionTmpRoot(async (root) => {
