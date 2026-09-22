@@ -603,7 +603,7 @@ function buildAgentEnvironment(
   delete env.ACPX_SESSION_RECORD_ID;
   // brick ceca191f — same reasoning as ACPX_SESSION_RECORD_ID immediately
   // above: a scratch directory path is session identity, and an inherited
-  // value would point a child at ITS PARENT's `/workspace/.tmp/<uuid>` rather
+  // value would point a child at ITS PARENT's `/tmp/acpx-<uuid>` rather
   // than its own. Re-set below, keyed off THIS spawn's own acpxRecordId.
   delete env.ACPX_SESSION_TMP;
   delete env.ACPX_PARENT_SESSION_URL;
@@ -834,7 +834,7 @@ function buildAgentEnvironment(
     const trimmedRecordId = sessionContext.acpxRecordId.trim();
     if (trimmedRecordId.length > 0) {
       env.ACPX_SESSION_RECORD_ID = trimmedRecordId;
-      // brick ceca191f (SPEC.md) — `/workspace/.tmp/<uuid>`, created mode 0700.
+      // brick ceca191f (SPEC.md v2) — `/tmp/acpx-<uuid>`, created mode 0700.
       // Keyed off the SAME id as ACPX_SESSION_RECORD_ID, for the same reason:
       // stable across queue-owner respawns, absent on the transient creation
       // spawn that carries "" and is skipped by the trim guard above.
