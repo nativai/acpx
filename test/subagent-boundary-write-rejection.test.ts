@@ -122,7 +122,7 @@ test("positive control: the child harness really exercises the factory", () => {
   assert.match(resolving.stderr, /chains-size 0/);
   // No write failure on this arm, so nothing may be reported.
   assert.ok(
-    !/onWriteError/.test(resolving.stderr),
+    !resolving.stderr.includes("onWriteError"),
     `a resolving write reported an error:\n${resolving.stderr}`,
   );
 });
