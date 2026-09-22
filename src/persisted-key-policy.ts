@@ -189,6 +189,70 @@ export type PersistedMessageKeysAreSnakeCase = RequireNoOffendingKeys<
   OffendingKeys<import("./types.js").SessionMessage>
 >;
 
+/**
+ * 🛑 THE TWO GUARDS ABOVE NAME THEIR ROOT BY HAND, AND THAT IS THE SAME DEFECT
+ * ONE LEVEL UP — `messages` WAS UNGUARDED FOR EXACTLY AS LONG AS NOBODY HAD
+ * THOUGHT TO NAME IT.
+ *
+ * brick://dce67687. `PersistedAcpxKeysAreSnakeCase` walks `record.acpx`;
+ * `PersistedMessageKeysAreSnakeCase` walks `record.messages`. Both were added
+ * AFTER a field in that subtree had already shipped and broken persistence. Five
+ * further `SessionRecord` fields are passed through `serialize.ts` WHOLESALE, so
+ * their interiors are persisted verbatim exactly as `messages` is, and none of
+ * them was covered by either root: `eventLog`, `messagesLog`,
+ * `cumulative_token_usage`, `request_token_usage`, `template`. A camelCase field
+ * added to any of them escaped precisely as `claudeUuid` did — and a brand-new
+ * wholesale subtree added tomorrow would have escaped too.
+ *
+ * This root is derived from `SessionRecord` itself, so **the default is
+ * guarded**. Nothing has to be registered, and the only way to end up unguarded
+ * is to add a name to {@link UnwalkedRecordField} below — a visible, reviewable
+ * edit with a stated reason, rather than an omission nobody can see.
+ *
+ * The record's OWN top-level keys are deliberately not checked: they are
+ * camelCase in memory by design and `serialize.ts` translates them one by one
+ * (`acpx_record_id: canonical.acpxRecordId`). It is their VALUES that reach disk
+ * verbatim, so it is their values this walks.
+ *
+ * The two narrower roots above are kept: they pin the two subtrees that have
+ * actually bitten, so a red there names the historical path instead of just
+ * "somewhere in the record".
+ *
+ * Fire-tested, not asserted — `scripts/lint-persisted-key-casing.ts` injects a
+ * camelCase key into a FRESH subtree type, registered nowhere, and requires
+ * `tsgo` to fail naming it. Measured against the tree this commit was cut from,
+ * that probe passed the typecheck (the hole) and fails it now.
+ */
+export type PersistedRecordSubtreeKeysAreSnakeCase = RequireNoOffendingKeys<
+  RecordSubtreeOffendingKeys<import("./types.js").SessionRecord>
+>;
+
+/**
+ * The only `SessionRecord` fields whose interiors are NOT walked.
+ *
+ * ⚠️ ADDING A NAME HERE OPTS THAT SUBTREE OUT OF THE ONLY CHECK THAT FIRES
+ * BEFORE THE CHANGE SHIPS. If you are here because a new field made the guard
+ * red, the fix is almost always to spell the field snake_case — not to land it
+ * here. Both current entries are exempt for a reason that makes the interior
+ * genuinely unreachable from disk in camelCase:
+ *
+ * - `subagents` / `importedFrom` — `serialize.ts` maps their fields ONE BY ONE
+ *   (`serializeSubagentRef`, the `imported_from` literal), so the in-memory
+ *   camelCase never reaches disk. Make one of them a wholesale passthrough and
+ *   it belongs back under the guard.
+ * - `agentCapabilities` — mirrors the runtime `OPAQUE_VALUE_PATHS` entry
+ *   `agent_capabilities`: an opaque passthrough of the adapter's own advertised
+ *   shape, which the runtime policy does not descend into either.
+ */
+type UnwalkedRecordField = "subagents" | "importedFrom" | "agentCapabilities";
+
+type WalkedRecordField<T> = Exclude<Extract<keyof T, string>, UnwalkedRecordField>;
+
+/** Every offending key in the INTERIOR of every walked `SessionRecord` field. */
+type RecordSubtreeOffendingKeys<T> = {
+  [K in WalkedRecordField<T>]: OffendingKeys<NonNullable<T[K]>>;
+}[WalkedRecordField<T>];
+
 /** Fails the constraint — and NAMES the key — as soon as an offender exists. */
 type RequireNoOffendingKeys<Offenders extends never> = Offenders;
 
@@ -252,14 +316,38 @@ type PermittedKey =
 type OpaqueFieldName = "config_options" | "desired_config_options";
 
 /**
+ * ⚠️ RETURNED WHEN THE WALK RUNS OUT OF DEPTH — ON PURPOSE, SO EXHAUSTION IS A
+ * RED AND NOT A SILENT PASS.
+ *
+ * brick://dce67687. The bound below used to yield `never`, which is the same
+ * value a clean subtree yields: a field nested past the limit was reported as
+ * "no violations found" by a walk that had in fact stopped looking. That is the
+ * failure shape this whole guard exists to prevent, reproduced inside the guard.
+ *
+ * So exhaustion now names itself and fails the constraint. Seeing this in a
+ * typecheck error means the persisted record grew deeper than the walk reaches —
+ * raise the `extends 12` bound below, do not silence it.
+ *
+ * ⚠️ IT ALREADY CAUGHT ONE: at the bound of 8 this commit inherited,
+ * {@link PersistedMessageKeysAreSnakeCase} was walking the message subtree to its
+ * exact last level with ZERO headroom (measured: red at 7, green at 8). One more
+ * nesting level under `messages` and that guard would have gone quietly blind —
+ * the same silence, inside the fix for it. Hence the bound moved to 12.
+ */
+type WalkDepthLimitExceeded = "__persisted_key_walk_ran_out_of_depth__";
+
+/**
  * Every offending key reachable from `T`.
  *
  * `Depth` bounds the walk so a self-referential type cannot make the compiler
- * recurse forever; 8 clears the deepest persisted nesting we have with room to
- * spare (`cost_units[] -> rates -> …` bottoms out at 4).
+ * recurse forever. Bisected per root with the sentinel above, 2026-09-22 on
+ * `origin/dev` 5756fd6 — the smallest bound at which each root is green:
+ * `acpx` **5**, `messages` **8**, the whole record **9**. 12 therefore clears the
+ * deepest subtree we have by three levels, and the cost is flat: the scoped
+ * typecheck measured 0.5–0.9 s at every bound from 9 to 14.
  */
-type OffendingKeys<T, Depth extends readonly unknown[] = []> = Depth["length"] extends 8
-  ? never
+type OffendingKeys<T, Depth extends readonly unknown[] = []> = Depth["length"] extends 12
+  ? WalkDepthLimitExceeded
   : T extends LeafValue
     ? never
     : T extends readonly (infer Element)[]
