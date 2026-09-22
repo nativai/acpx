@@ -39,8 +39,18 @@
 // HOME-derivation rows. Run the suite through `scripts/run-tests.mjs` (`pnpm test`), or
 // `env -u ACPX_PI_BOX_AGENT_DIR` the targeted run. See `box-env-scrub.ts`.
 
+// brick ceca191f — AND SESSION-TMP ROOT SCOPING RIDES HERE TOO, same coverage
+// argument again: `ensureSessionTmpDir` defaults to the real, disk-constrained
+// `/workspace/.tmp`, so every row that spawns with a synthetic `acpxRecordId`
+// would otherwise litter it with test debris. See `session-tmp-test-root.ts`.
+// Same caveat as above — a bare `node --test <file>` skips this too; point
+// `ACPX_SESSION_TMP_ROOT` at your own scratch dir for a targeted run that
+// exercises this path.
+
 import { scrubBoxHarnessEnvOverrides } from "./box-env-scrub.js";
 import { installOwnerReaper } from "./owner-reaper.js";
+import { scopeSessionTmpRootForTests } from "./session-tmp-test-root.js";
 
 scrubBoxHarnessEnvOverrides();
+scopeSessionTmpRootForTests();
 installOwnerReaper();

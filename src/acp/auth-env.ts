@@ -51,6 +51,7 @@ import { ATTRIBUTION_LOG_FILENAME } from "./openrouter-attribution.js";
 import { reportRoutingPolicyWarning, resolveBoxRouting } from "./openrouter-provider-policy.js";
 import type { ShimHandle } from "./openrouter-shim.js";
 import { spawnOpenRouterShim } from "./openrouter-shim.js";
+import { ensureSessionTmpDir } from "./session-tmp-dir.js";
 
 const AUTH_ENV_PREFIX = "ACPX_AUTH_";
 export const ACPX_EFFECTIVE_PROFILE_ENV = "ACPX_EFFECTIVE_PROFILE";
@@ -600,6 +601,11 @@ function buildAgentEnvironment(
   // ACPX_SESSION_URL: a stale value would pin another session's provider cache
   // key onto this adapter's requests.
   delete env.ACPX_SESSION_RECORD_ID;
+  // brick ceca191f — same reasoning as ACPX_SESSION_RECORD_ID immediately
+  // above: a scratch directory path is session identity, and an inherited
+  // value would point a child at ITS PARENT's `/workspace/.tmp/<uuid>` rather
+  // than its own. Re-set below, keyed off THIS spawn's own acpxRecordId.
+  delete env.ACPX_SESSION_TMP;
   delete env.ACPX_PARENT_SESSION_URL;
   delete env.ACPX_SESSION_NAME;
   // ── TOMBSTONE STRIP (brick b11f98fb, 2026-09-19) — HAS A RETIREMENT CONDITION ──
@@ -828,6 +834,11 @@ function buildAgentEnvironment(
     const trimmedRecordId = sessionContext.acpxRecordId.trim();
     if (trimmedRecordId.length > 0) {
       env.ACPX_SESSION_RECORD_ID = trimmedRecordId;
+      // brick ceca191f (SPEC.md) — `/workspace/.tmp/<uuid>`, created mode 0700.
+      // Keyed off the SAME id as ACPX_SESSION_RECORD_ID, for the same reason:
+      // stable across queue-owner respawns, absent on the transient creation
+      // spawn that carries "" and is skipped by the trim guard above.
+      env.ACPX_SESSION_TMP = ensureSessionTmpDir(trimmedRecordId);
     }
   }
   if (sessionContext && typeof sessionContext.sessionName === "string") {

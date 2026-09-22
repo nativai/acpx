@@ -21,6 +21,11 @@ import {
   pruneOrphanHarnessConfigDirs,
 } from "../acp/harness-config-dir.js";
 import {
+  describeSessionTmpSweep,
+  type KnownSessionTmpRecord,
+  sweepSessionTmpDirs,
+} from "../acp/session-tmp-sweep.js";
+import {
   listBuiltInAgents,
   resolveAgentCommand,
   resolveAgentNameFromCommand,
@@ -3957,6 +3962,66 @@ function knownRecordsById(
 }
 
 /**
+ * Index the store for the SESSION-TMP sweep — keyed by `acpxRecordId` ONLY,
+ * because that is the sole id `ensureSessionTmpDir` ever names a directory
+ * after (`session-tmp-dir.ts`); unlike the harness-config-dir sweep above, the
+ * ACP session id can never be the directory's name here.
+ */
+function knownSessionTmpRecords(
+  listed: readonly Pick<
+    SessionRecord,
+    "acpxRecordId" | "closed" | "lastUsedAt" | "lastPromptAt" | "createdAt"
+  >[],
+  now: number,
+): Map<string, KnownSessionTmpRecord> {
+  const records = new Map<string, KnownSessionTmpRecord>();
+  for (const entry of listed) {
+    if (typeof entry.acpxRecordId !== "string" || entry.acpxRecordId.length === 0) {
+      continue;
+    }
+    records.set(entry.acpxRecordId, {
+      closed: entry.closed === true,
+      idleMs: idleMillisSinceLastUse(entry, now),
+    });
+  }
+  return records;
+}
+
+/** Idle time from the most recent timestamp the record carries, or `undefined`
+ *  when none is usable — never guessed as either young or old. Mirrors
+ *  `abandoned-record-sweep.ts`'s `idleMillis`, kept local rather than shared
+ *  because that helper is not exported and the two ages answer genuinely
+ *  different questions (record abandonment vs. a directory's grace period). */
+function idleMillisSinceLastUse(
+  record: Pick<SessionRecord, "lastUsedAt" | "lastPromptAt" | "createdAt">,
+  now: number,
+): number | undefined {
+  const stamps = [record.lastUsedAt, record.lastPromptAt, record.createdAt]
+    .map((value) => (typeof value === "string" ? Date.parse(value) : Number.NaN))
+    .filter((value) => Number.isFinite(value));
+  if (stamps.length === 0) {
+    return undefined;
+  }
+  return Math.max(0, now - Math.max(...stamps));
+}
+
+/**
+ * Fold a DRY RUN's would-close ids into the session-tmp records map as closed,
+ * freshly (idleMs 0) — same reasoning as `withDryRunCloses` above: a real prune
+ * closes ownerless records BEFORE the directory pass runs, so a preview that
+ * skipped this would under-report exactly the set the record sweep releases.
+ */
+function withDryRunTmpCloses(
+  records: Map<string, KnownSessionTmpRecord>,
+  wouldClose: readonly string[],
+): Map<string, KnownSessionTmpRecord> {
+  for (const id of wouldClose) {
+    records.set(id, { closed: true, idleMs: 0 });
+  }
+  return records;
+}
+
+/**
  * ⚠️ C — THE FIRST-PROMPT TRIGGER (CONCEPTION §3, ruled A + C(first-prompt)).
  *
  * ## Why a PROMPT and not a CREATE, which is what the note originally recommended
@@ -4145,19 +4210,34 @@ async function sweepOrphanHarnessConfigDirs(
   // ask "what would this remove?" was the one way that could not answer, and a
   // preview showing nothing reads as a clean preview. It now walks the same
   // candidates under the same rule and removes none of them.
+  //
+  // ⚠️ brick ceca191f — AND THE ACPX_SESSION_TMP REAPER RIDES THE SAME TRIGGER.
+  // It is a SECOND, independent per-session directory leak (SPEC.md), and this
+  // function's caller is already the box's one gated entry point for "sweep
+  // orphaned per-session directories, at most once per interval, from a shared
+  // /proc census" — `sessions prune`, `sessions sweep-config-dirs`, and the
+  // opportunistic per-prompt trigger (`maybeSweepHarnessConfigDirsOnPrompt`,
+  // gated by `claimHarnessConfigDirSweep`). Giving ACPX_SESSION_TMP its own
+  // parallel trigger + gate would duplicate all of that for no behavioural
+  // gain, so it shares this one instead. It gets its OWN try/catch below so a
+  // failure in either sweep is reported without silencing the other.
+  let liveScan: ReturnType<typeof scanLiveProcesses> | undefined = undefined;
+  let listed: readonly SessionRecord[] | undefined = undefined;
+  let recordSweep: Awaited<ReturnType<typeof maybeSweepAbandonedRecords>> = undefined;
   try {
-    // ⚠️ ONE /proc CENSUS, SHARED BY BOTH SWEEPS. Taken once so the two cannot
-    // disagree about what is running, and so the cost is paid once.
-    const liveScan = scanLiveProcesses();
+    // ⚠️ ONE /proc CENSUS, SHARED BY ALL THREE SWEEPS (record, harness-config-dir,
+    // session-tmp). Taken once so none of them can disagree about what is
+    // running, and so the cost is paid once.
+    liveScan = scanLiveProcesses();
 
     // ⚠️ RECORDS FIRST, DIRECTORIES SECOND — THE ORDER IS LOAD-BEARING.
-    // The directory sweep removes only on positive ownership, and one of its
-    // clauses is "the record is CLOSED". That makes its effectiveness a function
+    // Both directory sweeps remove only on positive ownership, and one clause of
+    // each is "the record is CLOSED". That makes their effectiveness a function
     // of record state: a store full of ABANDONED-OPEN records makes a correct
     // sweep retain every directory forever (measured on the rig: 206 records, 88
     // still open, each pinning a config dir). The fix is to close the ownerless
     // records — one layer up — NOT to relax the deletion rule below.
-    const recordSweep = await maybeSweepAbandonedRecords({
+    recordSweep = await maybeSweepAbandonedRecords({
       session,
       liveScan,
       dryRun,
@@ -4165,10 +4245,12 @@ async function sweepOrphanHarnessConfigDirs(
       enabled: closeAbandonedRecords,
     });
 
-    // Re-read AFTER the record sweep, so the directory pass sees the closes it
-    // just made rather than the state that preceded them.
+    // Re-read AFTER the record sweep, so both directory passes see the closes
+    // it just made rather than the state that preceded them. Read ONCE and
+    // shared, rather than each sweep re-listing the store independently.
+    listed = await session.listSessions();
     const records = withDryRunCloses(
-      knownRecordsById(await session.listSessions()),
+      knownRecordsById(listed),
       dryRun && recordSweep !== undefined ? recordSweep.closed : [],
     );
     const swept = pruneOrphanHarnessConfigDirs({ records, liveScan, rootDir, dryRun });
@@ -4192,6 +4274,41 @@ async function sweepOrphanHarnessConfigDirs(
     // which is the exact ambiguity §7 exists to remove.
     process.stderr.write(
       `[acpx] harness config dir sweep skipped: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+  }
+
+  await sweepOrphanSessionTmpDirsPhase({ liveScan, listed, recordSweep, dryRun });
+}
+
+/**
+ * The session-tmp half of {@link sweepOrphanHarnessConfigDirs}, split out only
+ * to keep that function's own branching within the lint budget — it shares the
+ * SAME /proc census, record listing and abandoned-record sweep the harness
+ * pass above already produced, so nothing here re-derives them.
+ */
+async function sweepOrphanSessionTmpDirsPhase(params: {
+  liveScan: ReturnType<typeof scanLiveProcesses> | undefined;
+  listed: readonly SessionRecord[] | undefined;
+  recordSweep: Awaited<ReturnType<typeof maybeSweepAbandonedRecords>>;
+  dryRun: boolean;
+}): Promise<void> {
+  const { liveScan, listed, recordSweep, dryRun } = params;
+  if (liveScan === undefined || listed === undefined) {
+    // The shared /proc census or record listing above threw before either was
+    // captured — already reported by the harness-config-dir catch. Nothing to
+    // sweep with.
+    return;
+  }
+  try {
+    const tmpRecords = withDryRunTmpCloses(
+      knownSessionTmpRecords(listed, Date.now()),
+      dryRun && recordSweep !== undefined ? recordSweep.closed : [],
+    );
+    const tmpSwept = sweepSessionTmpDirs({ records: tmpRecords, liveScan, dryRun });
+    process.stderr.write(describeSessionTmpSweep(tmpSwept));
+  } catch (error) {
+    process.stderr.write(
+      `[acpx] session tmp sweep skipped: ${error instanceof Error ? error.message : String(error)}\n`,
     );
   }
 }

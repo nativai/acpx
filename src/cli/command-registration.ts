@@ -736,7 +736,7 @@ OTHER THINGS WORTH KNOWING.
   sessionsCommand
     .command("sweep-config-dirs")
     .description(
-      "Reap orphaned per-session harness config dirs. Deletes DIRECTORIES ONLY — no session record and no transcript is ever removed, unlike `prune`. Closes ownerless records first (reversible; the directory rule requires a CLOSED record). Prints its census by default.",
+      "Reap orphaned per-session harness config dirs AND orphaned ACPX_SESSION_TMP scratch dirs (brick ceca191f). Deletes DIRECTORIES ONLY — no session record and no transcript is ever removed, unlike `prune`. Closes ownerless records first (reversible; the directory rules require a CLOSED record, or an unclaimed/session-tmp directory old enough). Prints both censuses by default.",
     )
     .option(
       "--dry-run",

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -603,6 +604,104 @@ test("buildAgentSpawnOptions: ACPX_AGENT_FOLDER coexists with the URL session va
     });
     assert.equal(options.env.ACPX_AGENT_FOLDER, "/task/abs/agents/child-id");
     assert.equal(options.env.ACPX_SESSION_URL, expectedSessionUrl("child-id"));
+  });
+});
+
+// brick ceca191f — ACPX_SESSION_TMP (SPEC.md). Every row below sets
+// ACPX_SESSION_TMP_ROOT itself rather than relying solely on the suite-wide
+// `--import` scope (`test/session-tmp-test-root.ts`): this file is also run
+// standalone via a targeted `node --test`, which skips that preload, and a
+// row here creating a real directory under the box's actual `/workspace/.tmp`
+// is exactly the leak this feature exists to stop.
+function withScopedSessionTmpRoot<T>(fn: (root: string) => T): T {
+  const root = fsSync.mkdtempSync(path.join(os.tmpdir(), "acpx-session-tmp-spawn-test-"));
+  const previous = process.env.ACPX_SESSION_TMP_ROOT;
+  process.env.ACPX_SESSION_TMP_ROOT = root;
+  try {
+    return fn(root);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.ACPX_SESSION_TMP_ROOT;
+    } else {
+      process.env.ACPX_SESSION_TMP_ROOT = previous;
+    }
+    fsSync.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test("buildAgentSpawnOptions creates ACPX_SESSION_TMP mode 0700 under the configured root", () => {
+  withScopedSessionTmpRoot((root) => {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "11111111-2222-3333-4444-555555555555",
+    });
+    const expected = path.join(root, "11111111-2222-3333-4444-555555555555");
+    assert.equal(options.env.ACPX_SESSION_TMP, expected);
+    const stat = fsSync.statSync(expected);
+    assert.equal(stat.isDirectory(), true);
+    assert.equal(stat.mode & 0o777, 0o700);
+  });
+});
+
+test("buildAgentSpawnOptions gives two different sessions two different ACPX_SESSION_TMP dirs", () => {
+  withScopedSessionTmpRoot(() => {
+    const a = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "11111111-2222-3333-4444-555555555555",
+    });
+    const b = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "22222222-3333-4444-5555-666666666666",
+    });
+    assert.notEqual(a.env.ACPX_SESSION_TMP, b.env.ACPX_SESSION_TMP);
+    assert.equal(fsSync.existsSync(a.env.ACPX_SESSION_TMP ?? ""), true);
+    assert.equal(fsSync.existsSync(b.env.ACPX_SESSION_TMP ?? ""), true);
+  });
+});
+
+test("buildAgentSpawnOptions omits ACPX_SESSION_TMP when acpxRecordId is empty/whitespace", () => {
+  withScopedSessionTmpRoot(() => {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "   ",
+    });
+    assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_SESSION_TMP"), false);
+  });
+});
+
+test("buildAgentSpawnOptions clears a stale inherited ACPX_SESSION_TMP", () => {
+  withScopedSessionTmpRoot((root) => {
+    const previous = process.env.ACPX_SESSION_TMP;
+    process.env.ACPX_SESSION_TMP = "/workspace/.tmp/some-other-session";
+    try {
+      const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        acpxRecordId: "11111111-2222-3333-4444-555555555555",
+      });
+      assert.equal(
+        options.env.ACPX_SESSION_TMP,
+        path.join(root, "11111111-2222-3333-4444-555555555555"),
+      );
+    } finally {
+      if (previous === undefined) {
+        delete process.env.ACPX_SESSION_TMP;
+      } else {
+        process.env.ACPX_SESSION_TMP = previous;
+      }
+    }
+  });
+});
+
+test("buildAgentSpawnOptions: ACPX_SESSION_TMP survives being created twice (idempotent respawn)", () => {
+  withScopedSessionTmpRoot((root) => {
+    const first = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "11111111-2222-3333-4444-555555555555",
+    });
+    fsSync.writeFileSync(path.join(first.env.ACPX_SESSION_TMP ?? "", "marker.txt"), "hi");
+    const second = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "11111111-2222-3333-4444-555555555555",
+    });
+    assert.equal(second.env.ACPX_SESSION_TMP, first.env.ACPX_SESSION_TMP);
+    assert.equal(
+      fsSync.existsSync(path.join(root, "11111111-2222-3333-4444-555555555555", "marker.txt")),
+      true,
+      "a second spawn for the same session must not wipe an existing scratch file",
+    );
   });
 });
 
