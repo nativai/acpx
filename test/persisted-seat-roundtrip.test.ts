@@ -180,3 +180,62 @@ test("guard 7 · the contract covers every key of PersistedSeatFields", () => {
       `add it to every allowlist they name. If you removed one: update this count deliberately.`,
   );
 });
+
+// ── G5 (GATE-B1-FALSIFIABILITY.md) — skew survivable in the OTHER direction:
+// a record with NO seat fields at all must parse and render as ITS OWN seat,
+// never as an error. This is the reverse of guards 1-5 above (which all start
+// from a seat-BEARING record); a real pre-B1 record on disk has none of these
+// keys, and CONCEPTION §3.4 requires the UI to treat that absence as "this
+// session IS its own seat", never as an error state.
+
+test("G5 · a record with NO seat fields parses fine — undefined, never null/throw", () => {
+  const preSeatRecord = makeSessionRecord({
+    acpxRecordId: "pre-seat-record",
+    acpSessionId: "pre-seat-record-acp",
+    agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+    cwd: "/workspace/x",
+  });
+  const onDisk = JSON.parse(JSON.stringify(serializeSessionRecordForDisk(preSeatRecord))) as Record<
+    string,
+    unknown
+  >;
+  // Confirm the fixture is genuinely seat-less before asserting anything about
+  // parsing it — otherwise a passing test could just mean the fixture already
+  // carried seat fields by accident.
+  for (const key of ["seat_id", "holder_ordinal", "holder_active", "parent_seat_id"]) {
+    assert.equal(key in onDisk, false, `test fixture unexpectedly carries ${key} — fix the setup`);
+  }
+
+  const parsed = parseSessionRecord(onDisk);
+  assert.ok(parsed, "a seat-less record must still parse — never null/throw");
+  assert.equal(parsed.seatId, undefined);
+  assert.equal(parsed.holderOrdinal, undefined);
+  assert.equal(parsed.holderActive, undefined);
+  assert.equal(parsed.parentSeatId, undefined);
+});
+
+test("G5 · a seat-less record's INDEX ENTRY also parses fine — undefined, never null/throw", async () => {
+  const preSeatRecord = makeSessionRecord({
+    acpxRecordId: "pre-seat-index-entry",
+    acpSessionId: "pre-seat-index-entry-acp",
+    agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+    cwd: "/workspace/x",
+  });
+  const entry = toSessionIndexEntry(preSeatRecord, "pre-seat-index-entry.json");
+  for (const key of INDEXED_SEAT_KEYS) {
+    assert.equal(entry[key], undefined, `test fixture unexpectedly projects ${key}`);
+  }
+
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-seat-skew-guard-"));
+  try {
+    await writeSessionIndex(dir, { files: ["pre-seat-index-entry.json"], entries: [entry] });
+    const reloaded = await readSessionIndex(dir);
+    const back = reloaded?.entries[0];
+    assert.ok(back, "a seat-less index entry must still round-trip — never dropped/null");
+    for (const key of INDEXED_SEAT_KEYS) {
+      assert.equal(back[key], undefined);
+    }
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
