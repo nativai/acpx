@@ -806,6 +806,37 @@ function inheritedProfileSelection(
   return selection;
 }
 
+// Harness-native self-scheduling and skill-injection tools that fight the
+// ACPX-owned wakeup mechanism (Skills/scheduling) and the Operating System's own
+// skill delivery when left enabled by default on a bare `claude` spawn. Applied
+// ONLY at session creation (below) and ONLY when the caller never passed
+// --disallowed-tools at all — an explicit `--disallowed-tools ""` (which parses
+// to `[]`, not `undefined`) is the documented escape hatch and must pass through
+// untouched (acpx PROJECT.md brick ab754b0d).
+const CLAUDE_DEFAULT_DISALLOWED_TOOLS: readonly string[] = [
+  "ScheduleWakeup",
+  "CronCreate",
+  "CronList",
+  "CronDelete",
+  "RemoteTrigger",
+  "Skill",
+];
+
+// Gated strictly on the `claude` adapter kind — NOT `CLAUDE_FAMILY_ADAPTER_KINDS`
+// (agent-command.ts), which also matches the deprecated `claude-pty` bridge.
+// `claude-pty` must never receive this default.
+function resolveClaudeDefaultDisallowedTools(
+  agentCommand: string,
+  requested: string[] | undefined,
+): string[] | undefined {
+  if (requested !== undefined) {
+    return requested;
+  }
+  return acpAdapterKind(agentCommand) === "claude"
+    ? [...CLAUDE_DEFAULT_DISALLOWED_TOOLS]
+    : undefined;
+}
+
 // Assemble the child's sessionOptions, layering parent inheritance over the
 // global flags. Credential, model, and effort inheritance all require the child
 // to resolve to the SAME agent as its parent; explicit child values win
@@ -815,6 +846,7 @@ function inheritedSpawnSessionOptions(
   globalFlags: GlobalFlags,
   sameAgentAsParent: boolean,
   parent: ResolvedParentSession | undefined,
+  agentCommand: string,
 ): NonNullable<Parameters<SessionModule["createSession"]>[0]["sessionOptions"]> {
   // brick://5bac5564 R1: the PRIMARY Fable-leak site. A bare child of a Fable
   // parent inherits `fable` here. Resolve, tag provenance, then run the invariant
@@ -831,6 +863,7 @@ function inheritedSpawnSessionOptions(
   });
   return {
     ...sessionOptionsFromGlobalFlags(globalFlags),
+    disallowedTools: resolveClaudeDefaultDisallowedTools(agentCommand, globalFlags.disallowedTools),
     model: guarded.model,
     modelSource: guarded.source,
     ...(guarded.forced ? { modelGuardBlocked: guarded.blocked } : {}),
@@ -885,6 +918,7 @@ function buildSessionStartOptions(params: {
       params.globalFlags,
       params.agent.sameAgentAsParent,
       params.parent,
+      params.agent.agentCommand,
     ),
   };
 }
@@ -1642,7 +1676,13 @@ export async function handleExec(
     timeoutMs: globalFlags.timeout,
     verbose: globalFlags.verbose,
     promptRetries: globalFlags.promptRetries,
-    sessionOptions: sessionOptionsFromGlobalFlags(globalFlags),
+    sessionOptions: {
+      ...sessionOptionsFromGlobalFlags(globalFlags),
+      disallowedTools: resolveClaudeDefaultDisallowedTools(
+        agent.agentCommand,
+        globalFlags.disallowedTools,
+      ),
+    },
   });
 
   applyPermissionExitCode(result);

@@ -610,7 +610,8 @@ export function addGlobalFlags(command: Command): Command {
     )
     .option(
       "--disallowed-tools <list>",
-      'Tool names to block regardless of --allowed-tools, comma-separated (use "" for none)',
+      'Tool names to block regardless of --allowed-tools, comma-separated (use "" for none) ' +
+        "(defaults to ScheduleWakeup,CronCreate,CronList,CronDelete,RemoteTrigger,Skill for the claude agent)",
       parseDisallowedTools,
     )
     .option(

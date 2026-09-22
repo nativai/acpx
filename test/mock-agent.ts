@@ -768,6 +768,27 @@ function modelFromNewSessionMeta(params: NewSessionRequest): string | undefined 
   return options.model.trim() || undefined;
 }
 
+// Sibling to modelFromNewSessionMeta above — same _meta.claudeCode.options
+// fragment, different leaf. Lets a test observe the disallowedTools actually
+// forwarded on session/new (e.g. via `exec`, which persists no session record to
+// read back) through the existing operation log rather than a new capture
+// mechanism.
+function disallowedToolsFromNewSessionMeta(params: NewSessionRequest): string[] | undefined {
+  const meta = params._meta;
+  if (!isRecord(meta)) {
+    return undefined;
+  }
+  const claudeCode = meta.claudeCode;
+  if (!isRecord(claudeCode)) {
+    return undefined;
+  }
+  const options = claudeCode.options;
+  if (!isRecord(options) || !Array.isArray(options.disallowedTools)) {
+    return undefined;
+  }
+  return options.disallowedTools.filter((tool): tool is string => typeof tool === "string");
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -947,7 +968,12 @@ class MockAgent implements Agent {
       ? (modelFromNewSessionMeta(params) ?? DEFAULT_MODEL_ID)
       : DEFAULT_MODEL_ID;
     this.sessions.set(sessionId, createSessionState(false, requestedModel));
-    this.recordOperation({ method: "session/new", sessionId, modelId: requestedModel });
+    this.recordOperation({
+      method: "session/new",
+      sessionId,
+      modelId: requestedModel,
+      disallowedTools: disallowedToolsFromNewSessionMeta(params),
+    });
 
     const response: NewSessionResponse = { sessionId };
 
