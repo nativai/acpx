@@ -18,10 +18,23 @@
  * every reader (parse, the index projection, ...) rebuilds it key by key, so
  * a write-only test round-trips in memory and passes while a real reader
  * drops the field in production. Four `acpx.*` fields were lost exactly this
- * way before that guard existed; this file is the same guard for the
- * top-level seat/holder fields B1 introduces, and — same as its sibling — is
- * meant to keep covering every top-level seat-scoped field a LATER block
- * adds, not just the four registered here today.
+ * way before that guard existed; this file is the same guard, scoped to the
+ * four seat/holder fields B1 registers below.
+ *
+ * ⚠️ **THIS FILE DOES NOT COVER A FUTURE FIELD BY ITSELF — a real
+ * test-engineer proved it (GATE-B1-FALSIFIABILITY G1b, brick 5ad22d5d).**
+ * `PersistedSeatFields` is `Pick<SessionRecord, these 4 names>` — a
+ * HAND-WRITTEN list. Adding a field to `SessionRecord` does nothing to this
+ * Pick; nothing here forces a new field into it, unlike
+ * `persisted-acpx-contract.ts`'s `Required<SessionAcpxState>`, which covers
+ * its WHOLE type by construction. The TE proved this with a field added to
+ * `SessionRecord` + `serialize.ts` alone, silently destroyed on every round
+ * trip, while this file's own guard stayed green throughout (it was never
+ * told the field existed). **`full-record-contract.ts` is the guard that
+ * actually closes that gap** — it is exhaustive over every key of
+ * `SessionRecord`, compiler-forced, so a new field must be classified there
+ * or the build fails. Read that file, not this comment, for the guarantee
+ * a future top-level field actually gets.
  *
  * ## How the guard works — two halves, and neither is sufficient alone
  *
@@ -35,18 +48,17 @@
  * ## Scope, stated explicitly so nobody assumes coverage that isn't there
  *
  * This sentinel covers ONLY the seat/holder top-level record fields listed
- * in the `Pick<...>` below. It does **not** cover `record.acpx.*` (that is
- * `persisted-acpx-contract.ts`'s job) and it does **not** cover every
- * top-level `SessionRecord` field that existed before B1 — those are already
- * hand-enumerated field-by-field in `parseSessionRecord`'s single return
- * literal and are not the subject of the "writes are total, reads are
- * allowlists" hazard class this file exists to close (that class bites
- * fields parsed by a SEPARATE, more permissive sub-parser — `acpx.*` via
- * `parseAcpxState`, or these seat fields if a future reader ever grows one).
- * A block that adds another top-level, allowlist-parsed field should either
- * extend this file's `Pick<...>` (if it's seat/holder-shaped) or add its own
- * sibling contract file — never assume this file or its `acpx.*` sibling
- * already guards it.
+ * in the `Pick<...>` below, and ONLY the ones already listed there today — it
+ * does **not** automatically pick up a future field, seat-shaped or not (see
+ * the warning above). It does **not** cover `record.acpx.*` (that is
+ * `persisted-acpx-contract.ts`'s job). **`full-record-contract.ts` is the
+ * file with the general guarantee** — it classifies every top-level
+ * `SessionRecord` key, compiler-forced, so nothing added after this file was
+ * written can silently go unregistered. This file remains useful as the
+ * seat-specific fixture `persisted-seat-roundtrip.test.ts` drives for its
+ * INDEX-leg assertions (`full-record-contract.ts`'s guard does not touch the
+ * index projection — see its own Scope note) — it is a real, narrower guard,
+ * not a decommissioned one.
  *
  * ⚠️ SENTINELS ARE DISTINCT ON PURPOSE, same reasoning as the sibling file:
  * an equality test over identical placeholders passes on a crossed wire (a
