@@ -20,13 +20,6 @@ import {
   describeHarnessConfigDirSweepPlan,
   pruneOrphanHarnessConfigDirs,
 } from "../acp/harness-config-dir.js";
-import { resolveSessionTmpRoot } from "../acp/session-tmp-dir.js";
-import {
-  describeSessionTmpSweep,
-  findSessionTmpCandidates,
-  type KnownSessionTmpRecord,
-  sweepSessionTmpDirs,
-} from "../acp/session-tmp-sweep.js";
 import {
   listBuiltInAgents,
   resolveAgentCommand,
@@ -3964,74 +3957,6 @@ function knownRecordsById(
 }
 
 /**
- * Resolve session-tmp records with a TARGETED per-candidate lookup —
- * `resolveSessionRecord(id)`, never `session.listSessions()` — for exactly the
- * ids that have a directory under `/workspace/.tmp`. Brick ceca191f, TE
- * finding: `listSessions()` parses this box's ENTIRE real session store
- * (~1400 records) and reliably OOM-crashes the whole Node process doing it —
- * confirmed and isolated by a test-engineer, with the sweep code entirely
- * innocent. The candidate set here is typically a handful to a few dozen
- * directories, not the whole store, so a per-id lookup is both correct AND
- * cheap — it was never necessary to read every session on the box to decide
- * the fate of the few that actually have a scratch directory.
- *
- * ⚠️ THE THREE-WAY OUTCOME MATTERS, AND COLLAPSING IT TO TWO IS THE BUG THIS
- * FIXES. A lookup can (a) find an open or closed record — trust it fully; (b)
- * positively confirm no record exists (`SessionNotFoundError` on the direct
- * hot-dir path) — genuinely unclaimed, eligible for the sweep's hard-ceiling
- * clause; or (c) FAIL for some other reason (a transient I/O error, a
- * permission problem) — unknown, and must NEVER be treated the same as (b),
- * because (b) feeds the one clause that removes a directory with no record to
- * protect it. `unresolvedIds` is exactly the set that keeps (c) out of (b).
- */
-async function resolveSessionTmpRecordsForCandidates(
-  candidateIds: readonly string[],
-  now: number,
-): Promise<{ records: Map<string, KnownSessionTmpRecord>; unresolvedIds: Set<string> }> {
-  const records = new Map<string, KnownSessionTmpRecord>();
-  const unresolvedIds = new Set<string>();
-  await Promise.all(
-    candidateIds.map(async (id) => {
-      let record: SessionRecord;
-      try {
-        record = await resolveSessionRecord(id);
-      } catch (error) {
-        if (!(error instanceof SessionNotFoundError)) {
-          // A real failure, not a confirmed absence — see the header above.
-          unresolvedIds.add(id);
-        }
-        // A confirmed miss: leave `records` without this id, which is exactly
-        // how the sweep's "no record" clause is expressed.
-        return;
-      }
-      records.set(id, {
-        closed: record.closed === true,
-        idleMs: idleMillisSinceLastUse(record, now),
-      });
-    }),
-  );
-  return { records, unresolvedIds };
-}
-
-/** Idle time from the most recent timestamp the record carries, or `undefined`
- *  when none is usable — never guessed as either young or old. Mirrors
- *  `abandoned-record-sweep.ts`'s `idleMillis`, kept local rather than shared
- *  because that helper is not exported and the two ages answer genuinely
- *  different questions (record abandonment vs. a directory's grace period). */
-function idleMillisSinceLastUse(
-  record: Pick<SessionRecord, "lastUsedAt" | "lastPromptAt" | "createdAt">,
-  now: number,
-): number | undefined {
-  const stamps = [record.lastUsedAt, record.lastPromptAt, record.createdAt]
-    .map((value) => (typeof value === "string" ? Date.parse(value) : Number.NaN))
-    .filter((value) => Number.isFinite(value));
-  if (stamps.length === 0) {
-    return undefined;
-  }
-  return Math.max(0, now - Math.max(...stamps));
-}
-
-/**
  * ⚠️ C — THE FIRST-PROMPT TRIGGER (CONCEPTION §3, ruled A + C(first-prompt)).
  *
  * ## Why a PROMPT and not a CREATE, which is what the note originally recommended
@@ -4220,44 +4145,14 @@ async function sweepOrphanHarnessConfigDirs(
   // ask "what would this remove?" was the one way that could not answer, and a
   // preview showing nothing reads as a clean preview. It now walks the same
   // candidates under the same rule and removes none of them.
-  //
-  // ⚠️ brick ceca191f — AND THE ACPX_SESSION_TMP REAPER RIDES THE SAME TRIGGER,
-  // AND MUST RUN **FIRST**. It is a SECOND, independent per-session directory
-  // leak (SPEC.md), and this function's caller is already the box's one gated
-  // entry point for "sweep orphaned per-session directories, at most once per
-  // interval, from a shared /proc census" — `sessions prune`, `sessions
-  // sweep-config-dirs`, and the opportunistic per-prompt trigger
-  // (`maybeSweepHarnessConfigDirsOnPrompt`, gated by
-  // `claimHarnessConfigDirSweep`). Giving ACPX_SESSION_TMP its own parallel
-  // trigger + gate would duplicate all of that for no behavioural gain, so it
-  // shares this one instead.
-  //
-  // ⚠️ THE ORDERING IS LOAD-BEARING, NOT COSMETIC (TE finding, brick ceca191f).
-  // `session.listSessions()` below — pre-existing code, parsing this box's
-  // ENTIRE real session store to serve the harness-config-dir sweep and the
-  // abandoned-record sweep — reliably OOM-CRASHES THE WHOLE PROCESS on a real,
-  // large store (~1400 sessions, measured). A V8 heap-OOM is not a catchable JS
-  // exception: no try/catch anywhere in this process can survive it, and NOTHING
-  // after the crashing line ever runs. The session-tmp phase therefore MUST run
-  // — and complete — before that call, or its own correctness is irrelevant: a
-  // crash three lines later means the phase's code was never reached at all,
-  // exactly as a test-engineer reproduced. The session-tmp phase's OWN record
-  // lookups are a targeted per-id read (`resolveSessionTmpRecordsForCandidates`),
-  // never a full-store parse, so it does not share this crash risk — but only if
-  // nothing upstream of it in the same process already triggered it.
-  const liveScan = safeScanLiveProcesses();
-  await sweepOrphanSessionTmpDirsPhase({ liveScan, dryRun });
-  if (liveScan === undefined) {
-    // Already reported by safeScanLiveProcesses; neither phase can proceed
-    // without a /proc census.
-    return;
-  }
-
   try {
-    // ⚠️ RECORDS FIRST, DIRECTORIES SECOND — THE ORDER IS LOAD-BEARING (for
-    // THIS pair; see above for why session-tmp runs before BOTH of these).
-    // The harness-config-dir sweep removes only on positive ownership, and one
-    // clause is "the record is CLOSED". That makes its effectiveness a function
+    // ⚠️ ONE /proc CENSUS, SHARED BY BOTH SWEEPS. Taken once so the two cannot
+    // disagree about what is running, and so the cost is paid once.
+    const liveScan = scanLiveProcesses();
+
+    // ⚠️ RECORDS FIRST, DIRECTORIES SECOND — THE ORDER IS LOAD-BEARING.
+    // The directory sweep removes only on positive ownership, and one of its
+    // clauses is "the record is CLOSED". That makes its effectiveness a function
     // of record state: a store full of ABANDONED-OPEN records makes a correct
     // sweep retain every directory forever (measured on the rig: 206 records, 88
     // still open, each pinning a config dir). The fix is to close the ownerless
@@ -4272,15 +4167,8 @@ async function sweepOrphanHarnessConfigDirs(
 
     // Re-read AFTER the record sweep, so the directory pass sees the closes it
     // just made rather than the state that preceded them.
-    //
-    // ⚠️ THIS IS THE FULL-STORE PARSE THAT CAN OOM (see the header above) —
-    // pre-existing behaviour this brick did not introduce and does not fix
-    // here; flagged as a HIGH-priority residual for a context-engineer /
-    // `dev-server-platform` to assess separately. Everything this brick owns
-    // has already run by this point, above.
-    const listed = await session.listSessions();
     const records = withDryRunCloses(
-      knownRecordsById(listed),
+      knownRecordsById(await session.listSessions()),
       dryRun && recordSweep !== undefined ? recordSweep.closed : [],
     );
     const swept = pruneOrphanHarnessConfigDirs({ records, liveScan, rootDir, dryRun });
@@ -4302,68 +4190,8 @@ async function sweepOrphanHarnessConfigDirs(
     // behind --verbose would mean the ONE outcome that prints nothing at all is the
     // one where the sweep threw — silence reading as "it ran and found nothing",
     // which is the exact ambiguity §7 exists to remove.
-    //
-    // ⚠️ THIS CATCH CANNOT SAVE A V8 HEAP-OOM — noted, not fixed, here: a fatal
-    // OOM aborts the process before this handler ever runs. It DOES catch
-    // everything else (a normal thrown error, a resolvable I/O failure), which
-    // is why it stays.
     process.stderr.write(
       `[acpx] harness config dir sweep skipped: ${error instanceof Error ? error.message : String(error)}\n`,
-    );
-  }
-}
-
-/**
- * A `/proc` census that cannot itself throw past this call — `scanLiveProcesses`
- * is expected to be cheap and safe (confirmed: it was never the OOM source, only
- * `listSessions()` was), but the session-tmp phase now runs before the
- * try/catch that used to guard this, so it gets its own tiny one.
- */
-function safeScanLiveProcesses(): ReturnType<typeof scanLiveProcesses> | undefined {
-  try {
-    return scanLiveProcesses();
-  } catch (error) {
-    process.stderr.write(
-      `[acpx] /proc census failed: ${error instanceof Error ? error.message : String(error)}\n`,
-    );
-    return undefined;
-  }
-}
-
-/**
- * The session-tmp reaper phase — now fully SELF-CONTAINED and independent of
- * `session.listSessions()` / the abandoned-record sweep, precisely so it can
- * run (and complete) even where those would OOM the process (brick ceca191f,
- * TE finding). Records are resolved with a targeted per-candidate lookup, not
- * a full-store parse — see `resolveSessionTmpRecordsForCandidates`.
- */
-async function sweepOrphanSessionTmpDirsPhase(params: {
-  liveScan: ReturnType<typeof scanLiveProcesses> | undefined;
-  dryRun: boolean;
-}): Promise<void> {
-  const { liveScan, dryRun } = params;
-  if (liveScan === undefined) {
-    // The /proc census above failed — already reported. Nothing to sweep with.
-    return;
-  }
-  try {
-    const root = resolveSessionTmpRoot();
-    const candidateIds = findSessionTmpCandidates(root) ?? [];
-    const { records: tmpRecords, unresolvedIds } = await resolveSessionTmpRecordsForCandidates(
-      candidateIds,
-      Date.now(),
-    );
-    const tmpSwept = sweepSessionTmpDirs({
-      records: tmpRecords,
-      unresolvedIds,
-      liveScan,
-      rootDir: root,
-      dryRun,
-    });
-    process.stderr.write(describeSessionTmpSweep(tmpSwept));
-  } catch (error) {
-    process.stderr.write(
-      `[acpx] session tmp sweep skipped: ${error instanceof Error ? error.message : String(error)}\n`,
     );
   }
 }

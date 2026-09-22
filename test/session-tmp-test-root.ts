@@ -3,8 +3,11 @@
 //
 // `ensureSessionTmpDir` (src/acp/session-tmp-dir.ts) defaults to
 // `/workspace/.tmp` — a REAL, PVC-backed, disk-constrained directory on every
-// dev box (88% full, which is the whole reason this feature ships with a
-// reaper). Dozens of existing rows across this suite call
+// dev box (88% full — though Daniel's own measurement of this box's full
+// lifetime session count found the worst-case scratch footprint negligible
+// against its free space, which is why the reaper is now a separate brick,
+// 7a89ec64, rather than shipping with this one). Dozens of existing rows
+// across this suite call
 // `buildAgentSpawnOptions` / `buildAgentEnvironment` with a synthetic
 // `acpxRecordId` ("child-id", a fixture UUID, …), and every one of them now
 // creates a directory as a side effect. Left unscoped, running this suite

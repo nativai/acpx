@@ -57,8 +57,16 @@ export function resolveSessionTmpRoot(
   return SESSION_TMP_DEFAULT_ROOT;
 }
 
-/** `<root>/<sessionId>` — the only place this path is composed, shared by the
- *  writer here and the reaper in `session-tmp-sweep.ts`, so they cannot disagree. */
+/**
+ * `<root>/<sessionId>` — the only place this path is composed. A companion
+ * reaper (brick 7a89ec64, split from this one — SPEC.md's "ship the reaper
+ * with the feature" clause was withdrawn by Daniel on measurement: this box's
+ * full lifetime session count projects to a negligible worst-case scratch
+ * footprint against `/workspace`'s free space) lives on its own branch and
+ * must compose this SAME path the same way; keep this function as the one
+ * place that composition happens, exported, so a future reaper (in this repo
+ * or that branch) has no reason to duplicate it.
+ */
 export function sessionTmpDirFor(sessionId: string, root: string): string {
   return join(root, sessionId);
 }
@@ -67,13 +75,16 @@ export function sessionTmpDirFor(sessionId: string, root: string): string {
  * Create THIS session's scratch directory, mode `0700`, and return its path.
  *
  * ⚠️ BEST-EFFORT ON PURPOSE. A `mkdir` failure (disk full — `/workspace` runs at
- * 88%, which is the whole reason a reaper ships with this feature) is reported
- * to stderr rather than thrown: failing session creation itself over a scratch
- * directory would be a strictly worse outcome than a session that starts
- * without one. `ACPX_SESSION_TMP` is still set to the intended path either
- * way — a write against a directory that never got created fails LOUDLY at the
- * point of use (ENOENT), which is the failure mode SPEC.md wants, not a silent
- * fallback to `/tmp`.
+ * 88%, though Daniel's own measurement of this box's full lifetime session
+ * count found the worst-case scratch footprint negligible against its free
+ * space, which is why the reaper is a separate, unblocked, no-rush brick
+ * rather than a release condition for this variable — brick 7a89ec64) is
+ * reported to stderr rather than thrown: failing session creation itself over
+ * a scratch directory would be a strictly worse outcome than a session that
+ * starts without one. `ACPX_SESSION_TMP` is still set to the intended path
+ * either way — a write against a directory that never got created fails
+ * LOUDLY at the point of use (ENOENT), which is the failure mode SPEC.md
+ * wants, not a silent fallback to `/tmp`.
  *
  * ⚠️ `chmodSync` AFTER `mkdirSync`, NOT `mode` ALONE — measured against a REAL
  * spawn on devbox, not assumed. `/workspace` carries the setgid bit (`2775`),
