@@ -244,6 +244,57 @@ test("CONTROL: the policy still rejects the camelCase form of this same field", 
   }, /snake_case/);
 });
 
+// --- the MESSAGE subtree must stay WALKED (brick://94b6f8fb) ----------------
+// `serializeSessionRecordForDisk` passes `messages` through WHOLESALE, so every
+// key under it reaches disk verbatim. On 2026-09-19 acpx began writing the
+// adapter's camelCase `_meta.claudeUuid` straight onto `messages.Agent`; the
+// policy threw inside the write and 69 sessions silently stopped persisting —
+// and inter-agent DELIVERY broke with them, because delivering a message
+// persists the RECIPIENT's record (34 lost deliveries on 2026-09-22).
+//
+// The correct fix maps the wire spelling onto `claude_uuid` at the read site
+// (`conversation-model.ts`). The TEMPTING WRONG ONE is to make the policy stop
+// looking here — an entry in ZED_TAG_KEYS-style allowlisting, or `messages` in
+// OPAQUE_VALUE_PATHS. These two rows pin the subtree as walked so that cannot
+// happen quietly, and they pin the exact historical path so the regression
+// cannot return unnamed.
+//
+// ⚠️ THESE ARE NOT A REGRESSION TEST FOR THE 09-19 DEFECT — they pass on the
+// broken build too, because the runtime policy caught it correctly all along.
+// What failed was the FAILURE MODE and the fact that nothing caught it earlier.
+// The guard that would have caught it before it shipped is the compile-time
+// `PersistedMessageKeysAreSnakeCase` in `src/persisted-key-policy.ts`.
+
+function agentEntryOf(persisted: Record<string, unknown>): Record<string, unknown> {
+  const messages = persisted.messages as { Agent?: Record<string, unknown> }[];
+  const agent = messages.find((entry) => entry.Agent)?.Agent;
+  if (!agent) {
+    throw new Error("fixture must carry an Agent message entry or these rows prove nothing");
+  }
+  return agent;
+}
+
+test("persisted key policy rejects a camelCase key in the message subtree", () => {
+  const persisted = serializeSessionRecordForDisk(makeRecord());
+  agentEntryOf(persisted).claudeUuid = "d0fe0ebd-f63b-4249-91c9-57d9a87fe745";
+
+  const violations = findPersistedKeyPolicyViolations(persisted);
+  assert.equal(violations.includes("messages.Agent.claudeUuid"), true);
+  assert.throws(() => {
+    assertPersistedKeyPolicy(persisted);
+  }, /messages\.Agent\.claudeUuid/);
+});
+
+test("CONTROL: the same message-subtree key passes in snake_case", () => {
+  // Proves the rejection above is about the KEY NAME, not about the policy
+  // refusing any unknown field under `messages`.
+  const persisted = serializeSessionRecordForDisk(makeRecord());
+  agentEntryOf(persisted).claude_uuid = "d0fe0ebd-f63b-4249-91c9-57d9a87fe745";
+
+  assert.deepEqual(findPersistedKeyPolicyViolations(persisted), []);
+  assertPersistedKeyPolicy(persisted);
+});
+
 // --- the single-assignment-path invariant (brick://a89c3cd4) ----------------
 // `servedViaShim` is recorded inside `AcpClient.setShimHandle`, so the fact is
 // captured no matter WHICH shim-start site fires. That only holds while the
