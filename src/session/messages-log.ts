@@ -187,7 +187,7 @@ function isSessionMessage(raw: unknown): raw is SessionMessage {
       typeof user.id === "string" &&
       // Durable byway-fork provenance: recognized + preserved across the
       // messages_log round-trip; never stripped.
-      isOptionalString(user.claudeUuid) &&
+      isOptionalString(user.claude_uuid) &&
       Array.isArray(user.content) &&
       user.content.every((entry) => isUserContent(entry))
     );
@@ -197,7 +197,7 @@ function isSessionMessage(raw: unknown): raw is SessionMessage {
     const agent = isRecord(record.Agent) ? record.Agent : undefined;
     if (
       !agent ||
-      !isOptionalString(agent.claudeUuid) ||
+      !isOptionalString(agent.claude_uuid) ||
       !Array.isArray(agent.content) ||
       !agent.content.every(isAgentContent)
     ) {

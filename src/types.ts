@@ -473,7 +473,7 @@ export type SessionUserMessage = {
    * entry as a deterministic fallback. Absent on the very first User entry
    * (no predecessor) → fork falls back to the legacy index path.
    */
-  claudeUuid?: string;
+  claude_uuid?: string;
 };
 
 /**
@@ -506,8 +506,21 @@ export type SessionAgentMessage = {
    * Claude transcript record uuid of the last record streamed into this
    * entry (durable byway-fork provenance). Stamped last-wins from
    * `update._meta.claudeUuid`.
+   *
+   * ⚠️ THE WIRE FIELD IS camelCase `claudeUuid`; THE PERSISTED FIELD IS
+   * snake_case `claude_uuid`, AND THEY MUST NOT BE UNIFIED. The ACP update
+   * carries `_meta.claudeUuid` (claude-agent-acp's format — changing it would
+   * need a lockstep two-repo deploy), while `persisted-key-policy.ts` requires
+   * `/^[a-z][a-z0-9_]*$/` for every persisted key. `conversation-model.ts`
+   * maps one onto the other at the read site, the same way `SessionTerminalError`
+   * maps `normalizeOutputError`'s camelCase fields. Persisting the wire spelling
+   * instead made `serializeSessionRecordForDisk` throw, which SILENTLY STOPPED
+   * THE SESSION RECORD FROM BEING WRITTEN for the rest of the session — 33
+   * sessions on 2026-09-22 (brick://94b6f8fb). Guarded by
+   * `scripts/lint-persisted-key-casing.ts`, whose fixture carries a provenance
+   * message for exactly this reason.
    */
-  claudeUuid?: string;
+  claude_uuid?: string;
   /**
    * Present only on a synthetic terminal-error entry (FIX-A). Absent on every
    * normal streamed Agent turn.

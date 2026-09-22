@@ -214,7 +214,7 @@ type ForkSessionOptions = LoadSessionOptions & {
   /**
    * The source session's messages_log entries, threaded in so the fork
    * resolver can read durable byway-fork provenance (`messages[atIndex-1]
-   * .claudeUuid`) on the PTY-bridge path (A5).
+   * .claude_uuid`) on the PTY-bridge path (A5).
    */
   sourceMessages?: readonly SessionMessage[];
 };
@@ -232,10 +232,10 @@ function forkEntryClaudeUuid(entry: SessionMessage | undefined): string | undefi
     return undefined;
   }
   if ("User" in entry) {
-    return entry.User.claudeUuid;
+    return entry.User.claude_uuid;
   }
   if ("Agent" in entry) {
-    return entry.Agent.claudeUuid;
+    return entry.Agent.claude_uuid;
   }
   return undefined;
 }
@@ -263,7 +263,7 @@ export function resolvePtyForkMeta(
  * Resolve the Claude-ACP fork `resumeSessionAt` uuid (A6 — completes the
  * durable-provenance mechanism for the mainstream Claude adapter path,
  * mirroring the PTY-bridge branch above). Prefers `sourceMessages[atIndex-1]
- * .claudeUuid` directly, immune to record/transcript index divergence, and
+ * .claude_uuid` directly, immune to record/transcript index divergence, and
  * falls back to `resolveClaudeUuidForAcpxIndex`'s index-arithmetic
  * reconstruction only when the entry carries no provenance (pre-provenance
  * sessions/entries — currently ALL Claude-ACP entries, since the adapter does

@@ -1975,7 +1975,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // Stamp it onto the steer's User entry as the contract's primary
     // signal. Note: `recordPromptStart` already finalized this entry
     // to the append-only messages_log with its inherit-preceding value
-    // (= the preceding Agent's claudeUuid = the same pre-steer tail, equal
+    // (= the preceding Agent's claude_uuid = the same pre-steer tail, equal
     // by construction — see CONTRACT §2), so that inherited value is what
     // the fork resolver durably reads. This stamp keeps the live record in
     // sync with the bridge-authoritative uuid (and is picked up by a later

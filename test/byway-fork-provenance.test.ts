@@ -44,12 +44,14 @@ function tag(message: SessionMessage): "User" | "Agent" | "Resume" {
 
 function agentClaudeUuid(message: SessionMessage | undefined): string | undefined {
   return message && message !== "Resume" && "Agent" in message
-    ? message.Agent.claudeUuid
+    ? message.Agent.claude_uuid
     : undefined;
 }
 
 function userClaudeUuid(message: SessionMessage | undefined): string | undefined {
-  return message && message !== "Resume" && "User" in message ? message.User.claudeUuid : undefined;
+  return message && message !== "Resume" && "User" in message
+    ? message.User.claude_uuid
+    : undefined;
 }
 
 // Build the CONCEPTION §3d T2 stream shape:
@@ -217,7 +219,7 @@ test("(A6) resolveClaudeForkResumeAt: provenance present resolves DIRECTLY, bypa
 
     const sourceMessages: SessionMessage[] = [
       { User: { id: "u0", content: [{ Text: "hi" }] } },
-      { Agent: { content: [{ Text: "hello" }], tool_results: {}, claudeUuid: "provenance-a1" } },
+      { Agent: { content: [{ Text: "hello" }], tool_results: {}, claude_uuid: "provenance-a1" } },
       { User: { id: "u2", content: [{ Text: "again" }] } },
       { Agent: { content: [{ Text: "reply" }], tool_results: {} } },
     ];
@@ -315,8 +317,8 @@ test("(A4) claudeUuid survives the messages_log round-trip", async () => {
     const logPath = messagesLogPath(sessionDir, recordId);
     const messages: SessionMessage[] = [
       { User: { id: "u0", content: [{ Text: "prompt" }] } },
-      { Agent: { content: [{ Text: "reply" }], tool_results: {}, claudeUuid: "agent-uuid" } },
-      { User: { id: "u2", content: [{ Text: "stop" }], claudeUuid: "steer-uuid" } },
+      { Agent: { content: [{ Text: "reply" }], tool_results: {}, claude_uuid: "agent-uuid" } },
+      { User: { id: "u2", content: [{ Text: "stop" }], claude_uuid: "steer-uuid" } },
     ];
 
     const record = makeSessionRecord(
