@@ -3,6 +3,7 @@ import type { SessionRecord, SubagentRef } from "../../types.js";
 import { SESSION_RECORD_SCHEMA } from "../../types.js";
 import { getLoggedMessageCount } from "../messages-log-bookkeeping.js";
 import { normalizeRuntimeSessionId } from "../runtime-session-id.js";
+import { seatFieldsToPersistedRecord } from "./seat-fields.js";
 
 function serializeSubagentRef(ref: SubagentRef): Record<string, unknown> {
   return {
@@ -93,10 +94,7 @@ export function serializeSessionRecordForDisk(
     subagents: canonical.subagents?.map(serializeSubagentRef),
     metadata: canonical.metadata,
     template: canonical.template,
-    seat_id: canonical.seatId,
-    holder_ordinal: canonical.holderOrdinal,
-    holder_active: canonical.holderActive,
-    parent_seat_id: canonical.parentSeatId,
+    ...seatFieldsToPersistedRecord(canonical),
     imported_from: canonical.importedFrom
       ? {
           record_id: canonical.importedFrom.recordId,

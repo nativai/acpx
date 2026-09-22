@@ -12,6 +12,7 @@ import { normalizeSessionOwnerOptions } from "../owner-options.js";
 import { normalizeRuntimeSessionId } from "../runtime-session-id.js";
 import { rememberSessionMetadataBaseline } from "./metadata-merge.js";
 import { rememberSessionModelBaseline } from "./model-merge.js";
+import { parseSeatFieldsFromPersistedRecord } from "./seat-fields.js";
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -1491,20 +1492,10 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
 
   // SEATS (brick 5ad22d5d, C2) — top-level, additive under acpx.session.v1.
   // Absent on a pre-Seat record; never rejects the record (skew contract).
-  const seatId = normalizeOptionalString(record.seat_id);
-  if (seatId === null) {
-    return null;
-  }
-  const holderOrdinal = normalizeOptionalNonNegativeInteger(record.holder_ordinal);
-  if (holderOrdinal === null) {
-    return null;
-  }
-  const holderActive = normalizeOptionalBooleanField(record.holder_active);
-  if (holderActive === null) {
-    return null;
-  }
-  const parentSeatId = normalizeOptionalString(record.parent_seat_id);
-  if (parentSeatId === null) {
+  // The shared helper is the single place that knows the seat field set (C2:
+  // "one shared projection helper feeds both legs") — see seat-fields.ts.
+  const seatFields = parseSeatFieldsFromPersistedRecord(record);
+  if (seatFields === null) {
     return null;
   }
 
@@ -1557,10 +1548,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
       metadata,
       importedFrom: recordMetadata.importedFrom,
       template: parseTemplateState(record.template),
-      seatId: seatId ?? undefined,
-      holderOrdinal: holderOrdinal ?? undefined,
-      holderActive: holderActive ?? undefined,
-      parentSeatId: parentSeatId ?? undefined,
+      ...seatFields,
     }),
   );
 }

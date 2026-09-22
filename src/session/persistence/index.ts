@@ -9,6 +9,7 @@ import type { SessionRecord } from "../../types.js";
 import { modelSetMethodKnownUnsupported } from "../mode-preference.js";
 import { withSessionIndexLock } from "./index-lock.js";
 import { parseSessionRecord } from "./parse.js";
+import { parseSeatFieldsFromIndexEntry, seatFieldsToIndexEntry } from "./seat-fields.js";
 
 const SESSION_INDEX_SCHEMA = "acpx.session-index.v1";
 
@@ -450,10 +451,7 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     templateAutoPrompt: optionalString(record.templateAutoPrompt),
     templateSlug: optionalString(record.templateSlug),
     templateVersion: optionalFiniteNumber(record.templateVersion),
-    seatId: optionalString(record.seatId),
-    holderOrdinal: optionalFiniteNumber(record.holderOrdinal),
-    holderActive: optionalBoolean(record.holderActive),
-    parentSeatId: optionalString(record.parentSeatId),
+    ...parseSeatFieldsFromIndexEntry(record),
   };
 }
 
@@ -623,10 +621,7 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     templateAutoPrompt: record.template?.auto_prompt,
     templateSlug: record.template?.slug,
     templateVersion: record.template?.version,
-    seatId: record.seatId,
-    holderOrdinal: record.holderOrdinal,
-    holderActive: record.holderActive,
-    parentSeatId: record.parentSeatId,
+    ...seatFieldsToIndexEntry(record),
   };
 }
 
