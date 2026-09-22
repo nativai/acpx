@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -30,6 +30,22 @@ import test from "node:test";
  * box's control+workbench pod topology and cannot be exercised in a generic
  * single-machine CI runner. An environment-gated skip is not an ignored test —
  * it runs wherever the dependency exists (`dev-server-workspace` skill).
+ *
+ * ## ⚠️ ALSO GATED ON NOT ALREADY BEING ON THE WORKBENCH — MEASURED, NOT ASSUMED
+ *
+ * `workbench-exec` always targets the workbench pod, wherever it is invoked
+ * FROM. That is exactly its job when called from the control pod — but this
+ * project's own documented gate command (`dev-server-workspace` skill) is
+ * `workbench-exec run-gate.sh -- pnpm test`, which runs the ENTIRE suite,
+ * including this file, ON the workbench. A nested `workbench-exec` call from
+ * a process already on the workbench does not cross a pod boundary at all —
+ * it is a same-machine loopback — so both sides of the "cross-pod" check
+ * would trivially agree, including the `/tmp` positive control, which is
+ * exactly backwards: a same-machine loopback makes `/tmp` LOOK shared.
+ * Measured directly on devbox: `hostname` and `workbench-exec hostname` from
+ * a control-pod shell differ (`dev-server-<box>-...` vs
+ * `dev-server-workbench-...`); from a workbench-pod shell they are IDENTICAL.
+ * That equality is exactly the structural signal this gates on.
  */
 
 function workbenchExecAvailable(): boolean {
@@ -39,6 +55,36 @@ function workbenchExecAvailable(): boolean {
   } catch {
     return false;
   }
+}
+
+function alreadyOnWorkbench(): boolean {
+  try {
+    const remoteHostname = execFileSync("workbench-exec", ["hostname"], {
+      encoding: "utf8",
+      stdio: "pipe",
+    }).trim();
+    return remoteHostname === hostname();
+  } catch {
+    // Could not resolve either hostname — not a basis for skipping; let the
+    // test itself fail loudly rather than silently skip on an unrelated error.
+    return false;
+  }
+}
+
+/** The one skip reason that applies, or `false` to run. Centralised so both
+ *  rows below check the SAME two conditions in the SAME order. */
+function crossPodSkipReason(): string | false {
+  if (!workbenchExecAvailable()) {
+    return "workbench-exec not on PATH — not this box's topology";
+  }
+  if (alreadyOnWorkbench()) {
+    return (
+      "this process is already running ON the workbench pod (e.g. invoked via " +
+      "`workbench-exec run-gate.sh -- pnpm test`) — a nested workbench-exec call here " +
+      "would be a same-machine loopback, not a real cross-pod check"
+    );
+  }
+  return false;
 }
 
 function readViaWorkbench(path: string): string | undefined {
@@ -72,7 +118,7 @@ function writeViaWorkbench(destPath: string, content: string): boolean {
 
 test(
   "ACPX_SESSION_TMP (/workspace-rooted): a file written on the control pod is read byte-for-byte via workbench-exec, and vice versa",
-  { skip: !workbenchExecAvailable() && "workbench-exec not on PATH — not this box's topology" },
+  { skip: crossPodSkipReason() },
   () => {
     const dir = join("/workspace/.tmp", `crosspod-test-${randomUUID()}`);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -109,7 +155,7 @@ test(
 
 test(
   "POSITIVE CONTROL: the SAME check against a /tmp-rooted path FAILS — proving the apparatus can tell /workspace and /tmp apart",
-  { skip: !workbenchExecAvailable() && "workbench-exec not on PATH — not this box's topology" },
+  { skip: crossPodSkipReason() },
   () => {
     // ⚠️ THIS TEST MUST FAIL TO PASS. If a control-pod-local /tmp file were
     // somehow visible byte-identical via workbench-exec, the check above would
