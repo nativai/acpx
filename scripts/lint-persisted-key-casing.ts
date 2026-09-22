@@ -28,7 +28,30 @@ function makeRecord(): SessionRecord {
     },
     closed: false,
     title: null,
-    messages: [],
+    // ⚠️ NOT AN EMPTY LIST, AND DO NOT TRIM THESE ENTRIES BACK. `messages: []`
+    // is what let `messages.Agent.claudeUuid` past this lint and into
+    // production, where it threw inside `serializeSessionRecordForDisk` and
+    // silently stopped 33 sessions persisting (brick://94b6f8fb). A record with
+    // no messages never exercises the message subtree at all, so every key
+    // under `messages.*` was unguarded. Both entry kinds carry every optional
+    // provenance field so a camelCase one cannot be added without this lint
+    // failing.
+    messages: [
+      {
+        User: {
+          id: "lint-user",
+          content: [{ Text: "hello" }],
+          claude_uuid: "11111111-1111-4111-8111-111111111111",
+        },
+      },
+      {
+        Agent: {
+          content: [{ Text: "hi" }],
+          tool_results: {},
+          claude_uuid: "22222222-2222-4222-8222-222222222222",
+        },
+      },
+    ],
     updated_at: "2026-02-27T00:00:00.000Z",
     cumulative_token_usage: {},
     request_token_usage: {},

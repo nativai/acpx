@@ -274,6 +274,16 @@ function isAgentMessage(message: SessionMessage): message is { Agent: SessionAge
  * Durable byway-fork provenance: the claude transcript record uuid the bridge
  * tagged onto this `session/update` via `_meta.claudeUuid`. See the fork
  * provenance contract — producer is the bridge, consumer is acpx.
+ *
+ * ⚠️ THIS IS THE WIRE↔DISK BOUNDARY, AND `claudeUuid` HERE IS CORRECT. Do not
+ * "fix" this read to `claude_uuid` to match the field it is written into, and
+ * do not write the wire spelling straight through. The ACP update really does
+ * carry camelCase (claude-agent-acp's format); the persisted entry really is
+ * snake_case `claude_uuid` (`persisted-key-policy.ts`). Mapping happens HERE,
+ * once, so neither repo has to deploy in lockstep with the other. Writing
+ * `claudeUuid` onto the entry instead made `serializeSessionRecordForDisk`
+ * throw and silently stopped the record being written for the rest of the
+ * session (brick://94b6f8fb).
  */
 function claudeUuidFromUpdate(update: ExtendedSessionUpdate): string | undefined {
   const meta = asRecord((update as { _meta?: unknown })._meta);
@@ -292,7 +302,7 @@ function stampAgentClaudeUuid(
 ): void {
   const uuid = claudeUuidFromUpdate(update);
   if (uuid) {
-    ensureAgentMessage(conversation).claudeUuid = uuid;
+    ensureAgentMessage(conversation).claude_uuid = uuid;
   }
 }
 
@@ -302,29 +312,29 @@ function messageClaudeUuid(message: SessionMessage | undefined): string | undefi
     return undefined;
   }
   if (isUserMessage(message)) {
-    return message.User.claudeUuid;
+    return message.User.claude_uuid;
   }
   if (isAgentMessage(message)) {
-    return message.Agent.claudeUuid;
+    return message.Agent.claude_uuid;
   }
   return undefined;
 }
 
 /**
  * Deterministic A3 fallback: a User entry with no own provenance inherits the
- * immediately preceding messages_log entry's claudeUuid. The very first User
+ * immediately preceding messages_log entry's claude_uuid. The very first User
  * entry (no predecessor) is left without one, so the fork falls back to the
  * legacy index path. Called right after the User entry is appended (it is the
  * last message), so the predecessor is at index -2.
  */
 function inheritPrecedingClaudeUuid(conversation: SessionConversation): void {
   const last = conversation.messages.at(-1);
-  if (!last || !isUserMessage(last) || last.User.claudeUuid !== undefined) {
+  if (!last || !isUserMessage(last) || last.User.claude_uuid !== undefined) {
     return;
   }
   const inherited = messageClaudeUuid(conversation.messages.at(-2));
   if (inherited) {
-    last.User.claudeUuid = inherited;
+    last.User.claude_uuid = inherited;
   }
 }
 
@@ -344,7 +354,7 @@ export function stampSteerBoundaryUuid(
   for (let index = conversation.messages.length - 1; index >= 0; index -= 1) {
     const message = conversation.messages[index];
     if (isUserMessage(message) && message.User.id === promptMessageId) {
-      message.User.claudeUuid = steerBoundaryUuid;
+      message.User.claude_uuid = steerBoundaryUuid;
       return;
     }
   }

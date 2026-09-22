@@ -154,6 +154,7 @@ import { type QueueOwnerActiveSessionController } from "../queue/owner-turn-cont
 import { resolveAndEnsureAgentFolder } from "./agent-folder.js";
 import { resolveExistingBrickPath } from "./brick-link.js";
 import type { RunOnceOptions, SessionSendOptions } from "./contracts.js";
+import { createSubagentBoundaryWriteEnqueuer } from "./subagent-boundary-write.js";
 
 function claudeSubagentDir(cwd: string, acpSessionId: string): string {
   const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
@@ -1974,7 +1975,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // Stamp it onto the steer's User entry as the contract's primary
     // signal. Note: `recordPromptStart` already finalized this entry
     // to the append-only messages_log with its inherit-preceding value
-    // (= the preceding Agent's claudeUuid = the same pre-steer tail, equal
+    // (= the preceding Agent's claude_uuid = the same pre-steer tail, equal
     // by construction — see CONTRACT §2), so that inherited value is what
     // the fork resolver durably reads. This stamp keeps the live record in
     // sync with the bridge-authoritative uuid (and is picked up by a later
@@ -2151,26 +2152,16 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   const subagentTailers = new Map<string, { stop: () => Promise<void> }>();
   const subagentSaveChains = new Map<string, Promise<void>>();
 
-  const enqueueSubagentBoundaryWrite = (
-    childAcpxRecordId: string,
-    childRecord: SessionRecord,
-  ): Promise<void> => {
-    const previous = subagentSaveChains.get(childAcpxRecordId) ?? Promise.resolve();
-    const next = previous
-      .catch(() => {
-        // Preserve ordering after a best-effort write failure.
-      })
-      .then(async () => {
-        await writeSessionRecordAtBoundary(childRecord);
-      });
-    subagentSaveChains.set(childAcpxRecordId, next);
-    void next.finally(() => {
-      if (subagentSaveChains.get(childAcpxRecordId) === next) {
-        subagentSaveChains.delete(childAcpxRecordId);
-      }
-    });
-    return next;
-  };
+  const enqueueSubagentBoundaryWrite = createSubagentBoundaryWriteEnqueuer({
+    chains: subagentSaveChains,
+    write: writeSessionRecordAtBoundary,
+    onWriteError: (childAcpxRecordId, error) => {
+      process.stderr.write(
+        `[acpx] subagent record write failed (${childAcpxRecordId}): ` +
+          `${formatErrorMessage(error)}\n`,
+      );
+    },
+  });
 
   const getOrOpenSubagentEventWriter = async (
     childAcpxRecordId: string,
@@ -2371,15 +2362,26 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
               const tailer = subagentTailers.get(childAcpxRecordId);
               if (tailer) {
                 subagentTailers.delete(childAcpxRecordId);
-                void tailer.stop().then(() => {
-                  const childRecord = subagentRecordsById.get(childAcpxRecordId);
-                  if (childRecord) {
-                    childRecord.lastUsedAt = isoNow();
-                    void enqueueSubagentBoundaryWrite(childAcpxRecordId, childRecord).catch(
-                      () => {},
-                    );
-                  }
-                });
+                // Same detached-rejection class as `enqueueSubagentBoundaryWrite`
+                // above: `tailer.stop()` can reject (every other stop site
+                // `.catch`es it), and the `.then()`-derived promise is discarded
+                // by `void` with no handler — a fatal unhandled rejection.
+                void tailer
+                  .stop()
+                  .then(() => {
+                    const childRecord = subagentRecordsById.get(childAcpxRecordId);
+                    if (childRecord) {
+                      childRecord.lastUsedAt = isoNow();
+                      void enqueueSubagentBoundaryWrite(childAcpxRecordId, childRecord).catch(
+                        () => {},
+                      );
+                    }
+                  })
+                  .catch(() => {
+                    // Draining a finished sub-agent's tailer is best-effort; the
+                    // write failure it guards is already logged by
+                    // `enqueueSubagentBoundaryWrite`.
+                  });
               }
             }
           }
@@ -2654,9 +2656,16 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
             context: deliveryContextFor(injectedTask),
             settled: false,
           };
-          void injectedPromise.finally(() => {
-            tracked.settled = true;
-          });
+          // Same detached-rejection class as `enqueueSubagentBoundaryWrite`:
+          // `.finally()` returns a NEW promise inheriting `injectedPromise`'s
+          // rejection, and `void` drops it unhandled. The rejection itself is
+          // handled where `injectedPromise` is actually awaited; this chain
+          // exists only to flip the `settled` flag.
+          void injectedPromise
+            .finally(() => {
+              tracked.settled = true;
+            })
+            .catch(() => {});
           injectedDeliveries.push(tracked);
         }
       });
