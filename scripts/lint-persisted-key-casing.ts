@@ -204,7 +204,11 @@ function assertSerializerSourceKeys(): void {
 // guarded), probe 3 PASSED it — a fresh wholesale subtree was unguarded, exactly
 // as `messages` had been.
 
-/** Only `src/persisted-key-policy.ts` and its import closure — ~1 s, not ~20 s. */
+/**
+ * Only `src/persisted-key-policy.ts` and its import closure. Measured on the
+ * devbox workbench: ~2.4 s a run, against ~20 s for the whole-project
+ * `pnpm run typecheck` program. Five runs below, so ~12 s of gate time.
+ */
 const PROBE_TSCONFIG = {
   compilerOptions: {
     target: "ES2023",
