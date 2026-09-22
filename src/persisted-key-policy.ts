@@ -167,6 +167,28 @@ export type PersistedAcpxKeysAreSnakeCase = RequireNoOffendingKeys<
   OffendingKeys<import("./types.js").SessionAcpxState>
 >;
 
+/** Mirrors the runtime `ZED_TAG_KEYS` set — serde variant tags, PascalCase by schema. */
+type ZedTagKey =
+  | "User"
+  | "Agent"
+  | "Resume"
+  | "Text"
+  | "Mention"
+  | "Image"
+  | "Audio"
+  | "Thinking"
+  | "RedactedThinking"
+  | "ToolUse";
+
+/**
+ * The same derived guard over the MESSAGE subtree. `serialize.ts` passes
+ * `messages` through wholesale, so every key under it is persisted verbatim —
+ * which is why `messages.Agent.claudeUuid` reached production (brick://94b6f8fb).
+ */
+export type PersistedMessageKeysAreSnakeCase = RequireNoOffendingKeys<
+  OffendingKeys<import("./types.js").SessionMessage>
+>;
+
 /** Fails the constraint — and NAMES the key — as soon as an offender exists. */
 type RequireNoOffendingKeys<Offenders extends never> = Offenders;
 
@@ -211,6 +233,7 @@ type NonSnakeKeyOf<T> = {
  * only check that would have caught brick://48aca560.
  */
 type PermittedKey =
+  | ZedTagKey
   | "fromProfile"
   | "toProfile"
   | "fromAccount"
