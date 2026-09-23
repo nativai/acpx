@@ -3,9 +3,15 @@ import {
   isArchivedRecord,
   isoNow,
   listSessionIndexEntries,
+  overlaySessionIndexEntries,
   resolveSessionRecord,
+  sessionBaseDir,
+  sessionRecordFileName,
+  toSessionIndexEntry,
   writeSessionRecordAuthorizingParent,
+  writeSessionRecordAuthorizingParentWithoutIndex,
 } from "../../session/persistence.js";
+import type { SessionIndexEntryOverlay } from "../../session/persistence.js";
 import type { SessionIndexEntry } from "../../session/persistence/index.js";
 import type { SessionRecord } from "../../types.js";
 import { descendantRecords, readOwnerStatusForRecord } from "./session-control.js";
@@ -631,13 +637,21 @@ function applyParentToRecord(
  * ⚠️ `writeSessionRecordAuthorizingParent`, NOT `writeSessionRecord`. The plain
  * write read-preserves the parent linkage from disk and would put the OLD parent
  * straight back — exit 0, correct-looking output, nothing changed.
+ *
+ * `batched` picks the sibling that writes no index update, because the caller then
+ * owns that half (`indexOverlayBatch`). ⚠️ The two must stay in step: batching the
+ * record write without flushing the overlay leaves every moved child torn across
+ * the two stores until someone re-runs the command.
  */
 async function persistReparentedRecord(
   record: SessionRecord,
   refuse: (record: SessionRecord, code: SetParentRefusalCode, reason: string) => void,
+  batched: boolean,
 ): Promise<boolean> {
   try {
-    await writeSessionRecordAuthorizingParent(record);
+    await (batched
+      ? writeSessionRecordAuthorizingParentWithoutIndex(record)
+      : writeSessionRecordAuthorizingParent(record));
     return true;
   } catch (error) {
     // The write guard is the authority on archived records; catch its throw and
@@ -707,6 +721,93 @@ export async function setSessionParent(options: SetParentOptions): Promise<SetPa
   };
 }
 
+/**
+ * How many children may have their records written before the index is brought
+ * level. **Derived, not chosen** — and the derivation is the whole justification,
+ * so do not "round it up" without redoing it.
+ *
+ * Batching widens the window in which a moved child's record says NEW while its
+ * index entry still says OLD. The system already states its tolerance for that
+ * exact disagreement: `SCALAR_FLUSH_INTERVAL_MS = 5_000` (`index-update-queue.ts`)
+ * — a throttled scalar write may leave the two stores disagreeing for up to 5 s.
+ * At a measured ≈41 ms p90 per child (record write + record resolve, on a box at
+ * load 35-39, i.e. already pessimistic) the bound is CHUNK × 41 ms ≤ 5,000 ms →
+ * CHUNK ≤ 122. 100 leaves headroom: ≈4.1 s worst case, ≈1.4 s at the median.
+ *
+ * It also caps the crash-torn set at ≤100 rather than ≤N, and caps how long the
+ * board renders a moved child under its old parent.
+ *
+ * ⚠️ AT A REALISTIC HANDOVER SIZE THIS NEVER FIRES (20 < 100) — one flush, exactly
+ * as if there were no bound. It is insurance for pathological N, not a tuning knob.
+ */
+const INDEX_FLUSH_CHUNK = 100;
+
+/** Accumulates the index half of a batch re-parent and flushes it under one lock. */
+type IndexOverlayBatch = {
+  /**
+   * Whether the record write must SKIP its own index update, because this batch
+   * owns it. One flag, read by both halves, so "wrote the record without an index
+   * update" and "accumulated an overlay for it" cannot disagree — the pair that
+   * would silently leave every moved child torn.
+   */
+  batched: boolean;
+  /** Record a written child's new parent linkage; flushes when CHUNK is reached. */
+  add: (record: SessionRecord) => Promise<void>;
+  /** Write whatever is accumulated. Idempotent; a no-op when nothing is pending. */
+  flush: () => Promise<void>;
+};
+
+/**
+ * The parent-linkage half of `--children-of`, as an overlay batch.
+ *
+ * ⚠️ THE FIELD GROUP HERE MUST MATCH THE ONE THE RECORD WRITE IS AUTHORITATIVE FOR
+ * — `preserveParentLinkageForPersist`'s four fields. Overlay fewer and the index
+ * keeps a stale member of the group; overlay more and this command starts
+ * asserting fields it is not the authority on, which is exactly the whole-entry
+ * behaviour that reverts a concurrent close.
+ *
+ * `parentSessionUrl` is included even when it is `undefined`, and that is the
+ * point: a same-box parent must CLEAR a previous cross-box url rather than leave
+ * it pointing at the wrong host (`applyParentToRecord` does the same on the
+ * record). `overlaySessionIndexEntries` documents that an explicit undefined
+ * clears.
+ */
+function indexOverlayBatch(enabled: boolean): IndexOverlayBatch {
+  const pending = new Map<string, SessionIndexEntryOverlay>();
+  const flush = async (): Promise<void> => {
+    if (pending.size === 0) {
+      return;
+    }
+    const batch = new Map(pending);
+    pending.clear();
+    await overlaySessionIndexEntries(sessionBaseDir(), batch);
+  };
+  return {
+    batched: enabled,
+    add: async (record: SessionRecord): Promise<void> => {
+      if (!enabled) {
+        return;
+      }
+      const file = sessionRecordFileName(record.acpxRecordId);
+      pending.set(file, {
+        fields: {
+          parentSessionId: record.parentSessionId,
+          parentSessionUrl: record.parentSessionUrl,
+          parentSetAt: record.parentSetAt,
+          spawnedBySessionId: record.spawnedBySessionId,
+        },
+        // A child whose record the index has not caught up with yet still needs its
+        // row; the record is in hand, so build it from that.
+        fallback: toSessionIndexEntry(record, file),
+      });
+      if (pending.size >= INDEX_FLUSH_CHUNK) {
+        await flush();
+      }
+    },
+    flush,
+  };
+}
+
 type MoveContext = {
   /** An explicit single target has nothing to skip TO, so every per-child refusal
    *  becomes the WHOLE command's refusal. Under --children-of the same conditions
@@ -732,7 +833,6 @@ async function moveTargets(
   const moved: SetParentMovedSession[] = [];
   const skipped: SetParentSkippedSession[] = [];
   const warnings: string[] = [];
-  const now = isoNow();
 
   const refuse = (record: SessionRecord, code: SetParentRefusalCode, reason: string): void => {
     if (context.single) {
@@ -746,6 +846,41 @@ async function moveTargets(
     });
   };
 
+  // The single-target path keeps its IMMEDIATE per-record index write: one child is
+  // not a batch, and `test/session-reparent.test.ts` pins that write against the
+  // coalescing queue. `--dry-run` writes nothing at all, by either half.
+  const overlay = indexOverlayBatch(!context.single && !context.dryRun);
+
+  try {
+    await moveEach(targets, parent, graph, context, { moved, skipped, warnings, refuse, overlay });
+  } finally {
+    // 🛑 IN A `finally`, NOT AFTER THE LOOP, and not on `beforeExit` (which
+    // `SIGKILL` and `process.exit()` skip). A child whose record is already
+    // committed must get its index entry even when a later child throws —
+    // otherwise the throw, not the crash, is what leaves the store torn.
+    await overlay.flush();
+  }
+
+  return { moved, skipped, warnings };
+}
+
+type MoveAccumulators = {
+  moved: SetParentMovedSession[];
+  skipped: SetParentSkippedSession[];
+  warnings: string[];
+  refuse: (record: SessionRecord, code: SetParentRefusalCode, reason: string) => void;
+  overlay: IndexOverlayBatch;
+};
+
+async function moveEach(
+  targets: SessionRecord[],
+  parent: { acpxRecordId: string; sessionUrl?: string; crossBox: boolean },
+  graph: SessionIndexEntry[],
+  context: MoveContext,
+  out: MoveAccumulators,
+): Promise<void> {
+  const { moved, warnings, refuse, overlay } = out;
+  const now = isoNow();
   for (const record of targets) {
     const refusal = refusalForChild(record, parent, graph);
     if (refusal) {
@@ -760,9 +895,12 @@ async function moveTargets(
     warnings.push(
       ...noteHealedDivergence(entry, context.healed.get(record.acpxRecordId), context.dryRun),
     );
-    if (!context.dryRun && !(await persistReparentedRecord(record, refuse))) {
+    if (!context.dryRun && !(await persistReparentedRecord(record, refuse, overlay.batched))) {
       continue;
     }
+    // The record is committed; the index half is the overlay's, flushed by CHUNK
+    // and once in the caller's `finally`. A no-op for a single target or a dry run.
+    await overlay.add(record);
     // `Facets/user-facing-via-acpx-ui/FACET.md` gates the user-facing facet on
     // `unless_env="ACPX_PARENT_SESSION_URL"`, so a session that HAD no parent loses
     // its ability to hand work to Daniel once its owner next respawns. A genuine
@@ -775,6 +913,4 @@ async function moveTargets(
     }
     moved.push(entry);
   }
-
-  return { moved, skipped, warnings };
 }

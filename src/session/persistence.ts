@@ -9,6 +9,9 @@ export {
   manifestFailureRemedy,
 } from "./persistence/deletion-manifest.js";
 export { flushPendingSessionIndexUpdates } from "./persistence/index-update-queue.js";
+export { toSessionIndexEntry } from "./persistence/index.js";
+export { overlaySessionIndexEntries } from "./persistence/index-overlay.js";
+export type { SessionIndexEntryOverlay } from "./persistence/index-overlay.js";
 export {
   DEFAULT_HISTORY_LIMIT,
   absolutePath,
@@ -38,10 +41,12 @@ export {
   resolveTemplateSelector,
   rollbackTemplateSlug,
   sessionBaseDir,
+  sessionRecordFileName,
   writeSessionRecord,
   writeSessionRecordAtBoundary,
   writeSessionRecordAtBoundaryWithLifecycle,
   writeSessionRecordAuthorizingParent,
+  writeSessionRecordAuthorizingParentWithoutIndex,
   writeSessionRecordWithLifecycle,
   writeSessionRecordWithPersistedLifecycle,
 } from "./persistence/repository.js";

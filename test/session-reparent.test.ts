@@ -1582,3 +1582,206 @@ test("--children-of still moves every child over a DELETED and over a MALFORMED 
     });
   });
 });
+
+// ─── brick 2f6f9951: ONE locked index overlay per batch, not one per child ───
+//
+// `--children-of` rewrote the WHOLE of index.json once per child — every term of
+// that rewrite O(index size). It now writes the records, then overlays only the
+// parent-linkage field group onto the entries as they stand on disk, under one
+// lock, once per CHUNK (100) and once at the end.
+//
+// ⚠️ THIS IS NOT SHIPPED AS A SPEED FIX AND NO TEST HERE CLAIMS ONE. At a realistic
+// handover size (≤20 children) the end-to-end difference sits UNDER the ±2× noise
+// floor measured for this box (brick 2f6f9951 §7). What it buys is the hazard in
+// the second test below, which the per-child whole-entry write cannot avoid.
+
+test("--children-of writes the index ONCE for a 20-child batch, not once per child", async (t) => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "old-parent");
+    await seed(homeDir, "new-parent");
+    const childIds = Array.from({ length: 20 }, (_, i) => `child-${String(i).padStart(2, "0")}`);
+    for (const id of childIds) {
+      await seed(homeDir, id, { parentSessionId: "old-parent" });
+    }
+    await runCli(["claude", "sessions", "list", "--local"], homeDir);
+
+    const indexPath = path.join(homeDir, ".acpx", "sessions", "index.json");
+    const session = await loadSessionModule();
+    const originalRename = fs.rename;
+    let indexWrites = 0;
+    const spy = t.mock.method(fs, "rename", async (...args: Parameters<typeof fs.rename>) => {
+      // `writeSessionIndex` is temp-file + atomic rename, so the rename ONTO
+      // index.json is exactly one completed index write — countable, unlike an
+      // mtime, which coalesces two writes inside one clock tick.
+      if (args[1] === indexPath) {
+        indexWrites += 1;
+      }
+      return (originalRename as (...a: typeof args) => unknown).apply(fs, args);
+    });
+    let moved: number;
+    try {
+      const result = await session.setSessionParent({
+        target: { kind: "children-of", parentSessionId: "old-parent" },
+        parent: { id: "new-parent" },
+      });
+      moved = result.moved.length;
+    } finally {
+      spy.mock.restore();
+    }
+
+    assert.equal(moved, 20, "the measurement is meaningless if the command did not move them");
+    // ⚠️ BOTH BOUNDS, AND THE LOWER ONE IS NOT CEREMONY. A hook that observes
+    // nothing counts zero, and zero satisfies "at most one" — which is how an
+    // instrument that never fired reads as the strongest possible result. (It
+    // happened in this very file: a `rename` hook on the promises API missed the
+    // record writes entirely, because the brick outbox writes them synchronously.)
+    assert.ok(indexWrites >= 1, "the index-write hook never fired — the test measured nothing");
+    // 🛑 THE POSITIVE CONTROL. Per-child index writes make this 20. `ceil(20/100)`
+    // flushes is 1; the bound allows one extra for an incidental reconcile write, so
+    // this pins the ORDER OF MAGNITUDE rather than an exact schedule.
+    assert.ok(indexWrites <= 2, `expected one batched index write, got ${indexWrites}`);
+
+    // …and the batch is COMPLETE: read back from index.json on disk, not through an
+    // acpx API, which flushes on read and would hide a missing write.
+    for (const id of childIds) {
+      assert.equal(
+        (await readIndexEntry(homeDir, id)).parentSessionId,
+        "new-parent",
+        `${id} never reached the index`,
+      );
+      assert.equal((await readRecordJson(homeDir, id)).parent_session_id, "new-parent");
+    }
+  });
+});
+
+test("a child that CLOSES or is RENAMED during the batch keeps that change in BOTH stores", async (t) => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "old-parent");
+    await seed(homeDir, "new-parent");
+    const childIds = ["child-1", "child-2", "child-3", "child-4", "child-5", "child-6"];
+    for (const id of childIds) {
+      await seed(homeDir, id, { parentSessionId: "old-parent" });
+    }
+    await runCli(["claude", "sessions", "list", "--local"], homeDir);
+
+    // A SECOND writer, as a separate module instance — its own index-update queue
+    // and its own membership knowledge, i.e. the shape another process has.
+    const session = await loadSessionModule();
+    const other = await loadPersistenceModule();
+
+    // ⚠️ THE TRIGGER IS THE HARD PART, AND MY FIRST ONE SILENTLY NEVER FIRED.
+    // Hooking `fs.rename` (node:fs/promises) looked right and caught nothing: in a
+    // canonical session dir the record write goes through the brick outbox, which
+    // writes with SYNCHRONOUS `node:fs` (`writeRecordAtomic`). A hook that never
+    // fires makes this whole test pass for the wrong reason, so the fire count is
+    // asserted below rather than assumed.
+    //
+    // What fires reliably is the per-record `readPersistedLifecycle` read on the
+    // promises API. So: on each record read, ask DISK how many children already
+    // carry the new parent, and land the edits once some are written and some are
+    // not — order-independent, no timing, and provably inside the window.
+    const originalReadFile = fs.readFile;
+    const written = async (): Promise<string[]> => {
+      const done: string[] = [];
+      for (const id of childIds) {
+        const raw = JSON.parse(
+          await originalReadFile(sessionFilePath(homeDir, id), "utf8"),
+        ) as Record<string, unknown>;
+        if (raw.parent_session_id === "new-parent") {
+          done.push(id);
+        }
+      }
+      return done;
+    };
+    let victims: { closed: string; renamed: string } | undefined;
+    const spy = t.mock.method(fs, "readFile", async (...args: Parameters<typeof fs.readFile>) => {
+      const result = await (originalReadFile as (...a: typeof args) => unknown).apply(fs, args);
+      if (!victims) {
+        const done = await written();
+        if (done.length >= 2 && done.length < childIds.length) {
+          // Claim the victims BEFORE awaiting: the edits below read and write
+          // records themselves and would otherwise re-enter this hook.
+          victims = { closed: done[0], renamed: done[1] };
+          await other.closeSession(victims.closed);
+          const record = await other.resolveSessionRecord(victims.renamed);
+          record.name = "renamed-mid-batch";
+          // The privileged lifecycle write — what an external scalar edit uses, and
+          // the only path that may legitimately author `name`.
+          await other.writeSessionRecordWithLifecycle(record);
+        }
+      }
+      return result;
+    });
+    try {
+      const result = await session.setSessionParent({
+        target: { kind: "children-of", parentSessionId: "old-parent" },
+        parent: { id: "new-parent" },
+      });
+      assert.equal(result.moved.length, childIds.length);
+    } finally {
+      spy.mock.restore();
+    }
+
+    // No edit, no hazard — this test would then prove nothing at all.
+    assert.ok(victims, "the mid-batch edits never fired; the trigger is broken, not the code");
+    const { closed: closedId, renamed: renamedId } = victims;
+
+    // 🛑 THE HAZARD THIS COMMIT EXISTS TO ELIMINATE. The obvious batching shape —
+    // write N records, then replay the entry SNAPSHOT taken at record-write time —
+    // reverts `closed` to false for a child that closed during the window. Being
+    // closed, it receives no further record write, so NOTHING EVER HEALS IT: the
+    // board shows a live child that is gone, which is the disease this brick family
+    // treats. Reproduced with a control in the conception (§4.3); this assertion is
+    // red against that shape — verified by mutating the overlay to replay whole
+    // entries and watching it fail.
+    assert.equal((await readRecordJson(homeDir, closedId)).closed, true);
+    assert.equal(
+      (await readIndexEntry(homeDir, closedId)).closed,
+      true,
+      `the index reverted a concurrent CLOSE of ${closedId} — a child that is gone still renders as live`,
+    );
+    // Same construction, a different field: the overlay must write the parent group
+    // and nothing else.
+    assert.equal((await readRecordJson(homeDir, renamedId)).name, "renamed-mid-batch");
+    assert.equal(
+      (await readIndexEntry(homeDir, renamedId)).name,
+      "renamed-mid-batch",
+      `the index reverted a concurrent RENAME of ${renamedId}`,
+    );
+    // …and the re-parent itself still landed on both stores, for every child.
+    for (const id of childIds) {
+      assert.equal((await readRecordJson(homeDir, id)).parent_session_id, "new-parent");
+      assert.equal((await readIndexEntry(homeDir, id)).parentSessionId, "new-parent");
+    }
+  });
+});
+
+test("a same-box re-parent CLEARS a stale cross-box parentSessionUrl from the index entry", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "old-parent");
+    await seed(homeDir, "new-parent");
+    await seed(homeDir, "child", {
+      parentSessionId: "old-parent",
+      parentSessionUrl: "https://atrium.other-box.example/?session=old-parent",
+    });
+    await runCli(["claude", "sessions", "list", "--local"], homeDir);
+    assert.equal(
+      typeof (await readIndexEntry(homeDir, "child")).parentSessionUrl,
+      "string",
+      "fixture: the child must start with a cross-box url on its entry",
+    );
+
+    const session = await loadSessionModule();
+    await session.setSessionParent({
+      target: { kind: "children-of", parentSessionId: "old-parent" },
+      parent: { id: "new-parent" },
+    });
+
+    // ⚠️ AN OVERLAY BUILT WITH AN "ASSIGN ONLY DEFINED VALUES" HELPER PASSES EVERY
+    // OTHER TEST IN THIS FILE AND FAILS HERE: the new parent is same-box, so the
+    // field's new value IS absence, and a skipped undefined leaves the entry
+    // pointing at the wrong host while the record is correct.
+    assert.equal((await readIndexEntry(homeDir, "child")).parentSessionUrl, undefined);
+    assert.equal((await readRecordJson(homeDir, "child")).parent_session_url, undefined);
+  });
+});
