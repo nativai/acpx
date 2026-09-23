@@ -1947,6 +1947,58 @@ test("a child that CLOSES or is RENAMED during the batch keeps that change in BO
   });
 });
 
+// ⚠️ THIS TEST EXISTS BECAUSE THE FIX WEAKENED THE OLD CONTROL, AND SAYING SO IS
+// THE POINT. Clause 4 ("a concurrent close survives") used to be pinned by mutating
+// the overlay to write WHOLE ENTRIES instead of the field group. Once the overlay
+// began deriving from the record as read at FLUSH time, that mutation stopped
+// firing — a whole entry projected from the *fresh* record carries the concurrent
+// close and rename correctly, so the test above passes against it (verified: 37/37
+// green under that mutation). The clause is still violable, but only for entry
+// state that is NOT record-derived: what the INDEX-ONLY writers touch. acpx-ui
+// writes `closed`/`favorite` straight into the entry without a record write, and a
+// whole-entry projection silently discards exactly that.
+test("an INDEX-ONLY edit during the batch survives the flush", async (t) => {
+  await withTempHome(async (homeDir) => {
+    const childIds = await seedHandover(homeDir, 6);
+    const session = await loadSessionModule();
+    const indexPath = path.join(homeDir, ".acpx", "sessions", "index.json");
+
+    let victim: string | undefined;
+    const hook = editDuringBatch(t, homeDir, childIds, 1, async (written) => {
+      victim = written[0];
+      // An index-only writer: the ENTRY changes, the record does not. This is the
+      // shape acpx-ui's favorite/closed writes have.
+      const raw = JSON.parse(await fs.readFile(indexPath, "utf8")) as {
+        entries: Record<string, unknown>[];
+      };
+      const entry = raw.entries.find((candidate) => candidate.acpxRecordId === victim);
+      assert.ok(entry, "fixture: the victim has no index row to edit");
+      entry.favorite = true;
+      await fs.writeFile(indexPath, JSON.stringify(raw), "utf8");
+    });
+    try {
+      await session.setSessionParent({
+        target: { kind: "children-of", parentSessionId: "old-parent" },
+        parent: { id: "new-parent" },
+      });
+    } finally {
+      hook.restore();
+    }
+    assert.ok(hook.fired(), "the index-only edit never fired — the trigger is broken");
+    assert.ok(victim, "no victim was chosen");
+
+    assert.equal(
+      (await readIndexEntry(homeDir, victim)).favorite,
+      true,
+      "the flush discarded an index-only edit — it wrote more than its own field group",
+    );
+    // …and the edit really was index-only, or the assertion above proves nothing:
+    // a record-derived value would come back whatever the overlay wrote.
+    assert.equal((await readRecordJson(homeDir, victim)).favorite, undefined);
+    assert.equal((await readIndexEntry(homeDir, victim)).parentSessionId, "new-parent");
+  });
+});
+
 test("a same-box re-parent CLEARS a stale cross-box parentSessionUrl from the index entry", async () => {
   await withTempHome(async (homeDir) => {
     await seed(homeDir, "old-parent");

@@ -124,6 +124,22 @@ export type SessionIndexEntryOverlay = {
  * > under the held lock. The reads below are plain `fs.readFile` + parse: no
  * > outbox, no queue flush, no second lock of any kind. The cost of holding too
  * > long is a concurrent writer degrading to unlocked, never a wedge.
+ *
+ * ## Can this read a record MID-WRITE? No, and there are two cases
+ *
+ * - **The caller's own writes.** A caller must call this only for files whose
+ *   record write has already returned, and a mid-batch (chunked) flush must not
+ *   overlap one. `set-parent`'s loop is strictly sequential — `await` the record
+ *   write, then `await` the add that may flush — so the flush runs BETWEEN record
+ *   writes. A caller that wrote records concurrently would have to serialise them
+ *   against its flush itself.
+ * - **Another process's write.** Record writes land by `rename` (`persistRecordFile`,
+ *   and the outbox's `writeRecordAtomic` with fsync + rename), so a reader sees the
+ *   old bytes or the new bytes, never a torn file. Reading the OLD bytes — the
+ *   rename landing just after our `open` — is harmless and self-correcting:
+ *   record-first-index-second means that writer's own index update comes after its
+ *   record write, so it blocks on this lock and lands its value once we release.
+ *   The two stores converge on the later writer, which is the intended outcome.
  */
 export async function overlaySessionIndexEntries(
   sessionDir: string,
