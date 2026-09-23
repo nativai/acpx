@@ -7,7 +7,6 @@ import {
   resolveSessionRecord,
   sessionBaseDir,
   sessionRecordFileName,
-  toSessionIndexEntry,
   writeSessionRecordAuthorizingParent,
   writeSessionRecordAuthorizingParentWithoutIndex,
 } from "../../session/persistence.js";
@@ -426,6 +425,20 @@ function indexParents(entries: SessionIndexEntry[]): Map<string, string | undefi
  * while nothing assigns a parent outside record construction and this verb — the
  * condition `preserveParentLinkageForPersist` states, and it expires with a new
  * parent writer.** Re-run that grep before adding one.
+ *
+ * ⚠️ **AND THE BATCH IN THIS SAME FILE IS ITSELF A NEW PARENT WRITER FOR THE INDEX —
+ * so that escape clause has already fired once, here.** When `moveTargets` first
+ * batched the index update it wrote the group from an in-memory value captured at
+ * record-write time, which is NOT projected from a post-preserve read: a concurrent
+ * authoritative re-parent landing in between produced `record == THIRD,
+ * index == NEW` — the very fourth case this comment calls unreachable — and the
+ * child then matched NEITHER branch on a re-run, appearing in none of `moved`,
+ * `skipped` or `diverged` (test-engineer, brick 2f6f9951 §5).
+ * `overlaySessionIndexEntries` now derives the group from the RECORD ON DISK inside
+ * the index lock, i.e. from the persisted post-preserve bytes rather than from a
+ * snapshot, which restores reason (2) for this writer too. **Any future index-side
+ * parent writer owes the same property — that, not the grep, is what keeps this
+ * comment true.**
  */
 async function selectChildrenOf(
   oldParentId: string,
@@ -724,23 +737,43 @@ export async function setSessionParent(options: SetParentOptions): Promise<SetPa
 /**
  * How many children may have their records written before the index is brought
  * level. **Derived, not chosen** — and the derivation is the whole justification,
- * so do not "round it up" without redoing it.
+ * so do not "round it up" without redoing it. TWO constraints bind it, and the
+ * SECOND is the tighter one.
  *
- * Batching widens the window in which a moved child's record says NEW while its
- * index entry still says OLD. The system already states its tolerance for that
- * exact disagreement: `SCALAR_FLUSH_INTERVAL_MS = 5_000` (`index-update-queue.ts`)
- * — a throttled scalar write may leave the two stores disagreeing for up to 5 s.
- * At a measured ≈41 ms p90 per child (record write + record resolve, on a box at
- * load 35-39, i.e. already pessimistic) the bound is CHUNK × 41 ms ≤ 5,000 ms →
- * CHUNK ≤ 122. 100 leaves headroom: ≈4.1 s worst case, ≈1.4 s at the median.
+ * **(1) The two-store disagreement window.** Batching widens the interval in which
+ * a moved child's record says NEW while its index entry still says OLD. The system
+ * already states its tolerance for exactly that: `SCALAR_FLUSH_INTERVAL_MS = 5_000`
+ * (`index-update-queue.ts`) — a throttled scalar write may leave the two stores
+ * disagreeing for up to 5 s. At a measured ≈41 ms p90 per child (record write +
+ * record resolve, on a box at load 35-39, i.e. already pessimistic):
+ * CHUNK × 41 ms ≤ 5,000 ms → **CHUNK ≤ 122**.
  *
- * It also caps the crash-torn set at ≤100 rather than ≤N, and caps how long the
- * board renders a moved child under its old parent.
+ * **(2) How long the index lock is held — the binding one.**
+ * `overlaySessionIndexEntries` reads one RECORD per file inside the lock (that is
+ * what makes a concurrent authoritative write win instead of losing; see its
+ * contract 1). The threshold that matters is NOT the 5 s stale takeover — it is
+ * `INDEX_LOCK_MAX_WAIT_MS = 2_000` (`index-lock.ts`), after which a waiting writer
+ * **proceeds WITHOUT the lock**, i.e. degrades to the racing read-modify-write the
+ * lock exists to prevent. Measured on the live store (400 real records): read+parse
+ * median 0.68 ms, p90 3.1 ms, p99 8.7 ms, **worst 14.5 ms** — over a size
+ * distribution of median 5 KB, p99 174 KB, max 1.4 MB. Budgeting the whole locked
+ * section at ≤1 s (half the 2 s deadline), against reconcile+write ≈65 ms at 1,600
+ * entries and the WORST observed per-record cost, not the median:
+ * CHUNK × 14.5 ms + 65 ms ≤ 1,000 ms → **CHUNK ≤ 64**.
  *
- * ⚠️ AT A REALISTIC HANDOVER SIZE THIS NEVER FIRES (20 < 100) — one flush, exactly
+ * ⚠️ **The axis that measurement could not vary is record SIZE beyond 1.4 MB** —
+ * this box's largest. A store of multi-MB records pushes the per-record term up
+ * roughly linearly; at ~30 ms/record CHUNK=50 still lands at ≈1.6 s, inside the
+ * 2 s deadline, which is why the budget was set at half of it rather than at it.
+ *
+ * **50** satisfies both with margin (≈2.1 s of window, ≈0.8 s of lock at the worst
+ * observed cost). It also caps the crash-torn set at ≤50 rather than ≤N, and caps
+ * how long the board renders a moved child under its old parent.
+ *
+ * ⚠️ AT A REALISTIC HANDOVER SIZE THIS NEVER FIRES (20 < 50) — one flush, exactly
  * as if there were no bound. It is insurance for pathological N, not a tuning knob.
  */
-const INDEX_FLUSH_CHUNK = 100;
+const INDEX_FLUSH_CHUNK = 50;
 
 /** Accumulates the index half of a batch re-parent and flushes it under one lock. */
 type IndexOverlayBatch = {
@@ -751,14 +784,26 @@ type IndexOverlayBatch = {
    * would silently leave every moved child torn.
    */
   batched: boolean;
-  /** Record a written child's new parent linkage; flushes when CHUNK is reached. */
+  /**
+   * Mark a child as needing its index row brought level; flushes when CHUNK is
+   * reached.
+   *
+   * 🛑 **CALL THIS ONLY AFTER THAT CHILD'S RECORD WRITE HAS LANDED, AND THE
+   * ORDERING IS A CORRECTNESS REQUIREMENT, NOT TIDINESS.** The flush derives what
+   * it writes from the record ON DISK, so a file added before its record write
+   * would have the OLD parent projected into the index — the same stale-value bug
+   * the flush-time read exists to remove, with a new cause. The only call site is
+   * immediately after `persistReparentedRecord` returns true, and `flush()` runs
+   * only from inside this function (post-write) or from the caller's `finally`
+   * after the loop — so nothing can flush a file whose record is not yet written.
+   */
   add: (record: SessionRecord) => Promise<void>;
   /** Write whatever is accumulated. Idempotent; a no-op when nothing is pending. */
   flush: () => Promise<void>;
 };
 
 /**
- * The parent-linkage half of `--children-of`, as an overlay batch.
+ * The parent linkage, as the overlay reads it off the record at FLUSH time.
  *
  * ⚠️ THE FIELD GROUP HERE MUST MATCH THE ONE THE RECORD WRITE IS AUTHORITATIVE FOR
  * — `preserveParentLinkageForPersist`'s four fields. Overlay fewer and the index
@@ -766,19 +811,42 @@ type IndexOverlayBatch = {
  * asserting fields it is not the authority on, which is exactly the whole-entry
  * behaviour that reverts a concurrent close.
  *
+ * 🛑 A FUNCTION OF THE RECORD, NOT A CAPTURED OBJECT, AND THAT IS THE FIX FOR A
+ * REAL DEFECT — do not "simplify" it back. The first version of this batch captured
+ * these four values from the in-memory record at WRITE time and wrote them up to a
+ * chunk later. An operator's `--session-id` re-parent, or acpx-ui's parent PATCH
+ * when someone drags a session on the board, landing inside that window was then
+ * **clobbered by the older value** — and because selection matches on the entry's
+ * parent, the child afterwards appeared in NEITHER `moved` NOR `skipped` NOR
+ * `diverged` on a re-run: a silent orphan, the exact failure this brick family
+ * exists to kill. Reproduced with real writers by the test-engineer (window 4/4 on
+ * the branch vs 0/4 on `5756fd6`; the clobber landed in 2 of 4). Deriving from disk
+ * inside the lock means the record — the authority — always wins.
+ *
  * `parentSessionUrl` is included even when it is `undefined`, and that is the
  * point: a same-box parent must CLEAR a previous cross-box url rather than leave
  * it pointing at the wrong host (`applyParentToRecord` does the same on the
  * record). `overlaySessionIndexEntries` documents that an explicit undefined
  * clears.
  */
+const PARENT_LINKAGE_OVERLAY: SessionIndexEntryOverlay = {
+  fields: (record: SessionRecord) => ({
+    parentSessionId: record.parentSessionId,
+    parentSessionUrl: record.parentSessionUrl,
+    parentSetAt: record.parentSetAt,
+    spawnedBySessionId: record.spawnedBySessionId,
+  }),
+};
+
 function indexOverlayBatch(enabled: boolean): IndexOverlayBatch {
-  const pending = new Map<string, SessionIndexEntryOverlay>();
+  // Files only. The batch holds NO record state at all, so there is nothing in it
+  // that can go stale between the record write and the flush.
+  const pending = new Set<string>();
   const flush = async (): Promise<void> => {
     if (pending.size === 0) {
       return;
     }
-    const batch = new Map(pending);
+    const batch = new Map([...pending].map((file) => [file, PARENT_LINKAGE_OVERLAY]));
     pending.clear();
     await overlaySessionIndexEntries(sessionBaseDir(), batch);
   };
@@ -788,18 +856,7 @@ function indexOverlayBatch(enabled: boolean): IndexOverlayBatch {
       if (!enabled) {
         return;
       }
-      const file = sessionRecordFileName(record.acpxRecordId);
-      pending.set(file, {
-        fields: {
-          parentSessionId: record.parentSessionId,
-          parentSessionUrl: record.parentSessionUrl,
-          parentSetAt: record.parentSetAt,
-          spawnedBySessionId: record.spawnedBySessionId,
-        },
-        // A child whose record the index has not caught up with yet still needs its
-        // row; the record is in hand, so build it from that.
-        fallback: toSessionIndexEntry(record, file),
-      });
+      pending.add(sessionRecordFileName(record.acpxRecordId));
       if (pending.size >= INDEX_FLUSH_CHUNK) {
         await flush();
       }

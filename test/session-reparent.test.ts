@@ -1654,63 +1654,116 @@ test("--children-of writes the index ONCE for a 20-child batch, not once per chi
   });
 });
 
-test("a child that CLOSES or is RENAMED during the batch keeps that change in BOTH stores", async (t) => {
-  await withTempHome(async (homeDir) => {
-    await seed(homeDir, "old-parent");
-    await seed(homeDir, "new-parent");
-    const childIds = ["child-1", "child-2", "child-3", "child-4", "child-5", "child-6"];
+/**
+ * Fire `edit(written)` exactly ONCE, at a moment when at least `minWritten` of
+ * `childIds` have had their record committed by the in-flight batch and at least
+ * one has not — i.e. inside the window between a record write and the overlay
+ * flush, which is where every concurrency hazard on this path lives.
+ *
+ * ⚠️ THE TRIGGER IS THE HARD PART, AND MY FIRST ONE SILENTLY NEVER FIRED. Hooking
+ * `fs.rename` (node:fs/promises) looked right and caught nothing: in a canonical
+ * session dir the record write goes through the brick outbox, which writes with
+ * SYNCHRONOUS `node:fs` (`writeRecordAtomic`). A hook that never fires makes the
+ * whole test pass for the wrong reason — so every caller asserts `fired()` below.
+ *
+ * What fires reliably is the per-record `readPersistedLifecycle` read on the
+ * promises API. So: on each record read, ask DISK how far the batch has got, and
+ * land the edit once some children are written and some are not — order-
+ * independent, no timing, and provably inside the window.
+ */
+function editDuringBatch(
+  t: import("node:test").TestContext,
+  homeDir: string,
+  childIds: string[],
+  minWritten: number,
+  edit: (written: string[]) => Promise<void>,
+): { fired: () => string[] | undefined; restore: () => void } {
+  const originalReadFile = fs.readFile;
+  const writtenSoFar = async (): Promise<string[]> => {
+    const done: string[] = [];
     for (const id of childIds) {
-      await seed(homeDir, id, { parentSessionId: "old-parent" });
-    }
-    await runCli(["claude", "sessions", "list", "--local"], homeDir);
-
-    // A SECOND writer, as a separate module instance — its own index-update queue
-    // and its own membership knowledge, i.e. the shape another process has.
-    const session = await loadSessionModule();
-    const other = await loadPersistenceModule();
-
-    // ⚠️ THE TRIGGER IS THE HARD PART, AND MY FIRST ONE SILENTLY NEVER FIRED.
-    // Hooking `fs.rename` (node:fs/promises) looked right and caught nothing: in a
-    // canonical session dir the record write goes through the brick outbox, which
-    // writes with SYNCHRONOUS `node:fs` (`writeRecordAtomic`). A hook that never
-    // fires makes this whole test pass for the wrong reason, so the fire count is
-    // asserted below rather than assumed.
-    //
-    // What fires reliably is the per-record `readPersistedLifecycle` read on the
-    // promises API. So: on each record read, ask DISK how many children already
-    // carry the new parent, and land the edits once some are written and some are
-    // not — order-independent, no timing, and provably inside the window.
-    const originalReadFile = fs.readFile;
-    const written = async (): Promise<string[]> => {
-      const done: string[] = [];
-      for (const id of childIds) {
+      try {
         const raw = JSON.parse(
           await originalReadFile(sessionFilePath(homeDir, id), "utf8"),
         ) as Record<string, unknown>;
         if (raw.parent_session_id === "new-parent") {
           done.push(id);
         }
+      } catch {
+        // a record this test deliberately removed — not written, not a failure
       }
-      return done;
-    };
-    let victims: { closed: string; renamed: string } | undefined;
-    const spy = t.mock.method(fs, "readFile", async (...args: Parameters<typeof fs.readFile>) => {
-      const result = await (originalReadFile as (...a: typeof args) => unknown).apply(fs, args);
-      if (!victims) {
-        const done = await written();
-        if (done.length >= 2 && done.length < childIds.length) {
-          // Claim the victims BEFORE awaiting: the edits below read and write
-          // records themselves and would otherwise re-enter this hook.
-          victims = { closed: done[0], renamed: done[1] };
-          await other.closeSession(victims.closed);
-          const record = await other.resolveSessionRecord(victims.renamed);
-          record.name = "renamed-mid-batch";
-          // The privileged lifecycle write — what an external scalar edit uses, and
-          // the only path that may legitimately author `name`.
-          await other.writeSessionRecordWithLifecycle(record);
-        }
+    }
+    return done;
+  };
+  let firedWith: string[] | undefined;
+  const spy = t.mock.method(fs, "readFile", async (...args: Parameters<typeof fs.readFile>) => {
+    const result = await (originalReadFile as (...a: typeof args) => unknown).apply(fs, args);
+    if (!firedWith) {
+      const done = await writtenSoFar();
+      if (done.length >= minWritten && done.length < childIds.length) {
+        // Claim BEFORE awaiting: the edit reads and writes records itself and
+        // would otherwise re-enter this hook.
+        firedWith = done;
+        await edit(done);
       }
-      return result;
+    }
+    return result;
+  });
+  return { fired: () => firedWith, restore: () => spy.mock.restore() };
+}
+
+/** old-parent, new-parent, third-parent + `count` open children of old-parent. */
+async function seedHandover(homeDir: string, count: number): Promise<string[]> {
+  await seed(homeDir, "old-parent");
+  await seed(homeDir, "new-parent");
+  await seed(homeDir, "third-parent");
+  const childIds = Array.from({ length: count }, (_, i) => `child-${i + 1}`);
+  for (const id of childIds) {
+    await seed(homeDir, id, { parentSessionId: "old-parent" });
+  }
+  // Materialise index.json so the run under test is warm, as a real one is.
+  await runCli(["claude", "sessions", "list", "--local"], homeDir);
+  return childIds;
+}
+
+async function indexEntryOrUndefined(
+  homeDir: string,
+  id: string,
+): Promise<Record<string, unknown> | undefined> {
+  const raw = JSON.parse(
+    await fs.readFile(path.join(homeDir, ".acpx", "sessions", "index.json"), "utf8"),
+  ) as { entries?: Record<string, unknown>[] };
+  return (raw.entries ?? []).find((candidate) => candidate.acpxRecordId === id);
+}
+
+// 🛑 THE DEFECT THIS COMMIT FIXES, AS A TEST. The batch used to capture the four
+// parent fields at RECORD-WRITE time and write them up to a chunk later, so an
+// authoritative write to a field INSIDE the group — an operator's `--session-id`
+// move, or acpx-ui's parent PATCH when someone drags a session on the board —
+// landing in that window was overwritten by the older value. The child then named
+// a parent in the index that its record did not name, and because selection
+// matches on the ENTRY's parent, a re-run of the same handover reported
+// `moved:N skipped:0 diverged:0` with that child in NONE of the three arrays: a
+// silent orphan, which is the precise failure this brick family exists to kill.
+// (Test-engineer's finding on b01cd39; window 4/4 on the branch vs 0/4 on the
+// baseline, clobber observed in 2 of 4 real-writer runs.)
+test("a concurrent authoritative re-parent during the batch WINS — the flush must not clobber it", async (t) => {
+  await withTempHome(async (homeDir) => {
+    const childIds = await seedHandover(homeDir, 6);
+    const session = await loadSessionModule();
+    // A separate module instance: its own index-update queue and membership
+    // knowledge, i.e. what another process is.
+    const other = await loadSessionModule();
+
+    let victim: string | undefined;
+    const hook = editDuringBatch(t, homeDir, childIds, 1, async (written) => {
+      victim = written[0];
+      // Exactly what `sessions set-parent --session-id <child> --parent-id THIRD`
+      // does, and what acpx-ui's parent PATCH does: both stores, immediately.
+      await other.setSessionParent({
+        target: { kind: "session", sessionId: victim },
+        parent: { id: "third-parent" },
+      });
     });
     try {
       const result = await session.setSessionParent({
@@ -1719,11 +1772,149 @@ test("a child that CLOSES or is RENAMED during the batch keeps that change in BO
       });
       assert.equal(result.moved.length, childIds.length);
     } finally {
-      spy.mock.restore();
+      hook.restore();
+    }
+    assert.ok(hook.fired(), "the concurrent re-parent never fired — the trigger is broken");
+    assert.ok(victim, "no victim was chosen");
+
+    // The concurrent writer moved the RECORD to third-parent. The record is the
+    // authority, so the index must follow it — not the batch's older value.
+    assert.equal((await readRecordJson(homeDir, victim)).parent_session_id, "third-parent");
+    assert.equal(
+      (await readIndexEntry(homeDir, victim)).parentSessionId,
+      "third-parent",
+      "the batch clobbered a newer authoritative re-parent with its own stale value",
+    );
+    // The two stores agreeing is what keeps the child findable: with them split,
+    // a re-run of this handover selects on the index and the child is in none of
+    // moved/skipped/diverged.
+    for (const id of childIds) {
+      const record = await readRecordJson(homeDir, id);
+      const entry = await readIndexEntry(homeDir, id);
+      assert.equal(
+        entry.parentSessionId,
+        record.parent_session_id,
+        `${id}: the two stores disagree — that child is invisible to the next run`,
+      );
+    }
+    // …and every other child still landed on the handover's parent.
+    for (const id of childIds.filter((candidate) => candidate !== victim)) {
+      assert.equal((await readRecordJson(homeDir, id)).parent_session_id, "new-parent");
+    }
+  });
+});
+
+// Contract clause: "a moved file the index has no row for yet still needs one, or
+// the update is silently dropped for exactly the files that need it most". The TE
+// measured that deleting that insert left the suite 34/34 GREEN — a published
+// guarantee with no test is a comment, and Seat B2 is being told to rely on it.
+test("a moved child whose index ROW IS MISSING at flush time still gets one", async (t) => {
+  await withTempHome(async (homeDir) => {
+    const childIds = await seedHandover(homeDir, 6);
+    const session = await loadSessionModule();
+    const indexPath = path.join(homeDir, ".acpx", "sessions", "index.json");
+
+    let victim: string | undefined;
+    const hook = editDuringBatch(t, homeDir, childIds, 1, async (written) => {
+      victim = written[0];
+      // Drop just this child's ROW, leaving its record file (and therefore
+      // index.files) untouched, so the reconcile sees no drift and returns an
+      // index that simply has no row for a file that exists.
+      const raw = JSON.parse(await fs.readFile(indexPath, "utf8")) as {
+        entries: Record<string, unknown>[];
+      };
+      raw.entries = raw.entries.filter((entry) => entry.acpxRecordId !== victim);
+      await fs.writeFile(indexPath, JSON.stringify(raw), "utf8");
+    });
+    try {
+      await session.setSessionParent({
+        target: { kind: "children-of", parentSessionId: "old-parent" },
+        parent: { id: "new-parent" },
+      });
+    } finally {
+      hook.restore();
+    }
+    assert.ok(hook.fired(), "the row was never removed — the trigger is broken");
+    assert.ok(victim, "no victim was chosen");
+
+    const entry = await indexEntryOrUndefined(homeDir, victim);
+    assert.ok(entry, `${victim} has a record naming the new parent and NO index row at all`);
+    assert.equal(entry?.parentSessionId, "new-parent");
+    assert.equal((await readRecordJson(homeDir, victim)).parent_session_id, "new-parent");
+  });
+});
+
+// Contract clause: a record that is gone at flush time gets NO row — an index row
+// for a vanished record is worse than a missing one. Under the flush-time design
+// this holds BY CONSTRUCTION (the field group is derived from the record, so with
+// no record there is nothing to derive); the previous add-time-snapshot shape had
+// to remember a guard, and this test is what catches a revert to it.
+test("a child whose RECORD vanishes mid-batch gets NO index row resurrected", async (t) => {
+  await withTempHome(async (homeDir) => {
+    const childIds = await seedHandover(homeDir, 6);
+    const session = await loadSessionModule();
+
+    let victim: string | undefined;
+    const hook = editDuringBatch(t, homeDir, childIds, 1, async (written) => {
+      victim = written[0];
+      // Pruned by another process while the batch runs: record gone, row gone.
+      await fs.rm(sessionFilePath(homeDir, victim));
+    });
+    try {
+      await session.setSessionParent({
+        target: { kind: "children-of", parentSessionId: "old-parent" },
+        parent: { id: "new-parent" },
+      });
+    } finally {
+      hook.restore();
+    }
+    assert.ok(hook.fired(), "the record was never removed — the trigger is broken");
+    assert.ok(victim, "no victim was chosen");
+
+    assert.equal(
+      await indexEntryOrUndefined(homeDir, victim),
+      undefined,
+      "an index row was resurrected for a record that no longer exists",
+    );
+    // The rest of the batch is unaffected — one vanished record must not cost the
+    // others their index update.
+    for (const id of childIds.filter((candidate) => candidate !== victim)) {
+      assert.equal((await readIndexEntry(homeDir, id)).parentSessionId, "new-parent");
+    }
+  });
+});
+
+test("a child that CLOSES or is RENAMED during the batch keeps that change in BOTH stores", async (t) => {
+  await withTempHome(async (homeDir) => {
+    const childIds = await seedHandover(homeDir, 6);
+    const session = await loadSessionModule();
+    // A separate module instance — its own index-update queue and its own
+    // membership knowledge, i.e. the shape another process has.
+    const other = await loadPersistenceModule();
+
+    let victims: { closed: string; renamed: string } | undefined;
+    const hook = editDuringBatch(t, homeDir, childIds, 2, async (written) => {
+      victims = { closed: written[0], renamed: written[1] };
+      await other.closeSession(victims.closed);
+      const record = await other.resolveSessionRecord(victims.renamed);
+      record.name = "renamed-mid-batch";
+      // The privileged lifecycle write — what an external scalar edit uses, and
+      // the only path that may legitimately author `name`.
+      await other.writeSessionRecordWithLifecycle(record);
+    });
+    try {
+      const result = await session.setSessionParent({
+        target: { kind: "children-of", parentSessionId: "old-parent" },
+        parent: { id: "new-parent" },
+      });
+      assert.equal(result.moved.length, childIds.length);
+    } finally {
+      hook.restore();
     }
 
     // No edit, no hazard — this test would then prove nothing at all.
-    assert.ok(victims, "the mid-batch edits never fired; the trigger is broken, not the code");
+    assert.ok(hook.fired(), "the mid-batch edits never fired; the trigger is broken, not the code");
+    assert.ok(victims, "no victims were chosen");
     const { closed: closedId, renamed: renamedId } = victims;
 
     // 🛑 THE HAZARD THIS COMMIT EXISTS TO ELIMINATE. The obvious batching shape —
