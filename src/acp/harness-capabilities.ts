@@ -79,7 +79,7 @@ import { acpAdapterKind } from "./agent-command.js";
  * the token with the real reason and cite the build you measured it on.
  */
 
-export const HARNESS_IDS = ["claude", "claude-pty", "codex", "pi"] as const;
+export const HARNESS_IDS = ["claude", "codex", "pi"] as const;
 
 export type HarnessId = (typeof HARNESS_IDS)[number];
 
@@ -991,107 +991,6 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
     modelDegradeBlockedReason:
       "acpx's Fable→Opus degrade runs only inside the Claude-subscription failover engine, which does not reach this harness.",
     defaultModel: { source: "claude-subscription", id: "default" }, // C5 §8.4's own example
-    liveModelChangeBlockedReason:
-      "acpx has no live model path for this harness; recreate the session with a different --model.",
-  },
-
-  "claude-pty": {
-    id: "claude-pty",
-    measuredAgainst: {
-      // ⚠️ The deployed package version is the literal string `0.0.0-private`,
-      // which distinguishes NOTHING between builds. The commit is the only
-      // identity this adapter has, and recording that limit is the point — a
-      // citation that cannot date a build should say so rather than look precise.
-      adapter: {
-        kind: "resolved-commit",
-        spec: "claude-pty-acp 0.0.0-private",
-        commit: "ce2a2e6",
-      },
-      source:
-        "git -C /opt/claude-pty-acp rev-parse --short HEAD (the package version is a constant and cannot date a build)",
-    },
-    label: "claude-pty",
-    supportsProfiles: true,
-    supportsOutputStyles: true, // MAP §3.1 — create-time only, folded into the launch --settings JSON
-    arbitraryModelSupport: "none", // CONCEPTION §7.4 — hardcoded [opus, sonnet, haiku]
-    model: {
-      // types `/model <id>` into the live TUI via tmux keystrokes, claude-pty-acp :4648-4688 (MAP §3.1)
-      mechanism: "set-model",
-      // `SUPPORTED_MODELS = [opus, sonnet, haiku]`, claude-pty-acp :149-154 (MAP §3.1)
-      catalogue: "static",
-      // MEASURED 2026-09-06 on the live ACP wire against the deployed
-      // `/opt/claude-pty-acp` (adapter self-report
-      // `independent-claude-acp-transcript 0.9.0-c`), brick c4da2ff2, with a
-      // control that fires in BOTH directions on the same path:
-      //   POSITIVE  `sonnet` accepted at `session/set_model`; the adapter's own
-      //             launch argv reads
-      //             ["/home/node/.local/bin/claude","--model","sonnet","--effort","high",…]
-      //             — acpx's id reaches the harness VERBATIM, and the depth
-      //             travels as a SEPARATE flag rather than fused into the id.
-      //   NEGATIVE  `opus[1m]` REFUSED, ACP -32602:
-      //             `Unsupported model "opus[1m]". Available models: opus, sonnet, haiku`
-      // (The prompt that followed died with `tmux-lost` — a rig artifact, the
-      // adapter launching a hardcoded `/home/node/.local/bin/claude` under a
-      // foreign HOME. The id is settled at `session/set_model`, which is where
-      // both observations above were taken; no served response was measured.)
-      idForm: "bare",
-    },
-    depth: {
-      // the ONLY config option it advertises, claude-pty-acp :148,155,714-722 (MAP §3.1)
-      mechanism: "config-option",
-      // `SUPPORTED_EFFORTS = [low, medium, high, xhigh, max]`, model-independent (MAP §3.1)
-      ladder: "static",
-      configOptionAdvertisedAtSessionNew: true, // MAP §3.1 — its ONLY config option, default `high`
-    },
-    // `claude-home` forces adapter `claude-pty` (src/config/profiles.ts:145-156);
-    // `--subscription` is refused for it (src/acp/auth-env.ts:1152-1162).
-    credential: { tier: "profile", providers: ["claude-home"] },
-    // Physical transcript copy with INCLUSIVE truncation at a resolved Claude
-    // transcript UUID (`copyForkTranscript` :1605-1636, `claudeUuidForAcpxForkIndex`
-    // :1584-1604), and two loud refusals rather than a silent full copy (MAP §3.2).
-    fork: { supported: true, atIndex: "exact" },
-    midTurnSteering: true, // src/acp/mid-turn-injection-support.ts:5-20 (native TUI steering)
-    primerChannel: "system-prompt", // `_meta.systemPrompt` re-applied on every (re)launch, :1889-1893
-    usageReporting: true, // MAP §3.1 — same wire shape; cost derived from a pricing table
-    promptImages: true, // MAP §3.1 — `image:true`
-    // ⚠️ NOT MEASURED, AND THE TEMPTING ANSWER IS THE DANGEROUS ONE. The harness
-    // binary is the SAME Claude Code 2.1.251 that defines `/clear` (see the claude
-    // block), and this adapter drives it as a LIVE TUI where slash commands
-    // certainly work — so "obviously true" is the reading that will suggest itself.
-    // What nobody has measured is the only link that matters: whether a PROMPT
-    // arrives at the TUI as typed input that the TUI then executes as a slash
-    // command, or is routed some other way. `sendSlashCommand` exists in
-    // claude-pty-acp for `/model` (MAP §3.1, :4648-4688) — which is evidence that a
-    // prompt is NOT automatically a slash command, since one had to be built.
-    // A wrong `true` here would show a "Clear context" button that draws a boundary
-    // over history the harness still holds.
-    supportsSessionClear: false,
-    sessionClearBlockedReason:
-      "not measured: no probe has sent /clear as a prompt through claude-pty-acp and checked whether the TUI executed it as a slash command or answered it as a message. The underlying Claude Code binary does define /clear.",
-    // MEASURED, same seam as claude: `claude-pty` is in `CLAUDE_FAMILY_ADAPTER_KINDS`
-    // (src/acp/agent-command.ts:192) so `assertClaudeFamilySeam` admits it, and a
-    // `claude-home` profile's anchor is `<homePath>/.claude`
-    // (src/config/profiles.ts:854-865), so `requireAnchor` passes. This is the
-    // "unified SDK-subscription + claude-pty-bridge move" the handler's own comment
-    // names (src/cli/command-handlers.ts:2283-2289).
-    canSetCredentialLive: true,
-    credentialLiveBlockedReason:
-      "acpx's credential move is Claude-family only: this session's adapter has no Claude account to move and no Claude transcript to port.",
-    // ⚠️ NOT MEASURED, AND THE TWO HALVES OF THE CHAIN DISAGREE — which is exactly
-    // why this is a token and not a confident false. The GATE admits claude-pty: it
-    // is Claude-family and a `claude-home` profile has a non-null anchor, so
-    // `failoverEnabledForRecord` is true. The TRIGGER looks unreachable: the
-    // degrade needs `isFableModel(session_options.model)`
-    // (src/runtime/engine/failover.ts:383) and this adapter's catalogue is the
-    // static [opus, sonnet, haiku] (MAP §3.1, claude-pty-acp:149-154), so no Fable
-    // model should be pinnable — but whether acpx can STORE an unadvertised model
-    // id on the record before the adapter rejects it is not measured, and the
-    // fable-share probe reads the SUBSCRIPTION registry regardless of this
-    // session's `claude-home` profile. Two readings, no probe: do not pick one.
-    supportsModelDegrade: false,
-    modelDegradeBlockedReason:
-      "not measured: no probe has run a Fable-pinned claude-pty session through a rate-limit failover. The gate admits claude-home profiles, but the adapter's static [opus, sonnet, haiku] catalogue offers no Fable model to degrade FROM.",
-    defaultModel: { source: "claude-home", id: "default" },
     liveModelChangeBlockedReason:
       "acpx has no live model path for this harness; recreate the session with a different --model.",
   },
