@@ -4,7 +4,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { serializeSessionRecordForDisk } from "../src/session/persistence.js";
+import { parseSessionRecord, serializeSessionRecordForDisk } from "../src/session/persistence.js";
+import { toSessionIndexEntry } from "../src/session/persistence/index.js";
 import type { SessionRecord } from "../src/types.js";
 import {
   fileExists,
@@ -1469,5 +1470,700 @@ test("setSessionParent is reachable from the session module and returns the enve
     assert.equal(result.moved[0]?.acpxRecordId, "child");
     assert.equal(result.parent.crossBox, false);
     assert.equal((await readRecordJson(homeDir, "child")).parent_session_id, "b");
+  });
+});
+
+// ─── brick 853d9f38: selection from the INDEX, records loaded per TARGET ─────
+//
+// The change these three tests guard is invisible to every behavioural test in
+// this file: `--children-of` produced the same envelope before and after. What
+// changed is WHAT IT READS — a full-store `listSessions()` hydrate (4.2–13.4 s
+// over 1,600 records, 60–80 % of the command) replaced by one index read plus one
+// record read per target. So the first test asserts the READ COUNT, structurally,
+// because nothing else can fail when the optimisation silently does not happen.
+
+/**
+ * Count the record files `setSessionParent` reads, for a store of `chaff`
+ * uninvolved sessions plus a fixed three children.
+ *
+ * ⚠️ COUNTS `<id>.json` UNDER THE STORE, NOT EVERY READ. `index.json`, the
+ * `.messages.ndjson` sidecars and anything outside the session dir are excluded:
+ * the claim is about RECORD hydration, and a counter that also counts the index
+ * read would move for reasons that have nothing to do with it.
+ *
+ * The warm-up CLI run is load-bearing: on a COLD store the first index load
+ * rebuilds by re-parsing every record, which is the reconcile — a real, separate
+ * full-store read that this test is not about and that would mask the one it is.
+ */
+async function recordReadsForChildrenOf(
+  t: import("node:test").TestContext,
+  chaff: number,
+): Promise<number> {
+  return await withTempHome(async (homeDir) => {
+    await seed(homeDir, "old-parent");
+    await seed(homeDir, "new-parent");
+    for (let i = 0; i < 3; i += 1) {
+      await seed(homeDir, `child-${i}`, { parentSessionId: "old-parent" });
+    }
+    for (let i = 0; i < chaff; i += 1) {
+      await seed(homeDir, `chaff-${i}`);
+    }
+    await runCli(["claude", "sessions", "list", "--local"], homeDir);
+
+    const session = await loadSessionModule();
+    const storeDir = path.join(homeDir, ".acpx", "sessions");
+    const originalReadFile = fs.readFile;
+    let recordReads = 0;
+    const spy = t.mock.method(fs, "readFile", async (...args: Parameters<typeof fs.readFile>) => {
+      // Only string paths matter here — every record read goes through
+      // `path.join`. A non-string (fd / URL / Buffer) is simply not a record read.
+      const target = typeof args[0] === "string" ? args[0] : "";
+      if (
+        path.dirname(target) === storeDir &&
+        target.endsWith(".json") &&
+        path.basename(target) !== "index.json"
+      ) {
+        recordReads += 1;
+      }
+      return (originalReadFile as (...a: typeof args) => unknown).apply(fs, args);
+    });
+    try {
+      const result = await session.setSessionParent({
+        target: { kind: "children-of", parentSessionId: "old-parent" },
+        parent: { id: "new-parent" },
+      });
+      // The measurement is worthless if the command did not do the work.
+      assert.equal(result.moved.length, 3, "expected all three children to move");
+    } finally {
+      spy.mock.restore();
+    }
+    return recordReads;
+  });
+}
+
+test("--children-of reads a FIXED number of records — it does not scale with the store", async (t) => {
+  const small = await recordReadsForChildrenOf(t, 5);
+  const large = await recordReadsForChildrenOf(t, 60);
+
+  // 🛑 THE POSITIVE CONTROL. Against the pre-853d9f38 `listSessions()` selection
+  // these two differ by exactly the 55 chaff records — the whole store is hydrated
+  // to answer a question about three children. Equality is the claim; an absolute
+  // bound alone would pass a version that reads the store twice as long as it did
+  // so consistently.
+  assert.equal(
+    small,
+    large,
+    `record reads must not scale with the store: 5 chaff → ${small}, 60 chaff → ${large}`,
+  );
+  // …and the fixed number is small: one read per target for the selection, one for
+  // the write's read-preserve, plus the two parents. Not a tight pin — a budget.
+  assert.ok(large <= 12, `expected ~1+N record reads, got ${large}`);
+});
+
+test("an index row whose RECORD will not load is REPORTED, not silently dropped", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "old-parent");
+    await seed(homeDir, "new-parent");
+    await seed(homeDir, "child-ok", { parentSessionId: "old-parent" });
+    await seed(homeDir, "child-broken", { parentSessionId: "old-parent" });
+    // Materialise index.json while BOTH children are still readable, so the broken
+    // one keeps a valid entry naming old-parent.
+    await runCli(["claude", "sessions", "list", "--local"], homeDir);
+    await fs.writeFile(sessionFilePath(homeDir, "child-broken"), "{ not json\n", "utf8");
+
+    const result = await runCli(
+      [
+        "claude",
+        "sessions",
+        "set-parent",
+        "--children-of",
+        "old-parent",
+        "--parent-id",
+        "new-parent",
+        "--format",
+        "json",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const payload = parseJsonLine(result.stdout);
+
+    // The healthy sibling is unaffected — one bad row must not fail the handover.
+    assert.deepEqual(
+      (payload.moved as Record<string, unknown>[]).map((entry) => entry.acpxRecordId),
+      ["child-ok"],
+    );
+    // ⚠️ AND THE BAD ROW IS NAMED. Under the `listSessions()` selection it was
+    // filtered out before the predicate ever ran: neither `moved` nor `skipped`,
+    // `ok:true`, nothing for an operator to pull on — the exact silence F4 exists
+    // to end.
+    const skipped = payload.skipped as Record<string, unknown>[];
+    assert.equal(skipped.length, 1);
+    assert.equal(skipped[0]?.acpxRecordId, "child-broken");
+    assert.equal(skipped[0]?.code, "SESSION_NOT_FOUND");
+  });
+});
+
+test("--children-of still moves every child over a DELETED and over a MALFORMED index.json", async () => {
+  const indexPath = (homeDir: string): string =>
+    path.join(homeDir, ".acpx", "sessions", "index.json");
+
+  const runAndAssertBothMoved = async (
+    homeDir: string,
+    damage: (indexFile: string) => Promise<void>,
+  ): Promise<void> => {
+    await seed(homeDir, "old-parent");
+    await seed(homeDir, "new-parent");
+    await seed(homeDir, "child-1", { parentSessionId: "old-parent" });
+    await seed(homeDir, "child-2", { parentSessionId: "old-parent" });
+    await runCli(["claude", "sessions", "list", "--local"], homeDir);
+    await damage(indexPath(homeDir));
+
+    const result = await runCli(
+      [
+        "claude",
+        "sessions",
+        "set-parent",
+        "--children-of",
+        "old-parent",
+        "--parent-id",
+        "new-parent",
+        "--format",
+        "json",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const payload = parseJsonLine(result.stdout);
+    assert.deepEqual(
+      (payload.moved as Record<string, unknown>[])
+        .map((entry) => String(entry.acpxRecordId))
+        .toSorted((a, b) => a.localeCompare(b)),
+      ["child-1", "child-2"],
+      `a damaged index must not lose a child: ${result.stdout}`,
+    );
+    assert.deepEqual(payload.diverged, []);
+    assert.equal((await readIndexEntry(homeDir, "child-1")).parentSessionId, "new-parent");
+  };
+
+  // 🛑 NO `listSessions()` FALLBACK IS ADDED FOR THIS, and these two cases are why:
+  // `reconcileSessionIndex` already rebuilds from the records for BOTH faults, and
+  // the rebuild is shared by the entry read and the record read alike. A fallback
+  // would be dead code shadowing a working mechanism — a second, untested recovery
+  // path for the same fault (brick 853d9f38 §6).
+  await withTempHome(async (homeDir) => {
+    await runAndAssertBothMoved(homeDir, async (indexFile) => await fs.rm(indexFile));
+  });
+  await withTempHome(async (homeDir) => {
+    await runAndAssertBothMoved(homeDir, async (indexFile) => {
+      const raw = JSON.parse(await fs.readFile(indexFile, "utf8")) as {
+        entries: Record<string, unknown>[];
+      };
+      // One entry made unparseable by the index PARSER (`cwd` must be a string).
+      // `readSessionIndex` is all-or-nothing, so this fails the whole read.
+      const victim = raw.entries.find((entry) => entry.acpxRecordId === "child-2");
+      assert.ok(victim, "fixture: no entry for child-2 to malform");
+      victim.cwd = 12345;
+      await fs.writeFile(indexFile, JSON.stringify(raw), "utf8");
+    });
+  });
+});
+
+// ─── brick 2f6f9951: ONE locked index overlay per batch, not one per child ───
+//
+// `--children-of` rewrote the WHOLE of index.json once per child — every term of
+// that rewrite O(index size). It now writes the records, then overlays only the
+// parent-linkage field group onto the entries as they stand on disk, under one
+// lock, once per CHUNK (100) and once at the end.
+//
+// ⚠️ THIS IS NOT SHIPPED AS A SPEED FIX AND NO TEST HERE CLAIMS ONE. At a realistic
+// handover size (≤20 children) the end-to-end difference sits UNDER the ±2× noise
+// floor measured for this box (brick 2f6f9951 §7). What it buys is the hazard in
+// the second test below, which the per-child whole-entry write cannot avoid.
+
+test("--children-of writes the index ONCE for a 20-child batch, not once per child", async (t) => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "old-parent");
+    await seed(homeDir, "new-parent");
+    const childIds = Array.from({ length: 20 }, (_, i) => `child-${String(i).padStart(2, "0")}`);
+    for (const id of childIds) {
+      await seed(homeDir, id, { parentSessionId: "old-parent" });
+    }
+    await runCli(["claude", "sessions", "list", "--local"], homeDir);
+
+    const indexPath = path.join(homeDir, ".acpx", "sessions", "index.json");
+    const session = await loadSessionModule();
+    const originalRename = fs.rename;
+    let indexWrites = 0;
+    const spy = t.mock.method(fs, "rename", async (...args: Parameters<typeof fs.rename>) => {
+      // `writeSessionIndex` is temp-file + atomic rename, so the rename ONTO
+      // index.json is exactly one completed index write — countable, unlike an
+      // mtime, which coalesces two writes inside one clock tick.
+      if (args[1] === indexPath) {
+        indexWrites += 1;
+      }
+      return (originalRename as (...a: typeof args) => unknown).apply(fs, args);
+    });
+    let moved: number;
+    try {
+      const result = await session.setSessionParent({
+        target: { kind: "children-of", parentSessionId: "old-parent" },
+        parent: { id: "new-parent" },
+      });
+      moved = result.moved.length;
+    } finally {
+      spy.mock.restore();
+    }
+
+    assert.equal(moved, 20, "the measurement is meaningless if the command did not move them");
+    // ⚠️ BOTH BOUNDS, AND THE LOWER ONE IS NOT CEREMONY. A hook that observes
+    // nothing counts zero, and zero satisfies "at most one" — which is how an
+    // instrument that never fired reads as the strongest possible result. (It
+    // happened in this very file: a `rename` hook on the promises API missed the
+    // record writes entirely, because the brick outbox writes them synchronously.)
+    assert.ok(indexWrites >= 1, "the index-write hook never fired — the test measured nothing");
+    // 🛑 THE POSITIVE CONTROL. Per-child index writes make this 20. `ceil(20/100)`
+    // flushes is 1; the bound allows one extra for an incidental reconcile write, so
+    // this pins the ORDER OF MAGNITUDE rather than an exact schedule.
+    assert.ok(indexWrites <= 2, `expected one batched index write, got ${indexWrites}`);
+
+    // …and the batch is COMPLETE: read back from index.json on disk, not through an
+    // acpx API, which flushes on read and would hide a missing write.
+    for (const id of childIds) {
+      assert.equal(
+        (await readIndexEntry(homeDir, id)).parentSessionId,
+        "new-parent",
+        `${id} never reached the index`,
+      );
+      assert.equal((await readRecordJson(homeDir, id)).parent_session_id, "new-parent");
+    }
+  });
+});
+
+/**
+ * Fire `edit(written)` exactly ONCE, at a moment when at least `minWritten` of
+ * `childIds` have had their record committed by the in-flight batch and at least
+ * one has not — i.e. inside the window between a record write and the overlay
+ * flush, which is where every concurrency hazard on this path lives.
+ *
+ * ⚠️ THE TRIGGER IS THE HARD PART, AND MY FIRST ONE SILENTLY NEVER FIRED. Hooking
+ * `fs.rename` (node:fs/promises) looked right and caught nothing: in a canonical
+ * session dir the record write goes through the brick outbox, which writes with
+ * SYNCHRONOUS `node:fs` (`writeRecordAtomic`). A hook that never fires makes the
+ * whole test pass for the wrong reason — so every caller asserts `fired()` below.
+ *
+ * What fires reliably is the per-record `readPersistedLifecycle` read on the
+ * promises API. So: on each record read, ask DISK how far the batch has got, and
+ * land the edit once some children are written and some are not — order-
+ * independent, no timing, and provably inside the window.
+ */
+function editDuringBatch(
+  t: import("node:test").TestContext,
+  homeDir: string,
+  childIds: string[],
+  minWritten: number,
+  edit: (written: string[]) => Promise<void>,
+): { fired: () => string[] | undefined; restore: () => void } {
+  const originalReadFile = fs.readFile;
+  const writtenSoFar = async (): Promise<string[]> => {
+    const done: string[] = [];
+    for (const id of childIds) {
+      try {
+        const raw = JSON.parse(
+          await originalReadFile(sessionFilePath(homeDir, id), "utf8"),
+        ) as Record<string, unknown>;
+        if (raw.parent_session_id === "new-parent") {
+          done.push(id);
+        }
+      } catch {
+        // a record this test deliberately removed — not written, not a failure
+      }
+    }
+    return done;
+  };
+  let firedWith: string[] | undefined;
+  const spy = t.mock.method(fs, "readFile", async (...args: Parameters<typeof fs.readFile>) => {
+    const result = await (originalReadFile as (...a: typeof args) => unknown).apply(fs, args);
+    if (!firedWith) {
+      const done = await writtenSoFar();
+      if (done.length >= minWritten && done.length < childIds.length) {
+        // Claim BEFORE awaiting: the edit reads and writes records itself and
+        // would otherwise re-enter this hook.
+        firedWith = done;
+        await edit(done);
+      }
+    }
+    return result;
+  });
+  return { fired: () => firedWith, restore: () => spy.mock.restore() };
+}
+
+/** old-parent, new-parent, third-parent + `count` open children of old-parent. */
+async function seedHandover(homeDir: string, count: number): Promise<string[]> {
+  await seed(homeDir, "old-parent");
+  await seed(homeDir, "new-parent");
+  await seed(homeDir, "third-parent");
+  const childIds = Array.from({ length: count }, (_, i) => `child-${i + 1}`);
+  for (const id of childIds) {
+    await seed(homeDir, id, { parentSessionId: "old-parent" });
+  }
+  // Materialise index.json so the run under test is warm, as a real one is.
+  await runCli(["claude", "sessions", "list", "--local"], homeDir);
+  return childIds;
+}
+
+async function indexEntryOrUndefined(
+  homeDir: string,
+  id: string,
+): Promise<Record<string, unknown> | undefined> {
+  const raw = JSON.parse(
+    await fs.readFile(path.join(homeDir, ".acpx", "sessions", "index.json"), "utf8"),
+  ) as { entries?: Record<string, unknown>[] };
+  return (raw.entries ?? []).find((candidate) => candidate.acpxRecordId === id);
+}
+
+// 🛑 THE DEFECT THIS COMMIT FIXES, AS A TEST. The batch used to capture the four
+// parent fields at RECORD-WRITE time and write them up to a chunk later, so an
+// authoritative write to a field INSIDE the group — an operator's `--session-id`
+// move, or acpx-ui's parent PATCH when someone drags a session on the board —
+// landing in that window was overwritten by the older value. The child then named
+// a parent in the index that its record did not name, and because selection
+// matches on the ENTRY's parent, a re-run of the same handover reported
+// `moved:N skipped:0 diverged:0` with that child in NONE of the three arrays: a
+// silent orphan, which is the precise failure this brick family exists to kill.
+// (Test-engineer's finding on b01cd39; window 4/4 on the branch vs 0/4 on the
+// baseline, clobber observed in 2 of 4 real-writer runs.)
+test("a concurrent authoritative re-parent during the batch WINS — the flush must not clobber it", async (t) => {
+  await withTempHome(async (homeDir) => {
+    const childIds = await seedHandover(homeDir, 6);
+    const session = await loadSessionModule();
+    // A separate module instance: its own index-update queue and membership
+    // knowledge, i.e. what another process is.
+    const other = await loadSessionModule();
+
+    let victim: string | undefined;
+    const hook = editDuringBatch(t, homeDir, childIds, 1, async (written) => {
+      victim = written[0];
+      // Exactly what `sessions set-parent --session-id <child> --parent-id THIRD`
+      // does, and what acpx-ui's parent PATCH does: both stores, immediately.
+      await other.setSessionParent({
+        target: { kind: "session", sessionId: victim },
+        parent: { id: "third-parent" },
+      });
+    });
+    try {
+      const result = await session.setSessionParent({
+        target: { kind: "children-of", parentSessionId: "old-parent" },
+        parent: { id: "new-parent" },
+      });
+      assert.equal(result.moved.length, childIds.length);
+    } finally {
+      hook.restore();
+    }
+    assert.ok(hook.fired(), "the concurrent re-parent never fired — the trigger is broken");
+    assert.ok(victim, "no victim was chosen");
+
+    // The concurrent writer moved the RECORD to third-parent. The record is the
+    // authority, so the index must follow it — not the batch's older value.
+    assert.equal((await readRecordJson(homeDir, victim)).parent_session_id, "third-parent");
+    assert.equal(
+      (await readIndexEntry(homeDir, victim)).parentSessionId,
+      "third-parent",
+      "the batch clobbered a newer authoritative re-parent with its own stale value",
+    );
+    // The two stores agreeing is what keeps the child findable: with them split,
+    // a re-run of this handover selects on the index and the child is in none of
+    // moved/skipped/diverged.
+    for (const id of childIds) {
+      const record = await readRecordJson(homeDir, id);
+      const entry = await readIndexEntry(homeDir, id);
+      assert.equal(
+        entry.parentSessionId,
+        record.parent_session_id,
+        `${id}: the two stores disagree — that child is invisible to the next run`,
+      );
+    }
+    // …and every other child still landed on the handover's parent.
+    for (const id of childIds.filter((candidate) => candidate !== victim)) {
+      assert.equal((await readRecordJson(homeDir, id)).parent_session_id, "new-parent");
+    }
+  });
+});
+
+// Contract clause: "a moved file the index has no row for yet still needs one, or
+// the update is silently dropped for exactly the files that need it most". The TE
+// measured that deleting that insert left the suite 34/34 GREEN — a published
+// guarantee with no test is a comment, and Seat B2 is being told to rely on it.
+test("a moved child whose index ROW IS MISSING at flush time still gets one", async (t) => {
+  await withTempHome(async (homeDir) => {
+    const childIds = await seedHandover(homeDir, 6);
+    const session = await loadSessionModule();
+    const indexPath = path.join(homeDir, ".acpx", "sessions", "index.json");
+
+    let victim: string | undefined;
+    const hook = editDuringBatch(t, homeDir, childIds, 1, async (written) => {
+      victim = written[0];
+      // Drop just this child's ROW, leaving its record file (and therefore
+      // index.files) untouched, so the reconcile sees no drift and returns an
+      // index that simply has no row for a file that exists.
+      const raw = JSON.parse(await fs.readFile(indexPath, "utf8")) as {
+        entries: Record<string, unknown>[];
+      };
+      raw.entries = raw.entries.filter((entry) => entry.acpxRecordId !== victim);
+      await fs.writeFile(indexPath, JSON.stringify(raw), "utf8");
+    });
+    try {
+      await session.setSessionParent({
+        target: { kind: "children-of", parentSessionId: "old-parent" },
+        parent: { id: "new-parent" },
+      });
+    } finally {
+      hook.restore();
+    }
+    assert.ok(hook.fired(), "the row was never removed — the trigger is broken");
+    assert.ok(victim, "no victim was chosen");
+
+    const entry = await indexEntryOrUndefined(homeDir, victim);
+    assert.ok(entry, `${victim} has a record naming the new parent and NO index row at all`);
+    assert.equal(entry?.parentSessionId, "new-parent");
+    assert.equal((await readRecordJson(homeDir, victim)).parent_session_id, "new-parent");
+  });
+});
+
+// Contract clause: a record that is gone at flush time gets NO row — an index row
+// for a vanished record is worse than a missing one. Under the flush-time design
+// this holds BY CONSTRUCTION (the field group is derived from the record, so with
+// no record there is nothing to derive); the previous add-time-snapshot shape had
+// to remember a guard, and this test is what catches a revert to it.
+test("a child whose RECORD vanishes mid-batch gets NO index row resurrected", async (t) => {
+  await withTempHome(async (homeDir) => {
+    const childIds = await seedHandover(homeDir, 6);
+    const session = await loadSessionModule();
+
+    let victim: string | undefined;
+    const hook = editDuringBatch(t, homeDir, childIds, 1, async (written) => {
+      victim = written[0];
+      // Pruned by another process while the batch runs: record gone, row gone.
+      await fs.rm(sessionFilePath(homeDir, victim));
+    });
+    try {
+      await session.setSessionParent({
+        target: { kind: "children-of", parentSessionId: "old-parent" },
+        parent: { id: "new-parent" },
+      });
+    } finally {
+      hook.restore();
+    }
+    assert.ok(hook.fired(), "the record was never removed — the trigger is broken");
+    assert.ok(victim, "no victim was chosen");
+
+    assert.equal(
+      await indexEntryOrUndefined(homeDir, victim),
+      undefined,
+      "an index row was resurrected for a record that no longer exists",
+    );
+    // The rest of the batch is unaffected — one vanished record must not cost the
+    // others their index update.
+    for (const id of childIds.filter((candidate) => candidate !== victim)) {
+      assert.equal((await readIndexEntry(homeDir, id)).parentSessionId, "new-parent");
+    }
+  });
+});
+
+test("a child that CLOSES or is RENAMED during the batch keeps that change in BOTH stores", async (t) => {
+  await withTempHome(async (homeDir) => {
+    const childIds = await seedHandover(homeDir, 6);
+    const session = await loadSessionModule();
+    // A separate module instance — its own index-update queue and its own
+    // membership knowledge, i.e. the shape another process has.
+    const other = await loadPersistenceModule();
+
+    let victims: { closed: string; renamed: string } | undefined;
+    const hook = editDuringBatch(t, homeDir, childIds, 2, async (written) => {
+      victims = { closed: written[0], renamed: written[1] };
+      await other.closeSession(victims.closed);
+      const record = await other.resolveSessionRecord(victims.renamed);
+      record.name = "renamed-mid-batch";
+      // The privileged lifecycle write — what an external scalar edit uses, and
+      // the only path that may legitimately author `name`.
+      await other.writeSessionRecordWithLifecycle(record);
+    });
+    try {
+      const result = await session.setSessionParent({
+        target: { kind: "children-of", parentSessionId: "old-parent" },
+        parent: { id: "new-parent" },
+      });
+      assert.equal(result.moved.length, childIds.length);
+    } finally {
+      hook.restore();
+    }
+
+    // No edit, no hazard — this test would then prove nothing at all.
+    assert.ok(hook.fired(), "the mid-batch edits never fired; the trigger is broken, not the code");
+    assert.ok(victims, "no victims were chosen");
+    const { closed: closedId, renamed: renamedId } = victims;
+
+    // 🛑 THE HAZARD THIS COMMIT EXISTS TO ELIMINATE. The obvious batching shape —
+    // write N records, then replay the entry SNAPSHOT taken at record-write time —
+    // reverts `closed` to false for a child that closed during the window. Being
+    // closed, it receives no further record write, so NOTHING EVER HEALS IT: the
+    // board shows a live child that is gone, which is the disease this brick family
+    // treats. Reproduced with a control in the conception (§4.3); this assertion is
+    // red against that shape — verified by mutating the overlay to replay whole
+    // entries and watching it fail.
+    assert.equal((await readRecordJson(homeDir, closedId)).closed, true);
+    assert.equal(
+      (await readIndexEntry(homeDir, closedId)).closed,
+      true,
+      `the index reverted a concurrent CLOSE of ${closedId} — a child that is gone still renders as live`,
+    );
+    // Same construction, a different field: the overlay must write the parent group
+    // and nothing else.
+    assert.equal((await readRecordJson(homeDir, renamedId)).name, "renamed-mid-batch");
+    assert.equal(
+      (await readIndexEntry(homeDir, renamedId)).name,
+      "renamed-mid-batch",
+      `the index reverted a concurrent RENAME of ${renamedId}`,
+    );
+    // …and the re-parent itself still landed on both stores, for every child.
+    for (const id of childIds) {
+      assert.equal((await readRecordJson(homeDir, id)).parent_session_id, "new-parent");
+      assert.equal((await readIndexEntry(homeDir, id)).parentSessionId, "new-parent");
+    }
+  });
+});
+
+// ⚠️ THIS TEST EXISTS BECAUSE THE FIX WEAKENED THE OLD CONTROL, AND SAYING SO IS
+// THE POINT. Clause 4 ("a concurrent close survives") used to be pinned by mutating
+// the overlay to write WHOLE ENTRIES instead of the field group. Once the overlay
+// began deriving from the record as read at FLUSH time, that mutation stopped
+// firing — a whole entry projected from the *fresh* record carries the concurrent
+// close and rename correctly, so the test above passes against it (verified: 37/37
+// green under that mutation). The clause is still violable, but only for entry
+// state that is NOT record-derived: what the INDEX-ONLY writers touch. acpx-ui
+// writes `closed`/`favorite` straight into the entry without a record write, and a
+// whole-entry projection silently discards exactly that.
+test("an INDEX-ONLY edit during the batch survives the flush", async (t) => {
+  await withTempHome(async (homeDir) => {
+    const childIds = await seedHandover(homeDir, 6);
+    const session = await loadSessionModule();
+    const indexPath = path.join(homeDir, ".acpx", "sessions", "index.json");
+
+    let victim: string | undefined;
+    const hook = editDuringBatch(t, homeDir, childIds, 1, async (written) => {
+      victim = written[0];
+      // An index-only writer: the ENTRY changes, the record does not. This is the
+      // shape acpx-ui's favorite/closed writes have.
+      const raw = JSON.parse(await fs.readFile(indexPath, "utf8")) as {
+        entries: Record<string, unknown>[];
+      };
+      const entry = raw.entries.find((candidate) => candidate.acpxRecordId === victim);
+      assert.ok(entry, "fixture: the victim has no index row to edit");
+      entry.favorite = true;
+      await fs.writeFile(indexPath, JSON.stringify(raw), "utf8");
+    });
+    try {
+      await session.setSessionParent({
+        target: { kind: "children-of", parentSessionId: "old-parent" },
+        parent: { id: "new-parent" },
+      });
+    } finally {
+      hook.restore();
+    }
+    assert.ok(hook.fired(), "the index-only edit never fired — the trigger is broken");
+    assert.ok(victim, "no victim was chosen");
+
+    assert.equal(
+      (await readIndexEntry(homeDir, victim)).favorite,
+      true,
+      "the flush discarded an index-only edit — it wrote more than its own field group",
+    );
+    // …and the edit really was index-only, or the assertion above proves nothing:
+    // a record-derived value would come back whatever the overlay wrote.
+    assert.equal((await readRecordJson(homeDir, victim)).favorite, undefined);
+    assert.equal((await readIndexEntry(homeDir, victim)).parentSessionId, "new-parent");
+  });
+});
+
+// 🛑 THE OVERLAY'S FIELD GROUP MUST COVER EVERY ENTRY FIELD A RE-PARENT CHANGES,
+// AND THIS FINDS THEM BY SCANNING RATHER THAN FROM A LIST. `applyParentToRecord`
+// mutates the record; the overlay writes a NAMED SUBSET of the entry. A field added
+// to the first and forgotten in the second goes stale in the index while typecheck,
+// build and every other test here stay green — the "field-by-field transform leg
+// drops an un-whitelisted field" class this repo has lost three record fields to.
+//
+// So this compares the whole entry against the whole projection of the record that
+// produced it, naming no field: with no concurrent writer in the fixture, the two
+// must agree in EVERY field, and any disagreement IS a group member that went
+// missing. A new parent-ish field therefore arrives pre-covered.
+//
+// ⚠️ It is deliberately NOT a list of expected fields. A hand-maintained list
+// survives its own violation — that is the whole failure mode being guarded.
+test("the overlay's field group covers EVERY entry field a re-parent changes", async () => {
+  await withTempHome(async (homeDir) => {
+    const childIds = await seedHandover(homeDir, 4);
+    const session = await loadSessionModule();
+
+    const result = await session.setSessionParent({
+      target: { kind: "children-of", parentSessionId: "old-parent" },
+      parent: { id: "new-parent" },
+    });
+    assert.equal(result.moved.length, childIds.length);
+
+    for (const id of childIds) {
+      const file = `${encodeURIComponent(id)}.json`;
+      const record = parseSessionRecord(
+        JSON.parse(await fs.readFile(sessionFilePath(homeDir, id), "utf8")),
+      );
+      assert.ok(record, `${id}: record did not parse`);
+      // Both sides through JSON so "absent" and "undefined" compare equal, which is
+      // what `writeSessionIndex` does to the entry on its way to disk anyway.
+      const expected = JSON.parse(JSON.stringify(toSessionIndexEntry(record, file))) as Record<
+        string,
+        unknown
+      >;
+      const actual = JSON.parse(JSON.stringify(await readIndexEntry(homeDir, id))) as Record<
+        string,
+        unknown
+      >;
+      const disagreeing = [...new Set([...Object.keys(expected), ...Object.keys(actual)])].filter(
+        (key) => JSON.stringify(expected[key]) !== JSON.stringify(actual[key]),
+      );
+      assert.deepEqual(
+        disagreeing,
+        [],
+        `${id}: the index entry disagrees with its own record on ${disagreeing.join(", ")} — a field the re-parent changed is missing from the overlay's field group`,
+      );
+    }
+  });
+});
+
+test("a same-box re-parent CLEARS a stale cross-box parentSessionUrl from the index entry", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "old-parent");
+    await seed(homeDir, "new-parent");
+    await seed(homeDir, "child", {
+      parentSessionId: "old-parent",
+      parentSessionUrl: "https://atrium.other-box.example/?session=old-parent",
+    });
+    await runCli(["claude", "sessions", "list", "--local"], homeDir);
+    assert.equal(
+      typeof (await readIndexEntry(homeDir, "child")).parentSessionUrl,
+      "string",
+      "fixture: the child must start with a cross-box url on its entry",
+    );
+
+    const session = await loadSessionModule();
+    await session.setSessionParent({
+      target: { kind: "children-of", parentSessionId: "old-parent" },
+      parent: { id: "new-parent" },
+    });
+
+    // ⚠️ AN OVERLAY BUILT WITH AN "ASSIGN ONLY DEFINED VALUES" HELPER PASSES EVERY
+    // OTHER TEST IN THIS FILE AND FAILS HERE: the new parent is same-box, so the
+    // field's new value IS absence, and a skipped undefined leaves the entry
+    // pointing at the wrong host while the record is correct.
+    assert.equal((await readIndexEntry(homeDir, "child")).parentSessionUrl, undefined);
+    assert.equal((await readRecordJson(homeDir, "child")).parent_session_url, undefined);
   });
 });

@@ -90,9 +90,18 @@ export type SessionNameResolution =
   | { kind: "found"; record: SessionRecord }
   | { kind: "ambiguous"; candidates: SessionNameCandidate[] };
 
+/**
+ * The record's file name as the index knows it — `index.files` and every entry's
+ * `file` are basenames, so a caller keying anything by file (an index overlay, a
+ * pending map) must derive it HERE rather than rebuilding the `encodeURIComponent`
+ * by hand. One definition, so a key cannot drift from what the writer uses.
+ */
+export function sessionRecordFileName(acpxRecordId: string): string {
+  return `${encodeURIComponent(acpxRecordId)}.json`;
+}
+
 function sessionFilePath(acpxRecordId: string): string {
-  const safeId = encodeURIComponent(acpxRecordId);
-  return path.join(sessionBaseDir(), `${safeId}.json`);
+  return path.join(sessionBaseDir(), sessionRecordFileName(acpxRecordId));
 }
 
 export function sessionBaseDir(): string {
@@ -393,6 +402,46 @@ export async function writeSessionRecordAuthorizingParent(record: SessionRecord)
 }
 
 /**
+ * The same authorized parent write, with the index update left to the CALLER.
+ *
+ * For a batch re-parent (`set-parent --children-of`), which writes N records and
+ * then brings the index level once through `overlaySessionIndexEntries` — the
+ * whole index is rewritten per index update, every term of it O(index size), so
+ * doing that once per child is O(N × index). ⚠️ NOT A SPEED CLAIM at handover
+ * sizes: measured at N=20 the end-to-end difference sits under the instrument's
+ * ±2× noise floor (brick 2f6f9951 §7). It ships because a single locked overlay is
+ * the shape that CANNOT revert a concurrent close, which the per-child path's
+ * whole-entry replacement can.
+ *
+ * 🛑 SKIPS, IT DOES NOT DEFER — and the difference is not pedantic. Expressing
+ * this as `immediate: false` would NOT defer anything: a fresh CLI process is
+ * membership-unknown AND has `elapsed = Infinity`, so both fallthroughs in
+ * `updateSessionIndexForRecordWrite` flush anyway (the trap this file's own
+ * `writeSessionRecordAuthorizingParent` comment warns about). Worse, a deferred
+ * write leaves a whole-entry SNAPSHOT in the pending map, and any later flush —
+ * `beforeExit`, an owner exit, or any same-process index read's read-your-writes —
+ * writes that snapshot and reverts whatever changed in the meantime. Nothing is
+ * enqueued here, so there is nothing for a later flush to write.
+ *
+ * ⚠️ THE CALLER NOW OWNS THE INDEX HALF. Write the records, then flush the overlay
+ * in a `finally` — do not rely on `beforeExit`, which `SIGKILL` and
+ * `process.exit()` skip. Until that flush, each written child is torn
+ * `record=NEW, index=OLD`, which is the direction the `set-parent` heal branch
+ * repairs on a re-run. Forget the flush entirely and the run leaves a store that
+ * only a re-run fixes.
+ */
+export async function writeSessionRecordAuthorizingParentWithoutIndex(
+  record: SessionRecord,
+): Promise<void> {
+  await writeSessionRecordInternal(record, {
+    messagePersistence: "checkpoint",
+    preserveLifecycle: true,
+    authoritative: { parent: true },
+    skipIndexUpdate: true,
+  });
+}
+
+/**
  * Preserving write variant for callers that already hold the persisted
  * lifecycle from a fresh `readPersistedLifecycle` read. Metadata is still
  * reread inside the write so external metadata patches survive stale owner
@@ -527,6 +576,34 @@ function indexWriteIsImmediate(options: {
   return options.immediateIndexUpdate === true || !options.preserveLifecycle;
 }
 
+/**
+ * The index half of a record write. Membership-immediate / scalar-throttled
+ * (W2.3); the privileged lifecycle path (close/favorite/name) always writes
+ * immediately — human-frequency and freshness-sensitive.
+ *
+ * ⚠️ `skipIndexUpdate` writes NOTHING and ENQUEUES NOTHING — it is not a defer.
+ * The caller owns the index half; see
+ * `writeSessionRecordAuthorizingParentWithoutIndex` for why that distinction is
+ * the whole point and what a deferred snapshot would do instead.
+ */
+async function updateIndexForWrittenRecord(
+  sessionDir: string,
+  record: SessionRecord,
+  fileName: string,
+  options: {
+    preserveLifecycle: boolean;
+    immediateIndexUpdate?: true;
+    skipIndexUpdate?: true;
+  },
+): Promise<void> {
+  if (options.skipIndexUpdate === true) {
+    return;
+  }
+  await updateSessionIndexForRecordWrite(sessionDir, toSessionIndexEntry(record, fileName), {
+    immediate: indexWriteIsImmediate(options),
+  });
+}
+
 async function writeSessionRecordInternal(
   record: SessionRecord,
   options: {
@@ -543,6 +620,9 @@ async function writeSessionRecordInternal(
      * `writeSessionRecordAuthorizingParent` for why a re-parent needs it and why
      * it is NOT expressed by changing the general rule below. */
     immediateIndexUpdate?: true;
+    /** Write NO index update at all — the caller updates the index itself. See
+     * `writeSessionRecordAuthorizingParentWithoutIndex`; a skip, never a defer. */
+    skipIndexUpdate?: true;
   },
 ): Promise<void> {
   // ⚠️ THE ARCHIVED-RECORD WRITE GUARD, PLACED HERE **BY CONSTRUCTION**. All four
@@ -654,13 +734,7 @@ async function writeSessionRecordInternal(
         await persistRecordFile(file, persistedRecord as DiskRecord, ownedOutbox)
       ).metadata;
 
-      const fileName = path.basename(file);
-      // Membership-immediate / scalar-throttled index update (W2.3). The
-      // privileged lifecycle path (close/favorite/name) always writes
-      // immediately — human-frequency and freshness-sensitive.
-      await updateSessionIndexForRecordWrite(sessionDir, toSessionIndexEntry(record, fileName), {
-        immediate: indexWriteIsImmediate(options),
-      });
+      await updateIndexForWrittenRecord(sessionDir, record, path.basename(file), options);
       rememberSessionMetadataBaseline(record);
       rememberSessionModelBaseline(record);
     } finally {

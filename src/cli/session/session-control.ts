@@ -1092,8 +1092,8 @@ function ownerStatusBatch(
   };
 }
 
-function childrenByParentSessionId(records: SessionRecord[]): Map<string, SessionRecord[]> {
-  const childrenByParent = new Map<string, SessionRecord[]>();
+function childrenByParentSessionId<T extends GraphNode>(records: T[]): Map<string, T[]> {
+  const childrenByParent = new Map<string, T[]>();
   for (const record of records) {
     if (!record.parentSessionId) {
       continue;
@@ -1107,16 +1107,26 @@ function childrenByParentSessionId(records: SessionRecord[]): Map<string, Sessio
 }
 
 /**
+ * The three fields the parent-graph walk actually reads. Kept a STRUCTURAL type,
+ * not `SessionRecord`, so `sessions set-parent` can walk INDEX ENTRIES — which it
+ * already holds — instead of paying a full-store record hydrate for a scan
+ * (brick 853d9f38). Deliberately narrow: widening it (or reaching for `any`) would
+ * let a caller hand in something that only looks like a node.
+ */
+type GraphNode = { acpxRecordId: string; parentSessionId?: string; lastUsedAt: string };
+
+/**
  * Transitive local descendants of `rootSessionId` in the `parentSessionId` graph,
  * newest-first. The `seen` set IS the cycle guard, which is why
  * `sessions set-parent` reuses this as its cycle check rather than walking again.
+ *
+ * Generic over the node shape: `SessionRecord` and `SessionIndexEntry` both satisfy
+ * `GraphNode`, and the return type follows the input — so
+ * `readDescendantSessionOwnerStatuses` below still gets `SessionRecord[]` back.
  */
-export function descendantRecords(
-  rootSessionId: string,
-  records: SessionRecord[],
-): SessionRecord[] {
+export function descendantRecords<T extends GraphNode>(rootSessionId: string, records: T[]): T[] {
   const childrenByParent = childrenByParentSessionId(records);
-  const descendants: SessionRecord[] = [];
+  const descendants: T[] = [];
   const queue = [...(childrenByParent.get(rootSessionId) ?? [])];
   const seen = new Set<string>([rootSessionId]);
   while (queue.length > 0) {
@@ -1131,7 +1141,16 @@ export function descendantRecords(
   return descendants.toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
 }
 
-async function readOwnerStatusForRecord(record: SessionRecord): Promise<SessionOwnerStatus> {
+/**
+ * The owner probe for a record the caller ALREADY HOLDS.
+ *
+ * `readSessionOwnerStatus` above is this plus a `resolveSessionRecord` — so a caller
+ * that has just loaded the record (`sessions set-parent`, which loads one per target)
+ * must use this form, or it pays a second full record read and throws the result
+ * away. That second read was ~half of `--children-of`'s per-child cost (brick
+ * 853d9f38 §3.1).
+ */
+export async function readOwnerStatusForRecord(record: SessionRecord): Promise<SessionOwnerStatus> {
   const state = await readQueueOwnerState(record.acpxRecordId);
   const closed = record.closed === true;
   return {
