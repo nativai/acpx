@@ -109,7 +109,7 @@ test("G2/path 1 · `sessions new` mints a fresh seat, read back from DISK", asyn
     // observation is specifically about what a REAL FILE READ finds.
     const onDisk = await readRecordJson(homeDir, id);
     assert.equal(
-      typeof onDisk.seat_id === "string" && (onDisk.seat_id as string).length > 0,
+      typeof onDisk.seat_id === "string" && onDisk.seat_id.length > 0,
       true,
       "path 1: seat_id absent/empty on the record read back from disk",
     );
@@ -160,7 +160,7 @@ test("G2/path 2 · `sessions copy` mints a NEW seat, never inherits the source's
 
     const forkedOnDisk = await readRecordJson(homeDir, forkedId);
     assert.equal(
-      typeof forkedOnDisk.seat_id === "string" && (forkedOnDisk.seat_id as string).length > 0,
+      typeof forkedOnDisk.seat_id === "string" && forkedOnDisk.seat_id.length > 0,
       true,
       "path 2: seat_id absent/empty on the record read back from disk",
     );

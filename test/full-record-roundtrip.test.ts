@@ -23,11 +23,17 @@ import type { SessionAcpxState, SessionRecord } from "../src/types.js";
 // boundary (ERRATA §E12) — not the index projection, not a persistence-layer
 // refactor, not a fourth scope.
 
+// `FieldPlan`'s `persisted` is a non-nullable boolean-literal discriminant
+// (`{ persisted: true } | { persisted: false; reason: string }`), so truthiness
+// narrows identically to `=== true` / `=== false` here. The exhaustiveness that
+// matters does NOT live in these filters — it lives in RECORD_FIELD_PLAN's own
+// `satisfies { [K in keyof Required<SessionRecord>]: FieldPlan }`, which fails to
+// compile when a field is added unclassified.
 const PERSISTED_TRUE_KEYS = (Object.keys(RECORD_FIELD_PLAN) as (keyof SessionRecord)[]).filter(
-  (key) => RECORD_FIELD_PLAN[key].persisted === true,
+  (key) => RECORD_FIELD_PLAN[key].persisted,
 );
 const PERSISTED_FALSE_KEYS = (Object.keys(RECORD_FIELD_PLAN) as (keyof SessionRecord)[]).filter(
-  (key) => RECORD_FIELD_PLAN[key].persisted === false,
+  (key) => !RECORD_FIELD_PLAN[key].persisted,
 );
 
 /**
