@@ -1372,6 +1372,26 @@ export class BrickOutbox {
    * Full rationale: brick c141eaab, `verification/OUTBOX-DECISION.md`.
    */
   saveRecord(record: DiskRecord): DiskRecord {
+    if (
+      !unpublishedRecord(record) &&
+      (this.isBound() ||
+        metadataValue(record, "brick_projection_revision") ||
+        metadataValue(record, "spawn_key"))
+    ) {
+      // 🛑 NOT DEAD CODE, AND NOT A LEFTOVER OF THE DELETED PROJECTION. The return value
+      // is deliberately discarded: this call IS the box's instance-mismatch detector.
+      // `identityForRecord` throws `outbox-instance-mismatch` when the outbox's binding
+      // disagrees with `~/.acpx/instance.json` — the shape that wedged devbox for ~80
+      // minutes on 2026-09-15 (bricks 507a1c38 / 42b4fb28 / 7d03eca1). It used to be
+      // reached as a side effect of projecting the record; with the projection gone,
+      // dropping it would leave the record-write path silently unguarded and let a
+      // re-minted instance.json write records under a stale binding.
+      // The condition is the exact negation of the fast-path test the projection branch
+      // used, so precisely the same writes are checked as before — including the
+      // `instance-url-missing` case on an unbound outbox holding a projected record.
+      // `test/brick-outbox-wedge-detect.test.ts` goes red if this call is removed.
+      this.identityForRecord(record);
+    }
     return this.writeOwnedRecord(String(record.acpx_record_id), record, () => record);
   }
 

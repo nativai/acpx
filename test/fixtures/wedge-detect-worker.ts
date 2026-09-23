@@ -6,9 +6,16 @@
  * restore, or a re-provisioned PVC — see brick 7d03eca1's own "When it WOULD bite"). Every
  * session-mutating operation on that HOME then fails with `outbox-instance-mismatch`.
  *
- * `norotate-save-record` is the POSITIVE CONTROL: it proves `saveRecord` genuinely reaches the
- * projection path (via `identityForRecord`) rather than short-circuiting to `writeOwnedRecord` —
- * without it, `rotate-save-record` throwing would prove nothing about which code path failed.
+ * `norotate-save-record` is the POSITIVE CONTROL: it proves `saveRecord` genuinely reaches
+ * `identityForRecord` rather than short-circuiting past it — without it, `rotate-save-record`
+ * throwing would prove nothing about which code path failed.
+ *
+ * The control used to evidence that reach by asserting an outbox row appeared. Since the
+ * session-link projection was removed from the record-write path (brick c141eaab) saveRecord
+ * mints no rows, so the evidence is now the RECORD FILE: the unrotated arm writes it, and the
+ * rotated arm must NOT — the guard has to fire BEFORE the write, not after it. That is a
+ * stronger property than the row count ever was, and `outbox_rows` is now asserted to stay 0,
+ * which pins the projection removal too.
  *
  * Usage: HOME=<scratch> node --import tsx test/fixtures/wedge-detect-worker.ts <scenario>
  */
@@ -105,7 +112,7 @@ outbox.bindIdentity({
 let outcome: { threw: boolean; code: string | null; message: string };
 
 if (scenario === "norotate-save-record") {
-  // POSITIVE CONTROL: no rotation. This must succeed and actually write an outbox row, or the
+  // POSITIVE CONTROL: no rotation. This must succeed and actually write the record, or the
   // rotated arm's failure would not be attributable to the rotation at all.
   outcome = attempt(() => outbox.saveRecord(record()));
 } else if (scenario === "rotate-save-record") {
@@ -124,6 +131,7 @@ console.log(
     code: outcome.code,
     message: outcome.message,
     outbox_rows: outboxRowCount(outbox.dbPath),
+    record_written: fs.existsSync(outbox.recordPath(RECORD_ID)),
     db: outbox.dbPath,
   })}`,
 );
