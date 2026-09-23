@@ -6,6 +6,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { parseSessionRecord, serializeSessionRecordForDisk } from "../src/session/persistence.js";
 import { toSessionIndexEntry } from "../src/session/persistence/index.js";
+import { seatFieldsToIndexEntry } from "../src/session/persistence/seat-fields.js";
 import type { SessionRecord } from "../src/types.js";
 import {
   fileExists,
@@ -1798,14 +1799,32 @@ function editDuringBatch(
   return { fired: () => firedWith, restore: () => spy.mock.restore() };
 }
 
-/** old-parent, new-parent, third-parent + `count` open children of old-parent. */
+/**
+ * old-parent, new-parent, third-parent + `count` open children of old-parent.
+ *
+ * 🛑 THE SEATS ARE LOAD-BEARING FIXTURE, NOT DECORATION — WITHOUT THEM THE
+ * FIELD-GROUP-COVERAGE TEST BELOW PASSES VACUOUSLY.
+ *
+ * That test compares each entry against the full projection of its own record and
+ * names any disagreeing key. Seeded seat-less, EVERY seat field is `undefined` on
+ * both sides: they agree, the assertion passes, and a seat field missing from the
+ * overlay's group is invisible. Measured on the merge of this branch with Seat B1
+ * (brick 5ad22d5d): seat-less it reported 41/41 green while the overlay did NOT
+ * project `parentSeatId`; seeded as below, the same test reds naming that field.
+ *
+ * So: children start under a seat-bearing `old-parent` WITH its seat on them, and
+ * `new-parent` carries a DIFFERENT seat — that difference is what a missing
+ * projection leaves stale. `third-parent` is deliberately left SEAT-LESS: it is the
+ * only way to test that absence CLEARS rather than being skipped as undefined
+ * (Seat acceptance control (a)).
+ */
 async function seedHandover(homeDir: string, count: number): Promise<string[]> {
-  await seed(homeDir, "old-parent");
-  await seed(homeDir, "new-parent");
+  await seed(homeDir, "old-parent", { seatId: "seat-old" });
+  await seed(homeDir, "new-parent", { seatId: "seat-new" });
   await seed(homeDir, "third-parent");
   const childIds = Array.from({ length: count }, (_, i) => `child-${i + 1}`);
   for (const id of childIds) {
-    await seed(homeDir, id, { parentSessionId: "old-parent" });
+    await seed(homeDir, id, { parentSessionId: "old-parent", parentSeatId: "seat-old" });
   }
   // Materialise index.json so the run under test is warm, as a real one is.
   await runCli(["claude", "sessions", "list", "--local"], homeDir);
@@ -2134,6 +2153,94 @@ test("the overlay's field group covers EVERY entry field a re-parent changes", a
         [],
         `${id}: the index entry disagrees with its own record on ${disagreeing.join(", ")} — a field the re-parent changed is missing from the overlay's field group`,
       );
+    }
+  });
+});
+
+// ─── Seat programme acceptance controls (brick 5ad22d5d, AC11/E39) ──────────
+//
+// The three the Seat owner specified for `--children-of`, verbatim: (a) onto a
+// SEAT-LESS parent the entry's `parentSeatId` is ABSENT — the key gone, not null;
+// (b) onto a seat-bearing parent it equals that parent's `seatId`; (c) after
+// either, record and entry agree on ALL FOUR seat fields.
+//
+// (a) is the one that fails SILENTLY. An overlay that treats `undefined` as
+// "leave the existing value alone" — the shape `seatFieldsToIndexEntry` avoids by
+// being an unconditional object literal — lets the OLD parent's seat survive on
+// the entry while the record correctly has none, and every other test here stays
+// green. It is asserted on key PRESENCE (`in`), never on value, because
+// `readIndexEntry` cannot tell an absent key from one holding `undefined`.
+
+/** The four seat fields as the index leg spells them, from the helper that owns
+ *  the set — so a fifth seat field joins these assertions automatically. */
+const SEAT_INDEX_KEYS = Object.keys(
+  seatFieldsToIndexEntry({
+    seatId: undefined,
+    holderOrdinal: undefined,
+    holderActive: undefined,
+    parentSeatId: undefined,
+  }),
+);
+
+async function assertSeatFieldsAgree(homeDir: string, id: string): Promise<void> {
+  const record = parseSessionRecord(
+    JSON.parse(await fs.readFile(sessionFilePath(homeDir, id), "utf8")),
+  );
+  assert.ok(record, `${id}: record did not parse`);
+  const expected = seatFieldsToIndexEntry(record) as Record<string, unknown>;
+  const entry = await readIndexEntry(homeDir, id);
+  for (const key of SEAT_INDEX_KEYS) {
+    assert.equal(
+      JSON.stringify(entry[key]),
+      JSON.stringify(expected[key]),
+      `${id}: record and entry disagree on seat field ${key}`,
+    );
+  }
+}
+
+test("(a) --children-of onto a SEAT-LESS parent leaves the entry WITHOUT parentSeatId", async () => {
+  await withTempHome(async (homeDir) => {
+    const childIds = await seedHandover(homeDir, 4);
+    for (const id of childIds) {
+      assert.equal(
+        (await readIndexEntry(homeDir, id)).parentSeatId,
+        "seat-old",
+        `fixture: ${id} must START with the old parent's seat on its entry`,
+      );
+    }
+
+    const session = await loadSessionModule();
+    // third-parent is seeded seat-LESS on purpose: the new value IS absence.
+    await session.setSessionParent({
+      target: { kind: "children-of", parentSessionId: "old-parent" },
+      parent: { id: "third-parent" },
+    });
+
+    for (const id of childIds) {
+      const entry = await readIndexEntry(homeDir, id);
+      assert.equal(
+        "parentSeatId" in entry,
+        false,
+        `${id}: the KEY must be gone, not present-and-undefined — a stale "seat-old" here is the old parent's seat surviving a re-parent`,
+      );
+      await assertSeatFieldsAgree(homeDir, id);
+    }
+  });
+});
+
+test("(b) --children-of onto a seat-bearing parent puts THAT parent's seatId on the entry", async () => {
+  await withTempHome(async (homeDir) => {
+    const childIds = await seedHandover(homeDir, 4);
+    const session = await loadSessionModule();
+    await session.setSessionParent({
+      target: { kind: "children-of", parentSessionId: "old-parent" },
+      parent: { id: "new-parent" },
+    });
+
+    for (const id of childIds) {
+      assert.equal((await readIndexEntry(homeDir, id)).parentSeatId, "seat-new", id);
+      // (c) on the same run — record and entry agree on all four.
+      await assertSeatFieldsAgree(homeDir, id);
     }
   });
 });

@@ -12,6 +12,7 @@ import {
 } from "../../session/persistence.js";
 import type { SessionIndexEntryOverlay } from "../../session/persistence.js";
 import type { SessionIndexEntry } from "../../session/persistence/index.js";
+import { seatFieldsToIndexEntry } from "../../session/persistence/seat-fields.js";
 import type { SessionRecord } from "../../types.js";
 import { descendantRecords, readOwnerStatusForRecord } from "./session-control.js";
 
@@ -851,6 +852,36 @@ const PARENT_LINKAGE_OVERLAY: SessionIndexEntryOverlay = {
     parentSessionUrl: record.parentSessionUrl,
     parentSetAt: record.parentSetAt,
     spawnedBySessionId: record.spawnedBySessionId,
+    // 🛑 THE SEAT FIELDS ARE PROJECTED WHOLE, THROUGH THE SEAT PROGRAMME'S OWN HELPER,
+    // AND THREE OF THE FOUR ARE FIELDS THIS VERB DOES NOT CHANGE.
+    //
+    // `seatId`, `holderOrdinal` and `holderActive` are the CHILD'S OWN seat state; a
+    // re-parent does not touch them. Writing them anyway is a deliberate widening past
+    // "only the fields this command is authoritative for", and it is safe ONLY on the
+    // Seat programme's AC11/E39 invariant: the RECORD is the authority for all four
+    // seat fields and the index entry must mirror it, so a differing entry is a defect
+    // to heal rather than a concurrent edit to preserve. Under that invariant this is
+    // idempotent and it HEALS an entry already lagging its record.
+    //
+    // ⚠️ IT STOPS BEING SAFE THE DAY AN INDEX-ONLY SEAT WRITER EXISTS — an entry seat
+    // field set with no record write, the way acpx-ui writes `closed`/`favorite`. This
+    // projection would overwrite it. `test/session-reparent.test.ts`'s index-only-edit
+    // control guards the general rule but would NOT catch a seat-specific one. **This
+    // line is where it breaks if AC11/E39 ever changes.**
+    //
+    // ⚠️ ABSENCE MUST BE A VALUE HERE, AND IT IS — BY A PROPERTY OF THEIR HELPER, NOT
+    // OF THIS CODE. `seatFieldsToIndexEntry` is an UNCONDITIONAL object literal: all
+    // four keys are always emitted, `undefined` when the record has none. The spread
+    // therefore puts `parentSeatId: undefined` OVER the entry's old value, and
+    // `writeSessionIndex`'s `JSON.stringify` drops the key — so a re-parent onto a
+    // SEAT-LESS parent leaves the entry WITHOUT the key instead of keeping the old
+    // parent's seat. Had that helper used conditional spreads
+    // (`...(x ? { k: x } : {})`), absence would NOT clear and this would fail while
+    // every gate stayed green. That is a load-bearing dependency on someone else's
+    // implementation detail; if `seat-fields.ts` ever goes conditional, this breaks.
+    // Acceptance control (a) in `test/session-reparent.test.ts` is what holds it: it
+    // was OBSERVED to red with a surviving "seat-old" before this spread was added.
+    ...seatFieldsToIndexEntry(record),
   }),
 };
 
