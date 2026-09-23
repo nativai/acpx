@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
-import test, { after, type TestContext } from "node:test";
+import test, { after } from "node:test";
 // NOTE: `transcriptJsonlPath` / `legacyTranscriptJsonlPath` are deliberately NOT
 // imported here. Every path this file asserts on is built from a LITERAL slug
 // (see the DOTTED_* block below) — importing the path builders is what let three
@@ -10,7 +9,6 @@ import test, { after, type TestContext } from "node:test";
 // the tautology hard to reintroduce by accident.
 import {
   ensureTranscriptAtConfigDir,
-  legacyTranscriptCwdHash,
   resolveExistingTranscriptPath,
   transcriptCwdHash,
 } from "../src/config/subscription-transcript.js";
@@ -25,9 +23,16 @@ import {
 //
 // ⚠️ THE SPEC IS CLAUDE CODE'S OWN BEHAVIOUR, NOT ANY DESCRIPTION OF IT — this
 // program has been burned twice by trusting a written description over the
-// behaviour. The tests below therefore RUN A REAL CLAUDE CODE PROCESS in
-// dot-bearing cwds under isolated HOMEs and read back the directory name it
-// actually creates. Do not replace them with a hard-coded expectation table.
+// behaviour.
+//
+// 🛑 AND AS OF 2026-09-23 THIS FILE NO LONGER OBSERVES THAT BEHAVIOUR. The tests
+// that ran a real Claude Code process were DELETED on Daniel's explicit
+// instruction, to take the `claude` binary off the merge path — see the block
+// further down that stands where they were, and brick://37c0108a. What remains
+// is exactly the hard-coded expectation table their own comment warned against
+// accepting as a substitute: it pins the derivation to GROUND-TRUTH.md and stops
+// OUR side drifting, and it cannot notice CLAUDE CODE'S side drifting. Read the
+// deletion note before adding anything here that assumes otherwise.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -35,9 +40,6 @@ import {
  * live outside /tmp, and they must never touch the real ~/.claude or ~/.acpx.
  */
 const LIVE_HOME_ROOT = "/workspace/.acpx-transcript-slug-tests";
-
-/** How long to wait for Claude Code to write its project dir before giving up. */
-const LIVE_PROBE_TIMEOUT_MS = 30_000;
 
 /**
  * One scratch dir for this whole run, reaped in `after`.
@@ -65,272 +67,60 @@ after(async () => {
     await fs.rm(runRoot, { recursive: true, force: true });
   }
 });
-
-type LiveProbe = {
-  /** The directory name Claude Code actually created under `projects/`. */
-  observedDirName: string;
-  /** The transcript JSONL Claude Code created inside it, if any. */
-  observedJsonlName: string | undefined;
-  configDir: string;
-};
-
-/** Deliberate, written-down opt-out for boxes with no Claude Code installed. */
-const ALLOW_NO_CLAUDE_ENV = "ACPX_TEST_ALLOW_NO_CLAUDE";
-
-let claudeBinaryChecked = false;
-let claudeBinaryPresent = false;
-
-async function hasClaudeBinary(): Promise<boolean> {
-  if (claudeBinaryChecked) {
-    return claudeBinaryPresent;
-  }
-  claudeBinaryChecked = true;
-  claudeBinaryPresent = await new Promise<boolean>((resolve) => {
-    const probe = spawn("claude", ["--version"], { stdio: "ignore" });
-    probe.on("error", () => resolve(false));
-    probe.on("exit", (code) => resolve(code === 0));
-  });
-  return claudeBinaryPresent;
-}
-
-/**
- * Gate for the live probes — a MISSING `claude` binary FAILS by default.
- *
- * ⚠️ DO NOT turn this back into an unconditional `t.skip()`. A skipped test is
- * green in the summary line, so `# fail 0` would then be able to mean "the only
- * tests pinning this derivation to reality never ran" — the vacuous-pass shape
- * this whole lane exists to prevent (brick://ae715773). The pre-merge gate runs
- * on a box where `claude` is present, so failing by default costs that gate
- * nothing and makes its green mean something.
- *
- * Running somewhere without Claude Code is still allowed — but as a conscious
- * act, not an accident: set `ACPX_TEST_ALLOW_NO_CLAUDE=1`. The skip then names
- * exactly which property went unobserved.
- */
-async function requireClaudeBinary(t: TestContext, unverified: string): Promise<boolean> {
-  if (await hasClaudeBinary()) {
-    return true;
-  }
-
-  if (process.env[ALLOW_NO_CLAUDE_ENV] === "1") {
-    process.stderr.write(
-      `[acpx-test] UNVERIFIED: ${unverified} — the \`claude\` binary is absent and ` +
-        `${ALLOW_NO_CLAUDE_ENV}=1 was set, so this property was NOT observed in this run.\n`,
-    );
-    t.skip(
-      `SKIPPED BY EXPLICIT OPT-OUT (${ALLOW_NO_CLAUDE_ENV}=1) WITHOUT VERIFYING ANYTHING: ` +
-        `${unverified} was not observed, because the \`claude\` binary is not on PATH.`,
-    );
-    return false;
-  }
-
-  // Thrown rather than `assert.fail`-ed so this function has an explicit exit on
-  // every path (oxlint `consistent-return`); the observable behaviour — a failed
-  // test carrying this message — is identical.
-  throw new assert.AssertionError({
-    message:
-      `the \`claude\` binary is not on PATH, so ${unverified} could not be observed against ` +
-      `Claude Code's real behaviour — which is the ONLY thing that makes this derivation ` +
-      `trustworthy. This is a hard failure on purpose. If you genuinely intend to run this ` +
-      `suite on a box without Claude Code, say so deliberately: ${ALLOW_NO_CLAUDE_ENV}=1.`,
-  });
-}
-
-/**
- * Start a REAL Claude Code session in `cwd` under a throwaway isolated HOME and
- * return the directory name it creates under `<configDir>/projects/`.
- *
- * Claude Code writes that directory at STARTUP, before any API call, so a bogus
- * API key is enough — we never make a request, never need credentials, and never
- * read the caller's. We poll for the directory and kill the process the moment
- * it appears, which keeps each probe to a few seconds.
- */
-async function observeClaudeProjectDir(cwd: string, label: string): Promise<LiveProbe> {
-  const home = await fs.mkdtemp(path.join(await liveRoot(), `${label}-`));
-  const configDir = path.join(home, ".claude");
-  await fs.mkdir(cwd, { recursive: true });
-
-  const child = spawn("claude", ["-p", "x"], {
-    cwd,
-    env: {
-      ...process.env,
-      ANTHROPIC_API_KEY: "sk-ant-invalid-probe-key",
-      CLAUDE_CONFIG_DIR: configDir,
-      HOME: home,
-    },
-    stdio: "ignore",
-  });
-
-  const projectsDir = path.join(configDir, "projects");
-  const deadline = Date.now() + LIVE_PROBE_TIMEOUT_MS;
-  let observedDirName: string | undefined;
-  let observedJsonlName: string | undefined;
-  try {
-    // Wait for the project dir AND the transcript inside it. The JSONL lands a
-    // beat AFTER the directory, so stopping at the directory turns every
-    // downstream transcript assertion into a race — which already produced one
-    // false red ("no transcript written") that had nothing to do with the bug
-    // under test.
-    while (Date.now() < deadline) {
-      const entries = await fs.readdir(projectsDir).catch(() => [] as string[]);
-      if (entries.length > 0) {
-        observedDirName = entries[0];
-        const inner = await fs
-          .readdir(path.join(projectsDir, observedDirName))
-          .catch(() => [] as string[]);
-        observedJsonlName = inner.find((name) => name.endsWith(".jsonl"));
-        if (observedJsonlName) {
-          break;
-        }
-      }
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    }
-  } finally {
-    child.kill("SIGKILL");
-  }
-
-  assert.ok(
-    observedDirName,
-    `Claude Code created no directory under ${projectsDir} within ${LIVE_PROBE_TIMEOUT_MS}ms ` +
-      `for cwd ${cwd} — the probe could not observe the spec, so nothing below is verified.`,
-  );
-
-  return { configDir, observedDirName, observedJsonlName };
-}
-
-/**
- * The cwd shapes that matter. `.bare` is the live fleet exposure; `v1.2.3` and
- * `.hidden` are the multi-dot / dot-leading cases the charter names; the
- * underscore case exists because the mapping turned out to be much broader than
- * "dots" and a dot-only fix would still be wrong; `plain` is the control that
- * must be unaffected.
- */
-const LIVE_CASES: Array<{ dir: string; label: string; why: string }> = [
-  { dir: ".bare", label: "dot-leading", why: "the live fleet exposure — every Nativai .bare repo" },
-  { dir: "v1.2.3", label: "multi-dot", why: "several dots inside one segment" },
-  { dir: ".hidden", label: "dot-hidden", why: "a second dot-leading shape" },
-  { dir: "under_score", label: "underscore", why: "proves the rule is not dot-only" },
-  { dir: "plain", label: "control", why: "no special characters — must be unchanged" },
-];
-
-for (const testCase of LIVE_CASES) {
-  test(`GROUND TRUTH (live Claude Code): transcriptCwdHash matches the dir actually written for '${testCase.dir}' — ${testCase.why}`, async (t) => {
-    if (
-      !(await requireClaudeBinary(
-        t,
-        `that transcriptCwdHash matches the projects/ directory Claude Code really writes for a '${testCase.dir}' cwd`,
-      ))
-    ) {
-      return;
-    }
-
-    const cwd = await fs
-      .mkdtemp(path.join(await liveRoot(), "cwd-"))
-      .then((base) => path.join(base, testCase.dir));
-
-    const probe = await observeClaudeProjectDir(cwd, testCase.label);
-
-    // THE assertion: our derivation must equal what Claude Code actually wrote.
-    assert.equal(
-      transcriptCwdHash(cwd),
-      probe.observedDirName,
-      `our slug for ${cwd} does not match the directory Claude Code created`,
-    );
-  });
-}
-
-test("GROUND TRUTH (live Claude Code): the LEGACY slug is what was broken — it does NOT match reality for a dotted cwd", async (t) => {
-  if (
-    !(await requireClaudeBinary(
-      t,
-      "that the PRE-FIX slug genuinely disagrees with reality for a dotted cwd (i.e. that this lane fixed a real bug)",
-    ))
-  ) {
-    return;
-  }
-
-  const cwd = await fs
-    .mkdtemp(path.join(await liveRoot(), "cwd-"))
-    .then((base) => path.join(base, ".bare"));
-
-  const probe = await observeClaudeProjectDir(cwd, "legacy-contrast");
-
-  // This is the bug, stated as an executable fact rather than a comment: the
-  // pre-fix derivation disagrees with observed reality, the new one agrees.
-  assert.notEqual(
-    legacyTranscriptCwdHash(cwd),
-    probe.observedDirName,
-    "the legacy slug matched reality — then this cwd shape never reproduced the bug and this test is not testing what it claims",
-  );
-  assert.equal(transcriptCwdHash(cwd), probe.observedDirName);
-});
-
-test("FEATURE GOAL (live, end-to-end): a real dotted-cwd session's transcript is FOUND and PORTED across a subscription switch", async (t) => {
-  if (
-    !(await requireClaudeBinary(
-      t,
-      "THE FEATURE'S GOAL — that a real dotted-cwd session's transcript survives a subscription switch instead of leaving the session unpromptable",
-    ))
-  ) {
-    return;
-  }
-
-  const cwd = await fs
-    .mkdtemp(path.join(await liveRoot(), "cwd-"))
-    .then((base) => path.join(base, ".bare"));
-
-  // 1. A REAL Claude Code session in a dotted cwd writes a REAL transcript,
-  //    wherever Claude Code decides to put it. We never tell it where.
-  const probe = await observeClaudeProjectDir(cwd, "e2e");
-  assert.ok(
-    probe.observedJsonlName,
-    "Claude Code wrote no transcript JSONL — cannot exercise the port end-to-end",
-  );
-  const acpSessionId = probe.observedJsonlName.replace(/\.jsonl$/, "");
-  const sourceJsonl = path.join(
-    probe.configDir,
-    "projects",
-    probe.observedDirName,
-    probe.observedJsonlName,
-  );
-  await fs.appendFile(
-    sourceJsonl,
-    `{"type":"assistant","timestamp":"2026-08-20T12:00:00.000Z","text":"real-session-marker"}\n`,
-  );
-
-  // 2. Switch this session onto a different subscription's config dir.
-  const dstConfigDir = path.join(path.dirname(probe.configDir), "dst-subscription");
-  const recovery = await ensureTranscriptAtConfigDir(
-    { acpSessionId, acpx: {}, cwd },
-    dstConfigDir,
-    {
-      homeDir: path.dirname(probe.configDir),
-      registry: { subscriptions: [] },
-      sourceConfigDirs: [probe.configDir],
-    },
-  );
-
-  // 3. The outcome a real agent must get: the conversation came with it.
-  assert.equal(
-    recovery.status,
-    "ported",
-    `the switch did not port the transcript — this is the unpromptable-session bug. searched: ${recovery.searchedPaths.join(", ")}`,
-  );
-
-  // 4. And it landed where CLAUDE CODE will look for it on the target account —
-  //    i.e. under the directory name Claude Code itself produces, read off the
-  //    filesystem rather than recomputed here.
-  const expected = path.join(
-    dstConfigDir,
-    "projects",
-    probe.observedDirName,
-    `${acpSessionId}.jsonl`,
-  );
-  assert.equal(recovery.activePath, expected);
-  const ported = await fs.readFile(expected, "utf8");
-  assert.match(ported, /real-session-marker/);
-});
-
+// ─────────────────────────────────────────────────────────────────────────────
+// ⚠️ DELETED 2026-09-23: SEVEN LIVE-PROBE TESTS THAT USED TO STAND HERE.
+//
+// This is a DELIBERATE TRADE, not a cleanup, and it runs against the standing
+// rule ("a red is REPAIRED; deletion is only for a test that provably guards
+// nothing"). These tests guarded something real. Daniel overruled the rule
+// explicitly, to take the `claude` binary off the merge path. Recorded here so
+// that the cost is legible later, because the failure it leaves uncovered is
+// SILENT.
+//
+// WHAT THEY WERE. Five `GROUND TRUTH (live Claude Code)` rows (cwd shapes
+// `.bare`, `v1.2.3`, `.hidden`, `under_score`, `plain`), one `GROUND TRUTH`
+// legacy-contrast row, and one `FEATURE GOAL (live, end-to-end)` row. Each
+// spawned a REAL Claude Code process in a dot-bearing cwd under a throwaway
+// isolated HOME and read back the directory name it actually created under
+// `projects/`. No credentials were involved: Claude Code writes that directory
+// at STARTUP, before any API call.
+//
+// WHAT THEY GUARDED (brick://ae715773). acpx built the transcript directory with
+// `cwd.replace(/\//g, "-")` — mapping the path separator and NOTHING ELSE —
+// while Claude Code maps every character outside [A-Za-z0-9-]. So for any cwd
+// containing a `.` — i.e. EVERY Nativai `.bare` worktree — acpx looked for a
+// transcript at a path that CANNOT EXIST. The subscription switch found no
+// source, the port never ran, and THE SESSION WENT UNPROMPTABLE.
+//
+// WHY THEY WERE LIVE PROBES RATHER THAN A TABLE. The file's own header said it,
+// and it is still true: "THE SPEC IS CLAUDE CODE'S OWN BEHAVIOUR, NOT ANY
+// DESCRIPTION OF IT — this program has been burned twice by trusting a written
+// description over the behaviour." A table encodes what we believe today; the
+// probes encoded what Claude Code actually does.
+//
+// 🛑 WHAT IS NOW UNCOVERED. **A change by Claude Code to its project-directory
+// slug algorithm will not be detected by any test in this repo.** Nothing here
+// observes the real binary any more. The symptom would be sessions becoming
+// UNPROMPTABLE after a subscription switch, and no test failure will point at
+// the cause — the derivation below will keep agreeing with itself while
+// disagreeing with reality, which is exactly the shape of the original bug.
+//
+// If you are debugging that symptom: compare `transcriptCwdHash(cwd)` against
+// the directory a real `claude` actually creates under `<configDir>/projects/`.
+// That one comparison is what these seven tests did automatically.
+//
+// WHAT SURVIVES, and what it does NOT prove: the character-table tests below
+// (printable-ASCII coverage, the UTF-16 code-unit rule, the 200-char truncation)
+// still pin the derivation to the table recorded in GROUND-TRUTH.md. They keep
+// the algorithm from drifting on OUR side. They CANNOT notice Claude Code
+// drifting on THEIRS — that is precisely the half that was deleted.
+//
+// DECISION AND OWNER: deleted on Daniel's explicit instruction, 2026-09-23, to
+// remove the `claude` binary from the merge path. The alternative — installing
+// `claude` on the workbench image — was staged and fully measured (the same
+// seven rows: 7 FAIL without the binary, 108 pass / 0 fail / 0 skipped with it)
+// and CANCELLED in favour of this deletion. See brick://37c0108a.
+// ─────────────────────────────────────────────────────────────────────────────
 // ─── Rider 2: the fallback must not be able to mask a broken primary ─────────
 
 // ─────────────────────────────────────────────────────────────────────────────
