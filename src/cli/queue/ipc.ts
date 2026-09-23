@@ -253,6 +253,7 @@ function emitQueueOwnerError(
       acp: message.acp,
       effectiveAccount: message.effectiveAccount,
       automationCapacityReserved: message.automationCapacityReserved,
+      codexSubscriptionCap: message.codexSubscriptionCap,
     });
     formatter.flush();
   }
@@ -433,6 +434,7 @@ export type SubmitToQueueOwnerOptions = {
   timeoutMs?: number;
   suppressSdkConsoleErrors?: boolean;
   promptRetries?: number;
+  codexSubscriptionCapWeeklyPercent?: number;
   waitForCompletion: boolean;
   verbose?: boolean;
   sessionOptions?: NonNullable<AcpClientOptions["sessionOptions"]>;
@@ -524,6 +526,9 @@ async function submitToQueueOwner(
     timeoutMs: options.timeoutMs,
     suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
     promptRetries: options.promptRetries ?? 0,
+    ...(options.codexSubscriptionCapWeeklyPercent !== undefined
+      ? { codexSubscriptionCapWeeklyPercent: options.codexSubscriptionCapWeeklyPercent }
+      : {}),
     waitForCompletion: options.waitForCompletion,
     sessionOptions: options.sessionOptions,
     ...(options.ttlMs !== undefined ? { ttlMs: options.ttlMs } : {}),

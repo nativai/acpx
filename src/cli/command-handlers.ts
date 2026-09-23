@@ -1549,6 +1549,7 @@ async function deliverPrompt(params: {
     ttlMs: params.globalFlags.ttl,
     maxQueueDepth: params.config.queueMaxDepth,
     promptRetries: params.globalFlags.promptRetries,
+    codexSubscriptionCapWeeklyPercent: params.config.codexSubscriptionCapWeeklyPercent,
     verbose: params.globalFlags.verbose,
     waitForCompletion: params.waitForCompletion,
     messageId: params.messageId,
@@ -1686,6 +1687,7 @@ export async function handleExec(
     timeoutMs: globalFlags.timeout,
     verbose: globalFlags.verbose,
     promptRetries: globalFlags.promptRetries,
+    codexSubscriptionCapWeeklyPercent: config.codexSubscriptionCapWeeklyPercent,
     sessionOptions: {
       ...sessionOptionsFromGlobalFlags(globalFlags),
       disallowedTools: resolveClaudeDefaultDisallowedTools(

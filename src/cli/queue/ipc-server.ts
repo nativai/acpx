@@ -138,6 +138,7 @@ function makeQueueOwnerErrorFromUnknown(
     retryable: normalized.retryable,
     acp: normalized.acp,
     automationCapacityReserved: normalized.automationCapacityReserved,
+    codexSubscriptionCap: normalized.codexSubscriptionCap,
   };
 }
 
@@ -269,6 +270,7 @@ export type QueueTask = {
   timeoutMs?: number;
   suppressSdkConsoleErrors?: boolean;
   promptRetries?: number;
+  codexSubscriptionCapWeeklyPercent?: number;
   sessionOptions?: NonNullable<AcpClientOptions["sessionOptions"]>;
   waitForCompletion: boolean;
   // ONE TERMINAL PER TASK, EVER (A11, brick://53437107 §G2b). Set SYNCHRONOUSLY
@@ -982,6 +984,7 @@ export class SessionQueueOwner {
       timeoutMs: request.timeoutMs,
       suppressSdkConsoleErrors: request.suppressSdkConsoleErrors,
       promptRetries: request.promptRetries,
+      codexSubscriptionCapWeeklyPercent: request.codexSubscriptionCapWeeklyPercent,
       sessionOptions: request.sessionOptions,
       waitForCompletion: request.waitForCompletion,
       ttlMs: request.ttlMs,

@@ -1,5 +1,6 @@
 import type {
   AutomationCapacityReservedDetail,
+  CodexSubscriptionCapDetail,
   OutputErrorAcpPayload,
   OutputErrorCode,
   OutputErrorOrigin,
@@ -51,6 +52,7 @@ export type BuildJsonRpcErrorParams = {
   acp?: OutputErrorAcpPayload;
   effectiveAccount?: EffectiveAccountMetadata;
   automationCapacityReserved?: AutomationCapacityReservedDetail;
+  codexSubscriptionCap?: CodexSubscriptionCapDetail;
 };
 
 function hasValidAcpError(
@@ -76,6 +78,9 @@ function buildFallbackData(params: BuildJsonRpcErrorParams): Record<string, unkn
   assignEffectiveAccountData(data, params.effectiveAccount);
   if (params.automationCapacityReserved !== undefined) {
     Object.assign(data, params.automationCapacityReserved);
+  }
+  if (params.codexSubscriptionCap !== undefined) {
+    Object.assign(data, params.codexSubscriptionCap);
   }
 
   for (const [key, value] of Object.entries(data)) {

@@ -88,6 +88,7 @@ export type RunOnceOptions = {
   verbose?: boolean;
   sessionOptions?: SessionAgentOptions;
   promptRetries?: number;
+  codexSubscriptionCapWeeklyPercent?: number;
 } & TimedRunOptions;
 
 export type SessionCreateOptions = {
@@ -143,6 +144,7 @@ export type SessionSendOptions = {
   maxQueueDepth?: number;
   client?: AcpClient;
   promptRetries?: number;
+  codexSubscriptionCapWeeklyPercent?: number;
   sessionOptions?: SessionAgentOptions;
 } & TimedRunOptions;
 

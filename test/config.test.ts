@@ -23,6 +23,7 @@ test("loadResolvedConfig merges global and project config with project priority"
           ttl: 15,
           timeout: 30,
           queueMaxDepth: 9,
+          codexSubscriptionCap: { weeklyCapPercent: 87 },
           format: "json",
           agents: {
             custom: { command: "global-custom" },
@@ -87,6 +88,7 @@ test("loadResolvedConfig merges global and project config with project priority"
     assert.equal(config.ttlMs, 42_000);
     assert.equal(config.timeoutMs, undefined);
     assert.equal(config.queueMaxDepth, 5);
+    assert.equal(config.codexSubscriptionCapWeeklyPercent, 87);
     assert.equal(config.format, "quiet");
     assert.deepEqual(config.agents, {
       custom: "project-custom",
@@ -151,6 +153,7 @@ test("initGlobalConfigFile creates the config once and then reports existing fil
       authPolicy: string;
       ttl: number;
       queueMaxDepth: number;
+      codexSubscriptionCap: { weeklyCapPercent: number };
     };
     assert.equal(payload.defaultAgent, "codex");
     assert.equal(payload.defaultPermissions, "approve-all");
@@ -158,6 +161,7 @@ test("initGlobalConfigFile creates the config once and then reports existing fil
     assert.equal(payload.authPolicy, "skip");
     assert.equal(payload.ttl, 900);
     assert.equal(payload.queueMaxDepth, 16);
+    assert.equal(payload.codexSubscriptionCap.weeklyCapPercent, 90);
   });
 });
 
@@ -169,6 +173,7 @@ test("loadResolvedConfig applies default operational values", async () => {
     const config = await loadResolvedConfig(cwd);
     assert.equal(config.ttlMs, 900_000);
     assert.equal(config.disableExec, false);
+    assert.equal(config.codexSubscriptionCapWeeklyPercent, 90);
   });
 });
 

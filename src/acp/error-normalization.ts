@@ -1,5 +1,6 @@
 import {
   AutomationCapacityReservedError,
+  CodexSubscriptionCapError,
   AuthPolicyError,
   PermissionDeniedError,
   PermissionPromptUnavailableError,
@@ -10,6 +11,7 @@ import {
   OUTPUT_ERROR_ORIGINS,
   type ExitCode,
   type AutomationCapacityReservedDetail,
+  type CodexSubscriptionCapDetail,
   type OutputErrorAcpPayload,
   type OutputErrorCode,
   type OutputErrorOrigin,
@@ -34,6 +36,7 @@ type ErrorMeta = {
   acp?: OutputErrorAcpPayload;
   effectiveAccount?: EffectiveAccountMetadata;
   automationCapacityReserved?: AutomationCapacityReservedDetail;
+  codexSubscriptionCap?: CodexSubscriptionCapDetail;
 };
 
 export type NormalizedOutputError = {
@@ -45,6 +48,7 @@ export type NormalizedOutputError = {
   acp?: OutputErrorAcpPayload;
   effectiveAccount?: EffectiveAccountMetadata;
   automationCapacityReserved?: AutomationCapacityReservedDetail;
+  codexSubscriptionCap?: CodexSubscriptionCapDetail;
 };
 
 export type NormalizeOutputErrorOptions = {
@@ -55,6 +59,7 @@ export type NormalizeOutputErrorOptions = {
   acp?: OutputErrorAcpPayload;
   effectiveAccount?: EffectiveAccountMetadata;
   automationCapacityReserved?: AutomationCapacityReservedDetail;
+  codexSubscriptionCap?: CodexSubscriptionCapDetail;
 };
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -179,6 +184,10 @@ function automationCapacityReservedFromError(
     : undefined;
 }
 
+function codexSubscriptionCapFromError(error: unknown): CodexSubscriptionCapDetail | undefined {
+  return error instanceof CodexSubscriptionCapError ? error.codexSubscriptionCap : undefined;
+}
+
 function readOutputErrorMeta(error: unknown): ErrorMeta {
   const record = asRecord(error);
   if (!record) {
@@ -198,6 +207,7 @@ function readOutputErrorMeta(error: unknown): ErrorMeta {
 
   const acp = extractAcpError(record.acp);
   const automationCapacityReserved = automationCapacityReservedFromError(error);
+  const codexSubscriptionCap = codexSubscriptionCapFromError(error);
   return {
     outputCode,
     detailCode,
@@ -206,6 +216,7 @@ function readOutputErrorMeta(error: unknown): ErrorMeta {
     acp,
     effectiveAccount,
     automationCapacityReserved,
+    codexSubscriptionCap,
   };
 }
 
@@ -288,8 +299,18 @@ export function normalizeOutputError(
     retryable: meta.retryable ?? options.retryable,
     acp,
     effectiveAccount: meta.effectiveAccount ?? options.effectiveAccount,
+    ...resolvedStructuredErrorDetails(meta, options),
+  };
+}
+
+function resolvedStructuredErrorDetails(
+  meta: ErrorMeta,
+  options: NormalizeOutputErrorOptions,
+): Pick<NormalizedOutputError, "automationCapacityReserved" | "codexSubscriptionCap"> {
+  return {
     automationCapacityReserved:
       meta.automationCapacityReserved ?? options.automationCapacityReserved,
+    codexSubscriptionCap: meta.codexSubscriptionCap ?? options.codexSubscriptionCap,
   };
 }
 

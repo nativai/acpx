@@ -227,6 +227,20 @@ export type AutomationCapacityReservedDetail = {
   nextEligibilitySource?: AutomationEligibilitySource;
 };
 
+/**
+ * Local-box Codex subscription-cap admission result. This intentionally names
+ * neither an account nor a fleet: the observation comes from the submitting
+ * box's acpx-ui quota endpoint.
+ */
+export type CodexSubscriptionCapDetail = {
+  code: "codex-subscription-cap";
+  providerSubmitted: false;
+  weeklyCapPercent: number;
+  status: "at-cap" | "stale" | "elapsed" | "absent" | "read-failed";
+  observedWeeklyPercent?: number;
+  capturedAt?: string;
+};
+
 export type PermissionStats = {
   requested: number;
   approved: number;
@@ -303,6 +317,7 @@ export interface OutputFormatter {
     acp?: OutputErrorAcpPayload;
     effectiveAccount?: EffectiveAccountMetadata;
     automationCapacityReserved?: AutomationCapacityReservedDetail;
+    codexSubscriptionCap?: CodexSubscriptionCapDetail;
     timestamp?: string;
   }): void;
   onPermissionEscalation(event: PermissionEscalationEvent): void;
