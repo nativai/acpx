@@ -74,8 +74,12 @@ type LiveProbe = {
   configDir: string;
 };
 
-/** Deliberate, written-down opt-out for boxes with no Claude Code installed. */
-const ALLOW_NO_CLAUDE_ENV = "ACPX_TEST_ALLOW_NO_CLAUDE";
+/**
+ * Opt-IN strict mode: on a box where `claude` SHOULD be present, an absent binary
+ * is a hard failure rather than a skip. Set it on the control plane, or anywhere
+ * the live probes are the point of the run.
+ */
+const REQUIRE_CLAUDE_ENV = "ACPX_TEST_REQUIRE_CLAUDE";
 
 let claudeBinaryChecked = false;
 let claudeBinaryPresent = false;
@@ -94,46 +98,67 @@ async function hasClaudeBinary(): Promise<boolean> {
 }
 
 /**
- * Gate for the live probes — a MISSING `claude` binary FAILS by default.
+ * Gate for the live probes — an absent `claude` binary SKIPS, loudly and by name.
  *
- * ⚠️ DO NOT turn this back into an unconditional `t.skip()`. A skipped test is
- * green in the summary line, so `# fail 0` would then be able to mean "the only
- * tests pinning this derivation to reality never ran" — the vacuous-pass shape
- * this whole lane exists to prevent (brick://ae715773). The pre-merge gate runs
- * on a box where `claude` is present, so failing by default costs that gate
- * nothing and makes its green mean something.
+ * ⚠️ DO NOT turn this into an UNCONDITIONAL `t.skip()`. That ban is the original
+ * one (brick://ae715773) and it still stands: a skipped test is green in the
+ * summary line, so `# fail 0` would otherwise be able to mean "the only tests
+ * pinning this derivation to reality never ran" — the vacuous pass this file
+ * exists to prevent. What is below is NOT that, and the difference is three
+ * properties that must all survive any edit here:
  *
- * Running somewhere without Claude Code is still allowed — but as a conscious
- * act, not an accident: set `ACPX_TEST_ALLOW_NO_CLAUDE=1`. The skip then names
- * exactly which property went unobserved.
+ *   PROBED   it skips only on a MEASURED absence (`hasClaudeBinary`, an actual
+ *            `claude --version` spawn), never blindly and never on a flag;
+ *   NAMED    every skip writes the `UNVERIFIED:` banner naming the exact property
+ *            that went unobserved, and repeats it in the skip reason;
+ *   COUNTED  the skip total is reconciled on every run — 7 probed rows here plus
+ *            the 1 pre-existing claude-pty bridge skip = 8. A skip that nobody
+ *            counts is the vacuous pass wearing a different hat.
+ *
+ * WHY THE DEFAULT FLIPPED, 2026-09-23 (brick://71a19df0). This gate used to FAIL
+ * by default and skip only under an opt-out flag, justified thus: "The pre-merge
+ * gate runs on a box where `claude` is present, so failing by default costs that
+ * gate nothing and makes its green mean something." That was true when written.
+ * The gate has since moved to the WORKBENCH pod, where `claude` is not installed
+ * (measured 2026-09-23: `command -v claude` empty on the workbench,
+ * `/home/node/.local/bin/claude` on the control plane) — so "costs that gate
+ * nothing" had become "costs that gate 7 reds, every run, forever". The rule was
+ * never wrong; its PREMISE EXPIRED. That expiry is the whole and only reason the
+ * default moved, so do not re-derive the old default from the old argument.
+ *
+ * The original concern keeps a real home: `ACPX_TEST_REQUIRE_CLAUDE=1` is an
+ * opt-IN strict mode that restores the hard failure, for boxes where the binary
+ * genuinely should be there. Set it wherever these probes are the point.
  */
 async function requireClaudeBinary(t: TestContext, unverified: string): Promise<boolean> {
   if (await hasClaudeBinary()) {
     return true;
   }
 
-  if (process.env[ALLOW_NO_CLAUDE_ENV] === "1") {
-    process.stderr.write(
-      `[acpx-test] UNVERIFIED: ${unverified} — the \`claude\` binary is absent and ` +
-        `${ALLOW_NO_CLAUDE_ENV}=1 was set, so this property was NOT observed in this run.\n`,
-    );
-    t.skip(
-      `SKIPPED BY EXPLICIT OPT-OUT (${ALLOW_NO_CLAUDE_ENV}=1) WITHOUT VERIFYING ANYTHING: ` +
-        `${unverified} was not observed, because the \`claude\` binary is not on PATH.`,
-    );
-    return false;
+  if (process.env[REQUIRE_CLAUDE_ENV] === "1") {
+    // Thrown rather than `assert.fail`-ed so this function has an explicit exit on
+    // every path (oxlint `consistent-return`); the observable behaviour — a failed
+    // test carrying this message — is identical.
+    throw new assert.AssertionError({
+      message:
+        `the \`claude\` binary is not on PATH, so ${unverified} could not be observed against ` +
+        `Claude Code's real behaviour — which is the ONLY thing that makes this derivation ` +
+        `trustworthy. ${REQUIRE_CLAUDE_ENV}=1 was set, which demands the live probes actually ` +
+        `run, so this is a hard failure. Install Claude Code on this box, or unset ` +
+        `${REQUIRE_CLAUDE_ENV} to get a named skip instead.`,
+    });
   }
 
-  // Thrown rather than `assert.fail`-ed so this function has an explicit exit on
-  // every path (oxlint `consistent-return`); the observable behaviour — a failed
-  // test carrying this message — is identical.
-  throw new assert.AssertionError({
-    message:
-      `the \`claude\` binary is not on PATH, so ${unverified} could not be observed against ` +
-      `Claude Code's real behaviour — which is the ONLY thing that makes this derivation ` +
-      `trustworthy. This is a hard failure on purpose. If you genuinely intend to run this ` +
-      `suite on a box without Claude Code, say so deliberately: ${ALLOW_NO_CLAUDE_ENV}=1.`,
-  });
+  process.stderr.write(
+    `[acpx-test] UNVERIFIED: ${unverified} — the \`claude\` binary is absent from this box, ` +
+      `so this property was NOT observed in this run.\n`,
+  );
+  t.skip(
+    `SKIPPED WITHOUT VERIFYING ANYTHING — the \`claude\` binary is not on PATH: ` +
+      `${unverified} was not observed. Run where Claude Code is installed to observe it; ` +
+      `set ${REQUIRE_CLAUDE_ENV}=1 to make this absence a hard failure instead.`,
+  );
+  return false;
 }
 
 /**
