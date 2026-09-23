@@ -4,7 +4,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { serializeSessionRecordForDisk } from "../src/session/persistence.js";
+import { parseSessionRecord, serializeSessionRecordForDisk } from "../src/session/persistence.js";
+import { toSessionIndexEntry } from "../src/session/persistence/index.js";
 import type { SessionRecord } from "../src/types.js";
 import {
   fileExists,
@@ -1996,6 +1997,59 @@ test("an INDEX-ONLY edit during the batch survives the flush", async (t) => {
     // a record-derived value would come back whatever the overlay wrote.
     assert.equal((await readRecordJson(homeDir, victim)).favorite, undefined);
     assert.equal((await readIndexEntry(homeDir, victim)).parentSessionId, "new-parent");
+  });
+});
+
+// 🛑 THE OVERLAY'S FIELD GROUP MUST COVER EVERY ENTRY FIELD A RE-PARENT CHANGES,
+// AND THIS FINDS THEM BY SCANNING RATHER THAN FROM A LIST. `applyParentToRecord`
+// mutates the record; the overlay writes a NAMED SUBSET of the entry. A field added
+// to the first and forgotten in the second goes stale in the index while typecheck,
+// build and every other test here stay green — the "field-by-field transform leg
+// drops an un-whitelisted field" class this repo has lost three record fields to.
+//
+// So this compares the whole entry against the whole projection of the record that
+// produced it, naming no field: with no concurrent writer in the fixture, the two
+// must agree in EVERY field, and any disagreement IS a group member that went
+// missing. A new parent-ish field therefore arrives pre-covered.
+//
+// ⚠️ It is deliberately NOT a list of expected fields. A hand-maintained list
+// survives its own violation — that is the whole failure mode being guarded.
+test("the overlay's field group covers EVERY entry field a re-parent changes", async () => {
+  await withTempHome(async (homeDir) => {
+    const childIds = await seedHandover(homeDir, 4);
+    const session = await loadSessionModule();
+
+    const result = await session.setSessionParent({
+      target: { kind: "children-of", parentSessionId: "old-parent" },
+      parent: { id: "new-parent" },
+    });
+    assert.equal(result.moved.length, childIds.length);
+
+    for (const id of childIds) {
+      const file = `${encodeURIComponent(id)}.json`;
+      const record = parseSessionRecord(
+        JSON.parse(await fs.readFile(sessionFilePath(homeDir, id), "utf8")),
+      );
+      assert.ok(record, `${id}: record did not parse`);
+      // Both sides through JSON so "absent" and "undefined" compare equal, which is
+      // what `writeSessionIndex` does to the entry on its way to disk anyway.
+      const expected = JSON.parse(JSON.stringify(toSessionIndexEntry(record, file))) as Record<
+        string,
+        unknown
+      >;
+      const actual = JSON.parse(JSON.stringify(await readIndexEntry(homeDir, id))) as Record<
+        string,
+        unknown
+      >;
+      const disagreeing = [...new Set([...Object.keys(expected), ...Object.keys(actual)])].filter(
+        (key) => JSON.stringify(expected[key]) !== JSON.stringify(actual[key]),
+      );
+      assert.deepEqual(
+        disagreeing,
+        [],
+        `${id}: the index entry disagrees with its own record on ${disagreeing.join(", ")} — a field the re-parent changed is missing from the overlay's field group`,
+      );
+    }
   });
 });
 

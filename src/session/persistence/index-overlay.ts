@@ -80,8 +80,21 @@ export type SessionIndexEntryOverlay = {
  *    the guarantee the helper exists for: the obvious alternative shape, replacing
  *    whole entries, reverts `closed` to `false` for a child that closes mid-batch —
  *    and being closed, that child receives no further record write, so *nothing
- *    ever heals it*. Reproduced with a control (brick 2f6f9951 §4.3), and pinned by
- *    a regression test with a mutation probe.
+ *    ever heals it*. Reproduced with a control (brick 2f6f9951 §4.3).
+ *
+ *    ⚠️ **SCOPE OF THAT GUARANTEE, STATED AT THE STRENGTH THE TESTS ACTUALLY HOLD.**
+ *    For a group whose fields are all RECORD-DERIVED — every caller today — clause 4
+ *    holds *by construction*, and note what that costs: merging the group and
+ *    replacing the whole entry become functionally identical, so the mutation that
+ *    used to pin this clause **no longer fires** (measured: whole-entry replay,
+ *    37/37 green). What still fires is an INDEX-ONLY edit — an entry field changed
+ *    with no record write, which is how acpx-ui writes `closed`/`favorite` — and
+ *    that is the control the suite now carries.
+ *    **For a group that is NOT record-derived, clause 4 is UNTESTED.** Such a caller
+ *    is supported by the API (`fields` may ignore its argument) but does not exist
+ *    yet, so nothing exercises it: the entry state it would need to preserve is
+ *    exactly the state no record can restore. If you are that caller, bring a test
+ *    with you — do not read the sentence above as covering you.
  * 5. **One call is one lock and one index write**, for any number of files — so a
  *    caller may write N records and then bring the index level once, atomically,
  *    without holding the lock across the record writes.
