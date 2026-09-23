@@ -1386,3 +1386,199 @@ test("setSessionParent is reachable from the session module and returns the enve
     assert.equal((await readRecordJson(homeDir, "child")).parent_session_id, "b");
   });
 });
+
+// ─── brick 853d9f38: selection from the INDEX, records loaded per TARGET ─────
+//
+// The change these three tests guard is invisible to every behavioural test in
+// this file: `--children-of` produced the same envelope before and after. What
+// changed is WHAT IT READS — a full-store `listSessions()` hydrate (4.2–13.4 s
+// over 1,600 records, 60–80 % of the command) replaced by one index read plus one
+// record read per target. So the first test asserts the READ COUNT, structurally,
+// because nothing else can fail when the optimisation silently does not happen.
+
+/**
+ * Count the record files `setSessionParent` reads, for a store of `chaff`
+ * uninvolved sessions plus a fixed three children.
+ *
+ * ⚠️ COUNTS `<id>.json` UNDER THE STORE, NOT EVERY READ. `index.json`, the
+ * `.messages.ndjson` sidecars and anything outside the session dir are excluded:
+ * the claim is about RECORD hydration, and a counter that also counts the index
+ * read would move for reasons that have nothing to do with it.
+ *
+ * The warm-up CLI run is load-bearing: on a COLD store the first index load
+ * rebuilds by re-parsing every record, which is the reconcile — a real, separate
+ * full-store read that this test is not about and that would mask the one it is.
+ */
+async function recordReadsForChildrenOf(
+  t: import("node:test").TestContext,
+  chaff: number,
+): Promise<number> {
+  return await withTempHome(async (homeDir) => {
+    await seed(homeDir, "old-parent");
+    await seed(homeDir, "new-parent");
+    for (let i = 0; i < 3; i += 1) {
+      await seed(homeDir, `child-${i}`, { parentSessionId: "old-parent" });
+    }
+    for (let i = 0; i < chaff; i += 1) {
+      await seed(homeDir, `chaff-${i}`);
+    }
+    await runCli(["claude", "sessions", "list", "--local"], homeDir);
+
+    const session = await loadSessionModule();
+    const storeDir = path.join(homeDir, ".acpx", "sessions");
+    const originalReadFile = fs.readFile;
+    let recordReads = 0;
+    const spy = t.mock.method(fs, "readFile", async (...args: Parameters<typeof fs.readFile>) => {
+      // Only string paths matter here — every record read goes through
+      // `path.join`. A non-string (fd / URL / Buffer) is simply not a record read.
+      const target = typeof args[0] === "string" ? args[0] : "";
+      if (
+        path.dirname(target) === storeDir &&
+        target.endsWith(".json") &&
+        path.basename(target) !== "index.json"
+      ) {
+        recordReads += 1;
+      }
+      return (originalReadFile as (...a: typeof args) => unknown).apply(fs, args);
+    });
+    try {
+      const result = await session.setSessionParent({
+        target: { kind: "children-of", parentSessionId: "old-parent" },
+        parent: { id: "new-parent" },
+      });
+      // The measurement is worthless if the command did not do the work.
+      assert.equal(result.moved.length, 3, "expected all three children to move");
+    } finally {
+      spy.mock.restore();
+    }
+    return recordReads;
+  });
+}
+
+test("--children-of reads a FIXED number of records — it does not scale with the store", async (t) => {
+  const small = await recordReadsForChildrenOf(t, 5);
+  const large = await recordReadsForChildrenOf(t, 60);
+
+  // 🛑 THE POSITIVE CONTROL. Against the pre-853d9f38 `listSessions()` selection
+  // these two differ by exactly the 55 chaff records — the whole store is hydrated
+  // to answer a question about three children. Equality is the claim; an absolute
+  // bound alone would pass a version that reads the store twice as long as it did
+  // so consistently.
+  assert.equal(
+    small,
+    large,
+    `record reads must not scale with the store: 5 chaff → ${small}, 60 chaff → ${large}`,
+  );
+  // …and the fixed number is small: one read per target for the selection, one for
+  // the write's read-preserve, plus the two parents. Not a tight pin — a budget.
+  assert.ok(large <= 12, `expected ~1+N record reads, got ${large}`);
+});
+
+test("an index row whose RECORD will not load is REPORTED, not silently dropped", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "old-parent");
+    await seed(homeDir, "new-parent");
+    await seed(homeDir, "child-ok", { parentSessionId: "old-parent" });
+    await seed(homeDir, "child-broken", { parentSessionId: "old-parent" });
+    // Materialise index.json while BOTH children are still readable, so the broken
+    // one keeps a valid entry naming old-parent.
+    await runCli(["claude", "sessions", "list", "--local"], homeDir);
+    await fs.writeFile(sessionFilePath(homeDir, "child-broken"), "{ not json\n", "utf8");
+
+    const result = await runCli(
+      [
+        "claude",
+        "sessions",
+        "set-parent",
+        "--children-of",
+        "old-parent",
+        "--parent-id",
+        "new-parent",
+        "--format",
+        "json",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const payload = parseJsonLine(result.stdout);
+
+    // The healthy sibling is unaffected — one bad row must not fail the handover.
+    assert.deepEqual(
+      (payload.moved as Record<string, unknown>[]).map((entry) => entry.acpxRecordId),
+      ["child-ok"],
+    );
+    // ⚠️ AND THE BAD ROW IS NAMED. Under the `listSessions()` selection it was
+    // filtered out before the predicate ever ran: neither `moved` nor `skipped`,
+    // `ok:true`, nothing for an operator to pull on — the exact silence F4 exists
+    // to end.
+    const skipped = payload.skipped as Record<string, unknown>[];
+    assert.equal(skipped.length, 1);
+    assert.equal(skipped[0]?.acpxRecordId, "child-broken");
+    assert.equal(skipped[0]?.code, "SESSION_NOT_FOUND");
+  });
+});
+
+test("--children-of still moves every child over a DELETED and over a MALFORMED index.json", async () => {
+  const indexPath = (homeDir: string): string =>
+    path.join(homeDir, ".acpx", "sessions", "index.json");
+
+  const runAndAssertBothMoved = async (
+    homeDir: string,
+    damage: (indexFile: string) => Promise<void>,
+  ): Promise<void> => {
+    await seed(homeDir, "old-parent");
+    await seed(homeDir, "new-parent");
+    await seed(homeDir, "child-1", { parentSessionId: "old-parent" });
+    await seed(homeDir, "child-2", { parentSessionId: "old-parent" });
+    await runCli(["claude", "sessions", "list", "--local"], homeDir);
+    await damage(indexPath(homeDir));
+
+    const result = await runCli(
+      [
+        "claude",
+        "sessions",
+        "set-parent",
+        "--children-of",
+        "old-parent",
+        "--parent-id",
+        "new-parent",
+        "--format",
+        "json",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const payload = parseJsonLine(result.stdout);
+    assert.deepEqual(
+      (payload.moved as Record<string, unknown>[])
+        .map((entry) => String(entry.acpxRecordId))
+        .toSorted((a, b) => a.localeCompare(b)),
+      ["child-1", "child-2"],
+      `a damaged index must not lose a child: ${result.stdout}`,
+    );
+    assert.deepEqual(payload.diverged, []);
+    assert.equal((await readIndexEntry(homeDir, "child-1")).parentSessionId, "new-parent");
+  };
+
+  // 🛑 NO `listSessions()` FALLBACK IS ADDED FOR THIS, and these two cases are why:
+  // `reconcileSessionIndex` already rebuilds from the records for BOTH faults, and
+  // the rebuild is shared by the entry read and the record read alike. A fallback
+  // would be dead code shadowing a working mechanism — a second, untested recovery
+  // path for the same fault (brick 853d9f38 §6).
+  await withTempHome(async (homeDir) => {
+    await runAndAssertBothMoved(homeDir, async (indexFile) => await fs.rm(indexFile));
+  });
+  await withTempHome(async (homeDir) => {
+    await runAndAssertBothMoved(homeDir, async (indexFile) => {
+      const raw = JSON.parse(await fs.readFile(indexFile, "utf8")) as {
+        entries: Record<string, unknown>[];
+      };
+      // One entry made unparseable by the index PARSER (`cwd` must be a string).
+      // `readSessionIndex` is all-or-nothing, so this fails the whole read.
+      const victim = raw.entries.find((entry) => entry.acpxRecordId === "child-2");
+      assert.ok(victim, "fixture: no entry for child-2 to malform");
+      victim.cwd = 12345;
+      await fs.writeFile(indexFile, JSON.stringify(raw), "utf8");
+    });
+  });
+});
