@@ -140,6 +140,20 @@ export function steeredDeliveryWarning(params: {
  * shares (brick ddd76838 / 7ada04b9). `steeredDeliveryWarning` is tried first:
  * a steered terminal always reports "steered into active turn", never the
  * zero-output warning, however many cosmetic frames its ack produced.
+ *
+ * ⚠️ The `??` here is DEFENSE IN DEPTH, not the load-bearing guarantee — read
+ * this before "simplifying" it away or citing a test against it as proof of
+ * ordering. Both branches read the SAME `params.steered`, and
+ * `zeroAgentOutputWarning`'s own precondition (`isGenuineCompletionStopReason`'s
+ * explicit `steered` check) already returns `undefined` for every steered
+ * input before this `??` has anything to choose between — so today the two
+ * functions' non-undefined results can never collide, and no standing test can
+ * prove this ordering matters without mutating `isGenuineCompletionStopReason`
+ * itself (mutation testing is forbidden in this repo). The real, provable
+ * guarantee lives in `isGenuineCompletionStopReason`'s own unit coverage. This
+ * `??` exists so that IF that guard ever regresses on its own — someone drops
+ * the `steered` parameter, say — a steered terminal still gets the correct
+ * annotation instead of silently reverting to the pre-7ada04b9 defect.
  */
 export function deliveryTerminalWarning(params: {
   terminal: boolean;

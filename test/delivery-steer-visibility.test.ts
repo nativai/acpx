@@ -47,6 +47,7 @@ import { createSessionConversation } from "../src/session/conversation-model.js"
 import {
   buildDeliveryEvent,
   deliveryTerminalWarning,
+  hasCompletedDeliveryFor,
   isGenuineCompletionStopReason,
   steeredDeliveryWarning,
   zeroAgentOutputWarning,
@@ -204,7 +205,21 @@ test("7ada04b9: steeredDeliveryWarning fires on any done+steered terminal, indep
   );
 });
 
-test("7ada04b9: deliveryTerminalWarning — steered takes precedence over zero-output, at any frame count", () => {
+// NOTE ON SCOPE: this exercises the FINAL composed output of
+// deliveryTerminalWarning for steered inputs. It is NOT independent proof that
+// the `??` ORDERING inside deliveryTerminalWarning matters — both branches
+// read the same `params.steered`, and `zeroAgentOutputWarning`'s own
+// precondition (isGenuineCompletionStopReason's `steered` check, pinned in
+// "the zero-output rule fires on genuine completions only" above) already
+// returns `undefined` for every steered input before the `??` has anything to
+// choose between. Verified directly: reordering the `??` operands in
+// deliveryTerminalWarning does not change any assertion in this file — the
+// order is deliberate defense-in-depth (see its doc comment), not something a
+// standing test can prove without mutating isGenuineCompletionStopReason
+// itself (forbidden — no mutation testing in this repo). Don't cite this test
+// as proof of precedence; it proves the composed OUTPUT, which is what
+// callers actually observe.
+test("7ada04b9: deliveryTerminalWarning returns the steered annotation for steered inputs, at any frame count", () => {
   const D = (over: Partial<Parameters<typeof deliveryTerminalWarning>[0]>) =>
     deliveryTerminalWarning({
       terminal: true,
@@ -221,20 +236,56 @@ test("7ada04b9: deliveryTerminalWarning — steered takes precedence over zero-o
   assert.equal(
     D({ steered: true, framesAtStart: 0, framesAtTerminal: 2 }),
     STEERED_INTO_ACTIVE_TURN_WARNING,
-    "steered wins even though frames were observed — this is what makes the warning survive the cosmetic frame",
+    "steered still gets the steered annotation even though frames were observed",
   );
-  // Same shape but the pre-visibility-fix pi-acp (zero frames): steered still
-  // wins over the zero-output text — a more specific, more accurate annotation.
+  // Same shape but the pre-visibility-fix pi-acp (zero frames): still the
+  // steered text, from steeredDeliveryWarning alone (zeroAgentOutputWarning's
+  // own precondition already excludes steered inputs — see the note above).
   assert.equal(
     D({ steered: true, framesAtStart: 0, framesAtTerminal: 0 }),
     STEERED_INTO_ACTIVE_TURN_WARNING,
-    "steered wins over zero-output even when both conditions technically hold",
+    "steered gets the steered annotation at zero frames too",
   );
   // Not steered, zero frames: the original ddd76838 behaviour is preserved.
   assert.equal(D({ steered: false }), ZERO_AGENT_OUTPUT_WARNING);
   assert.equal(D({}), ZERO_AGENT_OUTPUT_WARNING, "steered omitted behaves like steered:false");
   // Not steered, frames observed: clean, no warning at all.
   assert.equal(D({ steered: false, framesAtTerminal: 2 }), undefined);
+});
+
+// brick 7ada04b9 — the dedup invariant `hasCompletedDeliveryFor` is DELIBERATELY
+// left unchanged (documented in delivery-events.ts with a ⚠️). A steered
+// delivery's content still reached and was acted on by the agent, so it must
+// still dedup like any other delivered prompt — a retry for the same messageId
+// must NOT re-send content the agent already saw. A prose comment is not a
+// test: this pins the invariant so a future edit that makes `steered` exclude
+// the event from dedup (a plausible-looking "fix" given
+// deliveryTerminalWarning's opposite-looking behaviour) goes red here.
+test("7ada04b9: hasCompletedDeliveryFor still dedups a steered terminal — the message reached the agent", () => {
+  const messageId = "steer-dedup-0001";
+  const steeredDone = buildDeliveryEvent({
+    messageId,
+    requestId: "req-1",
+    phase: "done",
+    stopReason: "end_turn",
+    steered: true,
+    warning: STEERED_INTO_ACTIVE_TURN_WARNING,
+  });
+  assert.equal(
+    hasCompletedDeliveryFor([steeredDone], messageId),
+    true,
+    "a steered delivery's content reached the agent — dedup must still find it",
+  );
+  // CONTROL: an ordinary, non-steered completion still dedups too (unaffected
+  // by this brick) — the property this test protects is additive, not a
+  // narrowing of the existing contract.
+  const plainDone = buildDeliveryEvent({
+    messageId,
+    requestId: "req-2",
+    phase: "done",
+    stopReason: "end_turn",
+  });
+  assert.equal(hasCompletedDeliveryFor([plainDone], messageId), true);
 });
 
 // ---------------------------------------------------------------------------
