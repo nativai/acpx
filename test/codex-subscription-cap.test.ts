@@ -21,11 +21,14 @@ function quotaResponse(overrides: Record<string, unknown> = {}): Record<string, 
 async function withQuotaServer(
   body: Record<string, unknown>,
   run: (fetchImpl: typeof fetch) => Promise<void>,
+  delayMs = 0,
 ): Promise<void> {
   const server = await new Promise<Server>((resolve) => {
     const created = createServer((_request, response) => {
-      response.setHeader("content-type", "application/json");
-      response.end(JSON.stringify(body));
+      setTimeout(() => {
+        response.setHeader("content-type", "application/json");
+        response.end(JSON.stringify(body));
+      }, delayMs);
     });
     created.listen(0, "127.0.0.1", () => resolve(created));
   });
@@ -49,6 +52,19 @@ test("fresh weekly observation below the local 90% cap permits", async () => {
       fetchImpl,
     });
   });
+});
+
+test("fresh local telemetry that exceeds the former two-second deadline permits", async () => {
+  await withQuotaServer(
+    quotaResponse(),
+    async (fetchImpl) => {
+      await admitCodexSubscriptionTurn({
+        weeklyCapPercent: 90,
+        fetchImpl,
+      });
+    },
+    2_100,
+  );
 });
 
 test("at-cap, stale, elapsed, and absent observations hold", async () => {

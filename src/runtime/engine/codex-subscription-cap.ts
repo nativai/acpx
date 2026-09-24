@@ -3,7 +3,12 @@ import type { CodexSubscriptionCapDetail } from "../../types.js";
 
 const WEEKLY_WINDOW_MINUTES = 10_080;
 const MAX_OBSERVATION_AGE_MS = 120_000;
-const ADMISSION_TIMEOUT_MS = 2_000;
+// A cold acpx-ui quota cache may need to stat and parse every historical Codex
+// rollout.  Two seconds is shorter than that normal first read, which turns a
+// fresh below-cap observation into a false fail-closed hold.  Keep the bound so
+// an unavailable control plane cannot block a turn forever, but leave enough
+// time for that bounded local scan to complete.
+const ADMISSION_TIMEOUT_MS = 45_000;
 const LOCAL_ACPX_UI_ORIGIN = "http://127.0.0.1:3456";
 
 type CodexQuotaWindow = {
