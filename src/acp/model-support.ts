@@ -11,14 +11,137 @@ import { splitCommandLine } from "./client-process.js";
 // notice instead of a scary -32603 RUNTIME internal-error card. Mirrors the
 // USAGE classification of SubscriptionUnknownError / ProfileUnknownError. (de290ae4)
 export class RequestedModelUnsupportedError extends AcpxOperationalError {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    detailCode: "MODEL_NOT_ADVERTISED" | "MODEL_EFFORT_OUT_OF_LADDER" = "MODEL_NOT_ADVERTISED",
+  ) {
     super(message, {
       outputCode: "USAGE",
-      detailCode: "MODEL_NOT_ADVERTISED",
+      detailCode,
       origin: "cli",
     });
     this.name = "RequestedModelUnsupportedError";
   }
+}
+
+export type AdvertisedComposedModel = Readonly<{
+  family: string;
+  efforts: readonly string[];
+  modelIds: readonly string[];
+}>;
+
+const COMPOSED_MODEL_ID = /^(.*)\[([^[]+)\]$/;
+
+function parseComposedModelId(modelId: string): { family: string; effort: string } | undefined {
+  const match = COMPOSED_MODEL_ID.exec(modelId.trim());
+  const family = match?.[1]?.trim();
+  const effort = match?.[2]?.trim().toLowerCase();
+  return family && effort ? { family, effort } : undefined;
+}
+
+/** Project exact adapter ids into per-family ladders without a family or rung table. */
+export function projectAdvertisedComposedModels(
+  models: SessionModelState,
+): AdvertisedComposedModel[] {
+  const families = new Map<string, { efforts: string[]; modelIds: string[] }>();
+  for (const model of models.availableModels) {
+    const parsed = parseComposedModelId(model.modelId);
+    if (!parsed) {
+      continue;
+    }
+    const row = families.get(parsed.family) ?? { efforts: [], modelIds: [] };
+    if (!row.efforts.includes(parsed.effort)) {
+      row.efforts.push(parsed.effort);
+    }
+    row.modelIds.push(model.modelId);
+    families.set(parsed.family, row);
+  }
+  return [...families.entries()].map(([family, row]) => ({
+    family,
+    efforts: row.efforts,
+    modelIds: row.modelIds,
+  }));
+}
+
+function requestedFamilyAndEffort(requestedModel: string): {
+  family: string;
+  effort: string | undefined;
+} {
+  const withoutSource = requestedModel.startsWith("chatgpt:")
+    ? requestedModel.slice("chatgpt:".length)
+    : requestedModel;
+  return parseComposedModelId(withoutSource) ?? { family: withoutSource, effort: undefined };
+}
+
+function selectedEffort(params: {
+  requestedEffort: string | undefined;
+  bracketEffort: string | undefined;
+  requestedFamily: string;
+  family: AdvertisedComposedModel;
+  currentModelId: string;
+}): string | undefined {
+  const explicit = params.requestedEffort?.trim().toLowerCase();
+  if (explicit && explicit !== "default") {
+    return explicit;
+  }
+  if (params.bracketEffort) {
+    return params.bracketEffort;
+  }
+  if (params.family.efforts.includes("medium")) {
+    return "medium";
+  }
+  const current = requestedFamilyAndEffort(params.currentModelId);
+  return current.family === params.requestedFamily ? current.effort : undefined;
+}
+
+function requireAdvertisedFamily(
+  requestedModel: string,
+  requestedFamily: string,
+  models: SessionModelState,
+): AdvertisedComposedModel {
+  const family = projectAdvertisedComposedModels(models).find(
+    (model) => model.family === requestedFamily,
+  );
+  if (family) {
+    return family;
+  }
+  throw new RequestedModelUnsupportedError(
+    `Cannot apply --model "${requestedModel}": the ACP agent did not advertise that model family. Available models: ${formatAvailableModelIds(models)}.`,
+  );
+}
+
+/** Resolve a family + requested effort only against the connected adapter catalogue. */
+export function resolveAdvertisedComposedModel(params: {
+  requestedModel: string;
+  reasoningEffort?: string;
+  models: SessionModelState;
+}): string {
+  const requested = requestedFamilyAndEffort(params.requestedModel.trim());
+  const family = requireAdvertisedFamily(params.requestedModel, requested.family, params.models);
+  const effort = selectedEffort({
+    requestedEffort: params.reasoningEffort,
+    bracketEffort: requested.effort,
+    requestedFamily: requested.family,
+    family,
+    currentModelId: params.models.currentModelId,
+  });
+  if (!effort || !family.efforts.includes(effort)) {
+    throw new RequestedModelUnsupportedError(
+      `Cannot apply --model "${params.requestedModel}" with reasoning effort "${effort ?? "default"}": ` +
+        `${family.family} offers ${family.efforts.join(", ") || "no advertised efforts"}.`,
+      "MODEL_EFFORT_OUT_OF_LADDER",
+    );
+  }
+  const resolved = family.modelIds.find(
+    (modelId) => requestedFamilyAndEffort(modelId).effort === effort,
+  );
+  if (!resolved) {
+    throw new RequestedModelUnsupportedError(
+      `Cannot apply --model "${params.requestedModel}" with reasoning effort "${effort}": the ACP agent did not advertise that composed id.`,
+      "MODEL_EFFORT_OUT_OF_LADDER",
+    );
+  }
+  return resolved;
 }
 
 // A trailing `[Nm]` (e.g. `sonnet[1m]`, `opus[1m]`) is a context-window MODIFIER on a

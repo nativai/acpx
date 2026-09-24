@@ -6,6 +6,8 @@ import { OUTPUT_ERROR_JSONRPC_CODES, buildJsonRpcErrorResponse } from "../src/ac
 import {
   RequestedModelUnsupportedError,
   assertRequestedModelSupported,
+  projectAdvertisedComposedModels,
+  resolveAdvertisedComposedModel,
 } from "../src/acp/model-support.js";
 import { AcpxOperationalError } from "../src/errors.js";
 
@@ -46,6 +48,69 @@ test("assertRequestedModelSupported still accepts an exact advertised id", () =>
       models: BASE_ADVERTISED,
       context: "replay",
     }),
+  );
+});
+
+const FUTURE_CODEX_MODELS: SessionModelState = {
+  currentModelId: "gpt-7-nova[low]",
+  availableModels: [
+    { modelId: "gpt-7-nova[low]", name: "Nova low" },
+    { modelId: "gpt-7-nova[max]", name: "Nova max" },
+    { modelId: "gpt-6-astra[medium]", name: "Astra medium" },
+  ],
+};
+
+test("adapter projection discovers a new family and its exact ladder without a family table", () => {
+  assert.deepEqual(projectAdvertisedComposedModels(FUTURE_CODEX_MODELS), [
+    {
+      family: "gpt-7-nova",
+      efforts: ["low", "max"],
+      modelIds: ["gpt-7-nova[low]", "gpt-7-nova[max]"],
+    },
+    {
+      family: "gpt-6-astra",
+      efforts: ["medium"],
+      modelIds: ["gpt-6-astra[medium]"],
+    },
+  ]);
+});
+
+test("adapter projection resolves an advertised family plus valid effort", () => {
+  assert.equal(
+    resolveAdvertisedComposedModel({
+      requestedModel: "gpt-7-nova",
+      reasoningEffort: "max",
+      models: FUTURE_CODEX_MODELS,
+    }),
+    "gpt-7-nova[max]",
+  );
+});
+
+test("adapter projection rejects an unadvertised family loudly", () => {
+  assert.throws(
+    () =>
+      resolveAdvertisedComposedModel({
+        requestedModel: "gpt-7-phantom",
+        reasoningEffort: "max",
+        models: FUTURE_CODEX_MODELS,
+      }),
+    (error: unknown) =>
+      error instanceof RequestedModelUnsupportedError &&
+      error.detailCode === "MODEL_NOT_ADVERTISED",
+  );
+});
+
+test("adapter projection rejects an out-of-ladder effort loudly", () => {
+  assert.throws(
+    () =>
+      resolveAdvertisedComposedModel({
+        requestedModel: "gpt-7-nova",
+        reasoningEffort: "high",
+        models: FUTURE_CODEX_MODELS,
+      }),
+    (error: unknown) =>
+      error instanceof RequestedModelUnsupportedError &&
+      error.detailCode === "MODEL_EFFORT_OUT_OF_LADDER",
   );
 });
 

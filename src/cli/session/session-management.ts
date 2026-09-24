@@ -77,10 +77,12 @@ import { setSessionModel } from "./session-control.js";
 // fork call sites stay under the lint complexity budget.
 function modelApplyParamsFromOptions(options: SessionCreateOptions): {
   requestedModel: string | undefined;
+  reasoningEffort: string | undefined;
   modelSource: string | undefined;
 } {
   return {
     requestedModel: options.sessionOptions?.model,
+    reasoningEffort: options.sessionOptions?.reasoningEffort,
     modelSource: options.sessionOptions?.modelSource,
   };
 }
@@ -185,12 +187,16 @@ async function createSessionRecordWithClient(
       client,
       sessionId,
       requestedModel: effectiveSessionOptions?.model,
+      reasoningEffort: effectiveSessionOptions?.reasoningEffort,
       modelSource: effectiveSessionOptions?.modelSource,
       models: sessionModels,
       advertisedConfigOptions: createdSession.configOptions,
       agentCommand: options.agentCommand,
       timeoutMs: options.timeoutMs,
     });
+  }
+  if (modelApply.effectiveModelId !== undefined && effectiveSessionOptions !== undefined) {
+    effectiveSessionOptions = { ...effectiveSessionOptions, model: modelApply.effectiveModelId };
   }
   const requestedModelApplied = modelApply.applied;
   // ⚠️ THE POST-MODEL RE-READ (CONCEPTION §5.2). Everything below that asks
