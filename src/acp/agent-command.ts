@@ -14,6 +14,14 @@ const DEFAULT_AGENT_CLOSE_AFTER_STDIN_END_MS = 100;
 const QODER_AGENT_CLOSE_AFTER_STDIN_END_MS = 750;
 const GEMINI_ACP_STARTUP_TIMEOUT_MS = 15_000;
 const CLAUDE_ACP_SESSION_CREATE_TIMEOUT_MS = 60_000;
+// The generic bound for every OTHER agent command's ACP `initialize` handshake
+// (gemini gets its own tighter timeout above). Deliberately generous: a
+// package-exec launch (`npx <adapter>@<pin>`) can cold-install on first run.
+// The point is not speed, it is a BOUND — before this existed, a spawned
+// process that never speaks ACP at all (wrong binary, interactive CLI waiting
+// on stdin, etc.) hung `sessions new` forever with no timeout to catch it
+// (brick 618f1dbf: measured 3h46m idle event loop, zero output).
+const AGENT_STARTUP_TIMEOUT_MS = 120_000;
 const GEMINI_VERSION_TIMEOUT_MS = 2_000;
 const GEMINI_ACP_FLAG_VERSION = [0, 33, 0] as const;
 const COPILOT_HELP_TIMEOUT_MS = 2_000;
@@ -448,6 +456,17 @@ export function resolveClaudeAcpSessionCreateTimeoutMs(): number {
   return CLAUDE_ACP_SESSION_CREATE_TIMEOUT_MS;
 }
 
+export function resolveAgentStartupTimeoutMs(): number {
+  const raw = process.env.ACPX_AGENT_STARTUP_TIMEOUT_MS;
+  if (typeof raw === "string" && raw.trim().length > 0) {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.round(parsed);
+    }
+  }
+  return AGENT_STARTUP_TIMEOUT_MS;
+}
+
 function parseGeminiVersion(value: string | undefined): GeminiVersion | undefined {
   if (typeof value !== "string") {
     return undefined;
@@ -569,6 +588,17 @@ export async function buildGeminiAcpStartupTimeoutMessage(command: string): Prom
 
   parts.push("Try upgrading Gemini CLI and using API-key-based auth for non-interactive ACP runs.");
   return parts.join(" ");
+}
+
+export function buildAgentStartupTimeoutMessage(agentCommand: string, timeoutMs: number): string {
+  return (
+    `Agent startup timed out after ${timeoutMs}ms before the ACP "initialize" handshake ` +
+    `completed (command: ${agentCommand}). The spawned process is still running but never ` +
+    `answered — most likely it does not speak ACP at all (e.g. an interactive CLI spawned by ` +
+    `mistake instead of the ACP adapter) or is waiting on interactive input/auth it will never ` +
+    `receive. The process has been terminated. If this command genuinely needs longer to start ` +
+    `(e.g. a first-run npx install), raise the bound with ACPX_AGENT_STARTUP_TIMEOUT_MS.`
+  );
 }
 
 export function buildClaudeAcpSessionCreateTimeoutMessage(): string {

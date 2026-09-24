@@ -718,6 +718,58 @@ test("resolveAgentInvocation rejects conflicting positional and override agents"
   );
 });
 
+// brick 618f1dbf: `--agent claude` (no positional agent) used to resolve to
+// `agentName: "codex"` (the DEFAULT_AGENT_NAME fallback, since no positional
+// name was given) while `agentCommand` became the literal string "claude" —
+// spawned verbatim as a raw command rather than resolved through the
+// registry. On a box where a bare `claude` binary happens to sit on PATH
+// (e.g. the interactive Claude Code CLI, installed for unrelated reasons and
+// NOT the ACP adapter), that silently spawned the wrong process instead of
+// the intended built-in "claude" agent -- which never speaks ACP and hangs
+// the handshake forever. This must now be refused loudly instead.
+test("resolveAgentInvocation refuses --agent when it names a known agent instead of a raw command", () => {
+  const flags = (agent: string) => ({
+    agent,
+    cwd: "/repo",
+    nonInteractivePermissions: "deny" as const,
+    ttl: 300_000,
+    format: "text" as const,
+  });
+
+  assert.throws(
+    () => resolveAgentInvocation(undefined, flags("claude"), config()),
+    /--agent "claude" is a raw ACP command \(escape hatch\), not a built-in agent selector/,
+  );
+
+  // Case- and whitespace-insensitive: still an exact registry-name match.
+  assert.throws(
+    () => resolveAgentInvocation(undefined, flags(" Codex "), config()),
+    /matches a known built-in agent name/,
+  );
+
+  // A config-registered custom agent name is refused the same way -- the
+  // registry lookup is the merged registry (built-ins + config.agents), not
+  // just the built-in set.
+  assert.throws(
+    () =>
+      resolveAgentInvocation(
+        undefined,
+        flags("my-custom-agent"),
+        config({ agents: { "my-custom-agent": "node my-agent.js" } }),
+      ),
+    /matches a known built-in agent name/,
+  );
+
+  // Negative case: a raw command that merely CONTAINS a known agent name is
+  // NOT refused -- only an exact match is treated as a likely mistake, so a
+  // genuine custom command line keeps working exactly as before.
+  assert.deepEqual(resolveAgentInvocation(undefined, flags("node ./claude-wrapper.js"), config()), {
+    agentName: "codex",
+    agentCommand: "node ./claude-wrapper.js",
+    cwd: "/repo",
+  });
+});
+
 test("resolveSessionSelectorFromFlags falls back through global and parent command options", () => {
   assert.deepEqual(
     resolveSessionSelectorFromFlags(

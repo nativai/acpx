@@ -4,6 +4,8 @@ import { InvalidArgumentError } from "commander";
 import type { Command } from "commander";
 import {
   DEFAULT_AGENT_NAME,
+  listBuiltInAgents,
+  normalizeAgentName,
   resolveAgentCommand as resolveAgentCommandFromRegistry,
 } from "../agent-registry.js";
 import type { SystemPromptOption } from "../runtime/engine/session-options.js";
@@ -920,6 +922,34 @@ export function resolveOutputPolicy(format: OutputFormat, jsonStrict: boolean): 
   };
 }
 
+// `--agent` is a RAW ACP command escape hatch, not a registry-name selector —
+// but its value reads exactly like one, and a caller who means "use the
+// built-in claude agent" naturally reaches for `--agent claude`. That value is
+// then spawned VERBATIM (never resolved through the registry), so if a
+// `claude`/`codex`/etc. binary happens to sit on PATH for unrelated reasons
+// (e.g. the interactive Claude Code CLI, not the ACP adapter), the CLI
+// silently launches the wrong process instead of the intended built-in agent —
+// which does not speak ACP and hangs the handshake forever. Refuse loudly
+// instead of guessing: this is the ONLY case worth refusing, because it is the
+// only raw value that can plausibly be a mistyped registry name rather than a
+// genuine custom command line (brick 618f1dbf).
+function rejectAgentOverrideNamingKnownAgent(override: string, config: ResolvedAcpxConfig): void {
+  const knownAgentNames = new Set(
+    listBuiltInAgents(config.agents).map((name) => normalizeAgentName(name)),
+  );
+  if (!knownAgentNames.has(normalizeAgentName(override))) {
+    return;
+  }
+  throw new InvalidArgumentError(
+    `--agent "${override}" is a raw ACP command (escape hatch), not a built-in agent ` +
+      `selector, so it is not what you likely intended: it matches a known built-in agent ` +
+      `name and would be spawned verbatim rather than resolved. To use the built-in ` +
+      `"${override}" agent, put it first instead: \`acpx ${override} sessions new ...\`. ` +
+      `To launch a genuine custom ACP command that happens to share this name, pass its ` +
+      `full command line instead of the bare name (e.g. \`--agent './${override}'\`).`,
+  );
+}
+
 export function resolveAgentInvocation(
   explicitAgentName: string | undefined,
   globalFlags: GlobalFlags,
@@ -933,12 +963,14 @@ export function resolveAgentInvocation(
   if (override && explicitAgentName) {
     throw new InvalidArgumentError("Do not combine positional agent with --agent override");
   }
+  // explicitAgentName is necessarily undefined here: the combination above
+  // already threw.
+  if (override) {
+    rejectAgentOverrideNamingKnownAgent(override, config);
+  }
 
   const agentName = explicitAgentName ?? config.defaultAgent ?? DEFAULT_AGENT_NAME;
-  const agentCommand =
-    override && override.length > 0
-      ? override
-      : resolveAgentCommandFromRegistry(agentName, config.agents);
+  const agentCommand = override || resolveAgentCommandFromRegistry(agentName, config.agents);
 
   return {
     agentName,

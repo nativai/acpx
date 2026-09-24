@@ -235,6 +235,23 @@ export class GeminiAcpStartupTimeoutError extends AcpxOperationalError {
   }
 }
 
+// Generic bound on every OTHER agent command's ACP `initialize` handshake
+// (gemini gets its own dedicated timeout + error above). This is the catch-all
+// that keeps `sessions new` from hanging forever against a spawned process
+// that never speaks ACP at all — e.g. a mistyped `--agent` escape-hatch value
+// that resolves to an unrelated interactive CLI on PATH (brick 618f1dbf).
+export class AgentStartupTimeoutError extends AcpxOperationalError {
+  constructor(message: string, options?: AcpxErrorOptions) {
+    super(message, {
+      outputCode: "TIMEOUT",
+      detailCode: "AGENT_STARTUP_TIMEOUT",
+      origin: "acp",
+      retryable: true,
+      ...options,
+    });
+  }
+}
+
 // A subscription id was requested that is not in the registry. Usage error.
 export class SubscriptionUnknownError extends AcpxOperationalError {
   constructor(id: string, knownIds?: readonly string[]) {
