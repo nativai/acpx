@@ -198,10 +198,20 @@ test("banding: the Unavailable band is hidden by default and never silently drop
 test("availability gate: a harness-native row belongs to its own agent type only", () => {
   const catalogue = buildCatalogue([], META);
   const opus = catalogue.models.find((m) => m.key === "claude-subscription:opus");
-  const codexFamily = catalogue.models.find((m) => m.key === "chatgpt:gpt-5.6-sol");
-  assert.ok(opus && codexFamily);
+  assert.ok(opus);
   assert.equal(isAvailableForAgent(opus, "claude"), true);
   assert.equal(isAvailableForAgent(opus, "codex"), false);
+
+  // Codex has no static native row since the live-Codex-catalogue merge
+  // (a003e31 / f526e54) — its ACP session advertisement is the only authority
+  // now (harness-models.ts header comment; models-catalogue.test.ts "codex has
+  // no static native rows; its ACP advertisement is authoritative"), so
+  // `buildCatalogue([], META)` never contains a `chatgpt:*` row to look up.
+  // The gate itself (`nativeAgentTypesForSource`) is unconditional on
+  // `model.source` regardless of where the row came from, so exercise it
+  // against a fixture this test controls, the same way every OpenRouter case
+  // in this file already does via `row()`.
+  const codexFamily = row({ key: "chatgpt:gpt-5.6-sol", source: "chatgpt", id: "gpt-5.6-sol" });
   assert.equal(isAvailableForAgent(codexFamily, "codex"), true);
   assert.equal(isAvailableForAgent(codexFamily, "claude"), false);
 });
