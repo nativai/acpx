@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
+import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -3852,8 +3853,18 @@ test("integration: codex-acp prompt --no-wait injects into an active queue-owner
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
     const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-codex-"));
+    const quotaServer = createServer((_request, response) => {
+      response.setHeader("content-type", "application/json");
+      response.end(
+        JSON.stringify({
+          capturedAt: new Date().toISOString(),
+          secondary: { windowMinutes: 10_080, usedPercent: 0, elapsed: false },
+        }),
+      );
+    });
 
     try {
+      await new Promise<void>((resolve) => quotaServer.listen(3456, "127.0.0.1", resolve));
       await writeFakeCodexAgent(fakeBinDir);
 
       const codexAgentArgs = ["--agent", "codex-acp", "--approve-all", "--cwd", cwd];
@@ -3927,6 +3938,9 @@ test("integration: codex-acp prompt --no-wait injects into an active queue-owner
       );
       assert.equal(closed.code, 0, closed.stderr);
     } finally {
+      await new Promise<void>((resolve, reject) =>
+        quotaServer.close((error) => (error ? reject(error) : resolve())),
+      );
       await fs.rm(fakeBinDir, { recursive: true, force: true });
       await fs.rm(cwd, { recursive: true, force: true });
     }

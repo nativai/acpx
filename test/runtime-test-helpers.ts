@@ -136,7 +136,8 @@ export async function withTempHome<T>(
   // real /tmp (brick 0bac6a00, `config-dir-root-isolation.ts`).
   const restoreConfigDirRoot = beginIsolatedHarnessConfigDirRoot(tempHome);
   globalThis.fetch = async (input, init) => {
-    if (String(input) === "http://127.0.0.1:3456/api/usage/codex/quota") {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (url === "http://127.0.0.1:3456/api/usage/codex/quota") {
       return new Response(
         JSON.stringify({
           capturedAt: new Date().toISOString(),
