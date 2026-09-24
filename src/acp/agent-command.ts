@@ -16,12 +16,17 @@ const GEMINI_ACP_STARTUP_TIMEOUT_MS = 15_000;
 const CLAUDE_ACP_SESSION_CREATE_TIMEOUT_MS = 60_000;
 // The generic bound for every OTHER agent command's ACP `initialize` handshake
 // (gemini gets its own tighter timeout above). Deliberately generous: a
-// package-exec launch (`npx <adapter>@<pin>`) can cold-install on first run.
-// The point is not speed, it is a BOUND — before this existed, a spawned
-// process that never speaks ACP at all (wrong binary, interactive CLI waiting
-// on stdin, etc.) hung `sessions new` forever with no timeout to catch it
-// (brick 618f1dbf: measured 3h46m idle event loop, zero output).
-const AGENT_STARTUP_TIMEOUT_MS = 120_000;
+// package-exec launch (`npx <adapter>@<pin>`) can cold-install on first run,
+// and this box's own load is documented to swing 2-4x within minutes while a
+// heavy gate runs elsewhere on it (dev-server-workspace skill, "Heavy gates
+// are serialised box-wide"). 3 minutes gives real headroom over both known
+// per-family budgets (claude session-create: 60s, gemini startup: 15s) so
+// ordinary scheduling contention cannot false-positive into a startup
+// failure. The point is not speed, it is a BOUND — before this existed, a
+// spawned process that never speaks ACP at all (wrong binary, interactive
+// CLI waiting on stdin, etc.) hung `sessions new` forever with no timeout to
+// catch it (brick 618f1dbf: measured 3h46m idle event loop, zero output).
+const AGENT_STARTUP_TIMEOUT_MS = 180_000;
 const GEMINI_VERSION_TIMEOUT_MS = 2_000;
 const GEMINI_ACP_FLAG_VERSION = [0, 33, 0] as const;
 const COPILOT_HELP_TIMEOUT_MS = 2_000;

@@ -950,6 +950,60 @@ function rejectAgentOverrideNamingKnownAgent(override: string, config: ResolvedA
   );
 }
 
+// A raw `--agent` override that does NOT collide with a known name (the exact
+// match above already refused those) is still spawned under an ASSUMED
+// identity: `agentName` falls back to config.defaultAgent / DEFAULT_AGENT_NAME
+// regardless of what the override actually launches, and that name (not the
+// command) is what model routing, --reasoning-effort / --output-style
+// compatibility checks, and credential/subscription selection key off of
+// downstream.
+//
+// Warn ONLY when the override is a single bare word with no path separator
+// (`looksLikeBareAgentName`) -- the exact shape a mistyped registry name
+// takes, and the exact shape that resolves via a PATH lookup rather than a
+// specific file (the mechanism behind brick 618f1dbf: a bare `claude` on PATH
+// is what silently became the wrong binary). A real command line -- anything
+// with a path separator or an argument -- is unambiguously deliberate: nobody
+// mistypes a registry name as `node /path/to/agent.js` or `./my-custom-server`
+// (both are the CLI's own documented escape-hatch examples), so warning on
+// those would just be noise on every legitimate custom-command invocation
+// without ever pointing at a real mistake.
+function looksLikeBareAgentName(value: string): boolean {
+  return !/[\s/\\]/.test(value);
+}
+
+function warnAgentOverrideIdentityAssumed(
+  override: string,
+  agentName: string,
+  jsonStrict: boolean | undefined,
+): void {
+  if (jsonStrict) {
+    return;
+  }
+  process.stderr.write(
+    `[acpx] --agent "${override}" is a raw command with no positional agent name, so acpx is ` +
+      `assuming agent identity "${agentName}" for model / --reasoning-effort / --output-style ` +
+      `routing and credential selection -- this may not describe the command actually being ` +
+      `launched. If "${override}" is meant to be one of acpx's built-in agents, use the ` +
+      `positional form instead (\`acpx <agent> ...\`); for a genuine custom command this ` +
+      `warning is expected and harmless.\n`,
+  );
+}
+
+// Groups the two override-only checks so resolveAgentInvocation's own
+// complexity stays flat regardless of how many of them there are.
+function handleAgentOverride(
+  override: string,
+  agentName: string,
+  globalFlags: GlobalFlags,
+  config: ResolvedAcpxConfig,
+): void {
+  rejectAgentOverrideNamingKnownAgent(override, config);
+  if (looksLikeBareAgentName(override)) {
+    warnAgentOverrideIdentityAssumed(override, agentName, globalFlags.jsonStrict);
+  }
+}
+
 export function resolveAgentInvocation(
   explicitAgentName: string | undefined,
   globalFlags: GlobalFlags,
@@ -963,13 +1017,13 @@ export function resolveAgentInvocation(
   if (override && explicitAgentName) {
     throw new InvalidArgumentError("Do not combine positional agent with --agent override");
   }
-  // explicitAgentName is necessarily undefined here: the combination above
+  // explicitAgentName is necessarily undefined below: the combination above
   // already threw.
+  const agentName = explicitAgentName ?? config.defaultAgent ?? DEFAULT_AGENT_NAME;
   if (override) {
-    rejectAgentOverrideNamingKnownAgent(override, config);
+    handleAgentOverride(override, agentName, globalFlags, config);
   }
 
-  const agentName = explicitAgentName ?? config.defaultAgent ?? DEFAULT_AGENT_NAME;
   const agentCommand = override || resolveAgentCommandFromRegistry(agentName, config.agents);
 
   return {

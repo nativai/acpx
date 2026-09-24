@@ -770,6 +770,116 @@ test("resolveAgentInvocation refuses --agent when it names a known agent instead
   });
 });
 
+function captureStderrSync<T>(run: () => T): { result: T; stderr: string } {
+  const original = process.stderr.write.bind(process.stderr);
+  let captured = "";
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    captured += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    return { result: run(), stderr: captured };
+  } finally {
+    process.stderr.write = original;
+  }
+}
+
+// brick 618f1dbf, follow-up: the exact-match refusal above only catches an
+// UNAMBIGUOUS mistake. A near-miss (`--agent claude-code`) or a genuine
+// custom command line still resolves with an ASSUMED `agentName` (from
+// config.defaultAgent / DEFAULT_AGENT_NAME) that has nothing to do with what
+// is actually being launched -- and that assumed name is what
+// --reasoning-effort / --output-style routing and credential selection key
+// off of downstream (command-handlers.ts warnReasoningEffortNotRoutable /
+// warnOutputStyleNotSupported both take `agent.agentName`, never the
+// command). Silently applying one harness's semantics to another's process
+// is the same failure shape as the exact-match case, one step removed, so it
+// must be visible.
+//
+// Refusing outright would break the documented escape hatch (`acpx --agent
+// ./my-custom-server "..."`, cli-public.ts) and, worse, would fire on nearly
+// every real command line (they routinely contain a path or an argument), so
+// the chosen boundary is narrower than "any override": exact known-name
+// match -> refuse; a BARE single-word override (no path separator, no
+// whitespace -- the exact shape of both a plausible registry-name typo and a
+// PATH lookup, the mechanism behind brick 618f1dbf) -> warn once,
+// non-fatally, on stderr; a real command line -> silent, same as always.
+test("resolveAgentInvocation warns only on a BARE-word override, never on a real command line", () => {
+  const flags = (agent: string, jsonStrict?: boolean) => ({
+    agent,
+    jsonStrict,
+    cwd: "/repo",
+    nonInteractivePermissions: "deny" as const,
+    ttl: 300_000,
+    format: "text" as const,
+  });
+
+  const nearMiss = captureStderrSync(() =>
+    resolveAgentInvocation(undefined, flags("claude-code"), config({ defaultAgent: "codex" })),
+  );
+  assert.deepEqual(nearMiss.result, {
+    agentName: "codex",
+    agentCommand: "claude-code",
+    cwd: "/repo",
+  });
+  assert.match(nearMiss.stderr, /--agent "claude-code" is a raw command with no positional agent/);
+  assert.match(nearMiss.stderr, /assuming agent identity "codex"/);
+
+  // A bare custom name with no path is EQUALLY ambiguous -- it is not a known
+  // registry key, but it still resolves via a PATH lookup exactly like the
+  // incident's literal `claude`, so it gets the same warning as a near-miss.
+  const bareCustom = captureStderrSync(() =>
+    resolveAgentInvocation(undefined, flags("my-bespoke-agent-binary"), config()),
+  );
+  assert.match(bareCustom.stderr, /assuming agent identity "codex"/);
+
+  // Negative case: a real command line (has a path separator or an argument)
+  // is UNAMBIGUOUSLY deliberate -- nobody mistypes a registry name as
+  // `node /path/to/agent.js` or `./my-custom-server` (both are the CLI's own
+  // documented escape-hatch examples) -- so these stay completely silent.
+  // Warning on every real custom-command invocation would make the signal
+  // meaningless noise on the escape hatch's single most common shape.
+  for (const realCommand of [
+    "node /opt/some/acp-server.js",
+    "./my-custom-server",
+    "/opt/some/acp-server.js",
+  ]) {
+    const genuineCustom = captureStderrSync(() =>
+      resolveAgentInvocation(undefined, flags(realCommand), config()),
+    );
+    assert.equal(
+      genuineCustom.stderr,
+      "",
+      `expected no warning for ${JSON.stringify(realCommand)}`,
+    );
+  }
+
+  // --json-strict carries a shipped contract that stderr stays EMPTY
+  // (test/integration.test.ts asserts this for the fleet's other CLI
+  // warnings) -- this one must honor it too, even for the bare-word case that
+  // would otherwise warn.
+  const strict = captureStderrSync(() =>
+    resolveAgentInvocation(undefined, flags("claude-code", true), config()),
+  );
+  assert.equal(strict.stderr, "");
+
+  // No warning at all when there is nothing assumed: a positional agent name
+  // makes the identity explicit, and no override means there is no raw
+  // command to be ambiguous about.
+  const bareFlags = {
+    cwd: "/repo",
+    nonInteractivePermissions: "deny" as const,
+    ttl: 300_000,
+    format: "text" as const,
+  };
+  const positional = captureStderrSync(() => resolveAgentInvocation("codex", bareFlags, config()));
+  assert.equal(positional.stderr, "");
+  const noOverride = captureStderrSync(() =>
+    resolveAgentInvocation(undefined, bareFlags, config()),
+  );
+  assert.equal(noOverride.stderr, "");
+});
+
 test("resolveSessionSelectorFromFlags falls back through global and parent command options", () => {
   assert.deepEqual(
     resolveSessionSelectorFromFlags(
