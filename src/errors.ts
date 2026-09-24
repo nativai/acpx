@@ -1,5 +1,6 @@
 import type {
   AutomationCapacityReservedDetail,
+  CodexSubscriptionCapDetail,
   OutputErrorAcpPayload,
   OutputErrorCode,
   OutputErrorOrigin,
@@ -377,6 +378,33 @@ export class AutomationCapacityReservedError extends AcpxOperationalError {
         ? { nextEligibilitySource: params.nextEligibilitySource }
         : {}),
     };
+  }
+}
+
+/**
+ * The local acpx-ui telemetry endpoint could not positively admit a Codex turn.
+ * This is deliberately a pre-provider terminal: callers must not retry through
+ * a different account or infer that the observation means zero usage.
+ */
+export class CodexSubscriptionCapError extends AcpxOperationalError {
+  readonly codexSubscriptionCap: CodexSubscriptionCapDetail;
+
+  constructor(detail: CodexSubscriptionCapDetail) {
+    const observed =
+      detail.observedWeeklyPercent === undefined
+        ? "no usable weekly observation"
+        : `${detail.observedWeeklyPercent.toFixed(1)}% weekly utilization`;
+    super(
+      `Codex subscription cap held before provider submission: ${observed} ` +
+        `(${detail.status}; local box cap ${detail.weeklyCapPercent.toFixed(1)}%).`,
+      {
+        outputCode: "RUNTIME",
+        detailCode: "codex-subscription-cap",
+        origin: "runtime",
+        retryable: true,
+      },
+    );
+    this.codexSubscriptionCap = detail;
   }
 }
 

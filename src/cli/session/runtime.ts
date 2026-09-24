@@ -2,7 +2,9 @@ import os from "node:os";
 import path from "node:path";
 import type { PromptResponse } from "@agentclientprotocol/sdk";
 import type { EffectiveAccountMetadata } from "../../acp/auth-env.js";
+import { splitCommandLine } from "../../acp/client-process.js";
 import { AcpClient } from "../../acp/client.js";
+import { isCodexAcpCommand } from "../../acp/codex-compat.js";
 import {
   formatErrorMessage,
   isRetryablePromptError,
@@ -22,6 +24,7 @@ import { transcriptCwdHash } from "../../config/subscription-transcript.js";
 import {
   AllSubscriptionsExhaustedError,
   AutomationCapacityReservedError,
+  CodexSubscriptionCapError,
   BridgeAuthGatedError,
   FableShareExhaustedError,
   isModelFloorUnmetError,
@@ -48,6 +51,7 @@ export { InterruptedError, TimeoutError } from "../../async-control.js";
 import { isFableModel } from "../../config/subscription-usage.js";
 import { formatPerfMetric, measurePerf, startPerfTimer } from "../../perf-metrics.js";
 import { textPrompt } from "../../prompt-content.js";
+import { admitCodexSubscriptionTurn } from "../../runtime/engine/codex-subscription-cap.js";
 import { bindRecordToDefaultAccount } from "../../runtime/engine/default-account-binding.js";
 import {
   applyConversation,
@@ -122,6 +126,7 @@ import {
   type AcpJsonRpcMessage,
   type AcpMessageDirection,
   type AutomationCapacityReservedDetail,
+  type CodexSubscriptionCapDetail,
   type AuthPolicy,
   type McpServer,
   type NonInteractivePermissionPolicy,
@@ -221,6 +226,7 @@ class QueueTaskOutputFormatter implements OutputFormatter {
     retryable?: boolean;
     acp?: OutputErrorAcpPayload;
     automationCapacityReserved?: AutomationCapacityReservedDetail;
+    codexSubscriptionCap?: CodexSubscriptionCapDetail;
     timestamp?: string;
   }): void {
     this.send({
@@ -233,6 +239,7 @@ class QueueTaskOutputFormatter implements OutputFormatter {
       retryable: params.retryable,
       acp: params.acp,
       automationCapacityReserved: params.automationCapacityReserved,
+      codexSubscriptionCap: params.codexSubscriptionCap,
     });
   }
 
@@ -1222,6 +1229,7 @@ function buildQueuedTaskRunOptions(
     suppressSdkConsoleErrors: task.suppressSdkConsoleErrors ?? options.suppressSdkConsoleErrors,
     verbose: options.verbose,
     promptRetries: task.promptRetries ?? options.promptRetries ?? 0,
+    codexSubscriptionCapWeeklyPercent: task.codexSubscriptionCapWeeklyPercent,
     sessionOptions: mergeSessionOptions(task.sessionOptions, options.sessionOptions),
     onClientAvailable: options.onClientAvailable,
     onClientClosed: options.onClientClosed,
@@ -1326,7 +1334,9 @@ function terminalizeDeliveryRefusedByReservedCapacity(
   // state exclusively by messageId. Mark the task first so owner shutdown cannot
   // append a second terminal for the same delivery.
   if (
-    !(error instanceof AutomationCapacityReservedError) ||
+    !(
+      error instanceof AutomationCapacityReservedError || error instanceof CodexSubscriptionCapError
+    ) ||
     !task.messageId ||
     task.terminalWritten
   ) {
@@ -1357,6 +1367,7 @@ function sendQueuedTaskError(task: QueueTask, error: unknown): void {
     acp: normalizedError.acp,
     effectiveAccount: normalizedError.effectiveAccount,
     automationCapacityReserved: normalizedError.automationCapacityReserved,
+    codexSubscriptionCap: normalizedError.codexSubscriptionCap,
     outputAlreadyEmitted: alreadyEmitted,
   });
 }
@@ -1423,6 +1434,7 @@ function isPreSubmitTerminalError(error: unknown): boolean {
     isSubscriptionLockBlockError(error) ||
     isModelFloorUnmetError(error) ||
     error instanceof AutomationCapacityReservedError ||
+    error instanceof CodexSubscriptionCapError ||
     error instanceof AllSubscriptionsExhaustedError
   );
 }
@@ -1644,6 +1656,12 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     }
     if (!lockOutcome.switchedTo && !selectionSwitched && !options.skipProactiveSelection) {
       await enforceAutomationWeeklyCeilingBeforeTurn(record);
+    }
+    const command = splitCommandLine(record.agentCommand);
+    if (isCodexAcpCommand(command.command, command.args)) {
+      await admitCodexSubscriptionTurn({
+        weeklyCapPercent: options.codexSubscriptionCapWeeklyPercent ?? 90,
+      });
     }
     // Pre-turn model-floor gate (brick://07dd62c9 §5b.a): under --floor-hard,
     // refuse UPFRONT (no prompt submitted) when the pinned model is knowably
@@ -3273,6 +3291,12 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
           );
         });
         const sessionId = createdSession.sessionId;
+        const command = splitCommandLine(options.agentCommand);
+        if (isCodexAcpCommand(command.command, command.args)) {
+          await admitCodexSubscriptionTurn({
+            weeklyCapPercent: options.codexSubscriptionCapWeeklyPercent ?? 90,
+          });
+        }
         const effectiveSessionOptions = withDefaultModelForNewSession(
           options.agentCommand,
           options.sessionOptions,

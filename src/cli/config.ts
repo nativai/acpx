@@ -30,6 +30,7 @@ type ConfigFileShape = {
   agents?: unknown;
   auth?: unknown;
   disableExec?: unknown;
+  codexSubscriptionCap?: unknown;
   mcpServers?: unknown;
 };
 
@@ -45,6 +46,7 @@ export type ResolvedAcpxConfig = {
   agents: Record<string, string>;
   auth: Record<string, string>;
   disableExec: boolean;
+  codexSubscriptionCapWeeklyPercent?: number;
   mcpServers: McpServer[];
   subscriptions: SubscriptionRegistry;
   globalPath: string;
@@ -66,6 +68,7 @@ const DEFAULT_AUTH_POLICY: AuthPolicy = "skip";
 const DEFAULT_OUTPUT_FORMAT: OutputFormat = "text";
 const DEFAULT_QUEUE_MAX_DEPTH = 16;
 const DEFAULT_DISABLE_EXEC = false;
+const DEFAULT_CODEX_SUBSCRIPTION_CAP_WEEKLY_PERCENT = 90;
 const VALID_PERMISSION_MODES = new Set<PermissionMode>([
   "approve-all",
   "approve-reads",
@@ -262,6 +265,30 @@ function parseDisableExec(value: unknown, sourcePath: string): boolean | undefin
   return value;
 }
 
+function parseCodexSubscriptionCapWeeklyPercent(
+  value: unknown,
+  sourcePath: string,
+): number | undefined {
+  if (value == null) {
+    return undefined;
+  }
+  if (!isObject(value) || typeof value.weeklyCapPercent !== "number") {
+    throw new Error(
+      `Invalid config codexSubscriptionCap in ${sourcePath}: expected object with weeklyCapPercent`,
+    );
+  }
+  if (
+    !Number.isFinite(value.weeklyCapPercent) ||
+    value.weeklyCapPercent <= 0 ||
+    value.weeklyCapPercent > 100
+  ) {
+    throw new Error(
+      `Invalid config codexSubscriptionCap.weeklyCapPercent in ${sourcePath}: expected number > 0 and <= 100`,
+    );
+  }
+  return value.weeklyCapPercent;
+}
+
 async function readConfigFile(filePath: string): Promise<ConfigFileLoadResult> {
   try {
     const payload = await fs.readFile(filePath, "utf8");
@@ -341,6 +368,10 @@ export async function loadResolvedConfig(cwd: string): Promise<ResolvedAcpxConfi
     agents,
     auth,
     disableExec,
+    codexSubscriptionCapWeeklyPercent: resolveCodexSubscriptionCapWeeklyPercent(
+      globalConfig,
+      globalPath,
+    ),
     mcpServers,
     subscriptions: loadSubscriptionRegistry(),
     globalPath,
@@ -348,6 +379,16 @@ export async function loadResolvedConfig(cwd: string): Promise<ResolvedAcpxConfi
     hasGlobalConfig: globalResult.exists,
     hasProjectConfig: projectResult.exists,
   };
+}
+
+function resolveCodexSubscriptionCapWeeklyPercent(
+  globalConfig: ConfigFileShape | undefined,
+  globalPath: string,
+): number {
+  return (
+    parseCodexSubscriptionCapWeeklyPercent(globalConfig?.codexSubscriptionCap, globalPath) ??
+    DEFAULT_CODEX_SUBSCRIPTION_CAP_WEEKLY_PERCENT
+  );
 }
 
 function resolveScalarConfigValues(
@@ -538,6 +579,7 @@ export function toConfigDisplay(config: ResolvedAcpxConfig): {
   agents: Record<string, ConfigAgentEntry>;
   authMethods: string[];
   disableExec: boolean;
+  codexSubscriptionCap: { weeklyCapPercent: number };
 } {
   const agents: Record<string, ConfigAgentEntry> = {};
   for (const [name, command] of Object.entries(config.agents)) {
@@ -556,6 +598,10 @@ export function toConfigDisplay(config: ResolvedAcpxConfig): {
     agents,
     authMethods: Object.keys(config.auth).toSorted(),
     disableExec: config.disableExec,
+    codexSubscriptionCap: {
+      weeklyCapPercent:
+        config.codexSubscriptionCapWeeklyPercent ?? DEFAULT_CODEX_SUBSCRIPTION_CAP_WEEKLY_PERCENT,
+    },
   };
 }
 
@@ -587,6 +633,7 @@ export async function initGlobalConfigFile(): Promise<{
     format: "text",
     agents: {},
     auth: {},
+    codexSubscriptionCap: { weeklyCapPercent: DEFAULT_CODEX_SUBSCRIPTION_CAP_WEEKLY_PERCENT },
   };
 
   await fs.writeFile(configPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");

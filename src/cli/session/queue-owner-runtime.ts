@@ -151,6 +151,7 @@ async function submitToRunningOwner(
     timeoutMs: options.timeoutMs,
     suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
     promptRetries: options.promptRetries,
+    codexSubscriptionCapWeeklyPercent: options.codexSubscriptionCapWeeklyPercent,
     waitForCompletion,
     verbose: options.verbose,
     sessionOptions: options.sessionOptions,

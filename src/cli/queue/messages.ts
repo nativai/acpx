@@ -17,6 +17,7 @@ import {
 import type {
   AcpJsonRpcMessage,
   AutomationCapacityReservedDetail,
+  CodexSubscriptionCapDetail,
   NonInteractivePermissionPolicy,
   PermissionMode,
   PromptInput,
@@ -40,6 +41,7 @@ export type QueueSubmitRequest = {
   timeoutMs?: number;
   suppressSdkConsoleErrors?: boolean;
   promptRetries?: number;
+  codexSubscriptionCapWeeklyPercent?: number;
   waitForCompletion: boolean;
   sessionOptions?: QueueSessionOptions;
   // Keep-warm-while-engaged: when set, the running owner adopts this as its new
@@ -262,6 +264,7 @@ export type QueueOwnerErrorMessage = {
   acp?: OutputErrorAcpPayload;
   effectiveAccount?: EffectiveAccountMetadata;
   automationCapacityReserved?: AutomationCapacityReservedDetail;
+  codexSubscriptionCap?: CodexSubscriptionCapDetail;
   outputAlreadyEmitted?: boolean;
 };
 
@@ -633,6 +636,9 @@ function parseSubmitRequest(
       ? { suppressSdkConsoleErrors: parsed.suppressSdkConsoleErrors }
       : {}),
     ...(parsed.promptRetries !== undefined ? { promptRetries: parsed.promptRetries } : {}),
+    ...(parsed.codexSubscriptionCapWeeklyPercent !== undefined
+      ? { codexSubscriptionCapWeeklyPercent: parsed.codexSubscriptionCapWeeklyPercent }
+      : {}),
     waitForCompletion: parsed.waitForCompletion,
     ...(parsed.sessionOptions !== undefined ? { sessionOptions: parsed.sessionOptions } : {}),
     ...(parsed.ttlMs !== undefined ? { ttlMs: parsed.ttlMs } : {}),
@@ -650,6 +656,7 @@ type ParsedSubmitRequestFields = Pick<
   | "permissionPolicy"
   | "suppressSdkConsoleErrors"
   | "promptRetries"
+  | "codexSubscriptionCapWeeklyPercent"
   | "waitForCompletion"
   | "sessionOptions"
   | "ttlMs"
@@ -671,6 +678,9 @@ function parseSubmitRequestFields(
     permissionPolicy: parseOptionalValue(request.permissionPolicy, isPermissionPolicy),
     suppressSdkConsoleErrors: parseOptionalBoolean(request.suppressSdkConsoleErrors),
     promptRetries: parseNonNegativeInteger(request.promptRetries),
+    codexSubscriptionCapWeeklyPercent: parseCapWeeklyPercent(
+      request.codexSubscriptionCapWeeklyPercent,
+    ),
     waitForCompletion:
       typeof request.waitForCompletion === "boolean" ? request.waitForCompletion : null,
     sessionOptions: parseSessionOptions(request.sessionOptions),
@@ -680,6 +690,15 @@ function parseSubmitRequestFields(
     return null;
   }
   return parsed as ParsedSubmitRequestFields;
+}
+
+function parseCapWeeklyPercent(value: unknown): number | undefined | null {
+  if (value == null) {
+    return undefined;
+  }
+  return typeof value === "number" && Number.isFinite(value) && value > 0 && value <= 100
+    ? value
+    : null;
 }
 
 function parseOptionalValue<T>(
@@ -1062,6 +1081,7 @@ function parseErrorOwnerMessage(
   const automationCapacityReserved = parseAutomationCapacityReservedDetail(
     message.automationCapacityReserved,
   );
+  const codexSubscriptionCap = parseCodexSubscriptionCapDetail(message.codexSubscriptionCap);
 
   return {
     type: "error",
@@ -1072,9 +1092,32 @@ function parseErrorOwnerMessage(
     message: message.message,
     retryable: typeof message.retryable === "boolean" ? message.retryable : undefined,
     acp: toAcpErrorPayload(message.acp),
-    ...(effectiveAccount === undefined ? {} : { effectiveAccount }),
-    ...(automationCapacityReserved == null ? {} : { automationCapacityReserved }),
-    ...(outputAlreadyEmitted === undefined ? {} : { outputAlreadyEmitted }),
+    ...optionalOwnerErrorDetails({
+      effectiveAccount,
+      automationCapacityReserved,
+      codexSubscriptionCap,
+      outputAlreadyEmitted,
+    }),
+  };
+}
+
+function optionalOwnerErrorDetails(params: {
+  effectiveAccount: EffectiveAccountMetadata | undefined;
+  automationCapacityReserved: AutomationCapacityReservedDetail | null | undefined;
+  codexSubscriptionCap: CodexSubscriptionCapDetail | null | undefined;
+  outputAlreadyEmitted: boolean | undefined;
+}): Partial<QueueOwnerErrorMessage> {
+  return {
+    ...(params.effectiveAccount === undefined ? {} : { effectiveAccount: params.effectiveAccount }),
+    ...(params.automationCapacityReserved == null
+      ? {}
+      : { automationCapacityReserved: params.automationCapacityReserved }),
+    ...(params.codexSubscriptionCap == null
+      ? {}
+      : { codexSubscriptionCap: params.codexSubscriptionCap }),
+    ...(params.outputAlreadyEmitted === undefined
+      ? {}
+      : { outputAlreadyEmitted: params.outputAlreadyEmitted }),
   };
 }
 
@@ -1123,6 +1166,46 @@ function parseAutomationCapacityReservedDetail(
   return detail as AutomationCapacityReservedDetail;
 }
 
+function parseCodexSubscriptionCapDetail(
+  value: unknown,
+): CodexSubscriptionCapDetail | null | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const detail = asRecord(value);
+  if (!detail || !hasCodexSubscriptionCapRequiredFields(detail)) {
+    return null;
+  }
+  if (!hasCodexSubscriptionCapOptionalFields(detail)) {
+    return null;
+  }
+  return detail as CodexSubscriptionCapDetail;
+}
+
+function hasCodexSubscriptionCapRequiredFields(value: Record<string, unknown>): boolean {
+  if (value.code !== "codex-subscription-cap" || value.providerSubmitted !== false) {
+    return false;
+  }
+  if (typeof value.weeklyCapPercent !== "number" || !Number.isFinite(value.weeklyCapPercent)) {
+    return false;
+  }
+  return ["at-cap", "stale", "elapsed", "absent", "read-failed"].includes(String(value.status));
+}
+
+function hasCodexSubscriptionCapOptionalFields(value: Record<string, unknown>): boolean {
+  if (
+    value.observedWeeklyPercent !== undefined &&
+    (typeof value.observedWeeklyPercent !== "number" ||
+      !Number.isFinite(value.observedWeeklyPercent))
+  ) {
+    return false;
+  }
+  return (
+    value.capturedAt === undefined ||
+    (typeof value.capturedAt === "string" && value.capturedAt.length > 0)
+  );
+}
+
 function isValidOwnerErrorCore(message: Record<string, unknown>): message is Record<
   string,
   unknown
@@ -1135,6 +1218,7 @@ function isValidOwnerErrorCore(message: Record<string, unknown>): message is Rec
     typeof message.message === "string" &&
     isOutputErrorCode(message.code) &&
     isOutputErrorOrigin(message.origin) &&
-    parseAutomationCapacityReservedDetail(message.automationCapacityReserved) !== null
+    parseAutomationCapacityReservedDetail(message.automationCapacityReserved) !== null &&
+    parseCodexSubscriptionCapDetail(message.codexSubscriptionCap) !== null
   );
 }
