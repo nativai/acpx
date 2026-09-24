@@ -4,6 +4,8 @@ import { InvalidArgumentError } from "commander";
 import type { Command } from "commander";
 import {
   DEFAULT_AGENT_NAME,
+  listKnownAgentSelectorNames,
+  normalizeAgentName,
   resolveAgentCommand as resolveAgentCommandFromRegistry,
 } from "../agent-registry.js";
 import type { SystemPromptOption } from "../runtime/engine/session-options.js";
@@ -920,6 +922,97 @@ export function resolveOutputPolicy(format: OutputFormat, jsonStrict: boolean): 
   };
 }
 
+// `--agent` is a RAW ACP command escape hatch, not a registry-name selector —
+// but its value reads exactly like one, and a caller who means "use the
+// built-in claude agent" naturally reaches for `--agent claude`. That value is
+// then spawned VERBATIM (never resolved through the registry), so if a
+// `claude`/`codex`/etc. binary happens to sit on PATH for unrelated reasons
+// (e.g. the interactive Claude Code CLI, not the ACP adapter), the CLI
+// silently launches the wrong process instead of the intended built-in agent —
+// which does not speak ACP and hangs the handshake forever. Refuse loudly
+// instead of guessing: this is the ONLY case worth refusing, because it is the
+// only raw value that can plausibly be a mistyped registry name rather than a
+// genuine custom command line (brick 618f1dbf).
+//
+// The known-name set is `listKnownAgentSelectorNames`, NOT `listBuiltInAgents`
+// — an alias (`factory-droid` -> `droid`) resolves to a real registry entry
+// exactly like a canonical name does, and a caller typing one plainly means
+// to select that agent, so it belongs in this same refuse-not-warn tier.
+// `listBuiltInAgents` alone would silently exclude every alias from this
+// check (measured: `--agent factory-droid` fell through to the weaker warn
+// tier), because that function's job is CLI subcommand registration, not
+// "what counts as a known agent name" — see its doc comment.
+function rejectAgentOverrideNamingKnownAgent(override: string, config: ResolvedAcpxConfig): void {
+  const knownAgentNames = new Set(
+    listKnownAgentSelectorNames(config.agents).map((name) => normalizeAgentName(name)),
+  );
+  if (!knownAgentNames.has(normalizeAgentName(override))) {
+    return;
+  }
+  throw new InvalidArgumentError(
+    `--agent "${override}" is a raw ACP command (escape hatch), not a built-in agent ` +
+      `selector, so it is not what you likely intended: it matches a known built-in agent ` +
+      `name and would be spawned verbatim rather than resolved. To use the built-in ` +
+      `"${override}" agent, put it first instead: \`acpx ${override} sessions new ...\`. ` +
+      `To launch a genuine custom ACP command that happens to share this name, pass its ` +
+      `full command line instead of the bare name (e.g. \`--agent './${override}'\`).`,
+  );
+}
+
+// A raw `--agent` override that does NOT collide with a known name (the exact
+// match above already refused those) is still spawned under an ASSUMED
+// identity: `agentName` falls back to config.defaultAgent / DEFAULT_AGENT_NAME
+// regardless of what the override actually launches, and that name (not the
+// command) is what model routing, --reasoning-effort / --output-style
+// compatibility checks, and credential/subscription selection key off of
+// downstream.
+//
+// Warn ONLY when the override is a single bare word with no path separator
+// (`looksLikeBareAgentName`) -- the exact shape a mistyped registry name
+// takes, and the exact shape that resolves via a PATH lookup rather than a
+// specific file (the mechanism behind brick 618f1dbf: a bare `claude` on PATH
+// is what silently became the wrong binary). A real command line -- anything
+// with a path separator or an argument -- is unambiguously deliberate: nobody
+// mistypes a registry name as `node /path/to/agent.js` or `./my-custom-server`
+// (both are the CLI's own documented escape-hatch examples), so warning on
+// those would just be noise on every legitimate custom-command invocation
+// without ever pointing at a real mistake.
+function looksLikeBareAgentName(value: string): boolean {
+  return !/[\s/\\]/.test(value);
+}
+
+function warnAgentOverrideIdentityAssumed(
+  override: string,
+  agentName: string,
+  jsonStrict: boolean | undefined,
+): void {
+  if (jsonStrict) {
+    return;
+  }
+  process.stderr.write(
+    `[acpx] --agent "${override}" is a raw command with no positional agent name, so acpx is ` +
+      `assuming agent identity "${agentName}" for model / --reasoning-effort / --output-style ` +
+      `routing and credential selection -- this may not describe the command actually being ` +
+      `launched. If "${override}" is meant to be one of acpx's built-in agents, use the ` +
+      `positional form instead (\`acpx <agent> ...\`); for a genuine custom command this ` +
+      `warning is expected and harmless.\n`,
+  );
+}
+
+// Groups the two override-only checks so resolveAgentInvocation's own
+// complexity stays flat regardless of how many of them there are.
+function handleAgentOverride(
+  override: string,
+  agentName: string,
+  globalFlags: GlobalFlags,
+  config: ResolvedAcpxConfig,
+): void {
+  rejectAgentOverrideNamingKnownAgent(override, config);
+  if (looksLikeBareAgentName(override)) {
+    warnAgentOverrideIdentityAssumed(override, agentName, globalFlags.jsonStrict);
+  }
+}
+
 export function resolveAgentInvocation(
   explicitAgentName: string | undefined,
   globalFlags: GlobalFlags,
@@ -933,12 +1026,14 @@ export function resolveAgentInvocation(
   if (override && explicitAgentName) {
     throw new InvalidArgumentError("Do not combine positional agent with --agent override");
   }
-
+  // explicitAgentName is necessarily undefined below: the combination above
+  // already threw.
   const agentName = explicitAgentName ?? config.defaultAgent ?? DEFAULT_AGENT_NAME;
-  const agentCommand =
-    override && override.length > 0
-      ? override
-      : resolveAgentCommandFromRegistry(agentName, config.agents);
+  if (override) {
+    handleAgentOverride(override, agentName, globalFlags, config);
+  }
+
+  const agentCommand = override || resolveAgentCommandFromRegistry(agentName, config.agents);
 
   return {
     agentName,

@@ -2347,6 +2347,89 @@ test("integration: gemini ACP startup timeout is surfaced as actionable error fo
   });
 });
 
+// brick 618f1dbf: before this timeout existed, ANY non-gemini agent command
+// that spawned successfully but never answered the ACP `initialize` handshake
+// (e.g. the wrong binary launched by a mistaken `--agent` value, or any
+// command that simply does not speak ACP) hung `sessions new` / `exec`
+// FOREVER -- no bound at all, unlike gemini's dedicated timeout above.
+// Measured incident: 3h46m idle event loop, zero output, until killed by
+// hand. This is the negative case: delete the generic timeout and this test
+// hangs until the outer `runCli` timeoutMs kills the harness itself, rather
+// than the CLI failing cleanly on its own.
+test("integration: generic agent startup timeout bounds a command that never answers initialize", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-hang-agent-"));
+    const fakeAgentPath = path.join(fakeBinDir, "fake-hang-agent");
+    const previousTimeout = process.env.ACPX_AGENT_STARTUP_TIMEOUT_MS;
+
+    try {
+      // Spawns fine, never writes a single ACP frame, never exits on its own
+      // -- indistinguishable, from acpx's side, from a real binary that
+      // simply does not speak ACP (exactly what a mistaken raw `--agent`
+      // command resolves to).
+      await fs.writeFile(fakeAgentPath, "#!/bin/sh\nsleep 60\n", {
+        encoding: "utf8",
+        mode: 0o755,
+      });
+      process.env.ACPX_AGENT_STARTUP_TIMEOUT_MS = "200";
+
+      const result = await runCli(
+        [
+          "--agent",
+          fakeAgentPath,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "exec",
+          "say exactly: hi",
+        ],
+        homeDir,
+        { timeoutMs: 10_000 },
+      );
+
+      assert.equal(result.code, 3, result.stderr);
+      const payloads = result.stdout
+        .trim()
+        .split("\n")
+        .filter((line) => line.trim().length > 0)
+        .map(
+          (line) =>
+            JSON.parse(line) as {
+              error?: { message?: string; data?: { acpxCode?: string; detailCode?: string } };
+            },
+        );
+      const timeoutError = payloads.find(
+        (payload) => payload.error?.data?.detailCode === "AGENT_STARTUP_TIMEOUT",
+      );
+      assert(timeoutError, result.stdout);
+      assert.equal(timeoutError.error?.data?.acpxCode, "TIMEOUT");
+      assert.match(timeoutError.error?.message ?? "", /initialize.*handshake completed/i);
+
+      // The spawned process must actually be gone -- not merely have its
+      // failure reported while it (and its held stdio pipes) keep running,
+      // which is the "never exited" half of the original incident.
+      await setTimeoutPromise(200);
+      const stillRunning = await new Promise<boolean>((resolve) => {
+        const probe = spawn("pgrep", ["-f", fakeAgentPath]);
+        probe.on("close", (code) => resolve(code === 0));
+        probe.on("error", () => resolve(false));
+      });
+      assert.equal(stillRunning, false, "fake agent process must be terminated after timeout");
+    } finally {
+      if (previousTimeout == null) {
+        delete process.env.ACPX_AGENT_STARTUP_TIMEOUT_MS;
+      } else {
+        process.env.ACPX_AGENT_STARTUP_TIMEOUT_MS = previousTimeout;
+      }
+      await fs.rm(fakeBinDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: built-in gemini falls back to --experimental-acp for Gemini CLI before 0.33.0", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));

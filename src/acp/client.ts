@@ -45,6 +45,7 @@ import {
   AgentDisconnectedError,
   AgentSpawnError,
   AgentStartupError,
+  AgentStartupTimeoutError,
   AuthPolicyError,
   ClaudeAcpSessionCreateTimeoutError,
   GeminiAcpStartupTimeoutError,
@@ -74,6 +75,7 @@ import type {
 } from "../types.js";
 import { enforcePermissionMode } from "../types.js";
 import {
+  buildAgentStartupTimeoutMessage,
   buildClaudeAcpSessionCreateTimeoutMessage,
   buildClaudeCodeOptionsMeta,
   buildGeminiAcpStartupTimeoutMessage,
@@ -86,6 +88,7 @@ import {
   isGeminiAcpCommand,
   isQoderAcpCommand,
   resolveAgentCloseAfterStdinEndMs,
+  resolveAgentStartupTimeoutMs,
   resolveClaudeAcpSessionCreateTimeoutMs,
   resolveClaudeCodeExecutable,
   resolveGeminiAcpStartupTimeoutMs,
@@ -1689,9 +1692,15 @@ export class AcpClient {
         version: "0.1.0",
       },
     });
-    const initialized = geminiAcp
-      ? await withTimeout(initializePromise, resolveGeminiAcpStartupTimeoutMs())
-      : await initializePromise;
+    // Every agent command's `initialize` handshake is bounded, gemini gets its
+    // own (tighter) timeout, every other command falls back to the generic
+    // one — never unbounded. Before this existed, a spawned process that never
+    // speaks ACP at all (wrong binary, interactive CLI waiting on stdin, ...)
+    // hung this await forever with nothing to catch it (brick 618f1dbf).
+    const timeoutMs = geminiAcp
+      ? resolveGeminiAcpStartupTimeoutMs()
+      : resolveAgentStartupTimeoutMs();
+    const initialized = await withTimeout(initializePromise, timeoutMs);
     await this.authenticateIfRequired(connection, initialized.authMethods ?? []);
     return initialized;
   }
@@ -1711,11 +1720,14 @@ export class AcpClient {
       params.child,
       params.startupStderr,
     );
-    try {
-      params.child.kill();
-    } catch {
-      // best effort
-    }
+    // A best-effort, unescalated `child.kill()` is not enough here: a process
+    // that hung the handshake in the first place (the exact shape this timeout
+    // exists to catch) may just as easily ignore or trap SIGTERM, in which case
+    // its stdio pipes stay open and keep acpx's own event loop alive — the
+    // "never exited" half of brick 618f1dbf. Reuse the same escalating
+    // SIGTERM->SIGKILL-plus-detach teardown the clean-close path already relies
+    // on, so a stuck child cannot strand this process either.
+    await this.terminateAgentProcess(params.child);
     if (params.launch.geminiAcp && error instanceof TimeoutError) {
       throw new GeminiAcpStartupTimeoutError(
         await buildGeminiAcpStartupTimeoutMessage(params.launch.spawnCommand),
@@ -1723,6 +1735,12 @@ export class AcpClient {
           cause: error,
           retryable: true,
         },
+      );
+    }
+    if (error instanceof TimeoutError) {
+      throw new AgentStartupTimeoutError(
+        buildAgentStartupTimeoutMessage(this.options.agentCommand, resolveAgentStartupTimeoutMs()),
+        { cause: error },
       );
     }
     throw normalizedError;

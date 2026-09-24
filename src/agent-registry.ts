@@ -466,3 +466,21 @@ export function resolveBuiltInAgentLaunch(
 export function listBuiltInAgents(overrides?: Record<string, string>): string[] {
   return Object.keys(mergeAgentRegistry(overrides));
 }
+
+/**
+ * Every string `resolveAgentCommand` recognizes as a real agent selector --
+ * registry keys (built-in + config overrides, from {@link listBuiltInAgents})
+ * PLUS every {@link AGENT_ALIASES} key. Deliberately a SEPARATE function from
+ * `listBuiltInAgents`, not a widening of it: that one drives CLI subcommand
+ * registration and its exact shape is pinned by
+ * `test/agent-registry.test.ts` ("preserves the required example prefix and
+ * alphabetical tail") for help-text ordering, so folding aliases into it
+ * would register them as their own top-level subcommands and reorder that
+ * pinned list for an unrelated reason. This is for a caller that needs "would
+ * this string be recognized as an agent at all" (e.g. refusing an ambiguous
+ * `--agent` override, brick 618f1dbf) — spread from `AGENT_ALIASES` directly,
+ * not enumerated, so an alias added there is covered here BY CONSTRUCTION.
+ */
+export function listKnownAgentSelectorNames(overrides?: Record<string, string>): string[] {
+  return [...new Set([...listBuiltInAgents(overrides), ...Object.keys(AGENT_ALIASES)])];
+}
