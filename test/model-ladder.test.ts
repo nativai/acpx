@@ -94,9 +94,12 @@ test("a claude session pinned to opus/fable reaches the top rung (max)", async (
 });
 
 test("a codex session pinned to a bracketed model id resolves the bare family's ceiling", async () => {
-  // gpt-5.5 is not in codexEffortCeiling's special-cased families, so it caps at
-  // "xhigh" (no "ultra") — real production logic, `harness-models.ts`.
   const rec = record("node /opt/codex-acp/dist/index.js", "gpt-5.5[xhigh]");
+  rec.acpx = {
+    ...rec.acpx,
+    current_model_id: "gpt-5.5[xhigh]",
+    available_models: ["gpt-5.5[low]", "gpt-5.5[medium]", "gpt-5.5[high]", "gpt-5.5[xhigh]"],
+  };
   const ladder = await resolveSessionModelLadder(rec, withRealCatalogue);
   assert.deepEqual(ladder.levels, ["low", "medium", "high", "xhigh"]);
 });

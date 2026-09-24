@@ -25,6 +25,8 @@ import {
   depthMechanismForAgentCommand,
   harnessIdForAgentCommand,
   harnessProvisionsModelCatalogue,
+  modelSelectionAuthorityForAgentCommand,
+  usesAdvertisedComposedModelCatalogue,
 } from "../acp/harness-capabilities.js";
 import { stripProviderPrefix } from "../acp/harness-config-dir.js";
 import { AcpxOperationalError } from "../errors.js";
@@ -255,6 +257,17 @@ function validationInputFor(
       : { reasoningEffort: params.reasoningEffort }),
     ...(depthFusedIntoId ? { assertBracketAsEffort: true } : {}),
   };
+}
+
+function shouldPrevalidateSessionModel(params: {
+  agentName: string | undefined;
+  agentCommand: string | undefined;
+}): boolean {
+  if (!isModelValidatedAgent(params.agentName, params.agentCommand)) {
+    return false;
+  }
+  const authority = modelSelectionAuthorityForAgentCommand(params.agentCommand);
+  return !usesAdvertisedComposedModelCatalogue(authority);
 }
 
 /**
@@ -712,7 +725,7 @@ export async function validateSessionModelFlags(params: {
   if (params.hasRawAgentOverride) {
     return undefined;
   }
-  if (!isModelValidatedAgent(params.agentName, params.agentCommand)) {
+  if (!shouldPrevalidateSessionModel(params)) {
     return undefined;
   }
   // Asked of the DESCRIPTOR, never of the agent NAME: it is the same predicate

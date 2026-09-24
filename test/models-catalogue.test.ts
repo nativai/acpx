@@ -249,14 +249,11 @@ test("merge: harness-native rows are in the SAME array, with the same descriptor
   ]);
 });
 
-test("merge: codex families are mandatory-depth, because a bare family is rejected", () => {
-  const sol = harnessNativeModels().find((m) => m.key === "chatgpt:gpt-5.6-sol");
-  assert.equal(sol?.depth.kind === "ladder" ? sol.depth.mandatory : false, true);
-  assert.equal(sol?.depth.kind === "ladder" ? sol.depth.default : null, "medium");
-  // Sol reaches ultra; the 5.4 tier stops at xhigh.
-  assert.ok(sol?.depth.kind === "ladder" && sol.depth.levels.includes("ultra"));
-  const mini = harnessNativeModels().find((m) => m.key === "chatgpt:gpt-5.4-mini");
-  assert.ok(mini?.depth.kind === "ladder" && !mini.depth.levels.includes("ultra"));
+test("merge: codex has no static native rows; its ACP advertisement is authoritative", () => {
+  assert.deepEqual(
+    harnessNativeModels().filter((model) => model.source === "chatgpt"),
+    [],
+  );
 });
 
 /**
@@ -296,23 +293,6 @@ test("merge: codex families are mandatory-depth, because a bare family is reject
  * If it ever needs to LOSE a row, something happened that is worth understanding
  * before editing the constant.
  */
-test("codex families are exactly the set the measured adapter advertises", () => {
-  assert.deepEqual(
-    harnessNativeModels()
-      .filter((model) => model.source === "chatgpt")
-      .map((model) => model.id),
-    [
-      "gpt-5.6-sol",
-      "gpt-6-astra",
-      "gpt-5.6-terra",
-      "gpt-5.6-luna",
-      "gpt-5.5",
-      "gpt-5.4-mini",
-      "gpt-5.3-codex-spark",
-    ],
-  );
-});
-
 test("merge: one id under two sources is two rows with two keys (C5 D2)", () => {
   const rows = harnessNativeModels().filter((m) => m.id === "opus");
   assert.deepEqual(rows.map((m) => m.key).toSorted(), [

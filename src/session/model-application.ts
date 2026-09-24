@@ -2,10 +2,14 @@ import type { SessionConfigOption, SessionModeState } from "@agentclientprotocol
 import type { SessionCreateResult } from "../acp/client.js";
 import {
   harnessIdForAgentCommand,
+  modelSelectionAuthorityForAgentCommand,
   resolveHarnessCapabilities,
+  usesAdvertisedComposedModelCatalogue,
 } from "../acp/harness-capabilities.js";
 import {
   assertRequestedModelSupported,
+  projectAdvertisedComposedModels,
+  resolveAdvertisedComposedModel,
   RequestedModelUnsupportedError,
 } from "../acp/model-support.js";
 import { withTimeout } from "../async-control.js";
@@ -104,6 +108,7 @@ export interface ModelApplyClient {
  */
 export interface ModelApplyOutcome {
   applied: boolean;
+  effectiveModelId?: string;
   refreshedConfigOptions?: SessionConfigOption[];
 }
 
@@ -111,6 +116,7 @@ interface ModelApplyParams {
   client: ModelApplyClient;
   sessionId: string;
   requestedModel: string | undefined;
+  reasoningEffort?: string;
   models: SessionCreateResult["models"];
   agentCommand?: string;
   timeoutMs?: number;
@@ -138,6 +144,26 @@ interface ModelApplyParams {
    * possible; they are ONE function now so they cannot answer differently again.
    */
   context?: "apply" | "replay";
+}
+
+function requestedModelForApply(
+  params: ModelApplyParams,
+  rawRequested: string,
+  guardedModel: string | undefined,
+): string {
+  const authority = modelSelectionAuthorityForAgentCommand(params.agentCommand);
+  if (
+    usesAdvertisedComposedModelCatalogue(authority) &&
+    params.models &&
+    projectAdvertisedComposedModels(params.models).length > 0
+  ) {
+    return resolveAdvertisedComposedModel({
+      requestedModel: rawRequested,
+      reasoningEffort: params.reasoningEffort,
+      models: params.models,
+    });
+  }
+  return guardedModel ?? rawRequested;
 }
 
 /**
@@ -194,9 +220,10 @@ export async function applyRequestedModelIfAdvertised(
     modelSource: params.modelSource,
     availableModels: params.models?.availableModels.map((model) => model.modelId),
   });
-  const requestedModel = guarded.model ?? rawRequested;
+  const requestedModel = requestedModelForApply(params, rawRequested, guarded.model);
 
-  return await applyModelAsSetModel(params, requestedModel, guarded.forced);
+  const outcome = await applyModelAsSetModel(params, requestedModel, guarded.forced);
+  return outcome.applied ? { ...outcome, effectiveModelId: requestedModel } : outcome;
 }
 
 /** The generic path: claude, claude-pty, codex and pi. */

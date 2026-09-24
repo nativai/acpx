@@ -143,3 +143,23 @@ test("the always-truthy trap: an unapplied outcome is still an object", async ()
   assert.ok(outcome, "the outcome object is truthy even when nothing was applied");
   assert.deepEqual(client.wire, []);
 });
+
+test("codex applies and returns the effective id from its live advertised ladder", async () => {
+  const client = mockClient();
+  const outcome = await applyRequestedModelIfAdvertised({
+    client,
+    sessionId: "ses_new_family",
+    requestedModel: "gpt-7-nova",
+    reasoningEffort: "max",
+    models: {
+      currentModelId: "gpt-7-nova[low]",
+      availableModels: [
+        { modelId: "gpt-7-nova[low]", name: "Nova low" },
+        { modelId: "gpt-7-nova[max]", name: "Nova max" },
+      ],
+    } as never,
+    agentCommand: CODEX,
+  });
+  assert.deepEqual(outcome, { applied: true, effectiveModelId: "gpt-7-nova[max]" });
+  assert.deepEqual(client.wire, [{ kind: "set_model", value: "gpt-7-nova[max]" }]);
+});

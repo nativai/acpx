@@ -1590,6 +1590,41 @@ export function depthMechanismForAgentCommand(
   return harness === undefined ? undefined : HARNESS_FACTS[harness].depth.mechanism;
 }
 
+export type ModelSelectionAuthority = Readonly<{
+  modelCatalogue: ModelCatalogue;
+  modelMechanism: ModelMechanism;
+  depthLadder: DepthLadder;
+  depthMechanism: DepthMechanism;
+}>;
+
+/** The descriptor-owned authority for model/depth selection on this adapter. */
+export function modelSelectionAuthorityForAgentCommand(
+  agentCommand: string | undefined,
+): ModelSelectionAuthority | undefined {
+  const harness = harnessIdForAgentCommand(agentCommand);
+  if (harness === undefined) {
+    return undefined;
+  }
+  const facts = HARNESS_FACTS[harness];
+  return {
+    modelCatalogue: facts.model.catalogue,
+    modelMechanism: facts.model.mechanism,
+    depthLadder: facts.depth.ladder,
+    depthMechanism: facts.depth.mechanism,
+  };
+}
+
+export function usesAdvertisedComposedModelCatalogue(
+  authority: ModelSelectionAuthority | undefined,
+): boolean {
+  return (
+    authority?.modelCatalogue === "acp" &&
+    authority.modelMechanism === "compose-into-id" &&
+    authority.depthLadder === "per-model" &&
+    authority.depthMechanism === "compose-into-id"
+  );
+}
+
 /**
  * Whether acpx has an apply path for `mechanism` today — the routing half of
  * every derived capability, exposed so an apply path can ask the same question

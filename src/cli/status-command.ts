@@ -2,6 +2,10 @@ import type { SessionConfigOption } from "@agentclientprotocol/sdk";
 import { Command } from "commander";
 import { harnessIdForAgentCommand } from "../acp/harness-capabilities.js";
 import {
+  projectAdvertisedComposedModels,
+  type AdvertisedComposedModel,
+} from "../acp/model-support.js";
+import {
   findProfile,
   isSubscriptionProfileLocked,
   loadProfileRegistry,
@@ -144,6 +148,7 @@ function printMissingStatus(format: ResolvedAcpxConfig["format"], agentCommand: 
   process.stdout.write("status: no-session\n");
   process.stdout.write("model: -\n");
   process.stdout.write("availableModels: -\n");
+  process.stdout.write("advertisedModelCatalogue: -\n");
   process.stdout.write("mode: -\n");
   process.stdout.write("reasoningEffort: -\n");
   process.stdout.write("reasoningEffortLive: -\n");
@@ -194,6 +199,7 @@ async function createStatusPayload(
     model: acpx.model,
     mode: acpx.mode,
     availableModels: acpx.availableModels,
+    advertisedModelCatalogue: acpx.advertisedModelCatalogue,
     reasoningEffort: acpx.reasoningEffort,
     reasoningEffortLive: acpx.reasoningEffortLive,
     effortLadder: acpx.effortLadder,
@@ -310,10 +316,34 @@ function statusCredential(record: SessionRecord): StatusCredentialPayload | null
 
 type StatusServedPayload = { model: string | null; effort: string | null; at: string | null };
 
+type StatusAdvertisedModelCatalogue = {
+  source: "acp";
+  availability: "adapter-advertised";
+  accountAllowed: null;
+  models: AdvertisedComposedModel[];
+};
+
+function advertisedModelCatalogue(
+  acpx: NonNullable<SessionRecord["acpx"]>,
+): StatusAdvertisedModelCatalogue | null {
+  const availableModels = acpx.available_models;
+  if (!availableModels) {
+    return null;
+  }
+  const models = projectAdvertisedComposedModels({
+    currentModelId: acpx.current_model_id ?? "",
+    availableModels: availableModels.map((modelId) => ({ modelId, name: modelId })),
+  });
+  return models.length > 0
+    ? { source: "acp", availability: "adapter-advertised", accountAllowed: null, models }
+    : null;
+}
+
 export async function statusAcpxFields(record: SessionRecord): Promise<{
   model: string | null;
   mode: string | null;
   availableModels: string[] | null;
+  advertisedModelCatalogue: StatusAdvertisedModelCatalogue | null;
   reasoningEffort: string | null;
   reasoningEffortLive: string | null;
   // The generic per-harness UNION `config_options` advertises — every rung ANY
@@ -366,6 +396,7 @@ export async function statusAcpxFields(record: SessionRecord): Promise<{
       model: null,
       mode: null,
       availableModels: null,
+      advertisedModelCatalogue: null,
       reasoningEffort: null,
       reasoningEffortLive: null,
       effortLadder: null,
@@ -389,6 +420,7 @@ export async function statusAcpxFields(record: SessionRecord): Promise<{
     model: optionalStatusString(acpx.current_model_id),
     mode: optionalStatusString(acpx.current_mode_id),
     availableModels: optionalStatusStringList(acpx.available_models),
+    advertisedModelCatalogue: advertisedModelCatalogue(acpx),
     // Intent (the authoritative per-session signal) + the adapter's advertised
     // live value. NOTE: on the deployed claude adapter the live snapshot is the
     // model default and may not track a per-session set — prefer the intent.
@@ -644,6 +676,7 @@ type StatusPayload = {
   model: string | null;
   mode: string | null;
   availableModels: string[] | null;
+  advertisedModelCatalogue: StatusAdvertisedModelCatalogue | null;
   reasoningEffort: string | null;
   reasoningEffortLive: string | null;
   effortLadder: string[] | null;
@@ -696,6 +729,7 @@ function statusJsonPayload(
   assignDefinedJsonField(result, "model", payload.model);
   assignDefinedJsonField(result, "mode", payload.mode);
   assignDefinedJsonField(result, "availableModels", payload.availableModels);
+  assignDefinedJsonField(result, "advertisedModelCatalogue", payload.advertisedModelCatalogue);
   assignDefinedJsonField(result, "reasoningEffort", payload.reasoningEffort);
   assignDefinedJsonField(result, "reasoningEffortLive", payload.reasoningEffortLive);
   assignDefinedJsonField(result, "effortLadder", payload.effortLadder);
@@ -741,6 +775,10 @@ function listOrDash(value: string[] | null): string {
   return value && value.length > 0 ? value.join(", ") : "-";
 }
 
+function advertisedModelCatalogueText(value: StatusAdvertisedModelCatalogue | null): string {
+  return value ? JSON.stringify(value) : "-";
+}
+
 function printTextStatus(payload: StatusPayload, dead: boolean): void {
   process.stdout.write(`session: ${payload.sessionId}\n`);
   if ("agentSessionId" in payload) {
@@ -751,6 +789,9 @@ function printTextStatus(payload: StatusPayload, dead: boolean): void {
   process.stdout.write(`status: ${payload.status}\n`);
   process.stdout.write(`model: ${orDash(payload.model)}\n`);
   process.stdout.write(`availableModels: ${listOrDash(payload.availableModels)}\n`);
+  process.stdout.write(
+    `advertisedModelCatalogue: ${advertisedModelCatalogueText(payload.advertisedModelCatalogue)}\n`,
+  );
   process.stdout.write(`mode: ${orDash(payload.mode)}\n`);
   process.stdout.write(`reasoningEffort: ${orDash(payload.reasoningEffort)}\n`);
   process.stdout.write(`reasoningEffortLive: ${orDash(payload.reasoningEffortLive)}\n`);
