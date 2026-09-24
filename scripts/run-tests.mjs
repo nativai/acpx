@@ -21,6 +21,7 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
+import http from "node:http";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -50,6 +51,35 @@ const IDLE_RELEASE_MS = "60000";
 
 function log(line) {
   process.stderr.write(`[acpx-test-reaper] ${line}\n`);
+}
+
+const CODEX_QUOTA_TEST_PORT = 3456;
+
+async function startCodexQuotaFixture() {
+  const server = http.createServer((request, response) => {
+    if (request.url !== "/api/usage/codex/quota") {
+      response.writeHead(404).end();
+      return;
+    }
+    response.writeHead(200, { "content-type": "application/json" }).end(
+      JSON.stringify({
+        capturedAt: new Date().toISOString(),
+        secondary: { windowMinutes: 10_080, usedPercent: 0, elapsed: false },
+      }),
+    );
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(CODEX_QUOTA_TEST_PORT, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  return server;
+}
+
+async function stopServer(server) {
+  await new Promise((resolve) => server.close(resolve));
 }
 
 async function loadReaper() {
@@ -106,6 +136,8 @@ log(
   `run=${runTag} idle_release_ms=${env.ACPX_OWNER_IDLE_RELEASE_MS} node_test_args=${String(args.length)}`,
 );
 
+const codexQuotaFixture = await startCodexQuotaFixture();
+
 const child = spawn(
   process.execPath,
   ["--test", "--import", pathToFileURL(preloadPath).href, ...args],
@@ -122,14 +154,18 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 
 child.on("error", (error) => {
   log(`FATAL — could not start node --test: ${String(error)}`);
-  process.exit(2);
+  void stopServer(codexQuotaFixture).finally(() => process.exit(2));
 });
 
 child.on("exit", (code, signal) => {
   // Captured BEFORE the sweep. Nothing below may change it.
   const rc = code ?? 1;
   void (async () => {
-    await sweepRunTag(runTag);
+    try {
+      await sweepRunTag(runTag);
+    } finally {
+      await stopServer(codexQuotaFixture);
+    }
     if (signal !== null) {
       log(`node --test was terminated by ${signal}`);
     }
