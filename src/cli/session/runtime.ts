@@ -78,8 +78,8 @@ import {
 import { withDefaultModelForNewSession } from "../../session/default-model.js";
 import {
   buildDeliveryEvent,
+  deliveryTerminalWarning,
   hasCompletedDeliveryFor,
-  zeroAgentOutputWarning,
   type DeliveryEventError,
   type DeliveryPhase,
   type DeliveryStopReason,
@@ -1829,14 +1829,18 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     if (phase === "accepted") {
       context.framesAtStart = sessionUpdateFrameCount;
     }
-    // Zero-output detection — the SINGLE decision every terminal path shares
-    // (zeroAgentOutputWarning in delivery-events.ts; full narrowness rationale
-    // lives there). A `done` terminal for a genuine completion whose window
-    // observed ZERO session/update frames is the 5.5 h wedge signature.
-    const warning = zeroAgentOutputWarning({
+    // Delivery-terminal warning — the SINGLE decision every terminal path
+    // shares (deliveryTerminalWarning in delivery-events.ts; full narrowness
+    // rationale lives there). A `steered: true` terminal always reports
+    // "steered into active turn" (brick 7ada04b9 — it is never a genuine
+    // completion, however many cosmetic frames its ack produced); otherwise a
+    // `done` terminal for a genuine completion whose window observed ZERO
+    // session/update frames is the original 5.5 h wedge signature.
+    const warning = deliveryTerminalWarning({
       terminal,
       phase,
       stopReason: params.stopReason,
+      steered: params.steered,
       framesAtStart: context.framesAtStart,
       framesAtTerminal: sessionUpdateFrameCount,
     });
@@ -1891,6 +1895,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     params: {
       stopReason?: DeliveryStopReason;
       error?: DeliveryEventError;
+      /** brick ddd76838 — forward the adapter's steer-ack flag onto the terminal. */
+      steered?: boolean;
     } = {},
   ): Promise<void> => {
     await appendDeliveryEvent(context, phase, {
