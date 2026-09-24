@@ -54,7 +54,6 @@ test("via-shim is routed today, and the route asks the SHIPPED array", () => {
   // Harnesses whose backend is genuinely fixed must never route, whatever the
   // array says — the support field is the first term of the AND.
   assert.equal(harnessRoutesModelViaShim("codex"), false);
-  assert.equal(harnessRoutesModelViaShim("claude-pty"), false);
   assert.equal(harnessRoutesModelViaShim(undefined), false);
 });
 

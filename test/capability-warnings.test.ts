@@ -38,7 +38,6 @@ test("depth routability is answered for EVERY declared harness, and in both dire
     HARNESS_IDS.map((id) => [id, HARNESS_FACTS[id].depth.mechanism, isDepthRequestRoutable(id)]),
     [
       ["claude", "config-option", true],
-      ["claude-pty", "config-option", true],
       // ⚠️ codex: depth rides INSIDE the model id, so the depth control cannot
       // move it. It must KEEP warning — this is `G1-WRN-01`'s positive control,
       // the thing that separates "made it a capability check" from "deleted the
@@ -113,7 +112,6 @@ test("output-style support is a descriptor read, and only the Claude family has 
     HARNESS_IDS.map((id) => [id, resolveHarnessCapabilities(id).supportsOutputStyles]),
     [
       ["claude", true],
-      ["claude-pty", true],
       ["codex", false],
       ["pi", false],
     ],

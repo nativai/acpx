@@ -98,7 +98,7 @@ test("codex record 019edbeb-53e3 (bracketed model id, no desired_config_options)
   assert.equal(resolveReasoningEffort(rec, harness), "xhigh");
 });
 
-test("claude-pty record 407c1e4d (desired_config_options.effort = max) is UNCHANGED by the per-harness dispatch", () => {
+test("claude-pty record 407c1e4d falls through the removed capability descriptor", () => {
   const rec = record({
     acpxRecordId: "407c1e4d-5104-48eb-b497-c103b8cebb69",
     agentCommand: "node /opt/claude-pty-acp/dist/index.js",
@@ -112,7 +112,7 @@ test("claude-pty record 407c1e4d (desired_config_options.effort = max) is UNCHAN
     },
   });
   const harness = harnessIdForAgentCommand(rec.agentCommand);
-  assert.equal(harness, "claude-pty");
+  assert.equal(harness, undefined);
   assert.equal(resolveReasoningEffort(rec, harness), "max");
 });
 

@@ -1351,8 +1351,8 @@ test("F-12: an unclassifiable agent gets NO claim, not a false one", () => {
   );
 });
 
-test("F-12 GUARDRAIL: claude and codex keep their declared answer", () => {
-  for (const id of ["claude", "claude-pty", "codex"] as const) {
+test("F-12 GUARDRAIL: declared non-Pi harnesses keep their declared answer", () => {
+  for (const id of ["claude", "codex"] as const) {
     const record = {
       acpxRecordId: `rec-f12-${id}`,
       agentCommand: AGENT_REGISTRY[id],

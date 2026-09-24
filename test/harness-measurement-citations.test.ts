@@ -326,11 +326,11 @@ test("4791a88c: the anti-drift check GOES RED on a stale citation — each way i
 test("4791a88c: the two harnesses whose adapter and CLI move apart cite both", () => {
   // pi-acp is not pi, and codex-acp is not the codex CLI. Two things that go
   // stale independently must both be named, or one moves while the citation
-  // still looks current. (claude/claude-pty are single artifacts, so
-  // `harness` is legitimately absent there — asserted, not assumed.)
+  // still looks current. (claude is a single artifact, so `harness` is
+  // legitimately absent there — asserted, not assumed.)
   assert.ok(HARNESS_FACTS.pi.measuredAgainst.harness, "pi cites no underlying pi version");
   assert.ok(HARNESS_FACTS.codex.measuredAgainst.harness, "codex cites no underlying codex CLI");
-  for (const id of ["claude", "claude-pty"] as const) {
+  for (const id of ["claude"] as const) {
     assert.equal(
       HARNESS_FACTS[id].measuredAgainst.harness,
       undefined,

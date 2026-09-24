@@ -22,7 +22,6 @@ import { AGENT_REGISTRY } from "../src/agent-registry.js";
 
 const COMMANDS: Record<HarnessId, string> = {
   claude: AGENT_REGISTRY.claude,
-  "claude-pty": AGENT_REGISTRY["claude-pty"],
   codex: AGENT_REGISTRY.codex,
   pi: AGENT_REGISTRY.pi,
 };
@@ -44,7 +43,6 @@ test("EVERY declared harness is covered by exactly one of {refuse, proceed} — 
 
   assert.deepEqual(verdicts, [
     ["claude", false, "exact"],
-    ["claude-pty", false, "exact"],
     // ⚠️ FALSE, and deliberately so. See the file header.
     ["codex", false, "turn-granular"],
     // ⚠️ PI MOVED FROM {refuse, "unsupported"} TO {proceed, "exact"} WHEN THE
@@ -93,7 +91,7 @@ test("the effective index is the LANDED one — odd requests round down on codex
   // re-derives the arithmetic is itself a consumer that has drifted from the
   // table — which is the drift the descriptor exists to end (row `G1-FRK-02`).
   for (const requested of [0, 1, 2, 3, 6, 7]) {
-    for (const id of ["claude", "claude-pty", "codex"] as const) {
+    for (const id of ["claude", "codex"] as const) {
       assert.equal(
         resolveEffectiveForkIndex(COMMANDS[id], requested),
         resolveForkLandingIndex(HARNESS_FACTS[id].fork, requested) ?? requested,
@@ -112,7 +110,6 @@ test("the effective index is the LANDED one — odd requests round down on codex
   assert.equal(resolveEffectiveForkIndex(COMMANDS.codex, 2), 2);
   // Claude is exact at every index, odd included.
   assert.equal(resolveEffectiveForkIndex(COMMANDS.claude, 7), 7);
-  assert.equal(resolveEffectiveForkIndex(COMMANDS["claude-pty"], 7), 7);
 });
 
 test("an unknown agent command falls back to the request — the best claim acpx can honestly make", () => {

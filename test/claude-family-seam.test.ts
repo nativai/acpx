@@ -50,10 +50,10 @@ test("isClaudeFamilyAgent classifies EVERY harness this fleet launches, from the
   assert.equal(isClaudeFamilyAgent(AGENT_REGISTRY.pi), false);
   assert.equal(isClaudeFamilyAgent(AGENT_REGISTRY.pi), false);
 
-  // And the descriptor's five harness ids are exactly the five the seam has to
-  // answer for — if a sixth is declared, this test names it rather than letting
+  // And the descriptor's declared harness ids are exactly the ones the seam has
+  // to answer for — if another is declared, this test names it rather than letting
   // it fall silently into whichever branch the predicate happens to take.
-  assert.deepEqual([...HARNESS_IDS], ["claude", "claude-pty", "codex", "pi"]);
+  assert.deepEqual([...HARNESS_IDS], ["claude", "codex", "pi"]);
 });
 
 test("isClaudeFamilyAgent recognises a dev-override claude command, not just the /opt one", () => {

@@ -147,11 +147,17 @@ test("the wire id AGREES with what `sessions new` would actually spawn", () => {
       checked += 1;
     }
   }
-  // The subject-witness: a vacuous loop would pass this test silently. The
-  // native rows alone guarantee one available seat per harness that has any.
+  // The subject-witness: a vacuous loop would pass this test silently. Count
+  // native rows only when they target a declared capability harness: the model
+  // catalogue intentionally retains Claude-PTY credential-source rows after
+  // Claude-PTY left HARNESS_IDS.
+  const declaredHarnessIds = new Set<string>(HARNESS_IDS);
+  const declaredNativeModels = harnessNativeModels().filter((model) =>
+    model.agentTypes.some((id) => declaredHarnessIds.has(id)),
+  );
   assert.ok(
-    checked >= harnessNativeModels().length,
-    `only ${checked} (model, agent) seats checked`,
+    checked >= declaredNativeModels.length,
+    `only ${checked} declared (model, agent) seats checked`,
   );
 });
 

@@ -155,7 +155,7 @@ test("acpx agents --json prints the {agents: [...]} envelope", async () => {
   const agents = parsed.agents as Array<Record<string, unknown>>;
   assert.deepEqual(
     agents.map((agent) => agent.id),
-    ["claude", "claude-pty", "codex", "pi"],
+    ["claude", "codex", "pi"],
   );
   for (const agent of agents) {
     // The C5 §8.4 + C4 §8 field set the consumers gate on.
@@ -219,7 +219,7 @@ test("acpx agents list is the same payload as the bare noun", async () => {
 test("the text form renders a table naming each harness and its mechanism", async () => {
   const stdout = await runAgents([]);
   assert.equal(stdout.includes("No acpx session found"), false);
-  for (const id of ["claude", "claude-pty", "codex", "pi"]) {
+  for (const id of ["claude", "codex", "pi"]) {
     assert.ok(stdout.includes(id), `text output does not mention ${id}`);
   }
   assert.ok(stdout.includes("FORK@INDEX"), "the text form is not a table");

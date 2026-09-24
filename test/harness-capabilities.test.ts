@@ -28,12 +28,11 @@ import { AGENT_REGISTRY } from "../src/agent-registry.js";
 import { applyRequestedModelIfAdvertised } from "../src/session/model-application.js";
 
 // The command strings acpx's registry launches by default, written out here
-// rather than read from AGENT_REGISTRY for claude/codex/claude-pty: those three
+// rather than read from AGENT_REGISTRY for claude/codex: both
 // entries are env-overridable (ACPX_*_ACP_COMMAND), and a test that read the env
 // would measure the box instead of the product.
 const DEFAULT_AGENT_COMMANDS: Record<HarnessId, string> = {
   claude: "node /opt/claude-agent-acp/dist/index.js",
-  "claude-pty": "node /opt/claude-pty-acp/dist/index.js",
   codex: "node /opt/codex-acp/dist/index.js",
   pi: AGENT_REGISTRY.pi,
 };
@@ -50,7 +49,7 @@ function selectOption(id: string): SessionConfigOption {
 }
 
 test("the table declares exactly the program harnesses", () => {
-  assert.deepEqual([...HARNESS_IDS], ["claude", "claude-pty", "codex", "pi"]);
+  assert.deepEqual([...HARNESS_IDS], ["claude", "codex", "pi"]);
   assert.deepEqual(
     listHarnessCapabilities().map((capability) => capability.id),
     [...HARNESS_IDS],
@@ -380,8 +379,8 @@ test("the config-file cell is the GATE on adapter env, so its population is pinn
     HARNESS_IDS.filter((id) => HARNESS_FACTS[id].primerChannel === "config-file"),
     ["pi"],
   );
-  // And the three the program requires untouched are NOT in it.
-  for (const id of ["claude", "claude-pty", "codex"] as const) {
+  // And the two declared non-Pi harnesses are NOT in it.
+  for (const id of ["claude", "codex"] as const) {
     assert.notEqual(HARNESS_FACTS[id].primerChannel, "config-file", id);
   }
 });
@@ -395,7 +394,7 @@ test("no descriptor entry carries a permission field — asserted on a populated
   // POSITIVE CONTROL, in the same assertion: the object under test is populated
   // and a field that MUST be present parses out. Without this, an instrument
   // pointed at [] or null would report "no permission field" and pass.
-  assert.ok(capabilities.length >= 4);
+  assert.ok(capabilities.length >= 3);
   for (const capability of capabilities) {
     assert.ok(
       typeof capability.fork.atIndex === "string" && capability.fork.atIndex.length > 0,
@@ -649,13 +648,13 @@ const CAPABILITY_REASON_PAIRS = [
 
 const NOT_MEASURED = "not measured:";
 
-test("all six keys are PRESENT on all five blocks, and every boolean is a real boolean", () => {
+test("all six keys are PRESENT on all declared blocks, and every boolean is a real boolean", () => {
   const capabilities = listHarnessCapabilities();
 
   // POSITIVE CONTROL, in the same assertion and in the same shape as the
   // permission-field test above: an instrument pointed at [] or at rows missing
   // their populated cells would report "all present" while examining nothing.
-  assert.equal(capabilities.length, 4);
+  assert.equal(capabilities.length, 3);
   for (const capability of capabilities) {
     assert.ok(
       typeof capability.label === "string" && capability.label.length > 0,
@@ -880,28 +879,17 @@ test("no non-Claude-family harness may declare supportsModelDegrade", () => {
   assert.equal(HARNESS_FACTS.claude.supportsModelDegrade, true); // control: the loop had a subject
 });
 
-test("the three cells are per-harness FACTS, not one answer repeated", () => {
-  // The defect being fixed was that all three were `agentType === "claude"`. If a
-  // future edit collapses them back onto one answer, this goes red: the three
-  // fields must not agree across all five harnesses.
+test("the three cells retain their per-harness capability pins", () => {
+  // With the Claude-PTY row removed, the three current arrays intentionally
+  // agree. The row pins below retain the per-capability contract without
+  // claiming a distinction that no longer exists in the declared roster.
   const rows = listHarnessCapabilities();
-  const clear = rows.map((row) => row.supportsSessionClear);
-  const credential = rows.map((row) => row.canSetCredentialLive);
-  const degrade = rows.map((row) => row.supportsModelDegrade);
-  assert.notDeepEqual(
-    clear,
-    credential,
-    "supportsSessionClear and canSetCredentialLive answer identically for all five harnesses — that is the collapsed name check returning",
-  );
-  assert.deepEqual(clear, degrade); // both are claude-only TODAY; see the row pins below
-
-  // And the per-harness pins, so a silent flip of any one cell is a red rather
-  // than a diff nobody reads. Each cites where its value comes from.
+  // The per-harness pins make a silent flip of any cell a red rather than a
+  // diff nobody reads. Each cites where its value comes from.
   assert.deepEqual(
     rows.map((row) => [row.id, row.supportsSessionClear] as const),
     [
       ["claude", true], // Claude Code 2.1.251 defines the `/clear` slash command
-      ["claude-pty", false], // not measured: prompt→TUI slash execution unprobed
       ["codex", false], // not measured
       ["pi", false], // not measured, and fork-vs-upstream dependent
     ],
@@ -910,7 +898,6 @@ test("the three cells are per-harness FACTS, not one answer repeated", () => {
     rows.map((row) => [row.id, row.canSetCredentialLive] as const),
     [
       ["claude", true], // Claude-family seam + subscription anchor
-      ["claude-pty", true], // Claude-family seam + claude-home anchor
       ["codex", false], // seam refuses; chatgpt has no transcript anchor
       ["pi", false], // box-provider credential; no AuthMode maps to it
     ],
@@ -919,7 +906,6 @@ test("the three cells are per-harness FACTS, not one answer repeated", () => {
     rows.map((row) => [row.id, row.supportsModelDegrade] as const),
     [
       ["claude", true], // brick://4d517be2, the harness the path was built for
-      ["claude-pty", false], // not measured: gate admits it, trigger looks unreachable
       ["codex", false], // chatgpt profile never enters the failover engine
       ["pi", false], // non-Claude adapter never enters the failover engine
     ],
