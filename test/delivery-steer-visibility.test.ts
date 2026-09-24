@@ -1,26 +1,39 @@
-// brick ddd76838 — a delivery must never record a CLEAN SUCCESS for a delivery
-// whose window observed nothing, and a steered delivery must not read as a
-// completed turn of its own.
+// brick ddd76838 / 7ada04b9 — a delivery must never record a CLEAN SUCCESS for a
+// delivery whose window observed nothing, and a steered delivery must not read
+// as a completed turn of its own.
 //
 // The 5.5 h wedge RCA: a pi steer-ack (`end_turn` + `_meta.piAcp.steered`, ZERO
 // `session/update` frames) was recorded by acpx as a clean `done` — every layer
 // read its own blind spot. The fix is two additive terminal annotations, both
-// READS OF DATA ALREADY ON THE WIRE:
+// READS OF DATA ALREADY ON THE WIRE, sharing one `warning` wire field:
 //
+//   • `warning: "steered into active turn"` — ANY `done` terminal carrying
+//     `steered: true`, unconditionally, regardless of frame count.
 //   • `warning: "completed with no agent output"` — a `done` terminal for a
-//     GENUINE completion whose delivery window observed ZERO session/update
-//     frames (window = frames between the delivery's `accepted` event and its
-//     terminal).
+//     GENUINE (non-steered) completion whose delivery window observed ZERO
+//     session/update frames (window = frames between the delivery's `accepted`
+//     event and its terminal).
 //   • `steered: true` — the adapter's `_meta.piAcp.steered` forwarded onto the
 //     terminal; `stopReason` STAYS `end_turn` (the union and the dedup keyed on
 //     it are unchanged).
+//
+// 2026-09-24 RECURRENCE: pi-acp's steer-visibility fix (ec12cdb, deployed) now
+// emits TWO cosmetic session/update frames on every absorbed steer (a banner
+// chunk + a session_info_update). That made the zero-output frame-counting
+// check permanently silent for every steered delivery — fix 1 of the original
+// round structurally disabled fix 2. The remedy is that a steered terminal is
+// no longer decided by frame count AT ALL: `steeredDeliveryWarning` is checked
+// BEFORE `zeroAgentOutputWarning` (`deliveryTerminalWarning`'s precedence), so
+// it fires on the `steered` flag alone and can never be defeated by a cosmetic
+// frame.
 //
 // Narrowness is the design: a cancelled/failed terminal with no frames is
 // unremarkable (no warning), a `deduplicated` terminal has no turn at all (no
 // warning), and the codex absorbed-steer terminal carries `stopReason: null` BY
 // DESIGN (the steer acts inside the containing turn, producing no frames of its
-// own — no warning). Overlapping windows can only UNDER-count a zero, so the
-// worst case is a missed warning, never a false one.
+// own — no warning, since it is also not `steered: true`). Overlapping windows
+// can only UNDER-count a zero, so the worst case for the zero-output half is a
+// missed warning, never a false one.
 
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -33,8 +46,11 @@ import { runPromptTurn } from "../src/runtime/engine/prompt-turn.js";
 import { createSessionConversation } from "../src/session/conversation-model.js";
 import {
   buildDeliveryEvent,
+  deliveryTerminalWarning,
   isGenuineCompletionStopReason,
+  steeredDeliveryWarning,
   zeroAgentOutputWarning,
+  STEERED_INTO_ACTIVE_TURN_WARNING,
   ZERO_AGENT_OUTPUT_WARNING,
 } from "../src/session/delivery-events.js";
 import { listSessionEvents } from "../src/session/events.js";
@@ -134,6 +150,18 @@ test("ddd76838: the zero-output rule fires on genuine completions only", () => {
   assert.equal(W({ stopReason: "deduplicated" }), undefined, "dedup is not a completion");
   assert.equal(W({ stopReason: null }), undefined, "absorbed (null) is not a completion");
   assert.equal(W({ terminal: false }), undefined, "non-terminals never warn");
+  // brick 7ada04b9: a steered terminal is never genuine, even with zero frames —
+  // it must NOT get the zero-output warning; steeredDeliveryWarning owns it.
+  assert.equal(
+    W({ steered: true }),
+    undefined,
+    "steered ⇒ not a genuine completion, no zero-output warning even at zero frames",
+  );
+  assert.equal(
+    W({ steered: true, framesAtTerminal: 3 }),
+    undefined,
+    "steered ⇒ still no zero-output warning regardless of frame count",
+  );
 
   assert.equal(isGenuineCompletionStopReason("end_turn"), true);
   assert.equal(isGenuineCompletionStopReason("end_turn"), true);
@@ -145,6 +173,68 @@ test("ddd76838: the zero-output rule fires on genuine completions only", () => {
   assert.equal(isGenuineCompletionStopReason("cancelled"), false);
   assert.equal(isGenuineCompletionStopReason(null), false);
   assert.equal(isGenuineCompletionStopReason(undefined), false);
+  // brick 7ada04b9: the load-bearing defect — pi's steer-ack reuses the GENUINE
+  // "end_turn" value, so `steered` must be read explicitly or this wrongly
+  // returns true for an absorbed steer, exactly as it did before the fix.
+  assert.equal(
+    isGenuineCompletionStopReason("end_turn", true),
+    false,
+    "a steered end_turn is not a genuine completion",
+  );
+  assert.equal(
+    isGenuineCompletionStopReason("end_turn", false),
+    true,
+    "steered:false is unaffected",
+  );
+  assert.equal(isGenuineCompletionStopReason("max_tokens", true), false);
+});
+
+test("7ada04b9: steeredDeliveryWarning fires on any done+steered terminal, independent of frames", () => {
+  const S = (over: Partial<Parameters<typeof steeredDeliveryWarning>[0]>) =>
+    steeredDeliveryWarning({ terminal: true, phase: "done", steered: true, ...over });
+  assert.equal(S({}), STEERED_INTO_ACTIVE_TURN_WARNING, "a steered done terminal always warns");
+  assert.equal(S({ steered: false }), undefined, "not steered ⇒ this function stays silent");
+  assert.equal(S({ steered: undefined }), undefined, "absent steered ⇒ silent");
+  assert.equal(S({ terminal: false }), undefined, "non-terminal ⇒ silent");
+  assert.equal(S({ phase: "failed" }), undefined, "a failed terminal never gets this annotation");
+  assert.equal(
+    S({ phase: "cancelled" }),
+    undefined,
+    "a cancelled terminal never gets this annotation",
+  );
+});
+
+test("7ada04b9: deliveryTerminalWarning — steered takes precedence over zero-output, at any frame count", () => {
+  const D = (over: Partial<Parameters<typeof deliveryTerminalWarning>[0]>) =>
+    deliveryTerminalWarning({
+      terminal: true,
+      phase: "done",
+      stopReason: "end_turn",
+      framesAtStart: 0,
+      framesAtTerminal: 0,
+      ...over,
+    });
+  // THE INCIDENT SHAPE, replayed directly against the pure function: a `done`
+  // terminal, stopReason "end_turn", steered:true, with TWO session/update
+  // frames observed in the window (pi-acp ec12cdb's cosmetic banner +
+  // session_info_update) — exactly what defeated the old frame-counting check.
+  assert.equal(
+    D({ steered: true, framesAtStart: 0, framesAtTerminal: 2 }),
+    STEERED_INTO_ACTIVE_TURN_WARNING,
+    "steered wins even though frames were observed — this is what makes the warning survive the cosmetic frame",
+  );
+  // Same shape but the pre-visibility-fix pi-acp (zero frames): steered still
+  // wins over the zero-output text — a more specific, more accurate annotation.
+  assert.equal(
+    D({ steered: true, framesAtStart: 0, framesAtTerminal: 0 }),
+    STEERED_INTO_ACTIVE_TURN_WARNING,
+    "steered wins over zero-output even when both conditions technically hold",
+  );
+  // Not steered, zero frames: the original ddd76838 behaviour is preserved.
+  assert.equal(D({ steered: false }), ZERO_AGENT_OUTPUT_WARNING);
+  assert.equal(D({}), ZERO_AGENT_OUTPUT_WARNING, "steered omitted behaves like steered:false");
+  // Not steered, frames observed: clean, no warning at all.
+  assert.equal(D({ steered: false, framesAtTerminal: 2 }), undefined);
 });
 
 // ---------------------------------------------------------------------------
@@ -291,10 +381,12 @@ function deliveryEventsFor(events: unknown[], messageId: string): Record<string,
     .map((event) => (event as { params: Record<string, unknown> }).params);
 }
 
-// THE INCIDENT REPRODUCED IN A TEST: pi steer-ack (end_turn + _meta.piAcp.steered,
-// ZERO frames). The terminal must record `steered` AND the zero-output warning —
-// never a clean bare end_turn.
-test("ddd76838: a steered delivery with ZERO frames records steered + the zero-output warning", async () => {
+// pi steer-ack (end_turn + _meta.piAcp.steered, ZERO frames — the pre-visibility
+// -fix pi-acp shape). The terminal must record `steered` AND the "steered into
+// active turn" annotation — never a clean bare end_turn, and never the generic
+// zero-output text once `steered` is known (brick 7ada04b9: the more specific
+// annotation wins).
+test("ddd76838/7ada04b9: a steered delivery with ZERO frames records steered + the steered annotation", async () => {
   await withTempHome(async (homeDir) => {
     const record = makeSessionRecord(homeDir);
     await writeSessionRecordFile(homeDir, record);
@@ -332,16 +424,21 @@ test("ddd76838: a steered delivery with ZERO frames records steered + the zero-o
     assert.equal(terminals[0]?.steered, true, "the steer-ack is recorded on the delivery record");
     assert.equal(
       terminals[0]?.warning,
-      ZERO_AGENT_OUTPUT_WARNING,
-      "the zero-frame delivery is NOT a clean success",
+      STEERED_INTO_ACTIVE_TURN_WARNING,
+      "the zero-frame steered delivery gets the steered annotation, not the generic zero-output one",
     );
   });
 });
 
-// CONTROL (the false-alarm direction): a steered delivery WITH frames — the
-// steady state once pi-acp emits its own visible steered chunk (lane C fix 1).
-// `steered` stays recorded; the warning must NOT fire.
-test("ddd76838 CONTROL: a steered delivery WITH frames records steered, NOT the warning", async () => {
+// THE 2026-09-24 RECURRENCE, REPRODUCED END-TO-END: pi-acp's steer-visibility
+// fix (ec12cdb, deployed) makes every absorbed steer emit TWO session/update
+// frames — an agent_message_chunk banner + a session_info_update — which is
+// exactly the shape that silenced the old frame-counting warning for all three
+// absorbed messages in the 2026-09-24 occurrence. `steered` must still be
+// recorded AND the terminal must still carry the "steered into active turn"
+// warning — proving the annotation survives the cosmetic frames, not just the
+// absence of frames.
+test("7ada04b9: a steered delivery WITH two cosmetic frames still warns — the recurrence shape", async () => {
   await withTempHome(async (homeDir) => {
     const record = makeSessionRecord(homeDir);
     await writeSessionRecordFile(homeDir, record);
@@ -349,8 +446,9 @@ test("ddd76838 CONTROL: a steered delivery WITH frames records steered, NOT the 
     const messageId = "ddd00002-2222-4222-8222-222222222222";
     const control = makeMockClient({
       onMainPrompt: async (_sessionId, emit) => {
-        // Post-fix pi-acp: the steered confirmation chunk arrives in the window.
+        // Post-fix pi-acp: two cosmetic frames arrive in the window, nothing else.
         emit(agentChunk("⏩ Steered into the active turn"));
+        emit({ update: { sessionUpdate: "session_info_update" } });
         return { stopReason: "end_turn", _meta: { piAcp: { steered: true } } };
       },
     });
@@ -371,7 +469,11 @@ test("ddd76838 CONTROL: a steered delivery WITH frames records steered, NOT the 
     ).filter((e) => e.phase === "done");
     assert.equal(terminals.length, 1);
     assert.equal(terminals[0]?.steered, true);
-    assert.equal("warning" in terminals[0], false, "frames were observed — no zero-output warning");
+    assert.equal(
+      terminals[0]?.warning,
+      STEERED_INTO_ACTIVE_TURN_WARNING,
+      "two cosmetic frames must not silence the steered annotation (this is the exact 2026-09-24 defect)",
+    );
   });
 });
 
