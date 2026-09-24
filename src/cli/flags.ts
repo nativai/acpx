@@ -4,7 +4,7 @@ import { InvalidArgumentError } from "commander";
 import type { Command } from "commander";
 import {
   DEFAULT_AGENT_NAME,
-  listBuiltInAgents,
+  listKnownAgentSelectorNames,
   normalizeAgentName,
   resolveAgentCommand as resolveAgentCommandFromRegistry,
 } from "../agent-registry.js";
@@ -933,9 +933,18 @@ export function resolveOutputPolicy(format: OutputFormat, jsonStrict: boolean): 
 // instead of guessing: this is the ONLY case worth refusing, because it is the
 // only raw value that can plausibly be a mistyped registry name rather than a
 // genuine custom command line (brick 618f1dbf).
+//
+// The known-name set is `listKnownAgentSelectorNames`, NOT `listBuiltInAgents`
+// — an alias (`factory-droid` -> `droid`) resolves to a real registry entry
+// exactly like a canonical name does, and a caller typing one plainly means
+// to select that agent, so it belongs in this same refuse-not-warn tier.
+// `listBuiltInAgents` alone would silently exclude every alias from this
+// check (measured: `--agent factory-droid` fell through to the weaker warn
+// tier), because that function's job is CLI subcommand registration, not
+// "what counts as a known agent name" — see its doc comment.
 function rejectAgentOverrideNamingKnownAgent(override: string, config: ResolvedAcpxConfig): void {
   const knownAgentNames = new Set(
-    listBuiltInAgents(config.agents).map((name) => normalizeAgentName(name)),
+    listKnownAgentSelectorNames(config.agents).map((name) => normalizeAgentName(name)),
   );
   if (!knownAgentNames.has(normalizeAgentName(override))) {
     return;

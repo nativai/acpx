@@ -760,6 +760,23 @@ test("resolveAgentInvocation refuses --agent when it names a known agent instead
     /matches a known built-in agent name/,
   );
 
+  // An AGENT_ALIASES entry (`factory-droid` / `factorydroid` -> `droid`) is
+  // refused the same way as a canonical name -- it resolves to a real
+  // registry entry via resolveAgentCommand exactly like "droid" does, so a
+  // caller typing it plainly means to select that agent. This is the TE-found
+  // gap (`618f1dbf` follow-up): `listBuiltInAgents` alone excludes aliases
+  // (it drives CLI subcommand registration, not "is this a known name"), so
+  // the lookup here must go through `listKnownAgentSelectorNames`, which
+  // includes AGENT_ALIASES by construction -- a FUTURE alias needs no test
+  // added here to be covered.
+  for (const alias of ["factory-droid", "factorydroid"]) {
+    assert.throws(
+      () => resolveAgentInvocation(undefined, flags(alias), config()),
+      /matches a known built-in agent name/,
+      `expected alias ${JSON.stringify(alias)} to be refused, not warned-on or accepted`,
+    );
+  }
+
   // Negative case: a raw command that merely CONTAINS a known agent name is
   // NOT refused -- only an exact match is treated as a likely mistake, so a
   // genuine custom command line keeps working exactly as before.
@@ -832,6 +849,14 @@ test("resolveAgentInvocation warns only on a BARE-word override, never on a real
     resolveAgentInvocation(undefined, flags("my-bespoke-agent-binary"), config()),
   );
   assert.match(bareCustom.stderr, /assuming agent identity "codex"/);
+
+  // A bare word that merely RESEMBLES a real AGENT_ALIASES entry (but is not
+  // one) belongs in THIS tier, not tier 1 -- confirms the alias lookup added
+  // for the exact-match test above is exact, not fuzzy/prefix matching.
+  const nearAlias = captureStderrSync(() =>
+    resolveAgentInvocation(undefined, flags("factory-droid-2"), config()),
+  );
+  assert.match(nearAlias.stderr, /assuming agent identity "codex"/);
 
   // Negative case: a real command line (has a path separator or an argument)
   // is UNAMBIGUOUSLY deliberate -- nobody mistypes a registry name as
