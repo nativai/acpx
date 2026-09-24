@@ -6,6 +6,7 @@ import {
   resolveGenericEffortLadder,
   resolveReasoningEffort,
   resolveServedAndFloor,
+  statusAcpxFields,
 } from "../src/cli/status-command.js";
 import type { SessionRecord } from "../src/types.js";
 import { makeSessionRecord } from "./runtime-test-helpers.js";
@@ -295,4 +296,30 @@ test("a codex record with a pin reports floorOk unknown with an explicit codex-s
   const result = resolveServedAndFloor(rec, harness);
   assert.equal(result.floorOk, null);
   assert.match(result.floorNote ?? "", /not evaluated for codex/);
+});
+
+test("status groups the exact Codex advertisement and does not claim account allowance", async () => {
+  const rec = record({
+    acpxRecordId: "codex-live-catalogue",
+    agentCommand: "node /opt/codex-acp/dist/index.js",
+    acpx: {
+      session_options: { model: "gpt-7-nova[max]" },
+      current_model_id: "gpt-7-nova[max]",
+      available_models: ["gpt-7-nova[low]", "gpt-7-nova[max]"],
+    },
+  });
+  const result = await statusAcpxFields(rec);
+  assert.deepEqual(result.advertisedModelCatalogue, {
+    source: "acp",
+    availability: "adapter-advertised",
+    accountAllowed: null,
+    models: [
+      {
+        family: "gpt-7-nova",
+        efforts: ["low", "max"],
+        modelIds: ["gpt-7-nova[low]", "gpt-7-nova[max]"],
+      },
+    ],
+  });
+  assert.deepEqual(result.effortCeiling, ["low", "max"]);
 });

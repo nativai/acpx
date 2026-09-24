@@ -73,6 +73,14 @@ function requestedFamilyAndEffort(requestedModel: string): {
   return parseComposedModelId(withoutSource) ?? { family: withoutSource, effort: undefined };
 }
 
+export function findAdvertisedComposedModel(
+  models: SessionModelState,
+  requestedModel: string,
+): AdvertisedComposedModel | undefined {
+  const requested = requestedFamilyAndEffort(requestedModel.trim());
+  return projectAdvertisedComposedModels(models).find((model) => model.family === requested.family);
+}
+
 function selectedEffort(params: {
   requestedEffort: string | undefined;
   bracketEffort: string | undefined;
@@ -99,9 +107,7 @@ function requireAdvertisedFamily(
   requestedFamily: string,
   models: SessionModelState,
 ): AdvertisedComposedModel {
-  const family = projectAdvertisedComposedModels(models).find(
-    (model) => model.family === requestedFamily,
-  );
+  const family = findAdvertisedComposedModel(models, requestedFamily);
   if (family) {
     return family;
   }

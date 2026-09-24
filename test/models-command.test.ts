@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { listHarnessCapabilities } from "../src/acp/harness-capabilities.js";
 import { buildCatalogue } from "../src/models/catalogue.js";
+import { harnessNativeModels, type NativeModel } from "../src/models/harness-models.js";
 import {
   composeEffectiveModelId,
   isModelValidatedAgent,
@@ -14,9 +15,46 @@ import {
   validateModelSelection,
   validateSessionModelFlags,
 } from "../src/models/model-slug-validation.js";
-import type { ModelCatalogue } from "../src/models/types.js";
+import type { CanonicalDepthLevel, ModelCatalogue } from "../src/models/types.js";
 
 const META = { fetchedAt: "2026-09-04T00:00:00.000Z", stale: false, error: null };
+
+function codexFixture(id: string, efforts: CanonicalDepthLevel[]): NativeModel {
+  return {
+    key: `chatgpt:${id}`,
+    source: "chatgpt",
+    id,
+    name: id,
+    vendor: "openai",
+    description: "adapter advertisement fixture",
+    contextLength: null,
+    tools: true,
+    billing: {
+      kind: "plan",
+      inPerM: null,
+      outPerM: null,
+      cacheReadPerM: null,
+      cacheWritePerM: null,
+      account: "chatgpt",
+    },
+    depth: { kind: "ladder", levels: efforts, default: "medium", mandatory: true },
+    badges: [],
+    aliasTarget: null,
+    equivalentTo: [],
+    createdAt: null,
+    selectable: true,
+    unavailableReasons: [],
+    availability: {},
+    favorite: false,
+    favoritedAt: null,
+    agentTypes: ["codex"],
+  };
+}
+
+const CODEX_FIXTURES = [
+  codexFixture("gpt-5.6-sol", ["low", "medium", "high", "xhigh", "max", "ultra"]),
+  codexFixture("gpt-5.6-luna", ["low", "medium", "high", "xhigh", "max"]),
+];
 
 /** node:assert's `throws` returns void, so the thrown value is captured here. */
 function caught(fn: () => unknown): ModelSlugError {
@@ -47,6 +85,7 @@ function catalogueWith(): ModelCatalogue {
       { id: "mistralai/large-3", name: "Mistral Large 3", supported_parameters: ["tools"] },
     ],
     META,
+    { nativeModels: [...harnessNativeModels(), ...CODEX_FIXTURES] },
   );
 }
 

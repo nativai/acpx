@@ -1,9 +1,12 @@
 import {
   harnessIdForAgentCommand,
   harnessProvisionsModelCatalogue,
+  modelSelectionAuthorityForAgentCommand,
   type HarnessId,
+  usesAdvertisedComposedModelCatalogue,
 } from "../acp/harness-capabilities.js";
 import { stripProviderPrefix } from "../acp/harness-config-dir.js";
+import { findAdvertisedComposedModel } from "../acp/model-support.js";
 import { findModelsById, loadCatalogue } from "../models/catalogue.js";
 import {
   candidatesFor,
@@ -87,6 +90,11 @@ export async function resolveSessionModelLadder(
     return unresolved("no pinned model");
   }
 
+  const authority = modelSelectionAuthorityForAgentCommand(record.agentCommand);
+  if (usesAdvertisedComposedModelCatalogue(authority)) {
+    return resolveAdvertisedComposedLadder(record, pinnedModel);
+  }
+
   const harness = harnessIdForAgentCommand(record.agentCommand);
   if (!isModelValidatedAgent(harness, record.agentCommand)) {
     return unresolved(unmeasuredHarnessNote(harness));
@@ -104,6 +112,24 @@ export async function resolveSessionModelLadder(
   }
 
   return resolveLadderFromCandidates(candidates);
+}
+
+function resolveAdvertisedComposedLadder(
+  record: SessionRecord,
+  pinnedModel: string,
+): SessionModelLadder {
+  const availableModels = record.acpx?.available_models;
+  if (!availableModels || availableModels.length === 0) {
+    return unresolved("adapter model catalogue not recorded");
+  }
+  const models = {
+    currentModelId: record.acpx?.current_model_id ?? "",
+    availableModels: availableModels.map((modelId) => ({ modelId, name: modelId })),
+  };
+  const family = findAdvertisedComposedModel(models, pinnedModel);
+  return family
+    ? { levels: [...family.efforts], note: null }
+    : unresolved("pinned model not in adapter advertisement");
 }
 
 function unmeasuredHarnessNote(harness: HarnessId | undefined): string {
