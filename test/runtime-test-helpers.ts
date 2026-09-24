@@ -126,6 +126,7 @@ export async function withTempHome<T>(
 ): Promise<T> {
   const originalHome = process.env.HOME;
   const originalStateHome = process.env.ACPX_STATE_HOME;
+  const originalFetch = globalThis.fetch;
   const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
   process.env.HOME = tempHome;
   process.env.ACPX_STATE_HOME = tempHome;
@@ -134,12 +135,25 @@ export async function withTempHome<T>(
   // no HOME reaches. Without this line every prune the suite runs walks the box's
   // real /tmp (brick 0bac6a00, `config-dir-root-isolation.ts`).
   const restoreConfigDirRoot = beginIsolatedHarnessConfigDirRoot(tempHome);
+  globalThis.fetch = async (input, init) => {
+    if (String(input) === "http://127.0.0.1:3456/api/usage/codex/quota") {
+      return new Response(
+        JSON.stringify({
+          capturedAt: new Date().toISOString(),
+          secondary: { windowMinutes: 10_080, usedPercent: 0, elapsed: false },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    return await originalFetch(input, init);
+  };
 
   try {
     return await run(tempHome);
   } finally {
     restoreEnv("HOME", originalHome);
     restoreEnv("ACPX_STATE_HOME", originalStateHome);
+    globalThis.fetch = originalFetch;
     restoreConfigDirRoot();
     await fs.rm(tempHome, { recursive: true, force: true });
   }
