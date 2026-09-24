@@ -3278,11 +3278,6 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
     }
   };
 
-  // A held Codex turn must be refused before the ACP lifecycle begins. In
-  // particular, session/new has observable downstream cleanup and cancellation
-  // effects, despite no provider prompt ever being submitted.
-  await admitCodexSubscriptionBeforeExecLifecycle(options);
-
   try {
     return await withInterrupt(
       async () => {
@@ -3296,6 +3291,12 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
           );
         });
         const sessionId = createdSession.sessionId;
+        const command = splitCommandLine(options.agentCommand);
+        if (isCodexAcpCommand(command.command, command.args)) {
+          await admitCodexSubscriptionTurn({
+            weeklyCapPercent: options.codexSubscriptionCapWeeklyPercent ?? 90,
+          });
+        }
         const effectiveSessionOptions = withDefaultModelForNewSession(
           options.agentCommand,
           options.sessionOptions,
@@ -3343,16 +3344,6 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
   } finally {
     await client.close();
   }
-}
-
-async function admitCodexSubscriptionBeforeExecLifecycle(options: RunOnceOptions): Promise<void> {
-  const command = splitCommandLine(options.agentCommand);
-  if (!isCodexAcpCommand(command.command, command.args)) {
-    return;
-  }
-  await admitCodexSubscriptionTurn({
-    weeklyCapPercent: options.codexSubscriptionCapWeeklyPercent ?? 90,
-  });
 }
 
 export async function sendSessionDirect(options: SessionSendOptions): Promise<SessionSendResult> {
