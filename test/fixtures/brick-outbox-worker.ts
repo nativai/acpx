@@ -122,6 +122,40 @@ try {
     console.log(`ACTED=${acted}`);
     process.exit(0);
   }
+  if (scenario === "legacy-relink") {
+    // NEGATIVE CASE for the clamp warned about on `preserveWriterUnownedMetadata`.
+    // A record that still carries a brick_projection_revision from before the
+    // session-link projection was removed must remain re-linkable: saveRecord owns
+    // metadata.brick, the stored record does not. Restoring `brick` from `current`
+    // in the record-write path turns every line below into a silent no-op.
+    const second = "33333333-3333-4333-8333-333333333333";
+    const legacy: DiskRecord = {
+      ...record,
+      metadata: { brick, brick_projection_revision: "0:7" },
+    };
+    writeRecordAtomic(outbox.recordPath(id), legacy);
+
+    outbox.saveRecord({ ...legacy, metadata: { ...legacy.metadata, brick: second } });
+    assert.equal(outbox.readRecord(id)?.metadata?.brick, second, "attach must move the link");
+    assert.equal(
+      outbox.readRecord(id)?.metadata?.brick_projection_revision,
+      "0:7",
+      "the record write must not mint a new projection revision",
+    );
+
+    const detached: DiskRecord = { ...legacy, metadata: { brick_projection_revision: "0:7" } };
+    outbox.saveRecord(detached);
+    assert.equal(outbox.readRecord(id)?.metadata?.brick, undefined, "detach must drop the link");
+
+    outbox.saveRecord({ ...legacy, metadata: { ...legacy.metadata, brick } });
+    assert.equal(outbox.readRecord(id)?.metadata?.brick, brick, "re-attach must restore the link");
+
+    // And none of it may enqueue an outbox intent.
+    assert.equal(outbox.inventory().outbox_depth, 0, "saveRecord must not enqueue intents");
+    acted++;
+    console.log(`ACTED=${acted}`);
+    process.exit(0);
+  }
   if (scenario === "gate") {
     assert.equal(
       outbox.withUserMutationGate(() => outbox.withUserMutationGate(() => 42)),

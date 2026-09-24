@@ -18,6 +18,7 @@ for (const scenario of [
   "initial-prompt",
   "ownership",
   "identity-guard",
+  "legacy-relink",
 ]) {
   test(`B14 ${scenario}`, () => {
     const root = "/workspace/bricksdb-b14-selftest";

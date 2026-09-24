@@ -443,6 +443,35 @@ function assertRecordIdentity(
     throw new OutboxError("record-ownership", "destination belongs to another ACP session");
   }
 }
+/**
+ * Carries forward the two metadata keys a record writer does not own: `spawn_state`
+ * belongs to the spawn reservation, and `brick_projection_revision` is the spawn
+ * publication projection's version tuple. A writer that simply did not load them
+ * must not drop them.
+ *
+ * ⚠️ DO NOT ADD `brick` HERE. It looks symmetric with the revision below — the
+ * projection used to own the session→brick link too — and it is the bug. Since the
+ * link is no longer projected on the record-write path, `metadata.brick` is the
+ * CALLER's, and pinning it to the stored value turns every attach, move and detach
+ * into a silent no-op for any record that still carries a revision. 562 of the 1,584
+ * live records on devbox carried one the day the projection was removed. Measured on
+ * this exact edit: attaching such a record to a second brick left it on the first,
+ * with no error. `test/fixtures/brick-outbox-worker.ts` scenario `legacy-relink`
+ * carries the negative case and goes red if the clamp comes back.
+ */
+function preserveWriterUnownedMetadata(result: DiskRecord, current: DiskRecord | undefined): void {
+  if (metadataValue(current, "spawn_key")) {
+    result.metadata = {
+      ...result.metadata,
+      spawn_state: metadataValue(current, "spawn_state") ?? "pending",
+    };
+  }
+  const revision = metadataValue(current, "brick_projection_revision");
+  if (revision) {
+    result.metadata = { ...result.metadata, brick_projection_revision: revision };
+  }
+}
+/** Projection-path variant: the projection DOES own `brick`, so it also restores it. */
 function preserveProjectionMetadata(result: DiskRecord, current: DiskRecord | undefined): void {
   if (metadataValue(current, "spawn_key")) {
     result.metadata = {
@@ -1323,30 +1352,47 @@ export class BrickOutbox {
       this.assertOwnership(id, writer, current);
       const result = build(current);
       this.assertOwnership(id, result, current);
-      preserveProjectionMetadata(result, current);
+      preserveWriterUnownedMetadata(result, current);
       writeRecordAtomic(this.recordPath(id), result);
       return result;
     });
   }
+  /**
+   * Persists a session record under the outbox's write mutex and ownership guard.
+   *
+   * ⚠️ DO NOT RE-ADD A `prepareProjection`/`applyProjection` BRANCH HERE. Until
+   * 2026-09-23 this path minted one outbox intent per record persist to ship the
+   * session→brick link to the central store. That link is already kept correct by
+   * acpx-ui's convergent reconciler (`server/remoteBrickSessionReconciliation.ts`),
+   * which has been the only thing doing the job since 2026-09-15 — the outbox
+   * delivered zero rows in that window and linkage stayed correct throughout. The
+   * projection was therefore pure duplication, and an expensive one: 480,099 rows /
+   * 392 MB, growing ~9,000 rows/hour, to express 566 links that changed 8 times.
+   * The outbox itself stays — it still owns spawn reservations and this write mutex.
+   * Full rationale: brick c141eaab, `verification/OUTBOX-DECISION.md`.
+   */
   saveRecord(record: DiskRecord): DiskRecord {
-    const id = String(record.acpx_record_id);
     if (
-      unpublishedRecord(record) ||
-      (!this.isBound() &&
-        !metadataValue(record, "brick_projection_revision") &&
-        !metadataValue(record, "spawn_key"))
+      !unpublishedRecord(record) &&
+      (this.isBound() ||
+        metadataValue(record, "brick_projection_revision") ||
+        metadataValue(record, "spawn_key"))
     ) {
-      return this.writeOwnedRecord(id, record, () => record);
+      // 🛑 NOT DEAD CODE, AND NOT A LEFTOVER OF THE DELETED PROJECTION. The return value
+      // is deliberately discarded: this call IS the box's instance-mismatch detector.
+      // `identityForRecord` throws `outbox-instance-mismatch` when the outbox's binding
+      // disagrees with `~/.acpx/instance.json` — the shape that wedged devbox for ~80
+      // minutes on 2026-09-15 (bricks 507a1c38 / 42b4fb28 / 7d03eca1). It used to be
+      // reached as a side effect of projecting the record; with the projection gone,
+      // dropping it would leave the record-write path silently unguarded and let a
+      // re-minted instance.json write records under a stale binding.
+      // The condition is the exact negation of the fast-path test the projection branch
+      // used, so precisely the same writes are checked as before — including the
+      // `instance-url-missing` case on an unbound outbox holding a projected record.
+      // `test/brick-outbox-wedge-detect.test.ts` goes red if this call is removed.
+      this.identityForRecord(record);
     }
-    const intent = this.prepareProjection(id, record, this.identityForRecord(record));
-    if (!intent) {
-      return this.writeOwnedRecord(id, record, () => record);
-    }
-    this.applyProjection(intent.id, (current) => ({
-      ...record,
-      metadata: { ...current.metadata, ...record.metadata },
-    }));
-    return this.readRecord(id)!;
+    return this.writeOwnedRecord(String(record.acpx_record_id), record, () => record);
   }
 
   prepareProjection(

@@ -11,8 +11,8 @@
  * the documented remedy, instead of a bare "identity binding differs from instance.json".
  *
  * ⚠️ `norotate-save-record` IS A POSITIVE CONTROL, NOT FILLER. It proves `saveRecord` genuinely
- * reaches `identityForRecord` (via the projection path) rather than short-circuiting to the
- * unguarded `writeOwnedRecord` fast path — without it, `rotate-save-record` throwing would not be
+ * reaches `identityForRecord` rather than short-circuiting to the unguarded `writeOwnedRecord`
+ * fast path — without it, `rotate-save-record` throwing would not be
  * attributable to the rotation at all (brick 7d03eca1's own measurement matrix makes the same
  * point about its `norotate-save-record` row).
  */
@@ -30,6 +30,7 @@ interface Observation {
   code: string | null;
   message: string;
   outbox_rows: number;
+  record_written: boolean;
   db: string;
 }
 
@@ -54,10 +55,12 @@ function probe(scenario: string): Observation {
   return JSON.parse(line.slice(4)) as Observation;
 }
 
-test("7d03eca1 wedge: POSITIVE CONTROL — an unrotated identity saves through the projection path", () => {
+test("7d03eca1 wedge: POSITIVE CONTROL — an unrotated identity saves through the identity check", () => {
   const observed = probe("norotate-save-record");
   assert.equal(observed.threw, false, observed.message);
-  assert.equal(observed.outbox_rows, 1);
+  assert.equal(observed.record_written, true, "the control must actually persist the record");
+  // Pins brick c141eaab: saveRecord no longer mints a session-link intent per persist.
+  assert.equal(observed.outbox_rows, 0);
 });
 
 test("7d03eca1 wedge: a re-minted instance.json under a bound outbox throws a NAMED, ACTIONABLE error", () => {
@@ -65,6 +68,9 @@ test("7d03eca1 wedge: a re-minted instance.json under a bound outbox throws a NA
   assert.equal(observed.threw, true);
   assert.equal(observed.code, "outbox-instance-mismatch");
   assert.equal(observed.outbox_rows, 0);
+  // The guard must fire BEFORE the write, not after it: a wedged box must not persist
+  // records under a stale binding. This is what the control's record_written pairs against.
+  assert.equal(observed.record_written, false, "a wedged outbox must not write the record");
   // Names both identities involved, not just "differs from instance.json" — a reader can tell
   // WHICH id is stale and which is live without opening the db.
   assert.match(observed.message, /i-aaaaaaaaaaaa/);
