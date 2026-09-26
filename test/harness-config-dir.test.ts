@@ -786,9 +786,11 @@ test("a provisioned pi session's stall policy keeps the WORST-CASE DEAD AIR insi
 // NOT-approved model) is what fires when no earlier resolution step claims the
 // slot. Step 3 of `findInitialModel` — a saved settings default — pre-empts it,
 // but ONLY when both `defaultProvider` and `defaultModel` are present; pi's gate
-// is `&&`, not "prefer whichever is set". This gate function is that documented
-// contract, not our writer's internals — it is what makes the negative rows
-// below a check on the CONTRACT rather than on our own code re-describing itself.
+// is `&&`, not "prefer whichever is set". This function documents that contract
+// in one place so the rows below can name it instead of re-deriving `&&` twice.
+// It is applied to the REAL generated settings.json (and to copies of it with
+// one key deleted) below — never to a hand-built object standing in for the
+// product — so it cannot become a tautology over its own mirror of the writer.
 function armsPiSavedDefaultModel(settings: {
   defaultProvider?: unknown;
   defaultModel?: unknown;
@@ -836,33 +838,60 @@ test("f2ac29e3: a provisioned pi session's settings.json arms pi's saved-default
   });
 });
 
-test("f2ac29e3: EITHER key alone leaves pi's saved-default gate UNARMED — both are required together", () => {
+test("f2ac29e3: EITHER key alone, removed from the REAL generated settings.json, leaves pi's saved-default gate UNARMED", () => {
   // Committed negative case per clause (dev-server-workspace → completeness-claim
-  // rule): a partial settings object — exactly what a future edit that drops
-  // "only one line, it looks redundant" would produce — must NOT arm the gate.
-  assert.equal(
-    armsPiSavedDefaultModel({ defaultProvider: PI_DEFAULT_PROVIDER }),
-    false,
-    "provider alone armed the gate — pi's step 3 requires defaultModel too",
-  );
-  assert.equal(
-    armsPiSavedDefaultModel({ defaultModel: PI_DEFAULT_MODEL_ID }),
-    false,
-    "model alone armed the gate — pi's step 3 requires defaultProvider too",
-  );
-  assert.equal(
-    armsPiSavedDefaultModel({}),
-    false,
-    "an empty settings object armed the gate — it must not",
-  );
-  assert.equal(
-    armsPiSavedDefaultModel({
-      defaultProvider: PI_DEFAULT_PROVIDER,
-      defaultModel: PI_DEFAULT_MODEL_ID,
-    }),
-    true,
-    "both keys together failed to arm the gate — the positive control for the three rows above",
-  );
+  // rule) — but the negative INPUT is derived from the real generated file Row 1
+  // also reads, by deleting exactly the key under test from a copy of it, not
+  // from a hand-built object. A synthetic object exercises only this file's own
+  // mirror of pi's `&&` contract and can never observe a regression in the
+  // WRITER; this row can, because its inputs originate from
+  // `applyHarnessConfigDir`'s actual output. Row 1 already reds if either
+  // product line is dropped (it asserts the field values directly) — this row
+  // is a second, contract-shaped view of the same guarantee, not a
+  // replacement for Row 1's protection.
+  withTempRoot((root) => {
+    const env = piIsolatedEnv(root, { piKnows: [] });
+    applyHarnessConfigDir({
+      env,
+      agentCommand: AGENT_REGISTRY.pi,
+      sessionId: "ses_pi_default_model_gate",
+      primer: "P",
+      rootDir: root,
+    });
+    assert.ok(
+      env.PI_CODING_AGENT_DIR,
+      "PI_CODING_AGENT_DIR unset — the read below would be of nothing",
+    );
+
+    const real = JSON.parse(
+      readFileSync(join(env.PI_CODING_AGENT_DIR, "settings.json"), "utf8"),
+    ) as Record<string, unknown>;
+
+    const withoutModel = { ...real };
+    delete withoutModel.defaultModel;
+    assert.equal(
+      armsPiSavedDefaultModel(withoutModel),
+      false,
+      "the real settings.json with defaultModel removed still armed the gate — pi's step 3 " +
+        "requires both keys",
+    );
+
+    const withoutProvider = { ...real };
+    delete withoutProvider.defaultProvider;
+    assert.equal(
+      armsPiSavedDefaultModel(withoutProvider),
+      false,
+      "the real settings.json with defaultProvider removed still armed the gate — pi's step 3 " +
+        "requires both keys",
+    );
+
+    assert.equal(
+      armsPiSavedDefaultModel(real),
+      true,
+      "the unmodified real settings.json failed to arm the gate — positive control for the two " +
+        "rows above",
+    );
+  });
 });
 
 test("f2ac29e3: the default model stays inside the without-approval set (model-selection → Cost traps)", () => {
