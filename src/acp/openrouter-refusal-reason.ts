@@ -40,7 +40,7 @@
  * ⇒ So it is used at exactly one point: **the terminal failure, to choose WORDING.**
  * A wrong answer costs a vaguer message, never a wrong action. Detection and retry
  * are handled where they are free and exact — pi's own idle bound and retry budget
- * (`writePiStallPolicy` in `harness-config-dir.ts`), sized from the same data.
+ * (`writePiStallPolicyAndDefaultModel` in `harness-config-dir.ts`), sized from the same data.
  *
  * ⚠️ **DO NOT PROMOTE THIS TO A DECISION INPUT.** Gating a retry, an abandon, or a
  * failover on a 50%-sensitive signal is the failure this comment exists to prevent.

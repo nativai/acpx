@@ -20,6 +20,8 @@ import {
 import {
   applyHarnessConfigDir,
   describePiExtensionSeedFailure,
+  PI_DEFAULT_MODEL_ID,
+  PI_DEFAULT_PROVIDER,
   pruneOrphanHarnessConfigDirs,
   removeHarnessConfigDir,
   rescueStrandedPiTranscriptForResume,
@@ -778,6 +780,103 @@ test("a provisioned pi session's stall policy keeps the WORST-CASE DEAD AIR insi
         `request delivers zero bytes forever, so waiting longer recovers nothing`,
     );
   });
+});
+
+// f2ac29e3: pi's own `defaultModelPerProvider.openrouter` (a hardcoded, metered,
+// NOT-approved model) is what fires when no earlier resolution step claims the
+// slot. Step 3 of `findInitialModel` — a saved settings default — pre-empts it,
+// but ONLY when both `defaultProvider` and `defaultModel` are present; pi's gate
+// is `&&`, not "prefer whichever is set". This gate function is that documented
+// contract, not our writer's internals — it is what makes the negative rows
+// below a check on the CONTRACT rather than on our own code re-describing itself.
+function armsPiSavedDefaultModel(settings: {
+  defaultProvider?: unknown;
+  defaultModel?: unknown;
+}): boolean {
+  return Boolean(settings.defaultProvider) && Boolean(settings.defaultModel);
+}
+
+test("f2ac29e3: a provisioned pi session's settings.json arms pi's saved-default model onto an APPROVED slug", () => {
+  withTempRoot((root) => {
+    const env = piIsolatedEnv(root, { piKnows: [] });
+    applyHarnessConfigDir({
+      env,
+      agentCommand: AGENT_REGISTRY.pi,
+      sessionId: "ses_pi_default_model",
+      primer: "P",
+      rootDir: root,
+    });
+    assert.ok(
+      env.PI_CODING_AGENT_DIR,
+      "PI_CODING_AGENT_DIR unset — the read below would be of nothing",
+    );
+
+    const settings = JSON.parse(
+      readFileSync(join(env.PI_CODING_AGENT_DIR, "settings.json"), "utf8"),
+    ) as { defaultProvider?: unknown; defaultModel?: unknown };
+
+    assert.equal(
+      settings.defaultProvider,
+      PI_DEFAULT_PROVIDER,
+      "defaultProvider missing or wrong — a pi spawn with no explicit --model would fall through " +
+        "to pi's own hardcoded, unapproved, metered default",
+    );
+    assert.equal(
+      settings.defaultModel,
+      PI_DEFAULT_MODEL_ID,
+      "defaultModel missing or wrong — a pi spawn with no explicit --model would fall through " +
+        "to pi's own hardcoded, unapproved, metered default",
+    );
+    assert.ok(
+      armsPiSavedDefaultModel(settings),
+      "the REAL generated settings.json does not satisfy pi's own step-3 gate " +
+        "(defaultProvider && defaultModel) — a pi spawn with no explicit --model would silently " +
+        "fall through to pi's hardcoded, unapproved, metered default",
+    );
+  });
+});
+
+test("f2ac29e3: EITHER key alone leaves pi's saved-default gate UNARMED — both are required together", () => {
+  // Committed negative case per clause (dev-server-workspace → completeness-claim
+  // rule): a partial settings object — exactly what a future edit that drops
+  // "only one line, it looks redundant" would produce — must NOT arm the gate.
+  assert.equal(
+    armsPiSavedDefaultModel({ defaultProvider: PI_DEFAULT_PROVIDER }),
+    false,
+    "provider alone armed the gate — pi's step 3 requires defaultModel too",
+  );
+  assert.equal(
+    armsPiSavedDefaultModel({ defaultModel: PI_DEFAULT_MODEL_ID }),
+    false,
+    "model alone armed the gate — pi's step 3 requires defaultProvider too",
+  );
+  assert.equal(
+    armsPiSavedDefaultModel({}),
+    false,
+    "an empty settings object armed the gate — it must not",
+  );
+  assert.equal(
+    armsPiSavedDefaultModel({
+      defaultProvider: PI_DEFAULT_PROVIDER,
+      defaultModel: PI_DEFAULT_MODEL_ID,
+    }),
+    true,
+    "both keys together failed to arm the gate — the positive control for the three rows above",
+  );
+});
+
+test("f2ac29e3: the default model stays inside the without-approval set (model-selection → Cost traps)", () => {
+  // Every OpenRouter-served model is metered per token against this box's own
+  // key; exactly two are approved for a spawn with no explicit sign-off. This
+  // row is the tripwire for a future edit to PI_DEFAULT_MODEL_ID that swaps in
+  // something else — it must red before that model ever spends real money.
+  const APPROVED_WITHOUT_SIGNOFF = ["z-ai/glm-5.3-flash", "deepseek/deepseek-v4.1-flash"];
+  assert.ok(
+    APPROVED_WITHOUT_SIGNOFF.includes(PI_DEFAULT_MODEL_ID),
+    `PI_DEFAULT_MODEL_ID (${PI_DEFAULT_MODEL_ID}) is not in the without-approval set ` +
+      `${JSON.stringify(APPROVED_WITHOUT_SIGNOFF)} — this would spend against the box's ` +
+      `OpenRouter key with no sign-off, on every pi spawn with no explicit --model`,
+  );
 });
 
 test("HERMETICITY CONTROL: pi provisioning reads the INJECTED state, in both directions", () => {

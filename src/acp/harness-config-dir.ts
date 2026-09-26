@@ -1499,7 +1499,7 @@ function writePiConfigDir(dir: string, input: HarnessConfigDirInput): HarnessCon
     input.provisionModelId ? stripProviderPrefix(input.provisionModelId) : undefined,
     files,
   );
-  writePiStallPolicy(dir, files);
+  writePiStallPolicyAndDefaultModel(dir, files);
   const piExtensions = seedPiExtensions(dir, boxAgentDir, input.env, files);
   writePiLiveRoutingExtension(dir, input.env, files, piExtensions);
   // KEEP pi's SESSION STORE IN THE BOX STORE (brick ac86eb34, corrected by
@@ -1539,7 +1539,7 @@ function writePiConfigDir(dir: string, input: HarnessConfigDirInput): HarnessCon
  * is loaded by pi unconditionally and merges with nothing: it is the same
  * mechanism a direct user gets, applied to the provisioned dir. Writing
  * `extensions: [...]` into the per-session `settings.json` was rejected — that
- * file is {@link writePiStallPolicy}'s contract (a partial object naming only
+ * file is {@link writePiStallPolicyAndDefaultModel}'s contract (a partial object naming only
  * what acpx changes), and re-shaping it to carry paths would couple two
  * unrelated concerns and give up the discovery symmetry with the box.
  *
@@ -1768,7 +1768,7 @@ function piWouldLoadExtensionDir(dir: string): boolean {
 
 /**
  * pi's HTTP idle bound for acpx-PROVISIONED sessions, in ms. See
- * {@link writePiStallPolicy}.
+ * {@link writePiStallPolicyAndDefaultModel}.
  *
  * **20 000 IS A DETECTOR, NOT A WAIT (bricks bb23a7fa, 5aacdba2).** The stall this
  * bound meets is an upstream refusal, not a slow model: `qwen/qwen3.8-flash` has one
@@ -1859,6 +1859,24 @@ const PI_RETRY_BASE_DELAY_MS = 500;
  * bb23a7fa; this constant is what keeps turns working until then.
  */
 const PI_TURN_MAX_RETRIES = 7;
+
+/**
+ * The OpenRouter provider slug pi's saved-default model resolution is armed
+ * for. See {@link writePiStallPolicyAndDefaultModel}'s doc comment for the
+ * full mechanism and why this default exists at all (brick f2ac29e3).
+ */
+export const PI_DEFAULT_PROVIDER = "openrouter";
+
+/**
+ * The model a pi spawn with no explicit `--model` lands on, once
+ * {@link PI_DEFAULT_PROVIDER} is also set. Must stay a member of the set of
+ * OpenRouter models approved for use with no explicit sign-off — currently
+ * `z-ai/glm-5.3-flash` and `deepseek/deepseek-v4.1-flash` (`model-selection`
+ * → Cost traps) — because every OpenRouter-served model is metered per token
+ * against this box's own key. See {@link writePiStallPolicyAndDefaultModel}'s
+ * doc comment for the full mechanism.
+ */
+export const PI_DEFAULT_MODEL_ID = "z-ai/glm-5.3-flash";
 
 /**
  * Bound how long an acpx-provisioned pi session sits in dead air when the
@@ -1952,8 +1970,53 @@ const PI_TURN_MAX_RETRIES = 7;
  * ⚠️ `parseTimeoutSetting` THROWS on a value it cannot parse rather than falling
  * back — a malformed number here is a hard startup error, not a silent default.
  * Keep these plain integers.
+ *
+ * ## THIS FUNCTION ALSO ARMS pi's SAVED-DEFAULT MODEL — read on before you rename it
+ *
+ * `defaultProvider` / `defaultModel` below are unrelated to the stall policy
+ * above; they are bundled into the same write because this is the one place
+ * that owns the session's `settings.json`, not because they share a purpose.
+ *
+ * **Why this exists at all — real-money cost, not a preference.** Every
+ * OpenRouter-served model is metered per token against this box's own
+ * OpenRouter key, and exactly two are approved for a pi spawn with no
+ * explicit `--model`: {@link PI_DEFAULT_MODEL_ID} and
+ * `deepseek/deepseek-v4.1-flash`. Measured on devbox 2026-09-24 (brick
+ * f2ac29e3): pi's installed package hardcodes a PER-PROVIDER fallback —
+ * `defaultModelPerProvider.openrouter === "moonshotai/kimi-k2.6"`
+ * (`@earendil-works/pi-coding-agent/dist/core/model-resolver.js:10-43`,
+ * confirmed still hardcoded there, not ours to change) — and 13 of 143
+ * sampled pi sessions had silently landed on it or another unapproved model.
+ *
+ * pi's own `findInitialModel()` (`model-resolver.js:~472`) resolves in order:
+ * (1) an explicit `--model` on the CLI, (2) the first scoped model unless
+ * resuming, (3) **a saved default from settings — gated on BOTH
+ * `defaultProvider` AND `defaultModelId` being present**, (4) the
+ * hardcoded `defaultModelPerProvider` table above, (5) the first available
+ * model. With neither key set, (1)–(3) all miss and (4) is what fires. Setting
+ * only one of the two keys is inert — the gate is `&&`, not "prefer whichever
+ * is set" — so BOTH lines below are required together; do not "simplify" this
+ * to one.
+ *
+ * ⚠️ **DO NOT gate this write on "no explicit model was requested."** An
+ * explicit model already wins regardless, via step (1) above or acpx's own
+ * post-creation model application — this default only ever fires when
+ * nothing else claimed the slot. A conditional here would add a branch that
+ * changes no observable behaviour.
+ *
+ * **Scope — new sessions only, and this file only.** `findInitialModel` runs
+ * at session start; a resuming session instead calls
+ * `restoreModelFromSession(savedProvider, savedModelId, ...)`, and acpx
+ * separately re-applies the session's persisted pin on reconnect — so this
+ * cannot move a live lane. It also changes nothing for a direct (non-acpx)
+ * pi user: this `settings.json` lives only inside a per-session dir acpx
+ * creates and removes, never `~/.pi/agent/settings.json`. Residual gap, pi-side
+ * and out of scope here: `restoreModelFromSession`'s OWN fallback, taken when
+ * a saved model can no longer be restored, walks `defaultModelPerProvider`
+ * directly rather than this settings default, so a restore failure can still
+ * land on `moonshotai/kimi-k2.6`.
  */
-function writePiStallPolicy(dir: string, files: string[]): void {
+function writePiStallPolicyAndDefaultModel(dir: string, files: string[]): void {
   const settingsPath = join(dir, "settings.json");
   writeFileSync(
     settingsPath,
@@ -1961,6 +2024,8 @@ function writePiStallPolicy(dir: string, files: string[]): void {
       {
         httpIdleTimeoutMs: PI_HTTP_IDLE_TIMEOUT_MS,
         retry: { maxRetries: PI_TURN_MAX_RETRIES, baseDelayMs: PI_RETRY_BASE_DELAY_MS },
+        defaultProvider: PI_DEFAULT_PROVIDER,
+        defaultModel: PI_DEFAULT_MODEL_ID,
       },
       null,
       2,
