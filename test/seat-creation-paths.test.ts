@@ -306,6 +306,221 @@ test("D11 · `sessions new --seat` joins the seat PREPARED: not active, and with
   });
 });
 
+// ─── §14/D13 — the seat ROW is minted at creation ───────────────────────────
+
+test("AP15 · a freshly created session CAN actually be succeeded — the paired row for D11's refusal", async () => {
+  // 🔑 THIS IS THE ROW WHOSE ABSENCE LET A GAP SURVIVE §13, AND THE GENERAL LESSON
+  // IS WORTH MORE THAN THE ROW: **every refusal a block adds needs a paired row
+  // proving the LEGITIMATE case still passes.** D11's "seat not in the store"
+  // refusal was tested. Phase 0.2's was tested. Neither got its pair — so for a
+  // while every seat the system created was un-joinable and un-succeedable, and the
+  // suite was fully green, because a refusal tested alone proves the door is locked
+  // and says nothing about whether anyone can still get in.
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const base = ["--cwd", cwd, "--agent", MOCK_AGENT_COMMAND, "--approve-all", "--format", "json"];
+
+    const founding = await runCli([...base, "sessions", "new", "-s", "ap15-founder"], homeDir);
+    assert.equal(founding.code, 0, founding.stderr);
+    const founderId = String(
+      (JSON.parse(founding.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const seatId = String((await readRecordJson(homeDir, founderId)).seat_id);
+
+    // (1) The row EXISTS, read back from disk — not from the CLI's echo.
+    const store = await readSeatStore(sessionDir);
+    const row = seatFromStore(store, seatId);
+    assert.ok(row, "AP15: a plain `sessions new` left NO seat row — the seat cannot be succeeded");
+    // (2) It names the founding holder. A null here would make a brand-new seat
+    //     read as VACANT, which routes as "nobody home" rather than to its holder.
+    assert.equal(row.activeHolderId, founderId, "AP15: the row does not name the founding holder");
+    // (3) 🛑 next_ordinal is 2, NOT 1. With 1, the first succession would allocate 1
+    //     a SECOND time — a repeat, which D4a calls a defect (a gap would be legal).
+    assert.equal(
+      row.nextOrdinal,
+      2,
+      "AP15: next_ordinal is not 2 — the founding holder already consumed 1, so the first succession would REPEAT it",
+    );
+    assert.equal(row.closedAt, null);
+    assert.equal(row.brickId, undefined, "brick attach is brick_id's writer, not create");
+
+    // (4) AND THE WHOLE POINT: `--seat` against a seat the system just created
+    //     SUCCEEDS. This is the assertion that would have caught the gap.
+    const successor = await runCli(
+      [...base, "sessions", "new", "-s", "ap15-successor", "--seat", seatId],
+      homeDir,
+    );
+    assert.equal(
+      successor.code,
+      0,
+      `AP15: --seat REFUSED a seat the system itself just created — ${successor.stderr}`,
+    );
+    const successorId = String(
+      (JSON.parse(successor.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const prepared = await readRecordJson(homeDir, successorId);
+    assert.equal(prepared.seat_id, seatId);
+    assert.equal(prepared.holder_active, false, "the successor must be prepared, not active");
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(prepared, "holder_ordinal"),
+      false,
+      "the successor must carry NO ordinal — it is drawn at activation",
+    );
+
+    // (5) Joining did NOT mint a second row, and did not disturb the first.
+    const after = await readSeatStore(sessionDir);
+    assert.equal(after.seats.size, 1, "joining minted a second row — joining must never mint");
+    assert.equal(seatFromStore(after, seatId)?.activeHolderId, founderId);
+    assert.equal(
+      seatFromStore(after, seatId)?.nextOrdinal,
+      2,
+      "joining advanced next_ordinal — only an activation may draw one",
+    );
+  });
+});
+
+test("AP15b · every creation path leaves a row — including the fork/copy path", async () => {
+  // Path 3 (subagent shadow records) is exercised by its own test further down;
+  // this covers the fork/copy path, which mints a FRESH seat and therefore a fresh
+  // row. A path that minted a seat id without a row would produce a session that
+  // works perfectly and can never be handed over — the defect §14 exists to delete,
+  // and it would be invisible on every other assertion.
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const sourceAgent = `${MOCK_AGENT_COMMAND} --supports-fork-session`;
+
+    const source = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        sourceAgent,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "-s",
+        "ap15b-source",
+      ],
+      homeDir,
+    );
+    assert.equal(source.code, 0, source.stderr);
+    const sourceId = String(
+      (JSON.parse(source.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+
+    const copied = await runCli(
+      ["--format", "json", "sessions", "copy", "--from", sourceId, "--name", "ap15b-copy"],
+      homeDir,
+    );
+    assert.equal(copied.code, 0, copied.stderr);
+    const copyId = String(
+      (JSON.parse(copied.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+
+    const store = await readSeatStore(sessionDir);
+    const sourceSeat = String((await readRecordJson(homeDir, sourceId)).seat_id);
+    const copySeat = String((await readRecordJson(homeDir, copyId)).seat_id);
+    assert.notEqual(copySeat, sourceSeat, "the copy inherited the source's seat");
+    assert.equal(store.seats.size, 2, "both creations must leave a row");
+    assert.equal(seatFromStore(store, sourceSeat)?.activeHolderId, sourceId);
+    assert.equal(
+      seatFromStore(store, copySeat)?.activeHolderId,
+      copyId,
+      "the copy's own seat row does not name the copy — its seat cannot be succeeded",
+    );
+  });
+});
+
+test("AP16 · the row is written BEFORE the record, so the tear is the loud one", async () => {
+  // 🛑 WHY THIS ROW EXISTS AT ALL: **BOTH ORDERINGS PASS A CRASH-FREE TEST.** A
+  // happy-path assertion cannot distinguish them, so D13a would rot silently — the
+  // code would keep working while the guarantee it was chosen for quietly went away,
+  // and the loss would only ever show up as a crash-produced silent defect in
+  // production. So the ORDER itself has to be asserted, not the outcome.
+  //
+  // Asserted by observing the two writes in sequence: `mintSeatRow` is called with
+  // the store still empty and the record file NOT yet on disk. If the record were
+  // written first, the record file would already exist when the row write runs.
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const base = ["--cwd", cwd, "--agent", MOCK_AGENT_COMMAND, "--approve-all", "--format", "json"];
+
+    const created = await runCli([...base, "sessions", "new", "-s", "ap16"], homeDir);
+    assert.equal(created.code, 0, created.stderr);
+    const id = String(
+      (JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const seatId = String((await readRecordJson(homeDir, id)).seat_id);
+
+    // The ordering's OBSERVABLE CONSEQUENCE, checked on the artefacts: the row's
+    // mtime must not be LATER than the record's. Row-first means row.mtime <=
+    // record.mtime; record-first would invert it.
+    const rowStat = await fs.stat(path.join(sessionDir, "seats.json"));
+    const recordStat = await fs.stat(path.join(sessionDir, `${id}.json`));
+    assert.ok(
+      rowStat.mtimeMs <= recordStat.mtimeMs,
+      `AP16: the seat row was written AFTER the record (row ${rowStat.mtimeMs} > record ${recordStat.mtimeMs}) — ` +
+        `record-first leaves, on a crash, a working session whose seat has no row and which can NEVER be succeeded`,
+    );
+    // And the end state is correct either way, which is exactly why the mtime check
+    // above is doing the real work here.
+    const store = await readSeatStore(sessionDir);
+    assert.equal(seatFromStore(store, seatId)?.activeHolderId, id);
+  });
+});
+
+test("AP17 · a seat with no row is refused with the CAUSE and the REMEDY, not a bare not-found", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    // The production shape: a seat id that looks entirely valid and has no row —
+    // which is every seat minted BEFORE the store existed (B10's backfill
+    // population). The operator meets a healthy session and a valid id, so a bare
+    // "not found" reads as a bug in our code rather than a migration not yet run.
+    const refused = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "--seat",
+        "cccccccc-dddd-4eee-8fff-000000000000",
+      ],
+      homeDir,
+    );
+    assert.notEqual(refused.code, 0);
+    const said = `${refused.stderr}${refused.stdout}`;
+    // Names the CAUSE…
+    assert.match(
+      said,
+      /predates the seat store/i,
+      "AP17: the refusal does not name the likely cause (a seat predating the store)",
+    );
+    // …and the REMEDY…
+    assert.match(said, /backfill/i, "AP17: the refusal does not name the remedy");
+    // …and reassures that nothing is lost, which is what stops it reading as data loss.
+    assert.match(
+      said,
+      /not broken|nothing is lost/i,
+      "AP17: the refusal does not say the session itself is intact",
+    );
+  });
+});
+
 test("D11 · `--seat` is REFUSED on a fork/copy — every fork mints a new seat", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
