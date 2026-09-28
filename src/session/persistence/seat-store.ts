@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { withSessionIndexLock } from "./index-lock.js";
+import { SEAT_STORE_FILE } from "./session-dir-files.js";
 
 /**
  * THE SEAT STORE — the authority for who holds each seat.
@@ -88,10 +89,13 @@ import { withSessionIndexLock } from "./index-lock.js";
  * near today; both are measurable, and neither is a date.
  */
 
-/** The store's filename inside `SESSIONS_DIR`. Exported because acpx-ui's watcher
- * classifier and its orphan filters must name the same file — a filename
- * hand-copied per call site is §E72's shape. */
-export const SEAT_STORE_FILE = "seats.json";
+/** The store's filename inside `SESSIONS_DIR`.
+ *
+ * Re-exported from `session-dir-files.ts` rather than defined here, so there is ONE
+ * definition in the repo and every enumerator of `SESSIONS_DIR` consults the same
+ * registry. A filename hand-copied per call site is §E72's shape — and worse, a
+ * deny-list that spells it breaks again the next time a file joins that directory. */
+export { SEAT_STORE_FILE };
 
 /**
  * A seat. **THE FIELD SET IS CLOSED AND COMPLETE AT SEVEN** — Daniel, 2026-09-28

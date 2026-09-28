@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { isNonSessionRecordFile } from "../persistence/session-dir-files.js";
 import {
   claimFileSets,
   claimOrphanFileSets,
@@ -345,7 +346,22 @@ export async function scanSessionDir(hotDir: string): Promise<{
   ignoredFiles: string[];
 }> {
   const dirents = await fs.readdir(hotDir, { withFileTypes: true });
-  const files = dirents.filter((entry) => entry.isFile()).map((entry) => entry.name);
+  // 🛑 acpx'S OWN STORES ARE EXCLUDED BEFORE CLASSIFICATION, not left to a downstream
+  // guard (brick b64dfbb3 / B2). This scan applies no name filter at all, so a store
+  // file enters as UNCLAIMED and reaches the ORPHAN path — and the orphan path's only
+  // protection is `INGEST_ORPHAN_ID_SHAPE` rejecting a stem that does not look like a
+  // minted id. That is precisely the incidental escape `RESERVED_ID_PARTS`'s own header
+  // says must not be relied on ("each is one rename away from eligibility"), and the
+  // archive side applies no shape guard at all by design. `seats` is named in that list
+  // as well; this is the other half, and it keeps the store out of the classifier
+  // rather than trusting the classifier to let it go.
+  //
+  // ⚠️ THE STAKES: the seat store is the one artefact here that cannot be rebuilt from
+  // a projection — it holds each seat's active holder and next ordinal, nothing else
+  // holds either, and re-minting a counter RE-ISSUES ordinals that must never repeat.
+  const files = dirents
+    .filter((entry) => entry.isFile() && !isNonSessionRecordFile(entry.name))
+    .map((entry) => entry.name);
 
   const [stats, recordTables] = await Promise.all([
     statAllFiles(hotDir, files),

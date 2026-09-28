@@ -11,6 +11,7 @@ import { textPrompt } from "../src/prompt-content.js";
 import {
   readSeatStore,
   resolveSessionRecord,
+  seatFromStore,
   withSeatStoreWrite,
 } from "../src/session/persistence.js";
 import type { SessionNotification, SessionRecord } from "../src/types.js";

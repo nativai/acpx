@@ -10,7 +10,7 @@ import { modelSetMethodKnownUnsupported } from "../mode-preference.js";
 import { withSessionIndexLock } from "./index-lock.js";
 import { parseSessionRecord } from "./parse.js";
 import { parseSeatFieldsFromIndexEntry, seatFieldsToIndexEntry } from "./seat-fields.js";
-import { SEAT_STORE_FILE } from "./seat-store.js";
+import { isNonSessionRecordFile } from "./session-dir-files.js";
 
 const SESSION_INDEX_SCHEMA = "acpx.session-index.v1";
 
@@ -690,15 +690,15 @@ async function listSessionRecordFiles(sessionDir: string): Promise<string[]> {
       (entry) =>
         entry.isFile() &&
         entry.name.endsWith(".json") &&
-        entry.name !== "index.json" &&
-        // 🛑 THE SEAT STORE IS NOT A SESSION RECORD (brick b64dfbb3 / B2). It lives in
-        // this same directory deliberately, so every enumerator here has to know about
-        // it. Without this clause `seats.json` is listed as a session record file, lands
-        // in the index's `files` array, and `readIndexEntryFromDisk` then tries to parse
-        // the seat store as a record — a permanent files-vs-entries mismatch that makes
-        // the reconciler do work on every pass and finds nothing wrong to report.
-        // Nothing errors, which is why it needs naming rather than a downstream guard.
-        entry.name !== SEAT_STORE_FILE,
+        // 🛑 THROUGH THE REGISTRY, NOT A NAME. This filter used to spell `index.json`
+        // and nothing else, which is why the seat store — added to this same directory
+        // deliberately — was silently enumerated as a session record the day it landed:
+        // `seats.json` reached the index's `files` array and `readIndexEntryFromDisk`
+        // tried to parse the store as a record, a permanent files-vs-entries mismatch
+        // that costs work on every reconcile and reports nothing. A deny-list over a
+        // directory breaks EVERY time a file is added, so the names live in ONE place
+        // (`session-dir-files.ts`) that every such site imports.
+        !isNonSessionRecordFile(entry.name),
     )
     .map((entry) => entry.name)
     .toSorted();

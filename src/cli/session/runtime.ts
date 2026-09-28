@@ -115,10 +115,8 @@ import {
 import {
   absolutePath,
   isoNow,
-  mintSeatRow,
   readPersistedLifecycle,
   resolveSessionRecord,
-  sessionBaseDir,
   writeSessionRecord,
   writeSessionRecordAtBoundary,
   type PersistedSessionLifecycle,
@@ -2519,23 +2517,40 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
 
             void (async () => {
               try {
-                // 🛑 D13/D13a — CREATION PATH 3 MINTS A SEAT ROW TOO, AND THE ROW GOES
-                // FIRST. This path is the one NOT reached through
-                // `createSessionRecordWithClient`, so it needs the mint explicitly — and
-                // a shadow record with a row-less seat is exactly the silent defect §14
-                // exists to delete, one creation path over: a session that works
-                // perfectly and can never be succeeded. No carve-out for
-                // `kind:"subagent"` (Daniel's no-carve-outs ruling): it is a real seat.
-                // Row-first for the same reason as the other two paths — the only torn
-                // state it can leave is an inert orphan row, never a row-less seat.
-                if (childRecord.seatId !== undefined) {
-                  await mintSeatRow(sessionBaseDir(), {
-                    seatId: childRecord.seatId,
-                    holderId: childRecord.acpxRecordId,
-                    name: childRecord.name,
-                    createdAt: spawnedAt,
-                  });
-                }
+                // 🛑 CREATION PATH 3 DOES **NOT** MINT ITS SEAT ROW YET, AND THAT IS A
+                // MEASURED BLOCK RATHER THAN AN OVERSIGHT. §14/D13 requires it — a
+                // shadow record whose seat has no row is a session that works perfectly
+                // and can never be succeeded, which is exactly the defect §14 deletes,
+                // one creation path over — and there is no carve-out for
+                // `kind:"subagent"`. It is owed. What stopped it:
+                //
+                // Adding `await mintSeatRow(...)` here made this path fail
+                // INTERMITTENTLY — measured 1 failure in 3 runs on a loaded box (load1
+                // ~26). The mint itself SUCCEEDS (27 ms); what fails is
+                // `writeSessionRecord(childRecord)` below, with
+                // `OutboxError: outbox-busy` after its full 4 s retry budget — so the
+                // child record is never written and the parent never lists the subagent.
+                // ⚠️ THAT LOSS IS SILENT: the enclosing catch is best-effort by design,
+                // so the turn continues and nothing reports the missing shadow record.
+                // An intermittent silent loss is not something to ship into a path whose
+                // error handling cannot surface it.
+                //
+                // ⚠️ THE MECHANISM IS NOT ESTABLISHED, and it is stated that way on
+                // purpose. The suggestive datum is that duration alone does not explain
+                // it — a plain `setTimeout(40)` in this exact position passes while the
+                // 27 ms mint fails, and `setTimeout(2500)` fails — which points at the
+                // mint TAKING THE `index.json` LOCK (D13b) rather than at how long it
+                // takes, plausibly contending with the live turn's own index write while
+                // that write holds the record outbox. **Plausible, not proven.** An
+                // earlier note here claimed this deterministically (3/3) and named lock
+                // ordering as the cause; both were wrong — the 3/3 was measured against a
+                // tree in which this very `writeSessionRecord(childRecord)` call had been
+                // deleted by an editing slip, so it was not measuring the mint at all.
+                //
+                // ⇒ Routed to the B2 sub-HoD rather than worked around, because the fix
+                // is a choice between D13a's row-before-record ordering and D13b's hold,
+                // and both are locked decisions. Paths 1 and 2 — the CLI-driven ones, not
+                // inside a live turn — mint correctly and are unaffected.
                 await writeSessionRecord(childRecord);
                 const parentRecord = eventWriter.getRecord();
                 parentRecord.subagents = [...(parentRecord.subagents ?? []), subagentRef];
