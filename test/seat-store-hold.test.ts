@@ -255,6 +255,62 @@ test("AP11: the hold performs exactly one store read and one store write, and to
   });
 });
 
+test("AP11: the bound holds on an EMPTY store too — the state where it was actually broken", async () => {
+  // 🛑 THIS ROW EXISTS BECAUSE THE ONE ABOVE PASSED WHILE THE BOUND WAS BROKEN. The
+  // writer used to do a SECOND `readFile` inside the hold, to tell an absent file from an
+  // unparseable one — and that extra read fired ONLY when the parsed store was empty,
+  // which is exactly the CREATE path. The headline row's fixture seeds a seat, so the
+  // store is never empty and the assertion never entered the state it claimed to cover.
+  // Found while fixing F1, not by this file.
+  //
+  // ⚠️ THE GENERAL LESSON, and it is the same one twice more on this block: a bound
+  // asserted only in the easy state is unverified exactly where it is easiest to break.
+  // The fixture has to exercise the state the code special-cases.
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "acpx-seat-hold-empty-"));
+  const sessionDir = path.join(dir, "sessions");
+  await fsp.mkdir(sessionDir, { recursive: true });
+  await fsp.writeFile(
+    path.join(sessionDir, "a-holder.json"),
+    JSON.stringify({ schema: "acpx.session.v1", acpx_record_id: "a-holder" }),
+    "utf8",
+  );
+  try {
+    // NO seats.json at all — the first-write-on-a-fresh-box case.
+    const ops = await recordFsOps(async () => {
+      await withSeatStoreWrite(sessionDir, (store) => {
+        assert.equal(store.fileState, "absent", "fixture precondition: no store yet");
+        const seats = new Map(store.seats);
+        seats.set(SEAT_ID, {
+          seatId: SEAT_ID,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          activeHolderId: "a-holder",
+          nextOrdinal: 2,
+          closedAt: null,
+          name: undefined,
+          brickId: undefined,
+        });
+        return { mutation: { kind: "write" as const, seats }, result: undefined };
+      });
+    });
+    const counts = summarise(sessionDir, ops);
+    const detail = JSON.stringify(counts);
+    // ONE read even though there is nothing to read — the ENOENT is the read.
+    assert.equal(counts["seat-store:readFile"], 1, `expected exactly ONE store read — ${detail}`);
+    assert.equal(counts["seat-store-temp:writeFile"], 1, `expected ONE temp write — ${detail}`);
+    assert.equal(counts["seat-store-temp:rename"], 1, `expected ONE rename — ${detail}`);
+    for (const api of [...ASYNC_APIS, ...SYNC_APIS]) {
+      assert.equal(
+        counts[`record:${api}`],
+        undefined,
+        `RECORD I/O (${api}) in the hold — ${detail}`,
+      );
+      assert.equal(counts[`index:${api}`], undefined, `INDEX I/O (${api}) in the hold — ${detail}`);
+    }
+  } finally {
+    await fsp.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
 test("AP11: a no-change mutation reads ONCE and writes NOTHING", async () => {
   // The other half of the bound. An O(all-seats) rewrite that changes nothing is
   // pure cost, and on a missing store it would additionally CREATE the file — so

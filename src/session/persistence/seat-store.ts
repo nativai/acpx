@@ -652,7 +652,11 @@ export async function withSeatStoreWrite<T>(
  *   the damage surfaces only when someone first tries to hand over. **Silent, permanent,
  *   and it is exactly the gap §14 exists to delete, reproduced by a crash.**
  * - **row first** ⇒ an orphan row nobody references. Creation failed, the caller holds
- *   no seat id, no session claims it: ~290 bytes, inert, and **visible** in `seats list`
+ *   no seat id, no session claims it: ~290 bytes, inert, and **enumerable from the
+ *   store**. ⚠️ NOT yet visible in any verb: `acpx seats list` is D12's and IS NOT BUILT
+ *   (measured at the CLI: rc 4, "No acpx session found" — the token is not a registered
+ *   verb, so it is absorbed as an agent name). Said as not-yet-built rather than reworded,
+ *   so nobody reads this as a capability that exists
  *   as a seat with an unresolvable holder.
  *
  * ⇒ Row-first makes the SILENT state structurally unreachable and leaves only the loud

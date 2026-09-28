@@ -655,15 +655,60 @@ test("D11 · `--seat` is REFUSED on a fork/copy — every fork mints a new seat"
       homeDir,
     );
     assert.notEqual(refused.code, 0, "`sessions copy --seat` was ACCEPTED");
-    // 🔑 A SILENTLY-IGNORED FLAG AND A SILENTLY-HONOURED ONE ARE BOTH WORSE THAN
-    // AN ERROR, so the row asserts the operator was TOLD — not merely that no seat
-    // was inherited. `--seat` is not registered on `copy` at all, so this is
-    // commander's unknown-option refusal; the library-level guard covers the
-    // combination on every other path.
+    // 🛑 THIS ROW NAMES *WHICH* MECHANISM REFUSES, AND THAT PRECISION IS THE POINT
+    // (finding F4). An earlier version asserted `/unknown option|--seat/i`, which
+    // matched EITHER mechanism — and since `refuseSeatJoinOnForkPath`'s own message also
+    // contains "--seat", the row was green whichever one fired AND green through a
+    // SILENT SWAP between them.
+    //
+    // TODAY THE REFUSAL COMES FROM THE FLAG REGISTRATION: `--seat` is registered on
+    // `sessions new` and NOT on `copy`, so commander rejects the unknown option before
+    // any of our code runs. Asserted on commander's own wording, so that if anyone
+    // registers `--seat` on `copy` — the natural "improvement", to give a better
+    // message — THIS ROW GOES RED and they must make the library guard load-bearing and
+    // say so here, instead of the protection quietly changing hands.
     assert.match(
       `${refused.stderr}${refused.stdout}`,
-      /unknown option|--seat/i,
-      "the refusal did not mention the rejected option",
+      /unknown option/i,
+      "the refusal is no longer commander's unknown-option error — if `--seat` was " +
+        "registered on `copy`, then `refuseSeatJoinOnForkPath` is now the only thing " +
+        "refusing, and that mechanism must be asserted here instead (see F4)",
+    );
+  });
+});
+
+test("F4 · the fork/copy GUARD itself refuses, independently of the flag registration", async () => {
+  // 🔑 WHY A SEPARATE ROW: `refuseSeatJoinOnForkPath` is REAL CODE WITH NO COVERAGE, and
+  // it is currently UNREACHABLE THROUGH THE CLI BY CONSTRUCTION — verified at source:
+  // `seatId` is passed into the create options only at the `sessions new` builder and
+  // `forkFromSessionId` only at the `copy` builder, two separate object literals, so the
+  // two are never set together. The row above proves the FLAG REGISTRATION refuses; this
+  // one proves THE GUARD would refuse if anything ever set both, which is exactly the
+  // state the natural "register --seat on copy" improvement would create.
+  //
+  // Driven against the library, because no CLI invocation can reach it. That is not a
+  // weaker test — it is the only instrument that can reach this code at all, and without
+  // it the guard is an untested claim sitting behind an assertion that passes for another
+  // reason entirely (F4).
+  const { createSession } = await import("../src/session/session.js");
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await assert.rejects(
+      () =>
+        createSession({
+          agentCommand: MOCK_AGENT_COMMAND,
+          cwd,
+          permissionMode: "approve-all",
+          // BOTH set — the combination the CLI cannot currently produce.
+          seatId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+          forkFromSessionId: "some-source-session",
+        }),
+      (error: unknown) =>
+        error instanceof Error &&
+        error.message.includes("--seat cannot be combined with a fork or copy") &&
+        error.message.includes("every fork mints a NEW seat"),
+      "the guard did not refuse the seat+fork combination, or refused without saying why",
     );
   });
 });

@@ -166,6 +166,33 @@ function seatFieldsForCreate(
  * different histories claim the same identity, which is the mis-seating D11's whole
  * asymmetry exists to prevent.
  *
+ * ⚠️ **CURRENTLY UNREACHABLE THROUGH THE CLI, BY CONSTRUCTION — AND KEPT DELIBERATELY**
+ * (finding F4). `seatId` reaches the create options only from the `sessions new` builder
+ * and `forkFromSessionId` only from the `copy` builder — two separate object literals —
+ * so nothing sets both today, and what actually refuses `sessions copy --seat` is
+ * commander rejecting an unregistered option. This guard is defence-in-depth for the
+ * in-process/library path.
+ *
+ * 🛑 **REGISTERING `--seat` ON `copy` IS DELIBERATELY NOT DONE, AND THE REASON IS FAILURE
+ * MODES RATHER THAN MESSAGE QUALITY.** Today the refusal is STRUCTURAL: the parser does
+ * not know the flag on that verb, so `copy --seat` cannot reach any code — **a
+ * parser-level barrier cannot regress silently.** Register it and the barrier becomes a
+ * RUNTIME CHECK, and if that check ever regresses, `copy --seat X` **silently joins a
+ * seat** — violating Daniel's binding ruling that every fork mints a new seat, and
+ * reproducing exactly the defect the restored G2/path-2 row exists to catch. A better
+ * message is worth having; it is not worth that price.
+ *
+ * ⇒ **SEQUENCED, NOT REJECTED.** Now that this guard is actually tested (below), the UX
+ * improvement becomes a *safe* follow-up with a real test behind it, rather than a swap
+ * that promotes an untested path to load-bearing. A later block's to take, with the AP13
+ * row updated in the same change.
+ *
+ * 🛑 IT IS TESTED DIRECTLY, because it has to be: no CLI invocation can reach it, and the
+ * AP13 row that looks like its test is actually asserting the flag registration.
+ * `seat-creation-paths.test.ts` carries both — one row pinned to commander's
+ * unknown-option wording so the protection cannot change hands silently, and one driving
+ * this function through `createSession` with both fields set.
+ *
  * ⚠️ WHY A THROW AND NOT A SILENT IGNORE. The mint seam is shared between the normal
  * and fork/copy paths, so the tempting `seatId ?? randomUUID()` would honour the flag
  * on a fork; the tempting "fix" is to drop the flag on that path instead. **Both are
@@ -525,7 +552,8 @@ async function createSessionRecordWithClient(
   // Record-first leaves, on a crash, a session carrying a seatId with NO ROW: a fully
   // working session that can never be succeeded, discovered only when someone first
   // tries to hand over — silent and permanent. Row-first leaves an orphan row nobody
-  // references: inert, ~290 bytes, and visible in `seats list`. Only one of those two
+  // references: inert, ~290 bytes, and enumerable from the store — though NOT yet
+  // visible in any verb, since `acpx seats list` is D12's and is not built. Only one of those two
   // torn states is loud, so only one ordering is allowed.
   // ⚠️ Do NOT move this below the record write for tidiness, and do not fold it into the
   // record write's own lock even though the index lock is re-entrant and would allow it.

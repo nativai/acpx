@@ -31,10 +31,17 @@ import { resolveAcpxUiBaseUrl } from "../../acp/auth-env.js";
  * ⚠️ NOT `.json`-suffixed, and that is STRUCTURAL rather than stylistic.
  *
  * acpx's own index rebuild ingests every `*.json` in this directory as a
- * candidate session record (`persistence/index.ts` `listSessionRecordFiles`:
- * `name.endsWith(".json") && name !== "index.json"`) and relies on the parse
- * failure to discard it. The live store is the proof of what that costs: 200
+ * candidate session record (`persistence/index.ts` `listSessionRecordFiles` — read
+ * the filter there, it is not quoted here) and relies on the parse failure to
+ * discard it. The live store is the proof of what that costs: 200
  * `<id>.delivery.json` files are read and thrown away on every rebuild.
+ *
+ * ⚠️ THE FILTER USED TO BE QUOTED VERBATIM HERE AND THE QUOTATION WENT STALE — it
+ * still read `name !== "index.json"` one commit after that site moved to the shared
+ * `session-dir-files.ts` registry (finding F6). **The property this file depends on
+ * was, and is, intact**; only the copy had rotted. Replaced with a pointer, because a
+ * citation cannot go stale the way a copy can — and what this file actually needs is
+ * the `.endsWith(".json")` test, which is stable and is asserted below.
  *
  * `"deletions.ndjson".endsWith(".json")` is FALSE — the last five characters are
  * `djson` — so this file is invisible to that filter, and equally to acpx-ui's
