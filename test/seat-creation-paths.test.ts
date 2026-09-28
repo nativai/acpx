@@ -26,7 +26,6 @@ import {
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 const MOCK_AGENT_COMMAND = `node ${JSON.stringify(MOCK_AGENT_PATH)}`;
-const MOCK_AGENT_WITH_FORK_SESSION = `${MOCK_AGENT_COMMAND} --supports-fork-session`;
 
 type CliResult = { code: number | null; stdout: string; stderr: string };
 
@@ -119,60 +118,22 @@ test("G2/path 1 · `sessions new` mints a fresh seat, read back from DISK", asyn
 });
 
 // ─── Path 2 — fork / copy ───────────────────────────────────────────────────
-
-test("G2/path 2 · `sessions copy` mints a NEW seat, never inherits the source's, read back from DISK", async () => {
-  await withTempHome(async (homeDir) => {
-    const cwd = path.join(homeDir, "workspace");
-    await fs.mkdir(cwd, { recursive: true });
-
-    const created = await runCli(
-      [
-        "--cwd",
-        cwd,
-        "--agent",
-        MOCK_AGENT_WITH_FORK_SESSION,
-        "--approve-all",
-        "--format",
-        "json",
-        "sessions",
-        "new",
-        "-s",
-        "path2-source",
-      ],
-      homeDir,
-    );
-    assert.equal(created.code, 0, created.stderr);
-    const sourceId = String(
-      (JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
-    );
-    const sourceOnDisk = await readRecordJson(homeDir, sourceId);
-    const sourceSeatId = sourceOnDisk.seat_id;
-    assert.equal(typeof sourceSeatId, "string");
-
-    const copied = await runCli(
-      ["--format", "json", "sessions", "copy", "--from", sourceId, "--name", "path2-fork"],
-      homeDir,
-    );
-    assert.equal(copied.code, 0, copied.stderr);
-    const forkedId = String(
-      (JSON.parse(copied.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
-    );
-
-    const forkedOnDisk = await readRecordJson(homeDir, forkedId);
-    assert.equal(
-      typeof forkedOnDisk.seat_id === "string" && forkedOnDisk.seat_id.length > 0,
-      true,
-      "path 2: seat_id absent/empty on the record read back from disk",
-    );
-    assert.notEqual(
-      forkedOnDisk.seat_id,
-      sourceSeatId,
-      "a fork must NEVER inherit the source's seat (Daniel, 2026-09-22: every fork mints a new seat)",
-    );
-    assert.equal(forkedOnDisk.holder_ordinal, 1);
-    assert.equal(forkedOnDisk.holder_active, true);
-  });
-});
+//
+// REMOVED (Daniel, 2026-09-28: "if this Test is doing trouble then completely
+// remove it please") — brick://d9ba2870. The row itself was sound; it reliably
+// tripped over the SHARED `withTempHome` fixture's cleanup racing the detached
+// `__queue-owner` daemon that `sessions new`/`sessions copy` intentionally
+// leave running past the CLI call's own exit (queue-owner-process.ts spawns it
+// `detached: true`, by design — see owner-reaper.ts). That daemon can still be
+// writing under `<tempHome>/.acpx/sessions/` when this test's own `withTempHome`
+// tears down its temp HOME, so `fs.rm(..., {recursive:true})` intermittently
+// (~1 in 5 runs, reproduced with no concurrent box load) throws:
+//   ENOTEMPTY: directory not empty, rmdir '<tempHome>/.acpx/sessions'
+// `withTempHome`'s cleanup is now retry-tolerant of exactly that race (below),
+// which is the fix for the other 64 files sharing the fixture; this row is
+// simply gone rather than reintroduced, per the ruling above. Only path 1 and
+// path 3 remain exercising G2 — the three-tests rationale at the top of this
+// file predates the removal.
 
 // ─── Path 3 — subagent shadow record (teammate_spawned) ────────────────────
 //
