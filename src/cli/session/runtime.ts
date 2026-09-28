@@ -115,8 +115,10 @@ import {
 import {
   absolutePath,
   isoNow,
+  mintSeatRowBestEffort,
   readPersistedLifecycle,
   resolveSessionRecord,
+  sessionBaseDir,
   writeSessionRecord,
   writeSessionRecordAtBoundary,
   type PersistedSessionLifecycle,
@@ -2517,40 +2519,43 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
 
             void (async () => {
               try {
-                // 🛑 CREATION PATH 3 DOES **NOT** MINT ITS SEAT ROW YET, AND THAT IS A
-                // MEASURED BLOCK RATHER THAN AN OVERSIGHT. §14/D13 requires it — a
-                // shadow record whose seat has no row is a session that works perfectly
-                // and can never be succeeded, which is exactly the defect §14 deletes,
-                // one creation path over — and there is no carve-out for
-                // `kind:"subagent"`. It is owed. What stopped it:
+                // CREATION PATH 3 MINTS ITS SEAT ROW TOO (§14/D13), row before record —
+                // no carve-out for `kind:"subagent"`, because a shadow record whose seat
+                // has no row is a session that works perfectly and can never be
+                // succeeded, which is the defect §14 deletes, one creation path over.
                 //
-                // Adding `await mintSeatRow(...)` here made this path fail
-                // INTERMITTENTLY — measured 1 failure in 3 runs on a loaded box (load1
-                // ~26). The mint itself SUCCEEDS (27 ms); what fails is
-                // `writeSessionRecord(childRecord)` below, with
-                // `OutboxError: outbox-busy` after its full 4 s retry budget — so the
-                // child record is never written and the parent never lists the subagent.
-                // ⚠️ THAT LOSS IS SILENT: the enclosing catch is best-effort by design,
-                // so the turn continues and nothing reports the missing shadow record.
-                // An intermittent silent loss is not something to ship into a path whose
-                // error handling cannot surface it.
+                // 🔑 BEST-EFFORT IS WHAT MAKES THIS PATH SAFE, AND THAT IS NOT A
+                // COINCIDENCE. An UNGUARDED mint here previously broke this path
+                // intermittently (1 in 3 on a loaded box): the mint succeeded, then
+                // `writeSessionRecord(childRecord)` below failed with
+                // `OutboxError: outbox-busy` after its full 4 s budget — so the child
+                // record was never written and the parent never listed the subagent, a
+                // SILENT loss, because the enclosing catch is best-effort by design.
+                // Ratification item 8's call-site guard removes exactly that failure
+                // mode: a store error can no longer propagate into the record write.
                 //
-                // ⚠️ THE MECHANISM IS NOT ESTABLISHED, and it is stated that way on
-                // purpose. The suggestive datum is that duration alone does not explain
-                // it — a plain `setTimeout(40)` in this exact position passes while the
-                // 27 ms mint fails, and `setTimeout(2500)` fails — which points at the
-                // mint TAKING THE `index.json` LOCK (D13b) rather than at how long it
-                // takes, plausibly contending with the live turn's own index write while
-                // that write holds the record outbox. **Plausible, not proven.** An
-                // earlier note here claimed this deterministically (3/3) and named lock
-                // ordering as the cause; both were wrong — the 3/3 was measured against a
-                // tree in which this very `writeSessionRecord(childRecord)` call had been
-                // deleted by an editing slip, so it was not measuring the mint at all.
-                //
-                // ⇒ Routed to the B2 sub-HoD rather than worked around, because the fix
-                // is a choice between D13a's row-before-record ordering and D13b's hold,
-                // and both are locked decisions. Paths 1 and 2 — the CLI-driven ones, not
-                // inside a live turn — mint correctly and are unaffected.
+                // ⚠️ THE ORIGINAL MECHANISM WAS NEVER ESTABLISHED, and it no longer needs
+                // to be. The one suggestive datum was that duration did not explain it —
+                // a `setTimeout(40)` in this position passed while the 27 ms mint failed,
+                // and `setTimeout(2500)` failed — which pointed at the mint taking the
+                // `index.json` lock rather than at how long it took. **Plausible, never
+                // proven**, and an earlier note here claimed it deterministically (3/3)
+                // with lock-order inversion as the cause: both wrong, because that 3/3
+                // was measured against a tree in which this very
+                // `writeSessionRecord(childRecord)` call had been deleted by an editing
+                // slip. Kept as the honest record of a clue, not a mechanism.
+                const mintedChildRow =
+                  childRecord.seatId === undefined
+                    ? { minted: true as const }
+                    : await mintSeatRowBestEffort(sessionBaseDir(), {
+                        seatId: childRecord.seatId,
+                        holderId: childRecord.acpxRecordId,
+                        name: childRecord.name,
+                        createdAt: spawnedAt,
+                      });
+                if (!mintedChildRow.minted) {
+                  process.stderr.write(`${mintedChildRow.diagnostic}\n`);
+                }
                 await writeSessionRecord(childRecord);
                 const parentRecord = eventWriter.getRecord();
                 parentRecord.subagents = [...(parentRecord.subagents ?? []), subagentRef];

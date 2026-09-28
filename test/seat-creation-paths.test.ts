@@ -382,6 +382,114 @@ test("AP15 · a freshly created session CAN actually be succeeded — the paired
   });
 });
 
+test("item 8 · a CORRUPT store still creates a USABLE session, keeps the seat_id, and WARNS", async () => {
+  // 🛑 THE PAIRED ROW IS THE HEALTHY-STORE CASE IN AP15 ABOVE. Without both halves this
+  // row cannot tell "fail-open working" from "the mint was silently skipped" — which is
+  // the same paired-row rule applied to the fix itself.
+  //
+  // WHY FAIL-OPEN, in one line each, and neither reason expires:
+  //  (i) FAIL-CLOSED IS A BOOTSTRAP TRAP — every recovery path on these boxes runs
+  //      through creating an agent session, so a store that stops `sessions new` stops
+  //      its own repair, and a perfectly worded error does not create the session
+  //      needed to act on it.
+  // (ii) the "seat_id with no row" state is NEITHER silent NOR permanent: AP17 (decided
+  //      after D13a) makes it loud, and the backfill repairs it.
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    await fs.mkdir(sessionDir, { recursive: true });
+    // A store that EXISTS and cannot be parsed — the writer must refuse to overwrite it.
+    await fs.writeFile(path.join(sessionDir, "seats.json"), "{ not json at all", "utf8");
+
+    const created = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "-s",
+        "item8",
+      ],
+      homeDir,
+    );
+    // 1. THE SESSION IS STILL CREATED. This is the whole ruling.
+    assert.equal(created.code, 0, `a corrupt seat store failed the spawn: ${created.stderr}`);
+    const id = String(
+      (JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+
+    // 2. IT KEEPS ITS seat_id — the handle the backfill keys on, and what keeps its
+    //    children's parent_seat_id chain from being orphaned. Dropping it would make the
+    //    session invisible to repair.
+    const onDisk = await readRecordJson(homeDir, id);
+    assert.equal(
+      typeof onDisk.seat_id === "string" && onDisk.seat_id.length > 0,
+      true,
+      "the session lost its seat_id — it is now invisible to the backfill and its " +
+        "descendants' seat edges are orphaned",
+    );
+
+    // 3. IT WARNED, LOUDLY, AND NAMED THE REAL REPAIR. Never a bare `.catch(() => {})`.
+    assert.match(created.stderr, /seat-row-not-minted/, "the store failure was swallowed");
+    assert.match(created.stderr, /USABLE/i, "the warning does not say the session is fine");
+    // 🔑 AND THE REMEDY IS THE CORRUPTION ONE, NOT "run the backfill" — which cannot
+    // repair a malformed file and refuses to run against one. Telling the operator to
+    // run it here would be a confident instruction to do the wrong thing (F1).
+    assert.match(
+      created.stderr,
+      /quarantine/i,
+      "the warning gives the wrong remedy for corruption",
+    );
+
+    // 4. AND THE CORRUPT BYTES SURVIVE — a corrupt store may hold hand-recoverable rows.
+    assert.match(await fs.readFile(path.join(sessionDir, "seats.json"), "utf8"), /not json at all/);
+  });
+});
+
+test("item 8 · an ABSENT store is NOT an error and emits NO diagnostic — the first write creates it", async () => {
+  // Condition (a). ⚠️ THIS IS THE ONE THAT WOULD HAVE BEEN WRONG BY DEFAULT: a fresh box
+  // has no `seats.json`, so treating absence as a failure would fire a scary diagnostic
+  // on EVERY first `sessions new` after deploy.
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+
+    const created = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "-s",
+        "fresh-box",
+      ],
+      homeDir,
+    );
+    assert.equal(created.code, 0, created.stderr);
+    assert.doesNotMatch(
+      created.stderr,
+      /seat-row-not-minted/,
+      "an absent store emitted a diagnostic — it is not an error, the first write CREATES the file",
+    );
+    // …and the file now exists with the row in it.
+    const store = await readSeatStore(sessionDir);
+    assert.equal(store.fileState, "ok");
+    assert.equal(store.seats.size, 1, "the first write did not create the store");
+  });
+});
+
 test("AP15b · every creation path leaves a row — including the fork/copy path", async () => {
   // Path 3 (subagent shadow records) is exercised by its own test further down;
   // this covers the fork/copy path, which mints a FRESH seat and therefore a fresh

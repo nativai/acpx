@@ -664,12 +664,18 @@ OTHER THINGS WORTH KNOWING.
       await handleSessionsSetParent(flags, this, config);
     });
 
-  // THE SUCCESSION VERB (§2.7, brick b64dfbb3). On `sessions` rather than under a new
-  // top-level verb for the reason D11 gives: `sessions` is already in TOP_LEVEL_VERBS,
-  // so this touches neither registration and cannot trip the two-registration hazard —
-  // and it mutates SESSION records, which is where `close`, `set-parent` and `rename`
-  // already live. D12's `seats` verb is a READ surface; a mutating verb does not belong
-  // on it.
+  // THE SUCCESSION VERB (§2.7, brick b64dfbb3). Its placement on the `sessions` surface —
+  // one name, no alias — is PINNED in `CONCEPTION.md` §3.6 (amended bullet 2); the
+  // reasoning lives there rather than here.
+  //
+  // ⚠️ RE-EXAMINED AND DELIBERATELY KEPT when B2b made `seats` a MUTATION surface
+  // (`seats set-brick` / `rename` / `delete`), which retired the earlier "`seats` is a
+  // read surface" argument. Read §3.6 before moving it; do not move it on the strength of
+  // the retired one.
+  //
+  // (Cited rather than restated on purpose: a citation cannot go stale the way a copy
+  // can — finding F6 on this same block was exactly a quotation that had rotted while
+  // the property it described was fine.)
   sessionsCommand
     .command("activate")
     .description(

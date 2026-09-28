@@ -58,13 +58,23 @@ import { SEAT_STORE_FILE } from "./session-dir-files.js";
  * ## 🛑 THE READER FAILS OPEN AND THE WRITER FAILS CLOSED — AND THAT ASYMMETRY IS
  * DELIBERATE. DO NOT "FIX" IT INTO SYMMETRY.
  *
- * `parseSeatStore` treats an unreadable top level as an EMPTY store; `withSeatStoreWrite`
+ * The reader RETURNS rather than throws for an unhealthy file; `withSeatStoreWrite`
  * REFUSES to write over one (`SeatStoreUnwritableError`). Each leg fails in the
  * direction that is recoverable:
  *
  * - a reader that failed closed would make the whole box **unroutable over one bad
  *   byte** — every delivery on every seat, for a defect in one row;
  * - a writer that failed open would **destroy the authority**.
+ *
+ * 🛑 **BUT "FAILS OPEN" MEANS *ROUTING CONTINUES VIA THE MIRROR*, NEVER *THE STORE IS
+ * SILENTLY EMPTY*** — and an earlier version of this module got that wrong, which is
+ * finding F1. It returned a plain empty store for a corrupt file, so a lookup found
+ * the seat in neither `seats` nor `malformedSeatIds` and answered **ABSENT** — and the
+ * refusal then told an operator whose file was present and corrupt to *"run the
+ * backfill"*, which **cannot repair corruption** and refuses to run against a
+ * malformed store. A confident instruction to do the wrong thing is worse than an
+ * error. The file's own state now travels on `SeatStore.fileState`, so absent,
+ * malformed and unreadable stay three distinct answers with three distinct remedies.
  *
  * ⚠️ **THIS STORE IS THE ONE ARTIFACT IN THE DESIGN WITH NO RECOVERY PATH, AND THAT
  * IS WHY.** Everything else here is a projection: `index.json`, the index entries, the
@@ -207,6 +217,33 @@ export type SeatStore = {
    * repaired" has to mean carried across a write, or it means nothing.
    */
   readonly unparsedRows: ReadonlyMap<string, unknown>;
+  /**
+   * THE STATE OF THE FILE ITSELF, which is a different question from the state of any
+   * row in it.
+   *
+   * - `absent` — no `seats.json`. **NOT an error**: the first `withSeatStoreWrite`
+   *   creates it, which on a fresh box is the first `sessions new` after deploy (or
+   *   B10's backfill, if it runs first — same helper, same lock).
+   * - `ok` — read and parsed. Individual rows may still be malformed; that is
+   *   `malformedSeatIds`.
+   * - `malformed` — the file exists and its top level does not parse.
+   * - `unreadable` — the read itself failed for something other than "not there"
+   *   (EACCES, EIO, …).
+   *
+   * 🛑 THIS EXISTS BECAUSE "MALFORMED NEVER READS AS ABSENT" HELD AT ROW SCOPE AND
+   * INVERTED AT FILE SCOPE (F1, found by the test-engineer). A corrupt store used to
+   * yield an empty store with zero malformed ids, so a lookup found the seat in
+   * neither collection and answered ABSENT — and the refusal then prescribed *"this
+   * seat predates the store; run the backfill"* to an operator whose file was present
+   * and corrupt. **The backfill mints rows for records that lack them; it cannot
+   * repair a malformed file** — so that was not merely an unhelpful message, it was a
+   * confident instruction to do the wrong thing.
+   *
+   * ⚠️ AND THIS IS WHAT "READER FAILS OPEN" ACTUALLY MEANS: routing CONTINUES via the
+   * `holder_active` mirror, never *the store is silently empty*. The reader keeps
+   * working; it just stops lying about why.
+   */
+  readonly fileState: "absent" | "ok" | "malformed" | "unreadable";
 };
 
 export function seatStorePath(sessionDir: string): string {
@@ -272,7 +309,28 @@ export function seatFromStore(store: SeatStore, seatId: string): SeatRecord | un
   if (store.malformedSeatIds.includes(seatId)) {
     throw new MalformedSeatRowError(seatId);
   }
+  // 🛑 AN UNHEALTHY FILE MUST NEVER ANSWER "ABSENT" (F1). The row may well be in there;
+  // we cannot read it. Returning `undefined` here would send the caller down the
+  // "predates the store, run the backfill" path — and the backfill cannot repair a
+  // corrupt file, so that is a confident instruction to do the wrong thing.
+  if (store.fileState === "malformed" || store.fileState === "unreadable") {
+    throw new SeatStoreUnhealthyError(store.fileState);
+  }
   return store.seats.get(seatId);
+}
+
+/**
+ * The store's FILE could not be read, so nothing can be said about any row in it.
+ *
+ * Distinct from `MalformedSeatRowError` (one bad row in a readable file) and from a
+ * genuinely absent seat, because the three demand different actions — which is the
+ * whole of F1.
+ */
+export class SeatStoreUnhealthyError extends Error {
+  constructor(readonly fileState: "malformed" | "unreadable") {
+    super(seatStoreUnhealthyMessage(fileState));
+    this.name = "SeatStoreUnhealthyError";
+  }
 }
 
 // ─── The C2 carrier: one helper, both legs, never re-derived per call site ────
@@ -385,33 +443,35 @@ export function parseSeatFromPersisted(raw: unknown): SeatRecord | undefined {
   };
 }
 
-const EMPTY_STORE: SeatStore = {
-  seats: new Map(),
-  malformedSeatIds: [],
-  unparsedRows: new Map(),
-};
+function emptyStore(fileState: SeatStore["fileState"]): SeatStore {
+  return { seats: new Map(), malformedSeatIds: [], unparsedRows: new Map(), fileState };
+}
 
 /**
  * Parse a store payload. Pure, so every row-level policy above is testable without
  * touching a filesystem.
  *
- * 🛑 A FILE WHOSE TOP LEVEL IS NOT AN OBJECT YIELDS AN EMPTY STORE WITH NO
- * MALFORMED IDS — there are no rows to attribute, so claiming one would be a lie.
+ * 🛑 A FILE WHOSE TOP LEVEL DOES NOT PARSE RETURNS `fileState: "malformed"`, NOT AN
+ * INDISTINGUISHABLE EMPTY STORE. There are no rows to attribute, so
+ * `malformedSeatIds` is legitimately empty — which is exactly why the FILE's state
+ * has to be carried separately (F1). An empty store and a corrupt one demand
+ * different actions, and the earlier shape made them the same value.
+ *
  * **That is a READ policy only.** Writing over such a file would destroy every seat
- * in it, so `withSeatStoreWrite` refuses instead; see `SeatStoreUnwritableError`.
- * The split matters: a reader that fails closed makes the whole box unroutable over
- * one bad byte, while a writer that fails open destroys the authority. Each leg
- * fails in the direction that is recoverable.
+ * in it, so `withSeatStoreWrite` refuses instead; see `SeatStoreUnwritableError`. The
+ * split matters: a reader that fails closed makes the whole box unroutable over one
+ * bad byte, while a writer that fails open destroys the authority. Each leg fails in
+ * the direction that is recoverable.
  */
 export function parseSeatStore(payload: string): SeatStore {
   let parsed: unknown;
   try {
     parsed = JSON.parse(payload);
   } catch {
-    return EMPTY_STORE;
+    return emptyStore("malformed");
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    return EMPTY_STORE;
+    return emptyStore("malformed");
   }
   const seats = new Map<string, SeatRecord>();
   const malformedSeatIds: string[] = [];
@@ -428,7 +488,7 @@ export function parseSeatStore(payload: string): SeatStore {
     }
     seats.set(key, seat);
   }
-  return { seats, malformedSeatIds, unparsedRows };
+  return { seats, malformedSeatIds, unparsedRows, fileState: "ok" };
 }
 
 /**
@@ -443,23 +503,31 @@ export async function readSeatStore(sessionDir: string): Promise<SeatStore> {
     payload = await fs.readFile(seatStorePath(sessionDir), "utf8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return EMPTY_STORE;
+      // (a) STORE ABSENT — not an error. The first write creates the file.
+      return emptyStore("absent");
     }
-    throw error;
+    // (c) UNREADABLE (EACCES, EIO, …) — THE READER DOES NOT THROW, and that is what
+    // "reader fails open" means: routing continues via the `holder_active` mirror
+    // rather than the whole box becoming unroutable over one bad permission bit. What
+    // it must NOT do is pretend the store is empty, so the state travels with the
+    // result and every caller can tell the two apart.
+    return emptyStore("unreadable");
   }
   return parseSeatStore(payload);
 }
 
 /** Raised when a write would destroy a store that exists but could not be read. */
 export class SeatStoreUnwritableError extends Error {
-  constructor(filePath: string) {
+  constructor(
+    readonly filePath: string,
+    readonly fileState: "malformed" | "unreadable",
+  ) {
     super(
-      `refusing to write the seat store at ${filePath}: the file exists but its top-level ` +
-        `structure could not be read, so writing would DESTROY every seat in it. This store is ` +
-        `the authority for each seat's active holder and next ordinal — nothing else holds ` +
-        `them, so unlike index.json it cannot be rebuilt from a projection, and restarting ` +
-        `ordinals would re-issue labels that must never repeat. Repair or move the file ` +
-        `deliberately; do not delete it to clear this error.`,
+      `refusing to write the seat store at ${filePath}: writing would DESTROY every seat ` +
+        `in it. This store is the authority for each seat's active holder and next ordinal — ` +
+        `nothing else holds them, so unlike index.json it cannot be rebuilt from a ` +
+        `projection, and restarting ordinals would re-issue labels that must never repeat. ` +
+        `Do not delete it to clear this error. ${seatStoreUnhealthyMessage(fileState)}`,
     );
     this.name = "SeatStoreUnwritableError";
   }
@@ -549,12 +617,21 @@ export async function withSeatStoreWrite<T>(
     if (mutation.kind === "no-change") {
       return result;
     }
-    if (store.seats.size === 0 && store.malformedSeatIds.length === 0) {
-      // Nothing parsed AND nothing attributable: either the file is absent (fine,
-      // we are creating it) or its top level was unreadable (not fine — writing
-      // would destroy it). Only a stat can tell those apart, and it costs one
-      // syscall on the create path alone.
-      await refuseIfUnreadableFileExists(sessionDir);
+    // 🛑 THE WRITER FAILS CLOSED ON AN UNHEALTHY FILE, and this is the asymmetry's other
+    // half: writing over a store whose contents could not be read would DESTROY every
+    // seat in it — and unlike `index.json` this file is rebuildable from nothing, since
+    // it holds each seat's active holder and next ordinal and nothing else holds either.
+    // `absent` is NOT unhealthy: creating the file is exactly what the first write on a
+    // fresh box is for.
+    //
+    // ⚠️ THIS USED TO BE A SECOND `readFile` INSIDE THE HOLD (to tell an absent file
+    // from an unparseable one), which quietly broke AP11's "exactly one read and one
+    // write" bound on the create path — where the store IS empty, so the extra read
+    // always fired. F1's typed `fileState` makes the distinction available from the read
+    // already taken, so the bound now holds UNCONDITIONALLY rather than only when the
+    // store happens to be non-empty.
+    if (store.fileState === "malformed" || store.fileState === "unreadable") {
+      throw new SeatStoreUnwritableError(seatStorePath(sessionDir), store.fileState);
     }
     await writeSeatStoreAtomically(sessionDir, mutation.seats, store.unparsedRows);
     return result;
@@ -639,6 +716,75 @@ export async function mintSeatRow(
 }
 
 /**
+ * Mint the row BEST-EFFORT AND LOUD — **ratification item 8, amended 2026-09-28.**
+ *
+ * 🛑 **SESSION CREATION NEVER DEPENDS ON THE SEAT STORE.** This is the call-site half of
+ * the asymmetry: `withSeatStoreWrite` keeps failing CLOSED (it will not corrupt the
+ * authority), and the create path decides that its own success does not depend on the
+ * store. Two reasons, both permanent:
+ *
+ * 1. **FAIL-CLOSED IS A BOOTSTRAP TRAP.** Every recovery path on these boxes runs
+ *    through creating an agent session. A store that stops `sessions new` stops its own
+ *    repair — the remedy requires the thing the failure prevents, and the only actor
+ *    left is a human by hand on a box where no agent can start. **A perfectly worded
+ *    error does not create the session needed to act on it.**
+ * 2. **THE "seat_id WITH NO ROW" STATE IS NEITHER SILENT NOR PERMANENT.** D13a priced it
+ *    as both — correctly, when it was written. **AP17 was decided afterwards and makes
+ *    it LOUD**, and B10's backfill repairs it. Nobody re-checked D13a's price against
+ *    AP17; the ORDERING still stands, only the price on one branch changed.
+ *
+ * 🛑 **NEVER A BARE `.catch(() => {})`.** A neighbouring write in `runtime.ts` swallows
+ * silently; that is the defect in that code, not the model to copy. This returns the
+ * failure so the caller emits ONE diagnostic naming the condition and the REAL remedy.
+ *
+ * ✅ **THE `seat_id` STAYS ON THE RECORD** — the caller must not "tidy it up" because
+ * `seatId?` is optional. It is the handle that makes the session repairable (B10 keys on
+ * it), and it keeps the children's `parent_seat_id` chain intact: dropping it would not
+ * only hide the session from the backfill, it would **orphan its descendants' seat
+ * edges**.
+ *
+ * Returns the condition rather than throwing, so the caller cannot accidentally treat a
+ * store failure as a creation failure.
+ */
+export async function mintSeatRowBestEffort(
+  sessionDir: string,
+  params: Parameters<typeof mintSeatRow>[1],
+): Promise<{ minted: true } | { minted: false; diagnostic: string }> {
+  try {
+    await mintSeatRow(sessionDir, params);
+    return { minted: true };
+  } catch (error) {
+    return {
+      minted: false,
+      diagnostic:
+        `acpx seat-row-not-minted: seat=${params.seatId} holder=${params.holderId} ` +
+        `store=${seatStorePath(sessionDir)} — the session was created and IS USABLE, and it ` +
+        `keeps its seat id, but its seat has no row yet, so it cannot be joined or ` +
+        `succeeded until one exists. ${seatStoreFailureRemedy(error)}`,
+    };
+  }
+}
+
+/** The remedy for whatever actually went wrong — (c)'s two sub-cases differ, and a
+ * generic "run the backfill" would be wrong for both of them. */
+function seatStoreFailureRemedy(error: unknown): string {
+  if (error instanceof SeatStoreUnwritableError) {
+    return seatStoreUnhealthyMessage(error.fileState);
+  }
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  if (code === "EACCES" || code === "EPERM" || code === "ENOSPC" || code === "EROFS") {
+    return (
+      `The store could not be written (${code}). Repair the filesystem — permissions or ` +
+      `free space — then run the seat backfill for the rows missed while it was unwritable.`
+    );
+  }
+  return (
+    `The row write failed: ${error instanceof Error ? error.message : String(error)}. ` +
+    `Once the cause is fixed, run the seat backfill to mint the missing rows.`
+  );
+}
+
+/**
  * The message a "seat has no row" refusal must carry — **AP17**.
  *
  * 🛑 NEVER A BARE "seat not found". Every seat minted BEFORE D13 landed has a record and
@@ -653,30 +799,40 @@ export async function mintSeatRow(
  */
 export function seatRowMissingMessage(seatId: string): string {
   return (
-    `seat ${JSON.stringify(seatId)} has no row in ${SEAT_STORE_FILE}. Two causes, and they ` +
-    `need different actions: either no such seat was ever created, or — far more likely if ` +
-    `a session is carrying this id — the seat PREDATES the seat store, in which case run ` +
-    `the seat backfill to mint rows for existing seats. The session itself is not broken ` +
-    `and nothing is lost; until the row exists it simply cannot be joined or succeeded.`
+    `seat ${JSON.stringify(seatId)} has no row in ${SEAT_STORE_FILE}. Two origins, one ` +
+    `remedy: either the seat PREDATES the seat store, or its row write failed at creation. ` +
+    `Either way, RUN THE SEAT BACKFILL — it mints a row for every seat-bearing record that ` +
+    `lacks one, whatever the origin. The session itself is not broken and nothing is lost; ` +
+    `until the row exists it simply cannot be joined or succeeded.`
   );
 }
 
-async function refuseIfUnreadableFileExists(sessionDir: string): Promise<void> {
-  const filePath = seatStorePath(sessionDir);
-  let payload: string;
-  try {
-    payload = await fs.readFile(filePath, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return;
-    }
-    throw error;
+/**
+ * The message for an UNHEALTHY STORE FILE — condition (c), and it is a **different
+ * remedy** from a missing row (AP17 covers both, with their different remedies).
+ *
+ * 🛑 THE BACKFILL IS NOT THE REMEDY FOR CORRUPTION ON ITS OWN, and saying so is the
+ * whole point. The backfill REFUSES to run against a malformed store — it names the
+ * file, prints the quarantine step, and never overwrites, because a corrupt file may
+ * hold hand-recoverable rows. Telling an operator with a corrupt store to "run the
+ * backfill" is a confident instruction to do the wrong thing (F1).
+ */
+export function seatStoreUnhealthyMessage(fileState: "malformed" | "unreadable"): string {
+  if (fileState === "malformed") {
+    return (
+      `${SEAT_STORE_FILE} EXISTS but its top level does not parse, so no seat in it can be ` +
+      `read — this is NOT an empty store and NOT a missing seat. Repair: QUARANTINE the ` +
+      `file (rename ${SEAT_STORE_FILE} to ${SEAT_STORE_FILE}.corrupt-<timestamp>, keeping ` +
+      `it — it may hold hand-recoverable rows), THEN run the seat backfill, which rebuilds ` +
+      `every row from the session records. Do not delete it, and do not expect the ` +
+      `backfill alone to fix this: it refuses to run against a malformed store rather ` +
+      `than overwrite one.`
+    );
   }
-  // The file is there and `readSeatStore` found nothing in it. An empty object is a
-  // legitimately empty store; anything else did not parse.
-  const trimmed = payload.trim();
-  if (trimmed.length === 0 || trimmed === "{}") {
-    return;
-  }
-  throw new SeatStoreUnwritableError(filePath);
+  return (
+    `${SEAT_STORE_FILE} could not be read (a permission or I/O failure, not a missing ` +
+    `file), so no seat in it can be read — this is NOT an empty store and NOT a missing ` +
+    `seat. Repair the filesystem first, then run the seat backfill for any rows missed ` +
+    `while it was unreadable.`
+  );
 }

@@ -51,7 +51,7 @@ import {
   findGitRepositoryRoot,
   findSessionByDirectoryWalk,
   isoNow,
-  mintSeatRow,
+  mintSeatRowBestEffort,
   normalizeName,
   readSeatStore,
   resolveSessionRecord,
@@ -532,12 +532,21 @@ async function createSessionRecordWithClient(
   // Only the FRESH-MINT path mints: `--seat` joined an existing row, and joining must
   // never mint one (D13).
   if (options.seatId === undefined && seatFields.seatId !== undefined) {
-    await mintSeatRow(sessionBaseDir(), {
+    // 🛑 BEST-EFFORT AND LOUD (ratification item 8) — A STORE FAILURE MUST NOT FAIL THE
+    // SPAWN. Fail-closed here would be a bootstrap trap: every recovery path on these
+    // boxes runs through creating an agent session, so a corrupt store that stops
+    // `sessions new` stops its own repair. The `seat_id` STAYS on the record — it is what
+    // makes the session repairable by the backfill and what keeps its children's
+    // `parent_seat_id` chain from being orphaned.
+    const minted = await mintSeatRowBestEffort(sessionBaseDir(), {
       seatId: seatFields.seatId,
       holderId: record.acpxRecordId,
       name: record.name,
       createdAt: now,
     });
+    if (!minted.minted) {
+      process.stderr.write(`${minted.diagnostic}\n`);
+    }
   }
   if (forkContext) {
     await writeSessionRecordAtBoundary(record);

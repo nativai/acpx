@@ -4,6 +4,9 @@ import path from "node:path";
 import test from "node:test";
 import {
   MalformedSeatRowError,
+  SeatStoreUnhealthyError,
+  seatStoreUnhealthyMessage,
+  SeatStoreUnwritableError,
   parseSeatStore,
   readSeatStore,
   SEAT_RECORD_FIELD_PLAN,
@@ -188,12 +191,73 @@ test("a malformed row does not take down the seats beside it", () => {
   assert.equal(seatFromStore(store, "good")?.nextOrdinal, 3);
 });
 
-test("an unparseable FILE is an empty store with no malformed ids — there are no rows to attribute", () => {
+test("F1 · an unparseable FILE reports fileState MALFORMED and must NOT read as absent", () => {
+  // 🛑 THE DEFECT THIS ROW EXISTS FOR (F1, found by the test-engineer). A corrupt store
+  // used to return a plain empty store with zero malformed ids, so a lookup found the
+  // seat in NEITHER collection and answered ABSENT — and the refusal then told an
+  // operator whose file was present and corrupt to "run the backfill", which CANNOT
+  // repair corruption and refuses to run against a malformed store. That is not an
+  // unhelpful message; it is a confident instruction to do the wrong thing.
+  //
+  // `malformedSeatIds` is legitimately EMPTY here — there are no rows to attribute —
+  // which is exactly why the FILE's state has to travel separately.
   for (const payload of ["not json at all", "[]", "null", '"a string"', "42"]) {
     const store = parseSeatStore(payload);
     assert.equal(store.seats.size, 0, payload);
     assert.deepEqual(store.malformedSeatIds, [], payload);
+    assert.equal(store.fileState, "malformed", `${payload}: file state not reported`);
+    assert.throws(
+      () => seatFromStore(store, "any-seat"),
+      SeatStoreUnhealthyError,
+      `${payload}: a corrupt store answered ABSENT for a seat it simply cannot read`,
+    );
   }
+});
+
+test("F1 · the three FILE states are three answers, not one — and the remedies differ", () => {
+  // The paired row: a MISSING file is genuinely absent and must NOT throw, or the fix
+  // for F1 would have broken the ordinary empty-box case.
+  assert.equal(parseSeatStore("{}").fileState, "ok");
+  assert.equal(seatFromStore(parseSeatStore("{}"), "nope"), undefined);
+
+  // …and the remedies are different text, because "run the backfill" is right for an
+  // absent ROW and wrong for a corrupt FILE.
+  const malformed = seatStoreUnhealthyMessage("malformed");
+  assert.match(malformed, /quarantine/i, "the malformed remedy does not say to quarantine");
+  assert.match(malformed, /corrupt-<timestamp>/, "it does not give the quarantine name");
+  assert.match(
+    malformed,
+    /refuses to run against a malformed store/i,
+    "it does not say the backfill alone is NOT the remedy",
+  );
+  const unreadable = seatStoreUnhealthyMessage("unreadable");
+  assert.match(unreadable, /repair the filesystem/i);
+  assert.doesNotMatch(
+    unreadable,
+    /quarantine/i,
+    "quarantining is the MALFORMED remedy; an unreadable file is a filesystem problem",
+  );
+});
+
+test("F1 · the writer still refuses over an unhealthy file, naming the real repair", async () => {
+  await withTempDir("acpx-seat-store-", async (dir) => {
+    await fs.writeFile(seatStorePath(dir), "{ this is not json", "utf8");
+    await assert.rejects(
+      () =>
+        withSeatStoreWrite(dir, () => ({
+          mutation: { kind: "write", seats: new Map() },
+          result: undefined,
+        })),
+      (error: unknown) =>
+        error instanceof SeatStoreUnwritableError &&
+        error.fileState === "malformed" &&
+        /quarantine/i.test(error.message),
+      "the writer overwrote a corrupt store, or refused without naming the repair",
+    );
+    // …and the corrupt bytes are STILL THERE. A corrupt file may hold hand-recoverable
+    // rows, so the writer must never clear it to make itself work.
+    assert.match(await fs.readFile(seatStorePath(dir), "utf8"), /this is not json/);
+  });
 });
 
 // ─── 3 · AP11 — the critical section cannot acquire a third operation ────────
