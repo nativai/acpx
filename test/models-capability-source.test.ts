@@ -8,6 +8,10 @@ import {
   setHarnessCapabilitiesForTesting,
 } from "../src/models/capability-source.js";
 import { buildCatalogue } from "../src/models/catalogue.js";
+import {
+  CLAUDE_FAMILY_OPENROUTER_REASON,
+  refusesClaudeFamilyOnOpenRouter,
+} from "../src/models/claude-family.js";
 import { harnessNativeModels } from "../src/models/harness-models.js";
 import { isAvailableForAgent } from "../src/models/matcher.js";
 import type { OpenRouterSnapshot } from "../src/models/openrouter-catalogue.js";
@@ -138,6 +142,18 @@ test("the OpenRouter band is locked per harness, exactly as the derivation says"
         continue;
       }
       const capability = capabilities.get(id);
+      // ⚠️ POLICY OUTRANKS THE SUPPORT DERIVATION (brick 30eb2003), the same way a
+      // catalogue-level block outranks it above. A Claude-family row on the
+      // OpenRouter route is refused for a policy-bound harness EVEN THOUGH that
+      // harness accepts arbitrary model ids — our subscriptions serve the same
+      // model at no marginal cost, so the band is narrower than the derivation
+      // alone predicts. Asked of the SAME predicate the gate uses, keeping this
+      // row's founding intent: FOLLOW the rule, never pin today's answer.
+      if (refusesClaudeFamilyOnOpenRouter({ harness: id, modelId: model.id })) {
+        assert.equal(availability.ok, false, `${model.key}/${id}`);
+        assert.equal(availability.reason, CLAUDE_FAMILY_OPENROUTER_REASON, `${model.key}/${id}`);
+        continue;
+      }
       const expected = capability?.acceptsArbitraryModelIds === true;
       assert.equal(availability.ok, expected, `${model.key}/${id}`);
       if (!expected) {
