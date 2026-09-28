@@ -1020,6 +1020,11 @@ test("G2/path 3 · a teammate_spawned notification mints a shadow-record seat, r
         "available. Investigate: the signature is the mint succeeding (~27 ms) and\n" +
         "writeSessionRecord(childRecord) then failing OutboxError: outbox-busy after its full\n" +
         "4 s budget, so the child record is never written.\n" +
+        "🛑 AND `outbox-busy` IS TERMINAL, NOT RETRYABLE — the name sounds transient and it is\n" +
+        "not. Fix this by ORDERING or LOCKING, NEVER by adding a retry or a poll: the write has\n" +
+        "already exhausted its own 4 s retry budget by the time you see this, and the contention\n" +
+        "is the parent turn's writes against the child write on ONE SQLite DB, so waiting longer\n" +
+        "cannot rescue it.\n" +
         "🔑 AND A RED HERE IS NOT THE HISTORICAL ROW-FIRST DEFECT RETURNING. Arm B (no mint at\n" +
         "all — this row's pre-B2 state) measured k=0 in N=18, so the intermittency was\n" +
         "introduced by the row-first mint and removed with it; it was never a property of this\n" +
