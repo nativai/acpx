@@ -236,9 +236,22 @@ export type CodexSubscriptionCapDetail = {
   code: "codex-subscription-cap";
   providerSubmitted: false;
   weeklyCapPercent: number;
-  status: "at-cap" | "stale" | "elapsed" | "absent" | "read-failed";
+  /**
+   * Only two hold reasons exist, and the narrowness is the point: a hold is
+   * either positive evidence of breach ("at-cap") or a dependency outage
+   * ("read-failed"). The retired "stale" | "elapsed" | "absent" values were all
+   * states that occur precisely when Codex has NOT run recently — the one moment
+   * the gate must not block — and holding on them deadlocked the cap
+   * permanently. See `src/runtime/engine/codex-subscription-cap.ts`.
+   * Records persisted before 2026-09-28 may still carry the retired values.
+   */
+  status: "at-cap" | "read-failed";
   observedWeeklyPercent?: number;
   capturedAt?: string;
+  /** Reported freshness of `capturedAt`; never a hold reason on its own. */
+  observationFreshness?: "fresh" | "stale";
+  /** ISO reset of the weekly window — when an at-cap hold clears by itself. */
+  resetsAt?: string;
 };
 
 export type PermissionStats = {
