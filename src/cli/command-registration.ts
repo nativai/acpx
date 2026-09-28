@@ -25,6 +25,7 @@ import {
   handleSessionsReopen,
   handleSessionsRepairAccountSeam,
   handleSessionsSetMetadata,
+  handleSessionsActivate,
   handleSessionsSetParent,
   handleSessionsSweepConfigDirs,
   handleSessionsShow,
@@ -661,6 +662,49 @@ OTHER THINGS WORTH KNOWING.
     )
     .action(async function (this: Command, flags: SessionsSetParentFlags) {
       await handleSessionsSetParent(flags, this, config);
+    });
+
+  // THE SUCCESSION VERB (§2.7, brick b64dfbb3). On `sessions` rather than under a new
+  // top-level verb for the reason D11 gives: `sessions` is already in TOP_LEVEL_VERBS,
+  // so this touches neither registration and cannot trip the two-registration hazard —
+  // and it mutates SESSION records, which is where `close`, `set-parent` and `rename`
+  // already live. D12's `seats` verb is a READ surface; a mutating verb does not belong
+  // on it.
+  sessionsCommand
+    .command("activate")
+    .description(
+      "Make an already-created holder the ACTIVE holder of its seat — the succession write. " +
+        "The successor must already have been created INTO the seat (`sessions new --seat`); " +
+        "activate never re-seats a session. Retires the current holder WITHOUT closing it: " +
+        "closing it is the handover party's own duty, and the command to do so is printed.",
+    )
+    .argument("<seat>", "The seat, by id (a lowercase UUID)")
+    .argument(
+      "<successor>",
+      "The holder to activate (acpx record id, ACP session id, or unique suffix). Must already belong to this seat.",
+    )
+    .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
+    .addHelpText(
+      "after",
+      `
+🛑 CLOSING THE PREDECESSOR IS YOUR DUTY, NOT THIS VERB'S.
+  Retirement is not a close: the retired holder keeps \`closed: false\` so its old
+  address still RESOLVES and a sender addressing it can be WARNED rather than getting
+  a bare closed error. That makes "retired but open" a TRANSITIONAL state — this
+  command prints the exact \`sessions close\` to run, and nobody else will run it.
+
+The two steps of a handover, in order:
+  1. acpx sessions new --seat <seat>      # create the successor, prepared, no ordinal
+  2. acpx sessions activate <seat> <new>  # retire the old holder, point the seat, draw the ordinal
+  3. acpx sessions close <old>            # YOUR duty — printed by step 2
+
+Two concurrent activations on one seat are safe: both read the seat row fresh under a
+lock, exactly one wins, and the loser refuses rather than overwriting. The ordinal is a
+DISPLAY LABEL and never a key — nothing resolves a holder by it.
+`,
+    )
+    .action(async function (this: Command, seat: string, successor: string) {
+      await handleSessionsActivate(seat, successor, this, config);
     });
 
   const historyCommand = sessionsCommand

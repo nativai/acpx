@@ -4579,6 +4579,137 @@ function resolveSetParentTarget(flags: SessionsSetParentFlags): SetParentTarget 
  * resolve an env/flag mix; here both are explicit and disagreeing about who the new
  * parent is can only be a mistake.
  */
+/**
+ * `acpx sessions activate <seat> <successor>` — the succession write (§2.7).
+ *
+ * The output is part of the contract, not decoration, and carries three things the
+ * caller cannot get anywhere else:
+ *
+ * 1. 🛑 **THE RETIREMENT DUTY (D7), with the exact command.** Retirement is NOT a
+ *    close: the retired holder keeps `closed: false` so its old address still resolves
+ *    and a sender can be WARNED rather than getting a bare closed error. That makes
+ *    "retired but open" transitional — and nothing else in the system will ever close
+ *    it. Daniel: *"whoever is doing the handover … should be aware that it's his duty
+ *    to close the old session."* An automatic close is deliberately NOT built: it would
+ *    terminate the caller's own process tree mid-verb when the handover party IS the
+ *    predecessor.
+ * 2. **THE DIVERGENCE LINE (D10)**, when the flip overwrote a mirror that disagreed
+ *    with the seat. One structured line per event, to stderr so it cannot be swallowed
+ *    by a stdout consumer. **Nothing accumulates** — no counter, no total, no field.
+ * 3. **THE ACTIVATION NOTICE (D6)** — the successor's orientation text, printed for the
+ *    handover party to deliver. It is NOT injected as a turn: a lifecycle verb must not
+ *    enqueue work into another session as a side effect, and D6 is explicit that the
+ *    work-content handover is the handover party's own deliberately written prompt.
+ */
+/**
+ * The D10 divergence line — **STDERR, and deliberately not only a JSON field.**
+ *
+ * A caller running `--format json` reads stdout; a diagnostic that lives only inside the
+ * payload is one a scripted caller never sees. And this is the signal that distinguishes
+ * "the flip repaired a real disagreement" from an ordinary succession, so it has to be
+ * greppable: someone will eventually want to count these across a fleet.
+ *
+ * 🛑 ONE LINE PER EVENT, AND NOTHING ACCUMULATES — no counter, no running total, no
+ * field on the seat. The count of seats currently divergent is derived on demand.
+ */
+function emitSeatDivergenceLine(
+  divergence:
+    | { seatId: string; predecessorId: string; overwrittenHolderActive: boolean | undefined }
+    | undefined,
+): void {
+  if (!divergence) {
+    return;
+  }
+  process.stderr.write(
+    `acpx seat-mirror-divergence: seat=${divergence.seatId} ` +
+      `predecessor=${divergence.predecessorId} ` +
+      `overwrote holder_active=${String(divergence.overwrittenHolderActive)} ` +
+      `(the seat named this holder active while its own mirror did not; the seat wins). ` +
+      `Repaired by this flip — not a count, and nothing is accumulated.\n`,
+  );
+}
+
+function activationHeadline(kind: "activated" | "resumed" | "already-active"): string {
+  if (kind === "already-active") {
+    return "Already active";
+  }
+  return kind === "resumed" ? "Resumed an interrupted activation" : "Activated";
+}
+
+/**
+ * The text output. 🛑 THE RETIREMENT DUTY IS PART OF THE CONTRACT, NOT A COURTESY —
+ * nothing in the system will ever close the retired holder, so if these lines stop
+ * appearing, "retired but open" silently becomes a resting state instead of a
+ * transitional one.
+ */
+function printActivationText(result: {
+  kind: "activated" | "resumed" | "already-active";
+  successorId: string;
+  ordinal: number;
+  seatId: string;
+  predecessorId: string | null;
+  notice: string;
+}): void {
+  process.stdout.write(
+    `${activationHeadline(result.kind)}: ${result.successorId} is holder #${result.ordinal} ` +
+      `of seat ${result.seatId}\n`,
+  );
+  if (result.predecessorId) {
+    process.stdout.write(
+      `Retired (NOT closed): ${result.predecessorId}\n` +
+        `🛑 YOUR DUTY — close it yourself; nothing else will:\n` +
+        `     acpx sessions close ${result.predecessorId}\n`,
+    );
+  }
+  // Printed for the handover party to DELIVER, not injected as a turn: a lifecycle verb
+  // must not enqueue work into another session as a side effect, and D6 is explicit that
+  // the work-content handover is the handover party's own deliberately written prompt.
+  process.stdout.write(`\n--- notice for the successor ---\n${result.notice}`);
+}
+
+export async function handleSessionsActivate(
+  seatRef: string,
+  successorRef: string,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  // `optsWithGlobals()` picks up this verb's own `--format` as well as the global one,
+  // so this is the same resolution every other session verb uses.
+  const { format } = resolveGlobalFlags(command, config);
+  const { activateSeatHolder, SeatActivationRefusalError } =
+    await import("./session/seat-activate.js");
+  try {
+    const result = await activateSeatHolder(seatRef, successorRef);
+    emitSeatDivergenceLine(result.divergence);
+    if (
+      !emitJsonResult(format, {
+        ok: true,
+        seatId: result.seatId,
+        predecessorId: result.predecessorId,
+        successorId: result.successorId,
+        holderOrdinal: result.ordinal,
+        outcome: result.kind,
+        mirrorDivergence: result.divergence ?? null,
+        activationNotice: result.notice,
+      }) &&
+      format !== "quiet"
+    ) {
+      printActivationText(result);
+    }
+  } catch (error) {
+    if (error instanceof SeatActivationRefusalError) {
+      if (!emitJsonResult(format, { ok: false, code: error.code, error: error.message })) {
+        if (format !== "quiet") {
+          process.stderr.write(`activate: ${error.code}: ${error.message}\n`);
+        }
+      }
+      process.exitCode = 1;
+      return;
+    }
+    throw error;
+  }
+}
+
 export async function handleSessionsSetParent(
   flags: SessionsSetParentFlags,
   command: Command,
