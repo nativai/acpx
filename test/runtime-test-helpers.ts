@@ -156,7 +156,14 @@ export async function withTempHome<T>(
     restoreEnv("ACPX_STATE_HOME", originalStateHome);
     globalThis.fetch = originalFetch;
     restoreConfigDirRoot();
-    await fs.rm(tempHome, { recursive: true, force: true });
+    // `force` suppresses ENOENT, not ENOTEMPTY. `sessions new`/`sessions copy`
+    // intentionally leave a detached `__queue-owner` daemon running past the
+    // CLI call's own exit (queue-owner-process.ts, `detached: true` by design —
+    // see owner-reaper.ts), and that daemon can still be writing under
+    // `<tempHome>/.acpx/sessions/` when a test's own cleanup runs here — races
+    // this recursive rm ~1 in 5 runs into ENOTEMPTY (brick://d9ba2870). Retry
+    // instead of widening isolation: the daemon drains on its own shortly.
+    await fs.rm(tempHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 }
 
