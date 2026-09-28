@@ -1019,7 +1019,12 @@ test("G2/path 3 · a teammate_spawned notification mints a shadow-record seat, r
         "PRODUCT RACE, never a flake, and a green re-run is the most dangerous outcome\n" +
         "available. Investigate: the signature is the mint succeeding (~27 ms) and\n" +
         "writeSessionRecord(childRecord) then failing OutboxError: outbox-busy after its full\n" +
-        "4 s budget, so the child record is never written. See brick b64dfbb3.",
+        "4 s budget, so the child record is never written.\n" +
+        "🔑 AND A RED HERE IS NOT THE HISTORICAL ROW-FIRST DEFECT RETURNING. Arm B (no mint at\n" +
+        "all — this row's pre-B2 state) measured k=0 in N=18, so the intermittency was\n" +
+        "introduced by the row-first mint and removed with it; it was never a property of this\n" +
+        "row. Treat a red as something NEW, or as the residual above its bound — not as a\n" +
+        "known issue to wave through. See brick b64dfbb3.",
     );
 
     const childRecord = await resolveSessionRecord(childRef.acpxRecordId);
