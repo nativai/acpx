@@ -10,6 +10,7 @@ import { modelSetMethodKnownUnsupported } from "../mode-preference.js";
 import { withSessionIndexLock } from "./index-lock.js";
 import { parseSessionRecord } from "./parse.js";
 import { parseSeatFieldsFromIndexEntry, seatFieldsToIndexEntry } from "./seat-fields.js";
+import { SEAT_STORE_FILE } from "./seat-store.js";
 
 const SESSION_INDEX_SCHEMA = "acpx.session-index.v1";
 
@@ -686,7 +687,18 @@ export async function writeSessionIndex(
 async function listSessionRecordFiles(sessionDir: string): Promise<string[]> {
   return (await fs.readdir(sessionDir, { withFileTypes: true }))
     .filter(
-      (entry) => entry.isFile() && entry.name.endsWith(".json") && entry.name !== "index.json",
+      (entry) =>
+        entry.isFile() &&
+        entry.name.endsWith(".json") &&
+        entry.name !== "index.json" &&
+        // 🛑 THE SEAT STORE IS NOT A SESSION RECORD (brick b64dfbb3 / B2). It lives in
+        // this same directory deliberately, so every enumerator here has to know about
+        // it. Without this clause `seats.json` is listed as a session record file, lands
+        // in the index's `files` array, and `readIndexEntryFromDisk` then tries to parse
+        // the seat store as a record — a permanent files-vs-entries mismatch that makes
+        // the reconciler do work on every pass and finds nothing wrong to report.
+        // Nothing errors, which is why it needs naming rather than a downstream guard.
+        entry.name !== SEAT_STORE_FILE,
     )
     .map((entry) => entry.name)
     .toSorted();

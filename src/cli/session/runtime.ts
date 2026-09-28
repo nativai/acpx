@@ -115,8 +115,10 @@ import {
 import {
   absolutePath,
   isoNow,
+  mintSeatRow,
   readPersistedLifecycle,
   resolveSessionRecord,
+  sessionBaseDir,
   writeSessionRecord,
   writeSessionRecordAtBoundary,
   type PersistedSessionLifecycle,
@@ -2517,6 +2519,23 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
 
             void (async () => {
               try {
+                // 🛑 D13/D13a — CREATION PATH 3 MINTS A SEAT ROW TOO, AND THE ROW GOES
+                // FIRST. This path is the one NOT reached through
+                // `createSessionRecordWithClient`, so it needs the mint explicitly — and
+                // a shadow record with a row-less seat is exactly the silent defect §14
+                // exists to delete, one creation path over: a session that works
+                // perfectly and can never be succeeded. No carve-out for
+                // `kind:"subagent"` (Daniel's no-carve-outs ruling): it is a real seat.
+                // Row-first for the same reason as the other two paths — the only torn
+                // state it can leave is an inert orphan row, never a row-less seat.
+                if (childRecord.seatId !== undefined) {
+                  await mintSeatRow(sessionBaseDir(), {
+                    seatId: childRecord.seatId,
+                    holderId: childRecord.acpxRecordId,
+                    name: childRecord.name,
+                    createdAt: spawnedAt,
+                  });
+                }
                 await writeSessionRecord(childRecord);
                 const parentRecord = eventWriter.getRecord();
                 parentRecord.subagents = [...(parentRecord.subagents ?? []), subagentRef];

@@ -39,6 +39,20 @@ const RESERVED_ID_PARTS: ReadonlySet<string> = new Set([
   "README",
   "deletions",
   "brick-remote-links",
+  // THE SEAT STORE (`seats.json`, brick b64dfbb3 / B2) — listed BY DESIGN rather than
+  // left to escape by accident, which is exactly what this list's own header asks for.
+  // It escapes today only because `INGEST_ORPHAN_ID_SHAPE` rejects the stem `seats` for
+  // not looking like an id acpx would mint — the same accidental escape the header names
+  // for `index` and `brick-remote-links`, and one rename away from failing.
+  //
+  // ⚠️ AND THE STAKES HERE ARE THE HIGHEST ON THIS LIST. The archive side
+  // (`claimArchiveFileSets`) applies NO shape guard at all — deliberately, per formats
+  // §2 C2.4 — so on that side this entry is the ONLY thing standing between the seat
+  // store and being claimed as an archived session's file set. And unlike every other
+  // artefact in this system the seat store cannot be rebuilt from a projection: it holds
+  // each seat's active holder and next ordinal, nothing else holds either, and re-minting
+  // a counter RE-ISSUES ordinals that must never repeat.
+  "seats",
 ]);
 
 /**

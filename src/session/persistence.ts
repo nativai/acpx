@@ -67,10 +67,12 @@ export type {
 // THE SEAT STORE — the authority for who holds each seat (brick b64dfbb3 / B2).
 export {
   MalformedSeatRowError,
+  mintSeatRow,
   parseSeatFromPersisted,
   parseSeatRefOrThrow,
   parseSeatStore,
   readSeatStore,
+  seatRowMissingMessage,
   SEAT_RECORD_FIELD_PLAN,
   SEAT_STORE_FILE,
   SEAT_STORE_NO_CHANGE,

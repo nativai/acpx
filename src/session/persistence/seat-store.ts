@@ -557,6 +557,106 @@ export async function withSeatStoreWrite<T>(
   });
 }
 
+/**
+ * Mint the seat ROW for a freshly-minted seat — **D13 (§14), brick b64dfbb3**.
+ *
+ * Called on the **fresh-mint** create paths only. `--seat` (D11) mints nothing: it
+ * JOINS an existing row, and joining must never mint one.
+ *
+ * 🛑 **THE CALLER MUST WRITE THIS BEFORE THE SESSION RECORD (D13a), AND THE ORDER IS
+ * THE WHOLE DESIGN.** The two writes can tear, and they are NOT symmetric:
+ *
+ * - **record first** ⇒ a session carrying a `seatId` with **no row** — a fully working
+ *   session that can **never be succeeded**. Every other operation behaves normally and
+ *   the damage surfaces only when someone first tries to hand over. **Silent, permanent,
+ *   and it is exactly the gap §14 exists to delete, reproduced by a crash.**
+ * - **row first** ⇒ an orphan row nobody references. Creation failed, the caller holds
+ *   no seat id, no session claims it: ~290 bytes, inert, and **visible** in `seats list`
+ *   as a seat with an unresolvable holder.
+ *
+ * ⇒ Row-first makes the SILENT state structurally unreachable and leaves only the loud
+ * one. Same argument as D3's retire-before-point, same standard: every torn state reads
+ * correct or loud, never silently unusable. The record id is available before either
+ * write, so the row can name its holder before that holder exists on disk.
+ *
+ * ⚠️ Its own hold (D13b): one `seats.json` read, one write, **no record I/O inside** —
+ * the record write happens outside it. The index lock is re-entrant and would permit
+ * nesting the record write here; **do not.** §2.6.1's structural bound governs the
+ * phase-2 activation hold, and this hold inherits the same discipline rather than being
+ * exempted from it.
+ */
+export async function mintSeatRow(
+  sessionDir: string,
+  params: {
+    readonly seatId: string;
+    readonly holderId: string;
+    readonly name: string | undefined;
+    readonly createdAt: string;
+  },
+): Promise<void> {
+  await withSeatStoreWrite(sessionDir, (store) => {
+    // A freshly-minted `crypto.randomUUID()` cannot already be in the store. If it is,
+    // something is badly wrong — a double-mint, or a caller passing a seat id it did not
+    // mint — and silently overwriting would destroy a live seat's pointer and counter.
+    if (store.seats.has(params.seatId) || store.malformedSeatIds.includes(params.seatId)) {
+      throw new Error(
+        `refusing to mint seat ${JSON.stringify(params.seatId)}: a row for it already ` +
+          `exists. A freshly minted seat id cannot collide, so this is a double-mint or a ` +
+          `caller minting an id it did not generate. Overwriting would discard that seat's ` +
+          `active holder and next ordinal, neither of which can be reconstructed.`,
+      );
+    }
+    const seats = new Map(store.seats);
+    seats.set(params.seatId, {
+      seatId: params.seatId,
+      createdAt: params.createdAt,
+      // B1 ships the founding holder as `holderActive: true, holderOrdinal: 1`, so it IS
+      // the active holder from the first instant; a null here would make a brand-new
+      // seat read as vacant.
+      activeHolderId: params.holderId,
+      // 🔑 TWO, NOT ONE — AND THIS IS THE ONE VALUE SOMEONE WILL "FIX" TO 1.
+      // `next_ordinal` means THE NEXT ORDINAL TO HAND OUT, not how many holders exist.
+      // Ordinal 1 is ALREADY TAKEN by the founding holder, which consumed it at creation
+      // without ever passing through the activation hold. A row created with 1 therefore
+      // makes the FIRST SUCCESSION ALLOCATE 1 A SECOND TIME — and D4a is explicit that a
+      // gap is legal while a REPEAT IS A DEFECT. `1` looks right to anyone reading this
+      // field as a count, which is exactly why it carries this comment.
+      nextOrdinal: 2,
+      closedAt: null,
+      // D9 phase (i): the name is written to the seat AND still to the session record,
+      // and the SEAT is authoritative wherever the two disagree.
+      name: params.name,
+      // `brick attach` is this field's writer (C4 / Cluster A requirement 5) and that is
+      // not this pass. Absent, deliberately — not an empty string.
+      brickId: undefined,
+    });
+    return { mutation: { kind: "write", seats }, result: undefined };
+  });
+}
+
+/**
+ * The message a "seat has no row" refusal must carry — **AP17**.
+ *
+ * 🛑 NEVER A BARE "seat not found". Every seat minted BEFORE D13 landed has a record and
+ * **no row**; that population is B10's backfill and §14 cannot reach it. So an operator
+ * hitting this meets a session that looks healthy, a seat id that looks valid, and a
+ * refusal that looks like a bug in our code. The message has to name the CAUSE and the
+ * REMEDY — which is the "never silently unusable" standard applied to the message rather
+ * than to the state.
+ *
+ * Shared by D11's `--seat` refusal and the activation's phase-0.2 refusal so the two
+ * cannot drift into saying different things about the same condition.
+ */
+export function seatRowMissingMessage(seatId: string): string {
+  return (
+    `seat ${JSON.stringify(seatId)} has no row in ${SEAT_STORE_FILE}. Two causes, and they ` +
+    `need different actions: either no such seat was ever created, or — far more likely if ` +
+    `a session is carrying this id — the seat PREDATES the seat store, in which case run ` +
+    `the seat backfill to mint rows for existing seats. The session itself is not broken ` +
+    `and nothing is lost; until the row exists it simply cannot be joined or succeeded.`
+  );
+}
+
 async function refuseIfUnreadableFileExists(sessionDir: string): Promise<void> {
   const filePath = seatStorePath(sessionDir);
   let payload: string;

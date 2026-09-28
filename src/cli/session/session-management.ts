@@ -51,10 +51,12 @@ import {
   findGitRepositoryRoot,
   findSessionByDirectoryWalk,
   isoNow,
+  mintSeatRow,
   normalizeName,
   readSeatStore,
   resolveSessionRecord,
   seatFromStore,
+  seatRowMissingMessage,
   sessionBaseDir,
   writeSessionRecord,
   writeSessionRecordAtBoundary,
@@ -215,12 +217,16 @@ async function refuseUnjoinableSeat(joinSeatId: string | undefined): Promise<voi
   const store = await readSeatStore(sessionBaseDir());
   const seat = seatFromStore(store, joinSeatId);
   if (!seat) {
+    // AP17 — THE REFUSAL DIAGNOSES. The shared message names the cause and the remedy,
+    // because the overwhelmingly likely reason a real seat id has no row is that the seat
+    // PREDATES the store (B10's backfill population), and a bare "not found" makes that
+    // look like a bug in our code rather than a migration that has not run.
     throw new Error(
-      `seat ${JSON.stringify(joinSeatId)} is not in the seat store, so there is nothing to ` +
-        `join. Joining NEVER creates a seat as a side effect — a mistyped id that minted the ` +
-        `seat it named would leave a session sitting in a seat nobody meant, and nothing ` +
-        `downstream can tell that apart from a session in the right one. Create the seat ` +
-        `deliberately, or omit --seat to mint a fresh one for this session.`,
+      `${seatRowMissingMessage(joinSeatId)} ` +
+        `Joining NEVER creates a seat as a side effect — a mistyped id that minted the seat ` +
+        `it named would leave a session sitting in a seat nobody meant, and nothing ` +
+        `downstream can tell that apart from a session in the right one. Omit --seat to mint ` +
+        `a fresh seat for this session.`,
     );
   }
   if (seat.closedAt !== null && seat.closedAt !== undefined) {
@@ -343,6 +349,9 @@ async function createSessionRecordWithClient(
   if (forkContext) {
     conversation.messages = structuredClone(forkContext.messages);
   }
+  // Hoisted out of the record literal so the SEAT ID is in hand before either write —
+  // D13a needs the row written first, and it cannot name its holder without both ids.
+  const seatFields = seatFieldsForCreate(options.seatId);
   const record: SessionRecord = {
     schema: "acpx.session.v1",
     acpxRecordId: options.recordId ?? sessionId,
@@ -381,7 +390,7 @@ async function createSessionRecordWithClient(
     //
     // A fork therefore still NEVER inherits the source's seat — it mints, exactly as
     // before. The default is unchanged byte for byte when `--seat` is absent.
-    ...seatFieldsForCreate(options.seatId),
+    ...seatFields,
     ...(forkContext
       ? {
           kind: "session" as const,
@@ -512,6 +521,24 @@ async function createSessionRecordWithClient(
     }
   }
 
+  // 🛑 D13a — THE SEAT ROW GOES FIRST, AND THE ORDER IS NOT A PREFERENCE.
+  // Record-first leaves, on a crash, a session carrying a seatId with NO ROW: a fully
+  // working session that can never be succeeded, discovered only when someone first
+  // tries to hand over — silent and permanent. Row-first leaves an orphan row nobody
+  // references: inert, ~290 bytes, and visible in `seats list`. Only one of those two
+  // torn states is loud, so only one ordering is allowed.
+  // ⚠️ Do NOT move this below the record write for tidiness, and do not fold it into the
+  // record write's own lock even though the index lock is re-entrant and would allow it.
+  // Only the FRESH-MINT path mints: `--seat` joined an existing row, and joining must
+  // never mint one (D13).
+  if (options.seatId === undefined && seatFields.seatId !== undefined) {
+    await mintSeatRow(sessionBaseDir(), {
+      seatId: seatFields.seatId,
+      holderId: record.acpxRecordId,
+      name: record.name,
+      createdAt: now,
+    });
+  }
   if (forkContext) {
     await writeSessionRecordAtBoundary(record);
   } else {
