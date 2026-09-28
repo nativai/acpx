@@ -90,6 +90,15 @@ const CLAUDE_FAMILY_ALIASES = ["opus", "sonnet", "haiku", "fable"] as const;
  * "claude" row exists outside `anthropic/`, so the arm is redundant **today** and is
  * kept as the cheaper half of a refusal that must not quietly stop covering a
  * family when a slug is renamed.
+ *
+ * ⚠️ **THE FIRST ARM IS A SUBSTRING TEST, SO IT OVER-REACHES BY DESIGN** — any
+ * namespaced slug whose model part contains "claude" is refused, a hypothetical
+ * `somevendor/claude-killer-3` included. Measured 2026-09-28: **zero of 458 live
+ * catalogue rows carry "claude" outside `anthropic/`**, so nothing is affected
+ * today, and it is the same trade `isFableModel` already makes. It is the right
+ * way round to be wrong: **if it ever bites, it presents as that model being
+ * REFUSED — loud, and in the safe direction — never as a Claude model silently
+ * getting through.** Narrow it only against a real row, never pre-emptively.
  */
 export function isClaudeFamilyModelId(id: string | null | undefined): boolean {
   if (typeof id !== "string") {
