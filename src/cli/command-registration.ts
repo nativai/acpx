@@ -1,5 +1,5 @@
 import { Command, Option } from "commander";
-import { DEFAULT_HISTORY_LIMIT } from "../session/persistence.js";
+import { DEFAULT_HISTORY_LIMIT, parseSeatRefOrThrow } from "../session/persistence.js";
 import { registerAgentsCommand } from "./agents-command.js";
 import {
   addArchiveRunIntentOptions,
@@ -354,6 +354,21 @@ export function registerSessionsCommand(
       "--parent-id <uuid>",
       "Record the spawning session's acpxRecordId as parent_session_id (falls back to ACPX_SESSION_URL env). Use --parent-session-url for the URL form.",
       (value: string) => parseNonEmptyValue("Parent session id", value),
+    )
+    // D11 (brick b64dfbb3) — CREATE INTO AN EXISTING SEAT. Registered on `new` ONLY,
+    // and deliberately NOT on `copy`: a fork or copy always mints a fresh seat, so an
+    // unknown-option error there is the correct refusal. The library-level guard
+    // (`refuseSeatJoinOnForkPath`) is what covers the combination on any other path.
+    // A flag rather than a new verb because `sessions` is already in TOP_LEVEL_VERBS,
+    // so this touches neither registration and cannot trip the two-registration hazard.
+    .option(
+      "--seat <uuid>",
+      "Create this session INTO an existing seat, PREPARED BUT NOT ACTIVE (no ordinal is " +
+        "allocated until `sessions activate` draws one). Omit it — the default — to mint a " +
+        "fresh seat, which is what every create does today. The seat must already exist: " +
+        "this never creates one as a side effect. Refused on a fork/copy, because every " +
+        "fork mints a new seat.",
+      (value: string) => parseSeatRefOrThrow("Seat id", value),
     )
     .option(
       "--metadata <key=value>",

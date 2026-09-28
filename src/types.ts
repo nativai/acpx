@@ -1261,32 +1261,44 @@ export type SessionRecord = {
    * being archived). Persisted `holder_ordinal`. B1 mints exactly one
    * holder per seat, so every record B1 creates carries `1`.
    *
-   * B2's succession verb, when creating an additional holder into an
-   * EXISTING seat, must NOT assign a bare `max(existing hot holders) + 1` —
-   * that re-issues a number whenever the current max is archived, a
-   * prepared-but-never-activated holder was discarded, or the seat is fully
-   * cold (no hot holder to take a max over). The specified rule (dated,
-   * B9-completed residual — see B1-SHAPE-AS-SHIPPED.md "The holder ordinal's
-   * single atomic home"):
+   * THE NUMBER COMES FROM THE SEAT'S STORED `next_ordinal` COUNTER — read,
+   * incremented and written under ONE hold of the index lock, inside the
+   * activation's phase-2 critical section (`seat-store.ts`'s
+   * `withSeatStoreWrite`; ACTIVATION-PROTOCOL.md §2.7 steps 2.4-2.5). Two
+   * concurrent activations on one seat therefore cannot take the same
+   * number, for the same reason `persistTemplateMark` computes its `max+1`
+   * inside the lock rather than before it.
    *
-   *   next = max({h.holderOrdinal : h in the seat's HOT holders} ∪
-   *              {predecessor.holderOrdinal}) + 1
+   * ⚠️ AN EARLIER VERSION OF THIS COMMENT SPECIFIED A DIFFERENT RULE BY NAME
+   * AND IT IS WITHDRAWN — do not reinstate it from memory or from a document
+   * that still carries it. Struck by Daniel on 2026-09-28 (Cluster A
+   * requirement 8, `Bricks/346ae7cf-.../decision/DECISION.md`): the
+   * `next = max(hot holders ∪ {predecessor}) + 1` contract, its LOUD REFUSAL
+   * on a seat with zero hot holders, and any archive/cold-tier read. His
+   * words: *"I guess it should be very well possible to make sure that we
+   * only assign numbers which have not yet been used in a seat. … Don't make
+   * it overcomplicated."* A stored counter does that with no scan at all, so
+   * a fully-cold seat is an ordinary case rather than a refusal.
    *
-   * assigned INSIDE the existing index lock (index-lock.ts:171-213) —
-   * atomically with the activation flip, not as a separate read. A seat with
-   * ZERO hot holders refuses loudly ("seat has no hot holder — restore one
-   * first") rather than restarting at 1 or scanning the cold tier
-   * (sessionArchive.ts:8-12 forbids ambient archive scans).
+   * 🛑 **AND THE DOCUMENT THAT CITES THIS COMMENT STILL CARRIES THE WITHDRAWN
+   * RULE.** `Bricks/5ad22d5d-.../conception/B1-SHAPE-AS-SHIPPED.md` (§"The
+   * holder ordinal's single atomic home", ~:170-174) states the max-rule, the
+   * loud zero-hot-holder refusal and the no-cold-scan clause as current, and
+   * says they are *"now the doc comment at"* this field — so the two
+   * pointed at each other and only this side has been corrected. That file is
+   * B1's dated record of what B1 shipped and is accurate AS OF 2026-09-22;
+   * it has deliberately not been rewritten here. **Do not reinstate the rule
+   * from it.** Cluster A (2026-09-28) is later and governs.
    *
-   * ⚠️ KNOWN, ACCEPTED LIMITATION (D-B1-14) — this rule protects against
-   * RENUMBERING (a displayed #5 silently becoming #4), which it fully closes.
-   * It does NOT fully close RE-ISSUE: two rare shapes (the max-holder was
-   * archived; a prepared-but-never-activated holder was discarded) can still
-   * hand out a number a seat already used once. Re-issue is much smaller
-   * than renumbering — nothing already displayed ever changes — and is dated:
-   * B9 extends the archive projections to carry seat/holder ids, after which
-   * the max is exact over hot ∪ archive-index by a targeted read and this
-   * leak closes for good.
+   * ⚠️ AND THE "KNOWN, ACCEPTED LIMITATION" THAT SAT HERE IS CLOSED, NOT
+   * DOCUMENTED. A label is never RE-ISSUED — archived holders included —
+   * because the counter only ever increases and never consults the
+   * population. A repeat is now a DEFECT, not a tolerated residual.
+   * **GAPS ARE LEGAL; REPEATS ARE NOT** (D4a): the guarantee is that a
+   * number is never handed out twice, never that none is skipped. A crashed
+   * activation's ordinal is deliberately burned rather than recovered —
+   * deriving it as `next_ordinal - 1` would be wrong the moment any other
+   * activation interleaved.
    *
    * 🛑 THE ORDINAL IS A DISPLAY LABEL AND MUST NEVER BE A KEY. This is what
    * makes the re-issue residual harmless rather than a live correctness bug:
@@ -1301,16 +1313,34 @@ export type SessionRecord = {
    */
   holderOrdinal?: number;
   /**
-   * True iff this holder is its seat's current ACTIVE holder. At most one
-   * record per `seatId` may carry `true` at any time — B1 mints one holder
-   * per seat so this holds trivially; B2's activation write owns enforcing
-   * it across a succession (the same unconditional-preserve discipline as
-   * `preserveParentLinkageForPersist`, per brick c99f9994's precedent).
-   * Persisted `holder_active`. Projected onto the index entry — NOT only
-   * the record — because acpx-ui's hot path never opens `<id>.json` and
-   * synthesises its view from the index entry instead (see
-   * `SessionIndexEntry.holderActive` below); a marker that stopped at the
-   * record would be a routing misroute, not a cosmetic one.
+   * True iff this holder is its seat's current ACTIVE holder.
+   *
+   * 🛑 THIS FIELD IS A MIRROR, NOT THE AUTHORITY — changed by Cluster A on
+   * 2026-09-28. The authority is `active_holder_id` ON THE SEAT RECORD in
+   * `~/.acpx/sessions/seats.json` (`seat-store.ts`). This flag is a
+   * write-both projection of it with EXACTLY ONE WRITER — B2's activation
+   * flip — kept only until every box reads the store. **Where the two
+   * disagree, THE SEAT WINS**, and the disagreement is reported rather than
+   * reconciled (one structured line at the flip; the count of currently
+   * divergent seats is DERIVED on demand and stored nowhere).
+   *
+   * ⚠️ Do not add a second writer. The two-source ambiguity the seat record
+   * exists to delete comes straight back, and it does not announce itself —
+   * both values simply look plausible.
+   *
+   * At most one record per `seatId` may carry `true` at a time. On the seat
+   * record that is true BY CONSTRUCTION (one field cannot hold two values);
+   * across these two mirrored records it is B2's own ordering that keeps it,
+   * which is why the retirement write precedes the pointer move. Persisted
+   * `holder_active`, and protected across every write — the privileged
+   * close included — by `preserveSeatHolderFieldsForPersist` under the
+   * `authoritative.seatHolder` gate (D1, brick c99f9994's precedent one
+   * field group over).
+   *
+   * Projected onto the index entry — NOT only the record — because acpx-ui's
+   * hot path never opens `<id>.json` and synthesises its view from the index
+   * entry instead (see `SessionIndexEntry.holderActive`); a marker that
+   * stopped at the record would be a routing failure, not a cosmetic one.
    */
   holderActive?: boolean;
   /**
@@ -1319,10 +1349,20 @@ export type SessionRecord = {
    * known only by URL, has no locally resolvable seat). Used solely to
    * compose `ACPX_PARENT_SEAT_URL` at every subsequent spawn of THIS
    * record (mirrors `parentSessionUrl`'s role for `ACPX_PARENT_SESSION_URL`).
-   * Persisted `parent_seat_id`. ⚠️ NOT kept live across a `set-parent`
-   * re-parent — that verb updates `parentSessionId`/`parentSessionUrl` but
-   * intentionally does not re-resolve this field (B1 scope boundary; see
-   * `B1-SHAPE-AS-SHIPPED.md`).
+   * Persisted `parent_seat_id`.
+   *
+   * ⚠️ AN EARLIER VERSION OF THIS COMMENT SAID THIS FIELD IS "NOT kept live
+   * across a `set-parent` re-parent". THAT IS NO LONGER TRUE — verified in
+   * the code, not inferred: `applyParentToRecord` writes
+   * `record.parentSeatId = parent.seatId` (`session-reparent.ts:647`) on the
+   * line beside `parentSessionId`, and CLEARS it for a cross-box parent whose
+   * seat is unknowable, so a re-parented child cannot keep composing
+   * `ACPX_PARENT_SEAT_URL` from its OLD parent's seat. `set-parent` is
+   * therefore this field's ONE authorised writer after creation, which is
+   * exactly why D1 puts it in the LINKAGE half of the seat group — preserved
+   * by `preserveParentLinkageForPersist` under the existing
+   * `authoritative.parent` gate, alongside the parent linkage it pairs with,
+   * rather than in the holder half whose writer is the activation flip.
    */
   parentSeatId?: string;
 };

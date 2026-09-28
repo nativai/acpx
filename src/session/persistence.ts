@@ -64,3 +64,20 @@ export type {
   TemplateSelectorResult,
   TemplateSlugAssignment,
 } from "./persistence/repository.js";
+// THE SEAT STORE — the authority for who holds each seat (brick b64dfbb3 / B2).
+export {
+  MalformedSeatRowError,
+  parseSeatFromPersisted,
+  parseSeatRefOrThrow,
+  parseSeatStore,
+  readSeatStore,
+  SEAT_RECORD_FIELD_PLAN,
+  SEAT_STORE_FILE,
+  SEAT_STORE_NO_CHANGE,
+  seatFromStore,
+  SeatStoreUnwritableError,
+  seatStorePath,
+  seatToPersisted,
+  withSeatStoreWrite,
+} from "./persistence/seat-store.js";
+export type { SeatRecord, SeatStore, SeatStoreMutation } from "./persistence/seat-store.js";

@@ -105,6 +105,30 @@ export type SessionCreateOptions = {
   parentSessionUrl?: string;
   /** The parent's seat id, resolved same-box only (C3/D-B1-9, brick 5ad22d5d). */
   parentSeatId?: string;
+  /**
+   * CREATE INTO AN EXISTING SEAT — `sessions new --seat <seat-ref>` (D11, brick
+   * b64dfbb3). The new record joins the named seat **prepared but not active**:
+   * `holderActive: false` and **no** `holderOrdinal`, because the ordinal is
+   * allocated at ACTIVATION (phase 2.4) and never at creation.
+   *
+   * 🛑 ABSENT ⇒ TODAY'S BEHAVIOUR BYTE FOR BYTE: a fresh `crypto.randomUUID()`
+   * seat. Minting is the DEFAULT; joining is the explicit, validated exception,
+   * and the asymmetry is deliberate rather than inherited. A mirror divergence is
+   * a wrong answer that HEALS — the next flip overwrites it. A MIS-SEATED SESSION
+   * IS A WRONG IDENTITY THAT EVERY LATER BLOCK INHERITS, and nothing downstream
+   * can tell it is wrong, because a session in the wrong seat looks exactly like a
+   * session in the right one: no signature to detect, no comparison that fails, no
+   * re-run that repairs it. Refusing a legitimate join costs one error message;
+   * accepting an illegitimate one costs a permanent, silent, inherited falsehood.
+   *
+   * ⇒ **NEVER INFERRED.** Not from a parent, a brick, a cwd, a template, or an
+   * `ACPX_SEAT_URL` in the environment. The only way a session joins an existing
+   * seat is an operator or agent typing `--seat` explicitly. Every inference rule
+   * is a way to reach the join by accident, which is the one thing that must not
+   * happen. ⚠️ And it is REFUSED outright on any fork/copy path — see
+   * `refuseSeatJoinOnForkPath`.
+   */
+  seatId?: string;
   metadata?: Record<string, string>;
   mcpServers?: McpServer[];
   permissionMode: PermissionMode;

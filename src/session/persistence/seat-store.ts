@@ -54,6 +54,27 @@ import { withSessionIndexLock } from "./index-lock.js";
  * asserts the type; `test/seat-store-hold.test.ts` (AP11) counts the I/O the hold
  * actually performs and carries a control proving the count is not vacuous.
  *
+ * ## 🛑 THE READER FAILS OPEN AND THE WRITER FAILS CLOSED — AND THAT ASYMMETRY IS
+ * DELIBERATE. DO NOT "FIX" IT INTO SYMMETRY.
+ *
+ * `parseSeatStore` treats an unreadable top level as an EMPTY store; `withSeatStoreWrite`
+ * REFUSES to write over one (`SeatStoreUnwritableError`). Each leg fails in the
+ * direction that is recoverable:
+ *
+ * - a reader that failed closed would make the whole box **unroutable over one bad
+ *   byte** — every delivery on every seat, for a defect in one row;
+ * - a writer that failed open would **destroy the authority**.
+ *
+ * ⚠️ **THIS STORE IS THE ONE ARTIFACT IN THE DESIGN WITH NO RECOVERY PATH, AND THAT
+ * IS WHY.** Everything else here is a projection: `index.json`, the index entries, the
+ * `holder_active` mirror, the archive projections — all rebuildable from the records
+ * that remain. **These seven fields are rebuildable from nothing.** Two of them
+ * specifically cannot be reconstructed even in principle: `active_holder_id`, because
+ * a mirror that disagreed with it is by definition not evidence of what it said; and
+ * `next_ordinal`, because a re-minted counter RE-ISSUES labels, and "a number is never
+ * re-issued" is the one guarantee Daniel stated outright (D4a). A rebuilt index costs a
+ * scan; a rebuilt seat store costs the guarantee.
+ *
  * ## Scaling — the ceiling is inherited rather than rediscovered
  *
  * Read-modify-write is **O(ALL SEATS) per write**: one JSON object, so every write
@@ -186,6 +207,55 @@ export type SeatStore = {
 
 export function seatStorePath(sessionDir: string): string {
   return path.join(sessionDir, SEAT_STORE_FILE);
+}
+
+/** A seat id is a UUID (C1). Deliberately anchored and case-sensitive-lowercase:
+ * every seat id in existence is a `crypto.randomUUID()`, which is lowercase. */
+const SEAT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * Validate a seat reference AT THE ORIGIN — **D8**, and this is the only place it
+ * happens (brick b64dfbb3; `ACTIVATION-PROTOCOL.md` §7).
+ *
+ * 🛑 **REJECTED, NOT REPAIRED. NOT TRIMMED, NOT LOWERCASED, NOT COERCED.** The value
+ * that gets written is byte-identical to the value accepted, and an accepted value is
+ * a UUID, which by definition has no surrounding whitespace.
+ *
+ * **A REPAIR AT THE ORIGIN IS WHAT CREATES THE COLLAPSE THIS EXISTS TO PREVENT.**
+ * Normalising makes the stored value differ from the submitted one, so the layers
+ * downstream end up disagreeing about which of the two they are looking at — and that
+ * disagreement is the measured defect: *absent*, *malformed* and *valid* are three
+ * states collapsed into one value, with each layer already picking a different one.
+ * Measured at `db49b08b` on a whitespace-only seat id: `auth-env.ts:856-861` trims
+ * then length-gates it, so it is ABSENT and no `ACPX_SEAT_URL` is emitted, silently;
+ * `parseSeatFieldsFromPersistedRecord` type-checks only, so a whitespace string is
+ * PRESENT AND VALID and rides onto the record; the index projection carries it
+ * verbatim; acpx-ui's PUT boundary rejects it as MALFORMED; and B6's
+ * `COALESCE(excluded.seat_id, seat_id)` coerces the absence away. Every layer is
+ * individually consistent; jointly they contradict, which is why no single-site review
+ * finds it.
+ *
+ * ⇒ If a malformed value can never ENTER, what each layer would do with one stops
+ * mattering. That is why this closes the ORIGIN only, and why it costs nothing: the
+ * invariant already held by construction — the sole minter is `crypto.randomUUID()` —
+ * so this makes an incidental invariant a stated one rather than constraining anything
+ * that works today.
+ *
+ * ⚠️ `auth-env.ts`'s `.trim()` is RECLASSIFIED, NOT REMOVED: it is a PRESENCE GUARD
+ * for the transient creation spawn (where `seatId` is `""`/unset), and it is correct
+ * as one because a valid UUID is unaffected by it. It is not the validator.
+ */
+export function parseSeatRefOrThrow(label: string, value: string): string {
+  if (SEAT_ID_RE.test(value)) {
+    return value;
+  }
+  throw new Error(
+    `${label} must be a seat id in lowercase UUID form, got ${JSON.stringify(value)}. ` +
+      `It is rejected rather than repaired: a seat id is never trimmed, lowercased or ` +
+      `otherwise normalised, because a value that is stored differently from how it was ` +
+      `submitted is exactly what makes the layers downstream disagree about whether it ` +
+      `is absent, malformed or valid. Pass the seat id exactly as the seat store holds it.`,
+  );
 }
 
 /**

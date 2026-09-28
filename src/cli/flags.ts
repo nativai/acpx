@@ -103,6 +103,12 @@ export type SessionsNewFlags = {
   resumeSession?: string;
   parentId?: string;
   parentSessionUrl?: string;
+  /** `--seat <uuid>` (D11, brick b64dfbb3) — create INTO this existing seat, prepared
+   * but not active. Absent is the default and means "mint a fresh seat", exactly as
+   * every create did before. Deliberately absent from `SessionsCopyFlags`: a fork or
+   * copy always mints, so the flag is not offered there and an unknown-option error is
+   * the refusal. */
+  seat?: string;
   metadata?: Record<string, string>;
   brick?: string | false;
   fromTemplate?: string;

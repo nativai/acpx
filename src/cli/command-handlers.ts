@@ -910,6 +910,14 @@ function buildSessionStartOptions(params: {
     parentSessionId: params.parent?.acpxRecordId,
     parentSessionUrl: params.parent?.sessionUrl,
     parentSeatId: params.parent?.seatId,
+    // D11 — the join, and it comes ONLY from the explicit flag. 🛑 Never from
+    // `params.parent?.seatId` beside it, nor from `ACPX_SEAT_URL`, a brick, a cwd or a
+    // template: joining a seat by INFERENCE is the mis-seating this design refuses,
+    // and a wrong seat is a wrong identity that every later block inherits with no
+    // signature to detect it. The two fields on these adjacent lines are easy to
+    // conflate and mean opposite things — `parentSeatId` records WHO SPAWNED ME,
+    // `seatId` records WHICH OFFICE I HOLD.
+    seatId: params.flags.seat,
     metadata: withInheritedBrick(
       applyBrickFlag(params.flags.metadata, params.resolvedBrick),
       params.parent?.brick,

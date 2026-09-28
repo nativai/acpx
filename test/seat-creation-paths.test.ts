@@ -8,7 +8,11 @@ import type { AcpClient } from "../src/acp/client.js";
 import type { QueueTask } from "../src/cli/queue/ipc.js";
 import { runQueuedTask } from "../src/cli/session/runtime.js";
 import { textPrompt } from "../src/prompt-content.js";
-import { resolveSessionRecord } from "../src/session/persistence.js";
+import {
+  readSeatStore,
+  resolveSessionRecord,
+  withSeatStoreWrite,
+} from "../src/session/persistence.js";
 import type { SessionNotification, SessionRecord } from "../src/types.js";
 import {
   makeSessionRecord as makeSessionRecordFixture,
@@ -119,21 +123,300 @@ test("G2/path 1 · `sessions new` mints a fresh seat, read back from DISK", asyn
 
 // ─── Path 2 — fork / copy ───────────────────────────────────────────────────
 //
-// REMOVED (Daniel, 2026-09-28: "if this Test is doing trouble then completely
-// remove it please") — brick://d9ba2870. The row itself was sound; it reliably
-// tripped over the SHARED `withTempHome` fixture's cleanup racing the detached
-// `__queue-owner` daemon that `sessions new`/`sessions copy` intentionally
-// leave running past the CLI call's own exit (queue-owner-process.ts spawns it
-// `detached: true`, by design — see owner-reaper.ts). That daemon can still be
-// writing under `<tempHome>/.acpx/sessions/` when this test's own `withTempHome`
-// tears down its temp HOME, so `fs.rm(..., {recursive:true})` intermittently
-// (~1 in 5 runs, reproduced with no concurrent box load) throws:
-//   ENOTEMPTY: directory not empty, rmdir '<tempHome>/.acpx/sessions'
-// `withTempHome`'s cleanup is now retry-tolerant of exactly that race (below),
-// which is the fix for the other 64 files sharing the fixture; this row is
-// simply gone rather than reintroduced, per the ruling above. Only path 1 and
-// path 3 remain exercising G2 — the three-tests rationale at the top of this
-// file predates the removal.
+// RESTORED 2026-09-28 by B2 (brick b64dfbb3), having been removed by `e071ad9`
+// under Daniel's ruling of the same day — *"if this Test is doing trouble then
+// completely remove it please"* (brick 8bc0cbb4 / d9ba2870).
+//
+// 🔑 WHY RESTORING IT IS NOT DEFYING THAT RULING. The instruction was about a
+// TROUBLESOME ROW, not a decision to stop protecting the PROPERTY — and the
+// property is Daniel's own binding ruling from six days earlier: every fork
+// mints a NEW seat, no exceptions (2026-09-22, topic 1). Removing the row left
+// that property undefended at exactly the moment the block most likely to break
+// it began work: B2/D11 adds `--seat`, whose naive implementation on the SHARED
+// mint seam (`seatId: options.seatId ?? crypto.randomUUID()`) would make a fork
+// silently inherit a seat. ⇒ THIS ROW IS NOW D11's REGRESSION GUARD, not
+// housekeeping.
+//
+// THE FLAKE'S KNOWN CAUSE WAS A FIXTURE DEFECT AND IT IS REPAIRED ON THIS
+// BRANCH. `sessions new`/`copy` intentionally leave a detached `__queue-owner`
+// daemon running past the CLI call's exit (`queue-owner-process.ts`,
+// `detached: true` by design), and it can still be writing under
+// `<tempHome>/.acpx/sessions/` when `withTempHome` tears the dir down —
+// `force` suppresses ENOENT, not ENOTEMPTY. `runtime-test-helpers.ts` now
+// passes `{ maxRetries: 5, retryDelay: 100 }`, shared by 65 test files.
+// ⚠️ READ THAT AT EXACTLY ITS WIDTH: it is evidence about the FIXTURE, not
+// about this row. The commit's 45/45 is `withTempHome`'s number, and this row
+// is a NEW SUBJECT. Its own stability is measured separately and cited in the
+// commit message, under real box load, because the original row's defect WAS
+// intermittency — a row reinstated on "the flake is fixed" is precisely the row
+// whose stability must be measured rather than argued, and this slot gets one
+// credible restoration.
+
+test("G2/path 2 · `sessions copy` mints a NEW seat and never inherits the source's", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    // ⚠️ THE SOURCE MUST BE CREATED WITH A FORK-CAPABLE AGENT, and this is the one
+    // fixture detail the restoration has to get right: `sessions copy` refuses
+    // outright unless the agent advertises `sessionCapabilities.fork`
+    // (session-management.ts), so a plain MOCK_AGENT_COMMAND source makes the copy
+    // exit 1 — which looks like the seat assertion failing and is not. Recovered
+    // from the removed row in `e071ad9` rather than re-derived.
+    const sourceAgent = `${MOCK_AGENT_COMMAND} --supports-fork-session`;
+    const source = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        sourceAgent,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "-s",
+        "path2-source",
+      ],
+      homeDir,
+    );
+    assert.equal(source.code, 0, source.stderr);
+    const sourceId = String(
+      (JSON.parse(source.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const sourceSeat = (await readRecordJson(homeDir, sourceId)).seat_id;
+    assert.equal(
+      typeof sourceSeat === "string" && sourceSeat.length > 0,
+      true,
+      "source precondition",
+    );
+
+    // `copy` inherits cwd and agent from the source record — as the original row did.
+    const copied = await runCli(
+      ["--format", "json", "sessions", "copy", "--from", sourceId, "--name", "path2-copy"],
+      homeDir,
+    );
+    assert.equal(copied.code, 0, copied.stderr);
+    const copyId = String(
+      (JSON.parse(copied.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+
+    // Read back from DISK — the falsifying observation is about what a real file
+    // read finds, not what the CLI echoed.
+    const copy = await readRecordJson(homeDir, copyId);
+    assert.equal(
+      typeof copy.seat_id === "string" && copy.seat_id.length > 0,
+      true,
+      "path 2: seat_id absent/empty on the copy read back from disk",
+    );
+    // 🛑 THE FALSIFIER. This is the assertion that goes red if the fork path is
+    // ever changed to carry the source's seat — including by the naive `??`
+    // spelling of D11's join on the shared mint seam.
+    assert.notEqual(
+      copy.seat_id,
+      sourceSeat,
+      "path 2: the copy INHERITED the source's seat — every fork must mint a new one (Daniel, 2026-09-22)",
+    );
+    // A fresh seat means a first holder, so the copy is holder #1 and active.
+    assert.equal(copy.holder_ordinal, 1);
+    assert.equal(copy.holder_active, true);
+  });
+});
+
+// ─── D11 — `--seat`: create INTO an existing seat ───────────────────────────
+//
+// AP13. The default must be preserved and joining must be opt-in, validated, and
+// unreachable by accident. Path 1 above already pins the default (fresh seat,
+// ordinal 1, active) — these rows pin the opt-in and, mostly, the REFUSALS,
+// which are the interesting part of D11 rather than the happy path.
+
+test("D11 · `sessions new --seat` joins the seat PREPARED: not active, and with NO ordinal", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+
+    // Plant the seat row through the store's own writer.
+    // ⚠️ AND THIS EXPOSES A REAL GAP, NOT A TEST CONVENIENCE: nothing in
+    // production writes a seat ROW yet. `sessions new` mints a `seat_id` onto the
+    // RECORD, and §1 names the ACTIVATION write as the store's first writer — so a
+    // seat minted after B10's backfill has no row, and can therefore never be
+    // joined or activated. Routed to the B2 sub-HoD; this row plants the row it
+    // needs so the join itself is still tested end to end.
+    const seatId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    await withSeatStoreWrite(sessionDir, () => ({
+      mutation: {
+        kind: "write" as const,
+        seats: new Map([
+          [
+            seatId,
+            {
+              seatId,
+              createdAt: "2026-09-28T00:00:00.000Z",
+              activeHolderId: null,
+              nextOrdinal: 1,
+              closedAt: null,
+              name: undefined,
+              brickId: undefined,
+            },
+          ],
+        ]),
+      },
+      result: undefined,
+    }));
+
+    const joined = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "-s",
+        "d11-joined",
+        "--seat",
+        seatId,
+      ],
+      homeDir,
+    );
+    assert.equal(joined.code, 0, joined.stderr);
+    const id = String(
+      (JSON.parse(joined.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+
+    const onDisk = await readRecordJson(homeDir, id);
+    assert.equal(onDisk.seat_id, seatId, "the joined record does not carry the requested seat");
+    assert.equal(
+      onDisk.holder_active,
+      false,
+      "a joined holder must be PREPARED, not active — activation is exclusive and is a separate step",
+    );
+    // 🛑 NO ORDINAL. Allocating one at creation would burn a number for a holder
+    // that may never be activated, and the activation heal relies on the absence
+    // directly ("N still lacks a holderOrdinal ⇒ allocate a fresh one").
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(onDisk, "holder_ordinal"),
+      false,
+      "a joined holder carries NO holder_ordinal — the ordinal is drawn at activation, never at creation",
+    );
+  });
+});
+
+test("D11 · `--seat` is REFUSED on a fork/copy — every fork mints a new seat", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const base = ["--cwd", cwd, "--agent", MOCK_AGENT_COMMAND, "--approve-all", "--format", "json"];
+
+    const source = await runCli([...base, "sessions", "new", "-s", "d11-fork-source"], homeDir);
+    assert.equal(source.code, 0, source.stderr);
+    const sourceId = String(
+      (JSON.parse(source.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+
+    const refused = await runCli(
+      [
+        ...base,
+        "sessions",
+        "copy",
+        "--from",
+        sourceId,
+        "--seat",
+        "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+      ],
+      homeDir,
+    );
+    assert.notEqual(refused.code, 0, "`sessions copy --seat` was ACCEPTED");
+    // 🔑 A SILENTLY-IGNORED FLAG AND A SILENTLY-HONOURED ONE ARE BOTH WORSE THAN
+    // AN ERROR, so the row asserts the operator was TOLD — not merely that no seat
+    // was inherited. `--seat` is not registered on `copy` at all, so this is
+    // commander's unknown-option refusal; the library-level guard covers the
+    // combination on every other path.
+    assert.match(
+      `${refused.stderr}${refused.stdout}`,
+      /unknown option|--seat/i,
+      "the refusal did not mention the rejected option",
+    );
+  });
+});
+
+test("D11/D8 · a malformed `--seat` is refused at the ORIGIN, before anything is created", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const base = ["--cwd", cwd, "--agent", MOCK_AGENT_COMMAND, "--approve-all", "--format", "json"];
+
+    // Each of these is a DIFFERENT one of the three states D8 refuses to collapse.
+    // The whitespace case is the measured specimen: one layer trims it to absent,
+    // one accepts it as a valid string, one rejects it as malformed.
+    for (const bad of [
+      "   ",
+      "",
+      "not-a-uuid",
+      "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE",
+      " aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    ]) {
+      const refused = await runCli([...base, "sessions", "new", "--seat", bad], homeDir);
+      assert.notEqual(refused.code, 0, `--seat ${JSON.stringify(bad)} was ACCEPTED`);
+      // 🛑 REJECTED, NOT REPAIRED — the uppercase and leading-space cases are the
+      // ones that would pass under a `trim().toLowerCase()`, and a value stored
+      // differently from how it was submitted is exactly what makes the layers
+      // downstream disagree about whether it is absent, malformed or valid.
+    }
+
+    // …and NOTHING was created by any of them: no seat row, and no session record.
+    const store = await readSeatStore(sessionDir).catch(() => undefined);
+    assert.equal(store?.seats.size ?? 0, 0, "a refused --seat minted a seat row");
+    const files = await fs.readdir(sessionDir).catch(() => [] as string[]);
+    assert.deepEqual(
+      files.filter((f) => f.endsWith(".json") && f !== "index.json" && f !== "seats.json"),
+      [],
+      "a refused --seat left a session record behind",
+    );
+  });
+});
+
+test("D11 · `--seat` naming a seat that is NOT in the store is refused — joining never mints one", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+
+    const absent = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+    const refused = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "--seat",
+        absent,
+      ],
+      homeDir,
+    );
+    assert.notEqual(refused.code, 0, "a --seat naming no existing seat was ACCEPTED");
+    // 🛑 THE REFUSAL THAT MATTERS MOST. A typo'd seat id that silently CREATED the
+    // seat it named would leave a session sitting in a seat nobody meant — and a
+    // mis-seated session is a wrong IDENTITY that every later block inherits, with
+    // no signature to detect it and no re-run that repairs it.
+    const store = await readSeatStore(sessionDir).catch(() => undefined);
+    assert.equal(
+      store?.seats.size ?? 0,
+      0,
+      "joining a non-existent seat MINTED it as a side effect — the one thing this refusal exists to prevent",
+    );
+  });
+});
 
 // ─── Path 3 — subagent shadow record (teammate_spawned) ────────────────────
 //

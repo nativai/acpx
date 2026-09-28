@@ -52,7 +52,10 @@ import {
   findSessionByDirectoryWalk,
   isoNow,
   normalizeName,
+  readSeatStore,
   resolveSessionRecord,
+  seatFromStore,
+  sessionBaseDir,
   writeSessionRecord,
   writeSessionRecordAtBoundary,
 } from "../../session/persistence.js";
@@ -118,12 +121,128 @@ function spawnGuardForcedInfo(
   return blocked && forcedTo ? { blocked, forcedTo } : undefined;
 }
 
+/**
+ * The seat fields a NEWLY CREATED record carries (D11, brick b64dfbb3).
+ *
+ * Two shapes, and the difference between them is the whole of D11:
+ *
+ * - **no `--seat` (the default, unchanged):** mint a fresh seat, `holderOrdinal: 1`,
+ *   `holderActive: true`. B1's behaviour byte for byte.
+ * - **`--seat <ref>`:** join that seat **PREPARED BUT NOT ACTIVE** —
+ *   `holderActive: false` and **NO `holderOrdinal` AT ALL**.
+ *
+ * ⚠️ THE ABSENT ORDINAL IS LOAD-BEARING, NOT AN OMISSION. The ordinal is drawn from
+ * the seat's stored `next_ordinal` counter at ACTIVATION (§2.7 phase 2.4), inside the
+ * one hold that also moves the pointer — so allocating one here would burn a number
+ * for a holder that may never be activated, and Daniel's guarantee is that a number
+ * is never RE-ISSUED. The activation heal relies on the absence directly: its branch
+ * is *"`N` still lacks a `holderOrdinal` ⇒ allocate a fresh one"*, which is how a
+ * crash between the counter write and the successor write is repaired. C2's
+ * *absence is a value* makes a missing field persist as missing, so this survives
+ * the round trip rather than being defaulted back to 1 by a reader.
+ *
+ * ⚠️ AND IT MUST NOT BE ACTIVE. Preparation is cheap and non-exclusive; ACTIVATION is
+ * exclusive. Two *prepared* holders on one seat is a supported state — a succession
+ * creates the successor while the predecessor is still active — and only `activate`
+ * may set the flag.
+ */
+function seatFieldsForCreate(
+  joinSeatId: string | undefined,
+): Pick<SessionRecord, "seatId" | "holderOrdinal" | "holderActive"> {
+  if (joinSeatId === undefined) {
+    return { seatId: crypto.randomUUID(), holderOrdinal: 1, holderActive: true };
+  }
+  return { seatId: joinSeatId, holderActive: false };
+}
+
+/**
+ * 🛑 `--seat` ON A FORK OR COPY IS REFUSED LOUDLY — never ignored, never honoured.
+ *
+ * Daniel, 2026-09-22 (topic 1, binding): **every fork mints a new seat, no
+ * exceptions** — including byways and template spawns. A fork is a divergent copy of
+ * a transcript; letting it join an existing seat would make two sessions with
+ * different histories claim the same identity, which is the mis-seating D11's whole
+ * asymmetry exists to prevent.
+ *
+ * ⚠️ WHY A THROW AND NOT A SILENT IGNORE. The mint seam is shared between the normal
+ * and fork/copy paths, so the tempting `seatId ?? randomUUID()` would honour the flag
+ * on a fork; the tempting "fix" is to drop the flag on that path instead. **Both are
+ * wrong in the same way**: the operator asked for something the system will not do,
+ * and neither variant tells them. A silently-ignored flag leaves them believing the
+ * session joined a seat it did not, which is a wrong belief about identity — exactly
+ * the class that never surfaces as an error.
+ */
+function refuseSeatJoinOnForkPath(options: SessionCreateOptions): void {
+  if (options.seatId === undefined || options.forkFromSessionId === undefined) {
+    return;
+  }
+  throw new Error(
+    `--seat cannot be combined with a fork or copy: every fork mints a NEW seat, no ` +
+      `exceptions (Daniel, 2026-09-22). Requested seat ${JSON.stringify(options.seatId)} ` +
+      `for a session forked from ${JSON.stringify(options.forkFromSessionId)}. A forked ` +
+      `session is a divergent copy of a transcript; if you want a holder in that seat, ` +
+      `create one with \`sessions new --seat\` instead of copying an existing session.`,
+  );
+}
+
+/**
+ * The remaining `--seat` refusals, all BEFORE any write (D11).
+ *
+ * 🛑 **THE SEAT MUST ALREADY EXIST — JOINING NEVER MINTS ONE AS A SIDE EFFECT.** That
+ * is the refusal that matters most here: a typo'd seat id which silently created the
+ * seat it named would produce a seat nobody meant, holding a session that believes it
+ * belongs there, and nothing downstream could tell — a mis-seated session is a wrong
+ * identity that every later block inherits, with no signature to detect and no re-run
+ * that repairs it. `seatFromStore` distinguishes the three states for us: a
+ * `MalformedSeatRowError` propagates as itself, because "present but unreadable" must
+ * never be reported as "no such seat" — a caller told the latter goes on to create one.
+ *
+ * ⚠️ NOT CHECKED HERE, AND STATED RATHER THAN QUIETLY SKIPPED: B1 ruling 4's *all
+ * holders of a seat share one kind*. Checking it needs an enumeration of the seat's
+ * existing holders — a scan for `seatId === s` over the index — and the seat record
+ * deliberately carries no holder list (the field set is closed at seven). That scan is
+ * the one the seat store exists to remove from hot paths, and the protocol confines it
+ * to the heal path. It is also unreachable today: the only two kinds are `session` and
+ * the `subagent` shadow record, and `runtime.ts`'s subagent path is never CLI-driven,
+ * so no `--seat` can reach it. ⇒ deferred deliberately, with the cost named; it wants
+ * a ruling on where the holder enumeration is allowed to live, not a scan added here
+ * on my own judgement.
+ */
+async function refuseUnjoinableSeat(joinSeatId: string | undefined): Promise<void> {
+  if (joinSeatId === undefined) {
+    return;
+  }
+  const store = await readSeatStore(sessionBaseDir());
+  const seat = seatFromStore(store, joinSeatId);
+  if (!seat) {
+    throw new Error(
+      `seat ${JSON.stringify(joinSeatId)} is not in the seat store, so there is nothing to ` +
+        `join. Joining NEVER creates a seat as a side effect — a mistyped id that minted the ` +
+        `seat it named would leave a session sitting in a seat nobody meant, and nothing ` +
+        `downstream can tell that apart from a session in the right one. Create the seat ` +
+        `deliberately, or omit --seat to mint a fresh one for this session.`,
+    );
+  }
+  if (seat.closedAt !== null && seat.closedAt !== undefined) {
+    throw new Error(
+      `seat ${JSON.stringify(joinSeatId)} was closed at ${seat.closedAt} — the office is ` +
+        `abolished and takes no further holders. This is not the same as the seat being ` +
+        `vacant: a vacant seat (no active holder) still accepts one.`,
+    );
+  }
+}
+
 // eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
 async function createSessionRecordWithClient(
   client: AcpClient,
   options: SessionCreateOptions,
 ): Promise<SessionRecord> {
   const cwd = absolutePath(options.cwd);
+  // BEFORE ANY WRITE, AND BEFORE THE AGENT IS EVEN STARTED (D11). A refusal that
+  // fired after `client.start()` would leave a spawned adapter behind for a request
+  // that was never going to be honoured.
+  refuseSeatJoinOnForkPath(options);
+  await refuseUnjoinableSeat(options.seatId);
   if (options.recordId) {
     const outbox = new BrickOutbox();
     try {
@@ -246,18 +365,23 @@ async function createSessionRecordWithClient(
     agentCapabilities: client.initializeResult?.agentCapabilities,
     ...conversation,
     acpx: desiredConfigOptions ? { desired_config_options: desiredConfigOptions } : {},
-    // SEATS (brick 5ad22d5d, D-B1-6/D-B1-7). This literal is the SHARED seam
-    // for BOTH the normal-create path AND the fork/copy path (forkContext is
-    // set above when options.forkFromSessionId was given) — so minting here
-    // unconditionally covers seat-creation paths 1 and 2 with one edit. A
-    // fork NEVER inherits the source's seat (Daniel, 2026-09-22: every fork
-    // mints a new seat, no exceptions) — hence unconditional, not gated on
-    // `forkContext`. B1 mints exactly one holder per seat, so holderOrdinal
-    // is always 1 and holderActive is always true here; B2's succession verb
-    // is the only place that ever creates holderOrdinal > 1.
-    seatId: crypto.randomUUID(),
-    holderOrdinal: 1,
-    holderActive: true,
+    // SEATS (brick 5ad22d5d, D-B1-6/D-B1-7; join added by B2/D11, brick b64dfbb3).
+    // This literal is the SHARED seam for BOTH the normal-create path AND the
+    // fork/copy path (forkContext is set above when options.forkFromSessionId was
+    // given) — which is what lets one edit cover seat-creation paths 1 and 2.
+    //
+    // 🛑 AND THAT SHARED SEAM IS EXACTLY THE TRAP D11 WARNS ABOUT. The naive
+    // version of the join — `seatId: options.seatId ?? crypto.randomUUID()` — reads
+    // like the obvious edit and would let `sessions copy --seat X` (and a fork)
+    // SILENTLY JOIN a seat, violating Daniel's topic-1 ruling that every fork mints
+    // a new seat, NO EXCEPTIONS (2026-09-22). `refuseSeatJoinOnForkPath` above has
+    // already thrown for that combination, so by here the join is known legitimate:
+    // a silently-ignored flag and a silently-honoured one are both worse than an
+    // error, and this is the line where the difference is decided.
+    //
+    // A fork therefore still NEVER inherits the source's seat — it mints, exactly as
+    // before. The default is unchanged byte for byte when `--seat` is absent.
+    ...seatFieldsForCreate(options.seatId),
     ...(forkContext
       ? {
           kind: "session" as const,
