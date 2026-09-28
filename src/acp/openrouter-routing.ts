@@ -144,6 +144,20 @@ export async function resolveOpenRouterRouteModel(params: {
   }
 
   const ref = parseModelRef(raw);
+
+  // ⚠️ THE CLAUDE-FAMILY REFUSAL IS NOT HERE, AND THAT IS DELIBERATE (brick
+  // 30eb2003). A predicate at this line was designed, built and then REMOVED as
+  // DEAD CODE: the harness-agnostic `assertModelPolicy` guard sits in
+  // `resolveAgentLaunchPlan` ABOVE the `applyProfileEnv` call that reaches this
+  // function (`client.ts` — one caller, one call site, verified), so for a
+  // Claude-family id it throws before this function is ever entered. A layer that
+  // never executes is worse than no layer, because it reads as coverage.
+  //
+  // ⇒ If you are looking for where Claude-family is refused: `assertModelPolicy`
+  //   (`models/claude-family.ts`), called from `resolveAgentLaunchPlan`, plus the
+  //   create-tier gate in `validateModelSelection`. DO NOT re-add one here without
+  //   first showing this line is reachable for such an id.
+
   // An explicit source prefix settles it without a catalogue read, either way.
   // A bracket is a context-window hint on claude (`sonnet[1m]`), never part of an
   // OpenRouter slug — and OpenRouter's own `:free` / `:batch` suffixes survive

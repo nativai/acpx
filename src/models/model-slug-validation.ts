@@ -31,6 +31,10 @@ import {
 import { stripProviderPrefix } from "../acp/harness-config-dir.js";
 import { AcpxOperationalError } from "../errors.js";
 import { findModelsById, loadCatalogue } from "./catalogue.js";
+import {
+  claudeFamilyOnOpenRouterMessage,
+  refusesClaudeFamilyOnOpenRouter,
+} from "./claude-family.js";
 import { nativeAgentTypesForSource } from "./harness-models.js";
 import { searchModels } from "./matcher.js";
 import type { CatalogueModel, ModelCatalogue } from "./types.js";
@@ -180,6 +184,14 @@ export type ValidationInput = {
    */
   agentName?: string;
   /**
+   * The agent COMMAND, from which the harness descriptor is derived. Distinct from
+   * `agentName` on purpose and NOT interchangeable with it: the name is the CLI
+   * agent-registry name and can be a custom alias, while the descriptor is derived
+   * from the command and cannot diverge. The Claude-family policy gate keys on the
+   * descriptor for exactly that reason — see the gate in `validateModelSelection`.
+   */
+  agentCommand?: string;
+  /**
    * Set only for a harness whose DESCRIPTOR fuses depth into the model id, where
    * `gpt-5.6-sol[high]`'s bracket is an effort and must answer to the model's
    * ladder. Left unset elsewhere because `sonnet[1m]`'s bracket is a
@@ -245,13 +257,19 @@ function refForLookup(raw: string, provisionsModelCatalogue: boolean | undefined
  * is orthogonal — it follows the depth MECHANISM, not the harness.
  */
 function validationInputFor(
-  params: { model: string | undefined; reasoningEffort: string | undefined; agentName?: string },
+  params: {
+    model: string | undefined;
+    reasoningEffort: string | undefined;
+    agentName?: string;
+    agentCommand?: string;
+  },
   provisionsModelCatalogue: boolean,
   depthFusedIntoId: boolean,
 ): ValidationInput {
   return {
     model: params.model,
     agentName: params.agentName,
+    ...(params.agentCommand !== undefined ? { agentCommand: params.agentCommand } : {}),
     ...(provisionsModelCatalogue
       ? { provisionsModelCatalogue: true }
       : { reasoningEffort: params.reasoningEffort }),
@@ -271,6 +289,27 @@ function shouldPrevalidateSessionModel(params: {
 }
 
 /**
+ * Tier 1 of the Claude-family policy (brick 30eb2003) — extracted from
+ * {@link validateModelSelection} only to keep that function inside the repo's
+ * complexity budget; it is called unconditionally and reads as one statement there.
+ * The reasoning for its PLACEMENT (above the catalogue lookup) is at the call site,
+ * and it is the load-bearing part.
+ */
+function assertClaudeFamilyPolicy(ref: ParsedModelRef, agentCommand: string | undefined): void {
+  const harness = harnessIdForAgentCommand(agentCommand);
+  if (!refusesClaudeFamilyOnOpenRouter({ harness, modelId: ref.id })) {
+    return;
+  }
+  throw new ModelSlugError(
+    claudeFamilyOnOpenRouterMessage({
+      requested: ref.raw,
+      ...(harness !== undefined ? { harness } : {}),
+    }),
+    "MODEL_CLAUDE_FAMILY_ON_OPENROUTER",
+  );
+}
+
+/**
  * Returns the resolved model when the catalogue could answer, `null` when it
  * stood aside (cold cache, or nothing to validate). Throws one of the five
  * shapes otherwise.
@@ -285,6 +324,38 @@ export function validateModelSelection(
   }
 
   const ref = refForLookup(raw, input.provisionsModelCatalogue);
+
+  // ── Claude-family policy refusal, create tier (brick 30eb2003) ─────────────
+  //
+  // 🛑 DO NOT MOVE THIS BELOW THE CATALOGUE LOOKUP. IT IS ONLY USEFUL ABOVE IT,
+  // AND THE REASON IS THE INCIDENT ITSELF.
+  //
+  // `openrouter/anthropic/claude-sonnet-5` (the SLASH spelling) is not a catalogue
+  // id — nothing strips that prefix on the claude path — so with a warm cache it
+  // falls through to `refuseOrStandAside` and out as `unknownSlugError`:
+  //     "...is not in this box's model catalogue ... try: acpx models --search sonnet"
+  // That is a SPELLING diagnosis for a POLICY problem. In the incident the agent
+  // met it, concluded it had a typo, followed the search hint, found the BARE form,
+  // and the bare form worked. **Our own error message walked the agent to the
+  // bypass.** A refusal that fires only where the id resolves leaves that hint in
+  // place on the exact path that was taken.
+  //
+  // Above the lookup it is also independent of the cache: `validateModelSelection`
+  // stands aside entirely on a cold cache (`refuseOrStandAside`), which would make
+  // a catalogue-derived answer silently absent precisely when nobody has warmed the
+  // box. Policy does not depend on what we have fetched.
+  //
+  // 🛑 GATED ON THE DESCRIPTOR (`harnessIdForAgentCommand`), NEVER ON THE AGENT
+  // NAME — the name form is a SILENT FAIL-OPEN. `input.agentName` is the CLI
+  // agent-registry name; it coincides with the harness id for a stock `claude` /
+  // `pi` agent and DIVERGES for a custom-named alias pointing at the same command.
+  // `assertModelAvailable` below already carries that hole (it looks `availability`
+  // up by NAME while `computeAvailability` keys it by HARNESS id, so a divergence
+  // misses the lookup and returns early on `undefined`). A policy gate on the name
+  // would inherit it exactly: register an alias, and this control stops applying
+  // with nothing failing anywhere.
+  assertClaudeFamilyPolicy(ref, input.agentCommand);
+
   const byId = findModelsById(catalogue, ref.id);
   const candidates = candidatesFor(byId, ref, input.agentName);
 
