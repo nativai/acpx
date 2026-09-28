@@ -850,6 +850,123 @@ function makeSubagentSpawningClient(sessionId: string, subagentId: string): AcpC
   return mock as unknown as AcpClient;
 }
 
+test("item 8 / path 3 · an UNWRITABLE store still leaves a usable shadow record, no row, and a diagnostic", async () => {
+  // 🔑 DETERMINISTIC BY INDUCING THE STATE, NOT BY SAMPLING FOR IT. The sampled path-3 row
+  // below can only observe the residual when contention happens to occur; this row FORCES
+  // the failure it cares about, so it can never red under load and it protects the
+  // MECHANISM regardless of the residual's rate. Same technique the test-engineer used to
+  // induce a corrupt store.
+  //
+  // The mint now runs AFTER the record write on path 3, so the fault that exercises item 8
+  // here is a store the writer must REFUSE to touch — which is what a corrupt `seats.json`
+  // produces (`SeatStoreUnwritableError`). This is AP15's pair for item 8 on path 3.
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    await fs.mkdir(sessionDir, { recursive: true });
+    // EXISTS and does not parse — the writer refuses rather than destroying it.
+    await fs.writeFile(path.join(sessionDir, "seats.json"), "{ not json at all", "utf8");
+
+    const parentRecord: SessionRecord = makeSessionRecordFixture({
+      acpxRecordId: "parent-session",
+      acpSessionId: "parent-session-acp",
+      agentCommand: "node mock-agent.js",
+      cwd,
+      seatId: "parent-seat",
+      holderOrdinal: 1,
+      holderActive: true,
+    });
+    await writeSessionRecordFile(homeDir, parentRecord);
+
+    // Capture the diagnostic: this path runs IN-PROCESS, so the warning goes to this
+    // process's own stderr rather than a subprocess's.
+    const written: string[] = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]): boolean => {
+      written.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return (realWrite as (c: string | Uint8Array, ...r: unknown[]) => boolean)(chunk, ...rest);
+    }) as typeof process.stderr.write;
+
+    try {
+      await runQueuedTask(
+        "parent-session",
+        {
+          requestId: "req-1",
+          message: "spawn a subagent",
+          prompt: textPrompt("spawn a subagent"),
+          permissionMode: "approve-all",
+          timeoutMs: 10_000,
+          waitForCompletion: true,
+          enqueuedAt: Date.now(),
+          send: () => {},
+          close: () => {},
+        },
+        {
+          sharedClient: makeSubagentSpawningClient("parent-session-acp", "subagent-1"),
+          suppressSdkConsoleErrors: true,
+        },
+      );
+    } finally {
+      process.stderr.write = realWrite;
+    }
+
+    // 1. THE SHADOW RECORD EXISTS — a store failure must not cost the subagent.
+    const reloadedParent = await resolveSessionRecord("parent-session");
+    const childRef = reloadedParent.subagents?.[0];
+    assert.ok(childRef, "an unwritable seat store cost the shadow record entirely");
+    const childRecord = await resolveSessionRecord(childRef.acpxRecordId);
+
+    // 2. IT KEEPS ITS seat_id — the handle B10 repairs by, and what keeps any descendants'
+    //    `parent_seat_id` chain from being orphaned.
+    assert.ok(
+      childRecord.seatId,
+      "the shadow record lost its seat_id — it is now invisible to the backfill",
+    );
+
+    // 3. THE ROW IS ABSENT, and the corrupt bytes are untouched (a corrupt store may hold
+    //    hand-recoverable rows, so the writer must never clear it to make itself work).
+    const store = await readSeatStore(sessionDir);
+    assert.equal(store.fileState, "malformed", "the store was overwritten or repaired");
+    assert.match(await fs.readFile(path.join(sessionDir, "seats.json"), "utf8"), /not json at all/);
+
+    // 4. THE DIAGNOSTIC WAS EMITTED AND NAMES THE REAL REMEDY. Never a bare catch — and for
+    //    a CORRUPT store the remedy is quarantine-then-backfill, not "run the backfill",
+    //    which cannot repair corruption and refuses to run against a malformed store.
+    const diagnostics = written.filter((line) => line.includes("seat-row-not-minted"));
+    assert.equal(
+      diagnostics.length,
+      1,
+      `expected exactly one diagnostic, got ${diagnostics.length}`,
+    );
+    assert.match(diagnostics[0], /USABLE/i, "the diagnostic does not say the session is fine");
+    assert.match(
+      diagnostics[0],
+      /quarantine/i,
+      "the diagnostic gives the wrong remedy for corruption",
+    );
+  });
+});
+
+// ⚠️ THIS ROW'S GATE DISPOSITION IS AN OPEN QUESTION, ROUTED RATHER THAN DECIDED HERE.
+//
+// The standing rule is that a mandatory-suite row which reds only intermittently under box
+// load is REMOVED, not carried — so a sampled detector cannot live in the mandatory gate.
+// This row's residual is bounded (k=0 in N=24 post-reorder, from k=1-in-6) but NOT proven
+// eliminated, and its fixture cannot control the outbox: the contention is between the
+// parent turn's writes and the child write on one SQLite DB, and `outbox-busy` is terminal
+// rather than retryable, so polling would not rescue it either.
+//
+// 🛑 BUT MOVING IT OUT OF THE GATE HAS A COST NOBODY HAS PRICED YET, WHICH IS WHY IT IS NOT
+// DONE HERE: this is B1's GATE-B1-FALSIFIABILITY §G2 row for creation path 3 — the ONE path
+// not reachable through `createSessionRecordWithClient`, and therefore the one a fix at that
+// level misses silently. Its primary property (path 3 puts a `seat_id` on the record) is NOT
+// intermittent; only its dependency on the child record write is. Taking it out of the
+// mandatory suite would quietly remove B1's coverage of the path most in need of it.
+//
+// ⇒ Left in place, with the residual named in the ASSERTION's failure message so whoever
+// meets the red gets the evidence and the instruction not to re-run for green. The
+// deterministic `item 8 / path 3` row above now covers the MECHANISM independently of the
+// rate, so the mechanism is protected either way.
 test("G2/path 3 · a teammate_spawned notification mints a shadow-record seat, read back from DISK", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -888,7 +1005,22 @@ test("G2/path 3 · a teammate_spawned notification mints a shadow-record seat, r
     // G2's falsifying observation.
     const reloadedParent = await resolveSessionRecord("parent-session");
     const childRef = reloadedParent.subagents?.[0];
-    assert.ok(childRef, "parent record must list the spawned subagent");
+    // 🛑 THE WARNING LIVES IN THE FAILURE MESSAGE, NOT ONLY IN A COMMENT. Whoever meets
+    // this red at 03:00 reads the failure output and nothing else; a comment is read only
+    // by whoever edits the file.
+    assert.ok(
+      childRef,
+      "parent record must list the spawned subagent.\n" +
+        "⚠️ PATH-3 OUTBOX RESIDUAL — this exact assertion was the known intermittent. The\n" +
+        "mint was moved to AFTER the record write (record first, then row, on path 3 only),\n" +
+        "which took it to k=0 in N=24 runs under controlled load, from a k=1-in-6 baseline.\n" +
+        "That BOUNDS the rate below ~1/6 at ~96% confidence — it does NOT prove it eliminated.\n" +
+        "🛑 DO NOT RE-RUN FOR GREEN. A wrong-value intermittent here fingerprints a REAL\n" +
+        "PRODUCT RACE, never a flake, and a green re-run is the most dangerous outcome\n" +
+        "available. Investigate: the signature is the mint succeeding (~27 ms) and\n" +
+        "writeSessionRecord(childRecord) then failing OutboxError: outbox-busy after its full\n" +
+        "4 s budget, so the child record is never written. See brick b64dfbb3.",
+    );
 
     const childRecord = await resolveSessionRecord(childRef.acpxRecordId);
     assert.equal(childRecord.kind, "subagent");

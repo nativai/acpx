@@ -2519,31 +2519,49 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
 
             void (async () => {
               try {
-                // CREATION PATH 3 MINTS ITS SEAT ROW TOO (§14/D13), row before record —
-                // no carve-out for `kind:"subagent"`, because a shadow record whose seat
-                // has no row is a session that works perfectly and can never be
-                // succeeded, which is the defect §14 deletes, one creation path over.
+                await writeSessionRecord(childRecord);
+                // CREATION PATH 3 MINTS ITS SEAT ROW (§14/D13) — but **RECORD FIRST, THEN
+                // ROW, ON THIS PATH ONLY**, which is the opposite of D13a's ordering
+                // everywhere else. No carve-out for `kind:"subagent"` on the row itself:
+                // a shadow record whose seat has no row is a session that can never be
+                // succeeded, which is the defect §14 deletes.
                 //
-                // 🔑 BEST-EFFORT IS WHAT MAKES THIS PATH SAFE, AND THAT IS NOT A
-                // COINCIDENCE. An UNGUARDED mint here previously broke this path
-                // intermittently (1 in 3 on a loaded box): the mint succeeded, then
-                // `writeSessionRecord(childRecord)` below failed with
-                // `OutboxError: outbox-busy` after its full 4 s budget — so the child
-                // record was never written and the parent never listed the subagent, a
+                // 🛑 WHY THE ORDER IS INVERTED HERE, AND WHY THAT IS LEGAL RATHER THAN A
+                // COMPROMISE. Row-first on this path is a MEASURED DEFECT: the mint
+                // SUCCEEDS in ~27 ms and the `writeSessionRecord` above then fails
+                // `OutboxError: outbox-busy` after its full 4 s budget, so the child
+                // record is never written and the parent never lists the subagent — a
                 // SILENT loss, because the enclosing catch is best-effort by design.
-                // Ratification item 8's call-site guard removes exactly that failure
-                // mode: a store error can no longer propagate into the record write.
+                // Reproduced deliberately: 1 failure in 6 runs under controlled load, and
+                // once in a full-suite run at 4619 ms against that 4 s budget.
                 //
-                // ⚠️ THE ORIGINAL MECHANISM WAS NEVER ESTABLISHED, and it no longer needs
-                // to be. The one suggestive datum was that duration did not explain it —
-                // a `setTimeout(40)` in this position passed while the 27 ms mint failed,
-                // and `setTimeout(2500)` failed — which pointed at the mint taking the
-                // `index.json` lock rather than at how long it took. **Plausible, never
-                // proven**, and an earlier note here claimed it deterministically (3/3)
-                // with lock-order inversion as the cause: both wrong, because that 3/3
-                // was measured against a tree in which this very
+                // ⚠️ **ITEM 8's GUARD DOES NOT COVER THIS, AND AN EARLIER VERSION OF THIS
+                // COMMENT CLAIMED IT DID — WHICH WAS SELF-REFUTING.** Item 8 catches a
+                // mint that FAILS; a catch around a call that SUCCEEDS is never invoked.
+                // The owner's clarification is what makes the reorder correct: *"never
+                // depends on the seat store" means BY ERROR **OR BY SIDE EFFECT***, so a
+                // mint whose SUCCESS breaks the record write is exactly the dependency
+                // item 8 forbids.
+                //
+                // ⚠️ AND D13a IS NOT BEING BROKEN — IT WAS REPRICED. Row-first was chosen
+                // because the row-less record was "silent and permanent"; item 8's
+                // repricing (J1) retired that clause. A row-less SHADOW record is now the
+                // legitimate, AP17-diagnosed, B10-repaired state, and nothing ever
+                // activates into a subagent's seat — path 3 is never CLI-driven, so
+                // `--seat` cannot target it and `activate` cannot reach it. The torn state
+                // this ordering can leave is therefore the harmless one HERE, which is not
+                // true on the two CLI paths, where row-first still stands.
+                //
+                // ⚠️ THE MECHANISM IS STILL NOT ESTABLISHED, and it is load-bearing again
+                // now that a fix depends on it. The one suggestive datum: duration does not
+                // explain it — a `setTimeout(40)` in the old position PASSED while the
+                // 27 ms mint FAILED, and `setTimeout(2500)` failed — which points at the
+                // mint taking the `index.json` lock rather than at how long it takes.
+                // **A clue, not a mechanism.** (An even earlier note called it
+                // deterministic 3/3 with lock-order inversion as the cause: both wrong,
+                // because that 3/3 was measured against a tree where this very
                 // `writeSessionRecord(childRecord)` call had been deleted by an editing
-                // slip. Kept as the honest record of a clue, not a mechanism.
+                // slip of mine.)
                 const mintedChildRow =
                   childRecord.seatId === undefined
                     ? { minted: true as const }
@@ -2556,7 +2574,6 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
                 if (!mintedChildRow.minted) {
                   process.stderr.write(`${mintedChildRow.diagnostic}\n`);
                 }
-                await writeSessionRecord(childRecord);
                 const parentRecord = eventWriter.getRecord();
                 parentRecord.subagents = [...(parentRecord.subagents ?? []), subagentRef];
                 // Sync the in-memory conversation onto the parent record before
