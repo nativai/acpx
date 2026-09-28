@@ -102,6 +102,7 @@ import {
 import { enforceModelFloorPostServe } from "../../session/model-floor-enforce.js";
 import { captureServedState } from "../../session/model-floor.js";
 import { guardServedModel, stampModelGuardBreadcrumb } from "../../session/model-guard.js";
+import { reportOperatorDiagnostic } from "../../session/operator-diagnostic.js";
 import {
   ownerOptionsToInput,
   persistSessionOwnerOptions,
@@ -2545,12 +2546,19 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
                 //
                 // ⚠️ AND D13a IS NOT BEING BROKEN — IT WAS REPRICED. Row-first was chosen
                 // because the row-less record was "silent and permanent"; item 8's
-                // repricing (J1) retired that clause. A row-less SHADOW record is now the
-                // legitimate, AP17-diagnosed, B10-repaired state, and nothing ever
-                // activates into a subagent's seat — path 3 is never CLI-driven, so
-                // `--seat` cannot target it and `activate` cannot reach it. The torn state
-                // this ordering can leave is therefore the harmless one HERE, which is not
-                // true on the two CLI paths, where row-first still stands.
+                // repricing (J1) retired that clause. A row-less record is the legitimate,
+                // AP17-diagnosed, B10-repaired state.
+                //
+                // 🛑 THE CLAUSE THAT USED TO FOLLOW HERE — *"and nothing ever activates into
+                // a subagent's seat, so the torn state is harmless HERE, which is not true
+                // on the two CLI paths, where row-first still stands"* — IS STRUCK (ruling
+                // 2026-09-28, SEAT-STORE.md item 8). It was REASSURANCE, not the licence, and
+                // reading it as the licence is what made the CLI paths look exempt: they have
+                // the SAME shape (mint, then a record write through the same outbox), so
+                // "less contention" was doing the work, and **less contention is not no
+                // dependency.** The licence is item 8 itself — the row-less state is
+                // legitimate WHEREVER it arises. **All three creation paths are now
+                // record-first**; `session-management.ts` carries the same inversion.
                 //
                 // ⚠️ THE MECHANISM IS STILL NOT ESTABLISHED, and it is load-bearing again
                 // now that a fix depends on it. The one suggestive datum: duration does not
@@ -2572,7 +2580,18 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
                         createdAt: spawnedAt,
                       });
                 if (!mintedChildRow.minted) {
-                  process.stderr.write(`${mintedChildRow.diagnostic}\n`);
+                  // 🛑 BOTH LEGS HERE TOO (F8). A bare `process.stderr.write` stood here and
+                  // was HALF of item 8's "stderr AND the stream" — and on this path the
+                  // stream is the MORE important half, not the less: there is no operator at
+                  // a terminal watching a subagent spawn, so a stderr-only diagnostic is
+                  // written to a stream nobody is reading and is gone.
+                  //
+                  // ON THE CHILD'S STREAM, not the parent's, for two reasons: the child IS
+                  // the subject (it is the record whose seat has no row, and B10 will repair
+                  // it by that id), and the parent record is mutated and written by the lines
+                  // immediately below — pushing a message onto it here would interleave with
+                  // that write's own `applyConversation` and could be lost silently.
+                  await reportOperatorDiagnostic(childRecord, mintedChildRow.diagnostic);
                 }
                 const parentRecord = eventWriter.getRecord();
                 parentRecord.subagents = [...(parentRecord.subagents ?? []), subagentRef];

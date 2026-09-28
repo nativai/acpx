@@ -38,6 +38,7 @@ import {
   mirrorModelGuardToMessages,
   stampModelGuardBreadcrumb,
 } from "../../session/model-guard.js";
+import { reportOperatorDiagnostic } from "../../session/operator-diagnostic.js";
 import {
   availableOutputStyles,
   findAdvertisedOutputStyleOption,
@@ -548,15 +549,42 @@ async function createSessionRecordWithClient(
     }
   }
 
-  // 🛑 D13a — THE SEAT ROW GOES FIRST, AND THE ORDER IS NOT A PREFERENCE.
-  // Record-first leaves, on a crash, a session carrying a seatId with NO ROW: a fully
-  // working session that can never be succeeded, discovered only when someone first
-  // tries to hand over — silent and permanent. Row-first leaves an orphan row nobody
-  // references: inert, ~290 bytes, and enumerable from the store — though NOT yet
-  // visible in any verb, since `acpx seats list` is D12's and is not built. Only one of those two
-  // torn states is loud, so only one ordering is allowed.
-  // ⚠️ Do NOT move this below the record write for tidiness, and do not fold it into the
-  // record write's own lock even though the index lock is re-entrant and would allow it.
+  // 🛑 THE RECORD IS WRITTEN FIRST, AND THE SEAT ROW IS MINTED AFTER IT. THAT ORDER IS
+  // RULED, NOT PREFERRED — and it is the REVERSE of what this site did until the ruling of
+  // 2026-09-28 (SEAT-STORE.md item 8, the third RULED paragraph).
+  //
+  // ⚠️ WHAT THE INVERTED COMMENT HERE USED TO SAY, AND WHY IT WAS WRONG: it invoked D13a
+  // — *"record-first leaves a session carrying a seatId with NO ROW … silent and
+  // permanent"* — and forbade exactly this move *"for tidiness"*. D13a's price was set
+  // BEFORE AP17 made that state loud and B10 made it repairable, and nobody re-checked it
+  // (the repricing pass, J1). **A row-less record is now the legitimate, AP17-diagnosed,
+  // B10-repaired state.** So the only thing D13a's ordering still bought was an inert
+  // orphan row — at the cost below, which is fatal.
+  //
+  // 🔑 WHY ROW-FIRST IS A DEFECT HERE: the mint takes the `index.json` lock and the record
+  // write goes through the outbox, so a mint that SUCCEEDS can make the following record
+  // write fail `outbox-busy` after its full 4 s budget — **no session at all.** Measured on
+  // the structurally identical path 3 (`runtime.ts`): 1 failure in 6 runs under controlled
+  // load, and once in a full suite run at 4619 ms against that 4 s budget. Item 8 forbids
+  // creation depending on the store **by error OR BY SIDE EFFECT**, and a catch around a
+  // call that SUCCEEDS is never invoked — so no amount of guarding here could have covered
+  // it. Only the ordering can.
+  // ⚠️ AND THE CONTENTION IS NOT KNOWN TO BE GONE, only moved off the critical path: the
+  // residual is bounded (k=0 in N=24 on path 3), NOT measured as zero. If it ever measures
+  // non-zero after this reorder it is the outbox's pre-existing race and is filed as the
+  // outbox owner's, not repaired here — and **never by adding a retry**: `outbox-busy` is
+  // terminal, its 4 s budget is already spent by the time anyone sees it.
+  // ⚠️ Decoupling the two writes (a separate lock or outbox) is deliberately NOT done: out
+  // of B2's scope, and a follow-on only if a residual is measured after this reorder.
+  if (forkContext) {
+    await writeSessionRecordAtBoundary(record);
+  } else {
+    await writeSessionRecord(record);
+  }
+  // 🛑 BELOW BOTH LEGS OF THE BRANCH ABOVE, DELIBERATELY. The fork leg writes through
+  // `writeSessionRecordAtBoundary` and the plain leg through `writeSessionRecord`; a mint
+  // placed under only one of them leaves `sessions copy`/fork on the old ordering — and it
+  // would look done, because the row still appears for `sessions new`.
   // Only the FRESH-MINT path mints: `--seat` joined an existing row, and joining must
   // never mint one (D13).
   if (options.seatId === undefined && seatFields.seatId !== undefined) {
@@ -573,13 +601,10 @@ async function createSessionRecordWithClient(
       createdAt: now,
     });
     if (!minted.minted) {
-      process.stderr.write(`${minted.diagnostic}\n`);
+      // BOTH LEGS — stderr AND the session stream (the ruling's "never a silent catch"),
+      // through the single writer that also serves path 3 and the divergence line.
+      await reportOperatorDiagnostic(record, minted.diagnostic);
     }
-  }
-  if (forkContext) {
-    await writeSessionRecordAtBoundary(record);
-  } else {
-    await writeSessionRecord(record);
   }
   if (guardForced) {
     // Best-effort mirror (pushes the warning message + boundary-writes the sidecar)

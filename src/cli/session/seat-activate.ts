@@ -420,10 +420,33 @@ async function healInterruptedActivation(
  * Plain prose, no markdown — these bubbles render RAW. Ends with a blank line so a
  * following handover prompt starts on its own line.
  */
+/**
+ * Who the predecessor was — and **the third case is the one F9 was about.**
+ *
+ * 🛑 `null` AND "NOT KNOWN" ARE DIFFERENT FACTS AND MUST NOT SHARE A REPRESENTATION.
+ * On the `resumed` and `already-active` branches the seat pointer ALREADY names the
+ * successor, so `resolvePredecessorOrRefuse` resolves the successor itself and the real
+ * predecessor is **unknowable from the state that survives** — it was retired moments
+ * earlier and nothing records which row it was. The first version of this function took
+ * `string | null` and those branches passed `null`, so the notice told a successor that
+ * had just healed a crashed succession *"this seat was vacant before you; there is no
+ * predecessor"* — **a fabricated fact in the one piece of text whose whole job is
+ * orientation** (D6: nothing here is fabricated). Found by the test-engineer as F9.
+ *
+ * ⇒ **When it is not known, the sentence is OMITTED. It is never computed instead.**
+ * Computing it would mean a holder scan on the heal path, which is exactly the
+ * index-wide read the protocol confines to the backfill.
+ */
+export type NoticePredecessor =
+  /** Resolved: an id, or `null` for a seat that was GENUINELY vacant. */
+  | { readonly known: true; readonly id: string | null }
+  /** Not computable on this branch. Say nothing. */
+  | { readonly known: false };
+
 export function composeSeatActivationNotice(params: {
   readonly seat: SeatRecord;
   readonly successorId: string;
-  readonly predecessorId: string | null;
+  readonly predecessor: NoticePredecessor;
   readonly ordinal: number;
 }): string {
   const base = resolveAcpxUiBaseUrl(process.env);
@@ -431,15 +454,18 @@ export function composeSeatActivationNotice(params: {
     ? `${base}/?seat=${params.seat.seatId}`
     : `seat id ${params.seat.seatId}`;
   const seatLabel = params.seat.name ? `"${params.seat.name}"` : "(unnamed)";
-  const predecessor =
-    params.predecessorId === null
-      ? "This seat was vacant before you; there is no predecessor."
-      : `Your predecessor is ${params.predecessorId}. It is RETIRED and still readable. ` +
-        `Its transcript is not yours.`;
+  // An OMITTED line, not an empty one — a blank line in a raw-rendered bubble reads as
+  // a missing sentence, which invites someone to "fix" it by computing the predecessor.
+  const predecessorLine = !params.predecessor.known
+    ? ""
+    : params.predecessor.id === null
+      ? "This seat was vacant before you; there is no predecessor.\n"
+      : `Your predecessor is ${params.predecessor.id}. It is RETIRED and still readable. ` +
+        `Its transcript is not yours.\n`;
   return (
     `${SEAT_ACTIVATION_NOTICE_MARKER}\n` +
     `You are now the active holder of seat ${seatLabel} (${seatAddress}), holder #${params.ordinal}.\n` +
-    `${predecessor}\n` +
+    predecessorLine +
     `Mail addressed to the seat now arrives here.\n` +
     `You have no inherited context: you are a fresh session that has taken over an ` +
     `address, not a continuation of anything. Nothing is waiting for you to resume.\n` +
@@ -465,24 +491,43 @@ export async function activateSeatHolder(
     // a completed activation (do nothing, burn no ordinal) versus D4's torn one
     // (finish the projection half).
     return successor.holderActive === true && successor.holderOrdinal !== undefined
-      ? outcome(seat, successor, null, successor.holderOrdinal, "already-active")
-      : outcome(seat, successor, null, await healInterruptedActivation(seat, successor), "resumed");
+      ? // F9 — NOT `{known:true, id:null}`. The pointer already names the successor, so the
+        // predecessor is unknowable here; claiming the seat was vacant would be a fabricated
+        // fact, and on the `resumed` branch a demonstrably false one (a predecessor was
+        // retired moments earlier by the run that crashed).
+        outcome(seat, successor, { known: false }, successor.holderOrdinal, "already-active")
+      : outcome(
+          seat,
+          successor,
+          { known: false },
+          await healInterruptedActivation(seat, successor),
+          "resumed",
+        );
   }
   return await runFreshActivation(seat, successor, predecessor, predecessorMirrorActive);
 }
 
-/** Build an outcome, so the three branches cannot describe themselves differently. */
+/**
+ * Build an outcome, so the three branches cannot describe themselves differently.
+ *
+ * ⚠️ THE MACHINE-READABLE `predecessorId` STAYS `null` WHEN UNKNOWN — deliberately, and it
+ * is a different audience from the notice. The payload is consumed by scripts that already
+ * treat `null` as *"no predecessor to act on"*, which is the correct action on BOTH the
+ * vacant and the unknown branch: there is nothing to close. The notice is read by an agent
+ * orienting itself, where "vacant" is a claim about history and a wrong one is a fabricated
+ * fact. Same value, two audiences, and only one of them can be misled by it.
+ */
 function outcome(
   seat: SeatRecord,
   successor: SessionRecord,
-  predecessorId: string | null,
+  predecessor: NoticePredecessor,
   ordinal: number,
   kind: SeatActivationOutcome["kind"],
   divergence?: SeatMirrorDivergence,
 ): SeatActivationOutcome {
   return {
     seatId: seat.seatId,
-    predecessorId,
+    predecessorId: predecessor.known ? predecessor.id : null,
     successorId: successor.acpxRecordId,
     ordinal,
     kind,
@@ -490,7 +535,7 @@ function outcome(
     notice: composeSeatActivationNotice({
       seat,
       successorId: successor.acpxRecordId,
-      predecessorId,
+      predecessor,
       ordinal,
     }),
   };
@@ -563,7 +608,9 @@ async function runFreshActivation(
     return outcome(
       seat,
       successor,
-      predecessor?.acpxRecordId ?? null,
+      // KNOWN on this branch, and `null` here means GENUINELY vacant — phase 0 resolved
+      // the predecessor from a pointer that did not yet name the successor.
+      { known: true, id: predecessor?.acpxRecordId ?? null },
       ordinal,
       "activated",
       observeMirrorDivergence(seat, predecessor, predecessorMirrorActive),

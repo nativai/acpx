@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
@@ -449,6 +450,110 @@ test("item 8 · a CORRUPT store still creates a USABLE session, keeps the seat_i
 
     // 4. AND THE CORRUPT BYTES SURVIVE — a corrupt store may hold hand-recoverable rows.
     assert.match(await fs.readFile(path.join(sessionDir, "seats.json"), "utf8"), /not json at all/);
+
+    // 5. 🛑 AND IT REACHED THE DURABLE LEG — the SESSION STREAM, not only stderr (F8).
+    // The ruling is "stderr AND the stream, never a silent catch", and assertion 3 above
+    // passed for weeks while the stream half did not exist: a terminal line lives exactly
+    // as long as the scrollback of whoever happened to be watching the spawn.
+    // From the sidecar (`<id>.messages.ndjson`) — a boundary write leaves the record's
+    // inline `messages` empty by design, so `<id>.json` is the wrong file to look in.
+    const sidecar = await fs
+      .readFile(path.join(sessionDir, `${id}.messages.ndjson`), "utf8")
+      .catch(() => "");
+    assert.match(
+      sidecar,
+      /seat-row-not-minted/,
+      "the warning is NOT on the session record — it exists only in the operator's terminal",
+    );
+    assert.match(
+      sidecar,
+      /"synthetic":true/,
+      "the warning was appended as a real turn; unmarked it counts as irreplaceable history " +
+        "in the resume fallback gate and can make the session permanently unpromptable",
+    );
+  });
+});
+
+// ─── THE THIRD PAIRED SET — fork/copy, which shares the mint CALL SITE with the row above
+//     and yet is a SEPARATE REACHABLE PATH: it writes through
+//     `writeSessionRecordAtBoundary`, the plain create through `writeSessionRecord`.
+//
+// 🔑 WHY THIS ROW EXISTS AT ALL, and it is the most reusable thing in this file: the unit of
+// coverage is THE REACHABLE PATH, NOT THE CALL SITE. The reorder this pass landed had to move
+// the mint below BOTH legs of `if (forkContext) … else …`; a version that moved it under only
+// one would leave copy/fork on the old ordering AND LOOK DONE, because the row for the plain
+// path would be green. Three times in one evening the accounting unit was one level too
+// coarse — the measured instance, then the call site, then the leg. **Count the branches the
+// fix must move PAST, not the call sites it must move WITHIN.**
+// Its paired healthy-store half is AP15b below (the copy path mints a row naming the copy).
+test("item 8 / fork-copy · a CORRUPT store still produces a USABLE COPY, keeps the seat_id, and WARNS", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    // The SOURCE is created against a HEALTHY store — the fault is injected after it, so
+    // this row isolates the copy path instead of testing two failures at once.
+    const sourceAgent = `${MOCK_AGENT_COMMAND} --supports-fork-session`;
+    const source = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        sourceAgent,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "-s",
+        "fc-source",
+      ],
+      homeDir,
+    );
+    assert.equal(source.code, 0, source.stderr);
+    const sourceId = String(
+      (JSON.parse(source.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const sourceSeat = String((await readRecordJson(homeDir, sourceId)).seat_id);
+
+    // NOW corrupt it, so the COPY's mint is the one that fails.
+    await fs.writeFile(path.join(sessionDir, "seats.json"), "{ not json at all", "utf8");
+
+    const copied = await runCli(
+      ["--format", "json", "sessions", "copy", "--from", sourceId, "--name", "fc-copy"],
+      homeDir,
+    );
+    assert.equal(copied.code, 0, `a corrupt seat store failed the COPY: ${copied.stderr}`);
+    const copyId = String(
+      (JSON.parse(copied.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const copy = await readRecordJson(homeDir, copyId);
+    assert.equal(
+      typeof copy.seat_id === "string" && copy.seat_id.length > 0,
+      true,
+      "the copy lost its seat_id — invisible to the backfill, and its descendants' seat edges orphaned",
+    );
+    // 🛑 AND STILL NOT THE SOURCE'S SEAT. A degraded path is exactly where a fallback to
+    // "inherit the source's seat" would look reasonable, and it is forbidden unconditionally.
+    assert.notEqual(
+      copy.seat_id,
+      sourceSeat,
+      "the copy inherited the SOURCE's seat under a store failure — every fork mints a new one",
+    );
+    assert.match(copied.stderr, /seat-row-not-minted/, "the copy path swallowed the store failure");
+    assert.match(
+      copied.stderr,
+      /quarantine/i,
+      "the copy path gave the wrong remedy for corruption",
+    );
+    const sidecar = await fs
+      .readFile(path.join(sessionDir, `${copyId}.messages.ndjson`), "utf8")
+      .catch(() => "");
+    assert.match(
+      sidecar,
+      /seat-row-not-minted/,
+      "the copy path's warning never reached the session stream — stderr only (F8)",
+    );
   });
 });
 
@@ -546,45 +651,34 @@ test("AP15b · every creation path leaves a row — including the fork/copy path
   });
 });
 
-test("AP16 · the row is written BEFORE the record, so the tear is the loud one", async () => {
-  // 🛑 WHY THIS ROW EXISTS AT ALL: **BOTH ORDERINGS PASS A CRASH-FREE TEST.** A
-  // happy-path assertion cannot distinguish them, so D13a would rot silently — the
-  // code would keep working while the guarantee it was chosen for quietly went away,
-  // and the loss would only ever show up as a crash-produced silent defect in
-  // production. So the ORDER itself has to be asserted, not the outcome.
-  //
-  // Asserted by observing the two writes in sequence: `mintSeatRow` is called with
-  // the store still empty and the record file NOT yet on disk. If the record were
-  // written first, the record file would already exist when the row write runs.
-  await withTempHome(async (homeDir) => {
-    const cwd = path.join(homeDir, "workspace");
-    await fs.mkdir(cwd, { recursive: true });
-    const sessionDir = path.join(homeDir, ".acpx", "sessions");
-    const base = ["--cwd", cwd, "--agent", MOCK_AGENT_COMMAND, "--approve-all", "--format", "json"];
-
-    const created = await runCli([...base, "sessions", "new", "-s", "ap16"], homeDir);
-    assert.equal(created.code, 0, created.stderr);
-    const id = String(
-      (JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
-    );
-    const seatId = String((await readRecordJson(homeDir, id)).seat_id);
-
-    // The ordering's OBSERVABLE CONSEQUENCE, checked on the artefacts: the row's
-    // mtime must not be LATER than the record's. Row-first means row.mtime <=
-    // record.mtime; record-first would invert it.
-    const rowStat = await fs.stat(path.join(sessionDir, "seats.json"));
-    const recordStat = await fs.stat(path.join(sessionDir, `${id}.json`));
-    assert.ok(
-      rowStat.mtimeMs <= recordStat.mtimeMs,
-      `AP16: the seat row was written AFTER the record (row ${rowStat.mtimeMs} > record ${recordStat.mtimeMs}) — ` +
-        `record-first leaves, on a crash, a working session whose seat has no row and which can NEVER be succeeded`,
-    );
-    // And the end state is correct either way, which is exactly why the mtime check
-    // above is doing the real work here.
-    const store = await readSeatStore(sessionDir);
-    assert.equal(seatFromStore(store, seatId)?.activeHolderId, id);
-  });
-});
+// ─── AP16 — ⛔ RETIRED AS WRITTEN, AND IT WAS A BLIND INSTRUMENT, NOT JUST A STALE ONE ──
+//
+// AP16 asserted `row.mtime <= record.mtime` to defend D13a's ROW-FIRST ordering. Two things
+// happened to it, and the second is the one worth carrying:
+//
+// 1. **ITS SUBJECT WAS REVERSED.** The ruling of 2026-09-28 (SEAT-STORE.md item 8) makes
+//    every creation path **RECORD FIRST, THEN THE ROW**. A row defending row-first now
+//    defends a retired contract.
+// 2. 🛑 **IT NEVER DISCRIMINATED THE TWO ORDERINGS AT ALL — MEASURED.** After the reorder it
+//    kept PASSING. Measured at the same tip: `row.mtimeNs - record.mtimeNs = −24.0 ms`, i.e.
+//    the row is still older than the record **under record-first**, because the record is
+//    written AGAIN ~24 ms after the mint by the rest of the create. So `row <= record` holds
+//    in BOTH regimes and always did. Its own comment said *"both orderings pass a crash-free
+//    test, so the ORDER itself has to be asserted"* — and then asserted a proxy that could
+//    not see the order. **A row whose comment names the trap is not thereby out of it.**
+//    (Fourth instrument defect of this family on this block, all mine.)
+//
+// ⚠️ **AND THE ORDER ON THE TWO CLI PATHS IS NOW NOT ASSERTED. Stated as a gap, not papered
+// over.** No post-hoc on-disk observation distinguishes the orderings there: the happy-path
+// end state is identical and the record's mtime is overwritten afterwards. I tried to induce
+// the discriminating fault — a read-only sessions dir with a valid store pre-seeded, where
+// record-first must emit NO mint diagnostic and row-first must emit one — and it is
+// **VACUOUS**: the run dies with `EACCES … index.json.<pid>.tmp` before either ordering
+// reaches the mint, so both arms print nothing. Evidence recorded here so nobody re-derives
+// it. What DOES defend the property the ordering exists for is the item-8 fault row on each
+// of the three reachable paths: a store failure cannot cost a session.
+// The one place the order IS directly observable is path 3 (in-process, so fs calls can be
+// sequenced) — that is the row at the end of this file.
 
 test("AP17 · a seat with no row is refused with the CAUSE and the REMEDY, not a bare not-found", async () => {
   await withTempHome(async (homeDir) => {
@@ -944,6 +1038,29 @@ test("item 8 / path 3 · an UNWRITABLE store still leaves a usable shadow record
       /quarantine/i,
       "the diagnostic gives the wrong remedy for corruption",
     );
+
+    // 5. 🛑 AND THE DURABLE LEG (F8) — WHICH MATTERS MORE HERE THAN ON THE CLI PATHS, NOT
+    //    LESS. There is no operator at a terminal watching a subagent spawn, so a
+    //    stderr-only diagnostic is written to a stream nobody is reading and is simply gone.
+    //    This site was a bare `process.stderr.write` until F8; the CLI site was fixed first
+    //    and this one was missed — the same stop-at-the-first-site shape the reorder hit.
+    //    ON THE CHILD's stream: the child is the record whose seat has no row, and it is the
+    //    id B10 repairs by.
+    const childSidecar = await fs
+      .readFile(path.join(sessionDir, `${childRef.acpxRecordId}.messages.ndjson`), "utf8")
+      .catch(() => "");
+    assert.match(
+      childSidecar,
+      /seat-row-not-minted/,
+      "path 3's warning never reached the session stream — and on this path there is no " +
+        "terminal for the other leg to reach either, so the diagnostic reached nobody",
+    );
+    assert.match(
+      childSidecar,
+      /"synthetic":true/,
+      "the warning was appended as a real turn — unmarked, it counts as irreplaceable " +
+        "history in the resume fallback gate",
+    );
   });
 });
 
@@ -1051,6 +1168,211 @@ test("G2/path 3 · a teammate_spawned notification mints a shadow-record seat, r
       childRecord.parentSeatId,
       "parent-seat",
       "the shadow record's parentSeatId must name its parent's actual seat",
+    );
+  });
+});
+
+// ─── AP16 (REVERSED) · THE RECORD IS WRITTEN BEFORE THE ROW — asserted where the order
+//     is actually observable ─────────────────────────────────────────────────────────────
+//
+// Path 3 runs IN-PROCESS, so the fs calls can be put in a single time-ordered sequence — the
+// two CLI paths run as subprocesses and leave no surviving trace of the order (see the
+// retired-AP16 block above for what was tried and why it is vacuous). So this is the ONE row
+// on the block that sees the ordering directly, and it sits on the path where the defect the
+// reorder fixes was actually MEASURED: mint first → the child record write loses the outbox
+// → the shadow record is silently gone.
+//
+// 🛑 IT IS NOT A PROXY. It does not compare mtimes, it does not check the end state, and it
+// does not read the source: it records the real write sequence and asserts the index of the
+// first write touching the CHILD RECORD is lower than the index of the first write touching
+// `seats.json`. Reverse the two statements in `runtime.ts` and this row goes red.
+test("AP16 (REVERSED) · path 3 writes the RECORD before the ROW, observed in call order", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    await fs.mkdir(sessionDir, { recursive: true });
+    await fs.mkdir(cwd, { recursive: true });
+
+    const parentRecord: SessionRecord = makeSessionRecordFixture({
+      acpxRecordId: "order-parent",
+      acpSessionId: "order-parent-acp",
+      agentCommand: "node mock-agent.js",
+      cwd,
+      seatId: "order-parent-seat",
+      holderOrdinal: 1,
+      holderActive: true,
+    });
+    await writeSessionRecordFile(homeDir, parentRecord);
+
+    // The spy KEEPS the original behaviour — a real write to a real store, observed. One
+    // shared array, because ordering across DIFFERENT apis is the whole point: a per-api
+    // call log (what `seat-store-hold.test.ts` builds) cannot answer "which happened first".
+    const sequence: string[] = [];
+    const originalWriteFile = fs.writeFile;
+    const originalRename = fs.rename;
+    const observe = (target: unknown): void => {
+      if (typeof target === "string") {
+        sequence.push(target);
+      }
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- patching the shared
+    // fs/promises namespace object is the documented technique here; the casts are the price
+    // of assigning over its typed methods and are confined to these four lines.
+    (fs as any).writeFile = (...args: unknown[]) => {
+      observe(args[0]);
+      return (originalWriteFile as (...a: unknown[]) => Promise<void>)(...args);
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- as above
+    (fs as any).rename = (...args: unknown[]) => {
+      observe(args[1]);
+      return (originalRename as (...a: unknown[]) => Promise<void>)(...args);
+    };
+    // 🛑 THE SYNC NAMESPACE TOO. The first version of this row watched only
+    // `node:fs/promises` and its non-vacuity guard fired: the sequence held four
+    // `index.json` writes and the seat row, and NO record file at all. Watching one
+    // namespace is how an fs instrument goes blind while looking complete — the same hole
+    // AP11's classifier had. `node:fs` and `node:fs/promises` are two objects.
+    const originalWriteFileSync = fsSync.writeFileSync;
+    const originalRenameSync = fsSync.renameSync;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- as above
+    (fsSync as any).writeFileSync = (...args: unknown[]) => {
+      observe(args[0]);
+      return (originalWriteFileSync as (...a: unknown[]) => void)(...args);
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- as above
+    (fsSync as any).renameSync = (...args: unknown[]) => {
+      observe(args[1]);
+      return (originalRenameSync as (...a: unknown[]) => void)(...args);
+    };
+    try {
+      await runQueuedTask(
+        "order-parent",
+        {
+          requestId: "req-order",
+          message: "spawn a subagent",
+          prompt: textPrompt("spawn a subagent"),
+          permissionMode: "approve-all",
+          timeoutMs: 10_000,
+          waitForCompletion: true,
+          enqueuedAt: Date.now(),
+          send: () => {},
+          close: () => {},
+        },
+        {
+          sharedClient: makeSubagentSpawningClient("order-parent-acp", "subagent-1"),
+          suppressSdkConsoleErrors: true,
+        },
+      );
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- restore
+      (fs as any).writeFile = originalWriteFile;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- restore
+      (fs as any).rename = originalRename;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- restore
+      (fsSync as any).writeFileSync = originalWriteFileSync;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- restore
+      (fsSync as any).renameSync = originalRenameSync;
+    }
+
+    const reloadedParent = await resolveSessionRecord("order-parent");
+    const childRef = reloadedParent.subagents?.[0];
+    assert.ok(childRef, "no shadow record was created, so there is no ordering to observe");
+    const childId = childRef.acpxRecordId;
+
+    const firstRecordWrite = sequence.findIndex((target) => target.includes(`${childId}.json`));
+    const firstRowWrite = sequence.findIndex((target) => target.includes("seats.json"));
+    // NON-VACUITY, BOTH HALVES. An instrument that observed neither write would satisfy any
+    // `<` comparison between two `-1`s, and that is exactly how this family of row goes
+    // quietly blind — which has happened four times on this block.
+    assert.notEqual(
+      firstRecordWrite,
+      -1,
+      `the instrument never saw the child record written at all — it is blind, not passing. ` +
+        `sequence=${JSON.stringify(sequence.slice(0, 20))}`,
+    );
+    assert.notEqual(
+      firstRowWrite,
+      -1,
+      `the instrument never saw the seat row written at all — it is blind, not passing. ` +
+        `sequence=${JSON.stringify(sequence.slice(0, 20))}`,
+    );
+    assert.ok(
+      firstRecordWrite < firstRowWrite,
+      `path 3 wrote the seat ROW before the child RECORD (record@${firstRecordWrite}, ` +
+        `row@${firstRowWrite}). That is the ordering whose mint SUCCEEDING made the record ` +
+        `write fail outbox-busy after its full 4 s budget — 1 failure in 6 under load — and ` +
+        `it loses the shadow record SILENTLY, because the enclosing catch is best-effort. ` +
+        `Item 8 forbids creation depending on the store BY ERROR OR BY SIDE EFFECT, and no ` +
+        `guard can catch a call that SUCCEEDS: only this ordering can.`,
+    );
+  });
+});
+
+// ─── F8's INVARIANT ITSELF: AN EMISSION ADDED TO OBSERVE A FAILURE JOINS THE CODE PATH IT
+//     OBSERVES, AND INHERITS ITS INVARIANTS ───────────────────────────────────────────────
+//
+// 🔑 THE POINT THE SUB-HoD MADE THAT THIS ROW EXISTS FOR: the durable leg is a RECORD WRITE,
+// so it can fail for exactly the reasons the thing it is reporting failed for. Two ways to
+// get that wrong, and item 8 forbids both: **throwing** (the warning costs the session it was
+// warning about) and **swallowing** (`.catch(() => {})`, so the operator believes a line is
+// on the record when it is not). `runtime.ts:2381` is a verbatim
+// `void writer.appendMessage(message).catch(() => {})` a few lines from path 3's mint — the
+// nearest idiom is the forbidden one. It is PRE-EXISTING and not B2's to fix; it is B2's to
+// not copy.
+//
+// This row drives the shared writer all three sites use, so it covers the plain-create path,
+// the fork/copy path and path 3 in one place, at the layer where the guarantee lives.
+test("F8 · when the DURABLE leg fails, the failure is ANNOUNCED — never swallowed, never thrown", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    await fs.mkdir(sessionDir, { recursive: true });
+    const record: SessionRecord = makeSessionRecordFixture({
+      acpxRecordId: "announce-subject",
+      acpSessionId: "announce-subject-acp",
+      agentCommand: "node mock-agent.js",
+      cwd: path.join(homeDir, "workspace"),
+      seatId: "announce-seat",
+      holderOrdinal: 1,
+      holderActive: true,
+    });
+    await writeSessionRecordFile(homeDir, record);
+
+    const written: string[] = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]): boolean => {
+      written.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return (realWrite as (c: string | Uint8Array, ...r: unknown[]) => boolean)(chunk, ...rest);
+    }) as typeof process.stderr.write;
+
+    // INDUCED, not sampled: a read-only session dir makes the boundary write fail
+    // deterministically (it cannot create its temp file or its lock).
+    await fs.chmod(sessionDir, 0o500);
+    try {
+      const { reportOperatorDiagnostic } = await import("../src/session/operator-diagnostic.js");
+      // 🛑 MUST NOT THROW. If this rejects, a store diagnostic can fail a spawn — which is
+      // the dependency item 8 deletes, reintroduced through the WARNING rather than the mint.
+      await reportOperatorDiagnostic(record, "acpx seat-row-not-minted: INDUCED-FOR-TEST");
+    } finally {
+      process.stderr.write = realWrite;
+      await fs.chmod(sessionDir, 0o700);
+    }
+
+    const all = written.join("");
+    // 1. The terminal leg still fired — it goes FIRST precisely so a failing durable leg
+    //    cannot take it down.
+    assert.match(
+      all,
+      /INDUCED-FOR-TEST/,
+      "the diagnostic itself was lost when the stream write failed",
+    );
+    // 2. AND THE FAILURE OF THE DURABLE LEG WAS ANNOUNCED. This is the assertion a
+    //    `.catch(() => {})` fails: without it, an operator reads the warning and reasonably
+    //    assumes it is on the record.
+    assert.match(
+      all,
+      /NOT on the record/,
+      "the durable leg failed SILENTLY — the operator is left believing the line is on the " +
+        "record. This is the `.catch(() => {})` shape item 8 forbids by name",
     );
   });
 });

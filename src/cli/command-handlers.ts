@@ -72,6 +72,7 @@ import { exportSession } from "../session/export.js";
 import { importSession } from "../session/import.js";
 import { getDesiredConfigOptions } from "../session/mode-preference.js";
 import { guardImplicitFable, resolveSpawnModelSource } from "../session/model-guard.js";
+import { reportOperatorDiagnostic } from "../session/operator-diagnostic.js";
 import {
   assertOutputStyleSupportedForRecord,
   OUTPUT_STYLE_CONFIG_ID,
@@ -4612,21 +4613,60 @@ function resolveSetParentTarget(flags: SessionsSetParentFlags): SetParentTarget 
  * 🛑 ONE LINE PER EVENT, AND NOTHING ACCUMULATES — no counter, no running total, no
  * field on the seat. The count of seats currently divergent is derived on demand.
  */
-function emitSeatDivergenceLine(
+function seatDivergenceLine(divergence: {
+  seatId: string;
+  predecessorId: string;
+  overwrittenHolderActive: boolean | undefined;
+}): string {
+  return (
+    `acpx seat-mirror-divergence: seat=${divergence.seatId} ` +
+    `predecessor=${divergence.predecessorId} ` +
+    `overwrote holder_active=${String(divergence.overwrittenHolderActive)} ` +
+    `(the seat named this holder active while its own mirror did not; the seat wins). ` +
+    `Repaired by this flip — not a count, and nothing is accumulated.`
+  );
+}
+
+/**
+ * 🛑 **THE STREAM LEG IS NOT OPTIONAL FOR THIS LINE — IT IS THE CONTRACT.** Cluster A
+ * requirement 3 says the divergence line goes to the verb's output **and the session stream**
+ * *"so it is on the record"*, and requirement 3 as amended stores **nothing**: no counter, no
+ * field, no total. So this line IS the entire durable trace of a two-source divergence, and
+ * for a while it was stderr-only (the test-engineer's F8) — meaning the design's forensic
+ * story, *"history is reconstructed from the stream lines"*, rested on lines that were never
+ * written anywhere durable. A terminal line lives as long as one operator's scrollback.
+ *
+ * ON THE SUCCESSOR'S STREAM. The predecessor is the subject of the divergence and was
+ * considered: rejected because it is being RETIRED in this same verb, so its stream is the
+ * one nobody opens again — a durable-by-letter, invisible-in-practice home. The successor is
+ * the session that carries the seat forward, and the line names the predecessor in its text,
+ * so the forensic link survives the choice.
+ */
+async function emitSeatDivergenceLine(
+  successorId: string,
   divergence:
     | { seatId: string; predecessorId: string; overwrittenHolderActive: boolean | undefined }
     | undefined,
-): void {
+): Promise<void> {
   if (!divergence) {
     return;
   }
-  process.stderr.write(
-    `acpx seat-mirror-divergence: seat=${divergence.seatId} ` +
-      `predecessor=${divergence.predecessorId} ` +
-      `overwrote holder_active=${String(divergence.overwrittenHolderActive)} ` +
-      `(the seat named this holder active while its own mirror did not; the seat wins). ` +
-      `Repaired by this flip — not a count, and nothing is accumulated.\n`,
-  );
+  const line = seatDivergenceLine(divergence);
+  let successor: SessionRecord;
+  try {
+    successor = await resolveSessionRecord(successorId);
+  } catch (error) {
+    // The record this very flip just wrote cannot be read back. Do NOT lose the line: the
+    // terminal leg still fires, and the reason the durable leg is missing is STATED — an
+    // operator who sees the divergence but not why it is absent from the record would
+    // reasonably assume it is there.
+    process.stderr.write(
+      `${line}\n[acpx] …and it is NOT on the record: session ${successorId} could not be ` +
+        `read back to append it (${error instanceof Error ? error.message : String(error)}).\n`,
+    );
+    return;
+  }
+  await reportOperatorDiagnostic(successor, line);
 }
 
 function activationHeadline(kind: "activated" | "resumed" | "already-active"): string {
@@ -4680,7 +4720,10 @@ export async function handleSessionsActivate(
     await import("./session/seat-activate.js");
   try {
     const result = await activateSeatHolder(seatRef, successorRef);
-    emitSeatDivergenceLine(result.divergence);
+    // AWAITED: the durable leg is a record write, and a floating promise here would let the
+    // process exit before the line reaches the stream — which is the failure mode F8 found,
+    // reintroduced by a missing `await` instead of a missing implementation.
+    await emitSeatDivergenceLine(result.successorId, result.divergence);
     if (
       !emitJsonResult(format, {
         ok: true,

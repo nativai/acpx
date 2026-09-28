@@ -590,3 +590,200 @@ test("a stale privileged write after the flip cannot revive the retired holder",
     void writeSessionRecordAuthorizingSeatHolderWithoutIndex;
   });
 });
+
+// ─── 7 · F8 — THE DURABLE LEG. A diagnostic on stderr ONLY is not on the record ──
+
+// 🛑 WHY THIS ROW IS NOT A NICETY: Cluster A requirement 3 stores NOTHING for a mirror
+// divergence — no counter, no field, no total — and says the line goes to the verb's output
+// **and the session stream** *"so it is on the record"*. So this line is the ENTIRE durable
+// trace of a two-source divergence, and it was stderr-only until F8 (the test-engineer's
+// pass 2) found the missing half. The row above it (§4) asserted "exactly one line" on
+// stderr and passed the whole time — proving that a complete-looking assertion on one leg
+// says nothing whatever about the other.
+test("F8 · the divergence line reaches the SUCCESSOR'S STREAM, not only stderr", async () => {
+  await withTempHome(async (homeDir) => {
+    await fs.mkdir(path.join(homeDir, "workspace"), { recursive: true });
+    await seedHolder(homeDir, "holder-one", { holderActive: false, holderOrdinal: 1 });
+    await seedHolder(homeDir, "holder-two", { holderActive: false });
+    await seedSeat(homeDir, { activeHolderId: "holder-one", nextOrdinal: 2 });
+
+    const result = await activate(homeDir);
+    assert.equal(result.code, 0, `${result.stderr}${result.stdout}`);
+    // The terminal leg — unchanged, and still exactly one.
+    assert.equal(
+      result.stderr.split("\n").filter((l) => l.includes("seat-mirror-divergence")).length,
+      1,
+    );
+
+    // THE DURABLE LEG, read back off disk.
+    // ⚠️ FROM THE SIDECAR, NOT `<id>.json`. A boundary write persists messages to
+    // `<id>.messages.ndjson` and leaves the record's inline `messages` EMPTY — that is the
+    // established storage shape (`messages_log`), not a defect. My first version of this row
+    // asserted on `record.messages` and failed against correct code, which is the same
+    // wrong-file mistake in the opposite direction: it would have reported a missing durable
+    // leg that was in fact present. Both files are read here so the row says WHICH carried it.
+    const successor = await readRecordJson(homeDir, "holder-two");
+    const sidecarPath = path.join(sessionDirOf(homeDir), "holder-two.messages.ndjson");
+    const sidecar = await fs.readFile(sidecarPath, "utf8").catch(() => "");
+    const onRecord = `${JSON.stringify(successor.messages ?? [])}\n${sidecar}`;
+    assert.ok(
+      sidecar.length > 0,
+      `the successor has no messages sidecar at all (${sidecarPath}) — the durable leg was ` +
+        `never written, so the line exists only in the operator's scrollback`,
+    );
+    // The record's BOOKKEEPING must agree with the sidecar, or the line is on disk and
+    // invisible: acpx-ui hydrates a conversation through `messages_log` (a
+    // `SessionMessagesLogState`, NOT a path — my first version asserted `typeof === "string"`
+    // and failed against a correct record, which is why the shape is named here).
+    const log = successor.messages_log as { count?: unknown; bytes?: unknown } | undefined;
+    assert.ok(
+      log !== undefined && typeof log.count === "number" && log.count >= 1,
+      `the record does not account for the appended message (messages_log=${JSON.stringify(log)}) ` +
+        `— nothing will render the line even though it is on disk`,
+    );
+    assert.ok(
+      onRecord.includes("seat-mirror-divergence"),
+      `the divergence line is NOT on the successor's record — it exists only in the ` +
+        `operator's scrollback, and requirement 3 stores nothing else about it. ` +
+        `messages=${onRecord.slice(0, 400)}`,
+    );
+    assert.ok(
+      onRecord.includes("predecessor=holder-one"),
+      "the line on the record does not name the predecessor, so the forensic link the " +
+        "successor's-stream choice depends on is broken",
+    );
+    // 🔑 SYNTHETIC — a system breadcrumb, not a model turn. Unmarked, it counts as
+    // irreplaceable history in the resume→session/new fallback gate (brick://de3645c6) and
+    // a fresh successor whose first prompt hits a missing transcript becomes permanently
+    // unpromptable. A WARNING MUST NEVER BE ABLE TO COST THE SESSION IT WARNS ABOUT.
+    assert.ok(
+      onRecord.includes('"synthetic":true'),
+      "the diagnostic was appended as a REAL turn — it must be marked synthetic",
+    );
+  });
+});
+
+// THE PAIR, and without it the row above cannot tell "writes on divergence" from "writes
+// on every activation" — the same trap §4's clean-succession row exists for, one leg down.
+test("F8 · a CLEAN succession puts NO divergence line on the successor's stream", async () => {
+  await withTempHome(async (homeDir) => {
+    await seedSuccession(homeDir);
+    const result = await activate(homeDir);
+    assert.equal(result.code, 0, result.stderr);
+    const successor = await readRecordJson(homeDir, "holder-two");
+    assert.equal(
+      JSON.stringify(successor.messages ?? []).includes("seat-mirror-divergence"),
+      false,
+      "a healthy succession wrote a divergence line onto the successor's record",
+    );
+  });
+});
+
+// ─── 8 · F9 — THE NOTICE MUST NOT STATE A FACT IT CANNOT KNOW ────────────────────
+
+// 🛑 THE DEFECT F9 FOUND: both the `resumed` and `already-active` branches rendered
+// *"This seat was vacant before you; there is no predecessor."* — on the HEAL path, where a
+// predecessor was demonstrably retired moments earlier by the run that crashed. D6's
+// governing rule is that nothing in this notice is fabricated, and this is the one piece of
+// text whose entire job is orienting a successor.
+//
+// ⚠️ AND THE FIX IS **OMIT**, NOT COMPUTE. On these branches the pointer already names the
+// successor, so `resolvePredecessorOrRefuse` resolves the successor ITSELF and the real
+// predecessor is unknowable from the surviving state. Computing it would need the holder
+// enumeration the protocol confines to the backfill. `{known:false}` means *"not computed on
+// this branch"*, which is a different fact from `{known:true, id:null}` = *genuinely vacant*.
+test("F9 · the RESUMED notice omits the predecessor sentence rather than claiming vacancy", async () => {
+  await withTempHome(async (homeDir) => {
+    await fs.mkdir(path.join(homeDir, "workspace"), { recursive: true });
+    // AP6's torn state: the pointer already moved to holder-two, holder-one is retired.
+    await seedHolder(homeDir, "holder-one", { holderActive: false, holderOrdinal: 1 });
+    await seedHolder(homeDir, "holder-two", { holderActive: false });
+    await seedSeat(homeDir, { activeHolderId: "holder-two", nextOrdinal: 2 });
+
+    const result = await activate(homeDir);
+    assert.equal(result.code, 0, `${result.stderr}${result.stdout}`);
+    const payload = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
+    assert.equal(payload.outcome, "resumed", "this row must exercise the HEAL branch");
+    const notice = String(payload.activationNotice);
+    assert.equal(
+      notice.includes("vacant"),
+      false,
+      `the resumed notice claims the seat was VACANT — holder-one was retired moments ago by ` +
+        `the crashed run, so this is a fabricated fact in the successor's orientation text: ${notice}`,
+    );
+    assert.equal(
+      notice.includes("no predecessor"),
+      false,
+      `the resumed notice denies a predecessor: ${notice}`,
+    );
+    // …and the rest of the notice is intact — an omission, not a truncation. The line it
+    // dropped must not have taken its neighbours with it.
+    assert.ok(notice.includes("holder #2"), `the resumed notice lost its ordinal: ${notice}`);
+    assert.ok(
+      notice.includes("no inherited context"),
+      `the resumed notice lost D6's central statement: ${notice}`,
+    );
+    assert.ok(
+      notice.includes("Mail addressed to the seat now arrives here"),
+      `the resumed notice lost the line that FOLLOWED the omitted one — the omission removed ` +
+        `more than the sentence: ${notice}`,
+    );
+  });
+});
+
+// THE PAIR — and it is the whole non-vacuity control for the two rows above: a notice that
+// dropped the sentence UNCONDITIONALLY would pass them both while losing real information
+// on the branch where the predecessor IS known.
+test("F9 · the ACTIVATED notice still names a known predecessor, and still reports a genuine vacancy", async () => {
+  await withTempHome(async (homeDir) => {
+    await seedSuccession(homeDir);
+    const withPredecessor = await activate(homeDir);
+    assert.equal(withPredecessor.code, 0, withPredecessor.stderr);
+    const notice = String(
+      (JSON.parse(withPredecessor.stdout.trim()) as Record<string, unknown>).activationNotice,
+    );
+    assert.ok(
+      notice.includes("Your predecessor is holder-one"),
+      `a KNOWN predecessor is no longer named — the omission was applied too widely: ${notice}`,
+    );
+    assert.ok(notice.includes("RETIRED and still readable"), notice);
+  });
+});
+
+test("F9 · a GENUINELY vacant seat still says so — `null` and `not known` are different facts", async () => {
+  await withTempHome(async (homeDir) => {
+    await fs.mkdir(path.join(homeDir, "workspace"), { recursive: true });
+    await seedHolder(homeDir, "holder-two", { holderActive: false });
+    // activeHolderId null = nobody home. The predecessor IS known here: there was none.
+    await seedSeat(homeDir, { activeHolderId: null, nextOrdinal: 2 });
+
+    const result = await activate(homeDir);
+    assert.equal(result.code, 0, `${result.stderr}${result.stdout}`);
+    const payload = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
+    assert.equal(payload.outcome, "activated");
+    assert.ok(
+      String(payload.activationNotice).includes("vacant"),
+      `a genuinely vacant seat stopped saying so — the F9 fix collapsed "not known" and ` +
+        `"known to be none" into one silence: ${String(payload.activationNotice)}`,
+    );
+  });
+});
+
+test("F9 · the ALREADY-ACTIVE notice omits it too", async () => {
+  await withTempHome(async (homeDir) => {
+    await fs.mkdir(path.join(homeDir, "workspace"), { recursive: true });
+    await seedHolder(homeDir, "holder-one", { holderActive: true, holderOrdinal: 1 });
+    await seedSeat(homeDir, { activeHolderId: "holder-one", nextOrdinal: 2 });
+
+    const result = await activate(homeDir, SEAT_A, "holder-one");
+    assert.equal(result.code, 0, `${result.stderr}${result.stdout}`);
+    const payload = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
+    assert.equal(payload.outcome, "already-active");
+    assert.equal(
+      String(payload.activationNotice).includes("vacant"),
+      false,
+      `the already-active notice claims vacancy while the addressee IS the sitting holder: ` +
+        String(payload.activationNotice),
+    );
+  });
+});
