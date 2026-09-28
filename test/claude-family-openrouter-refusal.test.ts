@@ -55,7 +55,8 @@ import type { CatalogueModel } from "../src/models/types.js";
  *       → every "POSITIVE CONTROL" block
  *   trim the `/` / namespace requirement out of the predicate
  *       → "a bare claude-* alias is NOT refused" — the 2-versus-2 boundary on live
- *         ids, and the one trim that would INVERT this control rather than weaken it
+ *         ids; the trim breaks Fable sessions at creation while leaving both incident
+ *         ids correctly refused
  *   swap the descriptor gate back to the agent NAME
  *       → "a custom agent NAME does not defeat the policy"
  *   restore the false key-level claim to the message
@@ -161,9 +162,13 @@ test("the family predicate fires on all three spellings and across the family", 
 
 test("POSITIVE CONTROL: the predicate does NOT fire on a claude-native alias", () => {
   // ⚠️ THE ROW THAT MATTERS MOST. These are what every ordinary claude session runs
-  // on. A predicate that merely looked for "claude" — or that dropped the namespace
-  // requirement — would refuse every claude spawn on this box, at session creation,
-  // where it is maximally disruptive.
+  // on, and the namespace requirement is what keeps them out of the predicate.
+  //
+  // Scoped accurately rather than dramatically: dropping that requirement would NOT
+  // refuse these aliases — none of them contains the substring "claude" — it would
+  // refuse the bare `claude-*` ids that DO live on this box, breaking those sessions
+  // at creation. Measured blast radius and the reason it is a regression rather than
+  // an inversion: the dedicated row below, which owns that boundary.
   for (const native of ["sonnet", "opus", "haiku", "fable", "default", "opus[1m]", "sonnet[1m]"]) {
     assert.equal(isClaudeFamilyModelId(native), false, native);
   }
@@ -174,18 +179,32 @@ test("POSITIVE CONTROL: the predicate does NOT fire on a claude-native alias", (
   assert.equal(isClaudeFamilyModelId(null), false);
 });
 
-test("POSITIVE CONTROL: a bare claude-* alias is NOT refused — refusing it would INVERT this control", () => {
+test("POSITIVE CONTROL: a bare claude-* alias is NOT refused — refusing it breaks Fable at creation", () => {
   // 🛑 DO NOT FOLD THIS BACK INTO THE MIXED LIST ABOVE, AND DO NOT "TIDY" THE `/`
   // REQUIREMENT OUT OF THE PREDICATE. THIS ROW IS THE BOUNDARY.
   //
   // `claude-fable-5` and `claude-fable-5-1` are LIVE model ids on this box and they
-  // carry NO namespace. A bare alias is a SUBSCRIPTION model at zero marginal cost
-  // — the free path this entire control exists to push work TOWARD.
+  // carry NO namespace. A bare alias is a SUBSCRIPTION model at zero marginal cost.
   //
-  // So refusing one would not merely be disruptive. **It would INVERT the control:**
-  // it would push work OFF the free subscription and ONTO the metered OpenRouter
-  // route this brick exists to prevent — causing precisely the spend it was built
-  // to stop.
+  // Trimming the `/` requirement would refuse both of them and BREAK FABLE SESSIONS
+  // AT CREATION, while leaving the ordinary aliases (`sonnet`, `opus`, `haiku`,
+  // `default`, `fable`, `opus[1m]`) and BOTH incident ids correctly handled.
+  // MEASURED, NOT INFERRED — a scratch two-arm predicate differing only in the `/`
+  // guard, run over the real ids: exactly those two flip false→true and nothing else
+  // moves. The blast radius is precisely those two ids.
+  //
+  // ⚠️ IT IS A REGRESSION, NOT AN INVERSION — AND THE DISTINCTION IS WHAT MAKES THIS
+  // COMMENT DURABLE. An earlier draft of this row claimed a trim would push work off
+  // the subscription and onto the metered route, "causing precisely the spend it was
+  // built to stop". That is false: the refusal's own remedy still resolves to a
+  // subscription model — `claudeFamilyOnOpenRouterMessage({requested:
+  // "claude-fable-5-1"})` emits `use instead:  --model fable  (on the box's default
+  // Claude subscription)`, and `fable` is refused by neither arm — so nobody is
+  // pushed to OpenRouter and no spend follows. The overstatement mattered because
+  // this row exists to survive being read by someone tidying the predicate: a reader
+  // who checks a dramatic claim, finds `sonnet` and `opus` untouched and the remedy
+  // intact, may write the whole comment off as inflated and tidy the guard anyway.
+  // An accurate justification outlives a dramatic one.
   //
   // Measured 2026-09-28 across the whole live session store: of the 4 ids
   // containing "claude", exactly 2 carry a namespace and exactly 2 do not —
@@ -202,7 +221,7 @@ test("POSITIVE CONTROL: a bare claude-* alias is NOT refused — refusing it wou
     assert.equal(
       isClaudeFamilyModelId(bareAlias),
       false,
-      `${bareAlias} is a subscription alias at no marginal cost — refusing it inverts the control`,
+      `${bareAlias} is a bare subscription alias at no marginal cost — refusing it breaks Fable at creation`,
     );
     // …and the enforcement itself must let it through, for every harness.
     for (const agentCommand of [REAL_CLAUDE_COMMAND, REAL_PI_COMMAND, undefined]) {
