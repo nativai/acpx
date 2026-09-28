@@ -1376,3 +1376,240 @@ test("F8 · when the DURABLE leg fails, the failure is ANNOUNCED — never swall
     );
   });
 });
+
+// ─── THE CLI ORDERING ROW — THE ONE THE RETIRED AP16 BLOCK SAID COULD NOT BE WRITTEN ──────
+//
+// ⚠️ READ THE RETIRED-AP16 BLOCK ABOVE FIRST: it states that the two CLI paths' ordering is
+// NOT asserted, and lists the faults that cannot assert it. **That paragraph is now WRONG in
+// its conclusion and RIGHT in every particular**, and the difference is one fault it did not
+// try. Kept as-is rather than rewritten, because the six vacuous candidates it and the
+// test-engineer's sweep recorded are the expensive part and must not be re-derived.
+//
+// 🔑 THE OBSERVATION. Call order does not survive a subprocess; the END STATE does:
+//        row-first    + a failed record write  ⇒  A SEAT ROW WITH NO RECORD
+//        record-first + a failed record write  ⇒  NO ROW AT ALL
+// So force the record write to fail, and ask whether an orphan row was left behind.
+//
+// 🔑 THE FAULT, AND IT IS ASYMMETRIC BY CONSTRUCTION — that is the whole trick. The record
+// write goes through the OUTBOX, whose SQLite db lives at `~/.acpx/brick-outbox.db`, **one
+// directory ABOVE** the seat store at `~/.acpx/sessions/seats.json`. `chmod 555` on `.acpx/`
+// stops SQLite creating its journal while `.acpx/sessions/` stays writable for the mint. A
+// whole-tree fault blocks both and cannot discriminate — which is exactly why six other
+// candidates are measured vacuous (see the retired-AP16 block and
+// `verification/verification-evidence/RIG-ordering-discriminator.md`): a directory at
+// `index.json` bites at an index write that PRECEDES the mint; a read-only sessions dir is
+// SYMMETRIC; and `chmod` on either JSON file does not bite at all, because temp+rename needs
+// no write permission on the TARGET.
+//
+// 🛑 THIS IS NOT E300's RETIRED DETECTOR, though the observation is identical. There the
+// orphan row was a RATE PROBE whose subject the fix eliminates, so it expired with the fix.
+// Here the orphan row's **ABSENCE is the assertion**, under a controlled fault. Same
+// observation, OPPOSITE epistemic role — do not retire this as a duplicate of that.
+//
+// 🔑 AND IT IS CALIBRATED, NOT ARGUED — MEASURED A/B, BOTH DIRECTIONS:
+//
+//   | tree       | ordering      | plain leg        | fork/copy leg    |
+//   |------------|---------------|------------------|------------------|
+//   | `a3a6f41`  | row-first     | **RED** orphans=1 | **RED** orphans=1 |
+//   | `28a17d6`  | record-first  | green orphans=0  | green orphans=0  |
+//
+// The red arm was produced by lifting THESE ROWS VERBATIM into a throwaway worktree at
+// `a3a6f41` and running them there; C1 and C2 PASSED on that arm (the fault signature was
+// `attempt to write a readonly database`, i.e. the record write), so the failure is the
+// ordering assertion firing and not the rig collapsing.
+//
+// 🛑 WHY THAT SECOND STEP WAS NOT OPTIONAL. The test-engineer's probe 14 had already shown the
+// MECHANISM discriminates. That is a different claim from "THIS ROW'S assertions fire on the
+// ordering they detect" — this is new assertion code and could be vacuous in its own right.
+// Three of this block's four instrument defects were exactly that: an assertion that looked
+// like coverage and could not fail. **A rig proven to discriminate does not transfer its
+// calibration to the row you write on top of it.**
+// 🔑 AND BOTH LEGS WENT RED SEPARATELY, which is the part that proves the fork/copy row is not
+// a duplicate of the plain one: if it were, it would have passed vacuously on the red arm.
+
+type OrderingArm = { readonly orphans: number; readonly failure: string };
+
+/**
+ * Run the discriminator on one CLI leg and return what the end state shows.
+ *
+ * BOTH CONTROLS ARE IN HERE, NOT IN THE INVESTIGATION THAT FOUND THEM — a rig whose controls
+ * live only in a scratch probe is a rig nobody can trust six months from now.
+ */
+async function runOrderingDiscriminator(homeDir: string, forkLeg: boolean): Promise<OrderingArm> {
+  const acpxDir = path.join(homeDir, ".acpx");
+  const sessionDir = path.join(acpxDir, "sessions");
+  const cwd = path.join(homeDir, "work");
+  await fs.mkdir(cwd, { recursive: true });
+  const agent = forkLeg ? `${MOCK_AGENT_COMMAND} --supports-fork-session` : MOCK_AGENT_COMMAND;
+
+  // 0 · RIG CONTROL — the UNFAULTED create must succeed, or nothing below means anything.
+  const seed = await runCli(
+    [
+      "--cwd",
+      cwd,
+      "--agent",
+      agent,
+      "--approve-all",
+      "--format",
+      "json",
+      "sessions",
+      "new",
+      "-s",
+      "seed",
+    ],
+    homeDir,
+  );
+  assert.equal(
+    seed.code,
+    0,
+    `rig control failed BEFORE the fault — non-result, not a red: ${seed.stderr}`,
+  );
+  const seedId = String(
+    (JSON.parse(seed.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+  );
+  const storePath = path.join(sessionDir, "seats.json");
+  const before = JSON.parse(await fs.readFile(storePath, "utf8")) as Record<string, unknown>;
+
+  // 1 · THE FAULT.
+  await fs.chmod(acpxDir, 0o555);
+  let run: CliResult;
+  let storeWritableUnderFault = false;
+  try {
+    // The asymmetry itself, asserted rather than assumed.
+    const stillWritable = await fs
+      .access(sessionDir, fsSync.constants.W_OK)
+      .then(() => true)
+      .catch(() => false);
+    assert.ok(
+      stillWritable,
+      "the fault is SYMMETRIC — it blocked the store as well as the outbox, so a missing row " +
+        "would prove nothing about ordering. This is the trap five other candidate faults fell into",
+    );
+
+    run = forkLeg
+      ? await runCli(
+          ["--format", "json", "sessions", "copy", "--from", seedId, "--name", "faulted"],
+          homeDir,
+        )
+      : await runCli(
+          [
+            "--cwd",
+            cwd,
+            "--agent",
+            agent,
+            "--approve-all",
+            "--format",
+            "json",
+            "sessions",
+            "new",
+            "-s",
+            "faulted",
+          ],
+          homeDir,
+        );
+
+    // C2 · THE STORE WAS WRITABLE AT THAT MOMENT — proven by planting a row through the
+    // PRODUCT'S OWN writer, not by an fs permission check (which is what `access` above
+    // already did, and which does not prove the writer would have succeeded).
+    // 🛑 WITHOUT C2, "no orphan row" collapses to "the store was unwritable too".
+    const { mintSeatRow } = await import("../src/session/persistence.js");
+    const probeSeat = crypto.randomUUID();
+    await mintSeatRow(sessionDir, {
+      seatId: probeSeat,
+      holderId: crypto.randomUUID(),
+      name: "c2-probe",
+      createdAt: new Date().toISOString(),
+    });
+    const afterProbe = JSON.parse(await fs.readFile(storePath, "utf8")) as Record<string, unknown>;
+    storeWritableUnderFault = Object.hasOwn(afterProbe, probeSeat);
+    delete afterProbe[probeSeat];
+    await fs.writeFile(storePath, `${JSON.stringify(afterProbe)}\n`, "utf8");
+  } finally {
+    // Restore BEFORE any assertion can throw, or `withTempHome`'s teardown fails on a
+    // read-only directory and the real failure is buried under a cleanup error.
+    await fs.chmod(acpxDir, 0o755);
+  }
+
+  // C1 · THE FAULT FIRED AT THE RECORD WRITE — **and this is the control that must be
+  // seam-specific rather than failure-generic.** "Did the run fail?" is not "did it fail at
+  // the seam I aimed at?" The test-engineer's first candidate passed a failure-generic C1
+  // while measuring nothing at all: it failed at a READ that happens BEFORE the mint, so
+  // neither ordering could have reached the mint and both arms showed no orphan.
+  // ⇒ A CONTROL CAN BE SATISFIED BY THE WRONG FAILURE.
+  assert.notEqual(
+    run.code,
+    0,
+    `the faulted run SUCCEEDED — the fault did not bite at all: ${run.stdout}`,
+  );
+  const both = run.stdout + run.stderr;
+  assert.match(
+    both,
+    /readonly database|attempt to write/i,
+    `C1: the run failed, but NOT at the record write — so this arm proves nothing about ` +
+      `ordering. Failure was: ${both.replace(/\s+/g, " ").slice(0, 300)}`,
+  );
+  assert.equal(
+    /EISDIR.*read|record-id destination already exists/i.test(both),
+    false,
+    "C1: the fault fired at an EARLY READ, before the mint — the classic vacuous arm",
+  );
+  assert.ok(
+    storeWritableUnderFault,
+    "C2: the store was NOT writable while the fault was in place, so the absence of an orphan " +
+      "row says only that nothing could be written — not that the mint never ran",
+  );
+
+  // 2 · THE OBSERVATION.
+  const store = JSON.parse(await fs.readFile(storePath, "utf8")) as Record<
+    string,
+    { active_holder_id?: string } | undefined
+  >;
+  const files = new Set(await fs.readdir(sessionDir));
+  let orphans = 0;
+  for (const seatId of Object.keys(store)) {
+    if (Object.hasOwn(before, seatId)) {
+      continue;
+    }
+    const holder = store[seatId]?.active_holder_id;
+    if (holder !== undefined && holder !== null && !files.has(`${holder}.json`)) {
+      orphans += 1;
+    }
+  }
+  return { orphans, failure: both.replace(/\s+/g, " ").slice(0, 200) };
+}
+
+const ORDERING_RED_MESSAGE =
+  "THE CLI MINT ORDERING HAS BEEN REVERSED BACK TO ROW-FIRST. A seat row was minted and the " +
+  "record write then failed, leaving a row that names a holder with no record — a seat that " +
+  "can never be succeeded, belonging to a session that does not exist. Under record-first " +
+  "this state is unreachable. Item 8 forbids creation depending on the store BY ERROR OR BY " +
+  "SIDE EFFECT, and no guard can catch a mint that SUCCEEDS: only the ordering can. " +
+  "DO NOT 'fix' this by deleting the orphan or by adding a retry — restore the ordering: the " +
+  "mint goes BELOW the whole `if (forkContext) … else …`, after both record writes.";
+
+test("ordering · PLAIN CREATE leaves NO orphan seat row when the record write fails", async () => {
+  await withTempHome(async (homeDir) => {
+    const arm = await runOrderingDiscriminator(homeDir, false);
+    assert.equal(
+      arm.orphans,
+      0,
+      `${ORDERING_RED_MESSAGE} (orphans=${arm.orphans}, fault=${arm.failure})`,
+    );
+  });
+});
+
+// THE SECOND LEG, AND IT IS NOT A DUPLICATE OF THE FIRST. `sessions copy` reaches the same
+// call site through the OTHER branch of `if (forkContext) … else …` and writes through
+// `writeSessionRecordAtBoundary` rather than `writeSessionRecord`. A reorder applied to one
+// leg only would leave this one row-first AND LOOK DONE. The unit of coverage is the
+// REACHABLE PATH, not the call site — counted wrong three times on this block before it stuck.
+test("ordering · FORK/COPY leaves NO orphan seat row when the record write fails", async () => {
+  await withTempHome(async (homeDir) => {
+    const arm = await runOrderingDiscriminator(homeDir, true);
+    assert.equal(
+      arm.orphans,
+      0,
+      `${ORDERING_RED_MESSAGE} (orphans=${arm.orphans}, fault=${arm.failure})`,
+    );
+  });
+});
