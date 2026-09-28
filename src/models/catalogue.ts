@@ -10,6 +10,11 @@
 import type { ArbitraryModelSupport } from "../acp/harness-capabilities.js";
 import { readHarnessCapabilities } from "./capability-source.js";
 import type { AvailabilityCapability } from "./capability-source.js";
+import {
+  CLAUDE_FAMILY_OPENROUTER_ANNOTATION,
+  CLAUDE_FAMILY_OPENROUTER_REASON,
+  refusesClaudeFamilyOnOpenRouter,
+} from "./claude-family.js";
 import { deriveDepthDescriptor } from "./depth.js";
 import { harnessNativeModels } from "./harness-models.js";
 import type { NativeModel } from "./harness-models.js";
@@ -259,6 +264,28 @@ function availabilityFor(
           reason: "other-harness",
           message: `${model.source} models are not reachable from a ${capability.id} session`,
         };
+  }
+
+  // ── Tier 3: the Claude-family DECLARATION (brick 30eb2003) ─────────────────
+  //
+  // Sited after the harness-native arm, so it can only ever see an OpenRouter row —
+  // a claude-native `sonnet` row is answered above and never reaches here.
+  //
+  // ⚠️ `capability.id` IS the harness id (this map is built from
+  // `readHarnessCapabilities`, which projects `HARNESS_FACTS`), which is why the
+  // SAME predicate the spawn-path gate uses is asked here. Two lists would drift;
+  // one predicate cannot.
+  //
+  // 🛑 DECLARATION ONLY. Availability annotates and never filters — the row stays
+  // in the list, greyed, with this reason — so this changes no spawn's outcome. It
+  // is what makes the policy readable BEFORE an agent acts; `assertModelPolicy` is
+  // what refuses. Never cite this as coverage.
+  if (refusesClaudeFamilyOnOpenRouter({ harness: capability.id, modelId: model.id })) {
+    return {
+      ok: false,
+      reason: CLAUDE_FAMILY_OPENROUTER_REASON,
+      message: CLAUDE_FAMILY_OPENROUTER_ANNOTATION,
+    };
   }
 
   if (!capability.acceptsArbitraryModelIds) {
