@@ -28,6 +28,117 @@ export type SeatRecordFields = Pick<
   "seatId" | "holderOrdinal" | "holderActive" | "parentSeatId"
 >;
 
+// ─── WRITE-AUTHORITY PARTITION (D1, brick b64dfbb3) ─────────────────────────
+
+/**
+ * THE SEAT GROUP HAS TWO WRITERS, NOT ONE — and this partition is the anchor
+ * that says which field belongs to which (D1, `ACTIVATION-PROTOCOL.md` §3.5).
+ *
+ * The set above is a PROJECTION set: which fields travel together onto the
+ * index. Authority is a different question, and it follows the WRITER:
+ *
+ *   - `holder`  — `seatId` / `holderOrdinal` / `holderActive`. Written at
+ *     record construction, then by B2's activation (succession) write and
+ *     nothing else. Protected across the privileged close by
+ *     `preserveSeatHolderFieldsForPersist`, bypassed by `authoritative.seatHolder`.
+ *   - `linkage` — `parentSeatId`. Written at record construction, then by
+ *     `sessions set-parent` — `applyParentToRecord` sets it on the same line as
+ *     `parentSessionId`, one writer, one call site, one fact. Protected by
+ *     `preserveParentLinkageForPersist`, bypassed by `authoritative.parent`.
+ *
+ * 🛑 WHY NOT ONE COARSE `seat?: true` AUTHORITATIVE FLAG. The preserves return
+ * early on their flag for the WHOLE function, not one field. With a single flag
+ * `set-parent` must declare it to write `parentSeatId` — and that same flag
+ * would hand `set-parent` authority over `holderActive`, reintroducing a second
+ * writer of the active-holder mirror through the very mechanism meant to
+ * protect it. That is Cluster A requirement 3's single-writer clause broken by
+ * its own fix. The partition makes the coupling STRUCTURAL instead of remembered.
+ *
+ * ⚠️ THIS OBJECT IS THE ANCHOR AND IT IS COMPILER-FORCED EXHAUSTIVE. Adding a
+ * fifth field to `SeatRecordFields` fails `pnpm run typecheck` BY NAME here
+ * until it is classified into one half — the same `RECORD_FIELD_PLAN` mechanism
+ * `full-record-contract.ts` uses, at seat scope. An anchor going red on a change
+ * to its source IS the anchor working; repair it by classifying the new field
+ * after confirming the change was intended.
+ *
+ * ⚠️ THIS DOES NOT SPLIT WHAT TRAVELS. `SeatIndexFields` and
+ * `seatFieldsToIndexEntry` still carry all four as one group — the index is a
+ * projection of the record and has no authority question at all. A reader who
+ * splits the index projection too has misread D1.
+ */
+export type SeatFieldHalf = "holder" | "linkage";
+
+export const SEAT_FIELD_PARTITION = {
+  seatId: "holder",
+  holderOrdinal: "holder",
+  holderActive: "holder",
+  parentSeatId: "linkage",
+} as const satisfies { [K in keyof Required<SeatRecordFields>]: SeatFieldHalf };
+
+/** The field names of one half, as a type — derived FROM the partition, so a
+ * newly classified field joins its half with no second list to update. */
+type SeatFieldsInHalf<H extends SeatFieldHalf> = {
+  [K in keyof typeof SEAT_FIELD_PARTITION]: (typeof SEAT_FIELD_PARTITION)[K] extends H ? K : never;
+}[keyof typeof SEAT_FIELD_PARTITION];
+
+/** The two halves as record-field types. Derived, never hand-listed: these are
+ * what the two preserve functions take, so classifying a new field into a half
+ * widens that preserve automatically. */
+export type SeatHolderFields = Pick<SessionRecord, SeatFieldsInHalf<"holder">>;
+export type SeatLinkageFields = Pick<SessionRecord, SeatFieldsInHalf<"linkage">>;
+
+/** The field names of one half, at runtime — the list both preserves iterate.
+ * Derived from the partition for the same reason the types are: a hand list
+ * "is correct the day it is written and silently wrong the day a field is
+ * added" (§E72), and this is the list a preserve would otherwise hard-code. */
+function seatFieldNamesInHalf<H extends SeatFieldHalf>(half: H): SeatFieldsInHalf<H>[] {
+  const names: SeatFieldsInHalf<H>[] = [];
+  for (const key of Object.keys(SEAT_FIELD_PARTITION) as (keyof SeatRecordFields)[]) {
+    if (SEAT_FIELD_PARTITION[key] === half) {
+      names.push(key as SeatFieldsInHalf<H>);
+    }
+  }
+  return names;
+}
+
+const SEAT_HOLDER_FIELD_NAMES = seatFieldNamesInHalf("holder");
+const SEAT_LINKAGE_FIELD_NAMES = seatFieldNamesInHalf("linkage");
+
+/** Copy ONE seat field from source to target, keeping the per-field type. Kept
+ * generic so the copy below needs no `any` and no per-field branch. */
+function assignSeatField<K extends keyof SeatRecordFields>(
+  target: Pick<SeatRecordFields, K>,
+  source: Pick<SeatRecordFields, K>,
+  field: K,
+): void {
+  target[field] = source[field];
+}
+
+/**
+ * Copy the `holder` half from `source` onto `target`.
+ *
+ * ⚠️ TOTAL OVER THE HALF, AND UNCONDITIONAL PER FIELD — it copies `undefined`
+ * as `undefined` rather than skipping an absent value. That is deliberate and
+ * it is the whole point of the preserve that calls it: the lost update being
+ * defended IS a stale in-memory record carrying the OLD value, so a
+ * fill-an-absence copy would let exactly that through unchanged. Absence is a
+ * value here, as it is in the projection helpers above.
+ */
+export function copySeatHolderFields(target: SeatHolderFields, source: SeatHolderFields): void {
+  for (const field of SEAT_HOLDER_FIELD_NAMES) {
+    assignSeatField(target, source, field);
+  }
+}
+
+/** Copy the `linkage` half. Same totality and the same reason as the holder
+ * half above — `preserveParentLinkageForPersist` already documents it for the
+ * `parentSessionId` group this field pairs with. */
+export function copySeatLinkageFields(target: SeatLinkageFields, source: SeatLinkageFields): void {
+  for (const field of SEAT_LINKAGE_FIELD_NAMES) {
+    assignSeatField(target, source, field);
+  }
+}
+
 /** The subset of SeatRecordFields projected onto the INDEX entry — currently
  * ALL of them. `parentSeatId` joined this set (D-B1-14 correction) so the F4
  * divergence-healing mechanism in session-reparent.ts, which compares the

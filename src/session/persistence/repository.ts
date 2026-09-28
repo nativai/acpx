@@ -43,6 +43,7 @@ import {
 } from "./metadata-merge.js";
 import { mergeRecordPinnedModelForPersist, rememberSessionModelBaseline } from "./model-merge.js";
 import { parseSessionRecord } from "./parse.js";
+import { copySeatHolderFields, copySeatLinkageFields } from "./seat-fields.js";
 import { serializeSessionRecordForDisk } from "./serialize.js";
 import {
   effectiveTemplateSlug,
@@ -255,6 +256,19 @@ export type PersistedSessionLifecycle = {
    * one read can serve both the preserve step and that merge (W2.4). */
   pid: number | undefined;
   acpx: SessionRecord["acpx"];
+  /** THE SEAT GROUP — all four fields, read-preserved as TWO independently
+   * authorised halves (D1, brick b64dfbb3). They are on this type for one
+   * blunt reason: without them here there is nothing for either preserve to
+   * read. Before B2 this type carried NO seat field at all, which meant
+   * `applyPersistedLifecycleForWrite` could not have preserved one even on a
+   * `preserveLifecycle: true` write — the seat group was unprotected on EVERY
+   * write path, not merely the privileged one. See
+   * `preserveSeatHolderFieldsForPersist` for which half each field is in and
+   * why the halves are separate. */
+  seatId: string | undefined;
+  holderOrdinal: number | undefined;
+  holderActive: boolean | undefined;
+  parentSeatId: string | undefined;
 };
 
 /**
@@ -287,6 +301,10 @@ export async function readPersistedLifecycle(
       metadata: parsed.metadata,
       pid: parsed.pid,
       acpx: parsed.acpx,
+      seatId: parsed.seatId,
+      holderOrdinal: parsed.holderOrdinal,
+      holderActive: parsed.holderActive,
+      parentSeatId: parsed.parentSeatId,
     };
   } catch {
     return undefined;
@@ -357,7 +375,7 @@ export async function writeSessionRecordAtBoundaryWithLifecycle(
  * in-memory record. Mirrors `closeSession`'s privilege, scoped to one group
  * instead of all of them. (brick c99f9994)
  */
-type WriteAuthoritativeFields = { parent?: true };
+type WriteAuthoritativeFields = { parent?: true; seatHolder?: true };
 
 /**
  * The ONE authorised writer of the parent linkage — `sessions set-parent` and any
@@ -442,6 +460,55 @@ export async function writeSessionRecordAuthorizingParentWithoutIndex(
 }
 
 /**
+ * THE ONE AUTHORISED WRITER OF THE SEAT HOLDER HALF — B2's activation
+ * (succession) write, and nothing else (D1, `ACTIVATION-PROTOCOL.md` §2.7).
+ *
+ * ⚠️ WITHOUT `authoritative.seatHolder` THE FLIP IS A SILENT NO-OP, exactly as
+ * `writeSessionRecordAuthorizingParent` warns for its own group:
+ * `writeSessionRecordInternal` re-reads `<id>.json` and
+ * `preserveSeatHolderFieldsForPersist` puts the OLD `holderActive` straight
+ * back, so a succession that mutates the record and calls plain
+ * `writeSessionRecord` writes the record it started from — exit 0,
+ * correct-looking output, the seat still mirroring the retired holder.
+ *
+ * ⚠️ NO INDEX UPDATE — THE CALLER OWNS THE INDEX HALF, and here that is
+ * structural rather than an optimisation. An activation is TWO record writes
+ * (retire the predecessor, activate the successor) that must reach the index as
+ * ONE atomic projection: a per-record index update between them publishes an
+ * index with two active holders or none. So both writes skip, and phase 4 brings
+ * the index level with a single `overlaySessionIndexEntries` call carrying both
+ * entries — one lock, one index write.
+ *
+ * 🛑 SKIPS, IT DOES NOT DEFER — the distinction `writeSessionRecordAuthorizingParentWithoutIndex`
+ * documents at length applies verbatim: a deferred write would leave a
+ * whole-entry SNAPSHOT in the pending map, and any later flush would write that
+ * snapshot and revert whatever changed meanwhile. For an active-holder pointer
+ * that is a routing failure, not a cosmetic one. Nothing is enqueued here, so
+ * there is nothing for a later flush to write.
+ *
+ * ⚠️ FLUSH THE OVERLAY IN A `finally`, never relying on `beforeExit`, which
+ * `SIGKILL` and `process.exit()` skip. Until that flush each written record is
+ * torn `record=NEW, index=OLD` — the direction the succession heal repairs on a
+ * re-run, and never one that routes to the retired holder.
+ *
+ * ⚠️ DO NOT "simplify" this to `writeSessionRecordWithLifecycle`. That bypass
+ * disables preservation for EVERY lifecycle field, so a concurrent rename, close
+ * or favourite-toggle landing in the read→write window is lost — a bigger hole
+ * than the one this closes. This write is authoritative for THREE FIELDS and
+ * ordinary for all the rest, which is the entire point of the flag.
+ */
+export async function writeSessionRecordAuthorizingSeatHolderWithoutIndex(
+  record: SessionRecord,
+): Promise<void> {
+  await writeSessionRecordInternal(record, {
+    messagePersistence: "checkpoint",
+    preserveLifecycle: true,
+    authoritative: { seatHolder: true },
+    skipIndexUpdate: true,
+  });
+}
+
+/**
  * Preserving write variant for callers that already hold the persisted
  * lifecycle from a fresh `readPersistedLifecycle` read. Metadata is still
  * reread inside the write so external metadata patches survive stale owner
@@ -517,6 +584,91 @@ function preserveParentLinkageForPersist(
   record.parentSessionUrl = persistedLifecycle.parentSessionUrl;
   record.parentSetAt = persistedLifecycle.parentSetAt;
   record.spawnedBySessionId = persistedLifecycle.spawnedBySessionId;
+  // `parentSeatId` is the LINKAGE half of the seat group (D1) and it belongs
+  // here rather than in its own preserve, because its writer is already here:
+  // `applyParentToRecord` sets it on the line after `parentSessionId`, one
+  // writer, one call site, one fact ("who is my parent"). It therefore rides
+  // the SAME `authoritative.parent` gate above — `set-parent` declares that
+  // flag today and gains nothing new. Derived from the partition in
+  // `seat-fields.ts`, never hand-listed here.
+  copySeatLinkageFields(record, persistedLifecycle);
+}
+
+/**
+ * Read-preserve the HOLDER half of the seat group — `seatId`, `holderOrdinal`
+ * and `holderActive` — across every write, including the privileged ones
+ * (D1, brick b64dfbb3, `ACTIVATION-PROTOCOL.md` §3.5).
+ *
+ * THE DEFECT THIS CLOSES IS `c99f9994` F2's, ONE FIELD GROUP OVER, and it was
+ * latent rather than absent: `PersistedSessionLifecycle` carried no seat field
+ * at all, so nothing preserved one on ANY path. `session-control.ts`'s
+ * `closeSession` reads the record at entry, then drains → asks the owner to
+ * close → SIGTERM, grace, SIGKILL, grace → kills the adapter, and only THEN
+ * writes that now-multi-second-stale record through
+ * `writeSessionRecordAtBoundaryWithLifecycle` (`preserveLifecycle: false`).
+ * An activation flip landing in that window was silently undone on the record,
+ * and then faithfully projected into the index by `overlaySessionIndexEntries`
+ * doing exactly what it promises. The close exits 0.
+ *
+ * ⚠️ NOBODY HAD HIT IT YET, AND B2 IS PRECISELY WHEN THEY WOULD. `seatId` and
+ * `holderOrdinal` are write-once at creation, so a stale copy carries the SAME
+ * value and the clobber is real but unobservable. `holderActive` is the first
+ * seat field that ever changes after creation — and the succession write is the
+ * thing that changes it. Measured on devbox 2026-09-28: 388 seats, 388 distinct
+ * ids, 388 `holderActive === true`, every seat single-holder. No succession had
+ * ever run, so no state had ever existed in which the mirror could disagree.
+ *
+ * 🛑 CALLED OUTSIDE THE `preserveLifecycle` BRANCH, AND THAT PLACEMENT IS THE
+ * FIX — the same placement, for the same reason, as
+ * `preserveParentLinkageForPersist` above, whose own comment records that it
+ * *"sat INSIDE that branch when this shipped, which looked right and left the
+ * real clobberer untouched."* The clobberer here is the PRIVILEGED write, which
+ * bypasses that branch by design. A preserve scoped to "the close path" would
+ * repeat the same mistake a third time: the close is the WIDEST window, not the
+ * only one — a live owner's ordinary checkpoint flush of a stale in-memory
+ * record is a second, permanent one that needs no crash at all.
+ *
+ * ⚠️ UNCONDITIONAL — DISK WINS. It does NOT merely fill an absence. The
+ * `last_turn_provider` style below would be the NO-OP FORM OF THIS FIX:
+ * `holderActive` is exactly the field that changes, so the lost update being
+ * defended IS a stale in-memory record carrying the OLD `true`, which a
+ * fill-an-absence preserve lets through unchanged. Same argument
+ * `preserveParentLinkageForPersist` already makes for its own group.
+ *
+ * ⚠️ AND THAT IS SAFE ONLY WHILE THIS ENUMERATION HOLDS — IT EXPIRES.
+ * Nothing assigns `seatId`, `holderOrdinal` or `holderActive` outside record
+ * CONSTRUCTION (`session-management.ts:258-260` for normal-create and
+ * fork/copy, `runtime.ts:2502-2504` for the subagent shadow path) — at which
+ * point no `<id>.json` exists yet, `readPersistedLifecycle` returns undefined,
+ * and this is a no-op — and the ONE authorised writer, B2's activation, which
+ * bypasses by NAME through `authoritative.seatHolder`. Re-verified at this
+ * branch point (acpx db49b08b): zero property assignments to any of the three
+ * anywhere in `src/`, with `parentSeatId` 12 files / `writeSessionRecordInternal`
+ * 3 as positive controls and a fresh negative control at 0.
+ * **ADD A `holderActive` (or `seatId` / `holderOrdinal`) WRITE ANYWHERE ELSE AND
+ * THIS ANALYSIS EXPIRES — re-run that grep:**
+ *     git grep -n -E 'holderActive|holderOrdinal|seatId' -- 'src/**\/*.ts'
+ * and classify every hit as writer / carrier / type / read before trusting this
+ * preserve again. A correct enumeration with no expiry note is correct once.
+ *
+ * ⚠️ NOT the same function as `repository.ts`'s own `closeSession`, which reads
+ * and writes adjacently and never was stale. TWO SAME-NAMED FUNCTIONS —
+ * `session-control.ts`'s is the unsafe one, and reasoning about the wrong one
+ * is what let the original defect ship.
+ */
+function preserveSeatHolderFieldsForPersist(
+  record: SessionRecord,
+  persistedLifecycle: PersistedSessionLifecycle | undefined,
+  authoritative: WriteAuthoritativeFields | undefined,
+): void {
+  // The gates live INSIDE the named function, not at the call site, for the
+  // reason the sibling preserve states: the write path then carries one
+  // unconditional call that a refactor cannot quietly re-gate on
+  // `preserveLifecycle` — which is precisely how F2 shipped.
+  if (!persistedLifecycle || authoritative?.seatHolder === true) {
+    return;
+  }
+  copySeatHolderFields(record, persistedLifecycle);
 }
 
 function applyPersistedLifecycleForWrite(
@@ -670,6 +822,18 @@ async function writeSessionRecordInternal(
     // close in flight silently undoes a re-parent (F2). One test pins BOTH
     // directions together, because fixing either one alone still looks green.
     preserveParentLinkageForPersist(record, freshPersisted, options.authoritative);
+    // 🛑 THE SEAT HOLDER HALF, PRESERVED UNCONDITIONALLY — same placement and
+    // the same reason as the parent linkage immediately above, and `freshPersisted`
+    // for the same reason too: disk is the authority for which holder is active,
+    // and a caller-supplied lifecycle can predate the succession by a whole turn.
+    //
+    // ⚠️ The ONE writer that must beat this is B2's activation, and it does so by
+    // NAME through `authoritative.seatHolder` — not by being privileged. Remove
+    // that gate and the succession verb becomes a silent no-op; remove this call
+    // and a close in flight silently undoes the flip, leaving the active-holder
+    // mirror pointing at the retired holder. One test pins BOTH directions,
+    // because fixing either one alone still looks green.
+    preserveSeatHolderFieldsForPersist(record, freshPersisted, options.authoritative);
     mergeRecordMetadataForPersist(record, persistedMetadata);
     // Same baseline-diff protection metadata gets (2c848d3), extended to the
     // pinned model: a stale/dropped write can't regress a record-pinned model,

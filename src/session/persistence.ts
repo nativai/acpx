@@ -46,6 +46,7 @@ export {
   writeSessionRecordAtBoundaryWithLifecycle,
   writeSessionRecordAuthorizingParent,
   writeSessionRecordAuthorizingParentWithoutIndex,
+  writeSessionRecordAuthorizingSeatHolderWithoutIndex,
   writeSessionRecordWithLifecycle,
   writeSessionRecordWithPersistedLifecycle,
 } from "./persistence/repository.js";
