@@ -434,17 +434,22 @@ test("B2c product-entered · a real `acpx seats close` refuses `sessions new --s
       0,
       `fixture precondition: acpx seats close must succeed once the active holder is closed — ${closedSeat.stdout}${closedSeat.stderr}`,
     );
+    const closedAt = (JSON.parse(closedSeat.stdout.trim()) as { closedAt?: string }).closedAt;
+    assert.ok(closedAt, "fixture precondition: the real close returned a timestamp");
 
     const refused = await runCli(
       [...base, "sessions", "new", "-s", "r4-refused", "--seat", seatId],
       homeDir,
     );
     assert.notEqual(refused.code, 0, "a seat closed by the REAL verb still accepted a join");
-    assert.match(
-      `${refused.stdout}${refused.stderr}`,
-      /SEAT_CLOSED/,
-      "the refusal must carry the SEAT_CLOSED code",
-    );
+    const said = `${refused.stdout}${refused.stderr}`;
+    assert.match(said, /SEAT_CLOSED/, "the refusal must carry the SEAT_CLOSED code");
+    // 🛑 F4 (independent TE finding, 2026-09-29): AC16's `Fails if:` clause is
+    // explicit — "refuses either without naming the seat and its closed_at". The
+    // product does this correctly, but a message reword could drop it silently
+    // and greenly with no assertion here to catch it.
+    assert.match(said, new RegExp(seatId), "the refusal must name the SEAT");
+    assert.match(said, new RegExp(closedAt), "the refusal must name its closed_at TIMESTAMP");
   });
 });
 

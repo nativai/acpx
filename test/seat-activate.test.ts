@@ -527,14 +527,37 @@ test("B2c product-entered · a real `acpx seats close` refuses a real `sessions 
       `fixture precondition: acpx seats close must succeed once the active holder is closed — ` +
         `${closedSeat.stdout}${closedSeat.stderr}`,
     );
+    const closedAt = (JSON.parse(closedSeat.stdout.trim()) as { closedAt?: string }).closedAt;
+    assert.ok(closedAt, "fixture precondition: the real close returned a timestamp");
 
     const refused = await activate(homeDir, seatId, h2);
     assert.notEqual(refused.code, 0, "a seat closed by the REAL verb still accepted an activation");
+    const said = `${refused.stdout}${refused.stderr}`;
     assert.match(
-      `${refused.stdout}${refused.stderr}`,
+      said,
       /SEAT_CLOSED/,
       "the refusal must carry the SEAT_CLOSED code — the command under test (`sessions activate`) " +
         "is what discriminates this from R4's identically-coded create-into-seat refusal",
+    );
+    // 🛑 F4 (independent TE finding, 2026-09-29): AC16's `Fails if:` clause is
+    // explicit — "refuses either without naming the seat and its closed_at". The
+    // product does this correctly, but a message reword could drop it silently
+    // and greenly with no assertion here to catch it.
+    assert.match(said, new RegExp(seatId), "the refusal must name the SEAT");
+    assert.match(said, new RegExp(closedAt), "the refusal must name its closed_at TIMESTAMP");
+    // 🛑 F5 (independent TE finding, 2026-09-29): `seat-activate.ts` throws
+    // SEAT_CLOSED from TWO sites — phase 0.1 (unlocked pre-check, `:160`) and
+    // phase 2 (re-check inside the hold, `:287`). A bare `/SEAT_CLOSED/` cannot
+    // tell them apart, so this row was believed to pin phase 0.1 and did not —
+    // deleting that guard would leave phase 2 to catch it and this row would stay
+    // green. Pin phase 0.1's UNIQUE phrase (phase 2's is "while this activation
+    // was running", which does not appear here) so a future deletion of the
+    // phase-0.1 guard turns this row red.
+    assert.match(
+      said,
+      /takes no further holders/,
+      "phase 0.1's unique phrase is absent — this row may be exercising phase 2's " +
+        "re-check instead, which would mean the phase-0.1 guard is unpinned",
     );
   });
 });

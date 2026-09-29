@@ -8,7 +8,11 @@ import { Command } from "commander";
 import { TOP_LEVEL_VERBS } from "../src/cli-core.js";
 import { registerDefaultCommands } from "../src/cli/command-registration.js";
 import type { ResolvedAcpxConfig } from "../src/cli/config.js";
-import { buildSeatDeletion, decideSeatClose } from "../src/cli/seats-command.js";
+import {
+  buildSeatDeletion,
+  decideSeatClose,
+  seatHolderOpenMessage,
+} from "../src/cli/seats-command.js";
 import { readSeatStore, withSeatStoreWrite, type SeatRecord } from "../src/session/persistence.js";
 import { withTempHome as withTempHomeFixture } from "./runtime-test-helpers.js";
 
@@ -79,11 +83,23 @@ import { withTempHome as withTempHomeFixture } from "./runtime-test-helpers.js";
  *   `D4`'s control arm (below) constructed a stamped row as an in-test VALUE rather
  *   than a store fixture, and that remains true — `D4` is about a checker seeing a
  *   value, not about reaching the closed STATE. The closed-seat rows added by B2c
- *   (Group CL, and the closed-seat legitimate-pass rows on `set-brick` / `rename` /
- *   `delete`) drive the real `acpx seats close` and read the result off disk — see
- *   `CL1`. A row still using `seatRow(..., { closed_at: … })` as a fixture in this file
- *   names its OWN structural reason (holder-changed's interleaving cannot be entered by
- *   a single-process CLI row — see `CL7`'s comment).
+ *   drive the real `acpx seats close` and read the result off disk — see `CL1` and
+ *   `CLB1` (the latter mints a real seat+holder, closes both for real, THEN drives
+ *   `set-brick` against the product-closed seat).
+ *   ⚠️ **CORRECTED (independent TE finding F3, 2026-09-29)** — ~~"A row still using
+ *   `seatRow(..., { closed_at: … })` as a fixture in this file names its OWN
+ *   structural reason (holder-changed's interleaving cannot be entered by a
+ *   single-process CLI row — see `CL7`'s comment)"~~ was FALSE on two counts: (1)
+ *   `CLB2`/`CLB3` fixtured `closed_at` directly with NO stated reason, and there was
+ *   none available — the shipped verb CAN produce that state, which is the defect
+ *   half of the fixture-disclosure rule, not the structural half; (2) the
+ *   cross-reference was wrong twice — holder-changed is `CL5`, not `CL7` (`CL7` is
+ *   the store-health row), and `CL5` is not a store fixture at all — it builds an
+ *   in-test `SeatRecord` value, calling `decideSeatClose` directly. **What is
+ *   actually true, post-fix:** `CLB2`/`CLB3` now state they are ANCHORED to `CLB1`
+ *   (cost/control reason, not a structural one — see their own comments), which is
+ *   the honest label; nothing in this file fixtures `closed_at` for a structural
+ *   reason any more.
  */
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
@@ -1260,12 +1276,32 @@ test("CL4 · R1 — refuses SEAT_HOLDER_OPEN while the active holder is open, an
   });
 });
 
-test("CL4 control · the message asserted above can be SEEN — a bogus holder id in the same shape would not match", () => {
-  // §3a-bis — the control arm for CL4's `new RegExp(holderId)` assertion: prove the
-  // pattern can fail before trusting that it passed for the right reason.
-  const message = "seat X refuses to close: its active holder Y is still open.";
-  assert.doesNotMatch(message, /aaaaaaaa-not-the-real-holder-id/);
-  assert.match(message, /Y is still open/);
+test("CL4 message · seatHolderOpenMessage (the PRODUCT's own builder) names the seat, the holder, and the --session-id remedy", () => {
+  // 🛑 CORRECTED (independent TE finding F1, 2026-09-29). This block used to be
+  // named "CL4 control" and asserted two regexes against a HAND-WRITTEN literal
+  // string that imported no product module at all. Proven vacuous by the TE:
+  // copied verbatim into a standalone file with no product import, it still
+  // passed — it tested the test. Worse than inert: named "control", it read as
+  // discharging §3a-bis for CL4 while examining a paraphrase, never the product's
+  // own message.
+  //
+  // §3a-bis's control-ARM requirement never attached to CL4 in the first place —
+  // CL4 is PRODUCT-ENTERED (a real open holder, closed for real via the CLI), not
+  // fault-injected, so there is no fault arm here that needs an unfaulted
+  // counterpart. What replaces it is a real assertion, against the exported
+  // `seatHolderOpenMessage` (product code, not a copy), that the message actually
+  // carries what an operator needs to act on the refusal.
+  const message = seatHolderOpenMessage(
+    "11111111-1111-4111-8111-111111111111",
+    "aaaaaaaa-0000-4000-8000-000000000000",
+  );
+  assert.match(message, /11111111-1111-4111-8111-111111111111/, "the message must name the SEAT");
+  assert.match(message, /aaaaaaaa-0000-4000-8000-000000000000/, "the message must name the HOLDER");
+  assert.match(
+    message,
+    /--session-id/,
+    "the remedy must use --session-id — the positional form resolves by NAME, not record id",
+  );
 });
 
 test("CL5 · decideSeatClose — the pure CAS decision, all four branches, width stated (R2)", () => {
@@ -1366,12 +1402,21 @@ test("CL7 · store health: MALFORMED/UNREADABLE refuses SEAT_STORE_UNWRITABLE, n
 
 test("CL8 · close on an ABSENT row refuses SEAT_ROW_MISSING with AP17's cause and remedy", async () => {
   await withRig(async (homeDir) => {
+    // `withRig` only mkdirs the sessions DIRECTORY — no `seats.json` is written
+    // here, so this is ALSO close on an absent STORE (F6, independent TE finding,
+    // part B: "close on an absent store must not create the file").
+    assert.equal(await storeExists(homeDir), false, "fixture precondition: no store file yet");
     const result = await runCli(["--format", "json", "seats", "close", SEAT_ABSENT], homeDir);
     assert.equal(result.code, 1);
     const refusal = refusalOf(result);
     assert.equal(refusal.code, "SEAT_ROW_MISSING");
     assert.match(refusal.error, /predates the seat store/i, "the refusal does not name the cause");
     assert.match(refusal.error, /backfill/i, "the refusal does not name the remedy");
+    assert.equal(
+      await storeExists(homeDir),
+      false,
+      "a refused close on an absent store must NOT create the file",
+    );
   });
 });
 
@@ -1401,20 +1446,64 @@ test("CL9 · close on a MALFORMED row refuses SEAT_ROW_MALFORMED; the row surviv
 // closed_at is BYTE-UNCHANGED — the standing guard that the `{...row, field}`
 // spread never drops or moves the key, one field over from D8's malformed-row trap.
 
-test("CLB1 · `set-brick` on a CLOSED seat SUCCEEDS; closed_at is byte-unchanged", async () => {
+test("CLB1 · `set-brick` on a CLOSED seat SUCCEEDS; closed_at is byte-unchanged — PRODUCT-ENTERED", async () => {
+  // 🛑 PRODUCT-ENTERED (independent TE finding F3, 2026-09-29). This row used to
+  // fixture `closed_at` directly with NO stated reason — the defect half of the
+  // fixture-disclosure rule PLAN §3.1 demands, since the shipped `acpx seats
+  // close` verb can produce this exact state. Reached here through the real
+  // verb, same pattern RN2' sets for a real seat+holder. CLB2 and CLB3 are
+  // ANCHORED to this row rather than repeating the mint+close sequence — see
+  // their own comments for the cost/control reason.
   await withRig(async (homeDir) => {
-    const closedAt = "2026-09-29T00:00:00.000Z";
-    await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A, { closed_at: closedAt }) });
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const base = ["--cwd", cwd, "--agent", MOCK_AGENT_COMMAND, "--approve-all", "--format", "json"];
 
-    const result = await runCli(["seats", "set-brick", SEAT_A, BRICK_ID], homeDir);
+    const founding = await runCli([...base, "sessions", "new", "-s", "clb1-holder"], homeDir);
+    assert.equal(founding.code, 0, founding.stderr);
+    const holderId = (JSON.parse(founding.stdout.trim()) as { acpxRecordId?: string }).acpxRecordId;
+    assert.ok(holderId, `fixture precondition — ${founding.stdout}`);
+    const seatId = (
+      JSON.parse(
+        await fs.readFile(path.join(homeDir, ".acpx", "sessions", `${holderId}.json`), "utf8"),
+      ) as { seat_id?: string }
+    ).seat_id;
+    assert.ok(seatId, "fixture precondition: the founding holder carries a seat id");
+
+    const closedHolder = await runCli(
+      [...base, "sessions", "close", "--session-id", holderId],
+      homeDir,
+    );
+    assert.equal(closedHolder.code, 0, closedHolder.stderr);
+    const closedSeat = await runCli([...base, "seats", "close", seatId], homeDir);
+    assert.equal(
+      closedSeat.code,
+      0,
+      `fixture precondition: the real close must succeed — ${closedSeat.stdout}${closedSeat.stderr}`,
+    );
+    const closedAt = (JSON.parse(closedSeat.stdout.trim()) as { closedAt?: string }).closedAt;
+    assert.ok(closedAt, "fixture precondition: the real close returned a timestamp");
+
+    const result = await runCli(["seats", "set-brick", seatId, BRICK_ID], homeDir);
     assert.equal(result.code, 0, result.output);
     const after = await readStoreJson(homeDir);
-    assert.equal(after[SEAT_A]?.brick_id, BRICK_ID);
-    assert.equal(after[SEAT_A]?.closed_at, closedAt, "close's timestamp must be byte-unchanged");
+    assert.equal(after[seatId]?.brick_id, BRICK_ID);
+    assert.equal(
+      after[seatId]?.closed_at,
+      closedAt,
+      "close's timestamp — WRITTEN BY THE REAL VERB — must be byte-unchanged",
+    );
   });
 });
 
-test("CLB2 · `rename` on a CLOSED seat SUCCEEDS; closed_at is byte-unchanged", async () => {
+test("CLB2 · `rename` on a CLOSED seat SUCCEEDS; closed_at is byte-unchanged — anchored to CLB1", async () => {
+  // ANCHORED TO CLB1, NOT product-entered separately (F3): CLB1 already proves
+  // the real `acpx seats close` produces this state; re-running that mint+close
+  // sequence here would cost a second CLI round-trip (sessions new + sessions
+  // close + seats close, ~5-8s) to re-verify a mechanism this file already
+  // verifies once, for a row whose own variable is `name`, not how closed_at got
+  // there. Same reasoning RN2' vs. the other `seatRow(...)`-based rows in this
+  // file already states for the well-formed-row class.
   await withRig(async (homeDir) => {
     const closedAt = "2026-09-29T00:00:00.000Z";
     await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A, { closed_at: closedAt, name: "old" }) });
@@ -1427,7 +1516,10 @@ test("CLB2 · `rename` on a CLOSED seat SUCCEEDS; closed_at is byte-unchanged", 
   });
 });
 
-test("CLB3 · `delete` on a CLOSED seat SUCCEEDS — the row is removed, which is what the byway sweep needs", async () => {
+test("CLB3 · `delete` on a CLOSED seat SUCCEEDS — the row is removed, which is what the byway sweep needs — anchored to CLB1", async () => {
+  // ANCHORED TO CLB1, same cost/control reason as CLB2's comment: this row's own
+  // variable is row REMOVAL, not the closing mechanism, which CLB1 already
+  // reaches through the real verb.
   await withRig(async (homeDir) => {
     const closedAt = "2026-09-29T00:00:00.000Z";
     await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A, { closed_at: closedAt }) });
@@ -1523,6 +1615,80 @@ test("H1 control · the op counter CATCHES a forbidden extra read — it is not 
     }
 
     assert.deepEqual(ops, ["readFileSync:store"], "an extra read inside the hold must be COUNTED");
+  });
+});
+
+test("AP11 (close) · the no-change path performs NO WRITE at all — mtime/inode/bytes identical, with a write-visible control", async () => {
+  // 🛑 WRITTEN (independent TE finding F6, 2026-09-29). PLAN §3.1 required this
+  // bound for `close` — "one seats.json read, at most one write, nothing else
+  // inside the hold, measured under an fs spy against the product's own mutator,
+  // as B2b's row H1 does" — and no such row existed. `close` is the FIRST verb
+  // whose `mutate` BRANCHES (`SEAT_STORE_NO_CHANGE` vs a real write), which is
+  // exactly the shape where a stray extra write hides silently.
+  //
+  // ⚠️ WHY THIS IS BLACK-BOX (file stats), NOT AN fs-SPY LIKE H1: H1 spies on
+  // `buildSeatDeletion`, an EXPORTED standalone mutator function called
+  // in-process. `close`'s `mutate` callback is inline inside the private
+  // `handleSeatsClose` — nothing to import and call directly. Reimplementing its
+  // logic here to spy on would be measuring a COPY of the product, the exact trap
+  // H1's own comment names ("a test that re-implemented the mutator would be
+  // measuring its own copy"). So this row measures the STORE FILE itself: mtime,
+  // inode and byte count all identical across a no-change close means no write
+  // reached the filesystem, which is what an accidental extra write would change.
+  await withRig(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const base = ["--cwd", cwd, "--agent", MOCK_AGENT_COMMAND, "--approve-all", "--format", "json"];
+    const storeFile = storePath(homeDir);
+
+    const founding = await runCli([...base, "sessions", "new", "-s", "ap11-holder"], homeDir);
+    assert.equal(founding.code, 0, founding.stderr);
+    const holderId = (JSON.parse(founding.stdout.trim()) as { acpxRecordId?: string }).acpxRecordId;
+    assert.ok(holderId, "fixture precondition");
+    const seatId = (
+      JSON.parse(
+        await fs.readFile(path.join(homeDir, ".acpx", "sessions", `${holderId}.json`), "utf8"),
+      ) as { seat_id?: string }
+    ).seat_id;
+    assert.ok(seatId, "fixture precondition: the founding holder carries a seat id");
+
+    const closedHolder = await runCli(
+      [...base, "sessions", "close", "--session-id", holderId],
+      homeDir,
+    );
+    assert.equal(closedHolder.code, 0, closedHolder.stderr);
+    const firstClose = await runCli([...base, "seats", "close", seatId], homeDir);
+    assert.equal(firstClose.code, 0, firstClose.stdout + firstClose.stderr);
+
+    // Wait past filesystem mtime resolution before the measurement window opens —
+    // the TE's own script validated 1.1s as sufficient on this box.
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    const before = await fs.stat(storeFile);
+
+    const secondClose = await runCli([...base, "seats", "close", seatId], homeDir);
+    assert.equal(secondClose.code, 0, "the no-change path must still be rc 0");
+
+    const after = await fs.stat(storeFile);
+    assert.equal(
+      before.mtimeMs,
+      after.mtimeMs,
+      "AP11: the no-change path WROTE the file (mtime moved)",
+    );
+    assert.equal(before.ino, after.ino, "AP11: the no-change path WROTE the file (inode moved)");
+    assert.equal(before.size, after.size, "AP11: the no-change path WROTE the file (size moved)");
+
+    // §3a-bis — THE CONTROL ARM. A "nothing was written" result is worthless from
+    // a blind instrument: prove the SAME measurement sees a write that DID happen.
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    const rename = await runCli(["seats", "rename", seatId, "ap11-control-rename"], homeDir);
+    assert.equal(rename.code, 0, rename.output);
+    const controlAfter = await fs.stat(storeFile);
+    assert.notEqual(
+      before.mtimeMs,
+      controlAfter.mtimeMs,
+      "CONTROL: a real write must move mtime — if it does not, this instrument is BLIND and the " +
+        "no-write result above proves nothing",
+    );
   });
 });
 
