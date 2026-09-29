@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { AcpxOperationalError } from "../errors.js";
 import { type LiveProcessScan, scanLiveProcesses } from "../process-population.js";
 import type { SessionRecord } from "../types.js";
 import {
@@ -191,6 +192,31 @@ export class SeatBackfillIndexUnreadableError extends Error {
         `the index on the next ordinary read, and run the backfill again.`,
     );
     this.name = "SeatBackfillIndexUnreadableError";
+  }
+}
+
+/**
+ * The SESSIONS DIRECTORY ITSELF does not exist — distinct from an absent
+ * `seats.json`, which is NORMAL and this verb creates on its first `--apply`.
+ * With no sessions directory there is nothing to scan (`listSessionRecordFiles`
+ * would otherwise fail later with a raw `ENOENT: scandir` from deep inside the
+ * run) and nothing to back-fill, so this is refused up front rather than left to
+ * surface as an unnamed filesystem error a fresh-box operator cannot act on.
+ *
+ * `AcpxOperationalError`, not a plain `Error`, so `--format json` carries a
+ * stable `data.detailCode` — the same requirement FIX 2 applied to the per-record
+ * malformed-row error, here at the top-level refusal instead.
+ */
+export class SeatBackfillSessionDirMissingError extends AcpxOperationalError {
+  constructor(readonly sessionDir: string) {
+    super(
+      `refusing to backfill: ${sessionDir} does not exist. This is not the same as an ` +
+        `absent seats.json — an absent seats.json is normal and this verb creates one. ` +
+        `There is no sessions directory here at all, so there is nothing to scan and ` +
+        `nothing to back-fill. Check that HOME / ACPX_STATE_HOME point at a real acpx ` +
+        `session store before running this verb.`,
+      { outputCode: "RUNTIME", detailCode: "SEAT_BACKFILL_SESSION_DIR_MISSING", origin: "cli" },
+    );
   }
 }
 
@@ -424,14 +450,19 @@ async function scanRecords(
 /**
  * PREFLIGHT — every refusal, before the first byte is written.
  *
- * Returns the index entries keyed by file. Throws `SeatStoreUnwritableError` for a
- * malformed or unreadable `seats.json` (the store's own error, carrying its own
- * `fileState` and quarantine remedy — not a generic throw), and
- * `SeatBackfillIndexUnreadableError` for an index that exists and does not parse.
- * An ABSENT store is not a refusal: creating it is exactly what the first write on a
- * fresh box is for.
+ * Returns the index entries keyed by file. Throws `SeatBackfillSessionDirMissingError`
+ * for a sessions DIRECTORY that does not exist at all (distinct from an absent
+ * `seats.json`, which this verb creates — see that error's own doc comment),
+ * `SeatStoreUnwritableError` for a malformed or unreadable `seats.json` (the store's
+ * own error, carrying its own `fileState` and quarantine remedy — not a generic
+ * throw), and `SeatBackfillIndexUnreadableError` for an index that exists and does
+ * not parse. An ABSENT store is not a refusal: creating it is exactly what the first
+ * write on a fresh box is for.
  */
 async function preflight(sessionDir: string): Promise<Map<string, SessionIndexEntry>> {
+  if (!(await pathExists(sessionDir))) {
+    throw new SeatBackfillSessionDirMissingError(sessionDir);
+  }
   const store = await readSeatStore(sessionDir);
   if (store.fileState === "malformed" || store.fileState === "unreadable") {
     throw new SeatStoreUnwritableError(seatStorePath(sessionDir), store.fileState);

@@ -1012,6 +1012,59 @@ test("R4: an UNREADABLE store is refused, and it is a DIFFERENT answer from abse
   });
 });
 
+test("R5: an ABSENT sessions directory is a NAMED refusal with a code, not a raw ENOENT", async () => {
+  await withTempHome(async (homeDir) => {
+    // Deliberately NO `seed()` — `withTempHome` only `mkdtemp`s an empty HOME, so
+    // `.acpx/sessions` genuinely does not exist here. Without this control the row
+    // could pass against a rig that happens to have the directory anyway.
+    const dir = sessionsDir(homeDir);
+    assert.equal(
+      await fs
+        .access(dir)
+        .then(() => true)
+        .catch(() => false),
+      false,
+      "rig is wrong: the sessions directory exists",
+    );
+
+    const result = await runCli(["seats", "backfill", "--apply", "--format", "json"], homeDir);
+    assert.notEqual(result.code, 0, "an absent sessions directory must not exit 0");
+
+    // Parse the ENVELOPE, not the rc and not a substring of stdout — a raw ENOENT
+    // trace would ALSO exit non-zero, so the code is the only thing that tells the
+    // two apart.
+    const envelope = JSON.parse(result.stdout.trim()) as {
+      error: { message: string; data?: { detailCode?: string } };
+    };
+    assert.equal(
+      envelope.error.data?.detailCode,
+      "SEAT_BACKFILL_SESSION_DIR_MISSING",
+      "the refusal must carry a stable machine-readable code, not a raw filesystem error",
+    );
+    assert.doesNotMatch(
+      envelope.error.message,
+      /ENOENT|scandir/,
+      "a NAMED refusal must replace the raw scandir trace, not sit beside it",
+    );
+    assert.match(
+      envelope.error.message,
+      /does not exist/,
+      "the message must say what is actually wrong",
+    );
+
+    // NOTHING WRITTEN: the directory this verb was pointed at must not spring into
+    // existence as a side effect of refusing to run against it.
+    assert.equal(
+      await fs
+        .access(dir)
+        .then(() => true)
+        .catch(() => false),
+      false,
+      "the refusal created the sessions directory",
+    );
+  });
+});
+
 // ─── L17 — RESUMABILITY: the row the operator actually needs ─────────────────
 
 /**
