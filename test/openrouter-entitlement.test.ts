@@ -84,6 +84,8 @@ import {
  *       → "the READ path narrows"
  *   drop `policyReason` anywhere between the throw and the wire
  *       → "policyReason reaches the SERIALIZED output"
+ *   serve a stale set from the read path WITHOUT labelling it
+ *       → "the Tier 3 annotation LABELS a stale set"
  */
 
 const FIXTURE_PATH = path.resolve(process.cwd(), "test/fixtures/openrouter-models-2026-09-04.json");
@@ -797,6 +799,55 @@ test("`offline` never touches the network, whatever the cache says", async () =>
     assert.equal(calls, 0);
     assert.equal(cold.allowed, null);
   });
+});
+
+test("the Tier 3 annotation LABELS a stale set, and says nothing about staleness when fresh", async () => {
+  // 🛑 THE COMMENT ON `openRouterNotEntitledAnnotation` ASSERTS THIS CLAUSE, SO IT
+  // NEEDS A CASE. A comment has no adversary — no typecheck, no test, no reviewer
+  // runs it — and a false one is what a future reader trusts INSTEAD of reading the
+  // code. It matters because the two readers treat staleness DIFFERENTLY on purpose:
+  // the read path serves a stale set and must say so (it can report), while the sync
+  // spawn reader fails open (it cannot). Drop the label and the read path silently
+  // enforces an hour-old set — enforcement the operator cannot see.
+  const { openRouterNotEntitledAnnotation } = await import("../src/models/claude-family.js");
+  const fresh = openRouterNotEntitledAnnotation(known());
+  const stale = openRouterNotEntitledAnnotation({ ...known(), stale: true });
+
+  assert.match(stale, /out-of-date cache/);
+  assert.match(stale, /acpx models --refresh/, "a stale label must carry a remedy that runs");
+  // THE NEGATIVE: a fresh set must NOT claim staleness, or the label means nothing.
+  assert.equal(fresh.includes("out-of-date cache"), false);
+  assert.notEqual(fresh, stale, "the two states must be distinguishable");
+  // Both still name the allowed set — the label is additive, never a replacement.
+  for (const slug of KEY_ALLOWS_SLUGS) {
+    assert.ok(fresh.includes(slug), slug);
+    assert.ok(stale.includes(slug), slug);
+  }
+
+  // …and it reaches the CATALOGUE ROW, not just the formatter: this is the string an
+  // agent and the acpx-ui picker actually read.
+  const rows = [{ id: "zzz-vendor/not-allowed-stale", supported_parameters: ["tools"] }];
+  const capabilities = [
+    {
+      id: "claude",
+      acceptsArbitraryModelIds: true,
+      arbitraryModelSupport: "via-shim" as const,
+      idForm: "source-prefixed" as const,
+      depthFusedIntoId: false,
+    },
+  ];
+  const staleRow = buildCatalogue(rows, META, {
+    entitlement: { ...known(), stale: true },
+    nativeModels: [],
+    capabilities,
+  }).models[0];
+  assert.match(staleRow?.availability.claude?.message ?? "", /out-of-date cache/);
+  const freshRow = buildCatalogue(rows, META, {
+    entitlement: known(),
+    nativeModels: [],
+    capabilities,
+  }).models[0];
+  assert.equal((freshRow?.availability.claude?.message ?? "").includes("out-of-date cache"), false);
 });
 
 test("entitlementModelSlugs drops a dated id whose undated form is also allowed", () => {
