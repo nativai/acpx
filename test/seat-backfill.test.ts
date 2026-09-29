@@ -1251,8 +1251,17 @@ test("L16b: `seats` is registered exactly once, and every subcommand it lists AN
     // the registration it checks.
     //
     // ⚠️ THIS ALONE CANNOT CATCH "three of four registered" — it discovers whatever
-    // is there and is happy. The literal four-name assertion is L16a, and it lands
-    // with the B2b union; do not read this row as covering that.
+    // is there and is happy. The literal five-name assertion is L16a, and it lands
+    // with the B2b/B10/B2c union; do not read this row as covering that.
+    //
+    // 🔑 THE FLOOR BELOW IS DERIVED FROM `SEATS_SUBCOMMANDS`, AND THE MIXTURE IS
+    // DELIBERATE — do not "fix" it back to a literal. What this row DISCOVERS stays
+    // uncoupled from any list (that is the point of a discovering check), but its
+    // FLOOR must track the true verb count or it cannot detect a loss: a floor below
+    // the real number passes while a verb is missing. A hardcoded number is a second
+    // count to maintain and rots the day a sixth verb lands; deriving it means adding
+    // a verb to L16a's list raises this floor automatically and the two can never
+    // drift apart.
     // ⚠️ THE NAME IS THE FIRST TOKEN ON A TWO-SPACE-INDENTED LINE, AND NOTHING MAY BE
     // ASSUMED TO FOLLOW IT. An earlier version required two more spaces and a
     // non-space after the name — which is the layout for a bare verb and NOT the
@@ -1267,8 +1276,9 @@ test("L16b: `seats` is registered exactly once, and every subcommand it lists AN
       .filter((name) => name !== "help");
     assert.ok(listed.includes("backfill"), `\`backfill\` is not listed: ${listed.join(",")}`);
     assert.ok(
-      listed.length >= 4,
-      `expected the whole union to be listed, found: ${listed.join(",")}`,
+      listed.length >= SEATS_SUBCOMMANDS.length,
+      `expected at least ${SEATS_SUBCOMMANDS.length} verbs (the whole union) to be ` +
+        `listed, found ${listed.length}: ${listed.join(",")}`,
     );
     for (const name of listed) {
       const sub = await runCli(["seats", name, "--help"], homeDir);
@@ -1281,17 +1291,24 @@ test("L16b: `seats` is registered exactly once, and every subcommand it lists AN
   });
 });
 
-// ─── L16a — ALL FOUR subcommands answer on the shipped binary ────────────────
+// ─── L16a — ALL FIVE subcommands answer on the shipped binary ────────────────
 
 /**
  * 🛑 THE ROW THAT CATCHES THE UNION'S ONLY SILENT DEFECT.
  *
- * B2b (`set-brick`, `rename`, `delete`) and B10 (`backfill`) were cut from the same
- * commit and each created `src/cli/seats-command.ts` exporting the SAME symbol
+ * B2b (`set-brick`, `rename`, `delete`), B10 (`backfill`) and B2c (`close`) each
+ * created `src/cli/seats-command.ts` exporting the SAME symbol
  * `registerSeatsCommand`. Resolving that add/add by KEEPING ONE SIDE yields a binary
- * that compiles, starts and answers — **with three of the four verbs missing**, and
+ * that compiles, starts and answers — **with the other side's verbs missing**, and
  * no type error anywhere. Neither lane's own rows can catch that, because each lane
  * only ever asserted its own verbs.
+ *
+ * 🔑 **THIS LIST IS THE ONLY ROW THAT CAN FAIL BY THE ABSENCE OF A NAMED VERB**, and
+ * that is why `close` was added to it in the B2c merge rather than getting a parallel
+ * row of its own. L16b below DISCOVERS what the binary advertises, so a verb that
+ * VANISHED is a verb it never sees; only a name written down here is missed when it
+ * stops being registered. A second list would be exactly as incomplete as the
+ * registration it checks.
  *
  * The other two collision points are loud and were MEASURED rather than assumed:
  * a duplicated registrar call makes commander 14 throw at CLI setup, and a duplicated
@@ -1305,9 +1322,9 @@ test("L16b: `seats` is registered exactly once, and every subcommand it lists AN
  * `SEAT_ROW_MALFORMED` is partial, committing the rest). A row here that poked at
  * either would couple this block to contracts it does not own.
  */
-const SEATS_SUBCOMMANDS = ["set-brick", "rename", "delete", "backfill"] as const;
+const SEATS_SUBCOMMANDS = ["set-brick", "rename", "delete", "backfill", "close"] as const;
 
-test("L16a: `acpx seats` registers ALL FOUR subcommands, and each ANSWERS", async () => {
+test("L16a: `acpx seats` registers ALL FIVE subcommands, and each ANSWERS", async () => {
   await withTempHome(async (homeDir) => {
     await seed(homeDir, [makeRecord({ acpxRecordId: "l16a" })]);
 

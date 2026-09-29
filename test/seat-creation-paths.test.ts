@@ -383,6 +383,76 @@ test("AP15 · a freshly created session CAN actually be succeeded — the paired
   });
 });
 
+test("B2c product-entered · a real `acpx seats close` refuses `sessions new --seat` (R4), with the open-seat pair", async () => {
+  // PRODUCT-ENTERED, per B2c PLAN.md §3 row R4. Sequence: mint a founding holder
+  // (open seat), close IT, close the SEAT for real, then attempt to join it —
+  // assert the refusal, and pair it with the SAME seat accepting a join BEFORE it
+  // was closed (the AP15 test above already proves that; this row's own pair is the
+  // founding holder's creation into the FRESH, still-open seat one line earlier in
+  // this same test, which is exactly the create-into-seat path R4 is about).
+  //
+  // 🔑 R4's refusal is coded `SEAT_CLOSED` — same code `sessions activate` uses for
+  // the identical fact (overrule, L0, 2026-09-29: callers branch on the CODE, never
+  // on prose). The COMMAND under test (`sessions new --seat`, not `sessions
+  // activate`) is what discriminates this row from the seat-activate.test.ts row
+  // asserting the same code.
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const base = ["--cwd", cwd, "--agent", MOCK_AGENT_COMMAND, "--approve-all", "--format", "json"];
+
+    const founding = await runCli([...base, "sessions", "new", "-s", "r4-founder"], homeDir);
+    assert.equal(founding.code, 0, founding.stderr);
+    const founderId = String(
+      (JSON.parse(founding.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const seatId = String((await readRecordJson(homeDir, founderId)).seat_id);
+
+    // AP15 pair, restated for THIS seat: while still open, a join succeeds.
+    const joinedWhileOpen = await runCli(
+      [...base, "sessions", "new", "-s", "r4-open-pair", "--seat", seatId],
+      homeDir,
+    );
+    assert.equal(
+      joinedWhileOpen.code,
+      0,
+      `AP15 pair: --seat refused a seat that is NOT closed — ${joinedWhileOpen.stderr}`,
+    );
+
+    // `--session-id`, NOT the positional `[name]` arg — that resolves by SESSION
+    // NAME, not by record id (`session-selector.ts`: only `--session-id`/
+    // `--session-url` reach `resolveExplicitSessionRecord`).
+    const closedHolder = await runCli(
+      [...base, "sessions", "close", "--session-id", founderId],
+      homeDir,
+    );
+    assert.equal(closedHolder.code, 0, closedHolder.stderr);
+
+    const closedSeat = await runCli([...base, "seats", "close", seatId], homeDir);
+    assert.equal(
+      closedSeat.code,
+      0,
+      `fixture precondition: acpx seats close must succeed once the active holder is closed — ${closedSeat.stdout}${closedSeat.stderr}`,
+    );
+    const closedAt = (JSON.parse(closedSeat.stdout.trim()) as { closedAt?: string }).closedAt;
+    assert.ok(closedAt, "fixture precondition: the real close returned a timestamp");
+
+    const refused = await runCli(
+      [...base, "sessions", "new", "-s", "r4-refused", "--seat", seatId],
+      homeDir,
+    );
+    assert.notEqual(refused.code, 0, "a seat closed by the REAL verb still accepted a join");
+    const said = `${refused.stdout}${refused.stderr}`;
+    assert.match(said, /SEAT_CLOSED/, "the refusal must carry the SEAT_CLOSED code");
+    // 🛑 F4 (independent TE finding, 2026-09-29): AC16's `Fails if:` clause is
+    // explicit — "refuses either without naming the seat and its closed_at". The
+    // product does this correctly, but a message reword could drop it silently
+    // and greenly with no assertion here to catch it.
+    assert.match(said, new RegExp(seatId), "the refusal must name the SEAT");
+    assert.match(said, new RegExp(closedAt), "the refusal must name its closed_at TIMESTAMP");
+  });
+});
+
 test("item 8 · a CORRUPT store still creates a USABLE session, keeps the seat_id, and WARNS", async () => {
   // 🛑 THE PAIRED ROW IS THE HEALTHY-STORE CASE IN AP15 ABOVE. Without both halves this
   // row cannot tell "fail-open working" from "the mint was silently skipped" — which is

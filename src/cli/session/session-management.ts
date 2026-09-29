@@ -12,6 +12,7 @@ import {
 } from "../../acp/harness-capabilities.js";
 import { withInterrupt, withTimeout } from "../../async-control.js";
 import { BrickOutbox } from "../../brick-outbox.js";
+import { AcpxOperationalError } from "../../errors.js";
 import { bindDefaultAccountToSessionOptionsAsync } from "../../runtime/engine/default-account-binding.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
 import { persistSessionOptions } from "../../runtime/engine/session-options.js";
@@ -258,10 +259,19 @@ async function refuseUnjoinableSeat(joinSeatId: string | undefined): Promise<voi
     );
   }
   if (seat.closedAt !== null && seat.closedAt !== undefined) {
-    throw new Error(
-      `seat ${JSON.stringify(joinSeatId)} was closed at ${seat.closedAt} — the office is ` +
+    // `detailCode: "SEAT_CLOSED"` — the SAME code `seat-activate.ts`'s
+    // `SeatActivationRefusalError` uses for the identical fact ("this seat is
+    // closed"). Overrule (L0, 2026-09-29): a code-less refusal forces callers to
+    // match on PROSE, and this programme has twice ruled that callers branch on
+    // CODES. `SEAT_CLOSED` is right here because the condition IS the same fact
+    // `seat-activate.ts` already reports under it — and the COMMAND, not the
+    // message, is what says which entry point refused: this is create-into-seat,
+    // that is activation, which is F4's discrimination requirement.
+    throw new AcpxOperationalError(
+      `seat ${JSON.stringify(joinSeatId)} was closed at ${seat.closedAt} — the seat is ` +
         `abolished and takes no further holders. This is not the same as the seat being ` +
         `vacant: a vacant seat (no active holder) still accepts one.`,
+      { outputCode: "RUNTIME", detailCode: "SEAT_CLOSED", origin: "runtime" },
     );
   }
 }

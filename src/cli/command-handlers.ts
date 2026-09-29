@@ -917,7 +917,7 @@ function buildSessionStartOptions(params: {
     // and a wrong seat is a wrong identity that every later block inherits with no
     // signature to detect it. The two fields on these adjacent lines are easy to
     // conflate and mean opposite things — `parentSeatId` records WHO SPAWNED ME,
-    // `seatId` records WHICH OFFICE I HOLD.
+    // `seatId` records WHICH SEAT I HOLD.
     seatId: params.flags.seat,
     metadata: withInheritedBrick(
       applyBrickFlag(params.flags.metadata, params.resolvedBrick),
