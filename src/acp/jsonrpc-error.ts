@@ -53,6 +53,19 @@ export type BuildJsonRpcErrorParams = {
   effectiveAccount?: EffectiveAccountMetadata;
   automationCapacityReserved?: AutomationCapacityReservedDetail;
   codexSubscriptionCap?: CodexSubscriptionCapDetail;
+  /**
+   * WHICH POLICY refused, as a stable token identical across the tiers that enforce
+   * one policy (`AcpxErrorOptions.policyReason`).
+   *
+   * 🛑 **THIS FIELD WAS MISSING AND THAT MADE THE WHOLE TOKEN INERT.** `policyReason`
+   * was correct on the thrown error and **absent from every byte of output**, so the
+   * only discriminator a real consumer had — an agent reading `--format json`,
+   * acpx-ui, any tool — was `detailCode`, which DIFFERS BY TIER for one policy. That
+   * is precisely what the token was introduced to fix. **A discriminator that does
+   * not cross this boundary does not exist**, so the committed case asserts it on the
+   * SERIALIZED output; asserting it on the in-process error is what missed it.
+   */
+  policyReason?: string;
 };
 
 function hasValidAcpError(
@@ -70,6 +83,10 @@ function buildFallbackData(params: BuildJsonRpcErrorParams): Record<string, unkn
   const data: Record<string, unknown> = {
     acpxCode: params.outputCode,
     detailCode: params.detailCode,
+    // ⚠️ `policyReason` sits beside `detailCode` deliberately: the pair is the whole
+    // point. `detailCode` says WHICH GATE fired, `policyReason` says WHICH POLICY —
+    // and only the second is stable across the tiers that enforce one policy.
+    policyReason: params.policyReason,
     origin: params.origin,
     retryable: params.retryable,
     timestamp: params.timestamp,

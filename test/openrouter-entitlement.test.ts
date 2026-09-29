@@ -74,6 +74,18 @@ import {
 const FIXTURE_PATH = path.resolve(process.cwd(), "test/fixtures/openrouter-models-2026-09-04.json");
 const META = { fetchedAt: "2026-09-04T00:10:56.992Z", stale: false, error: null };
 
+/**
+ * The shipped entitlement set in its SETTLED state (shas in step, nothing narrowed).
+ * Injected rather than resolved so no assertion depends on whether THIS box's key
+ * records an `entitlementSha` — and stated explicitly because the refusal wording is
+ * now a FUNCTION of the state (brick daed4261 F1), so a test that left `narrowed`
+ * ambiguous would assert against a message whose shape it never pinned.
+ */
+const SETTLED_ENTITLEMENT: OpenRouterEntitlementResolution = {
+  entries: OPENROUTER_ENTITLEMENT,
+  narrowed: false,
+};
+
 /** Real production agent commands, sampled from this box's live session store. */
 const REAL_CLAUDE_COMMAND = "node /opt/claude-agent-acp/dist/index.js";
 const REAL_PI_COMMAND = "node /opt/pi-acp/dist/index.js";
@@ -528,8 +540,12 @@ test("both skew wordings name the state, the consequence and the remedy — and 
   assert.match(unrecorded, /full entitlement/);
   // It must NOT claim the provider enforces anything, because pre-cutover it does
   // not — the same rule that had the false key-level claim cut from the
-  // Claude-family message.
-  assert.match(unrecorded, /nothing refuses it at the provider yet/);
+  // Claude-family message. ⚠️ AND IT MUST NOT CLAIM THE CONVERSE EITHER: the earlier
+  // wording said "nothing refuses it at the provider yet", which is false when a key
+  // IS restricted with no sha recorded — false in the reassuring direction. The
+  // careful form states only what acpx can check. Pinned in full by the dedicated
+  // row below ("claims nothing about the PROVIDER that acpx cannot know").
+  assert.match(unrecorded, /cannot tell from here whether this key is already restricted/);
   for (const text of [mismatch, unrecorded]) {
     assert.equal(/sk-[A-Za-z0-9]/.test(text), false, "a skew line must never carry a credential");
   }
@@ -597,7 +613,7 @@ test("entitlementSha survives parsing AND the status projection", async () => {
 test("the READ path narrows: a non-entitled row is unavailable for claude and pi", () => {
   const snapshot = JSON.parse(fs.readFileSync(FIXTURE_PATH, "utf8")) as OpenRouterSnapshot;
   const catalogue = buildCatalogue(snapshot.models, META, {
-    entitlement: OPENROUTER_ENTITLEMENT,
+    entitlement: SETTLED_ENTITLEMENT,
   });
   const openRouterRows = catalogue.models.filter((model) => model.source === "openrouter");
   assert.ok(openRouterRows.length > 50, "the fixture must actually carry OpenRouter rows");
@@ -634,7 +650,7 @@ test("the READ path narrows: a non-entitled row is unavailable for claude and pi
 test("the READ path leaves codex's own message alone, and Claude-family keeps its own reason", async () => {
   const { CLAUDE_FAMILY_OPENROUTER_REASON } = await import("../src/models/claude-family.js");
   const snapshot = JSON.parse(fs.readFileSync(FIXTURE_PATH, "utf8")) as OpenRouterSnapshot;
-  const catalogue = buildCatalogue(snapshot.models, META, { entitlement: OPENROUTER_ENTITLEMENT });
+  const catalogue = buildCatalogue(snapshot.models, META, { entitlement: SETTLED_ENTITLEMENT });
 
   const claudeRow = catalogue.models.find(
     (model) => model.source === "openrouter" && model.id.startsWith("anthropic/claude"),
@@ -660,7 +676,7 @@ test("`acpx models list --agent` DROPS a non-entitled row, and `--all` keeps it 
   // so an agent asking "why can I not use this?" always gets an answer.
   const { bandModels } = await import("../src/models/matcher.js");
   const snapshot = JSON.parse(fs.readFileSync(FIXTURE_PATH, "utf8")) as OpenRouterSnapshot;
-  const catalogue = buildCatalogue(snapshot.models, META, { entitlement: OPENROUTER_ENTITLEMENT });
+  const catalogue = buildCatalogue(snapshot.models, META, { entitlement: SETTLED_ENTITLEMENT });
 
   const nonEntitled = catalogue.models.find(
     (model) => model.availability.claude?.reason === OPENROUTER_NOT_ENTITLED_REASON,
@@ -710,7 +726,7 @@ test("Tier 1 REFUSES on entitlement too — the read path is not declaration-onl
     { id: entitled.slug, name: "entitled", supported_parameters: ["tools"] },
     { id: "zzz-vendor/not-entitled-1", name: "outsider", supported_parameters: ["tools"] },
   ];
-  const catalogue = buildCatalogue(rows, META, { entitlement: OPENROUTER_ENTITLEMENT });
+  const catalogue = buildCatalogue(rows, META, { entitlement: SETTLED_ENTITLEMENT });
 
   // THE NEGATIVE: the non-entitled row is refused at Tier 1, by the catalogue's reason.
   let thrown: unknown;
@@ -756,7 +772,7 @@ test("the entitlement reason token is IDENTICAL at both tiers, and machine-reada
     { id: entitled.slug, name: "entitled", supported_parameters: ["tools"] },
     { id: "zzz-vendor/not-entitled-2", name: "outsider", supported_parameters: ["tools"] },
   ];
-  const catalogue = buildCatalogue(rows, META, { entitlement: OPENROUTER_ENTITLEMENT });
+  const catalogue = buildCatalogue(rows, META, { entitlement: SETTLED_ENTITLEMENT });
 
   // TIER 1 — the `--model` gate.
   let tier1: unknown;
@@ -798,4 +814,230 @@ test("the entitlement reason token is IDENTICAL at both tiers, and machine-reada
   // NEGATIVE: the two policies must be DISTINGUISHABLE by the token, or it answers
   // "some policy refused" rather than "which one".
   assert.notEqual(claude.policyReason, OPENROUTER_NOT_ENTITLED_REASON);
+});
+
+test("F3 — policyReason reaches the SERIALIZED output, not just the thrown error", async () => {
+  // 🛑 THE ASSERTION THAT WOULD HAVE CAUGHT THE MISS, AND WHY IT IS ON BYTES. The
+  // token was correct on the thrown error and DROPPED AT SERIALIZATION —
+  // `BuildJsonRpcErrorParams` had no such field — so ZERO bytes of output carried it
+  // while every in-process check passed. For a real consumer (an agent reading
+  // `--format json`, acpx-ui, any tool) the only discriminator was `detailCode`,
+  // which DIFFERS BY TIER: exactly the problem the token was added to solve.
+  // **A discriminator that never crosses the process boundary does not exist.**
+  const { normalizeOutputError } = await import("../src/acp/error-normalization.js");
+  const { buildJsonRpcErrorResponse } = await import("../src/acp/jsonrpc-error.js");
+  const { ModelSlugError, validateModelSelection } =
+    await import("../src/models/model-slug-validation.js");
+
+  const onTheWire = (error: unknown) => {
+    const normalized = normalizeOutputError(error, { origin: "cli" });
+    const response = buildJsonRpcErrorResponse({
+      outputCode: normalized.code,
+      detailCode: normalized.detailCode,
+      origin: normalized.origin,
+      message: normalized.message,
+      policyReason: normalized.policyReason,
+    });
+    // Round-trip through JSON: the bytes are the subject, not the object.
+    return JSON.parse(JSON.stringify(response)) as {
+      error: { data?: { policyReason?: string; detailCode?: string } };
+    };
+  };
+
+  // P0 spawn guard.
+  const p0 = captureThrow(() =>
+    assertModelPolicy(REAL_CLAUDE_COMMAND, "zzz-vendor/not-entitled-3", {
+      entitlement: settled(),
+    }),
+  );
+  const p0Wire = onTheWire(p0);
+  assert.equal(p0Wire.error.data?.policyReason, OPENROUTER_NOT_ENTITLED_REASON);
+  assert.equal(p0Wire.error.data?.detailCode, "OPENROUTER_MODEL_NOT_ENTITLED");
+
+  // Tier 1 `--model` gate — the tier production actually reaches.
+  const rows = [{ id: "zzz-vendor/not-entitled-3", supported_parameters: ["tools"] }];
+  const catalogue = buildCatalogue(rows, META, { entitlement: SETTLED_ENTITLEMENT });
+  let tier1: unknown;
+  try {
+    validateModelSelection(catalogue, { model: "zzz-vendor/not-entitled-3", agentName: "claude" });
+  } catch (error) {
+    tier1 = error;
+  }
+  assert.ok(tier1 instanceof ModelSlugError);
+  const tier1Wire = onTheWire(tier1);
+  assert.equal(tier1Wire.error.data?.policyReason, OPENROUTER_NOT_ENTITLED_REASON);
+  assert.equal(tier1Wire.error.data?.detailCode, "MODEL_NOT_AVAILABLE_FOR_AGENT");
+
+  // THE PROPERTY, on the wire: tokens AGREE where detail codes DIFFER.
+  assert.equal(tier1Wire.error.data?.policyReason, p0Wire.error.data?.policyReason);
+  assert.notEqual(tier1Wire.error.data?.detailCode, p0Wire.error.data?.detailCode);
+
+  // NEGATIVE CONTROL: an error carrying NO policy token must not gain one, or the
+  // assertions above would pass on a serializer that hardcoded the field.
+  const plain = onTheWire(new ModelSlugError("[acpx] nope", "MODEL_SLUG_UNKNOWN"));
+  assert.equal(plain.error.data?.policyReason, undefined);
+  assert.equal(plain.error.data?.detailCode, "MODEL_SLUG_UNKNOWN");
+});
+
+test("F1 — Tier 1's refusal is STATE-AWARE and never lists the model it is refusing", async () => {
+  // 🛑 THE DEFECT: the annotation was a module-level constant enumerating the FULL
+  // entitlement set, so while narrowed, asking for `qwen/qwen3.8-flash` was refused by
+  // a message that listed `qwen/qwen3.8-flash` as choosable. The agent had no
+  // available action and the obvious next move is to retry what just failed. The tell
+  // to encode: the Tier 1 message was BYTE-IDENTICAL across all three sha states.
+  const { ModelSlugError, validateModelSelection } =
+    await import("../src/models/model-slug-validation.js");
+  const nonGreen = OPENROUTER_ENTITLEMENT.filter((entry) => entry.greenListed !== true);
+  assert.ok(nonGreen.length > 0, "the set must carry a non-green row for this to mean anything");
+  const subject = nonGreen[0];
+  assert.ok(subject);
+
+  const refusalFor = (entitlement: OpenRouterEntitlementResolution): string => {
+    const rows = OPENROUTER_ENTITLEMENT.map((entry) => ({
+      id: entry.slug,
+      supported_parameters: ["tools"],
+    }));
+    const catalogue = buildCatalogue(rows, META, { entitlement });
+    try {
+      validateModelSelection(catalogue, { model: subject.slug, agentName: "claude" });
+    } catch (error) {
+      assert.ok(error instanceof ModelSlugError);
+      return error.message;
+    }
+    return "";
+  };
+
+  // SETTLED: the row is entitled, so it is NOT refused at all.
+  assert.equal(refusalFor(SETTLED_ENTITLEMENT), "", `${subject.slug} is entitled when settled`);
+
+  // NARROWED: it IS refused — and the refusal must not name it.
+  const narrowedMessage = refusalFor(narrowed());
+  assert.notEqual(narrowedMessage, "", "a non-green row must be refused while narrowed");
+  // ⚠️ THE SUBJECT IS THE REMEDY LIST, NOT THE WHOLE STRING. The refusal legitimately
+  // ECHOES the requested slug back ("--model \"x\" is not available…"), which is good
+  // practice and must survive. The defect was the slug appearing in the CHOOSABLE SET
+  // — so the check is on the annotation the catalogue attached, which is the part that
+  // enumerates the remedy. Asserting on the whole message would forbid the echo.
+  const annotationOf = (entitlement: OpenRouterEntitlementResolution): string => {
+    const rows = OPENROUTER_ENTITLEMENT.map((entry) => ({
+      id: entry.slug,
+      supported_parameters: ["tools"],
+    }));
+    const catalogue = buildCatalogue(rows, META, { entitlement });
+    const row = catalogue.models.find((model) => model.id === subject.slug);
+    return row?.availability.claude?.message ?? "";
+  };
+  const narrowedAnnotation = annotationOf(narrowed());
+  assert.notEqual(narrowedAnnotation, "", "the narrowed row must carry an annotation");
+  // No non-green slug may appear in the remedy list — above all the refused one.
+  for (const entry of nonGreen) {
+    assert.equal(
+      narrowedAnnotation.includes(entry.slug),
+      false,
+      `narrowed remedy must not offer non-green ${entry.slug}`,
+    );
+  }
+  // The echo IS still there, and that is deliberate: the agent must see what it asked
+  // for. This is the control that stops the check above being satisfied by a refusal
+  // that names nothing at all.
+  assert.ok(
+    narrowedMessage.includes(subject.slug),
+    "the refusal must still echo the requested model back to the caller",
+  );
+  // The green ones MUST appear — otherwise "names nothing" would pass this.
+  for (const entry of OPENROUTER_GREEN_LIST) {
+    assert.ok(
+      narrowedAnnotation.includes(entry.slug),
+      `narrowed remedy must offer green ${entry.slug}`,
+    );
+  }
+  // And it carries the skew explanation ON THE REFUSAL PATH, which previously existed
+  // only on the success-path warning.
+  assert.match(narrowedMessage, /NARROWED/);
+  assert.match(narrowedMessage, /not in step/);
+  // F2 in the same breath: the remedy must name a command that RUNS.
+  assert.match(narrowedMessage, /pnpm run openrouter:entitlement/);
+
+  // THE BYTE-IDENTICAL TELL, encoded: the messages must DIFFER by state.
+  const outsider = (entitlement: OpenRouterEntitlementResolution): string => {
+    const rows = [{ id: "zzz-vendor/outsider-f1", supported_parameters: ["tools"] }];
+    const catalogue = buildCatalogue(rows, META, { entitlement });
+    try {
+      validateModelSelection(catalogue, { model: "zzz-vendor/outsider-f1", agentName: "claude" });
+    } catch (error) {
+      assert.ok(error instanceof ModelSlugError);
+      return error.message;
+    }
+    return "";
+  };
+  const settledOutsider = outsider(SETTLED_ENTITLEMENT);
+  const narrowedOutsider = outsider(narrowed());
+  assert.notEqual(settledOutsider, "");
+  assert.notEqual(narrowedOutsider, "");
+  assert.notEqual(
+    settledOutsider,
+    narrowedOutsider,
+    "the Tier 1 refusal is byte-identical across sha states — it is state-blind again",
+  );
+  // The settled one names the full set; the narrowed one does not.
+  assert.ok(settledOutsider.includes(subject.slug));
+  assert.equal(narrowedOutsider.includes(subject.slug), false);
+});
+
+test("F2 — every operator remedy names a command that actually runs", async () => {
+  // The skew line reaches an operator EXACTLY when the two enforcement layers have
+  // diverged: the one moment they need a runnable command, not a path to debug. The
+  // old text named `scripts/print-openrouter-entitlement.mjs`, which does not exist.
+  const mismatch = formatOpenRouterEntitlementSkew({
+    kind: "mismatch",
+    name: "openrouter",
+    codeSha: OPENROUTER_ENTITLEMENT_SHA,
+    entrySha: "deadbeef".repeat(8),
+  });
+  const unrecorded = formatOpenRouterEntitlementSkew({
+    kind: "unrecorded",
+    name: "openrouter",
+    codeSha: OPENROUTER_ENTITLEMENT_SHA,
+  });
+
+  assert.match(mismatch, /pnpm run openrouter:entitlement/);
+  // NEGATIVE: the non-existent module path must appear in NEITHER wording, and the
+  // `.mjs` spelling is the specific thing an operator pasted and got "Cannot find
+  // module" for.
+  for (const text of [mismatch, unrecorded]) {
+    assert.equal(text.includes(".mjs"), false, "a remedy must not name a file that does not exist");
+  }
+
+  // The script the remedy names must be the one that exists, and be declared as a
+  // package script — checked structurally, not by trusting the string.
+  const fsMod = await import("node:fs");
+  const pkg = JSON.parse(
+    fsMod.readFileSync(path.resolve(process.cwd(), "package.json"), "utf8"),
+  ) as { scripts?: Record<string, string> };
+  const script = pkg.scripts?.["openrouter:entitlement"];
+  assert.ok(script, "the remedy names `pnpm run openrouter:entitlement` — it must be declared");
+  const target = script.replace(/^tsx\s+/, "").trim();
+  assert.ok(
+    fsMod.existsSync(path.resolve(process.cwd(), target)),
+    `the declared script target ${target} must exist on disk`,
+  );
+});
+
+test("the unrecorded note claims nothing about the PROVIDER that acpx cannot know", () => {
+  // The residual is reachable in one step: restrict the key and omit entitlementSha,
+  // and acpx uses the full set while the key refuses. The old wording asserted
+  // "nothing refuses it at the provider yet" — a claim about the KEY, false in that
+  // state, and false in the REASSURING direction. Say what acpx knows instead.
+  const unrecorded = formatOpenRouterEntitlementSkew({
+    kind: "unrecorded",
+    name: "openrouter",
+    codeSha: OPENROUTER_ENTITLEMENT_SHA,
+  });
+  assert.equal(
+    unrecorded.includes("nothing refuses it at the provider"),
+    false,
+    "the note must not assert a provider fact this module cannot check",
+  );
+  assert.match(unrecorded, /cannot tell from here whether this key is already restricted/);
+  assert.match(unrecorded, /records no entitlementSha/);
 });

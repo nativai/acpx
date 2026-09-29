@@ -173,7 +173,7 @@ export const OPENROUTER_GREEN_LIST: readonly OpenRouterEntitlementEntry[] =
 
 /**
  * Both id forms of every entry, deduped and sorted — the flat list the key's
- * `scope.models` is GENERATED from (`scripts/print-openrouter-entitlement.mjs`).
+ * `scope.models` is GENERATED from — print it with `pnpm run openrouter:entitlement`.
  *
  * ⚠️ **BOTH FORMS ON PURPOSE, AND IT IS NOT HEDGING.** Nothing validates which
  * form `allowed_models` enforces on: the field takes "slug or canonical_slug" and
@@ -385,11 +385,21 @@ export function formatOpenRouterEntitlementSkew(skew: OpenRouterEntitlementSkew)
   const codeShort = skew.codeSha.slice(0, 16);
   if (skew.kind === "unrecorded") {
     return (
+      // 🛑 IT SAYS WHAT ACPX KNOWS, NEVER WHAT THE PROVIDER WILL DO. An earlier
+      // wording ended "…a non-entitled model is refused here but nothing refuses it
+      // at the provider yet" — a claim about the KEY that this module cannot check,
+      // and FALSE in the reassuring direction in the one state that matters: a key
+      // that IS restricted while no sha was recorded. Then acpx uses the full set,
+      // the provider refuses, and the operator has been told the opposite. The
+      // doc-comment on `resolveOpenRouterEntitlement` is already careful that this is
+      // a skew detector between two honest authorities and not an adversarial
+      // control; this sentence had to be equally careful.
       `providers.${skew.name} records no entitlementSha, so acpx cannot prove its allowed set ` +
       `matches the one this box's OpenRouter key was minted from. Using the full entitlement ` +
       `list (sha256:${codeShort}, ${OPENROUTER_ENTITLEMENT.length} models). This is the expected ` +
-      `state until the key is re-minted with a scope.models guardrail; a non-entitled model is ` +
-      `refused here but nothing refuses it at the provider yet.`
+      `state until the key is re-minted with a scope.models guardrail. ⚠️ acpx cannot tell from ` +
+      `here whether this key is already restricted: if it is, a model acpx permits may still be ` +
+      `refused at the provider. Record entitlementSha in the same change that restricts the key.`
     );
   }
   return (
@@ -398,7 +408,13 @@ export function formatOpenRouterEntitlementSkew(skew: OpenRouterEntitlementSkew)
     `two enforcement layers are NOT in step. Narrowing to the green list ` +
     `(${OPENROUTER_GREEN_LIST.map((entry) => entry.slug).join(", ")}) so acpx can never permit a ` +
     `model the key would refuse with an uninterpretable 403. Remedy: deploy the build whose list ` +
-    `the key was minted from, or re-mint the key from this build's list ` +
-    `(scripts/print-openrouter-entitlement.mjs).`
+    `the key was minted from, or re-mint the key from this build's list — run ` +
+    // ⚠️ THE RUNNABLE FORM, NOT THE FILE NAME. This named
+    // `scripts/print-openrouter-entitlement.mjs`, which does not exist (the script is
+    // `.ts`); an operator who pasted it got "Cannot find module". It matters out of
+    // proportion to its size because this line reaches an operator EXACTLY when the
+    // two enforcement layers have diverged — the one moment they need a command that
+    // runs rather than a path to debug.
+    `\`pnpm run openrouter:entitlement\` to print it.`
   );
 }

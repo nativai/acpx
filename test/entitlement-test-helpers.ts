@@ -1,5 +1,8 @@
 import type { OpenRouterRawModel } from "../src/models/openrouter-catalogue.js";
-import type { OpenRouterEntitlementEntry } from "../src/models/openrouter-entitlement.js";
+import type {
+  OpenRouterEntitlementEntry,
+  OpenRouterEntitlementResolution,
+} from "../src/models/openrouter-entitlement.js";
 
 /**
  * "Entitlement is NOT the subject of this test" — an entitlement set that covers
@@ -28,12 +31,15 @@ import type { OpenRouterEntitlementEntry } from "../src/models/openrouter-entitl
  * reads it, these rows never reach a guardrail, and the invariant tests that forbid
  * derivation run against the committed module, not against this.
  */
-export function entitleAll(
-  models: readonly OpenRouterRawModel[],
-): readonly OpenRouterEntitlementEntry[] {
-  return models.map((model) => ({
+export function entitleAll(models: readonly OpenRouterRawModel[]): OpenRouterEntitlementResolution {
+  const entries: readonly OpenRouterEntitlementEntry[] = models.map((model) => ({
     slug: model.id.replace(/^~/, "").toLowerCase(),
     canonicalSlug: `${model.id.replace(/^~/, "").toLowerCase()}-test-fixture-not-a-real-canonical`,
     why: "test fixture — entitlement is not this test's subject (entitleAll)",
   }));
+  // ⚠️ `narrowed: false` is part of the held-constant state, not a default worth
+  // skipping: the annotation is a FUNCTION of the resolution now (brick daed4261 F1),
+  // so a test that left this ambiguous would be asserting against a message whose
+  // shape depends on a field it never set.
+  return { entries, narrowed: false };
 }

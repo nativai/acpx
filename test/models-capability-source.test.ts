@@ -19,6 +19,7 @@ import type { OpenRouterSnapshot } from "../src/models/openrouter-catalogue.js";
 import {
   isEntitledOpenRouterModelId,
   OPENROUTER_ENTITLEMENT,
+  type OpenRouterEntitlementResolution,
 } from "../src/models/openrouter-entitlement.js";
 
 // Same fixture and resolution rule as models-catalogue.test.ts: from cwd, not
@@ -31,6 +32,18 @@ function fixture(): OpenRouterSnapshot {
 }
 
 const META = { fetchedAt: "2026-09-04T00:10:56.992Z", stale: false, error: null };
+
+/**
+ * The shipped entitlement set in its SETTLED state (shas in step, nothing narrowed).
+ * Injected rather than resolved so no assertion depends on whether THIS box's key
+ * records an `entitlementSha` — and stated explicitly because the refusal wording is
+ * now a FUNCTION of the state (brick daed4261 F1), so a test that left `narrowed`
+ * ambiguous would assert against a message whose shape it never pinned.
+ */
+const SETTLED_ENTITLEMENT: OpenRouterEntitlementResolution = {
+  entries: OPENROUTER_ENTITLEMENT,
+  narrowed: false,
+};
 
 test.afterEach(() => {
   setHarnessCapabilitiesForTesting(null);
@@ -138,7 +151,7 @@ test("the OpenRouter band is locked per harness, exactly as the derivation says"
   // environment-dependent test here would read as a banding bug. The real module is
   // passed, so the row still FOLLOWS the shipped policy rather than a fixture of it.
   const catalogue = buildCatalogue(fixture().models, META, {
-    entitlement: OPENROUTER_ENTITLEMENT,
+    entitlement: SETTLED_ENTITLEMENT,
   });
   const capabilities = new Map(readHarnessCapabilities().map((row) => [row.id, row]));
 

@@ -21,9 +21,11 @@
  *                                        ★ THE ENFORCEMENT. Harness-agnostic, every
  *                                        spawn incl. inherited / fork / template /
  *                                        resume, and independent of the catalogue.
- *   Tier 3  `availabilityFor`            The menu says why. DECLARATION ONLY —
- *                                        availability annotates, never filters, so
- *                                        it must never be called enforcement.
+ *   Tier 3  `availabilityFor`            The menu says why. For the CLAUDE-FAMILY
+ *                                        branch, declaration only. ⚠️ For the
+ *                                        ENTITLEMENT branch it is NOT: `availability`
+ *                                        is read by `assertModelAvailable`, so Tier 1
+ *                                        refuses on it — see `catalogue.ts`.
  *
  * ## Why this module sits LOW in the import graph
  *
@@ -44,9 +46,9 @@
  *
  * ## Brick daed4261 — this tier is now an ALLOWLIST, not only a Claude denylist
  *
- * `assertModelPolicy` refuses any non-entitled id on the OpenRouter route, against
- * {@link OPENROUTER_ENTITLEMENT}. The Claude-family refusal below is kept **verbatim
- * and list-independent** as its specialised case — see `assertModelPolicy`'s own
+ * `assertModelPolicy` refuses any non-entitled id on the OpenRouter route, against the
+ * entitlement module (`openrouter-entitlement.ts`). The Claude-family refusal below is
+ * kept **verbatim and list-independent** as its specialised case — see `assertModelPolicy`'s own
  * ordering note for why that is stronger than folding Claude into the list.
  */
 
@@ -56,7 +58,6 @@ import {
   isEntitledOpenRouterModelId,
   isFloatingAliasModelId,
   isOpenRouterRouteShapedModelId,
-  OPENROUTER_ENTITLEMENT,
   resolveOpenRouterEntitlement,
   type OpenRouterEntitlementResolution,
   type OpenRouterEntitlementSkew,
@@ -588,10 +589,51 @@ export class OpenRouterModelNotEntitledError extends AcpxOperationalError {
  */
 export const OPENROUTER_NOT_ENTITLED_REASON = "openrouter-not-entitled";
 
-export const OPENROUTER_NOT_ENTITLED_ANNOTATION =
-  "Not in this box's OpenRouter entitlement set — the box key is billed at metered API pricing, " +
-  `so the choosable set is enumerated (${OPENROUTER_ENTITLEMENT.map((entry) => entry.slug).join(", ")}). ` +
-  "Anything else needs Daniel's say-so for that spawn.";
+/**
+ * The annotation for a non-entitled row — **a function of the CURRENT state, never a
+ * constant.**
+ *
+ * 🛑 **IT WAS A CONSTANT, AND THAT MADE TIER 1 NAME THE REFUSED MODEL IN ITS OWN
+ * REMEDY LIST.** The constant enumerated the full {@link OPENROUTER_ENTITLEMENT}, so
+ * under sha skew — where acpx has narrowed `S` to the green list — asking for
+ * `qwen/qwen3.8-flash` was refused by a message that listed `qwen/qwen3.8-flash`
+ * among the choosable models. **The agent had no available action**, and the obvious
+ * next move is to retry the thing that just failed. Measured by the test engineer:
+ * the Tier 1 message was BYTE-IDENTICAL across all three sha states (one md5 for
+ * match, mismatch and absent alike) and always printed all five.
+ *
+ * ⚠️ **AND IT IS TIER 1, THE STATE-BLIND TIER, THAT PRODUCTION ACTUALLY REACHES** —
+ * `assertModelAvailable` fires on the `--model` flag before the spawn guard ever
+ * runs. P0's message was state-aware all along, which is exactly why a unit test
+ * would miss this: P0 is the tier a test naturally drives and the rarely-reached one
+ * in practice. **A refusal whose remedy names the refused model is worse than a bare
+ * refusal.** The committed case asserts the message DIFFERS by sha state and that the
+ * narrowed one contains no non-green slug.
+ */
+export function openRouterNotEntitledAnnotation(
+  resolution: Pick<OpenRouterEntitlementResolution, "entries" | "narrowed">,
+): string {
+  const choosable = resolution.entries.map((entry) => entry.slug).join(", ");
+  if (!resolution.narrowed) {
+    return (
+      "Not in this box's OpenRouter entitlement set — the box key is billed at metered API " +
+      `pricing, so the choosable set is enumerated (${choosable}). Anything else needs Daniel's ` +
+      "say-so for that spawn."
+    );
+  }
+  // The skew explanation rides on the REFUSAL, not only on the success-path warning:
+  // an agent refused while narrowed cannot otherwise tell a policy decision from a
+  // deployment state, and the remedy is different for each.
+  return (
+    "Not choosable on this box right now. acpx has NARROWED the choosable set to the green list " +
+    `(${choosable}) because this build's entitlement list does not match the one this box's ` +
+    "OpenRouter key was minted from — the two enforcement layers are not in step, so acpx cannot " +
+    "prove the key would serve anything wider. The full entitlement set is larger than the list " +
+    "above; it is not offered while the skew stands. Remedy (operator): deploy the build whose " +
+    "list the key was minted from, or re-mint the key from this build's list — " +
+    "`pnpm run openrouter:entitlement` prints it."
+  );
+}
 
 /**
  * Thrown when a Claude-family model is selected on the OpenRouter route (brick

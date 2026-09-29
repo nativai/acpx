@@ -13,7 +13,7 @@ import type { AvailabilityCapability } from "./capability-source.js";
 import {
   CLAUDE_FAMILY_OPENROUTER_ANNOTATION,
   CLAUDE_FAMILY_OPENROUTER_REASON,
-  OPENROUTER_NOT_ENTITLED_ANNOTATION,
+  openRouterNotEntitledAnnotation,
   OPENROUTER_NOT_ENTITLED_REASON,
   refusesClaudeFamilyOnOpenRouter,
 } from "./claude-family.js";
@@ -25,7 +25,7 @@ import type { LoadOptions, OpenRouterRawModel } from "./openrouter-catalogue.js"
 import {
   isEntitledOpenRouterModelId,
   resolveOpenRouterEntitlement,
-  type OpenRouterEntitlementEntry,
+  type OpenRouterEntitlementResolution,
 } from "./openrouter-entitlement.js";
 import type {
   AgentAvailability,
@@ -244,17 +244,17 @@ function computeAvailability(
   model: CatalogueModel,
   nativeAgentTypes: string[] | undefined,
   capabilities: AvailabilityCapability[],
-  entitled: readonly OpenRouterEntitlementEntry[],
+  entitlement: OpenRouterEntitlementResolution,
 ): Record<string, AgentAvailability> {
   const availability: Record<string, AgentAvailability> = {};
   for (const capability of capabilities) {
-    availability[capability.id] = availabilityFor(model, nativeAgentTypes, capability, entitled);
+    availability[capability.id] = availabilityFor(model, nativeAgentTypes, capability, entitlement);
   }
   return availability;
 }
 
 /**
- * ⚠️ `entitled` IS PASSED IN, NOT RESOLVED HERE. `resolveOpenRouterEntitlement`
+ * ⚠️ `entitlement` IS PASSED IN, NOT RESOLVED HERE. `resolveOpenRouterEntitlement`
  * reads `providers.json`, and this function runs once per (row × capability) — ~458
  * rows × 3 capabilities on a live catalogue, so resolving inside would be ~1,400
  * file reads per `acpx models` call. `buildCatalogue` resolves it once.
@@ -263,7 +263,7 @@ function availabilityFor(
   model: CatalogueModel,
   nativeAgentTypes: string[] | undefined,
   capability: AvailabilityCapability,
-  entitled: readonly OpenRouterEntitlementEntry[],
+  entitlement: OpenRouterEntitlementResolution,
 ): AgentAvailability {
   const blocking = model.unavailableReasons[0];
   if (blocking) {
@@ -332,7 +332,7 @@ function availabilityFor(
   // `assertModelPolicy`. Two consequences worth knowing:
   //
   //   · for a catalogued id passed as `--model`, the message an agent sees is
-  //     {@link OPENROUTER_NOT_ENTITLED_ANNOTATION} — which names the entitled set and
+  //     {@link openRouterNotEntitledAnnotation} — which names the entitled set and
   //     the escape hatch — not `assertModelPolicy`'s longer one. That one still fires
   //     on the legs Tier 1 cannot reach (inherited / fork / template / resume) and
   //     whenever the catalogue is cold;
@@ -348,11 +348,11 @@ function availabilityFor(
   // `--all` and on `acpx models show`. That split is deliberate — availability
   // annotates and never filters — so an agent asking "why can I not use this?" always
   // gets an answer, which is the exact opposite of the uninterpretable 403 above.
-  if (!isEntitledOpenRouterModelId(model.id, entitled)) {
+  if (!isEntitledOpenRouterModelId(model.id, entitlement.entries)) {
     return {
       ok: false,
       reason: OPENROUTER_NOT_ENTITLED_REASON,
-      message: OPENROUTER_NOT_ENTITLED_ANNOTATION,
+      message: openRouterNotEntitledAnnotation(entitlement),
     };
   }
 
@@ -484,7 +484,7 @@ export type BuildCatalogueOptions = {
    * whether this box's key records an `entitlementSha` — a box-dependent test here
    * would read as a catalogue bug.
    */
-  entitlement?: readonly OpenRouterEntitlementEntry[];
+  entitlement?: OpenRouterEntitlementResolution;
 };
 
 /** Merge the raw OpenRouter rows with the harness-native rows into ONE ordered list. */
@@ -498,21 +498,21 @@ export function buildCatalogue(
   const natives = options.nativeModels ?? harnessNativeModels();
   const equivalence = buildEquivalenceIndex(openRouterModels);
   // Resolved ONCE — see `availabilityFor`'s note on why this is not per row.
-  const entitled = options.entitlement ?? resolveOpenRouterEntitlement().entries;
+  const entitlement = options.entitlement ?? resolveOpenRouterEntitlement();
 
   const models: CatalogueModel[] = [];
   for (const native of natives) {
     const { agentTypes, ...row } = native;
     models.push({
       ...row,
-      availability: computeAvailability(row, agentTypes, capabilities, entitled),
+      availability: computeAvailability(row, agentTypes, capabilities, entitlement),
     });
   }
   for (const raw of openRouterModels) {
     const model = toCatalogueModel(raw, equivalence, now);
     models.push({
       ...model,
-      availability: computeAvailability(model, undefined, capabilities, entitled),
+      availability: computeAvailability(model, undefined, capabilities, entitlement),
     });
   }
 
