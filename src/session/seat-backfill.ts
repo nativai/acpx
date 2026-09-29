@@ -19,6 +19,7 @@ import { writeSessionRecordAuthorizingSeatHolderWithoutIndex } from "./persisten
 import { seatFieldsToIndexEntry } from "./persistence/seat-fields.js";
 import {
   backfillSeatRow,
+  MalformedSeatRowError,
   readSeatStore,
   type SeatRecord,
   seatStorePath,
@@ -573,7 +574,14 @@ function errorFor(plan: RecordPlan, stage: SeatBackfillStage, error: unknown): S
     file: plan.file,
     acpxRecordId: plan.record.acpxRecordId,
     stage,
-    code: (error as NodeJS.ErrnoException | undefined)?.code,
+    // `SEAT_ROW_MALFORMED` is the ESTABLISHED code for this condition — B2b already
+    // emits it (`src/cli/seats-command.ts:557`) and B2c's `SEAT_CLOSED` is the sibling
+    // precedent. Reusing it here, rather than coining a backfill-local name, is what
+    // lets a caller (B12b) branch on ONE code for ONE condition instead of two.
+    code:
+      error instanceof MalformedSeatRowError
+        ? "SEAT_ROW_MALFORMED"
+        : (error as NodeJS.ErrnoException | undefined)?.code,
     message: error instanceof Error ? error.message : String(error),
   };
 }

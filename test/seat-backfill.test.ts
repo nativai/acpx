@@ -539,6 +539,15 @@ test("R2b: the backfill REFUSES to overwrite a malformed ROW and carries it verb
       /PRESENT in the seat store but its row is malformed/,
       "the refusal must be MalformedSeatRowError, not a generic throw",
     );
+    // The `--format json` payload (this row drives the real CLI via `backfill()`,
+    // which always passes `--format json`) must carry a STABLE, machine-readable
+    // code — not leave a caller to string-match the prose above. `SEAT_ROW_MALFORMED`
+    // is the code B2b already emits for this same condition; reused, not re-coined.
+    assert.equal(
+      report.errors[0]?.code,
+      "SEAT_ROW_MALFORMED",
+      "the malformed-row error must carry a stable machine-readable code",
+    );
     assert.deepEqual(
       await readRawStore(homeDir),
       { [seatId]: corruptRow },
