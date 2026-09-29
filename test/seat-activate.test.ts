@@ -410,6 +410,16 @@ test("phase 0 · a CLOSED SEAT is refused, while a VACANT seat still accepts a h
   // seat is abolished and takes no holders; a VACANT seat (no active holder) is a
   // first-class resting state that must still accept one. A verb that refused both
   // would pass a closed-seat row alone.
+  //
+  // ⚠️ FIXTURE-ENTERED, AND STATED WHY (B2c, F-B2c-1): at B2 nothing in the product
+  // could write a closure, so a fixtured `closedAt` was the only way to reach this
+  // state at all. **The product path now EXISTS** — `acpx seats close` — and
+  // `"B2c product-entered · a real acpx seats close refuses a real activate (R3)"`
+  // below reaches this same refusal by driving it. This row is KEPT because its
+  // VACANT half is still a real AP15 pair for the fixture mechanism (clearing
+  // `closed_at` by hand is still the only way to reach "closed at a time nothing in
+  // this rig produced" — see B2c PLAN.md §0 F-B2c-1), not because the refusal still
+  // needs a fixture to be reached.
   await withTempHome(async (homeDir) => {
     await fs.mkdir(path.join(homeDir, "workspace"), { recursive: true });
     await seedHolder(homeDir, "holder-two", { holderActive: false });
@@ -419,7 +429,7 @@ test("phase 0 · a CLOSED SEAT is refused, while a VACANT seat still accepts a h
     assert.notEqual(refused.code, 0, "a closed seat accepted a holder");
     assert.match(`${refused.stdout}${refused.stderr}`, /SEAT_CLOSED/);
 
-    // Re-open the office by clearing `closed_at`, leaving it VACANT, and the same
+    // Re-open the seat by clearing `closed_at`, leaving it VACANT, and the same
     // activation must now succeed.
     await withSeatStoreWrite(sessionDirOf(homeDir), (store) => {
       const row = seatFromStore(store, SEAT_A);
@@ -436,6 +446,96 @@ test("phase 0 · a CLOSED SEAT is refused, while a VACANT seat still accepts a h
     );
     const payload = JSON.parse(allowed.stdout.trim()) as Record<string, unknown>;
     assert.equal(payload.predecessorId, null, "a vacant seat reported a predecessor");
+  });
+});
+
+test("B2c product-entered · a real `acpx seats close` refuses a real `sessions activate` (R3)", async () => {
+  // PRODUCT-ENTERED, per B2c PLAN.md §3 row R3 — the whole point of this block: the
+  // closed state is reached through the REAL `acpx seats close` verb, not a fixture.
+  //
+  // Sequence: mint a founding holder H1 into a fresh seat S (`sessions new -s`);
+  // create a successor H2 INTO that seat while it is still open (`sessions new
+  // --seat`, since create-into-seat itself refuses once S is closed — R4); close H1
+  // so the seat's active holder is no longer open (R1's precondition for `close` to
+  // succeed); close S for real; THEN attempt to activate H2 into S and assert the
+  // refusal carries `SEAT_CLOSED` — the same code `phase 0 · a CLOSED SEAT is
+  // refused` above asserts, reached this time by the real verb.
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const founded = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "-s",
+        "b2c-r3-h1",
+      ],
+      homeDir,
+    );
+    assert.equal(founded.code, 0, founded.stderr);
+    const h1 = (JSON.parse(founded.stdout.trim()) as { acpxRecordId?: string }).acpxRecordId;
+    assert.ok(h1, `fixture precondition: sessions new returned a record id — ${founded.stdout}`);
+    const h1Record = await readRecordJson(homeDir, h1);
+    const seatId = h1Record.seat_id as string | undefined;
+    assert.ok(seatId, "fixture precondition: the founding holder carries a seat id");
+    assert.match(seatId, /^[0-9a-f-]{36}$/);
+
+    const successor = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "--seat",
+        seatId,
+      ],
+      homeDir,
+    );
+    assert.equal(successor.code, 0, successor.stderr);
+    const h2 = (JSON.parse(successor.stdout.trim()) as { acpxRecordId?: string }).acpxRecordId;
+    assert.ok(
+      h2,
+      `fixture precondition: sessions new --seat returned a record id — ${successor.stdout}`,
+    );
+
+    // `--session-id`, NOT the positional `[name]` arg — that resolves by SESSION
+    // NAME, not by record id (`session-selector.ts`: only `--session-id`/
+    // `--session-url` reach `resolveExplicitSessionRecord`).
+    const closedHolder = await runCli(
+      ["--format", "json", "sessions", "close", "--session-id", h1],
+      homeDir,
+    );
+    assert.equal(closedHolder.code, 0, closedHolder.stderr);
+
+    const closedSeat = await runCli(["--format", "json", "seats", "close", seatId], homeDir);
+    assert.equal(
+      closedSeat.code,
+      0,
+      `fixture precondition: acpx seats close must succeed once the active holder is closed — ` +
+        `${closedSeat.stdout}${closedSeat.stderr}`,
+    );
+
+    const refused = await activate(homeDir, seatId, h2);
+    assert.notEqual(refused.code, 0, "a seat closed by the REAL verb still accepted an activation");
+    assert.match(
+      `${refused.stdout}${refused.stderr}`,
+      /SEAT_CLOSED/,
+      "the refusal must carry the SEAT_CLOSED code — the command under test (`sessions activate`) " +
+        "is what discriminates this from R4's identically-coded create-into-seat refusal",
+    );
   });
 });
 

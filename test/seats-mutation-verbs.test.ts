@@ -8,8 +8,8 @@ import { Command } from "commander";
 import { TOP_LEVEL_VERBS } from "../src/cli-core.js";
 import { registerDefaultCommands } from "../src/cli/command-registration.js";
 import type { ResolvedAcpxConfig } from "../src/cli/config.js";
-import { buildSeatDeletion } from "../src/cli/seats-command.js";
-import { readSeatStore, withSeatStoreWrite } from "../src/session/persistence.js";
+import { buildSeatDeletion, decideSeatClose } from "../src/cli/seats-command.js";
+import { readSeatStore, withSeatStoreWrite, type SeatRecord } from "../src/session/persistence.js";
 import { withTempHome as withTempHomeFixture } from "./runtime-test-helpers.js";
 
 /**
@@ -74,11 +74,16 @@ import { withTempHome as withTempHomeFixture } from "./runtime-test-helpers.js";
  *   disagreement as a fixture only so the verb meets a PRE-EXISTING one rather than the
  *   one it just created — the same reason the activation protocol reads its divergence
  *   before it writes.
- * - **`closed_at` non-null** — NOT ENTERED ANYWHERE IN THIS FILE, deliberately. Nothing
- *   in the product can write a closure until B2c, which is exactly why B2b ships no
- *   closed-seat refusal: such a refusal would have a structurally unreachable refused
- *   state. `D4`'s control arm constructs a stamped row as an in-test VALUE, never as a
- *   store fixture, and asserts only that the checker can see one.
+ * - **`closed_at` non-null** — **UPDATED FOR B2c: PRODUCT-ENTERED, by this block's own
+ *   `acpx seats close` verb.** At B2b nothing in the product could write a closure, so
+ *   `D4`'s control arm (below) constructed a stamped row as an in-test VALUE rather
+ *   than a store fixture, and that remains true — `D4` is about a checker seeing a
+ *   value, not about reaching the closed STATE. The closed-seat rows added by B2c
+ *   (Group CL, and the closed-seat legitimate-pass rows on `set-brick` / `rename` /
+ *   `delete`) drive the real `acpx seats close` and read the result off disk — see
+ *   `CL1`. A row still using `seatRow(..., { closed_at: … })` as a fixture in this file
+ *   names its OWN structural reason (holder-changed's interleaving cannot be entered by
+ *   a single-process CLI row — see `CL7`'s comment).
  */
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
@@ -212,6 +217,8 @@ test("R1 · the REAL BINARY answers `acpx seats` — asserted on stdout content,
     assert.match(help.output, /set-brick/);
     assert.match(help.output, /rename/);
     assert.match(help.output, /delete/);
+    // B2c — the shipped binary answers `acpx seats close`, not just `registerSeatsCommand`.
+    assert.match(help.output, /close/);
     assert.doesNotMatch(
       help.output,
       /No acpx session found/,
@@ -1098,6 +1105,340 @@ test("D9r · the variadic mix — good deleted, absent no-op'd, malformed refuse
     assert.deepEqual(retried.absent, [SEAT_A, SEAT_ABSENT]);
     assert.deepEqual(retried.malformed, [SEAT_C], "the corrupt row still refuses, still named");
     assert.equal(retried.storeWritten, false, "a retry that deletes nothing writes nothing");
+  });
+});
+
+// ═══ Group CL — `seats close` (B2c, brick 4a17c8b5) ══════════════════════════
+//
+// AC16 + B2c PLAN.md §2-§3. `close` is the writer of `closed_at` — the one ratified
+// seat field B2b shipped with no write path (PLAN.md §0 F-B2c-1).
+
+test("CL1 · a VACANT seat closes; closed_at is a FRESH clock read, postdating a read taken before the call; every field survives", async () => {
+  await withRig(async (homeDir) => {
+    // FIXTURE-ENTERED, structurally, same reason RN8 states for the identical shape:
+    // no product path clears `active_holder_id` back to null, so a vacant seat can
+    // only be REACHED in this rig by planting the row directly.
+    await writeStore(homeDir, {
+      [SEAT_A]: seatRow(SEAT_A, { active_holder_id: null, name: "alpha", brick_id: BRICK_ID }),
+    });
+    const before = Date.now();
+
+    const result = await runCli(["--format", "json", "seats", "close", SEAT_A], homeDir);
+    assert.equal(result.code, 0, result.output);
+    const payload = JSON.parse(result.stdout.trim()) as {
+      ok: boolean;
+      action: string;
+      closedAt: string;
+      changed: boolean;
+    };
+    assert.equal(payload.ok, true);
+    assert.equal(payload.action, "seat_closed");
+    assert.equal(payload.changed, true);
+
+    const after = await readStoreJson(homeDir);
+    const row = after[SEAT_A] as Record<string, unknown>;
+    // THE CLOCK IS THE PRODUCT'S — read off DISK, never the CLI's own echo alone —
+    // and it postdates a timestamp taken BEFORE the command ran.
+    const closedAtMs = Date.parse(row.closed_at as string);
+    assert.ok(
+      Number.isFinite(closedAtMs),
+      `closed_at is not a valid ISO instant: ${String(row.closed_at)}`,
+    );
+    assert.ok(
+      closedAtMs >= before,
+      "closed_at does not postdate a clock read taken before the call",
+    );
+    assert.equal(row.closed_at, payload.closedAt, "the JSON echo must match what landed on disk");
+
+    // EVERY FIELD SURVIVES — `close` touches closed_at and nothing else.
+    assert.equal(row.seat_id, SEAT_A);
+    assert.equal(row.active_holder_id, null);
+    assert.equal(row.name, "alpha");
+    assert.equal(row.brick_id, BRICK_ID);
+    assert.ok(Object.hasOwn(row, "next_ordinal"));
+  });
+});
+
+test("CL2 · IDEMPOTENT — a second close is a no-op, rc 0, and the timestamp does NOT move", async () => {
+  await withRig(async (homeDir) => {
+    await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A, { active_holder_id: null }) });
+
+    const first = await runCli(["--format", "json", "seats", "close", SEAT_A], homeDir);
+    assert.equal(first.code, 0, first.output);
+    const firstClosedAt = (await readStoreJson(homeDir))[SEAT_A]?.closed_at;
+    assert.ok(typeof firstClosedAt === "string");
+
+    const second = await runCli(["--format", "json", "seats", "close", SEAT_A], homeDir);
+    assert.equal(second.code, 0, "a second close on an already-closed seat must NOT be an error");
+    const payload = JSON.parse(second.stdout.trim()) as {
+      ok: boolean;
+      action: string;
+      changed: boolean;
+      closedAt: string;
+    };
+    assert.equal(payload.ok, true);
+    assert.equal(payload.action, "seat_close_no_change");
+    assert.equal(payload.changed, false, "a no-op must say so in its own payload");
+    assert.equal(payload.closedAt, firstClosedAt, "the timestamp must NOT move on a second close");
+    assert.equal(
+      (await readStoreJson(homeDir))[SEAT_A]?.closed_at,
+      firstClosedAt,
+      "read off DISK: the second close must not have re-stamped the field",
+    );
+  });
+});
+
+test("CL3 · there is NO --at / timestamp argument — a caller-supplied close time is UNREPRESENTABLE", async () => {
+  await withRig(async (homeDir) => {
+    await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A, { active_holder_id: null }) });
+    const result = await runCli(
+      ["seats", "close", SEAT_A, "--at", "2020-01-01T00:00:00.000Z"],
+      homeDir,
+    );
+    assert.notEqual(
+      result.code,
+      0,
+      "an unrecognised --at flag must be refused, not silently accepted",
+    );
+    assert.match(result.output, /unknown option/i);
+    assert.equal(
+      (await readStoreJson(homeDir))[SEAT_A]?.closed_at,
+      null,
+      "the seat must be untouched — commander's own refusal must fire before any write",
+    );
+  });
+});
+
+test("CL4 · R1 — refuses SEAT_HOLDER_OPEN while the active holder is open, and closes once it is closed (AP15 pair)", async () => {
+  await withRig(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const base = ["--cwd", cwd, "--agent", MOCK_AGENT_COMMAND, "--approve-all", "--format", "json"];
+
+    const founding = await runCli([...base, "sessions", "new", "-s", "cl4-holder"], homeDir);
+    assert.equal(founding.code, 0, founding.stderr);
+    const holderId = (JSON.parse(founding.stdout.trim()) as { acpxRecordId?: string }).acpxRecordId;
+    assert.ok(holderId, `fixture precondition — ${founding.stdout}`);
+    const holderRecord = JSON.parse(
+      await fs.readFile(path.join(homeDir, ".acpx", "sessions", `${holderId}.json`), "utf8"),
+    ) as { seat_id?: string };
+    const seatId = holderRecord.seat_id;
+    assert.ok(seatId, "fixture precondition: the founding holder carries a seat id");
+
+    // F4 — THE REFUSED STATE IS ENTERED: a real, open holder is the seat's active
+    // holder (that is exactly what `sessions new` without `--seat` leaves behind).
+    const refused = await runCli(["--format", "json", "seats", "close", seatId], homeDir);
+    assert.equal(refused.code, 1, refused.output);
+    const refusal = refusalOf(refused);
+    assert.equal(refusal.code, "SEAT_HOLDER_OPEN");
+    assert.match(refusal.error, new RegExp(holderId));
+    assert.match(refusal.error, /sessions close/);
+    assert.equal(
+      (await readStoreJson(homeDir))[seatId]?.closed_at,
+      null,
+      "a refused close must not have written anything",
+    );
+
+    // AP15 — THE PAIRED LEGITIMATE CASE, IN THE SAME RUN: close the holder, and the
+    // SAME seat now closes.
+    // `--session-id`, NOT the positional arg — the positional `[name]` on `sessions
+    // close` resolves by SESSION NAME, not by record id (`session-selector.ts`:
+    // `resolveSelectorName` feeds it through `normalizeName` as a name; only
+    // `--session-id`/`--session-url` reach `resolveExplicitSessionRecord`).
+    const closedHolder = await runCli(
+      ["--format", "json", "sessions", "close", "--session-id", holderId],
+      homeDir,
+    );
+    assert.equal(closedHolder.code, 0, closedHolder.stderr);
+    const allowed = await runCli(["--format", "json", "seats", "close", seatId], homeDir);
+    assert.equal(
+      allowed.code,
+      0,
+      `AP15: close was refused even after the holder was closed — ${allowed.output}`,
+    );
+    assert.equal((await readStoreJson(homeDir))[seatId]?.closed_at !== null, true);
+  });
+});
+
+test("CL4 control · the message asserted above can be SEEN — a bogus holder id in the same shape would not match", () => {
+  // §3a-bis — the control arm for CL4's `new RegExp(holderId)` assertion: prove the
+  // pattern can fail before trusting that it passed for the right reason.
+  const message = "seat X refuses to close: its active holder Y is still open.";
+  assert.doesNotMatch(message, /aaaaaaaa-not-the-real-holder-id/);
+  assert.match(message, /Y is still open/);
+});
+
+test("CL5 · decideSeatClose — the pure CAS decision, all four branches, width stated (R2)", () => {
+  // 🔑 EXPORTED FOR ONE REASON (same precedent `buildSeatDeletion` sets):
+  // SEAT_HOLDER_CHANGED's refused state needs an interleaving no single-process CLI
+  // row can enter deterministically, and a two-process race is a flaky test, not a
+  // test. So this row calls the PRODUCT's own decision function directly — the
+  // product appears in every branch below, executes, and discriminates on `kind`.
+  //
+  // WIDTH, STATED HONESTLY: the concurrent interleaving itself is not entered
+  // end-to-end here; the function that GOVERNS it is exercised directly. A row that
+  // claimed to enter the race itself would be the worse, dishonest artifact.
+  const row: SeatRecord = {
+    seatId: SEAT_A,
+    createdAt: "2026-09-29T00:00:00.000Z",
+    activeHolderId: "holder-1",
+    nextOrdinal: 2,
+    closedAt: null,
+    name: undefined,
+    brickId: undefined,
+  };
+
+  // Branch 1 — already closed.
+  assert.deepEqual(
+    decideSeatClose(
+      { ...row, closedAt: "2026-09-28T00:00:00.000Z" },
+      { id: "holder-1", open: false },
+    ),
+    { kind: "already-closed" },
+  );
+
+  // Branch 2 — R2: the vetted holder is no longer the current one.
+  assert.deepEqual(decideSeatClose(row, { id: "holder-DIFFERENT", open: false }), {
+    kind: "holder-changed",
+  });
+  // AC16 (ii): a null vetted holder against a row that has since gained one is ALSO
+  // a holder-changed — the same branch, entered from the vacant side.
+  assert.deepEqual(decideSeatClose(row, { id: null, open: false }), { kind: "holder-changed" });
+
+  // Branch 3 — R1: the (still-current) vetted holder was open.
+  assert.deepEqual(decideSeatClose(row, { id: "holder-1", open: true }), { kind: "holder-open" });
+
+  // Branch 4 — the unchanged, not-open path closes. AC16 (i)'s second half and (ii)'s
+  // first half, both reached here: a real holder that is now closed, and vacancy.
+  assert.deepEqual(decideSeatClose(row, { id: "holder-1", open: false }), { kind: "close" });
+  assert.deepEqual(decideSeatClose({ ...row, activeHolderId: null }, { id: null, open: false }), {
+    kind: "close",
+  });
+});
+
+test("CL6 · a DANGLING active_holder_id (record unresolvable) still closes — refusing would leave no remedy", async () => {
+  // FIXTURE-ENTERED, structurally: `active_holder_id` naming a session record that
+  // was never minted or has since been removed is a real-world event (hand
+  // intervention, an external purge) that no verb in this product produces — the
+  // same class of reason RN8/SB5 state for their own fixtures.
+  await withRig(async (homeDir) => {
+    const danglingId = "dddddddd-0000-4000-8000-dddddddddddd";
+    await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A, { active_holder_id: danglingId }) });
+
+    const result = await runCli(["--format", "json", "seats", "close", SEAT_A], homeDir);
+    assert.equal(
+      result.code,
+      0,
+      `a dangling holder pointer must still close — refusing leaves no remedy an operator can act on: ${result.output}`,
+    );
+    const payload = JSON.parse(result.stdout.trim()) as {
+      ok: boolean;
+      holderUnresolvable?: string;
+    };
+    assert.equal(payload.ok, true);
+    assert.equal(
+      payload.holderUnresolvable,
+      danglingId,
+      "the payload must say WHICH holder could not be resolved",
+    );
+    assert.equal((await readStoreJson(homeDir))[SEAT_A]?.closed_at !== null, true);
+  });
+});
+
+test("CL7 · store health: MALFORMED/UNREADABLE refuses SEAT_STORE_UNWRITABLE, never SEAT_ROW_MISSING — unfaulted control arm", async () => {
+  await withRig(async (homeDir) => {
+    // §3a-bis control arm FIRST.
+    await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A, { active_holder_id: null }) });
+    const control = await runCli(["--format", "json", "seats", "close", SEAT_A], homeDir);
+    assert.equal(control.code, 0, control.output);
+
+    await writeRawStore(homeDir, "{ not json at all");
+    const bytes = await readStoreBytes(homeDir);
+    const faulted = await runCli(["--format", "json", "seats", "close", SEAT_B], homeDir);
+    assert.equal(faulted.code, 1);
+    const refusal = refusalOf(faulted);
+    assert.equal(refusal.code, "SEAT_STORE_UNWRITABLE");
+    assert.match(refusal.error, /refusing to write the seat store at/);
+    assert.notEqual(refusal.code, "SEAT_ROW_MISSING", "F1: corrupt must never read as absent");
+    assert.equal(await readStoreBytes(homeDir), bytes, "the corrupt file must be left untouched");
+  });
+});
+
+test("CL8 · close on an ABSENT row refuses SEAT_ROW_MISSING with AP17's cause and remedy", async () => {
+  await withRig(async (homeDir) => {
+    const result = await runCli(["--format", "json", "seats", "close", SEAT_ABSENT], homeDir);
+    assert.equal(result.code, 1);
+    const refusal = refusalOf(result);
+    assert.equal(refusal.code, "SEAT_ROW_MISSING");
+    assert.match(refusal.error, /predates the seat store/i, "the refusal does not name the cause");
+    assert.match(refusal.error, /backfill/i, "the refusal does not name the remedy");
+  });
+});
+
+test("CL9 · close on a MALFORMED row refuses SEAT_ROW_MALFORMED; the row survives VERBATIM (never becomes the write that deletes it)", async () => {
+  await withRig(async (homeDir) => {
+    const malformed = { seat_id: SEAT_A, created_at: "x", next_ordinal: 0 };
+    await writeStore(homeDir, { [SEAT_A]: malformed });
+
+    const result = await runCli(["--format", "json", "seats", "close", SEAT_A], homeDir);
+    assert.equal(result.code, 1);
+    const refusal = refusalOf(result);
+    assert.equal(refusal.code, "SEAT_ROW_MALFORMED");
+
+    const after = await readStoreJson(homeDir);
+    assert.deepEqual(
+      after[SEAT_A],
+      malformed,
+      "close must not become the write that silently deletes an unreadable row",
+    );
+  });
+});
+
+// ═══ Group CLB — the three B2b verbs on a CLOSED seat (B2c PLAN.md §1) ════════
+//
+// All three SUCCEED — sub-HoD ruling, PLAN.md §1: close KEEPS the row precisely so
+// it stays correctable/attributable after abolition. Each row also asserts
+// closed_at is BYTE-UNCHANGED — the standing guard that the `{...row, field}`
+// spread never drops or moves the key, one field over from D8's malformed-row trap.
+
+test("CLB1 · `set-brick` on a CLOSED seat SUCCEEDS; closed_at is byte-unchanged", async () => {
+  await withRig(async (homeDir) => {
+    const closedAt = "2026-09-29T00:00:00.000Z";
+    await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A, { closed_at: closedAt }) });
+
+    const result = await runCli(["seats", "set-brick", SEAT_A, BRICK_ID], homeDir);
+    assert.equal(result.code, 0, result.output);
+    const after = await readStoreJson(homeDir);
+    assert.equal(after[SEAT_A]?.brick_id, BRICK_ID);
+    assert.equal(after[SEAT_A]?.closed_at, closedAt, "close's timestamp must be byte-unchanged");
+  });
+});
+
+test("CLB2 · `rename` on a CLOSED seat SUCCEEDS; closed_at is byte-unchanged", async () => {
+  await withRig(async (homeDir) => {
+    const closedAt = "2026-09-29T00:00:00.000Z";
+    await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A, { closed_at: closedAt, name: "old" }) });
+
+    const result = await runCli(["seats", "rename", SEAT_A, "renamed-after-close"], homeDir);
+    assert.equal(result.code, 0, result.output);
+    const after = await readStoreJson(homeDir);
+    assert.equal(after[SEAT_A]?.name, "renamed-after-close");
+    assert.equal(after[SEAT_A]?.closed_at, closedAt, "close's timestamp must be byte-unchanged");
+  });
+});
+
+test("CLB3 · `delete` on a CLOSED seat SUCCEEDS — the row is removed, which is what the byway sweep needs", async () => {
+  await withRig(async (homeDir) => {
+    const closedAt = "2026-09-29T00:00:00.000Z";
+    await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A, { closed_at: closedAt }) });
+
+    const result = await runCli(["seats", "delete", SEAT_A], homeDir);
+    assert.equal(result.code, 0, result.output);
+    assert.equal(
+      (await readStoreJson(homeDir))[SEAT_A],
+      undefined,
+      "a closed seat's row must still delete",
+    );
   });
 });
 
