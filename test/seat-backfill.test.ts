@@ -1196,3 +1196,69 @@ test("L18b: `--help` carries both decisions too — the operator reading before 
     assert.match(output, /--apply/);
   });
 });
+
+// ─── L16b — the `seats` noun is registered EXACTLY ONCE ─────────────────────
+
+/**
+ * 🛑 THE RISK RANKING HERE WAS MEASURED, NOT ASSUMED, AND IT INVERTED.
+ *
+ * B10 and B2b both create `src/cli/seats-command.ts` and both export the same symbol
+ * `registerSeatsCommand`, each registering a different subset of the `seats` verbs.
+ * Probed against this worktree's own commander (14.0.3) with the exact union shape —
+ * one registrar called twice on one program:
+ *
+ *   Error: cannot add command 'seats' as already have command 'seats'   → THREW
+ *
+ * So a duplicated call is **LOUD**: it breaks CLI setup on *every* `acpx` invocation
+ * and cannot survive one run, let alone reach a commit. The silent defect is the
+ * other one — resolving the add/add by KEEPING ONE SIDE, which yields a valid binary
+ * that starts, answers, and is missing verbs. That is what L16a (added with the
+ * merge) exists for.
+ *
+ * This row is belt-and-braces and is committed anyway: it costs nothing, and if a
+ * future commander relaxes the duplicate check it becomes load-bearing — better that
+ * it already exists than that someone has to notice.
+ */
+test("L16b: `seats` is registered exactly once, and every subcommand it lists ANSWERS", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [makeRecord({ acpxRecordId: "l16b" })]);
+
+    // 🔑 ASSERT ON OUTPUT, NEVER ON AN rc. `cli-core.ts` says it outright: the rc
+    // names WHICH FALL-THROUGH FIRED, not whether the command exists, and it is
+    // cwd-dependent — unsound in both directions. `No acpx session found` is what the
+    // agent-name fall-through prints, and it must be ABSENT for a registered verb.
+    const help = await runCli(["seats", "--help"], homeDir);
+    const output = `${help.stdout}${help.stderr}`;
+    assert.equal(
+      output.includes("No acpx session found"),
+      false,
+      "`seats` fell through to the agent registry",
+    );
+
+    // Exactly one `seats` in the top-level list — the duplicate-registration guard.
+    const topLevel = await runCli(["--help"], homeDir);
+    const topLevelText = `${topLevel.stdout}${topLevel.stderr}`;
+    const seatsMentions = topLevelText
+      .split("\n")
+      .filter((line) => /^\s{2,}seats\b/.test(line)).length;
+    assert.equal(seatsMentions, 1, `top-level help lists \`seats\` ${seatsMentions} times, want 1`);
+
+    // DISCOVERING, not a second hand-written list: every subcommand the binary
+    // actually advertises must answer. A hand list would be exactly as incomplete as
+    // the registration it checks.
+    //
+    // ⚠️ THIS ALONE CANNOT CATCH "three of four registered" — it discovers whatever
+    // is there and is happy. The literal four-name assertion is L16a, and it lands
+    // with the B2b union; do not read this row as covering that.
+    const listed = [...output.matchAll(/^\s{2}([a-z][a-z-]*)\s{2,}\S/gm)].map((match) => match[1]);
+    assert.ok(listed.includes("backfill"), `\`backfill\` is not listed: ${listed.join(",")}`);
+    for (const name of listed) {
+      const sub = await runCli(["seats", name, "--help"], homeDir);
+      assert.equal(
+        `${sub.stdout}${sub.stderr}`.includes("No acpx session found"),
+        false,
+        `\`seats ${name}\` is advertised but does not answer`,
+      );
+    }
+  });
+});
