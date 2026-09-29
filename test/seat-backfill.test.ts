@@ -67,9 +67,10 @@ import {
  * against every seat on every live box. The row fails on it, so the row discriminates
  * the defect it exists for rather than merely being non-vacuous.
  *
- * **L19 was falsified differently and more strongly — a TRANSPLANTED-TEST ARM against
- * the real pre-fix commit. Its own comment carries the label, the measurement, and
- * why it is NOT technique (b).**
+ * **L19 was falsified differently and more strongly — by a (b′) TRANSPLANTED-TEST ARM
+ * against the real committed pre-fix tree `c7ee352`, with the test file copied in
+ * because the row postdates that tree. Its own comment carries the claim, the
+ * disclosure that earns it, and the measurement.**
  */
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
@@ -1382,25 +1383,32 @@ test("L16a: `acpx seats` registers ALL FOUR subcommands, and each ANSWERS", asyn
  *   this is not data loss; but B12a's operator runs the command ONCE, and the
  *   remedy must never be "run it twice".
  *
- * ## How this row was falsified — a TRANSPLANTED-TEST ARM
+ * ## How this row was falsified
  *
- * *"The product side is the real committed pre-fix tree `c7ee352`; the test side was
- * copied in; nothing inverted and no `src/` guard touched. Not (b) — the test did not
- * exist on that tree — and stronger than (c), which only shows a row CAN fail."*
- * (L0's wording, 2026-09-29.) Measured: a detached worktree at `c7ee352` with this
- * file copied in, `build:test` rc 0, and **L19 fails there on exactly the assertion
- * that names the defect** — *"the orphan's index entry lacks its seatId"*.
+ * **Red arm — (b′) transplanted-test arm: L19 was run against the real committed
+ * pre-fix tree `c7ee352` with the test file copied in, since the row postdates that
+ * tree; nothing inverted, no `src/` guard touched.**
  *
- * 🛑 **THE LABEL LIVES HERE, IN THE CODE, BECAUSE A RE-DERIVER READS THE CODE** — the
- * same reason the name-ordering warning above is here rather than in a document
+ * *Measured:* detached worktree at `c7ee352`, `build:test` rc 0, and **L19 fails
+ * there on exactly the assertion that names the defect** — *"the orphan's index entry
+ * lacks its seatId"*.
+ *
+ * 🛑 **THAT DISCLOSURE IS THE CONDITION THAT EARNS THE FORM, NOT A FOOTNOTE.** (b′)
+ * must name the transplant AND the pre-fix SHA **in the same sentence that claims
+ * it**; an arm that cannot be stated that plainly falls back to (c). So do not
+ * shorten the sentence above to "red-armed (b′)" and explain it further down.
+ *
+ * 🛑 **AND THE LABEL LIVES HERE, IN THE CODE, BECAUSE A RE-DERIVER READS THE CODE** —
+ * the same reason the name-ordering warning above is here rather than in a document
  * beside it. A fragile fact belongs attached to the thing that can go wrong.
  *
- * ⚠️ I first called this "technique (b)" and that was WRONG. Under our own standard
- * (b) means THE TEST EXISTED ON THAT TREE; this row postdates it, so old product plus
- * new test is a MIXED TREE, which the standard excludes. Recorded rather than quietly
- * relabelled because a sibling lane met the identical shape and took the less
- * flattering call — and if two lanes name one method two ways, the block whose
- * evidence merely LOOKS weaker is the honest one.
+ * ⚠️ I first called this "technique (b)" and that was wrong: (b) means THE TEST
+ * EXISTED ON THAT TREE, and this row postdates `c7ee352`, so old product plus new
+ * test is a MIXED TREE. A sibling lane met the identical shape and took the less
+ * flattering call — "(b) unavailable" — and **(b′) exists so that honest call no
+ * longer reads as weaker.** Recorded rather than quietly relabelled, because if two
+ * lanes name one method two ways the block whose evidence merely LOOKS weaker is the
+ * honest one.
  */
 test("L19: a record with NO index entry gets a CORRECT entry in one --apply, and the second run is a no-op", async () => {
   await withTempHome(async (homeDir) => {
