@@ -1191,8 +1191,11 @@ test("L18b: `--help` carries both decisions too — the operator reading before 
     const output = `${help.stdout}${help.stderr}`;
     assert.match(output, /parent_seat_id IS DELIBERATELY NOT SET/);
     assert.match(output, /SAFE TO RE-RUN IF YOU INTERRUPT IT/);
-    // The control: `--help` really did render, so the two matches above are not
-    // passing against some other output that happens to contain the words.
+    // 🛑 THE PRECONDITION, NOT ADVICE. Concurrent-backfill-while-live is FORBIDDEN by
+    // B12a, and an operator must meet that before running, not discover it after.
+    assert.match(output, /RUN THIS ON A QUIET BOX/);
+    // The control: `--help` really did render, so the matches above are not passing
+    // against some other output that happens to contain the words.
     assert.match(output, /--apply/);
   });
 });

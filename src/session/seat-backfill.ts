@@ -150,6 +150,17 @@ export const SEAT_BACKFILL_NOTES = [
   // unset is recoverable by a later pass, while setting it WRONG across every record
   // is not — and this is the one artefact in the design with no recovery path.
   "parent_seat_id is deliberately NOT set by this verb (ruled): it is incompleteness, not a defect — setting it wrong across every record would be unrecoverable, leaving it unset is not",
+  // 🛑 THE PRECONDITION, STATED SO AN OPERATOR MEETS IT RATHER THAN DISCOVERS IT.
+  // B12a FORBIDS running this against a live box, and the chain is all measurement:
+  // the index lock PROCEEDS UNLOCKED after ~2 s of contention BY DESIGN (ratified,
+  // `SEAT-STORE.md` item 5); B2b's test-engineer measured the loss cliff at 0 losses
+  // with 2/4/6 concurrent writers and the FIRST LOSS AT 8, material from 16 — with
+  // every contender exiting rc 0 and empty stderr, so THE LOSS IS SILENT AT THE
+  // CALLER; and this run spends minutes doing 1,900 x (whole-index + whole-store
+  // rewrite) while a live box writes the index continuously. That is exactly the
+  // sustained-contention case in which the ratified give-up drops writes — on the one
+  // artefact with no recovery path.
+  "run this on a QUIET BOX: B12a forbids backfilling while sessions are live, because the index lock gives up after ~2 s of contention by design and concurrent writers start losing writes SILENTLY",
 ] as const;
 
 /** The index exists and does not satisfy `readSessionIndex`'s all-or-nothing

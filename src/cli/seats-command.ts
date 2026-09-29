@@ -824,6 +824,13 @@ WHAT IT WRITES, PER RECORD, IN THIS ORDER — and the order is the point.
   An index entry therefore never claims a seat the record lacks — and a record whose
   write fails takes its own index and row legs with it, rather than half-landing.
 
+🛑 RUN THIS ON A QUIET BOX. B12a FORBIDS backfilling while sessions are live, and
+  this is a precondition rather than advice. The index lock PROCEEDS UNLOCKED after
+  ~2 s of contention by design (ratified); concurrent writers were measured losing
+  writes from 8 upward — with every contender exiting 0 and empty stderr, so THE
+  LOSS IS SILENT. This run holds that contention for minutes, against the one
+  artefact in the design that cannot be rebuilt from anything.
+
 IDEMPOTENT, AND SAFE TO RE-RUN IF YOU INTERRUPT IT. A second --apply reports 0 and
 leaves seats.json byte-identical. A dry run writes nothing at all. Records that
 already carry a seat, and index entries that already agree with their record, are
