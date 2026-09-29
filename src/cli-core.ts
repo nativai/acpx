@@ -72,9 +72,18 @@ export const TOP_LEVEL_VERBS = new Set([
   "set-mode",
   "set",
   "sessions",
-  // `seats` — seat maintenance beside the session records. Registered by
-  // `registerSeatsCommand`; this entry is the second half of the two
-  // registrations that verb needs (B10, brick f65262c1).
+  // `seats` — the seat store's own surface: the MUTATION verbs (`set-brick`,
+  // `rename`, `delete`, B2b brick 03bc080b) and `backfill` (B10 brick f65262c1),
+  // all registered by the ONE `registerSeatsCommand`. This entry is the second half
+  // of the two registrations that verb needs. acpx is the seat store's only writer,
+  // so these verbs are what acpx-ui-side callers invoke by path; without this entry
+  // the token falls through to the AGENT registry and `acpx seats delete <id>`
+  // becomes a prompt delivery in any session-bearing cwd (OS brick 2e3f50b5).
+  //
+  // ⚠️ B2b AND B10 EACH ADDED THIS LINE, and the merge produced it TWICE — inert,
+  // because this is a `Set`, which is exactly why it is worth a word: of the three
+  // places the two lanes collided, this is the only one that could have survived
+  // silently. De-duplicated deliberately rather than left to the Set.
   "seats",
   "subscriptions",
   "profiles",

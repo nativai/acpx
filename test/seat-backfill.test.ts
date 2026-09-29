@@ -1250,9 +1250,82 @@ test("L16b: `seats` is registered exactly once, and every subcommand it lists AN
     // ⚠️ THIS ALONE CANNOT CATCH "three of four registered" — it discovers whatever
     // is there and is happy. The literal four-name assertion is L16a, and it lands
     // with the B2b union; do not read this row as covering that.
-    const listed = [...output.matchAll(/^\s{2}([a-z][a-z-]*)\s{2,}\S/gm)].map((match) => match[1]);
+    // ⚠️ THE NAME IS THE FIRST TOKEN ON A TWO-SPACE-INDENTED LINE, AND NOTHING MAY BE
+    // ASSUMED TO FOLLOW IT. An earlier version required two more spaces and a
+    // non-space after the name — which is the layout for a bare verb and NOT the
+    // layout commander uses once a subcommand takes options or arguments
+    // (`  set-brick [options] <seat> <brick>  Point a seat…`). It matched zero
+    // commands and the row failed on its own control, which is the right direction
+    // for a discovering check to fail in: it could not silently discover nothing.
+    // `-h, --help` cannot match because the alternation is anchored on `[a-z]`; the
+    // continuation lines are indented far deeper than two.
+    const listed = [...output.matchAll(/^ {2}([a-z][a-z0-9-]*)\b/gm)]
+      .map((match) => match[1])
+      .filter((name) => name !== "help");
     assert.ok(listed.includes("backfill"), `\`backfill\` is not listed: ${listed.join(",")}`);
+    assert.ok(
+      listed.length >= 4,
+      `expected the whole union to be listed, found: ${listed.join(",")}`,
+    );
     for (const name of listed) {
+      const sub = await runCli(["seats", name, "--help"], homeDir);
+      assert.equal(
+        `${sub.stdout}${sub.stderr}`.includes("No acpx session found"),
+        false,
+        `\`seats ${name}\` is advertised but does not answer`,
+      );
+    }
+  });
+});
+
+// ─── L16a — ALL FOUR subcommands answer on the shipped binary ────────────────
+
+/**
+ * 🛑 THE ROW THAT CATCHES THE UNION'S ONLY SILENT DEFECT.
+ *
+ * B2b (`set-brick`, `rename`, `delete`) and B10 (`backfill`) were cut from the same
+ * commit and each created `src/cli/seats-command.ts` exporting the SAME symbol
+ * `registerSeatsCommand`. Resolving that add/add by KEEPING ONE SIDE yields a binary
+ * that compiles, starts and answers — **with three of the four verbs missing**, and
+ * no type error anywhere. Neither lane's own rows can catch that, because each lane
+ * only ever asserted its own verbs.
+ *
+ * The other two collision points are loud and were MEASURED rather than assumed:
+ * a duplicated registrar call makes commander 14 throw at CLI setup, and a duplicated
+ * `TOP_LEVEL_VERBS` entry is inert because it is a `Set`. So this list is where the
+ * care belongs.
+ *
+ * ⚠️ IT ASSERTS THAT `delete` **ANSWERS**, AND DELIBERATELY EXERCISES NOTHING ELSE.
+ * B2b's semantics are TE-passed and are not this row's to re-litigate — variadic
+ * `delete` is a data-safety decision on a measured loss cliff, and it carries two
+ * OPPOSITE failure contracts (`SEAT_REF_INVALID` is total, nothing deleted;
+ * `SEAT_ROW_MALFORMED` is partial, committing the rest). A row here that poked at
+ * either would couple this block to contracts it does not own.
+ */
+const SEATS_SUBCOMMANDS = ["set-brick", "rename", "delete", "backfill"] as const;
+
+test("L16a: `acpx seats` registers ALL FOUR subcommands, and each ANSWERS", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [makeRecord({ acpxRecordId: "l16a" })]);
+
+    const help = await runCli(["seats", "--help"], homeDir);
+    const output = `${help.stdout}${help.stderr}`;
+    // 🔑 OUTPUT, NEVER AN rc. `cli-core.ts:41-52`: the rc names which fall-through
+    // fired rather than whether the command exists, and it is cwd-dependent — so it
+    // is unsound in both directions. `No acpx session found` is the control string.
+    assert.equal(
+      output.includes("No acpx session found"),
+      false,
+      "`seats` fell through to the agent registry",
+    );
+
+    for (const name of SEATS_SUBCOMMANDS) {
+      assert.match(
+        output,
+        new RegExp(`^\\s{2}${name}\\b`, "m"),
+        `\`seats --help\` does not list \`${name}\` — the union dropped a lane's verbs`,
+      );
+      // Advertised is not the same as reachable: ask each one directly.
       const sub = await runCli(["seats", name, "--help"], homeDir);
       assert.equal(
         `${sub.stdout}${sub.stderr}`.includes("No acpx session found"),

@@ -1060,6 +1060,14 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
   });
 
   registerSessionsCommand(program, undefined, config);
+  // ⚠️ EXACTLY ONE CALL, AND THE MERGE PRODUCED TWO. B2b and B10 each added their
+  // own; git folded the identical import into one but kept both calls, which is
+  // valid TypeScript and so invisible to typecheck. Commander 14 does catch it —
+  // measured: `cannot add command 'seats' as already have command 'seats'`, thrown
+  // at CLI setup, breaking EVERY `acpx` invocation rather than just `acpx seats`.
+  // ⚠️ SECOND HALF IN `src/cli-core.ts`'s `TOP_LEVEL_VERBS`. Registered top-level
+  // only — the seat store is one agent-agnostic file, so `acpx claude seats …`
+  // would be meaningless.
   registerSeatsCommand(program, config);
   registerSubscriptionsCommand(program, config);
   registerProfilesCommand(program, config);
