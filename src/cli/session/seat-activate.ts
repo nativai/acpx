@@ -158,7 +158,7 @@ async function resolveSeatOrRefuse(seatRef: string): Promise<SeatRecord> {
   if (seat.closedAt !== null && seat.closedAt !== undefined) {
     throw new SeatActivationRefusalError(
       "SEAT_CLOSED",
-      `seat ${seatId} was closed at ${seat.closedAt} — the office is abolished and takes ` +
+      `seat ${seatId} was closed at ${seat.closedAt} — the seat is abolished and takes ` +
         `no further holders. Note this is NOT the same as the seat being vacant: a vacant ` +
         `seat (no active holder) still accepts one.`,
     );

@@ -1,10 +1,14 @@
 import type { Command } from "commander";
+import { SessionNotFoundError } from "../errors.js";
 import {
   SEAT_STORE_FILE,
   SEAT_STORE_NO_CHANGE,
   SeatStoreUnwritableError,
   MalformedSeatRowError,
+  isoNow,
   parseSeatRefOrThrow,
+  readSeatStore,
+  resolveSessionRecord,
   seatFromStore,
   seatRowMissingMessage,
   seatStorePath,
@@ -20,9 +24,10 @@ import { emitJsonResult } from "./output/json-output.js";
 import { BRICK_UUID_RE } from "./session/brick-link.js";
 
 /**
- * `acpx seats set-brick` / `rename` / `delete` — **B2b, brick 03bc080b.**
+ * `acpx seats set-brick` / `rename` / `delete` — **B2b, brick 03bc080b** — plus
+ * `acpx seats close` — **B2c, brick 4a17c8b5.**
  *
- * ## Why these three live here rather than at their callers
+ * ## Why these live here rather than at their callers
  *
  * Three ratified decisions each assign a seat-store WRITE to code on the acpx-ui
  * side — `brick attach` sets a seat's `brick_id` (C4), the UI renames a seat (E10),
@@ -73,22 +78,42 @@ import { BRICK_UUID_RE } from "./session/brick-link.js";
  * `test/seats-mutation-verbs.test.ts` asserts the holder's record is UNCHANGED —
  * the contemplated state proven rather than tolerated.
  *
+ * ## 🛑 `close` KEEPS THE ROW; `delete` REMOVES IT — the one thing a writer must
+ * never collapse
+ *
+ * `close` writes `closed_at` and **touches no other field** (ratification item 2,
+ * `SEAT-STORE.md`). `delete` removes the row entirely. A writer that folded the two
+ * together would destroy the only thing `closed_at` records — that the seat's
+ * abolition is on a KEPT row, not that the row is gone. **`seats delete` on a
+ * closed seat still SUCCEEDS** (§1.1 below is `set-brick` / `rename` / `delete`, not
+ * `close`'s own scope) — B2b's header already states this and it remains correct:
+ * the byway sweep's caller is `delete`, and a seat that was abolished is exactly the
+ * population whose rows become collectable.
+ *
+ * ## The three B2b verbs on a CLOSED seat — all three SUCCEED (sub-HoD ruling,
+ * B2c PLAN.md §1)
+ *
+ * `set-brick` / `rename` / `delete` add **no** closed-seat refusal. `close` KEEPS
+ * the row precisely so a closed seat's record stays correctable and attributable —
+ * a misnamed seat discovered after abolition would otherwise be permanently
+ * unfixable, and `brick attach`'s real caller cannot interpret a seat-lifecycle
+ * refusal. Each of the three still asserts `closed_at` is BYTE-UNCHANGED after its
+ * write — the standing guard that the `{...row, field}` spread never drops or moves
+ * the key.
+ *
  * ## What this file deliberately does NOT do
  *
- * - **Nothing here writes `closed_at`.** Seat *closure* is B2c's verb. `delete`
- *   REMOVES the row; close KEEPS it and stamps it, and a writer that collapses the
- *   two destroys the only thing `closed_at` records (ratification item 2). The
- *   three verbs are otherwise indifferent to the field: they preserve it by
- *   spreading the fresh row.
- * - **No closed-seat refusal.** Item 2 places a closed seat's refusals on
- *   `activate` and create-into-seat, not here — and until B2c lands nothing in the
- *   product can write a closure, so such a refusal would have a structurally
- *   unreachable refused state. Consequence, stated loudly: **`seats delete` on a
- *   closed seat SUCCEEDS**, which is correct and is what the byway sweep needs.
  * - **No `--unset` on `set-brick`.** No caller needs it (`brick attach` always
  *   sets), so it would ship as an untested path. Consequence: once set, `brick_id`
  *   cannot be cleared by any verb in B2b.
  * - **No short-ref resolution.** See `parseBrickIdOrThrow`.
+ * - **No re-open verb.** Nothing in the record asks for one, and `close` is
+ *   deliberately the only writer of a `closed_at` **timestamp** anywhere in the
+ *   product (SEAT-STORE.md item 2, AC16). Once closed, a seat stays closed as far
+ *   as any shipped verb is concerned.
+ * - **No `--at` / timestamp argument on `close`.** The written value is always a
+ *   clock read taken INSIDE the write hold — never a caller-supplied or
+ *   caller-influenced value. Unrepresentable, not merely refused.
  */
 
 type SeatMutationRefusalCode =
@@ -97,7 +122,9 @@ type SeatMutationRefusalCode =
   | "SEAT_NAME_INVALID"
   | "SEAT_ROW_MISSING"
   | "SEAT_ROW_MALFORMED"
-  | "SEAT_STORE_UNWRITABLE";
+  | "SEAT_STORE_UNWRITABLE"
+  | "SEAT_HOLDER_OPEN"
+  | "SEAT_HOLDER_CHANGED";
 
 /** Refusals carry a code so a caller can render them without matching on prose —
  * the shape `SeatActivationRefusalError` already uses on the succession verb. */
@@ -575,6 +602,240 @@ function renderSeatDeleteReport(
   }
 }
 
+// ─── close ───────────────────────────────────────────────────────────────────
+
+/**
+ * 🛑 THE ONE STRUCTURAL PROBLEM IN THIS VERB, AND WHY IT IS THREE PHASES —
+ * `withSeatStoreWrite`'s `mutate` is SYNCHRONOUS BY DESIGN (`seat-store.ts:584-597`:
+ * *"`mutate` RETURNS A VALUE, NEVER A PROMISE, AND THAT IS THE BOUND"*), so it cannot
+ * `await` a session-record read. Resolving whether the seat's active holder is open
+ * needs exactly that — an async record read — so it cannot happen inside the hold,
+ * and a naive read-then-close has a real race: between an unlocked read and the
+ * hold, an activation can point a LIVE holder at the seat, and we would close a seat
+ * with a live holder.
+ *
+ * The shape below is copied from `seat-activate.ts`, which already solves this for
+ * the same reason (phase 0.1 reads unlocked; phase 2 re-checks `closedAt` fresh
+ * inside its own hold):
+ *
+ *   A (no lock) — read the row, note `active_holder_id` (`H₀`)
+ *   B (no lock) — if `H₀ !== null`, resolve its record and decide open / not-open
+ *   C (HOLD)    — re-read the row FRESH and decide via `decideSeatClose`, in order:
+ *                 ① already closed ⇒ no-op · ② `active_holder_id` moved since A ⇒
+ *                 refuse (the vetted holder is not the current one) · ③ the vetted
+ *                 holder was open ⇒ refuse · ④ otherwise write
+ *
+ * Both re-checks in C read the FRESH row — never a value captured before the lock
+ * (`withSeatStoreWrite`'s second hard rule).
+ */
+export type SeatCloseDecision =
+  | { readonly kind: "already-closed" }
+  | { readonly kind: "holder-changed" }
+  | { readonly kind: "holder-open" }
+  | { readonly kind: "close" };
+
+/**
+ * The CAS decision, extracted as a PURE, EXPORTED function — the same precedent
+ * `buildSeatDeletion` sets, and for the same one reason: `SEAT_HOLDER_CHANGED`'s
+ * refused state needs an interleaving no single-process CLI row can enter
+ * deterministically, and a two-process race is a flaky test, not a test. So a row
+ * calls this function directly — the product's own decision function — rather than
+ * racing two processes or re-implementing the decision as a second copy.
+ *
+ * Makes no I/O of its own: `freshRow` MUST already be the row read INSIDE the hold
+ * (phase C), and `vettedHolder` MUST already be resolved in the unlocked phase B.
+ */
+export function decideSeatClose(
+  freshRow: SeatRecord,
+  vettedHolder: { readonly id: string | null; readonly open: boolean },
+): SeatCloseDecision {
+  if (freshRow.closedAt !== null && freshRow.closedAt !== undefined) {
+    return { kind: "already-closed" };
+  }
+  if (freshRow.activeHolderId !== vettedHolder.id) {
+    return { kind: "holder-changed" };
+  }
+  if (vettedHolder.open) {
+    return { kind: "holder-open" };
+  }
+  return { kind: "close" };
+}
+
+/**
+ * Phase B — resolve `holderId`'s record (unlocked) and decide open / not-open.
+ *
+ * `null` (nobody home) trivially vets as not-open: there is no holder to close
+ * first (AC16 ii). A DANGLING pointer — the record cannot be resolved at all —
+ * ALSO vets as not-open: refusing would make the seat permanently uncloseable, with
+ * no action the operator can take. Judgment call, flagged in PLAN.md §2.2's table.
+ */
+async function vetActiveHolder(
+  holderId: string | null,
+): Promise<{ id: string | null; open: boolean; dangling: boolean }> {
+  if (holderId === null) {
+    return { id: null, open: false, dangling: false };
+  }
+  try {
+    const record = await resolveSessionRecord(holderId);
+    // `record.closed` is `boolean | undefined` — anything other than `true` is open,
+    // matching `seat-activate.ts`'s successor/predecessor checks elsewhere in this
+    // programme (`successor.closed === true`).
+    return { id: holderId, open: record.closed !== true, dangling: false };
+  } catch (error) {
+    if (error instanceof SessionNotFoundError) {
+      return { id: holderId, open: false, dangling: true };
+    }
+    throw error;
+  }
+}
+
+function seatHolderOpenMessage(seatId: string, holderId: string): string {
+  return (
+    `seat ${JSON.stringify(seatId)} refuses to close: its active holder ` +
+    `${JSON.stringify(holderId)} is still open per its own record. Close the holder ` +
+    // `--session-id`, NOT a bare positional: `sessions close`'s positional `[name]`
+    // resolves by SESSION NAME, not by record id (`session-selector.ts`), so a
+    // remedy naming the bare id here would be advice that does not work.
+    `first (\`acpx sessions close --session-id ${holderId}\`), then retry ` +
+    `\`acpx seats close ${seatId}\`. A VACANT seat (no active holder) closes ` +
+    `without this step.`
+  );
+}
+
+/**
+ * ⚠️ DELIBERATELY SHARES NO SUBSTRING WITH `seatHolderOpenMessage`, NOR WITH
+ * `seatRowMissingMessage` / `seatRowsMalformedMessage` / the unwritable-store
+ * message. Two refusals that shared a substring would be green whichever fired —
+ * B2's AP13 defect exactly.
+ */
+function seatHolderChangedMessage(seatId: string): string {
+  return (
+    `seat ${JSON.stringify(seatId)} was not closed: its active holder changed while ` +
+    `this close was evaluating it — a concurrent activation or handover won. Nothing ` +
+    `has been written. Re-run \`acpx seats close ${seatId}\` to evaluate the seat's ` +
+    `current state.`
+  );
+}
+
+type SeatCloseResult =
+  | { readonly kind: "already-closed"; readonly closedAt: string }
+  | {
+      readonly kind: "closed";
+      readonly closedAt: string;
+      readonly holderUnresolvable: string | undefined;
+    };
+
+async function handleSeatsClose(
+  seatRef: string,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const { format } = resolveGlobalFlags(command, config);
+  await runSeatMutation("close", format, async () => {
+    const seatId = parseSeatIdOrThrow(seatRef);
+    const sessionDir = sessionBaseDir();
+
+    // PHASE A — unlocked read. Also the FIRST row lookup, so a malformed/unwritable
+    // store or a missing/malformed row is refused right here, before any async
+    // holder resolution — never as a bare "seat not found" (F1's defect).
+    const preflightStore = await readSeatStore(sessionDir);
+    refuseUnwritableStore(preflightStore, sessionDir);
+    const preflightRow = requireSeatRow(preflightStore, seatId);
+
+    // PHASE B — unlocked, async. The record read `mutate` structurally cannot do.
+    const vetted = await vetActiveHolder(preflightRow.activeHolderId);
+
+    // PHASE C — THE HOLD. Re-read fresh; decide via the pure, exported function.
+    // ⚠️ THE RETURN TYPE IS ANNOTATED EXPLICITLY: without it, TypeScript narrows `T`
+    // in `withSeatStoreWrite<T>` per-branch from the switch's individual return
+    // statements rather than widening to `SeatCloseResult`, and the branches
+    // disagree on `result.kind`'s literal type.
+    const result = await withSeatStoreWrite<SeatCloseResult>(sessionDir, (store) => {
+      refuseUnwritableStore(store, sessionDir);
+      const freshRow = requireSeatRow(store, seatId);
+      const decision = decideSeatClose(freshRow, { id: vetted.id, open: vetted.open });
+      switch (decision.kind) {
+        case "already-closed": {
+          const outcome: SeatCloseResult = {
+            kind: "already-closed",
+            // `freshRow.closedAt` is a string here by construction of this branch.
+            closedAt: freshRow.closedAt as string,
+          };
+          return { mutation: SEAT_STORE_NO_CHANGE, result: outcome };
+        }
+        case "holder-changed":
+          throw new SeatMutationRefusalError(
+            "SEAT_HOLDER_CHANGED",
+            seatHolderChangedMessage(seatId),
+          );
+        case "holder-open":
+          throw new SeatMutationRefusalError(
+            "SEAT_HOLDER_OPEN",
+            // `vetted.id` is non-null here: "holder-open" only returns when
+            // `vettedHolder.open` is true, which `decideSeatClose` never sets for a
+            // `null` holder.
+            seatHolderOpenMessage(seatId, vetted.id as string),
+          );
+        case "close": {
+          // 🛑 THE CLOCK READ IS TAKEN HERE, INSIDE THE HOLD — never a value passed
+          // in, never a value computed in phase A or B (AC16, SEAT-STORE.md item 2).
+          const closedAt = isoNow();
+          const seats = new Map(store.seats);
+          // SPREAD the fresh row — `close` touches `closed_at` and NOTHING else.
+          seats.set(seatId, { ...freshRow, closedAt });
+          const outcome: SeatCloseResult = {
+            kind: "closed",
+            closedAt,
+            holderUnresolvable: vetted.dangling ? (vetted.id ?? undefined) : undefined,
+          };
+          return { mutation: { kind: "write", seats } as const, result: outcome };
+        }
+        default: {
+          // Exhaustive over `SeatCloseDecision["kind"]` — the compiler proves it
+          // (typecheck's control-flow analysis), but the linter's simpler analysis
+          // cannot, so this satisfies `consistent-return` without weakening the type.
+          const unreachable: never = decision;
+          throw new Error(`unreachable seat close decision: ${JSON.stringify(unreachable)}`);
+        }
+      }
+    });
+    renderSeatClose(format, seatId, result);
+  });
+}
+
+function renderSeatClose(format: OutputFormat, seatId: string, result: SeatCloseResult): void {
+  if (
+    emitJsonResult(format, {
+      ok: true,
+      action: result.kind === "already-closed" ? "seat_close_no_change" : "seat_closed",
+      seatId,
+      closedAt: result.closedAt,
+      changed: result.kind === "closed",
+      ...(result.kind === "closed" && result.holderUnresolvable !== undefined
+        ? { holderUnresolvable: result.holderUnresolvable }
+        : {}),
+    })
+  ) {
+    return;
+  }
+  if (format === "quiet") {
+    return;
+  }
+  if (result.kind === "already-closed") {
+    process.stdout.write(
+      `seat ${seatId}: already closed at ${result.closedAt} — no change (rc 0)\n`,
+    );
+    return;
+  }
+  process.stdout.write(`seat ${seatId}: closed at ${result.closedAt}\n`);
+  if (result.holderUnresolvable !== undefined) {
+    process.stdout.write(
+      `note: the seat's active holder ${result.holderUnresolvable} record was not ` +
+        `resolvable — closing anyway, since there is no holder to close first.\n`,
+    );
+  }
+}
+
 // ─── registration ────────────────────────────────────────────────────────────
 
 /**
@@ -587,8 +848,8 @@ export function registerSeatsCommand(parent: Command, config: ResolvedAcpxConfig
     .command("seats")
     .description(
       "Mutate the seat store (~/.acpx/sessions/seats.json): set a seat's brick, rename a " +
-        "seat, delete seat rows. acpx owns every write to this store; call these verbs " +
-        "rather than writing the file.",
+        "seat, close a seat, delete seat rows. acpx owns every write to this store; call " +
+        "these verbs rather than writing the file.",
     );
 
   seatsCommand
@@ -644,10 +905,10 @@ THERE IS NO --unset. Once set, \`brick_id\` is not cleared by any verb in B2b.
     .addHelpText(
       "after",
       `
-DELETE IS NOT CLOSE. This REMOVES the row; closing a seat KEEPS the row and stamps
-  \`closed_at\`, and nothing here ever writes that field — a writer that collapsed
-  the two would destroy the only thing \`closed_at\` records. Deleting a CLOSED
-  seat succeeds, which is what the byway sweep needs.
+DELETE IS NOT CLOSE. This REMOVES the row; \`acpx seats close\` KEEPS the row and
+  stamps \`closed_at\` — collapsing the two would destroy the only thing
+  \`closed_at\` records. Deleting a CLOSED seat succeeds, which is what the byway
+  sweep needs.
 
 A SEAT WITH NO ROW IS A NO-OP, NOT A REFUSAL (exit 0). The caller is a periodic
   sweep over a changing population; a missing row is its steady state. Nothing is
@@ -666,5 +927,34 @@ VARIADIC ON PURPOSE. The sweep is a synchronous batch loop, so one invocation pe
     )
     .action(async function (this: Command, seats: string[]) {
       await handleSeatsDelete(seats, this, config);
+    });
+
+  seatsCommand
+    .command("close")
+    .description("Deliberately close a seat — the seat is abolished, and the row is KEPT")
+    .argument("<seat>", "The seat, by id (a lowercase UUID)")
+    .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
+    .addHelpText(
+      "after",
+      `
+CLOSE IS NOT DELETE. This KEEPS the row and stamps \`closed_at\` with a clock read
+  taken inside the write; \`acpx seats delete\` removes the row entirely. There is
+  NO --at / timestamp argument: a caller-supplied close time is unrepresentable,
+  never merely refused.
+
+REFUSES if the seat's active holder is still open per its own record — close the
+  holder first (\`acpx sessions close --session-id <holder>\`). A VACANT seat (no
+  active holder) closes without that step.
+
+IDEMPOTENT. A second close on an already-closed seat is a no-op with a notice and
+  exit 0 — not an error, and the timestamp does not move.
+
+ONCE CLOSED, A SEAT REFUSES \`acpx sessions activate\` and refuses create-into-seat.
+  THERE IS NO RE-OPEN VERB: nothing in this CLI ever clears \`closed_at\` back to
+  null.
+`,
+    )
+    .action(async function (this: Command, seat: string) {
+      await handleSeatsClose(seat, this, config);
     });
 }
