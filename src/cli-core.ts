@@ -72,6 +72,10 @@ export const TOP_LEVEL_VERBS = new Set([
   "set-mode",
   "set",
   "sessions",
+  // `seats` — seat maintenance beside the session records. Registered by
+  // `registerSeatsCommand`; this entry is the second half of the two
+  // registrations that verb needs (B10, brick f65262c1).
+  "seats",
   "subscriptions",
   "profiles",
   // Without this entry `acpx models …` falls through to the AGENT registry and

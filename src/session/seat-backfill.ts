@@ -1,0 +1,684 @@
+import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { type LiveProcessScan, scanLiveProcesses } from "../process-population.js";
+import type { SessionRecord } from "../types.js";
+import {
+  type AbandonedRecordSweepResult,
+  sweepAbandonedSessionRecords,
+} from "./abandoned-record-sweep.js";
+import { overlaySessionIndexEntries } from "./persistence/index-overlay.js";
+import {
+  listSessionRecordFiles,
+  readSessionIndex,
+  type SessionIndexEntry,
+  sessionIndexPath,
+} from "./persistence/index.js";
+import { parseSessionRecord } from "./persistence/parse.js";
+import { writeSessionRecordAuthorizingSeatHolderWithoutIndex } from "./persistence/repository.js";
+import { seatFieldsToIndexEntry } from "./persistence/seat-fields.js";
+import {
+  backfillSeatRow,
+  readSeatStore,
+  type SeatRecord,
+  seatStorePath,
+  SeatStoreUnwritableError,
+} from "./persistence/seat-store.js";
+
+/**
+ * THE SEAT BACKFILL — mint a seat for every hot-tier session record that lacks one.
+ *
+ * Ruled, not designed here: the conception ruling of 2026-09-29
+ * (`Bricks/0d2b83f0-.../rulings/backfill-writer-2026-09-29.md`) and brick
+ * `f65262c1`'s amended brief. What this module implements and what it is forbidden
+ * to do are both from there; the reasoning below is only about HOW each ruled
+ * property is reached in this codebase.
+ *
+ * ## Three legs, per record, in one order
+ *
+ * **record → index → seat store**, so *an index entry never claims a seat the record
+ * lacks*. Here that ordering is reinforced by the seam rather than merely obeyed:
+ * `overlaySessionIndexEntries` projects the entry from **the record as it stands on
+ * disk, read inside the index lock** — so the index leg physically cannot invent a
+ * seat id the record does not already carry. A record write that throws takes its
+ * index leg down with it through the per-record `try`/`catch`, and the entry is left
+ * exactly as it was.
+ *
+ * ## 🛑 `reconcileSessionIndex` IS THE WRONG SEAM AND IT FAILS **GREEN**
+ *
+ * The reassuringly-named function is a silent no-op for this job, twice over
+ * (read at `d50e5bf`): its fast path compares only the **file list** and returns the
+ * index unchanged (`index.ts:797-799`), and a backfill changes record *contents*,
+ * never the file list — so that path is always the one taken. Even on drift,
+ * `reconcileDriftedEntries` only DROPS entries for vanished files and ADDS entries
+ * for new ones; it **never re-projects an existing entry** (`index.ts:820-831`),
+ * which is exactly what a stale entry needs. An implementer reaching for it gets a
+ * clean run, `drift: false`, and zero entries enriched — the cutover-blocking defect
+ * reproducing itself inside its own fix. `rebuildSessionIndex` is rejected for the
+ * opposite reason: it re-reads all ~1,900 records and rewrites every entry, an
+ * unbounded scan and a far wider blast radius than one field group needs.
+ *
+ * ## Why per-record locking, with its cost stated
+ *
+ * One `overlaySessionIndexEntries` and one `withSeatStoreWrite` **per record** is
+ * O(n²) in bytes written across a run. That shape was priced and accepted by the
+ * programme's L0 rather than overlooked: per-record locking is what buys per-record
+ * isolation *and* the ruled three-legs-in-order-per-record ordering, and both are
+ * ruled properties rather than preferences. A batched seat leg would be a contract
+ * change, not an optimisation — do not make it here.
+ *
+ * ## What it refuses, and why refusal comes BEFORE the first byte
+ *
+ * A malformed or unreadable `seats.json`, and an `index.json` that exists but fails
+ * `readSessionIndex`'s all-or-nothing contract (`index.ts:645-647`). All three are
+ * checked in preflight, before any backup is taken and before any record is written:
+ * discovering a corrupt store at the first seat write would mean refusing *after*
+ * having already rewritten records and the index. The backfill **cannot repair
+ * corruption** — `seatStoreUnhealthyMessage` prints the quarantine step — and a
+ * confident instruction to do the wrong thing is worse than an error (F1).
+ */
+
+/** Which leg a per-record failure happened in. Named, so "it failed" is never the
+ * whole diagnosis — a row asserting only that the run failed cannot tell a record
+ * write from an index write from a store write. */
+export type SeatBackfillStage = "parse" | "backup" | "record" | "index" | "store";
+
+export type SeatBackfillError = {
+  file: string;
+  acpxRecordId: string | undefined;
+  stage: SeatBackfillStage;
+  code: string | undefined;
+  message: string;
+};
+
+export type SeatBackfillReport = {
+  /** False for the default dry run. The dry run touches nothing. */
+  apply: boolean;
+  sessionDir: string;
+  /** The abandoned-record sweep, which runs FIRST and is REPORT-ONLY here. */
+  sweep: AbandonedRecordSweepResult;
+  recordsScanned: number;
+  /** Records that need (dry run) or were given (`--apply`) a `seat_id`. */
+  recordsSeated: number;
+  /** Distinct seats whose row is missing from `seats.json`. The headline count. */
+  seats: number;
+  /** Index entries needing (dry run) or given (`--apply`) the seat field group. */
+  indexEntries: number;
+  /** Records the index has no entry for at all. Reported, never fabricated — adding
+   * an entry is a MEMBERSHIP change and belongs to reconcile, not to this verb. */
+  recordsWithoutIndexEntry: number;
+  /** Rows minted for a seat a record already carried — AC11 (e)'s "repairs any
+   * row-less seat it meets", counted separately because it is the population that
+   * exists on a box where B1/B2 already landed. */
+  rowsRepaired: number;
+  errors: SeatBackfillError[];
+  /** The `.bak-mig-<TS>` suffix of this run's pre-apply copies, absent on a dry run. */
+  backupSuffix: string | undefined;
+  backups: string[];
+  /** `--verify`: records carrying `seat_id` whose index entry lacks `seatId`. */
+  staleIndexEntries: number;
+  elapsedMs: number;
+};
+
+/** The index exists and does not satisfy `readSessionIndex`'s all-or-nothing
+ * contract, so the backfill refuses rather than letting `reconcileSessionIndex`
+ * silently rebuild the whole store behind it. */
+export class SeatBackfillIndexUnreadableError extends Error {
+  constructor(readonly filePath: string) {
+    super(
+      `refusing to backfill: ${filePath} EXISTS but does not parse as a session index. ` +
+        `readSessionIndex is ALL-OR-NOTHING — one unparseable entry rejects the whole file — ` +
+        `so every index write from here would be built on a full REBUILD of the index from ` +
+        `records, which is both an unbounded scan and a far wider change than this verb is ` +
+        `allowed to make. Quarantine the file (rename it aside, keeping it), let acpx rebuild ` +
+        `the index on the next ordinary read, and run the backfill again.`,
+    );
+    this.name = "SeatBackfillIndexUnreadableError";
+  }
+}
+
+export type SeatBackfillOptions = {
+  sessionDir: string;
+  apply: boolean;
+  /** Injected in tests; the real run takes the box's `/proc` census. */
+  liveScan?: LiveProcessScan;
+  now?: () => Date;
+  newSeatId?: () => string;
+};
+
+// ─── The plan, computed before anything is written ──────────────────────────
+
+type RecordPlan = {
+  file: string;
+  record: SessionRecord;
+  seatId: string;
+  /** Leg 1 is needed: the record carries no `seat_id` yet. */
+  seatsRecord: boolean;
+  holderOrdinal: number;
+  holderActive: boolean;
+  /** Leg 2 is needed: the entry's seat field group disagrees with the record's. */
+  enrichesIndex: boolean;
+  hasIndexEntry: boolean;
+};
+
+type SeatPlan = { row: SeatRecord; needsRow: boolean; fromExistingSeatId: boolean };
+
+/**
+ * The seat a record belongs to, and the holder fields it will carry.
+ *
+ * ⚠️ NO EXCLUSIONS (Topic 1, closed): template and subagent records get seats too.
+ * A record lacking `seat_id` IS its own seat, so it gets a fresh one; a record that
+ * already carries one keeps it, and joins whatever other holders name it.
+ */
+function planRecordSeat(
+  record: SessionRecord,
+  newSeatId: () => string,
+): { seatId: string; seatsRecord: boolean; holderOrdinal: number; holderActive: boolean } {
+  if (typeof record.seatId === "string" && record.seatId.length > 0) {
+    return {
+      seatId: record.seatId,
+      seatsRecord: false,
+      holderOrdinal: record.holderOrdinal ?? 1,
+      holderActive: record.holderActive === true,
+    };
+  }
+  return {
+    seatId: newSeatId(),
+    seatsRecord: true,
+    holderOrdinal: 1,
+    // A closed session's seat is NOBODY HOME, not abolished: the holder mirror
+    // reads false and the row's `active_holder_id` is null, while `closed_at`
+    // stays null. The two facts are different and must not be collapsed.
+    holderActive: record.closed !== true,
+  };
+}
+
+/** True when the entry's seat field group already says what the record says. An
+ * entry that agrees is left BYTE-IDENTICAL — on a box where B1/B2 have landed most
+ * entries are already correct, and rewriting them would be pure churn. */
+function indexEntryAgrees(
+  entry: SessionIndexEntry | undefined,
+  plan: { seatId: string; holderOrdinal: number; holderActive: boolean },
+): boolean {
+  return (
+    entry !== undefined &&
+    entry.seatId === plan.seatId &&
+    entry.holderOrdinal === plan.holderOrdinal &&
+    entry.holderActive === plan.holderActive
+  );
+}
+
+/**
+ * The seat's active holder — **the OPEN holder, or `null`** (ruling §5).
+ *
+ * Deterministic where the ruling is silent: among the seat's OPEN members, the one
+ * already flagged `holder_active` wins; failing that, the highest ordinal — the most
+ * recent holder — wins. `null` when every member is closed, which is a first-class
+ * state and not an absence to be repaired.
+ */
+function activeHolderFor(members: readonly RecordPlan[]): RecordPlan | undefined {
+  const open = members.filter((member) => member.record.closed !== true);
+  return (
+    open.find((member) => member.holderActive) ??
+    open.toSorted((a, b) => b.holderOrdinal - a.holderOrdinal)[0]
+  );
+}
+
+/** The seat's representative for the copied NAME: its active holder, else its
+ * highest-ordinal member. D9 phase (i) writes the name to the seat and leaves it on
+ * the record; the seat is authoritative wherever the two disagree. */
+function seatNameSource(members: readonly RecordPlan[]): RecordPlan | undefined {
+  return (
+    activeHolderFor(members) ?? members.toSorted((a, b) => b.holderOrdinal - a.holderOrdinal)[0]
+  );
+}
+
+function earliestCreatedAt(members: readonly RecordPlan[], fallback: string): string {
+  const stamps = members
+    .map((member) => member.record.createdAt)
+    .filter((value): value is string => typeof value === "string" && value.length > 0)
+    .toSorted();
+  return stamps[0] ?? fallback;
+}
+
+/**
+ * The row for one seat, from every record that names it.
+ *
+ * 🔑 `nextOrdinal = max(holderOrdinal) + 1` **over that seat's records, never a
+ * constant.** Ordinal 1 is already consumed by the founding holder, so a row built
+ * with `1` makes the first succession re-issue it — and D4a is explicit that a gap
+ * is legal while a REPEAT is a defect. On a box where every seat has exactly one
+ * holder a hard-coded `2` passes against live data, which is why this is derived and
+ * why the falsifying case has to be a synthetic multi-holder rig.
+ *
+ * 🛑 `closedAt` is `null` — **PRESENT, never absent.** A backfilled seat reads NOT
+ * CLOSED; a closed session's seat is nobody home, not abolished. The store's own
+ * parse leg requires the key (`hasValidRequiredSeatFields`), so a row written without
+ * it is one the store would reject as malformed.
+ */
+function planSeatRow(seatId: string, members: readonly RecordPlan[], now: string): SeatRecord {
+  const holder = activeHolderFor(members);
+  return {
+    seatId,
+    createdAt: earliestCreatedAt(members, now),
+    activeHolderId: holder?.record.acpxRecordId ?? null,
+    nextOrdinal: Math.max(...members.map((member) => member.holderOrdinal)) + 1,
+    closedAt: null,
+    name: seatNameSource(members)?.record.name,
+    // `brick attach` is this field's writer (Cluster A requirement 5) and that is not
+    // this pass. Absent, deliberately — not an empty string.
+    brickId: undefined,
+  };
+}
+
+// ─── Reading the store ──────────────────────────────────────────────────────
+
+type ScannedRecords = {
+  plans: RecordPlan[];
+  errors: SeatBackfillError[];
+  recordsScanned: number;
+  recordsWithoutIndexEntry: number;
+  staleIndexEntries: number;
+};
+
+async function readRecordFile(
+  sessionDir: string,
+  file: string,
+): Promise<SessionRecord | undefined> {
+  try {
+    const payload = await fs.readFile(path.join(sessionDir, file), "utf8");
+    return parseSessionRecord(JSON.parse(payload)) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function scanRecords(
+  sessionDir: string,
+  entriesByFile: ReadonlyMap<string, SessionIndexEntry>,
+  newSeatId: () => string,
+): Promise<ScannedRecords> {
+  const files = await listSessionRecordFiles(sessionDir);
+  const plans: RecordPlan[] = [];
+  const errors: SeatBackfillError[] = [];
+  let recordsWithoutIndexEntry = 0;
+  let staleIndexEntries = 0;
+
+  for (const file of files) {
+    const record = await readRecordFile(sessionDir, file);
+    if (!record) {
+      // Per-record isolation starts here: an unparseable record is reported and the
+      // run continues. It is also NOT counted as a seat to mint — nothing can be
+      // derived from a record that did not parse.
+      errors.push({
+        file,
+        acpxRecordId: undefined,
+        stage: "parse",
+        code: undefined,
+        message: "record did not parse; skipped",
+      });
+      continue;
+    }
+    const entry = entriesByFile.get(file);
+    const seat = planRecordSeat(record, newSeatId);
+    if (!entry) {
+      recordsWithoutIndexEntry += 1;
+    }
+    if (!seat.seatsRecord && entry !== undefined && entry.seatId === undefined) {
+      staleIndexEntries += 1;
+    }
+    plans.push({
+      file,
+      record,
+      ...seat,
+      enrichesIndex: entry !== undefined && !indexEntryAgrees(entry, seat),
+      hasIndexEntry: entry !== undefined,
+    });
+  }
+  return {
+    plans,
+    errors,
+    recordsScanned: plans.length,
+    recordsWithoutIndexEntry,
+    staleIndexEntries,
+  };
+}
+
+/**
+ * PREFLIGHT — every refusal, before the first byte is written.
+ *
+ * Returns the index entries keyed by file. Throws `SeatStoreUnwritableError` for a
+ * malformed or unreadable `seats.json` (the store's own error, carrying its own
+ * `fileState` and quarantine remedy — not a generic throw), and
+ * `SeatBackfillIndexUnreadableError` for an index that exists and does not parse.
+ * An ABSENT store is not a refusal: creating it is exactly what the first write on a
+ * fresh box is for.
+ */
+async function preflight(sessionDir: string): Promise<Map<string, SessionIndexEntry>> {
+  const store = await readSeatStore(sessionDir);
+  if (store.fileState === "malformed" || store.fileState === "unreadable") {
+    throw new SeatStoreUnwritableError(seatStorePath(sessionDir), store.fileState);
+  }
+  const index = await readSessionIndex(sessionDir);
+  if (!index) {
+    const indexPath = sessionIndexPath(sessionDir);
+    if (await pathExists(indexPath)) {
+      throw new SeatBackfillIndexUnreadableError(indexPath);
+    }
+    return new Map();
+  }
+  return new Map(index.entries.map((entry) => [entry.file, entry]));
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ─── Rollback copies ────────────────────────────────────────────────────────
+
+/**
+ * The pre-apply copies, `.bak-mig-<TS>` beside each original — the record, the
+ * index AND `seats.json` (the ruling's amendment names all three).
+ *
+ * ⚠️ **COPIED, NOT RENAMED, AND THE DIFFERENCE IS OPERATIONAL.** The brief says
+ * "rename originals aside"; a rename would leave `index.json` and `seats.json`
+ * ABSENT for the length of the run — and every concurrent reader on the box, the
+ * running sessions included, resolves through those two files. A copy leaves the
+ * originals in place and yields the identical rollback artefact: restoring the three
+ * copies over the originals returns the store byte-for-byte to its pre-apply state,
+ * which is the property an operator actually needs and the one the acceptance rows
+ * assert.
+ */
+async function copyAside(filePath: string, suffix: string): Promise<string | undefined> {
+  if (!(await pathExists(filePath))) {
+    return undefined;
+  }
+  const target = `${filePath}${suffix}`;
+  await fs.copyFile(filePath, target);
+  return target;
+}
+
+function backupSuffixFor(now: Date): string {
+  return `.bak-mig-${now.toISOString().replace(/[:.]/g, "")}`;
+}
+
+/**
+ * The two STORE-WIDE copies — `index.json` and `seats.json`.
+ *
+ * 🛑 THESE TWO ARE FATAL ON FAILURE AND THE PER-RECORD ONES ARE NOT, and the split
+ * is the whole reason this is a separate function. A store-wide copy that cannot be
+ * taken means the run has no rollback at all, so it must not start; a single
+ * record's copy failing is one record's problem, and aborting the run for it would
+ * turn one unbackupable record into a total refusal for the other 1,899.
+ * ⚠️ Measured, not theorised: a record whose filename is long enough that
+ * `<file><suffix>` exceeds `NAME_MAX` made an earlier version of this function throw
+ * from the middle of the run — exit 1, nothing written, no per-record diagnosis.
+ */
+async function takeStoreBackups(sessionDir: string, suffix: string): Promise<string[]> {
+  const made: string[] = [];
+  for (const target of [sessionIndexPath(sessionDir), seatStorePath(sessionDir)]) {
+    const copy = await copyAside(target, suffix);
+    if (copy) {
+      made.push(copy);
+    }
+  }
+  return made;
+}
+
+// ─── The three legs ─────────────────────────────────────────────────────────
+
+/** Leg 1 — the RECORD. Through the one authorised writer of the seat-holder half:
+ * without `authoritative.seatHolder` the write is a silent no-op, because
+ * `preserveSeatHolderFieldsForPersist` puts the old (absent) values straight back.
+ * It skips the index on purpose — leg 2 is ours. */
+async function writeRecordLeg(plan: RecordPlan): Promise<void> {
+  plan.record.seatId = plan.seatId;
+  plan.record.holderOrdinal = plan.holderOrdinal;
+  plan.record.holderActive = plan.holderActive;
+  await writeSessionRecordAuthorizingSeatHolderWithoutIndex(plan.record);
+}
+
+/**
+ * Leg 2 — the INDEX, one entry, through the shared projection helper.
+ *
+ * `seatFieldsToIndexEntry` is the H-R1-1 helper and the only sanctioned way to spell
+ * this field group; a hand-rolled list here would be the second parallel field list
+ * that helper exists to have deleted. `overlaySessionIndexEntries` merges it onto the
+ * EXISTING entry under the index lock, re-reading the record from disk inside that
+ * lock — so a concurrent close, rename or favourite survives, and the entry cannot
+ * claim a seat the record does not carry.
+ */
+async function writeIndexLeg(sessionDir: string, plan: RecordPlan): Promise<void> {
+  await overlaySessionIndexEntries(
+    sessionDir,
+    new Map([[plan.file, { fields: (record: SessionRecord) => seatFieldsToIndexEntry(record) }]]),
+  );
+}
+
+// ─── The run ────────────────────────────────────────────────────────────────
+
+function groupBySeat(plans: readonly RecordPlan[]): Map<string, RecordPlan[]> {
+  const bySeat = new Map<string, RecordPlan[]>();
+  for (const plan of plans) {
+    const members = bySeat.get(plan.seatId);
+    if (members) {
+      members.push(plan);
+    } else {
+      bySeat.set(plan.seatId, [plan]);
+    }
+  }
+  return bySeat;
+}
+
+async function planSeats(
+  sessionDir: string,
+  plans: readonly RecordPlan[],
+  now: string,
+): Promise<Map<string, SeatPlan>> {
+  const store = await readSeatStore(sessionDir);
+  const seatPlans = new Map<string, SeatPlan>();
+  for (const [seatId, members] of groupBySeat(plans)) {
+    seatPlans.set(seatId, {
+      row: planSeatRow(seatId, members, now),
+      needsRow: !store.seats.has(seatId),
+      fromExistingSeatId: members.every((member) => !member.seatsRecord),
+    });
+  }
+  return seatPlans;
+}
+
+function errorFor(plan: RecordPlan, stage: SeatBackfillStage, error: unknown): SeatBackfillError {
+  return {
+    file: plan.file,
+    acpxRecordId: plan.record.acpxRecordId,
+    stage,
+    code: (error as NodeJS.ErrnoException | undefined)?.code,
+    message: error instanceof Error ? error.message : String(error),
+  };
+}
+
+type ApplyCounts = {
+  recordsSeated: number;
+  indexEntries: number;
+  rowsMinted: Set<string>;
+  backups: string[];
+};
+
+/**
+ * One record, all three legs, in the ruled order, isolated.
+ *
+ * 🛑 THE `try`/`catch` IS THE ISOLATION AND ITS SCOPE IS THE WHOLE RECORD, not one
+ * leg. A record whose leg 1 throws must not have legs 2 and 3 run — that is the
+ * ordering invariant expressed as control flow: with no `seat_id` on disk, an index
+ * entry claiming one is precisely the state this verb exists to prevent.
+ */
+/**
+ * Leg 3 — the SEAT ROW, through the single writer.
+ *
+ * Once per distinct seat: the `rowsMinted` guard skips only after a row has actually
+ * been written, so a seat whose first member failed earlier is still attempted by its
+ * next member. `backfillSeatRow` re-reads the store under the lock and decides
+ * present-vs-mint there, so this guard is an optimisation and never the authority.
+ */
+async function writeSeatLeg(
+  sessionDir: string,
+  plan: RecordPlan,
+  seatPlans: ReadonlyMap<string, SeatPlan>,
+  counts: ApplyCounts,
+): Promise<void> {
+  const seat = seatPlans.get(plan.seatId);
+  if (seat?.needsRow !== true || counts.rowsMinted.has(plan.seatId)) {
+    return;
+  }
+  if ((await backfillSeatRow(sessionDir, seat.row)) === "minted") {
+    counts.rowsMinted.add(plan.seatId);
+  }
+}
+
+async function applyRecord(
+  sessionDir: string,
+  plan: RecordPlan,
+  seatPlans: ReadonlyMap<string, SeatPlan>,
+  counts: ApplyCounts,
+  errors: SeatBackfillError[],
+  suffix: string,
+): Promise<void> {
+  let stage: SeatBackfillStage = "backup";
+  try {
+    if (plan.seatsRecord) {
+      // The record's rollback copy is taken IMMEDIATELY BEFORE its own write, inside
+      // this record's isolation — so a record that cannot be backed up is simply not
+      // written, and says so, instead of being written with no way back.
+      const copy = await copyAside(path.join(sessionDir, plan.file), suffix);
+      if (copy) {
+        counts.backups.push(copy);
+      }
+      stage = "record";
+      await writeRecordLeg(plan);
+      counts.recordsSeated += 1;
+    }
+    stage = "index";
+    if (plan.enrichesIndex) {
+      await writeIndexLeg(sessionDir, plan);
+      counts.indexEntries += 1;
+    }
+    stage = "store";
+    await writeSeatLeg(sessionDir, plan, seatPlans, counts);
+  } catch (error) {
+    errors.push(errorFor(plan, stage, error));
+  }
+}
+
+/**
+ * Run the backfill. Dry run by default — `apply: false` reads everything, computes
+ * every count and writes NOTHING, so the preview and the run cannot disagree about
+ * what is going to happen.
+ */
+export async function runSeatBackfill(options: SeatBackfillOptions): Promise<SeatBackfillReport> {
+  const startedAt = Date.now();
+  const now = options.now ?? (() => new Date());
+  const newSeatId = options.newSeatId ?? randomUUID;
+  const sessionDir = options.sessionDir;
+
+  const entriesByFile = await preflight(sessionDir);
+  const scanned = await scanRecords(sessionDir, entriesByFile, newSeatId);
+
+  // 🛑 THE SWEEP RUNS FIRST — before a single mint, and its output precedes every
+  // mint in the run log. REPORT-ONLY: closing a record is a lifecycle act with its
+  // own verb and its own authority, and nothing in the ruling gives this verb that
+  // authority. The `closeSession` callback below is a no-op for exactly that reason;
+  // `closed` is still populated from the verdicts, so the report says which ids a
+  // real sweep WOULD close without this run closing any of them.
+  const sweep = await sweepAbandonedSessionRecords({
+    records: scanned.plans.map((plan) => plan.record),
+    liveScan: options.liveScan ?? scanLiveProcesses(),
+    closeSession: async () => undefined,
+  });
+
+  const seatPlans = await planSeats(sessionDir, scanned.plans, now().toISOString());
+  const seatsNeedingRows = [...seatPlans.values()].filter((seat) => seat.needsRow);
+  const errors = [...scanned.errors];
+
+  const base = {
+    apply: options.apply,
+    sessionDir,
+    sweep,
+    recordsScanned: scanned.recordsScanned,
+    recordsWithoutIndexEntry: scanned.recordsWithoutIndexEntry,
+    staleIndexEntries: scanned.staleIndexEntries,
+  };
+
+  if (!options.apply) {
+    return {
+      ...base,
+      recordsSeated: scanned.plans.filter((plan) => plan.seatsRecord).length,
+      seats: seatsNeedingRows.length,
+      indexEntries: scanned.plans.filter((plan) => plan.enrichesIndex).length,
+      rowsRepaired: seatsNeedingRows.filter((seat) => seat.fromExistingSeatId).length,
+      errors,
+      backupSuffix: undefined,
+      backups: [],
+      elapsedMs: Date.now() - startedAt,
+    };
+  }
+
+  const suffix = backupSuffixFor(now());
+  const counts: ApplyCounts = {
+    recordsSeated: 0,
+    indexEntries: 0,
+    rowsMinted: new Set(),
+    backups: await takeStoreBackups(sessionDir, suffix),
+  };
+  for (const plan of scanned.plans) {
+    await applyRecord(sessionDir, plan, seatPlans, counts, errors, suffix);
+  }
+
+  return {
+    ...base,
+    recordsSeated: counts.recordsSeated,
+    seats: counts.rowsMinted.size,
+    indexEntries: counts.indexEntries,
+    rowsRepaired: [...counts.rowsMinted].filter(
+      (seatId) => seatPlans.get(seatId)?.fromExistingSeatId === true,
+    ).length,
+    errors,
+    backupSuffix: suffix,
+    backups: counts.backups,
+    elapsedMs: Date.now() - startedAt,
+  };
+}
+
+/**
+ * `--verify` — the standalone stale counter B12b runs per box.
+ *
+ * Counts records carrying `seat_id` whose index entry LACKS `seatId`. That is the
+ * cutover-blocking state exactly: B3's `resolveSeat` bounds its per-record fallback
+ * on `entry.createdAt`, so an entry WITH `createdAt` and WITHOUT `seatId` is TRUSTED
+ * and the fallback is skipped — the holder is invisible to the seat scan, and the
+ * seat reads VACANT or mail routes to the wrong holder, indefinitely for an idle
+ * session. Read-only: it never writes and never refuses on a malformed store,
+ * because a counter that cannot run on a sick box is no use for diagnosing one.
+ */
+export async function countStaleSeatIndexEntries(sessionDir: string): Promise<number> {
+  const index = await readSessionIndex(sessionDir);
+  if (!index) {
+    return 0;
+  }
+  const entriesByFile = new Map(index.entries.map((entry) => [entry.file, entry]));
+  let stale = 0;
+  for (const file of await listSessionRecordFiles(sessionDir)) {
+    const record = await readRecordFile(sessionDir, file);
+    if (!record || typeof record.seatId !== "string" || record.seatId.length === 0) {
+      continue;
+    }
+    if (entriesByFile.get(file)?.seatId === undefined) {
+      stale += 1;
+    }
+  }
+  return stale;
+}

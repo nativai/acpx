@@ -720,6 +720,64 @@ export async function mintSeatRow(
 }
 
 /**
+ * Mint the row for a seat that ALREADY EXISTS ON RECORDS — **B10's backfill leg**
+ * (`acpx seats backfill`), and the second operation on the single-writer helper's
+ * list (`SEAT-STORE.md` ratification item 2).
+ *
+ * 🛑 **IT LIVES HERE, BESIDE `mintSeatRow`, BECAUSE THE SINGLE-WRITER RULE IS ABOUT
+ * THE WRITE PATH AND THE ROW SHAPE TOGETHER.** A bulk writer that touches every row
+ * is the case item 2 exists for, and the conception ruling of 2026-09-29 is explicit
+ * that the backfill uses *the same row code the box's own sessions use* — D8
+ * strictness, `null` as a value, `closed_at` present — *"so there is no second
+ * implementation of the row shape to drift"*. Putting this in the backfill module
+ * would have created exactly that second implementation.
+ *
+ * ## How it differs from `mintSeatRow`, and why each difference is required
+ *
+ * - **It takes a whole computed row instead of minting one.** `mintSeatRow` knows
+ *   its seat has exactly one holder, so it can hard-code `nextOrdinal: 2`. A
+ *   backfilled seat may have SEVERAL holders already on disk, and AC11 (f) requires
+ *   `next_ordinal = max(holder_ordinal) + 1` over that seat's records — **never a
+ *   constant**. On a box where every existing seat happens to have one holder a
+ *   hard-coded `2` passes against live data, which is exactly why the rule is
+ *   stated as a rule and tested against a synthetic multi-holder rig.
+ * - **An existing row is LEFT ALONE rather than a refusal.** `mintSeatRow` throws on
+ *   a collision because a freshly minted `randomUUID()` cannot collide, so a
+ *   collision there means a double-mint. Here a present row is the NORMAL case on
+ *   every run after the first: it is what makes a second `--apply` report `0` and
+ *   leave the store byte-identical. `SEAT_STORE_NO_CHANGE`, not a rewrite of an
+ *   unchanged store — an O(all seats) rewrite that changes nothing is pure cost and
+ *   would break the byte-identical row outright.
+ * - **A MALFORMED row still throws.** "Carried, never repaired" (D8(4)) does not stop
+ *   at the file: a seat whose row is present and unreadable is not a seat lacking a
+ *   row, and minting over it would discard an active holder and an ordinal that
+ *   nothing else holds.
+ *
+ * ⚠️ **THE ROW IS COMPUTED OUTSIDE THE HOLD AND THAT IS NOT OPTIONAL** — the
+ * derivation reads session records, which is async, and `mutate` returns a VALUE.
+ * The ruling's *"computes inside the critical section (or re-reads under the lock)"*
+ * is satisfied by its second limb: the store is re-read under the lock on every
+ * single call, and the PRESENT/MINT decision is taken inside the hold against that
+ * fresh store. Nothing is cached across records and nothing is flushed at the end.
+ */
+export async function backfillSeatRow(
+  sessionDir: string,
+  row: SeatRecord,
+): Promise<"minted" | "present"> {
+  return await withSeatStoreWrite(sessionDir, (store) => {
+    if (store.malformedSeatIds.includes(row.seatId)) {
+      throw new MalformedSeatRowError(row.seatId);
+    }
+    if (store.seats.has(row.seatId)) {
+      return { mutation: SEAT_STORE_NO_CHANGE, result: "present" as const };
+    }
+    const seats = new Map(store.seats);
+    seats.set(row.seatId, row);
+    return { mutation: { kind: "write", seats } as const, result: "minted" as const };
+  });
+}
+
+/**
  * Mint the row BEST-EFFORT AND LOUD — **ratification item 8, amended 2026-09-28.**
  *
  * 🛑 **SESSION CREATION NEVER DEPENDS ON THE SEAT STORE.** This is the call-site half of

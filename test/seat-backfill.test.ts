@@ -1,0 +1,958 @@
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+import {
+  listSessionRecordFiles,
+  toSessionIndexEntry,
+  writeSessionIndex,
+} from "../src/session/persistence/index.js";
+import { parseSessionRecord } from "../src/session/persistence/parse.js";
+import {
+  backfillSeatRow,
+  parseSeatFromPersisted,
+  readSeatStore,
+  SEAT_STORE_FILE,
+  SeatStoreUnwritableError,
+} from "../src/session/persistence/seat-store.js";
+import type { SessionRecord } from "../src/types.js";
+import {
+  makeSessionRecord as makeSessionRecordFixture,
+  withTempHome as withTempHomeFixture,
+  writeSessionRecordFile,
+} from "./runtime-test-helpers.js";
+
+/**
+ * B10 — `acpx seats backfill`. Brick `f65262c1`, the conception ruling of
+ * 2026-09-29, and the acceptance rows of that brick's `plan/PLAN.md` §6.
+ *
+ * ## 🛑 AC16 GOVERNS: EVERY ROW DRIVES THE REAL CLI AGAINST AN ISOLATED RIG
+ *
+ * A unit test proves REGISTRATION, not that the shipped binary answers `acpx seats
+ * backfill` — and the latter is the subject. Every legitimate and every refusal row
+ * below spawns the compiled CLI with its own `HOME` and `ACPX_STATE_HOME`, exactly
+ * as `seat-creation-paths.test.ts` does. The few in-process rows are supplementary
+ * and say so.
+ *
+ * **`--apply` is NEVER run against a real box store.** Every rig is a temp home; the
+ * shared `assertTempHomePath` guard in `runtime-test-helpers.ts` makes that
+ * structural rather than remembered.
+ *
+ * ## The red arm — expectation inversion, never a broken guard
+ *
+ * Mutation testing is forbidden fleet-wide (Daniel, 2026-09-22), so no row here was
+ * proven by gutting a guard in `src/`. Where a property could be expressed as a
+ * COMMITTED negative case it is one — permanently red if the policy is removed,
+ * which is strictly stronger than a one-time demonstration. The two rows whose
+ * subject is an equality (L1's byte-identical dry run, L3's byte-identical second
+ * apply) were additionally falsified by flipping the expected value in THIS FILE,
+ * running this file alone, confirming the row FAILED, and reverting; the observation
+ * is recorded per row at the row.
+ */
+
+const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+
+type CliResult = { code: number | null; stdout: string; stderr: string };
+
+/**
+ * Drive the REAL compiled CLI against a rig home.
+ *
+ * Same scrub list as `seat-creation-paths.test.ts` / `session-reparent.test.ts`: a
+ * child built without it can silently acquire the TEST RUNNER's own session as
+ * ambient context. `HOME` and `ACPX_STATE_HOME` are both pinned because
+ * `sessionBaseDir()` reads `ACPX_STATE_HOME || os.homedir()` and the first WINS —
+ * pinning one leaves the store resolution to the other.
+ */
+function runCli(args: string[], homeDir: string): Promise<CliResult> {
+  return new Promise((resolve) => {
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: homeDir, ACPX_STATE_HOME: homeDir };
+    for (const key of [
+      "ACPX_SESSION_URL",
+      "ACPX_SESSION_NAME",
+      "ACPX_PARENT_SESSION_URL",
+      "ACPX_SEAT_URL",
+      "ACPX_PARENT_SEAT_URL",
+      "ACPX_TASK_FOLDER",
+      "ACPX_BRICK",
+      "ACPX_BRICK_PATH",
+      "ACPX_OWNER_LOG",
+    ]) {
+      delete env[key];
+    }
+    const child = spawn(process.execPath, [CLI_PATH, ...args], {
+      env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => (stdout += chunk));
+    child.stderr.on("data", (chunk: string) => (stderr += chunk));
+    child.stdin.end();
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+type BackfillJson = {
+  apply: boolean;
+  recordsScanned: number;
+  recordsSeated: number;
+  seats: number;
+  indexEntries: number;
+  recordsWithoutIndexEntry: number;
+  rowsRepaired: number;
+  errors: { file: string; stage: string; code?: string; message: string }[];
+  backupSuffix?: string;
+  backups: string[];
+  staleIndexEntries: number;
+  sweep: { scanned: number; closed: string[]; notMeasured: boolean };
+};
+
+async function backfill(homeDir: string, extra: string[] = []): Promise<BackfillJson> {
+  const result = await runCli(["seats", "backfill", "--format", "json", ...extra], homeDir);
+  assert.equal(result.code, 0, `seats backfill exited ${result.code}: ${result.stderr}`);
+  return JSON.parse(result.stdout.trim()) as BackfillJson;
+}
+
+function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
+  return withTempHomeFixture("acpx-seat-backfill-", run);
+}
+
+function sessionsDir(homeDir: string): string {
+  return path.join(homeDir, ".acpx", "sessions");
+}
+
+let recordSeq = 0;
+
+function makeRecord(overrides: Partial<SessionRecord> & { acpxRecordId: string }): SessionRecord {
+  recordSeq += 1;
+  return makeSessionRecordFixture({
+    acpSessionId: `acp-${overrides.acpxRecordId}`,
+    agentCommand: "node agent.js",
+    cwd: "/tmp/rig",
+    // Distinct, so `writeSessionIndex`'s lastUsedAt sort is deterministic.
+    lastUsedAt: `2026-01-01T00:00:${String(recordSeq % 60).padStart(2, "0")}.000Z`,
+    ...overrides,
+  });
+}
+
+async function seed(homeDir: string, records: readonly SessionRecord[]): Promise<void> {
+  for (const record of records) {
+    await writeSessionRecordFile(homeDir, record);
+  }
+  await rebuildRigIndex(homeDir);
+}
+
+/** The rig's `index.json`, projected the way acpx projects it. Deliberately built
+ * from the records ON DISK rather than from the in-memory fixtures: the index this
+ * verb enriches is the one a real box has, entries and all. */
+async function rebuildRigIndex(homeDir: string): Promise<void> {
+  const dir = sessionsDir(homeDir);
+  const files = await listSessionRecordFiles(dir);
+  const entries = [];
+  for (const file of files) {
+    const parsed = parseSessionRecord(JSON.parse(await fs.readFile(path.join(dir, file), "utf8")));
+    assert.ok(parsed, `rig record ${file} did not parse — the fixture is wrong, not the subject`);
+    entries.push(toSessionIndexEntry(parsed, file));
+  }
+  await writeSessionIndex(dir, { files, entries });
+}
+
+async function sha256(filePath: string): Promise<string> {
+  return createHash("sha256")
+    .update(await fs.readFile(filePath))
+    .digest("hex");
+}
+
+/** Every file in the store, by content hash. The instrument for every
+ * byte-identical row. */
+async function snapshot(homeDir: string): Promise<Map<string, string>> {
+  const dir = sessionsDir(homeDir);
+  const out = new Map<string, string>();
+  for (const name of (await fs.readdir(dir)).toSorted()) {
+    out.set(name, await sha256(path.join(dir, name)));
+  }
+  return out;
+}
+
+function diffNames(before: Map<string, string>, after: Map<string, string>): string[] {
+  const names = new Set([...before.keys(), ...after.keys()]);
+  return [...names].filter((name) => before.get(name) !== after.get(name)).toSorted();
+}
+
+async function readIndexEntries(homeDir: string): Promise<Map<string, Record<string, unknown>>> {
+  const payload = JSON.parse(
+    await fs.readFile(path.join(sessionsDir(homeDir), "index.json"), "utf8"),
+  ) as { entries: Record<string, unknown>[] };
+  return new Map(payload.entries.map((entry) => [String(entry.file), entry]));
+}
+
+async function readRecordJson(homeDir: string, id: string): Promise<Record<string, unknown>> {
+  const file = path.join(sessionsDir(homeDir), `${encodeURIComponent(id)}.json`);
+  return JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+}
+
+async function readRawStore(homeDir: string): Promise<Record<string, Record<string, unknown>>> {
+  return JSON.parse(
+    await fs.readFile(path.join(sessionsDir(homeDir), SEAT_STORE_FILE), "utf8"),
+  ) as Record<string, Record<string, unknown>>;
+}
+
+// ─── IR — the verb is answered by the SHIPPED binary ─────────────────────────
+
+test("IR: `acpx seats backfill` is a registered verb, not an agent-name fall-through", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [makeRecord({ acpxRecordId: "ir-1" })]);
+    const result = await runCli(["seats", "backfill", "--format", "json"], homeDir);
+    // ⚠️ THE CONTROL STRING, NOT THE EXIT CODE. An unregistered token is absorbed by
+    // the agent catch-all, whose rc is cwd-dependent and therefore sound in neither
+    // direction (`cli-core.ts`'s own warning on TOP_LEVEL_VERBS). `No acpx session
+    // found` is what that fall-through prints, and it must be ABSENT.
+    assert.equal(
+      `${result.stdout}${result.stderr}`.includes("No acpx session found"),
+      false,
+      "`seats` fell through to the agent registry — TOP_LEVEL_VERBS is missing the entry",
+    );
+    assert.equal(result.code, 0, result.stderr);
+  });
+});
+
+test("IR: a bogus subverb ERRORS — it does not become a prompt", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [makeRecord({ acpxRecordId: "ir-2" })]);
+    const result = await runCli(["seats", "zzznotaverb"], homeDir);
+    assert.notEqual(result.code, 0, "a bogus subverb must not succeed");
+    assert.equal(
+      `${result.stdout}${result.stderr}`.includes("No acpx session found"),
+      false,
+      "the bogus subverb reached the agent catch-all",
+    );
+  });
+});
+
+// ─── L1 — dry run is the default and it touches NOTHING ──────────────────────
+
+test("L1: the DEFAULT is a dry run — counts reported, store byte-identical", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [
+      makeRecord({ acpxRecordId: "l1-a" }),
+      makeRecord({ acpxRecordId: "l1-b" }),
+    ]);
+    const before = await snapshot(homeDir);
+
+    const report = await backfill(homeDir);
+
+    assert.equal(report.apply, false, "the default must be a dry run");
+    assert.equal(report.recordsScanned, 2);
+    assert.equal(report.seats, 2, "one seat per seat-less record");
+    assert.equal(report.indexEntries, 2);
+    assert.equal(report.errors.length, 0);
+
+    // 🔑 THE ROW'S SUBJECT. Inverted 2026-09-29 (flipped to `deepEqual(diff, ["x"])`)
+    // and this file alone re-run: the row FAILED as required, then reverted.
+    const after = await snapshot(homeDir);
+    assert.deepEqual(diffNames(before, after), [], "a dry run wrote to the store");
+    assert.equal(
+      after.has(SEAT_STORE_FILE),
+      false,
+      "a dry run CREATED seats.json — the absent store must stay absent",
+    );
+  });
+});
+
+// ─── L2 — apply, from an ABSENT store ────────────────────────────────────────
+
+test("L2: --apply mints the seats, enriches the entries and CREATES an absent store", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [
+      makeRecord({ acpxRecordId: "l2-a", name: "alpha" }),
+      makeRecord({ acpxRecordId: "l2-b", name: "beta", closed: true }),
+    ]);
+    // The control for the "creates an ABSENT store" claim: it really is absent first.
+    assert.equal((await readSeatStore(sessionsDir(homeDir))).fileState, "absent");
+
+    const report = await backfill(homeDir, ["--apply"]);
+    assert.equal(report.apply, true);
+    assert.equal(report.seats, 2);
+    assert.equal(report.recordsSeated, 2);
+    assert.equal(report.indexEntries, 2);
+    assert.equal(report.errors.length, 0);
+
+    const store = await readSeatStore(sessionsDir(homeDir));
+    assert.equal(store.fileState, "ok");
+    assert.equal(store.seats.size, 2);
+
+    const open = await readRecordJson(homeDir, "l2-a");
+    const closed = await readRecordJson(homeDir, "l2-b");
+    assert.equal(typeof open.seat_id, "string");
+    assert.equal(open.holder_ordinal, 1);
+    assert.equal(open.holder_active, true);
+    // A CLOSED session's seat is NOBODY HOME, not abolished: the holder mirror is
+    // false and the row's active holder is null, while `closed_at` stays null.
+    assert.equal(closed.holder_active, false);
+    const closedRow = store.seats.get(String(closed.seat_id));
+    assert.equal(closedRow?.activeHolderId, null);
+    assert.equal(closedRow?.closedAt, null);
+    assert.equal(store.seats.get(String(open.seat_id))?.activeHolderId, "l2-a");
+
+    // The entries carry the same group the records do — the leg-2 subject.
+    const entries = await readIndexEntries(homeDir);
+    assert.equal(entries.get("l2-a.json")?.seatId, open.seat_id);
+    assert.equal(entries.get("l2-b.json")?.seatId, closed.seat_id);
+    assert.equal(entries.get("l2-b.json")?.holderActive, false);
+  });
+});
+
+test("L2b: the record leg changes the SEAT GROUP and nothing else", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [makeRecord({ acpxRecordId: "l2b", name: "kept", favorite: true })]);
+    const before = await readRecordJson(homeDir, "l2b");
+
+    await backfill(homeDir, ["--apply"]);
+
+    const after = await readRecordJson(homeDir, "l2b");
+    const changed = [...new Set([...Object.keys(before), ...Object.keys(after)])]
+      .filter((key) => JSON.stringify(before[key]) !== JSON.stringify(after[key]))
+      .toSorted();
+    // A completeness claim by CONSTRUCTION rather than by spot-check: every key of
+    // both objects is compared, so a field this write silently drops shows up here.
+    assert.deepEqual(changed, ["holder_active", "holder_ordinal", "seat_id"]);
+  });
+});
+
+// ─── L3 — idempotent: apply, then apply ──────────────────────────────────────
+
+test("L3: a second --apply reports 0 and leaves the store byte-identical", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [
+      makeRecord({ acpxRecordId: "l3-a" }),
+      makeRecord({ acpxRecordId: "l3-b" }),
+    ]);
+    const first = await backfill(homeDir, ["--apply"]);
+    assert.equal(first.seats, 2, "control: the FIRST apply must actually mint something");
+
+    const afterFirst = await snapshot(homeDir);
+    const second = await backfill(homeDir, ["--apply"]);
+
+    assert.equal(second.seats, 0, "the second apply minted a seat");
+    assert.equal(second.recordsSeated, 0);
+    assert.equal(second.indexEntries, 0);
+    assert.equal(second.errors.length, 0);
+
+    // 🔑 THE ROW'S SUBJECT. Inverted 2026-09-29 (`second.seats` expected 1) and this
+    // file alone re-run: the row FAILED as required, then reverted.
+    const afterSecond = await snapshot(homeDir);
+    const changed = diffNames(afterFirst, afterSecond).filter(
+      // The second run takes its own rollback copies; those are NEW files, not
+      // changes to the store, and excluding them is what the row is about.
+      (name) => !name.includes(".bak-mig-"),
+    );
+    assert.deepEqual(changed, [], "the second apply rewrote part of the store");
+  });
+});
+
+// ─── L4 — the MIXED population, which is the live shape ──────────────────────
+
+test("L4: already-seated records and their entries are left BYTE-IDENTICAL", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [
+      makeRecord({
+        acpxRecordId: "l4-seated",
+        seatId: "11111111-2222-3333-4444-555555555555",
+        holderOrdinal: 1,
+        holderActive: true,
+      }),
+      makeRecord({ acpxRecordId: "l4-bare" }),
+    ]);
+    // Its row already exists, so nothing about this seat needs repairing either.
+    await backfillSeatRow(sessionsDir(homeDir), {
+      seatId: "11111111-2222-3333-4444-555555555555",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      activeHolderId: "l4-seated",
+      nextOrdinal: 2,
+      closedAt: null,
+      name: undefined,
+      brickId: undefined,
+    });
+    const seatedBefore = await sha256(path.join(sessionsDir(homeDir), "l4-seated.json"));
+
+    const report = await backfill(homeDir, ["--apply"]);
+    assert.equal(report.seats, 1, "only the unseated record's seat is minted");
+    assert.equal(report.recordsSeated, 1);
+    assert.equal(report.indexEntries, 1, "the already-correct entry must not be rewritten");
+
+    assert.equal(
+      await sha256(path.join(sessionsDir(homeDir), "l4-seated.json")),
+      seatedBefore,
+      "an already-seated record was rewritten",
+    );
+    const store = await readSeatStore(sessionsDir(homeDir));
+    assert.equal(store.seats.size, 2);
+    assert.equal(store.seats.get("11111111-2222-3333-4444-555555555555")?.nextOrdinal, 2);
+  });
+});
+
+// ─── L5 — next_ordinal is DERIVED, never a constant ──────────────────────────
+
+test("L5: next_ordinal = max(holder_ordinal)+1 over the seat's records, not 2", async () => {
+  await withTempHome(async (homeDir) => {
+    const seatId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    // No live specimen of a multi-holder seat exists on any box today — every
+    // existing seat has exactly one holder, so a hard-coded `2` passes against LIVE
+    // DATA. This synthetic rig is the only thing that can falsify the rule, which is
+    // precisely why the rule is tested here and not on a census.
+    await seed(homeDir, [
+      makeRecord({
+        acpxRecordId: "l5-h1",
+        seatId,
+        holderOrdinal: 1,
+        holderActive: false,
+        closed: true,
+      }),
+      makeRecord({
+        acpxRecordId: "l5-h2",
+        seatId,
+        holderOrdinal: 2,
+        holderActive: false,
+        closed: true,
+      }),
+      makeRecord({ acpxRecordId: "l5-h3", seatId, holderOrdinal: 3, holderActive: true }),
+    ]);
+
+    const report = await backfill(homeDir, ["--apply"]);
+    assert.equal(report.seats, 1, "three holders, ONE row");
+    assert.equal(report.rowsRepaired, 1, "the seat already existed on the records — a repair");
+
+    const row = (await readSeatStore(sessionsDir(homeDir))).seats.get(seatId);
+    assert.equal(row?.nextOrdinal, 4, "next_ordinal was not derived from the holders");
+    assert.notEqual(row?.nextOrdinal, 2, "a constant 2 would pass on every live seat");
+    assert.equal(row?.activeHolderId, "l5-h3", "the OPEN, active holder must be the pointer");
+  });
+});
+
+// ─── L6 / R2 — closed_at is PRESENT and null ─────────────────────────────────
+
+test("L6: a seat whose holders are all closed is `null` holder, `null` closed_at — PRESENT", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [makeRecord({ acpxRecordId: "l6", closed: true })]);
+    await backfill(homeDir, ["--apply"]);
+
+    const raw = await readRawStore(homeDir);
+    const [row] = Object.values(raw);
+    assert.equal(row.active_holder_id, null, "nobody home must be null, not omitted");
+    assert.equal("closed_at" in row, true, "closed_at was OMITTED — the store rejects such a row");
+    assert.equal(row.closed_at, null, "a backfilled seat reads NOT CLOSED");
+    // `name`/`brick_id` are the only omit-when-unset fields; `brick attach` is not
+    // this pass, so `brick_id` must be absent rather than null.
+    assert.equal("brick_id" in row, false);
+  });
+});
+
+test("R2: a row with closed_at ABSENT is malformed — the committed negative case", () => {
+  const withKey = {
+    seat_id: "s",
+    created_at: "t",
+    active_holder_id: null,
+    next_ordinal: 2,
+    closed_at: null,
+  };
+  // C1 — the control produces a NON-zero result first: the identical row WITH the
+  // key parses. Without it the rejection below would prove nothing.
+  assert.notEqual(parseSeatFromPersisted(withKey), undefined);
+  const { closed_at: _omitted, ...withoutKey } = withKey;
+  assert.equal(
+    parseSeatFromPersisted(withoutKey),
+    undefined,
+    "hasValidRequiredSeatFields accepted a row with closed_at absent",
+  );
+});
+
+test("R2b: the backfill REFUSES to overwrite a malformed ROW and carries it verbatim", async () => {
+  await withTempHome(async (homeDir) => {
+    const seatId = "dddddddd-eeee-ffff-0000-111111111111";
+    await seed(homeDir, [
+      makeRecord({ acpxRecordId: "r2b", seatId, holderOrdinal: 1, holderActive: true }),
+    ]);
+    // A row present and unreadable: `closed_at` absent. The FILE is fine, so this is
+    // not the R1/R4 refusal — it is the row-scoped one, and the two must not collapse.
+    const storePath = path.join(sessionsDir(homeDir), SEAT_STORE_FILE);
+    const corruptRow = { seat_id: seatId, created_at: "2026-01-01T00:00:00.000Z", next_ordinal: 2 };
+    await fs.writeFile(storePath, `${JSON.stringify({ [seatId]: corruptRow })}\n`, "utf8");
+
+    const report = await backfill(homeDir, ["--apply"]);
+    assert.equal(report.seats, 0, "a malformed row must not be minted over");
+    assert.equal(report.errors.length, 1);
+    assert.equal(
+      report.errors[0]?.stage,
+      "store",
+      "the failing LEG must be named, not just 'it failed'",
+    );
+    assert.match(
+      report.errors[0]?.message ?? "",
+      /PRESENT in the seat store but its row is malformed/,
+      "the refusal must be MalformedSeatRowError, not a generic throw",
+    );
+    assert.deepEqual(
+      await readRawStore(homeDir),
+      { [seatId]: corruptRow },
+      "the malformed row must be carried EXACTLY as read",
+    );
+  });
+});
+
+// ─── L7 — every minted row round-trips the store's own parse leg ─────────────
+
+test("L7: every backfilled row round-trips parseSeatFromPersisted", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [
+      makeRecord({ acpxRecordId: "l7-a", name: "named" }),
+      makeRecord({ acpxRecordId: "l7-b", name: undefined }),
+      makeRecord({ acpxRecordId: "l7-c", closed: true }),
+    ]);
+    const report = await backfill(homeDir, ["--apply"]);
+    assert.equal(report.seats, 3, "control: rows must actually have been written");
+
+    const raw = await readRawStore(homeDir);
+    assert.equal(Object.keys(raw).length, 3);
+    for (const [seatId, row] of Object.entries(raw)) {
+      const parsed = parseSeatFromPersisted(row);
+      assert.notEqual(parsed, undefined, `row ${seatId} is one the store's own parse leg rejects`);
+      assert.equal(parsed?.seatId, seatId, "the key IS the identity — a disagreement is malformed");
+    }
+    // And the store reads back with no malformed ids at all — the file-scope control.
+    const store = await readSeatStore(sessionsDir(homeDir));
+    assert.deepEqual(store.malformedSeatIds, []);
+  });
+});
+
+// ─── L8 — non-UUID `ses_` record ids are REAL ────────────────────────────────
+
+test("L8: a non-UUID `ses_` record id is seated, not skipped", async () => {
+  await withTempHome(async (homeDir) => {
+    // Four of these exist on the live devbox store. A backfill that quietly skipped
+    // them would leave real sessions permanently unjoinable.
+    await seed(homeDir, [makeRecord({ acpxRecordId: "ses_01JABCDEF0123456789" })]);
+    const report = await backfill(homeDir, ["--apply"]);
+    assert.equal(report.seats, 1);
+    assert.equal(report.errors.length, 0);
+    const record = await readRecordJson(homeDir, "ses_01JABCDEF0123456789");
+    assert.equal(typeof record.seat_id, "string");
+  });
+});
+
+// ─── L9 — NO EXCLUSIONS: templates and subagents get seats too ───────────────
+
+test("L9: template and subagent records are counted and seated (Topic 1, no exclusions)", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [
+      makeRecord({ acpxRecordId: "l9-plain" }),
+      makeRecord({
+        acpxRecordId: "l9-template",
+        template: { enabled: true, created_at: "2026-01-01T00:00:00.000Z" },
+      }),
+      makeRecord({ acpxRecordId: "l9-subagent", kind: "subagent" }),
+    ]);
+    const report = await backfill(homeDir, ["--apply"]);
+    assert.equal(report.recordsScanned, 3);
+    assert.equal(report.seats, 3, "a record was EXCLUDED — AC11 counts all records");
+    for (const id of ["l9-plain", "l9-template", "l9-subagent"]) {
+      assert.equal(typeof (await readRecordJson(homeDir, id)).seat_id, "string", `${id} unseated`);
+    }
+  });
+});
+
+// ─── L10 — the sweep runs FIRST, and is REPORT-ONLY ──────────────────────────
+
+test("L10: the abandoned-record sweep precedes every mint in the run log", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [makeRecord({ acpxRecordId: "l10" })]);
+    const result = await runCli(["seats", "backfill", "--apply"], homeDir);
+    assert.equal(result.code, 0, result.stderr);
+
+    const sweepAt = result.stdout.indexOf("abandoned session records:");
+    const mintAt = result.stdout.indexOf("seat backfill (");
+    assert.notEqual(sweepAt, -1, "the sweep did not report at all");
+    assert.notEqual(mintAt, -1);
+    assert.ok(sweepAt < mintAt, "the sweep must be reported BEFORE the mint counts");
+  });
+});
+
+test("L10b: the sweep is REPORT-ONLY — an abandoned record stays OPEN", async () => {
+  await withTempHome(async (homeDir) => {
+    // Long-idle (the fixture stamps 2026-01), no pid, so the sweep classifies it as
+    // abandoned. Closing a record is `sessions close`'s authority; nothing in the
+    // ruling gives it to this verb, so the record must come through untouched.
+    await seed(homeDir, [makeRecord({ acpxRecordId: "l10b" })]);
+    const report = await backfill(homeDir, ["--apply"]);
+    assert.equal(report.sweep.notMeasured, false, "control: /proc must be measurable here");
+    assert.deepEqual(
+      report.sweep.closed,
+      ["l10b"],
+      "control: this record IS an abandonment candidate",
+    );
+    assert.equal(
+      (await readRecordJson(homeDir, "l10b")).closed,
+      false,
+      "the backfill CLOSED a session — the sweep must be report-only",
+    );
+  });
+});
+
+// ─── L11 / L13 — the index leg, and the reconcile trap ───────────────────────
+
+test("L11: --verify counts exactly the stale entries, and 0 once enriched", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [
+      makeRecord({ acpxRecordId: "l11-a" }),
+      makeRecord({ acpxRecordId: "l11-b" }),
+    ]);
+    // A RECORD-ONLY backfill, reproduced exactly: the records gain `seat_id`, the
+    // index keeps its old (createdAt-bearing, seatId-less) entries. That is the state
+    // the whole index of every box would be in after a record-only run, and the state
+    // B3's resolveSeat TRUSTS and therefore never repairs.
+    const dir = sessionsDir(homeDir);
+    for (const id of ["l11-a", "l11-b"]) {
+      const file = path.join(dir, `${id}.json`);
+      const raw = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+      raw.seat_id = `00000000-0000-4000-8000-00000000000${id.endsWith("a") ? "1" : "2"}`;
+      raw.holder_ordinal = 1;
+      raw.holder_active = true;
+      await fs.writeFile(file, `${JSON.stringify(raw)}\n`, "utf8");
+    }
+
+    const verify = await runCli(["seats", "backfill", "--verify", "--format", "quiet"], homeDir);
+    assert.equal(verify.code, 0, verify.stderr);
+    assert.equal(verify.stdout.trim(), "2", "--verify did not count the stale entries");
+
+    const applied = await backfill(homeDir, ["--apply", "--verify"]);
+    assert.equal(applied.indexEntries, 2, "control: the entries must actually have been enriched");
+    assert.equal(applied.staleIndexEntries, 0, "stale entries remain after --apply");
+  });
+});
+
+test("L13: the entry IS enriched when only record CONTENTS changed — the anti-reconcile row", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [makeRecord({ acpxRecordId: "l13" })]);
+    const dir = sessionsDir(homeDir);
+    const seatId = "99999999-8888-7777-6666-555555555555";
+    const file = path.join(dir, "l13.json");
+    const raw = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+    raw.seat_id = seatId;
+    raw.holder_ordinal = 1;
+    raw.holder_active = true;
+    await fs.writeFile(file, `${JSON.stringify(raw)}\n`, "utf8");
+
+    // 🛑 THE FILE LIST IS UNCHANGED, which is the whole trap: `reconcileSessionIndex`
+    // compares only `index.files` against disk, matches, and returns the index
+    // UNCHANGED (`drift: false`). An index leg built on it gets a clean run and zero
+    // entries enriched — this row is RED against that implementation and green only
+    // against a targeted per-entry rewrite.
+    const filesBefore = (await readIndexEntries(homeDir)).size;
+
+    const report = await backfill(homeDir, ["--apply"]);
+    assert.equal(report.indexEntries, 1, "the stale entry was not re-projected");
+
+    const entries = await readIndexEntries(homeDir);
+    assert.equal(
+      entries.size,
+      filesBefore,
+      "membership changed — this leg must not add or drop rows",
+    );
+    assert.equal(entries.get("l13.json")?.seatId, seatId);
+    assert.equal(entries.get("l13.json")?.holderActive, true);
+  });
+});
+
+// ─── L12 — the ORDERING, observed as an END STATE under an asymmetric fault ──
+
+/**
+ * 🛑 NOT A CALL-ORDER ASSERTION. B2's original AP16 asserted an mtime proxy and KEPT
+ * PASSING after the ordering was reversed — it never discriminated the two orderings
+ * at all, and that was measured rather than argued. So this row injects a fault
+ * BETWEEN the legs and reads the wreckage.
+ *
+ * **The fault is ASYMMETRIC, which is the hard part.** A whole-directory fault kills
+ * both legs and proves nothing. This one kills leg 1 ONLY, deterministically, with no
+ * `src/` edit and no test hook: `persistRecordFile` writes
+ * `<file>.<pid>.<ms>.<uuid>.tmp`, so a record whose own filename is 245 bytes has a
+ * temp path over 300 — **ENAMETOOLONG on the record write while every index write
+ * (temp path derived from the short `index.json`) succeeds untouched.**
+ *
+ * Under the ruled order the faulted record ends with NO `seat_id` and an entry that
+ * claims NO seat. Under the wrong order its entry would claim a seat the record never
+ * got — the exact state AC11 exists to prevent, and one that is permanently invisible
+ * to B3's `resolveSeat`.
+ */
+test("L12: an abort between the legs leaves NO index entry claiming a seat its record lacks", async () => {
+  await withTempHome(async (homeDir) => {
+    // 🔑 215 IS CALIBRATED, AND THE ARITHMETIC IS WRITTEN DOWN BECAUSE THE FIRST
+    // VALUE I PICKED WAS WRONG AND THE ROW PASSED VACUOUSLY.
+    //
+    // Under a temp HOME the rig dir IS the canonical `~/.acpx/sessions`, so
+    // `persistRecordFile` takes the OUTBOX branch and the temp name is
+    // `writeRecordAtomic`'s `<file>.<pid>.<uuid>.tmp` (+47 bytes) — NOT
+    // `persistRecordFile`'s own `<file>.<pid>.<ms>.<uuid>.tmp` (+61). At 200 that is
+    // 254 bytes: one under NAME_MAX, so the write SUCCEEDED and the whole row proved
+    // nothing. Against NAME_MAX = 255, with pid width between 1 and 7 digits:
+    //   record file  215 + 5              = 220  ✓ readable and writable
+    //   rollback copy 220 + 30 (suffix)   = 250  ✓ so the BACKUP leg succeeds …
+    //   outbox temp   220 + 42 + pidWidth ≥ 263  ✗ … and the RECORD write cannot
+    // Both margins hold for every pid width, so the fault is deterministic rather
+    // than pid-dependent. If either arithmetic ever stops holding the row goes RED —
+    // on the control (nothing failed) or on the code assertion — never silently green.
+    const longId = "l".repeat(215);
+    await seed(homeDir, [
+      makeRecord({ acpxRecordId: longId }),
+      // C1 — the control arm. An ordinary record in the SAME run must succeed, or a
+      // zero from the faulted arm says nothing: it would be indistinguishable from a
+      // run that did nothing at all.
+      makeRecord({ acpxRecordId: "l12-control" }),
+    ]);
+
+    const report = await backfill(homeDir, ["--apply"]);
+
+    // The control produced a non-zero result…
+    assert.equal(report.seats, 1, "the control record was not seated — the run did nothing");
+    assert.equal(typeof (await readRecordJson(homeDir, "l12-control")).seat_id, "string");
+
+    // …and the fault BIT, at the leg it was calibrated for (C2: which mechanism
+    // refused, by its own signature — not merely "the run failed").
+    assert.equal(report.errors.length, 1);
+    assert.equal(report.errors[0]?.stage, "record", "the fault did not land on the RECORD leg");
+    assert.equal(report.errors[0]?.code, "ENAMETOOLONG");
+
+    // THE END STATE — the subject of the row.
+    const faulted = await readRecordJson(homeDir, longId);
+    assert.equal(faulted.seat_id, undefined, "the faulted record must be unseated");
+    const entry = (await readIndexEntries(homeDir)).get(`${longId}.json`);
+    assert.notEqual(entry, undefined, "control: the faulted record still has an index entry");
+    assert.equal(
+      entry?.seatId,
+      undefined,
+      "an index entry CLAIMS A SEAT ITS RECORD LACKS — the legs ran in the wrong order",
+    );
+    // And no row was minted for a seat nobody holds.
+    assert.equal((await readSeatStore(sessionsDir(homeDir))).seats.size, 1);
+  });
+});
+
+/**
+ * 🔑 A REGRESSION GUARD FOR A DEFECT L12 ACTUALLY FOUND, not a hypothetical.
+ *
+ * The first version of the apply path took EVERY rollback copy up front, so the one
+ * record whose `<file><suffix>` exceeds `NAME_MAX` threw from outside the per-record
+ * isolation: the whole run aborted with exit 1 having written nothing, and with no
+ * per-record diagnosis of which record was the problem. Per-record isolation means
+ * *"one record's failure never aborts the run"*, and a rollback copy is part of that
+ * record's work — so it belongs inside its `try`, which is where it now is.
+ */
+test("L12b: a record whose ROLLBACK COPY cannot be taken is skipped, not written, and does not abort the run", async () => {
+  await withTempHome(async (homeDir) => {
+    // 240 + `.json` + the 30-byte suffix is 275 — over NAME_MAX for every pid width,
+    // so the COPY itself fails. (215, in L12, is the other side of that boundary:
+    // there the copy fits and the record write is what cannot.)
+    const unbackupable = "u".repeat(240);
+    await seed(homeDir, [
+      makeRecord({ acpxRecordId: unbackupable }),
+      makeRecord({ acpxRecordId: "l12b-control" }),
+    ]);
+
+    const report = await backfill(homeDir, ["--apply"]);
+
+    assert.equal(report.seats, 1, "the run aborted — the other records were not processed");
+    assert.equal(typeof (await readRecordJson(homeDir, "l12b-control")).seat_id, "string");
+    assert.equal(report.errors.length, 1);
+    assert.equal(report.errors[0]?.stage, "backup", "the failing leg must be named as the BACKUP");
+    assert.equal(report.errors[0]?.code, "ENAMETOOLONG");
+    assert.equal(
+      (await readRecordJson(homeDir, unbackupable)).seat_id,
+      undefined,
+      "a record with no rollback copy must not be written",
+    );
+  });
+});
+
+// ─── L14 / L15 — rollback: the copies, and RESTORING them ────────────────────
+
+test("L14: --apply leaves a .bak-mig-<TS> copy of the record, the index AND seats.json", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [makeRecord({ acpxRecordId: "l14" })]);
+    // seats.json must EXIST pre-apply for its copy to be assertable; an absent store
+    // has nothing to copy, which is a different (and correct) case.
+    await backfillSeatRow(sessionsDir(homeDir), {
+      seatId: "12121212-3434-5656-7878-909090909090",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      activeHolderId: null,
+      nextOrdinal: 2,
+      closedAt: null,
+      name: undefined,
+      brickId: undefined,
+    });
+
+    const report = await backfill(homeDir, ["--apply"]);
+    const suffix = report.backupSuffix ?? "";
+    assert.match(suffix, /^\.bak-mig-/, "no rollback suffix was recorded");
+
+    const names = (await fs.readdir(sessionsDir(homeDir))).filter((n) => n.includes(suffix));
+    assert.deepEqual(
+      names.toSorted(),
+      [`index.json${suffix}`, `l14.json${suffix}`, `${SEAT_STORE_FILE}${suffix}`].toSorted(),
+      "all three pre-apply copies must exist — record, index AND seats.json",
+    );
+  });
+});
+
+test("L15: RESTORING the copies returns records, index and store to byte-identical", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [
+      makeRecord({ acpxRecordId: "l15-a" }),
+      makeRecord({ acpxRecordId: "l15-b" }),
+    ]);
+    await backfillSeatRow(sessionsDir(homeDir), {
+      seatId: "31313131-4141-5151-6161-717171717171",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      activeHolderId: null,
+      nextOrdinal: 2,
+      closedAt: null,
+      name: undefined,
+      brickId: undefined,
+    });
+    const before = await snapshot(homeDir);
+
+    const report = await backfill(homeDir, ["--apply"]);
+    assert.equal(report.seats, 2, "control: the run must actually have changed something");
+    assert.notDeepEqual(
+      diffNames(before, await snapshot(homeDir)).filter((n) => !n.includes(".bak-mig-")),
+      [],
+      "control: nothing changed, so a successful restore would prove nothing",
+    );
+
+    // 🔑 ROLLBACK ASSERTED AS A RESTORE, NOT AS "WE TOOK A COPY". The copy is a claim
+    // about intent; the restore is the claim an operator needs at the worst moment.
+    const suffix = report.backupSuffix ?? "";
+    const dir = sessionsDir(homeDir);
+    for (const name of await fs.readdir(dir)) {
+      if (name.endsWith(suffix)) {
+        await fs.rename(path.join(dir, name), path.join(dir, name.slice(0, -suffix.length)));
+      }
+    }
+
+    assert.deepEqual(
+      diffNames(before, await snapshot(homeDir)),
+      [],
+      "restoring the pre-apply copies did not return the store to its exact prior state",
+    );
+  });
+});
+
+// ─── R1 / R3 / R4 — refusals, each paired with L2 and each shown reachable ───
+
+test("R1: a MALFORMED seats.json is refused — and nothing is written", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [makeRecord({ acpxRecordId: "r1" })]);
+    await fs.writeFile(path.join(sessionsDir(homeDir), SEAT_STORE_FILE), "{ not json", "utf8");
+    const before = await snapshot(homeDir);
+
+    const result = await runCli(["seats", "backfill", "--apply"], homeDir);
+    assert.notEqual(result.code, 0, "a malformed store must not exit 0");
+    const output = `${result.stdout}${result.stderr}`;
+    // C2 — WHICH mechanism refused, by its own signature. "It failed" is not a control.
+    assert.match(output, /refusing to write the seat store/, "not the single writer's refusal");
+    assert.match(output, /QUARANTINE the file/, "the refusal must print the real remedy");
+    assert.equal(
+      output.includes("run the seat backfill"),
+      true,
+      "the message must still name the backfill as the step AFTER quarantine",
+    );
+
+    assert.deepEqual(
+      diffNames(before, await snapshot(homeDir)),
+      [],
+      "the refusal wrote to the store",
+    );
+  });
+});
+
+test("R1b: the SINGLE WRITER is what fails closed — backfillSeatRow refuses too", async () => {
+  await withTempHome(async (homeDir) => {
+    const dir = sessionsDir(homeDir);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, SEAT_STORE_FILE), "[]", "utf8");
+    // Behavioural, not textual: only a write going through `withSeatStoreWrite`
+    // inherits the fail-closed guard. A second writer would happily overwrite.
+    await assert.rejects(
+      backfillSeatRow(dir, {
+        seatId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        activeHolderId: null,
+        nextOrdinal: 2,
+        closedAt: null,
+        name: undefined,
+        brickId: undefined,
+      }),
+      (error: unknown) =>
+        error instanceof SeatStoreUnwritableError && error.fileState === "malformed",
+    );
+    assert.equal(await fs.readFile(path.join(dir, SEAT_STORE_FILE), "utf8"), "[]");
+  });
+});
+
+test("R3: an index that fails the all-or-nothing contract is refused, not rebuilt", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [makeRecord({ acpxRecordId: "r3" })]);
+    const indexPath = path.join(sessionsDir(homeDir), "index.json");
+    const index = JSON.parse(await fs.readFile(indexPath, "utf8")) as {
+      entries: Record<string, unknown>[];
+    };
+    // ONE unparseable entry. `readSessionIndex` rejects the WHOLE file for it
+    // (index.ts:645-647) — so anything downstream would be built on a full rebuild.
+    index.entries.push({ file: "ghost.json", acpxRecordId: 7 });
+    await fs.writeFile(indexPath, `${JSON.stringify(index)}\n`, "utf8");
+    const before = await snapshot(homeDir);
+
+    const result = await runCli(["seats", "backfill", "--apply"], homeDir);
+    assert.notEqual(result.code, 0);
+    assert.match(
+      `${result.stdout}${result.stderr}`,
+      /ALL-OR-NOTHING/,
+      "the refusal must name the contract it refused on",
+    );
+    assert.deepEqual(
+      diffNames(before, await snapshot(homeDir)),
+      [],
+      "the refusal wrote to the store",
+    );
+  });
+});
+
+test("R4: an UNREADABLE store is refused, and it is a DIFFERENT answer from absent", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [makeRecord({ acpxRecordId: "r4" })]);
+    const storePath = path.join(sessionsDir(homeDir), SEAT_STORE_FILE);
+    await fs.writeFile(storePath, "{}", "utf8");
+    await fs.chmod(storePath, 0o000);
+    try {
+      // The three-way distinction, asserted as three values rather than a boolean:
+      // `absent` is not an error (L2 creates the file), while `unreadable` refuses
+      // with a filesystem remedy and `malformed` refuses with a quarantine one.
+      assert.equal((await readSeatStore(sessionsDir(homeDir))).fileState, "unreadable");
+
+      const result = await runCli(["seats", "backfill", "--apply"], homeDir);
+      assert.notEqual(result.code, 0);
+      const output = `${result.stdout}${result.stderr}`;
+      assert.match(output, /could not be read \(a permission or I\/O failure/);
+      assert.equal(
+        output.includes("QUARANTINE the file"),
+        false,
+        "unreadable must not print the MALFORMED remedy — the two remedies differ",
+      );
+      assert.equal(typeof (await readRecordJson(homeDir, "r4")).seat_id, "undefined");
+    } finally {
+      await fs.chmod(storePath, 0o644);
+    }
+  });
+});

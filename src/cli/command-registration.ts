@@ -71,6 +71,7 @@ import {
 import { registerModelsCommand } from "./models-command.js";
 import { registerProfilesCommand } from "./profiles-command.js";
 import { registerProvidersCommand } from "./providers-command.js";
+import { registerSeatsCommand } from "./seats-command.js";
 import { DEFAULT_CLOSE_DRAIN_TIMEOUT_MS } from "./session/contracts.js";
 import { registerStatusCommand } from "./status-command.js";
 import { registerSubscriptionsCommand } from "./subscriptions-command.js";
@@ -1059,6 +1060,7 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
   });
 
   registerSessionsCommand(program, undefined, config);
+  registerSeatsCommand(program, config);
   registerSubscriptionsCommand(program, config);
   registerProfilesCommand(program, config);
   registerAgentsCommand(program, config);

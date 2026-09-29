@@ -684,7 +684,16 @@ export async function writeSessionIndex(
   await fs.rename(tempFile, filePath);
 }
 
-async function listSessionRecordFiles(sessionDir: string): Promise<string[]> {
+/**
+ * The session-record files in `sessionDir`, as the index itself enumerates them.
+ *
+ * ⚠️ EXPORTED SO B10's BACKFILL SHARES THIS ENUMERATION RATHER THAN RE-DERIVING IT.
+ * A second `readdir` filter would be a second answer to "which files are records",
+ * and the registry comment below is precisely the story of what happens when two
+ * such filters disagree. The backfill must see exactly the population the index
+ * sees, or a record it seats is one the index will never enrich.
+ */
+export async function listSessionRecordFiles(sessionDir: string): Promise<string[]> {
   return (await fs.readdir(sessionDir, { withFileTypes: true }))
     .filter(
       (entry) =>
