@@ -563,6 +563,12 @@ export class OpenRouterModelNotEntitledError extends AcpxOperationalError {
       outputCode: "USAGE",
       detailCode: "OPENROUTER_MODEL_NOT_ENTITLED",
       origin: "cli",
+      // ⚠️ THE SAME TOKEN THE READ PATH PUTS ON `availability.<agent>.reason`, and the
+      // same one Tier 1's refusal carries. `detailCode` differs by tier and cannot be
+      // made to agree — it names WHICH GATE fired — so this is the field a caller uses
+      // to ask "was this refused for entitlement?" without matching prose that is
+      // tuned for an agent to read and expected to change.
+      policyReason: OPENROUTER_NOT_ENTITLED_REASON,
     });
     this.name = "OpenRouterModelNotEntitledError";
   }
@@ -603,6 +609,10 @@ export class ClaudeFamilyOnOpenRouterError extends AcpxOperationalError {
       outputCode: "USAGE",
       detailCode: "CLAUDE_FAMILY_ON_OPENROUTER",
       origin: "cli",
+      // Same mechanism as the entitlement refusal: the token the read path already
+      // uses for this policy, so both tiers agree on WHICH policy refused even where
+      // their detail codes cannot (brick daed4261).
+      policyReason: CLAUDE_FAMILY_OPENROUTER_REASON,
     });
     this.name = "ClaudeFamilyOnOpenRouterError";
   }

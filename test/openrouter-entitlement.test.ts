@@ -7,6 +7,7 @@ import { buildCatalogue } from "../src/models/catalogue.js";
 import {
   assertModelPolicy,
   ClaudeFamilyOnOpenRouterError,
+  CLAUDE_FAMILY_OPENROUTER_REASON,
   claudeFamilyOnOpenRouterMessage,
   OPENROUTER_NOT_ENTITLED_REASON,
   OpenRouterModelNotEntitledError,
@@ -737,4 +738,64 @@ test("Tier 1 REFUSES on entitlement too — the read path is not declaration-onl
   });
   assert.equal(resolved?.id, entitled.slug);
   assert.equal(resolved?.source, "openrouter");
+});
+
+test("the entitlement reason token is IDENTICAL at both tiers, and machine-readable", async () => {
+  // 🛑 WHY A TOKEN AND NOT `detailCode`. One policy is enforced at two tiers whose
+  // detail codes necessarily DIFFER — Tier 1 is the generic availability gate
+  // (`MODEL_NOT_AVAILABLE_FOR_AGENT`), the spawn guard is specific
+  // (`OPENROUTER_MODEL_NOT_ENTITLED`). So "was this refused for entitlement?" was
+  // answerable only by matching the message — and the message is tuned for an agent to
+  // READ and is expected to change, so a caller coupled to it breaks on a reword.
+  // `policyReason` is the field that agrees across tiers.
+  const { ModelSlugError, validateModelSelection } =
+    await import("../src/models/model-slug-validation.js");
+  const entitled = OPENROUTER_ENTITLEMENT[0];
+  assert.ok(entitled);
+  const rows = [
+    { id: entitled.slug, name: "entitled", supported_parameters: ["tools"] },
+    { id: "zzz-vendor/not-entitled-2", name: "outsider", supported_parameters: ["tools"] },
+  ];
+  const catalogue = buildCatalogue(rows, META, { entitlement: OPENROUTER_ENTITLEMENT });
+
+  // TIER 1 — the `--model` gate.
+  let tier1: unknown;
+  try {
+    validateModelSelection(catalogue, { model: "zzz-vendor/not-entitled-2", agentName: "claude" });
+  } catch (error) {
+    tier1 = error;
+  }
+  assert.ok(tier1 instanceof ModelSlugError);
+  assert.equal(tier1.policyReason, OPENROUTER_NOT_ENTITLED_REASON);
+  assert.equal(tier1.detailCode, "MODEL_NOT_AVAILABLE_FOR_AGENT");
+
+  // P0 — the spawn-path guard.
+  const p0 = captureThrow(() =>
+    assertModelPolicy(REAL_CLAUDE_COMMAND, "zzz-vendor/not-entitled-2", {
+      entitlement: settled(),
+    }),
+  );
+  assert.ok(p0 instanceof OpenRouterModelNotEntitledError);
+  assert.equal(p0.policyReason, OPENROUTER_NOT_ENTITLED_REASON);
+  assert.equal(p0.detailCode, "OPENROUTER_MODEL_NOT_ENTITLED");
+
+  // THE PROPERTY: the tokens AGREE while the detail codes DIFFER. Both halves are
+  // asserted, because "they agree" is vacuous if the codes happened to agree too.
+  assert.equal(tier1.policyReason, p0.policyReason);
+  assert.notEqual(tier1.detailCode, p0.detailCode);
+  // …and it is the SAME token the read path publishes, so all three surfaces agree.
+  const row = catalogue.models.find((model) => model.id === "zzz-vendor/not-entitled-2");
+  assert.equal(row?.availability.claude?.reason, tier1.policyReason);
+
+  // The Claude-family refusal carries its own policy token by the same mechanism.
+  const claude = captureThrow(() =>
+    assertModelPolicy(REAL_CLAUDE_COMMAND, "anthropic/claude-sonnet-5", {
+      entitlement: settled(),
+    }),
+  );
+  assert.ok(claude instanceof ClaudeFamilyOnOpenRouterError);
+  assert.equal(claude.policyReason, CLAUDE_FAMILY_OPENROUTER_REASON);
+  // NEGATIVE: the two policies must be DISTINGUISHABLE by the token, or it answers
+  // "some policy refused" rather than "which one".
+  assert.notEqual(claude.policyReason, OPENROUTER_NOT_ENTITLED_REASON);
 });

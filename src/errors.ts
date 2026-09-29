@@ -13,6 +13,23 @@ type AcpxErrorOptions = ErrorOptions & {
   retryable?: boolean;
   acp?: OutputErrorAcpPayload;
   outputAlreadyEmitted?: boolean;
+  /**
+   * WHICH POLICY refused this, as a stable machine-readable token — the SAME token
+   * the catalogue puts on `availability.<agent>.reason` (brick daed4261).
+   *
+   * ⚠️ **IT EXISTS BECAUSE `detailCode` CANNOT ANSWER THE QUESTION.** One policy is
+   * enforced at two tiers that necessarily carry different `detailCode`s — the Tier 1
+   * `--model` gate answers `MODEL_NOT_AVAILABLE_FOR_AGENT` (it is the generic
+   * availability refusal) while the spawn-path guard answers
+   * `OPENROUTER_MODEL_NOT_ENTITLED`. So *"was this refused for entitlement?"* was
+   * answerable only by matching prose, which is exactly the coupling a refusal
+   * message must not create: the wording is tuned for an agent to READ and is
+   * expected to change.
+   *
+   * `policyReason` is the same on both tiers for one policy, so a caller
+   * discriminates on it and never on the message.
+   */
+  policyReason?: string;
 };
 
 export class AcpxOperationalError extends Error {
@@ -22,6 +39,8 @@ export class AcpxOperationalError extends Error {
   readonly retryable?: boolean;
   readonly acp?: OutputErrorAcpPayload;
   readonly outputAlreadyEmitted?: boolean;
+  /** Which POLICY refused this — see `AcpxErrorOptions.policyReason`. */
+  readonly policyReason?: string;
 
   constructor(message: string, options?: AcpxErrorOptions) {
     super(message, options);
@@ -32,6 +51,7 @@ export class AcpxOperationalError extends Error {
     this.retryable = options?.retryable;
     this.acp = options?.acp;
     this.outputAlreadyEmitted = options?.outputAlreadyEmitted;
+    this.policyReason = options?.policyReason;
   }
 }
 

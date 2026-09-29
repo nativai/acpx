@@ -48,8 +48,20 @@ const KNOWN_SOURCE_PREFIXES = new Set([
 ]);
 
 export class ModelSlugError extends AcpxOperationalError {
-  constructor(message: string, detailCode: string) {
-    super(message, { outputCode: "USAGE", detailCode, origin: "cli" });
+  /**
+   * @param policyReason WHICH policy refused, as the same machine-readable token the
+   *   catalogue puts on `availability.<agent>.reason` (brick daed4261). Passed through
+   *   so a caller can ask *"was this refused for entitlement?"* without matching prose
+   *   — `detailCode` cannot answer it, because one policy is enforced at two tiers
+   *   with necessarily different detail codes. See `AcpxErrorOptions.policyReason`.
+   */
+  constructor(message: string, detailCode: string, policyReason?: string) {
+    super(message, {
+      outputCode: "USAGE",
+      detailCode,
+      origin: "cli",
+      ...(policyReason !== undefined ? { policyReason } : {}),
+    });
   }
 }
 
@@ -570,11 +582,16 @@ function assertModelAvailable(
   if (availability === undefined || availability.ok) {
     return;
   }
+  // ⚠️ THE CATALOGUE'S OWN `reason` TOKEN IS CARRIED ONTO THE ERROR, not just rendered
+  // into the message (brick daed4261). This tier and the spawn-path guard enforce the
+  // SAME policies under different `detailCode`s, so the token is the only field that
+  // answers "which policy refused?" identically at both — and it costs one argument.
   throw new ModelSlugError(
     `[acpx] --model "${ref.raw}" is not available for a ${agentName} session: ` +
       `${availability.message ?? availability.reason}\n` +
       `  try: acpx models --agent ${agentName}`,
     "MODEL_NOT_AVAILABLE_FOR_AGENT",
+    availability.reason,
   );
 }
 
