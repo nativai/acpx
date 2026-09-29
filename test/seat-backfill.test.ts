@@ -18,7 +18,7 @@ import {
   SEAT_STORE_FILE,
   SeatStoreUnwritableError,
 } from "../src/session/persistence/seat-store.js";
-import { SEAT_BACKFILL_NOTES } from "../src/session/seat-backfill.js";
+import { countStaleSeatIndexEntries, SEAT_BACKFILL_NOTES } from "../src/session/seat-backfill.js";
 import type { SessionRecord } from "../src/types.js";
 import {
   makeSessionRecord as makeSessionRecordFixture,
@@ -1449,8 +1449,16 @@ test("L19: a record with NO index entry gets a CORRECT entry in one --apply, and
     );
 
     // (c) The brick's own measured acceptance, from the verb's own instrument.
+    //
+    // 🛑 MUST BE MEASURED AFTER THE APPLY, NOT READ FROM `first.staleIndexEntries`.
+    // `scanRecords` computes that field BEFORE any write, so on this rig it reads `0`
+    // whether or not the defect is present — the orphan's `seat.seatsRecord` is still
+    // `true` at scan time, which structurally excludes it from the pre-write count
+    // regardless of what its index entry ends up holding. Call the same instrument
+    // the CLI's own `--verify` uses, against the live post-apply store, so the
+    // assertion measures what its message claims.
     assert.equal(
-      first.staleIndexEntries,
+      await countStaleSeatIndexEntries(sessionsDir(homeDir)),
       0,
       "--verify still counts a stale entry after one --apply",
     );
