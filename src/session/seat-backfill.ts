@@ -104,8 +104,21 @@ export type SeatBackfillReport = {
   seats: number;
   /** Index entries needing (dry run) or given (`--apply`) the seat field group. */
   indexEntries: number;
-  /** Records the index has no entry for at all. Reported, never fabricated — adding
-   * an entry is a MEMBERSHIP change and belongs to reconcile, not to this verb. */
+  /**
+   * Records the index had no entry for when the run started.
+   *
+   * ⚠️ THIS FIELD'S DOC COMMENT USED TO CLAIM THE ENTRY WAS "reported, never
+   * fabricated — adding an entry is a MEMBERSHIP change and belongs to reconcile,
+   * not to this verb." **That was false about the shipped code**, and believing it is
+   * what let the defect through: `overlaySessionIndexEntries` reconciles membership,
+   * so the entry is created by this verb's own index writes regardless. It was a
+   * description of behaviour that does not happen, dressed as a design promise.
+   *
+   * What is true: the seat group is never invented — every field written is projected
+   * from the record on disk — and the entry these records get is the SAME projection
+   * reconcile would produce on the next ordinary index load. The count stays because
+   * it is worth an operator's attention, not because nothing is written.
+   */
   recordsWithoutIndexEntry: number;
   /** Rows minted for a seat a record already carried — AC11 (e)'s "repairs any
    * row-less seat it meets", counted separately because it is the population that
@@ -374,7 +387,27 @@ async function scanRecords(
       file,
       record,
       ...seat,
-      enrichesIndex: entry !== undefined && !indexEntryAgrees(entry, seat),
+      // 🛑 `entry === undefined` MEANS THE INDEX LEG IS NEEDED **MORE**, NOT LESS —
+      // and reading it the other way was a real defect, found by the test-engineer
+      // and reproduced on the live population (1 such record on devbox today).
+      //
+      // This clause used to open `entry !== undefined &&`, which skipped the index
+      // leg for a record the index had no entry for. That looked conservative and was
+      // the opposite, because THE ENTRY GETS CREATED ANYWAY, by someone else's write:
+      // `overlaySessionIndexEntries` calls `reconcileSessionIndex`, which reconciles
+      // MEMBERSHIP and adds an entry for every record file the index lacks —
+      // projected from that record AS IT STANDS AT THAT MOMENT. So the first
+      // enriching record's index write minted an entry for this one, projected BEFORE
+      // its `seat_id` was written, and nothing revisited it because its own flag had
+      // been fixed to `false` at scan time. End state after ONE `--apply`: record
+      // seated, row present, **entry carrying `createdAt` and no `seatId`** — which is
+      // exactly the cutover-blocking state this block exists to delete, and which
+      // `resolveSeat` TRUSTS and therefore never repairs.
+      //
+      // ⇒ The membership question is not ours to decide and never was: reconcile adds
+      // that entry on any index load. The only question is whether what it leaves
+      // behind is CORRECT or STALE, so this leg runs and makes it correct.
+      enrichesIndex: entry === undefined || !indexEntryAgrees(entry, seat),
       hasIndexEntry: entry !== undefined,
     });
   }

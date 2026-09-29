@@ -606,10 +606,13 @@ function headlineLines(report: SeatBackfillReport): string[] {
 function detailLines(report: SeatBackfillReport): string[] {
   const lines: string[] = [];
   if (report.recordsWithoutIndexEntry > 0) {
-    // Reported, never fabricated: adding an entry is a MEMBERSHIP change, which is
-    // reconcile's job and not this verb's.
+    // ⚠️ "left to reconcile" WAS WRONG AND IS CORRECTED. The index writes this run
+    // performs reconcile membership themselves, so these records DO get an entry —
+    // the run now makes sure it is a correct one rather than a stale projection
+    // taken before the record was seated. Worth the operator's attention, but it is
+    // not work deferred to anybody.
     lines.push(
-      `  ⚠ records with no index entry (left to reconcile): ${report.recordsWithoutIndexEntry}`,
+      `  records that had no index entry (entry written from the seated record): ${report.recordsWithoutIndexEntry}`,
     );
   }
   if (report.backupSuffix !== undefined) {

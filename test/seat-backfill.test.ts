@@ -1338,3 +1338,103 @@ test("L16a: `acpx seats` registers ALL FOUR subcommands, and each ANSWERS", asyn
     }
   });
 });
+
+// ─── L19 — the record the index has NO ENTRY for (a live population) ─────────
+
+/**
+ * 🛑 A REAL DEFECT, FOUND BY THE INDEPENDENT TEST-ENGINEER, ON A POPULATION THAT
+ * EXISTS ON THE LIVE FLEET — PLAN §4's census measured exactly ONE such record on
+ * devbox. Nothing covered it until this row.
+ *
+ * ## The mechanism, because it is not the one a reader expects
+ *
+ * A record with no index entry was EXCLUDED from the index leg by construction:
+ * the flag read `entry !== undefined && !indexEntryAgrees(...)`, so an orphan scored
+ * `false` and was never enriched — and was not counted either.
+ *
+ * But the entry gets created anyway, **by another record's index write**:
+ * `overlaySessionIndexEntries` → `reconcileSessionIndex` reconciles MEMBERSHIP and
+ * adds an entry for every record file the index lacks, projected from that record as
+ * it stands at that moment. So the first enriching record minted the orphan's entry
+ * from its UNSEATED record, and nothing revisited it.
+ *
+ * End state after ONE `--apply`: record seated · row present · **entry with
+ * `createdAt` and no `seatId`** — the exact cutover-blocking state this block exists
+ * to delete, and the one `resolveSeat` TRUSTS and therefore never repairs.
+ *
+ * ## Why the rig's NAMES are load-bearing
+ *
+ * Records are processed in sorted file order, so the defect only fires when an
+ * enriching record sorts BEFORE the orphan — it is the earlier record's index write
+ * that mints the stale entry. `a-normal` / `z-orphan` guarantees that order. Named
+ * the other way round this row would pass against the broken code.
+ *
+ * ## It breaks two RULED properties, and the row asserts both
+ *
+ * - the brick's own measured acceptance — *"after --apply, ZERO index entries whose
+ *   record carries seat_id but whose entry lacks it"* — `--verify` returned 1;
+ * - the ruled IDEMPOTENCY — *"a second --apply reports 0 and changes nothing"* — the
+ *   second run reported `0 1 0` and WROTE the index. It self-healed, which is why
+ *   this is not data loss; but B12a's operator runs the command ONCE, and the
+ *   remedy must never be "run it twice".
+ */
+test("L19: a record with NO index entry gets a CORRECT entry in one --apply, and the second run is a no-op", async () => {
+  await withTempHome(async (homeDir) => {
+    // Seed + index the ordinary record FIRST, so the orphan is genuinely absent from
+    // the index rather than merely last in it.
+    await seed(homeDir, [makeRecord({ acpxRecordId: "a-normal" })]);
+    await writeSessionRecordFile(homeDir, makeRecord({ acpxRecordId: "z-orphan" }));
+
+    // THE CONTROL: the orphan really has no entry, and the ordinary record does.
+    // Without this the row could pass against a rig that never had the population.
+    const before = await readIndexEntries(homeDir);
+    assert.equal(before.has("a-normal.json"), true, "rig is wrong: the normal record is unindexed");
+    assert.equal(before.has("z-orphan.json"), false, "rig is wrong: the orphan IS indexed");
+
+    const first = await backfill(homeDir, ["--apply", "--verify"]);
+    assert.equal(first.errors.length, 0, JSON.stringify(first.errors));
+    assert.equal(first.recordsWithoutIndexEntry, 1, "the orphan population was not seen at all");
+    assert.equal(first.seats, 2, "control: both records must be seated in this run");
+
+    // (a) The record and its row — the two legs that were already correct.
+    const orphanRecord = await readRecordJson(homeDir, "z-orphan");
+    const orphanSeatId = String(orphanRecord.seat_id);
+    assert.match(orphanSeatId, /^[0-9a-f-]{36}$/);
+    assert.equal(
+      (await readSeatStore(sessionsDir(homeDir))).seats.has(orphanSeatId),
+      true,
+      "no seat row for the orphan",
+    );
+
+    // (b) 🔑 THE SUBJECT: its index entry must carry ITS OWN seat id, not a stale
+    // projection taken before the record was seated.
+    const entry = (await readIndexEntries(homeDir)).get("z-orphan.json");
+    assert.notEqual(entry, undefined, "the orphan ended the run with no index entry at all");
+    assert.equal(
+      entry?.seatId,
+      orphanSeatId,
+      "the orphan's index entry lacks its seatId — resolveSeat TRUSTS this entry and never repairs it",
+    );
+
+    // (c) The brick's own measured acceptance, from the verb's own instrument.
+    assert.equal(
+      first.staleIndexEntries,
+      0,
+      "--verify still counts a stale entry after one --apply",
+    );
+
+    // (d) THE RULED IDEMPOTENCY, which the defect also broke: the second run must
+    // report 0 AND write nothing. Before the fix this reported `0 1 0` and rewrote
+    // the index — self-healing, but the ruled property was false as shipped.
+    const afterFirst = await snapshot(homeDir);
+    const second = await backfill(homeDir, ["--apply"]);
+    assert.equal(second.seats, 0);
+    assert.equal(second.indexEntries, 0, "the second --apply rewrote an index entry");
+    assert.equal(second.errors.length, 0);
+    assert.deepEqual(
+      diffNames(afterFirst, await snapshot(homeDir)).filter((n) => !n.includes(".bak-mig-")),
+      [],
+      "the second --apply changed the store",
+    );
+  });
+});
