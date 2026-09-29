@@ -544,24 +544,27 @@ test("RN2′ · the seat row carries the new name and the ACTIVE HOLDER'S RECORD
   });
 });
 
-test("RN3′ · the record-unchanged assertion CAN fail — the committed negative case", () => {
-  // In place of "make the implementation also write the holder's record and show
-  // RN2′ red" (forbidden: that is gutting/mutating the source). This feeds the same
-  // comparison the violation it exists to catch — a record whose `name` moved — and
-  // requires it to be caught. Without it, RN2′ would pass identically if the two
-  // reads were of the same stale buffer or the comparison were `assert.ok(true)`.
-  const recordBefore = JSON.stringify({ acpx_record_id: "r1", name: "alpha", seat_id: SEAT_A });
-  const recordAfterProjectionWrite = JSON.stringify({
-    acpx_record_id: "r1",
-    name: "renamed",
-    seat_id: SEAT_A,
-  });
-  assert.notEqual(
-    recordAfterProjectionWrite,
-    recordBefore,
-    "if this comparison cannot see a changed record name, RN2′ proves nothing",
-  );
-});
+// ⚠️ **PLAN.md's `RN3′` HAS NO ROW HERE, AND ITS DELETION IS THE POINT.**
+//
+// A row of that name existed and was a TAUTOLOGY: it built two literal JSON strings
+// differing in `name` and asserted they differ. It drove no CLI, touched no rig, read
+// no file, and never referenced RN2′'s comparison — it constructed a fresh unrelated
+// one. It could not fail for any product reason, and it was the only non-async row in
+// this file, which is the mechanical tell.
+//
+// 🔑 **THE PROTECTION RN3′ CLAIMED TO PROVIDE IS REAL AND LIVES IN `RN2′` ITSELF.**
+// RN2′ asserts the holder's record is BYTE-IDENTICAL after a `seats rename` driven
+// through the real binary. An implementation that also wrote the holder's record makes
+// that assertion fail — so RN2′ is SELF-FALSIFYING, which is what "red when its policy
+// is removed" actually means: permanently, rather than once. Appending a second block
+// to a self-falsifying assertion adds nothing and, built from literals, can only be a
+// tautology.
+//
+// **The test for whether any "negative case" is real: DOES THE PRODUCT APPEAR IN IT?**
+// A row constructible from literals in this file alone proves something about
+// JavaScript, not about our code.
+// *(Found by the independent test-engineer; the specification that invited it has been
+// corrected by the sub-HoD, and PLAN.md's credit for ruling A moves to RN2′.)*
 
 test("RN4 · a name is REJECTED, never repaired — with the legitimate pair that still passes", async () => {
   await withRig(async (homeDir) => {
@@ -841,6 +844,56 @@ test("D4 · DELETE DOES NOT CLOSE — no row anywhere gains a closed_at, and the
   });
 });
 
+test("D5b · a REPEATED id is reported once — the count must match the rows actually removed", async () => {
+  // Found by the independent test-engineer against the real binary: `delete <A> <A>`
+  // reported `deleted: [A, A]` for ONE row removed. The store was always correct —
+  // every lookup runs against the unmutated store read at the top of the hold, so the
+  // second occurrence merely re-read as present — but the payload over-reported, and
+  // the sweep's wiring may log that number.
+  //
+  // 🔑 THE ROW ASSERTS THE COUNT, NOT JUST THE END STATE, because the end state was
+  // never wrong: a row that only checked the store would have passed throughout the
+  // defect. That is the same shape as the suite-tally lesson on this block — assert
+  // the count, not only the outcome.
+  await withRig(async (homeDir) => {
+    await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A), [SEAT_B]: seatRow(SEAT_B) });
+
+    const result = await runCli(
+      ["--format", "json", "seats", "delete", SEAT_A, SEAT_A, SEAT_B],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.output);
+    const payload = JSON.parse(result.stdout.trim()) as {
+      deleted: string[];
+      absent: string[];
+      malformed: string[];
+    };
+    assert.deepEqual(payload.deleted, [SEAT_A, SEAT_B], "each id reported ONCE, in caller order");
+    assert.deepEqual(payload.absent, [], "a duplicate must not re-read as absent either");
+    assert.deepEqual(payload.malformed, []);
+    assert.deepEqual(Object.keys(await readStoreJson(homeDir)), [], "the store was always correct");
+  });
+
+  // The paired arm for a repeated ABSENT id: de-duplication must not turn a no-op into
+  // a deletion, nor report the same missing seat twice.
+  await withRig(async (homeDir) => {
+    await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A) });
+    const result = await runCli(
+      ["--format", "json", "seats", "delete", SEAT_ABSENT, SEAT_ABSENT],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.output);
+    const payload = JSON.parse(result.stdout.trim()) as {
+      deleted: string[];
+      absent: string[];
+      storeWritten: boolean;
+    };
+    assert.deepEqual(payload.absent, [SEAT_ABSENT]);
+    assert.deepEqual(payload.deleted, []);
+    assert.equal(payload.storeWritten, false);
+  });
+});
+
 test("D5 · N ids in ONE invocation — every row gone", async () => {
   await withRig(async (homeDir) => {
     await writeStore(homeDir, {
@@ -880,7 +933,7 @@ test("D6 · a MIXED batch — present ids deleted, absent ids no-op'd, rc 0", as
   });
 });
 
-test("D7 · a MALFORMED ROW survives the delete VERBATIM — with the control that proves the check bites", async () => {
+test("D7 · a MALFORMED ROW survives the delete VERBATIM", async () => {
   await withRig(async (homeDir) => {
     // `next_ordinal: 0` is unreadable by the parse leg (the counter starts at 1), so
     // this row lands in `unparsedRows` — carried, never repaired.
@@ -892,22 +945,23 @@ test("D7 · a MALFORMED ROW survives the delete VERBATIM — with the control th
 
     const after = await readStoreJson(homeDir);
     assert.equal(after[SEAT_A], undefined, "the target is deleted");
+    // 🔑 SELF-FALSIFYING, AND THAT IS WHY NOTHING IS APPENDED BELOW IT. A writer that
+    // built its next state from `store.seats` alone would drop the malformed row, so
+    // `after[SEAT_B]` would be `undefined` and this comparison would fail. The row
+    // therefore goes red WHEN THE POLICY IS REMOVED, permanently, by construction.
+    //
+    // ⚠️ An appended "negative case" USED TO SIT HERE and was DELETED as a tautology:
+    // it copied `after`, `delete`d the key, and asserted the key was `undefined` —
+    // which is true by the semantics of `delete` and could not fail for any product
+    // reason. The replacement proposed for it (`notDeepEqual` against the same copy)
+    // is the same tautology one operator over: comparing `undefined` to a literal
+    // object is a fact about JavaScript, not about this codebase. The rule that
+    // settles it — DOES THE PRODUCT APPEAR IN THE ASSERTION? — says delete, not repair.
     assert.deepEqual(
       after[SEAT_B],
       malformed,
       "the malformed row must be re-emitted VERBATIM — a mutator naturally builds its next " +
         "state from `seats`, which by definition excludes it (seat-store.ts:210-218)",
-    );
-
-    // THE COMMITTED NEGATIVE CASE for "[RED-WHEN-REMOVED]: build the next state from
-    // store.seats alone". Rather than gutting the writer, this reproduces what such a
-    // writer would PRODUCE and requires the same comparison to flag it.
-    const naiveWriterOutput: Record<string, PersistedRow> = { ...after };
-    delete naiveWriterOutput[SEAT_B];
-    assert.equal(
-      naiveWriterOutput[SEAT_B],
-      undefined,
-      "if the malformed row's absence is not detectable, D7's assertion proves nothing",
     );
   });
 });

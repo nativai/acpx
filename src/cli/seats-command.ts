@@ -497,7 +497,16 @@ async function handleSeatsDelete(
   await runSeatMutation("delete", format, async () => {
     // EVERY ref validated before the hold is taken: a malformed ref is the caller's
     // mistake and must not cost a lock acquisition, let alone a partial write.
-    const seatIds = seatRefs.map((ref) => parseSeatIdOrThrow(ref));
+    //
+    // 🔑 AND DE-DUPLICATED BEFORE THE HOLD, WHICH IS A REPORTING FIX, NOT A SAFETY ONE.
+    // The store always ended correct — every lookup runs against the UNMUTATED store
+    // read at the top of the hold, so a repeated id simply re-reads as present. What it
+    // corrupted was the COUNT: `acpx seats delete <A> <A>` reported `deleted: [A, A]`
+    // for one row removed, and the sweep's wiring may well log that number. A
+    // machine-readable payload that over-reports is worse than a slow one.
+    // `Set` preserves first-insertion order, so the report still reads in the order the
+    // caller passed. (Found by the independent test-engineer on the real binary.)
+    const seatIds = [...new Set(seatRefs.map((ref) => parseSeatIdOrThrow(ref)))];
     const sessionDir = sessionBaseDir();
     const outcome = await withSeatStoreWrite(sessionDir, (store) => {
       refuseUnwritableStore(store, sessionDir);
