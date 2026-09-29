@@ -689,7 +689,14 @@ async function vetActiveHolder(
   }
 }
 
-function seatHolderOpenMessage(seatId: string, holderId: string): string {
+/**
+ * 🔑 EXPORTED FOR ONE REASON — the same precedent `buildSeatDeletion` sets
+ * (`seats-command.ts:446-452`): so a test row can measure the PRODUCT's own
+ * message rather than a hand-written paraphrase. A row that reimplemented this
+ * string in the test file would pass with the product deleted — see CL4's
+ * former "control" block, which did exactly that and was corrected for it.
+ */
+export function seatHolderOpenMessage(seatId: string, holderId: string): string {
   return (
     `seat ${JSON.stringify(seatId)} refuses to close: its active holder ` +
     `${JSON.stringify(holderId)} is still open per its own record. Close the holder ` +
@@ -703,10 +710,24 @@ function seatHolderOpenMessage(seatId: string, holderId: string): string {
 }
 
 /**
- * ⚠️ DELIBERATELY SHARES NO SUBSTRING WITH `seatHolderOpenMessage`, NOR WITH
- * `seatRowMissingMessage` / `seatRowsMalformedMessage` / the unwritable-store
- * message. Two refusals that shared a substring would be green whichever fired —
- * B2's AP13 defect exactly.
+ * ⚠️ CORRECTED (independent TE finding F2, 2026-09-29) — this comment used to
+ * claim ~~"DELIBERATELY SHARES NO SUBSTRING WITH `seatHolderOpenMessage`, NOR
+ * WITH `seatRowMissingMessage` / `seatRowsMalformedMessage` / the
+ * unwritable-store message"~~. **That guarantee never held.** Measured: three
+ * shared substrings ≥12 chars, longest 56 (the `acpx seats close <seat>`
+ * remedy, the `seat "<id>" ` opener, and `": its active holder "`).
+ *
+ * **The TRUE, narrower guarantee, and why sharing THIS text is correct rather than
+ * an oversight:** both refusals come from the SAME command, so an operator needs
+ * the same next step from either, and forcing the remedy text apart would make one
+ * of the two messages actively worse advice. **The two refusals are discriminated
+ * by their CODE (`SEAT_HOLDER_OPEN` vs `SEAT_HOLDER_CHANGED`), never by prose.**
+ * What is NOT shared, and what any prose assertion must use if it asserts on text
+ * at all: `SEAT_HOLDER_OPEN` alone names the HOLDER ID and directs at `sessions
+ * close`; this message alone says "was not closed" / "changed while this close was
+ * evaluating it". 🛑 NEVER assert on `/seats close/` or `/active holder/` —
+ * measured shared, so a row using either is green whichever refusal fired (B2's
+ * AP13 defect, one field over).
  */
 function seatHolderChangedMessage(seatId: string): string {
   return (
