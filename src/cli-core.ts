@@ -83,6 +83,12 @@ export const TOP_LEVEL_VERBS = new Set([
   // Registered by `registerProvidersCommand`; this entry is the second half of
   // the two registrations that verb needs.
   "providers",
+  // `seats` — the seat-store MUTATION surface (`set-brick`, `rename`, `delete`),
+  // registered by `registerSeatsCommand`. acpx is the seat store's only writer, so
+  // these verbs are what acpx-ui-side callers invoke by path; without this entry the
+  // token falls through to the AGENT registry and `acpx seats delete <id>` becomes a
+  // prompt delivery in any session-bearing cwd (OS brick 2e3f50b5).
+  "seats",
   "status",
   // `output-styles` is registered top-level by `registerSharedAgentSubcommands`
   // (command-registration.ts, called with `program` from `registerDefaultCommands`)

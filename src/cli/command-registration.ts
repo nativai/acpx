@@ -71,6 +71,7 @@ import {
 import { registerModelsCommand } from "./models-command.js";
 import { registerProfilesCommand } from "./profiles-command.js";
 import { registerProvidersCommand } from "./providers-command.js";
+import { registerSeatsCommand } from "./seats-command.js";
 import { DEFAULT_CLOSE_DRAIN_TIMEOUT_MS } from "./session/contracts.js";
 import { registerStatusCommand } from "./status-command.js";
 import { registerSubscriptionsCommand } from "./subscriptions-command.js";
@@ -1064,6 +1065,10 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
   registerAgentsCommand(program, config);
   registerModelsCommand(program, config);
   registerProvidersCommand(program, config);
+  // ⚠️ SECOND HALF IN `src/cli-core.ts`'s `TOP_LEVEL_VERBS`. Registered top-level
+  // only — the seat store is one agent-agnostic file, so `acpx claude seats …`
+  // would be meaningless.
+  registerSeatsCommand(program, config);
   registerConfigCommand(program, config);
   registerFlowCommand(program, config);
 }
