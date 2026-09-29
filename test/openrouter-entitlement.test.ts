@@ -693,3 +693,48 @@ test("`acpx models list --agent` DROPS a non-entitled row, and `--all` keeps it 
     assert.ok(listed(false).some((model) => model.key === entitledRow.key));
   }
 });
+
+test("Tier 1 REFUSES on entitlement too — the read path is not declaration-only", async () => {
+  // 🛑 THE TEST BEHIND A COMMENT THAT ASSERTS A GUARANTEE (`catalogue.ts`, the
+  // entitlement branch). The Claude-family Tier 3 branch IS declaration-only; this one
+  // is not, and the difference is easy to state wrongly and impossible to notice:
+  // `availability` is also read by `assertModelAvailable` inside
+  // `validateModelSelection`, which THROWS. So a row this branch marks unavailable is
+  // refused by the `--model` gate, one tier ABOVE `assertModelPolicy`.
+  const { ModelSlugError, validateModelSelection } =
+    await import("../src/models/model-slug-validation.js");
+  const entitled = OPENROUTER_ENTITLEMENT[0];
+  assert.ok(entitled);
+  const rows = [
+    { id: entitled.slug, name: "entitled", supported_parameters: ["tools"] },
+    { id: "zzz-vendor/not-entitled-1", name: "outsider", supported_parameters: ["tools"] },
+  ];
+  const catalogue = buildCatalogue(rows, META, { entitlement: OPENROUTER_ENTITLEMENT });
+
+  // THE NEGATIVE: the non-entitled row is refused at Tier 1, by the catalogue's reason.
+  let thrown: unknown;
+  try {
+    validateModelSelection(catalogue, {
+      model: "zzz-vendor/not-entitled-1",
+      agentName: "claude",
+    });
+  } catch (error) {
+    thrown = error;
+  }
+  assert.ok(thrown instanceof ModelSlugError, "Tier 1 must refuse a non-entitled row");
+  assert.equal(thrown.detailCode, "MODEL_NOT_AVAILABLE_FOR_AGENT");
+  // The wording must still name the set, or the refusal relocates the puzzle.
+  assert.match(thrown.message, /entitlement set/);
+  for (const row of OPENROUTER_ENTITLEMENT) {
+    assert.ok(thrown.message.includes(row.slug), `Tier 1's refusal must name ${row.slug}`);
+  }
+
+  // POSITIVE CONTROL on the same call shape: the ENTITLED row resolves. Without it
+  // this row would pass on a Tier 1 that refuses every OpenRouter id.
+  const resolved = validateModelSelection(catalogue, {
+    model: entitled.slug,
+    agentName: "claude",
+  });
+  assert.equal(resolved?.id, entitled.slug);
+  assert.equal(resolved?.source, "openrouter");
+});

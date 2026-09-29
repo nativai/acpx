@@ -323,14 +323,31 @@ function availabilityFor(
   // interprets NOWHERE. Same module, same invariant, one consumer further out. No
   // network, no credential: the module is compiled in.
   //
-  // 🛑 DECLARATION ONLY, like the Claude branch above. It changes no spawn's
-  // outcome — `assertModelPolicy` is what refuses. What it DOES change is the
-  // default listing: a not-available row is bucketed `unavailable` by
-  // `partitionModels` and `acpx models list` drops that band unless `--all`, so the
-  // row is ABSENT by default and LISTED WITH THIS REASON under `--all` and on
-  // `acpx models show`. That split is deliberate — availability annotates and never
-  // filters, so an agent asking "why can I not use this?" always gets an answer,
-  // which is the exact opposite of the uninterpretable 403 above.
+  // 🛑 **NOT DECLARATION-ONLY — AND UNLIKE THE CLAUDE BRANCH ABOVE, THIS ONE DOES
+  // CHANGE OUTCOMES.** Saying otherwise would be the "comment a future reader trusts
+  // INSTEAD of reading the code" failure, so: `availability` is also consumed by
+  // `assertModelAvailable` (`model-slug-validation.ts`), which THROWS
+  // `ModelSlugError` / `MODEL_NOT_AVAILABLE_FOR_AGENT`. So a row marked unavailable
+  // here is REFUSED by the Tier 1 `--model` gate, which runs BEFORE
+  // `assertModelPolicy`. Two consequences worth knowing:
+  //
+  //   · for a catalogued id passed as `--model`, the message an agent sees is
+  //     {@link OPENROUTER_NOT_ENTITLED_ANNOTATION} — which names the entitled set and
+  //     the escape hatch — not `assertModelPolicy`'s longer one. That one still fires
+  //     on the legs Tier 1 cannot reach (inherited / fork / template / resume) and
+  //     whenever the catalogue is cold;
+  //   · the two tiers therefore use DIFFERENT detailCodes for one policy. A caller
+  //     discriminating on `detailCode` must expect either.
+  //
+  // This is the intended direction — the tiers agreeing is the whole point — but it
+  // is a wider change than "annotation", which is why it is written down here.
+  //
+  // What it also changes is the default LISTING: a not-available row is bucketed
+  // `unavailable` by `partitionModels` and `acpx models list` drops that band unless
+  // `--all`, so the row is ABSENT by default and LISTED WITH THIS REASON under
+  // `--all` and on `acpx models show`. That split is deliberate — availability
+  // annotates and never filters — so an agent asking "why can I not use this?" always
+  // gets an answer, which is the exact opposite of the uninterpretable 403 above.
   if (!isEntitledOpenRouterModelId(model.id, entitled)) {
     return {
       ok: false,
