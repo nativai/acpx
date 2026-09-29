@@ -58,6 +58,24 @@ export type BoxProviderEntry = {
   /** Native provider-side `expires_at` — the real deadline. Drives the expiry warning. */
   expiresAt?: string;
   mintedAt?: string;
+  /**
+   * The sha of the entitlement list this key's `allowed_models` guardrail was
+   * generated from (brick daed4261 §9). **NOT a secret** — it is a digest of a list
+   * of public model ids, and it exists so the two enforcement layers can be proven
+   * in step *from a box*, with no network and no management key (guardrail state is
+   * structurally unreadable from a box: 401 on every guardrail endpoint).
+   *
+   * Compared at spawn against `OPENROUTER_ENTITLEMENT_SHA`
+   * (`models/openrouter-entitlement.ts`). Equal ⇒ both layers provably came from
+   * one list. Different ⇒ skew, and acpx narrows to the green list. **ABSENT ⇒ no
+   * key-side claim was ever recorded — the pre-cutover state — and acpx does NOT
+   * narrow;** see `resolveOpenRouterEntitlement` for why that is the safe direction
+   * there and not an omission.
+   *
+   * ⚠️ Written by the MINT, beside `grantId` / `keyHash` / `mintedAt`. A restricted
+   * key whose sha was never recorded is the one residual this tie does not cover.
+   */
+  entitlementSha?: string;
 };
 
 export type BoxProviders = {
@@ -109,8 +127,15 @@ function finiteNumber(value: unknown): number | undefined {
 
 /**
  * The optional string fields, as a table rather than a chain of conditional
- * spreads — one place to add a field, and the same list drives both parsing and
- * the status projection below.
+ * spreads — one place to add a field for PARSING.
+ *
+ * 🛑 **THIS IS NOT THE ONLY LIST. `STATUS_FIELDS` BELOW DRIVES THE PROJECTION, AND
+ * A FIELD MISSING FROM EITHER IS DROPPED SILENTLY** — absent from a parsed entry, or
+ * present on the entry and invisible to `acpx providers`, with nothing failing in
+ * either direction. `apiKey` / `apiKeyEnv` are in this list and deliberately NOT in
+ * that one (they are secret). Every other field belongs in both:
+ * `test/box-providers.test.ts` round-trips `entitlementSha` through parsing AND the
+ * projection for exactly this reason.
  */
 const OPTIONAL_STRING_FIELDS = [
   "apiKey",
@@ -121,6 +146,7 @@ const OPTIONAL_STRING_FIELDS = [
   "limitReset",
   "expiresAt",
   "mintedAt",
+  "entitlementSha",
 ] as const;
 
 function parseEntry(name: string, raw: unknown): BoxProviderEntry | undefined {
@@ -445,6 +471,12 @@ export type BoxProviderStatus = {
   limitReset?: string;
   expiresAt?: string;
   mintedAt?: string;
+  /**
+   * The entitlement-list sha the key was minted from — safe to render (a digest of
+   * public model ids), and the only way an operator can see from a box whether the
+   * two enforcement layers are in step. See `BoxProviderEntry.entitlementSha`.
+   */
+  entitlementSha?: string;
   /** Whether a credential actually resolves — the boolean, never the value. */
   hasCredential: boolean;
   /** Whole days until `expiresAt`; negative once past. Undefined when unstamped. */
@@ -499,6 +531,7 @@ const STATUS_FIELDS = [
   "limitReset",
   "expiresAt",
   "mintedAt",
+  "entitlementSha",
 ] as const;
 
 /**

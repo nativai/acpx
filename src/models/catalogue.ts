@@ -13,6 +13,8 @@ import type { AvailabilityCapability } from "./capability-source.js";
 import {
   CLAUDE_FAMILY_OPENROUTER_ANNOTATION,
   CLAUDE_FAMILY_OPENROUTER_REASON,
+  OPENROUTER_NOT_ENTITLED_ANNOTATION,
+  OPENROUTER_NOT_ENTITLED_REASON,
   refusesClaudeFamilyOnOpenRouter,
 } from "./claude-family.js";
 import { deriveDepthDescriptor } from "./depth.js";
@@ -20,6 +22,11 @@ import { harnessNativeModels } from "./harness-models.js";
 import type { NativeModel } from "./harness-models.js";
 import { loadOpenRouterCatalogue } from "./openrouter-catalogue.js";
 import type { LoadOptions, OpenRouterRawModel } from "./openrouter-catalogue.js";
+import {
+  isEntitledOpenRouterModelId,
+  resolveOpenRouterEntitlement,
+  type OpenRouterEntitlementEntry,
+} from "./openrouter-entitlement.js";
 import type {
   AgentAvailability,
   CatalogueCounts,
@@ -237,18 +244,26 @@ function computeAvailability(
   model: CatalogueModel,
   nativeAgentTypes: string[] | undefined,
   capabilities: AvailabilityCapability[],
+  entitled: readonly OpenRouterEntitlementEntry[],
 ): Record<string, AgentAvailability> {
   const availability: Record<string, AgentAvailability> = {};
   for (const capability of capabilities) {
-    availability[capability.id] = availabilityFor(model, nativeAgentTypes, capability);
+    availability[capability.id] = availabilityFor(model, nativeAgentTypes, capability, entitled);
   }
   return availability;
 }
 
+/**
+ * ⚠️ `entitled` IS PASSED IN, NOT RESOLVED HERE. `resolveOpenRouterEntitlement`
+ * reads `providers.json`, and this function runs once per (row × capability) — ~458
+ * rows × 3 capabilities on a live catalogue, so resolving inside would be ~1,400
+ * file reads per `acpx models` call. `buildCatalogue` resolves it once.
+ */
 function availabilityFor(
   model: CatalogueModel,
   nativeAgentTypes: string[] | undefined,
   capability: AvailabilityCapability,
+  entitled: readonly OpenRouterEntitlementEntry[],
 ): AgentAvailability {
   const blocking = model.unavailableReasons[0];
   if (blocking) {
@@ -290,6 +305,38 @@ function availabilityFor(
 
   if (!capability.acceptsArbitraryModelIds) {
     return arbitraryModelDenial(capability);
+  }
+
+  // ── The ENTITLEMENT declaration (brick daed4261 §9, the READ path) ──────────
+  //
+  // ⚠️ IT SITS AFTER THE `acceptsArbitraryModelIds` ARM ON PURPOSE. For codex —
+  // which cannot reach OpenRouter at all — "this harness does not take arbitrary
+  // model ids" is the more informative answer, and the committed assertion that
+  // codex's reason is NOT a policy reason stays green. Reaching here means the
+  // harness genuinely could run this row and only the entitlement set stops it.
+  //
+  // ⚠️ WHY THE READ PATH NEEDS THIS AT ALL: a guardrail-restricted key's
+  // `GET /api/v1/models` returns the FULL catalogue, un-narrowed (measured
+  // 2026-09-29, 464 rows). So the provider will not narrow the advertisement for
+  // us — acpx would keep offering models the key refuses, an agent would pick one,
+  // and the failure would arrive as a provider 403 that `probeOpenRouterRefusal`
+  // interprets NOWHERE. Same module, same invariant, one consumer further out. No
+  // network, no credential: the module is compiled in.
+  //
+  // 🛑 DECLARATION ONLY, like the Claude branch above. It changes no spawn's
+  // outcome — `assertModelPolicy` is what refuses. What it DOES change is the
+  // default listing: a not-available row is bucketed `unavailable` by
+  // `partitionModels` and `acpx models list` drops that band unless `--all`, so the
+  // row is ABSENT by default and LISTED WITH THIS REASON under `--all` and on
+  // `acpx models show`. That split is deliberate — availability annotates and never
+  // filters, so an agent asking "why can I not use this?" always gets an answer,
+  // which is the exact opposite of the uninterpretable 403 above.
+  if (!isEntitledOpenRouterModelId(model.id, entitled)) {
+    return {
+      ok: false,
+      reason: OPENROUTER_NOT_ENTITLED_REASON,
+      message: OPENROUTER_NOT_ENTITLED_ANNOTATION,
+    };
   }
 
   return available(model, capability);
@@ -414,6 +461,13 @@ export type BuildCatalogueOptions = {
   now?: number;
   capabilities?: AvailabilityCapability[];
   nativeModels?: NativeModel[];
+  /**
+   * Inject the entitlement set (brick daed4261 §9) instead of resolving it from
+   * this box's `providers.json`. Tests use it so the annotation does not depend on
+   * whether this box's key records an `entitlementSha` — a box-dependent test here
+   * would read as a catalogue bug.
+   */
+  entitlement?: readonly OpenRouterEntitlementEntry[];
 };
 
 /** Merge the raw OpenRouter rows with the harness-native rows into ONE ordered list. */
@@ -426,15 +480,23 @@ export function buildCatalogue(
   const capabilities = options.capabilities ?? readHarnessCapabilities();
   const natives = options.nativeModels ?? harnessNativeModels();
   const equivalence = buildEquivalenceIndex(openRouterModels);
+  // Resolved ONCE — see `availabilityFor`'s note on why this is not per row.
+  const entitled = options.entitlement ?? resolveOpenRouterEntitlement().entries;
 
   const models: CatalogueModel[] = [];
   for (const native of natives) {
     const { agentTypes, ...row } = native;
-    models.push({ ...row, availability: computeAvailability(row, agentTypes, capabilities) });
+    models.push({
+      ...row,
+      availability: computeAvailability(row, agentTypes, capabilities, entitled),
+    });
   }
   for (const raw of openRouterModels) {
     const model = toCatalogueModel(raw, equivalence, now);
-    models.push({ ...model, availability: computeAvailability(model, undefined, capabilities) });
+    models.push({
+      ...model,
+      availability: computeAvailability(model, undefined, capabilities, entitled),
+    });
   }
 
   return {
