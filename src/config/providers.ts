@@ -115,10 +115,9 @@ function finiteNumber(value: unknown): number | undefined {
  * A FIELD MISSING FROM EITHER IS DROPPED SILENTLY** — absent from a parsed entry, or
  * present on the entry and invisible to `acpx providers`, with nothing failing in
  * either direction. `apiKey` / `apiKeyEnv` are in this list and deliberately NOT in
- * that one (they are secret). Every other field belongs in both:
- * Any new field belongs in both lists,
- * and `test/box-providers.test.ts` round-trips one through parsing AND the
- * projection for exactly this reason.
+ * that one (they are secret); **every other field belongs in both**, and
+ * `test/box-providers.test.ts` round-trips one through parsing AND the projection for
+ * exactly this reason.
  */
 const OPTIONAL_STRING_FIELDS = [
   "apiKey",
