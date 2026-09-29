@@ -23,9 +23,11 @@ import type { NativeModel } from "./harness-models.js";
 import { loadOpenRouterCatalogue } from "./openrouter-catalogue.js";
 import type { LoadOptions, OpenRouterRawModel } from "./openrouter-catalogue.js";
 import {
+  ENTITLEMENT_UNKNOWN,
   isEntitledOpenRouterModelId,
-  resolveOpenRouterEntitlement,
-  type OpenRouterEntitlementResolution,
+  loadOpenRouterEntitlement,
+  type EntitlementLoadOptions,
+  type OpenRouterEntitlement,
 } from "./openrouter-entitlement.js";
 import type {
   AgentAvailability,
@@ -244,7 +246,7 @@ function computeAvailability(
   model: CatalogueModel,
   nativeAgentTypes: string[] | undefined,
   capabilities: AvailabilityCapability[],
-  entitlement: OpenRouterEntitlementResolution,
+  entitlement: OpenRouterEntitlement,
 ): Record<string, AgentAvailability> {
   const availability: Record<string, AgentAvailability> = {};
   for (const capability of capabilities) {
@@ -254,16 +256,18 @@ function computeAvailability(
 }
 
 /**
- * ⚠️ `entitlement` IS PASSED IN, NOT RESOLVED HERE. `resolveOpenRouterEntitlement`
- * reads `providers.json`, and this function runs once per (row × capability) — ~458
- * rows × 3 capabilities on a live catalogue, so resolving inside would be ~1,400
- * file reads per `acpx models` call. `buildCatalogue` resolves it once.
+ * ⚠️ `entitlement` IS PASSED IN, NOT READ HERE. Establishing it touches
+ * `providers.json` and the entitlement cache, and this function runs once per
+ * (row × capability) — ~464 rows × 3 capabilities on a live catalogue, so reading
+ * inside would be ~1,400 file reads per `acpx models` call. `buildCatalogue`
+ * resolves it once, and `loadCatalogue` is the one place a network refresh can
+ * happen at all.
  */
 function availabilityFor(
   model: CatalogueModel,
   nativeAgentTypes: string[] | undefined,
   capability: AvailabilityCapability,
-  entitlement: OpenRouterEntitlementResolution,
+  entitlement: OpenRouterEntitlement,
 ): AgentAvailability {
   const blocking = model.unavailableReasons[0];
   if (blocking) {
@@ -307,21 +311,26 @@ function availabilityFor(
     return arbitraryModelDenial(capability);
   }
 
-  // ── The ENTITLEMENT declaration (brick daed4261 §9, the READ path) ──────────
+  // ── What the box KEY allows (brick ecfb0461, the READ path) ────────────────
   //
   // ⚠️ IT SITS AFTER THE `acceptsArbitraryModelIds` ARM ON PURPOSE. For codex —
   // which cannot reach OpenRouter at all — "this harness does not take arbitrary
   // model ids" is the more informative answer, and the committed assertion that
   // codex's reason is NOT a policy reason stays green. Reaching here means the
-  // harness genuinely could run this row and only the entitlement set stops it.
+  // harness genuinely could run this row and only the key stops it.
   //
-  // ⚠️ WHY THE READ PATH NEEDS THIS AT ALL: a guardrail-restricted key's
-  // `GET /api/v1/models` returns the FULL catalogue, un-narrowed (measured
-  // 2026-09-29, 464 rows). So the provider will not narrow the advertisement for
-  // us — acpx would keep offering models the key refuses, an agent would pick one,
-  // and the failure would arrive as a provider 403 that `probeOpenRouterRefusal`
-  // interprets NOWHERE. Same module, same invariant, one consumer further out. No
-  // network, no credential: the module is compiled in.
+  // ⚠️ WHY THE READ PATH NEEDS THIS AT ALL: the PUBLIC catalogue does not narrow
+  // for a scoped key. Measured 2026-09-29 on this box — `models/user` answered
+  // **2 rows** while `GET /api/v1/models` answered the full **464**. So the
+  // provider will not narrow the advertisement for us: acpx would keep offering
+  // models the key refuses, an agent would pick one, and the failure would arrive
+  // as a provider 403 that `probeOpenRouterRefusal` interprets NOWHERE.
+  //
+  // 🛑 **AN UNKNOWN SET PERMITS.** `isEntitledOpenRouterModelId` returns `true`
+  // when `allowed === null`, so a cold cache or a failed read leaves the catalogue
+  // exactly as it is today rather than emptying it. That single decision lives in
+  // the entitlement module so no consumer can implement it differently — and it is
+  // why this branch can be as strong as it is elsewhere.
   //
   // 🛑 **NOT DECLARATION-ONLY — AND UNLIKE THE CLAUDE BRANCH ABOVE, THIS ONE DOES
   // CHANGE OUTCOMES.** Saying otherwise would be the "comment a future reader trusts
@@ -332,23 +341,21 @@ function availabilityFor(
   // `assertModelPolicy`. Two consequences worth knowing:
   //
   //   · for a catalogued id passed as `--model`, the message an agent sees is
-  //     {@link openRouterNotEntitledAnnotation} — which names the entitled set and
-  //     the escape hatch — not `assertModelPolicy`'s longer one. That one still fires
-  //     on the legs Tier 1 cannot reach (inherited / fork / template / resume) and
-  //     whenever the catalogue is cold;
+  //     {@link openRouterNotEntitledAnnotation} — which names the allowed set — not
+  //     `assertModelPolicy`'s longer one. That one still fires on the legs Tier 1
+  //     cannot reach (inherited / fork / template / resume) and whenever the
+  //     catalogue is cold;
   //   · the two tiers therefore use DIFFERENT detailCodes for one policy. A caller
-  //     discriminating on `detailCode` must expect either.
+  //     discriminating on `detailCode` must expect either — which is exactly what
+  //     `policyReason` exists to make unnecessary.
   //
-  // This is the intended direction — the tiers agreeing is the whole point — but it
-  // is a wider change than "annotation", which is why it is written down here.
-  //
-  // What it also changes is the default LISTING: a not-available row is bucketed
-  // `unavailable` by `partitionModels` and `acpx models list` drops that band unless
-  // `--all`, so the row is ABSENT by default and LISTED WITH THIS REASON under
-  // `--all` and on `acpx models show`. That split is deliberate — availability
-  // annotates and never filters — so an agent asking "why can I not use this?" always
-  // gets an answer, which is the exact opposite of the uninterpretable 403 above.
-  if (!isEntitledOpenRouterModelId(model.id, entitlement.entries)) {
+  // What it also changes is the default LISTING, and that is the acceptance
+  // criterion of this brick: a not-available row is bucketed `unavailable` by
+  // `partitionModels` and `acpx models list` drops that band unless `--all`, so the
+  // row is ABSENT by default and LISTED WITH THIS REASON under `--all` and on
+  // `acpx models show`. An agent asking "why can I not use this?" always gets an
+  // answer — the exact opposite of the uninterpretable 403 above.
+  if (!isEntitledOpenRouterModelId(model.id, entitlement)) {
     return {
       ok: false,
       reason: OPENROUTER_NOT_ENTITLED_REASON,
@@ -479,12 +486,18 @@ export type BuildCatalogueOptions = {
   capabilities?: AvailabilityCapability[];
   nativeModels?: NativeModel[];
   /**
-   * Inject the entitlement set (brick daed4261 §9) instead of resolving it from
-   * this box's `providers.json`. Tests use it so the annotation does not depend on
-   * whether this box's key records an `entitlementSha` — a box-dependent test here
-   * would read as a catalogue bug.
+   * Inject what the key allows (brick ecfb0461) instead of reading this box's
+   * entitlement cache. Tests use it so the annotation does not depend on whether
+   * this box happens to have a warm cache — a box-dependent test here would read as
+   * a catalogue bug, and would flip between machines.
+   *
+   * 🛑 **`buildCatalogue` DEFAULTS TO `ENTITLEMENT_UNKNOWN`, i.e. FAIL OPEN, AND
+   * DOES NOT READ THE CACHE ITSELF.** It is synchronous and is called directly by
+   * tests and by `loadCatalogue`; giving it a disk read would put one on every
+   * caller that only wanted to assemble rows it already has. `loadCatalogue` is the
+   * one place the set is established.
    */
-  entitlement?: OpenRouterEntitlementResolution;
+  entitlement?: OpenRouterEntitlement;
 };
 
 /** Merge the raw OpenRouter rows with the harness-native rows into ONE ordered list. */
@@ -498,7 +511,7 @@ export function buildCatalogue(
   const natives = options.nativeModels ?? harnessNativeModels();
   const equivalence = buildEquivalenceIndex(openRouterModels);
   // Resolved ONCE — see `availabilityFor`'s note on why this is not per row.
-  const entitlement = options.entitlement ?? resolveOpenRouterEntitlement();
+  const entitlement = options.entitlement ?? ENTITLEMENT_UNKNOWN;
 
   const models: CatalogueModel[] = [];
   for (const native of natives) {
@@ -525,12 +538,33 @@ export function buildCatalogue(
   };
 }
 
-/** Load (cache-first) and assemble. The one entry point every caller uses. */
+/**
+ * Load (cache-first) and assemble. The one entry point every caller uses — and the
+ * ONE place the key's allowed set is established, refreshed and put on the network.
+ *
+ * ⚠️ **THE TWO LOADS SHARE THEIR OPTIONS DELIBERATELY.** `offline`, `refresh`,
+ * `ttlMs` and `now` mean the same thing to both, so `acpx models --refresh` refreshes
+ * the catalogue AND the allowed set in one command, and the session-create path's
+ * `offline: true` keeps both off the network. Two separate freshness policies over
+ * one user-visible list is the kind of second authority this brick exists to delete.
+ *
+ * 🛑 **`entitlement` WAS ACCEPTED HERE AND SILENTLY DISCARDED.** The old destructure
+ * pulled out `now`/`capabilities`/`nativeModels` and swept `entitlement` into
+ * `loadOptions`, which `buildCatalogue` never sees — so the documented injection
+ * seam was DEAD and every test using it was quietly measuring whatever this box's
+ * own state happened to be. It is forwarded explicitly below; `test/models-catalogue.test.ts`
+ * pins it with a set no box could produce by accident.
+ */
 export async function loadCatalogue(
-  options: LoadOptions & BuildCatalogueOptions = {},
+  options: LoadOptions & EntitlementLoadOptions & BuildCatalogueOptions = {},
 ): Promise<ModelCatalogue> {
-  const { now, capabilities, nativeModels, ...loadOptions } = options;
-  const result = await loadOpenRouterCatalogue(loadOptions);
+  const { now, capabilities, nativeModels, entitlement, ...loadOptions } = options;
+  const [result, allowed] = await Promise.all([
+    loadOpenRouterCatalogue(loadOptions),
+    entitlement !== undefined
+      ? Promise.resolve(entitlement)
+      : loadOpenRouterEntitlement(loadOptions),
+  ]);
   return buildCatalogue(
     result.snapshot?.models ?? [],
     {
@@ -541,7 +575,7 @@ export async function loadCatalogue(
       stale: result.stale,
       error: result.error,
     },
-    { now, capabilities, nativeModels },
+    { now, capabilities, nativeModels, entitlement: allowed },
   );
 }
 

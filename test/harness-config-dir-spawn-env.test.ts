@@ -9,8 +9,6 @@ import { AcpClient } from "../src/acp/client.js";
 import { ARBITRARY_MODEL_PROVISIONING_ROUTED_FOR } from "../src/acp/harness-capabilities.js";
 import type { HarnessId } from "../src/acp/harness-capabilities.js";
 import { resetSessionPrimerMemoForTests } from "../src/acp/session-primer.js";
-import { OPENROUTER_ENTITLEMENT } from "../src/models/openrouter-entitlement.js";
-import type { OpenRouterEntitlementEntry } from "../src/models/openrouter-entitlement.js";
 import type { AcpClientOptions } from "../src/types.js";
 
 // B3 deliverable 5 — RS-13's in-repo half: THE ADAPTER-BOUNDARY DIFFERENTIAL.
@@ -375,44 +373,6 @@ const PROVISIONED_SLUG = "openrouter/zzz-acpx-cba6fa92/routing-probe";
 const PROVISIONED_SLUG_STRIPPED = "zzz-acpx-cba6fa92/routing-probe";
 
 /**
- * Entitle `PROVISIONED_SLUG` for the duration of one probe (brick daed4261).
- *
- * ⚠️ WHY THIS EXISTS AT ALL, AND WHY THE NONSENSE SLUG IS KEPT. `assertModelPolicy`
- * became an entitlement ALLOWLIST, so a deliberately-unknown slug is now refused at
- * spawn — correctly: refusing what it does not know is the whole point of an
- * allowlist. But the nonsense slug is load-bearing for THIS row (see
- * `PROVISIONED_SLUG`): a real id might already sit in pi's box-overlaid store, and
- * then "the slug is in the written fragment" would no longer prove acpx put it
- * there. So the slug stays and the entitlement set is widened around it.
- *
- * ⚠️ IT MUTATES THE SHIPPED ARRAY IN PLACE, for the same reason
- * {@link withProvisioningList} does — this row's subject is a REAL spawn through
- * `client.ts`, which resolves the entitlement itself and takes no injection point.
- * `assertModelPolicy` does accept an injected resolution, but only a direct caller
- * can use it, and a direct call is not a spawn.
- *
- * Bounded deliberately: it does NOT touch `OPENROUTER_ENTITLEMENT_SHA` or
- * `OPENROUTER_GREEN_LIST` (both computed once at module load), and it does not need
- * to — with no `entitlementSha` recorded, `resolveOpenRouterEntitlement` returns the
- * full set, which is the array spliced here. Top-level rows in a node:test FILE run
- * SEQUENTIALLY and the restore is in a `finally`, so no other row sees the widening.
- */
-async function withProbeSlugEntitled<T>(run: () => Promise<T>): Promise<T> {
-  const shipped = OPENROUTER_ENTITLEMENT as OpenRouterEntitlementEntry[];
-  const original = [...shipped];
-  shipped.push({
-    slug: PROVISIONED_SLUG_STRIPPED,
-    canonicalSlug: `${PROVISIONED_SLUG_STRIPPED}-20260929`,
-    why: "test fixture — brick cba6fa92's routing probe, entitled only inside this row",
-  });
-  try {
-    return await run();
-  } finally {
-    shipped.splice(0, shipped.length, ...original);
-  }
-}
-
-/**
  * Swap the SHIPPED provisioning list, in place, for the duration of one probe.
  *
  * ⚠️ THE SHIPPED ARRAY IS THE SUBJECT, WHICH IS WHY THIS MUTATES IT RATHER THAN
@@ -451,11 +411,20 @@ async function withProvisioningList<T>(
  * and be non-empty. So a `false` here means acpx DECIDED not to provision, never
  * that nothing ran.
  */
+/**
+ * ⚠️ **THIS USED TO NEED THE PROBE SLUG ENTITLED, AND UNDER brick ecfb0461 IT NO
+ * LONGER DOES — WHICH IS WORTH STATING RATHER THAN SILENTLY DROPPING.** The old
+ * design carried a hardcoded allowlist in acpx, so `assertModelPolicy` refused this
+ * deliberately-unknown slug at spawn and the row had to splice it into the shipped
+ * array for the duration of the probe. There is no such array now: the set comes
+ * from the box key, this row spawns under an isolated `ACPX_STATE_HOME` with no
+ * `providers.json`, so the set reads UNKNOWN and the spawn guard fails open.
+ *
+ * The nonsense slug stays, and it is still load-bearing (see `PROVISIONED_SLUG`): a
+ * real id might already sit in pi's box-overlaid store, and then "the slug is in the
+ * written fragment" would no longer prove acpx put it there.
+ */
 async function observeProvisioning(harness: "pi"): Promise<boolean> {
-  return withProbeSlugEntitled(async () => observeProvisioningEntitled(harness));
-}
-
-async function observeProvisioningEntitled(harness: "pi"): Promise<boolean> {
   let observed: boolean | undefined;
   await spawnAndDumpEnv(
     harness,

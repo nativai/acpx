@@ -47,13 +47,38 @@ export const BOX_PI_ENV_PREFIX = "ACPX_PI_";
 export const SESSION_IDENTITY_ENV = ["ACPX_SESSION_RECORD_ID"] as const;
 
 /**
+ * brick ecfb0461 — THE SUITE MUST NEVER SEND THE BOX'S OpenRouter KEY OVER THE WIRE.
+ *
+ * Same family as the two scrubs above (make the starting environment a property of
+ * the repo, not of the box) but it SETS rather than deletes, because the hazard runs
+ * the other way. `loadOpenRouterEntitlement` asks the key what it allows
+ * (`GET /api/v1/models/user`), and any row reaching `loadCatalogue` **without** an
+ * isolated `ACPX_STATE_HOME` would resolve devbox's real `providers.json`, find a
+ * real credential and make a real authenticated call — slow, flaky, and a credential
+ * leaving the box on every gate run.
+ *
+ * ⚠️ **THE PUBLIC CATALOGUE LOADER IS NOT THE PRECEDENT TO COPY HERE.** It has the
+ * same cold-cache-fetches shape and the repo tolerates it — but it is *keyless*, so
+ * the worst case is a wasted request. Adding a credential to that shape is a new
+ * class of exposure, and it is not one to leave to "tests happen to isolate HOME":
+ * the store guard in `runtime-test-helpers.ts` is opt-in per test, not global.
+ *
+ * With this set, a cold cache simply reads as UNKNOWN and the product fails open —
+ * which is the production behaviour a test should be measuring anyway. A row that
+ * genuinely wants a populated set injects one (`buildCatalogue`'s `entitlement`
+ * option, or `entitlementCachePath` at a fixture).
+ */
+export const NO_ENTITLEMENT_FETCH_ENV = "ACPX_NO_OPENROUTER_ENTITLEMENT_FETCH";
+
+/**
  * Delete every box-level `ACPX_PI_*` override and every session-identity variable
- * from `env`, returning the names removed (sorted) so a caller can assert on what
- * actually happened rather than on the absence of a complaint.
+ * from `env`, and set the no-network guard above. Returns the names removed (sorted)
+ * so a caller can assert on what actually happened rather than on the absence of a
+ * complaint.
  *
  * Called once from the `--import` bootstrap (`install-owner-reaper.ts`), before any
  * test module body runs and therefore before any row spawns a CLI child — the children
- * are spawned from `process.env`, so removing it here removes it from them too.
+ * are spawned from `process.env`, so a change here reaches them too.
  */
 export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env): string[] {
   const removed: string[] = [];
@@ -66,5 +91,6 @@ export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env
       removed.push(name);
     }
   }
+  env[NO_ENTITLEMENT_FETCH_ENV] = "1";
   return removed.toSorted();
 }

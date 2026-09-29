@@ -61,7 +61,6 @@
     "lint:flow-schema-terms": "tsx scripts/lint-flow-schema-terms.ts",
     "lint:persisted-key-casing": "tsx scripts/lint-persisted-key-casing.ts",
     "mutate": "stryker run",
-    "openrouter:entitlement": "tsx scripts/print-openrouter-entitlement.ts",
     "perf:report": "tsx scripts/perf-report.ts",
     "precommit": "pnpm exec lint-staged && pnpm run -s build",
     "prepack": "tsdown --logLevel silent src/cli.ts src/flows.ts src/runtime.ts src/brick-outbox.ts --format esm --dts --clean --platform node --target node22 --no-fixedExtension",

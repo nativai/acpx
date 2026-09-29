@@ -38,29 +38,32 @@
  * DO NOT add an import from `models/` here — that is what would close the cycle.
  *
  * ⚠️ **`openrouter-entitlement.ts` IS THE ONE `models/` IMPORT, AND IT IS SAFE FOR
- * A CHECKABLE REASON RATHER THAN A HOPEFUL ONE:** it imports `node:crypto` and
+ * A CHECKABLE REASON RATHER THAN A HOPEFUL ONE:** it imports node builtins and
  * `config/providers.js`, and `config/providers.ts` imports only node builtins. So
  * the chain terminates and cannot reach back here. **Verify that before adding
  * anything to that module's imports** — a `models/` import over there closes the
  * cycle from a file whose name does not suggest it.
  *
- * ## Brick daed4261 — this tier is now an ALLOWLIST, not only a Claude denylist
+ * ## Brick ecfb0461 — this tier is an ALLOWLIST, and THE KEY IS THE LIST
  *
- * `assertModelPolicy` refuses any non-entitled id on the OpenRouter route, against the
- * entitlement module (`openrouter-entitlement.ts`). The Claude-family refusal below is
- * kept **verbatim and list-independent** as its specialised case — see `assertModelPolicy`'s own
- * ordering note for why that is stronger than folding Claude into the list.
+ * `assertModelPolicy` refuses any OpenRouter id the box's key does not allow,
+ * against the set the key itself reports (`openrouter-entitlement.ts`). There is no
+ * second list in acpx to keep in step, so there is no skew to detect and **an
+ * unknown set fails OPEN** — the key still refuses, so the only thing lost is a
+ * clean local message. The Claude-family refusal below is kept **verbatim and
+ * list-independent** as its specialised case; see `assertModelPolicy`'s own ordering
+ * note for why that is stronger than leaving it to the key.
  */
 
 import { harnessIdForAgentCommand } from "../acp/harness-capabilities.js";
 import { AcpxOperationalError } from "../errors.js";
 import {
+  entitlementModelSlugs,
   isEntitledOpenRouterModelId,
   isFloatingAliasModelId,
   isOpenRouterRouteShapedModelId,
-  resolveOpenRouterEntitlement,
-  type OpenRouterEntitlementResolution,
-  type OpenRouterEntitlementSkew,
+  readOpenRouterEntitlementSync,
+  type OpenRouterEntitlement,
 } from "./openrouter-entitlement.js";
 
 /**
@@ -331,22 +334,30 @@ function bareSlug(requested: string): string {
  * ★ THE ENFORCEMENT (P0). Refuse any model on the OpenRouter route that is not in
  * this box's entitlement set, for ANY harness, aborting the spawn.
  *
- * ## It is an ALLOWLIST as of brick daed4261, and that closed a real gap
+ * ## It is an ALLOWLIST, and the KEY is the list (brick ecfb0461)
  *
- * It used to refuse the **Claude family only**, which made the code tier NARROWER
+ * It once refused the **Claude family only**, which made the code tier NARROWER
  * than the policy it existed to give feedback on: `openrouter/openai/gpt-5-pro`,
- * `openrouter/google/gemini-3-ultra` and every other frontier non-Claude row were
- * off the green list and unrefused. Now the permitted set is
- * {@link OPENROUTER_ENTITLEMENT} — the same module the key's `allowed_models`
- * guardrail is generated from — so `S ⊆ K` holds and no model choice can produce
- * the uninterpretable provider 403 described in that module's header.
+ * `openrouter/google/gemini-3-ultra` and every other frontier row were unrefused.
+ * The permitted set is now whatever **the box's key itself reports** via
+ * `GET /api/v1/models/user` — so there is no second list in acpx that could disagree
+ * with the key, and the uninterpretable provider 403 has no way to arise from a
+ * model *choice*.
  *
- * ## The order of the four checks IS the design — read `assertModelPolicy`'s body
+ * ## The order of the four checks IS the design — read the body
  *
  *   1. not route-shaped     → return. The `/` boundary; keeps this off claude/codex.
  *   2. Claude-family        → throw, with the SHIPPED message, list-independent.
  *   3. floating `~…-latest` → throw, on shape, list-independent.
- *   4. not in `S`           → throw, naming the set.
+ *   4. key's set known and does not contain it → throw, naming the set.
+ *      key's set UNKNOWN    → **return (fail open)**, reporting via `onEntitlementUnknown`.
+ *
+ * 🛑 **STEP 4'S FAIL-OPEN IS THE POINT OF THE ONE-AUTHORITY DESIGN, NOT A GAP.** The
+ * key refuses regardless, so a cold cache or a failed read costs a legible local
+ * message and nothing else. Failing closed here would break every OpenRouter spawn
+ * on the box whenever OpenRouter is slow — a far larger harm than the one avoided.
+ * Steps 2 and 3 still fire in that state, which is exactly why they are kept
+ * independent of the set.
  *
  * Called from `AcpClient.resolveAgentLaunchPlan` ABOVE both `applyBoxProviderEnv`
  * and `applyProfileEnv`, which is what makes it the single place that covers every
@@ -404,42 +415,71 @@ export function assertModelPolicy(
     return;
   }
 
-  // 🛑 CLAUDE-FAMILY IS CHECKED BEFORE THE LIST AND INDEPENDENTLY OF IT — NOT
+  // 🛑 CLAUDE-FAMILY IS CHECKED BEFORE THE KEY'S SET AND INDEPENDENTLY OF IT — NOT
   // FOLDED INTO IT. Two reasons, and the second is why this ordering is not
   // cosmetic:
-  //   1. the shipped refusal keeps its own legible message, verbatim (30eb2003);
-  //   2. a Claude row accidentally added to the entitlement module would then
-  //      PERMIT Claude on the metered route. Checked first, it cannot: the
-  //      refusal does not consult the list at all. The module's own invariant
-  //      test asserts no Claude row exists, so the two can never contradict —
-  //      this ordering is what makes the contradiction harmless if it ever does.
+  //   1. the shipped refusal keeps its own legible message, verbatim (30eb2003) —
+  //      its remedy is a FREE subscription route, not "ask for a wider key";
+  //   2. it is list-independent, so it survives the fail-open state below. A key
+  //      that somehow allowed a Claude-family id, or an unreadable set, would
+  //      otherwise silently re-open the metered Claude route this control exists
+  //      to close — the 2026-09-27 incident.
   if (isClaudeFamilyModelId(requested)) {
     throw claudeFamilyRefusal(requested, agentCommand, options?.profileId);
   }
 
-  const resolution = effectiveEntitlement(options);
-  // A floating alias is refused on SHAPE, independently of the list — it is the
-  // one id form that can start resolving to a pricier build with no edit by
-  // anyone. See `isFloatingAliasModelId`.
-  const floatingAlias = isFloatingAliasModelId(requested);
-  if (!floatingAlias && isEntitledOpenRouterModelId(requested, resolution.entries)) {
+  // A floating alias is refused on SHAPE, independently of the key's set — it is
+  // the one id form that can start resolving to a pricier build with no edit by
+  // anyone, and the one refusal that survives fail-open. See `isFloatingAliasModelId`.
+  if (isFloatingAliasModelId(requested)) {
+    throw notEntitled(requested, ENTITLEMENT_UNKNOWN_FOR_ALIAS, true);
+  }
+
+  assertKeyAllows(requested, options);
+}
+
+/**
+ * Steps 4–5: consult the key's own set, or fail open. Split out for the complexity
+ * budget — the ordering above is the design and belongs in one readable function.
+ */
+function assertKeyAllows(requested: string, options: ModelPolicyOptions | undefined): void {
+  const entitlement = options?.entitlement ?? readOpenRouterEntitlementSync();
+  if (entitlement.allowed === null) {
+    // 🛑 FAIL OPEN, AND SAY SO. Fired only here — i.e. only when a check was
+    // actually skipped for a route-shaped, non-Claude, non-alias model — so it is
+    // never ambient noise on the claude spawns that make up most of this box.
+    options?.onEntitlementUnknown?.(entitlement);
     return;
   }
-  throw notEntitled(requested, resolution, floatingAlias);
+  if (isEntitledOpenRouterModelId(requested, entitlement)) {
+    return;
+  }
+  throw notEntitled(requested, entitlement, false);
 }
+
+/**
+ * The set handed to the alias refusal. An alias is refused on shape *before* the
+ * key is consulted, so there is deliberately no set to name in its message — and
+ * reading one would put a disk read on a path that does not need it.
+ */
+const ENTITLEMENT_UNKNOWN_FOR_ALIAS: OpenRouterEntitlement = {
+  allowed: null,
+  fetchedAt: null,
+  stale: false,
+  error: null,
+};
 
 export type ModelPolicyOptions = {
   profileId?: string | undefined;
-  /** Inject `S` instead of reading `providers.json` — tests, and only tests. */
-  entitlement?: OpenRouterEntitlementResolution;
+  /** Inject the key's set instead of reading the cache — tests, and only tests. */
+  entitlement?: OpenRouterEntitlement;
   /**
-   * Called when the two layers are not provably in step, BEFORE the allow/refuse
-   * decision and regardless of its outcome. Reporting is the caller's job (the spawn
-   * path writes one line); the detection lives in `resolveOpenRouterEntitlement` so
-   * a caller that forgets this callback cannot skip it — the same split
-   * `applyBoxProviderEnv`'s `onConflict` uses.
+   * Called when acpx could not establish what the key allows, immediately before it
+   * fails open. Reporting is the caller's job (the spawn path writes one line);
+   * detecting it lives here so a caller that forgets the callback still gets the
+   * right *behaviour* — the same split `applyBoxProviderEnv`'s `onConflict` uses.
    */
-  onEntitlementSkew?: (skew: OpenRouterEntitlementSkew) => void;
+  onEntitlementUnknown?: (entitlement: OpenRouterEntitlement) => void;
 };
 
 /**
@@ -462,94 +502,68 @@ function claudeFamilyRefusal(
   );
 }
 
-/** `S`, plus the skew report fired as a side effect. Split out for the complexity budget. */
-function effectiveEntitlement(
-  options: ModelPolicyOptions | undefined,
-): OpenRouterEntitlementResolution {
-  const resolution = options?.entitlement ?? resolveOpenRouterEntitlement();
-  if (resolution.skew !== undefined && options?.onEntitlementSkew) {
-    options.onEntitlementSkew(resolution.skew);
-  }
-  return resolution;
-}
-
-/** The refusal, built from `S` and the reason it is `S`. Split out for the complexity budget. */
+/** The refusal, built from what the key allows. Split out for the complexity budget. */
 function notEntitled(
   requested: string,
-  resolution: OpenRouterEntitlementResolution,
+  entitlement: OpenRouterEntitlement,
   floatingAlias: boolean,
 ): OpenRouterModelNotEntitledError {
   return new OpenRouterModelNotEntitledError(
     openRouterNotEntitledMessage({
       requested,
-      entries: resolution.entries,
-      narrowed: resolution.narrowed,
-      // ⚠️ ONLY a settled state (`skew === undefined`) proves the key came from THIS
-      // list. Pre-cutover and under skew acpx does not know, and must not say.
-      providerEnforced: resolution.skew === undefined,
+      slugs: entitlementModelSlugs(entitlement),
       floatingAlias,
     }),
   );
 }
 
 /**
- * The refusal for an OpenRouter id that is not Claude-family and not entitled
- * (brick daed4261 §9).
+ * The refusal for an OpenRouter id the box's key does not allow (brick ecfb0461).
  *
- * 🛑 **IT NEVER CLAIMS THE KEY REFUSES THIS MODEL UNLESS ACPX CAN PROVE IT.** The
- * Claude-family message carries the same rule and the reason is recorded there: an
- * earlier draft of *that* message asserted the box key denied Claude-family slugs,
- * and it was **cut because it was false** — an agent could disprove it with one
- * `curl`, and a message it can falsify in one command is worth less than no message
- * at all.
+ * 🛑 **IT NEVER CLAIMS SOMETHING ACPX CANNOT PROVE.** An earlier draft of the
+ * Claude-family message asserted the box key denied Claude-family slugs, and it was
+ * **cut because it was false** — an agent could disprove it with one `curl`, and a
+ * message it can falsify in one command is worth less than no message at all.
  *
- * Here the claim is **derived from state rather than assumed**: `providerEnforced`
- * is true only when the box's `providers.json` entry records an `entitlementSha`
- * EQUAL to this build's, which is the one condition under which the key provably
- * came from this very list. Pre-cutover (no sha) and under skew (a different sha)
- * the sentence is omitted, because in both cases acpx genuinely does not know.
+ * Under one authority that problem simply dissolves: the set below **is the key's
+ * own answer**, so *"the key would refuse this"* is not an inference acpx is making
+ * about a second list — it is a restatement of what the key just said. The sentence
+ * is therefore unconditional, where the two-list design had to hedge it three ways.
+ *
+ * The one place it is still withheld is a floating alias, refused on shape before
+ * the key is consulted: there acpx genuinely has not asked, so it says only what it
+ * knows.
  */
 function openRouterNotEntitledMessage(params: {
   requested: string;
-  entries: readonly { slug: string }[];
-  narrowed: boolean;
-  providerEnforced: boolean;
+  slugs: readonly string[];
   floatingAlias: boolean;
 }): string {
-  const allowed = params.entries.map((entry) => `    --model openrouter/${entry.slug}`).join("\n");
-  const why = params.floatingAlias
-    ? `"${params.requested}" is a FLOATING alias: OpenRouter re-points \`~…\` / \`…-latest\` ids at\n` +
-      `  whatever build is current, so what it costs can change with no edit by anyone. Pin the\n` +
-      `  dated build instead — an ordinary slug's id never floats.\n`
-    : `"${params.requested}" is not in this box's OpenRouter entitlement set.\n`;
-  const narrowed = params.narrowed
-    ? `\n  ⚠️ acpx has NARROWED the set to the green list because this build's entitlement list does\n` +
-      `  not match the one this box's key was minted from — see the warning above. The full set may\n` +
-      `  be wider than what is listed here.\n`
-    : "";
-  const provider = params.providerEnforced
-    ? `  This is not only an acpx rule: the box's OpenRouter key is bounded to this same list at the\n` +
-      `  provider, so calling OpenRouter directly with it would be refused too.\n`
-    : `  The box key is not yet bounded to this list at the provider, so this refusal is acpx's\n` +
-      `  alone. It is still the rule; calling OpenRouter directly to get around it is a reportable\n` +
-      `  action, not a loophole.\n`;
+  if (params.floatingAlias) {
+    return (
+      `[acpx] refusing --model "${params.requested}": it is a FLOATING alias. OpenRouter re-points\n` +
+      `  \`~…\` / \`…-latest\` ids at whatever build is current, so what it costs can change with no\n` +
+      `  edit by anyone. Pin the dated build instead — an ordinary slug's id never floats.\n` +
+      `  \`acpx models list\` shows exactly what this box's key allows.`
+    );
+  }
+  const allowed = params.slugs.map((slug) => `    --model openrouter/${slug}`).join("\n");
   return (
-    `[acpx] refusing --model "${params.requested}": ${why}` +
-    `  OpenRouter bills metered API pricing out of the box key, so the models an agent may choose\n` +
-    `  are an enumerated set.\n` +
-    narrowed +
-    `\n  entitled models on this box:\n${allowed}\n` +
-    `\n${provider}` +
+    `[acpx] refusing --model "${params.requested}": this box's OpenRouter key does not allow it.\n` +
+    `  OpenRouter bills metered API pricing out of the box key, so the key itself is scoped to an\n` +
+    `  enumerated set of models — this is the key's own answer, not a separate acpx rule, and\n` +
+    `  calling OpenRouter directly with this key would be refused too.\n` +
+    `\n  models this box's key allows:\n${allowed}\n` +
     `\n  Claude-family models are a separate matter: they are served by our subscriptions at no\n` +
     `  marginal cost — use \`--model sonnet\` / \`--model opus\` on a claude agent.\n` +
-    `  Anything outside the set above needs Daniel's explicit say-so for that spawn, and adding a\n` +
-    `  model to it requires re-minting the key — there is no per-task exception to waive here.`
+    `  Widening the set means re-minting the key — there is no per-task exception to waive here,\n` +
+    `  and nothing in acpx to edit. \`acpx models list\` always shows the current set.`
   );
 }
 
 /**
- * Thrown when a non-Claude OpenRouter model outside the entitlement set is selected
- * (brick daed4261).
+ * Thrown when an OpenRouter model the box key does not allow is selected
+ * (brick ecfb0461).
  *
  * Its own class rather than a reuse of {@link ClaudeFamilyOnOpenRouterError}: the
  * two refusals have different remedies — one points at a free subscription route,
@@ -576,62 +590,47 @@ export class OpenRouterModelNotEntitledError extends AcpxOperationalError {
 }
 
 /**
- * Tier 3's annotation for a non-entitled OpenRouter row, and the `availability`
- * reason slug that carries it (brick daed4261 §1.4 — the READ path).
+ * Tier 3's annotation for a row the box key does not allow, and the `availability`
+ * reason slug that carries it (brick ecfb0461 — the READ path).
  *
- * ⚠️ **THE READ PATH MATTERS BECAUSE THE PROVIDER'S DOES NOT NARROW.** Measured
- * 2026-09-29: `GET /api/v1/models` on a guardrail-restricted key returns the FULL
- * catalogue (464 rows), un-narrowed. So without this annotation acpx keeps
- * advertising models the key will refuse, an agent picks one, and the failure
- * arrives as a provider 403 that nothing interprets. Narrowing here is the same
- * invariant as the spawn-time refusal, one consumer further out — and it is driven
- * by the same module, with no network and no credential.
+ * ⚠️ **THE READ PATH MATTERS BECAUSE THE PROVIDER'S CATALOGUE DOES NOT NARROW.**
+ * Measured 2026-09-29: with a key whose `models/user` answer is **2 rows**, the
+ * public `GET /api/v1/models` still returns the **full 464**. So the provider will
+ * not narrow the advertisement for us — without this annotation acpx keeps offering
+ * models the key refuses, an agent picks one, and the failure arrives as a provider
+ * 403 that `probeOpenRouterRefusal` interprets nowhere. This is the same authority
+ * as the spawn-time refusal, one consumer further out, off the same cached read.
  */
 export const OPENROUTER_NOT_ENTITLED_REASON = "openrouter-not-entitled";
 
 /**
- * The annotation for a non-entitled row — **a function of the CURRENT state, never a
- * constant.**
+ * The annotation for a row the key does not allow — **a function of the CURRENT
+ * key's answer, never a constant.**
  *
- * 🛑 **IT WAS A CONSTANT, AND THAT MADE TIER 1 NAME THE REFUSED MODEL IN ITS OWN
- * REMEDY LIST.** The constant enumerated the full {@link OPENROUTER_ENTITLEMENT}, so
- * under sha skew — where acpx has narrowed `S` to the green list — asking for
- * `qwen/qwen3.8-flash` was refused by a message that listed `qwen/qwen3.8-flash`
- * among the choosable models. **The agent had no available action**, and the obvious
- * next move is to retry the thing that just failed. Measured by the test engineer:
- * the Tier 1 message was BYTE-IDENTICAL across all three sha states (one md5 for
- * match, mismatch and absent alike) and always printed all five.
+ * 🛑 **IT WAS A CONSTANT ONCE, AND THAT MADE TIER 1 NAME THE REFUSED MODEL IN ITS
+ * OWN REMEDY LIST** — a message that listed, among the choosable models, the very
+ * model it was refusing. **The agent had no available action**, and the obvious next
+ * move is to retry the thing that just failed. **A refusal whose remedy names the
+ * refused model is worse than a bare refusal.** Deriving it from the live set makes
+ * that shape unreachable by construction rather than by care.
  *
- * ⚠️ **AND IT IS TIER 1, THE STATE-BLIND TIER, THAT PRODUCTION ACTUALLY REACHES** —
+ * ⚠️ **AND IT IS TIER 1, NOT P0, THAT PRODUCTION ACTUALLY REACHES** —
  * `assertModelAvailable` fires on the `--model` flag before the spawn guard ever
- * runs. P0's message was state-aware all along, which is exactly why a unit test
- * would miss this: P0 is the tier a test naturally drives and the rarely-reached one
- * in practice. **A refusal whose remedy names the refused model is worse than a bare
- * refusal.** The committed case asserts the message DIFFERS by sha state and that the
- * narrowed one contains no non-green slug.
+ * runs, which is exactly why a unit test naturally drives the *other* tier and would
+ * miss a defect here.
+ *
+ * Never called with an unknown set: `availabilityFor` fails open before it gets
+ * here, so there is always a set to name.
  */
-export function openRouterNotEntitledAnnotation(
-  resolution: Pick<OpenRouterEntitlementResolution, "entries" | "narrowed">,
-): string {
-  const choosable = resolution.entries.map((entry) => entry.slug).join(", ");
-  if (!resolution.narrowed) {
-    return (
-      "Not in this box's OpenRouter entitlement set — the box key is billed at metered API " +
-      `pricing, so the choosable set is enumerated (${choosable}). Anything else needs Daniel's ` +
-      "say-so for that spawn."
-    );
-  }
-  // The skew explanation rides on the REFUSAL, not only on the success-path warning:
-  // an agent refused while narrowed cannot otherwise tell a policy decision from a
-  // deployment state, and the remedy is different for each.
+export function openRouterNotEntitledAnnotation(entitlement: OpenRouterEntitlement): string {
+  const choosable = entitlementModelSlugs(entitlement).join(", ");
+  const staleness = entitlement.stale
+    ? " (read from an out-of-date cache — `acpx models --refresh` re-reads it)"
+    : "";
   return (
-    "Not choosable on this box right now. acpx has NARROWED the choosable set to the green list " +
-    `(${choosable}) because this build's entitlement list does not match the one this box's ` +
-    "OpenRouter key was minted from — the two enforcement layers are not in step, so acpx cannot " +
-    "prove the key would serve anything wider. The full entitlement set is larger than the list " +
-    "above; it is not offered while the skew stands. Remedy (operator): deploy the build whose " +
-    "list the key was minted from, or re-mint the key from this build's list — " +
-    "`pnpm run openrouter:entitlement` prints it."
+    "This box's OpenRouter key does not allow this model — the key is billed at metered API " +
+    `pricing and is scoped to an enumerated set (${choosable})${staleness}. That set is the key's ` +
+    "own answer, not a separate acpx rule; widening it means re-minting the key."
   );
 }
 

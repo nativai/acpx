@@ -1,211 +1,499 @@
 /**
- * THE SINGLE SOURCE OF TRUTH for what this box's OpenRouter key may be billed for
- * (brick daed4261, CONCEPTION §9).
+ * WHAT THIS BOX'S OpenRouter KEY MAY BE BILLED FOR — read from the key itself
+ * (brick ecfb0461).
  *
- * ## Why one module and not two lists
+ * ## One authority, and that is the whole design
  *
- * Two enforcement layers ship against this set: this code, refusing at spawn; and
- * the provider, refusing a real HTTP call because the key's `allowed_models`
- * guardrail bounds it. **If they can differ, the failure lands in the worst
- * possible place.** A model the code permits and the key refuses comes back as a
- * provider 403 mid-turn — and a 403 is recognised NOWHERE: `probeOpenRouterRefusal`
- * returns `undefined` for any status that is not 429
- * (`openrouter-refusal-reason.ts:249-251`) and only runs at all when the turn error
- * says `timed out`/`timeout` (`:81-84`). So the agent gets an *uninterpretable*
- * turn failure, and an agent meeting an unexplained obstacle reads it as transient
- * infrastructure and retries.
+ * Daniel, 2026-09-29: *"agents can freely pick all models which the key allows to
+ * be selected. So this shouldn't be like dual hard coded in the key and somewhere
+ * else. the source of truth is what models does the key provide."*
  *
- * ⇒ The key's list is GENERATED from this module (`entitlementModelIds`, printed by
- * `pnpm run openrouter:entitlement`), never typed. Cardea validates
- * `scope.models` not at all — it passes verbatim into `allowed_models` — so a
- * hand-typed list is accepted end-to-end by both Cardea and OpenRouter while
- * enforcing nothing.
+ * So there is **no list in this file**. `GET /api/v1/models/user` answers, for a
+ * given key, exactly which models that key may use — and it answers to an
+ * **ordinary key with no management credential**. Measured 2026-09-29 on devbox:
  *
- * ## THE INVARIANT — S ⊆ K at every instant
+ * ```
+ * GET /api/v1/models/user  ->  200  { data: [ … ], links: { next: null }, total_count: 2 }
+ *      ids:       deepseek/deepseek-v4.1-flash  |  z-ai/glm-5.3-flash
+ *      canonical: deepseek/deepseek-v4.1-flash-20260910  |  z-ai/glm-5.3-flash-20260826
+ * GET /api/v1/models       ->  200  464 rows   (the public catalogue, un-narrowed)
+ * ```
  *
- * `S` = the set this code permits at spawn. `K` = the key's `allowed_models`. The
- * code layer is NEVER wider than the key, so every refusal an agent can provoke by
- * *choosing a model* is the legible spawn-time one, and the provider 403 stays a
- * backstop for the paths code cannot reach (a hand-rolled `curl` with the ambient
- * key, `acpx pi set model` on a live session, an already-running adapter).
+ * 🛑 **DO NOT EXPECT THE `allowed_models` SHAPE BACK.** A 4-string allowlist comes
+ * back as **2 rows**, because each row is a full catalogue object for a model the
+ * key may use and the two id *forms* of one model collapse into one row. A consumer
+ * that compares a 4-element allowlist against this endpoint reads 2 and wrongly
+ * concludes divergence. Measured five times across five boxes; it is stable. **Read
+ * `.data[].id`.**
  *
- * 🛑 **IT IS A PROPERTY OF THE CODE'S SHAPE, NOT A RULE ANYONE HAS TO REMEMBER.**
- * Only two values of `S` are reachable — {@link OPENROUTER_ENTITLEMENT} and
- * {@link OPENROUTER_GREEN_LIST} — and the second is a `filter` of the first, so no
- * branch can produce an `S` holding an id outside this module. That is what makes
- * {@link resolveOpenRouterEntitlement}'s narrowing safe in BOTH skew directions:
+ * ## What this replaced, and why the deletion is the feature
  *
- *   widen  the set → mint first, code second → shas differ → S = G(old) ⊆ K_old ⊆ K_new
- *   narrow the set → code first, mint second → shas differ → S = G(new) ⊆ K_old
- *   settled                                 → shas equal  → S = the list K came from
+ * The previous design kept **two** lists — a hardcoded entitlement module here and
+ * the key's `allowed_models` at OpenRouter — and then worked hard to keep them
+ * honest: an `entitlementSha` in `providers.json`, a sha comparison at spawn, three
+ * resolution branches, a narrowing rule, a skew warning, and a two-place edit on
+ * every change. **All of that existed only to detect divergence between two
+ * authorities. With one authority there is nothing to diverge**, so it is gone —
+ * and changing the allowed set is now a re-mint with no code change to keep in step.
  *
- * *"The code layer is the narrower one during skew"* therefore FALLS OUT of the
- * mechanism. Do not re-state it as a convention and do not add a branch that
- * widens `S` past this module.
+ * ## The dividend: this layer can fail OPEN, safely
  *
- * ## Why it lives in acpx, in code an agent can edit
+ * Under two lists the code had to be kept in lockstep or an agent met an
+ * uninterpretable provider 403 (`probeOpenRouterRefusal` returns `undefined` for any
+ * status that is not 429, and only runs when the turn error says `timeout`). Under
+ * one authority **the key refuses regardless**, so this layer is purely feedback.
+ * An unknown set — cold cache, failed fetch, no key — therefore permits everything
+ * and says so: the cost is legibility (an agent meets the provider's refusal instead
+ * of a clean one), never enforcement. Failing closed would trade that small cost for
+ * breaking every spawn on the box whenever OpenRouter is slow.
  *
- * The spawn path must resolve this with **no network and no credential** — a rule
- * the route already enforces twice (`openrouter-routing.ts:123-128`, `:173-177`: a
- * create must never fail because a catalogue fetch was slow). Being version
- * controlled, diffable and reviewable is the other half; the guardrail is
- * structurally unreadable from any box (401 to the ambient key on
- * `/api/v1/guardrails`, `/guardrails/assignments/keys` and `/api/v1/keys`).
+ * 🛑 **`allowed: null` (UNKNOWN) AND `allowed: new Set()` (THE KEY ALLOWS NOTHING)
+ * ARE DIFFERENT FACTS AND MUST NEVER COLLAPSE.** Collapsing them is how a cold cache
+ * becomes a box on which no model can be selected — a total outage produced by a
+ * missing file. Every read path below returns `null` for "I do not know".
  *
- * **That this file is agent-editable is not a weakness of the design; it is the
- * design.** This layer is avowedly as strong as review — its job is FAST, LEGIBLE
- * FEEDBACK at the moment of the mistake. The unliftable copy is the one frozen into
- * the guardrail at mint time, which no box can read, let alone change.
+ * ## Where the network hop lives — read path yes, spawn path never
+ *
+ * An earlier ruling (brick daed4261) forbade a **spawn-path** network probe. That
+ * ruling is not overturned here and its reason has not changed: `C4 §7.1` — no
+ * session create may block on a third-party fetch. What *is* revisited is whether
+ * the query may be the mechanism at all, and it may: the query rides
+ * {@link loadOpenRouterEntitlement} on the path that is **already async and already
+ * fetching from OpenRouter** (`loadCatalogue`), while the spawn path reads
+ * {@link readOpenRouterEntitlementSync} — a plain `readFileSync`, no network, no
+ * promise, no credential resolution beyond the fingerprint check.
  */
 
-import { createHash } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
+  fingerprintCredential,
   loadBoxProviders,
+  resolveBoxProviderKey,
   type BoxProviderEntry,
   type BoxProviderLookupOptions,
 } from "../config/providers.js";
 
-/** One entitled model, in BOTH id forms OpenRouter answers to. */
-export type OpenRouterEntitlementEntry = {
-  /** The plain slug, e.g. `z-ai/glm-5.3-flash`. */
-  readonly slug: string;
-  /**
-   * The dated form, **READ from `/api/v1/models`, NEVER CONSTRUCTED**.
-   *
-   * 🛑 It is NOT `slug + date`. Three date formats and at least one word
-   * reordering are on record: `anthropic/claude-fable-5` →
-   * `anthropic/claude-5-fable-20260609` (word order differs),
-   * `qwen/qwen3-235b-a22b` → `…-04-28` (dash-date), `z-ai/glm-5.3-flash` →
-   * `…-20260826` (compact-date). A CONSTRUCTED canonical slug is accepted by
-   * Cardea, by the guardrail write and by OpenRouter — and enforces nothing.
-   */
-  readonly canonicalSlug: string;
-  /**
-   * Green-listed = an agent may choose it without Daniel's per-spawn say-so
-   * (`Skills/model-selection`). ⚠️ A SUBSET OF THIS LIST, NEVER A SECOND ONE — see
-   * {@link OPENROUTER_GREEN_LIST}.
-   */
-  readonly greenListed?: true;
-  /** Why this row is in the set — so a later reader can judge a removal. */
-  readonly why: string;
-};
+/** The per-key endpoint. Answers to an ordinary key; no management credential. */
+export const OPENROUTER_MODELS_USER_URL = "https://openrouter.ai/api/v1/models/user";
 
-/** When the `canonicalSlug` values below were read. */
-export const OPENROUTER_ENTITLEMENT_MEASURED_AT = "2026-09-29";
+/** Same window the public catalogue uses — the allowed set changes only on a re-mint. */
+export const ENTITLEMENT_TTL_MS = 60 * 60 * 1000;
 
-/**
- * Where they were read from. **Public and unauthenticated** — no credential, no
- * cost, independently re-runnable, which is what makes the pre-mint catalogue
- * re-read a standing requirement rather than a favour.
- */
-export const OPENROUTER_ENTITLEMENT_SOURCE = "https://openrouter.ai/api/v1/models";
-
-/**
- * THE ENTITLEMENT SET — the models this box's key may be billed for at all.
- *
- * ⚠️ **THE ENTITLEMENT SET AND THE GREEN LIST ARE DIFFERENT SETS, AND COLLAPSING
- * THEM BREAKS WORKING SOFTWARE.** The green list answers *"what may an agent choose
- * without asking?"*; this answers *"what may this box bill at all?"* — and it must
- * be a superset, because measured live traffic legitimately sits outside the green
- * list: three `orseam-*` claude seam fixtures on `qwen/qwen3.8-flash` (preserved
- * deliberately — they are how someone re-tests this seam later) and
- * `tg-pi-personal-assistant-*`, Daniel's Telegram assistant, on
- * `moonshotai/kimi-k2.6`.
- *
- * 🛑 **THIS ARRAY IS THE ONE EDIT POINT.** Changing the set is deleting or adding
- * rows here — the sha regenerates itself, the generator output follows, and nothing
- * else in the codebase moves. It costs a per-box re-mint plus a revocation
- * (Cardea attaches a guardrail at MINT TIME ONLY), which is deliberate: it makes
- * policy and enforcement structurally unable to drift, and drift is exactly the
- * 2026-09-27 failure. **Do not build an in-band bypass to recover the old latency
- * — any lever an agent can pull is the rejected per-session-credential lever
- * wearing a new name.**
- *
- * ⚠️ **NO CLAUDE-FAMILY ROW, AND NO FLOATING `~…-latest` ALIAS, EVER.** Both are
- * refused by {@link assertModelPolicy} independently of this list, so a row added
- * here would not permit them — but it WOULD make the two layers disagree.
- * `test/openrouter-entitlement.test.ts` asserts all three invariants and goes red
- * on a violation.
- */
-export const OPENROUTER_ENTITLEMENT: readonly OpenRouterEntitlementEntry[] = [
-  {
-    slug: "z-ai/glm-5.3-flash",
-    canonicalSlug: "z-ai/glm-5.3-flash-20260826",
-    greenListed: true,
-    why: "green list · 34 open sessions measured 2026-09-29",
-  },
-  {
-    slug: "deepseek/deepseek-v4.1-flash",
-    canonicalSlug: "deepseek/deepseek-v4.1-flash-20260910",
-    greenListed: true,
-    why: "green list",
-  },
-  {
-    slug: "qwen/qwen3.8-flash",
-    canonicalSlug: "qwen/qwen3.8-flash-20260826",
-    why: "5 live sessions — 3 claude orseam-* seam fixtures + 2 pi",
-  },
-  {
-    slug: "moonshotai/kimi-k2.6",
-    canonicalSlug: "moonshotai/kimi-k2.6-20260420",
-    why: "live pi, incl. tg-pi-personal-assistant-* (Daniel's Telegram assistant)",
-  },
-  {
-    slug: "moonshotai/kimi-k2-thinking",
-    canonicalSlug: "moonshotai/kimi-k2-thinking-20251106",
-    why: "1 live pi session",
-  },
-];
-
-/**
- * `G` — the green list, **DERIVED BY FILTER**.
- *
- * 🛑 **NEVER REPLACE THIS WITH A SECOND LITERAL.** `G ⊆ K` is what licenses
- * narrowing to it as the safe response to sha skew, and as a `filter` that
- * containment is STRUCTURAL rather than asserted: every element is, by reference,
- * a row of {@link OPENROUTER_ENTITLEMENT}. A hand-written twin would be a second
- * list to keep in step — the exact defect this module exists to remove — and
- * `test/openrouter-entitlement.test.ts` checks reference identity, so it goes red
- * the moment one appears.
- */
-export const OPENROUTER_GREEN_LIST: readonly OpenRouterEntitlementEntry[] =
-  OPENROUTER_ENTITLEMENT.filter((entry) => entry.greenListed === true);
-
-/**
- * Both id forms of every entry, deduped and sorted — the flat list the key's
- * `scope.models` is GENERATED from — print it with `pnpm run openrouter:entitlement`.
- *
- * ⚠️ **BOTH FORMS ON PURPOSE, AND IT IS NOT HEDGING.** Nothing validates which
- * form `allowed_models` enforces on: the field takes "slug or canonical_slug" and
- * a list written in the wrong form is ACCEPTED and enforces NOTHING, silently.
- * Two spellings of one model **cannot widen the scope**, so carrying both is
- * form-agnostic — it closes the trap structurally instead of by guessing.
- */
-export function entitlementModelIds(
-  entries: readonly OpenRouterEntitlementEntry[] = OPENROUTER_ENTITLEMENT,
-): readonly string[] {
-  return [...new Set(entries.flatMap((entry) => [entry.slug, entry.canonicalSlug]))].toSorted();
-}
-
-/**
- * The fingerprint that ties the two layers together, over exactly the strings the
- * guardrail was generated from.
- *
- * ⚠️ **COMPUTED FROM THE ROWS, NEVER STORED AS A CONSTANT.** A hardcoded sha is a
- * second source of truth that goes stale on the first edit to the list — silently,
- * and in the direction that reports "in step" while the lists differ.
- */
-export function entitlementSha(
-  entries: readonly OpenRouterEntitlementEntry[] = OPENROUTER_ENTITLEMENT,
-): string {
-  return createHash("sha256").update(entitlementModelIds(entries).join("\n")).digest("hex");
-}
-
-/** This build's entitlement sha — the code half of the tie. */
-export const OPENROUTER_ENTITLEMENT_SHA = entitlementSha();
+const FETCH_TIMEOUT_MS = 15_000;
 
 /** The `providers.json` entry that pays for the OpenRouter route. */
 const OPENROUTER_PROVIDER_ENTRY = "openrouter";
+
+/**
+ * Set to any non-empty value to forbid the authenticated `models/user` call. A warm
+ * cache is still served; only the refresh is suppressed. The test suite sets it from
+ * its bootstrap so no gate run can put this box's key on the wire — see
+ * `test/box-env-scrub.ts`, which owns the reasoning.
+ */
+export const NO_ENTITLEMENT_FETCH_ENV = "ACPX_NO_OPENROUTER_ENTITLEMENT_FETCH";
+
+/**
+ * What the key allows, plus how well we know it.
+ *
+ * 🛑 `allowed === null` is **UNKNOWN**, never "nothing". See the header.
+ */
+export type OpenRouterEntitlement = {
+  /** Every id form the key named — `null` when acpx could not find out. */
+  allowed: ReadonlySet<string> | null;
+  /** ISO-8601 of the read these ids came from, when there was one. */
+  fetchedAt: string | null;
+  /** The ids are older than the TTL, or were served after a failed refresh. */
+  stale: boolean;
+  /** Human-readable when the read failed. Present with a `null` set, and on stale. */
+  error: string | null;
+};
+
+/** The fail-open value. Returned wherever acpx cannot establish the set. */
+export const ENTITLEMENT_UNKNOWN: OpenRouterEntitlement = {
+  allowed: null,
+  fetchedAt: null,
+  stale: false,
+  error: null,
+};
+
+function unknown(error: string | null): OpenRouterEntitlement {
+  return { allowed: null, fetchedAt: null, stale: false, error };
+}
+
+/** What lands on disk. `keyFingerprint` is a digest — never the key. */
+type EntitlementCacheFile = {
+  fetchedAt: string;
+  keyFingerprint: string;
+  modelIds: string[];
+};
+
+/**
+ * ⚠️ TAKES THE `env` IT IS ASKED ABOUT, NOT THE PROCESS'S — the same resolution
+ * ladder, and the same reason, as `defaultCatalogueCachePath` (brick ff298f02): a
+ * caller threading a scoped env must not silently read the machine's cache.
+ */
+export function defaultEntitlementCachePath(env: NodeJS.ProcessEnv = process.env): string {
+  const explicit = env.ACPX_OPENROUTER_ENTITLEMENT_CACHE?.trim();
+  if (explicit) {
+    return path.resolve(explicit);
+  }
+  return path.join(
+    env.ACPX_STATE_HOME?.trim() || env.HOME?.trim() || os.homedir(),
+    ".acpx",
+    "openrouter-entitlement.json",
+  );
+}
+
+/**
+ * The key's fingerprint, or `undefined` when this box has no OpenRouter credential.
+ *
+ * ⚠️ Never throws into session creation — `loadBoxProviders` degrades on a missing,
+ * unreadable or malformed file by its own contract, and the `catch` covers the rest.
+ */
+export function openRouterKeyFingerprint(
+  options?: BoxProviderLookupOptions & { entry?: BoxProviderEntry | undefined },
+): string | undefined {
+  const key = resolveOpenRouterKey(options);
+  return key === undefined ? undefined : fingerprintCredential(key);
+}
+
+/**
+ * The box's OpenRouter key, or `undefined`. ⚠️ Returns a SECRET — callers may
+ * fingerprint it or put it in a request header, and nowhere else.
+ */
+function resolveOpenRouterKey(
+  options?: BoxProviderLookupOptions & { entry?: BoxProviderEntry | undefined },
+): string | undefined {
+  const entry = options?.entry ?? findOpenRouterEntry(options);
+  if (entry === undefined) {
+    return undefined;
+  }
+  const key = resolveBoxProviderKey(entry, options?.env ?? process.env);
+  return key === undefined || key.trim() === "" ? undefined : key;
+}
+
+/**
+ * The cache file, validated — or `null`.
+ *
+ * 🛑 **A FINGERPRINT MISMATCH IS A COLD CACHE, AND THAT IS THE INVALIDATION THAT
+ * ACTUALLY FIRES.** Time alone is the wrong instrument here: the allowed set almost
+ * never changes on its own, it changes when the key is **re-minted** — which
+ * produces a *new key*, not an older timestamp. Without this check a box would keep
+ * serving the previous key's allowed set for up to a full TTL after a re-mint, which
+ * is precisely the window in which being wrong is most likely.
+ *
+ * `expectedFingerprint === undefined` (no credential on this box) matches nothing,
+ * so such a box reads as unknown and fails open — correct: with no key there is no
+ * authority to consult.
+ */
+function readCache(
+  cachePath: string,
+  expectedFingerprint: string | undefined,
+): {
+  snapshot: EntitlementCacheFile | null;
+  reason: string | null;
+} {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(cachePath, "utf8");
+  } catch {
+    return { snapshot: null, reason: null };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    // A truncated or hand-mangled cache is a cold cache, never a crash.
+    return { snapshot: null, reason: `${cachePath} is not valid JSON` };
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return { snapshot: null, reason: `${cachePath} is not an object` };
+  }
+  return validateCacheFile(parsed as Partial<EntitlementCacheFile>, cachePath, expectedFingerprint);
+}
+
+/** Shape + fingerprint validation. Split out for the complexity budget. */
+function validateCacheFile(
+  file: Partial<EntitlementCacheFile>,
+  cachePath: string,
+  expectedFingerprint: string | undefined,
+): { snapshot: EntitlementCacheFile | null; reason: string | null } {
+  if (!Array.isArray(file.modelIds) || typeof file.keyFingerprint !== "string") {
+    return { snapshot: null, reason: `${cachePath} is missing modelIds or keyFingerprint` };
+  }
+  if (expectedFingerprint === undefined) {
+    return { snapshot: null, reason: "this box has no resolvable OpenRouter credential" };
+  }
+  if (file.keyFingerprint !== expectedFingerprint) {
+    return {
+      snapshot: null,
+      reason: "the cached allowed set belongs to a different OpenRouter key (re-minted?)",
+    };
+  }
+  return {
+    snapshot: {
+      fetchedAt: typeof file.fetchedAt === "string" ? file.fetchedAt : new Date(0).toISOString(),
+      keyFingerprint: file.keyFingerprint,
+      modelIds: file.modelIds.filter((id): id is string => typeof id === "string"),
+    },
+    reason: null,
+  };
+}
+
+/** Atomic tmp + rename — a reader never sees a half-written set. */
+function writeCache(cachePath: string, file: EntitlementCacheFile): void {
+  fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+  const tmpPath = `${cachePath}.${process.pid}.tmp`;
+  fs.writeFileSync(tmpPath, `${JSON.stringify(file)}\n`, "utf8");
+  fs.renameSync(tmpPath, cachePath);
+}
+
+function isFresh(file: EntitlementCacheFile, ttlMs: number, now: number): boolean {
+  const fetchedAt = Date.parse(file.fetchedAt);
+  return Number.isFinite(fetchedAt) && now - fetchedAt < ttlMs;
+}
+
+function toEntitlement(file: EntitlementCacheFile, stale: boolean, error: string | null) {
+  return {
+    allowed: new Set(file.modelIds),
+    fetchedAt: file.fetchedAt,
+    stale,
+    error,
+  } satisfies OpenRouterEntitlement;
+}
+
+export type EntitlementLoadOptions = BoxProviderLookupOptions & {
+  /**
+   * 🛑 **`entitlementCachePath`, NOT `cachePath`, AND THE NAME IS LOAD-BEARING.**
+   * `loadCatalogue` takes `LoadOptions & EntitlementLoadOptions` in one object so
+   * `offline` / `refresh` / `ttlMs` / `now` are shared by construction — but
+   * `LoadOptions.cachePath` already names the *public catalogue* cache. A field of
+   * the same name would intersect to one string and point this loader at
+   * `models-cache.json`, which parses as "no modelIds" and reads as a permanently
+   * cold entitlement cache: fail-open everywhere, with nothing failing.
+   */
+  entitlementCachePath?: string;
+  ttlMs?: number;
+  /** Force a fetch even when the cache is fresh (`--refresh`). */
+  refresh?: boolean;
+  /** Never touch the network. */
+  offline?: boolean;
+  now?: number;
+  entry?: BoxProviderEntry | undefined;
+  /** Injected for tests. Receives the resolved key; returns the ids the key allows. */
+  fetchAllowed?: (key: string) => Promise<EntitlementSnapshot>;
+};
+
+/**
+ * The allowed set from disk, **SYNCHRONOUSLY and with no network access** — the
+ * spawn path's reader.
+ *
+ * ⚠️ A cold, stale-past-TTL, unparseable or foreign-key cache all return
+ * `allowed: null`, i.e. fail open with a reason. **Staleness fails open too**: an
+ * hour-old set is a set acpx cannot vouch for, and quietly enforcing it would be
+ * enforcement without authority — the exact thing this brick deleted.
+ */
+export function readOpenRouterEntitlementSync(
+  options: EntitlementLoadOptions = {},
+): OpenRouterEntitlement {
+  const cachePath = options.entitlementCachePath ?? defaultEntitlementCachePath(options.env);
+  const ttlMs = options.ttlMs ?? ENTITLEMENT_TTL_MS;
+  const now = options.now ?? Date.now();
+  const fingerprint = openRouterKeyFingerprint(options);
+  const { snapshot, reason } = readCache(cachePath, fingerprint);
+  if (snapshot === null) {
+    return unknown(reason ?? `no cached OpenRouter allowed-model set at ${cachePath}`);
+  }
+  if (!isFresh(snapshot, ttlMs, now)) {
+    return unknown(`the cached OpenRouter allowed-model set at ${cachePath} is older than its TTL`);
+  }
+  return toEntitlement(snapshot, false, null);
+}
+
+export type EntitlementSnapshot = {
+  fetchedAt: string;
+  modelIds: string[];
+};
+
+/**
+ * Ask the key what it allows.
+ *
+ * ⚠️ **BOTH ID FORMS PER ROW.** Each row carries `canonical_slug` as a FIELD
+ * (`z-ai/glm-5.3-flash` → `z-ai/glm-5.3-flash-20260826`; it is NOT `slug + date` —
+ * three date formats and at least one word reordering are on record, so it is read,
+ * never constructed). `.data[].id` is the authoritative read; adding
+ * `canonical_slug` cannot widen the set past what the key named — it is a second
+ * spelling of the same model — and it means either form an agent types resolves.
+ *
+ * ⚠️ **THE KEY IS AN ARGUMENT, NOT AN ENVIRONMENT READ OR AN ARGV.** It goes into a
+ * header and nowhere else: on these boxes an argv dump is a credential dump.
+ */
+export async function fetchOpenRouterAllowedModels(
+  key: string,
+  url = OPENROUTER_MODELS_USER_URL,
+): Promise<EntitlementSnapshot> {
+  const response = await fetch(url, {
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    headers: { accept: "application/json", authorization: `Bearer ${key}` },
+  });
+  if (!response.ok) {
+    throw new Error(`${url} responded ${response.status} ${response.statusText}`);
+  }
+  const body: unknown = await response.json();
+  const data = typeof body === "object" && body !== null ? (body as { data?: unknown }).data : null;
+  if (!Array.isArray(data)) {
+    throw new Error(`${url} returned no "data" array`);
+  }
+  const modelIds = new Set<string>();
+  for (const row of data) {
+    for (const id of rowModelIds(row)) {
+      modelIds.add(id);
+    }
+  }
+  return { fetchedAt: new Date().toISOString(), modelIds: [...modelIds].toSorted() };
+}
+
+/** Both id forms off one row, normalised. Split out for the complexity budget. */
+function rowModelIds(row: unknown): string[] {
+  if (typeof row !== "object" || row === null) {
+    return [];
+  }
+  const { id, canonical_slug: canonical } = row as { id?: unknown; canonical_slug?: unknown };
+  return [id, canonical]
+    .filter((value): value is string => typeof value === "string" && value.trim() !== "")
+    .map((value) => value.trim().toLowerCase());
+}
+
+/**
+ * Cache-first, stale-on-error — the read path's loader, and the only thing that ever
+ * puts this module on the network.
+ *
+ * Outcomes, all of them a usable answer:
+ *   fresh cache            → serve it, no network
+ *   stale cache, fetch ok  → serve the fetch, rewrite the cache
+ *   stale cache, fetch bad → serve the CACHE, `stale: true` + the error
+ *   no cache,   fetch bad  → UNKNOWN + the error ⇒ **fail open** (see the header)
+ *   no credential          → UNKNOWN, no network attempted
+ *
+ * ⚠️ A **stale** set is still served here, unlike the sync reader — the read path
+ * tried and can say so (`stale`, `error`), so annotating `acpx models` from an
+ * hour-old set beats annotating from nothing. The spawn path, which cannot report,
+ * fails open instead.
+ */
+export async function loadOpenRouterEntitlement(
+  options: EntitlementLoadOptions = {},
+): Promise<OpenRouterEntitlement> {
+  const cachePath = options.entitlementCachePath ?? defaultEntitlementCachePath(options.env);
+  const key = resolveOpenRouterKey(options);
+  if (key === undefined) {
+    return unknown("this box has no resolvable OpenRouter credential");
+  }
+  const fingerprint = fingerprintCredential(key);
+  const { snapshot, reason } = readCache(cachePath, fingerprint);
+  if (servableWithoutRefresh(snapshot, options)) {
+    return toEntitlement(snapshot, false, null);
+  }
+  const withheld = whyNoFetch(options, options.env ?? process.env);
+  if (withheld !== null) {
+    return servedWithoutFetch(snapshot, reason, cachePath, withheld);
+  }
+  return await refreshFromKey({ options, key, fingerprint, cachePath, snapshot });
+}
+
+/** A cache good enough to serve as-is. Split out for the complexity budget. */
+function servableWithoutRefresh(
+  snapshot: EntitlementCacheFile | null,
+  options: EntitlementLoadOptions,
+): snapshot is EntitlementCacheFile {
+  if (snapshot === null || options.refresh === true) {
+    return false;
+  }
+  return isFresh(snapshot, options.ttlMs ?? ENTITLEMENT_TTL_MS, options.now ?? Date.now());
+}
+
+/** The fetch-and-cache leg. Split out for the complexity budget. */
+async function refreshFromKey(params: {
+  options: EntitlementLoadOptions;
+  key: string;
+  fingerprint: string;
+  cachePath: string;
+  snapshot: EntitlementCacheFile | null;
+}): Promise<OpenRouterEntitlement> {
+  const fetchAllowed =
+    params.options.fetchAllowed ?? ((k: string) => fetchOpenRouterAllowedModels(k));
+  try {
+    const fetched = await fetchAllowed(params.key);
+    const file: EntitlementCacheFile = { ...fetched, keyFingerprint: params.fingerprint };
+    cacheOrWarn(params.cachePath, file);
+    return toEntitlement(file, false, null);
+  } catch (error) {
+    // Stale-on-error: a failed refresh serves the cache rather than emptiness, and
+    // labels it. With no cache it is UNKNOWN — never an empty set (see the header).
+    const message = error instanceof Error ? error.message : String(error);
+    return params.snapshot === null
+      ? unknown(message)
+      : toEntitlement(params.snapshot, true, message);
+  }
+}
+
+/**
+ * Why this call must not go to the network, or `null` when it may.
+ *
+ * 🛑 BOTH REASONS ARE CHECKED AFTER THE FRESH-CACHE BRANCH, so a warm cache is
+ * served either way — they suppress the FETCH, never the answer. The env guard is
+ * about a CREDENTIAL: this is the only authenticated outbound call acpx makes for
+ * the model surface, and `test/box-env-scrub.ts` sets it from the suite bootstrap
+ * rather than relying on every row to isolate `ACPX_STATE_HOME` (the store guard
+ * there is opt-in per test, not global).
+ */
+function whyNoFetch(options: EntitlementLoadOptions, env: NodeJS.ProcessEnv): string | null {
+  if (options.offline === true) {
+    return "acpx was asked not to touch the network (offline)";
+  }
+  return env[NO_ENTITLEMENT_FETCH_ENV]
+    ? `${NO_ENTITLEMENT_FETCH_ENV} is set, so acpx did not ask the key what it allows`
+    : null;
+}
+
+/** The answer when no fetch was made: a labelled stale cache, or UNKNOWN. */
+function servedWithoutFetch(
+  snapshot: EntitlementCacheFile | null,
+  reason: string | null,
+  cachePath: string,
+  withheld: string,
+): OpenRouterEntitlement {
+  if (snapshot === null) {
+    return unknown(reason ?? `${withheld}; no cached allowed-model set at ${cachePath}`);
+  }
+  return toEntitlement(snapshot, true, withheld);
+}
+
+/** ⚠️ Same never-throw-into-session-creation rule the catalogue read follows. */
+function findOpenRouterEntry(
+  options: BoxProviderLookupOptions | undefined,
+): BoxProviderEntry | undefined {
+  try {
+    return loadBoxProviders(options).providers.find(
+      (provider) => provider.name === OPENROUTER_PROVIDER_ENTRY,
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+function cacheOrWarn(cachePath: string, file: EntitlementCacheFile): void {
+  try {
+    writeCache(cachePath, file);
+  } catch (error) {
+    // An unwritable cache degrades to "fetch every time", not to a failure.
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(
+      `[acpx] warning: could not write the OpenRouter entitlement cache at ${cachePath}: ${message}\n`,
+    );
+  }
+}
 
 const OPENROUTER_ID_PREFIXES = ["openrouter/", "openrouter:"] as const;
 
@@ -217,24 +505,23 @@ export function withoutOpenRouterRoutePrefix(id: string): string {
 }
 
 /**
- * Whether this model id names the OpenRouter route at all — the gate that keeps
- * the allowlist off every other harness.
+ * Whether this model id names the OpenRouter route at all — the gate that keeps the
+ * allowed set off every other harness.
  *
  * 🛑 **THE NAMESPACE TEST IS LOAD-BEARING, NOT A TIDINESS CHECK. Without it this
- * predicate swallows every ordinary claude and codex session.** Measured on
- * devbox's whole session store, 2026-09-29: **zero non-OpenRouter model ids carry a
- * `/`.** claude and claude-pty run bare aliases (`opus` ×790, `sonnet` ×291,
- * `default` ×78, `fable` ×43, `haiku` ×6); codex runs bare ids with a bracket
- * (`gpt-6-astra[high]` ×32, 18 distinct forms); every namespaced id in the store is
- * an OpenRouter id. Structurally corroborated: `ModelSource` has five values
- * (`types.ts:12`) and the four non-OpenRouter ones carry only bare ids — claude's
- * compiled into `harness-models.ts`, codex's advertised bare over ACP.
+ * predicate swallows every ordinary claude and codex session.** Measured on devbox's
+ * whole session store, 2026-09-29: **zero non-OpenRouter model ids carry a `/`.**
+ * claude and claude-pty run bare aliases (`opus` ×790, `sonnet` ×291, `default` ×78,
+ * `fable` ×43, `haiku` ×6); codex runs bare ids with a bracket (`gpt-6-astra[high]`
+ * ×32, 18 distinct forms); every namespaced id in the store is an OpenRouter id.
+ * Structurally corroborated: `ModelSource` has five values (`types.ts:12`) and the
+ * four non-OpenRouter ones carry only bare ids — claude's compiled into
+ * `harness-models.ts`, codex's advertised bare over ACP.
  *
  * ⚠️ **NAME-SHAPED ON PURPOSE — IT MUST NOT CONSULT THE CATALOGUE.** The bare-slug
- * leg of the route reads the model cache, and a **cold** cache makes it stand
- * aside, so a catalogue-derived test would be silently absent exactly when the
- * cache is cold. `isClaudeFamilyModelId` is the existing precedent, for the same
- * reason.
+ * leg of the route reads the model cache, and a **cold** cache makes it stand aside,
+ * so a catalogue-derived test would be silently absent exactly when the cache is
+ * cold. `isClaudeFamilyModelId` is the existing precedent, for the same reason.
  *
  * ⚠️ An EXPLICIT `openrouter:` / `openrouter/` prefix settles it on its own, even
  * with no namespace after it (`openrouter/free`) — the caller named the route.
@@ -251,21 +538,19 @@ export function isOpenRouterRouteShapedModelId(id: string | null | undefined): b
 }
 
 /**
- * A FLOATING alias — OpenRouter's `~…` / `…-latest` rows, refused at this layer
- * **independently of the entitlement list**.
+ * A FLOATING alias — OpenRouter's `~…` / `…-latest` rows, refused **independently of
+ * what the key allows**.
  *
- * ⚠️ **THEY ARE THE ONLY GENUINELY FLOATING IDS, WHICH IS WHY THEY ARE THE ONE
- * SHAPE WORTH A DEDICATED REFUSAL.** A plain slug's canonical is PINNED — measured
- * across three natural experiments, an undated slug's canonical is the OLDER date
- * and a newer build ships as a NEW slug — so an ordinary entry never goes stale.
- * An entry on a floating alias is the opposite: a standing hole that could **begin
- * resolving to a pricier build with no edit by anyone**. Fail-closed refusal is the
- * correct posture, and refusing by SHAPE catches an alias spelling nobody
- * anticipated.
- *
- * ⚠️ The companion check — no entry has `canonicalSlug === slug`, the measured
- * signature of a floating row — belongs to the module's invariants and cannot live
- * here: a *requested* id's canonical form is not knowable without the network.
+ * ⚠️ **THE ONE DELIBERATE EXCEPTION TO "THE KEY DECIDES", AND IT IS NARROW.** A
+ * plain slug's canonical is PINNED — measured across three natural experiments, an
+ * undated slug's canonical is the OLDER date and a newer build ships as a NEW slug —
+ * so an ordinary id never goes stale. A floating alias is the opposite: a standing
+ * hole that could **begin resolving to a pricier build with no edit by anyone**.
+ * Refusing by SHAPE catches an alias spelling nobody anticipated, costs nothing, and
+ * — the reason it is worth keeping at all — **it is the one refusal that survives
+ * fail-open**, when the key's answer is unavailable and every other check stands
+ * aside. In practice it never contradicts the key: `models/user` answers with pinned
+ * ids.
  */
 export function isFloatingAliasModelId(id: string | null | undefined): boolean {
   if (typeof id !== "string") {
@@ -275,146 +560,53 @@ export function isFloatingAliasModelId(id: string | null | undefined): boolean {
   return slug.startsWith("~") || slug.endsWith("-latest");
 }
 
-/** Whether `id` is one of `entries`' two id forms. The route prefix is stripped first. */
+/**
+ * Whether the key allows this id.
+ *
+ * 🛑 **UNKNOWN PERMITS.** `allowed === null` means acpx could not establish the set,
+ * and this returns `true` — the fail-open decision, in one place so no caller can
+ * implement it differently. The key still refuses; only the local feedback is lost.
+ */
 export function isEntitledOpenRouterModelId(
   id: string,
-  entries: readonly OpenRouterEntitlementEntry[],
+  entitlement: OpenRouterEntitlement,
 ): boolean {
-  const slug = withoutOpenRouterRoutePrefix(id);
-  return entries.some((entry) => entry.slug === slug || entry.canonicalSlug === slug);
+  if (entitlement.allowed === null) {
+    return true;
+  }
+  return entitlement.allowed.has(withoutOpenRouterRoutePrefix(id));
 }
 
 /**
- * WHY the effective set is what it is — reported on the spawn log, never inferred.
+ * The ids the key allows, shortest-form-first and de-duplicated, for a message.
  *
- * - `mismatch` — the box's key was minted from a DIFFERENT list than this build
- *   carries. Real skew: narrow, and say so loudly.
- * - `unrecorded` — the entry records no sha (or there is no entry). **No key-side
- *   claim was ever made**, which is the pre-cutover state. Do not narrow; say so.
+ * `models/user` answers with both a slug and its dated canonical for one model, so a
+ * bare enumeration would offer an agent two spellings of two models as four choices.
+ * A dated id whose undated prefix is also allowed is dropped — the undated one is
+ * what a human writes, and both resolve.
  */
-export type OpenRouterEntitlementSkewKind = "mismatch" | "unrecorded";
-
-export type OpenRouterEntitlementSkew = {
-  kind: OpenRouterEntitlementSkewKind;
-  /** The `providers.<name>` entry consulted. */
-  name: string;
-  /** This build's sha — a fingerprint of a public list, not a secret. */
-  codeSha: string;
-  /** The entry's sha, when it declares one. */
-  entrySha?: string;
-};
-
-/** The effective allowed set, plus the reason it is that set. */
-export type OpenRouterEntitlementResolution = {
-  /** `S`. Always {@link OPENROUTER_ENTITLEMENT} or {@link OPENROUTER_GREEN_LIST}. */
-  entries: readonly OpenRouterEntitlementEntry[];
-  /** `true` when narrowed to the green list — i.e. `kind === "mismatch"`. */
-  narrowed: boolean;
-  /** Present whenever the two layers are not provably in step. */
-  skew?: OpenRouterEntitlementSkew;
-};
-
-/**
- * Resolve `S` — **no network, no credential, no management key**, and it never
- * throws into session creation (`loadBoxProviders` degrades on a missing,
- * unreadable or malformed file, by its own contract).
- *
- * 🛑 **AN ABSENT `entitlementSha` DOES NOT NARROW, AND THAT IS A DECISION RATHER
- * THAN AN OMISSION.** The field means *"this key was minted from list X"*. Absent
- * means no key-side claim was ever recorded — the pre-cutover state, where the key
- * is UNRESTRICTED and therefore `S ⊆ K` holds for any `S`. Narrowing on absence
- * would refuse the open `orseam-*` sessions on `qwen/qwen3.8-flash` **before the
- * mint**: breaking traffic that was preserved on purpose, in the one window where
- * this control provides nothing. It is REPORTED rather than silent, because a check
- * that has not started must not look like a check that passed.
- *
- * ⚠️ **WHAT THIS CHECK IS, STATED SO NOBODY OVERCLAIMS IT: a skew detector between
- * two honest authorities, NOT an adversarial control.** An agent that can rewrite
- * `providers.json` can rewrite this module too. The adversarial control is the
- * key's guardrail, which no box can read or lift (401 from the ambient key on every
- * guardrail endpoint) — this half exists so an honest deploy ordering cannot
- * silently produce an uninterpretable provider 403.
- */
-export function resolveOpenRouterEntitlement(
-  options?: BoxProviderLookupOptions & { entry?: BoxProviderEntry | undefined },
-): OpenRouterEntitlementResolution {
-  const entry = options?.entry ?? findOpenRouterEntry(options);
-  const entrySha = entry?.entitlementSha;
-  const name = entry?.name ?? OPENROUTER_PROVIDER_ENTRY;
-  if (entrySha === undefined) {
-    return {
-      entries: OPENROUTER_ENTITLEMENT,
-      narrowed: false,
-      skew: { kind: "unrecorded", name, codeSha: OPENROUTER_ENTITLEMENT_SHA },
-    };
+export function entitlementModelSlugs(entitlement: OpenRouterEntitlement): string[] {
+  if (entitlement.allowed === null) {
+    return [];
   }
-  if (entrySha === OPENROUTER_ENTITLEMENT_SHA) {
-    return { entries: OPENROUTER_ENTITLEMENT, narrowed: false };
-  }
-  return {
-    entries: OPENROUTER_GREEN_LIST,
-    narrowed: true,
-    skew: { kind: "mismatch", name, codeSha: OPENROUTER_ENTITLEMENT_SHA, entrySha },
-  };
-}
-
-/** ⚠️ Same never-throw-into-session-creation rule the route's catalogue read follows. */
-function findOpenRouterEntry(
-  options: BoxProviderLookupOptions | undefined,
-): BoxProviderEntry | undefined {
-  try {
-    return loadBoxProviders(options).providers.find(
-      (provider) => provider.name === OPENROUTER_PROVIDER_ENTRY,
-    );
-  } catch {
-    return undefined;
-  }
+  const all = [...entitlement.allowed].toSorted();
+  return all.filter((id) => !all.some((other) => other !== id && id.startsWith(`${other}-`)));
 }
 
 /**
- * The ONE wording for a skew, so the spawn path and any diagnostic cannot drift —
- * the same rule `formatBoxProviderEnvConflict` follows, and the same shape: say
- * which value is which, what the consequence is, and what to do about it. A
- * warning that names a divergence without naming the remedy just relocates the
- * puzzle.
+ * The one wording for "acpx could not establish what the key allows", so the spawn
+ * path and any diagnostic cannot drift.
  *
- * ⚠️ Carries no credential. A sha over a list of public model ids is not a secret,
- * and it is the only thing that makes the two layers comparable from a box at all.
+ * ⚠️ It says what acpx knows and what follows from it — never what the provider will
+ * do. The key's own refusal is still in force; that is precisely why failing open
+ * here is safe, and the note has to make that legible rather than alarming.
  */
-export function formatOpenRouterEntitlementSkew(skew: OpenRouterEntitlementSkew): string {
-  const codeShort = skew.codeSha.slice(0, 16);
-  if (skew.kind === "unrecorded") {
-    return (
-      // 🛑 IT SAYS WHAT ACPX KNOWS, NEVER WHAT THE PROVIDER WILL DO. An earlier
-      // wording ended "…a non-entitled model is refused here but nothing refuses it
-      // at the provider yet" — a claim about the KEY that this module cannot check,
-      // and FALSE in the reassuring direction in the one state that matters: a key
-      // that IS restricted while no sha was recorded. Then acpx uses the full set,
-      // the provider refuses, and the operator has been told the opposite. The
-      // doc-comment on `resolveOpenRouterEntitlement` is already careful that this is
-      // a skew detector between two honest authorities and not an adversarial
-      // control; this sentence had to be equally careful.
-      `providers.${skew.name} records no entitlementSha, so acpx cannot prove its allowed set ` +
-      `matches the one this box's OpenRouter key was minted from. Using the full entitlement ` +
-      `list (sha256:${codeShort}, ${OPENROUTER_ENTITLEMENT.length} models). This is the expected ` +
-      `state until the key is re-minted with a scope.models guardrail. ⚠️ acpx cannot tell from ` +
-      `here whether this key is already restricted: if it is, a model acpx permits may still be ` +
-      `refused at the provider. Record entitlementSha in the same change that restricts the key.`
-    );
-  }
+export function formatEntitlementUnknown(entitlement: OpenRouterEntitlement): string {
+  const because = entitlement.error === null ? "" : ` (${entitlement.error})`;
   return (
-    `providers.${skew.name} was minted from entitlement list sha256:` +
-    `${skew.entrySha?.slice(0, 16) ?? "unknown"} but this build carries sha256:${codeShort} — the ` +
-    `two enforcement layers are NOT in step. Narrowing to the green list ` +
-    `(${OPENROUTER_GREEN_LIST.map((entry) => entry.slug).join(", ")}) so acpx can never permit a ` +
-    `model the key would refuse with an uninterpretable 403. Remedy: deploy the build whose list ` +
-    `the key was minted from, or re-mint the key from this build's list — run ` +
-    // ⚠️ THE RUNNABLE FORM, NOT THE FILE NAME. This named
-    // `scripts/print-openrouter-entitlement.mjs`, which does not exist (the script is
-    // `.ts`); an operator who pasted it got "Cannot find module". It matters out of
-    // proportion to its size because this line reaches an operator EXACTLY when the
-    // two enforcement layers have diverged — the one moment they need a command that
-    // runs rather than a path to debug.
-    `\`pnpm run openrouter:entitlement\` to print it.`
+    `acpx could not read which models this box's OpenRouter key allows${because}, so it is not ` +
+    `checking your model choice against that set. The key itself still enforces it: a model it ` +
+    `does not allow will be refused by OpenRouter at call time instead of here. Run ` +
+    `\`acpx models --refresh\` to repopulate the set.`
   );
 }

@@ -18,8 +18,7 @@ import { isAvailableForAgent } from "../src/models/matcher.js";
 import type { OpenRouterSnapshot } from "../src/models/openrouter-catalogue.js";
 import {
   isEntitledOpenRouterModelId,
-  OPENROUTER_ENTITLEMENT,
-  type OpenRouterEntitlementResolution,
+  type OpenRouterEntitlement,
 } from "../src/models/openrouter-entitlement.js";
 
 // Same fixture and resolution rule as models-catalogue.test.ts: from cwd, not
@@ -34,15 +33,22 @@ function fixture(): OpenRouterSnapshot {
 const META = { fetchedAt: "2026-09-04T00:10:56.992Z", stale: false, error: null };
 
 /**
- * The shipped entitlement set in its SETTLED state (shas in step, nothing narrowed).
- * Injected rather than resolved so no assertion depends on whether THIS box's key
- * records an `entitlementSha` — and stated explicitly because the refusal wording is
- * now a FUNCTION of the state (brick daed4261 F1), so a test that left `narrowed`
- * ambiguous would assert against a message whose shape it never pinned.
+ * A KNOWN allowed set, stated here rather than read from this box (brick ecfb0461).
+ *
+ * ⚠️ The ids are the two this box's key really allowed on 2026-09-29, so the row
+ * exercises a realistic *narrow* set — but they are written down, not fetched, so
+ * no assertion depends on whether this box has a warm entitlement cache, a valid
+ * key, or a network. An environment-dependent row here would read as a banding bug.
+ *
+ * 🛑 Deliberately NOT `ENTITLEMENT_UNKNOWN`: unknown fails open and would make the
+ * entitlement branch below unreachable, so the loop would still pass on a build
+ * where that branch is broken.
  */
-const SETTLED_ENTITLEMENT: OpenRouterEntitlementResolution = {
-  entries: OPENROUTER_ENTITLEMENT,
-  narrowed: false,
+const KNOWN_ENTITLEMENT: OpenRouterEntitlement = {
+  allowed: new Set(["z-ai/glm-5.3-flash", "deepseek/deepseek-v4.1-flash"]),
+  fetchedAt: "2026-09-29T00:00:00.000Z",
+  stale: false,
+  error: null,
 };
 
 test.afterEach(() => {
@@ -145,13 +151,13 @@ test("the OpenRouter band is locked per harness, exactly as the derivation says"
   // left for the next reader to reason from. The lock is, and always was,
   // derived per harness: today `none` harnesses (codex, claude-pty) are locked
   // and claude is not.
-  // ⚠️ THE ENTITLEMENT SET IS INJECTED, NOT READ FROM THIS BOX. `buildCatalogue`
-  // otherwise resolves it from `~/.acpx/providers.json`, which would make this row's
-  // answer depend on whether THIS box's key records an `entitlementSha` — an
-  // environment-dependent test here would read as a banding bug. The real module is
-  // passed, so the row still FOLLOWS the shipped policy rather than a fixture of it.
+  // ⚠️ THE ALLOWED SET IS INJECTED, NOT READ FROM THIS BOX (brick ecfb0461) —
+  // otherwise this row's answer would depend on whether this box has a warm
+  // entitlement cache, which is an environment-dependent test that reads as a
+  // banding bug. The loop below asks the SAME predicate production asks, of the
+  // SAME set, so it still FOLLOWS the rule rather than pinning today's answer.
   const catalogue = buildCatalogue(fixture().models, META, {
-    entitlement: SETTLED_ENTITLEMENT,
+    entitlement: KNOWN_ENTITLEMENT,
   });
   const capabilities = new Map(readHarnessCapabilities().map((row) => [row.id, row]));
 
@@ -202,7 +208,7 @@ test("the OpenRouter band is locked per harness, exactly as the derivation says"
       // that cannot reach OpenRouter at all (codex) the answer stays
       // `agent-fixed-backend` — the more informative one. Move this branch above and
       // this row reds on codex while the product is right.
-      if (!isEntitledOpenRouterModelId(model.id, OPENROUTER_ENTITLEMENT)) {
+      if (!isEntitledOpenRouterModelId(model.id, KNOWN_ENTITLEMENT)) {
         assert.equal(availability.ok, false, `${model.key}/${id}`);
         assert.equal(availability.reason, OPENROUTER_NOT_ENTITLED_REASON, `${model.key}/${id}`);
         continue;

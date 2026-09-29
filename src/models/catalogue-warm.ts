@@ -39,6 +39,7 @@ import { realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { CATALOGUE_TTL_MS, defaultCatalogueCachePath } from "./openrouter-catalogue.js";
+import { defaultEntitlementCachePath, ENTITLEMENT_TTL_MS } from "./openrouter-entitlement.js";
 
 /**
  * How long a warm attempt suppresses the next one. Without it, N concurrent
@@ -55,6 +56,8 @@ export interface WarmDeps {
   spawn?: (command: string, args: string[], options: object) => ChildProcess;
   now?: () => number;
   cachePath?: string;
+  /** The key's allowed-model set (brick ecfb0461) — the second cache the warm fills. */
+  entitlementCachePath?: string;
   argv?: readonly string[];
   env?: NodeJS.ProcessEnv;
 }
@@ -71,8 +74,27 @@ function sentinelPathFor(cachePath: string): string {
  * mtime, for the same one-clock reason `warmedRecently` explains below.
  */
 export function catalogueNeedsWarm(deps: WarmDeps = {}): boolean {
-  const cachePath = deps.cachePath ?? defaultCatalogueCachePath();
   const now = (deps.now ?? Date.now)();
+  // ⚠️ TWO CACHES, EITHER ONE STALE IS ENOUGH (brick ecfb0461). The refresh child
+  // is a single `acpx models --refresh`, which rewrites both — so asking only
+  // about the catalogue would leave the ONE state that most needs warming
+  // unwarmed: a fresh catalogue beside a cold allowed-model set, which is exactly
+  // what a box looks like the first time this ships. The entitlement cache then
+  // never fills, `assertModelPolicy` fails open forever, and nothing anywhere
+  // reports a problem — the silent no-op this module was written to end, in a new
+  // costume.
+  return (
+    cacheOlderThan(deps.cachePath ?? defaultCatalogueCachePath(deps.env), CATALOGUE_TTL_MS, now) ||
+    cacheOlderThan(
+      deps.entitlementCachePath ?? defaultEntitlementCachePath(deps.env),
+      ENTITLEMENT_TTL_MS,
+      now,
+    )
+  );
+}
+
+/** Missing, unparseable, undated or past its TTL — all "worth refreshing". */
+function cacheOlderThan(cachePath: string, ttlMs: number, now: number): boolean {
   let raw: string;
   try {
     raw = fs.readFileSync(cachePath, "utf8");
@@ -85,7 +107,7 @@ export function catalogueNeedsWarm(deps: WarmDeps = {}): boolean {
     if (!Number.isFinite(fetchedAt)) {
       return true;
     }
-    return now - fetchedAt > CATALOGUE_TTL_MS;
+    return now - fetchedAt > ttlMs;
   } catch {
     return true; // unparseable is as good as absent
   }

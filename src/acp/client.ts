@@ -55,7 +55,7 @@ import {
 } from "../errors.js";
 import { FileSystemHandlers } from "../filesystem.js";
 import { assertModelPolicy } from "../models/claude-family.js";
-import { formatOpenRouterEntitlementSkew } from "../models/openrouter-entitlement.js";
+import { formatEntitlementUnknown } from "../models/openrouter-entitlement.js";
 import {
   classifyPermissionDecision,
   decisionToResponse,
@@ -1207,18 +1207,20 @@ export class AcpClient {
     // `reinjectRunningShim` short-circuit is BELOW this line, so a cold respawn
     // whose shim survived is still refused here.
 
-    // ⚠️ THE SKEW LINE FOLLOWS THE SAME NON-DEDUP RULE AS THE CONFLICT WARNING
+    // ⚠️ THE FAIL-OPEN NOTE FOLLOWS THE SAME NON-DEDUP RULE AS THE CONFLICT WARNING
     // BELOW, AND FOR THE SAME REASON: per spawn, every spawn. A once-per-process
     // line is indistinguishable from a check that stopped running, and the reader
     // who needs it is looking at THIS spawn's stderr, not at the first spawn of a
-    // long-lived queue owner. `unrecorded` is a NOTE (the expected pre-cutover
-    // state, no narrowing); `mismatch` is a WARNING (the two enforcement layers are
-    // out of step and acpx has narrowed to the green list).
+    // long-lived queue owner.
+    //
+    // ⚠️ It is a NOTE, not a warning: under one authority (brick ecfb0461) the key
+    // still enforces its own allowed set, so acpx not being able to read that set
+    // costs a clean local refusal and nothing else. Calling it a warning would
+    // invite an operator to treat a cold cache as an incident.
     assertModelPolicy(this.options.agentCommand, this.options.sessionOptions?.model, {
       profileId: this.options.sessionOptions?.profile,
-      onEntitlementSkew: (skew) => {
-        const label = skew.kind === "mismatch" ? "warning" : "note";
-        process.stderr.write(`[acpx] ${label}: ${formatOpenRouterEntitlementSkew(skew)}\n`);
+      onEntitlementUnknown: (entitlement) => {
+        process.stderr.write(`[acpx] note: ${formatEntitlementUnknown(entitlement)}\n`);
       },
     });
     // Box-scoped provider credentials (~/.acpx/providers.json) — adapter-agnostic,
