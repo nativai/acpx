@@ -123,7 +123,7 @@ export { SEAT_STORE_FILE };
  *
  * - **There is no `state` field, and that is not an omission.** The seat's state IS
  *   its current holder's state; `activeHolderId === null` is the whole vacancy rule.
- *   `closedAt` is a different fact (the office abolished) and does not reintroduce
+ *   `closedAt` is a different fact (the seat abolished) and does not reintroduce
  *   one.
  * - **There is no divergence counter.** A per-seat `mirror_divergences` field was
  *   ruled in and then WITHDRAWN on 2026-09-28T13:30Z — an eighth field for a
@@ -144,7 +144,7 @@ export type SeatRecord = {
    * LEGAL, repeats are DEFECTS (D4a): the guarantee is that a number is never
    * re-issued, not that none is ever skipped. */
   nextOrdinal: number;
-  /** A deliberate SEAT closure — the office abolished. `null` when open. Distinct
+  /** A deliberate SEAT closure — the seat abolished. `null` when open. Distinct
    * from a holder's `closed`, and distinct from vacancy. */
   closedAt: string | null;
   name: string | undefined;
