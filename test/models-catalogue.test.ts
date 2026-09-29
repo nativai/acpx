@@ -20,6 +20,7 @@ import {
   loadOpenRouterCatalogue,
 } from "../src/models/openrouter-catalogue.js";
 import type { OpenRouterRawModel, OpenRouterSnapshot } from "../src/models/openrouter-catalogue.js";
+import { entitleAll } from "./entitlement-test-helpers.js";
 
 // A REAL catalogue, recorded 2026-09-04T00:10:56Z. The counts asserted against
 // it are exact on purpose: when the live roster drifts, the live test below
@@ -328,14 +329,18 @@ test("availability: with a table it is a JOIN of selectability and the agent's c
       depthFusedIntoId: true,
     },
   ];
-  const catalogue = buildCatalogue(
-    [
-      { id: "a/x", supported_parameters: ["tools"] },
-      { id: "a/y:batch", supported_parameters: ["tools"] },
-    ],
-    META,
-    { capabilities },
-  );
+  // `entitleAll` holds the entitlement dimension constant: this row's subject is the
+  // JOIN of selectability and capability, and `a/x` is a synthetic id that the real
+  // entitlement set would (correctly) mark unavailable — for a reason that has
+  // nothing to do with what is being asserted here. See `entitlement-test-helpers`.
+  const rows: OpenRouterRawModel[] = [
+    { id: "a/x", supported_parameters: ["tools"] },
+    { id: "a/y:batch", supported_parameters: ["tools"] },
+  ];
+  const catalogue = buildCatalogue(rows, META, {
+    capabilities,
+    entitlement: entitleAll(rows),
+  });
 
   const open = catalogue.models.find((m) => m.id === "a/x");
   // An `ok` seat now also carries the WIRE ID — for a `bare` harness, the row's

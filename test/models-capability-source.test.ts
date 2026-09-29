@@ -10,11 +10,16 @@ import {
 import { buildCatalogue } from "../src/models/catalogue.js";
 import {
   CLAUDE_FAMILY_OPENROUTER_REASON,
+  OPENROUTER_NOT_ENTITLED_REASON,
   refusesClaudeFamilyOnOpenRouter,
 } from "../src/models/claude-family.js";
 import { harnessNativeModels } from "../src/models/harness-models.js";
 import { isAvailableForAgent } from "../src/models/matcher.js";
 import type { OpenRouterSnapshot } from "../src/models/openrouter-catalogue.js";
+import {
+  isEntitledOpenRouterModelId,
+  OPENROUTER_ENTITLEMENT,
+} from "../src/models/openrouter-entitlement.js";
 
 // Same fixture and resolution rule as models-catalogue.test.ts: from cwd, not
 // import.meta.dirname, because the suite runs the COMPILED tests out of
@@ -127,7 +132,14 @@ test("the OpenRouter band is locked per harness, exactly as the derivation says"
   // left for the next reader to reason from. The lock is, and always was,
   // derived per harness: today `none` harnesses (codex, claude-pty) are locked
   // and claude is not.
-  const catalogue = buildCatalogue(fixture().models, META);
+  // ⚠️ THE ENTITLEMENT SET IS INJECTED, NOT READ FROM THIS BOX. `buildCatalogue`
+  // otherwise resolves it from `~/.acpx/providers.json`, which would make this row's
+  // answer depend on whether THIS box's key records an `entitlementSha` — an
+  // environment-dependent test here would read as a banding bug. The real module is
+  // passed, so the row still FOLLOWS the shipped policy rather than a fixture of it.
+  const catalogue = buildCatalogue(fixture().models, META, {
+    entitlement: OPENROUTER_ENTITLEMENT,
+  });
   const capabilities = new Map(readHarnessCapabilities().map((row) => [row.id, row]));
 
   for (const model of catalogue.models.filter((row) => row.source === "openrouter")) {
@@ -155,17 +167,34 @@ test("the OpenRouter band is locked per harness, exactly as the derivation says"
         continue;
       }
       const expected = capability?.acceptsArbitraryModelIds === true;
-      assert.equal(availability.ok, expected, `${model.key}/${id}`);
       if (!expected) {
         // The reason FOLLOWS the support kind, exactly as `ok` follows the
         // derivation — never a per-harness literal. `none` is a fixed backend;
         // every other kind means the harness can do it and acpx has not wired it.
+        assert.equal(availability.ok, false, `${model.key}/${id}`);
         assert.equal(
           availability.reason,
           capability?.arbitraryModelSupport === "none" ? "agent-fixed-backend" : "acpx-not-wired",
           `${model.key}/${id}`,
         );
+        continue;
       }
+      // ⚠️ ENTITLEMENT OUTRANKS THE SUPPORT DERIVATION TOO (brick daed4261) — the
+      // same shape as the Claude-family branch above, one policy layer wider: the
+      // box key is billed at metered pricing, so the choosable set is enumerated and
+      // the band is narrower than "this harness accepts arbitrary ids" predicts.
+      //
+      // 🛑 IT IS SITED *AFTER* THE SUPPORT CHECK, NOT BEFORE, BECAUSE PRODUCTION IS:
+      // `availabilityFor` asks `acceptsArbitraryModelIds` first, so for a harness
+      // that cannot reach OpenRouter at all (codex) the answer stays
+      // `agent-fixed-backend` — the more informative one. Move this branch above and
+      // this row reds on codex while the product is right.
+      if (!isEntitledOpenRouterModelId(model.id, OPENROUTER_ENTITLEMENT)) {
+        assert.equal(availability.ok, false, `${model.key}/${id}`);
+        assert.equal(availability.reason, OPENROUTER_NOT_ENTITLED_REASON, `${model.key}/${id}`);
+        continue;
+      }
+      assert.equal(availability.ok, true, `${model.key}/${id}`);
     }
   }
 });
