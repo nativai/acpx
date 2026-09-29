@@ -1,5 +1,6 @@
 import type { Command } from "commander";
 import {
+  SEAT_STORE_FILE,
   SEAT_STORE_NO_CHANGE,
   SeatStoreUnwritableError,
   MalformedSeatRowError,
@@ -232,13 +233,45 @@ function requireSeatRow(store: SeatStore, seatId: string): SeatRecord {
   return row;
 }
 
+/**
+ * The refusal for a seat whose OWN row is present and unreadable.
+ *
+ * 🛑 IT NAMES THE REMEDY, NOT JUST THE CONDITION — the standard
+ * `seatStoreUnhealthyMessage` sets, and the reason F1 exists: a refusal that states a
+ * condition and leaves the operator to guess is one step from a refusal that
+ * prescribes the wrong repair. It also says that only THESE rows are corrupt, so
+ * nobody goes off to audit a file whose other rows are fine.
+ *
+ * ⚠️ DELIBERATELY SHARES NO MARKER WITH `seatRowMissingMessage`. That message's
+ * remedy is `RUN THE SEAT BACKFILL`; this one's is `QUARANTINE a copy`, and the
+ * backfill is explicitly NOT the fix here — it refuses to run against a corrupt store
+ * and cannot repair a row. Two refusals about "the row is not usable" that shared a
+ * substring would be green whichever fired, which is B2's AP13 defect.
+ */
+function seatRowsMalformedMessage(seatIds: readonly string[]): string {
+  const subject = seatIds.map((seatId) => JSON.stringify(seatId)).join(", ");
+  return (
+    `seat ${subject} is PRESENT in ${SEAT_STORE_FILE} and its row is MALFORMED, so this ` +
+    `delete REFUSES it instead of removing it: the store's one writer re-emits unreadable ` +
+    `rows verbatim as a data-loss defence, and such a row may still be hand-recoverable. ` +
+    `Only the named row is corrupt — every other row in the file read fine, so there is no ` +
+    `need to audit the whole store. Repair: QUARANTINE a copy of ${SEAT_STORE_FILE} ` +
+    `(${SEAT_STORE_FILE}.corrupt-<timestamp>, and KEEP it), hand-repair or hand-remove the ` +
+    `named row, then run the seat backfill for anything left without a row. Do not delete ` +
+    `the store to clear this.`
+  );
+}
+
 /** The errors a seat mutation may legitimately refuse with, normalised to one shape. */
 function asSeatRefusal(error: unknown): SeatMutationRefusalError | undefined {
   if (error instanceof SeatMutationRefusalError) {
     return error;
   }
   if (error instanceof MalformedSeatRowError) {
-    return new SeatMutationRefusalError("SEAT_ROW_MALFORMED", error.message);
+    return new SeatMutationRefusalError(
+      "SEAT_ROW_MALFORMED",
+      seatRowsMalformedMessage([error.seatId]),
+    );
   }
   if (error instanceof SeatStoreUnwritableError) {
     return new SeatMutationRefusalError("SEAT_STORE_UNWRITABLE", error.message);
@@ -362,10 +395,17 @@ async function handleSeatsRename(
       return;
     }
     process.stdout.write(`seat ${seatId}: name = ${JSON.stringify(name)}\n`);
-    // ⚠️ PRINTED EVERY TIME, DELIBERATELY. The seat is the authority for the name and
-    // no reader reads it yet, so this rename is invisible in every surface an operator
-    // is looking at while they run it. Saying so beats having them conclude the verb
-    // is broken. Delete this line when B7b lands — not before.
+    // ⚠️ PRINTED EVERY TIME, DELIBERATELY, AND ON THE TEXT PATH ONLY — a scripted
+    // caller's `--format json` payload must never gain a prose line, which
+    // `test/seats-mutation-verbs.test.ts` row RN11 asserts. The seat is the authority
+    // for the name and no reader reads it yet, so this rename is invisible in every
+    // surface an operator is looking at while they run it; saying so beats having them
+    // conclude the verb is broken.
+    //
+    // 🛑 EXPIRY CONDITION — DELETE THIS NOTICE WHEN **B7b (brick 693ed2a9)** MAKES
+    // READERS READ THE SEAT, and not before. It is stated here rather than in a
+    // document so whoever next edits this function meets it; B7b's brief carries
+    // "delete the rename notice" as an explicit deliverable.
     process.stdout.write(
       `note: the seat is the authority for its name, and until readers read the seat ` +
         `(B7b) the rail, board, chat header and Fleet still label a session from its own ` +
@@ -376,7 +416,22 @@ async function handleSeatsRename(
 
 // ─── delete ──────────────────────────────────────────────────────────────────
 
-export type SeatDeleteOutcome = { deleted: string[]; absent: string[] };
+/**
+ * A PER-ID REPORT, because this verb's outcome is not one verdict.
+ *
+ * 🛑 A CORRUPT ROW MUST NOT VETO UNRELATED WORK (sub-HoD ruling, 2026-09-29). The
+ * caller is a synchronous 5-minute sweep over a changing population: refusing the
+ * whole batch because one id's row is unreadable would wedge every other seat the
+ * sweep found, forever, on a condition only a human can clear. So the good ids are
+ * deleted and WRITTEN, the absent ones are no-op'd, the malformed ones are refused and
+ * NAMED — and the exit code is non-zero so nothing reads a partial run as a clean one.
+ *
+ * ⚠️ WHY A NON-ZERO RC IS SAFE HERE, stated because "partial success at rc 1" is
+ * normally an ambiguous shape: a caller that ignores the report and simply retries the
+ * whole batch is CORRECT, because delete is idempotent — the already-deleted ids come
+ * back as `absent` no-ops. Retrying costs a rewrite and changes nothing else.
+ */
+export type SeatDeleteOutcome = { deleted: string[]; absent: string[]; malformed: string[] };
 
 /**
  * Remove N rows in ONE hold.
@@ -403,12 +458,26 @@ export function buildSeatDeletion(
   outcome: SeatDeleteOutcome;
 } {
   const seats = new Map(store.seats);
-  const outcome: SeatDeleteOutcome = { deleted: [], absent: [] };
+  const outcome: SeatDeleteOutcome = { deleted: [], absent: [], malformed: [] };
   for (const seatId of seatIds) {
-    // Throws for a row that is present and unreadable: `delete` refuses rather than
-    // dropping it, because the helper carries unparsed rows across a write by design
-    // and a row nobody can read may still be hand-recoverable.
-    const row = seatFromStore(store, seatId);
+    // `seatFromStore` stays the ONE place the three states are discriminated —
+    // absent / malformed / present never share a value, and re-deriving that here
+    // from `store.malformedSeatIds` would be a second copy of the rule. The catch is
+    // narrow and per id, which is what makes the partial report possible.
+    let row: SeatRecord | undefined;
+    try {
+      row = seatFromStore(store, seatId);
+    } catch (error) {
+      if (!(error instanceof MalformedSeatRowError)) {
+        throw error;
+      }
+      // NOT deleted, and NOT reported as absent. The helper re-emits unreadable rows
+      // verbatim on the way out, so this row survives the write either way — the
+      // report exists so the caller is told rather than left to infer it from a
+      // count that does not add up.
+      outcome.malformed.push(seatId);
+      continue;
+    }
     if (!row) {
       outcome.absent.push(seatId);
       continue;
@@ -448,12 +517,32 @@ async function handleSeatsDelete(
 }
 
 function renderSeatDelete(format: OutputFormat, outcome: SeatDeleteOutcome): void {
+  const refused = outcome.malformed.length > 0;
+  const message = refused ? seatRowsMalformedMessage(outcome.malformed) : undefined;
+  renderSeatDeleteReport(format, outcome, message);
+  if (refused) {
+    // The rc is the only signal a caller that reads nothing else will see, and a
+    // partial run must never read as a clean one.
+    process.exitCode = 1;
+  }
+}
+
+function renderSeatDeleteReport(
+  format: OutputFormat,
+  outcome: SeatDeleteOutcome,
+  message: string | undefined,
+): void {
   if (
     emitJsonResult(format, {
-      ok: true,
+      // ONE object carrying the WHOLE per-id report, refusal included. A caller must
+      // not have to correlate an `ok:false` envelope with a separate success payload
+      // to learn which ids were actually deleted.
+      ok: message === undefined,
       action: "seats_deleted",
+      ...(message === undefined ? {} : { code: "SEAT_ROW_MALFORMED", error: message }),
       deleted: outcome.deleted,
       absent: outcome.absent,
+      malformed: outcome.malformed,
       storeWritten: outcome.deleted.length > 0,
     })
   ) {
@@ -471,6 +560,9 @@ function renderSeatDelete(format: OutputFormat, outcome: SeatDeleteOutcome): voi
     // missing row is its steady state, while a targeted `set-brick`/`rename` against a
     // missing row means the caller is wrong.
     process.stdout.write(`seat ${seatId}: no row — nothing to delete\n`);
+  }
+  if (message !== undefined) {
+    process.stderr.write(`seats delete: SEAT_ROW_MALFORMED: ${message}\n`);
   }
 }
 
@@ -551,6 +643,12 @@ DELETE IS NOT CLOSE. This REMOVES the row; closing a seat KEEPS the row and stam
 A SEAT WITH NO ROW IS A NO-OP, NOT A REFUSAL (exit 0). The caller is a periodic
   sweep over a changing population; a missing row is its steady state. Nothing is
   written in that case — an absent store is not created.
+
+A SEAT WHOSE OWN ROW IS MALFORMED IS REFUSED, AND ONLY THAT SEAT. The good ids in
+  the same invocation are still deleted and written; the malformed ones are named
+  with their repair, and the exit code is 1 so a partial run never reads as clean.
+  Retrying the whole batch is safe — delete is idempotent.
+
 
 VARIADIC ON PURPOSE. The sweep is a synchronous batch loop, so one invocation per
   swept seat would fork a process per row and multiply lock contention against a

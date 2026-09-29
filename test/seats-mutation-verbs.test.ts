@@ -49,6 +49,36 @@ import { withTempHome as withTempHomeFixture } from "./runtime-test-helpers.js";
  * is a coupling to a specific guard, the row instead asserts on a substring and a
  * refusal CODE that only that guard produces, which is the same evidence by a
  * different route.
+ *
+ * ## 🛑 PRECONDITION AUDIT — WHICH STATES THE PRODUCT ENTERS, AND WHICH A FIXTURE DOES
+ *
+ * Every assertion here names the state it claims to observe, and this is where that
+ * state is shown to have been ENTERED. A fixture-entered precondition is honest when
+ * the reason is structural and stated; it is a defect when a fixture quietly stands in
+ * for a product path that exists. The audit, row by class:
+ *
+ * - **A well-formed seat row + its holder** — PRODUCT-ENTERED. `RN2′` mints both with
+ *   a real `sessions new`, drives `seats rename` against them, and asserts on the
+ *   files the product wrote. The other rows use a fixture row of the SAME SHAPE
+ *   `mintSeatRow` writes, for control over `name` / `brick_id` / neighbouring rows —
+ *   anchored to the real path by RN2′ rather than standing in for it.
+ * - **`active_holder_id: null` (a vacant seat)** — FIXTURE-ENTERED, structurally. No
+ *   product path at `d50e5bf` clears that field; see `RN8`, which states it in full.
+ * - **A malformed ROW, and a malformed STORE FILE** — FIXTURE-ENTERED, structurally.
+ *   Nothing in the product writes an unparseable row or an unparseable file:
+ *   corruption is an external event (a torn disk, a hand edit), which is precisely why
+ *   the store carries `fileState` and `unparsedRows` at all. `SB5`, `RN9`, `D7`,
+ *   `D8r`, `D9r`.
+ * - **A seat row and a holder record disagreeing about `name`** — PRODUCT-ENTERED, and
+ *   by this very block: under ruling A one `seats rename` produces it. `RN5` writes the
+ *   disagreement as a fixture only so the verb meets a PRE-EXISTING one rather than the
+ *   one it just created — the same reason the activation protocol reads its divergence
+ *   before it writes.
+ * - **`closed_at` non-null** — NOT ENTERED ANYWHERE IN THIS FILE, deliberately. Nothing
+ *   in the product can write a closure until B2c, which is exactly why B2b ships no
+ *   closed-seat refusal: such a refusal would have a structurally unreachable refused
+ *   state. `D4`'s control arm constructs a stamped row as an in-test VALUE, never as a
+ *   store fixture, and asserts only that the checker can see one.
  */
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
@@ -620,6 +650,20 @@ test("RN6/RN7′ · rename's two refusals are distinguishable, and neither write
 });
 
 test("RN8 · a VACANT seat (active_holder_id null) is renamed anyway — there is no holder to project onto", async () => {
+  // 🛑 PRECONDITION IS **FIXTURE-ENTERED, AND HERE IS WHY** — PLAN.md's RN8 says this
+  // state is reachable "by minting a row and retiring its holder", and that is WRONG:
+  // corrected by the sub-HoD on the L0's measurement at `d50e5bf`, **NO PRODUCT PATH
+  // PRODUCES `active_holder_id === null` at this commit**. There is no standalone
+  // retire verb (`seats retire` / `sessions retire` do not exist); `mintSeatRow` sets
+  // the founding holder and `activate` sets the successor, so the field is never
+  // cleared by anything that ships.
+  //
+  // The row still earns its place: vacancy is a DOCUMENTED first-class state —
+  // `seat-store.ts` calls `null` "nobody home — a first-class, non-error state, not an
+  // absence to be repaired", and `resolvePredecessorOrRefuse` branches on it — so
+  // `rename` must handle it. The parse leg accepts an explicit `null` by design, which
+  // is what lets the fixture enter the state honestly. The CLI still drives the rename
+  // itself, so AC16's standard holds for the ACT; only the PRECONDITION is fixture-written.
   await withRig(async (homeDir) => {
     await writeStore(homeDir, {
       [SEAT_A]: seatRow(SEAT_A, { active_holder_id: null, name: "alpha" }),
@@ -655,6 +699,39 @@ test("RN9 · a malformed store refuses at the write seam, with the unfaulted con
     assert.equal(refusal.code, "SEAT_STORE_UNWRITABLE");
     assert.match(refusal.error, /refusing to write the seat store at/);
     assert.equal(await readStoreBytes(homeDir), bytes);
+  });
+});
+
+test("RN11 · the B7b note is TEXT-ONLY — a scripted caller's json payload carries no prose", async () => {
+  // Ruling A's accepted cost is surfaced in the product rather than only in a
+  // document, which means a prose line is written on every text-format rename. A
+  // machine-readable payload must never gain it: `--format json` is parsed, and one
+  // stray line ahead of the object breaks every consumer at once.
+  await withRig(async (homeDir) => {
+    await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A) });
+
+    const text = await runCli(["seats", "rename", SEAT_A, "noted"], homeDir);
+    assert.equal(text.code, 0, text.output);
+    assert.match(
+      text.stdout,
+      /note: the seat is the authority for its name/,
+      "the text path MUST carry the note — it is the only place an operator meets the cost",
+    );
+
+    const json = await runCli(
+      ["--format", "json", "seats", "rename", SEAT_A, "quiet-note"],
+      homeDir,
+    );
+    assert.equal(json.code, 0, json.output);
+    assert.doesNotMatch(json.stdout, /note: the seat is the authority/);
+    // The strong form: the WHOLE of stdout must parse as one object. A prose line
+    // anywhere in it — before, after or between — makes this throw.
+    const parsed = JSON.parse(json.stdout.trim()) as { action: string };
+    assert.equal(parsed.action, "seat_renamed");
+
+    const quiet = await runCli(["--format", "quiet", "seats", "rename", SEAT_A, "silent"], homeDir);
+    assert.equal(quiet.code, 0, quiet.output);
+    assert.equal(quiet.stdout, "", "quiet is quiet");
   });
 });
 
@@ -854,25 +931,119 @@ test("D8r · a malformed STORE refuses at the write seam, with the unfaulted con
   });
 });
 
-test("D9r · deleting a seat whose OWN row is malformed is REFUSED, not silently dropped", async () => {
-  // ⚠️ NOT IN THE PLAN'S ROW LIST — raised by the implementation and reported
-  // upward. The store's discipline is "carried and visible, NEVER repaired", and
-  // `withSeatStoreWrite` re-emits unparsed rows unconditionally as a data-loss
-  // defence, so a delete of an unreadable row cannot remove it without reaching
-  // around the one writer. It refuses instead, with its own code, and the refusal
-  // says the row is present rather than absent (D8's whole point).
+test("D9r · a seat whose OWN row is malformed is REFUSED and NAMED — the plan did not cover this row", async () => {
+  // ⚠️ NOT IN PLAN.md's ROW LIST. Raised by the implementation, escalated, and
+  // ratified by the sub-HoD on 2026-09-29: the store's discipline is "carried and
+  // visible, NEVER repaired", and `withSeatStoreWrite` re-emits unparsed rows
+  // unconditionally as a data-loss defence — so an unreadable row cannot be removed
+  // without reaching around the one writer, which is forbidden. It refuses instead.
+  //
+  // F4 — THE REFUSED STATE IS ENTERED by writing a store whose TARGET row does not
+  // parse (`next_ordinal: 0`; the counter starts at 1, so the parse leg rejects it).
   await withRig(async (homeDir) => {
     const malformed = { seat_id: SEAT_A, created_at: "x", next_ordinal: 0 };
     await writeStore(homeDir, { [SEAT_A]: malformed, [SEAT_B]: seatRow(SEAT_B) });
-    const bytes = await readStoreBytes(homeDir);
 
-    const result = await runCli(["--format", "json", "seats", "delete", SEAT_A], homeDir);
+    // AP15 — THE PAIRED LEGITIMATE ARM, IN THE SAME STORE AND THE SAME RUN: a corrupt
+    // row must not veto unrelated work, so the healthy id is deleted and WRITTEN.
+    const result = await runCli(["--format", "json", "seats", "delete", SEAT_A, SEAT_B], homeDir);
+    assert.equal(result.code, 1, "a partial run must never read as a clean one");
+    const payload = JSON.parse(result.stdout.trim()) as {
+      ok: boolean;
+      code: string;
+      error: string;
+      deleted: string[];
+      absent: string[];
+      malformed: string[];
+      storeWritten: boolean;
+    };
+    assert.equal(payload.ok, false);
+    assert.equal(payload.code, "SEAT_ROW_MALFORMED");
+    assert.deepEqual(payload.deleted, [SEAT_B], "the healthy row IS deleted in the same run");
+    assert.deepEqual(payload.malformed, [SEAT_A]);
+    assert.deepEqual(payload.absent, []);
+    assert.equal(payload.storeWritten, true);
+
+    const after = await readStoreJson(homeDir);
+    assert.equal(after[SEAT_B], undefined, "the good deletion reached disk");
+    assert.deepEqual(after[SEAT_A], malformed, "the malformed row survives VERBATIM");
+
+    // THE REMEDY, not just the condition — the standard `seatStoreUnhealthyMessage`
+    // sets. A refusal that names a condition and stops is one step from a refusal
+    // that prescribes the wrong repair (F1).
+    assert.match(payload.error, /QUARANTINE a copy/);
+    assert.match(payload.error, /corrupt-<timestamp>/);
+    assert.match(payload.error, /Only the named row is corrupt/);
+    assert.match(payload.error, new RegExp(SEAT_A), "the refusal must name WHICH seat");
+  });
+});
+
+test("D9r · MALFORMED and MISSING are distinguishable in BOTH directions", async () => {
+  // 🔑 THE AP13 CONTROL FOR THIS PAIR. Two refusals that both mean "this row is not
+  // usable" are green whichever fired if their messages share a marker. Each is
+  // required to carry its own marker AND to lack the other's — checked both ways,
+  // because one direction alone cannot see a subsuming message.
+  await withRig(async (homeDir) => {
+    const malformed = { seat_id: SEAT_A, created_at: "x", next_ordinal: 0 };
+    await writeStore(homeDir, { [SEAT_A]: malformed });
+
+    const malformedRun = await runCli(["--format", "json", "seats", "delete", SEAT_A], homeDir);
+    const malformedError = (JSON.parse(malformedRun.stdout.trim()) as { error: string }).error;
+    // `set-brick` is used for the MISSING arm because `delete` treats an absent row as
+    // a no-op by design — the two verbs are where each condition is refusable.
+    const missingRun = await runCli(
+      ["--format", "json", "seats", "set-brick", SEAT_ABSENT, BRICK_ID],
+      homeDir,
+    );
+    const missingError = refusalOf(missingRun).error;
+
+    assert.match(malformedError, /its row is MALFORMED/);
+    assert.doesNotMatch(malformedError, /RUN THE SEAT BACKFILL/);
+    assert.match(missingError, /RUN THE SEAT BACKFILL/);
+    assert.doesNotMatch(missingError, /QUARANTINE/);
+    assert.doesNotMatch(
+      missingError,
+      /its row is MALFORMED/,
+      "F1: an absent row must never be described as a corrupt one, or vice versa",
+    );
+  });
+});
+
+test("D9r · the variadic mix — good deleted, absent no-op'd, malformed refused, in ONE invocation", async () => {
+  await withRig(async (homeDir) => {
+    const malformed = { seat_id: SEAT_C, created_at: "x", next_ordinal: 0 };
+    await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A), [SEAT_C]: malformed });
+
+    const result = await runCli(
+      ["--format", "json", "seats", "delete", SEAT_A, SEAT_C, SEAT_ABSENT],
+      homeDir,
+    );
     assert.equal(result.code, 1);
-    const refusal = refusalOf(result);
-    assert.equal(refusal.code, "SEAT_ROW_MALFORMED");
-    assert.match(refusal.error, /is PRESENT in the seat store but its row is malformed/);
-    assert.notEqual(refusal.code, "SEAT_ROW_MISSING");
-    assert.equal(await readStoreBytes(homeDir), bytes, "nothing is written by the refusal");
+    const payload = JSON.parse(result.stdout.trim()) as {
+      deleted: string[];
+      absent: string[];
+      malformed: string[];
+    };
+    assert.deepEqual(payload.deleted, [SEAT_A]);
+    assert.deepEqual(payload.malformed, [SEAT_C]);
+    assert.deepEqual(payload.absent, [SEAT_ABSENT]);
+
+    // IDEMPOTENT RETRY — the property that makes a non-zero rc safe on a partial run:
+    // a caller that ignores the report and re-runs the whole batch is correct.
+    const retry = await runCli(
+      ["--format", "json", "seats", "delete", SEAT_A, SEAT_C, SEAT_ABSENT],
+      homeDir,
+    );
+    const retried = JSON.parse(retry.stdout.trim()) as {
+      deleted: string[];
+      absent: string[];
+      malformed: string[];
+      storeWritten: boolean;
+    };
+    assert.deepEqual(retried.deleted, [], "the already-deleted id is now simply absent");
+    assert.deepEqual(retried.absent, [SEAT_A, SEAT_ABSENT]);
+    assert.deepEqual(retried.malformed, [SEAT_C], "the corrupt row still refuses, still named");
+    assert.equal(retried.storeWritten, false, "a retry that deletes nothing writes nothing");
   });
 });
 
