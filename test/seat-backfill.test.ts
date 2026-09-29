@@ -18,6 +18,7 @@ import {
   SEAT_STORE_FILE,
   SeatStoreUnwritableError,
 } from "../src/session/persistence/seat-store.js";
+import { SEAT_BACKFILL_NOTES } from "../src/session/seat-backfill.js";
 import type { SessionRecord } from "../src/types.js";
 import {
   makeSessionRecord as makeSessionRecordFixture,
@@ -72,6 +73,42 @@ const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 type CliResult = { code: number | null; stdout: string; stderr: string };
 
 /**
+ * Spawn the CLI and hand back the child, for a row that must interrupt it.
+ *
+ * ⚠️ NO EXPLICIT RETURN TYPE, DELIBERATELY. Annotating this `ReturnType<typeof spawn>`
+ * widens it to `ChildProcess`, whose `stdout`/`stderr` are `Readable | null` — and
+ * `pnpm run typecheck` DOES NOT CATCH THAT, because it is a different tsconfig from
+ * `build:test`. Measured: typecheck green, `build:test` red with TS18047, and
+ * `node --test` then ran happily against the emitted-anyway JS. The inferred
+ * `ChildProcessByStdio` from the literal `stdio` tuple is what makes the streams
+ * non-null at every call site.
+ */
+function spawnCli(args: string[], homeDir: string) {
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: homeDir, ACPX_STATE_HOME: homeDir };
+  for (const key of CHILD_ENV_SCRUB) {
+    delete env[key];
+  }
+  return spawn(process.execPath, [CLI_PATH, ...args], { env, stdio: ["pipe", "pipe", "pipe"] });
+}
+
+/**
+ * Ambient session context a child must not inherit — the same scrub list
+ * `seat-creation-paths.test.ts` and `session-reparent.test.ts` use. Without it a
+ * child can silently acquire the TEST RUNNER's own session as ambient context.
+ */
+const CHILD_ENV_SCRUB = [
+  "ACPX_SESSION_URL",
+  "ACPX_SESSION_NAME",
+  "ACPX_PARENT_SESSION_URL",
+  "ACPX_SEAT_URL",
+  "ACPX_PARENT_SEAT_URL",
+  "ACPX_TASK_FOLDER",
+  "ACPX_BRICK",
+  "ACPX_BRICK_PATH",
+  "ACPX_OWNER_LOG",
+] as const;
+
+/**
  * Drive the REAL compiled CLI against a rig home.
  *
  * Same scrub list as `seat-creation-paths.test.ts` / `session-reparent.test.ts`: a
@@ -82,24 +119,7 @@ type CliResult = { code: number | null; stdout: string; stderr: string };
  */
 function runCli(args: string[], homeDir: string): Promise<CliResult> {
   return new Promise((resolve) => {
-    const env: NodeJS.ProcessEnv = { ...process.env, HOME: homeDir, ACPX_STATE_HOME: homeDir };
-    for (const key of [
-      "ACPX_SESSION_URL",
-      "ACPX_SESSION_NAME",
-      "ACPX_PARENT_SESSION_URL",
-      "ACPX_SEAT_URL",
-      "ACPX_PARENT_SEAT_URL",
-      "ACPX_TASK_FOLDER",
-      "ACPX_BRICK",
-      "ACPX_BRICK_PATH",
-      "ACPX_OWNER_LOG",
-    ]) {
-      delete env[key];
-    }
-    const child = spawn(process.execPath, [CLI_PATH, ...args], {
-      env,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    const child = spawnCli(args, homeDir);
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8");
@@ -123,6 +143,7 @@ type BackfillJson = {
   backupSuffix?: string;
   backups: string[];
   staleIndexEntries: number;
+  notes: string[];
   sweep: { scanned: number; closed: string[]; notMeasured: boolean };
 };
 
@@ -974,5 +995,204 @@ test("R4: an UNREADABLE store is refused, and it is a DIFFERENT answer from abse
     } finally {
       await fs.chmod(storePath, 0o644);
     }
+  });
+});
+
+// ─── L17 — RESUMABILITY: the row the operator actually needs ─────────────────
+
+/**
+ * 🔑 THE REALISTIC FAILURE IS NOT A CRASH, IT IS AN IMPATIENT HUMAN.
+ *
+ * The apply takes MINUTES at box scale (measured: 144 s for 1,900 records, and a real
+ * box's index is ~3x this rig's), so "operator hits Ctrl-C at 90 s because it looks
+ * hung" is the likeliest thing that will ever happen to this verb — and until this
+ * row, NOTHING asserted that it is harmless.
+ *
+ * **The interruption is SIGKILL, not SIGINT, deliberately**: SIGKILL cannot be caught,
+ * so no cleanup handler of ours can make the result look better than it is. Whatever
+ * survives is what the filesystem was left holding.
+ *
+ * ⚠️ THE KILL IS TRIGGERED BY A CONDITION, NOT BY A TIMER. A sleep-then-kill on this
+ * box is a coin flip — load swings 2-4x within minutes, so a delay tuned once lands
+ * before the run starts or after it finishes, and an interruption that missed the run
+ * entirely passes this row while proving nothing. The poll below waits for the store
+ * to show STRICT partial progress and only then kills, and the row asserts that it
+ * really did catch the run mid-flight.
+ */
+async function seatRowCount(homeDir: string): Promise<number> {
+  try {
+    return Object.keys(await readRawStore(homeDir)).length;
+  } catch {
+    // Absent, or caught mid-rename. Not an error: the poll simply has not seen
+    // progress yet, and the atomic rename means this can never read a torn file.
+    return 0;
+  }
+}
+
+/** Every index entry that claims a seat its record does not carry. THE invariant an
+ * interruption must never break, at any point in the run. */
+async function entriesClaimingUnseatedRecords(homeDir: string): Promise<string[]> {
+  const entries = await readIndexEntries(homeDir);
+  const offenders: string[] = [];
+  for (const [file, entry] of entries) {
+    if (typeof entry.seatId !== "string") {
+      continue;
+    }
+    const raw = JSON.parse(
+      await fs.readFile(path.join(sessionsDir(homeDir), file), "utf8"),
+    ) as Record<string, unknown>;
+    if (typeof raw.seat_id !== "string") {
+      offenders.push(file);
+    }
+  }
+  return offenders;
+}
+
+test("L17: a KILLED --apply leaves a consistent store, and re-running completes the remainder", async () => {
+  await withTempHome(async (homeDir) => {
+    // Large enough that the run is many seconds wide, so the poll cannot miss the
+    // window; small enough to stay a test. The row asserts the catch rather than
+    // assuming it.
+    const total = 120;
+    const records = [];
+    for (let i = 0; i < total; i++) {
+      records.push(makeRecord({ acpxRecordId: `l17-${String(i).padStart(3, "0")}` }));
+    }
+    await seed(homeDir, records);
+
+    const child = spawnCli(["seats", "backfill", "--apply", "--format", "json"], homeDir);
+    child.stdin.end();
+    child.stdout.resume();
+    child.stderr.resume();
+
+    let caughtAt = 0;
+    const exited = new Promise<void>((resolve) => child.on("close", () => resolve()));
+    // The liveness test is the child's OWN state, not a flag a listener sets: the
+    // linter cannot see a closure write, and more to the point a flag can lag the
+    // process it describes. `exitCode`/`signalCode` are both null only while running.
+    for (let attempt = 0; attempt < 3000; attempt++) {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        break;
+      }
+      const seen = await seatRowCount(homeDir);
+      if (seen > 0 && seen < total) {
+        caughtAt = seen;
+        child.kill("SIGKILL");
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    await exited;
+
+    // 🛑 THE CONTROL, AND IT IS THE WHOLE ROW. Without it, a run that finished before
+    // the first poll would sail through every assertion below — the store would be
+    // complete, the re-run would report 0, and the row would be green having never
+    // interrupted anything.
+    assert.ok(
+      caughtAt > 0 && caughtAt < total,
+      `the run was never caught mid-flight (caught at ${caughtAt} of ${total}) — this row proved nothing`,
+    );
+
+    // ⚠️ THE ARITHMETIC USES THE POST-EXIT COUNT, NOT `caughtAt`, AND THAT IS A REAL
+    // FLAKE THIS ROW WOULD OTHERWISE CARRY. `kill()` only DELIVERS the signal; the
+    // child keeps running until the kernel stops it, so more rows can land between
+    // the poll that read `caughtAt` and the process actually dying. `caughtAt` is
+    // therefore sound ONLY as the mid-flight control above — an undercount cannot
+    // make `0 < caughtAt < total` wrongly true — and the count below is what the
+    // re-run's remainder has to be measured against.
+    const landedBeforeKill = await seatRowCount(homeDir);
+    assert.ok(
+      landedBeforeKill >= caughtAt && landedBeforeKill < total,
+      `expected a partial store after the kill, found ${landedBeforeKill} of ${total}`,
+    );
+
+    // (a) No file is half-written. Every artefact is temp-file + rename, so an
+    // interruption tears BETWEEN artefacts and never inside one.
+    const interrupted = await readSeatStore(sessionsDir(homeDir));
+    assert.equal(interrupted.fileState, "ok", "SIGKILL left a torn seats.json");
+    assert.deepEqual(interrupted.malformedSeatIds, []);
+    assert.notEqual(
+      (await readIndexEntries(homeDir)).size,
+      0,
+      "SIGKILL left an index that does not parse",
+    );
+
+    // (b) THE ORDERING INVARIANT HOLDS AT THE INTERRUPTION POINT — the same property
+    // L12 asserts under a fault, here under a real kill at an arbitrary instant.
+    assert.deepEqual(
+      await entriesClaimingUnseatedRecords(homeDir),
+      [],
+      "an interrupted run left an index entry claiming a seat its record lacks",
+    );
+
+    // (c) RE-RUNNING COMPLETES THE REMAINDER, and reports 0 for what was already done.
+    const resumed = await backfill(homeDir, ["--apply"]);
+    assert.equal(resumed.errors.length, 0, JSON.stringify(resumed.errors));
+    assert.equal(
+      resumed.seats,
+      total - landedBeforeKill,
+      "the re-run did not mint exactly the seats the killed run had not reached",
+    );
+
+    // (d) …and the store is COMPLETE and idempotent afterwards.
+    assert.equal((await readSeatStore(sessionsDir(homeDir))).seats.size, total);
+    const third = await backfill(homeDir, ["--apply", "--verify"]);
+    assert.equal(third.seats, 0);
+    assert.equal(third.indexEntries, 0);
+    assert.equal(third.staleIndexEntries, 0, "stale entries survived the resumed run");
+  });
+});
+
+// ─── L18 — the decisions the COUNTS cannot say, in the verb's own output ─────
+
+/**
+ * 🛑 AN ABSENCE CANNOT BE DISTINGUISHED FROM AN OVERSIGHT, which is why this row
+ * exists at all. `parent_seat_id` being unset is a RULED outcome, and it shows up in
+ * the store as *nothing happening* — indistinguishable, to an operator, from a bug.
+ * Same for "safe to re-run": an operator who is not told will hand-repair a store
+ * that only needed the command run again.
+ *
+ * The row asserts against `SEAT_BACKFILL_NOTES` itself rather than re-spelling the
+ * sentences: delete a line from the renderer and this goes RED; delete the constant
+ * and it stops compiling. A row carrying its own copy of the wording would pass while
+ * the operator saw nothing.
+ */
+test("L18: every run states the decisions the counts cannot — in text AND in json", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [makeRecord({ acpxRecordId: "l18" })]);
+
+    // A DRY RUN too, not only an apply: the operator's first command is the dry run,
+    // and that is where the decision most needs to be met.
+    const dryText = await runCli(["seats", "backfill"], homeDir);
+    assert.equal(dryText.code, 0, dryText.stderr);
+    for (const note of SEAT_BACKFILL_NOTES) {
+      assert.equal(dryText.stdout.includes(note), true, `dry-run text is missing: ${note}`);
+    }
+
+    const applied = await backfill(homeDir, ["--apply"]);
+    assert.deepEqual(
+      applied.notes,
+      [...SEAT_BACKFILL_NOTES],
+      "--format json dropped the notes — a json operator meets the gap instead of the decision",
+    );
+
+    // The two decisions, named, so a future reader of this row knows WHICH facts are
+    // load-bearing rather than only that "some notes" are printed.
+    const joined = SEAT_BACKFILL_NOTES.join(" ");
+    assert.match(joined, /parent_seat_id is deliberately NOT set/);
+    assert.match(joined, /safe to re-run if interrupted/);
+  });
+});
+
+test("L18b: `--help` carries both decisions too — the operator reading before running", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [makeRecord({ acpxRecordId: "l18b" })]);
+    const help = await runCli(["seats", "backfill", "--help"], homeDir);
+    const output = `${help.stdout}${help.stderr}`;
+    assert.match(output, /parent_seat_id IS DELIBERATELY NOT SET/);
+    assert.match(output, /SAFE TO RE-RUN IF YOU INTERRUPT IT/);
+    // The control: `--help` really did render, so the two matches above are not
+    // passing against some other output that happens to contain the words.
+    assert.match(output, /--apply/);
   });
 });

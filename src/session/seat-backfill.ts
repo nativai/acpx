@@ -118,7 +118,39 @@ export type SeatBackfillReport = {
   /** `--verify`: records carrying `seat_id` whose index entry lacks `seatId`. */
   staleIndexEntries: number;
   elapsedMs: number;
+  /** {@link SEAT_BACKFILL_NOTES} — carried on the report so `--format json` gets them
+   * too, and so the operator MEETS A DECISION rather than a gap. */
+  notes: readonly string[];
 };
+
+/**
+ * WHAT THE OPERATOR IS TOLD ABOUT THIS RUN THAT THE COUNTS CANNOT SAY.
+ *
+ * 🛑 **THESE ARE NOT DECORATION. An absence cannot be distinguished from an
+ * oversight**, so a decision that shows up as *nothing happening* has to be stated
+ * or it reads as a bug — by the operator, and by the next agent to touch this code.
+ * Both lines below are RULED outcomes, and both are invisible in the summary counts.
+ *
+ * Exported so the acceptance row asserts THE SAME STRING the renderer prints: delete
+ * a line from the renderer and the row goes red; delete the constant and the row
+ * stops compiling. A row that re-spelled the sentence would pass while the operator
+ * saw nothing.
+ */
+export const SEAT_BACKFILL_NOTES = [
+  // L17. The apply takes MINUTES at box scale, so the realistic operator failure is
+  // Ctrl-C at 90 s because it looks hung. Every artefact is written temp-file +
+  // rename, so an interruption tears BETWEEN files and never inside one — and the
+  // legs run record → index → row, so what an interruption leaves behind is always
+  // a record ahead of its index entry, never an entry claiming a seat that is not on
+  // its record. Saying so is what stops a nervous operator from "repairing" it.
+  "safe to re-run if interrupted: a killed run leaves no half-written file, and re-running completes the remainder and reports 0 for what is already done",
+  // L18. `parent_seat_id` is DELIBERATELY not set (ruled 2026-09-29). Both sides
+  // undefined AGREE, so B3's divergence healing sees no divergence and routing keys
+  // on `seatId` regardless. The deciding reason is asymmetry of repair: leaving it
+  // unset is recoverable by a later pass, while setting it WRONG across every record
+  // is not — and this is the one artefact in the design with no recovery path.
+  "parent_seat_id is deliberately NOT set by this verb (ruled): it is incompleteness, not a defect — setting it wrong across every record would be unrecoverable, leaving it unset is not",
+] as const;
 
 /** The index exists and does not satisfy `readSessionIndex`'s all-or-nothing
  * contract, so the backfill refuses rather than letting `reconcileSessionIndex`
@@ -611,6 +643,7 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
     recordsScanned: scanned.recordsScanned,
     recordsWithoutIndexEntry: scanned.recordsWithoutIndexEntry,
     staleIndexEntries: scanned.staleIndexEntries,
+    notes: SEAT_BACKFILL_NOTES,
   };
 
   if (!options.apply) {

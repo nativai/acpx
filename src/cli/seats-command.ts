@@ -72,6 +72,16 @@ function detailLines(report: SeatBackfillReport): string[] {
     lines.push(`  ✗ ${error.file} [${error.stage}] ${error.code ?? ""} ${error.message}`);
   }
   lines.push(`  elapsed:              ${report.elapsedMs} ms`);
+  // 🛑 THE NOTES ARE PRINTED ON EVERY RUN, DRY OR APPLIED, AND ARE NOT SUPPRESSIBLE.
+  // Each states a RULED outcome that the counts above cannot express, and an absence
+  // is indistinguishable from an oversight: an operator who is not told that
+  // `parent_seat_id` is deliberately unset meets a GAP and files a defect, and one
+  // who is not told the run is re-runnable "repairs" an interrupted store by hand.
+  // Printed verbatim from `SEAT_BACKFILL_NOTES`, which the acceptance row asserts
+  // against — so a line deleted here goes RED rather than quietly disappearing.
+  for (const note of report.notes) {
+    lines.push(`  · ${note}`);
+  }
   return lines;
 }
 
@@ -159,9 +169,19 @@ WHAT IT WRITES, PER RECORD, IN THIS ORDER — and the order is the point.
   An index entry therefore never claims a seat the record lacks — and a record whose
   write fails takes its own index and row legs with it, rather than half-landing.
 
-IDEMPOTENT. A second --apply reports 0 and leaves seats.json byte-identical. A dry
-run writes nothing at all. Records that already carry a seat, and index entries that
-already agree with their record, are left BYTE-IDENTICAL.
+IDEMPOTENT, AND SAFE TO RE-RUN IF YOU INTERRUPT IT. A second --apply reports 0 and
+leaves seats.json byte-identical. A dry run writes nothing at all. Records that
+already carry a seat, and index entries that already agree with their record, are
+left BYTE-IDENTICAL.
+  On a box-sized store this takes MINUTES — it is not hung. If you do kill it, every
+  file is written temp-file-plus-rename, so nothing is left half-written; re-run it
+  and it completes the remainder. Do not repair an interrupted store by hand.
+
+parent_seat_id IS DELIBERATELY NOT SET by this verb (ruled 2026-09-29). That is
+  incompleteness, not a defect: both sides undefined AGREE, so nothing diverges and
+  routing keys on seat_id regardless. Leaving it unset is recoverable by a later
+  pass; setting it WRONG across every record would not be, and seats.json is the one
+  artefact in the design that cannot be rebuilt from anything.
 
 ROLLBACK. --apply first copies the index, seats.json and every record it is about to
 touch aside as <file>.bak-mig-<TS>. Restoring those copies over the originals returns
