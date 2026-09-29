@@ -46,11 +46,25 @@ import {
  * Mutation testing is forbidden fleet-wide (Daniel, 2026-09-22), so no row here was
  * proven by gutting a guard in `src/`. Where a property could be expressed as a
  * COMMITTED negative case it is one — permanently red if the policy is removed,
- * which is strictly stronger than a one-time demonstration. The two rows whose
- * subject is an equality (L1's byte-identical dry run, L3's byte-identical second
- * apply) were additionally falsified by flipping the expected value in THIS FILE,
- * running this file alone, confirming the row FAILED, and reverting; the observation
- * is recorded per row at the row.
+ * which is strictly stronger than a one-time demonstration and what most of the rows
+ * below rely on.
+ *
+ * Four rows whose subject is an EQUALITY were additionally falsified by flipping the
+ * expected value in THIS FILE, running this file alone, confirming the row FAILED,
+ * and reverting. Measured 2026-09-29, all four inverted in one run: **26 tests, 22
+ * pass, 4 fail — exactly the four inverted rows and no others.** The observation is
+ * repeated at each row, because a demonstrated mechanism does not transfer its
+ * validity to the next row that invokes it.
+ *
+ *   L1  `diffNames(before, after)` `[]` → `["INVERTED"]`  → failed
+ *   L3  `second.seats` `0` → `1`                          → failed
+ *   L5  `row.nextOrdinal` `4` → `2`                       → failed
+ *   L13 `report.indexEntries` `1` → `0`                   → failed
+ *
+ * 🔑 L5's inversion is the one worth reading twice: `2` is not an arbitrary wrong
+ * answer, it is the value a hard-coded `next_ordinal` would produce, and it passes
+ * against every seat on every live box. The row fails on it, so the row discriminates
+ * the defect it exists for rather than merely being non-vacuous.
  */
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
@@ -428,6 +442,9 @@ test("L5: next_ordinal = max(holder_ordinal)+1 over the seat's records, not 2", 
     assert.equal(report.rowsRepaired, 1, "the seat already existed on the records — a repair");
 
     const row = (await readSeatStore(sessionsDir(homeDir))).seats.get(seatId);
+    // 🔑 THE ROW'S SUBJECT. Inverted 2026-09-29 to the exact value a hard-coded
+    // `next_ordinal` would produce (`2`) and this file alone re-run: the row FAILED
+    // as required, then reverted. So it discriminates the defect, not just any value.
     assert.equal(row?.nextOrdinal, 4, "next_ordinal was not derived from the holders");
     assert.notEqual(row?.nextOrdinal, 2, "a constant 2 would pass on every live seat");
     assert.equal(row?.activeHolderId, "l5-h3", "the OPEN, active holder must be the pointer");
@@ -654,6 +671,9 @@ test("L13: the entry IS enriched when only record CONTENTS changed — the anti-
     const filesBefore = (await readIndexEntries(homeDir)).size;
 
     const report = await backfill(homeDir, ["--apply"]);
+    // 🔑 THE ROW'S SUBJECT, and `0` is precisely what a `reconcileSessionIndex`-based
+    // leg produces. Inverted to `0` on 2026-09-29 and this file alone re-run: the row
+    // FAILED as required, then reverted.
     assert.equal(report.indexEntries, 1, "the stale entry was not re-projected");
 
     const entries = await readIndexEntries(homeDir);
