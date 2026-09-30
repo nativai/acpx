@@ -18,10 +18,15 @@ import { join } from "node:path";
  * produced on the workbench and read here, and an isolated `HOME`/rig for a
  * gate run.
  *
- * **Prefer tier 1.** `/tmp` self-cleans on pod restart, which is why it needs no
- * reaper at all; this tier lands on the PVC — the TIGHT filesystem (192 GB, 75%
- * used as measured 2026-09-30) — and is therefore SWEPT. Reach for it only when
- * the workbench must read the file, or it must outlive a pod restart.
+ * **Prefer tier 1, and the reason IS the cleanup asymmetry.** `/tmp` self-cleans
+ * on pod restart, which is why it needs no reaper at all. This tier has no such
+ * mechanism and no reaper either, so NOTHING EVER RECLAIMS IT — whatever you
+ * leave here stays until a human removes it, and it stays on the PVC, the box's
+ * tight filesystem (192 GB with 46 GB free at 75% used — measured 2026-09-30; a
+ * reading at a time, not a property of the volume). That is the whole trade:
+ * tier 1 forgives what you forget and tier 2 does not. Reach for this one only
+ * when the workbench must read the file, or it must outlive a pod restart — and
+ * see the next section, which states the same thing as a rule.
  *
  * ## ⚠️ TEMPORARY SEMANTICS ARE IN THE NAME — AND NOTHING ENFORCES THEM
  *
