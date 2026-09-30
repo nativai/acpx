@@ -1015,11 +1015,23 @@ function makeSubagentSpawningClient(sessionId: string, subagentId: string): AcpC
 }
 
 test("item 8 / path 3 · an UNWRITABLE store still leaves a usable shadow record, no row, and a diagnostic", async () => {
-  // 🔑 DETERMINISTIC BY INDUCING THE STATE, NOT BY SAMPLING FOR IT. The sampled path-3 row
-  // below can only observe the residual when contention happens to occur; this row FORCES
-  // the failure it cares about, so it can never red under load and it protects the
-  // MECHANISM regardless of the residual's rate. Same technique the test-engineer used to
+  // 🔑 DETERMINISTIC IN THE FAULT IT INJECTS, NOT IN GETTING THERE. This row forces the
+  // fault it cares about (a corrupt `seats.json`) rather than sampling for it, so steps 2-5
+  // below are deterministic GIVEN step 1 lands. Same technique the test-engineer used to
   // induce a corrupt store.
+  //
+  // 🛑 STEP 1 IS NOT IMMUNE TO LOAD — A PRIOR VERSION OF THIS COMMENT CLAIMED "it can never
+  // red under load"; THAT CLAIM IS FALSE AND WAS FALSIFIED BY OBSERVATION (brick 7c339fda,
+  // 2026-09-30). Step 1 (`assert.ok(childRef, …)` below) depends on the child shadow-record
+  // write landing, and that write contends with the parent turn's own writes on the SAME
+  // outbox SQLite DB as the sampled `G2/path 3` row further down in this file
+  // (`OutboxError: outbox-busy`, terminal, not retryable — see that row's comment for the
+  // full mechanism and measured rates). This row and `AP16 (REVERSED)` below share that
+  // identical step-1 precondition and both inherit the same residual; a production reorder
+  // already bounded G2's rate from k=1-in-6 to k=0-in-24 WITHOUT eliminating it — A BOUND IS
+  // NOT A FIX. The remaining repair (make the shared precondition a named fixture
+  // precondition, distinct from this row's own mechanism assertions) is tracked separately,
+  // not attempted here — see brick 6b1e0038 (successor of 7c339fda).
   //
   // The mint now runs AFTER the record write on path 3, so the fault that exercises item 8
   // here is a store the writer must REFUSE to touch — which is what a corrupt `seats.json`
