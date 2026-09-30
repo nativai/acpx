@@ -1014,6 +1014,60 @@ function makeSubagentSpawningClient(sessionId: string, subagentId: string): AcpC
   return mock as unknown as AcpClient;
 }
 
+/**
+ * 🛑 THE SHARED PRECONDITION OF ALL THREE PATH-3 ROWS, NAMED — so that a miss reads as
+ * "the child shadow-record write did not land" and NEVER as a defect in the row's own
+ * mechanism.
+ *
+ * All three path-3 rows (item 8, G2, AP16) must first observe the child shadow record
+ * appear in the parent's `subagents[]`. That step is NOT any row's own criterion: it is a
+ * write through the session outbox, and it is the step that has failed under contention.
+ * Left inline, its failure presented as "the unwritable store cost the record" (item 8),
+ * "the parent does not list the subagent" (G2) or "there is no ordering to observe"
+ * (AP16) — three different-looking reds with ONE cause. That misattribution has already
+ * consumed TWO investigations (B2c's merge agent; B2c's independent test-engineer, round
+ * two), which is why the precondition is separated from the criterion here.
+ *
+ * 🔑 The mechanism, established by reading at `ef794177` (brick 6b1e0038): the outbox holds
+ * its exclusive SQLite lock ACROSS an `await` (`brick-outbox.ts` `withAsyncMutation`), while
+ * the busy-retry waits with `Atomics.wait` — SYNCHRONOUSLY blocking the only thread. So a
+ * second in-process write that overlaps the first cannot merely lose a lock race: it blocks
+ * the very thread the holder needs to reach COMMIT, burns its whole 4 s budget and fails
+ * terminally. Two overlapping in-process outbox writes LIVELOCK; the historical "1-in-6"
+ * was the rate at which two writes OVERLAP, not the rate at which a lock fight was lost.
+ *
+ * 🛑 `outbox-busy` IS TERMINAL, NOT RETRYABLE — the name sounds transient and is not. A red
+ * here is fixed by ORDERING or LOCKING, never by a retry or a poll: the write has already
+ * exhausted its own 4 s budget by the time you see it.
+ *
+ * 🛑 DO NOT RE-RUN FOR GREEN. A wrong-value intermittent here fingerprints a REAL PRODUCT
+ * RACE, never a flake, and a green re-run is the most dangerous outcome available.
+ *
+ * 🔑 A red here is also NOT the historical row-first defect returning. Arm B (no mint at
+ * all) measured k=0 in N=18, so the intermittency was introduced by the row-first mint and
+ * removed with it; it was never a property of these rows. See bricks b64dfbb3, 6b1e0038.
+ */
+async function requirePath3ShadowRecord(
+  parentRecordId: string,
+  rowCriterion: string,
+): Promise<NonNullable<SessionRecord["subagents"]>[number]> {
+  const reloadedParent = await resolveSessionRecord(parentRecordId);
+  const childRef = reloadedParent.subagents?.[0];
+  assert.ok(
+    childRef,
+    "PATH-3 SHARED PRECONDITION FAILED — THE CHILD SHADOW-RECORD WRITE DID NOT LAND.\n" +
+      "This is NOT this row's own mechanism failing. The parent record carries no\n" +
+      `subagents[0], so the row never reached what it actually tests:\n` +
+      `    ${rowCriterion}\n` +
+      "🛑 Suspect OUTBOX CONTENTION first: two overlapping in-process record writes\n" +
+      "livelock on the one SQLite outbox DB and the loser fails `outbox-busy` after its\n" +
+      "full 4 s budget, so the child record is never written and the parent never lists it.\n" +
+      "Fix by ORDERING or LOCKING — never by a retry or a poll. See this helper's comment\n" +
+      "for the measured mechanism, and brick 6b1e0038.",
+  );
+  return childRef;
+}
+
 test("item 8 / path 3 · an UNWRITABLE store still leaves a usable shadow record, no row, and a diagnostic", async () => {
   // 🔑 DETERMINISTIC IN THE FAULT IT INJECTS, NOT IN GETTING THERE. This row forces the
   // fault it cares about (a corrupt `seats.json`) rather than sampling for it, so steps 2-5
@@ -1087,9 +1141,12 @@ test("item 8 / path 3 · an UNWRITABLE store still leaves a usable shadow record
     }
 
     // 1. THE SHADOW RECORD EXISTS — a store failure must not cost the subagent.
-    const reloadedParent = await resolveSessionRecord("parent-session");
-    const childRef = reloadedParent.subagents?.[0];
-    assert.ok(childRef, "an unwritable seat store cost the shadow record entirely");
+    //    Through the NAMED shared precondition, so an outbox-contention miss cannot be
+    //    misread as "the unwritable store cost the record" — which is this row's subject.
+    const childRef = await requirePath3ShadowRecord(
+      "parent-session",
+      "that an UNWRITABLE SEAT STORE still leaves a usable shadow record (item 8)",
+    );
     const childRecord = await resolveSessionRecord(childRef.acpxRecordId);
 
     // 2. IT KEEPS ITS seat_id — the handle B10 repairs by, and what keeps any descendants'
@@ -1202,33 +1259,13 @@ test("G2/path 3 · a teammate_spawned notification mints a shadow-record seat, r
     // reading the PARENT record's subagents[] back off disk, then read the
     // child record independently. Both reads are real disk reads, matching
     // G2's falsifying observation.
-    const reloadedParent = await resolveSessionRecord("parent-session");
-    const childRef = reloadedParent.subagents?.[0];
-    // 🛑 THE WARNING LIVES IN THE FAILURE MESSAGE, NOT ONLY IN A COMMENT. Whoever meets
-    // this red at 03:00 reads the failure output and nothing else; a comment is read only
-    // by whoever edits the file.
-    assert.ok(
-      childRef,
-      "parent record must list the spawned subagent.\n" +
-        "⚠️ PATH-3 OUTBOX RESIDUAL — this exact assertion was the known intermittent. The\n" +
-        "mint was moved to AFTER the record write (record first, then row, on path 3 only),\n" +
-        "which took it to k=0 in N=24 runs under controlled load, from a k=1-in-6 baseline.\n" +
-        "That BOUNDS the rate below ~1/6 at ~96% confidence — it does NOT prove it eliminated.\n" +
-        "🛑 DO NOT RE-RUN FOR GREEN. A wrong-value intermittent here fingerprints a REAL\n" +
-        "PRODUCT RACE, never a flake, and a green re-run is the most dangerous outcome\n" +
-        "available. Investigate: the signature is the mint succeeding (~27 ms) and\n" +
-        "writeSessionRecord(childRecord) then failing OutboxError: outbox-busy after its full\n" +
-        "4 s budget, so the child record is never written.\n" +
-        "🛑 AND `outbox-busy` IS TERMINAL, NOT RETRYABLE — the name sounds transient and it is\n" +
-        "not. Fix this by ORDERING or LOCKING, NEVER by adding a retry or a poll: the write has\n" +
-        "already exhausted its own 4 s retry budget by the time you see this, and the contention\n" +
-        "is the parent turn's writes against the child write on ONE SQLite DB, so waiting longer\n" +
-        "cannot rescue it.\n" +
-        "🔑 AND A RED HERE IS NOT THE HISTORICAL ROW-FIRST DEFECT RETURNING. Arm B (no mint at\n" +
-        "all — this row's pre-B2 state) measured k=0 in N=18, so the intermittency was\n" +
-        "introduced by the row-first mint and removed with it; it was never a property of this\n" +
-        "row. Treat a red as something NEW, or as the residual above its bound — not as a\n" +
-        "known issue to wave through. See brick b64dfbb3.",
+    // Through the NAMED shared precondition (`requirePath3ShadowRecord`), which carries the
+    // full outbox-contention warning. THE WARNING LIVES IN THE FAILURE MESSAGE, NOT ONLY IN
+    // A COMMENT: whoever meets this red at 03:00 reads the failure output and nothing else.
+    const childRef = await requirePath3ShadowRecord(
+      "parent-session",
+      "that a teammate_spawned notification MINTS A SHADOW-RECORD SEAT, read back from " +
+        "disk (G2/path 3 — the path a createSessionRecordWithClient-level fix misses)",
     );
 
     const childRecord = await resolveSessionRecord(childRef.acpxRecordId);
@@ -1356,9 +1393,13 @@ test("AP16 (REVERSED) · path 3 writes the RECORD before the ROW, observed in ca
       (fsSync as any).renameSync = originalRenameSync;
     }
 
-    const reloadedParent = await resolveSessionRecord("order-parent");
-    const childRef = reloadedParent.subagents?.[0];
-    assert.ok(childRef, "no shadow record was created, so there is no ordering to observe");
+    // Through the NAMED shared precondition, so an outbox-contention miss cannot be misread
+    // as "there is no ordering to observe" — which would point the reader at this row's own
+    // subject (the record-before-row ordering) rather than at the write that never landed.
+    const childRef = await requirePath3ShadowRecord(
+      "order-parent",
+      "that path 3 writes the RECORD BEFORE THE ROW, observed in call order (AP16 REVERSED)",
+    );
     const childId = childRef.acpxRecordId;
 
     const firstRecordWrite = sequence.findIndex((target) => target.includes(`${childId}.json`));
