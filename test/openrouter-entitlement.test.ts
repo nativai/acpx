@@ -15,6 +15,7 @@ import {
 } from "../src/models/claude-family.js";
 import type { OpenRouterSnapshot } from "../src/models/openrouter-catalogue.js";
 import {
+  describeCatalogueEntitlement,
   ENTITLEMENT_TTL_MS,
   ENTITLEMENT_UNKNOWN,
   entitlementModelSlugs,
@@ -86,6 +87,9 @@ import {
  *       → "policyReason reaches the SERIALIZED output"
  *   serve a stale set from the read path WITHOUT labelling it
  *       → "the Tier 3 annotation LABELS a stale set"
+ *   fail open on the READ path without SAYING SO (decision 2, half-implemented)
+ *       → "the READ path says so when the key's set is UNKNOWN" — and its healthy-path
+ *         negative, so a build that always warns cannot pass either
  */
 
 const FIXTURE_PATH = path.resolve(process.cwd(), "test/fixtures/openrouter-models-2026-09-04.json");
@@ -1217,6 +1221,88 @@ test("loadCatalogue FORWARDS the injected set to buildCatalogue", async () => {
   // bypassed and the row is measuring the box.
   assert.equal(catalogue.models.length, 2);
   fs.rmSync(cacheDir, { recursive: true, force: true });
+});
+
+test("the READ path says so when the key's set is UNKNOWN — and stays quiet when it is not", async () => {
+  // 🛑 THE HALF OF DECISION 2 THAT WAS NOT BUILT. "Unknown permits everything AND
+  // SAYS SO" was true at the spawn path (`formatEntitlementUnknown` on stderr) and
+  // FALSE on the read path — which is the surface an agent actually queries. Under
+  // fail-open every OpenRouter row reads available, so an unreadable key answer
+  // produces a catalogue byte-indistinguishable from a key that genuinely allows
+  // everything: `acpx models list` reported ~310 models as available, unhedged, on a
+  // cold / corrupt / 401'd read, and `/api/models` gave the picker no field to
+  // qualify it with.
+  const { renderModelsListForTesting } = await import("../src/cli/models-command.js");
+  const rows = [
+    { id: "z-ai/glm-5.3-flash", supported_parameters: ["tools"] },
+    { id: "zzz-vendor/not-allowed-5", supported_parameters: ["tools"] },
+  ];
+  const capabilities = [
+    {
+      id: "claude",
+      acceptsArbitraryModelIds: true,
+      arbitraryModelSupport: "via-shim" as const,
+      idForm: "source-prefixed" as const,
+      depthFusedIntoId: false,
+    },
+  ];
+  const build = (entitlement: OpenRouterEntitlement) =>
+    buildCatalogue(rows, META, { entitlement, nativeModels: [], capabilities });
+
+  // ── THE MACHINE-READABLE HALF. `source` is what a consumer branches on; the
+  // picker is a machine and must never parse prose.
+  const unknownCat = build({ ...ENTITLEMENT_UNKNOWN, error: "connect ETIMEDOUT" });
+  assert.equal(unknownCat.entitlement.source, "unknown");
+  assert.equal(unknownCat.entitlement.stale, false);
+  assert.match(unknownCat.entitlement.note ?? "", /could not read/);
+  assert.match(unknownCat.entitlement.note ?? "", /connect ETIMEDOUT/, "it must carry WHY");
+  // …and it must say the listing is NOT narrowed, which is the read-path fact.
+  assert.match(unknownCat.entitlement.note ?? "", /nothing here is narrowed/);
+
+  // 🛑 THE NEGATIVE, AND IT IS WHY THIS ROW CANNOT BE SATISFIED BY ALWAYS WARNING:
+  // a known, fresh set reports `key` and carries NO note at all.
+  const knownCat = build(known());
+  assert.equal(knownCat.entitlement.source, "key");
+  assert.equal(knownCat.entitlement.stale, false);
+  assert.equal(knownCat.entitlement.note, null);
+
+  // A stale-but-read set is a THIRD state, distinguishable from both.
+  const staleCat = build({ ...known(), stale: true, error: "guard set" });
+  assert.equal(staleCat.entitlement.source, "key", "stale is still the KEY's answer");
+  assert.equal(staleCat.entitlement.stale, true);
+  assert.match(staleCat.entitlement.note ?? "", /older than its TTL/);
+
+  // ── THE HUMAN HALF, on the rendered CLI output — the bytes `acpx models list`
+  // actually prints. Asserting only the field would leave the verb able to drop it.
+  const unknownOut = renderModelsListForTesting(unknownCat, { agent: "claude" });
+  assert.match(unknownOut, /KEY'S ALLOWED SET UNKNOWN/);
+  assert.match(unknownOut, /NOT narrowed to it/);
+  // The fail-open behaviour itself is UNCHANGED — both rows are still offered.
+  assert.match(unknownOut, /zzz-vendor\/not-allowed-5/, "unknown must not start refusing rows");
+
+  const knownOut = renderModelsListForTesting(knownCat, { agent: "claude" });
+  assert.equal(
+    knownOut.includes("KEY'S ALLOWED SET UNKNOWN"),
+    false,
+    "a healthy read must print NO caveat — a footer that always warns gets ignored",
+  );
+  assert.equal(knownOut.includes("allowed set STALE"), false);
+  // POSITIVE CONTROL on the renderer itself: it did produce a real listing, so the
+  // absence above is a quiet footer rather than an empty string.
+  assert.match(knownOut, /z-ai\/glm-5.3-flash/);
+
+  const staleOut = renderModelsListForTesting(staleCat, { agent: "claude" });
+  assert.match(staleOut, /allowed set STALE/);
+  assert.equal(staleOut.includes("KEY'S ALLOWED SET UNKNOWN"), false, "stale is not unknown");
+
+  // ── And the descriptor is a pure function of the entitlement, so the three states
+  // cannot drift between the field and the renderer.
+  assert.deepEqual(describeCatalogueEntitlement(known()), {
+    source: "key",
+    stale: false,
+    note: null,
+  });
+  assert.equal(describeCatalogueEntitlement(ENTITLEMENT_UNKNOWN).source, "unknown");
 });
 
 test("a cold entitlement cache triggers the warm even when the catalogue is fresh", () => {

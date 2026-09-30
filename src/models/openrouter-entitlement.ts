@@ -74,6 +74,7 @@ import {
   type BoxProviderEntry,
   type BoxProviderLookupOptions,
 } from "../config/providers.js";
+import type { CatalogueEntitlement } from "./types.js";
 
 /** The per-key endpoint. Answers to an ordinary key; no management credential. */
 export const OPENROUTER_MODELS_USER_URL = "https://openrouter.ai/api/v1/models/user";
@@ -595,18 +596,60 @@ export function entitlementModelSlugs(entitlement: OpenRouterEntitlement): strin
 
 /**
  * The one wording for "acpx could not establish what the key allows", so the spawn
- * path and any diagnostic cannot drift.
+ * path and the read path cannot drift.
  *
  * ⚠️ It says what acpx knows and what follows from it — never what the provider will
  * do. The key's own refusal is still in force; that is precisely why failing open
  * here is safe, and the note has to make that legible rather than alarming.
+ *
+ * ⚠️ **SURFACE-NEUTRAL ON PURPOSE.** It is consumed by the spawn guard (one stderr
+ * line per spawn) *and* by the catalogue descriptor {@link describeCatalogueEntitlement},
+ * which puts it on `acpx models` and `/api/models`. An earlier wording said *"not
+ * checking your model choice"* — true at a spawn, wrong on a listing, where the fact
+ * is that **nothing has been narrowed**. One string for two surfaces only works if it
+ * names the consequence rather than one caller's moment.
  */
 export function formatEntitlementUnknown(entitlement: OpenRouterEntitlement): string {
   const because = entitlement.error === null ? "" : ` (${entitlement.error})`;
   return (
-    `acpx could not read which models this box's OpenRouter key allows${because}, so it is not ` +
-    `checking your model choice against that set. The key itself still enforces it: a model it ` +
-    `does not allow will be refused by OpenRouter at call time instead of here. Run ` +
-    `\`acpx models --refresh\` to repopulate the set.`
+    `acpx could not read which models this box's OpenRouter key allows${because}, so nothing here ` +
+    `is narrowed to that set. The key itself still enforces it: a model it does not allow will be ` +
+    `refused by OpenRouter at call time instead of here. Run \`acpx models --refresh\` to ` +
+    `repopulate the set.`
   );
+}
+
+/**
+ * The catalogue's own statement of how well it knows the key's set — the READ-PATH
+ * half of decision 2's *"permits everything **and says so**"*.
+ *
+ * 🛑 **THE SPAWN PATH SAID SO AND THE READ PATH DID NOT, WHICH MADE THE STATED DESIGN
+ * HALF-TRUE IN THE DIRECTION THAT MATTERS.** Under fail-open an unreadable answer
+ * leaves every OpenRouter row `ok: true` — a catalogue **byte-indistinguishable** from
+ * a box whose key genuinely allows everything. So `acpx models list` answered
+ * *"what may I use?"* with ~310 models, unhedged, on a cold / corrupt / 401'd read,
+ * and `/api/models` gave the picker no field to qualify it with. Daniel's ask was
+ * *"an agent can see and query via CLI what are the available models"*; silently
+ * overstating in a failure state is that question answered wrong.
+ *
+ * ⚠️ **`source` IS THE MACHINE-READABLE PART.** `note` is prose and must never be
+ * parsed — see `CatalogueEntitlement`.
+ */
+export function describeCatalogueEntitlement(
+  entitlement: OpenRouterEntitlement,
+): CatalogueEntitlement {
+  if (entitlement.allowed === null) {
+    return { source: "unknown", stale: false, note: formatEntitlementUnknown(entitlement) };
+  }
+  if (entitlement.stale) {
+    const because = entitlement.error === null ? "" : ` (${entitlement.error})`;
+    return {
+      source: "key",
+      stale: true,
+      note:
+        `the allowed-model set was read from a cache older than its TTL${because}, so it may not ` +
+        `match what this box's OpenRouter key allows right now. Run \`acpx models --refresh\`.`,
+    };
+  }
+  return { source: "key", stale: false, note: null };
 }

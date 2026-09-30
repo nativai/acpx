@@ -23,6 +23,7 @@ import type { NativeModel } from "./harness-models.js";
 import { loadOpenRouterCatalogue } from "./openrouter-catalogue.js";
 import type { LoadOptions, OpenRouterRawModel } from "./openrouter-catalogue.js";
 import {
+  describeCatalogueEntitlement,
   ENTITLEMENT_UNKNOWN,
   isEntitledOpenRouterModelId,
   loadOpenRouterEntitlement,
@@ -533,6 +534,13 @@ export function buildCatalogue(
     fetchedAt: meta.fetchedAt,
     stale: meta.stale,
     error: meta.error,
+    // 🛑 THE READ PATH'S HALF OF "permits everything AND SAYS SO" (brick ecfb0461).
+    // Under fail-open every OpenRouter row reads available, which is
+    // byte-indistinguishable from a key that genuinely allows everything — so
+    // without this the catalogue OVERSTATES what an agent may use, unhedged, in
+    // exactly the failure states the fail-open decision creates. `source` is the
+    // field a consumer branches on; see `CatalogueEntitlement`.
+    entitlement: describeCatalogueEntitlement(entitlement),
     counts: countModels(models),
     models,
   };

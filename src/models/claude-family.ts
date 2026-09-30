@@ -38,11 +38,13 @@
  * DO NOT add an import from `models/` here — that is what would close the cycle.
  *
  * ⚠️ **`openrouter-entitlement.ts` IS THE ONE `models/` IMPORT, AND IT IS SAFE FOR
- * A CHECKABLE REASON RATHER THAN A HOPEFUL ONE:** it imports node builtins and
- * `config/providers.js`, and `config/providers.ts` imports only node builtins. So
- * the chain terminates and cannot reach back here. **Verify that before adding
- * anything to that module's imports** — a `models/` import over there closes the
- * cycle from a file whose name does not suggest it.
+ * A CHECKABLE REASON RATHER THAN A HOPEFUL ONE:** it imports node builtins,
+ * `config/providers.js` (which imports only node builtins), and **`./types.js` as a
+ * type-only import** — `types.ts` declares no imports at all, so it is a leaf, and
+ * `import type` is erased before anything runs. The chain terminates and cannot
+ * reach back here. **Verify that before adding anything to that module's imports** —
+ * a `models/` import over there closes the cycle from a file whose name does not
+ * suggest it.
  *
  * ## Brick ecfb0461 — this tier is an ALLOWLIST, and THE KEY IS THE LIST
  *

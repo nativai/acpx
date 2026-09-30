@@ -194,6 +194,18 @@ function blockingReason(model: CatalogueModel, agentType: string | undefined): s
   return null;
 }
 
+/**
+ * The rendered `acpx models list` text, for tests only (brick ecfb0461).
+ *
+ * ⚠️ **A SEAM, NOT API** — hence the name, matching `setHarnessCapabilitiesForTesting`.
+ * It exists because the entitlement-state footer has to be asserted on the BYTES this
+ * verb prints: checking only `catalogue.entitlement.source` would stay green on a
+ * renderer that stopped printing it, which is precisely the regression the row guards.
+ */
+export function renderModelsListForTesting(catalogue: ModelCatalogue, flags: ModelsFlags): string {
+  return renderList(catalogue, flags);
+}
+
 function renderList(catalogue: ModelCatalogue, flags: ModelsFlags): string {
   const agentType = flags.agent?.trim() || undefined;
   const favoriteKeys = catalogue.models
@@ -245,14 +257,42 @@ function renderFooter(
  * footer over a catalogue that never loaded.
  */
 function describeFreshness(catalogue: ModelCatalogue): string {
+  const entitlement = describeEntitlementState(catalogue);
   if (catalogue.fetchedAt === null) {
-    return ` · ⚠ OpenRouter catalogue NOT LOADED${catalogue.error === null ? "" : ` (${catalogue.error})`} — harness models only`;
+    return ` · ⚠ OpenRouter catalogue NOT LOADED${catalogue.error === null ? "" : ` (${catalogue.error})`} — harness models only${entitlement}`;
   }
   if (catalogue.stale) {
     const why = catalogue.error === null ? "" : `; last refresh failed: ${catalogue.error}`;
-    return ` · catalogue STALE (fetched ${catalogue.fetchedAt}${why})`;
+    return ` · catalogue STALE (fetched ${catalogue.fetchedAt}${why})${entitlement}`;
   }
-  return ` · catalogue fetched ${catalogue.fetchedAt}`;
+  return ` · catalogue fetched ${catalogue.fetchedAt}${entitlement}`;
+}
+
+/**
+ * The READ-PATH half of *"permits everything and says so"* (brick ecfb0461).
+ *
+ * 🛑 **WITHOUT THIS, THE LISTING OVERSTATES WHAT AN AGENT MAY USE — SILENTLY, AND
+ * ONLY IN A FAILURE STATE.** Fail-open leaves every OpenRouter row available when
+ * acpx cannot read the key's set, which is byte-identical to a key that genuinely
+ * allows everything. So `acpx models list` answered *"what are the available
+ * models?"* with ~310 rows and no hedge on a cold / corrupt / 401'd read. The spawn
+ * path said so on stderr all along; this verb — the one an agent actually queries —
+ * did not.
+ *
+ * ⚠️ **SILENT ON THE HEALTHY PATH, DELIBERATELY.** A footer that always carried a
+ * caveat would be ignored within a day, and then the failure state would be
+ * invisible again for a new reason. `test/openrouter-entitlement.test.ts` asserts
+ * both directions, so a build that always warns cannot pass.
+ */
+function describeEntitlementState(catalogue: ModelCatalogue): string {
+  if (catalogue.entitlement.source === "unknown") {
+    return ` · ⚠ KEY'S ALLOWED SET UNKNOWN — this list is NOT narrowed to it${
+      catalogue.entitlement.note === null ? "" : ` (${catalogue.entitlement.note})`
+    }`;
+  }
+  return catalogue.entitlement.stale
+    ? ` · ⚠ allowed set STALE${catalogue.entitlement.note === null ? "" : ` (${catalogue.entitlement.note})`}`
+    : "";
 }
 
 /**
