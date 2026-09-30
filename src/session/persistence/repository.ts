@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -756,6 +757,133 @@ async function updateIndexForWrittenRecord(
   });
 }
 
+/**
+ * 🔑 THE IN-PROCESS WRITE CHAIN — why record writes are SERIALISED rather than allowed to
+ * contend, and why this is a FIX and not a tightened window.
+ *
+ * Every record write in this process opens its OWN `BrickOutbox` connection
+ * (`outboxForRecord` -> `openRecordOutbox` -> `new BrickOutbox()`) to the ONE SQLite file
+ * `$HOME/.acpx/brick-outbox.db`. Two of them overlapping do not merely race:
+ *
+ *  - `brick-outbox.ts`'s `withAsyncMutation` takes the exclusive lock with
+ *    `BEGIN IMMEDIATE` and then **`await`s** its action before `COMMIT` — it holds the lock
+ *    across a yield point; and
+ *  - its busy-retry waits with `Atomics.wait`, which blocks the **only** thread.
+ *
+ * So the contender does not just fail to get the lock — it blocks the very thread the
+ * holder needs in order to reach `COMMIT`. The holder cannot progress, the contender burns
+ * its whole 4 s budget, and fails terminally with `outbox-busy`. **Two overlapping
+ * in-process outbox writes LIVELOCK, deterministically** (measured 5/5 at `ef794177`).
+ *
+ * 🛑 THIS IS WHY THE HISTORICAL "k=1-in-6" WAS NEVER A LOCK-FIGHT RATE — it was the rate at
+ * which two writes happened to OVERLAP. Moving the path-3 seat mint to after the record
+ * write took the observed rate to k=0-in-24, which was read as "handled"; it only made the
+ * overlap rarer. **A BOUND IS NOT A FIX.** Serialising removes the overlap, so the livelock
+ * becomes structurally impossible rather than merely unlikely — that is the difference, and
+ * it is the reason a wider retry budget was refused: a budget can always be outlasted, and
+ * no battery can tell "fixed" from "more tightly bounded".
+ *
+ * ⚠️ SCOPE IS SINGLE-PROCESS, DELIBERATELY. This cannot help against a lock held by ANOTHER
+ * process (a second queue owner, a CLI invocation, acpx-ui's writer); `outbox-busy` remains
+ * possible from that source and is a different problem. `test/outbox-write-ordering.test.ts`
+ * pins both halves: the in-process row is the discriminator, and a cross-process row is kept
+ * as a positive control that the failure is producible at all.
+ *
+ * ⚠️ WHY A PLAIN PROMISE CHAIN AND NOT AN ADVISORY LOCK. `index-lock.ts`'s `withAdvisoryLock`
+ * gives up after ~2 s and PROCEEDS UNLOCKED, which re-admits exactly the overlap this
+ * removes. A chain has no such escape hatch.
+ *
+ * 🛑 RE-ENTRANCY IS REAL HERE, AND IT IS WHY THE `AsyncLocalStorage` BELOW IS NOT OPTIONAL.
+ * No PRODUCT path re-enters: verified at `ef794177` that no callee of the critical section
+ * calls a write entrypoint (`brick-outbox.ts` contains no reference to one at all; the only
+ * mentions in `messages-log.ts` / `persistence/index.ts` are comments). But a re-entrant
+ * write can still be INJECTED FROM OUTSIDE `src/`, and one is: `session-reparent.test.ts`'s
+ * `editDuringBatch` mocks `fs.readFile` — the very call `readPersistedLifecycle` makes
+ * INSIDE this function — and its callback writes records. A plain chain deadlocks there
+ * (measured: 9 rows in `session-reparent.test.ts` hung with "Promise resolution is still
+ * pending but the event loop has already resolved", against 43/43 green on the base).
+ *
+ * So a nested write RUNS DIRECTLY instead of enqueuing: it behaves exactly as it does
+ * without this chain — no better, no worse — while the TOP-LEVEL overlap, which is the
+ * actual production defect, is still removed. This cannot re-admit the livelock for the
+ * real case, because the real case is two INDEPENDENT top-level writes, never a nested one.
+ * `index-lock.ts:27` reaches for `AsyncLocalStorage` against this same hazard.
+ *
+ * 🛑 THE BYPASS IS A DOCUMENTED HAZARD, NOT A FEATURE. A nested write issued AFTER the
+ * outer write has taken the outbox lock would LIVELOCK DETERMINISTICALLY — it is the very
+ * mechanism described above: the inner write blocks the only thread with `Atomics.wait`
+ * while the outer holds `BEGIN IMMEDIATE` and can never reach `COMMIT`. Today the only
+ * reachable nesting happens BEFORE the lock is taken (`readPersistedLifecycle`), which is
+ * why it survives at all. Nesting a record write is therefore not merely unordered — past
+ * the lock it is a hang. Do not introduce one.
+ *
+ * ⚠️ WHAT THE ALS GUARD CAN AND CANNOT SEE. It detects a write re-entered on the SAME async
+ * context. A write issued from a continuation that ran OUTSIDE that context is not seen as
+ * nested and enqueues normally — and `updateIndexForWrittenRecord` has exactly such a
+ * continuation (the index-update queue / `index-lock`, measured: a write performs one
+ * record read inside this context and three index reads that are not). Nothing in `src/`
+ * writes a record from there, so this is not reachable today; if something ever does, it
+ * will deadlock rather than degrade, which is the safer of the two failures and is why this
+ * is recorded here rather than guarded against speculatively.
+ *
+ * ⚠️ AND NOT A PER-RECORD KEY. Keying the chain by record id would serialise nothing that
+ * matters: the production contention is the PARENT record's write against the CHILD
+ * record's — different ids, one DB.
+ *
+ * The chain shape is the one already proven per-child in
+ * `cli/session/subagent-boundary-write.ts` — including its lesson about never leaving a
+ * derived promise unhandled, which killed nine queue owners on 2026-09-22.
+ */
+let recordWriteChain: Promise<void> = Promise.resolve();
+const insideRecordWrite = new AsyncLocalStorage<true>();
+
+/** Counter name for the nested-write bypass. Read it via `getPerfMetricsSnapshot()`. */
+export const REENTRANT_RECORD_WRITE_COUNTER = "session.write_record_reentrant";
+let warnedAboutReentrantWrite = false;
+
+function enqueueRecordWrite<T>(action: () => Promise<T>): Promise<T> {
+  // RE-ENTRANT CALL — already inside a write on this async context. Enqueuing would wait
+  // for a chain entry that cannot complete until we return: a self-deadlock.
+  //
+  // 🛑 THIS BRANCH BYPASSES THE SERIALISATION, SO IT IS DELIBERATELY LOUD. A quiet
+  // fallback here would be the same defect that disqualified `index-lock.ts`'s
+  // `withAdvisoryLock` from this repair: its ~2 s proceed-unlocked degradation re-admits
+  // the very race being removed, and says nothing when it does. Today only a test reaches
+  // this branch (`session-reparent.test.ts`'s `editDuringBatch` mocks `fs.readFile`, which
+  // `readPersistedLifecycle` calls from inside the write). If a PRODUCT path ever nests a
+  // write, it would silently get the old unserialised behaviour and the livelock would be
+  // back for that path — so the counter below is what turns that into a signal instead of
+  // a silent regression. A non-zero count on a real process is a DEFECT TO INVESTIGATE,
+  // not a statistic.
+  if (insideRecordWrite.getStore()) {
+    incrementPerfCounter(REENTRANT_RECORD_WRITE_COUNTER);
+    if (!warnedAboutReentrantWrite) {
+      warnedAboutReentrantWrite = true;
+      // Once per process: loud enough to be seen, not so loud it drowns a test run.
+      process.stderr.write(
+        "[acpx] WARNING: a session record write was issued from INSIDE another record " +
+          "write on the same async context. It bypasses the in-process write ordering and " +
+          "is therefore exposed to outbox contention (brick 6b1e0038). If this is a " +
+          "product path rather than a test hook, it is a defect — see " +
+          "`enqueueRecordWrite` in session/persistence/repository.ts.\n",
+      );
+    }
+    return action();
+  }
+  // The chain is settled-void by construction, so `action` always runs: a failed write
+  // must never block the writes queued behind it.
+  const run = recordWriteChain.then(async () => await insideRecordWrite.run(true, action));
+  // ⚠️ BOTH handlers are required. The chain must swallow the rejection so ordering
+  // survives a failure, AND this derived promise must carry a rejection handler of its own
+  // — acpx installs no `unhandledRejection` hook, so an unhandled one is a process kill.
+  // The caller still sees the real outcome through `run`.
+  recordWriteChain = run.then(
+    () => {},
+    () => {},
+  );
+  return run;
+}
+
 async function writeSessionRecordInternal(
   record: SessionRecord,
   options: {
@@ -790,120 +918,124 @@ async function writeSessionRecordInternal(
   if (isArchivedRecord(record)) {
     throw new SessionArchivedError(record.acpxRecordId);
   }
-  await measurePerf("session.write_record", async () => {
-    await ensureSessionDir();
+  // OUTSIDE the chain on purpose: the guard above is a synchronous refusal that touches
+  // neither the outbox nor the index, so it must not wait behind queued writes.
+  await enqueueRecordWrite(async () => {
+    await measurePerf("session.write_record", async () => {
+      await ensureSessionDir();
 
-    const persistedLifecycle = options.persisted
-      ? options.persisted.value
-      : await readPersistedLifecycle(record.acpxRecordId);
-    // When the caller supplied a (possibly stale) lifecycle snapshot, reread the
-    // on-disk record ONCE so both metadata AND the pinned model merge against the
-    // freshest concurrent state rather than the caller's snapshot. Otherwise the
-    // fresh lifecycle read above already holds current disk state — no extra read.
-    const freshPersisted = options.persisted
-      ? await readPersistedLifecycle(record.acpxRecordId)
-      : persistedLifecycle;
-    const persistedMetadata = freshPersisted?.metadata;
+      const persistedLifecycle = options.persisted
+        ? options.persisted.value
+        : await readPersistedLifecycle(record.acpxRecordId);
+      // When the caller supplied a (possibly stale) lifecycle snapshot, reread the
+      // on-disk record ONCE so both metadata AND the pinned model merge against the
+      // freshest concurrent state rather than the caller's snapshot. Otherwise the
+      // fresh lifecycle read above already holds current disk state — no extra read.
+      const freshPersisted = options.persisted
+        ? await readPersistedLifecycle(record.acpxRecordId)
+        : persistedLifecycle;
+      const persistedMetadata = freshPersisted?.metadata;
 
-    if (options.preserveLifecycle) {
-      applyPersistedLifecycleForWrite(record, persistedLifecycle);
-    }
-    // 🛑 THE PARENT LINKAGE, PRESERVED UNCONDITIONALLY — OUTSIDE the branch above,
-    // and that placement IS the fix (see `preserveParentLinkageForPersist`). The
-    // write that clobbers a re-parent is the PRIVILEGED one — `session-control.ts`'s
-    // `closeSession`, which bypasses that branch by design and writes a record it
-    // read seconds earlier, before the owner-termination wait. `freshPersisted`, not
-    // the caller's snapshot: disk is the authority for who the parent is, and a
-    // caller-supplied lifecycle can predate the re-parent by a whole turn.
-    //
-    // ⚠️ The ONE writer that must beat this is `set-parent` itself, and it does so
-    // by NAME through `authoritative.parent` — not by being privileged. Remove that
-    // gate and the verb becomes a silent no-op (§1.2 leg b); remove this call and a
-    // close in flight silently undoes a re-parent (F2). One test pins BOTH
-    // directions together, because fixing either one alone still looks green.
-    preserveParentLinkageForPersist(record, freshPersisted, options.authoritative);
-    // 🛑 THE SEAT HOLDER HALF, PRESERVED UNCONDITIONALLY — same placement and
-    // the same reason as the parent linkage immediately above, and `freshPersisted`
-    // for the same reason too: disk is the authority for which holder is active,
-    // and a caller-supplied lifecycle can predate the succession by a whole turn.
-    //
-    // ⚠️ The ONE writer that must beat this is B2's activation, and it does so by
-    // NAME through `authoritative.seatHolder` — not by being privileged. Remove
-    // that gate and the succession verb becomes a silent no-op; remove this call
-    // and a close in flight silently undoes the flip, leaving the active-holder
-    // mirror pointing at the retired holder. One test pins BOTH directions,
-    // because fixing either one alone still looks green.
-    preserveSeatHolderFieldsForPersist(record, freshPersisted, options.authoritative);
-    mergeRecordMetadataForPersist(record, persistedMetadata);
-    // Same baseline-diff protection metadata gets (2c848d3), extended to the
-    // pinned model: a stale/dropped write can't regress a record-pinned model,
-    // while a deliberate set-model/subscription-switch/new --model still wins.
-    mergeRecordPinnedModelForPersist(record, freshPersisted?.acpx);
-    // 🛑 SAME BASELINE-DIFF PROTECTION, FOR WHO SERVED THE TURN (brick 4c272cab,
-    // finding PM-1). UNCONDITIONAL — outside the `preserveLifecycle` branch above —
-    // and that placement IS the fix: the write that clobbers this field is the
-    // PRIVILEGED one (`closeSession`), which bypasses that branch by design. A
-    // preserve inside it looked right, shipped, and changed nothing; measured on a
-    // live turn, the two final writes still landed `null`.
-    //
-    // MEASURED with per-object identity on every serialize, fresh session, one turn:
-    //   13:15:23.748  rec-5   provider="Wafer"   ← the turn's record, correct
-    //   13:15:24.365  rec-5   provider="Wafer"   ← on disk, correct
-    //   13:15:24.373  rec-11  provider=null      ← a DIFFERENT record object …
-    //   13:15:24.380  rec-13  provider=null      ← … clobbers it 8 ms later
-    // A LOST UPDATE, not a race: in the post-merge smoke the shim's line was on
-    // disk 3.1 s before the clobbering write. The earlier F-3 ordering fix was
-    // therefore treating the wrong cause, and this is why its 3/3 held only in a
-    // rig where no late writer happened to run.
-    //
-    // ⚠️ ONE-DIRECTIONAL: an in-memory value WINS (a later turn changes the
-    // provider), disk only fills an ABSENCE. The field is historical — "who served
-    // the last turn" — and like `served_via_shim` is never legitimately cleared,
-    // so there is no write this can wrongly suppress.
-    preserveLastTurnProviderForPersist(record, freshPersisted?.acpx);
-
-    const sessionDir = sessionBaseDir();
-    const logPath = messagesLogPath(sessionDir, record.acpxRecordId);
-    const ownedOutbox = outboxForRecord(record);
-    const writeLog = async (current?: DiskRecord) => {
-      if (current) {
-        mergeRecordMetadataForPersist(record, current.metadata);
+      if (options.preserveLifecycle) {
+        applyPersistedLifecycleForWrite(record, persistedLifecycle);
       }
-      if (options.messagePersistence === "boundary") {
-        await writeMessagesLogBoundary(record, logPath);
-      } else {
-        await clearMissingMessagesLogPointerForWrite(record, logPath);
+      // 🛑 THE PARENT LINKAGE, PRESERVED UNCONDITIONALLY — OUTSIDE the branch above,
+      // and that placement IS the fix (see `preserveParentLinkageForPersist`). The
+      // write that clobbers a re-parent is the PRIVILEGED one — `session-control.ts`'s
+      // `closeSession`, which bypasses that branch by design and writes a record it
+      // read seconds earlier, before the owner-termination wait. `freshPersisted`, not
+      // the caller's snapshot: disk is the authority for who the parent is, and a
+      // caller-supplied lifecycle can predate the re-parent by a whole turn.
+      //
+      // ⚠️ The ONE writer that must beat this is `set-parent` itself, and it does so
+      // by NAME through `authoritative.parent` — not by being privileged. Remove that
+      // gate and the verb becomes a silent no-op (§1.2 leg b); remove this call and a
+      // close in flight silently undoes a re-parent (F2). One test pins BOTH
+      // directions together, because fixing either one alone still looks green.
+      preserveParentLinkageForPersist(record, freshPersisted, options.authoritative);
+      // 🛑 THE SEAT HOLDER HALF, PRESERVED UNCONDITIONALLY — same placement and
+      // the same reason as the parent linkage immediately above, and `freshPersisted`
+      // for the same reason too: disk is the authority for which holder is active,
+      // and a caller-supplied lifecycle can predate the succession by a whole turn.
+      //
+      // ⚠️ The ONE writer that must beat this is B2's activation, and it does so by
+      // NAME through `authoritative.seatHolder` — not by being privileged. Remove
+      // that gate and the succession verb becomes a silent no-op; remove this call
+      // and a close in flight silently undoes the flip, leaving the active-holder
+      // mirror pointing at the retired holder. One test pins BOTH directions,
+      // because fixing either one alone still looks green.
+      preserveSeatHolderFieldsForPersist(record, freshPersisted, options.authoritative);
+      mergeRecordMetadataForPersist(record, persistedMetadata);
+      // Same baseline-diff protection metadata gets (2c848d3), extended to the
+      // pinned model: a stale/dropped write can't regress a record-pinned model,
+      // while a deliberate set-model/subscription-switch/new --model still wins.
+      mergeRecordPinnedModelForPersist(record, freshPersisted?.acpx);
+      // 🛑 SAME BASELINE-DIFF PROTECTION, FOR WHO SERVED THE TURN (brick 4c272cab,
+      // finding PM-1). UNCONDITIONAL — outside the `preserveLifecycle` branch above —
+      // and that placement IS the fix: the write that clobbers this field is the
+      // PRIVILEGED one (`closeSession`), which bypasses that branch by design. A
+      // preserve inside it looked right, shipped, and changed nothing; measured on a
+      // live turn, the two final writes still landed `null`.
+      //
+      // MEASURED with per-object identity on every serialize, fresh session, one turn:
+      //   13:15:23.748  rec-5   provider="Wafer"   ← the turn's record, correct
+      //   13:15:24.365  rec-5   provider="Wafer"   ← on disk, correct
+      //   13:15:24.373  rec-11  provider=null      ← a DIFFERENT record object …
+      //   13:15:24.380  rec-13  provider=null      ← … clobbers it 8 ms later
+      // A LOST UPDATE, not a race: in the post-merge smoke the shim's line was on
+      // disk 3.1 s before the clobbering write. The earlier F-3 ordering fix was
+      // therefore treating the wrong cause, and this is why its 3/3 held only in a
+      // rig where no late writer happened to run.
+      //
+      // ⚠️ ONE-DIRECTIONAL: an in-memory value WINS (a later turn changes the
+      // provider), disk only fills an ABSENCE. The field is historical — "who served
+      // the last turn" — and like `served_via_shim` is never legitimately cleared,
+      // so there is no write this can wrongly suppress.
+      preserveLastTurnProviderForPersist(record, freshPersisted?.acpx);
+
+      const sessionDir = sessionBaseDir();
+      const logPath = messagesLogPath(sessionDir, record.acpxRecordId);
+      const ownedOutbox = outboxForRecord(record);
+      const writeLog = async (current?: DiskRecord) => {
+        if (current) {
+          mergeRecordMetadataForPersist(record, current.metadata);
+        }
+        if (options.messagePersistence === "boundary") {
+          await writeMessagesLogBoundary(record, logPath);
+        } else {
+          await clearMissingMessagesLogPointerForWrite(record, logPath);
+        }
+      };
+      try {
+        await guardedMessagesWrite(ownedOutbox, record, writeLog);
+
+        // The snake_case key policy is asserted INSIDE serializeSessionRecordForDisk
+        // (brick://48aca560) so test fixtures cannot bypass it; do not re-walk here.
+        const persistedRecord = serializeSessionRecordForDisk(record, { messages: "split-tail" });
+
+        const file = sessionFilePath(record.acpxRecordId);
+        // The temp name must be unique PER CALL, not per millisecond: two writes
+        // from this process in the same millisecond used to build the identical
+        // path, so the first rename won and the second hit ENOENT — turning a
+        // concurrent record write into a thrown error. Reachable on the normal
+        // mid-turn injection path (queue-owner-runtime drains the whole
+        // midTurnBuffer synchronously, so several injections start in one tick and
+        // race each other's recordPromptStart). Uniqueness, not serialization:
+        // this is a filename collision, and ordering here is deliberately free.
+        // Same shape already used by src/flows/store.ts.
+        // Compact JSON: parses identically everywhere, saves ~30-40% of bytes and
+        // stringify CPU on every checkpoint of a multi-MB record.
+        record.metadata = (
+          await persistRecordFile(file, persistedRecord as DiskRecord, ownedOutbox)
+        ).metadata;
+
+        await updateIndexForWrittenRecord(sessionDir, record, path.basename(file), options);
+        rememberSessionMetadataBaseline(record);
+        rememberSessionModelBaseline(record);
+      } finally {
+        ownedOutbox?.close();
       }
-    };
-    try {
-      await guardedMessagesWrite(ownedOutbox, record, writeLog);
-
-      // The snake_case key policy is asserted INSIDE serializeSessionRecordForDisk
-      // (brick://48aca560) so test fixtures cannot bypass it; do not re-walk here.
-      const persistedRecord = serializeSessionRecordForDisk(record, { messages: "split-tail" });
-
-      const file = sessionFilePath(record.acpxRecordId);
-      // The temp name must be unique PER CALL, not per millisecond: two writes
-      // from this process in the same millisecond used to build the identical
-      // path, so the first rename won and the second hit ENOENT — turning a
-      // concurrent record write into a thrown error. Reachable on the normal
-      // mid-turn injection path (queue-owner-runtime drains the whole
-      // midTurnBuffer synchronously, so several injections start in one tick and
-      // race each other's recordPromptStart). Uniqueness, not serialization:
-      // this is a filename collision, and ordering here is deliberately free.
-      // Same shape already used by src/flows/store.ts.
-      // Compact JSON: parses identically everywhere, saves ~30-40% of bytes and
-      // stringify CPU on every checkpoint of a multi-MB record.
-      record.metadata = (
-        await persistRecordFile(file, persistedRecord as DiskRecord, ownedOutbox)
-      ).metadata;
-
-      await updateIndexForWrittenRecord(sessionDir, record, path.basename(file), options);
-      rememberSessionMetadataBaseline(record);
-      rememberSessionModelBaseline(record);
-    } finally {
-      ownedOutbox?.close();
-    }
+    });
   });
 }
 
