@@ -30,6 +30,20 @@ function tempCacheDir(): string {
  * FILE under `node --test` and re-invoking that is what produced a 116-failure
  * gate. Tests that expect a spawn must therefore look like acpx.
  */
+/** A fresh entitlement cache beside the catalogue one — see `catalogueNeedsWarm`. */
+function freshEntitlement(dir: string, now: number = Date.now()): string {
+  const entitlementCachePath = path.join(dir, "openrouter-entitlement.json");
+  fs.writeFileSync(
+    entitlementCachePath,
+    JSON.stringify({
+      fetchedAt: new Date(now).toISOString(),
+      keyFingerprint: "0".repeat(16),
+      modelIds: [],
+    }),
+  );
+  return entitlementCachePath;
+}
+
 function fakeCliEntry(dir: string): string {
   const distDir = path.join(dir, "dist");
   fs.mkdirSync(distDir, { recursive: true });
@@ -75,12 +89,18 @@ test("a FRESH cache needs no warm; a STALE one does", () => {
   const dir = tempCacheDir();
   const cachePath = path.join(dir, "models-cache.json");
   const now = Date.parse("2026-09-05T00:00:00.000Z");
+  // ⚠️ BOTH CACHES MUST BE PINNED (brick ecfb0461). The warm now also covers the
+  // key's allowed-model set, and an unpinned `entitlementCachePath` falls back to
+  // the real `$HOME/.acpx/…`, which does not exist on a test box — so "a FRESH
+  // cache needs no warm" would be measuring the absence of THAT file rather than
+  // the freshness of this one.
+  const entitlementCachePath = freshEntitlement(dir, now);
 
   fs.writeFileSync(
     cachePath,
     JSON.stringify({ fetchedAt: new Date(now - 60_000).toISOString(), models: [] }),
   );
-  assert.equal(catalogueNeedsWarm({ cachePath, now: () => now }), false);
+  assert.equal(catalogueNeedsWarm({ cachePath, entitlementCachePath, now: () => now }), false);
 
   fs.writeFileSync(
     cachePath,
@@ -89,7 +109,7 @@ test("a FRESH cache needs no warm; a STALE one does", () => {
       models: [],
     }),
   );
-  assert.equal(catalogueNeedsWarm({ cachePath, now: () => now }), true);
+  assert.equal(catalogueNeedsWarm({ cachePath, entitlementCachePath, now: () => now }), true);
 });
 
 test("an UNPARSEABLE cache is treated as absent, never as fresh", () => {
@@ -157,14 +177,31 @@ test("a FRESH cache spawns nothing", () => {
     JSON.stringify({ fetchedAt: new Date(now - 1000).toISOString(), models: [] }),
   );
   const spawner = recordingSpawn();
+  // Both caches fresh — see the note in "a FRESH cache needs no warm" (brick ecfb0461).
+  const entitlementCachePath = freshEntitlement(dir, now);
   warmCatalogueInBackground({
     cachePath,
+    entitlementCachePath,
     now: () => now,
     spawn: spawner.spawn,
     argv: ["node", fakeCliEntry(dir)],
     env: {},
   });
   assert.equal(spawner.calls.length, 0);
+
+  // NEGATIVE CONTROL on the same call: drop the entitlement cache and the SAME fresh
+  // catalogue DOES spawn — so the zero above is both caches being fresh rather than
+  // a spawner that never fires.
+  fs.rmSync(entitlementCachePath);
+  warmCatalogueInBackground({
+    cachePath,
+    entitlementCachePath,
+    now: () => now,
+    spawn: spawner.spawn,
+    argv: ["node", fakeCliEntry(dir)],
+    env: {},
+  });
+  assert.equal(spawner.calls.length, 1, "a cold entitlement cache must still warm");
 });
 
 test("the cooldown stops N concurrent creates each spawning their own refresh", () => {

@@ -411,6 +411,19 @@ async function withProvisioningList<T>(
  * and be non-empty. So a `false` here means acpx DECIDED not to provision, never
  * that nothing ran.
  */
+/**
+ * ⚠️ **THIS USED TO NEED THE PROBE SLUG ENTITLED, AND UNDER brick ecfb0461 IT NO
+ * LONGER DOES — WHICH IS WORTH STATING RATHER THAN SILENTLY DROPPING.** The old
+ * design carried a hardcoded allowlist in acpx, so `assertModelPolicy` refused this
+ * deliberately-unknown slug at spawn and the row had to splice it into the shipped
+ * array for the duration of the probe. There is no such array now: the set comes
+ * from the box key, this row spawns under an isolated `ACPX_STATE_HOME` with no
+ * `providers.json`, so the set reads UNKNOWN and the spawn guard fails open.
+ *
+ * The nonsense slug stays, and it is still load-bearing (see `PROVISIONED_SLUG`): a
+ * real id might already sit in pi's box-overlaid store, and then "the slug is in the
+ * written fragment" would no longer prove acpx put it there.
+ */
 async function observeProvisioning(harness: "pi"): Promise<boolean> {
   let observed: boolean | undefined;
   await spawnAndDumpEnv(

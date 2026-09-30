@@ -109,8 +109,15 @@ function finiteNumber(value: unknown): number | undefined {
 
 /**
  * The optional string fields, as a table rather than a chain of conditional
- * spreads — one place to add a field, and the same list drives both parsing and
- * the status projection below.
+ * spreads — one place to add a field for PARSING.
+ *
+ * 🛑 **THIS IS NOT THE ONLY LIST. `STATUS_FIELDS` BELOW DRIVES THE PROJECTION, AND
+ * A FIELD MISSING FROM EITHER IS DROPPED SILENTLY** — absent from a parsed entry, or
+ * present on the entry and invisible to `acpx providers`, with nothing failing in
+ * either direction. `apiKey` / `apiKeyEnv` are in this list and deliberately NOT in
+ * that one (they are secret); **every other field belongs in both**, and
+ * `test/box-providers.test.ts` round-trips one through parsing AND the projection for
+ * exactly this reason.
  */
 const OPTIONAL_STRING_FIELDS = [
   "apiKey",

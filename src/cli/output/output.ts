@@ -42,6 +42,9 @@ type RenderableOutputError = {
   acp?: OutputErrorAcpPayload;
   effectiveAccount?: EffectiveAccountMetadata;
   timestamp?: string;
+  /** WHICH POLICY refused — see `AcpxErrorOptions.policyReason`. Carried so the JSON
+   *  formatter can serialize it; the text renderer shows the prose instead. */
+  policyReason?: string;
 };
 
 type OutputFormatterOptions = {

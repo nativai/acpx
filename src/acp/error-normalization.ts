@@ -37,6 +37,7 @@ type ErrorMeta = {
   effectiveAccount?: EffectiveAccountMetadata;
   automationCapacityReserved?: AutomationCapacityReservedDetail;
   codexSubscriptionCap?: CodexSubscriptionCapDetail;
+  policyReason?: string;
 };
 
 export type NormalizedOutputError = {
@@ -49,6 +50,19 @@ export type NormalizedOutputError = {
   effectiveAccount?: EffectiveAccountMetadata;
   automationCapacityReserved?: AutomationCapacityReservedDetail;
   codexSubscriptionCap?: CodexSubscriptionCapDetail;
+  /**
+   * WHICH POLICY refused, as a stable token — see `AcpxErrorOptions.policyReason`.
+   *
+   * 🛑 **IT MUST REACH THE WIRE, AND ONCE DID NOT.** The token was added to
+   * `AcpxOperationalError` so a caller could ask *"was this refused for
+   * entitlement?"* without matching prose — and it was **dropped here**, at
+   * serialization, so **zero bytes of output carried it** while the in-process field
+   * was perfectly correct. A machine-readable discriminator that never leaves the
+   * process is not a discriminator; it left `detailCode` — which differs by tier — as
+   * the only thing a consumer could key on, i.e. the exact problem the token exists
+   * to solve. The test for it asserts the SERIALIZED bytes, never the thrown object.
+   */
+  policyReason?: string;
 };
 
 export type NormalizeOutputErrorOptions = {
@@ -60,6 +74,8 @@ export type NormalizeOutputErrorOptions = {
   effectiveAccount?: EffectiveAccountMetadata;
   automationCapacityReserved?: AutomationCapacityReservedDetail;
   codexSubscriptionCap?: CodexSubscriptionCapDetail;
+  /** Fallback when the error itself carries none — the error's own value wins. */
+  policyReason?: string;
 };
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -188,6 +204,11 @@ function codexSubscriptionCapFromError(error: unknown): CodexSubscriptionCapDeta
   return error instanceof CodexSubscriptionCapError ? error.codexSubscriptionCap : undefined;
 }
 
+/** A trimmed non-empty string, or `undefined`. Split out for the complexity budget. */
+function nonEmptyStringField(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
 function readOutputErrorMeta(error: unknown): ErrorMeta {
   const record = asRecord(error);
   if (!record) {
@@ -208,6 +229,7 @@ function readOutputErrorMeta(error: unknown): ErrorMeta {
   const acp = extractAcpError(record.acp);
   const automationCapacityReserved = automationCapacityReservedFromError(error);
   const codexSubscriptionCap = codexSubscriptionCapFromError(error);
+  const policyReason = nonEmptyStringField(record.policyReason);
   return {
     outputCode,
     detailCode,
@@ -217,6 +239,7 @@ function readOutputErrorMeta(error: unknown): ErrorMeta {
     effectiveAccount,
     automationCapacityReserved,
     codexSubscriptionCap,
+    policyReason,
   };
 }
 
@@ -299,6 +322,7 @@ export function normalizeOutputError(
     retryable: meta.retryable ?? options.retryable,
     acp,
     effectiveAccount: meta.effectiveAccount ?? options.effectiveAccount,
+    policyReason: meta.policyReason ?? options.policyReason,
     ...resolvedStructuredErrorDetails(meta, options),
   };
 }

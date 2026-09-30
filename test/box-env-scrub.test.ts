@@ -16,7 +16,11 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BOX_PI_ENV_PREFIX, scrubBoxHarnessEnvOverrides } from "./box-env-scrub.js";
+import {
+  BOX_PI_ENV_PREFIX,
+  NO_ENTITLEMENT_FETCH_ENV,
+  scrubBoxHarnessEnvOverrides,
+} from "./box-env-scrub.js";
 
 test("3b1ec678: the scrub removes every ACPX_PI_* override and leaves the rest alone", () => {
   const env: NodeJS.ProcessEnv = {
@@ -30,8 +34,14 @@ test("3b1ec678: the scrub removes every ACPX_PI_* override and leaves the rest a
 
   assert.deepEqual(removed, ["ACPX_PI_BOX_AGENT_DIR", "ACPX_PI_EXTENSIONS_SEED"]);
   // The negative control: a sweep that emptied the environment would satisfy the
-  // assertion above just as well as the correct one.
-  assert.deepEqual(Object.keys(env).toSorted(), ["ACPX_SESSION_URL", "HOME"]);
+  // assertion above just as well as the correct one. `NO_ENTITLEMENT_FETCH_ENV` is
+  // the one variable the bootstrap ADDS rather than removes (brick ecfb0461), so it
+  // belongs in the surviving set — it is pinned on its own below.
+  assert.deepEqual(Object.keys(env).toSorted(), [
+    NO_ENTITLEMENT_FETCH_ENV,
+    "ACPX_SESSION_URL",
+    "HOME",
+  ]);
 });
 
 test("c2df657e: the scrub removes ACPX_SESSION_RECORD_ID (product-set session identity)", () => {
@@ -44,7 +54,32 @@ test("c2df657e: the scrub removes ACPX_SESSION_RECORD_ID (product-set session id
   const removed = scrubBoxHarnessEnvOverrides(env);
 
   assert.deepEqual(removed, ["ACPX_SESSION_RECORD_ID"]);
-  assert.deepEqual(Object.keys(env).toSorted(), ["ACPX_SESSION_URL", "HOME"]);
+  assert.deepEqual(Object.keys(env).toSorted(), [
+    NO_ENTITLEMENT_FETCH_ENV,
+    "ACPX_SESSION_URL",
+    "HOME",
+  ]);
+});
+
+test("ecfb0461: the bootstrap forbids the authenticated models/user call", () => {
+  // 🛑 THE ONLY AUTHENTICATED OUTBOUND CALL acpx MAKES FOR THE MODEL SURFACE, so a
+  // row reaching `loadCatalogue` without an isolated `ACPX_STATE_HOME` would resolve
+  // devbox's real `providers.json` and put the box's OpenRouter key on the wire —
+  // on every gate run. The store guard in `runtime-test-helpers.ts` is opt-in per
+  // test, not global, so this cannot be left to individual rows remembering.
+  const env: NodeJS.ProcessEnv = { HOME: "/home/node" };
+  scrubBoxHarnessEnvOverrides(env);
+  assert.equal(env[NO_ENTITLEMENT_FETCH_ENV], "1");
+
+  // …and it is set in THIS process, which is the half the fixture above cannot
+  // report: whether the bootstrap actually ran here.
+  assert.ok(
+    process.env[NO_ENTITLEMENT_FETCH_ENV],
+    `${NO_ENTITLEMENT_FETCH_ENV} is not set in this process — either the suite bootstrap ` +
+      `(test/install-owner-reaper.ts, loaded by scripts/run-tests.mjs via --import) did not ` +
+      `run, or it stopped setting the guard. Either way a row can now send this box's ` +
+      `OpenRouter key to openrouter.ai.`,
+  );
 });
 
 test("c2df657e: the suite starts with no ACPX_SESSION_RECORD_ID in process.env", () => {

@@ -8,9 +8,18 @@ import {
   setHarnessCapabilitiesForTesting,
 } from "../src/models/capability-source.js";
 import { buildCatalogue } from "../src/models/catalogue.js";
+import {
+  CLAUDE_FAMILY_OPENROUTER_REASON,
+  OPENROUTER_NOT_ENTITLED_REASON,
+  refusesClaudeFamilyOnOpenRouter,
+} from "../src/models/claude-family.js";
 import { harnessNativeModels } from "../src/models/harness-models.js";
 import { isAvailableForAgent } from "../src/models/matcher.js";
 import type { OpenRouterSnapshot } from "../src/models/openrouter-catalogue.js";
+import {
+  isEntitledOpenRouterModelId,
+  type OpenRouterEntitlement,
+} from "../src/models/openrouter-entitlement.js";
 
 // Same fixture and resolution rule as models-catalogue.test.ts: from cwd, not
 // import.meta.dirname, because the suite runs the COMPILED tests out of
@@ -22,6 +31,25 @@ function fixture(): OpenRouterSnapshot {
 }
 
 const META = { fetchedAt: "2026-09-04T00:10:56.992Z", stale: false, error: null };
+
+/**
+ * A KNOWN allowed set, stated here rather than read from this box (brick ecfb0461).
+ *
+ * ⚠️ The ids are the two this box's key really allowed on 2026-09-29, so the row
+ * exercises a realistic *narrow* set — but they are written down, not fetched, so
+ * no assertion depends on whether this box has a warm entitlement cache, a valid
+ * key, or a network. An environment-dependent row here would read as a banding bug.
+ *
+ * 🛑 Deliberately NOT `ENTITLEMENT_UNKNOWN`: unknown fails open and would make the
+ * entitlement branch below unreachable, so the loop would still pass on a build
+ * where that branch is broken.
+ */
+const KNOWN_ENTITLEMENT: OpenRouterEntitlement = {
+  allowed: new Set(["z-ai/glm-5.3-flash", "deepseek/deepseek-v4.1-flash"]),
+  fetchedAt: "2026-09-29T00:00:00.000Z",
+  stale: false,
+  error: null,
+};
 
 test.afterEach(() => {
   setHarnessCapabilitiesForTesting(null);
@@ -123,7 +151,14 @@ test("the OpenRouter band is locked per harness, exactly as the derivation says"
   // left for the next reader to reason from. The lock is, and always was,
   // derived per harness: today `none` harnesses (codex, claude-pty) are locked
   // and claude is not.
-  const catalogue = buildCatalogue(fixture().models, META);
+  // ⚠️ THE ALLOWED SET IS INJECTED, NOT READ FROM THIS BOX (brick ecfb0461) —
+  // otherwise this row's answer would depend on whether this box has a warm
+  // entitlement cache, which is an environment-dependent test that reads as a
+  // banding bug. The loop below asks the SAME predicate production asks, of the
+  // SAME set, so it still FOLLOWS the rule rather than pinning today's answer.
+  const catalogue = buildCatalogue(fixture().models, META, {
+    entitlement: KNOWN_ENTITLEMENT,
+  });
   const capabilities = new Map(readHarnessCapabilities().map((row) => [row.id, row]));
 
   for (const model of catalogue.models.filter((row) => row.source === "openrouter")) {
@@ -138,18 +173,47 @@ test("the OpenRouter band is locked per harness, exactly as the derivation says"
         continue;
       }
       const capability = capabilities.get(id);
+      // ⚠️ POLICY OUTRANKS THE SUPPORT DERIVATION (brick 30eb2003), the same way a
+      // catalogue-level block outranks it above. A Claude-family row on the
+      // OpenRouter route is refused for a policy-bound harness EVEN THOUGH that
+      // harness accepts arbitrary model ids — our subscriptions serve the same
+      // model at no marginal cost, so the band is narrower than the derivation
+      // alone predicts. Asked of the SAME predicate the gate uses, keeping this
+      // row's founding intent: FOLLOW the rule, never pin today's answer.
+      if (refusesClaudeFamilyOnOpenRouter({ harness: id, modelId: model.id })) {
+        assert.equal(availability.ok, false, `${model.key}/${id}`);
+        assert.equal(availability.reason, CLAUDE_FAMILY_OPENROUTER_REASON, `${model.key}/${id}`);
+        continue;
+      }
       const expected = capability?.acceptsArbitraryModelIds === true;
-      assert.equal(availability.ok, expected, `${model.key}/${id}`);
       if (!expected) {
         // The reason FOLLOWS the support kind, exactly as `ok` follows the
         // derivation — never a per-harness literal. `none` is a fixed backend;
         // every other kind means the harness can do it and acpx has not wired it.
+        assert.equal(availability.ok, false, `${model.key}/${id}`);
         assert.equal(
           availability.reason,
           capability?.arbitraryModelSupport === "none" ? "agent-fixed-backend" : "acpx-not-wired",
           `${model.key}/${id}`,
         );
+        continue;
       }
+      // ⚠️ ENTITLEMENT OUTRANKS THE SUPPORT DERIVATION TOO (brick daed4261) — the
+      // same shape as the Claude-family branch above, one policy layer wider: the
+      // box key is billed at metered pricing, so the choosable set is enumerated and
+      // the band is narrower than "this harness accepts arbitrary ids" predicts.
+      //
+      // 🛑 IT IS SITED *AFTER* THE SUPPORT CHECK, NOT BEFORE, BECAUSE PRODUCTION IS:
+      // `availabilityFor` asks `acceptsArbitraryModelIds` first, so for a harness
+      // that cannot reach OpenRouter at all (codex) the answer stays
+      // `agent-fixed-backend` — the more informative one. Move this branch above and
+      // this row reds on codex while the product is right.
+      if (!isEntitledOpenRouterModelId(model.id, KNOWN_ENTITLEMENT)) {
+        assert.equal(availability.ok, false, `${model.key}/${id}`);
+        assert.equal(availability.reason, OPENROUTER_NOT_ENTITLED_REASON, `${model.key}/${id}`);
+        continue;
+      }
+      assert.equal(availability.ok, true, `${model.key}/${id}`);
     }
   }
 });

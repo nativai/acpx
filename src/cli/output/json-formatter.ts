@@ -245,12 +245,18 @@ class JsonOutputFormatter implements OutputFormatter {
     automationCapacityReserved?: AutomationCapacityReservedDetail;
     codexSubscriptionCap?: CodexSubscriptionCapDetail;
     timestamp?: string;
+    policyReason?: string;
   }): void {
     this.stdout.write(
       `${JSON.stringify(
         buildJsonRpcErrorResponse({
           outputCode: params.code,
           detailCode: params.detailCode,
+          // ⚠️ THIS HOP IS WHERE THE TOKEN WAS LOST. It is a per-field copy, not a
+          // spread, so a field absent here is dropped in silence — correct on the
+          // thrown error, absent from the wire. `test/openrouter-entitlement.test.ts`
+          // asserts it on the SERIALIZED bytes for exactly that reason.
+          policyReason: params.policyReason,
           origin: params.origin,
           message: params.message,
           retryable: params.retryable,

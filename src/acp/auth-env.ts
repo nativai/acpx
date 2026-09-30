@@ -1,5 +1,5 @@
 import { mkdirSync, readFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deleteBricksCredentialEnv } from "../bricks-credential.js";
@@ -34,6 +34,7 @@ import {
   isSubscriptionLocked,
   loadSubscriptionRegistry,
   subscriptionConfigDirExists,
+  subscriptionsDir,
 } from "../config/subscriptions.js";
 import type {
   ConfigDirChoice,
@@ -1711,6 +1712,81 @@ export function buildClaudeParentSessionMeta(
 }
 
 /**
+ * The prefix every OpenRouter-routed Claude session's harness home carries.
+ *
+ * ⚠️ IT IS WHAT KEEPS THE NAME OUT OF THE REGISTRY'S NAMESPACE. The directory
+ * lives beside real subscription config dirs (see `openRouterHarnessHomeDir`),
+ * so a name that could also be a registry id would point a Claude adapter at a
+ * REAL CREDENTIAL DIRECTORY. `sessionId` is the acpx record id — a uuid — and
+ * this prefix makes the two namespaces disjoint by construction rather than by
+ * the accident of today's ids all being `subN`.
+ */
+export const OPENROUTER_HARNESS_HOME_PREFIX = "or-";
+
+/**
+ * Where an OpenRouter-routed Claude session's isolated harness home lives.
+ *
+ * ## Two requirements that look like they conflict, and do not
+ *
+ * **ISOLATION** — why this directory exists at all (brick 007eaac8). The adapter
+ * must not inherit the box's real Claude OAuth, so `CLAUDE_CONFIG_DIR` must name
+ * a FRESH, EMPTY, per-session directory that is not one of the registry's
+ * subscription config dirs. That property is about the directory's contents and
+ * distinctness — **never about its parent**. `tmpdir()` was never what isolated
+ * it; `mkdirSync` of a fresh per-session name was, and still is.
+ *
+ * **INGESTIBILITY** — the defect this closes (brick e30b3f6a). Claude Code writes
+ * its transcript to `<CLAUDE_CONFIG_DIR>/projects/<cwd-slug>/<acp-session-id>.jsonl`,
+ * and acpx-ui's usage ingester only ever looks under the subscriptions root: it
+ * enumerates every child of that root having a `projects/` subdir
+ * (`acpx-ui/server/claudeJsonlUsage.ts`, `subscriptionDirs`). Under `tmpdir()`
+ * the transcript was therefore both unreachable and ephemeral — every
+ * OpenRouter-routed Claude session spent real money on the box's OpenRouter key
+ * and reported **$0**, with no signal anywhere, and the evidence vanished at the
+ * next pod restart. Six of the seven such sessions are already unrecoverable.
+ *
+ * ## ⚠️ A DIRECTORY UNDER THIS ROOT IS NOT A CREDENTIAL — MEASURED, NOT ASSUMED
+ *
+ * Every credential / account / picker / failover / purge path in acpx *and*
+ * acpx-ui resolves its subscription set from `registry.json`. Nothing enumerates
+ * this root to discover subscriptions: of 20 `readdir` sites in acpx's `src/`,
+ * zero root here; of 30 in acpx-ui's `server/` + `brick/`, exactly one does and
+ * it is the transcript reader above. The two paths most likely to object both
+ * take registry-sourced input — `resolvePurgeDir`
+ * (`src/cli/subscriptions-command.ts`) guards a `configDir` that came from a
+ * registry entry, and `findSubscriptionByConfigDir` / `findSubscriptionProfileByConfigDir`
+ * below are `.find()`s over `registry.subscriptions` / `registry.profiles`.
+ *
+ * And devbox has been running this design by accident for months: `sub4` and
+ * `sub6` sit here unregistered with 330 and 511 transcripts, ingested by the
+ * reader and absent from `acpx subscriptions list`, `/api/subscriptions/usage`
+ * and `/api/profiles` alike. Verified 2026-09-29 against acpx@ae4b91d0 and
+ * acpx-ui@b12b346b; full evidence in brick e30b3f6a,
+ * `agents/9ac01585…/CREDENTIAL-SEMANTICS.md`.
+ *
+ * ## ⚠️ STATED LIMITATION — this makes the transcript INGESTIBLE, not RESUMABLE
+ *
+ * `src/config/subscription-transcript.ts` searches only registry-listed config
+ * dirs, so acpx's own transcript recovery still cannot find this one. That is
+ * unchanged from the `tmpdir()` behaviour and deliberately out of scope; it is
+ * recorded here so a future reader does not mistake ingestion for resumption.
+ *
+ * ## 🛑 TWO "IMPROVEMENTS" THAT ARE THE BUG
+ *
+ * 1. **Moving this back under `tmpdir()`** — it reads as tidier and it re-opens
+ *    the silent-$0 hole in full.
+ * 2. **Dropping the prefix, or naming the dir after anything an operator picks** —
+ *    it reads as cleaner and it can shadow a registry id.
+ *
+ * `test/openrouter-transcript-ingestible.test.ts` goes red for either, and
+ * carries the `tmpdir()` layout as a committed negative case so the rule is
+ * exercised in both directions forever.
+ */
+export function openRouterHarnessHomeDir(sessionId: string): string {
+  return join(subscriptionsDir(), `${OPENROUTER_HARNESS_HOME_PREFIX}${sessionId}`);
+}
+
+/**
  * Start the OpenRouter shim for a session and shape the spawn env around it.
  *
  * ⚠️ EXTRACTED SO THE TWO ROUTES CANNOT DRIFT (brick 007eaac8). The legacy
@@ -1733,8 +1809,10 @@ export async function startOpenRouterShimForSession(
   model: string,
   reasoningEffort: string | undefined,
 ): Promise<ShimHandle> {
-  // Isolate Claude config in a per-session temp dir (no OAuth inheritance).
-  const configDir = join(tmpdir(), `or-${sessionId}`);
+  // Isolate Claude config in a fresh per-session dir (no OAuth inheritance),
+  // sited where the usage ingester can read the transcript it will hold and
+  // where the PVC will keep it — `openRouterHarnessHomeDir` carries both reasons.
+  const configDir = openRouterHarnessHomeDir(sessionId);
   mkdirSync(configDir, { recursive: true });
   env.CLAUDE_CONFIG_DIR = configDir;
 

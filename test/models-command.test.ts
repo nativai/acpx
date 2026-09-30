@@ -16,6 +16,7 @@ import {
   validateSessionModelFlags,
 } from "../src/models/model-slug-validation.js";
 import type { CanonicalDepthLevel, ModelCatalogue } from "../src/models/types.js";
+import { entitleAll } from "./entitlement-test-helpers.js";
 
 const META = { fetchedAt: "2026-09-04T00:00:00.000Z", stale: false, error: null };
 
@@ -56,6 +57,24 @@ const CODEX_FIXTURES = [
   codexFixture("gpt-5.6-luna", ["low", "medium", "high", "xhigh", "max"]),
 ];
 
+/**
+ * The slug used by the legs that go through `loadCatalogue` inside the CLI and so
+ * cannot take an injected allowed set.
+ *
+ * ⚠️ **IT NO LONGER HAS TO BE "ENTITLED", AND THAT IS THE POINT OF brick ecfb0461.**
+ * Under the old two-list design this had to be read out of a hardcoded module or the
+ * row would be refused by acpx's own copy of the policy. There is no such copy now:
+ * the allowed set comes from the box key, these legs run under an isolated
+ * `ACPX_STATE_HOME` with no `providers.json`, and the suite bootstrap forbids the
+ * network read outright (`test/box-env-scrub.ts`). So the set reads UNKNOWN, the
+ * product FAILS OPEN, and any slug is available — which is exactly the production
+ * behaviour on a box whose cache is cold.
+ *
+ * It keeps a realistic value so a reader is not misled about the shape of an
+ * OpenRouter id; nothing asserts on its membership anywhere.
+ */
+const ENTITLED_SEEDED_SLUG = "qwen/qwen3.8-flash";
+
 /** node:assert's `throws` returns void, so the thrown value is captured here. */
 function caught(fn: () => unknown): ModelSlugError {
   try {
@@ -68,25 +87,31 @@ function caught(fn: () => unknown): ModelSlugError {
 }
 
 function catalogueWith(): ModelCatalogue {
-  return buildCatalogue(
-    [
-      {
-        id: "moonshotai/kimi-k3",
-        name: "MoonshotAI: Kimi K3",
-        supported_parameters: ["tools"],
-        reasoning: { supported_efforts: ["low", "high", "max"], default_effort: "max" },
-      },
-      {
-        id: "deepseek/deepseek-v4-pro",
-        name: "DeepSeek: DeepSeek V4 Pro",
-        supported_parameters: ["tools"],
-        reasoning: { supported_efforts: ["high", "xhigh"], default_effort: "high" },
-      },
-      { id: "mistralai/large-3", name: "Mistral Large 3", supported_parameters: ["tools"] },
-    ],
-    META,
-    { nativeModels: [...harnessNativeModels(), ...CODEX_FIXTURES] },
-  );
+  const rows = [
+    {
+      id: "moonshotai/kimi-k3",
+      name: "MoonshotAI: Kimi K3",
+      supported_parameters: ["tools"],
+      reasoning: { supported_efforts: ["low", "high", "max"], default_effort: "max" },
+    },
+    {
+      id: "deepseek/deepseek-v4-pro",
+      name: "DeepSeek: DeepSeek V4 Pro",
+      supported_parameters: ["tools"],
+      reasoning: { supported_efforts: ["high", "xhigh"], default_effort: "high" },
+    },
+    { id: "mistralai/large-3", name: "Mistral Large 3", supported_parameters: ["tools"] },
+  ];
+  // ⚠️ `entitleAll` holds the allowed-set dimension constant (brick ecfb0461). Every
+  // row above is a synthetic id no real key allows, so without this the rows would be
+  // unavailable for claude and pi — and the tests in this file whose subject is slug
+  // parsing, the id FORM, effort ladders or provisioning would fail for a reason
+  // unrelated to what they assert. Injected rather than read, so nothing here depends
+  // on whether THIS box has a warm entitlement cache.
+  return buildCatalogue(rows, META, {
+    nativeModels: [...harnessNativeModels(), ...CODEX_FIXTURES],
+    entitlement: entitleAll(rows),
+  });
 }
 
 // ── Reference parsing ────────────────────────────────────────────────────────
@@ -650,12 +675,12 @@ test("a provisioning harness is VALIDATED but NEVER SUBSTITUTED — the flag rea
   // create path must hand the spawn exactly what the caller wrote; naming a better
   // form is `availability.<agent>.modelId`'s job (brick c4da2ff2), and GUESSING one
   // here is the picker's `source + "/" + id` trap.
-  const home = stateHome(); // seeds a cache holding moonshotai/kimi-k3
+  const home = stateHome(); // seeds a cache holding ENTITLED_SEEDED_SLUG
   const previous = process.env.ACPX_STATE_HOME;
   process.env.ACPX_STATE_HOME = home;
   try {
     for (const agentCommand of PI_COMMANDS) {
-      for (const model of ["moonshotai/kimi-k3", "openrouter/moonshotai/kimi-k3"]) {
+      for (const model of [ENTITLED_SEEDED_SLUG, `openrouter/${ENTITLED_SEEDED_SLUG}`]) {
         assert.equal(
           await validateSessionModelFlags({
             agentName: "pi",
@@ -705,8 +730,12 @@ test("`--reasoning-effort` is NOT judged for a provisioning harness", async () =
         agentName: "pi",
         agentCommand: PI_COMMAND,
         hasRawAgentOverride: false,
-        model: "moonshotai/kimi-k3",
-        // `medium` is NOT on kimi-k3's ladder (low, high, max) — a native-row harness
+        // This leg goes through `loadCatalogue`, which establishes the allowed set
+        // itself. Under the isolated `stateHome` there is no key and the suite
+        // forbids the network read, so the set is UNKNOWN and the product fails
+        // open — see `ENTITLED_SEEDED_SLUG`.
+        model: ENTITLED_SEEDED_SLUG,
+        // `medium` is NOT on this row's ladder (low, high, max) — a native-row harness
         // would refuse this, and the CONTROL below shows the ladder check is live.
         reasoningEffort: "medium",
       }),
@@ -805,6 +834,21 @@ function stateHome(): string {
         {
           id: "moonshotai/kimi-k3",
           name: "MoonshotAI: Kimi K3",
+          supported_parameters: ["tools"],
+          context_length: 1_048_576,
+          pricing: { prompt: "0.000003", completion: "0.000015" },
+          reasoning: { supported_efforts: ["low", "high", "max"], default_effort: "max" },
+        },
+        {
+          // Rows reached through this seeded cache go through `loadCatalogue` inside
+          // the CLI, which establishes the allowed set itself and takes NO injection
+          // point — so unlike `catalogueWith()` above, `entitleAll` cannot help here.
+          // Under the isolated state home the set is UNKNOWN and the product fails
+          // open, so the row is available (brick ecfb0461; see `ENTITLED_SEEDED_SLUG`).
+          // The ladder is deliberately the same as kimi-k3's, so `medium` is off-ladder
+          // for this row too and the effort-gate rows keep their negative input.
+          id: ENTITLED_SEEDED_SLUG,
+          name: "Qwen3.8 Flash",
           supported_parameters: ["tools"],
           context_length: 1_048_576,
           pricing: { prompt: "0.000003", completion: "0.000015" },

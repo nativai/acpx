@@ -54,6 +54,8 @@ import {
   UnsupportedPromptContentError,
 } from "../errors.js";
 import { FileSystemHandlers } from "../filesystem.js";
+import { assertModelPolicy } from "../models/claude-family.js";
+import { formatEntitlementUnknown } from "../models/openrouter-entitlement.js";
 import {
   classifyPermissionDecision,
   decisionToResponse,
@@ -1178,6 +1180,49 @@ export class AcpClient {
         this.latestProvisioningWarning = warning;
       },
     );
+    // ── P0: model POLICY, before any credential or route work (brick 30eb2003) ──
+    //
+    // ★ THE ENFORCEMENT for "Claude-family models are not available on the
+    // OpenRouter route". Sited HERE, above `applyBoxProviderEnv` and
+    // `applyProfileEnv`, for one reason: this method is the single convergence
+    // point of EVERY adapter spawn — create, acpx-ui create, an inherited child
+    // with no `--model`, `sessions copy`/fork, `--from-template`, and resume — so
+    // one harness-agnostic line covers all of them, including the four that brick
+    // 61731179 shows bypass the `--model` flag gate entirely.
+    //
+    // ⚠️ IT ABORTS THE SPAWN, in the same shape `startPickerShim`'s own refusal
+    // uses. The tempting alternative — quietly withholding the model from pi's
+    // provisioning below — is a NO-OP: pi's bundled catalogue already carries 33
+    // Claude-family rows, so not writing the id does not stop pi serving it. See
+    // `assertModelPolicy`.
+    //
+    // ⚠️ It reads NEITHER claude's routing NOR pi's provisioning, and changes
+    // neither. Both hooks below are untouched.
+    //
+    // ⚠️ ITS ONE BOUND, STATED SO NOBODY OVERCLAIMS IT: this covers every spawn
+    // that BUILDS A LAUNCH PLAN. `start()` returns early when the connection and
+    // the agent child are both already alive, so an ALREADY-RUNNING adapter is not
+    // reached and a live metered session keeps running until its owner dies. It is
+    // not, however, defeated by a live SHIM: `applyProfileEnv`'s
+    // `reinjectRunningShim` short-circuit is BELOW this line, so a cold respawn
+    // whose shim survived is still refused here.
+
+    // ⚠️ THE FAIL-OPEN NOTE FOLLOWS THE SAME NON-DEDUP RULE AS THE CONFLICT WARNING
+    // BELOW, AND FOR THE SAME REASON: per spawn, every spawn. A once-per-process
+    // line is indistinguishable from a check that stopped running, and the reader
+    // who needs it is looking at THIS spawn's stderr, not at the first spawn of a
+    // long-lived queue owner.
+    //
+    // ⚠️ It is a NOTE, not a warning: under one authority (brick ecfb0461) the key
+    // still enforces its own allowed set, so acpx not being able to read that set
+    // costs a clean local refusal and nothing else. Calling it a warning would
+    // invite an operator to treat a cold cache as an incident.
+    assertModelPolicy(this.options.agentCommand, this.options.sessionOptions?.model, {
+      profileId: this.options.sessionOptions?.profile,
+      onEntitlementUnknown: (entitlement) => {
+        process.stderr.write(`[acpx] note: ${formatEntitlementUnknown(entitlement)}\n`);
+      },
+    });
     // Box-scoped provider credentials (~/.acpx/providers.json) — adapter-agnostic,
     // and a strict fallback: it never overwrites a variable that is already set.
     // Deliberately BEFORE applyProfileEnv for predictable ordering; the two do not

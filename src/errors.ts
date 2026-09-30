@@ -13,6 +13,23 @@ type AcpxErrorOptions = ErrorOptions & {
   retryable?: boolean;
   acp?: OutputErrorAcpPayload;
   outputAlreadyEmitted?: boolean;
+  /**
+   * WHICH POLICY refused this, as a stable machine-readable token — the SAME token
+   * the catalogue puts on `availability.<agent>.reason` (brick daed4261).
+   *
+   * ⚠️ **IT EXISTS BECAUSE `detailCode` CANNOT ANSWER THE QUESTION.** One policy is
+   * enforced at two tiers that necessarily carry different `detailCode`s — the Tier 1
+   * `--model` gate answers `MODEL_NOT_AVAILABLE_FOR_AGENT` (it is the generic
+   * availability refusal) while the spawn-path guard answers
+   * `OPENROUTER_MODEL_NOT_ENTITLED`. So *"was this refused for entitlement?"* was
+   * answerable only by matching prose, which is exactly the coupling a refusal
+   * message must not create: the wording is tuned for an agent to READ and is
+   * expected to change.
+   *
+   * `policyReason` is the same on both tiers for one policy, so a caller
+   * discriminates on it and never on the message.
+   */
+  policyReason?: string;
 };
 
 export class AcpxOperationalError extends Error {
@@ -22,6 +39,8 @@ export class AcpxOperationalError extends Error {
   readonly retryable?: boolean;
   readonly acp?: OutputErrorAcpPayload;
   readonly outputAlreadyEmitted?: boolean;
+  /** Which POLICY refused this — see `AcpxErrorOptions.policyReason`. */
+  readonly policyReason?: string;
 
   constructor(message: string, options?: AcpxErrorOptions) {
     super(message, options);
@@ -32,6 +51,7 @@ export class AcpxOperationalError extends Error {
     this.retryable = options?.retryable;
     this.acp = options?.acp;
     this.outputAlreadyEmitted = options?.outputAlreadyEmitted;
+    this.policyReason = options?.policyReason;
   }
 }
 
@@ -399,30 +419,59 @@ export class AutomationCapacityReservedError extends AcpxOperationalError {
 }
 
 /**
- * The local acpx-ui telemetry endpoint could not positively admit a Codex turn.
- * This is deliberately a pre-provider terminal: callers must not retry through
- * a different account or infer that the observation means zero usage.
+ * A Codex turn was held before provider submission. Exactly two things can
+ * produce this, and the message names which:
+ *
+ *   "at-cap"      — the local weekly observation is AT OR OVER this box's cap,
+ *                   inside a window that has not yet reset. It clears by itself
+ *                   at `resetsAt`, which the message states.
+ *   "read-failed" — the same-box acpx-ui quota endpoint could not be read. That
+ *                   is a dependency outage, not a usage fact; it clears when
+ *                   acpx-ui answers again.
+ *
+ * Missing, stale or post-reset telemetry never reaches here — the gate admits on
+ * all three, because that observation only advances when an admitted Codex turn
+ * runs (`runtime/engine/codex-subscription-cap.ts`).
+ *
+ * Deliberately a pre-provider terminal: callers must not retry through a
+ * different account, and must not read an at-cap hold as anything but this box's
+ * own local policy on an account-global quota.
  */
 export class CodexSubscriptionCapError extends AcpxOperationalError {
   readonly codexSubscriptionCap: CodexSubscriptionCapDetail;
 
   constructor(detail: CodexSubscriptionCapDetail) {
-    const observed =
-      detail.observedWeeklyPercent === undefined
-        ? "no usable weekly observation"
-        : `${detail.observedWeeklyPercent.toFixed(1)}% weekly utilization`;
-    super(
-      `Codex subscription cap held before provider submission: ${observed} ` +
-        `(${detail.status}; local box cap ${detail.weeklyCapPercent.toFixed(1)}%).`,
-      {
-        outputCode: "RUNTIME",
-        detailCode: "codex-subscription-cap",
-        origin: "runtime",
-        retryable: true,
-      },
-    );
+    super(codexSubscriptionCapMessage(detail), {
+      outputCode: "RUNTIME",
+      detailCode: "codex-subscription-cap",
+      origin: "runtime",
+      retryable: true,
+    });
     this.codexSubscriptionCap = detail;
   }
+}
+
+function codexSubscriptionCapMessage(detail: CodexSubscriptionCapDetail): string {
+  const prefix = "Codex subscription cap held before provider submission";
+  const cap = `local box cap ${detail.weeklyCapPercent.toFixed(1)}%`;
+  if (detail.status !== "at-cap") {
+    return (
+      `${prefix}: the local acpx-ui quota endpoint could not be read, so this box ` +
+      `cannot check its weekly usage (${cap}). This is an acpx-ui outage, not a ` +
+      `usage reading — it clears when the endpoint answers again.`
+    );
+  }
+  const observed =
+    detail.observedWeeklyPercent === undefined
+      ? "weekly utilization at or above the cap"
+      : `${detail.observedWeeklyPercent.toFixed(1)}% weekly utilization`;
+  const age = detail.observationFreshness === "stale" ? ", reading is stale" : "";
+  const asOf = detail.capturedAt === undefined ? "" : ` as of ${detail.capturedAt}${age}`;
+  const resets =
+    detail.resetsAt === undefined
+      ? " The hold clears when the weekly window resets."
+      : ` The hold clears when the weekly window resets at ${detail.resetsAt}.`;
+  return `${prefix}: ${observed}${asOf} (${cap}).${resets}`;
 }
 
 // Every Fable-eligible subscription rejects claude-fable-5 with 429 while the

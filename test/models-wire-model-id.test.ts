@@ -28,6 +28,7 @@ import { composeEffectiveModelId, parseModelRef } from "../src/models/model-slug
 import type { OpenRouterSnapshot } from "../src/models/openrouter-catalogue.js";
 import type { DepthDescriptor } from "../src/models/types.js";
 import { deriveWireModelId } from "../src/models/wire-model-id.js";
+import { entitleAll } from "./entitlement-test-helpers.js";
 
 const FIXTURE_PATH = path.resolve(process.cwd(), "test/fixtures/openrouter-models-2026-09-04.json");
 
@@ -203,6 +204,10 @@ test("a source-prefixed harness gets the PREFIXED id and a bare one does not —
       capability({ id: "baring", idForm: "bare" }),
     ],
     nativeModels: [],
+    // The subject is the ID FORM, so the entitlement dimension is held constant —
+    // an unentitled row carries no `modelId` at all and there would be nothing to
+    // compare. See `entitlement-test-helpers`.
+    entitlement: entitleAll(rows),
   });
   const model = catalogue.models.find((row) => row.selectable);
   assert.ok(model, "the fixture slice must contain a selectable row");
@@ -294,7 +299,12 @@ test("claude is NOT reported as a fixed backend — the correctness fix, on the 
   // shim later moves this test instead of breaking it.
   const claude = listHarnessCapabilities().find((row) => row.id === "claude");
   assert.ok(claude);
-  const catalogue = buildCatalogue(fixture().models, META);
+  // The subject is the REASON claude gives for a denial — `acpx-not-wired` versus the
+  // permanent `agent-fixed-backend`. The entitlement layer would answer first with a
+  // third reason and the derivation under test would never be reached, so it is held
+  // constant here. `test/openrouter-entitlement.test.ts` is where it IS the subject.
+  const rows = fixture().models;
+  const catalogue = buildCatalogue(rows, META, { entitlement: entitleAll(rows) });
   const openRouter = catalogue.models.find((row) => row.source === "openrouter" && row.selectable);
   assert.ok(openRouter);
 

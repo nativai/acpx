@@ -222,6 +222,45 @@ export type ModelCatalogue = {
   stale: boolean;
   /** Human-readable when the upstream fetch failed. */
   error: string | null;
+  /**
+   * WHETHER THE PER-AGENT AVAILABILITY ABOVE IS NARROWED BY THE BOX KEY, OR MERELY
+   * UNCHECKED (brick ecfb0461).
+   *
+   * 🛑 **A CONSUMER CANNOT TELL "NARROWED" FROM "UNKNOWN" WITHOUT THIS, AND THE
+   * DIFFERENCE IS THE WHOLE ANSWER TO "WHAT MAY I USE?".** Under fail-open an
+   * unreadable key answer leaves every row `ok: true` — a catalogue that looks
+   * *identical* to a box whose key genuinely allows everything. So `acpx models list`
+   * was reporting ~310 available models, unhedged, on a cold / corrupt / 401'd read,
+   * and `/api/models` handed the picker no way to qualify it.
+   *
+   * The spawn path already said so (`formatEntitlementUnknown` on stderr). This is
+   * the same statement on the READ path, which is the surface an agent actually
+   * queries.
+   *
+   * ⚠️ **`source` IS THE DISCRIMINATOR, NOT `note`.** The picker is a machine: it
+   * keys on `source === "unknown"` and never on prose, because the wording is tuned
+   * for an agent to read and is expected to change.
+   */
+  entitlement: CatalogueEntitlement;
   counts: CatalogueCounts;
   models: CatalogueModel[];
+};
+
+/** How well the catalogue knows what the box's OpenRouter key allows. */
+export type CatalogueEntitlement = {
+  /**
+   * `"key"`     — the set came from the key's own answer, so the per-agent
+   *               availability above is genuinely narrowed to it.
+   * `"unknown"` — acpx could not establish it and **narrowed nothing**. Every
+   *               OpenRouter row reads available; that is fail-open, not a claim
+   *               that the key allows them. The key still refuses at call time.
+   */
+  source: "key" | "unknown";
+  /** The set was read, but from a cache older than its TTL. */
+  stale: boolean;
+  /**
+   * Why it is `unknown` or `stale`, in one sentence — for a human. **Never parse
+   * it**; branch on `source` / `stale`. `null` when the set is known and fresh.
+   */
+  note: string | null;
 };
