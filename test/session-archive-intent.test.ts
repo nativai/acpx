@@ -23,12 +23,11 @@ import {
  *
  * ⚠️ THE SCHEDULER'S ASSUMPTION WAS NOT UNREASONABLE, and that is why the fix is
  * a refusal rather than a corrected default. `sessions archive` was the ONLY one
- * of the five dry-run-bearing verbs on this surface with an inverted polarity —
- * `prune`, `templates migrate-slugs`, `repair-account-seam` and
- * `sweep-config-dirs` all declare only an affirmative `--dry-run`, so bare means
- * APPLY for every one of them. Generalising that to archive is the natural
- * reading. Refusing silence removes this verb from the inconsistency instead of
- * adding a sixth variant.
+ * of the dry-run-bearing verbs on this surface with an inverted polarity —
+ * `prune`, `templates migrate-slugs` and `repair-account-seam` all declare only
+ * an affirmative `--dry-run`, so bare means APPLY for every one of them.
+ * Generalising that to archive is the natural reading. Refusing silence removes
+ * this verb from the inconsistency instead of adding another variant.
  *
  * ⚠️ THESE ARE VECTOR-LEVEL TESTS AGAINST THE REAL PARSER, DELIBERATELY. The
  * acpx-ui test that missed this asserted on an argv array handed to a FAKE, and
