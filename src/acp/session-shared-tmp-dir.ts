@@ -170,11 +170,27 @@ export function sessionSharedTmpDirFor(sessionId: string, root: string): string 
  * got created fails LOUDLY at the point of use (ENOENT) rather than silently
  * landing somewhere else.
  *
- * Idempotent and safe to call on every spawn of a resumed session: re-running
- * `chmod` on an already-0700 directory is a no-op, so this also self-heals a
- * directory whose mode drifted under a still-open session — which matters more
- * here than for tier 1, since this directory outlives pod restarts and can
- * therefore be much older than the process looking at it.
+ * Idempotent, and safe to call on every spawn of a resumed session: re-running
+ * `mkdir`+`chmod` against an existing 0700 directory is a no-op, so a resumed
+ * session keeps whatever it left there.
+ *
+ * ⚠️ **BUT THIS RUNS ONCE PER OWNER SPAWN, NOT PER TURN — NOTHING IS MAINTAINED
+ * WHILE A SESSION IS LIVE.** It is called from `buildAgentEnvironment`
+ * (`auth-env.ts`) as the agent process's environment is composed, so it fires
+ * when a queue owner STARTS and not again for the turns that owner serves. A
+ * mode that drifts, or a directory that is deleted, is therefore repaired at
+ * the NEXT owner spawn — a `sessions recover`, or an idle release followed by a
+ * re-prompt — and **not** at the next prompt to a still-running owner.
+ * MEASURED (brick f61391ac verification, 2026-09-30): deleting a live session's
+ * directory and then re-prompting did NOT recreate it; `sessions recover` plus
+ * a re-prompt did, at `700`.
+ *
+ * That is coherent rather than a gap, and the reason is the best-effort clause
+ * above: the variable still names the documented path, so a write into a
+ * directory that is missing fails LOUDLY with ENOENT at the point of use
+ * instead of silently landing somewhere else. Do not "fix" this by re-ensuring
+ * per turn — that would put a filesystem call on the turn-serving path to
+ * defend against a case that already fails safely.
  */
 export function ensureSessionSharedTmpDir(
   sessionId: string,
