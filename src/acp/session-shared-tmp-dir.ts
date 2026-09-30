@@ -23,12 +23,27 @@ import { join } from "node:path";
  * used as measured 2026-09-30) — and is therefore SWEPT. Reach for it only when
  * the workbench must read the file, or it must outlive a pod restart.
  *
- * ## ⚠️ TEMPORARY SEMANTICS ARE IN THE NAME, AND THEY ARE ENFORCED
+ * ## ⚠️ TEMPORARY SEMANTICS ARE IN THE NAME — AND NOTHING ENFORCES THEM
  *
- * `_TMP` is not decoration. `scripts/sweep-shared-tmp.sh` removes any
- * `acpx-*` child of the root whose ENTIRE SUBTREE has been untouched for more
- * than 7 days. Anything you will later cite is not scratch and belongs in the
- * brick folder (tier 3), which is never swept.
+ * `_TMP` is a promise the WRITER keeps, not one the system collects on: there
+ * is deliberately **no reclaim mechanism** for this tier. Nothing sweeps it,
+ * nothing expires it, and unlike tier 1 there is no pod restart to wipe it —
+ * whatever you leave here stays until someone removes it. So treat it as
+ * scratch by discipline: anything you will later cite is not scratch at all and
+ * belongs in the brick folder (tier 3).
+ *
+ * ⚠️ **DO NOT ADD A REAPER FOR THIS. IT LOOKS LIKE THE OBVIOUS MISSING PIECE
+ * AND IT HAS ALREADY BEEN DISCARDED TWICE.** v1 of tier 1 (brick ceca191f)
+ * shipped this same kind of variable WITH a reaper; Daniel measured the real
+ * footprint — 0.27 GB across the box's entire 6,844-session lifetime — and
+ * removed it (7a89ec64) as a mechanism solving a problem that did not exist, at
+ * the cost it was built at. The tier-2 design then re-introduced one, and it
+ * was cut again before it shipped (2026-09-30, Daniel: *"we don't want to
+ * implement any automatic cleanup no sweeping"*). **The default for scratch on
+ * this fleet is NO reclaim mechanism until a MEASUREMENT demands one** — not a
+ * well-designed reclaim mechanism. If accumulation here ever becomes real,
+ * measure it first; the answer is a separate, deliberate decision, and the
+ * measurement is the thing that licenses it.
  *
  * ## `SHARED` MEANS BETWEEN PODS — IT IS NOT AN ACCESS STATEMENT
  *
@@ -46,20 +61,20 @@ export const SESSION_SHARED_TMP_DEFAULT_ROOT = "/workspace/.session-scratch";
  * ⚠️ **NOT `/workspace/.scratch`, AND NOT BY ACCIDENT.** That path ALREADY
  * EXISTS on devbox (measured 2026-09-30: 284 MB, 6 entries dated Sep 5–13,
  * referenced nowhere in the Operating System) — itself an instance of the
- * hand-rolled scratch sprawl this tier exists to replace. Cohabiting would have
- * been *safe*, since the sweeper only ever touches `acpx-*` children and none of
- * those 6 entries match. It is avoided because an EXCLUSIVELY acpx-owned root
- * buys a strictly stronger sweeper contract: the sweeper can assert that every
- * child is `acpx-*` and warn on anything else, which is unavailable the moment
- * the root is shared with hand-made files.
+ * hand-rolled scratch sprawl this tier exists to replace. Writing acpx's
+ * per-session directories into someone else's hand-made directory would
+ * entangle the two populations: this root is EXCLUSIVELY acpx-owned, so
+ * everything in it is `acpx-<recordId>` and anything else is immediately
+ * recognisable as not ours.
  *
  * ⚠️ **AND NOT `/workspace/.tmp`** — that was v1's `ACPX_SESSION_TMP` root.
  * Reusing the name invites exactly the tier-1/tier-2 confusion the three-tier
  * model exists to remove.
  *
  * ⚠️ **AND NOT `/workspace/projects/temp/`** — that path sits inside the
- * *projects* namespace and holds LIVE GIT WORKTREES, so a sweeper over it would
- * delete branches' working directories.
+ * *projects* namespace and holds LIVE GIT WORKTREES, so anything operating over
+ * it in bulk would be operating on branches' working directories. It stays what
+ * it is: a human/task-named throwaway area, outside this model.
  *
  * Hidden (leading dot) because the `/workspace` root listing is already ~2,488
  * entries; the fix must not add a 2,489th visible one. Discoverability comes
@@ -72,10 +87,11 @@ const SESSION_SHARED_TMP_DIR_PREFIX = "acpx-";
  * `ACPX_HARNESS_CONFIG_DIR_ROOT` — the only form that can scope a CHILD process
  * nobody edited, which is what the test suite needs.
  *
- * Scoping matters MORE here than for tier 1: the real default is on the PVC, so
- * an unscoped suite run would strew synthetic-recordId debris across the box's
- * real, swept scratch root. `test/session-shared-tmp-test-root.ts` pins it from
- * the `--import` preload, by construction rather than per-row opt-in.
+ * Scoping matters MORE here than for tier 1: the real default is on the PVC and
+ * nothing reclaims it, so an unscoped suite run would strew synthetic-recordId
+ * debris across the box's real scratch root and leave it there indefinitely.
+ * `test/session-shared-tmp-test-root.ts` pins it from the `--import` preload,
+ * by construction rather than per-row opt-in.
  *
  * ⚠️ Deliberately NOT part of `ssh-remote`'s forwarded set, and never should be
  * — a scratch path from one box names nothing meaningful on another, identical
@@ -90,8 +106,10 @@ export const SESSION_SHARED_TMP_ROOT_ENV = "ACPX_SESSION_SHARED_TMP_ROOT";
  * then the real default. A blank/whitespace-only value at either level is
  * treated as ABSENT, not as the empty string — `join("", id)` would otherwise
  * resolve to a path relative to the process cwd, i.e. a scratch directory
- * wherever the CLI happened to be invoked from, and a sweeper rooted there
- * reports a truthful, entirely clean census over the wrong directory.
+ * wherever the CLI happened to be invoked from. Nothing would error: the
+ * session would simply write its scratch into some unrelated working
+ * directory, and the agent looking for it under the documented root would find
+ * an empty one.
  */
 export function resolveSessionSharedTmpRoot(
   explicit?: string,
@@ -109,13 +127,12 @@ export function resolveSessionSharedTmpRoot(
 }
 
 /**
- * `<root>/acpx-<sessionId>` — the only place this path is composed, so neither a
- * future reader nor the sweeper has any reason to re-type it.
+ * `<root>/acpx-<sessionId>` — the only place this path is composed, so a future
+ * reader has no reason to re-type it.
  *
- * ⚠️ The `acpx-` prefix is part of the SWEEPER's contract, not cosmetics:
- * `scripts/sweep-shared-tmp.sh` only ever considers children matching `acpx-*`,
- * so a directory composed any other way would be invisible to the retention
- * policy this tier promises — durable in a place documented as temporary.
+ * The `acpx-` prefix makes every entry in the root self-identifying: the root
+ * is acpx-owned, so anything there NOT matching `acpx-*` did not come from
+ * here.
  */
 export function sessionSharedTmpDirFor(sessionId: string, root: string): string {
   return join(root, `${SESSION_SHARED_TMP_DIR_PREFIX}${sessionId}`);

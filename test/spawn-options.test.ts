@@ -617,11 +617,11 @@ test("buildAgentSpawnOptions: ACPX_AGENT_FOLDER coexists with the URL session va
 // ⚠️ brick f61391ac — IT SCOPES BOTH ROOTS, AND THE SECOND ONE IS THE URGENT
 // ONE. `buildAgentSpawnOptions` now also creates the TIER-2 directory
 // (`ACPX_SESSION_SHARED_TMP`), whose real default root is
-// `/workspace/.session-scratch` — on the PVC, the box's TIGHT filesystem, and
-// swept on a 7-day timer rather than wiped by a pod restart. So an unscoped row
-// here does not merely litter `/tmp`: it plants synthetic-recordId debris
+// `/workspace/.session-scratch` — on the PVC, the box's TIGHT filesystem, with
+// NO pod restart to wipe it and deliberately no reaper. So an unscoped row here
+// does not merely litter `/tmp`: it plants synthetic-recordId debris
 // (`acpx-child-id`, …) in the box's real shared scratch root, where it is
-// indistinguishable from a live session's directory and survives for a week.
+// indistinguishable from a live session's directory and stays indefinitely.
 // Every row below therefore gets both roots pinned, whether it looks at tier 2
 // or not.
 function withScopedSessionTmpRoot<T>(fn: (root: string, sharedRoot: string) => T): T {

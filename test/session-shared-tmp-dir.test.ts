@@ -20,17 +20,17 @@ function withScopedRoot<T>(fn: (root: string) => T): T {
   }
 }
 
-// The default root is the one fact the SWEEPER also depends on — it resolves the
-// root by importing this module rather than re-typing the literal, so a change
-// here that the sweeper did not see is impossible by construction. This row
-// pins the value the primer and the sweeper's own fixture both quote.
+// The default root is a PUBLISHED path: the primer teaches it, and agents will
+// hard-code it in shell one-liners long after this module is last read. Pinning
+// it here means a change to it is a deliberate act with a red test, not a quiet
+// edit that silently relocates every session's scratch.
 test("the default root is /workspace/.session-scratch — NOT the pre-existing /workspace/.scratch", () => {
   assert.equal(SESSION_SHARED_TMP_DEFAULT_ROOT, "/workspace/.session-scratch");
   assert.notEqual(
     SESSION_SHARED_TMP_DEFAULT_ROOT,
     "/workspace/.scratch",
     "/workspace/.scratch already exists with unrelated hand-made content (measured 2026-09-30); " +
-      "tier 2 owns its root exclusively so the sweeper may warn on any non-acpx-* child",
+      "tier 2 owns its root exclusively so every entry in it is recognisably acpx's",
   );
 });
 
@@ -53,9 +53,9 @@ test("resolveSessionSharedTmpRoot precedence: explicit arg > env > default", () 
 });
 
 // Acceptance criterion 4, the half that is easy to get wrong: `FOO=` in an env
-// file yields "" , and `join("", id)` is a path RELATIVE TO THE PROCESS CWD —
-// a scratch directory wherever the CLI happened to be invoked from, and a
-// sweeper that reports a clean census over the wrong place.
+// file yields "", and `join("", id)` is a path RELATIVE TO THE PROCESS CWD — a
+// scratch directory wherever the CLI happened to be invoked from, with nothing
+// erroring and the documented root sitting empty.
 test("a blank ACPX_SESSION_SHARED_TMP_ROOT is ABSENT, never a cwd-relative path", () => {
   const previous = process.env[SESSION_SHARED_TMP_ROOT_ENV];
   try {
