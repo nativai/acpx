@@ -182,7 +182,12 @@ function storePath(homeDir: string): string {
 
 type PersistedRow = Record<string, unknown>;
 
-/** A well-formed persisted seat row. `closed_at` is present and `null` — never absent. */
+/**
+ * A well-formed persisted seat row. `closed_at` is present and `null` — never
+ * absent; `favorite` likewise, matching what `mintSeatRow` / any real write emits
+ * post-D-STAR. `FV6` in the favorite group tests the OTHER shape — a row that
+ * predates the field entirely, by omitting it via `overrides`.
+ */
 function seatRow(seatId: string, overrides: PersistedRow = {}): PersistedRow {
   return {
     seat_id: seatId,
@@ -190,6 +195,7 @@ function seatRow(seatId: string, overrides: PersistedRow = {}): PersistedRow {
     active_holder_id: `aaaaaaaa-0000-4000-8000-${seatId.slice(-12)}`,
     next_ordinal: 2,
     closed_at: null,
+    favorite: false,
     ...overrides,
   };
 }
@@ -769,6 +775,137 @@ test("RN11 · the B7b note is TEXT-ONLY — a scripted caller's json payload car
   });
 });
 
+// ═══ Group FV — `seats favorite` (B2e, Daniel's D-STAR ruling) ════════════════
+//
+// The star belongs to the seat, not the session (D-STAR, 2026-09-30). This verb
+// writes the SEAT ROW ONLY, under the index lock, through the one writer —
+// `rename`'s single-hold shape, since a star has no holder state to vet either.
+
+test("FV1 · --on sets favorite:true; --off clears it; closed_at present and null; other fields byte-identical", async () => {
+  await withRig(async (homeDir) => {
+    const before = {
+      [SEAT_A]: seatRow(SEAT_A, { name: "alpha" }),
+      [SEAT_B]: seatRow(SEAT_B),
+    };
+    await writeStore(homeDir, before);
+
+    const on = await runCli(["seats", "favorite", SEAT_A, "--on"], homeDir);
+    assert.equal(on.code, 0, on.output);
+    const afterOn = await readStoreJson(homeDir);
+    assert.equal(afterOn[SEAT_A]?.favorite, true);
+    assert.ok(Object.hasOwn(afterOn[SEAT_A] as object, "closed_at"));
+    assert.equal(afterOn[SEAT_A]?.closed_at, null);
+    assert.deepEqual(
+      { ...afterOn[SEAT_A], favorite: undefined },
+      { ...before[SEAT_A], favorite: undefined },
+    );
+    assert.deepEqual(afterOn[SEAT_B], before[SEAT_B], "an unrelated seat is untouched");
+
+    const off = await runCli(["seats", "favorite", SEAT_A, "--off"], homeDir);
+    assert.equal(off.code, 0, off.output);
+    const afterOff = await readStoreJson(homeDir);
+    assert.equal(afterOff[SEAT_A]?.favorite, false);
+  });
+});
+
+test("FV2 · IDEMPOTENT — setting the value a seat already holds is a no-op and rewrites NOTHING", async () => {
+  await withRig(async (homeDir) => {
+    await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A, { favorite: false }) });
+
+    const first = await runCli(["--format", "json", "seats", "favorite", SEAT_A, "--off"], homeDir);
+    assert.equal(first.code, 0, first.output);
+    const payload = JSON.parse(first.stdout.trim()) as { changed: boolean; favorite: boolean };
+    assert.equal(payload.changed, false);
+    assert.equal(payload.favorite, false);
+
+    const bytes = await readStoreBytes(homeDir);
+    const second = await runCli(["seats", "favorite", SEAT_A, "--off"], homeDir);
+    assert.equal(second.code, 0, second.output);
+    assert.equal(
+      await readStoreBytes(homeDir),
+      bytes,
+      "a no-change mutation must not rewrite the store at all",
+    );
+  });
+});
+
+test("FV3 · exactly one of --on/--off is required — neither or both is refused, and nothing is written", async () => {
+  await withRig(async (homeDir) => {
+    await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A) });
+    const bytes = await readStoreBytes(homeDir);
+
+    const neither = await runCli(["--format", "json", "seats", "favorite", SEAT_A], homeDir);
+    assert.equal(neither.code, 1);
+    assert.equal(refusalOf(neither).code, "SEAT_FAVORITE_FLAG_INVALID");
+
+    const both = await runCli(
+      ["--format", "json", "seats", "favorite", SEAT_A, "--on", "--off"],
+      homeDir,
+    );
+    assert.equal(both.code, 1);
+    assert.equal(refusalOf(both).code, "SEAT_FAVORITE_FLAG_INVALID");
+
+    assert.equal(await readStoreBytes(homeDir), bytes, "a refused flag combination must not write");
+  });
+});
+
+test("FV4 · the two refusals are distinguishable, and neither writes — mirrors RN6/RN7′", async () => {
+  await withRig(async (homeDir) => {
+    await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A) });
+    const bytes = await readStoreBytes(homeDir);
+
+    const badRef = await runCli(
+      ["--format", "json", "seats", "favorite", "not-a-uuid", "--on"],
+      homeDir,
+    );
+    assert.equal(badRef.code, 1);
+    assert.equal(refusalOf(badRef).code, "SEAT_REF_INVALID");
+
+    const noRow = await runCli(
+      ["--format", "json", "seats", "favorite", SEAT_ABSENT, "--on"],
+      homeDir,
+    );
+    assert.equal(noRow.code, 1);
+    assert.equal(refusalOf(noRow).code, "SEAT_ROW_MISSING");
+
+    assert.equal(await readStoreBytes(homeDir), bytes);
+  });
+});
+
+test("FV5 · a malformed store refuses at the write seam, with the unfaulted control arm", async () => {
+  await withRig(async (homeDir) => {
+    await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A) });
+    const control = await runCli(["seats", "favorite", SEAT_A, "--on"], homeDir);
+    assert.equal(control.code, 0, control.output);
+    assert.equal((await readStoreJson(homeDir))[SEAT_A]?.favorite, true);
+
+    await writeRawStore(homeDir, "[]");
+    const bytes = await readStoreBytes(homeDir);
+    const faulted = await runCli(
+      ["--format", "json", "seats", "favorite", SEAT_A, "--off"],
+      homeDir,
+    );
+    assert.equal(faulted.code, 1);
+    assert.equal(refusalOf(faulted).code, "SEAT_STORE_UNWRITABLE");
+    assert.equal(await readStoreBytes(homeDir), bytes);
+  });
+});
+
+test("FV6 · a seat row written before `favorite` existed (no key on disk) starts un-starred, and --on stars it", async () => {
+  await withRig(async (homeDir) => {
+    // `favorite: undefined` is dropped by JSON.stringify — the shape of every seat
+    // on the fleet before this block's migration runs.
+    await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A, { favorite: undefined }) });
+    assert.ok(!Object.hasOwn((await readStoreJson(homeDir))[SEAT_A] as object, "favorite"));
+
+    const result = await runCli(["--format", "json", "seats", "favorite", SEAT_A, "--on"], homeDir);
+    assert.equal(result.code, 0, result.output);
+    const payload = JSON.parse(result.stdout.trim()) as { changed: boolean; favorite: boolean };
+    assert.equal(payload.changed, true, "absence must read as false, so --on is a real change");
+    assert.equal((await readStoreJson(homeDir))[SEAT_A]?.favorite, true);
+  });
+});
+
 // ═══ Group D — `seats delete` ═════════════════════════════════════════════════
 
 test("D1 · the row is gone and every other row is byte-identical", async () => {
@@ -1330,6 +1467,7 @@ test("CL5 · decideSeatClose — the pure CAS decision, all four branches, width
     closedAt: null,
     name: undefined,
     brickId: undefined,
+    favorite: false,
   };
 
   // Branch 1 — already closed.
@@ -2144,6 +2282,7 @@ test("RO7 · decideSeatReopen — the pure decision, both branches", () => {
     closedAt: null,
     name: undefined,
     brickId: undefined,
+    favorite: false,
   };
   assert.deepEqual(decideSeatReopen(row), { kind: "already-open" });
   assert.deepEqual(decideSeatReopen({ ...row, closedAt: "2026-09-28T00:00:00.000Z" }), {

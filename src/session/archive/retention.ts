@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { seatFromStore, type SeatStore } from "../persistence/seat-store.js";
 import { isNonSessionRecordFile } from "../persistence/session-dir-files.js";
 import {
   claimFileSets,
@@ -54,6 +55,18 @@ export type ManifestRetentionView = {
 export const EMPTY_MANIFEST_VIEW: ManifestRetentionView = {
   endOfLifeById: new Map(),
   lastRestoredAtById: new Map(),
+};
+
+/** A never-populated seat store — the default for a caller (or a test) that does
+ * not care about seat-aware protection. `fileState: "absent"` mirrors what
+ * `readSeatStore` itself returns for a box with no `seats.json` yet, so this is a
+ * real, valid `SeatStore` value and not a special case `seatFromStore` has to
+ * know about. */
+export const EMPTY_SEAT_STORE: SeatStore = {
+  seats: new Map(),
+  malformedSeatIds: [],
+  unparsedRows: new Map(),
+  fileState: "absent",
 };
 
 export type ArchiveCandidate = {
@@ -414,6 +427,7 @@ export function staticBlockerFor(
   candidate: ArchiveCandidate,
   boundaries: RetentionBoundaries,
   manifest: ManifestRetentionView = EMPTY_MANIFEST_VIEW,
+  seatStore: SeatStore = EMPTY_SEAT_STORE,
 ): { blocker: ArchiveBlocker; detail?: string } | undefined {
   if (candidate.files.some(isHostileFileName)) {
     // ⚠️ REFUSE, DO NOT ESCAPE. `MANIFEST.tsv`'s `file` column is the one column
@@ -428,7 +442,7 @@ export function staticBlockerFor(
     // reads as "possibly protected, skip this run", never as "safe to move".
     return { blocker: "record-unparseable", detail: candidate.recordDetail };
   }
-  const recordBlocker = recordBlockerFor(candidate.record);
+  const recordBlocker = recordBlockerFor(candidate.record, seatStore);
   if (recordBlocker) {
     return { blocker: recordBlocker };
   }
@@ -493,7 +507,25 @@ function restoreGraceBlockerFor(
   return { blocker: "recently-restored", detail: restoredAt };
 }
 
-function recordBlockerFor(record: ArchiveRecordView | undefined): ArchiveBlocker | undefined {
+/**
+ * ⚠️ SEAT-AWARE, PER D-STAR (2026-09-30) — the star belongs to the SEAT, not the
+ * session, so this no longer reads a per-record `favorite` at all. Only the seat's
+ * ACTIVE holder is protected; a RETIRED holder of the same starred seat is
+ * archivable. That is what dissolves the old cold-tier question outright: there is
+ * no "what if the only starred holder gets archived", because the star is not a
+ * property any holder carries any more.
+ *
+ * `seatFromStore` is used DELIBERATELY rather than a precomputed id set: it throws
+ * `MalformedSeatRowError` / `SeatStoreUnhealthyError` for a row or a whole store
+ * that is present and unreadable, and letting that propagate here is the correct
+ * failure direction for a destruction guard — silently treating "cannot tell if
+ * this seat is starred" as "not starred" is the one misclassification that could
+ * archive a record that should have stayed hot.
+ */
+function recordBlockerFor(
+  record: ArchiveRecordView | undefined,
+  seatStore: SeatStore,
+): ArchiveBlocker | undefined {
   if (!record) {
     return undefined;
   }
@@ -506,7 +538,14 @@ function recordBlockerFor(record: ArchiveRecordView | undefined): ArchiveBlocker
     // which is why this reads the record.
     return record.hasTemplate ? "template" : undefined;
   }
-  return record.favorite ? "favorite" : undefined;
+  if (record.seatId === undefined || !record.holderActive) {
+    // No seat (a record that predates the seat backfill — NOT the steady state),
+    // or a RETIRED holder: neither is the seat's active holder, so neither can be
+    // protected on the seat's behalf.
+    return undefined;
+  }
+  const seat = seatFromStore(seatStore, record.seatId);
+  return seat?.favorite === true ? "favorite" : undefined;
 }
 
 /**
@@ -671,6 +710,9 @@ export type PlanInput = {
   limit?: number;
   liveness: LivenessGateOptions;
   manifest?: ManifestRetentionView;
+  /** D-STAR: which seats are starred, for the seat-aware `favorite` blocker. Loaded
+   * ONCE per run by the caller (`planArchiveRun`), the same shape `manifest` is. */
+  seatStore?: SeatStore;
 };
 
 type PlanState = {
@@ -709,7 +751,7 @@ function considerCandidate(
   isExplicit: boolean,
 ): void {
   const manifest = input.manifest ?? EMPTY_MANIFEST_VIEW;
-  const staticBlocker = staticBlockerFor(candidate, input.boundaries, manifest);
+  const staticBlocker = staticBlockerFor(candidate, input.boundaries, manifest, input.seatStore);
   if (staticBlocker) {
     block(state, candidate, staticBlocker.blocker, staticBlocker.detail);
     return;
@@ -788,7 +830,12 @@ function pullCompanion(
   if (!companion) {
     return false;
   }
-  const staticBlocker = staticBlockerFor(companion, input.boundaries, input.manifest);
+  const staticBlocker = staticBlockerFor(
+    companion,
+    input.boundaries,
+    input.manifest,
+    input.seatStore,
+  );
   if (staticBlocker) {
     block(state, companion, staticBlocker.blocker, staticBlocker.detail);
     return false;

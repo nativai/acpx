@@ -150,6 +150,20 @@ export type SeatRecord = {
   closedAt: string | null;
   name: string | undefined;
   brickId: string | undefined;
+  /**
+   * THE STAR, MOVED HERE FROM THE SESSION RECORD — Daniel's ruling D-STAR
+   * (2026-09-30, relayed `Bricks/693ed2a9-.../` 22:09:40Z): *"the star actually
+   * belongs to the seat and not to the session."* Cluster A's closed seven-field
+   * set is reopened for this ONE additive field only — his decision, not a
+   * precedent for an eighth-field proposal to point at.
+   *
+   * 🛑 ALWAYS A CONCRETE BOOLEAN IN MEMORY, NEVER UNDEFINED — every row this or a
+   * later version writes carries it explicitly, exactly as `activeHolderId` and
+   * `closedAt` do. The one place undefined is tolerated is the PERSISTED byte
+   * stream for a row written before this field existed; see `parseSeatFromPersisted`
+   * for why that is a read-leniency concern and not a type-level one.
+   */
+  favorite: boolean;
 };
 
 type SeatFieldPlan = { readonly persisted: true };
@@ -174,6 +188,7 @@ export const SEAT_RECORD_FIELD_PLAN = {
   closedAt: { persisted: true },
   name: { persisted: true },
   brickId: { persisted: true },
+  favorite: { persisted: true },
 } as const satisfies { [K in keyof Required<SeatRecord>]: SeatFieldPlan };
 
 /**
@@ -349,6 +364,7 @@ type PersistedSeat = {
   closed_at: string | null;
   name?: string;
   brick_id?: string;
+  favorite: boolean;
 };
 
 /**
@@ -372,6 +388,12 @@ export function seatToPersisted(seat: SeatRecord): PersistedSeat {
     closed_at: seat.closedAt,
     name: seat.name,
     brick_id: seat.brickId,
+    // WRITTEN EVERY TIME, `false` included — like the two meaningful nulls above,
+    // never omitted. The read leg below tolerates its ABSENCE (a row written before
+    // this field existed); the write leg never re-produces that absence once a row
+    // has passed through here, which is what makes `seat-backfill.ts`'s migration a
+    // one-time cost rather than a permanent read-time default.
+    favorite: seat.favorite,
   };
 }
 
@@ -421,12 +443,31 @@ function hasValidOmittableSeatFields(row: Record<string, unknown>): boolean {
   return isOmittableString(row.name) && isOmittableString(row.brick_id);
 }
 
+/**
+ * `favorite` is PRESENT-AND-BOOLEAN on every row this store has ever written, and
+ * ABSENT on every row written before D-STAR — which, on a box that has not yet run
+ * `seats backfill`'s migration leg, is every existing seat. Rejecting that absence
+ * as malformed would turn every seat on the fleet into `MalformedSeatRowError` the
+ * instant this code deploys, before the migration that is supposed to fix it has
+ * had a chance to run — `withSeatStoreWrite`'s own read path included, which is
+ * what the migration itself calls. So absence is tolerated here and reads as
+ * `false` in `parseSeatFromPersisted`; a PRESENT wrong-typed value still rejects
+ * the row, per the same D8 strictness every other field on it gets.
+ */
+function hasValidFavoriteField(row: Record<string, unknown>): boolean {
+  return row.favorite === undefined || typeof row.favorite === "boolean";
+}
+
 export function parseSeatFromPersisted(raw: unknown): SeatRecord | undefined {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
     return undefined;
   }
   const row = raw as Record<string, unknown>;
-  if (!hasValidRequiredSeatFields(row) || !hasValidOmittableSeatFields(row)) {
+  if (
+    !hasValidRequiredSeatFields(row) ||
+    !hasValidOmittableSeatFields(row) ||
+    !hasValidFavoriteField(row)
+  ) {
     return undefined;
   }
   // The two predicates above have validated every field; the assertions here carry
@@ -441,6 +482,10 @@ export function parseSeatFromPersisted(raw: unknown): SeatRecord | undefined {
     closedAt: row.closed_at as string | null,
     name: row.name as string | undefined,
     brickId: row.brick_id as string | undefined,
+    // ABSENT reads as `false` — a row written before this field existed (D8's
+    // absent/malformed/valid split does not apply here: absence is a KNOWN,
+    // pre-migration state, never an unreadable one).
+    favorite: row.favorite === true,
   };
 }
 
@@ -725,6 +770,11 @@ export async function mintSeatRow(
       // `brick attach` is this field's writer (C4 / Cluster A requirement 5) and that is
       // not this pass. Absent, deliberately — not an empty string.
       brickId: undefined,
+      // A freshly-minted seat has no holder history to derive a star from —
+      // `false`, not absent (D-STAR moves the field onto the seat; there is no
+      // legacy per-record value to carry forward for a seat that did not exist a
+      // moment ago).
+      favorite: false,
     });
     return { mutation: { kind: "write", seats }, result: undefined };
   });
@@ -785,6 +835,51 @@ export async function backfillSeatRow(
     const seats = new Map(store.seats);
     seats.set(row.seatId, row);
     return { mutation: { kind: "write", seats } as const, result: "minted" as const };
+  });
+}
+
+/**
+ * THE ONE-TIME `favorite` MIGRATION — D-STAR, `Bricks/6adabe72-.../CONTENT.md`
+ * item 3. Called by `seat-backfill.ts` for every seat that ALREADY HAS a row (a
+ * fresh mint gets its `favorite` baked into the whole row by `planSeatRow`
+ * instead, via `backfillSeatRow` above — this function is the other half, for
+ * rows that predate the field entirely).
+ *
+ * 🛑 **TOUCHES `favorite` AND NOTHING ELSE.** Every other field on an existing row
+ * is left exactly as it stands — this is a migration of one field, not a
+ * reconciliation of the whole row, and spreading the fresh row (never rebuilding
+ * it) is what keeps `closed_at`'s "always present, `null` included" guarantee
+ * intact across the write.
+ *
+ * IDEMPOTENT AND CHEAP TO CALL REPEATEDLY: `SEAT_STORE_NO_CHANGE` the moment the
+ * on-disk value already matches, which is every seat's steady state after its
+ * first migrating run — the property AC4 measures as "re-run touches zero rows".
+ *
+ * A MALFORMED row still throws (D8(4), same as `backfillSeatRow`): a row that is
+ * present and unreadable is not a row lacking a migration, and writing over it
+ * would discard whatever is still recoverable from it.
+ */
+export async function migrateSeatFavorite(
+  sessionDir: string,
+  seatId: string,
+  desiredFavorite: boolean,
+): Promise<"migrated" | "unchanged" | "no-row"> {
+  return await withSeatStoreWrite(sessionDir, (store) => {
+    if (store.malformedSeatIds.includes(seatId)) {
+      throw new MalformedSeatRowError(seatId);
+    }
+    const row = store.seats.get(seatId);
+    if (!row) {
+      // No row yet — nothing to migrate. `backfillSeatRow` (run first, in the same
+      // pass) is what mints one, already carrying the right `favorite`.
+      return { mutation: SEAT_STORE_NO_CHANGE, result: "no-row" as const };
+    }
+    if (row.favorite === desiredFavorite) {
+      return { mutation: SEAT_STORE_NO_CHANGE, result: "unchanged" as const };
+    }
+    const seats = new Map(store.seats);
+    seats.set(seatId, { ...row, favorite: desiredFavorite });
+    return { mutation: { kind: "write", seats } as const, result: "migrated" as const };
   });
 }
 

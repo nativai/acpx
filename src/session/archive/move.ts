@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { withSessionIndexLock } from "../persistence/index-lock.js";
 import { reconcileSessionIndex, writeSessionIndex } from "../persistence/index.js";
+import { readSeatStore, seatFromStore } from "../persistence/seat-store.js";
 import { ACTIVE_SIDECAR_SUFFIXES, recordFileNameFor } from "./identity.js";
 import type { ArchiveManifestRow, ArchiveManifestWriter } from "./manifest.js";
 import { readArchiveRecord, type ArchiveRecordView } from "./record-view.js";
@@ -283,10 +284,33 @@ async function revalidateRecord(
   if (read.view.hasTemplate) {
     return { ok: false, reason: "template" };
   }
-  if (read.view.favorite) {
+  if (await isActiveHolderOfStarredSeat(hotDir, read.view)) {
     return { ok: false, reason: "favorite" };
   }
   return { ok: true, view: read.view };
+}
+
+/**
+ * ⚠️ SEAT-AWARE, PER D-STAR (2026-09-30) — see `retention.ts`'s `recordBlockerFor`
+ * for the full rationale; this is the APPLY-TIME twin, re-read fresh immediately
+ * before the rename rather than from a plan taken minutes earlier, matching this
+ * function's own "against the LIVE record, not the plan" discipline for every
+ * other field it checks. Only the seat's ACTIVE holder is protected; a RETIRED
+ * holder of the same starred seat is archivable.
+ *
+ * `hotDir` doubles as the seat store's directory (`~/.acpx/sessions`) — the same
+ * value `createContext` derives both from.
+ */
+async function isActiveHolderOfStarredSeat(
+  hotDir: string,
+  view: ArchiveRecordView,
+): Promise<boolean> {
+  if (view.seatId === undefined || !view.holderActive) {
+    return false;
+  }
+  const store = await readSeatStore(hotDir);
+  const seat = seatFromStore(store, view.seatId);
+  return seat?.favorite === true;
 }
 
 /**

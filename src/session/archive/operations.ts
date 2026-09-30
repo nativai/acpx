@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { readSeatStore } from "../persistence/seat-store.js";
 import {
   buildArchiveIndexEntry,
   listArchiveIndexShardKeys,
@@ -137,9 +138,14 @@ export async function planArchiveRun(
     liveness: Parameters<typeof buildArchivePlan>[0]["liveness"];
   },
 ): Promise<ArchivePlan> {
-  const [scan, manifest] = await Promise.all([
+  const [scan, manifest, seatStore] = await Promise.all([
     scanSessionDir(context.hotDir),
     loadManifestRetentionView(context),
+    // D-STAR: loaded ONCE per plan, same as the manifest fold — cheap (seat-store.ts:
+    // 113 KB / 0.83 ms measured at 389 seats) and the store's own "no cache, read
+    // fresh" rule is about mutual exclusion during a WRITE, not about a read-only
+    // planning pass over a snapshot it already takes of everything else.
+    readSeatStore(context.hotDir),
   ]);
   return await buildArchivePlan({
     candidates: scan.candidates,
@@ -151,6 +157,7 @@ export async function planArchiveRun(
     limit: options.limit,
     liveness: options.liveness,
     manifest,
+    seatStore,
   });
 }
 

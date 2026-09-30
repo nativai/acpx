@@ -38,7 +38,13 @@ export type ArchiveRecordView = {
   lastSeq: number | undefined;
   /** PRESENCE, not `.enabled` — a soft-retracted blueprint keeps `enabled:false`. */
   hasTemplate: boolean;
-  favorite: boolean;
+  /** `$.seat_id` — absent on a pre-seat record. Together with `holderActive`,
+   * this is what lets the archiver ask "is this record the ACTIVE holder of a
+   * starred seat" (D-STAR) instead of reading a per-record `favorite` — that field
+   * moved to the seat and is no longer this module's concern. */
+  seatId: string | undefined;
+  /** `$.holder_active === true` — see `seatId` above. */
+  holderActive: boolean;
   pid: number | undefined;
   parentSessionId: string | undefined;
   /**
@@ -131,7 +137,8 @@ export function projectArchiveRecord(parsed: unknown): ArchiveRecordView | undef
     brick: metadataString(metadata, "brick"),
     lastSeq: optionalNumber(record.last_seq),
     hasTemplate: record.template != null,
-    favorite: record.favorite === true,
+    seatId: optionalString(record.seat_id),
+    holderActive: record.holder_active === true,
     pid: optionalNumber(record.pid),
     parentSessionId: optionalString(record.parent_session_id),
     bywayParent: metadataString(metadata, "byway_parent"),

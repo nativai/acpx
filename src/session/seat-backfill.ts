@@ -21,6 +21,7 @@ import { seatFieldsToIndexEntry } from "./persistence/seat-fields.js";
 import {
   backfillSeatRow,
   MalformedSeatRowError,
+  migrateSeatFavorite,
   readSeatStore,
   type SeatRecord,
   seatStorePath,
@@ -126,6 +127,14 @@ export type SeatBackfillReport = {
    * row-less seat it meets", counted separately because it is the population that
    * exists on a box where B1/B2 already landed. */
   rowsRepaired: number;
+  /**
+   * D-STAR item 3, THE ONE-TIME MIGRATION: existing seat rows whose on-disk
+   * `favorite` disagreed with `any holder's favorite` and were corrected (dry run:
+   * would be corrected). **AC4 — re-run touches ZERO rows**: once every seat's
+   * on-disk value agrees with its records, this count is `0` and stays `0`, which
+   * is what "one-time" means for a migration that runs inside an idempotent verb.
+   */
+  favoritesMigrated: number;
   errors: SeatBackfillError[];
   /** The `.bak-mig-<TS>` suffix of this run's pre-apply copies, absent on a dry run. */
   backupSuffix: string | undefined;
@@ -253,7 +262,19 @@ type RecordPlan = {
   hasIndexEntry: boolean;
 };
 
-type SeatPlan = { row: SeatRecord; needsRow: boolean; fromExistingSeatId: boolean };
+type SeatPlan = {
+  row: SeatRecord;
+  needsRow: boolean;
+  fromExistingSeatId: boolean;
+  /**
+   * True when a row ALREADY EXISTS for this seat and its on-disk `favorite`
+   * disagrees with what this run computes from the records — the one-time
+   * migration leg (D-STAR item 3) exists for exactly this case. False for a fresh
+   * mint: `favorite` travels with the whole row there (`backfillSeatRow`), so
+   * there is nothing left for the migration leg to do.
+   */
+  favoriteNeedsMigration: boolean;
+};
 
 /**
  * The seat a record belongs to, and the holder fields it will carry.
@@ -348,6 +369,18 @@ function earliestCreatedAt(members: readonly RecordPlan[], fallback: string): st
  * parse leg requires the key (`hasValidRequiredSeatFields`), so a row written without
  * it is one the store would reject as malformed.
  */
+/**
+ * `favorite` — D-STAR, item 3: "seat.favorite = any holder's favorite". `some()`
+ * over every member's own per-record star, so a seat whose holders disagree (one
+ * `true`, one explicit `false`, one absent) migrates to `true` — the AC2 fixture
+ * verbatim. This is also what a FRESH mint needs: a record that already carried a
+ * per-record star must not have that history silently dropped to `false` just
+ * because its seat row happens to be minted today rather than migrated later.
+ */
+function favoriteFromHolders(members: readonly RecordPlan[]): boolean {
+  return members.some((member) => member.record.favorite === true);
+}
+
 function planSeatRow(seatId: string, members: readonly RecordPlan[], now: string): SeatRecord {
   const holder = activeHolderFor(members);
   return {
@@ -360,6 +393,7 @@ function planSeatRow(seatId: string, members: readonly RecordPlan[], now: string
     // `brick attach` is this field's writer (Cluster A requirement 5) and that is not
     // this pass. Absent, deliberately — not an empty string.
     brickId: undefined,
+    favorite: favoriteFromHolders(members),
   };
 }
 
@@ -600,10 +634,13 @@ async function planSeats(
   const store = await readSeatStore(sessionDir);
   const seatPlans = new Map<string, SeatPlan>();
   for (const [seatId, members] of groupBySeat(plans)) {
+    const row = planSeatRow(seatId, members, now);
+    const existing = store.seats.get(seatId);
     seatPlans.set(seatId, {
-      row: planSeatRow(seatId, members, now),
-      needsRow: !store.seats.has(seatId),
+      row,
+      needsRow: !existing,
       fromExistingSeatId: members.every((member) => !member.seatsRecord),
+      favoriteNeedsMigration: existing !== undefined && existing.favorite !== row.favorite,
     });
   }
   return seatPlans;
@@ -630,6 +667,12 @@ type ApplyCounts = {
   recordsSeated: number;
   indexEntries: number;
   rowsMinted: Set<string>;
+  /** Seats ATTEMPTED by the favorite-migration leg this run — guards against
+   * calling it once per member instead of once per seat, same shape as
+   * `rowsMinted`. Attempted, not "changed": `favoritesMigrated` below counts the
+   * subset that actually flipped a value. */
+  favoritesAttempted: Set<string>;
+  favoritesMigrated: number;
   backups: string[];
 };
 
@@ -664,6 +707,32 @@ async function writeSeatLeg(
   }
 }
 
+/**
+ * Leg 3½ — THE ONE-TIME `favorite` MIGRATION (D-STAR item 3), for a seat whose row
+ * ALREADY EXISTS. A fresh mint (leg 3 above) never reaches here: `needsRow` is
+ * mutually exclusive with `favoriteNeedsMigration` by construction (`planSeats`),
+ * because a minted row's `favorite` already came from `planSeatRow`.
+ *
+ * Once per distinct seat, same guard shape as `writeSeatLeg`: `migrateSeatFavorite`
+ * re-reads the store under the lock and decides present-vs-match there, so this
+ * guard is an optimisation and never the authority.
+ */
+async function writeFavoriteMigrationLeg(
+  sessionDir: string,
+  plan: RecordPlan,
+  seatPlans: ReadonlyMap<string, SeatPlan>,
+  counts: ApplyCounts,
+): Promise<void> {
+  const seat = seatPlans.get(plan.seatId);
+  if (!seat?.favoriteNeedsMigration || counts.favoritesAttempted.has(plan.seatId)) {
+    return;
+  }
+  counts.favoritesAttempted.add(plan.seatId);
+  if ((await migrateSeatFavorite(sessionDir, plan.seatId, seat.row.favorite)) === "migrated") {
+    counts.favoritesMigrated += 1;
+  }
+}
+
 async function applyRecord(
   sessionDir: string,
   plan: RecordPlan,
@@ -693,6 +762,7 @@ async function applyRecord(
     }
     stage = "store";
     await writeSeatLeg(sessionDir, plan, seatPlans, counts);
+    await writeFavoriteMigrationLeg(sessionDir, plan, seatPlans, counts);
   } catch (error) {
     errors.push(errorFor(plan, stage, error));
   }
@@ -745,6 +815,8 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
       seats: seatsNeedingRows.length,
       indexEntries: scanned.plans.filter((plan) => plan.enrichesIndex).length,
       rowsRepaired: seatsNeedingRows.filter((seat) => seat.fromExistingSeatId).length,
+      favoritesMigrated: [...seatPlans.values()].filter((seat) => seat.favoriteNeedsMigration)
+        .length,
       errors,
       backupSuffix: undefined,
       backups: [],
@@ -757,6 +829,8 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
     recordsSeated: 0,
     indexEntries: 0,
     rowsMinted: new Set(),
+    favoritesAttempted: new Set(),
+    favoritesMigrated: 0,
     backups: await takeStoreBackups(sessionDir, suffix),
   };
   for (const plan of scanned.plans) {
@@ -771,6 +845,7 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
     rowsRepaired: [...counts.rowsMinted].filter(
       (seatId) => seatPlans.get(seatId)?.fromExistingSeatId === true,
     ).length,
+    favoritesMigrated: counts.favoritesMigrated,
     errors,
     backupSuffix: suffix,
     backups: counts.backups,

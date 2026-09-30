@@ -113,6 +113,7 @@ async function seedSeat(homeDir: string, over: Partial<SeatRecord> = {}): Promis
     closedAt: null,
     name: "the seat",
     brickId: undefined,
+    favorite: false,
     ...over,
   };
   await withSeatStoreWrite(sessionDirOf(homeDir), (store) => {

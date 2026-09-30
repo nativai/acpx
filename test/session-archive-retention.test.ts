@@ -3,6 +3,7 @@ import test from "node:test";
 import { projectArchiveRecord } from "../src/session/archive/record-view.js";
 import {
   anchorIdFor,
+  EMPTY_MANIFEST_VIEW,
   orderForApply,
   resolveBoundaries,
   retentionMtimeAnchorMs,
@@ -11,6 +12,7 @@ import {
   type ArchiveCandidate,
   type PlannedArchive,
 } from "../src/session/archive/retention.js";
+import type { SeatRecord, SeatStore } from "../src/session/persistence/seat-store.js";
 
 /**
  * Cold-archive tier — the retention predicate (BRIEF §6, as corrected by
@@ -218,7 +220,89 @@ test("protected classes are blocked at any age", () => {
   assert.equal(blocker({ ...base, template: { enabled: true } }), "template");
   // Soft-retracted: still `!= null`, so testing `.enabled` truthiness archives it.
   assert.equal(blocker({ ...base, template: { enabled: false } }), "template");
-  assert.equal(blocker({ ...base, favorite: true }), "favorite");
+});
+
+// ── D-STAR: the `favorite` blocker is SEAT-AWARE, not a per-record field ────────
+//
+// 🛑 THE OLD RED DIRECTION, RESTATED ON THE NEW MECHANISM. Before D-STAR this file
+// asserted `blocker({...base, favorite: true}) === "favorite"` — a per-record
+// field the archiver no longer reads at all (`favorite` moved to the seat). The
+// row below is that same red direction, carried forward onto seat data: a
+// starred seat's ACTIVE holder is still refused archival. The GREEN direction —
+// a RETIRED holder of the same starred seat IS archivable — is the new one this
+// block adds, and it is exactly what dissolves the old cold-tier question: there
+// is no "what if the only starred holder is archived", because the star is not on
+// a holder any more.
+
+const SEAT_STARRED = "eeeeeeee-1111-4111-8111-111111111111";
+
+function starredSeatStore(): SeatStore {
+  const row: SeatRecord = {
+    seatId: SEAT_STARRED,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    activeHolderId: "some-holder",
+    nextOrdinal: 2,
+    closedAt: null,
+    name: undefined,
+    brickId: undefined,
+    favorite: true,
+  };
+  return {
+    seats: new Map([[SEAT_STARRED, row]]),
+    malformedSeatIds: [],
+    unparsedRows: new Map(),
+    fileState: "ok",
+  };
+}
+
+test("favorite (seat-aware): a starred seat's ACTIVE holder is refused archival — the RED direction", () => {
+  const base = { closed: true, closed_at: iso(60 * DAY) };
+  const files = { ".json": 60 * DAY };
+  const c = candidate({
+    record: { ...base, seat_id: SEAT_STARRED, holder_active: true },
+    files,
+  });
+  assert.equal(
+    staticBlockerFor(c, BOUNDARIES, EMPTY_MANIFEST_VIEW, starredSeatStore())?.blocker,
+    "favorite",
+  );
+});
+
+test("favorite (seat-aware): a RETIRED holder of the same starred seat IS archivable — the new GREEN direction", () => {
+  const base = { closed: true, closed_at: iso(60 * DAY) };
+  const files = { ".json": 60 * DAY };
+  const c = candidate({
+    record: { ...base, seat_id: SEAT_STARRED, holder_active: false },
+    files,
+  });
+  assert.equal(
+    staticBlockerFor(c, BOUNDARIES, EMPTY_MANIFEST_VIEW, starredSeatStore())?.blocker,
+    undefined,
+    "a retired holder of a starred seat must not be blocked on the seat's behalf",
+  );
+  assert.equal(tierFor(c, BOUNDARIES, false)?.tier, "closed", "and it archives normally");
+});
+
+test("favorite (seat-aware): an UN-starred seat's active holder is not blocked", () => {
+  const base = { closed: true, closed_at: iso(60 * DAY) };
+  const files = { ".json": 60 * DAY };
+  const c = candidate({
+    record: { ...base, seat_id: SEAT_STARRED, holder_active: true },
+    files,
+  });
+  // Empty seat store — no seat is starred. Control for the RED-direction row
+  // above: without a starred seat in the store, the same record is NOT blocked.
+  assert.equal(staticBlockerFor(c, BOUNDARIES)?.blocker, undefined);
+});
+
+test("favorite (seat-aware): a record with NO seat_id at all is never blocked on the seat's behalf", () => {
+  const base = { closed: true, closed_at: iso(60 * DAY) };
+  const files = { ".json": 60 * DAY };
+  const c = candidate({ record: base, files });
+  assert.equal(
+    staticBlockerFor(c, BOUNDARIES, EMPTY_MANIFEST_VIEW, starredSeatStore())?.blocker,
+    undefined,
+  );
 });
 
 test("an unreadable record blocks — the error path IS the guard", () => {

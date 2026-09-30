@@ -260,6 +260,7 @@ test("D11 · `sessions new --seat` joins the seat PREPARED: not active, and with
               closedAt: null,
               name: undefined,
               brickId: undefined,
+              favorite: false,
             },
           ],
         ]),

@@ -144,6 +144,7 @@ type BackfillJson = {
   indexEntries: number;
   recordsWithoutIndexEntry: number;
   rowsRepaired: number;
+  favoritesMigrated: number;
   errors: { file: string; stage: string; code?: string; message: string }[];
   backupSuffix?: string;
   backups: string[];
@@ -417,6 +418,7 @@ test("L4: already-seated records and their entries are left BYTE-IDENTICAL", asy
       closedAt: null,
       name: undefined,
       brickId: undefined,
+      favorite: false,
     });
     const seatedBefore = await sha256(path.join(sessionsDir(homeDir), "l4-seated.json"));
 
@@ -553,6 +555,119 @@ test("R2b: the backfill REFUSES to overwrite a malformed ROW and carries it verb
       { [seatId]: corruptRow },
       "the malformed row must be carried EXACTLY as read",
     );
+  });
+});
+
+// ─── D-STAR item 3 — the one-time `favorite` migration (brick 6adabe72) ──────
+
+test("FAV1: a FRESHLY-MINTED seat's favorite = any holder's favorite — the disagreeing fixture", async () => {
+  // 🛑 THE DISAGREEMENT IS THE POINT (AC2). A fixture where every holder agreed
+  // would pass on ANY implementation, including one that reads only the first
+  // holder — so this fixture deliberately carries one `true`, one explicit
+  // `false`, and one holder with no `favorite` at all.
+  await withTempHome(async (homeDir) => {
+    const seatId = "fafafafa-1111-4111-8111-111111111111";
+    // No existing row: this exercises `planSeatRow`'s mint-time computation.
+    await seed(homeDir, [
+      makeRecord({ acpxRecordId: "fav1-h1", seatId, holderOrdinal: 1, favorite: true }),
+      makeRecord({ acpxRecordId: "fav1-h2", seatId, holderOrdinal: 2, favorite: false }),
+      makeRecord({ acpxRecordId: "fav1-h3", seatId, holderOrdinal: 3, favorite: undefined }),
+    ]);
+
+    const report = await backfill(homeDir, ["--apply"]);
+    assert.equal(report.seats, 1);
+
+    const row = (await readSeatStore(sessionsDir(homeDir))).seats.get(seatId);
+    assert.equal(row?.favorite, true, "any holder's favorite must win");
+  });
+});
+
+test("FAV2: an EXISTING seat row is MIGRATED — favorite disagreed with the holders and is corrected", async () => {
+  await withTempHome(async (homeDir) => {
+    const seatId = "fafafafa-2222-4222-8222-222222222222";
+    await seed(homeDir, [
+      makeRecord({ acpxRecordId: "fav2-h1", seatId, holderOrdinal: 1, favorite: false }),
+      makeRecord({ acpxRecordId: "fav2-h2", seatId, holderOrdinal: 2, favorite: true }),
+    ]);
+    // Plant the row EXACTLY as it exists pre-migration: `favorite: false`, the
+    // default for every seat this store has never migrated.
+    await backfillSeatRow(sessionsDir(homeDir), {
+      seatId,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      activeHolderId: "fav2-h2",
+      nextOrdinal: 3,
+      closedAt: null,
+      name: undefined,
+      brickId: undefined,
+      favorite: false,
+    });
+
+    const report = await backfill(homeDir, ["--apply"]);
+    assert.equal(report.seats, 0, "the row already existed — this run mints nothing");
+    assert.equal(report.favoritesMigrated, 1, "the disagreement must be counted and corrected");
+
+    const row = (await readSeatStore(sessionsDir(homeDir))).seats.get(seatId);
+    assert.equal(row?.favorite, true);
+    assert.equal(row?.activeHolderId, "fav2-h2", "the migration touches favorite and nothing else");
+  });
+});
+
+test("FAV3: AC4 — a second --apply touches ZERO rows, with a positive control that the counter can see a change", async () => {
+  await withTempHome(async (homeDir) => {
+    const seatId = "fafafafa-3333-4333-8333-333333333333";
+    await seed(homeDir, [
+      makeRecord({ acpxRecordId: "fav3-h1", seatId, holderOrdinal: 1, favorite: true }),
+    ]);
+    await backfillSeatRow(sessionsDir(homeDir), {
+      seatId,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      activeHolderId: "fav3-h1",
+      nextOrdinal: 2,
+      closedAt: null,
+      name: undefined,
+      brickId: undefined,
+      favorite: false,
+    });
+
+    // POSITIVE CONTROL: the first run proves the counter is capable of seeing a
+    // change at all — a counter that always reads 0 would pass the re-run
+    // assertion below for the wrong reason.
+    const first = await backfill(homeDir, ["--apply"]);
+    assert.equal(first.favoritesMigrated, 1, "control: the counter must see this real change");
+
+    const bytes = await fs.readFile(path.join(sessionsDir(homeDir), SEAT_STORE_FILE), "utf8");
+    const second = await backfill(homeDir, ["--apply"]);
+    assert.equal(second.favoritesMigrated, 0, "AC4: re-run touches zero rows");
+    assert.equal(
+      await fs.readFile(path.join(sessionsDir(homeDir), SEAT_STORE_FILE), "utf8"),
+      bytes,
+      "a re-run with nothing to migrate must not rewrite the store",
+    );
+  });
+});
+
+test("FAV4: a DRY RUN reports favoritesMigrated without writing anything", async () => {
+  await withTempHome(async (homeDir) => {
+    const seatId = "fafafafa-4444-4444-8444-444444444444";
+    await seed(homeDir, [
+      makeRecord({ acpxRecordId: "fav4-h1", seatId, holderOrdinal: 1, favorite: true }),
+    ]);
+    await backfillSeatRow(sessionsDir(homeDir), {
+      seatId,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      activeHolderId: "fav4-h1",
+      nextOrdinal: 2,
+      closedAt: null,
+      name: undefined,
+      brickId: undefined,
+      favorite: false,
+    });
+    const before = await readRawStore(homeDir);
+
+    const report = await backfill(homeDir);
+    assert.equal(report.apply, false);
+    assert.equal(report.favoritesMigrated, 1, "the dry run must still COUNT the pending migration");
+    assert.deepEqual(await readRawStore(homeDir), before, "a dry run must touch nothing");
   });
 });
 
@@ -846,6 +961,7 @@ test("L14: --apply leaves a .bak-mig-<TS> copy of the record, the index AND seat
       closedAt: null,
       name: undefined,
       brickId: undefined,
+      favorite: false,
     });
 
     const report = await backfill(homeDir, ["--apply"]);
@@ -875,6 +991,7 @@ test("L15: RESTORING the copies returns records, index and store to byte-identic
       closedAt: null,
       name: undefined,
       brickId: undefined,
+      favorite: false,
     });
     const before = await snapshot(homeDir);
 
@@ -948,6 +1065,7 @@ test("R1b: the SINGLE WRITER is what fails closed — backfillSeatRow refuses to
         closedAt: null,
         name: undefined,
         brickId: undefined,
+        favorite: false,
       }),
       (error: unknown) =>
         error instanceof SeatStoreUnwritableError && error.fileState === "malformed",

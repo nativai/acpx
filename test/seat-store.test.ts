@@ -7,6 +7,7 @@ import {
   SeatStoreUnhealthyError,
   seatStoreUnhealthyMessage,
   SeatStoreUnwritableError,
+  migrateSeatFavorite,
   parseSeatStore,
   readSeatStore,
   SEAT_RECORD_FIELD_PLAN,
@@ -36,6 +37,7 @@ function seat(overrides: Partial<SeatRecord> = {}): SeatRecord {
     closedAt: null,
     name: undefined,
     brickId: undefined,
+    favorite: false,
     ...overrides,
   };
 }
@@ -47,29 +49,33 @@ async function readRaw(dir: string): Promise<Record<string, Record<string, unkno
   >;
 }
 
-// ─── 1 · THE CLOSED SET — seven fields, and the falsifier for an eighth ──────
+// ─── 1 · THE CLOSED SET — eight fields, and the falsifier for a ninth ────────
 
-test("the seat record field set is CLOSED AT SEVEN — an eighth field fails this row", () => {
-  // 🛑 THIS ROW IS THE FALSIFIER FOR "the record carries seven fields". Two
-  // eighth-field proposals have already been made and withdrawn (`holder_count`,
-  // struck by Daniel; `mirror_divergences`, withdrawn 2026-09-28T13:30Z), so this
-  // is a live pressure and not a hypothetical. The compiler forces the PLAN to be
-  // exhaustive over `SeatRecord`; this row forces the COUNT, which the compiler
-  // cannot: registering a new field would satisfy the `satisfies` and still red
-  // here, which is exactly the review moment that should happen.
+test("the seat record field set is CLOSED AT EIGHT — a ninth field fails this row", () => {
+  // 🛑 THIS ROW IS THE FALSIFIER FOR "the record carries eight fields". Widened
+  // from seven to eight 2026-09-30 for `favorite` alone — Daniel's D-STAR ruling
+  // REOPENED the closed seven-field set for this ONE additive field, which is his
+  // decision and NOT a precedent for a ninth. Two ninth-field proposals were
+  // already made and withdrawn before this widening (`holder_count`, struck by
+  // Daniel; `mirror_divergences`, withdrawn 2026-09-28T13:30Z), so this remains a
+  // live pressure. The compiler forces the PLAN to be exhaustive over
+  // `SeatRecord`; this row forces the COUNT, which the compiler cannot:
+  // registering a new field would satisfy the `satisfies` and still red here,
+  // which is exactly the review moment that should happen.
   assert.deepEqual(Object.keys(SEAT_RECORD_FIELD_PLAN).toSorted(), [
     "activeHolderId",
     "brickId",
     "closedAt",
     "createdAt",
+    "favorite",
     "name",
     "nextOrdinal",
     "seatId",
   ]);
-  assert.equal(Object.keys(SEAT_RECORD_FIELD_PLAN).length, 7);
+  assert.equal(Object.keys(SEAT_RECORD_FIELD_PLAN).length, 8);
 });
 
-test("a fully-populated seat round-trips through disk with all seven fields intact", async () => {
+test("a fully-populated seat round-trips through disk with all eight fields intact", async () => {
   await withTempDir("acpx-seat-store-", async (dir) => {
     const full = seat({
       activeHolderId: "holder-b",
@@ -77,6 +83,7 @@ test("a fully-populated seat round-trips through disk with all seven fields inta
       closedAt: "2026-09-28T01:00:00.000Z",
       name: "the seat's label",
       brickId: "b64dfbb3-e6df-4805-aef3-90951d937fb9",
+      favorite: true,
     });
     await withSeatStoreWrite(dir, () => ({
       mutation: { kind: "write", seats: new Map([[full.seatId, full]]) },
@@ -99,10 +106,136 @@ test("a fully-populated seat round-trips through disk with all seven fields inta
       "brick_id",
       "closed_at",
       "created_at",
+      "favorite",
       "name",
       "next_ordinal",
       "seat_id",
     ]);
+  });
+});
+
+// ─── 1a · `favorite` — D-STAR: always written, absence tolerated on READ ─────
+
+test("favorite is WRITTEN EVERY TIME, `false` included — never omitted like name/brick_id", async () => {
+  await withTempDir("acpx-seat-store-", async (dir) => {
+    const bare = seat({ favorite: false });
+    await withSeatStoreWrite(dir, () => ({
+      mutation: { kind: "write", seats: new Map([[bare.seatId, bare]]) },
+      result: undefined,
+    }));
+    const raw = await readRaw(dir);
+    assert.ok(
+      Object.keys(raw[bare.seatId]).includes("favorite"),
+      "an unset favorite was omitted like the omittable fields — it must not be",
+    );
+    assert.equal(raw[bare.seatId].favorite, false);
+  });
+});
+
+test("a row written before `favorite` existed reads back as `false`, not malformed", async () => {
+  await withTempDir("acpx-seat-store-", async (dir) => {
+    const seatId = "22222222-2222-4222-8222-222222222222";
+    const preMigration = {
+      seat_id: seatId,
+      created_at: "2026-01-01T00:00:00.000Z",
+      active_holder_id: null,
+      next_ordinal: 1,
+      closed_at: null,
+      // no `favorite` key at all — every seat on the fleet, pre-D-STAR.
+    };
+    await fs.writeFile(
+      seatStorePath(dir),
+      `${JSON.stringify({ [seatId]: preMigration })}\n`,
+      "utf8",
+    );
+    const store = await readSeatStore(dir);
+    assert.deepEqual(
+      store.malformedSeatIds,
+      [],
+      "absence of `favorite` must not read as malformed",
+    );
+    assert.equal(seatFromStore(store, seatId)?.favorite, false);
+  });
+});
+
+test("a PRESENT but wrong-typed favorite still makes the row malformed (D8 strictness)", async () => {
+  await withTempDir("acpx-seat-store-", async (dir) => {
+    const seatId = "33333333-3333-4333-8333-333333333333";
+    const bad = {
+      seat_id: seatId,
+      created_at: "2026-01-01T00:00:00.000Z",
+      active_holder_id: null,
+      next_ordinal: 1,
+      closed_at: null,
+      favorite: "yes",
+    };
+    await fs.writeFile(seatStorePath(dir), `${JSON.stringify({ [seatId]: bad })}\n`, "utf8");
+    const store = await readSeatStore(dir);
+    assert.deepEqual(store.malformedSeatIds, [seatId]);
+  });
+});
+
+// ─── 1b · `migrateSeatFavorite` — D-STAR item 3, the one-time migration ──────
+
+test("migrateSeatFavorite flips favorite and touches NOTHING else on the row", async () => {
+  await withTempDir("acpx-seat-store-", async (dir) => {
+    const row = seat({ favorite: false, name: "untouched", brickId: "untouched-brick" });
+    await withSeatStoreWrite(dir, () => ({
+      mutation: { kind: "write", seats: new Map([[row.seatId, row]]) },
+      result: undefined,
+    }));
+
+    const outcome = await migrateSeatFavorite(dir, row.seatId, true);
+    assert.equal(outcome, "migrated");
+
+    const store = await readSeatStore(dir);
+    assert.deepEqual(seatFromStore(store, row.seatId), { ...row, favorite: true });
+  });
+});
+
+test("migrateSeatFavorite is a NO-OP once the value already agrees — AC4's re-run", async () => {
+  await withTempDir("acpx-seat-store-", async (dir) => {
+    const row = seat({ favorite: true });
+    await withSeatStoreWrite(dir, () => ({
+      mutation: { kind: "write", seats: new Map([[row.seatId, row]]) },
+      result: undefined,
+    }));
+
+    // POSITIVE CONTROL: the counter can see a change when there is one.
+    assert.equal(await migrateSeatFavorite(dir, row.seatId, false), "migrated");
+    // THE RE-RUN: asking for the value it already holds touches zero rows.
+    assert.equal(await migrateSeatFavorite(dir, row.seatId, false), "unchanged");
+
+    const before = await fs.readFile(seatStorePath(dir), "utf8");
+    assert.equal(await migrateSeatFavorite(dir, row.seatId, false), "unchanged");
+    const after = await fs.readFile(seatStorePath(dir), "utf8");
+    assert.equal(after, before, "an unchanged migration must not rewrite the store at all");
+  });
+});
+
+test("migrateSeatFavorite on a seat with NO ROW is a no-op — backfillSeatRow mints it instead", async () => {
+  await withTempDir("acpx-seat-store-", async (dir) => {
+    assert.equal(
+      await migrateSeatFavorite(dir, "44444444-4444-4444-8444-444444444444", true),
+      "no-row",
+    );
+    const store = await readSeatStore(dir);
+    assert.equal(store.fileState, "absent", "a no-op migration must not create the store file");
+  });
+});
+
+test("migrateSeatFavorite THROWS on a malformed row rather than silently skipping it", async () => {
+  await withTempDir("acpx-seat-store-", async (dir) => {
+    const seatId = "55555555-5555-4555-8555-555555555555";
+    await fs.writeFile(
+      seatStorePath(dir),
+      `${JSON.stringify({ [seatId]: { seat_id: seatId } })}\n`,
+      "utf8",
+    );
+    await assert.rejects(
+      migrateSeatFavorite(dir, seatId, true),
+      (error: unknown) => error instanceof MalformedSeatRowError && error.seatId === seatId,
+    );
   });
 });
 

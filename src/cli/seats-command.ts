@@ -156,6 +156,7 @@ type SeatMutationRefusalCode =
   | "SEAT_REF_INVALID"
   | "BRICK_REF_INVALID"
   | "SEAT_NAME_INVALID"
+  | "SEAT_FAVORITE_FLAG_INVALID"
   | "SEAT_ROW_MISSING"
   | "SEAT_ROW_MALFORMED"
   | "SEAT_STORE_UNWRITABLE"
@@ -495,6 +496,91 @@ async function handleSeatsRename(
   });
 }
 
+// ─── favorite ────────────────────────────────────────────────────────────────
+
+/**
+ * `acpx seats favorite <seat> --on|--off` — Daniel's D-STAR ruling
+ * (2026-09-30T22:00:23Z, relayed `Bricks/693ed2a9-.../` 22:09:40Z): *"the star
+ * actually belongs to the seat and not to the session."* Writes the SEAT ROW
+ * ONLY, under the index lock, through the one writer — `rename`'s single-hold
+ * shape exactly, because a star has no holder state to vet either (no
+ * `vetActiveHolder` phase like `close`'s).
+ *
+ * acpx-ui's star toggle CALLS this verb (J5) rather than writing any record,
+ * exactly as `seats rename` is already called from there.
+ */
+function parseSeatFavoriteFlag(flags: { on?: boolean; off?: boolean }): boolean {
+  if (flags.on === true && flags.off === true) {
+    throw new SeatMutationRefusalError(
+      "SEAT_FAVORITE_FLAG_INVALID",
+      "pass exactly one of --on or --off, not both.",
+    );
+  }
+  if (flags.on !== true && flags.off !== true) {
+    throw new SeatMutationRefusalError(
+      "SEAT_FAVORITE_FLAG_INVALID",
+      "pass exactly one of --on or --off.",
+    );
+  }
+  return flags.on === true;
+}
+
+type SeatFavoriteResult =
+  | { readonly kind: "no-change"; readonly favorite: boolean }
+  | { readonly kind: "changed"; readonly favorite: boolean };
+
+async function handleSeatsFavorite(
+  seatRef: string,
+  flags: { on?: boolean; off?: boolean },
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const { format } = resolveGlobalFlags(command, config);
+  await runSeatMutation("favorite", format, async () => {
+    const seatId = parseSeatIdOrThrow(seatRef);
+    const favorite = parseSeatFavoriteFlag(flags);
+    const sessionDir = sessionBaseDir();
+    const result = await withSeatStoreWrite<SeatFavoriteResult>(sessionDir, (store) => {
+      refuseUnwritableStore(store, sessionDir);
+      const row = requireSeatRow(store, seatId);
+      if (row.favorite === favorite) {
+        return { mutation: SEAT_STORE_NO_CHANGE, result: { kind: "no-change", favorite } };
+      }
+      const seats = new Map(store.seats);
+      // SPREAD the fresh row — this touches `favorite` and nothing else, same
+      // discipline `set-brick`/`rename`/`close` all follow.
+      seats.set(seatId, { ...row, favorite });
+      return {
+        mutation: { kind: "write", seats } as const,
+        result: { kind: "changed", favorite },
+      };
+    });
+    renderSeatFavorite(format, seatId, result);
+  });
+}
+
+function renderSeatFavorite(
+  format: OutputFormat,
+  seatId: string,
+  result: SeatFavoriteResult,
+): void {
+  if (
+    emitJsonResult(format, {
+      ok: true,
+      action: result.kind === "no-change" ? "seat_favorite_no_change" : "seat_favorite_set",
+      seatId,
+      favorite: result.favorite,
+      changed: result.kind === "changed",
+    })
+  ) {
+    return;
+  }
+  if (format === "quiet") {
+    return;
+  }
+  process.stdout.write(`seat ${seatId}: favorite = ${result.favorite}\n`);
+}
+
 // ─── delete ──────────────────────────────────────────────────────────────────
 
 /**
@@ -674,6 +760,10 @@ function headlineLines(report: SeatBackfillReport): string[] {
     `  seats:                ${report.seats}${repaired}`,
     `  records seated:       ${report.recordsSeated}`,
     `  index entries:        ${report.indexEntries}`,
+    // D-STAR item 3: existing seat rows whose favorite disagreed with "any
+    // holder's favorite" and were (or, on a dry run, would be) corrected. `0` on
+    // every run after the fleet's first migrating pass — AC4.
+    `  favorites migrated:   ${report.favoritesMigrated}`,
     `  errors:               ${report.errors.length}`,
   ];
 }
@@ -1488,9 +1578,9 @@ export function registerSeatsCommand(parent: Command, config: ResolvedAcpxConfig
     // what exists, so a merge that keeps one lane's wording silently un-advertises
     // the other lane's verbs while every verb still works.
     "The seat store (~/.acpx/sessions/seats.json): set a seat's brick, rename a seat, " +
-      "close or reopen a seat, delete seat rows, list/show seats, and backfill seats for " +
-      "sessions that predate the store. acpx owns every write to this store; call these " +
-      "verbs rather than writing the file.",
+      "star/un-star a seat, close or reopen a seat, delete seat rows, list/show seats, and " +
+      "backfill seats for sessions that predate the store. acpx owns every write to this " +
+      "store; call these verbs rather than writing the file.",
   );
 
   seatsCommand
@@ -1536,6 +1626,35 @@ THERE IS NO --unset. Once set, \`brick_id\` is not cleared by any verb in B2b.
     )
     .action(async function (this: Command, seat: string, name: string) {
       await handleSeatsRename(seat, name, this, config);
+    });
+
+  seatsCommand
+    .command("favorite")
+    .description(
+      "Star or un-star a seat. Writes the SEAT ROW ONLY, under the index lock — " +
+        "the star belongs to the seat, not any session (Daniel's D-STAR ruling)",
+    )
+    .argument("<seat>", "The seat, by id (a lowercase UUID)")
+    .option("--on", "Star the seat")
+    .option("--off", "Un-star the seat")
+    .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
+    .addHelpText(
+      "after",
+      `
+EXACTLY ONE OF --on / --off IS REQUIRED. Passing both, or neither, is refused.
+
+IDEMPOTENT. Setting a seat to the value it already holds is a no-op — \`changed:
+  false\` in the JSON payload, not an error, and the row is not rewritten.
+
+THE STAR BELONGS TO THE SEAT, NOT ANY SESSION (Daniel's ruling D-STAR,
+  2026-09-30). A starred seat's ACTIVE holder is refused archival by
+  \`acpx sessions archive\`; a RETIRED holder of the same seat is not — there is
+  no "what if the only starred holder gets archived", because the star does not
+  live on a holder any more.
+`,
+    )
+    .action(async function (this: Command, seat: string, flags: { on?: boolean; off?: boolean }) {
+      await handleSeatsFavorite(seat, flags, this, config);
     });
 
   seatsCommand

@@ -288,6 +288,7 @@ test("AP11: the bound holds on an EMPTY store too — the state where it was act
           closedAt: null,
           name: undefined,
           brickId: undefined,
+          favorite: false,
         });
         return { mutation: { kind: "write" as const, seats }, result: undefined };
       });
