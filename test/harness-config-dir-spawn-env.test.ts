@@ -105,11 +105,14 @@ const EXPECTED: Record<string, string[]> = {
  * captured context is what turned an unreproducible intermittent into a
  * mechanism** — that instrument, not a reproduction, is the transferable part.
  *
- * The CAUSE is fixed in `pruneOrphanHarnessConfigDirs`, which no longer removes
- * an unrecognised id at all (brick cc9a5f25). This scoping is the second layer:
- * `os.tmpdir()` honours `TMPDIR` on POSIX and reads it per call, so pointing it
- * at a per-run directory keeps these spawns out of any other file's reach WITHOUT
- * inventing a test-only seam on `AcpClient`.
+ * The CAUSE was fixed in `pruneOrphanHarnessConfigDirs`, which stopped removing
+ * an unrecognised id at all (brick cc9a5f25) — and that function, along with the
+ * whole orphan sweep, was later removed entirely (brick d1e12500). This scoping
+ * is the second layer, independent of the sweep's existence: `os.tmpdir()`
+ * honours `TMPDIR` on POSIX and reads it per call, so pointing it at a per-run
+ * directory keeps these spawns (real writer-created config dirs) out of any
+ * other parallel test file's reach WITHOUT inventing a test-only seam on
+ * `AcpClient`.
  */
 async function spawnAndDumpEnv(
   harness: string,

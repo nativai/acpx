@@ -22,7 +22,6 @@ import {
   describePiExtensionSeedFailure,
   PI_DEFAULT_MODEL_ID,
   PI_DEFAULT_PROVIDER,
-  pruneOrphanHarnessConfigDirs,
   removeHarnessConfigDir,
   rescueStrandedPiTranscriptForResume,
 } from "../src/acp/harness-config-dir.js";
@@ -1241,80 +1240,6 @@ test("removeHarnessConfigDir deletes a config dir and REFUSES anything else", ()
   });
 });
 
-test("the orphan sweep removes dead dirs, RETAINS live ones, and prints its population", () => {
-  withTempRoot((root) => {
-    for (const [harness, id] of [
-      ["pi", "live-1"],
-      ["pi", "dead-1"],
-      ["pi", "dead-2"],
-    ] as const) {
-      applyHarnessConfigDir({
-        env: {},
-        agentCommand: AGENT_REGISTRY[harness],
-        sessionId: id,
-        primer: "P",
-        rootDir: root,
-      });
-    }
-    // ⚠️ A DIRECTORY THAT IS NOT OURS. `cli/queue/paths.ts` creates
-    // `/tmp/acpx-<hash>` for queue sockets — found by ENUMERATING the consumers
-    // of this name, not by recalling them. The sweep must never touch it.
-    const queueDir = join(root, "acpx-0a1b2c3d4e");
-    mkdirSync(queueDir, { recursive: true });
-
-    // ⚠️ UPDATED FOR cc9a5f25: removal now requires POSITIVE ownership, so the
-    // sweep is told which records exist and whether they are CLOSED, and is given
-    // a measured /proc census. "live-1" is retained because its record is OPEN —
-    // previously it was retained merely by being in a set of ids.
-    const result = pruneOrphanHarnessConfigDirs({
-      records: new Map([
-        ["live-1", { closed: false }],
-        ["dead-1", { closed: true }],
-        ["dead-2", { closed: true }],
-      ]),
-      liveScan: {
-        scanned: 40,
-        environRead: 9,
-        pids: new Set([1]),
-        referencedDirs: new Set<string>(),
-        referencedSessionIds: new Set<string>(),
-      },
-      rootDir: root,
-    });
-
-    // POPULATION FIRST: 0 scanned would mean NOT RUN, not clean.
-    assert.equal(result.scanned, 3, "scanned population is wrong — the sweep saw the wrong set");
-    assert.equal(result.removed.length, 2);
-    assert.equal(result.retained, 1);
-    assert.equal(result.retainedBy.openRecord, 1, "retained for the wrong reason");
-    assert.equal(existsSync(queueDir), true, "the queue socket dir was swept — it is not ours");
-    assert.equal(
-      readdirSync(root).some((entry) => entry.endsWith("-live-1")),
-      true,
-      "a LIVE session's dir was removed",
-    );
-  });
-});
-
-test("the sweep on an unreadable root reports scanned=0 — NOT RUN, not clean", () => {
-  const result = pruneOrphanHarnessConfigDirs({
-    records: new Map(),
-    liveScan: {
-      scanned: 40,
-      environRead: 9,
-      pids: new Set([1]),
-      referencedDirs: new Set<string>(),
-      referencedSessionIds: new Set<string>(),
-    },
-    rootDir: "/nonexistent-hp-b3-root-zzz9",
-  });
-  assert.equal(result.scanned, 0);
-  assert.deepEqual(result.removed, []);
-  // ⚠️ AND IT REPORTS THE REFUSAL (cc9a5f25). An unreadable root and a clean root
-  // both produce "removed 0"; `notMeasured` is what distinguishes them.
-  assert.equal(result.notMeasured, true);
-});
-
 // ── RS-14 (fa2e54ec): the recorded-path field, and its ABSENCE ──────────────
 
 test("RS-14: setHarnessConfigDir leaves a no-config-dir record COMPLETELY untouched", () => {
@@ -1742,37 +1667,6 @@ test("cb214e48: a dir with NO stranded transcript is removed exactly as before",
       removeHarnessConfigDir(plan.dir);
     });
     assert.equal(existsSync(plan.dir), false, "an ordinary config dir was refused");
-  });
-});
-
-test("cb214e48: the ORPHAN SWEEP rescues too — it is a second way to lose the same file", () => {
-  // Guarding only the close path would leave the age-based sweep as a quieter route
-  // to the same loss. Both recursive removals in the module route through the
-  // rescue; this row proves the sweep leg behaviourally rather than by reading the
-  // source for a helper's name.
-  withTempRoot((root) => {
-    const box = join(root, "box-agent");
-    mkdirSync(box, { recursive: true });
-    plantStrandedTranscript(root, "swept-1", STRANDED_SLUG, STRANDED_FILE, '{"child":"swept"}\n');
-    const result = withBoxPiAgentDir(box, () =>
-      pruneOrphanHarnessConfigDirs({
-        records: new Map([["swept-1", { closed: true }]]),
-        liveScan: {
-          scanned: 40,
-          environRead: 9,
-          pids: new Set([1]),
-          referencedDirs: new Set<string>(),
-          referencedSessionIds: new Set<string>(),
-        },
-        rootDir: root,
-      }),
-    );
-    assert.equal(result.removed.length, 1, "the sweep did not remove the closed session's dir");
-    assert.equal(
-      existsSync(join(box, "sessions", STRANDED_SLUG, STRANDED_FILE)),
-      true,
-      "the SWEEP destroyed a stranded transcript",
-    );
   });
 });
 
