@@ -13,9 +13,20 @@ import { join } from "node:path";
  *   1. **Self-cleaning.** `/tmp` is pod-local and wiped on pod restart, so a
  *      session's scratch directory cannot accumulate — that is the ENTIRE
  *      reason no reaper exists or is needed for this variable.
- *   2. **Room.** `/tmp` (overlay) has ~342 GB free on this box; `/workspace`
- *      (PVC) has 16 GB at 88% used. Scratch belongs on the roomy volume, not
- *      the tight permanent one.
+ *   2. **Room.** Scratch belongs on the roomy volume, not the tight permanent
+ *      one. Measured on devbox 2026-09-30: `/tmp` (overlay) 394 GB with
+ *      **347 GB free at 9% used**; `/workspace` (PVC) 192 GB with **46 GB free
+ *      at 75% used**.
+ *
+ *      ⚠️ THOSE ARE DATED READINGS, NOT PROPERTIES OF THE VOLUMES — WRITE THEM
+ *      THAT WAY. This line previously read "`/workspace` (PVC) has 16 GB at 88%
+ *      used" as a standing fact, which is how it went stale unnoticed: nothing
+ *      in the sentence told a reader it was a measurement that could age, so it
+ *      was re-quoted long after it stopped being true. And the PVC figure is
+ *      actively MOVING — 47 GB free at 13:05 and 46 GB at 13:25 on 2026-09-30 —
+ *      so re-measure rather than re-quoting. The CONCLUSION has never depended
+ *      on the exact numbers and is unchanged: the overlay has an order of
+ *      magnitude more headroom than the PVC.
  *   3. **Not shared with the workbench pod, and that is ACCEPTED, not a
  *      regression to work around.** `workbench-exec` forwards the whole
  *      environment, so the variable arrives on the workbench too — naming
@@ -27,9 +38,11 @@ import { join } from "node:path";
  * ⚠️ **DO NOT "FIX" THIS BACK TO `/workspace`.** That was v1's design, and it
  * is what CREATED the accumulation problem this variable's reaper was built to
  * solve — Daniel then measured the real footprint (0.27 GB across this box's
- * entire 6,844-session lifetime, against 16 GB free) and found the reaper was
- * solving a problem that did not exist at the cost it was built at. Moving
- * the root back to `/workspace` reintroduces that problem from nothing.
+ * entire 6,844-session lifetime, against the 16 GB free the PVC had AT THAT
+ * TIME — a historical reading, not today's; see the dated figures above) and
+ * found the reaper was solving a problem that did not exist at the cost it was
+ * built at. Moving the root back to `/workspace` reintroduces that problem from
+ * nothing.
  *
  * `harness-config-dir-root.ts` is the sibling precedent for a per-session
  * directory root, and it ALSO defaults to `tmpdir()` (i.e. `/tmp`) for exactly
