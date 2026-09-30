@@ -7,17 +7,20 @@ import {
   SeatStoreUnwritableError,
   MalformedSeatRowError,
   isoNow,
+  listSessionIndexEntries,
   parseSeatRefOrThrow,
   readSeatStore,
   resolveSessionRecord,
   seatFromStore,
   seatRowMissingMessage,
   seatStorePath,
+  seatStoreUnhealthyMessage,
   sessionBaseDir,
   withSeatStoreWrite,
   type SeatRecord,
   type SeatStore,
 } from "../session/persistence.js";
+import type { SessionIndexEntry } from "../session/persistence/index.js";
 import {
   countStaleSeatIndexEntries,
   runSeatBackfill,
@@ -107,19 +110,46 @@ import { BRICK_UUID_RE } from "./session/brick-link.js";
  * write — the standing guard that the `{...row, field}` spread never drops or moves
  * the key.
  *
+ * ## `acpx seats list` / `show` — B2d, brick `88186acd` — and `reopen` — R7,
+ * brick `d43db3b6`, built in the SAME lane at the programme owner's discretion
+ *
+ * Two read-only verbs plus the seat lifecycle's other timestamp writer.
+ *
+ * 🛑 **THE TWO-ENCODINGS RULE, measured live on devbox-staging 2026-09-30: a
+ * seat row's `active_holder_id` does NOT reliably say who is active.** Every
+ * BACKFILLED row carries `null` once its sole holder is closed (AC11 (c)); a
+ * LIVE-MINTED row whose holder is then closed KEEPS the closed session's id —
+ * nothing writes the row on a holder's own close (ratification item 5, by
+ * design). So `null` and a closed id are two encodings of the SAME fact, and a
+ * reader that trusted the raw pointer would report a CLOSED session as the
+ * active holder on every live-minted seat. `list`/`show` never render
+ * `active_holder_id` directly — they derive the holder's state from the
+ * HOLDER'S OWN RECORD via `vetActiveHolder` (already shipped for `close`,
+ * reused rather than re-derived), rendering `null` and a closed pointer
+ * IDENTICALLY as "nobody home", and a pointer with no record on disk at all
+ * (brick `6cb4f4dc`) as "holder record missing" — rendered honestly, not
+ * repaired.
+ *
+ * `reopen` sets `closed_at` back to `null` and **touches nothing else** —
+ * `active_holder_id` and `next_ordinal` are UNCHANGED, because re-opening is
+ * NOT a succession (Daniel's symmetry: reopen the seat, reopen the holder
+ * session, and you are back where you were — which only works if the seat verb
+ * never touches a session record). No eighth field: a reopened seat is
+ * indistinguishable on the row from one never closed (accepted deliberately —
+ * Daniel asked for symmetry, not an audit trail).
+ *
  * ## What this file deliberately does NOT do
  *
  * - **No `--unset` on `set-brick`.** No caller needs it (`brick attach` always
  *   sets), so it would ship as an untested path. Consequence: once set, `brick_id`
  *   cannot be cleared by any verb in B2b.
  * - **No short-ref resolution.** See `parseBrickIdOrThrow`.
- * - **No re-open verb.** Nothing in the record asks for one, and `close` is
- *   deliberately the only writer of a `closed_at` **timestamp** anywhere in the
- *   product (SEAT-STORE.md item 2, AC16). Once closed, a seat stays closed as far
- *   as any shipped verb is concerned.
  * - **No `--at` / timestamp argument on `close`.** The written value is always a
  *   clock read taken INSIDE the write hold — never a caller-supplied or
  *   caller-influenced value. Unrepresentable, not merely refused.
+ * - **`reopen` never re-points `active_holder_id` and never mints a new
+ *   holder.** It is the named inverse of `close` alone, not a general field
+ *   setter — see R7 item 1 (brick `d43db3b6`).
  */
 
 type SeatMutationRefusalCode =
@@ -129,6 +159,7 @@ type SeatMutationRefusalCode =
   | "SEAT_ROW_MISSING"
   | "SEAT_ROW_MALFORMED"
   | "SEAT_STORE_UNWRITABLE"
+  | "SEAT_STORE_UNHEALTHY"
   | "SEAT_HOLDER_OPEN"
   | "SEAT_HOLDER_CHANGED";
 
@@ -247,6 +278,23 @@ function parseSeatNameOrThrow(value: string): string {
 function refuseUnwritableStore(store: SeatStore, sessionDir: string): void {
   if (store.fileState === "malformed" || store.fileState === "unreadable") {
     throw new SeatStoreUnwritableError(seatStorePath(sessionDir), store.fileState);
+  }
+}
+
+/**
+ * The READ-path twin of `refuseUnwritableStore`.
+ *
+ * `SeatStoreUnwritableError`'s message opens "refusing to WRITE the seat store" —
+ * correct for `close`/`rename`/etc., actively wrong for `list`/`show`, which never
+ * write anything. Same underlying fact (F1: an unhealthy FILE must never read as an
+ * empty or absent store), worded for the verb that is actually refusing.
+ */
+function refuseUnhealthyStoreForRead(store: SeatStore): void {
+  if (store.fileState === "malformed" || store.fileState === "unreadable") {
+    throw new SeatMutationRefusalError(
+      "SEAT_STORE_UNHEALTHY",
+      seatStoreUnhealthyMessage(store.fileState),
+    );
   }
 }
 
@@ -976,6 +1024,410 @@ function renderSeatClose(format: OutputFormat, seatId: string, result: SeatClose
   }
 }
 
+// ─── reopen ──────────────────────────────────────────────────────────────────
+
+/**
+ * R7 (brick `d43db3b6`, ruled 2026-09-30T15:2xZ) — the named inverse of `close`.
+ *
+ * 🛑 **NO ASYNC PRE-PHASE, UNLIKE `close`.** `close` needs phases A/B to vet the
+ * active holder before its hold because a race exists — an activation could point a
+ * LIVE holder at the seat between an unlocked read and the hold. `reopen` has no
+ * such race: it never reads or writes anything about the holder at all (R7 item 2 —
+ * "the seat verb never touches a session record"), so there is nothing to vet and
+ * this verb's shape is `rename`'s single-hold pattern, not `close`'s three-phase one.
+ */
+export type SeatReopenDecision = { readonly kind: "already-open" } | { readonly kind: "reopen" };
+
+/**
+ * The pure decision, extracted for the same reason `decideSeatClose` is: a direct
+ * unit row exercises both branches without spawning a process.
+ */
+export function decideSeatReopen(freshRow: SeatRecord): SeatReopenDecision {
+  if (freshRow.closedAt === null || freshRow.closedAt === undefined) {
+    return { kind: "already-open" };
+  }
+  return { kind: "reopen" };
+}
+
+type SeatReopenResult =
+  | { readonly kind: "already-open"; readonly activeHolderId: string | null }
+  | { readonly kind: "reopened"; readonly activeHolderId: string | null };
+
+async function handleSeatsReopen(
+  seatRef: string,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const { format } = resolveGlobalFlags(command, config);
+  await runSeatMutation("reopen", format, async () => {
+    const seatId = parseSeatIdOrThrow(seatRef);
+    const sessionDir = sessionBaseDir();
+    const result = await withSeatStoreWrite<SeatReopenResult>(sessionDir, (store) => {
+      refuseUnwritableStore(store, sessionDir);
+      const row = requireSeatRow(store, seatId);
+      const decision = decideSeatReopen(row);
+      if (decision.kind === "already-open") {
+        return {
+          mutation: SEAT_STORE_NO_CHANGE,
+          result: { kind: "already-open", activeHolderId: row.activeHolderId },
+        };
+      }
+      const seats = new Map(store.seats);
+      // SPREAD the fresh row — reopen touches `closed_at` and NOTHING else.
+      // `active_holder_id` and `next_ordinal` are UNCHANGED: re-opening is not a
+      // succession (R7 item 2). This is the whole of Daniel's symmetry — reopen the
+      // seat, reopen the holder session, and the pointer is exactly where it was.
+      seats.set(seatId, { ...row, closedAt: null });
+      return {
+        mutation: { kind: "write", seats } as const,
+        result: { kind: "reopened", activeHolderId: row.activeHolderId },
+      };
+    });
+    renderSeatReopen(format, seatId, result);
+  });
+}
+
+function renderSeatReopen(format: OutputFormat, seatId: string, result: SeatReopenResult): void {
+  if (
+    emitJsonResult(format, {
+      ok: true,
+      action: result.kind === "already-open" ? "seat_reopen_no_change" : "seat_reopened",
+      seatId,
+      changed: result.kind === "reopened",
+      activeHolderId: result.activeHolderId,
+    })
+  ) {
+    return;
+  }
+  if (format === "quiet") {
+    return;
+  }
+  if (result.kind === "already-open") {
+    process.stdout.write(`seat ${seatId}: already open — no change (rc 0)\n`);
+    return;
+  }
+  process.stdout.write(
+    `seat ${seatId}: reopened. active_holder_id is UNCHANGED (${
+      result.activeHolderId ?? "null — nobody home"
+    }) — re-opening is not a succession.\n`,
+  );
+}
+
+// ─── show / list — the read surface (B2d, brick 88186acd) ────────────────────
+
+/**
+ * THE TWO-ENCODINGS RULE. Thin wrapper over the ALREADY-SHIPPED `vetActiveHolder`
+ * (used by `close` since B2c) — not re-derived, reused: the same function that
+ * decides whether `close` may proceed is the one that decides what `show`/`list`
+ * render, so the two can never disagree about what "the holder is open" means.
+ *
+ * `vacant` and `closed` render IDENTICALLY as "nobody home" (measured on
+ * devbox-staging: a backfilled row's `null` and a live-minted row's closed pointer
+ * are the SAME fact, encoded two different ways — see this file's header).
+ * `record-missing` is the third, distinct state (brick `6cb4f4dc`: the row outlives
+ * its holder's record) and is rendered honestly rather than folded into either.
+ */
+type ActiveHolderState =
+  | { readonly kind: "vacant" }
+  | { readonly kind: "active"; readonly holderId: string }
+  | { readonly kind: "closed"; readonly holderId: string }
+  | { readonly kind: "record-missing"; readonly holderId: string };
+
+async function resolveActiveHolderState(activeHolderId: string | null): Promise<ActiveHolderState> {
+  const vetted = await vetActiveHolder(activeHolderId);
+  if (vetted.id === null) {
+    return { kind: "vacant" };
+  }
+  if (vetted.dangling) {
+    return { kind: "record-missing", holderId: vetted.id };
+  }
+  return vetted.open
+    ? { kind: "active", holderId: vetted.id }
+    : { kind: "closed", holderId: vetted.id };
+}
+
+/** Text rendering — `vacant` and `closed` collapse to ONE string on purpose. */
+function renderActiveHolderText(state: ActiveHolderState): string {
+  switch (state.kind) {
+    case "vacant":
+    case "closed":
+      return "nobody home";
+    case "active":
+      return state.holderId;
+    case "record-missing":
+      return `${state.holderId} (holder record missing)`;
+    default: {
+      // Exhaustive over `ActiveHolderState["kind"]` — the compiler proves it, the
+      // linter's simpler analysis cannot (same shape as `decideSeatClose`'s switch).
+      const unreachable: never = state;
+      throw new Error(`unreachable active holder state: ${JSON.stringify(unreachable)}`);
+    }
+  }
+}
+
+/** JSON rendering — same collapse as the text form, `vacant`/`closed` both
+ * report `state: "nobody-home"`; `closed` additionally carries the id it
+ * resolved (for diagnosis), `vacant` carries none because there is none. */
+function activeHolderJson(state: ActiveHolderState): { state: string; id: string | null } {
+  switch (state.kind) {
+    case "vacant":
+      return { state: "nobody-home", id: null };
+    case "closed":
+      return { state: "nobody-home", id: state.holderId };
+    case "active":
+      return { state: "active", id: state.holderId };
+    case "record-missing":
+      return { state: "holder-record-missing", id: state.holderId };
+    default: {
+      const unreachable: never = state;
+      throw new Error(`unreachable active holder state: ${JSON.stringify(unreachable)}`);
+    }
+  }
+}
+
+type SeatHolderSummary = {
+  readonly id: string;
+  readonly ordinal: number | undefined;
+  /** `undefined` means the record could not be resolved — reported, not inferred. */
+  readonly open: boolean | undefined;
+};
+
+/**
+ * Every session-index entry naming this seat, each resolved via its OWN record —
+ * never the `holderActive` mirror, which is succession-bookkeeping (D-B1-14), not
+ * an open/closed fact, and can diverge from it (the whole reason
+ * `observeMirrorDivergence` exists on the activation path).
+ */
+async function listSeatHolders(seatId: string): Promise<SeatHolderSummary[]> {
+  const entries: SessionIndexEntry[] = await listSessionIndexEntries();
+  const holders: SeatHolderSummary[] = [];
+  for (const entry of entries) {
+    if (entry.seatId !== seatId) {
+      continue;
+    }
+    let open: boolean | undefined;
+    try {
+      const record = await resolveSessionRecord(entry.acpxRecordId);
+      open = record.closed !== true;
+    } catch (error) {
+      if (!(error instanceof SessionNotFoundError)) {
+        throw error;
+      }
+      open = undefined;
+    }
+    holders.push({ id: entry.acpxRecordId, ordinal: entry.holderOrdinal, open });
+  }
+  holders.sort(
+    (a, b) => (a.ordinal ?? Number.MAX_SAFE_INTEGER) - (b.ordinal ?? Number.MAX_SAFE_INTEGER),
+  );
+  return holders;
+}
+
+async function handleSeatsShow(
+  seatRef: string,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const { format } = resolveGlobalFlags(command, config);
+  await runSeatMutation("show", format, async () => {
+    const seatId = parseSeatIdOrThrow(seatRef);
+    const sessionDir = sessionBaseDir();
+    const store = await readSeatStore(sessionDir);
+    refuseUnhealthyStoreForRead(store);
+    const row = requireSeatRow(store, seatId);
+    const holderState = await resolveActiveHolderState(row.activeHolderId);
+    const holders = await listSeatHolders(seatId);
+    renderSeatShow(format, row, holderState, holders);
+  });
+}
+
+function seatShowJsonPayload(
+  row: SeatRecord,
+  holderState: ActiveHolderState,
+  holders: readonly SeatHolderSummary[],
+): Record<string, unknown> {
+  return {
+    ok: true,
+    seatId: row.seatId,
+    createdAt: row.createdAt,
+    closedAt: row.closedAt,
+    nextOrdinal: row.nextOrdinal,
+    name: row.name ?? null,
+    brickId: row.brickId ?? null,
+    // The RAW pointer, exactly as stored — for an operator diagnosing the store
+    // itself. Never used above to decide what "active" means; see `activeHolder`.
+    activeHolderIdRaw: row.activeHolderId,
+    activeHolder: activeHolderJson(holderState),
+    holders: holders.map((holder) => ({
+      id: holder.id,
+      ordinal: holder.ordinal ?? null,
+      open: holder.open ?? null,
+    })),
+  };
+}
+
+function describeHolderOpenState(open: boolean | undefined): string {
+  if (open === undefined) {
+    return "record missing";
+  }
+  return open ? "open" : "closed";
+}
+
+function renderSeatShowText(
+  row: SeatRecord,
+  holderState: ActiveHolderState,
+  holders: readonly SeatHolderSummary[],
+): void {
+  process.stdout.write(`seat ${row.seatId}\n`);
+  process.stdout.write(`  name:          ${row.name ?? "(unnamed)"}\n`);
+  process.stdout.write(`  created_at:    ${row.createdAt}\n`);
+  process.stdout.write(`  closed_at:     ${row.closedAt ?? "(open)"}\n`);
+  process.stdout.write(`  next_ordinal:  ${row.nextOrdinal}\n`);
+  process.stdout.write(`  brick_id:      ${row.brickId ?? "(none)"}\n`);
+  process.stdout.write(`  active holder: ${renderActiveHolderText(holderState)}\n`);
+  process.stdout.write(`  holders (${holders.length}):\n`);
+  for (const holder of holders) {
+    process.stdout.write(
+      `    #${holder.ordinal ?? "?"}  ${holder.id}  ${describeHolderOpenState(holder.open)}\n`,
+    );
+  }
+}
+
+function renderSeatShow(
+  format: OutputFormat,
+  row: SeatRecord,
+  holderState: ActiveHolderState,
+  holders: readonly SeatHolderSummary[],
+): void {
+  if (emitJsonResult(format, seatShowJsonPayload(row, holderState, holders))) {
+    return;
+  }
+  if (format === "quiet") {
+    process.stdout.write(`${row.seatId}\n`);
+    return;
+  }
+  renderSeatShowText(row, holderState, holders);
+}
+
+type SeatListRow = {
+  readonly seatId: string;
+  readonly name: string | undefined;
+  readonly closed: boolean;
+  readonly holderCount: number;
+  readonly holderState: ActiveHolderState;
+};
+
+/** One pass over the index — never one scan PER SEAT, which would be O(seats ×
+ * index size) on a box-sized store. */
+async function countHoldersBySeat(): Promise<Map<string, number>> {
+  const entries = await listSessionIndexEntries();
+  const counts = new Map<string, number>();
+  for (const entry of entries) {
+    if (entry.seatId === undefined) {
+      continue;
+    }
+    counts.set(entry.seatId, (counts.get(entry.seatId) ?? 0) + 1);
+  }
+  return counts;
+}
+
+async function handleSeatsList(
+  command: Command,
+  config: ResolvedAcpxConfig,
+  flags: { closed?: boolean; open?: boolean },
+): Promise<void> {
+  const { format } = resolveGlobalFlags(command, config);
+  await runSeatMutation("list", format, async () => {
+    const sessionDir = sessionBaseDir();
+    const store = await readSeatStore(sessionDir);
+    refuseUnhealthyStoreForRead(store);
+    const filter = seatListFilterFlags(flags);
+    const counts = await countHoldersBySeat();
+    const rows: SeatListRow[] = [];
+    for (const [seatId, row] of store.seats) {
+      const closed = row.closedAt !== null && row.closedAt !== undefined;
+      if (!includeSeatInList(closed, filter)) {
+        continue;
+      }
+      rows.push(await buildSeatListRow(seatId, row, closed, counts.get(seatId) ?? 0));
+    }
+    rows.sort((a, b) => a.seatId.localeCompare(b.seatId));
+    renderSeatList(format, rows, store.malformedSeatIds);
+  });
+}
+
+/** `--closed` and `--open` TOGETHER mean "no filtering" — see the verb's own
+ * help text for why that is not treated as a conflict to refuse. */
+function seatListFilterFlags(flags: { closed?: boolean; open?: boolean }): {
+  onlyClosed: boolean;
+  onlyOpen: boolean;
+} {
+  return {
+    onlyClosed: flags.closed === true && flags.open !== true,
+    onlyOpen: flags.open === true && flags.closed !== true,
+  };
+}
+
+function includeSeatInList(
+  closed: boolean,
+  filter: { onlyClosed: boolean; onlyOpen: boolean },
+): boolean {
+  if (filter.onlyClosed) {
+    return closed;
+  }
+  if (filter.onlyOpen) {
+    return !closed;
+  }
+  return true;
+}
+
+async function buildSeatListRow(
+  seatId: string,
+  row: SeatRecord,
+  closed: boolean,
+  holderCount: number,
+): Promise<SeatListRow> {
+  const holderState = await resolveActiveHolderState(row.activeHolderId);
+  return { seatId, name: row.name, closed, holderCount, holderState };
+}
+
+function renderSeatList(
+  format: OutputFormat,
+  rows: readonly SeatListRow[],
+  malformedSeatIds: readonly string[],
+): void {
+  if (
+    emitJsonResult(format, {
+      ok: true,
+      seats: rows.map((row) => ({
+        seatId: row.seatId,
+        name: row.name ?? null,
+        closed: row.closed,
+        holderCount: row.holderCount,
+        activeHolder: activeHolderJson(row.holderState),
+      })),
+      malformed: malformedSeatIds,
+    })
+  ) {
+    return;
+  }
+  if (format === "quiet") {
+    process.stdout.write(`${rows.length}\n`);
+    return;
+  }
+  for (const row of rows) {
+    process.stdout.write(
+      `${row.seatId}  ${row.name ?? "(unnamed)"}  active=${renderActiveHolderText(row.holderState)}  ` +
+        `holders=${row.holderCount}  ${row.closed ? "CLOSED" : "open"}\n`,
+    );
+  }
+  for (const seatId of malformedSeatIds) {
+    process.stderr.write(
+      `seat ${seatId}: row MALFORMED — not listed; see \`acpx seats show ${seatId}\`\n`,
+    );
+  }
+}
+
 // ─── registration ────────────────────────────────────────────────────────────
 
 /**
@@ -983,13 +1435,13 @@ function renderSeatClose(format: OutputFormat, seatId: string, result: SeatClose
  * (`src/cli-core.ts`) — IN THE SAME COMMIT. See this file's header for what
  * happens when only one lands.
  *
- * 🛑 **ONE REGISTRAR, FIVE SUBCOMMANDS — AND THIS IS A TWICE-MERGED FILE, SO READ
+ * 🛑 **ONE REGISTRAR, EIGHT SUBCOMMANDS — AND THIS IS A TWICE-MERGED FILE, SO READ
  * THAT AS A CONSTRAINT RATHER THAN A DESCRIPTION.** B2b (`set-brick`, `rename`,
- * `delete`), B10 (`backfill`) and B2c (`close`) each created this file with its own
- * `registerSeatsCommand` exporting the SAME SYMBOL. The union is semantic, not
- * textual: resolving that add/add by keeping either side produces a binary that
- * compiles, starts and answers **with the other side's verbs silently missing** —
- * and nothing in the type system can see it.
+ * `delete`), B10 (`backfill`), B2c (`close`) and B2d (`list`, `show`, `reopen`) each
+ * created or extended this file, all exporting/registering under the SAME SYMBOL.
+ * The union is semantic, not textual: resolving that add/add by keeping either side
+ * produces a binary that compiles, starts and answers **with the other side's verbs
+ * silently missing** — and nothing in the type system can see it.
  *
  * ⚠️ **B2c's merge added a SECOND failure shape the first union did not have.** Git
  * interleaved `backfill` and `close` so their shared tail lines (`.option("--format
@@ -1004,18 +1456,19 @@ function renderSeatClose(format: OutputFormat, seatId: string, result: SeatClose
  * `acpx` invocation rather than just `acpx seats`; and a duplicated `"seats"` in
  * `TOP_LEVEL_VERBS` is inert, because it is a `Set`. Both were measured, not assumed.
  *
- * `test/seat-backfill.test.ts` L16a pins the five-name list and L16b pins the
- * single registration.
+ * `test/seat-backfill.test.ts` L16a pins a four-name floor and L16b pins the
+ * single registration (a floor, not an exact count — it predates `close` and B2d
+ * and does not need to enumerate every verb to do its job).
  */
 export function registerSeatsCommand(parent: Command, config: ResolvedAcpxConfig): void {
   const seatsCommand = parent.command("seats").description(
-    // ⚠️ NAMES ALL FIVE VERBS. This string is the only place an operator discovers
+    // ⚠️ NAMES EVERY VERB. This string is the only place an operator discovers
     // what exists, so a merge that keeps one lane's wording silently un-advertises
     // the other lane's verbs while every verb still works.
     "The seat store (~/.acpx/sessions/seats.json): set a seat's brick, rename a seat, " +
-      "close a seat, delete seat rows, and backfill seats for sessions that predate the " +
-      "store. acpx owns every write to this store; call these verbs rather than writing " +
-      "the file.",
+      "close or reopen a seat, delete seat rows, list/show seats, and backfill seats for " +
+      "sessions that predate the store. acpx owns every write to this store; call these " +
+      "verbs rather than writing the file.",
   );
 
   seatsCommand
@@ -1179,12 +1632,98 @@ REFUSES if the seat's active holder is still open per its own record — close t
 IDEMPOTENT. A second close on an already-closed seat is a no-op with a notice and
   exit 0 — not an error, and the timestamp does not move.
 
-ONCE CLOSED, A SEAT REFUSES \`acpx sessions activate\` and refuses create-into-seat.
-  THERE IS NO RE-OPEN VERB: nothing in this CLI ever clears \`closed_at\` back to
-  null.
+ONCE CLOSED, A SEAT REFUSES \`acpx sessions activate\` and refuses create-into-seat,
+  UNTIL REOPENED. \`acpx seats reopen <seat>\` clears \`closed_at\` back to null and
+  touches nothing else — see \`acpx seats reopen --help\`.
 `,
     )
     .action(async function (this: Command, seat: string) {
       await handleSeatsClose(seat, this, config);
+    });
+
+  seatsCommand
+    .command("reopen")
+    .description("Reverse a close — clears `closed_at`, touches nothing else")
+    .argument("<seat>", "The seat, by id (a lowercase UUID)")
+    .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
+    .addHelpText(
+      "after",
+      `
+THE NAMED INVERSE OF \`close\`, AND NOTHING WIDER. Sets \`closed_at\` back to null.
+  \`active_holder_id\` and \`next_ordinal\` are UNCHANGED — re-opening is not a
+  succession, and this verb never reads or writes a session record. Daniel's
+  symmetry: reopen the seat, reopen the holder session, and the pointer is
+  exactly where it was.
+
+IDEMPOTENT. Reopening a seat that is not closed is a no-op with a notice and
+  exit 0 — not an error.
+
+NO EIGHTH FIELD. A reopened seat is indistinguishable on the row from one never
+  closed — there is no \`reopened_at\` trace. Accepted deliberately: the ask was
+  symmetry with session close/reopen, not an audit trail.
+
+NEVER AUTOMATIC. No verb, sweep or backfill reopens a seat on its own — this is
+  the only writer of \`closed_at\` back to null anywhere in the product.
+`,
+    )
+    .action(async function (this: Command, seat: string) {
+      await handleSeatsReopen(seat, this, config);
+    });
+
+  seatsCommand
+    .command("show")
+    .description("Show one seat's row and its holders")
+    .argument("<seat>", "The seat, by id (a lowercase UUID)")
+    .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
+    .addHelpText(
+      "after",
+      `
+THE ACTIVE HOLDER IS DERIVED, NEVER THE ROW'S RAW POINTER. \`active_holder_id\`
+  alone cannot say who is active: every backfilled row carries \`null\` once its
+  sole holder is closed, while a live-minted row whose holder is later closed
+  KEEPS the closed session's id — two encodings of the same fact. This verb
+  resolves the pointer against the holder's OWN record and renders a null
+  pointer and a closed pointer IDENTICALLY as "nobody home"; a pointer naming a
+  record that no longer exists on disk renders as "holder record missing"
+  rather than being folded into either of the other two.
+
+HOLDERS ARE LISTED FROM THE SESSION INDEX, each resolved via its own record —
+  not the \`holder_active\` mirror, which is succession bookkeeping and can
+  diverge from the record's own open/closed fact.
+
+READ-ONLY. Never writes \`seats.json\`; a malformed row or a malformed/unreadable
+  store is reported as such, never repaired, and a missing row is a DISTINCT
+  message from a missing seat id (run the seat backfill for the former).
+`,
+    )
+    .action(async function (this: Command, seat: string) {
+      await handleSeatsShow(seat, this, config);
+    });
+
+  seatsCommand
+    .command("list")
+    .description("List every seat row: id, name, active holder, holder count, closed marker")
+    .option("--closed", "Only closed seats")
+    .option("--open", "Only open (not-closed) seats")
+    .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
+    .addHelpText(
+      "after",
+      `
+SAME TWO-ENCODINGS RULE AS \`show\`: the active holder column is derived from the
+  holder's own record, never the row's raw \`active_holder_id\` — see
+  \`acpx seats show --help\`.
+
+--closed AND --open TOGETHER list everything (no filtering) — passing both is
+  not a refusal, since a caller building the flag from two independent booleans
+  should not have to special-case "neither" vs "both" meaning the same thing.
+
+READ-ONLY, one pass over the store and one pass over the session index — never
+  a scan per seat. A malformed/unreadable STORE refuses (SEAT_STORE_UNHEALTHY);
+  a seat whose own ROW is malformed is named on stderr and excluded from the
+  listing rather than silently dropped.
+`,
+    )
+    .action(async function (this: Command, flags: { closed?: boolean; open?: boolean }) {
+      await handleSeatsList(this, config, flags);
     });
 }

@@ -11,6 +11,7 @@ import type { ResolvedAcpxConfig } from "../src/cli/config.js";
 import {
   buildSeatDeletion,
   decideSeatClose,
+  decideSeatReopen,
   seatHolderOpenMessage,
 } from "../src/cli/seats-command.js";
 import { readSeatStore, withSeatStoreWrite, type SeatRecord } from "../src/session/persistence.js";
@@ -1531,6 +1532,477 @@ test("CLB3 · `delete` on a CLOSED seat SUCCEEDS — the row is removed, which i
       undefined,
       "a closed seat's row must still delete",
     );
+  });
+});
+
+// ═══ Group SH/LS/RO — B2d (`list`/`show`) + R7 (`reopen`), brick 88186acd ══════
+//
+// PRECONDITION AUDIT, extending the class above:
+// - A VACANT seat (`active_holder_id: null`) is FIXTURE-ENTERED, structurally, same
+//   reason CL1/RN8 state: no product path clears that field, and `mintSeatRow`
+//   always seeds a fresh seat with its founding holder.
+// - A seat whose `active_holder_id` points at a CLOSED session — SH2's whole
+//   subject — is PRODUCT-ENTERED: a real founder, closed for real via `sessions
+//   close`. Nothing writes the seat row on a holder's own close (ratification item
+//   5), so this state is reached by the ordinary product path, not fixtured.
+// - A DANGLING pointer (record resolvable to nothing) is FIXTURE-ENTERED,
+//   structurally, same reason CL6 states for `close`.
+// - `closed_at` non-null on a `reopen` row is PRODUCT-ENTERED where the row's own
+//   test needs the REAL verb's timestamp (RO2); FIXTURE-ENTERED, structurally
+//   noted, where the row's variable is something else (RO1, RO4-7).
+
+/**
+ * Mint a real founding holder and return its (holder id, seat id) — the shape
+ * CL4/CLB1/R4 each inline separately; factored here because Group SH/LS/RO uses it
+ * five times and a fixture would not reach the PRODUCT-ENTERED states these rows
+ * are about.
+ */
+async function mintFounderAndSeat(
+  homeDir: string,
+  name: string,
+): Promise<{ holderId: string; seatId: string }> {
+  const cwd = path.join(homeDir, "workspace");
+  await fs.mkdir(cwd, { recursive: true });
+  const base = ["--cwd", cwd, "--agent", MOCK_AGENT_COMMAND, "--approve-all", "--format", "json"];
+  const founding = await runCli([...base, "sessions", "new", "-s", name], homeDir);
+  assert.equal(founding.code, 0, founding.stderr);
+  const holderId = String(
+    (JSON.parse(founding.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+  );
+  const holderRecord = JSON.parse(
+    await fs.readFile(path.join(homeDir, ".acpx", "sessions", `${holderId}.json`), "utf8"),
+  ) as { seat_id?: string };
+  const seatId = String(holderRecord.seat_id);
+  assert.ok(seatId !== "undefined", "fixture precondition: the founding holder carries a seat id");
+  return { holderId, seatId };
+}
+
+// ─── show ────────────────────────────────────────────────────────────────────
+
+test("SH1 · a VACANT seat (active_holder_id: null) shows as NOBODY HOME", async () => {
+  await withRig(async (homeDir) => {
+    await writeStore(homeDir, {
+      [SEAT_A]: seatRow(SEAT_A, { active_holder_id: null, name: "alpha", brick_id: BRICK_ID }),
+    });
+    const result = await runCli(["--format", "json", "seats", "show", SEAT_A], homeDir);
+    assert.equal(result.code, 0, result.output);
+    const payload = JSON.parse(result.stdout.trim()) as {
+      activeHolder: { state: string; id: string | null };
+      activeHolderIdRaw: string | null;
+      brickId: string | null;
+    };
+    assert.deepEqual(payload.activeHolder, { state: "nobody-home", id: null });
+    assert.equal(payload.activeHolderIdRaw, null);
+    assert.equal(payload.brickId, BRICK_ID, "the seventh field, brick_id, must round-trip");
+
+    const text = await runCli(["seats", "show", SEAT_A], homeDir);
+    assert.match(text.stdout, /nobody home/);
+  });
+});
+
+/**
+ * 🔑 THE FALSIFIER — the row that would have gone RED had `show` trusted the seat
+ * row's raw `active_holder_id` pointer instead of `vetActiveHolder`'s resolution of
+ * the HOLDER'S OWN record. PRODUCT-ENTERED: a real founder, closed for real. The
+ * seat itself is NOT closed — this row's whole subject is the holder pointer, not
+ * seat closure, and conflating the two would test the wrong mechanism.
+ *
+ * Measured live on devbox-staging (2026-09-30) that this is not a hypothetical:
+ * `active_holder_id` is NEVER cleared by a holder's own close, so every session
+ * that closes without a successor leaves its seat's row pointing at a closed id
+ * forever — exactly the shape this row reaches through the real CLI.
+ */
+test("SH2 · a CLOSED holder's pointer shows as NOBODY HOME, identically to a null pointer (the falsifier)", async () => {
+  await withRig(async (homeDir) => {
+    const { holderId, seatId } = await mintFounderAndSeat(homeDir, "sh2-holder");
+    const closedHolder = await runCli(
+      ["--format", "json", "sessions", "close", "--session-id", holderId],
+      homeDir,
+    );
+    assert.equal(closedHolder.code, 0, closedHolder.stderr);
+
+    // Control: the row's RAW pointer still names the (now closed) holder — nothing
+    // clears it on a holder's own close. Without this, the row below could pass
+    // vacuously against a store that happened to already read `null`.
+    const rawRow = (await readStoreJson(homeDir))[seatId] as Record<string, unknown>;
+    assert.equal(
+      rawRow.active_holder_id,
+      holderId,
+      "fixture precondition: the raw pointer still names the closed holder",
+    );
+
+    const result = await runCli(["--format", "json", "seats", "show", seatId], homeDir);
+    assert.equal(result.code, 0, result.output);
+    const payload = JSON.parse(result.stdout.trim()) as {
+      activeHolder: { state: string; id: string | null };
+      activeHolderIdRaw: string | null;
+      holders: { id: string; open: boolean | null }[];
+    };
+    // THE ASSERTION THAT WOULD HAVE FAILED: a `show` reading the raw pointer would
+    // report `state: "active", id: holderId` here — a CLOSED session as the active
+    // holder.
+    assert.deepEqual(
+      payload.activeHolder,
+      { state: "nobody-home", id: holderId },
+      "a closed holder must render identically to vacancy in STATE, while still naming the id for diagnosis",
+    );
+    assert.equal(
+      payload.activeHolderIdRaw,
+      holderId,
+      "the RAW field must still show the actual pointer",
+    );
+
+    const text = await runCli(["seats", "show", seatId], homeDir);
+    assert.match(text.stdout, /active holder:\s+nobody home/);
+    assert.doesNotMatch(
+      text.stdout.split("\n").find((line) => line.includes("active holder:")) ?? "",
+      new RegExp(holderId),
+      "the ACTIVE HOLDER line must not print the closed holder's id as if it were current",
+    );
+
+    // The holders list (a different field) DOES resolve this holder, and correctly
+    // as closed — the two-encodings rule is about "who is ACTIVE", not about
+    // erasing the holder from history.
+    const holderEntry = payload.holders.find((holder) => holder.id === holderId);
+    assert.ok(holderEntry, "the closed holder must still appear in the holders list");
+    assert.equal(holderEntry?.open, false);
+  });
+});
+
+test("SH3 · a DANGLING active_holder_id (record unresolvable) shows as HOLDER RECORD MISSING", async () => {
+  await withRig(async (homeDir) => {
+    const danglingId = "dddddddd-0000-4000-8000-dddddddddddd";
+    await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A, { active_holder_id: danglingId }) });
+    const result = await runCli(["--format", "json", "seats", "show", SEAT_A], homeDir);
+    assert.equal(result.code, 0, result.output);
+    const payload = JSON.parse(result.stdout.trim()) as {
+      activeHolder: { state: string; id: string | null };
+    };
+    assert.deepEqual(payload.activeHolder, { state: "holder-record-missing", id: danglingId });
+    const text = await runCli(["seats", "show", SEAT_A], homeDir);
+    assert.match(text.stdout, /holder record missing/);
+  });
+});
+
+test("SH4 · show on an ABSENT row refuses SEAT_ROW_MISSING", async () => {
+  await withRig(async (homeDir) => {
+    const result = await runCli(["--format", "json", "seats", "show", SEAT_ABSENT], homeDir);
+    assert.equal(result.code, 1);
+    const refusal = refusalOf(result);
+    assert.equal(refusal.code, "SEAT_ROW_MISSING");
+  });
+});
+
+test("SH5 · show on a MALFORMED row refuses SEAT_ROW_MALFORMED", async () => {
+  await withRig(async (homeDir) => {
+    await writeStore(homeDir, { [SEAT_A]: { seat_id: SEAT_A, created_at: "x", next_ordinal: 0 } });
+    const result = await runCli(["--format", "json", "seats", "show", SEAT_A], homeDir);
+    assert.equal(result.code, 1);
+    assert.equal(refusalOf(result).code, "SEAT_ROW_MALFORMED");
+  });
+});
+
+test("SH6 · show against a MALFORMED STORE refuses SEAT_STORE_UNHEALTHY, never SEAT_ROW_MISSING — unfaulted control arm", async () => {
+  await withRig(async (homeDir) => {
+    // §3a-bis control arm FIRST — the healthy case must actually succeed.
+    await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A, { active_holder_id: null }) });
+    const control = await runCli(["--format", "json", "seats", "show", SEAT_A], homeDir);
+    assert.equal(control.code, 0, control.output);
+
+    await writeRawStore(homeDir, "{ not json at all");
+    const faulted = await runCli(["--format", "json", "seats", "show", SEAT_B], homeDir);
+    assert.equal(faulted.code, 1);
+    const refusal = refusalOf(faulted);
+    // 🛑 THE NEW READ-PATH CODE, DELIBERATELY NOT `SEAT_STORE_UNWRITABLE` — that
+    // code's message opens "refusing to WRITE the seat store", which is wrong for a
+    // read verb. `show`/`list` never call the writer at all.
+    assert.equal(refusal.code, "SEAT_STORE_UNHEALTHY");
+    assert.doesNotMatch(refusal.error, /refusing to write/i);
+    assert.notEqual(refusal.code, "SEAT_ROW_MISSING", "F1: corrupt must never read as absent");
+  });
+});
+
+test("SH7 · holders are listed from the session index, ordered by ordinal, resolved via their OWN record", async () => {
+  await withRig(async (homeDir) => {
+    const { holderId, seatId } = await mintFounderAndSeat(homeDir, "sh7-holder");
+    const result = await runCli(["--format", "json", "seats", "show", seatId], homeDir);
+    assert.equal(result.code, 0, result.output);
+    const payload = JSON.parse(result.stdout.trim()) as {
+      holders: { id: string; ordinal: number | null; open: boolean | null }[];
+    };
+    assert.deepEqual(payload.holders, [{ id: holderId, ordinal: 1, open: true }]);
+  });
+});
+
+// ─── list ────────────────────────────────────────────────────────────────────
+
+test("LS1 · lists both seats with no flag; --closed and --open each filter to one; together they filter to NEITHER (both listed)", async () => {
+  await withRig(async (homeDir) => {
+    const { seatId: openSeatId } = await mintFounderAndSeat(homeDir, "ls1-open");
+    // A second, CLOSED seat — vacant, fixtured (same structural reason as SH1).
+    const closedAt = "2026-09-29T00:00:00.000Z";
+    const current = await readStoreJson(homeDir);
+    current[SEAT_B] = seatRow(SEAT_B, { active_holder_id: null, closed_at: closedAt });
+    await writeStore(homeDir, current);
+
+    const all = await runCli(["--format", "json", "seats", "list"], homeDir);
+    assert.equal(all.code, 0, all.output);
+    const allSeatIds = (JSON.parse(all.stdout.trim()) as { seats: { seatId: string }[] }).seats.map(
+      (seat) => seat.seatId,
+    );
+    assert.ok(allSeatIds.includes(openSeatId) && allSeatIds.includes(SEAT_B), allSeatIds.join(","));
+
+    const closedOnly = await runCli(["--format", "json", "seats", "list", "--closed"], homeDir);
+    const closedIds = (
+      JSON.parse(closedOnly.stdout.trim()) as { seats: { seatId: string }[] }
+    ).seats.map((seat) => seat.seatId);
+    assert.deepEqual(closedIds, [SEAT_B]);
+
+    const openOnly = await runCli(["--format", "json", "seats", "list", "--open"], homeDir);
+    const openIds = (
+      JSON.parse(openOnly.stdout.trim()) as { seats: { seatId: string }[] }
+    ).seats.map((seat) => seat.seatId);
+    assert.deepEqual(openIds, [openSeatId]);
+
+    // BOTH FLAGS TOGETHER — the verb's own help text states this is "no filtering",
+    // not a refusal. Assert the documented behaviour rather than leaving it silent.
+    const both = await runCli(["--format", "json", "seats", "list", "--closed", "--open"], homeDir);
+    const bothIds = (JSON.parse(both.stdout.trim()) as { seats: { seatId: string }[] }).seats.map(
+      (seat) => seat.seatId,
+    );
+    assert.ok(
+      bothIds.includes(openSeatId) && bothIds.includes(SEAT_B),
+      `--closed --open together must list everything, got: ${bothIds.join(",")}`,
+    );
+  });
+});
+
+test("LS2 · holder count reflects the session index, one pass — not one scan per seat", async () => {
+  await withRig(async (homeDir) => {
+    const { seatId } = await mintFounderAndSeat(homeDir, "ls2-holder");
+    const current = await readStoreJson(homeDir);
+    current[SEAT_B] = seatRow(SEAT_B, { active_holder_id: null });
+    await writeStore(homeDir, current);
+
+    const result = await runCli(["--format", "json", "seats", "list"], homeDir);
+    assert.equal(result.code, 0, result.output);
+    const seats = (
+      JSON.parse(result.stdout.trim()) as { seats: { seatId: string; holderCount: number }[] }
+    ).seats;
+    assert.equal(seats.find((seat) => seat.seatId === seatId)?.holderCount, 1);
+    assert.equal(
+      seats.find((seat) => seat.seatId === SEAT_B)?.holderCount,
+      0,
+      "a seat with no index entries must report zero holders, not be absent from the report",
+    );
+  });
+});
+
+test("LS3 · list against a MALFORMED STORE refuses SEAT_STORE_UNHEALTHY — unfaulted control arm", async () => {
+  await withRig(async (homeDir) => {
+    await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A, { active_holder_id: null }) });
+    const control = await runCli(["--format", "json", "seats", "list"], homeDir);
+    assert.equal(control.code, 0, control.output);
+
+    await writeRawStore(homeDir, "{ not json at all");
+    const faulted = await runCli(["--format", "json", "seats", "list"], homeDir);
+    assert.equal(faulted.code, 1);
+    assert.equal(refusalOf(faulted).code, "SEAT_STORE_UNHEALTHY");
+  });
+});
+
+test("LS4 · a MALFORMED ROW is excluded from the listing and named, never silently dropped", async () => {
+  await withRig(async (homeDir) => {
+    await writeStore(homeDir, {
+      [SEAT_A]: seatRow(SEAT_A, { active_holder_id: null }),
+      [SEAT_B]: { seat_id: SEAT_B, created_at: "x", next_ordinal: 0 },
+    });
+    const result = await runCli(["--format", "json", "seats", "list"], homeDir);
+    assert.equal(result.code, 0, result.output);
+    const payload = JSON.parse(result.stdout.trim()) as {
+      seats: { seatId: string }[];
+      malformed: string[];
+    };
+    assert.ok(
+      payload.seats.every((seat) => seat.seatId !== SEAT_B),
+      "the malformed row must not be listed as a seat",
+    );
+    assert.deepEqual(payload.malformed, [SEAT_B]);
+  });
+});
+
+// ─── reopen ──────────────────────────────────────────────────────────────────
+
+test("RO1 · IDEMPOTENT no-op — reopening a seat that is NOT closed is rc 0 with a notice, and writes nothing", async () => {
+  await withRig(async (homeDir) => {
+    await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A, { active_holder_id: null }) });
+    const before = await readStoreBytes(homeDir);
+
+    const result = await runCli(["--format", "json", "seats", "reopen", SEAT_A], homeDir);
+    assert.equal(result.code, 0, result.output);
+    const payload = JSON.parse(result.stdout.trim()) as {
+      ok: boolean;
+      action: string;
+      changed: boolean;
+    };
+    assert.equal(payload.ok, true);
+    assert.equal(payload.action, "seat_reopen_no_change");
+    assert.equal(payload.changed, false);
+    assert.equal(
+      await readStoreBytes(homeDir),
+      before,
+      "a no-op reopen must not rewrite the store",
+    );
+  });
+});
+
+/**
+ * R7 item 2, verified on the REAL round trip: `active_holder_id` and
+ * `next_ordinal` are BYTE-UNCHANGED across close → reopen — reopening is not a
+ * succession, and the seat verb never touches a session record.
+ */
+test("RO2 · a real close -> reopen round trip clears closed_at and leaves active_holder_id / next_ordinal BYTE-UNCHANGED", async () => {
+  await withRig(async (homeDir) => {
+    const { holderId, seatId } = await mintFounderAndSeat(homeDir, "ro2-holder");
+    const closedHolder = await runCli(
+      ["--format", "json", "sessions", "close", "--session-id", holderId],
+      homeDir,
+    );
+    assert.equal(closedHolder.code, 0, closedHolder.stderr);
+    const closedSeat = await runCli(["--format", "json", "seats", "close", seatId], homeDir);
+    assert.equal(closedSeat.code, 0, closedSeat.output);
+
+    const beforeReopen = (await readStoreJson(homeDir))[seatId] as Record<string, unknown>;
+    assert.ok(
+      typeof beforeReopen.closed_at === "string",
+      "fixture precondition: the seat is really closed",
+    );
+
+    const reopened = await runCli(["--format", "json", "seats", "reopen", seatId], homeDir);
+    assert.equal(reopened.code, 0, reopened.output);
+    const payload = JSON.parse(reopened.stdout.trim()) as {
+      action: string;
+      changed: boolean;
+      activeHolderId: string | null;
+    };
+    assert.equal(payload.action, "seat_reopened");
+    assert.equal(payload.changed, true);
+    assert.equal(payload.activeHolderId, holderId);
+
+    const after = (await readStoreJson(homeDir))[seatId] as Record<string, unknown>;
+    assert.equal(after.closed_at, null, "closed_at must be cleared");
+    assert.equal(
+      after.active_holder_id,
+      beforeReopen.active_holder_id,
+      "active_holder_id must be BYTE-UNCHANGED — reopen is not a succession",
+    );
+    assert.equal(
+      after.next_ordinal,
+      beforeReopen.next_ordinal,
+      "next_ordinal must be BYTE-UNCHANGED — reopen never draws or resets it",
+    );
+    assert.equal(after.name, beforeReopen.name);
+  });
+});
+
+/**
+ * 🔑 AP15 — THE PAIRED REFUSAL, MIRRORING R4's EXACT SHAPE
+ * (`test/seat-creation-paths.test.ts:386`): before reopen, create-into-seat is
+ * refused SEAT_CLOSED; after reopen, the identical command is ACCEPTED. A refusal
+ * test alone cannot tell "correctly refused" from "broken in both states" — this
+ * row proves both halves in the same run, against the same seat.
+ */
+test("RO3 · AP15 pair — create-into-seat is refused SEAT_CLOSED before reopen, and ACCEPTED after", async () => {
+  await withRig(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const base = ["--cwd", cwd, "--agent", MOCK_AGENT_COMMAND, "--approve-all", "--format", "json"];
+    const { holderId, seatId } = await mintFounderAndSeat(homeDir, "ro3-founder");
+
+    const closedHolder = await runCli(
+      [...base, "sessions", "close", "--session-id", holderId],
+      homeDir,
+    );
+    assert.equal(closedHolder.code, 0, closedHolder.stderr);
+    const closedSeat = await runCli([...base, "seats", "close", seatId], homeDir);
+    assert.equal(closedSeat.code, 0, closedSeat.output);
+
+    // BEFORE reopen — refused.
+    const refused = await runCli(
+      [...base, "sessions", "new", "-s", "ro3-refused", "--seat", seatId],
+      homeDir,
+    );
+    assert.notEqual(refused.code, 0, "a closed seat must still refuse a join before reopen");
+    assert.match(`${refused.stdout}${refused.stderr}`, /SEAT_CLOSED/);
+
+    // THE VERB UNDER TEST.
+    const reopened = await runCli([...base, "seats", "reopen", seatId], homeDir);
+    assert.equal(reopened.code, 0, reopened.output);
+
+    // AFTER reopen — the IDENTICAL command now succeeds.
+    const accepted = await runCli(
+      [...base, "sessions", "new", "-s", "ro3-accepted", "--seat", seatId],
+      homeDir,
+    );
+    assert.equal(
+      accepted.code,
+      0,
+      `AP15: create-into-seat was still refused after reopen — ${accepted.stdout}${accepted.stderr}`,
+    );
+  });
+});
+
+test("RO4 · reopen on an ABSENT row refuses SEAT_ROW_MISSING", async () => {
+  await withRig(async (homeDir) => {
+    const result = await runCli(["--format", "json", "seats", "reopen", SEAT_ABSENT], homeDir);
+    assert.equal(result.code, 1);
+    assert.equal(refusalOf(result).code, "SEAT_ROW_MISSING");
+    assert.equal(await storeExists(homeDir), false, "a refused reopen must not create the store");
+  });
+});
+
+test("RO5 · reopen on a MALFORMED row refuses SEAT_ROW_MALFORMED; the row survives VERBATIM", async () => {
+  await withRig(async (homeDir) => {
+    const malformed = { seat_id: SEAT_A, created_at: "x", next_ordinal: 0 };
+    await writeStore(homeDir, { [SEAT_A]: malformed });
+    const result = await runCli(["--format", "json", "seats", "reopen", SEAT_A], homeDir);
+    assert.equal(result.code, 1);
+    assert.equal(refusalOf(result).code, "SEAT_ROW_MALFORMED");
+    assert.deepEqual((await readStoreJson(homeDir))[SEAT_A], malformed);
+  });
+});
+
+test("RO6 · reopen against a MALFORMED STORE refuses SEAT_STORE_UNWRITABLE — the EXISTING write-path code, not the new read one", async () => {
+  await withRig(async (homeDir) => {
+    // §3a-bis control arm FIRST.
+    await writeStore(homeDir, {
+      [SEAT_A]: seatRow(SEAT_A, { closed_at: "2026-09-29T00:00:00.000Z" }),
+    });
+    const control = await runCli(["--format", "json", "seats", "reopen", SEAT_A], homeDir);
+    assert.equal(control.code, 0, control.output);
+
+    await writeRawStore(homeDir, "{ not json at all");
+    const faulted = await runCli(["--format", "json", "seats", "reopen", SEAT_B], homeDir);
+    assert.equal(faulted.code, 1);
+    // 🛑 `reopen` IS A MUTATION — it must reuse the SAME `SEAT_STORE_UNWRITABLE`
+    // code every other writer uses, never the new `SEAT_STORE_UNHEALTHY` read-path
+    // code (SH6/LS3), which would be a second, inconsistent scheme for one fact.
+    assert.equal(refusalOf(faulted).code, "SEAT_STORE_UNWRITABLE");
+  });
+});
+
+test("RO7 · decideSeatReopen — the pure decision, both branches", () => {
+  const row: SeatRecord = {
+    seatId: SEAT_A,
+    createdAt: "2026-09-29T00:00:00.000Z",
+    activeHolderId: "holder-1",
+    nextOrdinal: 2,
+    closedAt: null,
+    name: undefined,
+    brickId: undefined,
+  };
+  assert.deepEqual(decideSeatReopen(row), { kind: "already-open" });
+  assert.deepEqual(decideSeatReopen({ ...row, closedAt: "2026-09-28T00:00:00.000Z" }), {
+    kind: "reopen",
   });
 });
 
