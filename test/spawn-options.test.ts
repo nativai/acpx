@@ -613,19 +613,41 @@ test("buildAgentSpawnOptions: ACPX_AGENT_FOLDER coexists with the URL session va
 // standalone via a targeted `node --test`, which skips that preload, and a
 // row here creating a real directory under the box's actual, shared `/tmp`
 // is exactly the kind of test debris this scoping exists to avoid.
-function withScopedSessionTmpRoot<T>(fn: (root: string) => T): T {
+//
+// ⚠️ brick f61391ac — IT SCOPES BOTH ROOTS, AND THE SECOND ONE IS THE URGENT
+// ONE. `buildAgentSpawnOptions` now also creates the TIER-2 directory
+// (`ACPX_SESSION_SHARED_TMP`), whose real default root is
+// `/workspace/.session-scratch` — on the PVC, the box's TIGHT filesystem, and
+// swept on a 7-day timer rather than wiped by a pod restart. So an unscoped row
+// here does not merely litter `/tmp`: it plants synthetic-recordId debris
+// (`acpx-child-id`, …) in the box's real shared scratch root, where it is
+// indistinguishable from a live session's directory and survives for a week.
+// Every row below therefore gets both roots pinned, whether it looks at tier 2
+// or not.
+function withScopedSessionTmpRoot<T>(fn: (root: string, sharedRoot: string) => T): T {
   const root = fsSync.mkdtempSync(path.join(os.tmpdir(), "acpx-session-tmp-spawn-test-"));
+  const sharedRoot = fsSync.mkdtempSync(
+    path.join(os.tmpdir(), "acpx-session-shared-tmp-spawn-test-"),
+  );
   const previous = process.env.ACPX_SESSION_TMP_ROOT;
+  const previousShared = process.env.ACPX_SESSION_SHARED_TMP_ROOT;
   process.env.ACPX_SESSION_TMP_ROOT = root;
+  process.env.ACPX_SESSION_SHARED_TMP_ROOT = sharedRoot;
   try {
-    return fn(root);
+    return fn(root, sharedRoot);
   } finally {
     if (previous === undefined) {
       delete process.env.ACPX_SESSION_TMP_ROOT;
     } else {
       process.env.ACPX_SESSION_TMP_ROOT = previous;
     }
+    if (previousShared === undefined) {
+      delete process.env.ACPX_SESSION_SHARED_TMP_ROOT;
+    } else {
+      process.env.ACPX_SESSION_SHARED_TMP_ROOT = previousShared;
+    }
     fsSync.rmSync(root, { recursive: true, force: true });
+    fsSync.rmSync(sharedRoot, { recursive: true, force: true });
   }
 }
 
@@ -701,6 +723,139 @@ test("buildAgentSpawnOptions: ACPX_SESSION_TMP survives being created twice (ide
       fsSync.existsSync(path.join(root, "acpx-11111111-2222-3333-4444-555555555555", "marker.txt")),
       true,
       "a second spawn for the same session must not wipe an existing scratch file",
+    );
+  });
+});
+
+// brick f61391ac — ACPX_SESSION_SHARED_TMP (tier 2, SPEC.md §3). These rows sit
+// at the SPAWN SEAM deliberately: `session-shared-tmp-dir.test.ts` proves the
+// module, but acceptance criteria 1/3/4 are claims about what a spawned
+// session's ENVIRONMENT carries, and only this seam answers that.
+test("buildAgentSpawnOptions creates ACPX_SESSION_SHARED_TMP mode 0700 under the configured root", () => {
+  withScopedSessionTmpRoot((_root, sharedRoot) => {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "11111111-2222-3333-4444-555555555555",
+    });
+    const expected = path.join(sharedRoot, "acpx-11111111-2222-3333-4444-555555555555");
+    assert.equal(options.env.ACPX_SESSION_SHARED_TMP, expected);
+    const stat = fsSync.statSync(expected);
+    assert.equal(stat.isDirectory(), true);
+    // The FULL mode, special bits included — this is `stat -c %a`, and the
+    // acceptance criterion is "exactly 700, not 2700".
+    assert.equal(stat.mode & 0o7777, 0o700);
+  });
+});
+
+test("buildAgentSpawnOptions keeps tier 1 and tier 2 as two DIFFERENT directories", () => {
+  withScopedSessionTmpRoot((root, sharedRoot) => {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "11111111-2222-3333-4444-555555555555",
+    });
+    assert.notEqual(options.env.ACPX_SESSION_TMP, options.env.ACPX_SESSION_SHARED_TMP);
+    assert.equal(
+      options.env.ACPX_SESSION_TMP,
+      path.join(root, "acpx-11111111-2222-3333-4444-555555555555"),
+    );
+    assert.equal(
+      options.env.ACPX_SESSION_SHARED_TMP,
+      path.join(sharedRoot, "acpx-11111111-2222-3333-4444-555555555555"),
+    );
+  });
+});
+
+test("buildAgentSpawnOptions gives two sessions two different ACPX_SESSION_SHARED_TMP dirs", () => {
+  withScopedSessionTmpRoot(() => {
+    const a = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "11111111-2222-3333-4444-555555555555",
+    });
+    const b = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "22222222-3333-4444-5555-666666666666",
+    });
+    assert.notEqual(a.env.ACPX_SESSION_SHARED_TMP, b.env.ACPX_SESSION_SHARED_TMP);
+    assert.equal(fsSync.existsSync(a.env.ACPX_SESSION_SHARED_TMP ?? ""), true);
+    assert.equal(fsSync.existsSync(b.env.ACPX_SESSION_SHARED_TMP ?? ""), true);
+  });
+});
+
+test("buildAgentSpawnOptions omits ACPX_SESSION_SHARED_TMP when acpxRecordId is empty/whitespace", () => {
+  withScopedSessionTmpRoot(() => {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "   ",
+    });
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(options.env, "ACPX_SESSION_SHARED_TMP"),
+      false,
+    );
+  });
+});
+
+// Acceptance criterion 3 — the strip line. A child must name ITS OWN recordId.
+// This matters more for tier 2 than tier 1: the inherited path would be on the
+// shared PVC and visible to a still-running parent on both pods.
+test("buildAgentSpawnOptions clears a stale inherited ACPX_SESSION_SHARED_TMP", () => {
+  withScopedSessionTmpRoot((_root, sharedRoot) => {
+    const previous = process.env.ACPX_SESSION_SHARED_TMP;
+    process.env.ACPX_SESSION_SHARED_TMP = "/workspace/.session-scratch/acpx-some-other-session";
+    try {
+      const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        acpxRecordId: "11111111-2222-3333-4444-555555555555",
+      });
+      assert.equal(
+        options.env.ACPX_SESSION_SHARED_TMP,
+        path.join(sharedRoot, "acpx-11111111-2222-3333-4444-555555555555"),
+      );
+    } finally {
+      if (previous === undefined) {
+        delete process.env.ACPX_SESSION_SHARED_TMP;
+      } else {
+        process.env.ACPX_SESSION_SHARED_TMP = previous;
+      }
+    }
+  });
+});
+
+// The strip block is ALLOW-BY-OMISSION, so the empty-recordId spawn is the case
+// that proves the delete actually fires: with no recordId nothing re-sets the
+// variable, so an inherited value survives if and only if the strip is missing.
+test("buildAgentSpawnOptions strips an inherited ACPX_SESSION_SHARED_TMP even with no recordId", () => {
+  withScopedSessionTmpRoot(() => {
+    const previous = process.env.ACPX_SESSION_SHARED_TMP;
+    process.env.ACPX_SESSION_SHARED_TMP = "/workspace/.session-scratch/acpx-some-other-session";
+    try {
+      const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        acpxRecordId: "   ",
+      });
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(options.env, "ACPX_SESSION_SHARED_TMP"),
+        false,
+        "a parent's shared-scratch path must never survive into a child's environment",
+      );
+    } finally {
+      if (previous === undefined) {
+        delete process.env.ACPX_SESSION_SHARED_TMP;
+      } else {
+        process.env.ACPX_SESSION_SHARED_TMP = previous;
+      }
+    }
+  });
+});
+
+test("buildAgentSpawnOptions: ACPX_SESSION_SHARED_TMP survives a respawn (idempotent)", () => {
+  withScopedSessionTmpRoot((_root, sharedRoot) => {
+    const first = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "11111111-2222-3333-4444-555555555555",
+    });
+    fsSync.writeFileSync(path.join(first.env.ACPX_SESSION_SHARED_TMP ?? "", "marker.txt"), "hi");
+    const second = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "11111111-2222-3333-4444-555555555555",
+    });
+    assert.equal(second.env.ACPX_SESSION_SHARED_TMP, first.env.ACPX_SESSION_SHARED_TMP);
+    assert.equal(
+      fsSync.existsSync(
+        path.join(sharedRoot, "acpx-11111111-2222-3333-4444-555555555555", "marker.txt"),
+      ),
+      true,
+      "a resumed session must not lose scratch that outlived a pod restart",
     );
   });
 });
