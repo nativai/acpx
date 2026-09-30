@@ -113,11 +113,12 @@ cwds, use the immutable record ID or session URL.
 - Closed sessions can still be loaded explicitly through embedding APIs.
 - `sessions prune` is the explicit way to delete closed **records** — and it takes
   the messages sidecar with them, so the transcript can never be rebuilt.
-- **To reclaim a leaked per-session harness config directory, use
-  `sessions sweep-config-dirs`, not `prune`.** It removes DIRECTORIES ONLY and
-  never touches a record or a transcript. Reaching for `prune` to free disk
-  couples reclaiming a directory to destroying history; that coupling is the whole
-  reason the sweep verb exists.
+- A per-session harness config directory (Pi only) is reclaimed by
+  `sessions close` / the terminal close path as soon as the last client releases
+  it. There is no separate reclaim verb: an orphan sweep that existed for the
+  ungraceful-death case was removed (it could OOM-crash the CLI by loading every
+  session's message history to build its candidate set) — the population it
+  protected is small and self-wipes on every pod restart regardless.
 
 ## Reopen
 
@@ -158,14 +159,10 @@ deletes each selected session's record **and its messages sidecar** — after wh
 that session's transcript can never be rebuilt — so it makes you say what you
 mean:
 
-> **⚠️ If what you actually want is DISK SPACE BACK, this is the wrong verb.**
-> Per-session harness config directories are reclaimed by
-> [`sessions sweep-config-dirs`](#sweep-config-dirs), which removes directories and
-> **never** deletes a record or a transcript. `prune` reclaims those directories
-> only as a side effect of destroying the sessions that own them — and, since a
-> pruned record no longer identifies its directory, **it can no longer reap them at
-> all**: the directory becomes unrecognised, and an unrecognised directory is always
-> kept. Use the sweep verb.
+> **⚠️ This verb does not reclaim per-session harness config directories.**
+> Those (Pi only) are released by the terminal close path as soon as the last
+> client lets go — `prune` deletes the record first, and a directory whose
+> record is gone can no longer be attributed to anything.
 
 ```bash
 # Preview what would be deleted. Needs no scope.
@@ -196,12 +193,6 @@ A destructive prune with none of `<id>...`, `--cwd`, `--whole-box`,
 `--older-than` or `--before` **refuses**: exit 2, nothing deleted, and it prints
 copy-pasteable alternatives carrying both the box-wide count and the count in
 this directory. `--dry-run` is exempt, so every preview workflow works unchanged.
-
-⚠️ **`--dry-run` previews the RECORD deletions, and it now also previews the
-config-dir sweep.** Until brick `0bac6a00` it returned _before_ the sweep ran, so a
-dry run showed nothing about directories at all — which read as "nothing would be
-removed" rather than "I did not look". It now classifies every candidate and prints
-each one with its verdict, its reason and its age, and removes none of them.
 
 `--include-templates` is **not** a scope. It widens what a scope selects — it
 deletes template blueprints — so it should never be the only thing you typed.
@@ -347,70 +338,6 @@ By default the submitter blocks until the queued prompt completes, streaming eve
 ```bash
 acpx codex --no-wait 'after the current turn ends, write the release notes'
 ```
-
-## Sweep config dirs
-
-`sessions sweep-config-dirs` reclaims **orphaned per-session harness config
-directories** — the `acpx-<harness>-<id>` directories acpx writes under the system
-temp dir for harnesses whose primer travels in a config file (Pi).
-
-**It removes DIRECTORIES ONLY. It never deletes a session record or a messages
-sidecar.** That is the whole point: `prune` reclaims those directories only by
-destroying the sessions that own them, which couples freeing disk to losing
-transcripts.
-
-```bash
-# Preview: classify every candidate, print its verdict and reason, remove nothing.
-acpx sessions sweep-config-dirs --dry-run
-
-# Reap.
-acpx sessions sweep-config-dirs
-
-# Bound the sweep to a directory instead of the system temp dir. Does NOT affect
-# which sessions are anything — only where the sweep looks.
-acpx sessions sweep-config-dirs --config-dir-root /path/to/root
-```
-
-### What it removes, and what it refuses to
-
-A directory is removed only when **every** clause holds:
-
-1. its id **resolves to a record** in the invoking home's store, **and**
-2. **that record is CLOSED**, **and**
-3. **no live process references the directory** (`/proc`, with a population
-   control — an unmeasurable scan removes nothing rather than guessing).
-
-Everything else is **kept and reported**:
-
-| reason         | meaning                                                     |
-| -------------- | ----------------------------------------------------------- |
-| `liveProcess`  | a running process names this directory                      |
-| `openRecord`   | a record exists and is still open — including open-but-idle |
-| `tooYoung`     | no record claims it, and it was written recently            |
-| `unrecognised` | **no record claims it.** Never removed, whatever its age    |
-| `unmeasured`   | the `/proc` census could not be taken, so the run refused   |
-
-⚠️ **`unrecognised` is retain-and-report, deliberately.** A directory the sweep
-cannot name is the category it understands _least_, so it gets the _most_
-conservative treatment: kept, listed with its age, and counted separately for a
-human to look at. The sweep does not remove what it cannot identify.
-
-⚠️ **A consequence worth knowing:** because `prune` deletes the record _before_ the
-sweep runs, a directory whose session was just pruned is `unrecognised` — and
-therefore kept. **`prune` cannot reap the config dirs of the sessions it deletes.**
-This verb can, precisely because it preserves the record it needs to read.
-
-### The census is printed by default
-
-Every run prints one line carrying every population — `scanned`, `removed`,
-`retained`, and the retention reasons — plus the root it walked. `--dry-run` and
-`--verbose` additionally print one line per candidate with its verdict, reason and
-age.
-
-**`scanned=0` means NOT RUN, not clean**, and the line says so. Read the
-per-candidate lines rather than the summary: a `removed=0` with sound retain
-reasons is a working sweep, and it is indistinguishable from a broken one if you
-only read the total.
 
 ## Cancelling
 
