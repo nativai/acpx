@@ -229,6 +229,17 @@ test("Codex cap denial persists and reaches IPC before client.prompt", async () 
       async (fetchImpl) => {
         const realFetch = globalThis.fetch;
         globalThis.fetch = fetchImpl;
+        // brick://c028c10e — ⚠️ CLEARING THE ENV SEAM IS LOAD-BEARING HERE, unlike in
+        // every other row in this file. This row drives the PRODUCTION call path
+        // (`runQueuedTask` → `admitCodexSubscriptionTurn` with no `fetchImpl`) and
+        // controls the quota read by patching `globalThis.fetch`. The seam cannot
+        // tell a patched global from the real one, so it is consulted first — and
+        // `scripts/run-tests.mjs` sets it run-wide, so its canned below-cap value
+        // admitted the very turn this row exists to prove is BLOCKED. Any future row
+        // that controls the read by patching the global rather than passing
+        // `fetchImpl` needs this same opt-out.
+        const realQuotaEnv = process.env.ACPX_TEST_CODEX_QUOTA_JSON;
+        delete process.env.ACPX_TEST_CODEX_QUOTA_JSON;
         try {
           const record = makeSessionRecord({
             acpxRecordId: "codex-cap-session",
@@ -272,8 +283,122 @@ test("Codex cap denial persists and reaches IPC before client.prompt", async () 
           assert.equal(persisted.error?.data?.providerSubmitted, false);
         } finally {
           globalThis.fetch = realFetch;
+          if (realQuotaEnv === undefined) {
+            delete process.env.ACPX_TEST_CODEX_QUOTA_JSON;
+          } else {
+            process.env.ACPX_TEST_CODEX_QUOTA_JSON = realQuotaEnv;
+          }
         }
       },
     );
   });
 });
+
+// ── The ACPX_TEST_CODEX_QUOTA_JSON seam ──────────────────────────────────────
+// brick://c028c10e. The seam exists because CHILD PROCESSES in the suite reach this
+// gate (a test spawns a real CLI, which takes a Codex turn) and nothing can be
+// injected across a process boundary. It replaced an HTTP fixture server on a
+// hardcoded 127.0.0.1:3456 — also real acpx-ui's port — which made two concurrent
+// suite runs impossible and killed whichever lane took the heavy-gate mutex.
+//
+// `scripts/run-tests.mjs` sets it for the whole run, so these rows run WITH a
+// below-cap value already in the environment. They pin the three properties that
+// keep a test backdoor from eating the tests around it:
+//   1. an explicitly injected `fetchImpl` always wins over it — this is what every
+//      other row in this file relies on, and checking the env first silently turned
+//      five HOLD rows into admits;
+//   2. it is an INPUT, not a skip: an at-cap canned value still holds;
+//   3. anything that does not parse as a usable observation is ignored, falling
+//      through to the real read rather than admitting on a malformed value.
+
+async function withQuotaEnv(value: string | undefined, run: () => Promise<void>): Promise<void> {
+  const original = process.env.ACPX_TEST_CODEX_QUOTA_JSON;
+  if (value === undefined) {
+    delete process.env.ACPX_TEST_CODEX_QUOTA_JSON;
+  } else {
+    process.env.ACPX_TEST_CODEX_QUOTA_JSON = value;
+  }
+  try {
+    await run();
+  } finally {
+    if (original === undefined) {
+      delete process.env.ACPX_TEST_CODEX_QUOTA_JSON;
+    } else {
+      process.env.ACPX_TEST_CODEX_QUOTA_JSON = original;
+    }
+  }
+}
+
+// Fails the real read, WITHOUT using the `fetchImpl` parameter — so the env seam is
+// still consulted and we can prove what it does. A test that passed `fetchImpl`
+// here would be measuring the precedence rule instead.
+async function withUnreachableQuotaEndpoint(run: () => Promise<void>): Promise<void> {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = () => {
+    throw new Error("quota endpoint unreachable");
+  };
+  try {
+    await run();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+test("an injected fetchImpl always wins over ACPX_TEST_CODEX_QUOTA_JSON", async () => {
+  // The env says 0% used; the injected response says 97%. The hold proves the
+  // injection is not shadowed — the property every other row in this file needs.
+  await withQuotaEnv(JSON.stringify(quotaResponse()), async () => {
+    await assertHolds(quotaResponse({ secondary: weeklyWindow({ usedPercent: 97 }) }), {
+      status: "at-cap",
+    });
+  });
+});
+
+test("a usable ACPX_TEST_CODEX_QUOTA_JSON observation replaces the endpoint read", async () => {
+  await withUnreachableQuotaEndpoint(async () => {
+    await withQuotaEnv(JSON.stringify(quotaResponse()), async () => {
+      // Admitting while the endpoint throws is only possible via the canned value.
+      await admitCodexSubscriptionTurn({ weeklyCapPercent: 90 });
+    });
+  });
+});
+
+test("an at-cap ACPX_TEST_CODEX_QUOTA_JSON observation still HOLDS — the seam is an input, not a skip", async () => {
+  await withUnreachableQuotaEndpoint(async () => {
+    await withQuotaEnv(
+      JSON.stringify(quotaResponse({ secondary: weeklyWindow({ usedPercent: 97 }) })),
+      async () => {
+        await assert.rejects(
+          admitCodexSubscriptionTurn({ weeklyCapPercent: 90 }),
+          (error: unknown) => {
+            assert.equal(capDetail(error)?.status, "at-cap");
+            return true;
+          },
+        );
+      },
+    );
+  });
+});
+
+// An unusable value must NOT admit. It falls through to the real read, which here
+// fails — so the gate holds `read-failed`, exactly as if the variable were absent.
+for (const [label, value] of [
+  ["unparseable JSON", "{not json"],
+  ["valid JSON of the wrong shape", JSON.stringify({ nope: true })],
+  ["a weekly window that fails validation", JSON.stringify(quotaResponse({ secondary: {} }))],
+  ["an empty value", ""],
+] as const) {
+  test(`ACPX_TEST_CODEX_QUOTA_JSON is ignored for ${label} and the real read is used`, async () => {
+    await withUnreachableQuotaEndpoint(async () => {
+      await withQuotaEnv(value, async () => {
+        await assert.rejects(
+          admitCodexSubscriptionTurn({ weeklyCapPercent: 90 }),
+          (error: unknown) => {
+            assert.equal(capDetail(error)?.status, "read-failed");
+            return true;
+          },
+        );
+      });
+    });
+  });
+}

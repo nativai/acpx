@@ -21,7 +21,6 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
-import http from "node:http";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -53,34 +52,48 @@ function log(line) {
   process.stderr.write(`[acpx-test-reaper] ${line}\n`);
 }
 
-const CODEX_QUOTA_TEST_PORT = 3456;
-
-async function startCodexQuotaFixture() {
-  const server = http.createServer((request, response) => {
-    if (request.url !== "/api/usage/codex/quota") {
-      response.writeHead(404).end();
-      return;
-    }
-    response.writeHead(200, { "content-type": "application/json" }).end(
-      JSON.stringify({
-        capturedAt: new Date().toISOString(),
-        secondary: { windowMinutes: 10_080, usedPercent: 0, elapsed: false },
-      }),
-    );
-  });
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(CODEX_QUOTA_TEST_PORT, "127.0.0.1", () => {
-      server.off("error", reject);
-      resolve();
-    });
-  });
-  return server;
-}
-
-async function stopServer(server) {
-  await new Promise((resolve) => server.close(resolve));
-}
+// brick://c028c10e — THERE IS NO CODEX-QUOTA FIXTURE SERVER HERE ANY MORE, AND
+// NOTHING MAY BIND A FIXED PORT FROM THIS HARNESS AGAIN.
+//
+// What used to be here: an HTTP server on a hardcoded `127.0.0.1:3456` answering
+// `/api/usage/codex/quota`, so that child-process tests taking a Codex turn would
+// pass the subscription-cap gate (which fetches that endpoint from acpx-ui in
+// production, `src/runtime/engine/codex-subscription-cap.ts`).
+//
+// Why it had to go: `3456` is also the port real acpx-ui serves on, and this
+// server bound it unconditionally on every run — including targeted ones. Two
+// lanes could not run the suite at once, and the loser died inside `build:test`
+// with `EADDRINUSE` and `GATE_RC=1` — no tally, no `not ok` lines, and an
+// unhandled rejection with no `[acpx-test-reaper]` prefix, so it read as "my
+// change broke the build". Worse, `run-gate.sh` does not reserve the port, so a
+// lane running `pnpm test` directly held it while holding no mutex, and the lane
+// that politely took the mutex was the one that failed. Measured 2026-09-29.
+//
+// What replaced it: `ACPX_TEST_CODEX_QUOTA_JSON` below. The gate's quota read
+// accepts a canned observation from that variable instead of an HTTP endpoint, and
+// `runCli`-style helpers pass `...process.env` to their children, so it reaches
+// every spawned CLI and its detached queue owner. No server, no port, no
+// collision. It is a canned INPUT, not a skip — `classifyObservation` still runs
+// on it, and it is honoured only when it parses as a usable observation
+// (`src/runtime/engine/codex-subscription-cap.ts`).
+//
+// MEASURED, so none of this is taken on faith (worktree at dev 1543b96):
+// without any fixture, `cli.test.js` + `integration.test.js` were 252/257 with 5
+// failures; with the fixture, 257/257 — so the fixture's presence was the only
+// discriminator.
+//
+// ⚠️ DO NOT "FIX" THIS BY RENAMING THE TESTS' `codex-acp-ops.jsonl` LOG FILE.
+// Four of those five failures are `cli.test.ts` brick tests whose agent is
+// `node <mock-agent.js>` — nothing to do with Codex — and the ONLY source of the
+// `codex-acp` substring is that log filename, passed as an argument, which
+// `isCodexAcpCommand` (`src/acp/codex-compat.ts:15`) substring-matches. It looks
+// exactly like an accident worth renaming. It is not: the SAME classifier drives
+// `resolvePrimerChannel` (`src/acp/agent-command.ts:151`), so the substring is
+// what selects the `developer-instructions` primer channel — and that is what
+// makes the brick-context resolution those tests assert happen at all. Renaming it
+// was tried under this brick: 5 rows went red with a missing
+// `brick context … --format inject` call, i.e. it silently changed what the tests
+// exercise. The substring matcher itself is brick://5a7cf1f0.
 
 async function loadReaper() {
   if (!existsSync(reaperPath)) {
@@ -123,6 +136,16 @@ const env = {
   // An explicit setting from the caller wins — an operator tuning this for a
   // targeted run must not be silently overridden.
   ACPX_OWNER_IDLE_RELEASE_MS: process.env.ACPX_OWNER_IDLE_RELEASE_MS ?? IDLE_RELEASE_MS,
+  // brick://c028c10e — the replacement for the deleted fixture server; see the
+  // block above. A below-cap weekly observation, so a test whose agent command is
+  // Codex-classified can take a turn without an acpx-ui to ask. An explicit value
+  // from the caller wins, so a row wanting an at-cap reading can still set one.
+  ACPX_TEST_CODEX_QUOTA_JSON:
+    process.env.ACPX_TEST_CODEX_QUOTA_JSON ??
+    JSON.stringify({
+      capturedAt: new Date().toISOString(),
+      secondary: { windowMinutes: 10_080, usedPercent: 0, elapsed: false },
+    }),
 };
 
 if (!existsSync(preloadPath)) {
@@ -135,8 +158,6 @@ if (!existsSync(preloadPath)) {
 log(
   `run=${runTag} idle_release_ms=${env.ACPX_OWNER_IDLE_RELEASE_MS} node_test_args=${String(args.length)}`,
 );
-
-const codexQuotaFixture = await startCodexQuotaFixture();
 
 const child = spawn(
   process.execPath,
@@ -154,7 +175,7 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 
 child.on("error", (error) => {
   log(`FATAL — could not start node --test: ${String(error)}`);
-  void stopServer(codexQuotaFixture).finally(() => process.exit(2));
+  process.exit(2);
 });
 
 child.on("exit", (code, signal) => {
@@ -163,8 +184,12 @@ child.on("exit", (code, signal) => {
   void (async () => {
     try {
       await sweepRunTag(runTag);
-    } finally {
-      await stopServer(codexQuotaFixture);
+    } catch (error) {
+      // Logged, never folded into the exit status — see the EXIT CODE note in the
+      // file header. Previously a `finally` guaranteed we reached `process.exit`
+      // below even if the sweep threw; with the fixture teardown gone, this catch
+      // is what keeps that guarantee.
+      log(`L2 sweep failed: ${String(error)}`);
     }
     if (signal !== null) {
       log(`node --test was terminated by ${signal}`);

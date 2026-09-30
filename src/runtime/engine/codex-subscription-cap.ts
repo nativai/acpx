@@ -250,7 +250,87 @@ export async function admitCodexSubscriptionTurn(params: {
   }
 }
 
+/**
+ * brick://c028c10e — THE TEST SEAM, AND WHY IT IS AN INPUT RATHER THAN A SWITCH.
+ *
+ * `ACPX_TEST_CODEX_QUOTA_JSON` supplies a canned observation in place of the HTTP
+ * read. It does NOT disable the gate: the value is classified by exactly the same
+ * `classifyObservation` as a real reading, so a canned at-cap window still HOLDs.
+ * That is deliberate — a skip flag would make the admission path untested, while a
+ * canned input leaves every branch live.
+ *
+ * WHY IT EXISTS. The gate is reached by CHILD PROCESSES in the suite (a test spawns
+ * a real CLI, which takes a Codex turn), and `globalThis.fetch` cannot be
+ * monkeypatched across a process boundary the way `test/runtime-test-helpers.ts`
+ * does for in-process rows. The previous answer was an HTTP fixture server on a
+ * hardcoded `127.0.0.1:3456` in `scripts/run-tests.mjs` — which is also real
+ * acpx-ui's port, so two lanes could not run the suite at once and the lane that
+ * took the heavy-gate mutex was the one that died (`EADDRINUSE`, `GATE_RC=1`, no
+ * tally). Measured 2026-09-29; removed under this brick.
+ *
+ * ⚠️ IT IS ALSO A BACKDOOR, so it is deliberately hard to trip by accident and loud
+ * when tripped:
+ *   - it is honoured ONLY when the value parses as a usable quota observation
+ *     (same `asCodexQuotaObservation` + `parseWeeklyWindow` the real path uses), so
+ *     a stray or truncated value falls through to the real read rather than
+ *     silently admitting;
+ *   - every honoured read logs to stderr, so a leak into a box environment is
+ *     visible in the logs instead of silently un-capping real spend.
+ *
+ * WHERE IT IS SET: `scripts/run-tests.mjs`, for the test run only. It is deliberately
+ * suite-wide rather than per-test. Measured under this brick: FIVE rows across two
+ * files need it, not one — and four of them are `cli.test.ts` BRICK tests whose agent
+ * is `node <mock-agent.js>`, Codex-classified only because `isCodexAcpCommand`
+ * substring-matches an `--operation-log …/codex-acp-ops.jsonl` argument
+ * (brick://5a7cf1f0). Renaming that log file to de-classify them was tried and
+ * REVERTED: the same classifier drives `resolvePrimerChannel`
+ * (`src/acp/agent-command.ts:151`), so the substring is also what selects the
+ * `developer-instructions` primer channel, and removing it dropped the
+ * brick-context resolution those tests assert — 5 rows red with a missing
+ * `brick context … --format inject`.
+ *
+ * ⚠️ NEVER set this in a box or pod environment. It belongs to the test harness only.
+ */
+// Returns a WRAPPER rather than the observation itself: the value is `unknown`, and
+// `unknown | undefined` collapses to `unknown` (oxlint `no-redundant-type-constituents`
+// rejects it), which would make "absent" indistinguishable from "a canned `undefined`".
+function cannedQuotaFromEnv(): { observation: unknown } | undefined {
+  const raw = process.env.ACPX_TEST_CODEX_QUOTA_JSON?.trim();
+  if (raw === undefined || raw.length === 0) {
+    return undefined;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  const quota = asCodexQuotaObservation(parsed);
+  if (!quota || !parseWeeklyWindow(quota.secondary)) {
+    return undefined;
+  }
+  process.stderr.write(
+    "[acpx] codex subscription cap: using ACPX_TEST_CODEX_QUOTA_JSON instead of the acpx-ui quota endpoint\n",
+  );
+  return { observation: parsed };
+}
+
 async function readLocalQuota(fetchImpl: typeof fetch | undefined): Promise<unknown> {
+  // PRECEDENCE: an explicitly injected `fetchImpl` > the canned env value > the real
+  // read. An explicit injection is a caller saying exactly what this read must see,
+  // and it must never be shadowed. Measured under brick://c028c10e: with the env
+  // checked first, the suite-wide value silently overrode the injected responses in
+  // `test/codex-subscription-cap.test.ts` and five HOLD rows went green-path — the
+  // canned below-cap reading admitted turns the rows exist to prove are BLOCKED.
+  // That is the exact shape of a test backdoor defeating the tests that guard it.
+  // The env seam exists only for the case that has no `fetchImpl` at all: a child
+  // process, where nothing can be injected across the boundary.
+  if (fetchImpl === undefined) {
+    const canned = cannedQuotaFromEnv();
+    if (canned !== undefined) {
+      return canned.observation;
+    }
+  }
   const response = await (fetchImpl ?? fetch)(`${LOCAL_ACPX_UI_ORIGIN}/api/usage/codex/quota`, {
     headers: { "User-Agent": "acpx/codex-subscription-cap" },
     signal: AbortSignal.timeout(ADMISSION_TIMEOUT_MS),
