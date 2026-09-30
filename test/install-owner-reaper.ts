@@ -47,10 +47,22 @@
 // <file>` skips this too; point `ACPX_SESSION_TMP_ROOT` at your own scratch
 // dir for a targeted run that exercises this path.
 
+// brick f61391ac — AND TIER-2 ROOT SCOPING RIDES HERE FOR THE SAME REASON, with
+// more at stake: `ensureSessionSharedTmpDir` defaults to
+// `/workspace/.session-scratch`, on the PVC, which unlike `/tmp` is NOT wiped by
+// a pod restart — unscoped debris there persists and is indistinguishable from a
+// live session's scratch. See `session-shared-tmp-test-root.ts`. Same bare-run
+// caveat as above: a `node --test <file>` skips this preload, so point
+// `ACPX_SESSION_SHARED_TMP_ROOT` at your own scratch dir for a targeted run
+// (the rows in `spawn-options.test.ts` pin it themselves for exactly this
+// reason).
+
 import { scrubBoxHarnessEnvOverrides } from "./box-env-scrub.js";
 import { installOwnerReaper } from "./owner-reaper.js";
+import { scopeSessionSharedTmpRootForTests } from "./session-shared-tmp-test-root.js";
 import { scopeSessionTmpRootForTests } from "./session-tmp-test-root.js";
 
 scrubBoxHarnessEnvOverrides();
 scopeSessionTmpRootForTests();
+scopeSessionSharedTmpRootForTests();
 installOwnerReaper();

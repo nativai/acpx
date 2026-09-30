@@ -52,6 +52,7 @@ import { ATTRIBUTION_LOG_FILENAME } from "./openrouter-attribution.js";
 import { reportRoutingPolicyWarning, resolveBoxRouting } from "./openrouter-provider-policy.js";
 import type { ShimHandle } from "./openrouter-shim.js";
 import { spawnOpenRouterShim } from "./openrouter-shim.js";
+import { ensureSessionSharedTmpDir } from "./session-shared-tmp-dir.js";
 import { ensureSessionTmpDir } from "./session-tmp-dir.js";
 
 const AUTH_ENV_PREFIX = "ACPX_AUTH_";
@@ -634,6 +635,14 @@ function buildAgentEnvironment(
   // value would point a child at ITS PARENT's `/tmp/acpx-<uuid>` rather
   // than its own. Re-set below, keyed off THIS spawn's own acpxRecordId.
   delete env.ACPX_SESSION_TMP;
+  // brick f61391ac — TIER 2, and the strip matters MORE here than for tier 1
+  // above. Both are session identity, so an inherited value points a child at
+  // its parent's directory either way — but tier 1's root is per-pod `/tmp`,
+  // wiped on restart, whereas this one is on the shared PVC and survives. An
+  // un-stripped value would therefore have a child writing into a LIVE
+  // PARENT's shared scratch, where both pods and a still-running parent can
+  // see it. Re-set below, keyed off THIS spawn's own acpxRecordId.
+  delete env.ACPX_SESSION_SHARED_TMP;
   delete env.ACPX_PARENT_SESSION_URL;
   delete env.ACPX_SESSION_NAME;
   // ── TOMBSTONE STRIP (brick b11f98fb, 2026-09-19) — HAS A RETIREMENT CONDITION ──
@@ -877,6 +886,13 @@ function buildAgentEnvironment(
       // stable across queue-owner respawns, absent on the transient creation
       // spawn that carries "" and is skipped by the trim guard above.
       env.ACPX_SESSION_TMP = ensureSessionTmpDir(trimmedRecordId);
+      // brick f61391ac (SPEC.md §3) — TIER 2:
+      // `/workspace/.session-scratch/acpx-<uuid>`, created mode 0700. Same id,
+      // same guard, same transient-creation-spawn exclusion as the two lines
+      // above; what differs is the ROOT — on `/workspace`, so both pods see it
+      // and it survives a pod restart, which is the entire reason this second
+      // variable exists alongside `ACPX_SESSION_TMP`.
+      env.ACPX_SESSION_SHARED_TMP = ensureSessionSharedTmpDir(trimmedRecordId);
     }
   }
   if (sessionContext && typeof sessionContext.sessionName === "string") {

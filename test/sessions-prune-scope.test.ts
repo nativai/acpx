@@ -66,10 +66,12 @@ function runCli(
     // deliberately — the manifest's `invoker` needs both directions
     // (ACPX_SESSION_URL present → the URL; absent → null, not missing).
     Object.assign(env, extraEnv ?? {});
-    // ⚠️ SCOPE THE CHILD'S OWN ENV, then verify it (brick 0bac6a00). A prune
-    // sweeps harness config dirs under a root NO HOME scopes, so an isolated
-    // store is not isolation here. Checking process.env instead would measure
-    // the runner, one inheritance step away from the process that sweeps.
+    // ⚠️ SCOPE THE CHILD'S OWN ENV, then verify it (brick 0bac6a00). Historically
+    // a prune swept harness config dirs under a root NO HOME scopes, so an
+    // isolated store was not isolation on its own; that sweep was removed
+    // (brick d1e12500), but this call stays — the same env var still scopes the
+    // WRITER (`applyHarnessConfigDir`) away from the box's real /tmp for any
+    // other CLI path this helper's callers may exercise.
     scopeHarnessConfigDirRootForCli(args, env, homeDir);
     const child = spawn(process.execPath, [CLI_PATH, ...args], {
       env,
