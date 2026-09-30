@@ -127,9 +127,19 @@ export function sessionTmpDirFor(sessionId: string, root: string): string {
  * sets the mode exactly, clearing any inherited special bit) costs nothing to
  * keep unconditional.
  *
- * Idempotent and safe to call on every spawn of a resumed session: re-running
- * `chmod` on an already-0700 directory is a no-op, so this also self-heals a
- * directory whose mode drifted under a still-open session.
+ * Idempotent, and safe to call on every spawn of a resumed session: re-running
+ * `mkdir`+`chmod` against an existing 0700 directory is a no-op.
+ *
+ * ⚠️ **ONCE PER OWNER SPAWN, NOT PER TURN — NOTHING IS MAINTAINED WHILE A
+ * SESSION IS LIVE.** This previously read "self-heals a directory whose mode
+ * drifted under a still-open session", which is not what the code does and
+ * invited exactly the wrong reading. The call site is `buildAgentEnvironment`
+ * (`auth-env.ts`), reached when a queue owner STARTS, not for the turns it then
+ * serves — so a drifted mode or a deleted directory is repaired at the NEXT
+ * owner spawn (a `sessions recover`, or an idle release plus a re-prompt), not
+ * at the next prompt to a live owner. Measured on the tier-2 sibling, which is
+ * called from the adjacent line of the same block: brick f61391ac
+ * verification, 2026-09-30.
  */
 export function ensureSessionTmpDir(
   sessionId: string,
