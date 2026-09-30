@@ -5080,7 +5080,7 @@ async function runCliWithEntry(
 
     let stdout = "";
     let stderr = "";
-    const timeoutMs = options.timeoutMs ?? 15_000;
+    const timeoutMs = options.timeoutMs ?? 60_000;
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       reject(new Error(`CLI timed out after ${timeoutMs}ms: acpx ${args.join(" ")}`));
