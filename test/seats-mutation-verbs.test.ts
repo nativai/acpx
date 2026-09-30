@@ -101,6 +101,13 @@ import { withTempHome as withTempHomeFixture } from "./runtime-test-helpers.js";
  *   (cost/control reason, not a structural one — see their own comments), which is
  *   the honest label; nothing in this file fixtures `closed_at` for a structural
  *   reason any more.
+ * - **`brick_id` set on a row** — **CORRECTED (independent TE finding, B2d/re-open
+ *   verification, 2026-09-30) — RECURRENCE of the SAME CLASS F3 caught above, on a
+ *   different field.** `LS5` fixtured `brick_id` directly with no stated reason,
+ *   while `seats set-brick` is a shipped path (`SB1` drives it for real, above) —
+ *   the exact defect half of the rule, again. Fixed the same way this rule prefers:
+ *   `LS5`'s with-brick arm now drives the real `set-brick` verb. Nothing in this
+ *   file fixtures `brick_id` for a structural reason.
  */
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
@@ -1734,6 +1741,92 @@ test("SH7 · holders are listed from the session index, ordered by ordinal, reso
   });
 });
 
+/**
+ * R2 (brick 5d632d35) — `describeHolderOpenState(undefined)` → "record missing" was
+ * verified at the ACTIVE-HOLDER seam (`SH3`, on `row.activeHolderId`) but never at
+ * this HOLDERS-LIST seam (`listSeatHolders`, one row per session-index entry). The
+ * two seams reach the same string through different inputs, and a TE pass found the
+ * obvious way to reach it here — deleting the holder's record FILE — does not work:
+ * `reconcileSessionIndex`'s fast path compares only the file LIST, so removing a
+ * file drops its own index entry before `listSeatHolders` ever iterates it, and the
+ * catch branch that renders "record missing" is unreachable that way. Corrupting the
+ * file's CONTENT in place — same filename, same file list — leaves the index entry
+ * untouched (the fast path never re-parses on an unchanged list) while
+ * `resolveSessionRecord` still fails to read it, which is what actually reaches the
+ * branch.
+ */
+test("SH8 · a holder whose RECORD IS UNREADABLE (not merely absent from the index) renders in the holders list as RECORD MISSING", async () => {
+  await withRig(async (homeDir) => {
+    const { holderId: founderId, seatId } = await mintFounderAndSeat(homeDir, "sh8-founder");
+    const cwd = path.join(homeDir, "workspace");
+    const successor = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "--seat",
+        seatId,
+        "-s",
+        "sh8-successor",
+      ],
+      homeDir,
+    );
+    assert.equal(successor.code, 0, successor.stderr);
+    const successorId = String(
+      (JSON.parse(successor.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+
+    // Control FIRST — both holders resolve OPEN before the corruption.
+    const control = await runCli(["--format", "json", "seats", "show", seatId], homeDir);
+    assert.equal(control.code, 0, control.output);
+    const controlHolders = (
+      JSON.parse(control.stdout.trim()) as { holders: { id: string; open: boolean | null }[] }
+    ).holders;
+    assert.ok(
+      controlHolders.length === 2 && controlHolders.every((holder) => holder.open === true),
+      `fixture precondition: both holders must resolve OPEN before corruption — ${JSON.stringify(controlHolders)}`,
+    );
+
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "sessions", `${successorId}.json`),
+      "{ not json at all",
+      "utf8",
+    );
+
+    const result = await runCli(["--format", "json", "seats", "show", seatId], homeDir);
+    assert.equal(result.code, 0, result.output);
+    const payload = JSON.parse(result.stdout.trim()) as {
+      holders: { id: string; ordinal: number | null; open: boolean | null }[];
+    };
+    const founder = payload.holders.find((holder) => holder.id === founderId);
+    const corrupted = payload.holders.find((holder) => holder.id === successorId);
+    assert.equal(
+      founder?.open,
+      true,
+      "the healthy founder must not be affected by the sibling's corruption",
+    );
+    assert.equal(
+      corrupted?.open,
+      null,
+      "an unreadable record must report open:null, not vanish from the list",
+    );
+
+    const text = await runCli(["seats", "show", seatId], homeDir);
+    assert.equal(text.code, 0, text.output);
+    assert.match(
+      text.stdout,
+      /record missing/,
+      "the TEXT rendering must print the same string SH3 asserts for the active-holder seam",
+    );
+  });
+});
+
 // ─── list ────────────────────────────────────────────────────────────────────
 
 test("LS1 · lists both seats with no flag; --closed and --open each filter to one; together they filter to NEITHER (both listed)", async () => {
@@ -1840,10 +1933,19 @@ test("LS4 · a MALFORMED ROW is excluded from the listing and named, never silen
  */
 test("LS5 · brick_id — a seat WITH a brick shows it in BOTH formats; a seat WITHOUT shows null/json and -/text", async () => {
   await withRig(async (homeDir) => {
+    // R0 (brick 5d632d35) — the WITH-BRICK arm is PRODUCT-ENTERED: `seats set-brick`
+    // is a shipped path (`SB1` drives it for real, above, in this same file), so
+    // fixturing `brick_id` directly would reintroduce the exact class an independent
+    // TE already eliminated once in this file (finding F3, on `closed_at`) — a
+    // fixture quietly standing in for a product path that exists (this file's own
+    // precondition-audit rule, above). `SEAT_B`'s `active_holder_id: null` stays
+    // fixtured — `RN8` documents that one as structurally legitimate.
     await writeStore(homeDir, {
-      [SEAT_A]: seatRow(SEAT_A, { active_holder_id: null, brick_id: BRICK_ID }),
+      [SEAT_A]: seatRow(SEAT_A, { active_holder_id: null }),
       [SEAT_B]: seatRow(SEAT_B, { active_holder_id: null }),
     });
+    const setBrick = await runCli(["seats", "set-brick", SEAT_A, BRICK_ID], homeDir);
+    assert.equal(setBrick.code, 0, setBrick.output);
 
     const json = await runCli(["--format", "json", "seats", "list"], homeDir);
     assert.equal(json.code, 0, json.output);
@@ -2046,6 +2148,69 @@ test("RO7 · decideSeatReopen — the pure decision, both branches", () => {
   assert.deepEqual(decideSeatReopen(row), { kind: "already-open" });
   assert.deepEqual(decideSeatReopen({ ...row, closedAt: "2026-09-28T00:00:00.000Z" }), {
     kind: "reopen",
+  });
+});
+
+/**
+ * 🔑 R1 (brick 5d632d35) — THE PRIMARY RESIDUAL, reframed by the programme owner as
+ * an UNMET ACCEPTANCE CRITERION rather than tidiness: R7 item 4 requires PAIRED rows
+ * for both refusals `reopen` lifts (AP15). `RO3` above covers `create-into-seat`
+ * only; the `sessions activate` half was verified once, on the product, by an
+ * independent TE (B2d/re-open `VERIFICATION.md` V5 — rc 1 `SEAT_CLOSED` before
+ * reopen, rc 0 `outcome:"activated"` `holderOrdinal:2` after) and stopped there —
+ * nothing in the repo re-checked it, so a future change to `seat-activate.ts` could
+ * silently invert the refusal with nothing red to catch it. Mirrors `RO3`'s exact
+ * shape: same seat, same run, refused before reopen, accepted after — a refusal row
+ * ALONE cannot tell "correctly refused" from "broken in both states".
+ */
+test("RO8 · AP15 pair — sessions activate is refused SEAT_CLOSED before reopen, and ACCEPTED after", async () => {
+  await withRig(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const base = ["--cwd", cwd, "--agent", MOCK_AGENT_COMMAND, "--approve-all", "--format", "json"];
+    const { holderId: founderId, seatId } = await mintFounderAndSeat(homeDir, "ro8-founder");
+
+    // The successor must be created INTO the seat WHILE IT IS STILL OPEN —
+    // create-into-seat itself refuses once the seat is closed (RO3 / seat-activate's
+    // own R4).
+    const successor = await runCli(
+      [...base, "sessions", "new", "--seat", seatId, "-s", "ro8-successor"],
+      homeDir,
+    );
+    assert.equal(successor.code, 0, successor.stderr);
+    const successorId = String(
+      (JSON.parse(successor.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+
+    const closedFounder = await runCli(
+      [...base, "sessions", "close", "--session-id", founderId],
+      homeDir,
+    );
+    assert.equal(closedFounder.code, 0, closedFounder.stderr);
+    const closedSeat = await runCli([...base, "seats", "close", seatId], homeDir);
+    assert.equal(closedSeat.code, 0, closedSeat.output);
+
+    // BEFORE reopen — refused.
+    const refused = await runCli([...base, "sessions", "activate", seatId, successorId], homeDir);
+    assert.notEqual(refused.code, 0, "a closed seat must still refuse an activation before reopen");
+    assert.match(`${refused.stdout}${refused.stderr}`, /SEAT_CLOSED/);
+
+    // THE VERB UNDER TEST.
+    const reopened = await runCli([...base, "seats", "reopen", seatId], homeDir);
+    assert.equal(reopened.code, 0, reopened.output);
+
+    // AFTER reopen — the IDENTICAL command now succeeds.
+    const accepted = await runCli([...base, "sessions", "activate", seatId, successorId], homeDir);
+    assert.equal(
+      accepted.code,
+      0,
+      `AP15: sessions activate was still refused after reopen — ${accepted.stdout}${accepted.stderr}`,
+    );
+    const payload = JSON.parse(accepted.stdout.trim()) as {
+      outcome?: string;
+      holderOrdinal?: number;
+    };
+    assert.equal(payload.outcome, "activated");
+    assert.equal(payload.holderOrdinal, 2, "the successor must take next_ordinal, not restart it");
   });
 });
 

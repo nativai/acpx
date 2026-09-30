@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { AcpxOperationalError } from "../../errors.js";
 import { withSessionIndexLock } from "./index-lock.js";
 import { SEAT_STORE_FILE } from "./session-dir-files.js";
 
@@ -516,8 +517,18 @@ export async function readSeatStore(sessionDir: string): Promise<SeatStore> {
   return parseSeatStore(payload);
 }
 
-/** Raised when a write would destroy a store that exists but could not be read. */
-export class SeatStoreUnwritableError extends Error {
+/**
+ * Raised when a write would destroy a store that exists but could not be read.
+ *
+ * `AcpxOperationalError`, not a plain `Error` (1dd9ae9a) — this is the WRITE SEAM
+ * refusing, and it is thrown from three call sites (`withSeatStoreWrite`,
+ * `refuseUnwritableStore` in `seats-command.ts`, and the backfill's own preflight),
+ * only one of which previously wrapped it with a code. `SEAT_STORE_UNWRITABLE` is
+ * REUSED verbatim from `seats-command.ts`'s established `SeatMutationRefusalCode` —
+ * the code names WHICH SEAM refused, not which verb called it, so every raise site
+ * carries the same code and the message text is unchanged either way.
+ */
+export class SeatStoreUnwritableError extends AcpxOperationalError {
   constructor(
     readonly filePath: string,
     readonly fileState: "malformed" | "unreadable",
@@ -528,8 +539,8 @@ export class SeatStoreUnwritableError extends Error {
         `nothing else holds them, so unlike index.json it cannot be rebuilt from a ` +
         `projection, and restarting ordinals would re-issue labels that must never repeat. ` +
         `Do not delete it to clear this error. ${seatStoreUnhealthyMessage(fileState)}`,
+      { outputCode: "RUNTIME", detailCode: "SEAT_STORE_UNWRITABLE", origin: "runtime" },
     );
-    this.name = "SeatStoreUnwritableError";
   }
 }
 

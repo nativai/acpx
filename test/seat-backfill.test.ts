@@ -1065,6 +1065,57 @@ test("R5: an ABSENT sessions directory is a NAMED refusal with a code, not a raw
   });
 });
 
+/**
+ * R6 (brick `1dd9ae9a`) — CONTENT.md's acceptance: "all three total refusals carry
+ * `data.detailCode`, asserted with ONE test that enumerates the population — so the
+ * next class added without a code reds by name." The population, as of this brick,
+ * is exactly the three preflight refusals `preflight()` in `seat-backfill.ts` can
+ * throw: `SEAT_BACKFILL_SESSION_DIR_MISSING` (R5's subject, already coded — its
+ * presence here is the control member, proving the enumeration itself is not
+ * vacuous), `SEAT_STORE_UNWRITABLE` (R1/R4's subject, REUSED from the established
+ * `seats-command.ts` convention rather than a new spelling — the code names the
+ * SEAM, not the caller), and `SEAT_BACKFILL_INDEX_UNREADABLE` (R3's subject, new —
+ * no established code exists for this seam elsewhere). A row that checked only the
+ * two newly-coded members would recreate the exact inconsistency this brick exists
+ * to close the moment a fourth refusal is added without a code.
+ */
+test("R6 · ALL THREE preflight refusals carry a stable data.detailCode — the population, not just the newest", async () => {
+  function detailCodeOf(stdout: string): string | undefined {
+    const envelope = JSON.parse(stdout.trim()) as { error: { data?: { detailCode?: string } } };
+    return envelope.error.data?.detailCode;
+  }
+
+  // (a) an absent sessions directory — mirrors R5.
+  await withTempHome(async (homeDir) => {
+    const result = await runCli(["seats", "backfill", "--apply", "--format", "json"], homeDir);
+    assert.notEqual(result.code, 0, "an absent sessions directory must not exit 0");
+    assert.equal(detailCodeOf(result.stdout), "SEAT_BACKFILL_SESSION_DIR_MISSING");
+  });
+
+  // (b) a malformed seats.json — mirrors R1.
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [makeRecord({ acpxRecordId: "r6b" })]);
+    await fs.writeFile(path.join(sessionsDir(homeDir), SEAT_STORE_FILE), "{ not json", "utf8");
+    const result = await runCli(["seats", "backfill", "--apply", "--format", "json"], homeDir);
+    assert.notEqual(result.code, 0, "a malformed store must not exit 0");
+    assert.equal(detailCodeOf(result.stdout), "SEAT_STORE_UNWRITABLE");
+  });
+
+  // (c) an index that fails the all-or-nothing contract — mirrors R3.
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [makeRecord({ acpxRecordId: "r6c" })]);
+    const indexPath = path.join(sessionsDir(homeDir), "index.json");
+    const index = JSON.parse(await fs.readFile(indexPath, "utf8")) as {
+      entries: Record<string, unknown>[];
+    };
+    index.entries.push({ file: "ghost.json", acpxRecordId: 7 });
+    await fs.writeFile(indexPath, `${JSON.stringify(index)}\n`, "utf8");
+    const result = await runCli(["seats", "backfill", "--apply", "--format", "json"], homeDir);
+    assert.notEqual(result.code, 0);
+    assert.equal(detailCodeOf(result.stdout), "SEAT_BACKFILL_INDEX_UNREADABLE");
+  });
+});
+
 // ─── L17 — RESUMABILITY: the row the operator actually needs ─────────────────
 
 /**

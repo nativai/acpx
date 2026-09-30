@@ -178,10 +178,19 @@ export const SEAT_BACKFILL_NOTES = [
   "run this on a QUIET BOX: B12a forbids backfilling while sessions are live, because the index lock gives up after ~2 s of contention by design and concurrent writers start losing writes SILENTLY",
 ] as const;
 
-/** The index exists and does not satisfy `readSessionIndex`'s all-or-nothing
+/**
+ * The index exists and does not satisfy `readSessionIndex`'s all-or-nothing
  * contract, so the backfill refuses rather than letting `reconcileSessionIndex`
- * silently rebuild the whole store behind it. */
-export class SeatBackfillIndexUnreadableError extends Error {
+ * silently rebuild the whole store behind it.
+ *
+ * `AcpxOperationalError`, not a plain `Error` (1dd9ae9a) — its sibling
+ * `SeatBackfillSessionDirMissingError` below sets the pattern for this file's own
+ * preflight refusals, and this is the second of the two that had no code. Unlike
+ * `SeatStoreUnwritableError`, no established code exists for this seam anywhere
+ * else, so `SEAT_BACKFILL_INDEX_UNREADABLE` is a NEW constant, on the
+ * `SEAT_BACKFILL_*` spelling the sibling already uses — never a second scheme.
+ */
+export class SeatBackfillIndexUnreadableError extends AcpxOperationalError {
   constructor(readonly filePath: string) {
     super(
       `refusing to backfill: ${filePath} EXISTS but does not parse as a session index. ` +
@@ -190,8 +199,8 @@ export class SeatBackfillIndexUnreadableError extends Error {
         `records, which is both an unbounded scan and a far wider change than this verb is ` +
         `allowed to make. Quarantine the file (rename it aside, keeping it), let acpx rebuild ` +
         `the index on the next ordinary read, and run the backfill again.`,
+      { outputCode: "RUNTIME", detailCode: "SEAT_BACKFILL_INDEX_UNREADABLE", origin: "cli" },
     );
-    this.name = "SeatBackfillIndexUnreadableError";
   }
 }
 
