@@ -1831,6 +1831,49 @@ test("LS4 · a MALFORMED ROW is excluded from the listing and named, never silen
   });
 });
 
+/**
+ * 🛑 THE CONTRACT WIDENING — owner ruling 2026-09-30T16:17:04Z, on the TE's V3
+ * finding: `list` must answer "which seat holds brick X", the one relation this
+ * programme moved from the session onto the seat. `brickId` is ALWAYS PRESENT in
+ * JSON (`null` when unset — C2's absence-is-a-value rule, same as `name`), and a
+ * short `brick` column (uuid8, `-` when unset) in text.
+ */
+test("LS5 · brick_id — a seat WITH a brick shows it in BOTH formats; a seat WITHOUT shows null/json and -/text", async () => {
+  await withRig(async (homeDir) => {
+    await writeStore(homeDir, {
+      [SEAT_A]: seatRow(SEAT_A, { active_holder_id: null, brick_id: BRICK_ID }),
+      [SEAT_B]: seatRow(SEAT_B, { active_holder_id: null }),
+    });
+
+    const json = await runCli(["--format", "json", "seats", "list"], homeDir);
+    assert.equal(json.code, 0, json.output);
+    const payload = JSON.parse(json.stdout.trim()) as {
+      seats: { seatId: string; brickId: string | null }[];
+    };
+    assert.equal(
+      payload.seats.find((seat) => seat.seatId === SEAT_A)?.brickId,
+      BRICK_ID,
+      "a seat WITH a brick must show it",
+    );
+    assert.equal(
+      payload.seats.find((seat) => seat.seatId === SEAT_B)?.brickId,
+      null,
+      "a seat WITHOUT a brick must show null, never be missing the key",
+    );
+    assert.ok(
+      Object.hasOwn(payload.seats.find((seat) => seat.seatId === SEAT_B) ?? {}, "brickId"),
+      "brickId must be a PRESENT key with value null, never an absent key",
+    );
+
+    const text = await runCli(["seats", "list"], homeDir);
+    assert.equal(text.code, 0, text.output);
+    const lineFor = (seatId: string) =>
+      text.stdout.split("\n").find((line) => line.startsWith(seatId));
+    assert.match(lineFor(SEAT_A) ?? "", new RegExp(`brick=${BRICK_ID.slice(0, 8)}\\b`));
+    assert.match(lineFor(SEAT_B) ?? "", /brick=-\s/);
+  });
+});
+
 // ─── reopen ──────────────────────────────────────────────────────────────────
 
 test("RO1 · IDEMPOTENT no-op — reopening a seat that is NOT closed is rc 0 with a notice, and writes nothing", async () => {

@@ -1309,9 +1309,18 @@ function renderSeatShow(
   renderSeatShowText(row, holderState, holders);
 }
 
+/**
+ * 🛑 SIX COLUMNS, WIDENED FROM FIVE 2026-09-30T16:17:04Z (the programme owner, on
+ * the TE's V3 finding) — `brickId` joins the cut. The relation this programme moved
+ * from the session onto the seat is the brick link, so an operator's read surface
+ * that could not answer "which seat holds brick X" was missing exactly that. C2's
+ * absence-is-a-value rule, which already governs `name`, now governs this field too
+ * — see `renderSeatList`'s JSON branch for what that means in practice.
+ */
 type SeatListRow = {
   readonly seatId: string;
   readonly name: string | undefined;
+  readonly brickId: string | undefined;
   readonly closed: boolean;
   readonly holderCount: number;
   readonly holderState: ActiveHolderState;
@@ -1388,7 +1397,29 @@ async function buildSeatListRow(
   holderCount: number,
 ): Promise<SeatListRow> {
   const holderState = await resolveActiveHolderState(row.activeHolderId);
-  return { seatId, name: row.name, closed, holderCount, holderState };
+  return { seatId, name: row.name, brickId: row.brickId, closed, holderCount, holderState };
+}
+
+function seatListRowJson(row: SeatListRow): Record<string, unknown> {
+  return {
+    seatId: row.seatId,
+    name: row.name ?? null,
+    // ALWAYS PRESENT, `null` when unset — never absent (C2's absence-is-a-value
+    // rule, widened onto this field 2026-09-30). A key that disappears when empty
+    // forces every consumer to distinguish "absent" from "null".
+    brickId: row.brickId ?? null,
+    closed: row.closed,
+    holderCount: row.holderCount,
+    activeHolder: activeHolderJson(row.holderState),
+  };
+}
+
+function seatListRowText(row: SeatListRow): string {
+  return (
+    `${row.seatId}  ${row.name ?? "(unnamed)"}  brick=${row.brickId?.slice(0, 8) ?? "-"}  ` +
+    `active=${renderActiveHolderText(row.holderState)}  holders=${row.holderCount}  ` +
+    `${row.closed ? "CLOSED" : "open"}\n`
+  );
 }
 
 function renderSeatList(
@@ -1399,13 +1430,7 @@ function renderSeatList(
   if (
     emitJsonResult(format, {
       ok: true,
-      seats: rows.map((row) => ({
-        seatId: row.seatId,
-        name: row.name ?? null,
-        closed: row.closed,
-        holderCount: row.holderCount,
-        activeHolder: activeHolderJson(row.holderState),
-      })),
+      seats: rows.map(seatListRowJson),
       malformed: malformedSeatIds,
     })
   ) {
@@ -1416,10 +1441,7 @@ function renderSeatList(
     return;
   }
   for (const row of rows) {
-    process.stdout.write(
-      `${row.seatId}  ${row.name ?? "(unnamed)"}  active=${renderActiveHolderText(row.holderState)}  ` +
-        `holders=${row.holderCount}  ${row.closed ? "CLOSED" : "open"}\n`,
-    );
+    process.stdout.write(seatListRowText(row));
   }
   for (const seatId of malformedSeatIds) {
     process.stderr.write(
@@ -1702,7 +1724,7 @@ READ-ONLY. Never writes \`seats.json\`; a malformed row or a malformed/unreadabl
 
   seatsCommand
     .command("list")
-    .description("List every seat row: id, name, active holder, holder count, closed marker")
+    .description("List every seat row: id, name, brick, active holder, holder count, closed marker")
     .option("--closed", "Only closed seats")
     .option("--open", "Only open (not-closed) seats")
     .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
