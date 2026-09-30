@@ -192,7 +192,7 @@ test("the verb tells the caller closing the predecessor is THEIR duty, with the 
     assert.match(result.stdout, /duty/i, "the output does not say whose duty the close is");
     assert.match(
       result.stdout,
-      /acpx sessions close holder-one/,
+      /acpx sessions close --session-id holder-one/,
       "the output does not give the exact command to discharge the duty",
     );
   });

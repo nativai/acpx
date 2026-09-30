@@ -700,9 +700,9 @@ OTHER THINGS WORTH KNOWING.
   command prints the exact \`sessions close\` to run, and nobody else will run it.
 
 The two steps of a handover, in order:
-  1. acpx sessions new --seat <seat>      # create the successor, prepared, no ordinal
-  2. acpx sessions activate <seat> <new>  # retire the old holder, point the seat, draw the ordinal
-  3. acpx sessions close <old>            # YOUR duty — printed by step 2
+  1. acpx sessions new --seat <seat>            # create the successor, prepared, no ordinal
+  2. acpx sessions activate <seat> <new>        # retire the old holder, point the seat, draw the ordinal
+  3. acpx sessions close --session-id <old>     # YOUR duty — printed by step 2
 
 Two concurrent activations on one seat are safe: both read the seat row fresh under a
 lock, exactly one wins, and the loser refuses rather than overwriting. The ordinal is a

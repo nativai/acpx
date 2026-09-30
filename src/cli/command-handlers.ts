@@ -4426,7 +4426,7 @@ function printActivationText(result: {
     process.stdout.write(
       `Retired (NOT closed): ${result.predecessorId}\n` +
         `🛑 YOUR DUTY — close it yourself; nothing else will:\n` +
-        `     acpx sessions close ${result.predecessorId}\n`,
+        `     acpx sessions close --session-id ${result.predecessorId}\n`,
     );
   }
   // Printed for the handover party to DELIVER, not injected as a turn: a lifecycle verb
