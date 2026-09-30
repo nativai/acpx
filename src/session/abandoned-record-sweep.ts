@@ -8,19 +8,22 @@ import type { SessionRecord } from "../types.js";
 /**
  * Close session records whose owner is gone (brick 7adac97e).
  *
- * ## ⚠️ WHY THIS EXISTS ONE LAYER ABOVE THE DIRECTORY SWEEP
+ * ## ⚠️ WHY THIS EXISTS — AND WHY IT HAS NO PRODUCTION CALLER AS OF 2026-09-30
  *
- * `pruneOrphanHarnessConfigDirs` now removes a directory only on POSITIVE
- * ownership, and one of its clauses is "the record is CLOSED". That is the right
- * safety rule and it is deliberately NOT weakened here. But it makes the
- * directory sweep's effectiveness a function of RECORD state — so a store full of
- * records that were abandoned rather than closed makes a *correct* sweep retain
- * every directory forever.
+ * This was written one layer above the harness-config-dir orphan sweep:
+ * `pruneOrphanHarnessConfigDirs` removed a directory only on POSITIVE ownership,
+ * one clause of which was "the record is CLOSED" — so a store full of records
+ * that were abandoned rather than closed made a *correct* sweep retain every
+ * directory forever (measured on the rig: 206 records, 118 closed, 88 still
+ * OPEN, each pinning a config dir at roughly 63 MB). This module fixed the
+ * population rather than relaxing the sweep's deletion rule.
  *
- * That is exactly what was measured on the rig: **206 records, 118 closed, 88
- * still OPEN**, from lanes that had long since finished, each one pinning a
- * config dir at roughly 63 MB. The population is not a reason to relax the
- * deletion rule; it is a reason to fix the population.
+ * The sweep itself was removed 2026-09-30 (brick d1e12500 — it OOM-crashed the
+ * CLI in production twice; see the anti-rebuild comment on `handlePrompt` in
+ * `cli/command-handlers.ts`) and its removal was not authorised to reach this
+ * module, so `sweepAbandonedSessionRecords` remains, tested, with no remaining
+ * caller outside its own test file. Flagged to the brick's owner rather than
+ * deleted silently.
  *
  * ## What "no live owner" means here, and why the pid alone will not do
  *
