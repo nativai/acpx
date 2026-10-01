@@ -747,6 +747,11 @@ export async function mintSeatRow(
     readonly holderId: string;
     readonly name: string | undefined;
     readonly createdAt: string;
+    // F1 fix (brick 3dff714d) — the resolved `--brick` (explicit or
+    // parent-inherited) for the founding holder, written onto the SEAT at mint
+    // time. `undefined` when the holder itself carries none, matching the
+    // "absent, not an empty string" discipline the field has always had.
+    readonly brickId: string | undefined;
   },
 ): Promise<void> {
   await withSeatStoreWrite(sessionDir, (store) => {
@@ -781,9 +786,12 @@ export async function mintSeatRow(
       // D9 phase (i): the name is written to the seat AND still to the session record,
       // and the SEAT is authoritative wherever the two disagree.
       name: params.name,
-      // `brick attach` is this field's writer (C4 / Cluster A requirement 5) and that is
-      // not this pass. Absent, deliberately — not an empty string.
-      brickId: undefined,
+      // F1 fix (brick 3dff714d) — the founding holder's resolved brick, so a
+      // fresh `sessions new --brick <uuid>` writes the SEAT's `brick_id` rather
+      // than leaving it for `brick attach` to set later (C4 / Cluster A
+      // requirement 5 is still true for a seat minted with NO `--brick`:
+      // `params.brickId` is `undefined` there, same as before this fix).
+      brickId: params.brickId,
       // A freshly-minted seat has no holder history to derive a star from —
       // `false`, not absent (D-STAR moves the field onto the seat; there is no
       // legacy per-record value to carry forward for a seat that did not exist a
@@ -942,9 +950,42 @@ export async function mintSeatRowBestEffort(
         `acpx seat-row-not-minted: seat=${params.seatId} holder=${params.holderId} ` +
         `store=${seatStorePath(sessionDir)} — the session was created and IS USABLE, and it ` +
         `keeps its seat id, but its seat has no row yet, so it cannot be joined or ` +
-        `succeeded until one exists. ${seatStoreFailureRemedy(error)}`,
+        `succeeded until one exists. ${brickConsequenceClause(params)}${seatStoreFailureRemedy(error)}`,
     };
   }
+}
+
+/**
+ * F1 (brick `3dff714d`) widened what a failed mint costs: the SEAT's `brick_id`
+ * is now written at mint time too (same row, same write), so a mint that fails
+ * loses the canonical link, not only the row — while the holder's OWN
+ * `metadata.brick` already landed (it was written before this call, on the
+ * record itself, which did not fail). **This is exactly the findings' F4
+ * class** ("a confident instruction to do the wrong thing is worse than an
+ * error") if the message does not name it: an operator reading only the
+ * generic remedy below has no way to know a brick link is even at stake.
+ *
+ * 🛑 **ONLY `seats backfill` IS A TRUE REMEDY HERE — `seats set-brick` IS NOT,
+ * AND NAMING IT WOULD BE A SECOND F4.** `mintSeatRow` is one atomic write of
+ * the WHOLE row; a failure means NO row exists for this seat at all, not a
+ * row missing one field. `seats set-brick` requires a pre-existing row
+ * (`requireSeatRow` refuses `SEAT_ROW_MISSING` otherwise), so it cannot act
+ * until something else has minted one — which is exactly `seats backfill`'s
+ * job (item (d): it now derives `brick_id` from the active holder, the same
+ * holder this diagnostic names). Do not "helpfully" add `set-brick` to this
+ * message; it is advice the operator cannot yet follow.
+ *
+ * Empty string when no brick was being minted at all, so a plain `sessions
+ * new` failure keeps its original, unwidened message.
+ */
+function brickConsequenceClause(params: Parameters<typeof mintSeatRow>[1]): string {
+  if (params.brickId === undefined) {
+    return "";
+  }
+  return (
+    `The seat's brick_id was NOT written — it is the CANONICAL copy (CONCEPTION C4) — even ` +
+    `though the holder's own metadata.brick is already set to ${params.brickId}. `
+  );
 }
 
 /** The remedy for whatever actually went wrong — (c)'s two sub-cases differ, and a

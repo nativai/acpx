@@ -4609,22 +4609,60 @@ test("integration: sessions close stays closed after live checkpoints", async ()
         },
       );
 
+      const recordPath = path.join(
+        homeDir,
+        ".acpx",
+        "sessions",
+        `${encodeURIComponent(sessionId as string)}.json`,
+      );
+
       try {
+        // 🛑 RE-INSTRUMENTED (brick 347d89d5). This used to poll by spawning a
+        // fresh `sessions read` CLI subprocess every 20ms. Under box load
+        // (reproduced at load1 ~29 on this box) a SINGLE such spawn can itself
+        // take several seconds — so a run of even a few slow polls blew the
+        // whole 5s budget before the wait's own deadline check ever fired
+        // (captured: `waitFor`'s bare timeout string, no `operator`, no
+        // expected/actual — `sessions close` was never reached). The ASSERTION
+        // this test exists for (close stays closed) is untouched below; only
+        // this precondition wait — "has the live checkpoint landed" — changes.
+        //
+        // That precondition is a FILE FACT, not a CLI-round-trip fact: the
+        // assistant's streamed text is written to the record's `messages`
+        // array by `LiveSessionCheckpoint` (src/session/live-checkpoint.ts,
+        // DEFAULT_LIVE_CHECKPOINT_INTERVAL_MS = 500) well before `sessions
+        // read` would ever report it. Polling the record file directly removes
+        // the load-sensitive subprocess-per-tick cost entirely rather than
+        // tolerating it with a wider number.
         await waitFor(async () => {
-          const result = await runCli(
-            [...baseAgentArgs(cwd), "--format", "json", "sessions", "read"],
-            homeDir,
-          );
-          assert.equal(result.code, 0, result.stderr);
-          const payload = JSON.parse(result.stdout.trim()) as {
-            entries?: Array<{ role?: string; textPreview?: string }>;
+          let raw: string;
+          try {
+            raw = await fs.readFile(recordPath, "utf8");
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+              return null;
+            }
+            throw error;
+          }
+          const record = JSON.parse(raw) as {
+            messages?: Array<{ Agent?: { content?: Array<{ Text?: string }> } }>;
           };
-          const assistantEntry = payload.entries?.find(
-            (entry) =>
-              entry.role === "assistant" && entry.textPreview?.includes("close-live-update"),
+          const hasLiveCheckpoint = (record.messages ?? []).some((message) =>
+            (message.Agent?.content ?? []).some(
+              (content) =>
+                typeof content.Text === "string" && content.Text.includes("close-live-update"),
+            ),
           );
-          return assistantEntry ? true : null;
-        }, 5_000);
+          return hasLiveCheckpoint ? true : null;
+          // Bound (next line) matches `runCliWithEntry`'s own default CLI
+          // timeout above in this file (60_000ms) — the already-established
+          // tolerance in this suite for how long a single acpx CLI/agent
+          // process may legitimately take to spawn and respond under load,
+          // not a number tuned to make any one run pass. The only cost left
+          // in the real envelope once the subprocess-per-tick polling is gone
+          // is this test's OWN prompt child's one-time spawn + ACP handshake +
+          // one checkpoint interval (<=500ms).
+        }, 60_000);
 
         const closed = await runCli(
           [...baseAgentArgs(cwd), "--format", "json", "sessions", "close"],
@@ -4635,12 +4673,6 @@ test("integration: sessions close stays closed after live checkpoints", async ()
           await awaitChildClose(promptChild).catch(() => {});
         }
 
-        const recordPath = path.join(
-          homeDir,
-          ".acpx",
-          "sessions",
-          `${encodeURIComponent(sessionId as string)}.json`,
-        );
         const storedRecord = JSON.parse(await fs.readFile(recordPath, "utf8")) as {
           closed?: boolean;
           closed_at?: string;
