@@ -222,22 +222,23 @@ test("protected classes are blocked at any age", () => {
   assert.equal(blocker({ ...base, template: { enabled: false } }), "template");
 });
 
-// ── D-STAR: the `favorite` blocker is SEAT-AWARE, not a per-record field ────────
+// ── D-STAR: the `favorite` blocker is SEAT-AWARE, WITH A LEGACY FALLBACK ────────
 //
-// 🛑 THE OLD RED DIRECTION, RESTATED ON THE NEW MECHANISM. Before D-STAR this file
-// asserted `blocker({...base, favorite: true}) === "favorite"` — a per-record
-// field the archiver no longer reads at all (`favorite` moved to the seat). The
-// row below is that same red direction, carried forward onto seat data: a
-// starred seat's ACTIVE holder is still refused archival. The GREEN direction —
-// a RETIRED holder of the same starred seat IS archivable — is the new one this
-// block adds, and it is exactly what dissolves the old cold-tier question: there
-// is no "what if the only starred holder is archived", because the star is not on
-// a holder any more.
+// 🛑 A FIRST CUT DROPPED THE LEGACY FALLBACK ENTIRELY — CAUGHT BY THE L0,
+// 2026-09-30T23:39Z, brick `6adabe72`. Reading the seat alone and coercing an
+// unmigrated seat's `favorite` to `false` silently unprotects every currently
+// starred record for two real windows: any box between deploying this code and
+// running the favorite migration (a seat row EXISTS but hasn't been corrected),
+// and any record with NO seat at all — which is ALL of production until the seat
+// backfill runs, not a hypothetical. Rows 1 and 2 below are exactly those two
+// windows, RED at `23909b70` (the coercing version) and GREEN after the fix.
+// Row 4 is the flip side: ONCE migrated, the seat's explicit value — including an
+// explicit `false` — OVERRIDES a stale legacy `true` on the record.
 
 const SEAT_STARRED = "eeeeeeee-1111-4111-8111-111111111111";
 
-function starredSeatStore(): SeatStore {
-  const row: SeatRecord = {
+function seatRowFixture(overrides: Partial<SeatRecord> = {}): SeatRecord {
+  return {
     seatId: SEAT_STARRED,
     createdAt: "2026-01-01T00:00:00.000Z",
     activeHolderId: "some-holder",
@@ -245,62 +246,126 @@ function starredSeatStore(): SeatStore {
     closedAt: null,
     name: undefined,
     brickId: undefined,
-    favorite: true,
+    favorite: undefined,
+    ...overrides,
   };
+}
+
+function seatStoreOf(row: SeatRecord, malformed: readonly string[] = []): SeatStore {
   return {
-    seats: new Map([[SEAT_STARRED, row]]),
-    malformedSeatIds: [],
-    unparsedRows: new Map(),
+    seats: malformed.includes(row.seatId) ? new Map() : new Map([[row.seatId, row]]),
+    malformedSeatIds: [...malformed],
+    unparsedRows: new Map(malformed.map((id) => [id, { seat_id: id }])),
     fileState: "ok",
   };
 }
 
-test("favorite (seat-aware): a starred seat's ACTIVE holder is refused archival — the RED direction", () => {
-  const base = { closed: true, closed_at: iso(60 * DAY) };
+function favoriteBlocker(
+  record: Record<string, unknown>,
+  seatStore: SeatStore = {
+    seats: new Map(),
+    malformedSeatIds: [],
+    unparsedRows: new Map(),
+    fileState: "ok",
+  },
+): string | undefined {
   const files = { ".json": 60 * DAY };
-  const c = candidate({
-    record: { ...base, seat_id: SEAT_STARRED, holder_active: true },
-    files,
-  });
+  const base = { closed: true, closed_at: iso(60 * DAY) };
+  return staticBlockerFor(
+    candidate({ record: { ...base, ...record }, files }),
+    BOUNDARIES,
+    EMPTY_MANIFEST_VIEW,
+    seatStore,
+  )?.blocker;
+}
+
+test("favorite ROW 1: a seat row WITHOUT the field yet — legacy record.favorite:true on the ACTIVE holder still PROTECTS", () => {
+  // The migration window: the seat row exists (real pre-migration shape — every
+  // OTHER field present, `favorite` simply never written) but has not been
+  // corrected. This must fall back to the record's own star, not read as unstarred.
+  const unmigrated = seatRowFixture(); // favorite: undefined, by the fixture's default
   assert.equal(
-    staticBlockerFor(c, BOUNDARIES, EMPTY_MANIFEST_VIEW, starredSeatStore())?.blocker,
+    favoriteBlocker(
+      { seat_id: SEAT_STARRED, holder_active: true, favorite: true },
+      seatStoreOf(unmigrated),
+    ),
     "favorite",
   );
 });
 
-test("favorite (seat-aware): a RETIRED holder of the same starred seat IS archivable — the new GREEN direction", () => {
-  const base = { closed: true, closed_at: iso(60 * DAY) };
-  const files = { ".json": 60 * DAY };
+test("favorite ROW 2: a SEAT-LESS record with legacy record.favorite:true still PROTECTS — production's steady state pre-backfill", () => {
+  // No seat_id at all: `seatFromStore` is never even consulted. This is not an
+  // edge case — it is every record in production until the seat backfill runs.
+  assert.equal(favoriteBlocker({ favorite: true }), "favorite");
+});
+
+test("favorite ROW 3a: a MIGRATED starred seat's ACTIVE holder is refused archival", () => {
+  const migrated = seatRowFixture({ favorite: true });
   const c = candidate({
-    record: { ...base, seat_id: SEAT_STARRED, holder_active: false },
-    files,
+    record: { closed: true, closed_at: iso(60 * DAY), seat_id: SEAT_STARRED, holder_active: true },
+    files: { ".json": 60 * DAY },
   });
   assert.equal(
-    staticBlockerFor(c, BOUNDARIES, EMPTY_MANIFEST_VIEW, starredSeatStore())?.blocker,
+    staticBlockerFor(c, BOUNDARIES, EMPTY_MANIFEST_VIEW, seatStoreOf(migrated))?.blocker,
+    "favorite",
+  );
+});
+
+test("favorite ROW 3b: a RETIRED holder of the same migrated starred seat IS archivable", () => {
+  const migrated = seatRowFixture({ favorite: true });
+  const c = candidate({
+    record: { closed: true, closed_at: iso(60 * DAY), seat_id: SEAT_STARRED, holder_active: false },
+    files: { ".json": 60 * DAY },
+  });
+  assert.equal(
+    staticBlockerFor(c, BOUNDARIES, EMPTY_MANIFEST_VIEW, seatStoreOf(migrated))?.blocker,
     undefined,
     "a retired holder of a starred seat must not be blocked on the seat's behalf",
   );
   assert.equal(tierFor(c, BOUNDARIES, false)?.tier, "closed", "and it archives normally");
 });
 
-test("favorite (seat-aware): an UN-starred seat's active holder is not blocked", () => {
-  const base = { closed: true, closed_at: iso(60 * DAY) };
-  const files = { ".json": 60 * DAY };
-  const c = candidate({
-    record: { ...base, seat_id: SEAT_STARRED, holder_active: true },
-    files,
-  });
-  // Empty seat store — no seat is starred. Control for the RED-direction row
-  // above: without a starred seat in the store, the same record is NOT blocked.
-  assert.equal(staticBlockerFor(c, BOUNDARIES)?.blocker, undefined);
+test("favorite ROW 4: a MIGRATED un-starred seat (favorite:false) archives its active holder EVEN WITH a stale legacy record.favorite:true", () => {
+  // The explicit seat value WINS once migrated — a stale per-record `true` left
+  // over from before the migration must not resurrect protection the seat itself
+  // has explicitly retracted.
+  const unstarred = seatRowFixture({ favorite: false });
+  assert.equal(
+    favoriteBlocker(
+      { seat_id: SEAT_STARRED, holder_active: true, favorite: true },
+      seatStoreOf(unstarred),
+    ),
+    undefined,
+    "the migrated seat's explicit false must override the record's stale legacy true",
+  );
 });
 
-test("favorite (seat-aware): a record with NO seat_id at all is never blocked on the seat's behalf", () => {
-  const base = { closed: true, closed_at: iso(60 * DAY) };
-  const files = { ".json": 60 * DAY };
-  const c = candidate({ record: base, files });
+test("favorite ROW 5: a MALFORMED seat row throws rather than silently reading 'not starred'", () => {
+  const store = seatStoreOf(seatRowFixture(), [SEAT_STARRED]);
+  assert.throws(
+    () => favoriteBlocker({ seat_id: SEAT_STARRED, holder_active: true, favorite: true }, store),
+    /is PRESENT in the seat store but its row is malformed/,
+    "a destruction guard must fail loud, never silently treat 'cannot tell' as 'not starred'",
+  );
+});
+
+test("favorite: no seat_id and no legacy favorite — not blocked (control for ROW 2)", () => {
+  assert.equal(favoriteBlocker({}), undefined);
+});
+
+test("favorite: a seat with no row at all (dangling seat_id) falls back to the legacy record value", () => {
+  const emptyStore: SeatStore = {
+    seats: new Map(),
+    malformedSeatIds: [],
+    unparsedRows: new Map(),
+    fileState: "ok",
+  };
   assert.equal(
-    staticBlockerFor(c, BOUNDARIES, EMPTY_MANIFEST_VIEW, starredSeatStore())?.blocker,
+    favoriteBlocker({ seat_id: SEAT_STARRED, holder_active: true, favorite: true }, emptyStore),
+    "favorite",
+  );
+  assert.equal(
+    favoriteBlocker({ seat_id: SEAT_STARRED, holder_active: true, favorite: false }, emptyStore),
     undefined,
   );
 });

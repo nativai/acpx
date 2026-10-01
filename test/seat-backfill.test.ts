@@ -671,6 +671,56 @@ test("FAV4: a DRY RUN reports favoritesMigrated without writing anything", async
   });
 });
 
+test("FAV5: a row with NO favorite key at all (real pre-migration shape) is migrated even when every holder computes to false", async () => {
+  // 🛑 THE TRI-STATE REGRESSION THIS ROW GUARDS. Under the coercion-to-false bug
+  // (caught by the L0 2026-09-30T23:39Z, brick `6adabe72`), a not-yet-migrated
+  // row's `favorite` read as `false` — identical to the value every holder here
+  // computes — so `favoriteNeedsMigration` compared `false !== false` and NEVER
+  // flagged the seat. The row stayed ambiguous ("not yet migrated" vs
+  // "explicitly un-starred") forever, because its computed answer happened to
+  // agree with the coerced one. With the tri-state fix, an absent key reads as
+  // `undefined`, `undefined !== false` is true, and the migration fires —
+  // converting the ambiguous state into an explicit, on-disk `false`.
+  await withTempHome(async (homeDir) => {
+    const seatId = "fafafafa-5555-4555-8555-555555555555";
+    await seed(homeDir, [
+      // No holder here has `favorite: true` — the computed answer is `false`.
+      makeRecord({ acpxRecordId: "fav5-h1", seatId, holderOrdinal: 1 }),
+    ]);
+    // Plant the row with the REAL pre-migration shape: every other field present,
+    // no `favorite` key whatsoever — not even an explicit `false`.
+    const dir = sessionsDir(homeDir);
+    const preMigrationRow = {
+      seat_id: seatId,
+      created_at: "2026-01-01T00:00:00.000Z",
+      active_holder_id: "fav5-h1",
+      next_ordinal: 2,
+      closed_at: null,
+    };
+    await fs.writeFile(
+      path.join(dir, SEAT_STORE_FILE),
+      `${JSON.stringify({ [seatId]: preMigrationRow })}\n`,
+      "utf8",
+    );
+    assert.ok(
+      !("favorite" in (await readRawStore(homeDir))[seatId]),
+      "fixture precondition: the planted row must carry no favorite key at all",
+    );
+
+    const report = await backfill(homeDir, ["--apply"]);
+    assert.equal(report.seats, 0, "the row already existed — nothing is minted");
+    assert.equal(
+      report.favoritesMigrated,
+      1,
+      "an absent key must be migrated to an explicit value, not silently matched",
+    );
+
+    const raw = await readRawStore(homeDir);
+    assert.ok(Object.hasOwn(raw[seatId], "favorite"), "the migration must leave an explicit key");
+    assert.equal(raw[seatId].favorite, false);
+  });
+});
+
 // ─── L7 — every minted row round-trips the store's own parse leg ─────────────
 
 test("L7: every backfilled row round-trips parseSeatFromPersisted", async () => {

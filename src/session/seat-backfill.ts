@@ -728,7 +728,14 @@ async function writeFavoriteMigrationLeg(
     return;
   }
   counts.favoritesAttempted.add(plan.seatId);
-  if ((await migrateSeatFavorite(sessionDir, plan.seatId, seat.row.favorite)) === "migrated") {
+  // `seat.row.favorite` is always a concrete boolean here — `planSeatRow` sets it
+  // from `favoriteFromHolders`, which never returns `undefined` — but the FIELD's
+  // own type is the tri-state `boolean | undefined` every `SeatRecord` carries
+  // (a row freshly read from disk may not have migrated yet), so this coerces
+  // rather than asserts.
+  if (
+    (await migrateSeatFavorite(sessionDir, plan.seatId, seat.row.favorite === true)) === "migrated"
+  ) {
     counts.favoritesMigrated += 1;
   }
 }

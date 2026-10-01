@@ -40,11 +40,22 @@ export type ArchiveRecordView = {
   hasTemplate: boolean;
   /** `$.seat_id` — absent on a pre-seat record. Together with `holderActive`,
    * this is what lets the archiver ask "is this record the ACTIVE holder of a
-   * starred seat" (D-STAR) instead of reading a per-record `favorite` — that field
-   * moved to the seat and is no longer this module's concern. */
+   * starred seat" (D-STAR). */
   seatId: string | undefined;
   /** `$.holder_active === true` — see `seatId` above. */
   holderActive: boolean;
+  /**
+   * `$.favorite === true` — the LEGACY per-record star. D-STAR moves the star's
+   * authority to the seat, but this field is NOT dead: it is the fallback the
+   * archiver's guard uses whenever the seat cannot yet answer authoritatively —
+   * no `seatId` at all (pre-backfill), or a seat row that has not been through the
+   * favorite migration (`seat.favorite === undefined`). Caught by the L0 2026-09-30
+   * T23:39Z on brick `6adabe72`: a first cut of this projection dropped this field
+   * entirely, which silently unprotected every currently-starred record for the
+   * whole window between deploying the seat-aware guard and running the migration.
+   * See `retention.ts`'s `recordBlockerFor` for where this is actually consulted.
+   */
+  favorite: boolean;
   pid: number | undefined;
   parentSessionId: string | undefined;
   /**
@@ -139,6 +150,7 @@ export function projectArchiveRecord(parsed: unknown): ArchiveRecordView | undef
     hasTemplate: record.template != null,
     seatId: optionalString(record.seat_id),
     holderActive: record.holder_active === true,
+    favorite: record.favorite === true,
     pid: optionalNumber(record.pid),
     parentSessionId: optionalString(record.parent_session_id),
     bywayParent: metadataString(metadata, "byway_parent"),

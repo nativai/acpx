@@ -284,7 +284,7 @@ async function revalidateRecord(
   if (read.view.hasTemplate) {
     return { ok: false, reason: "template" };
   }
-  if (await isActiveHolderOfStarredSeat(hotDir, read.view)) {
+  if (await favoriteBlocksArchival(hotDir, read.view)) {
     return { ok: false, reason: "favorite" };
   }
   return { ok: true, view: read.view };
@@ -292,25 +292,28 @@ async function revalidateRecord(
 
 /**
  * ⚠️ SEAT-AWARE, PER D-STAR (2026-09-30) — see `retention.ts`'s `recordBlockerFor`
- * for the full rationale; this is the APPLY-TIME twin, re-read fresh immediately
+ * for the FULL rationale (this is its APPLY-TIME twin, re-read fresh immediately
  * before the rename rather than from a plan taken minutes earlier, matching this
  * function's own "against the LIVE record, not the plan" discipline for every
- * other field it checks. Only the seat's ACTIVE holder is protected; a RETIRED
- * holder of the same starred seat is archivable.
+ * other field it checks) — including why the LEGACY FALLBACK ARM below is
+ * required and must not be deleted on the assumption every seat has migrated: a
+ * first cut of this function consulted the seat alone and coerced a not-yet-
+ * migrated seat to unstarred, silently unprotecting every currently-starred
+ * record until the migration ran (caught by the L0, 2026-09-30T23:39Z, brick
+ * `6adabe72`). The seat is authoritative ONLY once it can answer
+ * (`seat.favorite !== undefined`); otherwise this falls back to the record's own
+ * legacy `favorite`, at ANY holder state, exactly as before this block existed.
  *
  * `hotDir` doubles as the seat store's directory (`~/.acpx/sessions`) — the same
  * value `createContext` derives both from.
  */
-async function isActiveHolderOfStarredSeat(
-  hotDir: string,
-  view: ArchiveRecordView,
-): Promise<boolean> {
-  if (view.seatId === undefined || !view.holderActive) {
-    return false;
+async function favoriteBlocksArchival(hotDir: string, view: ArchiveRecordView): Promise<boolean> {
+  const seat =
+    view.seatId === undefined ? undefined : seatFromStore(await readSeatStore(hotDir), view.seatId);
+  if (seat?.favorite !== undefined) {
+    return seat.favorite && view.holderActive;
   }
-  const store = await readSeatStore(hotDir);
-  const seat = seatFromStore(store, view.seatId);
-  return seat?.favorite === true;
+  return view.favorite;
 }
 
 /**

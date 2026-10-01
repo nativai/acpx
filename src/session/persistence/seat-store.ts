@@ -157,13 +157,21 @@ export type SeatRecord = {
    * set is reopened for this ONE additive field only — his decision, not a
    * precedent for an eighth-field proposal to point at.
    *
-   * 🛑 ALWAYS A CONCRETE BOOLEAN IN MEMORY, NEVER UNDEFINED — every row this or a
-   * later version writes carries it explicitly, exactly as `activeHolderId` and
-   * `closedAt` do. The one place undefined is tolerated is the PERSISTED byte
-   * stream for a row written before this field existed; see `parseSeatFromPersisted`
-   * for why that is a read-leniency concern and not a type-level one.
+   * 🛑 TRI-STATE, DELIBERATELY — `undefined` IS A THIRD ANSWER, NOT A COERCED
+   * `false`. It means "this row has not been through the favorite migration yet",
+   * which is a DIFFERENT fact from "explicitly un-starred". A reader that collapses
+   * the two (a first cut of this field did exactly that, caught by the L0
+   * 2026-09-30T23:39Z on brick `6adabe72`) makes every currently-starred seat read
+   * as unstarred for every box between deploying this field and running
+   * `seats backfill`'s migration leg — a real, scheduled-sweep-facing window, not a
+   * hypothetical one. `mintSeatRow` and `migrateSeatFavorite` always write an
+   * explicit boolean, so `undefined` is reachable only on a row that predates this
+   * field or has not yet been migrated — see `parseSeatFromPersisted` and the
+   * archiver's `recordBlockerFor` (`retention.ts`) for what a caller must do with
+   * that third state: fall back to the record's own legacy `favorite`, never treat
+   * it as `false`.
    */
-  favorite: boolean;
+  favorite: boolean | undefined;
 };
 
 type SeatFieldPlan = { readonly persisted: true };
@@ -364,7 +372,7 @@ type PersistedSeat = {
   closed_at: string | null;
   name?: string;
   brick_id?: string;
-  favorite: boolean;
+  favorite?: boolean;
 };
 
 /**
@@ -388,11 +396,12 @@ export function seatToPersisted(seat: SeatRecord): PersistedSeat {
     closed_at: seat.closedAt,
     name: seat.name,
     brick_id: seat.brickId,
-    // WRITTEN EVERY TIME, `false` included — like the two meaningful nulls above,
-    // never omitted. The read leg below tolerates its ABSENCE (a row written before
-    // this field existed); the write leg never re-produces that absence once a row
-    // has passed through here, which is what makes `seat-backfill.ts`'s migration a
-    // one-time cost rather than a permanent read-time default.
+    // OMITTED WHEN UNDEFINED — same shape as `name`/`brick_id` above, not the two
+    // meaningful nulls: `undefined` here means "not yet migrated", a fact whose
+    // absence IS the fact, not a value nobody wrote. Once `mintSeatRow` or
+    // `migrateSeatFavorite` has touched a row it carries an explicit `true`/`false`
+    // forever after — this line is what lets that explicit value keep surviving
+    // every subsequent whole-store rewrite, exactly as an explicit `name` does.
     favorite: seat.favorite,
   };
 }
@@ -450,9 +459,13 @@ function hasValidOmittableSeatFields(row: Record<string, unknown>): boolean {
  * as malformed would turn every seat on the fleet into `MalformedSeatRowError` the
  * instant this code deploys, before the migration that is supposed to fix it has
  * had a chance to run — `withSeatStoreWrite`'s own read path included, which is
- * what the migration itself calls. So absence is tolerated here and reads as
- * `false` in `parseSeatFromPersisted`; a PRESENT wrong-typed value still rejects
- * the row, per the same D8 strictness every other field on it gets.
+ * what the migration itself calls. So absence is tolerated here — and, per the
+ * field's own doc comment, PRESERVED AS `undefined` rather than coerced to `false`:
+ * "not yet migrated" and "explicitly un-starred" are different facts, and a caller
+ * that cannot tell them apart (the archiver's guard, first built to coerce this to
+ * `false` and corrected 2026-09-30T23:39Z) silently unprotects every currently
+ * starred seat for as long as the box has not migrated. A PRESENT wrong-typed value
+ * still rejects the row, per the same D8 strictness every other field on it gets.
  */
 function hasValidFavoriteField(row: Record<string, unknown>): boolean {
   return row.favorite === undefined || typeof row.favorite === "boolean";
@@ -482,10 +495,11 @@ export function parseSeatFromPersisted(raw: unknown): SeatRecord | undefined {
     closedAt: row.closed_at as string | null,
     name: row.name as string | undefined,
     brickId: row.brick_id as string | undefined,
-    // ABSENT reads as `false` — a row written before this field existed (D8's
-    // absent/malformed/valid split does not apply here: absence is a KNOWN,
-    // pre-migration state, never an unreadable one).
-    favorite: row.favorite === true,
+    // ABSENT reads as `undefined`, NOT `false` — D8's absent/malformed/valid split
+    // does not apply here (absence is a KNOWN, pre-migration state, never an
+    // unreadable one), but coercing it to `false` collapses "not yet migrated" and
+    // "explicitly un-starred" into one value, which is the defect the L0 caught.
+    favorite: row.favorite as boolean | undefined,
   };
 }
 

@@ -116,7 +116,7 @@ test("a fully-populated seat round-trips through disk with all eight fields inta
 
 // ─── 1a · `favorite` — D-STAR: always written, absence tolerated on READ ─────
 
-test("favorite is WRITTEN EVERY TIME, `false` included — never omitted like name/brick_id", async () => {
+test("an EXPLICIT favorite (true or false) is always written, never omitted", async () => {
   await withTempDir("acpx-seat-store-", async (dir) => {
     const bare = seat({ favorite: false });
     await withSeatStoreWrite(dir, () => ({
@@ -126,13 +126,40 @@ test("favorite is WRITTEN EVERY TIME, `false` included — never omitted like na
     const raw = await readRaw(dir);
     assert.ok(
       Object.keys(raw[bare.seatId]).includes("favorite"),
-      "an unset favorite was omitted like the omittable fields — it must not be",
+      "an explicit false must not be omitted — it is a migrated answer, not an absence",
     );
     assert.equal(raw[bare.seatId].favorite, false);
   });
 });
 
-test("a row written before `favorite` existed reads back as `false`, not malformed", async () => {
+test("an UNDEFINED favorite (not yet migrated) is OMITTED on write — same shape as name/brick_id", async () => {
+  // 🛑 THE OTHER HALF OF THE TRI-STATE FIX. Once `favorite` could be `undefined`
+  // in memory (a row read pre-migration and never explicitly set), a write that
+  // round-trips it must not manufacture an explicit `false` on disk — that would
+  // silently "migrate" every seat the moment ANY OTHER seat in the store is
+  // written, without ever running the migration's own logic.
+  await withTempDir("acpx-seat-store-", async (dir) => {
+    const bare = seat({ favorite: undefined });
+    await withSeatStoreWrite(dir, () => ({
+      mutation: { kind: "write", seats: new Map([[bare.seatId, bare]]) },
+      result: undefined,
+    }));
+    const raw = await readRaw(dir);
+    assert.ok(
+      !Object.hasOwn(raw[bare.seatId] as object, "favorite"),
+      "an undefined favorite was written as a value instead of omitted",
+    );
+    const reread = await readSeatStore(dir);
+    assert.equal(seatFromStore(reread, bare.seatId)?.favorite, undefined);
+  });
+});
+
+test("a row written before `favorite` existed reads back as `undefined` — NOT malformed, NOT coerced to `false`", async () => {
+  // 🛑 THE TRI-STATE IS THE POINT (L0, 2026-09-30T23:39Z, brick `6adabe72`). A
+  // first cut coerced absence to `false`, which collapses "not yet migrated" and
+  // "explicitly un-starred" into the same value — the archiver's guard then reads
+  // an already-starred, not-yet-migrated seat as un-starred and silently drops its
+  // protection. `undefined` is the only answer that keeps the two facts apart.
   await withTempDir("acpx-seat-store-", async (dir) => {
     const seatId = "22222222-2222-4222-8222-222222222222";
     const preMigration = {
@@ -154,7 +181,7 @@ test("a row written before `favorite` existed reads back as `false`, not malform
       [],
       "absence of `favorite` must not read as malformed",
     );
-    assert.equal(seatFromStore(store, seatId)?.favorite, false);
+    assert.equal(seatFromStore(store, seatId)?.favorite, undefined);
   });
 });
 

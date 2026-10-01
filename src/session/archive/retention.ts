@@ -509,11 +509,40 @@ function restoreGraceBlockerFor(
 
 /**
  * ⚠️ SEAT-AWARE, PER D-STAR (2026-09-30) — the star belongs to the SEAT, not the
- * session, so this no longer reads a per-record `favorite` at all. Only the seat's
- * ACTIVE holder is protected; a RETIRED holder of the same starred seat is
- * archivable. That is what dissolves the old cold-tier question outright: there is
- * no "what if the only starred holder gets archived", because the star is not a
- * property any holder carries any more.
+ * session. Only the seat's ACTIVE holder is protected; a RETIRED holder of the
+ * same starred seat is archivable. That is what dissolves the old cold-tier
+ * question outright: there is no "what if the only starred holder gets archived",
+ * because the star is not a property any holder carries any more — ONCE THE SEAT
+ * HAS AN AUTHORITATIVE ANSWER.
+ *
+ * 🛑 **AND THAT "ONCE" IS LOAD-BEARING — THIS GUARD MUST NEVER GET LOOSER DURING
+ * THE MIGRATION.** A first cut of this function read the seat ALONE and coerced a
+ * not-yet-migrated seat's `favorite` to `false` (`seat-store.ts`'s old behaviour),
+ * which silently unprotects every currently-starred record for two real windows:
+ * (A) any box between deploying this code and running `seats backfill`'s
+ * migration leg, where an already-starred seat's row exists but has not been
+ * corrected yet; (B) any record with NO seat at all, which on this codebase is
+ * ALL of production until the seat backfill has run — not a hypothetical, the
+ * steady state until then, with a scheduled destruction sweep live throughout
+ * (`archive-command.ts`'s `--exclude-ids` is the scheduler's channel into this
+ * gate). Caught by the L0, 2026-09-30T23:39Z, on brick `6adabe72`.
+ *
+ * THE FIX: consult the seat ONLY WHEN IT CAN ANSWER (`seat.favorite !== undefined`
+ * — the tri-state `seat-store.ts` field). Everywhere else — no seat, or a seat row
+ * that has not been through the migration — fall back to the record's own LEGACY
+ * `favorite`, EXACTLY the base behaviour before this block existed (`favorite`
+ * blocks at ANY holder state, migrated or not).
+ *
+ * 🛑 **THE LEGACY FALLBACK ARM BELOW IS NOT DEAD CODE, AND MUST NOT BE DELETED ON
+ * THE ASSUMPTION THAT EVERY SEAT HAS MIGRATED.** It is unreachable BY DATA on a
+ * box where the migration has run for every seat — but that is a fact about ONE
+ * box's data at one moment, never provable by reading this source file, and a
+ * fleet is many boxes at once. Deleting it re-opens windows (A) and (B) for any
+ * box that has not (yet, or ever, for a seat this box never gets a fresh record
+ * for) run the migration. If you believe this arm is provably dead, the proof is
+ * a positive count of "every seat has an explicit favorite" taken ON THE BOX in
+ * question, not a code read — and even then it stays, because the NEXT `--apply`
+ * on a box that has not migrated needs it.
  *
  * `seatFromStore` is used DELIBERATELY rather than a precomputed id set: it throws
  * `MalformedSeatRowError` / `SeatStoreUnhealthyError` for a row or a whole store
@@ -538,14 +567,28 @@ function recordBlockerFor(
     // which is why this reads the record.
     return record.hasTemplate ? "template" : undefined;
   }
-  if (record.seatId === undefined || !record.holderActive) {
-    // No seat (a record that predates the seat backfill — NOT the steady state),
-    // or a RETIRED holder: neither is the seat's active holder, so neither can be
-    // protected on the seat's behalf.
-    return undefined;
+  return favoriteBlockerFor(record, seatStore);
+}
+
+/** Split out of `recordBlockerFor` to keep each function's complexity readable —
+ * the tri-state seat-vs-legacy decision is the doc comment above; this is only
+ * its control flow. */
+function favoriteBlockerFor(
+  record: ArchiveRecordView,
+  seatStore: SeatStore,
+): ArchiveBlocker | undefined {
+  const seat = record.seatId === undefined ? undefined : seatFromStore(seatStore, record.seatId);
+  if (seat?.favorite !== undefined) {
+    // MIGRATED: the seat is authoritative and OVERRIDES any stale legacy value on
+    // the record — an active holder of a starred seat is protected; a retired
+    // holder, or any holder of an explicitly un-starred seat, is not.
+    return seat.favorite && record.holderActive ? "favorite" : undefined;
   }
-  const seat = seatFromStore(seatStore, record.seatId);
-  return seat?.favorite === true ? "favorite" : undefined;
+  // LEGACY FALLBACK — see `recordBlockerFor`'s doc comment for why this is
+  // required, not dead code. No seat yet, or a seat row that predates the
+  // migration: the record's own `favorite` is the only signal that exists, and it
+  // blocks at ANY holder state, exactly as it did before this block existed.
+  return record.favorite ? "favorite" : undefined;
 }
 
 /**

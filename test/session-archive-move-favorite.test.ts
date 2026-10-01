@@ -120,3 +120,118 @@ test("revalidateBeforeApply: an UN-starred seat's active holder is not blocked (
     assert.equal(result.ok, true);
   });
 });
+
+// ── D-STAR TRI-STATE FIX — the two windows a first cut silently unprotected ───
+//
+// Caught by the L0, 2026-09-30T23:39Z, brick `6adabe72`: reading the seat alone
+// and coercing an unmigrated seat's `favorite` to `false` drops protection for
+// (A) any seat row that exists but has not been through the migration yet, and
+// (B) any record with no seat at all — production's steady state pre-backfill.
+// Both rows below are RED against that first cut and GREEN after the fix.
+
+test("revalidateBeforeApply ROW 1: a seat row WITHOUT the favorite field yet — legacy record.favorite:true still blocks the active holder", async () => {
+  await withTempDir("acpx-archive-move-fav-", async (hotDir) => {
+    const id = "unmigrated-active-holder";
+    await writeAgedRecord(hotDir, id, {
+      closed: true,
+      closed_at: new Date(Date.now() - OLD_MS).toISOString(),
+      seat_id: SEAT_STARRED,
+      holder_active: true,
+      favorite: true, // the legacy per-record star, never migrated onto the seat
+    });
+    // The seat row EXISTS (real pre-migration shape) but `favorite` was never set.
+    await withSeatStoreWrite(hotDir, (store) => {
+      const seats = new Map(store.seats);
+      seats.set(SEAT_STARRED, {
+        seatId: SEAT_STARRED,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        activeHolderId: id,
+        nextOrdinal: 2,
+        closedAt: null,
+        name: undefined,
+        brickId: undefined,
+        favorite: undefined,
+      });
+      return { mutation: { kind: "write", seats } as const, result: undefined };
+    });
+
+    const result = await revalidateBeforeApply(
+      hotDir,
+      id,
+      [`${id}.json`],
+      true,
+      60_000,
+      Date.now(),
+    );
+    assert.equal(result.ok, false, "an unmigrated seat must fall back to the record's own star");
+    if (!result.ok) {
+      assert.equal(result.reason, "favorite");
+    }
+  });
+});
+
+test("revalidateBeforeApply ROW 2: a SEAT-LESS record with legacy record.favorite:true still blocks — production's steady state pre-backfill", async () => {
+  await withTempDir("acpx-archive-move-fav-", async (hotDir) => {
+    const id = "no-seat-at-all";
+    await writeAgedRecord(hotDir, id, {
+      closed: true,
+      closed_at: new Date(Date.now() - OLD_MS).toISOString(),
+      favorite: true,
+      // no seat_id at all.
+    });
+
+    const result = await revalidateBeforeApply(
+      hotDir,
+      id,
+      [`${id}.json`],
+      true,
+      60_000,
+      Date.now(),
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.reason, "favorite");
+    }
+  });
+});
+
+test("revalidateBeforeApply ROW 4: a migrated un-starred seat (favorite:false) archives despite a stale legacy record.favorite:true", async () => {
+  await withTempDir("acpx-archive-move-fav-", async (hotDir) => {
+    const id = "migrated-unstarred-active-holder";
+    await writeAgedRecord(hotDir, id, {
+      closed: true,
+      closed_at: new Date(Date.now() - OLD_MS).toISOString(),
+      seat_id: SEAT_STARRED,
+      holder_active: true,
+      favorite: true, // stale — pre-migration value, left behind on the record
+    });
+    await withSeatStoreWrite(hotDir, (store) => {
+      const seats = new Map(store.seats);
+      seats.set(SEAT_STARRED, {
+        seatId: SEAT_STARRED,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        activeHolderId: id,
+        nextOrdinal: 2,
+        closedAt: null,
+        name: undefined,
+        brickId: undefined,
+        favorite: false, // MIGRATED, explicitly un-starred
+      });
+      return { mutation: { kind: "write", seats } as const, result: undefined };
+    });
+
+    const result = await revalidateBeforeApply(
+      hotDir,
+      id,
+      [`${id}.json`],
+      true,
+      60_000,
+      Date.now(),
+    );
+    assert.equal(
+      result.ok,
+      true,
+      "the migrated seat's explicit false must override the record's stale legacy true",
+    );
+  });
+});
