@@ -80,9 +80,15 @@ export {
   SEAT_STORE_FILE,
   SEAT_STORE_NO_CHANGE,
   seatFromStore,
+  seatBrickLinkFromRef,
   SeatStoreUnwritableError,
   seatStorePath,
   seatToPersisted,
   withSeatStoreWrite,
 } from "./persistence/seat-store.js";
-export type { SeatRecord, SeatStore, SeatStoreMutation } from "./persistence/seat-store.js";
+export type {
+  SeatBrickLink,
+  SeatRecord,
+  SeatStore,
+  SeatStoreMutation,
+} from "./persistence/seat-store.js";
