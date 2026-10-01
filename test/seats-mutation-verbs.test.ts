@@ -640,8 +640,8 @@ test("RN5 · the SEAT is the subject — a pre-existing disagreement is not cons
   // refuse. The correct one takes the seat as its only subject.
   //
   // ⚠️ SCOPE, STATED: this proves the VERB treats the seat as authoritative. It does
-  // NOT prove any READER prefers the seat — no reader reads the seat until B7b, and
-  // that is the accepted cost recorded on this block, not a gap in this row.
+  // NOT prove any READER prefers the seat — that is a separate row, not a gap in
+  // this one.
   await withRig(async (homeDir) => {
     const holderId = "aaaaaaaa-5555-4555-8555-555555555555";
     await writeStore(homeDir, {
@@ -742,20 +742,29 @@ test("RN9 · a malformed store refuses at the write seam, with the unfaulted con
   });
 });
 
-test("RN11 · the B7b note is TEXT-ONLY — a scripted caller's json payload carries no prose", async () => {
-  // Ruling A's accepted cost is surfaced in the product rather than only in a
-  // document, which means a prose line is written on every text-format rename. A
-  // machine-readable payload must never gain it: `--format json` is parsed, and one
-  // stray line ahead of the object breaks every consumer at once.
+test("RN11 · the B7b notice is GONE — text keeps its success line, json/quiet stay prose-free", async () => {
+  // Ruling A's accepted cost used to be surfaced with a prose notice on every
+  // text-format rename, because no reader read the seat yet. B7b made the acpx-ui
+  // readers (rail, board, chat header, Fleet) read the seat, so the notice became a
+  // falsehood and was deleted (brick 693ed2a9). This row now asserts the opposite
+  // of what it used to: the notice must NOT reappear. The json half is unchanged —
+  // `--format json` must never gain a prose line, whatever else moves.
   await withRig(async (homeDir) => {
     await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A) });
 
     const text = await runCli(["seats", "rename", SEAT_A, "noted"], homeDir);
     assert.equal(text.code, 0, text.output);
-    assert.match(
+    assert.doesNotMatch(
       text.stdout,
       /note: the seat is the authority for its name/,
-      "the text path MUST carry the note — it is the only place an operator meets the cost",
+      "the notice was deleted once B7b made the acpx-ui readers read the seat — it must not come back",
+    );
+    // Presence control, not merely absence: an over-deletion that also stripped the
+    // rename's own success line would otherwise pass the row above for the wrong
+    // reason. This is what distinguishes "deleted the notice" from "deleted too much".
+    assert.ok(
+      text.stdout.includes(`seat ${SEAT_A}: name = ${JSON.stringify("noted")}`),
+      `expected the rename's own success line in: ${text.stdout}`,
     );
 
     const json = await runCli(
@@ -765,13 +774,39 @@ test("RN11 · the B7b note is TEXT-ONLY — a scripted caller's json payload car
     assert.equal(json.code, 0, json.output);
     assert.doesNotMatch(json.stdout, /note: the seat is the authority/);
     // The strong form: the WHOLE of stdout must parse as one object. A prose line
-    // anywhere in it — before, after or between — makes this throw.
+    // anywhere in it — before, after or between — makes this throw. This also
+    // doubles as the positive control that the CLI ran and produced real output.
     const parsed = JSON.parse(json.stdout.trim()) as { action: string };
     assert.equal(parsed.action, "seat_renamed");
 
     const quiet = await runCli(["--format", "quiet", "seats", "rename", SEAT_A, "silent"], homeDir);
     assert.equal(quiet.code, 0, quiet.output);
     assert.equal(quiet.stdout, "", "quiet is quiet");
+  });
+});
+
+test("RN12 · `seats rename --help` no longer claims invisibility, but still explains the silent-no-op", async () => {
+  // The same expiry hit the verb's own --help text (a third site, alongside the
+  // text-format notice and the doc comment): it used to say the rename "WILL NOT
+  // SEE IT YET" and was "invisible in those four surfaces". That claim is deleted.
+  // The silent-no-op reasoning right beside it — writing the holder's record
+  // instead would be a no-op — is still true and must survive.
+  await withRig(async (homeDir) => {
+    const help = await runCli(["seats", "rename", "--help"], homeDir);
+    assert.equal(help.code, 0, help.output);
+    assert.doesNotMatch(
+      help.output,
+      /WILL NOT SEE IT YET/,
+      "the invisibility claim was deleted once B7b made the acpx-ui readers read the seat",
+    );
+    assert.doesNotMatch(help.output, /invisible in those four surfaces/);
+    // Presence control: the still-true silent-no-op reasoning must remain, so a
+    // blunt over-deletion of the whole help block fails this row too.
+    assert.match(
+      help.output,
+      /SILENT NO-OP/,
+      `expected the silent-no-op reasoning to survive in: ${help.output}`,
+    );
   });
 });
 
