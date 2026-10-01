@@ -888,6 +888,9 @@ function buildSessionStartOptions(params: {
   permissionPolicy?: PermissionPolicy;
   parent?: ResolvedParentSession;
   resolvedBrick?: string | false;
+  /** Brick `9984c510` — the leg `resolveBrickFlagValue` took for `resolvedBrick`,
+   * when it is a string. See `SessionCreateOptions.explicitBrickFlagValidated`. */
+  resolvedBrickValidated?: boolean;
 }): Parameters<SessionModule["createSession"]>[0] {
   return {
     agentCommand: params.agent.agentCommand,
@@ -928,6 +931,7 @@ function buildSessionStartOptions(params: {
     // do once inheritance has been applied. `string` = explicit `--brick`,
     // `false` = explicit `--no-brick`, `undefined` = neither flag given.
     explicitBrickFlag: params.resolvedBrick,
+    explicitBrickFlagValidated: params.resolvedBrickValidated,
     mcpServers: params.config.mcpServers,
     permissionMode: params.permissionMode,
     nonInteractivePermissions: params.globalFlags.nonInteractivePermissions,
@@ -946,16 +950,29 @@ function buildSessionStartOptions(params: {
   };
 }
 
+type ResolvedBrickFlagValue = {
+  readonly value: string | false | undefined;
+  readonly validated: boolean;
+};
+
+/**
+ * Brick `9984c510` — now returns the LEG alongside the ref, so callers can
+ * mark a freshly minted seat's `brick_id` VALIDATED vs UNVALIDATED without
+ * re-deriving it. `validated` is `false` whenever no explicit `--brick` was
+ * resolved THIS call (no flag, or `--no-brick`) — there is nothing to have
+ * validated.
+ */
 async function resolveBrickFlagValue(
   brick: string | false | undefined,
-): Promise<string | false | undefined> {
+): Promise<ResolvedBrickFlagValue> {
   if (brick === false) {
-    return false;
+    return { value: false, validated: false };
   }
   if (typeof brick === "string") {
-    return await resolveBrickFlagRef(brick);
+    const resolved = await resolveBrickFlagRef(brick);
+    return { value: resolved.ref, validated: resolved.validated };
   }
-  return undefined;
+  return { value: undefined, validated: false };
 }
 
 function optionValueSourceWithGlobals(command: Command, optionName: string): string | undefined {
@@ -2896,7 +2913,9 @@ export async function handleSessionsNew(
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const parent = await resolveAndValidateParentSessionId(flags);
-  const resolvedBrick = await resolveBrickFlagValue(flags.brick);
+  const { value: resolvedBrick, validated: resolvedBrickValidated } = await resolveBrickFlagValue(
+    flags.brick,
+  );
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const effectiveAgent = resolveEffectiveSpawnAgent(
     agent,
@@ -2974,6 +2993,7 @@ export async function handleSessionsNew(
       permissionPolicy,
       parent,
       resolvedBrick,
+      resolvedBrickValidated,
     }),
   );
   await maybeStampBrickLink(created);
@@ -3112,7 +3132,9 @@ async function runSessionCopy(
   // /fork origin (forkFromSessionId) — the "both edges" write. With no parent
   // context the `?.` guards omit both fields → byte-identical to today.
   const parent = await resolveAndValidateParentSessionId(flags);
-  const resolvedBrick = await resolveBrickFlagValue(flags.brick);
+  const { value: resolvedBrick, validated: resolvedBrickValidated } = await resolveBrickFlagValue(
+    flags.brick,
+  );
 
   const [{ createSession }, { printCopiedSessionByFormat, printCreatedSessionBanner }] =
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
@@ -3130,6 +3152,12 @@ async function runSessionCopy(
       parent?.brick, // spawn-parent brick (byway via --parent-id) — KEEP
       resolvedBrick === false,
     ),
+    // Brick `9984c510` — this path has no `explicitBrickFlag` (it exists only
+    // for the `--seat` JOIN comparison, which fork/copy can never reach —
+    // `refuseSeatJoinOnForkPath`), but it still MINTS a fresh seat
+    // (`seatFieldsForCreate`'s unconditional-mint default), so the hinge at
+    // `session-management.ts` still needs this signal independently.
+    explicitBrickFlagValidated: resolvedBrickValidated,
     parentSessionId: parent?.acpxRecordId,
     parentSessionUrl: parent?.sessionUrl,
     parentSeatId: parent?.seatId,
@@ -3316,7 +3344,9 @@ export async function handleSessionsEnsure(
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const parent = await resolveAndValidateParentSessionId(flags);
-  const resolvedBrick = await resolveBrickFlagValue(flags.brick);
+  const { value: resolvedBrick, validated: resolvedBrickValidated } = await resolveBrickFlagValue(
+    flags.brick,
+  );
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const effectiveAgent = resolveEffectiveSpawnAgent(
     agent,
@@ -3354,6 +3384,7 @@ export async function handleSessionsEnsure(
       permissionPolicy,
       parent,
       resolvedBrick,
+      resolvedBrickValidated,
     }),
   );
   await maybeStampBrickLink(result.record);
