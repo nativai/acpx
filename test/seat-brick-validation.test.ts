@@ -800,3 +800,209 @@ test("GREEN-ON-BASE (BRK2 stands) · a seat whose link is ALREADY PRESENT — va
     );
   });
 });
+
+// ─── TE Finding 2 + Gap B — the MINT path's own strip/write, brief follow-up ──
+
+test("mint path strips a FORGED inbound brick_validation (degraded leg) — the holder's own record must not launder it", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const created = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "-s",
+        "mint-forged-degraded",
+        "--brick",
+        BRICK_A,
+        // THE ATTACK: an operator-supplied --metadata claiming "validated"
+        // on a leg that is actually degraded. If this survives unstripped,
+        // the holder's own record would present an unvalidated ref as
+        // validated — the exact laundering invariant (i) exists to stop.
+        "--metadata",
+        "brick_validation=validated",
+      ],
+      homeDir,
+      { PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`, BRICK_SHIM_MODE: "hang" },
+    );
+    assert.equal(created.code, 0, created.stderr);
+    assert.match(created.stderr, /brick CLI unavailable/, "this row did not take the degraded leg");
+    const id = String(
+      (JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const onDisk = await readRawSessionRecord(homeDir, id);
+    const metadata = onDisk.metadata as Record<string, unknown> | undefined;
+    assert.equal(metadata?.brick, BRICK_A);
+    assert.equal(
+      metadata?.brick_validation,
+      "unvalidated",
+      "the forged 'validated' must be stripped and replaced with the TRUE state, not pass through",
+    );
+
+    // Same fact, from the other write path — the seat itself must also be
+    // unvalidated, so the holder and the seat agree.
+    const seatId = String(onDisk.seat_id);
+    const store = await readRawSeatStore(homeDir);
+    assert.equal(store[seatId]?.brick_id_validated, false);
+  });
+});
+
+test("mint path WRITES brick_validation on the FOUNDING holder when the state is known (healthy leg) — not just on a joining holder", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const created = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "-s",
+        "mint-writes-word",
+        "--brick",
+        BRICK_A,
+      ],
+      homeDir,
+      {
+        PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
+        BRICK_SHIM_MODE: "ok",
+        BRICK_SHIM_ID: BRICK_A,
+      },
+    );
+    assert.equal(created.code, 0, created.stderr);
+    const id = String(
+      (JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const onDisk = await readRawSessionRecord(homeDir, id);
+    const metadata = onDisk.metadata as Record<string, unknown> | undefined;
+    // Before this repair, a FOUNDING holder's own metadata never carried
+    // brick_validation at all (only a JOINING holder did) — absence there
+    // was ambiguous with "predates this brick" rather than "known
+    // validated". Gap B closes that: the founding holder gets the word too.
+    assert.equal(
+      metadata?.brick_validation,
+      "validated",
+      "the founding holder must carry the word on the healthy leg, exactly as a joining holder does",
+    );
+  });
+});
+
+test("mint path strips a forged brick_validation even when there is NO brick at all for this spawn", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const created = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "-s",
+        "mint-no-brick-forged",
+        "--metadata",
+        "brick_validation=validated",
+      ],
+      homeDir,
+    );
+    assert.equal(created.code, 0, created.stderr);
+    const id = String(
+      (JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const onDisk = await readRawSessionRecord(homeDir, id);
+    const metadata = onDisk.metadata as Record<string, unknown> | undefined;
+    assert.equal(metadata?.brick, undefined, "fixture sanity: no brick was ever given");
+    assert.equal(
+      Object.hasOwn(metadata ?? {}, "brick_validation"),
+      false,
+      "a forged brick_validation with NO ref at all must be stripped, not left standing about nothing",
+    );
+  });
+});
+
+// ─── TE Gap C — an empty-string brick_id must not become a truthy link ─────
+
+test("Gap C · a hand-written seat row with brick_id:'' reads as NO LINK, never a truthy-but-empty one", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const seatId = "9a900000-9999-4999-8999-999999999999";
+    await writeRawSeatStore(homeDir, {
+      [seatId]: rawSeatRow(seatId, { brick_id: "", brick_id_validated: true }),
+    });
+
+    const shown = await runCli(
+      ["--cwd", cwd, "--format", "json", "seats", "show", seatId],
+      homeDir,
+    );
+    assert.equal(shown.code, 0, shown.stderr);
+    const shownJson = JSON.parse(shown.stdout.trim()) as Record<string, unknown>;
+    assert.equal(
+      shownJson.brickId,
+      null,
+      "an empty-string ref must read as NO link, not a truthy one",
+    );
+    assert.equal(
+      shownJson.brickIdValidated,
+      null,
+      "with no link at all, the validation state must read null too — nothing to describe",
+    );
+  });
+});
+
+test("Gap C · (d′) can fill a seat row whose brick_id was the empty string — it must be treated as ABSENT", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const seatId = "9a900000-8888-4888-8888-888888888888";
+
+    await seed(homeDir, [
+      makeRecord({
+        acpxRecordId: "gapc-h1",
+        seatId,
+        holderOrdinal: 1,
+        holderActive: true,
+        metadata: { brick: BRICK_A },
+      }),
+    ]);
+    await writeRawSeatStore(homeDir, {
+      [seatId]: rawSeatRow(seatId, { active_holder_id: "gapc-h1", brick_id: "" }),
+    });
+
+    const report = await runCli(
+      ["--cwd", cwd, "--format", "json", "seats", "backfill", "--apply"],
+      homeDir,
+    );
+    assert.equal(report.code, 0, report.stderr);
+    const json = JSON.parse(report.stdout.trim()) as Record<string, unknown>;
+    assert.equal(
+      json.brickLinksFilled,
+      1,
+      "an empty-string brick_id must be treated as ABSENT and therefore fillable — before this fix it " +
+        "was permanently blind to this row because '' !== undefined",
+    );
+
+    const store = await readRawSeatStore(homeDir);
+    assert.equal(store[seatId]?.brick_id, BRICK_A);
+    assert.equal(store[seatId]?.brick_id_validated, false);
+  });
+});
