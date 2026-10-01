@@ -1006,3 +1006,82 @@ test("Gap C · (d′) can fill a seat row whose brick_id was the empty string �
     assert.equal(store[seatId]?.brick_id_validated, false);
   });
 });
+
+test("Gap C · a WHITESPACE-ONLY brick_id ('   ') reads as NO LINK too, and does not break seats list's column alignment", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const seatId = "9a900000-7777-4777-8777-777777777777";
+    await writeRawSeatStore(homeDir, {
+      [seatId]: rawSeatRow(seatId, { brick_id: "   ", brick_id_validated: true }),
+    });
+
+    const shown = await runCli(
+      ["--cwd", cwd, "--format", "json", "seats", "show", seatId],
+      homeDir,
+    );
+    assert.equal(shown.code, 0, shown.stderr);
+    const shownJson = JSON.parse(shown.stdout.trim()) as Record<string, unknown>;
+    assert.equal(
+      shownJson.brickId,
+      null,
+      "whitespace-only must read as NO link, same as empty string",
+    );
+    assert.equal(shownJson.brickIdValidated, null);
+
+    const listed = await runCli(["--cwd", cwd, "--format", "json", "seats", "list"], homeDir);
+    assert.equal(listed.code, 0, listed.stderr);
+    const seats = (
+      JSON.parse(listed.stdout.trim()) as { seats: { seatId: string; brickId: unknown }[] }
+    ).seats;
+    const row = seats.find((entry) => entry.seatId === seatId);
+    assert.equal(
+      row?.brickId,
+      null,
+      "seats list must agree with seats show, not render stray whitespace",
+    );
+  });
+});
+
+test("explicit --no-brick on a fresh mint writes no brick_validation at all — absence is the correct state when there is no link", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const created = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "-s",
+        "mint-no-brick-flag",
+        "--no-brick",
+        "--metadata",
+        "brick_validation=validated",
+      ],
+      homeDir,
+    );
+    assert.equal(created.code, 0, created.stderr);
+    const id = String(
+      (JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const onDisk = await readRawSessionRecord(homeDir, id);
+    const metadata = onDisk.metadata as Record<string, unknown> | undefined;
+    assert.equal(metadata?.brick, undefined, "fixture sanity: --no-brick must leave no ref at all");
+    // THE ASYMMETRY, DELIBERATE: this is the one case where absence IS the
+    // correct, specific state — there is genuinely nothing to say about a
+    // link that does not exist, so there is no alternative specific value
+    // to assert instead of absence.
+    assert.equal(
+      Object.hasOwn(metadata ?? {}, "brick_validation"),
+      false,
+      "--no-brick must never manufacture a validation claim about a link that does not exist",
+    );
+  });
+});
