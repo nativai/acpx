@@ -386,6 +386,49 @@ function metadataWithSeatBrickLink(
   };
 }
 
+/**
+ * Brick `9984c510`, TE Finding 2 / Gap B — the MINT path's own twin of
+ * {@link metadataWithSeatBrickLink}, which only `resolveJoinedSeatBrickMetadata`
+ * (the JOIN path) called. Measured gap: a real `sessions new --brick <uuid>
+ * --metadata brick_validation=validated` on the DEGRADED leg left the seat
+ * correctly `brick_id_validated=false` while the FOUNDING holder's own record
+ * said `{"brick_validation":"validated"}` — the forged word survived because
+ * nothing on this path ever strips it, and the identical forgery on the JOIN
+ * path is already overridden. Same input, two write paths, opposite outcomes.
+ *
+ * Fixes BOTH halves in one call, applied to `options.metadata` BEFORE the
+ * record literal is built (mirroring exactly where the join path reassigns
+ * `options.metadata`), so there is one strip/write site per path, not two:
+ *
+ * 1. **STRIP.** `metadataWithSeatBrickLink`'s own docstring already states
+ *    the principle ("no legitimate source for one before the link is
+ *    applied") — this path skipped it; apply it here too, independent of
+ *    whether a link exists at all (a forged word with NO ref is equally
+ *    nonsensical, and `link` being `undefined` must not leave it standing).
+ * 2. **WRITE WHEN KNOWN.** Ratified: the word is "always written when the
+ *    state is known", precisely so absence means UNKNOWN everywhere. The
+ *    mint path DOES know — `link` is derived from the same resolver leg the
+ *    seat's own `brick_id_validated` comes from — so withholding it here
+ *    created exactly the asymmetry the ruling forbids: a joining holder gets
+ *    the word, the founding holder never does, and the degraded leg
+ *    overwhelmingly hits the FOUNDING spawn in production.
+ *
+ * `link === undefined` ⇒ no brick at all for this mint; strip only, and
+ * collapse back to `undefined` (never a stray `{}`) when nothing is left —
+ * the same omit-when-empty convention `withoutBrickMetadata` already uses
+ * one function over.
+ */
+function metadataWithMintTimeBrickState(
+  childMetadata: Record<string, string> | undefined,
+  link: SeatBrickLink | undefined,
+): Record<string, string> | undefined {
+  if (link !== undefined) {
+    return metadataWithSeatBrickLink(childMetadata, link);
+  }
+  const { brick_validation: _stale, ...rest } = childMetadata ?? {};
+  return Object.keys(rest).length > 0 ? rest : undefined;
+}
+
 function resolveJoinedSeatBrickMetadata(
   childMetadata: Record<string, string> | undefined,
   explicitBrickFlag: string | false | undefined,
@@ -457,6 +500,21 @@ async function createSessionRecordWithClient(
         options.explicitBrickFlag,
         joinedSeat.seatId,
         joinedSeat.brickId,
+      ),
+    };
+  } else {
+    // Brick `9984c510`, TE Finding 2 / Gap B — the MINT path's twin of the
+    // join branch above. `joinedSeat === undefined` here means this spawn
+    // mints a fresh seat (`sessions new` with no `--seat`, or any copy/fork
+    // — `refuseSeatJoinOnForkPath` above already guarantees fork never joins),
+    // so the founding holder's own metadata must get the SAME strip-forged /
+    // write-when-known treatment the join path gets, applied BEFORE the
+    // record literal is built from `options.metadata` below.
+    options = {
+      ...options,
+      metadata: metadataWithMintTimeBrickState(
+        options.metadata,
+        seatBrickLinkFromRef(options.metadata?.brick, options.explicitBrickFlagValidated === true),
       ),
     };
   }
