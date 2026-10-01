@@ -32,6 +32,12 @@ import {
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 const MOCK_AGENT_COMMAND = `node ${JSON.stringify(MOCK_AGENT_PATH)}`;
+// Same fixture `cli.test.ts` / `client.test.ts` use to resolve `--brick` without
+// the real 3 s-timeout `brick show` round trip: prepended onto PATH, it makes
+// `resolveBrickFlagRef`'s `execFile("brick", …)` find this fake binary instead
+// of the box's real `/home/node/.local/bin/brick` — load-bearing, because the
+// real one would shell out against bricks this suite never created.
+const BRICK_SHIM_DIR = path.join(process.cwd(), "test", "fixtures", "brick-shim");
 
 type CliResult = { code: number | null; stdout: string; stderr: string };
 
@@ -41,9 +47,18 @@ type CliResult = { code: number | null; stdout: string; stderr: string };
 // failure this feature is exposed to is a field dropped by one of the
 // field-by-field persistence transforms, and every one of those legs is
 // green under a unit call on the mutator alone.
-function runCli(args: string[], homeDir: string): Promise<CliResult> {
+// `extraEnv` — F2 fixtures (brick 3dff714d) need to simulate a SPAWNING session
+// with its own ambient brick (`ACPX_SESSION_URL` pointing at a planted parent
+// record) without that key falling to the scrub loop below, same pattern as
+// `cli.test.ts`'s `runCli(..., { env })`: any key present in `extraEnv` is
+// exempt from the delete, everything else is scrubbed exactly as before.
+function runCli(
+  args: string[],
+  homeDir: string,
+  extraEnv: NodeJS.ProcessEnv = {},
+): Promise<CliResult> {
   return new Promise((resolve) => {
-    const env: NodeJS.ProcessEnv = { ...process.env, HOME: homeDir };
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: homeDir, ...extraEnv };
     delete env.ACPX_STATE_HOME;
     for (const key of [
       "ACPX_SESSION_URL",
@@ -56,7 +71,9 @@ function runCli(args: string[], homeDir: string): Promise<CliResult> {
       "ACPX_BRICK_PATH",
       "ACPX_OWNER_LOG",
     ]) {
-      delete env[key];
+      if (!Object.prototype.hasOwnProperty.call(extraEnv, key)) {
+        delete env[key];
+      }
     }
     const child = spawn(process.execPath, [CLI_PATH, ...args], {
       env,
@@ -347,7 +364,11 @@ test("AP15 · a freshly created session CAN actually be succeeded — the paired
       "AP15: next_ordinal is not 2 — the founding holder already consumed 1, so the first succession would REPEAT it",
     );
     assert.equal(row.closedAt, null);
-    assert.equal(row.brickId, undefined, "brick attach is brick_id's writer, not create");
+    // F1 fix (brick 3dff714d): `sessions new` now writes the SEAT's brick_id too,
+    // from whatever `--brick` resolves to — this fixture passed none, so still
+    // `undefined`. See "F1 · sessions new --brick writes the SEAT's brick_id" below
+    // for the case where a brick IS resolved.
+    assert.equal(row.brickId, undefined, "no --brick was passed to this fixture's spawn");
 
     // (4) AND THE WHOLE POINT: `--seat` against a seat the system just created
     //     SUCCEEDS. This is the assertion that would have caught the gap.
@@ -1643,6 +1664,7 @@ async function runOrderingDiscriminator(homeDir: string, forkLeg: boolean): Prom
       holderId: crypto.randomUUID(),
       name: "c2-probe",
       createdAt: new Date().toISOString(),
+      brickId: undefined,
     });
     const afterProbe = JSON.parse(await fs.readFile(storePath, "utf8")) as Record<string, unknown>;
     storeWritableUnderFault = Object.hasOwn(afterProbe, probeSeat);
@@ -1737,3 +1759,673 @@ test("ordering · FORK/COPY leaves NO orphan seat row when the record write fail
     );
   });
 });
+
+// ─── brick 3dff714d — F1/F2/F3: the seat's brick_id on the DOMINANT creation
+// path, and `seats set-brick --unset` ────────────────────────────────────────
+//
+// Daniel's own staging finding (Part 3, F1/F2/F3 — brick `0d2b83f0`'s
+// `agents/67f2803e-…/staging-findings-1a5845c3-2026-10-01.md`), decided in
+// `DECISIONS.md` on this brick. R10/R11: the value crosses CLI → seat-store →
+// bricks-service, so every row below STARTS the value on the PRODUCING side (a
+// real `runCli` spawn, or the store's own writer for a seat's PRE-EXISTING
+// brick — never `mintSeatRow` called directly, which would be a unit test of
+// the mutator, not coverage of the pipe) and ASSERTS it on the CONSUMING side
+// (the record/seat read back from DISK, or a real `acpx seats show` /
+// `seats set-brick` through `runCli` — the surface an operator and the
+// acpx-ui attach route actually read).
+
+// The findings' own two bricks (`staging-repro-…md`) — reused as fixed uuids
+// rather than `crypto.randomUUID()` so a failing assertion's message is
+// stable and greppable against the original finding.
+const BRICK_A = "1a5845c3-a832-4370-b564-8ec5286bff79";
+const BRICK_B = "1d459def-bbfd-44b6-8e14-9ad998f292d6";
+
+function brickShimEnv(brickId: string): NodeJS.ProcessEnv {
+  return {
+    PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
+    BRICK_SHIM_MODE: "ok",
+    BRICK_SHIM_ID: brickId,
+  };
+}
+
+// Plant a seat row directly through the store's OWN writer — the same
+// `withSeatStoreWrite` call the "D11" test near the top of this file uses —
+// so a row with a KNOWN, PRE-EXISTING brick_id exists without going through
+// `sessions new --brick` (the thing F1 below is testing).
+async function plantSeatRow(
+  homeDir: string,
+  seatId: string,
+  overrides: { brickId?: string; activeHolderId?: string | null } = {},
+): Promise<void> {
+  const sessionDir = path.join(homeDir, ".acpx", "sessions");
+  await withSeatStoreWrite(sessionDir, () => ({
+    mutation: {
+      kind: "write" as const,
+      seats: new Map([
+        [
+          seatId,
+          {
+            seatId,
+            createdAt: "2026-09-28T00:00:00.000Z",
+            activeHolderId: overrides.activeHolderId ?? null,
+            nextOrdinal: 1,
+            closedAt: null,
+            name: undefined,
+            brickId: overrides.brickId,
+            favorite: false,
+          },
+        ],
+      ]),
+    },
+    result: undefined,
+  }));
+}
+
+function sessionRecordFiles(sessionDir: string): Promise<string[]> {
+  return fs
+    .readdir(sessionDir)
+    .then((names) =>
+      names.filter(
+        (name) => name.endsWith(".json") && name !== "index.json" && name !== "seats.json",
+      ),
+    );
+}
+
+test("F1 · `sessions new --brick` writes the SEAT's brick_id, not only the holder's own metadata", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+
+    const created = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "-s",
+        "f1-fresh",
+        "--brick",
+        BRICK_A,
+      ],
+      homeDir,
+      brickShimEnv(BRICK_A),
+    );
+    assert.equal(created.code, 0, created.stderr);
+    const id = String(
+      (JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+
+    // Consuming side (a) — the holder's OWN metadata, unaffected by this fix
+    // (DECISIONS.md: "the holder's metadata.brick stays as the derived copy").
+    const onDisk = await readRecordJson(homeDir, id);
+    assert.equal(
+      (onDisk.metadata as Record<string, unknown> | undefined)?.brick,
+      BRICK_A,
+      "the holder's own metadata.brick must still carry --brick",
+    );
+    const seatId = String(onDisk.seat_id);
+
+    // Consuming side (b) — the SEAT's row, read back through the store.
+    const store = await readSeatStore(sessionDir);
+    const row = seatFromStore(store, seatId);
+    assert.ok(row, "F1: the seat row is missing entirely");
+    assert.equal(
+      row.brickId,
+      BRICK_A,
+      "F1 (brick 3dff714d): `sessions new --brick` left the SEAT's brick_id unset — only " +
+        "the holder's metadata.brick was written, which is the exact measured defect " +
+        "(C4/Cluster A: the seat record's brick_id is the source of truth)",
+    );
+
+    // Consuming side (c) — the surface an operator and the acpx-ui attach route
+    // actually read: a real `acpx seats show`, not a second store read.
+    const shown = await runCli(
+      ["--cwd", cwd, "--format", "json", "seats", "show", seatId],
+      homeDir,
+    );
+    assert.equal(shown.code, 0, shown.stderr);
+    assert.equal(
+      (JSON.parse(shown.stdout.trim()) as { brickId?: unknown }).brickId,
+      BRICK_A,
+      "F1: `acpx seats show` does not report the brick the seat was created with",
+    );
+  });
+});
+
+test(
+  "F2/leg 3 (THE MEASURED LEG) · join with NO --brick: the SEAT's brick wins, the spawner's " +
+    "ambient brick is never consulted",
+  async () => {
+    await withTempHome(async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      await fs.mkdir(cwd, { recursive: true });
+      const sessionDir = path.join(homeDir, ".acpx", "sessions");
+
+      // The SPAWNER — a session record carrying brick A as its OWN
+      // metadata.brick, addressed via ACPX_SESSION_URL exactly as a real
+      // handover spawn would be: `parentSessionRefFromEnv`
+      // (command-handlers.ts) is the ONLY way `parent?.brick` is ever
+      // populated for a bare `sessions new`, so simulating it any other way
+      // would not be testing the real ambient-inheritance seam this bug lives
+      // on.
+      await writeSessionRecordFile(
+        homeDir,
+        makeSessionRecordFixture({
+          acpxRecordId: "f2-spawner",
+          acpSessionId: "acp-f2-spawner",
+          agentCommand: MOCK_AGENT_COMMAND,
+          cwd,
+          metadata: { brick: BRICK_A },
+        }),
+      );
+
+      // The SEAT — planted directly with brick B: THE DISCRIMINATOR. With the
+      // seat and the spawner on the SAME brick, "holder inherits the seat"
+      // and "holder inherits the spawner" are INDISTINGUISHABLE
+      // (DECISIONS.md) — this is what splits the two hypotheses, reused from
+      // the findings' own repro shape (seat on B, spawner on A).
+      const seatId = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+      await plantSeatRow(homeDir, seatId, { brickId: BRICK_B });
+
+      const joined = await runCli(
+        [
+          "--cwd",
+          cwd,
+          "--agent",
+          MOCK_AGENT_COMMAND,
+          "--approve-all",
+          "--format",
+          "json",
+          "sessions",
+          "new",
+          "-s",
+          "f2-leg3-child",
+          "--seat",
+          seatId,
+          // 🛑 NO --brick AT ALL. This is leg 3 — the one that fired in
+          // Daniel's measured F2 run: a real handover spawn never carries
+          // --brick.
+        ],
+        homeDir,
+        { ACPX_SESSION_URL: "https://test-ui.example/?session=f2-spawner" },
+      );
+      assert.equal(joined.code, 0, joined.stderr);
+      const childId = String(
+        (JSON.parse(joined.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+      );
+
+      const onDisk = await readRecordJson(homeDir, childId);
+      assert.equal(
+        (onDisk.metadata as Record<string, unknown> | undefined)?.brick,
+        BRICK_B,
+        "F2/leg 3 (brick 3dff714d): the holder inherited the SPAWNER's brick A instead of " +
+          "the SEAT's brick B — the exact measured defect, and DECISIONS.md's own naming of " +
+          "the leg that fired in Daniel's real run",
+      );
+
+      // The seat itself must be untouched by the join — D13: joining never
+      // mints or mutates the row it joins.
+      const store = await readSeatStore(sessionDir);
+      assert.equal(
+        seatFromStore(store, seatId)?.brickId,
+        BRICK_B,
+        "the join must not have moved the seat's own brick_id",
+      );
+    });
+  },
+);
+
+test(
+  "F2/leg 1 · explicit --brick DISAGREEING with the seat is REFUSED at the origin, before " +
+    "anything is created",
+  async () => {
+    await withTempHome(async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      await fs.mkdir(cwd, { recursive: true });
+      const sessionDir = path.join(homeDir, ".acpx", "sessions");
+
+      const seatId = "cccccccc-dddd-4eee-8fff-000000000000";
+      await plantSeatRow(homeDir, seatId, { brickId: BRICK_B });
+
+      const refused = await runCli(
+        [
+          "--cwd",
+          cwd,
+          "--agent",
+          MOCK_AGENT_COMMAND,
+          "--approve-all",
+          "--format",
+          "json",
+          "sessions",
+          "new",
+          "-s",
+          "f2-leg1-refused",
+          "--seat",
+          seatId,
+          "--brick",
+          BRICK_A,
+        ],
+        homeDir,
+        brickShimEnv(BRICK_A),
+      );
+      assert.notEqual(
+        refused.code,
+        0,
+        "an explicit --brick that disagrees with the seat's own brick was ACCEPTED",
+      );
+      const said = `${refused.stdout}${refused.stderr}`;
+      assert.match(
+        said,
+        /SEAT_BRICK_MISMATCH/,
+        "the refusal must carry the SEAT_BRICK_MISMATCH code",
+      );
+      assert.match(said, new RegExp(BRICK_A), "the refusal must name the EXPLICIT --brick");
+      assert.match(said, new RegExp(BRICK_B), "the refusal must name the SEAT's own brick");
+      assert.match(said, /seats set-brick/, "the refusal must name the remedy");
+
+      // NOTHING WAS CREATED — the refusal fires before any write, the same
+      // guarantee D11/D8's "a malformed --seat is refused at the origin,
+      // before anything is created" gives the sibling refusal.
+      const files = await sessionRecordFiles(sessionDir);
+      assert.deepEqual(files, [], "a session record was written despite the refusal");
+
+      // And the seat itself is UNCHANGED.
+      const store = await readSeatStore(sessionDir);
+      assert.equal(
+        seatFromStore(store, seatId)?.brickId,
+        BRICK_B,
+        "the refused spawn must not have touched the seat's brick_id",
+      );
+    });
+  },
+);
+
+test("F2/leg 2 · explicit --brick EQUAL to the seat's own brick is accepted, with no diagnostic", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+
+    const seatId = "dddddddd-eeee-4fff-8000-111111111111";
+    await plantSeatRow(homeDir, seatId, { brickId: BRICK_A });
+
+    const joined = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "-s",
+        "f2-leg2-ok",
+        "--seat",
+        seatId,
+        "--brick",
+        BRICK_A,
+      ],
+      homeDir,
+      brickShimEnv(BRICK_A),
+    );
+    assert.equal(joined.code, 0, joined.stderr);
+    assert.doesNotMatch(
+      `${joined.stdout}${joined.stderr}`,
+      /SEAT_BRICK_MISMATCH/,
+      "leg 2 (X === Y) must accept with NO diagnostic, per DECISIONS.md",
+    );
+    const id = String(
+      (JSON.parse(joined.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const onDisk = await readRecordJson(homeDir, id);
+    assert.equal((onDisk.metadata as Record<string, unknown> | undefined)?.brick, BRICK_A);
+
+    const store = await readSeatStore(sessionDir);
+    assert.equal(
+      seatFromStore(store, seatId)?.brickId,
+      BRICK_A,
+      "leg 2 must not change the seat's own brick_id",
+    );
+  });
+});
+
+// ─── DECISIONS.md AMENDMENT — the four rows the TE's S4a/S4b/S4c measured
+// that the original three-leg ruling never addressed ──────────────────────
+
+test("S4c · `--no-brick` against a seat that CARRIES a brick is REFUSED, same family as a disagreeing --brick", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+
+    const seatId = "11111111-2222-4333-8444-555555555555";
+    await plantSeatRow(homeDir, seatId, { brickId: BRICK_B });
+
+    const refused = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "-s",
+        "s4c-refused",
+        "--seat",
+        seatId,
+        "--no-brick",
+      ],
+      homeDir,
+    );
+    assert.notEqual(
+      refused.code,
+      0,
+      "--no-brick against a brick-carrying seat was ACCEPTED — S4a/S4c says this must refuse",
+    );
+    const said = `${refused.stdout}${refused.stderr}`;
+    assert.match(
+      said,
+      /SEAT_BRICK_MISMATCH/,
+      "the refusal must carry the SEAT_BRICK_MISMATCH code",
+    );
+    assert.match(said, new RegExp(seatId), "the refusal must name the seat");
+    assert.match(said, new RegExp(BRICK_B), "the refusal must name the seat's own brick");
+
+    const files = await sessionRecordFiles(sessionDir);
+    assert.deepEqual(files, [], "a session record was written despite the refusal");
+    const store = await readSeatStore(sessionDir);
+    assert.equal(
+      seatFromStore(store, seatId)?.brickId,
+      BRICK_B,
+      "the refused spawn must not touch the seat",
+    );
+  });
+});
+
+test("S4a (1/3) · join a BRICK-LESS seat with explicit --brick A: accept, holder gets A, the SEAT IS NOT WRITTEN", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+
+    const seatId = "22222222-3333-4444-8555-666666666666";
+    await plantSeatRow(homeDir, seatId); // absent brick_id
+
+    const joined = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "-s",
+        "s4a-explicit",
+        "--seat",
+        seatId,
+        "--brick",
+        BRICK_A,
+      ],
+      homeDir,
+      brickShimEnv(BRICK_A),
+    );
+    assert.equal(joined.code, 0, joined.stderr);
+    const id = String(
+      (JSON.parse(joined.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const onDisk = await readRecordJson(homeDir, id);
+    assert.equal(
+      (onDisk.metadata as Record<string, unknown> | undefined)?.brick,
+      BRICK_A,
+      "S4a: an explicit --brick against a brick-less seat must still reach the holder",
+    );
+
+    const store = await readSeatStore(sessionDir);
+    assert.equal(
+      seatFromStore(store, seatId)?.brickId,
+      undefined,
+      "S4a: the SEAT MUST NOT BE WRITTEN as a side effect of a join — joining never mints/mutates (D13)",
+    );
+  });
+});
+
+test("S4a (2/3) · join a BRICK-LESS seat with --no-brick: accept, holder gets nothing — agrees with the seat", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+
+    const seatId = "33333333-4444-4555-8666-777777777777";
+    await plantSeatRow(homeDir, seatId); // absent brick_id
+
+    // The spawner has its OWN ambient brick A — --no-brick must suppress it,
+    // same as it does for a fresh mint (withInheritedBrick's `blocked` leg).
+    await writeSessionRecordFile(
+      homeDir,
+      makeSessionRecordFixture({
+        acpxRecordId: "s4a2-spawner",
+        acpSessionId: "acp-s4a2-spawner",
+        agentCommand: MOCK_AGENT_COMMAND,
+        cwd,
+        metadata: { brick: BRICK_A },
+      }),
+    );
+
+    const joined = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "-s",
+        "s4a-no-brick",
+        "--seat",
+        seatId,
+        "--no-brick",
+      ],
+      homeDir,
+      { ACPX_SESSION_URL: "https://test-ui.example/?session=s4a2-spawner" },
+    );
+    assert.equal(joined.code, 0, joined.stderr);
+    const id = String(
+      (JSON.parse(joined.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const onDisk = await readRecordJson(homeDir, id);
+    assert.equal(
+      (onDisk.metadata as Record<string, unknown> | undefined)?.brick,
+      undefined,
+      "S4a: --no-brick against a brick-less seat must leave the holder with NO brick, " +
+        "even though the spawner had one",
+    );
+
+    const store = await readSeatStore(sessionDir);
+    assert.equal(seatFromStore(store, seatId)?.brickId, undefined, "the seat stays untouched");
+  });
+});
+
+test(
+  "S4a (3/3) · join a BRICK-LESS seat with NO --brick flag: holder gets the SPAWNER's ambient " +
+    "brick — today's behaviour, deliberately preserved",
+  async () => {
+    await withTempHome(async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      await fs.mkdir(cwd, { recursive: true });
+      const sessionDir = path.join(homeDir, ".acpx", "sessions");
+
+      const seatId = "44444444-5555-4666-8777-888888888888";
+      await plantSeatRow(homeDir, seatId); // absent brick_id
+
+      await writeSessionRecordFile(
+        homeDir,
+        makeSessionRecordFixture({
+          acpxRecordId: "s4a3-spawner",
+          acpSessionId: "acp-s4a3-spawner",
+          agentCommand: MOCK_AGENT_COMMAND,
+          cwd,
+          metadata: { brick: BRICK_A },
+        }),
+      );
+
+      const joined = await runCli(
+        [
+          "--cwd",
+          cwd,
+          "--agent",
+          MOCK_AGENT_COMMAND,
+          "--approve-all",
+          "--format",
+          "json",
+          "sessions",
+          "new",
+          "-s",
+          "s4a-ambient",
+          "--seat",
+          seatId,
+          // NO --brick, NO --no-brick.
+        ],
+        homeDir,
+        { ACPX_SESSION_URL: "https://test-ui.example/?session=s4a3-spawner" },
+      );
+      assert.equal(joined.code, 0, joined.stderr);
+      const id = String(
+        (JSON.parse(joined.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+      );
+      const onDisk = await readRecordJson(homeDir, id);
+      assert.equal(
+        (onDisk.metadata as Record<string, unknown> | undefined)?.brick,
+        BRICK_A,
+        "S4a row 7: against a BRICK-LESS seat with no --brick, the holder must still inherit " +
+          "the spawner's ambient brick — absence on the seat means UNKNOWN, not an instruction " +
+          "to drop the ambient fallback",
+      );
+
+      const store = await readSeatStore(sessionDir);
+      assert.equal(
+        seatFromStore(store, seatId)?.brickId,
+        undefined,
+        "the seat must stay unwritten — this fallback must never heal a legacy seat as a side effect",
+      );
+    });
+  },
+);
+
+test("S4b · THE BETTER DISCRIMINATOR — seat on B, spawner with NO brick at all, no --brick: holder gets B, not nothing", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    // No spawner record, no ACPX_SESSION_URL at all — there is NO competing
+    // source of a brick anywhere. If the join path reads the seat's own
+    // brick_id, the holder gets B; if it does not (the measured defect), the
+    // holder gets nothing, which is a STRONGER falsifier than the A/B
+    // fixture because there is nothing else it could have gotten instead.
+    const seatId = "55555555-6666-4777-8888-999999999999";
+    await plantSeatRow(homeDir, seatId, { brickId: BRICK_B });
+
+    const joined = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "-s",
+        "s4b-child",
+        "--seat",
+        seatId,
+      ],
+      homeDir,
+    );
+    assert.equal(joined.code, 0, joined.stderr);
+    const id = String(
+      (JSON.parse(joined.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const onDisk = await readRecordJson(homeDir, id);
+    assert.equal(
+      (onDisk.metadata as Record<string, unknown> | undefined)?.brick,
+      BRICK_B,
+      "S4b: with NO competing brick source anywhere, the holder still did not get the seat's " +
+        "own brick — the join path never reads seat.brick_id at all, which is the actual defect",
+    );
+  });
+});
+
+test("F3 · `seats set-brick --unset` clears the seat's brick_id, read back through the CLI", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const base = ["--cwd", cwd, "--format", "json"];
+
+    const seatId = "eeeeeeee-ffff-4000-8111-222222222222";
+    await plantSeatRow(homeDir, seatId);
+
+    const set = await runCli([...base, "seats", "set-brick", seatId, BRICK_A], homeDir);
+    assert.equal(set.code, 0, set.stderr);
+    assert.equal((JSON.parse(set.stdout.trim()) as { brickId?: unknown }).brickId, BRICK_A);
+
+    const unset = await runCli([...base, "seats", "set-brick", seatId, "--unset"], homeDir);
+    assert.equal(unset.code, 0, unset.stderr);
+    const unsetPayload = JSON.parse(unset.stdout.trim()) as {
+      brickId?: unknown;
+      previousBrickId?: unknown;
+    };
+    assert.equal(unsetPayload.brickId, null, "--unset must report brickId: null");
+    assert.equal(unsetPayload.previousBrickId, BRICK_A, "--unset must report what it cleared");
+
+    const shown = await runCli([...base, "seats", "show", seatId], homeDir);
+    assert.equal(shown.code, 0, shown.stderr);
+    assert.equal(
+      (JSON.parse(shown.stdout.trim()) as { brickId?: unknown }).brickId,
+      null,
+      "F3 (brick 3dff714d): `seats show` still reports the OLD brick after --unset",
+    );
+  });
+});
+
+test(
+  "F3 negative · `set-brick` refuses when given BOTH a brick and --unset, or NEITHER — " +
+    "committed, not a mutation probe",
+  async () => {
+    await withTempHome(async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      await fs.mkdir(cwd, { recursive: true });
+      const base = ["--cwd", cwd, "--format", "json"];
+      const seatId = "ffffffff-0000-4111-8222-333333333333";
+      await plantSeatRow(homeDir, seatId);
+
+      const both = await runCli(
+        [...base, "seats", "set-brick", seatId, BRICK_A, "--unset"],
+        homeDir,
+      );
+      assert.notEqual(both.code, 0, "passing a brick AND --unset together was accepted");
+      assert.match(`${both.stdout}${both.stderr}`, /SEAT_BRICK_ARGS_INVALID/);
+
+      const neither = await runCli([...base, "seats", "set-brick", seatId], homeDir);
+      assert.notEqual(neither.code, 0, "passing neither a brick nor --unset was accepted");
+      assert.match(`${neither.stdout}${neither.stderr}`, /SEAT_BRICK_ARGS_INVALID/);
+    });
+  },
+);

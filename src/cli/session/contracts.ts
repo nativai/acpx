@@ -130,6 +130,17 @@ export type SessionCreateOptions = {
    */
   seatId?: string;
   metadata?: Record<string, string>;
+  /**
+   * The RAW `--brick` flag (brick 3dff714d, DECISIONS.md AMENDMENT) — never
+   * mixed with parent/ambient inheritance, unlike `metadata.brick` above.
+   * `string` = explicit `--brick <uuid>`; `false` = explicit `--no-brick`;
+   * `undefined` = neither flag was given. Consulted only on the `--seat` JOIN
+   * path (`resolveJoinedSeatBrickMetadata`), which must tell "the operator
+   * explicitly said X" apart from "nothing was said and this is ambient" —
+   * a distinction `metadata.brick` alone cannot make once inheritance has
+   * already been applied to it.
+   */
+  explicitBrickFlag?: string | false;
   mcpServers?: McpServer[];
   permissionMode: PermissionMode;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;

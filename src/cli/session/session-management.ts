@@ -62,6 +62,7 @@ import {
   sessionBaseDir,
   writeSessionRecord,
   writeSessionRecordAtBoundary,
+  type SeatRecord,
 } from "../../session/persistence.js";
 import type { SessionIndexEntry } from "../../session/persistence/index.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
@@ -239,9 +240,11 @@ function refuseSeatJoinOnForkPath(options: SessionCreateOptions): void {
  * a ruling on where the holder enumeration is allowed to live, not a scan added here
  * on my own judgement.
  */
-async function refuseUnjoinableSeat(joinSeatId: string | undefined): Promise<void> {
+async function refuseUnjoinableSeat(
+  joinSeatId: string | undefined,
+): Promise<SeatRecord | undefined> {
   if (joinSeatId === undefined) {
-    return;
+    return undefined;
   }
   const store = await readSeatStore(sessionBaseDir());
   const seat = seatFromStore(store, joinSeatId);
@@ -274,6 +277,97 @@ async function refuseUnjoinableSeat(joinSeatId: string | undefined): Promise<voi
       { outputCode: "RUNTIME", detailCode: "SEAT_CLOSED", origin: "runtime" },
     );
   }
+  // Returned (rather than re-read by the caller) so the ONE store read taken here
+  // is also what `resolveJoinedSeatBrickMetadata` reconciles against — a second,
+  // independent read could race a concurrent `seats set-brick` and compare the
+  // explicit flag against a seat that already moved.
+  return seat;
+}
+
+/**
+ * F2 (brick `3dff714d`) — the brick-reconciliation half of joining a seat,
+ * ruled in `DECISIONS.md` (b) and its AMENDMENT (the join path's complete
+ * truth table, added after the independent test-engineer measured three
+ * states the original three-leg ruling never addressed). **Seven rows, not
+ * three** — implement all seven, not the shape that reads as "the fix":
+ *
+ * | seat `brick_id` | spawner's flag      | outcome                                    |
+ * |---|---|---|
+ * | `B` | `--brick B` (agrees) | accept, no diagnostic — idempotent            |
+ * | `B` | `--brick A`, A≠B     | REFUSE at the origin                          |
+ * | `B` | `--no-brick`         | REFUSE at the origin — same family (S4c)      |
+ * | `B` | none                 | holder gets `B` — seat wins, spawner ignored  |
+ * | absent | `--brick A`       | accept, holder gets `A` — the SEAT IS NOT WRITTEN |
+ * | absent | `--no-brick`      | accept, holder gets nothing — agrees w/ seat  |
+ * | absent | none              | holder gets the SPAWNER's ambient brick — **today's behaviour, preserved** |
+ *
+ * 🛑 **S4a — WHY THE LAST ROW IS NOT A BUG LEFT IN.** By F1, brick-less seats
+ * are the DOMINANT population right now (every seat minted before this fix,
+ * and every fresh seat minted with no `--brick`). A strict "the seat wins,
+ * period" reading would make every ordinary handover spawn into one of those
+ * seats **silently lose its brick link** — worse than the measured defect, on
+ * the common path. Absence means UNKNOWN here, not "none" — this codebase has
+ * already settled that twice on this exact surface (`mintSeatRow`'s
+ * `brickId: undefined` is omitted, never an empty string; the sibling
+ * `parentSeatId` field's own comment: *"absent means unknown, never no
+ * seat"*) — so a brick-less seat is not an authority asserting "none", and
+ * there is nothing for a holder to disagree with. `--seat` must never WRITE
+ * the seat as a side effect of this fallback (joining never mints, D11); a
+ * legacy seat's absence is healed by `acpx seats backfill`, not by a spawn.
+ *
+ * `childMetadata` here is `buildSessionStartOptions`'s FULLY INHERITANCE-
+ * APPLIED value — i.e. it already carries the spawner's ambient brick when
+ * nothing was said explicitly, which is exactly the "absent seat, none" row's
+ * answer and exactly what the "seat HAS a brick" rows must OVERRIDE.
+ * `explicitBrickFlag` is the one signal `childMetadata` cannot provide:
+ * whether the operator SAID something (`string` = `--brick <uuid>`, `false` =
+ * `--no-brick`) or said nothing at all (`undefined`).
+ */
+function resolveJoinedSeatBrickMetadata(
+  childMetadata: Record<string, string> | undefined,
+  explicitBrickFlag: string | false | undefined,
+  joinedSeatId: string,
+  seatBrickId: string | undefined,
+): Record<string, string> | undefined {
+  if (seatBrickId === undefined) {
+    // The seat is BRICK-LESS: absence is UNKNOWN, not "none" (S4a). Nothing to
+    // override — `childMetadata` already carries the right answer for all
+    // three sub-rows (explicit --brick, explicit --no-brick, or the ambient
+    // ACPX_SESSION_URL fallback), and the seat is left byte-unwritten.
+    return childMetadata;
+  }
+  if (explicitBrickFlag === false) {
+    // S4c — `--no-brick` against a seat that CARRIES a brick is an explicit
+    // instruction contradicting the canonical field, same refusal family as a
+    // disagreeing --brick: asking for a holder that disagrees with its own
+    // seat is incoherent under C4.
+    throw new AcpxOperationalError(
+      `--no-brick disagrees with seat ${JSON.stringify(joinedSeatId)}'s brick ` +
+        `${JSON.stringify(seatBrickId)}. The SEAT's brick_id is canonical (CONCEPTION C4) — a ` +
+        `spawn cannot silently unlink it. Either omit --seat to spawn a fresh, unlinked seat, ` +
+        `or run \`acpx seats set-brick ${joinedSeatId} --unset\` first and re-spawn.`,
+      { outputCode: "USAGE", detailCode: "SEAT_BRICK_MISMATCH", origin: "runtime" },
+    );
+  }
+  if (typeof explicitBrickFlag === "string") {
+    const explicit = explicitBrickFlag.trim();
+    if (explicit !== seatBrickId) {
+      throw new AcpxOperationalError(
+        `--brick ${JSON.stringify(explicit)} disagrees with seat ${JSON.stringify(joinedSeatId)}'s ` +
+          `brick ${JSON.stringify(seatBrickId)}. The SEAT's brick_id is canonical (CONCEPTION C4) — ` +
+          `a spawn cannot silently re-point it. Either run \`acpx seats set-brick ${joinedSeatId} ` +
+          `${explicit}\` first and re-spawn, or drop --brick to join under the seat's own brick.`,
+        { outputCode: "USAGE", detailCode: "SEAT_BRICK_MISMATCH", origin: "runtime" },
+      );
+    }
+    // X === Y: accept, no diagnostic — idempotent restatement.
+    return { ...childMetadata, brick: seatBrickId };
+  }
+  // No flag at all, seat HAS a brick: the seat wins SILENTLY, overriding
+  // whatever ambient value `childMetadata` carried — this is the leg that
+  // fired in Daniel's measured F2 run (a real handover spawn never carries
+  // `--brick`).
+  return { ...childMetadata, brick: seatBrickId };
 }
 
 // eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
@@ -286,7 +380,23 @@ async function createSessionRecordWithClient(
   // fired after `client.start()` would leave a spawned adapter behind for a request
   // that was never going to be honoured.
   refuseSeatJoinOnForkPath(options);
-  await refuseUnjoinableSeat(options.seatId);
+  const joinedSeat = await refuseUnjoinableSeat(options.seatId);
+  if (joinedSeat) {
+    // F2 fix (brick 3dff714d, DECISIONS.md (b) + AMENDMENT) — reconcile
+    // BEFORE anything is created, same guarantee as the refusals just above.
+    // `options.seatId` is only set on the join path, so a fresh mint never
+    // reaches this branch and keeps its existing withInheritedBrick-derived
+    // metadata untouched.
+    options = {
+      ...options,
+      metadata: resolveJoinedSeatBrickMetadata(
+        options.metadata,
+        options.explicitBrickFlag,
+        joinedSeat.seatId,
+        joinedSeat.brickId,
+      ),
+    };
+  }
   if (options.recordId) {
     const outbox = new BrickOutbox();
     try {
@@ -609,6 +719,13 @@ async function createSessionRecordWithClient(
       holderId: record.acpxRecordId,
       name: record.name,
       createdAt: now,
+      // F1 fix (brick 3dff714d, DECISIONS.md) — the SEAT's brick_id is now
+      // written at mint time, from the same resolved value the holder's own
+      // `metadata.brick` already carries (set above by
+      // `withInheritedBrick`/`applyBrickFlag`). The holder's copy stays the
+      // derived projection; this is the canonical write C4 designates the seat
+      // row as needing, which nothing wrote before this fix.
+      brickId: options.metadata?.brick?.trim() || undefined,
     });
     if (!minted.minted) {
       // BOTH LEGS — stderr AND the session stream (the ruling's "never a silent catch"),

@@ -747,6 +747,11 @@ export async function mintSeatRow(
     readonly holderId: string;
     readonly name: string | undefined;
     readonly createdAt: string;
+    // F1 fix (brick 3dff714d) — the resolved `--brick` (explicit or
+    // parent-inherited) for the founding holder, written onto the SEAT at mint
+    // time. `undefined` when the holder itself carries none, matching the
+    // "absent, not an empty string" discipline the field has always had.
+    readonly brickId: string | undefined;
   },
 ): Promise<void> {
   await withSeatStoreWrite(sessionDir, (store) => {
@@ -781,9 +786,12 @@ export async function mintSeatRow(
       // D9 phase (i): the name is written to the seat AND still to the session record,
       // and the SEAT is authoritative wherever the two disagree.
       name: params.name,
-      // `brick attach` is this field's writer (C4 / Cluster A requirement 5) and that is
-      // not this pass. Absent, deliberately — not an empty string.
-      brickId: undefined,
+      // F1 fix (brick 3dff714d) — the founding holder's resolved brick, so a
+      // fresh `sessions new --brick <uuid>` writes the SEAT's `brick_id` rather
+      // than leaving it for `brick attach` to set later (C4 / Cluster A
+      // requirement 5 is still true for a seat minted with NO `--brick`:
+      // `params.brickId` is `undefined` there, same as before this fix).
+      brickId: params.brickId,
       // A freshly-minted seat has no holder history to derive a star from —
       // `false`, not absent (D-STAR moves the field onto the seat; there is no
       // legacy per-record value to carry forward for a seat that did not exist a
