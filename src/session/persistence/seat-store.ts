@@ -580,10 +580,19 @@ export function parseSeatFromPersisted(raw: unknown): SeatRecord | undefined {
     // UNVALIDATED, never validated-by-assumption — the `=== true` test turns a
     // missing/legacy sibling into `false` rather than `undefined`, so a row
     // written before this field existed is never silently trusted.
-    brickId:
-      row.brick_id === undefined
-        ? undefined
-        : { ref: row.brick_id as string, validated: row.brick_id_validated === true },
+    //
+    // TE Gap C: routed through `seatBrickLinkFromRef` rather than built
+    // inline, so an empty-string `brick_id` — unreachable from any writer
+    // here (`seatToPersisted` only ever writes a trimmed, non-empty ref) but
+    // reachable from a hand-written store — collapses to `undefined` instead
+    // of becoming a truthy link with nothing in it. Without this, `show`
+    // rendered `⚠ UNVALIDATED` with no ref, `list` rendered a bare `⚠`, and
+    // (d′) could never fill the row at all (`brickId !== undefined` already
+    // reads as "has a link").
+    brickId: seatBrickLinkFromRef(
+      row.brick_id as string | undefined,
+      row.brick_id_validated === true,
+    ),
     // ABSENT reads as `undefined`, NOT `false` — D8's absent/malformed/valid split
     // does not apply here (absence is a KNOWN, pre-migration state, never an
     // unreadable one), but coercing it to `false` collapses "not yet migrated" and
