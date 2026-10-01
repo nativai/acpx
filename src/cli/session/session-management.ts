@@ -57,11 +57,13 @@ import {
   normalizeName,
   readSeatStore,
   resolveSessionRecord,
+  seatBrickLinkFromRef,
   seatFromStore,
   seatRowMissingMessage,
   sessionBaseDir,
   writeSessionRecord,
   writeSessionRecordAtBoundary,
+  type SeatBrickLink,
   type SeatRecord,
 } from "../../session/persistence.js";
 import type { SessionIndexEntry } from "../../session/persistence/index.js";
@@ -328,11 +330,58 @@ async function refuseUnjoinableSeat(
  * whether the operator SAID something (`string` = `--brick <uuid>`, `false` =
  * `--no-brick`) or said nothing at all (`undefined`).
  */
+/**
+ * Invariant (i), brick `9984c510`: PROPAGATE THE REF WITH ITS STATE — nothing
+ * lost, nothing laundered. A holder joining a seat whose link is UNVALIDATED
+ * must not end up holding something indistinguishable from a validated one.
+ * `metadata` is `Record<string,string>` only, so the state rides a SECOND
+ * string key: `brick_validation: "validated" | "unvalidated"`.
+ *
+ * 🛑 **WRITTEN WHENEVER THE REF IS, FOR BOTH STATES — NEVER OMITTED FOR
+ * "VALIDATED".** A first cut omitted the key for the validated case (mirroring
+ * the on-disk `brick_id_validated` sibling's own omit-unless-needed shape) and
+ * that is a REJECTED design, not a style choice: on the seat row, ABSENCE
+ * means UNVALIDATED (ii); on the holder, an omit-when-validated shape would
+ * have made absence mean the OPPOSITE — validated. Every pre-fix holder
+ * record carries no such key at all, so that shape would read the ENTIRE
+ * existing population as validated-by-assumption, which is exactly what this
+ * brick exists to stop — moved one hop, from the seat onto the holder.
+ * Writing the word unconditionally makes ABSENCE MEAN UNKNOWN on BOTH sides —
+ * no link at all, or a holder that predates this brick — never "validated".
+ *
+ * 🛑 **A WORD, NOT A BOOLEAN-STRING.** `"false"` is a non-empty string and
+ * therefore TRUTHY — a consumer writing `if (md.brick_validation)` would read
+ * the one value that means "do not trust this" as true. `"validated"` /
+ * `"unvalidated"` are both truthy, so a careless truthiness check tells a
+ * reader nothing and an explicit string comparison is forced by construction.
+ *
+ * ⚠️ **SNAKE_CASE, NOT CAMEL — MEASURED, NOT A STYLE CHOICE.** A first cut
+ * wrote `brickValidated` and `assertPersistedKeyPolicy` (`persisted-key-
+ * policy.ts`) rejected the whole spawn at write time with "Persisted key
+ * policy violation (expected snake_case keys): metadata.brickValidated" —
+ * the policy walks EVERY persisted key, `metadata` included, with no
+ * exemption for this field. Caught by actually running the CLI, not by
+ * typecheck (metadata values are plain strings either way).
+ */
+function metadataWithSeatBrickLink(
+  childMetadata: Record<string, string> | undefined,
+  link: SeatBrickLink,
+): Record<string, string> | undefined {
+  // Drop any stale `brick_validation` the child might already carry (there is
+  // no legitimate source for one before the seat's link is applied).
+  const { brick_validation: _stale, ...rest } = childMetadata ?? {};
+  return {
+    ...rest,
+    brick: link.ref,
+    brick_validation: link.validated ? "validated" : "unvalidated",
+  };
+}
+
 function resolveJoinedSeatBrickMetadata(
   childMetadata: Record<string, string> | undefined,
   explicitBrickFlag: string | false | undefined,
   joinedSeatId: string,
-  seatBrickId: string | undefined,
+  seatBrickId: SeatBrickLink | undefined,
 ): Record<string, string> | undefined {
   if (seatBrickId === undefined) {
     // The seat is BRICK-LESS: absence is UNKNOWN, not "none" (S4a). Nothing to
@@ -348,7 +397,7 @@ function resolveJoinedSeatBrickMetadata(
     // seat is incoherent under C4.
     throw new AcpxOperationalError(
       `--no-brick disagrees with seat ${JSON.stringify(joinedSeatId)}'s brick ` +
-        `${JSON.stringify(seatBrickId)}. The SEAT's brick_id is canonical (CONCEPTION C4) — a ` +
+        `${JSON.stringify(seatBrickId.ref)}. The SEAT's brick_id is canonical (CONCEPTION C4) — a ` +
         `spawn cannot silently unlink it. Either omit --seat to spawn a fresh, unlinked seat, ` +
         `or run \`acpx seats set-brick ${joinedSeatId} --unset\` first and re-spawn.`,
       { outputCode: "USAGE", detailCode: "SEAT_BRICK_MISMATCH", origin: "runtime" },
@@ -356,23 +405,23 @@ function resolveJoinedSeatBrickMetadata(
   }
   if (typeof explicitBrickFlag === "string") {
     const explicit = explicitBrickFlag.trim();
-    if (explicit !== seatBrickId) {
+    if (explicit !== seatBrickId.ref) {
       throw new AcpxOperationalError(
         `--brick ${JSON.stringify(explicit)} disagrees with seat ${JSON.stringify(joinedSeatId)}'s ` +
-          `brick ${JSON.stringify(seatBrickId)}. The SEAT's brick_id is canonical (CONCEPTION C4) — ` +
+          `brick ${JSON.stringify(seatBrickId.ref)}. The SEAT's brick_id is canonical (CONCEPTION C4) — ` +
           `a spawn cannot silently re-point it. Either run \`acpx seats set-brick ${joinedSeatId} ` +
           `${explicit}\` first and re-spawn, or drop --brick to join under the seat's own brick.`,
         { outputCode: "USAGE", detailCode: "SEAT_BRICK_MISMATCH", origin: "runtime" },
       );
     }
     // X === Y: accept, no diagnostic — idempotent restatement.
-    return { ...childMetadata, brick: seatBrickId };
+    return metadataWithSeatBrickLink(childMetadata, seatBrickId);
   }
   // No flag at all, seat HAS a brick: the seat wins SILENTLY, overriding
   // whatever ambient value `childMetadata` carried — this is the leg that
   // fired in Daniel's measured F2 run (a real handover spawn never carries
   // `--brick`).
-  return { ...childMetadata, brick: seatBrickId };
+  return metadataWithSeatBrickLink(childMetadata, seatBrickId);
 }
 
 // eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
@@ -730,7 +779,19 @@ async function createSessionRecordWithClient(
       // `withInheritedBrick`/`applyBrickFlag`). The holder's copy stays the
       // derived projection; this is the canonical write C4 designates the seat
       // row as needing, which nothing wrote before this fix.
-      brickId: options.metadata?.brick?.trim() || undefined,
+      //
+      // THE HINGE, brick `9984c510` — `options.explicitBrickFlagValidated` is
+      // the ONE signal that traces back to `resolveBrickFlagRef`'s own leg
+      // (healthy vs degraded): `true` only when an explicit `--brick` was
+      // actually RESOLVED by `brick show`. Every other source of
+      // `metadata.brick` here — no flag at all (ambient parent inheritance)
+      // — never ran a resolution THIS spawn, so it defaults to `false`,
+      // never validated-by-assumption (invariant (ii)'s spirit, carried
+      // forward to the write side).
+      brickId: seatBrickLinkFromRef(
+        options.metadata?.brick,
+        options.explicitBrickFlagValidated === true,
+      ),
     });
     if (!minted.minted) {
       // BOTH LEGS — stderr AND the session stream (the ruling's "never a silent catch"),

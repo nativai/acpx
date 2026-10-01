@@ -119,6 +119,7 @@ import {
   mintSeatRowBestEffort,
   readPersistedLifecycle,
   resolveSessionRecord,
+  seatBrickLinkFromRef,
   sessionBaseDir,
   writeSessionRecord,
   writeSessionRecordAtBoundary,
@@ -2581,7 +2582,15 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
                         // F1 fix (brick 3dff714d) — same consistency rule as the
                         // other two mint call sites: the seat's brick_id is
                         // whatever the minting holder's own record carries.
-                        brickId: childRecord.metadata?.brick?.trim() || undefined,
+                        //
+                        // Brick `9984c510` — `childRecord` carries NO `metadata`
+                        // on this path at all (built above with no `metadata`
+                        // key), so this is always `undefined` today regardless
+                        // of the `validated` literal. `false` is the honest
+                        // placeholder if that ever changes: nothing on this
+                        // path resolves a `--brick` flag, so there is nothing
+                        // to have validated (invariant (ii)'s spirit).
+                        brickId: seatBrickLinkFromRef(childRecord.metadata?.brick, false),
                       });
                 if (!mintedChildRow.minted) {
                   // 🛑 BOTH LEGS HERE TOO (F8). A bare `process.stderr.write` stood here and
