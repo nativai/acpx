@@ -2975,11 +2975,7 @@ export async function handleSessionsNew(
     process.stderr.write(`[acpx] created ${scope}: ${created.acpxRecordId}\n`);
   }
 
-  // No occupant is ever evicted any more, so there is nothing to report as
-  // replaced — printNewSessionByFormat's `replaced` param always reads
-  // undefined here, which also means `replacedSessionId` never appears in the
-  // JSON result shape.
-  printNewSessionByFormat(created, undefined, globalFlags.format);
+  printNewSessionByFormat(created, globalFlags.format);
 }
 
 export async function handleSessionsCopy(

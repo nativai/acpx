@@ -219,11 +219,15 @@ export function warnUndeliveredCustody(sessionLabel: string, drain: SessionClose
   process.stderr.write(`${lines.join("\n")}\n`);
 }
 
-export function printNewSessionByFormat(
-  record: SessionRecord,
-  replaced: SessionRecord | undefined,
-  format: OutputFormat,
-): void {
+// L3 (brick 4e58b35c) — `sessions new` no longer evicts the occupant of an
+// already-occupied (cwd, name) slot (command-handlers.ts, handleSessionsNew),
+// so there is never anything to report as replaced. `replacedSessionId` is
+// deleted from the result shape outright rather than left always-undefined:
+// a census across acpx (src + test), acpx-ui (origin/dev, origin/master), and
+// the wisdom Skills scripts found no code consumer of this field (the sole
+// hit was a now-corrected doc line in Skills/acpx/SKILL.md describing the
+// deleted eviction as expected behaviour).
+export function printNewSessionByFormat(record: SessionRecord, format: OutputFormat): void {
   const subscriptionSelection = consumeAutoSubscriptionSelection();
   if (
     emitJsonResult(format, {
@@ -233,21 +237,10 @@ export function printNewSessionByFormat(
       acpxSessionId: record.acpSessionId,
       agentSessionId: record.agentSessionId,
       name: record.name,
-      replacedSessionId: replaced?.acpxRecordId,
       sessionUrl: composeSessionUrl(record),
       ...(subscriptionSelection ? { subscriptionSelection } : {}),
     })
   ) {
-    return;
-  }
-
-  if (format === "quiet") {
-    process.stdout.write(`${record.acpxRecordId}\n`);
-    return;
-  }
-
-  if (replaced) {
-    process.stdout.write(`${record.acpxRecordId}\t(replaced ${replaced.acpxRecordId})\n`);
     return;
   }
 
