@@ -78,12 +78,8 @@ import { BRICK_UUID_RE } from "./session/brick-link.js";
  * Daniel has already ruled is leaving the session record entirely
  * (2026-09-28T08:30:25Z — *"sessions don't have names"*).
  *
- * ⚠️ **THE ACCEPTED COST, STATED SO IT IS NOT DISCOVERED:** until B7b makes readers
- * read the seat, a `seats rename` **appears to do nothing** in the rail, the board,
- * the chat header and Fleet — all four still label a session from its record. That
- * is a contemplated state, not a defect (C2 phase (i) has the two sides disagreeing
- * *with the seat winning*), it expires with B7b, and the verb says so in its own
- * output rather than leaving the operator to wonder. `RN2′` in
+ * **The stale record copy is a CONTEMPLATED STATE, not a defect** — C2 phase (i)
+ * has the two sides disagreeing deliberately, *with the seat winning*. `RN2′` in
  * `test/seats-mutation-verbs.test.ts` asserts the holder's record is UNCHANGED —
  * the contemplated state proven rather than tolerated.
  *
@@ -477,22 +473,6 @@ async function handleSeatsRename(
       return;
     }
     process.stdout.write(`seat ${seatId}: name = ${JSON.stringify(name)}\n`);
-    // ⚠️ PRINTED EVERY TIME, DELIBERATELY, AND ON THE TEXT PATH ONLY — a scripted
-    // caller's `--format json` payload must never gain a prose line, which
-    // `test/seats-mutation-verbs.test.ts` row RN11 asserts. The seat is the authority
-    // for the name and no reader reads it yet, so this rename is invisible in every
-    // surface an operator is looking at while they run it; saying so beats having them
-    // conclude the verb is broken.
-    //
-    // 🛑 EXPIRY CONDITION — DELETE THIS NOTICE WHEN **B7b (brick 693ed2a9)** MAKES
-    // READERS READ THE SEAT, and not before. It is stated here rather than in a
-    // document so whoever next edits this function meets it; B7b's brief carries
-    // "delete the rename notice" as an explicit deliverable.
-    process.stdout.write(
-      `note: the seat is the authority for its name, and until readers read the seat ` +
-        `(B7b) the rail, board, chat header and Fleet still label a session from its own ` +
-        `record — so this rename will not be visible there yet.\n`,
-    );
   });
 }
 
@@ -1613,11 +1593,9 @@ THERE IS NO --unset. Once set, \`brick_id\` is not cleared by any verb in B2b.
     .addHelpText(
       "after",
       `
-🛑 THIS WRITES THE SEAT ROW AND NOTHING ELSE, AND YOU WILL NOT SEE IT YET.
+🛑 THIS WRITES THE SEAT ROW AND NOTHING ELSE.
   The seat record is the authority for the name; a holder's copy is a derived
-  projection. Until B7b makes readers read the seat, the rail, the board, the chat
-  header and Fleet all still label a session from its OWN record — so a rename is
-  correct, durable, and invisible in those four surfaces until then.
+  projection.
 
   Writing the holder's record instead would be a SILENT NO-OP: every preserving
   record write restores \`name\` from the on-disk value, and there is no \`name\`
