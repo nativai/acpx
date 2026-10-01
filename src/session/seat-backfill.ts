@@ -381,6 +381,26 @@ function favoriteFromHolders(members: readonly RecordPlan[]): boolean {
   return members.some((member) => member.record.favorite === true);
 }
 
+/**
+ * `brick_id` — item (d), brick `3dff714d`, DECISIONS.md CORRECTION + AMENDMENT.
+ * `seats backfill` is a THIRD site of F1's pattern: this function unconditionally
+ * returned `undefined` here, same comment as `mintSeatRow` carried before its own
+ * fix, and it is pre-existing code (`git show origin/seat/program:…` carries it
+ * identically) — not something this brick's edits introduced. Left unfixed, (a)
+ * only starts seats from now on and C4 stays false for every seat that predates
+ * it, which is the DOMINANT population per F1.
+ *
+ * Same shape as `name` (`seatNameSource`) — reused directly rather than
+ * re-deriving the same representative — **not** the same shape as `favorite`'s
+ * `some()`: where holders disagree, the ACTIVE holder's brick wins, not "any
+ * holder's". A retired holder's stale brick must not resurrect over the live
+ * link; `seatNameSource`'s own fallback (highest ordinal) applies identically
+ * when every member is closed.
+ */
+function brickFromHolders(members: readonly RecordPlan[]): string | undefined {
+  return seatNameSource(members)?.record.metadata?.brick?.trim() || undefined;
+}
+
 function planSeatRow(seatId: string, members: readonly RecordPlan[], now: string): SeatRecord {
   const holder = activeHolderFor(members);
   return {
@@ -390,9 +410,7 @@ function planSeatRow(seatId: string, members: readonly RecordPlan[], now: string
     nextOrdinal: Math.max(...members.map((member) => member.holderOrdinal)) + 1,
     closedAt: null,
     name: seatNameSource(members)?.record.name,
-    // `brick attach` is this field's writer (Cluster A requirement 5) and that is not
-    // this pass. Absent, deliberately — not an empty string.
-    brickId: undefined,
+    brickId: brickFromHolders(members),
     favorite: favoriteFromHolders(members),
   };
 }

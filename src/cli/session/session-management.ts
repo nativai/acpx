@@ -313,7 +313,12 @@ async function refuseUnjoinableSeat(
  * seat"*) — so a brick-less seat is not an authority asserting "none", and
  * there is nothing for a holder to disagree with. `--seat` must never WRITE
  * the seat as a side effect of this fallback (joining never mints, D11); a
- * legacy seat's absence is healed by `acpx seats backfill`, not by a spawn.
+ * legacy seat's absence is healed by `acpx seats backfill`, not by a spawn —
+ * **true only as of item (d) in this same change** (`seat-backfill.ts`'s
+ * `planSeatRow`), which derives `brick_id` from the active holder's own
+ * `metadata.brick`. Before (d), `backfill` mints the row and leaves
+ * `brick_id` absent — a THIRD site of F1's pattern, not a pre-existing
+ * remedy; that gap is the reason (d) exists at all.
  *
  * `childMetadata` here is `buildSessionStartOptions`'s FULLY INHERITANCE-
  * APPLIED value — i.e. it already carries the spawner's ambient brick when

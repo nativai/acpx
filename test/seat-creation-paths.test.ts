@@ -1821,6 +1821,10 @@ async function plantSeatRow(
   }));
 }
 
+// ENOENT (the directory itself never got created) is an even STRONGER "nothing
+// was written" than an empty listing — ROW A refuses before the sessions dir
+// exists at all, which earlier refusal rows never hit (they at least planted a
+// seat row first, via `plantSeatRow`, which creates the directory).
 function sessionRecordFiles(sessionDir: string): Promise<string[]> {
   return fs
     .readdir(sessionDir)
@@ -1828,7 +1832,13 @@ function sessionRecordFiles(sessionDir: string): Promise<string[]> {
       names.filter(
         (name) => name.endsWith(".json") && name !== "index.json" && name !== "seats.json",
       ),
-    );
+    )
+    .catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") {
+        return [];
+      }
+      throw error;
+    });
 }
 
 test("F1 · `sessions new --brick` writes the SEAT's brick_id, not only the holder's own metadata", async () => {
@@ -1897,6 +1907,260 @@ test("F1 · `sessions new --brick` writes the SEAT's brick_id, not only the hold
     );
   });
 });
+
+// 🔑 ROW B OF THE VALIDATION-VS-NO-VALIDATION PAIR (paired with "ROW A" below).
+// `resolveBrickFlagRef` falls back to `acceptUuidWhenBrickCliUnavailable`
+// whenever `brick show` does not resolve — and multiple independent
+// measurements on this box (this brick's own L0, the implementer, the TE, and
+// a sibling lane reading real session records: 5 of 5 consecutive degraded
+// spawns in one 24-minute window) agree that leg, not the `ok` one, is what a
+// loaded box actually takes: `brick show` measured at 4972–7658 ms against the
+// 3000 ms `BRICK_CLI_TIMEOUT_MS` budget — SUSTAINED windows, not run-to-run
+// noise, so retrying past it is not reliable.
+//
+// 🛑 **THE REAL SEMANTIC THIS ROW PINS IS "accepted UNVALIDATED" — not just
+// "the value survives".** The sibling lane's measurement is what makes this
+// row's point sharp: on the degraded leg the write ever lands (all five of
+// its spawns linked correctly) — **it is the CHECK that is dropped, not the
+// link.** A typo'd or stale brick ref would be written here too, reported as
+// SUCCESS, with the warning banner reading like a tolerated hiccup rather than
+// "nothing validated this." **This row PINS today's behaviour; it is not an
+// endorsement of it** — whether unvalidated-accept is the right product
+// decision is outside this brick's mandate. Its job is to make a future
+// change confront the fact rather than drift past it silently. See ROW A
+// below for the healthy-validation path this is contrasted against: together
+// they pin validation-vs-no-validation, which neither pins alone.
+//
+// The shim's `hang` mode (a 30 s sleep) makes the timeout fire deterministically
+// rather than depending on real box load, so this row is reliable rather than a
+// second flaky copy of the hazard it tests. No `timeoutMs` plumbing needed:
+// `execFile`'s own `timeout` option already bounds the wait to
+// `BRICK_CLI_TIMEOUT_MS` (~3 s), so this row costs seconds, not minutes.
+test(
+  "F1/fallback leg (ROW B) · --brick is ACCEPTED UNVALIDATED when `brick show` times out, and " +
+    "still reaches BOTH the holder and the SEAT — pins today's behaviour, not an endorsement",
+  async () => {
+    await withTempHome(async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      await fs.mkdir(cwd, { recursive: true });
+      const sessionDir = path.join(homeDir, ".acpx", "sessions");
+
+      const created = await runCli(
+        [
+          "--cwd",
+          cwd,
+          "--agent",
+          MOCK_AGENT_COMMAND,
+          "--approve-all",
+          "--format",
+          "json",
+          "sessions",
+          "new",
+          "-s",
+          "f1-fallback",
+          "--brick",
+          BRICK_A,
+        ],
+        homeDir,
+        {
+          PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
+          BRICK_SHIM_MODE: "hang",
+        },
+      );
+      assert.equal(created.code, 0, created.stderr);
+      // Sanity: this row must actually TAKE the fallback leg, not the `ok` one
+      // — otherwise it is a second copy of the F1 test above, not new coverage.
+      assert.match(
+        created.stderr,
+        /brick CLI unavailable/,
+        "this row did not take the degraded leg — the shim's `hang` mode did not time out as expected",
+      );
+      const id = String(
+        (JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+      );
+
+      const onDisk = await readRecordJson(homeDir, id);
+      assert.equal(
+        (onDisk.metadata as Record<string, unknown> | undefined)?.brick,
+        BRICK_A,
+        "on the fallback leg, the holder's own metadata.brick must still carry --brick",
+      );
+      const seatId = String(onDisk.seat_id);
+
+      const store = await readSeatStore(sessionDir);
+      assert.equal(
+        seatFromStore(store, seatId)?.brickId,
+        BRICK_A,
+        "F1 on the fallback leg: the SEAT's brick_id must still be written — " +
+          "`acceptUuidWhenBrickCliUnavailable` returns the same uuid it was given, so the " +
+          "degraded leg must reach the seat identically to the `ok` leg",
+      );
+    });
+  },
+);
+
+// 🔑 ROW A OF THE VALIDATION-VS-NO-VALIDATION PAIR (paired with ROW B above).
+// A row asserting "today's fallback is invariant — refused on BOTH the ok and
+// hang legs" was this lane's own FIRST DRAFT, and it is a REJECTED SHAPE, not
+// a rejected finding: a row that passes identically on the healthy and the
+// broken path cannot fail when the thing it guards breaks. The redesign pins
+// the two legs SEPARATELY instead — ROW A is `brick show` resolving cleanly
+// to NOT-FOUND (the healthy validation path: a typo'd/stale brick ref is
+// REFUSED), ROW B above is the same ref under `hang` (accepted unvalidated).
+// Neither row alone states the real semantic; together they do. Both are
+// deterministic — pinned by the shim's mode, never by real box load.
+test(
+  "F1/fallback leg (ROW A) · an UNKNOWN brick ref is REFUSED when `brick show` resolves " +
+    "cleanly — the healthy validation path ROW B above is contrasted against",
+  async () => {
+    await withTempHome(async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      await fs.mkdir(cwd, { recursive: true });
+      const sessionDir = path.join(homeDir, ".acpx", "sessions");
+
+      const refused = await runCli(
+        [
+          "--cwd",
+          cwd,
+          "--agent",
+          MOCK_AGENT_COMMAND,
+          "--approve-all",
+          "--format",
+          "json",
+          "sessions",
+          "new",
+          "-s",
+          "row-a-not-found",
+          "--brick",
+          BRICK_A,
+        ],
+        homeDir,
+        { PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`, BRICK_SHIM_MODE: "not-found" },
+      );
+      assert.notEqual(
+        refused.code,
+        0,
+        "an unknown brick ref was ACCEPTED — `brick show` resolved cleanly to not-found, so " +
+          "this is the HEALTHY validation leg and must refuse",
+      );
+      const said = `${refused.stdout}${refused.stderr}`;
+      assert.match(
+        said,
+        /unknown brick/i,
+        "the refusal must say the brick is UNKNOWN, not something else",
+      );
+
+      const files = await sessionRecordFiles(sessionDir);
+      assert.deepEqual(
+        files,
+        [],
+        "a session record was written despite the refusal, on the validation leg",
+      );
+    });
+  },
+);
+
+// 🔑 THE TE's INDUCED-FAILURE SPECIMEN, brick 3dff714d item 3 — F1 widened what a
+// failed mint costs (the canonical brick_id, not only the row), so the
+// diagnostic on that path must name the consequence AND the remedy must be one
+// an operator can actually EXECUTE from the state the failure leaves behind —
+// never "set-brick now" (requires a row that does not exist after an atomic
+// mint failure; naming it would be a second F4) and never a bare "run the
+// backfill" that doesn't say a brick link is even at stake. This row does not
+// stop at reading the message: it EXECUTES the printed advice and asserts the
+// operator ends up recovered, which is the only way to know the advice works
+// rather than merely reads well.
+test(
+  "F1 remedy · a CORRUPT store with --brick: the diagnostic names the brick consequence, and " +
+    "EXECUTING its remedy (quarantine + backfill) actually restores the seat's brick_id",
+  async () => {
+    await withTempHome(async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      await fs.mkdir(cwd, { recursive: true });
+      const sessionDir = path.join(homeDir, ".acpx", "sessions");
+      await fs.mkdir(sessionDir, { recursive: true });
+      // Same induction as "item 8" above: a store that EXISTS and cannot be
+      // parsed, so `withSeatStoreWrite` refuses to overwrite it (fail-closed)
+      // while the create path itself fails OPEN (item 8's ruling).
+      const storePath = path.join(sessionDir, "seats.json");
+      await fs.writeFile(storePath, "{ not json at all", "utf8");
+
+      const created = await runCli(
+        [
+          "--cwd",
+          cwd,
+          "--agent",
+          MOCK_AGENT_COMMAND,
+          "--approve-all",
+          "--format",
+          "json",
+          "sessions",
+          "new",
+          "-s",
+          "f1-remedy",
+          "--brick",
+          BRICK_A,
+        ],
+        homeDir,
+        brickShimEnv(BRICK_A),
+      );
+      // 1. The session is still created and usable (item 8's ruling, unaffected).
+      assert.equal(created.code, 0, `a corrupt seat store failed the spawn: ${created.stderr}`);
+      const id = String(
+        (JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+      );
+      const onDisk = await readRecordJson(homeDir, id);
+      const seatId = String(onDisk.seat_id);
+      assert.equal(
+        (onDisk.metadata as Record<string, unknown> | undefined)?.brick,
+        BRICK_A,
+        "the holder's own metadata.brick must land even though the row-mint failed",
+      );
+
+      // 2. THE DIAGNOSTIC NAMES THE BRICK CONSEQUENCE — not only "no row".
+      assert.match(
+        created.stderr,
+        /brick_id was NOT written/,
+        "the diagnostic must say a brick link is at stake, not only that the row is missing",
+      );
+      assert.match(
+        created.stderr,
+        new RegExp(BRICK_A),
+        "the diagnostic must name the brick that was lost from the canonical copy",
+      );
+      // 🛑 AND IT MUST NOT NAME `set-brick` AS A REMEDY HERE — no row exists yet
+      // for this seat, so `set-brick` would refuse SEAT_ROW_MISSING; naming it
+      // would be exactly the findings' F4 class this fix is supposed to avoid.
+      assert.doesNotMatch(
+        created.stderr,
+        /seats set-brick/,
+        "the diagnostic named a remedy the operator cannot yet execute — no row exists for " +
+          "this seat, so `seats set-brick` would refuse SEAT_ROW_MISSING",
+      );
+      assert.match(created.stderr, /quarantine/i, "the remedy for CORRUPTION must still be named");
+
+      // 3. EXECUTE THE PRINTED ADVICE, exactly as an operator would, and assert
+      // recovery — never just that the message reads well.
+      const quarantinePath = `${storePath}.corrupt-test`;
+      await fs.rename(storePath, quarantinePath);
+      const backfilled = await runCli(
+        ["--cwd", cwd, "--format", "json", "seats", "backfill", "--apply"],
+        homeDir,
+      );
+      assert.equal(backfilled.code, 0, backfilled.stderr);
+
+      const store = await readSeatStore(sessionDir);
+      const row = seatFromStore(store, seatId);
+      assert.ok(row, "the operator followed the printed remedy and the seat STILL has no row");
+      assert.equal(
+        row.brickId,
+        BRICK_A,
+        "RECOVERY: after executing the diagnostic's own remedy, the seat's brick_id must be " +
+          "restored — derived from the holder's metadata.brick, exactly as item (d) promises",
+      );
+    });
+  },
+);
 
 test(
   "F2/leg 3 (THE MEASURED LEG) · join with NO --brick: the SEAT's brick wins, the spawner's " +
