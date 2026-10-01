@@ -350,6 +350,16 @@ test("a MALFORMED row throws and is NOT reported as absent — the states must n
       '{"s":{"seat_id":"other","created_at":"t","active_holder_id":null,"next_ordinal":1,"closed_at":null}}',
     "row is not an object": '{"s":"not-a-row"}',
     "row is null": '{"s":null}',
+    // Brick `9984c510` — D8 applies to `brick_id_validated` exactly as it
+    // does to every other field. THE SUBSTITUTION THIS CASE EXISTS TO CATCH:
+    // a reader that silently dropped a non-boolean value here would read
+    // this row as a LEGAL one — `brick_id` present, state key absent reads
+    // as UNVALIDATED by invariant (ii) — instead of a CORRUPT one. That
+    // wrong answer is indistinguishable from a legitimate "legacy row" and
+    // would never surface as corruption, which is exactly the failure mode
+    // "malformed collapsing into absent" already names one field over.
+    "wrong-typed brick_id_validated":
+      '{"s":{"seat_id":"s","created_at":"t","active_holder_id":null,"next_ordinal":1,"closed_at":null,"brick_id":"1a5845c3-a832-4370-b564-8ec5286bff79","brick_id_validated":"yes"}}',
   };
   for (const [label, payload] of Object.entries(cases)) {
     const store = parseSeatStore(payload);
@@ -361,6 +371,26 @@ test("a MALFORMED row throws and is NOT reported as absent — the states must n
       `${label}: a malformed row read as ABSENT instead of throwing`,
     );
   }
+});
+
+// Brick `9984c510` — THE POSITIVE CONTROL for the "wrong-typed
+// brick_id_validated" case above, same fixture shape with a GENUINE boolean
+// in place of the corrupt value. Without this, the negative row proves only
+// that an instrument returns malformed for SOMETHING — never that it is
+// pointed at the field under test. A row that read EVERY seat as malformed
+// unconditionally would also pass the negative case above; it would fail
+// this one.
+test("the identical fixture with a GENUINE boolean brick_id_validated parses cleanly — the positive control for the malformed case above", () => {
+  const store = parseSeatStore(
+    '{"s":{"seat_id":"s","created_at":"t","active_holder_id":null,"next_ordinal":1,"closed_at":null,' +
+      '"brick_id":"1a5845c3-a832-4370-b564-8ec5286bff79","brick_id_validated":false}}',
+  );
+  assert.deepEqual(store.malformedSeatIds, [], "a genuine boolean must not be rejected");
+  const row = seatFromStore(store, "s");
+  assert.deepEqual(row?.brickId, {
+    ref: "1a5845c3-a832-4370-b564-8ec5286bff79",
+    validated: false,
+  });
 });
 
 test("a malformed row does not take down the seats beside it", () => {
