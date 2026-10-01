@@ -472,6 +472,9 @@ async function handleSeatsRename(
     if (format === "quiet") {
       return;
     }
+    // PRINTED ON THE TEXT PATH ONLY — a scripted caller's `--format json` payload
+    // must never gain a prose line, which `test/seats-mutation-verbs.test.ts` row
+    // RN11 asserts.
     process.stdout.write(`seat ${seatId}: name = ${JSON.stringify(name)}\n`);
   });
 }
