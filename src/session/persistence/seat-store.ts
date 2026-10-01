@@ -150,6 +150,22 @@ export { SEAT_STORE_FILE };
  * makes every read site fail `pnpm run typecheck` BY NAME until repaired, so
  * invariant (i) — an unvalidated ref is never presented as validated
  * anywhere it is copied — is enforced by the compiler, not by diligence.
+ *
+ * 🔑 **A REAL BOOLEAN HERE, A STATE WORD ON THE HOLDER
+ * (`session-management.ts`'s `metadata.brick_validation`) — DELIBERATE, NOT
+ * AN INCONSISTENCY TO HARMONISE.** The asymmetry is forced by each field's
+ * CARRIER, not by sloppiness: `metadata` is `Record<string,string>`, where
+ * `"false"` is a non-empty, TRUTHY string — a boolean-string there would let
+ * `if (md.brick_validation)` read the one value meaning "do not trust this"
+ * as true. A typed JSON field has no such trap, PROVIDED two things hold —
+ * both true here and both load-bearing: every read is an EQUALITY
+ * (`row.brick_id_validated === true`, never a bare `if (row.brick_id_validated)`
+ * truthiness check), and a malformed value is REJECTED by `isOmittableBoolean`
+ * rather than coerced. Collapsing THIS side to a word would be harmless;
+ * collapsing the holder side to a boolean-string reintroduces the truthy
+ * trap. Rewriting this field's read as truthiness would ALSO break something
+ * real — invariant (ii): `undefined` (not-yet-known) and `false`
+ * (known-unvalidated) are different facts, and truthiness collapses them.
  */
 export type SeatBrickLink = {
   readonly ref: string;

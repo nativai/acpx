@@ -362,6 +362,15 @@ async function refuseUnjoinableSeat(
  * the policy walks EVERY persisted key, `metadata` included, with no
  * exemption for this field. Caught by actually running the CLI, not by
  * typecheck (metadata values are plain strings either way).
+ *
+ * 🔑 **A WORD HERE, A REAL BOOLEAN ON THE SEAT (`seat-store.ts`'s
+ * `SeatBrickLink.validated`) — DELIBERATE, NOT AN INCONSISTENCY TO
+ * HARMONISE.** The seat's field is a typed JSON `boolean`, read only by
+ * EQUALITY and REJECTED when malformed, so it carries no truthy-string trap;
+ * `metadata` has no such protection — it is `Record<string,string>`, where
+ * `"false"` is truthy. Collapsing the SEAT side to a word would be harmless;
+ * collapsing THIS side to a boolean-string reintroduces the exact trap this
+ * comment opens with.
  */
 function metadataWithSeatBrickLink(
   childMetadata: Record<string, string> | undefined,
