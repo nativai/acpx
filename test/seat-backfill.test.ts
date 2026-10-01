@@ -1614,14 +1614,39 @@ test("L16a: `acpx seats` registers ALL FOUR subcommands, and each ANSWERS", asyn
         new RegExp(`^\\s{2}${name}\\b`, "m"),
         `\`seats --help\` does not list \`${name}\` — the union dropped a lane's verbs`,
       );
-      // Advertised is not the same as reachable: ask each one directly.
+      // 🛑 PRESENCE, NOT JUST ABSENCE. `output.includes("No acpx session found") ===
+      // false` was near-vacuous: commander answers an UNREGISTERED subcommand name
+      // with `--help` by printing the PARENT's (`seats`'s) own usage line, which
+      // also never contains that fallback marker — so the old check passed
+      // identically for a real verb and for garbage (measured directly against
+      // `seats l6c-item2-unregistered-subcommand --help`). The actual
+      // discriminator is each subcommand's OWN usage line (`Usage: acpx seats
+      // <name> …`), which only appears when commander actually resolved and
+      // dispatched to it — see the negative case below for the same probe
+      // applied to a name that was never registered.
       const sub = await runCli(["seats", name, "--help"], homeDir);
-      assert.equal(
-        `${sub.stdout}${sub.stderr}`.includes("No acpx session found"),
-        false,
-        `\`seats ${name}\` is advertised but does not answer`,
+      assert.match(
+        sub.stdout,
+        new RegExp(`^Usage: acpx seats ${name}\\b`, "m"),
+        `\`seats ${name}\` is listed but its own usage line never appeared — ` +
+          `it is advertised without actually being reachable`,
       );
     }
+
+    // PRESENCE/ABSENCE PAIR (required by the brief for an absence-shaped guard):
+    // a name that was NEVER registered must NOT get a per-subcommand usage line.
+    // Without this, emptying SEATS_SUBCOMMANDS to `[]` would leave the loop above
+    // vacuously green — the for-loop simply runs zero times — so this committed
+    // negative case is the one assertion in this test that fires regardless of
+    // what the array contains.
+    const unregisteredName = "l6c-item2-unregistered-subcommand";
+    const bogus = await runCli(["seats", unregisteredName, "--help"], homeDir);
+    assert.doesNotMatch(
+      bogus.stdout,
+      new RegExp(`^Usage: acpx seats ${unregisteredName}\\b`, "m"),
+      `an unregistered name must not get its own per-subcommand usage line — ` +
+        `if it does, the positive check above is vacuous again`,
+    );
   });
 });
 
