@@ -1834,12 +1834,15 @@ test("BRK1: a FRESHLY-MINTED seat's brick_id comes from the ACTIVE holder — th
 
     const row = (await readSeatStore(sessionsDir(homeDir))).seats.get(seatId);
     assert.equal(
-      row?.brickId,
+      row?.brickId?.ref,
       BRICK_B,
       "the ACTIVE holder's brick must win, not the RETIRED holder's HIGHER ordinal — brick_id " +
         "derives like name (the active-holder representative), never like favorite's some(), " +
         "and never by raw ordinal over all members",
     );
+    // Brick `9984c510`, R28 (5): a FRESH mint via the backfill always writes
+    // UNVALIDATED — it promotes the holder's own derived copy verbatim.
+    assert.equal(row?.brickId?.validated, false);
     assert.equal(row?.activeHolderId, "brk1-h1", "fixture sanity: h1 is the active holder");
   });
 });
@@ -1866,7 +1869,13 @@ test("BRK2: an EXISTING seat row that already carries a brick_id is LEFT UNCHANG
       nextOrdinal: 2,
       closedAt: null,
       name: undefined,
-      brickId: BRICK_A,
+      // Brick `9984c510`: `validated: true` here (not `false`, like every
+      // OTHER fixture in this file) is deliberate — BRK2 must prove the
+      // WHOLE link object is left alone, including its validation state,
+      // not merely its ref. If the (d′) fill leg this brick adds ever
+      // started reconciling a PRESENT link's state, this is the row that
+      // would catch it.
+      brickId: { ref: BRICK_A, validated: true },
       favorite: false,
     });
 
@@ -1875,9 +1884,14 @@ test("BRK2: an EXISTING seat row that already carries a brick_id is LEFT UNCHANG
 
     const row = (await readSeatStore(sessionsDir(homeDir))).seats.get(seatId);
     assert.equal(
-      row?.brickId,
+      row?.brickId?.ref,
       BRICK_A,
       "an existing row's brick_id must not be overwritten by a holder that disagrees with it",
+    );
+    assert.equal(
+      row?.brickId?.validated,
+      true,
+      "BRK2 must preserve the link's validation state too",
     );
   });
 });

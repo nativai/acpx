@@ -364,10 +364,15 @@ test("SB1 · sets brick_id; closed_at survives as an explicit null; every other 
       "closed_at must remain a PRESENT key, not be dropped by rebuilding the row",
     );
     assert.equal(after[SEAT_A]?.closed_at, null);
+    // Brick `9984c510`: a bare `set-brick` (no `--validated`) now also writes
+    // the sibling `brick_id_validated: false` — asserted explicitly here, and
+    // excluded from the "everything else untouched" comparison below exactly
+    // as `brick_id` itself is, since the two travel together by design.
+    assert.equal(after[SEAT_A]?.brick_id_validated, false);
     assert.deepEqual(
-      { ...after[SEAT_A], brick_id: undefined },
-      { ...before[SEAT_A], brick_id: undefined },
-      "every field other than brick_id must be untouched",
+      { ...after[SEAT_A], brick_id: undefined, brick_id_validated: undefined },
+      { ...before[SEAT_A], brick_id: undefined, brick_id_validated: undefined },
+      "every field other than brick_id/brick_id_validated must be untouched",
     );
     assert.deepEqual(after[SEAT_B], before[SEAT_B], "an unrelated row must be byte-identical");
   });

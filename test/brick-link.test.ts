@@ -85,7 +85,9 @@ test("resolveBrickFlagRef resolves through the shim and stores the returned uuid
         BRICK_SHIM_LOG: log,
       },
       async () => {
-        assert.equal(await resolveBrickFlagRef("myslug"), X);
+        // Brick `9984c510`: the WHOLE result is pinned, not just the ref — the
+        // healthy leg must report `validated: true`.
+        assert.deepStrictEqual(await resolveBrickFlagRef("myslug"), { ref: X, validated: true });
         assert.deepEqual(await readLog(log), [["show", "myslug", "--json"]]);
       },
     );
@@ -110,7 +112,12 @@ test("resolveBrickFlagRef refuses definitive not-found and ambiguous responses",
 test("resolveBrickFlagRef degrades to full-uuid only when the CLI is unavailable", async () => {
   await withNoBrickOnPath(async (dir) => {
     await withEnv({ PATH: dir, BRICK_SHIM_MODE: undefined }, async () => {
-      assert.equal(await resolveBrickFlagRef(Y.toUpperCase()), Y);
+      // Brick `9984c510`: no brick CLI on PATH at all is the degraded leg —
+      // the accepted uuid must be marked `validated: false`.
+      assert.deepStrictEqual(await resolveBrickFlagRef(Y.toUpperCase()), {
+        ref: Y,
+        validated: false,
+      });
       await assert.rejects(() => resolveBrickFlagRef("slug"), /non-uuid refs need the brick CLI/);
     });
   });
@@ -120,7 +127,8 @@ test("resolveBrickFlagRef treats garbage, hanging, and non-uuid show output as u
   await withEnv(
     { PATH: `${SHIM_DIR}:${process.env.PATH ?? ""}`, BRICK_SHIM_MODE: "garbage" },
     async () => {
-      assert.equal(await resolveBrickFlagRef(X), X);
+      // Brick `9984c510`: unparseable `show` output is the degraded leg.
+      assert.deepStrictEqual(await resolveBrickFlagRef(X), { ref: X, validated: false });
       await assert.rejects(() => resolveBrickFlagRef("slug"), /non-uuid refs need the brick CLI/);
     },
   );
@@ -132,7 +140,9 @@ test("resolveBrickFlagRef treats garbage, hanging, and non-uuid show output as u
       BRICK_SHIM_ID: "../../evil-path",
     },
     async () => {
-      assert.equal(await resolveBrickFlagRef(X), X);
+      // Brick `9984c510`: a `show` response with no USABLE brick id (the
+      // returned id fails `BRICK_UUID_RE`) is also the degraded leg.
+      assert.deepStrictEqual(await resolveBrickFlagRef(X), { ref: X, validated: false });
       await assert.rejects(() => resolveBrickFlagRef("slug"), /non-uuid refs need the brick CLI/);
     },
   );
@@ -141,7 +151,11 @@ test("resolveBrickFlagRef treats garbage, hanging, and non-uuid show output as u
     { PATH: `${SHIM_DIR}:${process.env.PATH ?? ""}`, BRICK_SHIM_MODE: "hang" },
     async () => {
       const started = Date.now();
-      assert.equal(await resolveBrickFlagRef(X, { timeoutMs: 25 }), X);
+      // Brick `9984c510`: a timed-out `show` is the canonical degraded leg.
+      assert.deepStrictEqual(await resolveBrickFlagRef(X, { timeoutMs: 25 }), {
+        ref: X,
+        validated: false,
+      });
       await assert.rejects(
         () => resolveBrickFlagRef("slug", { timeoutMs: 25 }),
         /non-uuid refs need the brick CLI/,

@@ -20,9 +20,11 @@ import { writeSessionRecordAuthorizingSeatHolderWithoutIndex } from "./persisten
 import { seatFieldsToIndexEntry } from "./persistence/seat-fields.js";
 import {
   backfillSeatRow,
+  fillSeatBrickLink,
   MalformedSeatRowError,
   migrateSeatFavorite,
   readSeatStore,
+  type SeatBrickLink,
   type SeatRecord,
   seatStorePath,
   SeatStoreUnwritableError,
@@ -135,6 +137,14 @@ export type SeatBackfillReport = {
    * is what "one-time" means for a migration that runs inside an idempotent verb.
    */
   favoritesMigrated: number;
+  /**
+   * (d′), brick `9984c510`: existing seat rows whose `brick_id` was ABSENT and
+   * were filled (dry run: would be filled) from their active holder's own
+   * derived link, marked UNVALIDATED. Never overwrites a PRESENT link (BRK2)
+   * — only absent → present is in scope. Same "re-run touches zero" contract
+   * as `favoritesMigrated` once every absent link has been filled once.
+   */
+  brickLinksFilled: number;
   errors: SeatBackfillError[];
   /** The `.bak-mig-<TS>` suffix of this run's pre-apply copies, absent on a dry run. */
   backupSuffix: string | undefined;
@@ -274,6 +284,14 @@ type SeatPlan = {
    * there is nothing left for the migration leg to do.
    */
   favoriteNeedsMigration: boolean;
+  /**
+   * (d′), brick `9984c510`: true when a row ALREADY EXISTS for this seat, its
+   * on-disk `brick_id` is ABSENT, and this run's derived `row.brickId` has
+   * something to fill it with. False for a fresh mint (the link travels with
+   * the whole row there) AND false when the existing row already carries a
+   * link, however obtained — BRK2, never overwritten, never reconciled.
+   */
+  brickLinkNeedsFill: boolean;
 };
 
 /**
@@ -401,6 +419,19 @@ function brickFromHolders(members: readonly RecordPlan[]): string | undefined {
   return seatNameSource(members)?.record.metadata?.brick?.trim() || undefined;
 }
 
+/**
+ * Brick `9984c510`, R28 (5) — ALWAYS UNVALIDATED. The backfill promotes the
+ * active holder's own derived copy VERBATIM; it validates nothing, so
+ * claiming anything else about it would be laundering a ref nobody confirmed
+ * exists. Shared by both the fresh-mint row below and the (d′) fill leg
+ * (`writeBrickLinkFillLeg`), which derives from this same `SeatRecord.brickId`
+ * rather than re-deriving the ref a second time.
+ */
+function brickLinkFromHolders(members: readonly RecordPlan[]): SeatBrickLink | undefined {
+  const ref = brickFromHolders(members);
+  return ref === undefined ? undefined : { ref, validated: false };
+}
+
 function planSeatRow(seatId: string, members: readonly RecordPlan[], now: string): SeatRecord {
   const holder = activeHolderFor(members);
   return {
@@ -410,7 +441,7 @@ function planSeatRow(seatId: string, members: readonly RecordPlan[], now: string
     nextOrdinal: Math.max(...members.map((member) => member.holderOrdinal)) + 1,
     closedAt: null,
     name: seatNameSource(members)?.record.name,
-    brickId: brickFromHolders(members),
+    brickId: brickLinkFromHolders(members),
     favorite: favoriteFromHolders(members),
   };
 }
@@ -659,6 +690,8 @@ async function planSeats(
       needsRow: !existing,
       fromExistingSeatId: members.every((member) => !member.seatsRecord),
       favoriteNeedsMigration: existing !== undefined && existing.favorite !== row.favorite,
+      brickLinkNeedsFill:
+        existing !== undefined && existing.brickId === undefined && row.brickId !== undefined,
     });
   }
   return seatPlans;
@@ -691,6 +724,9 @@ type ApplyCounts = {
    * subset that actually flipped a value. */
   favoritesAttempted: Set<string>;
   favoritesMigrated: number;
+  /** (d′), brick `9984c510` — same shape as `favoritesAttempted`, one field over. */
+  brickLinksAttempted: Set<string>;
+  brickLinksFilled: number;
   backups: string[];
 };
 
@@ -758,6 +794,34 @@ async function writeFavoriteMigrationLeg(
   }
 }
 
+/**
+ * Leg 3¾ — (d′), brick `9984c510`: FILL an ABSENT seat `brick_id` for a seat
+ * whose row ALREADY EXISTS. Mirrors `writeFavoriteMigrationLeg` one field
+ * over: `needsRow` is mutually exclusive with `brickLinkNeedsFill` by
+ * construction (`planSeats`) — a fresh mint's link travels with the whole
+ * row via `writeSeatLeg` instead.
+ *
+ * Once per distinct seat, same guard shape as the two legs above:
+ * `fillSeatBrickLink` re-reads the store under the lock and decides
+ * absent-vs-present there, so this guard is an optimisation and never the
+ * authority.
+ */
+async function writeBrickLinkFillLeg(
+  sessionDir: string,
+  plan: RecordPlan,
+  seatPlans: ReadonlyMap<string, SeatPlan>,
+  counts: ApplyCounts,
+): Promise<void> {
+  const seat = seatPlans.get(plan.seatId);
+  if (!seat?.brickLinkNeedsFill || counts.brickLinksAttempted.has(plan.seatId)) {
+    return;
+  }
+  counts.brickLinksAttempted.add(plan.seatId);
+  if ((await fillSeatBrickLink(sessionDir, plan.seatId, seat.row.brickId?.ref)) === "filled") {
+    counts.brickLinksFilled += 1;
+  }
+}
+
 async function applyRecord(
   sessionDir: string,
   plan: RecordPlan,
@@ -788,6 +852,7 @@ async function applyRecord(
     stage = "store";
     await writeSeatLeg(sessionDir, plan, seatPlans, counts);
     await writeFavoriteMigrationLeg(sessionDir, plan, seatPlans, counts);
+    await writeBrickLinkFillLeg(sessionDir, plan, seatPlans, counts);
   } catch (error) {
     errors.push(errorFor(plan, stage, error));
   }
@@ -842,6 +907,7 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
       rowsRepaired: seatsNeedingRows.filter((seat) => seat.fromExistingSeatId).length,
       favoritesMigrated: [...seatPlans.values()].filter((seat) => seat.favoriteNeedsMigration)
         .length,
+      brickLinksFilled: [...seatPlans.values()].filter((seat) => seat.brickLinkNeedsFill).length,
       errors,
       backupSuffix: undefined,
       backups: [],
@@ -856,6 +922,8 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
     rowsMinted: new Set(),
     favoritesAttempted: new Set(),
     favoritesMigrated: 0,
+    brickLinksAttempted: new Set(),
+    brickLinksFilled: 0,
     backups: await takeStoreBackups(sessionDir, suffix),
   };
   for (const plan of scanned.plans) {
@@ -871,6 +939,7 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
       (seatId) => seatPlans.get(seatId)?.fromExistingSeatId === true,
     ).length,
     favoritesMigrated: counts.favoritesMigrated,
+    brickLinksFilled: counts.brickLinksFilled,
     errors,
     backupSuffix: suffix,
     backups: counts.backups,

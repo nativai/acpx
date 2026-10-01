@@ -133,6 +133,59 @@ export { SEAT_STORE_FILE };
  *   **derived, never stored**: one structured line at the flip, and a
  *   count-of-currently-divergent-seats computed on demand.
  */
+/**
+ * The seat's canonical brick link, carrying HOW IT WAS OBTAINED — brick
+ * `9984c510`. Before this type existed, `brickId` was a bare `string`, which
+ * could only say ABSENT or A REF, so the only honest option under a degraded
+ * `brick show` was to withhold the ref — recreating the very defect (F1)
+ * writing it fixed. This gives the field a third thing to say: the ref is
+ * present AND we know whether `brick show` actually resolved it.
+ *
+ * ⚠️ **A TYPE CHANGE ON THE EXISTING SLOT, DELIBERATELY NOT A SECOND
+ * INDEPENDENT FIELD.** Two independent fields (`brickId` + a new
+ * `brickValidated`) would leave every existing read site compiling while
+ * silently ignoring the new flag — this repo's own documented, already-paid-
+ * for failure (`persisted-seat-contract.ts`: "writes are total, reads are
+ * allowlists" lost four `acpx.*` fields exactly that way). A type change
+ * makes every read site fail `pnpm run typecheck` BY NAME until repaired, so
+ * invariant (i) — an unvalidated ref is never presented as validated
+ * anywhere it is copied — is enforced by the compiler, not by diligence.
+ *
+ * 🔑 **A REAL BOOLEAN HERE, A STATE WORD ON THE HOLDER
+ * (`session-management.ts`'s `metadata.brick_validation`) — DELIBERATE, NOT
+ * AN INCONSISTENCY TO HARMONISE.** The asymmetry is forced by each field's
+ * CARRIER, not by sloppiness: `metadata` is `Record<string,string>`, where
+ * `"false"` is a non-empty, TRUTHY string — a boolean-string there would let
+ * `if (md.brick_validation)` read the one value meaning "do not trust this"
+ * as true. A typed JSON field has no such trap, PROVIDED two things hold —
+ * both true here and both load-bearing: every read is an EQUALITY
+ * (`row.brick_id_validated === true`, never a bare `if (row.brick_id_validated)`
+ * truthiness check), and a malformed value is REJECTED by `isOmittableBoolean`
+ * rather than coerced. Collapsing THIS side to a word would be harmless;
+ * collapsing the holder side to a boolean-string reintroduces the truthy
+ * trap. Rewriting this field's read as truthiness would ALSO break something
+ * real — invariant (ii): `undefined` (not-yet-known) and `false`
+ * (known-unvalidated) are different facts, and truthiness collapses them.
+ */
+export type SeatBrickLink = {
+  readonly ref: string;
+  /** TRUE only where `brick show` RESOLVED the ref. A timeout is not a
+   * validation, and absence of this flag ON DISK is UNVALIDATED, never
+   * validated-by-assumption (invariant (ii)). */
+  readonly validated: boolean;
+};
+
+/** Build a {@link SeatBrickLink} from a possibly-empty ref, trimming it the
+ * same way every other `brickId`-adjacent site in this codebase does.
+ * `undefined`/empty ⇒ `undefined` — "absent", never an empty-string ref. */
+export function seatBrickLinkFromRef(
+  ref: string | undefined,
+  validated: boolean,
+): SeatBrickLink | undefined {
+  const trimmed = ref?.trim();
+  return trimmed ? { ref: trimmed, validated } : undefined;
+}
+
 export type SeatRecord = {
   /** Identity. A UUID (C1) — validated at the ORIGIN and nowhere else (D8). */
   seatId: string;
@@ -149,7 +202,14 @@ export type SeatRecord = {
    * from a holder's `closed`, and distinct from vacancy. */
   closedAt: string | null;
   name: string | undefined;
-  brickId: string | undefined;
+  /**
+   * THE SEAT'S CANONICAL BRICK LINK, QUALIFIED BY HOW IT WAS OBTAINED —
+   * brick `9984c510`. The field set stays closed at EIGHT (below); this is a
+   * TYPE change on the existing `brickId` slot, not a ninth field. See
+   * {@link SeatBrickLink} for why a type change was chosen over a second,
+   * independent field.
+   */
+  brickId: SeatBrickLink | undefined;
   /**
    * THE STAR, MOVED HERE FROM THE SESSION RECORD — Daniel's ruling D-STAR
    * (2026-09-30, relayed `Bricks/693ed2a9-.../` 22:09:40Z): *"the star actually
@@ -372,6 +432,13 @@ type PersistedSeat = {
   closed_at: string | null;
   name?: string;
   brick_id?: string;
+  /**
+   * Brick `9984c510` — OMITTED when `brick_id` is absent. Absent WHILE
+   * `brick_id` is present ⇒ the row reads as `{ref, validated:false}` on the
+   * way back in (invariant (ii)) — a legacy row that predates this field, not
+   * a malformed one; see {@link SeatBrickLink}.
+   */
+  brick_id_validated?: boolean;
   favorite?: boolean;
 };
 
@@ -395,7 +462,11 @@ export function seatToPersisted(seat: SeatRecord): PersistedSeat {
     next_ordinal: seat.nextOrdinal,
     closed_at: seat.closedAt,
     name: seat.name,
-    brick_id: seat.brickId,
+    brick_id: seat.brickId?.ref,
+    // Travels WITH the ref, never independently of it — `seat.brickId?.validated`
+    // is `undefined` exactly when `seat.brickId` itself is, so the two keys are
+    // always omitted or present TOGETHER (brick `9984c510`).
+    brick_id_validated: seat.brickId?.validated,
     // OMITTED WHEN UNDEFINED — same shape as `name`/`brick_id` above, not the two
     // meaningful nulls: `undefined` here means "not yet migrated", a fact whose
     // absence IS the fact, not a value nobody wrote. Once `mintSeatRow` or
@@ -428,6 +499,13 @@ function isOmittableString(value: unknown): value is string | undefined {
   return value === undefined || typeof value === "string";
 }
 
+/** An OMITTABLE boolean — absent, or a boolean. A PRESENT wrong-typed value still
+ * rejects the row (D8), exactly as a wrong-typed `brick_id` already does — no new
+ * failure mode, same discipline one field over. */
+function isOmittableBoolean(value: unknown): value is boolean | undefined {
+  return value === undefined || typeof value === "boolean";
+}
+
 /** The ordinal counter. Starts at 1 and only ever increases, so 0 and negatives are
  * not "unset" — they are unreadable, and a store that handed one out would re-issue
  * a label that must never repeat. */
@@ -449,7 +527,11 @@ function hasValidRequiredSeatFields(row: Record<string, unknown>): boolean {
 }
 
 function hasValidOmittableSeatFields(row: Record<string, unknown>): boolean {
-  return isOmittableString(row.name) && isOmittableString(row.brick_id);
+  return (
+    isOmittableString(row.name) &&
+    isOmittableString(row.brick_id) &&
+    isOmittableBoolean(row.brick_id_validated)
+  );
 }
 
 /**
@@ -494,7 +576,23 @@ export function parseSeatFromPersisted(raw: unknown): SeatRecord | undefined {
     nextOrdinal: row.next_ordinal as number,
     closedAt: row.closed_at as string | null,
     name: row.name as string | undefined,
-    brickId: row.brick_id as string | undefined,
+    // Invariant (ii), brick `9984c510`: ABSENT `brick_id_validated` reads as
+    // UNVALIDATED, never validated-by-assumption — the `=== true` test turns a
+    // missing/legacy sibling into `false` rather than `undefined`, so a row
+    // written before this field existed is never silently trusted.
+    //
+    // TE Gap C: routed through `seatBrickLinkFromRef` rather than built
+    // inline, so an empty-string `brick_id` — unreachable from any writer
+    // here (`seatToPersisted` only ever writes a trimmed, non-empty ref) but
+    // reachable from a hand-written store — collapses to `undefined` instead
+    // of becoming a truthy link with nothing in it. Without this, `show`
+    // rendered `⚠ UNVALIDATED` with no ref, `list` rendered a bare `⚠`, and
+    // (d′) could never fill the row at all (`brickId !== undefined` already
+    // reads as "has a link").
+    brickId: seatBrickLinkFromRef(
+      row.brick_id as string | undefined,
+      row.brick_id_validated === true,
+    ),
     // ABSENT reads as `undefined`, NOT `false` — D8's absent/malformed/valid split
     // does not apply here (absence is a KNOWN, pre-migration state, never an
     // unreadable one), but coercing it to `false` collapses "not yet migrated" and
@@ -751,7 +849,9 @@ export async function mintSeatRow(
     // parent-inherited) for the founding holder, written onto the SEAT at mint
     // time. `undefined` when the holder itself carries none, matching the
     // "absent, not an empty string" discipline the field has always had.
-    readonly brickId: string | undefined;
+    // Brick `9984c510` widened the TYPE: the caller must say HOW it was
+    // obtained (validated vs unvalidated), never leave it to be re-guessed here.
+    readonly brickId: SeatBrickLink | undefined;
   },
 ): Promise<void> {
   await withSeatStoreWrite(sessionDir, (store) => {
@@ -906,6 +1006,54 @@ export async function migrateSeatFavorite(
 }
 
 /**
+ * (d′), brick `9984c510` — FILL an ABSENT seat `brick_id` from the active
+ * holder's own derived link, for a seat row that ALREADY EXISTS. Mirrors
+ * `migrateSeatFavorite`'s shape one field over (a fresh mint gets its
+ * `brickId` baked into the whole row by `planSeatRow` via `backfillSeatRow`
+ * instead — this is the other half, for rows that predate the fix).
+ *
+ * 🛑 **NEVER OVERWRITES A PRESENT LINK (BRK2).** Unlike `favorite`'s
+ * "any holder's star wins, even disagreeing with the stored value" rule,
+ * there is no reconciliation leg here: an existing VALIDATED or UNVALIDATED
+ * link is left EXACTLY as it stands, because this backfill has no way to
+ * re-validate it and silently replacing a sibling link would be exactly the
+ * laundering invariant (i) forbids. Only ABSENT → present is in scope.
+ *
+ * Always writes UNVALIDATED (R28 (5), CONTENT.md §4(E)) — this promotes the
+ * holder's own derived copy verbatim and validates nothing; the caller
+ * passes the already-derived ref, never re-deriving it here.
+ *
+ * IDEMPOTENT AND CHEAP TO CALL REPEATEDLY, same contract as
+ * `migrateSeatFavorite`: `SEAT_STORE_NO_CHANGE` the moment there is nothing
+ * left to fill — a seat with a present link, or a derived ref of `undefined`.
+ *
+ * A MALFORMED row still throws (D8(4), same as `migrateSeatFavorite`).
+ */
+export async function fillSeatBrickLink(
+  sessionDir: string,
+  seatId: string,
+  derivedRef: string | undefined,
+): Promise<"filled" | "unchanged" | "no-row"> {
+  return await withSeatStoreWrite(sessionDir, (store) => {
+    if (store.malformedSeatIds.includes(seatId)) {
+      throw new MalformedSeatRowError(seatId);
+    }
+    const row = store.seats.get(seatId);
+    if (!row) {
+      // No row yet — nothing to fill. `backfillSeatRow` (run first, in the same
+      // pass) is what mints one, already carrying the derived link.
+      return { mutation: SEAT_STORE_NO_CHANGE, result: "no-row" as const };
+    }
+    if (row.brickId !== undefined || derivedRef === undefined) {
+      return { mutation: SEAT_STORE_NO_CHANGE, result: "unchanged" as const };
+    }
+    const seats = new Map(store.seats);
+    seats.set(seatId, { ...row, brickId: { ref: derivedRef, validated: false } });
+    return { mutation: { kind: "write", seats } as const, result: "filled" as const };
+  });
+}
+
+/**
  * Mint the row BEST-EFFORT AND LOUD — **ratification item 8, amended 2026-09-28.**
  *
  * 🛑 **SESSION CREATION NEVER DEPENDS ON THE SEAT STORE.** This is the call-site half of
@@ -984,7 +1132,7 @@ function brickConsequenceClause(params: Parameters<typeof mintSeatRow>[1]): stri
   }
   return (
     `The seat's brick_id was NOT written — it is the CANONICAL copy (CONCEPTION C4) — even ` +
-    `though the holder's own metadata.brick is already set to ${params.brickId}. `
+    `though the holder's own metadata.brick is already set to ${params.brickId.ref}. `
   );
 }
 

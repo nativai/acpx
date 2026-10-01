@@ -141,6 +141,19 @@ export type SessionCreateOptions = {
    * already been applied to it.
    */
   explicitBrickFlag?: string | false;
+  /**
+   * Brick `9984c510` — whether `explicitBrickFlag` (when a string) was
+   * RESOLVED by `brick show` rather than accepted via
+   * `acceptUuidWhenBrickCliUnavailable`'s degraded leg. Meaningless when
+   * `explicitBrickFlag` is `false`/`undefined`. Consulted at seat-MINT time
+   * (the hinge, `session-management.ts`'s `mintSeatRowBestEffort` call) to
+   * mark the freshly minted seat's `brick_id` VALIDATED vs UNVALIDATED.
+   * Deliberately independent of `explicitBrickFlag` itself: a fresh mint can
+   * reach this signal through a path (`sessions copy`/fork) that never sets
+   * `explicitBrickFlag` at all, because that field exists only for the
+   * `--seat` JOIN comparison.
+   */
+  explicitBrickFlagValidated?: boolean;
   mcpServers?: McpServer[];
   permissionMode: PermissionMode;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;

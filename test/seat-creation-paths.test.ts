@@ -1795,7 +1795,7 @@ function brickShimEnv(brickId: string): NodeJS.ProcessEnv {
 async function plantSeatRow(
   homeDir: string,
   seatId: string,
-  overrides: { brickId?: string; activeHolderId?: string | null } = {},
+  overrides: { brickId?: string; brickValidated?: boolean; activeHolderId?: string | null } = {},
 ): Promise<void> {
   const sessionDir = path.join(homeDir, ".acpx", "sessions");
   await withSeatStoreWrite(sessionDir, () => ({
@@ -1811,7 +1811,16 @@ async function plantSeatRow(
             nextOrdinal: 1,
             closedAt: null,
             name: undefined,
-            brickId: overrides.brickId,
+            // Brick `9984c510`: TYPE change on the existing slot. None of
+            // this file's existing F2 join-truth-table callers assert
+            // anything about validation state, so the default (`false`,
+            // UNVALIDATED) is the conservative, never-validated-by-
+            // assumption choice — a caller that needs VALIDATED passes
+            // `brickValidated: true` explicitly.
+            brickId:
+              overrides.brickId === undefined
+                ? undefined
+                : { ref: overrides.brickId, validated: overrides.brickValidated ?? false },
             favorite: false,
           },
         ],
@@ -1886,7 +1895,7 @@ test("F1 · `sessions new --brick` writes the SEAT's brick_id, not only the hold
     const row = seatFromStore(store, seatId);
     assert.ok(row, "F1: the seat row is missing entirely");
     assert.equal(
-      row.brickId,
+      row.brickId?.ref,
       BRICK_A,
       "F1 (brick 3dff714d): `sessions new --brick` left the SEAT's brick_id unset — only " +
         "the holder's metadata.brick was written, which is the exact measured defect " +
@@ -1989,7 +1998,7 @@ test(
 
       const store = await readSeatStore(sessionDir);
       assert.equal(
-        seatFromStore(store, seatId)?.brickId,
+        seatFromStore(store, seatId)?.brickId?.ref,
         BRICK_A,
         "F1 on the fallback leg: the SEAT's brick_id must still be written — " +
           "`acceptUuidWhenBrickCliUnavailable` returns the same uuid it was given, so the " +
@@ -2153,7 +2162,7 @@ test(
       const row = seatFromStore(store, seatId);
       assert.ok(row, "the operator followed the printed remedy and the seat STILL has no row");
       assert.equal(
-        row.brickId,
+        row.brickId?.ref,
         BRICK_A,
         "RECOVERY: after executing the diagnostic's own remedy, the seat's brick_id must be " +
           "restored — derived from the holder's metadata.brick, exactly as item (d) promises",
@@ -2237,7 +2246,7 @@ test(
       // mints or mutates the row it joins.
       const store = await readSeatStore(sessionDir);
       assert.equal(
-        seatFromStore(store, seatId)?.brickId,
+        seatFromStore(store, seatId)?.brickId?.ref,
         BRICK_B,
         "the join must not have moved the seat's own brick_id",
       );
@@ -2302,7 +2311,7 @@ test(
       // And the seat itself is UNCHANGED.
       const store = await readSeatStore(sessionDir);
       assert.equal(
-        seatFromStore(store, seatId)?.brickId,
+        seatFromStore(store, seatId)?.brickId?.ref,
         BRICK_B,
         "the refused spawn must not have touched the seat's brick_id",
       );
@@ -2354,7 +2363,7 @@ test("F2/leg 2 · explicit --brick EQUAL to the seat's own brick is accepted, wi
 
     const store = await readSeatStore(sessionDir);
     assert.equal(
-      seatFromStore(store, seatId)?.brickId,
+      seatFromStore(store, seatId)?.brickId?.ref,
       BRICK_A,
       "leg 2 must not change the seat's own brick_id",
     );
@@ -2410,7 +2419,7 @@ test("S4c · `--no-brick` against a seat that CARRIES a brick is REFUSED, same f
     assert.deepEqual(files, [], "a session record was written despite the refusal");
     const store = await readSeatStore(sessionDir);
     assert.equal(
-      seatFromStore(store, seatId)?.brickId,
+      seatFromStore(store, seatId)?.brickId?.ref,
       BRICK_B,
       "the refused spawn must not touch the seat",
     );
