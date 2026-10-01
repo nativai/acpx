@@ -1201,13 +1201,26 @@ async function printLocalSessionsList(
   printSessionsByFormat(filtered, format);
 }
 
+// L3 (brick 6572c1a9) — a positional argument here is always resolved as a
+// cwd-scoped NAME, never as a session id, so a uuid passed positionally never
+// matches and lands exactly here. A bare "No named session" message reads as
+// an ordinary not-found and gives no actionable next step, which is how a
+// close that closed nothing got mistaken for one that succeeded. When the
+// given value has uuid shape, name the actual way to target by id.
+const SESSION_NAME_LOOKS_LIKE_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function missingScopedSessionMessage(
   agent: ResolvedAgentInvocation,
   sessionName: string | undefined,
 ): string {
-  return sessionName
-    ? `No named session "${sessionName}" for cwd ${agent.cwd} and agent ${agent.agentName}`
-    : `No cwd session for ${agent.cwd} and agent ${agent.agentName}`;
+  if (sessionName === undefined) {
+    return `No cwd session for ${agent.cwd} and agent ${agent.agentName}`;
+  }
+  const base = `No named session "${sessionName}" for cwd ${agent.cwd} and agent ${agent.agentName}`;
+  return SESSION_NAME_LOOKS_LIKE_UUID_RE.test(sessionName)
+    ? `${base} — "${sessionName}" looks like a session id; pass it with --session-id instead of positionally`
+    : base;
 }
 
 async function findScopedSessionOrThrow(
@@ -2928,26 +2941,14 @@ export async function handleSessionsNew(
   // it, here or anywhere, would trade a silent no-op for a latency regression on
   // every first create (C4 §7.1).
   warmCatalogueInBackground();
-  const [{ createSession, closeSession }, { printCreatedSessionBanner, printNewSessionByFormat }] =
+  const [{ createSession }, { printCreatedSessionBanner, printNewSessionByFormat }] =
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
 
-  const replaced = await findSession({
-    agentCommand: effectiveAgent.agentCommand,
-    agentName: effectiveAgent.agentName,
-    cwd: effectiveAgent.cwd,
-    name: flags.name,
-  });
-
-  if (replaced) {
-    // Deliberately takes the DEFAULT drain: every close entry point goes through
-    // the barrier, so it cannot be bypassed by an alternate route (DESIGN §6,
-    // and the precondition a future auto-close policy inherits).
-    await closeSession(replaced.acpxRecordId);
-    if (globalFlags.verbose) {
-      process.stderr.write(`[acpx] soft-closed prior session: ${replaced.acpxRecordId}\n`);
-    }
-  }
-
+  // L3 (brick 4e58b35c, Daniel: "a bad idea from in the first place") — `sessions
+  // new` used to silently CLOSE whatever session already occupied this (cwd,
+  // name) slot before creating the new one. Deleted outright: a name collision
+  // is not a condition `sessions new` reacts to at all, so the prior occupant
+  // (which can be another agent's live session on a shared box) is left alone.
   const created = await createSession(
     buildSessionStartOptions({
       agent: effectiveAgent,
@@ -2974,7 +2975,11 @@ export async function handleSessionsNew(
     process.stderr.write(`[acpx] created ${scope}: ${created.acpxRecordId}\n`);
   }
 
-  printNewSessionByFormat(created, replaced, globalFlags.format);
+  // No occupant is ever evicted any more, so there is nothing to report as
+  // replaced — printNewSessionByFormat's `replaced` param always reads
+  // undefined here, which also means `replacedSessionId` never appears in the
+  // JSON result shape.
+  printNewSessionByFormat(created, undefined, globalFlags.format);
 }
 
 export async function handleSessionsCopy(
