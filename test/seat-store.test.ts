@@ -82,7 +82,9 @@ test("a fully-populated seat round-trips through disk with all eight fields inta
       nextOrdinal: 5,
       closedAt: "2026-09-28T01:00:00.000Z",
       name: "the seat's label",
-      brickId: "b64dfbb3-e6df-4805-aef3-90951d937fb9",
+      // Brick `9984c510`: TYPE change on the existing slot, not a ninth
+      // field — `validated: true` exercises BOTH keys the sibling writes.
+      brickId: { ref: "b64dfbb3-e6df-4805-aef3-90951d937fb9", validated: true },
       favorite: true,
     });
     await withSeatStoreWrite(dir, () => ({
@@ -100,10 +102,22 @@ test("a fully-populated seat round-trips through disk with all eight fields inta
     // …and the ON-DISK SPELLING is snake_case, per the ratified item 4. If this
     // drifts to camelCase, every other reader of the store breaks at runtime
     // while every test that compares parsed objects stays green.
+    //
+    // NINE on-disk keys, not eight — brick `9984c510` adds `brick_id_validated`
+    // as a SIBLING persisted key for the existing `brickId` slot, same shape as
+    // the existing `name`/`brick_id` omit-when-absent pair, one key over. The
+    // CLOSED-AT-EIGHT row above is untouched: it pins the in-MEMORY
+    // `SeatRecord` field COUNT, and this brick changed `brickId`'s TYPE, not
+    // the field set — this list is the PERSISTED spelling, which was always a
+    // free-to-grow projection of that fixed set (`favorite` alone already
+    // persists as one key per in-memory field, so a new in-memory field here
+    // would have added one; what's different this time is a type carrying TWO
+    // on-disk keys for ONE in-memory field).
     const raw = await readRaw(dir);
     assert.deepEqual(Object.keys(raw[full.seatId]).toSorted(), [
       "active_holder_id",
       "brick_id",
+      "brick_id_validated",
       "closed_at",
       "created_at",
       "favorite",
@@ -206,7 +220,11 @@ test("a PRESENT but wrong-typed favorite still makes the row malformed (D8 stric
 
 test("migrateSeatFavorite flips favorite and touches NOTHING else on the row", async () => {
   await withTempDir("acpx-seat-store-", async (dir) => {
-    const row = seat({ favorite: false, name: "untouched", brickId: "untouched-brick" });
+    const row = seat({
+      favorite: false,
+      name: "untouched",
+      brickId: { ref: "untouched-brick", validated: false },
+    });
     await withSeatStoreWrite(dir, () => ({
       mutation: { kind: "write", seats: new Map([[row.seatId, row]]) },
       result: undefined,
@@ -277,6 +295,9 @@ test("an unset `name`/`brick_id` is OMITTED on disk, not written as null", async
     const keys = Object.keys(raw[bare.seatId]);
     assert.ok(!keys.includes("name"), "an unset name was written as a value");
     assert.ok(!keys.includes("brick_id"));
+    // Brick `9984c510`: the sibling travels WITH the ref, never independently
+    // of it — an absent `brickId` must omit BOTH on-disk keys together.
+    assert.ok(!keys.includes("brick_id_validated"));
     // But the two MEANINGFUL nulls are written, because null is a value there:
     // `active_holder_id: null` is "nobody home" and must be distinguishable from
     // a field nobody wrote.
