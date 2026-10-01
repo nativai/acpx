@@ -2646,7 +2646,7 @@ test("sessions new --brick writes record/index, injects env, stamps, and resolve
     const brickLog = path.join(homeDir, "brick.log");
     const brickPool = path.join(homeDir, "bricks");
     const agentCommand =
-      `${MOCK_AGENT_COMMAND} --operation-log ${JSON.stringify(path.join(homeDir, "codex-acp-ops.jsonl"))} ` +
+      `${MOCK_AGENT_COMMAND} --codex-acp --operation-log ${JSON.stringify(path.join(homeDir, "agent-ops.jsonl"))} ` +
       `--env-dump-file ${JSON.stringify(envDumpFile)}`;
     await fs.mkdir(path.join(brickPool, BRICK_X), { recursive: true });
     await fs.mkdir(cwd, { recursive: true });
@@ -2705,7 +2705,7 @@ test("sessions --brick degrades without brick CLI and survives context failure",
     const nodeOnlyBin = await writeNodeOnlyPathBin(homeDir);
     const brickPool = path.join(homeDir, "pool");
     const agentCommand =
-      `${MOCK_AGENT_COMMAND} --operation-log ${JSON.stringify(path.join(homeDir, "codex-acp-ops.jsonl"))} ` +
+      `${MOCK_AGENT_COMMAND} --codex-acp --operation-log ${JSON.stringify(path.join(homeDir, "agent-ops.jsonl"))} ` +
       `--env-dump-file ${JSON.stringify(envDumpFile)}`;
     await fs.mkdir(cwd, { recursive: true });
     await fs.mkdir(emptyBin, { recursive: true });
@@ -2784,7 +2784,7 @@ test("sessions --brick degrades without brick CLI and survives context failure",
     const brickLog = path.join(homeDir, "brick.log");
     const brickPool = path.join(homeDir, "pool");
     const agentCommand =
-      `${MOCK_AGENT_COMMAND} --operation-log ${JSON.stringify(path.join(homeDir, "codex-acp-ops.jsonl"))} ` +
+      `${MOCK_AGENT_COMMAND} --codex-acp --operation-log ${JSON.stringify(path.join(homeDir, "agent-ops.jsonl"))} ` +
       `--env-dump-file ${JSON.stringify(envDumpFile)}`;
     await fs.mkdir(path.join(brickPool, BRICK_X), { recursive: true });
     await fs.mkdir(cwd, { recursive: true });
@@ -2836,7 +2836,7 @@ test("sessions new --brick rejects unresolved refs before persistence", async ()
     await fs.mkdir(emptyBin, { recursive: true });
     await writeCodexAgentConfig(
       homeDir,
-      `${MOCK_AGENT_COMMAND} --operation-log ${JSON.stringify(path.join(homeDir, "codex-acp-ops.jsonl"))}`,
+      `${MOCK_AGENT_COMMAND} --codex-acp --operation-log ${JSON.stringify(path.join(homeDir, "agent-ops.jsonl"))}`,
     );
 
     const unknown = await runCli(
@@ -2896,7 +2896,7 @@ test("sessions new inherits parent brick and --no-brick blocks inheritance", asy
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     const brickLog = path.join(homeDir, "brick.log");
-    const agentCommand = `${MOCK_AGENT_COMMAND} --operation-log ${JSON.stringify(path.join(homeDir, "codex-acp-ops.jsonl"))}`;
+    const agentCommand = `${MOCK_AGENT_COMMAND} --codex-acp --operation-log ${JSON.stringify(path.join(homeDir, "agent-ops.jsonl"))}`;
     await fs.mkdir(cwd, { recursive: true });
     await writeCodexAgentConfig(homeDir, agentCommand);
     await writeSessionRecord(homeDir, {
@@ -2996,7 +2996,7 @@ test("sessions copy never steals source brick but does inherit the spawn parent'
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     const brickLog = path.join(homeDir, "brick.log");
-    const agentCommand = `${MOCK_AGENT_COMMAND} --operation-log ${JSON.stringify(path.join(homeDir, "codex-acp-ops.jsonl"))} --supports-fork-session`;
+    const agentCommand = `${MOCK_AGENT_COMMAND} --codex-acp --operation-log ${JSON.stringify(path.join(homeDir, "agent-ops.jsonl"))} --supports-fork-session`;
     await fs.mkdir(cwd, { recursive: true });
     await writeCodexAgentConfig(homeDir, agentCommand);
 
@@ -3050,7 +3050,7 @@ test("sessions copy never steals source brick but does inherit the spawn parent'
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     const brickLog = path.join(homeDir, "brick.log");
-    const agentCommand = `${MOCK_AGENT_COMMAND} --operation-log ${JSON.stringify(path.join(homeDir, "codex-acp-ops.jsonl"))} --supports-fork-session`;
+    const agentCommand = `${MOCK_AGENT_COMMAND} --codex-acp --operation-log ${JSON.stringify(path.join(homeDir, "agent-ops.jsonl"))} --supports-fork-session`;
     await fs.mkdir(cwd, { recursive: true });
     await writeCodexAgentConfig(homeDir, agentCommand);
 
@@ -3119,7 +3119,7 @@ test("sessions ensure --brick stamps create and reuse paths and can re-point the
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     const brickLog = path.join(homeDir, "brick.log");
-    const agentCommand = `${MOCK_AGENT_COMMAND} --operation-log ${JSON.stringify(path.join(homeDir, "codex-acp-ops.jsonl"))}`;
+    const agentCommand = `${MOCK_AGENT_COMMAND} --codex-acp --operation-log ${JSON.stringify(path.join(homeDir, "agent-ops.jsonl"))}`;
     await fs.mkdir(cwd, { recursive: true });
     await writeCodexAgentConfig(homeDir, agentCommand);
     const env = {
@@ -3174,9 +3174,9 @@ test("sessions ensure --brick stamps create and reuse paths and can re-point the
 test("sessions new --from-template --brick preserves template metadata, context, stamp, and auto-prompt", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
-    const operationLog = path.join(homeDir, "codex-acp-ops.jsonl");
+    const operationLog = path.join(homeDir, "agent-ops.jsonl");
     const brickLog = path.join(homeDir, "brick.log");
-    const agentCommand = `${MOCK_AGENT_COMMAND} --operation-log ${JSON.stringify(operationLog)} --supports-fork-session`;
+    const agentCommand = `${MOCK_AGENT_COMMAND} --codex-acp --operation-log ${JSON.stringify(operationLog)} --supports-fork-session`;
     await fs.mkdir(cwd, { recursive: true });
     await writeCodexAgentConfig(homeDir, agentCommand);
 
@@ -3273,7 +3273,7 @@ test("raw metadata brick is record-driven for stamp/context; set-metadata valida
     const brickLog = path.join(homeDir, "brick.log");
     const envDumpFile = path.join(homeDir, "adapter-env.json");
     const agentCommand =
-      `${MOCK_AGENT_COMMAND} --operation-log ${JSON.stringify(path.join(homeDir, "codex-acp-ops.jsonl"))} ` +
+      `${MOCK_AGENT_COMMAND} --codex-acp --operation-log ${JSON.stringify(path.join(homeDir, "agent-ops.jsonl"))} ` +
       `--env-dump-file ${JSON.stringify(envDumpFile)}`;
     await fs.mkdir(cwd, { recursive: true });
     await writeCodexAgentConfig(homeDir, agentCommand);
@@ -3393,7 +3393,7 @@ test("external brick metadata and an unknown legacy key survive owner turn-end, 
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     const taskDir = path.join(homeDir, "task");
-    const operationLog = path.join(homeDir, "codex-acp-ops.jsonl");
+    const operationLog = path.join(homeDir, "agent-ops.jsonl");
     const brickLog = path.join(homeDir, "brick.log");
     const agentCommand = mockCodexCommand(operationLog);
     await fs.mkdir(cwd, { recursive: true });
@@ -3563,7 +3563,7 @@ test("a legacy task_folder reaches neither the agent env nor the agent folder", 
     const brickPool = path.join(homeDir, "pool");
     const taskDir = path.join(homeDir, "taskdir");
     const agentCommand =
-      `${MOCK_AGENT_COMMAND} --operation-log ${JSON.stringify(path.join(homeDir, "codex-acp-ops.jsonl"))} ` +
+      `${MOCK_AGENT_COMMAND} --codex-acp --operation-log ${JSON.stringify(path.join(homeDir, "agent-ops.jsonl"))} ` +
       `--env-dump-file ${JSON.stringify(envDumpFile)}`;
     await fs.mkdir(path.join(brickPool, BRICK_X), { recursive: true });
     await fs.mkdir(taskDir, { recursive: true });
@@ -3636,7 +3636,7 @@ test("stale brick env is deleted when a session has no brick", async () => {
     const cwd = path.join(homeDir, "workspace");
     const envDumpFile = path.join(homeDir, "adapter-env.json");
     const agentCommand =
-      `${MOCK_AGENT_COMMAND} --operation-log ${JSON.stringify(path.join(homeDir, "codex-acp-ops.jsonl"))} ` +
+      `${MOCK_AGENT_COMMAND} --codex-acp --operation-log ${JSON.stringify(path.join(homeDir, "agent-ops.jsonl"))} ` +
       `--env-dump-file ${JSON.stringify(envDumpFile)}`;
     await fs.mkdir(cwd, { recursive: true });
     await writeCodexAgentConfig(homeDir, agentCommand);
@@ -3667,7 +3667,7 @@ test("empty raw brick metadata blocks inheritance, env injection, stamp, and con
     const envDumpFile = path.join(homeDir, "adapter-env.json");
     const brickLog = path.join(homeDir, "brick.log");
     const agentCommand =
-      `${MOCK_AGENT_COMMAND} --operation-log ${JSON.stringify(path.join(homeDir, "codex-acp-ops.jsonl"))} ` +
+      `${MOCK_AGENT_COMMAND} --codex-acp --operation-log ${JSON.stringify(path.join(homeDir, "agent-ops.jsonl"))} ` +
       `--env-dump-file ${JSON.stringify(envDumpFile)}`;
     await fs.mkdir(cwd, { recursive: true });
     await writeCodexAgentConfig(homeDir, agentCommand);
@@ -7502,6 +7502,13 @@ async function readJsonlIfExists<T>(file: string): Promise<T[]> {
 function mockCodexCommand(operationLog: string, extraArgs = ""): string {
   const args = [
     MOCK_AGENT_COMMAND,
+    // brick://5a7cf1f0 — DECLARES the session Codex-classified, the way
+    // GUARD_CLAUDE_COMMAND's `--claude-agent-acp` declares claude. This helper is
+    // named `mockCodexCommand`, and until now the only thing that actually made it
+    // Codex was that its log file happened to be called `codex-acp-ops.jsonl` —
+    // the detector matched the token as a substring of a FILENAME. The log is now
+    // `agent-ops.jsonl` and the classification is stated outright.
+    "--codex-acp",
     "--advertise-models",
     "--operation-log",
     JSON.stringify(operationLog),

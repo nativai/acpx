@@ -581,6 +581,21 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    // brick://5a7cf1f0 — DECLARATION ONLY, deliberately with no behavioural effect.
+    //
+    // The sibling `--claude-agent-acp` above switches the mock into SDK-adapter
+    // behaviour. This one switches nothing: its whole job is to make acpx's
+    // `isCodexAcpCommand` classify the session, the way `--claude-agent-acp` does
+    // for claude. Rows that need a Codex-classified session used to get one by
+    // ACCIDENT — they passed `--operation-log …/codex-acp-ops.jsonl`, and the
+    // detector matched the token as a substring of a LOG FILENAME. Now that the
+    // detector matches a path segment (or an adapter-named flag), those rows say
+    // what they mean instead. Accepted and ignored here because the mock's generic
+    // behaviour is exactly what they were getting before.
+    if (token === "--codex-acp") {
+      continue;
+    }
+
     if (token === "--expect-fork-meta-json") {
       const rawValue = parseOptionValue(argv, index + 1, token);
       expectedForkMeta = JSON.parse(rawValue) as unknown;

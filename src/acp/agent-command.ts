@@ -7,6 +7,7 @@ import {
   resolveWindowsCommand,
 } from "../spawn-command-options.js";
 import { type AcpClientOptions } from "../types.js";
+import { commandCarriesAdapterToken } from "./adapter-token.js";
 import { basenameToken, splitCommandLine } from "./client-process.js";
 import { isCodexAcpCommand } from "./codex-compat.js";
 
@@ -63,12 +64,19 @@ export function isGeminiAcpCommand(command: string, args: readonly string[]): bo
   );
 }
 
+/**
+ * brick://5a7cf1f0 — SEGMENT match, not substring; same defect class as
+ * `isCodexAcpCommand`, fixed with the same helper. Rationale in
+ * `adapter-token.ts`.
+ *
+ * Safe for the claude shape by measurement, not by assumption: `Projects/acpx/
+ * PROJECT.md` records that EVERY real claude record is a
+ * `…/claude-agent-acp/…/index.js` path (measured across all 2,924 records), so the
+ * token is always its own directory segment. Verified again on this box's live
+ * store before the change landed — no record's classification moved.
+ */
 export function isClaudeAcpCommand(command: string, args: readonly string[]): boolean {
-  const commandToken = basenameToken(command);
-  if (commandToken === "claude-agent-acp") {
-    return true;
-  }
-  return args.some((arg) => arg.includes("claude-agent-acp"));
+  return commandCarriesAdapterToken(command, args, "claude-agent-acp");
 }
 
 // String-level variant of isClaudeAcpCommand for callers that hold the unsplit
