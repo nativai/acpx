@@ -907,11 +907,27 @@ function buildSessionStartOptions(params: {
     // conflate and mean opposite things — `parentSeatId` records WHO SPAWNED ME,
     // `seatId` records WHICH SEAT I HOLD.
     seatId: params.flags.seat,
+    // F2 (brick 3dff714d) / DECISIONS.md AMENDMENT — computed exactly as
+    // before for BOTH fresh-mint and join: `withInheritedBrick` still mixes in
+    // the spawner's ambient `parent?.brick` here. That is deliberate, not the
+    // bug: on a join into a BRICK-LESS seat (the dominant legacy population,
+    // per F1) absence means UNKNOWN, not "none", and the ambient fallback is
+    // "today's behaviour, preserved" (truth-table row 7). On a join into a
+    // seat that DOES carry a brick, this computed value is OVERRIDDEN in
+    // `createSessionRecordWithClient` (`resolveJoinedSeatBrickMetadata`),
+    // which has the seat row in hand — this function has no I/O and cannot
+    // read it, so it cannot make that distinction itself.
     metadata: withInheritedBrick(
       applyBrickFlag(params.flags.metadata, params.resolvedBrick),
       params.parent?.brick,
       params.resolvedBrick === false,
     ),
+    // The RAW flag, never mixed with inheritance — `resolveJoinedSeatBrickMetadata`
+    // needs to tell "the operator explicitly said X" apart from "nothing was
+    // said and this is ambient", which the mixed `metadata.brick` above cannot
+    // do once inheritance has been applied. `string` = explicit `--brick`,
+    // `false` = explicit `--no-brick`, `undefined` = neither flag given.
+    explicitBrickFlag: params.resolvedBrick,
     mcpServers: params.config.mcpServers,
     permissionMode: params.permissionMode,
     nonInteractivePermissions: params.globalFlags.nonInteractivePermissions,

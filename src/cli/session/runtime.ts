@@ -2578,6 +2578,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
                         holderId: childRecord.acpxRecordId,
                         name: childRecord.name,
                         createdAt: spawnedAt,
+                        // F1 fix (brick 3dff714d) — same consistency rule as the
+                        // other two mint call sites: the seat's brick_id is
+                        // whatever the minting holder's own record carries.
+                        brickId: childRecord.metadata?.brick?.trim() || undefined,
                       });
                 if (!mintedChildRow.minted) {
                   // 🛑 BOTH LEGS HERE TOO (F8). A bare `process.stderr.write` stood here and

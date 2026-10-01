@@ -1784,3 +1784,100 @@ test("L19: a record with NO index entry gets a CORRECT entry in one --apply, and
     );
   });
 });
+
+// ─── item (d), brick 3dff714d — ADDITIVE ONLY: these two rows are the ONLY
+// change this brick makes to this file. `seats backfill` is a THIRD site of
+// F1's pattern (`planSeatRow` wrote `brickId: undefined` unconditionally,
+// same comment `mintSeatRow` carried before its own fix, and pre-existing —
+// not introduced by this brick's edits). Left unfixed, (a) only starts seats
+// from now on and C4 stays false for every pre-existing seat, the DOMINANT
+// population per F1. No existing row above is touched. ───────────────────
+
+const BRICK_A = "1a5845c3-a832-4370-b564-8ec5286bff79";
+const BRICK_B = "1d459def-bbfd-44b6-8e14-9ad998f292d6";
+
+test("BRK1: a FRESHLY-MINTED seat's brick_id comes from the ACTIVE holder — the disagreeing fixture", async () => {
+  // 🛑 THE DISAGREEMENT IS THE POINT, same discipline as FAV1 — AND THE TWO
+  // DISAGREEING AXES (active-vs-retired, ordinal) MUST POINT OPPOSITE WAYS, or
+  // the row cannot tell "the active holder wins" from "the highest ordinal
+  // wins" apart (TE finding, brick 3dff714d): an earlier version of this
+  // fixture put the active holder at the HIGHER ordinal too, so both
+  // hypotheses predicted the same answer and the row split only "any
+  // holder's brick wins" (the favorite-style rule), never the one it is
+  // named for. Here the ACTIVE holder is the LOWER ordinal (1) and carries
+  // B; the RETIRED holder is the HIGHER ordinal (2) and carries the stale A.
+  // `activeHolderFor` only ever considers OPEN members, so it never reaches
+  // h2 at all — a "highest ordinal overall" rule (wrongly including closed
+  // members) would instead resurrect h2's stale A.
+  await withTempHome(async (homeDir) => {
+    const seatId = "b4b4b4b4-1111-4111-8111-111111111111";
+    await seed(homeDir, [
+      makeRecord({
+        acpxRecordId: "brk1-h1",
+        seatId,
+        holderOrdinal: 1,
+        holderActive: true,
+        metadata: { brick: BRICK_B },
+      }),
+      makeRecord({
+        acpxRecordId: "brk1-h2",
+        seatId,
+        holderOrdinal: 2,
+        holderActive: false,
+        closed: true,
+        metadata: { brick: BRICK_A },
+      }),
+    ]);
+
+    const report = await backfill(homeDir, ["--apply"]);
+    assert.equal(report.seats, 1);
+
+    const row = (await readSeatStore(sessionsDir(homeDir))).seats.get(seatId);
+    assert.equal(
+      row?.brickId,
+      BRICK_B,
+      "the ACTIVE holder's brick must win, not the RETIRED holder's HIGHER ordinal — brick_id " +
+        "derives like name (the active-holder representative), never like favorite's some(), " +
+        "and never by raw ordinal over all members",
+    );
+    assert.equal(row?.activeHolderId, "brk1-h1", "fixture sanity: h1 is the active holder");
+  });
+});
+
+test("BRK2: an EXISTING seat row that already carries a brick_id is LEFT UNCHANGED by a backfill run", async () => {
+  // Preserves the measured invariant at the base: `backfillSeatRow` never
+  // recomputes an existing row — it mints an ABSENT one and leaves a PRESENT
+  // one alone (`SEAT_STORE_NO_CHANGE`). A seat whose row already has a brick
+  // must not be disturbed even when its holder disagrees with it.
+  await withTempHome(async (homeDir) => {
+    const seatId = "b4b4b4b4-2222-4222-8222-222222222222";
+    await seed(homeDir, [
+      makeRecord({
+        acpxRecordId: "brk2-h1",
+        seatId,
+        holderOrdinal: 1,
+        metadata: { brick: BRICK_B },
+      }),
+    ]);
+    await backfillSeatRow(sessionsDir(homeDir), {
+      seatId,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      activeHolderId: "brk2-h1",
+      nextOrdinal: 2,
+      closedAt: null,
+      name: undefined,
+      brickId: BRICK_A,
+      favorite: false,
+    });
+
+    const report = await backfill(homeDir, ["--apply"]);
+    assert.equal(report.seats, 0, "the row already existed — this run mints nothing");
+
+    const row = (await readSeatStore(sessionsDir(homeDir))).seats.get(seatId);
+    assert.equal(
+      row?.brickId,
+      BRICK_A,
+      "an existing row's brick_id must not be overwritten by a holder that disagrees with it",
+    );
+  });
+});

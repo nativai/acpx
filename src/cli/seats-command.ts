@@ -134,11 +134,21 @@ import { BRICK_UUID_RE } from "./session/brick-link.js";
  * indistinguishable on the row from one never closed (accepted deliberately —
  * Daniel asked for symmetry, not an audit trail).
  *
+ * ## `set-brick --unset` — F3 fix, brick `3dff714d`, DECISIONS.md (c)
+ *
+ * **No longer true as of this fix: "once set, brick_id cannot be cleared by any
+ * verb in B2b."** F1/(a) of the same brick makes `sessions new --brick` write the
+ * seat's `brick_id` at MINT time, so after that fix every fresh seat carries one —
+ * "unclearable" stopped being an edge case the moment it became universal. The
+ * code comment `server/seatMutations.ts:259` that documented the gap (*"No
+ * `--unset` exists … so the detach path must never call this"*) was an
+ * implementation constraint recorded as such, not a design argument for
+ * write-once; this verb is the fix, and wiring acpx-ui's `brick detach` to call
+ * it is this lane's own follow-up, tracked separately if it does not land in the
+ * same band.
+ *
  * ## What this file deliberately does NOT do
  *
- * - **No `--unset` on `set-brick`.** No caller needs it (`brick attach` always
- *   sets), so it would ship as an untested path. Consequence: once set, `brick_id`
- *   cannot be cleared by any verb in B2b.
  * - **No short-ref resolution.** See `parseBrickIdOrThrow`.
  * - **No `--at` / timestamp argument on `close`.** The written value is always a
  *   clock read taken INSIDE the write hold — never a caller-supplied or
@@ -153,6 +163,7 @@ type SeatMutationRefusalCode =
   | "BRICK_REF_INVALID"
   | "SEAT_NAME_INVALID"
   | "SEAT_FAVORITE_FLAG_INVALID"
+  | "SEAT_BRICK_ARGS_INVALID"
   | "SEAT_ROW_MISSING"
   | "SEAT_ROW_MALFORMED"
   | "SEAT_STORE_UNWRITABLE"
@@ -386,16 +397,49 @@ async function runSeatMutation(
 
 // ─── set-brick ───────────────────────────────────────────────────────────────
 
+/**
+ * The positional `[brick]` and `--unset` are mutually exclusive, and exactly one
+ * must be given — same idiom as `parseSeatFavoriteFlag`'s `--on`/`--off`, one
+ * argument over. `undefined` back from this means "clear the field", never
+ * "nothing was requested" — that case is already refused here.
+ */
+function parseSeatBrickArgs(
+  brickRef: string | undefined,
+  unset: boolean | undefined,
+): string | undefined {
+  if (unset === true) {
+    if (brickRef !== undefined) {
+      throw new SeatMutationRefusalError(
+        "SEAT_BRICK_ARGS_INVALID",
+        `pass either a brick uuid or --unset, not both (got brick ${JSON.stringify(brickRef)} and --unset).`,
+      );
+    }
+    return undefined;
+  }
+  if (brickRef === undefined) {
+    throw new SeatMutationRefusalError(
+      "SEAT_BRICK_ARGS_INVALID",
+      "pass a brick uuid, or --unset to clear the seat's brick_id.",
+    );
+  }
+  return parseBrickIdOrThrow(brickRef);
+}
+
 async function handleSeatsSetBrick(
   seatRef: string,
-  brickRef: string,
+  brickRef: string | undefined,
+  flags: { unset?: boolean },
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const { format } = resolveGlobalFlags(command, config);
   await runSeatMutation("set-brick", format, async () => {
     const seatId = parseSeatIdOrThrow(seatRef);
-    const brickId = parseBrickIdOrThrow(brickRef);
+    // F3 fix (brick `3dff714d`, DECISIONS.md (c)) — `brickId` is `undefined` for
+    // `--unset`, a full uuid otherwise. Both legs write through the SAME spread
+    // below, so `--unset` is not a second code path that could drift from the
+    // set path's field discipline.
+    const brickId = parseSeatBrickArgs(brickRef, flags.unset);
     const sessionDir = sessionBaseDir();
     const previousBrickId = await withSeatStoreWrite(sessionDir, (store) => {
       refuseUnwritableStore(store, sessionDir);
@@ -410,9 +454,9 @@ async function handleSeatsSetBrick(
     if (
       emitJsonResult(format, {
         ok: true,
-        action: "seat_brick_set",
+        action: brickId === undefined ? "seat_brick_unset" : "seat_brick_set",
         seatId,
-        brickId,
+        brickId: brickId ?? null,
         previousBrickId: previousBrickId ?? null,
       })
     ) {
@@ -422,7 +466,7 @@ async function handleSeatsSetBrick(
       return;
     }
     process.stdout.write(
-      `seat ${seatId}: brick_id = ${brickId}` +
+      `seat ${seatId}: brick_id = ${brickId ?? "(none)"}` +
         `${previousBrickId === undefined ? "" : ` (was ${previousBrickId})`}\n`,
     );
   });
@@ -1568,9 +1612,15 @@ export function registerSeatsCommand(parent: Command, config: ResolvedAcpxConfig
 
   seatsCommand
     .command("set-brick")
-    .description("Point a seat at a brick — the write behind `brick attach`")
+    .description(
+      "Point a seat at a brick — the write behind `brick attach` — or clear it with --unset",
+    )
     .argument("<seat>", "The seat, by id (a lowercase UUID)")
-    .argument("<brick>", "The brick, by FULL uuid — short refs are rejected, never resolved")
+    .argument(
+      "[brick]",
+      "The brick, by FULL uuid — short refs are rejected, never resolved. Omit with --unset",
+    )
+    .option("--unset", "Clear the seat's brick_id instead of setting one")
     .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
     .addHelpText(
       "after",
@@ -1580,11 +1630,17 @@ A SHORT BRICK REF IS REJECTED, NOT RESOLVED.
   against a 3 s timeout — so the resolution would fail this command rather than
   the ref. \`brick attach\` already holds the full uuid.
 
-THERE IS NO --unset. Once set, \`brick_id\` is not cleared by any verb in B2b.
+PASS EXACTLY ONE OF <brick> OR --unset. Neither, or both, is refused
+  (SEAT_BRICK_ARGS_INVALID) before anything is written.
 `,
     )
-    .action(async function (this: Command, seat: string, brick: string) {
-      await handleSeatsSetBrick(seat, brick, this, config);
+    .action(async function (
+      this: Command,
+      seat: string,
+      brick: string | undefined,
+      flags: { unset?: boolean },
+    ) {
+      await handleSeatsSetBrick(seat, brick, flags, this, config);
     });
 
   seatsCommand
