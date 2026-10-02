@@ -30,6 +30,18 @@ import { deriveAgentFolders, isSafePathSegment } from "./agent-folder.js";
  *   seat, directory empty  → removed (`removedEmpty`)
  *   seat, non-empty        → carried into the C7 holder folder (`moved`)
  *
+ * ## The link — why a uuid-form dir ends as a symlink, not as nothing
+ *
+ * Claude keeps its system prompt as a transcript snapshot and codex never re-sends developer items, so a
+ * session whose primer was rendered BEFORE C7 names `agents/<session-uuid>/` as "Your workspace" for the rest
+ * of its life, while its (re-derived-every-spawn) env names the holder path. Merely moving that directory away
+ * lets the agent `mkdir -p` it again and the split is back. So for a SEATED session the uuid-form path is left
+ * as a RELATIVE symlink to `<seat8>/holders/<session8>` (relative: it resolves on every box that mounts the
+ * pool). Name-form and bare-id8 dirs get no link — no primer ever rendered them. An existing link to the right
+ * holder is `alreadyLinked` (what keeps a second `--apply` a no-op); a link to anywhere else is `other` and is
+ * never repointed. Residual: a session whose pre-C7 primer names the uuid path but which has no uuid-form dir
+ * yet gets none (nothing exists to replace) and may still create one later.
+ *
  * Zero or several records for an id8 ⇒ `unresolved` / `ambiguous`, both untouched, as is anything whose name
  * matches no form (`other`). Nothing is ever overwritten or dropped: a merge into an existing target keeps
  * a name collision as `<name>.from-<srcdir>`.
@@ -260,8 +272,45 @@ async function carryDirectory(source: string, target: string, label: string): Pr
 }
 
 type Classified =
-  | { count: "untouchedSeatless" | "unresolved" | "ambiguous" | "other" | "alreadyC7" }
+  | {
+      count:
+        | "untouchedSeatless"
+        | "unresolved"
+        | "ambiguous"
+        | "other"
+        | "alreadyC7"
+        | "alreadyLinked";
+    }
   | { action: AgentFolderMigrationAction; empty: boolean };
+
+function holderFolder(brickPath: string, session: StoredSession): string {
+  return deriveAgentFolders({ brickPath, sessionId: session.id, seatId: session.seatId })
+    .agentFolder;
+}
+
+function isSeated(session: StoredSession): boolean {
+  return session.seatId.length > 0 && isSafePathSegment(session.seatId);
+}
+
+/**
+ * A symlink at `agents/<uuid>`. Only ONE is ours — the link this migration leaves — and only when it already
+ * resolves to that session's holder folder (relative or absolute). Anything else is somebody's: reported as
+ * `other` and NEVER repointed.
+ */
+async function classifyLink(
+  entry: Dirent,
+  brickPath: string,
+  population: Population,
+): Promise<Classified> {
+  const session = UUID_RE.test(entry.name) ? population.byId.get(entry.name) : undefined;
+  if (!session || !isSeated(session)) {
+    return { count: "other" };
+  }
+  const linkPath = path.join(brickPath, "agents", entry.name);
+  const target = await fs.readlink(linkPath);
+  const resolved = path.resolve(path.dirname(linkPath), target);
+  return { count: resolved === holderFolder(brickPath, session) ? "alreadyLinked" : "other" };
+}
 
 async function classifyDirectory(
   entry: Dirent,
@@ -269,6 +318,9 @@ async function classifyDirectory(
   brickPath: string,
   population: Population,
 ): Promise<Classified> {
+  if (entry.isSymbolicLink()) {
+    return await classifyLink(entry, brickPath, population);
+  }
   if (!entry.isDirectory()) {
     return { count: "other" };
   }
@@ -278,25 +330,34 @@ async function classifyDirectory(
     return { count: resolution.kind };
   }
   const { session } = resolution;
-  if (session.seatId.length === 0 || !isSafePathSegment(session.seatId)) {
+  if (!isSeated(session)) {
     return { count: "untouchedSeatless" };
   }
-  if ((await fs.readdir(dir)).length === 0) {
-    return { action: { action: "remove-empty", brick, from: dir }, empty: true };
+  const to = holderFolder(brickPath, session);
+  // The uuid form is the ONE form a primer ever rendered (and Claude/codex keep that primer forever), so
+  // only it leaves a link behind; name-form and bare-id8 dirs are carried or removed, never linked.
+  const link = entry.name === session.id;
+  const empty = (await fs.readdir(dir)).length === 0;
+  if (empty) {
+    return {
+      action: { action: "remove-empty", brick, from: dir, ...(link ? { to, link } : {}) },
+      empty,
+    };
   }
-  const to = deriveAgentFolders({
-    brickPath,
-    sessionId: session.id,
-    seatId: session.seatId,
-  }).agentFolder;
-  return { action: { action: "move", brick, from: dir, to }, empty: false };
+  return { action: { action: "move", brick, from: dir, to, ...(link ? { link } : {}) }, empty };
 }
 
 async function executeAction(action: AgentFolderMigrationAction, label: string): Promise<void> {
-  if (action.to === undefined) {
-    await fs.rmdir(action.from);
-  } else {
+  if (action.action === "move" && action.to !== undefined) {
     await carryDirectory(action.from, action.to, label);
+  } else {
+    await fs.rmdir(action.from);
+  }
+  if (action.link === true && action.to !== undefined) {
+    // The holder folder must exist before the link points at it: a dangling link would make the agent's
+    // own `mkdir -p agents/<uuid>` fail with EEXIST.
+    await fs.mkdir(action.to, { recursive: true });
+    await fs.symlink(path.relative(path.dirname(action.from), action.to), action.from);
   }
 }
 
@@ -334,6 +395,9 @@ async function migrateBrick(
     }
     state.actions.push(classified.action);
     state.counts[classified.empty ? "removedEmpty" : "moved"] += 1;
+    if (classified.action.link === true) {
+      state.counts.linked += 1;
+    }
   }
 }
 

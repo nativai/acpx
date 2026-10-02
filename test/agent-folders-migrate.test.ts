@@ -141,6 +141,10 @@ async function contentMultiset(root: string): Promise<string[]> {
     .toSorted();
 }
 
+function byText(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 async function read(file: string): Promise<string> {
   return await fs.readFile(file, "utf8");
 }
@@ -481,8 +485,8 @@ test("the dry run REPORTS the links it would create, and creates none", async ()
     assert.equal(report.counts.linked, 2);
     const links = report.actions.filter((action) => action.link === true);
     assert.deepEqual(
-      links.map((action) => path.basename(action.from)).toSorted(),
-      [S1, S6].toSorted(),
+      links.map((action) => path.basename(action.from)).toSorted(byText),
+      [S1, S6].toSorted(byText),
     );
     const agentsA = path.join(tree.pool, BRICK_A, "agents");
     assert.equal(
@@ -522,7 +526,8 @@ test("a symlink that already points at the right holder is skipped (alreadyLinke
       assert.equal(report.counts.linked, 0);
       assert.equal(report.counts.moved, 0);
       assert.equal(report.counts.removedEmpty, 0);
-      assert.equal(report.counts.other, 1, "the foreign link is reported as other");
+      // the foreign link, plus the plain `elsewhere` directory it points at (matches no session form)
+      assert.equal(report.counts.other, 2, "the foreign link is reported as other");
       assert.deepEqual(report.actions, []);
       assert.deepEqual(await snapshot(home), before, `apply=${apply} touched a link`);
     }

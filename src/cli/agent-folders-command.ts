@@ -23,10 +23,11 @@ import { brickPoolDir } from "./session/brick-link.js";
 type MigrateFlags = { apply?: boolean; pool?: string; sessionsDir?: string };
 
 function renderAction(action: AgentFolderMigrationAction, applied: boolean): string {
+  const linked = action.link === true ? (applied ? " + linked" : " + link") : "";
   if (action.action === "move") {
-    return `  ${applied ? "moved" : "move"}  ${action.from} -> ${action.to}`;
+    return `  ${applied ? "moved" : "move"}  ${action.from} -> ${action.to}${linked}`;
   }
-  return `  ${applied ? "removed" : "remove"} (empty)  ${action.from}`;
+  return `  ${applied ? "removed" : "remove"} (empty)  ${action.from}${linked}`;
 }
 
 function renderText(report: AgentFolderMigrationReport): string {
@@ -38,7 +39,8 @@ function renderText(report: AgentFolderMigrationReport): string {
     `  sessions: ${report.sessionsDir}`,
     `  ${applied ? "moved" : "would move"} ${counts.moved} · ${applied ? "removed" : "would remove"} ${counts.removedEmpty} empty · ` +
       `untouched: seat-less ${counts.untouchedSeatless}, unresolved ${counts.unresolved}, ` +
-      `ambiguous ${counts.ambiguous}, other ${counts.other} · already seat-keyed ${counts.alreadyC7}`,
+      `ambiguous ${counts.ambiguous}, other ${counts.other} · already seat-keyed ${counts.alreadyC7} · ` +
+      `${applied ? "linked" : "would link"} ${counts.linked} (already linked ${counts.alreadyLinked})`,
     ...report.actions.map((action) => renderAction(action, applied)),
     ...report.errors.map((error) => `  ERROR  ${error.from}: ${error.message}`),
   ];
