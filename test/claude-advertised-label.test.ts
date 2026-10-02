@@ -361,3 +361,39 @@ test("<synthetic>: the backwards scan skips it and returns the last REAL assista
     assert.equal(await readLastServedModel(record), undefined);
   });
 });
+
+test("a >128 KB line AFTER the assistant entry (Claude Code's prompt_snapshot) still yields the served model", async () => {
+  // MEASURED on the deployed binary 2026-10-02: a 160,703-byte `prompt_snapshot`
+  // attachment follows the assistant entries of a short first turn, so a fixed
+  // 128 KB tail window held no assistant line and `served` was never stamped.
+  await withTempHome("acpx-served-tail-", async (home) => {
+    const record = claudeRecord({});
+    const dir = path.join(home, ".claude", "projects", transcriptCwdHash(record.cwd));
+    await fs.mkdir(dir, { recursive: true });
+    const snapshot = {
+      type: "attachment",
+      attachment: { type: "prompt_snapshot", systemPrompt: "x".repeat(160_000) },
+    };
+    const lines = [
+      { type: "user", message: { role: "user", content: "hi" } },
+      {
+        type: "assistant",
+        message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [] },
+      },
+      snapshot,
+      { type: "last-prompt" },
+    ];
+    await fs.writeFile(
+      path.join(dir, `${record.acpSessionId}.jsonl`),
+      `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`,
+    );
+    assert.equal(await readLastServedModel(record), "claude-haiku-4-5-20251001");
+
+    // Control: with NO assistant entry at all, the grown window still finds nothing.
+    await fs.writeFile(
+      path.join(dir, `${record.acpSessionId}.jsonl`),
+      `${JSON.stringify(snapshot)}\n${JSON.stringify(lines[3])}\n`,
+    );
+    assert.equal(await readLastServedModel(record), undefined);
+  });
+});
