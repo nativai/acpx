@@ -37,7 +37,7 @@ type CliRunResult = { code: number | null; stdout: string; stderr: string };
 async function runCli(
   args: string[],
   homeDir: string,
-  options: { cwd?: string } = {},
+  options: { cwd?: string; timeoutMs?: number } = {},
 ): Promise<CliRunResult> {
   return await new Promise<CliRunResult>((resolve) => {
     const env: NodeJS.ProcessEnv = { ...process.env, HOME: homeDir, ACPX_STATE_HOME: homeDir };
@@ -56,6 +56,13 @@ async function runCli(
       cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    // A hang must read as a FAILURE (code null), never as a pending test.
+    const timer =
+      options.timeoutMs === undefined
+        ? undefined
+        : setTimeout(() => {
+            child.kill("SIGKILL");
+          }, options.timeoutMs);
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8");
@@ -68,6 +75,7 @@ async function runCli(
     });
     child.stdin.end();
     child.once("close", (code) => {
+      clearTimeout(timer);
       resolve({ code, stdout, stderr });
     });
   });
@@ -474,4 +482,180 @@ test("only the listed files read `legacyName` (discovering scan, with a negative
   // …and it FLAGS an unlisted subject that was never registered anywhere (negative control).
   const withIntruder = new Map(files).set("cli/session-routing.ts", "record.legacyName");
   assert.deepEqual(unlistedLegacyNameReaders(withIntruder), ["cli/session-routing.ts"]);
+});
+
+// ───────── GUARDS KEPT ALIVE (TE retirement audit, brick 61dc1302) ─────────
+//
+// Four legs rode inside rows that asserted the deleted name behaviour and were retired with
+// them, while the behaviour itself is NOT deleted: it still holds at the tip, and nothing
+// asserted it. Re-asserted here as id-addressed rows, GREEN on both sides of this change
+// (they are not new behaviour), each pinning the TEXT and not only the exit code.
+
+test("LG1: --session-id together with --session-url is refused, text names both flags", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await workdir(homeDir, "repo");
+    const session = await newSession(homeDir, cwd);
+
+    const result = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "codex",
+        "sessions",
+        "show",
+        "--session-id",
+        session.id,
+        "--session-url",
+        `https://acpx.devbox.nativai.de/?session=${session.id}`,
+      ],
+      homeDir,
+      { cwd },
+    );
+
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /only one of --session-id or --session-url/i);
+    // Control: either flag alone resolves the same session (so the refusal is the pair's).
+    for (const selector of [
+      ["--session-id", session.id],
+      ["--session-url", `https://acpx.devbox.nativai.de/?session=${session.id}`],
+    ]) {
+      const ok = await runCli(
+        ["--cwd", cwd, "--format", "json", "codex", "sessions", "show", ...selector],
+        homeDir,
+        { cwd },
+      );
+      assert.equal(ok.code, 0, ok.stderr);
+      assert.equal(
+        (JSON.parse(ok.stdout.trim()) as { acpxRecordId?: string }).acpxRecordId,
+        session.id,
+      );
+    }
+  });
+});
+
+test("LG2: a --session-url without ?session=<id> is refused, text names the missing query parameter", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await workdir(homeDir, "repo");
+    await newSession(homeDir, cwd);
+
+    const result = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "codex",
+        "sessions",
+        "show",
+        "--session-url",
+        "https://acpx.devbox.nativai.de/",
+      ],
+      homeDir,
+      { cwd },
+    );
+
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /must include a non-empty \?session=<id>/i);
+  });
+});
+
+test("LG3: a CLOSED session stays readable BY ID — status, show, history, export", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await workdir(homeDir, "repo");
+    const session = await newSession(homeDir, cwd);
+    const closed = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "close", "--session-id", session.id],
+      homeDir,
+      { cwd },
+    );
+    assert.equal(closed.code, 0, closed.stderr);
+    assert.equal((await readRecord(homeDir, session.id)).closed, true, "precondition: closed");
+    const bytes = await recordBytes(homeDir, session.id);
+    const byId = ["--session-id", session.id];
+
+    const show = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "show", ...byId],
+      homeDir,
+      { cwd },
+    );
+    assert.equal(show.code, 0, show.stderr);
+    const shown = JSON.parse(show.stdout.trim()) as { acpxRecordId?: string; closed?: boolean };
+    assert.equal(shown.acpxRecordId, session.id);
+    assert.equal(shown.closed, true);
+
+    const status = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "status", ...byId],
+      homeDir,
+      { cwd },
+    );
+    assert.equal(status.code, 0, status.stderr);
+    const snapshot = JSON.parse(status.stdout.trim()) as { action?: string; status?: string };
+    assert.equal(snapshot.action, "status_snapshot");
+    assert.notEqual(snapshot.status, "no-session", "a closed session reads as absent by id");
+
+    const history = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "history", ...byId],
+      homeDir,
+      { cwd },
+    );
+    assert.equal(history.code, 0, history.stderr);
+    assert.equal((JSON.parse(history.stdout.trim()) as { id?: string }).id, session.id);
+
+    const archivePath = path.join(homeDir, "closed-export.json");
+    const exported = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--format",
+        "json",
+        "codex",
+        "sessions",
+        "export",
+        ...byId,
+        "--output",
+        archivePath,
+      ],
+      homeDir,
+      { cwd },
+    );
+    assert.equal(exported.code, 0, exported.stderr);
+    const archive = JSON.parse(await fs.readFile(archivePath, "utf8")) as {
+      session?: { record_id?: string };
+    };
+    assert.equal(archive.session?.record_id, session.id);
+
+    assert.equal(await recordBytes(homeDir, session.id), bytes, "a read changed the record");
+  });
+});
+
+test("LG4: `sessions new` exits even when the adapter ignores SIGTERM, and the record is stored", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await workdir(homeDir, "repo");
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        { agents: { codex: { command: `${MOCK_AGENT_COMMAND} --ignore-sigterm` } } },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    const result = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "new"],
+      homeDir,
+      { cwd, timeoutMs: 8_000 },
+    );
+
+    assert.equal(result.code, 0, `hung or failed (null = killed at 8s): ${result.stderr}`);
+    const payload = JSON.parse(result.stdout.trim()) as {
+      action?: string;
+      created?: boolean;
+      acpxRecordId?: string;
+    };
+    assert.equal(payload.action, "session_ensured");
+    assert.equal(payload.created, true);
+    assert.equal(typeof payload.acpxRecordId, "string");
+    const stored = await readRecord(homeDir, String(payload.acpxRecordId));
+    assert.equal(stored.closed, false);
+    assert.equal(stored.agent_command, `${MOCK_AGENT_COMMAND} --ignore-sigterm`);
+  });
 });
