@@ -122,10 +122,7 @@ export function runProxy(token) {
     const prepend = readInjection("prepend");
     const append = readInjection("append");
     const rawBytes = Buffer.byteLength(line, "utf8");
-    if (
-      (prepend === undefined && append === undefined) ||
-      !Array.isArray(parsed?.params?.prompt)
-    ) {
+    if ((prepend === undefined && append === undefined) || !Array.isArray(parsed?.params?.prompt)) {
       outLog.write(
         `${JSON.stringify({ t: Date.now(), promptFrame: parsed, injected: false, rawBytes })}\n`,
       );

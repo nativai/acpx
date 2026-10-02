@@ -83,7 +83,9 @@ for (let round = 0; round < ROUNDS; round++) {
 const quantile = (sorted, q) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))];
 const fmt = (value) => value.toFixed(3).padStart(8);
 
-console.log(`rounds=${ROUNDS}  interleaved A/B/A/B  node=${process.version}  host=${os.hostname()}`);
+console.log(
+  `rounds=${ROUNDS}  interleaved A/B/A/B  node=${process.version}  host=${os.hostname()}`,
+);
 console.log("arm        median      p90       min       max");
 for (const [name, values] of Object.entries(samples)) {
   const sorted = [...values].sort((a, b) => a - b);
@@ -103,7 +105,8 @@ console.log(`sh    median - inproc median = ${(med("sh") - med("inproc")).toFixe
 console.log(`node  median - inproc median = ${(med("node") - med("inproc")).toFixed(3)} ms`);
 console.log(
   `A reported delta is only a result if it exceeds the noise floor above. sh clears it by ${(
-    (med("sh") - med("inproc")) / (noiseFloor || 1e-9)
+    (med("sh") - med("inproc")) /
+    (noiseFloor || 1e-9)
   ).toFixed(0)}x, node by ${((med("node") - med("inproc")) / (noiseFloor || 1e-9)).toFixed(0)}x.`,
 );
 
