@@ -15,14 +15,11 @@ import {
   type ProvisioningWarningHandler,
 } from "../config/os-harness-provisioning.js";
 import {
-  buildClaudeHomeMap,
   findProfile,
   getValidEffortsForProfile,
   isSubscriptionProfileLocked,
   loadProfileRegistry,
-  transcriptAnchorDir,
   type ChatGptProfileEntry,
-  type ClaudeHomeProfileEntry,
   type ProfileEntry,
   type ProfileRegistry,
   type SubscriptionProfileEntry,
@@ -43,7 +40,7 @@ import type {
 } from "../config/subscriptions.js";
 import { SubscriptionLockedError } from "../errors.js";
 import type { AcpClientOptions } from "../types.js";
-import { isClaudeFamilyAgent, isClaudePtyAgentCommand } from "./agent-command.js";
+import { isClaudeFamilyAgent } from "./agent-command.js";
 import { splitCommandLine } from "./client-process.js";
 import { isCodexAcpCommand } from "./codex-compat.js";
 import { harnessIdForAgentCommand } from "./harness-capabilities.js";
@@ -74,28 +71,6 @@ export type EffectiveAccountMetadata = {
   effectiveAnchor?: string;
   effectiveResolutionMethod?: "path" | "selection";
 };
-
-/**
- * The claude-pty bridge's published session/new `_meta` selector key
- * (independent-claude-acp). This exact string is the bridge interface —
- * never introduce a second name.
- */
-export const INDEPENDENT_CLAUDE_HOME_META_KEY = "independent-claude-acp/home";
-
-/**
- * The claude-pty bridge's session/new `_meta` key carrying the parent session's
- * acpx-ui URL (lineage). The bridge reads this (parentSessionUrlFromMeta) and
- * forwards it to the claude child as ACPX_PARENT_SESSION_URL so the child can
- * message its parent back. Unlike the SDK claude adapter (which inherits the
- * parent from the spawn PROCESS env), one bridge PROCESS serves many ACP
- * sessions, so the parent must be delivered PER session — via this `_meta` —
- * not via the process env. This exact string is the bridge interface. (FW-18)
- */
-export const INDEPENDENT_CLAUDE_PARENT_SESSION_URL_META_KEY =
-  "independent-claude-acp/parent-session-url";
-
-/** The bridge's server-side HOME allow-list env (JSON {id → abs home path}). */
-export const INDEPENDENT_CLAUDE_HOME_MAP_ENV = "INDEPENDENT_CLAUDE_HOME_MAP";
 
 function toEnvToken(value: string): string {
   return value
@@ -703,7 +678,7 @@ function buildAgentEnvironment(
   // harness is told the wrong answer with no way to tell (brick://aa74cb34).
   //
   // The rule already exists elsewhere and simply never reached here:
-  // applyClaudeHomeProfileAuth and applyChatGptProfileAuth both drop
+  // applyChatGptProfileAuth drops
   // ACPX_SUBSCRIPTION for the same reason, and the non-Claude branch below
   // warns that a subscription is inert for a non-Claude agent — but that guard
   // only fires for an explicitly STORED selection, so a leak through the env
@@ -739,7 +714,7 @@ function buildAgentEnvironment(
   // defect — and it is one acpx already legislated against elsewhere and never
   // generalised here: `applyChatGptProfileAuth` deletes exactly this variable,
   // its comment reading *"the bridge strips leaked SDK env defensively, but acpx
-  // must not emit it"*, and `applyClaudeHomeProfileAuth` does the same.
+  // must not emit it"*.
   //
   // Safe to clear for the same reason as the six above — every legitimate value
   // is written after this point, `applySubscriptionConfigDir` (sync) or
@@ -748,11 +723,6 @@ function buildAgentEnvironment(
   // subscription, so default-account-binding really does bind before spawn as
   // the branch below claims; the 2 unbound are closed OpenRouter-model sessions
   // that never used a Claude account at all.
-  //
-  // It also makes claude-pty match its own documentation. The branch below says
-  // a claude-pty session gets "no CLAUDE_CONFIG_DIR" because the bridge owns
-  // auth via its HOME selector — but it never cleared the INHERITED one, so a
-  // claude-pty child of a subscription-bound parent silently received one.
   //
   // The `CLAUDE_CODE_*` family (CLAUDECODE, CLAUDE_CODE_MESSAGING_SOCKET/TOKEN,
   // CLAUDE_CODE_EXECPATH …) leaks the same way and is DELIBERATELY LEFT ALONE:
@@ -833,21 +803,18 @@ function buildAgentEnvironment(
   applyAgentTypeEnvironment(env, agentCommand);
   const baseUrl = resolveAcpxUiBaseUrl(env);
   // ⚠️ HAND THE RESOLVED VALUE DOWN — this line is why the adapters do not each own
-  // a copy of the ladder above. claude-pty-acp used to carry a byte-for-byte port of
-  // it (`parseBoxBaseUrlFromResolvConf`, same devbox literal) purely because acpx
-  // resolved the host and then did not tell the child what it had decided: with
-  // ACPX_UI_BASE_URL unset in the pod env, acpx would answer from /proc/1/environ
-  // while the bridge answered from its own guess, and the child's OWN session URL
-  // could name a different host from its parent's. The two are now one answer by
-  // construction. Writing it here also NORMALIZES a trailing-slash or padded value,
+  // a copy of the ladder above. Adapters used to carry a byte-for-byte port of it
+  // purely because acpx resolved the host and then did not tell the child what it
+  // had decided: with ACPX_UI_BASE_URL unset in the pod env, acpx would answer from
+  // /proc/1/environ while the adapter answered from its own guess, and the child's
+  // OWN session URL could name a different host from its parent's. The two are now
+  // one answer by construction. Writing it here also NORMALIZES a trailing-slash or padded value,
   // so the child sees exactly the string acpx used.
   // ⚠️ And when nothing resolved, DELETE rather than leave the inherited value: the
   // only way to reach this branch with the key still present is a blank/whitespace
   // one (a usable value is rung 1 and cannot miss), and a blank ACPX_UI_BASE_URL is
-  // worse than an absent one — the bridge's own guard reads "unset" as fatal-and-
+  // worse than an absent one — an adapter's own guard reads "unset" as fatal-and-
   // legible but would have to special-case "set to nothing".
-  // Red on removal: "adapter env carries acpx's resolved base URL (the seam
-  // claude-pty-acp consumes)" in test/claude-pty-agent.test.ts.
   if (baseUrl) {
     env.ACPX_UI_BASE_URL = baseUrl;
   } else {
@@ -901,13 +868,10 @@ function buildAgentEnvironment(
       env.ACPX_SESSION_NAME = trimmedName;
     }
   }
-  // brick://c6e3618b — ONE composition, shared with the bridge's session/new `_meta`
-  // (buildClaudeParentSessionMeta). These two paths used to differ: the bridge
-  // preferred the explicit parentSessionUrl while this one always recomposed
-  // `${baseUrl}/?session=${parentId}` against the LOCAL base, silently re-hosting a
+  // brick://c6e3618b — prefer the explicit parentSessionUrl: always recomposing
+  // `${baseUrl}/?session=${parentId}` against the LOCAL base silently re-hosts a
   // cross-box parent onto this box — a well-formed URL for a session that does not
-  // exist here, which a child then reports back into. The FW-19 comment on
-  // resolveParentSessionUrl claimed the two were "byte-identical"; they now are.
+  // exist here, which a child then reports back into.
   const parentSessionUrl = resolveParentSessionUrl(sessionContext, baseUrl);
   if (parentSessionUrl) {
     env.ACPX_PARENT_SESSION_URL = parentSessionUrl;
@@ -958,16 +922,9 @@ function buildAgentEnvironment(
   // An unbound record deliberately stays raw here: registry defaults are
   // snapshotted onto sessions by default-account-binding before spawn, not
   // late-resolved inside the env builder.
-  // For the claude-pty bridge agent, subscription configDir resolution does not
-  // apply at all: an explicit --subscription is rejected (setup-tokens would
-  // wedge interactive Claude at the login picker) and the unselected default
-  // is skipped silently (no CLAUDE_CONFIG_DIR, no "no subscription selected"
-  // banner — the bridge owns auth via its HOME selector).
   if (!sessionContext?.profileId?.trim()) {
     const subscriptionId = sessionContext?.subscriptionId?.trim();
-    if (agentCommand !== undefined && isClaudePtyAgentCommand(agentCommand)) {
-      rejectExplicitSubscriptionForClaudePty(subscriptionId);
-    } else if (agentCommand !== undefined && subscriptionId && !isClaudeFamilyAgent(agentCommand)) {
+    if (agentCommand !== undefined && subscriptionId && !isClaudeFamilyAgent(agentCommand)) {
       // CONCEPTION §5.5 / §9.1, I3 §2.4: `subscription` is a Claude-family
       // field. `CLAUDE_CONFIG_DIR` means nothing to a harness that does not read
       // it, and setting it SILENTLY is the half of this defect that is easy to
@@ -1050,20 +1007,6 @@ function findSubscriptionProfileByConfigDir(
     (entry) =>
       entry.authMode === "subscription" && normalizedFsPath(entry.credentialSource) === normalized,
   );
-}
-
-function findClaudeHomeProfileByAnchor(
-  anchor: string,
-  registry: ProfileRegistry,
-): ProfileEntry | undefined {
-  const normalized = normalizedFsPath(anchor);
-  return registry.profiles.find((entry) => {
-    if (entry.authMode !== "claude-home") {
-      return false;
-    }
-    const profileAnchor = transcriptAnchorDir(entry);
-    return profileAnchor !== null && normalizedFsPath(profileAnchor) === normalized;
-  });
 }
 
 function findChatGptProfileByCodexHome(
@@ -1171,23 +1114,6 @@ function verifySubscriptionProfileEffectiveAccount(
   stampProfileEffectiveAccount(env, expectedProfile, configDir);
 }
 
-function verifyClaudeHomeProfileEffectiveAccount(
-  env: NodeJS.ProcessEnv,
-  expectedProfile: ClaudeHomeProfileEntry,
-  registry: ProfileRegistry,
-): void {
-  const anchor = transcriptAnchorDir(expectedProfile) ?? expectedProfile.homePath;
-  const physicalProfile = findClaudeHomeProfileByAnchor(anchor, registry) ?? expectedProfile;
-  assertPhysicalAccount({
-    expectedAccount: expectedProfile.account,
-    selectionKind: "profile",
-    selectionId: expectedProfile.id,
-    physicalAccount: physicalProfile.account,
-    anchor,
-  });
-  stampProfileEffectiveAccount(env, expectedProfile, anchor);
-}
-
 function verifyChatGptProfileEffectiveAccount(
   env: NodeJS.ProcessEnv,
   expectedProfile: ChatGptProfileEntry,
@@ -1213,8 +1139,6 @@ function verifyProfileEffectiveAccount(
   switch (expectedProfile.authMode) {
     case "subscription":
       return verifySubscriptionProfileEffectiveAccount(env, expectedProfile, registry);
-    case "claude-home":
-      return verifyClaudeHomeProfileEffectiveAccount(env, expectedProfile, registry);
     case "chatgpt":
       return verifyChatGptProfileEffectiveAccount(env, expectedProfile, registry);
   }
@@ -1487,7 +1411,7 @@ export function resolveConfiguredAuthCredential(
 
 /**
  * Apply profile-based authentication to the env dict. Always returns null —
- * every remaining profile kind (subscription, claude-home, chatgpt) authenticates
+ * every remaining profile kind (subscription, chatgpt) authenticates
  * by config-dir/env wiring, not a shim. (The OpenRouter picker route starts its
  * own shim separately, via `startOpenRouterShimForSession` — untouched by this
  * function.)
@@ -1531,23 +1455,6 @@ function validateProfileReasoningEffort(
   }
 }
 
-// Fail-fast guard for v1 subscription selection on the claude-pty bridge.
-// Unselected spawns pass silently (the bridge owns auth via its HOME selector);
-// an explicit id is a configuration error worth stopping the spawn over —
-// subscription configDirs hold headless setup-tokens, which interactive Claude
-// rejects at its login picker (a wedged TUI, not a clean error).
-function rejectExplicitSubscriptionForClaudePty(subscriptionId: string | null | undefined): void {
-  const trimmed = subscriptionId?.trim();
-  if (!trimmed) {
-    return;
-  }
-  throw new Error(
-    `[acpx] subscription "${trimmed}" cannot be used with the claude-pty bridge agent: ` +
-      `subscription configDirs hold headless setup-tokens, which interactive Claude does not accept. ` +
-      `Use a claude-home profile instead (--profile <id>).`,
-  );
-}
-
 // The loud half of the `--subscription` family gate: say once, on stderr, that
 // the selection is not being applied. Never an error — a subscription id on a
 // non-Claude session is a no-op, not a configuration failure, and a throw would
@@ -1560,28 +1467,6 @@ function warnSubscriptionIgnoredForNonClaudeAgent(
     `[acpx] subscription "${subscriptionId}" is not applied for agent command "${agentCommand}": ` +
       `subscriptions select a Claude account (CLAUDE_CONFIG_DIR), which this harness does not read.\n`,
   );
-}
-
-function assertClaudePtyProfileCompatibility(params: {
-  profileId: string;
-  profile: ProfileEntry;
-  agentCommand: string;
-  claudePty: boolean;
-}): void {
-  if (params.profile.authMode === "claude-home" && !params.claudePty) {
-    throw new Error(
-      `[acpx] profile "${params.profileId}" (authMode "claude-home") requires the claude-pty bridge agent; ` +
-        `this session's agent command is "${params.agentCommand}". ` +
-        `Create the session with the claude-pty agent to use this profile.`,
-    );
-  }
-  if (params.profile.authMode !== "claude-home" && params.claudePty) {
-    throw new Error(
-      `[acpx] profile "${params.profileId}" (authMode "${params.profile.authMode}") cannot be used with the ` +
-        `claude-pty bridge agent: its credentials are not an interactive Claude login ` +
-        `(interactive Claude would wedge at the login picker). Use a claude-home profile.`,
-    );
-  }
 }
 
 function assertCodexProfileCompatibility(params: {
@@ -1606,11 +1491,9 @@ function assertCodexProfileCompatibility(params: {
 
 // Both-directions profile↔agent compatibility gate, evaluated on EVERY spawn
 // (create / recover / keepwarm — applyProfileAuth is on the single resolution
-// path). claude-home profiles only work on the claude-pty bridge (interactive
-// HOME logins); every other authMode must stay off the bridge (their
-// credentials are not an interactive Claude login). Skipped when the caller
-// cannot supply the agent command (no silent false negatives — every
-// production spawn path passes it).
+// path). A chatgpt profile only works on the codex adapter, and no other authMode
+// may drive it. Skipped when the caller cannot supply the agent command (no
+// silent false negatives — every production spawn path passes it).
 function validateProfileAgentCompatibility(
   profileId: string,
   profile: ProfileEntry,
@@ -1620,25 +1503,8 @@ function validateProfileAgentCompatibility(
     return;
   }
   const split = splitCommandLine(agentCommand);
-  const claudePty = isClaudePtyAgentCommand(agentCommand);
   const codex = isCodexAcpCommand(split.command, split.args);
-  assertClaudePtyProfileCompatibility({ profileId, profile, agentCommand, claudePty });
   assertCodexProfileCompatibility({ profileId, profile, agentCommand, codex });
-}
-
-// claude-home branch of applyProfileAuth: the bridge owns auth via its HOME
-// selector. Inject the full allow-list map (ALL claude-home profiles in the
-// registry) so the bridge's unknown-selector diagnostics stay meaningful; the
-// per-session selection travels as session/new _meta (buildClaudeHomeSelectorMeta),
-// never as env. No CLAUDE_CONFIG_DIR: subscription configDir resolution does
-// not apply to interactive-home credentials (the bridge strips leaked SDK env
-// defensively, but acpx must not emit it). ACPX_SUBSCRIPTION is re-stamped
-// later as the unified selection id for child-spawn compatibility. The map
-// holds paths only, never credential contents.
-function applyClaudeHomeProfileAuth(env: NodeJS.ProcessEnv, registry: ProfileRegistry): void {
-  env[INDEPENDENT_CLAUDE_HOME_MAP_ENV] = JSON.stringify(buildClaudeHomeMap(registry));
-  delete env.CLAUDE_CONFIG_DIR;
-  delete env.ACPX_SUBSCRIPTION;
 }
 
 function applyChatGptProfileAuth(env: NodeJS.ProcessEnv, profile: ProfileEntry): void {
@@ -1648,31 +1514,6 @@ function applyChatGptProfileAuth(env: NodeJS.ProcessEnv, profile: ProfileEntry):
   env.CODEX_HOME = profile.codexHome;
   delete env.CLAUDE_CONFIG_DIR;
   delete env.ACPX_SUBSCRIPTION;
-  delete env[INDEPENDENT_CLAUDE_HOME_MAP_ENV];
-}
-
-/**
- * The `_meta` fragment selecting the bridge HOME for a claude-home profile
- * session: { "independent-claude-acp/home": <profile id> }. Undefined for
- * non-claude-home (or unknown) profiles. Re-resolved from the registry on
- * every call, so each spawn stays record-driven (restart safety): a missing
- * selector would NOT error bridge-side — it silently falls back to the box
- * default HOME (wrong credentials) — so callers attach this on every
- * session/new (and session/load, for when the bridge advertises loadSession).
- */
-export function buildClaudeHomeSelectorMeta(
-  profileId: string | null | undefined,
-  lookupOptions?: SubscriptionLookupOptions,
-): Record<string, unknown> | undefined {
-  const trimmed = profileId?.trim();
-  if (!trimmed) {
-    return undefined;
-  }
-  const profile = findProfile(trimmed, loadProfileRegistry(lookupOptions));
-  if (profile?.authMode !== "claude-home") {
-    return undefined;
-  }
-  return { [INDEPENDENT_CLAUDE_HOME_META_KEY]: trimmed };
 }
 
 /**
@@ -1688,10 +1529,8 @@ export function buildClaudeHomeSelectorMeta(
  * believing it reported upward. That was brick://c6e3618b. `test/parent-session-url
  * .test.ts` goes red if the preference is removed.
  *
- * Used by BOTH spawn paths, which is the point: the SDK claude adapter inherits its
- * parent from the process env (ACPX_PARENT_SESSION_URL via buildAgentEnvironment),
- * while the claude-pty bridge serves many ACP sessions per process and must learn
- * each session's parent per-`session/new` via `_meta`. They previously disagreed.
+ * The SDK claude adapter inherits its parent from the process env
+ * (ACPX_PARENT_SESSION_URL via buildAgentEnvironment).
  */
 function resolveParentSessionUrl(
   sessionContext: AgentSessionContext | undefined,
@@ -1709,22 +1548,6 @@ function resolveParentSessionUrl(
     return undefined;
   }
   return `${baseUrl}/?session=${parentId}`;
-}
-
-/**
- * The bridge-only `_meta` fragment carrying the parent session URL. Returns
- * undefined when there is no parent or the agent is not the bridge (the namespaced
- * key is harmless to other adapters, but gating keeps the contract explicit).
- */
-export function buildClaudeParentSessionMeta(
-  sessionContext: AgentSessionContext | undefined,
-  agentCommand: string | undefined,
-): Record<string, unknown> | undefined {
-  if (agentCommand === undefined || !isClaudePtyAgentCommand(agentCommand)) {
-    return undefined;
-  }
-  const url = resolveParentSessionUrl(sessionContext, resolveAcpxUiBaseUrl(process.env));
-  return url ? { [INDEPENDENT_CLAUDE_PARENT_SESSION_URL_META_KEY]: url } : undefined;
 }
 
 /**
@@ -1970,18 +1793,6 @@ export async function applyProfileAuth(
   validateProfileReasoningEffort(trimmedId, profile, reasoningEffortOverride);
   if (isSubscriptionProfileLocked(profile, registry)) {
     throw new SubscriptionLockedError(trimmedId);
-  }
-
-  if (profile.authMode === "claude-home") {
-    applyClaudeHomeProfileAuth(env, registry);
-    verifyProfileEffectiveAccount(env, profile, registry);
-    ensureProfileOsHarnessProvisioning({
-      registry,
-      profile,
-      env,
-      onWarning: onProvisioningWarning,
-    });
-    return null;
   }
 
   if (profile.authMode === "subscription") {

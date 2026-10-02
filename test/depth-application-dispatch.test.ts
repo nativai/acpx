@@ -156,8 +156,8 @@ test("an advertised effort takes the config-option arm and applies", async () =>
   assert.deepEqual(c.modeCalls, [], "the config-option arm must not touch the mode wire");
 });
 
-test("GUARDRAIL: claude and claude-pty take the UNCHANGED generic path", async () => {
-  for (const id of ["claude", "claude-pty"] as const) {
+test("GUARDRAIL: claude takes the UNCHANGED generic path", async () => {
+  for (const id of ["claude"] as const) {
     const c = client();
     const record = recordFor(AGENT_REGISTRY[id]);
     await persistAndApplyRequestedEffort({
@@ -201,7 +201,7 @@ test("GUARDRAIL: codex depth is a no-op and acpx adds no bracket parsing", async
 });
 
 test("no depth requested -> nothing happens anywhere, on every harness", async () => {
-  for (const id of ["claude", "claude-pty", "codex", "pi"] as const) {
+  for (const id of ["claude", "codex", "pi"] as const) {
     const c = client();
     const record = recordFor(AGENT_REGISTRY[id]);
     const before = JSON.stringify(record);
@@ -270,9 +270,9 @@ test("B3-04: a level the model does not support is recorded, not silently normal
 });
 
 test("B3-04 GUARDRAIL: the Claude family still records NOTHING on the success arm", async () => {
-  // The new recording must not give claude/claude-pty a field they never had —
+  // The new recording must not give claude a field they never had —
   // their `served` block belongs to the transcript producer.
-  for (const id of ["claude", "claude-pty"] as const) {
+  for (const id of ["claude"] as const) {
     const c = client();
     const record = recordFor(AGENT_REGISTRY[id]);
     await persistAndApplyRequestedEffort({

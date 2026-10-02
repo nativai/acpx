@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import type { SessionNotification } from "@agentclientprotocol/sdk";
-import { resolveClaudeForkResumeAt, resolvePtyForkMeta } from "../src/acp/client.js";
+import { resolveClaudeForkResumeAt, resolveIndexForkMeta } from "../src/acp/client.js";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
 import { transcriptJsonlPath } from "../src/config/subscription-transcript.js";
 import {
@@ -131,9 +131,9 @@ test("(a') steerBoundaryUuid is the PRIMARY path: it overrides the inherit-prece
 test("(b) fork resolution 4/5/6 → resumeSessionAt preSteerTail/preSteerTail/final — distinct, no collapse", () => {
   const messages = buildT2Conversation("pre-steer-tail").messages;
 
-  const at4 = resolvePtyForkMeta(messages, 4); // messages[3] = A3
-  const at5 = resolvePtyForkMeta(messages, 5); // messages[4] = U4
-  const at6 = resolvePtyForkMeta(messages, 6); // messages[5] = A5
+  const at4 = resolveIndexForkMeta(messages, 4); // messages[3] = A3
+  const at5 = resolveIndexForkMeta(messages, 5); // messages[4] = U4
+  const at6 = resolveIndexForkMeta(messages, 6); // messages[5] = A5
 
   assert.deepEqual(at4, { claudeCode: { options: { resumeSessionAt: "pre-steer-tail" } } });
   assert.deepEqual(at5, { claudeCode: { options: { resumeSessionAt: "pre-steer-tail" } } });
@@ -150,7 +150,7 @@ test("(c) an entry lacking claudeUuid resolves to the legacy forkAtMessageIndex 
   const messages = buildT2Conversation("pre-steer-tail").messages;
 
   // index 0 (the first User entry) carries no provenance → legacy fallback.
-  assert.deepEqual(resolvePtyForkMeta(messages, 1), { acpx: { forkAtMessageIndex: 1 } });
+  assert.deepEqual(resolveIndexForkMeta(messages, 1), { acpx: { forkAtMessageIndex: 1 } });
 
   // A fully pre-provenance session (no entry carries claudeUuid) → legacy path
   // for every index, exactly as today.
@@ -158,15 +158,15 @@ test("(c) an entry lacking claudeUuid resolves to the legacy forkAtMessageIndex 
     { User: { id: "u0", content: [{ Text: "hi" }] } },
     { Agent: { content: [{ Text: "hello" }], tool_results: {} } },
   ];
-  assert.deepEqual(resolvePtyForkMeta(legacy, 1), { acpx: { forkAtMessageIndex: 1 } });
-  assert.deepEqual(resolvePtyForkMeta(legacy, 2), { acpx: { forkAtMessageIndex: 2 } });
+  assert.deepEqual(resolveIndexForkMeta(legacy, 1), { acpx: { forkAtMessageIndex: 1 } });
+  assert.deepEqual(resolveIndexForkMeta(legacy, 2), { acpx: { forkAtMessageIndex: 2 } });
 
   // undefined source messages → legacy path (defensive).
-  assert.deepEqual(resolvePtyForkMeta(undefined, 3), { acpx: { forkAtMessageIndex: 3 } });
+  assert.deepEqual(resolveIndexForkMeta(undefined, 3), { acpx: { forkAtMessageIndex: 3 } });
 });
 
 // A6 — the Claude-ACP branch of buildForkRequestContext (client.ts). Mirrors
-// the resolvePtyForkMeta tests above (A5), but for `resolveClaudeForkResumeAt`,
+// the resolveIndexForkMeta tests above (A5), but for `resolveClaudeForkResumeAt`,
 // which is the Claude-adapter counterpart: same provenance-first, index-
 // arithmetic-fallback shape, proven against a REAL on-disk transcript so the
 // "bypasses the transcript walk entirely" claim isn't just an inline return.

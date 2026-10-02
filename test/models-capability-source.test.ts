@@ -149,7 +149,7 @@ test("the OpenRouter band is locked per harness, exactly as the derivation says"
   // OpenRouter band is no longer locked. Nothing failed to announce it, because
   // only the prose was wrong — which is precisely why it is repaired rather than
   // left for the next reader to reason from. The lock is, and always was,
-  // derived per harness: today `none` harnesses (codex, claude-pty) are locked
+  // derived per harness: today `none` harnesses (codex) are locked
   // and claude is not.
   // ⚠️ THE ALLOWED SET IS INJECTED, NOT READ FROM THIS BOX (brick ecfb0461) —
   // otherwise this row's answer would depend on whether this box has a warm

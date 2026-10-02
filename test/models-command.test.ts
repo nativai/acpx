@@ -186,7 +186,7 @@ test("SHAPE 2 — an id served on plan AND metered exits USAGE listing both, gue
 /**
  * REGRESSION GUARD — measured 2026-09-04T00:27Z against the deployed CLI.
  * `acpx claude sessions new --model sonnet` works today. `sonnet` is a row under
- * BOTH claude-subscription and claude-home, so a naive "more than one source ⇒
+ * more than one source, so a naive "more than one source ⇒
  * ambiguous" rule exited 2 on it. Those two are the same plan class reached
  * through a different credential, and the credential is what --profile /
  * --subscription select; --model has never meant a source.
@@ -202,10 +202,6 @@ test("a bare native alias on its own agent is NOT ambiguous — the deployed CLI
   assert.equal(
     validateModelSelection(catalogue, { model: "opus", agentName: "claude" })?.source,
     "claude-subscription",
-  );
-  assert.equal(
-    validateModelSelection(catalogue, { model: "opus", agentName: "claude-pty" })?.source,
-    "claude-pty",
   );
 });
 
@@ -947,13 +943,6 @@ test("CLI: favorites round-trip through the store, and the star lands on the lis
   assert.equal((JSON.parse(favorites.stdout) as { favorites: unknown[] }).favorites.length, 1);
   runCli(["models", "fav", "rm", "openrouter:moonshotai/kimi-k3"], home);
   assert.match(runCli(["models", "fav"], home).stdout, /No favorite models/);
-});
-
-test("CLI: `models fav add` on an ambiguous bare id exits 2 rather than guessing", () => {
-  const result = runCli(["models", "fav", "add", "opus"], stateHome());
-  assert.equal(result.status, 2);
-  assert.match(result.stderr, /claude-subscription:opus/);
-  assert.match(result.stderr, /claude-home:opus/);
 });
 
 test("CLI: `last-used` reads an EMPTY map without erroring, then round-trips a write", () => {

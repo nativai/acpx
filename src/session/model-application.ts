@@ -226,7 +226,7 @@ export async function applyRequestedModelIfAdvertised(
   return outcome.applied ? { ...outcome, effectiveModelId: requestedModel } : outcome;
 }
 
-/** The generic path: claude, claude-pty, codex and pi. */
+/** The generic path: claude, codex and pi. */
 async function applyModelAsSetModel(
   params: ModelApplyParams,
   requestedModel: string,
@@ -260,8 +260,8 @@ async function applyModelAsSetModel(
  * in one place so the rule cannot be got wrong at one call site out of four.
  *
  * ⚠️ `undefined` refreshed options means "this mechanism had nothing to re-read",
- * NOT "nothing is advertised". Collapsing the two deletes claude's and
- * claude-pty's working depth path, which is why this is a named function rather
+ * NOT "nothing is advertised". Collapsing the two deletes claude's
+ * working depth path, which is why this is a named function rather
  * than a `??` repeated at each site.
  */
 export function advertisedAfterModelApply(

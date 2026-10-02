@@ -1,13 +1,12 @@
 /**
- * The harness-native models — Claude's subscription/claude-home aliases, the
- * claude-pty bridge's three — expressed as the SAME rows, with the SAME `depth` descriptor, as the
+ * The harness-native models — Claude's subscription aliases — expressed as the SAME rows, with the SAME `depth` descriptor, as the
  * OpenRouter catalogue (C4 §7.2 rule 2 / C5 §8.1 note 4).
  *
  * ONE list, all sources. Two endpoints would mean two matchers and two orderings.
  *
  * Provenance of the values: read out of acpx-ui `src/models.ts` at `origin/dev`
  * on 2026-09-03 — `CLAUDE_THINKING_DEPTH_OPTIONS` (:94), `claudeEffortCeiling`
- * (:341) and `MODEL_OPTIONS['claude-pty']` (:210).
+ * (:341).
  * Codex is deliberately absent: its descriptor declares an ACP catalogue with
  * per-model ladders, so connected-session advertisement is its only authority.
  */
@@ -28,11 +27,8 @@ export type NativeModel = CatalogueModel & {
  * the capability table's to answer, not this module's.
  */
 export function nativeAgentTypesForSource(source: ModelSource): string[] | null {
-  if (source === "claude-subscription" || source === "claude-home") {
+  if (source === "claude-subscription") {
     return ["claude"];
-  }
-  if (source === "claude-pty") {
-    return ["claude-pty"];
   }
   if (source === "chatgpt") {
     return ["codex"];
@@ -88,12 +84,6 @@ const CLAUDE_ALIASES: {
   { id: "sonnet", name: "Sonnet" },
   { id: "haiku", name: "Haiku 4.5" },
   { id: "fable", name: "Fable 5" },
-];
-
-const CLAUDE_PTY_ALIASES: { id: string; name: string }[] = [
-  { id: "opus", name: "Opus" },
-  { id: "sonnet", name: "Sonnet" },
-  { id: "haiku", name: "Haiku" },
 ];
 
 /**
@@ -214,45 +204,23 @@ function nativeRow(params: {
 export function harnessNativeModels(): NativeModel[] {
   const rows: NativeModel[] = [];
 
-  for (const source of ["claude-subscription", "claude-home"] as const) {
-    for (const alias of CLAUDE_ALIASES) {
-      rows.push(
-        nativeRow({
-          source,
-          id: alias.id,
-          name: alias.name,
-          vendor: "anthropic",
-          description:
-            source === "claude-subscription"
-              ? "Claude Code on a Claude Max subscription."
-              : "Claude Code against an independent Claude home directory.",
-          depth: {
-            kind: "ladder",
-            levels: capLadder(CLAUDE_LADDER, claudeEffortCeiling(alias.id)),
-            default: null,
-            mandatory: false,
-          },
-          account: source,
-          agentTypes: ["claude"],
-          aliasTarget: alias.aliasTarget ?? null,
-        }),
-      );
-    }
-  }
-
-  for (const alias of CLAUDE_PTY_ALIASES) {
+  for (const alias of CLAUDE_ALIASES) {
     rows.push(
       nativeRow({
-        source: "claude-pty",
+        source: "claude-subscription",
         id: alias.id,
         name: alias.name,
         vendor: "anthropic",
-        description: "Interactive Claude through the claude-pty bridge.",
-        // The bridge advertises one fixed ladder for every model it takes, and
-        // its own default is `high` (C4 CONCEPTION §6.3).
-        depth: { kind: "ladder", levels: CLAUDE_LADDER, default: "high", mandatory: false },
-        account: "claude-pty",
-        agentTypes: ["claude-pty"],
+        description: "Claude Code on a Claude Max subscription.",
+        depth: {
+          kind: "ladder",
+          levels: capLadder(CLAUDE_LADDER, claudeEffortCeiling(alias.id)),
+          default: null,
+          mandatory: false,
+        },
+        account: "claude-subscription",
+        agentTypes: ["claude"],
+        aliasTarget: alias.aliasTarget ?? null,
       }),
     );
   }

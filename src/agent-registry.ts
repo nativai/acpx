@@ -43,7 +43,7 @@ export const ACP_ADAPTER_PACKAGE_RANGES = {
   // lives where it can be checked — `HARNESS_FACTS.codex.measuredAgainst`, which
   // names the commit and the bundled CLI and says how to re-derive both.
   //
-  // ⚠️ THIS TABLE IS FOR npx-LAUNCHED ADAPTERS ONLY. claude, claude-pty and codex
+  // ⚠️ THIS TABLE IS FOR npx-LAUNCHED ADAPTERS ONLY. claude and codex
   // are `/opt` builds and must not gain rows here; a row for one of them would
   // read as a pin while governing nothing, which is how this entry arose.
 } as const;
@@ -80,7 +80,7 @@ type BuiltInLaunchResolverOptions = {
  * published package otherwise (B5, brick ef5999ca).
  *
  * ⚠️ THIS IS THE ONE REGISTRY ENTRY THAT IS NOT A CONSTANT, AND THE REASON IS A
- * TRANSITION, NOT A PREFERENCE. `claude`/`codex`/`claude-pty` point at their
+ * TRANSITION, NOT A PREFERENCE. `claude`/`codex` point at their
  * `/opt` forks unconditionally because every box's bootstrap builds them. Pi's
  * fork is new: a box whose bootstrap predates it has no `/opt/pi-acp`, and an
  * unconditional path there would break `pi` outright on that box rather than
@@ -115,7 +115,6 @@ export function resolvePiAcpCommand(
 
 const CODEX_ACP_FORK_COMMAND = `node /opt/codex-acp/dist/index.js`;
 const CLAUDE_ACP_FORK_COMMAND = `node /opt/claude-agent-acp/dist/index.js`;
-const CLAUDE_PTY_ACP_FORK_COMMAND = `node /opt/claude-pty-acp/dist/index.js`;
 
 export const AGENT_REGISTRY: Record<string, string> = {
   pi: resolvePiAcpCommand(),
@@ -125,9 +124,6 @@ export const AGENT_REGISTRY: Record<string, string> = {
   gemini: "gemini --acp",
   cursor: "cursor-agent acp",
   copilot: "copilot --acp --stdio",
-  // Same built /opt-fork env-seam pattern as claude/codex; alphabetical-tail
-  // position per the listBuiltInAgents ordering convention.
-  "claude-pty": process.env.ACPX_CLAUDE_PTY_ACP_COMMAND || CLAUDE_PTY_ACP_FORK_COMMAND,
   droid: "droid exec --output-format acp",
   iflow: "iflow --experimental-acp",
   kilocode: "npx -y @kilocode/cli acp",
@@ -171,7 +167,6 @@ const BUILT_IN_LAUNCH_FORMS: Record<string, readonly string[]> = {
   pi: [resolvePiAcpCommand({}, () => true), resolvePiAcpCommand({}, () => false)],
   codex: [CODEX_ACP_FORK_COMMAND],
   claude: [CLAUDE_ACP_FORK_COMMAND],
-  "claude-pty": [CLAUDE_PTY_ACP_FORK_COMMAND],
 };
 
 /**
@@ -208,13 +203,11 @@ const AGENT_COMMAND_ENV_SEAMS: Record<string, string> = {
   pi: "ACPX_PI_ACP_COMMAND",
   codex: "ACPX_CODEX_ACP_COMMAND",
   claude: "ACPX_CLAUDE_ACP_COMMAND",
-  "claude-pty": "ACPX_CLAUDE_PTY_ACP_COMMAND",
 };
 
-// `claude`, `codex`, and `claude-pty` are intentionally absent here. Their
+// `claude` and `codex` are intentionally absent here. Their
 // AGENT_REGISTRY entries point at the container-built forks
-// (`node /opt/claude-agent-acp/dist/index.js`, `node /opt/codex-acp/dist/index.js`,
-// `node /opt/claude-pty-acp/dist/index.js`); with no built-in-package spec,
+// (`node /opt/claude-agent-acp/dist/index.js`, `node /opt/codex-acp/dist/index.js`); with no built-in-package spec,
 // findBuiltInAgentPackage() returns undefined for those commands, both resolvers
 // bail, and the client spawns the /opt command verbatim. Adding a spec whose
 // fallbackCommand equals the /opt command would make resolveInstalledBuiltInAgentLaunch

@@ -9,12 +9,7 @@
  */
 
 /** Where a model is reached — the first half of the `(source, id)` unit of choice (C5 D2). */
-export type ModelSource =
-  | "openrouter"
-  | "claude-subscription"
-  | "claude-home"
-  | "chatgpt"
-  | "claude-pty";
+export type ModelSource = "openrouter" | "claude-subscription" | "chatgpt";
 
 /**
  * The canonical thinking-depth vocabulary (C4 §6.1). Ordered weakest → strongest.
@@ -138,7 +133,7 @@ export type AgentAvailability = {
    *
    * ⚠️ **NOT ALWAYS `id`, AND NOT DERIVABLE FROM `source`.** Measured on every
    * harness (brick c4da2ff2): pi takes `source + "/" + id`,
-   * claude and claude-pty take the bare `id`, and codex takes `family[rung]`
+   * claude take the bare `id`, and codex takes `family[rung]`
    * with **a bare family refused**. So the obvious caller-side rule
    * `source === "openrouter" ? \`openrouter/${id}\` : id` is right for one
    * harnesses and silently wrong for a third — which is exactly why the answer

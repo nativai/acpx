@@ -512,7 +512,7 @@ export function withoutOpenRouterRoutePrefix(id: string): string {
  * 🛑 **THE NAMESPACE TEST IS LOAD-BEARING, NOT A TIDINESS CHECK. Without it this
  * predicate swallows every ordinary claude and codex session.** Measured on devbox's
  * whole session store, 2026-09-29: **zero non-OpenRouter model ids carry a `/`.**
- * claude and claude-pty run bare aliases (`opus` ×790, `sonnet` ×291, `default` ×78,
+ * claude run bare aliases (`opus` ×790, `sonnet` ×291, `default` ×78,
  * `fable` ×43, `haiku` ×6); codex runs bare ids with a bracket (`gpt-6-astra[high]`
  * ×32, 18 distinct forms); every namespaced id in the store is an OpenRouter id.
  * Structurally corroborated: `ModelSource` has five values (`types.ts:12`) and the

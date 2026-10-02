@@ -341,7 +341,7 @@ test("an UNAVAILABLE outcome is recorded even though no value was sent", async (
 test("GUARDRAIL: the Claude family record is NOT touched by the depth recorder", async () => {
   // `served` there belongs to the Claude-transcript producer, whose `effort`
   // means something different and which would overwrite this on the next turn.
-  for (const id of ["claude", "claude-pty"] as const) {
+  for (const id of ["claude"] as const) {
     const record = recordFor(AGENT_REGISTRY[id]);
     const before = JSON.stringify(record);
     recordDepthOutcome(record, projectDepthOntoLadder("ultra", ["low", "high"]));

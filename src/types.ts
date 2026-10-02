@@ -910,7 +910,7 @@ export type SessionAcpxState = {
     /**
      * Requested Claude thinking depth (the `effort` config option), persisted as
      * the durable end-to-end contract field. Carries the value requested via
-     * `--reasoning-effort` so it survives cold-resume (the claude-pty bridge reads
+     * `--reasoning-effort` so it survives cold-resume (an adapter reads
      * `session_options.effort` when reconstructing source state from the acpx
      * record). Kept alongside `acpx.desired_config_options.effort`, which remains
      * the live-config / reconnect-reapply field. Opaque string (an advertised

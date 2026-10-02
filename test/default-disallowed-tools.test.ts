@@ -149,8 +149,8 @@ test("default-disallowed-tools: an explicit non-empty --disallowed-tools list pa
 // Registered under the agent NAME "claude" but resolving to a command
 // acpAdapterKind does NOT classify as "claude" (no claude-agent-acp marker) — the
 // gate must be on the resolved adapter kind, not the CLI's agent-name string, so
-// this must NOT receive the default. This is the same discipline CONTENT.md
-// requires for excluding claude-pty, exercised from the opposite side.
+// this must NOT receive the default. This is the discipline that keeps non-claude
+// adapters off the default.
 test("default-disallowed-tools: an agent NAMED claude but not adapter-kind-detected as claude gets no default", async () => {
   await withAgentHome(MOCK_AGENT_COMMAND, async (homeDir, cwd) => {
     const disallowedTools = await newSessionAndReadDisallowedTools(

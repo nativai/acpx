@@ -202,7 +202,7 @@ export function applyDepthOutcomeToRecord(
  *  - it labels itself `source: "depth-projection"` so the two producers are
  *    distinguishable in the record instead of silently sharing a vocabulary.
  *
- * That gate is also exactly the program guardrail: claude and claude-pty depth
+ * That gate is also exactly the program guardrail: claude depth
  * goes through the existing generic path, unchanged.
  *
  * ⚠️ `readLastServedModel` returns undefined for any non-Claude agent
@@ -212,7 +212,7 @@ export function applyDepthOutcomeToRecord(
 export function recordDepthOutcome(record: SessionRecord, projection: DepthProjection): void {
   // ⚠️ NO DEPTH REQUEST ⇒ THE KEY IS ABSENT. Not `null`, not `{}` — absent.
   //
-  // Every default claude / claude-pty / codex spawn makes no depth request, and
+  // Every default claude / codex spawn makes no depth request, and
   // their records must stay byte-comparable to today's. A record that gains a key
   // has a CHANGED SHAPE, and record shape is consumed by parse, serialize, the
   // index projection and the UI — so "we added a field but it is null for you" is

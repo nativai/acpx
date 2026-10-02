@@ -64,7 +64,6 @@ type MockAgentOptions = {
   listPageSize: number;
   closeSessionMarker?: string;
   loadSessionNotFound: boolean;
-  loadSessionTranscriptGone: boolean;
   resumeSessionNotFound: boolean;
   loadSessionFailsOnEmpty: boolean;
   setSessionModeFails: boolean;
@@ -80,7 +79,7 @@ type MockAgentOptions = {
   envDumpFile?: string;
   /**
    * Extra environment variable NAMES to include in the env dump, beyond the
-   * ACPX_* / INDEPENDENT_CLAUDE_* / CLAUDE_CONFIG_DIR default. Needed because the
+   * ACPX_* / CLAUDE_CONFIG_DIR default. Needed because the
    * default is an ALLOWLIST, so a test asserting on any other name silently
    * reads `undefined` — which looks exactly like "acpx did not set it".
    */
@@ -402,7 +401,6 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let listPageSize = 100;
   let closeSessionMarker: string | undefined;
   let loadSessionNotFound = false;
-  let loadSessionTranscriptGone = false;
   let resumeSessionNotFound = false;
   let loadSessionFailsOnEmpty = false;
   let setSessionModeFails = false;
@@ -451,12 +449,6 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     if (token === "--load-session-not-found") {
       supportsLoadSession = true;
       loadSessionNotFound = true;
-      continue;
-    }
-
-    if (token === "--load-session-transcript-gone") {
-      supportsLoadSession = true;
-      loadSessionTranscriptGone = true;
       continue;
     }
 
@@ -650,7 +642,6 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     listPageSize,
     closeSessionMarker,
     loadSessionNotFound,
-    loadSessionTranscriptGone,
     resumeSessionNotFound,
     loadSessionFailsOnEmpty,
     setSessionModeFails,
@@ -1016,24 +1007,6 @@ class MockAgent implements Agent {
 
     if (this.options.loadSessionNotFound) {
       throw RequestError.resourceNotFound(params.sessionId);
-    }
-
-    if (this.options.loadSessionTranscriptGone) {
-      // Pinned wire shape of the independent-claude-acp bridge's session/load
-      // rejection for a never-prompted session (UIC-4 verification F1).
-      throw new RequestError(
-        -32000,
-        `session/load rejected: Claude session ${params.sessionId} is not resumable (transcript gone)`,
-        {
-          schema: "independent-claude-acp/load-session/v1",
-          reason: "transcript-gone",
-          sessionId: params.sessionId,
-          claudeSessionId: params.sessionId,
-          cwd: params.cwd,
-          homeSelector: "home1",
-          detail: `No transcript at expected path; the Claude session ${params.sessionId} is not resumable.`,
-        },
-      );
     }
 
     const existing = this.sessions.get(params.sessionId);
@@ -1698,16 +1671,11 @@ const mockAgentOptions = parseMockAgentOptions(process.argv.slice(2));
 if (mockAgentOptions.envDumpFile) {
   // Capture the ACPX_* env the adapter was spawned with, so an E2E can assert
   // what acpx injected (ACPX_BRICK, ACPX_AGENT_FOLDER, …). Also capture
-  // the claude-pty bridge selector env (INDEPENDENT_CLAUDE_*) and
   // CLAUDE_CONFIG_DIR so tests can assert both presence AND absence.
   const extra = new Set(mockAgentOptions.envDumpExtra ?? []);
   const acpxEnv: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
-    const captured =
-      key.startsWith("ACPX_") ||
-      key.startsWith("INDEPENDENT_CLAUDE_") ||
-      key === "CLAUDE_CONFIG_DIR" ||
-      extra.has(key);
+    const captured = key.startsWith("ACPX_") || key === "CLAUDE_CONFIG_DIR" || extra.has(key);
     if (captured && typeof value === "string") {
       acpxEnv[key] = value;
     }

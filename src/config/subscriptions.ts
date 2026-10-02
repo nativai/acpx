@@ -1071,8 +1071,8 @@ function profileIdsIn(items: unknown): string[] {
  * Delete a profile from the on-disk registry, whole-file read-modify-write so
  * every sibling entry (and its lock metadata, and `quarantined`) survives
  * byte-for-byte. Works on the raw document rather than the normalized
- * `subscriptions` view, because that view is subscription-authMode-only — a
- * claude-home bridge or an openrouter profile is invisible there but is still a
+ * `subscriptions` view, because that view is subscription-authMode-only — an
+ * openrouter profile is invisible there but is still a
  * removable registry entry.
  *
  * Optimistic concurrency, not a lock: acpx's registry writes are lockless

@@ -101,8 +101,6 @@ import {
 import {
   applyProfileAuth,
   buildAgentSpawnOptions,
-  buildClaudeHomeSelectorMeta,
-  buildClaudeParentSessionMeta,
   effectiveAccountMetadataFromEnv,
   readEnvCredential,
   resolveConfiguredAuthCredential,
@@ -224,7 +222,7 @@ type ForkSessionOptions = LoadSessionOptions & {
   /**
    * The source session's messages_log entries, threaded in so the fork
    * resolver can read durable byway-fork provenance (`messages[atIndex-1]
-   * .claude_uuid`) on the PTY-bridge path (A5).
+   * .claude_uuid`) on the non-Claude-ACP fork path (A5).
    */
   sourceMessages?: readonly SessionMessage[];
 };
@@ -251,14 +249,14 @@ function forkEntryClaudeUuid(entry: SessionMessage | undefined): string | undefi
 }
 
 /**
- * Resolve the fork `_meta` for the PTY-bridge path (A5). When the entry being
+ * Resolve the fork `_meta` for the non-Claude-ACP path (A5). When the entry being
  * forked at (`messages[atIndex-1]`) carries durable provenance, send it via the
  * EXISTING direct-uuid path (`claudeCode.options.resumeSessionAt`) — immune to
  * mid-turn steers and any messages_log/transcript divergence. Otherwise fall
- * back to the LEGACY index (`acpx.forkAtMessageIndex`), which the bridge
- * resolves with its reconstructed-index model for pre-provenance sessions.
+ * back to the LEGACY index (`acpx.forkAtMessageIndex`), which the adapter
+ * resolves with its own index model for pre-provenance sessions.
  */
-export function resolvePtyForkMeta(
+export function resolveIndexForkMeta(
   sourceMessages: readonly SessionMessage[] | undefined,
   atIndex: number,
 ): Record<string, unknown> {
@@ -272,7 +270,7 @@ export function resolvePtyForkMeta(
 /**
  * Resolve the Claude-ACP fork `resumeSessionAt` uuid (A6 — completes the
  * durable-provenance mechanism for the mainstream Claude adapter path,
- * mirroring the PTY-bridge branch above). Prefers `sourceMessages[atIndex-1]
+ * mirroring the index-fork branch above). Prefers `sourceMessages[atIndex-1]
  * .claude_uuid` directly, immune to record/transcript index divergence, and
  * falls back to `resolveClaudeUuidForAcpxIndex`'s index-arithmetic
  * reconstruction only when the entry carries no provenance (pre-provenance
@@ -1284,8 +1282,8 @@ export class AcpClient {
     // B3: the per-session harness config dir — primer + model pin + catalogue
     // fragment, one directory (CONCEPTION §5.3). GATED PER HARNESS off the
     // descriptor's `primerChannel === "config-file"`, so only pi receives it and
-    // claude / claude-pty / codex adapter environments are untouched. Applied
-    // unconditionally here it would be a real behaviour change to three
+    // claude / codex adapter environments are untouched. Applied
+    // unconditionally here it would be a real behaviour change to two
     // harnesses this program requires to stay identical.
     //
     // ⚠️ This is the ADAPTER boundary, one level downstream of the rig shim's
@@ -1456,7 +1454,7 @@ export class AcpClient {
    *     involved at all — which is what makes "any OpenRouter model" true for
    *     claude without pre-registering one profile per model;
    *   - any other session with a profile attached (`kind: "profile"`) takes
-   *     `applyProfileAuth`'s normal, non-shim path — subscription, claude-home or
+   *     `applyProfileAuth`'s normal, non-shim path — subscription or
    *     chatgpt. (The `openrouter`-authMode profile kind that used to be a second
    *     shim-starting route here was retired, brick 777b4be7.)
    *
@@ -1949,30 +1947,14 @@ export class AcpClient {
     return new Error(`${base}\n\n[acpx] ${hint}`, { cause: error });
   }
 
-  /**
-   * session/new `_meta`: the claudeCode options fragment plus — for a
-   * claude-home profile session — the bridge HOME selector
-   * (independent-claude-acp/home). Recomputed per call, so EVERY spawn path
-   * that lands in createSession (create / recover-fresh / keepwarm) carries
-   * the selector: a missing selector does not error bridge-side, it silently
-   * runs under the box-default HOME (wrong credentials).
-   */
+  /** session/new `_meta`: the claudeCode options fragment plus the OS primer. */
   private async buildNewSessionMeta(): Promise<Record<string, unknown> | undefined> {
     const optionsMeta = buildClaudeCodeOptionsMeta(this.options.sessionOptions);
-    const homeSelectorMeta = this.buildHomeSelectorMeta();
-    // FW-18/FW-19: the claude-pty bridge learns its per-session parent from the
-    // session/new `_meta` (not the spawn process env — one bridge serves many
-    // sessions). Carry the parent URL here so the child claude gets
-    // ACPX_PARENT_SESSION_URL and can message its parent back.
-    const parentMeta = buildClaudeParentSessionMeta(
-      this.options.sessionContext,
-      this.options.agentCommand,
-    );
     // OS primer (CONCEPTION §4.5.1): resolve `session-context.sh`, route by
     // agent type, and fold in any human `--append-system-prompt`. Merged LAST so
     // the primer fragment owns `systemPrompt` / `codex.developerInstructions`.
     const primerMeta = await this.buildPrimerSessionMeta(optionsMeta);
-    const merged = { ...optionsMeta, ...homeSelectorMeta, ...parentMeta, ...primerMeta };
+    const merged = { ...optionsMeta, ...primerMeta };
     return Object.keys(merged).length > 0 ? merged : undefined;
   }
 
@@ -2055,10 +2037,6 @@ export class AcpClient {
     return await resolveBrickContext(brick, { sessionId });
   }
 
-  private buildHomeSelectorMeta(): Record<string, unknown> | undefined {
-    return buildClaudeHomeSelectorMeta(this.options.sessionContext?.profileId);
-  }
-
   /**
    * Fix A (brick 92a994a0): fold an authoritative context-window hint into a
    * resume `_meta` fragment as `claudeCode.contextWindowSizeHint`, so the
@@ -2139,11 +2117,6 @@ export class AcpClient {
     let response: LoadSessionResponse | undefined;
 
     try {
-      // For claude-home sessions, carry the HOME selector on session/load too:
-      // when the bridge advertises loadSession (feat/session-load), the loaded
-      // session must re-bind to the same home — and a missing selector falls
-      // back silently to the box-default HOME, not an error.
-      const homeSelectorMeta = this.buildHomeSelectorMeta();
       // Re-supply the primer on cold load for the system-prompt channels
       // (CONCEPTION §4.5.2) so a restarted adapter regenerates it; codex returns
       // undefined here (its developer item is already in restored history).
@@ -2151,7 +2124,7 @@ export class AcpClient {
       const loadMeta =
         this.mergeOutputStyleMeta(
           this.mergeContextWindowHint(
-            { ...homeSelectorMeta, ...primerMeta },
+            { ...primerMeta },
             options.contextWindowSizeHint,
             options.contextWindowSizeHintModel,
           ),
@@ -2373,12 +2346,12 @@ export class AcpClient {
       };
     }
 
-    // PTY-bridge path (not isClaudeAcpCommand): prefer durable provenance, fall
+    // Non-Claude-ACP path: prefer durable provenance, fall
     // back to the legacy messages_log index for pre-provenance sessions (A5).
     return {
       claudeFork: false,
       sourceCwd: cwd,
-      meta: resolvePtyForkMeta(sourceMessages, atIndex),
+      meta: resolveIndexForkMeta(sourceMessages, atIndex),
     };
   }
 

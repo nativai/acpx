@@ -122,8 +122,6 @@ function boxLabel(): string {
 const SOURCE_TAGS: Record<string, string> = {
   openrouter: "or",
   "claude-subscription": "plan",
-  "claude-home": "home",
-  "claude-pty": "pty",
   chatgpt: "codex",
 };
 

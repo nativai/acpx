@@ -385,10 +385,9 @@ export async function setSessionSubscription(
 }
 
 // Move a session to a different credential PROFILE in place — the unified
-// primitive behind both SDK subscription moves (sub1↔sub2) and claude-pty bridge
-// moves (bridge1↔bridge2). Like setSessionSubscription, a profile is resolved
-// from the record on every spawn (CLAUDE_CONFIG_DIR for subscriptions, the
-// bridge's HOME for claude-home), so the durable move is the record edit +
+// primitive behind SDK subscription moves (sub1↔sub2). Like
+// setSessionSubscription, a profile is resolved from the record on every spawn
+// (CLAUDE_CONFIG_DIR for subscriptions), so the durable move is the record edit +
 // transcript port (switchSessionAccount); binding it requires a respawn:
 //   COLD (no live owner) → record edit only; the next spawn resolves the new dir.
 //   LIVE (queue owner holds a client on the old credential) → after the record

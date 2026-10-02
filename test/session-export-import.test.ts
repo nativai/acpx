@@ -1019,11 +1019,6 @@ for (const [agentName, expectedAgentCommand, deployedForkCommand] of [
     "node /opt/claude-agent-acp/dist/index.js",
   ],
   ["codex", "npx -y @agentclientprotocol/codex-acp@^0.0.1", "node /opt/codex-acp/dist/index.js"],
-  [
-    "claude-pty",
-    "npx -y @agentclientprotocol/claude-pty-acp@^0.1.0",
-    "node /opt/claude-pty-acp/dist/index.js",
-  ],
   ["pi", "npx pi-acp@^0.0.33", "node /opt/pi-acp/dist/index.js"],
 ] as const) {
   test(`importSession accepts a ${agentName} archive whose command is the deployed /opt fork path`, async () => {

@@ -805,7 +805,7 @@ function countOccurrences(haystack: string, needle: string): number {
 test("J1 there is EXACTLY ONE ACP prompt egress in src — STRUCTURAL, with its own control", () => {
   // Every `session/prompt` acpx sends, for every harness and every adapter variant, goes
   // through one line. That is WHY a per-turn channel placed in `AcpClient.prompt` reaches all
-  // harnesses with no per-harness cell, and why claude-pty is covered without being
+  // harnesses with no per-harness cell, and why no adapter variant is
   // special-cased. This row catches A SECOND EGRESS ADDED ELSEWHERE, which the behavioural row
   // in turn-context-chokepoint.test.ts structurally cannot see.
   const client = readSource("src/acp/client.ts", "async prompt(");

@@ -146,7 +146,6 @@ test("listBuiltInAgents preserves the required example prefix and alphabetical t
     "copilot",
   ]);
   assert.deepEqual(agents.slice(7), [
-    "claude-pty",
     "droid",
     "iflow",
     "kilocode",
@@ -194,7 +193,7 @@ test("pi built-in is the nativai fork when the box has it, the pinned upstream p
 });
 
 test("pi command resolution: env seam wins, then the fork, then the pinned upstream", () => {
-  // The env seam is the one claude/codex/claude-pty already have; I2 recorded its
+  // The env seam is the one claude/codex already have; I2 recorded its
   // absence for pi as a gap (no `ACPX_PI_ACP_COMMAND`, so the only overrides were
   // editing this file or acpx config).
   const present = () => true;

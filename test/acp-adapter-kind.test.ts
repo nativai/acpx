@@ -4,22 +4,14 @@ import { acpAdapterKind } from "../src/acp/agent-command.js";
 
 // brick://4dd3ee2c — the copy/fork/byway agent-lock must treat two command
 // spellings that drive the SAME adapter as the same agent type. The regression:
-// a claude-pty session created under `.../acp-server-transcript.mjs` (the root
-// shim) could not be forked once the resolver yielded `.../dist/index.js` (the
-// registry default) — the two are the SAME program, but the lock compared raw
-// command strings and rejected the copy, surfacing as a 502 on byway-create.
-test("acpAdapterKind maps both claude-pty command spellings to the same kind", () => {
-  const distDefault = "node /opt/claude-pty-acp/dist/index.js";
-  const mjsShim = "node /opt/claude-pty-acp/acp-server-transcript.mjs";
-  assert.equal(acpAdapterKind(distDefault), "claude-pty");
-  assert.equal(acpAdapterKind(mjsShim), "claude-pty");
-  assert.equal(acpAdapterKind(distDefault), acpAdapterKind(mjsShim));
-  // A dev-worktree override still classifies as claude-pty (path contains the
-  // repo name / server-script name).
-  assert.equal(
-    acpAdapterKind("node /workspace/projects/claude-pty-acp/main/acp-server-transcript.mjs"),
-    "claude-pty",
-  );
+// a session created under one command spelling could not be forked once the
+// resolver yielded another — the two are the SAME program, but the lock compared
+// raw command strings and rejected the copy, surfacing as a 502 on byway-create.
+test("acpAdapterKind maps both claude command spellings to the same kind", () => {
+  const distDefault = "node /opt/claude-agent-acp/dist/index.js";
+  const checkout = "node /workspace/projects/claude-agent-acp/main/dist/index.js";
+  assert.equal(acpAdapterKind(distDefault), "claude");
+  assert.equal(acpAdapterKind(checkout), "claude");
 });
 
 test("acpAdapterKind classifies the other known adapters", () => {
@@ -53,9 +45,9 @@ test("acpAdapterKind returns undefined for a raw/unknown command (strict escape 
 // adapter's cases live apart. A table that must stay rectangular makes the next
 // adapter that moves to `/opt` impossible to add without a row here.
 //
-// ⚠️ `/opt` rows measured against the box, not assumed: pi, codex, claude and
-// claude-pty ARE `/opt` forks (`ls -d /opt/*acp*`, 2026-09-06). The fork-naming
-// convention all four follow is that the fork dir is the package's unscoped name
+// ⚠️ `/opt` rows measured against the box, not assumed: pi, codex and
+// claude ARE `/opt` forks (`ls -d /opt/*acp*`, 2026-09-06). The fork-naming
+// convention all three follow is that the fork dir is the package's unscoped name
 // (`pi-acp`→`/opt/pi-acp`, `@agentclientprotocol/codex-acp`→`/opt/codex-acp`), so
 // a new adapter's `/opt` row is derivable rather than guessed.
 const ADAPTER_COMMAND_SHAPES: ReadonlyArray<[string, string, string]> = [
@@ -66,11 +58,6 @@ const ADAPTER_COMMAND_SHAPES: ReadonlyArray<[string, string, string]> = [
     "claude",
     "node /opt/claude-agent-acp/dist/index.js",
     "npx -y @agentclientprotocol/claude-agent-acp@^0.4.4",
-  ],
-  [
-    "claude-pty",
-    "node /opt/claude-pty-acp/dist/index.js",
-    "npx -y @agentclientprotocol/claude-pty-acp@^0.1.0",
   ],
 ];
 
@@ -93,7 +80,7 @@ test("acpAdapterKind classifies every adapter under BOTH the deployed /opt fork 
   // The table must stay rectangular — every adapter, both shapes, no gaps. A row
   // silently dropped would take its coverage with it and nothing else would say
   // so, which is why the count is pinned rather than inferred from the loop.
-  assert.equal(ADAPTER_COMMAND_SHAPES.length, 4);
+  assert.equal(ADAPTER_COMMAND_SHAPES.length, 3);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════

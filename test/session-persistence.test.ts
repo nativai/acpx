@@ -307,8 +307,8 @@ test("listSessions preserves acpx session_options provisioning_warning breadcrum
             provisioning_warning: {
               at: "2026-06-13T12:00:00.000Z",
               profile_id: "home1",
-              auth_mode: "claude-home",
-              adapter: "claude-pty",
+              auth_mode: "subscription",
+              adapter: "claude",
               anchor: "/tmp/home1/.claude",
               message: "human-owned commands directory left unchanged",
             },
@@ -323,8 +323,8 @@ test("listSessions preserves acpx session_options provisioning_warning breadcrum
     assert.deepEqual(record.acpx?.session_options?.provisioning_warning, {
       at: "2026-06-13T12:00:00.000Z",
       profile_id: "home1",
-      auth_mode: "claude-home",
-      adapter: "claude-pty",
+      auth_mode: "subscription",
+      adapter: "claude",
       anchor: "/tmp/home1/.claude",
       message: "human-owned commands directory left unchanged",
     });

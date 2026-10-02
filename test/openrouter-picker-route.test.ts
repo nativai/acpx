@@ -132,8 +132,7 @@ test("when ONE id exists under both sources, the harness-native row wins", async
   const collider = buildCatalogue([{ id: "sonnet", name: "Not the real Sonnet" }], META);
   // SUBJECT WITNESS — assert what the collision IS, not how many rows it has.
   // A count was the first form of this line and it was wrong (`sonnet` is a row
-  // under claude-subscription, claude-home AND claude-pty, so the real answer was
-  // 4, not 2): a count pins an unrelated fact and goes red for the wrong reason.
+  // under more than one source, so the real answer was not 2): a count pins an unrelated fact and goes red for the wrong reason.
   const sonnetRows = collider.models.filter((model) => model.id === "sonnet");
   assert.equal(
     sonnetRows.filter((model) => model.source === "openrouter").length,

@@ -349,7 +349,7 @@ export function setHarnessConfigDir(
   const normalized = dir?.trim();
   const normalizedSessionDir = piSessionDir?.trim();
   // ⚠️ NOTHING TO WRITE ⇒ TOUCH NOTHING (RS-14). Only pi ever gets a
-  // config dir, so this runs with `undefined` on every claude / claude-pty /
+  // config dir, so this runs with `undefined` on every claude /
   // codex spawn — and those records must not gain the key, be it a value, a
   // `null` or an `{}`. An unconditional `record.acpx = clone ?? {}` would give a
   // record whose `acpx` was previously ABSENT an empty object, changing the

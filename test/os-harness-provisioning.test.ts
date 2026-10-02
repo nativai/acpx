@@ -15,7 +15,6 @@ import { makeSessionRecord } from "./runtime-test-helpers.js";
 import { withCapturedStderrWrites } from "./tty-test-helpers.js";
 
 const SDK_CLAUDE_COMMAND = "node /opt/claude-agent-acp/dist/index.js";
-const CLAUDE_PTY_COMMAND = "node /opt/claude-pty-acp/dist/index.js";
 const CODEX_COMMAND = "node /opt/codex-acp/dist/index.js";
 
 type HarnessFixture = {
@@ -94,10 +93,6 @@ function registryWithProvisioning(
 
 async function writeRegistry(registryPath: string, registry: unknown): Promise<void> {
   await fs.writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`, { mode: 0o600 });
-}
-
-async function readJson(filePath: string): Promise<Record<string, unknown>> {
-  return JSON.parse(await fs.readFile(filePath, "utf8")) as Record<string, unknown>;
 }
 
 async function assertSymlinkTarget(linkPath: string, targetPath: string): Promise<void> {
@@ -184,120 +179,6 @@ test("W2 provisioning: subscription anchors symlink entries, rerun is idempotent
       (warning) => warnings.push(warning),
     );
     await assertSymlinkTarget(path.join(subDir, "skills"), path.join(fixture.sourceDir, "skills"));
-  });
-});
-
-test("W2 provisioning: claude-home merges settings hook and leaves human-owned directories untouched", async () => {
-  await withHarnessFixture(async (fixture) => {
-    const homePath = path.join(fixture.root, "interactive-home");
-    const anchor = path.join(homePath, ".claude");
-    await fs.mkdir(path.join(anchor, "commands"), { recursive: true });
-    await fs.writeFile(path.join(anchor, "commands", "human.md"), "keep\n");
-    await fs.writeFile(
-      path.join(anchor, "settings.json"),
-      `${JSON.stringify(
-        {
-          theme: "human",
-          hooks: {
-            PreToolUse: [{ matcher: "*", hooks: [{ type: "command", command: "echo keep" }] }],
-          },
-        },
-        null,
-        2,
-      )}\n`,
-    );
-    await writeRegistry(
-      fixture.registryPath,
-      registryWithProvisioning(fixture.sourceDir, [
-        {
-          id: "home1",
-          label: "Interactive one",
-          authMode: "claude-home",
-          homePath,
-        },
-      ]),
-    );
-
-    const warnings: ProvisioningWarningBreadcrumb[] = [];
-    await withCapturedStderrWrites(async (writes) => {
-      await applyProfileAuth(
-        {},
-        "home1",
-        "session-home",
-        null,
-        fixture.lookup,
-        CLAUDE_PTY_COMMAND,
-        (warning) => warnings.push(warning),
-      );
-      assert.match(writes.join(""), /already exists and is not the acpx-owned symlink/);
-    });
-
-    const settings = await readJson(path.join(anchor, "settings.json"));
-    assert.equal(settings.theme, "human");
-    const hooks = settings.hooks as Record<string, unknown>;
-    assert.ok(Array.isArray(hooks.PreToolUse));
-    const sessionStart = hooks.SessionStart as unknown[];
-    assert.equal(sessionStart.length, 1);
-    assert.match(JSON.stringify(sessionStart[0]), /nativai-os-primer/);
-    await assertSymlinkTarget(path.join(anchor, "skills"), path.join(fixture.sourceDir, "skills"));
-    await assertSymlinkTarget(
-      path.join(anchor, "plugins"),
-      path.join(fixture.sourceDir, "plugins"),
-    );
-    assert.deepEqual(await listDirNames(path.join(anchor, "commands")), ["human.md"]);
-    assert.equal(
-      warnings.some((warning) => warning.anchor === anchor),
-      true,
-    );
-
-    await applyProfileAuth({}, "home1", "session-home", null, fixture.lookup, CLAUDE_PTY_COMMAND);
-    const rerunSettings = await readJson(path.join(anchor, "settings.json"));
-    const rerunHooks = rerunSettings.hooks as Record<string, unknown>;
-    assert.equal((rerunHooks.SessionStart as unknown[]).length, 1);
-  });
-});
-
-test("W2 provisioning: human-modified marker hook is preserved with a warning", async () => {
-  await withHarnessFixture(async (fixture) => {
-    const homePath = path.join(fixture.root, "modified-home");
-    const anchor = path.join(homePath, ".claude");
-    await fs.mkdir(anchor, { recursive: true });
-    await fs.writeFile(
-      path.join(anchor, "settings.json"),
-      `${JSON.stringify({
-        hooks: {
-          SessionStart: [
-            {
-              matcher: "startup",
-              hooks: [{ type: "command", command: "echo human nativai-os-primer" }],
-            },
-          ],
-        },
-      })}\n`,
-    );
-    await writeRegistry(
-      fixture.registryPath,
-      registryWithProvisioning(fixture.sourceDir, [
-        { id: "home1", authMode: "claude-home", homePath },
-      ]),
-    );
-
-    const warnings: ProvisioningWarningBreadcrumb[] = [];
-    await applyProfileAuth(
-      {},
-      "home1",
-      "session-home",
-      null,
-      fixture.lookup,
-      CLAUDE_PTY_COMMAND,
-      (warning) => warnings.push(warning),
-    );
-    const settings = await readJson(path.join(anchor, "settings.json"));
-    assert.match(JSON.stringify(settings), /echo human nativai-os-primer/);
-    assert.equal(
-      warnings.some((warning) => warning.message.includes("differs from the source")),
-      true,
-    );
   });
 });
 

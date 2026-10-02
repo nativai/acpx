@@ -11,7 +11,6 @@ import {
 import { makeSessionRecord } from "./runtime-test-helpers.js";
 
 const CLAUDE_AGENT = "node /opt/claude-agent-acp/dist/index.js";
-const CLAUDE_PTY_AGENT = "node /opt/claude-pty-acp/acp-server-transcript.mjs";
 const CODEX_AGENT = "npx -y @agentclientprotocol/codex-acp";
 
 type RegistryProfile = Record<string, unknown>;
@@ -247,49 +246,7 @@ test("locked default subscription profile fails when no unlocked compatible prof
   );
 });
 
-test("incompatible default profile is skipped for claude-pty bridge", async () => {
-  await withRegistry(
-    {
-      defaultId: "sub1",
-      existingDirs: ["sub1"],
-      profiles: [],
-    },
-    async (ctx) => {
-      await fs.writeFile(
-        ctx.lookupOptions.registryPath,
-        JSON.stringify({
-          version: 3,
-          default: "sub1",
-          profiles: [subscriptionProfile("sub1", ctx.configDir("sub1"))],
-        }),
-      );
-      assert.equal(defaultAccountBindingForAgent(CLAUDE_PTY_AGENT, ctx.lookupOptions), undefined);
-    },
-  );
-});
-
-test("adapter-specific defaults bind claude-home for pty and chatgpt for codex", async () => {
-  await withRegistry(
-    {
-      defaultId: "bridge1",
-      profiles: [
-        {
-          id: "bridge1",
-          label: "Bridge 1",
-          authMode: "claude-home",
-          adapter: "claude-pty",
-          homePath: "/tmp/bridge1",
-          account: "bridge1",
-        },
-      ],
-    },
-    async (ctx) => {
-      assert.deepEqual(defaultAccountBindingForAgent(CLAUDE_PTY_AGENT, ctx.lookupOptions), {
-        profile: "bridge1",
-      });
-    },
-  );
-
+test("adapter-specific defaults bind chatgpt for codex", async () => {
   await withRegistry(
     {
       defaultId: "chatgpt1",

@@ -591,7 +591,7 @@ export async function drainInjectedPromptsWithBackstop(
 }
 
 // --- C1: turn-completion watchdog (G1) -------------------------------------
-// The adapter's own end-of-turn marker: for Claude / claude-pty the terminal
+// The adapter's own end-of-turn marker: for Claude the terminal
 // `usage_update` carrying `_meta._claude/lastTurnEndReason` (the same signal
 // acpx-ui reads); for codex-acp (493729fc F1) the `session_info_update` carrying
 // `_meta._codex/lastTurnEndReason` emitted on `turn/completed`. It rides on a
@@ -1760,8 +1760,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   const injectedDeliveries: TrackedInjectedDelivery[] = [];
   // Backend is constant per session, so resolve once: whether an injected prompt
   // to this backend returns a terminal response and can therefore be safely
-  // awaited (drained) even when waitForCompletion is false. True for Claude /
-  // claude-pty (both terminate); false for Codex (acts on the steer in-turn,
+  // awaited (drained) even when waitForCompletion is false. True for Claude;
+  // false for Codex (acts on the steer in-turn,
   // returns no terminal) and unknown backends — they stay fire-and-forget.
   const awaitInjectedPrompt = injectionReturnsTerminalResponse(record.agentCommand);
   // Codex steers are absorbed into the active turn and (pre-F1 adapters) never
@@ -1782,7 +1782,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   const acceptedDeliveryKeys = new Set<string>();
   const terminalDeliveryKeys = new Set<string>();
   // C1 turn-completion watchdog. Backend-gated to the set whose adapter emits
-  // an end-of-turn marker: Claude / claude-pty (`_claude/lastTurnEndReason`) and
+  // an end-of-turn marker: Claude (`_claude/lastTurnEndReason`) and
   // codex-acp (`_codex/lastTurnEndReason`, 493729fc F2 — bounds the wedged-main
   // class instead of holding the turn open indefinitely). Arming is
   // marker-driven, so a deployed codex adapter that predates its marker simply
@@ -2673,7 +2673,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         const injectedPromise = runInjectedPromptTask(sessionId, injectedTask);
         // Track (await) this injected promise when EITHER the caller is waiting
         // for completion (unchanged), OR the backend returns a terminal for an
-        // injected prompt (Claude / claude-pty). This is the root fix for the
+        // injected prompt (Claude). This is the root fix for the
         // "stuck red" bug: a Claude `--no-wait` injection that outlives the
         // primary must be awaited so its output folds into the record and its
         // delivery terminal is written before the turn's `finally` tears down

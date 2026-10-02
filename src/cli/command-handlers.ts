@@ -523,8 +523,7 @@ async function assertExplicitSubscriptionMatchesExistingSession(params: {
 
 /**
  * ⚠️ THESE TWO WARNINGS DISPATCH ON THE CAPABILITY DESCRIPTOR, NOT ON THE AGENT
- * NAME. Do not "simplify" either back to `name === "claude" || name ===
- * "claude-pty"`; that is the defect, not the style (CONCEPTION §9.1, §2.5, row
+ * NAME. Do not "simplify" either back to `name === "claude"`; that is the defect, not the style (CONCEPTION §9.1, §2.5, row
  * `G1-WRN-01`).
  *
  * The name gate was wrong in both directions simultaneously. The APPLY path is
@@ -596,7 +595,7 @@ function effortWillBeComposedIntoModelId(
 // brick://874fee67: sibling of the above, on the same descriptor rule.
 // `--output-style` is meaningful only for a harness that ADVERTISES an
 // `outputStyle` config option, which is what `supportsOutputStyles` records
-// (claude + claude-pty today; zero `outputStyle` references in codex-acp, and it
+// (claude today; zero `outputStyle` references in codex-acp, and it
 // is not a Pi concept at all — I2 R11). Never an error,
 // and never a write: the `advertisesConfigOption` gate in the apply path
 // enforces that independently.
@@ -820,8 +819,7 @@ const CLAUDE_DEFAULT_DISALLOWED_TOOLS: readonly string[] = [
 ];
 
 // Gated strictly on the `claude` adapter kind — NOT `CLAUDE_FAMILY_ADAPTER_KINDS`
-// (agent-command.ts), which also matches the deprecated `claude-pty` bridge.
-// `claude-pty` must never receive this default.
+// (agent-command.ts).
 function resolveClaudeDefaultDisallowedTools(
   agentCommand: string,
   requested: string[] | undefined,
@@ -1150,13 +1148,11 @@ function assertCopyAgentLock(params: {
   // Same ADAPTER TYPE under a different command spelling is NOT a cross-agent
   // copy — the copy uses `source.agentCommand` verbatim regardless of the path
   // agent, so the only thing to guard is a genuine agent-TYPE change. The
-  // exact-string check above is too strict: the claude-pty bridge's registry
-  // default (`.../dist/index.js`) and its `.../acp-server-transcript.mjs` root
-  // shim are the same program, and `ACPX_CLAUDE_PTY_ACP_COMMAND` / a config
-  // `agents` override can spell it a third way — so a session created under one
-  // spelling could not be forked/copied/byway-ed once the resolver yielded
-  // another (acpx-ui surfaced this as a 502 on byway-create over a claude-pty
-  // parent; brick://4dd3ee2c). Allow when both commands classify to the same
+  // exact-string check above is too strict: a registry default and a config
+  // `agents` override can spell the same adapter two ways — so a session created
+  // under one spelling could not be forked/copied/byway-ed once the resolver
+  // yielded another (acpx-ui surfaced this as a 502 on byway-create;
+  // brick://4dd3ee2c). Allow when both commands classify to the same
   // adapter kind; fall through to the strict reject only for a raw/unknown
   // command on either side (escape-hatch `--agent`).
   const sourceKind = acpAdapterKind(params.source.agentCommand);
@@ -2066,8 +2062,7 @@ export async function handleSetConfigOption(
 /**
  * The keys that are NOT ACP config options at all: `model` / `subscription` /
  * `profile`. `set subscription <id>` is a record edit (CLAUDE_CONFIG_DIR); `set
- * profile <id>` is the unified credential-move verb (SDK sub1↔sub2 AND claude-pty
- * bridge1↔bridge2). acpx-ui shells exactly these.
+ * profile <id>` is the unified credential-move verb (SDK sub1↔sub2). acpx-ui shells exactly these.
  */
 async function tryHandleRecordEditConfigKey(
   configId: string,
@@ -2501,7 +2496,7 @@ function assertSameCredentialClass(
 }
 
 // `acpx <agent> set profile <id>` — move the session to a different credential
-// PROFILE in place (the unified SDK-subscription + claude-pty-bridge move). Like
+// PROFILE in place (the unified credential move). Like
 // `set subscription`, the move is a record edit + transcript port; a respawn
 // binds it. Refuses with turn-in-flight if a turn is active on the live owner
 // (surfaced to acpx-ui as 409). The credential-CLASS guard below rejects a move

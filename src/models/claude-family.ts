@@ -390,13 +390,12 @@ function bareSlug(requested: string): string {
  * and codex session on the box. Two independent lines of evidence, both 2026-09-29:
  *
  *   CENSUS  devbox's whole session store — ZERO non-OpenRouter model ids carry a
- *           `/`. claude / claude-pty run bare aliases (`opus` ×790, `sonnet` ×291,
+ *           `/`. claude run bare aliases (`opus` ×790, `sonnet` ×291,
  *           `default` ×78, `fable` ×43, `haiku` ×6); codex runs bare ids with a
  *           bracket (`gpt-6-astra[high]` ×32, 18 distinct forms); every namespaced
  *           id present is an OpenRouter id.
  *   TYPE    `ModelSource` has exactly five values (`types.ts:12`) and the four
- *           non-OpenRouter ones — `claude-subscription`, `claude-home`,
- *           `claude-pty`, `chatgpt` — carry only bare ids: claude's are compiled
+ *           non-OpenRouter ones — `claude-subscription`, `chatgpt` — carry only bare ids: claude's are compiled
  *           into `harness-models.ts`, codex's are advertised bare over ACP.
  *
  * `test/openrouter-entitlement.test.ts` pins the boundary with those exact live ids

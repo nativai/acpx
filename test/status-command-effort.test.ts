@@ -99,24 +99,6 @@ test("codex record 019edbeb-53e3 (bracketed model id, no desired_config_options)
   assert.equal(resolveReasoningEffort(rec, harness), "xhigh");
 });
 
-test("claude-pty record 407c1e4d falls through the removed capability descriptor", () => {
-  const rec = record({
-    acpxRecordId: "407c1e4d-5104-48eb-b497-c103b8cebb69",
-    agentCommand: "node /opt/claude-pty-acp/dist/index.js",
-    acpx: {
-      session_options: { model: "opus", profile: "bridge2", effort: "max" },
-      current_model_id: "opus",
-      desired_config_options: { effort: "max" },
-      config_options: [
-        selectOption({ id: "effort", category: "thought_level", currentValue: "high" }),
-      ],
-    },
-  });
-  const harness = harnessIdForAgentCommand(rec.agentCommand);
-  assert.equal(harness, undefined);
-  assert.equal(resolveReasoningEffort(rec, harness), "max");
-});
-
 test("opencode record ses_f8409620 (an unmeasured harness) reports null, matching acpx-ui's explicit undefined for it", () => {
   const rec = record({
     acpxRecordId: "ses_f8409620effesINUtucxrQwXM0",

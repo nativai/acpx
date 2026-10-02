@@ -212,7 +212,7 @@ async function createSessionRecordWithClient(
   // ⚠️ DO NOT "simplify" this to `modelApply.refreshedConfigOptions` alone. A
   // `set-model` harness returns nothing to re-read, so `undefined` there means
   // "keep the snapshot", not "nothing is advertised" — collapsing the two would
-  // delete claude's and claude-pty's working depth path. Test:
+  // delete claude's working depth path. Test:
   // `test/model-application.test.ts` → "a set-model harness keeps the
   // session/new advertisement".
   const advertisedAfterModel = advertisedAfterModelApply(modelApply, sessionResult.configOptions);

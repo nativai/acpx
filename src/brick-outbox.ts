@@ -351,10 +351,6 @@ function projectionAgentType(record: DiskRecord): string | null {
   // value no agent-type prefix regex below can match, so "" is the same observable result.
   const command = (typeof record.agent_command === "string" ? record.agent_command : "").trim();
   const matches: Array<[string, RegExp]> = [
-    [
-      "claude-pty",
-      /(?:^|[\s/])(?:claude-pty-acp(?:@|[\s/]|$)|acp-server-transcript(?:@|[\s/.]|$))/,
-    ],
     ["claude", /(?:^|[\s/])claude-agent-acp(?:@|[\s/]|$)|^claude(?: |$)/],
     ["codex", /(?:^|[\s/])codex-acp(?:@|[\s/]|$)|^codex(?: |$)/],
     ["pi", /(?:^|[\s/])pi-acp(?:@|[\s/]|$)/],

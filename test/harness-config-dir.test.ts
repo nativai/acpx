@@ -47,7 +47,6 @@ import { makeSessionRecord } from "./runtime-test-helpers.js";
 // do not prove the harness READ the files — that is the rig's job (RS-13).
 
 const CLAUDE = "node /opt/claude-agent-acp/dist/index.js";
-const CLAUDE_PTY = "node /opt/claude-pty-acp/dist/index.js";
 const CODEX = "node /opt/codex-acp/dist/index.js";
 
 function withTempRoot<T>(run: (root: string) => T): T {
@@ -119,9 +118,9 @@ function piIsolatedEnv(
 
 // ── THE GUARDRAIL: the three Claude/codex agents gain NOTHING ────────────────
 
-test("GUARDRAIL: claude, claude-pty and codex adapter envs are UNCHANGED", () => {
+test("GUARDRAIL: claude and codex adapter envs are UNCHANGED", () => {
   withTempRoot((root) => {
-    for (const agentCommand of [CLAUDE, CLAUDE_PTY, CODEX]) {
+    for (const agentCommand of [CLAUDE, CODEX]) {
       const env: NodeJS.ProcessEnv = { PATH: "/usr/bin", HOME: "/home/node" };
       const before = JSON.stringify(env);
       const plan = applyHarnessConfigDir({
@@ -1244,9 +1243,9 @@ test("removeHarnessConfigDir deletes a config dir and REFUSES anything else", ()
 
 test("RS-14: setHarnessConfigDir leaves a no-config-dir record COMPLETELY untouched", () => {
   // ⚠️ ABSENT — not null, not {}. This runs with `undefined` on EVERY claude /
-  // claude-pty / codex spawn, because only pi gets a config dir. An
+  // codex spawn, because only pi gets a config dir. An
   // unconditional `record.acpx = clone ?? {}` would give a record whose `acpx`
-  // was previously absent an empty object, changing the record SHAPE for three
+  // was previously absent an empty object, changing the record SHAPE for two
   // harnesses the programme requires untouched — and record shape is consumed by
   // parse, serialize, the index projection and the UI.
   for (const acpx of [undefined, {}, { current_model_id: "x" }]) {
@@ -1489,9 +1488,9 @@ test("F-12: learning is TWO-WAY — a success clears a previous refusal", () => 
 });
 
 test("F-12: clearing on a record that never learned touches NOTHING", () => {
-  // RS-14's rule, applied to this field: claude/claude-pty/codex never learn it,
+  // RS-14's rule, applied to this field: claude/codex never learn it,
   // and their record shape must not move.
-  for (const id of ["claude", "claude-pty", "codex"] as const) {
+  for (const id of ["claude", "codex"] as const) {
     const record = { agentCommand: AGENT_REGISTRY[id] } as unknown as SessionRecord;
     const before = JSON.stringify(record);
     setModelSetMethodUnsupported(record, false);
