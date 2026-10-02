@@ -4,6 +4,7 @@ import {
   activeTranscriptConfigDir,
   resolveExistingTranscriptPath,
 } from "../config/subscription-transcript.js";
+import { SYNTHETIC_ASSISTANT_MODEL } from "../models/claude-advertised-label.js";
 import { harnessNativeModels } from "../models/harness-models.js";
 import type { SessionAcpxState, SessionRecord } from "../types.js";
 import { effortRank, normalizeEffortLevelForModel } from "./config-option-application.js";
@@ -360,8 +361,6 @@ function parseJsonObject(line: string): Record<string, unknown> | undefined {
     return undefined;
   }
 }
-
-const SYNTHETIC_ASSISTANT_MODEL = "<synthetic>";
 
 function assistantModelFromJsonlLine(line: string): string | undefined {
   const entry = parseJsonObject(line);

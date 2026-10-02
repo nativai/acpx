@@ -224,11 +224,93 @@ export function resolvedModelLabelForRecord(record: SessionRecord): string | und
   if (!isClaudeRecordCommand(record.agentCommand)) {
     return undefined;
   }
-  const alias = effectiveAlias(record);
   const options = advertisedModelOptions(record.acpx?.config_options);
-  if (alias === undefined || options === undefined) {
+  const option = aliasOption(record, options);
+  const label = option ? labelFromAdvertisedOption(option) : undefined;
+  if (!options || !option || label === undefined) {
     return undefined;
   }
-  const option = findAdvertisedOption(options, alias);
-  return option ? labelFromAdvertisedOption(option) : undefined;
+  return versionedByServedModel(label, option, options, servedModelOf(record)) ?? label;
+}
+
+function aliasOption(
+  record: SessionRecord,
+  options: AdvertisedModelOption[] | undefined,
+): AdvertisedModelOption | undefined {
+  const alias = effectiveAlias(record);
+  return alias === undefined || options === undefined
+    ? undefined
+    : findAdvertisedOption(options, alias);
+}
+
+/**
+ * Claude Code stamps `<synthetic>` on assistant entries it generates LOCALLY; it
+ * is never a served model. Shared by the served-model reader (`model-floor.ts`)
+ * and the index projection, which must not relay one an older acpx recorded.
+ */
+export const SYNTHETIC_ASSISTANT_MODEL = "<synthetic>";
+
+/** `acpx.served.model`, trimmed — absent when missing or `<synthetic>`. */
+export function servedModelOf(record: SessionRecord): string | undefined {
+  const served = nonEmpty(record.acpx?.served?.model);
+  return served === SYNTHETIC_ASSISTANT_MODEL ? undefined : served;
+}
+
+const CONTEXT_SUFFIX = / \(\d+(?:\.\d+)?[KM]\)$/;
+
+function familyOf(label: string): string {
+  return label.split(" ")[0]?.toLowerCase() ?? "";
+}
+
+/**
+ * A VERSION-LESS alias label, versioned by what the session actually SERVED
+ * (brick ebfe4c3c follow-up P-2, HoD rule 2026-10-02).
+ *
+ * The binary can advertise an alias without a version ("fable" → "Fable (1M
+ * context)") beside a concrete id that names it ("claude-fable-5-1" → "Fable 5.1
+ * · …"). Measured on Daniel's session 67f2803e: pin `fable`, served
+ * `claude-fable-5-1`, header "Fable (1M)" — the binary DID name the version, on
+ * another row. So, only when ALL hold:
+ *   · the alias label carries no digit;
+ *   · the served model equals the `value` of ANOTHER advertised option;
+ *   · that option's label passes the shape gate and is the SAME family;
+ * the label becomes that option's, keeping the alias's context suffix when the
+ * other lacks one ("Fable 5.1 (1M)").
+ *
+ * ⚠️ NEVER from `currentValue` alone (a stale creation snapshot — it reads
+ * `claude-fable-5-1` on that very record, but it says nothing about what served),
+ * never across families, never from a served id no option carries.
+ */
+function versionedByServedModel(
+  aliasLabel: string,
+  aliasOpt: AdvertisedModelOption,
+  options: readonly AdvertisedModelOption[],
+  served: string | undefined,
+): string | undefined {
+  const servedLabel = sameFamilyServedLabel(aliasLabel, aliasOpt, options, served);
+  if (servedLabel === undefined) {
+    return undefined;
+  }
+  const suffix = CONTEXT_SUFFIX.exec(aliasLabel)?.[0];
+  return suffix && !CONTEXT_SUFFIX.test(servedLabel) ? `${servedLabel}${suffix}` : servedLabel;
+}
+
+/** The served option's clean label — only for a version-less alias, another option, same family. */
+function sameFamilyServedLabel(
+  aliasLabel: string,
+  aliasOpt: AdvertisedModelOption,
+  options: readonly AdvertisedModelOption[],
+  served: string | undefined,
+): string | undefined {
+  if (/[0-9]/.test(aliasLabel) || served === undefined) {
+    return undefined;
+  }
+  const servedOption = findAdvertisedOption(options, served);
+  if (!servedOption || servedOption.value === aliasOpt.value) {
+    return undefined;
+  }
+  const servedLabel = labelFromAdvertisedOption(servedOption);
+  return servedLabel !== undefined && familyOf(servedLabel) === familyOf(aliasLabel)
+    ? servedLabel
+    : undefined;
 }

@@ -5,7 +5,10 @@ import {
   harnessIdForAgentCommand,
   resolveHarnessCapabilities,
 } from "../../acp/harness-capabilities.js";
-import { resolvedModelLabelForRecord } from "../../models/claude-advertised-label.js";
+import {
+  resolvedModelLabelForRecord,
+  servedModelOf,
+} from "../../models/claude-advertised-label.js";
 import type { SessionRecord } from "../../types.js";
 import { modelSetMethodKnownUnsupported } from "../mode-preference.js";
 import { withSessionIndexLock } from "./index-lock.js";
@@ -268,11 +271,6 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 
 function optionalString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
-}
-
-function nonEmptyTrimmed(value: string | undefined): string | undefined {
-  const trimmed = value?.trim();
-  return trimmed ? trimmed : undefined;
 }
 
 function optionalBoolean(value: unknown): boolean | undefined {
@@ -630,7 +628,9 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     outputStyleDesired: sessionOptions?.output_style,
     canSetModelLive: canSetModelLiveFromRecord(record),
     resolvedModelLabel: resolvedModelLabelForRecord(record),
-    servedModel: nonEmptyTrimmed(acpx?.served?.model),
+    // `servedModelOf` omits `<synthetic>`: records stamped by an acpx that predates
+    // the producer fix still carry it, and the header would print "served <synthetic>".
+    servedModel: servedModelOf(record),
     outputStyleSupported: outputStyleSupportedFromRecord(acpx),
     outputStyleApplied: acpx?.applied_output_style,
     outputStyleRefused: acpx?.refused_output_style,
