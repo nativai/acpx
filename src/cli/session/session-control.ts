@@ -26,11 +26,13 @@ import { OUTPUT_STYLE_CONFIG_ID, outputStyleChangePending } from "../../session/
 import {
   resolveSessionRecord,
   listSessions,
+  readRawRecordClosedState,
   writeSessionRecord,
   writeSessionRecordAtBoundaryWithLifecycle,
   writeSessionRecordWithLifecycle,
   isoNow,
 } from "../../session/persistence.js";
+import type { RawRecordFieldState } from "../../session/persistence.js";
 import type {
   SessionRecord,
   SessionSetConfigOptionResult,
@@ -691,10 +693,30 @@ export type SessionCloseDrainReport = {
   undelivered: QueueDrainedDelivery[];
 };
 
+// What the close actually verified on disk after writing — the record-derived
+// fact a caller (above all the CLI printer, brick 1bfb95ed deliverable 4) must
+// report, instead of inferring success from the write call's own exit status.
+export type SessionCloseRecordState =
+  | { status: "read"; closed: RawRecordFieldState; closedAt: RawRecordFieldState }
+  | { status: "read_failed"; error: string };
+
 export type SessionCloseResult = {
   record: SessionRecord;
   drain: SessionCloseDrainReport;
+  recordClosedState: SessionCloseRecordState;
 };
+
+// Re-reads `<id>.json` immediately after the terminal write, converting a
+// throw (missing file, invalid JSON) into its own distinct outcome rather than
+// letting it propagate and mask a close that otherwise succeeded.
+async function readBackRecordClosedState(acpxRecordId: string): Promise<SessionCloseRecordState> {
+  try {
+    const raw = await readRawRecordClosedState(acpxRecordId);
+    return { status: "read", closed: raw.closed, closedAt: raw.closedAt };
+  } catch (error) {
+    return { status: "read_failed", error: error instanceof Error ? error.message : String(error) };
+  }
+}
 
 // D1 step 0.5 — THE BARRIER. Best-effort exactly like step 1
 // (`tryCloseSessionOnRunningOwner`): a drain that cannot happen never blocks a
@@ -765,10 +787,11 @@ export async function closeSession(
   // read-preserve-lifecycle step so `closed: true` actually lands on disk.
   // See writeSessionRecord doc comment in repository.ts for the ownership rules.
   await writeSessionRecordAtBoundaryWithLifecycle(record);
+  const recordClosedState = await readBackRecordClosedState(record.acpxRecordId);
 
   releaseConfigDirOnTerminalClose(record);
 
-  return { record, drain };
+  return { record, drain, recordClosedState };
 }
 
 // ---------------------------------------------------------------------------
@@ -908,6 +931,7 @@ async function closeSelfOwnedSession(
   // Privileged write: same daemon-authorized close as the non-self path —
   // bypass the read-preserve-lifecycle step so `closed: true` lands on disk.
   await writeSessionRecordAtBoundaryWithLifecycle(record);
+  const recordClosedState = await readBackRecordClosedState(record.acpxRecordId);
 
   if (options.verbose) {
     process.stderr.write(
@@ -925,6 +949,7 @@ async function closeSelfOwnedSession(
   return {
     record,
     drain: { attempted: false, reachedOwner: false, undelivered: [] },
+    recordClosedState,
   };
 }
 

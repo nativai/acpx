@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   isTemplateRecord,
+  readRawRecordClosedState,
   serializeSessionRecordForDisk,
   writeSessionRecord as flushSessionRecord,
 } from "../src/session/persistence.js";
@@ -967,6 +968,66 @@ test("FW-16: a normal agent-exit flush still persists a non-template record (no 
     assert.equal("template" in onDisk, false, "no spurious template marker is introduced");
     assert.equal(onDisk["updated_at"], NEW_TS, "a genuinely newer in-memory updated_at still wins");
     assert.equal(onDisk["last_seq"], 3, "record content still persists on a normal flush");
+  });
+});
+
+// brick 1bfb95ed deliverable 4 — `readRawRecordClosedState` is the thing a
+// post-close verification reads: it must tell "never explicitly closed"
+// (absent) from "closed:false" from "closed:true", a distinction
+// `parseSessionRecord` destroys by defaulting an absent `closed` to `false`.
+test("readRawRecordClosedState distinguishes absent, false and true on disk", async () => {
+  await withTempHome(async (homeDir) => {
+    const absentId = "readback-absent";
+    await fs.mkdir(path.dirname(sessionFilePath(homeDir, absentId)), { recursive: true });
+    await fs.writeFile(
+      sessionFilePath(homeDir, absentId),
+      `${JSON.stringify({ acpxRecordId: absentId })}\n`,
+      "utf8",
+    );
+    const absent = await readRawRecordClosedState(absentId);
+    assert.deepEqual(absent.closed, { present: false });
+    assert.deepEqual(absent.closedAt, { present: false });
+
+    const falseId = "readback-false";
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: falseId,
+        acpSessionId: `${falseId}-acp`,
+        agentCommand: "agent",
+        cwd: homeDir,
+        closed: false,
+      }),
+    );
+    const falsy = await readRawRecordClosedState(falseId);
+    assert.deepEqual(falsy.closed, { present: true, value: false });
+    assert.deepEqual(
+      falsy.closedAt,
+      { present: false },
+      "undefined closedAt is dropped by JSON.stringify, not written as null",
+    );
+
+    const trueId = "readback-true";
+    const closedAtStamp = new Date().toISOString();
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: trueId,
+        acpSessionId: `${trueId}-acp`,
+        agentCommand: "agent",
+        cwd: homeDir,
+        closed: true,
+        closedAt: closedAtStamp,
+      }),
+    );
+    const truthy = await readRawRecordClosedState(trueId);
+    assert.deepEqual(truthy.closed, { present: true, value: true });
+    assert.deepEqual(truthy.closedAt, { present: true, value: closedAtStamp });
+
+    await assert.rejects(
+      readRawRecordClosedState("readback-never-written"),
+      "a missing record must throw — a close verb must treat this as its own failure, never a silent success",
+    );
   });
 });
 

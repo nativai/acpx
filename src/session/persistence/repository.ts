@@ -312,6 +312,44 @@ export async function readPersistedLifecycle(
   }
 }
 
+/** Whether a raw-JSON field was present on disk at all — `parseSessionRecord`
+ * collapses an absent `closed` into `false` (brick 1bfb95ed), which is exactly
+ * the distinction a post-write verification needs back. */
+export type RawRecordFieldState = { present: false } | { present: true; value: unknown };
+
+export type RawRecordClosedState = {
+  closed: RawRecordFieldState;
+  closedAt: RawRecordFieldState;
+};
+
+/**
+ * The record's `closed` / `closed_at` keys exactly as they sit in `<id>.json`
+ * right now — read directly off the raw parsed JSON, bypassing
+ * `parseSessionRecord`'s normalization so presence survives. For verifying a
+ * write actually landed (brick 1bfb95ed deliverable 4): the caller needs to
+ * tell "never explicitly closed" (absent) from "closed:false" from
+ * "closed:true", and a `SessionRecord.closed` (always a `boolean`) cannot
+ * make that distinction once parsed.
+ *
+ * Throws on a missing file or invalid JSON — the caller's problem to report,
+ * never silently downgraded to "unclosed" the way `readPersistedLifecycle`'s
+ * `undefined` return is for its own (different) purpose.
+ */
+export async function readRawRecordClosedState(
+  acpxRecordId: string,
+): Promise<RawRecordClosedState> {
+  const payload = await fs.readFile(sessionFilePath(acpxRecordId), "utf8");
+  const raw = JSON.parse(payload) as Record<string, unknown>;
+  return {
+    closed: Object.hasOwn(raw, "closed")
+      ? { present: true, value: raw.closed }
+      : { present: false },
+    closedAt: Object.hasOwn(raw, "closed_at")
+      ? { present: true, value: raw.closed_at }
+      : { present: false },
+  };
+}
+
 /**
  * Write a session record to `<id>.json` and update the index cache.
  *
