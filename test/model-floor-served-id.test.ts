@@ -223,7 +223,7 @@ test("R7 an at-floor serve after a mismatch clears the breadcrumb", async () => 
 // brick ac931199 closes it) ───────────────────────────────────────────────────
 //
 // `session_options.model === "default"` is not an invented fixture value — it
-// is exactly what the acpx-ui model picker's "Default (Opus 5, 1M context)" row
+// is exactly what the acpx-ui model picker's "Default (Opus, 1M context)" row
 // writes, and it is the LITERAL string `modelFamily`/`servedModelMatchesFloor`
 // used to compare against the served id before this fix — "default" contains
 // none of fable/opus/sonnet/haiku, so it always read as a concrete pin the

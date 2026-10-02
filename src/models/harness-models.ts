@@ -56,11 +56,24 @@ function capLadder(ladder: CanonicalDepthLevel[], ceiling: CanonicalDepthLevel) 
 // `aliasTarget` is what lets `model-floor.ts` resolve a `"default"` pin to a
 // comparable family instead of comparing the literal string "default" against
 // a served id (brick://ac931199). It is co-located with the `name` string that
-// already documents the same fact ("Opus 5") so the two can never drift apart
+// already documents the same fact ("Opus") so the two can never drift apart
 // silently the way an aliasTarget derived from an external adapter reading
 // could (contrast the fable cross-adapter-version note in model-floor.ts) —
 // this mapping is ours, not observed off the wire, and we update both fields
 // together the day acpx's own "default" choice changes.
+//
+// The names here are deliberately VERSION-NEUTRAL ("Opus", "Sonnet"), and must
+// stay that way. These aliases do not pin a version: each resolves to whatever
+// the Claude Code binary bundled in claude-agent-acp's @anthropic-ai/
+// claude-agent-sdk decides, so any vintage we bake in here is a claim we do not
+// control and it rots on the next SDK bump — silently, because nothing compares
+// the label to the served id. They were "Sonnet 5" and "Default (Opus 5, 1M
+// context)" while the bundled binary had already moved to Sonnet 5.5 / Opus 5.5
+// (SDK 0.3.257 -> 0.3.287), so the picker printed 5 for a session served 5.5 and
+// two agents drew wrong conclusions from it. The same reasoning is why
+// claude-agent-acp's own injectOpusModel describes its row as plain "Opus".
+// To learn what is ACTUALLY served, read the session record's `served_model` —
+// never this label.
 const CLAUDE_ALIASES: {
   id: string;
   name: string;
@@ -68,11 +81,11 @@ const CLAUDE_ALIASES: {
 }[] = [
   {
     id: "default",
-    name: "Default (Opus 5, 1M context)",
+    name: "Default (Opus, 1M context)",
     aliasTarget: { id: "opus", name: "Opus" },
   },
   { id: "opus", name: "Opus" },
-  { id: "sonnet", name: "Sonnet 5" },
+  { id: "sonnet", name: "Sonnet" },
   { id: "haiku", name: "Haiku 4.5" },
   { id: "fable", name: "Fable 5" },
 ];
