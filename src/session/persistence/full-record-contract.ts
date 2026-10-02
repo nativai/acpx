@@ -71,6 +71,7 @@ export const RECORD_FIELD_PLAN = {
   eventLog: { persisted: true },
   closed: { persisted: true },
   closedAt: { persisted: true },
+  reopenedAt: { persisted: true },
   favorite: { persisted: true },
   favoritedAt: { persisted: true },
   pid: { persisted: true },

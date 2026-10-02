@@ -2749,6 +2749,13 @@ export async function handleSessionsList(
 // regression — the thing that was missing here was SIGNAL, not exit status.
 const UNDELIVERED_CUSTODY_EXIT_CODE = 3;
 
+// The close itself landed (closeSession did not throw); this fires only when
+// the immediate post-write re-read of `<id>.json` (brick 1bfb95ed deliverable
+// 4) could not be performed — missing file, invalid JSON. Distinct from
+// UNDELIVERED_CUSTODY_EXIT_CODE: that is a default-off opt-in signal about
+// messages, this is never silent because there is no flag that suppresses it.
+const CLOSE_READBACK_FAILED_EXIT_CODE = 6;
+
 export async function handleSessionsClose(
   explicitAgentName: string | undefined,
   sessionName: string | undefined,
@@ -2792,7 +2799,30 @@ export async function handleSessionsClose(
     drainTimeoutMs: flags.drainTimeout,
     verbose: globalFlags.verbose,
   });
-  printClosedSessionByFormat(closed.record, closed.drain, globalFlags.format);
+  printClosedSessionByFormat(
+    closed.record,
+    closed.drain,
+    closed.recordClosedState,
+    globalFlags.format,
+  );
+
+  applyCloseExitCode(closed, record, flags, warnUndeliveredCustody);
+}
+
+// The close call itself already succeeded (it would have thrown otherwise);
+// a failed read-back is a SEPARATE fact — we closed it but could not verify
+// what landed — and must surface as its own non-zero, never a silent exit 0
+// (brick 1bfb95ed deliverable 4). Split out of handleSessionsClose to keep
+// that function's own complexity under the lint ceiling.
+function applyCloseExitCode(
+  closed: Awaited<ReturnType<SessionModule["closeSession"]>>,
+  record: SessionRecord,
+  flags: SessionsCloseFlags,
+  warnUndeliveredCustody: OutputRenderModule["warnUndeliveredCustody"],
+): void {
+  if (closed.recordClosedState.status === "read_failed") {
+    process.exitCode = CLOSE_READBACK_FAILED_EXIT_CODE;
+  }
 
   if (closed.drain.undelivered.length > 0) {
     warnUndeliveredCustody(record.name ?? record.acpxRecordId, closed.drain);

@@ -10,7 +10,10 @@ import type {
   SessionRecord,
 } from "../../types.js";
 import { probeQueueOwnerHealth } from "../queue/ipc.js";
-import type { SessionCloseDrainReport } from "../session/session-control.js";
+import type {
+  SessionCloseDrainReport,
+  SessionCloseRecordState,
+} from "../session/session-control.js";
 import { emitJsonResult } from "./json-output.js";
 
 function formatSessionLabel(record: SessionRecord): string {
@@ -141,9 +144,30 @@ function printTextAgentSessions(result: AgentSessionListResult): void {
   }
 }
 
+// brick 1bfb95ed deliverable 4: the printed outcome of a close must be what
+// `sessions close` RE-READ off `<id>.json` after writing, never its own write
+// call's exit status — the gap that let an operator trust a close which had,
+// elsewhere and later, silently reverted. `null` means the key was ABSENT on
+// disk, distinct from a present `false` (see `RawRecordFieldState`); a
+// non-boolean raw value prints as-is, which is itself a finding.
+function recordClosedStateForJson(state: SessionCloseRecordState): Record<string, unknown> {
+  if (state.status === "read_failed") {
+    return { recordReadBackFailed: true, recordReadBackError: state.error };
+  }
+  return {
+    recordClosed: state.closed.present ? state.closed.value : null,
+    recordClosedAt: state.closedAt.present ? state.closedAt.value : null,
+  };
+}
+
+function formatRawFieldForText(field: { present: boolean; value?: unknown }): string {
+  return field.present ? String(field.value) : "(absent)";
+}
+
 export function printClosedSessionByFormat(
   record: SessionRecord,
   drain: SessionCloseDrainReport,
+  recordClosedState: SessionCloseRecordState,
   format: OutputFormat,
 ): void {
   if (
@@ -163,6 +187,7 @@ export function printClosedSessionByFormat(
         ...(drain.turnSettled !== undefined ? { turnSettled: drain.turnSettled } : {}),
         undelivered: drain.undelivered,
       },
+      ...recordClosedStateForJson(recordClosedState),
     })
   ) {
     return;
@@ -173,6 +198,15 @@ export function printClosedSessionByFormat(
   }
 
   process.stdout.write(`${record.acpxRecordId}\n`);
+  if (recordClosedState.status === "read_failed") {
+    process.stderr.write(
+      `[acpx] closed ${record.acpxRecordId}, but could not read the record back to verify: ${recordClosedState.error}\n`,
+    );
+    return;
+  }
+  process.stdout.write(
+    `closed: ${formatRawFieldForText(recordClosedState.closed)} (read back from record)\n`,
+  );
 }
 
 /**

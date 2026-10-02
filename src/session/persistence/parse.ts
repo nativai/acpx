@@ -1374,6 +1374,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
   const pid = normalizeOptionalPid(record.pid);
   const closed = normalizeOptionalBoolean(record.closed, false);
   const closedAt = normalizeOptionalString(record.closed_at);
+  const reopenedAt = normalizeOptionalString(record.reopened_at);
   const favorite = normalizeOptionalBooleanField(record.favorite);
   const favoritedAt = normalizeOptionalString(record.favorited_at);
   const agentStartedAt = normalizeOptionalString(record.agent_started_at);
@@ -1421,6 +1422,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     pid === null ||
     closed === null ||
     closedAt === null ||
+    reopenedAt === null ||
     favorite === null ||
     favoritedAt === null ||
     agentStartedAt === null ||
@@ -1516,6 +1518,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
       eventLog,
       closed,
       closedAt,
+      reopenedAt,
       favorite,
       favoritedAt,
       pid,

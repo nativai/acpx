@@ -64,6 +64,7 @@ export function serializeSessionRecordForDisk(
     event_log: canonical.eventLog,
     closed: canonical.closed,
     closed_at: canonical.closedAt,
+    reopened_at: canonical.reopenedAt,
     favorite: canonical.favorite,
     favorited_at: canonical.favoritedAt,
     pid: canonical.pid,
