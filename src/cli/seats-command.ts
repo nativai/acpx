@@ -834,6 +834,9 @@ function headlineLines(report: SeatBackfillReport): string[] {
     // that were (or, on a dry run, would be) pointed at the seat's holder. `0` once
     // every such row has been filled once.
     `  holders filled:       ${report.activeHoldersFilled}`,
+    // Brick `eca085bb` fix round: filled holders whose `holder_active` mirror was (or would be)
+    // set true so it agrees with the pointer, as a fresh mint does.
+    `  holder mirrors set:   ${report.holderMirrorsSet}`,
     `  errors:               ${report.errors.length}`,
   ];
 }

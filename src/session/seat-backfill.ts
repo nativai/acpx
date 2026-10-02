@@ -153,6 +153,14 @@ export type SeatBackfillReport = {
    * non-null pointer. Same "re-run touches zero" contract as the two above.
    */
   activeHoldersFilled: number;
+  /**
+   * Brick `eca085bb` fix round: holders whose `holder_active` mirror was set TRUE
+   * (record AND index entry) because their pointer was filled — a fresh mint sets it,
+   * so the fill must too, or the first succession reports a false D10 divergence and
+   * the star guard (which reads the mirror) treats the seat's holder as retired. A
+   * holder whose mirror is already true is not counted. Dry run: would be set.
+   */
+  holderMirrorsSet: number;
   errors: SeatBackfillError[];
   /** The `.bak-mig-<TS>` suffix of this run's pre-apply copies, absent on a dry run. */
   backupSuffix: string | undefined;
@@ -307,6 +315,8 @@ type SeatPlan = {
    * touched; a closed (abolished) seat's vacancy is not ours to repair.
    */
   activeHolderNeedsFill: boolean;
+  /** The member the fill points at — the one whose mirror the fill must also set. */
+  holder: RecordPlan | undefined;
 };
 
 /**
@@ -705,6 +715,7 @@ async function planSeats(
         existing.activeHolderId === null &&
         existing.closedAt === null &&
         row.activeHolderId !== null,
+      holder: activeHolderFor(members),
     });
   }
   return seatPlans;
@@ -743,6 +754,7 @@ type ApplyCounts = {
   /** D-SEAT-HOLD, brick `eca085bb` — same shape, one field over. */
   activeHoldersAttempted: Set<string>;
   activeHoldersFilled: number;
+  holderMirrorsSet: number;
   backups: string[];
 };
 
@@ -847,6 +859,22 @@ async function writeBrickLinkFillLeg(
  * never overwrites a non-null pointer, so this guard is an optimisation and never
  * the authority.
  */
+function needsMirrorWrite(seat: SeatPlan): boolean {
+  return seat.activeHolderNeedsFill && seat.holder?.record.holderActive !== true;
+}
+
+/** Set the filled holder's `holder_active` TRUE on its record (re-read from disk,
+ * through the one authorised writer of the seat-holder half) and then its index entry. */
+async function writeHolderMirrorLeg(sessionDir: string, holder: RecordPlan): Promise<void> {
+  const fresh = await readRecordFile(sessionDir, holder.file);
+  if (!fresh) {
+    throw new Error(`holder record ${holder.file} no longer parses`);
+  }
+  fresh.holderActive = true;
+  await writeSessionRecordAuthorizingSeatHolderWithoutIndex(fresh);
+  await writeIndexLeg(sessionDir, holder);
+}
+
 async function writeActiveHolderFillLeg(
   sessionDir: string,
   plan: RecordPlan,
@@ -858,6 +886,13 @@ async function writeActiveHolderFillLeg(
     return;
   }
   counts.activeHoldersAttempted.add(plan.seatId);
+  // The mirror FIRST, then the pointer: a record ahead of its row is the direction
+  // this verb's ordering already tolerates, and a failure between the two is
+  // re-run-safe (the pointer is still null, so the next run fills it).
+  if (seat.holder !== undefined && needsMirrorWrite(seat)) {
+    await writeHolderMirrorLeg(sessionDir, seat.holder);
+    counts.holderMirrorsSet += 1;
+  }
   if (
     seat.row.activeHolderId !== null &&
     (await fillSeatActiveHolder(sessionDir, plan.seatId, seat.row.activeHolderId)) === "filled"
@@ -955,6 +990,7 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
       brickLinksFilled: [...seatPlans.values()].filter((seat) => seat.brickLinkNeedsFill).length,
       activeHoldersFilled: [...seatPlans.values()].filter((seat) => seat.activeHolderNeedsFill)
         .length,
+      holderMirrorsSet: [...seatPlans.values()].filter(needsMirrorWrite).length,
       errors,
       backupSuffix: undefined,
       backups: [],
@@ -973,6 +1009,7 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
     brickLinksFilled: 0,
     activeHoldersAttempted: new Set(),
     activeHoldersFilled: 0,
+    holderMirrorsSet: 0,
     backups: await takeStoreBackups(sessionDir, suffix),
   };
   for (const plan of scanned.plans) {
@@ -990,6 +1027,7 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
     favoritesMigrated: counts.favoritesMigrated,
     brickLinksFilled: counts.brickLinksFilled,
     activeHoldersFilled: counts.activeHoldersFilled,
+    holderMirrorsSet: counts.holderMirrorsSet,
     errors,
     backupSuffix: suffix,
     backups: counts.backups,
