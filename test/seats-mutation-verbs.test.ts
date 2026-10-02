@@ -707,8 +707,7 @@ test("RN8 · a VACANT seat (active_holder_id null) is renamed anyway — there i
   // cleared by anything that ships.
   //
   // The row still earns its place: vacancy is a DOCUMENTED first-class state —
-  // `seat-store.ts` calls `null` "nobody home — a first-class, non-error state, not an
-  // absence to be repaired", and `resolvePredecessorOrRefuse` branches on it — so
+  // `seat-store.ts` calls `null` "vacant" — a non-error state, and `resolvePredecessorOrRefuse` branches on it — so
   // `rename` must handle it. The parse leg accepts an explicit `null` by design, which
   // is what lets the fixture enter the state honestly. The CLI still drives the rename
   // itself, so AC16's standard holds for the ACT; only the PRECONDITION is fixture-written.
@@ -1774,7 +1773,7 @@ async function mintFounderAndSeat(
 
 // ─── show ────────────────────────────────────────────────────────────────────
 
-test("SH1 · a VACANT seat (active_holder_id: null) shows as NOBODY HOME", async () => {
+test("SH1 · a VACANT seat (active_holder_id: null) shows as VACANT", async () => {
   await withRig(async (homeDir) => {
     await writeStore(homeDir, {
       [SEAT_A]: seatRow(SEAT_A, { active_holder_id: null, name: "alpha", brick_id: BRICK_ID }),
@@ -1786,12 +1785,12 @@ test("SH1 · a VACANT seat (active_holder_id: null) shows as NOBODY HOME", async
       activeHolderIdRaw: string | null;
       brickId: string | null;
     };
-    assert.deepEqual(payload.activeHolder, { state: "nobody-home", id: null });
+    assert.deepEqual(payload.activeHolder, { state: "vacant", id: null });
     assert.equal(payload.activeHolderIdRaw, null);
     assert.equal(payload.brickId, BRICK_ID, "the seventh field, brick_id, must round-trip");
 
     const text = await runCli(["seats", "show", SEAT_A], homeDir);
-    assert.match(text.stdout, /nobody home/);
+    assert.match(text.stdout, /active holder:\s+vacant/);
   });
 });
 
@@ -1807,7 +1806,7 @@ test("SH1 · a VACANT seat (active_holder_id: null) shows as NOBODY HOME", async
  * that closes without a successor leaves its seat's row pointing at a closed id
  * forever — exactly the shape this row reaches through the real CLI.
  */
-test("SH2 · a CLOSED holder's pointer shows as NOBODY HOME, identically to a null pointer (the falsifier)", async () => {
+test("SH2 · a CLOSED holder's pointer shows as HELD BY A CLOSED SESSION, never as vacant and never as active (the falsifier)", async () => {
   await withRig(async (homeDir) => {
     const { holderId, seatId } = await mintFounderAndSeat(homeDir, "sh2-holder");
     const closedHolder = await runCli(
@@ -1836,10 +1835,13 @@ test("SH2 · a CLOSED holder's pointer shows as NOBODY HOME, identically to a nu
     // THE ASSERTION THAT WOULD HAVE FAILED: a `show` reading the raw pointer would
     // report `state: "active", id: holderId` here — a CLOSED session as the active
     // holder.
+    // (Brick `eca085bb`, D-SEAT-HOLD: this row used to assert the OPPOSITE — that a
+    // closed pointer renders identically to vacancy as "nobody-home". Inverted:
+    // a close does not vacate a seat, so the seat is shown as held.)
     assert.deepEqual(
       payload.activeHolder,
-      { state: "nobody-home", id: holderId },
-      "a closed holder must render identically to vacancy in STATE, while still naming the id for diagnosis",
+      { state: "held-by-closed-session", id: holderId },
+      "a closed holder must render as HELD BY a closed session — distinct from vacancy and from active",
     );
     assert.equal(
       payload.activeHolderIdRaw,
@@ -1848,12 +1850,14 @@ test("SH2 · a CLOSED holder's pointer shows as NOBODY HOME, identically to a nu
     );
 
     const text = await runCli(["seats", "show", seatId], homeDir);
-    assert.match(text.stdout, /active holder:\s+nobody home/);
-    assert.doesNotMatch(
-      text.stdout.split("\n").find((line) => line.includes("active holder:")) ?? "",
-      new RegExp(holderId),
-      "the ACTIVE HOLDER line must not print the closed holder's id as if it were current",
+    const holderLine =
+      text.stdout.split("\n").find((line) => line.includes("active holder:")) ?? "";
+    assert.match(
+      holderLine,
+      new RegExp(`${holderId} \\(held by a closed session\\)`),
+      "the ACTIVE HOLDER line must name the closed holder AND say it is closed",
     );
+    assert.doesNotMatch(holderLine, /nobody home|vacant/);
 
     // The holders list (a different field) DOES resolve this holder, and correctly
     // as closed — the two-encodings rule is about "who is ACTIVE", not about

@@ -190,8 +190,10 @@ export type SeatRecord = {
   /** Identity. A UUID (C1) — validated at the ORIGIN and nowhere else (D8). */
   seatId: string;
   createdAt: string;
-  /** THE AUTHORITY for who holds this seat. **`null` = nobody home** — a
-   * first-class, non-error state, not an absence to be repaired. */
+  /** THE AUTHORITY for who holds this seat. A holder that has CLOSED still holds
+   * it until a successor is activated (D-SEAT-HOLD). **`null` = vacant** — a
+   * non-error state, which no product path writes any more (a close keeps the
+   * pointer); it survives on a row the backfill has not yet filled. */
   activeHolderId: string | null;
   /** Monotonic counter. **Only ever increases**; read-incremented inside the write
    * hold so two concurrent activations cannot take the same number. Gaps are
@@ -459,7 +461,7 @@ type PersistedSeat = {
  *
  * ⚠️ THE ABSENT/NULL DISTINCTION IS DELIBERATE AND LOAD-BEARING. `active_holder_id`
  * and `closed_at` are always WRITTEN, `null` included, because `null` is a value
- * there — "nobody home" and "not closed" are facts, and a reader must be able to
+ * there — "vacant" and "not closed" are facts, and a reader must be able to
  * tell them from a field nobody wrote. `name` and `brick_id` are OMITTED when
  * unset, because for them absence is the fact. `JSON.stringify` drops
  * undefined-valued keys, which is what makes the second half work — so do NOT
@@ -1062,6 +1064,39 @@ export async function fillSeatBrickLink(
     }
     const seats = new Map(store.seats);
     seats.set(seatId, { ...row, brickId: { ref: derivedRef, validated: false } });
+    return { mutation: { kind: "write", seats } as const, result: "filled" as const };
+  });
+}
+
+/**
+ * D-SEAT-HOLD, brick `eca085bb` — POINT a NULL `active_holder_id` at the seat's
+ * holder, for a seat row that ALREADY EXISTS and is not itself closed. A closed
+ * session keeps holding its seat until a successor is activated, so a null pointer
+ * on an open seat is the active-only backfill's leftover (brick `5c4b8c4a`).
+ *
+ * 🛑 **NEVER OVERWRITES A NON-NULL POINTER** — only activation replaces one — and
+ * never touches a seat whose `closed_at` is set (an abolished seat's vacancy is
+ * not this backfill's to repair). Writes the pointer and nothing else. Same
+ * idempotent, malformed-row-throws contract as `fillSeatBrickLink`.
+ */
+export async function fillSeatActiveHolder(
+  sessionDir: string,
+  seatId: string,
+  holderId: string,
+): Promise<"filled" | "unchanged" | "no-row"> {
+  return await withSeatStoreWrite(sessionDir, (store) => {
+    if (store.malformedSeatIds.includes(seatId)) {
+      throw new MalformedSeatRowError(seatId);
+    }
+    const row = store.seats.get(seatId);
+    if (!row) {
+      return { mutation: SEAT_STORE_NO_CHANGE, result: "no-row" as const };
+    }
+    if (row.activeHolderId !== null || row.closedAt !== null) {
+      return { mutation: SEAT_STORE_NO_CHANGE, result: "unchanged" as const };
+    }
+    const seats = new Map(store.seats);
+    seats.set(seatId, { ...row, activeHolderId: holderId });
     return { mutation: { kind: "write", seats } as const, result: "filled" as const };
   });
 }
