@@ -2204,13 +2204,14 @@ export async function findSession(options: FindSessionOptions): Promise<SessionR
  * uniqueness, so two or more live sessions sharing a slot is an ordinary
  * state (HOD-R43, brick 4e58b35c).
  *
- * ⚠️ IT CAN THROW — it awaits `loadSessionIndexEntries()`, real I/O that a
- * concurrent `sessions new` can be racing via `loadOrRebuildSessionIndex`'s
- * rename-into-place. The "never affects whether a create succeeds" guarantee
- * is therefore the CALLER's job, not this function's: `handleSessionsNew`
- * wraps this call in a try/catch that degrades to no notice. Swallowing the
- * error in here instead would hide a real fault from any future caller that
- * wants to know about it.
+ * ⚠️ IT CAN THROW — it awaits `loadSessionIndexEntries()`, real unguarded
+ * I/O. Measured directly (fault injection, brick 4e58b35c): with
+ * `index.json` replaced by a directory, this call throws EISDIR. The "never
+ * affects whether a create succeeds" guarantee is therefore the CALLER's
+ * job, not this function's: `handleSessionsNew` wraps this call in a
+ * try/catch that degrades to no notice. Swallowing the error in here
+ * instead would hide a real fault from any future caller that wants to
+ * know about it.
  */
 export async function listCoClaimantSessions(
   options: FindSessionOptions,

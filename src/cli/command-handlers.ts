@@ -3027,11 +3027,12 @@ export async function handleSessionsNew(
   //
   // GUARDED HERE, not inside listCoClaimantSessions: it awaits
   // loadSessionIndexEntries(), which does real (unguarded) I/O, so this is a
-  // read that CAN throw — a corrupt/mid-rewrite index.json, or (the routine
-  // case on a shared box) a concurrent `sessions new` racing the same
-  // rename-into-place loadOrRebuildSessionIndex does. An advisory notice must
-  // never be able to fail the create it is only decorating, so any failure
-  // here degrades to "no notice" and falls through unconditionally.
+  // read that CAN throw — measured directly (fault injection, brick
+  // 4e58b35c): with index.json replaced by a directory, this call throws
+  // EISDIR, and unguarded that turned a create that would otherwise have
+  // succeeded into one that never ran at all. An advisory notice must never
+  // be able to fail the create it is only decorating, so any failure here
+  // degrades to "no notice" and falls through unconditionally.
   let coClaimants: SessionNameCandidate[] = [];
   try {
     coClaimants = await listCoClaimantSessions({
