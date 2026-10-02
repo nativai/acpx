@@ -65,12 +65,23 @@ function usableBaseDirectory(candidate: string | null | undefined): string | nul
 export function resolveAndEnsureAgentFolder(
   record: SessionRecord,
   brickPath?: string | null,
-): string | null {
+): AgentFolders | null {
   const baseDirectory = usableBaseDirectory(brickPath);
   if (!baseDirectory) {
     return null;
   }
   const agentFolder = path.join(baseDirectory, "agents", buildAgentFolderName(record));
   fs.mkdirSync(agentFolder, { recursive: true });
-  return agentFolder;
+  return { agentFolder, seatFolder: null };
+}
+
+// C7 (brick 09197f03) RED STUB — the seat-keyed derivation lands in the green commit.
+export type AgentFolders = { agentFolder: string; seatFolder: string | null };
+
+export function deriveAgentFolders(_input: {
+  brickPath: string;
+  sessionId: string;
+  seatId?: string | null;
+}): AgentFolders {
+  throw new Error("C7 red stub: deriveAgentFolders is not implemented");
 }

@@ -15,6 +15,18 @@ function modeForVerb() {
   return process.env.BRICK_SHIM_MODE ?? "ok";
 }
 
+// C7: when set, record what identity env the shim was spawned with (null = ABSENT), so a test
+// can assert the child's session and seat reach `brick` through env, not through flags.
+const envLogPath = process.env.BRICK_SHIM_ENV_LOG;
+if (envLogPath) {
+  const has = (name) => (Object.hasOwn(process.env, name) ? process.env[name] : null);
+  fs.appendFileSync(
+    envLogPath,
+    `${JSON.stringify({ verb, ACPX_SESSION_URL: has("ACPX_SESSION_URL"), ACPX_SEAT_URL: has("ACPX_SEAT_URL") })}\n`,
+    "utf8",
+  );
+}
+
 const mode = modeForVerb();
 if (mode === "hang") {
   setTimeout(() => {}, 30_000);

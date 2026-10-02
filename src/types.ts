@@ -358,6 +358,7 @@ export type AcpClientOptions = {
     brick?: string | null;
     brickPath?: string | null;
     agentFolder?: string | null;
+    seatFolder?: string | null;
     subscriptionId?: string | null;
     /** Profile id from session_options.profile — takes priority over subscriptionId. */
     profileId?: string | null;

@@ -521,6 +521,7 @@ export type AgentSessionContext = {
   brick?: string | null;
   brickPath?: string | null;
   agentFolder?: string | null;
+  seatFolder?: string | null;
   /**
    * Selected Claude subscription id (from ~/.acpx/subscriptions/registry.json).
    * When set and resolvable, buildAgentEnvironment points the adapter at that

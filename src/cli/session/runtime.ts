@@ -2348,7 +2348,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         parentSessionUrl: record.parentSessionUrl ?? null,
         brick,
         brickPath,
-        agentFolder: resolveAndEnsureAgentFolder(record, brickPath),
+        agentFolder: resolveAndEnsureAgentFolder(record, brickPath)?.agentFolder ?? null,
         subscriptionId: record.acpx?.session_options?.subscription ?? null,
         profileId: record.acpx?.session_options?.profile ?? null,
         reasoningEffort: sessionOptions?.reasoningEffort ?? null,

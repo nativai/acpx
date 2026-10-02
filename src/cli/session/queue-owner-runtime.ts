@@ -169,7 +169,7 @@ function sessionContextFromRecord(record: Awaited<ReturnType<typeof resolveSessi
     parentSessionUrl: record.parentSessionUrl ?? null,
     brick,
     brickPath,
-    agentFolder: resolveAndEnsureAgentFolder(record, brickPath),
+    agentFolder: resolveAndEnsureAgentFolder(record, brickPath)?.agentFolder ?? null,
     subscriptionId: record.acpx?.session_options?.subscription ?? null,
     profileId: record.acpx?.session_options?.profile ?? null,
     seatId: record.seatId ?? null,

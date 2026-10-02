@@ -19,6 +19,7 @@ type BrickContextOptions = {
   // as `--session <id>` so the rendered "Your workspace" line names the child's own agent
   // folder — never the spawner's, which the queue-owner's ambient $ACPX_SESSION_URL carries.
   sessionId?: string;
+  seatId?: string;
 };
 
 export async function resolveBrickContext(
