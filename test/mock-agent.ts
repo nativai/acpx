@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
@@ -87,6 +87,14 @@ type MockAgentOptions = {
   operationLogFile?: string;
   claudeAgentAcp: boolean;
   expectedForkMeta?: unknown;
+  /**
+   * brick ebfe4c3c — the `model` select's options, read from a JSON file
+   * (`[{value,name,description}, …]`), REPLACING the built-in list. This is how a
+   * test makes the mock advertise what the real claude adapter does
+   * ("Opus 5.5 · Best for everyday, complex tasks") — or a version no binary has
+   * shipped, to prove the label follows the advertisement with zero code edits.
+   */
+  modelAdvertisement?: { value: string; name: string; description?: string }[];
 };
 
 type SessionState = {
@@ -421,6 +429,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let operationLogFile: string | undefined;
   let claudeAgentAcp = false;
   let expectedForkMeta: unknown;
+  let modelAdvertisement: MockAgentOptions["modelAdvertisement"];
 
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
@@ -573,6 +582,15 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    if (token === "--model-advertisement") {
+      modelAdvertisement = JSON.parse(
+        readFileSync(parseOptionValue(argv, index + 1, token), "utf8"),
+      ) as MockAgentOptions["modelAdvertisement"];
+      advertiseConfigOptions = true;
+      index += 1;
+      continue;
+    }
+
     // brick://5a7cf1f0 — DECLARATION ONLY, deliberately with no behavioural effect.
     //
     // The sibling `--claude-agent-acp` above switches the mock into SDK-adapter
@@ -659,6 +677,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     operationLogFile,
     claudeAgentAcp,
     expectedForkMeta,
+    ...(modelAdvertisement !== undefined ? { modelAdvertisement } : {}),
   };
 }
 
@@ -833,7 +852,7 @@ function buildConfigOptions(
       category: "model",
       type: "select",
       currentValue: state.modelId,
-      options: [
+      options: options.modelAdvertisement ?? [
         { value: "default", name: "Default" },
         { value: "gpt-5.4", name: "gpt-5.4" },
         { value: "gpt-5.2", name: "gpt-5.2" },

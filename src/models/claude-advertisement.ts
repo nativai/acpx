@@ -74,7 +74,19 @@ export type ClaudeAdvertKey = {
 
 export type ClaudeAdvertSource = "probe" | "fixture";
 
-export type ClaudeAdvertFailure = { at: string; message: string; key: ClaudeAdvertKey };
+/**
+ * `retryAfter` is the end of the failed key's backoff window, WRITTEN INTO THE
+ * RECORD so an operator reading the file sees when the next automatic probe may
+ * run. It is bounded: never later than `at` + {@link CLAUDE_FAILED_KEY_RETRY_MS},
+ * so a box whose post-deploy probe failed retries on its own and cannot sit on
+ * alias-only labels until someone runs `--refresh`.
+ */
+export type ClaudeAdvertFailure = {
+  at: string;
+  retryAfter: string;
+  message: string;
+  key: ClaudeAdvertKey;
+};
 
 /** Schema v1 — the RAW advertisement, never labels. */
 export type ClaudeAdvertCache = {
@@ -259,7 +271,17 @@ function parseFailure(value: unknown): ClaudeAdvertFailure | null {
   if (!failure || key === null || at === null) {
     return null;
   }
-  return { at, message: typeof failure.message === "string" ? failure.message : "", key };
+  return {
+    at,
+    retryAfter: nonEmptyString(failure.retryAfter) ?? retryAfterFor(Date.parse(at)),
+    message: typeof failure.message === "string" ? failure.message : "",
+    key,
+  };
+}
+
+function retryAfterFor(failedAt: number): string {
+  const at = Number.isFinite(failedAt) ? failedAt : 0;
+  return new Date(at + CLAUDE_FAILED_KEY_RETRY_MS).toISOString();
 }
 
 /** Unreadable, garbled or foreign-schema = no cache. Never throws. */
@@ -327,12 +349,24 @@ function needsProbe(cache: ClaudeAdvertCache | null, key: ClaudeAdvertKey, now: 
   }
   const failure = cache.lastFailure;
   if (failure && sameClaudeAdvertKey(failure.key, key)) {
-    const elapsed = now - Date.parse(failure.at);
-    // A failure stamped in the future (clock step, copied file) must not
-    // suppress the retry forever — same both-ends rule as the warm sentinel.
-    return !(elapsed >= 0 && elapsed < CLAUDE_FAILED_KEY_RETRY_MS);
+    return !insideRetryWindow(failure, now);
   }
   return !sameClaudeAdvertKey(cache.key, key);
+}
+
+/**
+ * Bounded at BOTH ends, like the warm sentinel: a failure stamped in the future
+ * (clock step, copied file) does not suppress the retry, and a `retryAfter` past
+ * the 1 h bound (a hand-edited file) is capped to it.
+ */
+function insideRetryWindow(failure: ClaudeAdvertFailure, now: number): boolean {
+  const failedAt = Date.parse(failure.at);
+  const recorded = Date.parse(failure.retryAfter);
+  const retryAt = Math.min(
+    Number.isFinite(recorded) ? recorded : Number.POSITIVE_INFINITY,
+    failedAt + CLAUDE_FAILED_KEY_RETRY_MS,
+  );
+  return now >= failedAt && now < retryAt;
 }
 
 /** The warm predicate's third term (`catalogueNeedsWarm`): file reads only, no socket, no child. */
@@ -491,15 +525,15 @@ async function runProbe(params: {
   } catch (error) {
     next = {
       ...(params.cache ?? emptyCache()),
-      lastFailure: {
-        at: new Date(params.now()).toISOString(),
-        message: asMessage(error),
-        key: params.key,
-      },
+      lastFailure: failureAt(params.now(), asMessage(error), params.key),
     };
   }
   writeClaudeAdvertCache(params.cachePath, next);
   return next;
+}
+
+function failureAt(now: number, message: string, key: ClaudeAdvertKey): ClaudeAdvertFailure {
+  return { at: new Date(now).toISOString(), retryAfter: retryAfterFor(now), message, key };
 }
 
 function emptyCache(): ClaudeAdvertCache {
