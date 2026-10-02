@@ -120,14 +120,16 @@ import { BRICK_UUID_RE } from "./session/brick-link.js";
  * keeps the closed holder as the seat's holder and fills such a null on the next
  * run); a LIVE-MINTED row whose holder is then closed KEEPS the closed session's
  * id — nothing writes the row on a holder's own close (ratification item 5, by
- * design). So `null` and a closed id are two encodings of the SAME fact on a
- * store not yet re-backfilled, and a reader that trusted the raw pointer would
- * report a CLOSED session as the active holder on every live-minted seat. `list`/`show` never render
+ * design). A reader that trusted the raw pointer would report a CLOSED session
+ * as the ACTIVE holder on every live-minted seat — which is why `list`/`show`
+ * resolve the pointer instead. The `null` of a not-yet-re-backfilled row is a
+ * VACANCY the backfill's next run fills, not the same fact as a closed holder. `list`/`show` never render
  * `active_holder_id` directly — they derive the holder's state from the
  * HOLDER'S OWN RECORD via `vetActiveHolder` (already shipped for `close`,
- * reused rather than re-derived), rendering `null` and a closed pointer
- * IDENTICALLY as "nobody home", and a pointer with no record on disk at all
- * (brick `6cb4f4dc`) as "holder record missing" — rendered honestly, not
+ * reused rather than re-derived), rendering a closed pointer as "held by a
+ * closed session" (D-SEAT-HOLD, brick `eca085bb`: a close does not vacate a
+ * seat), a `null` pointer as "vacant", and a pointer with no record on disk at
+ * all (brick `6cb4f4dc`) as "holder record missing" — rendered honestly, not
  * repaired.
  *
  * `reopen` sets `closed_at` back to `null` and **touches nothing else** —
@@ -989,7 +991,7 @@ export function decideSeatClose(
 /**
  * Phase B — resolve `holderId`'s record (unlocked) and decide open / not-open.
  *
- * `null` (nobody home) trivially vets as not-open: there is no holder to close
+ * `null` (vacant) trivially vets as not-open: there is no holder to close
  * first (AC16 ii). A DANGLING pointer — the record cannot be resolved at all —
  * ALSO vets as not-open: refusing would make the seat permanently uncloseable, with
  * no action the operator can take. Judgment call, flagged in PLAN.md §2.2's table.
@@ -1266,7 +1268,7 @@ function renderSeatReopen(format: OutputFormat, seatId: string, result: SeatReop
   }
   process.stdout.write(
     `seat ${seatId}: reopened. active_holder_id is UNCHANGED (${
-      result.activeHolderId ?? "null — nobody home"
+      result.activeHolderId ?? "null — vacant"
     }) — re-opening is not a succession.\n`,
   );
 }
@@ -1279,16 +1281,18 @@ function renderSeatReopen(format: OutputFormat, seatId: string, result: SeatReop
  * decides whether `close` may proceed is the one that decides what `show`/`list`
  * render, so the two can never disagree about what "the holder is open" means.
  *
- * `vacant` and `closed` render IDENTICALLY as "nobody home" (measured on
- * devbox-staging: a backfilled row's `null` and a live-minted row's closed pointer
- * are the SAME fact, encoded two different ways — see this file's header).
- * `record-missing` is the third, distinct state (brick `6cb4f4dc`: the row outlives
- * its holder's record) and is rendered honestly rather than folded into either.
+ * Four states, each rendered distinctly (D-SEAT-HOLD, brick `eca085bb`, reversing
+ * the earlier collapse of `null` and a closed pointer into "nobody home"): a
+ * closed holder is `held-by-closed` — the seat IS held, by a session that has
+ * closed, until a successor is activated; `vacant` is a `null` pointer, which only
+ * a row the backfill has not reached can still carry; `record-missing`
+ * (brick `6cb4f4dc`: the row outlives its holder's record) is rendered honestly
+ * rather than folded into any of the others.
  */
 type ActiveHolderState =
   | { readonly kind: "vacant" }
   | { readonly kind: "active"; readonly holderId: string }
-  | { readonly kind: "closed"; readonly holderId: string }
+  | { readonly kind: "held-by-closed"; readonly holderId: string }
   | { readonly kind: "record-missing"; readonly holderId: string };
 
 async function resolveActiveHolderState(activeHolderId: string | null): Promise<ActiveHolderState> {
@@ -1301,15 +1305,16 @@ async function resolveActiveHolderState(activeHolderId: string | null): Promise<
   }
   return vetted.open
     ? { kind: "active", holderId: vetted.id }
-    : { kind: "closed", holderId: vetted.id };
+    : { kind: "held-by-closed", holderId: vetted.id };
 }
 
-/** Text rendering — `vacant` and `closed` collapse to ONE string on purpose. */
+/** Text rendering — a closed holder names its id and says the seat is held by it. */
 function renderActiveHolderText(state: ActiveHolderState): string {
   switch (state.kind) {
     case "vacant":
-    case "closed":
-      return "nobody home";
+      return "vacant";
+    case "held-by-closed":
+      return `${state.holderId} (held by a closed session)`;
     case "active":
       return state.holderId;
     case "record-missing":
@@ -1323,15 +1328,14 @@ function renderActiveHolderText(state: ActiveHolderState): string {
   }
 }
 
-/** JSON rendering — same collapse as the text form, `vacant`/`closed` both
- * report `state: "nobody-home"`; `closed` additionally carries the id it
- * resolved (for diagnosis), `vacant` carries none because there is none. */
+/** JSON rendering — `held-by-closed-session` carries the holder's id, `vacant`
+ * carries none because there is none. */
 function activeHolderJson(state: ActiveHolderState): { state: string; id: string | null } {
   switch (state.kind) {
     case "vacant":
-      return { state: "nobody-home", id: null };
-    case "closed":
-      return { state: "nobody-home", id: state.holderId };
+      return { state: "vacant", id: null };
+    case "held-by-closed":
+      return { state: "held-by-closed-session", id: state.holderId };
     case "active":
       return { state: "active", id: state.holderId };
     case "record-missing":
@@ -1936,13 +1940,13 @@ NEVER AUTOMATIC. No verb, sweep or backfill reopens a seat on its own — this i
       "after",
       `
 THE ACTIVE HOLDER IS DERIVED, NEVER THE ROW'S RAW POINTER. \`active_holder_id\`
-  alone cannot say who is active: every backfilled row carries \`null\` once its
-  sole holder is closed, while a live-minted row whose holder is later closed
-  KEEPS the closed session's id — two encodings of the same fact. This verb
-  resolves the pointer against the holder's OWN record and renders a null
-  pointer and a closed pointer IDENTICALLY as "nobody home"; a pointer naming a
-  record that no longer exists on disk renders as "holder record missing"
-  rather than being folded into either of the other two.
+  alone cannot say who is active: a live-minted row whose holder is later closed
+  KEEPS the closed session's id (a close does not vacate a seat). This verb
+  resolves the pointer against the holder's OWN record: a closed holder renders
+  as "held by a closed session" (state \`held-by-closed-session\`, naming the
+  id), a null pointer — only a row the backfill has not reached — as "vacant",
+  and a pointer naming a record that no longer exists on disk as "holder record
+  missing", none folded into another.
 
 HOLDERS ARE LISTED FROM THE SESSION INDEX, each resolved via its own record —
   not the \`holder_active\` mirror, which is succession bookkeeping and can
