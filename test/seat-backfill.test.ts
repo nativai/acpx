@@ -145,6 +145,7 @@ type BackfillJson = {
   recordsWithoutIndexEntry: number;
   rowsRepaired: number;
   favoritesMigrated: number;
+  brickLinksFilled: number;
   errors: { file: string; stage: string; code?: string; message: string }[];
   backupSuffix?: string;
   backups: string[];
@@ -1895,3 +1896,207 @@ test("BRK2: an EXISTING seat row that already carries a brick_id is LEFT UNCHANG
     );
   });
 });
+
+// ─── brick `5c4b8c4a` — ADDITIVE ONLY: narrows the (d′) fill leg to the
+// ACTIVE holder. `seatNameSource`'s highest-ordinal-over-ALL-members fallback
+// (correct for `name`) was also reachable through `brickFromHolders`, so a
+// seat whose holders are ALL CLOSED sourced its canonical brick link from a
+// RETIRED holder's stale `metadata.brick` — and BRK2 above then protects that
+// wrong value PERMANENTLY, because the fill is the only path that can ever
+// write it. `brickLinkSourceFor` closes that path: no OPEN member, no link.
+// No existing row above is touched. ───────────────────────────────────────
+
+test(
+  "BRK3/BRK4/COUNT/untouched: a seat with no OPEN member sources NO link, " +
+    "an OPEN holder's link IS filled in the same run, an existing link is " +
+    "left alone, and the run fills exactly one — not zero",
+  async () => {
+    await withTempHome(async (homeDir) => {
+      const seatBrk3 = "b4b4b4b4-3333-4333-8333-333333333333";
+      const seatBrk4 = "b4b4b4b4-4444-4444-8444-444444444444";
+      const seatUntouched = "b4b4b4b4-6666-4666-8666-666666666666";
+
+      await seed(homeDir, [
+        // BRK3 — the harmful case: the seat's ONLY holder is CLOSED and
+        // carries a stale brick ref. `activeHolderFor` returns `undefined`
+        // for this seat; the OLD fallback (highest ordinal over ALL
+        // members, closed included) would have returned this holder and
+        // promoted BRICK_A — the exact mechanism measured on staging.
+        makeRecord({
+          acpxRecordId: "brk3-h1",
+          seatId: seatBrk3,
+          holderOrdinal: 1,
+          holderActive: false,
+          closed: true,
+          metadata: { brick: BRICK_A },
+        }),
+        // BRK4 — the paired positive control, SAME temp HOME, SAME --apply:
+        // an OPEN active holder carrying a link. Without this row, BRK3's
+        // "not filled" is satisfied just as well by the fill leg being
+        // disabled outright, or by a fixture that never produced a fillable
+        // seat at all.
+        makeRecord({
+          acpxRecordId: "brk4-h1",
+          seatId: seatBrk4,
+          holderOrdinal: 1,
+          holderActive: true,
+          metadata: { brick: BRICK_B },
+        }),
+        // untouched control — the holder's brick DISAGREES with the
+        // already-present link (same discipline as BRK2 above), so a leg
+        // that started reconciling a PRESENT link against its holder would
+        // be caught here too.
+        makeRecord({
+          acpxRecordId: "brk-untouched-h1",
+          seatId: seatUntouched,
+          holderOrdinal: 1,
+          holderActive: true,
+          metadata: { brick: BRICK_B },
+        }),
+      ]);
+
+      // Pre-seed all three EXISTING rows — same mechanism as BRK2 above:
+      // `backfillSeatRow` mints a row only when none exists, so this is how
+      // an "the row already existed" seat is constructed for this leg.
+      await backfillSeatRow(sessionsDir(homeDir), {
+        seatId: seatBrk3,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        activeHolderId: null,
+        nextOrdinal: 2,
+        closedAt: null,
+        name: undefined,
+        brickId: undefined,
+        favorite: false,
+      });
+      await backfillSeatRow(sessionsDir(homeDir), {
+        seatId: seatBrk4,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        activeHolderId: null,
+        nextOrdinal: 2,
+        closedAt: null,
+        name: undefined,
+        brickId: undefined,
+        favorite: false,
+      });
+      await backfillSeatRow(sessionsDir(homeDir), {
+        seatId: seatUntouched,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        activeHolderId: "brk-untouched-h1",
+        nextOrdinal: 2,
+        closedAt: null,
+        name: undefined,
+        brickId: { ref: BRICK_A, validated: true },
+        favorite: false,
+      });
+
+      // THE ABSENCE DISCIPLINE: read the constructed fixture back from disk
+      // BEFORE --apply — never trust the builder's intent for a
+      // deliberately-absent value.
+      const beforeStore = await readSeatStore(sessionsDir(homeDir));
+      assert.equal(
+        beforeStore.seats.get(seatBrk3)?.brickId,
+        undefined,
+        "fixture sanity: BRK3's row must start with brick_id ABSENT, read from disk",
+      );
+      assert.equal(
+        beforeStore.seats.get(seatBrk4)?.brickId,
+        undefined,
+        "fixture sanity: BRK4's row must start with brick_id ABSENT, read from disk",
+      );
+      assert.deepEqual(
+        beforeStore.seats.get(seatUntouched)?.brickId,
+        { ref: BRICK_A, validated: true },
+        "fixture sanity: the untouched seat must start WITH a link, read from disk",
+      );
+
+      const report = await backfill(homeDir, ["--apply"]);
+
+      const afterStore = await readSeatStore(sessionsDir(homeDir));
+
+      // BRK3 — the harmful case.
+      assert.equal(
+        afterStore.seats.get(seatBrk3)?.brickId,
+        undefined,
+        "a seat whose only holder is CLOSED must not be filled from that holder's stale brick",
+      );
+
+      // BRK4 — the paired positive control, same run, always UNVALIDATED
+      // (R28 (5)).
+      assert.deepEqual(
+        afterStore.seats.get(seatBrk4)?.brickId,
+        { ref: BRICK_B, validated: false },
+        "a seat with an OPEN active holder carrying a link must still be filled",
+      );
+
+      // untouched control — BRK2's invariant holds in this arm too, even
+      // though the holder disagrees with the stored ref.
+      assert.deepEqual(
+        afterStore.seats.get(seatUntouched)?.brickId,
+        { ref: BRICK_A, validated: true },
+        "a seat whose row already carries a link must be left byte-identical",
+      );
+
+      // THE COUNT — excludes the do-nothing-failure reading of BRK3's
+      // absence: it is not a frozen write, a skipped code path, or a run
+      // that filled nothing. Exactly ONE seat (BRK4) was filled this run.
+      assert.equal(
+        report.brickLinksFilled,
+        1,
+        "exactly one seat (BRK4) should have been filled this run — not 0",
+      );
+    });
+  },
+);
+
+test(
+  "BRK5: a FRESH seat with no OPEN member is minted with NO brick link — " +
+    "the mint-path twin of BRK3, with a sibling mint in the same arm proving " +
+    "the mint leg itself still fills from an OPEN holder",
+  async () => {
+    await withTempHome(async (homeDir) => {
+      const seatClosedOnly = "b4b4b4b4-7777-4777-8777-777777777777";
+      const seatWithOpenHolder = "b4b4b4b4-8888-4888-8888-888888888888";
+
+      await seed(homeDir, [
+        // The FRESH-MINT twin of BRK3: NO existing row (this is leg 3's
+        // mint path — `planSeatRow`/`brickLinkFromHolders` — never leg 3¾'s
+        // fill path), and the seat's only holder is CLOSED.
+        makeRecord({
+          acpxRecordId: "brk5-closed-h1",
+          seatId: seatClosedOnly,
+          holderOrdinal: 1,
+          holderActive: false,
+          closed: true,
+          metadata: { brick: BRICK_A },
+        }),
+        // The sibling, SAME arm: an OPEN holder IS present, so the fresh
+        // mint's link IS minted — the positive control proving this is a
+        // real narrowing of the representative, not the mint leg disabled
+        // outright.
+        makeRecord({
+          acpxRecordId: "brk5-open-h1",
+          seatId: seatWithOpenHolder,
+          holderOrdinal: 1,
+          holderActive: true,
+          metadata: { brick: BRICK_B },
+        }),
+      ]);
+
+      const report = await backfill(homeDir, ["--apply"]);
+      assert.equal(report.seats, 2, "both seats are FRESH mints, never existing rows");
+
+      const store = await readSeatStore(sessionsDir(homeDir));
+
+      assert.equal(
+        store.seats.get(seatClosedOnly)?.brickId,
+        undefined,
+        "a freshly-minted seat whose only holder is CLOSED must carry NO brick link",
+      );
+      assert.deepEqual(
+        store.seats.get(seatWithOpenHolder)?.brickId,
+        { ref: BRICK_B, validated: false },
+        "the sibling fresh mint with an OPEN holder must still mint the link",
+      );
+    });
+  },
+);
