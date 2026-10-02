@@ -585,6 +585,14 @@ test("E7 every registry entry declares attribution — binds on the first provid
     assert.ok(entry.attribution, `provider ${entry.id} must declare attribution`);
     assertAttributionWellFormed(entry);
   }
+  // The shipped registry is empty, so the loop above asserts over an EMPTY SET. The seam is the
+  // one provider that actually exists at runtime, so check it here too — otherwise the only
+  // live provider in the system is the one this guard never looks at.
+  for (const entry of effectiveTurnContextProviders({
+    [TURN_CONTEXT_TEST_PAYLOAD_ENV]: "payload",
+  })) {
+    assertAttributionWellFormed(entry);
+  }
   // CONTROL (E9's malformed arm) — proving the assertion can fail at all. Without it, E7 is
   // green merely because the shipped set is empty.
   assert.throws(() =>
@@ -732,7 +740,17 @@ test("the test-payload seam is a real registry provider reading the SESSION's en
   const providers = effectiveTurnContextProviders(sessionEnv);
   assert.equal(providers.length, 1);
   assert.equal(providers[0].id, "test-payload");
-  assert.deepEqual(providers[0].attribution, { kind: "neutral" });
+  // ⚠️ `requires-mitigation`, NOT `neutral`. The seam carries arbitrary operator-supplied text
+  // it never inspects, so it cannot honestly answer the reviewer's question — and a seam that
+  // declared `neutral` would be the one provider defeating the mechanism built to stop exactly
+  // that. An earlier revision did declare `neutral`; a live agent was measured acting on an
+  // imperative payload delivered through it.
+  assert.deepEqual(providers[0].attribution, {
+    kind: "requires-mitigation",
+    evidence: "M1e/ENVELOPE-V1",
+  });
+  // ...and that declaration must satisfy the same guard every other provider faces.
+  assertAttributionWellFormed(providers[0]);
 
   const composed = await resolveTurnContext({ ...REQUEST, sessionEnv });
   assert.ok(composed, "the seam must contribute when the session env carries a payload");
@@ -752,4 +770,185 @@ test("the seam does NOT read acpx's own process.env", async () => {
   } finally {
     delete process.env[TURN_CONTEXT_TEST_PAYLOAD_ENV];
   }
+});
+
+// ---------------------------------------------------------------------------
+// J — THE ARCHITECTURAL INVARIANTS THAT LICENSE THIS DESIGN.
+//
+// These are not behaviour tests. They assert the two structural facts the whole scoping
+// argument rests on, so that a future refactor cannot quietly invalidate them. That matters
+// more here than usual: this mechanism is INERT in production, so a scoping defect produces no
+// symptom anyone would notice — these rows are the only thing watching.
+// ---------------------------------------------------------------------------
+
+/** Read a repo source file, asserting it was actually found and looks like itself. */
+function readSource(relativePath: string, expectedSymbol: string): string {
+  const absolute = join(repoRoot(), relativePath);
+  const source = readFileSync(absolute, "utf8");
+  // SUBJECT ASSERTIONS. A sweep with no subjects and a sweep with no offenders are the same
+  // green, and this file has already been bitten once by resolving `../src` to `dist-test/src`
+  // (compiled `.js`, zero `.ts`). Prove the subject before trusting a clean result.
+  assert.ok(source.length > 500, `${absolute} is empty or truncated — the sweep had no subject`);
+  assert.ok(
+    source.includes(expectedSymbol),
+    `${absolute} does not contain ${expectedSymbol} — wrong file, or it was renamed; this sweep ` +
+      "would otherwise report clean while measuring nothing",
+  );
+  return source;
+}
+
+/** Occurrences of `needle` in `haystack`, counted without regex escaping concerns. */
+function countOccurrences(haystack: string, needle: string): number {
+  return haystack.split(needle).length - 1;
+}
+
+test("J1 there is EXACTLY ONE ACP prompt egress in src — STRUCTURAL, with its own control", () => {
+  // Every `session/prompt` acpx sends, for every harness and every adapter variant, goes
+  // through one line. That is WHY a per-turn channel placed in `AcpClient.prompt` reaches all
+  // harnesses with no per-harness cell, and why claude-pty is covered without being
+  // special-cased. This row catches A SECOND EGRESS ADDED ELSEWHERE, which the behavioural row
+  // in turn-context-chokepoint.test.ts structurally cannot see.
+  const client = readSource("src/acp/client.ts", "async prompt(");
+
+  // ⚠️ THE INSTRUMENT CONTROL, AND IT IS THE POINT OF THIS ROW'S DESIGN. A grep-based
+  // chokepoint test that silently stops matching PASSES — reporting the premise protected at
+  // the exact moment it stopped being checked, which is the worst available failure for the
+  // only test guarding this design's central premise. acpx's own PROJECT.md documents the
+  // class: a NUL byte makes a search return zero with no error, and a reformat or a changed
+  // call shape does the same. So a ZERO match must read as BROKEN INSTRUMENT and fail here,
+  // never as a clean single chokepoint.
+  const occurrences = countOccurrences(client, "connection.prompt(");
+  assert.ok(
+    occurrences >= 1,
+    "INSTRUMENT BROKEN, NOT A CLEAN RESULT: the pattern `connection.prompt(` no longer matches " +
+      "anything in src/acp/client.ts. Either the call was reformatted or renamed, or the file " +
+      "is unreadable. Do NOT read this as 'one chokepoint'. Re-derive the pattern against the " +
+      "real send site before trusting this row again.",
+  );
+  assert.equal(
+    occurrences,
+    1,
+    "A SECOND ACP PROMPT EGRESS HAS APPEARED. The per-turn context design argues scope, " +
+      "inertness and harness-agnosticism from there being exactly one: see CONCEPTION §11.1. " +
+      "Either route the new call through AcpClient.prompt, or re-derive the scoping argument " +
+      "and update this test deliberately.",
+  );
+
+  // CONTROL on the counter itself: it reports other numbers, so `=== 1` above is a measurement
+  // and not a predicate that can only ever say what we hoped.
+  assert.equal(countOccurrences(client, "connection.prompt(no-such-symbol"), 0);
+  assert.ok(countOccurrences(client, "connection.") > 1);
+});
+
+test("J2 exactly ONE call site opts into per-turn context, and it is the new-turn path", () => {
+  // The mid-turn injected prompt and the one-shot exec path reach `AcpClient.prompt` directly
+  // and must NEVER be decorated: a steer carrying a "new turn" frame inside a turn that already
+  // had one is a content error, not merely waste.
+  const promptTurn = readSource("src/runtime/engine/prompt-turn.ts", "runPromptTurn");
+  const sessionRuntime = readSource("src/cli/session/runtime.ts", "client.prompt(");
+
+  assert.equal(
+    countOccurrences(promptTurn, "turnContext: true"),
+    1,
+    "runPromptTurn must set turnContext exactly once",
+  );
+  assert.equal(
+    countOccurrences(sessionRuntime, "turnContext"),
+    0,
+    "NOTHING in cli/session/runtime.ts may set turnContext. It holds the MID-TURN INJECTED " +
+      "prompt and the runOnce one-shot path; decorating either double-injects within one turn " +
+      "or frames a steer as a fresh turn. This is the single likeliest way this feature ships " +
+      "broken (CONCEPTION §3.2, §8).",
+  );
+
+  // CONTROL: the same counter finds the flag where it DOES belong, so a zero above is a real
+  // absence rather than a search that cannot match anything.
+  assert.ok(
+    countOccurrences(promptTurn, "turnContext") >= 1,
+    "the counter can find turnContext — so the 0 asserted above is an absence, not a dead search",
+  );
+});
+
+test("J3 the call sites reaching AcpClient.prompt are exactly THREE, and that is the tripwire", () => {
+  // THREE, not four. An earlier revision of the brief said four by conflating PATHS with CALL
+  // SITES: `prompt-turn.ts` serves both the main sequential queue turn and the engine runtime
+  // turn, so two paths share one line. The scoping claim is unchanged — exactly one of the
+  // three is opted in — but the number is what a future reader uses as a tripwire, so it has to
+  // be right.
+  const sites: Array<[string, string, number]> = [
+    ["src/runtime/engine/prompt-turn.ts", "runPromptTurn", 1],
+    ["src/cli/session/runtime.ts", "client.prompt(", 2],
+  ];
+  let total = 0;
+  for (const [file, symbol, expected] of sites) {
+    const code = stripComments(readSource(file, symbol));
+    const found = countOccurrences(code, "client.prompt(");
+    assert.equal(found, expected, `${file}: expected ${expected} AcpClient.prompt call site(s)`);
+    total += found;
+  }
+  assert.equal(
+    total,
+    3,
+    "The set of AcpClient.prompt call sites changed. Exactly one of them (runPromptTurn) may " +
+      "opt into per-turn context; a new NEW-TURN path that does not route through runPromptTurn " +
+      "ships UNDECORATED — the deliberate safe direction, but a decision to make knowingly " +
+      "rather than discover. Re-read CONCEPTION §3.1 and §3.4 before changing this number.",
+  );
+
+  // CONTROL: comment stripping must not have eaten the code. If it had, every count would be 0
+  // and the row would be measuring an empty string.
+  assert.ok(
+    stripComments(readSource("src/cli/session/runtime.ts", "client.prompt(")).length > 1000,
+  );
+});
+
+/**
+ * Remove line and block comments so a call-site count cannot be inflated by prose.
+ *
+ * This is why J3 failed on its first run: `cli/session/runtime.ts` mentions `client.prompt()`
+ * in SIX comments and calls it twice, so a raw count said 8. A tripwire that counts prose is a
+ * tripwire that fires on an edited comment and stays silent on a new call.
+ */
+function stripComments(source: string): string {
+  return source
+    .replaceAll(/\/\*[\s\S]*?\*\//gu, "")
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("//") && !line.trimStart().startsWith("*"))
+    .join("\n");
+}
+
+test("the seam ANNOUNCES ITSELF on every turn it contributes, and is NOT deduped", async () => {
+  const sessionEnv = { [TURN_CONTEXT_TEST_PAYLOAD_ENV]: "operator supplied text" };
+  const lines = await captureStderr(async () => {
+    for (let turn = 0; turn < 3; turn++) {
+      assert.ok(await resolveTurnContext({ ...REQUEST, sessionEnv }));
+    }
+  });
+  const announcements = lines.filter((line) => line.includes("is set ("));
+  // THREE lines for three turns — deliberately undeduped, unlike the (provider, class) failure
+  // warnings. The hazard here is PERSISTENCE: a stale env var in a pod spec, a session template
+  // or a COPIED SESSION RECORD injects operator text into every turn forever, and the injected
+  // block is absent from the user's transcript message, so a human cannot see it. A single line
+  // at session start is exactly what a reader scrolling a long session would miss.
+  assert.equal(
+    announcements.length,
+    3,
+    "one announcement per contributing turn, not one per process",
+  );
+  // The byte count is asserted against the payload's own length rather than a hand-typed
+  // number — I typed 21 first and the row caught it.
+  assert.match(
+    announcements[0],
+    new RegExp(
+      `ACPX_TURN_CONTEXT_TEST_PAYLOAD is set \\(${"operator supplied text".length} chars\\)`,
+    ),
+  );
+  assert.match(announcements[0], /operator-supplied text is being injected into this turn/);
+
+  // CONTROL: with the seam unset there are NO announcements. Without this the row would pass on
+  // a build that announces unconditionally — which would be noise on every production turn.
+  const quiet = await captureStderr(async () => {
+    await resolveTurnContext({ ...REQUEST, sessionEnv: {} });
+  });
+  assert.equal(quiet.filter((line) => line.includes("is set (")).length, 0);
 });

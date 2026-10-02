@@ -46,10 +46,18 @@
  * ingress surface this design rejects, to defend against a provider we ourselves wrote.
  * The bound is therefore **architectural**: the contract above plus code review.
  *
- * **Why that is real enforcement and not a wish:** there is **no runtime ingress**. A
- * provider cannot arrive from an env var, a config file, or a third party — the only way
- * one exists is a reviewed code change in this file's registry. Contract + review is the
- * actual mechanism, with a finite and known set of authors.
+ * **Why that is real enforcement and not a wish:** there is **no UNGOVERNED runtime ingress**.
+ * A *compiled-in* provider cannot arrive from a config file or a third party — the only way one
+ * exists is a reviewed code change in this file's registry, so contract + review is the actual
+ * mechanism, with a finite and known set of authors.
+ *
+ * ⚠️ **Corrected after measurement — an earlier revision said "no runtime ingress" flatly, and
+ * that was false.** One runtime path does exist: the `ACPX_TURN_CONTEXT_TEST_PAYLOAD` seam
+ * below. It was measured carrying an imperative payload that a live agent then acted on. It is
+ * kept rather than gated behind a test-only build, because it is what proves this channel is
+ * capable on a real deployed build — and it is **governed**: it is a declared provider subject
+ * to the same attribution union, caps, composer and envelope as any other, and it declares
+ * `requires-mitigation` because it cannot honestly claim neutrality for text it never inspects.
  */
 import { harnessIdForAgentCommand, type HarnessId } from "./harness-capabilities.js";
 
@@ -66,8 +74,8 @@ import { harnessIdForAgentCommand, type HarnessId } from "./harness-capabilities
 export const TURN_CONTEXT_BUDGET_MS = 100;
 
 /**
- * Byte caps — the quantitative half of the bulk bound (the categorical half is that there
- * is no runtime ingress at all).
+ * Byte caps — the quantitative half of the bulk bound (the categorical half is that the only
+ * runtime ingress is the governed test seam, and these caps apply to it too).
  *
  * Chosen against real numbers: the intended deltas are a timestamp (~30 ch), a brick
  * status line (~120 ch), an inbox notice (~200 ch). A primer-sized payload cannot fit by
@@ -182,9 +190,13 @@ export type TurnContextProvider = {
  * THE REGISTRY — **ships EMPTY, and that is the shipped state of this feature.**
  *
  * Deciding *what* to inject (time, brick status, inbox notice) is separate work with its
- * own cost argument. Adding an entry here is the only way a production payload can exist:
- * no env var, no config file, no command. That absence of runtime ingress is what makes
- * both the provider contract and the admissible-payload rule enforceable at review.
+ * own cost argument. Adding an entry here is the only way a **compiled-in** payload can
+ * exist: no config file, no command. That is what makes both the provider contract and the
+ * admissible-payload rule enforceable at review.
+ *
+ * ⚠️ It is **not** the only way *any* payload can exist — the `ACPX_TURN_CONTEXT_TEST_PAYLOAD`
+ * seam is a runtime path, deliberately kept and deliberately governed. See
+ * {@link testPayloadProvider}.
  */
 const SHIPPED_PROVIDERS: readonly TurnContextProvider[] = [];
 
@@ -254,6 +266,31 @@ function describeError(error: unknown): string {
 }
 
 /**
+ * The seam ANNOUNCES ITSELF, every turn it contributes. **Deliberately NOT deduped.**
+ *
+ * The realistic failure here is not an attacker, it is **a stale env var**.
+ * `ACPX_TURN_CONTEXT_TEST_PAYLOAD` surviving in a pod spec, a session template or a **copied
+ * session record** would inject operator text into every production turn of that session,
+ * indefinitely, with nobody remembering having set it — and the injected block is **absent from
+ * the user's transcript message** (acpx records the prompt before decorating), so a human
+ * reading the session cannot see it. Invisible, persistent, un-diagnosable, and reachable by
+ * copy-paste.
+ *
+ * **Why undeduped, against the `(provider, class)` dedupe used for failures:** those warnings
+ * describe a fault that is the same fact every turn, so once per process is the whole of the
+ * information. This line describes an ONGOING condition whose hazard IS its persistence, and a
+ * single line emitted at session start is exactly what a reader scrolling a long session would
+ * miss. The volume cost is real but it is bounded and self-selected: a production session with
+ * the seam unset emits **zero** of these, so the only person who ever sees one line per turn is
+ * the operator who armed it — which is precisely the person who needs to see it.
+ */
+function announceTurnContextSeam(payload: string): void {
+  process.stderr.write(
+    `[acpx] turn context: ${TURN_CONTEXT_TEST_PAYLOAD_ENV} is set (${payload.length} chars) — operator-supplied text is being injected into this turn\n`,
+  );
+}
+
+/**
  * The payload may not contain EITHER envelope tag, in any case.
  *
  * The closing tag would let a payload **close the envelope early** and emit arbitrary text
@@ -305,7 +342,31 @@ export function composeTurnContext(contributions: readonly string[]): string | u
   return composed;
 }
 
-/** The test-seam provider, present only when the SESSION's env carries a non-empty payload. */
+/**
+ * The test-seam provider, present only when the SESSION's env carries a non-empty payload.
+ *
+ * ⚠️ **THIS IS THE ONE RUNTIME INGRESS PATH, AND IT IS GOVERNED RATHER THAN HIDDEN.** An
+ * earlier revision of this module claimed there is *no* runtime ingress. That was false, and it
+ * was falsified by measurement, not by review: an imperative payload supplied through this env
+ * var made a live agent act on it. The seam is deliberately **not** gated behind a test-only
+ * build, because it is the instrument that proves the channel is *capable* on a real deployed
+ * build — gating it would trade that proof away to tidy a claim. A governed seam beats a hidden
+ * one. The accurate claim is **no UNGOVERNED runtime ingress**: this path is itself a declared
+ * provider, subject to the same attribution union, the same caps, the same composer and the
+ * same envelope as any compiled-in one.
+ *
+ * ⚠️ **AND THAT IS WHY IT DECLARES `requires-mitigation`, NOT `neutral`.** It carries arbitrary
+ * operator-supplied text that it never inspects, so the reviewer's question — *"read as the
+ * user's own words, does this payload change what the agent would do?"* — is **unanswerable**
+ * for it. `neutral` is therefore a claim this provider cannot make, and the whole point of the
+ * attribution union is that such a claim must be impossible to make silently. A seam that lied
+ * in its own declaration would have been the one provider defeating the mechanism built to stop
+ * exactly that.
+ *
+ * `evidence` cites `M1e/ENVELOPE-V1` because that is a real, measured mitigation which the
+ * composer already applies to this payload like any other: the attribution flip from USER to
+ * SYSTEM was measured on all three harnesses with `ENVELOPE-V1` wrapping the block.
+ */
 function testPayloadProvider(sessionEnv: NodeJS.ProcessEnv): TurnContextProvider | undefined {
   // Read from the SESSION's env, not `process.env` — the same one-env rule as every other
   // guard here. This is what makes a per-session test payload possible.
@@ -315,8 +376,14 @@ function testPayloadProvider(sessionEnv: NodeJS.ProcessEnv): TurnContextProvider
   }
   return {
     id: "test-payload",
-    attribution: { kind: "neutral" },
-    resolve: () => payload,
+    attribution: { kind: "requires-mitigation", evidence: `M1e/${TURN_CONTEXT_ENVELOPE_ID}` },
+    resolve: () => {
+      // Announce on contribution, not on registration: being asked to resolve is the moment
+      // this payload is actually on its way into a turn. If the caps or the envelope guard
+      // then reject it, that emits its own separate warning.
+      announceTurnContextSeam(payload);
+      return payload;
+    },
   };
 }
 
