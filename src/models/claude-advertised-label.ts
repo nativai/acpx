@@ -271,7 +271,7 @@ function familyOf(label: string): string {
  * · …"). Measured on Daniel's session 67f2803e: pin `fable`, served
  * `claude-fable-5-1`, header "Fable (1M)" — the binary DID name the version, on
  * another row. So, only when ALL hold:
- *   · the alias label carries no digit;
+ *   · the alias label carries no digit outside its context suffix;
  *   · the served model equals the `value` of ANOTHER advertised option;
  *   · that option's label passes the shape gate and is the SAME family;
  * the label becomes that option's, keeping the alias's context suffix when the
@@ -302,7 +302,10 @@ function sameFamilyServedLabel(
   options: readonly AdvertisedModelOption[],
   served: string | undefined,
 ): string | undefined {
-  if (/[0-9]/.test(aliasLabel) || served === undefined) {
+  // ⚠️ THE DIGIT TEST IGNORES THE CONTEXT SUFFIX: "Fable (1M)" carries a "1" that
+  // is a window, not a version — testing the whole label never fired on the very
+  // shape this rule exists for (caught by the 67f2803e row).
+  if (/[0-9]/.test(aliasLabel.replace(CONTEXT_SUFFIX, "")) || served === undefined) {
     return undefined;
   }
   const servedOption = findAdvertisedOption(options, served);

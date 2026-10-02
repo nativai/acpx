@@ -405,3 +405,117 @@ test("a >128 KB line AFTER the assistant entry (Claude Code's prompt_snapshot) s
     assert.equal(await readLastServedModel(record), undefined);
   });
 });
+
+// ── Follow-up P-2: a version-less alias label is versioned by the SERVED model ──
+//
+// The option list below is VERBATIM from Daniel's session 67f2803e
+// ("Seat-Conception-2", pin `fable`, served `claude-fable-5-1`) on the deployed
+// binary — read from a COPY of the record, prod untouched. It read "Fable (1M)".
+
+const SEAT_CONCEPTION_2_MODEL_OPTION = [
+  {
+    id: "model",
+    name: "Model",
+    type: "select" as const,
+    currentValue: "claude-fable-5-1",
+    options: [
+      {
+        value: "default",
+        name: "Default (recommended)",
+        description: "Opus 5.5 · Best for everyday, complex tasks",
+      },
+      { value: "opus", name: "Opus", description: "Opus 5.5 · Best for everyday, complex tasks" },
+      {
+        value: "claude-fable-5-1",
+        name: "Fable",
+        description: "Fable 5.1 · Most capable for your hardest and longest-running tasks",
+      },
+      { value: "sonnet", name: "Sonnet", description: "Sonnet 5.5 · Efficient for routine tasks" },
+      { value: "haiku", name: "Haiku", description: "Haiku 4.5 · Fastest for quick answers" },
+      { value: "fable", name: "Fable", description: "Fable (1M context)" },
+    ],
+  },
+];
+
+function fableRecord(
+  served: string | undefined,
+  configOptions: unknown[] = SEAT_CONCEPTION_2_MODEL_OPTION,
+) {
+  return claudeRecord({
+    current_model_id: "fable",
+    session_options: { model: "fable" },
+    config_options: configOptions as NonNullable<SessionRecord["acpx"]>["config_options"],
+    ...(served === undefined ? {} : { served: { model: served, source: "claude-transcript" } }),
+  });
+}
+
+test("P-2: the 67f2803e shape reads 'Fable 5.1 (1M)' — versioned by the served model, suffix kept", () => {
+  assert.equal(resolvedModelLabelForRecord(fableRecord("claude-fable-5-1")), "Fable 5.1 (1M)");
+  assert.equal(
+    toSessionIndexEntry(fableRecord("claude-fable-5-1"), "x.json").resolvedModelLabel,
+    "Fable 5.1 (1M)",
+  );
+});
+
+test("P-2 negatives: not yet served, <synthetic>, an unadvertised served id, or currentValue alone keep the alias label", () => {
+  // Not served yet: currentValue says claude-fable-5-1, and that MUST NOT be read (stale snapshot).
+  assert.equal(resolvedModelLabelForRecord(fableRecord(undefined)), "Fable (1M)");
+  assert.equal(resolvedModelLabelForRecord(fableRecord("<synthetic>")), "Fable (1M)");
+  assert.equal(resolvedModelLabelForRecord(fableRecord("claude-fable-9-9")), "Fable (1M)");
+});
+
+test("P-2 negative: a served model of ANOTHER family never relabels the session", () => {
+  // e.g. a fable pin that served on an opus id (a degrade): the label must not become "Opus …".
+  const withOpusId = [
+    {
+      ...SEAT_CONCEPTION_2_MODEL_OPTION[0],
+      options: [
+        ...SEAT_CONCEPTION_2_MODEL_OPTION[0].options,
+        {
+          value: "claude-opus-5-5",
+          name: "Opus",
+          description: "Opus 5.5 · Best for everyday tasks",
+        },
+      ],
+    },
+  ];
+  assert.equal(
+    resolvedModelLabelForRecord(fableRecord("claude-opus-5-5", withOpusId)),
+    "Fable (1M)",
+  );
+});
+
+test("P-2: an alias label that ALREADY carries a version keeps it, whatever served", () => {
+  const record = claudeRecord({
+    current_model_id: "opus",
+    config_options: SEAT_CONCEPTION_2_MODEL_OPTION,
+    served: { model: "claude-fable-5-1" },
+  });
+  assert.equal(resolvedModelLabelForRecord(record), "Opus 5.5");
+  // …and the five census rows still derive exactly as before (the §1.2 table row
+  // at the top of this file re-checks every shape; this pins the alias path).
+  for (const [alias, label] of [
+    ["default", "Opus 5.5"],
+    ["opus", "Opus 5.5"],
+    ["sonnet", "Sonnet 5.5"],
+    ["haiku", "Haiku 4.5"],
+    ["claude-fable-5-1", "Fable 5.1"],
+  ]) {
+    const r = claudeRecord({
+      current_model_id: alias,
+      config_options: SEAT_CONCEPTION_2_MODEL_OPTION,
+      served: { model: "claude-fable-5-1" },
+    });
+    assert.equal(resolvedModelLabelForRecord(r), label, alias);
+  }
+});
+
+test("P-3: an old '<synthetic>' served value is never relayed onto the index entry", () => {
+  const synthetic = claudeRecord({ current_model_id: "opus", served: { model: "<synthetic>" } });
+  const entry = toSessionIndexEntry(synthetic, "x.json");
+  assert.equal(entry.servedModel, undefined);
+  assert.equal("servedModel" in JSON.parse(JSON.stringify(entry)), false);
+  // Control: a real id on the same shape IS relayed.
+  const real = claudeRecord({ current_model_id: "opus", served: { model: "claude-opus-5-5" } });
+  assert.equal(toSessionIndexEntry(real, "x.json").servedModel, "claude-opus-5-5");
+});
