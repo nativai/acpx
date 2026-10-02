@@ -161,7 +161,7 @@ import {
 } from "../queue/ipc.js";
 import { type QueueOwnerActiveSessionController } from "../queue/owner-turn-controller.js";
 import { resolveAndEnsureAgentFolder } from "./agent-folder.js";
-import { resolveExistingBrickPath } from "./brick-link.js";
+import { resolveSessionBrickContext } from "./brick-link.js";
 import type { RunOnceOptions, SessionSendOptions } from "./contracts.js";
 import { createSubagentBoundaryWriteEnqueuer } from "./subagent-boundary-write.js";
 
@@ -2325,8 +2325,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   });
 
   const ownClient = options.client == null;
-  const brick = record.metadata?.brick?.trim() || null;
-  const brickPath = brick ? resolveExistingBrickPath(brick) : null;
+  const { brick, brickPath } = await resolveSessionBrickContext(record);
   const client =
     options.client ??
     new AcpClient({

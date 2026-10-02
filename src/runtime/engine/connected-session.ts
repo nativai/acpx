@@ -2,7 +2,7 @@ import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { AcpClient } from "../../acp/client.js";
 import { withInterrupt } from "../../async-control.js";
 import { resolveAndEnsureAgentFolder } from "../../cli/session/agent-folder.js";
-import { resolveExistingBrickPath } from "../../cli/session/brick-link.js";
+import { resolveSessionBrickContext } from "../../cli/session/brick-link.js";
 import {
   persistSessionOwnerOptions,
   resolveSessionOwnerOptions,
@@ -113,8 +113,7 @@ export async function withConnectedSession<T>(
     terminal: options.terminal,
   });
   persistSessionOwnerOptions(record, ownerOptionsToInput(ownerOptions));
-  const brick = record.metadata?.brick?.trim() || null;
-  const brickPath = brick ? resolveExistingBrickPath(brick) : null;
+  const { brick, brickPath } = await resolveSessionBrickContext(record);
   const client =
     options.createClient?.({
       agentCommand: record.agentCommand,

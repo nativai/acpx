@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { InvalidArgumentError } from "commander";
 import { brickChildEnv } from "../../bricks-credential.js";
+import { decideSessionBrick } from "../../session/seat-brick.js";
 import type { SessionRecord } from "../../types.js";
 
 export const BRICK_CLI_TIMEOUT_MS = 3_000;
@@ -120,8 +121,20 @@ export async function stampBrickSessionStarted(
   }
 }
 
+/**
+ * The `ACPX_BRICK` / `ACPX_BRICK_PATH` pair for a spawn — the SEAT's brick for a seated
+ * session (`decideSessionBrick`), never the record's `metadata.brick` cache read raw.
+ * All four env-builder sites call this; a fifth must too.
+ */
+export async function resolveSessionBrickContext(
+  subject: Pick<SessionRecord, "seatId" | "metadata">,
+): Promise<{ brick: string | null; brickPath: string | null }> {
+  const brick = (await decideSessionBrick(subject))?.ref ?? null;
+  return { brick, brickPath: brick ? resolveExistingBrickPath(brick) : null };
+}
+
 export async function maybeStampBrickLink(record: SessionRecord): Promise<void> {
-  const brickId = record.metadata?.brick?.trim().toLowerCase();
+  const brickId = (await decideSessionBrick(record))?.ref.toLowerCase();
   if (!brickId || !BRICK_UUID_RE.test(brickId)) {
     return;
   }

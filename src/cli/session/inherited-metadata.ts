@@ -19,7 +19,8 @@ function withoutBrickMetadata(
 }
 
 /**
- * Spawn-time `brick` inheritance — pure, no IO. Snapshot at spawn,
+ * Spawn-time `brick` inheritance — pure, no IO. `parentBrick` is the parent's DECIDED brick
+ * (its seat's, via `decideSessionBrick`), never its raw `metadata.brick` cache. Snapshot at spawn,
  * with an explicit `blocked` switch for --no-brick so callers can strip raw
  * metadata and suppress parent inheritance in one place.
  */

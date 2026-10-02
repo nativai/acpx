@@ -378,7 +378,7 @@ export function registerSessionsCommand(
     )
     .option(
       "--brick <ref>",
-      "Link the session to a brick (full uuid, uuid8, slug, or slug__uuid8; non-uuid refs resolve via the brick CLI). Stored as metadata.brick; reaches the agent as $ACPX_BRICK / $ACPX_BRICK_PATH.",
+      "Link the session to a brick (full uuid, uuid8, slug, or slug__uuid8; non-uuid refs resolve via the brick CLI). Links the session's SEAT — the seat's brick_id decides the session's brick, the record keeps only a cache of it; reaches the agent as $ACPX_BRICK / $ACPX_BRICK_PATH.",
       (value: string) => parseNonEmptyValue("Brick ref", value),
     )
     .option("--no-brick", "Do not link, and do not inherit the spawning session's brick.")
@@ -426,7 +426,7 @@ export function registerSessionsCommand(
     )
     .option(
       "--brick <ref>",
-      "Link the session to a brick (full uuid, uuid8, slug, or slug__uuid8; non-uuid refs resolve via the brick CLI). Stored as metadata.brick; reaches the agent as $ACPX_BRICK / $ACPX_BRICK_PATH.",
+      "Link the session to a brick (full uuid, uuid8, slug, or slug__uuid8; non-uuid refs resolve via the brick CLI). Links the session's SEAT — the seat's brick_id decides the session's brick, the record keeps only a cache of it; reaches the agent as $ACPX_BRICK / $ACPX_BRICK_PATH.",
       (value: string) => parseNonEmptyValue("Brick ref", value),
     )
     .option("--no-brick", "Do not link, and do not inherit the spawning session's brick.")
@@ -495,7 +495,7 @@ export function registerSessionsCommand(
     )
     .option(
       "--brick <ref>",
-      "Link the copied session to a brick (full uuid, uuid8, slug, or slug__uuid8; non-uuid refs resolve via the brick CLI). Stored as metadata.brick; reaches the agent as $ACPX_BRICK / $ACPX_BRICK_PATH.",
+      "Link the copied session to a brick (full uuid, uuid8, slug, or slug__uuid8; non-uuid refs resolve via the brick CLI). Links the session's SEAT — the seat's brick_id decides the session's brick, the record keeps only a cache of it; reaches the agent as $ACPX_BRICK / $ACPX_BRICK_PATH.",
       (value: string) => parseNonEmptyValue("Brick ref", value),
     )
     .option("--no-brick", "Do not link, and do not inherit the spawning session's brick.")

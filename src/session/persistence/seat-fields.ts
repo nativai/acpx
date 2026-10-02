@@ -222,6 +222,51 @@ export function parseSeatFieldsFromIndexEntry(raw: Record<string, unknown>): Sea
   };
 }
 
+// ─── the BRICK pair on the INDEX leg (brick fb1a7a9c / 9d0fb37c) ─────────────
+
+/** The two index fields that carry a session's brick. They travel TOGETHER through the two
+ * functions below, so a leg cannot project the ref and forget its state — the shape the
+ * 9d0fb37c test-engineer measured (byte-identical index for a validated and an unvalidated
+ * link). */
+export type BrickIndexFields = Pick<SessionIndexEntry, "metadataBrick" | "metadataBrickValidation">;
+
+/**
+ * Projects the holder's brick CACHE (`metadata.brick`, written at mint and join from the seat)
+ * and its validation state. 🛑 This is a PURE record→entry function with no seat access, and
+ * three paths build entries from it (write, overlay, reconcile-from-disk) — so the index shows
+ * the cache, not a fresh seat read. It is as current as the holder's last write.
+ *
+ * ⚠️ `unvalidated` is the DEFAULT, not `validated`: a holder with a brick and no state word
+ * (every pre-9984c510 record) reads `unvalidated`. Assert the key with a specific value — a
+ * skipped write and an unknown state would otherwise look the same.
+ */
+export function brickFieldsToIndexEntry(record: Pick<SessionRecord, "metadata">): BrickIndexFields {
+  const metadata = record.metadata;
+  const brick = metadata?.brick;
+  return {
+    metadataBrick: brick,
+    metadataBrickValidation: brick?.trim()
+      ? metadata?.brick_validation === "validated"
+        ? "validated"
+        : "unvalidated"
+      : undefined,
+  };
+}
+
+/** Lenient like the rest of the hot-path parser: a legacy entry (a brick, no state key) and a
+ * wrong-typed state both read `unvalidated`; no brick reads no state. */
+export function parseBrickFieldsFromIndexEntry(raw: Record<string, unknown>): BrickIndexFields {
+  const metadataBrick = typeof raw.metadataBrick === "string" ? raw.metadataBrick : undefined;
+  return {
+    metadataBrick,
+    metadataBrickValidation: metadataBrick?.trim()
+      ? raw.metadataBrickValidation === "validated"
+        ? "validated"
+        : "unvalidated"
+      : undefined,
+  };
+}
+
 // ─── local normalizers (deliberately NOT shared with parse.ts's — that
 // file's helpers are private to it, and duplicating three trivial one-liners
 // here is cheaper than exporting internals across a module boundary for it) ──

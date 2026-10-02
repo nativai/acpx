@@ -49,7 +49,7 @@ import { refreshQueueOwnerLease } from "../queue/lease-store.js";
 import { QueueOwnerTurnController } from "../queue/owner-turn-controller.js";
 import { terminalizeAbsorbedDeliveriesOnOwnerExit } from "./absorbed-delivery-registry.js";
 import { resolveAndEnsureAgentFolder } from "./agent-folder.js";
-import { resolveExistingBrickPath } from "./brick-link.js";
+import { resolveSessionBrickContext } from "./brick-link.js";
 import {
   DEFAULT_QUEUE_OWNER_TTL_MS,
   normalizeOwnerIdleReleaseMs,
@@ -159,9 +159,8 @@ async function submitToRunningOwner(
 }
 
 // eslint-disable-next-line complexity -- mirrors the sessionContext shape from runtime.ts / connected-session.ts; the ?. chains are load-bearing and cannot be simplified further without losing null safety
-function sessionContextFromRecord(record: Awaited<ReturnType<typeof resolveSessionRecord>>) {
-  const brick = record.metadata?.brick?.trim() || null;
-  const brickPath = brick ? resolveExistingBrickPath(brick) : null;
+async function sessionContextFromRecord(record: Awaited<ReturnType<typeof resolveSessionRecord>>) {
+  const { brick, brickPath } = await resolveSessionBrickContext(record);
   return {
     acpxRecordId: record.acpxRecordId,
     sessionName: record.name ?? null,
@@ -177,10 +176,10 @@ function sessionContextFromRecord(record: Awaited<ReturnType<typeof resolveSessi
   };
 }
 
-function createQueueOwnerSharedClient(
+async function createQueueOwnerSharedClient(
   options: QueueOwnerRuntimeOptions,
   sessionRecord: Awaited<ReturnType<typeof resolveSessionRecord>>,
-): AcpClient {
+): Promise<AcpClient> {
   return new AcpClient({
     agentCommand: sessionRecord.agentCommand,
     cwd: absolutePath(sessionRecord.cwd),
@@ -192,7 +191,7 @@ function createQueueOwnerSharedClient(
     terminal: options.terminal,
     suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
     verbose: options.verbose,
-    sessionContext: sessionContextFromRecord(sessionRecord),
+    sessionContext: await sessionContextFromRecord(sessionRecord),
     sessionOptions: mergeSessionOptions(
       options.sessionOptions,
       sessionOptionsFromRecord(sessionRecord),
@@ -662,7 +661,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   // WHEN an already-idle owner is released; WHETHER an active owner is protected is
   // the hasActiveTurn()+quiescence gate (see decideIdleOwnerRelease).
   let lastTaskCompletedAt = Date.now();
-  const sharedClient = createQueueOwnerSharedClient(options, sessionRecord);
+  const sharedClient = await createQueueOwnerSharedClient(options, sessionRecord);
   const ttlMs = normalizeQueueOwnerTtlMs(options.ttlMs);
   // W13-24-14 Phase 2 — memory-release idle timeout (ms), read from env at owner
   // start (reaches the owner via ...process.env, like ACPX_DEPLOY_VERSION_FILE).

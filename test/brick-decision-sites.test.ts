@@ -20,6 +20,8 @@ const MAY_TOUCH_THE_CACHE: Readonly<Record<string, string>> = {
   "src/session/seat-backfill.ts": "derives a seat's brick_id FROM its holder, once, at backfill",
   "src/cli/session/session-management.ts":
     "mint/join: writes the seat from the value the cache is about to carry",
+  "src/session/persistence/seat-store.ts":
+    "operator-facing MESSAGE text only (L4's surface, left untouched here); no read",
   "src/brick-outbox.ts": "WRITER: projects a brick CLI result onto the cache (and restores it)",
   "src/cli/session/runtime.ts":
     "subagent mint: the seat row's brick from the child's own (empty) cache",

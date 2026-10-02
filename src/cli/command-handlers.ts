@@ -93,6 +93,7 @@ import type {
   SessionNameCandidate,
   TemplateRollbackResult,
 } from "../session/persistence.js";
+import { decideSessionBrick } from "../session/seat-brick.js";
 import { EXIT_CODES } from "../types.js";
 import type {
   OutputFormat,
@@ -713,12 +714,14 @@ type ResolvedParentSession = {
 // is the persisted desired intent (the single source of truth — the live
 // config_options snapshot can be stale).
 // eslint-disable-next-line complexity -- explicit optional-field projection keeps inheritance reviewable
-function parentInheritableFields(parent: SessionRecord): ResolvedParentSession {
+async function parentInheritableFields(parent: SessionRecord): Promise<ResolvedParentSession> {
   const sessionOptions = parent.acpx?.session_options;
   return {
     acpxRecordId: parent.acpxRecordId,
     seatId: parent.seatId,
-    brick: parent.metadata?.brick,
+    // The parent's DECIDED brick (its seat's), never its raw `metadata.brick` cache — a child
+    // into a new seat must not inherit a stale copy (fb1a7a9c).
+    brick: (await decideSessionBrick(parent))?.ref,
     subscription: sessionOptions?.subscription,
     profile: sessionOptions?.profile,
     agentCommand: parent.agentCommand,
@@ -738,7 +741,10 @@ async function resolveAndValidateParentSessionId(
   try {
     // Local parent: snapshot its inheritable fields, and carry the explicit url
     // when one was supplied (else downstream derives it from the id same-box).
-    return { ...parentInheritableFields(await resolveSessionRecord(ref.id)), sessionUrl: ref.url };
+    return {
+      ...(await parentInheritableFields(await resolveSessionRecord(ref.id))),
+      sessionUrl: ref.url,
+    };
   } catch (error) {
     if (error instanceof SessionNotFoundError) {
       // FW-19: a parent identified by URL may live on ANOTHER box — its id won't
