@@ -401,12 +401,15 @@ function favoriteFromHolders(members: readonly RecordPlan[]): boolean {
 
 /**
  * `brick_id` — item (d), brick `3dff714d`, DECISIONS.md CORRECTION + AMENDMENT,
- * narrowed by brick `5c4b8c4a`. Same shape as `name` (`seatNameSource`) — reused
- * directly rather than re-deriving the same representative — **not** the same
- * shape as `favorite`'s `some()`: where holders disagree, the ACTIVE holder's
- * brick wins, not "any holder's". A seat with no OPEN member sources NO link —
- * absent means UNKNOWN, the pessimistic direction this family exists to make
- * safe, never a highest-ordinal fallback onto a closed holder's stale ref.
+ * narrowed by brick `5c4b8c4a`. Derives from the ACTIVE holder only
+ * (`activeHolderFor`) — the same representative `name` (`seatNameSource`) picks
+ * whenever one exists, and DELIBERATELY DIVERGING from `name` when every holder
+ * is closed: `name` still falls back to the highest-ordinal member there, `brick`
+ * does not. **Not** the same shape as `favorite`'s `some()` either: where holders
+ * disagree, the ACTIVE holder's brick wins, not "any holder's". A seat with no
+ * OPEN member sources NO link — absent means UNKNOWN, the pessimistic direction
+ * this family exists to make safe, never a highest-ordinal fallback onto a
+ * closed holder's stale ref.
  *
  * Daniel's ruling reaches ACTIVE holders only; whether a RETIRED holder's link
  * is legitimate evidence for a seat's canonical brick is still open. `provenance`
