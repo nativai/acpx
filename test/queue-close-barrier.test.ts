@@ -584,3 +584,51 @@ test("L1.11 a clean close prints no warning, exits 0, and reports an empty drain
     }
   });
 });
+
+// brick 1bfb95ed deliverable 4 — the CLI must print what it RE-READ off
+// `<id>.json` after closing, not merely that the close call returned
+// successfully. Asserted against the ACTUAL file content, not a hardcoded
+// expectation, so a regression that reads a stale in-memory value instead of
+// the disk would still be caught.
+test("L1.11 close prints the record-derived closed state read back from disk", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "barrier-readback-json";
+    await seedSessionRecord(homeDir, sessionId);
+
+    const jsonResult = await runCloseCli(
+      ["--format", "json", "claude", "sessions", "close", "--session-id", sessionId],
+      homeDir,
+      homeDir,
+    );
+    assert.equal(jsonResult.code, 0, `stderr was:\n${jsonResult.stderr}`);
+    const payload = JSON.parse(jsonResult.stdout.trim()) as {
+      recordClosed: unknown;
+      recordClosedAt: unknown;
+    };
+
+    const onDisk = JSON.parse(
+      await fs.readFile(
+        path.join(homeDir, ".acpx", "sessions", `${encodeURIComponent(sessionId)}.json`),
+        "utf8",
+      ),
+    ) as { closed: unknown; closed_at: unknown };
+    assert.equal(payload.recordClosed, true, "must report what the RECORD says, not an assumption");
+    assert.equal(
+      payload.recordClosed,
+      onDisk.closed,
+      "the printed value must be the one actually on disk, not a different source of truth",
+    );
+    assert.equal(typeof payload.recordClosedAt, "string");
+    assert.equal(payload.recordClosedAt, onDisk.closed_at);
+
+    const sessionIdText = "barrier-readback-text";
+    await seedSessionRecord(homeDir, sessionIdText);
+    const textResult = await runCloseCli(
+      ["claude", "sessions", "close", "--session-id", sessionIdText],
+      homeDir,
+      homeDir,
+    );
+    assert.equal(textResult.code, 0, `stderr was:\n${textResult.stderr}`);
+    assert.match(textResult.stdout, /closed: true \(read back from record\)/);
+  });
+});

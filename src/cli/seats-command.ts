@@ -11,12 +11,14 @@ import {
   parseSeatRefOrThrow,
   readSeatStore,
   resolveSessionRecord,
+  seatBrickLinkFromRef,
   seatFromStore,
   seatRowMissingMessage,
   seatStorePath,
   seatStoreUnhealthyMessage,
   sessionBaseDir,
   withSeatStoreWrite,
+  type SeatBrickLink,
   type SeatRecord,
   type SeatStore,
 } from "../session/persistence.js";
@@ -406,12 +408,20 @@ async function runSeatMutation(
 function parseSeatBrickArgs(
   brickRef: string | undefined,
   unset: boolean | undefined,
+  validated: boolean | undefined,
 ): string | undefined {
   if (unset === true) {
     if (brickRef !== undefined) {
       throw new SeatMutationRefusalError(
         "SEAT_BRICK_ARGS_INVALID",
         `pass either a brick uuid or --unset, not both (got brick ${JSON.stringify(brickRef)} and --unset).`,
+      );
+    }
+    if (validated === true) {
+      throw new SeatMutationRefusalError(
+        "SEAT_BRICK_ARGS_INVALID",
+        "--validated has nothing to assert against --unset — it clears both brick_id and " +
+          "brick_id_validated, there is no ref to have validated.",
       );
     }
     return undefined;
@@ -425,21 +435,49 @@ function parseSeatBrickArgs(
   return parseBrickIdOrThrow(brickRef);
 }
 
+/** `seats set-brick`'s JSON payload, pulled out to keep the mutation function
+ * under the complexity budget — additive brickIdValidated/previousBrickIdValidated
+ * siblings, same shape as `seats show`'s payload. */
+function setBrickJsonPayload(
+  seatId: string,
+  brickId: SeatBrickLink | undefined,
+  previousBrickId: SeatBrickLink | undefined,
+): Record<string, unknown> {
+  return {
+    ok: true,
+    action: brickId === undefined ? "seat_brick_unset" : "seat_brick_set",
+    seatId,
+    brickId: brickId?.ref ?? null,
+    brickIdValidated: brickId ? brickId.validated : null,
+    previousBrickId: previousBrickId?.ref ?? null,
+    previousBrickIdValidated: previousBrickId ? previousBrickId.validated : null,
+  };
+}
+
 async function handleSeatsSetBrick(
   seatRef: string,
   brickRef: string | undefined,
-  flags: { unset?: boolean },
+  flags: { unset?: boolean; validated?: boolean },
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const { format } = resolveGlobalFlags(command, config);
   await runSeatMutation("set-brick", format, async () => {
     const seatId = parseSeatIdOrThrow(seatRef);
-    // F3 fix (brick `3dff714d`, DECISIONS.md (c)) — `brickId` is `undefined` for
-    // `--unset`, a full uuid otherwise. Both legs write through the SAME spread
-    // below, so `--unset` is not a second code path that could drift from the
-    // set path's field discipline.
-    const brickId = parseSeatBrickArgs(brickRef, flags.unset);
+    // F3 fix (brick `3dff714d`, DECISIONS.md (c)) — `undefined` for `--unset`, a
+    // full uuid otherwise. Both legs write through the SAME spread below, so
+    // `--unset` is not a second code path that could drift from the set path's
+    // field discipline.
+    const resolvedRef = parseSeatBrickArgs(brickRef, flags.unset, flags.validated);
+    // Brick `9984c510`, ruling (B2′) — THIS VERB NEVER RESOLVES; THE CALLER
+    // ASSERTS. `seats set-brick` performs no `brick show` call — shape only,
+    // via `parseBrickIdOrThrow` — so on its own it cannot tell a real brick
+    // from a typo, exactly the defect this brick exists to fix. `brick attach`
+    // (acpx-ui) HAS already established existence before shelling out to this
+    // verb, and asserts that with `--validated`; a bare operator invocation has
+    // not, and DEFAULTS TO UNVALIDATED. `--unset` clears both keys (`brickId`
+    // becomes `undefined` entirely — there is no sibling to independently omit).
+    const brickId = seatBrickLinkFromRef(resolvedRef, flags.validated === true);
     const sessionDir = sessionBaseDir();
     const previousBrickId = await withSeatStoreWrite(sessionDir, (store) => {
       refuseUnwritableStore(store, sessionDir);
@@ -451,23 +489,15 @@ async function handleSeatsSetBrick(
       seats.set(seatId, { ...row, brickId });
       return { mutation: { kind: "write", seats } as const, result: row.brickId };
     });
-    if (
-      emitJsonResult(format, {
-        ok: true,
-        action: brickId === undefined ? "seat_brick_unset" : "seat_brick_set",
-        seatId,
-        brickId: brickId ?? null,
-        previousBrickId: previousBrickId ?? null,
-      })
-    ) {
+    if (emitJsonResult(format, setBrickJsonPayload(seatId, brickId, previousBrickId))) {
       return;
     }
     if (format === "quiet") {
       return;
     }
     process.stdout.write(
-      `seat ${seatId}: brick_id = ${brickId ?? "(none)"}` +
-        `${previousBrickId === undefined ? "" : ` (was ${previousBrickId})`}\n`,
+      `seat ${seatId}: brick_id = ${renderSeatBrickLinkText(brickId)}` +
+        `${previousBrickId === undefined ? "" : ` (was ${renderSeatBrickLinkText(previousBrickId)})`}\n`,
     );
   });
 }
@@ -791,6 +821,10 @@ function headlineLines(report: SeatBackfillReport): string[] {
     // holder's favorite" and were (or, on a dry run, would be) corrected. `0` on
     // every run after the fleet's first migrating pass — AC4.
     `  favorites migrated:   ${report.favoritesMigrated}`,
+    // (d′), brick `9984c510`: existing seat rows whose brick_id was ABSENT and
+    // were (or, on a dry run, would be) filled from their active holder's own
+    // link, marked UNVALIDATED. `0` once every absent link has been filled once.
+    `  brick links filled:   ${report.brickLinksFilled}`,
     `  errors:               ${report.errors.length}`,
   ];
 }
@@ -1370,7 +1404,11 @@ function seatShowJsonPayload(
     closedAt: row.closedAt,
     nextOrdinal: row.nextOrdinal,
     name: row.name ?? null,
-    brickId: row.brickId ?? null,
+    brickId: row.brickId?.ref ?? null,
+    // Brick `9984c510` — ADDITIVE: `brickId` keeps its existing shape (a bare
+    // ref or `null`) for every pre-existing consumer; the validation state
+    // rides a NEW sibling key so nothing that already reads `brickId` breaks.
+    brickIdValidated: row.brickId ? row.brickId.validated : null,
     // The RAW pointer, exactly as stored — for an operator diagnosing the store
     // itself. Never used above to decide what "active" means; see `activeHolder`.
     activeHolderIdRaw: row.activeHolderId,
@@ -1400,7 +1438,7 @@ function renderSeatShowText(
   process.stdout.write(`  created_at:    ${row.createdAt}\n`);
   process.stdout.write(`  closed_at:     ${row.closedAt ?? "(open)"}\n`);
   process.stdout.write(`  next_ordinal:  ${row.nextOrdinal}\n`);
-  process.stdout.write(`  brick_id:      ${row.brickId ?? "(none)"}\n`);
+  process.stdout.write(`  brick_id:      ${renderSeatBrickLinkText(row.brickId)}\n`);
   process.stdout.write(`  active holder: ${renderActiveHolderText(holderState)}\n`);
   process.stdout.write(`  holders (${holders.length}):\n`);
   for (const holder of holders) {
@@ -1408,6 +1446,16 @@ function renderSeatShowText(
       `    #${holder.ordinal ?? "?"}  ${holder.id}  ${describeHolderOpenState(holder.open)}\n`,
     );
   }
+}
+
+/** Shared text rendering for a seat's brick link — brick `9984c510`. Unvalidated
+ * must be UNMISSABLE; validated and absent stay byte-identical to before this
+ * brick existed, so an operator reading past rows notices nothing new. */
+function renderSeatBrickLinkText(link: SeatBrickLink | undefined): string {
+  if (!link) {
+    return "(none)";
+  }
+  return link.validated ? link.ref : `${link.ref} ⚠ UNVALIDATED`;
 }
 
 function renderSeatShow(
@@ -1437,7 +1485,7 @@ function renderSeatShow(
 type SeatListRow = {
   readonly seatId: string;
   readonly name: string | undefined;
-  readonly brickId: string | undefined;
+  readonly brickId: SeatBrickLink | undefined;
   readonly closed: boolean;
   readonly holderCount: number;
   readonly holderState: ActiveHolderState;
@@ -1524,7 +1572,9 @@ function seatListRowJson(row: SeatListRow): Record<string, unknown> {
     // ALWAYS PRESENT, `null` when unset — never absent (C2's absence-is-a-value
     // rule, widened onto this field 2026-09-30). A key that disappears when empty
     // forces every consumer to distinguish "absent" from "null".
-    brickId: row.brickId ?? null,
+    brickId: row.brickId?.ref ?? null,
+    // Brick `9984c510` — ADDITIVE sibling, same shape as `seats show`'s payload.
+    brickIdValidated: row.brickId ? row.brickId.validated : null,
     closed: row.closed,
     holderCount: row.holderCount,
     activeHolder: activeHolderJson(row.holderState),
@@ -1533,10 +1583,21 @@ function seatListRowJson(row: SeatListRow): Record<string, unknown> {
 
 function seatListRowText(row: SeatListRow): string {
   return (
-    `${row.seatId}  ${row.name ?? "(unnamed)"}  brick=${row.brickId?.slice(0, 8) ?? "-"}  ` +
+    `${row.seatId}  ${row.name ?? "(unnamed)"}  brick=${seatListBrickText(row.brickId)}  ` +
     `active=${renderActiveHolderText(row.holderState)}  holders=${row.holderCount}  ` +
     `${row.closed ? "CLOSED" : "open"}\n`
   );
+}
+
+/** The list view's compact brick rendering — an 8-char prefix, same as before
+ * brick `9984c510` when validated; marked when not, so a column scan does not
+ * have to open each seat individually to notice an unvalidated link. */
+function seatListBrickText(link: SeatBrickLink | undefined): string {
+  if (!link) {
+    return "-";
+  }
+  const short = link.ref.slice(0, 8);
+  return link.validated ? short : `${short}⚠`;
 }
 
 function renderSeatList(
@@ -1621,6 +1682,13 @@ export function registerSeatsCommand(parent: Command, config: ResolvedAcpxConfig
       "The brick, by FULL uuid — short refs are rejected, never resolved. Omit with --unset",
     )
     .option("--unset", "Clear the seat's brick_id instead of setting one")
+    .option(
+      "--validated",
+      "Assert the ref was already confirmed to resolve (the CALLER's claim, e.g. `brick " +
+        "attach` resolving it before shelling out here) — write brick_id_validated=true " +
+        "instead of the default false. This verb itself never calls `brick show`. Not " +
+        "valid with --unset.",
+    )
     .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
     .addHelpText(
       "after",
@@ -1630,6 +1698,10 @@ A SHORT BRICK REF IS REJECTED, NOT RESOLVED.
   against a 3 s timeout — so the resolution would fail this command rather than
   the ref. \`brick attach\` already holds the full uuid.
 
+THIS VERB NEVER VALIDATES THE REF ITSELF — brick_id_validated DEFAULTS TO false.
+  A full uuid is checked for SHAPE only. Pass --validated when the caller already
+  confirmed the brick exists (brick 9984c510); omit it for a bare operator set.
+
 PASS EXACTLY ONE OF <brick> OR --unset. Neither, or both, is refused
   (SEAT_BRICK_ARGS_INVALID) before anything is written.
 `,
@@ -1638,7 +1710,7 @@ PASS EXACTLY ONE OF <brick> OR --unset. Neither, or both, is refused
       this: Command,
       seat: string,
       brick: string | undefined,
-      flags: { unset?: boolean },
+      flags: { unset?: boolean; validated?: boolean },
     ) {
       await handleSeatsSetBrick(seat, brick, flags, this, config);
     });

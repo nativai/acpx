@@ -33,6 +33,7 @@ export {
   persistTemplateMark,
   pruneSessions,
   readPersistedLifecycle,
+  readRawRecordClosedState,
   resolveGlobalSessionByName,
   resolvePruneSessionIds,
   resolveSessionByExactName,
@@ -57,6 +58,8 @@ export type {
   PruneIdResolution,
   PruneOptions,
   PruneResult,
+  RawRecordClosedState,
+  RawRecordFieldState,
   SessionNameCandidate,
   SessionNameResolution,
   TemplateRollbackResult,
@@ -80,9 +83,15 @@ export {
   SEAT_STORE_FILE,
   SEAT_STORE_NO_CHANGE,
   seatFromStore,
+  seatBrickLinkFromRef,
   SeatStoreUnwritableError,
   seatStorePath,
   seatToPersisted,
   withSeatStoreWrite,
 } from "./persistence/seat-store.js";
-export type { SeatRecord, SeatStore, SeatStoreMutation } from "./persistence/seat-store.js";
+export type {
+  SeatBrickLink,
+  SeatRecord,
+  SeatStore,
+  SeatStoreMutation,
+} from "./persistence/seat-store.js";

@@ -79,6 +79,7 @@ function fullRecordSentinel(): SessionRecord {
     },
     closed: true,
     closedAt: "2026-01-01T00:00:03.000Z",
+    reopenedAt: "2026-01-01T00:00:03.500Z",
     favorite: true,
     favoritedAt: "2026-01-01T00:00:04.000Z",
     pid: 12345,
@@ -225,8 +226,8 @@ test("full-record guard 4 · the plan is non-trivial and covers every SessionRec
   const total = PERSISTED_TRUE_KEYS.length + PERSISTED_FALSE_KEYS.length;
   assert.equal(
     total,
-    50,
-    `RECORD_FIELD_PLAN has ${total} classified keys, this test expected 50. If you added a field ` +
+    51,
+    `RECORD_FIELD_PLAN has ${total} classified keys, this test expected 51. If you added a field ` +
       `to SessionRecord: classify it in full-record-contract.ts, then run guards 1-3 above. If you ` +
       `removed one: update this count deliberately.`,
   );

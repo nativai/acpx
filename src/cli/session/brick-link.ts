@@ -66,10 +66,23 @@ export function resolveExistingBrickPath(brickId: string): string | null {
   }
 }
 
+/**
+ * Brick `9984c510` — the return carries WHICH LEG resolved the ref, because
+ * this function is the only place that knows. `validated: true` only when
+ * `brick show` itself RESOLVED it; `validated: false` on the degraded leg
+ * (`acceptUuidWhenBrickCliUnavailable`) — a timeout is not a validation. This
+ * does NOT change accept/refuse behaviour (ROW B stays pinned): the same
+ * refs are accepted/refused as before, this only adds the leg as an output.
+ */
+export type ResolvedBrickFlagRef = {
+  readonly ref: string;
+  readonly validated: boolean;
+};
+
 export async function resolveBrickFlagRef(
   ref: string,
   options: BrickExecOptions = {},
-): Promise<string> {
+): Promise<ResolvedBrickFlagRef> {
   const trimmed = ref.trim();
   if (trimmed.length === 0) {
     throw new InvalidArgumentError("--brick must not be empty");
@@ -77,11 +90,14 @@ export async function resolveBrickFlagRef(
 
   const result = await runBrickShow(trimmed, options.timeoutMs ?? BRICK_CLI_TIMEOUT_MS);
   if (result.kind === "resolved") {
-    return result.brickId;
+    return { ref: result.brickId, validated: true };
   }
   throwForDefinitiveBrickFailure(result, trimmed);
 
-  return acceptUuidWhenBrickCliUnavailable(trimmed, unavailableBrickShowReason(result));
+  return {
+    ref: acceptUuidWhenBrickCliUnavailable(trimmed, unavailableBrickShowReason(result)),
+    validated: false,
+  };
 }
 
 export async function stampBrickSessionStarted(

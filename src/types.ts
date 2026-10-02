@@ -1180,6 +1180,12 @@ export type SessionRecord = {
   eventLog: SessionEventLog;
   closed?: boolean;
   closedAt?: string;
+  /** Set by the ONE authorised writer of a closed:true->false transition
+   * (`reopenSession`) at the moment it writes. The record-write seam's
+   * monotonicity guard (repository.ts) treats this as the warrant for that
+   * transition — present and newer than the disk `closedAt` being cleared —
+   * and refuses the transition otherwise (brick 1bfb95ed deliverable 3). */
+  reopenedAt?: string;
   favorite?: boolean;
   favoritedAt?: string;
   pid?: number;
