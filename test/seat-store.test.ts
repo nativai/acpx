@@ -299,7 +299,7 @@ test("an unset `name`/`brick_id` is OMITTED on disk, not written as null", async
     // of it — an absent `brickId` must omit BOTH on-disk keys together.
     assert.ok(!keys.includes("brick_id_validated"));
     // But the two MEANINGFUL nulls are written, because null is a value there:
-    // `active_holder_id: null` is "nobody home" and must be distinguishable from
+    // `active_holder_id: null` is "vacant" and must be distinguishable from
     // a field nobody wrote.
     assert.equal(raw[bare.seatId].closed_at, null);
     assert.ok(Object.keys(raw[bare.seatId]).includes("active_holder_id"));

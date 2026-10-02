@@ -352,7 +352,7 @@ test("AP15 · a freshly created session CAN actually be succeeded — the paired
     const row = seatFromStore(store, seatId);
     assert.ok(row, "AP15: a plain `sessions new` left NO seat row — the seat cannot be succeeded");
     // (2) It names the founding holder. A null here would make a brand-new seat
-    //     read as VACANT, which routes as "nobody home" rather than to its holder.
+    //     read as VACANT, which routes as "vacant" rather than to its holder.
     assert.equal(row.activeHolderId, founderId, "AP15: the row does not name the founding holder");
     // (3) 🛑 next_ordinal is 2, NOT 1. With 1, the first succession would allocate 1
     //     a SECOND time — a repeat, which D4a calls a defect (a gap would be legal).
