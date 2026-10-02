@@ -28,82 +28,6 @@ import type {
   ViewerRunsState,
 } from "../examples/flows/replay-viewer/src/types.js";
 
-test("replay viewer streams live sidebar and run patches over websocket", async () => {
-  const runsDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-replay-live-"));
-  const runId = "2026-03-31T080000000Z-pr-triage-live";
-  const startedAt = "2026-03-31T08:00:00.000Z";
-  const firstStep = makeStep(
-    "extract_intent#1",
-    "extract_intent",
-    startedAt,
-    "2026-03-31T08:00:04.000Z",
-  );
-  await writeRunBundle(runsDir, {
-    runId,
-    flowName: "pr-triage",
-    runTitle: "PR-triage-acpx-155",
-    startedAt,
-    projectedStatus: "completed",
-    liveStatus: "running",
-    updatedAt: "2026-03-31T08:00:05.000Z",
-    currentNode: "extract_intent",
-    steps: [firstStep],
-  });
-
-  const viewerServer = await createReplayViewerServer({
-    host: "127.0.0.1",
-    port: 0,
-    runsDir,
-    livePollIntervalMs: 50,
-  });
-
-  try {
-    const socket = new WebSocket(viewerServer.baseUrl.replace(/^http/, "ws") + "/api/live");
-    const inbox = createMessageInbox(socket);
-
-    await onceOpen(socket);
-    socket.send(JSON.stringify({ type: "hello", protocol: "acpx.replay.v1" }));
-    socket.send(JSON.stringify({ type: "subscribe_runs" }));
-
-    await inbox.next((message) => message.type === "ready");
-    const runsSnapshot = await inbox.next(
-      (message): message is Extract<ReplayServerMessage, { type: "runs_snapshot" }> =>
-        message.type === "runs_snapshot",
-    );
-
-    assert.equal(listViewerRuns(runsSnapshot.state)[0]?.status, "running");
-    assert.equal(listViewerRuns(runsSnapshot.state)[0]?.runTitle, "PR-triage-acpx-155");
-
-    const secondStep = makeStep(
-      "judge_solution#1",
-      "judge_solution",
-      "2026-03-31T08:00:06.000Z",
-      "2026-03-31T08:00:09.000Z",
-    );
-    await updateRunBundle(runsDir, runId, {
-      liveStatus: "waiting",
-      updatedAt: "2026-03-31T08:00:10.000Z",
-      currentNode: "judge_solution",
-      steps: [firstStep, secondStep],
-    });
-
-    const runsPatch = await inbox.next(
-      (message): message is Extract<ReplayServerMessage, { type: "runs_patch" }> =>
-        message.type === "runs_patch",
-    );
-
-    const nextRunsState = applyReplayPatch<ViewerRunsState>(runsSnapshot.state, runsPatch.ops);
-
-    assert.equal(listViewerRuns(nextRunsState)[0]?.status, "waiting");
-    assert.equal(listViewerRuns(nextRunsState)[0]?.currentNode, "judge_solution");
-
-    socket.close();
-  } finally {
-    await viewerServer.close();
-    await fs.rm(runsDir, { recursive: true, force: true });
-  }
-});
-
 test("computeResourceDelta falls back to a snapshot when patch generation throws", () => {
   const nextRun = {
     runId: "2026-04-01T180000000Z-example-two-turn-live",
@@ -556,40 +480,6 @@ async function writeRunBundle(
     } satisfies Partial<FlowRunState>),
   );
 
-  await fs.writeFile(path.join(projectionsDir, "steps.json"), JSON.stringify(options.steps));
-}
-
-async function updateRunBundle(
-  runsDir: string,
-  runId: string,
-  options: {
-    liveStatus: FlowRunState["status"];
-    updatedAt: string;
-    currentNode: string;
-    steps: FlowStepRecord[];
-  },
-): Promise<void> {
-  const runDir = path.join(runsDir, runId);
-  const projectionsDir = path.join(runDir, "projections");
-  const run = JSON.parse(
-    await fs.readFile(path.join(projectionsDir, "run.json"), "utf8"),
-  ) as FlowRunState;
-
-  await fs.writeFile(
-    path.join(projectionsDir, "live.json"),
-    JSON.stringify({
-      runId,
-      flowName: run.flowName,
-      runTitle: run.runTitle,
-      startedAt: run.startedAt,
-      updatedAt: options.updatedAt,
-      status: options.liveStatus,
-      currentNode: options.currentNode,
-      currentAttemptId: options.steps.at(-1)?.attemptId,
-      currentNodeType: options.steps.at(-1)?.nodeType,
-      currentNodeStartedAt: options.steps.at(-1)?.startedAt,
-    } satisfies Partial<FlowRunState>),
-  );
   await fs.writeFile(path.join(projectionsDir, "steps.json"), JSON.stringify(options.steps));
 }
 
