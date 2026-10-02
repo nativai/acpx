@@ -1432,6 +1432,10 @@ function seatShowJsonPayload(
     // ref or `null`) for every pre-existing consumer; the validation state
     // rides a NEW sibling key so nothing that already reads `brickId` breaks.
     brickIdValidated: row.brickId ? row.brickId.validated : null,
+    // Brick `a6884bb9` — a SEAT field, read KEYED from the row; never derived from the
+    // holder (B2d: a live-minted row keeps a stale `active_holder_id`). Always a boolean:
+    // a row that predates the field reads `false`, as the `favorite` verb itself reads it.
+    favorite: row.favorite === true,
     // The RAW pointer, exactly as stored — for an operator diagnosing the store
     // itself. Never used above to decide what "active" means; see `activeHolder`.
     activeHolderIdRaw: row.activeHolderId,
@@ -1462,6 +1466,7 @@ function renderSeatShowText(
   process.stdout.write(`  closed_at:     ${row.closedAt ?? "(open)"}\n`);
   process.stdout.write(`  next_ordinal:  ${row.nextOrdinal}\n`);
   process.stdout.write(`  brick_id:      ${renderSeatBrickLinkText(row.brickId)}\n`);
+  process.stdout.write(`  favorite:      ${row.favorite === true ? "yes" : "no"}\n`);
   process.stdout.write(`  active holder: ${renderActiveHolderText(holderState)}\n`);
   process.stdout.write(`  holders (${holders.length}):\n`);
   for (const holder of holders) {
@@ -1498,7 +1503,8 @@ function renderSeatShow(
 }
 
 /**
- * 🛑 SIX COLUMNS, WIDENED FROM FIVE 2026-09-30T16:17:04Z (the programme owner, on
+ * 🛑 SEVEN COLUMNS (`favorite` added for brick `a6884bb9`, text+JSON, appended before the
+ * closed marker). SIX COLUMNS, WIDENED FROM FIVE 2026-09-30T16:17:04Z (the programme owner, on
  * the TE's V3 finding) — `brickId` joins the cut. The relation this programme moved
  * from the session onto the seat is the brick link, so an operator's read surface
  * that could not answer "which seat holds brick X" was missing exactly that. C2's
@@ -1509,6 +1515,7 @@ type SeatListRow = {
   readonly seatId: string;
   readonly name: string | undefined;
   readonly brickId: SeatBrickLink | undefined;
+  readonly favorite: boolean;
   readonly closed: boolean;
   readonly holderCount: number;
   readonly holderState: ActiveHolderState;
@@ -1585,7 +1592,15 @@ async function buildSeatListRow(
   holderCount: number,
 ): Promise<SeatListRow> {
   const holderState = await resolveActiveHolderState(row.activeHolderId);
-  return { seatId, name: row.name, brickId: row.brickId, closed, holderCount, holderState };
+  return {
+    seatId,
+    name: row.name,
+    brickId: row.brickId,
+    favorite: row.favorite === true,
+    closed,
+    holderCount,
+    holderState,
+  };
 }
 
 function seatListRowJson(row: SeatListRow): Record<string, unknown> {
@@ -1598,6 +1613,8 @@ function seatListRowJson(row: SeatListRow): Record<string, unknown> {
     brickId: row.brickId?.ref ?? null,
     // Brick `9984c510` — ADDITIVE sibling, same shape as `seats show`'s payload.
     brickIdValidated: row.brickId ? row.brickId.validated : null,
+    // Brick `a6884bb9` — the SEVENTH column, ALWAYS a boolean (see `seats show`).
+    favorite: row.favorite,
     closed: row.closed,
     holderCount: row.holderCount,
     activeHolder: activeHolderJson(row.holderState),
@@ -1608,7 +1625,7 @@ function seatListRowText(row: SeatListRow): string {
   return (
     `${row.seatId}  ${row.name ?? "(unnamed)"}  brick=${seatListBrickText(row.brickId)}  ` +
     `active=${renderActiveHolderText(row.holderState)}  holders=${row.holderCount}  ` +
-    `${row.closed ? "CLOSED" : "open"}\n`
+    `favorite=${row.favorite ? "yes" : "no"}  ${row.closed ? "CLOSED" : "open"}\n`
   );
 }
 
