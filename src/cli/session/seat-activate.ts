@@ -196,6 +196,16 @@ async function resolveSuccessorOrRefuse(
   return successor;
 }
 
+/**
+ * An ABSENT `kind` MEANS "session". Pre-programme (backfilled) records carry none
+ * while a successor created with `--parent-id` is stamped `"session"`, so comparing
+ * the raw field refused a succession whenever one side spelled it and the other did
+ * not (brick `eca085bb` fix round, TE c1c2c2b7). Used on BOTH sides of the compare.
+ */
+function effectiveKind(record: SessionRecord): string {
+  return record.kind ?? "session";
+}
+
 /** Phase 0.2 — the predecessor, where the seat has one. */
 async function resolvePredecessorOrRefuse(
   seat: SeatRecord,
@@ -214,11 +224,11 @@ async function resolvePredecessorOrRefuse(
   // create path: the predecessor is named by the seat row, so no holder enumeration
   // is needed. (The create path's equivalent check is deferred for exactly that
   // reason — see `refuseUnjoinableSeat`.)
-  if (successor.kind !== predecessor.kind) {
+  if (effectiveKind(successor) !== effectiveKind(predecessor)) {
     throw new SeatActivationRefusalError(
       "KIND_MISMATCH",
-      `the successor's kind (${successor.kind ?? "session"}) differs from the seat's current ` +
-        `holder (${predecessor.kind ?? "session"}). All holders of one seat share one kind, ` +
+      `the successor's kind (${effectiveKind(successor)}) differs from the seat's current ` +
+        `holder (${effectiveKind(predecessor)}). All holders of one seat share one kind, ` +
         `so this successor cannot inherit this seat.`,
     );
   }
