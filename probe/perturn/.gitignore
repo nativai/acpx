@@ -1,0 +1,5 @@
+# Captured frames and live injection payloads are measurement OUTPUT, not source.
+frames/
+frames-prepend/
+inject/
+inject-hold/
