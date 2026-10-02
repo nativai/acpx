@@ -3,7 +3,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { OPENROUTER_SHIM_AUTH_PLACEHOLDER, pointAdapterAtShim } from "../src/acp/auth-env.js";
+import {
+  OPENROUTER_DISABLED_CLAUDE_CAPABILITIES,
+  OPENROUTER_SHIM_AUTH_PLACEHOLDER,
+  pointAdapterAtShim,
+} from "../src/acp/auth-env.js";
 import { shimConfigDirSessionId, type AcpClient } from "../src/acp/client.js";
 import { applyPromptModelIfAdvertised } from "../src/cli/session/runtime.js";
 import { createSessionConversation } from "../src/session/conversation-model.js";
@@ -247,4 +251,93 @@ test("a blank record id never yields the SHARED /tmp/or- config dir — on eithe
   assert.equal(shimConfigDirSessionId({ acpxRecordId: "real-id" }, "fallback-id"), "real-id");
   assert.equal(shimConfigDirSessionId({ acpxRecordId: "  padded  " }, "fallback-id"), "padded");
   assert.equal(shimConfigDirSessionId(undefined, "fallback-id"), "fallback-id");
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// brick 92121ff9 — Anthropic-only wire constructs OFF for shim-served adapters.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * How Claude Code 2.1.287 resolves `CLAUDE_CODE_MODEL_CAPABILITIES` for one
+ * model — transcribed from the bundled binary's parser: `;`-separated clauses,
+ * optional `<pattern>=` prefix (trailing `*` = prefix match, `[1m]` stripped
+ * from the model), `-cap` disables, clauses applied IN ORDER so the last setting
+ * of a capability wins. Used to assert what the CLI will EFFECTIVELY do with the
+ * merged value, not merely what string acpx wrote.
+ */
+function effectiveCapabilityOverrides(value: string, model: string): Map<string, boolean> {
+  const overrides = new Map<string, boolean>();
+  const bare = model.replace(/\[1m\]/gi, "");
+  for (const clause of value.split(";")) {
+    const eq = clause.indexOf("=");
+    if (eq !== -1) {
+      const pattern = clause.slice(0, eq).trim();
+      const matches =
+        pattern !== "" &&
+        (pattern.endsWith("*") ? bare.startsWith(pattern.slice(0, -1)) : bare === pattern);
+      if (!matches) {
+        continue;
+      }
+    }
+    for (const raw of (eq === -1 ? clause : clause.slice(eq + 1)).split(",")) {
+      const cap = raw.trim();
+      const enabled = !cap.startsWith("-");
+      overrides.set(enabled ? cap : cap.slice(1), enabled);
+    }
+  }
+  return overrides;
+}
+
+function assertAllFiveOff(value: string | undefined, model: string): void {
+  assert.ok(value, "CLAUDE_CODE_MODEL_CAPABILITIES must be set on a shim-served adapter");
+  const overrides = effectiveCapabilityOverrides(value, model);
+  for (const capability of OPENROUTER_DISABLED_CLAUDE_CAPABILITIES) {
+    assert.equal(overrides.get(capability), false, `${capability} must resolve OFF for ${model}`);
+  }
+}
+
+test("92121ff9 · the shim path disables all five capabilities, for any alias the CLI resolves", () => {
+  const env: NodeJS.ProcessEnv = {};
+  pointAdapterAtShim(env, 41234);
+  assert.deepEqual(
+    [...OPENROUTER_DISABLED_CLAUDE_CAPABILITIES],
+    [
+      "per_turn_effort",
+      "per_turn_timing",
+      "mid_conv_system",
+      "mid_conv_tool_change",
+      "context_management",
+    ],
+  );
+  // Model-less clause: the CLI's alias resolution moves with every bump
+  // (Opus 4.8 on 2.1.257, Opus 5.5 on 2.1.287), so the clause must not name one.
+  for (const model of ["claude-opus-5-5", "claude-opus-5-5[1m]", "claude-sonnet-5-5", "x"]) {
+    assertAllFiveOff(env.CLAUDE_CODE_MODEL_CAPABILITIES, model);
+  }
+});
+
+test("92121ff9 · a pre-existing operator value SURVIVES; ours is appended and wins for the five", () => {
+  const operator = "claude-opus-5-5=fast_mode,per_turn_effort;claude-sonnet*=-lean_prompt";
+  const env: NodeJS.ProcessEnv = { CLAUDE_CODE_MODEL_CAPABILITIES: operator };
+  pointAdapterAtShim(env, 41234);
+  const value = env.CLAUDE_CODE_MODEL_CAPABILITIES ?? "";
+  assert.ok(value.startsWith(`${operator};`), "the operator's clauses are kept verbatim, first");
+  // The operator ENABLED per_turn_effort for Opus 5.5 — behind the shim that is
+  // the dead turn, so the appended clause must override it…
+  assertAllFiveOff(value, "claude-opus-5-5");
+  // …while everything else the operator set still holds.
+  assert.equal(effectiveCapabilityOverrides(value, "claude-opus-5-5").get("fast_mode"), true);
+  assert.equal(effectiveCapabilityOverrides(value, "claude-sonnet-5-5").get("lean_prompt"), false);
+});
+
+test("92121ff9 · spawn then reconnect (pointAdapterAtShim twice) does not duplicate the clause", () => {
+  for (const initial of [undefined, "claude-opus-5-5=-fast_mode"]) {
+    const env: NodeJS.ProcessEnv =
+      initial === undefined ? {} : { CLAUDE_CODE_MODEL_CAPABILITIES: initial };
+    pointAdapterAtShim(env, 41234);
+    const once = env.CLAUDE_CODE_MODEL_CAPABILITIES;
+    pointAdapterAtShim(env, 41235);
+    assert.equal(env.CLAUDE_CODE_MODEL_CAPABILITIES, once);
+    assert.equal((once ?? "").split(";").filter((c) => c.includes("-per_turn_effort")).length, 1);
+  }
 });

@@ -241,3 +241,70 @@ test("buildAgentSpawnOptions (SDK claude): subscription resolution unchanged whe
     assert.equal(options.env.CLAUDE_CONFIG_DIR, path.join(subsDir, "sub1"));
   });
 });
+
+// brick 92121ff9 — the OpenRouter capability knob must stay OFF the Anthropic
+// path: subscription Opus/Sonnet 5.5 need per-turn effort and friends. These are
+// the negative cases for the shim-path rows in openrouter-picker-turn.test.ts.
+async function withScrubbedCapabilitiesEnv(
+  value: string | undefined,
+  run: () => Promise<void>,
+): Promise<void> {
+  const previous = process.env.CLAUDE_CODE_MODEL_CAPABILITIES;
+  if (value === undefined) {
+    delete process.env.CLAUDE_CODE_MODEL_CAPABILITIES;
+  } else {
+    process.env.CLAUDE_CODE_MODEL_CAPABILITIES = value;
+  }
+  try {
+    await run();
+  } finally {
+    if (previous === undefined) {
+      delete process.env.CLAUDE_CODE_MODEL_CAPABILITIES;
+    } else {
+      process.env.CLAUDE_CODE_MODEL_CAPABILITIES = previous;
+    }
+  }
+}
+
+test("92121ff9 · a subscription (non-shim) claude spawn carries NO capability knob", async () => {
+  await withScrubbedCapabilitiesEnv(undefined, async () => {
+    await withProfilesHome(HYBRID_REGISTRY, async (ctx) => {
+      const subsDir = path.join(ctx.homeDir, ".acpx", "subscriptions");
+      await fs.mkdir(path.join(subsDir, "sub1"), { recursive: true });
+      const options = buildAgentSpawnOptions(
+        "/tmp/acpx-auth-env-cwd",
+        undefined,
+        { acpxRecordId: "rec", subscriptionId: "sub1" },
+        ctx.lookupOptions,
+        SDK_CLAUDE_COMMAND,
+      );
+      const shim = await applyProfileAuth(
+        options.env,
+        "sub1",
+        "session-1",
+        "high",
+        ctx.lookupOptions,
+        SDK_CLAUDE_COMMAND,
+      );
+      assert.equal(shim, null);
+      assert.equal("CLAUDE_CODE_MODEL_CAPABILITIES" in options.env, false);
+    });
+  });
+});
+
+test("92121ff9 · an operator's own knob on a non-shim spawn passes through UNCHANGED", async () => {
+  await withScrubbedCapabilitiesEnv("claude-opus-5-5=-fast_mode", async () => {
+    await withProfilesHome(HYBRID_REGISTRY, async (ctx) => {
+      const subsDir = path.join(ctx.homeDir, ".acpx", "subscriptions");
+      await fs.mkdir(path.join(subsDir, "sub1"), { recursive: true });
+      const options = buildAgentSpawnOptions(
+        "/tmp/acpx-auth-env-cwd",
+        undefined,
+        { acpxRecordId: "rec", subscriptionId: "sub1" },
+        ctx.lookupOptions,
+        SDK_CLAUDE_COMMAND,
+      );
+      assert.equal(options.env.CLAUDE_CODE_MODEL_CAPABILITIES, "claude-opus-5-5=-fast_mode");
+    });
+  });
+});

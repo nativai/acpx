@@ -1748,6 +1748,77 @@ export async function startOpenRouterShimForSession(
 export const OPENROUTER_SHIM_AUTH_PLACEHOLDER = "acpx-openrouter-shim-placeholder";
 
 /**
+ * Claude Code capabilities switched OFF for every adapter that talks to the
+ * OpenRouter shim. Each one makes the CLI emit an Anthropic-API-only wire
+ * construct: `per_turn_effort` (an `output_config` on a mid-conversation
+ * message), `per_turn_timing`, `mid_conv_system` (a `role:"system"` message
+ * inside `messages`), `mid_conv_tool_change`, `context_management` (the
+ * top-level `context_management` edits).
+ *
+ * ## 🛑 THE REASON, AS REQUIREMENT + CONSEQUENCE
+ *
+ *   **REQUIREMENT.** The CLI enables these from its OWN model catalogue for the
+ *   Claude model it believes it is running — not from anything the provider
+ *   advertises. Behind the shim that belief is always wrong: the alias resolves
+ *   to a Claude model (Opus 5.5 on CLI 2.1.287) while OpenRouter serves a
+ *   non-Anthropic one. OpenRouter rejects at least the per-turn effort for every
+ *   non-Anthropic provider (measured: GLM and DeepSeek both 400
+ *   `Mid-conversation reasoning effort (configuration_update) is not
+ *   supported`), and the CLI's own "resend without per-turn statements" retry
+ *   recognises only Anthropic's error wording — so the turn DIES rather than
+ *   degrades. Disabling all five restores the wire shape CLI 2.1.257 sent, which
+ *   served both models for weeks. Conversation-level effort (top-level
+ *   `output_config.effort`) is NOT among them and still reaches the provider.
+ *
+ *   **CONSEQUENCE, for the next diagnosis.** If a future CLI renames one of
+ *   these, the env knob silently stops covering it: the symptom is that same
+ *   400 (or another provider-side rejection of a per-message field) on the
+ *   FIRST turn of an OpenRouter session right after a claude-agent-acp bump.
+ *   Re-read the CLI's capability list (the array that starts `"effort",
+ *   "max_effort", …` in the bundled `claude` binary) and update THIS list. The
+ *   shim also strips per-message `output_config` as a safety net
+ *   (`openrouter-shim-code.ts`), so per-turn effort specifically stays covered.
+ *
+ * Evidence: brick 92121ff9, `evidence/FINDINGS.md` (captured request bodies
+ * with and without each capability, plus real turns on both models).
+ *
+ * ⚠️ NOT FOR NON-SHIM SESSIONS. Anthropic-served Opus/Sonnet 5.5 need these;
+ * only {@link pointAdapterAtShim} applies them.
+ */
+export const OPENROUTER_DISABLED_CLAUDE_CAPABILITIES = [
+  "per_turn_effort",
+  "per_turn_timing",
+  "mid_conv_system",
+  "mid_conv_tool_change",
+  "context_management",
+] as const;
+
+const OPENROUTER_CAPABILITY_CLAUSE = OPENROUTER_DISABLED_CLAUDE_CAPABILITIES.map(
+  (capability) => `-${capability}`,
+).join(",");
+
+/**
+ * Add the shim's capability clause to a `CLAUDE_CODE_MODEL_CAPABILITIES` value.
+ *
+ * The CLI reads `;`-separated clauses `[<model-pattern>=]cap,-cap,…` IN ORDER
+ * and the LAST setting of a capability wins (read from CLI 2.1.287's parser).
+ * So the clause is APPENDED: an operator's other settings survive, and ours —
+ * a model-less clause, applying to whatever alias the CLI resolves — is the one
+ * that holds for these five. Already present ⇒ value returned unchanged, so a
+ * reconnect re-applying it never stacks copies.
+ */
+export function withOpenRouterCapabilityClause(existing: string | undefined): string {
+  const clauses = (existing ?? "")
+    .split(";")
+    .map((clause) => clause.trim())
+    .filter((clause) => clause.length > 0);
+  if (!clauses.includes(OPENROUTER_CAPABILITY_CLAUSE)) {
+    clauses.push(OPENROUTER_CAPABILITY_CLAUSE);
+  }
+  return clauses.join(";");
+}
+
+/**
  * Point a claude adapter's spawn env at an already-running shim.
  *
  * ⚠️ ONE FUNCTION BECAUSE THERE ARE TWO CALLERS AND FIXING ONE IS THE BUG. This
@@ -1765,6 +1836,10 @@ export function pointAdapterAtShim(env: NodeJS.ProcessEnv, port: number): void {
   // Remove any custom headers set by the subscription path —
   // the shim injects Authorization itself.
   delete env.ANTHROPIC_CUSTOM_HEADERS;
+  // Anthropic-only wire constructs off — see OPENROUTER_DISABLED_CLAUDE_CAPABILITIES.
+  env.CLAUDE_CODE_MODEL_CAPABILITIES = withOpenRouterCapabilityClause(
+    env.CLAUDE_CODE_MODEL_CAPABILITIES,
+  );
 }
 
 export async function applyProfileAuth(
