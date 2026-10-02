@@ -2099,7 +2099,7 @@ test(
 // ─── brick `eca085bb` — D-BRICK-ON-SEAT / D-SEAT-HOLD, AC-LINK1 and AC-LINK2.
 // Reverses `5c4b8c4a`'s active-only narrowing: the seat's holder is its holder
 // OPEN OR CLOSED, the brick link is taken from it, and a closed holder is never
-// "nobody home". AC-LINK1/AC-LINK2 are cited from `0d2b83f0`'s CONCEPTION.md
+// "vacant". AC-LINK1/AC-LINK2 are cited from `0d2b83f0`'s CONCEPTION.md
 // (D-BRICK-ON-SEAT, §3), not restated. The close-path half of AC-LINK2 is in
 // `seat-activate.test.ts`. ─────────────────────────────────────────────────
 

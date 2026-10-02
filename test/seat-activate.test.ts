@@ -923,7 +923,7 @@ test("F9 · a GENUINELY vacant seat still says so — `null` and `not known` are
   await withTempHome(async (homeDir) => {
     await fs.mkdir(path.join(homeDir, "workspace"), { recursive: true });
     await seedHolder(homeDir, "holder-two", { holderActive: false });
-    // activeHolderId null = nobody home. The predecessor IS known here: there was none.
+    // activeHolderId null = vacant. The predecessor IS known here: there was none.
     await seedSeat(homeDir, { activeHolderId: null, nextOrdinal: 2 });
 
     const result = await activate(homeDir);
