@@ -205,6 +205,77 @@ test("A5: closed:true with no closed_at falls back to the PRE-WRITE mtime, and a
   });
 });
 
+test("A6: a non-string disk closed_at falls back to the PRE-WRITE mtime, not silent acceptance", async () => {
+  await withTempHome("acpx-test-home-", async (homeDir) => {
+    resetPerfMetrics();
+    const id = "guard-a6-nonstring-closed-at";
+    await writeSessionRecordFile(
+      homeDir,
+      seedRecord(homeDir, id, { closed: true, closedAt: "2026-01-01T00:00:00.000Z" }),
+    );
+    // Corrupt closed_at to a NUMBER — the same degradation class A5 exercises
+    // via absence, reached here via a different vector: a non-string
+    // closed_at makes `parseSessionRecord` reject the WHOLE record
+    // (`closedAt === null` in its validation gate), routing to the raw
+    // fallback exactly as Lane A's R2 does for `metadata`.
+    const raw = await readOnDisk(homeDir, id);
+    raw.closed_at = 12345;
+    await fs.writeFile(sessionFilePath(homeDir, id), `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+
+    const staleWarrant = new Date(Date.now() - 60_000).toISOString();
+    const stale = seedRecord(homeDir, id, { closed: false, reopenedAt: staleWarrant });
+    const before = countBlocked();
+    const { stderr } = await captureStderr(() => writeSessionRecordWithLifecycle(stale));
+    assert.equal(
+      countBlocked(),
+      before + 1,
+      "a non-string closed_at must fall through to the mtime basis, never be silently accepted",
+    );
+    assert.match(stderr, /refused a closed:true->false write/);
+
+    const onDisk = await readOnDisk(homeDir, id);
+    assert.equal(onDisk.closed, true);
+  });
+});
+
+// Lane C (test-engineer) measured 20 real reopenSession() calls on the real
+// ext4-backed store: 20/20 succeeded, but the PRE-WRITE mtime basis this
+// guard uses only has ~4ms granularity there (40 writes produced 5 distinct
+// mtimes). A rapid close-then-reopen landing inside that quantum is a REAL,
+// TRANSIENT race on the mtime fallback specifically (closed_at present is
+// unaffected — that basis is a stored timestamp, not a filesystem one).
+// Reproducing the race itself would be flaky by construction, so this pins
+// the boundary it collapses to DETERMINISTICALLY: an EXACT tie between the
+// warrant and the resolved mtime. Per the equal-case rule (ruled explicitly,
+// strict `>`), a tie is refused — intended, transient, and loud, not a
+// defect, and NOT something a future reader should "fix" by relaxing to `>=`.
+test("A5/mtime equal case: a warrant tied with the pre-write mtime is refused — the characterized race, made deterministic", async () => {
+  await withTempHome("acpx-test-home-", async (homeDir) => {
+    resetPerfMetrics();
+    const id = "guard-mtime-equal-case";
+    await writeSessionRecordFile(homeDir, seedRecord(homeDir, id, { closed: true }));
+    const seeded = await readOnDisk(homeDir, id);
+    assert.equal(
+      "closed_at" in seeded,
+      false,
+      "control: must have no closed_at, or this exercises the wrong basis",
+    );
+    const mtimeMs = (await fs.stat(sessionFilePath(homeDir, id))).mtimeMs;
+    const tiedWarrant = new Date(mtimeMs).toISOString();
+
+    const stale = seedRecord(homeDir, id, { closed: false, reopenedAt: tiedWarrant });
+    const before = countBlocked();
+    await writeSessionRecordWithLifecycle(stale);
+    assert.equal(
+      countBlocked(),
+      before + 1,
+      "an exact tie against the pre-write mtime must be refused, not accepted",
+    );
+    const onDisk = await readOnDisk(homeDir, id);
+    assert.equal(onDisk.closed, true);
+  });
+});
+
 test("the equal case (warrant === closed_at) is refused, not accepted", async () => {
   await withTempHome("acpx-test-home-", async (homeDir) => {
     resetPerfMetrics();
