@@ -188,6 +188,28 @@ function effectiveAlias(record: SessionRecord): string | undefined {
 }
 
 /**
+ * The claude gate, made TOTAL for the projection.
+ *
+ * ⚠️ `isClaudeAcpAgentCommand` THROWS on an empty command ("Invalid --agent
+ * command: empty command"), and subagent shadow records are written with
+ * `agentCommand: ""` (`runtime.ts`, teammate_spawned). Called bare from
+ * `toSessionIndexEntry`, that throw failed the shadow record's write — inside a
+ * best-effort block, so silently — and the parent never listed its subagent
+ * (caught by `seat-creation-paths.test.ts` G2/path 3). A projection must never
+ * throw over one record.
+ */
+function isClaudeRecordCommand(agentCommand: unknown): boolean {
+  if (typeof agentCommand !== "string" || agentCommand.trim() === "") {
+    return false;
+  }
+  try {
+    return isClaudeAcpAgentCommand(agentCommand);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Index projection helper: claude-only gate + effective alias + the derivation.
  *
  * DERIVED AT PROJECTION, NOT PERSISTED (the `canSetModelLive` precedent): every
@@ -199,7 +221,7 @@ function effectiveAlias(record: SessionRecord): string | undefined {
  * byte-identical: they never carry this field.
  */
 export function resolvedModelLabelForRecord(record: SessionRecord): string | undefined {
-  if (!isClaudeAcpAgentCommand(record.agentCommand)) {
+  if (!isClaudeRecordCommand(record.agentCommand)) {
     return undefined;
   }
   const alias = effectiveAlias(record);

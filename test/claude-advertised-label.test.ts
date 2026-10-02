@@ -298,6 +298,14 @@ test("the claude gate: codex / pi / synthetic commands never carry the label", (
   );
 });
 
+test('a subagent shadow record (agentCommand "") projects without throwing and carries no label', () => {
+  // The shadow record runtime.ts writes on teammate_spawned has an EMPTY command,
+  // on which the claude gate throws — the projection must stay total.
+  const shadow = claudeRecord({ current_model_id: "opus", config_options: ADVERTISED_9_1 }, "");
+  assert.doesNotThrow(() => toSessionIndexEntry(shadow, "shadow.json"));
+  assert.equal(toSessionIndexEntry(shadow, "shadow.json").resolvedModelLabel, undefined);
+});
+
 test("servedModel is acpx.served.model verbatim, absent until a served turn", () => {
   const served = claudeRecord({
     current_model_id: "opus",
