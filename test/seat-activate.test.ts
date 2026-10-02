@@ -140,6 +140,51 @@ function activate(homeDir: string, seat = SEAT_A, successor = "holder-two"): Pro
   );
 }
 
+// ─── brick `eca085bb` — AC-LINK2 (D-BRICK-ON-SEAT / D-SEAT-HOLD, `0d2b83f0` CONCEPTION §3) ──
+// A close does not vacate a seat: the holder pointer is replaced only by activation.
+
+function closeSessionById(homeDir: string, id: string): Promise<CliResult> {
+  return runCli(
+    ["--agent", MOCK_AGENT_COMMAND, "--format", "json", "sessions", "close", "--session-id", id],
+    homeDir,
+  );
+}
+
+test("AC-LINK2: `sessions close` on the ACTIVE holder leaves the seat's active_holder_id set to it", async () => {
+  await withTempHome(async (homeDir) => {
+    await seedSuccession(homeDir);
+
+    const closed = await closeSessionById(homeDir, "holder-one");
+    assert.equal(closed.code, 0, `${closed.stderr}${closed.stdout}`);
+    // THE CONTROL: the close really landed — without it, "the pointer is unchanged"
+    // is satisfied just as well by a close that never ran.
+    assert.equal((await readRecordJson(homeDir, "holder-one")).closed, true);
+
+    const row = seatFromStore(await readSeatStore(sessionDirOf(homeDir)), SEAT_A);
+    assert.equal(
+      row?.activeHolderId,
+      "holder-one",
+      "AC-LINK2 FAILED: a close cleared the seat's holder pointer",
+    );
+    assert.equal(row?.closedAt, null, "closing a holder does not close the SEAT");
+  });
+});
+
+test("AC-LINK2 (succession): a successor is activated over a CLOSED predecessor, which stays closed", async () => {
+  await withTempHome(async (homeDir) => {
+    await seedSuccession(homeDir);
+    const closed = await closeSessionById(homeDir, "holder-one");
+    assert.equal(closed.code, 0, `${closed.stderr}${closed.stdout}`);
+
+    const result = await activate(homeDir);
+    assert.equal(result.code, 0, `${result.stderr}${result.stdout}`);
+    const row = seatFromStore(await readSeatStore(sessionDirOf(homeDir)), SEAT_A);
+    assert.equal(row?.activeHolderId, "holder-two", "the pointer is replaced by activation");
+    assert.equal((await readRecordJson(homeDir, "holder-one")).closed, true);
+    assert.equal((await readRecordJson(homeDir, "holder-two")).holder_active, true);
+  });
+});
+
 // ─── 1 · THE HAPPY PATH — the paired row every refusal below leans on ─────────
 
 test("a succession retires the predecessor, points the seat, and draws the ordinal", async () => {
@@ -607,6 +652,102 @@ test("phase 0 · a successor of a DIFFERENT kind is refused (B1 ruling 4)", asyn
   });
 });
 
+// ─── brick `eca085bb` fix round — KIND_MISMATCH on an ABSENT kind (TE c1c2c2b7) ──
+// An absent `kind` MEANS "session" (the refusal message already says so). Comparing
+// the raw field refused a succession whenever one side spelled it and the other did
+// not — the shape of every migrated (backfilled, pre-programme) record against a
+// successor created with `--parent-id`, which stamps `kind: "session"`.
+
+test('KIND · activation over a CLOSED predecessor with kind ABSENT accepts a successor of kind "session"', async () => {
+  await withTempHome(async (homeDir) => {
+    await fs.mkdir(path.join(homeDir, "workspace"), { recursive: true });
+    await seedHolder(homeDir, "holder-one", { holderActive: true, holderOrdinal: 1, closed: true });
+    await seedHolder(homeDir, "holder-two", { holderActive: false, kind: "session" });
+    await seedSeat(homeDir);
+    assert.equal(
+      (await readRecordJson(homeDir, "holder-one")).kind,
+      undefined,
+      "fixture: kind absent",
+    );
+
+    const result = await activate(homeDir);
+    assert.equal(result.code, 0, `${result.stderr}${result.stdout}`);
+    const row = seatFromStore(await readSeatStore(sessionDirOf(homeDir)), SEAT_A);
+    assert.equal(row?.activeHolderId, "holder-two");
+  });
+});
+
+test('KIND · activation over a CLOSED predecessor of kind "session" accepts a successor with kind ABSENT', async () => {
+  await withTempHome(async (homeDir) => {
+    await fs.mkdir(path.join(homeDir, "workspace"), { recursive: true });
+    await seedHolder(homeDir, "holder-one", {
+      holderActive: true,
+      holderOrdinal: 1,
+      closed: true,
+      kind: "session",
+    });
+    await seedHolder(homeDir, "holder-two", { holderActive: false });
+    await seedSeat(homeDir);
+
+    const result = await activate(homeDir);
+    assert.equal(result.code, 0, `${result.stderr}${result.stdout}`);
+    const row = seatFromStore(await readSeatStore(sessionDirOf(homeDir)), SEAT_A);
+    assert.equal(row?.activeHolderId, "holder-two");
+  });
+});
+
+test("KIND · a genuinely different kind still refuses, and the remedy is printed", async () => {
+  await withTempHome(async (homeDir) => {
+    await fs.mkdir(path.join(homeDir, "workspace"), { recursive: true });
+    await seedHolder(homeDir, "holder-one", { holderActive: true, holderOrdinal: 1, closed: true });
+    await seedHolder(homeDir, "holder-sub", { holderActive: false, kind: "subagent" });
+    await seedSeat(homeDir);
+
+    const result = await activate(homeDir, SEAT_A, "holder-sub");
+    assert.notEqual(result.code, 0, "a subagent was activated into a session seat");
+    const out = `${result.stdout}${result.stderr}`;
+    assert.match(out, /KIND_MISMATCH/);
+    assert.match(out, /subagent/);
+    assert.match(out, /differs from the seat's current holder \(session\)/);
+    assert.match(out, /cannot inherit this seat/);
+  });
+});
+
+// ─── brick `eca085bb` fix round — the FILL sets the holder's mirror ─────────────
+
+test("MIRROR · after `seats backfill --apply` fills a closed holder's pointer, the FIRST succession reports no mirrorDivergence", async () => {
+  await withTempHome(async (homeDir) => {
+    await fs.mkdir(path.join(homeDir, "workspace"), { recursive: true });
+    await seedHolder(homeDir, "holder-one", {
+      holderActive: false,
+      holderOrdinal: 1,
+      closed: true,
+    });
+    await seedHolder(homeDir, "holder-two", { holderActive: false });
+    // The migrated shape: an EXISTING row, null pointer (the narrowing's leftover).
+    await seedSeat(homeDir, { activeHolderId: null });
+
+    const filled = await runCli(["--format", "json", "seats", "backfill", "--apply"], homeDir);
+    assert.equal(filled.code, 0, `${filled.stderr}${filled.stdout}`);
+    const row = seatFromStore(await readSeatStore(sessionDirOf(homeDir)), SEAT_A);
+    assert.equal(row?.activeHolderId, "holder-one", "control: the fill really pointed the seat");
+    assert.equal(
+      (await readRecordJson(homeDir, "holder-one")).holder_active,
+      true,
+      "the mirror disagrees with the pointer the fill just wrote",
+    );
+
+    const result = await activate(homeDir);
+    assert.equal(result.code, 0, `${result.stderr}${result.stdout}`);
+    const payload = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
+    assert.equal(
+      payload.mirrorDivergence,
+      null,
+      "the first succession reported a false D10 divergence — the fill left the mirror false",
+    );
+  });
+});
+
 // ─── 6 · THE NOTICE (D6) — what it must and must not say ─────────────────────
 
 test("D6 · the notice orients and does NOT brief, claim inherited context, or say P is closed", async () => {
@@ -878,7 +1019,7 @@ test("F9 · a GENUINELY vacant seat still says so — `null` and `not known` are
   await withTempHome(async (homeDir) => {
     await fs.mkdir(path.join(homeDir, "workspace"), { recursive: true });
     await seedHolder(homeDir, "holder-two", { holderActive: false });
-    // activeHolderId null = nobody home. The predecessor IS known here: there was none.
+    // activeHolderId null = vacant. The predecessor IS known here: there was none.
     await seedSeat(homeDir, { activeHolderId: null, nextOrdinal: 2 });
 
     const result = await activate(homeDir);
