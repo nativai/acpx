@@ -358,6 +358,7 @@ export type AcpClientOptions = {
     brick?: string | null;
     brickPath?: string | null;
     agentFolder?: string | null;
+    /** C7 (brick 09197f03) — `<brick>/agents/<seat8>/`, exported as $ACPX_SEAT_FOLDER; null when seat-less. */
     seatFolder?: string | null;
     subscriptionId?: string | null;
     /** Profile id from session_options.profile — takes priority over subscriptionId. */

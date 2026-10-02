@@ -125,6 +125,24 @@ test("resolveAndEnsureAgentFolder gives a seat-less record <brick>/agents/<sessi
   }
 });
 
+// Ids come off disk: a separator or dot-segment must never reach a `mkdir` (it would escape the brick).
+test("resolveAndEnsureAgentFolder refuses an id that is not a single path segment and creates nothing", async () => {
+  await withBaseDir((brickDir) => {
+    for (const [acpxRecordId, seatId] of [
+      ["../escape", undefined],
+      ["a/b", undefined],
+      [SESSION_ID, "../../x"],
+      [SESSION_ID, ".."],
+    ] as const) {
+      assert.equal(
+        resolveAndEnsureAgentFolder(recordWith({ acpxRecordId, seatId }), brickDir),
+        null,
+      );
+    }
+    assert.equal(fs.existsSync(path.join(brickDir, "agents")), false);
+  });
+});
+
 // brick b11f98fb — the legacy `metadata.task_folder` fallback is GONE. This is the
 // specimen the removal has to be proven against: a pre-removal record that still
 // carries the key, pointing at a directory that really exists. Before the removal

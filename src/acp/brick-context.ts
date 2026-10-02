@@ -19,8 +19,29 @@ type BrickContextOptions = {
   // as `--session <id>` so the rendered "Your workspace" line names the child's own agent
   // folder — never the spawner's, which the queue-owner's ambient $ACPX_SESSION_URL carries.
   sessionId?: string;
+  // The child's OWN seat id (C7, brick 09197f03). The seat-keyed workspace path needs it, and it
+  // reaches the brick CLI through the child ENV (`ACPX_SEAT_URL`), never as a flag — see
+  // `brickContextEnv`. Absent for a seat-less child.
   seatId?: string;
 };
+
+function trimmedOrUndefined(value: string | null | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+/**
+ * The child's OWN identity for `resolveBrickContext`, read from the session context — the same context
+ * `$ACPX_AGENT_FOLDER` is derived from, so the two cannot name different directories (C7 row 3).
+ */
+export function brickContextIdentity(
+  sessionContext: { acpxRecordId?: string | null; seatId?: string | null } | undefined,
+): Pick<BrickContextOptions, "sessionId" | "seatId"> {
+  return {
+    sessionId: trimmedOrUndefined(sessionContext?.acpxRecordId),
+    seatId: trimmedOrUndefined(sessionContext?.seatId),
+  };
+}
 
 export async function resolveBrickContext(
   brickId: string,
@@ -34,13 +55,47 @@ export async function resolveBrickContext(
     normalized,
     options.timeoutMs ?? BRICK_CONTEXT_TIMEOUT_MS,
     options.sessionId,
+    options.seatId,
   );
+}
+
+/**
+ * The env `brick context` runs under: `brickChildEnv()` plus the CHILD's identity, so the rendered
+ * "Your workspace" line is derived from the same session and seat `$ACPX_AGENT_FOLDER` was.
+ *
+ * ⚠️ BY ENV, NEVER BY A `--seat` FLAG. The deployed `brick` CLI rejects an unknown flag (measured:
+ * `brick context X --bogusflag` → rc 2 `unknown flag`), and a failed context fetch BLANKS the whole brick
+ * block — so a flag would silently un-brick every agent on every box where acpx runs ahead of acpx-ui.
+ * An old brick CLI simply ignores `ACPX_SEAT_URL`.
+ *
+ * ⚠️ THE QUEUE OWNER'S AMBIENT `ACPX_SESSION_URL` / `ACPX_SEAT_URL` ARE THE SPAWNER'S, so each is SET to
+ * the child's or DELETED — never inherited. With no own id (the transient creation spawn) both are
+ * deleted: the brick CLI then renders its placeholder instead of the SPAWNER's folder, which a codex
+ * primer would otherwise keep in the thread history. A seat is only meaningful with a session.
+ * (Bare ids, not URLs: the brick CLI accepts either, and a bare id cannot name another box.)
+ */
+function brickContextEnv(sessionId?: string, seatId?: string): NodeJS.ProcessEnv {
+  const env = brickChildEnv();
+  const session = sessionId?.trim();
+  const seat = seatId?.trim();
+  if (session) {
+    env.ACPX_SESSION_URL = session;
+  } else {
+    delete env.ACPX_SESSION_URL;
+  }
+  if (session && seat) {
+    env.ACPX_SEAT_URL = seat;
+  } else {
+    delete env.ACPX_SEAT_URL;
+  }
+  return env;
 }
 
 function execBrickContext(
   brickId: string,
   timeoutMs: number,
   sessionId?: string,
+  seatId?: string,
 ): Promise<string | undefined> {
   return new Promise<string | undefined>((resolve) => {
     let child: ReturnType<typeof spawn>;
@@ -56,7 +111,7 @@ function execBrickContext(
         // `process.env` WHOLESALE, realm credential included. There was no error and no warning;
         // the child worked perfectly. This path never reaches `auth-env.ts`'s delete list, so the
         // contract's prefix-strip remedy could not cover it: the list is never consulted here.
-        env: brickChildEnv(),
+        env: brickContextEnv(sessionId, seatId),
       });
     } catch (error) {
       warnBrickContext(brickId, `spawn failed: ${describeError(error)}`);

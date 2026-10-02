@@ -1,5 +1,6 @@
 import { Command, Option } from "commander";
 import { DEFAULT_HISTORY_LIMIT, parseSeatRefOrThrow } from "../session/persistence.js";
+import { registerAgentFoldersCommand } from "./agent-folders-command.js";
 import { registerAgentsCommand } from "./agents-command.js";
 import {
   addArchiveRunIntentOptions,
@@ -1033,6 +1034,9 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
   // only — the seat store is one agent-agnostic file, so `acpx claude seats …`
   // would be meaningless.
   registerSeatsCommand(program, config);
+  // ⚠️ SECOND HALF IN `src/cli-core.ts`'s `TOP_LEVEL_VERBS` (`"agent-folders"`) — same commit, or the
+  // token is absorbed as an agent name (C7, brick 09197f03).
+  registerAgentFoldersCommand(program, config);
   registerSubscriptionsCommand(program, config);
   registerProfilesCommand(program, config);
   registerAgentsCommand(program, config);
