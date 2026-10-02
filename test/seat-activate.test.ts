@@ -140,6 +140,51 @@ function activate(homeDir: string, seat = SEAT_A, successor = "holder-two"): Pro
   );
 }
 
+// ─── brick `eca085bb` — AC-LINK2 (D-BRICK-ON-SEAT / D-SEAT-HOLD, `0d2b83f0` CONCEPTION §3) ──
+// A close does not vacate a seat: the holder pointer is replaced only by activation.
+
+function closeSessionById(homeDir: string, id: string): Promise<CliResult> {
+  return runCli(
+    ["--agent", MOCK_AGENT_COMMAND, "--format", "json", "sessions", "close", "--session-id", id],
+    homeDir,
+  );
+}
+
+test("AC-LINK2: `sessions close` on the ACTIVE holder leaves the seat's active_holder_id set to it", async () => {
+  await withTempHome(async (homeDir) => {
+    await seedSuccession(homeDir);
+
+    const closed = await closeSessionById(homeDir, "holder-one");
+    assert.equal(closed.code, 0, `${closed.stderr}${closed.stdout}`);
+    // THE CONTROL: the close really landed — without it, "the pointer is unchanged"
+    // is satisfied just as well by a close that never ran.
+    assert.equal((await readRecordJson(homeDir, "holder-one")).closed, true);
+
+    const row = seatFromStore(await readSeatStore(sessionDirOf(homeDir)), SEAT_A);
+    assert.equal(
+      row?.activeHolderId,
+      "holder-one",
+      "AC-LINK2 FAILED: a close cleared the seat's holder pointer",
+    );
+    assert.equal(row?.closedAt, null, "closing a holder does not close the SEAT");
+  });
+});
+
+test("AC-LINK2 (succession): a successor is activated over a CLOSED predecessor, which stays closed", async () => {
+  await withTempHome(async (homeDir) => {
+    await seedSuccession(homeDir);
+    const closed = await closeSessionById(homeDir, "holder-one");
+    assert.equal(closed.code, 0, `${closed.stderr}${closed.stdout}`);
+
+    const result = await activate(homeDir);
+    assert.equal(result.code, 0, `${result.stderr}${result.stdout}`);
+    const row = seatFromStore(await readSeatStore(sessionDirOf(homeDir)), SEAT_A);
+    assert.equal(row?.activeHolderId, "holder-two", "the pointer is replaced by activation");
+    assert.equal((await readRecordJson(homeDir, "holder-one")).closed, true);
+    assert.equal((await readRecordJson(homeDir, "holder-two")).holder_active, true);
+  });
+});
+
 // ─── 1 · THE HAPPY PATH — the paired row every refusal below leans on ─────────
 
 test("a succession retires the predecessor, points the seat, and draws the ordinal", async () => {
