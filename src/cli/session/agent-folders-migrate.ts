@@ -58,6 +58,10 @@ export type AgentFolderMigrationCounts = {
   ambiguous: number;
   other: number;
   alreadyC7: number;
+  /** C7 link: uuid-form dirs of seated sessions that are (or, in a dry run, would be) left as a symlink. */
+  linked: number;
+  /** A uuid-form entry that is ALREADY the right symlink — what makes a second `--apply` a no-op. */
+  alreadyLinked: number;
 };
 
 export type AgentFolderMigrationAction = {
@@ -65,6 +69,8 @@ export type AgentFolderMigrationAction = {
   brick: string;
   from: string;
   to?: string;
+  /** The uuid-form path is replaced by a relative symlink to the holder folder. */
+  link?: boolean;
 };
 
 export type AgentFolderMigrationReport = {
@@ -343,6 +349,8 @@ export async function migrateAgentFolders(
       ambiguous: 0,
       other: 0,
       alreadyC7: 0,
+      linked: 0,
+      alreadyLinked: 0,
     },
     actions: [],
     errors: [],

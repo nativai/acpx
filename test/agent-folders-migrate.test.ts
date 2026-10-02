@@ -37,6 +37,9 @@ const S5 = "55555555-5555-4555-8555-555555555555";
 const SEAT5 = "eeeeeeee-5555-4555-8555-eeeeeeeeeeee";
 // A seat-less session (pre-backfill).
 const S3 = "33333333-3333-4333-8333-333333333333";
+// A seated session whose uuid-form dir is EMPTY: removed, then replaced by the link.
+const S6 = "66666666-6666-4666-8666-666666666666";
+const SEAT6 = "dddddddd-6666-4666-8666-dddddddddddd";
 // Two sessions sharing an id8 ⇒ a name-form dir carrying it is AMBIGUOUS.
 const S4A = "44444444-aaaa-4444-8444-444444444444";
 const S4B = "44444444-bbbb-4444-8444-444444444444";
@@ -54,6 +57,7 @@ async function writeSeatedRecords(home: string): Promise<void> {
     [S1, SEAT1, "s1"],
     [S2, SEAT2, "s2"],
     [S5, SEAT5, "s5"],
+    [S6, SEAT6, "s6"],
     [S3, undefined, "s3"],
     [S4A, "ffffffff-4444-4444-8444-44444444444a", "s4a"],
     [S4B, "ffffffff-4444-4444-8444-44444444444b", "s4b"],
@@ -78,6 +82,7 @@ async function buildPopulation(home: string): Promise<Tree> {
   await writeFile(path.join(agentsA, S1, "sub", "deep.txt"), "deep file\n");
   await writeFile(path.join(agentsA, "my-name-11111111", "notes.md"), "name-form notes\n");
   await writeFile(path.join(agentsA, "my-name-11111111", "extra.txt"), "extra\n");
+  await fs.mkdir(path.join(agentsA, S6), { recursive: true });
   // S2: a bare id8 dir (non-empty) and an EMPTY name-form dir.
   await writeFile(path.join(agentsA, "22222222", "report.md"), "bare id8 report\n");
   await fs.mkdir(path.join(agentsA, "named-22222222"), { recursive: true });
@@ -99,7 +104,7 @@ async function buildPopulation(home: string): Promise<Tree> {
   return { pool, sessionsDir, home };
 }
 
-type Entry = { rel: string; kind: "dir" | "file"; sha?: string };
+type Entry = { rel: string; kind: "dir" | "file" | "link"; sha?: string; target?: string };
 
 /** Full tree listing with a sha256 per file — what "mutates nothing" is compared against. */
 async function snapshot(root: string): Promise<Entry[]> {
@@ -110,7 +115,10 @@ async function snapshot(root: string): Promise<Entry[]> {
     )) {
       const full = path.join(dir, entry.name);
       const rel = path.relative(root, full);
-      if (entry.isDirectory()) {
+      if (entry.isSymbolicLink()) {
+        // Never followed: a link is compared by its own target string.
+        out.push({ rel, kind: "link", target: await fs.readlink(full) });
+      } else if (entry.isDirectory()) {
         out.push({ rel, kind: "dir" });
         await walk(full);
       } else {
@@ -138,7 +146,7 @@ async function read(file: string): Promise<string> {
 }
 
 async function exists(file: string): Promise<boolean> {
-  return await fs.access(file).then(
+  return await fs.lstat(file).then(
     () => true,
     () => false,
   );
@@ -169,12 +177,14 @@ function runCli(args: string[], home: string): Promise<CliResult> {
 
 const EXPECTED_COUNTS = {
   moved: 3, // S1 uuid form, S1 name form, S2 bare id8
-  removedEmpty: 1, // named-22222222
+  removedEmpty: 2, // named-22222222, S6's empty uuid dir
   untouchedSeatless: 1, // S3's uuid dir
   unresolved: 1, // ghost-99999999
   ambiguous: 1, // x-44444444
   other: 2, // README.txt, scratch
   alreadyC7: 1, // BRICK_B's aaaaaaaa/holders
+  linked: 2, // S1's and S6's uuid-form paths become symlinks to their holder folders
+  alreadyLinked: 0,
 };
 
 const SEAT1_TARGET = (pool: string) =>
@@ -261,8 +271,16 @@ test("--apply carries uuid-form, name-form and bare-id8 dirs of seated sessions,
 
     const agentsA = path.join(tree.pool, BRICK_A, "agents");
     // Sources are gone (row 6: no non-empty directory is left behind), the EMPTY name form is removed.
-    for (const gone of [S1, "my-name-11111111", "22222222", "named-22222222"]) {
+    for (const gone of ["my-name-11111111", "22222222", "named-22222222"]) {
       assert.equal(await exists(path.join(agentsA, gone)), false, `${gone} was left behind`);
+    }
+    // The uuid-form paths are no longer directories: each is a RELATIVE symlink to its holder folder.
+    for (const [uuid, link] of [
+      [S1, "aaaaaaaa/holders/11111111"],
+      [S6, "dddddddd/holders/66666666"],
+    ]) {
+      assert.equal((await fs.lstat(path.join(agentsA, uuid))).isSymbolicLink(), true, uuid);
+      assert.equal(await fs.readlink(path.join(agentsA, uuid)), link);
     }
     // Seat-less / unresolved / ambiguous / non-matching are untouched.
     assert.equal(await read(path.join(agentsA, S3, "seatless.md")), "seat-less keeps its folder\n");
@@ -283,7 +301,10 @@ test("--apply carries uuid-form, name-form and bare-id8 dirs of seated sessions,
         "README.txt",
         "aaaaaaaa",
         "bbbbbbbb",
+        "dddddddd",
+        S1,
         S3,
+        S6,
         "ghost-99999999",
         "scratch",
         "x-44444444",
@@ -309,7 +330,13 @@ test("a second --apply reports zero moves and zero removals and changes nothing 
     assert.equal(second.counts.removedEmpty, 0);
     assert.deepEqual(second.actions, []);
     // The seat folders the first run created are recognised, not re-read as unresolved bare id8 dirs.
-    assert.equal(second.counts.alreadyC7, EXPECTED_COUNTS.alreadyC7 + 2);
+    assert.equal(second.counts.alreadyC7, EXPECTED_COUNTS.alreadyC7 + 3);
+    assert.equal(second.counts.linked, 0);
+    assert.equal(
+      second.counts.alreadyLinked,
+      2,
+      "the links the first run left are recognised, not re-read",
+    );
     assert.deepEqual(await snapshot(home), afterFirst, "the second --apply changed the filesystem");
   });
 });
@@ -363,6 +390,7 @@ test("merging into an EXISTING target keeps both sides: nothing overwritten, not
 
     const report = await migrateAgentFolders({ pool, sessionsDir, apply: true });
     assert.equal(report.counts.moved, 1);
+    assert.equal(report.counts.linked, 1);
 
     assert.equal(await read(path.join(target, "keep.txt")), "already there\n");
     assert.equal(await read(path.join(target, "notes.md")), "target notes\n");
@@ -371,7 +399,8 @@ test("merging into an EXISTING target keeps both sides: nothing overwritten, not
     assert.equal(await read(path.join(target, "dir", "inner.txt")), "target inner\n");
     assert.equal(await read(path.join(target, "dir", `inner.txt.from-${S5}`)), "source inner\n");
     assert.equal(await read(path.join(target, "dir", "more.txt")), "source more\n");
-    assert.equal(await exists(source), false);
+    // The source path is now the link, never a directory again.
+    assert.equal(await fs.readlink(source), "eeeeeeee/holders/55555555");
     assert.deepEqual(await contentMultiset(pool), before);
   });
 });
@@ -410,5 +439,93 @@ test("`agent-folders` is a REAL top-level verb: a bogus subverb is an error, nev
     assert.match(help.stdout, /--apply/);
     assert.match(help.stdout, /--pool/);
     assert.match(help.stdout, /--sessions-dir/);
+  });
+});
+
+// C7 LINK (F3, the TE's finding): Claude keeps its system prompt as a transcript SNAPSHOT and codex never
+// re-sends developer items, so a session whose primer was rendered BEFORE C7 keeps naming
+// `agents/<session-uuid>/` as "Your workspace" forever while its env names the holder path. If the migration
+// merely moved that directory away, the agent would `mkdir -p` it again and the split would be back.
+test("a write through the OLD uuid path lands in the holder folder, and `mkdir -p` of it still works", async () => {
+  await withTempHome("acpx-c7-link-", async (home) => {
+    const tree = await buildPopulation(home);
+    await migrateAgentFolders({ pool: tree.pool, sessionsDir: tree.sessionsDir, apply: true });
+    const agentsA = path.join(tree.pool, BRICK_A, "agents");
+
+    // What an agent holding the pre-C7 primer does: mkdir -p its named workspace, then write into it.
+    await fs.mkdir(path.join(agentsA, S1), { recursive: true });
+    await fs.writeFile(path.join(agentsA, S1, "late.md"), "written through the old path\n");
+    assert.equal(
+      await read(path.join(SEAT1_TARGET(tree.pool), "late.md")),
+      "written through the old path\n",
+    );
+    // The empty-uuid case too: the holder folder exists (it was created for the link), so the link is not dangling.
+    await fs.writeFile(path.join(agentsA, S6, "late.md"), "empty case\n");
+    assert.equal(
+      await read(path.join(agentsA, "dddddddd", "holders", "66666666", "late.md")),
+      "empty case\n",
+    );
+    // No second directory ever reappears next to the seat folder.
+    assert.equal((await fs.lstat(path.join(agentsA, S1))).isSymbolicLink(), true);
+  });
+});
+
+test("the dry run REPORTS the links it would create, and creates none", async () => {
+  await withTempHome("acpx-c7-link-dry-", async (home) => {
+    const tree = await buildPopulation(home);
+    const report = await migrateAgentFolders({
+      pool: tree.pool,
+      sessionsDir: tree.sessionsDir,
+      apply: false,
+    });
+    assert.equal(report.counts.linked, 2);
+    const links = report.actions.filter((action) => action.link === true);
+    assert.deepEqual(
+      links.map((action) => path.basename(action.from)).toSorted(),
+      [S1, S6].toSorted(),
+    );
+    const agentsA = path.join(tree.pool, BRICK_A, "agents");
+    assert.equal(
+      (await fs.lstat(path.join(agentsA, S1))).isDirectory(),
+      true,
+      "the dry run replaced a directory",
+    );
+  });
+});
+
+test("name-form and bare-id8 dirs are carried or removed WITHOUT a link (no primer ever rendered them)", async () => {
+  await withTempHome("acpx-c7-nolink-", async (home) => {
+    const tree = await buildPopulation(home);
+    await migrateAgentFolders({ pool: tree.pool, sessionsDir: tree.sessionsDir, apply: true });
+    const agentsA = path.join(tree.pool, BRICK_A, "agents");
+    for (const gone of ["my-name-11111111", "22222222", "named-22222222"]) {
+      assert.equal(await exists(path.join(agentsA, gone)), false, gone);
+    }
+  });
+});
+
+test("a symlink that already points at the right holder is skipped (alreadyLinked); one pointing ELSEWHERE is never repointed", async () => {
+  await withTempHome("acpx-c7-foreign-", async (home) => {
+    const pool = path.join(home, "pool");
+    const sessionsDir = path.join(home, ".acpx", "sessions");
+    await writeSeatedRecords(home);
+    const agents = path.join(pool, BRICK_C, "agents");
+    await fs.mkdir(path.join(agents, "eeeeeeee", "holders", "55555555"), { recursive: true });
+    await fs.symlink("eeeeeeee/holders/55555555", path.join(agents, S5)); // already right
+    await fs.mkdir(path.join(agents, "elsewhere"), { recursive: true });
+    await fs.symlink("elsewhere", path.join(agents, S1)); // foreign
+    const before = await snapshot(home);
+
+    for (const apply of [false, true]) {
+      const report = await migrateAgentFolders({ pool, sessionsDir, apply });
+      assert.equal(report.counts.alreadyLinked, 1, `apply=${apply}`);
+      assert.equal(report.counts.linked, 0);
+      assert.equal(report.counts.moved, 0);
+      assert.equal(report.counts.removedEmpty, 0);
+      assert.equal(report.counts.other, 1, "the foreign link is reported as other");
+      assert.deepEqual(report.actions, []);
+      assert.deepEqual(await snapshot(home), before, `apply=${apply} touched a link`);
+    }
+    assert.equal(await fs.readlink(path.join(agents, S1)), "elsewhere");
   });
 });
