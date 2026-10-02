@@ -400,23 +400,32 @@ function favoriteFromHolders(members: readonly RecordPlan[]): boolean {
 }
 
 /**
- * `brick_id` — item (d), brick `3dff714d`, DECISIONS.md CORRECTION + AMENDMENT.
- * `seats backfill` is a THIRD site of F1's pattern: this function unconditionally
- * returned `undefined` here, same comment as `mintSeatRow` carried before its own
- * fix, and it is pre-existing code (`git show origin/seat/program:…` carries it
- * identically) — not something this brick's edits introduced. Left unfixed, (a)
- * only starts seats from now on and C4 stays false for every seat that predates
- * it, which is the DOMINANT population per F1.
+ * `brick_id` — item (d), brick `3dff714d`, DECISIONS.md CORRECTION + AMENDMENT,
+ * narrowed by brick `5c4b8c4a`. Same shape as `name` (`seatNameSource`) — reused
+ * directly rather than re-deriving the same representative — **not** the same
+ * shape as `favorite`'s `some()`: where holders disagree, the ACTIVE holder's
+ * brick wins, not "any holder's". A seat with no OPEN member sources NO link —
+ * absent means UNKNOWN, the pessimistic direction this family exists to make
+ * safe, never a highest-ordinal fallback onto a closed holder's stale ref.
  *
- * Same shape as `name` (`seatNameSource`) — reused directly rather than
- * re-deriving the same representative — **not** the same shape as `favorite`'s
- * `some()`: where holders disagree, the ACTIVE holder's brick wins, not "any
- * holder's". A retired holder's stale brick must not resurrect over the live
- * link; `seatNameSource`'s own fallback (highest ordinal) applies identically
- * when every member is closed.
+ * Daniel's ruling reaches ACTIVE holders only; whether a RETIRED holder's link
+ * is legitimate evidence for a seat's canonical brick is still open. `provenance`
+ * carries only `"active-holder"` today and nothing branches on it yet — BOTH are
+ * deliberate, so a YES answer is one new branch here instead of a re-threaded
+ * return type through `brickFromHolders` → `brickLinkFromHolders` → `planSeatRow`.
+ * Do not simplify either away.
  */
+type BrickLinkProvenance = "active-holder";
+
+function brickLinkSourceFor(
+  members: readonly RecordPlan[],
+): { source: RecordPlan; provenance: BrickLinkProvenance } | undefined {
+  const holder = activeHolderFor(members);
+  return holder === undefined ? undefined : { source: holder, provenance: "active-holder" };
+}
+
 function brickFromHolders(members: readonly RecordPlan[]): string | undefined {
-  return seatNameSource(members)?.record.metadata?.brick?.trim() || undefined;
+  return brickLinkSourceFor(members)?.source.record.metadata?.brick?.trim() || undefined;
 }
 
 /**
