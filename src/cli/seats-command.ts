@@ -2,7 +2,6 @@ import type { Command } from "commander";
 import { SessionNotFoundError } from "../errors.js";
 import { describeAbandonedRecordSweep } from "../session/abandoned-record-sweep.js";
 import {
-  SEAT_STORE_FILE,
   SEAT_STORE_NO_CHANGE,
   SeatStoreUnwritableError,
   MalformedSeatRowError,
@@ -13,7 +12,7 @@ import {
   resolveSessionRecord,
   seatBrickLinkFromRef,
   seatFromStore,
-  seatRowMissingMessage,
+  SeatRowMissingError,
   seatStorePath,
   seatStoreUnhealthyMessage,
   sessionBaseDir,
@@ -25,6 +24,7 @@ import {
 import type { SessionIndexEntry } from "../session/persistence/index.js";
 import {
   countStaleSeatIndexEntries,
+  explainSeatRowMissing,
   runSeatBackfill,
   type SeatBackfillReport,
 } from "../session/seat-backfill.js";
@@ -303,7 +303,7 @@ function refuseUnhealthyStoreForRead(store: SeatStore): void {
   if (store.fileState === "malformed" || store.fileState === "unreadable") {
     throw new SeatMutationRefusalError(
       "SEAT_STORE_UNHEALTHY",
-      seatStoreUnhealthyMessage(store.fileState),
+      seatStoreUnhealthyMessage(store.fileState, store.storePath),
     );
   }
 }
@@ -319,7 +319,9 @@ function refuseUnhealthyStoreForRead(store: SeatStore): void {
 function requireSeatRow(store: SeatStore, seatId: string): SeatRecord {
   const row = seatFromStore(store, seatId);
   if (!row) {
-    throw new SeatMutationRefusalError("SEAT_ROW_MISSING", seatRowMissingMessage(seatId));
+    // Thrown bare: the origin (typo vs backfillable) needs a record scan, which cannot run
+    // inside the hold this is often called from. `asSeatRefusal` words it.
+    throw new SeatRowMissingError(seatId, store.storePath);
   }
   return row;
 }
@@ -339,29 +341,32 @@ function requireSeatRow(store: SeatStore, seatId: string): SeatRecord {
  * and cannot repair a row. Two refusals about "the row is not usable" that shared a
  * substring would be green whichever fired, which is B2's AP13 defect.
  */
-function seatRowsMalformedMessage(seatIds: readonly string[]): string {
+function seatRowsMalformedMessage(seatIds: readonly string[], storePath: string): string {
   const subject = seatIds.map((seatId) => JSON.stringify(seatId)).join(", ");
   return (
-    `seat ${subject} is PRESENT in ${SEAT_STORE_FILE} and its row is MALFORMED, so this ` +
-    `delete REFUSES it instead of removing it: the store's one writer re-emits unreadable ` +
-    `rows verbatim as a data-loss defence, and such a row may still be hand-recoverable. ` +
-    `Only the named row is corrupt — every other row in the file read fine, so there is no ` +
-    `need to audit the whole store. Repair: QUARANTINE a copy of ${SEAT_STORE_FILE} ` +
-    `(${SEAT_STORE_FILE}.corrupt-<timestamp>, and KEEP it), hand-repair or hand-remove the ` +
-    `named row, then run the seat backfill for anything left without a row. Do not delete ` +
-    `the store to clear this.`
+    `seat ${subject} is PRESENT in ${storePath} and its row is MALFORMED, so a seat command ` +
+    `REFUSES it rather than acting on it or dropping it: the store's one writer re-emits ` +
+    `unreadable rows verbatim as a data-loss defence, and such a row may still be ` +
+    `hand-recoverable. Only the named row is corrupt — every other row in the file read ` +
+    `fine, so there is no need to audit the whole store. Repair: QUARANTINE a copy of ` +
+    `${storePath} (${storePath}.corrupt-<timestamp>, and KEEP it), hand-repair or ` +
+    `hand-remove the named row, then run \`acpx seats backfill --apply\` for anything left ` +
+    `without a row. Do not delete the store to clear this.`
   );
 }
 
 /** The errors a seat mutation may legitimately refuse with, normalised to one shape. */
-function asSeatRefusal(error: unknown): SeatMutationRefusalError | undefined {
+async function asSeatRefusal(error: unknown): Promise<SeatMutationRefusalError | undefined> {
   if (error instanceof SeatMutationRefusalError) {
     return error;
+  }
+  if (error instanceof SeatRowMissingError) {
+    return new SeatMutationRefusalError("SEAT_ROW_MISSING", await explainSeatRowMissing(error));
   }
   if (error instanceof MalformedSeatRowError) {
     return new SeatMutationRefusalError(
       "SEAT_ROW_MALFORMED",
-      seatRowsMalformedMessage([error.seatId]),
+      seatRowsMalformedMessage([error.seatId], error.storePath),
     );
   }
   if (error instanceof SeatStoreUnwritableError) {
@@ -384,7 +389,7 @@ async function runSeatMutation(
   try {
     await run();
   } catch (error) {
-    const refusal = asSeatRefusal(error);
+    const refusal = await asSeatRefusal(error);
     if (!refusal) {
       throw error;
     }
@@ -745,13 +750,17 @@ async function handleSeatsDelete(
       }
       return { mutation: { kind: "write", seats } as const, result };
     });
-    renderSeatDelete(format, outcome);
+    renderSeatDelete(format, outcome, seatStorePath(sessionDir));
   });
 }
 
-function renderSeatDelete(format: OutputFormat, outcome: SeatDeleteOutcome): void {
+function renderSeatDelete(
+  format: OutputFormat,
+  outcome: SeatDeleteOutcome,
+  storePath: string,
+): void {
   const refused = outcome.malformed.length > 0;
-  const message = refused ? seatRowsMalformedMessage(outcome.malformed) : undefined;
+  const message = refused ? seatRowsMalformedMessage(outcome.malformed, storePath) : undefined;
   renderSeatDeleteReport(format, outcome, message);
   if (refused) {
     // The rc is the only signal a caller that reads nothing else will see, and a

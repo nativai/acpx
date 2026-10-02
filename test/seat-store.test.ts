@@ -20,6 +20,9 @@ import {
 } from "../src/session/persistence/seat-store.js";
 import { withTempDir } from "./runtime-test-helpers.js";
 
+/** An absolute path for pure parse rows — only ever echoed into refusals, never opened. */
+const TEST_STORE_PATH = "/rig/sessions/seats.json";
+
 // The seat store — `~/.acpx/sessions/seats.json`, the AUTHORITY for which holder
 // sits in which seat (brick b64dfbb3 / B2; SEAT-STORE.md, ratified 2026-09-28).
 //
@@ -362,7 +365,7 @@ test("a MALFORMED row throws and is NOT reported as absent — the states must n
       '{"s":{"seat_id":"s","created_at":"t","active_holder_id":null,"next_ordinal":1,"closed_at":null,"brick_id":"1a5845c3-a832-4370-b564-8ec5286bff79","brick_id_validated":"yes"}}',
   };
   for (const [label, payload] of Object.entries(cases)) {
-    const store = parseSeatStore(payload);
+    const store = parseSeatStore(payload, TEST_STORE_PATH);
     assert.deepEqual(store.malformedSeatIds, ["s"], `${label}: not recorded as malformed`);
     assert.equal(store.seats.size, 0, `${label}: a malformed row was accepted`);
     assert.throws(
@@ -384,6 +387,7 @@ test("the identical fixture with a GENUINE boolean brick_id_validated parses cle
   const store = parseSeatStore(
     '{"s":{"seat_id":"s","created_at":"t","active_holder_id":null,"next_ordinal":1,"closed_at":null,' +
       '"brick_id":"1a5845c3-a832-4370-b564-8ec5286bff79","brick_id_validated":false}}',
+    TEST_STORE_PATH,
   );
   assert.deepEqual(store.malformedSeatIds, [], "a genuine boolean must not be rejected");
   const row = seatFromStore(store, "s");
@@ -397,6 +401,7 @@ test("a malformed row does not take down the seats beside it", () => {
   const store = parseSeatStore(
     '{"bad":{"seat_id":"bad"},' +
       '"good":{"seat_id":"good","created_at":"t","active_holder_id":"h","next_ordinal":3,"closed_at":null}}',
+    TEST_STORE_PATH,
   );
   assert.deepEqual(store.malformedSeatIds, ["bad"]);
   assert.equal(seatFromStore(store, "good")?.nextOrdinal, 3);
@@ -413,7 +418,7 @@ test("F1 · an unparseable FILE reports fileState MALFORMED and must NOT read as
   // `malformedSeatIds` is legitimately EMPTY here — there are no rows to attribute —
   // which is exactly why the FILE's state has to travel separately.
   for (const payload of ["not json at all", "[]", "null", '"a string"', "42"]) {
-    const store = parseSeatStore(payload);
+    const store = parseSeatStore(payload, TEST_STORE_PATH);
     assert.equal(store.seats.size, 0, payload);
     assert.deepEqual(store.malformedSeatIds, [], payload);
     assert.equal(store.fileState, "malformed", `${payload}: file state not reported`);
@@ -428,12 +433,12 @@ test("F1 · an unparseable FILE reports fileState MALFORMED and must NOT read as
 test("F1 · the three FILE states are three answers, not one — and the remedies differ", () => {
   // The paired row: a MISSING file is genuinely absent and must NOT throw, or the fix
   // for F1 would have broken the ordinary empty-box case.
-  assert.equal(parseSeatStore("{}").fileState, "ok");
-  assert.equal(seatFromStore(parseSeatStore("{}"), "nope"), undefined);
+  assert.equal(parseSeatStore("{}", TEST_STORE_PATH).fileState, "ok");
+  assert.equal(seatFromStore(parseSeatStore("{}", TEST_STORE_PATH), "nope"), undefined);
 
   // …and the remedies are different text, because "run the backfill" is right for an
   // absent ROW and wrong for a corrupt FILE.
-  const malformed = seatStoreUnhealthyMessage("malformed");
+  const malformed = seatStoreUnhealthyMessage("malformed", TEST_STORE_PATH);
   assert.match(malformed, /quarantine/i, "the malformed remedy does not say to quarantine");
   assert.match(malformed, /corrupt-<timestamp>/, "it does not give the quarantine name");
   assert.match(
@@ -441,7 +446,7 @@ test("F1 · the three FILE states are three answers, not one — and the remedie
     /refuses to run against a malformed store/i,
     "it does not say the backfill alone is NOT the remedy",
   );
-  const unreadable = seatStoreUnhealthyMessage("unreadable");
+  const unreadable = seatStoreUnhealthyMessage("unreadable", TEST_STORE_PATH);
   assert.match(unreadable, /repair the filesystem/i);
   assert.doesNotMatch(
     unreadable,

@@ -539,7 +539,7 @@ test("R2b: the backfill REFUSES to overwrite a malformed ROW and carries it verb
     );
     assert.match(
       report.errors[0]?.message ?? "",
-      /PRESENT in the seat store but its row is malformed/,
+      /PRESENT in the seat store \/\S+seats\.json but its row is malformed/,
       "the refusal must be MalformedSeatRowError, not a generic throw",
     );
     // The `--format json` payload (this row drives the real CLI via `backfill()`,
@@ -1087,7 +1087,7 @@ test("R1: a MALFORMED seats.json is refused — and nothing is written", async (
     assert.match(output, /refusing to write the seat store/, "not the single writer's refusal");
     assert.match(output, /QUARANTINE the file/, "the refusal must print the real remedy");
     assert.equal(
-      output.includes("run the seat backfill"),
+      output.includes("acpx seats backfill --apply"),
       true,
       "the message must still name the backfill as the step AFTER quarantine",
     );
