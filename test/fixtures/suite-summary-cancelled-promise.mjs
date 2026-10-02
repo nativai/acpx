@@ -13,10 +13,10 @@
  */
 import test from "node:test";
 
-test("ok before the leak", () => {});
+void test("ok before the leak", () => {});
 
-test("leaks a never-resolving promise", async () => {
+void test("leaks a never-resolving promise", async () => {
   await new Promise(() => {});
 });
 
-test("ok after the leak — cascades to cancelled too", () => {});
+void test("ok after the leak — cascades to cancelled too", () => {});

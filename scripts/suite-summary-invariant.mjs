@@ -151,9 +151,7 @@ export function checkSuiteSummaryHealth(tapText) {
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const target = process.argv[2];
   const text =
-    target === undefined || target === "-"
-      ? readFileSync(0, "utf8")
-      : readFileSync(target, "utf8");
+    target === undefined || target === "-" ? readFileSync(0, "utf8") : readFileSync(target, "utf8");
 
   const health = checkSuiteSummaryHealth(text);
   if (health.ok) {
