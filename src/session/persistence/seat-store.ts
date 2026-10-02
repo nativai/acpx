@@ -1086,7 +1086,7 @@ export async function fillSeatActiveHolder(
 ): Promise<"filled" | "unchanged" | "no-row"> {
   return await withSeatStoreWrite(sessionDir, (store) => {
     if (store.malformedSeatIds.includes(seatId)) {
-      throw new MalformedSeatRowError(seatId);
+      throw new MalformedSeatRowError(seatId, store.storePath);
     }
     const row = store.seats.get(seatId);
     if (!row) {
