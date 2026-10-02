@@ -5,6 +5,16 @@
 - Upstream: https://github.com/agentclientprotocol/claude-agent-acp
 - ACPX pins the built-in package range so fresh installs pick up Claude model and ACP adapter fixes without depending on a global adapter binary.
 
+## Model labels
+
+acpx holds no table of Claude model names or versions. Every label is read from the adapter's own advertisement — the `model` config option the bundled Claude Code binary returns on `session/new`, whose description begins with the model's short name:
+
+- **Running and closed sessions:** the session index entry carries `resolvedModelLabel` — derived from the session's own stored advertisement for its current model — and `servedModel`, the model id the API actually served on the last turn. A session started on an older binary keeps the label of the model it ran. `acpx sessions reindex` backfills both fields after an upgrade.
+- **Before a session exists** (`acpx models`, pickers): the Claude rows are named from a cached probe of the adapter (a transient session, no prompt), re-probed once per deployed adapter build. `acpx models --refresh` forces a re-probe.
+- With no advertisement available, rows and sessions show version-free alias names (`Opus`, `Sonnet`) — never a guessed version.
+
+A label says what the binary calls the alias; to know what actually served a session, read `servedModel` (or the record's `acpx.served.model`).
+
 ## Account-scoped automation ceilings
 
 Claude subscription profiles sharing the same functional `account` share one automatic weekly ceiling. Operators can inspect and change it without reading or rewriting credential-bearing registry JSON:

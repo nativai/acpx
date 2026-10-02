@@ -197,6 +197,7 @@ Behavior:
 - For codex, reasoning effort is selected through advertised ACP model ids when the adapter reports model variants.
 - `--model <id>`: Claude-compatible adapters may consume session creation metadata; other agents must advertise ACP models and support `session/set_model`, otherwise `acpx` fails clearly instead of silently falling back.
 - `set model <id>`: calls `session/set_model`. This is the generic ACP method for mid-session model switching.
+- `acpx models list --agent claude` shows the Claude aliases named by the adapter itself (the bundled Claude Code binary's own labels, cached per deployed adapter build and cited per row in `advertisedBy`); `acpx models --refresh` re-probes the adapter. A label is not served truth: the session index's `servedModel` is.
 - `set-mode`/`set` route through queue-owner IPC when active, otherwise reconnect directly.
 
 ### Sessions
@@ -271,6 +272,7 @@ Behavior:
   - `--no-include-history` keeps the event streams and their timestamp sidecar. They are then **stranded permanently** — selection walks the record index, so once the record is gone nothing can match them again. A run that opts out says how many files, and how many bytes, before deleting anything (on a `--dry-run` too)
   - every destructive prune appends one line per deleted session to `~/.acpx/sessions/deletions.ndjson` **before** deleting anything, and refuses (exit 1, nothing deleted) if it cannot. **If a session has vanished, grep that file first** — matching the `id` FIELD, `grep '"id":"<id>"'`, never the bare id: `scope` records the invocation's whole id list, so a bare match also hits every other entry from the same multi-id run. And read the `manifest_open` header: `at` and `covers` name the coverage boundary, and a deletion older than `at` will never appear there
   - `--include-templates` is not a scope; it widens what a scope selects, so it still needs one
+- `sessions reindex` re-projects every session-index entry from its own record (records are read, only `index.json` is rewritten; idempotent) — the backfill after an acpx upgrade adds an index field such as `resolvedModelLabel` / `servedModel`
 - `status -s <name>` checks the exact cwd first, then one exact global agent
   match; `status --session-id <id>` and `status --session-url <url>` resolve
   persisted sessions globally by canonical identity

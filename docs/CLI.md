@@ -316,6 +316,7 @@ acpx [global_options] <agent> sessions history <name> [--limit <count>]
 acpx [global_options] <agent> sessions export [name] --output <path> [--cwd <dir>]
 acpx [global_options] <agent> sessions import <archive> [--name <name>] [--cwd <dir>]
 acpx [global_options] <agent> sessions prune [<id>...] [--cwd | --whole-box] [--older-than <days> | --before <date>] [--dry-run] [--no-include-history] [--include-templates]
+acpx [global_options] <agent> sessions reindex
 
 acpx [global_options] sessions ...   # defaults to codex
 ```
@@ -365,12 +366,27 @@ Behavior:
 - Every destructive prune appends one line per deleted session to `~/.acpx/sessions/deletions.ndjson` **before** deleting anything, and refuses to run (exit 1, nothing deleted) if it cannot. `templates rollback --delete` writes to the same file
 - `--include-templates` is not a scope — it widens what a scope selects, so it still needs one
 - close errors if the target session does not exist
+- `sessions reindex` re-projects every entry of the box's session index (`~/.acpx/sessions/index.json`) from its own record. It reads records and rewrites only `index.json`, holds the index lock, and is idempotent. Run it after upgrading acpx when a release adds an index field: an entry is otherwise re-projected only when its own session's record is next written, so closed sessions keep their old entry indefinitely
 
 For commands that address an existing session, an explicit name first uses that
 command's local lookup behavior. If local lookup misses, one exact global match
 for the selected agent is used. Multiple matches fail closed and list record IDs
 and cwds; select one with `--session-id` or `--session-url`. Omitted/default
 names, `sessions new`, and `sessions ensure` remain cwd-scoped.
+
+## `models` command
+
+```bash
+acpx [global_options] models [list] [--agent <type>] [--search <query>] [--all] [--json] [--refresh]
+acpx [global_options] models show <source>:<id> | <id> [--json]
+```
+
+- `models` and `models list` print the model catalogue, banded by source; `--agent <type>` keeps only what that agent type can run
+- `models show` prints one model in full: its thinking-depth ladder and default, price, context and per-agent availability
+- **Claude rows are named by the adapter itself.** Their `name` is the label the bundled Claude Code binary advertises for each alias (its `model` config option), read off a transient session — no prompt, no tokens, no session record — and cached in `~/.acpx/claude-advertisement.json`, keyed by the deployed adapter build. A newer binary needs no acpx change to show its new model names
+- each such row carries `advertisedBy` (adapter, adapter commit, SDK version, probe time, `source`), `models show` prints it as a `labels` line, and the text footer cites it. The JSON envelope's `claudeAdvertisement` reports `state`: `fresh` (probed for the deployed build), `stale` (the last good probe was of an older build) or `none` (never probed successfully — the rows then carry version-free alias names such as `Opus`)
+- the probe runs at most once per deployed adapter build, in a detached background refresh; no session create ever waits for it. A failed probe keeps the last good names and is retried automatically after an hour
+- `--refresh` forces a fresh catalogue fetch **and** a fresh Claude probe, in the foreground. It exits `0` whenever the catalogue was served, including after a failed probe; the failure is in the footer and in `claudeAdvertisement.error`
 
 ## `status` command
 
@@ -574,6 +590,8 @@ When `--format json` is used:
 - `sessions prune` with `json`: object containing `action`, `dryRun`, `count`, `bytesFreed`, `pruned`, `skippedTemplates`, `scope`, `strandedStreamFiles`, and `strandedStreamBytes`
 - `sessions prune` refused for want of a scope with `json`: object on **stdout** with `action: "sessions_prune_refused"`, `reason`, `agentName`, `cwd`, `closedCandidates`, `closedCandidatesInCwd`, and `scopes`; exit 2. `reason` is one of `scope_required`, `scope_conflict`, `session_not_found`, `session_ambiguous`, `session_open`.
 - `sessions prune` with `quiet`: one pruned session id per line, and nothing else — a refusal goes to stderr so a quiet consumer's stdout parse is never handed prose
+- `sessions reindex` with `text`: `reindexed <N> entries (<M> record files) in <T> ms`
+- `sessions reindex` with `json`: object containing `action: "sessions_reindexed"`, `entries`, `files`, and `ms`
 - `status` with `text`: key/value process status lines
 
 ## Permission modes
