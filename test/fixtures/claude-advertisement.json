@@ -1,0 +1,25 @@
+{
+  "options": [
+    {
+      "value": "default",
+      "name": "Default (recommended)",
+      "description": "Opus 5.5 · Best for everyday, complex tasks"
+    },
+    {
+      "value": "opus",
+      "name": "Opus",
+      "description": "Opus 5.5 · Best for everyday, complex tasks"
+    },
+    {
+      "value": "sonnet",
+      "name": "Sonnet",
+      "description": "Sonnet 5.5 · Efficient for routine tasks"
+    },
+    {
+      "value": "fable",
+      "name": "Fable",
+      "description": "Fable 5.1 · Most capable for your hardest and longest-running tasks"
+    },
+    { "value": "haiku", "name": "Haiku", "description": "Haiku 4.5 · Fastest for quick answers" }
+  ]
+}

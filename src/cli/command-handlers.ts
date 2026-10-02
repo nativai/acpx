@@ -77,7 +77,9 @@ import {
   resolveGlobalSessionByName,
   resolveSessionByExactName,
   matchesPruneSessionId,
+  rebuildSessionIndex,
   resolveSessionRecord,
+  sessionBaseDir,
   resolveTemplateSelector,
   rollbackTemplateSlug,
   DeletionManifestWriteError,
@@ -4368,6 +4370,45 @@ function resolveSetParentNewParent(
 }
 
 export { parseHistoryLimit, NoSessionError, loadSessionModule };
+
+/**
+ * `acpx sessions reindex` — re-project EVERY index entry from its own record
+ * (brick ebfe4c3c, CONTRACT §2.4). A thin surface over the existing
+ * `rebuildSessionIndex`: it holds the index lock, reads records only, and rewrites
+ * only `index.json` — so it is idempotent and safe to repeat.
+ *
+ * WHY IT EXISTS: an entry is re-projected only when its own record is written.
+ * After an acpx deploy that adds an index field, every CLOSED session keeps its
+ * pre-change entry forever, and stale queue owners strip unknown fields on their
+ * own rewrites until they recycle. This is the rollout step that backfills both —
+ * run after the refresh and again at the post-merge smoke. (The routine
+ * `sessions prune` rebuild is NOT a substitute: it is a deletion verb.)
+ *
+ * A SUBCOMMAND of `sessions`, which is already in `TOP_LEVEL_VERBS`, so the
+ * two-registration trap cannot apply.
+ */
+export async function handleSessionsReindex(
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const started = Date.now();
+  const index = await rebuildSessionIndex(sessionBaseDir(), "operator reindex");
+  const ms = Date.now() - started;
+  if (
+    emitJsonResult(globalFlags.format, {
+      action: "sessions_reindexed",
+      entries: index.entries.length,
+      files: index.files.length,
+      ms,
+    })
+  ) {
+    return;
+  }
+  process.stdout.write(
+    `reindexed ${index.entries.length} entries (${index.files.length} record files) in ${ms} ms\n`,
+  );
+}
 
 /**
  * `acpx sessions repair-account-seam` — the one-shot sweep of records the

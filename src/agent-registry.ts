@@ -114,13 +114,18 @@ export function resolvePiAcpCommand(
 }
 
 const CODEX_ACP_FORK_COMMAND = `node /opt/codex-acp/dist/index.js`;
-const CLAUDE_ACP_FORK_COMMAND = `node /opt/claude-agent-acp/dist/index.js`;
+export const CLAUDE_ACP_FORK_COMMAND = `node /opt/claude-agent-acp/dist/index.js`;
+
+/** The claude adapter command — `AGENT_REGISTRY.claude`, for a caller asking about a given env. */
+export function resolveClaudeAcpCommand(env: NodeJS.ProcessEnv = process.env): string {
+  return env.ACPX_CLAUDE_ACP_COMMAND || CLAUDE_ACP_FORK_COMMAND;
+}
 
 export const AGENT_REGISTRY: Record<string, string> = {
   pi: resolvePiAcpCommand(),
   openclaw: "openclaw acp",
   codex: process.env.ACPX_CODEX_ACP_COMMAND || CODEX_ACP_FORK_COMMAND,
-  claude: process.env.ACPX_CLAUDE_ACP_COMMAND || CLAUDE_ACP_FORK_COMMAND,
+  claude: resolveClaudeAcpCommand(),
   gemini: "gemini --acp",
   cursor: "cursor-agent acp",
   copilot: "copilot --acp --stdio",

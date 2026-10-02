@@ -5,6 +5,7 @@ import {
   harnessIdForAgentCommand,
   resolveHarnessCapabilities,
 } from "../../acp/harness-capabilities.js";
+import { resolvedModelLabelForRecord } from "../../models/claude-advertised-label.js";
 import type { SessionRecord } from "../../types.js";
 import { modelSetMethodKnownUnsupported } from "../mode-preference.js";
 import { withSessionIndexLock } from "./index-lock.js";
@@ -158,6 +159,24 @@ export type SessionIndexEntry = {
    * `undefined` means acpx cannot classify the adapter and makes no claim.
    */
   canSetModelLive?: boolean;
+  /**
+   * The Claude binary's own short label for this session's effective model
+   * ("Opus 5.5", "Opus 5 (1M)") — brick ebfe4c3c. Header-displayed, so projected
+   * onto the INDEX ENTRY for the reason `depthOutcome` above gives: acpx-ui's
+   * enriched hot path reads its view from the entry, never the record.
+   *
+   * ⚠️ DERIVED AT PROJECTION ({@link resolvedModelLabelForRecord}), NOT PERSISTED
+   * on the record — the `canSetModelLive` precedent — so the turn path's
+   * allowlist clone has nothing new to destroy. Absent when it cannot be derived
+   * (non-claude, no stored advertisement, a custom pin): never a guess.
+   */
+  resolvedModelLabel?: string;
+  /**
+   * What the API actually SERVED on the last turn — verbatim
+   * `record.acpx.served.model` (e.g. `claude-opus-5-5`). Absent until the first
+   * served turn. The truth a label is checked against, never the other way round.
+   */
+  servedModel?: string;
   // brick://874fee67 — projected so acpx-ui's hot-path (record-skipping) session
   // rebuild shows the real style in the chat header instead of a UI default
   // (the brick://4d517be2 failure class: passes typecheck+build, fails only at
@@ -249,6 +268,11 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 
 function optionalString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
+}
+
+function nonEmptyTrimmed(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
 }
 
 function optionalBoolean(value: unknown): boolean | undefined {
@@ -430,6 +454,10 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     lastTurnProviderAt: optionalString(record.lastTurnProviderAt),
     canSetModelLive:
       typeof record.canSetModelLive === "boolean" ? record.canSetModelLive : undefined,
+    // brick ebfe4c3c: BOTH index legs. Miss these and the next rewrite of ANY
+    // session strips them from every untouched entry.
+    resolvedModelLabel: optionalString(record.resolvedModelLabel),
+    servedModel: optionalString(record.servedModel),
     // brick://874fee67: BOTH index legs. This parser reconstructs an entry from
     // index.json on reconcile — miss it and an acpx-ui-written entry is stripped
     // on the next daemon rewrite, exactly as autoSubscription is parsed above.
@@ -601,6 +629,8 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     lastTurnProviderAt: acpx?.last_turn_provider?.at,
     outputStyleDesired: sessionOptions?.output_style,
     canSetModelLive: canSetModelLiveFromRecord(record),
+    resolvedModelLabel: resolvedModelLabelForRecord(record),
+    servedModel: nonEmptyTrimmed(acpx?.served?.model),
     outputStyleSupported: outputStyleSupportedFromRecord(acpx),
     outputStyleApplied: acpx?.applied_output_style,
     outputStyleRefused: acpx?.refused_output_style,

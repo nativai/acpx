@@ -72,7 +72,7 @@ export const NO_ENTITLEMENT_FETCH_ENV = "ACPX_NO_OPENROUTER_ENTITLEMENT_FETCH";
 
 /**
  * Delete every box-level `ACPX_PI_*` override and every session-identity variable
- * from `env`, and set the no-network guard above. Returns the names removed (sorted)
+ * from `env`, and set the no-network guard and the no-runtime-info seam above. Returns the names removed (sorted)
  * so a caller can assert on what actually happened rather than on the absence of a
  * complaint.
  *
@@ -80,6 +80,18 @@ export const NO_ENTITLEMENT_FETCH_ENV = "ACPX_NO_OPENROUTER_ENTITLEMENT_FETCH";
  * test module body runs and therefore before any row spawns a CLI child — the children
  * are spawned from `process.env`, so a change here reaches them too.
  */
+/**
+ * brick ebfe4c3c — the Claude model-advertisement cache is KEYED by the deployed
+ * adapter's sha, read from `/workspace/.runtime/info.json`. That is box state: a
+ * row reading it would key on whatever this box happens to have deployed, and flip
+ * between boxes and across every refresh. So the suite points the seam at a path
+ * that does not exist, and the key degrades to `{adapterSha: null, …}` — the same
+ * shape a non-box install produces. A row that wants a sha writes its own fixture
+ * info.json and passes it explicitly.
+ */
+export const RUNTIME_INFO_PATH_ENV = "ACPX_RUNTIME_INFO_PATH";
+export const NO_RUNTIME_INFO_PATH = "/nonexistent/acpx-test/runtime-info.json";
+
 export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env): string[] {
   const removed: string[] = [];
   for (const name of Object.keys(env)) {
@@ -92,5 +104,6 @@ export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env
     }
   }
   env[NO_ENTITLEMENT_FETCH_ENV] = "1";
+  env[RUNTIME_INFO_PATH_ENV] = NO_RUNTIME_INFO_PATH;
   return removed.toSorted();
 }

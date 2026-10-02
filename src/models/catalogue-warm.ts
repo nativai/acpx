@@ -29,8 +29,15 @@
  *     the acceptance criterion. Detached + `unref()` is the one shape where the
  *     parent exits immediately AND the refresh still completes.
  *
- * The child is the ordinary `acpx models --refresh` path, so there is no second
- * fetch-and-write implementation to drift from the first.
+ * The child is the ordinary `acpx models` load path (`--warm`: "refresh what is
+ * stale"), so there is no second fetch-and-write implementation to drift from the
+ * first.
+ *
+ * brick ebfe4c3c added a THIRD cache the child fills: the Claude adapter's model
+ * advertisement (`claude-advertisement.ts`), re-probed once per deployed adapter
+ * version. The warm is the ONLY automatic place that probe runs — which is how
+ * "at most one probe per deploy, never per session" holds while no create ever
+ * waits on it.
  */
 
 import { type ChildProcess, spawn as nodeSpawn } from "node:child_process";
@@ -38,6 +45,7 @@ import fs from "node:fs";
 import { realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { claudeAdvertisementNeedsProbe } from "./claude-advertisement.js";
 import { CATALOGUE_TTL_MS, defaultCatalogueCachePath } from "./openrouter-catalogue.js";
 import { defaultEntitlementCachePath, ENTITLEMENT_TTL_MS } from "./openrouter-entitlement.js";
 
@@ -60,7 +68,19 @@ export interface WarmDeps {
   entitlementCachePath?: string;
   argv?: readonly string[];
   env?: NodeJS.ProcessEnv;
+  /** The Claude model-advertisement cache (brick ebfe4c3c) — the third cache the warm fills. */
+  claudeAdvertCachePath?: string;
+  /** Where the deployed adapter's version is read (`ACPX_RUNTIME_INFO_PATH`). */
+  runtimeInfoPath?: string;
+  /**
+   * `"all"` (default, the create path): any of the three caches decides.
+   * `"claude-advertisement"` (the `acpx models` read verbs): ONLY the advertisement
+   * term decides, so OpenRouter's warm behaviour is unchanged by those kicks.
+   */
+  scope?: WarmScope;
 }
+
+export type WarmScope = "all" | "claude-advertisement";
 
 function sentinelPathFor(cachePath: string): string {
   return `${cachePath}.warming`;
@@ -83,13 +103,28 @@ export function catalogueNeedsWarm(deps: WarmDeps = {}): boolean {
   // never fills, `assertModelPolicy` fails open forever, and nothing anywhere
   // reports a problem — the silent no-op this module was written to end, in a new
   // costume.
+  //
+  // ⚠️ THE THIRD TERM IS FILE READS ONLY (the advertisement cache, info.json, the
+  // SDK's package.json) — no socket, no child — because this predicate runs on the
+  // session-create path. The probe itself only ever runs in the detached child.
+  const claudeTerm = () =>
+    claudeAdvertisementNeedsProbe({
+      cachePath: deps.claudeAdvertCachePath,
+      runtimeInfoPath: deps.runtimeInfoPath,
+      env: deps.env,
+      now: () => now,
+    });
+  if (deps.scope === "claude-advertisement") {
+    return claudeTerm();
+  }
   return (
     cacheOlderThan(deps.cachePath ?? defaultCatalogueCachePath(deps.env), CATALOGUE_TTL_MS, now) ||
     cacheOlderThan(
       deps.entitlementCachePath ?? defaultEntitlementCachePath(deps.env),
       ENTITLEMENT_TTL_MS,
       now,
-    )
+    ) ||
+    claudeTerm()
   );
 }
 
@@ -259,7 +294,11 @@ function detachRefreshChild(
   env: NodeJS.ProcessEnv,
 ): void {
   try {
-    const child = spawnFn(process.execPath, [entry, "models", "--refresh", "--format", "json"], {
+    // ⚠️ `--warm`, NOT `--refresh` (brick ebfe4c3c). `--refresh` FORCES — and now
+    // forces a Claude adapter probe too. This child fires up to once a minute per
+    // box, so forcing here would probe roughly hourly: "never per session or per
+    // turn" violated through the side door. `--warm` refreshes only what is stale.
+    const child = spawnFn(process.execPath, [entry, "models", "--warm", "--format", "json"], {
       detached: true,
       // Nothing is read back — the child's product is the cache file on disk.
       // Inheriting stdout would also corrupt a `--format json` parent.

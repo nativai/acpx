@@ -332,6 +332,8 @@ function parseJsonObject(line: string): Record<string, unknown> | undefined {
   }
 }
 
+const SYNTHETIC_ASSISTANT_MODEL = "<synthetic>";
+
 function assistantModelFromJsonlLine(line: string): string | undefined {
   const entry = parseJsonObject(line);
   if (!entry || entry.type !== "assistant") {
@@ -342,7 +344,13 @@ function assistantModelFromJsonlLine(line: string): string | undefined {
     return undefined;
   }
   const model = (message as { model?: unknown }).model;
-  return typeof model === "string" && model.trim().length > 0 ? model.trim() : undefined;
+  const trimmed = typeof model === "string" ? model.trim() : "";
+  // ⚠️ `<synthetic>` IS NOT A SERVED MODEL (brick ebfe4c3c §2.5). Claude Code stamps
+  // it on assistant entries it generates LOCALLY (an interrupt, a local error), so
+  // accepting it recorded "served <synthetic>" and compared the floor against it —
+  // a false `served_below_floor`. Returning undefined lets the backwards scan reach
+  // the last REAL assistant entry.
+  return trimmed.length > 0 && trimmed !== SYNTHETIC_ASSISTANT_MODEL ? trimmed : undefined;
 }
 
 // ─── Record stamping (served block + breadcrumbs) ───────────────────────────

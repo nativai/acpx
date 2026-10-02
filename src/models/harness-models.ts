@@ -11,8 +11,20 @@
  * per-model ladders, so connected-session advertisement is its only authority.
  */
 
+import {
+  findAdvertisedOption,
+  labelFromAdvertisedOption,
+  taglineFromAdvertisedOption,
+} from "./claude-advertised-label.js";
+import type { ClaudeAdvertisementSnapshot } from "./claude-advertisement.js";
 import { depthRank, toCanonicalLadder } from "./depth.js";
-import type { CanonicalDepthLevel, CatalogueModel, DepthDescriptor, ModelSource } from "./types.js";
+import type {
+  AdvertisedBy,
+  CanonicalDepthLevel,
+  CatalogueModel,
+  DepthDescriptor,
+  ModelSource,
+} from "./types.js";
 
 /** A native row plus the agent types that can actually run it (the availability join's input). */
 export type NativeModel = CatalogueModel & {
@@ -51,40 +63,40 @@ function capLadder(ladder: CanonicalDepthLevel[], ceiling: CanonicalDepthLevel) 
 // `default` is the ONE Claude alias whose id is not itself a family name — its
 // `aliasTarget` is what lets `model-floor.ts` resolve a `"default"` pin to a
 // comparable family instead of comparing the literal string "default" against
-// a served id (brick://ac931199). It is co-located with the `name` string that
-// already documents the same fact ("Opus") so the two can never drift apart
-// silently the way an aliasTarget derived from an external adapter reading
-// could (contrast the fable cross-adapter-version note in model-floor.ts) —
-// this mapping is ours, not observed off the wire, and we update both fields
-// together the day acpx's own "default" choice changes.
+// a served id (brick://ac931199). This mapping is ours, not observed off the
+// wire, and we update it the day acpx's own "default" choice changes.
 //
-// The names here are deliberately VERSION-NEUTRAL ("Opus", "Sonnet"), and must
-// stay that way. These aliases do not pin a version: each resolves to whatever
-// the Claude Code binary bundled in claude-agent-acp's @anthropic-ai/
-// claude-agent-sdk decides, so any vintage we bake in here is a claim we do not
-// control and it rots on the next SDK bump — silently, because nothing compares
-// the label to the served id. They were "Sonnet 5" and "Default (Opus 5, 1M
-// context)" while the bundled binary had already moved to Sonnet 5.5 / Opus 5.5
-// (SDK 0.3.257 -> 0.3.287), so the picker printed 5 for a session served 5.5 and
-// two agents drew wrong conclusions from it. The same reasoning is why
-// claude-agent-acp's own injectOpusModel describes its row as plain "Opus".
-// To learn what is ACTUALLY served, read the session record's `served_model` —
-// never this label.
+// ⚠️ THE ROW NAMES ARE NOT HELD HERE ANY MORE (brick ebfe4c3c). Each row's `name`
+// is the Claude Code binary's OWN label for that alias, read off the adapter's
+// `model` advertisement by `labelFromAdvertisedOption` — the advertisement is
+// probed once per deployed adapter version and cached (`claude-advertisement.ts`)
+// — so an SDK bump that ships "Opus 5.6" needs ZERO edits in either repo.
+// `fallbackName` is what a row shows when no advertisement is known, and it must
+// stay VERSION-FREE: a vintage baked in here is a claim we do not control and it
+// rots silently on the next bump. That already happened twice — "Sonnet 5" and
+// "Default (Opus 5, 1M context)" while the binary served 5.5, then "Haiku 4.5" /
+// "Fable 5" / a "1M" default the deployed binary no longer advertises.
+//
+// The row SET stays the five aliases, not the advertised list: `opus[1m]` and
+// `sonnet[1m]` are deliberately curated out of the picker (sonnet[1m] needs paid
+// credits). A new VERSION of a family needs no edit; a new FAMILY alias is a
+// one-line, deliberate curation and cost call — it also needs an effort ceiling.
+//
+// To learn what is ACTUALLY served, read the session record's
+// `acpx.served.model` — never a label.
 const CLAUDE_ALIASES: {
   id: string;
-  name: string;
+  fallbackName: string;
   aliasTarget?: { id: string; name: string | null };
 }[] = [
-  {
-    id: "default",
-    name: "Default (Opus, 1M context)",
-    aliasTarget: { id: "opus", name: "Opus" },
-  },
-  { id: "opus", name: "Opus" },
-  { id: "sonnet", name: "Sonnet" },
-  { id: "haiku", name: "Haiku 4.5" },
-  { id: "fable", name: "Fable 5" },
+  { id: "default", fallbackName: "Default", aliasTarget: { id: "opus", name: "Opus" } },
+  { id: "opus", fallbackName: "Opus" },
+  { id: "sonnet", fallbackName: "Sonnet" },
+  { id: "haiku", fallbackName: "Haiku" },
+  { id: "fable", fallbackName: "Fable" },
 ];
+
+const CLAUDE_STATIC_DESCRIPTION = "Claude Code on a Claude Max subscription.";
 
 /**
  * Historical measurement retained as rationale for removing the Codex product list.
@@ -156,6 +168,7 @@ function nativeRow(params: {
   account: string;
   agentTypes: string[];
   aliasTarget?: { id: string; name: string | null } | null;
+  advertisedBy?: AdvertisedBy;
 }): NativeModel {
   return {
     key: `${params.source}:${params.id}`,
@@ -188,6 +201,34 @@ function nativeRow(params: {
     favorite: false,
     favoritedAt: null,
     agentTypes: params.agentTypes,
+    ...(params.advertisedBy ? { advertisedBy: params.advertisedBy } : {}),
+  };
+}
+
+/**
+ * The name, tagline and citation for one Claude alias row: the advertised label
+ * when the snapshot carries a clean one, else the version-free fallback — and a
+ * citation IFF the name came from the advertisement.
+ */
+function claudeRowText(
+  alias: (typeof CLAUDE_ALIASES)[number],
+  advert: ClaudeAdvertisementSnapshot | null | undefined,
+): { name: string; description: string; advertisedBy?: AdvertisedBy } {
+  const option = advert ? findAdvertisedOption(advert.options, alias.id) : undefined;
+  const label = option ? labelFromAdvertisedOption(option) : undefined;
+  if (!advert || !option || label === undefined) {
+    return { name: alias.fallbackName, description: CLAUDE_STATIC_DESCRIPTION };
+  }
+  return {
+    name: label,
+    description: taglineFromAdvertisedOption(option) ?? CLAUDE_STATIC_DESCRIPTION,
+    advertisedBy: {
+      adapter: "claude-agent-acp",
+      adapterSha: advert.adapterSha,
+      sdkVersion: advert.sdkVersion,
+      probedAt: advert.probedAt,
+      source: advert.source,
+    },
   };
 }
 
@@ -200,18 +241,27 @@ function nativeRow(params: {
  * fabricated one would be rendered by the picker as the model's truth. `null`
  * means "the harness default applies" — which is exactly what omitting the flag
  * does today.
+ *
+ * 🛑 PURE, AND IT MUST STAY PURE — the advertisement is PASSED IN. `model-floor.ts`
+ * calls this with no argument on the per-turn hot path under the contract "a
+ * plain in-memory lookup … no cache/network I/O"; reading the advertisement cache
+ * in here would put a file read on every turn. `loadCatalogue` reads the cache
+ * once and hands the snapshot over. Called with no snapshot, the rows carry their
+ * version-free fallback names, which is all the floor needs (it reads ids and
+ * `aliasTarget`, never names).
  */
-export function harnessNativeModels(): NativeModel[] {
+export function harnessNativeModels(advert?: ClaudeAdvertisementSnapshot | null): NativeModel[] {
   const rows: NativeModel[] = [];
 
   for (const alias of CLAUDE_ALIASES) {
+    const text = claudeRowText(alias, advert);
     rows.push(
       nativeRow({
         source: "claude-subscription",
         id: alias.id,
-        name: alias.name,
+        name: text.name,
         vendor: "anthropic",
-        description: "Claude Code on a Claude Max subscription.",
+        description: text.description,
         depth: {
           kind: "ladder",
           levels: capLadder(CLAUDE_LADDER, claudeEffortCeiling(alias.id)),
@@ -221,6 +271,7 @@ export function harnessNativeModels(): NativeModel[] {
         account: "claude-subscription",
         agentTypes: ["claude"],
         aliasTarget: alias.aliasTarget ?? null,
+        advertisedBy: text.advertisedBy,
       }),
     );
   }

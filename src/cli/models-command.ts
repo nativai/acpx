@@ -17,15 +17,17 @@
  * Everything printed is derived by `src/models/*`; this file only formats.
  */
 
-import { Command, InvalidArgumentError } from "commander";
+import { Command, InvalidArgumentError, Option } from "commander";
 import { resolveAcpxUiBaseUrl } from "../acp/auth-env.js";
 import { resolveOpenRouterBoxCredential } from "../acp/openrouter-routing.js";
+import { warmCatalogueInBackground } from "../models/catalogue-warm.js";
 import {
   decorateFavorites,
   findModelByKey,
   findModelsById,
   loadCatalogue,
 } from "../models/catalogue.js";
+import { probeClaudeAdvertisement } from "../models/claude-advertisement.js";
 import { describeDepth } from "../models/depth.js";
 import { bandModels, isAvailableForAgent, searchModels } from "../models/matcher.js";
 import { nearestModels, parseModelRef, searchToken } from "../models/model-slug-validation.js";
@@ -45,6 +47,8 @@ type ModelsFlags = {
   json?: boolean;
   format?: string;
   refresh?: boolean;
+  /** Hidden: the detached warm child's "refresh what is stale" (brick ebfe4c3c). */
+  warm?: boolean;
 };
 
 /**
@@ -78,8 +82,32 @@ function failUsage(message: string): never {
   process.exit(2);
 }
 
-async function readCatalogue(flags: ModelsFlags): Promise<ModelCatalogue> {
-  const catalogue = await loadCatalogue({ refresh: flags.refresh === true });
+/**
+ * Which Claude-advertisement probe a load may run (CONTRACT §4.4): `--refresh`
+ * forces one in the foreground, the hidden `--warm` (the detached child) runs one
+ * only if the deployed key needs it, and every other read only reads the cache.
+ */
+function claudeProbeModeFor(flags: ModelsFlags): "force" | "if-needed" | "never" {
+  if (flags.refresh === true) {
+    return "force";
+  }
+  return flags.warm === true ? "if-needed" : "never";
+}
+
+async function readCatalogue(
+  flags: ModelsFlags,
+  config: ResolvedAcpxConfig,
+): Promise<ModelCatalogue> {
+  const catalogue = await loadCatalogue({
+    refresh: flags.refresh === true,
+    claudeProbe: claudeProbeModeFor(flags),
+    claudeAdvert: {
+      // The NORMAL spawn credential resolution, so the probe reads the text
+      // sessions see (CONTRACT §4.1 iii).
+      probe: (key) =>
+        probeClaudeAdvertisement({ agentCommand: key.agentCommand, authCredentials: config.auth }),
+    },
+  });
   let favorites: { key: string; favoritedAt: string }[] = [];
   try {
     favorites = getUiPrefsStore().listFavorites();
@@ -87,6 +115,22 @@ async function readCatalogue(flags: ModelsFlags): Promise<ModelCatalogue> {
     diag(`[acpx] warning: could not read the favorites store: ${asMessage(error)}\n`);
   }
   return decorateFavorites(catalogue, favorites);
+}
+
+/**
+ * The read verbs' kick (CONTRACT §4.4): acpx-ui's `/api/models` runs `acpx models
+ * --json`, so opening a create dialog after a deploy re-keys the advertisement on
+ * a box where no session is ever created. Scoped to the advertisement term so
+ * OpenRouter's warm behaviour is unchanged. Returns void — never awaited.
+ *
+ * ⚠️ `--refresh` and `--warm` NEVER kick: the warm child IS `models --warm`, so a
+ * kick from it would recurse.
+ */
+function kickClaudeAdvertisementWarm(flags: ModelsFlags): void {
+  if (flags.refresh === true || flags.warm === true) {
+    return;
+  }
+  warmCatalogueInBackground({ scope: "claude-advertisement" });
 }
 
 function asMessage(error: unknown): string {
@@ -243,8 +287,41 @@ function renderFooter(
   const hidden = flags.all === true ? "" : " (acpx models --all to see them and why)";
   return (
     `${catalogue.counts.selectable} selectable on ${box} · ${catalogue.counts.unavailable} unavailable${hidden}` +
-    `${agentNote}${describeFreshness(catalogue)}\n`
+    `${agentNote}${describeFreshness(catalogue)}${describeClaudeLabels(catalogue)}\n`
   );
+}
+
+function shortSha(sha: string | null): string {
+  return sha === null ? "(sha unknown)" : sha.slice(0, 8);
+}
+
+/** `claude-agent-acp 833570e0 / sdk 0.3.287` — the version a label is cited to. */
+function adapterCitation(sha: string | null, sdkVersion: string | null): string {
+  return `claude-agent-acp ${shortSha(sha)} / sdk ${sdkVersion ?? "?"}`;
+}
+
+/**
+ * Where the Claude rows' names came from (brick ebfe4c3c, CONTRACT §4.6). Unlike
+ * the entitlement note this is printed on the healthy path too: it IS the version
+ * citation for every Claude label above it.
+ */
+function describeClaudeLabels(catalogue: ModelCatalogue): string {
+  const claude = catalogue.claudeAdvertisement;
+  if (claude.state === "fresh") {
+    const fixture = claude.source === "fixture" ? " [fixture]" : "";
+    return ` · claude labels: ${adapterCitation(claude.adapterSha, claude.sdkVersion)}, probed ${claude.probedAt ?? "?"}${fixture}${lastProbeFailure(claude.error)}`;
+  }
+  if (claude.state === "stale") {
+    return (
+      ` · ⚠ claude labels STALE (from ${shortSha(claude.adapterSha)}/${claude.sdkVersion ?? "?"}; ` +
+      `deployed ${shortSha(claude.deployedAdapterSha)}/${claude.deployedSdkVersion ?? "?"}${lastProbeFailure(claude.error)})`
+    );
+  }
+  return ` · ⚠ claude labels unavailable — alias names only (${claude.error ?? "not probed yet"})`;
+}
+
+function lastProbeFailure(error: string | null): string {
+  return error === null ? "" : `; last probe failed: ${error}`;
 }
 
 /**
@@ -385,8 +462,20 @@ function renderShow(model: CatalogueModel): string {
     `  selectable  ${selectable}\n` +
     `  available   ${showAvailabilityLine(model)}\n` +
     `  favorite    ${model.favorite ? `yes — starred ${model.favoritedAt}` : "no"}\n` +
+    showLabelsLine(model) +
     showExtraLines(model)
   );
+}
+
+/** For a Claude row: which adapter build its name was read from, or that it is the fallback. */
+function showLabelsLine(model: CatalogueModel): string {
+  if (model.source !== "claude-subscription") {
+    return "";
+  }
+  const by = model.advertisedBy;
+  return by
+    ? `  labels      ${adapterCitation(by.adapterSha, by.sdkVersion)}, probed ${by.probedAt}${by.source === "fixture" ? " [fixture]" : ""}\n`
+    : "  labels      fallback (no advertisement)\n";
 }
 
 // ── Reference resolution, shared by `show` and `fav add|rm` ──────────────────
@@ -433,8 +522,9 @@ function resolveOne(catalogue: ModelCatalogue, ref: string): CatalogueModel {
 
 // ── Actions ──────────────────────────────────────────────────────────────────
 
-async function handleList(flags: ModelsFlags): Promise<void> {
-  const catalogue = await readCatalogue(flags);
+async function handleList(flags: ModelsFlags, config: ResolvedAcpxConfig): Promise<void> {
+  const catalogue = await readCatalogue(flags, config);
+  kickClaudeAdvertisementWarm(flags);
   if (wantsJson(flags)) {
     const payload = flags.search
       ? {
@@ -452,8 +542,13 @@ async function handleList(flags: ModelsFlags): Promise<void> {
   out(flags.search ? renderSearch(catalogue, flags) : renderList(catalogue, flags));
 }
 
-async function handleShow(ref: string, flags: ModelsFlags): Promise<void> {
-  const catalogue = await readCatalogue(flags);
+async function handleShow(
+  ref: string,
+  flags: ModelsFlags,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const catalogue = await readCatalogue(flags, config);
+  kickClaudeAdvertisementWarm(flags);
   const model = resolveOne(catalogue, ref);
   if (wantsJson(flags)) {
     out(`${JSON.stringify(model)}\n`);
@@ -655,6 +750,7 @@ async function handleFavWrite(
   action: "add" | "rm",
   ref: string,
   flags: ModelsFlags,
+  config: ResolvedAcpxConfig,
 ): Promise<void> {
   const store = getUiPrefsStore();
   const parsed = parseModelRef(ref);
@@ -670,7 +766,7 @@ async function handleFavWrite(
     return;
   }
 
-  const catalogue = await readCatalogue(flags);
+  const catalogue = await readCatalogue(flags, config);
   const model = resolveOne(catalogue, ref);
   if (action === "add") {
     store.addFavorite(model.source, model.id);
@@ -692,10 +788,14 @@ function addListFlags(command: Command): Command {
     .option("--all", "Include unavailable models, each with its reason (default: hidden)")
     .option("--json", "Shorthand for --format json")
     .option("--format <fmt>", "Output format: text, json", parseModelsFormat)
-    .option("--refresh", "Force a catalogue fetch instead of serving the cache");
+    .option(
+      "--refresh",
+      "Force a catalogue fetch and a fresh probe of the Claude adapter's model advertisement",
+    )
+    .addOption(new Option("--warm").hideHelp());
 }
 
-export function registerModelsCommand(parent: Command, _config: ResolvedAcpxConfig): void {
+export function registerModelsCommand(parent: Command, config: ResolvedAcpxConfig): void {
   const modelsCommand = parent
     .command("models")
     .description(
@@ -708,7 +808,7 @@ export function registerModelsCommand(parent: Command, _config: ResolvedAcpxConf
       "List models, banded: favorites first, then each harness, then OpenRouter by vendor",
     )
     .action(async function (this: Command, flags: ModelsFlags) {
-      await handleList(flags);
+      await handleList(flags, config);
     });
 
   addListFlags(modelsCommand.command("show"))
@@ -717,7 +817,7 @@ export function registerModelsCommand(parent: Command, _config: ResolvedAcpxConf
     )
     .argument("<ref>", "<source>:<id> or a bare <id>")
     .action(async function (this: Command, ref: string, flags: ModelsFlags) {
-      await handleShow(ref, flags);
+      await handleShow(ref, flags, config);
     });
 
   // ⚠️ A SUBCOMMAND OF `models`, WHICH IS ALREADY IN `TOP_LEVEL_VERBS` — so the
@@ -754,7 +854,7 @@ export function registerModelsCommand(parent: Command, _config: ResolvedAcpxConf
     .description("Star a model on this box (idempotent)")
     .argument("<ref>", "<source>:<id> or a bare <id>")
     .action(async function (this: Command, ref: string) {
-      await handleFavWrite("add", ref, {});
+      await handleFavWrite("add", ref, {}, config);
     });
 
   favCommand
@@ -763,7 +863,7 @@ export function registerModelsCommand(parent: Command, _config: ResolvedAcpxConf
     .description("Unstar a model on this box (idempotent)")
     .argument("<ref>", "<source>:<id> or a bare <id>")
     .action(async function (this: Command, ref: string) {
-      await handleFavWrite("rm", ref, {});
+      await handleFavWrite("rm", ref, {}, config);
     });
 
   const lastUsedCommand = modelsCommand
@@ -798,6 +898,6 @@ export function registerModelsCommand(parent: Command, _config: ResolvedAcpxConf
   // hand-rolled check here duplicating it; the test pins the behaviour, not this
   // comment.
   modelsCommand.action(async function (this: Command, flags: ModelsFlags) {
-    await handleList(flags);
+    await handleList(flags, config);
   });
 }

@@ -146,6 +146,13 @@ const env = {
       capturedAt: new Date().toISOString(),
       secondary: { windowMinutes: 10_080, usedPercent: 0, elapsed: false },
     }),
+  // brick ebfe4c3c — the Claude model-advertisement probe's canned input, same
+  // precedent as above: `acpx models --refresh` and the detached `models --warm`
+  // child would otherwise spawn the REAL deployed claude adapter from the suite.
+  // A FILE path; rows built from it carry `source: "fixture"`. Caller wins.
+  ACPX_TEST_CLAUDE_ADVERT_JSON:
+    process.env.ACPX_TEST_CLAUDE_ADVERT_JSON ??
+    fileURLToPath(new URL("../test/fixtures/claude-advertisement.json", import.meta.url)),
 };
 
 if (!existsSync(preloadPath)) {

@@ -10,6 +10,7 @@ import {
   assertForkAtIndexHonoured,
   resolveEffectiveForkIndex,
 } from "../../acp/harness-capabilities.js";
+import { readTransientAdvertisement } from "../../acp/transient-advertisement.js";
 import { withInterrupt, withTimeout } from "../../async-control.js";
 import { BrickOutbox } from "../../brick-outbox.js";
 import { bindDefaultAccountToSessionOptionsAsync } from "../../runtime/engine/default-account-binding.js";
@@ -752,29 +753,19 @@ export async function listAgentOutputStyles(
     return outputStyleListFromAdvertised(record.acpx?.config_options);
   }
 
-  const client = new AcpClient({
-    agentCommand: options.agentCommand,
-    cwd: absolutePath(options.cwd),
-    mcpServers: options.mcpServers,
-    // Read-only probe: no prompt is ever sent, so the most restrictive policy is
-    // correct — nothing can ask for a permission on this session.
-    permissionMode: "deny-all",
-    authCredentials: options.authCredentials,
-    authPolicy: options.authPolicy,
-    verbose: options.verbose,
-  });
-  try {
-    await withTimeout(client.start(), options.timeoutMs);
-    const created = await withTimeout(
-      client.createSession(absolutePath(options.cwd)),
-      options.timeoutMs,
-    );
-    return outputStyleListFromAdvertised(created.configOptions);
-  } finally {
-    await client.close().catch(() => {
-      // Enumeration is read-only; a close failure must not mask the answer.
-    });
-  }
+  // The transient open/read/close is shared with the Claude model-advertisement
+  // probe (brick ebfe4c3c) — one implementation of the measured no-prompt path.
+  return outputStyleListFromAdvertised(
+    await readTransientAdvertisement({
+      agentCommand: options.agentCommand,
+      cwd: options.cwd,
+      mcpServers: options.mcpServers,
+      authCredentials: options.authCredentials,
+      authPolicy: options.authPolicy,
+      verbose: options.verbose,
+      timeoutMs: options.timeoutMs,
+    }),
+  );
 }
 
 function outputStyleListFromAdvertised(

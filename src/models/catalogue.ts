@@ -11,6 +11,12 @@ import type { ArbitraryModelSupport } from "../acp/harness-capabilities.js";
 import { readHarnessCapabilities } from "./capability-source.js";
 import type { AvailabilityCapability } from "./capability-source.js";
 import {
+  CLAUDE_ADVERTISEMENT_UNKNOWN,
+  ensureClaudeAdvertisement,
+  type ClaudeProbeMode,
+  type EnsureClaudeAdvertisementOptions,
+} from "./claude-advertisement.js";
+import {
   CLAUDE_FAMILY_OPENROUTER_ANNOTATION,
   CLAUDE_FAMILY_OPENROUTER_REASON,
   openRouterNotEntitledAnnotation,
@@ -35,6 +41,7 @@ import type {
   CatalogueCounts,
   SelectabilityCounts,
   CatalogueModel,
+  ClaudeAdvertisementStatus,
   ModelBilling,
   ModelBadge,
   ModelCatalogue,
@@ -499,7 +506,18 @@ export type BuildCatalogueOptions = {
    * one place the set is established.
    */
   entitlement?: OpenRouterEntitlement;
+  /**
+   * The envelope describing where the Claude rows' names came from (brick
+   * ebfe4c3c). Like `entitlement`, NOT read here: `loadCatalogue` is the one place
+   * the advertisement cache is read. Absent ⇒ `state: "none"`, which is true of
+   * rows built with no advertisement.
+   */
+  claudeAdvertisement?: ClaudeAdvertisementStatus;
 };
+
+function claudeAdvertisementOf(options: BuildCatalogueOptions): ClaudeAdvertisementStatus {
+  return options.claudeAdvertisement ?? CLAUDE_ADVERTISEMENT_UNKNOWN;
+}
 
 /** Merge the raw OpenRouter rows with the harness-native rows into ONE ordered list. */
 export function buildCatalogue(
@@ -509,6 +527,8 @@ export function buildCatalogue(
 ): ModelCatalogue {
   const now = options.now ?? Date.now();
   const capabilities = options.capabilities ?? readHarnessCapabilities();
+  // No advertisement passed ⇒ the version-free fallback names. `loadCatalogue`
+  // is what supplies the cached advertisement.
   const natives = options.nativeModels ?? harnessNativeModels();
   const equivalence = buildEquivalenceIndex(openRouterModels);
   // Resolved ONCE — see `availabilityFor`'s note on why this is not per row.
@@ -541,6 +561,7 @@ export function buildCatalogue(
     // exactly the failure states the fail-open decision creates. `source` is the
     // field a consumer branches on; see `CatalogueEntitlement`.
     entitlement: describeCatalogueEntitlement(entitlement),
+    claudeAdvertisement: claudeAdvertisementOf(options),
     counts: countModels(models),
     models,
   };
@@ -564,14 +585,30 @@ export function buildCatalogue(
  * pins it with a set no box could produce by accident.
  */
 export async function loadCatalogue(
-  options: LoadOptions & EntitlementLoadOptions & BuildCatalogueOptions = {},
+  options: LoadOptions &
+    EntitlementLoadOptions &
+    Omit<BuildCatalogueOptions, "claudeAdvertisement"> &
+    ClaudeLoadOptions = {},
 ): Promise<ModelCatalogue> {
-  const { now, capabilities, nativeModels, entitlement, ...loadOptions } = options;
-  const [result, allowed] = await Promise.all([
+  const {
+    now,
+    capabilities,
+    nativeModels,
+    entitlement,
+    claudeProbe,
+    claudeAdvert,
+    ...loadOptions
+  } = options;
+  const [result, allowed, claude] = await Promise.all([
     loadOpenRouterCatalogue(loadOptions),
     entitlement !== undefined
       ? Promise.resolve(entitlement)
       : loadOpenRouterEntitlement(loadOptions),
+    // ⚠️ `never` IS THE DEFAULT AND EVERY EXISTING CALLER KEEPS IT — the
+    // session-create path's offline validation included. It reads the cache file
+    // (three small local reads) and never probes; only `acpx models --refresh`
+    // (`force`) and the detached warm child (`if-needed`) ask for a probe.
+    loadClaudeAdvertisement(claudeProbe, claudeAdvert),
   ]);
   return buildCatalogue(
     result.snapshot?.models ?? [],
@@ -583,9 +620,29 @@ export async function loadCatalogue(
       stale: result.stale,
       error: result.error,
     },
-    { now, capabilities, nativeModels, entitlement: allowed },
+    {
+      now,
+      capabilities,
+      nativeModels: nativeModels ?? harnessNativeModels(claude.snapshot),
+      entitlement: allowed,
+      claudeAdvertisement: claude.status,
+    },
   );
 }
+
+function loadClaudeAdvertisement(
+  claudeProbe: ClaudeProbeMode | undefined,
+  claudeAdvert: ClaudeLoadOptions["claudeAdvert"],
+) {
+  return ensureClaudeAdvertisement({ ...claudeAdvert, mode: claudeProbe ?? "never" });
+}
+
+/** How `loadCatalogue` treats the Claude advertisement (brick ebfe4c3c, CONTRACT §4.4). */
+export type ClaudeLoadOptions = {
+  claudeProbe?: ClaudeProbeMode;
+  /** Paths, clock and probe — injected in tests; defaults read this box. */
+  claudeAdvert?: Omit<EnsureClaudeAdvertisementOptions, "mode">;
+};
 
 /**
  * Stamp the per-box favorites onto the payload, so a caller never has to join

@@ -15,10 +15,13 @@
 // `ACPX_PI_BOX_AGENT_DIR` reds this row truthfully — that run is unscrubbed.
 
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import test from "node:test";
 import {
   BOX_PI_ENV_PREFIX,
   NO_ENTITLEMENT_FETCH_ENV,
+  NO_RUNTIME_INFO_PATH,
+  RUNTIME_INFO_PATH_ENV,
   scrubBoxHarnessEnvOverrides,
 } from "./box-env-scrub.js";
 
@@ -39,6 +42,7 @@ test("3b1ec678: the scrub removes every ACPX_PI_* override and leaves the rest a
   // belongs in the surviving set — it is pinned on its own below.
   assert.deepEqual(Object.keys(env).toSorted(), [
     NO_ENTITLEMENT_FETCH_ENV,
+    RUNTIME_INFO_PATH_ENV,
     "ACPX_SESSION_URL",
     "HOME",
   ]);
@@ -56,6 +60,7 @@ test("c2df657e: the scrub removes ACPX_SESSION_RECORD_ID (product-set session id
   assert.deepEqual(removed, ["ACPX_SESSION_RECORD_ID"]);
   assert.deepEqual(Object.keys(env).toSorted(), [
     NO_ENTITLEMENT_FETCH_ENV,
+    RUNTIME_INFO_PATH_ENV,
     "ACPX_SESSION_URL",
     "HOME",
   ]);
@@ -107,4 +112,16 @@ test("3b1ec678: the suite starts with no box-level ACPX_PI_* override in process
       `is supposed to have removed them; either it did not run (a bare \`node --test <file>\`) ` +
       `or it stopped scrubbing.`,
   );
+});
+
+test("ebfe4c3c: the suite never keys the Claude advertisement on this box's info.json", () => {
+  const env: NodeJS.ProcessEnv = {
+    [RUNTIME_INFO_PATH_ENV]: "/workspace/.runtime/info.json",
+    HOME: "/home/node",
+  };
+  scrubBoxHarnessEnvOverrides(env);
+  assert.equal(env[RUNTIME_INFO_PATH_ENV], NO_RUNTIME_INFO_PATH);
+  assert.equal(fs.existsSync(NO_RUNTIME_INFO_PATH), false, "the seam must point at NOTHING");
+  // …and the bootstrap applied it in THIS process.
+  assert.equal(process.env[RUNTIME_INFO_PATH_ENV], NO_RUNTIME_INFO_PATH);
 });

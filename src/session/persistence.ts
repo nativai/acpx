@@ -10,6 +10,7 @@ export {
 } from "./persistence/deletion-manifest.js";
 export { flushPendingSessionIndexUpdates } from "./persistence/index-update-queue.js";
 export { overlaySessionIndexEntries } from "./persistence/index-overlay.js";
+export { rebuildSessionIndex } from "./persistence/index.js";
 export type { SessionIndexEntryOverlay } from "./persistence/index-overlay.js";
 export {
   DEFAULT_HISTORY_LIMIT,

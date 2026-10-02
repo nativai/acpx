@@ -23,6 +23,7 @@ import {
   handleSessionsPrune,
   handleSessionsRecover,
   handleSessionsReopen,
+  handleSessionsReindex,
   handleSessionsRepairAccountSeam,
   handleSessionsSetMetadata,
   handleSessionsSetParent,
@@ -165,6 +166,16 @@ export function registerSessionsCommand(
     .option("--dry-run", "Preview slug/version assignments without writing records")
     .action(async function (this: Command, flags: { dryRun?: boolean }) {
       await handleSessionsTemplatesMigrateSlugs(flags, this, config);
+    });
+
+  sessionsCommand
+    .command("reindex")
+    .description(
+      "Re-project every session-index entry from its own record (reads records, rewrites only " +
+        "index.json; idempotent) — the backfill after an acpx upgrade adds an index field",
+    )
+    .action(async function (this: Command) {
+      await handleSessionsReindex(this, config);
     });
 
   sessionsCommand
