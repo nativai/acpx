@@ -334,11 +334,12 @@ test("L2: --apply mints the seats, enriches the entries and CREATES an absent st
     assert.equal(typeof open.seat_id, "string");
     assert.equal(open.holder_ordinal, 1);
     assert.equal(open.holder_active, true);
-    // A CLOSED session's seat is NOBODY HOME, not abolished: the holder mirror is
-    // false and the row's active holder is null, while `closed_at` stays null.
-    assert.equal(closed.holder_active, false);
+    // A CLOSED session keeps holding its seat (D-SEAT-HOLD, brick `eca085bb`): the
+    // holder mirror is true and the row's active holder names it, while `closed_at`
+    // stays null — a close ends nothing on the seat.
+    assert.equal(closed.holder_active, true);
     const closedRow = store.seats.get(String(closed.seat_id));
-    assert.equal(closedRow?.activeHolderId, null);
+    assert.equal(closedRow?.activeHolderId, "l2-b");
     assert.equal(closedRow?.closedAt, null);
     assert.equal(store.seats.get(String(open.seat_id))?.activeHolderId, "l2-a");
 
@@ -346,7 +347,7 @@ test("L2: --apply mints the seats, enriches the entries and CREATES an absent st
     const entries = await readIndexEntries(homeDir);
     assert.equal(entries.get("l2-a.json")?.seatId, open.seat_id);
     assert.equal(entries.get("l2-b.json")?.seatId, closed.seat_id);
-    assert.equal(entries.get("l2-b.json")?.holderActive, false);
+    assert.equal(entries.get("l2-b.json")?.holderActive, true);
   });
 });
 
@@ -483,14 +484,14 @@ test("L5: next_ordinal = max(holder_ordinal)+1 over the seat's records, not 2", 
 
 // ─── L6 / R2 — closed_at is PRESENT and null ─────────────────────────────────
 
-test("L6: a seat whose holders are all closed is `null` holder, `null` closed_at — PRESENT", async () => {
+test("L6: a seat whose holders are all closed keeps the closed holder, `null` closed_at — PRESENT", async () => {
   await withTempHome(async (homeDir) => {
     await seed(homeDir, [makeRecord({ acpxRecordId: "l6", closed: true })]);
     await backfill(homeDir, ["--apply"]);
 
     const raw = await readRawStore(homeDir);
     const [row] = Object.values(raw);
-    assert.equal(row.active_holder_id, null, "nobody home must be null, not omitted");
+    assert.equal(row.active_holder_id, "l6", "a closed holder keeps holding its seat");
     assert.equal("closed_at" in row, true, "closed_at was OMITTED — the store rejects such a row");
     assert.equal(row.closed_at, null, "a backfilled seat reads NOT CLOSED");
     // `name`/`brick_id` are the only omit-when-unset fields; `brick attach` is not
@@ -1808,9 +1809,10 @@ test("BRK1: a FRESHLY-MINTED seat's brick_id comes from the ACTIVE holder — th
   // holder's brick wins" (the favorite-style rule), never the one it is
   // named for. Here the ACTIVE holder is the LOWER ordinal (1) and carries
   // B; the RETIRED holder is the HIGHER ordinal (2) and carries the stale A.
-  // `activeHolderFor` only ever considers OPEN members, so it never reaches
-  // h2 at all — a "highest ordinal overall" rule (wrongly including closed
-  // members) would instead resurrect h2's stale A.
+  // `activeHolderFor` prefers the `holder_active`-flagged member (h1) over the
+  // higher ordinal, so a "highest ordinal overall" rule would instead resurrect
+  // h2's stale A. (Brick `eca085bb`: the choice is among ALL members, open or
+  // closed — the flag decides here, not open-ness.)
   await withTempHome(async (homeDir) => {
     const seatId = "b4b4b4b4-1111-4111-8111-111111111111";
     await seed(homeDir, [
@@ -1898,19 +1900,17 @@ test("BRK2: an EXISTING seat row that already carries a brick_id is LEFT UNCHANG
   });
 });
 
-// ─── brick `5c4b8c4a` — ADDITIVE ONLY: narrows the (d′) fill leg to the
-// ACTIVE holder. `seatNameSource`'s highest-ordinal-over-ALL-members fallback
-// (correct for `name`) was also reachable through `brickFromHolders`, so a
-// seat whose holders are ALL CLOSED sourced its canonical brick link from a
-// RETIRED holder's stale `metadata.brick` — and BRK2 above then protects that
-// wrong value PERMANENTLY, because the fill is the only path that can ever
-// write it. `brickLinkSourceFor` closes that path: no OPEN member, no link.
-// No existing row above is touched. ───────────────────────────────────────
+// ─── brick `5c4b8c4a` narrowed the (d′) fill leg to the ACTIVE holder; brick
+// `eca085bb` (D-SEAT-HOLD, D-BRICK-ON-SEAT) REVERSED it. A closed session keeps
+// holding its seat, so the seat's brick link is taken from its holder OPEN OR
+// CLOSED. BRK3 and BRK5 below were `5c4b8c4a`'s "a closed holder sources NO
+// link" assertions; they are INVERTED here, not deleted, so the harmful case
+// keeps a row. The fill leg still never overwrites a present link (BRK2). ─────
 
 test(
-  "BRK3/BRK4/COUNT/untouched: a seat with no OPEN member sources NO link, " +
-    "an OPEN holder's link IS filled in the same run, an existing link is " +
-    "left alone, and the run fills exactly one — not zero",
+  "BRK3/BRK4/COUNT/untouched: a seat whose only holder is CLOSED IS filled " +
+    "from that holder, an OPEN holder's link is filled in the same run, an " +
+    "existing link is left alone, and the run fills exactly two",
   async () => {
     await withTempHome(async (homeDir) => {
       const seatBrk3 = "b4b4b4b4-3333-4333-8333-333333333333";
@@ -1918,11 +1918,9 @@ test(
       const seatUntouched = "b4b4b4b4-6666-4666-8666-666666666666";
 
       await seed(homeDir, [
-        // BRK3 — the harmful case: the seat's ONLY holder is CLOSED and
-        // carries a stale brick ref. `activeHolderFor` returns `undefined`
-        // for this seat; the OLD fallback (highest ordinal over ALL
-        // members, closed included) would have returned this holder and
-        // promoted BRICK_A — the exact mechanism measured on staging.
+        // BRK3 — the seat's ONLY holder is CLOSED and carries a brick ref.
+        // It is still the seat's holder (D-SEAT-HOLD), so BRICK_A is promoted —
+        // the 35 links `5c4b8c4a` reverted on staging.
         makeRecord({
           acpxRecordId: "brk3-h1",
           seatId: seatBrk3,
@@ -2014,11 +2012,11 @@ test(
 
       const afterStore = await readSeatStore(sessionsDir(homeDir));
 
-      // BRK3 — the harmful case.
-      assert.equal(
+      // BRK3 — a closed holder's link IS the seat's link.
+      assert.deepEqual(
         afterStore.seats.get(seatBrk3)?.brickId,
-        undefined,
-        "a seat whose only holder is CLOSED must not be filled from that holder's stale brick",
+        { ref: BRICK_A, validated: false },
+        "a seat whose only holder is CLOSED must be filled from that holder's brick",
       );
 
       // BRK4 — the paired positive control, same run, always UNVALIDATED
@@ -2037,22 +2035,20 @@ test(
         "a seat whose row already carries a link must be left byte-identical",
       );
 
-      // THE COUNT — excludes the do-nothing-failure reading of BRK3's
-      // absence: it is not a frozen write, a skipped code path, or a run
-      // that filled nothing. Exactly ONE seat (BRK4) was filled this run.
+      // THE COUNT — BRK3 and BRK4 were filled this run; the untouched seat was not.
       assert.equal(
         report.brickLinksFilled,
-        1,
-        "exactly one seat (BRK4) should have been filled this run — not 0",
+        2,
+        "exactly two seats (BRK3, BRK4) should have been filled this run",
       );
     });
   },
 );
 
 test(
-  "BRK5: a FRESH seat with no OPEN member is minted with NO brick link — " +
-    "the mint-path twin of BRK3, with a sibling mint in the same arm proving " +
-    "the mint leg itself still fills from an OPEN holder",
+  "BRK5: a FRESH seat whose only holder is CLOSED is minted WITH that holder's " +
+    "brick link — the mint-path twin of BRK3, with a sibling mint in the same " +
+    "arm proving the mint leg still fills from an OPEN holder",
   async () => {
     await withTempHome(async (homeDir) => {
       const seatClosedOnly = "b4b4b4b4-7777-4777-8777-777777777777";
@@ -2070,10 +2066,8 @@ test(
           closed: true,
           metadata: { brick: BRICK_A },
         }),
-        // The sibling, SAME arm: an OPEN holder IS present, so the fresh
-        // mint's link IS minted — the positive control proving this is a
-        // real narrowing of the representative, not the mint leg disabled
-        // outright.
+        // The sibling, SAME arm: an OPEN holder — the positive control proving
+        // the mint leg is not disabled outright.
         makeRecord({
           acpxRecordId: "brk5-open-h1",
           seatId: seatWithOpenHolder,
@@ -2088,10 +2082,10 @@ test(
 
       const store = await readSeatStore(sessionsDir(homeDir));
 
-      assert.equal(
+      assert.deepEqual(
         store.seats.get(seatClosedOnly)?.brickId,
-        undefined,
-        "a freshly-minted seat whose only holder is CLOSED must carry NO brick link",
+        { ref: BRICK_A, validated: false },
+        "a freshly-minted seat whose only holder is CLOSED must carry that holder's brick link",
       );
       assert.deepEqual(
         store.seats.get(seatWithOpenHolder)?.brickId,
@@ -2319,14 +2313,15 @@ test(
 
       const dry = await backfill(homeDir, []);
       assert.equal(dry.activeHoldersFilled, 3, "the dry run must predict the pointer fills");
-      assert.equal(dry.brickLinksFilled, 2, "the dry run must predict the link fills");
+      assert.equal(dry.brickLinksFilled, 3, "the dry run must predict the link fills");
 
       const report = await backfill(homeDir, ["--apply"]);
       assert.equal(report.errors.length, 0, JSON.stringify(report.errors));
-      // THE PREDICTABLE NUMBERS: 3 all-closed seats ⇒ 3 pointers; the 2 that carry a
-      // brick ⇒ 2 links.
+      // THE PREDICTABLE NUMBERS: 3 all-closed seats ⇒ 3 pointers; the links are the 2
+      // that carry a brick plus the abolished seat's (the link fill never looked at
+      // `closed_at`; only the pointer fill does).
       assert.equal(report.activeHoldersFilled, 3);
-      assert.equal(report.brickLinksFilled, 2);
+      assert.equal(report.brickLinksFilled, 3);
 
       const after = await readSeatStore(dir);
       assert.equal(after.seats.get(ids.a)?.activeHolderId, "lk1x-a");
@@ -2346,6 +2341,7 @@ test(
       );
       assert.deepEqual(after.seats.get(ids.pointed)?.brickId, { ref: BRICK_C, validated: true });
       assert.equal(after.seats.get(ids.abolished)?.activeHolderId, null);
+      assert.deepEqual(after.seats.get(ids.abolished)?.brickId, { ref: BRICK_A, validated: false });
       assert.equal(after.seats.get(ids.abolished)?.closedAt, "2026-02-02T00:00:00.000Z");
 
       // A second run reports 0 and writes nothing.

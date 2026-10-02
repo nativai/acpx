@@ -1054,6 +1054,39 @@ export async function fillSeatBrickLink(
 }
 
 /**
+ * D-SEAT-HOLD, brick `eca085bb` — POINT a NULL `active_holder_id` at the seat's
+ * holder, for a seat row that ALREADY EXISTS and is not itself closed. A closed
+ * session keeps holding its seat until a successor is activated, so a null pointer
+ * on an open seat is the active-only backfill's leftover (brick `5c4b8c4a`).
+ *
+ * 🛑 **NEVER OVERWRITES A NON-NULL POINTER** — only activation replaces one — and
+ * never touches a seat whose `closed_at` is set (an abolished seat's vacancy is
+ * not this backfill's to repair). Writes the pointer and nothing else. Same
+ * idempotent, malformed-row-throws contract as `fillSeatBrickLink`.
+ */
+export async function fillSeatActiveHolder(
+  sessionDir: string,
+  seatId: string,
+  holderId: string,
+): Promise<"filled" | "unchanged" | "no-row"> {
+  return await withSeatStoreWrite(sessionDir, (store) => {
+    if (store.malformedSeatIds.includes(seatId)) {
+      throw new MalformedSeatRowError(seatId);
+    }
+    const row = store.seats.get(seatId);
+    if (!row) {
+      return { mutation: SEAT_STORE_NO_CHANGE, result: "no-row" as const };
+    }
+    if (row.activeHolderId !== null || row.closedAt !== null) {
+      return { mutation: SEAT_STORE_NO_CHANGE, result: "unchanged" as const };
+    }
+    const seats = new Map(store.seats);
+    seats.set(seatId, { ...row, activeHolderId: holderId });
+    return { mutation: { kind: "write", seats } as const, result: "filled" as const };
+  });
+}
+
+/**
  * Mint the row BEST-EFFORT AND LOUD — **ratification item 8, amended 2026-09-28.**
  *
  * 🛑 **SESSION CREATION NEVER DEPENDS ON THE SEAT STORE.** This is the call-site half of

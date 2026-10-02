@@ -114,13 +114,15 @@ import { BRICK_UUID_RE } from "./session/brick-link.js";
  * Two read-only verbs plus the seat lifecycle's other timestamp writer.
  *
  * 🛑 **THE TWO-ENCODINGS RULE, measured live on devbox-staging 2026-09-30: a
- * seat row's `active_holder_id` does NOT reliably say who is active.** Every
- * BACKFILLED row carries `null` once its sole holder is closed (AC11 (c)); a
- * LIVE-MINTED row whose holder is then closed KEEPS the closed session's id —
- * nothing writes the row on a holder's own close (ratification item 5, by
- * design). So `null` and a closed id are two encodings of the SAME fact, and a
- * reader that trusted the raw pointer would report a CLOSED session as the
- * active holder on every live-minted seat. `list`/`show` never render
+ * seat row's `active_holder_id` does NOT reliably say who is active.** A row
+ * BACKFILLED before brick `eca085bb` carries `null` once its sole holder is
+ * closed (AC11 (c) — the active-only narrowing, since reversed: a backfill now
+ * keeps the closed holder as the seat's holder and fills such a null on the next
+ * run); a LIVE-MINTED row whose holder is then closed KEEPS the closed session's
+ * id — nothing writes the row on a holder's own close (ratification item 5, by
+ * design). So `null` and a closed id are two encodings of the SAME fact on a
+ * store not yet re-backfilled, and a reader that trusted the raw pointer would
+ * report a CLOSED session as the active holder on every live-minted seat. `list`/`show` never render
  * `active_holder_id` directly — they derive the holder's state from the
  * HOLDER'S OWN RECORD via `vetActiveHolder` (already shipped for `close`,
  * reused rather than re-derived), rendering `null` and a closed pointer
@@ -822,9 +824,14 @@ function headlineLines(report: SeatBackfillReport): string[] {
     // every run after the fleet's first migrating pass — AC4.
     `  favorites migrated:   ${report.favoritesMigrated}`,
     // (d′), brick `9984c510`: existing seat rows whose brick_id was ABSENT and
-    // were (or, on a dry run, would be) filled from their active holder's own
-    // link, marked UNVALIDATED. `0` once every absent link has been filled once.
+    // were (or, on a dry run, would be) filled from their holder's own link —
+    // open or closed — marked UNVALIDATED. `0` once every absent link has been
+    // filled once.
     `  brick links filled:   ${report.brickLinksFilled}`,
+    // D-SEAT-HOLD, brick `eca085bb`: existing seat rows with a null holder pointer
+    // that were (or, on a dry run, would be) pointed at the seat's holder. `0` once
+    // every such row has been filled once.
+    `  holders filled:       ${report.activeHoldersFilled}`,
     `  errors:               ${report.errors.length}`,
   ];
 }

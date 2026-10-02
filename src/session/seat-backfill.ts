@@ -20,6 +20,7 @@ import { writeSessionRecordAuthorizingSeatHolderWithoutIndex } from "./persisten
 import { seatFieldsToIndexEntry } from "./persistence/seat-fields.js";
 import {
   backfillSeatRow,
+  fillSeatActiveHolder,
   fillSeatBrickLink,
   MalformedSeatRowError,
   migrateSeatFavorite,
@@ -139,12 +140,19 @@ export type SeatBackfillReport = {
   favoritesMigrated: number;
   /**
    * (d′), brick `9984c510`: existing seat rows whose `brick_id` was ABSENT and
-   * were filled (dry run: would be filled) from their active holder's own
-   * derived link, marked UNVALIDATED. Never overwrites a PRESENT link (BRK2)
+   * were filled (dry run: would be filled) from their holder's own derived
+   * link — open or closed — marked UNVALIDATED. Never overwrites a PRESENT link (BRK2)
    * — only absent → present is in scope. Same "re-run touches zero" contract
    * as `favoritesMigrated` once every absent link has been filled once.
    */
   brickLinksFilled: number;
+  /**
+   * D-SEAT-HOLD, brick `eca085bb`: existing seat rows whose `active_holder_id`
+   * was NULL on a seat that is not itself closed, and were pointed at the
+   * member `activeHolderFor` picks (dry run: would be). Never overwrites a
+   * non-null pointer. Same "re-run touches zero" contract as the two above.
+   */
+  activeHoldersFilled: number;
   errors: SeatBackfillError[];
   /** The `.bak-mig-<TS>` suffix of this run's pre-apply copies, absent on a dry run. */
   backupSuffix: string | undefined;
@@ -292,6 +300,13 @@ type SeatPlan = {
    * link, however obtained — BRK2, never overwritten, never reconciled.
    */
   brickLinkNeedsFill: boolean;
+  /**
+   * D-SEAT-HOLD, brick `eca085bb`: true when a row ALREADY EXISTS, its
+   * `active_holder_id` is null, the seat is not itself closed (`closed_at` null)
+   * and this run's derived holder names a member. A non-null pointer is never
+   * touched; a closed (abolished) seat's vacancy is not ours to repair.
+   */
+  activeHolderNeedsFill: boolean;
 };
 
 /**
@@ -317,10 +332,10 @@ function planRecordSeat(
     seatId: newSeatId(),
     seatsRecord: true,
     holderOrdinal: 1,
-    // A closed session's seat is NOBODY HOME, not abolished: the holder mirror
-    // reads false and the row's `active_holder_id` is null, while `closed_at`
-    // stays null. The two facts are different and must not be collapsed.
-    holderActive: record.closed !== true,
+    // The record founds its own seat, so it IS the seat's holder — open or
+    // closed (D-SEAT-HOLD): a close ends nothing on the seat, so the mirror
+    // agrees with the row's `active_holder_id`, which names this record.
+    holderActive: true,
   };
 }
 
@@ -340,18 +355,17 @@ function indexEntryAgrees(
 }
 
 /**
- * The seat's active holder — **the OPEN holder, or `null`** (ruling §5).
+ * The seat's holder — **open OR closed** (D-SEAT-HOLD, brick `eca085bb`).
  *
- * Deterministic where the ruling is silent: among the seat's OPEN members, the one
- * already flagged `holder_active` wins; failing that, the highest ordinal — the most
- * recent holder — wins. `null` when every member is closed, which is a first-class
- * state and not an absence to be repaired.
+ * A closed session keeps holding its seat until a successor is activated, so the
+ * holder is chosen among ALL of the seat's members: the one already flagged
+ * `holder_active` wins; failing that, the highest ordinal — the most recent holder.
+ * Never `undefined` for a seat with members.
  */
 function activeHolderFor(members: readonly RecordPlan[]): RecordPlan | undefined {
-  const open = members.filter((member) => member.record.closed !== true);
   return (
-    open.find((member) => member.holderActive) ??
-    open.toSorted((a, b) => b.holderOrdinal - a.holderOrdinal)[0]
+    members.find((member) => member.holderActive) ??
+    members.toSorted((a, b) => b.holderOrdinal - a.holderOrdinal)[0]
   );
 }
 
@@ -383,7 +397,7 @@ function earliestCreatedAt(members: readonly RecordPlan[], fallback: string): st
  * why the falsifying case has to be a synthetic multi-holder rig.
  *
  * 🛑 `closedAt` is `null` — **PRESENT, never absent.** A backfilled seat reads NOT
- * CLOSED; a closed session's seat is nobody home, not abolished. The store's own
+ * CLOSED; a closed session's seat is held by that session, not abolished. The store's own
  * parse leg requires the key (`hasValidRequiredSeatFields`), so a row written without
  * it is one the store would reject as malformed.
  */
@@ -400,40 +414,22 @@ function favoriteFromHolders(members: readonly RecordPlan[]): boolean {
 }
 
 /**
- * `brick_id` — item (d), brick `3dff714d`, DECISIONS.md CORRECTION + AMENDMENT,
- * narrowed by brick `5c4b8c4a`. Derives from the ACTIVE holder only
- * (`activeHolderFor`) — the same representative `name` (`seatNameSource`) picks
- * whenever one exists, and DELIBERATELY DIVERGING from `name` when every holder
- * is closed: `name` still falls back to the highest-ordinal member there, `brick`
- * does not. **Not** the same shape as `favorite`'s `some()` either: where holders
- * disagree, the ACTIVE holder's brick wins, not "any holder's". A seat with no
- * OPEN member sources NO link — absent means UNKNOWN, the pessimistic direction
- * this family exists to make safe, never a highest-ordinal fallback onto a
- * closed holder's stale ref.
- *
- * Daniel's ruling reaches ACTIVE holders only; whether a RETIRED holder's link
- * is legitimate evidence for a seat's canonical brick is still open. `provenance`
- * carries only `"active-holder"` today and nothing branches on it yet — BOTH are
- * deliberate, so a YES answer is one new branch here instead of a re-threaded
- * return type through `brickFromHolders` → `brickLinkFromHolders` → `planSeatRow`.
- * Do not simplify either away.
+ * `brick_id` — item (d), brick `3dff714d`, DECISIONS.md CORRECTION + AMENDMENT.
+ * Derives from the seat's HOLDER (`activeHolderFor`), open or closed: the brick
+ * is the seat's own, and in the one-time migration it is taken from the session
+ * that holds the seat, because that session's link was the seat's link all along
+ * (D-BRICK-ON-SEAT, brick `eca085bb`; this reverses brick `5c4b8c4a`'s
+ * active-only narrowing). **Not** the same shape as `favorite`'s `some()`: where
+ * members disagree, the holder's brick wins, not "any member's". A non-holder
+ * member's ref is never a source.
  */
-type BrickLinkProvenance = "active-holder";
-
-function brickLinkSourceFor(
-  members: readonly RecordPlan[],
-): { source: RecordPlan; provenance: BrickLinkProvenance } | undefined {
-  const holder = activeHolderFor(members);
-  return holder === undefined ? undefined : { source: holder, provenance: "active-holder" };
-}
-
 function brickFromHolders(members: readonly RecordPlan[]): string | undefined {
-  return brickLinkSourceFor(members)?.source.record.metadata?.brick?.trim() || undefined;
+  return activeHolderFor(members)?.record.metadata?.brick?.trim() || undefined;
 }
 
 /**
  * Brick `9984c510`, R28 (5) — ALWAYS UNVALIDATED. The backfill promotes the
- * active holder's own derived copy VERBATIM; it validates nothing, so
+ * holder's own derived copy VERBATIM; it validates nothing, so
  * claiming anything else about it would be laundering a ref nobody confirmed
  * exists. Shared by both the fresh-mint row below and the (d′) fill leg
  * (`writeBrickLinkFillLeg`), which derives from this same `SeatRecord.brickId`
@@ -704,6 +700,11 @@ async function planSeats(
       favoriteNeedsMigration: existing !== undefined && existing.favorite !== row.favorite,
       brickLinkNeedsFill:
         existing !== undefined && existing.brickId === undefined && row.brickId !== undefined,
+      activeHolderNeedsFill:
+        existing !== undefined &&
+        existing.activeHolderId === null &&
+        existing.closedAt === null &&
+        row.activeHolderId !== null,
     });
   }
   return seatPlans;
@@ -739,6 +740,9 @@ type ApplyCounts = {
   /** (d′), brick `9984c510` — same shape as `favoritesAttempted`, one field over. */
   brickLinksAttempted: Set<string>;
   brickLinksFilled: number;
+  /** D-SEAT-HOLD, brick `eca085bb` — same shape, one field over. */
+  activeHoldersAttempted: Set<string>;
+  activeHoldersFilled: number;
   backups: string[];
 };
 
@@ -834,6 +838,34 @@ async function writeBrickLinkFillLeg(
   }
 }
 
+/**
+ * Leg 3⅞ — D-SEAT-HOLD, brick `eca085bb`: POINT a null `active_holder_id` at the
+ * seat's holder, for a seat whose row ALREADY EXISTS and is not itself closed. A
+ * closed session keeps holding its seat, so a null pointer on such a row is the
+ * narrowing's leftover, not a state of the model. Same once-per-seat guard shape
+ * as the legs above; `fillSeatActiveHolder` re-reads the store under the lock and
+ * never overwrites a non-null pointer, so this guard is an optimisation and never
+ * the authority.
+ */
+async function writeActiveHolderFillLeg(
+  sessionDir: string,
+  plan: RecordPlan,
+  seatPlans: ReadonlyMap<string, SeatPlan>,
+  counts: ApplyCounts,
+): Promise<void> {
+  const seat = seatPlans.get(plan.seatId);
+  if (!seat?.activeHolderNeedsFill || counts.activeHoldersAttempted.has(plan.seatId)) {
+    return;
+  }
+  counts.activeHoldersAttempted.add(plan.seatId);
+  if (
+    seat.row.activeHolderId !== null &&
+    (await fillSeatActiveHolder(sessionDir, plan.seatId, seat.row.activeHolderId)) === "filled"
+  ) {
+    counts.activeHoldersFilled += 1;
+  }
+}
+
 async function applyRecord(
   sessionDir: string,
   plan: RecordPlan,
@@ -865,6 +897,7 @@ async function applyRecord(
     await writeSeatLeg(sessionDir, plan, seatPlans, counts);
     await writeFavoriteMigrationLeg(sessionDir, plan, seatPlans, counts);
     await writeBrickLinkFillLeg(sessionDir, plan, seatPlans, counts);
+    await writeActiveHolderFillLeg(sessionDir, plan, seatPlans, counts);
   } catch (error) {
     errors.push(errorFor(plan, stage, error));
   }
@@ -920,6 +953,8 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
       favoritesMigrated: [...seatPlans.values()].filter((seat) => seat.favoriteNeedsMigration)
         .length,
       brickLinksFilled: [...seatPlans.values()].filter((seat) => seat.brickLinkNeedsFill).length,
+      activeHoldersFilled: [...seatPlans.values()].filter((seat) => seat.activeHolderNeedsFill)
+        .length,
       errors,
       backupSuffix: undefined,
       backups: [],
@@ -936,6 +971,8 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
     favoritesMigrated: 0,
     brickLinksAttempted: new Set(),
     brickLinksFilled: 0,
+    activeHoldersAttempted: new Set(),
+    activeHoldersFilled: 0,
     backups: await takeStoreBackups(sessionDir, suffix),
   };
   for (const plan of scanned.plans) {
@@ -952,6 +989,7 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
     ).length,
     favoritesMigrated: counts.favoritesMigrated,
     brickLinksFilled: counts.brickLinksFilled,
+    activeHoldersFilled: counts.activeHoldersFilled,
     errors,
     backupSuffix: suffix,
     backups: counts.backups,
