@@ -28,7 +28,13 @@ import { AcpClient } from "./client.js";
 
 export type TransientAdvertisementOptions = Pick<
   AcpClientOptions,
-  "agentCommand" | "cwd" | "mcpServers" | "authCredentials" | "authPolicy" | "verbose"
+  | "agentCommand"
+  | "cwd"
+  | "mcpServers"
+  | "authCredentials"
+  | "authPolicy"
+  | "verbose"
+  | "sessionContext"
 > & { timeoutMs?: number };
 
 /** Open, read `configOptions` off `session/new`, close. Never prompts; writes no record. */
@@ -46,6 +52,7 @@ export async function readTransientAdvertisement(
     authCredentials: options.authCredentials,
     authPolicy: options.authPolicy,
     verbose: options.verbose,
+    sessionContext: options.sessionContext,
   });
   try {
     await withTimeout(client.start(), options.timeoutMs);

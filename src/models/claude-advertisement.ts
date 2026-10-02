@@ -485,6 +485,7 @@ export async function probeClaudeAdvertisement(params: {
   }
   const cwd = claudeProbeCwd(env);
   fs.mkdirSync(cwd, { recursive: true });
+  const sessionContext = await defaultSubscriptionContext();
   // Loaded on demand: the catalogue (and so the session-create path) reads this
   // module for its cache, and must not pay for the ACP client to do so.
   const { readTransientAdvertisement } = await import("../acp/transient-advertisement.js");
@@ -493,8 +494,37 @@ export async function probeClaudeAdvertisement(params: {
     cwd,
     authCredentials: params.authCredentials,
     timeoutMs: params.timeoutMs ?? CLAUDE_PROBE_TIMEOUT_MS,
+    ...(sessionContext ? { sessionContext } : {}),
   });
   return { options: advertisedModelOptions(configOptions) ?? [], source: "probe" };
+}
+
+/**
+ * The registry DEFAULT subscription, as the probe's spawn context — so the probe
+ * runs on the credential a new session would, and reads the text sessions read.
+ *
+ * ⚠️ WHY THIS IS EXPLICIT: `buildAgentEnvironment` deliberately leaves an UNBOUND
+ * spawn on the raw `~/.claude` (registry defaults are bound onto sessions before
+ * spawn, never late-resolved in the env builder), and a transient probe has no
+ * session to bind. Without this, a box whose raw `~/.claude` holds no credential
+ * probes uncredentialed and gets the binary's API-form text ("Use the default
+ * model (currently …) · $4/$20 per Mtok"): the LABELS are the same, the
+ * taglines are not (MEASURED on an isolated rig, 2026-10-02). No registry, or no
+ * usable default → `undefined`, and the probe runs raw as before.
+ */
+async function defaultSubscriptionContext(): Promise<
+  { acpxRecordId: string; subscriptionId: string } | undefined
+> {
+  try {
+    const { chooseSubscriptionConfigDir, loadSubscriptionRegistry } =
+      await import("../config/subscriptions.js");
+    const registry = loadSubscriptionRegistry();
+    const choice = chooseSubscriptionConfigDir(undefined, registry);
+    const subscriptionId = (choice.resolvedId ?? registry.default)?.trim();
+    return choice.configDir && subscriptionId ? { acpxRecordId: "", subscriptionId } : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
