@@ -235,6 +235,11 @@ function matchesAgentIdentity(
 export type PersistedSessionLifecycle = {
   closed: boolean | undefined;
   closedAt: string | undefined;
+  /** The monotonicity guard's warrant for a closed:true->false transition —
+   * read-preserved like its sibling `closedAt` so a stale in-memory flush
+   * cannot clobber a NEWER reopen's timestamp with an older one it happened
+   * to be holding (brick 1bfb95ed deliverable 3). */
+  reopenedAt: string | undefined;
   favorite: boolean | undefined;
   favoritedAt: string | undefined;
   name: string | undefined;
@@ -290,6 +295,7 @@ export async function readPersistedLifecycle(
     return {
       closed: parsed.closed,
       closedAt: parsed.closedAt,
+      reopenedAt: parsed.reopenedAt,
       favorite: parsed.favorite,
       favoritedAt: parsed.favoritedAt,
       name: parsed.name,
@@ -719,6 +725,7 @@ function applyPersistedLifecycleForWrite(
   }
   record.closed = persistedLifecycle.closed;
   record.closedAt = persistedLifecycle.closedAt;
+  record.reopenedAt = persistedLifecycle.reopenedAt;
   record.favorite = persistedLifecycle.favorite;
   record.favoritedAt = persistedLifecycle.favoritedAt;
   record.name = persistedLifecycle.name;
@@ -738,6 +745,169 @@ function applyPersistedLifecycleForWrite(
   ) {
     record.updated_at = persistedLifecycle.updatedAt;
   }
+}
+
+/** Counter name for a blocked `closed:true->false` regression. Read it via
+ * `getPerfMetricsSnapshot()` — mirrors `REENTRANT_RECORD_WRITE_COUNTER`'s
+ * shape, the nearest existing precedent for "this must never happen in
+ * product, make it both loud and countable." */
+export const CLOSED_REGRESSION_BLOCKED_COUNTER = "session.closed_regression_blocked";
+
+function reportClosedRegressionBlocked(acpxRecordId: string, mechanism: string): void {
+  incrementPerfCounter(CLOSED_REGRESSION_BLOCKED_COUNTER);
+  // Always loud, deliberately NOT deduped like the reentrant-write warning:
+  // this guard refusing is itself the finding every time it happens, not a
+  // single-shot notice of a condition that then persists for the process's
+  // lifetime.
+  process.stderr.write(
+    `[acpx] 🛑 refused a closed:true->false write for session ${acpxRecordId} — the ` +
+      `in-memory record carried no fresh reopen warrant (${mechanism}). The disk's ` +
+      `closed:true was restored instead of being overwritten, and the rest of this ` +
+      `write still landed. If this session was genuinely meant to reopen, use ` +
+      `'acpx sessions reopen ${acpxRecordId}' (brick 1bfb95ed deliverable 3).\n`,
+  );
+}
+
+/**
+ * THE MONOTONICITY GUARD (brick 1bfb95ed deliverable 3). A write may clear
+ * `closed:true` only when the record carries a WARRANT RECORDED ON THE
+ * RECORD ITSELF — `reopenedAt`, newer than the `closedAt` it would be
+ * clearing — never merely because some caller intended it. An exemption
+ * keyed on WHICH VERB called this is not an exemption at all: Lane A's
+ * forensics (brick 1bfb95ed FINDINGS.md §1f) found the specimen's own write
+ * went through the sanctioned reopen ROUTE, so a verb-keyed guard would not
+ * have caught it. This guard does not try to — see the brick for why that is
+ * a defensible, disclosed scope limit, not an oversight.
+ *
+ * What THIS guard catches: `applyPersistedLifecycleForWrite` already
+ * restores `closed` correctly whenever the preserve-read SUCCEEDS — the gap
+ * is only when that read fails (FINDINGS.md §1d: `readPersistedLifecycle`
+ * swallows a transient read/parse failure into `undefined`, and a
+ * `preserveLifecycle:true` write then silently proceeds with whatever
+ * `closed` happens to be in memory) and when the write is PRIVILEGED
+ * (`preserveLifecycle:false`, which skips `applyPersistedLifecycleForWrite`
+ * entirely by design — `closeSession`/`reopenSession` want to flip `closed`
+ * deliberately, but nothing before this guard existed to tell a deliberate
+ * flip from an accidental one at that seam).
+ *
+ * 🛑 CALLED UNCONDITIONALLY, OUTSIDE THE `preserveLifecycle` BRANCH — same
+ * placement, same reason, as `preserveParentLinkageForPersist` /
+ * `preserveSeatHolderFieldsForPersist` above: the clobberer this closes is
+ * reachable from the PRIVILEGED path, which bypasses that branch by design.
+ *
+ * Reads `persistedLifecycle` FIRST (the read `writeSessionRecordInternal`
+ * already performed — no extra I/O on the common path, where that read
+ * succeeded and `applyPersistedLifecycleForWrite` already did the right
+ * thing). Only on `persistedLifecycle === undefined` — meaning EITHER the
+ * record is legitimately new (nothing to protect) OR the read failed in a
+ * way that could be hiding a real `closed:true` (the dangerous case) — does
+ * it fall back to {@link readRawRecordClosedState}, deliverable (4)'s raw
+ * reader, which reads `closed`/`closed_at` directly off the bytes and so
+ * SURVIVES exactly the failure Lane A's R2 reproduction induces: a
+ * schema-invalid record (e.g. a non-string `metadata` value) that makes
+ * `parseSessionRecord` — and therefore `readPersistedLifecycle` — return
+ * nothing, while the raw `closed:true` is still sitting right there in the
+ * bytes.
+ *
+ * On refusal: forces `record.closed`/`record.closedAt` back to what the disk
+ * genuinely holds (or, when disk itself is unreadable, to `true` with
+ * whatever `closedAt` is already in memory — there is no prior value to
+ * restore) and reports loudly via {@link reportClosedRegressionBlocked}. It
+ * does NOT throw: the rest of the record this write carries is real,
+ * unrelated state (per the sub-HoD's ruling) — discarding the whole write to
+ * punish one field would be strictly worse than correcting that field alone.
+ */
+async function enforceClosedMonotonicityForWrite(
+  record: SessionRecord,
+  persistedLifecycle: PersistedSessionLifecycle | undefined,
+): Promise<void> {
+  if (record.closed !== false) {
+    return;
+  }
+  if (persistedLifecycle !== undefined) {
+    enforceClosedMonotonicityFromPersisted(record, persistedLifecycle);
+    return;
+  }
+  await enforceClosedMonotonicityFromRawFallback(record);
+}
+
+// The common case: the ordinary preserve-read already succeeded, so the truth
+// is right here — no extra I/O.
+function enforceClosedMonotonicityFromPersisted(
+  record: SessionRecord,
+  persistedLifecycle: PersistedSessionLifecycle,
+): void {
+  if (persistedLifecycle.closed !== true) {
+    return;
+  }
+  if (warrantCoversClosedAt(record.reopenedAt, persistedLifecycle.closedAt)) {
+    return;
+  }
+  record.closed = true;
+  record.closedAt = persistedLifecycle.closedAt;
+  reportClosedRegressionBlocked(record.acpxRecordId, "disk read succeeded");
+}
+
+// The ordinary read failed (persistedLifecycle undefined) — fall back to the
+// raw reader, which survives a schema-validation failure the ordinary read
+// cannot (Lane A's R2: a non-string `metadata` value).
+async function enforceClosedMonotonicityFromRawFallback(record: SessionRecord): Promise<void> {
+  let raw: RawRecordClosedState;
+  try {
+    raw = await readRawRecordClosedState(record.acpxRecordId);
+  } catch (error) {
+    handleUnreadableRecordDuringMonotonicityCheck(record, error);
+    return;
+  }
+
+  if (!raw.closed.present || raw.closed.value !== true) {
+    return;
+  }
+  const diskClosedAt =
+    raw.closedAt.present && typeof raw.closedAt.value === "string" ? raw.closedAt.value : undefined;
+  if (warrantCoversClosedAt(record.reopenedAt, diskClosedAt)) {
+    return;
+  }
+  record.closed = true;
+  record.closedAt = diskClosedAt;
+  reportClosedRegressionBlocked(record.acpxRecordId, "schema-invalid record, raw read");
+}
+
+// Split out of `enforceClosedMonotonicityFromRawFallback` to keep that
+// function's own complexity under the lint ceiling — same tactic as
+// `applyCloseExitCode` in command-handlers.ts (deliverable 4).
+function handleUnreadableRecordDuringMonotonicityCheck(
+  record: SessionRecord,
+  error: unknown,
+): void {
+  if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+    // Legitimately no record yet (a fresh session being created) — nothing
+    // to protect against.
+    return;
+  }
+  // The file exists but could not be read/parsed at all (EACCES, a truncated
+  // read racing a concurrent rename, …) — we cannot verify whether it
+  // currently holds `closed:true`. Fail closed: without a warrant, refuse the
+  // regression defensively. There is no prior `closedAt` to restore here —
+  // the read that would have supplied it is exactly what failed.
+  if (record.reopenedAt === undefined) {
+    record.closed = true;
+    reportClosedRegressionBlocked(record.acpxRecordId, "disk unreadable");
+  }
+}
+
+/** The warrant check: present, and strictly newer than the `closedAt` it
+ * would be clearing (or disk carries no `closedAt` at all to be newer
+ * than). ISO-8601 string comparison — the same idiom `updatedAt` already
+ * uses a few lines above for monotonic ordering. */
+function warrantCoversClosedAt(
+  reopenedAt: string | undefined,
+  diskClosedAt: string | undefined,
+): boolean {
+  if (reopenedAt === undefined) {
+    return false;
+  }
+  return diskClosedAt === undefined || reopenedAt > diskClosedAt;
 }
 
 /**
@@ -1030,6 +1200,14 @@ async function writeSessionRecordInternal(
       // the last turn" — and like `served_via_shim` is never legitimately cleared,
       // so there is no write this can wrongly suppress.
       preserveLastTurnProviderForPersist(record, freshPersisted?.acpx);
+      // 🛑 THE MONOTONICITY GUARD (brick 1bfb95ed deliverable 3) — UNCONDITIONAL,
+      // same placement/reason as the two preserves above: the clobberer it closes
+      // is reachable from the PRIVILEGED path, which bypasses `preserveLifecycle`
+      // by design. `freshPersisted`, not `persistedLifecycle`: when a caller
+      // supplied a snapshot (the queue-owner's checkpoint — exactly §1d's path),
+      // `freshPersisted` is the RE-READ, strictly more current than what that
+      // caller was holding.
+      await enforceClosedMonotonicityForWrite(record, freshPersisted);
 
       const sessionDir = sessionBaseDir();
       const logPath = messagesLogPath(sessionDir, record.acpxRecordId);

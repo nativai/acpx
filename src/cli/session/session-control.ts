@@ -1043,9 +1043,16 @@ export async function reopenSession(sessionId: string): Promise<SessionReopenRes
     return { record, reopened: false };
   }
 
+  const reopenedAt = isoNow();
   record.closed = false;
   record.closedAt = undefined;
-  record.lastUsedAt = isoNow();
+  // THE WARRANT (brick 1bfb95ed deliverable 3) — the ONE thing the record-write
+  // seam's monotonicity guard accepts as authorization for this exact
+  // transition: present, and newer than the `closedAt` just cleared above. Set
+  // it here, not inside the guard, because this is the one place that knows
+  // the transition is deliberate.
+  record.reopenedAt = reopenedAt;
+  record.lastUsedAt = reopenedAt;
   await writeSessionRecordWithLifecycle(record);
 
   return { record, reopened: true };
