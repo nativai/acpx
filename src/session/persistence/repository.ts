@@ -2175,10 +2175,14 @@ export async function findSession(options: FindSessionOptions): Promise<SessionR
   }
   // Ambiguity is judged among OPEN candidates only. Closed sessions are ranked
   // below live ones rather than competing with them, and that ranking is a
-  // contract, not a convenience: `sessions new -s <name>` soft-closes the prior
-  // same-named session and creates a fresh one, so one closed predecessor beside
-  // one live session is the ordinary shape of any recreated name — treating it
-  // as ambiguous would break `sessions show <name>` after a single re-`new`.
+  // contract, not a convenience: a closed session is not a live candidate an
+  // operator could mean, so one closed predecessor beside one live session is
+  // never ambiguous — only two or more OPEN same-named sessions are. (Until
+  // brick 4e58b35c this was ALSO the ordinary shape of any recreated name,
+  // because `sessions new -s <name>` soft-closed the prior occupant; that
+  // eviction is gone, so a re-`new` under D-IDENTITY now leaves both open and
+  // genuinely ambiguous — this rule no longer protects `sessions show <name>`
+  // after a plain re-`new`, only after an explicitly closed predecessor.)
   // With no live candidate at all, the closed set keeps its documented
   // newest-first archival fallback (index order is lastUsedAt desc), which
   // `exportSession` relies on. Neither case can misdeliver: a closed session
@@ -2188,6 +2192,45 @@ export async function findSession(options: FindSessionOptions): Promise<SessionR
     throw ambiguousSessionResolutionError(normalizedName, open);
   }
   return await loadRecordFromIndexEntry(open[0] ?? matches[0]);
+}
+
+/**
+ * Read-only report of OPEN sessions already occupying `(cwd, name)` — never
+ * CLOSES anything and never itself refuses or collapses a result the way
+ * {@link findSession} does on >1 open match (that behaviour is for
+ * resolution verbs — `prompt`, `sessions ensure` — that must pick exactly one
+ * target; this is only ever a report). `sessions new` calls it purely to NAME
+ * co-claimants in its own output: under D-IDENTITY a name carries no
+ * uniqueness, so two or more live sessions sharing a slot is an ordinary
+ * state (HOD-R43, brick 4e58b35c).
+ *
+ * ⚠️ IT CAN THROW — it awaits `loadSessionIndexEntries()`, real unguarded
+ * I/O. Measured directly (fault injection, brick 4e58b35c): with
+ * `index.json` replaced by a directory, this call throws EISDIR. The "never
+ * affects whether a create succeeds" guarantee is therefore the CALLER's
+ * job, not this function's: `handleSessionsNew` wraps this call in a
+ * try/catch that degrades to no notice. Swallowing the error in here
+ * instead would hide a real fault from any future caller that wants to
+ * know about it.
+ */
+export async function listCoClaimantSessions(
+  options: FindSessionOptions,
+): Promise<SessionNameCandidate[]> {
+  const normalizedCwd = absolutePath(options.cwd);
+  const normalizedName = normalizeName(options.name);
+  const entries = await loadSessionIndexEntries();
+  return entries
+    .filter(
+      (session) =>
+        matchesAgentIdentity(session, options.agentCommand, options.agentName) &&
+        matchesSessionEntry(session, normalizedCwd, normalizedName, false),
+    )
+    .map((session) => ({
+      acpxRecordId: session.acpxRecordId,
+      agentCommand: session.agentCommand,
+      agentName: session.agentName,
+      cwd: session.cwd,
+    }));
 }
 
 export async function findSessionByDirectoryWalk(

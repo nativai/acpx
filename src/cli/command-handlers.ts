@@ -71,6 +71,7 @@ import {
   findSessionByDirectoryWalk,
   isoNow,
   isTemplateRecord,
+  listCoClaimantSessions,
   listSessions,
   migrateTemplateSlugs,
   normalizeName,
@@ -87,7 +88,11 @@ import {
   writeSessionRecord,
   writeSessionRecordWithLifecycle,
 } from "../session/persistence.js";
-import type { MigrateSlugsResult, TemplateRollbackResult } from "../session/persistence.js";
+import type {
+  MigrateSlugsResult,
+  SessionNameCandidate,
+  TemplateRollbackResult,
+} from "../session/persistence.js";
 import { EXIT_CODES } from "../types.js";
 import type {
   OutputFormat,
@@ -1234,13 +1239,26 @@ async function printLocalSessionsList(
   printSessionsByFormat(filtered, format);
 }
 
+// L3 (brick 6572c1a9) — a positional argument here is always resolved as a
+// cwd-scoped NAME, never as a session id, so a uuid passed positionally never
+// matches and lands exactly here. A bare "No named session" message reads as
+// an ordinary not-found and gives no actionable next step, which is how a
+// close that closed nothing got mistaken for one that succeeded. When the
+// given value has uuid shape, name the actual way to target by id.
+const SESSION_NAME_LOOKS_LIKE_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function missingScopedSessionMessage(
   agent: ResolvedAgentInvocation,
   sessionName: string | undefined,
 ): string {
-  return sessionName
-    ? `No named session "${sessionName}" for cwd ${agent.cwd} and agent ${agent.agentName}`
-    : `No cwd session for ${agent.cwd} and agent ${agent.agentName}`;
+  if (sessionName === undefined) {
+    return `No cwd session for ${agent.cwd} and agent ${agent.agentName}`;
+  }
+  const base = `No named session "${sessionName}" for cwd ${agent.cwd} and agent ${agent.agentName}`;
+  return SESSION_NAME_LOOKS_LIKE_UUID_RE.test(sessionName)
+    ? `${base} — "${sessionName}" looks like a session id; pass it with --session-id instead of positionally`
+    : base;
 }
 
 async function findScopedSessionOrThrow(
@@ -2993,26 +3011,39 @@ export async function handleSessionsNew(
   // it, here or anywhere, would trade a silent no-op for a latency regression on
   // every first create (C4 §7.1).
   warmCatalogueInBackground();
-  const [{ createSession, closeSession }, { printCreatedSessionBanner, printNewSessionByFormat }] =
+  const [{ createSession }, { printCreatedSessionBanner, printNewSessionByFormat }] =
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
 
-  const replaced = await findSession({
-    agentCommand: effectiveAgent.agentCommand,
-    agentName: effectiveAgent.agentName,
-    cwd: effectiveAgent.cwd,
-    name: flags.name,
-  });
-
-  if (replaced) {
-    // Deliberately takes the DEFAULT drain: every close entry point goes through
-    // the barrier, so it cannot be bypassed by an alternate route (DESIGN §6,
-    // and the precondition a future auto-close policy inherits).
-    await closeSession(replaced.acpxRecordId);
-    if (globalFlags.verbose) {
-      process.stderr.write(`[acpx] soft-closed prior session: ${replaced.acpxRecordId}\n`);
-    }
+  // L3 (brick 4e58b35c, Daniel: "a bad idea from in the first place") — `sessions
+  // new` used to silently CLOSE whatever session already occupied this (cwd,
+  // name) slot before creating the new one. Deleted outright: a name collision
+  // is not a condition `sessions new` reacts to at all, so the prior occupant
+  // (which can be another agent's live session on a shared box) is left alone.
+  // HOD-R43 — the eviction lookup is gone, but the AMBIGUITY SIGNAL it
+  // incidentally provided is re-added here as a pure read: this never closes,
+  // never refuses, and never affects the create below. It only NAMES whoever
+  // else already holds this (cwd, name) slot, read BEFORE the create so the
+  // about-to-be-created session is never reported as its own co-claimant.
+  //
+  // GUARDED HERE, not inside listCoClaimantSessions: it awaits
+  // loadSessionIndexEntries(), which does real (unguarded) I/O, so this is a
+  // read that CAN throw — measured directly (fault injection, brick
+  // 4e58b35c): with index.json replaced by a directory, this call throws
+  // EISDIR, and unguarded that turned a create that would otherwise have
+  // succeeded into one that never ran at all. An advisory notice must never
+  // be able to fail the create it is only decorating, so any failure here
+  // degrades to "no notice" and falls through unconditionally.
+  let coClaimants: SessionNameCandidate[] = [];
+  try {
+    coClaimants = await listCoClaimantSessions({
+      agentCommand: effectiveAgent.agentCommand,
+      agentName: effectiveAgent.agentName,
+      cwd: effectiveAgent.cwd,
+      name: flags.name,
+    });
+  } catch {
+    coClaimants = [];
   }
-
   const created = await createSession(
     buildSessionStartOptions({
       agent: effectiveAgent,
@@ -3040,7 +3071,25 @@ export async function handleSessionsNew(
     process.stderr.write(`[acpx] created ${scope}: ${created.acpxRecordId}\n`);
   }
 
-  printNewSessionByFormat(created, replaced, globalFlags.format);
+  // HOD-R43 — reporting, never a condition: this never ran before the create
+  // above, and nothing here can change its outcome. Always on stderr, in
+  // every --format (consumer census, brick 4e58b35c): no acpx-ui or wisdom
+  // Skills script reads `sessions new`'s stderr on a successful create — in
+  // fact acpx-ui's own `extractCreatedSessionId` deliberately EXCLUDES stderr
+  // from its id search (acpx-ui server/sessionCreate.ts, brick eca6bf82: a
+  // brick-link warning's uuid on stderr once outranked the real session id),
+  // so a stdout JSON field would be the one with precedent against it, and
+  // stderr is where acpx already puts advisory, non-identity output.
+  if (coClaimants.length > 0) {
+    const otherIds = coClaimants.map((candidate) => candidate.acpxRecordId).join(", ");
+    process.stderr.write(
+      `[acpx] note: ${coClaimants.length} other session(s) already occupy this name in this ` +
+        `directory: ${otherIds}. A name is a display label, not an identity — use --session-id <id> ` +
+        `or --session-url <url> to address a specific one.\n`,
+    );
+  }
+
+  printNewSessionByFormat(created, globalFlags.format);
 }
 
 export async function handleSessionsCopy(

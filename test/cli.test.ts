@@ -4581,7 +4581,7 @@ test("generic sessions show resolves a uniquely matching non-default agent sessi
   });
 });
 
-test("generic readable lookup preserves active default-agent precedence over a closed predecessor", async () => {
+test("generic readable lookup preserves active default-agent precedence over an open predecessor", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
@@ -4609,16 +4609,70 @@ test("generic readable lookup preserves active default-agent precedence over a c
     const firstRecord = JSON.parse(
       await fs.readFile(sessionFilePath(homeDir, firstId), "utf8"),
     ) as { closed?: unknown };
-    assert.equal(firstRecord.closed, true);
+    assert.equal(firstRecord.closed, false);
 
+    // HOD-R43/brick 4e58b35c — `sessions new` no longer closes the prior
+    // same-named session, so two `sessions new -s recreated` calls leave BOTH
+    // open: this is genuinely two live candidates sharing a name, not the
+    // closed-vs-live shape the row's original name described. `sessions show`
+    // must therefore REFUSE as ambiguous (findSession's own contract — two open
+    // matches is exactly what it fails closed on), naming both ids and the
+    // --session-id/--session-url escape — never silently resolve to either.
     const shown = await runCli(
       ["--cwd", cwd, "--format", "json", "sessions", "show", "recreated"],
+      homeDir,
+    );
+    // Under --format json the error is a JSON-RPC envelope on STDOUT, not
+    // stderr — the human-text-on-stderr shape is interactive-only.
+    assert.notEqual(shown.code, 0, shown.stdout + shown.stderr);
+    assert.match(shown.stdout, /is ambiguous/, shown.stdout);
+    assert.match(shown.stdout, new RegExp(firstId), shown.stdout);
+    assert.match(shown.stdout, new RegExp(secondId), shown.stdout);
+    assert.match(shown.stdout, /--session-id <id>/, shown.stdout);
+  });
+});
+
+// The property the row above's original name described — a CLOSED
+// predecessor beside one live session is NOT ambiguous (findSession ranks
+// closed below live rather than letting it compete, repository.ts ~:2176) —
+// still holds. It can no longer be reached by two `sessions new` calls (the
+// eviction that used to produce it is deleted), so it is seeded directly: a
+// closed record written straight to disk, never through `sessions new`.
+test("generic readable lookup preserves active default-agent precedence over a closed predecessor", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(homeDir, MOCK_AGENT_COMMAND);
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "closed-predecessor",
+      acpSessionId: "closed-predecessor",
+      agentCommand: MOCK_AGENT_COMMAND,
+      cwd,
+      name: "recreated-seeded",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:00:00.000Z",
+      closed: true,
+    });
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "live-successor",
+      acpSessionId: "live-successor",
+      agentCommand: MOCK_AGENT_COMMAND,
+      cwd,
+      name: "recreated-seeded",
+      createdAt: "2026-02-01T00:00:00.000Z",
+      lastUsedAt: "2026-02-01T00:00:00.000Z",
+      closed: false,
+    });
+
+    const shown = await runCli(
+      ["--cwd", cwd, "--format", "json", "sessions", "show", "recreated-seeded"],
       homeDir,
     );
     assert.equal(shown.code, 0, shown.stderr);
     assert.equal(
       (JSON.parse(shown.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
-      secondId,
+      "live-successor",
     );
   });
 });

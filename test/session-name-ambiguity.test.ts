@@ -343,8 +343,13 @@ test("the real CLI refuses an ambiguous name for prompt, sessions new and sessio
       "the prompt body reached a session despite the ambiguity",
     );
 
-    // `sessions new` used to soft-close whichever same-named session `find`
-    // returned. It must refuse, and both candidates must stay open.
+    // HOD-R43 (brick 4e58b35c) — under D-IDENTITY a name carries no
+    // uniqueness, so `sessions new` does not treat this collision as a
+    // condition to react to at all: a THIRD "twin" create succeeds exactly
+    // like the first did, and every earlier candidate stays untouched. The
+    // only change is reporting — the create NAMES whoever else already held
+    // the slot (never closing, never refusing) so the operator can tell the
+    // co-claimants apart.
     const remade = await runCli(
       [
         "--cwd",
@@ -361,10 +366,22 @@ test("the real CLI refuses an ambiguous name for prompt, sessions new and sessio
       ],
       homeDir,
     );
-    assert.notEqual(remade.code, 0, describe(remade));
-    assert.match(output(remade), /is ambiguous/, describe(remade));
+    assert.equal(remade.code, 0, describe(remade));
+    const remadeId = String(
+      (JSON.parse(remade.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    assert.notEqual(remadeId, liveId);
+    assert.notEqual(remadeId, "twin-shadow");
+    assert.match(remade.stderr, new RegExp(escapeRegExp(liveId)), describe(remade));
+    assert.match(remade.stderr, /twin-shadow/, describe(remade));
+    assert.match(remade.stderr, /--session-id <id>/, describe(remade));
     assert.equal(await isClosed(homeDir, liveId), false, "sessions new closed a candidate anyway");
     assert.equal(await isClosed(homeDir, "twin-shadow"), false);
+    assert.equal(
+      await isClosed(homeDir, remadeId),
+      false,
+      "the newly created session must stay open",
+    );
 
     // `sessions ensure` is the path that silently REUSES an arbitrary
     // same-named session — two spawners picking one child name would collapse
