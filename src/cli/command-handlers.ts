@@ -71,6 +71,7 @@ import {
   findSessionByDirectoryWalk,
   isoNow,
   isTemplateRecord,
+  listCoClaimantSessions,
   listSessions,
   migrateTemplateSlugs,
   normalizeName,
@@ -3014,6 +3015,17 @@ export async function handleSessionsNew(
   // name) slot before creating the new one. Deleted outright: a name collision
   // is not a condition `sessions new` reacts to at all, so the prior occupant
   // (which can be another agent's live session on a shared box) is left alone.
+  // HOD-R43 — the eviction lookup is gone, but the AMBIGUITY SIGNAL it
+  // incidentally provided is re-added here as a pure read: this never closes,
+  // never refuses, and never affects the create below. It only NAMES whoever
+  // else already holds this (cwd, name) slot, read BEFORE the create so the
+  // about-to-be-created session is never reported as its own co-claimant.
+  const coClaimants = await listCoClaimantSessions({
+    agentCommand: effectiveAgent.agentCommand,
+    agentName: effectiveAgent.agentName,
+    cwd: effectiveAgent.cwd,
+    name: flags.name,
+  });
   const created = await createSession(
     buildSessionStartOptions({
       agent: effectiveAgent,
@@ -3039,6 +3051,24 @@ export async function handleSessionsNew(
   if (globalFlags.verbose) {
     const scope = flags.name ? `named session "${flags.name}"` : "cwd session";
     process.stderr.write(`[acpx] created ${scope}: ${created.acpxRecordId}\n`);
+  }
+
+  // HOD-R43 — reporting, never a condition: this never ran before the create
+  // above, and nothing here can change its outcome. Always on stderr, in
+  // every --format (consumer census, brick 4e58b35c): no acpx-ui or wisdom
+  // Skills script reads `sessions new`'s stderr on a successful create — in
+  // fact acpx-ui's own `extractCreatedSessionId` deliberately EXCLUDES stderr
+  // from its id search (acpx-ui server/sessionCreate.ts, brick eca6bf82: a
+  // brick-link warning's uuid on stderr once outranked the real session id),
+  // so a stdout JSON field would be the one with precedent against it, and
+  // stderr is where acpx already puts advisory, non-identity output.
+  if (coClaimants.length > 0) {
+    const otherIds = coClaimants.map((candidate) => candidate.acpxRecordId).join(", ");
+    process.stderr.write(
+      `[acpx] note: ${coClaimants.length} other session(s) already occupy this name in this ` +
+        `directory: ${otherIds}. A name is a display label, not an identity — use --session-id <id> ` +
+        `or --session-url <url> to address a specific one.\n`,
+    );
   }
 
   printNewSessionByFormat(created, globalFlags.format);

@@ -23,6 +23,7 @@ export {
   isArchivedRecord,
   isTemplateRecord,
   isoNow,
+  listCoClaimantSessions,
   listSessionIndexEntries,
   listSessions,
   listSessionsForAgent,

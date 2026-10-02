@@ -2175,10 +2175,14 @@ export async function findSession(options: FindSessionOptions): Promise<SessionR
   }
   // Ambiguity is judged among OPEN candidates only. Closed sessions are ranked
   // below live ones rather than competing with them, and that ranking is a
-  // contract, not a convenience: `sessions new -s <name>` soft-closes the prior
-  // same-named session and creates a fresh one, so one closed predecessor beside
-  // one live session is the ordinary shape of any recreated name — treating it
-  // as ambiguous would break `sessions show <name>` after a single re-`new`.
+  // contract, not a convenience: a closed session is not a live candidate an
+  // operator could mean, so one closed predecessor beside one live session is
+  // never ambiguous — only two or more OPEN same-named sessions are. (Until
+  // brick 4e58b35c this was ALSO the ordinary shape of any recreated name,
+  // because `sessions new -s <name>` soft-closed the prior occupant; that
+  // eviction is gone, so a re-`new` under D-IDENTITY now leaves both open and
+  // genuinely ambiguous — this rule no longer protects `sessions show <name>`
+  // after a plain re-`new`, only after an explicitly closed predecessor.)
   // With no live candidate at all, the closed set keeps its documented
   // newest-first archival fallback (index order is lastUsedAt desc), which
   // `exportSession` relies on. Neither case can misdeliver: a closed session
@@ -2188,6 +2192,36 @@ export async function findSession(options: FindSessionOptions): Promise<SessionR
     throw ambiguousSessionResolutionError(normalizedName, open);
   }
   return await loadRecordFromIndexEntry(open[0] ?? matches[0]);
+}
+
+/**
+ * Read-only report of OPEN sessions already occupying `(cwd, name)` — never
+ * throws, never closes anything, never affects whether a create succeeds.
+ * `sessions new` calls this purely to NAME co-claimants in its own output:
+ * under D-IDENTITY a name carries no uniqueness, so two or more live sessions
+ * sharing a slot is an ordinary state, not a condition to refuse or collapse
+ * (HOD-R43, brick 4e58b35c). Contrast with {@link findSession}, which THROWS
+ * on >1 open match — that behaviour is for resolution verbs (`prompt`,
+ * `sessions ensure`) that must pick exactly one target, never for a report.
+ */
+export async function listCoClaimantSessions(
+  options: FindSessionOptions,
+): Promise<SessionNameCandidate[]> {
+  const normalizedCwd = absolutePath(options.cwd);
+  const normalizedName = normalizeName(options.name);
+  const entries = await loadSessionIndexEntries();
+  return entries
+    .filter(
+      (session) =>
+        matchesAgentIdentity(session, options.agentCommand, options.agentName) &&
+        matchesSessionEntry(session, normalizedCwd, normalizedName, false),
+    )
+    .map((session) => ({
+      acpxRecordId: session.acpxRecordId,
+      agentCommand: session.agentCommand,
+      agentName: session.agentName,
+      cwd: session.cwd,
+    }));
 }
 
 export async function findSessionByDirectoryWalk(
