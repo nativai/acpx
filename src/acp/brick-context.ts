@@ -7,6 +7,7 @@ import { brickChildEnv } from "../bricks-credential.js";
 // and fixing either one alone would have left the other resolving the dead path with nothing
 // failing. See the note on the constant itself.
 import { brickPoolDir } from "../cli/session/brick-link.js";
+import { resolveAcpxUiBaseUrl } from "./auth-env.js";
 
 export const BRICK_CONTEXT_TIMEOUT_MS = 5_000;
 export const BRICK_CONTEXT_MAX_BYTES = 32_768;
@@ -60,8 +61,21 @@ export async function resolveBrickContext(
 }
 
 /**
+ * The base the identity URLs are composed against when acpx resolves none. The brick CLI reads ONLY the
+ * `?session=` / `?seat=` query param, never the host, so any well-formed origin does.
+ */
+const FALLBACK_IDENTITY_BASE_URL = "http://localhost";
+
+/**
  * The env `brick context` runs under: `brickChildEnv()` plus the CHILD's identity, so the rendered
  * "Your workspace" line is derived from the same session and seat `$ACPX_AGENT_FOLDER` was.
+ *
+ * ⚠️ URL FORMS, NEVER BARE IDS — AND THE FIRST VERSION OF THIS FUNCTION GOT THAT WRONG. It handed over bare
+ * uuids ("the brick CLI accepts either"). It does not, in remote mode: acpx-ui's `brick/cli-remote.ts` runs
+ * `new URL(env.ACPX_SESSION_URL)` on EVERY remote verb, so a bare uuid threw "Invalid URL", the CLI exited 1,
+ * and the agent got NO brick block at all (measured by the C7 test-engineer, P4). `ACPX_SESSION_URL` is
+ * composed exactly like `buildAgentEnvironment` composes it (`<base>/?session=<id>`), and `ACPX_SEAT_URL`
+ * likewise (`<base>/?seat=<id>`). The test drives this through a shim that performs that same parse.
  *
  * ⚠️ BY ENV, NEVER BY A `--seat` FLAG. The deployed `brick` CLI rejects an unknown flag (measured:
  * `brick context X --bogusflag` → rc 2 `unknown flag`), and a failed context fetch BLANKS the whole brick
@@ -72,19 +86,20 @@ export async function resolveBrickContext(
  * the child's or DELETED — never inherited. With no own id (the transient creation spawn) both are
  * deleted: the brick CLI then renders its placeholder instead of the SPAWNER's folder, which a codex
  * primer would otherwise keep in the thread history. A seat is only meaningful with a session.
- * (Bare ids, not URLs: the brick CLI accepts either, and a bare id cannot name another box.)
  */
 function brickContextEnv(sessionId?: string, seatId?: string): NodeJS.ProcessEnv {
   const env = brickChildEnv();
   const session = sessionId?.trim();
   const seat = seatId?.trim();
-  if (session) {
-    env.ACPX_SESSION_URL = session;
-  } else {
+  if (!session) {
     delete env.ACPX_SESSION_URL;
+    delete env.ACPX_SEAT_URL;
+    return env;
   }
-  if (session && seat) {
-    env.ACPX_SEAT_URL = seat;
+  const base = resolveAcpxUiBaseUrl(process.env) ?? FALLBACK_IDENTITY_BASE_URL;
+  env.ACPX_SESSION_URL = `${base}/?session=${encodeURIComponent(session)}`;
+  if (seat) {
+    env.ACPX_SEAT_URL = `${base}/?seat=${encodeURIComponent(seat)}`;
   } else {
     delete env.ACPX_SEAT_URL;
   }
