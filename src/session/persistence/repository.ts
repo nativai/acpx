@@ -2196,13 +2196,21 @@ export async function findSession(options: FindSessionOptions): Promise<SessionR
 
 /**
  * Read-only report of OPEN sessions already occupying `(cwd, name)` — never
- * throws, never closes anything, never affects whether a create succeeds.
- * `sessions new` calls this purely to NAME co-claimants in its own output:
- * under D-IDENTITY a name carries no uniqueness, so two or more live sessions
- * sharing a slot is an ordinary state, not a condition to refuse or collapse
- * (HOD-R43, brick 4e58b35c). Contrast with {@link findSession}, which THROWS
- * on >1 open match — that behaviour is for resolution verbs (`prompt`,
- * `sessions ensure`) that must pick exactly one target, never for a report.
+ * CLOSES anything and never itself refuses or collapses a result the way
+ * {@link findSession} does on >1 open match (that behaviour is for
+ * resolution verbs — `prompt`, `sessions ensure` — that must pick exactly one
+ * target; this is only ever a report). `sessions new` calls it purely to NAME
+ * co-claimants in its own output: under D-IDENTITY a name carries no
+ * uniqueness, so two or more live sessions sharing a slot is an ordinary
+ * state (HOD-R43, brick 4e58b35c).
+ *
+ * ⚠️ IT CAN THROW — it awaits `loadSessionIndexEntries()`, real I/O that a
+ * concurrent `sessions new` can be racing via `loadOrRebuildSessionIndex`'s
+ * rename-into-place. The "never affects whether a create succeeds" guarantee
+ * is therefore the CALLER's job, not this function's: `handleSessionsNew`
+ * wraps this call in a try/catch that degrades to no notice. Swallowing the
+ * error in here instead would hide a real fault from any future caller that
+ * wants to know about it.
  */
 export async function listCoClaimantSessions(
   options: FindSessionOptions,

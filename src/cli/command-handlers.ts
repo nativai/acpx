@@ -88,7 +88,11 @@ import {
   writeSessionRecord,
   writeSessionRecordWithLifecycle,
 } from "../session/persistence.js";
-import type { MigrateSlugsResult, TemplateRollbackResult } from "../session/persistence.js";
+import type {
+  MigrateSlugsResult,
+  SessionNameCandidate,
+  TemplateRollbackResult,
+} from "../session/persistence.js";
 import { EXIT_CODES } from "../types.js";
 import type {
   OutputFormat,
@@ -3020,12 +3024,25 @@ export async function handleSessionsNew(
   // never refuses, and never affects the create below. It only NAMES whoever
   // else already holds this (cwd, name) slot, read BEFORE the create so the
   // about-to-be-created session is never reported as its own co-claimant.
-  const coClaimants = await listCoClaimantSessions({
-    agentCommand: effectiveAgent.agentCommand,
-    agentName: effectiveAgent.agentName,
-    cwd: effectiveAgent.cwd,
-    name: flags.name,
-  });
+  //
+  // GUARDED HERE, not inside listCoClaimantSessions: it awaits
+  // loadSessionIndexEntries(), which does real (unguarded) I/O, so this is a
+  // read that CAN throw — a corrupt/mid-rewrite index.json, or (the routine
+  // case on a shared box) a concurrent `sessions new` racing the same
+  // rename-into-place loadOrRebuildSessionIndex does. An advisory notice must
+  // never be able to fail the create it is only decorating, so any failure
+  // here degrades to "no notice" and falls through unconditionally.
+  let coClaimants: SessionNameCandidate[] = [];
+  try {
+    coClaimants = await listCoClaimantSessions({
+      agentCommand: effectiveAgent.agentCommand,
+      agentName: effectiveAgent.agentName,
+      cwd: effectiveAgent.cwd,
+      name: flags.name,
+    });
+  } catch {
+    coClaimants = [];
+  }
   const created = await createSession(
     buildSessionStartOptions({
       agent: effectiveAgent,
