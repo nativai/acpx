@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { revalidateBeforeApply } from "../src/session/archive/move.js";
 import {
   listSessionRecordFiles,
   toSessionIndexEntry,
@@ -147,6 +148,7 @@ type BackfillJson = {
   favoritesMigrated: number;
   brickLinksFilled: number;
   activeHoldersFilled: number;
+  holderMirrorsSet: number;
   errors: { file: string; stage: string; code?: string; message: string }[];
   backupSuffix?: string;
   backups: string[];
@@ -2354,6 +2356,91 @@ test(
         [],
         "the second --apply changed the store",
       );
+    });
+  },
+);
+
+// ─── brick `eca085bb` fix round (TE c1c2c2b7) — the existing-row FILL sets the
+// holder's `holder_active` mirror, record AND index entry, as a fresh mint does. ──
+
+test(
+  "MIRROR: the existing-row pointer fill sets the holder's mirror on record AND index entry; " +
+    "the dry run counts the writes; a starred seat's filled holder is archive-protected",
+  async () => {
+    await withTempHome(async (homeDir) => {
+      const seatId = "e1e1e1e1-0020-4020-8020-000000000020";
+      const OLD = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+      await seed(homeDir, [
+        makeRecord({
+          acpxRecordId: "mir-h1",
+          seatId,
+          holderOrdinal: 1,
+          holderActive: false,
+          closed: true,
+          closedAt: OLD.toISOString(),
+          favorite: true,
+        }),
+      ]);
+      const dir = sessionsDir(homeDir);
+      await backfillSeatRow(dir, {
+        seatId,
+        activeHolderId: null,
+        closedAt: null,
+        ...EXISTING_ROW_BASE,
+        favorite: true,
+      });
+      const recordFile = path.join(dir, "mir-h1.json");
+      await fs.utimes(recordFile, OLD, OLD);
+      assert.equal(
+        (await readRecordJson(homeDir, "mir-h1")).holder_active,
+        false,
+        "fixture: mirror false",
+      );
+
+      const dry = await backfill(homeDir, []);
+      assert.equal(dry.activeHoldersFilled, 1, "control: the pointer fill is predicted");
+      assert.equal(dry.holderMirrorsSet, 1, "the dry run must count the mirror write");
+      assert.equal(
+        (await readRecordJson(homeDir, "mir-h1")).holder_active,
+        false,
+        "the dry run wrote the record",
+      );
+
+      const report = await backfill(homeDir, ["--apply"]);
+      assert.equal(report.errors.length, 0, JSON.stringify(report.errors));
+      assert.equal(report.activeHoldersFilled, 1);
+      assert.equal(report.holderMirrorsSet, 1);
+
+      const row = (await readSeatStore(dir)).seats.get(seatId);
+      assert.equal(row?.activeHolderId, "mir-h1");
+      assert.equal(
+        (await readRecordJson(homeDir, "mir-h1")).holder_active,
+        true,
+        "the record's mirror disagrees with the pointer",
+      );
+      assert.equal(
+        (await readIndexEntries(homeDir)).get("mir-h1.json")?.holderActive,
+        true,
+        "the index entry's mirror disagrees with the pointer",
+      );
+
+      // The star guard reads the MIRROR: a starred seat's filled holder is protected.
+      await fs.utimes(recordFile, OLD, OLD);
+      const verdict = await revalidateBeforeApply(
+        dir,
+        "mir-h1",
+        ["mir-h1.json"],
+        true,
+        60_000,
+        Date.now(),
+      );
+      assert.equal(verdict.ok, false, "a starred seat's filled holder is archivable");
+      if (!verdict.ok) {
+        assert.equal(verdict.reason, "favorite");
+      }
+
+      const second = await backfill(homeDir, ["--apply"]);
+      assert.equal(second.holderMirrorsSet, 0, "a second run must set no mirror");
     });
   },
 );
