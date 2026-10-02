@@ -12,15 +12,9 @@ import {
 } from "./event-log.js";
 import { getLoggedMessageCount } from "./messages-log-bookkeeping.js";
 import { messagesLogPath } from "./messages-log.js";
-import {
-  findSession,
-  listSessions,
-  normalizeName,
-  resolveGlobalSessionByName,
-  resolveSessionRecord,
-  sessionBaseDir,
-} from "./persistence.js";
+import { resolveSessionRecord, sessionBaseDir } from "./persistence.js";
 import { serializeSessionRecordForDisk } from "./persistence/serialize.js";
+import { seatDisplayName } from "./seat-display-name.js";
 
 export type ExportedSession = {
   format_version: 1;
@@ -47,11 +41,8 @@ export type ExportedSession = {
 };
 
 export type SessionExportLookup = {
-  sessionId?: string;
+  sessionId: string;
   agentName?: string;
-  agentCommand?: string;
-  cwd?: string;
-  name?: string;
 };
 
 class SessionExportError extends AcpxOperationalError {
@@ -70,64 +61,6 @@ class SessionExportError extends AcpxOperationalError {
 
 function sessionLookupError(message: string, code: string): SessionExportError {
   return new SessionExportError(message, code);
-}
-
-async function loadSessionRecord(
-  sessionLookup: SessionExportLookup,
-): Promise<SessionRecord | undefined> {
-  if (sessionLookup.sessionId) {
-    return await resolveSessionRecord(sessionLookup.sessionId);
-  }
-
-  const cwd = path.resolve(sessionLookup.cwd ?? process.cwd());
-  const name = normalizeName(sessionLookup.name);
-
-  if (sessionLookup.agentCommand) {
-    const agentCommand = sessionLookup.agentCommand;
-    const active = await findSession({
-      agentCommand,
-      agentName: sessionLookup.agentName,
-      cwd,
-      name,
-    });
-    if (active) {
-      return active;
-    }
-
-    const localClosed = await findSession({
-      agentCommand,
-      agentName: sessionLookup.agentName,
-      cwd,
-      name,
-      includeClosed: true,
-    });
-    if (localClosed || name === undefined) {
-      return localClosed;
-    }
-
-    return await resolveGlobalSessionByName({
-      agentCommand,
-      agentName: sessionLookup.agentName,
-      name,
-      includeClosed: true,
-    });
-  }
-
-  const matches = (await listSessions()).filter((session) => {
-    if (session.cwd !== cwd) {
-      return false;
-    }
-    if (name == null) {
-      return session.name == null;
-    }
-    return session.name === name;
-  });
-
-  if (matches.length > 1) {
-    throw sessionLookupError("multiple sessions match export lookup", "ambiguous-session");
-  }
-
-  return matches[0];
 }
 
 type EventLockPayload = {
@@ -266,10 +199,7 @@ export async function exportSession(
   sessionLookup: SessionExportLookup,
   outputPath: string,
 ): Promise<void> {
-  const record = await loadSessionRecord(sessionLookup);
-  if (!record) {
-    throw sessionLookupError("session not found", "not-found");
-  }
+  const record = await resolveSessionRecord(sessionLookup.sessionId);
 
   if (await isSessionActive(record)) {
     throw sessionLookupError(
@@ -288,7 +218,7 @@ export async function exportSession(
     messages_log: messagesLog,
     session: {
       record_id: record.acpxRecordId,
-      name: record.name ?? null,
+      name: (await seatDisplayName(record)) ?? null,
       agent: record.agentCommand,
       agent_name: normalizeAgentName(record.agentName ?? sessionLookup.agentName),
       cwd_relative: cwdRelative,

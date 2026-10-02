@@ -95,7 +95,6 @@ async function seedHolder(
     agentCommand: "node mock",
     agentName: "claude",
     cwd: path.join(homeDir, "workspace"),
-    name: id,
     seatId: SEAT_A,
     ...over,
   });

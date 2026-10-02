@@ -183,10 +183,7 @@ export async function setSessionModel(
   // apply below. Internal/replay callers leave recycleOwner off (multi-caller
   // guard) — they already cold-reconnect and must not recycle.
   const ownerToRecycle = options.recycleOwner
-    ? await refuseTurnInFlightForRecycle(
-        options.sessionId,
-        () => new ModelTurnInFlightError(options.sessionName),
-      )
+    ? await refuseTurnInFlightForRecycle(options.sessionId, () => new ModelTurnInFlightError())
     : false;
 
   let result: SessionSetModelResult;
@@ -242,7 +239,7 @@ export async function setSessionConfigOption(
   const ownerToRecycle = options.recycleOwner
     ? await refuseTurnInFlightForRecycle(
         options.sessionId,
-        () => new ConfigOptionTurnInFlightError(options.configId, options.sessionName),
+        () => new ConfigOptionTurnInFlightError(options.configId),
       )
     : false;
 
@@ -356,7 +353,7 @@ export async function setSessionSubscription(
   if (ownerAlive) {
     const active = await tryQueryActiveTurnOnRunningOwner(options.sessionId);
     if (active === true) {
-      throw new SubscriptionTurnInFlightError(options.sessionName);
+      throw new SubscriptionTurnInFlightError();
     }
   }
 
@@ -407,7 +404,7 @@ export async function setSessionProfile(
   if (ownerAlive) {
     const active = await tryQueryActiveTurnOnRunningOwner(options.sessionId);
     if (active === true) {
-      throw new ProfileTurnInFlightError(options.sessionName);
+      throw new ProfileTurnInFlightError();
     }
   }
 
@@ -447,7 +444,7 @@ export async function setSessionAutoFailover(
 ): Promise<SessionSetAutoFailoverResult> {
   const ownerAlive = await refuseTurnInFlightForLiveOwner(
     options.sessionId,
-    () => new ConfigOptionTurnInFlightError("auto-failover", options.sessionName),
+    () => new ConfigOptionTurnInFlightError("auto-failover"),
   );
 
   const record = await resolveSessionRecord(options.sessionId);
@@ -515,7 +512,7 @@ export async function setSessionOutputStyle(
 
   // Refuse ONLY for queued-behind work — never for the active turn itself.
   if (ownerAlive && liveness.queueDepth > 0) {
-    throw new ConfigOptionQueuedWorkError(OUTPUT_STYLE_CONFIG_ID, options.sessionName);
+    throw new ConfigOptionQueuedWorkError(OUTPUT_STYLE_CONFIG_ID);
   }
 
   const turnActive = ownerAlive
@@ -584,7 +581,7 @@ export async function setSessionAutoSubscription(
 ): Promise<SessionSetAutoSubscriptionResult> {
   const ownerAlive = await refuseTurnInFlightForLiveOwner(
     options.sessionId,
-    () => new ConfigOptionTurnInFlightError("auto-subscription", options.sessionName),
+    () => new ConfigOptionTurnInFlightError("auto-subscription"),
   );
 
   const record = await resolveSessionRecord(options.sessionId);
@@ -615,7 +612,7 @@ export async function setSessionFableDegrade(
 ): Promise<SessionSetFableDegradeResult> {
   const ownerAlive = await refuseTurnInFlightForLiveOwner(
     options.sessionId,
-    () => new ConfigOptionTurnInFlightError("fable-degrade", options.sessionName),
+    () => new ConfigOptionTurnInFlightError("fable-degrade"),
   );
 
   const record = await resolveSessionRecord(options.sessionId);

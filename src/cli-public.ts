@@ -60,26 +60,24 @@ export function configurePublicCli(options: ConfigurePublicCliOptions): void {
     "after",
     `
 Examples:
-  acpx pi "review recent changes"
+  acpx pi --session-id <id> "review recent changes"
   acpx openclaw exec "summarize active session state"
   acpx codex sessions new
-  acpx codex "fix the tests"
-  acpx codex prompt "fix the tests"
-  acpx codex --no-wait "queue follow-up task"
+  acpx codex --session-id <id> "fix the tests"
+  acpx codex prompt --session-id <id> "fix the tests"
+  acpx codex --session-id <id> --no-wait "queue follow-up task"
   acpx codex exec "what does this repo do"
-  acpx codex cancel
-  acpx codex set-mode plan
-  acpx codex set model 'gpt-5.6-sol[high]'
-  acpx codex -s backend "fix the API"
+  acpx codex cancel --session-id <id>
+  acpx codex set-mode plan --session-id <id>
+  acpx codex set model 'gpt-5.6-sol[high]' --session-id <id>
   acpx codex sessions
   acpx codex sessions new --name backend
-  acpx codex sessions ensure --name backend
-  acpx codex sessions close backend
-  acpx codex status
+  acpx codex sessions close --session-id <id>
+  acpx codex status --session-id <id>
   acpx config show
   acpx config init
-  acpx --ttl 30 codex "investigate flaky tests"
-  acpx claude "refactor auth"
+  acpx --ttl 30 codex --session-id <id> "investigate flaky tests"
+  acpx claude --session-id <id> "refactor auth"
   acpx --agent ./my-custom-server "do something"`,
   );
 }

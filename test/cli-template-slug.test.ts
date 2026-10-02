@@ -50,18 +50,13 @@ function withTempHome<T>(run: (homeDir: string) => Promise<T>): Promise<T> {
   return withTempHomeFixture("acpx-w13-cli-", run);
 }
 
-async function seedClosedSession(
-  homeDir: string,
-  id: string,
-  name: string,
-): Promise<SessionRecord> {
+async function seedClosedSession(homeDir: string, id: string): Promise<SessionRecord> {
   const record = makeSessionRecord({
     acpxRecordId: id,
     acpSessionId: `${id}-acp`,
     agentCommand: "node mock",
     agentName: "claude",
     cwd: path.join(homeDir, "workspace"),
-    name,
     closed: true,
   });
   await writeSessionRecordFile(homeDir, record);
@@ -70,16 +65,26 @@ async function seedClosedSession(
 
 test("CLI mark assigns slug+version; a second mark under the same slug is version 2", async () => {
   await withTempHome(async (homeDir) => {
-    await seedClosedSession(homeDir, "rec-1", "Context Engineer");
-    await seedClosedSession(homeDir, "rec-2", "Context Engineer");
+    await seedClosedSession(homeDir, "rec-1");
+    await seedClosedSession(homeDir, "rec-2");
 
     const first = await runCli(
-      ["--format", "json", "claude", "sessions", "template", "rec-1", "--enable"],
+      [
+        "--format",
+        "json",
+        "claude",
+        "sessions",
+        "template",
+        "rec-1",
+        "--enable",
+        "--slug",
+        "Context Engineer",
+      ],
       homeDir,
     );
     assert.equal(first.code, 0, first.stderr);
     const firstResult = JSON.parse(first.stdout.trim()) as { slug?: string; version?: number };
-    assert.equal(firstResult.slug, "context-engineer"); // default slugify(name)
+    assert.equal(firstResult.slug, "context-engineer"); // the explicit slug, canonicalized
     assert.equal(firstResult.version, 1);
 
     const second = await runCli(
@@ -105,9 +110,12 @@ test("CLI mark assigns slug+version; a second mark under the same slug is versio
 
 test("CLI rollback soft-retracts the latest and reports the new latest", async () => {
   await withTempHome(async (homeDir) => {
-    await seedClosedSession(homeDir, "rec-1", "Context Engineer");
-    await seedClosedSession(homeDir, "rec-2", "Context Engineer");
-    await runCli(["claude", "sessions", "template", "rec-1", "--enable"], homeDir);
+    await seedClosedSession(homeDir, "rec-1");
+    await seedClosedSession(homeDir, "rec-2");
+    await runCli(
+      ["claude", "sessions", "template", "rec-1", "--enable", "--slug", "context-engineer"],
+      homeDir,
+    );
     await runCli(
       ["claude", "sessions", "template", "rec-2", "--enable", "--slug", "context-engineer"],
       homeDir,
@@ -131,8 +139,11 @@ test("CLI rollback soft-retracts the latest and reports the new latest", async (
 
 test("CLI rollback --delete hard-removes; an empty slug rolls back as a no-op", async () => {
   await withTempHome(async (homeDir) => {
-    await seedClosedSession(homeDir, "solo", "Solo Template");
-    await runCli(["claude", "sessions", "template", "solo", "--enable"], homeDir);
+    await seedClosedSession(homeDir, "solo");
+    await runCli(
+      ["claude", "sessions", "template", "solo", "--enable", "--slug", "solo-template"],
+      homeDir,
+    );
 
     const del = await runCli(
       [
@@ -166,10 +177,13 @@ test("CLI migrate-slugs backfills (idempotent) and the bare `templates` list sti
     // Seed a template the legacy way (block, no slug/version) by marking then
     // stripping is awkward; instead mark normally and rely on migrate being a
     // no-op (already slugged), plus confirm a slug-less record gets backfilled.
-    await seedClosedSession(homeDir, "legacy", "Legacy Helper");
+    await seedClosedSession(homeDir, "legacy");
     // Mark WITHOUT going through slug assignment is not possible via the CLI, so
     // assert migrate is idempotent on an already-marked (slugged) template.
-    await runCli(["claude", "sessions", "template", "legacy", "--enable"], homeDir);
+    await runCli(
+      ["claude", "sessions", "template", "legacy", "--enable", "--slug", "legacy-helper"],
+      homeDir,
+    );
 
     const dry = await runCli(
       ["--format", "json", "claude", "sessions", "templates", "migrate-slugs", "--dry-run"],
@@ -184,5 +198,22 @@ test("CLI migrate-slugs backfills (idempotent) and the bare `templates` list sti
     // restructure that added rollback/migrate-slugs subcommands.
     const list = await runCli(["--format", "json", "claude", "sessions", "templates"], homeDir);
     assert.equal(list.code, 0, list.stderr);
+  });
+});
+
+// D-IDENTITY (brick 61dc1302): a session has no name, so `--enable` without `--slug` has
+// nothing to derive a slug from. It still marks the template (slug-less, resolves by id) —
+// it must NOT invent a slug, which is what the old `slugify(name)` default did.
+test("CLI mark without --slug derives NO slug (a session has no name to derive one from)", async () => {
+  await withTempHome(async (homeDir) => {
+    await seedClosedSession(homeDir, "rec-noslug");
+    const marked = await runCli(
+      ["--format", "json", "claude", "sessions", "template", "rec-noslug", "--enable"],
+      homeDir,
+    );
+    assert.equal(marked.code, 0, marked.stderr);
+    const result = JSON.parse(marked.stdout.trim()) as { slug?: string; version?: number };
+    assert.equal(result.slug, undefined);
+    assert.equal(result.version, undefined);
   });
 });

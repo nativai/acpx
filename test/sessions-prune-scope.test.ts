@@ -131,7 +131,6 @@ function streamPath(homeDir: string, id: string): string {
 type FixtureOptions = {
   closed?: boolean;
   closedAt?: string;
-  name?: string;
   template?: SessionRecord["template"];
   streamBytes?: number;
 };
@@ -152,14 +151,13 @@ async function seedSession(
         agentCommand: AGENT_COMMAND,
         agentName: "claude",
         cwd,
-        name: options.name ?? id,
         createdAt: "2026-07-24T04:30:00.000Z",
         lastUsedAt: closedAt,
         closed: options.closed ?? true,
         closedAt: (options.closed ?? true) ? closedAt : undefined,
         template: options.template,
       },
-      { defaultName: false, defaultAcpx: false },
+      { defaultAcpx: false },
     ),
   );
   await fs.writeFile(messagesPath(homeDir, id), `sidecar for ${id}\n`, "utf8");
@@ -523,8 +521,8 @@ test("prune refuses an ambiguous suffix, lists the matches, and deletes nothing"
   await withTempHome(async (homeDir) => {
     const workCwd = path.join(homeDir, "workspace");
     await fs.mkdir(workCwd, { recursive: true });
-    await seedSession(homeDir, "one-shared", workCwd, { name: "alpha" });
-    await seedSession(homeDir, "two-shared", workCwd, { name: "beta" });
+    await seedSession(homeDir, "one-shared", workCwd);
+    await seedSession(homeDir, "two-shared", workCwd);
 
     const result = await runCli(
       ["--cwd", workCwd, "claude", "sessions", "prune", "shared"],
@@ -538,7 +536,7 @@ test("prune refuses an ambiguous suffix, lists the matches, and deletes nothing"
       "acpx sessions prune: 'shared' is ambiguous — 2 closed sessions match, so prune deleted nothing.",
     );
     assert.ok(
-      lines.some((line) => line.startsWith("  one-shared (alpha)\t")),
+      lines.some((line) => line.startsWith("  one-shared\t")),
       `match list missing:\n${result.stderr}`,
     );
     assert.ok(lines.includes("Re-run prune with a longer suffix or the full id."));
@@ -1212,8 +1210,8 @@ test("every status line of every prune output path carries the literal token", a
     }
 
     // The ambiguity path needs its own fixture.
-    await seedSession(homeDir, "one-shared", workCwd, { name: "alpha" });
-    await seedSession(homeDir, "two-shared", workCwd, { name: "beta" });
+    await seedSession(homeDir, "one-shared", workCwd);
+    await seedSession(homeDir, "two-shared", workCwd);
     const ambiguous = await runCli(
       ["--cwd", workCwd, "claude", "sessions", "prune", "shared"],
       homeDir,

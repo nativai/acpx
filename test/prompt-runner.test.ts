@@ -262,5 +262,5 @@ async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<vo
 function makeSessionRecord(
   overrides: Parameters<typeof makeSessionRecordFixture>[0],
 ): ReturnType<typeof makeSessionRecordFixture> {
-  return makeSessionRecordFixture(overrides, { defaultName: false, defaultAcpx: false });
+  return makeSessionRecordFixture(overrides, { defaultAcpx: false });
 }

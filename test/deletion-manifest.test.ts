@@ -134,7 +134,6 @@ type ManifestLine = {
   invoker?: string | null;
   scope?: Record<string, unknown>;
   id?: string;
-  name?: string;
   cwd?: string;
   createdAt?: string;
   closedAt?: string;
@@ -167,7 +166,6 @@ function headersOf(lines: ManifestLine[]): ManifestLine[] {
 
 type FixtureOptions = {
   closed?: boolean;
-  name?: string;
   template?: SessionRecord["template"];
   /** Write the acpx-ui-owned timestamps sidecar alongside the stream. */
   timestamps?: boolean;
@@ -192,14 +190,13 @@ async function seedSession(
         agentCommand: AGENT_COMMAND,
         agentName: "claude",
         cwd,
-        name: options.name ?? id,
         createdAt: "2026-07-24T04:30:00.000Z",
         lastUsedAt: closedAt,
         closed: options.closed ?? true,
         closedAt: (options.closed ?? true) ? closedAt : undefined,
         template: options.template,
       },
-      { defaultName: false, defaultAcpx: false },
+      { defaultAcpx: false },
     ),
   );
   const dir = sessionDir(homeDir);
@@ -468,7 +465,6 @@ test("T-M1: both deleters write to the manifest, and a run that deletes nothing 
     const rollbackEntry = entries.find((e) => e.op === "templates_rollback_delete");
     assert.ok(rollbackEntry);
     assert.equal(rollbackEntry.id, "tmpl-victim");
-    assert.equal(rollbackEntry.name, "tmpl-victim");
     assert.equal(rollbackEntry.createdAt, "2026-07-24T04:30:00.000Z");
     assert.equal(rollbackEntry.closedAt, "2026-07-24T04:39:56.000Z");
     // No agent/scope on this path — it has neither, and absent means

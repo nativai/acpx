@@ -1,0 +1,477 @@
+// brick 61dc1302 — D-IDENTITY: identity is the UUID; a name is a label.
+//
+// One committed RED per removed resolution path (R10/R11), each driven through the REAL CLI
+// against the mock agent and asserted on the STORE (the other session's own bytes), never on
+// a CLI line. Acceptance rows: AC-ID1..AC-ID4 of the conception's D-IDENTITY amendment.
+//
+// What each row guards, and what it is RED against (seat/program 1280ab60):
+//   AC-ID1  a nameless `sessions new` changes NOTHING about an open session in the cwd
+//           — GREEN on the old tree too: it is the eviction fix's row (4e58b35c), KEPT as the
+//           control that the removal did not reintroduce a slot.
+//   AC-ID2  `acpx <agent> "<prompt>"` with no session id is REFUSED, create form named
+//           — red on old: the cwd walk found the session and delivered to it.
+//   AC-ID3  one row per removed path (cwd walk · `-s` selector · positional name · cross-cwd
+//           close-by-name · `sessions ensure` · cwd/name export · the library resolvers)
+//   AC-ID4  `-s` names the SEAT on a fresh create and is REFUSED with `--seat`
+//           — red on old: it named the session and was silently ignored on a join (F5).
+import "./install-owner-reaper.js";
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+
+const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
+const MOCK_AGENT_COMMAND = `node ${JSON.stringify(MOCK_AGENT_PATH)}`;
+// Tests run compiled from dist-test/test, so the REAL sources are two levels up.
+const SRC_DIR = fileURLToPath(new URL("../../src", import.meta.url));
+
+type CliRunResult = { code: number | null; stdout: string; stderr: string };
+
+// Isolated by CONSTRUCTION: ACPX_STATE_HOME is pinned alongside HOME or an inherited value
+// would win and these rows would run against the real store (brick://dd4cb0e8).
+async function runCli(
+  args: string[],
+  homeDir: string,
+  options: { cwd?: string } = {},
+): Promise<CliRunResult> {
+  return await new Promise<CliRunResult>((resolve) => {
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: homeDir, ACPX_STATE_HOME: homeDir };
+    for (const key of [
+      "ACPX_SESSION_URL",
+      "ACPX_SESSION_NAME",
+      "ACPX_PARENT_SESSION_URL",
+      "ACPX_BRICK",
+      "ACPX_BRICK_PATH",
+      "ACPX_SEAT_URL",
+    ]) {
+      delete env[key];
+    }
+    const child = spawn(process.execPath, [CLI_PATH, ...args], {
+      env,
+      cwd: options.cwd,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.stdin.end();
+    child.once("close", (code) => {
+      resolve({ code, stdout, stderr });
+    });
+  });
+}
+
+async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
+  const originalHome = process.env.HOME;
+  const originalStateHome = process.env.ACPX_STATE_HOME;
+  const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-identity-"));
+  process.env.HOME = tempHome;
+  process.env.ACPX_STATE_HOME = tempHome;
+  try {
+    await fs.mkdir(path.join(tempHome, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(tempHome, ".acpx", "config.json"),
+      `${JSON.stringify({ agents: { codex: { command: MOCK_AGENT_COMMAND } } }, null, 2)}\n`,
+      "utf8",
+    );
+    await run(tempHome);
+  } finally {
+    if (originalHome == null) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = originalHome;
+    }
+    if (originalStateHome == null) {
+      delete process.env.ACPX_STATE_HOME;
+    } else {
+      process.env.ACPX_STATE_HOME = originalStateHome;
+    }
+    await fs.rm(tempHome, { recursive: true, force: true });
+  }
+}
+
+const sessionsDir = (homeDir: string): string => path.join(homeDir, ".acpx", "sessions");
+const recordPath = (homeDir: string, id: string): string =>
+  path.join(sessionsDir(homeDir), `${encodeURIComponent(id)}.json`);
+
+async function recordBytes(homeDir: string, id: string): Promise<string> {
+  return createHash("sha256")
+    .update(await fs.readFile(recordPath(homeDir, id)))
+    .digest("hex");
+}
+
+async function readRecord(homeDir: string, id: string): Promise<Record<string, unknown>> {
+  return JSON.parse(await fs.readFile(recordPath(homeDir, id), "utf8")) as Record<string, unknown>;
+}
+
+async function recordIds(homeDir: string): Promise<string[]> {
+  const entries = await fs.readdir(sessionsDir(homeDir)).catch(() => [] as string[]);
+  return entries
+    .filter((name) => name.endsWith(".json") && name !== "index.json" && name !== "seats.json")
+    .map((name) => decodeURIComponent(name.slice(0, -".json".length)))
+    .toSorted();
+}
+
+type Created = { id: string; seatId: string };
+
+async function newSession(
+  homeDir: string,
+  cwd: string,
+  extra: string[] = [],
+): Promise<Created & { result: CliRunResult }> {
+  const result = await runCli(
+    ["--cwd", cwd, "--format", "json", "codex", "sessions", "new", ...extra],
+    homeDir,
+    { cwd },
+  );
+  assert.equal(result.code, 0, `sessions new failed: ${result.stderr}`);
+  const id = (JSON.parse(result.stdout.trim()) as { acpxRecordId: string }).acpxRecordId;
+  const seatId = (await readRecord(homeDir, id)).seat_id;
+  assert.equal(typeof seatId, "string", "the new record carries its seat id");
+  return { id, seatId: seatId as string, result };
+}
+
+// seats.json is a flat map: seat id → persisted row.
+async function seatRows(homeDir: string): Promise<Record<string, { name?: string }>> {
+  return JSON.parse(
+    await fs.readFile(path.join(sessionsDir(homeDir), "seats.json"), "utf8"),
+  ) as Record<string, { name?: string }>;
+}
+
+async function workdir(homeDir: string, name: string): Promise<string> {
+  const dir = path.join(homeDir, name);
+  await fs.mkdir(dir, { recursive: true });
+  return dir;
+}
+
+// ───────────────────────────────── AC-ID1 ─────────────────────────────────
+
+test("AC-ID1: a nameless `sessions new` in a cwd holding an open session changes NOTHING about it", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await workdir(homeDir, "repo");
+    const first = await newSession(homeDir, cwd);
+    const before = await recordBytes(homeDir, first.id);
+
+    const second = await newSession(homeDir, cwd);
+
+    assert.notEqual(second.id, first.id);
+    assert.equal(await recordBytes(homeDir, first.id), before, "the occupant's own bytes moved");
+    assert.equal((await readRecord(homeDir, first.id)).closed, false);
+    // And the same label twice is just two sessions (HOD-R43: a name is not a slot).
+    const labelled = await newSession(homeDir, cwd, ["-s", "twin"]);
+    const labelledBefore = await recordBytes(homeDir, labelled.id);
+    const twin = await newSession(homeDir, cwd, ["-s", "twin"]);
+    assert.notEqual(twin.id, labelled.id);
+    assert.equal(await recordBytes(homeDir, labelled.id), labelledBefore);
+  });
+});
+
+// ───────────────────────────────── AC-ID2 ─────────────────────────────────
+
+test('AC-ID2: `acpx <agent> "<prompt>"` with no session id is REFUSED, create form named, nothing delivered', async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await workdir(homeDir, "repo");
+    const occupant = await newSession(homeDir, cwd);
+    const before = await recordBytes(homeDir, occupant.id);
+
+    const result = await runCli(["--cwd", cwd, "codex", "hello there"], homeDir, { cwd });
+
+    assert.notEqual(result.code, 0, "an id-less prompt must not succeed");
+    assert.match(result.stderr, /--session-id/, "the refusal names the working form");
+    assert.match(result.stderr, /acpx codex sessions new/, "the refusal names the create form");
+    assert.equal(
+      await recordBytes(homeDir, occupant.id),
+      before,
+      "the cwd's open session received a delivery it was never addressed for",
+    );
+  });
+});
+
+// ───────────────────────────────── AC-ID3 ─────────────────────────────────
+
+test("AC-ID3 · cwd walk: a prompt from a SUBDIRECTORY of the session's cwd no longer routes up to it", async () => {
+  await withTempHome(async (homeDir) => {
+    const repo = await workdir(homeDir, "repo");
+    await fs.mkdir(path.join(repo, ".git"), { recursive: true });
+    const sub = await workdir(homeDir, path.join("repo", "pkg", "deep"));
+    const occupant = await newSession(homeDir, repo);
+    const before = await recordBytes(homeDir, occupant.id);
+
+    const result = await runCli(["--cwd", sub, "codex", "hello"], homeDir, { cwd: sub });
+
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /sessions new/);
+    assert.equal(await recordBytes(homeDir, occupant.id), before);
+  });
+});
+
+test("AC-ID3 · `-s <name>` selector: refused, never looked up", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await workdir(homeDir, "repo");
+    const named = await newSession(homeDir, cwd, ["-s", "alpha"]);
+    const before = await recordBytes(homeDir, named.id);
+
+    for (const args of [
+      ["codex", "-s", "alpha", "hello"],
+      ["codex", "cancel", "-s", "alpha"],
+      ["codex", "status", "-s", "alpha"],
+    ]) {
+      const result = await runCli(["--cwd", cwd, ...args], homeDir, { cwd });
+      assert.notEqual(result.code, 0, `${args.join(" ")} must be refused`);
+      assert.match(result.stderr, /--session-id/, `${args.join(" ")}: ${result.stderr}`);
+    }
+    assert.equal(await recordBytes(homeDir, named.id), before, "a name addressed a session");
+  });
+});
+
+test("AC-ID3 · positional name: `sessions close <name>` and `sessions close <uuid>` are refused and close NOTHING", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await workdir(homeDir, "repo");
+    const named = await newSession(homeDir, cwd, ["-s", "worker"]);
+    const before = await recordBytes(homeDir, named.id);
+
+    const byName = await runCli(["--cwd", cwd, "codex", "sessions", "close", "worker"], homeDir, {
+      cwd,
+    });
+    assert.notEqual(byName.code, 0);
+    assert.match(byName.stderr, /--session-id/);
+
+    const byUuid = await runCli(["--cwd", cwd, "codex", "sessions", "close", named.id], homeDir, {
+      cwd,
+    });
+    assert.notEqual(byUuid.code, 0);
+    assert.match(
+      byUuid.stderr,
+      new RegExp(`--session-id ${named.id}`),
+      "a uuid positional gets the hint",
+    );
+
+    assert.equal(await recordBytes(homeDir, named.id), before);
+    assert.equal((await readRecord(homeDir, named.id)).closed, false);
+  });
+});
+
+test("AC-ID3 · cross-cwd close-by-name (L3 TE finding): from ANOTHER cwd, a name closes nothing", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwdA = await workdir(homeDir, "repo-a");
+    const cwdB = await workdir(homeDir, "repo-b");
+    const victim = await newSession(homeDir, cwdA, ["-s", "shared-label"]);
+    const before = await recordBytes(homeDir, victim.id);
+
+    const result = await runCli(
+      ["--cwd", cwdB, "codex", "sessions", "close", "shared-label"],
+      homeDir,
+      { cwd: cwdB },
+    );
+
+    assert.notEqual(result.code, 0, "the global name resolver is gone");
+    assert.equal(await recordBytes(homeDir, victim.id), before, "another cwd's session was closed");
+    assert.equal((await readRecord(homeDir, victim.id)).closed, false);
+  });
+});
+
+test("AC-ID3 · every session-targeting verb with no id is refused with --session-id named", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await workdir(homeDir, "repo");
+    const occupant = await newSession(homeDir, cwd);
+    const before = await recordBytes(homeDir, occupant.id);
+
+    for (const args of [
+      ["codex", "status"],
+      ["codex", "cancel"],
+      ["codex", "set-mode", "plan"],
+      ["codex", "sessions", "show"],
+      ["codex", "sessions", "history"],
+      ["codex", "sessions", "close"],
+      ["codex", "sessions", "export", "--output", path.join(homeDir, "out.json")],
+    ]) {
+      const result = await runCli(["--cwd", cwd, ...args], homeDir, { cwd });
+      assert.notEqual(result.code, 0, `${args.join(" ")} must be refused`);
+      assert.match(result.stderr, /--session-id/, `${args.join(" ")}: ${result.stderr}`);
+    }
+    assert.equal(await recordBytes(homeDir, occupant.id), before);
+    await assert.rejects(fs.access(path.join(homeDir, "out.json")), "an export wrote a file");
+  });
+});
+
+test("AC-ID3 · `sessions ensure` is gone: refused, creates nothing, not listed", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await workdir(homeDir, "repo");
+    const idsBefore = await recordIds(homeDir);
+
+    const result = await runCli(
+      ["--cwd", cwd, "codex", "sessions", "ensure", "--name", "backend"],
+      homeDir,
+      { cwd },
+    );
+
+    assert.notEqual(result.code, 0);
+    assert.deepEqual(await recordIds(homeDir), idsBefore, "a deleted verb created a session");
+    const help = await runCli(["--cwd", cwd, "codex", "sessions", "--help"], homeDir, { cwd });
+    assert.doesNotMatch(help.stdout, /^\s+ensure\b/m);
+  });
+});
+
+test("AC-ID3 · the library resolvers are gone from the session module", async () => {
+  const persistence = (await import("../src/session/persistence.js")) as Record<string, unknown>;
+  const session = (await import("../src/session/session.js")) as Record<string, unknown>;
+  for (const name of [
+    "findSession",
+    "findSessionByDirectoryWalk",
+    "findClosedSessionsByDirectoryWalk",
+    "resolveSessionByExactName",
+    "resolveGlobalSessionByName",
+    "listCoClaimantSessions",
+  ]) {
+    assert.equal(persistence[name], undefined, `persistence still exports ${name}`);
+    assert.equal(session[name], undefined, `session still exports ${name}`);
+  }
+  // Positive control: the id resolver this block must NOT have removed.
+  assert.equal(typeof persistence.resolveSessionRecord, "function");
+});
+
+// ───────────────────────────────── AC-ID4 ─────────────────────────────────
+
+test("AC-ID4: `-s` names the SEAT on a fresh create; the record carries NO name", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await workdir(homeDir, "repo");
+    const created = await newSession(homeDir, cwd, ["-s", "alpha"]);
+
+    assert.equal((await seatRows(homeDir))[created.seatId]?.name, "alpha");
+    assert.equal("name" in (await readRecord(homeDir, created.id)), false, "a session got a name");
+    const unnamed = await newSession(homeDir, cwd);
+    assert.equal((await seatRows(homeDir))[unnamed.seatId]?.name, undefined);
+  });
+});
+
+test("AC-ID4: `-s` with `--seat` is REFUSED, creates nothing, leaves the seat's name alone", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await workdir(homeDir, "repo");
+    const first = await newSession(homeDir, cwd, ["-s", "alpha"]);
+    const idsBefore = await recordIds(homeDir);
+
+    const refused = await runCli(
+      ["--cwd", cwd, "codex", "sessions", "new", "--seat", first.seatId, "-s", "beta"],
+      homeDir,
+      { cwd },
+    );
+
+    assert.notEqual(refused.code, 0);
+    assert.match(refused.stderr, /seats rename/, "the refusal names the verb that renames a seat");
+    assert.deepEqual(await recordIds(homeDir), idsBefore, "a refused create left a record");
+    assert.equal((await seatRows(homeDir))[first.seatId]?.name, "alpha");
+
+    // Control: the same join WITHOUT `-s` works — the refusal is attributable to the flag.
+    const joined = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "new", "--seat", first.seatId],
+      homeDir,
+      { cwd },
+    );
+    assert.equal(joined.code, 0, joined.stderr);
+  });
+});
+
+// ───────────────────────── legacy `name` on old records ─────────────────────────
+
+test("a legacy `name` on an old record is kept readable for the backfill, never written by new code", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await workdir(homeDir, "repo");
+    const created = await newSession(homeDir, cwd);
+    // Age the record: an older acpx wrote `name` into it.
+    const raw = await readRecord(homeDir, created.id);
+    raw.name = "legacy label";
+    await fs.writeFile(
+      recordPath(homeDir, created.id),
+      `${JSON.stringify(raw, null, 2)}\n`,
+      "utf8",
+    );
+
+    const { resolveSessionRecord, writeSessionRecord } =
+      await import("../src/session/persistence.js");
+    const loaded = await resolveSessionRecord(created.id);
+    // Read through a loose view: this row is RED on the pre-change tree, where the field is `name`.
+    const view = loaded as unknown as Record<string, unknown>;
+    assert.equal(view.legacyName, "legacy label");
+    assert.equal("name" in view, false);
+
+    await writeSessionRecord(loaded);
+    assert.equal((await readRecord(homeDir, created.id)).name, "legacy label", "a rewrite lost it");
+
+    // A WRONG-TYPED legacy name no longer rejects the whole record (a name identifies nothing).
+    raw.name = 42;
+    await fs.writeFile(
+      recordPath(homeDir, created.id),
+      `${JSON.stringify(raw, null, 2)}\n`,
+      "utf8",
+    );
+    const dropped = (await resolveSessionRecord(created.id)) as unknown as Record<string, unknown>;
+    assert.equal(dropped.legacyName, undefined);
+  });
+});
+
+// STRUCTURAL, by discovery: the legacy field may be read by exactly the files that need it —
+// the parser/serializer pair, the type + persisted-field contract, the seat backfill (which
+// mints a seat's name from it), the template-slug migration and the display-name helper.
+// Anything else reading it is a resolution path coming back in by the side door.
+const LEGACY_NAME_READERS = new Set([
+  "session/persistence/full-record-contract.ts",
+  "session/persistence/parse.ts",
+  "session/persistence/repository.ts",
+  "session/persistence/serialize.ts",
+  "session/seat-backfill.ts",
+  "session/seat-display-name.ts",
+  "types.ts",
+]);
+
+async function sourceFiles(dir: string): Promise<string[]> {
+  const out: string[] = [];
+  for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      out.push(...(await sourceFiles(full)));
+    } else if (entry.name.endsWith(".ts")) {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
+function unlistedLegacyNameReaders(files: Map<string, string>): string[] {
+  return [...files]
+    .filter(([relative, text]) => text.includes("legacyName") && !LEGACY_NAME_READERS.has(relative))
+    .map(([relative]) => relative)
+    .toSorted();
+}
+
+test("only the listed files read `legacyName` (discovering scan, with a negative control)", async () => {
+  const files = new Map<string, string>();
+  for (const full of await sourceFiles(SRC_DIR)) {
+    files.set(
+      path.relative(SRC_DIR, full).split(path.sep).join("/"),
+      await fs.readFile(full, "utf8"),
+    );
+  }
+  const present = new Set(
+    [...files].filter(([, text]) => text.includes("legacyName")).map(([f]) => f),
+  );
+  // The scan is alive: it finds the listed readers (positive control)…
+  for (const expected of ["types.ts", "session/persistence/parse.ts"]) {
+    assert.ok(present.has(expected), `the scan did not see ${expected}`);
+  }
+  assert.deepEqual(unlistedLegacyNameReaders(files), []);
+  // …and it FLAGS an unlisted subject that was never registered anywhere (negative control).
+  const withIntruder = new Map(files).set("cli/session-routing.ts", "record.legacyName");
+  assert.deepEqual(unlistedLegacyNameReaders(withIntruder), ["cli/session-routing.ts"]);
+});

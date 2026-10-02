@@ -71,9 +71,9 @@ test("a new record file is reconciled in without a full rebuild", async () => {
   await withSessionDir(async (sessionDir) => {
     const a = record("rec-a");
     const fileA = await writeRecordFile(sessionDir, a);
-    // Entry for a deliberately carries a marker name the on-disk record does
+    // Entry for a deliberately carries a marker agent name the on-disk record does
     // NOT have — a full rebuild would lose it, incremental reconcile keeps it.
-    const markedEntryA = { ...toSessionIndexEntry(a, fileA), name: "marker-not-on-disk" };
+    const markedEntryA = { ...toSessionIndexEntry(a, fileA), agentName: "marker-not-on-disk" };
     await writeSessionIndex(sessionDir, { files: [fileA], entries: [markedEntryA] });
 
     const b = record("rec-b");
@@ -85,7 +85,7 @@ test("a new record file is reconciled in without a full rebuild", async () => {
     assert.deepEqual(index.files, [fileA, fileB].toSorted());
     const entryA = index.entries.find((entry) => entry.file === fileA);
     const entryB = index.entries.find((entry) => entry.file === fileB);
-    assert.equal(entryA?.name, "marker-not-on-disk", "existing entry must not be re-read");
+    assert.equal(entryA?.agentName, "marker-not-on-disk", "existing entry must not be re-read");
     assert.equal(entryB?.acpxRecordId, "rec-b");
   });
 });
@@ -138,11 +138,14 @@ test("providedEntries are used for new files instead of re-reading the record", 
     await writeSessionIndex(sessionDir, { files: [], entries: [] });
     const a = record("rec-a");
     const fileA = await writeRecordFile(sessionDir, a);
-    const provided = { ...toSessionIndexEntry(a, fileA), name: "provided-entry-wins" };
+    const provided = { ...toSessionIndexEntry(a, fileA), agentName: "provided-entry-wins" };
 
     const { index } = await reconcileSessionIndex(sessionDir, new Map([[fileA, provided]]));
 
-    assert.equal(index.entries.find((entry) => entry.file === fileA)?.name, "provided-entry-wins");
+    assert.equal(
+      index.entries.find((entry) => entry.file === fileA)?.agentName,
+      "provided-entry-wins",
+    );
   });
 });
 

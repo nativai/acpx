@@ -33,15 +33,12 @@ const CONCURRENT_WRITES = 6;
 
 test("concurrent session-record writes in the same millisecond all land (unique temp name)", async () => {
   await withTempHome("acpx-concurrent-record-write-home-", async (homeDir) => {
-    const seed = makeSessionRecord(
-      {
-        acpxRecordId: "concurrent-record-write",
-        acpSessionId: "concurrent-record-write-session",
-        agentCommand: "node mock-agent.js",
-        cwd: homeDir,
-      },
-      { defaultName: false },
-    );
+    const seed = makeSessionRecord({
+      acpxRecordId: "concurrent-record-write",
+      acpSessionId: "concurrent-record-write-session",
+      agentCommand: "node mock-agent.js",
+      cwd: homeDir,
+    });
     await writeSessionRecordFile(homeDir, seed);
 
     const realNow = Date.now;
@@ -51,16 +48,13 @@ test("concurrent session-record writes in the same millisecond all land (unique 
       settled = await Promise.allSettled(
         Array.from({ length: CONCURRENT_WRITES }, (_unused, index) =>
           writeSessionRecord(
-            makeSessionRecord(
-              {
-                acpxRecordId: "concurrent-record-write",
-                acpSessionId: "concurrent-record-write-session",
-                agentCommand: "node mock-agent.js",
-                cwd: homeDir,
-                name: `writer-${index}`,
-              },
-              { defaultName: false },
-            ),
+            makeSessionRecord({
+              acpxRecordId: "concurrent-record-write",
+              acpSessionId: "concurrent-record-write-session",
+              agentCommand: "node mock-agent.js",
+              cwd: homeDir,
+              title: `writer-${index}`,
+            }),
           ),
         ),
       );

@@ -13,7 +13,6 @@ import {
   handlePrompt,
   handleSessionsClose,
   handleSessionsCopy,
-  handleSessionsEnsure,
   handleSessionsExport,
   handleSessionsHistory,
   handleSessionsImport,
@@ -328,8 +327,9 @@ export function registerSessionsCommand(
     )
     .option(
       "--slug <slug>",
-      "Explicit template slug for --enable (canonicalized; default is slugify(name)). " +
-        "Use when the target slug differs from the session name's slug (e.g. a refresh).",
+      "Template slug for --enable (canonicalized). Required for a new template: a " +
+        "session has no name to derive one from, so without it the template is slug-less " +
+        "and resolves by id only.",
     )
     .action(async function (this: Command, id: string, flags: SessionsTemplateFlags) {
       await handleSessionsTemplate(explicitAgentName, id, flags, this, config);
@@ -342,7 +342,11 @@ export function registerSessionsCommand(
       "Use this local record UUID (distinct from the adapter session id)",
     )
     .description("Create a new session for current cwd (optionally from a template)")
-    .option("-s, --name <name>", "Session name", parseSessionName)
+    .option(
+      "-s, --name <name>",
+      "Name for the new SEAT (a display label — it identifies nothing). Refused with --seat: that seat already has its name (`seats rename`).",
+      parseSessionName,
+    )
     .option("--resume-session <id>", "Resume existing ACP session id", (value: string) =>
       parseNonEmptyValue("Resume session id", value),
     )
@@ -386,7 +390,7 @@ export function registerSessionsCommand(
       "--from-template <id>",
       "Instantiate from a saved template (acpx record id, ACP session id, or unique suffix). " +
         "Inherits the template's agent type + context; the new session is a normal open session. " +
-        "Combine with --cwd to place it elsewhere and -s to name it.",
+        "Combine with --cwd to place it elsewhere and -s to name its seat.",
       (value: string) => parseNonEmptyValue("Template id", value),
     )
     .option(
@@ -402,42 +406,10 @@ export function registerSessionsCommand(
       await handleSessionsNew(explicitAgentName, flags, this, config);
     });
 
-  sessionsCommand
-    .command("ensure")
-    .description("Ensure a session exists for current cwd or ancestor")
-    .option("-s, --name <name>", "Session name", parseSessionName)
-    .option("--resume-session <id>", "Resume existing ACP session id", (value: string) =>
-      parseNonEmptyValue("Resume session id", value),
-    )
-    .option(
-      "--parent-session-url <url>",
-      "Record the spawning session's acpx-ui URL as parent when creating (UUID parsed from ?session=; ignored when an existing session is reused).",
-      (value: string) => parseNonEmptyValue("Parent session URL", value),
-    )
-    .option(
-      "--parent-id <uuid>",
-      "Record the spawning session's acpxRecordId as parent_session_id when creating (falls back to ACPX_SESSION_URL env; ignored when an existing session is reused). Use --parent-session-url for the URL form.",
-      (value: string) => parseNonEmptyValue("Parent session id", value),
-    )
-    .option(
-      "--metadata <key=value>",
-      "Set or merge a metadata entry (repeatable; merges into existing session metadata, per-key overwrite)",
-      parseMetadataEntry,
-    )
-    .option(
-      "--brick <ref>",
-      "Link the session to a brick (full uuid, uuid8, slug, or slug__uuid8; non-uuid refs resolve via the brick CLI). Stored as metadata.brick; reaches the agent as $ACPX_BRICK / $ACPX_BRICK_PATH.",
-      (value: string) => parseNonEmptyValue("Brick ref", value),
-    )
-    .option("--no-brick", "Do not link, and do not inherit the spawning session's brick.")
-    .action(async function (this: Command, flags: SessionsNewFlags) {
-      await handleSessionsEnsure(explicitAgentName, flags, this, config);
-    });
-
   const closeCommand = sessionsCommand
     .command("close")
     .description("Close session for current cwd")
-    .argument("[name]", "Session name", parseSessionName)
+    .argument("[name]", "REFUSED — sessions are addressed by --session-id", parseSessionName)
     // D1 (brick://53437107) — the close-drain barrier's surface. Defaults keep a
     // close of an idle worker indistinguishable from before.
     .option(
@@ -477,7 +449,7 @@ export function registerSessionsCommand(
       "Truncate the copy at acpx message index N (omit = full copy)",
       parseForkAtIndex,
     )
-    .option("-s, --name <name>", "Name for the copied session", parseSessionName)
+    .option("-s, --name <name>", "Name for the copy's new SEAT (display only)", parseSessionName)
     .option(
       "--parent-session-url <url>",
       "Record the spawning session's acpx-ui URL as parent (UUID parsed from ?session=; falls back to ACPX_SESSION_URL env). Roots the copy/fork under its spawner in addition to its fork origin.",
@@ -573,7 +545,7 @@ export function registerSessionsCommand(
   const showCommand = sessionsCommand
     .command("show")
     .description("Show session metadata for current cwd")
-    .argument("[name]", "Session name", parseSessionName);
+    .argument("[name]", "REFUSED — sessions are addressed by --session-id", parseSessionName);
   addSessionIdentityOptions(showCommand);
   showCommand.action(async function (this: Command, name: string | undefined, flags: StatusFlags) {
     await handleSessionsShow(explicitAgentName, name, flags, this, config);
@@ -716,7 +688,7 @@ DISPLAY LABEL and never a key — nothing resolves a holder by it.
   const historyCommand = sessionsCommand
     .command("history")
     .description("Show recent session history entries")
-    .argument("[name]", "Session name", parseSessionName)
+    .argument("[name]", "REFUSED — sessions are addressed by --session-id", parseSessionName)
     .option(
       "--limit <count>",
       `Maximum number of entries to show (default: ${DEFAULT_HISTORY_LIMIT})`,
@@ -735,7 +707,7 @@ DISPLAY LABEL and never a key — nothing resolves a holder by it.
   const readCommand = sessionsCommand
     .command("read")
     .description("Read full session history")
-    .argument("[name]", "Session name", parseSessionName)
+    .argument("[name]", "REFUSED — sessions are addressed by --session-id", parseSessionName)
     .option(
       "--tail <count>",
       "Show only the last N entries instead of all history",
@@ -764,14 +736,9 @@ DISPLAY LABEL and never a key — nothing resolves a holder by it.
   const exportCommand = sessionsCommand
     .command("export")
     .description("Export a portable session archive")
-    .argument("[name]", "Session name", parseSessionName)
+    .argument("[name]", "REFUSED — sessions are addressed by --session-id", parseSessionName)
     .requiredOption("--output <path>", "Output archive path", (value: string) =>
       parseNonEmptyValue("Output path", value),
-    )
-    .addOption(
-      new LocalAttributeOption("--cwd <cwd>", "Session cwd to export", "sourceCwd").argParser(
-        (value: string) => parseNonEmptyValue("Session cwd", value),
-      ),
     );
   addSessionIdentityOptions(exportCommand);
   exportCommand.action(async function (
@@ -788,7 +755,6 @@ DISPLAY LABEL and never a key — nothing resolves a holder by it.
     .argument("<archive-path>", "Archive path", (value: string) =>
       parseNonEmptyValue("Archive path", value),
     )
-    .option("--name <name>", "Imported session name", parseSessionName)
     .addOption(
       new LocalAttributeOption("--cwd <cwd>", "Imported session cwd", "destinationCwd").argParser(
         (value: string) => parseNonEmptyValue("Imported session cwd", value),

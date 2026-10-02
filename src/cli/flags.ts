@@ -163,11 +163,9 @@ export type SessionsOwnerStatusFlags = {
 
 export type SessionsExportFlags = SessionSelectorFlags & {
   output: string;
-  sourceCwd?: string;
 };
 
 export type SessionsImportFlags = {
-  name?: string;
   destinationCwd?: string;
 };
 
@@ -678,7 +676,7 @@ export function addSessionOption(command: Command): Command {
   return addSessionIdentityOptions(
     command.option(
       "-s, --session <name>",
-      "Use named session (local first, then one exact global agent match)",
+      "REFUSED — a name identifies nothing; address a session with --session-id",
       parseSessionName,
     ),
   ).option(
@@ -691,7 +689,7 @@ export function addSessionNameOption(command: Command): Command {
   return addSessionIdentityOptions(
     command.option(
       "-s, --session <name>",
-      "Use named session (local first, then one exact global agent match)",
+      "REFUSED — a name identifies nothing; address a session with --session-id",
       parseSessionName,
     ),
   );

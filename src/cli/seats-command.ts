@@ -69,21 +69,13 @@ import { BRICK_UUID_RE } from "./session/brick-link.js";
  * ## 🛑 `rename` WRITES THE SEAT ROW ONLY — ruling A (L0, 2026-09-29T13:40:20Z)
  *
  * The brief and `MASTER-PLAN` both said to "keep the write-both discipline for
- * `name` during phase (i)". **Both predate Cluster A and both are wrong**, and the
- * code says so louder than either document: `applyPersistedLifecycleForWrite`
- * (`repository.ts:674-685`) sets `record.name = persistedLifecycle.name` on every
- * preserving write, and `WriteAuthoritativeFields` (`repository.ts:378`) carries
- * `parent` and `seatHolder` and **no `name` flag** — so a `seats rename` that wrote
- * the session record would be a *silent no-op*: exit 0, correct-looking output,
- * nothing changed. Making it work would need a third authority flag plus a
- * preservation bypass in the repo's most safety-critical write path, for a field
- * Daniel has already ruled is leaving the session record entirely
- * (2026-09-28T08:30:25Z — *"sessions don't have names"*).
- *
- * **The stale record copy is a CONTEMPLATED STATE, not a defect** — C2 phase (i)
- * has the two sides disagreeing deliberately, *with the seat winning*. `RN2′` in
- * `test/seats-mutation-verbs.test.ts` asserts the holder's record is UNCHANGED —
- * the contemplated state proven rather than tolerated.
+ * `name` during phase (i)". **Both predate Cluster A and both are wrong**: a session
+ * has no name at all (Daniel, 2026-09-28T08:30:25Z — *"sessions don't have names"*;
+ * the field was removed by D-IDENTITY, brick 61dc1302), so the seat row is the only
+ * place a name can be written. A record of an older acpx may still carry a `name` on
+ * disk (its legacy name, read only by the backfill); `RN2′` in
+ * `test/seats-mutation-verbs.test.ts` asserts the holder's record is UNCHANGED by a
+ * rename.
  *
  * ## 🛑 `close` KEEPS THE ROW; `delete` REMOVES IT — the one thing a writer must
  * never collapse

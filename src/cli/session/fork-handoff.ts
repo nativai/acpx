@@ -27,7 +27,6 @@ export function composeForkDivergenceNotice(fork: SessionRecord, sourceSessionId
   const ownIdentity = base
     ? `${base}/?session=${fork.acpxRecordId}`
     : `session id ${fork.acpxRecordId}`;
-  const ownName = fork.name ?? fork.acpxRecordId;
   const forkIndex = fork.forkedAtMessageIndex;
   const indexClause =
     forkIndex != null
@@ -37,7 +36,7 @@ export function composeForkDivergenceNotice(fork: SessionRecord, sourceSessionId
   return (
     `${FORK_NOTICE_MARKER}\n` +
     `You are a FORK — a divergent copy, not a continuation of the original session. ` +
-    `Your identity is "${ownName}" (${ownIdentity}). ` +
+    `Your identity is ${ownIdentity}. ` +
     `You were forked from session ${sourceSessionId}. ` +
     `${indexClause}\n\n` +
     `SELF-MESSAGE MITIGATION: You will likely perceive this message and the transcript above as coming ` +

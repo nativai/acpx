@@ -49,9 +49,6 @@ import {
 import { persistSessionOwnerOptions } from "../../session/owner-options.js";
 import {
   absolutePath,
-  findClosedSessionsByDirectoryWalk,
-  findGitRepositoryRoot,
-  findSessionByDirectoryWalk,
   isoNow,
   mintSeatRowBestEffort,
   normalizeName,
@@ -66,9 +63,8 @@ import {
   type SeatBrickLink,
   type SeatRecord,
 } from "../../session/persistence.js";
-import type { SessionIndexEntry } from "../../session/persistence/index.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
-import type { SessionEnsureResult, SessionRecord } from "../../types.js";
+import type { SessionRecord } from "../../types.js";
 import { resolveExistingBrickPath } from "./brick-link.js";
 import { DEFAULT_QUEUE_OWNER_TTL_MS } from "./contracts.js";
 import type {
@@ -76,11 +72,9 @@ import type {
   AgentOutputStyleListResult,
   SessionCreateOptions,
   SessionCreateWithClientResult,
-  SessionEnsureOptions,
   SessionListOptions,
   SessionListResult,
 } from "./contracts.js";
-import { setSessionModel } from "./session-control.js";
 
 // brick://5bac5564 Layer B belt inputs — the pin + its provenance from the create
 // options, spread into applyRequestedModelIfAdvertised. Extracted so the resume /
@@ -95,21 +89,6 @@ function modelApplyParamsFromOptions(options: SessionCreateOptions): {
     reasoningEffort: options.sessionOptions?.reasoningEffort,
     modelSource: options.sessionOptions?.modelSource,
   };
-}
-
-// brick://5bac5564 (RE-ENSURE-CLOBBER): a FLAGLESS re-ensure of an EXISTING session
-// must NOT clobber its explicit pin. inheritedSpawnSessionOptions fills `model` with
-// the INHERITED parent model on a flagless re-ensure, so applying it on the reuse
-// branch would overwrite the child's real `--model` pin with the parent's (the
-// general sonnet→opus / opus→fable clobber — the true M1). Return a model to apply
-// ONLY when THIS invocation explicitly requested it (model_source === "explicit");
-// never for an inherited / default / guard-forced value. Inheritance is a CREATE-time
-// concept; a reuse keeps the existing pin verbatim.
-function reuseExplicitModelToApply(options: SessionCreateOptions): string | undefined {
-  if (options.sessionOptions?.modelSource !== "explicit") {
-    return undefined;
-  }
-  return options.sessionOptions?.model;
 }
 
 // brick://5bac5564 Layer B: when the resolution-tier guard rewrote an implicit Fable,
@@ -216,6 +195,23 @@ function refuseSeatJoinOnForkPath(options: SessionCreateOptions): void {
       `for a session forked from ${JSON.stringify(options.forkFromSessionId)}. A forked ` +
       `session is a divergent copy of a transcript; if you want a holder in that seat, ` +
       `create one with \`sessions new --seat\` instead of copying an existing session.`,
+  );
+}
+
+/**
+ * `-s` names a SEAT AT CREATION (D-IDENTITY, brick 61dc1302, AC-ID4). On a join the seat
+ * already exists and already has its name, so the flag has no seat to name: REFUSED, with
+ * the verb that does rename a seat — never accepted and ignored, which would leave the
+ * operator believing they had named something.
+ */
+function refuseSeatNameOnJoin(options: SessionCreateOptions): void {
+  if (options.seatId === undefined || normalizeName(options.seatName) === undefined) {
+    return;
+  }
+  throw new Error(
+    `-s/--name cannot be combined with --seat: ${JSON.stringify(options.seatId)} already has ` +
+      `its name, and -s names a seat only when \`sessions new\` creates one. Rename an ` +
+      `existing seat with \`acpx seats rename\`.`,
   );
 }
 
@@ -486,6 +482,7 @@ async function createSessionRecordWithClient(
   // fired after `client.start()` would leave a spawned adapter behind for a request
   // that was never going to be honoured.
   refuseSeatJoinOnForkPath(options);
+  refuseSeatNameOnJoin(options);
   const joinedSeat = await refuseUnjoinableSeat(options.seatId);
   if (joinedSeat) {
     // F2 fix (brick 3dff714d, DECISIONS.md (b) + AMENDMENT) — reconcile
@@ -629,7 +626,6 @@ async function createSessionRecordWithClient(
     agentName: options.agentName,
     agentCommand: options.agentCommand,
     cwd,
-    name: normalizeName(options.name),
     createdAt: now,
     lastUsedAt: now,
     lastSeq: 0,
@@ -838,7 +834,7 @@ async function createSessionRecordWithClient(
     const minted = await mintSeatRowBestEffort(sessionBaseDir(), {
       seatId: seatFields.seatId,
       holderId: record.acpxRecordId,
-      name: record.name,
+      name: normalizeName(options.seatName),
       createdAt: now,
       // F1 fix (brick 3dff714d, DECISIONS.md) — the SEAT's brick_id is now
       // written at mint time, from the same resolved value the holder's own
@@ -1122,7 +1118,7 @@ function creationSessionContext(options: SessionCreateOptions) {
   const brickPath = brick ? resolveExistingBrickPath(brick) : null;
   return {
     acpxRecordId: "",
-    sessionName: normalizeName(options.name) ?? null,
+    sessionName: normalizeName(options.seatName) ?? null,
     parentSessionId: options.parentSessionId ?? null,
     // The full parent URL (real host) reaches the bridge at session/new AND becomes
     // ACPX_PARENT_SESSION_URL for this spawn. It is also persisted onto the record
@@ -1324,115 +1320,6 @@ export async function listAgentSessions(options: SessionListOptions): Promise<Se
   } finally {
     await client.close();
   }
-}
-
-// brick://16712ece — `closedMatches` is the walk's newest-first list of CLOSED
-// same-scope entries it could not see. Returns the `SessionEnsureResult` slice
-// to spread, or `undefined` when there was nothing to report, so the caller
-// spreads unconditionally and `createdBecauseClosed` is ABSENT (not `undefined`)
-// on the ordinary path.
-function describeClosedMatches(
-  closedMatches: readonly SessionIndexEntry[],
-): Pick<SessionEnsureResult, "createdBecauseClosed"> | undefined {
-  const nearest = closedMatches[0];
-  if (!nearest) {
-    return undefined;
-  }
-  return {
-    createdBecauseClosed: {
-      count: closedMatches.length,
-      nearestRecordId: nearest.acpxRecordId,
-      ...(nearest.name === undefined ? {} : { nearestName: nearest.name }),
-    },
-  };
-}
-
-export async function ensureSession(options: SessionEnsureOptions): Promise<SessionEnsureResult> {
-  const cwd = absolutePath(options.cwd);
-  const gitRoot = findGitRepositoryRoot(cwd);
-  const walkBoundary = options.walkBoundary ?? gitRoot ?? cwd;
-  const existing = await findSessionByDirectoryWalk({
-    agentCommand: options.agentCommand,
-    agentName: options.agentName,
-    cwd,
-    name: options.name,
-    boundary: walkBoundary,
-  });
-  if (existing) {
-    let working = existing;
-    if (options.metadata && Object.keys(options.metadata).length > 0) {
-      working = {
-        ...existing,
-        metadata: { ...existing.metadata, ...options.metadata },
-      };
-      await writeSessionRecord(working);
-    }
-    const requestedModel = reuseExplicitModelToApply(options);
-    if (requestedModel) {
-      // Internal ensure path — must NOT recycle the owner (the recycle flag is
-      // left off). This runs as part of session ensure/spawn, which already
-      // cold-reconnects; recycling here would thrash owners on ordinary prompts.
-      // Owner-recycle is a CLI-verb-only behavior, set by the set-model and
-      // set-effort handlers.
-      const result = await setSessionModel({
-        sessionId: working.acpxRecordId,
-        modelId: requestedModel,
-        mcpServers: options.mcpServers,
-        nonInteractivePermissions: options.nonInteractivePermissions,
-        authCredentials: options.authCredentials,
-        authPolicy: options.authPolicy,
-        terminal: options.terminal,
-        timeoutMs: options.timeoutMs,
-        verbose: options.verbose,
-      });
-      return { record: result.record, created: false };
-    }
-    return {
-      record: working,
-      created: false,
-    };
-  }
-
-  // brick://16712ece — the walk above filters CLOSED entries out, so a closed
-  // same-scope session is invisible here and we are about to create a fresh one
-  // over the top of it. Probe for what it could not see BEFORE creating, so the
-  // caller can say so; creating first would let the new record's own entry
-  // muddy the answer.
-  const closedMatches = await findClosedSessionsByDirectoryWalk({
-    agentCommand: options.agentCommand,
-    agentName: options.agentName,
-    cwd,
-    name: options.name,
-    boundary: walkBoundary,
-  });
-
-  const record = await createSession({
-    agentCommand: options.agentCommand,
-    agentName: options.agentName,
-    cwd,
-    name: options.name,
-    resumeSessionId: options.resumeSessionId,
-    parentSessionId: options.parentSessionId,
-    parentSessionUrl: options.parentSessionUrl,
-    parentSeatId: options.parentSeatId,
-    metadata: options.metadata,
-    mcpServers: options.mcpServers,
-    permissionMode: options.permissionMode,
-    nonInteractivePermissions: options.nonInteractivePermissions,
-    permissionPolicy: options.permissionPolicy,
-    authCredentials: options.authCredentials,
-    authPolicy: options.authPolicy,
-    terminal: options.terminal,
-    timeoutMs: options.timeoutMs,
-    verbose: options.verbose,
-    sessionOptions: options.sessionOptions,
-  });
-
-  return {
-    record,
-    created: true,
-    ...describeClosedMatches(closedMatches),
-  };
 }
 
 export { DEFAULT_QUEUE_OWNER_TTL_MS };

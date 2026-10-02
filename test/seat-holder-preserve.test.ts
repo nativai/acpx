@@ -98,7 +98,6 @@ async function seed(
     agentCommand: "node mock",
     agentName: "claude",
     cwd: path.join(homeDir, "workspace"),
-    name: id,
     ...overrides,
   });
   await writeSessionRecordFile(homeDir, record);
