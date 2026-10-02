@@ -172,6 +172,11 @@ import {
 } from "./session-control-errors.js";
 import { resolveSessionPrimer } from "./session-primer.js";
 import { TerminalManager } from "./terminal-manager.js";
+import {
+  buildTurnContextRequest,
+  hasTurnContextProviders,
+  resolveTurnContext,
+} from "./turn-context.js";
 
 export { buildSpawnCommandOptions };
 export {
@@ -297,16 +302,54 @@ export async function resolveClaudeForkResumeAt(args: {
 
 export type AcpPromptOptions = {
   messageId?: string;
+  /**
+   * Opt in to per-turn context injection (brick 4539b033, `src/acp/turn-context.ts`).
+   *
+   * **Default OFF, and eligibility is DECLARED by the caller rather than inferred here.**
+   * `runPromptTurn` is the only place that sets it, which covers the main sequential queue
+   * turn and the engine runtime turn with one line, and excludes the mid-turn injected
+   * prompt and the `runOnce` one-shot path by not touching them.
+   *
+   * ⚠️ **The mid-turn injected path must NEVER set this.** A steer would then arrive wearing
+   * a "new turn" frame inside a turn that already carried one — double injection within a
+   * single turn, and a content error rather than mere waste.
+   *
+   * Opt-in rather than inference deliberately: inference fails toward *decorating* an
+   * unconsidered path, opt-in fails toward *not* decorating it, and for a mechanism whose
+   * primary risk is unwanted content in a live turn the safe failure direction is not
+   * decorating.
+   */
+  turnContext?: boolean;
 };
 
-function buildPromptRequest(
+/**
+ * ⚠️ **THE INERT PATH MUST BE THE SAME CODE PATH, NOT AN EQUIVALENT ONE.** With
+ * `turnContext === undefined` this returns exactly the object it returned before per-turn
+ * injection existed — same literal, same key order, and `prompt` is the same reference, not
+ * a copy. Inertness is a BYTE-IDENTITY claim against captured literal wire frames, so it has
+ * to hold by construction rather than by inspection: no new key, no re-ordered key, no empty
+ * block, no `_meta`.
+ *
+ * When present, the composed block is **PREPENDED**. That inverts the primer's "append last"
+ * rule and the inversion is principled rather than contradictory: the underlying rule is
+ * *the instruction goes last*. For the primer, the primer is the frame and the human's
+ * append is the instruction; for a per-turn delta the **user's prompt** is the instruction
+ * and the delta is the frame. Same rule, different pair ⇒ frame first, instruction last.
+ * Prepending also keeps the user's own words in the most salient final position and stops the
+ * block reading as "the user also said this".
+ */
+export function buildPromptRequest(
   sessionId: string,
   prompt: PromptInput,
   options: AcpPromptOptions | undefined,
+  turnContext?: string,
 ) {
   return {
     sessionId,
-    prompt,
+    prompt:
+      turnContext === undefined
+        ? prompt
+        : [{ type: "text" as const, text: turnContext }, ...prompt],
     ...(options?.messageId !== undefined ? { messageId: options.messageId } : {}),
   };
 }
@@ -2362,6 +2405,13 @@ export class AcpClient {
   ): Promise<PromptResponse> {
     const connection = this.getConnection();
     const normalizedPrompt = this.normalizePromptForAgent(prompt);
+
+    // `undefined` here means "nothing to inject", decided SYNCHRONOUSLY — so the inert path
+    // never reaches an `await` at all. See {@link maybeResolveTurnContext}.
+    const pendingTurnContext = this.maybeResolveTurnContext(sessionId, options);
+    const composedTurnContext =
+      pendingTurnContext === undefined ? undefined : await pendingTurnContext;
+
     const restoreConsoleError = this.options.suppressSdkConsoleErrors
       ? installSdkConsoleErrorSuppression()
       : undefined;
@@ -2370,7 +2420,7 @@ export class AcpClient {
     try {
       promptPromise = this.runConnectionRequest(() =>
         connection.prompt({
-          ...buildPromptRequest(sessionId, normalizedPrompt, options),
+          ...buildPromptRequest(sessionId, normalizedPrompt, options, composedTurnContext),
         }),
       );
     } catch (error) {
@@ -2392,14 +2442,60 @@ export class AcpClient {
       this.throwPromptPermissionFailureIfPresent(sessionId);
       throw error;
     } finally {
-      restoreConsoleError?.();
-      if (this.activePrompt?.promise === promptPromise) {
-        this.activePrompt = undefined;
-      }
-      this.cancellingSessionIds.delete(sessionId);
-      this.abortAndDropPermissionSignal(sessionId);
-      this.promptPermissionFailures.delete(sessionId);
+      this.settlePromptBookkeeping(sessionId, promptPromise, restoreConsoleError);
     }
+  }
+
+  /**
+   * THE SYNCHRONOUS GUARD for per-turn context injection (`src/acp/turn-context.ts`).
+   *
+   * Returns `undefined` **synchronously** — no promise allocated, no microtask queued — when
+   * the turn is not opted in or there is nothing to inject. That is an implementation
+   * constraint, not a style choice: unconditionally `await`ing a `resolveTurnContext()` that
+   * short-circuits internally would still cost a promise and a microtask tick on EVERY turn
+   * with the registry empty, i.e. in production as shipped. That would both break the
+   * inertness claim and make the latency measurement measure a microtask the claim never
+   * included.
+   *
+   * `agentSpawnEnv`, and **no `process.env` fallback anywhere**: a provider must see the
+   * environment the SESSION's agent process was spawned with, never the spawner's. Before
+   * `start()` has captured it there is no session env, and an empty object is the honest
+   * answer — falling back to acpx's own env is exactly the defect this rule exists to
+   * prevent, and it is silent at runtime.
+   */
+  private maybeResolveTurnContext(
+    sessionId: string,
+    options: AcpPromptOptions | undefined,
+  ): Promise<string | undefined> | undefined {
+    if (options?.turnContext !== true) {
+      return undefined;
+    }
+    const sessionEnv = this.agentSpawnEnv ?? {};
+    if (!hasTurnContextProviders(sessionEnv)) {
+      return undefined;
+    }
+    return resolveTurnContext(
+      buildTurnContextRequest({
+        sessionId,
+        agentCommand: this.options.agentCommand,
+        sessionEnv,
+      }),
+    );
+  }
+
+  /** Per-prompt teardown: restore stderr suppression and drop this turn's bookkeeping. */
+  private settlePromptBookkeeping(
+    sessionId: string,
+    promptPromise: Promise<PromptResponse>,
+    restoreConsoleError: (() => void) | undefined,
+  ): void {
+    restoreConsoleError?.();
+    if (this.activePrompt?.promise === promptPromise) {
+      this.activePrompt = undefined;
+    }
+    this.cancellingSessionIds.delete(sessionId);
+    this.abortAndDropPermissionSignal(sessionId);
+    this.promptPermissionFailures.delete(sessionId);
   }
 
   private normalizePromptForAgent(prompt: PromptInput | string): PromptInput {
