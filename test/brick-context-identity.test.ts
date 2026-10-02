@@ -33,16 +33,17 @@ type ShimEnvRow = {
   ACPX_SEAT_URL: string | null;
 };
 
-/** The id carried by an `ACPX_*_URL` value — a bare uuid or a `?session=` / `?seat=` URL. */
+/**
+ * The id carried by an `ACPX_*_URL` value. STRICT: it must be a real URL, exactly as the acpx-ui brick CLI
+ * demands (`new URL(env.ACPX_SESSION_URL)`, brick/cli-remote.ts). A bare uuid THROWS here — the first
+ * version of this helper fell back to the raw value, which is how a bare-id env passed every row while the
+ * deployed remote CLI rejected it (rc 1, "Invalid URL", no brick block at all).
+ */
 function idOf(value: string | null, param: "session" | "seat"): string | null {
   if (value === null) {
     return null;
   }
-  try {
-    return new URL(value).searchParams.get(param);
-  } catch {
-    return value;
-  }
+  return new URL(value).searchParams.get(param);
 }
 
 async function withShim<T>(
@@ -59,6 +60,7 @@ async function withShim<T>(
     BRICK_SHIM_LOG: argsLog,
     BRICK_SHIM_ENV_LOG: envLog,
     ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh",
+    ACPX_UI_BASE_URL: "https://atrium.example.test",
     // The SPAWNER's identity — what the queue owner's ambient env carries and the child must never inherit.
     ACPX_SESSION_URL: SPAWNER_SESSION_URL,
     ACPX_SEAT_URL: SPAWNER_SEAT_URL,
@@ -190,4 +192,62 @@ test("AcpClient renders the brick block from the SAME seat and session $ACPX_AGE
   } finally {
     await fs.rm(brickDir, { recursive: true, force: true });
   }
+});
+
+test("the env handed to brick survives the REAL remote-mode parse: URL forms, and the CLI exits 0", async () => {
+  await withShim(
+    async ({ envLog }) => {
+      const text = await resolveBrickContext(BRICK_ID, {
+        sessionId: CHILD_SESSION,
+        seatId: CHILD_SEAT,
+      });
+      // The shim exits 1 on a throw from `new URL(...)`, exactly as cli-remote.ts does; that makes
+      // resolveBrickContext return undefined, i.e. NO BRICK BLOCK for the agent.
+      assert.equal(
+        text,
+        "BRICK BLOCK",
+        "brick rejected the env it was given — the agent gets no brick block",
+      );
+      const [row] = await readJsonl<ShimEnvRow>(envLog);
+      const session = new URL(row.ACPX_SESSION_URL ?? "");
+      assert.equal(session.searchParams.get("session"), CHILD_SESSION);
+      const seat = new URL(row.ACPX_SEAT_URL ?? "");
+      assert.equal(seat.searchParams.get("seat"), CHILD_SEAT);
+    },
+    { BRICK_SHIM_REMOTE_PARSE: "1", ACPX_UI_BASE_URL: "https://atrium.example.test" },
+  );
+});
+
+test("the URL forms use acpx's own resolved base URL (the one ACPX_SESSION_URL uses)", async () => {
+  await withShim(
+    async ({ envLog }) => {
+      await resolveBrickContext(BRICK_ID, { sessionId: CHILD_SESSION, seatId: CHILD_SEAT });
+      const [row] = await readJsonl<ShimEnvRow>(envLog);
+      assert.equal(row.ACPX_SESSION_URL, `https://atrium.example.test/?session=${CHILD_SESSION}`);
+      assert.equal(row.ACPX_SEAT_URL, `https://atrium.example.test/?seat=${CHILD_SEAT}`);
+    },
+    { ACPX_UI_BASE_URL: "https://atrium.example.test" },
+  );
+});
+
+test("a session with no seat still parses remotely, with no seat var; the creation spawn passes with neither", async () => {
+  await withShim(
+    async ({ envLog }) => {
+      assert.equal(
+        await resolveBrickContext(BRICK_ID, { sessionId: CHILD_SESSION }),
+        "BRICK BLOCK",
+      );
+      assert.equal(await resolveBrickContext(BRICK_ID, {}), "BRICK BLOCK");
+      const rows = await readJsonl<ShimEnvRow>(envLog);
+      assert.equal(rows.length, 2);
+      assert.equal(
+        new URL(rows[0].ACPX_SESSION_URL ?? "").searchParams.get("session"),
+        CHILD_SESSION,
+      );
+      assert.equal(rows[0].ACPX_SEAT_URL, null);
+      assert.equal(rows[1].ACPX_SESSION_URL, null);
+      assert.equal(rows[1].ACPX_SEAT_URL, null);
+    },
+    { BRICK_SHIM_REMOTE_PARSE: "1", ACPX_UI_BASE_URL: "https://atrium.example.test" },
+  );
 });

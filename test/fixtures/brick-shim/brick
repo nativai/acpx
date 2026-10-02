@@ -27,6 +27,23 @@ if (envLogPath) {
   );
 }
 
+// C7: BRICK_SHIM_REMOTE_PARSE=1 reproduces what the REAL acpx-ui brick CLI does in HTTP/remote mode
+// (brick/cli-remote.ts `dispatchRemoteBrick`): `new URL(env.ACPX_SESSION_URL).searchParams.get("session")`
+// on EVERY verb. A bare uuid throws "Invalid URL" and the CLI exits 1 — which blanks the brick block.
+if (process.env.BRICK_SHIM_REMOTE_PARSE) {
+  try {
+    if (process.env.ACPX_SESSION_URL) {
+      new URL(process.env.ACPX_SESSION_URL).searchParams.get("session");
+    }
+    if (process.env.ACPX_SEAT_URL) {
+      new URL(process.env.ACPX_SEAT_URL).searchParams.get("seat");
+    }
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(1);
+  }
+}
+
 const mode = modeForVerb();
 if (mode === "hang") {
   setTimeout(() => {}, 30_000);
