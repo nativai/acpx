@@ -761,153 +761,242 @@ function reportClosedRegressionBlocked(acpxRecordId: string, mechanism: string):
   // lifetime.
   process.stderr.write(
     `[acpx] 🛑 refused a closed:true->false write for session ${acpxRecordId} — the ` +
-      `in-memory record carried no fresh reopen warrant (${mechanism}). The disk's ` +
-      `closed:true was restored instead of being overwritten, and the rest of this ` +
-      `write still landed. If this session was genuinely meant to reopen, use ` +
+      `in-memory record carried no valid, fresh reopen warrant (${mechanism}). The ` +
+      `disk's closed:true was restored instead of being overwritten, and the rest of ` +
+      `this write still landed. If this session was genuinely meant to reopen, use ` +
       `'acpx sessions reopen ${acpxRecordId}' (brick 1bfb95ed deliverable 3).\n`,
   );
 }
 
+// EXACTLY the shape `isoNow()` (a few hundred lines below) produces —
+// `new Date().toISOString()`. Round II of this guard (Lane C / test-engineer,
+// brick 1bfb95ed) measured that an UNVALIDATED warrant string sorts as
+// "newer than any real timestamp" whenever it starts with a letter ('z' >
+// any digit, lexicographically) — so a stale in-memory copy carrying garbage
+// in `reopenedAt` defeated the first version of this check outright. A
+// non-UTC offset (`+02:00`) is a second, subtler failure of the same root
+// cause: it is a VALID timestamp but sorts WRONG against its own UTC
+// equivalent as a bare string. Requiring the exact `toISOString()` shape
+// removes both classes at once, not merely the specific strings that
+// exposed them.
+const WARRANT_FORMAT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
 /**
- * THE MONOTONICITY GUARD (brick 1bfb95ed deliverable 3). A write may clear
- * `closed:true` only when the record carries a WARRANT RECORDED ON THE
- * RECORD ITSELF — `reopenedAt`, newer than the `closedAt` it would be
- * clearing — never merely because some caller intended it. An exemption
- * keyed on WHICH VERB called this is not an exemption at all: Lane A's
- * forensics (brick 1bfb95ed FINDINGS.md §1f) found the specimen's own write
- * went through the sanctioned reopen ROUTE, so a verb-keyed guard would not
- * have caught it. This guard does not try to — see the brick for why that is
- * a defensible, disclosed scope limit, not an oversight.
+ * A validated warrant: present, exactly `toISOString()`-shaped, and not
+ * claiming a moment in the future. The future-bound guards against
+ * ACCIDENTAL clock skew in a writer-supplied timestamp, not a determined
+ * writer — `now` is computed by this same process evaluating the warrant, so
+ * a writer willing to lie about `reopenedAt` can lie about its own clock
+ * identically. This is a type GUARD, not just a boolean check, so a caller
+ * that narrows on it gets `reopenedAt: string` back without re-asserting it.
+ */
+function isValidBoundedWarrant(reopenedAt: string | undefined): reopenedAt is string {
+  return reopenedAt !== undefined && WARRANT_FORMAT_RE.test(reopenedAt) && reopenedAt <= isoNow();
+}
+
+/**
+ * THE warrant check, against a PRE-WRITE disk basis.
  *
- * What THIS guard catches: `applyPersistedLifecycleForWrite` already
- * restores `closed` correctly whenever the preserve-read SUCCEEDS — the gap
- * is only when that read fails (FINDINGS.md §1d: `readPersistedLifecycle`
- * swallows a transient read/parse failure into `undefined`, and a
- * `preserveLifecycle:true` write then silently proceeds with whatever
- * `closed` happens to be in memory) and when the write is PRIVILEGED
- * (`preserveLifecycle:false`, which skips `applyPersistedLifecycleForWrite`
- * entirely by design — `closeSession`/`reopenSession` want to flip `closed`
- * deliberately, but nothing before this guard existed to tell a deliberate
- * flip from an accidental one at that seam).
+ * `basis` is `undefined` only when disk could not be stat'd AT ALL (not even
+ * its mtime) — the totally-blind case, where a validated/bounded warrant is
+ * the best authorization available because there is nothing else to compare
+ * it against. Otherwise `basis` carries `closedAt` (the primary basis, when
+ * present) or `mtimeIso` (the fallback, when `closed_at` is absent — Lane
+ * C's A5 finding) — `diskClosedAt ?? mtimeIso` picks whichever applies.
+ *
+ * Strict `>`: an EXACT match is refused, not accepted — equality is not
+ * evidence of a NEWER authorization (ruled explicitly; granularity is not a
+ * concern on this filesystem — mtimes measured sub-second).
+ */
+function warrantAuthorizesReopen(
+  reopenedAt: string | undefined,
+  basis: { diskClosedAt: string | undefined; mtimeIso: string } | undefined,
+): boolean {
+  if (!isValidBoundedWarrant(reopenedAt)) {
+    return false;
+  }
+  if (basis === undefined) {
+    return true;
+  }
+  return reopenedAt > (basis.diskClosedAt ?? basis.mtimeIso);
+}
+
+type RecordClosedStateWithMtime =
+  | {
+      contentReadable: true;
+      closed: RawRecordFieldState;
+      closedAt: RawRecordFieldState;
+      mtimeMs: number;
+    }
+  | { contentReadable: false; mtimeMs: number };
+
+/**
+ * Content AND mtime, read in the SAME STEP so they cannot drift apart — a
+ * later edit that moves the `stat` to a different line, or splits it into a
+ * separate function, silently reintroduces the exact race this closes (Lane
+ * C: `reopenSession` stamps its warrant and THEN writes, so stat-ing the file
+ * AFTER a write always trivially passes; the comparison basis must be the
+ * disk state as it stood BEFORE this write, which is what calling this
+ * ahead of the actual `fs.writeFile`/rename gives for free).
+ *
+ * Used ONLY by the monotonicity guard below. Deliverable (4)'s own
+ * post-close read-back keeps using {@link readRawRecordClosedState}
+ * unchanged — this is a sibling, not a replacement.
+ *
+ * `contentReadable:false` on anything short of ENOENT (a schema-invalid body
+ * — Lane A's R2 — a truncated read racing a concurrent rename, EACCES,
+ * EISDIR, …) rather than throwing: `stat` succeeds in every one of those
+ * cases (measured), so the guard still has a usable pre-write mtime even
+ * when the content itself cannot be trusted. ENOENT is the one failure this
+ * lets propagate — the guard's own legitimately-new-record case.
+ *
+ * ⚠️ A DANGLING SYMLINK ALSO GIVES ENOENT HERE (`fs.stat` follows symlinks by
+ * default), so it reads as legitimately-new rather than unreadable. Measured
+ * dead on this store (0 symlinks found; a freshly created one WAS found by
+ * the identical check, so the probe discriminates) — named so a later reader
+ * does not have to rediscover it before trusting this function near one.
+ */
+async function readRecordClosedStateWithMtime(
+  acpxRecordId: string,
+): Promise<RecordClosedStateWithMtime> {
+  const filePath = sessionFilePath(acpxRecordId);
+  // `stat` FIRST, unconditionally, and let ENOENT propagate from HERE — never
+  // reorder this below the content read, which would attempt to parse a
+  // nonexistent file first and throw a different, misleading error instead.
+  const mtimeMs = (await fs.stat(filePath)).mtimeMs;
+  try {
+    const raw = JSON.parse(await fs.readFile(filePath, "utf8")) as Record<string, unknown>;
+    return {
+      contentReadable: true,
+      closed: Object.hasOwn(raw, "closed")
+        ? { present: true, value: raw.closed }
+        : { present: false },
+      closedAt: Object.hasOwn(raw, "closed_at")
+        ? { present: true, value: raw.closed_at }
+        : { present: false },
+      mtimeMs,
+    };
+  } catch {
+    return { contentReadable: false, mtimeMs };
+  }
+}
+
+/**
+ * THE MONOTONICITY GUARD (brick 1bfb95ed deliverable 3). Despite the name,
+ * READ THIS FIRST: on the measured evidence (Lane C / test-engineer, round
+ * II), the FORMAT-VALIDATION half ({@link WARRANT_FORMAT_RE},
+ * {@link isValidBoundedWarrant}) is doing more work than the ORDERING half.
+ * The live defects that actually reached disk were malformed input (a bare
+ * string beating any timestamp lexicographically; a non-UTC offset sorting
+ * wrong against its own UTC equivalent), not mis-ordered input — a reader
+ * who assumes "monotonicity" means "just a comparison" will reach for the
+ * wrong half when this ever needs touching again.
+ *
+ * A write may clear `closed:true` only when the record carries a WARRANT
+ * RECORDED ON THE RECORD ITSELF — `reopenedAt`, validated (see
+ * {@link isValidBoundedWarrant}) and strictly newer than a pre-write disk
+ * basis — never merely because some caller intended it. An exemption keyed
+ * on WHICH VERB called this is not an exemption at all: Lane A's forensics
+ * (brick 1bfb95ed FINDINGS.md §1f)
+ * found the specimen's own write went through the sanctioned reopen ROUTE,
+ * so a verb-keyed guard would not have caught it. This guard does not try
+ * to — see the brick for why that is a defensible, disclosed scope limit,
+ * not an oversight.
+ *
+ * 🛑 ROUND II (test-engineer / Lane C): the first version of this guard
+ * compared an UNVALIDATED `reopenedAt` against `closed_at` ALONE, and was
+ * silently defeated three ways — see {@link WARRANT_FORMAT_RE} and
+ * {@link warrantAuthorizesReopen}'s docs for the mechanisms and the fix.
  *
  * 🛑 CALLED UNCONDITIONALLY, OUTSIDE THE `preserveLifecycle` BRANCH — same
  * placement, same reason, as `preserveParentLinkageForPersist` /
  * `preserveSeatHolderFieldsForPersist` above: the clobberer this closes is
  * reachable from the PRIVILEGED path, which bypasses that branch by design.
  *
- * Reads `persistedLifecycle` FIRST (the read `writeSessionRecordInternal`
- * already performed — no extra I/O on the common path, where that read
- * succeeded and `applyPersistedLifecycleForWrite` already did the right
- * thing). Only on `persistedLifecycle === undefined` — meaning EITHER the
- * record is legitimately new (nothing to protect) OR the read failed in a
- * way that could be hiding a real `closed:true` (the dangerous case) — does
- * it fall back to {@link readRawRecordClosedState}, deliverable (4)'s raw
- * reader, which reads `closed`/`closed_at` directly off the bytes and so
- * SURVIVES exactly the failure Lane A's R2 reproduction induces: a
- * schema-invalid record (e.g. a non-string `metadata` value) that makes
- * `parseSessionRecord` — and therefore `readPersistedLifecycle` — return
- * nothing, while the raw `closed:true` is still sitting right there in the
- * bytes.
- *
  * On refusal: forces `record.closed`/`record.closedAt` back to what the disk
  * genuinely holds (or, when disk itself is unreadable, to `true` with
  * whatever `closedAt` is already in memory — there is no prior value to
- * restore) and reports loudly via {@link reportClosedRegressionBlocked}. It
- * does NOT throw: the rest of the record this write carries is real,
- * unrelated state (per the sub-HoD's ruling) — discarding the whole write to
- * punish one field would be strictly worse than correcting that field alone.
+ * restore) and reports loudly via {@link reportClosedRegressionBlocked},
+ * EVERY refusal path, including the two that were silent in round I. It does
+ * NOT throw: the rest of the record this write carries is real, unrelated
+ * state (per the sub-HoD's ruling) — discarding the whole write to punish
+ * one field would be strictly worse than correcting that field alone.
  */
-async function enforceClosedMonotonicityForWrite(
-  record: SessionRecord,
-  persistedLifecycle: PersistedSessionLifecycle | undefined,
-): Promise<void> {
+async function enforceClosedMonotonicityForWrite(record: SessionRecord): Promise<void> {
   if (record.closed !== false) {
     return;
   }
-  if (persistedLifecycle !== undefined) {
-    enforceClosedMonotonicityFromPersisted(record, persistedLifecycle);
-    return;
-  }
-  await enforceClosedMonotonicityFromRawFallback(record);
-}
 
-// The common case: the ordinary preserve-read already succeeded, so the truth
-// is right here — no extra I/O.
-function enforceClosedMonotonicityFromPersisted(
-  record: SessionRecord,
-  persistedLifecycle: PersistedSessionLifecycle,
-): void {
-  if (persistedLifecycle.closed !== true) {
-    return;
-  }
-  if (warrantCoversClosedAt(record.reopenedAt, persistedLifecycle.closedAt)) {
-    return;
-  }
-  record.closed = true;
-  record.closedAt = persistedLifecycle.closedAt;
-  reportClosedRegressionBlocked(record.acpxRecordId, "disk read succeeded");
-}
-
-// The ordinary read failed (persistedLifecycle undefined) — fall back to the
-// raw reader, which survives a schema-validation failure the ordinary read
-// cannot (Lane A's R2: a non-string `metadata` value).
-async function enforceClosedMonotonicityFromRawFallback(record: SessionRecord): Promise<void> {
-  let raw: RawRecordClosedState;
+  let state: RecordClosedStateWithMtime;
   try {
-    raw = await readRawRecordClosedState(record.acpxRecordId);
+    state = await readRecordClosedStateWithMtime(record.acpxRecordId);
   } catch (error) {
-    handleUnreadableRecordDuringMonotonicityCheck(record, error);
+    handleUnstattableRecordDuringMonotonicityCheck(record, error);
     return;
   }
-
-  if (!raw.closed.present || raw.closed.value !== true) {
-    return;
-  }
-  const diskClosedAt =
-    raw.closedAt.present && typeof raw.closedAt.value === "string" ? raw.closedAt.value : undefined;
-  if (warrantCoversClosedAt(record.reopenedAt, diskClosedAt)) {
-    return;
-  }
-  record.closed = true;
-  record.closedAt = diskClosedAt;
-  reportClosedRegressionBlocked(record.acpxRecordId, "schema-invalid record, raw read");
+  applyMonotonicityVerdict(record, state);
 }
 
-// Split out of `enforceClosedMonotonicityFromRawFallback` to keep that
-// function's own complexity under the lint ceiling — same tactic as
-// `applyCloseExitCode` in command-handlers.ts (deliverable 4).
-function handleUnreadableRecordDuringMonotonicityCheck(
+// Split out of `enforceClosedMonotonicityForWrite` to keep that function's
+// own complexity under the lint ceiling — same tactic as `applyCloseExitCode`
+// in command-handlers.ts (deliverable 4).
+function handleUnstattableRecordDuringMonotonicityCheck(
   record: SessionRecord,
   error: unknown,
 ): void {
   if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-    // Legitimately no record yet (a fresh session being created) — nothing
-    // to protect against.
-    return;
+    return; // legitimately no record yet (a fresh session being created)
   }
-  // The file exists but could not be read/parsed at all (EACCES, a truncated
-  // read racing a concurrent rename, …) — we cannot verify whether it
-  // currently holds `closed:true`. Fail closed: without a warrant, refuse the
-  // regression defensively. There is no prior `closedAt` to restore here —
-  // the read that would have supplied it is exactly what failed.
-  if (record.reopenedAt === undefined) {
+  // Cannot even stat the file — the totally-blind case. No basis to compare
+  // against at all; a validated, non-future warrant is the only thing that
+  // can authorize a regression here.
+  if (!warrantAuthorizesReopen(record.reopenedAt, undefined)) {
     record.closed = true;
-    reportClosedRegressionBlocked(record.acpxRecordId, "disk unreadable");
+    reportClosedRegressionBlocked(record.acpxRecordId, "disk unreadable (cannot stat)");
   }
 }
 
-/** The warrant check: present, and strictly newer than the `closedAt` it
- * would be clearing (or disk carries no `closedAt` at all to be newer
- * than). ISO-8601 string comparison — the same idiom `updatedAt` already
- * uses a few lines above for monotonic ordering. */
-function warrantCoversClosedAt(
-  reopenedAt: string | undefined,
-  diskClosedAt: string | undefined,
-): boolean {
-  if (reopenedAt === undefined) {
-    return false;
+// The stat succeeded (ENOENT already handled by the caller) — decide from
+// whatever content state came with it.
+// Content unreadable (schema-invalid, truncated, …) but stat succeeded — we
+// cannot PROVE disk is not `closed:true`, so treat it as if it were (the
+// conservative, fail-closed read). Content readable but genuinely not
+// `closed:true` returns `undefined` — nothing for the caller to protect
+// against either way.
+function diskClosedAtOrAssumedClosed(
+  state: RecordClosedStateWithMtime,
+): { closedAt: string | undefined } | undefined {
+  if (!state.contentReadable) {
+    return { closedAt: undefined };
   }
-  return diskClosedAt === undefined || reopenedAt > diskClosedAt;
+  if (!state.closed.present || state.closed.value !== true) {
+    return undefined;
+  }
+  const closedAt =
+    state.closedAt.present && typeof state.closedAt.value === "string"
+      ? state.closedAt.value
+      : undefined;
+  return { closedAt };
+}
+
+function applyMonotonicityVerdict(record: SessionRecord, state: RecordClosedStateWithMtime): void {
+  const diskState = diskClosedAtOrAssumedClosed(state);
+  if (diskState === undefined) {
+    return;
+  }
+  const basis = {
+    diskClosedAt: diskState.closedAt,
+    mtimeIso: new Date(state.mtimeMs).toISOString(),
+  };
+  if (warrantAuthorizesReopen(record.reopenedAt, basis)) {
+    return;
+  }
+  record.closed = true;
+  record.closedAt = diskState.closedAt;
+  reportClosedRegressionBlocked(
+    record.acpxRecordId,
+    state.contentReadable ? "no valid warrant" : "content unreadable, no valid warrant",
+  );
 }
 
 /**
@@ -1203,11 +1292,12 @@ async function writeSessionRecordInternal(
       // 🛑 THE MONOTONICITY GUARD (brick 1bfb95ed deliverable 3) — UNCONDITIONAL,
       // same placement/reason as the two preserves above: the clobberer it closes
       // is reachable from the PRIVILEGED path, which bypasses `preserveLifecycle`
-      // by design. `freshPersisted`, not `persistedLifecycle`: when a caller
-      // supplied a snapshot (the queue-owner's checkpoint — exactly §1d's path),
-      // `freshPersisted` is the RE-READ, strictly more current than what that
-      // caller was holding.
-      await enforceClosedMonotonicityForWrite(record, freshPersisted);
+      // by design. Does its OWN read+stat (round II, Lane C) rather than reusing
+      // `persistedLifecycle`/`freshPersisted` — the PRE-WRITE mtime it needs for
+      // the no-`closed_at` case has to come from a read taken in the same step as
+      // the content, immediately before THIS write, not from an earlier read this
+      // function's callers may have taken for an unrelated purpose.
+      await enforceClosedMonotonicityForWrite(record);
 
       const sessionDir = sessionBaseDir();
       const logPath = messagesLogPath(sessionDir, record.acpxRecordId);
