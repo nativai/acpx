@@ -42,6 +42,22 @@ export const SESSION_CLOSED_UNDELIVERED_MESSAGE =
 export const ABSORBED_TURN_NEVER_ENDED_MESSAGE =
   "delivery outcome unknown — the message may have been processed";
 
+// 71fdcaf2 (S5.4) — the OWNER-witnessed terminal for a delivery whose turn a session CLOSE cancelled. It is
+// written when a delivery's turn is CANCELLED while this owner is draining for a session close: the message reached
+// the agent, the turn never settled, and the sender must be told "outcome unknown — do not resend". Before this it
+// ended a code-less `cancelled`, and acpx-ui's sender notice fires only on `failed` + a code.
+//
+// ⚠️ A DISTINCT CODE FROM acpx-ui's `SESSION_CLOSED_ACCEPTED_UNSETTLED`, ON PURPOSE (DESIGN corollary C-3): that
+// one is what acpx-ui INFERS for an owner that died without writing a terminal; this one is what the owner
+// WITNESSED. They must stay separable by code, forever, or the residual-rate metric (DESIGN §5.3) cannot tell
+// "the system that lost it said so" from "we guessed afterwards". acpx-ui classifies both identically.
+// Contains the lower-case substring `session closed` (acpx-ui's pre-code backstop).
+export const SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE = "SESSION_CLOSED_TURN_CANCELLED";
+// ONE line on purpose: test/delivery-contract-single-source.test.ts (T11c) finds a contracted message by a verbatim
+// substring, and says itself that it cannot see one reassembled by concatenation.
+export const SESSION_CLOSED_TURN_CANCELLED_MESSAGE =
+  "session closed while the accepted turn was running — the turn was cancelled; outcome unknown, the message may have been processed";
+
 // Why the owner is writing an exit terminal. `session-close` is reachable only
 // through the drain verb, which carries `reason:'session-close'`; every other
 // death — including the signal path — is `owner-exit`.

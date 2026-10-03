@@ -273,6 +273,7 @@ async function drawOrdinalAndPointAtSuccessor(
   seatId: string,
   expectedPredecessorId: string | null,
   successorId: string,
+  keptOrdinal: number | undefined,
 ): Promise<number> {
   return await withSeatStoreWrite(sessionBaseDir(), (store) => {
     // Read FRESH inside the hold — never a value captured in phase 0. A
@@ -299,8 +300,16 @@ async function drawOrdinalAndPointAtSuccessor(
         `seat ${seatId} was closed at ${row.closedAt} while this activation was running.`,
       );
     }
-    const ordinal = row.nextOrdinal;
+    // 🔑 AC6 (brick e829327e) — AN ORDINAL IS A LABEL, ASSIGNED ONCE, NEVER RENUMBERED. A successor that
+    // already carries one is a FORMER holder being rolled back to: it keeps its number and the counter does
+    // not move (re-drawing turned #2 into #4 and left "#2" naming no one, under journal lines and stamps
+    // that already said "#2"). Only a holder with no ordinal yet — a NEW one — takes `next_ordinal`.
     const seats = new Map(store.seats);
+    if (keptOrdinal !== undefined) {
+      seats.set(seatId, { ...row, activeHolderId: successorId });
+      return { mutation: { kind: "write", seats }, result: keptOrdinal };
+    }
+    const ordinal = row.nextOrdinal;
     seats.set(seatId, { ...row, nextOrdinal: ordinal + 1, activeHolderId: successorId });
     return { mutation: { kind: "write", seats }, result: ordinal };
   });
@@ -625,6 +634,7 @@ async function runFreshActivation(
       seat.seatId,
       predecessor?.acpxRecordId ?? null,
       successor.acpxRecordId,
+      successor.holderOrdinal,
     );
     // PHASE 3 — activate the successor.
     await writeHolderMirror(successor, { holderActive: true, holderOrdinal: ordinal });

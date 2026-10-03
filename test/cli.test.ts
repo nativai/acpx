@@ -24,6 +24,7 @@ import {
   parseMaxTurns,
   parseTtlSeconds,
 } from "../src/cli.js";
+import { drainQueueOwnerForSession, tryCloseSessionOnRunningOwner } from "../src/cli/queue/ipc.js";
 import { FORK_NOTICE_MARKER } from "../src/cli/session/fork-handoff.js";
 import { transcriptJsonlPath } from "../src/config/subscription-transcript.js";
 import { DEFAULT_CODEX_MODEL } from "../src/session/default-model.js";
@@ -3137,6 +3138,210 @@ test("raw metadata brick is record-driven for stamp/context; set-metadata valida
         ["context", BRICK_X, "--session", noBrickId, "--format", "inject"],
       ],
     );
+  });
+});
+
+// Practical-tests pass 1, brick 71fdcaf2 (S5.4) — a delivery whose turn is CANCELLED BY A SESSION CLOSE used to end
+// `cancelled` with NO code, and acpx-ui's sender notice fires only on `failed` + a code, so the sender was never told.
+// The owner knows it is closing for the session (the drain verb flagged it), so the terminal it writes for a delivery
+// the close killed is `failed / SESSION_CLOSED_TURN_CANCELLED` — outcome unknown, do not resend. A cancel with NO
+// close (the Stop button) is a different fact and must stay `cancelled`.
+async function deliveryTerminalFor(
+  homeDir: string,
+  id: string,
+  messageId: string,
+): Promise<
+  { phase?: string; stopReason?: string | null; error?: { detailCode?: string } } | undefined
+> {
+  const stream = path.join(homeDir, ".acpx", "sessions", `${encodeURIComponent(id)}.stream.ndjson`);
+  const raw = await fs.readFile(stream, "utf8").catch(() => "");
+  const terminals = raw
+    .split("\n")
+    .filter((line) => line.includes('"acpx/delivery"') && line.includes(messageId))
+    .map((line) => (JSON.parse(line) as { params: { phase?: string } }).params)
+    .filter((params) => params.phase !== "accepted" && params.phase !== "queued");
+  return terminals.at(-1) as
+    | { phase?: string; stopReason?: string | null; error?: { detailCode?: string } }
+    | undefined;
+}
+
+async function startSleepingDelivery(
+  homeDir: string,
+  cwd: string,
+  id: string,
+  messageId: string,
+  operationLog: string,
+): Promise<void> {
+  const ownerEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: homeDir,
+    ACPX_STATE_HOME: homeDir,
+    ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh",
+  };
+  for (const key of ["ACPX_SESSION_URL", "ACPX_SESSION_NAME", "ACPX_BRICK", "ACPX_BRICK_PATH"]) {
+    delete ownerEnv[key];
+  }
+  const blocker = spawn(
+    process.execPath,
+    [
+      CLI_PATH,
+      "--cwd",
+      cwd,
+      "--format",
+      "quiet",
+      "codex",
+      "prompt",
+      "--session-id",
+      id,
+      "--message-id",
+      messageId,
+      "sleep 60000",
+    ],
+    { env: ownerEnv, stdio: ["ignore", "ignore", "ignore"] },
+  );
+  blocker.unref();
+  await waitFor(async () => {
+    const operations = await readMockOperations(operationLog).catch(() => []);
+    return operations.some(
+      (entry) => entry.method === "session/prompt" && entry.text === "sleep 60000",
+    )
+      ? true
+      : null;
+  }, 15_000);
+  // the delivery must be ACCEPTED before the close, or this measures a different state
+  await waitFor(async () => {
+    const stream = path.join(
+      homeDir,
+      ".acpx",
+      "sessions",
+      `${encodeURIComponent(id)}.stream.ndjson`,
+    );
+    const raw = await fs.readFile(stream, "utf8").catch(() => "");
+    return raw.includes(messageId) && raw.includes('"phase":"accepted"') ? true : null;
+  }, 15_000);
+}
+
+async function freshSleepingTarget(
+  homeDir: string,
+  messageId: string,
+): Promise<{ cwd: string; id: string; operationLog: string }> {
+  const cwd = path.join(homeDir, "workspace");
+  const operationLog = path.join(homeDir, "codex-acp-ops.jsonl");
+  await fs.mkdir(cwd, { recursive: true });
+  await writeCodexAgentConfig(homeDir, mockCodexCommand(operationLog, "--close-cancels-prompt"));
+  const created = await runCli(
+    [
+      "--cwd",
+      cwd,
+      "--format",
+      "json",
+      "codex",
+      "sessions",
+      "new",
+      "--name",
+      "close-cancelled-target",
+    ],
+    homeDir,
+    { env: { ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh" } },
+  );
+  assert.equal(created.code, 0, created.stderr);
+  const id = String((JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId);
+  await startSleepingDelivery(homeDir, cwd, id, messageId, operationLog);
+  return { cwd, id, operationLog };
+}
+
+test("a delivery whose turn a session CLOSE cancels ends failed/SESSION_CLOSED_TURN_CANCELLED, not cancelled (71fdcaf2)", async () => {
+  await withTempHome(async (homeDir) => {
+    const messageId = "0a1b2c3d-1111-4222-8333-444455556666";
+    const { id } = await freshSleepingTarget(homeDir, messageId);
+    // The close's TWO owner-facing steps, driven in-process against the live owner and WITHOUT the final
+    // SIGTERM that `sessions close` follows them with: that kill races the owner's own terminal write (the
+    // delivery then has NO terminal and acpx-ui's closed-session fallback mints the same code), so a test through
+    // the whole verb could not pin which writer won. Here the owner survives, so the terminal is the OWNER's.
+    const previousState = process.env.ACPX_STATE_HOME;
+    process.env.ACPX_STATE_HOME = homeDir;
+    try {
+      const drain = await drainQueueOwnerForSession({
+        sessionId: id,
+        reason: "session-close",
+        timeoutMs: 200,
+      });
+      assert.ok(drain, "the owner did not answer the drain — nothing measured");
+      assert.equal(await tryCloseSessionOnRunningOwner({ sessionId: id, timeoutMs: 5_000 }), true);
+    } finally {
+      if (previousState === undefined) {
+        delete process.env.ACPX_STATE_HOME;
+      } else {
+        process.env.ACPX_STATE_HOME = previousState;
+      }
+    }
+    const terminal = await waitFor(
+      async () => (await deliveryTerminalFor(homeDir, id, messageId)) ?? null,
+      15_000,
+    );
+    assert.equal(
+      terminal.phase,
+      "failed",
+      `the close-cancelled delivery ended ${String(terminal.phase)}`,
+    );
+    assert.equal(terminal.error?.detailCode, "SESSION_CLOSED_TURN_CANCELLED");
+  });
+});
+
+test("a CANCEL with no close still ends the delivery cancelled — only a close earns the code (71fdcaf2 control)", async () => {
+  await withTempHome(async (homeDir) => {
+    const messageId = "9f8e7d6c-1111-4222-8333-444455556666";
+    const { cwd, id } = await freshSleepingTarget(homeDir, messageId);
+    const cancelled = await runCli(["--cwd", cwd, "codex", "cancel", "--session-id", id], homeDir, {
+      env: { ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh" },
+    });
+    assert.equal(cancelled.code, 0, cancelled.stderr);
+    const terminal = await waitFor(
+      async () => (await deliveryTerminalFor(homeDir, id, messageId)) ?? null,
+      15_000,
+    );
+    assert.equal(terminal.phase, "cancelled");
+    assert.equal(terminal.error?.detailCode ?? "", "");
+  });
+});
+
+// Practical-tests pass 1, brick eb8b1fa3 — the REAL-TURN proof that the holder's own ordinal reaches the
+// adapter's environment through the queue-owner leg (`sessionContextFromRecord`). The record's holder_ordinal is
+// set to 2 so the assertion cannot be satisfied by a default of 1: it is the HANDOVER shape (B is holder #2).
+test("a seated holder's adapter env carries its own ACPX_SEAT_ORDINAL beside the seat name (eb8b1fa3)", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const envDumpFile = path.join(homeDir, "env-dump.json");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(
+      homeDir,
+      `${MOCK_AGENT_COMMAND} --env-dump-file ${JSON.stringify(envDumpFile)}`,
+    );
+    const env = { ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh" };
+    const created = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "new", "--name", "ordinal-probe"],
+      homeDir,
+      { env },
+    );
+    assert.equal(created.code, 0, created.stderr);
+    const id = String(
+      (JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const recordFile = sessionFilePath(homeDir, id);
+    const record = JSON.parse(await fs.readFile(recordFile, "utf8")) as Record<string, unknown>;
+    assert.equal(typeof record.seat_id, "string", "the session is not seated — nothing measured");
+    record.holder_ordinal = 2;
+    await fs.writeFile(recordFile, JSON.stringify(record), "utf8");
+
+    const prompted = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "prompt", "--session-id", id, "after handover"],
+      homeDir,
+      { env, timeoutMs: 60_000 },
+    );
+    assert.equal(prompted.code, 0, prompted.stderr);
+    const dump = JSON.parse(await fs.readFile(envDumpFile, "utf8")) as Record<string, string>;
+    assert.equal(dump.ACPX_SESSION_NAME, "ordinal-probe");
+    assert.equal(dump.ACPX_SEAT_ORDINAL, "2");
   });
 });
 

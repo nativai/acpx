@@ -374,6 +374,8 @@ export type AcpClientOptions = {
     seatId?: string | null;
     /** Mirrors AgentSessionContext.parentSeatId in auth-env.ts. */
     parentSeatId?: string | null;
+    /** eb8b1fa3 — the holder's own ordinal; mirrors AgentSessionContext.seatOrdinal in auth-env.ts. */
+    seatOrdinal?: number | null;
   };
   sessionOptions?: {
     model?: string;

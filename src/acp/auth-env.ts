@@ -560,6 +560,13 @@ export type AgentSessionContext = {
    * is only ever populated from a SAME-BOX parent's own record.
    */
   parentSeatId?: string | null;
+  /**
+   * The holder's OWN display ordinal in its seat (`record.holderOrdinal`) — exported as
+   * `ACPX_SEAT_ORDINAL`. `ACPX_SESSION_NAME` is the SEAT's name (D-IDENTITY), the same for every
+   * holder, so this is the only fact in the environment that says WHICH holder an agent is: the
+   * brick CLI composes its default journal author from it (`<seat> #<ordinal> (session:<id8>)`).
+   */
+  seatOrdinal?: number | null;
 };
 
 /**
@@ -627,6 +634,9 @@ function buildAgentEnvironment(
   // of the feature working.
   delete env.ACPX_SEAT_URL;
   delete env.ACPX_PARENT_SEAT_URL;
+  // eb8b1fa3 — the holder's own ordinal is session identity like the two above: an inherited value would
+  // label a child's journal lines with its PARENT's holder number. Re-set below from THIS spawn's context.
+  delete env.ACPX_SEAT_ORDINAL;
   // brick c2df657e — the OpenRouter sticky-routing key the seeded pi extension
   // reads (PI_ROUTING_EXTENSION_CODE). Session identity, same reasoning as
   // ACPX_SESSION_URL: a stale value would pin another session's provider cache
@@ -877,6 +887,18 @@ function buildAgentEnvironment(
     if (trimmedSeat.length > 0) {
       env.ACPX_SEAT_URL = `${baseUrl}/?seat=${trimmedSeat}`;
     }
+  }
+  // eb8b1fa3 (S4.5/AC5) — the holder's OWN ordinal, beside ACPX_SESSION_NAME (the SEAT's name, the same for
+  // every holder). Together with the session id they let the brick CLI attribute a journal line to
+  // `<seat> #<ordinal> (session:<id8>)` with no schema change. No base URL needed: it composes nothing.
+  // Ordinal 0 is a valid value, so test the number, not its truthiness.
+  if (
+    sessionContext &&
+    typeof sessionContext.seatOrdinal === "number" &&
+    Number.isInteger(sessionContext.seatOrdinal) &&
+    sessionContext.seatOrdinal >= 0
+  ) {
+    env.ACPX_SEAT_ORDINAL = String(sessionContext.seatOrdinal);
   }
   // brick c2df657e — hand the RECORD id to the adapter on its own, WITHOUT the
   // ACPX_SESSION_URL gate: the pi sticky-routing extension needs the stable key

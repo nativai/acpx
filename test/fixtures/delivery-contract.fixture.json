@@ -46,6 +46,18 @@
       "resendSafe": false,
       "acpxUiDefinitiveGiveUp": false,
       "requiredSubstringLowercased": null
+    },
+    {
+      "$comment": "A delivery whose turn a session CLOSE cancelled (71fdcaf2, S5.4). The message reached the agent and the turn never settled, so the outcome is unknown: the sender is notified (outcome-unknown wording, never 'resend'). Owner-WITNESSED, hence a code distinct from acpx-ui's inferred SESSION_CLOSED_ACCEPTED_UNSETTLED (DESIGN corollary C-3). Definitive by code AND by the substring backstop.",
+      "detailCode": "SESSION_CLOSED_TURN_CANCELLED",
+      "message": "session closed while the accepted turn was running — the turn was cancelled; outcome unknown, the message may have been processed",
+      "phase": "failed",
+      "reachedModel": "yes",
+      "retryable": false,
+      "notifiesSender": true,
+      "resendSafe": false,
+      "acpxUiDefinitiveGiveUp": true,
+      "requiredSubstringLowercased": "session closed"
     }
   ]
 }

@@ -34,6 +34,7 @@ import {
   type QueueOwnerMessage,
   type QueueRequest,
 } from "./messages.js";
+import { noteSessionCloseDrain } from "./session-close-intent.js";
 
 // How often the drain re-reads the runtime's local turn signal while waiting for
 // an in-flight turn to end. A synchronous in-process read, so the cadence costs
@@ -433,6 +434,10 @@ export class SessionQueueOwner {
     //    why the default is still honest there.
     this.draining = true;
     this.drainCause = reason === "session-close" ? "session-close" : "owner-exit";
+    if (this.drainCause === "session-close") {
+      // 71fdcaf2 — the runtime writes the terminal for a delivery the close cancels; tell it a close is on.
+      noteSessionCloseDrain(this.sessionId);
+    }
 
     // 2. Settle what is already WITH the agent. Never cancel it: the answer to a
     //    running turn is not ours to destroy, and an absorbed injection whose
