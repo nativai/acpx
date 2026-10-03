@@ -6,7 +6,7 @@
 #
 # acpx env-scopes `core.hooksPath` to this directory (`src/acp/auth-env.ts`,
 # `applyGitCommitAttribution`) so that the shipped `prepare-commit-msg` runs and
-# stamps `Session:` / `Brick:` trailers on agent commits. The redirect is
+# stamps `Session:` / `Brick:` / `Seat:` trailers on agent commits. The redirect is
 # wholesale: git then looks for EVERY hook here, and this directory held exactly
 # one. So a repo's own `pre-commit` — a formatter, a linter — was silently
 # skipped for every agent commit on the box, while still firing for every HUMAN
