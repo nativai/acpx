@@ -3144,7 +3144,7 @@ test("raw metadata brick is record-driven for stamp/context; set-metadata valida
 // Practical-tests pass 1, brick 71fdcaf2 (S5.4) — a delivery whose turn is CANCELLED BY A SESSION CLOSE used to end
 // `cancelled` with NO code, and acpx-ui's sender notice fires only on `failed` + a code, so the sender was never told.
 // The owner knows it is closing for the session (the drain verb flagged it), so the terminal it writes for a delivery
-// the close killed is `failed / SESSION_CLOSED_ACCEPTED_UNSETTLED` — outcome unknown, do not resend. A cancel with NO
+// the close killed is `failed / SESSION_CLOSED_TURN_CANCELLED` — outcome unknown, do not resend. A cancel with NO
 // close (the Stop button) is a different fact and must stay `cancelled`.
 async function deliveryTerminalFor(
   homeDir: string,
@@ -3250,7 +3250,7 @@ async function freshSleepingTarget(
   return { cwd, id, operationLog };
 }
 
-test("a delivery whose turn a session CLOSE cancels ends failed/SESSION_CLOSED_ACCEPTED_UNSETTLED, not cancelled (71fdcaf2)", async () => {
+test("a delivery whose turn a session CLOSE cancels ends failed/SESSION_CLOSED_TURN_CANCELLED, not cancelled (71fdcaf2)", async () => {
   await withTempHome(async (homeDir) => {
     const messageId = "0a1b2c3d-1111-4222-8333-444455556666";
     const { id } = await freshSleepingTarget(homeDir, messageId);
@@ -3284,7 +3284,7 @@ test("a delivery whose turn a session CLOSE cancels ends failed/SESSION_CLOSED_A
       "failed",
       `the close-cancelled delivery ended ${String(terminal.phase)}`,
     );
-    assert.equal(terminal.error?.detailCode, "SESSION_CLOSED_ACCEPTED_UNSETTLED");
+    assert.equal(terminal.error?.detailCode, "SESSION_CLOSED_TURN_CANCELLED");
   });
 });
 
