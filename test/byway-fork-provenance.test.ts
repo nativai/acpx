@@ -329,7 +329,7 @@ test("(A4) claudeUuid survives the messages_log round-trip", async () => {
         cwd: path.join(homeDir, "cwd"),
         messages: [],
       },
-      { defaultName: false, defaultAcpx: false },
+      { defaultAcpx: false },
     );
 
     await appendFinalizedMessagesToLog(record, logPath, messages);

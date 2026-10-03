@@ -1,24 +1,14 @@
 import path from "node:path";
 import { resolveAcpxUiBaseUrl } from "../../acp/auth-env.js";
 import { consumeAutoSubscriptionSelection } from "../../runtime/engine/auto-subscription.js";
-import { effectiveTemplateSlug } from "../../session/persistence/template-slug.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
-import type {
-  AgentSessionListResult,
-  OutputFormat,
-  SessionEnsureResult,
-  SessionRecord,
-} from "../../types.js";
+import type { AgentSessionListResult, OutputFormat, SessionRecord } from "../../types.js";
 import { probeQueueOwnerHealth } from "../queue/ipc.js";
 import type {
   SessionCloseDrainReport,
   SessionCloseRecordState,
 } from "../session/session-control.js";
 import { emitJsonResult } from "./json-output.js";
-
-function formatSessionLabel(record: SessionRecord): string {
-  return record.name ?? "cwd";
-}
 
 // The created child's own acpx-ui URL (this box's base + ?session=<id>) — so a
 // spawning agent gets the child's address directly. Reuses the box-base resolver
@@ -90,7 +80,7 @@ export function printSessionsByFormat(sessions: SessionRecord[], format: OutputF
   for (const session of sessions) {
     const closedMarker = session.closed ? " [closed]" : "";
     process.stdout.write(
-      `${session.acpxRecordId}${closedMarker}\t${session.name ?? "-"}\t${session.cwd}\t${session.lastUsedAt}\n`,
+      `${session.acpxRecordId}${closedMarker}\t${session.cwd}\t${session.lastUsedAt}\n`,
     );
   }
 }
@@ -270,7 +260,6 @@ export function printNewSessionByFormat(record: SessionRecord, format: OutputFor
       acpxRecordId: record.acpxRecordId,
       acpxSessionId: record.acpSessionId,
       agentSessionId: record.agentSessionId,
-      name: record.name,
       sessionUrl: composeSessionUrl(record),
       ...(subscriptionSelection ? { subscriptionSelection } : {}),
     })
@@ -294,7 +283,6 @@ export function printCopiedSessionByFormat(
       acpxRecordId: record.acpxRecordId,
       acpxSessionId: record.acpSessionId,
       agentSessionId: record.agentSessionId,
-      name: record.name,
       sourceSessionId: source.acpxRecordId,
       forkedFromSessionId: record.forkedFromSessionId,
       // EFFECTIVE index. `forkedAtMessageIndexRequested` rides beside it only on
@@ -347,7 +335,6 @@ export function printReopenedSessionByFormat(
       acpxRecordId: record.acpxRecordId,
       acpxSessionId: record.acpSessionId,
       agentSessionId: record.agentSessionId,
-      name: record.name,
       closed: record.closed === true,
     })
   ) {
@@ -361,82 +348,6 @@ export function printReopenedSessionByFormat(
 
   const action = reopened ? "reopened" : "already open";
   process.stdout.write(`${record.acpxRecordId}\t(${action})\n`);
-}
-
-export function printEnsuredSessionByFormat(
-  record: SessionRecord,
-  created: boolean,
-  format: OutputFormat,
-  createdBecauseClosed?: SessionEnsureResult["createdBecauseClosed"],
-): void {
-  if (
-    emitJsonResult(format, {
-      action: "session_ensured",
-      created,
-      acpxRecordId: record.acpxRecordId,
-      acpxSessionId: record.acpSessionId,
-      agentSessionId: record.agentSessionId,
-      name: record.name,
-      // brick://16712ece — ADDITIVE. Absent on every pre-existing shape, so the
-      // `--format json` consumers this feature exists to protect (the nightly
-      // intaker re-bake among them) keep parsing unchanged; a script that wants
-      // the signal reads one new key instead of scraping stderr.
-      ...(createdBecauseClosed ? { createdBecauseClosed } : {}),
-    })
-  ) {
-    return;
-  }
-
-  if (format === "quiet") {
-    process.stdout.write(`${record.acpxRecordId}\n`);
-    return;
-  }
-
-  const action = created ? "created" : "existing";
-  process.stdout.write(`${record.acpxRecordId}\t(${action})\n`);
-}
-
-/**
- * brick://16712ece — `sessions ensure` created a NEW session while a CLOSED one
- * of the same name/cwd/agent existed.
- *
- * STDERR, always — including under `--format json`. That is a hard constraint,
- * not a style choice: the caller this warning protects most (the nightly
- * intaker re-bake, `sessions ensure -s tmpl:intaker-bake --format json`) PARSES
- * stdout, so putting the warning there would break the legitimate caller in the
- * name of protecting the illegitimate one.
- *
- * ⚠️ EVERY ROUTE NAMED HERE MUST EXIST. This whole brick is the fallout of a
- * closed-session message that kept naming `reopen-and-deliver` behaviour after
- * it was removed; a "helpful" pointer at a verb nobody built costs an operator
- * more than silence. The regression guard is the TEXT assertion in
- * test/session-closed-recovery.test.ts — if you change the wording, change it
- * there too, and if you add a route, add it only once it ships.
- */
-export function warnEnsureCreatedOverClosed(
-  record: SessionRecord,
-  closed: NonNullable<SessionEnsureResult["createdBecauseClosed"]>,
-): void {
-  const label = closed.nearestName ?? closed.nearestRecordId;
-  const others = closed.count > 1 ? ` (${closed.count} closed matches; newest shown)` : "";
-  // The send-message route needs this box's acpx-ui URL. Where that is unknown the
-  // line is dropped rather than printed with a fabricated host — same rule as the
-  // doc comment above: a pointer an operator cannot follow costs more than silence.
-  const reopenUrl = composeSessionUrlForId(closed.nearestRecordId);
-  const lines = [
-    `⚠️  acpx: created a NEW EMPTY session ${record.acpxRecordId} — a CLOSED session of the same name/cwd already existed${others}.`,
-    `    Its history is NOT carried over. Closed session: ${label} (${closed.nearestRecordId}).`,
-    `    If you meant to REVIVE that one instead of starting over, reopen it:`,
-    `      acpx sessions reopen ${closed.nearestRecordId}`,
-    ...(reopenUrl
-      ? [
-          `      # or, to reopen AND deliver in one step:`,
-          `      send-message.sh --reopen ${reopenUrl} '<text>'`,
-        ]
-      : []),
-    `    If a fresh session was what you wanted, nothing is wrong — this is only a notice.`,
-  ];
-  process.stderr.write(`${lines.join("\n")}\n`);
 }
 
 export function printQueuedPromptByFormat(
@@ -468,7 +379,6 @@ export function formatPromptSessionBannerLine(
   currentCwd: string,
   connectionStatus: SessionConnectionStatus | null = null,
 ): string {
-  const label = formatSessionLabel(record);
   const normalizedSessionCwd = path.resolve(record.cwd);
   const normalizedCurrentCwd = path.resolve(currentCwd);
   const routedFrom =
@@ -481,10 +391,10 @@ export function formatPromptSessionBannerLine(
   const agentSuffix = connectionStatus === null ? "" : ` · agent ${connectionStatus}`;
 
   if (routedFrom) {
-    return `[acpx] session ${label} (${record.acpxRecordId}) · ${normalizedSessionCwd} (routed from ${routedFrom})${agentSuffix}`;
+    return `[acpx] session ${record.acpxRecordId} · ${normalizedSessionCwd} (routed from ${routedFrom})${agentSuffix}`;
   }
 
-  return `[acpx] session ${label} (${record.acpxRecordId}) · ${normalizedSessionCwd}${agentSuffix}`;
+  return `[acpx] session ${record.acpxRecordId} · ${normalizedSessionCwd}${agentSuffix}`;
 }
 
 export async function printPromptSessionBanner(
@@ -584,8 +494,7 @@ export function printCreatedSessionBanner(
     return;
   }
 
-  const label = formatSessionLabel(record);
-  process.stderr.write(`[acpx] created session ${label} (${record.acpxRecordId})\n`);
+  process.stderr.write(`[acpx] created session ${record.acpxRecordId}\n`);
   process.stderr.write(`[acpx] agent: ${agentName}\n`);
   process.stderr.write(`[acpx] cwd: ${record.cwd}\n`);
   const url = composeSessionUrl(record);
@@ -942,10 +851,7 @@ export function printPruneResultByFormat(
 
 function printPrunedRecordLines(pruned: SessionRecord[]): void {
   for (const record of pruned) {
-    const label = record.name ? ` (${record.name})` : "";
-    process.stdout.write(
-      `  ${record.acpxRecordId}${label}\t${record.closedAt ?? record.lastUsedAt}\n`,
-    );
+    process.stdout.write(`  ${record.acpxRecordId}\t${record.closedAt ?? record.lastUsedAt}\n`);
   }
 }
 
@@ -1009,10 +915,10 @@ function emitPruneJsonResult(
   });
 }
 
-/** Same read-side derivation the template resolver uses, so the skip line names
- *  the slug a `--from-template` call would actually have asked for. */
+/** The slug a `--from-template` call would actually have asked for (the stored
+ *  slug; a slug-less template resolves by id). */
 function templateSkipSlug(record: SessionRecord): string {
-  return effectiveTemplateSlug(record.template?.slug, record.name) ?? record.acpxRecordId;
+  return record.template?.slug ?? record.acpxRecordId;
 }
 
 /**

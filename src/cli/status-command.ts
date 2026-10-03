@@ -23,7 +23,6 @@ import {
 } from "../session/model-floor.js";
 import { resolveSessionModelLadder } from "../session/model-ladder.js";
 import { outputStyleChangePending } from "../session/output-style.js";
-import { findSession, resolveGlobalSessionByName } from "../session/persistence.js";
 import type { SessionAcpxState, SessionRecord } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import {
@@ -35,7 +34,7 @@ import {
 import { emitJsonResult } from "./output/json-output.js";
 import { agentSessionIdPayload } from "./output/render.js";
 import { probeQueueOwnerHealth } from "./queue/ipc.js";
-import { resolveExplicitSessionRecord, resolveSessionTargetSelector } from "./session-selector.js";
+import { requireExplicitSessionRecord, resolveSessionTargetSelector } from "./session-selector.js";
 
 type SessionStatusState = "running" | "idle" | "dead";
 
@@ -99,67 +98,9 @@ export async function handleStatus(
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const selector = resolveSessionTargetSelector({ flags, command });
-  const explicitRecord = await resolveExplicitSessionRecord(selector);
-  const localRecord =
-    explicitRecord ??
-    (await findSession({
-      agentCommand: agent.agentCommand,
-      agentName: agent.agentName,
-      cwd: agent.cwd,
-      name: selector.name,
-    }));
-  const record =
-    localRecord ??
-    (selector.name === undefined
-      ? undefined
-      : await resolveGlobalSessionByName({
-          agentCommand: agent.agentCommand,
-          agentName: agent.agentName,
-          name: selector.name,
-        }));
-
-  if (!record) {
-    printMissingStatus(globalFlags.format, agent.agentCommand);
-    return;
-  }
+  const record = await requireExplicitSessionRecord(selector, agent.agentName);
 
   await printSessionStatus(record, globalFlags.format);
-}
-
-function printMissingStatus(format: ResolvedAcpxConfig["format"], agentCommand: string): void {
-  if (
-    emitJsonResult(format, {
-      action: "status_snapshot",
-      status: "no-session",
-      summary: "no active session",
-    })
-  ) {
-    return;
-  }
-
-  if (format === "quiet") {
-    process.stdout.write("no-session\n");
-    return;
-  }
-
-  process.stdout.write("session: -\n");
-  process.stdout.write(`agent: ${agentCommand}\n`);
-  process.stdout.write("pid: -\n");
-  process.stdout.write("status: no-session\n");
-  process.stdout.write("model: -\n");
-  process.stdout.write("availableModels: -\n");
-  process.stdout.write("advertisedModelCatalogue: -\n");
-  process.stdout.write("mode: -\n");
-  process.stdout.write("reasoningEffort: -\n");
-  process.stdout.write("reasoningEffortLive: -\n");
-  process.stdout.write("effortLadder: -\n");
-  process.stdout.write("effortCeiling: -\n");
-  process.stdout.write("served: -\n");
-  process.stdout.write("floorOk: -\n");
-  process.stdout.write("outputStyleDesired: -\n");
-  process.stdout.write("outputStyleApplied: -\n");
-  process.stdout.write("uptime: -\n");
-  process.stdout.write("lastPromptTime: -\n");
 }
 
 async function printSessionStatus(

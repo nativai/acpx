@@ -1055,7 +1055,7 @@ export class FlowRunner {
     const created = await createSessionWithClient({
       agentCommand: agent.agentCommand,
       cwd: agent.cwd,
-      name,
+      seatName: name,
       mcpServers: this.mcpServers,
       permissionMode: this.permissionMode,
       nonInteractivePermissions: this.nonInteractivePermissions,

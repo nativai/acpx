@@ -377,15 +377,12 @@ function promptText(input: PromptInput | string): string {
 }
 
 function makeSessionRecord(cwd: string, agentCommand = "node mock-agent.js"): SessionRecord {
-  return makeSessionRecordFixture(
-    {
-      acpxRecordId: "steer-visibility",
-      acpSessionId: "steer-visibility-session",
-      agentCommand,
-      cwd,
-    },
-    { defaultName: false },
-  );
+  return makeSessionRecordFixture({
+    acpxRecordId: "steer-visibility",
+    acpSessionId: "steer-visibility-session",
+    agentCommand,
+    cwd,
+  });
 }
 
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {

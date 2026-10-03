@@ -897,9 +897,8 @@ export async function mintSeatRow(
       // field as a count, which is exactly why it carries this comment.
       nextOrdinal: 2,
       closedAt: null,
-      // CONCEPTION §4 contract C2, name removal, phase (i): the name is written to the seat
-      // AND still to the session record, and the SEAT is authoritative wherever the two
-      // disagree. Phase (ii)'s gate is a measured condition on the fleet, never a date.
+      // D-IDENTITY (brick 61dc1302): the name lives on the SEAT alone — the session record
+      // carries none (an old record's legacy name is read only by the backfill).
       name: params.name,
       // F1 fix (brick 3dff714d) — the founding holder's resolved brick, so a
       // fresh `sessions new --brick <uuid>` writes the SEAT's `brick_id` rather

@@ -14,7 +14,6 @@ import { installOwnerReaper } from "./owner-reaper.js";
 installOwnerReaper();
 
 export type MakeSessionRecordOptions = {
-  defaultName?: boolean;
   defaultAcpx?: boolean;
   resolveCwd?: boolean;
 };
@@ -29,7 +28,6 @@ export function makeSessionRecord(
   options: MakeSessionRecordOptions = {},
 ): SessionRecord {
   const timestamp = "2026-01-01T00:00:00.000Z";
-  const defaultName = options.defaultName ?? true;
   const defaultAcpx = options.defaultAcpx ?? true;
   return {
     schema: "acpx.session.v1",
@@ -39,7 +37,7 @@ export function makeSessionRecord(
     agentName: overrides.agentName,
     agentCommand: overrides.agentCommand,
     cwd: options.resolveCwd === false ? overrides.cwd : path.resolve(overrides.cwd),
-    name: overrides.name ?? (defaultName ? overrides.acpxRecordId : undefined),
+    legacyName: overrides.legacyName,
     createdAt: overrides.createdAt ?? timestamp,
     lastUsedAt: overrides.lastUsedAt ?? timestamp,
     lastSeq: overrides.lastSeq ?? 0,

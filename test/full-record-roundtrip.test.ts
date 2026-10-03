@@ -64,7 +64,7 @@ function fullRecordSentinel(): SessionRecord {
     agentName: "sentinel-agent-name",
     agentCommand: "node /opt/claude-agent-acp/dist/index.js",
     cwd: "/workspace/sentinel-cwd",
-    name: "sentinel-name",
+    legacyName: "sentinel-legacy-name",
     createdAt: "2026-01-01T00:00:00.000Z",
     lastUsedAt: "2026-01-01T00:00:01.000Z",
     lastSeq: 42,

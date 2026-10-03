@@ -31,6 +31,7 @@ import {
   resolveSessionRecord,
   writeSessionRecordAtBoundary,
 } from "../../session/persistence.js";
+import { seatDisplayName } from "../../session/seat-display-name.js";
 import type { AcpJsonRpcMessage, SessionRecord, SessionSendOutcome } from "../../types.js";
 import {
   appendDeliveryStreamEvent,
@@ -160,15 +161,16 @@ async function submitToRunningOwner(
 
 // eslint-disable-next-line complexity -- mirrors the sessionContext shape from runtime.ts / connected-session.ts; the ?. chains are load-bearing and cannot be simplified further without losing null safety
 async function sessionContextFromRecord(record: Awaited<ReturnType<typeof resolveSessionRecord>>) {
+  const displayName = await seatDisplayName(record);
   const { brick, brickPath } = await resolveSessionBrickContext(record);
   return {
     acpxRecordId: record.acpxRecordId,
-    sessionName: record.name ?? null,
+    sessionName: displayName ?? null,
     parentSessionId: record.parentSessionId ?? null,
     parentSessionUrl: record.parentSessionUrl ?? null,
     brick,
     brickPath,
-    agentFolder: resolveAndEnsureAgentFolder(record, brickPath),
+    agentFolder: resolveAndEnsureAgentFolder(record, brickPath, displayName),
     subscriptionId: record.acpx?.session_options?.subscription ?? null,
     profileId: record.acpx?.session_options?.profile ?? null,
     seatId: record.seatId ?? null,
@@ -1445,7 +1447,7 @@ function assertRecordOpenForCliPrompt(record: SessionRecord, options: SessionSen
   if (options.messageId !== undefined || !record.closed) {
     return;
   }
-  throw new SessionClosedError(record.acpxRecordId, record.name ?? undefined);
+  throw new SessionClosedError(record.acpxRecordId);
 }
 
 export async function sendSession(options: SessionSendOptions): Promise<SessionSendOutcome> {

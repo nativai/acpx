@@ -27,9 +27,8 @@ export function validateSessionMetadataValue(key: string, value: string): string
 
 /**
  * Update-in-place (per-key) merge of a single metadata entry into a session
- * record. Pure: returns a new record, never mutates the input. Mirrors the
- * `ensureSession` merge shape (`{ ...existing, ...new }`) so the create/ensure
- * and self-apply paths cannot drift; other metadata keys are preserved.
+ * record. Pure: returns a new record, never mutates the input. Per-key
+ * overwrite (`{ ...existing, ...new }`); other metadata keys are preserved.
  */
 export function mergeSessionMetadata(
   record: SessionRecord,

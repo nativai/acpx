@@ -96,7 +96,13 @@ export type SessionCreateOptions = {
   agentCommand: string;
   agentName?: string;
   cwd: string;
-  name?: string;
+  /**
+   * The NAME the freshly minted SEAT gets (`-s`; D-IDENTITY, brick 61dc1302). A session
+   * has no name — the seat does, and it identifies nothing. REFUSED together with
+   * `seatId`: a joined seat already has its name (`seats rename` is the verb), and
+   * silently ignoring the flag is how a seat ended up unnamed once (F5).
+   */
+  seatName?: string;
   resumeSessionId?: string;
   forkFromSessionId?: string;
   forkAtMessageIndex?: number;
@@ -196,35 +202,6 @@ export type SessionSendOptions = {
   sessionOptions?: SessionAgentOptions;
 } & TimedRunOptions;
 
-export type SessionEnsureOptions = {
-  agentCommand: string;
-  agentName?: string;
-  cwd: string;
-  name?: string;
-  resumeSessionId?: string;
-  parentSessionId?: string;
-  /** Full parent acpx-ui URL (host+id) for cross-machine lineage. (FW-19) */
-  parentSessionUrl?: string;
-  /** The parent's seat id, resolved same-box only (C3/D-B1-9, brick 5ad22d5d). */
-  parentSeatId?: string;
-  metadata?: Record<string, string>;
-  /** `string` = an explicit `--brick`. On a REUSED session it re-points the seat's link
-   * (`ensureSession`); the create path does not read it. */
-  explicitBrickFlag?: string | false;
-  /** Whether `explicitBrickFlag` was resolved by `brick show` (see `SessionCreateOptions`). */
-  explicitBrickFlagValidated?: boolean;
-  mcpServers?: McpServer[];
-  permissionMode: PermissionMode;
-  nonInteractivePermissions?: NonInteractivePermissionPolicy;
-  permissionPolicy?: PermissionPolicy;
-  authCredentials?: Record<string, string>;
-  authPolicy?: AuthPolicy;
-  terminal?: boolean;
-  verbose?: boolean;
-  walkBoundary?: string;
-  sessionOptions?: SessionAgentOptions;
-} & TimedRunOptions;
-
 export type SessionListOptions = {
   agentCommand: string;
   agentName?: string;
@@ -277,12 +254,9 @@ export type SessionSetModelOptions = {
    * CLI-verb path only: when set, a live idle queue owner is recycled after the
    * desired model is persisted so the change binds on the next turn (the next
    * prompt cold-resumes and replays it — mirrors `set profile`). Defaults off so
-   * internal/replay callers (e.g. ensureSession) never recycle; they already
-   * cold-reconnect. See setSessionModel.
+   * internal/replay callers never recycle; they already cold-reconnect. See setSessionModel.
    */
   recycleOwner?: boolean;
-  /** Only used for the turn-in-flight error message on the recycle path. */
-  sessionName?: string;
 } & TimedRunOptions;
 
 export type SessionSetConfigOptionOptions = {
@@ -302,8 +276,6 @@ export type SessionSetConfigOptionOptions = {
    * by the CLI `set effort` handler. See setSessionConfigOption.
    */
   recycleOwner?: boolean;
-  /** Only used for the turn-in-flight error message on the recycle path. */
-  sessionName?: string;
 } & TimedRunOptions;
 
 /**
@@ -330,8 +302,6 @@ export type SessionCreateWithClientResult = {
 export type SessionSetSubscriptionOptions = {
   sessionId: string;
   subscriptionId: string;
-  /** Used only for the turn-in-flight error message. */
-  sessionName?: string;
   verbose?: boolean;
   /** Test override for the registry/home lookup. */
   loadOpts?: SubscriptionLookupOptions;
@@ -349,8 +319,6 @@ export type SessionSetSubscriptionResult = {
 export type SessionSetProfileOptions = {
   sessionId: string;
   profileId: string;
-  /** Used only for the turn-in-flight error message. */
-  sessionName?: string;
   verbose?: boolean;
   /** Test override for the registry/home lookup. */
   loadOpts?: SubscriptionLookupOptions;
@@ -368,8 +336,6 @@ export type SessionSetProfileResult = {
 export type SessionSetAutoFailoverOptions = {
   sessionId: string;
   autoFailover: boolean;
-  /** Used only for the turn-in-flight error message. */
-  sessionName?: string;
 };
 
 export type SessionSetAutoFailoverResult = {
@@ -411,8 +377,6 @@ export type SessionSetOutputStyleOptions = {
    *  a null-shaped clear cannot reach the create-time flag slot our styles arrive
    *  through, so "revert" is an ordinary set of the advertised `"default"` id. */
   outputStyle: string;
-  /** Used only for the refusal error message. */
-  sessionName?: string;
 };
 
 export type SessionSetOutputStyleResult = {
@@ -434,8 +398,6 @@ export type SessionSetOutputStyleResult = {
 export type SessionSetAutoSubscriptionOptions = {
   sessionId: string;
   autoSubscription: boolean;
-  /** Used only for the turn-in-flight error message. */
-  sessionName?: string;
 };
 
 export type SessionSetAutoSubscriptionResult = {
@@ -449,8 +411,6 @@ export type SessionSetAutoSubscriptionResult = {
 export type SessionSetFableDegradeOptions = {
   sessionId: string;
   fableDegradeOk: boolean;
-  /** Used only for the turn-in-flight error message. */
-  sessionName?: string;
 };
 
 export type SessionSetFableDegradeResult = {

@@ -1146,13 +1146,11 @@ function parseSessionRecordMetadata(record: Record<string, unknown>): {
   return { lastRequestId, importedFrom };
 }
 
-function normalizeOptionalName(value: unknown): string | undefined | null {
-  if (value == null) {
-    return undefined;
-  }
-
+// LEGACY `name` (D-IDENTITY): a name identifies nothing now, so a wrong-typed one
+// is dropped rather than rejecting the whole record the way it used to.
+function normalizeLegacyName(value: unknown): string | undefined {
   if (typeof value !== "string") {
-    return null;
+    return undefined;
   }
 
   const trimmed = value.trim();
@@ -1370,7 +1368,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     return null;
   }
 
-  const name = normalizeOptionalName(record.name);
+  const legacyName = normalizeLegacyName(record.name);
   const pid = normalizeOptionalPid(record.pid);
   const closed = normalizeOptionalBoolean(record.closed, false);
   const closedAt = normalizeOptionalString(record.closed_at);
@@ -1418,7 +1416,6 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     typeof record.last_seq !== "number" ||
     !Number.isInteger(record.last_seq) ||
     record.last_seq < 0 ||
-    name === null ||
     pid === null ||
     closed === null ||
     closedAt === null ||
@@ -1510,7 +1507,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
       agentName: agentName ?? undefined,
       agentCommand,
       cwd,
-      name,
+      legacyName,
       createdAt: record.created_at,
       lastUsedAt: record.last_used_at,
       lastSeq: record.last_seq,

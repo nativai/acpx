@@ -314,8 +314,8 @@ test("L1: the DEFAULT is a dry run — counts reported, store byte-identical", a
 test("L2: --apply mints the seats, enriches the entries and CREATES an absent store", async () => {
   await withTempHome(async (homeDir) => {
     await seed(homeDir, [
-      makeRecord({ acpxRecordId: "l2-a", name: "alpha" }),
-      makeRecord({ acpxRecordId: "l2-b", name: "beta", closed: true }),
+      makeRecord({ acpxRecordId: "l2-a", legacyName: "alpha" }),
+      makeRecord({ acpxRecordId: "l2-b", legacyName: "beta", closed: true }),
     ]);
     // The control for the "creates an ABSENT store" claim: it really is absent first.
     assert.equal((await readSeatStore(sessionsDir(homeDir))).fileState, "absent");
@@ -355,7 +355,7 @@ test("L2: --apply mints the seats, enriches the entries and CREATES an absent st
 
 test("L2b: the record leg changes the SEAT GROUP and nothing else", async () => {
   await withTempHome(async (homeDir) => {
-    await seed(homeDir, [makeRecord({ acpxRecordId: "l2b", name: "kept", favorite: true })]);
+    await seed(homeDir, [makeRecord({ acpxRecordId: "l2b", legacyName: "kept", favorite: true })]);
     const before = await readRecordJson(homeDir, "l2b");
 
     await backfill(homeDir, ["--apply"]);
@@ -731,8 +731,8 @@ test("FAV5: a row with NO favorite key at all (real pre-migration shape) is migr
 test("L7: every backfilled row round-trips parseSeatFromPersisted", async () => {
   await withTempHome(async (homeDir) => {
     await seed(homeDir, [
-      makeRecord({ acpxRecordId: "l7-a", name: "named" }),
-      makeRecord({ acpxRecordId: "l7-b", name: undefined }),
+      makeRecord({ acpxRecordId: "l7-a", legacyName: "named" }),
+      makeRecord({ acpxRecordId: "l7-b", legacyName: undefined }),
       makeRecord({ acpxRecordId: "l7-c", closed: true }),
     ]);
     const report = await backfill(homeDir, ["--apply"]);

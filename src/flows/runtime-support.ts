@@ -313,7 +313,6 @@ export function createSyntheticSessionRecord(options: {
     agentSessionId: options.binding.agentSessionId,
     agentCommand: options.binding.agentCommand,
     cwd: options.binding.cwd,
-    name: options.binding.name,
     createdAt: options.createdAt,
     lastUsedAt: options.updatedAt,
     lastSeq: options.lastSeq,

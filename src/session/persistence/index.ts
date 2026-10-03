@@ -47,7 +47,6 @@ export type SessionIndexEntry = {
   agentName?: string;
   agentCommand: string;
   cwd: string;
-  name?: string;
   closed: boolean;
   lastUsedAt: string;
   kind?: "session" | "subagent";
@@ -383,9 +382,6 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
   if (!hasRequiredIndexEntryFields(record)) {
     return undefined;
   }
-  if (record.name !== undefined && typeof record.name !== "string") {
-    return undefined;
-  }
   if (record.kind !== undefined && record.kind !== "session" && record.kind !== "subagent") {
     return undefined;
   }
@@ -402,7 +398,6 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     agentName: optionalString(record.agentName),
     agentCommand: record.agentCommand,
     cwd: record.cwd,
-    name: record.name,
     closed: record.closed,
     lastUsedAt: record.lastUsedAt,
     kind: record.kind,
@@ -576,7 +571,6 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     agentName: record.agentName,
     agentCommand: record.agentCommand,
     cwd: record.cwd,
-    name: record.name,
     closed: record.closed === true,
     lastUsedAt: record.lastUsedAt,
     kind: record.kind,
