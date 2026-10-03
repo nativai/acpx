@@ -9,7 +9,8 @@ if (logPath) {
 }
 
 function modeForVerb() {
-  if (verb === "context" && process.env.BRICK_SHIM_CONTEXT_MODE) {
+  // CONTEXT_MODE breaks the inject render only; `context --json` is the ref-resolve call.
+  if (verb === "context" && !args.includes("--json") && process.env.BRICK_SHIM_CONTEXT_MODE) {
     return process.env.BRICK_SHIM_CONTEXT_MODE;
   }
   return process.env.BRICK_SHIM_MODE ?? "ok";
