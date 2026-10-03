@@ -336,7 +336,6 @@ test("RED-ON-BASE · ROW B extended, degraded leg (`brick show` times out) · th
       {
         PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
         BRICK_SHIM_MODE: "hang",
-        ACPX_BRICK_RESOLVE_TIMEOUT_MS: "3000",
       },
     );
     assert.equal(created.code, 0, created.stderr);
@@ -453,7 +452,6 @@ test("RED-ON-BASE (validated flag) / GREEN-ON-BASE (acceptance) · REFERENCE ARM
       {
         PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
         BRICK_SHIM_MODE: "hang",
-        ACPX_BRICK_RESOLVE_TIMEOUT_MS: "3000",
       },
     );
     // GREEN-ON-BASE half: the ACCEPTANCE itself is pre-existing behaviour
@@ -887,7 +885,6 @@ test("mint path strips a FORGED inbound brick_validation (degraded leg) — the 
       {
         PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
         BRICK_SHIM_MODE: "hang",
-        ACPX_BRICK_RESOLVE_TIMEOUT_MS: "3000",
       },
     );
     assert.equal(created.code, 0, created.stderr);

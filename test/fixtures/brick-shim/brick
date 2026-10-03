@@ -68,6 +68,11 @@ if (mode === "hang") {
   );
 } else if (verb === "stamp") {
   process.exit(0);
+} else if (verb === "context" && args.includes("--json")) {
+  // The lean resolve `acpx` validates a ref with: the same `data.brick` as `show`, no card.
+  const id = process.env.BRICK_SHIM_ID ?? "11111111-2222-3333-4444-555555555555";
+  const brickPath = process.env.BRICK_SHIM_PATH ?? `/tmp/brick-shim/${id}`;
+  process.stdout.write(JSON.stringify({ ok: true, data: { brick: { id, path: brickPath } } }));
 } else if (verb === "context") {
   if (process.env.BRICK_SHIM_CONTEXT_FILE) {
     process.stdout.write(fs.readFileSync(process.env.BRICK_SHIM_CONTEXT_FILE));
