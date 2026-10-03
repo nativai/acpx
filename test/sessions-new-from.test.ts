@@ -144,7 +144,6 @@ async function writeOldSession(
       acpSessionId: id,
       agentCommand: params.agentCommand ?? CLAUDE_COMMAND,
       cwd: params.cwd,
-      name: "predecessor",
       favorite: true,
       parentSessionId: params.parentId,
       metadata: { brick: BRICK_A },
@@ -224,7 +223,6 @@ test("--from transfers NOTHING else: not the name, favorite, closed state or his
     );
     const stored = await readStored(homeDir, createdId(result));
 
-    assert.notEqual(stored.name, "predecessor");
     assert.notEqual(stored.favorite, true);
     assert.notEqual(stored.closed, true);
     assert.deepEqual(stored.messages ?? [], []);

@@ -93,7 +93,7 @@ function makeRecord(id: string, overrides: Partial<SessionRecord> = {}): Session
       closedAt: "2026-07-24T04:39:56.000Z",
       ...overrides,
     },
-    { defaultName: false, defaultAcpx: false },
+    { defaultAcpx: false },
   );
 }
 
