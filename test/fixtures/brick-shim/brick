@@ -9,7 +9,8 @@ if (logPath) {
 }
 
 function modeForVerb() {
-  if (verb === "context" && process.env.BRICK_SHIM_CONTEXT_MODE) {
+  // CONTEXT_MODE breaks the inject render only; `context --json` is the ref-resolve call.
+  if (verb === "context" && !args.includes("--json") && process.env.BRICK_SHIM_CONTEXT_MODE) {
     return process.env.BRICK_SHIM_CONTEXT_MODE;
   }
   return process.env.BRICK_SHIM_MODE ?? "ok";
@@ -59,9 +60,20 @@ if (mode === "hang") {
 } else if (verb === "show") {
   const id = process.env.BRICK_SHIM_ID ?? "11111111-2222-3333-4444-555555555555";
   const brickPath = process.env.BRICK_SHIM_PATH ?? `/tmp/brick-shim/${id}`;
-  process.stdout.write(JSON.stringify({ ok: true, data: { brick: { id, path: brickPath } } }));
+  // A real `brick show` of a container brick is a 4-12 MB card (measured 2026-10-03: 0d2b83f0
+  // 4.1 MB, a2d3967c 12.4 MB). BRICK_SHIM_CARD_BYTES pads THIS verb only, as the real CLI does:
+  // the lean `context --json` below stays small.
+  const padding = "x".repeat(Number(process.env.BRICK_SHIM_CARD_BYTES ?? 0));
+  process.stdout.write(
+    JSON.stringify({ ok: true, data: { brick: { id, path: brickPath }, parts: padding } }),
+  );
 } else if (verb === "stamp") {
   process.exit(0);
+} else if (verb === "context" && args.includes("--json")) {
+  // The lean resolve `acpx` validates a ref with: the same `data.brick` as `show`, no card.
+  const id = process.env.BRICK_SHIM_ID ?? "11111111-2222-3333-4444-555555555555";
+  const brickPath = process.env.BRICK_SHIM_PATH ?? `/tmp/brick-shim/${id}`;
+  process.stdout.write(JSON.stringify({ ok: true, data: { brick: { id, path: brickPath } } }));
 } else if (verb === "context") {
   if (process.env.BRICK_SHIM_CONTEXT_FILE) {
     process.stdout.write(fs.readFileSync(process.env.BRICK_SHIM_CONTEXT_FILE));

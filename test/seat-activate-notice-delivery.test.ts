@@ -206,6 +206,36 @@ test("ND1 · DELIVERED (TEXT): the notice is POSTed to the successor's message r
   });
 });
 
+test("O7 · a predecessor that is ALREADY CLOSED is reported as closed — no duty to close it", async () => {
+  await withRig(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await writeSessionRecordFile(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "holder-one",
+        acpSessionId: "holder-one-acp",
+        agentCommand: "node mock",
+        agentName: "claude",
+        cwd,
+        seatId: SEAT_A,
+        holderActive: true,
+        holderOrdinal: 1,
+        closed: true,
+        closedAt: "2026-10-03T00:00:00.000Z",
+      }),
+    );
+    const stub = await startStub({ status: 200, body: JSON.stringify({ delivery_id: "dlv-o7" }) });
+    try {
+      const result = await activate(homeDir, { ACPX_UI_INTERNAL_URL: stub.url }, [], "text");
+      assert.equal(result.code, 0, `${result.stderr}${result.stdout}`);
+      assert.match(result.stdout, /Retired \(already closed\): holder-one/);
+      assert.doesNotMatch(result.stdout, /NOT closed|YOUR DUTY|sessions close/);
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
 test("ND2 · DELIVERED (JSON): activationNoticeDelivery is {delivered:true, deliveryId}, and `from` is the activator's own session id when ACPX_SESSION_URL is set", async () => {
   await withRig(async (homeDir) => {
     const stub = await startStub({ status: 200, body: JSON.stringify({ delivery_id: "dlv-78" }) });

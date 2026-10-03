@@ -2502,7 +2502,7 @@ test("sessions new --brick writes record/index, injects env, stamps, and resolve
 
     const calls = await readJsonl<string[]>(brickLog);
     assert.deepEqual(calls, [
-      ["show", "short-ref", "--json"],
+      ["context", "short-ref", "--json"],
       ["context", BRICK_X, "--format", "inject"],
       ["stamp", BRICK_X, "session-started", "--by", `session:${childId}`],
     ]);
@@ -2632,7 +2632,7 @@ test("sessions --brick degrades without brick CLI and survives context failure",
     const calls = await readJsonl<string[]>(brickLog);
     assert.equal(calls.filter((call) => call[0] === "stamp").length, 1);
     assert.deepEqual(
-      calls.filter((call) => call[0] === "context"),
+      calls.filter((call) => call[0] === "context" && call.at(-1) !== "--json"),
       [["context", BRICK_X, "--format", "inject"]],
     );
   });
@@ -2698,8 +2698,8 @@ test("sessions new --brick rejects unresolved refs before persistence", async ()
     assert.deepEqual(await listSessionRecordFiles(homeDir), []);
 
     assert.deepEqual(await readJsonl<string[]>(brickLog), [
-      ["show", "nope", "--json"],
-      ["show", "dup", "--json"],
+      ["context", "nope", "--json"],
+      ["context", "dup", "--json"],
     ]);
   });
 });
@@ -2797,7 +2797,7 @@ test("sessions new inherits parent brick and --no-brick blocks inheritance", asy
     assert.deepEqual(calls, [
       ["context", BRICK_X, "--format", "inject"],
       ["stamp", BRICK_X, "session-started", "--by", `session:${inheritedId}`],
-      ["show", "other-ref", "--json"],
+      ["context", "other-ref", "--json"],
       ["context", BRICK_Z, "--format", "inject"],
       ["stamp", BRICK_Z, "session-started", "--by", `session:${explicitId}`],
     ]);
@@ -2999,9 +2999,9 @@ test("sessions new --from-template --brick preserves template metadata, context,
     assert.equal(record.metadata?.template_source, templateId);
 
     const calls = await readJsonl<string[]>(brickLog);
-    assert.equal(calls.filter((call) => call[0] === "show").length, 1);
+    assert.equal(calls.filter((call) => call.at(-1) === "--json").length, 1);
     assert.deepEqual(
-      calls.filter((call) => call[0] === "context"),
+      calls.filter((call) => call[0] === "context" && call.at(-1) !== "--json"),
       [["context", BRICK_X, "--format", "inject"]],
     );
     assert.deepEqual(
@@ -3127,7 +3127,7 @@ test("raw metadata brick is record-driven for stamp/context; set-metadata valida
 
     const calls = await readJsonl<string[]>(brickLog);
     assert.deepEqual(
-      calls.filter((call) => call[0] !== "show"),
+      calls.filter((call) => call[0] !== "show" && call.at(-1) !== "--json"),
       [
         // Create-time render for raw-brick: transient session context (acpxRecordId="") → no --session.
         ["context", BRICK_X, "--format", "inject"],

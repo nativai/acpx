@@ -156,13 +156,21 @@ export async function warnIfBrickDoesNotResolve(brickId: string): Promise<boolea
   return result.kind === "resolved";
 }
 
+/**
+ * Resolves a ref to a brick id with `brick context --json`, NOT `brick show --json` (O3). `show`
+ * renders the whole card — 4.1 MB for container 0d2b83f0, 12.4 MB for a2d3967c, 3-15 s — which
+ * blows execFile's 1 MiB maxBuffer (or brick's own 15 s client timeout) and read as "CLI
+ * unavailable", storing the link UNVALIDATED. `context` carries the same `data.brick.id` and the
+ * same not-found exit (3) in ~0.4 s and 57-115 KB (measured 2026-10-03, same two bricks).
+ * Residual: a brick whose context alone passes 1 MiB would still read UNVALIDATED.
+ */
 async function runBrickShow(ref: string, timeoutMs: number): Promise<BrickShowResult> {
   try {
-    const { stdout } = await execBrick(["show", ref, "--json"], { timeoutMs });
+    const { stdout } = await execBrick(["context", ref, "--json"], { timeoutMs });
     const parsed: unknown = JSON.parse(stdout);
     const brickId = readBrickId(parsed);
     if (!brickId) {
-      return { kind: "unavailable", reason: "show returned no usable brick id" };
+      return { kind: "unavailable", reason: "context returned no usable brick id" };
     }
     return { kind: "resolved", brickId };
   } catch (error) {

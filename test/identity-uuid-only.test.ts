@@ -332,6 +332,19 @@ test("AC-ID3 · `sessions ensure` is gone: refused, creates nothing, not listed"
   });
 });
 
+test("O10 · `sessions --help` no longer describes the deleted `ensure` verb", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await workdir(homeDir, "repo");
+    const help = await runCli(["--cwd", cwd, "codex", "sessions", "--help"], homeDir, { cwd });
+    assert.match(
+      help.stdout,
+      /create, or close sessions/,
+      "positive control: the description line",
+    );
+    assert.doesNotMatch(help.stdout, /ensure/i);
+  });
+});
+
 test("AC-ID3 · the library resolvers are gone from the session module", async () => {
   const persistence = (await import("../src/session/persistence.js")) as Record<string, unknown>;
   const session = (await import("../src/session/session.js")) as Record<string, unknown>;
