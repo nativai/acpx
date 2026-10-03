@@ -52,7 +52,7 @@ try {
   const store = createFileSessionStore({ stateDir });
   const current = await store.load(id);
   assert.ok(current);
-  current.name = "positive writer control";
+  current.title = "positive writer control";
   const save =
     mode === "repository" || mode === "state-home"
       ? writeSessionRecordWithLifecycle
@@ -60,8 +60,8 @@ try {
   await save(current);
   operations++;
   process.stdout.write(`${JSON.stringify({ actors: 1, operation: "positive-write-completed" })}\n`);
-  assert.equal(outbox.readRecord(id)?.name, "positive writer control");
-  const stale = parseSessionRecord({ ...raw, metadata: {}, name: "stale writer" });
+  assert.equal(outbox.readRecord(id)?.title, "positive writer control");
+  const stale = parseSessionRecord({ ...raw, metadata: {}, title: "stale writer" });
   assert.ok(stale);
   outbox.setDrain("public-writer-control");
   let refused = false;
@@ -76,14 +76,14 @@ try {
   operations++;
   const observed = outbox.readRecord(id);
   process.stdout.write(
-    `${JSON.stringify({ mode, actors: 1, operations, refused, name: observed?.name, metadata: observed?.metadata })}\n`,
+    `${JSON.stringify({ mode, actors: 1, operations, refused, title: observed?.title, metadata: observed?.metadata })}\n`,
   );
   assert.equal(
     refused,
     true,
     "a metadata-dropped writer must still consult the active outbox drain",
   );
-  assert.equal(observed?.name, "positive writer control");
+  assert.equal(observed?.title, "positive writer control");
   assert.equal(observed?.metadata?.brick, brick);
   if (mode === "state-home") {
     process.env.ACPX_STATE_HOME = path.join(os.homedir(), "alternate-state-home");
@@ -91,9 +91,9 @@ try {
     const alternate = createFileSessionStore({
       stateDir: path.join(process.env.ACPX_STATE_HOME, ".acpx"),
     });
-    assert.equal((await alternate.load(id))?.name, "stale writer");
+    assert.equal((await alternate.load(id))?.title, "stale writer");
     assert.equal(
-      outbox.readRecord(id)?.name,
+      outbox.readRecord(id)?.title,
       "positive writer control",
       "state-home writes must not be redirected into HOME",
     );
@@ -102,11 +102,11 @@ try {
   const separate = createFileSessionStore({ stateDir: path.join(os.homedir(), "independent") });
   await separate.save(stale);
   assert.equal(
-    (await separate.load(id))?.name,
+    (await separate.load(id))?.title,
     "stale writer",
     "a genuinely non-overlapping custom store is not the canonical writer",
   );
-  assert.equal(outbox.readRecord(id)?.name, "positive writer control");
+  assert.equal(outbox.readRecord(id)?.title, "positive writer control");
 } finally {
   outbox.close();
   if (operations === 0) {

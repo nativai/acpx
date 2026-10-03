@@ -71,15 +71,17 @@ test("resolveAndEnsureAgentFolder returns null and creates nothing when the bric
   assert.equal(fs.existsSync(missing), false);
 });
 
-test("resolveAndEnsureAgentFolder creates <brick>/agents/<name>-<id8> and returns the absolute path", async () => {
+test("resolveAndEnsureAgentFolder creates <brick>/agents/<seat-name>-<id8> and returns the absolute path", async () => {
   await withBaseDir((brickDir) => {
     const record = recordWith({
       acpxRecordId: "f186ee80-aaaa-bbbb-cccc-dddddddddddd",
-      name: "Conception Agent",
       metadata: { brick: "11111111-2222-3333-4444-555555555555" },
     });
     const expected = path.join(brickDir, "agents", "conception-agent-f186ee80");
-    assert.equal(resolveAndEnsureAgentFolder(record, brickDir), expected);
+    assert.equal(resolveAndEnsureAgentFolder(record, brickDir, "Conception Agent"), expected);
+    // No seat name ⇒ the bare id8 (a session has no name of its own).
+    const bare = path.join(brickDir, "agents", "f186ee80");
+    assert.equal(resolveAndEnsureAgentFolder(record, brickDir), bare);
     assert.ok(fs.statSync(expected).isDirectory());
   });
 });
@@ -93,7 +95,6 @@ test("resolveAndEnsureAgentFolder ignores a legacy metadata.task_folder entirely
   await withBaseDir((taskDir) => {
     const record = recordWith({
       acpxRecordId: "f186ee80-aaaa-bbbb-cccc-dddddddddddd",
-      name: "Legacy Agent",
       metadata: { task_folder: taskDir },
     });
     assert.equal(resolveAndEnsureAgentFolder(record), null);
@@ -112,11 +113,10 @@ test("resolveAndEnsureAgentFolder uses the brick path on a record that still has
     try {
       const record = recordWith({
         acpxRecordId: "f186ee80-aaaa-bbbb-cccc-dddddddddddd",
-        name: "Brick Agent",
         metadata: { brick: "11111111-2222-3333-4444-555555555555", task_folder: taskDir },
       });
       const expected = path.join(brickDir, "agents", "brick-agent-f186ee80");
-      assert.equal(resolveAndEnsureAgentFolder(record, brickDir), expected);
+      assert.equal(resolveAndEnsureAgentFolder(record, brickDir, "Brick Agent"), expected);
       assert.ok(fs.statSync(expected).isDirectory());
       assert.equal(fs.existsSync(path.join(taskDir, "agents")), false);
     } finally {

@@ -29,9 +29,9 @@ export function sanitizeAgentFolderName(name: string | undefined): string | unde
   return slug;
 }
 
-function buildAgentFolderName(record: SessionRecord): string {
+function buildAgentFolderName(record: SessionRecord, displayName: string | undefined): string {
   const idSuffix = record.acpxRecordId.slice(0, AGENT_RECORD_ID_SLUG_LENGTH);
-  const sanitized = sanitizeAgentFolderName(record.name);
+  const sanitized = sanitizeAgentFolderName(displayName);
   return sanitized ? `${sanitized}-${idSuffix}` : idSuffix;
 }
 
@@ -50,8 +50,8 @@ function usableBaseDirectory(candidate: string | null | undefined): string | nul
 
 /**
  * Resolve (and create) the per-agent folder for a session:
- * `<brick_path>/agents/<sanitized-name>-<id8>/` (bare `<id8>` when the name is
- * empty). Returns the absolute path, or `null` when there is no usable brick
+ * `<brick_path>/agents/<sanitized-seat-name>-<id8>/` (bare `<id8>` when the seat
+ * has no name — see `seatDisplayName`). Returns the absolute path, or `null` when there is no usable brick
  * folder.
  *
  * Defensive: only acts when the brick path is absolute and already exists as a
@@ -65,12 +65,13 @@ function usableBaseDirectory(candidate: string | null | undefined): string | nul
 export function resolveAndEnsureAgentFolder(
   record: SessionRecord,
   brickPath?: string | null,
+  displayName?: string,
 ): string | null {
   const baseDirectory = usableBaseDirectory(brickPath);
   if (!baseDirectory) {
     return null;
   }
-  const agentFolder = path.join(baseDirectory, "agents", buildAgentFolderName(record));
+  const agentFolder = path.join(baseDirectory, "agents", buildAgentFolderName(record, displayName));
   fs.mkdirSync(agentFolder, { recursive: true });
   return agentFolder;
 }

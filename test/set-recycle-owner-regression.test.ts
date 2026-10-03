@@ -239,7 +239,6 @@ test("T5.3 TURN-IN-FLIGHT: set effort with an active turn is refused; owner surv
             configId: "effort",
             value: "low",
             recycleOwner: true,
-            sessionName: "my-session",
           }),
         (error: unknown) => {
           assert(error instanceof Error);
@@ -275,7 +274,6 @@ test("T5.4 TURN-IN-FLIGHT: set model with an active turn is refused; owner survi
             sessionId,
             modelId: "sonnet",
             recycleOwner: true,
-            sessionName: "my-session",
           }),
         (error: unknown) => {
           assert(error instanceof Error);
@@ -307,7 +305,6 @@ test("T5.4b TURN-IN-FLIGHT: set auto-failover with an active turn is refused; ow
           await setSessionAutoFailover({
             sessionId,
             autoFailover: false,
-            sessionName: "my-session",
           }),
         (error: unknown) => {
           assert(error instanceof Error);

@@ -122,7 +122,7 @@ function sessionRecord(
         cwd: "/tmp/acpx-messages-log-test",
         messages,
       },
-      { defaultName: false, defaultAcpx: false },
+      { defaultAcpx: false },
     ),
     ...overrides,
   };
@@ -445,10 +445,7 @@ test("an empty record's converged split form round-trips through export and impo
     const archivePath = path.join(homeDir, "empty-archive.json");
     const emptyState = { v: 1, count: 0, base_index: 0, bytes: 0 };
 
-    await writeRawRecord(
-      homeDir,
-      sessionRecord("roundtrip-empty", [], { cwd, name: "roundtrip-empty" }),
-    );
+    await writeRawRecord(homeDir, sessionRecord("roundtrip-empty", [], { cwd }));
     await writeSessionRecordAtBoundary(await resolveSessionRecord("roundtrip-empty"));
 
     await exportSession({ sessionId: "roundtrip-empty" }, archivePath);
@@ -465,7 +462,7 @@ test("an empty record's converged split form round-trips through export and impo
     await fs.rm(sessionFilePath(homeDir, "roundtrip-empty"));
     await fs.rm(messagesLogPath(sessionDir, "roundtrip-empty"));
 
-    const imported = await importSession(archivePath, { name: "roundtrip-empty-imported" });
+    const imported = await importSession(archivePath);
     const importedRaw = await readRawRecord(homeDir, imported.record_id);
     assert.deepEqual(importedRaw.messages, []);
     assert.deepEqual(importedRaw.messages_log, emptyState);
@@ -820,7 +817,7 @@ test("repository hydration gives legacy and hand-split twins identical windows a
     const resolved = await resolveSessionRecord("golden");
     assert.deepEqual(resolved.messages, messages);
     const cli = await runBuiltCli(
-      ["--format", "json", "codex", "sessions", "history", "golden"],
+      ["--format", "json", "codex", "sessions", "history", "--session-id", "golden"],
       homeDir,
     );
     assert.equal(cli.code, 0, cli.stderr);

@@ -24,7 +24,6 @@ function createSessionRecord(overrides: Partial<AcpSessionRecord> = {}): AcpSess
     agentSessionId: "inner-1",
     agentCommand: "codex --acp",
     cwd: "/tmp/acpx",
-    name: "agent:codex:acp:test",
     createdAt: "2026-04-05T00:00:00.000Z",
     lastUsedAt: "2026-04-05T00:00:00.000Z",
     lastSeq: 0,

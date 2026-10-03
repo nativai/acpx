@@ -33,13 +33,12 @@ test("a concurrent lifecycle write survives a checkpoint using a pre-read lifecy
     const checkpointing = record("clobber-guard");
     await persistence.writeSessionRecord(checkpointing);
 
-    // "Process B": close + favorite + rename the session on disk.
+    // "Process B": close + favorite the session on disk.
     const fromB = record("clobber-guard", {
       closed: true,
       closedAt: "2026-06-12T08:00:00.000Z",
       favorite: true,
       favoritedAt: "2026-06-12T08:00:01.000Z",
-      name: "renamed-by-b",
     });
     await persistence.writeSessionRecordWithLifecycle(fromB);
 
@@ -54,7 +53,6 @@ test("a concurrent lifecycle write survives a checkpoint using a pre-read lifecy
     assert.equal(onDisk.closedAt, "2026-06-12T08:00:00.000Z");
     assert.equal(onDisk.favorite, true, "B's favorite must survive A's checkpoint");
     assert.equal(onDisk.favoritedAt, "2026-06-12T08:00:01.000Z");
-    assert.equal(onDisk.name, "renamed-by-b", "B's rename must survive A's checkpoint");
     assert.equal(onDisk.lastUsedAt, "2026-06-12T08:00:02.000Z", "A's payload still lands");
   });
 });
@@ -77,11 +75,11 @@ test("readPersistedLifecycle carries pid and acpx for the closed-state merge", a
 test("an undefined persisted lifecycle means no prior state: the record writes as-is", async () => {
   await withTempHome("acpx-single-read-", async () => {
     const persistence = await loadPersistence();
-    const rec = record("fresh-write", { name: "fresh-name" });
+    const rec = record("fresh-write", { title: "fresh-title" });
     await persistence.writeSessionRecordWithPersistedLifecycle(rec, undefined);
 
     const onDisk = await persistence.resolveSessionRecord("fresh-write");
-    assert.equal(onDisk.name, "fresh-name");
+    assert.equal(onDisk.title, "fresh-title");
     assert.equal(onDisk.closed, false);
   });
 });

@@ -210,7 +210,6 @@ function toPromptInput(
 
 function createInitialRecord(params: {
   recordId: string;
-  sessionName: string;
   sessionId: string;
   agentCommand: string;
   cwd: string;
@@ -224,7 +223,6 @@ function createInitialRecord(params: {
     agentSessionId: params.agentSessionId,
     agentCommand: params.agentCommand,
     cwd: params.cwd,
-    name: params.sessionName,
     createdAt: now,
     lastUsedAt: now,
     lastSeq: 0,
@@ -709,7 +707,6 @@ export class AcpRuntimeManager {
     const { input, client, agentCommand, cwd, session } = params;
     const record = createInitialRecord({
       recordId: createRecordId(input.sessionKey, input.mode),
-      sessionName: input.sessionKey,
       sessionId: session.sessionId,
       agentCommand,
       cwd,

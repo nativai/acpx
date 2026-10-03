@@ -2739,7 +2739,7 @@ test("connectAndLoadSession reuses an already loaded client session", async () =
 function makeSessionRecord(
   overrides: Parameters<typeof makeSessionRecordFixture>[0],
 ): ReturnType<typeof makeSessionRecordFixture> {
-  return makeSessionRecordFixture(overrides, { defaultName: false, defaultAcpx: false });
+  return makeSessionRecordFixture(overrides, { defaultAcpx: false });
 }
 
 async function writeSubscriptionRegistry(

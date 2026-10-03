@@ -296,8 +296,6 @@ test("D11 · `sessions new --seat` joins the seat PREPARED: not active, and with
         "json",
         "sessions",
         "new",
-        "-s",
-        "d11-joined",
         "--seat",
         seatId,
       ],
@@ -372,10 +370,7 @@ test("AP15 · a freshly created session CAN actually be succeeded — the paired
 
     // (4) AND THE WHOLE POINT: `--seat` against a seat the system just created
     //     SUCCEEDS. This is the assertion that would have caught the gap.
-    const successor = await runCli(
-      [...base, "sessions", "new", "-s", "ap15-successor", "--seat", seatId],
-      homeDir,
-    );
+    const successor = await runCli([...base, "sessions", "new", "--seat", seatId], homeDir);
     assert.equal(
       successor.code,
       0,
@@ -431,10 +426,7 @@ test("B2c product-entered · a real `acpx seats close` refuses `sessions new --s
     const seatId = String((await readRecordJson(homeDir, founderId)).seat_id);
 
     // AP15 pair, restated for THIS seat: while still open, a join succeeds.
-    const joinedWhileOpen = await runCli(
-      [...base, "sessions", "new", "-s", "r4-open-pair", "--seat", seatId],
-      homeDir,
-    );
+    const joinedWhileOpen = await runCli([...base, "sessions", "new", "--seat", seatId], homeDir);
     assert.equal(
       joinedWhileOpen.code,
       0,
@@ -459,10 +451,7 @@ test("B2c product-entered · a real `acpx seats close` refuses `sessions new --s
     const closedAt = (JSON.parse(closedSeat.stdout.trim()) as { closedAt?: string }).closedAt;
     assert.ok(closedAt, "fixture precondition: the real close returned a timestamp");
 
-    const refused = await runCli(
-      [...base, "sessions", "new", "-s", "r4-refused", "--seat", seatId],
-      homeDir,
-    );
+    const refused = await runCli([...base, "sessions", "new", "--seat", seatId], homeDir);
     assert.notEqual(refused.code, 0, "a seat closed by the REAL verb still accepted a join");
     const said = `${refused.stdout}${refused.stderr}`;
     assert.match(said, /SEAT_CLOSED/, "the refusal must carry the SEAT_CLOSED code");
@@ -2215,8 +2204,6 @@ test(
           "json",
           "sessions",
           "new",
-          "-s",
-          "f2-leg3-child",
           "--seat",
           seatId,
           // 🛑 NO --brick AT ALL. This is leg 3 — the one that fired in
@@ -2275,8 +2262,6 @@ test(
           "json",
           "sessions",
           "new",
-          "-s",
-          "f2-leg1-refused",
           "--seat",
           seatId,
           "--brick",
@@ -2337,8 +2322,6 @@ test("F2/leg 2 · explicit --brick EQUAL to the seat's own brick is accepted, wi
         "json",
         "sessions",
         "new",
-        "-s",
-        "f2-leg2-ok",
         "--seat",
         seatId,
         "--brick",
@@ -2391,8 +2374,6 @@ test("S4c · `--no-brick` against a seat that CARRIES a brick is REFUSED, same f
         "json",
         "sessions",
         "new",
-        "-s",
-        "s4c-refused",
         "--seat",
         seatId,
         "--no-brick",
@@ -2444,8 +2425,6 @@ test("S4a (1/3) · join a BRICK-LESS seat with explicit --brick A: accept, holde
         "json",
         "sessions",
         "new",
-        "-s",
-        "s4a-explicit",
         "--seat",
         seatId,
         "--brick",
@@ -2507,8 +2486,6 @@ test("S4a (2/3) · join a BRICK-LESS seat with --no-brick: accept, holder gets n
         "json",
         "sessions",
         "new",
-        "-s",
-        "s4a-no-brick",
         "--seat",
         seatId,
         "--no-brick",
@@ -2567,8 +2544,6 @@ test(
           "json",
           "sessions",
           "new",
-          "-s",
-          "s4a-ambient",
           "--seat",
           seatId,
           // NO --brick, NO --no-brick.
@@ -2623,8 +2598,6 @@ test("S4b · THE BETTER DISCRIMINATOR — seat on B, spawner with NO brick at al
         "json",
         "sessions",
         "new",
-        "-s",
-        "s4b-child",
         "--seat",
         seatId,
       ],

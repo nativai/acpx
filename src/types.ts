@@ -1172,7 +1172,16 @@ export type SessionRecord = {
   agentName?: string;
   agentCommand: string;
   cwd: string;
-  name?: string;
+  /**
+   * LEGACY, read-only (D-IDENTITY, brick 61dc1302): the display name an older acpx
+   * wrote into `name` on the record. A session has NO name — a name lives on its
+   * SEAT and identifies nothing. This survives only so (a) the seat backfill can
+   * still mint a seat that carries the name on a box not yet backfilled, and
+   * (b) a rewrite of an old record does not destroy it before that backfill runs.
+   * No new code sets it; nothing resolves, routes, lists or displays from it
+   * (test/identity-legacy-name.test.ts pins the only three files that may read it).
+   */
+  legacyName?: string;
   createdAt: string;
   lastUsedAt: string;
   lastSeq: number;
@@ -1435,30 +1444,6 @@ export type SessionSetModelResult = {
   loadError?: string;
   /** True when a live queue owner existed and was recycled to bind the change. */
   ownerRestarted?: boolean;
-};
-
-export type SessionEnsureResult = {
-  record: SessionRecord;
-  created: boolean;
-  /**
-   * brick://16712ece — present ONLY when `created` is true AND the directory
-   * walk had CLOSED same-scope matches it could not see.
-   *
-   * `ensure` cannot tell "recover my session" from "give me a fresh one" apart:
-   * the nightly intaker re-bake legitimately ensures a fixed name whose previous
-   * record is closed and MUST get a new session, while an operator recovering a
-   * closed worker must NOT silently land in an empty one. So `ensure` keeps
-   * creating and reports the ambiguity instead of guessing — additive, so the
-   * `--format json` consumers this protects keep parsing unchanged.
-   */
-  createdBecauseClosed?: {
-    /** How many closed same-scope records the walk skipped. */
-    count: number;
-    /** The newest of them — the one an operator most likely meant to revive. */
-    nearestRecordId: string;
-    /** Its display name, when it had one. */
-    nearestName?: string;
-  };
 };
 
 export type AgentSessionListResult = {

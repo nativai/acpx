@@ -280,15 +280,12 @@ function makeQueueTask(
 }
 
 function makeSessionRecord(cwd: string, agentCommand = "node mock-agent.js"): SessionRecord {
-  return makeSessionRecordFixture(
-    {
-      acpxRecordId: "mid-turn-injection",
-      acpSessionId: "mid-turn-injection-session",
-      agentCommand,
-      cwd,
-    },
-    { defaultName: false },
-  );
+  return makeSessionRecordFixture({
+    acpxRecordId: "mid-turn-injection",
+    acpSessionId: "mid-turn-injection-session",
+    agentCommand,
+    cwd,
+  });
 }
 
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
@@ -1220,19 +1217,16 @@ test("runQueuedTask emits active before prompt execution and idle after completi
 test("runQueuedTask emits subscription and effort in acpx/turn params", async () => {
   await withNoUnhandledRejections(async () => {
     await withTempHome(async (homeDir) => {
-      const record = makeSessionRecordFixture(
-        {
-          acpxRecordId: "turn-attribution-test",
-          acpSessionId: "turn-attribution-session",
-          agentCommand: "node mock-agent.js",
-          cwd: homeDir,
-          acpx: {
-            session_options: { profile: "sub2" },
-            desired_config_options: { effort: "high" },
-          },
+      const record = makeSessionRecordFixture({
+        acpxRecordId: "turn-attribution-test",
+        acpSessionId: "turn-attribution-session",
+        agentCommand: "node mock-agent.js",
+        cwd: homeDir,
+        acpx: {
+          session_options: { profile: "sub2" },
+          desired_config_options: { effort: "high" },
         },
-        { defaultName: false },
-      );
+      });
       await writeSessionRecordFile(homeDir, record);
 
       let activeSeenInsidePrompt = false;
