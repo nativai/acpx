@@ -769,7 +769,7 @@ async function resolveNewSessionLineage(flags: SessionsNewFlags): Promise<{
 }> {
   const from = flags.from === undefined ? undefined : await resolveFromSessionRecord(flags.from);
   const parent = await resolveParentForNew(flags, from);
-  return { from, parent, inherit: from ? parentInheritableFields(from) : parent };
+  return { from, parent, inherit: from ? await parentInheritableFields(from) : parent };
 }
 
 async function resolveParentForNew(
