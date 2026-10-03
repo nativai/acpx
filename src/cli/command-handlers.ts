@@ -148,6 +148,14 @@ import type {
   SetParentResult,
   SetParentTarget,
 } from "./session/session-reparent.js";
+import {
+  fromParentFlags,
+  refuseFromWithTemplate,
+  resolveFromSessionRecord,
+  seatToJoin,
+  skippedFromOptionsNote,
+  withFromOptions,
+} from "./session/sessions-new-from.js";
 
 type SessionModule = typeof import("../session/session.js");
 type OutputModule = typeof import("./output/output.js");
@@ -749,6 +757,77 @@ type EffectiveSpawnAgent = {
   sameAgentAsParent: boolean;
 };
 
+// `sessions new`'s lineage and inheritance sources. The parent is the flags / env as always,
+// except that `--from <old>` (brick 06b01b6b) supplies the old session's own parent when the
+// command line names none — a derived parent that no longer resolves is dropped with a note
+// rather than failing a create the operator never asked it of. `inherit` is where inherited
+// model/effort/profile/output-style/brick come from: the old session under `--from`, else the parent.
+async function resolveNewSessionLineage(flags: SessionsNewFlags): Promise<{
+  from: SessionRecord | undefined;
+  parent: ResolvedParentSession | undefined;
+  inherit: ResolvedParentSession | undefined;
+}> {
+  const from = flags.from === undefined ? undefined : await resolveFromSessionRecord(flags.from);
+  const parent = await resolveParentForNew(flags, from);
+  return { from, parent, inherit: from ? parentInheritableFields(from) : parent };
+}
+
+async function resolveParentForNew(
+  flags: SessionsNewFlags,
+  from: SessionRecord | undefined,
+): Promise<ResolvedParentSession | undefined> {
+  const derived = fromParentFlags(flags, from);
+  if (!derived) {
+    return await resolveAndValidateParentSessionId(flags);
+  }
+  try {
+    return await resolveAndValidateParentSessionId(derived);
+  } catch (error) {
+    if (!(error instanceof InvalidArgumentError)) {
+      throw error;
+    }
+    process.stderr.write(
+      `[acpx] --from: the old session's parent ${derived.parentId} no longer resolves; ` +
+        `creating without it\n`,
+    );
+    return await resolveAndValidateParentSessionId(flags);
+  }
+}
+
+// The agent `sessions new` spawns. Under `--from` the old session's cwd is the default (an
+// explicit `--cwd` wins), and when the new agent differs from the old one the agent-specific
+// options are skipped and said so on stderr.
+function resolveNewSessionAgent(params: {
+  agent: ResolvedAgentInvocation;
+  explicitAgentName: string | undefined;
+  globalFlags: GlobalFlags;
+  inherit: ResolvedParentSession | undefined;
+  from: SessionRecord | undefined;
+  fromRef: string | undefined;
+  command: Command;
+  config: ResolvedAcpxConfig;
+}): EffectiveSpawnAgent {
+  const resolved = resolveEffectiveSpawnAgent(
+    params.agent,
+    params.explicitAgentName,
+    params.globalFlags,
+    params.inherit,
+    params.config,
+  );
+  if (!params.from) {
+    return resolved;
+  }
+  const note = resolved.sameAgentAsParent
+    ? undefined
+    : skippedFromOptionsNote(params.from, params.fromRef ?? params.from.acpxRecordId);
+  if (note) {
+    process.stderr.write(note);
+  }
+  const cwdSource = optionValueSourceWithGlobals(params.command, "cwd");
+  const cwdIsExplicit = cwdSource !== undefined && cwdSource !== "default";
+  return cwdIsExplicit ? resolved : { ...resolved, cwd: params.from.cwd };
+}
+
 // Resolve the agent a spawn (`sessions new` / `ensure`) actually uses, applying
 // parent agent-type inheritance: a bare/defaulted spawn inside an acpx session
 // adopts the parent's agent command (an explicit positional agent / --agent
@@ -879,6 +958,12 @@ function buildSessionStartOptions(params: {
   permissionMode: ReturnType<typeof resolvePermissionMode>;
   permissionPolicy?: PermissionPolicy;
   parent?: ResolvedParentSession;
+  /** Where inherited model/effort/profile/output-style/brick come from: the spawning `parent`,
+   * or — under `sessions new --from` (brick 06b01b6b) — the old session's fields. Always passed,
+   * so a caller cannot forget it; `parent` stays the lineage edge either way. */
+  inherit: ResolvedParentSession | undefined;
+  /** `sessions new --from`: the old session (its seat, allowed tools, system prompt, policy). */
+  from?: SessionRecord;
   resolvedBrick?: string | false;
   /** Brick `9984c510` — the leg `resolveBrickFlagValue` took for `resolvedBrick`,
    * when it is a string. See `SessionCreateOptions.explicitBrickFlagValidated`. */
@@ -894,14 +979,16 @@ function buildSessionStartOptions(params: {
     parentSessionId: params.parent?.acpxRecordId,
     parentSessionUrl: params.parent?.sessionUrl,
     parentSeatId: params.parent?.seatId,
-    // D11 — the join, and it comes ONLY from the explicit flag. 🛑 Never from
+    // D11 — the join, and it comes ONLY from an explicit flag: `--seat`, or `--from <old>`,
+    // which NAMES the predecessor whose seat this session is the prepared successor of
+    // (brick 06b01b6b — the handover's create step). 🛑 Never from
     // `params.parent?.seatId` beside it, nor from `ACPX_SEAT_URL`, a brick, a cwd or a
     // template: joining a seat by INFERENCE is the mis-seating this design refuses,
     // and a wrong seat is a wrong identity that every later block inherits with no
     // signature to detect it. The two fields on these adjacent lines are easy to
     // conflate and mean opposite things — `parentSeatId` records WHO SPAWNED ME,
-    // `seatId` records WHICH SEAT I HOLD.
-    seatId: params.flags.seat,
+    // `seatId` records WHICH SEAT I HOLD. An explicit `--seat` beats `--from`'s seat.
+    seatId: seatToJoin(params.flags, params.from),
     // F2 (brick 3dff714d) / DECISIONS.md AMENDMENT — computed exactly as
     // before for BOTH fresh-mint and join: `withInheritedBrick` still mixes in
     // the spawner's ambient `parent?.brick` here. That is deliberate, not the
@@ -914,7 +1001,7 @@ function buildSessionStartOptions(params: {
     // read it, so it cannot make that distinction itself.
     metadata: withInheritedBrick(
       applyBrickFlag(params.flags.metadata, params.resolvedBrick),
-      params.parent?.brick,
+      params.inherit?.brick,
       params.resolvedBrick === false,
     ),
     // The RAW flag, never mixed with inheritance — `resolveJoinedSeatBrickMetadata`
@@ -933,11 +1020,15 @@ function buildSessionStartOptions(params: {
     terminal: params.globalFlags.terminal,
     timeoutMs: params.globalFlags.timeout,
     verbose: params.globalFlags.verbose,
-    sessionOptions: inheritedSpawnSessionOptions(
-      params.globalFlags,
+    sessionOptions: withFromOptions(
+      inheritedSpawnSessionOptions(
+        params.globalFlags,
+        params.agent.sameAgentAsParent,
+        params.inherit,
+        params.agent.agentCommand,
+      ),
+      params.from,
       params.agent.sameAgentAsParent,
-      params.parent,
-      params.agent.agentCommand,
     ),
   };
 }
@@ -2598,6 +2689,7 @@ export async function handleSessionsNew(
   // session (createSession never carries the template marker forward). Routes
   // through the shared copy core so it reuses native deep-copy, the agent-type
   // lock, and cwd/lineage handling rather than the fresh-session path.
+  refuseFromWithTemplate(flags);
   if (flags.fromTemplate !== undefined) {
     await handleSessionsNewFromTemplate(explicitAgentName, flags, command, config);
     return;
@@ -2607,18 +2699,22 @@ export async function handleSessionsNew(
   validateExplicitCredentialFlags(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
-  const parent = await resolveAndValidateParentSessionId(flags);
+  // Brick 06b01b6b — an unknown `--from` refuses here, before anything is created.
+  const { from, parent, inherit } = await resolveNewSessionLineage(flags);
   const { value: resolvedBrick, validated: resolvedBrickValidated } = await resolveBrickFlagValue(
     flags.brick,
   );
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const effectiveAgent = resolveEffectiveSpawnAgent(
+  const effectiveAgent = resolveNewSessionAgent({
     agent,
     explicitAgentName,
     globalFlags,
-    parent,
+    inherit,
+    from,
+    fromRef: flags.from,
+    command,
     config,
-  );
+  });
   // Both sides of this merge are kept. B0.2 renamed the two warnings when it moved
   // them off the agent-NAME gate onto the capability descriptor; WS-picker added
   // the catalogue-backed flag validation immediately after them. They are
@@ -2670,6 +2766,8 @@ export async function handleSessionsNew(
       permissionMode,
       permissionPolicy,
       parent,
+      inherit,
+      from,
       resolvedBrick,
       resolvedBrickValidated,
     }),
@@ -4018,19 +4116,69 @@ function activationHeadline(kind: "activated" | "resumed" | "already-active"): s
 }
 
 /**
+ * What the activator is told about the successor's notice. `suppressed` and `not-resent`
+ * both print the notice as before, WITHOUT the not-delivered line: the operator asked for
+ * the first (`--no-notify`), and on the second nothing was written, so nothing is lost.
+ */
+type NoticeOutcome =
+  | { kind: "delivered"; deliveryId?: string }
+  | { kind: "failed"; reason: string }
+  | { kind: "suppressed" }
+  | { kind: "not-resent" };
+
+async function deliverOrSkipNotice(
+  result: { kind: "activated" | "resumed" | "already-active"; successorId: string; notice: string },
+  notify: boolean,
+): Promise<NoticeOutcome> {
+  if (!notify) {
+    return { kind: "suppressed" };
+  }
+  if (result.kind === "already-active") {
+    return { kind: "not-resent" };
+  }
+  const { deliverActivationNotice } = await import("./session/notice-delivery.js");
+  const delivery = await deliverActivationNotice({
+    successorId: result.successorId,
+    notice: result.notice,
+  });
+  return delivery.delivered
+    ? { kind: "delivered", deliveryId: delivery.deliveryId }
+    : { kind: "failed", reason: delivery.reason };
+}
+
+function noticeDeliveryJson(outcome: NoticeOutcome): Record<string, unknown> {
+  if (outcome.kind === "delivered") {
+    return { delivered: true, ...(outcome.deliveryId ? { deliveryId: outcome.deliveryId } : {}) };
+  }
+  if (outcome.kind === "failed") {
+    return { delivered: false, reason: outcome.reason };
+  }
+  return {
+    delivered: false,
+    reason:
+      outcome.kind === "suppressed"
+        ? "suppressed by --no-notify"
+        : "already active: nothing was written, notice not re-sent",
+  };
+}
+
+/**
  * The text output. 🛑 THE RETIREMENT DUTY IS PART OF THE CONTRACT, NOT A COURTESY —
  * nothing in the system will ever close the retired holder, so if these lines stop
  * appearing, "retired but open" silently becomes a resting state instead of a
  * transitional one.
  */
-function printActivationText(result: {
-  kind: "activated" | "resumed" | "already-active";
-  successorId: string;
-  ordinal: number;
-  seatId: string;
-  predecessorId: string | null;
-  notice: string;
-}): void {
+function printActivationText(
+  result: {
+    kind: "activated" | "resumed" | "already-active";
+    successorId: string;
+    ordinal: number;
+    seatId: string;
+    predecessorId: string | null;
+    notice: string;
+  },
+  noticeOutcome: NoticeOutcome,
+): void {
   process.stdout.write(
     `${activationHeadline(result.kind)}: ${result.successorId} is holder #${result.ordinal} ` +
       `of seat ${result.seatId}\n`,
@@ -4042,10 +4190,24 @@ function printActivationText(result: {
         `     acpx sessions close --session-id ${result.predecessorId}\n`,
     );
   }
-  // Printed for the handover party to DELIVER, not injected as a turn: a lifecycle verb
-  // must not enqueue work into another session as a side effect, and D6 is explicit that
-  // the work-content handover is the handover party's own deliberately written prompt.
+  // c85c42bf (HOD-R46 (b), AC6 "one command and no follow-up"): the notice is DELIVERED to
+  // the successor as its next turn, so a successor no longer learns it holds the seat only if
+  // the activator remembers to paste it. This revises the earlier "printed for the handover
+  // party to DELIVER, not injected as a turn" ruling for the NOTICE only — D6 still holds that
+  // the work-content handover is the handover party's own deliberately written prompt, and
+  // the notice carries no work. A failed delivery is never silent: the notice is printed and
+  // the line below says to paste it.
+  if (noticeOutcome.kind === "delivered") {
+    const delivery = noticeOutcome.deliveryId ? ` (delivery ${noticeOutcome.deliveryId})` : "";
+    process.stdout.write(`\nnotice delivered to ${result.successorId}${delivery}\n`);
+    return;
+  }
   process.stdout.write(`\n--- notice for the successor ---\n${result.notice}`);
+  if (noticeOutcome.kind === "failed") {
+    process.stdout.write(
+      `notice NOT delivered — paste it to the successor (${noticeOutcome.reason})\n`,
+    );
+  }
 }
 
 export async function handleSessionsActivate(
@@ -4057,6 +4219,7 @@ export async function handleSessionsActivate(
   // `optsWithGlobals()` picks up this verb's own `--format` as well as the global one,
   // so this is the same resolution every other session verb uses.
   const { format } = resolveGlobalFlags(command, config);
+  const notify = command.opts<{ notify?: boolean }>().notify !== false;
   const { activateSeatHolder, SeatActivationRefusalError } =
     await import("./session/seat-activate.js");
   try {
@@ -4065,6 +4228,9 @@ export async function handleSessionsActivate(
     // process exit before the line reaches the stream — which is the failure mode F8 found,
     // reintroduced by a missing `await` instead of a missing implementation.
     await emitSeatDivergenceLine(result.successorId, result.divergence);
+    // AFTER the activation write (and its divergence line): a delivery failure must never be
+    // able to undo or mask a succession that already landed — it only changes what is printed.
+    const noticeOutcome = await deliverOrSkipNotice(result, notify);
     if (
       !emitJsonResult(format, {
         ok: true,
@@ -4075,10 +4241,11 @@ export async function handleSessionsActivate(
         outcome: result.kind,
         mirrorDivergence: result.divergence ?? null,
         activationNotice: result.notice,
+        activationNoticeDelivery: noticeDeliveryJson(noticeOutcome),
       }) &&
       format !== "quiet"
     ) {
-      printActivationText(result);
+      printActivationText(result, noticeOutcome);
     }
   } catch (error) {
     if (error instanceof SeatActivationRefusalError) {

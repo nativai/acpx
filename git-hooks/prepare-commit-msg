@@ -3,9 +3,10 @@
 #
 # Activated ONLY for acpx-spawned agent processes, via an env-scoped
 # core.hooksPath (GIT_CONFIG_* set in acpx's buildAgentEnvironment). Humans and
-# non-agent git never reach this hook. It appends up to three trailers:
+# non-agent git never reach this hook. It appends up to four trailers:
 #   Session: <acpx-ui session URL>   — always (when ACPX_SESSION_URL is set)
 #   Brick: <acpx-ui brick URL>       — when ACPX_BRICK is set (session has a linked brick)
+#   Seat: <acpx-ui seat URL>         — when ACPX_SEAT_URL is set (session holds a seat)
 #   Message: <user-prompt turn K>    — only when a Claude transcript is locatable
 # It also strips Co-Authored-By lines from the harness that reference anthropic.com.
 # It is idempotent (safe on amend/rebase) and must NEVER fail a commit: any error
@@ -43,6 +44,18 @@ if [ -n "${ACPX_BRICK:-}" ]; then
       printf 'Brick: %s\n' "$_BRICK_URL" >>"$MSG_FILE"
     fi
     unset _BRICK_BASE _BRICK_URL
+  fi
+fi
+
+# --- Seat: trailer (idempotent; only when the session holds a seat) ---
+# ACPX_SEAT_URL is composed per session by buildAgentEnvironment (src/acp/auth-env.ts)
+# and is already a full URL, so it is copied verbatim. The seat outlives the holder,
+# so `git blame` reaches the seat after the authoring session is gone.
+if [ -n "${ACPX_SEAT_URL:-}" ]; then
+  if ! grep -q '^Seat:' "$MSG_FILE" 2>/dev/null; then
+    if ! git interpret-trailers --trailer "Seat: $ACPX_SEAT_URL" --in-place "$MSG_FILE" 2>/dev/null; then
+      printf 'Seat: %s\n' "$ACPX_SEAT_URL" >>"$MSG_FILE"
+    fi
   fi
 fi
 

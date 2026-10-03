@@ -567,9 +567,13 @@ test("R2b: the backfill REFUSES to overwrite a malformed ROW and carries it verb
 
 test("FAV1: a FRESHLY-MINTED seat's favorite = any holder's favorite — the disagreeing fixture", async () => {
   // 🛑 THE DISAGREEMENT IS THE POINT (AC2). A fixture where every holder agreed
-  // would pass on ANY implementation, including one that reads only the first
-  // holder — so this fixture deliberately carries one `true`, one explicit
-  // `false`, and one holder with no `favorite` at all.
+  // would pass on ANY implementation — so this fixture deliberately carries one
+  // `true`, one explicit `false`, and one holder with no `favorite` at all, which
+  // excludes an implementation that reads `false`/absent as the answer.
+  //
+  // ⚠️ IT DOES NOT EXCLUDE "READS ONLY THE FIRST HOLDER": the `true` holder is FIRST
+  // here (ordinal 1), so such an implementation also passes this row. That property
+  // is secured by FAV2 below, whose `true` holder is the SECOND one.
   await withTempHome(async (homeDir) => {
     const seatId = "fafafafa-1111-4111-8111-111111111111";
     // No existing row: this exercises `planSeatRow`'s mint-time computation.

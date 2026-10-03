@@ -128,8 +128,9 @@ export type SessionCreateOptions = {
    * accepting an illegitimate one costs a permanent, silent, inherited falsehood.
    *
    * ⇒ **NEVER INFERRED.** Not from a parent, a brick, a cwd, a template, or an
-   * `ACPX_SEAT_URL` in the environment. The only way a session joins an existing
-   * seat is an operator or agent typing `--seat` explicitly. Every inference rule
+   * `ACPX_SEAT_URL` in the environment. The only ways a session joins an existing
+   * seat are an operator or agent typing `--seat` explicitly, or `--from <old>`
+   * (brick 06b01b6b), which names the predecessor whose seat it succeeds. Every inference rule
    * is a way to reach the join by accident, which is the one thing that must not
    * happen. ⚠️ And it is REFUSED outright on any fork/copy path — see
    * `refuseSeatJoinOnForkPath`.
@@ -254,7 +255,8 @@ export type SessionSetModelOptions = {
    * CLI-verb path only: when set, a live idle queue owner is recycled after the
    * desired model is persisted so the change binds on the next turn (the next
    * prompt cold-resumes and replays it — mirrors `set profile`). Defaults off so
-   * internal/replay callers never recycle; they already cold-reconnect. See setSessionModel.
+   * internal/replay callers never recycle; they already
+   * cold-reconnect. See setSessionModel.
    */
   recycleOwner?: boolean;
 } & TimedRunOptions;

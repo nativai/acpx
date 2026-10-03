@@ -969,8 +969,9 @@ export type SessionAcpxState = {
      * (brick://5bac5564 Layer C). A single FLAT STRING (one of the `ModelSource`
      * values: explicit | inherited | default | failover | guard-forced); a nested
      * value would fail the whole record load (brick://d4f7d808). Load-bearing for
-     * CORRECTNESS, not just audit: the apply-tier guard uses it to distinguish
-     * an explicit Fable (keep) from an implicit one (force) once the resolution context is gone. Threaded through EVERY
+     * CORRECTNESS, not just audit: the apply-tier
+     * guard uses it to distinguish an explicit Fable (keep) from an implicit one
+     * (force) once the resolution context is gone. Threaded through EVERY
      * session_options transform leg (parse/clone/merge/carry-forward) or it
      * silently drops (brick://07dd62c9).
      */

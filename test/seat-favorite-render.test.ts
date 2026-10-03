@@ -189,3 +189,17 @@ test("FR5 · the verb's own write is what the read surface shows: --on then show
     assert.equal(await read(), false);
   });
 });
+
+test("FR6 · `seats --help` names the favorite column of `list`, in the columns' real order (L4 residual, TEXT help)", async () => {
+  await withRig(async (homeDir) => {
+    const help = await runCli(["seats", "--help"], homeDir);
+    assert.equal(help.code, 0, help.output);
+    // Commander wraps a long description across lines, so compare on collapsed whitespace.
+    const flat = help.output.replace(/\s+/g, " ");
+    assert.match(
+      flat,
+      /id, name, brick, active holder, holder count, favorite, closed marker/,
+      "the list description must name every column `seats list` prints, favorite included, in order",
+    );
+  });
+});
