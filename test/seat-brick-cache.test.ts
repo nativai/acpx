@@ -378,6 +378,28 @@ test("F1 · `sessions set-metadata brick X` on a SEATED record re-points the SEA
   });
 });
 
+test("O3 · `sessions set-metadata brick X` of a container brick (full card over 1 MiB) writes the seat link VALIDATED", async () => {
+  await withTempHome(async (homeDir) => {
+    await plantLinkedSeatAndHolder(
+      homeDir,
+      "o3-holder",
+      { ref: SEAT_BRICK, validated: true },
+      {
+        brick: SEAT_BRICK,
+        brick_validation: "validated",
+      },
+    );
+    const out = await runCli(homeDir, SET_METADATA(homeDir, "o3-holder", NEW_BRICK), {
+      BRICK_SHIM_MODE: "ok",
+      BRICK_SHIM_ID: NEW_BRICK,
+      BRICK_SHIM_CARD_BYTES: String(2 * 1024 * 1024),
+    });
+    assert.equal(out.code, 0, out.stderr);
+    assert.deepEqual(await readSeatBrick(homeDir), { ref: NEW_BRICK, validated: true });
+    assert.equal((await readCache(homeDir, "o3-holder"))?.brick_validation, "validated");
+  });
+});
+
 test("F2 · `seats set-brick` writes the holder's cache AND its validation; the index follows; --unset clears both", async () => {
   await withTempHome(async (homeDir) => {
     await plantLinkedSeatAndHolder(

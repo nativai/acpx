@@ -262,7 +262,7 @@ test("RED-ON-BASE · healthy leg (`brick show` resolves) · the seat's brick_id_
   });
 });
 
-test("O3 · a SLOW but healthy `brick show` (past the old 3 s budget) still marks the seat's brick link VALIDATED", async () => {
+test("O3 · a container brick whose full card is over 1 MiB still gets its seat link VALIDATED", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
@@ -279,7 +279,7 @@ test("O3 · a SLOW but healthy `brick show` (past the old 3 s budget) still mark
         "sessions",
         "new",
         "-s",
-        "slow-healthy-leg",
+        "big-card-leg",
         "--brick",
         BRICK_A,
       ],
@@ -288,9 +288,9 @@ test("O3 · a SLOW but healthy `brick show` (past the old 3 s budget) still mark
         PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
         BRICK_SHIM_MODE: "ok",
         BRICK_SHIM_ID: BRICK_A,
-        // `brick show` of a container brick measured 3-15 s on this box; the answer is healthy,
-        // only slow — a 3 s budget read it as "CLI unavailable" and stored the link UNVALIDATED.
-        BRICK_SHIM_SHOW_DELAY_MS: "4500",
+        // `brick show` of a container brick is a 4-12 MB card; execFile's 1 MiB default
+        // maxBuffer killed it, which read as "CLI unavailable" and stored the link UNVALIDATED.
+        BRICK_SHIM_CARD_BYTES: String(2 * 1024 * 1024),
       },
     );
     assert.equal(created.code, 0, created.stderr);
@@ -306,7 +306,7 @@ test("O3 · a SLOW but healthy `brick show` (past the old 3 s budget) still mark
     assert.equal(
       store[seatId]?.brick_id_validated,
       true,
-      "O3: a resolving --brick create must leave the seat link VALIDATED, however slow `brick show` was",
+      "O3: a resolving --brick create must leave the seat link VALIDATED, however large the brick's card is",
     );
   });
 });
