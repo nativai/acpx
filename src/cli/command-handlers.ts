@@ -4130,22 +4130,19 @@ async function deliverOrSkipNotice(
 }
 
 function noticeDeliveryJson(outcome: NoticeOutcome): Record<string, unknown> {
-  switch (outcome.kind) {
-    case "delivered":
-      return {
-        delivered: true,
-        ...(outcome.deliveryId ? { deliveryId: outcome.deliveryId } : {}),
-      };
-    case "failed":
-      return { delivered: false, reason: outcome.reason };
-    case "suppressed":
-      return { delivered: false, reason: "suppressed by --no-notify" };
-    case "not-resent":
-      return {
-        delivered: false,
-        reason: "already active: nothing was written, notice not re-sent",
-      };
+  if (outcome.kind === "delivered") {
+    return { delivered: true, ...(outcome.deliveryId ? { deliveryId: outcome.deliveryId } : {}) };
   }
+  if (outcome.kind === "failed") {
+    return { delivered: false, reason: outcome.reason };
+  }
+  return {
+    delivered: false,
+    reason:
+      outcome.kind === "suppressed"
+        ? "suppressed by --no-notify"
+        : "already active: nothing was written, notice not re-sent",
+  };
 }
 
 /**
