@@ -109,6 +109,9 @@ export type SessionsNewFlags = {
    * copy always mints, so the flag is not offered there and an unknown-option error is
    * the refusal. */
   seat?: string;
+  /** `--from <old-session-id|url>` (brick 06b01b6b) — take the old session's relevant options as
+   * defaults (explicit flags win), and create INTO its seat when it holds one. `new` only. */
+  from?: string;
   metadata?: Record<string, string>;
   brick?: string | false;
   fromTemplate?: string;

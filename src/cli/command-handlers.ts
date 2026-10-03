@@ -158,6 +158,14 @@ import type {
   SetParentResult,
   SetParentTarget,
 } from "./session/session-reparent.js";
+import {
+  fromParentFlags,
+  refuseFromWithTemplate,
+  resolveFromSessionRecord,
+  seatToJoin,
+  skippedFromOptionsNote,
+  withFromOptions,
+} from "./session/sessions-new-from.js";
 
 class NoSessionError extends Error {
   constructor(message: string) {
@@ -762,6 +770,77 @@ type EffectiveSpawnAgent = {
   sameAgentAsParent: boolean;
 };
 
+// `sessions new`'s lineage and inheritance sources. The parent is the flags / env as always,
+// except that `--from <old>` (brick 06b01b6b) supplies the old session's own parent when the
+// command line names none — a derived parent that no longer resolves is dropped with a note
+// rather than failing a create the operator never asked it of. `inherit` is where inherited
+// model/effort/profile/output-style/brick come from: the old session under `--from`, else the parent.
+async function resolveNewSessionLineage(flags: SessionsNewFlags): Promise<{
+  from: SessionRecord | undefined;
+  parent: ResolvedParentSession | undefined;
+  inherit: ResolvedParentSession | undefined;
+}> {
+  const from = flags.from === undefined ? undefined : await resolveFromSessionRecord(flags.from);
+  const parent = await resolveParentForNew(flags, from);
+  return { from, parent, inherit: from ? parentInheritableFields(from) : parent };
+}
+
+async function resolveParentForNew(
+  flags: SessionsNewFlags,
+  from: SessionRecord | undefined,
+): Promise<ResolvedParentSession | undefined> {
+  const derived = fromParentFlags(flags, from);
+  if (!derived) {
+    return await resolveAndValidateParentSessionId(flags);
+  }
+  try {
+    return await resolveAndValidateParentSessionId(derived);
+  } catch (error) {
+    if (!(error instanceof InvalidArgumentError)) {
+      throw error;
+    }
+    process.stderr.write(
+      `[acpx] --from: the old session's parent ${derived.parentId} no longer resolves; ` +
+        `creating without it\n`,
+    );
+    return await resolveAndValidateParentSessionId(flags);
+  }
+}
+
+// The agent `sessions new` spawns. Under `--from` the old session's cwd is the default (an
+// explicit `--cwd` wins), and when the new agent differs from the old one the agent-specific
+// options are skipped and said so on stderr.
+function resolveNewSessionAgent(params: {
+  agent: ResolvedAgentInvocation;
+  explicitAgentName: string | undefined;
+  globalFlags: GlobalFlags;
+  inherit: ResolvedParentSession | undefined;
+  from: SessionRecord | undefined;
+  fromRef: string | undefined;
+  command: Command;
+  config: ResolvedAcpxConfig;
+}): EffectiveSpawnAgent {
+  const resolved = resolveEffectiveSpawnAgent(
+    params.agent,
+    params.explicitAgentName,
+    params.globalFlags,
+    params.inherit,
+    params.config,
+  );
+  if (!params.from) {
+    return resolved;
+  }
+  const note = resolved.sameAgentAsParent
+    ? undefined
+    : skippedFromOptionsNote(params.from, params.fromRef ?? params.from.acpxRecordId);
+  if (note) {
+    process.stderr.write(note);
+  }
+  const cwdSource = optionValueSourceWithGlobals(params.command, "cwd");
+  const cwdIsExplicit = cwdSource !== undefined && cwdSource !== "default";
+  return cwdIsExplicit ? resolved : { ...resolved, cwd: params.from.cwd };
+}
+
 // Resolve the agent a spawn (`sessions new` / `ensure`) actually uses, applying
 // parent agent-type inheritance: a bare/defaulted spawn inside an acpx session
 // adopts the parent's agent command (an explicit positional agent / --agent
@@ -892,6 +971,12 @@ function buildSessionStartOptions(params: {
   permissionMode: ReturnType<typeof resolvePermissionMode>;
   permissionPolicy?: PermissionPolicy;
   parent?: ResolvedParentSession;
+  /** Where inherited model/effort/profile/output-style/brick come from: the spawning `parent`,
+   * or — under `sessions new --from` (brick 06b01b6b) — the old session's fields. Always passed,
+   * so a caller cannot forget it; `parent` stays the lineage edge either way. */
+  inherit: ResolvedParentSession | undefined;
+  /** `sessions new --from`: the old session (its seat, allowed tools, system prompt, policy). */
+  from?: SessionRecord;
   resolvedBrick?: string | false;
   /** Brick `9984c510` — the leg `resolveBrickFlagValue` took for `resolvedBrick`,
    * when it is a string. See `SessionCreateOptions.explicitBrickFlagValidated`. */
@@ -907,14 +992,16 @@ function buildSessionStartOptions(params: {
     parentSessionId: params.parent?.acpxRecordId,
     parentSessionUrl: params.parent?.sessionUrl,
     parentSeatId: params.parent?.seatId,
-    // D11 — the join, and it comes ONLY from the explicit flag. 🛑 Never from
+    // D11 — the join, and it comes ONLY from an explicit flag: `--seat`, or `--from <old>`,
+    // which NAMES the predecessor whose seat this session is the prepared successor of
+    // (brick 06b01b6b — the handover's create step). 🛑 Never from
     // `params.parent?.seatId` beside it, nor from `ACPX_SEAT_URL`, a brick, a cwd or a
     // template: joining a seat by INFERENCE is the mis-seating this design refuses,
     // and a wrong seat is a wrong identity that every later block inherits with no
     // signature to detect it. The two fields on these adjacent lines are easy to
     // conflate and mean opposite things — `parentSeatId` records WHO SPAWNED ME,
-    // `seatId` records WHICH SEAT I HOLD.
-    seatId: params.flags.seat,
+    // `seatId` records WHICH SEAT I HOLD. An explicit `--seat` beats `--from`'s seat.
+    seatId: seatToJoin(params.flags, params.from),
     // F2 (brick 3dff714d) / DECISIONS.md AMENDMENT — computed exactly as
     // before for BOTH fresh-mint and join: `withInheritedBrick` still mixes in
     // the spawner's ambient `parent?.brick` here. That is deliberate, not the
@@ -927,7 +1014,7 @@ function buildSessionStartOptions(params: {
     // read it, so it cannot make that distinction itself.
     metadata: withInheritedBrick(
       applyBrickFlag(params.flags.metadata, params.resolvedBrick),
-      params.parent?.brick,
+      params.inherit?.brick,
       params.resolvedBrick === false,
     ),
     // The RAW flag, never mixed with inheritance — `resolveJoinedSeatBrickMetadata`
@@ -946,11 +1033,15 @@ function buildSessionStartOptions(params: {
     terminal: params.globalFlags.terminal,
     timeoutMs: params.globalFlags.timeout,
     verbose: params.globalFlags.verbose,
-    sessionOptions: inheritedSpawnSessionOptions(
-      params.globalFlags,
+    sessionOptions: withFromOptions(
+      inheritedSpawnSessionOptions(
+        params.globalFlags,
+        params.agent.sameAgentAsParent,
+        params.inherit,
+        params.agent.agentCommand,
+      ),
+      params.from,
       params.agent.sameAgentAsParent,
-      params.parent,
-      params.agent.agentCommand,
     ),
   };
 }
@@ -2951,6 +3042,7 @@ export async function handleSessionsNew(
   // session (createSession never carries the template marker forward). Routes
   // through the shared copy core so it reuses native deep-copy, the agent-type
   // lock, and cwd/lineage handling rather than the fresh-session path.
+  refuseFromWithTemplate(flags);
   if (flags.fromTemplate !== undefined) {
     await handleSessionsNewFromTemplate(explicitAgentName, flags, command, config);
     return;
@@ -2960,18 +3052,22 @@ export async function handleSessionsNew(
   validateExplicitCredentialFlags(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
-  const parent = await resolveAndValidateParentSessionId(flags);
+  // Brick 06b01b6b — an unknown `--from` refuses here, before anything is created.
+  const { from, parent, inherit } = await resolveNewSessionLineage(flags);
   const { value: resolvedBrick, validated: resolvedBrickValidated } = await resolveBrickFlagValue(
     flags.brick,
   );
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const effectiveAgent = resolveEffectiveSpawnAgent(
+  const effectiveAgent = resolveNewSessionAgent({
     agent,
     explicitAgentName,
     globalFlags,
-    parent,
+    inherit,
+    from,
+    fromRef: flags.from,
+    command,
     config,
-  );
+  });
   // Both sides of this merge are kept. B0.2 renamed the two warnings when it moved
   // them off the agent-NAME gate onto the capability descriptor; WS-picker added
   // the catalogue-backed flag validation immediately after them. They are
@@ -3053,6 +3149,8 @@ export async function handleSessionsNew(
       permissionMode,
       permissionPolicy,
       parent,
+      inherit,
+      from,
       resolvedBrick,
       resolvedBrickValidated,
     }),
@@ -3462,6 +3560,7 @@ export async function handleSessionsEnsure(
       permissionMode,
       permissionPolicy,
       parent,
+      inherit: parent,
       resolvedBrick,
       resolvedBrickValidated,
     }),
