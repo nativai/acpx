@@ -103,7 +103,7 @@ test("every sessionContext built from a record carries seatOrdinal beside seatId
       if (/^\s*seatId: record\.seatId \?\? null,\s*$/.test(line)) {
         sites += 1;
         const window = lines.slice(index, index + 3).join("\n");
-        if (!/seatOrdinal: record\.holderOrdinal \?\? null,/.test(window)) {
+        if (!window.includes("seatOrdinal: record.holderOrdinal ?? null,")) {
           missing.push(`${path.relative(srcDir, file)}:${index + 1}`);
         }
       }
