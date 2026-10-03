@@ -63,6 +63,7 @@ type MockAgentOptions = {
   supportsListSessions: boolean;
   listPageSize: number;
   closeSessionMarker?: string;
+  closeCancelsPrompt: boolean;
   loadSessionNotFound: boolean;
   loadSessionTranscriptGone: boolean;
   resumeSessionNotFound: boolean;
@@ -403,6 +404,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let supportsListSessions = false;
   let listPageSize = 100;
   let closeSessionMarker: string | undefined;
+  let closeCancelsPrompt = false;
   let loadSessionNotFound = false;
   let loadSessionTranscriptGone = false;
   let resumeSessionNotFound = false;
@@ -541,6 +543,14 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    // 71fdcaf2 — the REAL claude adapter's ACP `session/close` cancels the turn in flight, so the prompt
+    // returns stopReason "cancelled". This flag makes the mock do the same (and advertise close support).
+    if (token === "--close-cancels-prompt") {
+      supportsCloseSession = true;
+      closeCancelsPrompt = true;
+      continue;
+    }
+
     if (token === "--ignore-sigterm") {
       ignoreSigterm = true;
       continue;
@@ -642,6 +652,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     supportsListSessions,
     listPageSize,
     closeSessionMarker,
+    closeCancelsPrompt,
     loadSessionNotFound,
     loadSessionTranscriptGone,
     resumeSessionNotFound,
@@ -1138,6 +1149,9 @@ class MockAgent implements Agent {
   }
 
   async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
+    if (this.options.closeCancelsPrompt) {
+      this.sessions.get(params.sessionId)?.pendingPrompt?.abort();
+    }
     this.sessions.delete(params.sessionId);
     if (this.options.closeSessionMarker) {
       writeFileSync(this.options.closeSessionMarker, `${params.sessionId}\n`, { flag: "a" });
