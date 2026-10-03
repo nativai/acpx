@@ -4178,12 +4178,15 @@ function printActivationText(
     notice: string;
   },
   noticeOutcome: NoticeOutcome,
+  predecessorClosed: boolean,
 ): void {
   process.stdout.write(
     `${activationHeadline(result.kind)}: ${result.successorId} is holder #${result.ordinal} ` +
       `of seat ${result.seatId}\n`,
   );
-  if (result.predecessorId) {
+  if (result.predecessorId && predecessorClosed) {
+    process.stdout.write(`Retired (already closed): ${result.predecessorId}\n`);
+  } else if (result.predecessorId) {
     process.stdout.write(
       `Retired (NOT closed): ${result.predecessorId}\n` +
         `🛑 YOUR DUTY — close it yourself; nothing else will:\n` +
@@ -4207,6 +4210,18 @@ function printActivationText(
     process.stdout.write(
       `notice NOT delivered — paste it to the successor (${noticeOutcome.reason})\n`,
     );
+  }
+}
+
+/** Whether the record is closed — a record that cannot be read counts as open, so the duty line stays. */
+async function isRecordClosed(recordId: string | null): Promise<boolean> {
+  if (!recordId) {
+    return false;
+  }
+  try {
+    return (await resolveSessionRecord(recordId)).closed === true;
+  } catch {
+    return false;
   }
 }
 
@@ -4245,7 +4260,7 @@ export async function handleSessionsActivate(
       }) &&
       format !== "quiet"
     ) {
-      printActivationText(result, noticeOutcome);
+      printActivationText(result, noticeOutcome, await isRecordClosed(result.predecessorId));
     }
   } catch (error) {
     if (error instanceof SeatActivationRefusalError) {
