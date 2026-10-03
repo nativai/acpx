@@ -208,6 +208,11 @@ export type SessionEnsureOptions = {
   /** The parent's seat id, resolved same-box only (C3/D-B1-9, brick 5ad22d5d). */
   parentSeatId?: string;
   metadata?: Record<string, string>;
+  /** `string` = an explicit `--brick`. On a REUSED session it re-points the seat's link
+   * (`ensureSession`); the create path does not read it. */
+  explicitBrickFlag?: string | false;
+  /** Whether `explicitBrickFlag` was resolved by `brick show` (see `SessionCreateOptions`). */
+  explicitBrickFlagValidated?: boolean;
   mcpServers?: McpServer[];
   permissionMode: PermissionMode;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;

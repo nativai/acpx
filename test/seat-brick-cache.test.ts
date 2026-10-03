@@ -255,3 +255,12 @@ test("(c) a child spawned into a NEW seat inherits the parent's SEAT brick when 
     assert.equal(childSeat?.brickId?.ref, SEAT_BRICK, "the child's own seat");
   });
 });
+
+test("(b) a schema-invalid (non-string) metadata.brick decides to nothing rather than throwing", async () => {
+  await withTempHome(async (homeDir) => {
+    const ctx = await connectedSessionContext(
+      seatedRecord(homeDir, "garbage-cache", { brick: 42 as unknown as string }, false),
+    );
+    assert.equal(ctx?.brick, null);
+  });
+});

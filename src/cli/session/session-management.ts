@@ -57,10 +57,12 @@ import {
   normalizeName,
   readSeatStore,
   resolveSessionRecord,
+  SEAT_STORE_NO_CHANGE,
   seatBrickLinkFromRef,
   seatFromStore,
   seatRowMissingMessage,
   sessionBaseDir,
+  withSeatStoreWrite,
   writeSessionRecord,
   writeSessionRecordAtBoundary,
   type SeatBrickLink,
@@ -1352,6 +1354,51 @@ function describeClosedMatches(
   };
 }
 
+/** Best-effort, like every spawn-path seat write: a store failure must not refuse an ensure over
+ * a brick label, so it is said on stderr and the cache re-point still proceeds. */
+async function repointSeatBrick(seatId: string, link: SeatBrickLink): Promise<void> {
+  try {
+    await withSeatStoreWrite(sessionBaseDir(), (store) => {
+      const row = store.seats.get(seatId);
+      if (row === undefined) {
+        return { mutation: SEAT_STORE_NO_CHANGE, result: undefined };
+      }
+      const seats = new Map(store.seats);
+      seats.set(seatId, { ...row, brickId: link });
+      return { mutation: { kind: "write" as const, seats }, result: undefined };
+    });
+  } catch (error) {
+    process.stderr.write(
+      `[acpx] warning: could not re-point seat ${seatId} to brick ${link.ref}: ${formatErrorMessage(error)}\n`,
+    );
+  }
+}
+
+/** The reuse leg's metadata write. An explicit `--brick` on a REUSED session re-points the SEAT
+ * (the seat's link decides the session's brick — fb1a7a9c) and re-syncs the record's cache. */
+async function applyReuseMetadata(
+  existing: SessionRecord,
+  options: SessionEnsureOptions,
+): Promise<SessionRecord> {
+  const reuseLink =
+    existing.seatId !== undefined && typeof options.explicitBrickFlag === "string"
+      ? seatBrickLinkFromRef(options.explicitBrickFlag, options.explicitBrickFlagValidated === true)
+      : undefined;
+  if (existing.seatId !== undefined && reuseLink !== undefined) {
+    await repointSeatBrick(existing.seatId, reuseLink);
+  }
+  if (!options.metadata || Object.keys(options.metadata).length === 0) {
+    return existing;
+  }
+  const merged = { ...existing.metadata, ...options.metadata };
+  const working = {
+    ...existing,
+    metadata: reuseLink === undefined ? merged : metadataWithSeatBrickLink(merged, reuseLink),
+  };
+  await writeSessionRecord(working);
+  return working;
+}
+
 export async function ensureSession(options: SessionEnsureOptions): Promise<SessionEnsureResult> {
   const cwd = absolutePath(options.cwd);
   const gitRoot = findGitRepositoryRoot(cwd);
@@ -1364,14 +1411,7 @@ export async function ensureSession(options: SessionEnsureOptions): Promise<Sess
     boundary: walkBoundary,
   });
   if (existing) {
-    let working = existing;
-    if (options.metadata && Object.keys(options.metadata).length > 0) {
-      working = {
-        ...existing,
-        metadata: { ...existing.metadata, ...options.metadata },
-      };
-      await writeSessionRecord(working);
-    }
+    const working = await applyReuseMetadata(existing, options);
     const requestedModel = reuseExplicitModelToApply(options);
     if (requestedModel) {
       // Internal ensure path — must NOT recycle the owner (the recycle flag is

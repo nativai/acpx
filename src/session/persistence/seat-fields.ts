@@ -245,11 +245,12 @@ export function brickFieldsToIndexEntry(record: Pick<SessionRecord, "metadata">)
   const brick = metadata?.brick;
   return {
     metadataBrick: brick,
-    metadataBrickValidation: brick?.trim()
-      ? metadata?.brick_validation === "validated"
-        ? "validated"
-        : "unvalidated"
-      : undefined,
+    metadataBrickValidation:
+      typeof brick === "string" && brick.trim()
+        ? metadata?.brick_validation === "validated"
+          ? "validated"
+          : "unvalidated"
+        : undefined,
   };
 }
 

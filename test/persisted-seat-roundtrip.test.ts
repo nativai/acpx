@@ -319,3 +319,11 @@ test("guard 7 · a LEGACY holder (a brick, no state word) and a legacy index ent
   } as unknown as SessionIndexEntry;
   assert.equal(brickValidationOf(await indexRoundTrip(garbled)), "unvalidated");
 });
+
+test("guard 8 · a schema-invalid (non-string) metadata.brick never throws out of the index projection", () => {
+  // closed-monotonicity-guard.test.ts writes such a record on purpose; the old projection copied
+  // the value and never looked at it, so the new one must not either.
+  const record = brickRecord("idx-garbage", { brick: 42 as unknown as string });
+  assert.doesNotThrow(() => toSessionIndexEntry(record, "idx-garbage.json"));
+  assert.equal(brickValidationOf(toSessionIndexEntry(record, "idx-garbage.json")), undefined);
+});

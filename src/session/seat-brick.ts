@@ -54,7 +54,8 @@ export function decideBrick(
       source: "seat",
     };
   }
-  const cached = metadata?.brick?.trim();
+  const raw: unknown = metadata?.brick;
+  const cached = typeof raw === "string" ? raw.trim() : undefined;
   return cached
     ? { ref: cached, validation: brickValidationFromMetadata(metadata), source: "metadata" }
     : undefined;
