@@ -4099,19 +4099,69 @@ function activationHeadline(kind: "activated" | "resumed" | "already-active"): s
 }
 
 /**
+ * What the activator is told about the successor's notice. `suppressed` and `not-resent`
+ * both print the notice as before, WITHOUT the not-delivered line: the operator asked for
+ * the first (`--no-notify`), and on the second nothing was written, so nothing is lost.
+ */
+type NoticeOutcome =
+  | { kind: "delivered"; deliveryId?: string }
+  | { kind: "failed"; reason: string }
+  | { kind: "suppressed" }
+  | { kind: "not-resent" };
+
+async function deliverOrSkipNotice(
+  result: { kind: "activated" | "resumed" | "already-active"; successorId: string; notice: string },
+  notify: boolean,
+): Promise<NoticeOutcome> {
+  if (!notify) {
+    return { kind: "suppressed" };
+  }
+  if (result.kind === "already-active") {
+    return { kind: "not-resent" };
+  }
+  const { deliverActivationNotice } = await import("./session/notice-delivery.js");
+  const delivery = await deliverActivationNotice({
+    successorId: result.successorId,
+    notice: result.notice,
+  });
+  return delivery.delivered
+    ? { kind: "delivered", deliveryId: delivery.deliveryId }
+    : { kind: "failed", reason: delivery.reason };
+}
+
+function noticeDeliveryJson(outcome: NoticeOutcome): Record<string, unknown> {
+  if (outcome.kind === "delivered") {
+    return { delivered: true, ...(outcome.deliveryId ? { deliveryId: outcome.deliveryId } : {}) };
+  }
+  if (outcome.kind === "failed") {
+    return { delivered: false, reason: outcome.reason };
+  }
+  return {
+    delivered: false,
+    reason:
+      outcome.kind === "suppressed"
+        ? "suppressed by --no-notify"
+        : "already active: nothing was written, notice not re-sent",
+  };
+}
+
+/**
  * The text output. 🛑 THE RETIREMENT DUTY IS PART OF THE CONTRACT, NOT A COURTESY —
  * nothing in the system will ever close the retired holder, so if these lines stop
  * appearing, "retired but open" silently becomes a resting state instead of a
  * transitional one.
  */
-function printActivationText(result: {
-  kind: "activated" | "resumed" | "already-active";
-  successorId: string;
-  ordinal: number;
-  seatId: string;
-  predecessorId: string | null;
-  notice: string;
-}): void {
+function printActivationText(
+  result: {
+    kind: "activated" | "resumed" | "already-active";
+    successorId: string;
+    ordinal: number;
+    seatId: string;
+    predecessorId: string | null;
+    notice: string;
+  },
+  noticeOutcome: NoticeOutcome,
+): void {
   process.stdout.write(
     `${activationHeadline(result.kind)}: ${result.successorId} is holder #${result.ordinal} ` +
       `of seat ${result.seatId}\n`,
@@ -4123,10 +4173,24 @@ function printActivationText(result: {
         `     acpx sessions close --session-id ${result.predecessorId}\n`,
     );
   }
-  // Printed for the handover party to DELIVER, not injected as a turn: a lifecycle verb
-  // must not enqueue work into another session as a side effect, and D6 is explicit that
-  // the work-content handover is the handover party's own deliberately written prompt.
+  // c85c42bf (HOD-R46 (b), AC6 "one command and no follow-up"): the notice is DELIVERED to
+  // the successor as its next turn, so a successor no longer learns it holds the seat only if
+  // the activator remembers to paste it. This revises the earlier "printed for the handover
+  // party to DELIVER, not injected as a turn" ruling for the NOTICE only — D6 still holds that
+  // the work-content handover is the handover party's own deliberately written prompt, and
+  // the notice carries no work. A failed delivery is never silent: the notice is printed and
+  // the line below says to paste it.
+  if (noticeOutcome.kind === "delivered") {
+    const delivery = noticeOutcome.deliveryId ? ` (delivery ${noticeOutcome.deliveryId})` : "";
+    process.stdout.write(`\nnotice delivered to ${result.successorId}${delivery}\n`);
+    return;
+  }
   process.stdout.write(`\n--- notice for the successor ---\n${result.notice}`);
+  if (noticeOutcome.kind === "failed") {
+    process.stdout.write(
+      `notice NOT delivered — paste it to the successor (${noticeOutcome.reason})\n`,
+    );
+  }
 }
 
 export async function handleSessionsActivate(
@@ -4138,6 +4202,7 @@ export async function handleSessionsActivate(
   // `optsWithGlobals()` picks up this verb's own `--format` as well as the global one,
   // so this is the same resolution every other session verb uses.
   const { format } = resolveGlobalFlags(command, config);
+  const notify = command.opts<{ notify?: boolean }>().notify !== false;
   const { activateSeatHolder, SeatActivationRefusalError } =
     await import("./session/seat-activate.js");
   try {
@@ -4146,6 +4211,9 @@ export async function handleSessionsActivate(
     // process exit before the line reaches the stream — which is the failure mode F8 found,
     // reintroduced by a missing `await` instead of a missing implementation.
     await emitSeatDivergenceLine(result.successorId, result.divergence);
+    // AFTER the activation write (and its divergence line): a delivery failure must never be
+    // able to undo or mask a succession that already landed — it only changes what is printed.
+    const noticeOutcome = await deliverOrSkipNotice(result, notify);
     if (
       !emitJsonResult(format, {
         ok: true,
@@ -4156,10 +4224,11 @@ export async function handleSessionsActivate(
         outcome: result.kind,
         mirrorDivergence: result.divergence ?? null,
         activationNotice: result.notice,
+        activationNoticeDelivery: noticeDeliveryJson(noticeOutcome),
       }) &&
       format !== "quiet"
     ) {
-      printActivationText(result);
+      printActivationText(result, noticeOutcome);
     }
   } catch (error) {
     if (error instanceof SeatActivationRefusalError) {
