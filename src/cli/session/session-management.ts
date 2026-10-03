@@ -60,7 +60,7 @@ import {
   SEAT_STORE_NO_CHANGE,
   seatBrickLinkFromRef,
   seatFromStore,
-  seatRowMissingMessage,
+  SeatRowMissingError,
   sessionBaseDir,
   withSeatStoreWrite,
   writeSessionRecord,
@@ -70,6 +70,7 @@ import {
 } from "../../session/persistence.js";
 import type { SessionIndexEntry } from "../../session/persistence/index.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
+import { explainSeatRowMissing } from "../../session/seat-backfill.js";
 import type { SessionEnsureResult, SessionRecord } from "../../types.js";
 import { resolveSessionBrickContext } from "./brick-link.js";
 import { DEFAULT_QUEUE_OWNER_TTL_MS } from "./contracts.js";
@@ -253,12 +254,12 @@ async function refuseUnjoinableSeat(
   const store = await readSeatStore(sessionBaseDir());
   const seat = seatFromStore(store, joinSeatId);
   if (!seat) {
-    // AP17 — THE REFUSAL DIAGNOSES. The shared message names the cause and the remedy,
-    // because the overwhelmingly likely reason a real seat id has no row is that the seat
-    // PREDATES the store (B10's backfill population), and a bare "not found" makes that
-    // look like a bug in our code rather than a migration that has not run.
+    // AP17 — THE REFUSAL DIAGNOSES. The shared message names the cause and the remedy, and
+    // the remedy follows the ORIGIN (brick `bf454a2c`): a seat id some record carries
+    // PREDATES the store or lost its row write (B10's backfill population) and is sent to
+    // the backfill; an id no record carries is a typo and is told to check the id.
     throw new Error(
-      `${seatRowMissingMessage(joinSeatId)} ` +
+      `${await explainSeatRowMissing(new SeatRowMissingError(joinSeatId, store.storePath))} ` +
         `Joining NEVER creates a seat as a side effect — a mistyped id that minted the seat ` +
         `it named would leave a session sitting in a seat nobody meant, and nothing ` +
         `downstream can tell that apart from a session in the right one. Omit --seat to mint ` +
