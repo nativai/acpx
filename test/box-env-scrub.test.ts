@@ -19,6 +19,7 @@ import test from "node:test";
 import {
   BOX_PI_ENV_PREFIX,
   NO_ENTITLEMENT_FETCH_ENV,
+  NOTICE_DELIVERY_DEAD_ORIGIN,
   scrubBoxHarnessEnvOverrides,
 } from "./box-env-scrub.js";
 
@@ -40,6 +41,7 @@ test("3b1ec678: the scrub removes every ACPX_PI_* override and leaves the rest a
   assert.deepEqual(Object.keys(env).toSorted(), [
     NO_ENTITLEMENT_FETCH_ENV,
     "ACPX_SESSION_URL",
+    "ACPX_UI_INTERNAL_URL",
     "HOME",
   ]);
 });
@@ -57,6 +59,7 @@ test("c2df657e: the scrub removes ACPX_SESSION_RECORD_ID (product-set session id
   assert.deepEqual(Object.keys(env).toSorted(), [
     NO_ENTITLEMENT_FETCH_ENV,
     "ACPX_SESSION_URL",
+    "ACPX_UI_INTERNAL_URL",
     "HOME",
   ]);
 });
@@ -79,6 +82,20 @@ test("ecfb0461: the bootstrap forbids the authenticated models/user call", () =>
       `(test/install-owner-reaper.ts, loaded by scripts/run-tests.mjs via --import) did not ` +
       `run, or it stopped setting the guard. Either way a row can now send this box's ` +
       `OpenRouter key to openrouter.ai.`,
+  );
+});
+
+test("c85c42bf: the bootstrap points the activation-notice origin at a dead port", () => {
+  // `sessions activate` POSTs to this box's acpx-ui, derived from the pod namespace when the
+  // variable is unset — so without this guard every activate row run on a box would reach the
+  // box's REAL acpx-ui. A row that wants a stub sets its own child env.
+  const env: NodeJS.ProcessEnv = { HOME: "/home/node", ACPX_UI_INTERNAL_URL: "http://real:3456" };
+  scrubBoxHarnessEnvOverrides(env);
+  assert.equal(env.ACPX_UI_INTERNAL_URL, NOTICE_DELIVERY_DEAD_ORIGIN);
+  assert.equal(
+    process.env.ACPX_UI_INTERNAL_URL,
+    NOTICE_DELIVERY_DEAD_ORIGIN,
+    "the suite bootstrap did not run in this process (or stopped setting the guard)",
   );
 });
 
