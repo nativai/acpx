@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { seatFromStore, type SeatStore } from "../persistence/seat-store.js";
+import { SEAT_STORE_FILE, seatFromStore, type SeatStore } from "../persistence/seat-store.js";
 import { isNonSessionRecordFile } from "../persistence/session-dir-files.js";
 import {
   claimFileSets,
@@ -67,6 +67,8 @@ export const EMPTY_SEAT_STORE: SeatStore = {
   malformedSeatIds: [],
   unparsedRows: new Map(),
   fileState: "absent",
+  // Never read: `fileState: "absent"` builds no refusal, so no path is ever named from it.
+  storePath: SEAT_STORE_FILE,
 };
 
 export type ArchiveCandidate = {

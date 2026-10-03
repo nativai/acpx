@@ -401,7 +401,7 @@ test("SB2 · a malformed SEAT ref is refused by the seat-id mechanism, and nothi
   });
 });
 
-test("SB3 · a well-formed seat id with NO ROW is refused with the backfill remedy (AP17)", async () => {
+test("SB3 · a well-formed seat id with NO ROW (and no record) is refused naming that origin, not a backfill it cannot get (AP17 / F4)", async () => {
   await withRig(async (homeDir) => {
     await writeStore(homeDir, { [SEAT_A]: seatRow(SEAT_A) });
 
@@ -412,9 +412,12 @@ test("SB3 · a well-formed seat id with NO ROW is refused with the backfill reme
     assert.equal(result.code, 1);
     const refusal = refusalOf(result);
     assert.equal(refusal.code, "SEAT_ROW_MISSING");
-    // The remedy wording is what SB2's mechanism CANNOT produce — that asymmetry is
-    // what makes the two refusals distinguishable rather than merely differently worded.
-    assert.match(refusal.error, /RUN THE SEAT BACKFILL/);
+    // The wording is what SB2's mechanism CANNOT produce — that asymmetry is what makes
+    // the two refusals distinguishable rather than merely differently worded. SEAT_ABSENT
+    // is referenced by no record, so this is the typo origin (brick `bf454a2c`); the
+    // backfillable origin's pair lives in `seat-store-refusals.test.ts`.
+    assert.match(refusal.error, /has no row in/);
+    assert.match(refusal.error, /no session record references/);
     assert.doesNotMatch(refusal.error, /must be a seat id in lowercase UUID form/);
   });
 });
@@ -456,7 +459,7 @@ test("SB4b · the three set-brick refusals are PAIRWISE distinguishable — the 
     const markers = [
       /Seat id must be a seat id in lowercase UUID form/,
       /Brick id must be a FULL brick uuid/,
-      /RUN THE SEAT BACKFILL/,
+      /has no row in/,
     ];
     for (const [index, result] of refusals.entries()) {
       const { error } = refusalOf(result);
@@ -681,13 +684,13 @@ test("RN6/RN7′ · rename's two refusals are distinguishable, and neither write
     const badRefusal = refusalOf(badRef);
     assert.equal(badRefusal.code, "SEAT_REF_INVALID");
     assert.match(badRefusal.error, /Seat id must be a seat id in lowercase UUID form/);
-    assert.doesNotMatch(badRefusal.error, /RUN THE SEAT BACKFILL/);
+    assert.doesNotMatch(badRefusal.error, /has no row in/);
 
     const noRow = await runCli(["--format", "json", "seats", "rename", SEAT_ABSENT, "x"], homeDir);
     assert.equal(noRow.code, 1);
     const noRowRefusal = refusalOf(noRow);
     assert.equal(noRowRefusal.code, "SEAT_ROW_MISSING");
-    assert.match(noRowRefusal.error, /RUN THE SEAT BACKFILL/);
+    assert.match(noRowRefusal.error, /has no row in/);
     assert.doesNotMatch(noRowRefusal.error, /must be a seat id in lowercase UUID form/);
 
     assert.equal(await readStoreBytes(homeDir), bytes);
@@ -1259,8 +1262,8 @@ test("D9r · MALFORMED and MISSING are distinguishable in BOTH directions", asyn
     const missingError = refusalOf(missingRun).error;
 
     assert.match(malformedError, /its row is MALFORMED/);
-    assert.doesNotMatch(malformedError, /RUN THE SEAT BACKFILL/);
-    assert.match(missingError, /RUN THE SEAT BACKFILL/);
+    assert.doesNotMatch(malformedError, /has no row in/);
+    assert.match(missingError, /has no row in/);
     assert.doesNotMatch(missingError, /QUARANTINE/);
     assert.doesNotMatch(
       missingError,
@@ -1595,8 +1598,15 @@ test("CL8 · close on an ABSENT row refuses SEAT_ROW_MISSING with AP17's cause a
     assert.equal(result.code, 1);
     const refusal = refusalOf(result);
     assert.equal(refusal.code, "SEAT_ROW_MISSING");
-    assert.match(refusal.error, /predates the seat store/i, "the refusal does not name the cause");
-    assert.match(refusal.error, /backfill/i, "the refusal does not name the remedy");
+    // No record carries SEAT_ABSENT, so the cause is a mistyped id and the remedy is to
+    // check it — NOT the backfill (brick `bf454a2c`; the backfillable pair is in
+    // `seat-store-refusals.test.ts`).
+    assert.match(
+      refusal.error,
+      /no session record references/i,
+      "the refusal does not name the cause",
+    );
+    assert.match(refusal.error, /acpx seats list/, "the refusal does not name the remedy");
     assert.equal(
       await storeExists(homeDir),
       false,
