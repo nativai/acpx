@@ -560,6 +560,13 @@ export type AgentSessionContext = {
    * is only ever populated from a SAME-BOX parent's own record.
    */
   parentSeatId?: string | null;
+  /**
+   * The holder's OWN display ordinal in its seat (`record.holderOrdinal`) — exported as
+   * `ACPX_SEAT_ORDINAL`. `ACPX_SESSION_NAME` is the SEAT's name (D-IDENTITY), the same for every
+   * holder, so this is the only fact in the environment that says WHICH holder an agent is: the
+   * brick CLI composes its default journal author from it (`<seat> #<ordinal> (session:<id8>)`).
+   */
+  seatOrdinal?: number | null;
 };
 
 /**

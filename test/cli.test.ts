@@ -3140,6 +3140,46 @@ test("raw metadata brick is record-driven for stamp/context; set-metadata valida
   });
 });
 
+// Practical-tests pass 1, brick eb8b1fa3 — the REAL-TURN proof that the holder's own ordinal reaches the
+// adapter's environment through the queue-owner leg (`sessionContextFromRecord`). The record's holder_ordinal is
+// set to 2 so the assertion cannot be satisfied by a default of 1: it is the HANDOVER shape (B is holder #2).
+test("a seated holder's adapter env carries its own ACPX_SEAT_ORDINAL beside the seat name (eb8b1fa3)", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const envDumpFile = path.join(homeDir, "env-dump.json");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeCodexAgentConfig(
+      homeDir,
+      `${MOCK_AGENT_COMMAND} --env-dump-file ${JSON.stringify(envDumpFile)}`,
+    );
+    const env = { ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh" };
+    const created = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "new", "--name", "ordinal-probe"],
+      homeDir,
+      { env },
+    );
+    assert.equal(created.code, 0, created.stderr);
+    const id = String(
+      (JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const recordFile = sessionFilePath(homeDir, id);
+    const record = JSON.parse(await fs.readFile(recordFile, "utf8")) as Record<string, unknown>;
+    assert.equal(typeof record.seat_id, "string", "the session is not seated — nothing measured");
+    record.holder_ordinal = 2;
+    await fs.writeFile(recordFile, JSON.stringify(record), "utf8");
+
+    const prompted = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "prompt", "--session-id", id, "after handover"],
+      homeDir,
+      { env, timeoutMs: 60_000 },
+    );
+    assert.equal(prompted.code, 0, prompted.stderr);
+    const dump = JSON.parse(await fs.readFile(envDumpFile, "utf8")) as Record<string, string>;
+    assert.equal(dump.ACPX_SESSION_NAME, "ordinal-probe");
+    assert.equal(dump.ACPX_SEAT_ORDINAL, "2");
+  });
+});
+
 // brick b11f98fb: `task_folder` is the REMOVED legacy key, kept here deliberately as
 // the specimen unknown key. The contract it now proves is the one the removal rests
 // on: an orphan key round-trips through a concurrent owner turn-end, a next prompt
