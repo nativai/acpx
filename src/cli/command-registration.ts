@@ -123,7 +123,7 @@ export function registerSessionsCommand(
 ): void {
   const sessionsCommand = parent
     .command("sessions")
-    .description("List, ensure, create, or close sessions for this agent");
+    .description("List, create, or close sessions for this agent");
   addSessionsListOptions(sessionsCommand);
 
   sessionsCommand.action(async function (this: Command, flags: SessionsListFlags) {

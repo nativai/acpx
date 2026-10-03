@@ -443,7 +443,7 @@ function resolveJoinedSeatBrickMetadata(
     throw new AcpxOperationalError(
       `--no-brick disagrees with seat ${JSON.stringify(joinedSeatId)}'s brick ` +
         `${JSON.stringify(seatBrickId.ref)}. The SEAT's brick_id is canonical (CONCEPTION C4) — a ` +
-        `spawn cannot silently unlink it. Either omit --seat to spawn a fresh, unlinked seat, ` +
+        `spawn cannot silently unlink it. Either spawn a fresh, unlinked seat (no --seat, no --from), ` +
         `or run \`acpx seats set-brick ${joinedSeatId} --unset\` first and re-spawn.`,
       { outputCode: "USAGE", detailCode: "SEAT_BRICK_MISMATCH", origin: "runtime" },
     );

@@ -88,7 +88,7 @@ test("resolveBrickFlagRef resolves through the shim and stores the returned uuid
         // Brick `9984c510`: the WHOLE result is pinned, not just the ref — the
         // healthy leg must report `validated: true`.
         assert.deepStrictEqual(await resolveBrickFlagRef("myslug"), { ref: X, validated: true });
-        assert.deepEqual(await readLog(log), [["show", "myslug", "--json"]]);
+        assert.deepEqual(await readLog(log), [["context", "myslug", "--json"]]);
       },
     );
   });

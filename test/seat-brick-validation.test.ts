@@ -262,6 +262,55 @@ test("RED-ON-BASE · healthy leg (`brick show` resolves) · the seat's brick_id_
   });
 });
 
+test("O3 · a container brick whose full card is over 1 MiB still gets its seat link VALIDATED", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const created = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "-s",
+        "big-card-leg",
+        "--brick",
+        BRICK_A,
+      ],
+      homeDir,
+      {
+        PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
+        BRICK_SHIM_MODE: "ok",
+        BRICK_SHIM_ID: BRICK_A,
+        // `brick show` of a container brick is a 4-12 MB card; execFile's 1 MiB default
+        // maxBuffer killed it, which read as "CLI unavailable" and stored the link UNVALIDATED.
+        BRICK_SHIM_CARD_BYTES: String(2 * 1024 * 1024),
+      },
+    );
+    assert.equal(created.code, 0, created.stderr);
+    assert.doesNotMatch(created.stderr, /brick CLI unavailable/);
+    const id = String(
+      (JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const onDisk = await readRawSessionRecord(homeDir, id);
+    const seatId = String(onDisk.seat_id);
+
+    const store = await readRawSeatStore(homeDir);
+    assert.equal(store[seatId]?.brick_id, BRICK_A);
+    assert.equal(
+      store[seatId]?.brick_id_validated,
+      true,
+      "O3: a resolving --brick create must leave the seat link VALIDATED, however large the brick's card is",
+    );
+  });
+});
+
 test("RED-ON-BASE · ROW B extended, degraded leg (`brick show` times out) · the seat's brick_id_validated is FALSE on disk", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -284,7 +333,10 @@ test("RED-ON-BASE · ROW B extended, degraded leg (`brick show` times out) · th
         BRICK_A,
       ],
       homeDir,
-      { PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`, BRICK_SHIM_MODE: "hang" },
+      {
+        PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
+        BRICK_SHIM_MODE: "hang",
+      },
     );
     assert.equal(created.code, 0, created.stderr);
     // THE LEG-WAS-ACTUALLY-TAKEN GUARD — without it this row silently
@@ -397,7 +449,10 @@ test("RED-ON-BASE (validated flag) / GREEN-ON-BASE (acceptance) · REFERENCE ARM
         BRICK_WRONG,
       ],
       homeDir,
-      { PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`, BRICK_SHIM_MODE: "hang" },
+      {
+        PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
+        BRICK_SHIM_MODE: "hang",
+      },
     );
     // GREEN-ON-BASE half: the ACCEPTANCE itself is pre-existing behaviour
     // (`acceptUuidWhenBrickCliUnavailable` returns the uuid it was given,
@@ -827,7 +882,10 @@ test("mint path strips a FORGED inbound brick_validation (degraded leg) — the 
         "brick_validation=validated",
       ],
       homeDir,
-      { PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`, BRICK_SHIM_MODE: "hang" },
+      {
+        PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
+        BRICK_SHIM_MODE: "hang",
+      },
     );
     assert.equal(created.code, 0, created.stderr);
     assert.match(created.stderr, /brick CLI unavailable/, "this row did not take the degraded leg");
