@@ -28,6 +28,7 @@ import {
   runSeatBackfill,
   type SeatBackfillReport,
 } from "../session/seat-backfill.js";
+import { writeBrickLink } from "../session/seat-brick-write.js";
 import type { OutputFormat } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import { parseOutputFormat, resolveGlobalFlags } from "./flags.js";
@@ -481,15 +482,18 @@ async function handleSeatsSetBrick(
     // becomes `undefined` entirely — there is no sibling to independently omit).
     const brickId = seatBrickLinkFromRef(resolvedRef, flags.validated === true);
     const sessionDir = sessionBaseDir();
-    const previousBrickId = await withSeatStoreWrite(sessionDir, (store) => {
-      refuseUnwritableStore(store, sessionDir);
-      const row = requireSeatRow(store, seatId);
-      const seats = new Map(store.seats);
-      // SPREAD the fresh row — `closed_at` is `null`, never absent, on every row, and
-      // the parse leg rejects a row missing the key as malformed (D8). Rebuilding the
-      // row field-by-field is how that key goes missing.
-      seats.set(seatId, { ...row, brickId });
-      return { mutation: { kind: "write", seats } as const, result: row.brickId };
+    // ONE writer for the pair (fb1a7a9c): the seat row AND the active holder's cache + validation,
+    // together — `writeBrickLink` spreads the fresh row (`closed_at` stays `null`, never absent; the
+    // parse leg rejects a row missing the key as malformed, D8) and this verb keeps its refusals
+    // through the guard, which runs inside the same hold.
+    const { previous: previousBrickId } = await writeBrickLink({
+      seatId,
+      link: brickId,
+      sessionDir,
+      guard: (store) => {
+        refuseUnwritableStore(store, sessionDir);
+        return requireSeatRow(store, seatId);
+      },
     });
     if (emitJsonResult(format, setBrickJsonPayload(seatId, brickId, previousBrickId))) {
       return;

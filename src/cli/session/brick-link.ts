@@ -3,6 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { InvalidArgumentError } from "commander";
 import { brickChildEnv } from "../../bricks-credential.js";
+import { sessionBaseDir } from "../../session/persistence/repository.js";
+import { decideSessionBrick } from "../../session/seat-brick.js";
 import type { SessionRecord } from "../../types.js";
 
 export const BRICK_CLI_TIMEOUT_MS = 3_000;
@@ -120,23 +122,38 @@ export async function stampBrickSessionStarted(
   }
 }
 
+/**
+ * The `ACPX_BRICK` / `ACPX_BRICK_PATH` pair for a spawn — the SEAT's brick for a seated
+ * session (`decideSessionBrick`), never the record's `metadata.brick` cache read raw.
+ * All four env-builder sites call this; a fifth must too.
+ */
+export async function resolveSessionBrickContext(
+  subject: Pick<SessionRecord, "seatId" | "metadata">,
+): Promise<{ brick: string | null; brickPath: string | null }> {
+  const brick = (await decideSessionBrick(subject, sessionBaseDir()))?.ref ?? null;
+  return { brick, brickPath: brick ? resolveExistingBrickPath(brick) : null };
+}
+
 export async function maybeStampBrickLink(record: SessionRecord): Promise<void> {
-  const brickId = record.metadata?.brick?.trim().toLowerCase();
+  const brickId = (await decideSessionBrick(record, sessionBaseDir()))?.ref.toLowerCase();
   if (!brickId || !BRICK_UUID_RE.test(brickId)) {
     return;
   }
   await stampBrickSessionStarted(brickId, record.acpxRecordId);
 }
 
-export async function warnIfBrickDoesNotResolve(brickId: string): Promise<void> {
+/** Warns when the ref is a definite miss, and says whether `brick show` RESOLVED it — the only
+ * thing that earns `validated` (a not-found, a timeout and a missing CLI are all `false`). */
+export async function warnIfBrickDoesNotResolve(brickId: string): Promise<boolean> {
   const normalized = brickId.trim().toLowerCase();
   if (!BRICK_UUID_RE.test(normalized)) {
-    return;
+    return false;
   }
   const result = await runBrickShow(normalized, BRICK_CLI_TIMEOUT_MS);
   if (result.kind === "not-found") {
     process.stderr.write(`[acpx] warning: brick does not resolve in the pool: ${normalized}\n`);
   }
+  return result.kind === "resolved";
 }
 
 async function runBrickShow(ref: string, timeoutMs: number): Promise<BrickShowResult> {

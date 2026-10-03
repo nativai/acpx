@@ -65,8 +65,9 @@ import {
 } from "../../session/persistence.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
 import { explainSeatRowMissing } from "../../session/seat-backfill.js";
+import { withBrickCache } from "../../session/seat-brick.js";
 import type { SessionRecord } from "../../types.js";
-import { resolveExistingBrickPath } from "./brick-link.js";
+import { resolveSessionBrickContext } from "./brick-link.js";
 import { DEFAULT_QUEUE_OWNER_TTL_MS } from "./contracts.js";
 import type {
   AgentOutputStyleListOptions,
@@ -373,14 +374,9 @@ function metadataWithSeatBrickLink(
   childMetadata: Record<string, string> | undefined,
   link: SeatBrickLink,
 ): Record<string, string> | undefined {
-  // Drop any stale `brick_validation` the child might already carry (there is
-  // no legitimate source for one before the seat's link is applied).
-  const { brick_validation: _stale, ...rest } = childMetadata ?? {};
-  return {
-    ...rest,
-    brick: link.ref,
-    brick_validation: link.validated ? "validated" : "unvalidated",
-  };
+  // Drops any stale `brick_validation` the child might already carry (no legitimate source for
+  // one before the seat's link is applied) — and spells the pair through the ONE helper.
+  return withBrickCache(childMetadata, link) ?? {};
 }
 
 /**
@@ -1114,9 +1110,14 @@ async function forkSessionRecordWithClient(
 // Build the best-effort sessionContext for the first (creation) spawn. The ?? null chains mirror
 // the sessionContext shape in queue-owner-runtime.ts / connected-session.ts (trivial field-mapping).
 // eslint-disable-next-line complexity -- ?? null field-mapping; cannot simplify without losing null safety
-function creationSessionContext(options: SessionCreateOptions) {
-  const brick = options.metadata?.brick?.trim() || null;
-  const brickPath = brick ? resolveExistingBrickPath(brick) : null;
+async function creationSessionContext(options: SessionCreateOptions) {
+  // No record yet, so no record seatId — but a JOIN names its seat (`options.seatId`), and
+  // that seat's brick is the one this spawn must carry, not the spawner's ambient value
+  // `options.metadata` holds until `createSessionRecordWithClient` reconciles it.
+  const { brick, brickPath } = await resolveSessionBrickContext({
+    seatId: options.seatId,
+    metadata: options.metadata,
+  });
   return {
     acpxRecordId: "",
     sessionName: normalizeName(options.seatName) ?? null,
@@ -1175,7 +1176,7 @@ export async function createSessionWithClient(
     // sessionContext fields are best-effort (each is guarded independently in
     // buildAgentEnvironment, so a null acpxRecordId only skips ACPX_SESSION_URL
     // on this one spawn — it is set on the next spawn from the persisted record).
-    sessionContext: creationSessionContext(effectiveOptions),
+    sessionContext: await creationSessionContext(effectiveOptions),
   });
 
   try {

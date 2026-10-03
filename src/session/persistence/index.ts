@@ -9,7 +9,12 @@ import type { SessionRecord } from "../../types.js";
 import { modelSetMethodKnownUnsupported } from "../mode-preference.js";
 import { withSessionIndexLock } from "./index-lock.js";
 import { parseSessionRecord } from "./parse.js";
-import { parseSeatFieldsFromIndexEntry, seatFieldsToIndexEntry } from "./seat-fields.js";
+import {
+  brickFieldsToIndexEntry,
+  parseBrickFieldsFromIndexEntry,
+  parseSeatFieldsFromIndexEntry,
+  seatFieldsToIndexEntry,
+} from "./seat-fields.js";
 import { isNonSessionRecordFile } from "./session-dir-files.js";
 
 const SESSION_INDEX_SCHEMA = "acpx.session-index.v1";
@@ -93,7 +98,13 @@ export type SessionIndexEntry = {
    * green. CONCEPTION 9.3 leg 4.
    */
   forkedAtMessageIndexRequested?: number;
+  /** The holder's CACHE of its session's brick (brick fb1a7a9c) — the seat's `brick_id` is the
+   * authority. Both brick fields travel through `seat-fields.ts`'s brick carrier. */
   metadataBrick?: string;
+  /** The cache's validation state, PRESENT WHENEVER `metadataBrick` is (9d0fb37c): `validated`
+   * only where `brick show` resolved the ref; a holder that carries no state word reads
+   * `unvalidated`, never validated-by-assumption. Absent exactly when there is no brick. */
+  metadataBrickValidation?: "validated" | "unvalidated";
   metadataSpawnState?: string;
   // Infra-label (brick 2ac729a4): metadata.infra projected as hot-path scalars so
   // acpx-ui's fleet-list ⚙ infra badge renders without a per-record read. Additive,
@@ -406,7 +417,7 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     forkedFromSessionId: optionalString(record.forkedFromSessionId),
     forkedAtMessageIndex: optionalFiniteNumber(record.forkedAtMessageIndex),
     forkedAtMessageIndexRequested: optionalFiniteNumber(record.forkedAtMessageIndexRequested),
-    metadataBrick: optionalString(record.metadataBrick),
+    ...parseBrickFieldsFromIndexEntry(record),
     metadataSpawnState: optionalString(record.metadataSpawnState),
     metadataInfra: optionalBoolean(record.metadataInfra),
     metadataInfraPurpose: optionalString(record.metadataInfraPurpose),
@@ -576,7 +587,7 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     forkedFromSessionId: record.forkedFromSessionId,
     forkedAtMessageIndex: record.forkedAtMessageIndex,
     forkedAtMessageIndexRequested: record.forkedAtMessageIndexRequested,
-    metadataBrick: metadata?.brick,
+    ...brickFieldsToIndexEntry(record),
     metadataSpawnState: metadata?.spawn_state,
     // Infra label (brick 2ac729a4): flat string keys → hot-path index scalars.
     metadataInfra: metadata?.infra === "1" ? true : undefined,

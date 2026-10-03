@@ -239,3 +239,91 @@ test("G5 · a seat-less record's INDEX ENTRY also parses fine — undefined, nev
     await fs.rm(dir, { recursive: true, force: true });
   }
 });
+
+// brick fb1a7a9c / 9d0fb37c — the index's BRICK PAIR: `metadataBrick` (the holder's cache of its
+// seat's brick) and its validation state. Asserted as a PRESENT KEY WITH A SPECIFIC VALUE, never
+// by absence or truthiness: on this field a skipped write and an unknown state read the same.
+
+function brickValidationOf(entry: SessionIndexEntry | undefined): unknown {
+  return (entry as unknown as Record<string, unknown> | undefined)?.metadataBrickValidation;
+}
+
+async function indexRoundTrip(entry: SessionIndexEntry): Promise<SessionIndexEntry | undefined> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-brick-index-guard-"));
+  try {
+    await writeSessionIndex(dir, { files: [entry.file], entries: [entry] });
+    return (await readSessionIndex(dir))?.entries[0];
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+}
+
+function brickRecord(id: string, metadata: Record<string, string> | undefined): SessionRecord {
+  return makeSessionRecord({
+    acpxRecordId: id,
+    acpSessionId: `${id}-acp`,
+    agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+    cwd: "/workspace/x",
+    metadata,
+  });
+}
+
+const INDEX_BRICK = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+
+test("guard 6 · the index entry carries the brick's validation state, for validated / unvalidated / absent, through BOTH legs", async () => {
+  const validated = toSessionIndexEntry(
+    brickRecord("idx-validated", { brick: INDEX_BRICK, brick_validation: "validated" }),
+    "idx-validated.json",
+  );
+  const unvalidated = toSessionIndexEntry(
+    brickRecord("idx-unvalidated", { brick: INDEX_BRICK, brick_validation: "unvalidated" }),
+    "idx-unvalidated.json",
+  );
+  const absent = toSessionIndexEntry(brickRecord("idx-absent", undefined), "idx-absent.json");
+
+  assert.equal(brickValidationOf(validated), "validated");
+  assert.equal(brickValidationOf(unvalidated), "unvalidated");
+  assert.equal(brickValidationOf(absent), undefined);
+  assert.equal(absent.metadataBrick, undefined);
+
+  // A validated and an unvalidated link must be DIFFERENT index bytes (the 9d0fb37c measurement).
+  assert.notEqual(
+    JSON.stringify({ ...validated, file: "x" }),
+    JSON.stringify({ ...unvalidated, file: "x" }),
+  );
+
+  // The parse leg: the state survives index.json, and an absent brick stays absent.
+  assert.equal(brickValidationOf(await indexRoundTrip(validated)), "validated");
+  assert.equal(brickValidationOf(await indexRoundTrip(unvalidated)), "unvalidated");
+  const backAbsent = await indexRoundTrip(absent);
+  assert.equal(brickValidationOf(backAbsent), undefined);
+  assert.equal(backAbsent?.metadataBrick, undefined);
+});
+
+test("guard 7 · a LEGACY holder (a brick, no state word) and a legacy index entry read UNVALIDATED — never validated-by-assumption", async () => {
+  const legacyRecord = toSessionIndexEntry(
+    brickRecord("idx-legacy", { brick: INDEX_BRICK }),
+    "idx-legacy.json",
+  );
+  assert.equal(brickValidationOf(legacyRecord), "unvalidated");
+
+  // An index.json written before this field existed: the brick, and no state key at all.
+  const legacyEntry: SessionIndexEntry = { ...legacyRecord };
+  delete (legacyEntry as unknown as Record<string, unknown>).metadataBrickValidation;
+  assert.equal(brickValidationOf(await indexRoundTrip(legacyEntry)), "unvalidated");
+
+  // A wrong-typed state is dropped to the same default, never coerced to validated.
+  const garbled = {
+    ...legacyRecord,
+    metadataBrickValidation: true,
+  } as unknown as SessionIndexEntry;
+  assert.equal(brickValidationOf(await indexRoundTrip(garbled)), "unvalidated");
+});
+
+test("guard 8 · a schema-invalid (non-string) metadata.brick never throws out of the index projection", () => {
+  // closed-monotonicity-guard.test.ts writes such a record on purpose; the old projection copied
+  // the value and never looked at it, so the new one must not either.
+  const record = brickRecord("idx-garbage", { brick: 42 as unknown as string });
+  assert.doesNotThrow(() => toSessionIndexEntry(record, "idx-garbage.json"));
+  assert.equal(brickValidationOf(toSessionIndexEntry(record, "idx-garbage.json")), undefined);
+});

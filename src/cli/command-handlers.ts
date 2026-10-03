@@ -69,6 +69,8 @@ import {
   matchesPruneSessionId,
   resolveSessionRecord,
   resolveTemplateSelector,
+  seatBrickLinkFromRef,
+  sessionBaseDir,
   rollbackTemplateSlug,
   DeletionManifestWriteError,
   describeManifestFailure,
@@ -77,6 +79,8 @@ import {
   writeSessionRecordWithLifecycle,
 } from "../session/persistence.js";
 import type { MigrateSlugsResult, TemplateRollbackResult } from "../session/persistence.js";
+import { writeBrickLink } from "../session/seat-brick-write.js";
+import { decideSessionBrick } from "../session/seat-brick.js";
 import { seatDisplayName } from "../session/seat-display-name.js";
 import { EXIT_CODES } from "../types.js";
 import type {
@@ -699,12 +703,14 @@ type ResolvedParentSession = {
 // is the persisted desired intent (the single source of truth — the live
 // config_options snapshot can be stale).
 // eslint-disable-next-line complexity -- explicit optional-field projection keeps inheritance reviewable
-function parentInheritableFields(parent: SessionRecord): ResolvedParentSession {
+async function parentInheritableFields(parent: SessionRecord): Promise<ResolvedParentSession> {
   const sessionOptions = parent.acpx?.session_options;
   return {
     acpxRecordId: parent.acpxRecordId,
     seatId: parent.seatId,
-    brick: parent.metadata?.brick,
+    // The parent's DECIDED brick (its seat's), never its raw `metadata.brick` cache — a child
+    // into a new seat must not inherit a stale copy (fb1a7a9c).
+    brick: (await decideSessionBrick(parent, sessionBaseDir()))?.ref,
     subscription: sessionOptions?.subscription,
     profile: sessionOptions?.profile,
     agentCommand: parent.agentCommand,
@@ -724,7 +730,10 @@ async function resolveAndValidateParentSessionId(
   try {
     // Local parent: snapshot its inheritable fields, and carry the explicit url
     // when one was supplied (else downstream derives it from the id same-box).
-    return { ...parentInheritableFields(await resolveSessionRecord(ref.id)), sessionUrl: ref.url };
+    return {
+      ...(await parentInheritableFields(await resolveSessionRecord(ref.id))),
+      sessionUrl: ref.url,
+    };
   } catch (error) {
     if (error instanceof SessionNotFoundError) {
       // FW-19: a parent identified by URL may live on ANOTHER box — its id won't
@@ -760,7 +769,7 @@ async function resolveNewSessionLineage(flags: SessionsNewFlags): Promise<{
 }> {
   const from = flags.from === undefined ? undefined : await resolveFromSessionRecord(flags.from);
   const parent = await resolveParentForNew(flags, from);
-  return { from, parent, inherit: from ? parentInheritableFields(from) : parent };
+  return { from, parent, inherit: from ? await parentInheritableFields(from) : parent };
 }
 
 async function resolveParentForNew(
@@ -2414,9 +2423,17 @@ export async function handleSessionsSetMetadata(
   const selector = resolveSessionTargetSelector({ flags, command });
   const record = await requireExplicitSessionRecord(selector, agent.agentName);
   if (key === "brick") {
-    await warnIfBrickDoesNotResolve(trimmedValue);
+    // The brick link has ONE writer (fb1a7a9c): a seated record's SEAT is re-pointed and the cache
+    // follows with its validation word; a seat-less record's cache is written the same way.
+    const validated = await warnIfBrickDoesNotResolve(trimmedValue);
+    await writeBrickLink({
+      seatId: record.seatId,
+      recordIds: [record.acpxRecordId],
+      link: seatBrickLinkFromRef(trimmedValue, validated),
+    });
+  } else {
+    await writeSessionRecord(mergeSessionMetadata(record, key, trimmedValue));
   }
-  await writeSessionRecord(mergeSessionMetadata(record, key, trimmedValue));
   printSetMetadataResultByFormat(key, trimmedValue, record, globalFlags.format);
 }
 

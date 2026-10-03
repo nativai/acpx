@@ -19,6 +19,7 @@ for (const scenario of [
   "ownership",
   "identity-guard",
   "legacy-relink",
+  "seat-decided-projection",
 ]) {
   test(`B14 ${scenario}`, () => {
     const root = "/workspace/bricksdb-b14-selftest";

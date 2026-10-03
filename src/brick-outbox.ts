@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { isSqliteExperimentalWarning } from "./models/ui-prefs-store.js";
+import { decideSessionBrickSync } from "./session/seat-brick.js";
 
 type SqliteModule = { DatabaseSync: new (path: string) => DatabaseSync };
 let sqliteModule: SqliteModule | undefined;
@@ -387,6 +388,19 @@ export function projectionIdentity(
 function metadataValue(record: DiskRecord | undefined, key: string): string | undefined {
   return record?.metadata?.[key];
 }
+/**
+ * The brick a record HAS NOW, decided like every other site (fb1a7a9c): its seat's `brick_id` when it
+ * is seated and the seat has one, else the cache. The projection TARGET (upsert vs tombstone, and
+ * which brick) comes from here. What the session HAD — the tombstone's brick, `preserveProjection*` —
+ * stays on the on-disk cache (`metadataValue(current, "brick")`): the cache is what was last published.
+ */
+function decidedBrick(record: DiskRecord | undefined): string | undefined {
+  const seatId = typeof record?.seat_id === "string" ? record.seat_id : undefined;
+  return decideSessionBrickSync(
+    { seatId, metadata: record?.metadata },
+    path.join(os.homedir(), ".acpx", "sessions"),
+  )?.ref;
+}
 function recordOwnsAttempt(record: DiskRecord | undefined, attempt: SpawnAttempt): boolean {
   if (!record) {
     return false;
@@ -602,7 +616,7 @@ function needsPublication(
   attempt: SpawnAttempt | undefined,
   next: SpawnAttemptState,
 ): boolean {
-  if (!metadataValue(record, "brick")) {
+  if (!decidedBrick(record)) {
     return false;
   }
   if (next === "published") {
@@ -1413,7 +1427,7 @@ export class BrickOutbox {
       if (unpublishedRecord(record)) {
         return undefined;
       }
-      const brick = metadataValue(record, "brick") || metadataValue(current, "brick");
+      const brick = decidedBrick(record) || metadataValue(current, "brick");
       if (!brick) {
         return undefined;
       }
@@ -1443,7 +1457,7 @@ export class BrickOutbox {
           intentId,
           id,
           brick,
-          metadataValue(record, "brick") ? "upsert" : "tombstone",
+          decidedBrick(record) ? "upsert" : "tombstone",
           revision,
           epoch,
           JSON.stringify(payload),
