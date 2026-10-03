@@ -1051,3 +1051,68 @@ test("F9 · the ALREADY-ACTIVE notice omits it too", async () => {
     );
   });
 });
+
+// ─── practical-tests pass 1, brick e829327e — AC6: an ordinal is a LABEL, assigned once, never renumbered ─────
+// Rolling back to a RETIRED (open) former holder used to draw a fresh ordinal for it — #2 became #4, and "#2"
+// named no one in the seat any more — overwriting a label that journal lines, stamps and humans already hold.
+// Re-activating a holder KEEPS its ordinal and leaves next_ordinal alone; only a NEW holder (one with no
+// ordinal yet) takes next_ordinal.
+
+/** a retired (#1), b retired (#2), c ACTIVE (#3), and a PREPARED holder d with no ordinal; next_ordinal 4. */
+async function seedRolledForwardSeat(homeDir: string): Promise<void> {
+  await fs.mkdir(path.join(homeDir, "workspace"), { recursive: true });
+  await seedHolder(homeDir, "holder-a", { holderActive: false, holderOrdinal: 1 });
+  await seedHolder(homeDir, "holder-b", { holderActive: false, holderOrdinal: 2 });
+  await seedHolder(homeDir, "holder-c", { holderActive: true, holderOrdinal: 3 });
+  await seedHolder(homeDir, "holder-d", { holderActive: false });
+  await seedSeat(homeDir, { activeHolderId: "holder-c", nextOrdinal: 4 });
+}
+
+test("AC6 · re-activating a RETIRED holder KEEPS its ordinal and does not advance next_ordinal", async () => {
+  await withTempHome(async (homeDir) => {
+    await seedRolledForwardSeat(homeDir);
+
+    const result = await activate(homeDir, SEAT_A, "holder-b");
+    assert.equal(result.code, 0, `${result.stderr}${result.stdout}`);
+    const payload = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
+    assert.equal(payload.outcome, "activated");
+    assert.equal(payload.holderOrdinal, 2, "holder-b was #2 and must stay #2, not be re-drawn");
+
+    const row = seatFromStore(await readSeatStore(sessionDirOf(homeDir)), SEAT_A);
+    assert.equal(
+      row?.activeHolderId,
+      "holder-b",
+      "the pointer must still move to the re-activated holder",
+    );
+    assert.equal(
+      row?.nextOrdinal,
+      4,
+      "re-activation consumed an ordinal — next_ordinal must not move",
+    );
+
+    const b = await readRecordJson(homeDir, "holder-b");
+    const c = await readRecordJson(homeDir, "holder-c");
+    assert.equal(b.holder_ordinal, 2, "the stored label of holder-b changed");
+    assert.equal(b.holder_active, true);
+    assert.equal(c.holder_ordinal, 3, "the retired holder's label must be untouched");
+    assert.equal(c.holder_active, false);
+  });
+});
+
+test("AC6 · a NEW holder still takes next_ordinal, after a re-activation as before it", async () => {
+  await withTempHome(async (homeDir) => {
+    await seedRolledForwardSeat(homeDir);
+
+    const rollback = await activate(homeDir, SEAT_A, "holder-b");
+    assert.equal(rollback.code, 0, `${rollback.stderr}${rollback.stdout}`);
+
+    const fresh = await activate(homeDir, SEAT_A, "holder-d");
+    assert.equal(fresh.code, 0, `${fresh.stderr}${fresh.stdout}`);
+    const payload = JSON.parse(fresh.stdout.trim()) as Record<string, unknown>;
+    assert.equal(payload.holderOrdinal, 4, "a new holder takes next_ordinal (4)");
+    const row = seatFromStore(await readSeatStore(sessionDirOf(homeDir)), SEAT_A);
+    assert.equal(row?.nextOrdinal, 5);
+    assert.equal((await readRecordJson(homeDir, "holder-d")).holder_ordinal, 4);
+    assert.equal((await readRecordJson(homeDir, "holder-b")).holder_ordinal, 2, "b is still #2");
+  });
+});
