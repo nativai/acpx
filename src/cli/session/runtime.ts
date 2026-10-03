@@ -2328,6 +2328,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   const ownClient = options.client == null;
   const displayName = options.client == null ? await seatDisplayName(record) : undefined;
   const { brick, brickPath } = await resolveSessionBrickContext(record);
+  // Only an owned client builds its own adapter env — a supplied one needs no folder created here.
+  const agentFolders = ownClient ? resolveAndEnsureAgentFolder(record, brickPath) : null;
   const client =
     options.client ??
     new AcpClient({
@@ -2349,7 +2351,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         parentSessionUrl: record.parentSessionUrl ?? null,
         brick,
         brickPath,
-        agentFolder: resolveAndEnsureAgentFolder(record, brickPath, displayName),
+        agentFolder: agentFolders?.agentFolder ?? null,
+        seatFolder: agentFolders?.seatFolder ?? null,
         subscriptionId: record.acpx?.session_options?.subscription ?? null,
         profileId: record.acpx?.session_options?.profile ?? null,
         reasoningEffort: sessionOptions?.reasoningEffort ?? null,

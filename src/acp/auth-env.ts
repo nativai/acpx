@@ -521,6 +521,8 @@ export type AgentSessionContext = {
   brick?: string | null;
   brickPath?: string | null;
   agentFolder?: string | null;
+  /** C7 (brick 09197f03) — `<brick>/agents/<seat8>/`; mirrors AcpClientOptions.sessionContext.seatFolder. */
+  seatFolder?: string | null;
   /**
    * Selected Claude subscription id (from ~/.acpx/subscriptions/registry.json).
    * When set and resolvable, buildAgentEnvironment points the adapter at that
@@ -669,6 +671,13 @@ function buildAgentEnvironment(
   delete env.ACPX_TASK_FOLDER;
   delete env.ACPX_BRICK;
   delete env.ACPX_BRICK_PATH;
+  // C7 (brick 09197f03) — the agent's workspace folders are session identity like every variable above, and
+  // were MISSING from this list: ACPX_AGENT_FOLDER was only ever written, never cleared, so a brick-less or
+  // seat-less child of a long-lived queue owner inherited its parent's folder. ACPX_SEAT_FOLDER is the new
+  // sibling and must move with it — a seat-less child must never inherit a stale seat folder. Both are
+  // re-set below from THIS spawn's own context, or stay absent.
+  delete env.ACPX_AGENT_FOLDER;
+  delete env.ACPX_SEAT_FOLDER;
   // ── THE BRICKS-REALM CREDENTIAL — STRIPPED BY PREFIX, NOT BY NAME ────────────────────────────
   //
   // ⚠️ A NEW NAME ADDED TO THE LIST ABOVE WOULD NOT BE GOOD ENOUGH, AND THIS FILE IS ITS OWN
@@ -942,6 +951,15 @@ function buildAgentEnvironment(
     const trimmedAgentFolder = sessionContext.agentFolder.trim();
     if (trimmedAgentFolder.length > 0) {
       env.ACPX_AGENT_FOLDER = trimmedAgentFolder;
+    }
+  }
+  // C7 — additive beside ACPX_AGENT_FOLDER (C3's dual-write rule): the seat-level folder that holds
+  // seat-level artifacts beside `holders/`. Unlike ACPX_SEAT_URL it composes no URL, so it does NOT depend
+  // on a resolvable base URL.
+  if (sessionContext && typeof sessionContext.seatFolder === "string") {
+    const trimmedSeatFolder = sessionContext.seatFolder.trim();
+    if (trimmedSeatFolder.length > 0) {
+      env.ACPX_SEAT_FOLDER = trimmedSeatFolder;
     }
   }
   // No base URL means no host for `<recordId>@<host>` — the function's own

@@ -163,6 +163,7 @@ async function submitToRunningOwner(
 async function sessionContextFromRecord(record: Awaited<ReturnType<typeof resolveSessionRecord>>) {
   const displayName = await seatDisplayName(record);
   const { brick, brickPath } = await resolveSessionBrickContext(record);
+  const agentFolders = resolveAndEnsureAgentFolder(record, brickPath);
   return {
     acpxRecordId: record.acpxRecordId,
     sessionName: displayName ?? null,
@@ -170,7 +171,8 @@ async function sessionContextFromRecord(record: Awaited<ReturnType<typeof resolv
     parentSessionUrl: record.parentSessionUrl ?? null,
     brick,
     brickPath,
-    agentFolder: resolveAndEnsureAgentFolder(record, brickPath, displayName),
+    agentFolder: agentFolders?.agentFolder ?? null,
+    seatFolder: agentFolders?.seatFolder ?? null,
     subscriptionId: record.acpx?.session_options?.subscription ?? null,
     profileId: record.acpx?.session_options?.profile ?? null,
     seatId: record.seatId ?? null,

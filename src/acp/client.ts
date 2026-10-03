@@ -111,7 +111,7 @@ import {
   type AgentSessionContext,
   type EffectiveAccountMetadata,
 } from "./auth-env.js";
-import { resolveBrickContext } from "./brick-context.js";
+import { brickContextIdentity, resolveBrickContext } from "./brick-context.js";
 import {
   materializeClaudeForkSession,
   resolveClaudeUuidForAcpxIndex,
@@ -2005,11 +2005,13 @@ export class AcpClient {
     if (!brick) {
       return undefined;
     }
-    // Render the brick block from the child's OWN id, not the queue-owner's ambient
-    // $ACPX_SESSION_URL (the spawner's). Omitting the flag when we have no own id (the
-    // transient creation spawn, acpxRecordId="") falls back to env — harmless, serves no turn.
-    const sessionId = this.options.sessionContext?.acpxRecordId?.trim() || undefined;
-    return await resolveBrickContext(brick, { sessionId });
+    // Render the brick block from the child's OWN session AND seat, not the queue-owner's ambient
+    // $ACPX_SESSION_URL (the spawner's). With no own id (the transient creation spawn, acpxRecordId="")
+    // the flag is omitted AND the spawner's ambient session/seat are stripped from brick's env
+    // (`brickContextEnv`), so the block renders its placeholder — never the spawner's folder.
+    // C7: the workspace path is `<brick>/agents/<seat8>/holders/<session8>/`, so the primer's line can only
+    // equal $ACPX_AGENT_FOLDER if brick is told the seat the folder was derived from.
+    return await resolveBrickContext(brick, brickContextIdentity(this.options.sessionContext));
   }
 
   private buildHomeSelectorMeta(): Record<string, unknown> | undefined {

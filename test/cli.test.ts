@@ -3332,6 +3332,7 @@ test("a legacy task_folder reaches neither the agent env nor the agent folder", 
       BRICK_SHIM_ID: BRICK_X,
       ACPX_BRICK_POOL_DIR: brickPool,
       ACPX_AGENT_FOLDER: undefined,
+      ACPX_SEAT_FOLDER: undefined,
       ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh",
     };
     const created = await runCli(
@@ -3364,6 +3365,9 @@ test("a legacy task_folder reaches neither the agent env nor the agent folder", 
     // the adapter environment any more.
     assert.equal(Object.prototype.hasOwnProperty.call(firstEnv, "ACPX_TASK_FOLDER"), false);
     assert.equal(Object.prototype.hasOwnProperty.call(firstEnv, "ACPX_AGENT_FOLDER"), false);
+    // The creation spawn has no record yet, so it carries neither folder (and ACPX_SEAT_FOLDER too is
+    // deleted, never inherited).
+    assert.equal(Object.prototype.hasOwnProperty.call(firstEnv, "ACPX_SEAT_FOLDER"), false);
 
     const prompted = await runCli(
       ["--cwd", cwd, "--format", "json", "codex", "prompt", "--session-id", id, "hi"],
@@ -3372,8 +3376,21 @@ test("a legacy task_folder reaches neither the agent env nor the agent folder", 
     );
     assert.equal(prompted.code, 0, prompted.stderr);
     const secondEnv = JSON.parse(await fs.readFile(envDumpFile, "utf8")) as Record<string, string>;
-    const expectedAgentFolder = path.join(brickPool, BRICK_X, "agents", `both-${id.slice(0, 8)}`);
+    // C7 (brick 09197f03): the folder is keyed on the SEAT and the holder's id — never on the name.
+    // `sessions new` minted the record's seat; read it from disk rather than assuming the shape.
+    const seatId = String(
+      (JSON.parse(await fs.readFile(sessionFilePath(homeDir, id), "utf8")) as { seat_id?: unknown })
+        .seat_id,
+    );
+    assert.match(
+      seatId,
+      /^[0-9a-f]{8}-[0-9a-f]{4}-/,
+      "the record carries no seat — the arm measured nothing",
+    );
+    const expectedSeatFolder = path.join(brickPool, BRICK_X, "agents", seatId.slice(0, 8));
+    const expectedAgentFolder = path.join(expectedSeatFolder, "holders", id.slice(0, 8));
     assert.equal(secondEnv.ACPX_AGENT_FOLDER, expectedAgentFolder);
+    assert.equal(secondEnv.ACPX_SEAT_FOLDER, expectedSeatFolder);
     assert.equal(Object.prototype.hasOwnProperty.call(secondEnv, "ACPX_TASK_FOLDER"), false);
     await fs.access(expectedAgentFolder);
     // The agent folder lands under the BRICK; the legacy task dir is never touched.
@@ -3405,12 +3422,18 @@ test("stale brick env is deleted when a session has no brick", async () => {
           ACPX_BRICK: "stale-brick",
           ACPX_BRICK_PATH: "/stale/brick",
           ACPX_TASK_FOLDER: "/stale/task",
+          // C7: both folder variables are session identity too (FW-07) — a brick-less child must not
+          // inherit its parent's agent or seat folder.
+          ACPX_AGENT_FOLDER: "/stale/brick/agents/aaaaaaaa/holders/bbbbbbbb",
+          ACPX_SEAT_FOLDER: "/stale/brick/agents/aaaaaaaa",
           ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh",
         },
       },
     );
     assert.equal(result.code, 0, result.stderr);
     const envDump = JSON.parse(await fs.readFile(envDumpFile, "utf8")) as Record<string, string>;
+    assert.equal(Object.prototype.hasOwnProperty.call(envDump, "ACPX_AGENT_FOLDER"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(envDump, "ACPX_SEAT_FOLDER"), false);
     assert.equal(Object.prototype.hasOwnProperty.call(envDump, "ACPX_BRICK"), false);
     assert.equal(Object.prototype.hasOwnProperty.call(envDump, "ACPX_BRICK_PATH"), false);
     assert.equal(Object.prototype.hasOwnProperty.call(envDump, "ACPX_TASK_FOLDER"), false);

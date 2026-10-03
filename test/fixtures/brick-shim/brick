@@ -15,6 +15,35 @@ function modeForVerb() {
   return process.env.BRICK_SHIM_MODE ?? "ok";
 }
 
+// C7: when set, record what identity env the shim was spawned with (null = ABSENT), so a test
+// can assert the child's session and seat reach `brick` through env, not through flags.
+const envLogPath = process.env.BRICK_SHIM_ENV_LOG;
+if (envLogPath) {
+  const has = (name) => (Object.hasOwn(process.env, name) ? process.env[name] : null);
+  fs.appendFileSync(
+    envLogPath,
+    `${JSON.stringify({ verb, ACPX_SESSION_URL: has("ACPX_SESSION_URL"), ACPX_SEAT_URL: has("ACPX_SEAT_URL") })}\n`,
+    "utf8",
+  );
+}
+
+// C7: BRICK_SHIM_REMOTE_PARSE=1 reproduces what the REAL acpx-ui brick CLI does in HTTP/remote mode
+// (brick/cli-remote.ts `dispatchRemoteBrick`): `new URL(env.ACPX_SESSION_URL).searchParams.get("session")`
+// on EVERY verb. A bare uuid throws "Invalid URL" and the CLI exits 1 — which blanks the brick block.
+if (process.env.BRICK_SHIM_REMOTE_PARSE) {
+  try {
+    if (process.env.ACPX_SESSION_URL) {
+      new URL(process.env.ACPX_SESSION_URL).searchParams.get("session");
+    }
+    if (process.env.ACPX_SEAT_URL) {
+      new URL(process.env.ACPX_SEAT_URL).searchParams.get("seat");
+    }
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(1);
+  }
+}
+
 const mode = modeForVerb();
 if (mode === "hang") {
   setTimeout(() => {}, 30_000);
