@@ -12,11 +12,7 @@ import {
   resolveTemplateSelector,
   rollbackTemplateSlug,
 } from "../src/session/persistence.js";
-import {
-  effectiveTemplateSlug,
-  isLaterTemplate,
-  slugify,
-} from "../src/session/persistence/template-slug.js";
+import { isLaterTemplate, slugify } from "../src/session/persistence/template-slug.js";
 import type { SessionRecord } from "../src/types.js";
 import {
   fileExists,
@@ -48,13 +44,6 @@ test("slugify (Appendix A) is lowercase kebab, collapses runs, trims, caps 64, d
   assert.equal(capped?.length, 64);
   // a slice that lands mid-separator must not leave a trailing dash
   assert.equal(slugify(`${"a".repeat(63)} bbbb`), "a".repeat(63));
-});
-
-test("effectiveTemplateSlug prefers stored slug, else slugify(name)", () => {
-  assert.equal(effectiveTemplateSlug("ctx-eng", "Context Engineer"), "ctx-eng");
-  assert.equal(effectiveTemplateSlug(undefined, "Context Engineer"), "context-engineer");
-  assert.equal(effectiveTemplateSlug(undefined, undefined), undefined);
-  assert.equal(effectiveTemplateSlug(undefined, "🙂"), undefined); // ⇒ caller uses record id
 });
 
 // ---------------------------------------------------------------------------
@@ -104,7 +93,7 @@ async function seedTemplate(homeDir: string, opts: SeedTemplateOptions): Promise
     acpSessionId: `${opts.id}-acp`,
     agentCommand: opts.agentCommand ?? AGENT,
     cwd: path.join(homeDir, "workspace"),
-    name: opts.name ?? opts.id,
+    legacyName: opts.name ?? opts.id,
     closed: true,
   });
   record.template = {
@@ -125,7 +114,7 @@ function makeCandidate(homeDir: string, id: string, name: string): SessionRecord
     acpSessionId: `${id}-acp`,
     agentCommand: AGENT,
     cwd: path.join(homeDir, "workspace"),
-    name,
+    legacyName: name,
     closed: true,
   });
   // The block markSessionAsTemplate builds (sans slug/version, which persistTemplateMark assigns).
@@ -152,10 +141,10 @@ async function readIndexEntry(
 // Mark: slug + version assignment (version = max+1 over the effectiveSlug group)
 // ---------------------------------------------------------------------------
 
-test("mark assigns default slug = slugify(name) + version 1 on a fresh slug", async () => {
+test("mark assigns the explicit slug + version 1 on a fresh slug", async () => {
   await withTempHome(async (homeDir) => {
     const cand = makeCandidate(homeDir, "cand-1", "Context Engineer");
-    await persistTemplateMark(cand, {}); // no --slug ⇒ default slugify(name)
+    await persistTemplateMark(cand, { slug: "context-engineer" });
 
     assert.equal(cand.template?.slug, "context-engineer");
     assert.equal(cand.template?.version, 1);
@@ -167,6 +156,17 @@ test("mark assigns default slug = slugify(name) + version 1 on a fresh slug", as
     const entry = await readIndexEntry(homeDir, "cand-1");
     assert.equal(entry?.templateSlug, "context-engineer");
     assert.equal(entry?.templateVersion, 1);
+  });
+});
+
+// D-IDENTITY (brick 61dc1302): a session has no name to derive a default slug from. The mark
+// still lands (slug-less, resolves by id) — it must not invent one from the legacy name.
+test("mark with no --slug derives NO slug, even from a legacy name", async () => {
+  await withTempHome(async (homeDir) => {
+    const cand = makeCandidate(homeDir, "cand-noslug", "Context Engineer");
+    await persistTemplateMark(cand, {});
+    assert.equal(cand.template?.slug, undefined);
+    assert.equal(cand.template?.version, undefined);
   });
 });
 

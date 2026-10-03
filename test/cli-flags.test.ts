@@ -573,7 +573,7 @@ test("session selector flags document explicit identity options", () => {
   const promptSessionHelp = addSessionOption(new Command()).helpInformation().replace(/\s+/g, " ");
   assert.match(
     promptSessionHelp,
-    /Use named session \(local first, then one exact global agent match\)/,
+    /REFUSED — a name identifies nothing; address a session with --session-id/,
   );
   assert.match(
     promptSessionHelp,
@@ -593,7 +593,7 @@ test("session selector flags document explicit identity options", () => {
     .replace(/\s+/g, " ");
   assert.match(
     namedSessionHelp,
-    /Use named session \(local first, then one exact global agent match\)/,
+    /REFUSED — a name identifies nothing; address a session with --session-id/,
   );
   assert.match(
     namedSessionHelp,

@@ -158,14 +158,11 @@ acpx codex -s docs 'rewrite API docs'           # parallel work in another named
 
 acpx codex sessions              # list sessions for codex command
 acpx codex sessions list         # explicit list
-acpx codex sessions show         # inspect cwd session metadata
-acpx codex sessions history      # show recent turn history
-acpx codex sessions new          # create fresh cwd-scoped default session
-acpx codex sessions new --name api # create fresh named session
-acpx codex sessions ensure       # return existing scoped session or create one
-acpx codex sessions ensure --name api # ensure named scoped session
-acpx codex sessions close        # close cwd-scoped default session
-acpx codex sessions close api    # close local named session, or one exact global match
+acpx codex sessions show --session-id <id>    # inspect session metadata
+acpx codex sessions history --session-id <id> # show recent turn history
+acpx codex sessions new                       # create a fresh session (prints its id)
+acpx codex sessions new --name api            # same, naming the new SEAT (a display label)
+acpx codex sessions close --session-id <id>   # close a session
 acpx codex sessions reopen <id>  # reopen a closed session (inverse of close; NOT `sessions recover`)
 acpx codex status                # local process status for current session
 acpx codex status --session-url "$ACPX_SESSION_URL" # durable self-check by URL
@@ -333,7 +330,7 @@ JSON events include a stable envelope for correlation:
 }
 ```
 
-Session-control JSON payloads (`sessions new|ensure`, `status`) always include
+Session-control JSON payloads (`sessions new`, `status`) always include
 `acpxRecordId` and `acpxSessionId`. They include `agentSessionId` only when the
 adapter exposes a provider-native session ID. The text/quiet session id is the
 local acpx record id; do not assume it can be passed to the native provider CLI
@@ -390,17 +387,15 @@ spawns the ACP bridge directly without `pnpm` wrapper noise:
 
 ## Session behavior
 
-- Prompt commands require an existing saved session record (created via `sessions new` or `sessions ensure`).
-- Prompts route by walking up from `cwd` (or `--cwd`) to the nearest git root (inclusive) and selecting the nearest active session matching `(agent command, dir, optional name)`.
-- If no git root is found, prompts only match an exact `cwd` session (no parent-directory walk).
-- `-s <name>` first selects a parallel named session during that directory walk. After a
-  local miss, existing-session commands use one exact, agent-matching global name; collisions
-  fail closed and require `--session-id` or `--session-url`.
-- `sessions new [--name <name>]` creates a fresh session for that scope and soft-closes the prior one.
-- `sessions ensure [--name <name>]` is idempotent: it returns an existing scoped session or creates one when missing.
-- `sessions close [name]` soft-closes the session: queue owner/processes are terminated, record is kept with `closed: true`.
+- A session is identified by its UUID and by nothing else. Every call that targets a session names it
+  with `--session-id <id>` (or `--session-url <url>`); the only call without one is `sessions new`.
+  There is no cwd walk, no name lookup and no `sessions ensure`: a call with no id is refused, with
+  the create form named. A session has a `cwd` (for `sessions list --filter-cwd` and display) and
+  belongs to a seat; a name exists on the seat only, is a display label, and identifies nothing.
+- `sessions new [--name <name>]` always creates a new session — it never closes or reuses another.
+  `--name` names the new seat and is refused together with `--seat` (rename with `seats rename`).
+- `sessions close --session-id <id>` soft-closes the session: queue owner/processes are terminated, record is kept with `closed: true`.
 - `sessions reopen <id>` clears `closed` so prompts are accepted again — the inverse of `close`. Idempotent, spawns nothing (the next prompt cold-respawns the owner), does not cascade to subagents, and is **not** `sessions recover` (which restarts a wedged queue owner and leaves the session closed).
-- `sessions ensure` over a **closed** same-scope session creates a fresh, empty one — closed sessions are invisible to auto-resume by scope. It warns on **stderr** and reports `createdBecauseClosed` in the JSON result so that is never silent; use `sessions reopen` when you meant to revive the old session.
 - `sessions list` uses agent-side ACP `session/list` when available; use
   `--cursor`, `--filter-cwd`, or `--local` for pagination, cwd filtering, or
   saved-record inspection.

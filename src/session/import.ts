@@ -9,12 +9,7 @@ import type { AcpJsonRpcMessage, SessionRecord } from "../types.js";
 import { defaultSessionEventLog, sessionEventActivePath } from "./event-log.js";
 import { setLoggedMessageCount } from "./messages-log-bookkeeping.js";
 import { messagesLogPath } from "./messages-log.js";
-import {
-  findSession,
-  listSessions,
-  parseSessionRecord,
-  writeSessionRecord,
-} from "./persistence.js";
+import { listSessions, parseSessionRecord, writeSessionRecord } from "./persistence.js";
 
 const SUPPORTED_FORMAT_VERSION = 1;
 
@@ -54,7 +49,6 @@ type ParsedExportedSession = z.infer<typeof exportedSessionSchema>;
 type ParsedExportedMessagesLog = NonNullable<ParsedExportedSession["messages_log"]>;
 
 export type ImportSessionOptions = {
-  name?: string;
   newCwd?: string;
   expectedAgentName?: string;
   expectedAgentCommand?: string;
@@ -139,10 +133,6 @@ function resolveImportedCwd(cwdRelative: string, newCwd: string | undefined): st
     return cwdRelative;
   }
   return path.join(os.homedir(), cwdRelative);
-}
-
-function resolveImportedName(parsed: ParsedExportedSession, requestedName: string | undefined) {
-  return requestedName ?? parsed.session.name ?? undefined;
 }
 
 function assertExpectedAgentCommand(
@@ -267,22 +257,6 @@ function commandLooksLikeBuiltInAgent(command: string, agentName: string): boole
   return kind !== undefined && kind === agentName.trim().toLowerCase();
 }
 
-async function assertDestinationScopeAvailable(record: SessionRecord): Promise<void> {
-  const existing = await findSession({
-    agentCommand: record.agentCommand,
-    agentName: record.agentName,
-    cwd: record.cwd,
-    name: record.name,
-  });
-  if (!existing) {
-    return;
-  }
-  throw importError(
-    "A session already exists for the import destination scope; pass --name or --cwd to import a separate copy",
-    "session-scope-exists",
-  );
-}
-
 async function assertProviderSessionAvailable(record: SessionRecord): Promise<void> {
   const existing = (await listSessions()).find(
     (session) => session.acpSessionId === record.acpSessionId,
@@ -299,7 +273,7 @@ async function assertProviderSessionAvailable(record: SessionRecord): Promise<vo
 function buildImportedRecord(
   parsed: ParsedExportedSession,
   sourceRecord: SessionRecord,
-  options: { newRecordId: string; cwd: string; name?: string },
+  options: { newRecordId: string; cwd: string },
 ): SessionRecord {
   const eventLog = {
     ...defaultSessionEventLog(options.newRecordId),
@@ -313,7 +287,6 @@ function buildImportedRecord(
     acpxRecordId: options.newRecordId,
     agentName: sourceRecord.agentName ?? normalizeAgentIdentity(parsed.session.agent_name),
     cwd: options.cwd,
-    name: resolveImportedName(parsed, options.name),
     closed: false,
     closedAt: undefined,
     pid: undefined,
@@ -381,10 +354,8 @@ export async function importSession(
   const newRecord = buildImportedRecord(parsed, sourceRecord, {
     newRecordId,
     cwd,
-    name: options.name,
   });
 
-  await assertDestinationScopeAvailable(newRecord);
   await assertProviderSessionAvailable(newRecord);
   if (parsed.messages_log) {
     await restoreImportedMessagesLog(sessionsDir, newRecord, parsed.messages_log);

@@ -13,11 +13,7 @@ import {
   resolveEffectiveForkIndex,
   resolveHarnessCapabilities,
 } from "../acp/harness-capabilities.js";
-import {
-  listBuiltInAgents,
-  resolveAgentCommand,
-  resolveAgentNameFromCommand,
-} from "../agent-registry.js";
+import { resolveAgentNameFromCommand } from "../agent-registry.js";
 import {
   findProfile,
   isSubscriptionProfileLocked,
@@ -66,18 +62,10 @@ import {
   OUTPUT_STYLE_CONFIG_ID,
 } from "../session/output-style.js";
 import {
-  findGitRepositoryRoot,
-  findSession,
-  findSessionByDirectoryWalk,
   isoNow,
   isTemplateRecord,
-  listCoClaimantSessions,
-  listSessions,
   migrateTemplateSlugs,
-  normalizeName,
   persistTemplateMark,
-  resolveGlobalSessionByName,
-  resolveSessionByExactName,
   matchesPruneSessionId,
   resolveSessionRecord,
   resolveTemplateSelector,
@@ -88,11 +76,8 @@ import {
   writeSessionRecord,
   writeSessionRecordWithLifecycle,
 } from "../session/persistence.js";
-import type {
-  MigrateSlugsResult,
-  SessionNameCandidate,
-  TemplateRollbackResult,
-} from "../session/persistence.js";
+import type { MigrateSlugsResult, TemplateRollbackResult } from "../session/persistence.js";
+import { seatDisplayName } from "../session/seat-display-name.js";
 import { EXIT_CODES } from "../types.js";
 import type {
   OutputFormat,
@@ -131,10 +116,11 @@ import { emitJsonResult } from "./output/json-output.js";
 import type { PruneRefusal, PruneScope } from "./output/render.js";
 import {
   explicitSessionIdFromSelector,
+  NoSessionError,
+  noSessionIdMessage,
   parseSessionIdFromUrl,
-  resolveExplicitSessionRecord,
+  requireExplicitSessionRecord,
   resolveSessionTargetSelector,
-  type SessionTargetSelector,
 } from "./session-selector.js";
 import {
   maybeStampBrickLink,
@@ -166,13 +152,6 @@ import {
   skippedFromOptionsNote,
   withFromOptions,
 } from "./session/sessions-new-from.js";
-
-class NoSessionError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "NoSessionError";
-  }
-}
 
 type SessionModule = typeof import("../session/session.js");
 type OutputModule = typeof import("./output/output.js");
@@ -454,7 +433,7 @@ function assertProfileUnlocked(profile: ProfileEntry, registry: ProfileRegistry)
 }
 
 function existingSessionSubscriptionLabel(record: SessionRecord): string {
-  return record.name ? `"${record.name}" (${record.acpxRecordId})` : record.acpxRecordId;
+  return record.acpxRecordId;
 }
 
 function switchSubscriptionCommand(
@@ -462,8 +441,7 @@ function switchSubscriptionCommand(
   agentName: string,
   requested: string,
 ): string {
-  const sessionFlag = record.name ? ` --session ${record.name}` : "";
-  return `acpx ${agentName} set${sessionFlag} subscription ${requested}`;
+  return `acpx ${agentName} set subscription ${requested} --session-id ${record.acpxRecordId}`;
 }
 
 type EffectiveSubscriptionSelection = {
@@ -987,7 +965,7 @@ function buildSessionStartOptions(params: {
     recordId: params.flags.recordId,
     agentName: params.agent.agentName,
     cwd: params.agent.cwd,
-    name: params.flags.name,
+    seatName: params.flags.name,
     resumeSessionId: params.flags.resumeSession,
     parentSessionId: params.parent?.acpxRecordId,
     parentSessionUrl: params.parent?.sessionUrl,
@@ -1092,8 +1070,8 @@ function resolveCopyDestinationCwd(
   return cwdSource && cwdSource !== "default" ? path.resolve(globalFlags.cwd) : source.cwd;
 }
 
-function sourceDefaultForkName(source: SessionRecord): string {
-  const sourceName = source.name ?? source.title ?? "session";
+async function sourceDefaultForkName(source: SessionRecord): Promise<string> {
+  const sourceName = (await seatDisplayName(source)) ?? source.title ?? "session";
   return `${sourceName} (fork)`;
 }
 
@@ -1330,320 +1308,6 @@ async function printLocalSessionsList(
   printSessionsByFormat(filtered, format);
 }
 
-// L3 (brick 6572c1a9) — a positional argument here is always resolved as a
-// cwd-scoped NAME, never as a session id, so a uuid passed positionally never
-// matches and lands exactly here. A bare "No named session" message reads as
-// an ordinary not-found and gives no actionable next step, which is how a
-// close that closed nothing got mistaken for one that succeeded. When the
-// given value has uuid shape, name the actual way to target by id.
-const SESSION_NAME_LOOKS_LIKE_UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-function missingScopedSessionMessage(
-  agent: ResolvedAgentInvocation,
-  sessionName: string | undefined,
-): string {
-  if (sessionName === undefined) {
-    return `No cwd session for ${agent.cwd} and agent ${agent.agentName}`;
-  }
-  const base = `No named session "${sessionName}" for cwd ${agent.cwd} and agent ${agent.agentName}`;
-  return SESSION_NAME_LOOKS_LIKE_UUID_RE.test(sessionName)
-    ? `${base} — "${sessionName}" looks like a session id; pass it with --session-id instead of positionally`
-    : base;
-}
-
-async function findScopedSessionOrThrow(
-  agent: ResolvedAgentInvocation,
-  sessionName: string | undefined,
-): Promise<SessionRecord> {
-  const record = await findSession({
-    agentCommand: agent.agentCommand,
-    agentName: agent.agentName,
-    cwd: agent.cwd,
-    name: sessionName,
-    includeClosed: true,
-  });
-
-  if (!record) {
-    throw new Error(missingScopedSessionMessage(agent, sessionName));
-  }
-
-  return record;
-}
-
-function agentNamesForCommand(agentCommand: string, config: ResolvedAcpxConfig): string[] {
-  return listBuiltInAgents(config.agents).filter(
-    (name) => resolveAgentCommand(name, config.agents) === agentCommand,
-  );
-}
-
-function explicitSessionCommand(
-  agentCommand: string,
-  sessionName: string | undefined,
-  subcommand: string,
-  config: ResolvedAcpxConfig,
-): string {
-  const names = agentNamesForCommand(agentCommand, config);
-  const prefix = names[0] ? `acpx ${names[0]}` : `acpx --agent ${JSON.stringify(agentCommand)}`;
-  return sessionName
-    ? `${prefix} sessions ${subcommand} ${sessionName}`
-    : `${prefix} sessions ${subcommand}`;
-}
-
-async function findGenericReadableSessionOrThrow(
-  agent: ResolvedAgentInvocation,
-  sessionName: string | undefined,
-  subcommand: string,
-  config: ResolvedAcpxConfig,
-): Promise<SessionRecord> {
-  const defaultScopedRecord = await findSession({
-    agentCommand: agent.agentCommand,
-    agentName: agent.agentName,
-    cwd: agent.cwd,
-    name: sessionName,
-    includeClosed: true,
-  });
-
-  if (defaultScopedRecord) {
-    return defaultScopedRecord;
-  }
-
-  const normalizedName = normalizeName(sessionName);
-  if (normalizedName !== undefined) {
-    return await findExplicitGenericReadableSessionOrThrow(
-      agent,
-      normalizedName,
-      subcommand,
-      config,
-    );
-  }
-
-  const candidates = (await listSessions()).filter(
-    (record) =>
-      record.kind !== "subagent" &&
-      record.cwd === agent.cwd &&
-      (normalizedName == null ? record.name == null : record.name === normalizedName),
-  );
-  if (candidates.length === 1) {
-    return candidates[0];
-  }
-
-  const baseMessage = missingScopedSessionMessage(agent, sessionName);
-  const defaultHint = `Searched default agent ${agent.agentName}.`;
-
-  if (candidates.length === 0) {
-    throw new Error(
-      `${baseMessage}\n${defaultHint} To inspect another agent, use \`acpx <agent> sessions ${subcommand}${
-        sessionName ? ` ${sessionName}` : ""
-      }\`.`,
-    );
-  }
-
-  const suggestions = candidates
-    .map(
-      (candidate) =>
-        `  - ${explicitSessionCommand(candidate.agentCommand, sessionName, subcommand, config)}`,
-    )
-    .join("\n");
-  throw new Error(
-    `${baseMessage}\n${defaultHint} Multiple matching sessions exist across agents; use an explicit agent command:\n${suggestions}`,
-  );
-}
-
-async function findExplicitGenericReadableSessionOrThrow(
-  agent: ResolvedAgentInvocation,
-  sessionName: string,
-  subcommand: string,
-  config: ResolvedAcpxConfig,
-): Promise<SessionRecord> {
-  const localResolution = await resolveSessionByExactName({
-    name: sessionName,
-    cwd: agent.cwd,
-    includeClosed: true,
-    excludeSubagents: true,
-  });
-  if (localResolution.kind === "found") {
-    return localResolution.record;
-  }
-  if (localResolution.kind === "ambiguous") {
-    const suggestions = localResolution.candidates
-      .map(
-        (candidate) =>
-          `  - ${explicitSessionCommand(candidate.agentCommand, sessionName, subcommand, config)}`,
-      )
-      .join("\n");
-    throw new Error(
-      `${missingScopedSessionMessage(agent, sessionName)}\n` +
-        `Searched default agent ${agent.agentName}. Multiple matching sessions exist across agents; use an explicit agent command:\n` +
-        suggestions,
-    );
-  }
-
-  const globalRecord = await resolveGlobalSessionByName({
-    agentCommand: agent.agentCommand,
-    agentName: agent.agentName,
-    name: sessionName,
-    includeClosed: true,
-  });
-  if (globalRecord) {
-    return globalRecord;
-  }
-
-  throw new Error(
-    `${missingScopedSessionMessage(agent, sessionName)}\n` +
-      `Searched default agent ${agent.agentName}. To inspect another agent, use \`acpx <agent> sessions ${subcommand} ${sessionName}\`.`,
-  );
-}
-
-async function findExplicitAgentReadableSessionOrThrow(
-  agent: ResolvedAgentInvocation,
-  sessionName: string | undefined,
-): Promise<SessionRecord> {
-  const localRecord = await findSession({
-    agentCommand: agent.agentCommand,
-    agentName: agent.agentName,
-    cwd: agent.cwd,
-    name: sessionName,
-    includeClosed: true,
-  });
-  if (localRecord) {
-    return localRecord;
-  }
-
-  if (sessionName !== undefined) {
-    const globalRecord = await resolveGlobalSessionByName({
-      agentCommand: agent.agentCommand,
-      agentName: agent.agentName,
-      name: sessionName,
-      includeClosed: true,
-    });
-    if (globalRecord) {
-      return globalRecord;
-    }
-  }
-
-  return await findScopedSessionOrThrow(agent, sessionName);
-}
-
-async function findReadableSessionOrThrow(params: {
-  explicitAgentName: string | undefined;
-  agent: ResolvedAgentInvocation;
-  selector: SessionTargetSelector;
-  subcommand: string;
-  config: ResolvedAcpxConfig;
-}): Promise<SessionRecord> {
-  const explicitRecord = await resolveExplicitSessionRecord(params.selector);
-  if (explicitRecord) {
-    return explicitRecord;
-  }
-
-  if (params.selector.name !== undefined) {
-    try {
-      return await resolveSessionRecord(params.selector.name);
-    } catch (error) {
-      if (!(error instanceof SessionNotFoundError)) {
-        throw error;
-      }
-    }
-  }
-
-  if (params.explicitAgentName == null) {
-    return await findGenericReadableSessionOrThrow(
-      params.agent,
-      params.selector.name,
-      params.subcommand,
-      params.config,
-    );
-  }
-
-  return await findExplicitAgentReadableSessionOrThrow(params.agent, params.selector.name);
-}
-
-async function findRoutedSessionOrThrow(
-  agentCommand: string,
-  agentName: string,
-  cwd: string,
-  sessionName: string | undefined,
-): Promise<SessionRecord> {
-  const gitRoot = findGitRepositoryRoot(cwd);
-  const walkBoundary = gitRoot ?? cwd;
-
-  const record = await findSessionByDirectoryWalk({
-    agentCommand,
-    agentName,
-    cwd,
-    name: sessionName,
-    boundary: walkBoundary,
-  });
-
-  if (record) {
-    return record;
-  }
-
-  if (sessionName !== undefined) {
-    const globalRecord = await resolveGlobalSessionByName({
-      agentCommand,
-      agentName,
-      name: sessionName,
-    });
-    if (globalRecord) {
-      return globalRecord;
-    }
-  }
-
-  const createCmd = sessionName
-    ? `acpx ${agentName} sessions new --name ${sessionName}`
-    : `acpx ${agentName} sessions new`;
-  throw new NoSessionError(
-    `⚠ No acpx session found (searched up to ${walkBoundary}).\nCreate one: ${createCmd}`,
-  );
-}
-
-async function findRoutedTargetSessionOrThrow(
-  agent: ResolvedAgentInvocation,
-  selector: SessionTargetSelector,
-): Promise<SessionRecord> {
-  const explicitRecord = await resolveExplicitSessionRecord(selector);
-  if (explicitRecord) {
-    return explicitRecord;
-  }
-
-  return await findRoutedSessionOrThrow(
-    agent.agentCommand,
-    agent.agentName,
-    agent.cwd,
-    selector.name,
-  );
-}
-
-async function findOptionalRoutedTargetSession(
-  agent: ResolvedAgentInvocation,
-  selector: SessionTargetSelector,
-): Promise<SessionRecord | undefined> {
-  const explicitRecord = await resolveExplicitSessionRecord(selector);
-  if (explicitRecord) {
-    return explicitRecord;
-  }
-
-  const gitRoot = findGitRepositoryRoot(agent.cwd);
-  const localRecord = await findSessionByDirectoryWalk({
-    agentCommand: agent.agentCommand,
-    agentName: agent.agentName,
-    cwd: agent.cwd,
-    name: selector.name,
-    boundary: gitRoot ?? agent.cwd,
-  });
-  if (localRecord || selector.name === undefined) {
-    return localRecord;
-  }
-
-  return await resolveGlobalSessionByName({
-    agentCommand: agent.agentCommand,
-    agentName: agent.agentName,
-    name: selector.name,
-  });
-}
-
 // Shared prompt-delivery core: build the output formatter and enqueue/run the
 // prompt against an existing session. Used by `handlePrompt` and by the
 // `sessions new --from-template` auto-fire (which calls it with
@@ -1746,7 +1410,7 @@ export async function handlePrompt(
   const { printPromptSessionBanner, printQueuedPromptByFormat, printServedBelowFloorWarning } =
     await loadOutputRenderModule();
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await findRoutedTargetSessionOrThrow(agent, selector);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName);
   await assertExplicitSubscriptionMatchesExistingSession({
     globalFlags,
     record,
@@ -2010,12 +1674,7 @@ export async function handleCancel(
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const { cancelSessionPrompt } = await loadSessionModule();
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await findOptionalRoutedTargetSession(agent, selector);
-
-  if (!record) {
-    printCancelResultByFormat({ sessionId: "", cancelled: false }, globalFlags.format);
-    return;
-  }
+  const record = await requireExplicitSessionRecord(selector, agent.agentName);
 
   const result = await cancelSessionPrompt({
     sessionId: record.acpxRecordId,
@@ -2035,7 +1694,7 @@ export async function handleSetMode(
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const { setSessionMode } = await loadSessionModule();
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await findRoutedTargetSessionOrThrow(agent, selector);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName);
   const result = await setSessionMode({
     sessionId: record.acpxRecordId,
     modeId,
@@ -2068,7 +1727,7 @@ export async function handleSetModel(
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const { setSessionModel } = await loadSessionModule();
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await findRoutedTargetSessionOrThrow(agent, selector);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName);
   const result = await setSessionModel({
     sessionId: record.acpxRecordId,
     modelId,
@@ -2082,7 +1741,6 @@ export async function handleSetModel(
     // CLI verb: recycle a live idle owner so the change binds on the next turn
     // (refuses with turn-in-flight if a turn is active). acpx-ui shells this.
     recycleOwner: true,
-    sessionName: selector.name ?? record.name,
   });
 
   if (globalFlags.verbose && result.loadError) {
@@ -2161,7 +1819,7 @@ export async function handleSetConfigOption(
   const resolvedConfigId = resolveCompatibleConfigId(agent, configId);
   const { setSessionConfigOption } = await loadSessionModule();
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await findRoutedTargetSessionOrThrow(agent, selector);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName);
   const result = await setSessionConfigOption({
     sessionId: record.acpxRecordId,
     configId: resolvedConfigId,
@@ -2178,7 +1836,6 @@ export async function handleSetConfigOption(
     // reverting a live set). Scoped to depth options — other config options keep
     // the existing live/direct apply. Refuses with turn-in-flight if active.
     recycleOwner: isDepthConfigOption(resolvedConfigId),
-    sessionName: selector.name ?? record.name,
   });
 
   if (globalFlags.verbose && result.loadError) {
@@ -2253,7 +1910,7 @@ async function tryHandleDepthConfigKey(
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await findRoutedTargetSessionOrThrow(agent, selector);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName);
   const mechanism = depthMechanismForAgentCommand(record.agentCommand);
   if (mechanism !== "mode" || !acpxRoutesDepthMechanism(mechanism)) {
     return false;
@@ -2355,7 +2012,7 @@ export async function handleSetOutputStyle(
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await findRoutedTargetSessionOrThrow(agent, selector);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName);
   // Throws OutputStyleNotSupportedError / OutputStyleUnknownError. Claude Code
   // itself validates nothing here, so this refusal is the only thing standing
   // between a typo and a session that reports a style it does not have.
@@ -2364,7 +2021,6 @@ export async function handleSetOutputStyle(
   const result = await setSessionOutputStyle({
     sessionId: record.acpxRecordId,
     outputStyle: value,
-    sessionName: selector.name ?? record.name,
   });
   printSetOutputStyleResultByFormat(value, result, globalFlags.format);
 }
@@ -2402,12 +2058,11 @@ export async function handleSetAutoFailover(
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const autoFailover = parseAutoFailoverValue(value);
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await findRoutedTargetSessionOrThrow(agent, selector);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName);
   const { setSessionAutoFailover } = await loadSessionModule();
   const result = await setSessionAutoFailover({
     sessionId: record.acpxRecordId,
     autoFailover,
-    sessionName: selector.name ?? record.name,
   });
   printSetAutoFailoverResultByFormat(result, globalFlags.format);
 }
@@ -2465,12 +2120,11 @@ export async function handleSetAutoSubscription(
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const autoSubscription = parseOnOffValue(value, "auto-subscription");
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await findRoutedTargetSessionOrThrow(agent, selector);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName);
   const { setSessionAutoSubscription } = await loadSessionModule();
   const result = await setSessionAutoSubscription({
     sessionId: record.acpxRecordId,
     autoSubscription,
-    sessionName: selector.name ?? record.name,
   });
   printOnOffResultByFormat(
     {
@@ -2508,12 +2162,11 @@ export async function handleSetFableDegrade(
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const fableDegradeOk = parseOnOffValue(value, "fable-degrade");
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await findRoutedTargetSessionOrThrow(agent, selector);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName);
   const { setSessionFableDegrade } = await loadSessionModule();
   const result = await setSessionFableDegrade({
     sessionId: record.acpxRecordId,
     fableDegradeOk,
-    sessionName: selector.name ?? record.name,
   });
   printOnOffResultByFormat(
     {
@@ -2573,12 +2226,11 @@ export async function handleSetSubscription(
     throw new SubscriptionLockedError(trimmedId);
   }
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await findRoutedTargetSessionOrThrow(agent, selector);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName);
   const { setSessionSubscription } = await loadSessionModule();
   const result = await setSessionSubscription({
     sessionId: record.acpxRecordId,
     subscriptionId: trimmedId,
-    sessionName: selector.name ?? record.name,
     verbose: globalFlags.verbose,
   });
   printSetSubscriptionResultByFormat(result, globalFlags.format);
@@ -2678,14 +2330,13 @@ export async function handleSetProfile(
   }
   assertProfileUnlocked(target, registry);
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await findRoutedTargetSessionOrThrow(agent, selector);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName);
   assertSameCredentialClass(record, target, registry);
 
   const { setSessionProfile } = await loadSessionModule();
   const result = await setSessionProfile({
     sessionId: record.acpxRecordId,
     profileId: trimmedId,
-    sessionName: selector.name ?? record.name,
     verbose: globalFlags.verbose,
   });
   printSetProfileResultByFormat(result, globalFlags.format);
@@ -2761,7 +2412,7 @@ export async function handleSessionsSetMetadata(
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const trimmedValue = validateSessionMetadataValue(key, value);
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await findRoutedTargetSessionOrThrow(agent, selector);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName);
   if (key === "brick") {
     await warnIfBrickDoesNotResolve(trimmedValue);
   }
@@ -2878,28 +2529,7 @@ export async function handleSessionsClose(
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
 
   const selector = resolveSessionTargetSelector({ flags, command, positionalName: sessionName });
-  const explicitRecord = await resolveExplicitSessionRecord(selector);
-  const localRecord =
-    explicitRecord ??
-    (await findSession({
-      agentCommand: agent.agentCommand,
-      agentName: agent.agentName,
-      cwd: agent.cwd,
-      name: selector.name,
-    }));
-  const record =
-    localRecord ??
-    (selector.name === undefined
-      ? undefined
-      : await resolveGlobalSessionByName({
-          agentCommand: agent.agentCommand,
-          agentName: agent.agentName,
-          name: selector.name,
-        }));
-
-  if (!record) {
-    throw new Error(missingScopedSessionMessage(agent, sessionName));
-  }
+  const record = await requireExplicitSessionRecord(selector, agent.agentName);
 
   // Commander maps `--no-drain` onto `flags.drain === false`; absent means the
   // barrier runs.
@@ -2934,7 +2564,7 @@ function applyCloseExitCode(
   }
 
   if (closed.drain.undelivered.length > 0) {
-    warnUndeliveredCustody(record.name ?? record.acpxRecordId, closed.drain);
+    warnUndeliveredCustody(record.acpxRecordId, closed.drain);
     if (flags.failOnUndelivered) {
       process.exitCode = UNDELIVERED_CUSTODY_EXIT_CODE;
     }
@@ -3110,36 +2740,6 @@ export async function handleSessionsNew(
   const [{ createSession }, { printCreatedSessionBanner, printNewSessionByFormat }] =
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
 
-  // L3 (brick 4e58b35c, Daniel: "a bad idea from in the first place") — `sessions
-  // new` used to silently CLOSE whatever session already occupied this (cwd,
-  // name) slot before creating the new one. Deleted outright: a name collision
-  // is not a condition `sessions new` reacts to at all, so the prior occupant
-  // (which can be another agent's live session on a shared box) is left alone.
-  // HOD-R43 — the eviction lookup is gone, but the AMBIGUITY SIGNAL it
-  // incidentally provided is re-added here as a pure read: this never closes,
-  // never refuses, and never affects the create below. It only NAMES whoever
-  // else already holds this (cwd, name) slot, read BEFORE the create so the
-  // about-to-be-created session is never reported as its own co-claimant.
-  //
-  // GUARDED HERE, not inside listCoClaimantSessions: it awaits
-  // loadSessionIndexEntries(), which does real (unguarded) I/O, so this is a
-  // read that CAN throw — measured directly (fault injection, brick
-  // 4e58b35c): with index.json replaced by a directory, this call throws
-  // EISDIR, and unguarded that turned a create that would otherwise have
-  // succeeded into one that never ran at all. An advisory notice must never
-  // be able to fail the create it is only decorating, so any failure here
-  // degrades to "no notice" and falls through unconditionally.
-  let coClaimants: SessionNameCandidate[] = [];
-  try {
-    coClaimants = await listCoClaimantSessions({
-      agentCommand: effectiveAgent.agentCommand,
-      agentName: effectiveAgent.agentName,
-      cwd: effectiveAgent.cwd,
-      name: flags.name,
-    });
-  } catch {
-    coClaimants = [];
-  }
   const created = await createSession(
     buildSessionStartOptions({
       agent: effectiveAgent,
@@ -3165,26 +2765,7 @@ export async function handleSessionsNew(
   );
 
   if (globalFlags.verbose) {
-    const scope = flags.name ? `named session "${flags.name}"` : "cwd session";
-    process.stderr.write(`[acpx] created ${scope}: ${created.acpxRecordId}\n`);
-  }
-
-  // HOD-R43 — reporting, never a condition: this never ran before the create
-  // above, and nothing here can change its outcome. Always on stderr, in
-  // every --format (consumer census, brick 4e58b35c): no acpx-ui or wisdom
-  // Skills script reads `sessions new`'s stderr on a successful create — in
-  // fact acpx-ui's own `extractCreatedSessionId` deliberately EXCLUDES stderr
-  // from its id search (acpx-ui server/sessionCreate.ts, brick eca6bf82: a
-  // brick-link warning's uuid on stderr once outranked the real session id),
-  // so a stdout JSON field would be the one with precedent against it, and
-  // stderr is where acpx already puts advisory, non-identity output.
-  if (coClaimants.length > 0) {
-    const otherIds = coClaimants.map((candidate) => candidate.acpxRecordId).join(", ");
-    process.stderr.write(
-      `[acpx] note: ${coClaimants.length} other session(s) already occupy this name in this ` +
-        `directory: ${otherIds}. A name is a display label, not an identity — use --session-id <id> ` +
-        `or --session-url <url> to address a specific one.\n`,
-    );
+    process.stderr.write(`[acpx] created session: ${created.acpxRecordId}\n`);
   }
 
   printNewSessionByFormat(created, globalFlags.format);
@@ -3320,7 +2901,7 @@ async function runSessionCopy(
     agentCommand: source.agentCommand,
     agentName: source.agentName ?? resolveAgentNameFromCommand(source.agentCommand, config.agents),
     cwd: resolveCopyDestinationCwd(command, globalFlags, source),
-    name: flags.name ?? sourceDefaultForkName(source),
+    seatName: flags.name ?? (await sourceDefaultForkName(source)),
     // metadata.brick carry: precedence = --brick flag > spawn-parent brick (--parent-id / byway)
     // > none. A plain fork/copy carries NO brick by default (the 07-15 source.metadata.brick
     // fallback was reversed, brick://1113da9d) so it does not impersonate the source's brick.
@@ -3510,89 +3091,6 @@ function printTemplateResult(record: SessionRecord, enable: boolean, format: Out
   }
 }
 
-export async function handleSessionsEnsure(
-  explicitAgentName: string | undefined,
-  flags: SessionsNewFlags,
-  command: Command,
-  config: ResolvedAcpxConfig,
-): Promise<void> {
-  const globalFlags = resolveGlobalFlags(command, config);
-  validateExplicitCredentialFlags(globalFlags);
-  const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
-  const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
-  const parent = await resolveAndValidateParentSessionId(flags);
-  const { value: resolvedBrick, validated: resolvedBrickValidated } = await resolveBrickFlagValue(
-    flags.brick,
-  );
-  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const effectiveAgent = resolveEffectiveSpawnAgent(
-    agent,
-    explicitAgentName,
-    globalFlags,
-    parent,
-    config,
-  );
-  warnReasoningEffortNotRoutable(globalFlags, effectiveAgent.agentName);
-  warnOutputStyleNotSupported(globalFlags, effectiveAgent.agentName);
-  const existing = await findSessionByDirectoryWalk({
-    agentCommand: effectiveAgent.agentCommand,
-    cwd: effectiveAgent.cwd,
-    name: flags.name,
-    boundary: findGitRepositoryRoot(effectiveAgent.cwd) ?? effectiveAgent.cwd,
-  });
-  if (existing) {
-    await assertExplicitSubscriptionMatchesExistingSession({
-      globalFlags,
-      record: existing,
-      agentName: effectiveAgent.agentName,
-    });
-  }
-  const [
-    { ensureSession },
-    { printCreatedSessionBanner, printEnsuredSessionByFormat, warnEnsureCreatedOverClosed },
-  ] = await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
-  const result = await ensureSession(
-    buildSessionStartOptions({
-      agent: effectiveAgent,
-      flags,
-      globalFlags,
-      config,
-      permissionMode,
-      permissionPolicy,
-      parent,
-      inherit: parent,
-      resolvedBrick,
-      resolvedBrickValidated,
-    }),
-  );
-  await maybeStampBrickLink(result.record);
-
-  if (result.created) {
-    printCreatedSessionBanner(
-      result.record,
-      effectiveAgent.agentName,
-      globalFlags.format,
-      globalFlags.jsonStrict,
-    );
-  }
-
-  printEnsuredSessionByFormat(
-    result.record,
-    result.created,
-    globalFlags.format,
-    result.createdBecauseClosed,
-  );
-
-  // brick://16712ece — (c) "create, but say so". `ensure` cannot distinguish an
-  // operator recovering a closed session from automation that legitimately wants
-  // a fresh one under a fixed name, so it keeps creating and reports the
-  // ambiguity on STDERR. Emitted AFTER the stdout result so a `--format json`
-  // consumer's parse is never interleaved.
-  if (result.createdBecauseClosed) {
-    warnEnsureCreatedOverClosed(result.record, result.createdBecauseClosed);
-  }
-}
-
 function userContentToText(content: SessionUserContent): string {
   if ("Text" in content) {
     return content.Text;
@@ -3685,7 +3183,6 @@ function sessionDetailsLines(record: SessionRecord): string[] {
     `agentSessionId: ${displayValue(record.agentSessionId)}`,
     `agent: ${record.agentCommand}`,
     `cwd: ${record.cwd}`,
-    `name: ${displayValue(record.name)}`,
     `created: ${record.createdAt}`,
     `lastActivity: ${record.lastUsedAt}`,
     `lastPrompt: ${displayValue(record.lastPromptAt)}`,
@@ -3756,13 +3253,7 @@ export async function handleSessionsShow(
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const selector = resolveSessionTargetSelector({ flags, command, positionalName: sessionName });
-  const record = await findReadableSessionOrThrow({
-    explicitAgentName,
-    agent,
-    selector,
-    subcommand: "show",
-    config,
-  });
+  const record = await requireExplicitSessionRecord(selector, agent.agentName);
 
   printSessionDetailsByFormat(record, globalFlags.format);
 }
@@ -3776,15 +3267,8 @@ export async function handleSessionsHistory(
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const subcommand = command.name() === "read" ? "read" : "history";
   const selector = resolveSessionTargetSelector({ flags, command, positionalName: sessionName });
-  const record = await findReadableSessionOrThrow({
-    explicitAgentName,
-    agent,
-    selector,
-    subcommand,
-    config,
-  });
+  const record = await requireExplicitSessionRecord(selector, agent.agentName);
 
   printSessionHistoryByFormat(record, flags.limit, globalFlags.format);
 }
@@ -3798,21 +3282,13 @@ export async function handleSessionsExport(
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const cwd = flags.sourceCwd ? path.resolve(agent.cwd, flags.sourceCwd) : agent.cwd;
   const selector = resolveSessionTargetSelector({ flags, command, positionalName: sessionName });
   const explicitSessionId = explicitSessionIdFromSelector(selector);
+  if (explicitSessionId === undefined) {
+    throw new NoSessionError(noSessionIdMessage(agent.agentName));
+  }
 
-  await exportSession(
-    explicitSessionId
-      ? { sessionId: explicitSessionId }
-      : {
-          agentName: globalFlags.agent ? undefined : agent.agentName,
-          agentCommand: agent.agentCommand,
-          cwd,
-          name: selector.name,
-        },
-    flags.output,
-  );
+  await exportSession({ sessionId: explicitSessionId }, flags.output);
 
   if (
     emitJsonResult(globalFlags.format, {
@@ -3841,7 +3317,6 @@ export async function handleSessionsImport(
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const result = await importSession(archivePath, {
-    name: flags.name,
     newCwd: flags.destinationCwd ? path.resolve(globalFlags.cwd, flags.destinationCwd) : undefined,
     expectedAgentName: globalFlags.agent ? undefined : agent.agentName,
     expectedAgentCommand: agent.agentCommand,
@@ -4414,13 +3889,9 @@ function shortSessionId(sessionId: string): string {
   return sessionId.slice(0, 8);
 }
 
-function describeSetParentSession(name: string | undefined, sessionId: string): string {
-  return name ? `${name} (${shortSessionId(sessionId)})` : shortSessionId(sessionId);
-}
-
 function setParentMovedLine(entry: SetParentResult["moved"][number]): string {
   const was = entry.previousParentSessionId
-    ? `   was: ${describeSetParentSession(entry.previousParentName, entry.previousParentSessionId)}`
+    ? `   was: ${shortSessionId(entry.previousParentSessionId)}`
     : "   was: (root)";
   // The `[fork edge → spawn]` annotation IS decision 1 rendered. It is the one
   // behaviour a user can be surprised by — an explicitly set parent overriding a
@@ -4434,7 +3905,7 @@ function setParentMovedLine(entry: SetParentResult["moved"][number]): string {
   const healed = entry.healedStoreDivergence
     ? `   [healed split store: record=${shortOrNone(entry.healedStoreDivergence.recordParentSessionId)} index=${shortOrNone(entry.healedStoreDivergence.indexParentSessionId)}]`
     : "";
-  return `  ${describeSetParentSession(entry.name, entry.acpxRecordId)}${was}${forkNote}${healed}`;
+  return `  ${shortSessionId(entry.acpxRecordId)}${was}${forkNote}${healed}`;
 }
 
 function printSetParentResult(result: SetParentResult, format: OutputFormat): void {
@@ -4444,7 +3915,7 @@ function printSetParentResult(result: SetParentResult, format: OutputFormat): vo
   if (format === "quiet") {
     return;
   }
-  const destination = describeSetParentSession(result.parent.name, result.parent.acpxRecordId);
+  const destination = shortSessionId(result.parent.acpxRecordId);
   if (result.dryRun) {
     process.stdout.write("DRY RUN — no changes written.\n");
   }
@@ -4477,16 +3948,14 @@ function printSetParentSkippedAndWarnings(result: SetParentResult): void {
     process.stdout.write(`Diverged ${result.diverged.length} — NOT moved:\n`);
     for (const entry of result.diverged) {
       process.stdout.write(
-        `  ${describeSetParentSession(entry.name, entry.acpxRecordId)}   record=${shortOrNone(entry.recordParentSessionId)} index=${shortOrNone(entry.indexParentSessionId)} — ${entry.reason}\n`,
+        `  ${shortSessionId(entry.acpxRecordId)}   record=${shortOrNone(entry.recordParentSessionId)} index=${shortOrNone(entry.indexParentSessionId)} — ${entry.reason}\n`,
       );
     }
   }
   if (result.skipped.length > 0) {
     process.stdout.write(`Skipped ${result.skipped.length}:\n`);
     for (const entry of result.skipped) {
-      process.stdout.write(
-        `  ${describeSetParentSession(entry.name, entry.acpxRecordId)}   ${entry.reason}\n`,
-      );
+      process.stdout.write(`  ${shortSessionId(entry.acpxRecordId)}   ${entry.reason}\n`);
     }
   }
   for (const warning of result.warnings) {

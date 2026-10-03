@@ -28,7 +28,7 @@ acpx [global_options] cancel [-s <name>]
 acpx [global_options] set-mode <mode> [-s <name>]
 acpx [global_options] set <key> <value> [-s <name>]
 acpx [global_options] status [-s <name> | --session-id <id> | --session-url <url>]
-acpx [global_options] sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>]]
+acpx [global_options] sessions [list | new [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>]]
 acpx [global_options] config [show | init]
 
 acpx [global_options] <agent> [prompt_options] [prompt_text...]
@@ -38,7 +38,7 @@ acpx [global_options] <agent> cancel [-s <name>]
 acpx [global_options] <agent> set-mode <mode> [-s <name>]
 acpx [global_options] <agent> set <key> <value> [-s <name>]
 acpx [global_options] <agent> status [-s <name> | --session-id <id> | --session-url <url>]
-acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>]]
+acpx [global_options] <agent> sessions [list | new [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>]]
 ```
 
 `<agent>` can be:
@@ -151,7 +151,7 @@ Each agent command supports the same shape.
 acpx [global_options] pi [prompt_options] [prompt_text...]
 acpx [global_options] pi prompt [prompt_options] [prompt_text...]
 acpx [global_options] pi exec [prompt_text...]
-acpx [global_options] pi sessions [list | new [--name <name>] | ensure [--name <name>] | close [name]]
+acpx [global_options] pi sessions [list | new [--name <name>] | close [name]]
 ```
 
 Built-in command mapping: `pi -> npx pi-acp`
@@ -162,7 +162,7 @@ Built-in command mapping: `pi -> npx pi-acp`
 acpx [global_options] openclaw [prompt_options] [prompt_text...]
 acpx [global_options] openclaw prompt [prompt_options] [prompt_text...]
 acpx [global_options] openclaw exec [prompt_text...]
-acpx [global_options] openclaw sessions [list | new [--name <name>] | ensure [--name <name>] | close [name]]
+acpx [global_options] openclaw sessions [list | new [--name <name>] | close [name]]
 ```
 
 Built-in command mapping: `openclaw -> openclaw acp`
@@ -185,7 +185,7 @@ For repo-local OpenClaw checkouts, override the built-in command in config:
 acpx [global_options] codex [prompt_options] [prompt_text...]
 acpx [global_options] codex prompt [prompt_options] [prompt_text...]
 acpx [global_options] codex exec [prompt_text...]
-acpx [global_options] codex sessions [list | new [--name <name>] | ensure [--name <name>] | close [name]]
+acpx [global_options] codex sessions [list | new [--name <name>] | close [name]]
 ```
 
 Built-in command mapping: `codex -> npx -y @agentclientprotocol/codex-acp`
@@ -196,7 +196,7 @@ Built-in command mapping: `codex -> npx -y @agentclientprotocol/codex-acp`
 acpx [global_options] claude [prompt_options] [prompt_text...]
 acpx [global_options] claude prompt [prompt_options] [prompt_text...]
 acpx [global_options] claude exec [prompt_text...]
-acpx [global_options] claude sessions [list | new [--name <name>] | ensure [--name <name>] | close [name]]
+acpx [global_options] claude sessions [list | new [--name <name>] | close [name]]
 ```
 
 Built-in command mapping: `claude -> npx -y @agentclientprotocol/claude-agent-acp`
@@ -303,10 +303,7 @@ acpx [global_options] <agent> sessions list
 acpx [global_options] <agent> sessions list [--cursor <cursor>] [--filter-cwd <dir>] [--local]
 acpx [global_options] <agent> sessions new
 acpx [global_options] <agent> sessions new --name <name>
-acpx [global_options] <agent> sessions ensure
-acpx [global_options] <agent> sessions ensure --name <name>
-acpx [global_options] <agent> sessions close
-acpx [global_options] <agent> sessions close <name>
+acpx [global_options] <agent> sessions close --session-id <id>
 acpx [global_options] <agent> sessions reopen <id>
 acpx [global_options] <agent> sessions reopen <id>
 acpx [global_options] <agent> sessions show
@@ -335,14 +332,11 @@ Behavior:
 - when the agent does not support `session/list`, list falls back to local saved
   records unless agent-side list filters were requested
 - `sessions new` creates a fresh cwd-scoped default session
-- `sessions new --name <name>` creates a fresh named session for cwd
-- creating a fresh session soft-closes the previous open session in that scope (if present)
+- `sessions new --name <name>` creates a fresh session and names its SEAT (a display label; refused together with `--seat`)
+- `sessions new` never closes or reuses another session
 - text and quiet output print the local `acpxRecordId`; JSON output also includes
   `acpxSessionId` and, when the adapter exposes one, `agentSessionId`
-- `sessions ensure` returns the nearest matching active session or creates one for cwd
-- `sessions ensure --name <name>` does the same for named sessions
-- `sessions close` soft-closes the current cwd default session
-- `sessions close <name>` soft-closes the local named session first, then one exact global agent match
+- `sessions close --session-id <id>` soft-closes that session
 - `sessions reopen <id>` reopens a closed session so prompts are accepted again — the inverse of `sessions close`. Idempotent (an already-open session exits 0 with `reopened:false`), spawns nothing (the next prompt cold-respawns the owner), and does NOT cascade to subagents. **Not `sessions recover`**, which force-restarts a wedged queue owner and leaves the session closed.
 - `sessions reopen <id>` reopens a closed session so prompts are accepted again — the inverse of `sessions close`. Idempotent (an already-open session exits 0 with `reopened:false`), spawns nothing (the next prompt cold-respawns the owner), and does NOT cascade to subagents. Not `sessions recover`, which restarts a wedged queue owner and leaves the session closed.
 - `sessions show [name]` displays stored session metadata
@@ -366,11 +360,7 @@ Behavior:
 - `--include-templates` is not a scope — it widens what a scope selects, so it still needs one
 - close errors if the target session does not exist
 
-For commands that address an existing session, an explicit name first uses that
-command's local lookup behavior. If local lookup misses, one exact global match
-for the selected agent is used. Multiple matches fail closed and list record IDs
-and cwds; select one with `--session-id` or `--session-url`. Omitted/default
-names, `sessions new`, and `sessions ensure` remain cwd-scoped.
+Commands that address an existing session take `--session-id <id>` or `--session-url <url>` and nothing else: a name, a positional name or the cwd never selects a session (D-IDENTITY). A call with no id is refused with exit code `4`, naming the create form.
 
 ## `status` command
 
@@ -471,19 +461,11 @@ Session records are stored in:
 ~/.acpx/sessions/*.json
 ```
 
-### Auto-resume
+### Addressing
 
-For prompt commands:
+There is no auto-resume by directory: a prompt names its session with `--session-id <id>` (or `--session-url <url>`). With no id the call exits with code `4` and prints the create form (`sessions new`).
 
-1. Detect the nearest git root by checking for `.git` while walking up from `absoluteCwd`.
-2. If a git root is found, walk from `absoluteCwd` up to that git root (inclusive).
-3. If no git root exists, only check exact `absoluteCwd` (no parent-directory walk).
-4. At each checked directory, find the first active (non-closed) session matching `(agentCommand, dir, optionalName)`.
-5. If found, use that session record for prompt queueing and resume attempts.
-6. If not found, exit with code `4` and print guidance to create one via `sessions new`.
-
-Use `sessions new [--name <name>]` when you explicitly want a fresh scoped session.
-Use `sessions ensure [--name <name>]` when you want idempotent "get-or-create" behavior.
+Use `sessions new [--name <name>]` to create a session; address it afterwards by the id it prints.
 
 If a saved session PID is dead, `acpx` respawns the agent, tries `session/resume` when advertised or `session/load` otherwise, and transparently falls back to `session/new` when reconnecting fails.
 
@@ -505,13 +487,9 @@ When a prompt is already in flight for a session, `acpx` uses a per-session queu
 - closed sessions still keep full record data and can be resumed explicitly via record id/session load flows
 - session records also keep lightweight turn history previews used by `sessions history`
 
-### Named sessions
+### Names and cwd
 
-`-s, --session <name>` adds `name` into the scope key so multiple parallel conversations can coexist in the same repo and agent command.
-
-### CWD scoping
-
-`--cwd` sets the starting point for directory-walk routing (bounded by git root) and the exact scope directory when creating sessions via `sessions new`.
+A session has no name. `sessions new -s, --name <name>` names the new SEAT — a display label that identifies nothing and is not unique. A session's `cwd` is a property for display and `sessions list --filter-cwd`; `--cwd` sets the directory a new session is created in.
 
 ## Output formats
 

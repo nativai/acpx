@@ -1,6 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
-import { statSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -47,51 +46,9 @@ import { parseSessionRecord } from "./parse.js";
 import { copySeatHolderFields, copySeatLinkageFields } from "./seat-fields.js";
 import { findHolderlessSeats, reapHolderlessSeats } from "./seat-holderless.js";
 import { serializeSessionRecordForDisk } from "./serialize.js";
-import {
-  effectiveTemplateSlug,
-  pickLatestTemplate,
-  slugify,
-  type TemplateOrderKey,
-} from "./template-slug.js";
+import { pickLatestTemplate, slugify, type TemplateOrderKey } from "./template-slug.js";
 
 export const DEFAULT_HISTORY_LIMIT = 20;
-
-type FindSessionOptions = {
-  agentCommand: string;
-  agentName?: string;
-  cwd: string;
-  name?: string;
-  includeClosed?: boolean;
-};
-
-type FindSessionByDirectoryWalkOptions = {
-  agentCommand: string;
-  agentName?: string;
-  cwd: string;
-  name?: string;
-  boundary?: string;
-};
-
-type ResolveSessionByExactNameOptions = {
-  name: string;
-  agentCommand?: string;
-  agentName?: string;
-  cwd?: string;
-  includeClosed?: boolean;
-  excludeSubagents?: boolean;
-};
-
-export type SessionNameCandidate = {
-  acpxRecordId: string;
-  agentCommand: string;
-  agentName?: string;
-  cwd: string;
-};
-
-export type SessionNameResolution =
-  | { kind: "none" }
-  | { kind: "found"; record: SessionRecord }
-  | { kind: "ambiguous"; candidates: SessionNameCandidate[] };
 
 /**
  * The record's file name as the index knows it — `index.files` and every entry's
@@ -134,9 +91,9 @@ export function isArchivedRecord(record: SessionRecord): boolean {
  * The archive fallback leg — the fix for `acpx sessions show --session-id
  * <archived>` answering "Session not found".
  *
- * ⚠️ EXACT ID ONLY, AND SUFFIX/NAME RESOLUTION IS DELIBERATELY NOT EXTENDED HERE.
- * `findSession` and `findSessionByDirectoryWalk` search index entries; adding a
- * cold-dir scan to them would put an O(archive) readdir — 13,944 files today — on
+ * ⚠️ EXACT ID ONLY, AND SUFFIX RESOLUTION IS DELIBERATELY NOT EXTENDED HERE.
+ * The index-entry searches (`resolveSessionRecord`'s suffix leg) must not gain a
+ * cold-dir scan: an O(archive) readdir — 13,944 files today — would land on
  * ORDINARY CLI PATHS that have nothing to do with the archive. Browsing is served
  * by the shard index instead (`acpx sessions archive --list`).
  */
@@ -204,24 +161,6 @@ export async function listSessionIndexEntries(): Promise<SessionIndexEntry[]> {
   return await loadSessionIndexEntries();
 }
 
-function matchesSessionEntry(
-  session: SessionIndexEntry,
-  normalizedCwd: string,
-  normalizedName: string | undefined,
-  includeClosed = false,
-): boolean {
-  if (session.cwd !== normalizedCwd) {
-    return false;
-  }
-  if (!includeClosed && session.closed) {
-    return false;
-  }
-  if (normalizedName == null) {
-    return session.name == null;
-  }
-  return session.name === normalizedName;
-}
-
 function matchesAgentIdentity(
   session: Pick<SessionIndexEntry, "agentCommand" | "agentName">,
   agentCommand: string,
@@ -243,8 +182,7 @@ export type PersistedSessionLifecycle = {
   reopenedAt: string | undefined;
   favorite: boolean | undefined;
   favoritedAt: string | undefined;
-  name: string | undefined;
-  /** acpx-ui-owned template marker — read-preserved like closed/favorite/name so a
+  /** acpx-ui-owned template marker — read-preserved like closed/favorite so a
    * stale agent-exit checkpoint flush can't clobber an externally-set template (FW-16). */
   template: SessionRecord["template"];
   /** The parent linkage — read-preserved as a group so an externally-set parent
@@ -299,7 +237,6 @@ export async function readPersistedLifecycle(
       reopenedAt: parsed.reopenedAt,
       favorite: parsed.favorite,
       favoritedAt: parsed.favoritedAt,
-      name: parsed.name,
       template: parsed.template,
       parentSessionId: parsed.parentSessionId,
       parentSessionUrl: parsed.parentSessionUrl,
@@ -363,15 +300,12 @@ export async function readRawRecordClosedState(
  * ## Session-lifecycle-state ownership (see DESIGN.md)
  *
  * UI-authored lifecycle fields (`closed`, `closed_at`), the UI-owned favorite
- * state (`favorite`, `favorited_at`), and the UI-owned display `name` are
- * **read-preserved** on every daemon write: before serializing, we read the
- * current on-disk `<id>.json` and overwrite the in-memory record's
- * lifecycle / favorite / name fields with the on-disk values. This means a
- * UI PATCH that flipped `closed=true` or `favorite=true`, or renamed the
- * session, survives the next daemon checkpoint — the daemon can never
- * silently revert user intent. (The daemon never legitimately renames a
- * session, so preserving `name` from disk has no productive write to
- * suppress.)
+ * state (`favorite`, `favorited_at`) are **read-preserved** on every daemon
+ * write: before serializing, we read the current on-disk `<id>.json` and
+ * overwrite the in-memory record's lifecycle / favorite fields with the
+ * on-disk values. This means a UI PATCH that flipped `closed=true` or
+ * `favorite=true` survives the next daemon checkpoint — the daemon can never
+ * silently revert user intent. (A session has no name to preserve: D-IDENTITY.)
  *
  * The **one authorized daemon writer** of these fields is `closeSession`
  * (and its privileged helper variants): it bypasses the preserve step so it
@@ -436,7 +370,7 @@ type WriteAuthoritativeFields = { parent?: true; seatHolder?: true };
  * The index half is written IMMEDIATELY rather than through the coalescing queue.
  * That is not an optimisation: `immediate: !preserveLifecycle` classifies this as an
  * ordinary throttled write, when a re-parent is squarely the human-frequency,
- * freshness-sensitive class the close/favorite/name comment at the call site
+ * freshness-sensitive class the close/favorite comment at the call site
  * describes — and acceptance criterion 2 asks the board to follow within ~1 s. It is
  * prompt today only BY ACCIDENT, because a fresh CLI process has no `lastWrittenAt`
  * for the file (`elapsed = Infinity`) and takes the immediate branch anyway; any
@@ -729,11 +663,10 @@ function applyPersistedLifecycleForWrite(
   record.reopenedAt = persistedLifecycle.reopenedAt;
   record.favorite = persistedLifecycle.favorite;
   record.favoritedAt = persistedLifecycle.favoritedAt;
-  record.name = persistedLifecycle.name;
   // `template` is an acpx-ui-owned marker the daemon/agent never authors, so the
   // agent-exit checkpoint flush of a (possibly stale) in-memory record must adopt
   // the on-disk value rather than overwrite it — same read-preserve contract as
-  // closed/favorite/name. Without this, marking a template while its agent is live
+  // closed/favorite. Without this, marking a template while its agent is live
   // then letting the agent gracefully disconnect (connection_close) clobbers the
   // marker and the template silently vanishes from ?view=templates (FW-16).
   record.template = persistedLifecycle.template;
@@ -1095,7 +1028,7 @@ function indexWriteIsImmediate(options: {
 
 /**
  * The index half of a record write. Membership-immediate / scalar-throttled
- * (W2.3); the privileged lifecycle path (close/favorite/name) always writes
+ * (W2.3); the privileged lifecycle path (close/favorite) always writes
  * immediately — human-frequency and freshness-sensitive.
  *
  * ⚠️ `skipIndexUpdate` writes NOTHING and ENQUEUES NOTHING — it is not a defer.
@@ -1526,43 +1459,8 @@ export async function resolveSessionRecord(sessionId: string): Promise<SessionRe
   throw new SessionNotFoundError(sessionId);
 }
 
-function hasGitDirectory(dir: string): boolean {
-  const gitPath = path.join(dir, ".git");
-  try {
-    return statSync(gitPath).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
-function isWithinBoundary(boundary: string, target: string): boolean {
-  const relative = path.relative(boundary, target);
-  return relative.length === 0 || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-
 export function absolutePath(value: string): string {
   return path.resolve(value);
-}
-
-export function findGitRepositoryRoot(startDir: string): string | undefined {
-  let current = absolutePath(startDir);
-  const root = path.parse(current).root;
-
-  for (;;) {
-    if (hasGitDirectory(current)) {
-      return current;
-    }
-
-    if (current === root) {
-      return undefined;
-    }
-
-    const parent = path.dirname(current);
-    if (parent === current) {
-      return undefined;
-    }
-    current = parent;
-  }
 }
 
 export function normalizeName(value: string | undefined): string | undefined {
@@ -1641,9 +1539,7 @@ async function enabledTemplateEntriesForSlug(slug: string): Promise<SessionIndex
   const entries = await loadSessionIndexEntries();
   return entries.filter(
     (entry) =>
-      entry.templateEnabled === true &&
-      entry.kind !== "subagent" &&
-      effectiveTemplateSlug(entry.templateSlug, entry.name) === slug,
+      entry.templateEnabled === true && entry.kind !== "subagent" && entry.templateSlug === slug,
   );
 }
 
@@ -1702,9 +1598,9 @@ export async function resolveTemplateSelector(arg: string): Promise<TemplateSele
 
 // Canonicalize the slug to store at mark-time: an explicit `--slug` is run
 // through slugify (idempotent on an already-canonical value) and must be
-// non-empty; otherwise default to slugify(name). A degenerate name (slugifies
-// to empty) ⇒ undefined: the mark leaves slug/version unset and the record
-// groups/resolves by id (graceful — same as a UI-created slug-less template).
+// non-empty. Without one ⇒ undefined: the mark leaves slug/version unset and the
+// record groups/resolves by id (graceful — same as a UI-created slug-less
+// template). A session has no name to derive a default from (D-IDENTITY).
 function resolveMarkSlug(
   record: SessionRecord,
   explicitSlug: string | undefined,
@@ -1718,19 +1614,18 @@ function resolveMarkSlug(
     }
     return slug;
   }
-  return record.name !== undefined ? slugify(record.name) : undefined;
+  return undefined;
 }
 
 // An index entry counts toward a slug's version-max when it IS or WAS a template
 // (templateEnabled present: enabled OR soft-retracted — never a plain session or a
-// subagent), it is not the record being marked, and its effectiveSlug matches —
-// counting slug-less/version-less siblings via slugify(name).
+// subagent), it is not the record being marked, and its stored slug matches.
 function entryIsVersionPeer(entry: SessionIndexEntry, slug: string, selfRecordId: string): boolean {
   return (
     entry.templateEnabled !== undefined &&
     entry.kind !== "subagent" &&
     entry.acpxRecordId !== selfRecordId &&
-    effectiveTemplateSlug(entry.templateSlug, entry.name) === slug
+    entry.templateSlug === slug
   );
 }
 
@@ -1881,7 +1776,7 @@ async function hardDeleteSessionRecord(entry: SessionIndexEntry): Promise<void> 
   const safeId = encodeURIComponent(acpxRecordId);
 
   // Loaded BEFORE anything is unlinked, for the manifest. If it cannot be read,
-  // fall back to the index entry's own projection — `name`/`cwd` are there, and
+  // fall back to the index entry's own projection — `cwd` is there, and
   // `createdAt`/`closedAt` are then ABSENT from the entry, which per the schema
   // means "we could not read it", never "it had none".
   const record = await loadRecordFromIndexEntry(entry).catch(() => undefined);
@@ -1893,7 +1788,6 @@ async function hardDeleteSessionRecord(entry: SessionIndexEntry): Promise<void> 
       op: "templates_rollback_delete",
       at: isoNow(),
       id: acpxRecordId,
-      name: record?.name ?? entry.name,
       cwd: record?.cwd ?? entry.cwd,
       createdAt: record?.createdAt,
       closedAt: record?.closedAt,
@@ -1993,7 +1887,7 @@ function migrationSlugFor(record: SessionRecord, takenSlugs: Set<string>): strin
   if (existing !== undefined) {
     return existing;
   }
-  const base = record.name !== undefined ? slugify(record.name) : undefined;
+  const base = record.legacyName !== undefined ? slugify(record.legacyName) : undefined;
   if (base === undefined) {
     return undefined;
   }
@@ -2074,7 +1968,7 @@ async function migrateOneTemplateRecord(
   }
   result.assignments.push({
     acpxRecordId: record.acpxRecordId,
-    name: record.name,
+    name: record.legacyName,
     slug: plan.slug,
     version: plan.version,
   });
@@ -2134,300 +2028,6 @@ export async function listSubagentsForSession(
     .filter((entry): entry is SessionRecord => Boolean(entry))
     .filter((entry) => entry.parentSessionId === parentAcpxRecordId)
     .toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
-}
-
-/**
- * The one ambiguous-name message shape for the whole repository: a name (or an
- * unnamed cwd lookup) either resolves to exactly one session or errors — it
- * never silently picks a winner. Names every candidate so the operator can act
- * without reading source, and hands them the exact next selector to use.
- */
-function ambiguousSessionResolutionError(
-  name: string | undefined,
-  candidates: readonly Pick<SessionIndexEntry, "acpxRecordId" | "cwd">[],
-): SessionResolutionError {
-  const subject = name === undefined ? "Unnamed session lookup" : `Session name "${name}"`;
-  const rendered = candidates
-    .toSorted((a, b) => a.cwd.localeCompare(b.cwd) || a.acpxRecordId.localeCompare(b.acpxRecordId))
-    .map((candidate) => `  - cwd: ${candidate.cwd}; record ID: ${candidate.acpxRecordId}`)
-    .join("\n");
-  return new SessionResolutionError(
-    `${subject} is ambiguous across eligible sessions:\n` +
-      `${rendered}\n` +
-      "Use --session-id <id> or --session-url <url> to select one.",
-  );
-}
-
-export async function findSession(options: FindSessionOptions): Promise<SessionRecord | undefined> {
-  const normalizedCwd = absolutePath(options.cwd);
-  const normalizedName = normalizeName(options.name);
-  const entries = await loadSessionIndexEntries();
-  // filter, not find: co-located duplicates have no principled winner, and the
-  // index is ordered by lastUsedAt desc — so `find` silently returns whichever
-  // session was touched most recently, and every misdelivery makes that winner
-  // stickier. Fail closed instead, like every sibling resolver in this file.
-  const matches = entries.filter(
-    (session) =>
-      matchesAgentIdentity(session, options.agentCommand, options.agentName) &&
-      matchesSessionEntry(session, normalizedCwd, normalizedName, options.includeClosed),
-  );
-  if (matches.length === 0) {
-    return undefined;
-  }
-  // Ambiguity is judged among OPEN candidates only. Closed sessions are ranked
-  // below live ones rather than competing with them, and that ranking is a
-  // contract, not a convenience: a closed session is not a live candidate an
-  // operator could mean, so one closed predecessor beside one live session is
-  // never ambiguous — only two or more OPEN same-named sessions are. (Until
-  // brick 4e58b35c this was ALSO the ordinary shape of any recreated name,
-  // because `sessions new -s <name>` soft-closed the prior occupant; that
-  // eviction is gone, so a re-`new` under D-IDENTITY now leaves both open and
-  // genuinely ambiguous — this rule no longer protects `sessions show <name>`
-  // after a plain re-`new`, only after an explicitly closed predecessor.)
-  // With no live candidate at all, the closed set keeps its documented
-  // newest-first archival fallback (index order is lastUsedAt desc), which
-  // `exportSession` relies on. Neither case can misdeliver: a closed session
-  // receives nothing.
-  const open = matches.filter((session) => !session.closed);
-  if (open.length > 1) {
-    throw ambiguousSessionResolutionError(normalizedName, open);
-  }
-  return await loadRecordFromIndexEntry(open[0] ?? matches[0]);
-}
-
-/**
- * Read-only report of OPEN sessions already occupying `(cwd, name)` — never
- * CLOSES anything and never itself refuses or collapses a result the way
- * {@link findSession} does on >1 open match (that behaviour is for
- * resolution verbs — `prompt`, `sessions ensure` — that must pick exactly one
- * target; this is only ever a report). `sessions new` calls it purely to NAME
- * co-claimants in its own output: under D-IDENTITY a name carries no
- * uniqueness, so two or more live sessions sharing a slot is an ordinary
- * state (HOD-R43, brick 4e58b35c).
- *
- * ⚠️ IT CAN THROW — it awaits `loadSessionIndexEntries()`, real unguarded
- * I/O. Measured directly (fault injection, brick 4e58b35c): with
- * `index.json` replaced by a directory, this call throws EISDIR. The "never
- * affects whether a create succeeds" guarantee is therefore the CALLER's
- * job, not this function's: `handleSessionsNew` wraps this call in a
- * try/catch that degrades to no notice. Swallowing the error in here
- * instead would hide a real fault from any future caller that wants to
- * know about it.
- */
-export async function listCoClaimantSessions(
-  options: FindSessionOptions,
-): Promise<SessionNameCandidate[]> {
-  const normalizedCwd = absolutePath(options.cwd);
-  const normalizedName = normalizeName(options.name);
-  const entries = await loadSessionIndexEntries();
-  return entries
-    .filter(
-      (session) =>
-        matchesAgentIdentity(session, options.agentCommand, options.agentName) &&
-        matchesSessionEntry(session, normalizedCwd, normalizedName, false),
-    )
-    .map((session) => ({
-      acpxRecordId: session.acpxRecordId,
-      agentCommand: session.agentCommand,
-      agentName: session.agentName,
-      cwd: session.cwd,
-    }));
-}
-
-export async function findSessionByDirectoryWalk(
-  options: FindSessionByDirectoryWalkOptions,
-): Promise<SessionRecord | undefined> {
-  const normalizedName = normalizeName(options.name);
-  const normalizedStart = absolutePath(options.cwd);
-  const normalizedBoundary = absolutePath(options.boundary ?? normalizedStart);
-  const walkBoundary = isWithinBoundary(normalizedBoundary, normalizedStart)
-    ? normalizedBoundary
-    : normalizedStart;
-  const sessions = (await loadSessionIndexEntries()).filter((session) =>
-    matchesAgentIdentity(session, options.agentCommand, options.agentName),
-  );
-
-  let current = normalizedStart;
-  const walkRoot = path.parse(current).root;
-
-  for (;;) {
-    // Ambiguity is judged at THIS directory level, never globally: a match in a
-    // deeper cwd legitimately shadows a shallower one — that is how nested
-    // worktrees resolve. Only co-located duplicates are ambiguous.
-    const matches = sessions.filter((session) =>
-      matchesSessionEntry(session, current, normalizedName),
-    );
-    if (matches.length > 1) {
-      throw ambiguousSessionResolutionError(normalizedName, matches);
-    }
-    if (matches.length === 1) {
-      return await loadRecordFromIndexEntry(matches[0]);
-    }
-
-    const parent = nextWalkParent(current, walkBoundary, walkRoot);
-    if (!parent) {
-      return undefined;
-    }
-    current = parent;
-  }
-}
-
-/**
- * The CLOSED counterpart of {@link findSessionByDirectoryWalk}: walk the same
- * path and report the CLOSED entries that would have matched, newest first.
- *
- * Exists for `ensureSession`'s create-because-closed warning (brick://16712ece).
- * `findSessionByDirectoryWalk` filters closed entries out at
- * {@link matchesSessionEntry} (`includeClosed` defaults false), so a closed
- * match is invisible to `ensureSession` and it falls through to `createSession`
- * with rc=0 and no signal — an operator who meant RECOVERY silently lands in a
- * fresh empty session with the history abandoned.
- *
- * ⚠️ DO NOT "improve" this into a resolution that throws on multiple matches
- * the way the open walk does. It reports a COUNT, and a fixed name accumulating
- * many closed records is the ORDINARY shape of legitimate automation, not an
- * ambiguity: measured 2026-09-05 on devbox's production index, the nightly
- * intaker re-bake (`intaker-refresh-charter.md` step 2, which ensures
- * `-s tmpl:intaker-bake` in a fixed cwd) had left 38 same-name records, all 38
- * closed and 0 open. Throwing here would abort that job every night — which is
- * exactly why `ensure` warns instead of refusing. The regression guard is
- * "warns and still creates with MANY closed same-name matches" in
- * test/session-closed-recovery.test.ts.
- */
-export async function findClosedSessionsByDirectoryWalk(
-  options: FindSessionByDirectoryWalkOptions,
-): Promise<SessionIndexEntry[]> {
-  const normalizedName = normalizeName(options.name);
-  const normalizedStart = absolutePath(options.cwd);
-  const normalizedBoundary = absolutePath(options.boundary ?? normalizedStart);
-  const walkBoundary = isWithinBoundary(normalizedBoundary, normalizedStart)
-    ? normalizedBoundary
-    : normalizedStart;
-  const sessions = (await loadSessionIndexEntries()).filter((session) =>
-    matchesAgentIdentity(session, options.agentCommand, options.agentName),
-  );
-
-  let current = normalizedStart;
-  const walkRoot = path.parse(current).root;
-
-  for (;;) {
-    // Same shadowing rule as the open walk: the DEEPEST level with a match wins,
-    // so a closed session in an ancestor cwd is not reported when a nearer one
-    // exists.
-    const matches = sessions.filter(
-      (session) => session.closed && matchesSessionEntry(session, current, normalizedName, true),
-    );
-    if (matches.length > 0) {
-      return matches.toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
-    }
-
-    const parent = nextWalkParent(current, walkBoundary, walkRoot);
-    if (!parent) {
-      return [];
-    }
-    current = parent;
-  }
-}
-
-/**
- * Resolve an explicitly supplied display name from index entries, hydrating
- * only the unique exact candidate. Callers decide whether this query is local
- * (pass cwd) or global (omit cwd).
- */
-function exactSessionNameCandidates(
-  entries: SessionIndexEntry[],
-  options: ResolveSessionByExactNameOptions,
-  normalizedName: string,
-): SessionIndexEntry[] {
-  const normalizedCwd = options.cwd === undefined ? undefined : absolutePath(options.cwd);
-  let candidates = entries.filter(
-    (entry) => entry.name === normalizedName && (options.includeClosed || !entry.closed),
-  );
-  if (normalizedCwd !== undefined) {
-    candidates = candidates.filter((entry) => entry.cwd === normalizedCwd);
-  }
-  if (options.excludeSubagents) {
-    candidates = candidates.filter((entry) => entry.kind !== "subagent");
-  }
-  const agentCommand = options.agentCommand;
-  if (agentCommand !== undefined) {
-    candidates = candidates.filter((entry) =>
-      matchesAgentIdentity(entry, agentCommand, options.agentName),
-    );
-  }
-  return candidates.toSorted(
-    (a, b) => a.cwd.localeCompare(b.cwd) || a.acpxRecordId.localeCompare(b.acpxRecordId),
-  );
-}
-
-export async function resolveSessionByExactName(
-  options: ResolveSessionByExactNameOptions,
-): Promise<SessionNameResolution> {
-  const normalizedName = normalizeName(options.name);
-  if (normalizedName === undefined) {
-    return { kind: "none" };
-  }
-
-  const candidates = exactSessionNameCandidates(
-    await loadSessionIndexEntries(),
-    options,
-    normalizedName,
-  );
-
-  if (candidates.length === 0) {
-    return { kind: "none" };
-  }
-  if (candidates.length > 1) {
-    return {
-      kind: "ambiguous",
-      candidates: candidates.map(({ acpxRecordId, agentCommand, agentName, cwd }) => ({
-        acpxRecordId,
-        agentCommand,
-        agentName,
-        cwd,
-      })),
-    };
-  }
-
-  const record = await loadRecordFromIndexEntry(candidates[0]);
-  return record ? { kind: "found", record } : { kind: "none" };
-}
-
-export async function resolveGlobalSessionByName(options: {
-  agentCommand: string;
-  agentName?: string;
-  name: string;
-  includeClosed?: boolean;
-}): Promise<SessionRecord | undefined> {
-  const resolution = await resolveSessionByExactName(options);
-  if (resolution.kind === "none") {
-    return undefined;
-  }
-  if (resolution.kind === "found") {
-    return resolution.record;
-  }
-
-  throw ambiguousSessionResolutionError(
-    normalizeName(options.name) ?? options.name,
-    resolution.candidates,
-  );
-}
-
-function nextWalkParent(
-  current: string,
-  walkBoundary: string,
-  walkRoot: string,
-): string | undefined {
-  if (current === walkBoundary || current === walkRoot) {
-    return undefined;
-  }
-
-  const parent = path.dirname(current);
-  if (parent === current || !isWithinBoundary(walkBoundary, parent)) {
-    return undefined;
-  }
-
-  return parent;
 }
 
 function killSignalCandidates(signal: NodeJS.Signals | undefined): NodeJS.Signals[] {
@@ -2521,7 +2121,7 @@ export type PruneCandidateCounts = {
  *  first" — a distinction the prunable-record set alone cannot make. */
 export type PruneIdResolution = {
   id: string;
-  closedMatches: { acpxRecordId: string; name?: string; lastUsedAt: string }[];
+  closedMatches: { acpxRecordId: string; lastUsedAt: string }[];
   openMatches: number;
 };
 
@@ -2737,7 +2337,6 @@ export async function pruneSessions(options: PruneOptions = {}): Promise<PruneRe
         agent: options.agentName,
         scope: options.auditScope,
         id: record.acpxRecordId,
-        name: record.name,
         cwd: record.cwd,
         createdAt: record.createdAt,
         closedAt: record.closedAt,
@@ -2959,7 +2558,6 @@ export async function resolvePruneSessionIds(
         .filter((entry) => entry.closed)
         .map((entry) => ({
           acpxRecordId: entry.acpxRecordId,
-          name: entry.name,
           lastUsedAt: entry.lastUsedAt,
         })),
       openMatches: matches.filter((entry) => !entry.closed).length,

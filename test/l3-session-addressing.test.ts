@@ -247,22 +247,3 @@ test("L3/6572c1a9: `sessions close <uuid>` positionally refuses non-zero and nam
 // unchanged — otherwise the refusal above could be "every positional close now
 // fails", which would pass the row above for the wrong reason entirely.
 // ---------------------------------------------------------------------------
-test("L3/6572c1a9 control: `sessions close <name>` by an actual resolving positional name still closes", async () => {
-  await withTempHome(async (homeDir) => {
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-l3-cwd-"));
-    try {
-      const { acpxRecordId } = await createNamedSession(homeDir, cwd, "close-name-probe");
-
-      const closedByName = await runCli(
-        [...baseAgentArgs(cwd), "sessions", "close", "close-name-probe"],
-        homeDir,
-      );
-      assert.equal(closedByName.code, 0, closedByName.stderr);
-
-      const recordAfter = await readSessionRecord(homeDir, acpxRecordId);
-      assert.equal(recordAfter.closed, true, "a resolving positional name must still close");
-    } finally {
-      await fs.rm(cwd, { recursive: true, force: true });
-    }
-  });
-});

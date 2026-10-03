@@ -392,9 +392,8 @@ function activeHolderFor(members: readonly RecordPlan[]): RecordPlan | undefined
 }
 
 /** The seat's representative for the copied NAME: its active holder, else its
- * highest-ordinal member. CONCEPTION §4 contract C2 (name removal, phase (i)) writes the
- * name to the seat and leaves it on the record; the seat is authoritative wherever the
- * two disagree. */
+ * highest-ordinal member. The name copied is the record's LEGACY name — an old acpx
+ * wrote one on the session; since D-IDENTITY a session has none, the seat does. */
 function seatNameSource(members: readonly RecordPlan[]): RecordPlan | undefined {
   return (
     activeHolderFor(members) ?? members.toSorted((a, b) => b.holderOrdinal - a.holderOrdinal)[0]
@@ -471,7 +470,7 @@ function planSeatRow(seatId: string, members: readonly RecordPlan[], now: string
     activeHolderId: holder?.record.acpxRecordId ?? null,
     nextOrdinal: Math.max(...members.map((member) => member.holderOrdinal)) + 1,
     closedAt: null,
-    name: seatNameSource(members)?.record.name,
+    name: seatNameSource(members)?.record.legacyName,
     brickId: brickLinkFromHolders(members),
     favorite: favoriteFromHolders(members),
   };

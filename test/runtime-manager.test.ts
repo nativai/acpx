@@ -303,8 +303,6 @@ test("AcpRuntimeManager creates a fresh record for each oneshot session", async 
   });
 
   assert.notEqual(first.acpxRecordId, second.acpxRecordId);
-  assert.equal(first.name, "oneshot-session");
-  assert.equal(second.name, "oneshot-session");
   assert.equal(store.records.size, 2);
 });
 

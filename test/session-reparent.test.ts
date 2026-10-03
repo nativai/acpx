@@ -95,7 +95,6 @@ async function seed(
     agentCommand: "node mock",
     agentName: "claude",
     cwd: path.join(homeDir, "workspace"),
-    name: id,
     ...overrides,
   });
   await writeSessionRecordFile(homeDir, record);
@@ -1294,7 +1293,6 @@ test("SESSION_ARCHIVED: an archived record refuses, exit 1, and is not resurrect
       agentCommand: "node mock",
       agentName: "claude",
       cwd: path.join(homeDir, "workspace"),
-      name: "archived-child",
       parentSessionId: "old-parent",
     });
     const archiveDir = path.join(homeDir, ".acpx", "sessions-archive");
@@ -2040,7 +2038,7 @@ test("a child whose RECORD vanishes mid-batch gets NO index row resurrected", as
   });
 });
 
-test("a child that CLOSES or is RENAMED during the batch keeps that change in BOTH stores", async (t) => {
+test("a child that CLOSES or is FAVORITED during the batch keeps that change in BOTH stores", async (t) => {
   await withTempHome(async (homeDir) => {
     const childIds = await seedHandover(homeDir, 6);
     const session = await loadSessionModule();
@@ -2053,9 +2051,10 @@ test("a child that CLOSES or is RENAMED during the batch keeps that change in BO
       victims = { closed: written[0], renamed: written[1] };
       await other.closeSession(victims.closed);
       const record = await other.resolveSessionRecord(victims.renamed);
-      record.name = "renamed-mid-batch";
+      record.favorite = true;
+      record.favoritedAt = "2026-06-12T08:00:00.000Z";
       // The privileged lifecycle write — what an external scalar edit uses, and
-      // the only path that may legitimately author `name`.
+      // the only path that may legitimately author `favorite`.
       await other.writeSessionRecordWithLifecycle(record);
     });
     try {
@@ -2089,11 +2088,11 @@ test("a child that CLOSES or is RENAMED during the batch keeps that change in BO
     );
     // Same construction, a different field: the overlay must write the parent group
     // and nothing else.
-    assert.equal((await readRecordJson(homeDir, renamedId)).name, "renamed-mid-batch");
+    assert.equal((await readRecordJson(homeDir, renamedId)).favorite, true);
     assert.equal(
-      (await readIndexEntry(homeDir, renamedId)).name,
-      "renamed-mid-batch",
-      `the index reverted a concurrent RENAME of ${renamedId}`,
+      (await readIndexEntry(homeDir, renamedId)).favorite,
+      true,
+      `the index reverted a concurrent FAVORITE of ${renamedId}`,
     );
     // …and the re-parent itself still landed on both stores, for every child.
     for (const id of childIds) {

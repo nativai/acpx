@@ -1,22 +1,14 @@
 // brick://16712ece — a closed session's refusal must print advice an operator
-// can actually EXECUTE, and `sessions ensure` must not revive-by-accident in
-// silence.
+// can actually EXECUTE.
 //
-// Three defects, three groups of tests:
+// Two groups of tests remain. (PART 2 — `sessions ensure` over a closed session — was
+// retired with `sessions ensure` itself: D-IDENTITY, brick 61dc1302.)
 //
 //   PART 1 — NO VERB REOPENED A CLOSED SESSION. `sessions recover` returns rc=0
 //     with `{"ownerFound":false,"state":"no_owner"}` and leaves `closed` true
 //     (it un-wedges a queue OWNER, a different problem). `sessions reopen` is
 //     the lifecycle inverse of `sessions close`; these tests read the RECORD
 //     BACK, because a command's success line is intent, not outcome.
-//
-//   PART 2 — `sessions ensure` CREATED A NEW SESSION SILENTLY when the named
-//     session existed but was closed. It still creates — measured 2026-09-05 on
-//     devbox's production index, the nightly intaker re-bake had left 38
-//     same-name records, ALL closed, and it REQUIRES a fresh session each night
-//     — but it now says so on stderr and in an additive JSON key. The assertion
-//     that matters is on the STORE (a new record appeared / the warning fired),
-//     never on the exit code: rc=0 looking fine is the entire defect.
 //
 //   PART 3 — THE `SESSION_CLOSED` TEXT PROMISED A REMOVED BEHAVIOUR
 //     ("reopen-and-deliver" on a plain delivery). It recurred because nothing
@@ -135,14 +127,6 @@ async function readRecordJson(
   return JSON.parse(raw) as Record<string, unknown>;
 }
 
-// Count the session RECORDS in the store. The whole of part 2 is that rc=0
-// looked fine while a record appeared, so every ensure assertion below is
-// anchored on this, not on the exit code.
-async function countRecords(homeDir: string): Promise<number> {
-  const entries = await fs.readdir(sessionsDir(homeDir)).catch(() => [] as string[]);
-  return entries.filter((name) => name.endsWith(".json") && name !== "index.json").length;
-}
-
 function makeSessionRecord(
   overrides: Partial<SessionRecord> & {
     acpxRecordId: string;
@@ -160,7 +144,6 @@ function makeSessionRecord(
     agentCommand: overrides.agentCommand,
     agentName: overrides.agentName,
     cwd: path.resolve(overrides.cwd),
-    name: overrides.name,
     createdAt: overrides.createdAt ?? timestamp,
     lastUsedAt: overrides.lastUsedAt ?? timestamp,
     lastSeq: 0,
@@ -205,9 +188,9 @@ async function writeMockAgentConfig(homeDir: string): Promise<void> {
 // ───────────────────────────── PART 3 — the text ─────────────────────────────
 
 test("SESSION_CLOSED names the reopen routes that EXIST and not the removed one", () => {
-  const error = new SessionClosedError("rec-1234", "my-session");
+  const error = new SessionClosedError("rec-1234");
 
-  assert.match(error.message, /'my-session'/);
+  assert.match(error.message, /'rec-1234'/);
   // The CLI route an operator can run from the shell that printed this.
   assert.match(error.message, /acpx sessions reopen rec-1234/);
   // The agent route. `--reopen` is REQUIRED and was never mentioned before.
@@ -231,15 +214,16 @@ test("SESSION_CLOSED names the reopen routes that EXIST and not the removed one"
   // accident in a later reword would silently reroute delivery retries, and
   // nothing in THIS repo would notice. Note the substring is "session is closed"
   // with no name between the words — this message always has one, which is
-  // exactly why it never matched.
+  // exactly why it never matched. (Since D-IDENTITY the label is the id.)
   const normalized = error.message.toLowerCase();
   assert.doesNotMatch(normalized, /session is closed/);
   assert.doesNotMatch(normalized, /read-only/);
   assert.doesNotMatch(normalized, /template/);
 
-  const withoutName = new SessionClosedError("raw-id", undefined);
-  assert.match(withoutName.message, /'raw-id'/);
-  assert.match(withoutName.message, /acpx sessions reopen raw-id/);
+  // The refusal labels the session by its id — a session has no name (D-IDENTITY).
+  const other = new SessionClosedError("raw-id");
+  assert.match(other.message, /'raw-id'/);
+  assert.match(other.message, /acpx sessions reopen raw-id/);
 });
 
 // STRUCTURAL, not textual: every `acpx sessions <verb>` the refusal names is
@@ -252,7 +236,7 @@ test("every `sessions <verb>` the SESSION_CLOSED text names exists in the CLI", 
     const help = await runCli(["codex", "sessions", "--help"], homeDir);
     assert.equal(help.code, 0, help.stderr);
 
-    const message = new SessionClosedError("rec-1234", "my-session").message;
+    const message = new SessionClosedError("rec-1234").message;
     const named = [...message.matchAll(/acpx sessions ([a-z][a-z-]*)/g)].map((m) => m[1]);
     assert.ok(named.length > 0, "the refusal must name at least one CLI verb");
 
@@ -289,7 +273,7 @@ test("sessions reopen flips a closed record open, proven by reading the record b
     await fs.mkdir(cwd, { recursive: true });
 
     const created = await runCli(
-      ["--cwd", cwd, "--format", "json", "codex", "sessions", "ensure", "-s", "worker"],
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "new", "-s", "worker"],
       homeDir,
     );
     assert.equal(created.code, 0, created.stderr);
@@ -332,7 +316,7 @@ test("sessions reopen is idempotent on an already-open session", async () => {
     await fs.mkdir(cwd, { recursive: true });
 
     const created = await runCli(
-      ["--cwd", cwd, "--format", "json", "codex", "sessions", "ensure", "-s", "worker"],
+      ["--cwd", cwd, "--format", "json", "codex", "sessions", "new", "-s", "worker"],
       homeDir,
     );
     assert.equal(created.code, 0, created.stderr);
@@ -386,166 +370,5 @@ test("reopen does not cascade to subagents", async () => {
       true,
       "a subagent must stay closed — reopen writes only the session it was given",
     );
-  });
-});
-
-// ───────────────────── PART 2 — ensure over a closed session ─────────────────
-
-test("sessions ensure over a CLOSED same-name session creates AND says so", async () => {
-  await withTempHome(async (homeDir) => {
-    await writeMockAgentConfig(homeDir);
-    const cwd = path.join(homeDir, "workspace");
-    await fs.mkdir(cwd, { recursive: true });
-
-    const first = await runCli(
-      ["--cwd", cwd, "--format", "json", "codex", "sessions", "ensure", "-s", "worker"],
-      homeDir,
-    );
-    assert.equal(first.code, 0, first.stderr);
-    const firstId = (JSON.parse(first.stdout.trim()) as { acpxRecordId: string }).acpxRecordId;
-
-    const closed = await runCli(
-      ["--format", "json", "codex", "sessions", "close", "--session-id", firstId],
-      homeDir,
-      { cwd },
-    );
-    assert.equal(closed.code, 0, closed.stderr);
-
-    const before = await countRecords(homeDir);
-    const second = await runCli(
-      ["--cwd", cwd, "--format", "json", "codex", "sessions", "ensure", "-s", "worker"],
-      homeDir,
-    );
-    assert.equal(second.code, 0, second.stderr);
-
-    // (1) It still creates — the nightly intaker re-bake depends on exactly this.
-    const after = await countRecords(homeDir);
-    assert.equal(after, before + 1, "ensure must still create a fresh session");
-    const payload = JSON.parse(second.stdout.trim()) as Record<string, unknown>;
-    assert.equal(payload.created, true);
-    assert.notEqual(payload.acpxRecordId, firstId, "the new session is not the closed one");
-
-    // (2) The additive machine-readable signal.
-    const signal = payload.createdBecauseClosed as Record<string, unknown> | undefined;
-    assert.ok(signal, "created-over-closed must be reported in the JSON result");
-    assert.equal(signal.count, 1);
-    assert.equal(signal.nearestRecordId, firstId);
-    assert.equal(signal.nearestName, "worker");
-
-    // (3) The human signal — on STDERR, naming what happened, that the history
-    //     is NOT carried over, and only routes that exist.
-    assert.match(second.stderr, /NEW EMPTY session/);
-    assert.match(second.stderr, /history is NOT carried over/i);
-    assert.match(second.stderr, new RegExp(`acpx sessions reopen ${firstId}`));
-    assert.match(second.stderr, /--reopen/);
-  });
-});
-
-// THE HARD CONSTRAINT. The caller this warning protects (`sessions ensure
-// -s tmpl:intaker-bake --format json`, nightly) PARSES STDOUT. A warning on
-// stdout would break the legitimate caller in the name of protecting the
-// accidental one, so stdout must stay a single parseable JSON document.
-test("the create-over-closed warning never contaminates stdout under --format json", async () => {
-  await withTempHome(async (homeDir) => {
-    await writeMockAgentConfig(homeDir);
-    const cwd = path.join(homeDir, "workspace");
-    await fs.mkdir(cwd, { recursive: true });
-
-    const first = await runCli(
-      ["--cwd", cwd, "--format", "json", "codex", "sessions", "ensure", "-s", "bake"],
-      homeDir,
-    );
-    assert.equal(first.code, 0, first.stderr);
-    const firstId = (JSON.parse(first.stdout.trim()) as { acpxRecordId: string }).acpxRecordId;
-    await runCli(
-      ["--format", "json", "codex", "sessions", "close", "--session-id", firstId],
-      homeDir,
-      { cwd },
-    );
-
-    const second = await runCli(
-      ["--cwd", cwd, "--format", "json", "codex", "sessions", "ensure", "-s", "bake"],
-      homeDir,
-    );
-    assert.equal(second.code, 0, second.stderr);
-    assert.ok(second.stderr.includes("NEW EMPTY session"), "precondition: the warning did fire");
-
-    // jq -e . would accept nothing less; neither does this.
-    const parsed = JSON.parse(second.stdout.trim()) as Record<string, unknown>;
-    assert.equal(parsed.action, "session_ensured");
-    assert.doesNotMatch(second.stdout, /NEW EMPTY session/);
-    assert.doesNotMatch(second.stdout, /⚠/);
-  });
-});
-
-// The intaker shape: a fixed name whose closed records accumulate. Measured
-// 2026-09-05 at 38 closed / 0 open. Many closed matches must NOT read as an
-// ambiguity — throwing here would abort that job every night.
-test("many closed same-name matches still create, and are counted not refused", async () => {
-  await withTempHome(async (homeDir) => {
-    await writeMockAgentConfig(homeDir);
-    const cwd = path.join(homeDir, "workspace");
-    await fs.mkdir(cwd, { recursive: true });
-
-    const ids: string[] = [];
-    for (let i = 0; i < 4; i += 1) {
-      const run = await runCli(
-        ["--cwd", cwd, "--format", "json", "codex", "sessions", "ensure", "-s", "nightly"],
-        homeDir,
-      );
-      assert.equal(run.code, 0, run.stderr);
-      const id = (JSON.parse(run.stdout.trim()) as { acpxRecordId: string }).acpxRecordId;
-      ids.push(id);
-      const closed = await runCli(
-        ["--format", "json", "codex", "sessions", "close", "--session-id", id],
-        homeDir,
-        { cwd },
-      );
-      assert.equal(closed.code, 0, closed.stderr);
-    }
-    assert.equal(new Set(ids).size, 4, "each night must have produced a distinct record");
-
-    const run = await runCli(
-      ["--cwd", cwd, "--format", "json", "codex", "sessions", "ensure", "-s", "nightly"],
-      homeDir,
-    );
-    assert.equal(run.code, 0, run.stderr);
-    const payload = JSON.parse(run.stdout.trim()) as Record<string, unknown>;
-    assert.equal(payload.created, true);
-    const signal = payload.createdBecauseClosed as Record<string, unknown>;
-    assert.equal(signal.count, 4);
-    assert.match(run.stderr, /4 closed matches/);
-  });
-});
-
-// CONTROL for the two assertions above: an ensure with NO closed match must
-// produce NEITHER the warning NOR the JSON key. Without this, a warning that
-// always fired would pass every test above.
-test("no closed match ⇒ no warning and no createdBecauseClosed key", async () => {
-  await withTempHome(async (homeDir) => {
-    await writeMockAgentConfig(homeDir);
-    const cwd = path.join(homeDir, "workspace");
-    await fs.mkdir(cwd, { recursive: true });
-
-    const created = await runCli(
-      ["--cwd", cwd, "--format", "json", "codex", "sessions", "ensure", "-s", "fresh"],
-      homeDir,
-    );
-    assert.equal(created.code, 0, created.stderr);
-    const payload = JSON.parse(created.stdout.trim()) as Record<string, unknown>;
-    assert.equal(payload.created, true);
-    assert.equal(payload.createdBecauseClosed, undefined);
-    assert.doesNotMatch(created.stderr, /NEW EMPTY session/);
-
-    // And the reuse path (an OPEN match) neither creates nor warns.
-    const reused = await runCli(
-      ["--cwd", cwd, "--format", "json", "codex", "sessions", "ensure", "-s", "fresh"],
-      homeDir,
-    );
-    assert.equal(reused.code, 0, reused.stderr);
-    const reusedPayload = JSON.parse(reused.stdout.trim()) as Record<string, unknown>;
-    assert.equal(reusedPayload.created, false);
-    assert.equal(reusedPayload.createdBecauseClosed, undefined);
-    assert.doesNotMatch(reused.stderr, /NEW EMPTY session/);
   });
 });
