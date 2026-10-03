@@ -10,7 +10,54 @@ import test from "node:test";
 // entry below that says WHY it may touch the cache. The negative case at the bottom feeds the
 // scanner a fresh offender and expects it flagged without registering it anywhere.
 
-const RAW_CACHE_READ = /\bmetadata\??\.brick\b(?!_)/;
+/**
+ * Every SPELLING of "read the brick off the record's metadata cache" the TE measured (te-fail on
+ * 4423697c, C8: the old single regex caught ONE spelling and called itself "no src file reads the
+ * cache"). Each spelling carries a fixture below that MUST be flagged — a negative control per
+ * spelling, so a regex edited into silence goes red here rather than passing the sweep.
+ *
+ * ⚠️ NOT CATCHABLE BY NAME: a local alias (`const meta = record.metadata; meta.brick`). The
+ * regexes key on an identifier ending in `metadata`; an alias with another name is invisible to a
+ * text scan. The seat-brick.ts header says a new site must call the decider — this guard is the
+ * net for the spellings that name the field, not a proof.
+ */
+const CACHE_READ_SPELLINGS: readonly { name: string; re: RegExp; fixture: string }[] = [
+  {
+    name: "member access",
+    re: /\b\w*[Mm]etadata\??\.brick\b(?!_)/,
+    fixture: "const b = record.metadata?.brick?.trim();",
+  },
+  {
+    name: "bracket access",
+    re: /\b\w*[Mm]etadata\??\.?\[\s*["']brick["']\s*\]/,
+    fixture: 'const b = record.metadata["brick"];',
+  },
+  {
+    name: "optional bracket access",
+    re: /\b\w*[Mm]etadata\??\.?\[\s*["']brick["']\s*\]/,
+    fixture: 'const b = record.metadata?.["brick"];',
+  },
+  {
+    name: "destructuring",
+    re: /\{[^}]*\bbrick\b[^}]*\}\s*=\s*[\w.?]*[Mm]etadata\b/,
+    fixture: "const { brick } = record.metadata;",
+  },
+  {
+    name: "metadataValue/metadataString helper",
+    re: /\bmetadata(?:Value|String)\([^)]*["']brick["']\s*\)/,
+    fixture: 'const b = metadataString(metadata, "brick");',
+  },
+  {
+    name: "metadataValue on a disk record",
+    re: /\bmetadata(?:Value|String)\([^)]*["']brick["']\s*\)/,
+    fixture: 'if (!metadataValue(record, "brick")) {',
+  },
+  {
+    name: "parent/child-prefixed metadata",
+    re: /\b\w*[Mm]etadata\??\.brick\b(?!_)/,
+    fixture: "const b = parentMetadata.brick;",
+  },
+];
 
 /** file → why a raw `metadata.brick` is correct there. */
 const MAY_TOUCH_THE_CACHE: Readonly<Record<string, string>> = {
@@ -34,7 +81,7 @@ function rawCacheReadLines(source: string): number[] {
     if (code.startsWith("//") || code.startsWith("*") || code.startsWith("/*")) {
       return;
     }
-    if (RAW_CACHE_READ.test(line)) {
+    if (CACHE_READ_SPELLINGS.some(({ re }) => re.test(line))) {
       hits.push(index + 1);
     }
   });
@@ -81,12 +128,14 @@ test("no src file outside the allowlist reads the record's metadata.brick cache 
   );
 });
 
-test("the scanner flags a fresh offender, and ignores comments and metadata.brick_validation", () => {
-  assert.deepEqual(rawCacheReadLines("const b = record.metadata?.brick?.trim();"), [1]);
-  assert.deepEqual(rawCacheReadLines("const b = options.metadata.brick;"), [1]);
+test("the scanner flags EVERY spelling's fixture, and ignores comments and metadata.brick_validation", () => {
+  for (const { name, fixture } of CACHE_READ_SPELLINGS) {
+    assert.deepEqual(rawCacheReadLines(fixture), [1], `spelling not flagged: ${name}`);
+  }
   assert.deepEqual(
     rawCacheReadLines("// record.metadata?.brick is the link\n * metadata.brick"),
     [],
   );
   assert.deepEqual(rawCacheReadLines("const v = metadata?.brick_validation;"), []);
+  assert.deepEqual(rawCacheReadLines('const v = metadata["brick_validation"];'), []);
 });

@@ -179,6 +179,55 @@ try {
     console.log(`ACTED=${acted}`);
     process.exit(0);
   }
+  if (scenario === "seat-decided-projection") {
+    // fb1a7a9c F4 — the projection TARGET is the brick the session HAS: its seat's, not a stale
+    // cache. Seat S is linked to `brick`; the record's cache says STALE.
+    const stale = "33333333-3333-4333-8333-333333333333";
+    const seatId = "44444444-4444-4444-8444-444444444444";
+    delete process.env.ACPX_STATE_HOME;
+    const { withSeatStoreWrite } = await import("../../src/session/persistence/seat-store.js");
+    await withSeatStoreWrite(`${os.homedir()}/.acpx/sessions`, () => ({
+      mutation: {
+        kind: "write" as const,
+        seats: new Map([
+          [
+            seatId,
+            {
+              seatId,
+              createdAt: "2026-10-03T00:00:00.000Z",
+              activeHolderId: id,
+              nextOrdinal: 2,
+              closedAt: null,
+              name: undefined,
+              brickId: { ref: brick, validated: true },
+              favorite: false,
+            },
+          ],
+        ]),
+      },
+      result: undefined,
+    }));
+    const seated = { ...record, seat_id: seatId, metadata: { brick: stale } };
+    const staleCache = outbox.prepareProjection(id, seated, identity)!;
+    assert.equal(staleCache.brick_id, brick, "stale cache: the intent targets the SEAT's brick");
+    assert.equal(staleCache.op, "upsert");
+    const noCache = outbox.prepareProjection(
+      id,
+      { ...record, seat_id: seatId, metadata: {} },
+      identity,
+    )!;
+    assert.equal(noCache.brick_id, brick, "no cache at all: still the SEAT's brick");
+    assert.equal(noCache.op, "upsert", "a seated session with a seat brick is not tombstoned");
+    const seatless = outbox.prepareProjection(
+      id,
+      { ...record, metadata: { brick: stale } },
+      identity,
+    )!;
+    assert.equal(seatless.brick_id, stale, "a seat-less record still projects its cache");
+    acted++;
+    console.log(`ACTED=${acted}`);
+    process.exit(0);
+  }
   if (scenario === "frontier") {
     for (let revision = 1; revision <= 3; revision++) {
       const intent = outbox.prepareProjection(id, record, identity)!;
