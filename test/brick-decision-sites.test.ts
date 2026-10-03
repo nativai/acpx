@@ -59,19 +59,52 @@ const CACHE_READ_SPELLINGS: readonly { name: string; re: RegExp; fixture: string
   },
 ];
 
-/** file → why a raw `metadata.brick` is correct there. */
-const MAY_TOUCH_THE_CACHE: Readonly<Record<string, string>> = {
-  "src/session/seat-brick.ts": "the decider itself — the fallback leg",
-  "src/session/persistence/seat-fields.ts":
-    "the index projection of the cache (a pure record→entry function)",
-  "src/session/seat-backfill.ts": "derives a seat's brick_id FROM its holder, once, at backfill",
-  "src/cli/session/session-management.ts":
-    "mint/join: writes the seat from the value the cache is about to carry",
-  "src/session/persistence/seat-store.ts":
-    "operator-facing MESSAGE text only (L4's surface, left untouched here); no read",
-  "src/brick-outbox.ts": "WRITER: projects a brick CLI result onto the cache (and restores it)",
-  "src/cli/session/runtime.ts":
-    "subagent mint: the seat row's brick from the child's own (empty) cache",
+/**
+ * file → { hits, why }: the EXACT number of cache-naming lines each file may carry, and why each is
+ * not a "which brick does this session have" decision. An exact count, not a wholesale exemption
+ * (te-fail C8: `brick-outbox.ts` was allowlisted whole and hid two deciding reads): a new site in an
+ * allowlisted file changes the count and fails here until someone reads it.
+ */
+const MAY_TOUCH_THE_CACHE: Readonly<Record<string, { hits: number; why: string }>> = {
+  "src/session/seat-brick.ts": {
+    hits: 2,
+    why: "the decider's fallback leg, and withBrickCache (the ONE spelling of the cache pair)",
+  },
+  "src/session/persistence/seat-fields.ts": {
+    hits: 1,
+    why: "the index projection of the cache (a pure record->entry function)",
+  },
+  "src/session/seat-backfill.ts": {
+    hits: 1,
+    why: "derives a seat's brick_id FROM its holder, once, at backfill (3dff714d (d))",
+  },
+  "src/cli/session/session-management.ts": {
+    hits: 2,
+    why: "mint/join: the new seat's brick_id from the value the cache is about to carry",
+  },
+  "src/cli/session/runtime.ts": {
+    hits: 1,
+    why: "subagent seat mint from the child's own (empty) cache",
+  },
+  "src/cli/session/inherited-metadata.ts": {
+    hits: 3,
+    why: "pure merge over the CHILD's to-be-written metadata, before any record exists",
+  },
+  "src/session/archive/record-view.ts": {
+    hits: 1,
+    why: "archive manifest projection of the cache: a read-only copy (census F)",
+  },
+  "src/session/persistence/seat-store.ts": {
+    hits: 1,
+    why: "operator-facing MESSAGE text only (L4's surface); no read",
+  },
+  "src/brick-outbox.ts": {
+    hits: 8,
+    why:
+      "7 WRITERS that project a brick CLI result onto the cache, and ONE read of the ON-DISK " +
+      "cache as 'what was last published' (the tombstone target). The projection target is " +
+      "decided through decidedBrick() -> the decider, not read here (fb1a7a9c F4).",
+  },
 };
 
 function rawCacheReadLines(source: string): number[] {
@@ -101,31 +134,35 @@ async function sourceFiles(dir: string): Promise<string[]> {
   return out;
 }
 
-test("no src file outside the allowlist reads the record's metadata.brick cache directly", async () => {
+test("no src file outside the allowlist reads the record's metadata.brick cache, and no allowlisted file reads more than it says", async () => {
   const root = process.cwd();
   const files = await sourceFiles(path.join(root, "src"));
   assert.ok(files.length > 100, `scanned only ${files.length} files — the walk is broken`);
   const offenders: string[] = [];
-  let allowlistedHits = 0;
+  const counts = new Map<string, number>();
   for (const file of files) {
     const rel = path.relative(root, file);
     const hits = rawCacheReadLines(await fs.readFile(file, "utf8"));
-    if (rel in MAY_TOUCH_THE_CACHE) {
-      allowlistedHits += hits.length;
-    } else if (hits.length > 0) {
+    if (hits.length > 0) {
+      counts.set(rel, hits.length);
+    }
+    if (!(rel in MAY_TOUCH_THE_CACHE) && hits.length > 0) {
       offenders.push(`${rel}:${hits.join(",")}`);
     }
   }
-  assert.ok(
-    allowlistedHits > 0,
-    "positive control: the scanner found no read in the allowlisted files",
-  );
   assert.deepEqual(
     offenders,
     [],
     "these sites read metadata.brick directly — decide the brick through decideSessionBrick / " +
       "resolveSessionBrickContext (src/session/seat-brick.ts) instead",
   );
+  for (const [rel, { hits }] of Object.entries(MAY_TOUCH_THE_CACHE)) {
+    assert.equal(
+      counts.get(rel) ?? 0,
+      hits,
+      `${rel}: the allowlist says ${hits} cache-naming line(s); read the new site(s) and decide`,
+    );
+  }
 });
 
 test("the scanner flags EVERY spelling's fixture, and ignores comments and metadata.brick_validation", () => {

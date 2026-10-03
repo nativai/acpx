@@ -1,6 +1,12 @@
+import fs from "node:fs";
 import type { SessionRecord } from "../types.js";
-import { sessionBaseDir } from "./persistence/repository.js";
-import { readSeatStore, seatFromStore, type SeatRecord } from "./persistence/seat-store.js";
+import {
+  parseSeatStore,
+  readSeatStore,
+  seatFromStore,
+  seatStorePath,
+  type SeatRecord,
+} from "./persistence/seat-store.js";
 
 /**
  * THE ONE PLACE THAT DECIDES A SESSION'S BRICK (brick fb1a7a9c; Daniel,
@@ -64,7 +70,7 @@ export function decideBrick(
 /** IO half — one `seats.json` read per call, and none for a seat-less record. */
 export async function decideSessionBrick(
   subject: BrickSubject,
-  sessionDir: string = sessionBaseDir(),
+  sessionDir: string,
 ): Promise<DecidedBrick | undefined> {
   let seat: SeatRecord | undefined;
   if (subject.seatId !== undefined) {
@@ -75,4 +81,46 @@ export async function decideSessionBrick(
     }
   }
   return decideBrick(seat, subject.metadata);
+}
+
+/** The synchronous twin, for the callers that decide inside a sync lock (the brick outbox).
+ * Same fail-open contract; the SAME `decideBrick`, so the two cannot drift. */
+export function decideSessionBrickSync(
+  subject: BrickSubject,
+  sessionDir: string,
+): DecidedBrick | undefined {
+  let seat: SeatRecord | undefined;
+  if (subject.seatId !== undefined) {
+    try {
+      const storePath = seatStorePath(sessionDir);
+      seat = seatFromStore(
+        parseSeatStore(fs.readFileSync(storePath, "utf8"), storePath),
+        subject.seatId,
+      );
+    } catch {
+      seat = undefined;
+    }
+  }
+  return decideBrick(seat, subject.metadata);
+}
+
+/**
+ * The cache a seated (or seat-less) holder carries for a brick link: `metadata.brick` and its
+ * validation word TOGETHER, or neither. THE ONLY place the pair is spelled — a state word that
+ * outlives its ref (or a ref with a stale word) is exactly the "validated-by-assumption" bug.
+ * `link === undefined` clears both (a detach). Returns `undefined` rather than `{}`.
+ */
+export function withBrickCache(
+  metadata: Record<string, string> | undefined,
+  link: { readonly ref: string; readonly validated: boolean } | undefined,
+): Record<string, string> | undefined {
+  const { brick: _brick, brick_validation: _word, ...rest } = metadata ?? {};
+  if (link === undefined) {
+    return Object.keys(rest).length > 0 ? rest : undefined;
+  }
+  return {
+    ...rest,
+    brick: link.ref,
+    brick_validation: link.validated ? "validated" : "unvalidated",
+  };
 }

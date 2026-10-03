@@ -65,6 +65,7 @@ import {
 } from "../../session/persistence.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
 import { explainSeatRowMissing } from "../../session/seat-backfill.js";
+import { withBrickCache } from "../../session/seat-brick.js";
 import type { SessionRecord } from "../../types.js";
 import { resolveSessionBrickContext } from "./brick-link.js";
 import { DEFAULT_QUEUE_OWNER_TTL_MS } from "./contracts.js";
@@ -373,14 +374,9 @@ function metadataWithSeatBrickLink(
   childMetadata: Record<string, string> | undefined,
   link: SeatBrickLink,
 ): Record<string, string> | undefined {
-  // Drop any stale `brick_validation` the child might already carry (there is
-  // no legitimate source for one before the seat's link is applied).
-  const { brick_validation: _stale, ...rest } = childMetadata ?? {};
-  return {
-    ...rest,
-    brick: link.ref,
-    brick_validation: link.validated ? "validated" : "unvalidated",
-  };
+  // Drops any stale `brick_validation` the child might already carry (no legitimate source for
+  // one before the seat's link is applied) — and spells the pair through the ONE helper.
+  return withBrickCache(childMetadata, link) ?? {};
 }
 
 /**

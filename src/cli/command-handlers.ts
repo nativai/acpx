@@ -69,6 +69,8 @@ import {
   matchesPruneSessionId,
   resolveSessionRecord,
   resolveTemplateSelector,
+  seatBrickLinkFromRef,
+  sessionBaseDir,
   rollbackTemplateSlug,
   DeletionManifestWriteError,
   describeManifestFailure,
@@ -77,6 +79,7 @@ import {
   writeSessionRecordWithLifecycle,
 } from "../session/persistence.js";
 import type { MigrateSlugsResult, TemplateRollbackResult } from "../session/persistence.js";
+import { writeBrickLink } from "../session/seat-brick-write.js";
 import { decideSessionBrick } from "../session/seat-brick.js";
 import { seatDisplayName } from "../session/seat-display-name.js";
 import { EXIT_CODES } from "../types.js";
@@ -699,7 +702,7 @@ async function parentInheritableFields(parent: SessionRecord): Promise<ResolvedP
     seatId: parent.seatId,
     // The parent's DECIDED brick (its seat's), never its raw `metadata.brick` cache — a child
     // into a new seat must not inherit a stale copy (fb1a7a9c).
-    brick: (await decideSessionBrick(parent))?.ref,
+    brick: (await decideSessionBrick(parent, sessionBaseDir()))?.ref,
     subscription: sessionOptions?.subscription,
     profile: sessionOptions?.profile,
     agentCommand: parent.agentCommand,
@@ -2329,9 +2332,17 @@ export async function handleSessionsSetMetadata(
   const selector = resolveSessionTargetSelector({ flags, command });
   const record = await requireExplicitSessionRecord(selector, agent.agentName);
   if (key === "brick") {
-    await warnIfBrickDoesNotResolve(trimmedValue);
+    // The brick link has ONE writer (fb1a7a9c): a seated record's SEAT is re-pointed and the cache
+    // follows with its validation word; a seat-less record's cache is written the same way.
+    const validated = await warnIfBrickDoesNotResolve(trimmedValue);
+    await writeBrickLink({
+      seatId: record.seatId,
+      recordIds: [record.acpxRecordId],
+      link: seatBrickLinkFromRef(trimmedValue, validated),
+    });
+  } else {
+    await writeSessionRecord(mergeSessionMetadata(record, key, trimmedValue));
   }
-  await writeSessionRecord(mergeSessionMetadata(record, key, trimmedValue));
   printSetMetadataResultByFormat(key, trimmedValue, record, globalFlags.format);
 }
 
