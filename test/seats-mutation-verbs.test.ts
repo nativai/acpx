@@ -417,7 +417,7 @@ test("SB3 · a well-formed seat id with NO ROW (and no record) is refused naming
     // is referenced by no record, so this is the typo origin (brick `bf454a2c`); the
     // backfillable origin's pair lives in `seat-store-refusals.test.ts`.
     assert.match(refusal.error, /has no row in/);
-    assert.match(refusal.error, /no session record references/);
+    assert.match(refusal.error, /no readable session record in \S+ carries that seat id/);
     assert.doesNotMatch(refusal.error, /must be a seat id in lowercase UUID form/);
   });
 });
@@ -1603,7 +1603,7 @@ test("CL8 · close on an ABSENT row refuses SEAT_ROW_MISSING with AP17's cause a
     // `seat-store-refusals.test.ts`).
     assert.match(
       refusal.error,
-      /no session record references/i,
+      /no readable session record in \S+ carries that seat id/i,
       "the refusal does not name the cause",
     );
     assert.match(refusal.error, /acpx seats list/, "the refusal does not name the remedy");
