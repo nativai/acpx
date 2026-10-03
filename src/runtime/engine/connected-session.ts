@@ -117,6 +117,7 @@ export async function withConnectedSession<T>(
   const displayName = await seatDisplayName(record);
   const brick = record.metadata?.brick?.trim() || null;
   const brickPath = brick ? resolveExistingBrickPath(brick) : null;
+  const agentFolders = resolveAndEnsureAgentFolder(record, brickPath);
   const client =
     options.createClient?.({
       agentCommand: record.agentCommand,
@@ -136,7 +137,8 @@ export async function withConnectedSession<T>(
         parentSessionUrl: record.parentSessionUrl ?? null,
         brick,
         brickPath,
-        agentFolder: resolveAndEnsureAgentFolder(record, brickPath, displayName),
+        agentFolder: agentFolders?.agentFolder ?? null,
+        seatFolder: agentFolders?.seatFolder ?? null,
         subscriptionId: record.acpx?.session_options?.subscription ?? null,
         profileId: record.acpx?.session_options?.profile ?? null,
         seatId: record.seatId ?? null,
@@ -162,7 +164,8 @@ export async function withConnectedSession<T>(
         parentSessionUrl: record.parentSessionUrl ?? null,
         brick,
         brickPath,
-        agentFolder: resolveAndEnsureAgentFolder(record, brickPath, displayName),
+        agentFolder: agentFolders?.agentFolder ?? null,
+        seatFolder: agentFolders?.seatFolder ?? null,
         subscriptionId: record.acpx?.session_options?.subscription ?? null,
         profileId: record.acpx?.session_options?.profile ?? null,
         seatId: record.seatId ?? null,

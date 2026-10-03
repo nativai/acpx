@@ -71,18 +71,74 @@ test("resolveAndEnsureAgentFolder returns null and creates nothing when the bric
   assert.equal(fs.existsSync(missing), false);
 });
 
-test("resolveAndEnsureAgentFolder creates <brick>/agents/<seat-name>-<id8> and returns the absolute path", async () => {
+const SEAT_ID = "137b9523-2f75-4172-8e96-94d52eeea152";
+const SESSION_ID = "f186ee80-aaaa-bbbb-cccc-dddddddddddd";
+
+// C7 rows 1 + 4: a seated record resolves to `<brick>/agents/<seat8>/holders/<session8>` and creates it
+// (and with it the seat folder); NO name appears anywhere in the path.
+test("resolveAndEnsureAgentFolder creates <brick>/agents/<seat8>/holders/<session8> for a seated record", async () => {
   await withBaseDir((brickDir) => {
     const record = recordWith({
-      acpxRecordId: "f186ee80-aaaa-bbbb-cccc-dddddddddddd",
+      acpxRecordId: SESSION_ID,
+      seatId: SEAT_ID,
       metadata: { brick: "11111111-2222-3333-4444-555555555555" },
     });
-    const expected = path.join(brickDir, "agents", "conception-agent-f186ee80");
-    assert.equal(resolveAndEnsureAgentFolder(record, brickDir, "Conception Agent"), expected);
-    // No seat name ⇒ the bare id8 (a session has no name of its own).
-    const bare = path.join(brickDir, "agents", "f186ee80");
-    assert.equal(resolveAndEnsureAgentFolder(record, brickDir), bare);
-    assert.ok(fs.statSync(expected).isDirectory());
+    const seatFolder = path.join(brickDir, "agents", "137b9523");
+    const agentFolder = path.join(seatFolder, "holders", "f186ee80");
+    assert.deepEqual(resolveAndEnsureAgentFolder(record, brickDir), { agentFolder, seatFolder });
+    assert.ok(fs.statSync(agentFolder).isDirectory());
+    assert.ok(fs.statSync(seatFolder).isDirectory());
+    // The name is not an input: no name-slug directory is ever created.
+    assert.deepEqual(fs.readdirSync(path.join(brickDir, "agents")), ["137b9523"]);
+  });
+});
+
+test("the same ids always resolve to the same path: the record carries no name, and the derivation takes none", async () => {
+  await withBaseDir((brickDir) => {
+    const first = resolveAndEnsureAgentFolder(
+      recordWith({ acpxRecordId: SESSION_ID, seatId: SEAT_ID }),
+      brickDir,
+    );
+    const second = resolveAndEnsureAgentFolder(
+      recordWith({ acpxRecordId: SESSION_ID, seatId: SEAT_ID }),
+      brickDir,
+    );
+    assert.deepEqual(second, first);
+    assert.deepEqual(fs.readdirSync(path.join(brickDir, "agents")), ["137b9523"]);
+  });
+});
+
+// C7 row 4: a record WITHOUT a seat keeps the id-only full-uuid folder and never invents a seat path.
+test("resolveAndEnsureAgentFolder gives a seat-less record <brick>/agents/<session-uuid> and no seat folder", async () => {
+  for (const seatId of [undefined, "", "   "]) {
+    await withBaseDir((brickDir) => {
+      const record = recordWith({ acpxRecordId: SESSION_ID, seatId });
+      const agentFolder = path.join(brickDir, "agents", SESSION_ID);
+      assert.deepEqual(resolveAndEnsureAgentFolder(record, brickDir), {
+        agentFolder,
+        seatFolder: null,
+      });
+      assert.ok(fs.statSync(agentFolder).isDirectory());
+      assert.deepEqual(fs.readdirSync(path.join(brickDir, "agents")), [SESSION_ID]);
+    });
+  }
+});
+
+// Ids come off disk: a separator or dot-segment must never reach a `mkdir` (it would escape the brick).
+test("resolveAndEnsureAgentFolder refuses an id that is not a single path segment and creates nothing", async () => {
+  await withBaseDir((brickDir) => {
+    for (const [acpxRecordId, seatId] of [
+      ["../escape", undefined],
+      ["a/b", undefined],
+      [SESSION_ID, "../../x"],
+      [SESSION_ID, ".."],
+    ] as const) {
+      assert.equal(
+        resolveAndEnsureAgentFolder(recordWith({ acpxRecordId, seatId }), brickDir),
+        null,
+      );
+    }
+    assert.equal(fs.existsSync(path.join(brickDir, "agents")), false);
   });
 });
 
@@ -94,7 +150,8 @@ test("resolveAndEnsureAgentFolder creates <brick>/agents/<seat-name>-<id8> and r
 test("resolveAndEnsureAgentFolder ignores a legacy metadata.task_folder entirely", async () => {
   await withBaseDir((taskDir) => {
     const record = recordWith({
-      acpxRecordId: "f186ee80-aaaa-bbbb-cccc-dddddddddddd",
+      acpxRecordId: SESSION_ID,
+      seatId: SEAT_ID,
       metadata: { task_folder: taskDir },
     });
     assert.equal(resolveAndEnsureAgentFolder(record), null);
@@ -112,12 +169,14 @@ test("resolveAndEnsureAgentFolder uses the brick path on a record that still has
     const brickDir = await fsp.mkdtemp(path.join(os.tmpdir(), "acpx-agent-brick-"));
     try {
       const record = recordWith({
-        acpxRecordId: "f186ee80-aaaa-bbbb-cccc-dddddddddddd",
+        acpxRecordId: SESSION_ID,
+        seatId: SEAT_ID,
         metadata: { brick: "11111111-2222-3333-4444-555555555555", task_folder: taskDir },
       });
-      const expected = path.join(brickDir, "agents", "brick-agent-f186ee80");
-      assert.equal(resolveAndEnsureAgentFolder(record, brickDir, "Brick Agent"), expected);
-      assert.ok(fs.statSync(expected).isDirectory());
+      const seatFolder = path.join(brickDir, "agents", "137b9523");
+      const agentFolder = path.join(seatFolder, "holders", "f186ee80");
+      assert.deepEqual(resolveAndEnsureAgentFolder(record, brickDir), { agentFolder, seatFolder });
+      assert.ok(fs.statSync(agentFolder).isDirectory());
       assert.equal(fs.existsSync(path.join(taskDir, "agents")), false);
     } finally {
       await fsp.rm(brickDir, { recursive: true, force: true });

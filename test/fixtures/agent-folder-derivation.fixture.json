@@ -1,0 +1,37 @@
+{
+  "contract": "C7 (brick 09197f03): seated => agentFolder <brick>/agents/<seat-id8>/holders/<session-id8>, seatFolder <brick>/agents/<seat-id8>; seat-less => agentFolder <brick>/agents/<session-uuid>, seatFolder null. Inputs are trimmed; an empty or absent seatId is seat-less; brickPath is normalized (no trailing or doubled slash). Paths carry no trailing slash.",
+  "cases": [
+    {
+      "name": "seated",
+      "brickPath": "/wisdom/Bricks/09197f03-2d16-4638-8f17-037706837cc7",
+      "sessionId": "eda16115-5c69-4118-a3ac-321cea3a28bf",
+      "seatId": "137b9523-2f75-4172-8e96-94d52eeea152",
+      "agentFolder": "/wisdom/Bricks/09197f03-2d16-4638-8f17-037706837cc7/agents/137b9523/holders/eda16115",
+      "seatFolder": "/wisdom/Bricks/09197f03-2d16-4638-8f17-037706837cc7/agents/137b9523"
+    },
+    {
+      "name": "seat-less (seatId null)",
+      "brickPath": "/wisdom/Bricks/09197f03-2d16-4638-8f17-037706837cc7",
+      "sessionId": "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+      "seatId": null,
+      "agentFolder": "/wisdom/Bricks/09197f03-2d16-4638-8f17-037706837cc7/agents/0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+      "seatFolder": null
+    },
+    {
+      "name": "seat-less (seatId empty string, the transient creation spawn)",
+      "brickPath": "/tmp/pool/b1",
+      "sessionId": "ffffffff-0000-4000-8000-000000000001",
+      "seatId": "",
+      "agentFolder": "/tmp/pool/b1/agents/ffffffff-0000-4000-8000-000000000001",
+      "seatFolder": null
+    },
+    {
+      "name": "padded ids and trailing slash on brickPath",
+      "brickPath": "/tmp/pool/b2/",
+      "sessionId": "  aaaaaaaa-1111-4222-8333-444444444444 ",
+      "seatId": " bbbbbbbb-5555-4666-8777-888888888888  ",
+      "agentFolder": "/tmp/pool/b2/agents/bbbbbbbb/holders/aaaaaaaa",
+      "seatFolder": "/tmp/pool/b2/agents/bbbbbbbb"
+    }
+  ]
+}
