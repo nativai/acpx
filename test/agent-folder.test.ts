@@ -81,7 +81,6 @@ test("resolveAndEnsureAgentFolder creates <brick>/agents/<seat8>/holders/<sessio
     const record = recordWith({
       acpxRecordId: SESSION_ID,
       seatId: SEAT_ID,
-      name: "Conception Agent",
       metadata: { brick: "11111111-2222-3333-4444-555555555555" },
     });
     const seatFolder = path.join(brickDir, "agents", "137b9523");
@@ -94,14 +93,14 @@ test("resolveAndEnsureAgentFolder creates <brick>/agents/<seat8>/holders/<sessio
   });
 });
 
-test("a rename cannot orphan the folder: the same ids resolve to the same path under any name", async () => {
+test("the same ids always resolve to the same path: the record carries no name, and the derivation takes none", async () => {
   await withBaseDir((brickDir) => {
     const first = resolveAndEnsureAgentFolder(
-      recordWith({ acpxRecordId: SESSION_ID, seatId: SEAT_ID, name: "first-name" }),
+      recordWith({ acpxRecordId: SESSION_ID, seatId: SEAT_ID }),
       brickDir,
     );
     const second = resolveAndEnsureAgentFolder(
-      recordWith({ acpxRecordId: SESSION_ID, seatId: SEAT_ID, name: "second-name" }),
+      recordWith({ acpxRecordId: SESSION_ID, seatId: SEAT_ID }),
       brickDir,
     );
     assert.deepEqual(second, first);
@@ -113,7 +112,7 @@ test("a rename cannot orphan the folder: the same ids resolve to the same path u
 test("resolveAndEnsureAgentFolder gives a seat-less record <brick>/agents/<session-uuid> and no seat folder", async () => {
   for (const seatId of [undefined, "", "   "]) {
     await withBaseDir((brickDir) => {
-      const record = recordWith({ acpxRecordId: SESSION_ID, seatId, name: "Seatless Agent" });
+      const record = recordWith({ acpxRecordId: SESSION_ID, seatId });
       const agentFolder = path.join(brickDir, "agents", SESSION_ID);
       assert.deepEqual(resolveAndEnsureAgentFolder(record, brickDir), {
         agentFolder,
@@ -153,7 +152,6 @@ test("resolveAndEnsureAgentFolder ignores a legacy metadata.task_folder entirely
     const record = recordWith({
       acpxRecordId: SESSION_ID,
       seatId: SEAT_ID,
-      name: "Legacy Agent",
       metadata: { task_folder: taskDir },
     });
     assert.equal(resolveAndEnsureAgentFolder(record), null);
@@ -173,7 +171,6 @@ test("resolveAndEnsureAgentFolder uses the brick path on a record that still has
       const record = recordWith({
         acpxRecordId: SESSION_ID,
         seatId: SEAT_ID,
-        name: "Brick Agent",
         metadata: { brick: "11111111-2222-3333-4444-555555555555", task_folder: taskDir },
       });
       const seatFolder = path.join(brickDir, "agents", "137b9523");

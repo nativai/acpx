@@ -65,7 +65,7 @@ async function writeSeatedRecords(home: string): Promise<void> {
   for (const [id, seatId, name] of records) {
     await writeSessionRecordFile(
       home,
-      makeSessionRecord({ ...base, acpxRecordId: id, acpSessionId: `acp-${name}`, seatId, name }),
+      makeSessionRecord({ ...base, acpxRecordId: id, acpSessionId: `acp-${name}`, seatId }),
     );
   }
 }
