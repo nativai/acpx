@@ -256,7 +256,13 @@ test("HL5: a NON-active holder found only by its record's seat_id keeps the seat
       [PARENT_ONLY_SEAT],
       "only the seat that is merely a PARENT is holder-less",
     );
-    assert.deepEqual(await rowIds(homeDir), [ARCHIVE_SEAT, HOT_GARBLED_SEAT].toSorted());
+    // The seat-less `child` record is itself seated by this same run, so the store
+    // also holds that new row — only the three PLANTED rows are the subject.
+    const planted = new Set([HOT_GARBLED_SEAT, ARCHIVE_SEAT, PARENT_ONLY_SEAT]);
+    assert.deepEqual(
+      (await rowIds(homeDir)).filter((id) => planted.has(id)),
+      [ARCHIVE_SEAT, HOT_GARBLED_SEAT].toSorted(),
+    );
   });
 });
 

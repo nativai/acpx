@@ -846,6 +846,10 @@ function headlineLines(report: SeatBackfillReport): string[] {
     // Brick `eca085bb` fix round: filled holders whose `holder_active` mirror was (or would be)
     // set true so it agrees with the pointer, as a fresh mint does.
     `  holder mirrors set:   ${report.holderMirrorsSet}`,
+    // Brick `6cb4f4dc`: seat rows with no holder record anywhere (hot tier or archive).
+    // The label is STABLE, and it differs by mode on purpose — a dry run says what
+    // `--apply` WILL remove, an applied run what it DID.
+    `  holder-less seats ${report.apply ? "reaped" : "to reap"}: ${report.holderlessSeats.length}`,
     `  errors:               ${report.errors.length}`,
   ];
 }
@@ -862,6 +866,7 @@ function detailLines(report: SeatBackfillReport): string[] {
       `  records that had no index entry (entry written from the seated record): ${report.recordsWithoutIndexEntry}`,
     );
   }
+  lines.push(...report.holderlessSeats.map((seatId) => `  holder-less seat ${seatId}`));
   if (report.backupSuffix !== undefined) {
     lines.push(`  rollback copies:      ${report.backups.length} × *${report.backupSuffix}`);
   }
@@ -1843,7 +1848,8 @@ VARIADIC ON PURPOSE. The sweep is a synchronous batch loop, so one invocation pe
     .description(
       "Mint a seat for every hot-tier session record that lacks one: the seat_id onto the " +
         "record, the seat field group onto its index entry, and one row per distinct seat in " +
-        "seats.json. DRY RUN BY DEFAULT — --apply is the only writer.",
+        "seats.json; and remove the seat rows whose holders have no session record at all (hot or " +
+        "archived). DRY RUN BY DEFAULT — --apply is the only writer.",
     )
     .option("--apply", "Write. Without it this is a dry run that touches nothing.")
     .option(
@@ -1893,6 +1899,12 @@ IT REFUSES rather than overwriting:
 Neither refusal writes anything, including the rollback copies.
 
 NO EXCLUSIONS. Template and subagent records get seats too.
+
+HOLDER-LESS SEATS ARE REAPED. A seat row none of whose holders has a session record
+FILE — in the hot tier or in the archive — is removed by --apply, and the dry run counts
+and lists them ("holder-less seats to reap: N", then the ids). A holder whose record
+exists but does not parse still counts as a holder, so that seat is kept. \`sessions
+prune\` removes the seat of the last record it deletes by the same rule.
 
 THE ABANDONED-RECORD SWEEP RUNS FIRST and is REPORT-ONLY here — it names the open
 records with no live owner; closing one is \`sessions close\`'s job, not this verb's.
