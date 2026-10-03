@@ -2405,6 +2405,36 @@ test("S4c · `--no-brick` against a seat that CARRIES a brick is REFUSED, same f
   });
 });
 
+test("O2 · `--from <A> --no-brick` is refused with advice that does not name the --seat flag the caller never typed", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const shimEnv = {
+      PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
+      BRICK_SHIM_MODE: "ok",
+      BRICK_SHIM_ID: BRICK_A,
+    };
+    const base = ["--cwd", cwd, "--agent", MOCK_AGENT_COMMAND, "--approve-all", "--format", "json"];
+
+    const first = await runCli([...base, "sessions", "new", "--brick", BRICK_A], homeDir, shimEnv);
+    assert.equal(first.code, 0, first.stderr);
+    const firstId = String(
+      (JSON.parse(first.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+
+    const refused = await runCli(
+      [...base, "sessions", "new", "--from", firstId, "--no-brick"],
+      homeDir,
+      shimEnv,
+    );
+    assert.notEqual(refused.code, 0, "--no-brick against a brick-carrying seat must refuse");
+    const said = `${refused.stdout}${refused.stderr}`;
+    assert.match(said, /SEAT_BRICK_MISMATCH/);
+    assert.doesNotMatch(said, /omit --seat/, "the advice names a flag the caller did not type");
+    assert.match(said, /seats set-brick \S+ --unset/, "the working remedy stays");
+  });
+});
+
 test("S4a (1/3) · join a BRICK-LESS seat with explicit --brick A: accept, holder gets A, the SEAT IS NOT WRITTEN", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
