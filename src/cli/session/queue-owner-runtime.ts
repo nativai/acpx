@@ -176,6 +176,7 @@ async function sessionContextFromRecord(record: Awaited<ReturnType<typeof resolv
     subscriptionId: record.acpx?.session_options?.subscription ?? null,
     profileId: record.acpx?.session_options?.profile ?? null,
     seatId: record.seatId ?? null,
+    seatOrdinal: record.holderOrdinal ?? null,
     parentSeatId: record.parentSeatId ?? null,
   };
 }

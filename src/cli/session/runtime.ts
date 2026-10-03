@@ -2357,6 +2357,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         profileId: record.acpx?.session_options?.profile ?? null,
         reasoningEffort: sessionOptions?.reasoningEffort ?? null,
         seatId: record.seatId ?? null,
+        seatOrdinal: record.holderOrdinal ?? null,
         parentSeatId: record.parentSeatId ?? null,
       },
       sessionOptions,
