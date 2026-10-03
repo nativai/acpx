@@ -674,6 +674,10 @@ OTHER THINGS WORTH KNOWING.
       "The holder to activate (acpx record id, ACP session id, or unique suffix). Must already belong to this seat.",
     )
     .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
+    .option(
+      "--no-notify",
+      "Do not deliver the activation notice to the successor; print it for you to paste instead",
+    )
     .addHelpText(
       "after",
       `

@@ -71,8 +71,17 @@ export const SESSION_IDENTITY_ENV = ["ACPX_SESSION_RECORD_ID"] as const;
 export const NO_ENTITLEMENT_FETCH_ENV = "ACPX_NO_OPENROUTER_ENTITLEMENT_FETCH";
 
 /**
+ * brick c85c42bf — `sessions activate` POSTs its notice to this box's acpx-ui. Same family as
+ * the guard above (the suite must never touch the box), and it SETS: a dead port, so a row
+ * that does not stub the origin gets a fast "unreachable" instead of reaching the real
+ * acpx-ui through the namespace-derived cluster-internal URL. A row that wants a stub
+ * overrides it in its own child env (`test/seat-activate-notice-delivery.test.ts`).
+ */
+export const NOTICE_DELIVERY_DEAD_ORIGIN = "http://127.0.0.1:9";
+
+/**
  * Delete every box-level `ACPX_PI_*` override and every session-identity variable
- * from `env`, and set the no-network guard above. Returns the names removed (sorted)
+ * from `env`, and set the no-network guards above. Returns the names removed (sorted)
  * so a caller can assert on what actually happened rather than on the absence of a
  * complaint.
  *
@@ -92,5 +101,6 @@ export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env
     }
   }
   env[NO_ENTITLEMENT_FETCH_ENV] = "1";
+  env.ACPX_UI_INTERNAL_URL = NOTICE_DELIVERY_DEAD_ORIGIN;
   return removed.toSorted();
 }
