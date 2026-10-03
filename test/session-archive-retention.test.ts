@@ -257,6 +257,7 @@ function seatStoreOf(row: SeatRecord, malformed: readonly string[] = []): SeatSt
     malformedSeatIds: [...malformed],
     unparsedRows: new Map(malformed.map((id) => [id, { seat_id: id }])),
     fileState: "ok",
+    storePath: "/rig/sessions/seats.json",
   };
 }
 
@@ -267,6 +268,7 @@ function favoriteBlocker(
     malformedSeatIds: [],
     unparsedRows: new Map(),
     fileState: "ok",
+    storePath: "/rig/sessions/seats.json",
   },
 ): string | undefined {
   const files = { ".json": 60 * DAY };
@@ -344,7 +346,7 @@ test("favorite ROW 5: a MALFORMED seat row throws rather than silently reading '
   const store = seatStoreOf(seatRowFixture(), [SEAT_STARRED]);
   assert.throws(
     () => favoriteBlocker({ seat_id: SEAT_STARRED, holder_active: true, favorite: true }, store),
-    /is PRESENT in the seat store but its row is malformed/,
+    /is PRESENT in the seat store \/rig\/sessions\/seats\.json but its row is malformed/,
     "a destruction guard must fail loud, never silently treat 'cannot tell' as 'not starred'",
   );
 });
@@ -359,6 +361,7 @@ test("favorite: a seat with no row at all (dangling seat_id) falls back to the l
     malformedSeatIds: [],
     unparsedRows: new Map(),
     fileState: "ok",
+    storePath: "/rig/sessions/seats.json",
   };
   assert.equal(
     favoriteBlocker({ seat_id: SEAT_STARRED, holder_active: true, favorite: true }, emptyStore),
