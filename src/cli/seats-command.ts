@@ -1469,7 +1469,8 @@ function renderSeatShowText(
   process.stdout.write(`  holders (${holders.length}):\n`);
   for (const holder of holders) {
     process.stdout.write(
-      `    #${holder.ordinal ?? "?"}  ${holder.id}  ${describeHolderOpenState(holder.open)}\n`,
+      `    ${holder.ordinal === undefined ? "prepared" : `#${holder.ordinal}`}  ${holder.id}  ` +
+        `${describeHolderOpenState(holder.open)}\n`,
     );
   }
 }
