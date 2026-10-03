@@ -262,6 +262,55 @@ test("RED-ON-BASE · healthy leg (`brick show` resolves) · the seat's brick_id_
   });
 });
 
+test("O3 · a SLOW but healthy `brick show` (past the old 3 s budget) still marks the seat's brick link VALIDATED", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const created = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "-s",
+        "slow-healthy-leg",
+        "--brick",
+        BRICK_A,
+      ],
+      homeDir,
+      {
+        PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
+        BRICK_SHIM_MODE: "ok",
+        BRICK_SHIM_ID: BRICK_A,
+        // `brick show` of a container brick measured 3-15 s on this box; the answer is healthy,
+        // only slow — a 3 s budget read it as "CLI unavailable" and stored the link UNVALIDATED.
+        BRICK_SHIM_SHOW_DELAY_MS: "4500",
+      },
+    );
+    assert.equal(created.code, 0, created.stderr);
+    assert.doesNotMatch(created.stderr, /brick CLI unavailable/);
+    const id = String(
+      (JSON.parse(created.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
+    );
+    const onDisk = await readRawSessionRecord(homeDir, id);
+    const seatId = String(onDisk.seat_id);
+
+    const store = await readRawSeatStore(homeDir);
+    assert.equal(store[seatId]?.brick_id, BRICK_A);
+    assert.equal(
+      store[seatId]?.brick_id_validated,
+      true,
+      "O3: a resolving --brick create must leave the seat link VALIDATED, however slow `brick show` was",
+    );
+  });
+});
+
 test("RED-ON-BASE · ROW B extended, degraded leg (`brick show` times out) · the seat's brick_id_validated is FALSE on disk", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
