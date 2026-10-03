@@ -1929,9 +1929,8 @@ test("F1 · `sessions new --brick` writes the SEAT's brick_id, not only the hold
 //
 // The shim's `hang` mode (a 30 s sleep) makes the timeout fire deterministically
 // rather than depending on real box load, so this row is reliable rather than a
-// second flaky copy of the hazard it tests. No `timeoutMs` plumbing needed:
-// `execFile`'s own `timeout` option already bounds the wait to
-// `BRICK_CLI_TIMEOUT_MS` (~3 s), so this row costs seconds, not minutes.
+// second flaky copy of the hazard it tests. The resolve budget is 20 s in production (O3), so
+// the row shortens it with `ACPX_BRICK_RESOLVE_TIMEOUT_MS` and costs seconds, not minutes.
 test(
   "F1/fallback leg (ROW B) · --brick is ACCEPTED UNVALIDATED when `brick show` times out, and " +
     "still reaches BOTH the holder and the SEAT — pins today's behaviour, not an endorsement",
@@ -1961,6 +1960,7 @@ test(
         {
           PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
           BRICK_SHIM_MODE: "hang",
+          ACPX_BRICK_RESOLVE_TIMEOUT_MS: "3000",
         },
       );
       assert.equal(created.code, 0, created.stderr);

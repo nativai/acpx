@@ -8,6 +8,19 @@ import { decideSessionBrick } from "../../session/seat-brick.js";
 import type { SessionRecord } from "../../types.js";
 
 export const BRICK_CLI_TIMEOUT_MS = 3_000;
+/**
+ * The budget for the `brick show` that VALIDATES a ref. `show` renders the whole card, so a
+ * container brick answers in 3-15 s (measured 2026-10-03, `brick show a2d3967c` 15.2 s) — and a
+ * timeout is read as "CLI unavailable", which stores the link UNVALIDATED (O3: a `--brick` create
+ * of a healthy brick read `⚠ UNVALIDATED`). `ACPX_BRICK_RESOLVE_TIMEOUT_MS` shortens it for the
+ * tests' deterministic `hang` shim.
+ */
+const BRICK_RESOLVE_TIMEOUT_MS = 20_000;
+
+function brickResolveTimeoutMs(): number {
+  const override = Number(process.env.ACPX_BRICK_RESOLVE_TIMEOUT_MS);
+  return Number.isFinite(override) && override > 0 ? override : BRICK_RESOLVE_TIMEOUT_MS;
+}
 export const BRICK_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /**
  * The brick pool's default location — the value `acpx-ui` has used all along
@@ -90,7 +103,7 @@ export async function resolveBrickFlagRef(
     throw new InvalidArgumentError("--brick must not be empty");
   }
 
-  const result = await runBrickShow(trimmed, options.timeoutMs ?? BRICK_CLI_TIMEOUT_MS);
+  const result = await runBrickShow(trimmed, options.timeoutMs ?? brickResolveTimeoutMs());
   if (result.kind === "resolved") {
     return { ref: result.brickId, validated: true };
   }
@@ -149,7 +162,7 @@ export async function warnIfBrickDoesNotResolve(brickId: string): Promise<boolea
   if (!BRICK_UUID_RE.test(normalized)) {
     return false;
   }
-  const result = await runBrickShow(normalized, BRICK_CLI_TIMEOUT_MS);
+  const result = await runBrickShow(normalized, brickResolveTimeoutMs());
   if (result.kind === "not-found") {
     process.stderr.write(`[acpx] warning: brick does not resolve in the pool: ${normalized}\n`);
   }
