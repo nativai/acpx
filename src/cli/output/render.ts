@@ -243,6 +243,44 @@ export function warnUndeliveredCustody(sessionLabel: string, drain: SessionClose
   process.stderr.write(`${lines.join("\n")}\n`);
 }
 
+// Brick 9956d212 (3) — the seat id is what the operator must hand `sessions activate`; it was
+// reachable only through a follow-up `sessions show`. A record with no `seatId` (pre-Seat) is
+// its own seat and has nothing to name here.
+function resolveSeatUrl(seatId: string | undefined): string | undefined {
+  const base = seatId ? resolveAcpxUiBaseUrl(process.env) : undefined;
+  return base ? `${base}/?seat=${seatId}` : undefined;
+}
+
+function newSessionSeatJson(record: SessionRecord, seatUrl: string | undefined) {
+  if (!record.seatId) {
+    return {};
+  }
+  return {
+    seatId: record.seatId,
+    holderActive: record.holderActive === true,
+    ...(seatUrl ? { seatUrl } : {}),
+  };
+}
+
+// STDERR, beside the `[acpx] created session` banner: stdout stays the bare record id, which
+// `ID=$(acpx sessions new)` consumers capture.
+function printNewSessionSeatLines(record: SessionRecord, seatUrl: string | undefined): void {
+  const seatId = record.seatId;
+  if (!seatId) {
+    return;
+  }
+  process.stderr.write(`seat: ${seatId}\n`);
+  if (seatUrl) {
+    process.stderr.write(`seat url: ${seatUrl}\n`);
+  }
+  if (record.holderActive === false) {
+    process.stderr.write(
+      `prepared into seat ${seatId} — NOT active; activate with: ` +
+        `acpx sessions activate ${seatId} ${record.acpxRecordId}\n`,
+    );
+  }
+}
+
 // L3 (brick 4e58b35c) — `sessions new` no longer evicts the occupant of an
 // already-occupied (cwd, name) slot (command-handlers.ts, handleSessionsNew),
 // so there is never anything to report as replaced. `replacedSessionId` is
@@ -253,6 +291,7 @@ export function warnUndeliveredCustody(sessionLabel: string, drain: SessionClose
 // deleted eviction as expected behaviour).
 export function printNewSessionByFormat(record: SessionRecord, format: OutputFormat): void {
   const subscriptionSelection = consumeAutoSubscriptionSelection();
+  const seatUrl = resolveSeatUrl(record.seatId);
   if (
     emitJsonResult(format, {
       action: "session_ensured",
@@ -261,6 +300,7 @@ export function printNewSessionByFormat(record: SessionRecord, format: OutputFor
       acpxSessionId: record.acpSessionId,
       agentSessionId: record.agentSessionId,
       sessionUrl: composeSessionUrl(record),
+      ...newSessionSeatJson(record, seatUrl),
       ...(subscriptionSelection ? { subscriptionSelection } : {}),
     })
   ) {
@@ -268,6 +308,9 @@ export function printNewSessionByFormat(record: SessionRecord, format: OutputFor
   }
 
   process.stdout.write(`${record.acpxRecordId}\n`);
+  if (format !== "quiet") {
+    printNewSessionSeatLines(record, seatUrl);
+  }
 }
 
 export function printCopiedSessionByFormat(

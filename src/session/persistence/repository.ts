@@ -44,6 +44,7 @@ import {
 import { mergeRecordPinnedModelForPersist, rememberSessionModelBaseline } from "./model-merge.js";
 import { parseSessionRecord } from "./parse.js";
 import { copySeatHolderFields, copySeatLinkageFields } from "./seat-fields.js";
+import { findHolderlessSeats, reapHolderlessSeats } from "./seat-holderless.js";
 import { serializeSessionRecordForDisk } from "./serialize.js";
 import { pickLatestTemplate, slugify, type TemplateOrderKey } from "./template-slug.js";
 
@@ -2353,6 +2354,8 @@ export async function pruneSessions(options: PruneOptions = {}): Promise<PruneRe
     // best effort cache rebuild
   });
 
+  await reapSeatsOfPrunedRecords(sessionDir, records);
+
   return {
     pruned: records,
     skippedTemplates,
@@ -2362,6 +2365,38 @@ export async function pruneSessions(options: PruneOptions = {}): Promise<PruneRe
     strandedStreamBytes,
     auditEntries,
   };
+}
+
+/**
+ * A SEAT EXISTS ONLY FOR A SESSION THAT HAS A RECORD (brick `6cb4f4dc`): when prune
+ * deletes the last record that held a seat, the row goes with it. Measured on
+ * devbox-staging, acpx-ui's catalogue probe is `sessions new` → `close` → `prune`, and
+ * the prune used to leave 28–29 rows whose holder no longer existed.
+ *
+ * Only the seats of the records JUST deleted are asked about, and only a seat with NO
+ * remaining holder — hot or archived, parseable or not — is removed
+ * (`persistence/seat-holderless.ts` carries the class).
+ *
+ * BEST-EFFORT, AND DELIBERATELY NOT A REASON FOR PRUNE TO FAIL: the records are already
+ * deleted, so an unreadable or unwritable store here must not turn a completed prune
+ * into an error. A row left behind is not lost — `acpx seats backfill` lists and reaps
+ * the same class.
+ */
+async function reapSeatsOfPrunedRecords(
+  sessionDir: string,
+  records: readonly SessionRecord[],
+): Promise<void> {
+  const seatIds = new Set(
+    records.flatMap((record) => (record.seatId === undefined ? [] : [record.seatId])),
+  );
+  if (seatIds.size === 0) {
+    return;
+  }
+  try {
+    await reapHolderlessSeats(sessionDir, await findHolderlessSeats(sessionDir, seatIds));
+  } catch {
+    // best effort — see above
+  }
 }
 
 /**

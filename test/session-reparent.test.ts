@@ -584,6 +584,57 @@ test("BOTH DIRECTIONS AT ONCE: the preserve beats a stale write, and set-parent 
   });
 });
 
+// brick 73c568cf — the SEAT LINKAGE half of the same window. `parentSeatId` is
+// written by `set-parent` on the line after `parentSessionId`, but the close
+// path's preserve restored only the four session-id fields, so a stale
+// `closeSession` write left a record carrying the NEW `parentSessionId` and the
+// OLD `parentSeatId` — torn, exit 0, and exactly what B1's lockstep rule exists
+// to prevent. The assertions are on the two fields AGREEING, not on either one
+// alone, because the torn state has each of them individually "plausible".
+test("a stale close-path write cannot tear parentSeatId from parentSessionId (brick 73c568cf)", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "old-parent", { seatId: "old-parent-seat" });
+    await seed(homeDir, "new-parent", { seatId: "new-parent-seat" });
+    await seed(homeDir, "child", {
+      parentSessionId: "old-parent",
+      parentSeatId: "old-parent-seat",
+    });
+
+    const persistence = await loadPersistenceModule();
+
+    // `closeSession` reads the record at entry and writes it back seconds later.
+    const staleRecord = await persistence.resolveSessionRecord("child");
+    assert.equal(staleRecord.parentSeatId, "old-parent-seat", "fixture precondition");
+
+    const setParent = await runCli(
+      ["claude", "sessions", "set-parent", "--session-id", "child", "--parent-id", "new-parent"],
+      homeDir,
+    );
+    assert.equal(setParent.code, 0, setParent.stderr);
+    const afterSetParent = await readRecordJson(homeDir, "child");
+    assert.equal(
+      afterSetParent.parent_seat_id,
+      "new-parent-seat",
+      "precondition: set-parent did not land the new seat on disk",
+    );
+
+    staleRecord.closed = true;
+    staleRecord.closedAt = new Date().toISOString();
+    await persistence.writeSessionRecordAtBoundaryWithLifecycle(staleRecord);
+
+    const afterClose = await readRecordJson(homeDir, "child");
+    assert.equal(afterClose.closed, true, "the close itself must still have landed");
+    assert.equal(afterClose.parent_session_id, "new-parent");
+    assert.equal(
+      afterClose.parent_seat_id,
+      "new-parent-seat",
+      "TORN PARENT LINKAGE: the stale close-path write kept the NEW parentSessionId " +
+        "and put the OLD parentSeatId back — children of this record would compose " +
+        "ACPX_PARENT_SEAT_URL from the predecessor's seat",
+    );
+  });
+});
+
 // ─── 3. Self-clobber — leg (b) ────────────────────────────────────────────────
 
 test("set-parent on an existing on-disk record actually changes it (leg b)", async () => {

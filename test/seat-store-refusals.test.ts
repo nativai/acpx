@@ -165,7 +165,11 @@ test("F4-typo · show on a seat id NO RECORD references: the refusal says check 
     const result = await runCli(["seats", "show", SEAT_TYPO], homeDir);
     assert.equal(result.code, 1, result.output);
     assert.match(result.output, /SEAT_ROW_MISSING/);
-    assert.match(result.output, /no session record references/i, "does not name the real origin");
+    assert.match(
+      result.output,
+      /no readable session record in \S+ carries that seat id/i,
+      "does not name the real origin",
+    );
     assert.match(
       result.output,
       /typo|check the (seat )?id/i,
@@ -179,6 +183,32 @@ test("F4-typo · show on a seat id NO RECORD references: the refusal says check 
   });
 });
 
+test("F4-unparseable · a seat whose ONLY referencing record does not PARSE: the refusal states what was measured and never claims the seat was never minted — TEXT mode, combined stream", async () => {
+  await withRig(async (homeDir) => {
+    await writeStore(homeDir, { [SEAT_OTHER]: seatRow(SEAT_OTHER) });
+    // The one record that names this seat is invalid JSON (its text still carries the id).
+    // The seat WAS minted; the scan cannot read the record that proves it.
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "sessions", "broken-holder.json"),
+      `{"acpx_record_id": "broken-holder", "seat_id": "${SEAT_TYPO}", "holder_ordinal": 1,`,
+      "utf8",
+    );
+    const result = await runCli(["seats", "show", SEAT_TYPO], homeDir);
+    assert.equal(result.code, 1, result.output);
+    assert.match(result.output, /SEAT_ROW_MISSING/);
+    assert.match(
+      result.output,
+      /no readable session record in \S*sessions carries that seat id/i,
+      "the sentence must state the property that was measured",
+    );
+    assert.doesNotMatch(
+      result.output,
+      /never minted|ever minted|nothing to repair/i,
+      "an unparseable record is evidence the seat WAS minted — the refusal must not deny it",
+    );
+  });
+});
+
 test("F4-typo · rename (a MUTATION verb, row looked up inside the hold) refuses the same way — JSON mode, combined stream", async () => {
   await withRig(async (homeDir) => {
     await writeStore(homeDir, { [SEAT_OTHER]: seatRow(SEAT_OTHER) });
@@ -188,7 +218,7 @@ test("F4-typo · rename (a MUTATION verb, row looked up inside the hold) refuses
     );
     assert.equal(result.code, 1, result.output);
     assert.match(result.output, /SEAT_ROW_MISSING/);
-    assert.match(result.output, /no session record references/i);
+    assert.match(result.output, /no readable session record in \S+ carries that seat id/i);
     assert.doesNotMatch(result.output, /backfill/i);
   });
 });
@@ -228,7 +258,7 @@ test("F4-backfillable · a seat whose record exists and whose ROW is missing IS 
       /acpx seats backfill --apply/,
       "the advice must be runnable as printed",
     );
-    assert.doesNotMatch(refused.output, /no session record references/i);
+    assert.doesNotMatch(refused.output, /no readable session record in \S+ carries that seat id/i);
 
     // RUN THE ADVICE, as printed (a bare `seats backfill` is a DRY RUN that writes nothing).
     const healed = await runCli(["seats", "backfill", "--apply", "--format", "json"], homeDir);
@@ -253,7 +283,7 @@ test("F4-backfillable · rename (inside the hold, JSON) gives the same backfill 
     assert.equal(refused.code, 1, refused.output);
     assert.match(refused.output, /SEAT_ROW_MISSING/);
     assert.match(refused.output, /acpx seats backfill --apply/);
-    assert.doesNotMatch(refused.output, /no session record references/i);
+    assert.doesNotMatch(refused.output, /no readable session record in \S+ carries that seat id/i);
     const healed = await runCli(["seats", "backfill", "--apply", "--format", "json"], homeDir);
     assert.equal(healed.code, 0, healed.output);
     const renamed = await runCli(
@@ -273,7 +303,7 @@ test("F4 · activate (phase 0.1) follows the origin too: typo ⇒ no backfill; b
     );
     assert.notEqual(typo.code, 0, typo.output);
     assert.match(typo.output, /SEAT_ROW_MISSING/);
-    assert.match(typo.output, /no session record references/i);
+    assert.match(typo.output, /no readable session record in \S+ carries that seat id/i);
     assert.doesNotMatch(typo.output, /backfill/i);
 
     const real = await runCli(
@@ -307,7 +337,7 @@ test("F4 · create-into-seat (`sessions new --seat`) follows the origin too — 
       );
     const typo = await join(SEAT_TYPO);
     assert.notEqual(typo.code, 0, typo.output);
-    assert.match(typo.output, /no session record references/i);
+    assert.match(typo.output, /no readable session record in \S+ carries that seat id/i);
     assert.doesNotMatch(typo.output, /backfill/i);
     const real = await join(backfillable);
     assert.notEqual(real.code, 0, real.output);

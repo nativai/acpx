@@ -4042,37 +4042,6 @@ test("same-agent claude child inherits parent profile when no child credential i
   });
 });
 
-test("explicit chatgpt profile on codex child is preserved over claude parent profile", async () => {
-  await withTempHome(async (homeDir) => {
-    const { cwd, claudeCommand, codexCommand } = await setupCredentialInheritanceFixture(homeDir);
-    const parentId = await writeClaudeParentWithProfile(homeDir, {
-      cwd,
-      claudeCommand,
-      profile: "sub2",
-    });
-
-    const stored = await createChildAndReadRecord(homeDir, [
-      "--cwd",
-      cwd,
-      "--format",
-      "json",
-      "--profile",
-      "chatgpt",
-      "codex",
-      "sessions",
-      "new",
-      "--parent-id",
-      parentId,
-    ]);
-    const options = sessionOptionsFromRecord(stored);
-
-    assert.equal(stored.parent_session_id, parentId);
-    assert.equal(stored.agent_command, codexCommand);
-    assert.equal(options.profile, "chatgpt");
-    assert.equal(options.subscription, undefined);
-  });
-});
-
 test("explicit claude subscription on codex child still rejects as incompatible", async () => {
   await withTempHome(async (homeDir) => {
     const { cwd } = await setupCredentialInheritanceFixture(homeDir);

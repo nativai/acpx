@@ -18,6 +18,7 @@ import {
 import { parseSessionRecord } from "./persistence/parse.js";
 import { writeSessionRecordAuthorizingSeatHolderWithoutIndex } from "./persistence/repository.js";
 import { seatFieldsToIndexEntry } from "./persistence/seat-fields.js";
+import { findHolderlessSeats, reapHolderlessSeats } from "./persistence/seat-holderless.js";
 import {
   backfillSeatRow,
   fillSeatActiveHolder,
@@ -29,6 +30,7 @@ import {
   readSeatStore,
   type SeatBrickLink,
   type SeatRecord,
+  SEAT_STORE_FILE,
   seatStorePath,
   SeatStoreUnwritableError,
 } from "./persistence/seat-store.js";
@@ -163,6 +165,14 @@ export type SeatBackfillReport = {
    * holder whose mirror is already true is not counted. Dry run: would be set.
    */
   holderMirrorsSet: number;
+  /**
+   * Brick `6cb4f4dc`, A SEAT EXISTS ONLY FOR A SESSION THAT HAS A RECORD: the ids of
+   * seat rows none of whose holders has a session record FILE in the hot tier or the
+   * archive (an unparseable record still counts as a holder). Dry run: the rows
+   * `--apply` WOULD remove. Applied: the rows actually removed. The class and its edges
+   * live in `persistence/seat-holderless.ts`.
+   */
+  holderlessSeats: string[];
   errors: SeatBackfillError[];
   /** The `.bak-mig-<TS>` suffix of this run's pre-apply copies, absent on a dry run. */
   backupSuffix: string | undefined;
@@ -941,6 +951,30 @@ async function applyRecord(
 }
 
 /**
+ * The reap leg: runs last, after every mint, and re-checks each row's pointer inside the
+ * hold, so a row a succession moved in the meantime is left alone. A failure is a
+ * reported `store` error and not a throw — the other legs have already landed.
+ */
+async function reapHolderless(
+  sessionDir: string,
+  holderless: Parameters<typeof reapHolderlessSeats>[1],
+  errors: SeatBackfillError[],
+): Promise<string[]> {
+  try {
+    return await reapHolderlessSeats(sessionDir, holderless);
+  } catch (error) {
+    errors.push({
+      file: SEAT_STORE_FILE,
+      acpxRecordId: undefined,
+      stage: "store",
+      code: (error as NodeJS.ErrnoException | undefined)?.code,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return [];
+  }
+}
+
+/**
  * Run the backfill. Dry run by default — `apply: false` reads everything, computes
  * every count and writes NOTHING, so the preview and the run cannot disagree about
  * what is going to happen.
@@ -967,6 +1001,9 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
   });
 
   const seatPlans = await planSeats(sessionDir, scanned.plans, now().toISOString());
+  // Found BEFORE any leg runs, on the store as it stood: a row this run mints has a
+  // record by construction, so the two populations cannot overlap.
+  const holderless = await findHolderlessSeats(sessionDir);
   const seatsNeedingRows = [...seatPlans.values()].filter((seat) => seat.needsRow);
   const errors = [...scanned.errors];
 
@@ -993,6 +1030,7 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
       activeHoldersFilled: [...seatPlans.values()].filter((seat) => seat.activeHolderNeedsFill)
         .length,
       holderMirrorsSet: [...seatPlans.values()].filter(needsMirrorWrite).length,
+      holderlessSeats: holderless.map((seat) => seat.seatId),
       errors,
       backupSuffix: undefined,
       backups: [],
@@ -1017,6 +1055,8 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
   for (const plan of scanned.plans) {
     await applyRecord(sessionDir, plan, seatPlans, counts, errors, suffix);
   }
+  // Last, after every mint.
+  const holderlessReaped = await reapHolderless(sessionDir, holderless, errors);
 
   return {
     ...base,
@@ -1030,6 +1070,7 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
     brickLinksFilled: counts.brickLinksFilled,
     activeHoldersFilled: counts.activeHoldersFilled,
     holderMirrorsSet: counts.holderMirrorsSet,
+    holderlessSeats: holderlessReaped,
     errors,
     backupSuffix: suffix,
     backups: counts.backups,

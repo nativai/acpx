@@ -15,6 +15,9 @@ const SESSION_ID = "740e3fbc-1024-481e-96bb-203ac5eefb1b";
 const BRICK_ID = "49d4ba9c-8ac1-4253-b7dd-f46374efb796";
 // Expected Brick: URL = base URL (SESSION_URL up to '?') + ?brick=<uuid>
 const BRICK_URL = `https://acpx.devbox.nativai.de/?brick=${BRICK_ID}`;
+// ACPX_SEAT_URL is composed by auth-env.ts as `<base>/?seat=<id>`; the hook copies it verbatim.
+const SEAT_ID = "3f2b8c1e-5d44-4b7a-9a10-6c0de9f1a222";
+const SEAT_URL = `https://acpx.devbox.nativai.de/?seat=${SEAT_ID}`;
 
 // Fixture transcript: exactly 3 genuine user-prompt turns amid noise the predicate
 // must reject (tool_result carrier, assistant, isMeta/isSidechain/isCompactSummary,
@@ -208,6 +211,84 @@ test("hook: Brick trailer absent when ACPX_BRICK is unset", () => {
   assert.equal(countLines(message, "Session:"), 1);
   assert.equal(countLines(message, "Brick:"), 0, message);
   assert.equal(countLines(message, "Message:"), 1);
+});
+
+test("hook: Seat trailer carries ACPX_SEAT_URL verbatim when it is set", () => {
+  const { message } = runHookWithTranscript({
+    subject: "feat: seated commit\n",
+    transcript: FIXTURE_LINES,
+    extraEnv: { ACPX_BRICK: BRICK_ID, ACPX_SEAT_URL: SEAT_URL },
+  });
+  assert.equal(countLines(message, "Seat:"), 1, message);
+  assert.equal(message.match(/^Seat: (.+)$/m)?.[1], SEAT_URL);
+});
+
+test("hook: Seat trailer absent when ACPX_SEAT_URL is unset or empty — never invented", () => {
+  for (const seatUrl of [undefined, ""]) {
+    const { message } = runHookWithTranscript({
+      subject: "feat: seatless commit\n",
+      transcript: FIXTURE_LINES,
+      extraEnv: { ACPX_BRICK: BRICK_ID, ACPX_SEAT_URL: seatUrl },
+    });
+    assert.equal(countLines(message, "Session:"), 1, message);
+    assert.equal(countLines(message, "Seat:"), 0, message);
+  }
+});
+
+test("hook: Seat trailer is idempotent — a second run adds no duplicate", () => {
+  const dir = mkdtempSync(join(tmpdir(), "acpx-hook-"));
+  execFileSync("git", ["init", "-q"], { cwd: dir });
+  const msgFile = join(dir, "COMMIT_EDITMSG");
+  writeFileSync(msgFile, "feat: repeat\n");
+  const env = {
+    ...process.env,
+    ACPX_SESSION_URL: SESSION_URL,
+    ACPX_BRICK: BRICK_ID,
+    ACPX_SEAT_URL: SEAT_URL,
+  };
+  execFileSync("sh", [HOOK, msgFile], { cwd: dir, env });
+  execFileSync("sh", [HOOK, msgFile], { cwd: dir, env });
+  const message = execFileSync("cat", [msgFile]).toString();
+  assert.equal(countLines(message, "Seat:"), 1, message);
+  assert.equal(countLines(message, "Session:"), 1, message);
+  assert.equal(countLines(message, "Brick:"), 1, message);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("hook: Session, Brick and Seat share ONE trailer paragraph — all three extract via %(trailers)", () => {
+  const { dir, message } = runHookWithTranscript({
+    subject: "feat: all three\n\nBody paragraph.\n",
+    extraEnv: { ACPX_BRICK: BRICK_ID, ACPX_SEAT_URL: SEAT_URL },
+  });
+  // A blank line between trailers would end the block; the real extraction is the witness.
+  const msgFile = join(dir, "COMMIT_EDITMSG");
+  execFileSync(
+    "git",
+    [
+      "-c",
+      "core.hooksPath=/dev/null",
+      "-c",
+      "user.name=hook-test",
+      "-c",
+      "user.email=hook-test@example.invalid",
+      "commit",
+      "-q",
+      "--allow-empty",
+      "-F",
+      msgFile,
+    ],
+    { cwd: dir },
+  );
+  const extracted = execFileSync(
+    "git",
+    ["log", "-1", "--format=%(trailers:key=Session,key=Brick,key=Seat,valueonly)"],
+    { cwd: dir },
+  )
+    .toString()
+    .split("\n")
+    .filter((l) => l.length > 0);
+  assert.deepEqual(extracted, [SESSION_URL, BRICK_URL, SEAT_URL], message);
+  rmSync(dir, { recursive: true, force: true });
 });
 
 test("hook: Co-Authored-By anthropic.com lines stripped from commit message", () => {
