@@ -122,12 +122,10 @@ export class SessionArchivedError extends AcpxOperationalError {
 
 export class SessionClosedError extends AcpxOperationalError {
   readonly sessionId: string;
-  readonly sessionName: string | undefined;
 
-  constructor(sessionId: string, sessionName: string | undefined) {
-    const label = sessionName ?? sessionId;
+  constructor(sessionId: string) {
     super(
-      `Session '${label}' is closed; prompts are rejected until it is reopened. ` +
+      `Session '${sessionId}' is closed; prompts are rejected until it is reopened. ` +
         `Reopen it with \`acpx sessions reopen ${sessionId}\`, or click Reopen in acpx-ui. ` +
         `To reopen and deliver in one step, use \`send-message.sh --reopen <session-url> '<text>'\` — ` +
         `a plain delivery to a closed session does NOT reopen it, it is rejected with 409 SESSION_CLOSED.`,
@@ -138,7 +136,6 @@ export class SessionClosedError extends AcpxOperationalError {
       },
     );
     this.sessionId = sessionId;
-    this.sessionName = sessionName;
   }
 }
 
@@ -666,10 +663,9 @@ export class BridgeAuthGatedError extends AcpxOperationalError {
 // live queue owner. Refused (not queued) — switching mid-stream would tear the
 // client down. acpx-ui maps the "turn-in-flight" detailCode to a 409.
 export class SubscriptionTurnInFlightError extends AcpxOperationalError {
-  constructor(sessionName?: string) {
-    const label = sessionName ? ` '${sessionName}'` : "";
+  constructor() {
     super(
-      `Cannot switch subscription while a turn is in flight on session${label}; wait for the current turn to finish (turn-in-flight).`,
+      `Cannot switch subscription while a turn is in flight on this session; wait for the current turn to finish (turn-in-flight).`,
       {
         outputCode: "USAGE",
         detailCode: "TURN_IN_FLIGHT",
@@ -725,10 +721,9 @@ export class ProfileClassMismatchError extends AcpxOperationalError {
 // down. Shares the "TURN_IN_FLIGHT" detailCode with the subscription path so
 // acpx-ui maps it to the same 409.
 export class ProfileTurnInFlightError extends AcpxOperationalError {
-  constructor(sessionName?: string) {
-    const label = sessionName ? ` '${sessionName}'` : "";
+  constructor() {
     super(
-      `Cannot move the session to a different credential while a turn is in flight on session${label}; wait for the current turn to finish (turn-in-flight).`,
+      `Cannot move the session to a different credential while a turn is in flight on this session; wait for the current turn to finish (turn-in-flight).`,
       {
         outputCode: "USAGE",
         detailCode: "TURN_IN_FLIGHT",
@@ -743,10 +738,9 @@ export class ProfileTurnInFlightError extends AcpxOperationalError {
 // would SIGKILL the live turn. Shares the "TURN_IN_FLIGHT" detailCode with the
 // subscription/profile paths so acpx-ui maps it to the same 409.
 export class ModelTurnInFlightError extends AcpxOperationalError {
-  constructor(sessionName?: string) {
-    const label = sessionName ? ` '${sessionName}'` : "";
+  constructor() {
     super(
-      `Cannot change the model while a turn is in flight on session${label}; wait for the current turn to finish (turn-in-flight).`,
+      `Cannot change the model while a turn is in flight on this session; wait for the current turn to finish (turn-in-flight).`,
       {
         outputCode: "USAGE",
         detailCode: "TURN_IN_FLIGHT",
@@ -760,10 +754,9 @@ export class ModelTurnInFlightError extends AcpxOperationalError {
 // `set effort`) was requested while a turn is in flight on the live queue owner.
 // Refused for the same reason as ModelTurnInFlightError; same 409 contract.
 export class ConfigOptionTurnInFlightError extends AcpxOperationalError {
-  constructor(configId: string, sessionName?: string) {
-    const label = sessionName ? ` '${sessionName}'` : "";
+  constructor(configId: string) {
     super(
-      `Cannot change config option "${configId}" while a turn is in flight on session${label}; wait for the current turn to finish (turn-in-flight).`,
+      `Cannot change config option "${configId}" while a turn is in flight on this session; wait for the current turn to finish (turn-in-flight).`,
       {
         outputCode: "USAGE",
         detailCode: "TURN_IN_FLIGHT",
@@ -786,10 +779,9 @@ export class ConfigOptionTurnInFlightError extends AcpxOperationalError {
  * Refusing turns that into a visible "try again when idle".
  */
 export class ConfigOptionQueuedWorkError extends AcpxOperationalError {
-  constructor(configId: string, sessionName?: string) {
-    const label = sessionName ? ` '${sessionName}'` : "";
+  constructor(configId: string) {
     super(
-      `Cannot change config option "${configId}" while work is queued on session${label}; the change would restart the agent and drop the queued prompt(s) — try again once the queue has drained (queued-work).`,
+      `Cannot change config option "${configId}" while work is queued on this session; the change would restart the agent and drop the queued prompt(s) — try again once the queue has drained (queued-work).`,
       {
         outputCode: "USAGE",
         detailCode: "QUEUED_WORK",

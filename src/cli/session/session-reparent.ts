@@ -54,12 +54,8 @@ export class SetParentRefusalError extends Error {
 
 export type SetParentMovedSession = {
   acpxRecordId: string;
-  name?: string;
   previousParentSessionId?: string;
   previousParentSessionUrl?: string;
-  /** Display name of the previous parent, when it resolves locally — for the text
-   *  renderer, which must show WHAT a child is being moved off, not just an id. */
-  previousParentName?: string;
   parentSetAt: string;
   spawnedBySessionId?: string;
   /**
@@ -101,7 +97,6 @@ export type SetParentMovedSession = {
  */
 export type SetParentDivergedSession = {
   acpxRecordId: string;
-  name?: string;
   recordParentSessionId?: string;
   indexParentSessionId?: string;
   reason: string;
@@ -109,7 +104,6 @@ export type SetParentDivergedSession = {
 
 export type SetParentSkippedSession = {
   acpxRecordId: string;
-  name?: string;
   code: SetParentRefusalCode;
   reason: string;
 };
@@ -117,7 +111,7 @@ export type SetParentSkippedSession = {
 export type SetParentResult = {
   ok: true;
   dryRun: boolean;
-  parent: { acpxRecordId: string; sessionUrl?: string; crossBox: boolean; name?: string };
+  parent: { acpxRecordId: string; sessionUrl?: string; crossBox: boolean };
   /**
    * ⚠️ AN ARRAY, ALWAYS — a batch of one is still a batch, so a caller never
    * branches on which target flag was passed. (acpx-ui `97ff3eac` is the live
@@ -513,7 +507,6 @@ async function childOutcome(
       kind: "unresolved",
       entry: {
         acpxRecordId: entry.acpxRecordId,
-        ...(entry.name ? { name: entry.name } : {}),
         code: "SESSION_NOT_FOUND",
         reason: "the index names this child but its record could not be read",
       },
@@ -548,7 +541,6 @@ function divergedEntryFor(
 ): SetParentDivergedSession {
   return {
     acpxRecordId: record.acpxRecordId,
-    ...(record.name ? { name: record.name } : {}),
     ...divergenceOf(record.parentSessionId, indexParent),
     reason:
       "record and index entry disagree about this session's parent, and the record names a third session — re-assert it explicitly with --session-id if you want it moved",
@@ -556,7 +548,7 @@ function divergedEntryFor(
 }
 
 function divergedWarning(entry: SetParentDivergedSession): string {
-  return `${entry.name ?? entry.acpxRecordId} is SPLIT across the two stores (record: ${entry.recordParentSessionId ?? "none"}, index: ${entry.indexParentSessionId ?? "none"}) and was NOT moved`;
+  return `${entry.acpxRecordId} is SPLIT across the two stores (record: ${entry.recordParentSessionId ?? "none"}, index: ${entry.indexParentSessionId ?? "none"}) and was NOT moved`;
 }
 
 function divergenceOf(
@@ -590,7 +582,7 @@ function noteHealedDivergence(
   entry.healedStoreDivergence = divergence;
   const outcome = dryRun ? "this run WOULD rewrite both" : "this run rewrote both";
   return [
-    `${entry.name ?? entry.acpxRecordId} was SPLIT across the two stores (record: ${divergence.recordParentSessionId ?? "none"}, index: ${divergence.indexParentSessionId ?? "none"}) — ${outcome}`,
+    `${entry.acpxRecordId} was SPLIT across the two stores (record: ${divergence.recordParentSessionId ?? "none"}, index: ${divergence.indexParentSessionId ?? "none"}) — ${outcome}`,
   ];
 }
 
@@ -617,7 +609,6 @@ function applyParentToRecord(
   parent: { acpxRecordId: string; sessionUrl?: string; seatId?: string },
   now: string,
   ownerState: string,
-  nameOf: (sessionId: string) => string | undefined,
 ): SetParentMovedSession {
   const previousParentSessionId = record.parentSessionId;
   const previousParentSessionUrl = record.parentSessionUrl;
@@ -648,12 +639,8 @@ function applyParentToRecord(
 
   return {
     acpxRecordId: record.acpxRecordId,
-    ...(record.name ? { name: record.name } : {}),
     ...(previousParentSessionId ? { previousParentSessionId } : {}),
     ...(previousParentSessionUrl ? { previousParentSessionUrl } : {}),
-    ...(previousParentSessionId && nameOf(previousParentSessionId)
-      ? { previousParentName: nameOf(previousParentSessionId) }
-      : {}),
     parentSetAt: now,
     ...(record.spawnedBySessionId ? { spawnedBySessionId: record.spawnedBySessionId } : {}),
     wasForkEdge,
@@ -721,13 +708,9 @@ export async function setSessionParent(options: SetParentOptions): Promise<SetPa
     warnings.push("new parent is closed");
   }
 
-  const nameById = new Map(entries.map((entry) => [entry.acpxRecordId, entry.name]));
-  const nameOf = (sessionId: string): string | undefined => nameById.get(sessionId);
-
   const outcome = await moveTargets(selection.targets, parent, entries, {
     single: options.target.kind === "session",
     dryRun,
-    nameOf,
     healed: selection.healed,
   });
   warnings.push(...outcome.warnings);
@@ -740,7 +723,6 @@ export async function setSessionParent(options: SetParentOptions): Promise<SetPa
       acpxRecordId: parent.acpxRecordId,
       ...(parent.sessionUrl ? { sessionUrl: parent.sessionUrl } : {}),
       crossBox: parent.crossBox,
-      ...(parent.record?.name ? { name: parent.record.name } : {}),
     },
     moved: outcome.moved,
     // Unresolvable index rows join the per-child refusals: both are "named, not
@@ -919,7 +901,6 @@ type MoveContext = {
    *  fail wholesale because one child is odd. */
   single: boolean;
   dryRun: boolean;
-  nameOf: (sessionId: string) => string | undefined;
   /** Children whose two stores disagreed and that this run is healing. */
   healed: ChildSelection["healed"];
 };
@@ -944,7 +925,6 @@ async function moveTargets(
     }
     skipped.push({
       acpxRecordId: record.acpxRecordId,
-      ...(record.name ? { name: record.name } : {}),
       code,
       reason,
     });
@@ -998,7 +978,7 @@ async function moveEach(
     // read once by the selection, and the id form would read it a second time and
     // throw the result away.
     const ownerState = (await readOwnerStatusForRecord(record)).classification;
-    const entry = applyParentToRecord(record, parent, now, ownerState, context.nameOf);
+    const entry = applyParentToRecord(record, parent, now, ownerState);
     warnings.push(
       ...noteHealedDivergence(entry, context.healed.get(record.acpxRecordId), context.dryRun),
     );
@@ -1015,7 +995,7 @@ async function moveEach(
     // done, because nobody reads `--help` then.
     if (!entry.previousParentSessionId) {
       warnings.push(
-        `${entry.name ?? entry.acpxRecordId} had no parent: adopting it strips its user-facing acpx-ui facet when its owner next respawns`,
+        `${entry.acpxRecordId} had no parent: adopting it strips its user-facing acpx-ui facet when its owner next respawns`,
       );
     }
     moved.push(entry);

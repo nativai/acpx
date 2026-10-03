@@ -73,6 +73,8 @@ type MockAgentOptions = {
   setSessionModelFails: boolean;
   setSessionModelInvalidParams: boolean;
   advertiseConfigOptions: boolean;
+  /** `--advertise-output-style`: add Claude's `outputStyle` select to the config options. */
+  advertiseOutputStyle: boolean;
   advertiseModels: boolean;
   replayLoadSessionUpdates: boolean;
   loadReplayText: string;
@@ -411,6 +413,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let setSessionModelFails = false;
   let setSessionModelInvalidParams = false;
   let advertiseConfigOptions = false;
+  let advertiseOutputStyle = false;
   let advertiseModels = false;
   let replayLoadSessionUpdates = false;
   let loadReplayText = "replayed load session update";
@@ -500,6 +503,11 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
 
     if (token === "--advertise-config-options") {
       advertiseConfigOptions = true;
+      continue;
+    }
+
+    if (token === "--advertise-output-style") {
+      advertiseOutputStyle = true;
       continue;
     }
 
@@ -644,6 +652,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     setSessionModelFails,
     setSessionModelInvalidParams,
     advertiseConfigOptions,
+    advertiseOutputStyle,
     advertiseModels,
     replayLoadSessionUpdates,
     loadReplayText,
@@ -855,6 +864,24 @@ function buildConfigOptions(
             { value: "xhigh", name: "Xhigh" },
           ],
         },
+    ...(options.advertiseOutputStyle
+      ? [
+          {
+            id: "outputStyle",
+            name: "Output Style",
+            category: "output_style",
+            type: "select" as const,
+            currentValue:
+              typeof state.configValues.outputStyle === "string"
+                ? state.configValues.outputStyle
+                : "default",
+            options: ["default", "Proactive", "Explanatory", "Learning"].map((value) => ({
+              value,
+              name: value,
+            })),
+          },
+        ]
+      : []),
   ];
 }
 

@@ -18,7 +18,6 @@ Core capabilities:
 - Persistent multi-turn sessions per repo/cwd
 - One-shot execution mode (`exec`)
 - Named parallel sessions (`-s/--session`)
-- Idempotent session creation (`sessions ensure`)
 - Session retention controls (`sessions prune` with age filters and history cleanup)
 - Portable session export/import for moving records and history across machines
 - Queue-aware prompt submission with optional fire-and-forget (`--no-wait`)
@@ -77,7 +76,7 @@ acpx [global_options] cancel [-s <name>]
 acpx [global_options] set-mode <mode> [-s <name>]
 acpx [global_options] set <key> <value> [-s <name>]
 acpx [global_options] status [-s <name> | --session-id <id> | --session-url <url>]
-acpx [global_options] sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [<id>...] [--cwd | --whole-box] [--older-than <days> | --before <date>] [--dry-run] [--no-include-history] [--include-templates]]
+acpx [global_options] sessions [list | new [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [<id>...] [--cwd | --whole-box] [--older-than <days> | --before <date>] [--dry-run] [--no-include-history] [--include-templates]]
 acpx [global_options] config [show | init]
 acpx [global_options] subscriptions ceiling show [profile:<id> | account:<id>]
 acpx [global_options] subscriptions ceiling set <profile:id | account:id> <90% | 0.90 | 1.00>
@@ -93,7 +92,7 @@ acpx [global_options] <agent> cancel [-s <name>]
 acpx [global_options] <agent> set-mode <mode> [-s <name>]
 acpx [global_options] <agent> set <key> <value> [-s <name>]
 acpx [global_options] <agent> status [-s <name> | --session-id <id> | --session-url <url>]
-acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [<id>...] [--cwd | --whole-box] [--older-than <days> | --before <date>] [--dry-run] [--no-include-history] [--include-templates]]
+acpx [global_options] <agent> sessions [list | new [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [<id>...] [--cwd | --whole-box] [--older-than <days> | --before <date>] [--dry-run] [--no-include-history] [--include-templates]]
 ```
 
 If prompt text is omitted and stdin is piped, `acpx` reads prompt text from stdin.
@@ -209,8 +208,6 @@ acpx sessions list --cursor <cursor>
 acpx sessions list --local
 acpx sessions new
 acpx sessions new --name backend
-acpx sessions ensure
-acpx sessions ensure --name backend
 acpx sessions close
 acpx sessions close backend
 acpx sessions reopen <id>
@@ -225,7 +222,6 @@ acpx status --session-url "$ACPX_SESSION_URL"
 
 acpx codex sessions
 acpx codex sessions new --name backend
-acpx codex sessions ensure --name backend
 acpx codex sessions close backend
 acpx codex sessions reopen <id>
 acpx codex sessions show backend
@@ -248,7 +244,6 @@ Behavior:
 - `new` creates a fresh session for the current `(agentCommand, cwd, optional name)` scope
 - `new --name <name>` targets a named session scope
 - when `new` replaces an existing open session in that scope, the old one is soft-closed
-- `ensure` returns the nearest matching active session for the scope, or creates one when none is open. Idempotent — safe to call before every prompt in scripts.
 - `close` targets current cwd default session
 - `close <name>` targets the current cwd named session first, then one exact
   global agent match
@@ -575,7 +570,7 @@ acpx claude -s reviewer 'review the diff in src/auth/'
 Idempotent session bootstrap (safe to call before every prompt in scripts):
 
 ```bash
-acpx codex sessions ensure -s ci
+acpx codex sessions new -s ci
 acpx codex -s ci 'run the smoke suite and report failures'
 ```
 

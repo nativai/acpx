@@ -109,6 +109,9 @@ export type SessionsNewFlags = {
    * copy always mints, so the flag is not offered there and an unknown-option error is
    * the refusal. */
   seat?: string;
+  /** `--from <old-session-id|url>` (brick 06b01b6b) — take the old session's relevant options as
+   * defaults (explicit flags win), and create INTO its seat when it holds one. `new` only. */
+  from?: string;
   metadata?: Record<string, string>;
   brick?: string | false;
   fromTemplate?: string;
@@ -163,11 +166,9 @@ export type SessionsOwnerStatusFlags = {
 
 export type SessionsExportFlags = SessionSelectorFlags & {
   output: string;
-  sourceCwd?: string;
 };
 
 export type SessionsImportFlags = {
-  name?: string;
   destinationCwd?: string;
 };
 
@@ -678,7 +679,7 @@ export function addSessionOption(command: Command): Command {
   return addSessionIdentityOptions(
     command.option(
       "-s, --session <name>",
-      "Use named session (local first, then one exact global agent match)",
+      "REFUSED — a name identifies nothing; address a session with --session-id",
       parseSessionName,
     ),
   ).option(
@@ -691,7 +692,7 @@ export function addSessionNameOption(command: Command): Command {
   return addSessionIdentityOptions(
     command.option(
       "-s, --session <name>",
-      "Use named session (local first, then one exact global agent match)",
+      "REFUSED — a name identifies nothing; address a session with --session-id",
       parseSessionName,
     ),
   );

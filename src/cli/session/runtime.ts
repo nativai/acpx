@@ -125,6 +125,7 @@ import {
   writeSessionRecordAtBoundary,
   type PersistedSessionLifecycle,
 } from "../../session/persistence.js";
+import { seatDisplayName } from "../../session/seat-display-name.js";
 import {
   SESSION_RECORD_SCHEMA,
   type AcpJsonRpcMessage,
@@ -1643,7 +1644,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   // corresponding CLI surface). See DESIGN.md §4 "reopen question" for why
   // we don't auto-reopen on a successful turn.
   if (record.closed) {
-    throw new SessionClosedError(record.acpxRecordId, record.name ?? undefined);
+    throw new SessionClosedError(record.acpxRecordId);
   }
   if (bindRecordToDefaultAccount(record)) {
     await writeSessionRecord(record);
@@ -2325,6 +2326,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   });
 
   const ownClient = options.client == null;
+  const displayName = options.client == null ? await seatDisplayName(record) : undefined;
   const brick = record.metadata?.brick?.trim() || null;
   const brickPath = brick ? resolveExistingBrickPath(brick) : null;
   // Only an owned client builds its own adapter env — a supplied one needs no folder created here.
@@ -2345,7 +2347,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       verbose: options.verbose,
       sessionContext: {
         acpxRecordId: record.acpxRecordId,
-        sessionName: record.name ?? null,
+        sessionName: displayName ?? null,
         parentSessionId: record.parentSessionId ?? null,
         parentSessionUrl: record.parentSessionUrl ?? null,
         brick,
@@ -2488,7 +2490,6 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
               acpSessionId: childAcpSessionId,
               agentCommand: "",
               cwd: record.cwd,
-              name: childName,
               createdAt: spawnedAt,
               lastUsedAt: spawnedAt,
               lastSeq: 0,
@@ -2580,7 +2581,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
                     : await mintSeatRowBestEffort(sessionBaseDir(), {
                         seatId: childRecord.seatId,
                         holderId: childRecord.acpxRecordId,
-                        name: childRecord.name,
+                        name: childName,
                         createdAt: spawnedAt,
                         // F1 fix (brick 3dff714d) — same consistency rule as the
                         // other two mint call sites: the seat's brick_id is

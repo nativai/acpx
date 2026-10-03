@@ -897,9 +897,8 @@ export async function mintSeatRow(
       // field as a count, which is exactly why it carries this comment.
       nextOrdinal: 2,
       closedAt: null,
-      // CONCEPTION §4 contract C2, name removal, phase (i): the name is written to the seat
-      // AND still to the session record, and the SEAT is authoritative wherever the two
-      // disagree. Phase (ii)'s gate is a measured condition on the fleet, never a date.
+      // D-IDENTITY (brick 61dc1302): the name lives on the SEAT alone — the session record
+      // carries none (an old record's legacy name is read only by the backfill).
       name: params.name,
       // F1 fix (brick 3dff714d) — the founding holder's resolved brick, so a
       // fresh `sessions new --brick <uuid>` writes the SEAT's `brick_id` rather
@@ -1251,11 +1250,14 @@ export function seatRowMissingMessage(
 ): string {
   const subject = `seat ${JSON.stringify(seatId)} has no row in ${storePath}`;
   if (!referencedByRecord) {
+    // 🛑 STATES ONLY WHAT THE SCAN MEASURED. It reads the hot tier through the same
+    // enumeration and reader as the backfill, so "no READABLE record carries this id"
+    // is true; "this seat was never minted" is NOT — a record that does not parse (or
+    // one that only lives in the archive) is invisible to the scan and may well be the
+    // seat's holder (L4 verification case C, 2026-10-03).
     return (
-      `${subject}, and no session record references that seat id — so it is not a seat ` +
-      `that predates the store or lost its row write, and there is nothing to repair: no ` +
-      `seat with this id was ever minted on this box. Check the id for a typo ` +
-      `(\`acpx seats list\` shows the seats that exist).`
+      `${subject}, and no readable session record in ${path.dirname(storePath)} carries that ` +
+      `seat id. Check the id for a typo (\`acpx seats list\` shows the seats that exist).`
     );
   }
   return (

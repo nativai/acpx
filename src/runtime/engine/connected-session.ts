@@ -9,6 +9,7 @@ import {
   ownerOptionsToInput,
 } from "../../session/owner-options.js";
 import { absolutePath, isoNow } from "../../session/persistence.js";
+import { seatDisplayName } from "../../session/seat-display-name.js";
 import { DEFAULT_PERMISSION_MODE } from "../../types.js";
 import type {
   AcpPermissionDecision,
@@ -113,6 +114,7 @@ export async function withConnectedSession<T>(
     terminal: options.terminal,
   });
   persistSessionOwnerOptions(record, ownerOptionsToInput(ownerOptions));
+  const displayName = await seatDisplayName(record);
   const brick = record.metadata?.brick?.trim() || null;
   const brickPath = brick ? resolveExistingBrickPath(brick) : null;
   const agentFolders = resolveAndEnsureAgentFolder(record, brickPath);
@@ -130,7 +132,7 @@ export async function withConnectedSession<T>(
       verbose: options.verbose,
       sessionContext: {
         acpxRecordId: record.acpxRecordId,
-        sessionName: record.name ?? null,
+        sessionName: displayName ?? null,
         parentSessionId: record.parentSessionId ?? null,
         parentSessionUrl: record.parentSessionUrl ?? null,
         brick,
@@ -157,7 +159,7 @@ export async function withConnectedSession<T>(
       verbose: options.verbose,
       sessionContext: {
         acpxRecordId: record.acpxRecordId,
-        sessionName: record.name ?? null,
+        sessionName: displayName ?? null,
         parentSessionId: record.parentSessionId ?? null,
         parentSessionUrl: record.parentSessionUrl ?? null,
         brick,

@@ -31,22 +31,6 @@ export function slugify(name: string): string | undefined {
 }
 
 /**
- * The slug a template effectively groups / resolves under: the persisted
- * `template.slug` when present, else `slugify(name)`. Lets slug-less records
- * (UI-created or pre-migration) still collapse and resolve. `undefined` ⇒ the
- * caller falls back to the record id (singleton group).
- */
-export function effectiveTemplateSlug(
-  slug: string | undefined,
-  name: string | undefined,
-): string | undefined {
-  if (slug !== undefined) {
-    return slug;
-  }
-  return name !== undefined ? slugify(name) : undefined;
-}
-
-/**
  * The fields the "latest" comparator orders on. Mapped from either a record
  * (`template.version` / `template.created_at` / `acpxRecordId`) or an index
  * entry (`templateVersion` / `templateCreatedAt` / `acpxRecordId`).

@@ -417,7 +417,7 @@ test("SB3 · a well-formed seat id with NO ROW (and no record) is refused naming
     // is referenced by no record, so this is the typo origin (brick `bf454a2c`); the
     // backfillable origin's pair lives in `seat-store-refusals.test.ts`.
     assert.match(refusal.error, /has no row in/);
-    assert.match(refusal.error, /no session record references/);
+    assert.match(refusal.error, /no readable session record in \S+ carries that seat id/);
     assert.doesNotMatch(refusal.error, /must be a seat id in lowercase UUID form/);
   });
 });
@@ -1603,7 +1603,7 @@ test("CL8 · close on an ABSENT row refuses SEAT_ROW_MISSING with AP17's cause a
     // `seat-store-refusals.test.ts`).
     assert.match(
       refusal.error,
-      /no session record references/i,
+      /no readable session record in \S+ carries that seat id/i,
       "the refusal does not name the cause",
     );
     assert.match(refusal.error, /acpx seats list/, "the refusal does not name the remedy");
@@ -1964,8 +1964,6 @@ test("SH8 · a holder whose RECORD IS UNREADABLE (not merely absent from the ind
         "new",
         "--seat",
         seatId,
-        "-s",
-        "sh8-successor",
       ],
       homeDir,
     );
@@ -2264,10 +2262,7 @@ test("RO3 · AP15 pair — create-into-seat is refused SEAT_CLOSED before reopen
     assert.equal(closedSeat.code, 0, closedSeat.output);
 
     // BEFORE reopen — refused.
-    const refused = await runCli(
-      [...base, "sessions", "new", "-s", "ro3-refused", "--seat", seatId],
-      homeDir,
-    );
+    const refused = await runCli([...base, "sessions", "new", "--seat", seatId], homeDir);
     assert.notEqual(refused.code, 0, "a closed seat must still refuse a join before reopen");
     assert.match(`${refused.stdout}${refused.stderr}`, /SEAT_CLOSED/);
 
@@ -2276,10 +2271,7 @@ test("RO3 · AP15 pair — create-into-seat is refused SEAT_CLOSED before reopen
     assert.equal(reopened.code, 0, reopened.output);
 
     // AFTER reopen — the IDENTICAL command now succeeds.
-    const accepted = await runCli(
-      [...base, "sessions", "new", "-s", "ro3-accepted", "--seat", seatId],
-      homeDir,
-    );
+    const accepted = await runCli([...base, "sessions", "new", "--seat", seatId], homeDir);
     assert.equal(
       accepted.code,
       0,
@@ -2365,10 +2357,7 @@ test("RO8 · AP15 pair — sessions activate is refused SEAT_CLOSED before reope
     // The successor must be created INTO the seat WHILE IT IS STILL OPEN —
     // create-into-seat itself refuses once the seat is closed (RO3 / seat-activate's
     // own R4).
-    const successor = await runCli(
-      [...base, "sessions", "new", "--seat", seatId, "-s", "ro8-successor"],
-      homeDir,
-    );
+    const successor = await runCli([...base, "sessions", "new", "--seat", seatId], homeDir);
     assert.equal(successor.code, 0, successor.stderr);
     const successorId = String(
       (JSON.parse(successor.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,

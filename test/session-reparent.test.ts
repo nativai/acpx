@@ -95,7 +95,6 @@ async function seed(
     agentCommand: "node mock",
     agentName: "claude",
     cwd: path.join(homeDir, "workspace"),
-    name: id,
     ...overrides,
   });
   await writeSessionRecordFile(homeDir, record);
@@ -582,6 +581,57 @@ test("BOTH DIRECTIONS AT ONCE: the preserve beats a stale write, and set-parent 
     );
     // Provenance stays the SPAWNER across both directions.
     assert.equal((await readRecordJson(homeDir, "child")).spawned_by_session_id, "old-parent");
+  });
+});
+
+// brick 73c568cf — the SEAT LINKAGE half of the same window. `parentSeatId` is
+// written by `set-parent` on the line after `parentSessionId`, but the close
+// path's preserve restored only the four session-id fields, so a stale
+// `closeSession` write left a record carrying the NEW `parentSessionId` and the
+// OLD `parentSeatId` — torn, exit 0, and exactly what B1's lockstep rule exists
+// to prevent. The assertions are on the two fields AGREEING, not on either one
+// alone, because the torn state has each of them individually "plausible".
+test("a stale close-path write cannot tear parentSeatId from parentSessionId (brick 73c568cf)", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, "old-parent", { seatId: "old-parent-seat" });
+    await seed(homeDir, "new-parent", { seatId: "new-parent-seat" });
+    await seed(homeDir, "child", {
+      parentSessionId: "old-parent",
+      parentSeatId: "old-parent-seat",
+    });
+
+    const persistence = await loadPersistenceModule();
+
+    // `closeSession` reads the record at entry and writes it back seconds later.
+    const staleRecord = await persistence.resolveSessionRecord("child");
+    assert.equal(staleRecord.parentSeatId, "old-parent-seat", "fixture precondition");
+
+    const setParent = await runCli(
+      ["claude", "sessions", "set-parent", "--session-id", "child", "--parent-id", "new-parent"],
+      homeDir,
+    );
+    assert.equal(setParent.code, 0, setParent.stderr);
+    const afterSetParent = await readRecordJson(homeDir, "child");
+    assert.equal(
+      afterSetParent.parent_seat_id,
+      "new-parent-seat",
+      "precondition: set-parent did not land the new seat on disk",
+    );
+
+    staleRecord.closed = true;
+    staleRecord.closedAt = new Date().toISOString();
+    await persistence.writeSessionRecordAtBoundaryWithLifecycle(staleRecord);
+
+    const afterClose = await readRecordJson(homeDir, "child");
+    assert.equal(afterClose.closed, true, "the close itself must still have landed");
+    assert.equal(afterClose.parent_session_id, "new-parent");
+    assert.equal(
+      afterClose.parent_seat_id,
+      "new-parent-seat",
+      "TORN PARENT LINKAGE: the stale close-path write kept the NEW parentSessionId " +
+        "and put the OLD parentSeatId back — children of this record would compose " +
+        "ACPX_PARENT_SEAT_URL from the predecessor's seat",
+    );
   });
 });
 
@@ -1243,7 +1293,6 @@ test("SESSION_ARCHIVED: an archived record refuses, exit 1, and is not resurrect
       agentCommand: "node mock",
       agentName: "claude",
       cwd: path.join(homeDir, "workspace"),
-      name: "archived-child",
       parentSessionId: "old-parent",
     });
     const archiveDir = path.join(homeDir, ".acpx", "sessions-archive");
@@ -1989,7 +2038,7 @@ test("a child whose RECORD vanishes mid-batch gets NO index row resurrected", as
   });
 });
 
-test("a child that CLOSES or is RENAMED during the batch keeps that change in BOTH stores", async (t) => {
+test("a child that CLOSES or is FAVORITED during the batch keeps that change in BOTH stores", async (t) => {
   await withTempHome(async (homeDir) => {
     const childIds = await seedHandover(homeDir, 6);
     const session = await loadSessionModule();
@@ -2002,9 +2051,10 @@ test("a child that CLOSES or is RENAMED during the batch keeps that change in BO
       victims = { closed: written[0], renamed: written[1] };
       await other.closeSession(victims.closed);
       const record = await other.resolveSessionRecord(victims.renamed);
-      record.name = "renamed-mid-batch";
+      record.favorite = true;
+      record.favoritedAt = "2026-06-12T08:00:00.000Z";
       // The privileged lifecycle write — what an external scalar edit uses, and
-      // the only path that may legitimately author `name`.
+      // the only path that may legitimately author `favorite`.
       await other.writeSessionRecordWithLifecycle(record);
     });
     try {
@@ -2038,11 +2088,11 @@ test("a child that CLOSES or is RENAMED during the batch keeps that change in BO
     );
     // Same construction, a different field: the overlay must write the parent group
     // and nothing else.
-    assert.equal((await readRecordJson(homeDir, renamedId)).name, "renamed-mid-batch");
+    assert.equal((await readRecordJson(homeDir, renamedId)).favorite, true);
     assert.equal(
-      (await readIndexEntry(homeDir, renamedId)).name,
-      "renamed-mid-batch",
-      `the index reverted a concurrent RENAME of ${renamedId}`,
+      (await readIndexEntry(homeDir, renamedId)).favorite,
+      true,
+      `the index reverted a concurrent FAVORITE of ${renamedId}`,
     );
     // …and the re-parent itself still landed on both stores, for every child.
     for (const id of childIds) {

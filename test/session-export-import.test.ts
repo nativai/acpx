@@ -27,7 +27,6 @@ function makeSessionRecord(
     agentSessionId: overrides.agentSessionId,
     agentCommand: overrides.agentCommand,
     cwd: path.resolve(overrides.cwd),
-    name: overrides.name ?? overrides.acpxRecordId,
     createdAt: overrides.createdAt ?? timestamp,
     lastUsedAt: overrides.lastUsedAt ?? timestamp,
     lastSeq: overrides.lastSeq ?? 0,
@@ -163,7 +162,6 @@ test("exportSession and importSession round-trip session state with a fresh reco
       acpSessionId: "provider-session",
       agentCommand: AGENT_REGISTRY.codex,
       cwd,
-      name: "debug",
       messages: [
         {
           User: {
@@ -181,14 +179,7 @@ test("exportSession and importSession round-trip session state with a fresh reco
     ];
     await writeHistory(homeDir, source.acpxRecordId, history);
 
-    await exportSession(
-      {
-        agentCommand: AGENT_REGISTRY.codex,
-        cwd,
-        name: "debug",
-      },
-      archivePath,
-    );
+    await exportSession({ sessionId: "source-record" }, archivePath);
 
     await fs.rm(sessionFilePath(homeDir, source.acpxRecordId));
     await fs.rm(streamPath(homeDir, source.acpxRecordId));
@@ -199,7 +190,6 @@ test("exportSession and importSession round-trip session state with a fresh reco
     assert.notEqual(record.acpxRecordId, source.acpxRecordId);
     assert.equal(record.acpSessionId, source.acpSessionId);
     assert.equal(record.agentCommand, source.agentCommand);
-    assert.equal(record.name, source.name);
     assert.equal(record.cwd, source.cwd);
     assert.deepEqual(record.messages, source.messages);
     assert.deepEqual(await readHistory(homeDir, imported.record_id), history);
@@ -235,7 +225,6 @@ test("exportSession includes split message logs while state stays legacy-shaped,
         acpSessionId: "split-source",
         agentCommand: AGENT_REGISTRY.codex,
         cwd,
-        name: "split",
         messages: inlineMessages,
         messagesLog: {
           v: 1,
@@ -246,14 +235,7 @@ test("exportSession includes split message logs while state stays legacy-shaped,
       }),
     );
 
-    await exportSession(
-      {
-        agentCommand: AGENT_REGISTRY.codex,
-        cwd,
-        name: "split",
-      },
-      archivePath,
-    );
+    await exportSession({ sessionId: "split-source" }, archivePath);
 
     const archive = JSON.parse(await fs.readFile(archivePath, "utf8")) as {
       messages_log?: {
@@ -281,7 +263,7 @@ test("exportSession includes split message logs while state stays legacy-shaped,
     await fs.rm(sessionFilePath(homeDir, "split-source"));
     await fs.rm(sessionMessagesLogPath(homeDir, "split-source"));
 
-    const imported = await importSession(archivePath, { name: "split-imported" });
+    const imported = await importSession(archivePath);
     const importedRaw = JSON.parse(
       await fs.readFile(sessionFilePath(homeDir, imported.record_id), "utf8"),
     ) as Record<string, unknown>;
@@ -308,7 +290,6 @@ test("exportSession scrubs source absolute paths from portable archives", async 
       acpSessionId: "provider-session",
       agentCommand: AGENT_REGISTRY.codex,
       cwd,
-      name: "debug",
       eventLog: {
         active_path: streamPath(homeDir, "source-record"),
         segment_count: 1,
@@ -320,7 +301,7 @@ test("exportSession scrubs source absolute paths from portable archives", async 
     });
     await writeSessionRecordFile(homeDir, source);
 
-    await exportSession({ agentCommand: AGENT_REGISTRY.codex, cwd, name: "debug" }, archivePath);
+    await exportSession({ sessionId: "source-record" }, archivePath);
 
     const payload = await fs.readFile(archivePath, "utf8");
     assert.doesNotMatch(payload, new RegExp(escapeRegExp(homeDir)));
@@ -357,7 +338,6 @@ test("exportSession skips malformed event-log lines", async () => {
       acpSessionId: "provider-session",
       agentCommand: AGENT_REGISTRY.codex,
       cwd,
-      name: "debug",
     });
     await writeSessionRecordFile(homeDir, source);
 
@@ -374,7 +354,7 @@ test("exportSession skips malformed event-log lines", async () => {
       ].join("\n"),
     );
 
-    await exportSession({ agentCommand: AGENT_REGISTRY.codex, cwd, name: "debug" }, archivePath);
+    await exportSession({ sessionId: "source-record" }, archivePath);
 
     const archive = JSON.parse(await fs.readFile(archivePath, "utf8")) as {
       history?: unknown[];
@@ -383,7 +363,7 @@ test("exportSession skips malformed event-log lines", async () => {
   });
 });
 
-test("importSession rewrites cwd and name when requested", async () => {
+test("importSession rewrites cwd when requested", async () => {
   await withTempHome("acpx-export-import-", async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     const newCwd = path.join(homeDir, "other");
@@ -397,22 +377,19 @@ test("importSession rewrites cwd and name when requested", async () => {
         acpSessionId: "provider-session",
         agentCommand: AGENT_REGISTRY.codex,
         cwd,
-        name: "debug",
       }),
     );
 
-    await exportSession({ agentCommand: AGENT_REGISTRY.codex, cwd, name: "debug" }, archivePath);
+    await exportSession({ sessionId: "source-record" }, archivePath);
     await fs.rm(sessionFilePath(homeDir, "source-record"));
 
     const imported = await importSession(archivePath, {
-      name: "debug-on-laptop",
       newCwd,
     });
     const record = await resolveSessionRecord(imported.record_id);
 
     assert.equal(imported.cwd, newCwd);
     assert.equal(record.cwd, newCwd);
-    assert.equal(record.name, "debug-on-laptop");
   });
 });
 
@@ -424,14 +401,10 @@ test("exportSession stores the home directory as a portable relative cwd", async
       acpSessionId: "provider-session",
       agentCommand: AGENT_REGISTRY.codex,
       cwd: homeDir,
-      name: "home",
     });
     await writeSessionRecordFile(homeDir, source);
 
-    await exportSession(
-      { agentCommand: AGENT_REGISTRY.codex, cwd: homeDir, name: "home" },
-      archivePath,
-    );
+    await exportSession({ sessionId: "home-record" }, archivePath);
     await fs.rm(sessionFilePath(homeDir, source.acpxRecordId));
 
     const archive = JSON.parse(await fs.readFile(archivePath, "utf8")) as {
@@ -439,93 +412,10 @@ test("exportSession stores the home directory as a portable relative cwd", async
     };
     assert.equal(archive.session?.cwd_relative, ".");
 
-    const imported = await importSession(archivePath, { name: "home-copy" });
+    const imported = await importSession(archivePath);
     const record = await resolveSessionRecord(imported.record_id);
 
     assert.equal(record.cwd, homeDir);
-  });
-});
-
-test("exportSession prefers an active session over an older closed record for the same scope", async () => {
-  await withTempHome("acpx-export-import-", async (homeDir) => {
-    const cwd = path.join(homeDir, "workspace");
-    const archivePath = path.join(homeDir, "archive.json");
-    await fs.mkdir(cwd, { recursive: true });
-
-    await writeSessionRecordFile(
-      homeDir,
-      makeSessionRecord({
-        acpxRecordId: "aaa-closed-record",
-        acpSessionId: "closed-provider-session",
-        agentCommand: AGENT_REGISTRY.codex,
-        cwd,
-        name: "debug",
-        closed: true,
-        closedAt: "2026-01-01T00:05:00.000Z",
-        lastUsedAt: "2026-01-01T00:05:00.000Z",
-      }),
-    );
-    await writeSessionRecordFile(
-      homeDir,
-      makeSessionRecord({
-        acpxRecordId: "zzz-active-record",
-        acpSessionId: "active-provider-session",
-        agentCommand: AGENT_REGISTRY.codex,
-        cwd,
-        name: "debug",
-        closed: false,
-        lastUsedAt: "2026-01-01T00:10:00.000Z",
-      }),
-    );
-
-    await exportSession({ agentCommand: AGENT_REGISTRY.codex, cwd, name: "debug" }, archivePath);
-
-    const archive = JSON.parse(await fs.readFile(archivePath, "utf8")) as {
-      session?: { record_id?: unknown };
-    };
-    assert.equal(archive.session?.record_id, "zzz-active-record");
-  });
-});
-
-test("exportSession falls back to the newest closed session for a scope", async () => {
-  await withTempHome("acpx-export-import-", async (homeDir) => {
-    const cwd = path.join(homeDir, "workspace");
-    const archivePath = path.join(homeDir, "archive.json");
-    await fs.mkdir(cwd, { recursive: true });
-
-    await writeSessionRecordFile(
-      homeDir,
-      makeSessionRecord({
-        acpxRecordId: "aaa-closed-record",
-        acpSessionId: "old-provider-session",
-        agentCommand: AGENT_REGISTRY.codex,
-        cwd,
-        name: "debug",
-        closed: true,
-        closedAt: "2026-01-01T00:05:00.000Z",
-        lastUsedAt: "2026-01-01T00:05:00.000Z",
-      }),
-    );
-    await writeSessionRecordFile(
-      homeDir,
-      makeSessionRecord({
-        acpxRecordId: "zzz-closed-record",
-        acpSessionId: "new-provider-session",
-        agentCommand: AGENT_REGISTRY.codex,
-        cwd,
-        name: "debug",
-        closed: true,
-        closedAt: "2026-01-01T00:10:00.000Z",
-        lastUsedAt: "2026-01-01T00:10:00.000Z",
-      }),
-    );
-
-    await exportSession({ agentCommand: AGENT_REGISTRY.codex, cwd, name: "debug" }, archivePath);
-
-    const archive = JSON.parse(await fs.readFile(archivePath, "utf8")) as {
-      session?: { record_id?: unknown };
-    };
-    assert.equal(archive.session?.record_id, "zzz-closed-record");
   });
 });
 
@@ -540,7 +430,6 @@ test("importSession reopens closed exported sessions without stale process metad
       acpSessionId: "provider-session",
       agentCommand: AGENT_REGISTRY.codex,
       cwd,
-      name: "debug",
       closed: true,
       closedAt: "2026-01-02T00:00:00.000Z",
       pid: 12345,
@@ -551,7 +440,7 @@ test("importSession reopens closed exported sessions without stale process metad
     });
     await writeSessionRecordFile(homeDir, source);
 
-    await exportSession({ agentCommand: AGENT_REGISTRY.codex, cwd, name: "debug" }, archivePath);
+    await exportSession({ sessionId: "source-record" }, archivePath);
     await fs.rm(sessionFilePath(homeDir, source.acpxRecordId));
 
     const imported = await importSession(archivePath);
@@ -598,7 +487,7 @@ test("exportSession ignores stale live process metadata on closed sessions", asy
         "utf8",
       );
 
-      await exportSession({ agentCommand: AGENT_REGISTRY.codex, cwd, name: recordId }, archivePath);
+      await exportSession({ sessionId: recordId }, archivePath);
 
       const archive = JSON.parse(await fs.readFile(archivePath, "utf8")) as {
         session?: { record_id?: string };
@@ -646,10 +535,7 @@ test("exportSession refuses a session locked by a live pid", async () => {
       );
 
       await assert.rejects(
-        exportSession(
-          { agentCommand: AGENT_REGISTRY.codex, cwd, name: recordId },
-          path.join(homeDir, "archive.json"),
-        ),
+        exportSession({ sessionId: recordId }, path.join(homeDir, "archive.json")),
         (error: unknown) => {
           assert.equal((error as { code?: unknown }).code, "session-locked");
           assert.equal((error as { exitCode?: unknown }).exitCode, 2);
@@ -689,10 +575,7 @@ test("exportSession refuses a session owned by a live queue owner without an eve
       );
 
       await assert.rejects(
-        exportSession(
-          { agentCommand: AGENT_REGISTRY.codex, cwd, name: recordId },
-          path.join(homeDir, "archive.json"),
-        ),
+        exportSession({ sessionId: recordId }, path.join(homeDir, "archive.json")),
         (error: unknown) => {
           assert.equal((error as { code?: unknown }).code, "session-locked");
           assert.equal((error as { exitCode?: unknown }).exitCode, 2);
@@ -731,10 +614,9 @@ test("importSession rejects archives that do not match the expected agent", asyn
       acpSessionId: "provider-session",
       agentCommand: AGENT_REGISTRY.codex,
       cwd,
-      name: "debug",
     });
     await writeSessionRecordFile(homeDir, source);
-    await exportSession({ agentCommand: AGENT_REGISTRY.codex, cwd, name: "debug" }, archivePath);
+    await exportSession({ sessionId: "source-record" }, archivePath);
 
     const archive = JSON.parse(await fs.readFile(archivePath, "utf8")) as {
       session: { agent: string; state: { agent_command: string } };
@@ -775,13 +657,9 @@ test("importSession accepts built-in agent archives across adapter command drift
       acpSessionId: "provider-session",
       agentCommand: AGENT_REGISTRY.codex,
       cwd,
-      name: "debug",
     });
     await writeSessionRecordFile(homeDir, source);
-    await exportSession(
-      { agentName: "codex", agentCommand: AGENT_REGISTRY.codex, cwd, name: "debug" },
-      archivePath,
-    );
+    await exportSession({ agentName: "codex", sessionId: "source-record" }, archivePath);
     await fs.rm(sessionFilePath(homeDir, source.acpxRecordId));
 
     const archive = JSON.parse(await fs.readFile(archivePath, "utf8")) as {
@@ -817,13 +695,9 @@ test("importSession ignores stale agent_name when commands match exactly", async
       acpSessionId: "provider-session",
       agentCommand: AGENT_REGISTRY.openclaw,
       cwd,
-      name: "debug",
     });
     await writeSessionRecordFile(homeDir, source);
-    await exportSession(
-      { agentName: "codex", agentCommand: AGENT_REGISTRY.openclaw, cwd, name: "debug" },
-      archivePath,
-    );
+    await exportSession({ agentName: "codex", sessionId: "source-record" }, archivePath);
     await fs.rm(sessionFilePath(homeDir, source.acpxRecordId));
 
     const imported = await importSession(archivePath, {
@@ -833,30 +707,6 @@ test("importSession ignores stale agent_name when commands match exactly", async
     const record = await resolveSessionRecord(imported.record_id);
 
     assert.equal(record.agentCommand, AGENT_REGISTRY.openclaw);
-  });
-});
-
-test("importSession rejects destination scope collisions", async () => {
-  await withTempHome("acpx-export-import-", async (homeDir) => {
-    const cwd = path.join(homeDir, "workspace");
-    const archivePath = path.join(homeDir, "archive.json");
-    await fs.mkdir(cwd, { recursive: true });
-
-    const source = makeSessionRecord({
-      acpxRecordId: "source-record",
-      acpSessionId: "provider-session",
-      agentCommand: AGENT_REGISTRY.codex,
-      cwd,
-      name: "debug",
-    });
-    await writeSessionRecordFile(homeDir, source);
-    await exportSession({ agentCommand: AGENT_REGISTRY.codex, cwd, name: "debug" }, archivePath);
-
-    await assert.rejects(importSession(archivePath), (error: unknown) => {
-      assert.equal((error as { code?: unknown }).code, "session-scope-exists");
-      assert.equal((error as { exitCode?: unknown }).exitCode, 2);
-      return true;
-    });
   });
 });
 
@@ -871,12 +721,11 @@ test("importSession rejects archives whose provider session id already exists lo
       acpSessionId: "provider-session",
       agentCommand: AGENT_REGISTRY.codex,
       cwd,
-      name: "debug",
     });
     await writeSessionRecordFile(homeDir, source);
-    await exportSession({ agentCommand: AGENT_REGISTRY.codex, cwd, name: "debug" }, archivePath);
+    await exportSession({ sessionId: "source-record" }, archivePath);
 
-    await assert.rejects(importSession(archivePath, { name: "debug-copy" }), (error: unknown) => {
+    await assert.rejects(importSession(archivePath), (error: unknown) => {
       assert.equal((error as { code?: unknown }).code, "session-provider-exists");
       assert.equal((error as { exitCode?: unknown }).exitCode, 2);
       return true;
@@ -898,7 +747,6 @@ test("importSession rejects provider session collisions across built-in command 
         acpSessionId: "provider-session",
         agentCommand: oldCommand,
         cwd,
-        name: "old-debug",
       }),
     );
 
@@ -908,7 +756,7 @@ test("importSession rejects provider session collisions across built-in command 
       exported_by: "source-user",
       session: {
         record_id: "source-record",
-        name: "debug",
+        name: null,
         agent: oldCommand,
         agent_name: "codex",
         cwd_relative: ".",
@@ -921,7 +769,6 @@ test("importSession rejects provider session collisions across built-in command 
             acpSessionId: "provider-session",
             agentCommand: oldCommand,
             cwd,
-            name: "debug",
           }),
         ),
       },
@@ -931,7 +778,6 @@ test("importSession rejects provider session collisions across built-in command 
 
     await assert.rejects(
       importSession(archivePath, {
-        name: "debug-copy",
         expectedAgentName: "codex",
         expectedAgentCommand: AGENT_REGISTRY.codex,
       }),
@@ -980,13 +826,9 @@ test("importSession accepts a pi archive whose command is the DEPLOYED /opt fork
       acpSessionId: "provider-session",
       agentCommand: expectedAgentCommand,
       cwd,
-      name: "debug",
     });
     await writeSessionRecordFile(homeDir, source);
-    await exportSession(
-      { agentName: "pi", agentCommand: expectedAgentCommand, cwd, name: "debug" },
-      archivePath,
-    );
+    await exportSession({ agentName: "pi", sessionId: "source-record" }, archivePath);
     await fs.rm(sessionFilePath(homeDir, source.acpxRecordId));
 
     const archive = JSON.parse(await fs.readFile(archivePath, "utf8")) as {
@@ -1037,13 +879,9 @@ for (const [agentName, expectedAgentCommand, deployedForkCommand] of [
         acpSessionId: "provider-session",
         agentCommand: expectedAgentCommand,
         cwd,
-        name: "debug",
       });
       await writeSessionRecordFile(homeDir, source);
-      await exportSession(
-        { agentName, agentCommand: expectedAgentCommand, cwd, name: "debug" },
-        archivePath,
-      );
+      await exportSession({ agentName, sessionId: "source-record" }, archivePath);
       await fs.rm(sessionFilePath(homeDir, source.acpxRecordId));
 
       const archive = JSON.parse(await fs.readFile(archivePath, "utf8")) as {
@@ -1083,13 +921,9 @@ for (const adversarialCommand of ["npx rapi-acp", "npx rapi-acp@1.0.0"]) {
         acpSessionId: "provider-session",
         agentCommand: expectedAgentCommand,
         cwd,
-        name: "debug",
       });
       await writeSessionRecordFile(homeDir, source);
-      await exportSession(
-        { agentName: "pi", agentCommand: expectedAgentCommand, cwd, name: "debug" },
-        archivePath,
-      );
+      await exportSession({ agentName: "pi", sessionId: "source-record" }, archivePath);
       await fs.rm(sessionFilePath(homeDir, source.acpxRecordId));
 
       const archive = JSON.parse(await fs.readFile(archivePath, "utf8")) as {

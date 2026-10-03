@@ -4,7 +4,6 @@ import type { SessionRecord } from "../types.js";
 import { resolveSessionSelectorFromFlags, type SessionSelectorFlags } from "./flags.js";
 
 export type SessionTargetSelector = {
-  name?: string;
   sessionId?: string;
   sessionUrl?: string;
 };
@@ -22,39 +21,39 @@ export function parseSessionIdFromUrl(url: string | undefined): string | undefin
   }
 }
 
+const SESSION_ID_LOOKS_LIKE_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// D-IDENTITY (brick 61dc1302) — a session is addressed by its id and by nothing else, so a
+// NAME handed to a verb that targets a session — through `-s/--session` or as a positional —
+// is refused rather than looked up. The message names the working form; a uuid passed
+// positionally gets the same hint, because that is the most likely mistake.
+function refuseSessionName(via: string, value: string): never {
+  const hint = SESSION_ID_LOOKS_LIKE_UUID_RE.test(value)
+    ? ` "${value}" looks like a session id — pass it as --session-id ${value}.`
+    : " A name identifies nothing; pass --session-id <id> (or --session-url <url>).";
+  throw new InvalidArgumentError(`${via} no longer selects a session.${hint}`);
+}
+
 export function resolveSessionTargetSelector(params: {
   flags: SessionSelectorFlags;
   command: Command;
   positionalName?: string;
 }): SessionTargetSelector {
   const flags = resolveSessionSelectorFromFlags(params.flags, params.command);
-  const name = resolveSelectorName(flags.session, params.positionalName);
-  assertCompatibleSelectors(name, flags);
+  const positional = normalizeName(params.positionalName);
+  if (positional !== undefined) {
+    refuseSessionName("A positional session name", positional);
+  }
+  if (flags.session !== undefined) {
+    refuseSessionName("-s/--session", flags.session);
+  }
+  assertSingleExplicitSelector(flags);
 
   return {
-    name,
     sessionId: flags.sessionId,
     sessionUrl: flags.sessionUrl,
   };
-}
-
-function resolveSelectorName(flagName: string | undefined, positionalName: string | undefined) {
-  const normalizedPosition = normalizeName(positionalName);
-  if (normalizedPosition !== undefined && flagName !== undefined) {
-    throw new InvalidArgumentError(
-      "Pass the session name either positionally or with -s/--session, not both",
-    );
-  }
-  return normalizedPosition ?? flagName;
-}
-
-function assertCompatibleSelectors(name: string | undefined, flags: SessionSelectorFlags): void {
-  assertSingleExplicitSelector(flags);
-  if (name !== undefined && (flags.sessionId !== undefined || flags.sessionUrl !== undefined)) {
-    throw new InvalidArgumentError(
-      "Pass either a session name or --session-id/--session-url, not both",
-    );
-  }
 }
 
 function assertSingleExplicitSelector(flags: SessionSelectorFlags): void {
@@ -81,4 +80,33 @@ export async function resolveExplicitSessionRecord(
 ): Promise<SessionRecord | undefined> {
   const sessionId = explicitSessionIdFromSelector(selector);
   return sessionId === undefined ? undefined : await resolveSessionRecord(sessionId);
+}
+
+export class NoSessionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NoSessionError";
+  }
+}
+
+// The refusal for a call that names no session — with the create form named, because
+// `acpx <agent> "<prompt>"` is what a caller who forgot the id wrote, and the create is the
+// one thing they may actually want (AC-ID2).
+export function noSessionIdMessage(agentName: string): string {
+  return (
+    `⚠ No acpx session found: no session id was given. Every acpx call names its session by id — ` +
+    `pass --session-id <id> ` +
+    `(or --session-url <url>).\nNo session yet? Create one: acpx ${agentName} sessions new`
+  );
+}
+
+export async function requireExplicitSessionRecord(
+  selector: SessionTargetSelector,
+  agentName: string,
+): Promise<SessionRecord> {
+  const record = await resolveExplicitSessionRecord(selector);
+  if (!record) {
+    throw new NoSessionError(noSessionIdMessage(agentName));
+  }
+  return record;
 }

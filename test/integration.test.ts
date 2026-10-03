@@ -22,6 +22,7 @@ import {
   recordSessionUpdate,
 } from "../src/session/conversation-model.js";
 import type { SessionRecord } from "../src/types.js";
+import { addressByRememberedId, rememberCreatedSession } from "./id-addressing-harness.js";
 import {
   extractAgentMessageChunkText,
   extractJsonRpcId,
@@ -3731,7 +3732,14 @@ test("integration: cancel yields cancelled stopReason without queue error", asyn
 
       const promptChild = spawn(
         process.execPath,
-        [CLI_PATH, ...baseAgentArgs(cwd), "--format", "json", "prompt", "sleep 5000"],
+        [
+          CLI_PATH,
+          ...addressByRememberedId(
+            [...baseAgentArgs(cwd), "--format", "json", "prompt", "sleep 5000"],
+            homeDir,
+            cwd,
+          ),
+        ],
         {
           env: {
             ...process.env,
@@ -4472,7 +4480,14 @@ test("integration: sessions history shows in-flight prompt after prompt starts",
 
       const promptChild = spawn(
         process.execPath,
-        [CLI_PATH, ...baseAgentArgs(cwd), "--format", "quiet", "prompt", "sleep 1500"],
+        [
+          CLI_PATH,
+          ...addressByRememberedId(
+            [...baseAgentArgs(cwd), "--format", "quiet", "prompt", "sleep 1500"],
+            homeDir,
+            cwd,
+          ),
+        ],
         {
           env: {
             ...process.env,
@@ -4594,11 +4609,17 @@ test("integration: sessions close stays closed after live checkpoints", async ()
         process.execPath,
         [
           CLI_PATH,
-          ...baseAgentArgs(cwd),
-          "--format",
-          "quiet",
-          "prompt",
-          "stream-sleep 5000 close-live-update",
+          ...addressByRememberedId(
+            [
+              ...baseAgentArgs(cwd),
+              "--format",
+              "quiet",
+              "prompt",
+              "stream-sleep 5000 close-live-update",
+            ],
+            homeDir,
+            cwd,
+          ),
         ],
         {
           env: {
@@ -5075,7 +5096,10 @@ async function runCli(
   homeDir: string,
   options: CliRunOptions = {},
 ): Promise<CliRunResult> {
-  return await runCliWithEntry(CLI_PATH, args, homeDir, options);
+  const addressed = addressByRememberedId(args, homeDir, options.cwd);
+  const result = await runCliWithEntry(CLI_PATH, addressed, homeDir, options);
+  rememberCreatedSession(args, homeDir, options.cwd, result);
+  return result;
 }
 
 async function runCliWithEntry(
