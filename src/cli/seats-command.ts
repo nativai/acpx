@@ -339,11 +339,12 @@ function requireSeatRow(store: SeatStore, seatId: string): SeatRecord {
  * prescribes the wrong repair. It also says that only THESE rows are corrupt, so
  * nobody goes off to audit a file whose other rows are fine.
  *
- * ⚠️ DELIBERATELY SHARES NO MARKER WITH `seatRowMissingMessage`. That message's
- * remedy is `RUN THE SEAT BACKFILL`; this one's is `QUARANTINE a copy`, and the
- * backfill is explicitly NOT the fix here — it refuses to run against a corrupt store
- * and cannot repair a row. Two refusals about "the row is not usable" that shared a
- * substring would be green whichever fired, which is B2's AP13 defect.
+ * ⚠️ THIS MESSAGE AND `seatRowMissingMessage` SHARE THE COMMAND `acpx seats backfill --apply`
+ * — both end there, so a row asserting on that substring alone is GREEN WHICHEVER
+ * FIRED (B2's AP13 defect). They are told apart by their CONDITION markers: this one
+ * says `is PRESENT in … MALFORMED` and `QUARANTINE a copy` (the backfill is the LAST
+ * step here, after the row is hand-repaired or removed — it cannot repair a row), the
+ * missing-row message says `has no row in`. Discriminate on those.
  */
 function seatRowsMalformedMessage(seatIds: readonly string[], storePath: string): string {
   const subject = seatIds.map((seatId) => JSON.stringify(seatId)).join(", ");
@@ -2004,7 +2005,9 @@ READ-ONLY. Never writes \`seats.json\`; a malformed row or a malformed/unreadabl
 
   seatsCommand
     .command("list")
-    .description("List every seat row: id, name, brick, active holder, holder count, closed marker")
+    .description(
+      "List every seat row: id, name, brick, active holder, holder count, favorite, closed marker",
+    )
     .option("--closed", "Only closed seats")
     .option("--open", "Only open (not-closed) seats")
     .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
