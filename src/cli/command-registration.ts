@@ -371,6 +371,18 @@ export function registerSessionsCommand(
         "fork mints a new seat.",
       (value: string) => parseSeatRefOrThrow("Seat id", value),
     )
+    // Brick 06b01b6b — the handover's create step. `new` only, like `--seat`.
+    .option(
+      "--from <id|url>",
+      "Create this session as the successor of an existing one (acpx record id or session URL): " +
+        "its model, effort, subscription/profile, auto-failover policy, allowed tools, system " +
+        "prompt, output style, cwd, parent and brick link become this session's defaults — any " +
+        "explicit flag overrides — and, when it holds a seat, this session is created INTO that " +
+        "seat, prepared and not active (what `--seat <that seat>` does). The name, history, " +
+        "favorite and closed state do not transfer. If this session's agent differs, the " +
+        "agent-specific options are skipped, with a note on stderr. Refuses an unknown id.",
+      (value: string) => parseNonEmptyValue("From session", value),
+    )
     .option(
       "--metadata <key=value>",
       "Set a metadata entry on the session (repeatable; e.g. --metadata brick=<uuid>)",

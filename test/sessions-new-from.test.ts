@@ -19,7 +19,7 @@ import {
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 const MOCK_AGENT_COMMAND = `node ${JSON.stringify(MOCK_AGENT_PATH)}`;
-const CLAUDE_COMMAND = `${MOCK_AGENT_COMMAND} --claude-agent-acp --advertise-models --advertise-config-options`;
+const CLAUDE_COMMAND = `${MOCK_AGENT_COMMAND} --claude-agent-acp --advertise-models --advertise-config-options --advertise-output-style`;
 const OTHER_AGENT_COMMAND = `node ${JSON.stringify(path.join(path.dirname(MOCK_AGENT_PATH), "other-agent.js"))}`;
 const BRICK_SHIM_DIR = path.join(process.cwd(), "test", "fixtures", "brick-shim");
 const BRICK_A = "1a5845c3-a832-4370-b564-8ec5286bff79";
@@ -204,6 +204,8 @@ test("--from copies model, effort, profile, auto-failover, allowed tools, system
     assert.equal(stored.cwd, oldCwd);
     assert.equal(stored.parent_session_id, "the-parent");
     assert.equal(stored.metadata?.brick, BRICK_A);
+    // Same agent ⇒ nothing was skipped, so nothing is announced.
+    assert.doesNotMatch(result.stderr, /skipped/);
   });
 });
 
