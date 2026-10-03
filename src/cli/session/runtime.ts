@@ -150,6 +150,8 @@ import {
 } from "../../types.js";
 import {
   ABSORBED_TURN_NEVER_ENDED_MESSAGE,
+  SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE,
+  SESSION_CLOSED_TURN_CANCELLED_MESSAGE,
   SESSION_CLOSED_UNDELIVERED_DETAIL_CODE,
   SESSION_CLOSED_UNDELIVERED_MESSAGE,
 } from "../queue/delivery-terminals.js";
@@ -161,6 +163,7 @@ import {
   waitMs,
 } from "../queue/ipc.js";
 import { type QueueOwnerActiveSessionController } from "../queue/owner-turn-controller.js";
+import { isSessionCloseDrainActive } from "../queue/session-close-intent.js";
 import { resolveAndEnsureAgentFolder } from "./agent-folder.js";
 import { resolveSessionBrickContext } from "./brick-link.js";
 import type { RunOnceOptions, SessionSendOptions } from "./contracts.js";
@@ -1904,6 +1907,21 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       steered?: boolean;
     } = {},
   ): Promise<void> => {
+    // 71fdcaf2 (S5.4) — THE ONE CHOKE POINT for every terminal this runtime writes (main turn, injected turn,
+    // absorbed sweep). A turn CANCELLED while this owner is draining for a session close is the close's doing,
+    // not a Stop: the message reached the agent and never settled, so it is `failed` with the outcome-unknown
+    // code acpx-ui notifies the sender on — never a code-less `cancelled`. A cancel with NO close stays one.
+    if (phase === "cancelled" && isSessionCloseDrainActive(record.acpxRecordId)) {
+      await appendDeliveryEvent(context, "failed", {
+        error: {
+          code: 0,
+          message: SESSION_CLOSED_TURN_CANCELLED_MESSAGE,
+          detailCode: SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE,
+        },
+        terminal: true,
+      });
+      return;
+    }
     await appendDeliveryEvent(context, phase, {
       ...params,
       terminal: true,

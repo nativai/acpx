@@ -13,6 +13,8 @@ import {
   QUEUE_OWNER_CLOSING_MESSAGE,
   QUEUE_OWNER_SHUTDOWN_DETAIL_CODE,
   QUEUE_OWNER_SHUTDOWN_MESSAGE,
+  SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE,
+  SESSION_CLOSED_TURN_CANCELLED_MESSAGE,
   SESSION_CLOSED_UNDELIVERED_DETAIL_CODE,
   SESSION_CLOSED_UNDELIVERED_MESSAGE,
 } from "../src/cli/queue/delivery-terminals.js";
@@ -22,6 +24,10 @@ import {
   SessionQueueOwner,
   tryAcquireQueueOwnerLease,
 } from "../src/cli/queue/ipc.js";
+import {
+  isSessionCloseDrainActive,
+  resetSessionCloseIntentForTests,
+} from "../src/cli/queue/session-close-intent.js";
 import {
   registerAbsorbedDeliveries,
   terminalizeAbsorbedDeliveriesOnOwnerExit,
@@ -310,7 +316,7 @@ test("L1.4/L3.1 the emitted contract strings match the checked-in cross-repo fix
   // rather than silently diverging for six weeks.
   assert.equal(
     createHash("sha256").update(bytes).digest("hex"),
-    "9594e346089f7f09554fdd7b64b74579ebb1ff6f089b8eeeb1e4df75f7fb7052",
+    "0bd104b32912f0fcbcdd9fc4f73e8393c73cd2e4da72ec59be73a234d9e28e00",
     "delivery-contract.fixture.json changed — re-broker the sha to the acpx-ui lanes before merging",
   );
 
@@ -333,6 +339,10 @@ test("L1.4/L3.1 the emitted contract strings match the checked-in cross-repo fix
   assert.equal(
     emitted.get(ABSORBED_TURN_NEVER_ENDED_DETAIL_CODE)?.message,
     ABSORBED_TURN_NEVER_ENDED_MESSAGE,
+  );
+  assert.equal(
+    emitted.get(SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE)?.message,
+    SESSION_CLOSED_TURN_CANCELLED_MESSAGE,
   );
 
   // And the classification rule holds against those literal texts. acpx-ui's
@@ -406,6 +416,26 @@ test("L1.7 the owner-exit vocabulary splits by cause: close vs self-exit vs abso
     assert.equal(absorbedEvents.length, 1);
     assert.equal(absorbedEvents[0].error?.detailCode, ABSORBED_TURN_NEVER_ENDED_DETAIL_CODE);
     assert.equal(absorbedEvents[0].error?.message, ABSORBED_TURN_NEVER_ENDED_MESSAGE);
+  });
+});
+
+// 71fdcaf2 — the drain FOR A CLOSE is what tells the runtime a cancelled turn is the close's doing.
+test("71fdcaf2 · only a drain for session-close flags the session as closing", async () => {
+  await withTempHome(async () => {
+    resetSessionCloseIntentForTests();
+    const sessionId = "close-intent-session";
+    await withOwner(sessionId, stubControlHandlers(), async (owner) => {
+      assert.equal(isSessionCloseDrainActive(sessionId), false, "flagged before any drain");
+      await owner.drainDeliveries("session-close", 0);
+      assert.equal(isSessionCloseDrainActive(sessionId), true, "the drain did not flag the close");
+    });
+    // a plain owner exit (idle release / TTL) is NOT a close
+    const exiting = "close-intent-owner-exit";
+    await withOwner(exiting, stubControlHandlers(), async (owner) => {
+      await owner.close();
+      assert.equal(isSessionCloseDrainActive(exiting), false, "an owner exit was read as a close");
+    });
+    resetSessionCloseIntentForTests();
   });
 });
 
