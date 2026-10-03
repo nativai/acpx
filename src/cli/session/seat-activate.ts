@@ -60,7 +60,7 @@ import {
   readSeatStore,
   resolveSessionRecord,
   seatFromStore,
-  seatRowMissingMessage,
+  SeatRowMissingError,
   sessionBaseDir,
   sessionRecordFileName,
   withSeatStoreWrite,
@@ -68,6 +68,7 @@ import {
   type SeatRecord,
 } from "../../session/persistence.js";
 import { toSessionIndexEntry } from "../../session/persistence/index.js";
+import { explainSeatRowMissing } from "../../session/seat-backfill.js";
 import type { SessionRecord } from "../../types.js";
 
 /** Stable sentinel, first line of every activation notice, on its own line.
@@ -151,9 +152,9 @@ async function resolveSeatOrRefuse(seatRef: string): Promise<SeatRecord> {
   const store = await readSeatStore(sessionBaseDir());
   const seat = seatFromStore(store, seatId);
   if (!seat) {
-    // AP17 — the refusal names the cause and the remedy. Shared with D11's refusal so
-    // the two cannot drift into describing the same condition differently.
-    throw new SeatActivationRefusalError("SEAT_ROW_MISSING", seatRowMissingMessage(seatId));
+    // AP17 — the refusal names the cause and the remedy. Thrown bare and worded by
+    // `activateSeatHolder`, like phases 2 and 3's: the origin needs a record scan.
+    throw new SeatRowMissingError(seatId, store.storePath);
   }
   if (seat.closedAt !== null && seat.closedAt !== undefined) {
     throw new SeatActivationRefusalError(
@@ -278,7 +279,7 @@ async function drawOrdinalAndPointAtSuccessor(
     // compare-and-swap against a pre-hold snapshot is not a compare-and-swap.
     const row = seatFromStore(store, seatId);
     if (!row) {
-      throw new SeatActivationRefusalError("SEAT_ROW_MISSING", seatRowMissingMessage(seatId));
+      throw new SeatRowMissingError(seatId, store.storePath);
     }
     // 🛑 THE COMPARE-AND-SWAP. Exactly one of two concurrent activations may win; the
     // loser aborts LOUDLY rather than overwriting a pointer that moved under it.
@@ -384,10 +385,7 @@ async function healInterruptedActivation(
     ordinal = await withSeatStoreWrite(sessionBaseDir(), (store) => {
       const row = seatFromStore(store, seat.seatId);
       if (!row) {
-        throw new SeatActivationRefusalError(
-          "SEAT_ROW_MISSING",
-          seatRowMissingMessage(seat.seatId),
-        );
+        throw new SeatRowMissingError(seat.seatId, store.storePath);
       }
       const drawn = row.nextOrdinal;
       const seats = new Map(store.seats);
@@ -488,6 +486,23 @@ export function composeSeatActivationNotice(params: {
  * Run a succession. See this file's header for the phase order and why it is the order.
  */
 export async function activateSeatHolder(
+  seatRef: string,
+  successorRef: string,
+): Promise<SeatActivationOutcome> {
+  try {
+    return await activateSeatHolderUnworded(seatRef, successorRef);
+  } catch (error) {
+    // The three missing-row sites throw bare (two are inside `withSeatStoreWrite`'s hold,
+    // which may not read session records); the origin-aware wording is added HERE, outside
+    // every hold. Brick `bf454a2c`.
+    if (error instanceof SeatRowMissingError) {
+      throw new SeatActivationRefusalError("SEAT_ROW_MISSING", await explainSeatRowMissing(error));
+    }
+    throw error;
+  }
+}
+
+async function activateSeatHolderUnworded(
   seatRef: string,
   successorRef: string,
 ): Promise<SeatActivationOutcome> {

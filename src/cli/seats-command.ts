@@ -2,7 +2,6 @@ import type { Command } from "commander";
 import { SessionNotFoundError } from "../errors.js";
 import { describeAbandonedRecordSweep } from "../session/abandoned-record-sweep.js";
 import {
-  SEAT_STORE_FILE,
   SEAT_STORE_NO_CHANGE,
   SeatStoreUnwritableError,
   MalformedSeatRowError,
@@ -13,7 +12,7 @@ import {
   resolveSessionRecord,
   seatBrickLinkFromRef,
   seatFromStore,
-  seatRowMissingMessage,
+  SeatRowMissingError,
   seatStorePath,
   seatStoreUnhealthyMessage,
   sessionBaseDir,
@@ -25,6 +24,7 @@ import {
 import type { SessionIndexEntry } from "../session/persistence/index.js";
 import {
   countStaleSeatIndexEntries,
+  explainSeatRowMissing,
   runSeatBackfill,
   type SeatBackfillReport,
 } from "../session/seat-backfill.js";
@@ -299,7 +299,7 @@ function refuseUnhealthyStoreForRead(store: SeatStore): void {
   if (store.fileState === "malformed" || store.fileState === "unreadable") {
     throw new SeatMutationRefusalError(
       "SEAT_STORE_UNHEALTHY",
-      seatStoreUnhealthyMessage(store.fileState),
+      seatStoreUnhealthyMessage(store.fileState, store.storePath),
     );
   }
 }
@@ -315,7 +315,9 @@ function refuseUnhealthyStoreForRead(store: SeatStore): void {
 function requireSeatRow(store: SeatStore, seatId: string): SeatRecord {
   const row = seatFromStore(store, seatId);
   if (!row) {
-    throw new SeatMutationRefusalError("SEAT_ROW_MISSING", seatRowMissingMessage(seatId));
+    // Thrown bare: the origin (typo vs backfillable) needs a record scan, which cannot run
+    // inside the hold this is often called from. `asSeatRefusal` words it.
+    throw new SeatRowMissingError(seatId, store.storePath);
   }
   return row;
 }
@@ -335,29 +337,32 @@ function requireSeatRow(store: SeatStore, seatId: string): SeatRecord {
  * and cannot repair a row. Two refusals about "the row is not usable" that shared a
  * substring would be green whichever fired, which is B2's AP13 defect.
  */
-function seatRowsMalformedMessage(seatIds: readonly string[]): string {
+function seatRowsMalformedMessage(seatIds: readonly string[], storePath: string): string {
   const subject = seatIds.map((seatId) => JSON.stringify(seatId)).join(", ");
   return (
-    `seat ${subject} is PRESENT in ${SEAT_STORE_FILE} and its row is MALFORMED, so this ` +
-    `delete REFUSES it instead of removing it: the store's one writer re-emits unreadable ` +
-    `rows verbatim as a data-loss defence, and such a row may still be hand-recoverable. ` +
-    `Only the named row is corrupt — every other row in the file read fine, so there is no ` +
-    `need to audit the whole store. Repair: QUARANTINE a copy of ${SEAT_STORE_FILE} ` +
-    `(${SEAT_STORE_FILE}.corrupt-<timestamp>, and KEEP it), hand-repair or hand-remove the ` +
-    `named row, then run the seat backfill for anything left without a row. Do not delete ` +
-    `the store to clear this.`
+    `seat ${subject} is PRESENT in ${storePath} and its row is MALFORMED, so a seat command ` +
+    `REFUSES it rather than acting on it or dropping it: the store's one writer re-emits ` +
+    `unreadable rows verbatim as a data-loss defence, and such a row may still be ` +
+    `hand-recoverable. Only the named row is corrupt — every other row in the file read ` +
+    `fine, so there is no need to audit the whole store. Repair: QUARANTINE a copy of ` +
+    `${storePath} (${storePath}.corrupt-<timestamp>, and KEEP it), hand-repair or ` +
+    `hand-remove the named row, then run \`acpx seats backfill --apply\` for anything left ` +
+    `without a row. Do not delete the store to clear this.`
   );
 }
 
 /** The errors a seat mutation may legitimately refuse with, normalised to one shape. */
-function asSeatRefusal(error: unknown): SeatMutationRefusalError | undefined {
+async function asSeatRefusal(error: unknown): Promise<SeatMutationRefusalError | undefined> {
   if (error instanceof SeatMutationRefusalError) {
     return error;
+  }
+  if (error instanceof SeatRowMissingError) {
+    return new SeatMutationRefusalError("SEAT_ROW_MISSING", await explainSeatRowMissing(error));
   }
   if (error instanceof MalformedSeatRowError) {
     return new SeatMutationRefusalError(
       "SEAT_ROW_MALFORMED",
-      seatRowsMalformedMessage([error.seatId]),
+      seatRowsMalformedMessage([error.seatId], error.storePath),
     );
   }
   if (error instanceof SeatStoreUnwritableError) {
@@ -380,7 +385,7 @@ async function runSeatMutation(
   try {
     await run();
   } catch (error) {
-    const refusal = asSeatRefusal(error);
+    const refusal = await asSeatRefusal(error);
     if (!refusal) {
       throw error;
     }
@@ -741,13 +746,17 @@ async function handleSeatsDelete(
       }
       return { mutation: { kind: "write", seats } as const, result };
     });
-    renderSeatDelete(format, outcome);
+    renderSeatDelete(format, outcome, seatStorePath(sessionDir));
   });
 }
 
-function renderSeatDelete(format: OutputFormat, outcome: SeatDeleteOutcome): void {
+function renderSeatDelete(
+  format: OutputFormat,
+  outcome: SeatDeleteOutcome,
+  storePath: string,
+): void {
   const refused = outcome.malformed.length > 0;
-  const message = refused ? seatRowsMalformedMessage(outcome.malformed) : undefined;
+  const message = refused ? seatRowsMalformedMessage(outcome.malformed, storePath) : undefined;
   renderSeatDeleteReport(format, outcome, message);
   if (refused) {
     // The rc is the only signal a caller that reads nothing else will see, and a
@@ -1415,6 +1424,10 @@ function seatShowJsonPayload(
     // ref or `null`) for every pre-existing consumer; the validation state
     // rides a NEW sibling key so nothing that already reads `brickId` breaks.
     brickIdValidated: row.brickId ? row.brickId.validated : null,
+    // Brick `a6884bb9` — a SEAT field, read KEYED from the row; never derived from the
+    // holder (B2d: a live-minted row keeps a stale `active_holder_id`). Always a boolean:
+    // a row that predates the field reads `false`, as the `favorite` verb itself reads it.
+    favorite: row.favorite === true,
     // The RAW pointer, exactly as stored — for an operator diagnosing the store
     // itself. Never used above to decide what "active" means; see `activeHolder`.
     activeHolderIdRaw: row.activeHolderId,
@@ -1445,6 +1458,7 @@ function renderSeatShowText(
   process.stdout.write(`  closed_at:     ${row.closedAt ?? "(open)"}\n`);
   process.stdout.write(`  next_ordinal:  ${row.nextOrdinal}\n`);
   process.stdout.write(`  brick_id:      ${renderSeatBrickLinkText(row.brickId)}\n`);
+  process.stdout.write(`  favorite:      ${row.favorite === true ? "yes" : "no"}\n`);
   process.stdout.write(`  active holder: ${renderActiveHolderText(holderState)}\n`);
   process.stdout.write(`  holders (${holders.length}):\n`);
   for (const holder of holders) {
@@ -1481,7 +1495,8 @@ function renderSeatShow(
 }
 
 /**
- * 🛑 SIX COLUMNS, WIDENED FROM FIVE 2026-09-30T16:17:04Z (the programme owner, on
+ * 🛑 SEVEN COLUMNS (`favorite` added for brick `a6884bb9`, text+JSON, appended before the
+ * closed marker). SIX COLUMNS, WIDENED FROM FIVE 2026-09-30T16:17:04Z (the programme owner, on
  * the TE's V3 finding) — `brickId` joins the cut. The relation this programme moved
  * from the session onto the seat is the brick link, so an operator's read surface
  * that could not answer "which seat holds brick X" was missing exactly that. C2's
@@ -1492,6 +1507,7 @@ type SeatListRow = {
   readonly seatId: string;
   readonly name: string | undefined;
   readonly brickId: SeatBrickLink | undefined;
+  readonly favorite: boolean;
   readonly closed: boolean;
   readonly holderCount: number;
   readonly holderState: ActiveHolderState;
@@ -1568,7 +1584,15 @@ async function buildSeatListRow(
   holderCount: number,
 ): Promise<SeatListRow> {
   const holderState = await resolveActiveHolderState(row.activeHolderId);
-  return { seatId, name: row.name, brickId: row.brickId, closed, holderCount, holderState };
+  return {
+    seatId,
+    name: row.name,
+    brickId: row.brickId,
+    favorite: row.favorite === true,
+    closed,
+    holderCount,
+    holderState,
+  };
 }
 
 function seatListRowJson(row: SeatListRow): Record<string, unknown> {
@@ -1581,6 +1605,8 @@ function seatListRowJson(row: SeatListRow): Record<string, unknown> {
     brickId: row.brickId?.ref ?? null,
     // Brick `9984c510` — ADDITIVE sibling, same shape as `seats show`'s payload.
     brickIdValidated: row.brickId ? row.brickId.validated : null,
+    // Brick `a6884bb9` — the SEVENTH column, ALWAYS a boolean (see `seats show`).
+    favorite: row.favorite,
     closed: row.closed,
     holderCount: row.holderCount,
     activeHolder: activeHolderJson(row.holderState),
@@ -1591,7 +1617,7 @@ function seatListRowText(row: SeatListRow): string {
   return (
     `${row.seatId}  ${row.name ?? "(unnamed)"}  brick=${seatListBrickText(row.brickId)}  ` +
     `active=${renderActiveHolderText(row.holderState)}  holders=${row.holderCount}  ` +
-    `${row.closed ? "CLOSED" : "open"}\n`
+    `favorite=${row.favorite ? "yes" : "no"}  ${row.closed ? "CLOSED" : "open"}\n`
   );
 }
 

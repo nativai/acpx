@@ -69,6 +69,7 @@ export {
   parseSeatStore,
   readSeatStore,
   seatRowMissingMessage,
+  SeatRowMissingError,
   SeatStoreUnhealthyError,
   seatStoreUnhealthyMessage,
   SEAT_RECORD_FIELD_PLAN,

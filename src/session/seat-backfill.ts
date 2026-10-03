@@ -23,6 +23,8 @@ import {
   fillSeatActiveHolder,
   fillSeatBrickLink,
   MalformedSeatRowError,
+  seatRowMissingMessage,
+  type SeatRowMissingError,
   migrateSeatFavorite,
   readSeatStore,
   type SeatBrickLink,
@@ -1063,4 +1065,27 @@ export async function countStaleSeatIndexEntries(sessionDir: string): Promise<nu
     }
   }
   return stale;
+}
+
+/**
+ * The refusal text for a seat whose row is missing — chosen by the PROPERTY that makes
+ * the backfill able to help: does any session record carry this seat id?
+ *
+ * Lives HERE because it asks exactly the question the backfill asks, through the same
+ * record enumeration and the same reader — so "the backfill would mint this seat" and
+ * "the refusal says the backfill would" cannot drift apart. It reads session records,
+ * so it runs OUTSIDE `withSeatStoreWrite`'s hold (a holding call site throws
+ * `SeatRowMissingError` and the layer around the hold calls this). Brick `bf454a2c`.
+ */
+export async function explainSeatRowMissing(error: SeatRowMissingError): Promise<string> {
+  const sessionDir = path.dirname(error.storePath);
+  let referenced = false;
+  for (const file of await listSessionRecordFiles(sessionDir)) {
+    const record = await readRecordFile(sessionDir, file);
+    if (record?.seatId === error.seatId) {
+      referenced = true;
+      break;
+    }
+  }
+  return seatRowMissingMessage(error.seatId, error.storePath, referenced);
 }

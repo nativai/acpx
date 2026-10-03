@@ -271,9 +271,12 @@ export const SEAT_RECORD_FIELD_PLAN = {
  * seat on top of a row that is still there.
  */
 export class MalformedSeatRowError extends Error {
-  constructor(readonly seatId: string) {
+  constructor(
+    readonly seatId: string,
+    readonly storePath: string,
+  ) {
     super(
-      `seat ${JSON.stringify(seatId)} is PRESENT in the seat store but its row is malformed. ` +
+      `seat ${JSON.stringify(seatId)} is PRESENT in the seat store ${storePath} but its row is malformed. ` +
         `This is not an absent seat and must not be treated as one: the row is still on disk. ` +
         `Repair or remove it deliberately — the store is the authority for this seat's active ` +
         `holder and next ordinal, and nothing else holds either.`,
@@ -330,6 +333,12 @@ export type SeatStore = {
    * working; it just stops lying about why.
    */
   readonly fileState: "absent" | "ok" | "malformed" | "unreadable";
+  /**
+   * The store's ABSOLUTE path, carried on the value so that every refusal built from a
+   * store can name the file an operator must open (brick `6391b51b`). On a box with
+   * more than one session directory a bare `seats.json` — or a UUID — is no address.
+   */
+  readonly storePath: string;
 };
 
 export function seatStorePath(sessionDir: string): string {
@@ -393,14 +402,14 @@ export function parseSeatRefOrThrow(label: string, value: string): string {
  */
 export function seatFromStore(store: SeatStore, seatId: string): SeatRecord | undefined {
   if (store.malformedSeatIds.includes(seatId)) {
-    throw new MalformedSeatRowError(seatId);
+    throw new MalformedSeatRowError(seatId, store.storePath);
   }
   // 🛑 AN UNHEALTHY FILE MUST NEVER ANSWER "ABSENT" (F1). The row may well be in there;
   // we cannot read it. Returning `undefined` here would send the caller down the
   // "predates the store, run the backfill" path — and the backfill cannot repair a
   // corrupt file, so that is a confident instruction to do the wrong thing.
   if (store.fileState === "malformed" || store.fileState === "unreadable") {
-    throw new SeatStoreUnhealthyError(store.fileState);
+    throw new SeatStoreUnhealthyError(store.fileState, store.storePath);
   }
   return store.seats.get(seatId);
 }
@@ -413,8 +422,11 @@ export function seatFromStore(store: SeatStore, seatId: string): SeatRecord | un
  * whole of F1.
  */
 export class SeatStoreUnhealthyError extends Error {
-  constructor(readonly fileState: "malformed" | "unreadable") {
-    super(seatStoreUnhealthyMessage(fileState));
+  constructor(
+    readonly fileState: "malformed" | "unreadable",
+    readonly storePath: string,
+  ) {
+    super(seatStoreUnhealthyMessage(fileState, storePath));
     this.name = "SeatStoreUnhealthyError";
   }
 }
@@ -603,8 +615,8 @@ export function parseSeatFromPersisted(raw: unknown): SeatRecord | undefined {
   };
 }
 
-function emptyStore(fileState: SeatStore["fileState"]): SeatStore {
-  return { seats: new Map(), malformedSeatIds: [], unparsedRows: new Map(), fileState };
+function emptyStore(fileState: SeatStore["fileState"], storePath: string): SeatStore {
+  return { seats: new Map(), malformedSeatIds: [], unparsedRows: new Map(), fileState, storePath };
 }
 
 /**
@@ -623,15 +635,15 @@ function emptyStore(fileState: SeatStore["fileState"]): SeatStore {
  * bad byte, while a writer that fails open destroys the authority. Each leg fails in
  * the direction that is recoverable.
  */
-export function parseSeatStore(payload: string): SeatStore {
+export function parseSeatStore(payload: string, storePath: string): SeatStore {
   let parsed: unknown;
   try {
     parsed = JSON.parse(payload);
   } catch {
-    return emptyStore("malformed");
+    return emptyStore("malformed", storePath);
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    return emptyStore("malformed");
+    return emptyStore("malformed", storePath);
   }
   const seats = new Map<string, SeatRecord>();
   const malformedSeatIds: string[] = [];
@@ -648,7 +660,7 @@ export function parseSeatStore(payload: string): SeatStore {
     }
     seats.set(key, seat);
   }
-  return { seats, malformedSeatIds, unparsedRows, fileState: "ok" };
+  return { seats, malformedSeatIds, unparsedRows, fileState: "ok", storePath };
 }
 
 /**
@@ -664,16 +676,16 @@ export async function readSeatStore(sessionDir: string): Promise<SeatStore> {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       // (a) STORE ABSENT — not an error. The first write creates the file.
-      return emptyStore("absent");
+      return emptyStore("absent", seatStorePath(sessionDir));
     }
     // (c) UNREADABLE (EACCES, EIO, …) — THE READER DOES NOT THROW, and that is what
     // "reader fails open" means: routing continues via the `holder_active` mirror
     // rather than the whole box becoming unroutable over one bad permission bit. What
     // it must NOT do is pretend the store is empty, so the state travels with the
     // result and every caller can tell the two apart.
-    return emptyStore("unreadable");
+    return emptyStore("unreadable", seatStorePath(sessionDir));
   }
-  return parseSeatStore(payload);
+  return parseSeatStore(payload, seatStorePath(sessionDir));
 }
 
 /**
@@ -697,7 +709,7 @@ export class SeatStoreUnwritableError extends AcpxOperationalError {
         `in it. This store is the authority for each seat's active holder and next ordinal — ` +
         `nothing else holds them, so unlike index.json it cannot be rebuilt from a ` +
         `projection, and restarting ordinals would re-issue labels that must never repeat. ` +
-        `Do not delete it to clear this error. ${seatStoreUnhealthyMessage(fileState)}`,
+        `Do not delete it to clear this error. ${seatStoreUnhealthyMessage(fileState, filePath)}`,
       { outputCode: "RUNTIME", detailCode: "SEAT_STORE_UNWRITABLE", origin: "runtime" },
     );
   }
@@ -951,7 +963,7 @@ export async function backfillSeatRow(
 ): Promise<"minted" | "present"> {
   return await withSeatStoreWrite(sessionDir, (store) => {
     if (store.malformedSeatIds.includes(row.seatId)) {
-      throw new MalformedSeatRowError(row.seatId);
+      throw new MalformedSeatRowError(row.seatId, store.storePath);
     }
     if (store.seats.has(row.seatId)) {
       return { mutation: SEAT_STORE_NO_CHANGE, result: "present" as const };
@@ -990,7 +1002,7 @@ export async function migrateSeatFavorite(
 ): Promise<"migrated" | "unchanged" | "no-row"> {
   return await withSeatStoreWrite(sessionDir, (store) => {
     if (store.malformedSeatIds.includes(seatId)) {
-      throw new MalformedSeatRowError(seatId);
+      throw new MalformedSeatRowError(seatId, store.storePath);
     }
     const row = store.seats.get(seatId);
     if (!row) {
@@ -1038,7 +1050,7 @@ export async function fillSeatBrickLink(
 ): Promise<"filled" | "unchanged" | "no-row"> {
   return await withSeatStoreWrite(sessionDir, (store) => {
     if (store.malformedSeatIds.includes(seatId)) {
-      throw new MalformedSeatRowError(seatId);
+      throw new MalformedSeatRowError(seatId, store.storePath);
     }
     const row = store.seats.get(seatId);
     if (!row) {
@@ -1073,7 +1085,7 @@ export async function fillSeatActiveHolder(
 ): Promise<"filled" | "unchanged" | "no-row"> {
   return await withSeatStoreWrite(sessionDir, (store) => {
     if (store.malformedSeatIds.includes(seatId)) {
-      throw new MalformedSeatRowError(seatId);
+      throw new MalformedSeatRowError(seatId, store.storePath);
     }
     const row = store.seats.get(seatId);
     if (!row) {
@@ -1175,39 +1187,80 @@ function brickConsequenceClause(params: Parameters<typeof mintSeatRow>[1]): stri
  * generic "run the backfill" would be wrong for both of them. */
 function seatStoreFailureRemedy(error: unknown): string {
   if (error instanceof SeatStoreUnwritableError) {
-    return seatStoreUnhealthyMessage(error.fileState);
+    return seatStoreUnhealthyMessage(error.fileState, error.filePath);
   }
   const code = (error as NodeJS.ErrnoException | undefined)?.code;
   if (code === "EACCES" || code === "EPERM" || code === "ENOSPC" || code === "EROFS") {
     return (
       `The store could not be written (${code}). Repair the filesystem — permissions or ` +
-      `free space — then run the seat backfill for the rows missed while it was unwritable.`
+      `free space — then run \`acpx seats backfill --apply\` for the rows missed while it was unwritable.`
     );
   }
   return (
     `The row write failed: ${error instanceof Error ? error.message : String(error)}. ` +
-    `Once the cause is fixed, run the seat backfill to mint the missing rows.`
+    `Once the cause is fixed, run \`acpx seats backfill --apply\` to mint the missing rows.`
   );
 }
 
 /**
- * The message a "seat has no row" refusal must carry — **AP17**.
+ * Thrown by a lookup that found NO ROW for a seat id — **by a call site that cannot
+ * decide the origin itself.**
  *
- * 🛑 NEVER A BARE "seat not found". Every seat minted BEFORE D13 landed has a record and
- * **no row**; that population is B10's backfill and §14 cannot reach it. So an operator
- * hitting this meets a session that looks healthy, a seat id that looks valid, and a
- * refusal that looks like a bug in our code. The message has to name the CAUSE and the
- * REMEDY — which is the "never silently unusable" standard applied to the message rather
- * than to the state.
- *
- * Shared by D11's `--seat` refusal and the activation's phase-0.2 refusal so the two
- * cannot drift into saying different things about the same condition.
+ * 🛑 WHY THIS IS AN ERROR AND NOT A FINISHED MESSAGE. The advice depends on whether any
+ * session record references the id (`seatRowMissingMessage`), and answering that reads
+ * session records — async, and forbidden inside `withSeatStoreWrite`'s hold (one
+ * `seats.json` read, at most one write, nothing else). So the hold throws this, carrying
+ * only what it knows, and the layer OUTSIDE the hold turns it into the refusal.
  */
-export function seatRowMissingMessage(seatId: string): string {
+export class SeatRowMissingError extends Error {
+  constructor(
+    readonly seatId: string,
+    readonly storePath: string,
+  ) {
+    super(`seat ${JSON.stringify(seatId)} has no row in ${storePath}.`);
+    this.name = "SeatRowMissingError";
+  }
+}
+
+/**
+ * The message a "seat has no row" refusal must carry — **AP17**, and **R21**: the advice
+ * follows the PROPERTY that makes the case repairable, never an enumeration of origins.
+ *
+ * 🛑 THE PROPERTY IS "A SESSION RECORD STILL CARRIES THIS SEAT ID". The backfill mints a
+ * row for every seat-bearing record that lacks one, so it can heal exactly the seats some
+ * record references — whether the seat predates the store or its row write failed — and
+ * it cannot mint a seat nobody created. A message that sent every missing row to the
+ * backfill was F4 (brick `bf454a2c`): precise, confident, and wrong for a mistyped id.
+ * The caller supplies `referencedByRecord`; this function only words the two answers.
+ *
+ * ⚠️ THE BACKFILL ADVICE IS `acpx seats backfill --apply`, NOT `acpx seats backfill`: the
+ * bare verb is a DRY RUN that writes nothing, so advising it would be a remedy that, run
+ * as printed, changes nothing. Nor does the backfill establish a seat's brick link
+ * (R26) — this message says nothing about migration state beyond the row.
+ *
+ * Never a bare "seat not found": every seat minted BEFORE D13 landed has a record and
+ * **no row**, which makes a session that looks healthy meet a refusal that looks like a
+ * bug in our code. Shared by D11's `--seat` refusal, the activation's phase-0.1 refusal
+ * and the `seats` verbs so they cannot drift into describing one condition differently.
+ */
+export function seatRowMissingMessage(
+  seatId: string,
+  storePath: string,
+  referencedByRecord: boolean,
+): string {
+  const subject = `seat ${JSON.stringify(seatId)} has no row in ${storePath}`;
+  if (!referencedByRecord) {
+    return (
+      `${subject}, and no session record references that seat id — so it is not a seat ` +
+      `that predates the store or lost its row write, and there is nothing to repair: no ` +
+      `seat with this id was ever minted on this box. Check the id for a typo ` +
+      `(\`acpx seats list\` shows the seats that exist).`
+    );
+  }
   return (
-    `seat ${JSON.stringify(seatId)} has no row in ${SEAT_STORE_FILE}. Two origins, one ` +
-    `remedy: either the seat PREDATES the seat store, or its row write failed at creation. ` +
-    `Either way, RUN THE SEAT BACKFILL — it mints a row for every seat-bearing record that ` +
+    `${subject}, but a session record still references it. Two origins, one remedy: either ` +
+    `the seat PREDATES the seat store, or its row write failed at creation. Either way, ` +
+    `RUN \`acpx seats backfill --apply\` — it mints a row for every seat-bearing record that ` +
     `lacks one, whatever the origin. The session itself is not broken and nothing is lost; ` +
     `until the row exists it simply cannot be joined or succeeded.`
   );
@@ -1222,23 +1275,29 @@ export function seatRowMissingMessage(seatId: string): string {
  * file, prints the quarantine step, and never overwrites, because a corrupt file may
  * hold hand-recoverable rows. Telling an operator with a corrupt store to "run the
  * backfill" is a confident instruction to do the wrong thing (F1).
+ *
+ * The ABSOLUTE path is spelled out everywhere the operator must act on the file —
+ * including the quarantine target — so the step can be pasted (brick `6391b51b`).
  */
-export function seatStoreUnhealthyMessage(fileState: "malformed" | "unreadable"): string {
+export function seatStoreUnhealthyMessage(
+  fileState: "malformed" | "unreadable",
+  storePath: string,
+): string {
   if (fileState === "malformed") {
     return (
-      `${SEAT_STORE_FILE} EXISTS but its top level does not parse, so no seat in it can be ` +
+      `${storePath} EXISTS but its top level does not parse, so no seat in it can be ` +
       `read — this is NOT an empty store and NOT a missing seat. Repair: QUARANTINE the ` +
-      `file (rename ${SEAT_STORE_FILE} to ${SEAT_STORE_FILE}.corrupt-<timestamp>, keeping ` +
-      `it — it may hold hand-recoverable rows), THEN run the seat backfill, which rebuilds ` +
-      `every row from the session records. Do not delete it, and do not expect the ` +
-      `backfill alone to fix this: it refuses to run against a malformed store rather ` +
-      `than overwrite one.`
+      `file (rename ${storePath} to ${storePath}.corrupt-<timestamp>, keeping ` +
+      `it — it may hold hand-recoverable rows), THEN run \`acpx seats backfill --apply\`, ` +
+      `which rebuilds every row from the session records. Do not delete it, and do not ` +
+      `expect the backfill alone to fix this: it refuses to run against a malformed store ` +
+      `rather than overwrite one.`
     );
   }
   return (
-    `${SEAT_STORE_FILE} could not be read (a permission or I/O failure, not a missing ` +
+    `${storePath} could not be read (a permission or I/O failure, not a missing ` +
     `file), so no seat in it can be read — this is NOT an empty store and NOT a missing ` +
-    `seat. Repair the filesystem first, then run the seat backfill for any rows missed ` +
-    `while it was unreadable.`
+    `seat. Repair the filesystem first, then run \`acpx seats backfill --apply\` for any rows ` +
+    `missed while it was unreadable.`
   );
 }

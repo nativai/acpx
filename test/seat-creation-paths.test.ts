@@ -766,26 +766,24 @@ test("AP17 · a seat with no row is refused with the CAUSE and the REMEDY, not a
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
 
-    // The production shape: a seat id that looks entirely valid and has no row —
-    // which is every seat minted BEFORE the store existed (B10's backfill
-    // population). The operator meets a healthy session and a valid id, so a bare
-    // "not found" reads as a bug in our code rather than a migration not yet run.
-    const refused = await runCli(
-      [
-        "--cwd",
-        cwd,
-        "--agent",
-        MOCK_AGENT_COMMAND,
-        "--approve-all",
-        "--format",
-        "json",
-        "sessions",
-        "new",
-        "--seat",
-        "cccccccc-dddd-4eee-8fff-000000000000",
-      ],
-      homeDir,
+    // The production shape: a seat that was minted BEFORE the store existed — a hot-tier
+    // record carrying `seat_id`, and no row (B10's backfill population). Entered by the
+    // product (a real founding `sessions new`) with ONLY its row then removed. An id no
+    // record carries is the OTHER origin (a typo) and gets the opposite advice — that
+    // pair is `seat-store-refusals.test.ts`'s (brick `bf454a2c`).
+    const base = ["--cwd", cwd, "--agent", MOCK_AGENT_COMMAND, "--approve-all", "--format", "json"];
+    const founding = await runCli([...base, "sessions", "new", "-s", "ap17-founder"], homeDir);
+    assert.equal(founding.code, 0, founding.stderr);
+    const founderId = String(
+      (JSON.parse(founding.stdout.trim()) as { acpxRecordId?: unknown }).acpxRecordId,
     );
+    const founderSeatId = String((await readRecordJson(homeDir, founderId)).seat_id);
+    const storeFile = path.join(homeDir, ".acpx", "sessions", "seats.json");
+    const rows = JSON.parse(await fs.readFile(storeFile, "utf8")) as Record<string, unknown>;
+    assert.ok(rows[founderSeatId], "fixture precondition: the product minted a row to remove");
+    delete rows[founderSeatId];
+    await fs.writeFile(storeFile, `${JSON.stringify(rows)}\n`, "utf8");
+    const refused = await runCli([...base, "sessions", "new", "--seat", founderSeatId], homeDir);
     assert.notEqual(refused.code, 0);
     const said = `${refused.stderr}${refused.stdout}`;
     // Names the CAUSE…
