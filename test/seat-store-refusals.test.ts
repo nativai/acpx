@@ -179,6 +179,32 @@ test("F4-typo · show on a seat id NO RECORD references: the refusal says check 
   });
 });
 
+test("F4-unparseable · a seat whose ONLY referencing record does not PARSE: the refusal states what was measured and never claims the seat was never minted — TEXT mode, combined stream", async () => {
+  await withRig(async (homeDir) => {
+    await writeStore(homeDir, { [SEAT_OTHER]: seatRow(SEAT_OTHER) });
+    // The one record that names this seat is invalid JSON (its text still carries the id).
+    // The seat WAS minted; the scan cannot read the record that proves it.
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "sessions", "broken-holder.json"),
+      `{"acpx_record_id": "broken-holder", "seat_id": "${SEAT_TYPO}", "holder_ordinal": 1,`,
+      "utf8",
+    );
+    const result = await runCli(["seats", "show", SEAT_TYPO], homeDir);
+    assert.equal(result.code, 1, result.output);
+    assert.match(result.output, /SEAT_ROW_MISSING/);
+    assert.match(
+      result.output,
+      /no readable session record in \S*sessions carries that seat id/i,
+      "the sentence must state the property that was measured",
+    );
+    assert.doesNotMatch(
+      result.output,
+      /never minted|ever minted|nothing to repair/i,
+      "an unparseable record is evidence the seat WAS minted — the refusal must not deny it",
+    );
+  });
+});
+
 test("F4-typo · rename (a MUTATION verb, row looked up inside the hold) refuses the same way — JSON mode, combined stream", async () => {
   await withRig(async (homeDir) => {
     await writeStore(homeDir, { [SEAT_OTHER]: seatRow(SEAT_OTHER) });
