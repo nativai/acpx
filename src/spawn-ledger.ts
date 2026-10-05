@@ -193,6 +193,34 @@ function retryOnBusy<T>(op: () => T): T {
   }
 }
 
+/**
+ * `retryOnBusy` with the SAME budget and backoff, but waiting with a timer instead of
+ * `Atomics.wait`, so a contender yields the event loop instead of freezing it (brick eb4c8d06).
+ * Every async record writer (the repository and the public file store) must take this path: a
+ * frozen loop in a queue owner stalls everything else that owner is doing, and a same-process
+ * holder that needs the loop to reach COMMIT cannot get it.
+ * `test/spawn-ledger-async-wait.test.ts` goes red if an async caller waits synchronously again.
+ */
+async function retryOnBusyAsync<T>(op: () => T): Promise<T> {
+  const started = Date.now();
+  let delay = 10 + Math.floor(Math.random() * 16);
+  for (;;) {
+    try {
+      return op();
+    } catch (error) {
+      const waited = Date.now() - started;
+      if (!isBusyAcquisitionError(error) || waited >= LEDGER_RETRY_BUDGET_MS) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(LEDGER_RETRY_CAP_MS, delay)));
+      delay = Math.min(
+        LEDGER_RETRY_CAP_MS,
+        Math.ceil(delay * 1.7) + Math.floor(Math.random() * 25),
+      );
+    }
+  }
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS spawn_run (
@@ -653,11 +681,31 @@ export class SpawnLedger {
   }
 
   private locked<T>(action: () => T): T {
-    let acquired = false;
+    return this.commitOrRollback(
+      () =>
+        retryOnBusy(() => {
+          this.db.exec("BEGIN IMMEDIATE");
+        }),
+      action,
+    );
+  }
+
+  /** `locked()` for async callers: the lock is acquired with a yielding wait, the action stays synchronous. */
+  private async lockedAsync<T>(action: () => T): Promise<T> {
     try {
-      retryOnBusy(() => {
+      await retryOnBusyAsync(() => {
         this.db.exec("BEGIN IMMEDIATE");
       });
+    } catch (error) {
+      throw this.translate(error);
+    }
+    return this.commitOrRollback(() => undefined, action);
+  }
+
+  private commitOrRollback<T>(begin: () => void, action: () => T): T {
+    let acquired = false;
+    try {
+      begin();
       acquired = true;
       const result = action();
       if (result instanceof Promise) {
@@ -753,17 +801,22 @@ export class SpawnLedger {
 
   /** Persists a spawn-owned session record under the ledger's write lock and ownership guard. */
   saveRecord(record: DiskRecord): DiskRecord {
-    return this.locked(() => {
-      if (metadataValue(record, "spawn_key")) {
-        this.assertBoundToThisInstance();
-      }
-      const id = String(record.acpx_record_id);
-      const current = this.readRecord(id);
-      this.assertSpawnOwnership(id, record, current);
-      preserveSpawnState(record, current);
-      writeRecordAtomic(this.recordPath(id), record);
-      return record;
-    });
+    return this.locked(() => this.saveRecordLocked(record));
+  }
+  /** `saveRecord` for async callers — identical, but waits for the lock without blocking the loop. */
+  async saveRecordAsync(record: DiskRecord): Promise<DiskRecord> {
+    return await this.lockedAsync(() => this.saveRecordLocked(record));
+  }
+  private saveRecordLocked(record: DiskRecord): DiskRecord {
+    if (metadataValue(record, "spawn_key")) {
+      this.assertBoundToThisInstance();
+    }
+    const id = String(record.acpx_record_id);
+    const current = this.readRecord(id);
+    this.assertSpawnOwnership(id, record, current);
+    preserveSpawnState(record, current);
+    writeRecordAtomic(this.recordPath(id), record);
+    return record;
   }
 
   reserveSpawn(input: SpawnReservation): SpawnAttempt {

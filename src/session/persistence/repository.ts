@@ -752,7 +752,7 @@ async function persistRecordFile(
   ledger: SpawnLedger | undefined,
 ): Promise<DiskRecord> {
   if (ledger) {
-    return ledger.saveRecord(raw);
+    return await ledger.saveRecordAsync(raw);
   }
   const temporary = `${file}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
   await fs.writeFile(temporary, `${JSON.stringify(raw)}\n`, "utf8");
