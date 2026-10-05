@@ -66,7 +66,7 @@ class FileSessionStore implements AcpSessionStore {
     const ledger = openSpawnLedgerForRecord(record.metadata, this.sessionDir);
     if (ledger) {
       try {
-        ledger.saveRecord(persisted as DiskRecord);
+        await ledger.saveRecordAsync(persisted as DiskRecord);
       } finally {
         ledger.close();
       }
