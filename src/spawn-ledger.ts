@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import { queueLockFilePath } from "./cli/queue/paths.js";
 import { isSqliteExperimentalWarning } from "./models/ui-prefs-store.js";
 
 /**
@@ -327,10 +328,16 @@ function receiptConflicts(run: SpawnRun, receipt: CentralRunReceipt): boolean {
     receipt.status === "spawned" && run.session_id && receipt.session_id !== run.session_id,
   );
 }
+function rebindsReservedDestination(writer: DiskRecord, current: DiskRecord): boolean {
+  return (
+    Boolean(metadataValue(current, "spawn_key")) && current.acp_session_id !== writer.acp_session_id
+  );
+}
 function assertRecordIdentity(
   id: string,
   writer: DiskRecord,
   current: DiskRecord | undefined,
+  ownerMayRebind = false,
 ): void {
   if (writer.acpx_record_id !== id) {
     throw new SpawnLedgerError("record-ownership", "record id does not own destination");
@@ -345,8 +352,10 @@ function assertRecordIdentity(
     throw new SpawnLedgerError("record-ownership", "destination belongs to another spawn attempt");
   }
   // acp_session_id is protected on reserved destinations: a delayed child must not rebind a
-  // record an attempt owns.
-  if (metadataValue(current, "spawn_key") && current.acp_session_id !== writer.acp_session_id) {
+  // record an attempt owns. The one legitimate rebind is the session's OWN owner after its
+  // cold session/resume misses and falls back to session/new (brick d36c222f) — see
+  // `SpawnLedger.ownerMayRebind`.
+  if (rebindsReservedDestination(writer, current) && !ownerMayRebind) {
     throw new SpawnLedgerError("record-ownership", "destination belongs to another ACP session");
   }
 }
@@ -765,12 +774,19 @@ export class SpawnLedger {
 
   /** The spawn_key ownership check: only a live attempt's own destination may be written. */
   private assertSpawnOwnership(id: string, writer: DiskRecord, current: DiskRecord | undefined) {
-    assertRecordIdentity(id, writer, current);
     const key = writer.metadata?.spawn_key;
+    const attempt = key
+      ? this.db.prepare("SELECT * FROM spawn_attempt WHERE idempotency_key=?").get(key)
+      : undefined;
+    assertRecordIdentity(
+      id,
+      writer,
+      current,
+      Boolean(attempt) && this.ownerMayRebind(id, attempt!),
+    );
     if (!key) {
       return;
     }
-    const attempt = this.db.prepare("SELECT * FROM spawn_attempt WHERE idempotency_key=?").get(key);
     if (!attempt || attempt.target_record_id !== id) {
       throw new SpawnLedgerError("record-ownership", "spawn key does not own reserved destination");
     }
@@ -779,6 +795,35 @@ export class SpawnLedger {
         "spawn-revoked",
         `spawn attempt is ${String(attempt.state)}; write refused`,
       );
+    }
+  }
+
+  /**
+   * Whether THIS process may rebind the record's acp_session_id: the attempt that owns the
+   * destination is the run's adopted one, and this process is the session's live queue owner
+   * (it holds the session's queue lease). That is exactly the writer that runs the
+   * session/resume → session/new fallback, which hands the session a new ACP id on a normal
+   * cold start; refusing it meant an auto-spawned agent never received its initial prompt
+   * (brick d36c222f).
+   *
+   * ⚠️ DO NOT WIDEN THIS TO "THE ATTEMPT IS ADOPTED". Any process that loaded the record
+   * carries the same spawn_key — acpx-ui's `writeOwnedRecord`, a second CLI, a delayed child —
+   * and only the lease identifies the one process entitled to the session's ACP binding.
+   * `test/spawn-ledger.test.ts` carries the foreign-writer negative.
+   */
+  private ownerMayRebind(id: string, attempt: Record<string, unknown>): boolean {
+    if (attempt.state !== "adopted") {
+      return false;
+    }
+    const run = this.getSpawnRun(String(attempt.run_id));
+    if (!run || run.adopted_fence !== Number(attempt.fence)) {
+      return false;
+    }
+    try {
+      const lease = JSON.parse(fs.readFileSync(queueLockFilePath(id), "utf8")) as { pid?: unknown };
+      return lease.pid === process.pid;
+    } catch {
+      return false;
     }
   }
 
