@@ -1,3 +1,5 @@
+import { OutboxError } from "../brick-outbox.js";
+
 const DEFAULT_LIVE_CHECKPOINT_INTERVAL_MS = 500;
 
 export type LiveSessionCheckpointOptions = {
@@ -36,9 +38,33 @@ function reportCheckpointFailure(error: unknown): void {
   process.stderr.write(
     `[acpx] 🛑 session record checkpoint FAILED — this session's record has stopped ` +
       `being written to disk, so state changed from here on is being lost even though ` +
-      `it looks correct in memory. A non-snake_case persisted key is the known cause ` +
-      `(see src/persisted-key-policy.ts). ${detail}\n`,
+      `it looks correct in memory. ${checkpointFailureCause(error)} ${detail}\n`,
   );
+}
+
+const KEY_POLICY_VIOLATION_PREFIX = "Persisted key policy violation";
+
+/**
+ * Name the failure for what it IS (brick://b8e251eb). This line used to blame "a
+ * non-snake_case persisted key" for every failure, and on 2026-10-05 it said so
+ * for an `outbox-busy` lock timeout — pointing a diagnosis at the key policy
+ * while the real cause was another process holding the outbox write lock.
+ */
+export function checkpointFailureCause(error: unknown): string {
+  if (error instanceof OutboxError && error.code === "outbox-busy") {
+    return (
+      "Cause: OutboxError outbox-busy — another writer held the session outbox lock " +
+      "(~/.acpx/brick-outbox.db) past the retry budget; lock contention, not a record defect."
+    );
+  }
+  if (error instanceof OutboxError) {
+    return `Cause: OutboxError ${error.code}.`;
+  }
+  if (error instanceof Error && error.message.startsWith(KEY_POLICY_VIOLATION_PREFIX)) {
+    return "Cause: a non-snake_case persisted key (see src/persisted-key-policy.ts).";
+  }
+  const name = error instanceof Error ? error.name : typeof error;
+  return `Cause: ${name} — not a persisted-key violation.`;
 }
 
 export class LiveSessionCheckpoint {

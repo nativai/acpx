@@ -1188,6 +1188,12 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
                   );
                 }
               },
+              // brick://b8e251eb: the task was handed back with the retryable
+              // owner-exit terminal — release, so that terminal is true and the
+              // re-drive meets a fresh owner rather than this one.
+              onTurnStartAbandoned: () => {
+                recycleOwnerAfterTask = true;
+              },
               setMidTurnHandler: midTurnInjectionSupported
                 ? (handler) => {
                     activeMidTurnHandler = handler;
