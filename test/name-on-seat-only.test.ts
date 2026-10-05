@@ -152,7 +152,7 @@ function recordFixture() {
 
 test("the persisted record carries no `name` key, and a `name` on disk is not parsed back", () => {
   const record = recordFixture();
-  const persisted = serializeSessionRecordForDisk(record) as Record<string, unknown>;
+  const persisted = serializeSessionRecordForDisk(record);
   assert.equal(Object.hasOwn(persisted, "name"), false);
   assert.equal(Object.hasOwn(record, "name"), false);
 

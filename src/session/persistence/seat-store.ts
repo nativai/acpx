@@ -1068,6 +1068,39 @@ export async function fillSeatBrickLink(
 }
 
 /**
+ * D-NAME-HARD-MIGRATION — a seat row that ALREADY EXISTS takes a record's LEGACY
+ * name, only when the row has NONE (absent or blank). The strip step of the seat
+ * backfill calls this BEFORE it deletes the name from the record, so the name is
+ * never on neither side.
+ *
+ * 🛑 **NEVER OVERWRITES A PRESENT NAME** — the seat's name is the display truth
+ * since the identity lane, so a differing record name loses (the backfill counts
+ * and lists that case; it does not resolve it here). Same idempotent,
+ * malformed-row-throws contract as `fillSeatBrickLink`.
+ */
+export async function fillSeatName(
+  sessionDir: string,
+  seatId: string,
+  name: string,
+): Promise<"filled" | "unchanged" | "no-row"> {
+  return await withSeatStoreWrite(sessionDir, (store) => {
+    if (store.malformedSeatIds.includes(seatId)) {
+      throw new MalformedSeatRowError(seatId, store.storePath);
+    }
+    const row = store.seats.get(seatId);
+    if (!row) {
+      return { mutation: SEAT_STORE_NO_CHANGE, result: "no-row" as const };
+    }
+    if (row.name?.trim()) {
+      return { mutation: SEAT_STORE_NO_CHANGE, result: "unchanged" as const };
+    }
+    const seats = new Map(store.seats);
+    seats.set(seatId, { ...row, name });
+    return { mutation: { kind: "write", seats } as const, result: "filled" as const };
+  });
+}
+
+/**
  * D-SEAT-HOLD, brick `eca085bb` — POINT a NULL `active_holder_id` at the seat's
  * holder, for a seat row that ALREADY EXISTS and is not itself closed. A closed
  * session keeps holding its seat until a successor is activated, so a null pointer

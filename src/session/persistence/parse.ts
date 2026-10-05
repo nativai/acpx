@@ -1146,17 +1146,6 @@ function parseSessionRecordMetadata(record: Record<string, unknown>): {
   return { lastRequestId, importedFrom };
 }
 
-// LEGACY `name` (D-IDENTITY): a name identifies nothing now, so a wrong-typed one
-// is dropped rather than rejecting the whole record the way it used to.
-function normalizeLegacyName(value: unknown): string | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
-}
-
 function normalizeOptionalPid(value: unknown): number | undefined | null {
   if (value == null) {
     return undefined;
@@ -1368,7 +1357,6 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     return null;
   }
 
-  const legacyName = normalizeLegacyName(record.name);
   const pid = normalizeOptionalPid(record.pid);
   const closed = normalizeOptionalBoolean(record.closed, false);
   const closedAt = normalizeOptionalString(record.closed_at);
@@ -1507,7 +1495,6 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
       agentName: agentName ?? undefined,
       agentCommand,
       cwd,
-      legacyName,
       createdAt: record.created_at,
       lastUsedAt: record.last_used_at,
       lastSeq: record.last_seq,

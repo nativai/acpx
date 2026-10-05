@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { isSqliteExperimentalWarning } from "./models/ui-prefs-store.js";
-import { decideSessionBrickSync } from "./session/seat-brick.js";
+import { decideSessionBrickSync, seatNameSync } from "./session/seat-brick.js";
 
 type SqliteModule = { DatabaseSync: new (path: string) => DatabaseSync };
 let sqliteModule: SqliteModule | undefined;
@@ -561,7 +561,6 @@ function applyIntentFields(
   } else {
     delete updated.metadata.brick;
   }
-  updated.name = payload.name;
   updated.closed = payload.closed;
   if (payload.last_used_at !== null) {
     updated.last_used_at = payload.last_used_at;
@@ -586,7 +585,11 @@ function makeProjectionPayload(
     ...identity,
     session_id: id,
     brick_id: brick,
-    name: stringOrNull(record.name),
+    // The SEAT's name (D-NAME-HARD-MIGRATION): the record has none, and the apply no longer writes one back.
+    name: seatNameSync(
+      typeof record.seat_id === "string" ? record.seat_id : undefined,
+      path.join(os.homedir(), ".acpx", "sessions"),
+    ),
     closed: record.closed === true,
     last_used_at: stringOrNull(record.last_used_at),
     projection_epoch: epoch,

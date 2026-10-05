@@ -1836,7 +1836,6 @@ async function unlinkHardDeletedFiles(
 
 export type TemplateSlugAssignment = {
   acpxRecordId: string;
-  name: string | undefined;
   slug: string;
   version: number;
 };
@@ -1849,18 +1848,6 @@ export type MigrateSlugsResult = {
   dryRun: boolean;
   assignments: TemplateSlugAssignment[];
 };
-
-function disambiguateSlug(base: string, taken: ReadonlySet<string>): string {
-  if (!taken.has(base)) {
-    return base;
-  }
-  for (let suffix = 2; ; suffix += 1) {
-    const candidate = `${base}-${suffix}`;
-    if (!taken.has(candidate)) {
-      return candidate;
-    }
-  }
-}
 
 // Deterministic created_at-asc, then acpxRecordId-asc, via a single composite key
 // (NUL separator keeps the created_at boundary clean — neither field contains NUL).
@@ -1879,21 +1866,14 @@ type TemplateSlugPlan =
   | { kind: "skipped" }
   | { kind: "degenerate" };
 
-// The slug a record keeps (already-slugged) or is assigned during migration: a
-// slug-less record gets a disambiguated slug (D3) added to `takenSlugs`. Returns
-// undefined only for a degenerate name (slugifies to empty) — leave it slug-less.
-function migrationSlugFor(record: SessionRecord, takenSlugs: Set<string>): string | undefined {
-  const existing = record.template?.slug;
-  if (existing !== undefined) {
-    return existing;
-  }
-  const base = record.legacyName !== undefined ? slugify(record.legacyName) : undefined;
-  if (base === undefined) {
-    return undefined;
-  }
-  const slug = disambiguateSlug(base, takenSlugs);
-  takenSlugs.add(slug);
-  return slug;
+// The slug a record keeps (already-slugged). A slug-less record has NO name to
+// derive one from — the session record carries none (D-NAME-HARD-MIGRATION), the
+// seat does, and a template's slug is not the seat's to supply — so it stays
+// slug-less (reported `degenerate`; it groups by id). DEBT SITE: the verb used to
+// slugify the record's own name; whether to retire it or derive from the seat's
+// name is the owner's call, not this change's.
+function migrationSlugFor(record: SessionRecord): string | undefined {
+  return record.template?.slug;
 }
 
 // Decide the slug+version for one template record during migration. Skips an
@@ -1901,14 +1881,13 @@ function migrationSlugFor(record: SessionRecord, takenSlugs: Set<string>): strin
 // migration slug + the next version for that slug. Updates the in-memory state.
 function planTemplateSlugMigration(
   record: SessionRecord,
-  takenSlugs: Set<string>,
   maxVersionBySlug: Map<string, number>,
 ): TemplateSlugPlan {
   const { slug: existingSlug, version: existingVersion } = record.template ?? {};
   if (existingSlug !== undefined && typeof existingVersion === "number") {
     return { kind: "skipped" };
   }
-  const slug = migrationSlugFor(record, takenSlugs);
+  const slug = migrationSlugFor(record);
   if (slug === undefined) {
     return { kind: "degenerate" };
   }
@@ -1918,24 +1897,21 @@ function planTemplateSlugMigration(
   return { kind: "assign", slug, version };
 }
 
-// Anchor idempotency + disambiguation on slugs/versions already persisted.
+// Anchor idempotency on versions already persisted.
 function seedTemplateSlugState(records: readonly SessionRecord[]): {
-  takenSlugs: Set<string>;
   maxVersionBySlug: Map<string, number>;
 } {
-  const takenSlugs = new Set<string>();
   const maxVersionBySlug = new Map<string, number>();
   for (const record of records) {
     const slug = record.template?.slug;
     if (slug !== undefined) {
-      takenSlugs.add(slug);
       maxVersionBySlug.set(
         slug,
         Math.max(maxVersionBySlug.get(slug) ?? 0, record.template?.version ?? 0),
       );
     }
   }
-  return { takenSlugs, maxVersionBySlug };
+  return { maxVersionBySlug };
 }
 
 async function loadEnabledTemplateRecordsSorted(): Promise<SessionRecord[]> {
@@ -1968,7 +1944,6 @@ async function migrateOneTemplateRecord(
   }
   result.assignments.push({
     acpxRecordId: record.acpxRecordId,
-    name: record.legacyName,
     slug: plan.slug,
     version: plan.version,
   });
@@ -1999,7 +1974,7 @@ export async function migrateTemplateSlugs(
   await ensureSessionDir();
   return await withSessionIndexLock(sessionBaseDir(), async () => {
     const records = await loadEnabledTemplateRecordsSorted();
-    const { takenSlugs, maxVersionBySlug } = seedTemplateSlugState(records);
+    const { maxVersionBySlug } = seedTemplateSlugState(records);
     const result: MigrateSlugsResult = {
       scanned: records.length,
       assigned: 0,
@@ -2010,7 +1985,7 @@ export async function migrateTemplateSlugs(
       assignments: [],
     };
     for (const record of records) {
-      const plan = planTemplateSlugMigration(record, takenSlugs, maxVersionBySlug);
+      const plan = planTemplateSlugMigration(record, maxVersionBySlug);
       await migrateOneTemplateRecord(record, plan, options.dryRun === true, result);
     }
     return result;
