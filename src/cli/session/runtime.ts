@@ -2174,10 +2174,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   const subagentEventWriters = new Map<string, SessionEventWriter>();
   // Subagent JSONL tailers: map from ACPX record id to stop function
   const subagentTailers = new Map<string, { stop: () => Promise<void> }>();
-  const subagentSaveChains = new Map<string, Promise<void>>();
-
-  const enqueueSubagentBoundaryWrite = createSubagentBoundaryWriteEnqueuer({
-    chains: subagentSaveChains,
+  // Shadow-record saves are coalesced per child (brick://5e7c2a85): the tailer
+  // enqueues on every 300 ms batch, the writer saves at most once per interval,
+  // and every path that ends a child or the turn flushes it.
+  const subagentWrites = createSubagentBoundaryWriteEnqueuer({
     write: writeSessionRecordAtBoundary,
     onWriteError: (childAcpxRecordId, error) => {
       process.stderr.write(
@@ -2211,7 +2211,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     const stops = [...subagentTailers.values()].map((t) => t.stop().catch(() => {}));
     await Promise.all(stops);
     subagentTailers.clear();
-    await Promise.all([...subagentSaveChains.values()].map((save) => save.catch(() => {})));
+    // The tailers' final drains above have enqueued; write every child's latest
+    // state now rather than after its interval.
+    await subagentWrites.flush();
   };
 
   const closeAllSubagentEventWriters = async (): Promise<void> => {
@@ -2388,8 +2390,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
               const tailer = subagentTailers.get(childAcpxRecordId);
               if (tailer) {
                 subagentTailers.delete(childAcpxRecordId);
-                // Same detached-rejection class as `enqueueSubagentBoundaryWrite`
-                // above: `tailer.stop()` can reject (every other stop site
+                // Same detached-rejection class as `newPendingSave` in
+                // subagent-boundary-write.ts: `tailer.stop()` can reject (every other stop site
                 // `.catch`es it), and the `.then()`-derived promise is discarded
                 // by `void` with no handler — a fatal unhandled rejection.
                 void tailer
@@ -2398,15 +2400,16 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
                     const childRecord = subagentRecordsById.get(childAcpxRecordId);
                     if (childRecord) {
                       childRecord.lastUsedAt = isoNow();
-                      void enqueueSubagentBoundaryWrite(childAcpxRecordId, childRecord).catch(
-                        () => {},
-                      );
+                      void subagentWrites.enqueue(childAcpxRecordId, childRecord).catch(() => {});
                     }
+                    // The child is finished: persist its final state now, not
+                    // after the coalescing interval.
+                    return subagentWrites.flush(childAcpxRecordId);
                   })
                   .catch(() => {
                     // Draining a finished sub-agent's tailer is best-effort; the
-                    // write failure it guards is already logged by
-                    // `enqueueSubagentBoundaryWrite`.
+                    // write failure it guards is already logged by the
+                    // `onWriteError` of `subagentWrites`.
                   });
               }
             }
@@ -2568,7 +2571,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
                     .catch(() => {});
                 }
               });
-              void enqueueSubagentBoundaryWrite(childAcpxRecordId, childRecord).catch(() => {});
+              void subagentWrites.enqueue(childAcpxRecordId, childRecord).catch(() => {});
             });
             subagentTailers.set(childAcpxRecordId, tailer);
           }
@@ -2692,7 +2695,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
             context: deliveryContextFor(injectedTask),
             settled: false,
           };
-          // Same detached-rejection class as `enqueueSubagentBoundaryWrite`:
+          // Same detached-rejection class as `newPendingSave` (subagent-boundary-write.ts):
           // `.finally()` returns a NEW promise inheriting `injectedPromise`'s
           // rejection, and `void` drops it unhandled. The rejection itself is
           // handled where `injectedPromise` is actually awaited; this chain
