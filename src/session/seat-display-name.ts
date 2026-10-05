@@ -28,3 +28,8 @@ export async function seatDisplayName(
   }
   return undefined;
 }
+
+// PLANTED to prove the guard is red (never merged): a record-side name read as the session's name.
+export function plantedRecordNameRead(record: { name?: string }): string | undefined {
+  return record.name;
+}
