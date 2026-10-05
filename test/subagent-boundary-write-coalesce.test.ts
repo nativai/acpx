@@ -26,7 +26,7 @@ import type { QueueTask } from "../src/cli/queue/ipc.js";
 import { runQueuedTask } from "../src/cli/session/runtime.js";
 import {
   createSubagentBoundaryWriteEnqueuer,
-  SUBAGENT_RECORD_SAVE_INTERVAL_MS,
+  setSubagentRecordSaveIntervalForTests,
 } from "../src/cli/session/subagent-boundary-write.js";
 import { transcriptCwdHash } from "../src/config/subscription-transcript.js";
 import { textPrompt } from "../src/prompt-content.js";
@@ -242,20 +242,32 @@ interface SubagentTurn {
   childFile?: string;
   messagesBeforeFlush?: number;
   mtimeBeforeFlush?: number;
-  msFromTranscriptToDisk?: number;
+  /** The child's state was on disk while the turn was still running. */
+  landedInsideTurn?: boolean;
 }
 
 /**
  * One parent turn that spawns a child, feeds its transcript, waits until the
  * tailer's batch is enqueued (and held by the interval), then either completes
  * the child or simply ends the turn.
+ *
+ * `intervalMs` is the runtime's coalescing interval for this turn. The rows
+ * set it so that the timer CANNOT be what lands the state they observe, which
+ * makes them structural rather than wall-clock bounds. A wall-clock bound red
+ * at box load 65 (integration suite, 2026-10-05): one save alone took > 2 s
+ * there, behind the per-record lock.
  */
-async function runSubagentTurn(homeDir: string, completeChild: boolean): Promise<SubagentTurn> {
+async function runSubagentTurn(
+  homeDir: string,
+  mode: "complete" | "end-turn" | "watch-without-completion",
+  intervalMs: number,
+): Promise<SubagentTurn> {
   const cwd = path.join(homeDir, "workspace");
   await fs.mkdir(cwd, { recursive: true });
   const claudeConfigDir = path.join(homeDir, "claude-config");
   const originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
   process.env.CLAUDE_CONFIG_DIR = claudeConfigDir;
+  setSubagentRecordSaveIntervalForTests(intervalMs);
   try {
     const parent = makeSessionRecord({
       acpxRecordId: "parent-session",
@@ -325,7 +337,6 @@ async function runSubagentTurn(homeDir: string, completeChild: boolean): Promise
           { type: "user", message: { role: "user", content: "do the thing" } },
           { type: "assistant", message: { role: "assistant", content: "done" } },
         ];
-        const transcriptWrittenAt = performance.now();
         await fs.writeFile(
           path.join(dir, "agent-worker-1.jsonl"),
           lines.map((l) => JSON.stringify(l)).join("\n") + "\n",
@@ -336,15 +347,23 @@ async function runSubagentTurn(homeDir: string, completeChild: boolean): Promise
         observed.messagesBeforeFlush = (await resolveSessionRecord(childId)).messages.length;
         observed.mtimeBeforeFlush = (await fs.stat(observed.childFile)).mtimeMs;
 
-        if (completeChild) {
-          handlers.onAcpMessage?.("inbound", taskCompleted("parent-session-acp", "worker-1"));
+        if (mode === "watch-without-completion") {
+          // Same in-turn watch, no task_completed: nothing may land the state.
           const landed = await waitFor(async () => {
             const child = await resolveSessionRecord(childId);
-            return child.messages.length > 0 ? performance.now() : undefined;
-          }, 4_000);
-          if (landed !== undefined) {
-            observed.msFromTranscriptToDisk = landed - transcriptWrittenAt;
-          }
+            return child.messages.length > 0 ? true : undefined;
+          }, 3_000);
+          observed.landedInsideTurn = landed === true;
+        }
+        if (mode === "complete") {
+          handlers.onAcpMessage?.("inbound", taskCompleted("parent-session-acp", "worker-1"));
+          // Generous: this bounds only how long a slow box may take to write,
+          // never what is being proven — that is "before the turn returned".
+          const landed = await waitFor(async () => {
+            const child = await resolveSessionRecord(childId);
+            return child.messages.length > 0 ? true : undefined;
+          }, 30_000);
+          observed.landedInsideTurn = landed === true;
         }
         return { stopReason: "end_turn" as const };
       },
@@ -355,7 +374,7 @@ async function runSubagentTurn(homeDir: string, completeChild: boolean): Promise
       message: "spawn a subagent",
       prompt: textPrompt("spawn a subagent"),
       permissionMode: "approve-all",
-      timeoutMs: 20_000,
+      timeoutMs: 60_000,
       waitForCompletion: true,
       enqueuedAt: Date.now(),
       send: () => {},
@@ -367,6 +386,7 @@ async function runSubagentTurn(homeDir: string, completeChild: boolean): Promise
     });
     return observed;
   } finally {
+    setSubagentRecordSaveIntervalForTests(undefined);
     if (originalClaudeConfigDir === undefined) {
       delete process.env.CLAUDE_CONFIG_DIR;
     } else {
@@ -375,35 +395,58 @@ async function runSubagentTurn(homeDir: string, completeChild: boolean): Promise
   }
 }
 
+// Far beyond anything the completion row waits: the timer can never land it.
+const COMPLETION_ROW_INTERVAL_MS = 600_000;
+// Long enough that a leaked timer cannot fire before the turn returns, short
+// enough to wait out afterwards.
+const TURN_END_ROW_INTERVAL_MS = 5_000;
+
 test("runtime: task_completed persists the child's final state without waiting out the interval", async () => {
   await withTempHomeFixture("acpx-subagent-coalesce-", async (homeDir) => {
-    const observed = await runSubagentTurn(homeDir, true);
+    const observed = await runSubagentTurn(homeDir, "complete", COMPLETION_ROW_INTERVAL_MS);
 
     assert.ok(observed.childId, "no sub-agent shadow record reached disk");
-    // Positive control for the timing below: the batch was held by the
-    // interval, not saved per batch as before.
+    // Control: the tailer's batch is held, not saved per batch. A per-batch
+    // save path would land it whatever the interval is.
     assert.equal(
       observed.messagesBeforeFlush,
       0,
-      "the tailer's batch reached disk before the interval — saves are not coalesced",
+      "the tailer's batch reached disk before any flush — saves are not coalesced",
     );
-    // The save is held for the interval from its FIRST enqueue, which is no
-    // earlier than the transcript write. Landing sooner than that can only be
-    // the completion flush.
-    assert.ok(
-      observed.msFromTranscriptToDisk !== undefined &&
-        observed.msFromTranscriptToDisk < SUBAGENT_RECORD_SAVE_INTERVAL_MS,
-      `final state reached disk ${String(observed.msFromTranscriptToDisk?.toFixed(0))} ms after the ` +
-        `transcript write; the interval is ${SUBAGENT_RECORD_SAVE_INTERVAL_MS} ms, so completion did not flush`,
+    // Observed INSIDE the turn (turn end has not flushed yet), with the timer
+    // ten minutes away: only the completion flush can have landed it (the
+    // negative row below shows nothing else does).
+    assert.equal(
+      observed.landedInsideTurn,
+      true,
+      "the child's final state did not reach disk after task_completed while the turn was " +
+        "still running — completion did not flush",
     );
     const finalChild = await resolveSessionRecord(observed.childId);
     assert.equal(finalChild.messages.length, 2);
   });
 });
 
+test("runtime (negative control): without task_completed, nothing lands the state inside the turn", async () => {
+  await withTempHomeFixture("acpx-subagent-coalesce-", async (homeDir) => {
+    const observed = await runSubagentTurn(
+      homeDir,
+      "watch-without-completion",
+      COMPLETION_ROW_INTERVAL_MS,
+    );
+
+    assert.ok(observed.childId, "no sub-agent shadow record reached disk");
+    // The completion row's "landed inside the turn" can therefore only mean the
+    // completion flush — not the event stream, the writer, or anything else.
+    assert.equal(observed.landedInsideTurn, false, "the state landed inside the turn unflushed");
+    // And turn end still lands it.
+    assert.equal((await resolveSessionRecord(observed.childId)).messages.length, 2);
+  });
+});
+
 test("runtime: turn end flushes a pending child save, and no save outlives the turn", async () => {
   await withTempHomeFixture("acpx-subagent-coalesce-", async (homeDir) => {
-    const observed = await runSubagentTurn(homeDir, false);
+    const observed = await runSubagentTurn(homeDir, "end-turn", TURN_END_ROW_INTERVAL_MS);
 
     assert.ok(observed.childId && observed.childFile, "no sub-agent shadow record reached disk");
     assert.equal(observed.messagesBeforeFlush, 0, "the batch was not held by the interval");
@@ -417,7 +460,7 @@ test("runtime: turn end flushes a pending child save, and no save outlives the t
     // the record after the turn has returned. (The event writer's close also
     // saves the record at turn end, so the state check above alone cannot tell
     // a flush from a leaked timer; this one can.)
-    await sleep(SUBAGENT_RECORD_SAVE_INTERVAL_MS + 500);
+    await sleep(TURN_END_ROW_INTERVAL_MS + 1_000);
     assert.equal(
       (await fs.stat(observed.childFile)).mtimeMs,
       mtimeAtReturn,

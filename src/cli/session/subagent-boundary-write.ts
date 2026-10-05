@@ -16,6 +16,18 @@ import type { SessionRecord } from "../../types.js";
  */
 export const SUBAGENT_RECORD_SAVE_INTERVAL_MS = 2_000;
 
+let intervalOverrideForTests: number | undefined;
+
+/**
+ * Test seam: the interval a writer created after this call uses when its
+ * caller passes none, i.e. the runtime's. A runtime row can then tell a flush
+ * from the timer structurally instead of against a wall clock that box load
+ * stretches (brick://5e7c2a85). `undefined` restores the default.
+ */
+export function setSubagentRecordSaveIntervalForTests(intervalMs: number | undefined): void {
+  intervalOverrideForTests = intervalMs;
+}
+
 export interface SubagentBoundaryWriter {
   /**
    * Record `childRecord` as the child's latest state. It is saved within one
@@ -83,7 +95,8 @@ export function createSubagentBoundaryWriteEnqueuer(deps: {
   onWriteError: (childAcpxRecordId: string, error: unknown) => void;
   intervalMs?: number;
 }): SubagentBoundaryWriter {
-  const intervalMs = deps.intervalMs ?? SUBAGENT_RECORD_SAVE_INTERVAL_MS;
+  const intervalMs =
+    deps.intervalMs ?? intervalOverrideForTests ?? SUBAGENT_RECORD_SAVE_INTERVAL_MS;
   const children = new Map<string, ChildSaveState>();
 
   const startSave = (childAcpxRecordId: string, state: ChildSaveState): void => {
