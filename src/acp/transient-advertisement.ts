@@ -2,10 +2,12 @@
  * Read what an adapter ADVERTISES for a new session — its `config_options` —
  * by opening a transient ACP session and closing it again.
  *
- * ONE implementation, two callers: `listAgentOutputStyles` (acpx-ui's create
- * dialog, brick://874fee67 §4.2 #40) and the Claude model-advertisement probe
- * (`src/models/claude-advertisement.ts`, brick ebfe4c3c). Factored out so the
- * second caller reuses the measured path instead of re-implementing it.
+ * ONE implementation, three callers: `listAgentOutputStyles` (acpx-ui's create
+ * dialog, brick://874fee67 §4.2 #40), the Claude model-advertisement probe
+ * (`src/models/claude-advertisement.ts`, brick ebfe4c3c) and `acpx <agent>
+ * model-catalogue` (the adapter's `models` advertisement, brick 574b137e — it
+ * replaced acpx-ui creating, statusing and pruning a throwaway Codex session).
+ * Factored out so every caller reuses the measured path.
  *
  * What the path costs, MEASURED 2026-10-02 on the deployed claude-agent-acp
  * (CONTRACT §4.1): only `initialize` + `session/new` cross the wire — **no prompt
@@ -21,10 +23,9 @@
  */
 
 import path from "node:path";
-import type { SessionConfigOption } from "@agentclientprotocol/sdk";
 import { withTimeout } from "../async-control.js";
 import type { AcpClientOptions } from "../types.js";
-import { AcpClient } from "./client.js";
+import { AcpClient, type SessionCreateResult } from "./client.js";
 
 export type TransientAdvertisementOptions = Pick<
   AcpClientOptions,
@@ -37,10 +38,10 @@ export type TransientAdvertisementOptions = Pick<
   | "sessionContext"
 > & { timeoutMs?: number };
 
-/** Open, read `configOptions` off `session/new`, close. Never prompts; writes no record. */
+/** Open, read the advertisement off `session/new`, close. Never prompts; writes no record. */
 export async function readTransientAdvertisement(
   options: TransientAdvertisementOptions,
-): Promise<SessionConfigOption[] | undefined> {
+): Promise<Pick<SessionCreateResult, "configOptions" | "models">> {
   const cwd = path.resolve(options.cwd);
   const client = new AcpClient({
     agentCommand: options.agentCommand,
@@ -57,7 +58,7 @@ export async function readTransientAdvertisement(
   try {
     await withTimeout(client.start(), options.timeoutMs);
     const created = await withTimeout(client.createSession(cwd), options.timeoutMs);
-    return created.configOptions;
+    return { configOptions: created.configOptions, models: created.models };
   } finally {
     await client.close().catch(() => {
       // Enumeration is read-only; a close failure must not mask the answer.

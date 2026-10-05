@@ -489,7 +489,7 @@ export async function probeClaudeAdvertisement(params: {
   // Loaded on demand: the catalogue (and so the session-create path) reads this
   // module for its cache, and must not pay for the ACP client to do so.
   const { readTransientAdvertisement } = await import("../acp/transient-advertisement.js");
-  const configOptions = await readTransientAdvertisement({
+  const { configOptions } = await readTransientAdvertisement({
     agentCommand: params.agentCommand,
     cwd,
     authCredentials: params.authCredentials,
