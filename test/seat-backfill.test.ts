@@ -174,6 +174,19 @@ async function backfill(homeDir: string, extra: string[] = []): Promise<Backfill
   return JSON.parse(result.stdout.trim()) as BackfillJson;
 }
 
+/** For the rows whose subject IS a per-record refusal: an apply that refused something exits 1
+ * (the owner's window reads the rc) AND still prints its whole report on stdout. */
+async function backfillRefusing(homeDir: string, extra: string[] = []): Promise<BackfillJson> {
+  const result = await runCli(["seats", "backfill", "--format", "json", ...extra], homeDir);
+  assert.equal(
+    result.code,
+    1,
+    `a refusing apply must exit 1, got ${result.code}: ${result.stderr}`,
+  );
+  assert.match(result.stderr, /refused or failed during --apply/);
+  return JSON.parse(result.stdout.trim()) as BackfillJson;
+}
+
 function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
   return withTempHomeFixture("acpx-seat-backfill-", run);
 }
@@ -563,7 +576,7 @@ test("R2b: the backfill REFUSES to overwrite a malformed ROW and carries it verb
     const corruptRow = { seat_id: seatId, created_at: "2026-01-01T00:00:00.000Z", next_ordinal: 2 };
     await fs.writeFile(storePath, `${JSON.stringify({ [seatId]: corruptRow })}\n`, "utf8");
 
-    const report = await backfill(homeDir, ["--apply"]);
+    const report = await backfillRefusing(homeDir, ["--apply"]);
     assert.equal(report.seats, 0, "a malformed row must not be minted over");
     assert.equal(report.errors.length, 1);
     assert.equal(
@@ -973,7 +986,7 @@ test("L12: an abort between the legs leaves NO index entry claiming a seat its r
       makeRecord({ acpxRecordId: "l12-control" }),
     ]);
 
-    const report = await backfill(homeDir, ["--apply"]);
+    const report = await backfillRefusing(homeDir, ["--apply"]);
 
     // The control produced a non-zero result…
     assert.equal(report.seats, 1, "the control record was not seated — the run did nothing");
@@ -1021,7 +1034,7 @@ test("L12b: a record whose ROLLBACK COPY cannot be taken is skipped, not written
       makeRecord({ acpxRecordId: "l12b-control" }),
     ]);
 
-    const report = await backfill(homeDir, ["--apply"]);
+    const report = await backfillRefusing(homeDir, ["--apply"]);
 
     assert.equal(report.seats, 1, "the run aborted — the other records were not processed");
     assert.equal(typeof (await readRecordJson(homeDir, "l12b-control")).seat_id, "string");
@@ -2785,22 +2798,17 @@ test("N6: `seats rename` re-projects the seat's name onto its holders' index ent
 
 // ─── X — an apply with refused records must not exit 0 ───────────────────────
 
-/** A brick-linked record: its rewrite goes through the outbox, which refuses it when the HOME's
- * `instance.json` names another home — the failure the TE measured on a copy of a store. */
+/** A record the outbox REFUSES to rewrite: its `spawn_key` names a reservation no spawn attempt in
+ * this HOME's outbox owns ("record-ownership") — the same refusal the TE measured when a copied
+ * store was applied under another HOME. Every other record writes normally. */
 async function seedRefusedRig(homeDir: string): Promise<void> {
   await seed(homeDir, [
     makeRecord({
       acpxRecordId: "x-refused",
-      metadata: { brick: "22222222-2222-4222-8222-222222222222" },
+      metadata: { spawn_key: "cc164a178cc50fe894b6d98267050d8c", spawn_state: "published" },
     }),
     makeRecord({ acpxRecordId: "x-fine" }),
   ]);
-  await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
-  await fs.writeFile(
-    path.join(homeDir, ".acpx", "instance.json"),
-    JSON.stringify({ instance_id: "i-0123456789ab", home: "/somewhere/else" }),
-    "utf8",
-  );
 }
 
 test("X1: an apply whose records are REFUSED exits NON-zero with the reason on stderr (the report still prints)", async () => {
@@ -2814,7 +2822,7 @@ test("X1: an apply whose records are REFUSED exits NON-zero with the reason on s
     );
     assert.notEqual(result.code, 0, "an apply that refused records exited 0");
     assert.match(result.stderr, /x-refused\.json/, "stderr names the refused record");
-    assert.match(result.stderr, /instance identity/i, "stderr carries the reason");
+    assert.match(result.stderr, /record-ownership|does not own/i, "stderr carries the reason");
   });
 });
 

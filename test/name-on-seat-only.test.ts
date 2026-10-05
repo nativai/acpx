@@ -51,8 +51,8 @@ const ALLOWED_NAME_READS: ReadonlyMap<string, { count: number; why: string }> = 
   [
     "session/persistence/index.ts",
     {
-      count: 5,
-      why: "the index's own plumbing: parseIndexEntry preserves the projected `name` (1), the seat-name projection compares it (1), and three fs Dirent names in the record-file enumeration",
+      count: 7,
+      why: "the index's own plumbing: parseIndexEntry preserves the projected `name` when present (3 reads of the raw entry's key), the seat-name projection compares it (1), and three fs Dirent names in the record-file enumeration",
     },
   ],
   [
