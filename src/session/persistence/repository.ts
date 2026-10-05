@@ -678,9 +678,10 @@ async function updateIndexForWrittenRecord(
  * matters: the production contention is the PARENT record's write against the CHILD
  * record's — different ids, one DB.
  *
- * The chain shape is the one already proven per-child in
- * `cli/session/subagent-boundary-write.ts` — including its lesson about never leaving a
- * derived promise unhandled, which killed nine queue owners on 2026-09-22.
+ * The chain shape is the one first proven per-child in
+ * `cli/session/subagent-boundary-write.ts` (since coalesced, brick://5e7c2a85) — including
+ * its lesson about never leaving a derived promise unhandled, which killed nine queue
+ * owners on 2026-09-22.
  */
 let recordWriteChain: Promise<void> = Promise.resolve();
 const insideRecordWrite = new AsyncLocalStorage<true>();
