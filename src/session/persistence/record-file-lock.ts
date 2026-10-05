@@ -36,40 +36,15 @@ import os from "node:os";
  * than that bound, so a waiting writer clears an orphan itself instead of refusing. A same-host,
  * same-boot holder that is provably ALIVE is never broken at any age.
  *
- * Breaking a stale lock is ACQUIRING it (exclusive removal, then the atomic create), never
+ * Breaking a stale lock is ACQUIRING it (compare-and-delete, then the atomic create), never
  * writing without it.
- *
- * 🛑 FENCED, BECAUSE A REMOVAL CAN TAKE THE WRONG FILE. Several waiters judge one dead holder at once;
- * one removes it, a contender links a fresh lock, and a second remover — whose judgement predates
- * that — takes the FRESH lock (te-A attack E). No removal scheme on a path can rule that out, and
- * putting a taken lock back is worse: the hand-back can re-create a lock its holder already
- * released, a phantom naming a live pid that nothing may break (te-A F2, brick eb4c8d06). So:
- *  - every acquisition writes a unique `nonce` into its lock;
- *  - every removal (stale break and release) `rename`s the lock to a private tombstone, which is
- *    atomic, and deletes it. A breaker that finds it took a lock other than the one it judged puts
- *    NOTHING back — it re-judges from scratch; a release only ever starts on a lock carrying its own
- *    nonce;
- *  - the HOLDER is fenced: `fence()` re-reads the lock SYNCHRONOUSLY immediately before the
- *    record's commit rename and throws unless the lock still carries the holder's nonce. The caller
- *    issues the commit rename synchronously right after it, so no event-loop turn separates them. `withRecordFileLock` then
- *    re-runs the whole attempt — acquire, fresh read, merge, commit — so a holder whose lock was
- *    taken never commits on a stale read.
- * The window left is the holder's own fence-read -> commit-rename: two back-to-back syscalls
- * (measured with an awaited fence + awaited rename: p99 9 ms, max 59 ms at load1 19 — which is why
- * both are synchronous; see the fence-window probe in brick eb4c8d06 verification/probes).
  */
 
 const RECORD_LOCK_BUDGET_MS = 20_000;
 const RECORD_LOCK_STALE_MS = 15_000;
 const RECORD_LOCK_CAP_MS = 50;
 
-type LockHolder = {
-  pid: number;
-  start: string | null;
-  host: string | null;
-  boot: string | null;
-  nonce: string | null;
-};
+type LockHolder = { pid: number; start: string | null; host: string | null; boot: string | null };
 
 function bootId(): string | null {
   try {
@@ -147,7 +122,6 @@ async function readHolder(lockPath: string): Promise<ReadHolder | null> {
         start: parsed.start ?? null,
         host: parsed.host ?? null,
         boot: parsed.boot ?? null,
-        nonce: parsed.nonce ?? null,
       },
     };
   } catch {
@@ -198,94 +172,37 @@ function warnIfUnjudged(lockPath: string, reason: string, current: ReadHolder): 
   );
 }
 
-/** Reads the nonce currently at the lock path, or null. */
-async function nonceAt(lockPath: string): Promise<string | null> {
-  try {
-    return parseHolder(await fs.readFile(lockPath, "utf8")).nonce ?? null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Takes whatever lock file is at the path — atomically, so of several concurrent removers exactly
- * one gets it — deletes it, and returns its content (null if the path was already empty). Never
- * puts anything back: a caller that took the wrong lock must re-judge, and a holder that lost its
- * lock is caught by its fence.
- */
-async function takeLock(lockPath: string): Promise<string | null> {
-  const tombstone = `${lockPath}.${process.pid}.${randomUUID()}.removed`;
-  try {
-    await fs.rename(lockPath, tombstone);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return null;
-    }
-    throw error;
-  }
-  try {
-    return await fs.readFile(tombstone, "utf8");
-  } finally {
-    await fs.rm(tombstone, { force: true });
-  }
-}
-
-/** The lock at the path if it may be broken now, re-checked once so a just-replaced lock is skipped. */
-async function judgeBreakable(
-  lockPath: string,
-): Promise<{ current: ReadHolder | null; reason: string | null; changed: boolean }> {
+/** Removes a breakable lock — compare-and-delete on its content, so a fresh holder is never hit. */
+async function breakStaleHolder(lockPath: string): Promise<{ broken: boolean; holder: string }> {
   const current = await readHolder(lockPath);
   const reason = current ? breakReason(current) : null;
   if (!current || !reason) {
-    return { current, reason: null, changed: false };
+    return { broken: false, holder: current?.raw ?? "unreadable holder" };
   }
+  warnIfUnjudged(lockPath, reason, current);
   const again = await readHolder(lockPath);
-  return { current, reason, changed: again?.raw !== current.raw };
+  if (again?.raw === current.raw) {
+    await fs.rm(lockPath, { force: true });
+  }
+  return { broken: true, holder: current.raw };
 }
 
-/** Removes a breakable lock. Returns retry=true when the lock path should be re-tried at once. */
-async function breakStaleHolder(lockPath: string): Promise<{ retry: boolean; holder: string }> {
-  const { current, reason, changed } = await judgeBreakable(lockPath);
-  const holder = current?.raw ?? "unreadable holder";
-  if (!current || !reason || changed) {
-    return { retry: changed, holder };
-  }
-  if ((await takeLock(lockPath)) === current.raw) {
-    warnIfUnjudged(lockPath, reason, current);
-  }
-  // Taken the judged lock, found the path empty, or took a fresh lock by mistake: in every case
-  // nothing is put back, and the loop re-judges from scratch.
-  return { retry: true, holder };
-}
-
-class RecordLockFenceLost extends Error {}
-
-function nonceAtSync(lockPath: string): string | null {
-  try {
-    return parseHolder(readFileSync(lockPath, "utf8")).nonce ?? null;
-  } catch {
-    return null;
-  }
-}
-
-/** Releases our lock: only a lock carrying our nonce is ever taken. */
-async function release(lockPath: string, nonce: string): Promise<void> {
-  if ((await nonceAt(lockPath)) !== nonce) {
-    return;
-  }
-  const taken = await takeLock(lockPath);
-  if (taken !== null && parseHolder(taken).nonce !== nonce) {
-    // Our lock was replaced in the read -> rename instant; the lock we took belongs to a holder
-    // whose fence will now refuse its commit and retry. Nothing is put back.
-    process.stderr.write(`[acpx] WARNING: released a foreign session record lock ${lockPath}\n`);
-  }
-}
-
-async function acquire(lockPath: string, content: string, started: number): Promise<void> {
+export async function withRecordFileLock<T>(
+  recordFile: string,
+  action: () => Promise<T>,
+): Promise<T> {
+  const lockPath = `${recordFile}.lock`;
+  const content = JSON.stringify({
+    pid: process.pid,
+    start: processStartTime(process.pid),
+    host: LOCAL_HOST,
+    boot: LOCAL_BOOT,
+  });
+  const started = Date.now();
   let delay = 2 + Math.floor(Math.random() * 3);
   while (!(await tryAcquire(lockPath, content))) {
-    const { retry, holder } = await breakStaleHolder(lockPath);
-    if (retry) {
+    const { broken, holder } = await breakStaleHolder(lockPath);
+    if (broken) {
       continue;
     }
     if (Date.now() - started >= RECORD_LOCK_BUDGET_MS) {
@@ -294,44 +211,9 @@ async function acquire(lockPath: string, content: string, started: number): Prom
     await new Promise((resolve) => setTimeout(resolve, delay));
     delay = Math.min(RECORD_LOCK_CAP_MS, delay * 2 + Math.floor(Math.random() * 3));
   }
-}
-
-/**
- * Runs `action` holding the record's lock. `action` MUST call `fence()` — synchronous — and then
- * its commit (the record's temp -> rename) SYNCHRONOUSLY with nothing awaited in between, and must
- * be safe to re-run from scratch: when the fence finds the lock no longer ours, the whole attempt —
- * acquire, read, merge, commit — runs again.
- */
-export async function withRecordFileLock<T>(
-  recordFile: string,
-  action: (fence: () => void) => Promise<T>,
-): Promise<T> {
-  const lockPath = `${recordFile}.lock`;
-  const started = Date.now();
-  for (;;) {
-    const nonce = randomUUID();
-    const content = JSON.stringify({
-      pid: process.pid,
-      start: processStartTime(process.pid),
-      host: LOCAL_HOST,
-      boot: LOCAL_BOOT,
-      nonce,
-    });
-    await acquire(lockPath, content, started);
-    const fence = (): void => {
-      if (nonceAtSync(lockPath) !== nonce) {
-        throw new RecordLockFenceLost();
-      }
-    };
-    try {
-      return await action(fence);
-    } catch (error) {
-      if (!(error instanceof RecordLockFenceLost)) {
-        throw error;
-      }
-      // Our lock was taken while we held it; nothing was committed. Start over.
-    } finally {
-      await release(lockPath, nonce);
-    }
+  try {
+    return await action();
+  } finally {
+    await fs.rm(lockPath, { force: true });
   }
 }
