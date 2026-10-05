@@ -59,15 +59,28 @@ export function requiresBrickOutbox(metadata: Record<string, string> | undefined
     Boolean(metadata?.[key]),
   );
 }
+/**
+ * Opens the outbox for a record write ONLY when the record is a spawn-reserved destination
+ * (`metadata.spawn_key`). Every other record — 1,784 of 1,786 live records on devbox — is
+ * written by the caller's own unique-temp + rename path and never touches
+ * `~/.acpx/brick-outbox.db`.
+ *
+ * 🛑 DO NOT GO BACK TO OPENING IT UNCONDITIONALLY. Until this change every session write on
+ * the box took the ONE box-wide SQLite write lock, so a single queue owner with seven parallel
+ * sub-agents held it ~97 % of the time and every other session on the box got
+ * `outbox-busy` (devbox, 2026-10-05; RCA in brick 7d717c8a). For an ordinary record the lock
+ * bought one thing: the dormant drain barrier (`setDrain` has no caller in acpx or acpx-ui,
+ * and acpx-ui already writes ordinary records without the outbox — conception brief
+ * 3cabbcf4 §Q1/§Q2). Spawn records keep the outbox because their ownership guard
+ * (`assertOwnership`'s `spawn_attempt` query) and `spawn_state` carry-forward need it.
+ */
 export function openRecordOutbox(
-  _metadata: Record<string, string> | undefined,
+  metadata: Record<string, string> | undefined,
   directory = path.join(os.homedir(), ".acpx", "sessions"),
 ): BrickOutbox | undefined {
-  if (!isCanonicalSessionDirectory(directory)) {
+  if (!metadata?.spawn_key || !isCanonicalSessionDirectory(directory)) {
     return undefined;
   }
-  // C0 §1.4/§7.1: exclusion applies to canonical writers even before projection binding.
-  // Opening unconditionally removes the existence-check race with a concurrent drain entry.
   return new BrickOutbox();
 }
 export function isCanonicalSessionDirectory(directory: string): boolean {
@@ -115,6 +128,39 @@ function retryOnBusy<T>(op: () => T): T {
         throw error; // translate() maps an exhausted busy to outbox-busy, as before
       }
       sleepSync(Math.min(OUTBOX_RETRY_CAP_MS, delay));
+      delay = Math.min(
+        OUTBOX_RETRY_CAP_MS,
+        Math.ceil(delay * 1.7) + Math.floor(Math.random() * 25),
+      );
+    }
+  }
+}
+
+/**
+ * `retryOnBusy` with the SAME budget and backoff, but waiting with a timer instead of
+ * `Atomics.wait`, so a contender yields the event loop instead of freezing it.
+ *
+ * 🛑 THIS IS WHY IT EXISTS, AND WHY THE ASYNC PATHS MUST NOT GO BACK TO `retryOnBusy`.
+ * `withAsyncMutation` holds `BEGIN IMMEDIATE` across an `await`, so the holder needs the event
+ * loop to reach `COMMIT`. A same-process contender that waits with `Atomics.wait` takes the loop
+ * away from it: the holder cannot commit until the contender gives up after its whole 4 s budget,
+ * and every other process on the box is locked out for that time (devbox 2026-10-05, brick
+ * eb4c8d06: one queue owner held the lock ~97 % of the time in 4.2 s / 8.2 s blocks). A timer
+ * wait lets the holder run, commit, and release within milliseconds.
+ * `test/outbox-async-wait.test.ts` goes red if an async caller waits synchronously again.
+ */
+async function retryOnBusyAsync<T>(op: () => T): Promise<T> {
+  const started = Date.now();
+  let delay = 10 + Math.floor(Math.random() * 16);
+  for (;;) {
+    try {
+      return op();
+    } catch (error) {
+      const waited = Date.now() - started;
+      if (!isBusyAcquisitionError(error) || waited >= OUTBOX_RETRY_BUDGET_MS) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(OUTBOX_RETRY_CAP_MS, delay)));
       delay = Math.min(
         OUTBOX_RETRY_CAP_MS,
         Math.ceil(delay * 1.7) + Math.floor(Math.random() * 25),
@@ -1207,6 +1253,27 @@ export class BrickOutbox {
     }
   }
 
+  /** `locked()` for async callers: the lock is acquired with a yielding wait, the action stays synchronous. */
+  private async lockedAsync<T>(action: () => T): Promise<T> {
+    let acquired = false;
+    try {
+      await this.beginImmediateWithRetryAsync();
+      acquired = true;
+      const result = action();
+      if (result instanceof Promise) {
+        throw new Error("outbox transaction requires synchronous action");
+      }
+      this.db.exec("COMMIT");
+      acquired = false;
+      return result;
+    } catch (error) {
+      if (acquired) {
+        this.db.exec("ROLLBACK");
+      }
+      throw this.translate(error);
+    }
+  }
+
   private meta(key: string): string | null {
     const row = this.db.prepare("SELECT value FROM meta WHERE key=?").get(key);
     return row ? String(row.value) : null;
@@ -1317,11 +1384,16 @@ export class BrickOutbox {
       this.db.exec("BEGIN IMMEDIATE");
     });
   }
+  private async beginImmediateWithRetryAsync(): Promise<void> {
+    await retryOnBusyAsync(() => {
+      this.db.exec("BEGIN IMMEDIATE");
+    });
+  }
 
   private async withAsyncMutation<T>(action: () => Promise<T>): Promise<T> {
     let acquired = false;
     try {
-      this.beginImmediateWithRetry();
+      await this.beginImmediateWithRetryAsync();
       acquired = true;
       this.refuseDrain();
       const result = await action();
@@ -1342,16 +1414,21 @@ export class BrickOutbox {
     writer: DiskRecord,
     build: (current: DiskRecord | undefined) => DiskRecord,
   ): DiskRecord {
-    return this.locked(() => {
-      this.refuseDrain();
-      const current = this.readRecord(id);
-      this.assertOwnership(id, writer, current);
-      const result = build(current);
-      this.assertOwnership(id, result, current);
-      preserveWriterUnownedMetadata(result, current);
-      writeRecordAtomic(this.recordPath(id), result);
-      return result;
-    });
+    return this.locked(() => this.writeOwnedRecordLocked(id, writer, build));
+  }
+  private writeOwnedRecordLocked(
+    id: string,
+    writer: DiskRecord,
+    build: (current: DiskRecord | undefined) => DiskRecord,
+  ): DiskRecord {
+    this.refuseDrain();
+    const current = this.readRecord(id);
+    this.assertOwnership(id, writer, current);
+    const result = build(current);
+    this.assertOwnership(id, result, current);
+    preserveWriterUnownedMetadata(result, current);
+    writeRecordAtomic(this.recordPath(id), result);
+    return result;
   }
   /**
    * Persists a session record under the outbox's write mutex and ownership guard.
@@ -1368,6 +1445,16 @@ export class BrickOutbox {
    * Full rationale: brick c141eaab, `verification/OUTBOX-DECISION.md`.
    */
   saveRecord(record: DiskRecord): DiskRecord {
+    this.checkSaveIdentity(record);
+    return this.writeOwnedRecord(String(record.acpx_record_id), record, () => record);
+  }
+  /** `saveRecord` for async callers — identical, but waits for the lock without blocking the loop. */
+  async saveRecordAsync(record: DiskRecord): Promise<DiskRecord> {
+    this.checkSaveIdentity(record);
+    const id = String(record.acpx_record_id);
+    return await this.lockedAsync(() => this.writeOwnedRecordLocked(id, record, () => record));
+  }
+  private checkSaveIdentity(record: DiskRecord): void {
     if (
       !unpublishedRecord(record) &&
       (this.isBound() ||
@@ -1388,7 +1475,6 @@ export class BrickOutbox {
       // `test/brick-outbox-wedge-detect.test.ts` goes red if this call is removed.
       this.identityForRecord(record);
     }
-    return this.writeOwnedRecord(String(record.acpx_record_id), record, () => record);
   }
 
   prepareProjection(

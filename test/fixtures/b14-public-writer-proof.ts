@@ -63,38 +63,38 @@ try {
   assert.equal(outbox.readRecord(id)?.name, "positive writer control");
   const stale = parseSessionRecord({ ...raw, metadata: {}, name: "stale writer" });
   assert.ok(stale);
+  // 🛑 AN ORDINARY RECORD WRITE NO LONGER OPENS THE OUTBOX (brick eb4c8d06), so an active drain
+  // cannot refuse it. Until 2026-10-05 this leg asserted the opposite, and that is exactly what
+  // made every session write on the box take the ONE box-wide SQLite write lock: one queue owner
+  // with seven sub-agents held it ~97 % of the time and every other session got `outbox-busy`.
+  // The drain it protected is dormant (`setDrain` has no caller in acpx or acpx-ui, and acpx-ui
+  // already wrote ordinary records without the outbox). A write that LANDS while the drain is set
+  // is the behavioural proof that it never touched `brick-outbox.db` — any outbox mutation would
+  // have been refused `maintenance`. Spawn records still consult the drain (`B14 drain`).
   outbox.setDrain("public-writer-control");
-  let refused = false;
-  try {
-    await save(stale);
-  } catch (error) {
-    refused = (error as { code?: string }).code === "maintenance";
-    if (!refused) {
-      throw error;
-    }
-  }
+  await save(stale);
   operations++;
   const observed = outbox.readRecord(id);
   process.stdout.write(
-    `${JSON.stringify({ mode, actors: 1, operations, refused, name: observed?.name, metadata: observed?.metadata })}\n`,
+    `${JSON.stringify({ mode, actors: 1, operations, name: observed?.name, metadata: observed?.metadata })}\n`,
   );
   assert.equal(
-    refused,
-    true,
-    "a metadata-dropped writer must still consult the active outbox drain",
+    observed?.name,
+    "stale writer",
+    "an ordinary record write was refused or redirected while a drain was set — it consulted the outbox",
   );
-  assert.equal(observed?.name, "positive writer control");
-  assert.equal(observed?.metadata?.brick, brick);
   if (mode === "state-home") {
     process.env.ACPX_STATE_HOME = path.join(os.homedir(), "alternate-state-home");
-    await writeSessionRecordWithLifecycle(stale);
+    const stateHomeWrite = parseSessionRecord({ ...raw, metadata: {}, name: "state-home writer" });
+    assert.ok(stateHomeWrite);
+    await writeSessionRecordWithLifecycle(stateHomeWrite);
     const alternate = createFileSessionStore({
       stateDir: path.join(process.env.ACPX_STATE_HOME, ".acpx"),
     });
-    assert.equal((await alternate.load(id))?.name, "stale writer");
+    assert.equal((await alternate.load(id))?.name, "state-home writer");
     assert.equal(
       outbox.readRecord(id)?.name,
-      "positive writer control",
+      "stale writer",
       "state-home writes must not be redirected into HOME",
     );
     delete process.env.ACPX_STATE_HOME;
@@ -106,7 +106,6 @@ try {
     "stale writer",
     "a genuinely non-overlapping custom store is not the canonical writer",
   );
-  assert.equal(outbox.readRecord(id)?.name, "positive writer control");
 } finally {
   outbox.close();
   if (operations === 0) {

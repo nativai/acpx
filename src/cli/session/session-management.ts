@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
 import {
   AcpClient,
@@ -12,7 +15,6 @@ import {
 } from "../../acp/harness-capabilities.js";
 import { readTransientAdvertisement } from "../../acp/transient-advertisement.js";
 import { withInterrupt, withTimeout } from "../../async-control.js";
-import { BrickOutbox } from "../../brick-outbox.js";
 import { bindDefaultAccountToSessionOptionsAsync } from "../../runtime/engine/default-account-binding.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
 import { persistSessionOptions } from "../../runtime/engine/session-options.js";
@@ -125,17 +127,16 @@ async function createSessionRecordWithClient(
   options: SessionCreateOptions,
 ): Promise<SessionRecord> {
   const cwd = absolutePath(options.cwd);
-  if (options.recordId) {
-    const outbox = new BrickOutbox();
-    try {
-      if (outbox.readRecord(options.recordId)) {
-        throw new Error(
-          "record-id destination already exists; refusing to create another ACP session",
-        );
-      }
-    } finally {
-      outbox.close();
-    }
+  // A plain existence check on the same path `BrickOutbox.recordPath` resolves. It must NOT
+  // construct a `BrickOutbox`: the constructor takes the box-wide outbox write lock, which put
+  // every `sessions new --record-id` behind whichever queue owner held it (brick eb4c8d06).
+  if (
+    options.recordId &&
+    fs.existsSync(
+      path.join(os.homedir(), ".acpx", "sessions", `${encodeURIComponent(options.recordId)}.json`),
+    )
+  ) {
+    throw new Error("record-id destination already exists; refusing to create another ACP session");
   }
   await withTimeout(client.start(), options.timeoutMs);
   let sessionId: string;

@@ -67,7 +67,7 @@ class FileSessionStore implements AcpSessionStore {
     if (outbox) {
       try {
         const raw = persisted as DiskRecord;
-        outbox.saveRecord(raw);
+        await outbox.saveRecordAsync(raw);
       } finally {
         outbox.close();
       }

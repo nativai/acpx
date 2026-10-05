@@ -766,7 +766,7 @@ async function persistRecordFile(
   outbox: BrickOutbox | undefined,
 ): Promise<DiskRecord> {
   if (outbox) {
-    return outbox.saveRecord(raw);
+    return await outbox.saveRecordAsync(raw);
   }
   const temporary = `${file}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
   await fs.writeFile(temporary, `${JSON.stringify(raw)}\n`, "utf8");
