@@ -386,11 +386,7 @@ type WriteAuthoritativeFields = { parent?: true };
  * ⚠️ DO NOT "simplify" this to `writeSessionRecordWithLifecycle`. That bypass
  * disables preservation for EVERY lifecycle field, so a concurrent rename, close or
  * favourite-toggle landing in the read→write window is lost — a bigger hole than
- * the one this closes. Nor pass a doctored snapshot through
- * `writeSessionRecordWithPersistedLifecycle`: that works only by feeding the
- * preserve mechanism a lie, and a later refactor pointing
- * `applyPersistedLifecycleForWrite` at `freshPersisted` — which reads like a bug
- * fix — would silently revert set-parent to a no-op.
+ * the one this closes.
  */
 export async function writeSessionRecordAuthorizingParent(record: SessionRecord): Promise<void> {
   await writeSessionRecordInternal(record, {
@@ -438,25 +434,6 @@ export async function writeSessionRecordAuthorizingParentWithoutIndex(
     preserveLifecycle: true,
     authoritative: { parent: true },
     skipIndexUpdate: true,
-  });
-}
-
-/**
- * Preserving write variant for callers that already hold the persisted
- * lifecycle from a fresh `readPersistedLifecycle` read. Metadata is still
- * reread inside the write so external metadata patches survive stale owner
- * checkpoints (W11). Semantics are otherwise identical to `writeSessionRecord`;
- * `persisted` may be undefined when the file was missing ("no prior state to
- * preserve").
- */
-export async function writeSessionRecordWithPersistedLifecycle(
-  record: SessionRecord,
-  persisted: PersistedSessionLifecycle | undefined,
-): Promise<void> {
-  await writeSessionRecordInternal(record, {
-    messagePersistence: "checkpoint",
-    preserveLifecycle: true,
-    persisted: { value: persisted },
   });
 }
 
@@ -609,9 +586,6 @@ async function writeSessionRecordInternal(
   options: {
     messagePersistence: "checkpoint" | "boundary";
     preserveLifecycle: boolean;
-    /** Wrapper distinguishes "caller provided a read result (possibly
-     * undefined)" from "not provided — read from disk here". */
-    persisted?: { value: PersistedSessionLifecycle | undefined };
     /** Field groups this write is AUTHORITATIVE for — preserved for every other
      * field, taken from the in-memory record for these. See
      * `writeSessionRecordAuthorizingParent`. */
@@ -641,20 +615,24 @@ async function writeSessionRecordInternal(
   await measurePerf("session.write_record", async () => {
     await ensureSessionDir();
 
-    const persistedLifecycle = options.persisted
-      ? options.persisted.value
-      : await readPersistedLifecycle(record.acpxRecordId);
-    // When the caller supplied a (possibly stale) lifecycle snapshot, reread the
-    // on-disk record ONCE so both metadata AND the pinned model merge against the
-    // freshest concurrent state rather than the caller's snapshot. Otherwise the
-    // fresh lifecycle read above already holds current disk state — no extra read.
-    const freshPersisted = options.persisted
-      ? await readPersistedLifecycle(record.acpxRecordId)
-      : persistedLifecycle;
+    const sessionDir = sessionBaseDir();
+    const logPath = messagesLogPath(sessionDir, record.acpxRecordId);
+    await writeMessagesSidecar(record, logPath, options.messagePersistence === "boundary");
+
+    // 🛑 THE DISK READ THAT EVERY MERGE BELOW USES IS TAKEN HERE — AFTER THE MESSAGES-LOG FLUSH,
+    // IMMEDIATELY BEFORE THE TEMP-WRITE + RENAME — AND THAT PLACEMENT IS THE FIX (brick eb4c8d06).
+    // Session writes no longer go through any lock, so two processes writing one record are
+    // ordered only by these merges. Read before the flush (as it was, or from a snapshot the
+    // CALLER read even earlier, which the live checkpoint passed in until 2026-10-05), a close,
+    // re-parent, favourite or metadata patch landing during the flush was overwritten by this
+    // write: measured 1-13 lost updates per 20 cross-process ops per pair
+    // (`test/outbox-writer-pairs.test.ts`). Moving the read here shrinks the window to
+    // read -> rename. Do not hoist it back above the flush, and do not feed it a caller's snapshot.
+    const freshPersisted = await readPersistedLifecycle(record.acpxRecordId);
     const persistedMetadata = freshPersisted?.metadata;
 
     if (options.preserveLifecycle) {
-      applyPersistedLifecycleForWrite(record, persistedLifecycle);
+      applyPersistedLifecycleForWrite(record, freshPersisted);
     }
     // 🛑 THE PARENT LINKAGE, PRESERVED UNCONDITIONALLY — OUTSIDE the branch above,
     // and that placement IS the fix (see `preserveParentLinkageForPersist`). The
@@ -698,9 +676,6 @@ async function writeSessionRecordInternal(
     // so there is no write this can wrongly suppress.
     preserveLastTurnProviderForPersist(record, freshPersisted?.acpx);
 
-    const sessionDir = sessionBaseDir();
-    const logPath = messagesLogPath(sessionDir, record.acpxRecordId);
-    await writeMessagesSidecar(record, logPath, options.messagePersistence === "boundary");
     // Only a spawn-owned record (metadata.spawn_key) opens the spawn ledger; every other
     // record write stays off SQLite entirely.
     const ledger = openSpawnLedgerForRecord(record.metadata, sessionDir);

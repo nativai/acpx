@@ -107,7 +107,7 @@ test("mergeMetadataForPersist without a baseline overlays current keys without c
   );
 });
 
-test("writeSessionRecordWithPersistedLifecycle rereads metadata before persisting", async () => {
+test("a stale owner checkpoint rereads metadata before persisting", async () => {
   await withTempHome("acpx-metadata-merge-", async () => {
     const persistence = await loadPersistence();
     const owner = record("fresh-metadata", {
@@ -116,8 +116,7 @@ test("writeSessionRecordWithPersistedLifecycle rereads metadata before persistin
     await persistence.writeSessionRecord(owner);
 
     const staleOwnerRecord = await persistence.resolveSessionRecord("fresh-metadata");
-    const staleLifecycle = await persistence.readPersistedLifecycle("fresh-metadata");
-    assert.equal(staleLifecycle?.metadata?.brick, "old-brick");
+    assert.equal(staleOwnerRecord.metadata?.brick, "old-brick");
 
     const external = await persistence.resolveSessionRecord("fresh-metadata");
     external.metadata = {
@@ -129,7 +128,7 @@ test("writeSessionRecordWithPersistedLifecycle rereads metadata before persistin
     await persistence.writeSessionRecord(external);
 
     staleOwnerRecord.lastUsedAt = "2026-07-03T00:00:00.000Z";
-    await persistence.writeSessionRecordWithPersistedLifecycle(staleOwnerRecord, staleLifecycle);
+    await persistence.writeSessionRecord(staleOwnerRecord);
 
     const onDisk = await persistence.resolveSessionRecord("fresh-metadata");
     assert.deepEqual(onDisk.metadata, {

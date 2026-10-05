@@ -2,9 +2,10 @@
  * Same-record WRITER PAIRS across PROCESSES (brick eb4c8d06). Driven by
  * `test/outbox-writer-pairs.test.ts`; both roles share one isolated HOME.
  *
- *   owner <dir> <records>   — a queue owner's live checkpoint, the runtime's exact sequence
- *                             (`runtime.ts` LiveSessionCheckpoint save): pre-read the lifecycle,
- *                             flush, write WITH that pre-read snapshot. Round-robin over the
+ *   owner <dir> <records>   — a queue owner's live checkpoint, the runtime's sequence
+ *                             (`runtime.ts` LiveSessionCheckpoint save): pre-read the lifecycle
+ *                             for its own merges, then `eventWriter.checkpoint()` =
+ *                             `writeSessionRecord`. Round-robin over the
  *                             records, back to back, until `<dir>/stop` exists. Publishes
  *                             per-record write counts to `<dir>/owner.json`.
  *   pair <dir> <kind> <records> — applies ONE op per record (record i gets op i), then waits until
@@ -24,7 +25,6 @@ import {
   readPersistedLifecycle,
   resolveSessionRecord,
   writeSessionRecord,
-  writeSessionRecordWithPersistedLifecycle,
 } from "../../src/session/persistence.js";
 import type { SessionRecord } from "../../src/types.js";
 
@@ -50,12 +50,12 @@ async function runOwner(count: number): Promise<void> {
     const i = turn++ % count;
     const record = records[i];
     try {
-      const persisted = await readPersistedLifecycle(record.acpxRecordId);
+      await readPersistedLifecycle(record.acpxRecordId);
       record.messages.push({
         Agent: { content: [{ Text: `checkpoint ${turn}` }], tool_results: {} },
       });
       record.lastUsedAt = new Date().toISOString();
-      await writeSessionRecordWithPersistedLifecycle(record, persisted);
+      await writeSessionRecord(record);
       writes[i]++;
     } catch (error) {
       const code = (error as { code?: string }).code ?? (error as Error).message;

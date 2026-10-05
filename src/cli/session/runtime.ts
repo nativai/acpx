@@ -2388,13 +2388,14 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       await flushPendingMessages(false);
       record.lastUsedAt = isoNow();
       applyConversation(record, conversation);
-      // One pre-read feeds the closed-state merge and lifecycle preserve; the
-      // write path separately rereads metadata so external metadata patches win
-      // over stale owner state (W11).
+      // This pre-read feeds the owner's own closed-state and preference merges. The write
+      // path does NOT reuse it: it rereads the record right before its rename, so a close,
+      // favourite, rename or metadata patch from another process that lands during this
+      // checkpoint's flush survives it (brick eb4c8d06).
       const persisted = await readPersistedLifecycle(record.acpxRecordId);
       mergeLatestDurablePreferences(persisted);
       applyPersistedClosedState(persisted);
-      await eventWriter.checkpoint({ persistedLifecycle: { value: persisted } });
+      await eventWriter.checkpoint();
     },
     // ⚠️ NO `onError` HERE ON PURPOSE (brick://48aca560). This used to carry one
     // gated behind `options.verbose`, which meant every ordinary queue-owner

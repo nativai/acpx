@@ -48,7 +48,6 @@ export {
   writeSessionRecordAuthorizingParent,
   writeSessionRecordAuthorizingParentWithoutIndex,
   writeSessionRecordWithLifecycle,
-  writeSessionRecordWithPersistedLifecycle,
 } from "./persistence/repository.js";
 export type {
   MigrateSlugsResult,
