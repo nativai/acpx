@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import fs from "node:fs/promises";
+import fs, { type FileHandle } from "node:fs/promises";
 import os from "node:os";
 
 /**
@@ -36,8 +36,18 @@ import os from "node:os";
  * than that bound, so a waiting writer clears an orphan itself instead of refusing. A same-host,
  * same-boot holder that is provably ALIVE is never broken at any age.
  *
- * Breaking a stale lock is ACQUIRING it (compare-and-delete, then the atomic create), never
+ * Breaking a stale lock is ACQUIRING it (exclusive removal, then the atomic create), never
  * writing without it.
+ *
+ * 🛑 EVERY REMOVAL OF THE LOCK FILE GOES THROUGH `removeIfStill` — the stale-break AND the release.
+ * Never `rm` the lock path directly. A read-then-`rm` deletes whatever file is at the path at the
+ * moment of the `rm`, and several waiters judge the same dead holder at once: one breaks it, a
+ * second contender links a fresh lock, and a third waiter whose re-read still saw the dead holder
+ * `rm`s the FRESH lock — two live holders (te-A attack E: 3 overlaps per 1,500 critical sections
+ * with a holder SIGKILLed every 300 ms; `test/record-file-lock.test.ts` "attack E" row). `rename` is
+ * atomic, so exactly one remover takes the file, and it then checks that the file it took is the
+ * one it judged (content + inode + mtime) and hands anything else straight back with `link`, which
+ * never overwrites.
  */
 
 const RECORD_LOCK_BUDGET_MS = 20_000;
@@ -107,26 +117,47 @@ function parseHolder(raw: string): Partial<LockHolder> {
   }
 }
 
-type ReadHolder = { raw: string; ageMs: number; holder: LockHolder };
+/** One lock FILE, identified by content AND inode AND mtime — a fresh file can reuse an inode. */
+type LockSnapshot = { raw: string; ino: number; mtimeMs: number };
 
-async function readHolder(lockPath: string): Promise<ReadHolder | null> {
+/** Reads content and stat through ONE file handle, so both describe the same file. */
+async function snapshot(file: string): Promise<LockSnapshot | null> {
+  let handle: FileHandle | undefined;
   try {
-    const [raw, stat] = await Promise.all([fs.readFile(lockPath, "utf8"), fs.stat(lockPath)]);
-    // Unparseable content is treated as an UNIDENTIFIED holder, so the age bound still clears it.
-    const parsed = parseHolder(raw);
-    return {
-      raw,
-      ageMs: Date.now() - stat.mtimeMs,
-      holder: {
-        pid: typeof parsed.pid === "number" ? parsed.pid : -1,
-        start: parsed.start ?? null,
-        host: parsed.host ?? null,
-        boot: parsed.boot ?? null,
-      },
-    };
+    handle = await fs.open(file, "r");
+    const [stat, raw] = await Promise.all([handle.stat(), handle.readFile("utf8")]);
+    return { raw, ino: stat.ino, mtimeMs: stat.mtimeMs };
   } catch {
     return null;
+  } finally {
+    await handle?.close();
   }
+}
+
+function sameLock(a: LockSnapshot | null, b: LockSnapshot): boolean {
+  return a !== null && a.raw === b.raw && a.ino === b.ino && a.mtimeMs === b.mtimeMs;
+}
+
+type ReadHolder = { snapshot: LockSnapshot; raw: string; ageMs: number; holder: LockHolder };
+
+async function readHolder(lockPath: string): Promise<ReadHolder | null> {
+  const current = await snapshot(lockPath);
+  if (!current) {
+    return null;
+  }
+  // Unparseable content is treated as an UNIDENTIFIED holder, so the age bound still clears it.
+  const parsed = parseHolder(current.raw);
+  return {
+    snapshot: current,
+    raw: current.raw,
+    ageMs: Date.now() - current.mtimeMs,
+    holder: {
+      pid: typeof parsed.pid === "number" ? parsed.pid : -1,
+      start: parsed.start ?? null,
+      host: parsed.host ?? null,
+      boot: parsed.boot ?? null,
+    },
+  };
 }
 
 /**
@@ -134,19 +165,58 @@ async function readHolder(lockPath: string): Promise<ReadHolder | null> {
  * file and hard-linked to the lock path, which fails with EEXIST if the lock exists. A lock file
  * therefore never exists without the pid that owns it, so it can always be judged dead or alive.
  */
-async function tryAcquire(lockPath: string, content: string): Promise<boolean> {
+async function tryAcquire(lockPath: string, content: string): Promise<LockSnapshot | null> {
   const temporary = `${lockPath}.${process.pid}.${randomUUID()}.tmp`;
   await fs.writeFile(temporary, content, "utf8");
   try {
+    // Snapshot BEFORE the link: the link shares this inode and mtime, so this is exactly the
+    // identity our release must find at the lock path.
+    const mine = await snapshot(temporary);
     await fs.link(temporary, lockPath);
-    return true;
+    return mine;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      return false;
+      return null;
     }
     throw error;
   } finally {
     await fs.rm(temporary, { force: true });
+  }
+}
+
+type Removal = "removed" | "absent" | "not-expected";
+
+/**
+ * Removes the lock file ONLY if it is still `expected`. Exclusive by construction: `rename` moves
+ * whatever is at the path to a name unique to this call, so of several concurrent removers exactly
+ * one gets the file. The taken file is then checked against `expected`; anything else — a fresh
+ * lock a contender linked after another remover took the stale one — is handed back at once with
+ * `link`, which never overwrites. Nothing is put back blindly: if the path is already occupied
+ * again, the taken file is dropped (its holder's lock was gone the moment another remover took the
+ * stale one; restoring over the newer lock would make it worse).
+ */
+async function removeIfStill(lockPath: string, expected: LockSnapshot): Promise<Removal> {
+  const tombstone = `${lockPath}.${process.pid}.${randomUUID()}.removed`;
+  try {
+    await fs.rename(lockPath, tombstone);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return "absent";
+    }
+    throw error;
+  }
+  try {
+    if (sameLock(await snapshot(tombstone), expected)) {
+      return "removed";
+    }
+    await fs.link(tombstone, lockPath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "EEXIST") {
+        throw error;
+      }
+    });
+    return "not-expected";
+  } finally {
+    await fs.rm(tombstone, { force: true });
   }
 }
 
@@ -172,19 +242,31 @@ function warnIfUnjudged(lockPath: string, reason: string, current: ReadHolder): 
   );
 }
 
-/** Removes a breakable lock — compare-and-delete on its content, so a fresh holder is never hit. */
+/** Removes a breakable lock through `removeIfStill`, so a fresh holder's lock is never deleted. */
 async function breakStaleHolder(lockPath: string): Promise<{ broken: boolean; holder: string }> {
   const current = await readHolder(lockPath);
   const reason = current ? breakReason(current) : null;
   if (!current || !reason) {
     return { broken: false, holder: current?.raw ?? "unreadable holder" };
   }
-  warnIfUnjudged(lockPath, reason, current);
-  const again = await readHolder(lockPath);
-  if (again?.raw === current.raw) {
-    await fs.rm(lockPath, { force: true });
+  const removal = await removeIfStill(lockPath, current.snapshot);
+  if (removal === "removed") {
+    warnIfUnjudged(lockPath, reason, current);
   }
-  return { broken: true, holder: current.raw };
+  // "absent": someone else broke or released it — retry the create at once. "not-expected": a
+  // fresh lock is in place and was handed back — wait for it like any live holder.
+  return { broken: removal !== "not-expected", holder: current.raw };
+}
+
+/** Releases OUR lock through `removeIfStill`; a lock that is no longer ours is never deleted. */
+async function release(lockPath: string, mine: LockSnapshot): Promise<void> {
+  const removal = await removeIfStill(lockPath, mine);
+  if (removal !== "removed") {
+    process.stderr.write(
+      `[acpx] WARNING: session record lock ${lockPath} was broken while this process held it ` +
+        `(${removal}); another writer may have overlapped this write.\n`,
+    );
+  }
 }
 
 export async function withRecordFileLock<T>(
@@ -200,7 +282,8 @@ export async function withRecordFileLock<T>(
   });
   const started = Date.now();
   let delay = 2 + Math.floor(Math.random() * 3);
-  while (!(await tryAcquire(lockPath, content))) {
+  let mine: LockSnapshot | null;
+  while (!(mine = await tryAcquire(lockPath, content))) {
     const { broken, holder } = await breakStaleHolder(lockPath);
     if (broken) {
       continue;
@@ -214,6 +297,6 @@ export async function withRecordFileLock<T>(
   try {
     return await action();
   } finally {
-    await fs.rm(lockPath, { force: true });
+    await release(lockPath, mine);
   }
 }
