@@ -13,7 +13,7 @@ import {
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import type { SessionAcpxState, SessionRecord } from "../../types.js";
 import { sessionArchiveDirFor } from "../archive/paths.js";
-import { getLoggedMessageCount, markAllMessagesLogged } from "../messages-log-bookkeeping.js";
+import { getLoggedMessageCount, setLoggedMessageCount } from "../messages-log-bookkeeping.js";
 import {
   appendFinalizedMessagesToLog,
   clearMissingMessagesLogPointerForWrite,
@@ -913,9 +913,12 @@ async function writeMessagesLogBoundary(record: SessionRecord, logPath: string):
   const loggedCount = getLoggedMessageCount(record);
   const messagesToAppend = record.messages.slice(loggedCount);
   await appendFinalizedMessagesToLog(record, logPath, messagesToAppend);
-  if (messagesToAppend.length > 0) {
-    markAllMessagesLogged(record);
-  }
+  // ⚠️ COUNT WHAT WAS APPENDED — DO NOT "SIMPLIFY" THIS TO markAllMessagesLogged.
+  // The record is live: the sub-agent tailer pushes onto it while this append
+  // awaits, and marking everything logged would skip those pushes in the log
+  // and in the split tail, for good (brick://5e7c2a85;
+  // test/messages-log-boundary-concurrent-push.test.ts).
+  setLoggedMessageCount(record, getLoggedMessageCount(record) + messagesToAppend.length);
 
   // Converge the zero-message case. Guarded on `messages.length` rather than on
   // "did the append set a pointer", so it cannot mis-fire on a record that has
