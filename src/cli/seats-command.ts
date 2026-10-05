@@ -857,7 +857,7 @@ function headlineLines(report: SeatBackfillReport): string[] {
     `  records to strip:            ${report.recordsToStrip}`,
     `  stripped:                    ${report.stripped}`,
     `  unparseable, name left in place: ${report.unparseableNameLeft.length}`,
-    `  index entries with a name:   ${report.indexEntriesWithName}`,
+    `  index names to project:      ${report.indexNamesToProject}`,
     `  errors:               ${report.errors.length}`,
   ];
 }

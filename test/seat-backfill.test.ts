@@ -2619,9 +2619,10 @@ test("N1: dry run — the four numbers, the differing seats listed, the unparsea
     // records to strip: every PARSEABLE record with a `name` key of any value (7)
     assert.equal(report.recordsToStrip, 7);
     assert.equal(report.stripped, 0, "a dry run strips nothing");
-    // index entries whose `name` differs from the seat's name they will have: n-none (stale
-    // "stale" on a nameless seat), n-take, n-wins, n-old, n-new — n-fresh already agrees
-    assert.equal(report.indexNamesToProject, 5);
+    // index entries whose `name` differs from the seat's name they will have: n-none (a stale
+    // name on a nameless seat), n-take, n-old, n-new. n-fresh agrees (entry "alpha"), and n-wins
+    // already agrees: seeding its seat row projected "seat-name-wins" onto its entry.
+    assert.equal(report.indexNamesToProject, 4);
     // RULED: an unparseable record's name is left in place and LISTED by id
     assert.deepEqual(
       report.unparseableNameLeft.map((left) => left.acpxRecordId),
@@ -2681,7 +2682,7 @@ test("N2: apply — seats take the names, the SEAT wins a difference, every pars
         file,
       );
     }
-    assert.equal(report.indexNamesToProject, 5);
+    assert.equal(report.indexNamesToProject, 4);
   });
 });
 

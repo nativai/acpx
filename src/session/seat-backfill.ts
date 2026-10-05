@@ -213,9 +213,11 @@ export type SeatBackfillReport = {
    * plus this listed residual. Identical on a dry run and an apply (the apply leaves them).
    */
   unparseableNameLeft: { file: string; acpxRecordId: string | undefined }[];
-  /** index.json entries carrying a stale `name` key (an older acpx projected one).
-   * The strip step re-projects the index without it. Dry run: would be; apply: were. */
-  indexEntriesWithName: number;
+  /** Index entries whose `name` is not the name of the seat they will have — absent where the
+   * seat has one, stale or differing, or present on a nameless seat's entry. The entry's name is
+   * PROJECTED FROM THE SEAT (spec §1); the apply re-projects the whole index once. Identical on
+   * a dry run and an apply (the pre-run population); `0` on the run after. */
+  indexNamesToProject: number;
   errors: SeatBackfillError[];
   /** The `.bak-mig-<TS>` suffix of this run's pre-apply copies, absent on a dry run. */
   backupSuffix: string | undefined;
@@ -341,6 +343,8 @@ type RecordPlan = {
   /** Leg 2 is needed: the entry's seat field group disagrees with the record's. */
   enrichesIndex: boolean;
   hasIndexEntry: boolean;
+  /** The `name` the index entry carries now (absent when it has none or has no entry). */
+  indexName: string | undefined;
   /**
    * D-NAME-HARD-MIGRATION: the record's `name` as it stands ON DISK — trimmed, and
    * only when it is a non-empty string. The parsed record carries no name at all
@@ -610,6 +614,11 @@ async function readRecordFile(
   return (await readRecordWithLegacyName(sessionDir, file))?.record;
 }
 
+/** The `name` an index entry carries now (absent for no entry or no name). */
+function indexNameOf(entry: SessionIndexEntry | undefined): string | undefined {
+  return entry === undefined ? undefined : entry.name;
+}
+
 async function scanRecords(
   sessionDir: string,
   entriesByFile: ReadonlyMap<string, SessionIndexEntry>,
@@ -673,6 +682,7 @@ async function scanRecords(
       // behind is CORRECT or STALE, so this leg runs and makes it correct.
       enrichesIndex: entry === undefined || !indexEntryAgrees(entry, seat),
       hasIndexEntry: entry !== undefined,
+      indexName: indexNameOf(entry),
       recordName,
       hasNameKey,
     });
@@ -1190,29 +1200,10 @@ async function reapHolderless(
   }
 }
 
-/**
- * index.json entries that still carry a `name` key — written by an older acpx, which
- * projected the record's name into the entry. Read RAW: `readSessionIndex` drops the
- * key on parse, which is also why one ordinary index write removes it.
- */
-async function countIndexEntriesWithName(sessionDir: string): Promise<number> {
-  try {
-    const raw = JSON.parse(await fs.readFile(sessionIndexPath(sessionDir), "utf8")) as {
-      entries?: unknown;
-    };
-    return Array.isArray(raw.entries)
-      ? raw.entries.filter(
-          (entry) => typeof entry === "object" && entry !== null && Object.hasOwn(entry, "name"),
-        ).length
-      : 0;
-  } catch {
-    return 0;
-  }
-}
-
-/** Re-project the whole index once, under its lock, through the parse that carries
- * no `name`: every entry the per-record legs did not reach loses its stale key too. */
-async function reprojectIndexWithoutNames(sessionDir: string): Promise<void> {
+/** Re-project the whole index once, under its lock: `writeSessionIndex` projects every
+ * entry's name from the seat store, so entries the per-record legs did not reach (an existing
+ * seat that already had a name, an entry with a stale one) are brought level too. */
+async function reprojectIndexNames(sessionDir: string): Promise<void> {
   await withSessionIndexLock(sessionDir, async () => {
     const index = await readSessionIndex(sessionDir);
     if (index) {
@@ -1222,11 +1213,7 @@ async function reprojectIndexWithoutNames(sessionDir: string): Promise<void> {
 }
 
 /** The strip step's PRE-RUN numbers, identical on a dry run and an apply. */
-function nameStripBase(
-  scanned: ScannedRecords,
-  seatPlans: ReadonlyMap<string, SeatPlan>,
-  indexEntriesWithName: number,
-) {
+function nameStripBase(scanned: ScannedRecords, seatPlans: ReadonlyMap<string, SeatPlan>) {
   return {
     recordsWithLegacyName: scanned.plans.filter((plan) => plan.recordName !== undefined).length,
     seatsDifferingName: [...seatPlans]
@@ -1238,7 +1225,9 @@ function nameStripBase(
       })),
     recordsToStrip: scanned.plans.filter((plan) => plan.hasNameKey).length,
     unparseableNameLeft: scanned.unparseableNameLeft,
-    indexEntriesWithName,
+    indexNamesToProject: scanned.plans.filter(
+      (plan) => plan.hasIndexEntry && plan.indexName !== seatPlans.get(plan.seatId)?.seatName,
+    ).length,
   };
 }
 
@@ -1246,7 +1235,7 @@ function nameStripBase(
  * the per-record legs have already landed. */
 async function reprojectIndexLeg(sessionDir: string, errors: SeatBackfillError[]): Promise<void> {
   try {
-    await reprojectIndexWithoutNames(sessionDir);
+    await reprojectIndexNames(sessionDir);
   } catch (error) {
     errors.push({
       file: "index.json",
@@ -1290,10 +1279,9 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
   const holderless = await findHolderlessSeats(sessionDir);
   const seatsNeedingRows = [...seatPlans.values()].filter((seat) => seat.needsRow);
   const errors = [...scanned.errors];
-  const indexEntriesWithName = await countIndexEntriesWithName(sessionDir);
 
   const base = {
-    ...nameStripBase(scanned, seatPlans, indexEntriesWithName),
+    ...nameStripBase(scanned, seatPlans),
     apply: options.apply,
     sessionDir,
     sweep,
@@ -1348,7 +1336,7 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
   }
   // Last, after every mint.
   const holderlessReaped = await reapHolderless(sessionDir, holderless, errors);
-  if (indexEntriesWithName > 0) {
+  if (base.indexNamesToProject > 0) {
     await reprojectIndexLeg(sessionDir, errors);
   }
 

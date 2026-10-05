@@ -26,8 +26,18 @@ const SRC_DIR = fileURLToPath(new URL("../../src", import.meta.url));
 //   • a RECORD-ISH identifier's `.name` (or a `name` key probed on a raw object) — allowed only at
 //     the sites below, each of which is NOT the session's own name, with the exact count and the
 //     reason. A new hit, or a changed count, fails here and says which file.
-const RECORD_NAME_READ =
-  /\b(?:record|rec|raw|current|updated|source|target|resolved|loaded|persisted|fresh|canonical|session|sessionRecord|indexEntry|member|holder|parsed|payload|diskRecord|existing)\??\.name\b|\[["']name["']\]|\)\.name\b|Object\.hasOwn\([^)]*["']name["']\)/g;
+const RECORD_ISH =
+  "record|rec|raw|current|updated|source|target|resolved|loaded|persisted|fresh|canonical|session|sessionRecord|indexEntry|entry|member|holder|parsed|payload|diskRecord|existing";
+const RECORD_NAME_READ = new RegExp(
+  [
+    `\\b(?:${RECORD_ISH})\\??\\.name\\b`, // record.name / entry.name / entry?.name
+    `\\[["']name["']\\]`, // bracket access
+    `\\)\\.name\\b`, // (await load()).name
+    `Object\\.hasOwn\\([^)]*["']name["']\\)`, // a raw `name` key probe
+    `\\{[^}]*\\bname\\b[^}]*\\}\\s*=\\s*(?:await\\s+)?(?:${RECORD_ISH})\\b`, // const { name } = record
+  ].join("|"),
+  "g",
+);
 const LEGACY_CARRIER = /\blegacyName\b/g;
 
 const ALLOWED_NAME_READS: ReadonlyMap<string, { count: number; why: string }> = new Map([
@@ -35,7 +45,21 @@ const ALLOWED_NAME_READS: ReadonlyMap<string, { count: number; why: string }> = 
     "session/seat-backfill.ts",
     {
       count: 4,
-      why: "the strip step: the ONE reader left of the record's on-disk `name` — raw JSON, to move it to the seat and delete it (and to list the unparseable residual)",
+      why: "the strip step: the ONE reader left of the record's on-disk `name` — raw JSON, to move it to the seat and delete it (and to list the unparseable residual) — plus the index entry's current name, compared with the seat's to count what the re-projection will change",
+    },
+  ],
+  [
+    "session/persistence/index.ts",
+    {
+      count: 5,
+      why: "the index's own plumbing: parseIndexEntry preserves the projected `name` (1), the seat-name projection compares it (1), and three fs Dirent names in the record-file enumeration",
+    },
+  ],
+  [
+    "session/persistence/seat-store.ts",
+    {
+      count: 4,
+      why: "the seat store's raw index patch that PROJECTS a changed seat name onto its holders' entries (the writer, not a read of a session's own name)",
     },
   ],
   [
@@ -49,6 +73,12 @@ const ALLOWED_NAME_READS: ReadonlyMap<string, { count: number; why: string }> = 
     "session/archive/archive-index.ts",
     { count: 1, why: "the ARCHIVE tier's own index row, same exemption" },
   ],
+  [
+    "cli/archive-command.ts",
+    { count: 1, why: "prints an ARCHIVE index row's name, same exemption" },
+  ],
+  ["session/archive/operations.ts", { count: 1, why: "an fs Dirent name in the archive sweep" }],
+  ["session/archive/retention.ts", { count: 2, why: "fs Dirent names in the retention sweep" }],
   [
     "session/persistence/parse.ts",
     {
@@ -72,6 +102,14 @@ const ALLOWED_NAME_READS: ReadonlyMap<string, { count: number; why: string }> = 
   ],
   ["agent-registry.ts", { count: 1, why: "an npm package.json `name`" }],
   ["models/catalogue.ts", { count: 1, why: "a model catalogue row's `name`" }],
+  ["models/matcher.ts", { count: 1, why: "a model row's `name`" }],
+  ["config/providers.ts", { count: 2, why: "a provider entry's `name`" }],
+  ["mcp-servers.ts", { count: 1, why: "an MCP server entry's `name`" }],
+  ["acp/terminal-manager.ts", { count: 1, why: "an env var entry's `name`" }],
+  ["acp/harness-config-dir.ts", { count: 3, why: "fs Dirent names" }],
+  ["cli/output/output.ts", { count: 1, why: "a function value's `name` in a log renderer" }],
+  ["cli/session/agent-folders-migrate.ts", { count: 10, why: "fs Dirent names" }],
+  ["session/conversation-model.ts", { count: 1, why: "a tool entry's `name`" }],
 ]);
 
 async function sourceFiles(dir: string): Promise<string[]> {
@@ -137,6 +175,12 @@ test("GUARD: no record/index `name` is read as the session's own name (allowlist
     'const label = parsed["name"];',
     "const label = (await load()).name;",
     "const legacy = record.legacyName;",
+    "const label = entry.name;",
+    "const label = entry?.name;",
+    "const label = indexEntry?.name ?? entry.title;",
+    "const { name } = record;",
+    "const { id, name: label } = entry;",
+    "const { name } = await resolve(entry);".replace("await resolve(entry)", "entry"),
   ]) {
     const withIntruder = new Map(files).set("cli/session-routing.ts", planted);
     assert.notDeepEqual(nameReadViolations(withIntruder), [], `the guard missed: ${planted}`);
