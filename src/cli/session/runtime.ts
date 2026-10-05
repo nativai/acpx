@@ -1480,22 +1480,29 @@ const PREVIOUS_TURN_CANCEL_WAIT_MS = 2_500;
  *
  * The owner's shared client can still be running a turn when the next one
  * starts: an injected prompt the drain backstop gave up on keeps running on the
- * adapter after the turn was finalized. Starting the next turn on top of it put
- * two prompts into one agent — and when that turn re-picked a subscription
- * (sub5→sub8) it spawned a SECOND adapter beside the live one: two agent loops
- * in one session, committing to one worktree (lane A, 2026-10-05).
+ * adapter after the turn was finalized. When the next turn re-picked a
+ * subscription (sub5→sub8) it spawned a SECOND adapter beside the live one: two
+ * agent loops in one session, committing to one worktree (lane A, 2026-10-05).
  *
- * So before any turn starts — on the shared client, or on a fresh one for a
- * subscription switch or a failover — a previous turn still live on the shared
- * client is cancelled, and if it does not end, its adapter is stopped. Never
- * both running. Loud, because a turn ended this way may have been mid-work.
- * Called from runSessionPrompt only once the new turn is past every refusal.
+ * So before a turn starts on a FRESH client (a subscription switch or a
+ * failover), a previous turn still live on the shared client is cancelled, and
+ * if it does not end, its adapter is stopped. Never two adapters running turns.
+ * Loud, because a turn ended this way may have been mid-work. Called from
+ * runSessionPrompt only once the new turn is past every refusal.
  */
 export async function endPreviousLiveTurn(
   client: AcpClient | undefined,
+  nextTurnClient: AcpClient,
   sessionRecordId: string,
 ): Promise<void> {
-  if (!client?.hasActivePrompt()) {
+  // ⚠️ SAME CLIENT ⇒ DO NOTHING. One adapter cannot run two agent loops:
+  // claude-agent-acp QUEUES a new prompt behind the live one, so the old turn
+  // finishes and the new message runs after it (te-7531 round 2, baseline
+  // 79fe7835 loses nothing). Cancelling there was all cost (B1): the old turn's
+  // remaining work never ran, and the adapter's late `cancelled` ending was
+  // attributed to the NEW prompt — its delivery `failed` with an empty detail
+  // code while the agent then ran it, reply missing from messages.ndjson.
+  if (client === undefined || client === nextTurnClient || !client.hasActivePrompt()) {
     return;
   }
   process.stderr.write(
@@ -2520,6 +2527,14 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       },
       sessionOptions,
     });
+  // brick://7531ef5c: end a previous turn still live on the owner's shared client
+  // HERE — after every refusal above (closed record, subscription lock, model
+  // floor, Codex cap, dedup: a REFUSED delivery must not kill live work, and
+  // round 1 ran this before the Codex cap admission), and BEFORE this turn's
+  // handlers are registered or its client connects. It acts only when this turn
+  // runs on a DIFFERENT client (see endPreviousLiveTurn) — and constructing one
+  // spawns nothing, so the old turn ends before a second adapter can exist.
+  await endPreviousLiveTurn(options.previousTurnClient, client, record.acpxRecordId);
   client.updateRuntimeOptions({
     permissionMode: options.permissionMode,
     nonInteractivePermissions: options.nonInteractivePermissions,
@@ -3220,13 +3235,6 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     return response;
   };
 
-  // brick://7531ef5c: end a previous turn still live on the owner's shared client
-  // HERE — after every refusal above (closed record, subscription lock, model
-  // floor, Codex cap, dedup) and before the connect that may start an adapter or
-  // the prompt that would join a live one. ⚠️ Not earlier: a delivery that is
-  // then REFUSED must not kill live work, and running it before the Codex cap
-  // admission turned that denial into QUEUE_RUNTIME_PROMPT_FAILED (round 1).
-  await endPreviousLiveTurn(options.previousTurnClient, record.acpxRecordId);
   // brick://b8e251eb: from here on the catch below writes the delivery terminal.
   // Everything above is the window the queue owner must terminalize itself — keep
   // this line IMMEDIATELY before the `try`.

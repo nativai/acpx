@@ -21,7 +21,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AcpClient } from "../src/acp/client.js";
 import type { QueueTask } from "../src/cli/queue/ipc.js";
-import { runQueuedTask } from "../src/cli/session/runtime.js";
+import { endPreviousLiveTurn, runQueuedTask } from "../src/cli/session/runtime.js";
 import { type PromptInput, textPrompt } from "../src/prompt-content.js";
 import { listSessionEvents } from "../src/session/events.js";
 import type { SessionRecord } from "../src/types.js";
@@ -441,51 +441,94 @@ test("7531ef5c F1 CONTROL: after the tool call COMPLETES, silence is timed from 
 
 async function backstoppedTurnThenNextTurn(adapter: AdapterControl): Promise<{
   secondCall: PromptCall | undefined;
-  sessionId: string;
+  secondTerminal: Record<string, unknown> | undefined;
 }> {
-  let sessionId = "";
+  let secondTerminal: Record<string, unknown> | undefined;
   await withTempHome("acpx-7531ef5c-two-", async (home) => {
     const record = sessionRecord(home);
-    sessionId = record.acpxRecordId;
     await writeSessionRecordFile(home, record);
     await withDrainTimeout(200, async () => {
       // Turn 1 is finalized by the backstop while its injected prompt is still
-      // running on the adapter — the state lane A's owner was in at 13:23:54Z.
+      // running on the adapter — a genuinely stalled agent (te-7531 S5: Claude
+      // Code waiting on a slow / retrying API between tool calls).
       await (
         await startTurnWithInjection(record.acpxRecordId, adapter)
       ).run;
       assert.equal(adapter.inFlight(), 1, "turn 1's injected prompt is still live on the adapter");
-      // The next delivered message.
+      // The next delivered message, on the SAME shared client.
       await runQueuedTask(
         record.acpxRecordId,
         queueTask("req-second", SECOND_PROMPT_TEXT, SECOND_ID, true),
         { sharedClient: adapter.client, suppressSdkConsoleErrors: true },
       );
     });
+    secondTerminal = terminalFor(await streamEvents(record.acpxRecordId), SECOND_ID);
   });
   return {
     secondCall: adapter.calls.find((call) => call.text === SECOND_PROMPT_TEXT),
-    sessionId,
+    secondTerminal,
   };
 }
 
-test("7531ef5c: the next turn first ENDS a still-live previous turn — never two prompts running in one agent", async () => {
+// B1 (te-7531 round 2, BLOCKING on 7ec48822): on the SAME client there is no
+// second loop to prevent — claude-agent-acp queues the new prompt behind the
+// live one, and the baseline loses nothing. Cancelling there killed the old
+// turn's remaining work and pinned its late `cancelled` on the NEW message.
+test("7531ef5c B1: on the SAME client a live previous turn is LEFT RUNNING — the next message queues behind it, nothing cancelled", async () => {
   const adapter = makeAdapter({ honoursCancel: true });
-  const { secondCall } = await backstoppedTurnThenNextTurn(adapter);
-  assert.ok(secondCall, "the next turn ran");
-  // On the unrepaired base: 1 — turn 1's injected prompt was still running.
-  assert.equal(secondCall.inFlightAtStart, 0, "a previous turn was still live when the next began");
-  assert.equal(adapter.cancels(), 1, "the live turn was cancelled first");
-  assert.equal(adapter.closes(), 0, "a turn that honours cancel keeps its adapter");
+  const { secondCall, secondTerminal } = await backstoppedTurnThenNextTurn(adapter);
+  assert.ok(secondCall, "the next message reached the agent");
+  // On 7ec48822: 1 cancel — the stalled turn's remaining work was killed.
+  assert.equal(adapter.cancels(), 0, "the live previous turn was cancelled");
+  assert.equal(adapter.closes(), 0, "the adapter was stopped");
+  assert.equal(adapter.inFlight(), 1, "the previous turn is still running, as on the baseline");
+  assert.equal(
+    secondCall.inFlightAtStart,
+    1,
+    "the next prompt was queued beside it on ONE adapter",
+  );
+  assert.equal(secondTerminal?.phase, "done", `next delivery: ${JSON.stringify(secondTerminal)}`);
+  adapter.resolveInjected();
 });
 
-test("7531ef5c: a previous turn that ignores cancel has its ADAPTER STOPPED before the next turn starts", async () => {
-  const adapter = makeAdapter({ honoursCancel: false });
-  const { secondCall } = await backstoppedTurnThenNextTurn(adapter);
-  assert.ok(secondCall, "the next turn ran");
-  assert.equal(secondCall.inFlightAtStart, 0, "a previous turn was still live when the next began");
-  assert.equal(adapter.cancels(), 1);
-  assert.equal(adapter.closes(), 1, "the adapter running the unkillable turn was stopped");
+// The two-loop defect needs a FRESH client (subscription switch / failover).
+// The unit harness cannot drive a real switch, so the guard's fresh-client branch
+// is pinned directly: the next turn's client is a different object.
+test("7531ef5c: before a turn on a DIFFERENT client, a live previous turn on the shared client is cancelled first", async () => {
+  const previous = makeAdapter({ honoursCancel: true });
+  const next = makeAdapter({ honoursCancel: true });
+  await withTempHome("acpx-7531ef5c-fresh-", async (home) => {
+    const record = sessionRecord(home);
+    await writeSessionRecordFile(home, record);
+    await withDrainTimeout(200, async () => {
+      await (
+        await startTurnWithInjection(record.acpxRecordId, previous)
+      ).run;
+    });
+  });
+  assert.equal(previous.inFlight(), 1, "the previous turn is live");
+  await endPreviousLiveTurn(previous.client, next.client, "single-live-turn");
+  assert.equal(previous.cancels(), 1, "the live turn was cancelled");
+  assert.equal(previous.closes(), 0, "a turn that honours cancel keeps its adapter");
+  assert.equal(previous.inFlight(), 0, "no live turn remains before the fresh client starts");
+});
+
+test("7531ef5c: before a turn on a DIFFERENT client, a previous turn that ignores cancel has its ADAPTER STOPPED", async () => {
+  const previous = makeAdapter({ honoursCancel: false });
+  const next = makeAdapter({ honoursCancel: true });
+  await withTempHome("acpx-7531ef5c-fresh2-", async (home) => {
+    const record = sessionRecord(home);
+    await writeSessionRecordFile(home, record);
+    await withDrainTimeout(200, async () => {
+      await (
+        await startTurnWithInjection(record.acpxRecordId, previous)
+      ).run;
+    });
+  });
+  await endPreviousLiveTurn(previous.client, next.client, "single-live-turn");
+  assert.equal(previous.cancels(), 1);
+  assert.equal(previous.closes(), 1, "the adapter running the unkillable turn was stopped");
+  assert.equal(previous.inFlight(), 0);
 });
 
 // NEGATIVE CASE for the guard's PLACEMENT (round 2): a delivery that is then
