@@ -64,7 +64,6 @@ function fullRecordSentinel(): SessionRecord {
     agentName: "sentinel-agent-name",
     agentCommand: "node /opt/claude-agent-acp/dist/index.js",
     cwd: "/workspace/sentinel-cwd",
-    legacyName: "sentinel-legacy-name",
     createdAt: "2026-01-01T00:00:00.000Z",
     lastUsedAt: "2026-01-01T00:00:01.000Z",
     lastSeq: 42,
@@ -226,8 +225,8 @@ test("full-record guard 4 · the plan is non-trivial and covers every SessionRec
   const total = PERSISTED_TRUE_KEYS.length + PERSISTED_FALSE_KEYS.length;
   assert.equal(
     total,
-    51,
-    `RECORD_FIELD_PLAN has ${total} classified keys, this test expected 51. If you added a field ` +
+    50,
+    `RECORD_FIELD_PLAN has ${total} classified keys, this test expected 50. If you added a field ` +
       `to SessionRecord: classify it in full-record-contract.ts, then run guards 1-3 above. If you ` +
       `removed one: update this count deliberately.`,
   );

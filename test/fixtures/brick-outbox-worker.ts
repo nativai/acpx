@@ -228,6 +228,56 @@ try {
     console.log(`ACTED=${acted}`);
     process.exit(0);
   }
+  if (scenario === "seat-name-projection") {
+    // D-NAME-HARD-MIGRATION — the projection's `name` is the SEAT's name, never the record's, and
+    // applying it writes NO `name` back onto the record.
+    const seatId = "55555555-5555-4555-8555-555555555555";
+    delete process.env.ACPX_STATE_HOME;
+    const { withSeatStoreWrite } = await import("../../src/session/persistence/seat-store.js");
+    await withSeatStoreWrite(`${os.homedir()}/.acpx/sessions`, () => ({
+      mutation: {
+        kind: "write" as const,
+        seats: new Map([
+          [
+            seatId,
+            {
+              seatId,
+              createdAt: "2026-10-05T00:00:00.000Z",
+              activeHolderId: id,
+              nextOrdinal: 2,
+              closedAt: null,
+              name: "seat-label",
+              brickId: undefined,
+              favorite: false,
+            },
+          ],
+        ]),
+      },
+      result: undefined,
+    }));
+    const nameOf = (intent: { payload: string }): unknown => JSON.parse(intent.payload).name;
+    const seated = outbox.prepareProjection(
+      id,
+      { ...record, seat_id: seatId, name: "STALE-RECORD-NAME" },
+      identity,
+    )!;
+    assert.equal(nameOf(seated), "seat-label", "the payload carries the SEAT's name");
+    outbox.applyProjection(seated.id);
+    assert.equal(
+      Object.hasOwn(outbox.readRecord(id) ?? {}, "name"),
+      false,
+      "applying wrote a name onto the record",
+    );
+    const seatless = outbox.prepareProjection(
+      id,
+      { ...record, name: "STALE-RECORD-NAME" },
+      identity,
+    )!;
+    assert.equal(nameOf(seatless), null, "a seat-less record projects no name");
+    acted++;
+    console.log(`ACTED=${acted}`);
+    process.exit(0);
+  }
   if (scenario === "frontier") {
     for (let revision = 1; revision <= 3; revision++) {
       const intent = outbox.prepareProjection(id, record, identity)!;

@@ -76,7 +76,6 @@ test("isLaterTemplate (Appendix B): version, then created_at, then acpxRecordId"
 
 type SeedTemplateOptions = {
   id: string;
-  name?: string;
   slug?: string;
   version?: number;
   enabled?: boolean;
@@ -93,7 +92,6 @@ async function seedTemplate(homeDir: string, opts: SeedTemplateOptions): Promise
     acpSessionId: `${opts.id}-acp`,
     agentCommand: opts.agentCommand ?? AGENT,
     cwd: path.join(homeDir, "workspace"),
-    legacyName: opts.name ?? opts.id,
     closed: true,
   });
   record.template = {
@@ -108,13 +106,12 @@ async function seedTemplate(homeDir: string, opts: SeedTemplateOptions): Promise
 }
 
 // A fresh, un-marked candidate session ready to be marked under a slug.
-function makeCandidate(homeDir: string, id: string, name: string): SessionRecord {
+function makeCandidate(homeDir: string, id: string): SessionRecord {
   const record = makeSessionRecord({
     acpxRecordId: id,
     acpSessionId: `${id}-acp`,
     agentCommand: AGENT,
     cwd: path.join(homeDir, "workspace"),
-    legacyName: name,
     closed: true,
   });
   // The block markSessionAsTemplate builds (sans slug/version, which persistTemplateMark assigns).
@@ -143,7 +140,7 @@ async function readIndexEntry(
 
 test("mark assigns the explicit slug + version 1 on a fresh slug", async () => {
   await withTempHome(async (homeDir) => {
-    const cand = makeCandidate(homeDir, "cand-1", "Context Engineer");
+    const cand = makeCandidate(homeDir, "cand-1");
     await persistTemplateMark(cand, { slug: "context-engineer" });
 
     assert.equal(cand.template?.slug, "context-engineer");
@@ -160,19 +157,19 @@ test("mark assigns the explicit slug + version 1 on a fresh slug", async () => {
 });
 
 // D-IDENTITY (brick 61dc1302): a session has no name to derive a default slug from. The mark
-// still lands (slug-less, resolves by id) — it must not invent one from the legacy name.
-test("mark with no --slug derives NO slug, even from a legacy name", async () => {
+// still lands (slug-less, resolves by id) — it must not invent one from anywhere.
+test("mark with no --slug derives NO slug (a session record has no name at all)", async () => {
   await withTempHome(async (homeDir) => {
-    const cand = makeCandidate(homeDir, "cand-noslug", "Context Engineer");
+    const cand = makeCandidate(homeDir, "cand-noslug");
     await persistTemplateMark(cand, {});
     assert.equal(cand.template?.slug, undefined);
     assert.equal(cand.template?.version, undefined);
   });
 });
 
-test("mark honors an explicit --slug (canonicalized) different from slugify(name)", async () => {
+test("mark honors an explicit --slug (canonicalized) different from any name", async () => {
   await withTempHome(async (homeDir) => {
-    const cand = makeCandidate(homeDir, "cand-x", "Refreshed Context Eng v2");
+    const cand = makeCandidate(homeDir, "cand-x");
     await persistTemplateMark(cand, { slug: "Context Engineer" }); // explicit, non-canonical input
 
     assert.equal(cand.template?.slug, "context-engineer"); // canonicalized via slugify
@@ -184,20 +181,18 @@ test("version = max+1 over the slug group, counting BOTH enabled and disabled (s
   await withTempHome(async (homeDir) => {
     await seedTemplate(homeDir, {
       id: "ce-v1",
-      name: "Context Engineer",
       slug: "context-engineer",
       version: 1,
       enabled: false, // soft-retracted — must still count toward max
     });
     await seedTemplate(homeDir, {
       id: "ce-v2",
-      name: "Context Engineer",
       slug: "context-engineer",
       version: 2,
       enabled: true,
     });
 
-    const cand = makeCandidate(homeDir, "ce-v3", "Context Engineer");
+    const cand = makeCandidate(homeDir, "ce-v3");
     await persistTemplateMark(cand, { slug: "context-engineer" });
     assert.equal(cand.template?.version, 3); // max(1 disabled, 2 enabled) + 1
   });
@@ -205,13 +200,12 @@ test("version = max+1 over the slug group, counting BOTH enabled and disabled (s
 
 test("version = max+1 ranges over effectiveSlug, so slug-less / version-less siblings count", async () => {
   await withTempHome(async (homeDir) => {
-    // A pre-migration template: enabled, no slug, no version. Its effectiveSlug
-    // derives from slugify(name) = "helper" and its version counts as 0.
-    await seedTemplate(homeDir, { id: "legacy", name: "Helper" });
+    // A pre-migration template: enabled, no slug, no version. Its version counts as 0.
+    await seedTemplate(homeDir, { id: "legacy" });
 
-    const cand = makeCandidate(homeDir, "helper-new", "Helper");
+    const cand = makeCandidate(homeDir, "helper-new");
     await persistTemplateMark(cand, { slug: "helper" });
-    // legacy is in the "helper" group via slugify(name); version ?? 0 = 0 ⇒ new = 1
+    // the version-less sibling counts as 0 ⇒ new = 1
     assert.equal(cand.template?.version, 1);
     // The refreshed candidate must sort LATEST over the version-less sibling.
     const resolved = await resolveTemplateSelector("helper");
@@ -222,7 +216,7 @@ test("version = max+1 ranges over effectiveSlug, so slug-less / version-less sib
 
 test("idempotent re-mark under the same slug preserves version (does not bump to latest)", async () => {
   await withTempHome(async (homeDir) => {
-    const cand = makeCandidate(homeDir, "idem", "Helper");
+    const cand = makeCandidate(homeDir, "idem");
     await persistTemplateMark(cand, { slug: "helper" });
     assert.equal(cand.template?.version, 1);
 
@@ -242,13 +236,11 @@ test("selector resolves a literal id to that exact record (snapshot), never redi
     // Two enabled versions of one slug; a third record whose literal id we pass.
     await seedTemplate(homeDir, {
       id: "ce-a",
-      name: "Context Engineer",
       slug: "context-engineer",
       version: 1,
     });
     await seedTemplate(homeDir, {
       id: "ce-b",
-      name: "Context Engineer",
       slug: "context-engineer",
       version: 2,
     });
@@ -263,13 +255,11 @@ test("selector falls through to the slug's latest only on an id MISS", async () 
   await withTempHome(async (homeDir) => {
     await seedTemplate(homeDir, {
       id: "ce-a",
-      name: "Context Engineer",
       slug: "context-engineer",
       version: 1,
     });
     await seedTemplate(homeDir, {
       id: "ce-b",
-      name: "Context Engineer",
       slug: "context-engineer",
       version: 2,
     });
@@ -282,8 +272,8 @@ test("selector falls through to the slug's latest only on an id MISS", async () 
 
 test("selector rethrows an AMBIGUOUS id (suffix matches >1) — it never silently becomes a slug lookup", async () => {
   await withTempHome(async (homeDir) => {
-    await seedTemplate(homeDir, { id: "dup-aaaa", name: "One", slug: "one", version: 1 });
-    await seedTemplate(homeDir, { id: "dup-bbbb", name: "Two", slug: "two", version: 1 });
+    await seedTemplate(homeDir, { id: "dup-aaaa", slug: "one", version: 1 });
+    await seedTemplate(homeDir, { id: "dup-bbbb", slug: "two", version: 1 });
     // "dup-" is a suffix of neither acpxRecordId nor acpSessionId, so craft an
     // ambiguous SUFFIX: both acpSessionIds end with "-acp".
     await assert.rejects(
@@ -303,7 +293,6 @@ test("selector throws a clear not-found naming both attempts when neither id nor
   await withTempHome(async (homeDir) => {
     await seedTemplate(homeDir, {
       id: "ce",
-      name: "Context Engineer",
       slug: "context-engineer",
       version: 1,
     });
@@ -322,7 +311,6 @@ test("selector's slug branch ignores SOFT-RETRACTED (disabled) versions", async 
   await withTempHome(async (homeDir) => {
     await seedTemplate(homeDir, {
       id: "only-v1",
-      name: "Solo",
       slug: "solo",
       version: 1,
       enabled: false, // retracted ⇒ slug has no enabled version
@@ -339,13 +327,11 @@ test("the id stamped as template_source is the RESOLVED latest record id (not th
   await withTempHome(async (homeDir) => {
     await seedTemplate(homeDir, {
       id: "ce-1",
-      name: "Context Engineer",
       slug: "context-engineer",
       version: 1,
     });
     await seedTemplate(homeDir, {
       id: "ce-2",
-      name: "Context Engineer",
       slug: "context-engineer",
       version: 2,
     });
@@ -364,13 +350,11 @@ test("rollback soft-retracts the latest, dropping it from BOTH slug resolution a
   await withTempHome(async (homeDir) => {
     await seedTemplate(homeDir, {
       id: "v1",
-      name: "Context Engineer",
       slug: "context-engineer",
       version: 1,
     });
     await seedTemplate(homeDir, {
       id: "v2",
-      name: "Context Engineer",
       slug: "context-engineer",
       version: 2,
     });
@@ -398,13 +382,11 @@ test("re-enabling a soft-retracted version restores it as latest", async () => {
   await withTempHome(async (homeDir) => {
     await seedTemplate(homeDir, {
       id: "v1",
-      name: "Context Engineer",
       slug: "context-engineer",
       version: 1,
     });
     await seedTemplate(homeDir, {
       id: "v2",
-      name: "Context Engineer",
       slug: "context-engineer",
       version: 2,
     });
@@ -428,13 +410,11 @@ test("rollback --delete hard-removes the record + sidecars + index entry", async
   await withTempHome(async (homeDir) => {
     await seedTemplate(homeDir, {
       id: "v1",
-      name: "Context Engineer",
       slug: "context-engineer",
       version: 1,
     });
     await seedTemplate(homeDir, {
       id: "v2",
-      name: "Context Engineer",
       slug: "context-engineer",
       version: 2,
     });
@@ -452,7 +432,7 @@ test("rollback --delete hard-removes the record + sidecars + index entry", async
 
 test("rolling back the only version empties the slug; rolling back an empty slug is a no-op", async () => {
   await withTempHome(async (homeDir) => {
-    await seedTemplate(homeDir, { id: "solo", name: "Solo", slug: "solo", version: 1 });
+    await seedTemplate(homeDir, { id: "solo", slug: "solo", version: 1 });
 
     const first = await rollbackTemplateSlug("solo");
     assert.equal(first.outcome, "soft-retract");
@@ -464,21 +444,28 @@ test("rolling back the only version empties the slug; rolling back an empty slug
 });
 
 // ---------------------------------------------------------------------------
-// migrate-slugs: idempotent backfill + collision disambiguation (D3)
+// migrate-slugs: idempotent backfill of version onto slugged templates. D-NAME-HARD-MIGRATION: the
+// session record has no name, so a slug-less template is NEVER given one (DEBT SITE — the verb used
+// to slugify the record's own name; retiring it or sourcing the slug elsewhere is the owner's call).
 // ---------------------------------------------------------------------------
 
-test("migrate-slugs backfills slug+version on un-migrated templates; --dry-run writes nothing", async () => {
+test("migrate-slugs backfills the version of a slugged template; --dry-run writes nothing", async () => {
   await withTempHome(async (homeDir) => {
-    await seedTemplate(homeDir, { id: "t1", name: "Context Engineer" }); // no slug/version
+    await seedTemplate(homeDir, { id: "t1", slug: "context-engineer" }); // slug, no version
 
     const dry = await migrateTemplateSlugs({ dryRun: true });
     assert.equal(dry.assigned, 1);
     assert.equal(dry.dryRun, true);
     const stillBare = await resolveSessionRecord("t1");
-    assert.equal(stillBare.template?.slug, undefined, "dry-run wrote nothing");
+    assert.equal(stillBare.template?.version, undefined, "dry-run wrote nothing");
 
     const wet = await migrateTemplateSlugs();
     assert.equal(wet.assigned, 1);
+    assert.deepEqual(
+      wet.assignments.map((assignment) => Object.keys(assignment).toSorted()),
+      [["acpxRecordId", "slug", "version"]],
+      "an assignment carries no name",
+    );
     const migrated = await resolveSessionRecord("t1");
     assert.equal(migrated.template?.slug, "context-engineer");
     assert.equal(migrated.template?.version, 1);
@@ -487,7 +474,7 @@ test("migrate-slugs backfills slug+version on un-migrated templates; --dry-run w
 
 test("migrate-slugs is idempotent: a second run skips already-migrated templates (no renumber)", async () => {
   await withTempHome(async (homeDir) => {
-    await seedTemplate(homeDir, { id: "t1", name: "Helper" });
+    await seedTemplate(homeDir, { id: "t1", slug: "helper" });
     await migrateTemplateSlugs();
     const afterFirst = await resolveSessionRecord("t1");
     assert.equal(afterFirst.template?.version, 1);
@@ -500,42 +487,17 @@ test("migrate-slugs is idempotent: a second run skips already-migrated templates
   });
 });
 
-test("migrate-slugs disambiguates collisions (D3): distinct templates with the same name get distinct slugs", async () => {
+test("migrate-slugs leaves a slug-less template slug-less — a record has no name to derive one from", async () => {
   await withTempHome(async (homeDir) => {
-    // Two distinct templates both named "Helper" (slugify ⇒ "helper").
-    await seedTemplate(homeDir, {
-      id: "older",
-      name: "Helper",
-      createdAt: "2026-06-01T00:00:00.000Z",
-    });
-    await seedTemplate(homeDir, {
-      id: "newer",
-      name: "Helper",
-      createdAt: "2026-06-02T00:00:00.000Z",
-    });
+    await seedTemplate(homeDir, { id: "older", createdAt: "2026-06-01T00:00:00.000Z" });
+    await seedTemplate(homeDir, { id: "newer", createdAt: "2026-06-02T00:00:00.000Z" });
 
     const result = await migrateTemplateSlugs();
-    assert.equal(result.assigned, 2);
-
-    const older = await resolveSessionRecord("older");
-    const newer = await resolveSessionRecord("newer");
-    // earliest created_at gets the bare slug; the later one is disambiguated.
-    assert.equal(older.template?.slug, "helper");
-    assert.equal(newer.template?.slug, "helper-2");
-    assert.notEqual(older.template?.slug, newer.template?.slug);
-    // distinct slugs ⇒ each is version 1 of its own slug (NOT merged into versions)
-    assert.equal(older.template?.version, 1);
-    assert.equal(newer.template?.version, 1);
-  });
-});
-
-test("migrate-slugs leaves an emoji-only-named template slug-less (groups by id)", async () => {
-  await withTempHome(async (homeDir) => {
-    await seedTemplate(homeDir, { id: "emoji", name: "🙂" });
-    const result = await migrateTemplateSlugs();
-    assert.equal(result.degenerate, 1);
+    assert.equal(result.degenerate, 2);
     assert.equal(result.assigned, 0);
-    const rec = await resolveSessionRecord("emoji");
-    assert.equal(rec.template?.slug, undefined);
+    for (const id of ["older", "newer"]) {
+      const record = await resolveSessionRecord(id);
+      assert.equal(record.template?.slug, undefined, `${id} was given a slug from nowhere`);
+    }
   });
 });

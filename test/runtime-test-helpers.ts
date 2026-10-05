@@ -37,7 +37,6 @@ export function makeSessionRecord(
     agentName: overrides.agentName,
     agentCommand: overrides.agentCommand,
     cwd: options.resolveCwd === false ? overrides.cwd : path.resolve(overrides.cwd),
-    legacyName: overrides.legacyName,
     createdAt: overrides.createdAt ?? timestamp,
     lastUsedAt: overrides.lastUsedAt ?? timestamp,
     lastSeq: overrides.lastSeq ?? 0,

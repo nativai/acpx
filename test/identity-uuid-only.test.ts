@@ -27,8 +27,6 @@ import { fileURLToPath } from "node:url";
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 const MOCK_AGENT_COMMAND = `node ${JSON.stringify(MOCK_AGENT_PATH)}`;
-// Tests run compiled from dist-test/test, so the REAL sources are two levels up.
-const SRC_DIR = fileURLToPath(new URL("../../src", import.meta.url));
 
 type CliRunResult = { code: number | null; stdout: string; stderr: string };
 
@@ -406,7 +404,7 @@ test("AC-ID4: `-s` with `--seat` is REFUSED, creates nothing, leaves the seat's 
 
 // ───────────────────────── legacy `name` on old records ─────────────────────────
 
-test("a legacy `name` on an old record is kept readable for the backfill, never written by new code", async () => {
+test("a legacy `name` on an old record is NOT surfaced and a rewrite drops it (D-NAME-HARD-MIGRATION)", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await workdir(homeDir, "repo");
     const created = await newSession(homeDir, cwd);
@@ -422,79 +420,27 @@ test("a legacy `name` on an old record is kept readable for the backfill, never 
     const { resolveSessionRecord, writeSessionRecord } =
       await import("../src/session/persistence.js");
     const loaded = await resolveSessionRecord(created.id);
-    // Read through a loose view: this row is RED on the pre-change tree, where the field is `name`.
+    // Read through a loose view: the type has no such field, which is the point.
     const view = loaded as unknown as Record<string, unknown>;
-    assert.equal(view.legacyName, "legacy label");
     assert.equal("name" in view, false);
+    assert.equal("legacyName" in view, false);
 
     await writeSessionRecord(loaded);
-    assert.equal((await readRecord(homeDir, created.id)).name, "legacy label", "a rewrite lost it");
+    assert.equal(
+      Object.hasOwn(await readRecord(homeDir, created.id), "name"),
+      false,
+      "a rewrite kept the name on the record",
+    );
 
-    // A WRONG-TYPED legacy name no longer rejects the whole record (a name identifies nothing).
+    // A WRONG-TYPED legacy name does not reject the record either.
     raw.name = 42;
     await fs.writeFile(
       recordPath(homeDir, created.id),
       `${JSON.stringify(raw, null, 2)}\n`,
       "utf8",
     );
-    const dropped = (await resolveSessionRecord(created.id)) as unknown as Record<string, unknown>;
-    assert.equal(dropped.legacyName, undefined);
+    assert.equal((await resolveSessionRecord(created.id)).acpxRecordId, created.id);
   });
-});
-
-// STRUCTURAL, by discovery: the legacy field may be read by exactly the files that need it —
-// the parser/serializer pair, the type + persisted-field contract, the seat backfill (which
-// mints a seat's name from it), the template-slug migration and the display-name helper.
-// Anything else reading it is a resolution path coming back in by the side door.
-const LEGACY_NAME_READERS = new Set([
-  "session/persistence/full-record-contract.ts",
-  "session/persistence/parse.ts",
-  "session/persistence/repository.ts",
-  "session/persistence/serialize.ts",
-  "session/seat-backfill.ts",
-  "session/seat-display-name.ts",
-  "types.ts",
-]);
-
-async function sourceFiles(dir: string): Promise<string[]> {
-  const out: string[] = [];
-  for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      out.push(...(await sourceFiles(full)));
-    } else if (entry.name.endsWith(".ts")) {
-      out.push(full);
-    }
-  }
-  return out;
-}
-
-function unlistedLegacyNameReaders(files: Map<string, string>): string[] {
-  return [...files]
-    .filter(([relative, text]) => text.includes("legacyName") && !LEGACY_NAME_READERS.has(relative))
-    .map(([relative]) => relative)
-    .toSorted();
-}
-
-test("only the listed files read `legacyName` (discovering scan, with a negative control)", async () => {
-  const files = new Map<string, string>();
-  for (const full of await sourceFiles(SRC_DIR)) {
-    files.set(
-      path.relative(SRC_DIR, full).split(path.sep).join("/"),
-      await fs.readFile(full, "utf8"),
-    );
-  }
-  const present = new Set(
-    [...files].filter(([, text]) => text.includes("legacyName")).map(([f]) => f),
-  );
-  // The scan is alive: it finds the listed readers (positive control)…
-  for (const expected of ["types.ts", "session/persistence/parse.ts"]) {
-    assert.ok(present.has(expected), `the scan did not see ${expected}`);
-  }
-  assert.deepEqual(unlistedLegacyNameReaders(files), []);
-  // …and it FLAGS an unlisted subject that was never registered anywhere (negative control).
-  const withIntruder = new Map(files).set("cli/session-routing.ts", "record.legacyName");
-  assert.deepEqual(unlistedLegacyNameReaders(withIntruder), ["cli/session-routing.ts"]);
 });
 
 // ───────── GUARDS KEPT ALIVE (TE retirement audit, brick 61dc1302) ─────────
