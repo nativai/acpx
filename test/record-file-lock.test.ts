@@ -168,3 +168,110 @@ for (const [label, identity] of [
     assert.equal(ran, true);
   });
 }
+
+/** A live process on THIS host and boot, and the lock content it would write — never breakable. */
+async function liveHolder(): Promise<{ lock: string; stop: () => void }> {
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"]);
+  const stat = readFileSync(`/proc/${child.pid}/stat`, "utf8");
+  const start = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] ?? null;
+  return {
+    lock: JSON.stringify({ pid: child.pid, start, ...LOCAL }),
+    stop: () => child.kill("SIGKILL"),
+  };
+}
+
+/** Puts `content` at the lock path the way a contender does: write a temp, then an atomic link. */
+async function linkLock(lockPath: string, content: string): Promise<void> {
+  const temporary = `${lockPath}.contender.tmp`;
+  await fs.writeFile(temporary, content);
+  await fs.link(temporary, lockPath);
+  await fs.rm(temporary);
+}
+
+type Mutable = { rm: typeof fs.rm; rename: typeof fs.rename };
+
+/**
+ * te-A ATTACK E, deterministically (brick eb4c8d06). Several waiters judge one DEAD holder at
+ * once. Waiter A has judged the stale lock X and re-read it; at the very moment A acts on the lock
+ * path, another breaker removes X and a contender C links its FRESH lock Y. This row performs that
+ * swap at A's first destructive call on the lock path (`rm` or `rename` — whichever the code uses),
+ * which is the exact interleaving the stochastic harness hits ~3 times per 1,500 critical sections.
+ *
+ * RED on a3139b7f: A's read-then-`rm` deletes Y, A acquires at once and runs while C still holds —
+ * two live holders. GREEN with the exclusive break: A takes the file by `rename`, sees it is not
+ * the X it judged, links Y straight back and waits for C like any live holder.
+ */
+test("record lock: attack E — a breaker never deletes a fresh lock that replaced the stale one it judged", async () => {
+  const file = await tempRecordFile();
+  const lockPath = `${file}.lock`;
+  await fs.writeFile(lockPath, JSON.stringify({ pid: await deadPid(), start: null, ...LOCAL }));
+  const contender = await liveHolder();
+  const mutable = fs as unknown as Mutable;
+  const original = { rm: mutable.rm, rename: mutable.rename };
+  let swapped = false;
+  const swapFirst = async (target: unknown) => {
+    if (!swapped && target === lockPath) {
+      swapped = true;
+      await original.rm(lockPath);
+      await linkLock(lockPath, contender.lock);
+    }
+  };
+  mutable.rm = (async (target: string, ...rest: unknown[]) => {
+    await swapFirst(target);
+    return await (original.rm as (...a: unknown[]) => Promise<void>)(target, ...rest);
+  }) as typeof fs.rm;
+  mutable.rename = (async (from: string, to: string) => {
+    await swapFirst(from);
+    return await original.rename(from, to);
+  }) as typeof fs.rename;
+  let ran = false;
+  let writing: Promise<void> | undefined;
+  try {
+    writing = withRecordFileLock(file, async () => {
+      ran = true;
+    });
+    await sleep(1_000);
+  } finally {
+    mutable.rm = original.rm;
+    mutable.rename = original.rename;
+  }
+  try {
+    assert.equal(swapped, true, "the break never touched the lock path — this row tested nothing");
+    assert.equal(ran, false, "TWO LIVE HOLDERS: the breaker deleted the contender's fresh lock");
+    assert.equal(
+      await fs.readFile(lockPath, "utf8"),
+      contender.lock,
+      "the contender's fresh lock was removed",
+    );
+    // The contender releases: the waiting writer must now acquire and land.
+    await fs.rm(lockPath);
+    await writing;
+    assert.equal(ran, true);
+  } finally {
+    contender.stop();
+  }
+});
+
+/**
+ * The same hazard on RELEASE: if our lock was broken while we held it and a contender has linked
+ * its own, our release must not delete theirs. RED on a3139b7f (release was a plain `rm`).
+ */
+test("record lock: release never deletes a lock that is no longer ours", async () => {
+  const file = await tempRecordFile();
+  const lockPath = `${file}.lock`;
+  const contender = await liveHolder();
+  try {
+    await withRecordFileLock(file, async () => {
+      // Our lock is broken and a contender links its own while we are still inside.
+      await fs.rm(lockPath);
+      await linkLock(lockPath, contender.lock);
+    });
+    assert.equal(
+      await fs.readFile(lockPath, "utf8"),
+      contender.lock,
+      "our release deleted the contender's lock",
+    );
+  } finally {
+    contender.stop();
+  }
+});
