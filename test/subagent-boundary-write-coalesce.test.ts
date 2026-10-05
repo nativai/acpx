@@ -195,13 +195,13 @@ test("a throwing onWriteError does not stop the child's later saves", async () =
   assert.deepEqual(saved, [2]);
 });
 
-// ─── Runtime wiring: task_completed flushes the child's coalesced save ───────
+// ─── Runtime wiring: completion and turn end flush the coalesced save ───────
 //
 // Driven through runQueuedTask → runSessionPrompt's REAL onSessionUpdate and
 // onAcpMessage handlers with a minimal AcpClient mock (the convention
 // seat-creation-paths.test.ts uses for this handler chain). The real tailer
-// reads a real JSONL file, so the child's save is genuinely coalesced behind
-// the production interval when task_completed arrives.
+// reads a real JSONL file, so the child's save is genuinely held behind the
+// production interval when the flush is due.
 
 function teammateSpawned(sessionId: string, subagentId: string): SessionNotification {
   return {
@@ -237,95 +237,106 @@ async function waitFor<T>(probe: () => Promise<T | undefined>, timeoutMs: number
   return undefined;
 }
 
-test("runtime: task_completed persists the child's final state without waiting out the interval", async () => {
-  await withTempHomeFixture("acpx-subagent-coalesce-", async (homeDir) => {
-    const cwd = path.join(homeDir, "workspace");
-    await fs.mkdir(cwd, { recursive: true });
-    const claudeConfigDir = path.join(homeDir, "claude-config");
-    const originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
-    process.env.CLAUDE_CONFIG_DIR = claudeConfigDir;
-    try {
-      const parent = makeSessionRecord({
-        acpxRecordId: "parent-session",
-        acpSessionId: "parent-session-acp",
-        agentCommand: "node mock-agent.js",
-        cwd,
-      });
-      await writeSessionRecordFile(homeDir, parent);
+interface SubagentTurn {
+  childId?: string;
+  childFile?: string;
+  messagesBeforeFlush?: number;
+  mtimeBeforeFlush?: number;
+  msFromTranscriptToDisk?: number;
+}
 
-      const observed: {
-        childId?: string;
-        messagesBeforeCompletion?: number;
-        msFromTranscriptToDisk?: number;
-      } = {};
-      let handlers: {
-        onSessionUpdate?: (n: SessionNotification) => void;
-        onAcpMessage?: (direction: "outbound" | "inbound", m: AcpJsonRpcMessage) => void;
-      } = {};
-      const client = {
-        hasReusableSession: () => true,
-        supportsLoadSession: () => false,
-        supportsResumeSession: () => false,
-        start: async () => {},
-        getAgentLifecycleSnapshot: () => ({ running: true }),
-        getPermissionStats: () => ({ requested: 0, approved: 0, denied: 0, cancelled: 0 }),
-        initializeResult: undefined,
-        updateRuntimeOptions: () => {},
-        setEventHandlers: (h: typeof handlers) => {
-          handlers = h;
-        },
-        clearEventHandlers: () => {},
-        hasActivePrompt: () => false,
-        requestCancelActivePrompt: async () => false,
-        cancelActivePrompt: async () => {},
-        setSessionMode: async () => {},
-        setSessionModel: async () => {},
-        setSessionConfigOption: async () => ({ configOptions: [] }),
-        close: async () => {},
-        waitForSessionUpdatesIdle: async () => {},
-        getEffectiveAccountMetadata: () => undefined,
-        prompt: async () => {
-          handlers.onSessionUpdate?.(teammateSpawned("parent-session-acp", "worker-1"));
-          // The child id is minted internally; find its shadow record on disk.
-          const sessionsDir = path.join(homeDir, ".acpx", "sessions");
-          const childId = await waitFor(async () => {
-            for (const name of await fs.readdir(sessionsDir)) {
-              if (!name.endsWith(".json") || name === "index.json") {
-                continue;
-              }
-              const raw = await fs.readFile(path.join(sessionsDir, name), "utf8");
-              if (raw.includes('"kind":"subagent"') || raw.includes('"kind": "subagent"')) {
-                return name.slice(0, -".json".length);
-              }
+/**
+ * One parent turn that spawns a child, feeds its transcript, waits until the
+ * tailer's batch is enqueued (and held by the interval), then either completes
+ * the child or simply ends the turn.
+ */
+async function runSubagentTurn(homeDir: string, completeChild: boolean): Promise<SubagentTurn> {
+  const cwd = path.join(homeDir, "workspace");
+  await fs.mkdir(cwd, { recursive: true });
+  const claudeConfigDir = path.join(homeDir, "claude-config");
+  const originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = claudeConfigDir;
+  try {
+    const parent = makeSessionRecord({
+      acpxRecordId: "parent-session",
+      acpSessionId: "parent-session-acp",
+      agentCommand: "node mock-agent.js",
+      cwd,
+    });
+    await writeSessionRecordFile(homeDir, parent);
+    const sessionsDir = path.join(homeDir, ".acpx", "sessions");
+
+    const observed: SubagentTurn = {};
+    let handlers: {
+      onSessionUpdate?: (n: SessionNotification) => void;
+      onAcpMessage?: (direction: "outbound" | "inbound", m: AcpJsonRpcMessage) => void;
+    } = {};
+    const client = {
+      hasReusableSession: () => true,
+      supportsLoadSession: () => false,
+      supportsResumeSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({ running: true }),
+      getPermissionStats: () => ({ requested: 0, approved: 0, denied: 0, cancelled: 0 }),
+      initializeResult: undefined,
+      updateRuntimeOptions: () => {},
+      setEventHandlers: (h: typeof handlers) => {
+        handlers = h;
+      },
+      clearEventHandlers: () => {},
+      hasActivePrompt: () => false,
+      requestCancelActivePrompt: async () => false,
+      cancelActivePrompt: async () => {},
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+      setSessionConfigOption: async () => ({ configOptions: [] }),
+      close: async () => {},
+      waitForSessionUpdatesIdle: async () => {},
+      getEffectiveAccountMetadata: () => undefined,
+      prompt: async () => {
+        handlers.onSessionUpdate?.(teammateSpawned("parent-session-acp", "worker-1"));
+        // The child id is minted internally; find its shadow record on disk.
+        const childId = await waitFor(async () => {
+          for (const name of await fs.readdir(sessionsDir)) {
+            if (!name.endsWith(".json") || name === "index.json") {
+              continue;
             }
-            return undefined;
-          }, 5_000);
-          observed.childId = childId;
-          if (!childId) {
-            return { stopReason: "end_turn" as const };
+            const raw = await fs.readFile(path.join(sessionsDir, name), "utf8");
+            if (raw.includes('"kind":"subagent"') || raw.includes('"kind": "subagent"')) {
+              return name.slice(0, -".json".length);
+            }
           }
-          const dir = path.join(
-            claudeConfigDir,
-            "projects",
-            transcriptCwdHash(cwd),
-            "parent-session-acp",
-            "subagents",
-          );
-          await fs.mkdir(dir, { recursive: true });
-          const lines = [
-            { type: "user", message: { role: "user", content: "do the thing" } },
-            { type: "assistant", message: { role: "assistant", content: "done" } },
-          ];
-          const transcriptWrittenAt = performance.now();
-          await fs.writeFile(
-            path.join(dir, "agent-worker-1.jsonl"),
-            lines.map((l) => JSON.stringify(l)).join("\n") + "\n",
-          );
-          // Two tailer polls: the batch is read and its save enqueued, then held
-          // by the interval.
-          await sleep(700);
-          observed.messagesBeforeCompletion = (await resolveSessionRecord(childId)).messages.length;
+          return undefined;
+        }, 5_000);
+        observed.childId = childId;
+        if (!childId) {
+          return { stopReason: "end_turn" as const };
+        }
+        observed.childFile = path.join(sessionsDir, `${childId}.json`);
+        const dir = path.join(
+          claudeConfigDir,
+          "projects",
+          transcriptCwdHash(cwd),
+          "parent-session-acp",
+          "subagents",
+        );
+        await fs.mkdir(dir, { recursive: true });
+        const lines = [
+          { type: "user", message: { role: "user", content: "do the thing" } },
+          { type: "assistant", message: { role: "assistant", content: "done" } },
+        ];
+        const transcriptWrittenAt = performance.now();
+        await fs.writeFile(
+          path.join(dir, "agent-worker-1.jsonl"),
+          lines.map((l) => JSON.stringify(l)).join("\n") + "\n",
+        );
+        // Two tailer polls: the batch is read and its save enqueued, then held
+        // by the interval.
+        await sleep(700);
+        observed.messagesBeforeFlush = (await resolveSessionRecord(childId)).messages.length;
+        observed.mtimeBeforeFlush = (await fs.stat(observed.childFile)).mtimeMs;
 
+        if (completeChild) {
           handlers.onAcpMessage?.("inbound", taskCompleted("parent-session-acp", "worker-1"));
           const landed = await waitFor(async () => {
             const child = await resolveSessionRecord(childId);
@@ -334,51 +345,83 @@ test("runtime: task_completed persists the child's final state without waiting o
           if (landed !== undefined) {
             observed.msFromTranscriptToDisk = landed - transcriptWrittenAt;
           }
-          return { stopReason: "end_turn" as const };
-        },
-      } as unknown as AcpClient;
+        }
+        return { stopReason: "end_turn" as const };
+      },
+    } as unknown as AcpClient;
 
-      const task: QueueTask = {
-        requestId: "req-1",
-        message: "spawn a subagent",
-        prompt: textPrompt("spawn a subagent"),
-        permissionMode: "approve-all",
-        timeoutMs: 20_000,
-        waitForCompletion: true,
-        enqueuedAt: Date.now(),
-        send: () => {},
-        close: () => {},
-      };
-      await runQueuedTask("parent-session", task, {
-        sharedClient: client,
-        suppressSdkConsoleErrors: true,
-      });
-
-      assert.ok(observed.childId, "no sub-agent shadow record reached disk");
-      // Positive control for the timing below: the batch was coalesced, not
-      // saved per batch as before.
-      assert.equal(
-        observed.messagesBeforeCompletion,
-        0,
-        "the tailer's batch reached disk before the interval — saves are not coalesced",
-      );
-      // The save is held for the interval from its FIRST enqueue, which is no
-      // earlier than the transcript write. Landing sooner than that can only be
-      // the completion flush.
-      assert.ok(
-        observed.msFromTranscriptToDisk !== undefined &&
-          observed.msFromTranscriptToDisk < SUBAGENT_RECORD_SAVE_INTERVAL_MS,
-        `final state reached disk ${String(observed.msFromTranscriptToDisk?.toFixed(0))} ms after the ` +
-          `transcript write; the interval is ${SUBAGENT_RECORD_SAVE_INTERVAL_MS} ms, so completion did not flush`,
-      );
-      const finalChild = await resolveSessionRecord(observed.childId);
-      assert.equal(finalChild.messages.length, 2);
-    } finally {
-      if (originalClaudeConfigDir === undefined) {
-        delete process.env.CLAUDE_CONFIG_DIR;
-      } else {
-        process.env.CLAUDE_CONFIG_DIR = originalClaudeConfigDir;
-      }
+    const task: QueueTask = {
+      requestId: "req-1",
+      message: "spawn a subagent",
+      prompt: textPrompt("spawn a subagent"),
+      permissionMode: "approve-all",
+      timeoutMs: 20_000,
+      waitForCompletion: true,
+      enqueuedAt: Date.now(),
+      send: () => {},
+      close: () => {},
+    };
+    await runQueuedTask("parent-session", task, {
+      sharedClient: client,
+      suppressSdkConsoleErrors: true,
+    });
+    return observed;
+  } finally {
+    if (originalClaudeConfigDir === undefined) {
+      delete process.env.CLAUDE_CONFIG_DIR;
+    } else {
+      process.env.CLAUDE_CONFIG_DIR = originalClaudeConfigDir;
     }
+  }
+}
+
+test("runtime: task_completed persists the child's final state without waiting out the interval", async () => {
+  await withTempHomeFixture("acpx-subagent-coalesce-", async (homeDir) => {
+    const observed = await runSubagentTurn(homeDir, true);
+
+    assert.ok(observed.childId, "no sub-agent shadow record reached disk");
+    // Positive control for the timing below: the batch was held by the
+    // interval, not saved per batch as before.
+    assert.equal(
+      observed.messagesBeforeFlush,
+      0,
+      "the tailer's batch reached disk before the interval — saves are not coalesced",
+    );
+    // The save is held for the interval from its FIRST enqueue, which is no
+    // earlier than the transcript write. Landing sooner than that can only be
+    // the completion flush.
+    assert.ok(
+      observed.msFromTranscriptToDisk !== undefined &&
+        observed.msFromTranscriptToDisk < SUBAGENT_RECORD_SAVE_INTERVAL_MS,
+      `final state reached disk ${String(observed.msFromTranscriptToDisk?.toFixed(0))} ms after the ` +
+        `transcript write; the interval is ${SUBAGENT_RECORD_SAVE_INTERVAL_MS} ms, so completion did not flush`,
+    );
+    const finalChild = await resolveSessionRecord(observed.childId);
+    assert.equal(finalChild.messages.length, 2);
+  });
+});
+
+test("runtime: turn end flushes a pending child save, and no save outlives the turn", async () => {
+  await withTempHomeFixture("acpx-subagent-coalesce-", async (homeDir) => {
+    const observed = await runSubagentTurn(homeDir, false);
+
+    assert.ok(observed.childId && observed.childFile, "no sub-agent shadow record reached disk");
+    assert.equal(observed.messagesBeforeFlush, 0, "the batch was not held by the interval");
+    const finalChild = await resolveSessionRecord(observed.childId);
+    assert.equal(finalChild.messages.length, 2, "the child's final state is not on disk");
+
+    // The instrument sees a save: the record file changed across the turn end.
+    const mtimeAtReturn = (await fs.stat(observed.childFile)).mtimeMs;
+    assert.notEqual(mtimeAtReturn, observed.mtimeBeforeFlush, "no save at turn end was observed");
+    // The pending save was FLUSHED, not left to its timer: nothing rewrites
+    // the record after the turn has returned. (The event writer's close also
+    // saves the record at turn end, so the state check above alone cannot tell
+    // a flush from a leaked timer; this one can.)
+    await sleep(SUBAGENT_RECORD_SAVE_INTERVAL_MS + 500);
+    assert.equal(
+      (await fs.stat(observed.childFile)).mtimeMs,
+      mtimeAtReturn,
+      "the child's record was rewritten after the turn ended — a coalesced save outlived it",
+    );
   });
 });
