@@ -25,12 +25,23 @@ import os from "node:os";
  * (control + workbench) with SEPARATE pid namespaces sharing one filesystem, so a live holder on
  * the other pod reads as ESRCH here. The lock therefore records `host` (hostname) and `boot`
  * (`/proc/sys/kernel/random/boot_id`), and a lock from a different — or unknown — host or boot is
- * NEVER broken, only waited on and then refused. The cost: a lock orphaned by a process that died
- * on ANOTHER host blocks that record until someone removes the file; the refusal names the file
- * and its holder for exactly that reason.
+ * never judged by its pid.
+ *
+ * ⚠️ BUT IT IS BOUNDED BY AGE. A pod restart changes the hostname and kills every owner mid-turn,
+ * so "foreign host" is precisely the post-restart orphan; left unbounded it would recreate the
+ * 2026-10-05 symptom — a session record that refuses every write until someone deletes a file.
+ * Legitimate holds are milliseconds (read -> merge -> rename, no network), so a lock that cannot
+ * be judged by pid is broken once it is older than RECORD_LOCK_STALE_MS, with a warning naming
+ * the file, holder and age. The waiter's budget (RECORD_LOCK_BUDGET_MS) is deliberately LONGER
+ * than that bound, so a waiting writer clears an orphan itself instead of refusing. A same-host,
+ * same-boot holder that is provably ALIVE is never broken at any age.
+ *
+ * Breaking a stale lock is ACQUIRING it (compare-and-delete, then the atomic create), never
+ * writing without it.
  */
 
-const RECORD_LOCK_BUDGET_MS = 10_000;
+const RECORD_LOCK_BUDGET_MS = 20_000;
+const RECORD_LOCK_STALE_MS = 15_000;
 const RECORD_LOCK_CAP_MS = 50;
 
 type LockHolder = { pid: number; start: string | null; host: string | null; boot: string | null };
@@ -51,8 +62,7 @@ export class RecordLockTimeoutError extends Error {
   constructor(lockPath: string, holder: string) {
     super(
       `session record lock ${lockPath} is held by ${holder} for over ` +
-        `${RECORD_LOCK_BUDGET_MS} ms; refusing to write unlocked. A holder on another host or ` +
-        `boot is never broken automatically — if it is known dead, remove the lock file.`,
+        `${RECORD_LOCK_BUDGET_MS} ms; refusing to write unlocked`,
     );
   }
 }
@@ -89,17 +99,26 @@ function holderIsProvablyDead(holder: LockHolder): boolean {
   return current !== null && current !== holder.start;
 }
 
-async function readHolder(lockPath: string): Promise<{ raw: string; holder: LockHolder } | null> {
+function parseHolder(raw: string): Partial<LockHolder> {
   try {
-    const raw = await fs.readFile(lockPath, "utf8");
-    const parsed = JSON.parse(raw) as Partial<LockHolder>;
-    if (typeof parsed.pid !== "number") {
-      return null;
-    }
+    return JSON.parse(raw) as Partial<LockHolder>;
+  } catch {
+    return {};
+  }
+}
+
+type ReadHolder = { raw: string; ageMs: number; holder: LockHolder };
+
+async function readHolder(lockPath: string): Promise<ReadHolder | null> {
+  try {
+    const [raw, stat] = await Promise.all([fs.readFile(lockPath, "utf8"), fs.stat(lockPath)]);
+    // Unparseable content is treated as an UNIDENTIFIED holder, so the age bound still clears it.
+    const parsed = parseHolder(raw);
     return {
       raw,
+      ageMs: Date.now() - stat.mtimeMs,
       holder: {
-        pid: parsed.pid,
+        pid: typeof parsed.pid === "number" ? parsed.pid : -1,
         start: parsed.start ?? null,
         host: parsed.host ?? null,
         boot: parsed.boot ?? null,
@@ -131,12 +150,36 @@ async function tryAcquire(lockPath: string, content: string): Promise<boolean> {
   }
 }
 
-/** Removes the lock only when its holder is provably dead — compare-and-delete on its content. */
-async function breakDeadHolder(lockPath: string): Promise<{ broken: boolean; holder: string }> {
+/** Why this lock may be broken, or null: a provably dead local holder, or an unjudgeable stale one. */
+function breakReason(current: ReadHolder): string | null {
+  if (current.holder.pid > 0 && holderIsProvablyDead(current.holder)) {
+    return "holder is dead";
+  }
+  if (!isLocalHolder(current.holder) && current.ageMs > RECORD_LOCK_STALE_MS) {
+    return `holder on another host/boot or unidentified, lock is ${Math.round(current.ageMs)} ms old`;
+  }
+  return null;
+}
+
+/** A break by AGE (not by a provably dead local pid) is named on stderr — the owner.log. */
+function warnIfUnjudged(lockPath: string, reason: string, current: ReadHolder): void {
+  if (isLocalHolder(current.holder)) {
+    return;
+  }
+  process.stderr.write(
+    `[acpx] WARNING: breaking stale session record lock ${lockPath} (${reason}); ` +
+      `holder ${current.raw}\n`,
+  );
+}
+
+/** Removes a breakable lock — compare-and-delete on its content, so a fresh holder is never hit. */
+async function breakStaleHolder(lockPath: string): Promise<{ broken: boolean; holder: string }> {
   const current = await readHolder(lockPath);
-  if (!current || !holderIsProvablyDead(current.holder)) {
+  const reason = current ? breakReason(current) : null;
+  if (!current || !reason) {
     return { broken: false, holder: current?.raw ?? "unreadable holder" };
   }
+  warnIfUnjudged(lockPath, reason, current);
   const again = await readHolder(lockPath);
   if (again?.raw === current.raw) {
     await fs.rm(lockPath, { force: true });
@@ -158,7 +201,7 @@ export async function withRecordFileLock<T>(
   const started = Date.now();
   let delay = 2 + Math.floor(Math.random() * 3);
   while (!(await tryAcquire(lockPath, content))) {
-    const { broken, holder } = await breakDeadHolder(lockPath);
+    const { broken, holder } = await breakStaleHolder(lockPath);
     if (broken) {
       continue;
     }

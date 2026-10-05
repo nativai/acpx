@@ -114,28 +114,57 @@ test("record lock: a LIVE holder is never broken or bypassed — the writer refu
   }
 });
 
+async function writeLock(file: string, content: object, ageMs: number): Promise<string> {
+  const lock = JSON.stringify(content);
+  await fs.writeFile(`${file}.lock`, lock);
+  const when = new Date(Date.now() - ageMs);
+  await fs.utimes(`${file}.lock`, when, when);
+  return lock;
+}
+
 /**
- * NEGATIVE CASE — the other pod. A lock naming a DIFFERENT host (or boot) with a pid that looks
- * dead here is NOT broken: that pid lives in another pid namespace, so ESRCH proves nothing. The
- * writer waits its budget and refuses. Same for a lock with no host at all (unknown provenance).
+ * THE OTHER POD. A lock from a different host (or boot, or with no identity) cannot be judged by
+ * its pid — that pid lives in another pid namespace, so ESRCH proves nothing. It is broken only by
+ * AGE (> 15 s; a legitimate hold lasts milliseconds), which is also what clears the orphan a pod
+ * restart leaves behind.
  */
+for (const [label, identity] of [
+  ["a foreign host", { host: "dev-server-workbench-other-pod", boot: LOCAL.boot }],
+  ["no host identity", {}],
+] as const) {
+  test(`record lock: a 16 s old lock from ${label} IS broken and the write lands`, async () => {
+    const file = await tempRecordFile();
+    await writeLock(file, { pid: await deadPid(), start: null, ...identity }, 16_000);
+    let ran = false;
+    await withRecordFileLock(file, async () => {
+      ran = true;
+    });
+    assert.ok(ran, "the write did not land");
+  });
+}
+
 for (const [label, identity] of [
   ["a foreign host", { host: "dev-server-workbench-other-pod", boot: LOCAL.boot }],
   ["a foreign boot", { host: LOCAL.host, boot: "00000000-0000-0000-0000-000000000000" }],
   ["no host identity", {}],
 ] as const) {
-  test(`record lock: a dead-looking pid from ${label} is NEVER broken — the writer refuses`, async () => {
+  test(`record lock: a 1 s old lock from ${label} with a dead-looking pid is NOT broken — the writer waits`, async () => {
     const file = await tempRecordFile();
-    const lock = JSON.stringify({ pid: await deadPid(), start: null, ...identity });
-    await fs.writeFile(`${file}.lock`, lock);
+    const lock = await writeLock(file, { pid: await deadPid(), start: null, ...identity }, 1_000);
     let ran = false;
-    await assert.rejects(
-      withRecordFileLock(file, async () => {
-        ran = true;
-      }),
-      (error: Error & { code?: string }) => error.code === "record-lock-timeout",
+    const writing = withRecordFileLock(file, async () => {
+      ran = true;
+    });
+    await sleep(2_000);
+    assert.equal(ran, false, "the writer did not wait for a young foreign lock");
+    assert.equal(
+      await fs.readFile(`${file}.lock`, "utf8"),
+      lock,
+      "a young foreign lock was broken",
     );
-    assert.equal(ran, false, "the action ran without the lock");
-    assert.equal(await fs.readFile(`${file}.lock`, "utf8"), lock, "a foreign lock was broken");
+    // The holder releases: the waiting writer must now acquire and land.
+    await fs.rm(`${file}.lock`);
+    await writing;
+    assert.equal(ran, true);
   });
 }
