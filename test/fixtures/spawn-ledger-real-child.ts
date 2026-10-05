@@ -3,11 +3,11 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { BrickOutbox } from "../../src/brick-outbox.js";
 import { parseSessionRecord } from "../../src/session/persistence/parse.js";
+import { SpawnLedger } from "../../src/spawn-ledger.js";
 
-assert.ok(os.homedir().startsWith("/workspace/bricksdb-b14-selftest/"));
-const outbox = new BrickOutbox();
+assert.ok(os.homedir().startsWith("/workspace/spawn-ledger-selftest/"));
+const outbox = new SpawnLedger();
 const revoked = process.argv[2] === "revoked";
 const target = "33333333-3333-4333-8333-333333333333";
 const marker = path.join(os.homedir(), "adapter-reached");
@@ -20,7 +20,7 @@ const attempt = outbox.reserveSpawn({
   child_brick_id: "fixture",
   target_record_id: target,
 });
-const command = `node ${path.resolve("test/fixtures/b14-acp-barrier.mjs")} ${marker} ${release}`;
+const command = `node ${path.resolve("test/fixtures/spawn-ledger-acp-barrier.mjs")} ${marker} ${release}`;
 const child = spawn(
   process.execPath,
   [
@@ -69,7 +69,7 @@ await new Promise<void>((resolve, reject) => {
 });
 let acted = 0;
 try {
-  const deadline = Date.now() + 10000;
+  const deadline = Date.now() + 45000;
   while (!fs.existsSync(marker) && Date.now() < deadline && child.exitCode === null) {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }

@@ -32,7 +32,7 @@ export function createSubagentBoundaryWriteEnqueuer(deps: {
     // `.catch(() => {})` settles `next`, NOT this derived promise. acpx installs
     // no `process.on("unhandledRejection")`, so under Node's default
     // `--unhandled-rejections=throw` one rejected write — e.g.
-    // `OutboxError("outbox-busy")` under record-outbox contention — becomes an
+    // `SpawnLedgerError("outbox-busy")` under spawn-ledger contention — becomes an
     // uncaught exception that kills the whole queue-owner process mid-turn.
     // Nine owners died that way on devbox on 2026-09-22.
     // Fire-tested by `test/subagent-boundary-write-rejection.test.ts`, which

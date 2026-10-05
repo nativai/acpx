@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+import path from "node:path";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
 import {
   AcpClient,
@@ -12,7 +14,6 @@ import {
 } from "../../acp/harness-capabilities.js";
 import { readTransientAdvertisement } from "../../acp/transient-advertisement.js";
 import { withInterrupt, withTimeout } from "../../async-control.js";
-import { BrickOutbox } from "../../brick-outbox.js";
 import { bindDefaultAccountToSessionOptionsAsync } from "../../runtime/engine/default-account-binding.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
 import { persistSessionOptions } from "../../runtime/engine/session-options.js";
@@ -54,6 +55,8 @@ import {
   isoNow,
   normalizeName,
   resolveSessionRecord,
+  sessionBaseDir,
+  sessionRecordFileName,
   writeSessionRecord,
   writeSessionRecordAtBoundary,
 } from "../../session/persistence.js";
@@ -126,15 +129,12 @@ async function createSessionRecordWithClient(
 ): Promise<SessionRecord> {
   const cwd = absolutePath(options.cwd);
   if (options.recordId) {
-    const outbox = new BrickOutbox();
-    try {
-      if (outbox.readRecord(options.recordId)) {
-        throw new Error(
-          "record-id destination already exists; refusing to create another ACP session",
-        );
-      }
-    } finally {
-      outbox.close();
+    // A plain existence check — it must not open the spawn ledger (that took the box-wide
+    // SQLite write lock on every session creation, brick 750d674d).
+    if (existsSync(path.join(sessionBaseDir(), sessionRecordFileName(options.recordId)))) {
+      throw new Error(
+        "record-id destination already exists; refusing to create another ACP session",
+      );
     }
   }
   await withTimeout(client.start(), options.timeoutMs);

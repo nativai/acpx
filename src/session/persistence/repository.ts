@@ -3,13 +3,13 @@ import { statSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { BrickOutbox, openRecordOutbox, type DiskRecord } from "../../brick-outbox.js";
 import {
   SessionArchivedError,
   SessionNotFoundError,
   SessionResolutionError,
 } from "../../errors.js";
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
+import { SpawnLedger, openSpawnLedgerForRecord, type DiskRecord } from "../../spawn-ledger.js";
 import type { SessionAcpxState, SessionRecord } from "../../types.js";
 import { sessionArchiveDirFor } from "../archive/paths.js";
 import { getLoggedMessageCount, markAllMessagesLogged } from "../messages-log-bookkeeping.js";
@@ -700,20 +700,11 @@ async function writeSessionRecordInternal(
 
     const sessionDir = sessionBaseDir();
     const logPath = messagesLogPath(sessionDir, record.acpxRecordId);
-    const ownedOutbox = outboxForRecord(record);
-    const writeLog = async (current?: DiskRecord) => {
-      if (current) {
-        mergeRecordMetadataForPersist(record, current.metadata);
-      }
-      if (options.messagePersistence === "boundary") {
-        await writeMessagesLogBoundary(record, logPath);
-      } else {
-        await clearMissingMessagesLogPointerForWrite(record, logPath);
-      }
-    };
+    await writeMessagesSidecar(record, logPath, options.messagePersistence === "boundary");
+    // Only a spawn-owned record (metadata.spawn_key) opens the spawn ledger; every other
+    // record write stays off SQLite entirely.
+    const ledger = openSpawnLedgerForRecord(record.metadata, sessionDir);
     try {
-      await guardedMessagesWrite(ownedOutbox, record, writeLog);
-
       // The snake_case key policy is asserted INSIDE serializeSessionRecordForDisk
       // (brick://48aca560) so test fixtures cannot bypass it; do not re-walk here.
       const persistedRecord = serializeSessionRecordForDisk(record, { messages: "split-tail" });
@@ -731,42 +722,37 @@ async function writeSessionRecordInternal(
       // Compact JSON: parses identically everywhere, saves ~30-40% of bytes and
       // stringify CPU on every checkpoint of a multi-MB record.
       record.metadata = (
-        await persistRecordFile(file, persistedRecord as DiskRecord, ownedOutbox)
+        await persistRecordFile(file, persistedRecord as DiskRecord, ledger)
       ).metadata;
 
       await updateIndexForWrittenRecord(sessionDir, record, path.basename(file), options);
       rememberSessionMetadataBaseline(record);
       rememberSessionModelBaseline(record);
     } finally {
-      ownedOutbox?.close();
+      ledger?.close();
     }
   });
 }
 
-async function guardedMessagesWrite(
-  outbox: BrickOutbox | undefined,
+async function writeMessagesSidecar(
   record: SessionRecord,
-  action: (current?: DiskRecord) => Promise<void>,
+  logPath: string,
+  boundary: boolean,
 ): Promise<void> {
-  if (!outbox) {
-    return await action();
+  if (boundary) {
+    await writeMessagesLogBoundary(record, logPath);
+  } else {
+    await clearMissingMessagesLogPointerForWrite(record, logPath);
   }
-  await outbox.withOwnedSidecarWrite(
-    record.acpxRecordId,
-    serializeSessionRecordForDisk(record, { messages: "split-tail" }) as DiskRecord,
-    action,
-  );
 }
-function outboxForRecord(record: SessionRecord): BrickOutbox | undefined {
-  return openRecordOutbox(record.metadata, sessionBaseDir());
-}
+
 async function persistRecordFile(
   file: string,
   raw: DiskRecord,
-  outbox: BrickOutbox | undefined,
+  ledger: SpawnLedger | undefined,
 ): Promise<DiskRecord> {
-  if (outbox) {
-    return outbox.saveRecord(raw);
+  if (ledger) {
+    return ledger.saveRecord(raw);
   }
   const temporary = `${file}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
   await fs.writeFile(temporary, `${JSON.stringify(raw)}\n`, "utf8");
@@ -1232,12 +1218,7 @@ async function hardDeleteSessionRecord(entry: SessionIndexEntry): Promise<void> 
     },
   ]);
 
-  const expected = record
-    ? (serializeSessionRecordForDisk(record) as DiskRecord)
-    : { acpx_record_id: acpxRecordId, acp_session_id: entry.acpSessionId };
-  await withCanonicalDeletion(sessionDir, expected, () =>
-    unlinkHardDeletedFiles(sessionDir, acpxRecordId, safeId),
-  );
+  await unlinkHardDeletedFiles(sessionDir, acpxRecordId, safeId);
   await rebuildSessionIndex(sessionDir, "template-rollback-delete").catch(() => {
     // best-effort cache rebuild; the record files are already gone
   });
@@ -2297,27 +2278,7 @@ async function pruneSessionFiles(
   streamFilesBySafeId: Map<string, string[]>,
   includeHistory: boolean,
 ): Promise<number> {
-  return withCanonicalDeletion(
-    sessionDir,
-    serializeSessionRecordForDisk(record) as DiskRecord,
-    () => unlinkPrunedSessionFiles(record, sessionDir, streamFilesBySafeId, includeHistory),
-  );
-}
-
-async function withCanonicalDeletion<T>(
-  sessionDir: string,
-  expected: DiskRecord,
-  action: () => Promise<T>,
-): Promise<T> {
-  const outbox = openRecordOutbox(expected.metadata, sessionDir);
-  if (!outbox) {
-    return action();
-  }
-  try {
-    return await outbox.withRecordDeletion(String(expected.acpx_record_id), expected, action);
-  } finally {
-    outbox.close();
-  }
+  return unlinkPrunedSessionFiles(record, sessionDir, streamFilesBySafeId, includeHistory);
 }
 
 async function unlinkPrunedSessionFiles(
