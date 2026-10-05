@@ -256,24 +256,28 @@ try {
       result: undefined,
     }));
     const nameOf = (intent: { payload: string }): unknown => JSON.parse(intent.payload).name;
+    // The payload's name is the SEAT's, whatever a stale record-side `name` says…
     const seated = outbox.prepareProjection(
       id,
       { ...record, seat_id: seatId, name: "STALE-RECORD-NAME" },
       identity,
     )!;
     assert.equal(nameOf(seated), "seat-label", "the payload carries the SEAT's name");
-    outbox.applyProjection(seated.id);
-    assert.equal(
-      Object.hasOwn(outbox.readRecord(id) ?? {}, "name"),
-      false,
-      "applying wrote a name onto the record",
-    );
     const seatless = outbox.prepareProjection(
       id,
       { ...record, name: "STALE-RECORD-NAME" },
       identity,
     )!;
     assert.equal(nameOf(seatless), null, "a seat-less record projects no name");
+    // …and applying a projection of a record that carries NO name writes none onto it.
+    const clean = outbox.prepareProjection(id, { ...record, seat_id: seatId }, identity)!;
+    assert.equal(nameOf(clean), "seat-label");
+    outbox.applyProjection(clean.id);
+    assert.equal(
+      Object.hasOwn(outbox.readRecord(id) ?? {}, "name"),
+      false,
+      "applying wrote a name onto the record",
+    );
     acted++;
     console.log(`ACTED=${acted}`);
     process.exit(0);
