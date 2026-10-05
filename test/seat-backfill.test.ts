@@ -149,6 +149,17 @@ type BackfillJson = {
   brickLinksFilled: number;
   activeHoldersFilled: number;
   holderMirrorsSet: number;
+  recordsWithLegacyName: number;
+  seatsTakingName: number;
+  seatsDifferingName: {
+    seatId: string;
+    seatName: string;
+    records: { acpxRecordId: string; recordName: string }[];
+  }[];
+  recordsToStrip: number;
+  stripped: number;
+  indexNamesToProject: number;
+  unparseableNameLeft: { file: string; acpxRecordId?: string }[];
   errors: { file: string; stage: string; code?: string; message: string }[];
   backupSuffix?: string;
   backups: string[];
@@ -160,6 +171,19 @@ type BackfillJson = {
 async function backfill(homeDir: string, extra: string[] = []): Promise<BackfillJson> {
   const result = await runCli(["seats", "backfill", "--format", "json", ...extra], homeDir);
   assert.equal(result.code, 0, `seats backfill exited ${result.code}: ${result.stderr}`);
+  return JSON.parse(result.stdout.trim()) as BackfillJson;
+}
+
+/** For the rows whose subject IS a per-record refusal: an apply that refused something exits 1
+ * (the owner's window reads the rc) AND still prints its whole report on stdout. */
+async function backfillRefusing(homeDir: string, extra: string[] = []): Promise<BackfillJson> {
+  const result = await runCli(["seats", "backfill", "--format", "json", ...extra], homeDir);
+  assert.equal(
+    result.code,
+    1,
+    `a refusing apply must exit 1, got ${result.code}: ${result.stderr}`,
+  );
+  assert.match(result.stderr, /refused or failed during --apply/);
   return JSON.parse(result.stdout.trim()) as BackfillJson;
 }
 
@@ -183,6 +207,18 @@ function makeRecord(overrides: Partial<SessionRecord> & { acpxRecordId: string }
     lastUsedAt: `2026-01-01T00:00:${String(recordSeq % 60).padStart(2, "0")}.000Z`,
     ...overrides,
   });
+}
+
+/** Age records the way an older acpx left them: its `name` written ON DISK. The record
+ * type has no such field any more, so this is a raw edit of the JSON — and it is done
+ * AFTER the index is built, so the index entries are the post-identity ones. */
+async function stampLegacyNames(homeDir: string, names: Record<string, unknown>): Promise<void> {
+  for (const [id, name] of Object.entries(names)) {
+    const file = path.join(sessionsDir(homeDir), `${encodeURIComponent(id)}.json`);
+    const raw = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+    raw.name = name;
+    await fs.writeFile(file, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+  }
 }
 
 async function seed(homeDir: string, records: readonly SessionRecord[]): Promise<void> {
@@ -314,9 +350,10 @@ test("L1: the DEFAULT is a dry run — counts reported, store byte-identical", a
 test("L2: --apply mints the seats, enriches the entries and CREATES an absent store", async () => {
   await withTempHome(async (homeDir) => {
     await seed(homeDir, [
-      makeRecord({ acpxRecordId: "l2-a", legacyName: "alpha" }),
-      makeRecord({ acpxRecordId: "l2-b", legacyName: "beta", closed: true }),
+      makeRecord({ acpxRecordId: "l2-a" }),
+      makeRecord({ acpxRecordId: "l2-b", closed: true }),
     ]);
+    await stampLegacyNames(homeDir, { "l2-a": "alpha", "l2-b": "beta" });
     // The control for the "creates an ABSENT store" claim: it really is absent first.
     assert.equal((await readSeatStore(sessionsDir(homeDir))).fileState, "absent");
 
@@ -355,7 +392,8 @@ test("L2: --apply mints the seats, enriches the entries and CREATES an absent st
 
 test("L2b: the record leg changes the SEAT GROUP and nothing else", async () => {
   await withTempHome(async (homeDir) => {
-    await seed(homeDir, [makeRecord({ acpxRecordId: "l2b", legacyName: "kept", favorite: true })]);
+    await seed(homeDir, [makeRecord({ acpxRecordId: "l2b", favorite: true })]);
+    await stampLegacyNames(homeDir, { l2b: "kept" });
     const before = await readRecordJson(homeDir, "l2b");
 
     await backfill(homeDir, ["--apply"]);
@@ -366,7 +404,12 @@ test("L2b: the record leg changes the SEAT GROUP and nothing else", async () => 
       .toSorted();
     // A completeness claim by CONSTRUCTION rather than by spot-check: every key of
     // both objects is compared, so a field this write silently drops shows up here.
-    assert.deepEqual(changed, ["holder_active", "holder_ordinal", "seat_id"]);
+    // …plus the legacy `name`, which the strip step moved to the seat (D-NAME-HARD-MIGRATION).
+    assert.deepEqual(changed, ["holder_active", "holder_ordinal", "name", "seat_id"]);
+    assert.equal(
+      (await readSeatStore(sessionsDir(homeDir))).seats.get(String(after.seat_id))?.name,
+      "kept",
+    );
   });
 });
 
@@ -533,7 +576,7 @@ test("R2b: the backfill REFUSES to overwrite a malformed ROW and carries it verb
     const corruptRow = { seat_id: seatId, created_at: "2026-01-01T00:00:00.000Z", next_ordinal: 2 };
     await fs.writeFile(storePath, `${JSON.stringify({ [seatId]: corruptRow })}\n`, "utf8");
 
-    const report = await backfill(homeDir, ["--apply"]);
+    const report = await backfillRefusing(homeDir, ["--apply"]);
     assert.equal(report.seats, 0, "a malformed row must not be minted over");
     assert.equal(report.errors.length, 1);
     assert.equal(
@@ -735,10 +778,11 @@ test("FAV5: a row with NO favorite key at all (real pre-migration shape) is migr
 test("L7: every backfilled row round-trips parseSeatFromPersisted", async () => {
   await withTempHome(async (homeDir) => {
     await seed(homeDir, [
-      makeRecord({ acpxRecordId: "l7-a", legacyName: "named" }),
-      makeRecord({ acpxRecordId: "l7-b", legacyName: undefined }),
+      makeRecord({ acpxRecordId: "l7-a" }),
+      makeRecord({ acpxRecordId: "l7-b" }),
       makeRecord({ acpxRecordId: "l7-c", closed: true }),
     ]);
+    await stampLegacyNames(homeDir, { "l7-a": "named" });
     const report = await backfill(homeDir, ["--apply"]);
     assert.equal(report.seats, 3, "control: rows must actually have been written");
 
@@ -942,7 +986,7 @@ test("L12: an abort between the legs leaves NO index entry claiming a seat its r
       makeRecord({ acpxRecordId: "l12-control" }),
     ]);
 
-    const report = await backfill(homeDir, ["--apply"]);
+    const report = await backfillRefusing(homeDir, ["--apply"]);
 
     // The control produced a non-zero result…
     assert.equal(report.seats, 1, "the control record was not seated — the run did nothing");
@@ -990,7 +1034,7 @@ test("L12b: a record whose ROLLBACK COPY cannot be taken is skipped, not written
       makeRecord({ acpxRecordId: "l12b-control" }),
     ]);
 
-    const report = await backfill(homeDir, ["--apply"]);
+    const report = await backfillRefusing(homeDir, ["--apply"]);
 
     assert.equal(report.seats, 1, "the run aborted — the other records were not processed");
     assert.equal(typeof (await readRecordJson(homeDir, "l12b-control")).seat_id, "string");
@@ -2448,3 +2492,348 @@ test(
     });
   },
 );
+
+// ─── N — D-NAME-HARD-MIGRATION: the strip step ───────────────────────────────
+
+/** A seat row already in `seats.json`, the way an identity-lane box has them. */
+async function seedSeat(
+  homeDir: string,
+  seatId: string,
+  holderId: string,
+  name: string | undefined,
+): Promise<void> {
+  await backfillSeatRow(sessionsDir(homeDir), {
+    seatId,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    activeHolderId: holderId,
+    nextOrdinal: 3,
+    closedAt: null,
+    name,
+    brickId: undefined,
+    favorite: false,
+  });
+}
+
+/** Add `name` keys to the INDEX entries, as the index an older acpx wrote carries. */
+async function stampIndexNames(homeDir: string, names: Record<string, string>): Promise<void> {
+  const file = path.join(sessionsDir(homeDir), "index.json");
+  const index = JSON.parse(await fs.readFile(file, "utf8")) as {
+    entries: Record<string, unknown>[];
+  };
+  for (const entry of index.entries) {
+    const name = names[String(entry.acpxRecordId)];
+    if (name !== undefined) {
+      entry.name = name;
+    }
+  }
+  await fs.writeFile(file, JSON.stringify(index), "utf8");
+}
+
+async function readSeatNames(homeDir: string): Promise<Record<string, string | undefined>> {
+  const store = await readSeatStore(sessionsDir(homeDir));
+  return Object.fromEntries([...store.seats].map(([id, row]) => [id, row.name]));
+}
+
+async function nameKeyOwners(homeDir: string): Promise<string[]> {
+  const out: string[] = [];
+  for (const file of (await fs.readdir(sessionsDir(homeDir))).toSorted()) {
+    if (!/^[^.]+\.json$/.test(file) || file === "index.json" || file === SEAT_STORE_FILE) {
+      continue;
+    }
+    const raw = JSON.parse(await fs.readFile(path.join(sessionsDir(homeDir), file), "utf8")) as {
+      name?: unknown;
+      acpx_record_id?: string;
+    };
+    if (Object.hasOwn(raw, "name")) {
+      out.push(String(raw.acpx_record_id));
+    }
+  }
+  return out;
+}
+
+/** A rig population covering every class the strip decides on. */
+async function seedNameRig(homeDir: string): Promise<void> {
+  await seed(homeDir, [
+    makeRecord({ acpxRecordId: "n-fresh" }), // seat-less, named: its fresh seat takes the name
+    makeRecord({
+      acpxRecordId: "n-take",
+      seatId: "seat-take",
+      holderOrdinal: 1,
+      holderActive: true,
+    }),
+    makeRecord({
+      acpxRecordId: "n-wins",
+      seatId: "seat-wins",
+      holderOrdinal: 1,
+      holderActive: true,
+    }),
+    makeRecord({ acpxRecordId: "n-wrongtype" }), // a `name` of the wrong type: stripped, no taker
+    makeRecord({ acpxRecordId: "n-blank" }), // a blank `name`: stripped, no taker
+    makeRecord({ acpxRecordId: "n-none" }), // no `name` key: left alone
+    makeRecord({
+      acpxRecordId: "n-old",
+      seatId: "seat-multi",
+      holderOrdinal: 1,
+      holderActive: false,
+    }),
+    makeRecord({
+      acpxRecordId: "n-new",
+      seatId: "seat-multi",
+      holderOrdinal: 2,
+      holderActive: true,
+    }),
+  ]);
+  await seedSeat(homeDir, "seat-take", "n-take", undefined);
+  await seedSeat(homeDir, "seat-wins", "n-wins", "seat-name-wins");
+  await seedSeat(homeDir, "seat-multi", "n-new", undefined);
+  await stampLegacyNames(homeDir, {
+    "n-fresh": "alpha",
+    "n-take": "beta",
+    "n-wins": "other-name",
+    "n-wrongtype": 42,
+    "n-blank": "   ",
+    "n-old": "old-holder",
+    "n-new": "new-holder",
+  });
+  await stampIndexNames(homeDir, { "n-fresh": "alpha", "n-none": "stale" });
+  // An UNPARSEABLE record that carries a name — written after the index, like a July QA fixture.
+  await fs.writeFile(
+    path.join(sessionsDir(homeDir), "17100000-aaaa.json"),
+    JSON.stringify({ schema: "not-acpx", acpx_record_id: "17100000-aaaa", name: "fixture" }),
+    "utf8",
+  );
+}
+
+test("N1: dry run — the four numbers, the differing seats listed, the unparseable residual listed; nothing written", async () => {
+  await withTempHome(async (homeDir) => {
+    await seedNameRig(homeDir);
+    const before = await snapshot(homeDir);
+
+    const report = await backfill(homeDir);
+
+    // records with a legacy NAME (a non-empty string): fresh, take, wins, old, new
+    assert.equal(report.recordsWithLegacyName, 5);
+    // seats that take one: fresh's new seat (alpha), seat-take (beta), seat-multi (new-holder)
+    assert.equal(report.seatsTakingName, 3);
+    // seats that differ: seat-wins (record "other-name"), seat-multi (record "old-holder")
+    assert.deepEqual(
+      report.seatsDifferingName
+        .map((seat) => ({
+          seatId: seat.seatId,
+          seatName: seat.seatName,
+          records: seat.records.map((record) => `${record.acpxRecordId}=${record.recordName}`),
+        }))
+        .toSorted((a, b) => a.seatId.localeCompare(b.seatId)),
+      [
+        { seatId: "seat-multi", seatName: "new-holder", records: ["n-old=old-holder"] },
+        { seatId: "seat-wins", seatName: "seat-name-wins", records: ["n-wins=other-name"] },
+      ],
+    );
+    // records to strip: every PARSEABLE record with a `name` key of any value (7)
+    assert.equal(report.recordsToStrip, 7);
+    assert.equal(report.stripped, 0, "a dry run strips nothing");
+    // index entries whose `name` differs from the seat's name they will have: n-none (a stale
+    // name on a nameless seat), n-take, n-old, n-new. n-fresh agrees (entry "alpha"), and n-wins
+    // already agrees: seeding its seat row projected "seat-name-wins" onto its entry.
+    assert.equal(report.indexNamesToProject, 4);
+    // RULED: an unparseable record's name is left in place and LISTED by id
+    assert.deepEqual(
+      report.unparseableNameLeft.map((left) => left.acpxRecordId),
+      ["17100000-aaaa"],
+    );
+    assert.deepEqual(diffNames(before, await snapshot(homeDir)), [], "a dry run wrote");
+  });
+});
+
+test("N2: apply — seats take the names, the SEAT wins a difference, every parseable record loses `name`, the index is re-projected", async () => {
+  await withTempHome(async (homeDir) => {
+    await seedNameRig(homeDir);
+    const dry = await backfill(homeDir);
+    const keptBefore = await readRecordJson(homeDir, "n-none");
+
+    const report = await backfill(homeDir, ["--apply"]);
+
+    assert.equal(report.errors.filter((error) => error.stage !== "parse").length, 0);
+    assert.equal(report.stripped, 7);
+    assert.equal(report.stripped, dry.recordsToStrip, "the apply stripped what the dry run said");
+    assert.equal(report.seatsTakingName, 3);
+    assert.equal(report.recordsWithLegacyName, dry.recordsWithLegacyName);
+
+    // the seat rows: takers took, the SEAT's own name won where it differed
+    const names = await readSeatNames(homeDir);
+    assert.equal(names["seat-take"], "beta");
+    assert.equal(names["seat-wins"], "seat-name-wins");
+    assert.equal(names["seat-multi"], "new-holder");
+    const fresh = await readRecordJson(homeDir, "n-fresh");
+    assert.equal(names[String(fresh.seat_id)], "alpha");
+
+    // NAME-FIELD: zero over parseable records; the unparseable fixture keeps its name, byte for byte
+    assert.deepEqual(await nameKeyOwners(homeDir), ["17100000-aaaa"]);
+    assert.equal(
+      JSON.parse(await fs.readFile(path.join(sessionsDir(homeDir), "17100000-aaaa.json"), "utf8"))
+        .name,
+      "fixture",
+    );
+
+    // a record with no `name` key was not rewritten for the strip (its seat group is its own business)
+    const keptAfter = await readRecordJson(homeDir, "n-none");
+    assert.equal(keptAfter.last_used_at, keptBefore.last_used_at);
+
+    // the index carries the SEAT's name on every seated entry (D-NAME-HARD-MIGRATION: the
+    // entry's `name` is projected from the seat) and none on a nameless seat's entry
+    const entries = await readIndexEntries(homeDir);
+    const entryName = (file: string): unknown => entries.get(file)?.name;
+    assert.equal(entryName("n-take.json"), "beta");
+    assert.equal(entryName("n-wins.json"), "seat-name-wins");
+    assert.equal(entryName("n-old.json"), "new-holder");
+    assert.equal(entryName("n-new.json"), "new-holder");
+    assert.equal(entryName("n-fresh.json"), "alpha");
+    for (const file of ["n-none.json", "n-wrongtype.json", "n-blank.json"]) {
+      assert.equal(
+        entries.has(file) && Object.hasOwn(entries.get(file) ?? {}, "name"),
+        false,
+        file,
+      );
+    }
+    assert.equal(report.indexNamesToProject, 4);
+  });
+});
+
+test("N3: the strip changes the `name` key and the seat group, nothing else, and keeps a rollback copy that still holds the name", async () => {
+  await withTempHome(async (homeDir) => {
+    await seedNameRig(homeDir);
+    const before = await readRecordJson(homeDir, "n-take");
+
+    const report = await backfill(homeDir, ["--apply"]);
+
+    const after = await readRecordJson(homeDir, "n-take");
+    const changed = [...new Set([...Object.keys(before), ...Object.keys(after)])]
+      .filter((key) => JSON.stringify(before[key]) !== JSON.stringify(after[key]))
+      .toSorted();
+    assert.deepEqual(changed, ["name"], "the strip touched more than the name");
+    const suffix = report.backupSuffix ?? "";
+    assert.notEqual(suffix, "");
+    const copy = JSON.parse(
+      await fs.readFile(path.join(sessionsDir(homeDir), `n-take.json${suffix}`), "utf8"),
+    ) as { name?: string };
+    assert.equal(copy.name, "beta", "the rollback copy lost the name");
+  });
+});
+
+test("N4: the second dry run prints 0 everywhere (bar the listed unparseable residual); a second apply writes nothing", async () => {
+  await withTempHome(async (homeDir) => {
+    await seedNameRig(homeDir);
+    await backfill(homeDir, ["--apply"]);
+    const snapshotAfterFirst = await snapshot(homeDir);
+
+    const second = await backfill(homeDir);
+    assert.equal(second.recordsWithLegacyName, 0);
+    assert.equal(second.seatsTakingName, 0);
+    assert.deepEqual(second.seatsDifferingName, []);
+    assert.equal(second.recordsToStrip, 0);
+    assert.equal(second.stripped, 0);
+    assert.equal(second.indexNamesToProject, 0);
+    assert.deepEqual(
+      second.unparseableNameLeft.map((left) => left.acpxRecordId),
+      ["17100000-aaaa"],
+      "the residual stays listed — it is the one thing the strip leaves",
+    );
+    assert.deepEqual(diffNames(snapshotAfterFirst, await snapshot(homeDir)), []);
+
+    const again = await backfill(homeDir, ["--apply"]);
+    assert.equal(again.stripped, 0);
+    assert.deepEqual(
+      diffNames(snapshotAfterFirst, await snapshot(homeDir)).filter(
+        (name) => !name.includes(".bak-mig-"), // every apply takes its own store-wide copies
+      ),
+      [],
+      "not idempotent",
+    );
+  });
+});
+
+test("N5: the text report prints the strip numbers and lists the differing seats and the residual", async () => {
+  await withTempHome(async (homeDir) => {
+    await seedNameRig(homeDir);
+    const result = await runCli(["seats", "backfill"], homeDir);
+    assert.equal(result.code, 0, result.stderr);
+    for (const expected of [
+      "records with a legacy name:  5",
+      "seats taking a name:         3",
+      "seats already differing:     2",
+      "records to strip:            7",
+      "stripped:                    0",
+      "seat seat-wins keeps",
+      "unparseable, name left in place: 17100000-aaaa",
+    ]) {
+      assert.ok(
+        result.stdout.includes(expected),
+        `missing ${JSON.stringify(expected)}:\n${result.stdout}`,
+      );
+    }
+  });
+});
+
+test("N6: `seats rename` re-projects the seat's name onto its holders' index entries", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [
+      makeRecord({ acpxRecordId: "n6-a" }),
+      makeRecord({ acpxRecordId: "n6-b" }),
+    ]);
+    await backfill(homeDir, ["--apply"]);
+    const seatId = String((await readRecordJson(homeDir, "n6-a")).seat_id);
+
+    const renamed = await runCli(["seats", "rename", seatId, "after-rename"], homeDir);
+    assert.equal(renamed.code, 0, renamed.stderr);
+
+    const entries = await readIndexEntries(homeDir);
+    assert.equal(entries.get("n6-a.json")?.name, "after-rename");
+    assert.equal(
+      Object.hasOwn(entries.get("n6-b.json") ?? {}, "name"),
+      false,
+      "another seat's entry took the name",
+    );
+  });
+});
+
+// ─── X — an apply with refused records must not exit 0 ───────────────────────
+
+/** A record the outbox REFUSES to rewrite: its `spawn_key` names a reservation no spawn attempt in
+ * this HOME's outbox owns ("record-ownership") — the same refusal the TE measured when a copied
+ * store was applied under another HOME. Every other record writes normally. */
+async function seedRefusedRig(homeDir: string): Promise<void> {
+  await seed(homeDir, [
+    makeRecord({
+      acpxRecordId: "x-refused",
+      metadata: { spawn_key: "cc164a178cc50fe894b6d98267050d8c", spawn_state: "published" },
+    }),
+    makeRecord({ acpxRecordId: "x-fine" }),
+  ]);
+}
+
+test("X1: an apply whose records are REFUSED exits NON-zero with the reason on stderr (the report still prints)", async () => {
+  await withTempHome(async (homeDir) => {
+    await seedRefusedRig(homeDir);
+    const result = await runCli(["seats", "backfill", "--apply", "--format", "json"], homeDir);
+    const report = JSON.parse(result.stdout.trim()) as BackfillJson;
+    assert.ok(
+      report.errors.some((error) => error.stage !== "parse"),
+      `the rig did not produce a refused record: ${JSON.stringify(report.errors)}`,
+    );
+    assert.notEqual(result.code, 0, "an apply that refused records exited 0");
+    assert.match(result.stderr, /x-refused\.json/, "stderr names the refused record");
+    assert.match(result.stderr, /record-ownership|does not own/i, "stderr carries the reason");
+  });
+});
+
+test("X2: a dry run, and an apply with no refusals, still exit 0 (parse-stage skips are not refusals)", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [makeRecord({ acpxRecordId: "x-ok" })]);
+    await fs.writeFile(path.join(sessionsDir(homeDir), "junk.json"), "{ not a record", "utf8");
+    const dry = await runCli(["seats", "backfill"], homeDir);
+    assert.equal(dry.code, 0, dry.stderr);
+    const applied = await runCli(["seats", "backfill", "--apply"], homeDir);
+    assert.equal(applied.code, 0, applied.stderr);
+    assert.match(applied.stdout, /\[parse\]/, "control: the parse-stage skip is in the report");
+  });
+});

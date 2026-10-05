@@ -8,11 +8,12 @@ import { readSeatStore, seatFromStore } from "./persistence/seat-store.js";
  * only `ACPX_SESSION_NAME`, the git author name and the agent-folder slug.
  *
  * Best-effort by contract: a label must never fail a spawn, so a missing,
- * unhealthy or malformed seat store degrades to the record's LEGACY name (a box
- * not yet backfilled) and then to nothing.
+ * unhealthy or malformed seat store, a seat-less record and a nameless seat all
+ * yield `undefined` — there is no record-side name to fall back to
+ * (D-NAME-HARD-MIGRATION: the name lives on the seat only; callers show the uuid8).
  */
 export async function seatDisplayName(
-  record: Pick<SessionRecord, "seatId" | "legacyName">,
+  record: Pick<SessionRecord, "seatId">,
 ): Promise<string | undefined> {
   if (record.seatId !== undefined) {
     try {
@@ -22,8 +23,8 @@ export async function seatDisplayName(
         return trimmed;
       }
     } catch {
-      // display-only: fall through to the legacy label
+      // display-only: a label never fails a spawn
     }
   }
-  return record.legacyName;
+  return undefined;
 }

@@ -8,6 +8,18 @@ Repo: https://github.com/openclaw/acpx
 
 ### Changes
 
+- Seats/identity: **the name lives on the SEAT only** (D-NAME-HARD-MIGRATION, brick
+  15f4ad42). The session record has no `name` — no type field, no writer, no
+  parse — and `ACPX_SESSION_NAME` and every display derive from the seat's name
+  (a seat-less record shows its uuid8). `acpx seats backfill` gains the strip
+  step: a seat that has no name takes its record's, a seat whose name differs
+  keeps it (counted and listed by id), the field is deleted per record (rollback
+  copy kept) and the index is re-projected; an unparseable record's name is left
+  in place and listed. The index entry's `name` is PROJECTED from the seat (on every
+  index write and on every seat-name change: rename, mint, backfill); a seat-less entry
+  carries none. The brick outbox projects the seat's name and no longer
+  writes one back onto the record; `templates migrate-slugs` derives no slug
+  from a name any more.
 - Pi provisioning: acpx-spawned pi sessions now **see the box's deployed pi
   extensions**. Until now, acpx re-pointed `PI_CODING_AGENT_DIR` to a per-session
   dir whose `settings.json` is the only global settings file the session reads

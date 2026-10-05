@@ -1175,16 +1175,6 @@ export type SessionRecord = {
   agentName?: string;
   agentCommand: string;
   cwd: string;
-  /**
-   * LEGACY, read-only (D-IDENTITY, brick 61dc1302): the display name an older acpx
-   * wrote into `name` on the record. A session has NO name — a name lives on its
-   * SEAT and identifies nothing. This survives only so (a) the seat backfill can
-   * still mint a seat that carries the name on a box not yet backfilled, and
-   * (b) a rewrite of an old record does not destroy it before that backfill runs.
-   * No new code sets it; nothing resolves, routes, lists or displays from it
-   * (test/identity-legacy-name.test.ts pins the only three files that may read it).
-   */
-  legacyName?: string;
   createdAt: string;
   lastUsedAt: string;
   lastSeq: number;

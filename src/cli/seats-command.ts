@@ -847,7 +847,35 @@ function headlineLines(report: SeatBackfillReport): string[] {
     // The label is STABLE, and it differs by mode on purpose — a dry run says what
     // `--apply` WILL remove, an applied run what it DID.
     `  holder-less seats ${report.apply ? "reaped" : "to reap"}: ${report.holderlessSeats.length}`,
+    // D-NAME-HARD-MIGRATION: the name lives on the SEAT only. Records with a legacy name,
+    // seats that take one because they have none, seats whose name already differs
+    // (listed below), records the strip deletes the field from; `stripped` is the
+    // apply's own tally. All `0` on the run after the first apply.
+    `  records with a legacy name:  ${report.recordsWithLegacyName}`,
+    `  seats taking a name:         ${report.seatsTakingName}`,
+    `  seats already differing:     ${report.seatsDifferingName.length}`,
+    `  records to strip:            ${report.recordsToStrip}`,
+    `  stripped:                    ${report.stripped}`,
+    `  unparseable, name left in place: ${report.unparseableNameLeft.length}`,
+    `  index names to project:      ${report.indexNamesToProject}`,
     `  errors:               ${report.errors.length}`,
+  ];
+}
+
+/** D-NAME-HARD-MIGRATION: the unparseable residual and the seats that keep a different name,
+ * each listed by id — the cases the counts cannot say. */
+function nameStripLines(report: SeatBackfillReport): string[] {
+  return [
+    ...report.unparseableNameLeft.map(
+      (left) =>
+        `  unparseable, name left in place: ${left.acpxRecordId ?? "(no id)"} (${left.file})`,
+    ),
+    ...report.seatsDifferingName.map((seat) => {
+      const dropped = seat.records
+        .map((record) => `${record.acpxRecordId} ${JSON.stringify(record.recordName)}`)
+        .join(", ");
+      return `  seat ${seat.seatId} keeps ${JSON.stringify(seat.seatName)}; record name dropped: ${dropped}`;
+    }),
   ];
 }
 
@@ -864,6 +892,7 @@ function detailLines(report: SeatBackfillReport): string[] {
     );
   }
   lines.push(...report.holderlessSeats.map((seatId) => `  holder-less seat ${seatId}`));
+  lines.push(...nameStripLines(report));
   if (report.backupSuffix !== undefined) {
     lines.push(`  rollback copies:      ${report.backups.length} × *${report.backupSuffix}`);
   }
@@ -934,13 +963,39 @@ async function handleSeatsBackfill(
 
   if (format === "json") {
     process.stdout.write(`${JSON.stringify(report)}\n`);
-    return;
-  }
-  if (format === "quiet") {
+  } else if (format === "quiet") {
     process.stdout.write(`${report.seats} ${report.indexEntries} ${report.errors.length}\n`);
+  } else {
+    process.stdout.write(renderText(report));
+  }
+  failOnRefusedRecords(report);
+}
+
+/**
+ * An APPLY that refused or failed any record must NOT exit 0: the owner's window reads the rc, and
+ * a run under a HOME whose path differs from `instance.json`'s `home` refuses EVERY record while
+ * the report still prints. The report is printed first (it is the evidence); then the refusals are
+ * summarised on stderr and the exit code is set. Parse-stage skips are NOT refusals — a store
+ * carries unparseable files (delivery sidecars, fixtures) that were never this verb's to write —
+ * and a dry run writes nothing, so neither sets the code.
+ */
+function failOnRefusedRecords(report: SeatBackfillReport): void {
+  const refused = report.errors.filter((error) => error.stage !== "parse");
+  if (!report.apply || refused.length === 0) {
     return;
   }
-  process.stdout.write(renderText(report));
+  const shown = refused
+    .slice(0, 5)
+    .map((error) =>
+      `  ${error.file} [${error.stage}] ${error.code ?? ""} ${error.message}`.trimEnd(),
+    );
+  const more =
+    refused.length > shown.length ? `\n  … and ${refused.length - shown.length} more` : "";
+  process.stderr.write(
+    `seats backfill: ${refused.length} record(s)/leg(s) refused or failed during --apply; ` +
+      `the run did NOT complete — exit 1. First reasons:\n${shown.join("\n")}${more}\n`,
+  );
+  process.exitCode = 1;
 }
 
 // ─── close ───────────────────────────────────────────────────────────────────

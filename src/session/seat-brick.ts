@@ -104,6 +104,24 @@ export function decideSessionBrickSync(
   return decideBrick(seat, subject.metadata);
 }
 
+/** The synchronous twin, for the callers that read inside a sync lock (the brick outbox).
+ * Same fail-open contract: any unreadable store, a missing seat or a blank name is `null`. */
+export function seatNameSync(seatId: string | undefined, sessionDir: string): string | null {
+  if (seatId === undefined) {
+    return null;
+  }
+  try {
+    const storePath = seatStorePath(sessionDir);
+    const name = seatFromStore(
+      parseSeatStore(fs.readFileSync(storePath, "utf8"), storePath),
+      seatId,
+    )?.name;
+    return name?.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * The cache a seated (or seat-less) holder carries for a brick link: `metadata.brick` and its
  * validation word TOGETHER, or neither. THE ONLY place the pair is spelled — a state word that

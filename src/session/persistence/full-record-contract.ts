@@ -63,7 +63,6 @@ export const RECORD_FIELD_PLAN = {
   agentName: { persisted: true },
   agentCommand: { persisted: true },
   cwd: { persisted: true },
-  legacyName: { persisted: true },
   createdAt: { persisted: true },
   lastUsedAt: { persisted: true },
   lastSeq: { persisted: true },

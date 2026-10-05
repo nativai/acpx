@@ -607,7 +607,7 @@ export type PruneRefusal =
       reason: "session_ambiguous";
       agentName: string;
       sessionId: string;
-      matches: { acpxRecordId: string; name?: string; lastUsedAt: string }[];
+      matches: { acpxRecordId: string; lastUsedAt: string }[];
     }
   | { reason: "session_open"; agentName: string; sessionId: string }
   | {
@@ -720,10 +720,7 @@ function renderPruneRefusalText(refusal: PruneRefusal): string {
     // what to do next.
     const header = `acpx sessions prune: '${refusal.sessionId}' is ambiguous — ${count} closed session${count === 1 ? "" : "s"} match, so prune deleted nothing.\n`;
     const rows = refusal.matches
-      .map(
-        (match) =>
-          `  ${match.acpxRecordId}${match.name ? ` (${match.name})` : ""}\t${match.lastUsedAt}\n`,
-      )
+      .map((match) => `  ${match.acpxRecordId}\t${match.lastUsedAt}\n`)
       .join("");
     return `${header}${rows}Re-run prune with a longer suffix or the full id.\n`;
   }

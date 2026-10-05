@@ -56,8 +56,6 @@ export function serializeSessionRecordForDisk(
     agent_name: canonical.agentName,
     agent_command: canonical.agentCommand,
     cwd: canonical.cwd,
-    // LEGACY passthrough only — see SessionRecord.legacyName. Never set by new code.
-    name: canonical.legacyName,
     created_at: canonical.createdAt,
     last_used_at: canonical.lastUsedAt,
     last_seq: canonical.lastSeq,

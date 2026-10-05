@@ -94,7 +94,6 @@ export type DeletionManifestEntry = {
   /** The resolved CLI prune scope. Absent on the rollback path. */
   scope?: unknown;
   id: string;
-  name?: string;
   cwd: string;
   createdAt?: string;
   closedAt?: string;
@@ -330,9 +329,6 @@ function serializeManifestEntry(entry: DeletionManifestEntry): string {
     line.scope = entry.scope;
   }
   line.id = entry.id;
-  if (entry.name != null) {
-    line.name = entry.name;
-  }
   line.cwd = entry.cwd;
   if (entry.createdAt != null) {
     line.createdAt = entry.createdAt;

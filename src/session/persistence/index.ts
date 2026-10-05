@@ -15,6 +15,7 @@ import {
   parseSeatFieldsFromIndexEntry,
   seatFieldsToIndexEntry,
 } from "./seat-fields.js";
+import { readSeatStore } from "./seat-store.js";
 import { isNonSessionRecordFile } from "./session-dir-files.js";
 
 const SESSION_INDEX_SCHEMA = "acpx.session-index.v1";
@@ -50,6 +51,14 @@ export type SessionIndexEntry = {
   closed: boolean;
   lastUsedAt: string;
   kind?: "session" | "subagent";
+  /**
+   * The SEAT's display name, PROJECTED onto the entry (D-NAME-HARD-MIGRATION, spec §1):
+   * the session record has no name, so nothing the record carries ever sets this. It is
+   * written by `writeSessionIndex` from the seat store on every index write, and by the
+   * seat store on every seat-name change. Absent for a seat-less entry, for a seat with
+   * no row, and for a seat with no name — the consumer shows the uuid8.
+   */
+  name?: string;
   // ── Hot-path enrichment (perf/index-entry-enrichment) ───────────────────────
   // Scalar fields acpx-ui's ~2 Hz session-list rebuild needs per session,
   // projected into this sidecar so the hot path reads index.json (already
@@ -406,6 +415,7 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     lastPromptAt: optionalString(record.lastPromptAt),
     favorite: optionalBoolean(record.favorite),
     title: typeof record.title === "string" ? record.title : undefined,
+    ...(typeof record.name === "string" && record.name.length > 0 ? { name: record.name } : {}),
     createdAt: optionalString(record.createdAt),
     parentSessionId: optionalString(record.parentSessionId),
     parentSessionUrl: optionalString(record.parentSessionUrl),
@@ -660,6 +670,44 @@ export async function readSessionIndex(sessionDir: string): Promise<SessionIndex
   }
 }
 
+/**
+ * The entry's `name`, PROJECTED from the seat (D-NAME-HARD-MIGRATION): the seat's trimmed name
+ * on an entry whose seat has one, no `name` key on every other entry (seat-less, no row, or a
+ * nameless seat). One `seats.json` read per index write. An UNHEALTHY store, and a seat whose
+ * row is malformed, are not evidence of "no name" — those entries keep what they carry.
+ */
+async function projectSeatNames(
+  sessionDir: string,
+  entries: readonly SessionIndexEntry[],
+): Promise<SessionIndexEntry[]> {
+  const store = await readSeatStore(sessionDir);
+  if (store.fileState === "malformed" || store.fileState === "unreadable") {
+    return [...entries];
+  }
+  return entries.map((entry) => {
+    if (entry.seatId === undefined) {
+      return withProjectedName(entry, undefined);
+    }
+    return store.malformedSeatIds.includes(entry.seatId)
+      ? entry
+      : withProjectedName(entry, store.seats.get(entry.seatId)?.name);
+  });
+}
+
+/** The entry carrying `seatName` (trimmed) as its `name`, or none when the seat has none. */
+function withProjectedName(
+  entry: SessionIndexEntry,
+  seatName: string | undefined,
+): SessionIndexEntry {
+  const name = seatName?.trim() || undefined;
+  if (entry.name === name) {
+    return entry;
+  }
+  const projected = { ...entry };
+  delete projected.name;
+  return name === undefined ? projected : { ...projected, name };
+}
+
 export async function writeSessionIndex(
   sessionDir: string,
   index: {
@@ -668,6 +716,7 @@ export async function writeSessionIndex(
   },
 ): Promise<void> {
   const filePath = sessionIndexPath(sessionDir);
+  const entries = await projectSeatNames(sessionDir, index.entries);
   // Per-call randomUUID: `${pid}.${Date.now()}` alone is NOT unique. Two writes
   // from this process in the same millisecond build the identical temp path, so
   // the first rename wins and the second hits ENOENT — turning a concurrent
@@ -683,7 +732,7 @@ export async function writeSessionIndex(
   const payload = JSON.stringify({
     schema: SESSION_INDEX_SCHEMA,
     files: [...index.files].toSorted(),
-    entries: [...index.entries].toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt)),
+    entries: entries.toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt)),
   });
   await fs.writeFile(tempFile, `${payload}\n`, "utf8");
   await fs.rename(tempFile, filePath);

@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { AcpxOperationalError } from "../../errors.js";
 import { withSessionIndexLock } from "./index-lock.js";
-import { SEAT_STORE_FILE } from "./session-dir-files.js";
+import { SEAT_STORE_FILE, SESSION_INDEX_FILE } from "./session-dir-files.js";
 
 /**
  * THE SEAT STORE — the authority for who holds each seat.
@@ -689,6 +689,83 @@ export async function readSeatStore(sessionDir: string): Promise<SeatStore> {
 }
 
 /**
+ * D-NAME-HARD-MIGRATION — a seat's NAME is projected onto its holders' index entries, so a
+ * seat-store write that changes a name (rename, mint, backfill fill) re-projects the entries of
+ * exactly those seats, here, inside the same hold as the write. A RAW edit of `index.json`
+ * (every other field of every entry is left byte-for-byte as it stands), temp + rename like the
+ * index's own writer. Best-effort: the seat write has already landed, an absent or unparseable
+ * index has nothing to patch, and the next index write projects every name from the store
+ * regardless — so a failure here is a stale label until then, never a lost seat.
+ */
+async function reprojectChangedSeatNames(
+  sessionDir: string,
+  before: ReadonlyMap<string, SeatRecord>,
+  after: ReadonlyMap<string, SeatRecord>,
+): Promise<void> {
+  const changed = changedSeatNames(before, after);
+  if (changed.size === 0) {
+    return;
+  }
+  const indexPath = path.join(sessionDir, SESSION_INDEX_FILE);
+  try {
+    const index = JSON.parse(await fs.readFile(indexPath, "utf8")) as { entries?: unknown };
+    if (!Array.isArray(index.entries) || !patchEntryNames(index.entries, changed)) {
+      return;
+    }
+    const tempFile = `${indexPath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
+    await fs.writeFile(tempFile, `${JSON.stringify(index)}\n`, "utf8");
+    await fs.rename(tempFile, indexPath);
+  } catch {
+    // see the doc comment: the next index write projects every name from the store.
+  }
+}
+
+function trimmedSeatName(row: SeatRecord | undefined): string | undefined {
+  return row?.name?.trim() || undefined;
+}
+
+/** seat id → its new trimmed name (`undefined` = now nameless), for the seats whose name changed. */
+function changedSeatNames(
+  before: ReadonlyMap<string, SeatRecord>,
+  after: ReadonlyMap<string, SeatRecord>,
+): Map<string, string | undefined> {
+  const changed = new Map<string, string | undefined>();
+  for (const [seatId, row] of after) {
+    if (trimmedSeatName(before.get(seatId)) !== trimmedSeatName(row)) {
+      changed.set(seatId, trimmedSeatName(row));
+    }
+  }
+  return changed;
+}
+
+/** Set or drop `name` on one raw entry; true when the entry moved. */
+function setEntryName(entry: Record<string, unknown>, name: string | undefined): boolean {
+  if (name === undefined) {
+    return Object.hasOwn(entry, "name") && delete entry.name;
+  }
+  if (entry.name === name) {
+    return false;
+  }
+  entry.name = name;
+  return true;
+}
+
+/** Patch the raw entries of the changed seats; true when anything moved. */
+function patchEntryNames(
+  entries: Record<string, unknown>[],
+  changed: ReadonlyMap<string, string | undefined>,
+): boolean {
+  let touched = false;
+  for (const entry of entries) {
+    const seatId = entry.seatId;
+    if (typeof seatId === "string" && changed.has(seatId)) {
+      touched = setEntryName(entry, changed.get(seatId)) || touched;
+    }
+  }
+  return touched;
+}
+
+/**
  * Raised when a write would destroy a store that exists but could not be read.
  *
  * `AcpxOperationalError`, not a plain `Error` (1dd9ae9a) — this is the WRITE SEAM
@@ -816,6 +893,7 @@ export async function withSeatStoreWrite<T>(
       throw new SeatStoreUnwritableError(seatStorePath(sessionDir), store.fileState);
     }
     await writeSeatStoreAtomically(sessionDir, mutation.seats, store.unparsedRows);
+    await reprojectChangedSeatNames(sessionDir, store.seats, mutation.seats);
     return result;
   });
 }
@@ -1063,6 +1141,39 @@ export async function fillSeatBrickLink(
     }
     const seats = new Map(store.seats);
     seats.set(seatId, { ...row, brickId: { ref: derivedRef, validated: false } });
+    return { mutation: { kind: "write", seats } as const, result: "filled" as const };
+  });
+}
+
+/**
+ * D-NAME-HARD-MIGRATION — a seat row that ALREADY EXISTS takes a record's LEGACY
+ * name, only when the row has NONE (absent or blank). The strip step of the seat
+ * backfill calls this BEFORE it deletes the name from the record, so the name is
+ * never on neither side.
+ *
+ * 🛑 **NEVER OVERWRITES A PRESENT NAME** — the seat's name is the display truth
+ * since the identity lane, so a differing record name loses (the backfill counts
+ * and lists that case; it does not resolve it here). Same idempotent,
+ * malformed-row-throws contract as `fillSeatBrickLink`.
+ */
+export async function fillSeatName(
+  sessionDir: string,
+  seatId: string,
+  name: string,
+): Promise<"filled" | "unchanged" | "no-row"> {
+  return await withSeatStoreWrite(sessionDir, (store) => {
+    if (store.malformedSeatIds.includes(seatId)) {
+      throw new MalformedSeatRowError(seatId, store.storePath);
+    }
+    const row = store.seats.get(seatId);
+    if (!row) {
+      return { mutation: SEAT_STORE_NO_CHANGE, result: "no-row" as const };
+    }
+    if (row.name?.trim()) {
+      return { mutation: SEAT_STORE_NO_CHANGE, result: "unchanged" as const };
+    }
+    const seats = new Map(store.seats);
+    seats.set(seatId, { ...row, name });
     return { mutation: { kind: "write", seats } as const, result: "filled" as const };
   });
 }

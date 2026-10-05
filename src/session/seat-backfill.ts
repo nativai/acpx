@@ -8,12 +8,14 @@ import {
   type AbandonedRecordSweepResult,
   sweepAbandonedSessionRecords,
 } from "./abandoned-record-sweep.js";
+import { withSessionIndexLock } from "./persistence/index-lock.js";
 import { overlaySessionIndexEntries } from "./persistence/index-overlay.js";
 import {
   listSessionRecordFiles,
   readSessionIndex,
   type SessionIndexEntry,
   sessionIndexPath,
+  writeSessionIndex,
 } from "./persistence/index.js";
 import { parseSessionRecord } from "./persistence/parse.js";
 import { writeSessionRecordAuthorizingSeatHolderWithoutIndex } from "./persistence/repository.js";
@@ -23,6 +25,7 @@ import {
   backfillSeatRow,
   fillSeatActiveHolder,
   fillSeatBrickLink,
+  fillSeatName,
   MalformedSeatRowError,
   seatRowMissingMessage,
   type SeatRowMissingError,
@@ -91,7 +94,16 @@ import {
 /** Which leg a per-record failure happened in. Named, so "it failed" is never the
  * whole diagnosis — a row asserting only that the run failed cannot tell a record
  * write from an index write from a store write. */
-export type SeatBackfillStage = "parse" | "backup" | "record" | "index" | "store";
+export type SeatBackfillStage = "parse" | "backup" | "record" | "index" | "store" | "strip";
+
+/** One seat whose name and its holders' legacy names do not agree. */
+export type SeatNameDifference = {
+  seatId: string;
+  /** The name the seat has — or takes in this run — and keeps. */
+  seatName: string;
+  /** The holder records whose different legacy name is dropped. */
+  records: { acpxRecordId: string; recordName: string }[];
+};
 
 export type SeatBackfillError = {
   file: string;
@@ -173,6 +185,39 @@ export type SeatBackfillReport = {
    * live in `persistence/seat-holderless.ts`.
    */
   holderlessSeats: string[];
+  /**
+   * D-NAME-HARD-MIGRATION: the name lives on the SEAT only, so the strip step moves
+   * every record's legacy `name` to its seat and deletes the field. Records whose
+   * `name` is a usable string (trimmed, non-empty) — the baseline's NAME-FIELD count
+   * for a record-side name. Dry run and apply report the same pre-run population.
+   */
+  recordsWithLegacyName: number;
+  /** Seats that take a legacy name because they have none (dry run: would take;
+   * apply: did — a fresh mint carrying the name counts). */
+  seatsTakingName: number;
+  /** Seats whose own name differs from a holder record's legacy name, or whose
+   * holders disagree: the SEAT wins (it is the display truth), the case is LISTED
+   * by id and the record's different name is dropped with the field. */
+  seatsDifferingName: SeatNameDifference[];
+  /** Records carrying a `name` key of ANY value (a wrong-typed or blank name is
+   * stripped too): what the strip step will delete (dry run) — equals `stripped`
+   * after an apply that had no errors. */
+  recordsToStrip: number;
+  /** Records the strip step deleted the field from (apply only; `0` on a dry run). */
+  stripped: number;
+  /**
+   * RULED (L0, 2026-10-05): a record that does NOT PARSE is never edited by the strip —
+   * not even at raw-JSON level; such files are not this migration's to touch. Those that
+   * carry a `name` are COUNTED and LISTED here, by id, as "unparseable, name left in
+   * place", so the NAME-FIELD baseline after the apply reads 0 over parseable records
+   * plus this listed residual. Identical on a dry run and an apply (the apply leaves them).
+   */
+  unparseableNameLeft: { file: string; acpxRecordId: string | undefined }[];
+  /** Index entries whose `name` is not the name of the seat they will have — absent where the
+   * seat has one, stale or differing, or present on a nameless seat's entry. The entry's name is
+   * PROJECTED FROM THE SEAT (spec §1); the apply re-projects the whole index once. Identical on
+   * a dry run and an apply (the pre-run population); `0` on the run after. */
+  indexNamesToProject: number;
   errors: SeatBackfillError[];
   /** The `.bak-mig-<TS>` suffix of this run's pre-apply copies, absent on a dry run. */
   backupSuffix: string | undefined;
@@ -298,6 +343,16 @@ type RecordPlan = {
   /** Leg 2 is needed: the entry's seat field group disagrees with the record's. */
   enrichesIndex: boolean;
   hasIndexEntry: boolean;
+  /** The `name` the index entry carries now (absent when it has none or has no entry). */
+  indexName: string | undefined;
+  /**
+   * D-NAME-HARD-MIGRATION: the record's `name` as it stands ON DISK — trimmed, and
+   * only when it is a non-empty string. The parsed record carries no name at all
+   * any more, so this is read from the raw JSON beside it.
+   */
+  recordName: string | undefined;
+  /** The raw record carries a `name` key (any value): the strip leg deletes it. */
+  hasNameKey: boolean;
 };
 
 type SeatPlan = {
@@ -329,6 +384,16 @@ type SeatPlan = {
   activeHolderNeedsFill: boolean;
   /** The member the fill points at — the one whose mirror the fill must also set. */
   holder: RecordPlan | undefined;
+  /**
+   * D-NAME-HARD-MIGRATION: a name this seat takes from its holders' legacy names
+   * because it has none (a fresh mint carries it in the row; for an existing row
+   * `fillSeatName` writes it).
+   */
+  takenName: string | undefined;
+  /** The name the seat has, or takes, and keeps. */
+  seatName: string | undefined;
+  /** Holders whose legacy name differs from the name the seat ends up with. */
+  differing: { acpxRecordId: string; recordName: string }[];
 };
 
 /**
@@ -398,6 +463,17 @@ function seatNameSource(members: readonly RecordPlan[]): RecordPlan | undefined 
   return (
     activeHolderFor(members) ?? members.toSorted((a, b) => b.holderOrdinal - a.holderOrdinal)[0]
   );
+}
+
+/** The name a seat with none takes: the first holder, in `seatNameSource` order, that
+ * has a legacy name — the active holder, else the highest ordinal. */
+function recordNameFromHolders(members: readonly RecordPlan[]): string | undefined {
+  const first = seatNameSource(members);
+  const ordered = [
+    ...(first ? [first] : []),
+    ...members.toSorted((a, b) => b.holderOrdinal - a.holderOrdinal),
+  ];
+  return ordered.find((member) => member.recordName !== undefined)?.recordName;
 }
 
 function earliestCreatedAt(members: readonly RecordPlan[], fallback: string): string {
@@ -470,7 +546,7 @@ function planSeatRow(seatId: string, members: readonly RecordPlan[], now: string
     activeHolderId: holder?.record.acpxRecordId ?? null,
     nextOrdinal: Math.max(...members.map((member) => member.holderOrdinal)) + 1,
     closedAt: null,
-    name: seatNameSource(members)?.record.legacyName,
+    name: recordNameFromHolders(members),
     brickId: brickLinkFromHolders(members),
     favorite: favoriteFromHolders(members),
   };
@@ -480,22 +556,67 @@ function planSeatRow(seatId: string, members: readonly RecordPlan[], now: string
 
 type ScannedRecords = {
   plans: RecordPlan[];
+  unparseableNameLeft: { file: string; acpxRecordId: string | undefined }[];
   errors: SeatBackfillError[];
   recordsScanned: number;
   recordsWithoutIndexEntry: number;
   staleIndexEntries: number;
 };
 
+type ReadRecord = { record: SessionRecord; recordName: string | undefined; hasNameKey: boolean };
+
+/** The record AND its on-disk legacy `name`, which the parser no longer surfaces:
+ * the backfill is the one reader left, and reads it from the raw JSON. */
+async function readRecordWithLegacyName(
+  sessionDir: string,
+  file: string,
+): Promise<ReadRecord | undefined> {
+  try {
+    const raw: unknown = JSON.parse(await fs.readFile(path.join(sessionDir, file), "utf8"));
+    const record = parseSessionRecord(raw);
+    if (!record) {
+      return undefined;
+    }
+    const rawName = (raw as Record<string, unknown>).name;
+    const trimmed = typeof rawName === "string" ? rawName.trim() : "";
+    return {
+      record,
+      recordName: trimmed.length > 0 ? trimmed : undefined,
+      hasNameKey: Object.hasOwn(raw as object, "name"),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/** For a record that does not parse: its `name` key and id, read RAW and only to be
+ * REPORTED — nothing here ever writes. Empty when it has no `name` (or no JSON). */
+async function unparseableNameOf(
+  sessionDir: string,
+  file: string,
+): Promise<{ file: string; acpxRecordId: string | undefined }[]> {
+  try {
+    const raw = JSON.parse(await fs.readFile(path.join(sessionDir, file), "utf8")) as unknown;
+    if (typeof raw !== "object" || raw === null || !Object.hasOwn(raw, "name")) {
+      return [];
+    }
+    const id = (raw as Record<string, unknown>).acpx_record_id;
+    return [{ file, acpxRecordId: typeof id === "string" ? id : undefined }];
+  } catch {
+    return [];
+  }
+}
+
 async function readRecordFile(
   sessionDir: string,
   file: string,
 ): Promise<SessionRecord | undefined> {
-  try {
-    const payload = await fs.readFile(path.join(sessionDir, file), "utf8");
-    return parseSessionRecord(JSON.parse(payload)) ?? undefined;
-  } catch {
-    return undefined;
-  }
+  return (await readRecordWithLegacyName(sessionDir, file))?.record;
+}
+
+/** The `name` an index entry carries now (absent for no entry or no name). */
+function indexNameOf(entry: SessionIndexEntry | undefined): string | undefined {
+  return entry === undefined ? undefined : entry.name;
 }
 
 async function scanRecords(
@@ -506,12 +627,13 @@ async function scanRecords(
   const files = await listSessionRecordFiles(sessionDir);
   const plans: RecordPlan[] = [];
   const errors: SeatBackfillError[] = [];
+  const unparseableNameLeft: { file: string; acpxRecordId: string | undefined }[] = [];
   let recordsWithoutIndexEntry = 0;
   let staleIndexEntries = 0;
 
   for (const file of files) {
-    const record = await readRecordFile(sessionDir, file);
-    if (!record) {
+    const read = await readRecordWithLegacyName(sessionDir, file);
+    if (!read) {
       // Per-record isolation starts here: an unparseable record is reported and the
       // run continues. It is also NOT counted as a seat to mint — nothing can be
       // derived from a record that did not parse.
@@ -522,8 +644,10 @@ async function scanRecords(
         code: undefined,
         message: "record did not parse; skipped",
       });
+      unparseableNameLeft.push(...(await unparseableNameOf(sessionDir, file)));
       continue;
     }
+    const { record, recordName, hasNameKey } = read;
     const entry = entriesByFile.get(file);
     const seat = planRecordSeat(record, newSeatId);
     if (!entry) {
@@ -558,10 +682,14 @@ async function scanRecords(
       // behind is CORRECT or STALE, so this leg runs and makes it correct.
       enrichesIndex: entry === undefined || !indexEntryAgrees(entry, seat),
       hasIndexEntry: entry !== undefined,
+      indexName: indexNameOf(entry),
+      recordName,
+      hasNameKey,
     });
   }
   return {
     plans,
+    unparseableNameLeft,
     errors,
     recordsScanned: plans.length,
     recordsWithoutIndexEntry,
@@ -705,6 +833,23 @@ function groupBySeat(plans: readonly RecordPlan[]): Map<string, RecordPlan[]> {
   return bySeat;
 }
 
+/** D-NAME-HARD-MIGRATION, per seat: the name it takes (only when it has none), the name it
+ * ends up with, and the holders whose record name differs from that — the SEAT wins. */
+function planSeatName(
+  seatRow: SeatRecord | undefined,
+  members: readonly RecordPlan[],
+): Pick<SeatPlan, "takenName" | "seatName" | "differing"> {
+  const existingName = seatRow?.name?.trim() || undefined;
+  const takenName = existingName === undefined ? recordNameFromHolders(members) : undefined;
+  const seatName = existingName ?? takenName;
+  const differing = members.flatMap((member) =>
+    member.recordName !== undefined && member.recordName !== seatName
+      ? [{ acpxRecordId: member.record.acpxRecordId, recordName: member.recordName }]
+      : [],
+  );
+  return { takenName, seatName, differing };
+}
+
 async function planSeats(
   sessionDir: string,
   plans: readonly RecordPlan[],
@@ -715,6 +860,7 @@ async function planSeats(
   for (const [seatId, members] of groupBySeat(plans)) {
     const row = planSeatRow(seatId, members, now);
     const existing = store.seats.get(seatId);
+    const { takenName, seatName, differing } = planSeatName(store.seats.get(seatId), members);
     seatPlans.set(seatId, {
       row,
       needsRow: !existing,
@@ -728,6 +874,9 @@ async function planSeats(
         existing.closedAt === null &&
         row.activeHolderId !== null,
       holder: activeHolderFor(members),
+      takenName,
+      seatName,
+      differing,
     });
   }
   return seatPlans;
@@ -767,6 +916,9 @@ type ApplyCounts = {
   activeHoldersAttempted: Set<string>;
   activeHoldersFilled: number;
   holderMirrorsSet: number;
+  /** D-NAME-HARD-MIGRATION: seats that took a legacy name (minted with it, or filled). */
+  namesTaken: Set<string>;
+  stripped: number;
   backups: string[];
 };
 
@@ -913,6 +1065,75 @@ async function writeActiveHolderFillLeg(
   }
 }
 
+/**
+ * Leg 3⅞+ — D-NAME-HARD-MIGRATION, the SEAT takes the record's legacy name. After the
+ * mint (a fresh row carries the name already) and for an existing row that has none;
+ * `fillSeatName` re-reads the store under the lock, never overwrites a present name,
+ * and answers `unchanged` for a seat that already has one — which is also what a
+ * just-minted row answers, so this is safe to call once per seat unconditionally.
+ *
+ * 🛑 A seat with NO ROW here is a failure, not a no-op: the strip leg that follows
+ * deletes the only other copy of the name.
+ */
+async function writeSeatNameLeg(
+  sessionDir: string,
+  plan: RecordPlan,
+  seatPlans: ReadonlyMap<string, SeatPlan>,
+  counts: ApplyCounts,
+): Promise<void> {
+  const seat = seatPlans.get(plan.seatId);
+  if (seat?.takenName === undefined || counts.namesTaken.has(plan.seatId)) {
+    return;
+  }
+  const outcome = await fillSeatName(sessionDir, plan.seatId, seat.takenName);
+  if (outcome === "no-row") {
+    throw new Error(`seat ${plan.seatId} has no row to take the name ${seat.takenName}`);
+  }
+  // `unchanged` is a name that is already there: ours from this run's own mint, or not.
+  if (outcome === "filled" || counts.rowsMinted.has(plan.seatId)) {
+    counts.namesTaken.add(plan.seatId);
+  }
+}
+
+/**
+ * Leg 4 — D-NAME-HARD-MIGRATION, the STRIP: delete the record's `name`, last, after
+ * its seat holds the name (or already had a different one, which wins). Through the
+ * record writer every other leg uses: the serializer no longer writes `name`, so a
+ * fresh read and a rewrite IS the deletion, per-record atomic like any record write.
+ * The rollback copy is the one taken before leg 1 when this run already wrote the
+ * record, else taken here — immediately before the write, inside the record's try.
+ * The index leg re-projects the entry; the index parse carries no `name` either.
+ */
+async function writeStripLeg(
+  sessionDir: string,
+  plan: RecordPlan,
+  counts: ApplyCounts,
+  suffix: string,
+  alreadyCopied: boolean,
+): Promise<void> {
+  if (!plan.hasNameKey) {
+    return;
+  }
+  if (!alreadyCopied) {
+    const copy = await copyAside(path.join(sessionDir, plan.file), suffix);
+    if (copy) {
+      counts.backups.push(copy);
+    }
+  }
+  const fresh = await readRecordWithLegacyName(sessionDir, plan.file);
+  if (!fresh) {
+    throw new Error(`record ${plan.file} no longer parses`);
+  }
+  if (fresh.hasNameKey) {
+    await writeSessionRecordAuthorizingSeatHolderWithoutIndex(fresh.record);
+    if ((await readRecordWithLegacyName(sessionDir, plan.file))?.hasNameKey === true) {
+      throw new Error(`record ${plan.file} still carries a name after the rewrite`);
+    }
+  }
+  await writeIndexLeg(sessionDir, plan);
+  counts.stripped += 1;
+}
+
 async function applyRecord(
   sessionDir: string,
   plan: RecordPlan,
@@ -922,6 +1143,7 @@ async function applyRecord(
   suffix: string,
 ): Promise<void> {
   let stage: SeatBackfillStage = "backup";
+  let copiedForRecordLeg = false;
   try {
     if (plan.seatsRecord) {
       // The record's rollback copy is taken IMMEDIATELY BEFORE its own write, inside
@@ -931,6 +1153,7 @@ async function applyRecord(
       if (copy) {
         counts.backups.push(copy);
       }
+      copiedForRecordLeg = true;
       stage = "record";
       await writeRecordLeg(plan);
       counts.recordsSeated += 1;
@@ -945,6 +1168,9 @@ async function applyRecord(
     await writeFavoriteMigrationLeg(sessionDir, plan, seatPlans, counts);
     await writeBrickLinkFillLeg(sessionDir, plan, seatPlans, counts);
     await writeActiveHolderFillLeg(sessionDir, plan, seatPlans, counts);
+    await writeSeatNameLeg(sessionDir, plan, seatPlans, counts);
+    stage = "strip";
+    await writeStripLeg(sessionDir, plan, counts, suffix, copiedForRecordLeg);
   } catch (error) {
     errors.push(errorFor(plan, stage, error));
   }
@@ -971,6 +1197,53 @@ async function reapHolderless(
       message: error instanceof Error ? error.message : String(error),
     });
     return [];
+  }
+}
+
+/** Re-project the whole index once, under its lock: `writeSessionIndex` projects every
+ * entry's name from the seat store, so entries the per-record legs did not reach (an existing
+ * seat that already had a name, an entry with a stale one) are brought level too. */
+async function reprojectIndexNames(sessionDir: string): Promise<void> {
+  await withSessionIndexLock(sessionDir, async () => {
+    const index = await readSessionIndex(sessionDir);
+    if (index) {
+      await writeSessionIndex(sessionDir, { files: index.files, entries: index.entries });
+    }
+  });
+}
+
+/** The strip step's PRE-RUN numbers, identical on a dry run and an apply. */
+function nameStripBase(scanned: ScannedRecords, seatPlans: ReadonlyMap<string, SeatPlan>) {
+  return {
+    recordsWithLegacyName: scanned.plans.filter((plan) => plan.recordName !== undefined).length,
+    seatsDifferingName: [...seatPlans]
+      .filter(([, seat]) => seat.differing.length > 0)
+      .map(([seatId, seat]) => ({
+        seatId,
+        seatName: seat.seatName ?? "",
+        records: seat.differing,
+      })),
+    recordsToStrip: scanned.plans.filter((plan) => plan.hasNameKey).length,
+    unparseableNameLeft: scanned.unparseableNameLeft,
+    indexNamesToProject: scanned.plans.filter(
+      (plan) => plan.hasIndexEntry && plan.indexName !== seatPlans.get(plan.seatId)?.seatName,
+    ).length,
+  };
+}
+
+/** The index re-projection as a leg: a failure is a reported `index` error, not a throw —
+ * the per-record legs have already landed. */
+async function reprojectIndexLeg(sessionDir: string, errors: SeatBackfillError[]): Promise<void> {
+  try {
+    await reprojectIndexNames(sessionDir);
+  } catch (error) {
+    errors.push({
+      file: "index.json",
+      acpxRecordId: undefined,
+      stage: "index",
+      code: (error as NodeJS.ErrnoException | undefined)?.code,
+      message: error instanceof Error ? error.message : String(error),
+    });
   }
 }
 
@@ -1008,6 +1281,7 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
   const errors = [...scanned.errors];
 
   const base = {
+    ...nameStripBase(scanned, seatPlans),
     apply: options.apply,
     sessionDir,
     sweep,
@@ -1031,6 +1305,9 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
         .length,
       holderMirrorsSet: [...seatPlans.values()].filter(needsMirrorWrite).length,
       holderlessSeats: holderless.map((seat) => seat.seatId),
+      seatsTakingName: [...seatPlans.values()].filter((seat) => seat.takenName !== undefined)
+        .length,
+      stripped: 0,
       errors,
       backupSuffix: undefined,
       backups: [],
@@ -1050,6 +1327,8 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
     activeHoldersAttempted: new Set(),
     activeHoldersFilled: 0,
     holderMirrorsSet: 0,
+    namesTaken: new Set(),
+    stripped: 0,
     backups: await takeStoreBackups(sessionDir, suffix),
   };
   for (const plan of scanned.plans) {
@@ -1057,6 +1336,9 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
   }
   // Last, after every mint.
   const holderlessReaped = await reapHolderless(sessionDir, holderless, errors);
+  if (base.indexNamesToProject > 0) {
+    await reprojectIndexLeg(sessionDir, errors);
+  }
 
   return {
     ...base,
@@ -1071,6 +1353,8 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
     activeHoldersFilled: counts.activeHoldersFilled,
     holderMirrorsSet: counts.holderMirrorsSet,
     holderlessSeats: holderlessReaped,
+    seatsTakingName: counts.namesTaken.size,
+    stripped: counts.stripped,
     errors,
     backupSuffix: suffix,
     backups: counts.backups,
