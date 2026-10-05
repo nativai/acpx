@@ -40,7 +40,10 @@ const MAIN_ID = "7531ef5c-0000-4000-8000-00000000000a";
 const INJECTED_ID = "7531ef5c-0000-4000-8000-00000000000b";
 const SECOND_ID = "7531ef5c-0000-4000-8000-00000000000c";
 
-type Handlers = { onAcpMessage?: (direction: unknown, message: unknown) => void };
+type Handlers = {
+  onAcpMessage?: (direction: unknown, message: unknown) => void;
+  onSessionUpdate?: (notification: unknown) => void;
+};
 
 type PromptCall = { text: string; inFlightAtStart: number };
 
@@ -53,6 +56,12 @@ type AdapterControl = {
   resolveInjected: () => void;
   /** One inbound ACP message from the adapter — what a working agent streams. */
   emitAgentOutput: () => void;
+  /** A tool-call frame, delivered the way AcpClient delivers a session/update. */
+  emitToolCall: (
+    kind: "tool_call" | "tool_call_update",
+    toolCallId: string,
+    status: "pending" | "in_progress" | "completed" | "failed",
+  ) => void;
   cancels: () => number;
   closes: () => number;
   inFlight: () => number;
@@ -90,6 +99,7 @@ function makeAdapter(options: { honoursCancel: boolean }): AdapterControl {
     },
     clearEventHandlers: () => {
       delete handlers.onAcpMessage;
+      delete handlers.onSessionUpdate;
     },
     hasActivePrompt: () => active !== undefined,
     requestCancelActivePrompt: async () => false,
@@ -153,6 +163,14 @@ function makeAdapter(options: { honoursCancel: boolean }): AdapterControl {
     injectedInFlight: injectedStarted.promise,
     resolveMain: () => main?.resolve({ stopReason: "end_turn" }),
     resolveInjected: () => injected?.resolve({ stopReason: "end_turn" }),
+    emitToolCall: (kind, toolCallId, status) => {
+      const params = {
+        sessionId: "acp-7531ef5c",
+        update: { sessionUpdate: kind, toolCallId, status, title: "Bash" },
+      };
+      handlers.onAcpMessage?.("inbound", { jsonrpc: "2.0", method: "session/update", params });
+      handlers.onSessionUpdate?.(params);
+    },
     emitAgentOutput: () => {
       handlers.onAcpMessage?.("inbound", {
         jsonrpc: "2.0",
@@ -341,6 +359,72 @@ test("7531ef5c CONTROL: a SILENT agent is still bounded — the backstop fires o
       assert.ok(
         finishedAt - lastOutputAt >= windowMs - 50,
         `finalized ${finishedAt - lastOutputAt}ms after the last output — before a full silence window`,
+      );
+    });
+
+    const injected = terminalFor(await streamEvents(record.acpxRecordId), INJECTED_ID);
+    assert.equal(injected?.phase, "failed");
+    assert.equal(
+      (injected?.error as { detailCode?: string } | undefined)?.detailCode,
+      "INJECTED_RESPONSE_TIMEOUT",
+    );
+  });
+});
+
+// F1 (te-7531, VERIFICATION.md S2b): the steer is consumed, then ONE tool call runs
+// silently for longer than the window — claude-agent-acp sends `tool_call` at the
+// start and nothing until the tool returns. That is work, not silence.
+test("7531ef5c F1: an OPEN tool call holds the window — a silent tool longer than the window is no false idle, the steer ends done", async () => {
+  await withTempHome("acpx-7531ef5c-tool-", async (home) => {
+    const record = sessionRecord(home);
+    await writeSessionRecordFile(home, record);
+    const adapter = makeAdapter({ honoursCancel: true });
+    const windowMs = 400;
+
+    await withDrainTimeout(windowMs, async () => {
+      const { run } = await startTurnWithInjection(record.acpxRecordId, adapter);
+      let finished = false;
+      void run.then(() => {
+        finished = true;
+      });
+      adapter.emitToolCall("tool_call", "bash-long", "in_progress");
+      // Silent for 4 windows: no frames at all while the tool runs.
+      await sleep(4 * windowMs);
+      // On 98351e9b the backstop fired one window after the tool started.
+      assert.equal(finished, false, "the turn was finalized while a tool call was still open");
+      adapter.emitToolCall("tool_call_update", "bash-long", "completed");
+      adapter.resolveInjected();
+      await run;
+    });
+
+    const events = await streamEvents(record.acpxRecordId);
+    const injected = terminalFor(events, INJECTED_ID);
+    assert.equal(injected?.phase, "done", `injected delivery: ${JSON.stringify(injected)}`);
+    assert.equal(adapter.cancels(), 0, "nothing cancelled the running tool");
+  });
+});
+
+// CONTROL for F1: the hold ends with the tool. Once it completes, timing resumes
+// from the completion — a finished tool followed by silence still fires.
+test("7531ef5c F1 CONTROL: after the tool call COMPLETES, silence is timed from the completion and the backstop still fires", async () => {
+  await withTempHome("acpx-7531ef5c-toolend-", async (home) => {
+    const record = sessionRecord(home);
+    await writeSessionRecordFile(home, record);
+    const adapter = makeAdapter({ honoursCancel: false });
+    const windowMs = 400;
+    let completedAt = 0;
+
+    await withDrainTimeout(windowMs, async () => {
+      const { run } = await startTurnWithInjection(record.acpxRecordId, adapter);
+      adapter.emitToolCall("tool_call", "bash-short", "in_progress");
+      await sleep(2 * windowMs);
+      adapter.emitToolCall("tool_call_update", "bash-short", "completed");
+      completedAt = Date.now();
+      await run;
+      const elapsed = Date.now() - completedAt;
+      assert.ok(
+        elapsed >= windowMs - 50,
+        `fired ${elapsed}ms after the tool completed — before a full silence window`,
       );
     });
 
