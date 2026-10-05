@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { SpawnLedgerError } from "../src/spawn-ledger.js";
 import { LiveSessionCheckpoint } from "../src/session/live-checkpoint.js";
+import { SpawnLedgerError } from "../src/spawn-ledger.js";
 
 /**
  * brick://48aca560 — a checkpoint that fails silently is indistinguishable from

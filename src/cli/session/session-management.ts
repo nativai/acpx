@@ -755,17 +755,16 @@ export async function listAgentOutputStyles(
 
   // The transient open/read/close is shared with the Claude model-advertisement
   // probe (brick ebfe4c3c) — one implementation of the measured no-prompt path.
-  return outputStyleListFromAdvertised(
-    await readTransientAdvertisement({
-      agentCommand: options.agentCommand,
-      cwd: options.cwd,
-      mcpServers: options.mcpServers,
-      authCredentials: options.authCredentials,
-      authPolicy: options.authPolicy,
-      verbose: options.verbose,
-      timeoutMs: options.timeoutMs,
-    }),
-  );
+  const { configOptions } = await readTransientAdvertisement({
+    agentCommand: options.agentCommand,
+    cwd: options.cwd,
+    mcpServers: options.mcpServers,
+    authCredentials: options.authCredentials,
+    authPolicy: options.authPolicy,
+    verbose: options.verbose,
+    timeoutMs: options.timeoutMs,
+  });
+  return outputStyleListFromAdvertised(configOptions);
 }
 
 function outputStyleListFromAdvertised(

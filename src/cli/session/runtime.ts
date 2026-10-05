@@ -19,7 +19,6 @@ import { assertRequestedModelSupported } from "../../acp/model-support.js";
 import { explainTurnError, type RefusalProbeDeps } from "../../acp/openrouter-refusal-reason.js";
 import { explainPiTurnError } from "../../acp/pi-turn-error.js";
 import { InterruptedError, withInterrupt, withTimeout } from "../../async-control.js";
-import { SpawnLedgerError } from "../../spawn-ledger.js";
 import { tailClaudeSubagentJsonl } from "../../claude-jsonl.js";
 import { transcriptCwdHash } from "../../config/subscription-transcript.js";
 import {
@@ -44,6 +43,7 @@ import {
   isSubscriptionLockBlockError,
   selectSubscriptionBeforeTurn,
 } from "../../runtime/engine/failover.js";
+import { SpawnLedgerError } from "../../spawn-ledger.js";
 import {
   registerAbsorbedDeliveries,
   unregisterAbsorbedDeliveries,
