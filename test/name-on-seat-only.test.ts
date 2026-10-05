@@ -56,7 +56,11 @@ const ALLOWED_NAME_READS: ReadonlyMap<string, { count: number; why: string }> = 
       why: "a SUBAGENT REF's `name` inside a parent record (the adapter's subagent label), not a session name",
     },
   ],
-  ["prompt-content.ts", { count: 2, why: "a prompt content block's `name`, not a session name" }],
+  [
+    "prompt-content.ts",
+    { count: 4, why: "a prompt content block's `name` (resource/tool blocks), not a session name" },
+  ],
+  ["errors.ts", { count: 1, why: "`new.target.name` — an Error subclass's own class name" }],
   ["session/messages-log.ts", { count: 1, why: "a tool-use block's `name`" }],
   ["runtime/public/events.ts", { count: 1, why: "a content block's `name`" }],
   [

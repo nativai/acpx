@@ -826,10 +826,10 @@ function groupBySeat(plans: readonly RecordPlan[]): Map<string, RecordPlan[]> {
 /** D-NAME-HARD-MIGRATION, per seat: the name it takes (only when it has none), the name it
  * ends up with, and the holders whose record name differs from that — the SEAT wins. */
 function planSeatName(
-  existing: SeatRecord | undefined,
+  seatRow: SeatRecord | undefined,
   members: readonly RecordPlan[],
 ): Pick<SeatPlan, "takenName" | "seatName" | "differing"> {
-  const existingName = existing?.name?.trim() || undefined;
+  const existingName = seatRow?.name?.trim() || undefined;
   const takenName = existingName === undefined ? recordNameFromHolders(members) : undefined;
   const seatName = existingName ?? takenName;
   const differing = members.flatMap((member) =>
@@ -850,7 +850,7 @@ async function planSeats(
   for (const [seatId, members] of groupBySeat(plans)) {
     const row = planSeatRow(seatId, members, now);
     const existing = store.seats.get(seatId);
-    const { takenName, seatName, differing } = planSeatName(existing, members);
+    const { takenName, seatName, differing } = planSeatName(store.seats.get(seatId), members);
     seatPlans.set(seatId, {
       row,
       needsRow: !existing,
