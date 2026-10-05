@@ -7,40 +7,38 @@
 // `queue owner healthy`. acpx-ui kept the item `delivering` until a manual
 // `sessions recover` let it re-drive.
 //
-// THE MECHANISM (reproduced here, file:line at the unrepaired base 79fe783):
+// THE MECHANISM (file:line at the unrepaired base 79fe783):
 //   - the owner pulls the task and calls `runQueuedTask`
 //     (queue-owner-runtime.ts:1159);
 //   - `runSessionPrompt` → `recordPromptStart` → `writeSessionRecordAtBoundary`
-//     (runtime.ts:1704) throws `OutboxError("outbox-busy")` (since the spawn-ledger reduction: `SpawnLedgerError`) after the outbox's own
-//     4 s busy budget. That is BEFORE the main turn try (runtime.ts:3030), so no
-//     `failed` delivery terminal is written by the turn;
+//     (runtime.ts:1704) threw (then: outbox-busy). That is BEFORE the main turn try
+//     (runtime.ts:3030), so no `failed` delivery terminal is written by the turn;
 //   - `runQueuedTask`'s catch (runtime.ts:1417-1426) only terminalizes the
 //     closed-record and reserved-capacity classes, and `sendQueuedTaskError`
 //     returns at once for a `waitForCompletion:false` task — which every acpx-ui
 //     delivery is. Then `task.close()`, `runQueuedTask` RESOLVES, and the owner loop
 //     goes back to `nextTask()` with a healthy heartbeat.
-// The a8eb45f2 hotfix (294d674) is NOT the swallow point: it only touched the
-// sub-agent boundary-write chain. The error here is caught by design and dropped
-// because nothing writes a terminal for its class.
+// The defect is the dropped error, not its cause: ANY throw from that write is lost
+// the same way. Since the spawn-ledger reduction an ordinary record write no longer
+// opens SQLite, so the wedge row makes the SAME write fail without a lock (the
+// sessions directory made read-only once the task is accepted, so the write's
+// temp file cannot be created) — the specimen's throw site, deterministically,
+// with no ledger involved.
 //
-// THE FIX (re-scoped 2026-10-05, Daniel): every such pre-turn failure — outbox-busy
-// included — gets one DEFINITIVE QUEUE_TURN_START_FAILED terminal (never reached
-// the model, resend-safe, not auto-retried) and a named owner.log line.
+// THE FIX (re-scoped 2026-10-05, Daniel): every such pre-turn failure gets one
+// DEFINITIVE QUEUE_TURN_START_FAILED terminal (never reached the model,
+// resend-safe, not auto-retried) and a named owner.log line.
 //
 // The production interaction shape these rows enter: a real SessionQueueOwner,
 // a real IPC `submit_prompt` with `waitForCompletion:false` + `messageId` (the
-// exact acpx-ui `prompt --no-wait --message-id` shape), the task pulled by
-// `nextTask()`, and the lock held by a SEPARATE PROCESS — the cross-process holder
-// that a same-process serialisation fix (42d9327) cannot remove.
+// exact acpx-ui `prompt --no-wait --message-id` shape), and the task pulled by
+// `nextTask()`.
 
 import assert from "node:assert/strict";
-import { fork } from "node:child_process";
-import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
 import type { AcpClient } from "../src/acp/client.js";
 import {
   QUEUE_TURN_START_FAILED_DETAIL_CODE,
@@ -60,92 +58,11 @@ import { writeSessionRecord } from "../src/session/persistence.js";
 import { connectSocket, nextJsonLine } from "./queue-test-helpers.js";
 import { makeSessionRecord, sessionFilePath, withTempHome } from "./runtime-test-helpers.js";
 
-// Resolved into the SOURCE tree: `build:test` does not copy `.mjs` fixtures into
-// `dist-test/`. From `dist-test/test/` two levels up is the repo root.
-const HOLDER_PATH = fileURLToPath(
-  new URL("../../test/fixtures/outbox-lock-holder.mjs", import.meta.url),
-);
-const DUTY_HOLDER_PATH = fileURLToPath(
-  new URL("../../test/fixtures/outbox-duty-holder.mjs", import.meta.url),
-);
-
 const MESSAGE_ID = "b8e251eb-0000-4000-8000-000000000001";
 const PROMPT_TEXT = "a steer from Daniel";
 
-type Holder = { release: () => Promise<void>; alive: () => boolean };
-
-// Holds `$HOME/.acpx/brick-outbox.db`'s write lock from another process until
-// released. Asserts it ACTED before returning, so a row can never pass against a
-// holder that never took the lock.
-async function holdOutboxLock(home: string): Promise<Holder> {
-  const dbPath = path.join(home, ".acpx", "brick-outbox.db");
-  assert.ok(fsSync.existsSync(dbPath), "no outbox DB to hold — the instrument is blind");
-  assert.ok(fsSync.existsSync(HOLDER_PATH), `lock-holder fixture missing at ${HOLDER_PATH}`);
-  const marker = path.join(home, "holder-acted");
-  const holder = fork(HOLDER_PATH, [dbPath, marker], {
-    execArgv: [],
-    stdio: ["ignore", "ignore", "pipe", "ipc"],
-  });
-  const exited = new Promise<void>((resolve) => holder.once("exit", () => resolve()));
-  const deadline = Date.now() + 5_000;
-  while (!fsSync.existsSync(marker) && Date.now() < deadline && holder.exitCode === null) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  assert.ok(fsSync.existsSync(marker), `holder never took the lock (exit=${holder.exitCode})`);
-  let released = false;
-  return {
-    alive: () => holder.exitCode === null && holder.signalCode === null,
-    release: async () => {
-      if (released) {
-        return;
-      }
-      released = true;
-      if (holder.exitCode === null && holder.signalCode === null) {
-        holder.send("release");
-        await exited;
-      }
-    },
-  };
-}
-
-// brick://b8e251eb F2 — ONE DUTY CYCLE of the production contention shape (te-B's
-// duty-cycle probe: a separate process holding the lock ~95 % of the time in 6 s
-// bursts), pinned to a point in the turn instead of to a timer. The lock is FREE
-// when the turn starts and is taken by another PROCESS inside the turn, before the
-// prompt is submitted — exactly the gap te-B's intermittent holder hit.
-type DutyHolder = {
-  hold: () => Promise<void>;
-  release: () => Promise<void>;
-  stop: () => Promise<void>;
-};
-
-async function startDutyHolder(home: string): Promise<DutyHolder> {
-  const dbPath = path.join(home, ".acpx", "brick-outbox.db");
-  assert.ok(fsSync.existsSync(dbPath), "no outbox DB to hold — the instrument is blind");
-  assert.ok(fsSync.existsSync(DUTY_HOLDER_PATH), `duty holder missing at ${DUTY_HOLDER_PATH}`);
-  const child = fork(DUTY_HOLDER_PATH, [dbPath], {
-    execArgv: [],
-    stdio: ["ignore", "ignore", "pipe", "ipc"],
-  });
-  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
-  const nextReply = async (): Promise<{ held?: boolean; ready?: boolean }> =>
-    await new Promise((resolve) => child.once("message", (m) => resolve(m as { held?: boolean })));
-  assert.equal((await nextReply()).ready, true, "duty holder did not start");
-  const command = async (cmd: string, expectHeld: boolean): Promise<void> => {
-    const reply = nextReply();
-    child.send({ cmd });
-    assert.equal((await reply).held, expectHeld, `duty holder did not ACT on ${cmd}`);
-  };
-  return {
-    hold: async () => await command("hold", true),
-    release: async () => await command("release", false),
-    stop: async () => {
-      if (child.exitCode === null && child.signalCode === null) {
-        child.send({ cmd: "exit" });
-        await exited;
-      }
-    },
-  };
+function messagesLogFile(home: string, sessionId: string): string {
+  return path.join(home, ".acpx", "sessions", `${encodeURIComponent(sessionId)}.messages.ndjson`);
 }
 
 type MockClient = { client: AcpClient; promptCalls: () => number };
@@ -153,7 +70,8 @@ type MockClient = { client: AcpClient; promptCalls: () => number };
 // The reuse happy-path surface `runSessionPrompt` touches (same shape as
 // delivery-steer-visibility.test.ts). `prompt` either ends the turn or throws.
 // With `onStart`, the client is NOT reusable: every connect awaits `start()` and
-// creates a fresh session — the hook point INSIDE the turn, before the prompt.
+// creates a fresh session — a hook point INSIDE the turn, before the prompt (the
+// adapter failing to start is a real pre-model failure there).
 function makeMockClient(
   onPrompt: () => Promise<{ stopReason: "end_turn" }>,
   hooks: { onStart?: () => Promise<void> } = {},
@@ -225,13 +143,9 @@ async function captureStderr<T>(run: () => Promise<T>): Promise<{ value: T; stde
 
 // `.messages.ndjson` — the conversation history acpx-ui renders.
 async function userRowsFor(home: string, sessionId: string): Promise<number> {
-  const file = path.join(
-    home,
-    ".acpx",
-    "sessions",
-    `${encodeURIComponent(sessionId)}.messages.ndjson`,
-  );
-  const lines = (await fs.readFile(file, "utf8")).split("\n").filter(Boolean);
+  const lines = (await fs.readFile(messagesLogFile(home, sessionId), "utf8"))
+    .split("\n")
+    .filter(Boolean);
   return lines.filter((line) => {
     const row = JSON.parse(line) as { User?: { id?: string } };
     return row.User?.id === MESSAGE_ID;
@@ -257,7 +171,6 @@ async function withAcceptedNoWaitTask(
       agentCommand: "node mock-agent.js",
       cwd: home,
     });
-    // Through the real write path, so the outbox DB exists to be held.
     await writeSessionRecord(record);
 
     const lease = await tryAcquireQueueOwnerLease(sessionId);
@@ -312,42 +225,50 @@ async function withAcceptedNoWaitTask(
   });
 }
 
-test("b8e251eb: an accepted no-wait task whose turn cannot start under outbox-busy gets ONE definitive terminal and a named owner.log line, never silence", async () => {
+test("b8e251eb: an accepted no-wait task whose turn-start record write throws gets ONE definitive terminal and a named owner.log line, never silence", async () => {
   await withAcceptedNoWaitTask("acpx-b8e251eb-wedge-", async ({ home, sessionId, task }) => {
     const mock = makeMockClient(async () => ({ stopReason: "end_turn" }));
-    const holder = await holdOutboxLock(home);
+    // recordPromptStart's boundary write creates files in the sessions dir; make
+    // that dir read-only AFTER the task was accepted so exactly that write throws.
+    // Existing files (the stream the terminal is appended to) stay writable.
+    const sessionsDir = path.dirname(messagesLogFile(home, sessionId));
+    await fs.chmod(sessionsDir, 0o555);
+    let stderr: string;
     try {
-      const { stderr } = await captureStderr(
+      ({ stderr } = await captureStderr(
         async () =>
           await runQueuedTask(sessionId, task, {
             sharedClient: mock.client,
             suppressSdkConsoleErrors: true,
           }),
-      );
-      assert.ok(holder.alive(), "the holder must still hold — otherwise this row proved nothing");
-
-      const events = await deliveryEvents(sessionId);
-      // THE WEDGE: on the unrepaired base this is 0 — no terminal, no turn, nothing.
-      assert.equal(
-        events.length,
-        1,
-        `an accepted task that never started must leave exactly ONE delivery terminal; got ${JSON.stringify(events)}`,
-      );
-      assert.equal(events[0].phase, "failed");
-      assert.equal(events[0].error.detailCode, QUEUE_TURN_START_FAILED_DETAIL_CODE);
-      assert.ok(
-        events[0].error.message.startsWith(`${QUEUE_TURN_START_FAILED_MESSAGE}: `),
-        events[0].error.message,
-      );
-      assert.match(events[0].error.message, /SpawnLedgerError outbox-busy/);
-      assert.equal(mock.promptCalls(), 0, "nothing reached the model");
-      // Named for what it is in owner.log — not a generic line, not silence.
-      assert.match(stderr, /could not start the turn/);
-      assert.match(stderr, /SpawnLedgerError outbox-busy/);
-      assert.match(stderr, new RegExp(MESSAGE_ID));
+      ));
     } finally {
-      await holder.release();
+      await fs.chmod(sessionsDir, 0o755);
     }
+
+    const events = await deliveryEvents(sessionId);
+    // THE WEDGE: on the unrepaired base this is 0 — no terminal, no turn, nothing.
+    assert.equal(
+      events.length,
+      1,
+      `an accepted task that never started must leave exactly ONE delivery terminal; got ${JSON.stringify(events)}`,
+    );
+    assert.equal(events[0].phase, "failed");
+    assert.equal(events[0].error.detailCode, QUEUE_TURN_START_FAILED_DETAIL_CODE);
+    assert.ok(
+      events[0].error.message.startsWith(`${QUEUE_TURN_START_FAILED_MESSAGE}: `),
+      events[0].error.message,
+    );
+    assert.match(
+      events[0].error.message,
+      /EACCES/,
+      "the failure carries its reason — and proves the lever bit (a root run cannot be denied)",
+    );
+    assert.equal(mock.promptCalls(), 0, "nothing reached the model");
+    // Named for what it is in owner.log — not a generic line, not silence.
+    assert.match(stderr, /could not start the turn/);
+    assert.match(stderr, /EACCES/);
+    assert.match(stderr, new RegExp(MESSAGE_ID));
   });
 });
 
@@ -409,44 +330,39 @@ test("b8e251eb: a turn that started and then failed keeps exactly ONE terminal (
 // first attempt persisted must not be appended a second time.
 test("b8e251eb F2: a re-drive of a message whose first attempt never reached the model leaves ONE User row in the history", async () => {
   await withAcceptedNoWaitTask("acpx-b8e251eb-f2-", async ({ home, sessionId, task, submit }) => {
-    const holder = await startDutyHolder(home);
-    let holdOnStart = true;
-    // te-B's duty-cycle shape, pinned: lock FREE at turn start (the User row is
-    // persisted), then taken by another PROCESS inside the turn before the prompt.
+    let adapterStarts = true;
+    // Attempt 1 persists the User row (turn start succeeds), then the adapter fails
+    // to start inside the turn — before the prompt is ever sent.
     const mock = makeMockClient(async () => ({ stopReason: "end_turn" }), {
       onStart: async () => {
-        if (holdOnStart) {
-          await holder.hold();
+        if (!adapterStarts) {
+          throw new Error("adapter failed to start");
         }
       },
     });
-    try {
-      await captureStderr(
-        async () =>
-          await runQueuedTask(sessionId, task, {
-            sharedClient: mock.client,
-            suppressSdkConsoleErrors: true,
-          }),
-      );
-      assert.equal(mock.promptCalls(), 0, "attempt 1 never reached the model");
-      assert.equal(await userRowsFor(home, sessionId), 1, "attempt 1 persisted the User row");
+    adapterStarts = false;
+    await captureStderr(
+      async () =>
+        await runQueuedTask(sessionId, task, {
+          sharedClient: mock.client,
+          suppressSdkConsoleErrors: true,
+        }),
+    );
+    assert.equal(mock.promptCalls(), 0, "attempt 1 never reached the model");
+    assert.equal(await userRowsFor(home, sessionId), 1, "attempt 1 persisted the User row");
 
-      // The re-drive of the SAME messageId, contention over.
-      await holder.release();
-      holdOnStart = false;
-      const redriven = await submit("acpx-b8e251eb-f2-redrive");
-      await captureStderr(
-        async () =>
-          await runQueuedTask(sessionId, redriven, {
-            sharedClient: mock.client,
-            suppressSdkConsoleErrors: true,
-          }),
-      );
-      assert.equal(mock.promptCalls(), 1, "the re-drive delivered it");
-      // On the unrepaired base: 2.
-      assert.equal(await userRowsFor(home, sessionId), 1, "one message id, one User row");
-    } finally {
-      await holder.stop();
-    }
+    // The re-drive of the SAME messageId, adapter healthy again.
+    adapterStarts = true;
+    const redriven = await submit("acpx-b8e251eb-f2-redrive");
+    await captureStderr(
+      async () =>
+        await runQueuedTask(sessionId, redriven, {
+          sharedClient: mock.client,
+          suppressSdkConsoleErrors: true,
+        }),
+    );
+    assert.equal(mock.promptCalls(), 1, "the re-drive delivered it");
+    // On the unrepaired base: 2.
+    assert.equal(await userRowsFor(home, sessionId), 1, "one message id, one User row");
   });
 });
