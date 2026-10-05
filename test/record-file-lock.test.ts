@@ -168,3 +168,165 @@ for (const [label, identity] of [
     assert.equal(ran, true);
   });
 }
+
+type Mutable = { rm: typeof fs.rm; rename: typeof fs.rename };
+type Gate = { open: () => void; opened: Promise<void> };
+
+function gate(): Gate {
+  let open = () => {};
+  const opened = new Promise<void>((resolve) => (open = resolve));
+  return { open, opened };
+}
+
+/**
+ * Holds the FIRST destructive call on the lock path (`rm` or `rename`, whichever the code uses) until
+ * `release` is opened, and reports when that call has completed. This is te-A's attack-F
+ * choreography — a breaker Y that judged the dead lock D, delayed between judgement and removal —
+ * done in-process, by gate rather than by sleep.
+ */
+function delayFirstRemoval(lockPath: string): {
+  reached: Gate;
+  release: Gate;
+  done: Gate;
+  restore: () => void;
+} {
+  const mutable = fs as unknown as Mutable;
+  const original = { rm: mutable.rm, rename: mutable.rename };
+  const reached = gate();
+  const release = gate();
+  const done = gate();
+  let first = true;
+  const hold = async <R>(target: unknown, call: () => Promise<R>): Promise<R> => {
+    if (!first || target !== lockPath) {
+      return await call();
+    }
+    first = false;
+    reached.open();
+    await release.opened;
+    try {
+      return await call();
+    } finally {
+      done.open();
+    }
+  };
+  mutable.rm = (async (target: string, ...rest: unknown[]) =>
+    await hold(target, async () =>
+      (original.rm as (...a: unknown[]) => Promise<void>)(target, ...rest),
+    )) as typeof fs.rm;
+  mutable.rename = (async (from: string, to: string) =>
+    await hold(from, async () => original.rename(from, to))) as typeof fs.rename;
+  return {
+    reached,
+    release,
+    done,
+    restore: () => {
+      mutable.rm = original.rm;
+      mutable.rename = original.rename;
+    },
+  };
+}
+
+/**
+ * te-A F1 (brick eb4c8d06). D is a dead local lock. Breaker Y judges it and is delayed before its
+ * removal; meanwhile X breaks D itself and takes a fresh lock. Y's removal then takes X's LIVE lock
+ * by mistake, and a contender (Y, re-judging) acquires the empty path while X is still inside.
+ *
+ * Required: X's commit never happens on the lock it lost — its fence refuses, X re-runs after Y,
+ * and the two commits are strictly ordered. RED on main 532ec129: X commits while Y holds the lock.
+ */
+test("record lock: F1 — a holder whose lock was taken by a mistaken breaker never commits on it", async () => {
+  const file = await tempRecordFile();
+  const lockPath = `${file}.lock`;
+  await fs.writeFile(lockPath, JSON.stringify({ pid: await deadPid(), start: null, ...LOCAL }));
+  const injected = delayFirstRemoval(lockPath);
+  const events: string[] = [];
+  const xInside = gate();
+  const xMayCommit = gate();
+  let xAttempts = 0;
+  try {
+    const y = withRecordFileLock(file, async (fence) => {
+      events.push("Y inside");
+      fence?.();
+      events.push("Y commit");
+    });
+    await injected.reached.opened; // Y judged D dead and is about to remove it.
+    const x = withRecordFileLock(file, async (fence) => {
+      xAttempts++;
+      events.push(`X inside #${xAttempts}`);
+      xInside.open();
+      await xMayCommit.opened;
+      fence?.();
+      events.push(`X commit #${xAttempts}`);
+    });
+    await xInside.opened; // X broke D and holds a fresh lock.
+    injected.release.open(); // Y's removal now takes X's live lock.
+    await injected.done.opened;
+    // Y re-judges, finds the path empty, acquires and commits while X is still inside.
+    await y;
+    xMayCommit.open();
+    await x;
+  } finally {
+    injected.restore();
+  }
+  assert.deepEqual(
+    events.filter((event) => event.includes("commit")),
+    ["Y commit", `X commit #${xAttempts}`],
+    `commits not ordered: ${events.join(", ")}`,
+  );
+  assert.equal(xAttempts, 2, `X committed on the lock it had lost: ${events.join(", ")}`);
+  await assert.rejects(fs.stat(lockPath), /ENOENT/, "a lock was left behind");
+});
+
+/**
+ * te-A F2. As F1, but the mistaken removal lands AFTER X has committed and BEFORE X releases. With a
+ * hand-back, X's lock was re-created after X released — a phantom naming a live pid that nothing may
+ * break, wedging the record for X's lifetime (RED on 6ad6bfb4). Required: no lock is left, and the
+ * next writer acquires within one backoff step.
+ */
+test("record lock: F2 — a holder releasing inside a mistaken removal leaves no phantom lock", async () => {
+  const file = await tempRecordFile();
+  const lockPath = `${file}.lock`;
+  await fs.writeFile(lockPath, JSON.stringify({ pid: await deadPid(), start: null, ...LOCAL }));
+  const injected = delayFirstRemoval(lockPath);
+  let xCommits = 0;
+  try {
+    const y = withRecordFileLock(file, async () => {});
+    await injected.reached.opened;
+    await withRecordFileLock(file, async (fence) => {
+      fence?.();
+      xCommits++;
+      // X has committed. Y's mistaken removal of X's lock lands now, before X's release.
+      injected.release.open();
+      await injected.done.opened;
+    });
+    await y;
+  } finally {
+    injected.restore();
+  }
+  assert.equal(xCommits, 1);
+  await assert.rejects(
+    fs.stat(lockPath),
+    /ENOENT/,
+    "PHANTOM: a lock outlived its holder's release",
+  );
+  const started = Date.now();
+  await withRecordFileLock(file, async () => {});
+  assert.ok(Date.now() - started < 200, "the next writer did not acquire within one backoff step");
+});
+
+/** The fence itself: a holder whose lock was replaced is refused at its fence and re-runs once. */
+test("record lock: fence refuses a holder whose lock was replaced, and the attempt re-runs", async () => {
+  const file = await tempRecordFile();
+  const lockPath = `${file}.lock`;
+  let attempts = 0;
+  await withRecordFileLock(file, async (fence) => {
+    attempts++;
+    if (attempts === 1) {
+      // Someone took our lock and another writer now holds it — then released it.
+      await fs.rm(lockPath);
+    }
+    fence();
+  });
+  assert.equal(attempts, 2);
+  await assert.rejects(fs.stat(lockPath), /ENOENT/);
+});
