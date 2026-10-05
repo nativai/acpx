@@ -13,6 +13,7 @@ import {
   resolveEffectiveForkIndex,
   resolveHarnessCapabilities,
 } from "../acp/harness-capabilities.js";
+import { projectAdvertisedComposedModels } from "../acp/model-support.js";
 import {
   listBuiltInAgents,
   resolveAgentCommand,
@@ -337,6 +338,60 @@ export async function handleListOutputStyles(
   for (const style of result.available) {
     process.stdout.write(`${style === result.current ? "* " : "  "}${style}\n`);
   }
+}
+
+// brick 574b137e — the adapter's advertised model catalogue, for a caller with no
+// session (acpx-ui's model picker). Same transient open/read/close as
+// `output-styles`: `initialize` + `session/new`, no prompt, no tokens, and NO
+// acpx session record — so a catalogue read is never a session-store write.
+// `--profile` selects the account the adapter authenticates as (a ChatGPT
+// profile's CODEX_HOME); `acpxRecordId: ""` is the transient-spawn marker the
+// client already treats as "no record to write" (`resolveBrickContext`).
+export async function handleModelCatalogue(
+  explicitAgentName: string | undefined,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const { readTransientAdvertisement } = await import("../acp/transient-advertisement.js");
+  const { models } = await readTransientAdvertisement({
+    agentCommand: agent.agentCommand,
+    cwd: globalFlags.cwd,
+    authCredentials: config.auth,
+    authPolicy: globalFlags.authPolicy,
+    timeoutMs: globalFlags.timeout,
+    verbose: globalFlags.verbose,
+    ...(globalFlags.profile
+      ? { sessionContext: { acpxRecordId: "", profileId: globalFlags.profile } }
+      : {}),
+  });
+  const families = models ? projectAdvertisedComposedModels(models) : [];
+  if (
+    emitJsonResult(globalFlags.format, {
+      action: "model_catalogue",
+      agent: agent.agentName,
+      currentModelId: models?.currentModelId ?? null,
+      advertisedModelCatalogue: advertisedCatalogue(families),
+    })
+  ) {
+    return;
+  }
+  for (const family of families) {
+    process.stdout.write(`${family.family}: ${family.efforts.join(", ")}\n`);
+  }
+}
+
+/** The `status` JSON shape (`advertisedModelCatalogue`), so one parser reads both. */
+function advertisedCatalogue(families: ReturnType<typeof projectAdvertisedComposedModels>) {
+  return families.length > 0
+    ? {
+        source: "acp" as const,
+        availability: "adapter-advertised" as const,
+        accountAllowed: null,
+        models: families,
+      }
+    : null;
 }
 
 function resolveRequestedOutputPolicy(globalFlags: {
