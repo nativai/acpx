@@ -146,7 +146,6 @@ import {
 } from "../../types.js";
 import {
   ABSORBED_TURN_NEVER_ENDED_MESSAGE,
-  ownerExitDeliveryError,
   QUEUE_TURN_START_FAILED_DETAIL_CODE,
   QUEUE_TURN_START_FAILED_MESSAGE,
   SESSION_CLOSED_UNDELIVERED_DETAIL_CODE,
@@ -199,11 +198,9 @@ type RunSessionPromptOptions = Omit<
   // agent sees the new message mid-turn via the Pushable input. Pass undefined
   // to clear the handler after the turn ends.
   setMidTurnHandler?: (handler: ((task: QueueTask) => void) | undefined) => void;
-  // brick://b8e251eb: true while the turn has written, or will write, this
-  // delivery's terminal itself. False means NOTHING reached the model and NO
-  // terminal was written — the queue owner then retries or terminalizes. Set on
-  // entering the turn's try; handed back (reset to false) only by the turn's catch
-  // for an outbox-busy thrown before the prompt was submitted.
+  // brick://b8e251eb: set on entering the region whose catch writes this
+  // delivery's terminal itself. Still false on failure means NOTHING reached the
+  // model and NO terminal was written — the queue owner then writes one.
   turnStart?: TurnStartProgress;
 };
 
@@ -1360,25 +1357,6 @@ function terminalizeDeliveryRefusedByReservedCapacity(
   appendDeliveryStreamEventSync(sessionRecordId, task, "failed", deliveryErrorFrom(error));
 }
 
-// brick://b8e251eb — the turn-start retry. Delays BETWEEN attempts, so 4 attempts.
-// Each attempt can itself spend the outbox's 4 s synchronous busy budget, so the
-// owner gives up after ~23 s of sustained contention and hands the task to the
-// delivery layer, whose own re-drive backs off for up to 2 h.
-export const TURN_START_RETRY_DELAYS_MS: readonly number[] = [1_000, 2_000, 4_000];
-
-export type TurnStartRetryPolicy = {
-  delaysMs: readonly number[];
-  sleep?: (ms: number) => Promise<void>;
-};
-
-// The one class measured to clear on its own (`retry the operation` is in its text).
-// Retried only while the prompt has provably not been submitted (`turnOwnsTerminal`
-// false); a User row an earlier attempt already persisted is not appended twice
-// (recordPromptStart is idempotent on the message id).
-function isTransientTurnStartError(error: unknown): boolean {
-  return error instanceof OutboxError && error.code === "outbox-busy";
-}
-
 function describeTurnStartError(error: unknown): string {
   if (error instanceof OutboxError) {
     return `OutboxError ${error.code}: ${error.message}`;
@@ -1390,18 +1368,10 @@ function describeTurnStartError(error: unknown): string {
 // starts used to reach `sendQueuedTaskError`, which returns at once without a
 // waiter, so the owner closed the task having written nothing: acpx-ui held the
 // item `delivering` behind a healthy lease for as long as the owner lived (14 min
-// on devbox, 2026-10-05). Every failure in that window now leaves exactly one
-// terminal and one owner.log line.
-//
-// Two shapes, by whether a retry can help:
-//   - transient (outbox-busy, already retried in-owner): the RETRYABLE owner-exit
-//     terminal, and the owner is told to release. That terminal says "the owner
-//     shut down before the message was accepted" — it is honest only because the
-//     owner then really does exit (`onTurnStartAbandoned`). Deployed acpx-ui
-//     re-drives exactly this code into a cold-spawned owner.
-//   - anything else: a definitive `failed` with the real reason. ⚠️ Do not mint
-//     those retryable: a deterministic failure would be re-driven for the whole
-//     2 h retry ceiling.
+// on devbox, 2026-10-05, an outbox-busy). Every failure in that window now
+// leaves exactly one DEFINITIVE terminal (QUEUE_TURN_START_FAILED: never reached
+// the model, resend-safe, not auto-retried — see the delivery contract fixture)
+// and one owner.log line naming the error.
 // Scope: the pre-submit refusals (`isPreSubmitTerminalError`) keep the surfacing
 // they already have, and the two refusals above already wrote their terminal.
 function terminalizeTurnThatNeverStarted(
@@ -1409,14 +1379,16 @@ function terminalizeTurnThatNeverStarted(
   task: QueueTask,
   error: unknown,
   turnStart: TurnStartProgress,
-  onTurnStartAbandoned: (() => void) | undefined,
 ): void {
   if (!isUnterminalizedTurnStartFailure(task, error, turnStart)) {
     return;
   }
   task.terminalWritten = true;
-  const transient = isTransientTurnStartError(error);
-  const terminalError = turnStartFailureTerminal(error, transient);
+  const terminalError: DeliveryEventError = {
+    code: 0,
+    message: `${QUEUE_TURN_START_FAILED_MESSAGE}: ${describeTurnStartError(error)}`,
+    detailCode: QUEUE_TURN_START_FAILED_DETAIL_CODE,
+  };
   appendDeliveryStreamEventSync(sessionRecordId, task, "failed", terminalError);
   appendRefusedStreamEventSync(sessionRecordId, task, terminalError);
   // NOT verbose-gated: this line is the whole point. The owner's stderr is its
@@ -1424,12 +1396,8 @@ function terminalizeTurnThatNeverStarted(
   process.stderr.write(
     `[acpx] queue owner could not start the turn for session ${sessionRecordId} ` +
       `(messageId=${task.messageId ?? "-"} requestId=${task.requestId}): ` +
-      `${describeTurnStartError(error)}; wrote a ${terminalError.detailCode} terminal` +
-      `${transient ? " and is releasing so the delivery layer re-drives it" : ""}\n`,
+      `${describeTurnStartError(error)}; wrote a ${terminalError.detailCode} terminal\n`,
   );
-  if (transient) {
-    onTurnStartAbandoned?.();
-  }
 }
 
 function isUnterminalizedTurnStartFailure(
@@ -1444,32 +1412,6 @@ function isUnterminalizedTurnStartFailure(
     error instanceof InterruptedError ||
     isPreSubmitTerminalError(error)
   );
-}
-
-function turnStartFailureTerminal(error: unknown, transient: boolean): DeliveryEventError {
-  if (transient) {
-    return ownerExitDeliveryError("owner-exit");
-  }
-  return {
-    code: 0,
-    message: `${QUEUE_TURN_START_FAILED_MESSAGE}: ${describeTurnStartError(error)}`,
-    detailCode: QUEUE_TURN_START_FAILED_DETAIL_CODE,
-  };
-}
-
-// The delay before the next turn-start attempt, or undefined when this failure
-// must not be retried: the turn already started, the class is not transient, or
-// the bounded attempts are spent.
-function turnStartRetryDelay(
-  error: unknown,
-  turnStart: TurnStartProgress,
-  retry: TurnStartRetryPolicy,
-  attempt: number,
-): number | undefined {
-  if (turnStart.turnOwnsTerminal || !isTransientTurnStartError(error)) {
-    return undefined;
-  }
-  return retry.delaysMs[attempt];
 }
 
 function sendQueuedTaskError(task: QueueTask, error: unknown): void {
@@ -1522,109 +1464,46 @@ export async function runQueuedTask(
     // subsequent turns cold-spawn on the new transcript anchor.
     onFailoverSwitched?: (newProfileId: string) => void;
     onLockBlocked?: () => void;
-    // brick://b8e251eb: the task could not be started and was handed back with the
-    // retryable owner-exit terminal. The owner MUST release after this task, or
-    // that terminal is a lie and acpx-ui re-drives into the same owner.
-    onTurnStartAbandoned?: () => void;
-    turnStartRetry?: TurnStartRetryPolicy;
   },
 ): Promise<void> {
   const outputFormatter = task.waitForCompletion
     ? new QueueTaskOutputFormatter(task)
     : DISCARD_OUTPUT_FORMATTER;
-  const retry = options.turnStartRetry ?? { delaysMs: TURN_START_RETRY_DELAYS_MS };
-  // A subscription switch decided by an attempt that then failed must survive the
-  // retry: the switched-to profile is on disk, so a re-run sees no switch and would
-  // otherwise reuse the shared client pinned to the OLD config dir.
-  const freshClient = { required: false };
+  const turnStart: TurnStartProgress = { turnOwnsTerminal: false };
 
   try {
-    for (let attempt = 0; ; attempt += 1) {
-      const turnStart: TurnStartProgress = { turnOwnsTerminal: false };
-      try {
-        sendQueuedTaskResult(
-          task,
-          await runQueuedTaskAttempt(sessionRecordId, task, options, outputFormatter, {
-            turnStart,
-            freshClient,
-          }),
-        );
-        return;
-      } catch (error) {
-        const delayMs = turnStartRetryDelay(error, turnStart, retry, attempt);
-        if (delayMs === undefined) {
-          failQueuedTask(sessionRecordId, task, options, error, turnStart);
-          return;
-        }
-        // An async wait, never Atomics.wait: the heartbeat, the IPC server and the
-        // other process's COMMIT all need this event loop free.
-        process.stderr.write(
-          `[acpx] turn start for session ${sessionRecordId} hit ${describeTurnStartError(error)}; ` +
-            `retry ${attempt + 1}/${retry.delaysMs.length} in ${delayMs}ms\n`,
-        );
-        await (retry.sleep ?? waitMs)(delayMs);
-      }
-    }
-  } finally {
-    task.close();
-  }
-}
-
-async function runQueuedTaskAttempt(
-  sessionRecordId: string,
-  task: QueueTask,
-  options: QueuedTaskRuntimeOptions,
-  outputFormatter: OutputFormatter,
-  state: { turnStart: TurnStartProgress; freshClient: { required: boolean } },
-): Promise<SessionSendResult> {
-  try {
-    const lockPolicy = await applyQueuedTaskSubscriptionLockPolicy(sessionRecordId, options);
-    state.freshClient.required ||= lockPolicy.useFreshClient;
-    return await runSessionPrompt({
-      ...buildQueuedTaskRunOptions(
+    let result: SessionSendResult;
+    try {
+      const lockPolicy = await applyQueuedTaskSubscriptionLockPolicy(sessionRecordId, options);
+      result = await runSessionPrompt({
+        ...buildQueuedTaskRunOptions(sessionRecordId, task, options, outputFormatter, turnStart),
+        ...(lockPolicy.useFreshClient ? { client: undefined } : {}),
+      });
+    } catch (error) {
+      result = await runQueuedTaskFailover(
         sessionRecordId,
         task,
         options,
         outputFormatter,
-        state.turnStart,
-      ),
-      ...(state.freshClient.required ? { client: undefined } : {}),
-    });
+        error,
+        turnStart,
+      );
+    }
+    sendQueuedTaskResult(task, result);
   } catch (error) {
-    return await runQueuedTaskFailover(
-      sessionRecordId,
-      task,
-      options,
-      outputFormatter,
-      error,
-      state.turnStart,
-    );
-  }
-}
-
-function failQueuedTask(
-  sessionRecordId: string,
-  task: QueueTask,
-  options: QueuedTaskRuntimeOptions,
-  error: unknown,
-  turnStart: TurnStartProgress,
-): void {
-  if (isSubscriptionLockBlockError(error)) {
-    options.onLockBlocked?.();
-  }
-  terminalizeDeliveryRefusedByReservedCapacity(sessionRecordId, task, error);
-  terminalizeDeliveryRefusedByClosedRecord(sessionRecordId, task, error);
-  // After the two above, so a task they already terminalized is skipped here.
-  terminalizeTurnThatNeverStarted(
-    sessionRecordId,
-    task,
-    error,
-    turnStart,
-    options.onTurnStartAbandoned,
-  );
-  sendQueuedTaskError(task, error);
-  if (error instanceof InterruptedError) {
-    throw error;
+    if (isSubscriptionLockBlockError(error)) {
+      options.onLockBlocked?.();
+    }
+    terminalizeDeliveryRefusedByReservedCapacity(sessionRecordId, task, error);
+    terminalizeDeliveryRefusedByClosedRecord(sessionRecordId, task, error);
+    // After the two above, so a task they already terminalized is skipped here.
+    terminalizeTurnThatNeverStarted(sessionRecordId, task, error, turnStart);
+    sendQueuedTaskError(task, error);
+    if (error instanceof InterruptedError) {
+      throw error;
+    }
+  } finally {
+    task.close();
   }
 }
 
@@ -1953,9 +1832,6 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   // (brick 56d3532d) without ever being able to reject a real late chunk.
   // `promptTurnActive` above is per-turn and must NOT be substituted here.
   let promptEverSubmitted = false;
-  // brick://b8e251eb: this delivery's main prompt may have reached the model.
-  // Latched before `accepted`; see runPromptAttempt.
-  let promptSubmitted = false;
   let promptTurnHadSideEffects = false;
   // Fork: in-flight mid-turn-injected prompts. Tracked so a turn awaits all
   // of them before the queue-owner loop starts the next sequential task —
@@ -3061,11 +2937,6 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // Fresh watchdog state for this attempt (a retry re-arms cleanly).
     turnAbandoned = false;
     endMarkerReasonThisTurn = undefined;
-    // brick://b8e251eb: latched BEFORE `accepted` is even attempted. acpx-ui reads
-    // `accepted` as "the model got it" and will never re-drive an item carrying it,
-    // and from here the prompt may reach the model — so nothing after this point
-    // may be handed back as retryable.
-    promptSubmitted = true;
     await appendDeliveryEvent(mainDeliveryContext, "accepted");
     const response = await measurePerf("runtime.prompt.agent_turn", async () => {
       const turnPromise = runPromptTurn({
@@ -3237,10 +3108,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     return response;
   };
 
-  // brick://b8e251eb: from here on the catch below writes the delivery terminal —
-  // except for a transient outbox-busy before `promptSubmitted`, which it hands
-  // back. Everything above is the window the queue owner must terminalize itself
-  // — keep this line IMMEDIATELY before the `try`.
+  // brick://b8e251eb: from here on the catch below writes the delivery terminal.
+  // Everything above is the window the queue owner must terminalize itself — keep
+  // this line IMMEDIATELY before the `try`.
   if (options.turnStart) {
     options.turnStart.turnOwnsTerminal = true;
   }
@@ -3359,16 +3229,6 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       error,
       client.getEffectiveAccountMetadata(),
     );
-    // brick://b8e251eb F1: a pre-submit write (connect bookkeeping, the live
-    // checkpoint) can still lose to an intermittent outbox holder AFTER the turn
-    // took ownership. The prompt provably never reached the model and no
-    // `accepted` was written, so hand the delivery back to the queue owner, which
-    // retries it and, once exhausted, terminalizes it RETRYABLY — rather than
-    // writing a non-retryable `failed` acpx-ui would bury.
-    if (!promptSubmitted && options.turnStart && isTransientTurnStartError(error)) {
-      options.turnStart.turnOwnsTerminal = false;
-      throw annotatedError;
-    }
     if (error instanceof InterruptedError) {
       await completeAbsorbedInjectedDeliveries("cancelled", {
         stopReason: "cancelled",

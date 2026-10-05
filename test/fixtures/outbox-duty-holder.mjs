@@ -1,6 +1,6 @@
 /**
  * An INTERMITTENT holder of the session outbox's SQLite write lock, from a SEPARATE
- * PROCESS, driven over IPC (brick://b8e251eb F1). It starts with the lock FREE and
+ * PROCESS, driven over IPC (brick://b8e251eb F2). It starts with the lock FREE and
  * takes / drops it on command, so a test can pin one duty cycle of the production
  * contention shape (7d717c8a: one owner held the lock ~97 % of the time in bursts)
  * to an exact point in the turn instead of to a timer:
