@@ -2782,3 +2782,50 @@ test("N6: `seats rename` re-projects the seat's name onto its holders' index ent
     );
   });
 });
+
+// ─── X — an apply with refused records must not exit 0 ───────────────────────
+
+/** A brick-linked record: its rewrite goes through the outbox, which refuses it when the HOME's
+ * `instance.json` names another home — the failure the TE measured on a copy of a store. */
+async function seedRefusedRig(homeDir: string): Promise<void> {
+  await seed(homeDir, [
+    makeRecord({
+      acpxRecordId: "x-refused",
+      metadata: { brick: "22222222-2222-4222-8222-222222222222" },
+    }),
+    makeRecord({ acpxRecordId: "x-fine" }),
+  ]);
+  await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+  await fs.writeFile(
+    path.join(homeDir, ".acpx", "instance.json"),
+    JSON.stringify({ instance_id: "i-0123456789ab", home: "/somewhere/else" }),
+    "utf8",
+  );
+}
+
+test("X1: an apply whose records are REFUSED exits NON-zero with the reason on stderr (the report still prints)", async () => {
+  await withTempHome(async (homeDir) => {
+    await seedRefusedRig(homeDir);
+    const result = await runCli(["seats", "backfill", "--apply", "--format", "json"], homeDir);
+    const report = JSON.parse(result.stdout.trim()) as BackfillJson;
+    assert.ok(
+      report.errors.some((error) => error.stage !== "parse"),
+      `the rig did not produce a refused record: ${JSON.stringify(report.errors)}`,
+    );
+    assert.notEqual(result.code, 0, "an apply that refused records exited 0");
+    assert.match(result.stderr, /x-refused\.json/, "stderr names the refused record");
+    assert.match(result.stderr, /instance identity/i, "stderr carries the reason");
+  });
+});
+
+test("X2: a dry run, and an apply with no refusals, still exit 0 (parse-stage skips are not refusals)", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [makeRecord({ acpxRecordId: "x-ok" })]);
+    await fs.writeFile(path.join(sessionsDir(homeDir), "junk.json"), "{ not a record", "utf8");
+    const dry = await runCli(["seats", "backfill"], homeDir);
+    assert.equal(dry.code, 0, dry.stderr);
+    const applied = await runCli(["seats", "backfill", "--apply"], homeDir);
+    assert.equal(applied.code, 0, applied.stderr);
+    assert.match(applied.stdout, /\[parse\]/, "control: the parse-stage skip is in the report");
+  });
+});
