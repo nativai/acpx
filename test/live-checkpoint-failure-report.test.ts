@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { OutboxError } from "../src/brick-outbox.js";
+import { SpawnLedgerError } from "../src/spawn-ledger.js";
 import { LiveSessionCheckpoint } from "../src/session/live-checkpoint.js";
 
 /**
@@ -65,10 +65,10 @@ async function reportFor(error: Error): Promise<string> {
 
 test("b8e251eb: an outbox-busy checkpoint failure is named as lock contention, never as a key-policy violation", async () => {
   const captured = await reportFor(
-    new OutboxError("outbox-busy", "session write refused: outbox-busy; retry the operation"),
+    new SpawnLedgerError("outbox-busy", "session write refused: outbox-busy; retry the operation"),
   );
   assert.match(captured, /checkpoint FAILED/);
-  assert.match(captured, /OutboxError outbox-busy/);
+  assert.match(captured, /SpawnLedgerError outbox-busy/);
   assert.doesNotMatch(captured, /snake_case/);
 });
 

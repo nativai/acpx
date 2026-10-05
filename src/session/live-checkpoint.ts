@@ -1,4 +1,4 @@
-import { OutboxError } from "../brick-outbox.js";
+import { SpawnLedgerError } from "../spawn-ledger.js";
 
 const DEFAULT_LIVE_CHECKPOINT_INTERVAL_MS = 500;
 
@@ -51,14 +51,14 @@ const KEY_POLICY_VIOLATION_PREFIX = "Persisted key policy violation";
  * while the real cause was another process holding the outbox write lock.
  */
 export function checkpointFailureCause(error: unknown): string {
-  if (error instanceof OutboxError && error.code === "outbox-busy") {
+  if (error instanceof SpawnLedgerError && error.code === "outbox-busy") {
     return (
-      "Cause: OutboxError outbox-busy — another writer held the session outbox lock " +
+      "Cause: SpawnLedgerError outbox-busy — another writer held the spawn-ledger lock " +
       "(~/.acpx/brick-outbox.db) past the retry budget; lock contention, not a record defect."
     );
   }
-  if (error instanceof OutboxError) {
-    return `Cause: OutboxError ${error.code}.`;
+  if (error instanceof SpawnLedgerError) {
+    return `Cause: SpawnLedgerError ${error.code}.`;
   }
   if (error instanceof Error && error.message.startsWith(KEY_POLICY_VIOLATION_PREFIX)) {
     return "Cause: a non-snake_case persisted key (see src/persisted-key-policy.ts).";

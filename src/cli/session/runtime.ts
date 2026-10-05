@@ -19,7 +19,7 @@ import { assertRequestedModelSupported } from "../../acp/model-support.js";
 import { explainTurnError, type RefusalProbeDeps } from "../../acp/openrouter-refusal-reason.js";
 import { explainPiTurnError } from "../../acp/pi-turn-error.js";
 import { InterruptedError, withInterrupt, withTimeout } from "../../async-control.js";
-import { OutboxError } from "../../brick-outbox.js";
+import { SpawnLedgerError } from "../../spawn-ledger.js";
 import { tailClaudeSubagentJsonl } from "../../claude-jsonl.js";
 import { transcriptCwdHash } from "../../config/subscription-transcript.js";
 import {
@@ -1358,8 +1358,8 @@ function terminalizeDeliveryRefusedByReservedCapacity(
 }
 
 function describeTurnStartError(error: unknown): string {
-  if (error instanceof OutboxError) {
-    return `OutboxError ${error.code}: ${error.message}`;
+  if (error instanceof SpawnLedgerError) {
+    return `SpawnLedgerError ${error.code}: ${error.message}`;
   }
   return error instanceof Error ? `${error.name}: ${error.message}` : formatErrorMessage(error);
 }

@@ -43,8 +43,8 @@ if (isCliEntrypoint(process.argv)) {
     process.env.ACPX_QUEUE_OWNER_ARGS ??= queueOwnerArgOverride;
   }
 
-  if (process.argv.length === 3 && process.argv[2] === "__brick-outbox-module") {
-    process.stdout.write(`${new URL("./brick-outbox.js", import.meta.url).href}\n`);
+  if (process.argv.length === 3 && process.argv[2] === "__spawn-ledger-module") {
+    process.stdout.write(`${new URL("./spawn-ledger.js", import.meta.url).href}\n`);
   } else {
     void main(process.argv);
   }

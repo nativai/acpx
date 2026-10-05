@@ -11,7 +11,7 @@
 //   - the owner pulls the task and calls `runQueuedTask`
 //     (queue-owner-runtime.ts:1159);
 //   - `runSessionPrompt` → `recordPromptStart` → `writeSessionRecordAtBoundary`
-//     (runtime.ts:1704) throws `OutboxError("outbox-busy")` after the outbox's own
+//     (runtime.ts:1704) throws `OutboxError("outbox-busy")` (since the spawn-ledger reduction: `SpawnLedgerError`) after the outbox's own
 //     4 s busy budget. That is BEFORE the main turn try (runtime.ts:3030), so no
 //     `failed` delivery terminal is written by the turn;
 //   - `runQueuedTask`'s catch (runtime.ts:1417-1426) only terminalizes the
@@ -339,11 +339,11 @@ test("b8e251eb: an accepted no-wait task whose turn cannot start under outbox-bu
         events[0].error.message.startsWith(`${QUEUE_TURN_START_FAILED_MESSAGE}: `),
         events[0].error.message,
       );
-      assert.match(events[0].error.message, /OutboxError outbox-busy/);
+      assert.match(events[0].error.message, /SpawnLedgerError outbox-busy/);
       assert.equal(mock.promptCalls(), 0, "nothing reached the model");
       // Named for what it is in owner.log — not a generic line, not silence.
       assert.match(stderr, /could not start the turn/);
-      assert.match(stderr, /OutboxError outbox-busy/);
+      assert.match(stderr, /SpawnLedgerError outbox-busy/);
       assert.match(stderr, new RegExp(MESSAGE_ID));
     } finally {
       await holder.release();
