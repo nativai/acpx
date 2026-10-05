@@ -39,6 +39,10 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import type { AcpClient } from "../src/acp/client.js";
 import {
+  QUEUE_TURN_START_FAILED_DETAIL_CODE,
+  QUEUE_TURN_START_FAILED_MESSAGE,
+} from "../src/cli/queue/delivery-terminals.js";
+import {
   type QueueTask,
   releaseQueueOwnerLease,
   SessionQueueOwner,
@@ -333,12 +337,17 @@ test("b8e251eb: a NON-transient failure before the turn starts is failed loudly 
     const events = await deliveryEvents(sessionId);
     assert.equal(events.length, 1, `exactly one terminal; got ${JSON.stringify(events)}`);
     assert.equal(events[0].phase, "failed");
-    assert.notEqual(
+    assert.equal(
       events[0].error.detailCode,
-      "QUEUE_OWNER_SHUTDOWN",
+      QUEUE_TURN_START_FAILED_DETAIL_CODE,
       "a deterministic failure must not be minted retryable — acpx-ui would bounce it for 2 h",
     );
-    assert.ok(events[0].error.message.length > 0, "the failure carries its reason");
+    // The contract's `messageMatch: prefix`: the fixed text, then the real reason.
+    assert.ok(
+      events[0].error.message.startsWith(`${QUEUE_TURN_START_FAILED_MESSAGE}: `),
+      events[0].error.message,
+    );
+    assert.match(events[0].error.message, /SessionNotFoundError/, "the failure carries its reason");
     assert.deepEqual(sleeps, [], "only a transient class is retried");
     assert.equal(abandoned, 0);
     assert.equal(mock.promptCalls(), 0);

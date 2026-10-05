@@ -13,6 +13,8 @@ import {
   QUEUE_OWNER_CLOSING_MESSAGE,
   QUEUE_OWNER_SHUTDOWN_DETAIL_CODE,
   QUEUE_OWNER_SHUTDOWN_MESSAGE,
+  QUEUE_TURN_START_FAILED_DETAIL_CODE,
+  QUEUE_TURN_START_FAILED_MESSAGE,
   SESSION_CLOSED_UNDELIVERED_DETAIL_CODE,
   SESSION_CLOSED_UNDELIVERED_MESSAGE,
 } from "../src/cli/queue/delivery-terminals.js";
@@ -303,6 +305,13 @@ test("L1.4/L3.1 the emitted contract strings match the checked-in cross-repo fix
       message: string;
       requiredSubstringLowercased: string | null;
     }>;
+    turnStartTerminals: Array<{
+      detailCode: string;
+      message: string;
+      messageMatch: string;
+      retryable: boolean;
+      reachedModel: string;
+    }>;
   };
 
   // The sha binds acpx's copy to acpx-ui's. acpx-ui vendors the same bytes and
@@ -310,7 +319,7 @@ test("L1.4/L3.1 the emitted contract strings match the checked-in cross-repo fix
   // rather than silently diverging for six weeks.
   assert.equal(
     createHash("sha256").update(bytes).digest("hex"),
-    "9594e346089f7f09554fdd7b64b74579ebb1ff6f089b8eeeb1e4df75f7fb7052",
+    "6d271365bc5bc0b23d560c22e06f21024c080c7992b5adc55a6d726834141a67",
     "delivery-contract.fixture.json changed — re-broker the sha to the acpx-ui lanes before merging",
   );
 
@@ -334,6 +343,18 @@ test("L1.4/L3.1 the emitted contract strings match the checked-in cross-repo fix
     emitted.get(ABSORBED_TURN_NEVER_ENDED_DETAIL_CODE)?.message,
     ABSORBED_TURN_NEVER_ENDED_MESSAGE,
   );
+
+  // brick://b8e251eb — the turn-never-started terminal, its own section.
+  assert.deepEqual(
+    fixture.turnStartTerminals.map((entry) => entry.detailCode),
+    [QUEUE_TURN_START_FAILED_DETAIL_CODE],
+  );
+  const [turnStart] = fixture.turnStartTerminals;
+  assert.equal(turnStart.message, QUEUE_TURN_START_FAILED_MESSAGE);
+  assert.equal(turnStart.messageMatch, "prefix");
+  assert.equal(turnStart.retryable, false);
+  assert.equal(turnStart.reachedModel, "no");
+  assert.doesNotMatch(turnStart.message, /session (is )?closed/i);
 
   // And the classification rule holds against those literal texts. acpx-ui's
   // `isTerminalEnqueueFailure` / `isDefinitiveGiveUp` both LOWER-CASE the text

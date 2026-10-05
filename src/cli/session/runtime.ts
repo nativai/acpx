@@ -147,6 +147,8 @@ import {
 import {
   ABSORBED_TURN_NEVER_ENDED_MESSAGE,
   ownerExitDeliveryError,
+  QUEUE_TURN_START_FAILED_DETAIL_CODE,
+  QUEUE_TURN_START_FAILED_MESSAGE,
   SESSION_CLOSED_UNDELIVERED_DETAIL_CODE,
   SESSION_CLOSED_UNDELIVERED_MESSAGE,
 } from "../queue/delivery-terminals.js";
@@ -1447,8 +1449,8 @@ function turnStartFailureTerminal(error: unknown, transient: boolean): DeliveryE
   }
   return {
     code: 0,
-    message: `queue owner could not start the turn: ${describeTurnStartError(error)}`,
-    detailCode: "QUEUE_TURN_START_FAILED",
+    message: `${QUEUE_TURN_START_FAILED_MESSAGE}: ${describeTurnStartError(error)}`,
+    detailCode: QUEUE_TURN_START_FAILED_DETAIL_CODE,
   };
 }
 

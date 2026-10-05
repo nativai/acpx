@@ -42,6 +42,18 @@ export const SESSION_CLOSED_UNDELIVERED_MESSAGE =
 export const ABSORBED_TURN_NEVER_ENDED_MESSAGE =
   "delivery outcome unknown — the message may have been processed";
 
+// brick://b8e251eb — the owner ACCEPTED the task but its turn never started
+// (a non-transient failure before the prompt was submitted). Never reached the
+// model → a resend is safe; DEFINITIVE, because the failure is not known to clear
+// on its own, so acpx-ui must not auto re-drive it for its whole retry ceiling.
+// Contracted in the fixture's `turnStartTerminals`. The emitted message is this
+// text as a PREFIX: `${QUEUE_TURN_START_FAILED_MESSAGE}: <ErrorClass>: <detail>`.
+// It must not contain `session closed` / `session is closed`, which would make
+// acpx-ui's substring backstops classify it as a close.
+export const QUEUE_TURN_START_FAILED_DETAIL_CODE = "QUEUE_TURN_START_FAILED";
+export const QUEUE_TURN_START_FAILED_MESSAGE =
+  "the turn never started — the message did not reach the agent";
+
 // Why the owner is writing an exit terminal. `session-close` is reachable only
 // through the drain verb, which carries `reason:'session-close'`; every other
 // death — including the signal path — is `owner-exit`.
