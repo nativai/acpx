@@ -38,6 +38,7 @@ import readline from "node:readline";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import type { AcpClient } from "../src/acp/client.js";
+import { OutboxError } from "../src/brick-outbox.js";
 import {
   QUEUE_TURN_START_FAILED_DETAIL_CODE,
   QUEUE_TURN_START_FAILED_MESSAGE,
@@ -60,6 +61,9 @@ import { makeSessionRecord, sessionFilePath, withTempHome } from "./runtime-test
 // `dist-test/`. From `dist-test/test/` two levels up is the repo root.
 const HOLDER_PATH = fileURLToPath(
   new URL("../../test/fixtures/outbox-lock-holder.mjs", import.meta.url),
+);
+const DUTY_HOLDER_PATH = fileURLToPath(
+  new URL("../../test/fixtures/outbox-duty-holder.mjs", import.meta.url),
 );
 
 const MESSAGE_ID = "b8e251eb-0000-4000-8000-000000000001";
@@ -101,17 +105,63 @@ async function holdOutboxLock(home: string): Promise<Holder> {
   };
 }
 
+// brick://b8e251eb F1 — ONE DUTY CYCLE of the production contention shape (te-B's
+// duty-cycle probe: a separate process holding the lock ~95 % of the time in 6 s
+// bursts), pinned to a point in the turn instead of to a timer. The lock is FREE
+// when the turn starts and is taken by another PROCESS inside the turn, before the
+// prompt is submitted — exactly the gap te-B's intermittent holder hit.
+type DutyHolder = {
+  hold: () => Promise<void>;
+  release: () => Promise<void>;
+  stop: () => Promise<void>;
+};
+
+async function startDutyHolder(home: string): Promise<DutyHolder> {
+  const dbPath = path.join(home, ".acpx", "brick-outbox.db");
+  assert.ok(fsSync.existsSync(dbPath), "no outbox DB to hold — the instrument is blind");
+  assert.ok(fsSync.existsSync(DUTY_HOLDER_PATH), `duty holder missing at ${DUTY_HOLDER_PATH}`);
+  const child = fork(DUTY_HOLDER_PATH, [dbPath], {
+    execArgv: [],
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
+  });
+  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  const nextReply = async (): Promise<{ held?: boolean; ready?: boolean }> =>
+    await new Promise((resolve) => child.once("message", (m) => resolve(m as { held?: boolean })));
+  assert.equal((await nextReply()).ready, true, "duty holder did not start");
+  const command = async (cmd: string, expectHeld: boolean): Promise<void> => {
+    const reply = nextReply();
+    child.send({ cmd });
+    assert.equal((await reply).held, expectHeld, `duty holder did not ACT on ${cmd}`);
+  };
+  return {
+    hold: async () => await command("hold", true),
+    release: async () => await command("release", false),
+    stop: async () => {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.send({ cmd: "exit" });
+        await exited;
+      }
+    },
+  };
+}
+
 type MockClient = { client: AcpClient; promptCalls: () => number };
 
 // The reuse happy-path surface `runSessionPrompt` touches (same shape as
 // delivery-steer-visibility.test.ts). `prompt` either ends the turn or throws.
-function makeMockClient(onPrompt: () => Promise<{ stopReason: "end_turn" }>): MockClient {
+// With `onStart`, the client is NOT reusable: every connect awaits `start()` and
+// creates a fresh session — the hook point INSIDE the turn, before the prompt.
+function makeMockClient(
+  onPrompt: () => Promise<{ stopReason: "end_turn" }>,
+  hooks: { onStart?: () => Promise<void> } = {},
+): MockClient {
   let calls = 0;
   const mock = {
-    hasReusableSession: () => true,
+    hasReusableSession: () => hooks.onStart === undefined,
     supportsLoadSession: () => false,
     supportsResumeSession: () => false,
-    start: async () => {},
+    start: async () => await hooks.onStart?.(),
+    createSession: async () => ({ sessionId: "acp-fresh-session" }),
     getAgentLifecycleSnapshot: () => ({ running: true }),
     getPermissionStats: () => ({ requested: 0, approved: 0, denied: 0, cancelled: 0 }),
     initializeResult: undefined,
@@ -170,10 +220,31 @@ async function captureStderr<T>(run: () => Promise<T>): Promise<{ value: T; stde
   }
 }
 
-// One owner, one accepted no-wait task, exactly as acpx-ui submits it.
+// `.messages.ndjson` — the conversation history acpx-ui renders.
+async function userRowsFor(home: string, sessionId: string): Promise<number> {
+  const file = path.join(
+    home,
+    ".acpx",
+    "sessions",
+    `${encodeURIComponent(sessionId)}.messages.ndjson`,
+  );
+  const lines = (await fs.readFile(file, "utf8")).split("\n").filter(Boolean);
+  return lines.filter((line) => {
+    const row = JSON.parse(line) as { User?: { id?: string } };
+    return row.User?.id === MESSAGE_ID;
+  }).length;
+}
+
+// One owner, one accepted no-wait task, exactly as acpx-ui submits it. `submit`
+// delivers the SAME messageId again — acpx-ui's re-drive.
 async function withAcceptedNoWaitTask(
   prefix: string,
-  run: (context: { home: string; sessionId: string; task: QueueTask }) => Promise<void>,
+  run: (context: {
+    home: string;
+    sessionId: string;
+    task: QueueTask;
+    submit: (requestId: string) => Promise<QueueTask>;
+  }) => Promise<void>,
 ): Promise<void> {
   await withTempHome(prefix, async (home) => {
     const sessionId = `${prefix}session`;
@@ -200,13 +271,18 @@ async function withAcceptedNoWaitTask(
       }),
       queryActiveTurn: () => false,
     });
-    const socket = await connectSocket(lease.socketPath);
-    const lines = readline.createInterface({ input: socket });
-    try {
+    const closers: Array<() => void> = [];
+    const submit = async (requestId: string): Promise<QueueTask> => {
+      const socket = await connectSocket(lease.socketPath);
+      const lines = readline.createInterface({ input: socket });
+      closers.push(() => {
+        lines.close();
+        socket.destroy();
+      });
       socket.write(
         `${JSON.stringify({
           type: "submit_prompt",
-          requestId: `${prefix}request`,
+          requestId,
           ownerGeneration: lease.ownerGeneration,
           messageId: MESSAGE_ID,
           message: PROMPT_TEXT,
@@ -218,10 +294,15 @@ async function withAcceptedNoWaitTask(
       assert.equal(accepted.type, "accepted", "the owner accepted the task — custody is ours");
       const task = await owner.nextTask();
       assert(task);
-      await run({ home, sessionId, task });
+      return task;
+    };
+    try {
+      const task = await submit(`${prefix}request`);
+      await run({ home, sessionId, task, submit });
     } finally {
-      lines.close();
-      socket.destroy();
+      for (const close of closers.splice(0)) {
+        close();
+      }
       await owner.close();
       await releaseQueueOwnerLease(lease);
     }
@@ -384,5 +465,193 @@ test("b8e251eb: a turn that started and then failed keeps exactly ONE terminal (
     assert.equal(terminals[0].phase, "failed");
     assert.notEqual(terminals[0].error.detailCode, "QUEUE_OWNER_SHUTDOWN");
     assert.equal(abandoned, 0, "a started turn is never handed back as never-delivered");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F1 / F2 — te-B's duty-cycle findings (VERIFICATION.md, session a53cd96d).
+//
+// Under an intermittent holder the turn START can succeed and a PRE-SUBMIT write
+// inside the turn (connect bookkeeping, the live checkpoint) then loses. Before
+// the fix that wrote `failed` with detailCode "" — non-retryable to acpx-ui —
+// for a message the model never saw (F1); and acpx-ui's re-drive then appended a
+// second User row for the same message id (F2).
+// ---------------------------------------------------------------------------
+
+test("b8e251eb F1: outbox-busy on a PRE-SUBMIT write inside the turn is retried in-owner and the message is then delivered", async () => {
+  await withAcceptedNoWaitTask("acpx-b8e251eb-f1-", async ({ home, sessionId, task }) => {
+    const holder = await startDutyHolder(home);
+    let starts = 0;
+    let abandoned = 0;
+    const sleeps: number[] = [];
+    // Lock FREE at turn start; another process takes it on the FIRST connect.
+    const mock = makeMockClient(async () => ({ stopReason: "end_turn" }), {
+      onStart: async () => {
+        starts += 1;
+        if (starts === 1) {
+          await holder.hold();
+        }
+      },
+    });
+    try {
+      await captureStderr(
+        async () =>
+          await runQueuedTask(sessionId, task, {
+            sharedClient: mock.client,
+            suppressSdkConsoleErrors: true,
+            onTurnStartAbandoned: () => {
+              abandoned += 1;
+            },
+            // The holder's burst ends during the owner's backoff — one duty cycle.
+            turnStartRetry: {
+              delaysMs: [1, 1, 1],
+              sleep: async (ms) => {
+                sleeps.push(ms);
+                await holder.release();
+              },
+            },
+          }),
+      );
+      const events = await deliveryEvents(sessionId);
+      // On the unrepaired base: ["failed"] with detailCode "" and the model never asked.
+      assert.deepEqual(
+        events.map((event) => event.phase),
+        ["accepted", "done"],
+        `the busy pre-submit attempt must leave no terminal; got ${JSON.stringify(events)}`,
+      );
+      assert.equal(mock.promptCalls(), 1, "the model received the message exactly once");
+      assert.ok(starts >= 2, "the turn was really re-entered after the busy attempt");
+      assert.ok(sleeps.length >= 1, "the retry went through the async backoff");
+      assert.equal(abandoned, 0);
+      assert.equal(await userRowsFor(home, sessionId), 1, "one User row for one message");
+    } finally {
+      await holder.stop();
+    }
+  });
+});
+
+test("b8e251eb F1: when the in-turn pre-submit outbox-busy outlasts the retries, the delivery is handed back RETRYABLE, never as a bare failed", async () => {
+  await withAcceptedNoWaitTask("acpx-b8e251eb-f1x-", async ({ home, sessionId, task }) => {
+    const holder = await startDutyHolder(home);
+    let abandoned = 0;
+    // Taken inside the turn on the first connect and NEVER released.
+    const mock = makeMockClient(async () => ({ stopReason: "end_turn" }), {
+      onStart: async () => await holder.hold(),
+    });
+    try {
+      await captureStderr(
+        async () =>
+          await runQueuedTask(sessionId, task, {
+            sharedClient: mock.client,
+            suppressSdkConsoleErrors: true,
+            onTurnStartAbandoned: () => {
+              abandoned += 1;
+            },
+            turnStartRetry: { delaysMs: [1], sleep: async () => {} },
+          }),
+      );
+      const events = await deliveryEvents(sessionId);
+      assert.equal(events.length, 1, `exactly one terminal; got ${JSON.stringify(events)}`);
+      assert.equal(events[0].phase, "failed");
+      // On the unrepaired base: detailCode "" — terminal to acpx-ui, never re-driven.
+      assert.equal(events[0].error.detailCode, "QUEUE_OWNER_SHUTDOWN");
+      assert.equal(mock.promptCalls(), 0, "nothing reached the model");
+      assert.equal(abandoned, 1, "the owner releases, so the retryable terminal is true");
+    } finally {
+      await holder.stop();
+    }
+  });
+});
+
+// NEGATIVE CASE for F1: once the prompt may have reached the model, an outbox-busy
+// must NEVER be handed back as retryable — a re-drive could make the model see it
+// twice. Here the busy surfaces from INSIDE the model call, i.e. after submission;
+// an implementation that hands back every outbox-busy regardless of submission
+// goes red on this row.
+test("b8e251eb F1 NEGATIVE: an outbox-busy AFTER the prompt was submitted is never retried nor minted retryable", async () => {
+  await withAcceptedNoWaitTask("acpx-b8e251eb-f1n-", async ({ sessionId, task }) => {
+    let abandoned = 0;
+    const sleeps: number[] = [];
+    const mock = makeMockClient(async () => {
+      throw new OutboxError(
+        "outbox-busy",
+        "session write refused: outbox-busy; retry the operation",
+      );
+    });
+    await captureStderr(
+      async () =>
+        await runQueuedTask(sessionId, task, {
+          sharedClient: mock.client,
+          suppressSdkConsoleErrors: true,
+          onTurnStartAbandoned: () => {
+            abandoned += 1;
+          },
+          turnStartRetry: {
+            delaysMs: [1, 1],
+            sleep: async (ms) => {
+              sleeps.push(ms);
+            },
+          },
+        }),
+    );
+    const events = await deliveryEvents(sessionId);
+    assert.deepEqual(
+      events.map((event) => event.phase),
+      ["accepted", "failed"],
+      JSON.stringify(events),
+    );
+    assert.notEqual(
+      events[1].error.detailCode,
+      "QUEUE_OWNER_SHUTDOWN",
+      "a delivery that may have reached the model must not be re-drivable",
+    );
+    assert.equal(mock.promptCalls(), 1, "never re-submitted");
+    assert.deepEqual(sleeps, [], "no turn-start retry after submission");
+    assert.equal(abandoned, 0);
+  });
+});
+
+test("b8e251eb F2: a re-drive of a message whose first attempt never reached the model leaves ONE User row in the history", async () => {
+  await withAcceptedNoWaitTask("acpx-b8e251eb-f2-", async ({ home, sessionId, task, submit }) => {
+    const holder = await startDutyHolder(home);
+    let holdOnStart = true;
+    const mock = makeMockClient(async () => ({ stopReason: "end_turn" }), {
+      onStart: async () => {
+        if (holdOnStart) {
+          await holder.hold();
+        }
+      },
+    });
+    try {
+      // Attempt 1: the User row is persisted, then a pre-submit write loses.
+      // No in-owner retry here, so the delivery layer's re-drive is what follows.
+      await captureStderr(
+        async () =>
+          await runQueuedTask(sessionId, task, {
+            sharedClient: mock.client,
+            suppressSdkConsoleErrors: true,
+            turnStartRetry: { delaysMs: [] },
+          }),
+      );
+      assert.equal(mock.promptCalls(), 0, "attempt 1 never reached the model");
+      assert.equal(await userRowsFor(home, sessionId), 1, "attempt 1 persisted the User row");
+
+      // acpx-ui's re-drive of the SAME messageId, contention over.
+      await holder.release();
+      holdOnStart = false;
+      const redriven = await submit("acpx-b8e251eb-f2-redrive");
+      await captureStderr(
+        async () =>
+          await runQueuedTask(sessionId, redriven, {
+            sharedClient: mock.client,
+            suppressSdkConsoleErrors: true,
+          }),
+      );
+      assert.equal(mock.promptCalls(), 1, "the re-drive delivered it");
+      // On the unrepaired base: 2.
+      assert.equal(await userRowsFor(home, sessionId), 1, "one message id, one User row");
+    } finally {
+      await holder.stop();
+    }
   });
 });

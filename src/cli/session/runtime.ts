@@ -199,13 +199,15 @@ type RunSessionPromptOptions = Omit<
   // agent sees the new message mid-turn via the Pushable input. Pass undefined
   // to clear the handler after the turn ends.
   setMidTurnHandler?: (handler: ((task: QueueTask) => void) | undefined) => void;
-  // brick://b8e251eb: flipped to true the moment the turn enters the region whose
-  // catch writes its own delivery terminal. Until then nothing reached the model and
-  // nothing wrote a terminal — the queue owner reads it to tell the two apart.
+  // brick://b8e251eb: true while the turn has written, or will write, this
+  // delivery's terminal itself. False means NOTHING reached the model and NO
+  // terminal was written — the queue owner then retries or terminalizes. Set on
+  // entering the turn's try; handed back (reset to false) only by the turn's catch
+  // for an outbox-busy thrown before the prompt was submitted.
   turnStart?: TurnStartProgress;
 };
 
-type TurnStartProgress = { reached: boolean };
+type TurnStartProgress = { turnOwnsTerminal: boolean };
 
 type ActiveSessionController = QueueOwnerActiveSessionController;
 
@@ -1370,8 +1372,9 @@ export type TurnStartRetryPolicy = {
 };
 
 // The one class measured to clear on its own (`retry the operation` is in its text).
-// Thrown at outbox OPEN or BEGIN — before anything is written — so re-running the
-// turn start cannot duplicate a persisted prompt.
+// Retried only while the prompt has provably not been submitted (`turnOwnsTerminal`
+// false); a User row an earlier attempt already persisted is not appended twice
+// (recordPromptStart is idempotent on the message id).
 function isTransientTurnStartError(error: unknown): boolean {
   return error instanceof OutboxError && error.code === "outbox-busy";
 }
@@ -1435,7 +1438,7 @@ function isUnterminalizedTurnStartFailure(
   turnStart: TurnStartProgress,
 ): boolean {
   return !(
-    turnStart.reached ||
+    turnStart.turnOwnsTerminal ||
     task.waitForCompletion ||
     task.terminalWritten ||
     error instanceof InterruptedError ||
@@ -1463,7 +1466,7 @@ function turnStartRetryDelay(
   retry: TurnStartRetryPolicy,
   attempt: number,
 ): number | undefined {
-  if (turnStart.reached || !isTransientTurnStartError(error)) {
+  if (turnStart.turnOwnsTerminal || !isTransientTurnStartError(error)) {
     return undefined;
   }
   return retry.delaysMs[attempt];
@@ -1537,7 +1540,7 @@ export async function runQueuedTask(
 
   try {
     for (let attempt = 0; ; attempt += 1) {
-      const turnStart: TurnStartProgress = { reached: false };
+      const turnStart: TurnStartProgress = { turnOwnsTerminal: false };
       try {
         sendQueuedTaskResult(
           task,
@@ -1888,12 +1891,14 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     }
 
     const promptStartedAt = isoNow();
-    const promptMessageId = recordPromptSubmission(
-      conversation,
-      prompt,
-      promptStartedAt,
-      messageId,
-    );
+    // brick://b8e251eb F2: ONE User row per message id. A turn that failed before
+    // completing (an in-owner turn-start retry, or acpx-ui's re-drive of the same
+    // message) already persisted this row; appending it again showed the message
+    // twice in history while the model saw it once.
+    const promptMessageId =
+      messageId !== undefined && hasUserMessageId(conversation, messageId)
+        ? messageId
+        : recordPromptSubmission(conversation, prompt, promptStartedAt, messageId);
     record.lastPromptAt = promptStartedAt;
     record.lastUsedAt = promptStartedAt;
     applyConversation(record, conversation);
@@ -1948,6 +1953,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   // (brick 56d3532d) without ever being able to reject a real late chunk.
   // `promptTurnActive` above is per-turn and must NOT be substituted here.
   let promptEverSubmitted = false;
+  // brick://b8e251eb: this delivery's main prompt may have reached the model.
+  // Latched before `accepted`; see runPromptAttempt.
+  let promptSubmitted = false;
   let promptTurnHadSideEffects = false;
   // Fork: in-flight mid-turn-injected prompts. Tracked so a turn awaits all
   // of them before the queue-owner loop starts the next sequential task —
@@ -3053,6 +3061,11 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // Fresh watchdog state for this attempt (a retry re-arms cleanly).
     turnAbandoned = false;
     endMarkerReasonThisTurn = undefined;
+    // brick://b8e251eb: latched BEFORE `accepted` is even attempted. acpx-ui reads
+    // `accepted` as "the model got it" and will never re-drive an item carrying it,
+    // and from here the prompt may reach the model — so nothing after this point
+    // may be handed back as retryable.
+    promptSubmitted = true;
     await appendDeliveryEvent(mainDeliveryContext, "accepted");
     const response = await measurePerf("runtime.prompt.agent_turn", async () => {
       const turnPromise = runPromptTurn({
@@ -3224,11 +3237,12 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     return response;
   };
 
-  // brick://b8e251eb: from here on every failure writes its own delivery terminal
-  // (the catch below). Everything above is the silent window the queue owner must
-  // terminalize itself — keep this line IMMEDIATELY before the `try`.
+  // brick://b8e251eb: from here on the catch below writes the delivery terminal —
+  // except for a transient outbox-busy before `promptSubmitted`, which it hands
+  // back. Everything above is the window the queue owner must terminalize itself
+  // — keep this line IMMEDIATELY before the `try`.
   if (options.turnStart) {
-    options.turnStart.reached = true;
+    options.turnStart.turnOwnsTerminal = true;
   }
   try {
     return await withInterrupt(
@@ -3345,6 +3359,16 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       error,
       client.getEffectiveAccountMetadata(),
     );
+    // brick://b8e251eb F1: a pre-submit write (connect bookkeeping, the live
+    // checkpoint) can still lose to an intermittent outbox holder AFTER the turn
+    // took ownership. The prompt provably never reached the model and no
+    // `accepted` was written, so hand the delivery back to the queue owner, which
+    // retries it and, once exhausted, terminalizes it RETRYABLY — rather than
+    // writing a non-retryable `failed` acpx-ui would bury.
+    if (!promptSubmitted && options.turnStart && isTransientTurnStartError(error)) {
+      options.turnStart.turnOwnsTerminal = false;
+      throw annotatedError;
+    }
     if (error instanceof InterruptedError) {
       await completeAbsorbedInjectedDeliveries("cancelled", {
         stopReason: "cancelled",
