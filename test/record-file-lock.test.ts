@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -12,6 +13,19 @@ async function tempRecordFile(): Promise<string> {
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** The identity a lock written on THIS host and boot carries. */
+const LOCAL = {
+  host: os.hostname(),
+  boot: readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(),
+};
+
+async function deadPid(): Promise<number> {
+  const child = spawn(process.execPath, ["-e", ""]);
+  const pid = child.pid!;
+  await new Promise((resolve) => child.once("exit", resolve));
+  return pid;
+}
 
 test("record lock: two writers of one record never overlap, and the lock is gone afterwards", async () => {
   const file = await tempRecordFile();
@@ -42,10 +56,10 @@ test("record lock: released when the action throws", async () => {
 
 test("record lock: a lock left by a DEAD process is broken", async () => {
   const file = await tempRecordFile();
-  const child = spawn(process.execPath, ["-e", ""]);
-  const deadPid = child.pid!;
-  await new Promise((resolve) => child.once("exit", resolve));
-  await fs.writeFile(`${file}.lock`, JSON.stringify({ pid: deadPid, start: null }));
+  await fs.writeFile(
+    `${file}.lock`,
+    JSON.stringify({ pid: await deadPid(), start: null, ...LOCAL }),
+  );
   const started = Date.now();
   let ran = false;
   await withRecordFileLock(file, async () => {
@@ -63,7 +77,7 @@ test("record lock: a LIVE pid whose start time differs (pid reuse) is treated as
   if (process.platform !== "linux") {
     return;
   }
-  await fs.writeFile(`${file}.lock`, JSON.stringify({ pid: process.pid, start: "0" }));
+  await fs.writeFile(`${file}.lock`, JSON.stringify({ pid: process.pid, start: "0", ...LOCAL }));
   let ran = false;
   await withRecordFileLock(file, async () => {
     ran = true;
@@ -84,7 +98,7 @@ test("record lock: a LIVE holder is never broken or bypassed — the writer refu
       .readFile(`/proc/${holder.pid}/stat`, "utf8")
       .then((stat) => stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] ?? null)
       .catch(() => null);
-    await fs.writeFile(`${file}.lock`, JSON.stringify({ pid: holder.pid, start }));
+    await fs.writeFile(`${file}.lock`, JSON.stringify({ pid: holder.pid, start, ...LOCAL }));
     let ran = false;
     await assert.rejects(
       withRecordFileLock(file, async () => {
@@ -99,3 +113,29 @@ test("record lock: a LIVE holder is never broken or bypassed — the writer refu
     holder.kill("SIGKILL");
   }
 });
+
+/**
+ * NEGATIVE CASE — the other pod. A lock naming a DIFFERENT host (or boot) with a pid that looks
+ * dead here is NOT broken: that pid lives in another pid namespace, so ESRCH proves nothing. The
+ * writer waits its budget and refuses. Same for a lock with no host at all (unknown provenance).
+ */
+for (const [label, identity] of [
+  ["a foreign host", { host: "dev-server-workbench-other-pod", boot: LOCAL.boot }],
+  ["a foreign boot", { host: LOCAL.host, boot: "00000000-0000-0000-0000-000000000000" }],
+  ["no host identity", {}],
+] as const) {
+  test(`record lock: a dead-looking pid from ${label} is NEVER broken — the writer refuses`, async () => {
+    const file = await tempRecordFile();
+    const lock = JSON.stringify({ pid: await deadPid(), start: null, ...identity });
+    await fs.writeFile(`${file}.lock`, lock);
+    let ran = false;
+    await assert.rejects(
+      withRecordFileLock(file, async () => {
+        ran = true;
+      }),
+      (error: Error & { code?: string }) => error.code === "record-lock-timeout",
+    );
+    assert.equal(ran, false, "the action ran without the lock");
+    assert.equal(await fs.readFile(`${file}.lock`, "utf8"), lock, "a foreign lock was broken");
+  });
+}

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
+import os from "node:os";
 
 /**
  * A per-record lock file, `<record>.json.lock`, held ONLY across a record write's
@@ -19,19 +20,39 @@ import fs from "node:fs/promises";
  * `Atomics.wait`), breaks it ONLY when the holder is provably dead, and otherwise fails with
  * `record-lock-timeout`. `index-lock.ts`'s ~2 s give-up-and-proceed is exactly the shape that
  * re-admits the lost update silently; do not copy it here.
+ *
+ * 🛑 "PROVABLY DEAD" IS ONLY PROVABLE ON THE HOLDER'S OWN HOST AND BOOT. A dev box is two pods
+ * (control + workbench) with SEPARATE pid namespaces sharing one filesystem, so a live holder on
+ * the other pod reads as ESRCH here. The lock therefore records `host` (hostname) and `boot`
+ * (`/proc/sys/kernel/random/boot_id`), and a lock from a different — or unknown — host or boot is
+ * NEVER broken, only waited on and then refused. The cost: a lock orphaned by a process that died
+ * on ANOTHER host blocks that record until someone removes the file; the refusal names the file
+ * and its holder for exactly that reason.
  */
 
 const RECORD_LOCK_BUDGET_MS = 10_000;
 const RECORD_LOCK_CAP_MS = 50;
 
-type LockHolder = { pid: number; start: string | null };
+type LockHolder = { pid: number; start: string | null; host: string | null; boot: string | null };
+
+function bootId(): string | null {
+  try {
+    return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+const LOCAL_HOST = os.hostname();
+const LOCAL_BOOT = bootId();
 
 export class RecordLockTimeoutError extends Error {
   readonly code = "record-lock-timeout";
   constructor(lockPath: string, holder: string) {
     super(
-      `session record lock ${lockPath} is held by a live process (${holder}) for over ` +
-        `${RECORD_LOCK_BUDGET_MS} ms; refusing to write unlocked`,
+      `session record lock ${lockPath} is held by ${holder} for over ` +
+        `${RECORD_LOCK_BUDGET_MS} ms; refusing to write unlocked. A holder on another host or ` +
+        `boot is never broken automatically — if it is known dead, remove the lock file.`,
     );
   }
 }
@@ -46,7 +67,15 @@ function processStartTime(pid: number): string | null {
   }
 }
 
+/** Same host AND same boot, both known — the only case in which a pid can be judged at all. */
+function isLocalHolder(holder: LockHolder): boolean {
+  return LOCAL_BOOT !== null && holder.host === LOCAL_HOST && holder.boot === LOCAL_BOOT;
+}
+
 function holderIsProvablyDead(holder: LockHolder): boolean {
+  if (!isLocalHolder(holder)) {
+    return false;
+  }
   try {
     process.kill(holder.pid, 0);
   } catch (error) {
@@ -67,7 +96,15 @@ async function readHolder(lockPath: string): Promise<{ raw: string; holder: Lock
     if (typeof parsed.pid !== "number") {
       return null;
     }
-    return { raw, holder: { pid: parsed.pid, start: parsed.start ?? null } };
+    return {
+      raw,
+      holder: {
+        pid: parsed.pid,
+        start: parsed.start ?? null,
+        host: parsed.host ?? null,
+        boot: parsed.boot ?? null,
+      },
+    };
   } catch {
     return null;
   }
@@ -112,7 +149,12 @@ export async function withRecordFileLock<T>(
   action: () => Promise<T>,
 ): Promise<T> {
   const lockPath = `${recordFile}.lock`;
-  const content = JSON.stringify({ pid: process.pid, start: processStartTime(process.pid) });
+  const content = JSON.stringify({
+    pid: process.pid,
+    start: processStartTime(process.pid),
+    host: LOCAL_HOST,
+    boot: LOCAL_BOOT,
+  });
   const started = Date.now();
   let delay = 2 + Math.floor(Math.random() * 3);
   while (!(await tryAcquire(lockPath, content))) {
