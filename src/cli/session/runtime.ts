@@ -1440,6 +1440,47 @@ function sendQueuedTaskError(task: QueueTask, error: unknown): void {
   });
 }
 
+// How long a still-live previous turn gets to honour `session/cancel` before its
+// adapter is stopped outright.
+const PREVIOUS_TURN_CANCEL_WAIT_MS = 2_500;
+
+/**
+ * brick://7531ef5c — AT MOST ONE LIVE AGENT TURN PER SESSION.
+ *
+ * The owner's shared client can still be running a turn when the next one
+ * starts: an injected prompt the drain backstop gave up on keeps running on the
+ * adapter after the turn was finalized. Starting the next turn on top of it put
+ * two prompts into one agent — and when that turn re-picked a subscription
+ * (sub5→sub8) it spawned a SECOND adapter beside the live one: two agent loops
+ * in one session, committing to one worktree (lane A, 2026-10-05).
+ *
+ * So before any turn starts — on the shared client, or on a fresh one for a
+ * subscription switch or a failover — a previous turn still live on the shared
+ * client is cancelled, and if it does not end, its adapter is stopped. Never
+ * both running. Loud, because a turn ended this way may have been mid-work.
+ */
+export async function endPreviousLiveTurn(
+  client: AcpClient | undefined,
+  sessionRecordId: string,
+): Promise<void> {
+  if (!client?.hasActivePrompt()) {
+    return;
+  }
+  process.stderr.write(
+    `[acpx] a previous turn is still live on session ${sessionRecordId}'s adapter; ` +
+      `cancelling it before the next turn starts\n`,
+  );
+  await client.cancelActivePrompt(PREVIOUS_TURN_CANCEL_WAIT_MS);
+  if (!client.hasActivePrompt()) {
+    return;
+  }
+  process.stderr.write(
+    `[acpx] the previous turn on session ${sessionRecordId} did not end on cancel; ` +
+      `stopping its adapter\n`,
+  );
+  await client.close();
+}
+
 export async function runQueuedTask(
   sessionRecordId: string,
   task: QueueTask,
@@ -1472,6 +1513,7 @@ export async function runQueuedTask(
   const turnStart: TurnStartProgress = { turnOwnsTerminal: false };
 
   try {
+    await endPreviousLiveTurn(options.sharedClient, sessionRecordId);
     let result: SessionSendResult;
     try {
       const lockPolicy = await applyQueuedTaskSubscriptionLockPolicy(sessionRecordId, options);
@@ -1686,15 +1728,19 @@ async function runQueuedTaskFailover(
       record,
       triggerError: error,
       verbose: options.verbose,
-      runTurn: async () =>
+      runTurn: async () => {
+        // brick://7531ef5c: the fresh client spawns a SECOND adapter; the shared
+        // one must not still be running a turn when it does.
+        await endPreviousLiveTurn(options.sharedClient, sessionRecordId);
         // Fresh client (omit sharedClient) so the retry resolves the new dir.
-        await runSessionPrompt({
+        return await runSessionPrompt({
           ...buildQueuedTaskRunOptions(sessionRecordId, task, options, outputFormatter, turnStart),
           client: undefined,
           // brick://4d517be2: the failover loop is already selecting reactively —
           // suppress proactive selection on the retry so the two don't fight.
           skipProactiveSelection: true,
-        }),
+        });
+      },
     });
   } catch (failoverError) {
     await surfaceFailoverTerminalError(record, failoverError);
@@ -1859,6 +1905,11 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   // delivery's observation window is the DELTA between its `accepted` snapshot
   // (DeliveryContext.framesAtStart) and the count at its terminal.
   let sessionUpdateFrameCount = 0;
+  // brick://7531ef5c — wall clock of the adapter's last INBOUND ACP message (a
+  // session/update frame, a tool/permission/fs request, a response). The drain
+  // backstop times its silence window from here, never from the main request's
+  // return. 0 = nothing received yet.
+  let lastAgentProgressAt = 0;
   let eventWriterClosed = false;
   const acceptedDeliveryKeys = new Set<string>();
   const terminalDeliveryKeys = new Set<string>();
@@ -2449,6 +2500,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // eslint-disable-next-line complexity -- fork integration handler; intentionally over budget, refactor would risk verified merge semantics
     onAcpMessage: (direction, message) => {
       sawAcpMessage = true;
+      if (direction === "inbound") {
+        lastAgentProgressAt = Date.now();
+      }
       pendingMessages.push(message);
       // Route messages with subagentId to the child stream as well
       const claudeCodeMeta = extractClaudeCodeMeta(message);
@@ -2846,17 +2900,31 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         return;
       }
       const drainTimeoutMs = resolveInjectedDrainTimeoutMs();
-      // ONE shared deadline, measured from the FIRST entry into the drain and
-      // never re-armed per iteration — otherwise a steady message stream could
-      // hold the turn open indefinitely. `0` ⇒ unbounded (existing contract).
-      const drainDeadlineAt = drainTimeoutMs > 0 ? Date.now() + drainTimeoutMs : undefined;
+      // brick://7531ef5c — the backstop is a SILENCE window: it fires only after
+      // `drainTimeoutMs` with no inbound ACP message from the adapter. It used to
+      // be a fixed deadline from the first entry into this drain, i.e. from the
+      // main request's return — which the Claude adapter sends at the FIRST
+      // mid-turn message. A worker still busy 30 min later then got a false
+      // `idle`, its consumed injected delivery a `failed`/outcome-unknown, and
+      // the next message started a SECOND turn beside the live one (lane A,
+      // 2026-10-05: two agent loops editing one worktree).
+      // Not timed from the injected prompt's submission either: an agent can
+      // legitimately work longer than the window after an injection.
+      // ⚠️ Only adapter OUTPUT re-arms it — never an injection or its settling,
+      // or a steady message stream could hold a silent turn open forever (the
+      // F1 shared-deadline row pins that). `0` ⇒ unbounded (existing contract).
+      const drainEnteredAt = Date.now();
+      const drainDeadlineAt = (): number | undefined =>
+        drainTimeoutMs > 0
+          ? Math.max(drainEnteredAt, lastAgentProgressAt) + drainTimeoutMs
+          : undefined;
       const emitDrainBackstopFired = (pending: number) => {
         // Diagnosable, NON-verbose-gated → owner.log (mirrors the idle-release
         // line at queue-owner-runtime.ts:784-786). The owner's stderr is its own
         // owner.log fd, never a --json-strict client's JSON-RPC stream.
         process.stderr.write(
           `[acpx] injected-prompt drain backstop fired for session ${record.acpxRecordId} ` +
-            `after ${drainTimeoutMs}ms; finalizing with ${pending} injected prompt(s) still pending\n`,
+            `after ${drainTimeoutMs}ms without adapter output; finalizing with ${pending} injected prompt(s) still pending\n`,
         );
       };
       while (true) {
@@ -2868,32 +2936,31 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
           // down — the stuck-red bug the drain-await was built to fix.
           break;
         }
-        // Shared budget, not a fresh one per pass.
-        const remainingMs = drainDeadlineAt === undefined ? 0 : drainDeadlineAt - Date.now();
-        if (drainDeadlineAt !== undefined && remainingMs <= 0) {
-          // Budget already exhausted — a non-positive timeout would mean
-          // "unbounded" to the backstop, so finalize here instead.
+        // Re-read every pass: progress since the last pass moves the deadline.
+        const deadlineAt = drainDeadlineAt();
+        const remainingMs = deadlineAt === undefined ? 0 : deadlineAt - Date.now();
+        if (deadlineAt !== undefined && remainingMs <= 0) {
+          // A full silence window elapsed — a non-positive timeout would mean
+          // "unbounded" to the backstop, so finalize here instead. This is the
+          // ONLY place the backstop fires: a timer expiry below just loops back
+          // here, where the adapter's progress since then is re-checked.
           emitDrainBackstopFired(unsettled.length);
           drainTimedOut = true;
           break;
         }
-        const drainResult = await drainInjectedPromptsWithBackstop(
+        // A timeout here is not yet a verdict — loop and re-check progress.
+        // The synthetic pass below iterates the live set, so an injection that
+        // landed during this await still gets its terminal.
+        await drainInjectedPromptsWithBackstop(
           unsettled.map((delivery) => delivery.promise),
           remainingMs,
-          emitDrainBackstopFired,
+          () => {},
         );
-        if (drainResult.timedOut) {
-          // The backstop path DOES have an await behind it, which is exactly
-          // why the synthetic pass below iterates the live set: an injection
-          // that landed during that await still gets its terminal.
-          drainTimedOut = true;
-          break;
-        }
-        // That set settled — but the handler is still registered, so a NEW
-        // injection may have arrived while we waited. Loop and drain it too.
-        // This TERMINATES: each new injection makes the adapter hand the previous
-        // one off, so the set only fails to close while the real agent turn is
-        // still running — which is exactly when we want to keep injecting.
+        // Either that set settled — but the handler is still registered, so a
+        // NEW injection may have arrived while we waited, loop and drain it too
+        // — or the timer expired and the top of the loop decides. This
+        // TERMINATES: the set only fails to close while the agent keeps
+        // producing output, which is exactly when the turn must stay open.
       }
     } finally {
       // A1: the turn is genuinely closing — stop injecting. Reached on EVERY
