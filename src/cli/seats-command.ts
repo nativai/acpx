@@ -963,13 +963,39 @@ async function handleSeatsBackfill(
 
   if (format === "json") {
     process.stdout.write(`${JSON.stringify(report)}\n`);
-    return;
-  }
-  if (format === "quiet") {
+  } else if (format === "quiet") {
     process.stdout.write(`${report.seats} ${report.indexEntries} ${report.errors.length}\n`);
+  } else {
+    process.stdout.write(renderText(report));
+  }
+  failOnRefusedRecords(report);
+}
+
+/**
+ * An APPLY that refused or failed any record must NOT exit 0: the owner's window reads the rc, and
+ * a run under a HOME whose path differs from `instance.json`'s `home` refuses EVERY record while
+ * the report still prints. The report is printed first (it is the evidence); then the refusals are
+ * summarised on stderr and the exit code is set. Parse-stage skips are NOT refusals — a store
+ * carries unparseable files (delivery sidecars, fixtures) that were never this verb's to write —
+ * and a dry run writes nothing, so neither sets the code.
+ */
+function failOnRefusedRecords(report: SeatBackfillReport): void {
+  const refused = report.errors.filter((error) => error.stage !== "parse");
+  if (!report.apply || refused.length === 0) {
     return;
   }
-  process.stdout.write(renderText(report));
+  const shown = refused
+    .slice(0, 5)
+    .map((error) =>
+      `  ${error.file} [${error.stage}] ${error.code ?? ""} ${error.message}`.trimEnd(),
+    );
+  const more =
+    refused.length > shown.length ? `\n  … and ${refused.length - shown.length} more` : "";
+  process.stderr.write(
+    `seats backfill: ${refused.length} record(s)/leg(s) refused or failed during --apply; ` +
+      `the run did NOT complete — exit 1. First reasons:\n${shown.join("\n")}${more}\n`,
+  );
+  process.exitCode = 1;
 }
 
 // ─── close ───────────────────────────────────────────────────────────────────

@@ -415,7 +415,7 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     lastPromptAt: optionalString(record.lastPromptAt),
     favorite: optionalBoolean(record.favorite),
     title: typeof record.title === "string" ? record.title : undefined,
-    name: optionalString(record.name),
+    ...(typeof record.name === "string" && record.name.length > 0 ? { name: record.name } : {}),
     createdAt: optionalString(record.createdAt),
     parentSessionId: optionalString(record.parentSessionId),
     parentSessionUrl: optionalString(record.parentSessionUrl),
