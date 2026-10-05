@@ -1440,32 +1440,6 @@ function sendQueuedTaskError(task: QueueTask, error: unknown): void {
   });
 }
 
-/**
- * brick://7531ef5c F1 — keep `open` equal to the tool calls that have started and
- * not yet finished: add on `tool_call` (unless it already arrives finished),
- * remove on any `completed`/`failed` status. Updates for an id never seen open
- * are ignored, so a stray late update cannot open a call that never started.
- */
-function trackOpenToolCall(open: Set<string>, notification: SessionNotification): void {
-  const update = notification.update as {
-    sessionUpdate?: unknown;
-    toolCallId?: unknown;
-    status?: unknown;
-  };
-  const kind = update.sessionUpdate;
-  if (
-    (kind !== "tool_call" && kind !== "tool_call_update") ||
-    typeof update.toolCallId !== "string"
-  ) {
-    return;
-  }
-  if (update.status === "completed" || update.status === "failed") {
-    open.delete(update.toolCallId);
-  } else if (kind === "tool_call") {
-    open.add(update.toolCallId);
-  }
-}
-
 // How long a still-live previous turn gets to honour `session/cancel` before its
 // adapter is stopped outright.
 const PREVIOUS_TURN_CANCEL_WAIT_MS = 2_500;
@@ -1936,11 +1910,6 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   // backstop times its silence window from here, never from the main request's
   // return. 0 = nothing received yet.
   let lastAgentProgressAt = 0;
-  // brick://7531ef5c F1 — this turn's tool calls that started and have not yet
-  // reported `completed`/`failed`. claude-agent-acp sends `tool_call` when a tool
-  // starts and nothing more until it returns (it drops tool_progress), so a long
-  // silent tool looks exactly like a silent agent unless it is tracked here.
-  const openToolCalls = new Set<string>();
   let eventWriterClosed = false;
   const acceptedDeliveryKeys = new Set<string>();
   const terminalDeliveryKeys = new Set<string>();
@@ -2599,7 +2568,6 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       // so even a frame this handler later drops (turnAbandoned) still proves
       // "the delivery was not silent".
       sessionUpdateFrameCount += 1;
-      trackOpenToolCall(openToolCalls, notification);
       // C1: the watchdog listens on the live session-update tap. The end-of-turn
       // marker arriving here (during the main prompt's await) arms the response
       // bound; nothing else in this handler changes for the common path.
@@ -2946,18 +2914,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       // or a steady message stream could hold a silent turn open forever (the
       // F1 shared-deadline row pins that). `0` ⇒ unbounded (existing contract).
       const drainEnteredAt = Date.now();
-      // F1: while a tool call is OPEN the window is HELD (re-checked one window
-      // from now, never fired). Its closing `tool_call_update` is itself inbound
-      // adapter output, so timing resumes from the tool's completion.
-      const drainDeadlineAt = (): number | undefined => {
-        if (drainTimeoutMs <= 0) {
-          return undefined;
-        }
-        if (openToolCalls.size > 0) {
-          return Date.now() + drainTimeoutMs;
-        }
-        return Math.max(drainEnteredAt, lastAgentProgressAt) + drainTimeoutMs;
-      };
+      const drainDeadlineAt = (): number | undefined =>
+        drainTimeoutMs > 0
+          ? Math.max(drainEnteredAt, lastAgentProgressAt) + drainTimeoutMs
+          : undefined;
       const emitDrainBackstopFired = (pending: number) => {
         // Diagnosable, NON-verbose-gated → owner.log (mirrors the idle-release
         // line at queue-owner-runtime.ts:784-786). The owner's stderr is its own
