@@ -488,6 +488,44 @@ test("7531ef5c: a previous turn that ignores cancel has its ADAPTER STOPPED befo
   assert.equal(adapter.closes(), 1, "the adapter running the unkillable turn was stopped");
 });
 
+// NEGATIVE CASE for the guard's PLACEMENT (round 2): a delivery that is then
+// REFUSED must not touch a live previous turn. Round 1 ran the guard first thing
+// in runQueuedTask, ahead of every refusal — it would cancel live work for a
+// message that never ran, and it turned the Codex cap denial into
+// QUEUE_RUNTIME_PROMPT_FAILED (codex-subscription-cap.test.ts).
+test("7531ef5c: a REFUSED delivery (closed session) leaves a live previous turn running — nothing cancelled or stopped", async () => {
+  await withTempHome("acpx-7531ef5c-refused-", async (home) => {
+    const record = sessionRecord(home);
+    await writeSessionRecordFile(home, record);
+    const adapter = makeAdapter({ honoursCancel: true });
+    await withDrainTimeout(200, async () => {
+      await (
+        await startTurnWithInjection(record.acpxRecordId, adapter)
+      ).run;
+      assert.equal(adapter.inFlight(), 1, "turn 1's injected prompt is still live on the adapter");
+      // The user closes the session; the next delivery is refused before any turn.
+      await writeSessionRecordFile(home, {
+        ...record,
+        closed: true,
+        closedAt: new Date().toISOString(),
+      });
+      await runQueuedTask(
+        record.acpxRecordId,
+        queueTask("req-refused", SECOND_PROMPT_TEXT, SECOND_ID, false),
+        { sharedClient: adapter.client, suppressSdkConsoleErrors: true },
+      );
+    });
+    assert.equal(adapter.cancels(), 0, "a refused delivery cancelled the live turn");
+    assert.equal(adapter.closes(), 0, "a refused delivery stopped the live adapter");
+    assert.equal(adapter.inFlight(), 1, "the live turn is untouched");
+    assert.ok(
+      !adapter.calls.some((call) => call.text === SECOND_PROMPT_TEXT),
+      "the refused message never reached the agent",
+    );
+    adapter.resolveInjected();
+  });
+});
+
 // NEGATIVE CASE: an idle shared client is left alone — the guard must not
 // cancel or restart an adapter that has no turn running.
 test("7531ef5c CONTROL: with no live previous turn, the next turn neither cancels nor stops anything", async () => {

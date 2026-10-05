@@ -202,6 +202,10 @@ type RunSessionPromptOptions = Omit<
   // delivery's terminal itself. Still false on failure means NOTHING reached the
   // model and NO terminal was written — the queue owner then writes one.
   turnStart?: TurnStartProgress;
+  // brick://7531ef5c: the queue owner's shared client, whose previous turn must
+  // be ended before THIS turn starts — whether this turn runs on that client or
+  // on a fresh one (subscription switch, failover).
+  previousTurnClient?: AcpClient;
 };
 
 type TurnStartProgress = { turnOwnsTerminal: boolean };
@@ -1225,6 +1229,7 @@ function buildQueuedTaskRunOptions(
   return {
     sessionRecordId,
     turnStart,
+    previousTurnClient: options.sharedClient,
     mcpServers: options.mcpServers,
     requestId: task.requestId,
     messageId: task.messageId,
@@ -1484,6 +1489,7 @@ const PREVIOUS_TURN_CANCEL_WAIT_MS = 2_500;
  * subscription switch or a failover — a previous turn still live on the shared
  * client is cancelled, and if it does not end, its adapter is stopped. Never
  * both running. Loud, because a turn ended this way may have been mid-work.
+ * Called from runSessionPrompt only once the new turn is past every refusal.
  */
 export async function endPreviousLiveTurn(
   client: AcpClient | undefined,
@@ -1539,7 +1545,6 @@ export async function runQueuedTask(
   const turnStart: TurnStartProgress = { turnOwnsTerminal: false };
 
   try {
-    await endPreviousLiveTurn(options.sharedClient, sessionRecordId);
     let result: SessionSendResult;
     try {
       const lockPolicy = await applyQueuedTaskSubscriptionLockPolicy(sessionRecordId, options);
@@ -1754,19 +1759,15 @@ async function runQueuedTaskFailover(
       record,
       triggerError: error,
       verbose: options.verbose,
-      runTurn: async () => {
-        // brick://7531ef5c: the fresh client spawns a SECOND adapter; the shared
-        // one must not still be running a turn when it does.
-        await endPreviousLiveTurn(options.sharedClient, sessionRecordId);
+      runTurn: async () =>
         // Fresh client (omit sharedClient) so the retry resolves the new dir.
-        return await runSessionPrompt({
+        await runSessionPrompt({
           ...buildQueuedTaskRunOptions(sessionRecordId, task, options, outputFormatter, turnStart),
           client: undefined,
           // brick://4d517be2: the failover loop is already selecting reactively —
           // suppress proactive selection on the retry so the two don't fight.
           skipProactiveSelection: true,
-        });
-      },
+        }),
     });
   } catch (failoverError) {
     await surfaceFailoverTerminalError(record, failoverError);
@@ -3219,6 +3220,13 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     return response;
   };
 
+  // brick://7531ef5c: end a previous turn still live on the owner's shared client
+  // HERE — after every refusal above (closed record, subscription lock, model
+  // floor, Codex cap, dedup) and before the connect that may start an adapter or
+  // the prompt that would join a live one. ⚠️ Not earlier: a delivery that is
+  // then REFUSED must not kill live work, and running it before the Codex cap
+  // admission turned that denial into QUEUE_RUNTIME_PROMPT_FAILED (round 1).
+  await endPreviousLiveTurn(options.previousTurnClient, record.acpxRecordId);
   // brick://b8e251eb: from here on the catch below writes the delivery terminal.
   // Everything above is the window the queue owner must terminalize itself — keep
   // this line IMMEDIATELY before the `try`.
