@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { statSync } from "node:fs";
+import { renameSync, statSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -625,7 +625,7 @@ async function writeSessionRecordInternal(
     // ONLY that span: never the messages-log flush above, never the index update below. The
     // re-read alone still lost 3-4 of 20 cross-process ops per pair under load; the lock is what
     // takes that to zero for every writer that goes through this function.
-    await withRecordFileLock(file, async () => {
+    await withRecordFileLock(file, async (fence) => {
       // 🛑 THE DISK READ THAT EVERY MERGE BELOW USES IS TAKEN HERE — AFTER THE MESSAGES-LOG FLUSH,
       // IMMEDIATELY BEFORE THE TEMP-WRITE + RENAME — AND THAT PLACEMENT IS THE FIX (brick eb4c8d06).
       // Session writes no longer go through any lock, so two processes writing one record are
@@ -703,7 +703,7 @@ async function writeSessionRecordInternal(
         // Compact JSON: parses identically everywhere, saves ~30-40% of bytes and
         // stringify CPU on every checkpoint of a multi-MB record.
         record.metadata = (
-          await persistRecordFile(file, persistedRecord as DiskRecord, ledger)
+          await persistRecordFile(file, persistedRecord as DiskRecord, ledger, fence)
         ).metadata;
       } finally {
         ledger?.close();
@@ -732,13 +732,26 @@ async function persistRecordFile(
   file: string,
   raw: DiskRecord,
   ledger: SpawnLedger | undefined,
+  fence: () => void,
 ): Promise<DiskRecord> {
   if (ledger) {
+    fence();
     return await ledger.saveRecordAsync(raw);
   }
   const temporary = `${file}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
   await fs.writeFile(temporary, `${JSON.stringify(raw)}\n`, "utf8");
-  await fs.rename(temporary, file);
+  // 🛑 FENCE AND COMMIT RENAME ARE BACK-TO-BACK SYNCHRONOUS CALLS, AND THAT IS THE POINT. If the
+  // record lock was taken while we held it, the fence throws and the whole read -> merge -> commit
+  // re-runs under a fresh lock (`record-file-lock.ts`). Do not make either one async or put an
+  // await between them: an awaited pair left a 9 ms p99 / 59 ms max window in which another writer
+  // could acquire, read, and lose this commit (brick eb4c8d06).
+  try {
+    fence();
+    renameSync(temporary, file);
+  } catch (error) {
+    await fs.rm(temporary, { force: true });
+    throw error;
+  }
   return raw;
 }
 
