@@ -43,6 +43,7 @@ import {
 } from "./metadata-merge.js";
 import { mergeRecordPinnedModelForPersist, rememberSessionModelBaseline } from "./model-merge.js";
 import { parseSessionRecord } from "./parse.js";
+import { withRecordFileLock } from "./record-file-lock.js";
 import { serializeSessionRecordForDisk } from "./serialize.js";
 import {
   effectiveTemplateSlug,
@@ -619,93 +620,99 @@ async function writeSessionRecordInternal(
     const logPath = messagesLogPath(sessionDir, record.acpxRecordId);
     await writeMessagesSidecar(record, logPath, options.messagePersistence === "boundary");
 
-    // 🛑 THE DISK READ THAT EVERY MERGE BELOW USES IS TAKEN HERE — AFTER THE MESSAGES-LOG FLUSH,
-    // IMMEDIATELY BEFORE THE TEMP-WRITE + RENAME — AND THAT PLACEMENT IS THE FIX (brick eb4c8d06).
-    // Session writes no longer go through any lock, so two processes writing one record are
-    // ordered only by these merges. Read before the flush (as it was, or from a snapshot the
-    // CALLER read even earlier, which the live checkpoint passed in until 2026-10-05), a close,
-    // re-parent, favourite or metadata patch landing during the flush was overwritten by this
-    // write: measured 1-13 lost updates per 20 cross-process ops per pair
-    // (`test/outbox-writer-pairs.test.ts`). Moving the read here shrinks the window to
-    // read -> rename. Do not hoist it back above the flush, and do not feed it a caller's snapshot.
-    const freshPersisted = await readPersistedLifecycle(record.acpxRecordId);
-    const persistedMetadata = freshPersisted?.metadata;
+    const file = sessionFilePath(record.acpxRecordId);
+    // 🛑 READ -> MERGE -> RENAME RUNS UNDER THE RECORD'S OWN LOCK FILE (`record-file-lock.ts`), and
+    // ONLY that span: never the messages-log flush above, never the index update below. The
+    // re-read alone still lost 3-4 of 20 cross-process ops per pair under load; the lock is what
+    // takes that to zero for every writer that goes through this function.
+    await withRecordFileLock(file, async () => {
+      // 🛑 THE DISK READ THAT EVERY MERGE BELOW USES IS TAKEN HERE — AFTER THE MESSAGES-LOG FLUSH,
+      // IMMEDIATELY BEFORE THE TEMP-WRITE + RENAME — AND THAT PLACEMENT IS THE FIX (brick eb4c8d06).
+      // Session writes no longer go through any lock, so two processes writing one record are
+      // ordered only by these merges. Read before the flush (as it was, or from a snapshot the
+      // CALLER read even earlier, which the live checkpoint passed in until 2026-10-05), a close,
+      // re-parent, favourite or metadata patch landing during the flush was overwritten by this
+      // write: measured 1-13 lost updates per 20 cross-process ops per pair
+      // (`test/outbox-writer-pairs.test.ts`). Moving the read here shrinks the window to
+      // read -> rename. Do not hoist it back above the flush, and do not feed it a caller's snapshot.
+      const freshPersisted = await readPersistedLifecycle(record.acpxRecordId);
+      const persistedMetadata = freshPersisted?.metadata;
 
-    if (options.preserveLifecycle) {
-      applyPersistedLifecycleForWrite(record, freshPersisted);
-    }
-    // 🛑 THE PARENT LINKAGE, PRESERVED UNCONDITIONALLY — OUTSIDE the branch above,
-    // and that placement IS the fix (see `preserveParentLinkageForPersist`). The
-    // write that clobbers a re-parent is the PRIVILEGED one — `session-control.ts`'s
-    // `closeSession`, which bypasses that branch by design and writes a record it
-    // read seconds earlier, before the owner-termination wait. `freshPersisted`, not
-    // the caller's snapshot: disk is the authority for who the parent is, and a
-    // caller-supplied lifecycle can predate the re-parent by a whole turn.
-    //
-    // ⚠️ The ONE writer that must beat this is `set-parent` itself, and it does so
-    // by NAME through `authoritative.parent` — not by being privileged. Remove that
-    // gate and the verb becomes a silent no-op (§1.2 leg b); remove this call and a
-    // close in flight silently undoes a re-parent (F2). One test pins BOTH
-    // directions together, because fixing either one alone still looks green.
-    preserveParentLinkageForPersist(record, freshPersisted, options.authoritative);
-    mergeRecordMetadataForPersist(record, persistedMetadata);
-    // Same baseline-diff protection metadata gets (2c848d3), extended to the
-    // pinned model: a stale/dropped write can't regress a record-pinned model,
-    // while a deliberate set-model/subscription-switch/new --model still wins.
-    mergeRecordPinnedModelForPersist(record, freshPersisted?.acpx);
-    // 🛑 SAME BASELINE-DIFF PROTECTION, FOR WHO SERVED THE TURN (brick 4c272cab,
-    // finding PM-1). UNCONDITIONAL — outside the `preserveLifecycle` branch above —
-    // and that placement IS the fix: the write that clobbers this field is the
-    // PRIVILEGED one (`closeSession`), which bypasses that branch by design. A
-    // preserve inside it looked right, shipped, and changed nothing; measured on a
-    // live turn, the two final writes still landed `null`.
-    //
-    // MEASURED with per-object identity on every serialize, fresh session, one turn:
-    //   13:15:23.748  rec-5   provider="Wafer"   ← the turn's record, correct
-    //   13:15:24.365  rec-5   provider="Wafer"   ← on disk, correct
-    //   13:15:24.373  rec-11  provider=null      ← a DIFFERENT record object …
-    //   13:15:24.380  rec-13  provider=null      ← … clobbers it 8 ms later
-    // A LOST UPDATE, not a race: in the post-merge smoke the shim's line was on
-    // disk 3.1 s before the clobbering write. The earlier F-3 ordering fix was
-    // therefore treating the wrong cause, and this is why its 3/3 held only in a
-    // rig where no late writer happened to run.
-    //
-    // ⚠️ ONE-DIRECTIONAL: an in-memory value WINS (a later turn changes the
-    // provider), disk only fills an ABSENCE. The field is historical — "who served
-    // the last turn" — and like `served_via_shim` is never legitimately cleared,
-    // so there is no write this can wrongly suppress.
-    preserveLastTurnProviderForPersist(record, freshPersisted?.acpx);
+      if (options.preserveLifecycle) {
+        applyPersistedLifecycleForWrite(record, freshPersisted);
+      }
+      // 🛑 THE PARENT LINKAGE, PRESERVED UNCONDITIONALLY — OUTSIDE the branch above,
+      // and that placement IS the fix (see `preserveParentLinkageForPersist`). The
+      // write that clobbers a re-parent is the PRIVILEGED one — `session-control.ts`'s
+      // `closeSession`, which bypasses that branch by design and writes a record it
+      // read seconds earlier, before the owner-termination wait. `freshPersisted`, not
+      // the caller's snapshot: disk is the authority for who the parent is, and a
+      // caller-supplied lifecycle can predate the re-parent by a whole turn.
+      //
+      // ⚠️ The ONE writer that must beat this is `set-parent` itself, and it does so
+      // by NAME through `authoritative.parent` — not by being privileged. Remove that
+      // gate and the verb becomes a silent no-op (§1.2 leg b); remove this call and a
+      // close in flight silently undoes a re-parent (F2). One test pins BOTH
+      // directions together, because fixing either one alone still looks green.
+      preserveParentLinkageForPersist(record, freshPersisted, options.authoritative);
+      mergeRecordMetadataForPersist(record, persistedMetadata);
+      // Same baseline-diff protection metadata gets (2c848d3), extended to the
+      // pinned model: a stale/dropped write can't regress a record-pinned model,
+      // while a deliberate set-model/subscription-switch/new --model still wins.
+      mergeRecordPinnedModelForPersist(record, freshPersisted?.acpx);
+      // 🛑 SAME BASELINE-DIFF PROTECTION, FOR WHO SERVED THE TURN (brick 4c272cab,
+      // finding PM-1). UNCONDITIONAL — outside the `preserveLifecycle` branch above —
+      // and that placement IS the fix: the write that clobbers this field is the
+      // PRIVILEGED one (`closeSession`), which bypasses that branch by design. A
+      // preserve inside it looked right, shipped, and changed nothing; measured on a
+      // live turn, the two final writes still landed `null`.
+      //
+      // MEASURED with per-object identity on every serialize, fresh session, one turn:
+      //   13:15:23.748  rec-5   provider="Wafer"   ← the turn's record, correct
+      //   13:15:24.365  rec-5   provider="Wafer"   ← on disk, correct
+      //   13:15:24.373  rec-11  provider=null      ← a DIFFERENT record object …
+      //   13:15:24.380  rec-13  provider=null      ← … clobbers it 8 ms later
+      // A LOST UPDATE, not a race: in the post-merge smoke the shim's line was on
+      // disk 3.1 s before the clobbering write. The earlier F-3 ordering fix was
+      // therefore treating the wrong cause, and this is why its 3/3 held only in a
+      // rig where no late writer happened to run.
+      //
+      // ⚠️ ONE-DIRECTIONAL: an in-memory value WINS (a later turn changes the
+      // provider), disk only fills an ABSENCE. The field is historical — "who served
+      // the last turn" — and like `served_via_shim` is never legitimately cleared,
+      // so there is no write this can wrongly suppress.
+      preserveLastTurnProviderForPersist(record, freshPersisted?.acpx);
 
-    // Only a spawn-owned record (metadata.spawn_key) opens the spawn ledger; every other
-    // record write stays off SQLite entirely.
-    const ledger = openSpawnLedgerForRecord(record.metadata, sessionDir);
-    try {
-      // The snake_case key policy is asserted INSIDE serializeSessionRecordForDisk
-      // (brick://48aca560) so test fixtures cannot bypass it; do not re-walk here.
-      const persistedRecord = serializeSessionRecordForDisk(record, { messages: "split-tail" });
+      // Only a spawn-owned record (metadata.spawn_key) opens the spawn ledger; every other
+      // record write stays off SQLite entirely.
+      const ledger = openSpawnLedgerForRecord(record.metadata, sessionDir);
+      try {
+        // The snake_case key policy is asserted INSIDE serializeSessionRecordForDisk
+        // (brick://48aca560) so test fixtures cannot bypass it; do not re-walk here.
+        const persistedRecord = serializeSessionRecordForDisk(record, { messages: "split-tail" });
 
-      const file = sessionFilePath(record.acpxRecordId);
-      // The temp name must be unique PER CALL, not per millisecond: two writes
-      // from this process in the same millisecond used to build the identical
-      // path, so the first rename won and the second hit ENOENT — turning a
-      // concurrent record write into a thrown error. Reachable on the normal
-      // mid-turn injection path (queue-owner-runtime drains the whole
-      // midTurnBuffer synchronously, so several injections start in one tick and
-      // race each other's recordPromptStart). Uniqueness, not serialization:
-      // this is a filename collision, and ordering here is deliberately free.
-      // Same shape already used by src/flows/store.ts.
-      // Compact JSON: parses identically everywhere, saves ~30-40% of bytes and
-      // stringify CPU on every checkpoint of a multi-MB record.
-      record.metadata = (
-        await persistRecordFile(file, persistedRecord as DiskRecord, ledger)
-      ).metadata;
+        // The temp name must be unique PER CALL, not per millisecond: two writes
+        // from this process in the same millisecond used to build the identical
+        // path, so the first rename won and the second hit ENOENT — turning a
+        // concurrent record write into a thrown error. Reachable on the normal
+        // mid-turn injection path (queue-owner-runtime drains the whole
+        // midTurnBuffer synchronously, so several injections start in one tick and
+        // race each other's recordPromptStart). Uniqueness, not serialization:
+        // this is a filename collision, and ordering here is deliberately free.
+        // Same shape already used by src/flows/store.ts.
+        // Compact JSON: parses identically everywhere, saves ~30-40% of bytes and
+        // stringify CPU on every checkpoint of a multi-MB record.
+        record.metadata = (
+          await persistRecordFile(file, persistedRecord as DiskRecord, ledger)
+        ).metadata;
+      } finally {
+        ledger?.close();
+      }
+    });
 
-      await updateIndexForWrittenRecord(sessionDir, record, path.basename(file), options);
-      rememberSessionMetadataBaseline(record);
-      rememberSessionModelBaseline(record);
-    } finally {
-      ledger?.close();
-    }
+    await updateIndexForWrittenRecord(sessionDir, record, path.basename(file), options);
+    rememberSessionMetadataBaseline(record);
+    rememberSessionModelBaseline(record);
   });
 }
 

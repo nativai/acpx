@@ -10,8 +10,9 @@ import { makeSessionRecord, withTempHome } from "./runtime-test-helpers.js";
 /**
  * SAME-RECORD WRITER PAIRS ACROSS PROCESSES (brick eb4c8d06).
  *
- * Ordinary session writes no longer go through the outbox's box-wide lock, so two processes
- * writing the SAME record are ordered only by the repository's own read-merge-rename rules. Each
+ * Ordinary session writes no longer go through the outbox's box-wide lock; two processes writing
+ * the SAME record are ordered by the repository's per-record lock file and its read-merge-rename
+ * rules. Each
  * row runs a live owner checkpointing 20 records back to back in one process and, in a second
  * process, one op per record; after the owner has rewritten that record twice more, the op's
  * effect must still be on disk. A missing effect is a LOST UPDATE.
@@ -100,27 +101,25 @@ async function runPair(kind: string): Promise<{ pair: PairResult; ownerErrors: o
 /**
  * MEASURED LOST UPDATES (lost / 20 ops per run; devbox workbench, load1 ~40-75, 2026-10-05):
  *
- *   pair          main 79fe7835   spawn-only 0b60de85   integrate 29c98145
- *   writer        0, 0            6, 4                  8
- *   close         8, 6            4, 1                  1
- *   set-parent    3, 2            2, 1                  4
- *   ui-lifecycle  9, 9            13, 8                 10
+ *   pair          main      spawn-only  integrate  + re-read      + record lock
+ *                 79fe7835  0b60de85    29c98145   before rename  (this tree)
+ *   writer        0, 0      6, 4, 4     8          4, 3, 2        0, 0, 0
+ *   close         8, 6      4, 1, 8     1          4, 4, 4        0, 0, 0
+ *   set-parent    3, 2      2, 1, 3     4          3, 4, 1        0, 0, 0
+ *   ui-lifecycle  9, 9      13, 8, 13   10         3, 0, 2        1, 4, 1
  *
- * 🛑 `writer` IS A REGRESSION, the other three are PRE-EXISTING. On main the outbox lock re-merged
- * a writer's metadata against the disk image under its lock (`withOwnedSidecarWrite`); with
- * ordinary records off the outbox nothing orders two processes' read-merge-rename of one record,
- * so a CLI metadata patch (`brick attach`, `set-model`, any second writer) racing a live owner's
- * checkpoint is lost. close / set-parent / ui-lifecycle lose updates on main too: the owner writes
- * with a lifecycle snapshot it read before its message flush, so anything landing in that window
- * is overwritten. All four are cross-process; the fix (per-record lock or narrower merge) is an
- * open decision — brick eb4c8d06. Each row is `todo` until then: it RUNS and REPORTS its count on
- * every suite run (the `diagnostic` line), and must be made a hard assertion when the fix lands.
+ * The first three are HARD rows: every writer in them goes through `writeSessionRecordInternal`,
+ * which re-reads right before its rename and holds the record's lock file across read -> rename
+ * (brick eb4c8d06). Remove either and these rows go red.
+ *
+ * 🛑 `ui-lifecycle` stays `todo`, and that is not this repo's bug to hide: it models acpx-ui's
+ * own raw tmp + rename of favourite / name / metadata, which does NOT take the record lock. Until
+ * acpx-ui takes the same `<record>.json.lock` (protocol in `record-file-lock.ts`) a live owner's
+ * checkpoint can still overwrite an acpx-ui lifecycle edit landing inside its read -> rename.
  */
-const KNOWN_LOSSES: Record<string, string> = {
-  writer: "REGRESSION vs main (0/40 -> 18/60): cross-process metadata RMW lost; brick eb4c8d06",
-  close: "pre-existing on main (14/40): owner checkpoint's pre-read lifecycle snapshot",
-  "set-parent": "pre-existing on main (5/40): owner checkpoint races the re-parent write",
-  "ui-lifecycle": "pre-existing on main (18/40): owner checkpoint's pre-read lifecycle snapshot",
+const KNOWN_LOSSES: Record<string, string | undefined> = {
+  "ui-lifecycle":
+    "acpx-ui's raw write does not take the record lock yet: 1-4/20 lost with the lock in acpx",
 };
 
 for (const kind of ["writer", "close", "set-parent", "ui-lifecycle"]) {
