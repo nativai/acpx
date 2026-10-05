@@ -4,7 +4,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { serializeSessionRecordForDisk } from "../src/session/persistence.js";
-import { toSessionIndexEntry } from "../src/session/persistence/index.js";
+import { toSessionIndexEntry, writeSessionIndex } from "../src/session/persistence/index.js";
 import { parseSessionRecord } from "../src/session/persistence/parse.js";
 import { seatDisplayName } from "../src/session/seat-display-name.js";
 import { makeSessionRecord, withTempHome } from "./runtime-test-helpers.js";
@@ -171,7 +171,7 @@ test("the persisted record carries no `name` key, and a `name` on disk is not pa
   );
 });
 
-test("the index entry carries no `name`: it is projected from nothing the record has", () => {
+test("the entry BUILT from a record carries no `name`: nothing the record has is a name", () => {
   const entry = toSessionIndexEntry(recordFixture(), "ns-1.json") as Record<string, unknown>;
   assert.equal(Object.hasOwn(entry, "name"), false);
 });
@@ -204,5 +204,99 @@ test("seatDisplayName: the seat's name, or nothing — never a record-side fallb
     // A stray record-side name is invisible to the helper by construction.
     const stray = { seatId: "seat-nameless", name: "stray" };
     assert.equal(await seatDisplayName(stray), undefined);
+  });
+});
+
+// ───────────── the index entry's `name` is PROJECTED FROM THE SEAT (spec §1) ─────────────
+
+type RawEntry = Record<string, unknown>;
+
+async function readRawIndexEntries(homeDir: string): Promise<Map<string, RawEntry>> {
+  const payload = JSON.parse(
+    await fs.readFile(path.join(homeDir, ".acpx", "sessions", "index.json"), "utf8"),
+  ) as { entries: RawEntry[] };
+  return new Map(payload.entries.map((entry) => [String(entry.file), entry]));
+}
+
+function entryFor(id: string, seatId: string | undefined, name?: string) {
+  const record = makeSessionRecord({
+    acpxRecordId: id,
+    acpSessionId: `acp-${id}`,
+    agentCommand: "node agent.js",
+    cwd: "/tmp/ns",
+    seatId,
+    holderOrdinal: seatId === undefined ? undefined : 1,
+    holderActive: seatId === undefined ? undefined : true,
+  });
+  return { ...toSessionIndexEntry(record, `${id}.json`), ...(name === undefined ? {} : { name }) };
+}
+
+test("every index write projects the SEAT's name onto its seated entries; a seat-less entry carries none", async () => {
+  await withTempHome("acpx-name-on-seat-", async (homeDir) => {
+    const dir = path.join(homeDir, ".acpx", "sessions");
+    await seedSeat(homeDir, "seat-a", "alpha-seat");
+    await seedSeat(homeDir, "seat-nameless", undefined);
+    await writeSessionIndex(dir, {
+      files: ["a.json", "n.json", "none.json", "orphan.json", "stale.json"],
+      entries: [
+        entryFor("a", "seat-a"),
+        entryFor("n", "seat-nameless", "STALE"), // a nameless seat: the stale key is removed
+        entryFor("none", undefined, "STALE"), // seat-less: no `name` key at all
+        entryFor("orphan", "seat-without-row", "STALE"), // a seat with no row: none either
+        entryFor("stale", "seat-a", "WRONG"), // a differing name is overwritten by the seat's
+      ],
+    });
+    const entries = await readRawIndexEntries(homeDir);
+    assert.equal(entries.get("a.json")?.name, "alpha-seat");
+    assert.equal(entries.get("stale.json")?.name, "alpha-seat");
+    for (const file of ["n.json", "none.json", "orphan.json"]) {
+      assert.equal(Object.hasOwn(entries.get(file) ?? {}, "name"), false, file);
+    }
+  });
+});
+
+test("a seat-store write that changes a seat's name re-projects its entries (rename, mint, fill)", async () => {
+  await withTempHome("acpx-name-on-seat-", async (homeDir) => {
+    const dir = path.join(homeDir, ".acpx", "sessions");
+    const { withSeatStoreWrite, fillSeatName } =
+      await import("../src/session/persistence/seat-store.js");
+    await seedSeat(homeDir, "seat-a", "before");
+    await seedSeat(homeDir, "seat-b", undefined);
+    await writeSessionIndex(dir, {
+      files: ["a.json", "b.json"],
+      entries: [entryFor("a", "seat-a"), entryFor("b", "seat-b")],
+    });
+    assert.equal((await readRawIndexEntries(homeDir)).get("a.json")?.name, "before");
+
+    await withSeatStoreWrite(dir, (store) => {
+      const row = store.seats.get("seat-a");
+      assert.ok(row);
+      return {
+        mutation: {
+          kind: "write" as const,
+          seats: new Map(store.seats).set("seat-a", { ...row, name: "after" }),
+        },
+        result: undefined,
+      };
+    });
+    assert.equal((await readRawIndexEntries(homeDir)).get("a.json")?.name, "after", "rename");
+
+    assert.equal(await fillSeatName(dir, "seat-b", "filled"), "filled");
+    assert.equal((await readRawIndexEntries(homeDir)).get("b.json")?.name, "filled", "fill");
+    assert.equal((await readRawIndexEntries(homeDir)).get("a.json")?.name, "after", "untouched");
+  });
+});
+
+test("an unreadable seat store leaves the index's names exactly as they stand", async () => {
+  await withTempHome("acpx-name-on-seat-", async (homeDir) => {
+    const dir = path.join(homeDir, ".acpx", "sessions");
+    await seedSeat(homeDir, "seat-a", "alpha-seat");
+    await writeSessionIndex(dir, { files: ["a.json"], entries: [entryFor("a", "seat-a")] });
+    await fs.writeFile(path.join(dir, "seats.json"), "{ not json", "utf8");
+    await writeSessionIndex(dir, {
+      files: ["a.json"],
+      entries: [entryFor("a", "seat-a", "alpha-seat")],
+    });
+    assert.equal((await readRawIndexEntries(homeDir)).get("a.json")?.name, "alpha-seat");
   });
 });

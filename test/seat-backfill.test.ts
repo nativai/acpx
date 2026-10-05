@@ -158,7 +158,7 @@ type BackfillJson = {
   }[];
   recordsToStrip: number;
   stripped: number;
-  indexEntriesWithName: number;
+  indexNamesToProject: number;
   unparseableNameLeft: { file: string; acpxRecordId?: string }[];
   errors: { file: string; stage: string; code?: string; message: string }[];
   backupSuffix?: string;
@@ -2619,7 +2619,9 @@ test("N1: dry run — the four numbers, the differing seats listed, the unparsea
     // records to strip: every PARSEABLE record with a `name` key of any value (7)
     assert.equal(report.recordsToStrip, 7);
     assert.equal(report.stripped, 0, "a dry run strips nothing");
-    assert.equal(report.indexEntriesWithName, 2);
+    // index entries whose `name` differs from the seat's name they will have: n-none (stale
+    // "stale" on a nameless seat), n-take, n-wins, n-old, n-new — n-fresh already agrees
+    assert.equal(report.indexNamesToProject, 5);
     // RULED: an unparseable record's name is left in place and LISTED by id
     assert.deepEqual(
       report.unparseableNameLeft.map((left) => left.acpxRecordId),
@@ -2663,12 +2665,23 @@ test("N2: apply — seats take the names, the SEAT wins a difference, every pars
     const keptAfter = await readRecordJson(homeDir, "n-none");
     assert.equal(keptAfter.last_used_at, keptBefore.last_used_at);
 
-    // the index carries no `name` at all
+    // the index carries the SEAT's name on every seated entry (D-NAME-HARD-MIGRATION: the
+    // entry's `name` is projected from the seat) and none on a nameless seat's entry
     const entries = await readIndexEntries(homeDir);
-    for (const [file, entry] of entries) {
-      assert.equal(Object.hasOwn(entry, "name"), false, `${file} kept a name in the index`);
+    const entryName = (file: string): unknown => entries.get(file)?.name;
+    assert.equal(entryName("n-take.json"), "beta");
+    assert.equal(entryName("n-wins.json"), "seat-name-wins");
+    assert.equal(entryName("n-old.json"), "new-holder");
+    assert.equal(entryName("n-new.json"), "new-holder");
+    assert.equal(entryName("n-fresh.json"), "alpha");
+    for (const file of ["n-none.json", "n-wrongtype.json", "n-blank.json"]) {
+      assert.equal(
+        entries.has(file) && Object.hasOwn(entries.get(file) ?? {}, "name"),
+        false,
+        file,
+      );
     }
-    assert.equal(report.indexEntriesWithName, 2);
+    assert.equal(report.indexNamesToProject, 5);
   });
 });
 
@@ -2705,7 +2718,7 @@ test("N4: the second dry run prints 0 everywhere (bar the listed unparseable res
     assert.deepEqual(second.seatsDifferingName, []);
     assert.equal(second.recordsToStrip, 0);
     assert.equal(second.stripped, 0);
-    assert.equal(second.indexEntriesWithName, 0);
+    assert.equal(second.indexNamesToProject, 0);
     assert.deepEqual(
       second.unparseableNameLeft.map((left) => left.acpxRecordId),
       ["17100000-aaaa"],
@@ -2744,5 +2757,27 @@ test("N5: the text report prints the strip numbers and lists the differing seats
         `missing ${JSON.stringify(expected)}:\n${result.stdout}`,
       );
     }
+  });
+});
+
+test("N6: `seats rename` re-projects the seat's name onto its holders' index entries", async () => {
+  await withTempHome(async (homeDir) => {
+    await seed(homeDir, [
+      makeRecord({ acpxRecordId: "n6-a" }),
+      makeRecord({ acpxRecordId: "n6-b" }),
+    ]);
+    await backfill(homeDir, ["--apply"]);
+    const seatId = String((await readRecordJson(homeDir, "n6-a")).seat_id);
+
+    const renamed = await runCli(["seats", "rename", seatId, "after-rename"], homeDir);
+    assert.equal(renamed.code, 0, renamed.stderr);
+
+    const entries = await readIndexEntries(homeDir);
+    assert.equal(entries.get("n6-a.json")?.name, "after-rename");
+    assert.equal(
+      Object.hasOwn(entries.get("n6-b.json") ?? {}, "name"),
+      false,
+      "another seat's entry took the name",
+    );
   });
 });
