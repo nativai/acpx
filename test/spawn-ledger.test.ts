@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test, { afterEach } from "node:test";
+import { queueLockFilePath } from "../src/cli/queue/paths.js";
 import { createFileSessionStore } from "../src/runtime/public/file-session-store.js";
 import { parseSessionRecord } from "../src/session/persistence/parse.js";
 import { writeSessionRecordWithLifecycle } from "../src/session/persistence/repository.js";
@@ -508,3 +509,96 @@ for (const scenario of ["positive", "revoked"]) {
     }
   });
 }
+
+/** Brings RECORD_ID's attempt to `state` with a record written under the creating ACP id. */
+function adoptedSpawnRecord(ledger: SpawnLedger, adopt: boolean): DiskRecord {
+  const attempt = reserve(ledger);
+  ledger.recordSpawnChild("run-1", 1, process.pid);
+  const owned = diskRecord({ spawn_key: attempt.idempotency_key, spawn_state: "pending" });
+  ledger.saveRecord(owned);
+  if (adopt) {
+    ledger.transitionSpawn("run-1", 1, "published", { session_url: "https://x.invalid/" });
+    ledger.transitionSpawn("run-1", 1, "adopted");
+  }
+  return owned;
+}
+function holdQueueLease(pid: number): void {
+  const file = queueLockFilePath(RECORD_ID);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ pid, sessionId: RECORD_ID }));
+}
+
+test("d36c222f: the session's own queue owner may rebind acp_session_id once the attempt is adopted", async () => {
+  freshHome("rebind-owner");
+  const ledger = new SpawnLedger();
+  try {
+    const owned = adoptedSpawnRecord(ledger, true);
+    holdQueueLease(process.pid);
+    const rebound = { ...owned, acp_session_id: "fresh-after-resume-miss" };
+    ledger.saveRecord(rebound);
+    await ledger.saveRecordAsync({ ...rebound, name: "async owner write" });
+    assert.equal(ledger.readRecord(RECORD_ID)?.acp_session_id, "fresh-after-resume-miss");
+    assert.equal(ledger.readRecord(RECORD_ID)?.metadata?.spawn_state, "published");
+  } finally {
+    ledger.close();
+  }
+});
+
+test("d36c222f negative: a foreign writer still cannot rebind an adopted spawn record", () => {
+  freshHome("rebind-foreign");
+  const ledger = new SpawnLedger();
+  try {
+    const owned = adoptedSpawnRecord(ledger, true);
+    const foreign = { ...owned, acp_session_id: "foreign-acp-session" };
+    // No queue lease at all (acpx-ui's writeOwnedRecord, a second CLI) …
+    assert.throws(() => ledger.saveRecord(foreign), /belongs to another ACP session/);
+    assert.throws(
+      () => ledger.writeOwnedRecord(RECORD_ID, foreign, () => foreign),
+      /belongs to another ACP session/,
+    );
+    // … and a lease held by ANOTHER process (the real owner is someone else).
+    holdQueueLease(process.pid + 1);
+    assert.throws(() => ledger.saveRecord(foreign), /belongs to another ACP session/);
+    assert.equal(ledger.readRecord(RECORD_ID)?.acp_session_id, owned.acp_session_id);
+  } finally {
+    ledger.close();
+  }
+});
+
+test("d36c222f negative: even the lease holder cannot rebind before the attempt is adopted", () => {
+  freshHome("rebind-unadopted");
+  const ledger = new SpawnLedger();
+  try {
+    const owned = adoptedSpawnRecord(ledger, false);
+    holdQueueLease(process.pid);
+    assert.throws(
+      () => ledger.saveRecord({ ...owned, acp_session_id: "delayed-child-acp-session" }),
+      /belongs to another ACP session/,
+    );
+  } finally {
+    ledger.close();
+  }
+});
+
+test("d36c222f: an auto-spawned agent receives its initial prompt exactly once through the real CLI after the resume miss", () => {
+  fs.mkdirSync(ROOT, { recursive: true });
+  const childHome = fs.mkdtempSync(path.join(ROOT, "initial-prompt-"));
+  try {
+    const result = spawnSync(
+      process.execPath,
+      ["--import", "tsx", "test/fixtures/spawn-ledger-initial-prompt.ts"],
+      {
+        cwd: process.cwd(),
+        env: { PATH: process.env.PATH, HOME: childHome },
+        encoding: "utf8",
+        // Two cold CLI starts plus a queue owner — load-bound like the real-child rows above.
+        timeout: 150_000,
+      },
+    );
+    assert.ok(result.stdout.includes("ACTORS=1"), `EXAMINED NOTHING: ${result.stderr}`);
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /PHASES=2/);
+  } finally {
+    fs.rmSync(childHome, { recursive: true, force: true });
+  }
+});
