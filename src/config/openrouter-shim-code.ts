@@ -14,6 +14,8 @@
 //   4. Record WHO SERVED the turn (brick 4c272cab §8): one NDJSON line per
 //      response to `OR_ATTRIBUTION_LOG`, sniffed off the response head without
 //      buffering it.
+//   5. Drop per-message `output_config` (per-turn effort) that OpenRouter rejects
+//      for non-Anthropic providers (brick 92121ff9); top-level effort is kept.
 // Reads config from env: OR_MODEL, OPENROUTER_API_KEY, OR_REASONING_EFFORT,
 // OR_PROVIDER, OR_ATTRIBUTION_LOG, OR_UPSTREAM_HOST.
 // On startup writes "PORT=<n>\n" to stdout so the caller learns the bound port.
@@ -190,6 +192,19 @@ const server = http.createServer((req, res) => {
             if (blk && typeof blk.text === 'string' && blk.text.indexOf('cch=') !== -1) {
               blk.text = blk.text.replace(/cch=[0-9a-f]+/g, 'cch=stable')
             }
+          }
+        }
+        // Strip PER-MESSAGE output_config (per-turn effort). OpenRouter calls it a
+        // "configuration_update" and 400s it for every non-Anthropic provider, and
+        // the CLI cannot recover from that wording (brick 92121ff9). acpx already
+        // turns the capability off (OPENROUTER_DISABLED_CLAUDE_CAPABILITIES in
+        // auth-env.ts); this catches a future CLI shipping it under a name that
+        // list does not cover.
+        // ⚠️ THE TOP-LEVEL obj.output_config STAYS: it carries the user's selected
+        // effort at conversation level, which these models do accept.
+        if (Array.isArray(obj.messages)) {
+          for (const msg of obj.messages) {
+            if (msg && typeof msg === 'object') { delete msg.output_config }
           }
         }
         // Strip extended-thinking / computer-use fields that GPT models don't support.

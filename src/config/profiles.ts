@@ -16,8 +16,8 @@ import {
   type SubscriptionLookupOptions,
 } from "./subscriptions.js";
 
-export type AdapterId = "claude" | "claude-pty" | "codex";
-export type AuthMode = "subscription" | "chatgpt" | "claude-home";
+export type AdapterId = "claude" | "codex";
+export type AuthMode = "subscription" | "chatgpt";
 export type ProfileId = string;
 export type AccountId = string;
 
@@ -47,13 +47,6 @@ export type SubscriptionProfileEntry = CommonProfileFields & {
   lockedBy?: string;
 };
 
-export type ClaudeHomeProfileEntry = CommonProfileFields & {
-  authMode: "claude-home";
-  adapter: "claude-pty";
-  credentialSource: null;
-  homePath: string;
-};
-
 export type ChatGptProfileEntry = CommonProfileFields & {
   authMode: "chatgpt";
   adapter: "codex";
@@ -62,7 +55,7 @@ export type ChatGptProfileEntry = CommonProfileFields & {
   codexHome: string;
 };
 
-export type ProfileEntry = SubscriptionProfileEntry | ClaudeHomeProfileEntry | ChatGptProfileEntry;
+export type ProfileEntry = SubscriptionProfileEntry | ChatGptProfileEntry;
 export type ResolvedProfile = ProfileEntry;
 
 export type EffectiveResolution = {
@@ -113,15 +106,13 @@ function nonEmptyString(value: unknown): string | undefined {
 }
 
 function isValidAuthMode(value: unknown): value is AuthMode {
-  return value === "subscription" || value === "chatgpt" || value === "claude-home";
+  return value === "subscription" || value === "chatgpt";
 }
 
 export function adapterForAuthMode(authMode: AuthMode): AdapterId {
   switch (authMode) {
     case "subscription":
       return "claude";
-    case "claude-home":
-      return "claude-pty";
     case "chatgpt":
       return "codex";
   }
@@ -244,25 +235,6 @@ function normalizeSubscriptionProfile(
   };
 }
 
-function normalizeClaudeHomeProfile(
-  raw: Record<string, unknown>,
-  common: CommonProfileFields,
-): NormalizeProfileResult {
-  const homePath = nonEmptyString(raw.homePath);
-  if (!homePath) {
-    return quarantine(raw, `profile "${common.id}" claude-home auth requires homePath`, common.id);
-  }
-  return {
-    profile: {
-      ...common,
-      authMode: "claude-home",
-      adapter: "claude-pty",
-      credentialSource: null,
-      homePath,
-    },
-  };
-}
-
 function normalizeChatGptProfile(
   raw: Record<string, unknown>,
   homeDir: string,
@@ -290,8 +262,6 @@ function normalizeProfileEntry(value: unknown, homeDir: string): NormalizeProfil
   switch (envelope.authMode) {
     case "subscription":
       return normalizeSubscriptionProfile(envelope.raw, homeDir, common);
-    case "claude-home":
-      return normalizeClaudeHomeProfile(envelope.raw, common);
     case "chatgpt":
       return normalizeChatGptProfile(envelope.raw, homeDir, common);
   }
@@ -347,9 +317,6 @@ function serializeProfileForRegistry(profile: ProfileEntry): Record<string, unkn
       lockedAt: profile.lockedAt,
       lockedBy: profile.lockedBy,
     };
-  }
-  if (profile.authMode === "claude-home") {
-    return { ...common, homePath: profile.homePath };
   }
   return { ...common, codexHome: profile.codexHome };
 }
@@ -677,46 +644,14 @@ export function isSubscriptionProfileLocked(
 /**
  * Return the valid effort levels for a profile, or null when reasoning is not
  * applicable (used by CLI validation and the `profiles` discovery command).
- * - subscription / claude-home -> Claude set: low/medium/high/xhigh/max
+ * - subscription -> Claude set: low/medium/high/xhigh/max
  * - chatgpt -> null
  */
 export function getValidEffortsForProfile(profile: ProfileEntry): readonly string[] | null {
-  if (profile.authMode === "subscription" || profile.authMode === "claude-home") {
+  if (profile.authMode === "subscription") {
     return ["low", "medium", "high", "xhigh", "max"];
   }
   return null;
-}
-
-/**
- * id -> homePath map over ALL claude-home profiles in the registry — the value
- * of the bridge's INDEPENDENT_CLAUDE_HOME_MAP allow-list env. Always the full
- * map (not a single entry) so the bridge's unknown-selector diagnostics stay
- * meaningful.
- */
-export function buildClaudeHomeMap(registry: ProfileRegistry): Record<string, string> {
-  const map: Record<string, string> = {};
-  for (const profile of registry.profiles) {
-    if (profile.authMode === "claude-home") {
-      map[profile.id] = profile.homePath;
-    }
-  }
-  return map;
-}
-
-/**
- * True when `profileId` names a claude-home profile in the registry. Used to
- * keep the current W4-out-of-scope failover exclusion and to gate the bridge
- * `_meta` selector.
- */
-export function isClaudeHomeProfileId(
-  profileId: string | null | undefined,
-  options?: SubscriptionLookupOptions,
-): boolean {
-  const trimmed = profileId?.trim();
-  if (!trimmed) {
-    return false;
-  }
-  return findProfile(trimmed, loadProfileRegistry(options))?.authMode === "claude-home";
 }
 
 export async function loadResolvedProfiles(
@@ -750,8 +685,6 @@ export function transcriptAnchorDir(profile: ResolvedProfile): string | null {
   switch (profile.authMode) {
     case "subscription":
       return profile.credentialSource;
-    case "claude-home":
-      return path.join(profile.homePath, ".claude");
     case "chatgpt":
       return null;
   }

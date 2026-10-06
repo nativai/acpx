@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+import path from "node:path";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
 import {
   AcpClient,
@@ -10,8 +12,8 @@ import {
   assertForkAtIndexHonoured,
   resolveEffectiveForkIndex,
 } from "../../acp/harness-capabilities.js";
+import { readTransientAdvertisement } from "../../acp/transient-advertisement.js";
 import { withInterrupt, withTimeout } from "../../async-control.js";
-import { BrickOutbox } from "../../brick-outbox.js";
 import { AcpxOperationalError } from "../../errors.js";
 import { bindDefaultAccountToSessionOptionsAsync } from "../../runtime/engine/default-account-binding.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
@@ -58,6 +60,7 @@ import {
   seatFromStore,
   SeatRowMissingError,
   sessionBaseDir,
+  sessionRecordFileName,
   writeSessionRecord,
   writeSessionRecordAtBoundary,
   type SeatBrickLink,
@@ -513,15 +516,12 @@ async function createSessionRecordWithClient(
     };
   }
   if (options.recordId) {
-    const outbox = new BrickOutbox();
-    try {
-      if (outbox.readRecord(options.recordId)) {
-        throw new Error(
-          "record-id destination already exists; refusing to create another ACP session",
-        );
-      }
-    } finally {
-      outbox.close();
+    // A plain existence check — it must not open the spawn ledger (that took the box-wide
+    // SQLite write lock on every session creation, brick 750d674d).
+    if (existsSync(path.join(sessionBaseDir(), sessionRecordFileName(options.recordId)))) {
+      throw new Error(
+        "record-id destination already exists; refusing to create another ACP session",
+      );
     }
   }
   await withTimeout(client.start(), options.timeoutMs);
@@ -600,7 +600,7 @@ async function createSessionRecordWithClient(
   // ⚠️ DO NOT "simplify" this to `modelApply.refreshedConfigOptions` alone. A
   // `set-model` harness returns nothing to re-read, so `undefined` there means
   // "keep the snapshot", not "nothing is advertised" — collapsing the two would
-  // delete claude's and claude-pty's working depth path. Test:
+  // delete claude's working depth path. Test:
   // `test/model-application.test.ts` → "a set-model harness keeps the
   // session/new advertisement".
   const advertisedAfterModel = advertisedAfterModelApply(modelApply, sessionResult.configOptions);
@@ -795,21 +795,15 @@ async function createSessionRecordWithClient(
   // B10-repaired state.** So the only thing D13a's ordering still bought was an inert
   // orphan row — at the cost below, which is fatal.
   //
-  // 🔑 WHY ROW-FIRST IS A DEFECT HERE: the mint takes the `index.json` lock and the record
-  // write goes through the outbox, so a mint that SUCCEEDS can make the following record
-  // write fail `outbox-busy` after its full 4 s budget — **no session at all.** Measured on
-  // the structurally identical path 3 (`runtime.ts`): 1 failure in 6 runs under controlled
-  // load, and once in a full suite run at 4619 ms against that 4 s budget. Item 8 forbids
-  // creation depending on the store **by error OR BY SIDE EFFECT**, and a catch around a
-  // call that SUCCEEDS is never invoked — so no amount of guarding here could have covered
-  // it. Only the ordering can.
-  // ⚠️ AND THE CONTENTION IS NOT KNOWN TO BE GONE, only moved off the critical path: the
-  // residual is bounded (k=0 in N=24 on path 3), NOT measured as zero. If it ever measures
-  // non-zero after this reorder it is the outbox's pre-existing race and is filed as the
-  // outbox owner's, not repaired here — and **never by adding a retry**: `outbox-busy` is
-  // terminal, its 4 s budget is already spent by the time anyone sees it.
-  // ⚠️ Decoupling the two writes (a separate lock or outbox) is deliberately NOT done: out
-  // of B2's scope, and a follow-on only if a residual is measured after this reorder.
+  // 🔑 WHY ROW-FIRST WAS A DEFECT: the mint takes the `index.json` lock, and the record write
+  // then went through the box-wide SQLite outbox, so a mint that SUCCEEDED could make the
+  // following record write fail `outbox-busy` after its full 4 s budget — **no session at
+  // all.** Item 8 forbids creation depending on the store **by error OR BY SIDE EFFECT**, and
+  // a catch around a call that SUCCEEDS is never invoked — so only the ordering could cover it.
+  // The outbox is gone from ordinary record writes (they take the per-record file lock only;
+  // the spawn ledger opens for `metadata.spawn_key` records alone), so that contention no longer
+  // exists; the record-first ordering stays because a row-less record is the legitimate,
+  // AP17-diagnosed, B10-repaired state and a row-first orphan buys nothing.
   if (forkContext) {
     await writeSessionRecordAtBoundary(record);
   } else {
@@ -1223,29 +1217,18 @@ export async function listAgentOutputStyles(
     return outputStyleListFromAdvertised(record.acpx?.config_options);
   }
 
-  const client = new AcpClient({
+  // The transient open/read/close is shared with the Claude model-advertisement
+  // probe (brick ebfe4c3c) — one implementation of the measured no-prompt path.
+  const { configOptions } = await readTransientAdvertisement({
     agentCommand: options.agentCommand,
-    cwd: absolutePath(options.cwd),
+    cwd: options.cwd,
     mcpServers: options.mcpServers,
-    // Read-only probe: no prompt is ever sent, so the most restrictive policy is
-    // correct — nothing can ask for a permission on this session.
-    permissionMode: "deny-all",
     authCredentials: options.authCredentials,
     authPolicy: options.authPolicy,
     verbose: options.verbose,
+    timeoutMs: options.timeoutMs,
   });
-  try {
-    await withTimeout(client.start(), options.timeoutMs);
-    const created = await withTimeout(
-      client.createSession(absolutePath(options.cwd)),
-      options.timeoutMs,
-    );
-    return outputStyleListFromAdvertised(created.configOptions);
-  } finally {
-    await client.close().catch(() => {
-      // Enumeration is read-only; a close failure must not mask the answer.
-    });
-  }
+  return outputStyleListFromAdvertised(configOptions);
 }
 
 function outputStyleListFromAdvertised(

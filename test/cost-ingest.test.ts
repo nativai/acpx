@@ -80,7 +80,7 @@ test("5026423b: `measuredFree` is ASSIGNED — a row quoting zero yields `free`,
 
 test("5026423b: `reported` is admitted for a NON-ZERO adapter figure with no units", () => {
   // The positive arm — a harness that gives a total and no token breakdown
-  // (claude / claude-pty). Without this the rule above would read as "never
+  // (claude). Without this the rule above would read as "never
   // trust the adapter", which is not what it says.
   const acpx = state();
   rememberSessionCost(acpx, {

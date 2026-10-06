@@ -136,7 +136,7 @@ function errorMessageText(error: unknown): string {
   return typeof error === "string" ? error : "";
 }
 
-// A claude-pty bridge whose stored Claude login expired surfaces as a generic
+// An adapter whose stored Claude login expired surfaces as a generic
 // AdapterHealthError on the adapter's catch-all code (-32000) carrying
 // data.reason/state === "auth-gated". Detect that auth-gated state explicitly so
 // it does NOT collapse into the broad "-32000 → auth_failed" rule below (which is
@@ -154,7 +154,7 @@ function classifyFromAcp(acp: ReturnType<typeof extractAcpError>): FailoverTrigg
   if (byKind) {
     return byKind;
   }
-  // 2. Auth-gated bridge (expired claude-home login) → distinct trigger, ahead
+  // 2. Auth-gated bridge (expired login) → distinct trigger, ahead
   //    of the generic -32000 rule. Still non-null so failover engages.
   if (isAuthGatedAcp(acp)) {
     return "auth_gated";

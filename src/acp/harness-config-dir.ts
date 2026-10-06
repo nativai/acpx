@@ -76,8 +76,8 @@ import { readPiAdvertisedModelIds } from "./pi-model-knowledge.js";
  * ## ⚠️ IT IS GATED PER HARNESS, OFF THE DESCRIPTOR — never applied unconditionally
  *
  * This writes environment variables into the ADAPTER spawn. Applied to every
- * agent, claude / claude-pty / codex would each silently gain env entries they
- * have no use for — a real behaviour change to three harnesses the program
+ * agent, claude / codex would each silently gain env entries they
+ * have no use for — a real behaviour change to two harnesses the program
  * requires to be untouched. The gate is `primerChannel === "config-file"`, which
  * only pi declares, so a harness that carries its primer on an ACP `_meta`
  * channel is never given a config dir it would ignore.

@@ -3,11 +3,11 @@ import test from "node:test";
 import type { SessionRecord } from "../src/types.js";
 import { makeSessionRecord, withTempHome } from "./runtime-test-helpers.js";
 
-// perf-loadfix W2.4 — the checkpoint path passes one pre-read lifecycle
-// snapshot through to the write path. W11 intentionally rereads metadata inside
-// that write, but the lifecycle-clobber protection (another process's
-// closed/favorite/name write survives our checkpoint) must still behave exactly
-// like the re-reading writeSessionRecord (annex D4).
+// The lifecycle-clobber protection: another process's closed/favorite/name write
+// survives our checkpoint. Until 2026-10-05 the checkpoint passed a lifecycle
+// snapshot it had read BEFORE its flush into the write (perf-loadfix W2.4); that
+// snapshot is gone — the write rereads the record right before its rename
+// (brick eb4c8d06) — so these rows drive the one remaining write path.
 
 type PersistenceModule = typeof import("../src/session/persistence.js");
 
@@ -27,7 +27,7 @@ function record(id: string, overrides: Partial<SessionRecord> = {}): SessionReco
   };
 }
 
-test("a concurrent lifecycle write survives a checkpoint using a pre-read lifecycle", async () => {
+test("a concurrent lifecycle write survives a checkpoint whose owner read the record before it", async () => {
   await withTempHome("acpx-single-read-", async () => {
     const persistence = await loadPersistence();
     const checkpointing = record("clobber-guard");
@@ -42,11 +42,9 @@ test("a concurrent lifecycle write survives a checkpoint using a pre-read lifecy
     });
     await persistence.writeSessionRecordWithLifecycle(fromB);
 
-    // "Process A" checkpoints: one read feeds both merge and write.
-    const persisted = await persistence.readPersistedLifecycle("clobber-guard");
-    assert.equal(persisted?.closed, true);
+    // "Process A" checkpoints the record object it loaded BEFORE B's write.
     checkpointing.lastUsedAt = "2026-06-12T08:00:02.000Z";
-    await persistence.writeSessionRecordWithPersistedLifecycle(checkpointing, persisted);
+    await persistence.writeSessionRecord(checkpointing);
 
     const onDisk = await persistence.resolveSessionRecord("clobber-guard");
     assert.equal(onDisk.closed, true, "B's closed must survive A's checkpoint");
@@ -72,41 +70,14 @@ test("readPersistedLifecycle carries pid and acpx for the closed-state merge", a
   });
 });
 
-test("an undefined persisted lifecycle means no prior state: the record writes as-is", async () => {
+test("no record on disk means no prior state: the record writes as-is", async () => {
   await withTempHome("acpx-single-read-", async () => {
     const persistence = await loadPersistence();
     const rec = record("fresh-write", { title: "fresh-title" });
-    await persistence.writeSessionRecordWithPersistedLifecycle(rec, undefined);
+    await persistence.writeSessionRecord(rec);
 
     const onDisk = await persistence.resolveSessionRecord("fresh-write");
     assert.equal(onDisk.title, "fresh-title");
     assert.equal(onDisk.closed, false);
-  });
-});
-
-test("pass-through variant matches the re-reading variant byte-for-byte", async () => {
-  await withTempHome("acpx-single-read-", async (homeDir) => {
-    const fs = await import("node:fs/promises");
-    const path = await import("node:path");
-    const persistence = await loadPersistence();
-    const recordPath = path.join(homeDir, ".acpx", "sessions", "parity.json");
-
-    const base = record("parity");
-    await persistence.writeSessionRecord(base);
-    const closed = record("parity", { closed: true, closedAt: "2026-06-12T09:00:00.000Z" });
-    await persistence.writeSessionRecordWithLifecycle(closed);
-
-    const checkpointing = record("parity", { lastUsedAt: "2026-06-12T09:00:01.000Z" });
-
-    // Variant 1: classic re-reading write.
-    await persistence.writeSessionRecord({ ...checkpointing });
-    const classic = await fs.readFile(recordPath, "utf8");
-
-    // Variant 2: pass-through write with a fresh pre-read.
-    const persisted = await persistence.readPersistedLifecycle("parity");
-    await persistence.writeSessionRecordWithPersistedLifecycle({ ...checkpointing }, persisted);
-    const passThrough = await fs.readFile(recordPath, "utf8");
-
-    assert.equal(passThrough, classic);
   });
 });

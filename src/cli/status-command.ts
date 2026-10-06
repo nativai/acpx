@@ -401,7 +401,7 @@ function desiredEffort(acpx: NonNullable<SessionRecord["acpx"]>): string | null 
  *    (`session_options.effort`) — the projection records what pi actually
  *    applied, including a position-projected collapse (`xhigh`/`max` -> e.g.
  *    `medium`), so the requested value alone would echo a wish, not the truth.
- *  - claude / claude-pty / anything else (incl. opencode, unmeasured by this
+ *  - claude / anything else (incl. opencode, unmeasured by this
  *    concept — CONTENT.md) — UNCHANGED: `desired_config_options.effort`. An
  *    opencode record never sets that field, so it naturally reports `null`
  *    here, matching acpx-ui's explicit `undefined` for the same harness.
@@ -489,8 +489,6 @@ export function resolveGenericEffortLadder(acpx: SessionAcpxState): string[] | n
  *    downgrades. `servedModel` is therefore left `undefined` for pi, which
  *    makes `evaluateModelFloor` report `"unknown"` (never a false `at-floor`
  *    or `below-floor` on data acpx does not have).
- *  - claude-pty: never populated (`captureServedState` is gated on the
- *    `claude-agent-acp` SDK adapter specifically) — reports `"unknown"`.
  *  - codex: never populated — `recordDepthOutcome`'s own comment states this
  *    is a MEASURED baseline (codex's depth request always lands in its
  *    "unavailable" outcome, since depth is fused into the model id rather than

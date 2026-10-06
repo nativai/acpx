@@ -5,8 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { getAccountHealth, resetKnownDeadSubs } from "../src/config/known-dead-subscriptions.js";
-import { transcriptJsonlPath } from "../src/config/subscription-transcript.js";
-import { AllSubscriptionsExhaustedError, BridgeAuthGatedError } from "../src/errors.js";
+import { AllSubscriptionsExhaustedError } from "../src/errors.js";
 import { attemptFailoverAndRetry } from "../src/runtime/engine/failover.js";
 import type { SessionRecord } from "../src/types.js";
 
@@ -82,48 +81,6 @@ async function withRig(
   }
 }
 
-async function withHomeRig(
-  homes: Array<{ id: string; account: string }>,
-  defaultId: string,
-  run: (ctx: {
-    homeDir: string;
-    registryPath: string;
-    claudeAnchor: (id: string) => string;
-  }) => Promise<void>,
-): Promise<void> {
-  resetKnownDeadSubs();
-  const home = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fo-home-"));
-  const registryPath = path.join(home, ".acpx", "subscriptions", "registry.json");
-  const homePath = (id: string) => path.join(home, "homes", id);
-  const claudeAnchor = (id: string) => path.join(homePath(id), ".claude");
-  try {
-    for (const profile of homes) {
-      await fs.mkdir(claudeAnchor(profile.id), { recursive: true });
-    }
-    await fs.mkdir(path.dirname(registryPath), { recursive: true });
-    await fs.writeFile(
-      registryPath,
-      JSON.stringify({
-        version: 3,
-        default: defaultId,
-        profiles: homes.map((profile) => ({
-          id: profile.id,
-          label: profile.id,
-          authMode: "claude-home",
-          adapter: "claude-pty",
-          account: profile.account,
-          credentialSource: null,
-          homePath: homePath(profile.id),
-        })),
-      }),
-    );
-    await run({ homeDir: home, registryPath, claudeAnchor });
-  } finally {
-    await fs.rm(home, { recursive: true, force: true });
-    resetKnownDeadSubs();
-  }
-}
-
 function makeRecord(options: {
   profile?: string;
   subscription?: string;
@@ -193,29 +150,6 @@ function futureSessionLimitMessage(minutesFromNow: number): { message: string; r
     message: `Internal error: You've hit your session limit · resets ${hour12}:${minute}${meridiem} (UTC)`,
     resetIso: reset.toISOString(),
   };
-}
-
-// The auth-gated bridge failure shape: a claude-pty AdapterHealthError carried to
-// acpx as a generic RequestError on the catch-all code -32000 with
-// data.reason/state === "auth-gated" (claude-pty-acp acp-server-transcript.mjs).
-function authGatedError(
-  message = "Interactive Claude login is required for this HOME",
-  effectiveAccount?: string,
-): Error {
-  const error = new Error(message);
-  (error as { acp?: { code: number; message: string; data: Record<string, unknown> } }).acp = {
-    code: -32000,
-    message,
-    data: { reason: "auth-gated", state: "auth-gated" },
-  };
-  if (effectiveAccount) {
-    (
-      error as { effectiveAccountMetadata?: { effectiveAccount: string } }
-    ).effectiveAccountMetadata = {
-      effectiveAccount,
-    };
-  }
-  return error;
 }
 
 test("attemptFailoverAndRetry switches to a healthy sub and returns its result", async () => {
@@ -542,46 +476,6 @@ test("profile-pinned SDK failover rewrites the unified profile selection", async
   );
 });
 
-test("claude-home sibling failover ports the transcript across HOME anchors", async () => {
-  await withHomeRig(
-    [
-      { id: "homeA", account: "acct-a" },
-      { id: "homeB", account: "acct-b" },
-    ],
-    "homeA",
-    async ({ homeDir, registryPath, claudeAnchor }) => {
-      const prevHome = process.env.HOME;
-      process.env.HOME = homeDir;
-      try {
-        const cwd = path.join(homeDir, "work");
-        const acpSessionId = "claude-home-session";
-        const record = makeRecord({
-          profile: "homeA",
-          acpSessionId,
-          cwd,
-        });
-        const src = transcriptJsonlPath(claudeAnchor("homeA"), cwd, acpSessionId);
-        await fs.mkdir(path.dirname(src), { recursive: true });
-        await fs.writeFile(src, "remember: bridge context survives\n");
-
-        const out = await attemptFailoverAndRetry<string>({
-          record,
-          loadOpts: { homeDir, registryPath },
-          runTurn: async () => "HOME-OK",
-        });
-
-        assert.equal(out.switchedTo, "homeB");
-        assert.equal(record.acpx?.session_options?.profile, "homeB");
-        assert.equal(record.acpx?.session_options?.account_switch?.toAccount, "acct-b");
-        const dst = transcriptJsonlPath(claudeAnchor("homeB"), cwd, acpSessionId);
-        assert.equal(await fs.readFile(dst, "utf8"), "remember: bridge context survives\n");
-      } finally {
-        process.env.HOME = prevHome;
-      }
-    },
-  );
-});
-
 test("retry failure marks the effective account, not the intended target account", async () => {
   await withRig(
     [
@@ -655,165 +549,6 @@ test("no sibling profile produces an honest failover-unavailable exhaustion", as
 // sibling bridge. The turn runs on the sibling; no error is surfaced. Proves
 // "auth_gated" is a real (non-null) failover trigger that still reaches a usable
 // bridge while the pool has one.
-test("S4: auth-gated bridge fails over to a healthy sibling bridge and the turn runs", async () => {
-  await withHomeRig(
-    [
-      { id: "bridge2", account: "acct-b2" },
-      { id: "bridge1", account: "acct-b1" },
-    ],
-    "bridge2",
-    async ({ homeDir, registryPath, claudeAnchor }) => {
-      const prevHome = process.env.HOME;
-      process.env.HOME = homeDir;
-      try {
-        const cwd = path.join(homeDir, "work");
-        const acpSessionId = "bridge-failover-session";
-        const record = makeRecord({ profile: "bridge2", acpSessionId, cwd });
-        // Seed the selected bridge's transcript so the failover ports it across.
-        const src = transcriptJsonlPath(claudeAnchor("bridge2"), cwd, acpSessionId);
-        await fs.mkdir(path.dirname(src), { recursive: true });
-        await fs.writeFile(src, "bridge context\n");
-
-        let turns = 0;
-        const out = await attemptFailoverAndRetry<string>({
-          record,
-          triggerError: authGatedError(
-            "Interactive Claude login is required for this HOME",
-            "acct-b2",
-          ),
-          loadOpts: { homeDir, registryPath },
-          runTurn: async () => {
-            turns += 1;
-            return "BRIDGE-OK";
-          },
-        });
-
-        assert.equal(out.result, "BRIDGE-OK");
-        assert.equal(out.switchedTo, "bridge1");
-        assert.equal(turns, 1);
-        assert.equal(record.acpx?.session_options?.profile, "bridge1");
-      } finally {
-        process.env.HOME = prevHome;
-      }
-    },
-  );
-});
-
-// S3 — short, bounded TTL for a non-quota (auth-gated) dead-mark. The selected
-// bridge is marked dead at now+~60s, NEVER the process-lifetime sentinel
-// (9999-…). Because activeDeadUntil() treats a past deadUntil as "not dead", this
-// auto-recovers in ~1 min with no acpx-ui restart (fixes defect D). Solo bridge
-// (no sibling) so the turn exhausts immediately into a BridgeAuthGatedError (S5).
-test("S3+S5: auth-gated dead-mark uses a ~60s TTL (not the sentinel) and throws BridgeAuthGatedError", async () => {
-  await withHomeRig(
-    [{ id: "solo", account: "acct-solo" }],
-    "solo",
-    async ({ homeDir, registryPath }) => {
-      const prevHome = process.env.HOME;
-      process.env.HOME = homeDir;
-      try {
-        const record = makeRecord({ profile: "solo" });
-        const before = Date.now();
-        await assert.rejects(
-          () =>
-            attemptFailoverAndRetry<string>({
-              record,
-              triggerError: authGatedError(
-                "Interactive Claude login is required for this HOME",
-                "acct-solo",
-              ),
-              loadOpts: { homeDir, registryPath },
-              runTurn: async () => "never",
-            }),
-          BridgeAuthGatedError,
-        );
-        const after = Date.now();
-
-        const health = await getAccountHealth("acct-solo");
-        assert.ok(health.deadUntil, "the auth-gated account was marked dead");
-        assert.notEqual(
-          health.deadUntil,
-          "9999-12-31T23:59:59.999Z",
-          "NOT the process-lifetime sentinel",
-        );
-        const deadMs = Date.parse(health.deadUntil);
-        // deadUntil ≈ now + 60s (bounded by the call window).
-        assert.ok(
-          deadMs >= before + 60_000 && deadMs <= after + 60_000,
-          `deadUntil ${health.deadUntil} should be ~now+60s`,
-        );
-        // Selection restored so a later turn (post-login) re-probes and recovers.
-        assert.equal(record.acpx?.session_options?.profile, "solo");
-        assert.equal(record.acpx?.session_options?.account_switch, undefined);
-      } finally {
-        process.env.HOME = prevHome;
-      }
-    },
-  );
-});
-
-// S5 — acceptance #1: when the selected bridge AND its sibling are both
-// auth-gated, the pool exhausts into a BridgeAuthGatedError (keyed on the INITIAL
-// trigger), NOT a false AllSubscriptionsExhaustedError. Failover IS attempted
-// (the sibling is tried) before exhausting — proving honest surfacing, not a
-// quota lie. Both accounts carry the short non-quota TTL.
-test("S5: both bridges auth-gated → BridgeAuthGatedError (not AllSubscriptionsExhaustedError), both short-TTL'd", async () => {
-  await withHomeRig(
-    [
-      { id: "bridge2", account: "acct-b2" },
-      { id: "bridge1", account: "acct-b1" },
-    ],
-    "bridge2",
-    async ({ homeDir, registryPath, claudeAnchor }) => {
-      const prevHome = process.env.HOME;
-      process.env.HOME = homeDir;
-      try {
-        const cwd = path.join(homeDir, "work");
-        const acpSessionId = "both-gated-session";
-        const record = makeRecord({ profile: "bridge2", acpSessionId, cwd });
-        const src = transcriptJsonlPath(claudeAnchor("bridge2"), cwd, acpSessionId);
-        await fs.mkdir(path.dirname(src), { recursive: true });
-        await fs.writeFile(src, "bridge context\n");
-
-        await assert.rejects(
-          () =>
-            attemptFailoverAndRetry<string>({
-              record,
-              triggerError: authGatedError(
-                "Interactive Claude login is required for this HOME",
-                "acct-b2",
-              ),
-              loadOpts: { homeDir, registryPath },
-              // The sibling is tried, but its login is gated too.
-              runTurn: async () => {
-                throw authGatedError(
-                  "Interactive Claude login is required for this HOME",
-                  "acct-b1",
-                );
-              },
-            }),
-          (err: unknown) => {
-            assert.ok(err instanceof BridgeAuthGatedError, "throws BridgeAuthGatedError");
-            assert.ok(!(err instanceof AllSubscriptionsExhaustedError), "NOT exhausted/quota");
-            return true;
-          },
-        );
-
-        // Both bridge accounts marked dead on the short TTL, not the sentinel.
-        for (const account of ["acct-b2", "acct-b1"]) {
-          const health = await getAccountHealth(account);
-          assert.ok(health.deadUntil, `${account} marked dead`);
-          assert.notEqual(health.deadUntil, "9999-12-31T23:59:59.999Z", `${account} not sentinel`);
-        }
-        // Selection restored to the original bridge for a later re-probe.
-        assert.equal(record.acpx?.session_options?.profile, "bridge2");
-      } finally {
-        process.env.HOME = prevHome;
-      }
-    },
-  );
-});
-
 // Regression for 52906cf1: account-level lock exclusion in turn-failover.
 // Account-locked siblings are excluded UPSTREAM in failoverCandidates via
 // isSubscriptionProfileLocked, before they ever reach pickSubscriptionSibling.

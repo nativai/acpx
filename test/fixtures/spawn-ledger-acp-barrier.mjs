@@ -5,8 +5,8 @@ import readline from "node:readline";
 const marker = process.argv[2];
 const release = process.argv[3];
 if (
-  !marker?.startsWith("/workspace/bricksdb-b14-selftest/") ||
-  !release?.startsWith("/workspace/bricksdb-b14-selftest/")
+  !marker?.startsWith("/workspace/spawn-ledger-selftest/") ||
+  !release?.startsWith("/workspace/spawn-ledger-selftest/")
 ) {
   console.error("EXAMINED NOTHING");
   process.exit(2);

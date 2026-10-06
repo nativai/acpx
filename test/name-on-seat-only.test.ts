@@ -13,7 +13,8 @@ import { makeSessionRecord, withTempHome } from "./runtime-test-helpers.js";
  * D-NAME-HARD-MIGRATION (brick 15f4ad42, spec AMENDMENT-2026-10-05-NAME-ON-SEAT-ONLY §1/§4):
  * the NAME lives on the SEAT only. The session record has no `name`, no writer sets one, and the
  * index entry carries none. These rows hold that line; the migration itself is rowed in
- * `seat-backfill.test.ts` (N1–N5) and the outbox projection in `brick-outbox.test.ts`.
+ * `seat-backfill.test.ts` (N1–N5); the outbox projection that once read the seat name was
+ * deleted with the outbox (HOD-R51).
  */
 
 // Tests run compiled from dist-test/test, so the REAL sources are two levels up.
@@ -101,6 +102,10 @@ const ALLOWED_NAME_READS: ReadonlyMap<string, { count: number; why: string }> = 
     },
   ],
   ["agent-registry.ts", { count: 1, why: "an npm package.json `name`" }],
+  [
+    "models/claude-advertised-label.ts",
+    { count: 1, why: "an advertised model option's `name` (the SDK select option, not a record)" },
+  ],
   ["models/catalogue.ts", { count: 1, why: "a model catalogue row's `name`" }],
   ["models/matcher.ts", { count: 1, why: "a model row's `name`" }],
   ["config/providers.ts", { count: 2, why: "a provider entry's `name`" }],

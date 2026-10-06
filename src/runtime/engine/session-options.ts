@@ -18,8 +18,8 @@ export type SessionAgentOptions = {
    */
   profile?: string;
   // Claude thinking depth (the `effort` config option). Persisted to disk as
-  // `session_options.effort` (the durable end-to-end contract field the claude-pty
-  // bridge reads on cold-resume) AND, at the creation sites, as
+  // `session_options.effort` (the durable end-to-end contract field adapters
+  // read on cold-resume) AND, at the creation sites, as
   // `acpx.desired_config_options.effort` (live config + reconnect reapply).
   // Carried forward across turns by mergeSessionOptions so a per-spawn depth
   // survives a same-session re-create. Opaque string (an advertised effort

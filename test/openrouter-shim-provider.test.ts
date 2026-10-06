@@ -67,16 +67,17 @@ async function captureServer(reply?: unknown): Promise<Capture> {
   };
 }
 
-async function postMessages(port: number): Promise<void> {
-  const payload = JSON.stringify({
-    model: "claude-opus-4-8",
-    max_tokens: 1,
-    messages: [{ role: "user", content: "hi" }],
-  });
+const DEFAULT_PAYLOAD = {
+  model: "claude-opus-4-8",
+  max_tokens: 1,
+  messages: [{ role: "user", content: "hi" }],
+};
+
+async function postMessages(port: number, payload: unknown = DEFAULT_PAYLOAD): Promise<void> {
   const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: payload,
+    body: JSON.stringify(payload),
   });
   await response.text();
 }
@@ -85,6 +86,7 @@ async function withShim(
   options: Parameters<typeof spawnOpenRouterShim>[2],
   run: (capture: Capture) => Promise<void>,
   reply?: unknown,
+  payload?: unknown,
 ): Promise<void> {
   const capture = await captureServer(reply);
   const previous = process.env.OR_UPSTREAM_HOST;
@@ -92,7 +94,7 @@ async function withShim(
   try {
     const shim = await spawnOpenRouterShim(SYNTHETIC_KEY, MODEL, options);
     try {
-      await postMessages(shim.port);
+      await postMessages(shim.port, payload);
       await run(capture);
     } finally {
       shim.stop();
@@ -265,5 +267,57 @@ test("T9 · a response naming no provider records NOTHING — absence stays abse
       assert.equal(readFileSync(logPath, "utf8"), "");
     },
     { id: "gen-TESTONLY-2", choices: [{ finish_reason: "stop" }] },
+  );
+});
+
+// brick 92121ff9 — CLI 2.1.287 sends per-turn effort as an `output_config` ON A
+// MESSAGE (a mid-conversation `role:"system"` message). OpenRouter 400s it as a
+// "configuration_update" for every non-Anthropic provider. The shim strips it as
+// a safety net behind acpx's CLAUDE_CODE_MODEL_CAPABILITIES knob. This payload is
+// the shape captured from a real 2.1.287 request (evidence/capture-A-*.ndjson).
+const PER_TURN_EFFORT_PAYLOAD = {
+  model: "claude-opus-5-5",
+  max_tokens: 1,
+  output_config: { effort: "high" },
+  messages: [
+    { role: "user", content: [{ type: "text", text: "hi" }] },
+    {
+      role: "system",
+      content: [{ type: "text", text: "<env>" }],
+      output_config: { effort: "high" },
+    },
+  ],
+};
+
+test("92121ff9 · per-message output_config is stripped from EVERY message", async () => {
+  await withShim(
+    {},
+    async (capture) => {
+      assert.equal(capture.bodies.length, 1);
+      const body = capture.bodies[0] as { messages: Record<string, unknown>[] };
+      assert.equal(body.messages.length, 2, "messages themselves are forwarded, not dropped");
+      for (const message of body.messages) {
+        assert.equal("output_config" in message, false);
+      }
+      // The system message's content survives — only the effort carrier goes.
+      assert.deepEqual(body.messages[1].content, [{ type: "text", text: "<env>" }]);
+    },
+    undefined,
+    PER_TURN_EFFORT_PAYLOAD,
+  );
+});
+
+test("92121ff9 · the TOP-LEVEL output_config.effort (the user's selection) is kept unchanged", async () => {
+  // The negative case for the row above: an over-eager strip that also deleted
+  // the conversation-level effort would pass it and silently drop what the user
+  // selected — both green-listed models accept effort at conversation level.
+  await withShim(
+    {},
+    async (capture) => {
+      const body = capture.bodies[0] as Record<string, unknown>;
+      assert.deepEqual(body.output_config, { effort: "high" });
+    },
+    undefined,
+    PER_TURN_EFFORT_PAYLOAD,
   );
 });

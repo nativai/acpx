@@ -19,7 +19,6 @@ import { makeSessionRecord } from "./runtime-test-helpers.js";
 // ends; a sweep for the records the seam already wedged.
 
 const CLAUDE = "node /opt/claude-agent-acp/dist/index.js";
-const CLAUDE_PTY = "node /opt/claude-pty-acp/dist/index.js";
 const CODEX = "node /opt/codex-acp/dist/index.js";
 const PI_CMD = AGENT_REGISTRY.pi;
 const PI = AGENT_REGISTRY.pi;
@@ -45,7 +44,6 @@ test("isClaudeFamilyAgent classifies EVERY harness this fleet launches, from the
   // registry change that moves a harness's command cannot leave this test
   // asserting about a spelling nothing launches any more.
   assert.equal(isClaudeFamilyAgent(AGENT_REGISTRY.claude), true);
-  assert.equal(isClaudeFamilyAgent(AGENT_REGISTRY["claude-pty"]), true);
   assert.equal(isClaudeFamilyAgent(AGENT_REGISTRY.codex), false);
   assert.equal(isClaudeFamilyAgent(AGENT_REGISTRY.pi), false);
   assert.equal(isClaudeFamilyAgent(AGENT_REGISTRY.pi), false);
@@ -58,14 +56,10 @@ test("isClaudeFamilyAgent classifies EVERY harness this fleet launches, from the
 
 test("isClaudeFamilyAgent recognises a dev-override claude command, not just the /opt one", () => {
   // ACPX_CLAUDE_ACP_COMMAND / a config `agents` entry pointing at a checkout. All
-  // three of these spellings exist in the real store on devbox (measured
+  // of these spellings exist in the real store on devbox (measured
   // 2026-09-04): a worktree build is still the claude adapter.
   assert.equal(
     isClaudeFamilyAgent('node "/workspace/projects/claude-agent-acp/forkfund-fw12/dist/index.js"'),
-    true,
-  );
-  assert.equal(
-    isClaudeFamilyAgent("node /workspace/projects/claude-pty-acp/main/dist/index.js"),
     true,
   );
 });
@@ -286,7 +280,7 @@ test("the sweep refuses a record whose backup cannot be taken, and keeps going",
 
 test("the sweep's summary always states what it SKIPPED, not only what it changed", async () => {
   await withSweepFixture(async (fixture) => {
-    const claude = recordFor("rec-claude", CLAUDE_PTY, { ...WEDGED_OPTIONS });
+    const claude = recordFor("rec-claude", CLAUDE, { ...WEDGED_OPTIONS });
     const result = await repairAccountSeamRecords({
       dryRun: true,
       loadRecords: async () => [claude],

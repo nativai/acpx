@@ -101,8 +101,6 @@ import {
 import {
   applyProfileAuth,
   buildAgentSpawnOptions,
-  buildClaudeHomeSelectorMeta,
-  buildClaudeParentSessionMeta,
   effectiveAccountMetadataFromEnv,
   readEnvCredential,
   resolveConfiguredAuthCredential,
@@ -172,6 +170,11 @@ import {
 } from "./session-control-errors.js";
 import { resolveSessionPrimer } from "./session-primer.js";
 import { TerminalManager } from "./terminal-manager.js";
+import {
+  buildTurnContextRequest,
+  hasTurnContextProviders,
+  resolveTurnContext,
+} from "./turn-context.js";
 
 export { buildSpawnCommandOptions };
 export {
@@ -219,7 +222,7 @@ type ForkSessionOptions = LoadSessionOptions & {
   /**
    * The source session's messages_log entries, threaded in so the fork
    * resolver can read durable byway-fork provenance (`messages[atIndex-1]
-   * .claude_uuid`) on the PTY-bridge path (A5).
+   * .claude_uuid`) on the non-Claude-ACP fork path (A5).
    */
   sourceMessages?: readonly SessionMessage[];
 };
@@ -246,14 +249,14 @@ function forkEntryClaudeUuid(entry: SessionMessage | undefined): string | undefi
 }
 
 /**
- * Resolve the fork `_meta` for the PTY-bridge path (A5). When the entry being
+ * Resolve the fork `_meta` for the non-Claude-ACP path (A5). When the entry being
  * forked at (`messages[atIndex-1]`) carries durable provenance, send it via the
  * EXISTING direct-uuid path (`claudeCode.options.resumeSessionAt`) — immune to
  * mid-turn steers and any messages_log/transcript divergence. Otherwise fall
- * back to the LEGACY index (`acpx.forkAtMessageIndex`), which the bridge
- * resolves with its reconstructed-index model for pre-provenance sessions.
+ * back to the LEGACY index (`acpx.forkAtMessageIndex`), which the adapter
+ * resolves with its own index model for pre-provenance sessions.
  */
-export function resolvePtyForkMeta(
+export function resolveIndexForkMeta(
   sourceMessages: readonly SessionMessage[] | undefined,
   atIndex: number,
 ): Record<string, unknown> {
@@ -267,7 +270,7 @@ export function resolvePtyForkMeta(
 /**
  * Resolve the Claude-ACP fork `resumeSessionAt` uuid (A6 — completes the
  * durable-provenance mechanism for the mainstream Claude adapter path,
- * mirroring the PTY-bridge branch above). Prefers `sourceMessages[atIndex-1]
+ * mirroring the index-fork branch above). Prefers `sourceMessages[atIndex-1]
  * .claude_uuid` directly, immune to record/transcript index divergence, and
  * falls back to `resolveClaudeUuidForAcpxIndex`'s index-arithmetic
  * reconstruction only when the entry carries no provenance (pre-provenance
@@ -297,16 +300,54 @@ export async function resolveClaudeForkResumeAt(args: {
 
 export type AcpPromptOptions = {
   messageId?: string;
+  /**
+   * Opt in to per-turn context injection (brick 4539b033, `src/acp/turn-context.ts`).
+   *
+   * **Default OFF, and eligibility is DECLARED by the caller rather than inferred here.**
+   * `runPromptTurn` is the only place that sets it, which covers the main sequential queue
+   * turn and the engine runtime turn with one line, and excludes the mid-turn injected
+   * prompt and the `runOnce` one-shot path by not touching them.
+   *
+   * ⚠️ **The mid-turn injected path must NEVER set this.** A steer would then arrive wearing
+   * a "new turn" frame inside a turn that already carried one — double injection within a
+   * single turn, and a content error rather than mere waste.
+   *
+   * Opt-in rather than inference deliberately: inference fails toward *decorating* an
+   * unconsidered path, opt-in fails toward *not* decorating it, and for a mechanism whose
+   * primary risk is unwanted content in a live turn the safe failure direction is not
+   * decorating.
+   */
+  turnContext?: boolean;
 };
 
-function buildPromptRequest(
+/**
+ * ⚠️ **THE INERT PATH MUST BE THE SAME CODE PATH, NOT AN EQUIVALENT ONE.** With
+ * `turnContext === undefined` this returns exactly the object it returned before per-turn
+ * injection existed — same literal, same key order, and `prompt` is the same reference, not
+ * a copy. Inertness is a BYTE-IDENTITY claim against captured literal wire frames, so it has
+ * to hold by construction rather than by inspection: no new key, no re-ordered key, no empty
+ * block, no `_meta`.
+ *
+ * When present, the composed block is **PREPENDED**. That inverts the primer's "append last"
+ * rule and the inversion is principled rather than contradictory: the underlying rule is
+ * *the instruction goes last*. For the primer, the primer is the frame and the human's
+ * append is the instruction; for a per-turn delta the **user's prompt** is the instruction
+ * and the delta is the frame. Same rule, different pair ⇒ frame first, instruction last.
+ * Prepending also keeps the user's own words in the most salient final position and stops the
+ * block reading as "the user also said this".
+ */
+export function buildPromptRequest(
   sessionId: string,
   prompt: PromptInput,
   options: AcpPromptOptions | undefined,
+  turnContext?: string,
 ) {
   return {
     sessionId,
-    prompt,
+    prompt:
+      turnContext === undefined
+        ? prompt
+        : [{ type: "text" as const, text: turnContext }, ...prompt],
     ...(options?.messageId !== undefined ? { messageId: options.messageId } : {}),
   };
 }
@@ -1241,8 +1282,8 @@ export class AcpClient {
     // B3: the per-session harness config dir — primer + model pin + catalogue
     // fragment, one directory (CONCEPTION §5.3). GATED PER HARNESS off the
     // descriptor's `primerChannel === "config-file"`, so only pi receives it and
-    // claude / claude-pty / codex adapter environments are untouched. Applied
-    // unconditionally here it would be a real behaviour change to three
+    // claude / codex adapter environments are untouched. Applied
+    // unconditionally here it would be a real behaviour change to two
     // harnesses this program requires to stay identical.
     //
     // ⚠️ This is the ADAPTER boundary, one level downstream of the rig shim's
@@ -1413,7 +1454,7 @@ export class AcpClient {
    *     involved at all — which is what makes "any OpenRouter model" true for
    *     claude without pre-registering one profile per model;
    *   - any other session with a profile attached (`kind: "profile"`) takes
-   *     `applyProfileAuth`'s normal, non-shim path — subscription, claude-home or
+   *     `applyProfileAuth`'s normal, non-shim path — subscription or
    *     chatgpt. (The `openrouter`-authMode profile kind that used to be a second
    *     shim-starting route here was retired, brick 777b4be7.)
    *
@@ -1906,30 +1947,14 @@ export class AcpClient {
     return new Error(`${base}\n\n[acpx] ${hint}`, { cause: error });
   }
 
-  /**
-   * session/new `_meta`: the claudeCode options fragment plus — for a
-   * claude-home profile session — the bridge HOME selector
-   * (independent-claude-acp/home). Recomputed per call, so EVERY spawn path
-   * that lands in createSession (create / recover-fresh / keepwarm) carries
-   * the selector: a missing selector does not error bridge-side, it silently
-   * runs under the box-default HOME (wrong credentials).
-   */
+  /** session/new `_meta`: the claudeCode options fragment plus the OS primer. */
   private async buildNewSessionMeta(): Promise<Record<string, unknown> | undefined> {
     const optionsMeta = buildClaudeCodeOptionsMeta(this.options.sessionOptions);
-    const homeSelectorMeta = this.buildHomeSelectorMeta();
-    // FW-18/FW-19: the claude-pty bridge learns its per-session parent from the
-    // session/new `_meta` (not the spawn process env — one bridge serves many
-    // sessions). Carry the parent URL here so the child claude gets
-    // ACPX_PARENT_SESSION_URL and can message its parent back.
-    const parentMeta = buildClaudeParentSessionMeta(
-      this.options.sessionContext,
-      this.options.agentCommand,
-    );
     // OS primer (CONCEPTION §4.5.1): resolve `session-context.sh`, route by
     // agent type, and fold in any human `--append-system-prompt`. Merged LAST so
     // the primer fragment owns `systemPrompt` / `codex.developerInstructions`.
     const primerMeta = await this.buildPrimerSessionMeta(optionsMeta);
-    const merged = { ...optionsMeta, ...homeSelectorMeta, ...parentMeta, ...primerMeta };
+    const merged = { ...optionsMeta, ...primerMeta };
     return Object.keys(merged).length > 0 ? merged : undefined;
   }
 
@@ -2014,10 +2039,6 @@ export class AcpClient {
     return await resolveBrickContext(brick, brickContextIdentity(this.options.sessionContext));
   }
 
-  private buildHomeSelectorMeta(): Record<string, unknown> | undefined {
-    return buildClaudeHomeSelectorMeta(this.options.sessionContext?.profileId);
-  }
-
   /**
    * Fix A (brick 92a994a0): fold an authoritative context-window hint into a
    * resume `_meta` fragment as `claudeCode.contextWindowSizeHint`, so the
@@ -2098,11 +2119,6 @@ export class AcpClient {
     let response: LoadSessionResponse | undefined;
 
     try {
-      // For claude-home sessions, carry the HOME selector on session/load too:
-      // when the bridge advertises loadSession (feat/session-load), the loaded
-      // session must re-bind to the same home — and a missing selector falls
-      // back silently to the box-default HOME, not an error.
-      const homeSelectorMeta = this.buildHomeSelectorMeta();
       // Re-supply the primer on cold load for the system-prompt channels
       // (CONCEPTION §4.5.2) so a restarted adapter regenerates it; codex returns
       // undefined here (its developer item is already in restored history).
@@ -2110,7 +2126,7 @@ export class AcpClient {
       const loadMeta =
         this.mergeOutputStyleMeta(
           this.mergeContextWindowHint(
-            { ...homeSelectorMeta, ...primerMeta },
+            { ...primerMeta },
             options.contextWindowSizeHint,
             options.contextWindowSizeHintModel,
           ),
@@ -2332,12 +2348,12 @@ export class AcpClient {
       };
     }
 
-    // PTY-bridge path (not isClaudeAcpCommand): prefer durable provenance, fall
+    // Non-Claude-ACP path: prefer durable provenance, fall
     // back to the legacy messages_log index for pre-provenance sessions (A5).
     return {
       claudeFork: false,
       sourceCwd: cwd,
-      meta: resolvePtyForkMeta(sourceMessages, atIndex),
+      meta: resolveIndexForkMeta(sourceMessages, atIndex),
     };
   }
 
@@ -2364,6 +2380,13 @@ export class AcpClient {
   ): Promise<PromptResponse> {
     const connection = this.getConnection();
     const normalizedPrompt = this.normalizePromptForAgent(prompt);
+
+    // `undefined` here means "nothing to inject", decided SYNCHRONOUSLY — so the inert path
+    // never reaches an `await` at all. See {@link maybeResolveTurnContext}.
+    const pendingTurnContext = this.maybeResolveTurnContext(sessionId, options);
+    const composedTurnContext =
+      pendingTurnContext === undefined ? undefined : await pendingTurnContext;
+
     const restoreConsoleError = this.options.suppressSdkConsoleErrors
       ? installSdkConsoleErrorSuppression()
       : undefined;
@@ -2372,7 +2395,7 @@ export class AcpClient {
     try {
       promptPromise = this.runConnectionRequest(() =>
         connection.prompt({
-          ...buildPromptRequest(sessionId, normalizedPrompt, options),
+          ...buildPromptRequest(sessionId, normalizedPrompt, options, composedTurnContext),
         }),
       );
     } catch (error) {
@@ -2394,14 +2417,60 @@ export class AcpClient {
       this.throwPromptPermissionFailureIfPresent(sessionId);
       throw error;
     } finally {
-      restoreConsoleError?.();
-      if (this.activePrompt?.promise === promptPromise) {
-        this.activePrompt = undefined;
-      }
-      this.cancellingSessionIds.delete(sessionId);
-      this.abortAndDropPermissionSignal(sessionId);
-      this.promptPermissionFailures.delete(sessionId);
+      this.settlePromptBookkeeping(sessionId, promptPromise, restoreConsoleError);
     }
+  }
+
+  /**
+   * THE SYNCHRONOUS GUARD for per-turn context injection (`src/acp/turn-context.ts`).
+   *
+   * Returns `undefined` **synchronously** — no promise allocated, no microtask queued — when
+   * the turn is not opted in or there is nothing to inject. That is an implementation
+   * constraint, not a style choice: unconditionally `await`ing a `resolveTurnContext()` that
+   * short-circuits internally would still cost a promise and a microtask tick on EVERY turn
+   * with the registry empty, i.e. in production as shipped. That would both break the
+   * inertness claim and make the latency measurement measure a microtask the claim never
+   * included.
+   *
+   * `agentSpawnEnv`, and **no `process.env` fallback anywhere**: a provider must see the
+   * environment the SESSION's agent process was spawned with, never the spawner's. Before
+   * `start()` has captured it there is no session env, and an empty object is the honest
+   * answer — falling back to acpx's own env is exactly the defect this rule exists to
+   * prevent, and it is silent at runtime.
+   */
+  private maybeResolveTurnContext(
+    sessionId: string,
+    options: AcpPromptOptions | undefined,
+  ): Promise<string | undefined> | undefined {
+    if (options?.turnContext !== true) {
+      return undefined;
+    }
+    const sessionEnv = this.agentSpawnEnv ?? {};
+    if (!hasTurnContextProviders(sessionEnv)) {
+      return undefined;
+    }
+    return resolveTurnContext(
+      buildTurnContextRequest({
+        sessionId,
+        agentCommand: this.options.agentCommand,
+        sessionEnv,
+      }),
+    );
+  }
+
+  /** Per-prompt teardown: restore stderr suppression and drop this turn's bookkeeping. */
+  private settlePromptBookkeeping(
+    sessionId: string,
+    promptPromise: Promise<PromptResponse>,
+    restoreConsoleError: (() => void) | undefined,
+  ): void {
+    restoreConsoleError?.();
+    if (this.activePrompt?.promise === promptPromise) {
+      this.activePrompt = undefined;
+    }
+    this.cancellingSessionIds.delete(sessionId);
+    this.abortAndDropPermissionSignal(sessionId);
+    this.promptPermissionFailures.delete(sessionId);
   }
 
   private normalizePromptForAgent(prompt: PromptInput | string): PromptInput {

@@ -14,7 +14,7 @@
  *   openrouter model                → PICKER route (here): the picked slug, on the
  *                                     BOX key from `~/.acpx/providers.json`.
  *   a profile, no OpenRouter model  → the profile's own auth (`applyProfileAuth`,
- *                                     subscription/claude-home/chatgpt only — the
+ *                                     subscription/chatgpt only — the
  *                                     `openrouter`-authMode profile kind that used
  *                                     to also take this branch was retired, brick
  *                                     777b4be7). Untouched by this module.
@@ -314,7 +314,7 @@ export async function resolveOpenRouterRoute(params: {
  * Why this profile is NOT used on the picker route.
  *
  * ⚠️ NO PROFILE KIND CAN BE AN OPENROUTER ACCOUNT ANYMORE. This function used to
- * distinguish a real subscription/claude-home/chatgpt profile from an
+ * distinguish a real subscription/chatgpt profile from an
  * OpenRouter-authMode one, which was the only kind that could name a genuine
  * second account (brick 069fdebe) — refused by `assertNoOpenRouterProfileConflict`,
  * removed along with that profile kind (brick 777b4be7). Every resolvable profile

@@ -60,7 +60,7 @@ test("classifyFailover maps the auth-required ACP code (-32000) to auth_failed",
   );
 });
 
-// S1 — THE CRUX. A claude-pty bridge whose stored Claude login expired throws a
+// S1 — THE CRUX. An adapter whose stored Claude login expired throws a
 // generic AdapterHealthError on the catch-all code -32000 carrying
 // data.reason/state === "auth-gated". This MUST classify as "auth_gated" (a
 // distinct, non-quota trigger), NOT "auth_failed" — otherwise it rides the

@@ -39,13 +39,7 @@ import { nativeAgentTypesForSource } from "./harness-models.js";
 import { searchModels } from "./matcher.js";
 import type { CatalogueModel, ModelCatalogue } from "./types.js";
 
-const KNOWN_SOURCE_PREFIXES = new Set([
-  "openrouter",
-  "claude-subscription",
-  "claude-home",
-  "chatgpt",
-  "claude-pty",
-]);
+const KNOWN_SOURCE_PREFIXES = new Set(["openrouter", "claude-subscription", "chatgpt"]);
 
 export class ModelSlugError extends AcpxOperationalError {
   /**
@@ -467,7 +461,7 @@ export function candidatesFor(
  * MEASURED 2026-09-04T00:27Z, and it is why this function exists: a first cut
  * refused on "more than one source", and `acpx claude sessions new --model
  * sonnet` — which works on the deployed CLI today — exited 2, because `sonnet`
- * is a row under BOTH `claude-subscription` and `claude-home`. Those two are
+ * was a row under BOTH `claude-subscription` and a second Claude source. Those two were
  * the same weights on the same plan class reached through a different
  * credential, and the credential is what `--profile` / `--subscription` select;
  * `--model` has never meant a source. So a split that costs the same is not an
@@ -644,7 +638,7 @@ export async function validateModelSelectionFromCache(
  * honest remedy is the LATE error `assertRequestedModelSupported` already emits
  * (brick a5eddb8d §5). Do not "repair" the table on the strength of one seat.
  */
-const NATIVE_MODEL_LIST_AGENTS = new Set(["claude", "claude-pty", "codex"]);
+const NATIVE_MODEL_LIST_AGENTS = new Set(["claude", "codex"]);
 
 /**
  * Whether acpx can judge a `--model` for this session at all. TWO ARMS, and they
@@ -665,7 +659,7 @@ const NATIVE_MODEL_LIST_AGENTS = new Set(["claude", "claude-pty", "codex"]);
  * a bogus id was accepted at create and died only at turn time — the wire check
  * is structurally incapable of catching it, and deferring to it is not an option.
  * MEASURED 2026-09-06 at 11cadc6e on the box's real cache: of 430 OpenRouter rows,
- * 293 carry `availability.pi.ok === true` (0 for claude / claude-pty / codex), and
+ * 293 carry `availability.pi.ok === true` (0 for claude / codex), and
  * all 430 carry an entry for each — so the catalogue does answer for pi, and an
  * empty-map false negative is excluded.
  *

@@ -1,12 +1,5 @@
-import fs from "node:fs";
 import type { SessionRecord } from "../types.js";
-import {
-  parseSeatStore,
-  readSeatStore,
-  seatFromStore,
-  seatStorePath,
-  type SeatRecord,
-} from "./persistence/seat-store.js";
+import { readSeatStore, seatFromStore, type SeatRecord } from "./persistence/seat-store.js";
 
 /**
  * THE ONE PLACE THAT DECIDES A SESSION'S BRICK (brick fb1a7a9c; Daniel,
@@ -81,45 +74,6 @@ export async function decideSessionBrick(
     }
   }
   return decideBrick(seat, subject.metadata);
-}
-
-/** The synchronous twin, for the callers that decide inside a sync lock (the brick outbox).
- * Same fail-open contract; the SAME `decideBrick`, so the two cannot drift. */
-export function decideSessionBrickSync(
-  subject: BrickSubject,
-  sessionDir: string,
-): DecidedBrick | undefined {
-  let seat: SeatRecord | undefined;
-  if (subject.seatId !== undefined) {
-    try {
-      const storePath = seatStorePath(sessionDir);
-      seat = seatFromStore(
-        parseSeatStore(fs.readFileSync(storePath, "utf8"), storePath),
-        subject.seatId,
-      );
-    } catch {
-      seat = undefined;
-    }
-  }
-  return decideBrick(seat, subject.metadata);
-}
-
-/** The synchronous twin, for the callers that read inside a sync lock (the brick outbox).
- * Same fail-open contract: any unreadable store, a missing seat or a blank name is `null`. */
-export function seatNameSync(seatId: string | undefined, sessionDir: string): string | null {
-  if (seatId === undefined) {
-    return null;
-  }
-  try {
-    const storePath = seatStorePath(sessionDir);
-    const name = seatFromStore(
-      parseSeatStore(fs.readFileSync(storePath, "utf8"), storePath),
-      seatId,
-    )?.name;
-    return name?.trim() || null;
-  } catch {
-    return null;
-  }
 }
 
 /**

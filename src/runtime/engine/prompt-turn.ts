@@ -9,7 +9,7 @@ type PromptTurnClient = {
   prompt: (
     sessionId: string,
     prompt: PromptInput | string,
-    options?: { messageId?: string },
+    options?: { messageId?: string; turnContext?: boolean },
   ) => Promise<{ stopReason: RunPromptResult["stopReason"]; _meta?: unknown }>;
   waitForSessionUpdatesIdle?: (options?: { idleMs?: number; timeoutMs?: number }) => Promise<void>;
 };
@@ -93,8 +93,18 @@ export async function runPromptTurn(params: {
   steered?: boolean;
 }> {
   try {
+    // ⚠️ THE ONLY PLACE IN THE CODEBASE THAT OPTS INTO PER-TURN CONTEXT INJECTION
+    // (`src/acp/turn-context.ts`). `runPromptTurn` IS the new-turn path: both the main
+    // sequential queue turn and the engine runtime turn reach this line, so one flag covers
+    // both. Every other `AcpClient.prompt` caller is excluded by not being touched —
+    // specifically the MID-TURN INJECTED prompt (which would double-inject inside a single
+    // turn, framing a steer as a fresh turn) and the `runOnce` one-shot path (whose single
+    // turn has no previous turn for a delta to be relative to).
+    // If a new new-turn path ever appears that does not route through here, it goes
+    // UNDECORATED — the deliberate, safe failure direction.
     const promptPromise = params.client.prompt(params.sessionId, params.prompt, {
       messageId: params.messageId,
+      turnContext: true,
     });
     await params.onPromptStarted?.();
     const response = await withTimeout(promptPromise, params.timeoutMs);

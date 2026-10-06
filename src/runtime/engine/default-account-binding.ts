@@ -1,4 +1,4 @@
-import { isClaudeAcpCommand, isClaudePtyAgentCommand } from "../../acp/agent-command.js";
+import { isClaudeAcpCommand } from "../../acp/agent-command.js";
 import { splitCommandLine } from "../../acp/client-process.js";
 import { isCodexAcpCommand } from "../../acp/codex-compat.js";
 import {
@@ -80,9 +80,6 @@ function wantsAutoSelection(options: SessionAgentOptions | undefined): boolean {
 }
 
 function adapterForAgentCommand(agentCommand: string): AdapterId | undefined {
-  if (isClaudePtyAgentCommand(agentCommand)) {
-    return "claude-pty";
-  }
   const split = splitCommandLine(agentCommand);
   if (isCodexAcpCommand(split.command, split.args)) {
     return "codex";

@@ -11,12 +11,11 @@ import { AGENT_REGISTRY } from "../src/agent-registry.js";
 
 // Unified OS-primer injection at the acpx layer (CONCEPTION §4). acpx runs the
 // session-context primer once per process and routes it to the right `_meta`
-// channel per agent type: claude/claude-pty → `systemPrompt {append}`, codex →
+// channel per agent type: claude → `systemPrompt {append}`, codex →
 // `codex.developerInstructions`, unknown agents → nothing. Re-supplied on cold
 // resume for the system-prompt channels only (codex restores from thread).
 
 const SDK_CLAUDE_COMMAND = "node /opt/claude-agent-acp/dist/index.js";
-const CLAUDE_PTY_COMMAND = "node /opt/claude-pty-acp/dist/index.js";
 const CODEX_COMMAND = "node /opt/codex-acp/dist/index.js";
 const UNKNOWN_COMMAND = "node ./test/mock-agent.js";
 
@@ -26,16 +25,11 @@ const PRIMER_SEPARATOR = "\n\n---\n\n";
 // §4.3 — channel routing by agent type (substring detectors)
 // ---------------------------------------------------------------------------
 
-test("resolvePrimerChannel: claude + claude-pty route to the system-prompt channel", () => {
+test("resolvePrimerChannel: claude routes to the system-prompt channel", () => {
   assert.equal(resolvePrimerChannel(SDK_CLAUDE_COMMAND), "system-prompt");
-  assert.equal(resolvePrimerChannel(CLAUDE_PTY_COMMAND), "system-prompt");
   // dev override forms still match (substring, not exact registry string)
   assert.equal(
     resolvePrimerChannel("node /workspace/projects/claude-agent-acp/dev/dist/index.js"),
-    "system-prompt",
-  );
-  assert.equal(
-    resolvePrimerChannel("node /workspace/projects/claude-pty-acp/main/acp-server-transcript.mjs"),
     "system-prompt",
   );
 });
@@ -362,16 +356,6 @@ test("createSession (claude): primer rides _meta.systemPrompt {append}", async (
     stubConnection(client, captured);
     await client.createSession("/tmp/acpx-primer-claude");
     assert.match(systemPromptAppend(captured.newSessionMeta) ?? "", /PRIMER-CLAUDE/);
-  });
-});
-
-test("createSession (claude-pty): primer rides _meta.systemPrompt {append}", async () => {
-  await withPrimerScript("printf 'PRIMER-PTY\\n'", async () => {
-    const captured: CapturedConnection = {};
-    const client = makeClient(CLAUDE_PTY_COMMAND);
-    stubConnection(client, captured);
-    await client.createSession("/tmp/acpx-primer-pty");
-    assert.match(systemPromptAppend(captured.newSessionMeta) ?? "", /PRIMER-PTY/);
   });
 });
 

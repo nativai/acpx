@@ -26,7 +26,6 @@
  * `4145fe1e/reports/W2-wire-id-shapes-and-reason-split.md`):
  *
  *     claude       bare alias, no prefix, no bracket   `sonnet`
- *     claude-pty   bare alias, no prefix, no bracket   `sonnet`
  *     codex        no prefix, bracket MANDATORY        `gpt-5.6-sol[medium]`
  *     pi           source + "/" + id                   `openrouter/qwen/qwen3-coder-flash`
  *

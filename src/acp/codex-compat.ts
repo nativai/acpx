@@ -1,18 +1,16 @@
-import path from "node:path";
+import { commandCarriesAdapterToken } from "./adapter-token.js";
 
-function basenameToken(value: string): string {
-  return path
-    .basename(value)
-    .toLowerCase()
-    .replace(/\.(cmd|exe|bat)$/u, "");
-}
+const CODEX_ACP_TOKEN = "codex-acp";
 
+/**
+ * brick://5a7cf1f0 — SEGMENT match, not substring. This answer gates Codex
+ * admission and selects the primer channel, so a false positive both caps a
+ * non-Codex session and blocks it outright whenever acpx-ui is unreachable. The
+ * full rationale, the genuine spellings it must keep matching, and the one known
+ * residual are in `adapter-token.ts`.
+ */
 export function isCodexAcpCommand(command: string, args: readonly string[]): boolean {
-  const commandToken = basenameToken(command);
-  if (commandToken === "codex-acp") {
-    return true;
-  }
-  return args.some((arg) => arg.includes("codex-acp"));
+  return commandCarriesAdapterToken(command, args, CODEX_ACP_TOKEN);
 }
 
 export function isLegacyZedCodexAcpInvocation(agentCommand: string): boolean {

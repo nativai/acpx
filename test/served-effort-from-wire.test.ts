@@ -243,7 +243,7 @@ test("F-14 GUARDRAIL: the Claude family still records nothing", async () => {
   // `recordDepthOutcome` is a no-op for the Claude family and must stay so —
   // their records are required to remain byte-comparable.
   const ladder = ["low", "high", "max"];
-  for (const id of ["claude", "claude-pty"] as const) {
+  for (const id of ["claude"] as const) {
     const rec = { agentCommand: AGENT_REGISTRY[id], acpx: {} } as unknown as SessionRecord;
     const client = agent({ acknowledgeAs: "max", ladder });
     await persistAndApplyRequestedEffort({

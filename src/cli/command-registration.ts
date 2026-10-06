@@ -23,6 +23,7 @@ import {
   handleSessionsPrune,
   handleSessionsRecover,
   handleSessionsReopen,
+  handleSessionsReindex,
   handleSessionsRepairAccountSeam,
   handleSessionsSetMetadata,
   handleSessionsActivate,
@@ -33,6 +34,7 @@ import {
   handleSessionsTemplatesMigrateSlugs,
   handleSessionsTemplatesRollback,
   handleListOutputStyles,
+  handleModelCatalogue,
   handleSetConfigOption,
   handleSetMode,
   parseHistoryLimit,
@@ -88,6 +90,7 @@ type SharedSubcommandDescriptions = {
   setMode: string;
   setConfig: string;
   outputStyles: string;
+  modelCatalogue: string;
   status: string;
 };
 
@@ -167,6 +170,16 @@ export function registerSessionsCommand(
     .option("--dry-run", "Preview slug/version assignments without writing records")
     .action(async function (this: Command, flags: { dryRun?: boolean }) {
       await handleSessionsTemplatesMigrateSlugs(flags, this, config);
+    });
+
+  sessionsCommand
+    .command("reindex")
+    .description(
+      "Re-project every session-index entry from its own record (reads records, rewrites only " +
+        "index.json; idempotent) — the backfill after an acpx upgrade adds an index field",
+    )
+    .action(async function (this: Command) {
+      await handleSessionsReindex(this, config);
     });
 
   sessionsCommand
@@ -934,6 +947,15 @@ export function registerSharedAgentSubcommands(
     await handleListOutputStyles(explicitAgentName, flags, this, config);
   });
 
+  // brick 574b137e — the adapter's advertised model catalogue, read through the
+  // same transient session as `output-styles`: no prompt, no record written.
+  parent
+    .command("model-catalogue")
+    .description(descriptions.modelCatalogue)
+    .action(async function (this: Command) {
+      await handleModelCatalogue(explicitAgentName, this, config);
+    });
+
   registerStatusCommand(parent, explicitAgentName, config, descriptions.status);
 }
 
@@ -965,6 +987,8 @@ export function registerAgentCommand(
       "Set session config option (special keys: `model`, `subscription` <id> — switch the Claude subscription in place; `profile` <id> — move the session to a different credential profile, SDK sub1↔sub2 or bridge1↔bridge2; `outputStyle` <name> — set the Claude Code output style, accepted even mid-turn and bound when the turn ends)",
     outputStyles:
       "List the output styles this agent offers (pass --session-id to read a session's own advertised list instead of opening a transient one)",
+    modelCatalogue:
+      "Print the model catalogue this agent's adapter advertises (transient session; writes no session record)",
     status: "Show local status of current session agent process",
   });
 
@@ -1003,6 +1027,7 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
     setMode: `Set session mode for ${config.defaultAgent} by default`,
     setConfig: `Set session config option for ${config.defaultAgent} by default (special keys: \`model\`, \`subscription\` <id>, \`profile\` <id> — move the session's credential, SDK sub1↔sub2 or bridge1↔bridge2; \`outputStyle\` <name>)`,
     outputStyles: `List the output styles ${config.defaultAgent} offers`,
+    modelCatalogue: `Print the model catalogue ${config.defaultAgent}'s adapter advertises`,
     status: `Show local status for ${config.defaultAgent} by default`,
   });
 

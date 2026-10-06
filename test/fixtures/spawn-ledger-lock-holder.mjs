@@ -3,8 +3,8 @@ import { DatabaseSync } from "node:sqlite";
 const file = process.argv[2];
 const marker = process.argv[3];
 if (
-  !file?.startsWith("/workspace/bricksdb-b14-selftest/") ||
-  !marker?.startsWith("/workspace/bricksdb-b14-selftest/")
+  !file?.startsWith("/workspace/spawn-ledger-selftest/") ||
+  !marker?.startsWith("/workspace/spawn-ledger-selftest/")
 ) {
   process.exit(2);
 }

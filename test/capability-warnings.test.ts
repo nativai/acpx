@@ -122,9 +122,9 @@ test("output-style support is a descriptor read, and only the Claude family has 
 
 test("a live model change is ALLOWED on every harness acpx can actually route", () => {
   // The positive control: the refusal must not have broken `set model` itself.
-  // claude / claude-pty / pi are `set-model`; codex is `compose-into-id`. Both
+  // claude / pi are `set-model`; codex is `compose-into-id`. Both
   // mechanisms are in MODEL_MECHANISMS_ROUTED_BY_ACPX.
-  for (const id of ["claude", "claude-pty", "codex", "pi"] as const) {
+  for (const id of ["claude", "codex", "pi"] as const) {
     assert.doesNotThrow(() => assertLiveModelChangeRoutable(recordFor(AGENT_REGISTRY[id])), id);
   }
 });

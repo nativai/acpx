@@ -98,13 +98,6 @@ const MAY_TOUCH_THE_CACHE: Readonly<Record<string, { hits: number; why: string }
     hits: 1,
     why: "operator-facing MESSAGE text only (L4's surface); no read",
   },
-  "src/brick-outbox.ts": {
-    hits: 8,
-    why:
-      "7 WRITERS that project a brick CLI result onto the cache, and ONE read of the ON-DISK " +
-      "cache as 'what was last published' (the tombstone target). The projection target is " +
-      "decided through decidedBrick() -> the decider, not read here (fb1a7a9c F4).",
-  },
 };
 
 function rawCacheReadLines(source: string): number[] {
