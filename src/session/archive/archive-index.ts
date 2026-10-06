@@ -29,7 +29,10 @@ export type ArchiveIndexEntry = {
   reason: string;
   wave: string;
   kind?: string;
-  /** ⚠️ NOT `clean()`ed — faithful and JSON-escaped, unlike the manifest's column 10. */
+  /**
+   * The SEAT's display name captured at archive time (D3) — the record has none. Faithful and
+   * JSON-escaped on a live archive; a reindex restores it from the manifest's lossy column 10.
+   */
   name?: string;
   cwd?: string;
   agentName?: string;

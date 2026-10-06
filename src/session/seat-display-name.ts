@@ -1,6 +1,18 @@
 import type { SessionRecord } from "../types.js";
 import { sessionBaseDir } from "./persistence.js";
-import { readSeatStore, seatFromStore } from "./persistence/seat-store.js";
+import { readSeatStore, seatFromStore, type SeatStore } from "./persistence/seat-store.js";
+
+/** The seat's trimmed, non-empty name from an already-read store; `undefined` otherwise. */
+export function seatNameFromStore(
+  store: SeatStore,
+  seatId: string | undefined,
+): string | undefined {
+  if (seatId === undefined) {
+    return undefined;
+  }
+  const trimmed = seatFromStore(store, seatId)?.name?.trim();
+  return trimmed ? trimmed : undefined;
+}
 
 /**
  * The DISPLAY label for a session: its SEAT's name (D-IDENTITY, brick 61dc1302 —
@@ -17,11 +29,7 @@ export async function seatDisplayName(
 ): Promise<string | undefined> {
   if (record.seatId !== undefined) {
     try {
-      const name = seatFromStore(await readSeatStore(sessionBaseDir()), record.seatId)?.name;
-      const trimmed = name?.trim();
-      if (trimmed) {
-        return trimmed;
-      }
+      return seatNameFromStore(await readSeatStore(sessionBaseDir()), record.seatId);
     } catch {
       // display-only: a label never fails a spawn
     }

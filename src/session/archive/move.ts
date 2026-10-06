@@ -99,6 +99,7 @@ function isoOrEmpty(value: string | undefined): string {
  */
 function recordColumnsFor(
   view: ArchiveRecordView | undefined,
+  seatName: string | undefined,
 ): Pick<ArchiveManifestRow, "closed" | "closedAt" | "lastUsedAt" | "kind" | "name" | "brick"> {
   if (!view) {
     // An orphan has no record: columns 6-11 are empty, by contract.
@@ -109,7 +110,8 @@ function recordColumnsFor(
     closedAt: isoOrEmpty(view.closedAt),
     lastUsedAt: isoOrEmpty(view.lastUsedAt ?? view.updatedAt ?? view.createdAt),
     kind: isoOrEmpty(view.kind),
-    name: isoOrEmpty(view.name),
+    // D3: the SEAT's display name, captured at archive time — the record has none.
+    name: isoOrEmpty(seatName),
     brick: isoOrEmpty(view.brick),
   };
 }
@@ -119,9 +121,10 @@ export function buildArchiveRows(
   id: string,
   reason: string,
   view: ArchiveRecordView | undefined,
+  seatName: string | undefined,
   stats: readonly FileStat[],
 ): ArchiveManifestRow[] {
-  const recordColumns = recordColumnsFor(view);
+  const recordColumns = recordColumnsFor(view, seatName);
   return stats.map((stat) => ({
     at: writer.at,
     wave: writer.wave,
