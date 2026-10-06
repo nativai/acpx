@@ -31,7 +31,6 @@ export type ArchiveRecordView = {
   updatedAt: string | undefined;
   createdAt: string | undefined;
   kind: string | undefined;
-  name: string | undefined;
   cwd: string | undefined;
   agentName: string | undefined;
   brick: string | undefined;
@@ -40,7 +39,8 @@ export type ArchiveRecordView = {
   hasTemplate: boolean;
   /** `$.seat_id` — absent on a pre-seat record. Together with `holderActive`,
    * this is what lets the archiver ask "is this record the ACTIVE holder of a
-   * starred seat" (D-STAR). */
+   * starred seat" (D-STAR), and what the archiver resolves the archive-time
+   * display NAME from (D3): the record carries no name, the seat does. */
   seatId: string | undefined;
   /** `$.holder_active === true` — see `seatId` above. */
   holderActive: boolean;
@@ -142,7 +142,6 @@ export function projectArchiveRecord(parsed: unknown): ArchiveRecordView | undef
     updatedAt: optionalString(record.updated_at),
     createdAt: optionalString(record.created_at),
     kind: optionalString(record.kind),
-    name: optionalString(record.name) ?? optionalString(record.title),
     cwd: optionalString(record.cwd),
     agentName: optionalString(record.agent_name),
     brick: metadataString(metadata, "brick"),

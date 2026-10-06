@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { readSeatStore } from "../persistence/seat-store.js";
+import { readSeatStore, type SeatStore } from "../persistence/seat-store.js";
+import { seatNameFromStore } from "../seat-display-name.js";
 import {
   buildArchiveIndexEntry,
   listArchiveIndexShardKeys,
@@ -11,7 +12,12 @@ import {
   type ArchiveIndexEntry,
 } from "./archive-index.js";
 import { claimArchiveFileSets, findRecordFile, recordFileNameFor } from "./identity.js";
-import { ArchiveManifestWriter, foldArchiveManifest, type ManifestFold } from "./manifest.js";
+import {
+  ArchiveManifestWriter,
+  foldArchiveManifest,
+  type ManifestFold,
+  type ManifestFoldEntry,
+} from "./manifest.js";
 import {
   ArchiveRefusal,
   assertSameDevice,
@@ -212,11 +218,19 @@ export async function applyArchiveRun(options: ArchiveRunOptions): Promise<Archi
 
   await assertSameDevice(context.hotDir, context.archiveDir);
 
+  const seatStore = await readSeatStoreForNames(context, result.warnings);
   const writer = await ArchiveManifestWriter.open(context.archiveDir, context.at, context.wave);
   const shardEntries: ArchiveIndexEntry[] = [];
   try {
     for (const planned of plan.selected) {
-      const entry = await archiveOneId(context, writer, planned, options.boundaries, result);
+      const entry = await archiveOneId(
+        context,
+        writer,
+        planned,
+        options.boundaries,
+        seatStore,
+        result,
+      );
       if (entry) {
         shardEntries.push(entry);
       }
@@ -231,11 +245,32 @@ export async function applyArchiveRun(options: ArchiveRunOptions): Promise<Archi
   return result;
 }
 
+/**
+ * D3: the seat store, read ONCE per apply run, for the archive-time name capture.
+ *
+ * ⚠️ A NAME IS DISPLAY-ONLY AND MUST NEVER STOP AN ARCHIVE. An unreadable store
+ * archives every row nameless — and says so, loudly, so the gap is not silent.
+ */
+async function readSeatStoreForNames(
+  context: ArchiveContext,
+  warnings: string[],
+): Promise<SeatStore | undefined> {
+  try {
+    return await readSeatStore(context.hotDir);
+  } catch (error) {
+    warnings.push(
+      `seat store unreadable (${(error as Error).message}): this run's archived rows carry NO seat name`,
+    );
+    return undefined;
+  }
+}
+
 async function archiveOneId(
   context: ArchiveContext,
   writer: ArchiveManifestWriter,
   planned: PlannedArchive,
   boundaries: RetentionBoundaries,
+  seatStore: SeatStore | undefined,
   result: ArchiveRunResult,
 ): Promise<ArchiveIndexEntry | undefined> {
   const { candidate } = planned;
@@ -273,11 +308,16 @@ async function archiveOneId(
   }
 
   // Step 4: WRITE-AHEAD. The row block is on disk before the first rename.
+  const seatName =
+    seatStore && revalidated.view
+      ? seatNameFromStore(seatStore, revalidated.view.seatId)
+      : undefined;
   const rows = buildArchiveRows(
     writer,
     candidate.id,
     planned.reason,
     revalidated.view,
+    seatName,
     revalidated.stats,
   );
   await writer.appendIdBlock(rows);
@@ -306,18 +346,20 @@ async function archiveOneId(
   if (!revalidated.view) {
     return undefined;
   }
-  return indexEntryFor(context, planned, revalidated.view, outcome.moved.length, bytes);
+  return indexEntryFor(context, planned, revalidated.view, seatName, outcome.moved.length, bytes);
 }
 
 function indexEntryFor(
   context: ArchiveContext,
   planned: PlannedArchive,
   view: ArchiveRecordView,
+  seatName: string | undefined,
   files: number,
   bytes: number,
 ): ArchiveIndexEntry {
   return buildArchiveIndexEntry({
     ...projectIndexFields(view),
+    name: seatName,
     id: planned.candidate.id,
     archivedAt: context.at,
     reason: planned.reason,
@@ -958,6 +1000,10 @@ function resolveArchivedAt(
   return new Date(mtimeMs).toISOString();
 }
 
+function archivedNameFrom(row: ManifestFoldEntry | undefined): string | undefined {
+  return row?.name ? row.name : undefined;
+}
+
 async function rebuildEntry(
   context: ArchiveContext,
   safeId: string,
@@ -979,6 +1025,9 @@ async function rebuildEntry(
 
   return buildArchiveIndexEntry({
     ...projectIndexFields(read.view),
+    // D3: the name captured at archive time — the seat may have been renamed or deleted since,
+    // and the archived record has no name of its own. The manifest column is the only copy.
+    name: archivedNameFrom(manifestRow),
     id,
     archivedAt: resolveArchivedAt(context, id, recordFile, stats, fold),
     reason: manifestRow?.reason ?? "unknown",
@@ -999,9 +1048,6 @@ async function rebuildEntry(
 function projectIndexFields(view: ArchiveRecordView): Partial<ArchiveIndexEntry> {
   return {
     kind: view.kind,
-    // ⚠️ NOT clean()'ed — the shard carries the faithful, JSON-escaped value.
-    // Only MANIFEST.tsv's column 10 is lossy.
-    name: view.name,
     cwd: view.cwd,
     agentName: view.agentName,
     brick: view.brick,

@@ -64,19 +64,18 @@ const ALLOWED_NAME_READS: ReadonlyMap<string, { count: number; why: string }> = 
     },
   ],
   [
-    "session/archive/record-view.ts",
+    "session/archive/archive-index.ts",
     {
       count: 1,
-      why: "the ARCHIVE tier (cold store) is outside the seat model and untouched (B9 discarded)",
+      why: "the ARCHIVE tier's own shard row: it parses back the `name` the archive CAPTURED from the SEAT at archive time (D3, brick b0c59024) — not a record field; record-view.ts no longer reads a record name at all",
     },
   ],
   [
-    "session/archive/archive-index.ts",
-    { count: 1, why: "the ARCHIVE tier's own index row, same exemption" },
-  ],
-  [
     "cli/archive-command.ts",
-    { count: 1, why: "prints an ARCHIVE index row's name, same exemption" },
+    {
+      count: 1,
+      why: "prints an ARCHIVE shard row's seat-sourced name (D3, brick b0c59024)",
+    },
   ],
   ["session/archive/operations.ts", { count: 1, why: "an fs Dirent name in the archive sweep" }],
   ["session/archive/retention.ts", { count: 2, why: "fs Dirent names in the retention sweep" }],

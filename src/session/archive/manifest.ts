@@ -158,6 +158,8 @@ export type ManifestFoldEntry = {
   closedAt: string;
   /** Column 8, as it stood AT ARCHIVE TIME. Empty on a restore row. */
   lastUsedAt: string;
+  /** Column 10 — the SEAT's name captured at archive time (D3). Lossy (cleaned, 120 chars). */
+  name: string;
 };
 
 /** The immutable end-of-life anchor for one id — see `firstArchiveById`. */
@@ -298,5 +300,6 @@ function parseManifestLine(line: string): ManifestFoldEntry | undefined {
     reason: columns[4],
     closedAt: columns[6],
     lastUsedAt: columns[7],
+    name: columns[9],
   };
 }
