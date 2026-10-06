@@ -26,6 +26,7 @@ import { outputStyleChangePending } from "../session/output-style.js";
 import type { SessionAcpxState, SessionRecord } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import {
+  addSeatSelectorOption,
   addSessionNameOption,
   resolveAgentInvocation,
   resolveGlobalFlags,
@@ -764,6 +765,7 @@ export function registerStatusCommand(
 ): void {
   const statusCommand = parent.command("status").description(description);
   addSessionNameOption(statusCommand);
+  addSeatSelectorOption(statusCommand);
   statusCommand.action(async function (this: Command, flags: StatusFlags) {
     await handleStatus(explicitAgentName, flags, this, config);
   });

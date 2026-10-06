@@ -61,7 +61,16 @@ async function resolveSessionConnectionStatus(
   return classifyConnectionStatus(health);
 }
 
-export function printSessionsByFormat(sessions: SessionRecord[], format: OutputFormat): void {
+/**
+ * `sessions list` TEXT rows: `<id>[ [closed]]\t<cwd>\t<lastUsedAt>[\tseat <seat8> <name>]`.
+ * The seat column (hole #7) is APPENDED so the existing positional columns keep their
+ * places for any `cut -f` reader; it appears when the caller supplies `seatLabel`.
+ */
+export function printSessionsByFormat(
+  sessions: SessionRecord[],
+  format: OutputFormat,
+  seatLabel?: (session: SessionRecord) => string,
+): void {
   if (format === "json") {
     process.stdout.write(`${JSON.stringify(sessions)}\n`);
     return;
@@ -79,8 +88,9 @@ export function printSessionsByFormat(sessions: SessionRecord[], format: OutputF
 
   for (const session of sessions) {
     const closedMarker = session.closed ? " [closed]" : "";
+    const seatColumn = seatLabel ? `\t${seatLabel(session)}` : "";
     process.stdout.write(
-      `${session.acpxRecordId}${closedMarker}\t${session.cwd}\t${session.lastUsedAt}\n`,
+      `${session.acpxRecordId}${closedMarker}\t${session.cwd}\t${session.lastUsedAt}${seatColumn}\n`,
     );
   }
 }
@@ -262,16 +272,12 @@ function newSessionSeatJson(record: SessionRecord, seatUrl: string | undefined) 
   };
 }
 
-// STDERR, beside the `[acpx] created session` banner: stdout stays the bare record id, which
-// `ID=$(acpx sessions new)` consumers capture.
-function printNewSessionSeatLines(record: SessionRecord, seatUrl: string | undefined): void {
+// STDERR, after the banner (which names the seat — `printCreatedSessionBanner`): stdout stays
+// the bare record id, which `ID=$(acpx sessions new)` consumers capture.
+function printNewSessionSeatLines(record: SessionRecord): void {
   const seatId = record.seatId;
   if (!seatId) {
     return;
-  }
-  process.stderr.write(`seat: ${seatId}\n`);
-  if (seatUrl) {
-    process.stderr.write(`seat url: ${seatUrl}\n`);
   }
   if (record.holderActive === false) {
     process.stderr.write(
@@ -309,7 +315,7 @@ export function printNewSessionByFormat(record: SessionRecord, format: OutputFor
 
   process.stdout.write(`${record.acpxRecordId}\n`);
   if (format !== "quiet") {
-    printNewSessionSeatLines(record, seatUrl);
+    printNewSessionSeatLines(record);
   }
 }
 
@@ -337,6 +343,8 @@ export function printCopiedSessionByFormat(
         : { forkedAtMessageIndexRequested: record.forkedAtMessageIndexRequested }),
       ephemeral: record.metadata?.byway === "1",
       sessionUrl: composeSessionUrl(record),
+      // F6 — a copy/fork mints a NEW seat; its address is that seat, not the source's.
+      ...newSessionSeatJson(record, resolveSeatUrl(record.seatId)),
       ...(subscriptionSelection ? { subscriptionSelection } : {}),
     })
   ) {
@@ -537,6 +545,15 @@ export function printCreatedSessionBanner(
     return;
   }
 
+  // SEAT FIRST (hole #5): the seat is the address to hand out — it survives a handover; the
+  // session lines below name this one holder.
+  if (record.seatId) {
+    const seatUrl = resolveSeatUrl(record.seatId);
+    if (seatUrl) {
+      process.stderr.write(`[acpx] seat url: ${seatUrl}\n`);
+    }
+    process.stderr.write(`[acpx] seat: ${record.seatId}\n`);
+  }
   process.stderr.write(`[acpx] created session ${record.acpxRecordId}\n`);
   process.stderr.write(`[acpx] agent: ${agentName}\n`);
   process.stderr.write(`[acpx] cwd: ${record.cwd}\n`);

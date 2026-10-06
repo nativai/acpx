@@ -312,11 +312,15 @@ test("#5 · the `sessions new` stderr banner opens with the ?seat= URL; the ?ses
     assert.equal(result.code, 0, result.stderr);
     const id = result.stdout.split("\n")[0];
     const seatId = String((await rig.onDisk(id)).seat_id);
+    // The banner proper — a first run on a fresh store prints an unrelated index-rebuild
+    // notice ABOVE it, so "first stderr line" is not the banner's first line.
     const lines = result.stderr.split("\n").filter((line) => line.length > 0);
-    assert.ok(lines[0]?.includes(`${UI_BASE}/?seat=${seatId}`), result.stderr);
-    const seatLine = lines.findIndex((line) => line.includes(`?seat=${seatId}`));
+    const seatLine = lines.indexOf(`[acpx] seat url: ${UI_BASE}/?seat=${seatId}`);
+    const createdLine = lines.indexOf(`[acpx] created session ${id}`);
     const sessionLine = lines.findIndex((line) => line.includes(`?session=${id}`));
-    assert.ok(sessionLine > seatLine, result.stderr);
+    assert.ok(seatLine >= 0, result.stderr);
+    assert.ok(seatLine < createdLine, `the seat is not first in the banner:\n${result.stderr}`);
+    assert.ok(createdLine < sessionLine, result.stderr);
   });
 });
 
@@ -354,6 +358,46 @@ test("#16 · the ⟦FORK-NOTICE⟧ names the fork's NEW seat and $ACPX_SEAT_URL,
     // `printenv | grep ACPX_` puts every ACPX_* value — credentials included — into the
     // transcript, where it is re-sent on every later turn.
     assert.doesNotMatch(notice, /printenv/);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.ACPX_UI_BASE_URL;
+    } else {
+      process.env.ACPX_UI_BASE_URL = previous;
+    }
+  }
+});
+
+test("#16 · the notice names the SOURCE's seat as the source's; a seat-less record still gets no env dump", () => {
+  const previous = process.env.ACPX_UI_BASE_URL;
+  process.env.ACPX_UI_BASE_URL = UI_BASE;
+  try {
+    const sourceSeat = "cccccccc-dddd-4eee-8fff-000000000000";
+    const fork = makeSessionRecord({
+      acpxRecordId: "11111111-2222-4333-8444-555555555555",
+      acpSessionId: "11111111-2222-4333-8444-555555555555",
+      agentCommand: "agent",
+      cwd: "/tmp",
+      seatId: "66666666-7777-4888-8999-aaaaaaaaaaaa",
+    });
+    const notice = composeForkDivergenceNotice(
+      fork,
+      "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+      sourceSeat,
+    );
+    assert.ok(
+      notice.includes(`(seat ${sourceSeat}) — that seat is the SOURCE's, not yours`),
+      notice,
+    );
+
+    const seatless = makeSessionRecord({
+      acpxRecordId: "11111111-2222-4333-8444-555555555555",
+      acpSessionId: "11111111-2222-4333-8444-555555555555",
+      agentCommand: "agent",
+      cwd: "/tmp",
+    });
+    const legacy = composeForkDivergenceNotice(seatless, "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff");
+    assert.ok(legacy.includes(`${UI_BASE}/?session=${seatless.acpxRecordId}`), legacy);
+    assert.doesNotMatch(legacy, /\?seat=|printenv/);
   } finally {
     if (previous === undefined) {
       delete process.env.ACPX_UI_BASE_URL;

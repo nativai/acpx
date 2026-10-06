@@ -1,24 +1,109 @@
 import { InvalidArgumentError, type Command } from "commander";
-import { normalizeName, resolveSessionRecord } from "../session/persistence.js";
+import {
+  normalizeName,
+  parseSeatRefOrThrow,
+  readSeatStore,
+  resolveSessionRecord,
+  seatFromStore,
+  sessionBaseDir,
+} from "../session/persistence.js";
 import type { SessionRecord } from "../types.js";
 import { resolveSessionSelectorFromFlags, type SessionSelectorFlags } from "./flags.js";
 
 export type SessionTargetSelector = {
   sessionId?: string;
   sessionUrl?: string;
+  /** `--seat <uuid|?seat= url>` — resolved to the seat's ACTIVE holder at call time. */
+  seat?: string;
 };
 
-export function parseSessionIdFromUrl(url: string | undefined): string | undefined {
+function urlParam(url: string | undefined, key: "session" | "seat"): string | undefined {
   if (!url) {
     return undefined;
   }
   try {
-    const parsed = new URL(url);
-    const id = parsed.searchParams.get("session");
+    const id = new URL(url).searchParams.get(key);
     return id && id.trim().length > 0 ? id : undefined;
   } catch {
     return undefined;
   }
+}
+
+export function parseSessionIdFromUrl(url: string | undefined): string | undefined {
+  return urlParam(url, "session");
+}
+
+/** The `?seat=<id>` of an acpx-ui URL, when it carries one (unvalidated). */
+export function parseSeatIdFromUrl(url: string | undefined): string | undefined {
+  return urlParam(url, "seat");
+}
+
+/**
+ * A seat reference — a seat id, or an acpx-ui URL carrying `?seat=<id>` — reduced to the
+ * seat id, validated at this origin (D8: rejected, never repaired). A URL naming BOTH a
+ * seat and a session is refused: it names two agents, and picking one silently is the
+ * defect class this resolver exists to close.
+ */
+export function seatIdFromRef(label: string, value: string): string {
+  if (value.includes("?") || value.includes("://")) {
+    if (parseSessionIdFromUrl(value) !== undefined && parseSeatIdFromUrl(value) !== undefined) {
+      throw new InvalidArgumentError(
+        `${label} names both ?seat= and ?session= — pass one address, not two`,
+      );
+    }
+    const seatId = parseSeatIdFromUrl(value);
+    if (seatId === undefined) {
+      throw new InvalidArgumentError(`${label} must be a seat id or a URL carrying ?seat=<id>`);
+    }
+    return parseSeatRefOrThrowAsArgument(label, seatId);
+  }
+  return parseSeatRefOrThrowAsArgument(label, value);
+}
+
+function parseSeatRefOrThrowAsArgument(label: string, value: string): string {
+  try {
+    return parseSeatRefOrThrow(label, value);
+  } catch (error) {
+    throw new InvalidArgumentError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+/**
+ * THE ONE SEAT → HOLDER RESOLVER (hole #18; shared by `--parent-seat`, `set-parent` and the
+ * `--seat` selector). Reads the seat row fresh at CALL time and returns its ACTIVE holder,
+ * so an address held across a succession reaches the successor.
+ *
+ * Every unresolvable case is a refusal that names its own cause — never a fallback to the
+ * caller's own session, which is what made `--parent-session-url ?seat=` silently mis-parent
+ * (hole #1). Thrown as `NoSessionError` (exit 4): there is no session to address. An
+ * unhealthy store or a malformed row throws its own error from `seatFromStore` unchanged.
+ */
+export async function resolveSeatActiveHolder(
+  label: string,
+  value: string,
+): Promise<{ seatId: string; holderId: string }> {
+  const seatId = seatIdFromRef(label, value);
+  const store = await readSeatStore(sessionBaseDir());
+  const seat = seatFromStore(store, seatId);
+  if (!seat) {
+    throw new NoSessionError(
+      `${label}: seat ${seatId} is not in this box's seat store (${store.storePath}) — a typo, ` +
+        `a seat on another box, or a seat that predates the store (\`acpx seats list\` shows ` +
+        `the seats here).`,
+    );
+  }
+  if (seat.closedAt !== null) {
+    throw new NoSessionError(
+      `${label}: seat ${seatId} is closed (at ${seat.closedAt}) — a closed seat has no holder to address.`,
+    );
+  }
+  if (seat.activeHolderId === null) {
+    throw new NoSessionError(
+      `${label}: seat ${seatId} has no active holder (vacant) — activate one with ` +
+        `\`acpx sessions activate ${seatId} <session>\`.`,
+    );
+  }
+  return { seatId, holderId: seat.activeHolderId };
 }
 
 const SESSION_ID_LOOKS_LIKE_UUID_RE =
@@ -53,21 +138,28 @@ export function resolveSessionTargetSelector(params: {
   return {
     sessionId: flags.sessionId,
     sessionUrl: flags.sessionUrl,
+    seat: flags.seat,
   };
 }
 
 function assertSingleExplicitSelector(flags: SessionSelectorFlags): void {
-  if (flags.sessionId !== undefined && flags.sessionUrl !== undefined) {
-    throw new InvalidArgumentError("Pass only one of --session-id or --session-url");
+  const given = [flags.seat, flags.sessionId, flags.sessionUrl].filter((v) => v !== undefined);
+  if (given.length > 1) {
+    throw new InvalidArgumentError("Pass only one of --seat, --session-id or --session-url");
   }
 }
 
+/**
+ * The session id a selector names WITHOUT a seat lookup. A seat address (`--seat`, or a
+ * `--session-url` carrying `?seat=`) has no id until the store is read, so it yields
+ * `undefined` here; use `resolveExplicitSessionRecord` for those.
+ */
 export function explicitSessionIdFromSelector(selector: SessionTargetSelector): string | undefined {
   if (selector.sessionUrl !== undefined) {
     const id = parseSessionIdFromUrl(selector.sessionUrl);
     if (!id) {
       throw new InvalidArgumentError(
-        "--session-url must include a non-empty ?session=<id> query parameter",
+        "--session-url must include a non-empty ?session=<id> (or ?seat=<id>) query parameter",
       );
     }
     return id;
@@ -75,9 +167,24 @@ export function explicitSessionIdFromSelector(selector: SessionTargetSelector): 
   return selector.sessionId;
 }
 
+// A `--session-url` that carries `?seat=` (and no `?session=`) is a seat address.
+function seatRefFromSelector(selector: SessionTargetSelector): string | undefined {
+  if (selector.seat !== undefined) {
+    return selector.seat;
+  }
+  const url = selector.sessionUrl;
+  return url !== undefined && parseSeatIdFromUrl(url) !== undefined ? url : undefined;
+}
+
 export async function resolveExplicitSessionRecord(
   selector: SessionTargetSelector,
 ): Promise<SessionRecord | undefined> {
+  const seatRef = seatRefFromSelector(selector);
+  if (seatRef !== undefined) {
+    const label = selector.seat !== undefined ? "--seat" : "--session-url";
+    const { holderId } = await resolveSeatActiveHolder(label, seatRef);
+    return await resolveSessionRecord(holderId);
+  }
   const sessionId = explicitSessionIdFromSelector(selector);
   return sessionId === undefined ? undefined : await resolveSessionRecord(sessionId);
 }

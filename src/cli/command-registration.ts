@@ -43,6 +43,7 @@ import {
 import { registerConfigCommand } from "./config-command.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import {
+  addSeatSelectorOption,
   addSessionIdentityOptions,
   addPromptInputOption,
   addSessionNameOption,
@@ -365,8 +366,13 @@ export function registerSessionsCommand(
       parseNonEmptyValue("Resume session id", value),
     )
     .option(
+      "--parent-seat <seat>",
+      "The parent as a SEAT (seat id or ?seat= URL) — the primary form: records that seat's ACTIVE holder as parent, and the seat beside it. An unknown, closed or vacant seat is refused. --parent-session-url / --parent-id remain the deliberate session forms.",
+      (value: string) => parseNonEmptyValue("Parent seat", value),
+    )
+    .option(
       "--parent-session-url <url>",
-      "Record the spawning session's acpx-ui URL as parent (UUID parsed from ?session=). Mirrors the agent identity URL — the same URL humans paste in a browser and that agents POST to.",
+      "Record the spawning session's acpx-ui URL as parent: ?session=<id> names that session; ?seat=<id> names that seat's ACTIVE holder (as --parent-seat). A URL carrying neither is refused.",
       (value: string) => parseNonEmptyValue("Parent session URL", value),
     )
     .option(
@@ -452,6 +458,7 @@ export function registerSessionsCommand(
       "Exit 3 instead of 0 when the close found undelivered messages in the queue owner's custody",
     );
   addSessionIdentityOptions(closeCommand);
+  addSeatSelectorOption(closeCommand);
   closeCommand.action(async function (
     this: Command,
     name: string | undefined,
@@ -477,8 +484,13 @@ export function registerSessionsCommand(
     )
     .option("-s, --name <name>", "Name for the copy's new SEAT (display only)", parseSessionName)
     .option(
+      "--parent-seat <seat>",
+      "The parent as a SEAT (seat id or ?seat= URL) — the primary form: records that seat's ACTIVE holder as parent, and the seat beside it. An unknown, closed or vacant seat is refused. --parent-session-url / --parent-id remain the deliberate session forms.",
+      (value: string) => parseNonEmptyValue("Parent seat", value),
+    )
+    .option(
       "--parent-session-url <url>",
-      "Record the spawning session's acpx-ui URL as parent (UUID parsed from ?session=; falls back to ACPX_SESSION_URL env). Roots the copy/fork under its spawner in addition to its fork origin.",
+      "Record the spawning session's acpx-ui URL as parent (?session=<id>, or ?seat=<id> for that seat's ACTIVE holder; falls back to ACPX_SESSION_URL env only when no parent flag is given). Roots the copy/fork under its spawner in addition to its fork origin.",
       (value: string) => parseNonEmptyValue("Parent session URL", value),
     )
     .option(
@@ -614,10 +626,14 @@ export function registerSessionsCommand(
       "--children-of <id>",
       "Re-parent every OPEN DIRECT child of this session. Must resolve locally — a typo refuses rather than matching zero children. Closed children and Task-tool subagents are not moved.",
     )
+    .option(
+      "--parent-seat <seat>",
+      "The new parent as a SEAT (seat id or ?seat= URL): that seat's ACTIVE holder. Same-box only.",
+    )
     .option("--parent-id <uuid>", "The new parent, by local acpx record id")
     .option(
       "--parent-session-url <url>",
-      "The new parent, by full acpx-ui URL — the form that also accepts a parent on ANOTHER box",
+      "The new parent, by full acpx-ui URL (?session=<id> — the form that also accepts a parent on ANOTHER box — or ?seat=<id>, as --parent-seat)",
     )
     .option("--dry-run", "Preview the move and write nothing")
     .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
@@ -881,6 +897,7 @@ export function registerSharedAgentSubcommands(
     .argument("[prompt...]", "Prompt text")
     .showHelpAfterError();
   addSessionOption(promptCommand);
+  addSeatSelectorOption(promptCommand);
   addPromptInputOption(promptCommand);
   promptCommand.option(
     "--message-id <uuid>",
@@ -903,6 +920,7 @@ export function registerSharedAgentSubcommands(
 
   const cancelCommand = parent.command("cancel").description(descriptions.cancel);
   addSessionNameOption(cancelCommand);
+  addSeatSelectorOption(cancelCommand);
   cancelCommand.action(async function (this: Command, flags: StatusFlags) {
     await handleCancel(explicitAgentName, flags, this, config);
   });
