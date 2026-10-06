@@ -62,7 +62,7 @@ import { listHarnessCapabilities } from "../acp/harness-capabilities.js";
 import type { ArbitraryModelSupport, ModelIdForm } from "../acp/harness-capabilities.js";
 
 export type AvailabilityCapability = {
-  /** Agent type id — `claude` | `claude-pty` | `codex` | `pi`. */
+  /** Agent type id — `claude` | `codex` | `pi`. */
   id: string;
   /** False ⇒ the OpenRouter band is locked for this agent type (C5 §8.4). */
   acceptsArbitraryModelIds: boolean;

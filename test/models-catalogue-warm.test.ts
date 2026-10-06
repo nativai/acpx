@@ -9,6 +9,10 @@ import {
   WARM_ATTEMPT_COOLDOWN_MS,
   warmCatalogueInBackground,
 } from "../src/models/catalogue-warm.js";
+import {
+  CLAUDE_ADVERT_SCHEMA,
+  currentClaudeAdvertKey,
+} from "../src/models/claude-advertisement.js";
 import { CATALOGUE_TTL_MS } from "../src/models/openrouter-catalogue.js";
 
 /**
@@ -42,6 +46,32 @@ function freshEntitlement(dir: string, now: number = Date.now()): string {
     }),
   );
   return entitlementCachePath;
+}
+
+/**
+ * A FRESH Claude model-advertisement cache (brick ebfe4c3c) — the warm's THIRD
+ * term. Pinned for the same reason the entitlement cache is: unpinned, it falls
+ * back to the real `$HOME/.acpx/claude-advertisement.json`, and a "fresh ⇒ no
+ * warm" row would measure whether THIS box happens to hold one.
+ */
+function freshClaudeAdvert(
+  dir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): { claudeAdvertCachePath: string; runtimeInfoPath: string } {
+  const claudeAdvertCachePath = path.join(dir, "claude-advertisement.json");
+  const runtimeInfoPath = path.join(dir, "no-runtime-info.json");
+  fs.writeFileSync(
+    claudeAdvertCachePath,
+    JSON.stringify({
+      schema: CLAUDE_ADVERT_SCHEMA,
+      key: currentClaudeAdvertKey({ env, runtimeInfoPath }),
+      probedAt: new Date().toISOString(),
+      source: "fixture",
+      options: [{ value: "opus", name: "Opus", description: "Opus 9.1 · x" }],
+      lastFailure: null,
+    }),
+  );
+  return { claudeAdvertCachePath, runtimeInfoPath };
 }
 
 function fakeCliEntry(dir: string): string {
@@ -95,12 +125,16 @@ test("a FRESH cache needs no warm; a STALE one does", () => {
   // cache needs no warm" would be measuring the absence of THAT file rather than
   // the freshness of this one.
   const entitlementCachePath = freshEntitlement(dir, now);
+  const claude = freshClaudeAdvert(dir);
 
   fs.writeFileSync(
     cachePath,
     JSON.stringify({ fetchedAt: new Date(now - 60_000).toISOString(), models: [] }),
   );
-  assert.equal(catalogueNeedsWarm({ cachePath, entitlementCachePath, now: () => now }), false);
+  assert.equal(
+    catalogueNeedsWarm({ cachePath, entitlementCachePath, ...claude, now: () => now }),
+    false,
+  );
 
   fs.writeFileSync(
     cachePath,
@@ -109,7 +143,10 @@ test("a FRESH cache needs no warm; a STALE one does", () => {
       models: [],
     }),
   );
-  assert.equal(catalogueNeedsWarm({ cachePath, entitlementCachePath, now: () => now }), true);
+  assert.equal(
+    catalogueNeedsWarm({ cachePath, entitlementCachePath, ...claude, now: () => now }),
+    true,
+  );
 });
 
 test("an UNPARSEABLE cache is treated as absent, never as fresh", () => {
@@ -163,7 +200,56 @@ test("the child re-invokes acpx's OWN refresh path — no second fetch implement
   const call = spawner.calls[0];
   assert.ok(call);
   assert.equal(call.command, process.execPath);
-  assert.deepEqual(call.args.slice(1), ["models", "--refresh", "--format", "json"]);
+  // ⚠️ DELIBERATELY CHANGED from `--refresh` (brick ebfe4c3c, CONTRACT §4.4): `--refresh`
+  // now FORCES a Claude adapter probe, and this child fires up to once a minute per
+  // box — forcing would probe ~hourly, "never per session" violated through the side
+  // door. `--warm` refreshes only what is stale.
+  assert.deepEqual(call.args.slice(1), ["models", "--warm", "--format", "json"]);
+});
+
+test("a STALE Claude advertisement alone triggers the warm; scope claude-advertisement ignores OpenRouter", () => {
+  const dir = tempCacheDir();
+  const cachePath = path.join(dir, "models-cache.json");
+  const now = Date.now();
+  fs.writeFileSync(
+    cachePath,
+    JSON.stringify({ fetchedAt: new Date(now).toISOString(), models: [] }),
+  );
+  const entitlementCachePath = freshEntitlement(dir, now);
+  const claude = freshClaudeAdvert(dir, {});
+  const spawner = recordingSpawn();
+  const warm = (scope: "all" | "claude-advertisement") =>
+    warmCatalogueInBackground({
+      cachePath,
+      entitlementCachePath,
+      ...claude,
+      scope,
+      now: () => now,
+      spawn: spawner.spawn,
+      argv: ["node", fakeCliEntry(dir)],
+      env: {},
+    });
+  warm("claude-advertisement");
+  assert.equal(spawner.calls.length, 0, "a fresh advertisement needs no warm");
+
+  // The deploy moved: the cached key no longer matches what is deployed.
+  fs.writeFileSync(
+    claude.runtimeInfoPath,
+    JSON.stringify({ "claude-agent-acp": { sha: "redeployed", state: "ok" } }),
+  );
+  // The key only differs for the DEPLOYED command, which is the env-less default here.
+  warm("claude-advertisement");
+  assert.equal(spawner.calls.length, 1, "a re-keyed advertisement warms on its own");
+  assert.deepEqual(spawner.calls[0]?.args.slice(1), ["models", "--warm", "--format", "json"]);
+
+  // Scope claude-advertisement with a COLD OpenRouter cache and a fresh advertisement: no warm.
+  fs.rmSync(cachePath);
+  fs.rmSync(`${cachePath}.warming`, { force: true });
+  fs.rmSync(claude.runtimeInfoPath);
+  warm("claude-advertisement");
+  assert.equal(spawner.calls.length, 1, "the read-verb scope must not warm for OpenRouter");
+  warm("all");
+  assert.equal(spawner.calls.length, 2, "…while the create path's scope still does");
 });
 
 // ── When it must NOT spawn ───────────────────────────────────────────────────
@@ -177,11 +263,13 @@ test("a FRESH cache spawns nothing", () => {
     JSON.stringify({ fetchedAt: new Date(now - 1000).toISOString(), models: [] }),
   );
   const spawner = recordingSpawn();
-  // Both caches fresh — see the note in "a FRESH cache needs no warm" (brick ecfb0461).
+  // All caches fresh — see the note in "a FRESH cache needs no warm" (brick ecfb0461).
   const entitlementCachePath = freshEntitlement(dir, now);
+  const claude = freshClaudeAdvert(dir, {});
   warmCatalogueInBackground({
     cachePath,
     entitlementCachePath,
+    ...claude,
     now: () => now,
     spawn: spawner.spawn,
     argv: ["node", fakeCliEntry(dir)],
@@ -196,6 +284,7 @@ test("a FRESH cache spawns nothing", () => {
   warmCatalogueInBackground({
     cachePath,
     entitlementCachePath,
+    ...claude,
     now: () => now,
     spawn: spawner.spawn,
     argv: ["node", fakeCliEntry(dir)],

@@ -13,7 +13,6 @@ import {
   loadProfileRegistry,
   resolvePhysicalAccount,
   siblingProfiles,
-  transcriptAnchorDir,
   verifyEffectiveResolution,
 } from "../src/config/profiles.js";
 import { loadSubscriptionRegistry } from "../src/config/subscriptions.js";
@@ -125,13 +124,6 @@ test("W5 migration: hybrid registry unions v1 subscriptions and quarantines clau
       profiles: [
         { id: "sub1", label: "One", harness: "claude", authMode: "subscription" },
         {
-          id: "home-test",
-          label: "Home",
-          harness: "claude",
-          authMode: "claude-home",
-          homePath: "/workspace/projects/temp/w5-selftest/home-test",
-        },
-        {
           id: "claude-deepseek",
           label: "claude-deepseek template",
           harness: "claude",
@@ -152,7 +144,7 @@ test("W5 migration: hybrid registry unions v1 subscriptions and quarantines clau
         });
         assert.deepEqual(
           registry.profiles.map((profile) => profile.id),
-          ["sub1", "home-test", "sub2"],
+          ["sub1", "sub2"],
         );
         assert.equal(registry.quarantined?.length, 1);
         assert.match(registry.quarantined?.[0]?.reason ?? "", /legacy harness conflicts/);
@@ -175,27 +167,14 @@ test("W5 migration: profiles-only registry backfills adapter/account and preserv
   await withRegistryFile(
     {
       provisioning: { osHarness: { enabled: true, sourceDir: "/home/node/.claude" } },
-      profiles: [
-        {
-          id: "home1",
-          label: "Interactive one",
-          harness: "claude",
-          authMode: "claude-home",
-          homePath: "/workspace/projects/temp/w5-selftest/home1",
-          accountEmail: "one@example.com",
-        },
-        { id: "codex-main", label: "Codex", authMode: "chatgpt" },
-      ],
+      profiles: [{ id: "codex-main", label: "Codex", authMode: "chatgpt" }],
     },
     async (ctx) => {
       const registry = loadProfileRegistry({
         homeDir: ctx.homeDir,
         registryPath: ctx.registryPath,
       });
-      const home1 = registry.profiles.find((profile) => profile.id === "home1");
       const codex = registry.profiles.find((profile) => profile.id === "codex-main");
-      assert.equal(home1?.adapter, "claude-pty");
-      assert.equal(home1?.account, "home1");
       assert.equal(codex?.adapter, "codex");
       assert.equal(codex?.account, "codex-main");
       assert.equal(
@@ -310,20 +289,6 @@ test("W5 seam contract: siblings, transcript anchors, and physical account verif
           credentialSource: "__SUB3__",
         },
         {
-          id: "home1",
-          label: "Home One",
-          authMode: "claude-home",
-          account: "home-a",
-          homePath: "__HOME1__",
-        },
-        {
-          id: "home2",
-          label: "Home Two",
-          authMode: "claude-home",
-          account: "home-b",
-          homePath: "__HOME2__",
-        },
-        {
           id: "codex1",
           label: "Codex One",
           authMode: "chatgpt",
@@ -336,16 +301,12 @@ test("W5 seam contract: siblings, transcript anchors, and physical account verif
       const sub1Dir = ctx.configDir("sub1");
       const sub2Dir = ctx.configDir("sub2");
       const sub3Dir = ctx.configDir("sub3");
-      const home1 = path.join(ctx.homeDir, "homes", "home1");
-      const home2 = path.join(ctx.homeDir, "homes", "home2");
       const codex1 = path.join(ctx.homeDir, "codex", "one");
       const codexOther = path.join(ctx.homeDir, "codex", "other");
       await Promise.all([
         fs.mkdir(sub1Dir, { recursive: true }),
         fs.mkdir(sub2Dir, { recursive: true }),
         fs.mkdir(sub3Dir, { recursive: true }),
-        fs.mkdir(path.join(home1, ".claude"), { recursive: true }),
-        fs.mkdir(path.join(home2, ".claude"), { recursive: true }),
         fs.mkdir(codex1, { recursive: true }),
         fs.mkdir(codexOther, { recursive: true }),
       ]);
@@ -357,8 +318,6 @@ test("W5 seam contract: siblings, transcript anchors, and physical account verif
           .replace("__SUB1__", sub1Dir)
           .replace("__SUB2__", sub2Dir)
           .replace("__SUB3__", sub3Dir)
-          .replace("__HOME1__", home1)
-          .replace("__HOME2__", home2)
           .replace("__CODEX1__", codex1),
         { mode: 0o600 },
       );
@@ -371,8 +330,6 @@ test("W5 seam contract: siblings, transcript anchors, and physical account verif
           ["sub1", "claude"],
           ["sub2", "claude"],
           ["sub3-same-account", "claude"],
-          ["home1", "claude-pty"],
-          ["home2", "claude-pty"],
           ["codex1", "codex"],
         ],
       );
@@ -381,16 +338,7 @@ test("W5 seam contract: siblings, transcript anchors, and physical account verif
         (await siblingProfiles("sub1", lookup)).map((profile) => profile.id),
         ["sub2"],
       );
-      assert.deepEqual(
-        (await siblingProfiles("home1", lookup)).map((profile) => profile.id),
-        ["home2"],
-      );
-
-      const homeProfile = registry.profiles.find((profile) => profile.id === "home1");
-      assert.ok(homeProfile);
-      assert.equal(transcriptAnchorDir(homeProfile), path.join(home1, ".claude"));
       assert.equal(await resolvePhysicalAccount(sub2Dir, lookup), "acct-b");
-      assert.equal(await resolvePhysicalAccount(path.join(home1, ".claude"), lookup), "home-a");
 
       const verified = await verifyEffectiveResolution(
         { acpx: { session_options: { profile: "sub2" } } },

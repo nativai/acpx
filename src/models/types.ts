@@ -9,12 +9,7 @@
  */
 
 /** Where a model is reached — the first half of the `(source, id)` unit of choice (C5 D2). */
-export type ModelSource =
-  | "openrouter"
-  | "claude-subscription"
-  | "claude-home"
-  | "chatgpt"
-  | "claude-pty";
+export type ModelSource = "openrouter" | "claude-subscription" | "chatgpt";
 
 /**
  * The canonical thinking-depth vocabulary (C4 §6.1). Ordered weakest → strongest.
@@ -138,7 +133,7 @@ export type AgentAvailability = {
    *
    * ⚠️ **NOT ALWAYS `id`, AND NOT DERIVABLE FROM `source`.** Measured on every
    * harness (brick c4da2ff2): pi takes `source + "/" + id`,
-   * claude and claude-pty take the bare `id`, and codex takes `family[rung]`
+   * claude take the bare `id`, and codex takes `family[rung]`
    * with **a bare family refused**. So the obvious caller-side rule
    * `source === "openrouter" ? \`openrouter/${id}\` : id` is right for one
    * harnesses and silently wrong for a third — which is exactly why the answer
@@ -184,6 +179,25 @@ export type CatalogueModel = {
   favorite: boolean;
   /** ISO-8601 when `favorite`, else `null`. */
   favoritedAt: string | null;
+  /**
+   * THE VERSION CITATION for a row whose `name` came from an adapter's own model
+   * advertisement (brick ebfe4c3c) — present IFF it did, absent on a fallback
+   * name. Carried per row so `acpx models show <row> --json` cites itself.
+   */
+  advertisedBy?: AdvertisedBy;
+};
+
+/** Which adapter build a row's advertised `name` was read from, and when. */
+export type AdvertisedBy = {
+  adapter: "claude-agent-acp";
+  /** The deployed claude-agent-acp commit (`info.json`); `null` off-box or under a command override. */
+  adapterSha: string | null;
+  /** The adapter's bundled `@anthropic-ai/claude-agent-sdk` version. */
+  sdkVersion: string | null;
+  /** ISO-8601 of the probe the advertisement came from. */
+  probedAt: string;
+  /** `"probe"` = a real transient session; `"fixture"` = `ACPX_TEST_CLAUDE_ADVERT_JSON`. */
+  source: "probe" | "fixture";
 };
 
 export type SelectabilityCounts = {
@@ -242,8 +256,32 @@ export type ModelCatalogue = {
    * for an agent to read and is expected to change.
    */
   entitlement: CatalogueEntitlement;
+  /**
+   * How fresh the Claude rows' advertised names are (brick ebfe4c3c, CONTRACT
+   * §4.6): what they were probed from, what is deployed NOW, and the last error.
+   */
+  claudeAdvertisement: ClaudeAdvertisementStatus;
   counts: CatalogueCounts;
   models: CatalogueModel[];
+};
+
+export type ClaudeAdvertisementStatus = {
+  /**
+   * `fresh` — a good probe for the DEPLOYED adapter key;
+   * `stale` — the names come from a good probe of an OLDER key (re-probe pending or failed);
+   * `none`  — never a good probe on this box: the rows carry version-free alias names.
+   */
+  state: "fresh" | "stale" | "none";
+  /** Of the options in use. */
+  probedAt: string | null;
+  adapterSha: string | null;
+  sdkVersion: string | null;
+  source: "probe" | "fixture" | null;
+  /** The key deployed now. */
+  deployedAdapterSha: string | null;
+  deployedSdkVersion: string | null;
+  /** The last probe failure's message, iff it was for the deployed key. */
+  error: string | null;
 };
 
 /** How well the catalogue knows what the box's OpenRouter key allows. */

@@ -6,6 +6,10 @@ import test from "node:test";
 import { catalogueNeedsWarm } from "../src/models/catalogue-warm.js";
 import { buildCatalogue, loadCatalogue } from "../src/models/catalogue.js";
 import {
+  CLAUDE_ADVERT_SCHEMA,
+  currentClaudeAdvertKey,
+} from "../src/models/claude-advertisement.js";
+import {
   assertModelPolicy,
   ClaudeFamilyOnOpenRouterError,
   CLAUDE_FAMILY_OPENROUTER_REASON,
@@ -1333,15 +1337,48 @@ test("a cold entitlement cache triggers the warm even when the catalogue is fres
       entitlementCachePath,
       JSON.stringify({ fetchedAt: new Date(now).toISOString(), keyFingerprint: "x", modelIds: [] }),
     );
-    assert.equal(catalogueNeedsWarm({ cachePath, entitlementCachePath, now: () => now }), false);
+    const claude = freshClaudeAdvert(dir);
+    assert.equal(
+      catalogueNeedsWarm({ cachePath, entitlementCachePath, ...claude, now: () => now }),
+      false,
+    );
 
     // …and the original leg still works: a STALE catalogue warms regardless.
     fs.writeFileSync(
       cachePath,
       JSON.stringify({ fetchedAt: new Date(now - 48 * 3600_000).toISOString(), models: [] }),
     );
-    assert.equal(catalogueNeedsWarm({ cachePath, entitlementCachePath, now: () => now }), true);
+    assert.equal(
+      catalogueNeedsWarm({ cachePath, entitlementCachePath, ...claude, now: () => now }),
+      true,
+    );
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+/**
+ * A FRESH Claude model-advertisement cache (brick ebfe4c3c) — the warm's THIRD
+ * term. Pinned for the same reason the entitlement cache is: unpinned, it falls
+ * back to the real `$HOME/.acpx/claude-advertisement.json`, and a "fresh ⇒ no
+ * warm" row would measure whether THIS box happens to hold one.
+ */
+function freshClaudeAdvert(
+  dir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): { claudeAdvertCachePath: string; runtimeInfoPath: string } {
+  const claudeAdvertCachePath = path.join(dir, "claude-advertisement.json");
+  const runtimeInfoPath = path.join(dir, "no-runtime-info.json");
+  fs.writeFileSync(
+    claudeAdvertCachePath,
+    JSON.stringify({
+      schema: CLAUDE_ADVERT_SCHEMA,
+      key: currentClaudeAdvertKey({ env, runtimeInfoPath }),
+      probedAt: new Date().toISOString(),
+      source: "fixture",
+      options: [{ value: "opus", name: "Opus", description: "Opus 9.1 · x" }],
+      lastFailure: null,
+    }),
+  );
+  return { claudeAdvertCachePath, runtimeInfoPath };
+}

@@ -108,6 +108,8 @@ export const TOP_LEVEL_VERBS = new Set([
   // status) were all present, which is exactly how a hand-maintained list goes
   // wrong: correct enough to look complete.
   "output-styles",
+  // `model-catalogue` — same shared-subcommand registration as `output-styles`.
+  "model-catalogue",
   "config",
   "help",
 ]);

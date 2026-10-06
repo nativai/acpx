@@ -16,8 +16,6 @@ import {
   resolveSessionRecord,
   writeSessionRecord,
   writeSessionRecordAtBoundary,
-  writeSessionRecordWithPersistedLifecycle,
-  type PersistedSessionLifecycle,
 } from "./persistence.js";
 
 const LOCK_RETRY_MS = 15;
@@ -385,21 +383,10 @@ export class SessionEventWriter {
     }
   }
 
-  /**
-   * Persist the record. When the caller already read the persisted lifecycle
-   * this turn (the live-checkpoint path), pass it through so the write does
-   * not parse the same multi-MB record a second time; `value: undefined`
-   * means "file was missing — nothing to preserve".
-   */
-  async checkpoint(options?: {
-    persistedLifecycle?: { value: PersistedSessionLifecycle | undefined };
-  }): Promise<void> {
+  /** Persist the record. The write merges against the disk image it reads right before its rename. */
+  async checkpoint(): Promise<void> {
     if (this.closed) {
       throw new Error("SessionEventWriter is closed");
-    }
-    if (options?.persistedLifecycle) {
-      await writeSessionRecordWithPersistedLifecycle(this.record, options.persistedLifecycle.value);
-      return;
     }
     await writeSessionRecord(this.record);
   }

@@ -71,6 +71,7 @@ function stripCommentLines(source: string): string {
 type ContractFixture = {
   quiesceRejection: { message: string };
   ownerExitTerminals: Array<{ detailCode: string; message: string }>;
+  turnStartTerminals: Array<{ detailCode: string; message: string }>;
 };
 
 // DERIVED FROM THE FIXTURE, NEVER TRANSCRIBED. A hand-maintained list here would
@@ -86,7 +87,7 @@ async function contractedMessages(): Promise<Array<{ label: string; message: str
 
   return [
     { label: "quiesceRejection", message: fixture.quiesceRejection.message },
-    ...fixture.ownerExitTerminals.map((entry) => ({
+    ...[...fixture.ownerExitTerminals, ...fixture.turnStartTerminals].map((entry) => ({
       label: entry.detailCode,
       message: entry.message,
     })),

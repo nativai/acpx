@@ -408,7 +408,7 @@ test("cb214e48: the plan reports the session dir it handed pi", () => {
 test("ac86eb34 GUARDRAIL: the Claude family and codex never gain the variable", () => {
   const { root, box, cwd } = fixture();
   try {
-    for (const id of ["claude", "claude-pty", "codex"] as const) {
+    for (const id of ["claude", "codex"] as const) {
       const env: NodeJS.ProcessEnv = { PI_CODING_AGENT_DIR: box, HOME: root };
       applyHarnessConfigDir({
         env,

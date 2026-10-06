@@ -59,5 +59,20 @@
       "acpxUiDefinitiveGiveUp": true,
       "requiredSubstringLowercased": "session closed"
     }
+  ],
+  "turnStartTerminals": [
+    {
+      "$comment": "brick://b8e251eb. The owner ACCEPTED the task but its turn NEVER STARTED: a non-transient failure before the prompt was submitted (the transient outbox-busy class is retried in-owner and, if exhausted, handed back as QUEUE_OWNER_SHUTDOWN instead). Never reached the model, so a resend is safe; DEFINITIVE, because the failure is not known to clear on its own, so acpx-ui must not auto re-drive it and must tell the sender. Not an owner exit — the owner keeps serving — hence its own section, leaving the three KD-3 owner-exit codes untouched. `messageMatch:prefix`: the emitted text is `<message>: <ErrorClass>: <detail>`, so match with startsWith, never equality. `acpxUiDefinitiveGiveUp:true` is the acpx-ui target set by lane f062bed9.",
+      "detailCode": "QUEUE_TURN_START_FAILED",
+      "message": "the turn never started — the message did not reach the agent",
+      "messageMatch": "prefix",
+      "phase": "failed",
+      "reachedModel": "no",
+      "retryable": false,
+      "notifiesSender": true,
+      "resendSafe": true,
+      "acpxUiDefinitiveGiveUp": true,
+      "requiredSubstringLowercased": null
+    }
   ]
 }

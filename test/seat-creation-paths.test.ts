@@ -1523,22 +1523,30 @@ test("F8 · when the DURABLE leg fails, the failure is ANNOUNCED — never swall
 // So force the record write to fail, and ask whether an orphan row was left behind.
 //
 // 🔑 THE FAULT, AND IT IS ASYMMETRIC BY CONSTRUCTION — that is the whole trick. The record
-// write goes through the OUTBOX, whose SQLite db lives at `~/.acpx/brick-outbox.db`, **one
-// directory ABOVE** the seat store at `~/.acpx/sessions/seats.json`. `chmod 555` on `.acpx/`
-// stops SQLite creating its journal while `.acpx/sessions/` stays writable for the mint. A
-// whole-tree fault blocks both and cannot discriminate — which is exactly why six other
-// candidates are measured vacuous (see the retired-AP16 block and
-// `verification/verification-evidence/RIG-ordering-discriminator.md`): a directory at
-// `index.json` bites at an index write that PRECEDES the mint; a read-only sessions dir is
-// SYMMETRIC; and `chmod` on either JSON file does not bite at all, because temp+rename needs
-// no write permission on the TARGET.
+// write runs under the record's own lock file, `<sessions>/<record-id>.json.lock`
+// (`record-file-lock.ts`); the mint writes `seats.json` and never touches that path. So a
+// DIRECTORY planted at `<record-id>.json.lock` (the run is pinned to that id with
+// `--record-id`) makes the record write — and only the record write — wait out the lock budget
+// and fail `record-lock-timeout`, while the seat store stays writable for the mint. (Until
+// 2026-10-06 the fault was `chmod 555 ~/.acpx`, which stopped the SQLite OUTBOX creating its
+// journal one directory above the store; ordinary record writes no longer open the outbox, so
+// that fault stopped biting — HOD-R51.) A whole-tree fault blocks both and cannot
+// discriminate — which is exactly why six other candidates are measured vacuous (see the
+// retired-AP16 block and `verification/verification-evidence/RIG-ordering-discriminator.md`):
+// a directory at `index.json` bites at an index write that PRECEDES the mint; a read-only
+// sessions dir is SYMMETRIC; and `chmod` on either JSON file does not bite at all, because
+// temp+rename needs no write permission on the TARGET.
+//
+// ⚠️ EACH ARM WAITS THE LOCK BUDGET (20 s) before the write fails — the price of a fault that
+// bites at the record write and nowhere else.
 //
 // 🛑 THIS IS NOT E300's RETIRED DETECTOR, though the observation is identical. There the
 // orphan row was a RATE PROBE whose subject the fix eliminates, so it expired with the fix.
 // Here the orphan row's **ABSENCE is the assertion**, under a controlled fault. Same
 // observation, OPPOSITE epistemic role — do not retire this as a duplicate of that.
 //
-// 🔑 AND IT IS CALIBRATED, NOT ARGUED — MEASURED A/B, BOTH DIRECTIONS:
+// 🔑 AND IT IS CALIBRATED, NOT ARGUED — MEASURED A/B, BOTH DIRECTIONS (measured on the
+// outbox-era fault; the lock-directory fault's red arm has not been re-measured):
 //
 //   | tree       | ordering      | plain leg        | fork/copy leg    |
 //   |------------|---------------|------------------|------------------|
@@ -1603,10 +1611,11 @@ async function runOrderingDiscriminator(homeDir: string, forkLeg: boolean): Prom
   const before = JSON.parse(await fs.readFile(storePath, "utf8")) as Record<string, unknown>;
 
   // 1 · THE FAULT.
-  await fs.chmod(acpxDir, 0o555);
+  const faultedId = crypto.randomUUID();
+  await fs.mkdir(path.join(sessionDir, `${faultedId}.json.lock`));
   let run: CliResult;
   let storeWritableUnderFault = false;
-  try {
+  {
     // The asymmetry itself, asserted rather than assumed.
     const stillWritable = await fs
       .access(sessionDir, fsSync.constants.W_OK)
@@ -1614,13 +1623,24 @@ async function runOrderingDiscriminator(homeDir: string, forkLeg: boolean): Prom
       .catch(() => false);
     assert.ok(
       stillWritable,
-      "the fault is SYMMETRIC — it blocked the store as well as the outbox, so a missing row " +
-        "would prove nothing about ordering. This is the trap five other candidate faults fell into",
+      "the fault is SYMMETRIC — it blocked the store as well as the record write, so a missing " +
+        "row would prove nothing about ordering. This is the trap five other candidate faults fell into",
     );
 
     run = forkLeg
       ? await runCli(
-          ["--format", "json", "sessions", "copy", "--from", seedId, "--name", "faulted"],
+          [
+            "--format",
+            "json",
+            "sessions",
+            "copy",
+            "--from",
+            seedId,
+            "--name",
+            "faulted",
+            "--record-id",
+            faultedId,
+          ],
           homeDir,
         )
       : await runCli(
@@ -1636,6 +1656,8 @@ async function runOrderingDiscriminator(homeDir: string, forkLeg: boolean): Prom
             "new",
             "-s",
             "faulted",
+            "--record-id",
+            faultedId,
           ],
           homeDir,
         );
@@ -1657,10 +1679,6 @@ async function runOrderingDiscriminator(homeDir: string, forkLeg: boolean): Prom
     storeWritableUnderFault = Object.hasOwn(afterProbe, probeSeat);
     delete afterProbe[probeSeat];
     await fs.writeFile(storePath, `${JSON.stringify(afterProbe)}\n`, "utf8");
-  } finally {
-    // Restore BEFORE any assertion can throw, or `withTempHome`'s teardown fails on a
-    // read-only directory and the real failure is buried under a cleanup error.
-    await fs.chmod(acpxDir, 0o755);
   }
 
   // C1 · THE FAULT FIRED AT THE RECORD WRITE — **and this is the control that must be
@@ -1677,7 +1695,7 @@ async function runOrderingDiscriminator(homeDir: string, forkLeg: boolean): Prom
   const both = run.stdout + run.stderr;
   assert.match(
     both,
-    /readonly database|attempt to write/i,
+    /session record lock|record-lock-timeout/i,
     `C1: the run failed, but NOT at the record write — so this arm proves nothing about ` +
       `ordering. Failure was: ${both.replace(/\s+/g, " ").slice(0, 300)}`,
   );

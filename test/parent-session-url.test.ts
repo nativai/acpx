@@ -3,7 +3,6 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { buildClaudeParentSessionMeta } from "../src/acp/auth-env.js";
 import { buildAgentSpawnOptions } from "../src/acp/client.js";
 import { parseSessionRecord, serializeSessionRecordForDisk } from "../src/session/persistence.js";
 import {
@@ -37,8 +36,6 @@ const FOREIGN_HOST = "https://acpx.devbox.konsiq.de";
 const LOCAL_HOST = "https://acpx.devbox.nativai.de";
 const PARENT_ID = "deadbeef-1111-4111-8111-111111111111";
 const FOREIGN_PARENT_URL = `${FOREIGN_HOST}/?session=${PARENT_ID}`;
-// The bridge agent — `_meta` is emitted only for this command (claude-pty-agent.test.ts).
-const CLAUDE_PTY_COMMAND = "node /opt/claude-pty-acp/dist/index.js";
 
 function withEnv<T>(overrides: Record<string, string | undefined>, fn: () => T): T {
   const previous: Record<string, string | undefined> = {};
@@ -134,27 +131,6 @@ test("c6e3618b: no parent at all → no ACPX_PARENT_SESSION_URL, and a blank url
       }).env.ACPX_PARENT_SESSION_URL,
       `${LOCAL_HOST}/?session=${PARENT_ID}`,
     );
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Leg 2 — the claude-pty bridge's session/new `_meta`
-// Both spawn paths now share one composition. This pins that they AGREE, which
-// is what the FW-19 comment already claimed while they silently diverged.
-// ---------------------------------------------------------------------------
-
-test("c6e3618b: the bridge _meta and the process env agree on the foreign parent URL", () => {
-  withEnv({ ACPX_UI_BASE_URL: LOCAL_HOST }, () => {
-    const context = {
-      acpxRecordId: "child-1",
-      parentSessionId: PARENT_ID,
-      parentSessionUrl: FOREIGN_PARENT_URL,
-    };
-    const meta = buildClaudeParentSessionMeta(context, CLAUDE_PTY_COMMAND);
-    const envUrl = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, context).env
-      .ACPX_PARENT_SESSION_URL;
-    assert.equal(meta?.["independent-claude-acp/parent-session-url"], FOREIGN_PARENT_URL);
-    assert.equal(meta?.["independent-claude-acp/parent-session-url"], envUrl);
   });
 });
 

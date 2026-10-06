@@ -2,16 +2,15 @@
  * A rejected sub-agent boundary record-write must NOT kill the queue-owner
  * process (brick://da3d7c95).
  *
- * WHAT THIS DEFENDS. `createSubagentBoundaryWriteEnqueuer` chains a `.finally()`
- * onto the write promise to drop the chain entry once it settles. `.finally()`
- * returns a NEW promise that inherits the rejection, and the `void` in front of
- * it discards that promise with no handler. acpx installs no
- * `process.on("unhandledRejection")`, so under Node's default
- * `--unhandled-rejections=throw` a single rejected write — `OutboxError
- * ("outbox-busy")` under record-outbox contention — became an uncaught
- * exception that killed the queue owner mid-turn. Nine owners died that way on
- * devbox on 2026-09-22; the call sites' own `.catch(() => {})` on the returned
- * promise does not cover the derived one.
+ * WHAT THIS DEFENDS. A failed save rejects the promise `enqueue` hands back,
+ * and that promise is shared by every caller whose state the save carried.
+ * acpx installs no `process.on("unhandledRejection")`, so under Node's default
+ * `--unhandled-rejections=throw` one such promise left without a handler —
+ * `OutboxError("outbox-busy")` under record-outbox contention — is an uncaught
+ * exception that kills the queue owner mid-turn. Nine owners died that way on
+ * devbox on 2026-09-22 (then through a discarded `.finally()`-derived promise;
+ * since brick://5e7c2a85 the writer coalesces, and the exposure is a caller
+ * that `void`s `enqueue` without a `.catch()`).
  *
  * ⚠️ THIS MUST RUN IN A CHILD PROCESS, AND THAT IS THE WHOLE POINT. `node --test`
  * installs its own `unhandledRejection` handler, so in-process the fault is
@@ -21,18 +20,18 @@
  * queue owner, and its EXIT CODE is the observable.
  *
  * ⚠️ AND IT MUST IMPORT THE REAL FACTORY, NOT A RE-TYPED COPY OF THE SHAPE. A
- * hand-written replica of the `.then`/`.finally`/`void` chain would pass
- * forever after someone fixed the replica and not the product. The child
- * imports the compiled `src/cli/session/subagent-boundary-write.js` and
- * substitutes only the leaf `write` — which is the one thing that has to be
- * substituted to inject the rejection the outbox raises in production.
+ * hand-written replica would pass forever after someone fixed the replica and
+ * not the product. The child imports the compiled
+ * `src/cli/session/subagent-boundary-write.js` and substitutes only the leaf
+ * `write` — which is the one thing that has to be substituted to inject the
+ * rejection the outbox raises in production.
  *
- * MUTATION CONTROL. Deleting the trailing `.catch()` from the factory turns
- * `rejecting-write` from exit 0 to exit 1 with `ERR_UNHANDLED_REJECTION`;
- * measured while writing this test. `resolving-write` is the positive control
- * that proves the child harness reaches and exercises the factory at all —
- * without it, an exit 0 from a child that silently failed to import anything
- * would read as a pass.
+ * NEGATIVE CASE. The child's second enqueue is a bare `void` with no handler;
+ * deleting the `promise.catch(() => {})` in `newPendingSave` makes that child
+ * exit 1 with `ERR_UNHANDLED_REJECTION`. `resolving-write` is the positive
+ * control that proves the child harness reaches and exercises the factory at
+ * all — without it, an exit 0 from a child that silently failed to import
+ * anything would read as a pass.
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -59,9 +58,8 @@ function runChild(mode: "rejecting-write" | "resolving-write"): ChildResult {
   const source = `
     import { createSubagentBoundaryWriteEnqueuer } from ${JSON.stringify(FACTORY_URL)};
 
-    const chains = new Map();
-    const enqueue = createSubagentBoundaryWriteEnqueuer({
-      chains,
+    const writer = createSubagentBoundaryWriteEnqueuer({
+      intervalMs: 10,
       write: async () => {
         if (${JSON.stringify(mode)} === "rejecting-write") {
           const error = new Error("outbox-busy");
@@ -74,15 +72,17 @@ function runChild(mode: "rejecting-write" | "resolving-write"): ChildResult {
       },
     });
 
-    // Exactly what both production call sites do: discard the returned promise
-    // behind a .catch(). The derived .finally() promise is the exposure.
-    void enqueue("child-record-id", { acpxRecordId: "child-record-id" }).catch(() => {});
+    // What both production call sites do: discard the returned promise behind
+    // a .catch().
+    void writer.enqueue("child-record-id", { acpxRecordId: "child-record-id" }).catch(() => {});
+    // A careless caller: no handler at all. Coalesced into the same save.
+    void writer.enqueue("child-record-id", { acpxRecordId: "child-record-id" });
 
     // Give the microtask queue and the unhandled-rejection check time to run.
     // An unhandled rejection is raised on the macrotask turn AFTER the promise
     // settles, so an immediate exit would miss it and report a false pass.
     setTimeout(() => {
-      process.stderr.write("chains-size " + chains.size + "\\n");
+      process.stderr.write("pending-count " + writer.pendingCount() + "\\n");
       process.exit(0);
     }, 200);
   `;
@@ -110,16 +110,16 @@ test("a rejected sub-agent boundary write does not kill the owner process", () =
   );
   // The failure is surfaced, not swallowed.
   assert.match(rejecting.stderr, /onWriteError child-record-id outbox-busy/);
-  // The chain entry is still dropped — the `.finally()` bookkeeping must keep
-  // working on the failure path, not just the success path.
-  assert.match(rejecting.stderr, /chains-size 0/);
+  // The child's entry is still dropped — the bookkeeping must keep working on
+  // the failure path, not just the success path.
+  assert.match(rejecting.stderr, /pending-count 0/);
 });
 
 test("positive control: the child harness really exercises the factory", () => {
   const resolving = runChild("resolving-write");
 
   assert.equal(resolving.status, 0, `stderr:\n${resolving.stderr}`);
-  assert.match(resolving.stderr, /chains-size 0/);
+  assert.match(resolving.stderr, /pending-count 0/);
   // No write failure on this arm, so nothing may be reported.
   assert.ok(
     !resolving.stderr.includes("onWriteError"),
@@ -127,11 +127,10 @@ test("positive control: the child harness really exercises the factory", () => {
   );
 });
 
-test("in-process: the returned promise rejects and the chain entry is dropped", async () => {
-  const chains = new Map<string, Promise<void>>();
+test("in-process: the returned promise rejects and the child entry is dropped", async () => {
   const seen: unknown[] = [];
-  const enqueue = createSubagentBoundaryWriteEnqueuer({
-    chains,
+  const writer = createSubagentBoundaryWriteEnqueuer({
+    intervalMs: 1,
     write: async () => {
       throw new Error("outbox-busy");
     },
@@ -141,24 +140,28 @@ test("in-process: the returned promise rejects and the chain entry is dropped", 
   });
 
   const record = { acpxRecordId: "child-record-id" } as unknown as SessionRecord;
-  await assert.rejects(enqueue("child-record-id", record), /outbox-busy/);
-  // Let the bookkeeping chain settle.
+  await assert.rejects(writer.enqueue("child-record-id", record), /outbox-busy/);
+  // Let the bookkeeping settle.
   await new Promise((resolve) => setTimeout(resolve, 10));
 
-  assert.equal(chains.size, 0);
+  assert.equal(writer.pendingCount(), 0);
   assert.equal(seen.length, 1);
 });
 
 test("writes for one sub-agent stay serialised across a failure", async () => {
-  const chains = new Map<string, Promise<void>>();
   const order: string[] = [];
   let call = 0;
-  const enqueue = createSubagentBoundaryWriteEnqueuer({
-    chains,
+  let firstStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    firstStarted = resolve;
+  });
+  const writer = createSubagentBoundaryWriteEnqueuer({
+    intervalMs: 1,
     write: async () => {
       call += 1;
       const label = `write-${call}`;
       order.push(`${label}-start`);
+      firstStarted();
       await new Promise((resolve) => setTimeout(resolve, 5));
       order.push(`${label}-end`);
       if (call === 1) {
@@ -169,8 +172,10 @@ test("writes for one sub-agent stay serialised across a failure", async () => {
   });
 
   const record = { acpxRecordId: "child-record-id" } as unknown as SessionRecord;
-  const first = enqueue("child-record-id", record).catch(() => {});
-  const second = enqueue("child-record-id", record).catch(() => {});
+  const first = writer.enqueue("child-record-id", record).catch(() => {});
+  // Enqueued while the first save is IN FLIGHT, so it cannot coalesce into it.
+  await started;
+  const second = writer.enqueue("child-record-id", record).catch(() => {});
   await Promise.all([first, second]);
 
   // The second write starts only after the first has finished failing.

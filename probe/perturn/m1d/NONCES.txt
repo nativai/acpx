@@ -1,0 +1,8 @@
+bare claude-agent-acp PTN-9AA304A4
+bare codex-acp PTN-2A08FE0A
+bare pi-acp PTN-C83863AF
+enveloped claude-agent-acp PTN-E09BD21B
+enveloped codex-acp PTN-9053934D
+enveloped pi-acp PTN-C57F4AFB
+enveloped-clean codex-acp PTN-C9B517FE
+claude-pty PTN-1706B21A

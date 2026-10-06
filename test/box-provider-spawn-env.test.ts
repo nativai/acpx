@@ -25,7 +25,7 @@ const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url
 const SYNTHETIC_KEY = "sk-or-v1-TESTONLY-spawnenv-00000000000000000000000000";
 const SYNTHETIC_KEY_2 = "sk-or-v1-TESTONLY-spawnenv-second-000000000000000000";
 
-// ⚠️ THE MOCK AGENT'S ENV DUMP IS AN ALLOWLIST (ACPX_* / INDEPENDENT_CLAUDE_* /
+// ⚠️ THE MOCK AGENT'S ENV DUMP IS AN ALLOWLIST (ACPX_* /
 // CLAUDE_CONFIG_DIR), so any other name reads `undefined` — INDISTINGUISHABLE
 // from "acpx never set it", which is precisely the false negative this file must
 // not be able to produce. `--env-dump-extra` names the probe variables

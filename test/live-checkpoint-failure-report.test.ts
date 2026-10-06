@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { LiveSessionCheckpoint } from "../src/session/live-checkpoint.js";
+import { SpawnLedgerError } from "../src/spawn-ledger.js";
 
 /**
  * brick://48aca560 — a checkpoint that fails silently is indistinguishable from
@@ -47,6 +48,42 @@ test("a failing checkpoint reports itself with NO onError supplied", async () =>
   // does not tell a reader their session has stopped persisting.
   assert.match(captured, /stopped being written to disk/);
   assert.match(captured, /acpx\.cost_units\.cacheRead/);
+});
+
+// brick://b8e251eb — the banner used to blame "a non-snake_case persisted key" for
+// EVERY failure, including the outbox-busy lock timeouts of 2026-10-05.
+async function reportFor(error: Error): Promise<string> {
+  return await captureStderr(async () => {
+    const checkpoint = new LiveSessionCheckpoint({
+      intervalMs: 1,
+      save: () => Promise.reject(error),
+    });
+    checkpoint.request();
+    await settle();
+  });
+}
+
+test("b8e251eb: an outbox-busy checkpoint failure is named as lock contention, never as a key-policy violation", async () => {
+  const captured = await reportFor(
+    new SpawnLedgerError("outbox-busy", "session write refused: outbox-busy; retry the operation"),
+  );
+  assert.match(captured, /checkpoint FAILED/);
+  assert.match(captured, /SpawnLedgerError outbox-busy/);
+  assert.doesNotMatch(captured, /snake_case/);
+});
+
+test("b8e251eb: an unrelated failure is not blamed on the key policy either", async () => {
+  const captured = await reportFor(new Error("EACCES: permission denied, open '/x'"));
+  assert.match(captured, /not a persisted-key violation/);
+  assert.doesNotMatch(captured, /non-snake_case persisted key \(/);
+});
+
+test("b8e251eb CONTROL: a real key-policy violation still names the key policy", async () => {
+  const captured = await reportFor(
+    new Error("Persisted key policy violation (expected snake_case keys): acpx.costUnits"),
+  );
+  assert.match(captured, /non-snake_case persisted key/);
+  assert.match(captured, /persisted-key-policy\.ts/);
 });
 
 test("CONTROL: a checkpoint that succeeds reports nothing", async () => {

@@ -147,7 +147,7 @@ export type SessionIndexEntryOverlay = {
  *   writes. A caller that wrote records concurrently would have to serialise them
  *   against its flush itself.
  * - **Another process's write.** Record writes land by `rename` (`persistRecordFile`,
- *   and the outbox's `writeRecordAtomic` with fsync + rename), so a reader sees the
+ *   and the spawn ledger's `writeRecordAtomic` with fsync + rename), so a reader sees the
  *   old bytes or the new bytes, never a torn file. Reading the OLD bytes — the
  *   rename landing just after our `open` — is harmless and self-correcting:
  *   record-first-index-second means that writer's own index update comes after its

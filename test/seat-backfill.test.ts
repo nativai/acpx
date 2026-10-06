@@ -965,15 +965,14 @@ test("L12: an abort between the legs leaves NO index entry claiming a seat its r
     // 🔑 215 IS CALIBRATED, AND THE ARITHMETIC IS WRITTEN DOWN BECAUSE THE FIRST
     // VALUE I PICKED WAS WRONG AND THE ROW PASSED VACUOUSLY.
     //
-    // Under a temp HOME the rig dir IS the canonical `~/.acpx/sessions`, so
-    // `persistRecordFile` takes the OUTBOX branch and the temp name is
-    // `writeRecordAtomic`'s `<file>.<pid>.<uuid>.tmp` (+47 bytes) — NOT
-    // `persistRecordFile`'s own `<file>.<pid>.<ms>.<uuid>.tmp` (+61). At 200 that is
-    // 254 bytes: one under NAME_MAX, so the write SUCCEEDED and the whole row proved
-    // nothing. Against NAME_MAX = 255, with pid width between 1 and 7 digits:
+    // The record write takes the record's lock first, and the lock's temp name is
+    // `<file>.lock.<pid>.<uuid>.tmp` (`record-file-lock.ts` `tryAcquire`: 5 + 1 + pidWidth + 1 +
+    // 36 + 4 bytes on top of the file name) — the FIRST name too long to write. A value picked
+    // from the record's own temp name (`<file>.<pid>.<ms>.<uuid>.tmp`, +61) would pass vacuously.
+    // Against NAME_MAX = 255, with pid width between 1 and 7 digits:
     //   record file  215 + 5              = 220  ✓ readable and writable
     //   rollback copy 220 + 30 (suffix)   = 250  ✓ so the BACKUP leg succeeds …
-    //   outbox temp   220 + 42 + pidWidth ≥ 263  ✗ … and the RECORD write cannot
+    //   lock temp     220 + 47 + pidWidth ≥ 268  ✗ … and the RECORD write cannot
     // Both margins hold for every pid width, so the fault is deterministic rather
     // than pid-dependent. If either arithmetic ever stops holding the row goes RED —
     // on the control (nothing failed) or on the code assertion — never silently green.
@@ -2798,8 +2797,9 @@ test("N6: `seats rename` re-projects the seat's name onto its holders' index ent
 
 // ─── X — an apply with refused records must not exit 0 ───────────────────────
 
-/** A record the outbox REFUSES to rewrite: its `spawn_key` names a reservation no spawn attempt in
- * this HOME's outbox owns ("record-ownership") — the same refusal the TE measured when a copied
+/** A record the spawn ledger REFUSES to rewrite: its `spawn_key` names a reservation no spawn attempt
+ * in this HOME's ledger owns ("record-ownership"); only spawn-owned records (`metadata.spawn_key`) open
+ * the ledger at all, so this is the one kind of record a backfill can still have refused — the same refusal the TE measured when a copied
  * store was applied under another HOME. Every other record writes normally. */
 async function seedRefusedRig(homeDir: string): Promise<void> {
   await seed(homeDir, [

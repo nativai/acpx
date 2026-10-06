@@ -141,17 +141,10 @@ export type Band = {
   models: CatalogueModel[];
 };
 
-const NATIVE_SOURCE_ORDER: ModelSource[] = [
-  "claude-subscription",
-  "claude-home",
-  "claude-pty",
-  "chatgpt",
-];
+const NATIVE_SOURCE_ORDER: ModelSource[] = ["claude-subscription", "chatgpt"];
 
 const SOURCE_LABELS: Record<ModelSource, string> = {
   "claude-subscription": "Claude — on your subscription",
-  "claude-home": "Claude — independent home",
-  "claude-pty": "Claude PTY bridge",
   chatgpt: "Codex — on your ChatGPT plan",
   openrouter: "OpenRouter",
 };

@@ -4,6 +4,7 @@ import {
   activeTranscriptConfigDir,
   resolveExistingTranscriptPath,
 } from "../config/subscription-transcript.js";
+import { SYNTHETIC_ASSISTANT_MODEL } from "../models/claude-advertised-label.js";
 import { harnessNativeModels } from "../models/harness-models.js";
 import type { SessionAcpxState, SessionRecord } from "../types.js";
 import { effortRank, normalizeEffortLevelForModel } from "./config-option-application.js";
@@ -258,6 +259,19 @@ export function floorHardEnabled(record: SessionRecord): boolean {
 const SERVED_TAIL_BYTES = 128 * 1024;
 
 /**
+ * ⚠️ THE TAIL WINDOW GROWS UNTIL IT REACHES AN ASSISTANT ENTRY (brick ebfe4c3c).
+ * Claude Code (2.1.287) appends a `prompt_snapshot` attachment — the whole system
+ * prompt plus tool schemas, MEASURED at 160,703 bytes on one line — AFTER the
+ * turn's assistant entries. A fixed 128 KB tail therefore held no assistant line
+ * at all on a short first turn, and the served model went unrecorded: on devbox
+ * 2026-10-02, 18 of 113 claude records prompted that day had no `served` stamp.
+ * Doubling up to this cap keeps the common case one 128 KB read and bounds the
+ * worst case; a transcript with no assistant entry in its last 8 MB has no
+ * served model worth stamping.
+ */
+const SERVED_TAIL_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
  * Read the model of the LAST `assistant` entry in the session's active Claude
  * transcript JSONL — the authoritative served model for the most recent turn.
  * No-ops (returns undefined) for non-Claude adapters (only claude-agent-acp
@@ -293,29 +307,45 @@ async function readLastAssistantModelFromJsonl(filePath: string): Promise<string
     if (size === 0) {
       return undefined;
     }
-    const readLen = Math.min(size, SERVED_TAIL_BYTES);
-    const start = size - readLen;
-    const buffer = Buffer.alloc(readLen);
-    await handle.read(buffer, 0, readLen, start);
-    let text = buffer.toString("utf8");
-    // Drop a leading partial line when the window did not start at byte 0.
-    if (start > 0) {
-      const firstNewline = text.indexOf("\n");
-      text = firstNewline >= 0 ? text.slice(firstNewline + 1) : "";
-    }
-    const lines = text.split("\n");
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const model = assistantModelFromJsonlLine(lines[i].trim());
-      if (model) {
-        return model;
-      }
-    }
-    return undefined;
+    let found: string | undefined;
+    let readLen = 0;
+    let window = SERVED_TAIL_BYTES;
+    do {
+      readLen = Math.min(size, window);
+      found = await lastAssistantModelInTail(handle, size, readLen);
+      window *= 2;
+    } while (found === undefined && readLen < size && readLen < SERVED_TAIL_MAX_BYTES);
+    return found;
   } catch {
     return undefined;
   } finally {
     await handle.close().catch(() => {});
   }
+}
+
+/** The last assistant model within the final `readLen` bytes, scanning backwards. */
+async function lastAssistantModelInTail(
+  handle: Awaited<ReturnType<typeof open>>,
+  size: number,
+  readLen: number,
+): Promise<string | undefined> {
+  const start = size - readLen;
+  const buffer = Buffer.alloc(readLen);
+  await handle.read(buffer, 0, readLen, start);
+  let text = buffer.toString("utf8");
+  // Drop a leading partial line when the window did not start at byte 0.
+  if (start > 0) {
+    const firstNewline = text.indexOf("\n");
+    text = firstNewline >= 0 ? text.slice(firstNewline + 1) : "";
+  }
+  const lines = text.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const model = assistantModelFromJsonlLine(lines[i].trim());
+    if (model) {
+      return model;
+    }
+  }
+  return undefined;
 }
 
 function parseJsonObject(line: string): Record<string, unknown> | undefined {
@@ -342,7 +372,13 @@ function assistantModelFromJsonlLine(line: string): string | undefined {
     return undefined;
   }
   const model = (message as { model?: unknown }).model;
-  return typeof model === "string" && model.trim().length > 0 ? model.trim() : undefined;
+  const trimmed = typeof model === "string" ? model.trim() : "";
+  // ⚠️ `<synthetic>` IS NOT A SERVED MODEL (brick ebfe4c3c §2.5). Claude Code stamps
+  // it on assistant entries it generates LOCALLY (an interrupt, a local error), so
+  // accepting it recorded "served <synthetic>" and compared the floor against it —
+  // a false `served_below_floor`. Returning undefined lets the backwards scan reach
+  // the last REAL assistant entry.
+  return trimmed.length > 0 && trimmed !== SYNTHETIC_ASSISTANT_MODEL ? trimmed : undefined;
 }
 
 // ─── Record stamping (served block + breadcrumbs) ───────────────────────────

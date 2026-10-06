@@ -6,8 +6,8 @@ import { reopenSession } from "../src/cli/session/session-control.js";
 import { getPerfMetricsSnapshot, resetPerfMetrics } from "../src/perf-metrics.js";
 import {
   readPersistedLifecycle,
+  writeSessionRecord,
   writeSessionRecordWithLifecycle,
-  writeSessionRecordWithPersistedLifecycle,
 } from "../src/session/persistence.js";
 import { CLOSED_REGRESSION_BLOCKED_COUNTER } from "../src/session/persistence/repository.js";
 import {
@@ -347,7 +347,7 @@ test("R2 (brick 1bfb95ed): a schema-invalid record cannot smuggle closed:false p
     // specimen is actually intact, not that the guard fired.
     const staleIntact = seedRecord(homeDir, id, { closed: false });
     const beforeControl = countBlocked();
-    await writeSessionRecordWithPersistedLifecycle(staleIntact, await readPersistedLifecycle(id));
+    await writeSessionRecord(staleIntact);
     assert.equal(
       countBlocked(),
       beforeControl,
@@ -377,9 +377,9 @@ test("R2 (brick 1bfb95ed): a schema-invalid record cannot smuggle closed:false p
 
     const staleCorrupt = seedRecord(homeDir, id, { closed: false });
     const beforeRed = countBlocked();
-    // The caller's own read ALSO failed (undefined) — exactly what a real
-    // queue-owner checkpoint would have gotten, per LiveSessionCheckpoint.save.
-    await writeSessionRecordWithPersistedLifecycle(staleCorrupt, undefined);
+    // The write's own in-lock read ALSO fails (undefined) on this specimen — the
+    // guard's independent raw read is what must catch it.
+    await writeSessionRecord(staleCorrupt);
     assert.equal(
       countBlocked(),
       beforeRed + 1,
@@ -394,10 +394,8 @@ test("R2 (brick 1bfb95ed): a schema-invalid record cannot smuggle closed:false p
 // NOT an integration test, DELIBERATELY. A file broken badly enough to make
 // JSON.parse itself throw (distinct from the schema-invalid-but-
 // syntactically-valid case R2 exercises above) is ALSO broken for every
-// other reader `writeSessionRecordWithPersistedLifecycle`'s pipeline touches
-// (measured: driving this through the real write entrypoint throws earlier,
-// inside `BrickOutbox.readRecord`'s own `JSON.parse` of the SAME bytes — a
-// different component hitting the identical wall first). There is no file
+// other reader the write pipeline touches (`readPersistedLifecycle` and the
+// record merge parse the SAME bytes first). There is no file
 // content that fails only this guard's own reader. So this tests the
 // PRIMITIVE directly — the guard's own "disk unreadable, non-ENOENT, fail
 // closed" branch is covered by code review plus this, not by an end-to-end

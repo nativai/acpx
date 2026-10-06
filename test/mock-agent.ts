@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
@@ -65,7 +65,6 @@ type MockAgentOptions = {
   closeSessionMarker?: string;
   closeCancelsPrompt: boolean;
   loadSessionNotFound: boolean;
-  loadSessionTranscriptGone: boolean;
   resumeSessionNotFound: boolean;
   loadSessionFailsOnEmpty: boolean;
   setSessionModeFails: boolean;
@@ -83,7 +82,7 @@ type MockAgentOptions = {
   envDumpFile?: string;
   /**
    * Extra environment variable NAMES to include in the env dump, beyond the
-   * ACPX_* / INDEPENDENT_CLAUDE_* / CLAUDE_CONFIG_DIR default. Needed because the
+   * ACPX_* / CLAUDE_CONFIG_DIR default. Needed because the
    * default is an ALLOWLIST, so a test asserting on any other name silently
    * reads `undefined` — which looks exactly like "acpx did not set it".
    */
@@ -91,6 +90,14 @@ type MockAgentOptions = {
   operationLogFile?: string;
   claudeAgentAcp: boolean;
   expectedForkMeta?: unknown;
+  /**
+   * brick ebfe4c3c — the `model` select's options, read from a JSON file
+   * (`[{value,name,description}, …]`), REPLACING the built-in list. This is how a
+   * test makes the mock advertise what the real claude adapter does
+   * ("Opus 5.5 · Best for everyday, complex tasks") — or a version no binary has
+   * shipped, to prove the label follows the advertisement with zero code edits.
+   */
+  modelAdvertisement?: { value: string; name: string; description?: string }[];
 };
 
 type SessionState = {
@@ -406,7 +413,6 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let closeSessionMarker: string | undefined;
   let closeCancelsPrompt = false;
   let loadSessionNotFound = false;
-  let loadSessionTranscriptGone = false;
   let resumeSessionNotFound = false;
   let loadSessionFailsOnEmpty = false;
   let setSessionModeFails = false;
@@ -428,6 +434,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let operationLogFile: string | undefined;
   let claudeAgentAcp = false;
   let expectedForkMeta: unknown;
+  let modelAdvertisement: MockAgentOptions["modelAdvertisement"];
 
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
@@ -456,12 +463,6 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     if (token === "--load-session-not-found") {
       supportsLoadSession = true;
       loadSessionNotFound = true;
-      continue;
-    }
-
-    if (token === "--load-session-transcript-gone") {
-      supportsLoadSession = true;
-      loadSessionTranscriptGone = true;
       continue;
     }
 
@@ -599,6 +600,30 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    if (token === "--model-advertisement") {
+      modelAdvertisement = JSON.parse(
+        readFileSync(parseOptionValue(argv, index + 1, token), "utf8"),
+      ) as MockAgentOptions["modelAdvertisement"];
+      advertiseConfigOptions = true;
+      index += 1;
+      continue;
+    }
+
+    // brick://5a7cf1f0 — DECLARATION ONLY, deliberately with no behavioural effect.
+    //
+    // The sibling `--claude-agent-acp` above switches the mock into SDK-adapter
+    // behaviour. This one switches nothing: its whole job is to make acpx's
+    // `isCodexAcpCommand` classify the session, the way `--claude-agent-acp` does
+    // for claude. Rows that need a Codex-classified session used to get one by
+    // ACCIDENT — they passed `--operation-log …/codex-acp-ops.jsonl`, and the
+    // detector matched the token as a substring of a LOG FILENAME. Now that the
+    // detector matches a path segment (or an adapter-named flag), those rows say
+    // what they mean instead. Accepted and ignored here because the mock's generic
+    // behaviour is exactly what they were getting before.
+    if (token === "--codex-acp") {
+      continue;
+    }
+
     if (token === "--expect-fork-meta-json") {
       const rawValue = parseOptionValue(argv, index + 1, token);
       expectedForkMeta = JSON.parse(rawValue) as unknown;
@@ -654,7 +679,6 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     closeSessionMarker,
     closeCancelsPrompt,
     loadSessionNotFound,
-    loadSessionTranscriptGone,
     resumeSessionNotFound,
     loadSessionFailsOnEmpty,
     setSessionModeFails,
@@ -673,6 +697,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     operationLogFile,
     claudeAgentAcp,
     expectedForkMeta,
+    ...(modelAdvertisement !== undefined ? { modelAdvertisement } : {}),
   };
 }
 
@@ -847,7 +872,7 @@ function buildConfigOptions(
       category: "model",
       type: "select",
       currentValue: state.modelId,
-      options: [
+      options: options.modelAdvertisement ?? [
         { value: "default", name: "Default" },
         { value: "gpt-5.4", name: "gpt-5.4" },
         { value: "gpt-5.2", name: "gpt-5.2" },
@@ -1039,24 +1064,6 @@ class MockAgent implements Agent {
 
     if (this.options.loadSessionNotFound) {
       throw RequestError.resourceNotFound(params.sessionId);
-    }
-
-    if (this.options.loadSessionTranscriptGone) {
-      // Pinned wire shape of the independent-claude-acp bridge's session/load
-      // rejection for a never-prompted session (UIC-4 verification F1).
-      throw new RequestError(
-        -32000,
-        `session/load rejected: Claude session ${params.sessionId} is not resumable (transcript gone)`,
-        {
-          schema: "independent-claude-acp/load-session/v1",
-          reason: "transcript-gone",
-          sessionId: params.sessionId,
-          claudeSessionId: params.sessionId,
-          cwd: params.cwd,
-          homeSelector: "home1",
-          detail: `No transcript at expected path; the Claude session ${params.sessionId} is not resumable.`,
-        },
-      );
     }
 
     const existing = this.sessions.get(params.sessionId);
@@ -1724,16 +1731,11 @@ const mockAgentOptions = parseMockAgentOptions(process.argv.slice(2));
 if (mockAgentOptions.envDumpFile) {
   // Capture the ACPX_* env the adapter was spawned with, so an E2E can assert
   // what acpx injected (ACPX_BRICK, ACPX_AGENT_FOLDER, …). Also capture
-  // the claude-pty bridge selector env (INDEPENDENT_CLAUDE_*) and
   // CLAUDE_CONFIG_DIR so tests can assert both presence AND absence.
   const extra = new Set(mockAgentOptions.envDumpExtra ?? []);
   const acpxEnv: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
-    const captured =
-      key.startsWith("ACPX_") ||
-      key.startsWith("INDEPENDENT_CLAUDE_") ||
-      key === "CLAUDE_CONFIG_DIR" ||
-      extra.has(key);
+    const captured = key.startsWith("ACPX_") || key === "CLAUDE_CONFIG_DIR" || extra.has(key);
     if (captured && typeof value === "string") {
       acpxEnv[key] = value;
     }

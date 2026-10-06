@@ -125,8 +125,8 @@ test("0ededc52: the pin table holds ONLY adapters the registry can launch by npx
   // ⚠️ THE ROW A DEAD ENTRY WOULD HAVE FAILED. `codex: "^0.0.44"` sat here
   // referenced by nothing, naming a version the deployed build was already past
   // (`/opt/codex-acp` is 0.0.45) — a version claim that governed no behaviour and
-  // could not be shown to have expired, in the pinning table itself. claude,
-  // claude-pty and codex are `/opt` builds; a row for any of them reads as a pin
+  // could not be shown to have expired, in the pinning table itself. claude
+  // and codex are `/opt` builds; a row for any of them reads as a pin
   // while pinning nothing, which is exactly how that entry arose.
   //
   // ⚠️ "CAN LAUNCH", NOT "IS LAUNCHING HERE" — and the difference is a live

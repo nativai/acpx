@@ -944,7 +944,7 @@ test("cb214e48: a BOX-level PI_CODING_AGENT_DIR DOES reach it", () => {
 test("cb214e48: PI_CODING_AGENT_SESSION_DIR never survives the copy — for ANY harness", () => {
   // Unconditional: `writePiConfigDir` is its only writer and its value is
   // inherently cwd-specific, so an inherited one can only ever be another
-  // session's. pi re-sets its own afterwards; claude / claude-pty / codex carry it
+  // session's. pi re-sets its own afterwards; claude / codex carry it
   // today for no reason at all.
   withProcessEnv(
     "PI_CODING_AGENT_SESSION_DIR",
@@ -1744,10 +1744,8 @@ test("buildAgentSpawnOptions leaves ACPX_AGENT_TYPE UNSET for an unclassifiable 
   try {
     // `undefined` = no agent command reached the env builder at all; the second
     // is a well-formed command for an adapter no detector knows.
-    // NOT covered: an EMPTY agentCommand — `buildAgentEnvironment` throws
-    // "Invalid --agent command: empty command" from `isClaudePtyAgentCommand`
-    // further down, pre-existing behavior unrelated to this variable
-    // (`harnessIdForAgentCommand` short-circuits an empty command by contract).
+    // NOT covered: an EMPTY agentCommand — pre-existing behavior unrelated to this
+    // variable (`harnessIdForAgentCommand` short-circuits an empty command by contract).
     for (const agentCommand of [undefined, "node /opt/some-unknown-acp/dist/index.js"]) {
       const options = buildAgentSpawnOptions(
         "/tmp/acpx-agent",
@@ -1890,22 +1888,6 @@ test("buildAgentSpawnOptions does not leak CLAUDE_CONFIG_DIR into a non-claude c
       false,
       "a pi session must not receive a pointer into a Claude subscription's credential dir",
     );
-  });
-});
-
-test("buildAgentSpawnOptions does not leak CLAUDE_CONFIG_DIR into a claude-pty child", () => {
-  // The subscription branch documents claude-pty as getting "no CLAUDE_CONFIG_DIR"
-  // (the bridge owns auth via its HOME selector) — but it never cleared an
-  // INHERITED one, so the code contradicted its own comment.
-  withPoisonedConfigDir(() => {
-    const options = buildAgentSpawnOptions(
-      "/tmp/acpx-agent",
-      undefined,
-      { acpxRecordId: "11111111-2222-3333-4444-555555555555" },
-      undefined,
-      "node /opt/claude-pty-acp/dist/index.js",
-    );
-    assert.equal(Object.prototype.hasOwnProperty.call(options.env, "CLAUDE_CONFIG_DIR"), false);
   });
 });
 

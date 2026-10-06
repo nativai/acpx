@@ -151,7 +151,7 @@ export type HarnessPrimerChannel =
 
 /** A model's identity for the picker: the `(source, id)` pair (C5 §8.1). */
 export interface HarnessDefaultModel {
-  /** C5's model-source vocabulary: `openrouter | claude-subscription | claude-home | chatgpt`. */
+  /** C5's model-source vocabulary: `openrouter | claude-subscription | chatgpt`. */
   source: string;
   /**
    * The model id, or the literal `default` when acpx pins nothing and the
@@ -481,7 +481,7 @@ export type HarnessAdapterIdentity =
    *
    * ⚠️ **WHICH ADAPTERS THOSE ARE IS NOT FIXED — IT CHANGES WHEN A BOOTSTRAP
    * SHIPS.** Measured 2026-09-05, `info.json` carried `acpx`, `acpx-ui`,
-   * `claude-agent-acp`, `claude-pty-acp`, `codex-acp` and not `pi-acp`.
+   * `claude-agent-acp`, `codex-acp` and not `pi-acp`.
    * **Re-measured on devbox 2026-09-06T23:00Z it carries `pi` and
    * `pi-acp` too** (`pi-acp` → `af431c6e`, `state: ok`, `ref: main`), because the
    * `e50f051` bootstrap built the fork onto the fleet that morning. So pi now
@@ -970,7 +970,7 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
     // `setSessionProfile` (src/cli/session/session-control.ts:343-377) — admits a
     // record only through `assertClaudeFamilySeam`
     // (src/runtime/engine/account-seam.ts:111-120 → `isClaudeFamilyAgent`,
-    // src/acp/agent-command.ts:226-232, whose set is {claude, claude-pty}). The move
+    // src/acp/agent-command.ts:226-232, whose set is {claude}). The move
     // is a record edit + transcript port + owner restart, so the SESSION survives
     // even though the adapter process does not — which is what "live" means here.
     // A `subscription` profile has a transcript anchor (`credentialSource`,
@@ -1008,7 +1008,7 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
       // and the bundled CLI went 0.144.1 → 0.153.3. A citation carrying only the
       // package version would have read as current across a bump that changed
       // the harness's depth vocabulary. This is the same limit spelled out for
-      // claude-pty, arriving on a harness that does have a real version.
+      // another harness, arriving on one that does have a real version.
       //
       // ⚠️ The box's own `codex` on PATH is a DIFFERENT build from the one the
       // adapter bundles (measured: 0.144.6 on PATH against 0.144.1 bundled,
@@ -1026,7 +1026,7 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
     label: "codex",
     // A `chatgpt` profile is bound to codex (src/config/profiles.ts:145-156,
     // re-asserted at spawn src/acp/auth-env.ts:1213-1226). Note acpx-ui's LIVE
-    // profile-switch route stays gated to claude/claude-pty (CONCEPTION §9.2).
+    // profile-switch route stays gated to claude (CONCEPTION §9.2).
     supportsProfiles: true,
     supportsOutputStyles: false, // MAP §3.1 — zero `outputStyle` references in codex-acp
     arbitraryModelSupport: "none", // CONCEPTION §7.4 — fixed backend; ids are `family[effort]`
@@ -1090,7 +1090,7 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
     // is a SUBSTRING FALSE POSITIVE — `case "thread/goal/cleared":`
     // (/opt/codex-acp/dist/index.js, `grep -rao` 2026-09-05). It is recorded here
     // because it reads as evidence at a glance and is not; the same probe's
-    // claude-pty "hit" was `set/clear ACPX_PARENT_SESSION_URL` in a sourcemap.
+    // claude "hit" was `set/clear ACPX_PARENT_SESSION_URL` in a sourcemap.
     supportsSessionClear: false,
     sessionClearBlockedReason:
       "not measured: no probe has sent /clear as a prompt through codex-acp to the codex app-server to see whether it is executed as a slash command.",
@@ -1098,7 +1098,7 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
     // question: codex is `supportsProfiles: true` (a `chatgpt` profile binds to it
     // at creation) and still cannot move credential live, for two independent
     // reasons. (1) `assertClaudeFamilySeam` (src/runtime/engine/account-seam.ts:111-120)
-    // refuses every non-{claude, claude-pty} adapter BEFORE any work, and throws
+    // refuses every non-claude adapter BEFORE any work, and throws
     // rather than no-ops on purpose. (2) Even inside the seam, `requireAnchor`
     // (:82-90) would refuse: `transcriptAnchorDir` returns null for `chatgpt`
     // (src/config/profiles.ts:854-865) — there is no Claude transcript to port.
@@ -1492,7 +1492,7 @@ export function resolveHarnessCapabilities(
  * whether acpx has an apply path for the harness's depth mechanism.
  *
  * This is the predicate the CLI's "ignoring for agent X" warning dispatches on,
- * replacing a hard-coded `name === "claude" || name === "claude-pty"` gate
+ * replacing a hard-coded `name === "claude"` gate
  * (CONCEPTION §9.1, §2.5). The name gate was wrong in both directions at once:
  * the APPLY path is already capability-gated (an advertised `effort` config
  * option, `src/session/config-option-application.ts:252`), so a harness that

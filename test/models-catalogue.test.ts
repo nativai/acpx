@@ -257,52 +257,6 @@ test("merge: codex has no static native rows; its ACP advertisement is authorita
   );
 });
 
-/**
- * 🔒 THE RE-MEASURE TRIGGER, MADE ENFORCEABLE.
- *
- * This is a change-detector ON PURPOSE. `CODEX_FAMILIES` is a frozen
- * measurement, not a product list, so an edit to it must be a deliberate act
- * that updates a cited expectation — never a name someone added from release
- * notes. The list here carries the same scope as the constant: it is what
- * `codex-acp 0.0.45` / `@openai/codex 0.144.1` advertised ON DEVBOX, ON THIS
- * BOX'S CODEX CREDENTIAL, at 2026-09-04T22:36Z (brick://db554b05). codex's
- * models-manager refreshes remotely, per account — so this is not a fleet fact.
- *
- * What it caught: `gpt-5.4`, `gpt-5.3-codex` and `gpt-5.2` were listed and are
- * advertised at NEITHER 0.144.1 NOR 0.153.3 — phantom rows that `acpx models
- * show` printed with a full ladder and that no `--model` form could spawn.
- *
- * THE PIN HAS MOVED, AND THIS EXPECTATION GAINED ITS ROW — 2026-09-05, adapter
- * `codex-acp 42987b87` / `@openai/codex ^0.153.3`: the advertised set is those
- * six PLUS `gpt-6-astra` (35 ids over seven families), no family retired and
- * none returned. `gpt-6-astra` sits at index 1 because the constant places it
- * there deliberately — acpx-ui's mirror treats index 0 as the create-time
- * default and Astra is opt-in — so this list asserts ORDER as well as membership.
- *
- * ⚠️ THIS ROW WENT RED FOR THE RIGHT REASON AND ITS OWN TEXT SAID WHAT TO DO.
- * The previous version of this comment ended "so when the pin moves, this
- * expectation gains a row". The pin moved at 2026-09-05T01:22Z (the bump merged
- * into the program branch) and nothing added the row: the constant was corrected
- * on `main` by a different lane, and this expectation — which encodes the SAME
- * measurement — was not, so the two contradicted until the composition was gated.
- * A rule written into a comment has a reader, never an agent. If a future reader
- * finds this list disagreeing with the constant again, the constant is not
- * automatically right: BOTH are transcriptions of one wire measurement, and
- * brick://8ca68c82 (sourcing the catalogue from the advertisement) is the fix
- * that removes the second copy.
- *
- * If it ever needs to LOSE a row, something happened that is worth understanding
- * before editing the constant.
- */
-test("merge: one id under two sources is two rows with two keys (C5 D2)", () => {
-  const rows = harnessNativeModels().filter((m) => m.id === "opus");
-  assert.deepEqual(rows.map((m) => m.key).toSorted(), [
-    "claude-home:opus",
-    "claude-pty:opus",
-    "claude-subscription:opus",
-  ]);
-});
-
 // ── The availability join ────────────────────────────────────────────────────
 
 test("availability: an EMPTY capability table yields an empty map, never a guess", () => {

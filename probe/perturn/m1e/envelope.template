@@ -1,0 +1,7 @@
+<acpx-turn-context>
+Inserted automatically by acpx (the agent runtime) before this turn. This is NOT part of
+the user's message: the user did not write it. Do not attribute it to the user or refer
+back to it as something the user said.
+
+@@DELTA@@
+</acpx-turn-context>

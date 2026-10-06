@@ -516,8 +516,6 @@ function ownedConfigDir(profile: ProfileEntry): string | null {
   switch (profile.authMode) {
     case "subscription":
       return profile.credentialSource;
-    case "claude-home":
-      return profile.homePath;
     case "chatgpt":
       return null;
   }

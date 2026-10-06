@@ -1,0 +1,9 @@
+m1e-clean claude-agent-acp PTN-DB99114F
+m1e-clean codex-acp PTN-CD946AA0
+m1e-clean pi-acp PTN-1E550580
+m1e-adverse codex-acp PTN-4BACEA0C
+m1e-prodpath-turn2 codex-acp PTN-6229F10A
+m1e-adverse-t1-bare claude-agent-acp PTN-2B39A593
+m1e-adverse-t1-bare pi-acp PTN-8380AF2D
+m1e-adverse-t2-V2 claude-agent-acp PTN-99B1E059
+m1e-adverse-t2-V2 pi-acp PTN-2C119A76

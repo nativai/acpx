@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { openRecordOutbox, type DiskRecord } from "../../brick-outbox.js";
 import { hydrateSessionMessagesFromLog, messagesLogPath } from "../../session/messages-log.js";
 import { parseSessionRecord } from "../../session/persistence/parse.js";
 import { serializeSessionRecordForDisk } from "../../session/persistence/serialize.js";
+import { openSpawnLedgerForRecord, type DiskRecord } from "../../spawn-ledger.js";
 import type { AcpFileSessionStoreOptions, AcpSessionRecord, AcpSessionStore } from "./contract.js";
 
 function safeSessionId(sessionId: string): string {
@@ -63,13 +63,12 @@ class FileSessionStore implements AcpSessionStore {
     const persisted = serializeSessionRecordForDisk(record);
 
     const file = this.filePath(record.acpxRecordId);
-    const outbox = openRecordOutbox(record.metadata, this.sessionDir);
-    if (outbox) {
+    const ledger = openSpawnLedgerForRecord(record.metadata, this.sessionDir);
+    if (ledger) {
       try {
-        const raw = persisted as DiskRecord;
-        outbox.saveRecord(raw);
+        await ledger.saveRecordAsync(persisted as DiskRecord);
       } finally {
-        outbox.close();
+        ledger.close();
       }
       return;
     }

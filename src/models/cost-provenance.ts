@@ -30,7 +30,7 @@
  * ## `coverage: null` means exactly ONE thing
  *
  * **"Not decomposable by construction"** — the harness handed us a single
- * cumulative total with no units to count (claude and claude-pty both
+ * cumulative total with no units to count (claude both
  * report `cost` and no token breakdown). **"We did not check" can never produce
  * `null`**: every derivation that has units emits counts, so a `null` from a
  * unit-bearing source would be a bug, not a state.

@@ -643,8 +643,8 @@ export class SubscriptionRemoveInUseError extends AcpxOperationalError {
   }
 }
 
-// A claude-home (PTY bridge) turn failed because the bridge's Claude login is
-// gated/expired and no sibling bridge has a usable login. NOT quota — detailCode
+// A turn failed because the adapter's Claude login is gated/expired and no
+// sibling account has a usable login. NOT quota — detailCode
 // 'auth-gated' so acpx-ui renders the existing AuthGatedBanner (keyed on
 // lastError.code === 'auth-gated'), never the exhausted/quota one. Sibling of
 // AllSubscriptionsExhaustedError; the record's selection is left unchanged so a
@@ -692,8 +692,8 @@ export class ProfileUnknownError extends AcpxOperationalError {
 }
 
 // A `set profile` move was requested across credential classes (e.g. an SDK
-// subscription session → a claude-pty bridge profile). The auth layer requires
-// a move to stay within the session's adapter/authMode class (claude-home⟺claude-pty
+// subscription session → a chatgpt profile). The auth layer requires
+// a move to stay within the session's adapter/authMode class (chatgpt⟺codex
 // vs subscription⟺SDK), so the move is refused before it can wedge the next
 // turn's auth.
 export class ProfileClassMismatchError extends AcpxOperationalError {
@@ -706,7 +706,7 @@ export class ProfileClassMismatchError extends AcpxOperationalError {
     super(
       `Cannot move session to profile "${params.targetId}" (authMode "${params.targetAuthMode}"): ` +
         `the session's current credential "${params.currentId}" is authMode "${params.currentAuthMode}". ` +
-        `A move must stay within the same credential class (subscription↔subscription or claude-home↔claude-home).`,
+        `A move must stay within the same credential class (subscription↔subscription or chatgpt↔chatgpt).`,
       {
         outputCode: "USAGE",
         detailCode: "PROFILE_CLASS_MISMATCH",

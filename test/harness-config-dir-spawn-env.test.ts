@@ -29,7 +29,7 @@ import type { AcpClientOptions } from "../src/types.js";
 // ⚠️ WHAT IT STILL CANNOT SEE: whether the harness READ the files. That needs a
 // real Pi turn on the rig.
 //
-// ⚠️ THE MOCK AGENT'S ENV DUMP IS AN ALLOWLIST (ACPX_* / INDEPENDENT_CLAUDE_* /
+// ⚠️ THE MOCK AGENT'S ENV DUMP IS AN ALLOWLIST (ACPX_* /
 // CLAUDE_CONFIG_DIR). The three names under test are NONE of those, so without
 // `--env-dump-extra` every one reads `undefined` — INDISTINGUISHABLE from "acpx
 // never set it", and this whole file would pass while proving nothing. hp-b1-acpx
@@ -65,7 +65,6 @@ const CONFIG_DIR_NAMES = [
  */
 const HARNESS_DIR_TOKENS: Record<string, string> = {
   claude: "claude-agent-acp",
-  "claude-pty": "claude-pty-acp",
   codex: "codex-acp",
   pi: "pi-acp",
 };
@@ -73,7 +72,6 @@ const HARNESS_DIR_TOKENS: Record<string, string> = {
 /** Which harnesses MUST receive a config dir, and exactly which names. */
 const EXPECTED: Record<string, string[]> = {
   claude: [],
-  "claude-pty": [],
   codex: [],
   pi: ["PI_CODING_AGENT_DIR"],
 };
@@ -172,7 +170,7 @@ async function scopeTmpDir(): Promise<() => Promise<void>> {
   };
 }
 
-test("RS-13: config-dir vars reach pi ONLY — claude/claude-pty/codex EMPTY", async () => {
+test("RS-13: config-dir vars reach pi ONLY — claude/codex EMPTY", async () => {
   const observed: Record<string, string[]> = {};
   const populations: Record<string, number> = {};
 
@@ -211,7 +209,7 @@ test("RS-13: config-dir vars reach pi ONLY — claude/claude-pty/codex EMPTY", a
   const gained = Object.entries(observed).filter(([, names]) => names.length > 0);
   const empty = Object.entries(observed).filter(([, names]) => names.length === 0);
   assert.equal(gained.length, 1, "exactly pi must gain config-dir vars");
-  assert.equal(empty.length, 3, "exactly claude, claude-pty and codex must gain none");
+  assert.equal(empty.length, 2, "exactly claude and codex must gain none");
 });
 
 test("RS-13 control: the probe CAN see these names — a planted value is captured", async () => {

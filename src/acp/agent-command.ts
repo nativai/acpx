@@ -7,6 +7,7 @@ import {
   resolveWindowsCommand,
 } from "../spawn-command-options.js";
 import { type AcpClientOptions } from "../types.js";
+import { commandCarriesAdapterToken } from "./adapter-token.js";
 import { basenameToken, splitCommandLine } from "./client-process.js";
 import { isCodexAcpCommand } from "./codex-compat.js";
 
@@ -63,12 +64,19 @@ export function isGeminiAcpCommand(command: string, args: readonly string[]): bo
   );
 }
 
+/**
+ * brick://5a7cf1f0 — SEGMENT match, not substring; same defect class as
+ * `isCodexAcpCommand`, fixed with the same helper. Rationale in
+ * `adapter-token.ts`.
+ *
+ * Safe for the claude shape by measurement, not by assumption: `Projects/acpx/
+ * PROJECT.md` records that EVERY real claude record is a
+ * `…/claude-agent-acp/…/index.js` path (measured across all 2,924 records), so the
+ * token is always its own directory segment. Verified again on this box's live
+ * store before the change landed — no record's classification moved.
+ */
 export function isClaudeAcpCommand(command: string, args: readonly string[]): boolean {
-  const commandToken = basenameToken(command);
-  if (commandToken === "claude-agent-acp") {
-    return true;
-  }
-  return args.some((arg) => arg.includes("claude-agent-acp"));
+  return commandCarriesAdapterToken(command, args, "claude-agent-acp");
 }
 
 // String-level variant of isClaudeAcpCommand for callers that hold the unsplit
@@ -78,25 +86,6 @@ export function isClaudeAcpCommand(command: string, args: readonly string[]): bo
 export function isClaudeAcpAgentCommand(agentCommand: string): boolean {
   const { command, args } = splitCommandLine(agentCommand);
   return isClaudeAcpCommand(command, args);
-}
-
-// The claude-pty bridge (independent-claude-acp). Matches the bootstrapped
-// built default (`node /opt/claude-pty-acp/dist/index.js`), the root shim,
-// and dev overrides via ACPX_CLAUDE_PTY_ACP_COMMAND or a config.json `agents`
-// entry pointing at a checkout (any path containing the repo name or the
-// server script name). Deliberately does NOT overlap isClaudeAcpCommand
-// ("claude-agent-acp"), so the SDK-adapter-specific handling never applies.
-export function isClaudePtyAcpCommand(command: string, args: readonly string[]): boolean {
-  return [command, ...args].some(
-    (part) => part.includes("claude-pty-acp") || part.includes("acp-server-transcript"),
-  );
-}
-
-// String-level variant for callers that hold the unsplit agentCommand
-// (auth-env validation, session-create compatibility checks).
-export function isClaudePtyAgentCommand(agentCommand: string): boolean {
-  const { command, args } = splitCommandLine(agentCommand);
-  return isClaudePtyAcpCommand(command, args);
 }
 
 export function isCopilotAcpCommand(command: string, args: readonly string[]): boolean {
@@ -137,7 +126,7 @@ export function isPiAcpCommand(command: string, args: readonly string[]): boolea
  * `resolveAgentNameFromCommand`, which requires an exact registry-string match
  * and would miss dev overrides / `--agent` custom commands.
  *
- *  - `system-prompt`           → claude + claude-pty (`_meta.systemPrompt {append}`)
+ *  - `system-prompt`           → claude (`_meta.systemPrompt {append}`)
  *  - `developer-instructions`  → codex (`_meta.codex.developerInstructions`)
  *  - `none`                    → unknown agents (inject nothing — safe)
  */
@@ -145,7 +134,7 @@ export type PrimerChannel = "system-prompt" | "developer-instructions" | "none";
 
 export function resolvePrimerChannel(agentCommand: string): PrimerChannel {
   const { command, args } = splitCommandLine(agentCommand);
-  if (isClaudeAcpCommand(command, args) || isClaudePtyAcpCommand(command, args)) {
+  if (isClaudeAcpCommand(command, args)) {
     return "system-prompt";
   }
   if (isCodexAcpCommand(command, args)) {
@@ -157,11 +146,6 @@ export function resolvePrimerChannel(agentCommand: string): PrimerChannel {
 /**
  * ORDER IS PART OF THE CONTRACT — first match wins.
  *
- * `claude-pty` sits before `claude`: the two detectors are disjoint today
- * (`acp-server-transcript` / `claude-pty-acp` vs `claude-agent-acp`), but the
- * PTY check stays first so a future spelling that satisfies both cannot silently
- * resolve to the SDK adapter, whose per-adapter handling is different.
- *
  * `pi` was added by B0.2 so ONE classifier answers for every harness the
  * capability descriptor declares. Widening this table can only make the
  * copy/fork agent-lock MORE permissive, and only between two spellings of the
@@ -170,7 +154,6 @@ export function resolvePrimerChannel(agentCommand: string): PrimerChannel {
 const ADAPTER_KIND_DETECTORS: ReadonlyArray<
   [string, (command: string, args: readonly string[]) => boolean]
 > = [
-  ["claude-pty", isClaudePtyAcpCommand],
   ["claude", isClaudeAcpCommand],
   ["codex", isCodexAcpCommand],
   ["gemini", isGeminiAcpCommand],
@@ -182,11 +165,8 @@ const ADAPTER_KIND_DETECTORS: ReadonlyArray<
  * The canonical ADAPTER TYPE for an agent command, derived from the substring
  * command detectors (NOT `resolveAgentNameFromCommand`, which requires an exact
  * registry-string match). Two command spellings that drive the same adapter map
- * to the same kind — most notably the claude-pty bridge, whose deployed
- * `.../dist/index.js` (registry default) and `.../acp-server-transcript.mjs`
- * root shim are byte-for-byte the same program (the shim just re-exports
- * `dist/index.js`), plus any `ACPX_CLAUDE_PTY_ACP_COMMAND` / config `agents`
- * override pointing at a checkout. Returns `undefined` for a raw/unknown command
+ * to the same kind — e.g. a deployed `.../dist/index.js` registry default and a
+ * config `agents` override pointing at a checkout. Returns `undefined` for a raw/unknown command
  * so callers can fall back to strict command-string identity for genuine escape
  * hatches. Used by the copy/fork agent-lock so a same-adapter copy under a
  * different command spelling is not misread as a cross-agent copy, and — since
@@ -204,7 +184,7 @@ export function acpAdapterKind(agentCommand: string): string | undefined {
 }
 
 /** The adapter kinds whose credential IS a Claude account. Not a list to extend casually. */
-const CLAUDE_FAMILY_ADAPTER_KINDS: ReadonlySet<string> = new Set(["claude", "claude-pty"]);
+const CLAUDE_FAMILY_ADAPTER_KINDS: ReadonlySet<string> = new Set(["claude"]);
 
 /**
  * THE ONE PREDICATE for the account/subscription seam (CONCEPTION §5.5): *the
@@ -326,7 +306,7 @@ export function buildPrimerSessionMeta(
     return primerPlusBrick ? { codex: { developerInstructions: primerPlusBrick } } : undefined;
   }
 
-  // system-prompt channel (claude, claude-pty).
+  // system-prompt channel (claude).
   if (typeof humanSystemPrompt === "string" && humanSystemPrompt.length > 0) {
     // Human `--system-prompt` replace wins — skip the auto-primer and brick context (Q4/W10).
     return undefined;
@@ -345,7 +325,7 @@ export function buildPrimerSessionMeta(
  * in separator (brick 968519c3).
  *
  *  - the STREAM leg: {@link buildPrimerSessionMeta} above, for the harnesses
- *    whose primer rides an ACP `_meta` channel (claude, claude-pty, codex);
+ *    whose primer rides an ACP `_meta` channel (claude, codex);
  *  - the CONFIG-DIR leg: `applyHarnessConfigDirEnv` in `src/acp/client.ts`,
  *    for the harnesses whose only working primer path is a file in a per-session
  *    config dir (pi — `primerChannel === "config-file"`).

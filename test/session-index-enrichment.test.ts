@@ -126,7 +126,7 @@ test("toSessionIndexEntry projects every hot scalar from the record", () => {
 });
 
 test("promptImageSupported derivation mirrors acpx-ui's extractPromptImageSupported", () => {
-  // true → projected true (e.g. codex / claude-pty that advertise image:true)
+  // true → projected true (e.g. codex that advertise image:true)
   assert.equal(
     toSessionIndexEntry(
       enrichedRecord({ agentCapabilities: { promptCapabilities: { image: true } } }),

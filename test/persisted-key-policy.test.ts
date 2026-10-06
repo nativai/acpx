@@ -178,7 +178,7 @@ test("serializeSessionRecordForDisk rejects the provisioning_warning breadcrumb'
       provisioning_warning: {
         at: "2026-06-13T12:00:00.000Z",
         profileId: "home1",
-        authMode: "claude-home",
+        authMode: "subscription",
         message: "hook install failed",
       },
     },

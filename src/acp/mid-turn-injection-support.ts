@@ -1,4 +1,4 @@
-import { isClaudeAcpCommand, isClaudePtyAcpCommand } from "./agent-command.js";
+import { isClaudeAcpCommand } from "./agent-command.js";
 import { splitCommandLine } from "./client-process.js";
 import { isCodexAcpCommand } from "./codex-compat.js";
 import { harnessIdForAgentCommand, HARNESS_FACTS } from "./harness-capabilities.js";
@@ -6,13 +6,13 @@ import { harnessIdForAgentCommand, HARNESS_FACTS } from "./harness-capabilities.
 /**
  * Whether a mid-turn steer can be injected into this backend's active turn.
  *
- * B3: this was a hardcoded claude / codex / claude-pty name allow-list. It is now
+ * B3: this was a hardcoded claude / codex name allow-list. It is now
  * the capability descriptor's `midTurnSteering` cell, so the declared capability
  * and the shipped behaviour cannot disagree — which is the entire failure mode
  * the descriptor exists to end. `test/harness-capabilities.test.ts` pins the two
  * against each other for every harness.
  *
- * ⚠️ The ANSWERS ARE UNCHANGED, deliberately. claude / claude-pty / codex declare
+ * ⚠️ The ANSWERS ARE UNCHANGED, deliberately. claude / codex declare
  * `midTurnSteering: true` and pi declares `false` (I2 R3 — its adapter does not
  * support it). This is a change of SOURCE, not of behaviour: it must stay
  * that way, because widening steering to a harness that cannot absorb an injected
@@ -30,15 +30,7 @@ export function supportsMidTurnPromptInjection(agentCommand: string): boolean {
       return HARNESS_FACTS[harness].midTurnSteering;
     }
     const { command, args } = splitCommandLine(agentCommand);
-    return (
-      isClaudeAcpCommand(command, args) ||
-      isCodexAcpCommand(command, args) ||
-      // The claude-pty bridge's interactive TUI supports native mid-turn steering, so
-      // enable injection: a steer is typed straight into the running terminal rather
-      // than serialized behind the active turn. (Was omitted only because this gate
-      // predated the bridge; not a deliberate exclusion.)
-      isClaudePtyAcpCommand(command, args)
-    );
+    return isClaudeAcpCommand(command, args) || isCodexAcpCommand(command, args);
   } catch {
     return false;
   }
@@ -52,8 +44,6 @@ export function supportsMidTurnPromptInjection(agentCommand: string): boolean {
 //   Claude ACP  → a separate concurrent client.prompt() that resolves with
 //                 result(stopReason) and can outlive the primary — the RCA bug;
 //                 awaiting it IS the fix.
-//   claude-pty  → injectSteer() always resolves with a terminal (steer-ack on a
-//                 landed paste, else the turn-end fallback) — safe to await.
 //   Codex       → acts on the steer WITHIN the active turn and returns NO
 //                 terminal for the injected request → must stay fire-and-forget
 //                 (awaiting it would hold the turn open until the backstop).
@@ -71,14 +61,14 @@ export function injectionReturnsTerminalResponse(agentCommand: string): boolean 
       return true;
     }
     const { command, args } = splitCommandLine(agentCommand);
-    return isClaudeAcpCommand(command, args) || isClaudePtyAcpCommand(command, args);
+    return isClaudeAcpCommand(command, args);
   } catch {
     return false;
   }
 }
 
 // Whether this backend's adapter emits an end-of-turn marker session update
-// (`_claude/lastTurnEndReason` for Claude / claude-pty; `_codex/lastTurnEndReason`
+// (`_claude/lastTurnEndReason` for Claude; `_codex/lastTurnEndReason`
 // for codex-acp since the 493729fc F1 fix) that the C1 turn-completion watchdog
 // can arm on. Safe to include a backend whose DEPLOYED adapter predates its
 // marker: the watchdog only starts timers when a marker is actually seen, so
@@ -86,11 +76,7 @@ export function injectionReturnsTerminalResponse(agentCommand: string): boolean 
 export function emitsTurnEndMarker(agentCommand: string): boolean {
   try {
     const { command, args } = splitCommandLine(agentCommand);
-    return (
-      isClaudeAcpCommand(command, args) ||
-      isClaudePtyAcpCommand(command, args) ||
-      isCodexAcpCommand(command, args)
-    );
+    return isClaudeAcpCommand(command, args) || isCodexAcpCommand(command, args);
   } catch {
     return false;
   }

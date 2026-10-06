@@ -150,33 +150,6 @@ test("removeProfileFromRegistry preserves sibling lock metadata and quarantined 
   });
 });
 
-test("removeProfileFromRegistry removes a claude-home bridge, which the subscriptions view hides", async () => {
-  await withTempDir(async (homeDir) => {
-    const registryPath = await writeRegistry(homeDir, {
-      default: "sub1",
-      profiles: [
-        subscriptionProfile("sub1"),
-        {
-          id: "bridge1",
-          label: "Claude Bridge (claude-pty)",
-          authMode: "claude-home",
-          adapter: "claude-pty",
-          account: "bridge1",
-          credentialSource: null,
-          homePath: "/home/node/.acpx/subscriptions/bridge1",
-        },
-      ],
-    });
-
-    const result = removeProfileFromRegistry("bridge1", { homeDir, registryPath });
-
-    assert.ok(result);
-    assert.deepEqual(result.remaining, ["sub1"]);
-    assert.equal(result.wasDefault, false);
-    assert.equal(result.newDefault, "sub1");
-  });
-});
-
 test("removeProfileFromRegistry also drops a legacy v1 subscriptions[] entry", async () => {
   await withTempDir(async (homeDir) => {
     const registryPath = await writeRegistry(homeDir, {

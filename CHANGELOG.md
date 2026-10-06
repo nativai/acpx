@@ -101,6 +101,19 @@ Repo: https://github.com/openclaw/acpx
   legacy-environment policy retains the previous soft 0.90 behavior. Usage JSON
   now exposes vendor availability, automation eligibility, the effective ceiling,
   reason, provenance, and telemetry freshness.
+- Models: Claude model names now come from the adapter itself. Every
+  `claude-subscription` row in `acpx models` is named with the label the
+  bundled Claude Code binary advertises for that alias, probed once per
+  deployed adapter build on a transient session (no prompt, no tokens, no
+  record), cached in `~/.acpx/claude-advertisement.json`, and cited per row
+  (`advertisedBy`) and in the footer; the envelope's `claudeAdvertisement`
+  reports `fresh` / `stale` / `none`. The hardcoded, version-bearing names are
+  gone — with no advertisement the rows read `Default` / `Opus` / `Sonnet` /
+  `Haiku` / `Fable`. `acpx models --refresh` also re-probes the adapter. The
+  session index gains `resolvedModelLabel` (the session's own advertised label)
+  and `servedModel` (what the API last served), and the new
+  `acpx sessions reindex` backfills them. A locally generated `<synthetic>`
+  transcript entry is no longer recorded as the served model. (brick ebfe4c3c)
 
 ### Breaking
 

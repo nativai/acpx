@@ -1,4 +1,4 @@
-import { isClaudeAcpCommand, isClaudePtyAgentCommand } from "../../acp/agent-command.js";
+import { isClaudeAcpCommand } from "../../acp/agent-command.js";
 import { splitCommandLine } from "../../acp/client-process.js";
 import { isCodexAcpCommand } from "../../acp/codex-compat.js";
 import {
@@ -69,12 +69,9 @@ function autoTimeoutMs(isFable: boolean): number {
 
 // Only the SDK claude adapter has per-subscription CLAUDE_CONFIG_DIRs. Mirror
 // default-account-binding's `adapterForAgentCommand(...) === "claude"` guard
-// (codex / gemini / claude-pty all fall through as a no-op). Re-derived here
+// (codex / gemini all fall through as a no-op). Re-derived here
 // rather than imported to avoid a cycle with default-account-binding.
 function isClaudeAdapterCommand(agentCommand: string): boolean {
-  if (isClaudePtyAgentCommand(agentCommand)) {
-    return false;
-  }
   const split = splitCommandLine(agentCommand);
   if (isCodexAcpCommand(split.command, split.args)) {
     return false;

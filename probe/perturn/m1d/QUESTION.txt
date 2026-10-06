@@ -1,0 +1,1 @@
+Answer with exactly two lines and nothing else. Line 1: the value of PERTURN-NONCE you received this turn, or NONE if you received none. Line 2: exactly one word — USER if that value was provided by the user in their message, or SYSTEM if it was provided by the system as injected turn context.

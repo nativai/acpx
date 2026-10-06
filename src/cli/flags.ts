@@ -52,7 +52,7 @@ export type GlobalFlags = PermissionFlags & {
   format: OutputFormat;
   model?: string;
   // Opaque string at parse time — validated against the profile's valid set at
-  // execution time (subscription/claude-home: low/medium/high/xhigh/max).
+  // execution time (subscription: low/medium/high/xhigh/max).
   reasoningEffort?: string;
   /**
    * `--output-style <name>` (brick://874fee67): the Claude Code output style for
@@ -599,7 +599,7 @@ export function addGlobalFlags(command: Command): Command {
     )
     .option(
       "--profile <id>",
-      "Profile id from the profiles registry (subscription, claude-home, or chatgpt auth mode)",
+      "Profile id from the profiles registry (subscription or chatgpt auth mode)",
     )
     .option(
       "--allowed-tools <list>",
