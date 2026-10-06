@@ -138,14 +138,21 @@ export function resolveSessionTargetSelector(params: {
   return {
     sessionId: flags.sessionId,
     sessionUrl: flags.sessionUrl,
-    seat: flags.seat,
+    ...(flags.seat === undefined ? {} : { seat: flags.seat }),
   };
 }
 
 function assertSingleExplicitSelector(flags: SessionSelectorFlags): void {
-  const given = [flags.seat, flags.sessionId, flags.sessionUrl].filter((v) => v !== undefined);
-  if (given.length > 1) {
-    throw new InvalidArgumentError("Pass only one of --seat, --session-id or --session-url");
+  if (
+    flags.seat !== undefined &&
+    (flags.sessionId !== undefined || flags.sessionUrl !== undefined)
+  ) {
+    throw new InvalidArgumentError(
+      "--seat cannot be combined with --session-id or --session-url — pass one address",
+    );
+  }
+  if (flags.sessionId !== undefined && flags.sessionUrl !== undefined) {
+    throw new InvalidArgumentError("Pass only one of --session-id or --session-url");
   }
 }
 

@@ -753,9 +753,15 @@ export function resolveSessionSelectorFromFlags(
     session: resolveSessionNameFromFlags(flags, command),
     sessionId: resolveStringFlagFromScopes("Session id", "sessionId", flags, command),
     sessionUrl: resolveStringFlagFromScopes("Session URL", "sessionUrl", flags, command),
-    // Own flags only — never a parent scope (see addSeatSelectorOption).
-    seat: parseOptionalNonEmptyFlag("Seat", flags.seat),
+    // Own flags only — never a parent scope (see addSeatSelectorOption). Present only when
+    // given, so a verb without `--seat` sees exactly the selector it always did.
+    ...seatSelectorFlag(flags),
   };
+}
+
+function seatSelectorFlag(flags: SessionSelectorFlags): { seat?: string } {
+  const seat = parseOptionalNonEmptyFlag("Seat", flags.seat);
+  return seat === undefined ? {} : { seat };
 }
 
 function parseOptionalSessionName(value: unknown): string | undefined {
