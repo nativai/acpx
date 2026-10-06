@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { Command, InvalidArgumentError } from "commander";
 import { acpAdapterKind } from "../acp/agent-command.js";
+import { resolveAcpxUiBaseUrl } from "../acp/auth-env.js";
 import { isLegacyZedCodexAcpInvocation } from "../acp/codex-compat.js";
 import {
   assertForkAtIndexHonoured,
@@ -68,6 +69,7 @@ import {
   migrateTemplateSlugs,
   persistTemplateMark,
   matchesPruneSessionId,
+  readSeatStore,
   rebuildSessionIndex,
   resolveSessionRecord,
   resolveTemplateSelector,
@@ -83,7 +85,7 @@ import {
 import type { MigrateSlugsResult, TemplateRollbackResult } from "../session/persistence.js";
 import { writeBrickLink } from "../session/seat-brick-write.js";
 import { decideSessionBrick } from "../session/seat-brick.js";
-import { seatDisplayName } from "../session/seat-display-name.js";
+import { seatDisplayName, seatNameFromStore } from "../session/seat-display-name.js";
 import { EXIT_CODES } from "../types.js";
 import type {
   OutputFormat,
@@ -121,11 +123,13 @@ import { emitJsonResult } from "./output/json-output.js";
 // Type-only, so the render module stays lazily imported at runtime.
 import type { PruneRefusal, PruneScope } from "./output/render.js";
 import {
-  explicitSessionIdFromSelector,
   NoSessionError,
   noSessionIdMessage,
+  parseSeatIdFromUrl,
   parseSessionIdFromUrl,
   requireExplicitSessionRecord,
+  resolveExplicitSessionRecord,
+  resolveSeatActiveHolder,
   resolveSessionTargetSelector,
 } from "./session-selector.js";
 import {
@@ -682,12 +686,21 @@ async function resolvePermissionPolicyFromFlags(
 // linkage + local record lookup) and, when known, its FULL url (host+id). The url
 // is preserved verbatim so a cross-box parent keeps its real host (FW-19); a bare
 // --parent-id has no url (same-box, derived from the local base url downstream).
-type ParentSessionRef = { id: string; url?: string; fromUrlFlag: boolean };
+// `seatId` is set when the parent was given as a SEAT (`--parent-seat`, or a
+// `--parent-session-url` carrying `?seat=`): `id` is then that seat's ACTIVE holder at
+// creation, and the seat is recorded beside it. `label` names the flag for refusals.
+type ParentSessionRef = {
+  id: string;
+  url?: string;
+  fromUrlFlag: boolean;
+  seatId?: string;
+  label: string;
+};
 
 // The minimal flag shape the parent resolver reads. Both `SessionsNewFlags` and
-// `SessionsCopyFlags` carry `--parent-session-url`/`--parent-id`, so the shared
-// resolver accepts either (used by plain `new` and by the copy/template path).
-type ParentFlagSource = { parentSessionUrl?: string; parentId?: string };
+// `SessionsCopyFlags` carry `--parent-seat`/`--parent-session-url`/`--parent-id`, so the
+// shared resolver accepts either (used by plain `new` and by the copy/template path).
+type ParentFlagSource = { parentSessionUrl?: string; parentId?: string; parentSeat?: string };
 
 /**
  * ⚠️ `allowEnvFallback: false` IS A SAFETY GATE, NOT A TIDINESS OPTION. The env
@@ -698,23 +711,68 @@ type ParentFlagSource = { parentSessionUrl?: string; parentId?: string };
  * edges nobody noticed, because nothing in the output says so. `set-parent` with no
  * parent flag is a usage error, never an env-derived default.
  */
-function resolveParentSessionRefFromFlagOrEnv(
+//
+// 🛑 A PARENT FLAG THAT WAS GIVEN IS HONOURED OR REFUSED — NEVER REPLACED BY ENV (hole #1,
+// P5-SEAT-VERIFY). `--parent-session-url ?seat=…` used to miss `parseSessionIdFromUrl`, fall
+// through, and record the CALLER's `ACPX_SESSION_URL` as the parent at rc 0 — a wrong
+// parent nothing reported. The env fallback applies only when NO parent flag was passed.
+async function resolveParentSessionRefFromFlagOrEnv(
   flags: ParentFlagSource,
   options: { allowEnvFallback?: boolean } = {},
-): ParentSessionRef | undefined {
-  // --parent-session-url <url> wins over --parent-id <uuid>; both override env.
-  const flagUrl = flags.parentSessionUrl?.trim();
-  if (flagUrl) {
-    const id = parseSessionIdFromUrl(flagUrl);
-    if (id) {
-      return { id, url: flagUrl, fromUrlFlag: true };
-    }
+): Promise<ParentSessionRef | undefined> {
+  const given = givenParentFlags(flags);
+  if (given.seat) {
+    return await parentSessionRefFromSeatFlag(given.seat, given);
   }
-  const flagValue = flags.parentId?.trim();
-  if (flagValue) {
-    return { id: flagValue, fromUrlFlag: false };
+  // --parent-session-url <url> wins over --parent-id <uuid>; both override env.
+  if (given.url) {
+    return await parentSessionRefFromUrlFlag(given.url);
+  }
+  if (given.id) {
+    return { id: given.id, fromUrlFlag: false, label: "--parent-id" };
   }
   return options.allowEnvFallback === false ? undefined : parentSessionRefFromEnv();
+}
+
+function givenParentFlags(flags: ParentFlagSource): { seat?: string; url?: string; id?: string } {
+  return {
+    seat: flags.parentSeat?.trim() || undefined,
+    url: flags.parentSessionUrl?.trim() || undefined,
+    id: flags.parentId?.trim() || undefined,
+  };
+}
+
+async function parentSessionRefFromSeatFlag(
+  seat: string,
+  others: { url?: string; id?: string },
+): Promise<ParentSessionRef> {
+  if (others.url || others.id) {
+    throw new InvalidArgumentError(
+      "--parent-seat cannot be combined with --parent-session-url or --parent-id — pass one parent",
+    );
+  }
+  return await parentSessionRefFromSeat("--parent-seat", seat);
+}
+
+// `?seat=` → that seat's active holder; `?session=` → that session; neither → refused.
+async function parentSessionRefFromUrlFlag(flagUrl: string): Promise<ParentSessionRef> {
+  if (parseSeatIdFromUrl(flagUrl) !== undefined) {
+    return await parentSessionRefFromSeat("--parent-session-url", flagUrl);
+  }
+  const id = parseSessionIdFromUrl(flagUrl);
+  if (!id) {
+    throw new InvalidArgumentError(
+      `--parent-session-url must carry ?session=<id> or ?seat=<id>, got ${JSON.stringify(flagUrl)}`,
+    );
+  }
+  return { id, url: flagUrl, fromUrlFlag: true, label: "--parent-session-url" };
+}
+
+// A SEAT as parent: its ACTIVE holder at creation, with the seat recorded beside it. Same-box
+// only — a seat on another box does not resolve here and is refused, never guessed.
+async function parentSessionRefFromSeat(label: string, value: string): Promise<ParentSessionRef> {
+  const { seatId, holderId } = await resolveSeatActiveHolder(label, value);
+  return { id: holderId, fromUrlFlag: false, seatId, label };
 }
 
 // Env fallback: ACPX_SESSION_URL is the spawning agent's OWN url (its real host).
@@ -723,7 +781,9 @@ function resolveParentSessionRefFromFlagOrEnv(
 function parentSessionRefFromEnv(): ParentSessionRef | undefined {
   const envUrl = process.env.ACPX_SESSION_URL?.trim();
   const envFromUrl = parseSessionIdFromUrl(envUrl);
-  return envFromUrl ? { id: envFromUrl, url: envUrl, fromUrlFlag: false } : undefined;
+  return envFromUrl
+    ? { id: envFromUrl, url: envUrl, fromUrlFlag: false, label: "ACPX_SESSION_URL" }
+    : undefined;
 }
 
 type ResolvedParentSession = {
@@ -778,17 +838,15 @@ async function parentInheritableFields(parent: SessionRecord): Promise<ResolvedP
 async function resolveAndValidateParentSessionId(
   flags: ParentFlagSource,
 ): Promise<ResolvedParentSession | undefined> {
-  const ref = resolveParentSessionRefFromFlagOrEnv(flags);
+  const ref = await resolveParentSessionRefFromFlagOrEnv(flags);
   if (!ref) {
     return undefined;
   }
   try {
     // Local parent: snapshot its inheritable fields, and carry the explicit url
     // when one was supplied (else downstream derives it from the id same-box).
-    return {
-      ...(await parentInheritableFields(await resolveSessionRecord(ref.id))),
-      sessionUrl: ref.url,
-    };
+    const fields = await parentInheritableFields(await resolveSessionRecord(ref.id));
+    return { ...fields, seatId: ref.seatId ?? fields.seatId, sessionUrl: ref.url };
   } catch (error) {
     if (error instanceof SessionNotFoundError) {
       // FW-19: a parent identified by URL may live on ANOTHER box — its id won't
@@ -798,8 +856,10 @@ async function resolveAndValidateParentSessionId(
       if (ref.url) {
         return { acpxRecordId: ref.id, sessionUrl: ref.url };
       }
-      const label = flags.parentSessionUrl ? "--parent-session-url" : "--parent-id";
-      throw new InvalidArgumentError(`${label} refers to unknown session: ${ref.id}`);
+      const what = ref.seatId
+        ? `seat ${ref.seatId}'s active holder, an unknown session`
+        : "unknown session";
+      throw new InvalidArgumentError(`${ref.label} refers to ${what}: ${ref.id}`);
     }
     throw error;
   }
@@ -1366,7 +1426,28 @@ async function printLocalSessionsList(
   ]);
   const sessions = await listSessionsForAgent(agentCommand, agentName);
   const filtered = filterCwd ? sessions.filter((session) => session.cwd === filterCwd) : sessions;
-  printSessionsByFormat(filtered, format);
+  printSessionsByFormat(filtered, format, await seatColumnLabeller());
+}
+
+/**
+ * The `sessions list --local` seat column (hole #7): `seat <seat8> <name>`. Display-only and
+ * best-effort — an unreadable store or a malformed row degrades the NAME to `(unnamed)`,
+ * never the listing; a record with no seat reads `seat -`.
+ */
+async function seatColumnLabeller(): Promise<(session: SessionRecord) => string> {
+  const store = await readSeatStore(sessionBaseDir()).catch(() => undefined);
+  return (session) => {
+    if (!session.seatId) {
+      return "seat -";
+    }
+    let name: string | undefined;
+    try {
+      name = store ? seatNameFromStore(store, session.seatId) : undefined;
+    } catch {
+      // display-only: a malformed row or unhealthy store never fails the list
+    }
+    return `seat ${session.seatId.slice(0, 8)} ${name ?? "(unnamed)"}`;
+  };
 }
 
 // Shared prompt-delivery core: build the output formatter and enqueue/run the
@@ -2858,7 +2939,7 @@ export async function handleSessionsCopy(
   // (plain) fork so the forked agent self-identifies and does not act as the source.
   // Byway (ephemeral) keeps its existing frontend handoff untouched.
   const forkNotice = !flags.ephemeral
-    ? composeForkDivergenceNotice(created, source.acpxRecordId)
+    ? composeForkDivergenceNotice(created, source.acpxRecordId, source.seatId)
     : undefined;
 
   if (!forkNotice && !handoffPrompt) {
@@ -3247,6 +3328,7 @@ function printSessionDetailsByFormat(record: SessionRecord, format: OutputFormat
 function sessionDetailsLines(record: SessionRecord): string[] {
   return [
     `id: ${record.acpxRecordId}`,
+    ...sessionSeatLines(record),
     `sessionId: ${record.acpSessionId}`,
     `agentSessionId: ${displayValue(record.agentSessionId)}`,
     `agent: ${record.agentCommand}`,
@@ -3264,6 +3346,27 @@ function sessionDetailsLines(record: SessionRecord): string[] {
     `disconnectReason: ${displayValue(record.lastAgentDisconnectReason)}`,
     `historyEntries: ${conversationHistoryEntries(record).length}`,
   ];
+}
+
+// Hole #4 — the seat this session holds, its holder state, and its parent's seat, beside the
+// session lines (the JSON form already carries `seatId`/`holderOrdinal`/`parentSeatId`).
+function sessionSeatLines(record: SessionRecord): string[] {
+  const base = record.seatId ? resolveAcpxUiBaseUrl(process.env) : undefined;
+  return [
+    `seat: ${displayValue(record.seatId)}`,
+    ...(base ? [`seatUrl: ${base}/?seat=${record.seatId}`] : []),
+    `holder: ${holderLine(record)}`,
+    `parentSession: ${displayValue(record.parentSessionId)}`,
+    `parentSeat: ${displayValue(record.parentSeatId)}`,
+  ];
+}
+
+function holderLine(record: SessionRecord): string {
+  if (!record.seatId) {
+    return "-";
+  }
+  const ordinal = record.holderOrdinal === undefined ? "" : `#${record.holderOrdinal} `;
+  return `${ordinal}(${record.holderActive === true ? "active" : "not active"})`;
 }
 
 function displayValue(value: string | number | boolean | null | undefined): string {
@@ -3351,7 +3454,7 @@ export async function handleSessionsExport(
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const selector = resolveSessionTargetSelector({ flags, command, positionalName: sessionName });
-  const explicitSessionId = explicitSessionIdFromSelector(selector);
+  const explicitSessionId = (await resolveExplicitSessionRecord(selector))?.acpxRecordId;
   if (explicitSessionId === undefined) {
     throw new NoSessionError(noSessionIdMessage(agent.agentName));
   }
@@ -3924,6 +4027,7 @@ export type SessionsSetParentFlags = {
   childrenOf?: string;
   parentSessionUrl?: string;
   parentId?: string;
+  parentSeat?: string;
   dryRun?: boolean;
 };
 
@@ -4042,7 +4146,8 @@ function printSetParentSkippedAndWarnings(result: SetParentResult): void {
 function setParentDetachAttempted(flags: SessionsSetParentFlags): boolean {
   return (
     (flags.parentId !== undefined && flags.parentId.trim() === "") ||
-    (flags.parentSessionUrl !== undefined && flags.parentSessionUrl.trim() === "")
+    (flags.parentSessionUrl !== undefined && flags.parentSessionUrl.trim() === "") ||
+    (flags.parentSeat !== undefined && flags.parentSeat.trim() === "")
   );
 }
 
@@ -4335,7 +4440,7 @@ export async function handleSessionsSetParent(
   const globalFlags = resolveGlobalFlags(command, config);
   const { setSessionParent, SetParentRefusalError } = await loadSessionModule();
 
-  const inputs = resolveSetParentInputs(flags);
+  const inputs = await resolveSetParentInputs(flags);
   if ("code" in inputs) {
     emitSetParentRefusal(inputs.code, inputs.message, globalFlags.format);
     return;
@@ -4358,46 +4463,71 @@ export async function handleSessionsSetParent(
 }
 
 /** Every flag-level refusal, decided before the session store is touched. */
-function resolveSetParentInputs(
+async function resolveSetParentInputs(
   flags: SessionsSetParentFlags,
-):
+): Promise<
   | { target: SetParentTarget; parent: { id: string; url?: string } }
-  | { code: SetParentRefusalCode | "USAGE"; message: string } {
+  | { code: SetParentRefusalCode | "USAGE"; message: string }
+> {
   if (setParentDetachAttempted(flags)) {
     return {
       code: "PARENT_DETACH_UNSUPPORTED",
       message:
-        "clearing a parent is not supported; pass a real --parent-id or --parent-session-url",
+        "clearing a parent is not supported; pass a real --parent-seat, --parent-id or --parent-session-url",
     };
   }
   const target = resolveSetParentTarget(flags);
   if (typeof target === "string") {
     return { code: "USAGE", message: target };
   }
-  const parent = resolveSetParentNewParent(flags);
-  return typeof parent === "string" ? { code: "USAGE", message: parent } : { target, parent };
+  const parent = await resolveSetParentNewParent(flags);
+  return "code" in parent ? parent : { target, parent };
 }
 
 /**
  * The new parent, from flags ONLY.
  *
- * ⚠️ BOTH flags given is a usage error here, deliberately UNLIKE the spawn path
+ * ⚠️ TWO parent flags given is a usage error here, deliberately UNLIKE the spawn path
  * where `--parent-session-url` quietly wins. There that precedence resolves an
  * env/flag mix; here both are explicit and disagreeing can only be a mistake.
+ *
+ * A SEAT parent (`--parent-seat`, or `--parent-session-url ?seat=`) is that seat's ACTIVE
+ * holder; an unresolvable seat is refused with its own cause (PARENT_NOT_FOUND), never
+ * misreported as "no parent flag given" (the verifier's row 4f).
  */
-function resolveSetParentNewParent(
+async function resolveSetParentNewParent(
   flags: SessionsSetParentFlags,
-): { id: string; url?: string } | string {
-  if (flags.parentId?.trim() && flags.parentSessionUrl?.trim()) {
-    return "--parent-id and --parent-session-url are mutually exclusive";
+): Promise<{ id: string; url?: string } | { code: "USAGE" | "PARENT_NOT_FOUND"; message: string }> {
+  const given = [flags.parentSeat, flags.parentId, flags.parentSessionUrl].filter((v) => v?.trim());
+  if (given.length > 1) {
+    return {
+      code: "USAGE",
+      message: "--parent-seat, --parent-id and --parent-session-url are mutually exclusive",
+    };
   }
-  // NO ENV FALLBACK — see resolveParentSessionRefFromFlagOrEnv. A missing parent
-  // flag is a usage error, never "adopt the caller".
-  const parentRef = resolveParentSessionRefFromFlagOrEnv(flags, { allowEnvFallback: false });
-  if (!parentRef) {
-    return "set-parent requires exactly one of --parent-id <uuid> or --parent-session-url <url>";
+  try {
+    // NO ENV FALLBACK — see resolveParentSessionRefFromFlagOrEnv. A missing parent
+    // flag is a usage error, never "adopt the caller".
+    const parentRef = await resolveParentSessionRefFromFlagOrEnv(flags, {
+      allowEnvFallback: false,
+    });
+    if (!parentRef) {
+      return {
+        code: "USAGE",
+        message:
+          "set-parent requires exactly one of --parent-seat <seat>, --parent-id <uuid> or --parent-session-url <url>",
+      };
+    }
+    return { id: parentRef.id, ...(parentRef.url ? { url: parentRef.url } : {}) };
+  } catch (error) {
+    if (error instanceof NoSessionError) {
+      return { code: "PARENT_NOT_FOUND", message: error.message };
+    }
+    if (error instanceof InvalidArgumentError) {
+      return { code: "USAGE", message: error.message };
+    }
+    throw error;
   }
-  return { id: parentRef.id, ...(parentRef.url ? { url: parentRef.url } : {}) };
 }
 
 export { parseHistoryLimit, NoSessionError, loadSessionModule };

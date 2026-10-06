@@ -85,6 +85,8 @@ export type SessionSelectorFlags = {
   session?: string;
   sessionId?: string;
   sessionUrl?: string;
+  /** `--seat <uuid|?seat= url>` — registered only where `addSeatSelectorOption` adds it. */
+  seat?: string;
 };
 
 export type PromptFlags = SessionSelectorFlags & {
@@ -103,6 +105,9 @@ export type SessionsNewFlags = {
   resumeSession?: string;
   parentId?: string;
   parentSessionUrl?: string;
+  /** `--parent-seat <uuid|?seat= url>` — the parent as a SEAT: its active holder is recorded,
+   * with the seat beside it (hole #1). */
+  parentSeat?: string;
   /** `--seat <uuid>` (D11, brick b64dfbb3) — create INTO this existing seat, prepared
    * but not active. Absent is the default and means "mint a fresh seat", exactly as
    * every create did before. Deliberately absent from `SessionsCopyFlags`: a fork or
@@ -130,6 +135,7 @@ export type SessionsCopyFlags = {
   name?: string;
   parentId?: string;
   parentSessionUrl?: string;
+  parentSeat?: string;
   metadata?: Record<string, string>;
   brick?: string | false;
   ephemeral?: boolean;
@@ -670,9 +676,26 @@ export function addSessionIdentityOptions(command: Command): Command {
     )
     .option(
       "--session-url <url>",
-      "Resolve a session globally from an acpx-ui URL containing ?session=<id>",
+      "Resolve a session globally from an acpx-ui URL containing ?session=<id>, or ?seat=<id> (that seat's ACTIVE holder)",
       (value: string) => parseNonEmptyValue("Session URL", value),
     );
+}
+
+/**
+ * `--seat <uuid|url>` on the verbs an orchestrator drives a child with (hole #18): resolved
+ * to the seat's ACTIVE holder at call time, so the address survives a succession.
+ *
+ * ⚠️ DO NOT ADD THIS TO THE AGENT-LEVEL COMMAND (`acpx <agent> --seat …`). Options there
+ * are visible to every subcommand, and `sessions new --seat` means something else (create
+ * INTO the seat): `acpx <agent> --seat S sessions new` would parse, ignore S, and mint a
+ * fresh seat — a silent wrong placement. The agent-level form is `--session-url ?seat=`.
+ */
+export function addSeatSelectorOption(command: Command): Command {
+  return command.option(
+    "--seat <seat>",
+    "Address the session by its SEAT (seat id or ?seat= URL): resolved to the seat's ACTIVE holder at call time, so it reaches the successor after a handover. --session-id stays the deliberate form for one specific holder.",
+    (value: string) => parseNonEmptyValue("Seat", value),
+  );
 }
 
 export function addSessionOption(command: Command): Command {
@@ -730,7 +753,15 @@ export function resolveSessionSelectorFromFlags(
     session: resolveSessionNameFromFlags(flags, command),
     sessionId: resolveStringFlagFromScopes("Session id", "sessionId", flags, command),
     sessionUrl: resolveStringFlagFromScopes("Session URL", "sessionUrl", flags, command),
+    // Own flags only — never a parent scope (see addSeatSelectorOption). Present only when
+    // given, so a verb without `--seat` sees exactly the selector it always did.
+    ...seatSelectorFlag(flags),
   };
+}
+
+function seatSelectorFlag(flags: SessionSelectorFlags): { seat?: string } {
+  const seat = parseOptionalNonEmptyFlag("Seat", flags.seat);
+  return seat === undefined ? {} : { seat };
 }
 
 function parseOptionalSessionName(value: unknown): string | undefined {

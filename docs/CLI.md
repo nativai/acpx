@@ -364,6 +364,8 @@ Behavior:
 
 Commands that address an existing session take `--session-id <id>` or `--session-url <url>` and nothing else: a name, a positional name or the cwd never selects a session (D-IDENTITY). A call with no id is refused with exit code `4`, naming the create form.
 
+`prompt`, `status`, `cancel` and `sessions close` also take `--seat <seat id | ?seat= url>`, and every `--session-url` may carry `?seat=<id>`: the seat resolves to its ACTIVE holder at call time, so an address held across a handover reaches the successor. An unknown, closed or vacant seat is refused (exit `4`). `--session-id` stays the deliberate form for one specific holder. `sessions new`/`copy` and `sessions set-parent` take `--parent-seat <seat id | ?seat= url>` (and `--parent-session-url ?seat=…`): the parent recorded is that seat's active holder, with the seat beside it; an unresolvable seat is refused, never replaced by `ACPX_SESSION_URL`.
+
 ## `models` command
 
 ```bash

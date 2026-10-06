@@ -43,10 +43,10 @@ export function refuseFromWithTemplate(flags: { from?: string; fromTemplate?: st
  * parent. `undefined` when an explicit parent flag is present or the old session has no parent.
  */
 export function fromParentFlags(
-  flags: { parentId?: string; parentSessionUrl?: string },
+  flags: { parentId?: string; parentSessionUrl?: string; parentSeat?: string },
   from: SessionRecord | undefined,
 ): { parentId?: string; parentSessionUrl?: string } | undefined {
-  if (!from?.parentSessionId || flags.parentId || flags.parentSessionUrl) {
+  if (!from?.parentSessionId || flags.parentId || flags.parentSessionUrl || flags.parentSeat) {
     return undefined;
   }
   return { parentId: from.parentSessionId, parentSessionUrl: from.parentSessionUrl };
