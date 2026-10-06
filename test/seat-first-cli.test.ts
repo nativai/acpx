@@ -496,6 +496,56 @@ test("#18 · an unknown seat, a CLOSED seat and a VACANT seat are each refused w
   });
 });
 
+test("V1b F1 · a seat refusal (unknown, closed, vacant; rc 4) never advises `sessions new` — it points at the seat", async () => {
+  // Brick e7c106cc. The generic NO_SESSION hint ("start a fresh session with `acpx <agent>
+  // sessions new`, then retry") is WRONG here: the fresh session mints a NEW seat, so the
+  // retry against the old seat fails exactly as before and a stray session is left behind.
+  await withRig(async (rig) => {
+    const unknownSeat = "0f0f0f0f-1111-4222-8333-444455556666";
+    const closedHolder = await rig.create(["-s", "abolished"]);
+    const closedSeat = String((await rig.onDisk(closedHolder)).seat_id);
+    const vacantHolder = await rig.create(["-s", "vacant"]);
+    const vacantSeat = String((await rig.onDisk(vacantHolder)).seat_id);
+    await withSeatStoreWrite(rig.sessionDir, (store) => {
+      const seats = new Map(store.seats);
+      const closedRow = seats.get(closedSeat);
+      const vacantRow = seats.get(vacantSeat);
+      if (!closedRow || !vacantRow) {
+        return { mutation: SEAT_STORE_NO_CHANGE, result: undefined };
+      }
+      seats.set(closedSeat, { ...closedRow, closedAt: "2026-10-06T00:00:00.000Z" });
+      seats.set(vacantSeat, { ...vacantRow, activeHolderId: null });
+      return { mutation: { kind: "write", seats }, result: undefined };
+    });
+
+    for (const [label, args] of [
+      ["unknown via --seat", ["status", "--seat", unknownSeat]],
+      ["closed via --seat", ["status", "--seat", closedSeat]],
+      [
+        "vacant via --session-url ?seat=",
+        ["cancel", "--session-url", `${UI_BASE}/?seat=${vacantSeat}`],
+      ],
+      ["unknown via prompt --seat", ["prompt", "--seat", unknownSeat, "echo x"]],
+      ["unknown via --parent-seat", ["sessions", "new", "--parent-seat", unknownSeat]],
+    ] as const) {
+      const result = await rig.cli([...rig.base, ...args]);
+      assert.equal(result.code, 4, `${label}: ${result.stderr}`);
+      assert.doesNotMatch(result.stderr, /sessions new`, then retry|start a fresh session/, label);
+      assert.match(result.stderr, /acpx seats show/, `${label}: no seat-specific hint`);
+    }
+
+    // The PAIR: a plain missing SESSION still gets the generic hint — only seats lose it.
+    const missing = await rig.cli([
+      ...rig.base,
+      "status",
+      "--session-id",
+      "0f0f0f0f-9999-4222-8333-444455556666",
+    ]);
+    assert.equal(missing.code, 4, missing.stderr);
+    assert.doesNotMatch(missing.stderr, /acpx seats show/);
+  });
+});
+
 test("#18 · `--seat` with `--session-id` is refused; `--session-id` stays the deliberate session form", async () => {
   await withRig(async (rig) => {
     const { seatId, founder } = await succeededSeat(rig, "exception");
