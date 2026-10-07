@@ -678,3 +678,158 @@ test("V1c pair · a seat with NO link still falls back to the holder's cache ('a
     source: "metadata",
   });
 });
+
+// ─── V1c, widened by the TE (R1–R4 + controls G1–G3; brick fced3ab0 TESTER-PLAN) ──
+//
+// `decideSessionBrick` is the one input to the `ACPX_BRICK` env builders, to what a child
+// inherits (`parentInheritableFields`) and to the `session-started` stamp — so asserting it
+// is asserting the effect. A stub `brick` comes first on PATH and logs every call.
+
+const BRICK_SHIM_DIR = path.join(process.cwd(), "test", "fixtures", "brick-shim");
+
+async function shimEnv(rig: Rig, tag: string): Promise<{ env: NodeJS.ProcessEnv; log: string }> {
+  const log = path.join(rig.homeDir, `brick-shim-${tag}.log`);
+  await fs.writeFile(log, "");
+  return { env: { PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`, BRICK_SHIM_LOG: log }, log };
+}
+
+async function seatRowBrick(rig: Rig, seatId: string): Promise<unknown> {
+  const store = JSON.parse(
+    await fs.readFile(path.join(rig.sessionDir, "seats.json"), "utf8"),
+  ) as Record<string, { brick_id?: unknown }>;
+  return store[seatId]?.brick_id ?? undefined;
+}
+
+/**
+ * Founder P linked to B (`mint`: `sessions new --brick B`; `setb`: `seats set-brick S B`), then
+ * N = `sessions new --from P`, Q = `sessions new --seat S` (prepared, never activated),
+ * `sessions activate S N`. P is RETIRED, N ACTIVE, Q PREPARED, the seat still linked to B.
+ */
+async function linkedSucceededSeat(rig: Rig, variant: "mint" | "setb") {
+  const { env } = await shimEnv(rig, `setup-${variant}`);
+  const founder =
+    variant === "mint"
+      ? await rig.create(["-s", `v1c-${variant}`, "--brick", BRICK_B], env)
+      : await rig.create(["-s", `v1c-${variant}`], env);
+  const seatId = String((await rig.onDisk(founder)).seat_id);
+  if (variant === "setb") {
+    assert.equal((await rig.cli(["seats", "set-brick", seatId, BRICK_B], env)).code, 0);
+  }
+  // `mint` resolves `--brick` through the stub, which answers its own fixed brick id — so B is
+  // whatever the founder decided, read back (never assumed), and must be present.
+  const brick = (await brickOf(rig, founder)).decided;
+  assert.ok(brick, "P+ · the linked founder reads a brick");
+  if (variant === "setb") {
+    assert.equal(brick, BRICK_B);
+  }
+  const successor = await rig.create(["--from", founder], env);
+  const prepared = await rig.create(["--seat", seatId], env);
+  const activated = await rig.cli(["sessions", "activate", seatId, successor, "--no-notify"], env);
+  assert.equal(activated.code, 0, activated.stderr);
+  return { seatId, founder, successor, prepared, env, brick };
+}
+
+for (const variant of ["mint", "setb"] as const) {
+  test(`V1c R1+R2 (${variant}) · after --unset the RETIRED and the PREPARED holder resolve NO brick; the active one neither`, async () => {
+    await withRig(async (rig) => {
+      const { seatId, founder, successor, prepared, env, brick } = await linkedSucceededSeat(
+        rig,
+        variant,
+      );
+      assert.equal(
+        (await brickOf(rig, founder)).decided,
+        brick,
+        "G1/P+ · retired, seat still linked = B",
+      );
+      const unset = await rig.cli(["seats", "set-brick", seatId, "--unset"], env);
+      assert.equal(unset.code, 0, unset.stderr);
+      // One comparison, so the diff names EVERY holder that still resolves a brick.
+      assert.deepEqual(
+        {
+          "R1 retired P": (await brickOf(rig, founder)).decided ?? null,
+          "R2 prepared Q": (await brickOf(rig, prepared)).decided ?? null,
+          "C1 active N": (await brickOf(rig, successor)).decided ?? null,
+        },
+        { "R1 retired P": null, "R2 prepared Q": null, "C1 active N": null },
+      );
+    });
+  });
+}
+
+test("V1c R3 · a child spawned under the RETIRED holder after --unset inherits no brick: no link, no cache, no stamp", async () => {
+  await withRig(async (rig) => {
+    const { seatId, founder, env } = await linkedSucceededSeat(rig, "setb");
+    assert.equal((await rig.cli(["seats", "set-brick", seatId, "--unset"], env)).code, 0);
+    const spawn = await shimEnv(rig, "r3-child");
+    const child = await rig.create(["--parent-id", founder], spawn.env);
+    const childSeat = String((await rig.onDisk(child)).seat_id);
+    assert.equal(
+      await seatRowBrick(rig, childSeat),
+      undefined,
+      "R3 · the child's NEW seat was linked",
+    );
+    assert.equal((await brickOf(rig, child)).cache, undefined, "R3 · the child caches a brick");
+    const calls = await fs.readFile(spawn.log, "utf8");
+    assert.doesNotMatch(calls, new RegExp(BRICK_B), `R3 · a brick call named B: ${calls}`);
+  });
+});
+
+test("V1c R4 · `sessions new --from <retired P>` after --unset carries no brick forward", async () => {
+  await withRig(async (rig) => {
+    const { seatId, founder, env } = await linkedSucceededSeat(rig, "setb");
+    assert.equal((await rig.cli(["seats", "set-brick", seatId, "--unset"], env)).code, 0);
+    const next = await rig.create(["--from", founder], env);
+    assert.equal((await brickOf(rig, next)).decided, undefined, "R4 · --from carried B forward");
+  });
+});
+
+test("V1c G1 · a retired holder of a still-LINKED seat keeps B, and its child inherits B", async () => {
+  await withRig(async (rig) => {
+    const { founder, env } = await linkedSucceededSeat(rig, "setb");
+    assert.equal((await brickOf(rig, founder)).decided, BRICK_B);
+    const child = await rig.create(["--parent-id", founder], env);
+    const childSeat = String((await rig.onDisk(child)).seat_id);
+    assert.deepEqual(
+      await seatRowBrick(rig, childSeat),
+      BRICK_B,
+      "G1 · the child did not inherit B",
+    );
+  });
+});
+
+test("V1c G2+G3 · a ROW-LESS and a SEAT-LESS record keep their cache through another seat's --unset", async () => {
+  await withRig(async (rig) => {
+    const { env } = await shimEnv(rig, "g23");
+    const rowless = await rig.create(["-s", "rowless", "--brick", BRICK_B], env);
+    const seatless = await rig.create(["-s", "seatless", "--brick", BRICK_B], env);
+    const rowlessSeat = String((await rig.onDisk(rowless)).seat_id);
+    await withSeatStoreWrite(rig.sessionDir, (store) => {
+      const seats = new Map(store.seats);
+      seats.delete(rowlessSeat);
+      return { mutation: { kind: "write", seats }, result: undefined };
+    });
+    const seatlessFile = path.join(rig.sessionDir, `${seatless}.json`);
+    const seatlessRecord = await rig.onDisk(seatless);
+    delete seatlessRecord.seat_id;
+    await fs.writeFile(seatlessFile, `${JSON.stringify(seatlessRecord)}\n`);
+
+    const brick = (await brickOf(rig, rowless)).cache;
+    assert.ok(brick, "G2 precondition: the row-less record caches a brick");
+    const other = await rig.create(["-s", "other", "--brick", BRICK_B], env);
+    const otherSeat = String((await rig.onDisk(other)).seat_id);
+    assert.equal((await rig.cli(["seats", "set-brick", otherSeat, "--unset"], env)).code, 0);
+
+    assert.equal(
+      (await brickOf(rig, rowless)).decided,
+      brick,
+      "G2 · row-less record lost its brick",
+    );
+    const seatlessNow = await rig.onDisk(seatless);
+    assert.equal(seatlessNow.seat_id, undefined, "G3 precondition: still seat-less");
+    assert.equal(
+      ((seatlessNow.metadata ?? {}) as Record<string, string>).brick,
+      brick,
+      "G3 · seat-less record lost its cache",
+    );
+  });
+});
