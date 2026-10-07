@@ -67,6 +67,12 @@ import {
 } from "../../runtime/engine/session-options.js";
 import { applyExecReasoningEffort } from "../../session/config-option-application.js";
 import {
+  ContextAlarmDetector,
+  contextFillFromState,
+  readSeatContextAlarmLevel,
+  registerContextAlarmDetector,
+} from "../../session/context-alarm-detector.js";
+import {
   cloneSessionAcpxState,
   cloneSessionConversation,
   hasUserMessageId,
@@ -1927,6 +1933,15 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   // short. Each carries its delivery context + a settled flag so the drain
   // backstop (C3) can write a terminal for one still pending when it fires.
   const injectedDeliveries: TrackedInjectedDelivery[] = [];
+  // Brick 4f3fa88c — the context alarm. The detector judges every usage report against
+  // the SEAT's level; a crossing mid-turn is injected through the same path a parent's
+  // message takes (`contextAlarmInjector`, set only while a turn accepts injections), and
+  // every later turn opens with the line via the turn-context channel.
+  const contextAlarm = new ContextAlarmDetector(
+    async () => await readSeatContextAlarmLevel(sessionBaseDir(), record.seatId),
+    contextFillFromState(record.acpx?.context_fill),
+  );
+  let contextAlarmInjector: ((task: QueueTask) => void) | undefined;
   // Backend is constant per session, so resolve once: whether an injected prompt
   // to this backend returns a terminal response and can therefore be safely
   // awaited (drained) even when waitForCompletion is false. True for Claude;
@@ -2673,6 +2688,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         },
       );
       trimConversationForRuntime(conversation);
+      if ((notification.update as { sessionUpdate?: string }).sessionUpdate === "usage_update") {
+        observeContextFill();
+      }
 
       // Detect teammate_spawned events to create subagent session records
       const update = notification.update as Record<string, unknown>;
@@ -2952,6 +2970,34 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     }
   };
 
+  const observeContextFill = (): void => {
+    const fill = contextFillFromState(acpxState?.context_fill);
+    if (!fill) {
+      return;
+    }
+    void contextAlarm
+      .observe(fill)
+      .then((notice) => {
+        // No injector = no turn accepting injections now (between turns, or a harness
+        // without mid-turn steering): the next turn opens with the line instead.
+        if (notice && contextAlarmInjector) {
+          contextAlarmInjector(contextAlarmTask(notice));
+        }
+      })
+      .catch(() => {});
+  };
+
+  const contextAlarmTask = (notice: string): QueueTask => ({
+    requestId: `context-alarm-${crypto.randomUUID()}`,
+    message: notice,
+    prompt: textPrompt(notice),
+    permissionMode: options.permissionMode,
+    waitForCompletion: false,
+    enqueuedAt: Date.now(),
+    send: () => {},
+    close: () => {},
+  });
+
   const buildPromptStartedHook = (sessionId: string, attempt: number) => {
     // The mid-turn injection handler must be (re)registered on EVERY attempt
     // (including retries) so concurrently-arriving tasks reach the in-flight
@@ -2966,7 +3012,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       // so the agent sees the new message via its Pushable input mid-turn
       // rather than waiting for the current turn to end. Each injected promise
       // is tracked so the turn can await all of them once it finishes.
-      options.setMidTurnHandler?.((injectedTask: QueueTask) => {
+      const injectTask = (injectedTask: QueueTask): void => {
         const injectedPromise = runInjectedPromptTask(sessionId, injectedTask);
         // Track (await) this injected promise when EITHER the caller is waiting
         // for completion (unchanged), OR the backend returns a terminal for an
@@ -3001,7 +3047,11 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
             .catch(() => {});
           injectedDeliveries.push(tracked);
         }
-      });
+      };
+      if (options.setMidTurnHandler) {
+        contextAlarmInjector = injectTask;
+        options.setMidTurnHandler(injectTask);
+      }
       if (attempt === 0 && options.onPromptActive) {
         try {
           await options.onPromptActive();
@@ -3134,6 +3184,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       // timeout, and a throw. Doing it here rather than before the await also
       // FREEZES `injectedDeliveries` for the synthetic pass below, so nothing
       // can be appended to it mid-iteration.
+      contextAlarmInjector = undefined;
       options.setMidTurnHandler?.(undefined);
     }
     // C3 (G2 completeness): the backstop fired with injected prompts still
@@ -3175,6 +3226,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     turnAbandoned = false;
     endMarkerReasonThisTurn = undefined;
     await appendDeliveryEvent(mainDeliveryContext, "accepted");
+    // The seat's level as of this turn, and the detector visible to the turn-context
+    // channel while this turn's prompt is composed (brick 4f3fa88c).
+    await contextAlarm.refreshLevel();
+    const unregisterContextAlarm = registerContextAlarmDetector(sessionId, contextAlarm);
     const response = await measurePerf("runtime.prompt.agent_turn", async () => {
       const turnPromise = runPromptTurn({
         client,
@@ -3221,7 +3276,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         activeTurnWatchdog = undefined;
         watchdog.dispose();
       }
-    });
+    }).finally(unregisterContextAlarm);
     // The primary ACP prompt resolved. That may be a real turn end OR the
     // adapter handing the turn over to an injected prompt, so keep injecting
     // while any injected prompt is still unsettled; stop only once they are

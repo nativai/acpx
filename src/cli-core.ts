@@ -85,6 +85,9 @@ export const TOP_LEVEL_VERBS = new Set([
   // places the two lanes collided, this is the only one that could have survived
   // silently. De-duplicated deliberately rather than left to the Set.
   "seats",
+  // `context` — the context alarm's surface (brick 4f3fa88c): fill, level, compaction point,
+  // and `--alarm`, which writes the SEAT row. Registered by `registerContextCommand`.
+  "context",
   // `agent-folders` — C7's filesystem migration (`agent-folders migrate`, brick 09197f03), registered by
   // `registerAgentFoldersCommand`. This entry is the second half of the two registrations that verb needs:
   // without it `acpx agent-folders bogus` is a prompt delivery to the cwd's session, not an error.

@@ -644,6 +644,13 @@ export type SessionOwnerOptions = {
   terminal?: boolean;
 };
 
+/** `acpx.context_fill` — see `SessionAcpxState.context_fill`. */
+export type SessionContextFill = {
+  used_tokens: number;
+  window_tokens: number;
+  compaction_tokens?: number;
+};
+
 export type SessionAcpxState = {
   reset_on_next_ensure?: boolean;
   current_mode_id?: string;
@@ -787,6 +794,14 @@ export type SessionAcpxState = {
    * normalises at read time.
    */
   last_turn_provider?: LastTurnProviderBreadcrumb;
+  /**
+   * The context fill the adapter LAST reported (brick 4f3fa88c) — what `acpx context`
+   * shows and what the context alarm is computed from after an owner respawn.
+   * `window_tokens: 0` is UNKNOWN (Daniel: an unknown window is 0, never a guess);
+   * `compaction_tokens` is where the harness said it auto-compacts, absent when it did not
+   * say. Overwritten whole by every `usage_update`.
+   */
+  context_fill?: SessionContextFill;
   /**
    * What a `--reasoning-effort` request ACTUALLY produced (B3, CONCEPTION §6.2).
    *

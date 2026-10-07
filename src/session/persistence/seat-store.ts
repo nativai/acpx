@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { AcpxOperationalError } from "../../errors.js";
+import { isContextAlarmLevel } from "../context-alarm.js";
 import { withSessionIndexLock } from "./index-lock.js";
 import { SEAT_STORE_FILE, SESSION_INDEX_FILE } from "./session-dir-files.js";
 
@@ -234,6 +235,17 @@ export type SeatRecord = {
    * it as `false`.
    */
   favorite: boolean | undefined;
+  /**
+   * THE CONTEXT-ALARM LEVEL, IN PERCENT — Daniel, 2026-10-07 (brick 7f61daf9
+   * `decision/DECISION.md` item A, 18:43:18Z: *"Yes, the alarm level should be set per
+   * seat."*). He amended his 2026-09-28 closure for this ONE field, by name; the comment
+   * below on the plan count still stands for any other proposal.
+   *
+   * `undefined` = the default (90); `0` = off; otherwise an integer 1-100. A successor
+   * shares it because it shares the seat — that is the whole reason it lives here and not
+   * on a holder. `acpx context --alarm` is its writer; `default` writes `undefined`.
+   */
+  contextAlarm?: number | undefined;
 };
 
 type SeatFieldPlan = { readonly persisted: true };
@@ -259,6 +271,7 @@ export const SEAT_RECORD_FIELD_PLAN = {
   name: { persisted: true },
   brickId: { persisted: true },
   favorite: { persisted: true },
+  contextAlarm: { persisted: true },
 } as const satisfies { [K in keyof Required<SeatRecord>]: SeatFieldPlan };
 
 /**
@@ -454,6 +467,8 @@ type PersistedSeat = {
    */
   brick_id_validated?: boolean;
   favorite?: boolean;
+  /** Brick 4f3fa88c — OMITTED when the seat uses the default level. */
+  context_alarm?: number;
 };
 
 /**
@@ -488,6 +503,8 @@ export function seatToPersisted(seat: SeatRecord): PersistedSeat {
     // forever after — this line is what lets that explicit value keep surviving
     // every subsequent whole-store rewrite, exactly as an explicit `name` does.
     favorite: seat.favorite,
+    // OMITTED WHEN UNDEFINED, like `name`: absence IS "the default level".
+    context_alarm: seat.contextAlarm,
   };
 }
 
@@ -544,7 +561,8 @@ function hasValidOmittableSeatFields(row: Record<string, unknown>): boolean {
   return (
     isOmittableString(row.name) &&
     isOmittableString(row.brick_id) &&
-    isOmittableBoolean(row.brick_id_validated)
+    isOmittableBoolean(row.brick_id_validated) &&
+    hasValidContextAlarmField(row)
   );
 }
 
@@ -565,6 +583,12 @@ function hasValidOmittableSeatFields(row: Record<string, unknown>): boolean {
  */
 function hasValidFavoriteField(row: Record<string, unknown>): boolean {
   return row.favorite === undefined || typeof row.favorite === "boolean";
+}
+
+/** Brick 4f3fa88c — absent (the default), or an integer 0-100. A PRESENT wrong value
+ *  rejects the row, the same D8 strictness every other field gets. */
+function hasValidContextAlarmField(row: Record<string, unknown>): boolean {
+  return row.context_alarm === undefined || isContextAlarmLevel(row.context_alarm);
 }
 
 export function parseSeatFromPersisted(raw: unknown): SeatRecord | undefined {
@@ -612,7 +636,14 @@ export function parseSeatFromPersisted(raw: unknown): SeatRecord | undefined {
     // unreadable one), but coercing it to `false` collapses "not yet migrated" and
     // "explicitly un-starred" into one value, which is the defect the L0 caught.
     favorite: row.favorite as boolean | undefined,
+    ...contextAlarmFromRow(row),
   };
+}
+
+/** PRESENT ONLY WHEN SET: absence is "the default level", and a row read back must
+ *  compare equal to the row written — an undefined-valued key would not. */
+function contextAlarmFromRow(row: Record<string, unknown>): Pick<SeatRecord, "contextAlarm"> {
+  return row.context_alarm === undefined ? {} : { contextAlarm: row.context_alarm as number };
 }
 
 function emptyStore(fileState: SeatStore["fileState"], storePath: string): SeatStore {
@@ -989,6 +1020,9 @@ export async function mintSeatRow(
       // legacy per-record value to carry forward for a seat that did not exist a
       // moment ago).
       favorite: false,
+      // A new seat starts at the default level (brick 4f3fa88c) — children and forks
+      // included: they have their own seats.
+      contextAlarm: undefined,
     });
     return { mutation: { kind: "write", seats }, result: undefined };
   });
@@ -1175,6 +1209,33 @@ export async function fillSeatName(
     const seats = new Map(store.seats);
     seats.set(seatId, { ...row, name });
     return { mutation: { kind: "write", seats } as const, result: "filled" as const };
+  });
+}
+
+/**
+ * Brick 4f3fa88c — SET the seat's context-alarm level (`undefined` = back to the default).
+ * The one writer of `contextAlarm`, called by `acpx context --alarm`. Touches that field
+ * and nothing else; same idempotent, malformed-row-throws contract as `fillSeatName`.
+ */
+export async function setSeatContextAlarm(
+  sessionDir: string,
+  seatId: string,
+  level: number | undefined,
+): Promise<"set" | "unchanged" | "no-row"> {
+  return await withSeatStoreWrite(sessionDir, (store) => {
+    if (store.malformedSeatIds.includes(seatId)) {
+      throw new MalformedSeatRowError(seatId, store.storePath);
+    }
+    const row = store.seats.get(seatId);
+    if (!row) {
+      return { mutation: SEAT_STORE_NO_CHANGE, result: "no-row" as const };
+    }
+    if (row.contextAlarm === level) {
+      return { mutation: SEAT_STORE_NO_CHANGE, result: "unchanged" as const };
+    }
+    const seats = new Map(store.seats);
+    seats.set(seatId, { ...row, contextAlarm: level });
+    return { mutation: { kind: "write", seats } as const, result: "set" as const };
   });
 }
 

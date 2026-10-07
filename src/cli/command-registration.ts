@@ -42,6 +42,7 @@ import {
 } from "./command-handlers.js";
 import { registerConfigCommand } from "./config-command.js";
 import type { ResolvedAcpxConfig } from "./config.js";
+import { registerContextCommand } from "./context-command.js";
 import {
   addSeatSelectorOption,
   addSessionIdentityOptions,
@@ -1060,6 +1061,8 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
   // only — the seat store is one agent-agnostic file, so `acpx claude seats …`
   // would be meaningless.
   registerSeatsCommand(program, config);
+  // ⚠️ SECOND HALF IN `src/cli-core.ts`'s `TOP_LEVEL_VERBS` (`"context"`, brick 4f3fa88c).
+  registerContextCommand(program, config);
   // ⚠️ SECOND HALF IN `src/cli-core.ts`'s `TOP_LEVEL_VERBS` (`"agent-folders"`) — same commit, or the
   // token is absorbed as an agent name (C7, brick 09197f03).
   registerAgentFoldersCommand(program, config);

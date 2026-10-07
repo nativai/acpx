@@ -76,6 +76,8 @@ export const PERSISTED_ACPX_SENTINEL = {
   refused_output_style: "sentinel-refused-style",
   context_window_size: 987_654,
   context_window_model_id: "sentinel-window-model",
+  // brick 4f3fa88c — every key nested, so the round-trip's deepEqual proves each one.
+  context_fill: { used_tokens: 876_543, window_tokens: 876_544, compaction_tokens: 876_545 },
   available_models: ["sentinel-available-model"],
   available_commands: ["sentinel-available-command"],
   progress: { phase: "thinking", label: "sentinel-progress-label" },

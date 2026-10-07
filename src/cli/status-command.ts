@@ -15,6 +15,7 @@ import {
   isSubscriptionLocked,
   loadSubscriptionRegistry,
 } from "../config/subscriptions.js";
+import { formatContextLine } from "../session/context-alarm.js";
 import {
   evaluateModelFloor,
   type ModelFloorEvaluation,
@@ -25,6 +26,7 @@ import { resolveSessionModelLadder } from "../session/model-ladder.js";
 import { outputStyleChangePending } from "../session/output-style.js";
 import type { SessionAcpxState, SessionRecord } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
+import { readSessionContext, sessionContextJson } from "./context-command.js";
 import {
   addSeatSelectorOption,
   addSessionNameOption,
@@ -113,8 +115,15 @@ async function printSessionStatus(
   const payload = await createStatusPayload(record, health, statusState);
   const running = isRunningStatus(statusState);
   const dead = isDeadStatus(statusState);
+  // Brick 4f3fa88c — one context line: fill, the seat's alarm, the compaction point.
+  const context = await readSessionContext(record);
 
-  if (emitStatusJson(format, record, payload, statusState, running, dead)) {
+  if (
+    emitJsonResult(format, {
+      ...statusJsonPayload(record, payload, statusState, running, dead),
+      context: sessionContextJson(context),
+    })
+  ) {
     return;
   }
 
@@ -124,6 +133,7 @@ async function printSessionStatus(
   }
 
   printTextStatus(payload, dead);
+  process.stdout.write(`context: ${formatContextLine(context.fill, context.alarm)}\n`);
 }
 
 async function createStatusPayload(
@@ -638,17 +648,6 @@ type StatusPayload = {
   signal: NodeJS.Signals | null;
   agentSessionId?: string;
 };
-
-function emitStatusJson(
-  format: ResolvedAcpxConfig["format"],
-  record: SessionRecord,
-  payload: StatusPayload,
-  statusState: SessionStatusState,
-  running: boolean,
-  dead: boolean,
-): boolean {
-  return emitJsonResult(format, statusJsonPayload(record, payload, statusState, running, dead));
-}
 
 function statusJsonPayload(
   record: SessionRecord,

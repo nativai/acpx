@@ -341,6 +341,7 @@ function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
     state.context_window_size = record.context_window_size;
   }
   assignStringState(state, "context_window_model_id", record.context_window_model_id);
+  assignContextFill(state, record.context_fill);
 
   // 🛑 brick 4c272cab / finding PM-1 — WITHOUT THIS LEG THE FIELD IS WRITTEN
   // CORRECTLY AND LOST ON THE NEXT READ, which is not a display bug: the reader
@@ -767,6 +768,26 @@ function isValidRoutingPolicyWarning(
     typeof record.at === "string" &&
     record.at.length > 0
   );
+}
+
+/** Brick 4f3fa88c — `acpx.context_fill`, every number validated, else dropped whole. */
+function assignContextFill(state: SessionAcpxState, raw: unknown): void {
+  if (typeof raw !== "object" || raw === null) {
+    return;
+  }
+  const fill = raw as Record<string, unknown>;
+  const count = (value: unknown): value is number =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0;
+  if (!count(fill.used_tokens) || !count(fill.window_tokens)) {
+    return;
+  }
+  state.context_fill = {
+    used_tokens: fill.used_tokens,
+    window_tokens: fill.window_tokens,
+    ...(count(fill.compaction_tokens) && fill.compaction_tokens > 0
+      ? { compaction_tokens: fill.compaction_tokens }
+      : {}),
+  };
 }
 
 /**
