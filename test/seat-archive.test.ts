@@ -13,6 +13,7 @@ import {
   runRestore,
 } from "../src/session/archive/operations.js";
 import { resolveBoundaries } from "../src/session/archive/retention.js";
+import { reconcileSeatArchive } from "../src/session/persistence/seat-archive.js";
 import { withSeatStoreWrite } from "../src/session/persistence/seat-store.js";
 import { runSeatBackfill } from "../src/session/seat-backfill.js";
 import type { SessionRecord } from "../src/types.js";
@@ -459,5 +460,73 @@ test("idempotent + the one-holder verb: a second wave moves nothing; a holder re
     );
     assert.equal(again.code, 0, again.stderr);
     assert.match(again.stdout, /"seatStoreWrites": ?0/);
+  });
+});
+
+test("F1: a CORRUPT ledger file still keeps `seats backfill` off its seat, and is reported — never a re-mint from the retired holder", async () => {
+  await withRig(async (rig) => {
+    await writeHolder(rig, "holder-retired", SEAT_A, { ordinal: 1, active: false });
+    await writeHolder(rig, "holder-active", SEAT_A, { ordinal: 2, active: true });
+    await plantRows(rig, [
+      { seatId: SEAT_A, holder: "holder-active", nextOrdinal: 3, name: "kept" },
+    ]);
+    await wave(rig, ["holder-active"]);
+    assert.equal((await seatsJson(rig))[SEAT_A], undefined);
+    // Outside damage: ledger writes are temp + rename, so only something else truncates one.
+    await fs.writeFile(ledgerPath(rig, SEAT_A), '{"seat_id": "', "utf8");
+
+    const liveScan = {
+      scanned: 1,
+      environRead: 1,
+      pids: new Set([1]),
+      referencedDirs: new Set<string>(),
+      referencedSessionIds: new Set<string>(),
+    };
+    const dry = await runSeatBackfill({ sessionDir: rig.hot, apply: false, liveScan });
+    assert.equal(dry.seats, 0, "the dry run plans no row for the seat");
+    const report = await runSeatBackfill({ sessionDir: rig.hot, apply: true, liveScan });
+    assert.equal(report.seats, 0, "no row minted");
+    assert.equal((await seatsJson(rig))[SEAT_A], undefined, "seats.json still has no row");
+    assert.deepEqual(report.archivedSeats, [SEAT_A], "reported as archived");
+    assert.deepEqual(
+      report.unreadableArchivedSeats,
+      [SEAT_A],
+      "reported as an unreadable ledger file",
+    );
+    assert.equal(
+      await fs.readFile(ledgerPath(rig, SEAT_A), "utf8"),
+      '{"seat_id": "',
+      "the damaged file is left for a human",
+    );
+
+    // Addressing names the damaged file, not "a typo".
+    await assert.rejects(
+      resolveSeatActiveHolder("--seat", SEAT_A),
+      (error: Error) => error.message.includes("does not parse") && !error.message.includes("typo"),
+    );
+  });
+});
+
+test("F2: a holder that is hot again by the time the fold's write lands (a restore inside the wave's window) gets its seat straight back", async () => {
+  await withRig(async (rig) => {
+    await writeHolder(rig, "holder-a", SEAT_A);
+    await plantRows(rig, [{ seatId: SEAT_A, holder: "holder-a", name: "raced" }]);
+    const before = (await seatsJson(rig))[SEAT_A];
+
+    // The plan saw the holder archived (`assumeArchived` stands in for the plan-time read); by
+    // the write it is hot — exactly what a restore landing between plan and write leaves.
+    const result = await reconcileSeatArchive({
+      sessionDir: rig.hot,
+      dryRun: false,
+      assumeArchived: new Set(["holder-a"]),
+      at: "2026-10-07T00:00:00.000Z",
+      wave: "race",
+    });
+    assert.deepEqual((await seatsJson(rig))[SEAT_A], before, "the row is back, field for field");
+    assert.equal(await readLedger(rig, SEAT_A), undefined, "and not left in the ledger");
+    assert.deepEqual(
+      result.unfolded.map((seat) => seat.seatId),
+      [SEAT_A],
+    );
   });
 });
