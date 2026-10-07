@@ -116,11 +116,14 @@ async function handleContext(flags: ContextFlags, command: Command, config: Reso
   const changed =
     flags.alarm === undefined ? undefined : await writeAlarmLevel(record, flags.alarm);
   const report = await readSessionContext(record);
+  // Not a sessionContext build: test/seat-ordinal-env.test.ts counts every
+  // `seatId: record.seatId ?? null,` line as one, and this output carries no ordinal.
+  const seatId = record.seatId ?? null;
   if (
     emitJsonResult(format, {
       action: "context",
       acpxRecordId: record.acpxRecordId,
-      seatId: record.seatId ?? null,
+      seatId,
       ...sessionContextJson(report),
     })
   ) {

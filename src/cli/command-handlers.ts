@@ -74,6 +74,7 @@ import {
   resolveSessionRecord,
   resolveTemplateSelector,
   seatBrickLinkFromRef,
+  seatFromStore,
   sessionBaseDir,
   rollbackTemplateSlug,
   DeletionManifestWriteError,
@@ -2880,6 +2881,34 @@ export async function handleSessionsNew(
     return;
   }
 
+  const { created, agentName, globalFlags } = await createSessionFromNewFlags(
+    explicitAgentName,
+    flags,
+    command,
+    config,
+  );
+  const { printCreatedSessionBanner, printNewSessionByFormat } = await loadOutputRenderModule();
+
+  printCreatedSessionBanner(created, agentName, globalFlags.format, globalFlags.jsonStrict);
+
+  if (globalFlags.verbose) {
+    process.stderr.write(`[acpx] created session: ${created.acpxRecordId}\n`);
+  }
+
+  printNewSessionByFormat(created, globalFlags.format);
+}
+
+/**
+ * `sessions new`'s create, without its printing — shared with `sessions handover` (brick
+ * f74abb05), which creates its successor through exactly this path (`--from <caller>`), so a
+ * handover successor and a hand-run `sessions new --from` successor cannot drift apart.
+ */
+async function createSessionFromNewFlags(
+  explicitAgentName: string | undefined,
+  flags: SessionsNewFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<{ created: SessionRecord; agentName: string; globalFlags: GlobalFlags }> {
   const globalFlags = resolveGlobalFlags(command, config);
   validateExplicitCredentialFlags(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
@@ -2939,8 +2968,7 @@ export async function handleSessionsNew(
   // it, here or anywhere, would trade a silent no-op for a latency regression on
   // every first create (C4 §7.1).
   warmCatalogueInBackground();
-  const [{ createSession }, { printCreatedSessionBanner, printNewSessionByFormat }] =
-    await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
+  const { createSession } = await loadSessionModule();
 
   const created = await createSession(
     buildSessionStartOptions({
@@ -2958,19 +2986,7 @@ export async function handleSessionsNew(
     }),
   );
   await maybeStampBrickLink(created);
-
-  printCreatedSessionBanner(
-    created,
-    effectiveAgent.agentName,
-    globalFlags.format,
-    globalFlags.jsonStrict,
-  );
-
-  if (globalFlags.verbose) {
-    process.stderr.write(`[acpx] created session: ${created.acpxRecordId}\n`);
-  }
-
-  printNewSessionByFormat(created, globalFlags.format);
+  return { created, agentName: effectiveAgent.agentName, globalFlags };
 }
 
 export async function handleSessionsCopy(
@@ -4499,6 +4515,157 @@ export async function handleSessionsActivate(
     }
     throw error;
   }
+}
+
+/**
+ * `acpx sessions handover --brief <file>` — brick f74abb05 (Daniel, 7f61daf9 DECISION.md item F).
+ *
+ * Composed from the two verbs it replaces, never a second implementation of either:
+ *   1. the brief is checked first — a missing, unreadable or empty brief creates nothing;
+ *   2. `sessions new --from <caller>` creates the successor IN THE CALLER'S SEAT with its exact
+ *      settings — and, being a succession, never takes the caller's ACPX_SESSION_URL as its
+ *      parent (the top-level trap, closed in `resolveParentForNew`);
+ *   3. `sessions activate` makes it the seat's holder;
+ *   4. ONE turn is delivered: the activation notice, then the standard handover prompt.
+ * Never a fork (no transcript is copied) and never a close of the caller (its own duty, printed).
+ */
+export async function handleSessionsHandover(
+  explicitAgentName: string | undefined,
+  flags: { brief: string; sessionId?: string },
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const { format } = resolveGlobalFlags(command, config);
+  const handover = await import("./session/handover.js");
+  const { activateSeatHolder, SeatActivationRefusalError } =
+    await import("./session/seat-activate.js");
+  try {
+    const brief = await handover.readHandoverBrief(flags.brief);
+    const warning = handover.handoverBriefSizeWarning(brief);
+    if (warning) {
+      process.stderr.write(`${warning}\n`);
+    }
+    const caller = await resolveHandoverCaller(flags.sessionId, handover.HandoverRefusalError);
+    const { created } = await createSessionFromNewFlags(
+      explicitAgentName,
+      { from: caller.acpxRecordId },
+      command,
+      config,
+    );
+    const result = await activateSeatHolder(String(caller.seatId), created.acpxRecordId);
+    await emitSeatDivergenceLine(result.successorId, result.divergence);
+    const turn = {
+      ...result,
+      notice:
+        result.notice +
+        handover.composeHandoverPrompt({
+          predecessorId: caller.acpxRecordId,
+          briefPath: brief.path,
+        }),
+    };
+    const outcome = await deliverOrSkipNotice(turn, true);
+    if (outcome.kind === "failed") {
+      process.exitCode = 1;
+    }
+    printHandoverResult(format, { turn, outcome, brief, predecessorId: caller.acpxRecordId });
+  } catch (error) {
+    if (
+      error instanceof handover.HandoverRefusalError ||
+      error instanceof SeatActivationRefusalError
+    ) {
+      if (!emitJsonResult(format, { ok: false, code: error.code, error: error.message })) {
+        process.stderr.write(`handover: ${error.code}: ${error.message}\n`);
+      }
+      process.exitCode = 1;
+      return;
+    }
+    throw error;
+  }
+}
+
+function printHandoverResult(
+  format: OutputFormat,
+  params: {
+    turn: Parameters<typeof printActivationText>[0];
+    outcome: NoticeOutcome;
+    brief: { path: string; bytes: number };
+    predecessorId: string;
+  },
+): void {
+  const { turn, outcome, brief } = params;
+  const seatUrl = seatAddressFor(turn.seatId);
+  if (
+    emitJsonResult(format, {
+      ok: outcome.kind !== "failed",
+      action: "session_handover",
+      seatId: turn.seatId,
+      seatUrl,
+      predecessorId: params.predecessorId,
+      successorId: turn.successorId,
+      holderOrdinal: turn.ordinal,
+      brief: brief.path,
+      briefBytes: brief.bytes,
+      handoverDelivery: noticeDeliveryJson(outcome),
+    }) ||
+    format === "quiet"
+  ) {
+    return;
+  }
+  printActivationText(turn, outcome, false);
+  process.stdout.write(`seat: ${seatUrl}\n`);
+}
+
+/** The handing-over session: `--session-id`, else the caller's own `$ACPX_SESSION_URL`. */
+async function resolveHandoverCaller(
+  sessionId: string | undefined,
+  Refusal: typeof import("./session/handover.js").HandoverRefusalError,
+): Promise<SessionRecord> {
+  const ref = sessionId ?? parseSessionIdFromUrl(process.env.ACPX_SESSION_URL?.trim() || undefined);
+  if (!ref) {
+    throw new Refusal(
+      "NO_CALLER",
+      "no session to hand over — run it from inside the session ($ACPX_SESSION_URL) or pass --session-id <id>",
+    );
+  }
+  const caller = await resolveSessionRecord(ref);
+  if (!caller.seatId) {
+    throw new Refusal(
+      "NO_SEAT",
+      `session ${caller.acpxRecordId} holds no seat, so it has nothing to hand over; nothing was created`,
+    );
+  }
+  await refuseUnlessActiveHolder(caller, caller.seatId, Refusal);
+  return caller;
+}
+
+/** TE D3 — only the seat's ACTIVE holder may hand it over. A retired holder doing so would
+ *  retire the live holder (another agent) behind its back. */
+async function refuseUnlessActiveHolder(
+  caller: SessionRecord,
+  seatId: string,
+  Refusal: typeof import("./session/handover.js").HandoverRefusalError,
+): Promise<void> {
+  const seat = seatFromStore(await readSeatStore(sessionBaseDir()), seatId);
+  if (!seat) {
+    throw new Refusal(
+      "NO_SEAT",
+      `seat ${seatId} has no row in the seat store (run \`acpx seats backfill\`); nothing was created`,
+    );
+  }
+  if (seat.activeHolderId !== caller.acpxRecordId) {
+    const holder = seat.activeHolderId ?? "nobody (the seat is vacant)";
+    throw new Refusal(
+      "NOT_HOLDER",
+      `session ${caller.acpxRecordId} is not the active holder of seat ${seatAddressFor(seat.seatId)} — ` +
+        `its current holder is ${holder}. Only the active holder hands a seat over; nothing was created`,
+    );
+  }
+}
+
+/** The seat's `<base>/?seat=<id>` address, or the bare id where this box names no base. */
+function seatAddressFor(seatId: string): string {
+  const base = resolveAcpxUiBaseUrl(process.env)?.replace(/\/+$/, "");
+  return base ? `${base}/?seat=${seatId}` : seatId;
 }
 
 export async function handleSessionsSetParent(
