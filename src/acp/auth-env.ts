@@ -584,6 +584,79 @@ function applyAgentTypeEnvironment(env: NodeJS.ProcessEnv, agentCommand: string 
   }
 }
 
+/**
+ * The ceiling, in tokens, on how much of one tool call's output a Codex agent can
+ * read back (`tool_output_token_limit`). Codex's per-call `max_output_tokens` is
+ * clamped to it, and the OS include renders reach ~217 KB (≥ ~60k tokens), so a
+ * lower ceiling silently truncates a role/skill load mid-file.
+ *
+ * Daniel's decision (brick://ab9e9ebe): every box gets 200000, and a new box must
+ * get it without anyone remembering to set it. It is therefore delivered HERE, per
+ * adapter spawn, through the `CODEX_CONFIG` env var codex-acp already merges into
+ * every thread it starts, resumes or forks (`createSessionConfig`) — and
+ * `~/.codex/config.toml` no longer carries it. Do not move it back into a per-box
+ * file: that is the arrangement that left four boxes without it.
+ */
+export const CODEX_TOOL_OUTPUT_TOKEN_LIMIT = 200_000;
+
+const CODEX_TOOL_OUTPUT_TOKEN_LIMIT_KEY = "tool_output_token_limit";
+
+/**
+ * Put {@link CODEX_TOOL_OUTPUT_TOKEN_LIMIT} into a codex adapter's `CODEX_CONFIG`.
+ *
+ *  - absent / blank        → `{"tool_output_token_limit":200000}`
+ *  - JSON object, no key   → the key is added; every other key is kept
+ *  - JSON object, has key  → untouched: an operator's explicit value wins
+ *  - anything else         → untouched, with one stderr warning. codex-acp
+ *    `JSON.parse`s the variable itself, so rewriting it would not make that
+ *    failure any better, only harder to attribute.
+ *
+ * Non-codex adapters are never touched. The gate is the single codex classifier
+ * (`isCodexAcpCommand`), keyed on the REAL production command shape
+ * `node /opt/codex-acp/dist/index.js`.
+ */
+function applyCodexToolOutputLimit(env: NodeJS.ProcessEnv, agentCommand: string | undefined): void {
+  if (agentCommand === undefined) {
+    return;
+  }
+  const split = splitCommandLine(agentCommand);
+  if (!isCodexAcpCommand(split.command, split.args)) {
+    return;
+  }
+  const config = parseCodexConfigEnv(env.CODEX_CONFIG);
+  if (config === undefined) {
+    process.stderr.write(
+      `[acpx] CODEX_CONFIG is not a JSON object; leaving it untouched, so ` +
+        `${CODEX_TOOL_OUTPUT_TOKEN_LIMIT_KEY} is not set for this codex session.\n`,
+    );
+    return;
+  }
+  if (Object.prototype.hasOwnProperty.call(config, CODEX_TOOL_OUTPUT_TOKEN_LIMIT_KEY)) {
+    return;
+  }
+  env.CODEX_CONFIG = JSON.stringify({
+    ...config,
+    [CODEX_TOOL_OUTPUT_TOKEN_LIMIT_KEY]: CODEX_TOOL_OUTPUT_TOKEN_LIMIT,
+  });
+}
+
+/** `{}` for an absent/blank value, the parsed object, or `undefined` when it is not a JSON object. */
+function parseCodexConfigEnv(raw: string | undefined): Record<string, unknown> | undefined {
+  if (raw === undefined || raw.trim() === "") {
+    return {};
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return undefined;
+  }
+  return parsed as Record<string, unknown>;
+}
+
 // eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
 function buildAgentEnvironment(
   authCredentials: Record<string, string> | undefined,
@@ -820,6 +893,7 @@ function buildAgentEnvironment(
   delete env.PI_PROVIDER;
   delete env.PI_REASONING_LEVEL;
   applyAgentTypeEnvironment(env, agentCommand);
+  applyCodexToolOutputLimit(env, agentCommand);
   const baseUrl = resolveAcpxUiBaseUrl(env);
   // ⚠️ HAND THE RESOLVED VALUE DOWN — this line is why the adapters do not each own
   // a copy of the ladder above. Adapters used to carry a byte-for-byte port of it
