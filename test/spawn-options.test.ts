@@ -1769,6 +1769,89 @@ test("buildAgentSpawnOptions leaves ACPX_AGENT_TYPE UNSET for an unclassifiable 
   }
 });
 
+// --- CODEX_CONFIG tool_output_token_limit (brick://ab9e9ebe) ----------------
+// acpx, not a per-box config.toml, is the source of truth for the Codex tool-output
+// ceiling, so a new box gets it with no one remembering to set it. `agentCommand`
+// below is the REAL production shape (206 live codex records carry exactly it).
+
+const CODEX_PRODUCTION_COMMAND = "node /opt/codex-acp/dist/index.js";
+
+function codexConfigEnvFor(agentCommand: string | undefined, inherited: string | undefined) {
+  const previous = process.env.CODEX_CONFIG;
+  if (inherited === undefined) {
+    delete process.env.CODEX_CONFIG;
+  } else {
+    process.env.CODEX_CONFIG = inherited;
+  }
+  try {
+    return buildAgentSpawnOptions(
+      "/tmp/acpx-agent",
+      undefined,
+      { acpxRecordId: "11111111-2222-3333-4444-555555555555" },
+      undefined,
+      agentCommand,
+    ).env.CODEX_CONFIG;
+  } finally {
+    if (previous === undefined) {
+      delete process.env.CODEX_CONFIG;
+    } else {
+      process.env.CODEX_CONFIG = previous;
+    }
+  }
+}
+
+test("codex spawn: CODEX_CONFIG absent or blank gets tool_output_token_limit 200000", () => {
+  for (const inherited of [undefined, "", "   "]) {
+    const value = codexConfigEnvFor(CODEX_PRODUCTION_COMMAND, inherited);
+    assert.deepEqual(JSON.parse(value ?? "null"), { tool_output_token_limit: 200_000 });
+  }
+});
+
+test("codex spawn: an operator CODEX_CONFIG object keeps its keys and gains the limit", () => {
+  const value = codexConfigEnvFor(
+    CODEX_PRODUCTION_COMMAND,
+    '{"model_verbosity":"low","x":{"a":1}}',
+  );
+  assert.deepEqual(JSON.parse(value ?? "null"), {
+    model_verbosity: "low",
+    x: { a: 1 },
+    tool_output_token_limit: 200_000,
+  });
+});
+
+test("codex spawn: an operator-set tool_output_token_limit wins, byte for byte", () => {
+  for (const operator of [
+    '{"tool_output_token_limit":2000}',
+    '{"model_verbosity":"low", "tool_output_token_limit": 5}',
+  ]) {
+    assert.equal(codexConfigEnvFor(CODEX_PRODUCTION_COMMAND, operator), operator);
+  }
+});
+
+test("codex spawn: a non-object CODEX_CONFIG is left untouched with one stderr warning", async () => {
+  for (const operator of ["not json", "[1,2]", "42", "null", '"str"']) {
+    let value: string | undefined;
+    await withCapturedStderrWrites(async (writes) => {
+      value = codexConfigEnvFor(CODEX_PRODUCTION_COMMAND, operator);
+      const warnings = writes.filter((line) => line.includes("CODEX_CONFIG is not a JSON object"));
+      assert.equal(warnings.length, 1, `expected one warning for ${operator}`);
+    });
+    assert.equal(value, operator);
+  }
+});
+
+test("non-codex spawns never get CODEX_CONFIG and keep an inherited one untouched", () => {
+  for (const agentCommand of [
+    undefined,
+    "node /opt/claude-agent-acp/dist/index.js",
+    "node /opt/pi-acp/dist/index.js",
+    "node /opt/some-unknown-acp/dist/index.js",
+  ]) {
+    assert.equal(codexConfigEnvFor(agentCommand, undefined), undefined, String(agentCommand));
+    assert.equal(codexConfigEnvFor(agentCommand, '{"a":1}'), '{"a":1}', String(agentCommand));
+  }
+});
+
 // --- account-stamp leak (brick://6530d3b4) ----------------------------------
 // The FW-07 delete list covered session identity and not account identity, so a
 // pi child of a claude parent inherited a complete Claude credential identity
