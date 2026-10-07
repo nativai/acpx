@@ -560,6 +560,8 @@ function planSeatRow(seatId: string, members: readonly RecordPlan[], now: string
     name: recordNameFromHolders(members),
     brickId: brickLinkFromHolders(members),
     favorite: favoriteFromHolders(members),
+    // A backfilled seat has no level of its own yet: the default (brick 4f3fa88c).
+    contextAlarm: undefined,
   };
 }
 

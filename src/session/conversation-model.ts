@@ -731,6 +731,9 @@ export function cloneSessionAcpxState(
     refused_output_style: state.refused_output_style,
     context_window_size: state.context_window_size,
     context_window_model_id: state.context_window_model_id,
+    // brick 4f3fa88c — written on every usage_update DURING the turn and re-based off
+    // this clone after it: missing here, the fill would be gone from every saved record.
+    context_fill: cloneOptional(state.context_fill),
     available_models: state.available_models ? [...state.available_models] : undefined,
     available_commands: state.available_commands ? [...state.available_commands] : undefined,
     progress: state.progress ? deepClone(state.progress) : undefined,
@@ -1106,6 +1109,7 @@ const SESSION_UPDATE_HANDLERS: Record<string, SessionUpdateHandler> = {
     if (update.sessionUpdate === "usage_update") {
       applyUsageUpdate(conversation, update);
       rememberContextWindow(acpx, update);
+      rememberContextFill(acpx, update);
       // ⚠️ BEFORE, AND INDEPENDENT OF, THE COST INGEST BELOW — which returns
       // early without a `_meta.piAcp.message` block, i.e. on EVERY Claude
       // session. Folding attribution into that call left it unreachable on the
@@ -1335,6 +1339,40 @@ function rememberContextWindow(acpx: SessionAcpxState, update: UsageUpdate): voi
     acpx.context_window_size = size;
     acpx.context_window_model_id = modelId;
   }
+}
+
+/**
+ * Brick 4f3fa88c: remember the fill as reported — `used`, the window (`0` = unknown, kept
+ * as 0, never replaced by a remembered or guessed one) and the compaction point the
+ * adapter named in `_meta.contextCompaction.atTokens`. Whole-value overwrite: a point the
+ * adapter stopped naming (a model switch) is not carried forward.
+ */
+function rememberContextFill(acpx: SessionAcpxState, update: UsageUpdate): void {
+  const used = (update as { used?: unknown }).used;
+  if (typeof used !== "number" || !Number.isFinite(used) || used < 0) {
+    return;
+  }
+  const size = (update as { size?: unknown }).size;
+  const window = typeof size === "number" && Number.isFinite(size) && size > 0 ? size : 0;
+  const compactAt = readCompactionAtTokens((update as { _meta?: unknown })._meta);
+  acpx.context_fill = {
+    used_tokens: used,
+    window_tokens: window,
+    ...(compactAt === undefined ? {} : { compaction_tokens: compactAt }),
+  };
+}
+
+/** `_meta.contextCompaction.atTokens` — the one key every adapter names it under. */
+function readCompactionAtTokens(meta: unknown): number | undefined {
+  if (typeof meta !== "object" || meta === null) {
+    return undefined;
+  }
+  const block = (meta as Record<string, unknown>).contextCompaction;
+  const at =
+    typeof block === "object" && block !== null
+      ? (block as Record<string, unknown>).atTokens
+      : undefined;
+  return typeof at === "number" && Number.isFinite(at) && at > 0 ? at : undefined;
 }
 
 /** Fix A: the context-window hint to inject on resume — the remembered size,

@@ -59,6 +59,7 @@
  * to the same attribution union, caps, composer and envelope as any other, and it declares
  * `requires-mitigation` because it cannot honestly claim neutrality for text it never inspects.
  */
+import { contextAlarmLineForTurnStart } from "../session/context-alarm-detector.js";
 import { harnessIdForAgentCommand, type HarnessId } from "./harness-capabilities.js";
 
 /**
@@ -198,7 +199,27 @@ export type TurnContextProvider = {
  * seam is a runtime path, deliberately kept and deliberately governed. See
  * {@link testPayloadProvider}.
  */
-const SHIPPED_PROVIDERS: readonly TurnContextProvider[] = [];
+/**
+ * THE CONTEXT ALARM AT THE TOP OF EVERY LATER TURN (brick 4f3fa88c, Daniel's item C):
+ * while the session's fill is past its seat's alarm, every prompt it receives — a parent's
+ * message, a wakeup, Daniel's own — opens with the fixed `⟦CONTEXT-ALARM⟧` line, numbers
+ * as last reported. Wire-only, like every provider here: the transcript keeps the user's
+ * own text.
+ *
+ * `requires-mitigation`, not `neutral`: the line tells the agent to hand over, so read as
+ * the user's own words it WOULD change what the agent does. The envelope's measured
+ * attribution flip (M1e/ENVELOPE-V1) is the mitigation it rides on.
+ *
+ * Cheap by construction — one synchronous map lookup; the detector it reads is fed by the
+ * usage reports, never by I/O here.
+ */
+const contextAlarmProvider: TurnContextProvider = {
+  id: "context-alarm",
+  attribution: { kind: "requires-mitigation", evidence: `M1e/${TURN_CONTEXT_ENVELOPE_ID}` },
+  resolve: (request) => contextAlarmLineForTurnStart(request.sessionId),
+};
+
+const SHIPPED_PROVIDERS: readonly TurnContextProvider[] = [contextAlarmProvider];
 
 let registeredProviders: readonly TurnContextProvider[] = SHIPPED_PROVIDERS;
 
