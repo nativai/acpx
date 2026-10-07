@@ -943,6 +943,12 @@ function detailLines(report: SeatBackfillReport): string[] {
         `  archived seat ${seatId} (in seat-archive/; restore its holder to bring it back)`,
     ),
   );
+  lines.push(
+    ...report.unreadableArchivedSeats.map(
+      (seatId) =>
+        `  ⚠ archived seat ${seatId}: its seat-archive/ file does NOT PARSE — skipped, repair it by hand`,
+    ),
+  );
   lines.push(...nameStripLines(report));
   if (report.backupSuffix !== undefined) {
     lines.push(`  rollback copies:      ${report.backups.length} × *${report.backupSuffix}`);

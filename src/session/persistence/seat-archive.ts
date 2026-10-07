@@ -120,21 +120,31 @@ function parseLedgerEntry(raw: unknown): SeatArchiveLedgerEntry | undefined {
   };
 }
 
+export type SeatArchiveLedger = {
+  entries: Map<string, SeatArchiveLedgerEntry>;
+  /**
+   * Seat ids whose ledger file EXISTS and does not parse (outside damage — every write is temp +
+   * rename). 🛑 STILL ARCHIVED: the file is the seat's only copy, so every reader that skips a
+   * ledger seat (the backfill) must skip these too, or it re-mints the seat from a retired holder.
+   */
+  unreadable: string[];
+  problems: string[];
+};
+
 /**
  * Every ledger entry, keyed by seat id. A file that does not parse is NAMED in `problems`
- * and never deleted: it may be the only copy of a seat row.
+ * and `unreadable`, and never deleted: it may be the only copy of a seat row.
  */
-export async function readSeatArchiveLedger(
-  sessionDir: string,
-): Promise<{ entries: Map<string, SeatArchiveLedgerEntry>; problems: string[] }> {
+export async function readSeatArchiveLedger(sessionDir: string): Promise<SeatArchiveLedger> {
   const entries = new Map<string, SeatArchiveLedgerEntry>();
+  const unreadable: string[] = [];
   const problems: string[] = [];
   let files: string[];
   try {
     files = await fs.readdir(seatArchiveDir(sessionDir));
   } catch (error) {
     if (isAbsent(error)) {
-      return { entries, problems };
+      return { entries, unreadable, problems };
     }
     throw error;
   }
@@ -152,31 +162,48 @@ export async function readSeatArchiveLedger(
       entry = undefined;
     }
     if (!entry || entry.row.seatId !== seatId) {
-      problems.push(`ledger file ${path.join(seatArchiveDir(sessionDir), file)} does not parse`);
+      unreadable.push(seatId);
+      problems.push(unreadableLedgerMessage(seatId, path.join(seatArchiveDir(sessionDir), file)));
       continue;
     }
     entries.set(seatId, entry);
   }
-  return { entries, problems };
+  return { entries, unreadable, problems };
 }
 
-/** The ledger entry for one seat, or `undefined`. Never throws for an unreadable file. */
-export async function readSeatArchiveEntry(
-  sessionDir: string,
-  seatId: string,
-): Promise<SeatArchiveLedgerEntry | undefined> {
-  try {
-    return parseLedgerEntry(JSON.parse(await fs.readFile(ledgerFile(sessionDir, seatId), "utf8")));
-  } catch {
-    return undefined;
-  }
+function unreadableLedgerMessage(seatId: string, file: string): string {
+  return (
+    `seat ${seatId} is ARCHIVED, but its ledger file ${file} does not parse — it is the seat's ` +
+    `only copy, so nothing re-mints or deletes it. Repair it by hand (or restore it from a backup).`
+  );
 }
 
 /**
- * The refusal text for a seat that is in the ledger — shared by every refusal of a missing
- * seat (`--seat`/`?seat=`/`--parent-seat` and the `seats` verbs), so they cannot drift.
+ * The refusal text for a seat that is in the ledger, or `undefined` when it is not — shared by
+ * every refusal of a missing seat (`--seat`/`?seat=`/`--parent-seat` and the `seats` verbs), so
+ * they cannot drift. A ledger file that exists and does not parse is still an archived seat.
  */
-export function archivedSeatMessage(seatId: string, entry: SeatArchiveLedgerEntry): string {
+export async function archivedSeatRefusal(
+  sessionDir: string,
+  seatId: string,
+): Promise<string | undefined> {
+  const file = ledgerFile(sessionDir, seatId);
+  let text: string;
+  try {
+    text = await fs.readFile(file, "utf8");
+  } catch {
+    return undefined;
+  }
+  let entry: SeatArchiveLedgerEntry | undefined;
+  try {
+    entry = parseLedgerEntry(JSON.parse(text));
+  } catch {
+    entry = undefined;
+  }
+  return entry ? archivedSeatMessage(seatId, entry) : unreadableLedgerMessage(seatId, file);
+}
+
+function archivedSeatMessage(seatId: string, entry: SeatArchiveLedgerEntry): string {
   return (
     `seat ${seatId}${entry.row.name ? ` (${JSON.stringify(entry.row.name)})` : ""} is ARCHIVED ` +
     `with its active holder ${entry.holderId} (moved to the archive tier${
@@ -492,7 +519,36 @@ async function applyPlan(
   result.seatStoreWrites = wrote ? 1 : 0;
   // 3. The ledger files that the write made redundant.
   await finishAfterWrite(sessionDir, storePath, outcome, result);
+  // 4. F2 — a holder restored INSIDE this run's plan→write window is hot again while its seat
+  //    was just folded. Read again now, AFTER the write: a restore that moved its files before
+  //    this read is caught here; one that moves them after it runs its own reconcile after this
+  //    write, which unfolds. No ordering leaves the seat in the ledger behind a hot holder.
+  await unfoldRacedHolders(options, outcome.removed, result);
   return result;
+}
+
+async function unfoldRacedHolders(
+  options: SeatArchiveReconcileOptions,
+  removed: readonly SeatRecord[],
+  result: SeatArchiveReconcileResult,
+): Promise<void> {
+  const hotFiles = new Set(await fs.readdir(options.sessionDir));
+  const raced = removed
+    .map((row) => row.activeHolderId ?? "")
+    .filter((holderId) => hotFiles.has(`${encodeSessionSafeId(holderId)}.json`));
+  if (raced.length === 0) {
+    return;
+  }
+  const again = await reconcileSeatArchive({
+    ...options,
+    holderIds: new Set(raced),
+    assumeArchived: undefined,
+  });
+  const back = new Set(again.unfolded.map((seat) => seat.seatId));
+  result.folded = result.folded.filter((seat) => !back.has(seat.seatId));
+  result.unfolded.push(...again.unfolded);
+  result.problems.push(...again.problems);
+  result.seatStoreWrites += again.seatStoreWrites;
 }
 
 /**

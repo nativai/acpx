@@ -19,11 +19,7 @@ import {
 } from "./persistence/index.js";
 import { parseSessionRecord } from "./persistence/parse.js";
 import { writeSessionRecordAuthorizingSeatHolderWithoutIndex } from "./persistence/repository.js";
-import {
-  archivedSeatMessage,
-  readSeatArchiveEntry,
-  readSeatArchiveLedger,
-} from "./persistence/seat-archive.js";
+import { archivedSeatRefusal, readSeatArchiveLedger } from "./persistence/seat-archive.js";
 import { seatFieldsToIndexEntry } from "./persistence/seat-fields.js";
 import { findHolderlessSeats, reapHolderlessSeats } from "./persistence/seat-holderless.js";
 import {
@@ -197,6 +193,9 @@ export type SeatBackfillReport = {
    * the real row back.
    */
   archivedSeats: string[];
+  /** Of `archivedSeats`, those whose ledger file exists and does not parse — still skipped
+   * (the file is the seat's only copy), and named so a human repairs it. */
+  unreadableArchivedSeats: string[];
   /**
    * D-NAME-HARD-MIGRATION: the name lives on the SEAT only, so the strip step moves
    * every record's legacy `name` to its seat and deletes the field. Records whose
@@ -1289,15 +1288,13 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
   });
 
   const ledger = await readSeatArchiveLedger(sessionDir);
+  // F1: a ledger file that does not parse is STILL an archived seat — skipping only the parsed
+  // ones re-minted the seat from its retired holder (ordinal re-issued, name lost).
+  const ledgerSeatIds = new Set([...ledger.entries.keys(), ...ledger.unreadable]);
   const archivedSeats = [...groupBySeat(scanned.plans).keys()].filter((seatId) =>
-    ledger.entries.has(seatId),
+    ledgerSeatIds.has(seatId),
   );
-  const seatPlans = await planSeats(
-    sessionDir,
-    scanned.plans,
-    now().toISOString(),
-    new Set(ledger.entries.keys()),
-  );
+  const seatPlans = await planSeats(sessionDir, scanned.plans, now().toISOString(), ledgerSeatIds);
   // Found BEFORE any leg runs, on the store as it stood: a row this run mints has a
   // record by construction, so the two populations cannot overlap.
   const holderless = await findHolderlessSeats(sessionDir);
@@ -1313,6 +1310,7 @@ export async function runSeatBackfill(options: SeatBackfillOptions): Promise<Sea
     recordsWithoutIndexEntry: scanned.recordsWithoutIndexEntry,
     staleIndexEntries: scanned.staleIndexEntries,
     archivedSeats,
+    unreadableArchivedSeats: archivedSeats.filter((seatId) => ledger.unreadable.includes(seatId)),
     notes: SEAT_BACKFILL_NOTES,
   };
 
@@ -1430,9 +1428,9 @@ export async function countStaleSeatIndexEntries(sessionDir: string): Promise<nu
 export async function explainSeatRowMissing(error: SeatRowMissingError): Promise<string> {
   const sessionDir = path.dirname(error.storePath);
   // Brick 87497c17: neither a typo nor a backfill case — the seat left with its archived holder.
-  const archived = await readSeatArchiveEntry(sessionDir, error.seatId);
+  const archived = await archivedSeatRefusal(sessionDir, error.seatId);
   if (archived) {
-    return archivedSeatMessage(error.seatId, archived);
+    return archived;
   }
   let referenced = false;
   for (const file of await listSessionRecordFiles(sessionDir)) {

@@ -7,7 +7,7 @@ import {
   seatFromStore,
   sessionBaseDir,
 } from "../session/persistence.js";
-import { archivedSeatMessage, readSeatArchiveEntry } from "../session/persistence/seat-archive.js";
+import { archivedSeatRefusal } from "../session/persistence/seat-archive.js";
 import { SEAT_UNRESOLVED_DETAIL_CODE, type SessionRecord } from "../types.js";
 import { resolveSessionSelectorFromFlags, type SessionSelectorFlags } from "./flags.js";
 
@@ -88,12 +88,9 @@ export async function resolveSeatActiveHolder(
   const seat = seatFromStore(store, seatId);
   if (!seat) {
     // Brick 87497c17: same refusal, same code — but an ARCHIVED seat names its way back.
-    const archived = await readSeatArchiveEntry(sessionBaseDir(), seatId);
+    const archived = await archivedSeatRefusal(sessionBaseDir(), seatId);
     if (archived) {
-      throw new NoSessionError(
-        `${label}: ${archivedSeatMessage(seatId, archived)}`,
-        SEAT_UNRESOLVED_DETAIL_CODE,
-      );
+      throw new NoSessionError(`${label}: ${archived}`, SEAT_UNRESOLVED_DETAIL_CODE);
     }
     throw new NoSessionError(
       `${label}: seat ${seatId} is not in this box's seat store (${store.storePath}) — a typo, ` +
