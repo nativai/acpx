@@ -292,6 +292,31 @@ test("ledger · NEGATIVE: `--message-id` (acpx-ui's own delivery) writes no line
   });
 });
 
+test("ledger · NEGATIVE: a ?seat= that is not a seat id is recorded as from.seat null — the line is still written", async () => {
+  await withRig(async (rig) => {
+    const caller = await rig.create();
+    const target = await rig.create();
+    const callerUrl = `${UI_BASE}/?session=${caller}`;
+    const realSeat = String((await rig.onDisk(caller)).seat_id);
+    for (const seatUrl of [
+      `${UI_BASE}/?seat=garbage-seat`,
+      // An uppercased real seat id: the store never normalises one, so neither does the ledger.
+      `${UI_BASE}/?seat=${realSeat.toUpperCase()}`,
+    ]) {
+      const result = await rig.cli(
+        [...rig.base, "prompt", "--session-id", target, "--no-wait", "hi"],
+        { ACPX_SESSION_URL: callerUrl, ACPX_SEAT_URL: seatUrl },
+      );
+      assert.equal(result.code, 0, result.stderr);
+    }
+    const lines = await rig.ledger();
+    assert.equal(lines.length, 2, JSON.stringify(lines));
+    for (const line of lines) {
+      assert.deepEqual(line.from, { session: caller, seat: null, url: callerUrl });
+    }
+  });
+});
+
 test("ledger · NEGATIVE: an ACPX_SESSION_URL without a ?session= uuid is no identity", async () => {
   await withRig(async (rig) => {
     const target = await rig.create();
@@ -482,6 +507,14 @@ test("ledger writer · caller identity: url uuid first, record id as fallback, s
   const seat = randomUUID();
   assert.equal(resolveLedgerCaller({}), undefined);
   assert.equal(resolveLedgerCaller({ ACPX_SESSION_URL: "   " }), undefined);
+  assert.equal(
+    resolveLedgerCaller({
+      ACPX_SESSION_URL: `${UI_BASE}/?session=${session}`,
+      ACPX_SEAT_URL: `${UI_BASE}/?seat=garbage-seat`,
+    })?.seat,
+    null,
+    "a ?seat= that is not a seat id must be null, not written through",
+  );
   assert.deepEqual(
     resolveLedgerCaller({
       ACPX_SESSION_URL: `${UI_BASE}/?session=${session}`,

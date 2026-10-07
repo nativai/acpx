@@ -14,7 +14,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { normalizeOutputError } from "../acp/error-normalization.js";
-import { sessionBaseDir } from "../session/persistence.js";
+import { parseSeatRefOrThrow, sessionBaseDir } from "../session/persistence.js";
 import type { PromptInput } from "../types.js";
 import { parseSeatIdFromUrl, parseSessionIdFromUrl } from "./session-selector.js";
 
@@ -63,9 +63,22 @@ export function resolveLedgerCaller(
   }
   return {
     session,
-    seat: parseSeatIdFromUrl(nonEmpty(env.ACPX_SEAT_URL)) ?? null,
+    seat: validSeatOrNull(parseSeatIdFromUrl(nonEmpty(env.ACPX_SEAT_URL))),
     url: url ?? null,
   };
+}
+
+// The seat store's own rule (lowercase uuid, never normalised): a `?seat=` that is not a seat
+// id is recorded as unknown (`null`), never written through for the reader to key on.
+function validSeatOrNull(value: string | undefined): string | null {
+  if (value === undefined) {
+    return null;
+  }
+  try {
+    return parseSeatRefOrThrow("ACPX_SEAT_URL", value);
+  } catch {
+    return null;
+  }
 }
 
 function nonEmpty(value: string | undefined): string | undefined {
