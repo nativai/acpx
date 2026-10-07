@@ -119,10 +119,12 @@ import {
   type SessionsCloseFlags,
   type StatusFlags,
 } from "./flags.js";
+import { type MessageLedgerKind, withMessageLedger } from "./message-ledger.js";
 import { emitJsonResult } from "./output/json-output.js";
 // Type-only, so the render module stays lazily imported at runtime.
 import type { PruneRefusal, PruneScope } from "./output/render.js";
 import {
+  addressedSeatIdFromSelector,
   NoSessionError,
   noSessionIdMessage,
   parseSeatIdFromUrl,
@@ -1491,6 +1493,7 @@ async function deliverPrompt(params: {
   outputPolicy: ReturnType<typeof resolveRequestedOutputPolicy>;
   config: ResolvedAcpxConfig;
   messageId?: string;
+  onSubmitAccepted?: () => void;
 }) {
   const { createOutputFormatter } = await loadOutputModule();
   const { sendSession } = await loadSessionModule();
@@ -1524,6 +1527,7 @@ async function deliverPrompt(params: {
     verbose: params.globalFlags.verbose,
     waitForCompletion: params.waitForCompletion,
     messageId: params.messageId,
+    onSubmitAccepted: params.onSubmitAccepted,
     sessionOptions: sessionOptionsFromGlobalFlags(params.globalFlags),
   });
 }
@@ -1587,17 +1591,29 @@ export async function handlePrompt(
   const prompt = await readPrompt(promptParts, flags.file, globalFlags.cwd);
 
   await printPromptSessionBanner(record, agent.cwd, outputPolicy.format, outputPolicy.jsonStrict);
-  const result = await deliverPrompt({
-    sessionId: record.acpxRecordId,
-    prompt,
-    waitForCompletion: flags.wait !== false,
-    globalFlags,
-    permissionMode,
-    permissionPolicy,
-    outputPolicy,
-    config,
-    messageId: flags.messageId,
-  });
+  const addressedSeat = addressedSeatIdFromSelector(selector);
+  const result = await withMessageLedger(
+    {
+      kind: "prompt",
+      to: { session: record.acpxRecordId, seat: addressedSeat ?? record.seatId ?? null },
+      addressedAs: addressedSeat === undefined ? "session" : "seat",
+      prompt,
+      messageId: flags.messageId,
+    },
+    (onSubmitAccepted) =>
+      deliverPrompt({
+        sessionId: record.acpxRecordId,
+        prompt,
+        waitForCompletion: flags.wait !== false,
+        globalFlags,
+        permissionMode,
+        permissionPolicy,
+        outputPolicy,
+        config,
+        messageId: flags.messageId,
+        onSubmitAccepted,
+      }),
+  );
 
   if ("queued" in result) {
     printQueuedPromptByFormat(result, outputPolicy.format);
@@ -2821,18 +2837,29 @@ async function handleSessionsNewFromTemplate(
   }
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
-  await deliverPrompt({
-    sessionId: created.acpxRecordId,
-    prompt: textPrompt(autoPromptText),
-    // Enqueue-and-return: the spawn command surfaces the child's URL promptly while
-    // the agent works the prompt asynchronously (mirrors the UI's `prompt --no-wait`).
-    waitForCompletion: false,
-    globalFlags,
-    permissionMode,
-    permissionPolicy,
-    outputPolicy: resolveRequestedOutputPolicy(globalFlags),
-    config,
-  });
+  const prompt = textPrompt(autoPromptText);
+  await withMessageLedger(
+    {
+      kind: "template-prompt",
+      to: ledgerTargetOf(created),
+      addressedAs: "session",
+      prompt,
+    },
+    (onSubmitAccepted) =>
+      deliverPrompt({
+        sessionId: created.acpxRecordId,
+        prompt,
+        // Enqueue-and-return: the spawn command surfaces the child's URL promptly while
+        // the agent works the prompt asynchronously (mirrors the UI's `prompt --no-wait`).
+        waitForCompletion: false,
+        globalFlags,
+        permissionMode,
+        permissionPolicy,
+        outputPolicy: resolveRequestedOutputPolicy(globalFlags),
+        config,
+        onSubmitAccepted,
+      }),
+  );
 }
 
 export async function handleSessionsNew(
@@ -2974,7 +3001,7 @@ export async function handleSessionsCopy(
 
   if (!forkNotice) {
     // Byway / ephemeral path: no notice, deliver handoffPrompt as-is (may include images).
-    await deliverCopyHandoffPrompt(created.acpxRecordId, handoffPrompt!, command, config);
+    await deliverCopyHandoffPrompt(created, handoffPrompt!, "prompt", command, config);
     return;
   }
 
@@ -2984,7 +3011,7 @@ export async function handleSessionsCopy(
   // ignored (fork handoffs via --prompt don't carry images).
   const handoffText = handoffPrompt ? promptToDisplayText(handoffPrompt) : "";
   const deliverText = forkNotice + (handoffText ? handoffText : "");
-  await deliverCopyHandoffPrompt(created.acpxRecordId, textPrompt(deliverText), command, config);
+  await deliverCopyHandoffPrompt(created, textPrompt(deliverText), "fork-notice", command, config);
 }
 
 async function resolveCopyHandoffPrompt(
@@ -3009,9 +3036,15 @@ async function resolveCopyHandoffPrompt(
   );
 }
 
+// The ledger's `to` for a session this command just created and prompts directly.
+function ledgerTargetOf(created: SessionRecord): { session: string; seat: string | null } {
+  return { session: created.acpxRecordId, seat: created.seatId ?? null };
+}
+
 async function deliverCopyHandoffPrompt(
-  sessionId: string,
+  created: SessionRecord,
   prompt: import("../types.js").PromptInput,
+  kind: MessageLedgerKind,
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
@@ -3019,18 +3052,28 @@ async function deliverCopyHandoffPrompt(
   validateExplicitCredentialFlags(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
-  await deliverPrompt({
-    sessionId,
-    prompt,
-    // Copy/fork handoff is a spawn-style fire-and-return operation: the parent
-    // gets the child's id/URL immediately while the copied session works async.
-    waitForCompletion: false,
-    globalFlags,
-    permissionMode,
-    permissionPolicy,
-    outputPolicy: resolveRequestedOutputPolicy(globalFlags),
-    config,
-  });
+  await withMessageLedger(
+    {
+      kind,
+      to: ledgerTargetOf(created),
+      addressedAs: "session",
+      prompt,
+    },
+    (onSubmitAccepted) =>
+      deliverPrompt({
+        sessionId: created.acpxRecordId,
+        prompt,
+        // Copy/fork handoff is a spawn-style fire-and-return operation: the parent
+        // gets the child's id/URL immediately while the copied session works async.
+        waitForCompletion: false,
+        globalFlags,
+        permissionMode,
+        permissionPolicy,
+        outputPolicy: resolveRequestedOutputPolicy(globalFlags),
+        config,
+        onSubmitAccepted,
+      }),
+  );
 }
 
 // Shared core for `sessions copy`/`fork` and `sessions new --from-template`.
