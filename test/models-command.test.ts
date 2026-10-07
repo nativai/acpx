@@ -153,6 +153,40 @@ test("SHAPE 1 — a typo still finds its target, because a typo shares no whole 
   assert.match(error.message, /deepseek\/deepseek-v4-pro/);
 });
 
+test("SHAPE 1 — a retired claude-home: prefix suggests the plan row first, never a metered one", () => {
+  const rows = [
+    {
+      id: "anthropic/claude-opus-4.9",
+      name: "Anthropic: Claude Opus 4.9",
+      supported_parameters: ["tools"],
+      pricing: { prompt: "0.000005", completion: "0.000025" },
+    },
+    { id: "moonshotai/kimi-k3", name: "MoonshotAI: Kimi K3", supported_parameters: ["tools"] },
+  ];
+  const catalogue = buildCatalogue(rows, META, {
+    nativeModels: [...harnessNativeModels(), ...CODEX_FIXTURES],
+    entitlement: entitleAll(rows),
+  });
+  const suggested = (model: string) =>
+    caught(() => validateModelSelection(catalogue, { model }))
+      .message.split("did you mean:\n")[1]
+      .split("\n")
+      .filter((line) => line.startsWith("    "));
+
+  const retired = suggested("claude-home:opus");
+  assert.match(retired[0], /^ {4}claude-subscription:opus /);
+  assert.match(retired[0], /on plan/);
+  // Nothing metered ranks above the plan row.
+  const firstMetered = retired.findIndex((line) => line.includes("per 1M]"));
+  assert.ok(firstMetered === -1 || firstMetered > 0, retired.join("\n"));
+
+  // CONTROL — an explicit openrouter: input still gets OpenRouter suggestions, so the
+  // fix cannot pass by suppressing suggestions altogether.
+  const explicit = suggested("openrouter:anthropic/claude-opus-4.8");
+  assert.ok(explicit.length > 0);
+  assert.match(explicit[0], /^ {4}openrouter:anthropic\/claude-opus-4\.9 /);
+});
+
 /**
  * ⚠️ AMBIGUITY IS ABOUT THE BILL. The case D2 protects against is the same
  * weights reached through two doors that cost DIFFERENT money — `opus` on plan
