@@ -26,6 +26,7 @@ import {
 import { isDetachedArchiveDir } from "../session/archive/paths.js";
 import { resolveBoundaries, type ArchivePlan } from "../session/archive/retention.js";
 import { sessionBaseDir } from "../session/persistence/repository.js";
+import { seatArchiveReportLines } from "../session/persistence/seat-archive.js";
 
 /**
  * `acpx sessions archive` / `acpx sessions restore`.
@@ -386,6 +387,7 @@ function archiveRunJson(context: ArchiveContext, result: ArchiveRunResult): unkn
     skippedAtApply: result.skippedAtApply,
     failures: result.failures,
     indexReconciled: result.indexReconciled,
+    seatArchive: result.seatArchive,
     warnings: result.warnings,
   };
 }
@@ -404,6 +406,9 @@ function writeArchiveRunText(context: ArchiveContext, result: ArchiveRunResult):
   appendPlanNotes(lines, result);
   if (result.applied) {
     appendAppliedLines(lines, result);
+  }
+  if (result.seatArchive) {
+    lines.push(...seatArchiveReportLines(result.seatArchive).map((line) => `  ${line}`));
   }
   for (const warning of result.warnings) {
     lines.push(`  ⚠ ${warning}`);
@@ -669,6 +674,11 @@ function writeRestoreText(result: Awaited<ReturnType<typeof runRestore>>): void 
     process.stdout.write(
       `skipped ${skipped.id}: ${skipped.reason}${skipped.detail ? ` (${skipped.detail})` : ""}\n`,
     );
+  }
+  if (result.seatArchive) {
+    for (const line of seatArchiveReportLines(result.seatArchive)) {
+      process.stdout.write(`${line}\n`);
+    }
   }
   for (const warning of result.warnings) {
     // The byway-anchor warning lives here and is the one a user must not miss.

@@ -1,5 +1,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import {
+  reconcileSeatArchive,
+  type SeatArchiveReconcileResult,
+} from "../persistence/seat-archive.js";
 import { readSeatStore, type SeatStore } from "../persistence/seat-store.js";
 import { seatNameFromStore } from "../seat-display-name.js";
 import {
@@ -102,6 +106,9 @@ export type ArchiveRunResult = {
   skippedAtApply: { id: string; reason: string; detail?: string }[];
   failures: { id: string; file: string; error: string }[];
   indexReconciled: boolean;
+  /** Brick 87497c17: the seats archived with their holders (and any restored). Absent only
+   * when the run was gated before reading anything. */
+  seatArchive?: SeatArchiveReconcileResult;
   warnings: string[];
 };
 
@@ -213,6 +220,11 @@ export async function applyArchiveRun(options: ArchiveRunOptions): Promise<Archi
     return result;
   }
   if (options.dryRun) {
+    // Predicts THIS wave too: its selected holders are read as archived.
+    result.seatArchive = await reconcileSeatsAfter(context, undefined, result.warnings, {
+      dryRun: true,
+      assumeArchived: new Set(plan.selected.map((entry) => entry.candidate.id)),
+    });
     return result;
   }
 
@@ -241,8 +253,41 @@ export async function applyArchiveRun(options: ArchiveRunOptions): Promise<Archi
 
   await writeShardEntries(context, shardEntries, result.warnings);
   result.indexReconciled = (await reconcileHotIndex(context.hotDir)).drift;
+  // Every seat, not only this run's: the next wave also folds a backlog left by an earlier one.
+  result.seatArchive = await reconcileSeatsAfter(context, undefined, result.warnings);
   result.applied = true;
   return result;
+}
+
+/**
+ * Brick 87497c17 — a seat is archived with its active holder, and restored with it.
+ *
+ * ⚠️ A SEAT FAILURE NEVER FAILS THE MOVE THAT PRECEDED IT. The files have already moved; a
+ * reconcile that could not run leaves seats exactly as they were (or in both places, which
+ * the next run finishes), and says so in the warnings.
+ */
+async function reconcileSeatsAfter(
+  context: ArchiveContext,
+  holderIds: ReadonlySet<string> | undefined,
+  warnings: string[],
+  preview?: { dryRun: true; assumeArchived: ReadonlySet<string> },
+): Promise<SeatArchiveReconcileResult | undefined> {
+  try {
+    return await reconcileSeatArchive({
+      sessionDir: context.hotDir,
+      archiveDir: context.archiveDir,
+      holderIds,
+      dryRun: preview?.dryRun ?? false,
+      assumeArchived: preview?.assumeArchived,
+      at: context.at,
+      wave: context.wave,
+    });
+  } catch (error) {
+    warnings.push(
+      `seat archive reconcile failed (${(error as Error).message}); the next wave or restore re-runs it`,
+    );
+    return undefined;
+  }
 }
 
 /**
@@ -414,6 +459,8 @@ export type RestoreResult = {
   skipped: { id: string; reason: string; detail?: string }[];
   warnings: string[];
   indexReconciled: boolean;
+  /** Brick 87497c17: the seats of the restored holders, put back in `seats.json`. */
+  seatArchive?: SeatArchiveReconcileResult;
 };
 
 export async function runRestore(
@@ -453,6 +500,13 @@ export async function runRestore(
     result.warnings,
   );
   result.indexReconciled = (await reconcileHotIndex(context.hotDir)).drift;
+  // Every REQUESTED holder, not only the ones moved now: a holder already back in the hot dir
+  // (restored by acpx-ui, whose seat call then failed) gets its seat back here too.
+  result.seatArchive = await reconcileSeatsAfter(
+    context,
+    new Set([...ids, ...result.restored.map((entry) => entry.id)]),
+    result.warnings,
+  );
   return result;
 }
 

@@ -1,4 +1,4 @@
-import type { Command } from "commander";
+import { InvalidArgumentError, type Command } from "commander";
 import { SessionNotFoundError } from "../errors.js";
 import { describeAbandonedRecordSweep } from "../session/abandoned-record-sweep.js";
 import {
@@ -22,6 +22,10 @@ import {
   type SeatStore,
 } from "../session/persistence.js";
 import type { SessionIndexEntry } from "../session/persistence/index.js";
+import {
+  reconcileSeatArchive,
+  seatArchiveReportLines,
+} from "../session/persistence/seat-archive.js";
 import {
   countStaleSeatIndexEntries,
   explainSeatRowMissing,
@@ -644,6 +648,45 @@ function renderSeatFavorite(
   process.stdout.write(`seat ${seatId}: favorite = ${result.favorite}\n`);
 }
 
+// ─── reconcile-archive ───────────────────────────────────────────────────────
+
+/**
+ * Brick 87497c17 — the seat of ONE holder follows that holder between the hot seat store and
+ * the ledger of archived seats. acpx-ui's Restore button calls this after its in-process
+ * restore, so acpx stays the only writer of `seats.json`. Same reconcile the wave and
+ * `acpx sessions restore` run, scoped to one holder.
+ */
+async function handleSeatsReconcileArchive(
+  holderId: string,
+  flags: { dryRun?: boolean },
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const { format } = resolveGlobalFlags(command, config);
+  const at = isoNow();
+  const result = await reconcileSeatArchive({
+    sessionDir: sessionBaseDir(),
+    holderIds: new Set([holderId]),
+    dryRun: flags.dryRun === true,
+    at,
+    wave: `seat-${at.replace(/[-:]/g, "").slice(0, 13)}Z`,
+  });
+  process.exitCode = result.problems.length > 0 ? 1 : 0;
+  if (
+    emitJsonResult(format, {
+      ok: result.problems.length === 0,
+      action: "seat_archive_reconcile",
+      holderId,
+      ...result,
+    })
+  ) {
+    return;
+  }
+  if (format !== "quiet") {
+    process.stdout.write(`${seatArchiveReportLines(result).join("\n")}\n`);
+  }
+}
+
 // ─── delete ──────────────────────────────────────────────────────────────────
 
 /**
@@ -847,6 +890,8 @@ function headlineLines(report: SeatBackfillReport): string[] {
     // The label is STABLE, and it differs by mode on purpose — a dry run says what
     // `--apply` WILL remove, an applied run what it DID.
     `  holder-less seats ${report.apply ? "reaped" : "to reap"}: ${report.holderlessSeats.length}`,
+    // Brick 87497c17: seats archived with their holder — skipped, never re-minted.
+    `  archived seats skipped: ${report.archivedSeats.length}`,
     // D-NAME-HARD-MIGRATION: the name lives on the SEAT only. Records with a legacy name,
     // seats that take one because they have none, seats whose name already differs
     // (listed below), records the strip deletes the field from; `stripped` is the
@@ -892,6 +937,12 @@ function detailLines(report: SeatBackfillReport): string[] {
     );
   }
   lines.push(...report.holderlessSeats.map((seatId) => `  holder-less seat ${seatId}`));
+  lines.push(
+    ...report.archivedSeats.map(
+      (seatId) =>
+        `  archived seat ${seatId} (in seat-archive/; restore its holder to bring it back)`,
+    ),
+  );
   lines.push(...nameStripLines(report));
   if (report.backupSuffix !== undefined) {
     lines.push(`  rollback copies:      ${report.backups.length} × *${report.backupSuffix}`);
@@ -1764,10 +1815,43 @@ export function registerSeatsCommand(parent: Command, config: ResolvedAcpxConfig
     // what exists, so a merge that keeps one lane's wording silently un-advertises
     // the other lane's verbs while every verb still works.
     "The seat store (~/.acpx/sessions/seats.json): set a seat's brick, rename a seat, " +
-      "star/un-star a seat, close or reopen a seat, delete seat rows, list/show seats, and " +
-      "backfill seats for sessions that predate the store. acpx owns every write to this " +
-      "store; call these verbs rather than writing the file.",
+      "star/un-star a seat, close or reopen a seat, delete seat rows, list/show seats, " +
+      "backfill seats for sessions that predate the store, and reconcile a holder's seat with " +
+      "the ledger of archived seats. acpx owns every write to this store; call these verbs " +
+      "rather than writing the file.",
   );
+
+  seatsCommand
+    .command("reconcile-archive")
+    .description(
+      "Move one holder's seat between seats.json and the ledger of archived seats " +
+        "(~/.acpx/sessions/seat-archive/): back into seats.json when the holder is hot again, " +
+        "into the ledger when it is archived",
+    )
+    .argument("<holder>", "The holder's session id (exact)", (value: string) => {
+      if (value.trim().length === 0) {
+        throw new InvalidArgumentError("holder must be a non-empty session id");
+      }
+      return value;
+    })
+    .option("--dry-run", "Report what would move and write nothing")
+    .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
+    .addHelpText(
+      "after",
+      `
+A SEAT IS ARCHIVED WITH ITS ACTIVE HOLDER (brick 87497c17). The retention wave
+  (\`acpx sessions archive --apply\`) and \`acpx sessions restore\` run this same
+  reconcile themselves; this verb is the one-holder form, for a restore done
+  outside acpx (acpx-ui's Restore button).
+
+IDEMPOTENT. A second run moves nothing. A seat whose holder is archived and whose
+  seat is STARRED is never moved — it is reported. The row is always in seats.json,
+  in the ledger, or (after an interrupted run) in both; the next run finishes it.
+`,
+    )
+    .action(async function (this: Command, holder: string, flags: { dryRun?: boolean }) {
+      await handleSeatsReconcileArchive(holder, flags, this, config);
+    });
 
   seatsCommand
     .command("set-brick")
