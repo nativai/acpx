@@ -6,6 +6,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { composeForkDivergenceNotice } from "../src/cli/session/fork-handoff.js";
 import { SEAT_STORE_NO_CHANGE, withSeatStoreWrite } from "../src/session/persistence.js";
+import { decideBrick, decideSessionBrick } from "../src/session/seat-brick.js";
 import { makeSessionRecord, withTempHome } from "./runtime-test-helpers.js";
 
 // Brick 155e1d8a (V1, P5-SEAT-VERIFY holes #1 #2 #4 #5 #7 #16 #18 + F6): every acpx CLI
@@ -599,5 +600,81 @@ test("F6 · `sessions copy --format json` carries the copy's NEW seatId and seat
     const copySeat = String((await rig.onDisk(json.acpxRecordId)).seat_id);
     assert.equal(json.seatId, copySeat);
     assert.equal(json.seatUrl, `${UI_BASE}/?seat=${copySeat}`);
+  });
+});
+
+// ─── V1c — every holder's brick cache mirrors the seat (brick fced3ab0) ─────
+//
+// `writeBrickLink` used to rewrite the cache on the ACTIVE holder only, so after a
+// succession the RETIRED holder kept `metadata.brick`; on an unset `decideBrick` (seat
+// link absent ⇒ "unknown") then fell back to that stale cache and still answered B.
+
+const BRICK_B = "bbbbbbbb-0000-4000-8000-0000000000b1";
+const BRICK_B2 = "bbbbbbbb-0000-4000-8000-0000000000b2";
+
+async function brickOf(rig: Rig, id: string) {
+  const record = await rig.onDisk(id);
+  const metadata = (record.metadata ?? undefined) as Record<string, string> | undefined;
+  const decided = await decideSessionBrick(
+    { seatId: String(record.seat_id), metadata },
+    rig.sessionDir,
+  );
+  return { cache: metadata?.brick, decided: decided?.ref };
+}
+
+test("V1c · `seats set-brick --unset` after a real succession clears the RETIRED holder's cache too", async () => {
+  await withRig(async (rig) => {
+    const founder = await rig.create(["-s", "unset-after-succession"]);
+    const seatId = String((await rig.onDisk(founder)).seat_id);
+    const set = await rig.cli(["seats", "set-brick", seatId, BRICK_B]);
+    assert.equal(set.code, 0, set.stderr);
+    assert.equal((await brickOf(rig, founder)).cache, BRICK_B, "precondition: founder cached B");
+
+    const successor = await rig.create(["--from", founder]);
+    const activated = await rig.cli(["sessions", "activate", seatId, successor, "--no-notify"]);
+    assert.equal(activated.code, 0, activated.stderr);
+
+    const unset = await rig.cli(["seats", "set-brick", seatId, "--unset"]);
+    assert.equal(unset.code, 0, unset.stderr);
+    for (const [role, id] of [
+      ["retired founder", founder],
+      ["active successor", successor],
+    ] as const) {
+      const { cache, decided } = await brickOf(rig, id);
+      assert.equal(cache, undefined, `${role} still caches a brick after --unset`);
+      assert.equal(decided, undefined, `${role}: decideBrick still answers a brick after --unset`);
+    }
+  });
+});
+
+test("V1c · `seats set-brick` after a succession re-points EVERY holder's cache to the new brick", async () => {
+  await withRig(async (rig) => {
+    const founder = await rig.create(["-s", "set-after-succession"]);
+    const seatId = String((await rig.onDisk(founder)).seat_id);
+    assert.equal((await rig.cli(["seats", "set-brick", seatId, BRICK_B])).code, 0);
+    const successor = await rig.create(["--from", founder]);
+    assert.equal(
+      (await rig.cli(["sessions", "activate", seatId, successor, "--no-notify"])).code,
+      0,
+    );
+
+    const reset = await rig.cli(["seats", "set-brick", seatId, BRICK_B2]);
+    assert.equal(reset.code, 0, reset.stderr);
+    for (const [role, id] of [
+      ["retired founder", founder],
+      ["active successor", successor],
+    ] as const) {
+      const { cache, decided } = await brickOf(rig, id);
+      assert.equal(cache, BRICK_B2, `${role}'s cache does not mirror the seat's new brick`);
+      assert.equal(decided, BRICK_B2, role);
+    }
+  });
+});
+
+test("V1c pair · a seat with NO link still falls back to the holder's cache ('absence = unknown' kept)", () => {
+  assert.deepEqual(decideBrick({ brickId: undefined }, { brick: BRICK_B }), {
+    ref: BRICK_B,
+    validation: "unknown",
+    source: "metadata",
   });
 });
