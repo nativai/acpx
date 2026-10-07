@@ -369,3 +369,54 @@ test("F7 no caller session and no --session-id is refused before anything is cre
     assert.equal(JSON.parse(res.stdout.trim()).code, "NO_CALLER");
   });
 });
+
+test("F8 (TE D3) a RETIRED holder cannot hand over: NOT_HOLDER names the live holder, and nothing is created, delivered or displaced", async () => {
+  await withTempHome("acpx-handover-retired-", async (homeDir) => {
+    const cwd = await rig(homeDir);
+    const retiredId = await newHolder(homeDir, cwd);
+    const seatId = (await readStored(homeDir, retiredId)).seat_id;
+    let liveId = "";
+    await withAcpxUi(async (origin) => {
+      const first = await handover(homeDir, retiredId, origin, [
+        "--brief",
+        await writeBrief(homeDir),
+      ]);
+      assert.equal(first.code, 0, first.stderr);
+      liveId = String(JSON.parse(first.stdout.trim()).successorId);
+    });
+    assert.equal((await readStored(homeDir, retiredId)).holder_active, false, "fixture: retired");
+    const before = await sessionIds(homeDir);
+
+    await withAcpxUi(async (origin, posted) => {
+      // The retired holder, by --session-id, from a THIRD party's shell (no ACPX_SESSION_URL of its own).
+      const res = await runCli(
+        [
+          "--format",
+          "json",
+          "claude",
+          "sessions",
+          "handover",
+          "--session-id",
+          retiredId,
+          "--brief",
+          await writeBrief(homeDir),
+        ],
+        homeDir,
+        { ACPX_UI_INTERNAL_URL: origin, ACPX_UI_BASE_URL: "https://atrium.example.test" },
+      );
+      assert.notEqual(res.code, 0, "must refuse");
+      const out = JSON.parse(res.stdout.trim()) as { code: string; error: string };
+      assert.equal(out.code, "NOT_HOLDER");
+      assert.ok(out.error.includes(liveId), `names the live holder: ${out.error}`);
+      assert.ok(out.error.includes(`https://atrium.example.test/?seat=${seatId}`), out.error);
+      assert.deepEqual(posted, [], "nothing delivered");
+    });
+    assert.deepEqual(await sessionIds(homeDir), before, "nothing created");
+    assert.equal(
+      (await readStored(homeDir, liveId)).holder_active,
+      true,
+      "the live holder is untouched",
+    );
+    assert.equal((await readStored(homeDir, retiredId)).holder_active, false);
+  });
+});
