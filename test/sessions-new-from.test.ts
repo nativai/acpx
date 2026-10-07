@@ -685,8 +685,9 @@ test("S5 (brick 28964dd8): a succession still carries effort, harness, profile, 
     const holderId = await createSeatedHolder(
       homeDir,
       cwd,
-      ["--model", "fable", "--brick", BRICK_A],
+      ["--model", "fable"],
       brickShimEnv(BRICK_A),
+      ["--brick", BRICK_A],
     );
     // Plant the remaining options on the holder's record, as a live holder carries them.
     const holderFile = sessionFilePath(homeDir, holderId);

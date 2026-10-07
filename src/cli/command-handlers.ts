@@ -156,6 +156,7 @@ import type {
 } from "./session/session-reparent.js";
 import {
   fromParentFlags,
+  isSuccession,
   refuseFromWithTemplate,
   resolveFromSessionRecord,
   seatToJoin,
@@ -803,6 +804,8 @@ type ResolvedParentSession = {
   profile?: string;
   agentCommand?: string;
   model?: string;
+  /** Brick 28964dd8 — `model`'s stored provenance; read only when this is a succession. */
+  modelSource?: string;
   effort?: string;
   /**
    * brick://874fee67 — the parent's DURABLE `session_options.output_style`.
@@ -830,6 +833,7 @@ async function parentInheritableFields(parent: SessionRecord): Promise<ResolvedP
     profile: sessionOptions?.profile,
     agentCommand: parent.agentCommand,
     model: sessionOptions?.model,
+    modelSource: sessionOptions?.model_source,
     effort: parent.acpx?.desired_config_options?.effort,
     outputStyle: sessionOptions?.output_style,
   };
@@ -837,8 +841,9 @@ async function parentInheritableFields(parent: SessionRecord): Promise<ResolvedP
 
 async function resolveAndValidateParentSessionId(
   flags: ParentFlagSource,
+  options: { allowEnvFallback?: boolean } = {},
 ): Promise<ResolvedParentSession | undefined> {
-  const ref = await resolveParentSessionRefFromFlagOrEnv(flags);
+  const ref = await resolveParentSessionRefFromFlagOrEnv(flags, options);
   if (!ref) {
     return undefined;
   }
@@ -887,13 +892,18 @@ async function resolveNewSessionLineage(flags: SessionsNewFlags): Promise<{
   return { from, parent, inherit: from ? await parentInheritableFields(from) : parent };
 }
 
+// Brick 28964dd8 — a successor (`--from` into the old session's own seat) is never the old
+// session's child: with no parent flag its parent is the old session's own parent, or NONE for
+// a top-level holder. The ACPX_SESSION_URL fallback is the CALLER — under the handover, the
+// predecessor itself — so it is closed here, or a top-level successor loses its user-facing facet.
 async function resolveParentForNew(
   flags: SessionsNewFlags,
   from: SessionRecord | undefined,
 ): Promise<ResolvedParentSession | undefined> {
+  const flagsOnly = { allowEnvFallback: !isSuccession(flags, from) };
   const derived = fromParentFlags(flags, from);
   if (!derived) {
-    return await resolveAndValidateParentSessionId(flags);
+    return await resolveAndValidateParentSessionId(flags, flagsOnly);
   }
   try {
     return await resolveAndValidateParentSessionId(derived);
@@ -905,7 +915,7 @@ async function resolveParentForNew(
       `[acpx] --from: the old session's parent ${derived.parentId} no longer resolves; ` +
         `creating without it\n`,
     );
-    return await resolveAndValidateParentSessionId(flags);
+    return await resolveAndValidateParentSessionId(flags, flagsOnly);
   }
 }
 
@@ -1020,6 +1030,32 @@ function resolveClaudeDefaultDisallowedTools(
     : undefined;
 }
 
+// brick://5bac5564 R1: the PRIMARY Fable-leak site. A bare child of a Fable
+// parent inherits `fable` here. Resolve, tag provenance, then run the invariant
+// guard so an IMPLICIT Fable is rewritten to the non-Fable default while an
+// explicit `--model fable` is preserved. modelSource is also load-bearing for
+// the reuse-branch clobber-guard (RE-ENSURE-CLOBBER addendum).
+//
+// `succession` (brick 28964dd8): `parent` is the predecessor whose seat this session joins, so
+// its model arrives as "succession" and the guard keeps it, Fable included.
+function guardedSpawnModel(
+  explicitModel: string | undefined,
+  sameAgentAsParent: boolean,
+  parent: ResolvedParentSession | undefined,
+  succession: boolean,
+): ReturnType<typeof guardImplicitFable> {
+  const inheritedModel = sameAgentAsParent ? parent?.model : undefined;
+  return guardImplicitFable({
+    resolvedModel: withInheritedModel(explicitModel, inheritedModel),
+    explicitModel,
+    source: resolveSpawnModelSource(
+      explicitModel,
+      inheritedModel,
+      succession ? { modelSource: parent?.modelSource } : undefined,
+    ),
+  });
+}
+
 // Assemble the child's sessionOptions, layering parent inheritance over the
 // global flags. Credential, model, and effort inheritance all require the child
 // to resolve to the SAME agent as its parent; explicit child values win
@@ -1030,20 +1066,9 @@ function inheritedSpawnSessionOptions(
   sameAgentAsParent: boolean,
   parent: ResolvedParentSession | undefined,
   agentCommand: string,
+  succession: boolean,
 ): NonNullable<Parameters<SessionModule["createSession"]>[0]["sessionOptions"]> {
-  // brick://5bac5564 R1: the PRIMARY Fable-leak site. A bare child of a Fable
-  // parent inherits `fable` here. Resolve, tag provenance, then run the invariant
-  // guard so an IMPLICIT Fable is rewritten to the non-Fable default while an
-  // explicit `--model fable` is preserved. modelSource is also load-bearing for
-  // the reuse-branch clobber-guard (RE-ENSURE-CLOBBER addendum).
-  const explicitModel = globalFlags.model;
-  const inheritedModel = sameAgentAsParent ? parent?.model : undefined;
-  const resolvedModel = withInheritedModel(explicitModel, inheritedModel);
-  const guarded = guardImplicitFable({
-    resolvedModel,
-    explicitModel,
-    source: resolveSpawnModelSource(explicitModel, inheritedModel),
-  });
+  const guarded = guardedSpawnModel(globalFlags.model, sameAgentAsParent, parent, succession);
   return {
     ...sessionOptionsFromGlobalFlags(globalFlags),
     disallowedTools: resolveClaudeDefaultDisallowedTools(agentCommand, globalFlags.disallowedTools),
@@ -1140,6 +1165,7 @@ function buildSessionStartOptions(params: {
         params.agent.sameAgentAsParent,
         params.inherit,
         params.agent.agentCommand,
+        isSuccession(params.flags, params.from),
       ),
       params.from,
       params.agent.sameAgentAsParent,

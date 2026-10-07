@@ -399,7 +399,8 @@ export function registerSessionsCommand(
     .option(
       "--from <id|url>",
       "Create this session as the successor of an existing one (acpx record id or session URL): " +
-        "its model, effort, subscription/profile, auto-failover policy, allowed tools, system " +
+        "its exact model (Fable included), effort, subscription/profile, auto-failover policy, " +
+        "allowed tools, system " +
         "prompt, output style, cwd, parent and brick link become this session's defaults — any " +
         "explicit flag overrides — and, when it holds a seat, this session is created INTO that " +
         "seat, prepared and not active (what `--seat <that seat>` does). The name, history, " +

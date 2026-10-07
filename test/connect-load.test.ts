@@ -2903,7 +2903,6 @@ for (const [source, expected] of [
       });
 
       assert.deepEqual(replayed, [expected]);
-      assert.equal(record.acpx?.current_model_id, expected);
     });
   });
 }

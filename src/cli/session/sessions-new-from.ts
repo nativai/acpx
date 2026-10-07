@@ -65,6 +65,15 @@ export function seatToJoin(
 }
 
 /**
+ * Brick 28964dd8 — `--from` creates a SUCCESSOR when the new session lands in the old
+ * session's own seat. A successor is the same seat continuing, never the old session's child:
+ * it takes the old session's exact model and its parent, never the caller's ACPX_SESSION_URL.
+ */
+export function isSuccession(flags: { seat?: string }, from: SessionRecord | undefined): boolean {
+  return from?.seatId !== undefined && seatToJoin(flags, from) === from.seatId;
+}
+
+/**
  * Layer the options this module owns (allowed tools, system prompt, auto-failover policy) under
  * the already-resolved `options`. They are agent-specific, so they cross only to the same agent.
  */
