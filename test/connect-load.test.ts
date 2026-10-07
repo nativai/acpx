@@ -2850,3 +2850,59 @@ test("connectAndLoadSession keeps a terminal_error-only record LOUD — a failed
     );
   });
 });
+
+// Brick 28964dd8 — the reconnect path's belt accepts `succession` exactly as it accepts
+// `explicit`: a successor's Fable pin is replayed as Fable, while the same pin arriving
+// `inherited` (the paired control) is still forced to the non-Fable default.
+for (const [source, expected] of [
+  ["succession", "fable"],
+  ["inherited", "opus"],
+] as const) {
+  test(`connectAndLoadSession replays a ${source} Fable pin as ${expected} (brick 28964dd8)`, async () => {
+    await withTempHome(async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      await fs.mkdir(cwd, { recursive: true });
+      const record = makeSessionRecord({
+        acpxRecordId: `succession-replay-${source}`,
+        acpSessionId: "stale-session",
+        agentCommand: "agent",
+        cwd,
+        acpx: { session_options: { model: "fable", model_source: source } },
+      });
+      const replayed: string[] = [];
+      const client: FakeClient = {
+        hasReusableSession: () => false,
+        start: async () => {},
+        getAgentLifecycleSnapshot: () => ({ running: true }),
+        supportsLoadSession: () => true,
+        supportsResumeSession: () => false,
+        loadSessionWithOptions: async () => {
+          throw { error: { code: -32002, message: "session not found" } };
+        },
+        createSession: async () => ({
+          sessionId: "fresh-session",
+          agentSessionId: "fresh-runtime",
+          models: {
+            currentModelId: "default-model",
+            availableModels: ["default-model", "opus", "fable"].map((id) => ({
+              modelId: id,
+              name: id,
+            })),
+          },
+        }),
+        setSessionMode: async () => {},
+        setSessionModel: async (_sessionId, modelId) => {
+          replayed.push(modelId);
+        },
+      };
+
+      await connectAndLoadSession({
+        client: client as never,
+        record,
+        activeController: ACTIVE_CONTROLLER,
+      });
+
+      assert.deepEqual(replayed, [expected]);
+    });
+  });
+}

@@ -22,13 +22,18 @@ export const NON_FABLE_DEFAULT_MODEL = "opus";
 //    (brick://4d517be2). The SANCTIONED exception to "Fable only via explicit
 //    request" — the marker lets audits distinguish a deliberate degrade from a
 //    silent `guard-forced`.
+//  - succession   : `sessions new --from <holder>` INTO the holder's own seat carried the
+//    predecessor's pin unchanged (brick 28964dd8). A successor is the same seat continuing,
+//    not a child, and the predecessor's pin already passed the guard — so both tiers accept
+//    it exactly as they accept `explicit`. Children and forks never get it.
 export type ModelSource =
   | "explicit"
   | "inherited"
   | "default"
   | "failover"
   | "guard-forced"
-  | "explicit-degrade";
+  | "explicit-degrade"
+  | "succession";
 
 // Pick a CONCRETE advertised non-Fable model when the adapter's model set is
 // known. Skips the bare `default` alias (which can resolve to Fable server-side,
@@ -47,14 +52,33 @@ export function pickNonFableDefault(availableModels: string[] | undefined): stri
 // Resolve the provenance of a spawn-time model resolution (pre-guard). Explicit
 // child `--model` wins; else an inheritable parent value is "inherited"; else
 // "default". Mirrors the precedence in `withInheritedModel`.
+//
+// `successionOf` (brick 28964dd8) is the predecessor when this create is a succession
+// into its seat: its pin then arrives as "succession" — but only when the predecessor's
+// own pin would be SERVED as-is. A predecessor whose stored Fable the serve-time belt
+// would force (a non-explicit provenance that slipped through) passes it on as
+// "inherited", so a succession can never launder an implicit Fable into an accepted one.
 export function resolveSpawnModelSource(
   explicitModel: string | undefined,
   inheritedModel: string | undefined,
+  successionOf?: { modelSource: string | undefined },
 ): ModelSource {
   if (explicitModel?.trim()) {
     return "explicit";
   }
-  return inheritedModel?.trim() ? "inherited" : "default";
+  if (!inheritedModel?.trim()) {
+    return "default";
+  }
+  const servedAsIs =
+    successionOf !== undefined &&
+    !guardServedModel({ requestedModel: inheritedModel, modelSource: successionOf.modelSource })
+      .forced;
+  return servedAsIs ? "succession" : "inherited";
+}
+
+// The provenances both guard tiers accept as a deliberate model choice.
+function isDeliberateModelSource(source: string | undefined): boolean {
+  return source === "explicit" || source === "succession";
 }
 
 export type GuardImplicitFableResult = {
@@ -79,7 +103,7 @@ export function guardImplicitFable(params: {
   source: ModelSource;
   availableModels?: string[];
 }): GuardImplicitFableResult {
-  const requestedFable = isFableModel(params.explicitModel);
+  const requestedFable = isFableModel(params.explicitModel) || params.source === "succession";
   if (!isFableModel(params.resolvedModel) || requestedFable) {
     return { model: params.resolvedModel, source: params.source, forced: false };
   }
@@ -94,7 +118,7 @@ export function guardImplicitFable(params: {
  * through resolution.
  *
  * GRANDFATHER LEGACY (HoD Q4 decision, brick://5bac5564): force ONLY when
- * `modelSource` is PRESENT and != "explicit". When `modelSource` is ABSENT (every
+ * `modelSource` is PRESENT and neither "explicit" nor "succession" (brick 28964dd8). When `modelSource` is ABSENT (every
  * pre-fix/legacy record) the belt must NOT force — a deliberate Fable pin (e.g.
  * the Mail-Server session `session_options.model="fable"`) and an implicit
  * inherited-Fable pin are INDISTINGUISHABLE without provenance, and force-flipping
@@ -107,7 +131,7 @@ export function guardServedModel(params: {
   modelSource: string | undefined;
   availableModels?: string[];
 }): { model: string | undefined; forced: boolean; blocked?: string } {
-  if (params.modelSource === undefined || params.modelSource === "explicit") {
+  if (params.modelSource === undefined || isDeliberateModelSource(params.modelSource)) {
     return { model: params.requestedModel, forced: false };
   }
   if (!isFableModel(params.requestedModel)) {
