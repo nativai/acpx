@@ -15,23 +15,55 @@ type Node = {
   holderOrdinal?: number;
   closed?: boolean;
 };
-const node = (id: string, over: Partial<Node> = {}): Node => ({ acpxRecordId: id, lastUsedAt: "2026-10-07T00:00:00.000Z", ...over });
+const node = (id: string, over: Partial<Node> = {}): Node => ({
+  acpxRecordId: id,
+  lastUsedAt: "2026-10-07T00:00:00.000Z",
+  ...over,
+});
 const ids = (records: Node[]) => records.map((r) => r.acpxRecordId).toSorted();
 
 function succession(): Node[] {
   return [
     node("x", { seatId: "seat-x", holderActive: true, holderOrdinal: 1 }),
-    node("a", { seatId: "S", holderActive: false, holderOrdinal: 1, parentSessionId: "x", parentSeatId: "seat-x" }),
-    node("b", { seatId: "S", holderActive: true, holderOrdinal: 2, parentSessionId: "a", parentSeatId: "S" }),
-    node("c", { seatId: "seat-c", holderActive: true, holderOrdinal: 1, parentSessionId: "a", parentSeatId: "S" }),
-    node("g", { seatId: "seat-g", holderActive: true, holderOrdinal: 1, parentSessionId: "c", parentSeatId: "seat-c" }),
+    node("a", {
+      seatId: "S",
+      holderActive: false,
+      holderOrdinal: 1,
+      parentSessionId: "x",
+      parentSeatId: "seat-x",
+    }),
+    node("b", {
+      seatId: "S",
+      holderActive: true,
+      holderOrdinal: 2,
+      parentSessionId: "a",
+      parentSeatId: "S",
+    }),
+    node("c", {
+      seatId: "seat-c",
+      holderActive: true,
+      holderOrdinal: 1,
+      parentSessionId: "a",
+      parentSeatId: "S",
+    }),
+    node("g", {
+      seatId: "seat-g",
+      holderActive: true,
+      holderOrdinal: 1,
+      parentSessionId: "c",
+      parentSeatId: "seat-c",
+    }),
   ];
 }
 
 test("085c8dd6: the successor's family scan reaches what its predecessor spawned; the retired holder's reaches nothing", () => {
   assert.deepEqual(ids(familyDescendantRecords("b", succession())), ["c", "g"]);
   assert.deepEqual(ids(familyDescendantRecords("a", succession())), []);
-  assert.deepEqual(ids(familyDescendantRecords("x", succession())), ["b", "c", "g"], "the seat (its current holder) keeps its place under x; the retired a is its history");
+  assert.deepEqual(
+    ids(familyDescendantRecords("x", succession())),
+    ["b", "c", "g"],
+    "the seat (its current holder) keeps its place under x; the retired a is its history",
+  );
 });
 
 test("085c8dd6: the predecessor ARCHIVED (absent) — the stored seat edge still carries the child", () => {
@@ -40,14 +72,16 @@ test("085c8dd6: the predecessor ARCHIVED (absent) — the stored seat edge still
 });
 
 test("085c8dd6: no stored parentSeatId — the seat of the parent record decides", () => {
-  const records = succession().map((r) => (r.acpxRecordId === "c" ? { ...r, parentSeatId: undefined } : r));
+  const records = succession();
+  delete records.find((r) => r.acpxRecordId === "c")!.parentSeatId;
   assert.deepEqual(ids(familyDescendantRecords("b", records)), ["c", "g"]);
 });
 
 test("085c8dd6: a seat-less parent, and a vacant seat, keep the session edge", () => {
   const plain = [node("p"), node("k", { parentSessionId: "p" })];
   assert.deepEqual(ids(familyDescendantRecords("p", plain)), ["k"]);
-  const vacant = succession().map((r) => (r.acpxRecordId === "b" ? { ...r, holderActive: false } : r));
+  const vacant = succession();
+  vacant.find((r) => r.acpxRecordId === "b")!.holderActive = false;
   assert.deepEqual(ids(familyDescendantRecords("a", vacant)), ["b", "c", "g"]);
 });
 
