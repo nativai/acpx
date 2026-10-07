@@ -133,6 +133,43 @@ test("once per crossing: speaks on the crossing update only, re-arms after the f
   assert.deepEqual(spoke, [false, true, false, false, false, false, true]);
 });
 
+// D2 (TE 4c8a82db, verification-evidence/codex-errhigh-probe.txt) — the REAL report sequence
+// of one codex turn at `--alarm 4` (33,136 of an 828,400 window, codex compacting at 40,000).
+// Err-high charges cross the alarm and the next report corrects them back below it; a latch
+// that re-arms on any dip spoke FIVE times for TWO real crossings (one before the compaction
+// at 37,152 → 16,106, one after it).
+const TE_CODEX_INTERLEAVING = [
+  21_704, 21_811, 22_183, 53_467, 29_390, 29_497, 29_899, 61_128, 37_152, 16_106, 16_510, 47_647,
+  22_432, 22_790, 23_148, 23_255, 23_688, 54_965, 30_537, 30_895, 31_253, 31_360, 31_790, 32_288,
+  37_891, 40_024, 17_602, 17_913, 23_882,
+];
+
+test("D2 — an estimate correcting itself is not the fill dropping back: one notice per real crossing", () => {
+  const latch = new ContextAlarmLatch();
+  const alarm = resolveContextAlarm(4, fill(0, 828_400, 40_000));
+  assert.equal(alarm.atTokens, 33_136);
+  const spokeAt = TE_CODEX_INTERLEAVING.filter((used) =>
+    latch.observe(fill(used, 828_400, 40_000), alarm),
+  );
+  assert.deepEqual(spokeAt, [53_467, 47_647]);
+});
+
+test("D2 — re-arm rule: only a drop below HALF the alarm point (a compaction, /compact) re-arms; off/unknown re-arms too", () => {
+  const alarm = resolveContextAlarm(undefined, fill(0, 1_000_000, 967_000)); // 900,000
+  const latch = new ContextAlarmLatch();
+  const spoke = (used: number, a = alarm) => latch.observe(fill(used, 1_000_000, 967_000), a);
+  assert.equal(spoke(905_000), true);
+  assert.equal(spoke(880_000), false); // an estimate corrected down: NOT re-armed
+  assert.equal(spoke(920_000), false);
+  assert.equal(spoke(450_001), false); // still above half
+  assert.equal(spoke(910_000), false);
+  assert.equal(spoke(449_999), false); // below half: re-armed
+  assert.equal(spoke(901_000), true);
+  // The alarm switched off (or the window unknown) re-arms: switching it back on speaks again.
+  assert.equal(spoke(950_000, resolveContextAlarm(0, fill(0, 1_000_000, 967_000))), false);
+  assert.equal(spoke(950_000), true);
+});
+
 test("the notice is the fixed line, numbers filled in, and names the way out", () => {
   const f = fill(903_112, 1_000_000, 967_000);
   const notice = formatContextAlarmNotice(f, resolveContextAlarm(undefined, f));
