@@ -1098,7 +1098,7 @@ export async function readDescendantSessionOwnerStatuses(
   rootSessionId: string,
 ): Promise<SessionOwnerStatusBatch> {
   const root = await resolveSessionRecord(rootSessionId);
-  const descendants = descendantRecords(root.acpxRecordId, await listSessions());
+  const descendants = familyDescendantRecords(root.acpxRecordId, await listSessions());
   const sessions = await Promise.all(
     descendants.map(async (record) => await readOwnerStatusForRecord(record)),
   );
@@ -1154,6 +1154,148 @@ type GraphNode = { acpxRecordId: string; parentSessionId?: string; lastUsedAt: s
  */
 export function descendantRecords<T extends GraphNode>(rootSessionId: string, records: T[]): T[] {
   const childrenByParent = childrenByParentSessionId(records);
+  const descendants: T[] = [];
+  const queue = [...(childrenByParent.get(rootSessionId) ?? [])];
+  const seen = new Set<string>([rootSessionId]);
+  while (queue.length > 0) {
+    const record = queue.shift();
+    if (!record || seen.has(record.acpxRecordId)) {
+      continue;
+    }
+    seen.add(record.acpxRecordId);
+    descendants.push(record);
+    queue.push(...(childrenByParent.get(record.acpxRecordId) ?? []));
+  }
+  return descendants.toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
+}
+
+type FamilyNode = GraphNode & {
+  seatId?: string;
+  parentSeatId?: string;
+  holderActive?: boolean;
+  holderOrdinal?: number;
+  closed?: boolean;
+};
+
+/**
+ * Transitive local FAMILY descendants of `rootSessionId`, newest-first (brick 085c8dd6) — what
+ * `sessions owner-status --descendants-of` scans. The parent-child relation is between SEATS: a child
+ * belongs to its parent seat (its stored `parentSeatId`, else the seat of the record `parentSessionId`
+ * names) and hangs under that seat's current holder (active, not closed), so after a handover the
+ * successor's scan reaches every child its predecessors spawned, with no `set-parent`. A seat with
+ * another holder is one node: its current holder takes the seat's place (the first holder link that
+ * leaves the seat, current holder first, then by ordinal; a prepared holder never counts) and the other
+ * holders are its history, nobody's child. A parent with no seat, or a seat with no current holder,
+ * keeps `parentSessionId`. This is the rule acpx-ui reads on every surface (`shared/lineage.ts`
+ * `resolveFamily`, list surface); `descendantRecords` above stays on the STORED edge because
+ * `sessions set-parent` uses it to refuse a cycle in what it writes.
+ */
+export function familyDescendantRecords<T extends FamilyNode>(
+  rootSessionId: string,
+  records: T[],
+): T[] {
+  const seats = indexSeats(records);
+  const childrenByParent = new Map<string, T[]>();
+  for (const record of records) {
+    const parent = familyParentOf(record, seats);
+    if (parent) {
+      childrenByParent.set(parent, [...(childrenByParent.get(parent) ?? []), record]);
+    }
+  }
+  return walkChildren(rootSessionId, childrenByParent);
+}
+
+type SeatIndex<T extends FamilyNode> = {
+  byId: Map<string, T>;
+  currentBySeat: Map<string, T>;
+  holdersBySeat: Map<string, T[]>;
+};
+
+function indexSeats<T extends FamilyNode>(records: T[]): SeatIndex<T> {
+  const seats: SeatIndex<T> = {
+    byId: new Map(),
+    currentBySeat: new Map(),
+    holdersBySeat: new Map(),
+  };
+  for (const record of records) {
+    seats.byId.set(record.acpxRecordId, record);
+    if (!record.seatId) {
+      continue;
+    }
+    seats.holdersBySeat.set(record.seatId, [
+      ...(seats.holdersBySeat.get(record.seatId) ?? []),
+      record,
+    ]);
+    if (isCurrentHolder(record) && !seats.currentBySeat.has(record.seatId)) {
+      seats.currentBySeat.set(record.seatId, record);
+    }
+  }
+  return seats;
+}
+
+function isCurrentHolder(record: FamilyNode): boolean {
+  return record.holderActive === true && record.closed !== true;
+}
+
+function parentSeatOf<T extends FamilyNode>(record: T, seats: SeatIndex<T>): string | undefined {
+  if (!record.parentSessionId) {
+    return undefined;
+  }
+  return record.parentSeatId ?? seats.byId.get(record.parentSessionId)?.seatId;
+}
+
+// The stored edge, carried to its parent seat's current holder (never to the record itself).
+function viaSeat<T extends FamilyNode>(record: T, seats: SeatIndex<T>): string | undefined {
+  const seat = parentSeatOf(record, seats);
+  const holder = seat ? seats.currentBySeat.get(seat) : undefined;
+  return holder && holder !== record ? holder.acpxRecordId : record.parentSessionId;
+}
+
+function familyParentOf<T extends FamilyNode>(record: T, seats: SeatIndex<T>): string | undefined {
+  const seat = record.seatId;
+  const current = seat ? seats.currentBySeat.get(seat) : undefined;
+  if (!seat || !current || (seats.holdersBySeat.get(seat) ?? []).length < 2) {
+    return viaSeat(record, seats);
+  }
+  // A handed-over seat: the other holders are its history; the current holder takes its place.
+  return current === record ? seatPlace(record, seat, seats) : undefined;
+}
+
+// The first holder link that leaves the seat: the current holder's, then by ordinal (highest first).
+// A prepared holder (no ordinal) never counts, nor a link to a holder of the seat itself.
+function seatPlace<T extends FamilyNode>(
+  current: T,
+  seat: string,
+  seats: SeatIndex<T>,
+): string | undefined {
+  const holders = (seats.holdersBySeat.get(seat) ?? [])
+    .filter((h) => h === current || typeof h.holderOrdinal === "number")
+    .toSorted((a, b) => byCurrentThenOrdinal(a, b, current));
+  const leaving = holders.find((h) => leavesSeat(h, seat, seats));
+  return leaving ? viaSeat(leaving, seats) : undefined;
+}
+
+function byCurrentThenOrdinal(a: FamilyNode, b: FamilyNode, current: FamilyNode): number {
+  if (a === current) {
+    return -1;
+  }
+  if (b === current) {
+    return 1;
+  }
+  return (b.holderOrdinal ?? 0) - (a.holderOrdinal ?? 0);
+}
+
+function leavesSeat<T extends FamilyNode>(holder: T, seat: string, seats: SeatIndex<T>): boolean {
+  if (!holder.parentSessionId || parentSeatOf(holder, seats) === seat) {
+    return false;
+  }
+  return seats.byId.get(holder.parentSessionId)?.seatId !== seat;
+}
+
+function walkChildren<T extends GraphNode>(
+  rootSessionId: string,
+  childrenByParent: Map<string, T[]>,
+): T[] {
   const descendants: T[] = [];
   const queue = [...(childrenByParent.get(rootSessionId) ?? [])];
   const seen = new Set<string>([rootSessionId]);
