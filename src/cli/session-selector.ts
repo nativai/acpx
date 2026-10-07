@@ -7,7 +7,7 @@ import {
   seatFromStore,
   sessionBaseDir,
 } from "../session/persistence.js";
-import type { SessionRecord } from "../types.js";
+import { SEAT_UNRESOLVED_DETAIL_CODE, type SessionRecord } from "../types.js";
 import { resolveSessionSelectorFromFlags, type SessionSelectorFlags } from "./flags.js";
 
 export type SessionTargetSelector = {
@@ -90,17 +90,20 @@ export async function resolveSeatActiveHolder(
       `${label}: seat ${seatId} is not in this box's seat store (${store.storePath}) — a typo, ` +
         `a seat on another box, or a seat that predates the store (\`acpx seats list\` shows ` +
         `the seats here).`,
+      SEAT_UNRESOLVED_DETAIL_CODE,
     );
   }
   if (seat.closedAt !== null) {
     throw new NoSessionError(
       `${label}: seat ${seatId} is closed (at ${seat.closedAt}) — a closed seat has no holder to address.`,
+      SEAT_UNRESOLVED_DETAIL_CODE,
     );
   }
   if (seat.activeHolderId === null) {
     throw new NoSessionError(
       `${label}: seat ${seatId} has no active holder (vacant) — activate one with ` +
         `\`acpx sessions activate ${seatId} <session>\`.`,
+      SEAT_UNRESOLVED_DETAIL_CODE,
     );
   }
   return { seatId, holderId: seat.activeHolderId };
@@ -197,9 +200,15 @@ export async function resolveExplicitSessionRecord(
 }
 
 export class NoSessionError extends Error {
-  constructor(message: string) {
+  /** Read by `normalizeOutputError` (`readOutputErrorMeta`) into the rendered error. */
+  readonly detailCode?: string;
+
+  constructor(message: string, detailCode?: string) {
     super(message);
     this.name = "NoSessionError";
+    if (detailCode !== undefined) {
+      this.detailCode = detailCode;
+    }
   }
 }
 

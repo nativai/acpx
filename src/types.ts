@@ -43,6 +43,15 @@ export const EXIT_CODES = {
 
 export type ExitCode = (typeof EXIT_CODES)[keyof typeof EXIT_CODES];
 
+/**
+ * `detailCode` of a NO_SESSION refusal for a seat address that resolves to no holder
+ * (unknown, closed or vacant seat — `resolveSeatActiveHolder`). The output layer gives it
+ * a SEAT hint instead of the generic "start a fresh session with `sessions new`": a fresh
+ * session mints a NEW seat, so that retry fails again and leaves a stray session behind
+ * (brick e7c106cc).
+ */
+export const SEAT_UNRESOLVED_DETAIL_CODE = "SEAT_UNRESOLVED";
+
 export const OUTPUT_FORMATS = ["text", "json", "quiet"] as const;
 export type OutputFormat = (typeof OUTPUT_FORMATS)[number];
 

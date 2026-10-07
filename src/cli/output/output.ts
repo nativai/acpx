@@ -25,6 +25,7 @@ import type {
   OutputErrorOrigin,
   PermissionEscalationEvent,
 } from "../../types.js";
+import { SEAT_UNRESOLVED_DETAIL_CODE } from "../../types.js";
 import { createJsonOutputFormatter } from "./json-formatter.js";
 import { isReadLikeTool, SUPPRESSED_READ_OUTPUT } from "./read-suppression.js";
 
@@ -352,7 +353,7 @@ export function getTextErrorRemediationHints(params: RenderableOutputError): str
   }
 
   if (params.code === "NO_SESSION") {
-    return noSessionHints(lowerMessage);
+    return noSessionHints(params, lowerMessage);
   }
 
   return matchingTextErrorRule(params, lowerMessage)?.hints ?? [];
@@ -449,7 +450,16 @@ function matchingTextErrorRule(
   return TEXT_ERROR_HINT_RULES.find((rule) => rule.matches(params, lowerMessage));
 }
 
-function noSessionHints(lowerMessage: string): string[] {
+// ⚠️ NEVER the generic "start a fresh session" hint for a seat: a new session mints a NEW
+// seat, so the retry against this one fails again (brick e7c106cc).
+const SEAT_UNRESOLVED_HINT =
+  "hint: this addressed a SEAT — inspect it with `acpx seats show <seat>` (`acpx seats list` for all); " +
+  "a vacant seat needs `acpx sessions activate <seat> <session>`. Creating a new session does not help: it gets a new seat.";
+
+function noSessionHints(params: RenderableOutputError, lowerMessage: string): string[] {
+  if (params.detailCode === SEAT_UNRESOLVED_DETAIL_CODE) {
+    return [SEAT_UNRESOLVED_HINT];
+  }
   if (lowerMessage.includes("create one:")) {
     return [];
   }
