@@ -27,6 +27,7 @@ import {
   handleSessionsRepairAccountSeam,
   handleSessionsSetMetadata,
   handleSessionsActivate,
+  handleSessionsHandover,
   handleSessionsSetParent,
   handleSessionsShow,
   handleSessionsTemplate,
@@ -731,6 +732,28 @@ DISPLAY LABEL and never a key — nothing resolves a holder by it.
     )
     .action(async function (this: Command, seat: string, successor: string) {
       await handleSessionsActivate(seat, successor, this, config);
+    });
+
+  // Brick f74abb05 (Daniel, 7f61daf9 DECISION.md item F) — one command for the agent at its
+  // context alarm: `new --from <self>` + `activate` + one handover turn pointing at the brief.
+  sessionsCommand
+    .command("handover")
+    .description(
+      "Hand your seat to a successor: create it in your seat with your exact settings, activate " +
+        "it and prompt it with a standard prompt pointing at your brief. Never forks; does not close you.",
+    )
+    .requiredOption(
+      "--brief <file>",
+      "The handover brief the successor reads first (keep it under 20 KB)",
+    )
+    .option(
+      "--session-id <id>",
+      "The session handing over (default: your own, from $ACPX_SESSION_URL)",
+      (value: string) => parseNonEmptyValue("Session id", value),
+    )
+    .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
+    .action(async function (this: Command, flags: { brief: string; sessionId?: string }) {
+      await handleSessionsHandover(explicitAgentName, flags, this, config);
     });
 
   const historyCommand = sessionsCommand
