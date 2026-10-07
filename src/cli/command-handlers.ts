@@ -74,6 +74,7 @@ import {
   resolveSessionRecord,
   resolveTemplateSelector,
   seatBrickLinkFromRef,
+  seatFromStore,
   sessionBaseDir,
   rollbackTemplateSlug,
   DeletionManifestWriteError,
@@ -4633,7 +4634,32 @@ async function resolveHandoverCaller(
       `session ${caller.acpxRecordId} holds no seat, so it has nothing to hand over; nothing was created`,
     );
   }
+  await refuseUnlessActiveHolder(caller, caller.seatId, Refusal);
   return caller;
+}
+
+/** TE D3 — only the seat's ACTIVE holder may hand it over. A retired holder doing so would
+ *  retire the live holder (another agent) behind its back. */
+async function refuseUnlessActiveHolder(
+  caller: SessionRecord,
+  seatId: string,
+  Refusal: typeof import("./session/handover.js").HandoverRefusalError,
+): Promise<void> {
+  const seat = seatFromStore(await readSeatStore(sessionBaseDir()), seatId);
+  if (!seat) {
+    throw new Refusal(
+      "NO_SEAT",
+      `seat ${seatId} has no row in the seat store (run \`acpx seats backfill\`); nothing was created`,
+    );
+  }
+  if (seat.activeHolderId !== caller.acpxRecordId) {
+    const holder = seat.activeHolderId ?? "nobody (the seat is vacant)";
+    throw new Refusal(
+      "NOT_HOLDER",
+      `session ${caller.acpxRecordId} is not the active holder of seat ${seatAddressFor(seat.seatId)} — ` +
+        `its current holder is ${holder}. Only the active holder hands a seat over; nothing was created`,
+    );
+  }
 }
 
 /** The seat's `<base>/?seat=<id>` address, or the bare id where this box names no base. */

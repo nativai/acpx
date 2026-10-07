@@ -19,7 +19,13 @@ export const HANDOVER_PROMPT_MARKER = "⟦HANDOVER⟧";
 
 export class HandoverRefusalError extends Error {
   constructor(
-    readonly code: "BRIEF_MISSING" | "BRIEF_UNREADABLE" | "BRIEF_EMPTY" | "NO_CALLER" | "NO_SEAT",
+    readonly code:
+      | "BRIEF_MISSING"
+      | "BRIEF_UNREADABLE"
+      | "BRIEF_EMPTY"
+      | "NO_CALLER"
+      | "NO_SEAT"
+      | "NOT_HOLDER",
     message: string,
   ) {
     super(message);
