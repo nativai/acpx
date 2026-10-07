@@ -13,7 +13,8 @@
  * - **The compaction point is read at runtime from each harness** — every adapter names it
  *   in `usage_update._meta.contextCompaction.atTokens`. No static table.
  * - **Unknown window ⇒ window 0, usage 0 %, no alarm** — and no "unconfirmed" wording.
- * - **Once per crossing**: speaks once when the fill crosses, re-arms when it drops back.
+ * - **Once per crossing**: speaks once when the fill crosses; re-arms only when the fill
+ *   drops below half the alarm point (a compaction), never on an estimate's correction.
  *
  * Pure: no I/O here. The detector lives in the turn runtime, the delivery in the
  * mid-turn injector and the turn-context channel.
@@ -113,15 +114,27 @@ export function isPastContextAlarm(fill: ContextFill, alarm: ContextAlarm): bool
 
 /**
  * ONCE PER CROSSING. `observe` returns `true` exactly on the update that crosses the
- * alarm, then stays quiet while the fill stays past it; a fill below the alarm (after a
- * compaction, say) — or the alarm switched off — re-arms it.
+ * alarm, then stays quiet while the fill stays past it.
+ *
+ * 🔑 RE-ARM RULE: only a fill below HALF the alarm point re-arms it (a compaction, a
+ * `/compact`, a switch to a bigger window) — or the alarm going off / the window unknown.
+ * A dip just below the alarm is an ESTIMATE CORRECTING ITSELF, not the fill dropping back:
+ * codex-acp's err-high charge crosses, the next real report lands back below, and a latch
+ * that re-armed on any dip spoke five times in one turn for two real crossings (TE D2,
+ * brick 4f3fa88c).
  */
 export class ContextAlarmLatch {
   private spoken = false;
 
   observe(fill: ContextFill, alarm: ContextAlarm): boolean {
-    if (!isPastContextAlarm(fill, alarm)) {
+    if (alarm.atTokens === undefined) {
       this.spoken = false;
+      return false;
+    }
+    if (fill.used < alarm.atTokens) {
+      if (fill.used < alarm.atTokens / 2) {
+        this.spoken = false;
+      }
       return false;
     }
     if (this.spoken) {
