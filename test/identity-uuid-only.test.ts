@@ -104,7 +104,7 @@ async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<vo
     } else {
       process.env.ACPX_STATE_HOME = originalStateHome;
     }
-    await fs.rm(tempHome, { recursive: true, force: true });
+    await fs.rm(tempHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 }
 
