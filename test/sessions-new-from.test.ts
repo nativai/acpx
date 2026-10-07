@@ -102,7 +102,7 @@ function createdId(result: CliResult): string {
   return payload.acpxRecordId as string;
 }
 
-async function writeConfig(homeDir: string): Promise<void> {
+async function writeConfig(homeDir: string, operationLog?: string): Promise<void> {
   const subscriptionsRoot = path.join(homeDir, ".acpx", "subscriptions");
   for (const id of ["sub1", "sub2"]) {
     await fs.mkdir(path.join(subscriptionsRoot, id), { recursive: true });
@@ -125,7 +125,15 @@ async function writeConfig(homeDir: string): Promise<void> {
   );
   await fs.writeFile(
     path.join(homeDir, ".acpx", "config.json"),
-    `${JSON.stringify({ agents: { claude: { command: CLAUDE_COMMAND } } })}\n`,
+    `${JSON.stringify({
+      agents: {
+        claude: {
+          command: operationLog
+            ? `${CLAUDE_COMMAND} --operation-log ${JSON.stringify(operationLog)}`
+            : CLAUDE_COMMAND,
+        },
+      },
+    })}\n`,
     "utf8",
   );
 }
@@ -466,5 +474,249 @@ test("--from cannot be combined with --from-template", async () => {
     );
     assert.notEqual(result.code, 0);
     assert.match(result.stderr + result.stdout, /--from cannot be combined with --from-template/);
+  });
+});
+
+// Brick 28964dd8 — a successor (`--from` INTO the predecessor's own seat) runs on the
+// predecessor's EXACT model, Fable included, recorded `model_source: succession`. A child or a
+// fork of a Fable session still has an implicit Fable guard-forced off it (brick 5bac5564).
+
+const SUCCESSION_TURN = "succession-first-turn";
+
+async function workspace(homeDir: string): Promise<string> {
+  const cwd = path.join(homeDir, "workspace");
+  await fs.mkdir(cwd, { recursive: true });
+  return cwd;
+}
+
+async function createSeatedHolder(
+  homeDir: string,
+  cwd: string,
+  flags: string[],
+  env: NodeJS.ProcessEnv = {},
+  verbFlags: string[] = [],
+): Promise<string> {
+  return createdId(
+    await runCli(
+      [
+        "--cwd",
+        cwd,
+        ...COMMON,
+        ...flags,
+        "claude",
+        "sessions",
+        "new",
+        "-s",
+        "holder",
+        ...verbFlags,
+      ],
+      homeDir,
+      env,
+    ),
+  );
+}
+
+async function servedModelOf(operationLog: string, text: string): Promise<unknown> {
+  const prompts = (await fs.readFile(operationLog, "utf8"))
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as { method?: string; text?: string; modelId?: unknown })
+    .filter((op) => op.method === "session/prompt" && op.text === text);
+  assert.equal(prompts.length, 1, "exactly one served turn");
+  return prompts[0]?.modelId;
+}
+
+function sessionUrl(id: string): string {
+  return `https://atrium.example.test/?session=${id}`;
+}
+
+test("S1 (brick 28964dd8): a successor of an explicit-Fable holder carries fable as `succession`, and its first turn is served by fable", async () => {
+  await withTempHome("acpx-succession-fable-", async (homeDir) => {
+    const operationLog = path.join(homeDir, "agent-ops.jsonl");
+    await writeConfig(homeDir, operationLog);
+    const cwd = await workspace(homeDir);
+    const holderId = await createSeatedHolder(homeDir, cwd, ["--model", "fable"]);
+    const holder = await readStored(homeDir, holderId);
+    assert.equal(holder.acpx?.session_options?.model_source, "explicit");
+
+    // The handover's create step exactly as a holder runs it: its OWN url, nothing else.
+    const successorId = createdId(
+      await runCli([...COMMON, "claude", "sessions", "new", "--from", holderId], homeDir, {
+        ACPX_SESSION_URL: sessionUrl(holderId),
+      }),
+    );
+    const successor = await readStored(homeDir, successorId);
+    const options = successor.acpx?.session_options ?? {};
+    assert.equal(successor.seat_id, holder.seat_id);
+    assert.equal(options.model, "fable");
+    assert.equal(options.model_source, "succession");
+    assert.equal(options.model_guard, undefined, "the guard must not fire on a succession");
+
+    const turn = await runCli(
+      ["--cwd", cwd, ...COMMON, "claude", "prompt", "--session-id", successorId, SUCCESSION_TURN],
+      homeDir,
+    );
+    assert.equal(turn.code, 0, turn.stderr);
+    assert.equal(await servedModelOf(operationLog, SUCCESSION_TURN), "fable");
+    const afterTurn = (await readStored(homeDir, successorId)).acpx?.session_options ?? {};
+    assert.equal(afterTurn.model, "fable");
+    assert.equal(afterTurn.model_source, "succession");
+    assert.equal(afterTurn.model_guard, undefined, "the serve-time belt must not fire either");
+  });
+});
+
+test("S2 (brick 28964dd8): an explicit --model on the --from line overrides the predecessor's model, recorded explicit", async () => {
+  await withTempHome("acpx-succession-override-", async (homeDir) => {
+    await writeConfig(homeDir);
+    const cwd = await workspace(homeDir);
+    const holderId = await createSeatedHolder(homeDir, cwd, ["--model", "fable"]);
+
+    const successorId = createdId(
+      await runCli(
+        [...COMMON, "--model", "opus", "claude", "sessions", "new", "--from", holderId],
+        homeDir,
+        { ACPX_SESSION_URL: sessionUrl(holderId) },
+      ),
+    );
+    const options = (await readStored(homeDir, successorId)).acpx?.session_options ?? {};
+    assert.equal(options.model, "opus");
+    assert.equal(options.model_source, "explicit");
+  });
+});
+
+test("S3 (brick 28964dd8): a CHILD of a Fable holder — spawned without --model — is still guard-forced to opus", async () => {
+  await withTempHome("acpx-succession-child-", async (homeDir) => {
+    await writeConfig(homeDir);
+    const cwd = await workspace(homeDir);
+    const holderId = await createSeatedHolder(homeDir, cwd, ["--model", "fable"]);
+
+    // A spawn from inside the holder: parent by ACPX_SESSION_URL, a NEW seat.
+    const childId = createdId(
+      await runCli(["--cwd", cwd, ...COMMON, "claude", "sessions", "new"], homeDir, {
+        ACPX_SESSION_URL: sessionUrl(holderId),
+      }),
+    );
+    const child = await readStored(homeDir, childId);
+    assert.equal(child.parent_session_id, holderId);
+    assert.notEqual(child.seat_id, (await readStored(homeDir, holderId)).seat_id);
+    assert.equal(child.acpx?.session_options?.model, "opus");
+    assert.equal(child.acpx?.session_options?.model_source, "guard-forced");
+  });
+});
+
+test("S3 (brick 28964dd8): --from into a DIFFERENT seat is not a succession — an implicit Fable is still guard-forced", async () => {
+  await withTempHome("acpx-succession-other-seat-", async (homeDir) => {
+    await writeConfig(homeDir);
+    const cwd = await workspace(homeDir);
+    const holderId = await createSeatedHolder(homeDir, cwd, ["--model", "fable"]);
+    const otherSeat = (
+      await readStored(
+        homeDir,
+        createdId(
+          await runCli(
+            ["--cwd", cwd, ...COMMON, "--model", "opus", "claude", "sessions", "new", "-s", "b"],
+            homeDir,
+          ),
+        ),
+      )
+    ).seat_id;
+
+    const successorId = createdId(
+      await runCli(
+        [...COMMON, "claude", "sessions", "new", "--from", holderId, "--seat", String(otherSeat)],
+        homeDir,
+      ),
+    );
+    const options = (await readStored(homeDir, successorId)).acpx?.session_options ?? {};
+    assert.equal(options.model, "opus");
+    assert.equal(options.model_source, "guard-forced");
+  });
+});
+
+test("S4 (brick 28964dd8): a TOP-LEVEL holder's successor has no parent even with ACPX_SESSION_URL set — it is never its predecessor's child", async () => {
+  await withTempHome("acpx-succession-top-level-", async (homeDir) => {
+    await writeConfig(homeDir);
+    const cwd = await workspace(homeDir);
+    const holderId = await createSeatedHolder(homeDir, cwd, ["--model", "opus"]);
+    const holder = await readStored(homeDir, holderId);
+    assert.equal(holder.parent_session_id, undefined);
+
+    const successorId = createdId(
+      await runCli([...COMMON, "claude", "sessions", "new", "--from", holderId], homeDir, {
+        ACPX_SESSION_URL: sessionUrl(holderId),
+      }),
+    );
+    const successor = (await readStored(homeDir, successorId)) as StoredRecord & {
+      parent_seat_id?: string;
+      parent_session_url?: string;
+    };
+    assert.equal(successor.seat_id, holder.seat_id);
+    assert.equal(successor.holder_active, false);
+    assert.equal(successor.parent_session_id, undefined);
+    assert.equal(successor.parent_session_url, undefined);
+    assert.equal(successor.parent_seat_id, undefined);
+  });
+});
+
+test("S4 (brick 28964dd8): a CHILD holder's successor takes the holder's own parent, not the ACPX_SESSION_URL caller", async () => {
+  await withTempHome("acpx-succession-child-holder-", async (homeDir) => {
+    await writeConfig(homeDir);
+    const cwd = await workspace(homeDir);
+    await writeParent(homeDir, cwd, "the-parent");
+    const holderId = await createSeatedHolder(homeDir, cwd, ["--model", "opus"], {}, [
+      "--parent-id",
+      "the-parent",
+    ]);
+    assert.equal((await readStored(homeDir, holderId)).parent_session_id, "the-parent");
+
+    const successorId = createdId(
+      await runCli([...COMMON, "claude", "sessions", "new", "--from", holderId], homeDir, {
+        ACPX_SESSION_URL: sessionUrl(holderId),
+      }),
+    );
+    assert.equal((await readStored(homeDir, successorId)).parent_session_id, "the-parent");
+  });
+});
+
+test("S5 (brick 28964dd8): a succession still carries effort, harness, profile, auto-failover, cwd and brick exactly", async () => {
+  await withTempHome("acpx-succession-regression-", async (homeDir) => {
+    await writeConfig(homeDir);
+    const cwd = await workspace(homeDir);
+    const holderId = await createSeatedHolder(
+      homeDir,
+      cwd,
+      ["--model", "fable", "--brick", BRICK_A],
+      brickShimEnv(BRICK_A),
+    );
+    // Plant the remaining options on the holder's record, as a live holder carries them.
+    const holderFile = sessionFilePath(homeDir, holderId);
+    const raw = JSON.parse(await fs.readFile(holderFile, "utf8")) as {
+      acpx: {
+        session_options: Record<string, unknown>;
+        desired_config_options?: Record<string, unknown>;
+      };
+    };
+    raw.acpx.session_options.profile = "sub2";
+    raw.acpx.session_options.auto_failover = false;
+    raw.acpx.desired_config_options = { ...raw.acpx.desired_config_options, effort: "high" };
+    await fs.writeFile(holderFile, `${JSON.stringify(raw)}\n`, "utf8");
+    const holder = await readStored(homeDir, holderId);
+
+    const successorId = createdId(
+      await runCli([...COMMON, "claude", "sessions", "new", "--from", holderId], homeDir, {
+        ...brickShimEnv(BRICK_A),
+        ACPX_SESSION_URL: sessionUrl(holderId),
+      }),
+    );
+    const successor = await readStored(homeDir, successorId);
+    const options = successor.acpx?.session_options ?? {};
+    assert.equal(options.model, "fable");
+    assert.equal(options.model_source, "succession");
+    assert.equal(successor.acpx?.desired_config_options?.effort, "high");
+    assert.equal(options.profile, "sub2");
+    assert.equal(options.auto_failover, false);
+    assert.equal(successor.agent_command, holder.agent_command);
+    assert.equal(successor.cwd, cwd);
+    assert.equal(successor.metadata?.brick, BRICK_A);
   });
 });

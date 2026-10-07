@@ -1199,7 +1199,13 @@ class MockAgent implements Agent {
     const promptAbort = new AbortController();
     session.pendingPrompt = promptAbort;
     const text = getPromptText(params.prompt);
-    this.recordOperation({ method: "session/prompt", sessionId: params.sessionId, text });
+    // `modelId` is the model this turn is SERVED by — what a "served by" assertion reads.
+    this.recordOperation({
+      method: "session/prompt",
+      sessionId: params.sessionId,
+      text,
+      modelId: session.modelId,
+    });
 
     if (text === "partial-retryable-error") {
       try {

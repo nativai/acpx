@@ -171,3 +171,22 @@ test("guardServedModel: a non-Fable pin is untouched regardless of provenance", 
     assert.equal(r.model, "opus");
   }
 });
+
+// Brick 28964dd8 — `succession` (a successor into its predecessor's own seat) is accepted by
+// both tiers exactly as `explicit` is; every other non-explicit provenance is still guarded.
+test("guardImplicitFable: a succession Fable is PRESERVED with source succession", () => {
+  const r = guardImplicitFable({
+    resolvedModel: "fable",
+    explicitModel: undefined,
+    source: "succession",
+  });
+  assert.equal(r.model, "fable");
+  assert.equal(r.source, "succession");
+  assert.equal(r.forced, false);
+});
+
+test("guardServedModel: succession Fable provenance is preserved", () => {
+  const r = guardServedModel({ requestedModel: "fable", modelSource: "succession" });
+  assert.equal(r.model, "fable");
+  assert.equal(r.forced, false);
+});
