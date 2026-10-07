@@ -54,7 +54,10 @@ async function readRaw(dir: string): Promise<Record<string, Record<string, unkno
 
 // ─── 1 · THE CLOSED SET — eight fields, and the falsifier for a ninth ────────
 
-test("the seat record field set is CLOSED AT EIGHT — a ninth field fails this row", () => {
+test("the seat record field set is CLOSED AT NINE — a tenth field fails this row", () => {
+  // Widened from eight to nine 2026-10-07 for `contextAlarm` alone — Daniel's decision on
+  // brick 7f61daf9 (DECISION.md item A: "Yes, the alarm level should be set per seat"),
+  // amending his own closure for this ONE field. Not a precedent for a tenth.
   // 🛑 THIS ROW IS THE FALSIFIER FOR "the record carries eight fields". Widened
   // from seven to eight 2026-09-30 for `favorite` alone — Daniel's D-STAR ruling
   // REOPENED the closed seven-field set for this ONE additive field, which is his
@@ -69,16 +72,17 @@ test("the seat record field set is CLOSED AT EIGHT — a ninth field fails this 
     "activeHolderId",
     "brickId",
     "closedAt",
+    "contextAlarm",
     "createdAt",
     "favorite",
     "name",
     "nextOrdinal",
     "seatId",
   ]);
-  assert.equal(Object.keys(SEAT_RECORD_FIELD_PLAN).length, 8);
+  assert.equal(Object.keys(SEAT_RECORD_FIELD_PLAN).length, 9);
 });
 
-test("a fully-populated seat round-trips through disk with all eight fields intact", async () => {
+test("a fully-populated seat round-trips through disk with all nine fields intact", async () => {
   await withTempDir("acpx-seat-store-", async (dir) => {
     const full = seat({
       activeHolderId: "holder-b",
@@ -89,6 +93,8 @@ test("a fully-populated seat round-trips through disk with all eight fields inta
       // field — `validated: true` exercises BOTH keys the sibling writes.
       brickId: { ref: "b64dfbb3-e6df-4805-aef3-90951d937fb9", validated: true },
       favorite: true,
+      // Brick 4f3fa88c — the ninth field.
+      contextAlarm: 75,
     });
     await withSeatStoreWrite(dir, () => ({
       mutation: { kind: "write", seats: new Map([[full.seatId, full]]) },
@@ -122,6 +128,7 @@ test("a fully-populated seat round-trips through disk with all eight fields inta
       "brick_id",
       "brick_id_validated",
       "closed_at",
+      "context_alarm",
       "created_at",
       "favorite",
       "name",

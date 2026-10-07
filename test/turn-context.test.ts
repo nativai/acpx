@@ -183,28 +183,37 @@ test("D3 a provider returning whitespace only contributes nothing, not an empty 
 // The registry ships EMPTY, and the synchronous guard.
 // ---------------------------------------------------------------------------
 
-test("the shipped registry is EMPTY — this is the shipped state of the feature", () => {
-  assert.deepEqual(turnContextProviders(), []);
+test("the shipped registry holds exactly the context alarm (brick 4f3fa88c)", () => {
+  assert.deepEqual(
+    turnContextProviders().map((entry) => entry.id),
+    ["context-alarm"],
+  );
 });
 
 test("D10 the synchronous guard predicate is false with an empty registry and no payload", () => {
   // If this predicate is false, the `&&` at the call site cannot reach resolveTurnContext,
-  // so no promise is allocated and no microtask is queued on the inert path.
-  assert.equal(hasTurnContextProviders({}), false);
-
-  // CONTROL (registry): a registered provider flips it true — otherwise this row would pass
-  // on a build where the predicate is hardwired to false.
-  const restore = setTurnContextProvidersForTesting([provider("p", () => "x")]);
+  // so no promise is allocated and no microtask is queued on the inert path. The shipped
+  // registry is no longer empty (the context alarm, brick 4f3fa88c), so this row empties it.
+  const restoreEmpty = setTurnContextProvidersForTesting([]);
   try {
-    assert.equal(hasTurnContextProviders({}), true);
-  } finally {
-    restore();
-  }
+    assert.equal(hasTurnContextProviders({}), false);
 
-  // CONTROL (test seam): the payload env alone also flips it true.
-  assert.equal(hasTurnContextProviders({ [TURN_CONTEXT_TEST_PAYLOAD_ENV]: "nonce" }), true);
-  // ...and an empty/whitespace payload does NOT, so the seam cannot accidentally arm itself.
-  assert.equal(hasTurnContextProviders({ [TURN_CONTEXT_TEST_PAYLOAD_ENV]: "   " }), false);
+    // CONTROL (registry): a registered provider flips it true — otherwise this row would pass
+    // on a build where the predicate is hardwired to false.
+    const restore = setTurnContextProvidersForTesting([provider("p", () => "x")]);
+    try {
+      assert.equal(hasTurnContextProviders({}), true);
+    } finally {
+      restore();
+    }
+
+    // CONTROL (test seam): the payload env alone also flips it true.
+    assert.equal(hasTurnContextProviders({ [TURN_CONTEXT_TEST_PAYLOAD_ENV]: "nonce" }), true);
+    // ...and an empty/whitespace payload does NOT, so the seam cannot accidentally arm itself.
+    assert.equal(hasTurnContextProviders({ [TURN_CONTEXT_TEST_PAYLOAD_ENV]: "   " }), false);
+  } finally {
+    restoreEmpty();
+  }
 });
 
 test("resolveTurnContext with no providers never consults a provider", async () => {
@@ -736,39 +745,47 @@ test("G3 buildTurnContextRequest carries sessionEnv through and derives the harn
 // ---------------------------------------------------------------------------
 
 test("the test-payload seam is a real registry provider reading the SESSION's env", async () => {
-  const sessionEnv = { [TURN_CONTEXT_TEST_PAYLOAD_ENV]: "a1b2c3d4e5f60718" };
-  const providers = effectiveTurnContextProviders(sessionEnv);
-  assert.equal(providers.length, 1);
-  assert.equal(providers[0].id, "test-payload");
-  // ⚠️ `requires-mitigation`, NOT `neutral`. The seam carries arbitrary operator-supplied text
-  // it never inspects, so it cannot honestly answer the reviewer's question — and a seam that
-  // declared `neutral` would be the one provider defeating the mechanism built to stop exactly
-  // that. An earlier revision did declare `neutral`; a live agent was measured acting on an
-  // imperative payload delivered through it.
-  assert.deepEqual(providers[0].attribution, {
-    kind: "requires-mitigation",
-    evidence: "M1e/ENVELOPE-V1",
-  });
-  // ...and that declaration must satisfy the same guard every other provider faces.
-  assertAttributionWellFormed(providers[0]);
+  // The seam alone — the shipped context-alarm provider (brick 4f3fa88c) is not its subject.
+  const restoreEmpty = setTurnContextProvidersForTesting([]);
+  try {
+    const sessionEnv = { [TURN_CONTEXT_TEST_PAYLOAD_ENV]: "a1b2c3d4e5f60718" };
+    const providers = effectiveTurnContextProviders(sessionEnv);
+    assert.equal(providers.length, 1);
+    assert.equal(providers[0].id, "test-payload");
+    // ⚠️ `requires-mitigation`, NOT `neutral`. The seam carries arbitrary operator-supplied text
+    // it never inspects, so it cannot honestly answer the reviewer's question — and a seam that
+    // declared `neutral` would be the one provider defeating the mechanism built to stop exactly
+    // that. An earlier revision did declare `neutral`; a live agent was measured acting on an
+    // imperative payload delivered through it.
+    assert.deepEqual(providers[0].attribution, {
+      kind: "requires-mitigation",
+      evidence: "M1e/ENVELOPE-V1",
+    });
+    // ...and that declaration must satisfy the same guard every other provider faces.
+    assertAttributionWellFormed(providers[0]);
 
-  const composed = await resolveTurnContext({ ...REQUEST, sessionEnv });
-  assert.ok(composed, "the seam must contribute when the session env carries a payload");
-  assert.ok(composed.includes("a1b2c3d4e5f60718"));
-  assert.ok(composed.startsWith(TURN_CONTEXT_OPEN_TAG));
+    const composed = await resolveTurnContext({ ...REQUEST, sessionEnv });
+    assert.ok(composed, "the seam must contribute when the session env carries a payload");
+    assert.ok(composed.includes("a1b2c3d4e5f60718"));
+    assert.ok(composed.startsWith(TURN_CONTEXT_OPEN_TAG));
 
-  // CONTROL: unset ⇒ no providers, nothing composed. Same instrument, opposite verdict.
-  assert.deepEqual(effectiveTurnContextProviders({}), []);
-  assert.equal(await resolveTurnContext({ ...REQUEST, sessionEnv: {} }), undefined);
+    // CONTROL: unset ⇒ no providers, nothing composed. Same instrument, opposite verdict.
+    assert.deepEqual(effectiveTurnContextProviders({}), []);
+    assert.equal(await resolveTurnContext({ ...REQUEST, sessionEnv: {} }), undefined);
+  } finally {
+    restoreEmpty();
+  }
 });
 
 test("the seam does NOT read acpx's own process.env", async () => {
+  const restoreEmpty = setTurnContextProvidersForTesting([]);
   process.env[TURN_CONTEXT_TEST_PAYLOAD_ENV] = "leaked-from-acpx-env";
   try {
     assert.deepEqual(effectiveTurnContextProviders({}), []);
     assert.equal(await resolveTurnContext({ ...REQUEST, sessionEnv: {} }), undefined);
   } finally {
     delete process.env[TURN_CONTEXT_TEST_PAYLOAD_ENV];
+    restoreEmpty();
   }
 });
 
