@@ -1002,7 +1002,7 @@ export function registerAgentCommand(
     cancel: "Cooperatively cancel current in-flight prompt",
     setMode: "Set session mode",
     setConfig:
-      "Set session config option (special keys: `model`, `subscription` <id> — switch the Claude subscription in place; `profile` <id> — move the session to a different credential profile, SDK sub1↔sub2 or bridge1↔bridge2; `outputStyle` <name> — set the Claude Code output style, accepted even mid-turn and bound when the turn ends)",
+      "Set session config option (special keys: `model`, `subscription` <id> — switch the Claude subscription in place; `profile` <id> — move the session to a different credential profile, SDK sub1↔sub2; `outputStyle` <name> — set the Claude Code output style, accepted even mid-turn and bound when the turn ends)",
     outputStyles:
       "List the output styles this agent offers (pass --session-id to read a session's own advertised list instead of opening a transient one)",
     modelCatalogue:
@@ -1043,7 +1043,7 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
     exec: `One-shot prompt using ${config.defaultAgent} by default`,
     cancel: `Cancel active prompt for ${config.defaultAgent} by default`,
     setMode: `Set session mode for ${config.defaultAgent} by default`,
-    setConfig: `Set session config option for ${config.defaultAgent} by default (special keys: \`model\`, \`subscription\` <id>, \`profile\` <id> — move the session's credential, SDK sub1↔sub2 or bridge1↔bridge2; \`outputStyle\` <name>)`,
+    setConfig: `Set session config option for ${config.defaultAgent} by default (special keys: \`model\`, \`subscription\` <id>, \`profile\` <id> — move the session's credential, SDK sub1↔sub2; \`outputStyle\` <name>)`,
     outputStyles: `List the output styles ${config.defaultAgent} offers`,
     modelCatalogue: `Print the model catalogue ${config.defaultAgent}'s adapter advertises`,
     status: `Show local status for ${config.defaultAgent} by default`,

@@ -41,6 +41,13 @@ import type { CatalogueModel, ModelCatalogue } from "./types.js";
 
 const KNOWN_SOURCE_PREFIXES = new Set(["openrouter", "claude-subscription", "chatgpt"]);
 
+/**
+ * A source prefix that used to exist and no longer does (`claude-home`, removed with
+ * the claude-pty adapter, brick 3ba8efe1). It is not a known source, so it is not
+ * split off — but a remembered `claude-home:opus` still means "`opus` on the plan".
+ */
+const RETIRED_SOURCE_PREFIXES = new Set(["claude-home"]);
+
 export class ModelSlugError extends AcpxOperationalError {
   /**
    * @param policyReason WHICH policy refused, as the same machine-readable token the
@@ -478,9 +485,26 @@ function isAmbiguous(candidates: CatalogueModel[]): boolean {
   return new Set(candidates.map((model) => model.billing.kind)).size > 1;
 }
 
+/**
+ * A retired prefix is stripped before ranking and metered rows go last: trigram
+ * similarity otherwise ranks `anthropic/claude-opus-…` (metered, OpenRouter) above the
+ * plan row `opus`, and an agent following "did you mean" would spend money unasked.
+ */
+function suggestionsFor(catalogue: ModelCatalogue, ref: ParsedModelRef): CatalogueModel[] {
+  const colon = ref.id.indexOf(":");
+  const retired = colon > 0 && RETIRED_SOURCE_PREFIXES.has(ref.id.slice(0, colon).toLowerCase());
+  if (!retired) {
+    return nearestModels(catalogue, ref.id);
+  }
+  const alias = ref.id.slice(colon + 1);
+  const ranked = nearestModels(catalogue, alias, catalogue.models.length);
+  const unmetered = ranked.filter((model) => model.billing.kind !== "metered");
+  return [...unmetered, ...ranked.filter((model) => model.billing.kind === "metered")].slice(0, 3);
+}
+
 /** Shape 1 — unknown slug: the three nearest matches by the SAME matcher. */
 function unknownSlugError(catalogue: ModelCatalogue, ref: ParsedModelRef): ModelSlugError {
-  const suggestions = nearestModels(catalogue, ref.id);
+  const suggestions = suggestionsFor(catalogue, ref);
   const suggestionText =
     suggestions.length > 0
       ? `\n  did you mean:\n${suggestions.map((model) => `    ${describeRow(model)}`).join("\n")}`
