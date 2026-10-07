@@ -129,12 +129,16 @@ async function writeCache(recordId: string, link: SeatBrickLink | undefined): Pr
   }
 }
 
+// Whether `withBrickCache` would change nothing. Compared key-for-key WITHOUT naming the field:
+// the cache pair is spelled only in seat-brick.ts (`brick-decision-sites.test.ts` holds that).
 function cacheMatches(
   metadata: Record<string, string> | undefined,
   link: SeatBrickLink | undefined,
 ): boolean {
-  const target = withBrickCache(metadata, link);
+  const before = metadata ?? {};
+  const after = withBrickCache(metadata, link) ?? {};
+  const keys = Object.keys(after);
   return (
-    target?.brick === metadata?.brick && target?.brick_validation === metadata?.brick_validation
+    keys.length === Object.keys(before).length && keys.every((key) => before[key] === after[key])
   );
 }
