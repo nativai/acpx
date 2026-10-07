@@ -438,6 +438,8 @@ export type SubmitToQueueOwnerOptions = {
   waitForCompletion: boolean;
   verbose?: boolean;
   sessionOptions?: NonNullable<AcpClientOptions["sessionOptions"]>;
+  /** Client-side only (never put on the wire): fired once the owner acks the submit. */
+  onSubmitAccepted?: () => void;
   // Keep-warm idle-TTL override (ms; 0 = forever) for the running owner. Absent
   // => do not change the owner's TTL.
   ttlMs?: number;
@@ -542,6 +544,7 @@ async function submitToQueueOwner(
     owner,
     request,
     onAccepted: ({ resolve }) => {
+      options.onSubmitAccepted?.();
       options.outputFormatter.setContext({
         sessionId: options.sessionId,
       });

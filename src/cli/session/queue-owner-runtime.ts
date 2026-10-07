@@ -156,6 +156,7 @@ async function submitToRunningOwner(
     waitForCompletion,
     verbose: options.verbose,
     sessionOptions: options.sessionOptions,
+    onSubmitAccepted: options.onSubmitAccepted,
   });
 }
 

@@ -192,6 +192,14 @@ function seatRefFromSelector(selector: SessionTargetSelector): string | undefine
   return url !== undefined && parseSeatIdFromUrl(url) !== undefined ? url : undefined;
 }
 
+/** The seat a selector ADDRESSES (`--seat`, or a `--session-url` carrying `?seat=`), if any. */
+export function addressedSeatIdFromSelector(selector: SessionTargetSelector): string | undefined {
+  const seatRef = seatRefFromSelector(selector);
+  return seatRef === undefined
+    ? undefined
+    : seatIdFromRef(selector.seat !== undefined ? "--seat" : "--session-url", seatRef);
+}
+
 export async function resolveExplicitSessionRecord(
   selector: SessionTargetSelector,
 ): Promise<SessionRecord | undefined> {

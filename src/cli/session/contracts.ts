@@ -195,6 +195,11 @@ export type SessionSendOptions = {
   verbose?: boolean;
   waitForCompletion?: boolean;
   messageId?: string;
+  /**
+   * Fired in THIS (client) process when the queue owner acknowledges the submit — the
+   * message ledger's accept point (`cli/message-ledger.ts`). Never sent to the owner.
+   */
+  onSubmitAccepted?: () => void;
   ttlMs?: number;
   maxQueueDepth?: number;
   client?: AcpClient;

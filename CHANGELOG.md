@@ -114,6 +114,16 @@ Repo: https://github.com/openclaw/acpx
   and `servedModel` (what the API last served), and the new
   `acpx sessions reindex` backfills them. A locally generated `<synthetic>`
   transcript entry is no longer recorded as the served model. (brick ebfe4c3c)
+- A prompt an agent sends with `prompt`, `sessions new --from-template` or
+  `sessions copy` (including the fork notice) is now recorded as one NDJSON
+  line in `<state home>/message-ledger/<UTC date>.ndjson` — sender session and
+  seat, target session and seat, whether a seat or a session was addressed,
+  accepted or refused, and the text — so acpx-ui can show CLI sends in the
+  message history. Only callers carrying an agent identity
+  (`ACPX_SESSION_URL` with `?session=`, or `ACPX_SESSION_RECORD_ID`) and no
+  `--message-id` are recorded. A ledger write failure prints one
+  `acpx: message ledger not written: …` line on stderr and changes nothing
+  else. (brick c6bab3aa)
 
 ### Breaking
 
