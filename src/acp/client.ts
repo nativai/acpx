@@ -190,6 +190,7 @@ const DRAIN_POLL_INTERVAL_MS = 20;
 const AGENT_CLOSE_TERM_GRACE_MS = 1_500;
 const AGENT_CLOSE_KILL_GRACE_MS = 1_000;
 const STARTUP_STDERR_MAX_CHARS = 8_192;
+const NOOP = (): void => {};
 
 type LoadSessionOptions = {
   suppressReplayUpdates?: boolean;
@@ -839,6 +840,21 @@ export class AcpClient {
     sessionId: string;
     promise: Promise<PromptResponse>;
   };
+  /**
+   * A TURN prompt that has been called but is not on the wire yet: open only while
+   * `prompt()` awaits its per-turn context, closed in the same synchronous step that sets
+   * `activePrompt` (brick bf3a4533). While it is open the prompt counts as active, and a
+   * cancel or an injected prompt for its session waits for `sent` before acting.
+   *
+   * ⚠️ DO NOT drop this in favour of `activePrompt` alone. Callers read `hasActivePrompt()`
+   * the moment `prompt()` returns — the queue owner applies a cancel queued while the turn
+   * was starting at exactly that point, and arms the mid-turn handler there. With a context
+   * provider registered, `prompt()` returns BEFORE `activePrompt` is set, so that cancel was
+   * silently dropped (`cancelled: true` reported, turn ran to `end_turn`) and an injection
+   * reached the agent ahead of the turn's own prompt. Guarded by
+   * `test/prompt-start-window.test.ts`.
+   */
+  private startingPrompt?: { sessionId: string; sent: Promise<void> };
   private readonly cancellingSessionIds = new Set<string>();
   private readonly permissionAbortControllers = new Map<string, AbortController>();
   private closing = false;
@@ -1139,13 +1155,14 @@ export class AcpClient {
   }
 
   hasActivePrompt(sessionId?: string): boolean {
-    if (!this.activePrompt) {
+    const current = this.activePrompt ?? this.startingPrompt;
+    if (!current) {
       return false;
     }
     if (sessionId == null) {
       return true;
     }
-    return this.activePrompt.sessionId === sessionId;
+    return current.sessionId === sessionId;
   }
 
   async start(): Promise<void> {
@@ -2384,8 +2401,11 @@ export class AcpClient {
     // `undefined` here means "nothing to inject", decided SYNCHRONOUSLY — so the inert path
     // never reaches an `await` at all. See {@link maybeResolveTurnContext}.
     const pendingTurnContext = this.maybeResolveTurnContext(sessionId, options);
-    const composedTurnContext =
-      pendingTurnContext === undefined ? undefined : await pendingTurnContext;
+    const markSent =
+      pendingTurnContext === undefined ? NOOP : this.holdPromptStart(sessionId, pendingTurnContext);
+    // No context of its own (an injected prompt) ⇒ wait for a turn prompt still composing.
+    const beforeSend = pendingTurnContext ?? this.turnPromptComposing(sessionId);
+    const composedTurnContext = beforeSend === undefined ? undefined : await beforeSend;
 
     const restoreConsoleError = this.options.suppressSdkConsoleErrors
       ? installSdkConsoleErrorSuppression()
@@ -2400,6 +2420,7 @@ export class AcpClient {
       );
     } catch (error) {
       restoreConsoleError?.();
+      markSent();
       throw error;
     }
 
@@ -2407,6 +2428,7 @@ export class AcpClient {
       sessionId,
       promise: promptPromise,
     };
+    markSent();
 
     try {
       const response = await promptPromise;
@@ -2456,6 +2478,35 @@ export class AcpClient {
         sessionEnv,
       }),
     );
+  }
+
+  /**
+   * Open {@link startingPrompt} for `sessionId` while `composing` runs; the returned function
+   * closes it and releases `sent` — call it in the step that sets `activePrompt`. A compose
+   * that rejects sends nothing, so it releases the waiters itself.
+   */
+  private holdPromptStart(sessionId: string, composing: Promise<unknown>): () => void {
+    let release!: () => void;
+    const start = { sessionId, sent: new Promise<void>((resolve) => (release = resolve)) };
+    this.startingPrompt = start;
+    const close = (): void => {
+      if (this.startingPrompt === start) {
+        this.startingPrompt = undefined;
+      }
+      release();
+    };
+    composing.catch(close);
+    return close;
+  }
+
+  /**
+   * A prompt injected into a turn whose own prompt is still being composed must reach the
+   * agent AFTER it, never ahead (brick bf3a4533). `undefined`, synchronously, when nothing
+   * is composing — so the inert path still never awaits.
+   */
+  private turnPromptComposing(sessionId: string): Promise<undefined> | undefined {
+    const start = this.startingPrompt;
+    return start?.sessionId === sessionId ? start.sent.then(() => undefined) : undefined;
   }
 
   /** Per-prompt teardown: restore stderr suppression and drop this turn's bookkeeping. */
@@ -2719,6 +2770,7 @@ export class AcpClient {
   }
 
   async requestCancelActivePrompt(): Promise<boolean> {
+    await this.untilStartingPromptSent();
     const active = this.activePrompt;
     if (!active) {
       return false;
@@ -2727,7 +2779,18 @@ export class AcpClient {
     return true;
   }
 
+  /**
+   * A cancel for a prompt still being composed waits until it is on the wire: a
+   * `session/cancel` sent ahead of its `session/prompt` cancels nothing (brick bf3a4533).
+   */
+  private async untilStartingPromptSent(): Promise<void> {
+    if (this.startingPrompt) {
+      await this.startingPrompt.sent;
+    }
+  }
+
   async cancelActivePrompt(waitMs = 2_500): Promise<PromptResponse | undefined> {
+    await this.untilStartingPromptSent();
     const active = this.activePrompt;
     if (!active) {
       return undefined;
