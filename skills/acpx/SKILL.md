@@ -209,6 +209,9 @@ acpx sessions list --cursor <cursor>
 acpx sessions list --local
 acpx sessions new
 acpx sessions new --name backend
+acpx --format json sessions new --name worker --prompt-file brief.md
+acpx sessions new --no-parent --favorite --prompt "start here"
+acpx sessions set-parent --session-id <id> --no-parent
 acpx sessions close
 acpx sessions close backend
 acpx sessions reopen <id>
@@ -244,6 +247,23 @@ Behavior:
 - `sessions list --local` reads saved acpx records instead
 - `new` creates a fresh session for the current `(agentCommand, cwd, optional name)` scope
 - `new --name <name>` targets a named session scope
+- `new --prompt <text>` / `--prompt-file <path|->` creates the session AND
+  enqueues its first turn in one call (non-blocking, the same delivery as
+  `prompt --no-wait`); JSON adds `promptQueued: true`. The prompt is validated
+  before anything is created (both flags, a missing/empty file, `--seat`,
+  `--from` or `--no-prompt` beside it: refused, nothing created). If the
+  session is created but the enqueue fails, it is kept, the exit is non-zero
+  and JSON carries `promptQueued: false` + `promptError` beside the usual
+  `acpxRecordId` / `sessionUrl` / `seatUrl` — prompt or close that session,
+  do not re-run the spawn. With `--from-template` the text REPLACES the
+  template's stored auto-prompt
+- `new --no-parent` records no parent session and no parent seat (a top-level
+  session; its agent gets no `ACPX_PARENT_*`) while still inheriting agent,
+  model, effort, credentials and brick from the caller
+- `new --favorite` creates the session's seat starred (as `seats favorite
+<seat> --on`); refused on a seat join
+- `set-parent --session-id <id> --no-parent` clears one session's parent
+  (record and index, parent seat included)
 - when `new` replaces an existing open session in that scope, the old one is soft-closed
 - `close` targets current cwd default session
 - `close <name>` targets the current cwd named session first, then one exact

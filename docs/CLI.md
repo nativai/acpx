@@ -303,6 +303,8 @@ acpx [global_options] <agent> sessions list
 acpx [global_options] <agent> sessions list [--cursor <cursor>] [--filter-cwd <dir>] [--local]
 acpx [global_options] <agent> sessions new
 acpx [global_options] <agent> sessions new --name <name>
+acpx [global_options] <agent> sessions new [--prompt <text> | --prompt-file <path|->] [--no-parent] [--favorite]
+acpx [global_options] <agent> sessions set-parent --session-id <id> --no-parent
 acpx [global_options] <agent> sessions close --session-id <id>
 acpx [global_options] <agent> sessions reopen <id>
 acpx [global_options] <agent> sessions reopen <id>
@@ -335,6 +337,12 @@ Behavior:
 - `sessions new` creates a fresh cwd-scoped default session
 - `sessions new --name <name>` creates a fresh session and names its SEAT (a display label; refused together with `--seat`)
 - `sessions new` never closes or reuses another session
+- `sessions new --prompt <text>` / `--prompt-file <path>` (`-` reads stdin) creates the session AND enqueues the text as its first turn in one call. It is non-blocking — it returns once the turn is queued, through the same delivery `prompt --no-wait` uses — and the result line adds `promptQueued: true`. The prompt is read and validated first: both flags together, a missing, unreadable, empty or whitespace-only file, or an empty `--prompt` are refused (exit 2) and nothing is created. Refused with `--seat` (a seat join is prepared, not active: `sessions activate`, then `prompt --seat`), with `--from` (use `sessions handover --brief`) and with `--no-prompt`. With `--from-template` the text REPLACES the template's stored auto-prompt (a one-line stderr note says so when a stored prompt is discarded); `--no-prompt` still suppresses it
+- If the session is created but its first turn cannot be enqueued, the session is kept (open and promptable), the command exits non-zero, stderr names the new seat and session with the retry and close commands, and the JSON result line carries `promptQueued: false` and `promptError: { code, message }` beside the usual `acpxRecordId` / `sessionUrl` / `seatUrl`. With no first turn requested, `promptQueued` is absent
+- `sessions new --no-parent` creates a top-level session: no parent session and no parent seat are recorded, so its agent gets no `ACPX_PARENT_SESSION_URL` / `ACPX_PARENT_SEAT_URL` — even when `ACPX_SESSION_URL` names a caller. Only the edge is dropped: agent type, model, effort, credentials and brick are still inherited from the caller. Refused with any `--parent-*` flag
+- `sessions new --favorite` creates the session's seat starred — the same seat-row star `seats favorite <seat> --on` sets. Refused when the session joins an existing seat (`--seat`, or `--from` into the old session's seat)
+- `sessions new --from <id>` never takes its parent from `ACPX_SESSION_URL`: the old session's parent is the default, and a parentless old session gives a parentless new one
+- `sessions set-parent --session-id <id> --no-parent` clears one session's parent (parent session, parent seat, parent URL and the re-parent marker, in the record and the index). `spawned_by_session_id` is kept. Refused with `--children-of` and with any `--parent-*` flag; an empty parent flag (`--parent-id ''`) is still refused as `PARENT_DETACH_UNSUPPORTED`. A forked session keeps its fork source, and acpx-ui's board and relations views place a fork with no parent under that source (reported in `warnings`)
 - text and quiet output print the local `acpxRecordId`; JSON output also includes
   `acpxSessionId` and, when the adapter exposes one, `agentSessionId`
 - `sessions close --session-id <id>` soft-closes that session
