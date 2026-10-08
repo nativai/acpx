@@ -444,14 +444,13 @@ export function registerSessionsCommand(
       "Enqueue this text as the new session's first turn right after creation (non-blocking: " +
         "returns once it is queued). With --from-template it REPLACES the template's stored " +
         "auto-prompt (which is then not sent). Refused with --seat, --from and --no-prompt.",
-      (value: string) => parseNonEmptyValue("Prompt", value),
     )
     .option(
       "--prompt-file <path>",
       "As --prompt, reading the first turn from a file (use - for stdin): with --from-template " +
-        "it likewise REPLACES the template's stored auto-prompt. A missing, unreadable or empty " +
-        "file is refused and nothing is created.",
-      (value: string) => parseNonEmptyValue("Prompt file", value),
+        "it likewise REPLACES the template's stored auto-prompt. A relative path resolves " +
+        "against the directory you run acpx in, NOT --cwd (which is where the new session " +
+        "lives). A missing, unreadable or empty file is refused and nothing is created.",
     )
     .option(
       "--no-prompt",
@@ -544,7 +543,8 @@ export function registerSessionsCommand(
     )
     .option(
       "--prompt-file <path>",
-      "Read prompt handoff from file path (use - for stdin) and enqueue it after creation (non-blocking)",
+      "Read prompt handoff from file path (use - for stdin) and enqueue it after creation " +
+        "(non-blocking). A relative path resolves against the directory you run acpx in, not --cwd",
       (value: string) => parseNonEmptyValue("Prompt file", value),
     )
     .action(async function (this: Command, flags: SessionsCopyFlags) {

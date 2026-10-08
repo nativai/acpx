@@ -331,13 +331,6 @@ export function printNewSessionByFormat(
   process.stdout.write(`${record.acpxRecordId}\n`);
   if (format !== "quiet") {
     printNewSessionSeatLines(record);
-    printFirstTurnQueuedLine(firstTurn);
-  }
-}
-
-function printFirstTurnQueuedLine(firstTurn: FirstTurnOutcome | undefined): void {
-  if (firstTurn?.promptQueued === true) {
-    process.stderr.write("[acpx] first turn queued\n");
   }
 }
 
@@ -421,7 +414,6 @@ export function printCopiedSessionByFormat(
         `so the request was snapped down to the nearest one.\n`,
     );
   }
-  printFirstTurnQueuedLine(firstTurn);
 }
 
 // brick://16712ece — `sessions reopen`. `reopened:false` is the idempotent

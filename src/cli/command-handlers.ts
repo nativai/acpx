@@ -2782,9 +2782,9 @@ function applyCloseExitCode(
 // template's stored auto_prompt  ▷  nothing. A blank stored prompt means no fire.
 function resolveTemplateFirstTurn(
   flags: SessionsNewFlags,
-  firstTurn: PromptInput | undefined,
+  firstTurn: HandoffPrompt | undefined,
   source: SessionRecord,
-): PromptInput | undefined {
+): HandoffPrompt | undefined {
   if (firstTurn) {
     return firstTurn;
   }
@@ -2792,7 +2792,9 @@ function resolveTemplateFirstTurn(
     return undefined;
   }
   const stored = source.template?.auto_prompt;
-  return stored?.trim() ? textPrompt(stored) : undefined;
+  return stored?.trim()
+    ? { prompt: textPrompt(stored), source: "the template's stored auto-prompt" }
+    : undefined;
 }
 
 /**
@@ -2801,6 +2803,7 @@ function resolveTemplateFirstTurn(
  */
 function refuseNewSessionFlagCombinations(flags: SessionsNewFlags): void {
   refuseNoParentWithParentFlag(flags);
+  refuseFavoriteOnSeatFlag(flags);
   refuseFirstTurnCombinations(flags);
 }
 
@@ -2816,6 +2819,11 @@ function refuseNoParentWithParentFlag(flags: SessionsNewFlags): void {
   }
 }
 
+// ⚠️ EVERY COMMAND THESE REFUSALS ADVISE MUST DO THE RIGHT THING WHEN RUN LITERALLY (TE F3,
+// brick b40a9a5d): the first `--from` advice was a bare `sessions handover --brief <file>`, which
+// hands over the CALLER's own seat — run as printed, it retired the parent agent itself.
+// `test/sessions-new-first-turn.test.ts` executes the printed handover command and asserts the
+// caller's seat is untouched; keep `--session-id <from>` in it.
 function refuseFirstTurnCombinations(flags: SessionsNewFlags): void {
   const hasFirstTurn = flags.promptTextGiven === true || flags.promptFile !== undefined;
   if (!hasFirstTurn) {
@@ -2824,19 +2832,50 @@ function refuseFirstTurnCombinations(flags: SessionsNewFlags): void {
   if (flags.noPromptGiven === true) {
     throw new InvalidArgumentError("--no-prompt cannot be combined with --prompt or --prompt-file");
   }
+  const file = advisedPromptFile(flags);
   if (flags.seat !== undefined) {
     throw new InvalidArgumentError(
-      "--prompt/--prompt-file cannot be combined with --seat: a session created into a seat is " +
-        "PREPARED, not active. Run `acpx sessions activate <seat> <new>`, then " +
-        "`acpx prompt --seat <seat> --no-wait -f <file>`.",
+      `--prompt/--prompt-file cannot be combined with --seat: a session created into a seat is ` +
+        `PREPARED, not active. Create it without a first turn (\`acpx sessions new --seat ` +
+        `${flags.seat}\`), activate it (\`acpx sessions activate ${flags.seat} <new session id>\`), ` +
+        `then \`acpx prompt --seat ${flags.seat} --no-wait -f ${file}\`.`,
     );
   }
   if (flags.from !== undefined) {
+    const from = parseSessionIdFromUrl(flags.from) ?? flags.from;
     throw new InvalidArgumentError(
-      "--prompt/--prompt-file cannot be combined with --from: `acpx sessions handover --brief " +
-        "<file>` creates, activates and prompts a successor in one command.",
+      `--prompt/--prompt-file cannot be combined with --from. To hand ${from}'s seat to a ` +
+        `successor: \`acpx sessions handover --session-id ${from} --brief ${file}\` — the ` +
+        `successor is sent a standard prompt POINTING AT the brief, not the brief itself as its ` +
+        `first turn. By hand: \`acpx sessions new --from ${from}\`, then \`acpx sessions ` +
+        `activate <seat> <new session id>\`, then \`acpx prompt --seat <seat> --no-wait -f ${file}\`.`,
     );
   }
+}
+
+// The brief as the advice should name it: the resolved absolute path of `--prompt-file`, else a
+// placeholder for an inline `--prompt` (which has no file to point at).
+function advisedPromptFile(flags: SessionsNewFlags): string {
+  if (flags.promptFile === undefined || flags.promptFile === "-") {
+    return "<file>";
+  }
+  return path.resolve(process.cwd(), flags.promptFile);
+}
+
+/** F1 — `--favorite` with an explicit `--seat` is refused as USAGE here, before any read. The
+ *  `--from`-into-its-seat case needs the old record and is refused in `createSessionFromNewFlags`. */
+function refuseFavoriteOnSeatFlag(flags: SessionsNewFlags): void {
+  if (flags.favorite === true && flags.seat !== undefined) {
+    throw new InvalidArgumentError(favoriteOnJoinMessage(flags.seat));
+  }
+}
+
+function favoriteOnJoinMessage(seatId: string): string {
+  return (
+    `--favorite cannot be combined with joining seat ${seatId} (--seat, or --from into the old ` +
+    `session's seat): it stars a seat only when \`sessions new\` creates one. Star an existing ` +
+    `seat with \`acpx seats favorite ${seatId} --on\`.`
+  );
 }
 
 /** The first-turn half of `sessions new`'s flags, in the shape `resolveHandoffPrompt` reads. */
@@ -2858,13 +2897,18 @@ function firstTurnFlags(flags: SessionsNewFlags): { prompt?: string; promptFile?
  */
 async function queueFirstTurn(
   created: SessionRecord,
-  prompt: PromptInput,
+  firstTurn: HandoffPrompt,
   kind: MessageLedgerKind,
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<FirstTurnOutcome> {
   try {
-    await deliverHandoffPrompt(created, prompt, kind, command, config);
+    await deliverHandoffPrompt(created, firstTurn.prompt, kind, command, config);
+    if (resolveGlobalFlags(command, config).format === "text") {
+      // Names the file actually sent (TE F2): the line a caller reads to catch a wrong brief.
+      const from = firstTurn.source ? ` (from ${firstTurn.source})` : "";
+      process.stderr.write(`[acpx] first turn queued${from}\n`);
+    }
     return { promptQueued: true };
   } catch (error) {
     const normalized = normalizeOutputError(error, { origin: "cli" });
@@ -2895,7 +2939,7 @@ async function queueFirstTurn(
 async function handleSessionsNewFromTemplate(
   explicitAgentName: string | undefined,
   flags: SessionsNewFlags,
-  firstTurn: PromptInput | undefined,
+  firstTurn: HandoffPrompt | undefined,
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
@@ -2962,7 +3006,7 @@ async function queueTemplateFirstTurn(
     source: SessionRecord;
     fromTemplate: string;
     flags: SessionsNewFlags;
-    firstTurn: PromptInput | undefined;
+    firstTurn: HandoffPrompt | undefined;
   },
   command: Command,
   config: ResolvedAcpxConfig,
@@ -2999,10 +3043,7 @@ export async function handleSessionsNew(
   refuseNewSessionFlagCombinations(flags);
   // Brick b40a9a5d decision 1 — the first turn is read and validated HERE, before anything
   // is created: a missing, unreadable or empty prompt leaves no record and no seat behind.
-  const firstTurn = await resolveHandoffPrompt(
-    firstTurnFlags(flags),
-    resolveGlobalFlags(command, config).cwd,
-  );
+  const firstTurn = await resolveHandoffPrompt(firstTurnFlags(flags));
   // `sessions new --from-template <id>` instantiates a working session from a
   // saved template. It is a copy whose source must be a template; the copy
   // inherits the template's agent type + context and is itself a normal open
@@ -3054,6 +3095,10 @@ async function createSessionFromNewFlags(
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   // Brick 06b01b6b — an unknown `--from` refuses here, before anything is created.
   const { from, parent, inherit } = await resolveNewSessionLineage(flags);
+  const joining = seatToJoin(flags, from);
+  if (flags.favorite === true && joining !== undefined) {
+    throw new InvalidArgumentError(favoriteOnJoinMessage(joining));
+  }
   const { value: resolvedBrick, validated: resolvedBrickValidated } = await resolveBrickFlagValue(
     flags.brick,
   );
@@ -3134,7 +3179,7 @@ export async function handleSessionsCopy(
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
-  const handoffPrompt = await resolveHandoffPrompt(flags, resolveGlobalFlags(command, config).cwd);
+  const handoffPrompt = (await resolveHandoffPrompt(flags))?.prompt;
   const { created, source } = await runSessionCopy(
     explicitAgentName,
     flags,
@@ -3171,15 +3216,26 @@ export async function handleSessionsCopy(
   await deliverHandoffPrompt(created, textPrompt(deliverText), "fork-notice", command, config);
 }
 
+/** A validated first turn, and where it was read from (`--prompt-file`'s resolved path,
+ *  `"stdin"`, or absent for an inline `--prompt`). */
+type HandoffPrompt = { prompt: PromptInput; source?: string };
+
 /**
  * `--prompt <text>` / `--prompt-file <path>` (`-` = stdin), read and validated BEFORE the
  * caller creates anything — so every refusal here leaves no session behind. Shared by
  * `sessions copy` and `sessions new` (brick b40a9a5d), which must refuse identically.
+ *
+ * 🛑 A RELATIVE `--prompt-file` RESOLVES AGAINST THE CALLER'S WORKING DIRECTORY, NOT `--cwd`
+ * (HoD ruling on TE F2). On these two verbs `--cwd` is where the NEW session lives, and the
+ * canonical spawn line carries `--cwd <child worktree>` while the brief sits in the parent's
+ * folder: resolving against `--cwd` silently sent a same-named file from the child's tree as
+ * its first turn, rc 0. `acpx prompt -f` keeps `--cwd`, where it selects an existing session.
+ * Test: "a relative --prompt-file resolves against the caller's directory, not --cwd".
  */
-async function resolveHandoffPrompt(
-  flags: { prompt?: string; promptFile?: string },
-  cwd: string,
-): Promise<PromptInput | undefined> {
+async function resolveHandoffPrompt(flags: {
+  prompt?: string;
+  promptFile?: string;
+}): Promise<HandoffPrompt | undefined> {
   const hasPrompt = typeof flags.prompt === "string";
   const hasPromptFile = typeof flags.promptFile === "string";
   if (!hasPrompt && !hasPromptFile) {
@@ -3189,25 +3245,25 @@ async function resolveHandoffPrompt(
     throw new InvalidArgumentError("Use only one of --prompt or --prompt-file");
   }
   if (hasPrompt) {
-    return await readPrompt([flags.prompt as string], undefined, cwd);
+    // Here, not in a commander argParser: an argParser refusal exits 1 with a help dump and
+    // no JSON error (TE F1). And a blank text must never fall through to reading stdin.
+    if ((flags.prompt as string).trim().length === 0) {
+      throw new InvalidArgumentError("--prompt must not be empty");
+    }
+    return { prompt: await readPrompt([flags.prompt as string], undefined, process.cwd()) };
   }
-  return await readPromptFileOrRefuse(flags.promptFile as string, cwd);
+  return await readPromptFileOrRefuse(flags.promptFile as string);
 }
 
-// The file read names `--prompt-file` and the path in every refusal: `readPrompt`'s own
-// messages say `--file` (the `prompt` verb's flag) and pass a raw ENOENT/EISDIR through.
-async function readPromptFileOrRefuse(file: string, cwd: string): Promise<PromptInput> {
-  const label = `--prompt-file ${JSON.stringify(file)}`;
-  let source: string;
-  try {
-    source =
-      file === "-"
-        ? await readPromptInputFromStdin()
-        : await fs.readFile(path.resolve(cwd, file), "utf8");
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code ?? String(error);
-    throw new InvalidArgumentError(`${label} cannot be read (${code})`);
+// The file read names `--prompt-file` and the RESOLVED path in every refusal, so a caller sees
+// where it looked: `readPrompt`'s own messages say `--file` and pass a raw ENOENT through.
+async function readPromptFileOrRefuse(file: string): Promise<HandoffPrompt> {
+  if (file.trim().length === 0) {
+    throw new InvalidArgumentError("--prompt-file must not be empty");
   }
+  const resolved = file === "-" ? "stdin" : path.resolve(process.cwd(), file);
+  const label = `--prompt-file ${file === "-" ? "- (stdin)" : JSON.stringify(resolved)}`;
+  const source = await readPromptFileSource(file, resolved, label);
   let prompt: PromptInput;
   try {
     prompt = mergePromptSourceWithText(source, "");
@@ -3220,7 +3276,20 @@ async function readPromptFileOrRefuse(file: string, cwd: string): Promise<Prompt
   if (prompt.length === 0) {
     throw new InvalidArgumentError(`${label} is empty`);
   }
-  return prompt;
+  return { prompt, source: resolved };
+}
+
+async function readPromptFileSource(
+  file: string,
+  resolved: string,
+  label: string,
+): Promise<string> {
+  try {
+    return file === "-" ? await readPromptInputFromStdin() : await fs.readFile(resolved, "utf8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? String(error);
+    throw new InvalidArgumentError(`${label} cannot be read (${code})`);
+  }
 }
 
 // The ledger's `to` for a session this command just created and prompts directly.

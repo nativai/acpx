@@ -11,6 +11,8 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -37,11 +39,18 @@ const IDENTITY_KEYS = [
   "ACPX_BRICK_PATH",
   "ACPX_OWNER_LOG",
   "ACPX_QUEUE_OWNER_ARGS",
+  // A handover delivers its notice through acpx-ui: never let a row reach this box's real one.
+  "ACPX_UI_INTERNAL_URL",
 ] as const;
 
 type CliResult = { code: number | null; stdout: string; stderr: string };
 
-function runCli(args: string[], env: NodeJS.ProcessEnv, stdin = ""): Promise<CliResult> {
+function runCli(
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  stdin = "",
+  callerCwd?: string,
+): Promise<CliResult> {
   return new Promise((resolve) => {
     const childEnv: NodeJS.ProcessEnv = { ...process.env, ACPX_UI_BASE_URL: UI_BASE };
     delete childEnv.ACPX_STATE_HOME;
@@ -51,6 +60,8 @@ function runCli(args: string[], env: NodeJS.ProcessEnv, stdin = ""): Promise<Cli
     Object.assign(childEnv, env);
     const child = spawn(process.execPath, [CLI_PATH, ...args], {
       env: childEnv,
+      // The CALLER's working directory — distinct from the `--cwd` a row passes (TE F2).
+      ...(callerCwd ? { cwd: callerCwd } : {}),
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -69,7 +80,12 @@ type Rig = {
   cwd: string;
   /** Global flags naming the mock agent explicitly. */
   base: string[];
-  cli: (args: string[], env?: NodeJS.ProcessEnv, stdin?: string) => Promise<CliResult>;
+  cli: (
+    args: string[],
+    env?: NodeJS.ProcessEnv,
+    stdin?: string,
+    callerCwd?: string,
+  ) => Promise<CliResult>;
   /** `sessions new` + extra flags, asserted rc 0; returns the parsed JSON result line. */
   create: (extra?: string[], env?: NodeJS.ProcessEnv) => Promise<Record<string, unknown>>;
   onDisk: (id: string) => Promise<Record<string, unknown>>;
@@ -92,8 +108,8 @@ async function withRig(run: (rig: Rig) => Promise<void>): Promise<void> {
     await Promise.all([home, stateHome, cwd].map((dir) => fs.mkdir(dir, { recursive: true })));
     const sessionsDir = path.join(stateHome, ".acpx", "sessions");
     const base = ["--cwd", cwd, "--agent", MOCK_AGENT_COMMAND, "--approve-all"];
-    const cli = (args: string[], env: NodeJS.ProcessEnv = {}, stdin = "") =>
-      runCli(args, { HOME: home, ACPX_STATE_HOME: stateHome, ...env }, stdin);
+    const cli = (args: string[], env: NodeJS.ProcessEnv = {}, stdin = "", callerCwd?: string) =>
+      runCli(args, { HOME: home, ACPX_STATE_HOME: stateHome, ...env }, stdin, callerCwd);
     const readJson = async (file: string) =>
       JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
     const onDisk = async (id: string) => await readJson(path.join(sessionsDir, `${id}.json`));
@@ -294,18 +310,25 @@ test("new refuses every invalid first-turn / parent combination before creating 
       { flags: ["--prompt-file", rig.cwd], error: /cannot be read \(EISDIR\)/ },
       { flags: ["--prompt-file", empty], error: /--prompt-file ".*" is empty/ },
       { flags: ["--prompt-file", blank], error: /--prompt-file ".*" is empty/ },
-      { flags: ["--prompt", ""], error: /Prompt must not be empty/ },
-      { flags: ["--prompt", "   "], error: /Prompt must not be empty/ },
+      { flags: ["--prompt", ""], error: /--prompt must not be empty/ },
+      { flags: ["--prompt", "   "], error: /--prompt must not be empty/ },
+      { flags: ["--prompt-file", ""], error: /--prompt-file must not be empty/ },
       { flags: ["--prompt", "echo a", "--no-prompt"], error: /--no-prompt cannot be combined/ },
       { flags: ["--no-prompt", "--prompt", "echo a"], error: /--no-prompt cannot be combined/ },
       { flags: ["--no-prompt", "--prompt-file", good], error: /--no-prompt cannot be combined/ },
       {
         flags: ["--prompt", "echo a", "--seat", existingSeat],
-        error: /cannot be combined with --seat: .*sessions activate/,
+        error: new RegExp(
+          `cannot be combined with --seat: .*acpx sessions new --seat ${existingSeat}.*` +
+            `acpx sessions activate ${existingSeat} .*acpx prompt --seat ${existingSeat}`,
+        ),
       },
       {
         flags: ["--prompt-file", good, "--from", existingId],
-        error: /cannot be combined with --from: .*sessions handover --brief/,
+        error: new RegExp(
+          `cannot be combined with --from\\. .*acpx sessions handover --session-id ${existingId} ` +
+            `--brief ${good.replaceAll("/", "\\/")}.*POINTING AT the brief`,
+        ),
       },
       {
         flags: ["--no-parent", "--parent-id", existingId],
@@ -317,13 +340,22 @@ test("new refuses every invalid first-turn / parent combination before creating 
         error: /--no-parent cannot be combined/,
       },
       { flags: ["--favorite", "--seat", existingSeat], error: /--favorite cannot be combined/ },
+      // `existing` is its seat's active holder, so `--from` joins that seat.
+      { flags: ["--favorite", "--from", existingId], error: /--favorite cannot be combined/ },
     ];
     for (const { flags, error } of cases) {
       const before = await rig.census();
-      const result = await rig.cli([...rig.base, "sessions", "new", ...flags]);
-      assert.notEqual(result.code, 0, `${flags.join(" ")} must be refused`);
-      assert.match(`${result.stderr}${result.stdout}`, error, flags.join(" "));
-      assert.deepEqual(await rig.census(), before, `${flags.join(" ")} created something`);
+      const result = await rig.cli([...rig.base, "--format", "json", "sessions", "new", ...flags]);
+      const label = flags.join(" ");
+      // TE F1: every refusal this brick adds is a USAGE refusal — exit 2 and, under
+      // --format json, ONE JSON-RPC error line carrying acpxCode "USAGE" (no help dump).
+      assert.equal(result.code, 2, `${label}: ${result.stdout}${result.stderr}`);
+      const line = JSON.parse(result.stdout.trim()) as {
+        error?: { message?: unknown; data?: { acpxCode?: unknown } };
+      };
+      assert.equal(line.error?.data?.acpxCode, "USAGE", label);
+      assert.match(String(line.error?.message), error, label);
+      assert.deepEqual(await rig.census(), before, `${label} created something`);
     }
   });
 });
@@ -810,5 +842,104 @@ test("new --from-template --parent-seat records that seat's holder as parent, no
     );
     assert.equal(child.parent_session_id, seatParent.acpxRecordId);
     assert.equal(child.parent_seat_id, seatParent.seatId);
+  });
+});
+
+// ─── TE F2: a relative --prompt-file is the CALLER's, never the one in the child's --cwd ─────
+
+test("new: a relative --prompt-file resolves against the caller's directory, not --cwd — and every message names the resolved path", async () => {
+  await withRig(async (rig) => {
+    const callerDir = path.join(rig.stateHome, "caller");
+    await fs.mkdir(callerDir, { recursive: true });
+    // A same-named file in BOTH places: the trap is a silent send of the wrong one.
+    await fs.writeFile(path.join(callerDir, "brief.md"), "echo from-caller-dir-4e\n", "utf8");
+    await fs.writeFile(path.join(rig.cwd, "brief.md"), "echo from-cwd-flag-4e\n", "utf8");
+
+    const result = await rig.cli(
+      [...rig.base, "--ttl", "1", "sessions", "new", "--prompt-file", "brief.md"],
+      {},
+      "",
+      callerDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const id = result.stdout.trim().split("\n")[0];
+    const sent = path.join(callerDir, "brief.md");
+    assert.ok(
+      result.stderr.includes(`[acpx] first turn queued (from ${sent})`),
+      `the text line names the file actually sent: ${result.stderr}`,
+    );
+    const previews = await waitForPreview(rig, id, "from-caller-dir-4e");
+    assert.equal(previews.includes("from-cwd-flag-4e"), false, JSON.stringify(previews));
+
+    const missing = await rig.cli(
+      [...rig.base, "sessions", "new", "--prompt-file", "only-in-cwd.md"],
+      {},
+      "",
+      callerDir,
+    );
+    assert.equal(missing.code, 2, missing.stderr);
+    assert.ok(
+      missing.stderr.includes(
+        `"${path.join(callerDir, "only-in-cwd.md")}" cannot be read (ENOENT)`,
+      ),
+      missing.stderr,
+    );
+  });
+});
+
+// ─── TE F3: the --from refusal's advice, run LITERALLY, hands over THAT session's seat ──────
+
+async function withAcpxUiStandIn(run: (origin: string) => Promise<void>): Promise<void> {
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(202, { "content-type": "application/json" });
+      res.end(JSON.stringify({ delivery_id: "delivery-1", status: "queued" }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  try {
+    await run(`http://127.0.0.1:${port}`);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
+test("new --from X --prompt-file: the advised handover command, run as printed by a DIFFERENT caller, hands over X's seat and leaves the caller's alone", async () => {
+  await withAcpxUiStandIn(async (origin) => {
+    await withRig(async (rig) => {
+      const callerResult = await rig.create();
+      const caller = String(callerResult.acpxRecordId);
+      const callerSeat = String(callerResult.seatId);
+      const targetResult = await rig.create();
+      const target = String(targetResult.acpxRecordId);
+      const targetSeat = String(targetResult.seatId);
+      const brief = await writePromptFile(rig.stateHome, "the handover brief\n");
+      const env = { ...(await rig.agentEnv(caller)), ACPX_UI_INTERNAL_URL: origin };
+
+      const refused = await rig.cli(
+        [...rig.base, "sessions", "new", "--from", target, "--prompt-file", brief],
+        env,
+      );
+      assert.equal(refused.code, 2, refused.stderr);
+      const advised = /`acpx (sessions handover [^`]+)`/.exec(refused.stderr)?.[1];
+      assert.ok(advised, `no handover command in: ${refused.stderr}`);
+
+      // Literally as printed — no flags added.
+      const ran = await rig.cli([...advised.split(" "), "--format", "json"], env);
+      assert.equal(ran.code, 0, `${advised}: ${ran.stdout}${ran.stderr}`);
+      const result = JSON.parse(ran.stdout.trim()) as {
+        predecessorId?: unknown;
+        successorId?: unknown;
+      };
+      assert.equal(result.predecessorId, target);
+      assert.equal((await rig.seatRow(targetSeat)).active_holder_id, result.successorId);
+      assert.equal(
+        (await rig.seatRow(callerSeat)).active_holder_id,
+        caller,
+        "the caller's seat moved",
+      );
+    });
   });
 });
