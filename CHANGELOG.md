@@ -124,8 +124,37 @@ Repo: https://github.com/openclaw/acpx
   `--message-id` are recorded. A ledger write failure prints one
   `acpx: message ledger not written: …` line on stderr and changes nothing
   else. (brick c6bab3aa)
+- CLI: `sessions new --prompt <text>` and the new `--prompt-file <path>`
+  (`-` = stdin) create the session AND enqueue its first turn in one call,
+  non-blocking, through the same delivery `prompt --no-wait` uses. The prompt
+  is validated before anything is created; the JSON result adds
+  `promptQueued` (absent when no first turn was asked for). A session created
+  whose first turn could not be enqueued is kept, the exit is non-zero, and
+  the result carries `promptQueued: false` + `promptError`. **Behaviour
+  change:** `--prompt` without `--from-template` used to be silently ignored;
+  it now enqueues a real first turn, and an empty `--prompt ""` is refused
+  instead of acting as "no auto-prompt". With `--from-template` both flags
+  replace the stored auto-prompt, as `--prompt` always did, now with a stderr
+  note. Refused with `--seat`, `--from` and `--no-prompt`. (brick b40a9a5d)
+- CLI: `sessions new --no-parent` creates a top-level session — no parent
+  session or parent seat is recorded even when `ACPX_SESSION_URL` names a
+  caller — while agent, model, effort, credentials and brick still inherit
+  from the caller. `sessions new --favorite` creates the seat starred.
+  `sessions set-parent --session-id <id> --no-parent` clears a session's
+  parent. (brick b40a9a5d)
+- CLI: `--prompt-file` refusals on `sessions new` and `sessions copy` name the
+  flag and the RESOLVED absolute path (`cannot be read (ENOENT)`, `is empty`)
+  instead of `--file` or a raw filesystem error; text output says
+  `[acpx] first turn queued (from <path>)`. (brick b40a9a5d)
 
 ### Breaking
+
+- CLI: a relative `--prompt-file` on `sessions new` and `sessions copy`
+  resolves against the directory acpx is run in, no longer against `--cwd`.
+  On these verbs `--cwd` is where the NEW session lives, so a same-named file
+  in that directory could be sent instead of the caller's brief. Pass an
+  absolute path to be explicit. `acpx prompt -f` is unchanged. (brick
+  b40a9a5d)
 
 - CLI: remove the agent-facing `acpx usage` and `acpx sessions tree` commands;
   agents should use the deployed acpx wisdom usage and session-tree scripts.
@@ -141,6 +170,12 @@ Repo: https://github.com/openclaw/acpx
 - CLI/sessions: keep Claude effort application from failing child-session
   creation when an adapter advertises stale effort options, including explicit
   `--reasoning-effort xhigh|max` requests.
+- CLI: `sessions new --from <id>` no longer makes the new session the
+  CALLER's child when the old session has no parent and no seat: the
+  `ACPX_SESSION_URL` fallback was closed only for a succession. `--from`
+  now takes its parent from the old session or an explicit flag only.
+  `sessions new --from-template` also honours `--parent-seat`, which it
+  silently dropped. (brick b40a9a5d)
 
 ## 2026.5.23 (v0.10.0)
 

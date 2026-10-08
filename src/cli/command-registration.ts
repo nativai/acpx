@@ -352,7 +352,7 @@ export function registerSessionsCommand(
       await handleSessionsTemplate(explicitAgentName, id, flags, this, config);
     });
 
-  sessionsCommand
+  const newCommand = sessionsCommand
     .command("new")
     .option(
       "--record-id <uuid>",
@@ -381,6 +381,15 @@ export function registerSessionsCommand(
       "--parent-id <uuid>",
       "Record the spawning session's acpxRecordId as parent_session_id (falls back to ACPX_SESSION_URL env). Use --parent-session-url for the URL form.",
       (value: string) => parseNonEmptyValue("Parent session id", value),
+    )
+    // Brick b40a9a5d — commander's `--no-*` idiom, as `--no-brick` beside it.
+    .option(
+      "--no-parent",
+      "Create a TOP-LEVEL session: record no parent session and no parent seat, so the session's agent gets no ACPX_PARENT_SESSION_URL / ACPX_PARENT_SEAT_URL. Only the edge is dropped — agent type, model, effort, credentials and brick are still inherited from the calling session as without the flag. Refused with --parent-seat, --parent-session-url or --parent-id.",
+    )
+    .option(
+      "--favorite",
+      "Star the new session's SEAT, as `acpx seats favorite <seat> --on` would. Refused when the session joins an existing seat (--seat, or --from into the old session's seat): star that seat with `seats favorite`.",
     )
     // D11 (brick b64dfbb3) — CREATE INTO AN EXISTING SEAT. Registered on `new` ONLY,
     // and deliberately NOT on `copy`: a fork or copy always mints a fresh seat, so an
@@ -428,18 +437,32 @@ export function registerSessionsCommand(
         "Combine with --cwd to place it elsewhere and -s to name its seat.",
       (value: string) => parseNonEmptyValue("Template id", value),
     )
+    // Brick b40a9a5d — create AND enqueue the first turn in one call, through the same
+    // delivery `acpx prompt --no-wait` uses. Validated before anything is created.
     .option(
       "--prompt <text>",
-      "With --from-template: override the template's stored auto-prompt with this text " +
-        "(auto-fired into the new session). Ignored without --from-template.",
+      "Enqueue this text as the new session's first turn right after creation (non-blocking: " +
+        "returns once it is queued). With --from-template it REPLACES the template's stored " +
+        "auto-prompt (which is then not sent). Refused with --seat, --from and --no-prompt.",
+    )
+    .option(
+      "--prompt-file <path>",
+      "As --prompt, reading the first turn from a file (use - for stdin): with --from-template " +
+        "it likewise REPLACES the template's stored auto-prompt. A relative path resolves " +
+        "against the directory you run acpx in, NOT --cwd (which is where the new session " +
+        "lives). A missing, unreadable or empty file is refused and nothing is created.",
     )
     .option(
       "--no-prompt",
       "With --from-template: do not auto-fire the template's stored auto-prompt (create a pure copy).",
-    )
-    .action(async function (this: Command, flags: SessionsNewFlags) {
-      await handleSessionsNew(explicitAgentName, flags, this, config);
-    });
+    );
+  // `--prompt <text>` and `--no-prompt` share commander's ONE `prompt` key and the last one
+  // wins, so "both given" cannot be read off the parsed flags; these record each occurrence.
+  newCommand.on("option:prompt", () => newCommand.setOptionValue("promptTextGiven", true));
+  newCommand.on("option:no-prompt", () => newCommand.setOptionValue("noPromptGiven", true));
+  newCommand.action(async function (this: Command, flags: SessionsNewFlags) {
+    await handleSessionsNew(explicitAgentName, flags, this, config);
+  });
 
   const closeCommand = sessionsCommand
     .command("close")
@@ -520,7 +543,8 @@ export function registerSessionsCommand(
     )
     .option(
       "--prompt-file <path>",
-      "Read prompt handoff from file path (use - for stdin) and enqueue it after creation (non-blocking)",
+      "Read prompt handoff from file path (use - for stdin) and enqueue it after creation " +
+        "(non-blocking). A relative path resolves against the directory you run acpx in, not --cwd",
       (value: string) => parseNonEmptyValue("Prompt file", value),
     )
     .action(async function (this: Command, flags: SessionsCopyFlags) {
@@ -614,7 +638,7 @@ export function registerSessionsCommand(
   sessionsCommand
     .command("set-parent")
     .description(
-      "Change which session is recorded as a session's parent — one session via --session-id, or EVERY open direct child of a session via --children-of (the agent-handover form). Moves the session graph only.",
+      "Change which session is recorded as a session's parent — one session via --session-id, or EVERY open direct child of a session via --children-of (the agent-handover form) — or clear one session's parent with --no-parent. Moves the session graph only.",
     )
     // ⚠️ NONE of the four id/url options gets `parseNonEmptyValue`, and that is
     // deliberate: an EMPTY value must reach the handler so it can refuse BY NAME
@@ -637,6 +661,10 @@ export function registerSessionsCommand(
     .option(
       "--parent-session-url <url>",
       "The new parent, by full acpx-ui URL (?session=<id> — the form that also accepts a parent on ANOTHER box — or ?seat=<id>, as --parent-seat)",
+    )
+    .option(
+      "--no-parent",
+      "CLEAR the parent of the ONE session named by --session-id: it becomes top-level (its parent session, parent seat and parent URL are removed from the record and the index). Refused with --children-of and with any --parent-* flag.",
     )
     .option("--dry-run", "Preview the move and write nothing")
     .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
@@ -667,8 +695,15 @@ WARNING: GIVING A PARENT TO A SESSION THAT HAD NONE STRIPS ITS USER-FACING FACET
   so a previously top-level session that acquires a parent loses its ability to hand
   work to Daniel when its owner next respawns. Reported in \`warnings\` at runtime too.
 
+CLEARING A PARENT (--no-parent) MAKES THE SESSION TOP-LEVEL.
+  Its user-facing facet comes back when its owner next respawns (the running process
+  keeps the old ACPX_PARENT_SESSION_URL until then). A session that was FORKED keeps
+  its fork source, and acpx-ui's board and relations views place a fork with no parent
+  under that source — the session list shows it top-level. Reported in \`warnings\`.
+
 OTHER THINGS WORTH KNOWING.
-  - Clearing a parent is not supported and refuses by name (PARENT_DETACH_UNSUPPORTED).
+  - An EMPTY parent flag (\`--parent-id ''\`) is not a clear and refuses by name
+    (PARENT_DETACH_UNSUPPORTED); --no-parent is the clear.
   - A cross-box parent (given by --parent-session-url and absent locally) is NOT
     cycle-checked: the remote graph is unwalkable from here.
   - --children-of is N separate writes, not a transaction. A crash midway leaves some

@@ -7332,7 +7332,9 @@ test("sessions fork --prompt-file queues prompt handoff from a file", async () =
         "--from",
         "source-file-handoff",
         "--prompt-file",
-        "handoff.txt",
+        // Absolute: a relative --prompt-file resolves against the CALLER's directory, not
+        // --cwd (brick b40a9a5d, TE F2), and this child runs in the repo root.
+        path.join(cwd, "handoff.txt"),
       ],
       homeDir,
     );
