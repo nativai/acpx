@@ -893,24 +893,30 @@ async function resolveNewSessionLineage(flags: SessionsNewFlags): Promise<{
   inherit: ResolvedParentSession | undefined;
 }> {
   const from = flags.from === undefined ? undefined : await resolveFromSessionRecord(flags.from);
-  const parent = await resolveParentForNew(flags, from);
-  return { from, parent, inherit: from ? await parentInheritableFields(from) : parent };
+  const caller = await resolveParentForNew(flags, from);
+  // `--no-parent` (brick b40a9a5d, HoD ruling R1) drops ONLY the recorded edge — the parent
+  // session and the parent SEAT. What the session inherits (agent type, model, effort,
+  // credentials, brick) still resolves from the caller exactly as without the flag: a bare
+  // `sessions new --no-parent` from a claude session is a claude child at the caller's model.
+  const parent = flags.parent === false ? undefined : caller;
+  return { from, parent, inherit: from ? await parentInheritableFields(from) : caller };
 }
 
 // Brick 28964dd8 — a successor (`--from` into the old session's own seat) is never the old
 // session's child: with no parent flag its parent is the old session's own parent, or NONE for
 // a top-level holder. The ACPX_SESSION_URL fallback is the CALLER — under the handover, the
 // predecessor itself — so it is closed here, or a top-level successor loses its user-facing facet.
+//
+// ⚠️ CLOSED FOR EVERY `--from`, NOT ONLY A SUCCESSION (brick b40a9a5d, HoD ruling R4). Gating it
+// on `isSuccession` left it open for an old session that holds NO seat (a legacy record): that
+// `--from` mints a fresh seat, so it is not a succession, and a PARENTLESS old session then
+// produced the caller's child — measured, rc 0, the caller recorded as parent and parent seat.
+// `--from` says the old session's parent is the default; "none" is a value, not a gap to fill.
 async function resolveParentForNew(
   flags: SessionsNewFlags,
   from: SessionRecord | undefined,
 ): Promise<ResolvedParentSession | undefined> {
-  // `--no-parent` (brick b40a9a5d): a top-level session — no flag, no env fallback, and not
-  // the parent `--from` would otherwise derive. Nothing is inherited from a parent either.
-  if (flags.parent === false) {
-    return undefined;
-  }
-  const flagsOnly = { allowEnvFallback: !isSuccession(flags, from) };
+  const flagsOnly = { allowEnvFallback: from === undefined };
   const derived = fromParentFlags(flags, from);
   if (!derived) {
     return await resolveAndValidateParentSessionId(flags, flagsOnly);
@@ -2911,37 +2917,76 @@ async function handleSessionsNewFromTemplate(
   }
   const { created, source } = await runSessionCopy(
     explicitAgentName,
-    {
-      from: resolvedSource.acpxRecordId,
-      recordId: flags.recordId,
-      name: flags.name,
-      // Mark this child as a template-spawn (vs a plain fork): a normal
-      // `sessions copy`/`fork` writes the same parent_session_id +
-      // forked_from_session_id, so the board needs an explicit discriminator
-      // to place it under its creator with a "from template" provenance badge.
-      // Only the --from-template path sets it; plain copy/fork never does.
-      // template_source = the RESOLVED immutable id (not the raw arg) so a child
-      // spawned by slug records the concrete version it actually came from.
-      metadata: { ...flags.metadata, template_source: resolvedSource.acpxRecordId },
-      brick: flags.brick,
-      parentId: flags.parentId,
-      parentSessionUrl: flags.parentSessionUrl,
-      parentSeat: flags.parentSeat,
-      noParent: flags.parent === false,
-      favorite: flags.favorite,
-    },
+    templateCopyFlags(flags, resolvedSource.acpxRecordId),
     command,
     config,
     true,
   );
-  const prompt = resolveTemplateFirstTurn(flags, firstTurn, source);
-  // A `spawn_key` reservation (acpx-ui's spawn path) fires its own prompt once published.
-  const outcome =
-    prompt && created.metadata?.spawn_state !== "pending"
-      ? await queueFirstTurn(created, prompt, "template-prompt", command, config)
-      : undefined;
+  const outcome = await queueTemplateFirstTurn(
+    { created, source, fromTemplate, flags, firstTurn },
+    command,
+    config,
+  );
   const { printCopiedSessionByFormat } = await loadOutputRenderModule();
   printCopiedSessionByFormat(created, source, globalFlags.format, outcome);
+}
+
+function templateCopyFlags(flags: SessionsNewFlags, templateId: string): SessionsCopyFlags {
+  return {
+    from: templateId,
+    recordId: flags.recordId,
+    name: flags.name,
+    // Mark this child as a template-spawn (vs a plain fork): a normal
+    // `sessions copy`/`fork` writes the same parent_session_id +
+    // forked_from_session_id, so the board needs an explicit discriminator
+    // to place it under its creator with a "from template" provenance badge.
+    // Only the --from-template path sets it; plain copy/fork never does.
+    // template_source = the RESOLVED immutable id (not the raw arg) so a child
+    // spawned by slug records the concrete version it actually came from.
+    metadata: { ...flags.metadata, template_source: templateId },
+    brick: flags.brick,
+    parentId: flags.parentId,
+    parentSessionUrl: flags.parentSessionUrl,
+    parentSeat: flags.parentSeat,
+    noParent: flags.parent === false,
+    favorite: flags.favorite,
+  };
+}
+
+// The template spawn's first turn: the caller's (replacing the stored auto-prompt), else the
+// stored one, else none — and never for a `spawn_key` reservation, whose publisher (acpx-ui's
+// spawn path) fires its own prompt.
+async function queueTemplateFirstTurn(
+  spawn: {
+    created: SessionRecord;
+    source: SessionRecord;
+    fromTemplate: string;
+    flags: SessionsNewFlags;
+    firstTurn: PromptInput | undefined;
+  },
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<FirstTurnOutcome | undefined> {
+  const prompt = resolveTemplateFirstTurn(spawn.flags, spawn.firstTurn, spawn.source);
+  if (spawn.firstTurn && spawn.source.template?.auto_prompt?.trim()) {
+    noteTemplateAutoPromptReplaced(spawn.fromTemplate, resolveGlobalFlags(command, config));
+  }
+  if (!prompt || spawn.created.metadata?.spawn_state === "pending") {
+    return undefined;
+  }
+  return await queueFirstTurn(spawn.created, prompt, "template-prompt", command, config);
+}
+
+// HoD ruling R2 (brick b40a9a5d): replacing is the contract, but a discarded stored prompt may
+// be the template's whole role brief — say so, once, where the caller can see it.
+function noteTemplateAutoPromptReplaced(fromTemplate: string, globalFlags: GlobalFlags): void {
+  if (globalFlags.jsonStrict && globalFlags.format === "json") {
+    return;
+  }
+  process.stderr.write(
+    `[acpx] --from-template ${fromTemplate}: its stored auto-prompt was REPLACED by ` +
+      `--prompt/--prompt-file and is not sent\n`,
+  );
 }
 
 export async function handleSessionsNew(
@@ -3249,7 +3294,7 @@ async function runSessionCopy(
   // carries BOTH its spawn-parent edge (parentSessionId/Url) AND its template
   // /fork origin (forkFromSessionId) — the "both edges" write. With no parent
   // context the `?.` guards omit both fields → byte-identical to today.
-  const parent = await resolveCopyParent(flags);
+  const { caller, parent } = await resolveCopyLineage(flags);
   const { value: resolvedBrick, validated: resolvedBrickValidated } = await resolveBrickFlagValue(
     flags.brick,
   );
@@ -3269,7 +3314,7 @@ async function runSessionCopy(
     // fallback was reversed, brick://1113da9d) so it does not impersonate the source's brick.
     metadata: withInheritedBrick(
       applyBrickFlag(copyMetadata(flags, source, forkAtMessageIndex), resolvedBrick),
-      parent?.brick, // spawn-parent brick (byway via --parent-id) — KEEP
+      caller?.brick, // spawn-parent brick (byway via --parent-id) — KEEP; the CALLER's under --no-parent
       resolvedBrick === false,
     ),
     // Brick `9984c510` — this path has no `explicitBrickFlag` (it exists only
@@ -3304,11 +3349,14 @@ async function runSessionCopy(
   return { created, source };
 }
 
-// `noParent` (`sessions new --from-template --no-parent`) records none, env included.
-async function resolveCopyParent(
-  flags: SessionsCopyFlags,
-): Promise<ResolvedParentSession | undefined> {
-  return flags.noParent ? undefined : await resolveAndValidateParentSessionId(flags);
+// `noParent` (`sessions new --from-template --no-parent`, HoD ruling R1) records no parent
+// edge; the caller is still resolved, because the copy's brick inherits from it as before.
+async function resolveCopyLineage(flags: SessionsCopyFlags): Promise<{
+  caller: ResolvedParentSession | undefined;
+  parent: ResolvedParentSession | undefined;
+}> {
+  const caller = await resolveAndValidateParentSessionId(flags);
+  return { caller, parent: flags.noParent ? undefined : caller };
 }
 
 function assertTemplateSource(source: SessionRecord): void {

@@ -1518,7 +1518,7 @@ test("setSessionParent is reachable from the session module and returns the enve
     assert.equal(result.ok, true);
     assert.equal(result.moved.length, 1);
     assert.equal(result.moved[0]?.acpxRecordId, "child");
-    assert.equal(result.parent.crossBox, false);
+    assert.equal(result.parent?.crossBox, false);
     assert.equal((await readRecordJson(homeDir, "child")).parent_session_id, "b");
   });
 });

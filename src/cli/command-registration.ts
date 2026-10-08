@@ -385,7 +385,7 @@ export function registerSessionsCommand(
     // Brick b40a9a5d — commander's `--no-*` idiom, as `--no-brick` beside it.
     .option(
       "--no-parent",
-      "Create a TOP-LEVEL session: record no parent and ignore the ACPX_SESSION_URL fallback, so nothing is inherited from the calling session (agent, model, effort, profile, brick) and the session's agent gets no ACPX_PARENT_SESSION_URL / ACPX_PARENT_SEAT_URL. Refused with --parent-seat, --parent-session-url or --parent-id.",
+      "Create a TOP-LEVEL session: record no parent session and no parent seat, so the session's agent gets no ACPX_PARENT_SESSION_URL / ACPX_PARENT_SEAT_URL. Only the edge is dropped — agent type, model, effort, credentials and brick are still inherited from the calling session as without the flag. Refused with --parent-seat, --parent-session-url or --parent-id.",
     )
     .option(
       "--favorite",
@@ -442,14 +442,15 @@ export function registerSessionsCommand(
     .option(
       "--prompt <text>",
       "Enqueue this text as the new session's first turn right after creation (non-blocking: " +
-        "returns once it is queued). With --from-template it replaces the template's stored " +
-        "auto-prompt. Refused with --seat, --from and --no-prompt.",
+        "returns once it is queued). With --from-template it REPLACES the template's stored " +
+        "auto-prompt (which is then not sent). Refused with --seat, --from and --no-prompt.",
       (value: string) => parseNonEmptyValue("Prompt", value),
     )
     .option(
       "--prompt-file <path>",
-      "As --prompt, reading the first turn from a file (use - for stdin). A missing, unreadable " +
-        "or empty file is refused and nothing is created.",
+      "As --prompt, reading the first turn from a file (use - for stdin): with --from-template " +
+        "it likewise REPLACES the template's stored auto-prompt. A missing, unreadable or empty " +
+        "file is refused and nothing is created.",
       (value: string) => parseNonEmptyValue("Prompt file", value),
     )
     .option(

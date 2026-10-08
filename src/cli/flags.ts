@@ -133,7 +133,8 @@ export type SessionsNewFlags = {
    * the LAST of `--prompt`/`--no-prompt`, so "both were given" is invisible without them. */
   promptTextGiven?: boolean;
   noPromptGiven?: boolean;
-  /** `--no-parent` → `false`: a top-level session — no parent recorded, no env fallback. */
+  /** `--no-parent` → `false`: a top-level session — no parent edge (session or seat) is
+   * recorded; inheritance from the caller is unchanged (HoD ruling R1, brick b40a9a5d). */
   parent?: boolean;
   /** `--favorite`: the new SEAT is minted starred (D-STAR — the star is the seat's). */
   favorite?: boolean;
@@ -153,7 +154,7 @@ export type SessionsCopyFlags = {
   prompt?: string;
   promptFile?: string;
   /** Internal (no `copy` flag): `sessions new --from-template --no-parent` — record no
-   * parent and skip the ACPX_SESSION_URL fallback. */
+   * parent edge; the caller still supplies the inherited brick. */
   noParent?: boolean;
   /** Internal (no `copy` flag): `sessions new --from-template --favorite`. */
   favorite?: boolean;
