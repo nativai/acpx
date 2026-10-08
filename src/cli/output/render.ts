@@ -295,7 +295,21 @@ function printNewSessionSeatLines(record: SessionRecord): void {
 // the wisdom Skills scripts found no code consumer of this field (the sole
 // hit was a now-corrected doc line in Skills/acpx/SKILL.md describing the
 // deleted eviction as expected behaviour).
-export function printNewSessionByFormat(record: SessionRecord, format: OutputFormat): void {
+/**
+ * The first turn `sessions new --prompt / --prompt-file` (or a template's auto-prompt)
+ * enqueued, as the result line reports it (brick b40a9a5d). ABSENT when no first turn was
+ * asked for, so a create without one prints exactly the line it always did; `false` only
+ * ever means "asked for and NOT queued", and then the command exits non-zero.
+ */
+export type FirstTurnOutcome =
+  | { promptQueued: true }
+  | { promptQueued: false; promptError: { code: string; message: string } };
+
+export function printNewSessionByFormat(
+  record: SessionRecord,
+  format: OutputFormat,
+  firstTurn?: FirstTurnOutcome,
+): void {
   const subscriptionSelection = consumeAutoSubscriptionSelection();
   const seatUrl = resolveSeatUrl(record.seatId);
   if (
@@ -308,6 +322,7 @@ export function printNewSessionByFormat(record: SessionRecord, format: OutputFor
       sessionUrl: composeSessionUrl(record),
       ...newSessionSeatJson(record, seatUrl),
       ...(subscriptionSelection ? { subscriptionSelection } : {}),
+      ...firstTurn,
     })
   ) {
     return;
@@ -316,13 +331,49 @@ export function printNewSessionByFormat(record: SessionRecord, format: OutputFor
   process.stdout.write(`${record.acpxRecordId}\n`);
   if (format !== "quiet") {
     printNewSessionSeatLines(record);
+    printFirstTurnQueuedLine(firstTurn);
   }
+}
+
+function printFirstTurnQueuedLine(firstTurn: FirstTurnOutcome | undefined): void {
+  if (firstTurn?.promptQueued === true) {
+    process.stderr.write("[acpx] first turn queued\n");
+  }
+}
+
+/**
+ * The session exists and is promptable, but its first turn was not enqueued. Names the new
+ * seat and session — the caller has nothing else to find them by when the command failed —
+ * and the two ways forward. STDERR; the result line carries `promptQueued: false`.
+ */
+export function printFirstTurnNotQueued(
+  record: SessionRecord,
+  message: string,
+  format: OutputFormat,
+  jsonStrict = false,
+): void {
+  if (jsonStrict && format === "json") {
+    return;
+  }
+  const seatUrl = resolveSeatUrl(record.seatId);
+  const seat = seatUrl ?? record.seatId ?? "(none)";
+  const session = composeSessionUrl(record) ?? record.acpxRecordId;
+  const retryTarget = record.seatId
+    ? `--seat ${record.seatId}`
+    : `--session-id ${record.acpxRecordId}`;
+  process.stderr.write(
+    `[acpx] the session was created but its first turn was NOT queued: ${message}\n` +
+      `[acpx] it is open and can be prompted — seat: ${seat}  session: ${session}\n` +
+      `[acpx] retry: acpx prompt ${retryTarget} --no-wait -f <file>  ` +
+      `or close it: acpx sessions close --session-id ${record.acpxRecordId}\n`,
+  );
 }
 
 export function printCopiedSessionByFormat(
   record: SessionRecord,
   source: SessionRecord,
   format: OutputFormat,
+  firstTurn?: FirstTurnOutcome,
 ): void {
   const subscriptionSelection = consumeAutoSubscriptionSelection();
   if (
@@ -346,6 +397,7 @@ export function printCopiedSessionByFormat(
       // F6 — a copy/fork mints a NEW seat; its address is that seat, not the source's.
       ...newSessionSeatJson(record, resolveSeatUrl(record.seatId)),
       ...(subscriptionSelection ? { subscriptionSelection } : {}),
+      ...firstTurn,
     })
   ) {
     return;
@@ -369,6 +421,7 @@ export function printCopiedSessionByFormat(
         `so the request was snapped down to the nearest one.\n`,
     );
   }
+  printFirstTurnQueuedLine(firstTurn);
 }
 
 // brick://16712ece — `sessions reopen`. `reopened:false` is the idempotent

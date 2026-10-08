@@ -136,6 +136,12 @@ export type SessionCreateOptions = {
    * `refuseSeatJoinOnForkPath`.
    */
   seatId?: string;
+  /**
+   * `sessions new --favorite` (brick b40a9a5d): the freshly MINTED seat row is born starred —
+   * the star is the SEAT's (D-STAR), never a record field. A join mints nothing, so this is
+   * refused with `seatId` (`refuseSeatFavoriteOnJoin`) rather than ignored.
+   */
+  seatFavorite?: boolean;
   metadata?: Record<string, string>;
   /**
    * The RAW `--brick` flag (brick 3dff714d, DECISIONS.md AMENDMENT) — never

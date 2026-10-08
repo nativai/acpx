@@ -221,6 +221,23 @@ function refuseSeatNameOnJoin(options: SessionCreateOptions): void {
 }
 
 /**
+ * `--favorite` stars the seat `sessions new` MINTS (brick b40a9a5d). A join mints nothing and
+ * the seat already carries its own star, so the flag has no seat to star: REFUSED with the
+ * verb that does — the same reasoning as `-s` above, never accepted and ignored.
+ */
+function refuseSeatFavoriteOnJoin(options: SessionCreateOptions): void {
+  if (options.seatId === undefined || options.seatFavorite !== true) {
+    return;
+  }
+  throw new Error(
+    `--favorite cannot be combined with joining seat ${JSON.stringify(options.seatId)} ` +
+      `(--seat, or --from into the old session's seat): it stars a seat only when ` +
+      `\`sessions new\` creates one. Star an existing seat with ` +
+      `\`acpx seats favorite <seat> --on\`.`,
+  );
+}
+
+/**
  * The remaining `--seat` refusals, all BEFORE any write (D11).
  *
  * 🛑 **THE SEAT MUST ALREADY EXIST — JOINING NEVER MINTS ONE AS A SIDE EFFECT.** That
@@ -483,6 +500,7 @@ async function createSessionRecordWithClient(
   // that was never going to be honoured.
   refuseSeatJoinOnForkPath(options);
   refuseSeatNameOnJoin(options);
+  refuseSeatFavoriteOnJoin(options);
   const joinedSeat = await refuseUnjoinableSeat(options.seatId);
   if (joinedSeat) {
     // F2 fix (brick 3dff714d, DECISIONS.md (b) + AMENDMENT) — reconcile
@@ -846,6 +864,7 @@ async function createSessionRecordWithClient(
         options.metadata?.brick,
         options.explicitBrickFlagValidated === true,
       ),
+      favorite: options.seatFavorite === true,
     });
     if (!minted.minted) {
       // BOTH LEGS — stderr AND the session stream (the ruling's "never a silent catch"),

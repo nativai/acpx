@@ -4,6 +4,7 @@ import { Command, InvalidArgumentError } from "commander";
 import { acpAdapterKind } from "../acp/agent-command.js";
 import { resolveAcpxUiBaseUrl } from "../acp/auth-env.js";
 import { isLegacyZedCodexAcpInvocation } from "../acp/codex-compat.js";
+import { exitCodeForOutputErrorCode, normalizeOutputError } from "../acp/error-normalization.js";
 import {
   assertForkAtIndexHonoured,
   acpxRoutesDepthMechanism,
@@ -91,6 +92,7 @@ import { EXIT_CODES } from "../types.js";
 import type {
   OutputFormat,
   OutputPolicy,
+  PromptInput,
   SessionAgentContent,
   SessionRecord,
   SessionSetDepthResult,
@@ -123,7 +125,7 @@ import {
 import { type MessageLedgerKind, withMessageLedger } from "./message-ledger.js";
 import { emitJsonResult } from "./output/json-output.js";
 // Type-only, so the render module stays lazily imported at runtime.
-import type { PruneRefusal, PruneScope } from "./output/render.js";
+import type { FirstTurnOutcome, PruneRefusal, PruneScope } from "./output/render.js";
 import {
   addressedSeatIdFromSelector,
   NoSessionError,
@@ -903,6 +905,11 @@ async function resolveParentForNew(
   flags: SessionsNewFlags,
   from: SessionRecord | undefined,
 ): Promise<ResolvedParentSession | undefined> {
+  // `--no-parent` (brick b40a9a5d): a top-level session — no flag, no env fallback, and not
+  // the parent `--from` would otherwise derive. Nothing is inherited from a parent either.
+  if (flags.parent === false) {
+    return undefined;
+  }
   const flagsOnly = { allowEnvFallback: !isSuccession(flags, from) };
   const derived = fromParentFlags(flags, from);
   if (!derived) {
@@ -1131,6 +1138,7 @@ function buildSessionStartOptions(params: {
     // conflate and mean opposite things — `parentSeatId` records WHO SPAWNED ME,
     // `seatId` records WHICH SEAT I HOLD. An explicit `--seat` beats `--from`'s seat.
     seatId: seatToJoin(params.flags, params.from),
+    seatFavorite: params.flags.favorite === true,
     // F2 (brick 3dff714d) / DECISIONS.md AMENDMENT — computed exactly as
     // before for BOTH fresh-mint and join: `withInheritedBrick` still mixes in
     // the spawner's ambient `parent?.brick` here. That is deliberate, not the
@@ -2763,21 +2771,111 @@ function applyCloseExitCode(
   }
 }
 
-// Resolve the prompt to auto-fire on a `--from-template` spawn. Commander couples
-// --prompt <text> / --no-prompt onto flags.prompt:
-//   false → --no-prompt (suppress); string → explicit override;
-//   true/undefined → fall through to the template's stored auto_prompt.
-// Precedence: --prompt <text>  ▷  template.auto_prompt  ▷  nothing. A blank result
-// (absent/empty/whitespace) means no fire.
-function resolveTemplateAutoPrompt(
+// The first turn of a `--from-template` spawn. Precedence: the explicit first turn
+// (--prompt / --prompt-file, already read and validated)  ▷  --no-prompt (none)  ▷  the
+// template's stored auto_prompt  ▷  nothing. A blank stored prompt means no fire.
+function resolveTemplateFirstTurn(
   flags: SessionsNewFlags,
+  firstTurn: PromptInput | undefined,
   source: SessionRecord,
-): string | undefined {
+): PromptInput | undefined {
+  if (firstTurn) {
+    return firstTurn;
+  }
   if (flags.prompt === false) {
     return undefined;
   }
-  const resolved = typeof flags.prompt === "string" ? flags.prompt : source.template?.auto_prompt;
-  return resolved?.trim() ? resolved : undefined;
+  const stored = source.template?.auto_prompt;
+  return stored?.trim() ? textPrompt(stored) : undefined;
+}
+
+/**
+ * Brick b40a9a5d — every `sessions new` refusal the first turn or `--no-parent` adds, all
+ * decided from the flags alone, BEFORE anything is read or created.
+ */
+function refuseNewSessionFlagCombinations(flags: SessionsNewFlags): void {
+  refuseNoParentWithParentFlag(flags);
+  refuseFirstTurnCombinations(flags);
+}
+
+function refuseNoParentWithParentFlag(flags: SessionsNewFlags): void {
+  if (flags.parent !== false) {
+    return;
+  }
+  const given = givenParentFlags(flags);
+  if (given.seat || given.url || given.id) {
+    throw new InvalidArgumentError(
+      "--no-parent cannot be combined with --parent-seat, --parent-session-url or --parent-id",
+    );
+  }
+}
+
+function refuseFirstTurnCombinations(flags: SessionsNewFlags): void {
+  const hasFirstTurn = flags.promptTextGiven === true || flags.promptFile !== undefined;
+  if (!hasFirstTurn) {
+    return;
+  }
+  if (flags.noPromptGiven === true) {
+    throw new InvalidArgumentError("--no-prompt cannot be combined with --prompt or --prompt-file");
+  }
+  if (flags.seat !== undefined) {
+    throw new InvalidArgumentError(
+      "--prompt/--prompt-file cannot be combined with --seat: a session created into a seat is " +
+        "PREPARED, not active. Run `acpx sessions activate <seat> <new>`, then " +
+        "`acpx prompt --seat <seat> --no-wait -f <file>`.",
+    );
+  }
+  if (flags.from !== undefined) {
+    throw new InvalidArgumentError(
+      "--prompt/--prompt-file cannot be combined with --from: `acpx sessions handover --brief " +
+        "<file>` creates, activates and prompts a successor in one command.",
+    );
+  }
+}
+
+/** The first-turn half of `sessions new`'s flags, in the shape `resolveHandoffPrompt` reads. */
+function firstTurnFlags(flags: SessionsNewFlags): { prompt?: string; promptFile?: string } {
+  return {
+    prompt: typeof flags.prompt === "string" ? flags.prompt : undefined,
+    promptFile: flags.promptFile,
+  };
+}
+
+/**
+ * Enqueue a just-created session's first turn and report the outcome instead of throwing.
+ *
+ * The session is real and promptable whatever happens here, so a failed enqueue does NOT
+ * close it — `sessions copy` leaves its copy in place on the same failure (measured, brick
+ * b40a9a5d). It exits with the code the failure would have exited with, names the new seat
+ * and session on stderr, and lets the caller print ONE result line carrying
+ * `promptQueued: false` (copy prints the created line and then a second, error line).
+ */
+async function queueFirstTurn(
+  created: SessionRecord,
+  prompt: PromptInput,
+  kind: MessageLedgerKind,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<FirstTurnOutcome> {
+  try {
+    await deliverHandoffPrompt(created, prompt, kind, command, config);
+    return { promptQueued: true };
+  } catch (error) {
+    const normalized = normalizeOutputError(error, { origin: "cli" });
+    const globalFlags = resolveGlobalFlags(command, config);
+    const { printFirstTurnNotQueued } = await loadOutputRenderModule();
+    printFirstTurnNotQueued(
+      created,
+      normalized.message,
+      globalFlags.format,
+      globalFlags.jsonStrict,
+    );
+    process.exitCode = exitCodeForOutputErrorCode(normalized.code);
+    return {
+      promptQueued: false,
+      promptError: { code: normalized.code, message: normalized.message },
+    };
+  }
 }
 
 // `sessions new --from-template <id>` instantiates a working session from a saved
@@ -2791,6 +2889,7 @@ function resolveTemplateAutoPrompt(
 async function handleSessionsNewFromTemplate(
   explicitAgentName: string | undefined,
   flags: SessionsNewFlags,
+  firstTurn: PromptInput | undefined,
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
@@ -2827,40 +2926,22 @@ async function handleSessionsNewFromTemplate(
       brick: flags.brick,
       parentId: flags.parentId,
       parentSessionUrl: flags.parentSessionUrl,
+      parentSeat: flags.parentSeat,
+      noParent: flags.parent === false,
+      favorite: flags.favorite,
     },
     command,
     config,
     true,
   );
-  const autoPromptText = resolveTemplateAutoPrompt(flags, source);
-  if (!autoPromptText || created.metadata?.spawn_state === "pending") {
-    return;
-  }
-  const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
-  const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
-  const prompt = textPrompt(autoPromptText);
-  await withMessageLedger(
-    {
-      kind: "template-prompt",
-      to: ledgerTargetOf(created),
-      addressedAs: "session",
-      prompt,
-    },
-    (onSubmitAccepted) =>
-      deliverPrompt({
-        sessionId: created.acpxRecordId,
-        prompt,
-        // Enqueue-and-return: the spawn command surfaces the child's URL promptly while
-        // the agent works the prompt asynchronously (mirrors the UI's `prompt --no-wait`).
-        waitForCompletion: false,
-        globalFlags,
-        permissionMode,
-        permissionPolicy,
-        outputPolicy: resolveRequestedOutputPolicy(globalFlags),
-        config,
-        onSubmitAccepted,
-      }),
-  );
+  const prompt = resolveTemplateFirstTurn(flags, firstTurn, source);
+  // A `spawn_key` reservation (acpx-ui's spawn path) fires its own prompt once published.
+  const outcome =
+    prompt && created.metadata?.spawn_state !== "pending"
+      ? await queueFirstTurn(created, prompt, "template-prompt", command, config)
+      : undefined;
+  const { printCopiedSessionByFormat } = await loadOutputRenderModule();
+  printCopiedSessionByFormat(created, source, globalFlags.format, outcome);
 }
 
 export async function handleSessionsNew(
@@ -2869,15 +2950,22 @@ export async function handleSessionsNew(
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
+  refuseFromWithTemplate(flags);
+  refuseNewSessionFlagCombinations(flags);
+  // Brick b40a9a5d decision 1 — the first turn is read and validated HERE, before anything
+  // is created: a missing, unreadable or empty prompt leaves no record and no seat behind.
+  const firstTurn = await resolveHandoffPrompt(
+    firstTurnFlags(flags),
+    resolveGlobalFlags(command, config).cwd,
+  );
   // `sessions new --from-template <id>` instantiates a working session from a
   // saved template. It is a copy whose source must be a template; the copy
   // inherits the template's agent type + context and is itself a normal open
   // session (createSession never carries the template marker forward). Routes
   // through the shared copy core so it reuses native deep-copy, the agent-type
   // lock, and cwd/lineage handling rather than the fresh-session path.
-  refuseFromWithTemplate(flags);
   if (flags.fromTemplate !== undefined) {
-    await handleSessionsNewFromTemplate(explicitAgentName, flags, command, config);
+    await handleSessionsNewFromTemplate(explicitAgentName, flags, firstTurn, command, config);
     return;
   }
 
@@ -2895,7 +2983,13 @@ export async function handleSessionsNew(
     process.stderr.write(`[acpx] created session: ${created.acpxRecordId}\n`);
   }
 
-  printNewSessionByFormat(created, globalFlags.format);
+  // The SAME delivery `acpx prompt --no-wait` takes (`deliverPrompt` → `sendSession`), so the
+  // first turn starts through the owner's ordinary turn path — context alarm, pending-cancel
+  // handling (bf3a4533) and the message ledger included. Never a side path.
+  const outcome = firstTurn
+    ? await queueFirstTurn(created, firstTurn, "prompt", command, config)
+    : undefined;
+  printNewSessionByFormat(created, globalFlags.format, outcome);
 }
 
 /**
@@ -2995,7 +3089,7 @@ export async function handleSessionsCopy(
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
-  const handoffPrompt = await resolveCopyHandoffPrompt(flags, command, config);
+  const handoffPrompt = await resolveHandoffPrompt(flags, resolveGlobalFlags(command, config).cwd);
   const { created, source } = await runSessionCopy(
     explicitAgentName,
     flags,
@@ -3003,6 +3097,8 @@ export async function handleSessionsCopy(
     config,
     false,
   );
+  const { printCopiedSessionByFormat } = await loadOutputRenderModule();
+  printCopiedSessionByFormat(created, source, resolveGlobalFlags(command, config).format);
 
   // #3 Fork notice: inject a divergence-handoff as turn 1 for every non-ephemeral
   // (plain) fork so the forked agent self-identifies and does not act as the source.
@@ -3017,7 +3113,7 @@ export async function handleSessionsCopy(
 
   if (!forkNotice) {
     // Byway / ephemeral path: no notice, deliver handoffPrompt as-is (may include images).
-    await deliverCopyHandoffPrompt(created, handoffPrompt!, "prompt", command, config);
+    await deliverHandoffPrompt(created, handoffPrompt!, "prompt", command, config);
     return;
   }
 
@@ -3027,14 +3123,18 @@ export async function handleSessionsCopy(
   // ignored (fork handoffs via --prompt don't carry images).
   const handoffText = handoffPrompt ? promptToDisplayText(handoffPrompt) : "";
   const deliverText = forkNotice + (handoffText ? handoffText : "");
-  await deliverCopyHandoffPrompt(created, textPrompt(deliverText), "fork-notice", command, config);
+  await deliverHandoffPrompt(created, textPrompt(deliverText), "fork-notice", command, config);
 }
 
-async function resolveCopyHandoffPrompt(
-  flags: SessionsCopyFlags,
-  command: Command,
-  config: ResolvedAcpxConfig,
-): Promise<import("../types.js").PromptInput | undefined> {
+/**
+ * `--prompt <text>` / `--prompt-file <path>` (`-` = stdin), read and validated BEFORE the
+ * caller creates anything — so every refusal here leaves no session behind. Shared by
+ * `sessions copy` and `sessions new` (brick b40a9a5d), which must refuse identically.
+ */
+async function resolveHandoffPrompt(
+  flags: { prompt?: string; promptFile?: string },
+  cwd: string,
+): Promise<PromptInput | undefined> {
   const hasPrompt = typeof flags.prompt === "string";
   const hasPromptFile = typeof flags.promptFile === "string";
   if (!hasPrompt && !hasPromptFile) {
@@ -3043,13 +3143,39 @@ async function resolveCopyHandoffPrompt(
   if (hasPrompt && hasPromptFile) {
     throw new InvalidArgumentError("Use only one of --prompt or --prompt-file");
   }
+  if (hasPrompt) {
+    return await readPrompt([flags.prompt as string], undefined, cwd);
+  }
+  return await readPromptFileOrRefuse(flags.promptFile as string, cwd);
+}
 
-  const globalFlags = resolveGlobalFlags(command, config);
-  return await readPrompt(
-    hasPrompt ? [flags.prompt as string] : [],
-    flags.promptFile,
-    globalFlags.cwd,
-  );
+// The file read names `--prompt-file` and the path in every refusal: `readPrompt`'s own
+// messages say `--file` (the `prompt` verb's flag) and pass a raw ENOENT/EISDIR through.
+async function readPromptFileOrRefuse(file: string, cwd: string): Promise<PromptInput> {
+  const label = `--prompt-file ${JSON.stringify(file)}`;
+  let source: string;
+  try {
+    source =
+      file === "-"
+        ? await readPromptInputFromStdin()
+        : await fs.readFile(path.resolve(cwd, file), "utf8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? String(error);
+    throw new InvalidArgumentError(`${label} cannot be read (${code})`);
+  }
+  let prompt: PromptInput;
+  try {
+    prompt = mergePromptSourceWithText(source, "");
+  } catch (error) {
+    if (error instanceof PromptInputValidationError) {
+      throw new InvalidArgumentError(`${label}: ${error.message}`);
+    }
+    throw error;
+  }
+  if (prompt.length === 0) {
+    throw new InvalidArgumentError(`${label} is empty`);
+  }
+  return prompt;
 }
 
 // The ledger's `to` for a session this command just created and prompts directly.
@@ -3057,9 +3183,9 @@ function ledgerTargetOf(created: SessionRecord): { session: string; seat: string
   return { session: created.acpxRecordId, seat: created.seatId ?? null };
 }
 
-async function deliverCopyHandoffPrompt(
+async function deliverHandoffPrompt(
   created: SessionRecord,
-  prompt: import("../types.js").PromptInput,
+  prompt: PromptInput,
   kind: MessageLedgerKind,
   command: Command,
   config: ResolvedAcpxConfig,
@@ -3123,13 +3249,15 @@ async function runSessionCopy(
   // carries BOTH its spawn-parent edge (parentSessionId/Url) AND its template
   // /fork origin (forkFromSessionId) — the "both edges" write. With no parent
   // context the `?.` guards omit both fields → byte-identical to today.
-  const parent = await resolveAndValidateParentSessionId(flags);
+  const parent = await resolveCopyParent(flags);
   const { value: resolvedBrick, validated: resolvedBrickValidated } = await resolveBrickFlagValue(
     flags.brick,
   );
 
-  const [{ createSession }, { printCopiedSessionByFormat, printCreatedSessionBanner }] =
-    await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
+  const [{ createSession }, { printCreatedSessionBanner }] = await Promise.all([
+    loadSessionModule(),
+    loadOutputRenderModule(),
+  ]);
   const created = await createSession({
     recordId: flags.recordId,
     agentCommand: source.agentCommand,
@@ -3155,6 +3283,7 @@ async function runSessionCopy(
     parentSeatId: parent?.seatId,
     forkFromSessionId: source.acpxRecordId,
     forkAtMessageIndex: flags.atIndex,
+    seatFavorite: flags.favorite,
     mcpServers: config.mcpServers,
     permissionMode,
     nonInteractivePermissions: globalFlags.nonInteractivePermissions,
@@ -3170,8 +3299,16 @@ async function runSessionCopy(
   await maybeStampBrickLink(created);
   const sourceType = agentTypeLabel(source.agentCommand, config);
   printCreatedSessionBanner(created, sourceType, globalFlags.format, globalFlags.jsonStrict);
-  printCopiedSessionByFormat(created, source, globalFlags.format);
+  // The result line is the CALLER's: `sessions new --from-template` prints it only after the
+  // first turn is queued, so it can carry `promptQueued`.
   return { created, source };
+}
+
+// `noParent` (`sessions new --from-template --no-parent`) records none, env included.
+async function resolveCopyParent(
+  flags: SessionsCopyFlags,
+): Promise<ResolvedParentSession | undefined> {
+  return flags.noParent ? undefined : await resolveAndValidateParentSessionId(flags);
 }
 
 function assertTemplateSource(source: SessionRecord): void {
@@ -4113,6 +4250,8 @@ export type SessionsSetParentFlags = {
   parentSessionUrl?: string;
   parentId?: string;
   parentSeat?: string;
+  /** `--no-parent` → `false`: CLEAR the one target session's parent (brick b40a9a5d). */
+  parent?: boolean;
   dryRun?: boolean;
 };
 
@@ -4172,12 +4311,10 @@ function printSetParentResult(result: SetParentResult, format: OutputFormat): vo
   if (format === "quiet") {
     return;
   }
-  const destination = shortSessionId(result.parent.acpxRecordId);
   if (result.dryRun) {
     process.stdout.write("DRY RUN — no changes written.\n");
   }
-  const verb = result.dryRun ? "Would re-parent" : "Re-parented";
-  process.stdout.write(`${verb} ${result.moved.length} session(s) onto  ${destination}\n`);
+  process.stdout.write(`${setParentHeadline(result)}\n`);
   for (const entry of result.moved) {
     process.stdout.write(`${setParentMovedLine(entry)}\n`);
   }
@@ -4194,6 +4331,15 @@ function printSetParentResult(result: SetParentResult, format: OutputFormat): vo
     );
   }
   printSetParentSkippedAndWarnings(result);
+}
+
+function setParentHeadline(result: SetParentResult): string {
+  if (result.parent === null) {
+    const verb = result.dryRun ? "Would clear" : "Cleared";
+    return `${verb} the parent of ${result.moved.length} session(s) — top-level`;
+  }
+  const verb = result.dryRun ? "Would re-parent" : "Re-parented";
+  return `${verb} ${result.moved.length} session(s) onto  ${shortSessionId(result.parent.acpxRecordId)}`;
 }
 
 function shortOrNone(sessionId: string | undefined): string {
@@ -4223,10 +4369,14 @@ function printSetParentSkippedAndWarnings(result: SetParentResult): void {
 /**
  * Detach detection, and it runs BEFORE the "exactly one" check on purpose:
  * `--parent-id ''` must refuse BY NAME (`PARENT_DETACH_UNSUPPORTED`) rather than
- * arrive as "neither flag given" (USAGE) or, worse, silently no-op. Clearing a
- * parent would require DELETING a relations row, and that table's contract is
- * "edges are lineage history" with deletion deliberately absent — a relations-model
- * decision, not a re-parent feature (DECISION 5).
+ * arrive as "neither flag given" (USAGE) or, worse, silently no-op. An EMPTY parent
+ * flag is not a clear — `--no-parent` is (brick b40a9a5d), and the refusal names it.
+ *
+ * (Brick c99f9994 decision 5 kept clearing out of scope because acpx-ui's `relations`
+ * table never deleted an edge. acpx-ui 085c8dd6 (on its `master`, deployed on devbox as
+ * of 2026-10-08) deletes the row of a session whose family link disappeared — for a link
+ * that acpx-ui process itself synced; one cleared while acpx-ui was down keeps its stale
+ * `relations.db` row (brick b40a9a5d).)
  */
 function setParentDetachAttempted(flags: SessionsSetParentFlags): boolean {
   return (
@@ -4702,14 +4852,17 @@ export async function handleSessionsSetParent(
 async function resolveSetParentInputs(
   flags: SessionsSetParentFlags,
 ): Promise<
-  | { target: SetParentTarget; parent: { id: string; url?: string } }
+  | { target: SetParentTarget; parent: { id: string; url?: string } | null }
   | { code: SetParentRefusalCode | "USAGE"; message: string }
 > {
+  if (flags.parent === false) {
+    return resolveSetParentClearInputs(flags);
+  }
   if (setParentDetachAttempted(flags)) {
     return {
       code: "PARENT_DETACH_UNSUPPORTED",
       message:
-        "clearing a parent is not supported; pass a real --parent-seat, --parent-id or --parent-session-url",
+        "an empty parent flag is not a clear; pass --no-parent to clear the parent, or a real --parent-seat, --parent-id or --parent-session-url",
     };
   }
   const target = resolveSetParentTarget(flags);
@@ -4718,6 +4871,34 @@ async function resolveSetParentInputs(
   }
   const parent = await resolveSetParentNewParent(flags);
   return "code" in parent ? parent : { target, parent };
+}
+
+/** `--no-parent`: exactly one target session, and no parent flag beside it (even an empty one). */
+function resolveSetParentClearInputs(
+  flags: SessionsSetParentFlags,
+): { target: SetParentTarget; parent: null } | { code: "USAGE"; message: string } {
+  const parentFlagGiven = [flags.parentSeat, flags.parentId, flags.parentSessionUrl].some(
+    (value) => value !== undefined,
+  );
+  if (parentFlagGiven) {
+    return {
+      code: "USAGE",
+      message:
+        "--no-parent cannot be combined with --parent-seat, --parent-id or --parent-session-url",
+    };
+  }
+  const target = resolveSetParentTarget(flags);
+  if (typeof target === "string") {
+    return { code: "USAGE", message: target };
+  }
+  if (target.kind !== "session") {
+    return {
+      code: "USAGE",
+      message:
+        "--no-parent clears ONE session's parent: name it with --session-id, not --children-of",
+    };
+  }
+  return { target, parent: null };
 }
 
 /**

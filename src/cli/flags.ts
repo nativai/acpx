@@ -120,12 +120,23 @@ export type SessionsNewFlags = {
   metadata?: Record<string, string>;
   brick?: string | false;
   fromTemplate?: string;
-  // --from-template auto-fire (ignored outside the --from-template path). Commander
-  // couples `--prompt <text>` and `--no-prompt` onto this one property:
-  //   string  → override the template's stored auto_prompt with this text
-  //   false   → --no-prompt: suppress any auto-prompt
-  //   true / undefined → use the template's auto_prompt (the default)
+  // The new session's FIRST TURN (brick b40a9a5d). Commander couples `--prompt <text>`
+  // and `--no-prompt` onto this one property:
+  //   string  → enqueue this text as the first turn (with --from-template: in place of
+  //             the template's stored auto_prompt)
+  //   false   → --no-prompt: with --from-template, suppress the stored auto_prompt
+  //   true / undefined → no explicit prompt (a template fires its auto_prompt)
   prompt?: string | boolean;
+  /** `--prompt-file <path>` (`-` = stdin) — the first turn, read from a file. */
+  promptFile?: string;
+  /** Set by the registration's option listeners: the one `prompt` key above keeps only
+   * the LAST of `--prompt`/`--no-prompt`, so "both were given" is invisible without them. */
+  promptTextGiven?: boolean;
+  noPromptGiven?: boolean;
+  /** `--no-parent` → `false`: a top-level session — no parent recorded, no env fallback. */
+  parent?: boolean;
+  /** `--favorite`: the new SEAT is minted starred (D-STAR — the star is the seat's). */
+  favorite?: boolean;
 };
 
 export type SessionsCopyFlags = {
@@ -141,6 +152,11 @@ export type SessionsCopyFlags = {
   ephemeral?: boolean;
   prompt?: string;
   promptFile?: string;
+  /** Internal (no `copy` flag): `sessions new --from-template --no-parent` — record no
+   * parent and skip the ACPX_SESSION_URL fallback. */
+  noParent?: boolean;
+  /** Internal (no `copy` flag): `sessions new --from-template --favorite`. */
+  favorite?: boolean;
 };
 
 export type SessionsTemplateFlags = {

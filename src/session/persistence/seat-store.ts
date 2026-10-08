@@ -975,6 +975,8 @@ export async function mintSeatRow(
     // Brick `9984c510` widened the TYPE: the caller must say HOW it was
     // obtained (validated vs unvalidated), never leave it to be re-guessed here.
     readonly brickId: SeatBrickLink | undefined;
+    /** `sessions new --favorite` (brick b40a9a5d) — the row is born starred. Absent ⇒ `false`. */
+    readonly favorite?: boolean;
   },
 ): Promise<void> {
   await withSeatStoreWrite(sessionDir, (store) => {
@@ -1018,8 +1020,8 @@ export async function mintSeatRow(
       // A freshly-minted seat has no holder history to derive a star from —
       // `false`, not absent (D-STAR moves the field onto the seat; there is no
       // legacy per-record value to carry forward for a seat that did not exist a
-      // moment ago).
-      favorite: false,
+      // moment ago). `true` only when the creator asked for the star (`--favorite`).
+      favorite: params.favorite === true,
       // A new seat starts at the default level (brick 4f3fa88c) — children and forks
       // included: they have their own seats.
       contextAlarm: undefined,
@@ -1317,7 +1319,8 @@ export async function mintSeatRowBestEffort(
         `acpx seat-row-not-minted: seat=${params.seatId} holder=${params.holderId} ` +
         `store=${seatStorePath(sessionDir)} — the session was created and IS USABLE, and it ` +
         `keeps its seat id, but its seat has no row yet, so it cannot be joined or ` +
-        `succeeded until one exists. ${brickConsequenceClause(params)}${seatStoreFailureRemedy(error)}`,
+        `succeeded until one exists. ${brickConsequenceClause(params)}` +
+        `${favoriteConsequenceClause(params)}${seatStoreFailureRemedy(error)}`,
     };
   }
 }
@@ -1352,6 +1355,22 @@ function brickConsequenceClause(params: Parameters<typeof mintSeatRow>[1]): stri
   return (
     `The seat's brick_id was NOT written — it is the CANONICAL copy (CONCEPTION C4) — even ` +
     `though the holder's own metadata.brick is already set to ${params.brickId.ref}. `
+  );
+}
+
+/**
+ * `--favorite` rides the same atomic row write (brick b40a9a5d), so a failed mint loses the
+ * star too — and the backfill cannot restore it (it derives a star from the holders' legacy
+ * record field, which a new session never has). Said here, or the operator believes the seat
+ * is starred. Empty when no star was asked for.
+ */
+function favoriteConsequenceClause(params: Parameters<typeof mintSeatRow>[1]): string {
+  if (params.favorite !== true) {
+    return "";
+  }
+  return (
+    "The requested star (--favorite) was NOT written either: once the row exists, star it " +
+    `with \`acpx seats favorite ${params.seatId} --on\`. `
   );
 }
 

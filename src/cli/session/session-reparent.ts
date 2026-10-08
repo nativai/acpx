@@ -56,7 +56,8 @@ export type SetParentMovedSession = {
   acpxRecordId: string;
   previousParentSessionId?: string;
   previousParentSessionUrl?: string;
-  parentSetAt: string;
+  /** Absent on a CLEAR (`--no-parent`): the record then carries no `parent_set_at` either. */
+  parentSetAt?: string;
   spawnedBySessionId?: string;
   /**
    * True when this child's GRAPH edge came from `forkedFromSessionId` before the
@@ -111,7 +112,8 @@ export type SetParentSkippedSession = {
 export type SetParentResult = {
   ok: true;
   dryRun: boolean;
-  parent: { acpxRecordId: string; sessionUrl?: string; crossBox: boolean };
+  /** `null` on a clear (`--no-parent`, brick b40a9a5d): the session now has no parent. */
+  parent: { acpxRecordId: string; sessionUrl?: string; crossBox: boolean } | null;
   /**
    * ⚠️ AN ARRAY, ALWAYS — a batch of one is still a batch, so a caller never
    * branches on which target flag was passed. (acpx-ui `97ff3eac` is the live
@@ -138,10 +140,19 @@ export type SetParentTarget =
 export type SetParentOptions = {
   target: SetParentTarget;
   /** The new parent, already resolved from flags by the CLI layer. `url` is
-   *  present only when `--parent-session-url` was given (FW-19 cross-box form). */
-  parent: { id: string; url?: string };
+   *  present only when `--parent-session-url` was given (FW-19 cross-box form).
+   *  `null` CLEARS the parent (`--no-parent`, brick b40a9a5d) — one session only. */
+  parent: { id: string; url?: string } | null;
   dryRun?: boolean;
 };
+
+/** The new parent as the move reads it; `null` is a clear. */
+type NewParent = {
+  acpxRecordId: string;
+  sessionUrl?: string;
+  seatId?: string;
+  crossBox: boolean;
+} | null;
 
 /**
  * Mirror of branch 3 ("fork") of acpx-ui's `shared/lineage.ts` `resolveLineage`,
@@ -177,7 +188,7 @@ function hadForkEdge(record: SessionRecord): boolean {
 
 function refusalForChild(
   record: SessionRecord,
-  parent: { acpxRecordId: string; crossBox: boolean },
+  parent: NewParent,
   graph: SessionIndexEntry[],
 ): { code: SetParentRefusalCode; reason: string } | undefined {
   // Subagents are Task-tool children of a PROCESS: they die with their turn, and
@@ -192,6 +203,10 @@ function refusalForChild(
   }
   if (isArchivedRecord(record)) {
     return { code: "SESSION_ARCHIVED", reason: "session is archived; restore it first" };
+  }
+  // A clear has no parent to be self or a descendant.
+  if (parent === null) {
+    return undefined;
   }
   if (record.acpxRecordId === parent.acpxRecordId) {
     return { code: "PARENT_SELF", reason: "a session cannot be its own parent" };
@@ -288,7 +303,7 @@ type ChildSelection = {
 async function selectTargets(
   target: SetParentTarget,
   entries: SessionIndexEntry[],
-  newParentId: string,
+  newParentId: string | undefined,
 ): Promise<ChildSelection> {
   if (target.kind === "session") {
     let record: SessionRecord;
@@ -336,6 +351,11 @@ async function selectTargets(
       );
     }
     throw error;
+  }
+  if (newParentId === undefined) {
+    // The CLI refuses `--no-parent --children-of` as USAGE first; this is the library's own
+    // guard, because the heal classification below has no meaning without a new parent.
+    throw new Error("clearing a parent applies to one session (--session-id), not --children-of");
   }
   return await selectChildrenOf(oldParent.acpxRecordId, newParentId, entries);
 }
@@ -606,7 +626,7 @@ function classifyChild(
 // eslint-disable-next-line complexity -- explicit optional-field projection
 function applyParentToRecord(
   record: SessionRecord,
-  parent: { acpxRecordId: string; sessionUrl?: string; seatId?: string },
+  parent: NewParent,
   now: string,
   ownerState: string,
 ): SetParentMovedSession {
@@ -621,11 +641,15 @@ function applyParentToRecord(
   if (record.spawnedBySessionId === undefined && previousParentSessionId !== undefined) {
     record.spawnedBySessionId = previousParentSessionId;
   }
-  record.parentSessionId = parent.acpxRecordId;
+  // A CLEAR (`parent === null`, brick b40a9a5d) empties the whole linkage group below —
+  // `parentSetAt` included: the record then reads as one created with no parent, which is
+  // what acpx-ui's lineage rule needs (its explicit-parent branch requires BOTH fields). Only
+  // the write-once `spawnedBySessionId` above survives, as the provenance it is.
+  record.parentSessionId = parent?.acpxRecordId;
   // Cleared, not merged, when the new parent is same-box: a stale cross-box url
   // left behind would keep pointing at the wrong host.
-  record.parentSessionUrl = parent.sessionUrl;
-  record.parentSetAt = now;
+  record.parentSessionUrl = parent?.sessionUrl;
+  record.parentSetAt = parent ? now : undefined;
   // SEATS (C3, brick 5ad22d5d). THE INVARIANT: parentSeatId is ALWAYS the seat
   // of the record named by parentSessionId — whatever writes one writes the
   // other, in the same write. Cleared, not merged, same reasoning as
@@ -635,13 +659,17 @@ function applyParentToRecord(
   // would reintroduce the frozen-parent bug it is meant to fix: every
   // re-parented child would keep composing ACPX_PARENT_SEAT_URL from its OLD
   // parent's seat while parentSessionId correctly named the new one.
-  record.parentSeatId = parent.seatId;
+  //
+  // 🛑 ON A CLEAR THIS IS THE FAMILY EDGE ITSELF GOING: acpx-ui's family rule hangs a child
+  // under its stored `parentSeatId` (brick 085c8dd6), so clearing `parentSessionId` alone
+  // would leave the session in its old parent seat's family.
+  record.parentSeatId = parent?.seatId;
 
   return {
     acpxRecordId: record.acpxRecordId,
     ...(previousParentSessionId ? { previousParentSessionId } : {}),
     ...(previousParentSessionUrl ? { previousParentSessionUrl } : {}),
-    parentSetAt: now,
+    ...(parent ? { parentSetAt: now } : {}),
     ...(record.spawnedBySessionId ? { spawnedBySessionId: record.spawnedBySessionId } : {}),
     wasForkEdge,
     ownerState,
@@ -696,15 +724,15 @@ export async function setSessionParent(options: SetParentOptions): Promise<SetPa
   // ONE index read serves selection, the name map and the cycle walk. Records are
   // loaded per TARGET (see `selectChildrenOf`), never for the store.
   const entries = await listSessionIndexEntries();
-  const parent = await resolveNewParent(options.parent);
-  const selection = await selectTargets(options.target, entries, parent.acpxRecordId);
+  const parent = options.parent === null ? null : await resolveNewParent(options.parent);
+  const selection = await selectTargets(options.target, entries, parent?.acpxRecordId);
 
   const warnings: string[] = [];
   // Allowed, not refused: the board hides closed sessions as tiles but walks
   // THROUGH them when resolving a root, so the subtree still resolves — and
   // refusing would block the legitimate repair "put this child back under its
   // real, now-closed parent".
-  if (parent.record?.closed === true) {
+  if (parent?.record?.closed === true) {
     warnings.push("new parent is closed");
   }
 
@@ -719,11 +747,13 @@ export async function setSessionParent(options: SetParentOptions): Promise<SetPa
   return {
     ok: true,
     dryRun,
-    parent: {
-      acpxRecordId: parent.acpxRecordId,
-      ...(parent.sessionUrl ? { sessionUrl: parent.sessionUrl } : {}),
-      crossBox: parent.crossBox,
-    },
+    parent: parent
+      ? {
+          acpxRecordId: parent.acpxRecordId,
+          ...(parent.sessionUrl ? { sessionUrl: parent.sessionUrl } : {}),
+          crossBox: parent.crossBox,
+        }
+      : null,
     moved: outcome.moved,
     // Unresolvable index rows join the per-child refusals: both are "named, not
     // moved, and said so out loud".
@@ -907,7 +937,7 @@ type MoveContext = {
 
 async function moveTargets(
   targets: SessionRecord[],
-  parent: { acpxRecordId: string; sessionUrl?: string; seatId?: string; crossBox: boolean },
+  parent: NewParent,
   graph: SessionIndexEntry[],
   context: MoveContext,
 ): Promise<{
@@ -961,7 +991,7 @@ async function moveEach(
   // `seatId` rides along because `applyParentToRecord` writes `record.parentSeatId`
   // from it (SEATS C3, brick 5ad22d5d). The loop moved out of `moveTargets` on this
   // branch; the type has to follow it, or the field is only structurally present.
-  parent: { acpxRecordId: string; sessionUrl?: string; seatId?: string; crossBox: boolean },
+  parent: NewParent,
   graph: SessionIndexEntry[],
   context: MoveContext,
   out: MoveAccumulators,
@@ -988,16 +1018,35 @@ async function moveEach(
     // The record is committed; the index half is the overlay's, flushed by CHUNK
     // and once in the caller's `finally`. A no-op for a single target or a dry run.
     await overlay.add(record);
-    // `Facets/user-facing-via-acpx-ui/FACET.md` gates the user-facing facet on
-    // `unless_env="ACPX_PARENT_SESSION_URL"`, so a session that HAD no parent loses
-    // its ability to hand work to Daniel once its owner next respawns. A genuine
-    // behaviour loss with no in-scope remedy — surfaced at the moment the thing is
-    // done, because nobody reads `--help` then.
-    if (!entry.previousParentSessionId) {
-      warnings.push(
-        `${entry.acpxRecordId} had no parent: adopting it strips its user-facing acpx-ui facet when its owner next respawns`,
-      );
-    }
+    warnings.push(...moveWarnings(record, entry, parent));
     moved.push(entry);
   }
+}
+
+function moveWarnings(
+  record: SessionRecord,
+  entry: SetParentMovedSession,
+  parent: NewParent,
+): string[] {
+  if (parent === null) {
+    // A fork with no parent falls back to its FORK edge on acpx-ui's board and relations
+    // surfaces (`shared/lineage.ts` branch 3) — the clear is real, but the session is shown
+    // under its fork source there, and only the list shows it top-level. Byways excepted:
+    // their relations edge is the spawn edge, never the fork.
+    return record.forkedFromSessionId !== undefined && record.metadata?.byway !== "1"
+      ? [
+          `${entry.acpxRecordId} was forked from ${record.forkedFromSessionId}: with no parent, acpx-ui's board and relations views place it under that fork source (the session list shows it top-level)`,
+        ]
+      : [];
+  }
+  // `Facets/user-facing-via-acpx-ui/FACET.md` gates the user-facing facet on
+  // `unless_env="ACPX_PARENT_SESSION_URL"`, so a session that HAD no parent loses
+  // its ability to hand work to Daniel once its owner next respawns. A genuine
+  // behaviour loss with no in-scope remedy — surfaced at the moment the thing is
+  // done, because nobody reads `--help` then.
+  return entry.previousParentSessionId
+    ? []
+    : [
+        `${entry.acpxRecordId} had no parent: adopting it strips its user-facing acpx-ui facet when its owner next respawns`,
+      ];
 }
