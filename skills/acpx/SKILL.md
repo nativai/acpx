@@ -249,7 +249,9 @@ Behavior:
 - `new --name <name>` targets a named session scope
 - `new --prompt <text>` / `--prompt-file <path|->` creates the session AND
   enqueues its first turn in one call (non-blocking, the same delivery as
-  `prompt --no-wait`); JSON adds `promptQueued: true`. The prompt is validated
+  `prompt --no-wait`); JSON adds `promptQueued: true`. A relative
+  `--prompt-file` resolves against the directory you run acpx in, NOT
+  `--cwd` (the new session's directory) — pass an absolute brief path. The prompt is validated
   before anything is created (both flags, a missing/empty file, `--seat`,
   `--from` or `--no-prompt` beside it: refused, nothing created). If the
   session is created but the enqueue fails, it is kept, the exit is non-zero

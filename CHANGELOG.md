@@ -142,11 +142,19 @@ Repo: https://github.com/openclaw/acpx
   from the caller. `sessions new --favorite` creates the seat starred.
   `sessions set-parent --session-id <id> --no-parent` clears a session's
   parent. (brick b40a9a5d)
-- CLI: `sessions copy --prompt-file` refusals now name `--prompt-file` and the
-  path (`cannot be read (ENOENT)`, `is empty`) instead of `--file` or a raw
-  filesystem error. (brick b40a9a5d)
+- CLI: `--prompt-file` refusals on `sessions new` and `sessions copy` name the
+  flag and the RESOLVED absolute path (`cannot be read (ENOENT)`, `is empty`)
+  instead of `--file` or a raw filesystem error; text output says
+  `[acpx] first turn queued (from <path>)`. (brick b40a9a5d)
 
 ### Breaking
+
+- CLI: a relative `--prompt-file` on `sessions new` and `sessions copy`
+  resolves against the directory acpx is run in, no longer against `--cwd`.
+  On these verbs `--cwd` is where the NEW session lives, so a same-named file
+  in that directory could be sent instead of the caller's brief. Pass an
+  absolute path to be explicit. `acpx prompt -f` is unchanged. (brick
+  b40a9a5d)
 
 - CLI: remove the agent-facing `acpx usage` and `acpx sessions tree` commands;
   agents should use the deployed acpx wisdom usage and session-tree scripts.
