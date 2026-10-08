@@ -747,3 +747,68 @@ test("set-parent --no-parent refuses --children-of, any --parent-* flag, and an 
     }
   });
 });
+
+// ─── decision 5: --resume-session + a first turn is allowed (a normal active holder) ────────
+
+test("new --resume-session --prompt: the resumed session is created and its first turn runs", async () => {
+  await withRig(async (rig) => {
+    const loadable = `${MOCK_AGENT_COMMAND} --supports-load-session`;
+    const base = ["--cwd", rig.cwd, "--agent", loadable, "--approve-all", "--format", "json"];
+    const first = await rig.cli([...base, "sessions", "new"]);
+    assert.equal(first.code, 0, first.stderr);
+    const original = String(
+      (JSON.parse(first.stdout.trim()) as { acpxRecordId: unknown }).acpxRecordId,
+    );
+    const acpSessionId = String((await rig.onDisk(original)).acp_session_id);
+    const close = await rig.cli([...rig.base, "sessions", "close", "--session-id", original]);
+    assert.equal(close.code, 0, close.stderr);
+
+    const resumed = await rig.cli([
+      ...base,
+      "sessions",
+      "new",
+      "--resume-session",
+      acpSessionId,
+      // A fresh local record: without it the record id defaults to the ACP session id, i.e.
+      // the CLOSED original's file, and the first turn is (rightly) refused as closed.
+      "--record-id",
+      randomUUID(),
+      "--prompt",
+      "echo resumed-marker-9d",
+    ]);
+    assert.equal(resumed.code, 0, resumed.stderr);
+    const payload = JSON.parse(resumed.stdout.trim()) as Record<string, unknown>;
+    assert.equal(payload.promptQueued, true);
+    await waitForPreview(rig, String(payload.acpxRecordId), "resumed-marker-9d");
+  });
+});
+
+// ─── --from-template honours --parent-seat (it was silently dropped before b40a9a5d) ────────
+
+test("new --from-template --parent-seat records that seat's holder as parent, not the env caller", async () => {
+  await withRig(async (rig) => {
+    const template = await makeTemplate(rig, "");
+    const envCaller = String((await rig.create()).acpxRecordId);
+    const seatParent = await rig.create();
+    const result = await rig.cli(
+      [
+        ...rig.base,
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "--from-template",
+        template,
+        "--parent-seat",
+        String(seatParent.seatId),
+      ],
+      await rig.agentEnv(envCaller),
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const child = await rig.onDisk(
+      String((JSON.parse(result.stdout.trim()) as { acpxRecordId: unknown }).acpxRecordId),
+    );
+    assert.equal(child.parent_session_id, seatParent.acpxRecordId);
+    assert.equal(child.parent_seat_id, seatParent.seatId);
+  });
+});

@@ -342,7 +342,7 @@ function printFirstTurnQueuedLine(firstTurn: FirstTurnOutcome | undefined): void
 }
 
 /**
- * The session exists and is promptable, but its first turn was not enqueued. Names the new
+ * The session exists, but its first turn was not enqueued. Names the new
  * seat and session — the caller has nothing else to find them by when the command failed —
  * and the two ways forward. STDERR; the result line carries `promptQueued: false`.
  */
@@ -363,7 +363,7 @@ export function printFirstTurnNotQueued(
     : `--session-id ${record.acpxRecordId}`;
   process.stderr.write(
     `[acpx] the session was created but its first turn was NOT queued: ${message}\n` +
-      `[acpx] it is open and can be prompted — seat: ${seat}  session: ${session}\n` +
+      `[acpx] the session exists — seat: ${seat}  session: ${session}\n` +
       `[acpx] retry: acpx prompt ${retryTarget} --no-wait -f <file>  ` +
       `or close it: acpx sessions close --session-id ${record.acpxRecordId}\n`,
   );
