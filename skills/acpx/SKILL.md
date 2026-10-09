@@ -133,6 +133,13 @@ Rules:
 - `--agent <command>` explicitly sets a raw ACP adapter command.
 - Do not combine a positional agent and `--agent` in the same command.
 
+Spawned non-Claude commands do not inherit the caller's descriptive `CLAUDE_EFFORT`.
+Recognized SDK Claude commands and legacy `claude-pty-acp` commands preserve it;
+the PTY exception does not restore adapter support. `CLAUDE_CODE_EFFORT_LEVEL`
+and existing `CODEX_*` handling are unchanged. Unknown or omitted commands get
+no exemption. Adapter detection matches complete path/package tokens, including
+declaration flags; a token occurring only in a flag-value path can still match.
+
 ## Commands
 
 ### Prompt (default, persistent session)
