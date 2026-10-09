@@ -4,12 +4,17 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { resolveClaudeCodeExecutable } from "../src/acp/agent-command.js";
+import {
+  acpAdapterKind,
+  isClaudeFamilyAgent,
+  resolveClaudeCodeExecutable,
+  resolvePrimerChannel,
+} from "../src/acp/agent-command.js";
 import { resolveAcpxUiBaseUrl } from "../src/acp/auth-env.js";
 import { resolveAgentSessionCwd } from "../src/acp/client-process.js";
 import { buildAgentSpawnOptions, buildSpawnCommandOptions } from "../src/acp/client.js";
 import { buildTerminalSpawnOptions } from "../src/acp/terminal-manager.js";
-import { AGENT_REGISTRY } from "../src/agent-registry.js";
+import { AGENT_REGISTRY, listAgentLaunchForms } from "../src/agent-registry.js";
 import { buildQueueOwnerSpawnOptions } from "../src/cli/session/queue-owner-process.js";
 import {
   markSubscriptionDead,
@@ -1065,6 +1070,230 @@ test("27894f40: the scrub is scoped to those five — an unrelated PI_* var is u
       assert.equal(options.env.PI_CODING_AGENT, "true");
     },
   );
+});
+
+// 7395a3c8: production forms are from conception's devbox records:
+// Codex 01a12262-d51e-72d3-a20f-6c258d13efbd, Pi c314d28d-8cfc-4d68-8a6e-41d4004d8b32,
+// SDK ba3ae04c-0b3a-4a44-baa2-3d2994ccb1ba, legacy PTY 162e8142-90e2-418f-8623-e89059af5324.
+const CLAUDE_EFFORT_VALUES = [undefined, "low", "high", "max", "", "not-an-effort"] as const;
+const ACTIVE_EFFORT_VALUES = [undefined, "high", ""] as const;
+const SHIPPED_NON_CLAUDE_FORMS = Object.keys(AGENT_REGISTRY)
+  .filter((name) => name !== "claude")
+  .flatMap((name) => listAgentLaunchForms(name).map((command) => ({ name, command })));
+
+test("7395a3c8: registry denominator includes 14 non-Claude agents and all 15 launch forms", () => {
+  assert.equal(Object.keys(AGENT_REGISTRY).length, 15);
+  assert.equal(new Set(SHIPPED_NON_CLAUDE_FORMS.map(({ name }) => name)).size, 14);
+  assert.equal(SHIPPED_NON_CLAUDE_FORMS.length, 15);
+  assert.equal(SHIPPED_NON_CLAUDE_FORMS.filter(({ name }) => name === "pi").length, 2);
+});
+
+function assertClaudeEffortInheritance(command: string | undefined, preserve: boolean): void {
+  const before = {
+    metadata: process.env.CLAUDE_EFFORT,
+    active: process.env.CLAUDE_CODE_EFFORT_LEVEL,
+  };
+  for (const metadata of CLAUDE_EFFORT_VALUES) {
+    for (const active of ACTIVE_EFFORT_VALUES) {
+      withProcessEnv("CLAUDE_EFFORT", metadata, () => {
+        withProcessEnv("CLAUDE_CODE_EFFORT_LEVEL", active, () => {
+          assert.equal(Object.hasOwn(process.env, "CLAUDE_EFFORT"), metadata !== undefined);
+          assert.equal(process.env.CLAUDE_EFFORT, metadata);
+          const { env } = buildAgentSpawnOptions(
+            process.cwd(),
+            undefined,
+            undefined,
+            undefined,
+            command,
+          );
+          assert.equal(Object.hasOwn(env, "CLAUDE_EFFORT"), preserve && metadata !== undefined);
+          assert.equal(env.CLAUDE_EFFORT, preserve ? metadata : undefined);
+          assert.equal(Object.hasOwn(env, "CLAUDE_CODE_EFFORT_LEVEL"), active !== undefined);
+          assert.equal(env.CLAUDE_CODE_EFFORT_LEVEL, active);
+          assert.equal(process.env.CLAUDE_EFFORT, metadata, "builder must not mutate caller");
+          assert.equal(process.env.CLAUDE_CODE_EFFORT_LEVEL, active);
+        });
+      });
+    }
+  }
+  assert.equal(process.env.CLAUDE_EFFORT, before.metadata);
+  assert.equal(process.env.CLAUDE_CODE_EFFORT_LEVEL, before.active);
+}
+
+for (const { name, command } of SHIPPED_NON_CLAUDE_FORMS) {
+  test(`7395a3c8: ${name} strips foreign metadata and preserves active input: ${command}`, () => {
+    assertClaudeEffortInheritance(command, false);
+  });
+}
+
+const CLAUDE_EFFORT_PRESERVATION_FORMS = [
+  "node /opt/claude-agent-acp/dist/index.js",
+  "node /workspace/projects/claude-agent-acp/metadata-effort-default/dist/index.js",
+  'node "/workspace/projects/claude-agent-acp/checkout with spaces/dist/index.js"',
+  "npx -y @agentclientprotocol/claude-agent-acp@1.2.3",
+  "claude-agent-acp",
+  "/tools/claude-agent-acp.cmd",
+  "node /tmp/mock-agent.js --claude-agent-acp",
+  "node /opt/claude-pty-acp/dist/index.js",
+  'node "/workspace/projects/claude-pty-acp/checkout with spaces/dist/index.js"',
+  "npx -y @example/claude-pty-acp@1.2.3",
+  "claude-pty-acp",
+  "/tools/claude-pty-acp.bat",
+  "'C:\\tools\\claude-pty-acp.exe'",
+] as const;
+
+for (const command of CLAUDE_EFFORT_PRESERVATION_FORMS) {
+  test(`7395a3c8: preserves Claude metadata byte-for-byte, independent of active input: ${command}`, () => {
+    assertClaudeEffortInheritance(command, true);
+  });
+}
+
+const NON_CLAUDE_CUSTOM_FORMS = [
+  undefined,
+  "claude",
+  "node /opt/some-unknown-acp/dist/index.js",
+  "custom-acp --stdio",
+  "npx -y opencode-ai acp",
+  "npx -y @example/custom-acp",
+  "node /opt/not-claude-agent-acp/dist/index.js",
+  "node /opt/not-claude-pty-acp/dist/index.js",
+  "node /opt/claude-pty-acpx/dist/index.js",
+  "node /tmp/custom.js --log /tmp/claude-agent-acp-ops.jsonl",
+  "node /tmp/custom.js --log /tmp/claude-pty-acp-ops.jsonl",
+  "node /tmp/custom.js --not-claude-agent-acp",
+  "node /tmp/custom.js --not-claude-pty-acp",
+  "npx not-claude-agent-acp@1.2.3",
+  "npx not-claude-pty-acp@1.2.3",
+] as const;
+
+for (const command of NON_CLAUDE_CUSTOM_FORMS) {
+  test(`7395a3c8: unknown/omitted/affix command gets no exemption: ${command ?? "<omitted>"}`, () => {
+    withPoisonedAccountStamp(() => {
+      withProcessEnv("ACPX_AGENT_TYPE", "claude", () => {
+        assertClaudeEffortInheritance(command, false);
+      });
+    });
+  });
+}
+
+test("7395a3c8: empty and malformed commands retain parser rejection, not an exemption", () => {
+  withProcessEnv("CLAUDE_EFFORT", "high", () => {
+    for (const command of ["", "   ", 'node "unterminated']) {
+      assert.throws(
+        () => buildAgentSpawnOptions(process.cwd(), undefined, undefined, undefined, command),
+        /Invalid --agent command: (empty command|unterminated quote)/,
+      );
+      assert.equal(process.env.CLAUDE_EFFORT, "high");
+    }
+  });
+});
+
+test("7395a3c8: legacy PTY metadata exemption does not re-enable family/kind/primer", () => {
+  const command = "node /opt/claude-pty-acp/dist/index.js";
+  assert.equal(acpAdapterKind(command), undefined);
+  assert.equal(isClaudeFamilyAgent(command), false);
+  assert.equal(resolvePrimerChannel(command), "none");
+  withProcessEnv("ACPX_AGENT_TYPE", "claude", () => {
+    withProcessEnv("CLAUDE_EFFORT", "high", () => {
+      const { env } = buildAgentSpawnOptions(
+        process.cwd(),
+        undefined,
+        undefined,
+        undefined,
+        command,
+      );
+      assert.equal(env.CLAUDE_EFFORT, "high");
+      assert.equal(Object.hasOwn(env, "ACPX_AGENT_TYPE"), false);
+    });
+  });
+});
+
+test("7395a3c8: production Codex strips metadata across no-context, creation and turn spawns", () => {
+  withScopedSessionTmpRoot((root, sharedRoot) => {
+    withProcessEnv("CLAUDE_EFFORT", "high", () => {
+      for (const context of [
+        undefined,
+        { acpxRecordId: "" },
+        { acpxRecordId: "effort-child", seatId: "child-seat", reasoningEffort: "max" },
+      ]) {
+        const { env } = buildAgentSpawnOptions(
+          process.cwd(),
+          undefined,
+          context,
+          undefined,
+          "node /opt/codex-acp/dist/index.js",
+        );
+        assert.equal(Object.hasOwn(env, "CLAUDE_EFFORT"), false);
+        const hasRecord = Boolean(context?.acpxRecordId);
+        assert.equal(Object.hasOwn(env, "ACPX_SESSION_RECORD_ID"), hasRecord);
+        if (hasRecord) {
+          assert.equal(env.ACPX_SESSION_TMP, path.join(root, "acpx-effort-child"));
+          assert.equal(env.ACPX_SESSION_SHARED_TMP, path.join(sharedRoot, "acpx-effort-child"));
+          assert.equal(env.ACPX_SEAT_URL, `${resolveAcpxUiBaseUrl(process.env)}/?seat=child-seat`);
+        }
+      }
+    });
+  });
+});
+
+test("7395a3c8: production Codex retains CODEX env and operator model/effort config bytes", () => {
+  const config =
+    '{ "model": "gpt-6.1-sol", "model_reasoning_effort": "max", "tool_output_token_limit": 321 }';
+  withProcessEnvAll(
+    [
+      ["CLAUDE_EFFORT", "low"],
+      ["CODEX_CONFIG", config],
+      ["CODEX_HOME", "/operator/codex-home"],
+      ["CODEX_MODEL", "gpt-6.1-sol"],
+      ["CODEX_REASONING_EFFORT", "max"],
+      ["CODEX_UNRELATED_CONTROL", "retain-me"],
+    ],
+    () => {
+      const { env } = buildAgentSpawnOptions(
+        process.cwd(),
+        undefined,
+        undefined,
+        undefined,
+        "node /opt/codex-acp/dist/index.js",
+      );
+      assert.equal(Object.hasOwn(env, "CLAUDE_EFFORT"), false);
+      assert.equal(env.CODEX_CONFIG, config);
+      assert.equal(env.CODEX_HOME, "/operator/codex-home");
+      assert.equal(env.CODEX_MODEL, "gpt-6.1-sol");
+      assert.equal(env.CODEX_REASONING_EFFORT, "max");
+      assert.equal(env.CODEX_UNRELATED_CONTROL, "retain-me");
+    },
+  );
+});
+
+test("7395a3c8: known flag-value residual remains explicit, outside executable inference claim", () => {
+  for (const token of ["claude-agent-acp", "claude-pty-acp"]) {
+    const command = `node /tmp/custom.js --cwd /workspace/projects/${token}/main`;
+    withProcessEnv("CLAUDE_EFFORT", "high", () => {
+      const { env } = buildAgentSpawnOptions(
+        process.cwd(),
+        undefined,
+        undefined,
+        undefined,
+        command,
+      );
+      assert.equal(env.CLAUDE_EFFORT, "high", "shared token helper sees flag values too");
+    });
+  }
+});
+
+test("7395a3c8: ordinary explicit auth still applies after inherited-metadata cleanup", () => {
+  withProcessEnv("CLAUDE_EFFORT", "high", () => {
+    const { env } = buildAgentSpawnOptions(
+      process.cwd(),
+      { CLAUDE_EFFORT: "explicit-auth-control" },
+      undefined,
+      undefined,
+      "node /opt/codex-acp/dist/index.js",
+    );
+    assert.equal(env.CLAUDE_EFFORT, "explicit-auth-control");
+    assert.equal(process.env.CLAUDE_EFFORT, "high");
+  });
 });
 
 test("buildTerminalSpawnOptions hides Windows console windows and maps env entries", () => {

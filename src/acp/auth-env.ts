@@ -40,6 +40,7 @@ import type {
 } from "../config/subscriptions.js";
 import { SubscriptionLockedError } from "../errors.js";
 import type { AcpClientOptions } from "../types.js";
+import { commandCarriesAdapterToken } from "./adapter-token.js";
 import { isClaudeFamilyAgent } from "./agent-command.js";
 import { splitCommandLine } from "./client-process.js";
 import { isCodexAcpCommand } from "./codex-compat.js";
@@ -657,6 +658,18 @@ function parseCodexConfigEnv(raw: string | undefined): Record<string, unknown> |
   return parsed as Record<string, unknown>;
 }
 
+function preservesInheritedClaudeEffort(agentCommand: string | undefined): boolean {
+  if (isClaudeFamilyAgent(agentCommand)) {
+    return true;
+  }
+  if (!agentCommand?.trim()) {
+    return false;
+  }
+  const { command, args } = splitCommandLine(agentCommand);
+  // Legacy PTY preservation is local to this metadata rule; it is not an SDK/account family.
+  return commandCarriesAdapterToken(command, args, "claude-pty-acp");
+}
+
 // eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
 function buildAgentEnvironment(
   authCredentials: Record<string, string> | undefined,
@@ -892,6 +905,11 @@ function buildAgentEnvironment(
   delete env.PI_MODEL;
   delete env.PI_PROVIDER;
   delete env.PI_REASONING_LEVEL;
+  // 7395a3c8: caller Claude metadata is foreign to other targets. Keep the active
+  // CLAUDE_CODE_EFFORT_LEVEL input independent; spawn-options.test.ts covers both.
+  if (!preservesInheritedClaudeEffort(agentCommand)) {
+    delete env.CLAUDE_EFFORT;
+  }
   applyAgentTypeEnvironment(env, agentCommand);
   applyCodexToolOutputLimit(env, agentCommand);
   const baseUrl = resolveAcpxUiBaseUrl(env);
