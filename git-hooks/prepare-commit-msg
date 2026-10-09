@@ -25,6 +25,18 @@ MSG_FILE="${1:-}"
 # These are added by the agent harness prompt and are not useful in commit history.
 sed -i '/^Co-Authored-By:.*anthropic\.com/d' "$MSG_FILE" 2>/dev/null || true
 
+# --- Terminate the last line ---
+# `git merge -m "<subject>"` writes MERGE_MSG with NO trailing newline. git
+# interpret-trailers then appends the first trailer on the very next line, inside
+# the subject's paragraph, and every later trailer after a blank line. Git reads
+# trailers only from the final paragraph, so %(trailers:key=Session) comes back
+# empty. With the last line terminated, the first trailer opens its own paragraph.
+# `$(tail -c1 ...)` strips a newline, so it is non-empty only for a non-newline
+# last byte; an empty file stays untouched.
+if [ -n "$(tail -c1 "$MSG_FILE" 2>/dev/null)" ]; then
+  printf '\n' >>"$MSG_FILE" 2>/dev/null || true
+fi
+
 # --- Session: trailer (idempotent) ---
 if ! grep -q '^Session:' "$MSG_FILE" 2>/dev/null; then
   if ! git interpret-trailers --trailer "Session: $ACPX_SESSION_URL" --in-place "$MSG_FILE" 2>/dev/null; then

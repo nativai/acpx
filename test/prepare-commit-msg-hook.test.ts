@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import test from "node:test";
@@ -331,4 +339,202 @@ test("hook: jq missing → Session only (PATH without jq)", () => {
   assert.equal(countLines(message, "Session:"), 1, message);
   assert.equal(countLines(message, "Message:"), 0, message);
   rmSync(dir, { recursive: true, force: true });
+});
+
+// --- Real-git coverage: the hook as git invokes it, trailers read back by git ---
+//
+// The cases above feed the hook a hand-written message file. These drive real
+// `git commit` / `git merge` through core.hooksPath (as acpx's env-scoped hooks
+// do) and read the trailers back with git's own parser, because that parser is
+// what the atrium git area relies on. `git merge -m "<subject>"` is the case that
+// motivated them: git writes MERGE_MSG with NO trailing newline.
+
+const ALL_TRAILERS = [`Session: ${SESSION_URL}`, `Brick: ${BRICK_URL}`, `Seat: ${SEAT_URL}`];
+const BOB_TRAILER = "Co-Authored-By: Bob <bob@example.invalid>";
+
+type GitRepo = { dir: string; git: (...args: string[]) => string };
+
+// A fresh repo whose hooks dir holds ONLY the prepare-commit-msg hook under test.
+// Transcript env is dropped, so no Message: trailer joins the expected set.
+function makeGitRepo(): GitRepo {
+  const dir = mkdtempSync(join(tmpdir(), "acpx-hook-git-"));
+  const hooksDir = join(dir, "hooks");
+  mkdirSync(hooksDir);
+  symlinkSync(HOOK, join(hooksDir, "prepare-commit-msg"));
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v !== undefined && !k.startsWith("CLAUDE_") && !k.startsWith("GIT_")) {
+      env[k] = v;
+    }
+  }
+  Object.assign(env, {
+    ACPX_SESSION_URL: SESSION_URL,
+    ACPX_BRICK: BRICK_ID,
+    ACPX_SEAT_URL: SEAT_URL,
+    GIT_EDITOR: "true",
+    GIT_MERGE_AUTOEDIT: "no",
+  });
+  const git = (...args: string[]): string =>
+    execFileSync(
+      "git",
+      [
+        "-c",
+        `core.hooksPath=${hooksDir}`,
+        "-c",
+        "user.name=hook-test",
+        "-c",
+        "user.email=hook-test@example.invalid",
+        ...args,
+      ],
+      { cwd: dir, env, encoding: "utf8" },
+    );
+  git("init", "-q", "-b", "main");
+  git("commit", "-q", "--allow-empty", "-m", "base");
+  return { dir, git };
+}
+
+// Each side adds its own file, so `git merge --no-ff side` never conflicts.
+function branchOffMain(repo: GitRepo): void {
+  repo.git("checkout", "-q", "-b", "side");
+  writeFileSync(join(repo.dir, "side.txt"), "side\n");
+  repo.git("add", "side.txt");
+  repo.git("commit", "-q", "-m", "side work");
+  repo.git("checkout", "-q", "main");
+  writeFileSync(join(repo.dir, "main.txt"), "main\n");
+  repo.git("add", "main.txt");
+  repo.git("commit", "-q", "-m", "main work");
+}
+
+// Every trailer git parses from the last commit, in order, as "Key: value" lines.
+function trailersOfHead(repo: GitRepo): string[] {
+  return repo
+    .git("log", "-1", "--format=%(trailers:unfold)")
+    .split("\n")
+    .filter((l) => l.length > 0);
+}
+
+test("hook (git): normal commit with a body → one trailer block", () => {
+  const repo = makeGitRepo();
+  repo.git("commit", "-q", "--allow-empty", "-m", "feat: with body", "-m", "Body paragraph.");
+  assert.deepEqual(trailersOfHead(repo), ALL_TRAILERS);
+  rmSync(repo.dir, { recursive: true, force: true });
+});
+
+test("hook (git): one-line -m commit → one trailer block", () => {
+  const repo = makeGitRepo();
+  repo.git("commit", "-q", "--allow-empty", "-m", "feat: one line");
+  assert.deepEqual(trailersOfHead(repo), ALL_TRAILERS);
+  rmSync(repo.dir, { recursive: true, force: true });
+});
+
+test("hook (git): merge with a one-line -m keeps its trailers (unterminated MERGE_MSG)", () => {
+  const repo = makeGitRepo();
+  branchOffMain(repo);
+  repo.git("merge", "--no-ff", "-m", "Merge side into main", "side");
+  assert.deepEqual(trailersOfHead(repo), ALL_TRAILERS);
+  assert.equal(repo.git("log", "-1", "--format=%P").trim().split(" ").length, 2, "is a merge");
+  assert.equal(
+    repo.git("log", "-1", "--format=%(trailers:key=Session,valueonly)").trim(),
+    SESSION_URL,
+  );
+  // One paragraph for the subject, one for the trailers: nothing between them but a blank line.
+  assert.equal(
+    repo.git("log", "-1", "--format=%B").trimEnd(),
+    ["Merge side into main", "", ...ALL_TRAILERS].join("\n"),
+  );
+  rmSync(repo.dir, { recursive: true, force: true });
+});
+
+test("hook (git): merge with a body keeps its trailers", () => {
+  const repo = makeGitRepo();
+  branchOffMain(repo);
+  repo.git("merge", "--no-ff", "-m", "Merge side into main", "-m", "Body paragraph.", "side");
+  assert.deepEqual(trailersOfHead(repo), ALL_TRAILERS);
+  rmSync(repo.dir, { recursive: true, force: true });
+});
+
+test("hook (git): git's default merge message keeps its trailers", () => {
+  const repo = makeGitRepo();
+  branchOffMain(repo);
+  repo.git("merge", "--no-ff", "side");
+  assert.match(repo.git("log", "-1", "--format=%s"), /^Merge branch 'side'/);
+  assert.deepEqual(trailersOfHead(repo), ALL_TRAILERS);
+  rmSync(repo.dir, { recursive: true, force: true });
+});
+
+test("hook (git): default merge message with # comment lines (conflict resolved) keeps its trailers", () => {
+  const repo = makeGitRepo();
+  writeFileSync(join(repo.dir, "clash.txt"), "base\n");
+  repo.git("add", "clash.txt");
+  repo.git("commit", "-q", "-m", "add clash");
+  repo.git("checkout", "-q", "-b", "side");
+  writeFileSync(join(repo.dir, "clash.txt"), "side\n");
+  repo.git("commit", "-q", "-am", "side edit");
+  repo.git("checkout", "-q", "main");
+  writeFileSync(join(repo.dir, "clash.txt"), "main\n");
+  repo.git("commit", "-q", "-am", "main edit");
+  assert.throws(() => repo.git("merge", "--no-ff", "side"), "the merge must stop on a conflict");
+  const mergeMsg = readFileSync(join(repo.dir, ".git", "MERGE_MSG"), "utf8");
+  assert.match(mergeMsg, /^#/m, `MERGE_MSG should carry # comment lines: ${mergeMsg}`);
+  writeFileSync(join(repo.dir, "clash.txt"), "resolved\n");
+  repo.git("add", "clash.txt");
+  repo.git("commit", "-q", "--no-edit");
+  assert.deepEqual(trailersOfHead(repo), ALL_TRAILERS);
+  rmSync(repo.dir, { recursive: true, force: true });
+});
+
+test("hook (git): --amend adds no duplicate trailers (commit and merge)", () => {
+  const repo = makeGitRepo();
+  repo.git("commit", "-q", "--allow-empty", "-m", "feat: to amend");
+  repo.git("commit", "-q", "--amend", "--allow-empty", "--no-edit");
+  repo.git("commit", "-q", "--amend", "--allow-empty", "-m", "feat: to amend, reworded");
+  assert.deepEqual(trailersOfHead(repo), ALL_TRAILERS);
+
+  branchOffMain(repo);
+  repo.git("merge", "--no-ff", "-m", "Merge side into main", "side");
+  repo.git("commit", "-q", "--amend", "--allow-empty", "--no-edit");
+  assert.deepEqual(trailersOfHead(repo), ALL_TRAILERS);
+  rmSync(repo.dir, { recursive: true, force: true });
+});
+
+test("hook (git): a message already ending in a trailer gets ours in the same block", () => {
+  const repo = makeGitRepo();
+  repo.git("commit", "-q", "--allow-empty", "-m", "feat: co-authored", "-m", BOB_TRAILER);
+  assert.deepEqual(trailersOfHead(repo), [BOB_TRAILER, ...ALL_TRAILERS]);
+
+  branchOffMain(repo);
+  repo.git("merge", "--no-ff", "-m", "Merge side into main", "-m", BOB_TRAILER, "side");
+  assert.deepEqual(trailersOfHead(repo), [BOB_TRAILER, ...ALL_TRAILERS]);
+  rmSync(repo.dir, { recursive: true, force: true });
+});
+
+// File-level: the unterminated last line is the trigger, whatever git command wrote it.
+test("hook: a message whose last line has no newline still gets one trailer block", () => {
+  for (const subject of [
+    "Merge side into main",
+    "feat: body\n\nBody paragraph, unterminated",
+    "feat: two\nlines, no blank",
+  ]) {
+    const { dir, message } = runHookWithTranscript({
+      subject,
+      extraEnv: { ACPX_BRICK: BRICK_ID, ACPX_SEAT_URL: SEAT_URL },
+    });
+    const parsed = execFileSync("git", ["interpret-trailers", "--parse"], {
+      cwd: dir,
+      input: message,
+      encoding: "utf8",
+    })
+      .split("\n")
+      .filter((l) => l.length > 0);
+    assert.deepEqual(parsed, ALL_TRAILERS, JSON.stringify(message));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("hook: messages that already end in a newline come out unchanged by the terminator step", () => {
+  const { message } = runHookWithTranscript({
+    subject: "feat: terminated\n\nBody.\n",
+    extraEnv: { ACPX_BRICK: BRICK_ID, ACPX_SEAT_URL: SEAT_URL },
+  });
+  assert.equal(message, ["feat: terminated", "", "Body.", "", ...ALL_TRAILERS, ""].join("\n"));
 });
