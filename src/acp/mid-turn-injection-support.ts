@@ -67,19 +67,47 @@ export function injectionReturnsTerminalResponse(agentCommand: string): boolean 
   }
 }
 
-// Whether this backend's adapter emits an end-of-turn marker session update
-// (`_claude/lastTurnEndReason` for Claude; `_codex/lastTurnEndReason`
-// for codex-acp since the 493729fc F1 fix) that the C1 turn-completion watchdog
-// can arm on. Safe to include a backend whose DEPLOYED adapter predates its
-// marker: the watchdog only starts timers when a marker is actually seen, so
-// with no marker it never fires and long-running turns are never truncated.
-export function emitsTurnEndMarker(agentCommand: string): boolean {
+/**
+ * What may arm the C1 turn-completion watchdog for this backend (brick a147982f).
+ *
+ *  - `claude-prompt-lifecycle` — claude-agent-acp. ONLY a `_claude/promptLifecycle` ext
+ *    notification whose `promptId` equals the guarded attempt's own `_claude/promptId`
+ *    arms it. The adapter's `_claude/lastTurnEndReason` `usage_update` marker never does:
+ *    it rides on an SDK `result`, which ends one model loop, not the ACP prompt — a
+ *    background Agent re-drives the model inside the same prompt after it, and the marker
+ *    carries no prompt identity. Arming on it cut live work in at least 34 of 39 Claude
+ *    firings. A deployed adapter that predates the lifecycle signal therefore leaves the
+ *    Claude watchdog DORMANT — never firing, which is the safe direction.
+ *  - `codex-turn-marker` — codex-acp. Only `_codex/lastTurnEndReason` (493729fc F1) arms it,
+ *    exactly as before.
+ *  - `none` — everything else, claude-pty-acp and pi-acp included: no watchdog at all.
+ *
+ * ⚠️ DO NOT route a Claude-family adapter to `codex-turn-marker`, and do not make
+ * `claude-prompt-lifecycle` fall back to the usage_update marker "for older adapters".
+ * That fallback IS the bug. `test/turn-watchdog-arming.test.ts` pins this table against real
+ * command lines sampled from the live session store.
+ */
+export type TurnWatchdogArming = "claude-prompt-lifecycle" | "codex-turn-marker" | "none";
+
+export function turnWatchdogArming(agentCommand: string): TurnWatchdogArming {
   try {
     const { command, args } = splitCommandLine(agentCommand);
-    return isClaudeAcpCommand(command, args) || isCodexAcpCommand(command, args);
+    if (isClaudeAcpCommand(command, args)) {
+      return "claude-prompt-lifecycle";
+    }
+    if (isCodexAcpCommand(command, args)) {
+      return "codex-turn-marker";
+    }
+    return "none";
   } catch {
-    return false;
+    return "none";
   }
+}
+
+// Whether this backend has a C1 turn-completion watchdog at all. What arms it is
+// harness-specific — see `turnWatchdogArming`.
+export function emitsTurnEndMarker(agentCommand: string): boolean {
+  return turnWatchdogArming(agentCommand) !== "none";
 }
 
 // Whether a non-waiting injected prompt is known to be absorbed into the

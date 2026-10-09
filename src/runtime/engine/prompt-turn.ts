@@ -9,7 +9,7 @@ type PromptTurnClient = {
   prompt: (
     sessionId: string,
     prompt: PromptInput | string,
-    options?: { messageId?: string; turnContext?: boolean },
+    options?: { messageId?: string; turnContext?: boolean; promptId?: string },
   ) => Promise<{ stopReason: RunPromptResult["stopReason"]; _meta?: unknown }>;
   waitForSessionUpdatesIdle?: (options?: { idleMs?: number; timeoutMs?: number }) => Promise<void>;
 };
@@ -85,6 +85,8 @@ export async function runPromptTurn(params: {
   conversation: SessionConversation;
   promptMessageId?: string;
   messageId?: string;
+  /** brick a147982f — forwarded as `AcpPromptOptions.promptId` (`_claude/promptId`). */
+  promptId?: string;
   onPromptStarted?: () => Promise<void> | void;
 }): Promise<{
   stopReason: RunPromptResult["stopReason"];
@@ -105,6 +107,7 @@ export async function runPromptTurn(params: {
     const promptPromise = params.client.prompt(params.sessionId, params.prompt, {
       messageId: params.messageId,
       turnContext: true,
+      promptId: params.promptId,
     });
     await params.onPromptStarted?.();
     const response = await withTimeout(promptPromise, params.timeoutMs);

@@ -3,7 +3,7 @@ import path from "node:path";
 import type { PromptResponse } from "@agentclientprotocol/sdk";
 import type { EffectiveAccountMetadata } from "../../acp/auth-env.js";
 import { splitCommandLine } from "../../acp/client-process.js";
-import { AcpClient } from "../../acp/client.js";
+import { AcpClient, type AcpPromptOptions } from "../../acp/client.js";
 import { isCodexAcpCommand } from "../../acp/codex-compat.js";
 import {
   formatErrorMessage,
@@ -11,9 +11,9 @@ import {
   normalizeOutputError,
 } from "../../acp/error-normalization.js";
 import {
-  emitsTurnEndMarker,
   injectionAbsorbsIntoActiveTurn,
   injectionReturnsTerminalResponse,
+  turnWatchdogArming,
 } from "../../acp/mid-turn-injection-support.js";
 import { assertRequestedModelSupported } from "../../acp/model-support.js";
 import { explainTurnError, type RefusalProbeDeps } from "../../acp/openrouter-refusal-reason.js";
@@ -89,10 +89,16 @@ import {
   hasCompletedDeliveryFor,
   type DeliveryEventError,
   type DeliveryPhase,
+  type DeliveryRecoveredBy,
   type DeliveryStopReason,
 } from "../../session/delivery-events.js";
 import { defaultSessionEventLog } from "../../session/event-log.js";
-import { listSessionEvents, SessionEventWriter } from "../../session/events.js";
+import {
+  CLAUDE_PROMPT_LIFECYCLE_METHOD,
+  listSessionEvents,
+  SessionEventWriter,
+  TURN_WATCHDOG_EVENT_METHOD,
+} from "../../session/events.js";
 import { LiveSessionCheckpoint } from "../../session/live-checkpoint.js";
 import { copyLoggedMessageCount } from "../../session/messages-log-bookkeeping.js";
 import {
@@ -163,6 +169,8 @@ import {
   QUEUE_TURN_START_FAILED_MESSAGE,
   SESSION_CLOSED_UNDELIVERED_DETAIL_CODE,
   SESSION_CLOSED_UNDELIVERED_MESSAGE,
+  TURN_WATCHDOG_CANCELLED_DETAIL_CODE,
+  TURN_WATCHDOG_CANCELLED_MESSAGE,
 } from "../queue/delivery-terminals.js";
 import {
   appendDeliveryStreamEventSync,
@@ -617,38 +625,42 @@ export async function drainInjectedPromptsWithBackstop(
   return { timedOut, pending };
 }
 
-// --- C1: turn-completion watchdog (G1) -------------------------------------
-// The adapter's own end-of-turn marker: for Claude the terminal
-// `usage_update` carrying `_meta._claude/lastTurnEndReason` (the same signal
-// acpx-ui reads); for codex-acp (493729fc F1) the `session_info_update` carrying
-// `_meta._codex/lastTurnEndReason` emitted on `turn/completed`. It rides on a
-// REAL message and can appear on either the notification-level or the
-// update-level `_meta`. Seeing it proves the adapter's turn ended; if the
-// response is then still overdue, the response was withheld (the Claude adapter
-// routing hole, or a codex minted-turn-id regression) and the watchdog recovers
-// — a turn with NO marker never triggers, so genuinely long-running work can
-// never be truncated.
-const TURN_END_MARKER_META_KEYS = [
-  "_claude/lastTurnEndReason",
-  "_codex/lastTurnEndReason",
-] as const;
+// --- C1: turn-completion watchdog (G1; arming reworked by brick a147982f) ---
+// The watchdog bounds a main-turn `client.prompt()` await whose response is
+// WITHHELD after the adapter's turn has provably ended. What counts as "provably
+// ended" is harness-specific (`turnWatchdogArming`):
+//
+//  - Claude: ONLY a `_claude/promptLifecycle` ext notification whose `promptId`
+//    equals the guarded attempt's own `_claude/promptId`. `phase:"sdk_idle"` comes
+//    from the adapter's reader when the SDK reports `session_state_changed: idle`
+//    while that prompt owns the stream (so it survives a prompt-loop routing hole);
+//    `phase:"completing"` comes from the prompt loop just before it returns and
+//    carries the end reason.
+//  - codex-acp: the `session_info_update` carrying `_meta._codex/lastTurnEndReason`
+//    emitted on `turn/completed` (493729fc F1), unchanged.
+//
+// ⚠️ The Claude `usage_update` carrying `_meta._claude/lastTurnEndReason` does NOT
+// arm, and must not be made to "for older adapters". It rides on an SDK `result`,
+// which ends ONE model loop, not the ACP prompt: a background Agent re-drives the
+// model inside the same prompt after it, the adapter re-stamps it on later results,
+// and it carries no prompt identity. The old claim here — that the marker proves the
+// turn ended, so long-running work can never be truncated — was false, and the
+// watchdog cut live work in at least 34 of 39 Claude firings (brick a147982f
+// CONCEPTION §2.3). With today's adapter (no lifecycle signal) the Claude watchdog
+// is therefore dormant. `test/turn-watchdog-lifecycle.test.ts` N1/N3 pin this.
+const CODEX_TURN_END_MARKER_META_KEY = "_codex/lastTurnEndReason";
 
 const TURN_END_MARKER_UPDATE_TYPES = new Set(["usage_update", "session_info_update"]);
 
-function readTurnEndReason(meta: unknown): string | undefined {
+function readCodexTurnEndReason(meta: unknown): string | undefined {
   if (!meta || typeof meta !== "object") {
     return undefined;
   }
-  for (const key of TURN_END_MARKER_META_KEYS) {
-    const value = (meta as Record<string, unknown>)[key];
-    if (typeof value === "string" && value.length > 0) {
-      return value;
-    }
-  }
-  return undefined;
+  const value = (meta as Record<string, unknown>)[CODEX_TURN_END_MARKER_META_KEY];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
-function turnEndReasonFromNotification(notification: SessionNotification): string | undefined {
+function codexTurnEndReasonFromNotification(notification: SessionNotification): string | undefined {
   const update = (notification as { update?: unknown }).update as
     | Record<string, unknown>
     | undefined;
@@ -656,29 +668,96 @@ function turnEndReasonFromNotification(notification: SessionNotification): strin
     return undefined;
   }
   return (
-    readTurnEndReason((notification as { _meta?: unknown })._meta) ??
-    readTurnEndReason(update._meta)
+    readCodexTurnEndReason((notification as { _meta?: unknown })._meta) ??
+    readCodexTurnEndReason(update._meta)
   );
 }
 
-// Genuine completions the end-marker can report. Used for the Q2 reconciliation:
-// when tier-1's cancel recovers a turn whose marker already reported one of these,
-// the delivery terminal reports that semantic truth rather than the `cancelled`
-// our own nudge produced.
+type PromptLifecycleSignal = {
+  promptId: string;
+  phase: "sdk_idle" | "completing";
+  lastTurnEndReason?: string;
+};
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function promptLifecycleParams(message: AcpJsonRpcMessage): Record<string, unknown> {
+  const { method, params } = message as { method?: unknown; params?: unknown };
+  if (method !== CLAUDE_PROMPT_LIFECYCLE_METHOD || !params || typeof params !== "object") {
+    return {};
+  }
+  return params as Record<string, unknown>;
+}
+
+// A `_claude/promptLifecycle` notification's signal, or `undefined` for any other
+// message or a malformed one — which then simply does not arm.
+function readPromptLifecycleSignal(message: AcpJsonRpcMessage): PromptLifecycleSignal | undefined {
+  const params = promptLifecycleParams(message);
+  const promptId = nonEmptyString(params.promptId);
+  const phase = params.phase;
+  if (promptId === undefined || (phase !== "sdk_idle" && phase !== "completing")) {
+    return undefined;
+  }
+  const lastTurnEndReason = nonEmptyString(params.lastTurnEndReason);
+  return { promptId, phase, ...(lastTurnEndReason !== undefined ? { lastTurnEndReason } : {}) };
+}
+
+type TurnWatchdogArmedBy = "sdk_idle" | "completing" | "codex_marker";
+
+// Genuine completions the arming signal can report.
 const COMPLETION_TURN_END_REASONS = new Set(["end_turn", "max_tokens", "max_turns"]);
 
-function reconcileStopReasonWithMarker(
+export type TurnWatchdogReconciliation =
+  // Not the watchdog's doing: report the raw stop reason exactly as before.
+  | { kind: "unchanged" }
+  // The tier-1 cancel settled a turn that had already ended — nothing arrived after
+  // the arming signal. `stopReason` is the signal's reason, or `null` when it carried
+  // none (armed by `sdk_idle` alone).
+  | { kind: "recovered"; stopReason: DeliveryStopReason }
+  // The tier-1 cancel stopped a turn that was still producing output.
+  | { kind: "cut" };
+
+/**
+ * Q2, made honest (brick a147982f X3). Only a cancel the WATCHDOG sent can be
+ * reconciled, and only when no `session/update` arrived after the signal that armed
+ * it. A user or owner cancel is never rewritten, whatever marker preceded it — it
+ * used to be, whenever any marker had been seen, which reported cut work as
+ * `end_turn`.
+ */
+export function reconcileStopReasonWithMarker(
   rawStopReason: RunPromptResult["stopReason"],
   endMarkerReason: string | undefined,
-): RunPromptResult["stopReason"] {
-  if (
-    rawStopReason === "cancelled" &&
-    endMarkerReason !== undefined &&
-    COMPLETION_TURN_END_REASONS.has(endMarkerReason)
-  ) {
-    return endMarkerReason as RunPromptResult["stopReason"];
+  watchdog: { watchdogCancelSent: boolean; updatesAfterArm: number },
+): TurnWatchdogReconciliation {
+  if (rawStopReason !== "cancelled" || !watchdog.watchdogCancelSent) {
+    return { kind: "unchanged" };
   }
-  return rawStopReason;
+  if (watchdog.updatesAfterArm > 0) {
+    return { kind: "cut" };
+  }
+  if (endMarkerReason === "cancelled") {
+    return { kind: "recovered", stopReason: "cancelled" };
+  }
+  return {
+    kind: "recovered",
+    stopReason:
+      endMarkerReason !== undefined && COMPLETION_TURN_END_REASONS.has(endMarkerReason)
+        ? (endMarkerReason as DeliveryStopReason)
+        : null,
+  };
+}
+
+// The delivery phase of a recovered terminal: `done`, unless the arming signal itself
+// said the turn ended cancelled.
+function recoveredDeliveryPhase(
+  reconciliation: TurnWatchdogReconciliation,
+): Exclude<DeliveryPhase, "accepted"> | undefined {
+  if (reconciliation.kind !== "recovered") {
+    return undefined;
+  }
+  return reconciliation.stopReason === "cancelled" ? "cancelled" : "done";
 }
 
 // Tier-2 turn-response timeout: retryable + a stable detailCode the UI (D-lane)
@@ -715,10 +794,11 @@ function resolveTurnResponseTimeoutMs(): number {
 type TurnWatchdogOptions = {
   timeoutMs: number;
   sessionId: string;
-  // Tier 1 (nudge): the SDK turn ended but the response is overdue — cancel the
-  // active prompt so the withheld response/cancel result settles through the
-  // adapter's existing cancel path. No work is lost (the marker proved the turn
-  // already ended).
+  // Tier 1 (nudge): an attributed signal said the adapter's turn ended but the
+  // response is overdue — cancel the active prompt so the withheld response/cancel
+  // result settles through the adapter's existing cancel path. Whether work was cut
+  // is decided afterwards from what arrived since arming
+  // (`reconcileStopReasonWithMarker`), never assumed here.
   onTier1: () => void;
   // Tier 2 (bound): still unsettled a second interval later — abandon the turn.
   // Runs just before the guarded turn promise is rejected so late continuations
@@ -728,11 +808,13 @@ type TurnWatchdogOptions = {
 };
 
 /**
- * Bounds a main-turn `client.prompt()` await once the adapter has emitted its
- * end-of-turn marker. Two tiers, each `timeoutMs` apart: tier 1 nudges (cancel),
- * tier 2 rejects the guarded promise with a retryable {@link TurnResponseTimeoutError}.
- * The clock only starts when {@link noteEndMarker} is called from the production
- * session-update tap — no marker, no timers, so live work is never truncated.
+ * Bounds a main-turn `client.prompt()` await once an arming signal says the
+ * adapter's turn ended (`turnWatchdogArming`). Two tiers, each `timeoutMs` apart:
+ * tier 1 nudges (cancel), tier 2 rejects the guarded promise with a retryable
+ * {@link TurnResponseTimeoutError}. The clock starts at the FIRST
+ * {@link noteEndMarker} call and never re-arms; no signal, no timers. That bounds
+ * live work only as well as the signal is true, which is why Claude arms on the
+ * attributed prompt-lifecycle signal alone.
  */
 class TurnWatchdog {
   private endMarkerSeenAt: number | undefined;
@@ -743,9 +825,10 @@ class TurnWatchdog {
 
   constructor(private readonly options: TurnWatchdogOptions) {}
 
-  noteEndMarker(): void {
+  /** Starts the clock. True only for the call that armed it. */
+  noteEndMarker(): boolean {
     if (this.disposed || this.endMarkerSeenAt !== undefined) {
-      return;
+      return false;
     }
     this.endMarkerSeenAt = Date.now();
     const { timeoutMs } = this.options;
@@ -760,6 +843,7 @@ class TurnWatchdog {
       this.rejectTurn?.(new TurnResponseTimeoutError(this.options.sessionId, timeoutMs * 2));
     }, timeoutMs * 2);
     this.tier2Timer.unref?.();
+    return true;
   }
 
   async guard<T>(turnPromise: Promise<T>): Promise<T> {
@@ -1975,19 +2059,72 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   let eventWriterClosed = false;
   const acceptedDeliveryKeys = new Set<string>();
   const terminalDeliveryKeys = new Set<string>();
-  // C1 turn-completion watchdog. Backend-gated to the set whose adapter emits
-  // an end-of-turn marker: Claude (`_claude/lastTurnEndReason`) and
-  // codex-acp (`_codex/lastTurnEndReason`, 493729fc F2 — bounds the wedged-main
-  // class instead of holding the turn open indefinitely). Arming is
-  // marker-driven, so a deployed codex adapter that predates its marker simply
-  // never triggers it. `activeTurnWatchdog` is the per-attempt instance the
-  // production session-update tap feeds; `turnAbandoned` suppresses a tier-2
-  // abandoned turn's late continuations; `endMarkerReasonThisTurn` carries the
-  // marker's reason for the Q2 stop-reason reconciliation.
-  const turnWatchdogEnabled = emitsTurnEndMarker(record.agentCommand);
+  // C1 turn-completion watchdog. WHAT arms it is harness-specific
+  // (`turnWatchdogArming`, brick a147982f): for Claude only an attributed
+  // `_claude/promptLifecycle` signal (the inbound wire tap below), for codex-acp
+  // only its `_codex/lastTurnEndReason` marker (the session-update tap, 493729fc
+  // F2), for anything else nothing. A deployed adapter that sends no arming signal
+  // never triggers it — today's claude-agent-acp included, so the Claude watchdog
+  // stays dormant until the adapter ships the lifecycle signal.
+  //
+  // Per-attempt state, reset in `runPromptAttempt`:
+  //  - `activeTurnWatchdog` — the instance the taps feed while the guard is up;
+  //  - `guardedPromptIdThisTurn` — the `_claude/promptId` this attempt sent; a
+  //    lifecycle signal carrying any other id (an injected or orphaned prompt's)
+  //    never arms it;
+  //  - `endMarkerReasonThisTurn` — the reason the arming signal reported, if any;
+  //  - `watchdogArmedBy` / `watchdogArmedAt` — what armed it, for the stream record;
+  //  - `watchdogCancelSent` / `updatesAfterArm` — whether tier 1 cancelled, and how
+  //    many `session/update` frames arrived between arming and that cancel:
+  //    together they decide whether the cancel recovered an ended turn or cut a
+  //    live one (`reconcileStopReasonWithMarker`). Frames after the cancel are the
+  //    adapter answering it and say nothing about whether work was still going on;
+  //  - `turnAbandoned` — suppresses a tier-2 abandoned turn's late continuations.
+  const turnWatchdogArmingMode = turnWatchdogArming(record.agentCommand);
+  const turnWatchdogEnabled = turnWatchdogArmingMode !== "none";
   let activeTurnWatchdog: TurnWatchdog | undefined;
   let turnAbandoned = false;
   let endMarkerReasonThisTurn: string | undefined;
+  let guardedPromptIdThisTurn: string | undefined;
+  let watchdogArmedBy: TurnWatchdogArmedBy | undefined;
+  let watchdogArmedAt: number | undefined;
+  let watchdogCancelSent = false;
+  let updatesAfterArm = 0;
+  const armTurnWatchdog = (armedBy: TurnWatchdogArmedBy): void => {
+    if (activeTurnWatchdog?.noteEndMarker()) {
+      watchdogArmedBy = armedBy;
+      watchdogArmedAt = Date.now();
+    }
+  };
+  // The inbound wire tap's half of C1. Both the Claude arming signal and the frames
+  // counted after it are read here, in wire order — the SDK dispatches
+  // `session/update` to the session-update tap asynchronously, so counting there
+  // could attribute a frame sent BEFORE the signal to the time after it.
+  const armOnPromptLifecycle = (message: AcpJsonRpcMessage): void => {
+    const signal = readPromptLifecycleSignal(message);
+    // Attributed only: a signal for any other prompt (an injected or orphaned one,
+    // or a previous attempt) never arms this attempt.
+    if (signal === undefined || signal.promptId !== guardedPromptIdThisTurn) {
+      return;
+    }
+    // `completing` carries the reason; whichever attributed signal comes first
+    // (normally `sdk_idle`) starts the clock.
+    if (signal.lastTurnEndReason !== undefined) {
+      endMarkerReasonThisTurn = signal.lastTurnEndReason;
+    }
+    armTurnWatchdog(signal.phase);
+  };
+  const observeTurnWatchdogInbound = (message: AcpJsonRpcMessage): void => {
+    if ((message as { method?: unknown }).method === "session/update") {
+      if (watchdogArmedBy !== undefined && !watchdogCancelSent) {
+        updatesAfterArm += 1;
+      }
+      return;
+    }
+    if (turnWatchdogArmingMode === "claude-prompt-lifecycle") {
+      armOnPromptLifecycle(message);
+    }
+  };
 
   const appendDeliveryEvent = async (
     context: DeliveryContext | undefined,
@@ -1997,6 +2134,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       error?: DeliveryEventError;
       /** brick ddd76838 — forward the adapter's steer-ack flag onto the terminal. */
       steered?: boolean;
+      /** brick a147982f — the C1 watchdog recovered this terminal (forensic). */
+      recoveredBy?: DeliveryRecoveredBy;
       terminal?: boolean;
     } = {},
   ): Promise<void> => {
@@ -2052,6 +2191,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         error: params.error,
         ...(params.steered ? { steered: true } : {}),
         ...(warning ? { warning } : {}),
+        ...(params.recoveredBy ? { recoveredBy: params.recoveredBy } : {}),
       }),
     );
     markDeliveryEvent({
@@ -2091,13 +2231,18 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       error?: DeliveryEventError;
       /** brick ddd76838 — forward the adapter's steer-ack flag onto the terminal. */
       steered?: boolean;
+      /** brick a147982f — the C1 watchdog recovered this terminal (forensic). */
+      recoveredBy?: DeliveryRecoveredBy;
     } = {},
   ): Promise<void> => {
     // 71fdcaf2 (S5.4) — THE ONE CHOKE POINT for every terminal this runtime writes (main turn, injected turn,
     // absorbed sweep). A turn CANCELLED while this owner is draining for a session close is the close's doing,
     // not a Stop: the message reached the agent and never settled, so it is `failed` with the outcome-unknown
     // code acpx-ui notifies the sender on — never a code-less `cancelled`. A cancel with NO close stays one.
-    if (phase === "cancelled" && isSessionCloseDrainActive(record.acpxRecordId)) {
+    // brick a147982f — a turn the C1 watchdog's cancel cut is a cancel too: during a close drain the close wins.
+    const watchdogCut =
+      phase === "failed" && params.error?.detailCode === TURN_WATCHDOG_CANCELLED_DETAIL_CODE;
+    if ((phase === "cancelled" || watchdogCut) && isSessionCloseDrainActive(record.acpxRecordId)) {
       await appendDeliveryEvent(context, "failed", {
         error: {
           code: 0,
@@ -2331,6 +2476,19 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     injectedTask.close();
   };
 
+  // brick a147982f X1 — an injected prompt carries its OWN `_claude/promptId`, so the
+  // adapter can attribute its lifecycle signals; never the guarded turn's, so they can
+  // never arm that turn's watchdog. Non-Claude backends get exactly the options they
+  // always got.
+  const injectedPromptOptions = (messageId: string | undefined): AcpPromptOptions | undefined => {
+    const promptId =
+      turnWatchdogArmingMode === "claude-prompt-lifecycle" ? crypto.randomUUID() : undefined;
+    if (promptId === undefined) {
+      return messageId !== undefined ? { messageId } : undefined;
+    }
+    return { ...(messageId !== undefined ? { messageId } : {}), promptId };
+  };
+
   const runInjectedPromptTask = async (
     sessionId: string,
     injectedTask: QueueTask,
@@ -2352,7 +2510,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       const injectedResponsePromise = client.prompt(
         sessionId,
         injectedPrompt,
-        injectedTask.messageId !== undefined ? { messageId: injectedTask.messageId } : undefined,
+        injectedPromptOptions(injectedTask.messageId),
       );
       absorbedDelivery = createAbsorbedInjectedDelivery(injectedTask, injectedDeliveryContext);
       const injectedResponse = await injectedResponsePromise;
@@ -2591,6 +2749,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       sawAcpMessage = true;
       if (direction === "inbound") {
         lastAgentProgressAt = Date.now();
+        observeTurnWatchdogInbound(message);
       }
       pendingMessages.push(message);
       // Route messages with subagentId to the child stream as well
@@ -2658,14 +2817,15 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       // "the delivery was not silent".
       sessionUpdateFrameCount += 1;
       trackOpenToolCall(openToolCalls, notification);
-      // C1: the watchdog listens on the live session-update tap. The end-of-turn
-      // marker arriving here (during the main prompt's await) arms the response
-      // bound; nothing else in this handler changes for the common path.
-      if (turnWatchdogEnabled) {
-        const endReason = turnEndReasonFromNotification(notification);
+      // C1, codex half: codex-acp's `_codex/lastTurnEndReason` marker arriving here
+      // (during the main prompt's await) arms the response bound. A Claude turn is
+      // never armed from this tap — only by its attributed lifecycle signal
+      // (`observeTurnWatchdogInbound`).
+      if (turnWatchdogArmingMode === "codex-turn-marker") {
+        const endReason = codexTurnEndReasonFromNotification(notification);
         if (endReason !== undefined) {
           endMarkerReasonThisTurn = endReason;
-          activeTurnWatchdog?.noteEndMarker();
+          armTurnWatchdog("codex_marker");
         }
       }
       // A turn abandoned at tier 2 may still emit late updates when its withheld
@@ -3222,9 +3382,17 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
 
   const runPromptAttempt = async (sessionId: string, attempt: number) => {
     const promptStartedAt = Date.now();
-    // Fresh watchdog state for this attempt (a retry re-arms cleanly).
+    // Fresh watchdog state for this attempt (a retry re-arms cleanly, under a NEW
+    // prompt id, so a late signal from the failed attempt cannot arm it).
     turnAbandoned = false;
     endMarkerReasonThisTurn = undefined;
+    watchdogArmedBy = undefined;
+    watchdogArmedAt = undefined;
+    watchdogCancelSent = false;
+    updatesAfterArm = 0;
+    guardedPromptIdThisTurn =
+      turnWatchdogArmingMode === "claude-prompt-lifecycle" ? crypto.randomUUID() : undefined;
+    const promptId = guardedPromptIdThisTurn;
     await appendDeliveryEvent(mainDeliveryContext, "accepted");
     // The seat's level as of this turn, and the detector visible to the turn-context
     // channel while this turn's prompt is composed (brick 4f3fa88c).
@@ -3239,18 +3407,20 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         conversation,
         promptMessageId,
         messageId: options.messageId,
+        ...(promptId !== undefined ? { promptId } : {}),
         onPromptStarted: buildPromptStartedHook(sessionId, attempt),
       });
       if (!turnWatchdogEnabled) {
         return await turnPromise;
       }
       // Bound the await against a withheld response. The watchdog only arms once
-      // the end-of-turn marker reaches the session-update tap above; until then
-      // this is a plain `await turnPromise`.
+      // an arming signal reaches one of the taps above (`turnWatchdogArming`);
+      // until then this is a plain `await turnPromise`.
       const watchdog = new TurnWatchdog({
         timeoutMs: resolveTurnResponseTimeoutMs(),
         sessionId: record.acpxRecordId,
         onTier1: () => {
+          watchdogCancelSent = true;
           void client.requestCancelActivePrompt().catch(() => {
             // Best effort: the nudge either settles the withheld prompt or tier 2
             // bounds it. Never let the cancel's own failure escape the watchdog.
@@ -3260,12 +3430,32 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
           turnAbandoned = true;
         },
         log: (tier, elapsedMs) => {
+          // X4 — the watchdog names itself as the origin of what follows, in the
+          // stream (activity-neutral), ahead of the `session/cancel` it is about to
+          // send. Queued with the wire messages so it keeps their order.
+          pendingMessages.push({
+            jsonrpc: "2.0",
+            method: TURN_WATCHDOG_EVENT_METHOD,
+            params: {
+              tier,
+              sessionId: record.acpxRecordId,
+              promptId: guardedPromptIdThisTurn ?? null,
+              armedBy: watchdogArmedBy ?? null,
+              markerReason: endMarkerReasonThisTurn ?? null,
+              armedAt:
+                watchdogArmedAt !== undefined ? new Date(watchdogArmedAt).toISOString() : null,
+              overdueMs: elapsedMs,
+              action: tier === 1 ? "cancel" : "abandon",
+              at: new Date().toISOString(),
+            },
+          } as AcpJsonRpcMessage);
           // Diagnosable, NON-verbose-gated → owner.log (mirrors the drain-backstop
           // line). The owner's stderr is its own owner.log fd, never a client's
-          // JSON-RPC stream.
+          // JSON-RPC stream. The prefix is what the firing census greps for.
           process.stderr.write(
             `[acpx] turn-completion watchdog tier ${tier} for session ${record.acpxRecordId}: ` +
-              `end-of-turn marker seen, response overdue ${elapsedMs}ms\n`,
+              `end-of-turn marker seen, response overdue ${elapsedMs}ms ` +
+              `promptId=${guardedPromptIdThisTurn ?? "-"} armedBy=${watchdogArmedBy ?? "-"}\n`,
           );
         },
       });
@@ -3400,6 +3590,103 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     return response;
   };
 
+  // The main terminal of a turn the C1 watchdog's own cancel settled; false when the
+  // watchdog had no part in how it ended.
+  const appendWatchdogTurnTerminal = async (
+    reconciliation: TurnWatchdogReconciliation,
+  ): Promise<boolean> => {
+    if (reconciliation.kind === "cut") {
+      await appendDeliveryTerminal(mainDeliveryContext, "failed", {
+        error: {
+          code: 0,
+          message: TURN_WATCHDOG_CANCELLED_MESSAGE,
+          detailCode: TURN_WATCHDOG_CANCELLED_DETAIL_CODE,
+        },
+      });
+      return true;
+    }
+    if (reconciliation.kind === "recovered") {
+      await appendDeliveryTerminal(
+        mainDeliveryContext,
+        recoveredDeliveryPhase(reconciliation) ?? "done",
+        { stopReason: reconciliation.stopReason, recoveredBy: "turn-watchdog" },
+      );
+      return true;
+    }
+    return false;
+  };
+
+  const appendMainTurnTerminals = async (
+    response: Awaited<ReturnType<typeof runPromptTurn>>,
+  ): Promise<void> => {
+    // Q2 (brick a147982f X3): when the watchdog's OWN tier-1 cancel settled a
+    // turn that had already ended, the delivery terminal reports what the
+    // arming signal said (`recoveredBy` marks it); when that cancel cut a turn
+    // still producing output, it is `failed / TURN_WATCHDOG_CANCELLED`. Any
+    // other cancel stays `cancelled`. The raw stopReason still flows to the
+    // caller's RunPromptResult below.
+    const reconciliation = reconcileStopReasonWithMarker(
+      response.stopReason,
+      endMarkerReasonThisTurn,
+      { watchdogCancelSent, updatesAfterArm },
+    );
+    const terminalStopReason = response.stopReason;
+    // Absorbed (codex) deliveries keep their phase mapping off the reconciled
+    // outcome; they never carry the watchdog's failure code.
+    const absorbedPhase =
+      recoveredDeliveryPhase(reconciliation) ?? deliveryPhaseForStopReason(terminalStopReason);
+    await completeAbsorbedInjectedDeliveries(
+      absorbedPhase,
+      absorbedPhase === "cancelled" ? { stopReason: "cancelled" } : { stopReason: null },
+    );
+    if (await appendWatchdogTurnTerminal(reconciliation)) {
+      return;
+    }
+    // brick 4ec33f59 — a turn that FAILED HARD still terminates `done`,
+    // because the ACP wire StopReason union has no `"error"` member. The
+    // adapter reports the failure out of band (`_meta.piAcp.turnError`) and
+    // `runPromptTurn` reads it. Carry it here, or the failure reaches nobody:
+    // the terminal falls back to EMPTY_DELIVERY_ERROR and acpx-ui renders a
+    // clean success for a turn that failed. It stays a `done` — the message
+    // WAS delivered and the model DID take the turn, so nothing here may
+    // become a failure phase or acquire a resend verdict; it reports, it does
+    // not instruct.
+    //
+    // ⚠️ DO NOT "SIMPLIFY" THIS TO ALWAYS PASS AN `error`, and do not drop the
+    // emptiness check in `turnErrorFromMeta`. `buildDeliveryEvent` substitutes
+    // EMPTY_DELIVERY_ERROR (`{code:0, message:""}`) whenever `error` is
+    // absent, so acpx sends an error object on EVERY done, successful or not.
+    // acpx-ui treats a NON-EMPTY `message` as the failure note — so passing an
+    // empty-message error unconditionally would stamp "the turn reported an
+    // error" onto EVERY SUCCESSFUL TURN IN THE APP. From inside this file that
+    // guard looks like defensive clutter; the reason lives in acpx-ui, whose
+    // control `4ec33f59 CONTROL: a clean 'done' invents no note` goes red the
+    // moment this widens. The acpx-side control below pins the same property.
+    // TWO explainers meet at this seam — the token-CEILING one (0095b715) and
+    // the RATE-LIMIT one (bb23a7fa / 5aacdba2). Both must still reach the user;
+    // the precedence between them lives in `turnErrorForDeliveryTerminal`, so
+    // that it is one testable function rather than a rule spelled out here.
+    const turnErrorForTerminal = await turnErrorForDeliveryTerminal(
+      terminalStopReason,
+      response.turnError,
+      record.acpx?.current_model_id,
+      process.env,
+    );
+    await appendDeliveryTerminal(
+      mainDeliveryContext,
+      deliveryPhaseForStopReason(terminalStopReason),
+      {
+        stopReason: toDeliveryStopReason(terminalStopReason),
+        // brick ddd76838 — forward the adapter's steer-ack flag so the
+        // delivery record says "absorbed steer", not a bare end_turn.
+        ...(response.steered ? { steered: true } : {}),
+        ...(turnErrorForTerminal
+          ? { error: { code: 0, message: turnErrorForTerminal, detailCode: "" } }
+          : {}),
+      },
+    );
+  };
+
   // brick://b8e251eb: from here on the catch below writes the delivery terminal.
   // Everything above is the window the queue owner must terminalize itself — keep
   // this line IMMEDIATELY before the `try`.
@@ -3428,61 +3715,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         await liveCheckpoint.checkpoint();
 
         const response = await savePromptSuccess(await runPromptWithRetries(activeSessionId));
-        // Q2 (semantic truth): if tier-1's cancel recovered a turn whose marker
-        // already reported a genuine completion, the delivery terminal reports
-        // that completion — not the `cancelled` our own nudge produced. The raw
-        // stopReason still flows to the caller's RunPromptResult below.
-        const terminalStopReason = reconcileStopReasonWithMarker(
-          response.stopReason,
-          endMarkerReasonThisTurn,
-        );
-        await completeAbsorbedInjectedDeliveries(
-          deliveryPhaseForStopReason(terminalStopReason),
-          terminalStopReason === "cancelled" ? { stopReason: "cancelled" } : { stopReason: null },
-        );
-        // brick 4ec33f59 — a turn that FAILED HARD still terminates `done`,
-        // because the ACP wire StopReason union has no `"error"` member. The
-        // adapter reports the failure out of band (`_meta.piAcp.turnError`) and
-        // `runPromptTurn` reads it. Carry it here, or the failure reaches nobody:
-        // the terminal falls back to EMPTY_DELIVERY_ERROR and acpx-ui renders a
-        // clean success for a turn that failed. It stays a `done` — the message
-        // WAS delivered and the model DID take the turn, so nothing here may
-        // become a failure phase or acquire a resend verdict; it reports, it does
-        // not instruct.
-        //
-        // ⚠️ DO NOT "SIMPLIFY" THIS TO ALWAYS PASS AN `error`, and do not drop the
-        // emptiness check in `turnErrorFromMeta`. `buildDeliveryEvent` substitutes
-        // EMPTY_DELIVERY_ERROR (`{code:0, message:""}`) whenever `error` is
-        // absent, so acpx sends an error object on EVERY done, successful or not.
-        // acpx-ui treats a NON-EMPTY `message` as the failure note — so passing an
-        // empty-message error unconditionally would stamp "the turn reported an
-        // error" onto EVERY SUCCESSFUL TURN IN THE APP. From inside this file that
-        // guard looks like defensive clutter; the reason lives in acpx-ui, whose
-        // control `4ec33f59 CONTROL: a clean 'done' invents no note` goes red the
-        // moment this widens. The acpx-side control below pins the same property.
-        // TWO explainers meet at this seam — the token-CEILING one (0095b715) and
-        // the RATE-LIMIT one (bb23a7fa / 5aacdba2). Both must still reach the user;
-        // the precedence between them lives in `turnErrorForDeliveryTerminal`, so
-        // that it is one testable function rather than a rule spelled out here.
-        const turnErrorForTerminal = await turnErrorForDeliveryTerminal(
-          terminalStopReason,
-          response.turnError,
-          record.acpx?.current_model_id,
-          process.env,
-        );
-        await appendDeliveryTerminal(
-          mainDeliveryContext,
-          deliveryPhaseForStopReason(terminalStopReason),
-          {
-            stopReason: toDeliveryStopReason(terminalStopReason),
-            // brick ddd76838 — forward the adapter's steer-ack flag so the
-            // delivery record says "absorbed steer", not a bare end_turn.
-            ...(response.steered ? { steered: true } : {}),
-            ...(turnErrorForTerminal
-              ? { error: { code: 0, message: turnErrorForTerminal, detailCode: "" } }
-              : {}),
-          },
-        );
+        await appendMainTurnTerminals(response);
         promptTurnActive = false;
 
         return {

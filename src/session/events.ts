@@ -34,11 +34,19 @@ const EVENT_LOCK_STALE_MS = 15_000;
 export const ACTIVITY_NEUTRAL_EVENT_METHOD = "_claude/sessionStatus";
 export const TURN_EVENT_METHOD = "acpx/turn";
 export const RECEIVED_EVENT_METHOD = "acpx/received";
+// brick a147982f — the C1 watchdog's own record of each tier it reached, written by acpx.
+export const TURN_WATCHDOG_EVENT_METHOD = "acpx/turn-watchdog";
+// brick a147982f — the claude-agent-acp ext notification that attributes an SDK turn end to one
+// `session/prompt` (`_claude/promptId`). It is what arms the Claude watchdog; it is chrome, not
+// agent output.
+export const CLAUDE_PROMPT_LIFECYCLE_METHOD = "_claude/promptLifecycle";
 export const ACTIVITY_NEUTRAL_EVENT_METHODS = new Set([
   ACTIVITY_NEUTRAL_EVENT_METHOD,
   DELIVERY_EVENT_METHOD,
   TURN_EVENT_METHOD,
   RECEIVED_EVENT_METHOD,
+  TURN_WATCHDOG_EVENT_METHOD,
+  CLAUDE_PROMPT_LIFECYCLE_METHOD,
 ]);
 
 export function isActivityNeutralEventMessage(message: AcpJsonRpcMessage): boolean {

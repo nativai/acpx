@@ -57,6 +57,16 @@ export const SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE = "SESSION_CLOSED_TURN_CA
 // substring, and says itself that it cannot see one reassembled by concatenation.
 export const SESSION_CLOSED_TURN_CANCELLED_MESSAGE =
   "session closed while the accepted turn was running — the turn was cancelled; outcome unknown, the message may have been processed";
+// brick a147982f (X5) — the C1 turn watchdog's tier-1 cancel stopped a turn that was STILL PRODUCING
+// OUTPUT after the signal that armed it. The message reached the agent and part of the work may have
+// happened, so it is `failed` and not resend-safe: same family as the runtime's TURN_RESPONSE_TIMEOUT. A
+// tier-1 cancel that only settled an already-ended turn is NOT this — that one is a `done` carrying
+// `recoveredBy: "turn-watchdog"`. Not in test/fixtures/delivery-contract.fixture.json, deliberately: that
+// fixture contracts the owner-exit and turn-start terminals only. Must not contain `session closed`.
+// ONE line on purpose (T11c finds contracted messages by verbatim substring).
+export const TURN_WATCHDOG_CANCELLED_DETAIL_CODE = "TURN_WATCHDOG_CANCELLED";
+export const TURN_WATCHDOG_CANCELLED_MESSAGE =
+  "the turn watchdog stopped this turn while the agent was still working — part of the work may have happened; check the transcript before re-sending";
 // brick://b8e251eb — the owner ACCEPTED the task but its turn never started
 // (a non-transient failure before the prompt was submitted). Never reached the
 // model → a resend is safe; DEFINITIVE, because the failure is not known to clear

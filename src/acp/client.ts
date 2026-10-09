@@ -319,7 +319,16 @@ export type AcpPromptOptions = {
    * decorating.
    */
   turnContext?: boolean;
+  /**
+   * brick a147982f (X1) — this `session/prompt` attempt's identity, sent as
+   * `_meta["_claude/promptId"]`. claude-agent-acp echoes it on its `_claude/promptLifecycle`
+   * signals, which is the ONLY thing that arms the Claude turn watchdog. Set by the runtime for
+   * claude-agent-acp only, a fresh UUID per attempt; absent ⇒ the request carries no `_meta`.
+   */
+  promptId?: string;
 };
+
+export const CLAUDE_PROMPT_ID_META_KEY = "_claude/promptId";
 
 /**
  * ⚠️ **THE INERT PATH MUST BE THE SAME CODE PATH, NOT AN EQUIVALENT ONE.** With
@@ -336,6 +345,8 @@ export type AcpPromptOptions = {
  * and the delta is the frame. Same rule, different pair ⇒ frame first, instruction last.
  * Prepending also keeps the user's own words in the most salient final position and stops the
  * block reading as "the user also said this".
+ *
+ * `_meta` appears only when `options.promptId` is set (brick a147982f), and is then the last key.
  */
 export function buildPromptRequest(
   sessionId: string,
@@ -350,6 +361,9 @@ export function buildPromptRequest(
         ? prompt
         : [{ type: "text" as const, text: turnContext }, ...prompt],
     ...(options?.messageId !== undefined ? { messageId: options.messageId } : {}),
+    ...(options?.promptId !== undefined
+      ? { _meta: { [CLAUDE_PROMPT_ID_META_KEY]: options.promptId } }
+      : {}),
   };
 }
 

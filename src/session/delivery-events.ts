@@ -15,6 +15,8 @@ export type DeliveryStopReason =
   | "deduplicated"
   | null;
 
+export type DeliveryRecoveredBy = "turn-watchdog";
+
 export type DeliveryEventError = {
   code: number;
   message: string;
@@ -222,6 +224,14 @@ export function buildDeliveryEvent(params: {
   steered?: boolean;
   /** brick ddd76838 / 7ada04b9 — see `deliveryTerminalWarning`'s doc comment. */
   warning?: string;
+  /**
+   * brick a147982f — set only on a terminal the C1 turn watchdog RECOVERED: its tier-1 cancel
+   * settled a turn the adapter had already ended (no agent output after the arming signal). It
+   * is forensic: `stopReason` may then be `null` (the turn was armed by `sdk_idle` alone, so its
+   * reason is unknown). A watchdog cancel that cut live work is never `recoveredBy` — it is a
+   * `failed` terminal with `TURN_WATCHDOG_CANCELLED_DETAIL_CODE`.
+   */
+  recoveredBy?: DeliveryRecoveredBy;
   at?: string;
 }): AcpJsonRpcMessage {
   return {
@@ -235,6 +245,7 @@ export function buildDeliveryEvent(params: {
       error: params.error ?? EMPTY_DELIVERY_ERROR,
       ...(params.steered ? { steered: true } : {}),
       ...(params.warning ? { warning: params.warning } : {}),
+      ...(params.recoveredBy ? { recoveredBy: params.recoveredBy } : {}),
       at: params.at ?? new Date().toISOString(),
     },
   } as AcpJsonRpcMessage;
