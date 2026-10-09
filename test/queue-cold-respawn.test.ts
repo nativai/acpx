@@ -336,7 +336,7 @@ describe("spawnAndAwaitQueueOwner — lease-before-listen window (A1)", () => {
     assert.equal(fake.polls(), 5);
   });
 
-  it("T-A1b: an owner that never listens fails bounded by the wall-clock budget, not by a poll count", async () => {
+  it("T-A1b: an owner that never listens fails bounded by the wall-clock budget, with the retryable not-accepting error unchanged", async () => {
     const fake = makeStartupWindowRuntime({
       phases: ["lease-not-listening"],
       startupBudgetMs: 30_000,
@@ -345,11 +345,14 @@ describe("spawnAndAwaitQueueOwner — lease-before-listen window (A1)", () => {
     await assert.rejects(
       async () => await spawnAndAwaitQueueOwner(makeSendOptions(), fake.deps),
       (error: unknown) => {
-        assert(error instanceof Error);
-        // Hung start: owner alive, never submittable — the existing message, no exit info.
-        assert.match(error.message, /failed to start for session cold-respawn-session/);
-        assert.match(error.message, /after 1 spawn attempt\(s\)/);
-        assert.doesNotMatch(error.message, /died on startup/);
+        // Nothing was submitted: callers (acpx-ui classifyEnqueueFailure) must see the
+        // same class as the first-attempt failure, not "failed to start".
+        assert(error instanceof QueueConnectionError);
+        assert.equal(error.detailCode, "QUEUE_NOT_ACCEPTING_REQUESTS");
+        assert.equal(error.retryable, true);
+        assert.equal(error.origin, "queue");
+        assert.match(error.message, /running but not accepting queue requests/);
+        assert.doesNotMatch(error.message, /failed to start/);
         return true;
       },
     );
@@ -362,6 +365,40 @@ describe("spawnAndAwaitQueueOwner — lease-before-listen window (A1)", () => {
     );
     // ~2 s per not-accepting poll ⇒ ~14 polls; a 120-poll cap would have run ~4 min.
     assert.ok(fake.polls() < 20, `${fake.polls()} polls: the loop must be time-bound`);
+  });
+
+  it("T-A1b control: no lease within the budget still fails with 'failed to start'", async () => {
+    const fake = makeStartupWindowRuntime({ phases: ["no-lease"], startupBudgetMs: 5_000 });
+
+    await assert.rejects(
+      async () => await spawnAndAwaitQueueOwner(makeSendOptions(), fake.deps),
+      (error: unknown) => {
+        assert(error instanceof Error);
+        assert.ok(!(error instanceof QueueConnectionError));
+        assert.match(error.message, /failed to start for session cold-respawn-session/);
+        assert.match(error.message, /after 1 spawn attempt\(s\)/);
+        assert.doesNotMatch(error.message, /died on startup/);
+        return true;
+      },
+    );
+    assert.equal(fake.spawns(), 1);
+  });
+
+  it("T-A1b dead owner: a lease that never listened and an owner that exited keeps the exit diagnostic", async () => {
+    const fake = makeStartupWindowRuntime({
+      phases: ["lease-not-listening"],
+      ownerExitsAfterPolls: 1,
+    });
+
+    await assert.rejects(
+      async () => await spawnAndAwaitQueueOwner(makeSendOptions(), fake.deps),
+      (error: unknown) => {
+        assert(error instanceof Error);
+        assert.ok(!(error instanceof QueueConnectionError));
+        assert.match(error.message, /owner process died on startup: exit code 1/);
+        return true;
+      },
+    );
   });
 
   it("T-A1c: a not-accepting owner that then exits is re-spawned, as before", async () => {
@@ -466,6 +503,25 @@ describe("sendSession — young lease that is not yet listening (A2, real socket
         await bindLater.catch(() => undefined);
         await closeServer(server);
       }
+    });
+  });
+
+  it("T-A2: a young lease that never listens rethrows the ORIGINAL not-accepting error at budget expiry", async () => {
+    await withLeaseFixture(0, async () => {
+      await assert.rejects(
+        async () =>
+          await sendSession(makeSendOptions({ sessionId: A2_SESSION, waitForCompletion: false }), {
+            ...noSpawnDeps,
+            startupBudgetMs: 1_500,
+          }),
+        (error: unknown) => {
+          assert(error instanceof QueueConnectionError);
+          assert.equal(error.detailCode, "QUEUE_NOT_ACCEPTING_REQUESTS");
+          assert.equal(error.retryable, true);
+          assert.match(error.message, /running but not accepting queue requests/);
+          return true;
+        },
+      );
     });
   });
 

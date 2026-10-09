@@ -1326,9 +1326,12 @@ function isQueueNotAcceptingRequests(error: unknown): error is QueueConnectionEr
   );
 }
 
-type StartupSubmit =
-  | { starting: false; outcome: SessionSendOutcome | undefined }
-  | { starting: true; error: QueueConnectionError };
+// `starting` is set when the lease exists but nothing listens yet; `outcome` is the
+// submit result otherwise (`undefined` = no usable owner).
+type StartupSubmit = {
+  outcome: SessionSendOutcome | undefined;
+  starting: QueueConnectionError | undefined;
+};
 
 // One submit attempt, with "lease written, listener not yet bound" reported as a
 // state (`starting`) instead of a throw. Every other error still propagates.
@@ -1339,12 +1342,12 @@ async function submitOrNoteStarting(
 ): Promise<StartupSubmit> {
   try {
     return {
-      starting: false,
+      starting: undefined,
       outcome: await deps.submitToRunningOwner(options, waitForCompletion),
     };
   } catch (error) {
     if (isQueueNotAcceptingRequests(error)) {
-      return { starting: true, error };
+      return { starting: error, outcome: undefined };
     }
     throw error;
   }
@@ -1397,6 +1400,22 @@ function formatOwnerStartFailure(
   );
 }
 
+// Budget spent with a live lease that never listened and an owner that has not
+// exited: nothing was submitted, so hand back the retryable not-accepting error
+// UNCHANGED (message, detailCode, retryable). Callers classify the enqueue failure
+// by that text/code (acpx-ui classifyEnqueueFailure); a plain "failed to start"
+// would read as ack-ambiguous and be converted to hold-until-idle, re-stranding a
+// session that never idles. "failed to start" stays for never-saw-a-lease and for
+// dead owners. Held by T-A1b and its two controls.
+function throwIfStillStarting(
+  lastStarting: QueueConnectionError | undefined,
+  spawned: SpawnedQueueOwner,
+): void {
+  if (lastStarting && !spawned.exit) {
+    throw lastStarting;
+  }
+}
+
 // Cold-respawn startup: spawn a queue owner and wait for it to become
 // submittable, re-spawning a fresh owner (bounded) whenever the spawned one dies
 // before it can create its lock + listen. This is the W13-24-14 fix: a transient
@@ -1415,15 +1434,16 @@ export async function spawnAndAwaitQueueOwner(
   let spawned = deps.spawnQueueOwnerProcess(runtimeOptions);
   let spawnsUsed = 1;
   let lastExit: OwnerExitInfo | undefined;
+  let lastStarting: QueueConnectionError | undefined;
   const startedAtMs = deps.nowMs();
   try {
     while (deps.nowMs() - startedAtMs < deps.startupBudgetMs) {
       // `starting` falls through like `undefined`: a dead owner is still caught by
       // the `spawned.exit` check below.
       const attempt = await submitOrNoteStarting(deps, effectiveOptions, waitForCompletion);
-      const queued = attempt.starting ? undefined : attempt.outcome;
-      if (queued) {
-        return queued;
+      lastStarting = attempt.starting;
+      if (attempt.outcome) {
+        return attempt.outcome;
       }
 
       const exit = spawned.exit;
@@ -1451,6 +1471,7 @@ export async function spawnAndAwaitQueueOwner(
 
       await deps.waitMs(QUEUE_CONNECT_RETRY_MS);
     }
+    throwIfStillStarting(lastStarting, spawned);
   } finally {
     spawned.dispose();
   }
@@ -1528,16 +1549,17 @@ async function submitToRunningOrStartingOwner(
   deps: SendSessionRuntimeDeps,
 ): Promise<SessionSendOutcome | undefined> {
   let attempt = await submitOrNoteStarting(deps, options, waitForCompletion);
-  if (!attempt.starting) {
+  const firstError = attempt.starting;
+  if (!firstError) {
     return attempt.outcome;
   }
-  const firstError = attempt.error;
   const deadlineMs = deps.nowMs() + (await startupBudgetLeftForLease(options.sessionId, deps));
   while (attempt.starting && deps.nowMs() < deadlineMs) {
     await deps.waitMs(QUEUE_CONNECT_RETRY_MS);
     attempt = await submitOrNoteStarting(deps, options, waitForCompletion);
   }
   if (attempt.starting) {
+    // Budget spent: the ORIGINAL error, so the caller's classification is unchanged.
     throw firstError;
   }
   return attempt.outcome;
