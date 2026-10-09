@@ -24,7 +24,10 @@ import {
   ownerExitDeliveryError,
   QUEUE_OWNER_CLOSING_DETAIL_CODE,
   QUEUE_OWNER_CLOSING_MESSAGE,
+  SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE,
+  SESSION_CLOSED_TURN_CANCELLED_MESSAGE,
 } from "./delivery-terminals.js";
+import { claimMainTurnCutByClose } from "./main-turn-delivery.js";
 import {
   parseQueueRequest,
   type QueueDrainedDelivery,
@@ -474,7 +477,40 @@ export class SessionQueueOwner {
    */
   terminalizeCustodyOnSignal(): number {
     const custody = [...this.pending.splice(0), ...(this.midTurnCustodySource?.() ?? [])];
-    return this.terminalizeCustody(custody, this.drainCause).length;
+    const undelivered = this.terminalizeCustody(custody, this.drainCause).length;
+    return undelivered + this.terminalizeMainTurnCutByClose();
+  }
+
+  /**
+   * brick 570d2570 — the running MAIN turn's delivery, cut by the session close. `sessions close` SIGTERMs this
+   * owner right after the ACP close cancels the turn, and the runtime writes that turn's terminal only at the end
+   * of its async path, so without this the delivery stays `accepted` forever and acpx-ui reads it `done`. The
+   * code is the one the runtime's own choke point writes for a close-cancelled turn: the message reached the
+   * agent, the close cut its turn, outcome unknown, do not resend. Nothing is re-delivered or resumed — the close
+   * stands (Daniel, 2026-10-09); only the record changes.
+   *
+   * ONLY when this owner was TOLD the session is closing (`drainCause`), for the reason `OwnerExitCause` gives:
+   * on `--no-drain`, or any other death, the owner witnessed no close and writes nothing here. One terminal per
+   * delivery: the claim in `main-turn-delivery.ts` is shared with the runtime's choke point, so a turn whose
+   * terminal the runtime already wrote (or is writing) — including a watchdog cut — gets nothing more. And a turn
+   * that ENDED ON ITS OWN before the kill (its prompt resolved with a stop the close did not cause) gets nothing
+   * either: the close did not cut it. SYNCHRONOUS and O(1), like every write on this exit path — it runs inside the
+   * 1.5 s grace before SIGKILL. Returns the terminals written (0 or 1).
+   */
+  private terminalizeMainTurnCutByClose(): number {
+    if (this.drainCause !== "session-close") {
+      return 0;
+    }
+    const context = claimMainTurnCutByClose(this.sessionId);
+    if (!context) {
+      return 0;
+    }
+    appendDeliveryStreamEventSync(this.sessionId, context, "failed", {
+      code: 0,
+      message: SESSION_CLOSED_TURN_CANCELLED_MESSAGE,
+      detailCode: SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE,
+    });
+    return 1;
   }
 
   isDraining(): boolean {

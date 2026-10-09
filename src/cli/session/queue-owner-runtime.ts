@@ -427,12 +427,13 @@ export function installQueueOwnerFatalSignalHandlers(params: {
     // is also why every write in the sweep is synchronous. Anything moved below
     // the reap becomes dead code silently.
     try {
-      const undelivered = params.owner.terminalizeCustodyOnSignal();
+      // `custody` includes the main turn a session close cut (brick 570d2570).
+      const custody = params.owner.terminalizeCustodyOnSignal();
       const absorbed = terminalizeAbsorbedDeliveriesOnOwnerExit(params.sessionId);
-      if (undelivered > 0 || absorbed > 0) {
+      if (custody > 0 || absorbed > 0) {
         process.stderr.write(
           `[acpx] queue owner for session ${params.sessionId} took ${signal} while holding custody; ` +
-            `wrote ${undelivered} undelivered + ${absorbed} absorbed terminal(s)\n`,
+            `wrote ${custody} custody + ${absorbed} absorbed terminal(s)\n`,
         );
       }
     } catch {
