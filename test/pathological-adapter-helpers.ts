@@ -55,7 +55,29 @@ type CapturedEventHandlers = {
 export type PromptCall = {
   kind: "main" | "injected";
   messageId?: string;
+  /** brick a147982f — the `_claude/promptId` the runtime sent with this prompt, if any. */
+  promptId?: string;
 };
+
+/**
+ * brick a147982f — how the scripted Claude adapter ends a turn (CONCEPTION §6, I-layer):
+ *  - `lifecycle`     — the fixed adapter: `sdk_idle` then `completing{reason}`, both carrying
+ *                      the guarded prompt's `_claude/promptId`;
+ *  - `legacy`        — today's deployed adapter: the `_claude/lastTurnEndReason` `usage_update`
+ *                      marker mid-prompt, no lifecycle signal;
+ *  - `foreign`       — lifecycle signals carrying ANOTHER prompt's id (an injected/orphaned one);
+ *  - `routing-hole`  — `sdk_idle` only: the SDK went idle, the prompt loop never returned;
+ *  - `lost-response` — `sdk_idle` + `completing{reason}`, then the response is lost.
+ * None of them settles the prompt: the test decides whether and how it responds.
+ */
+export type ClaudeAdapterEndMode =
+  | "lifecycle"
+  | "legacy"
+  | "foreign"
+  | "routing-hole"
+  | "lost-response";
+
+export const FOREIGN_PROMPT_ID = "foreign-prompt-0000-4000-8000-000000000000";
 
 /**
  * The adapter's end-of-turn marker: the terminal `usage_update` carrying
@@ -71,6 +93,27 @@ export function turnEndMarkerNotification(
     update: { sessionUpdate: "usage_update" },
     _meta: { "_claude/lastTurnEndReason": reason },
   } as unknown as SessionNotification;
+}
+
+/** brick a147982f — a `_claude/promptLifecycle` ext notification, as the adapter sends it. */
+export function promptLifecycleMessage(params: {
+  acpSessionId: string;
+  promptId: string;
+  phase: "sdk_idle" | "completing";
+  lastTurnEndReason?: string;
+}): unknown {
+  return {
+    jsonrpc: "2.0",
+    method: "_claude/promptLifecycle",
+    params: {
+      sessionId: params.acpSessionId,
+      promptId: params.promptId,
+      phase: params.phase,
+      ...(params.lastTurnEndReason !== undefined
+        ? { lastTurnEndReason: params.lastTurnEndReason }
+        : {}),
+    },
+  };
 }
 
 /**
@@ -97,8 +140,20 @@ export type PathologicalControl = {
   promptCalls: PromptCall[];
   /** Resolves once the MAIN prompt has been invoked (the turn is in flight). */
   mainPromptInFlight: Promise<void>;
-  /** Push the end-of-turn marker through the captured production tap. */
+  /**
+   * Push the Claude `_claude/lastTurnEndReason` usage_update marker (today's adapter) through
+   * both production taps, wire tap first, as the real client does.
+   */
   emitTurnEndMarker: (reason?: string) => void;
+  /** brick a147982f — a `session/update` through both taps (wire tap, then session-update tap). */
+  emitSessionUpdate: (notification: SessionNotification) => void;
+  /** brick a147982f — a `_claude/promptLifecycle` notification through the inbound wire tap. */
+  emitPromptLifecycle: (
+    phase: "sdk_idle" | "completing",
+    options?: { promptId?: string; lastTurnEndReason?: string },
+  ) => void;
+  /** brick a147982f — the `_claude/promptId` of the latest MAIN prompt (undefined if none sent). */
+  mainPromptId: () => string | undefined;
   /** Push the CODEX end-of-turn marker (493729fc F2) through the same tap. */
   emitCodexTurnEndMarker: (reason?: string) => void;
   /** Settle the withheld MAIN prompt (models the adapter finally responding). */
@@ -134,12 +189,42 @@ export function makePathologicalClient(config: {
     // Default: ignore cancel (do not settle the withheld prompt).
   };
 
-  const emitTurnEndMarker = (reason = "end_turn"): void => {
+  const emitSessionUpdate = (notification: SessionNotification): void => {
     try {
-      handlers.onSessionUpdate?.(turnEndMarkerNotification(config.acpSessionId, reason));
+      handlers.onAcpMessage?.("inbound", {
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: notification,
+      });
+      handlers.onSessionUpdate?.(notification);
     } catch {
       // The real client swallows session-update handler errors (client.ts).
     }
+  };
+
+  const emitTurnEndMarker = (reason = "end_turn"): void => {
+    emitSessionUpdate(turnEndMarkerNotification(config.acpSessionId, reason));
+  };
+
+  let latestMainPromptId: string | undefined;
+  const emitPromptLifecycle = (
+    phase: "sdk_idle" | "completing",
+    options: { promptId?: string; lastTurnEndReason?: string } = {},
+  ): void => {
+    const promptId = options.promptId ?? latestMainPromptId;
+    if (promptId === undefined) {
+      // An adapter only signals for a prompt that carried an id.
+      return;
+    }
+    handlers.onAcpMessage?.(
+      "inbound",
+      promptLifecycleMessage({
+        acpSessionId: config.acpSessionId,
+        promptId,
+        phase,
+        lastTurnEndReason: options.lastTurnEndReason,
+      }),
+    );
   };
 
   const emitCodexTurnEndMarker = (reason = "end_turn"): void => {
@@ -184,16 +269,25 @@ export function makePathologicalClient(config: {
     prompt: (
       _sessionId: string,
       input: PromptInput | string,
-      options?: { messageId?: string },
+      options?: { messageId?: string; promptId?: string },
     ): Promise<PromptResponse> => {
       const text = promptText(input);
       if (text === INJECTED_PROMPT_TEXT) {
-        promptCalls.push({ kind: "injected", messageId: options?.messageId });
+        promptCalls.push({
+          kind: "injected",
+          messageId: options?.messageId,
+          promptId: options?.promptId,
+        });
         return (
           config.onInjectedPrompt?.(options?.messageId) ?? new Promise<PromptResponse>(() => {})
         );
       }
-      promptCalls.push({ kind: "main", messageId: options?.messageId });
+      promptCalls.push({
+        kind: "main",
+        messageId: options?.messageId,
+        promptId: options?.promptId,
+      });
+      latestMainPromptId = options?.promptId;
       mainInFlight.resolve();
       return mainRelease.promise;
     },
@@ -204,6 +298,9 @@ export function makePathologicalClient(config: {
     promptCalls,
     mainPromptInFlight: mainInFlight.promise,
     emitTurnEndMarker,
+    emitSessionUpdate,
+    emitPromptLifecycle,
+    mainPromptId: () => latestMainPromptId,
     emitCodexTurnEndMarker,
     resolveMainPrompt: (response) => mainRelease.resolve(response),
     rejectMainPrompt: (error) => mainRelease.reject(error),
@@ -224,6 +321,37 @@ export function cancelResolvesPrompt(
   reason: PromptResponse["stopReason"] = "end_turn",
 ): void {
   control.setCancelBehavior(() => control.resolveMainPrompt({ stopReason: reason }));
+}
+
+/**
+ * brick a147982f — emit how the scripted Claude adapter ends its turn in `mode`
+ * ({@link ClaudeAdapterEndMode}). The prompt is NOT settled here.
+ */
+export function emitClaudeTurnEnd(
+  control: PathologicalControl,
+  mode: ClaudeAdapterEndMode,
+  reason = "end_turn",
+): void {
+  switch (mode) {
+    case "legacy":
+      control.emitTurnEndMarker(reason);
+      return;
+    case "foreign":
+      control.emitPromptLifecycle("sdk_idle", { promptId: FOREIGN_PROMPT_ID });
+      control.emitPromptLifecycle("completing", {
+        promptId: FOREIGN_PROMPT_ID,
+        lastTurnEndReason: reason,
+      });
+      return;
+    case "routing-hole":
+      control.emitPromptLifecycle("sdk_idle");
+      return;
+    case "lifecycle":
+    case "lost-response":
+      control.emitPromptLifecycle("sdk_idle");
+      control.emitPromptLifecycle("completing", { lastTurnEndReason: reason });
+      return;
+  }
 }
 
 /**

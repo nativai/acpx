@@ -42,6 +42,7 @@ import {
   CLAUDE_AGENT_COMMAND,
   CODEX_AGENT_COMMAND,
   cancelResolvesPrompt,
+  emitClaudeTurnEnd,
   makePathologicalClient,
   neverRespondIgnoresCancel,
 } from "./pathological-adapter-helpers.js";
@@ -1631,11 +1632,34 @@ function terminalsForMessage(events: unknown[], messageId: string): Record<strin
   );
 }
 
-// C1 tier-1: the SDK turn ended (marker seen) but the response is withheld; the
-// tier-1 cancel nudge settles it. Our own nudge yields `cancelled`, yet the
-// marker said end_turn, so the delivery terminal reconciles to the semantic
-// completion (Q2). Exactly one terminal for the messageId.
-test("C1 watchdog: tier-1 cancel recovers a withheld, marker-ended turn with Q2 semantic done/end_turn", async () => {
+async function captureStderr<T>(run: () => Promise<T>): Promise<{ result: T; stderr: string }> {
+  const original = process.stderr.write.bind(process.stderr);
+  let captured = "";
+  process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
+    captured += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+    return (original as (...args: unknown[]) => boolean)(chunk, ...rest);
+  }) as typeof process.stderr.write;
+  try {
+    const result = await run();
+    return { result, stderr: captured };
+  } finally {
+    process.stderr.write = original;
+  }
+}
+
+function turnWatchdogEvents(events: unknown[]): Record<string, unknown>[] {
+  return events
+    .filter((event) => eventMethod(event) === "acpx/turn-watchdog")
+    .map((event) => eventParams(event));
+}
+
+// C1 tier-1, brick a147982f P9 — the ROUTING HOLE C1 exists for (AC4a): the adapter's
+// reader saw SDK idle and sent an attributed `sdk_idle`, then the prompt loop never
+// returned — no `completing`, no response. The tier-1 cancel nudge settles it. Nothing
+// arrived after the signal, so this is a recovery, not a cut: `done`, `stopReason: null`
+// (sdk_idle carries no reason), `recoveredBy: "turn-watchdog"`, and the stream names the
+// watchdog as the origin. Exactly one terminal for the messageId.
+test("C1 watchdog: tier-1 cancel recovers a routing hole (attributed sdk_idle, no response) as done + recoveredBy", async () => {
   await withNoUnhandledRejections(async () => {
     await withTempHome(async (homeDir) => {
       const record = makeSessionRecord(homeDir, CLAUDE_AGENT_COMMAND);
@@ -1655,44 +1679,70 @@ test("C1 watchdog: tier-1 cancel recovers a withheld, marker-ended turn with Q2 
         mainMessageId,
       );
 
-      const run = withTurnResponseTimeout(40, () =>
-        runQueuedTask(record.acpxRecordId, mainTask, {
-          sharedClient: control.client,
-          suppressSdkConsoleErrors: true,
-        }),
-      );
+      const { stderr } = await captureStderr(async () => {
+        const run = withTurnResponseTimeout(40, () =>
+          runQueuedTask(record.acpxRecordId, mainTask, {
+            sharedClient: control.client,
+            suppressSdkConsoleErrors: true,
+          }),
+        );
 
-      await control.mainPromptInFlight;
-      await tick();
-      control.emitTurnEndMarker("end_turn");
-      await withRaceTimeout(run, 3_000, "tier-1 did not recover the withheld turn");
+        await control.mainPromptInFlight;
+        await tick();
+        emitClaudeTurnEnd(control, "routing-hole");
+        await withRaceTimeout(run, 3_000, "tier-1 did not recover the withheld turn");
+      });
 
       assert.ok(
         mainSends.find((m) => m.type === "result"),
         "turn finalized after tier-1 recovery",
       );
       assert.ok(control.cancelCount() >= 1, "tier-1 issued at least one cancel nudge");
+      const promptId = control.mainPromptId();
+      assert.ok(promptId, "the main prompt carried a _claude/promptId");
 
-      const terminals = terminalsForMessage(
-        await listSessionEvents(record.acpxRecordId),
-        mainMessageId,
-      );
+      const events = await listSessionEvents(record.acpxRecordId);
+      const terminals = terminalsForMessage(events, mainMessageId);
       assert.equal(terminals.length, 1, "exactly one terminal for the received messageId");
       assert.deepEqual(terminals[0], {
         messageId: mainMessageId,
         requestId: "req-c1-tier1",
         phase: "done",
-        stopReason: "end_turn",
+        stopReason: null,
       });
+      const terminalParams = deliveryParamsForMessage(events, mainMessageId).find(
+        (event) => event.phase === "done",
+      );
+      assert.equal(terminalParams?.recoveredBy, "turn-watchdog");
+
+      const watchdogEvents = turnWatchdogEvents(events);
+      assert.equal(watchdogEvents.length, 1, "one acpx/turn-watchdog record (tier 1 only)");
+      assert.equal(watchdogEvents[0]?.tier, 1);
+      assert.equal(watchdogEvents[0]?.armedBy, "sdk_idle");
+      assert.equal(watchdogEvents[0]?.action, "cancel");
+      assert.equal(watchdogEvents[0]?.promptId, promptId);
+      assert.equal(watchdogEvents[0]?.markerReason, null);
+      assert.equal(watchdogEvents[0]?.sessionId, record.acpxRecordId);
+      assert.equal(typeof watchdogEvents[0]?.armedAt, "string");
+      assert.equal(watchdogEvents[0]?.overdueMs, 40);
+
+      assert.match(
+        stderr,
+        new RegExp(
+          `turn-completion watchdog tier 1 for session ${record.acpxRecordId}: .*promptId=${promptId} armedBy=sdk_idle`,
+        ),
+        "the owner.log line names the prompt and what armed the watchdog",
+      );
     });
   });
 });
 
-// C1 tier-2 + the design's mandatory late-response guard: an adapter that emits
-// the marker, never responds, and ignores cancel is bounded at tier 2 with a
-// retryable TURN_RESPONSE_TIMEOUT failed terminal; the owner survives. When the
-// abandoned client.prompt() finally settles AFTER tier-2, it must be inert — no
-// duplicate terminal, no record clobber, no crash / unhandled rejection.
+// C1 tier-2 (brick a147982f P11) + the design's mandatory late-response guard: an
+// adapter that sends an attributed lifecycle signal, never responds, and ignores
+// cancel is bounded at tier 2 with a retryable TURN_RESPONSE_TIMEOUT failed terminal;
+// the owner survives and the stream records both tiers. When the abandoned
+// client.prompt() finally settles AFTER tier-2, it must be inert — no duplicate
+// terminal, no record clobber, no crash / unhandled rejection.
 test("C1 watchdog: tier-2 bounds a never-responding turn (TURN_RESPONSE_TIMEOUT); a late response is inert", async () => {
   await withNoUnhandledRejections(async () => {
     await withTempHome(async (homeDir) => {
@@ -1722,7 +1772,7 @@ test("C1 watchdog: tier-2 bounds a never-responding turn (TURN_RESPONSE_TIMEOUT)
 
       await control.mainPromptInFlight;
       await tick();
-      control.emitTurnEndMarker("end_turn");
+      emitClaudeTurnEnd(control, "lost-response");
       await withRaceTimeout(run, 3_000, "tier-2 did not bound the never-responding turn");
 
       const errorMessage = mainSends.find((m) => m.type === "error") as
@@ -1736,6 +1786,15 @@ test("C1 watchdog: tier-2 bounds a never-responding turn (TURN_RESPONSE_TIMEOUT)
       const terminalsBefore = terminalsForMessage(eventsBefore, mainMessageId);
       assert.equal(terminalsBefore.length, 1, "exactly one terminal at tier-2");
       assert.equal(terminalsBefore[0]?.phase, "failed");
+      assert.deepEqual(
+        turnWatchdogEvents(eventsBefore).map((event) => [event.tier, event.action, event.armedBy]),
+        [
+          [1, "cancel", "sdk_idle"],
+          [2, "abandon", "sdk_idle"],
+        ],
+        "the stream records both tiers, tier 2 as an abandon",
+      );
+      assert.equal(turnWatchdogEvents(eventsBefore)[1]?.markerReason, "end_turn");
       const recordBefore = await resolveSessionRecord(record.acpxRecordId);
 
       // The abandoned prompt finally settles AFTER tier-2 — the guard.
@@ -2904,7 +2963,9 @@ test("AC-9: the tier-2 watchdog path keeps injecting — an arriving message is 
 
       await control.mainPromptInFlight;
       await withRaceTimeout(firstInFlight.promise, 3_000, "the first injection never fired");
-      control.emitTurnEndMarker("end_turn");
+      // brick a147982f — an attributed lifecycle signal arms the Claude watchdog (the
+      // usage_update marker no longer does).
+      emitClaudeTurnEnd(control, "lost-response");
       // Tier 1 fires at timeoutMs, tier 2 at timeoutMs*2 (= 80 ms); the ensuing
       // handlePromptFailure drain then runs to its 600 ms backstop. 200 ms lands
       // squarely inside that drain.
