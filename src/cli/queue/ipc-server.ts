@@ -9,6 +9,8 @@ import {
   buildDeliveryEvent,
   type DeliveryEventError,
   type DeliveryPhase,
+  type DeliveryRecoveredBy,
+  type DeliveryStopReason,
 } from "../../session/delivery-events.js";
 import type { DepthProjection } from "../../session/depth-projection.js";
 import { sessionEventActivePath } from "../../session/event-log.js";
@@ -27,7 +29,7 @@ import {
   SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE,
   SESSION_CLOSED_TURN_CANCELLED_MESSAGE,
 } from "./delivery-terminals.js";
-import { claimMainTurnCutByClose } from "./main-turn-delivery.js";
+import { claimMainTurnOnSessionClose } from "./main-turn-delivery.js";
 import {
   parseQueueRequest,
   type QueueDrainedDelivery,
@@ -191,8 +193,10 @@ export function appendDeliveryStreamEventSync(
   task: Pick<QueueTask, "messageId" | "requestId">,
   phase: DeliveryPhase,
   error?: DeliveryEventError,
+  // brick 570d2570 — a turn's own `done` written from the owner's exit path carries its real stop reason.
+  terminal?: DeliveryLineTerminalFields,
 ): void {
-  const line = deliveryStreamLine(task, phase, error);
+  const line = deliveryStreamLine(task, phase, error, terminal);
   if (!line) {
     return;
   }
@@ -245,10 +249,17 @@ export function appendRefusedStreamEventSync(
 }
 
 // A task with no messageId has no delivery lifecycle to update, so it is skipped.
+type DeliveryLineTerminalFields = {
+  stopReason?: DeliveryStopReason;
+  steered?: boolean;
+  recoveredBy?: DeliveryRecoveredBy;
+};
+
 function deliveryStreamLine(
   task: Pick<QueueTask, "messageId" | "requestId">,
   phase: DeliveryPhase,
   error?: DeliveryEventError,
+  terminal: DeliveryLineTerminalFields = {},
 ): string | undefined {
   if (!task.messageId) {
     return undefined;
@@ -258,6 +269,7 @@ function deliveryStreamLine(
     requestId: task.requestId,
     phase,
     ...(error !== undefined ? { error } : {}),
+    ...terminal,
   });
   return `${JSON.stringify(event)}\n`;
 }
@@ -493,19 +505,29 @@ export class SessionQueueOwner {
    * on `--no-drain`, or any other death, the owner witnessed no close and writes nothing here. One terminal per
    * delivery: the claim in `main-turn-delivery.ts` is shared with the runtime's choke point, so a turn whose
    * terminal the runtime already wrote (or is writing) — including a watchdog cut — gets nothing more. And a turn
-   * that ENDED ON ITS OWN before the kill (its prompt resolved with a stop the close did not cause) gets nothing
-   * either: the close did not cut it. SYNCHRONOUS and O(1), like every write on this exit path — it runs inside the
+   * that ENDED ON ITS OWN before the kill (its response arrived with a stop the close did not cause) gets its
+   * OWN `done`, with its recorded stopReason (570d2570 C3) — never the close's code. SYNCHRONOUS and O(1), like every write on this exit path — it runs inside the
    * 1.5 s grace before SIGKILL. Returns the terminals written (0 or 1).
    */
   private terminalizeMainTurnCutByClose(): number {
     if (this.drainCause !== "session-close") {
       return 0;
     }
-    const context = claimMainTurnCutByClose(this.sessionId);
-    if (!context) {
+    const claimed = claimMainTurnOnSessionClose(this.sessionId);
+    if (!claimed) {
       return 0;
     }
-    appendDeliveryStreamEventSync(this.sessionId, context, "failed", {
+    if (claimed.ownEnd) {
+      // The turn had already ANSWERED on its own (`ownEnd` is recorded the moment the response arrives); the
+      // close only cut the runtime's write. That turn's own `done`, with its stopReason — never the close's code.
+      appendDeliveryStreamEventSync(this.sessionId, claimed.context, "done", claimed.ownEnd.error, {
+        stopReason: claimed.ownEnd.stopReason,
+        ...(claimed.ownEnd.steered ? { steered: true } : {}),
+        ...(claimed.ownEnd.recoveredBy ? { recoveredBy: claimed.ownEnd.recoveredBy } : {}),
+      });
+      return 1;
+    }
+    appendDeliveryStreamEventSync(this.sessionId, claimed.context, "failed", {
       code: 0,
       message: SESSION_CLOSED_TURN_CANCELLED_MESSAGE,
       detailCode: SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE,

@@ -58,7 +58,11 @@ import {
   applyConversation,
   applyLifecycleSnapshotToRecord,
 } from "../../runtime/engine/lifecycle.js";
-import { runPromptTurn, steeredFromMeta } from "../../runtime/engine/prompt-turn.js";
+import {
+  runPromptTurn,
+  steeredFromMeta,
+  turnErrorFromMeta,
+} from "../../runtime/engine/prompt-turn.js";
 import { connectAndLoadSession } from "../../runtime/engine/reconnect.js";
 import {
   mergeSessionOptions,
@@ -1964,7 +1968,6 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
           requestId: mainDeliveryContext.requestId,
         },
         terminalClaimed: false,
-        turnEndedOnItsOwn: false,
       }
     : undefined;
 
@@ -3443,6 +3446,41 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     injectedDeliveries.length = 0;
   };
 
+  // brick 570d2570 — what the owner's close sweep writes if it lands before this turn's own terminal: the turn's
+  // `done` (with the stopReason, steer flag, watchdog recovery and turn-error note the runtime's own terminal would
+  // carry) when it ended on its own, else nothing recorded (the close's code). Called at response time and again
+  // after the late-update drain; `mainTurnEndedOnItsOwn` uses the reconciliation `appendMainTurnTerminals` applies.
+  const recordMainTurnOwnEnd = (answer: {
+    stopReason: RunPromptResult["stopReason"];
+    turnError?: string;
+    steered?: boolean;
+  }): void => {
+    if (!openMainDelivery) {
+      return;
+    }
+    const reconciliation = reconcileStopReasonWithMarker(
+      answer.stopReason,
+      endMarkerReasonThisTurn,
+      {
+        watchdogCancelSent,
+        updatesAfterArm,
+      },
+    );
+    if (!mainTurnEndedOnItsOwn(answer.stopReason, reconciliation)) {
+      delete openMainDelivery.ownEnd;
+      return;
+    }
+    const recovered = reconciliation.kind === "recovered";
+    openMainDelivery.ownEnd = {
+      stopReason: recovered ? reconciliation.stopReason : toDeliveryStopReason(answer.stopReason),
+      ...(answer.steered ? { steered: true } : {}),
+      ...(recovered ? { recoveredBy: "turn-watchdog" as const } : {}),
+      ...(answer.turnError
+        ? { error: { code: 0, message: answer.turnError, detailCode: "" } }
+        : {}),
+    };
+  };
+
   const runPromptAttempt = async (sessionId: string, attempt: number) => {
     const promptStartedAt = Date.now();
     // Fresh watchdog state for this attempt (a retry re-arms cleanly, under a NEW
@@ -3476,6 +3514,15 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         messageId: options.messageId,
         ...(promptId !== undefined ? { promptId } : {}),
         onPromptStarted: buildPromptStartedHook(sessionId, attempt),
+        // brick 570d2570 (C3) — the turn's own end, recorded the moment the response arrives (before the drain).
+        onPromptResponse: (answer) => {
+          const turnError = turnErrorFromMeta(answer._meta);
+          recordMainTurnOwnEnd({
+            stopReason: answer.stopReason,
+            ...(turnError !== undefined ? { turnError } : {}),
+            ...(steeredFromMeta(answer._meta) ? { steered: true } : {}),
+          });
+        },
       });
       if (!turnWatchdogEnabled) {
         return await turnPromise;
@@ -3534,18 +3581,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         watchdog.dispose();
       }
     }).finally(unregisterContextAlarm);
-    if (openMainDelivery) {
-      // brick 570d2570 — recorded the moment the prompt resolves, ahead of every await between here and the
-      // terminal, so a close-cut sweep that lands in that gap can tell a turn that ended on its own from one the
-      // close cut (`mainTurnEndedOnItsOwn`).
-      openMainDelivery.turnEndedOnItsOwn = mainTurnEndedOnItsOwn(
-        response.stopReason,
-        reconcileStopReasonWithMarker(response.stopReason, endMarkerReasonThisTurn, {
-          watchdogCancelSent,
-          updatesAfterArm,
-        }),
-      );
-    }
+    // brick 570d2570 — re-recorded after the late-update drain with the reconciliation `appendMainTurnTerminals`
+    // will use, so a close in the remaining gap writes exactly the terminal this turn would have written.
+    recordMainTurnOwnEnd(response);
     // The primary ACP prompt resolved. That may be a real turn end OR the
     // adapter handing the turn over to an injected prompt, so keep injecting
     // while any injected prompt is still unsettled; stop only once they are

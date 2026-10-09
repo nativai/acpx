@@ -11,6 +11,8 @@
 // injected prompt holds the runtime — so no row races the close against the runtime.
 
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import path from "node:path";
 import test from "node:test";
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import {
@@ -24,11 +26,18 @@ import {
   SessionQueueOwner,
   tryAcquireQueueOwnerLease,
 } from "../src/cli/queue/ipc.js";
+import {
+  claimMainTurnDeliveryTerminal,
+  type OpenMainTurnDelivery,
+  registerOpenMainTurnDelivery,
+  unregisterOpenMainTurnDelivery,
+} from "../src/cli/queue/main-turn-delivery.js";
 import type { QueueOwnerMessage } from "../src/cli/queue/messages.js";
 import { resetSessionCloseIntentForTests } from "../src/cli/queue/session-close-intent.js";
 import { runQueuedTask } from "../src/cli/session/runtime.js";
 import { textPrompt } from "../src/prompt-content.js";
 import type { DepthProjection } from "../src/session/depth-projection.js";
+import { sessionEventActivePath } from "../src/session/event-log.js";
 import { listSessionEvents } from "../src/session/events.js";
 import type { SessionNotification, SessionRecord } from "../src/types.js";
 import {
@@ -265,7 +274,7 @@ test("570d2570: the signal sweep after a close drain gives the cut main turn fai
 // end_turn and the runtime is still in its post-resolution awaits (held here by an injected prompt, the
 // production way: `drainInjectedPrompts` keeps the turn open while one is unsettled) when the kill lands.
 // The sweep writes nothing; the turn's own `done` follows once the runtime finishes.
-test("570d2570: a main turn that resolved on its own before the kill never gets the close's code", async () => {
+test("570d2570: a main turn that resolved on its own before the kill gets its OWN done, never the close's code", async () => {
   const mainMessageId = "57000002-0000-4000-8000-000000000002";
   const injectedMessageId = "57000002-0000-4000-8000-0000000000aa";
   const injected = createDeferred<PromptResponse>();
@@ -299,16 +308,24 @@ test("570d2570: a main turn that resolved on its own before the kill never gets 
         "parked: no terminal yet",
       );
       await drainForClose(rig.owner);
-      assert.equal(rig.owner.terminalizeCustodyOnSignal(), 0, "the sweep wrote nothing");
-      assert.deepEqual(
-        await terminalsFor(rig.record, mainMessageId),
-        [],
-        "no close code for a turn that ended on its own",
+      // 570d2570 C3 — the sweep writes the turn's OWN done (it answered end_turn), never the close's code.
+      assert.equal(
+        rig.owner.terminalizeCustodyOnSignal(),
+        1,
+        "the sweep wrote the turn's own terminal",
       );
+      const atKill = await terminalsFor(rig.record, mainMessageId);
+      assert.equal(atKill.length, 1);
+      assert.equal(atKill[0]?.phase, "done", "no close code for a turn that ended on its own");
+      assert.equal(atKill[0]?.stopReason, "end_turn");
       injected.resolve({ stopReason: "end_turn" });
       await withRaceTimeout(rig.run, MUST_FINISH_MS, "the turn never finished");
       const terminals = await terminalsFor(rig.record, mainMessageId);
-      assert.equal(terminals.length, 1, "exactly one terminal: the turn's own");
+      assert.equal(
+        terminals.length,
+        1,
+        "exactly one terminal: the runtime's own later done is suppressed",
+      );
       assert.equal(terminals[0]?.phase, "done");
       assert.equal(terminals[0]?.stopReason, "end_turn");
     },
@@ -389,7 +406,10 @@ test("570d2570: without a close drain the signal sweep writes nothing for the ma
 
 // The watchdog is armed (attributed sdk_idle + completing) and the agent kept producing output after
 // the signal, so a tier-1 cancel would be a CUT. The close kills the owner FIRST: the sweep writes the
-// close's code, and the runtime's later cut (TURN_WATCHDOG_CANCELLED, mapped or not) adds nothing.
+// close's code. What this row GUARDS in production is the at-kill half: an armed watchdog does not stop the
+// sweep from writing the close's code. Its second half — the runtime's later cut (TURN_WATCHDOG_CANCELLED,
+// mapped or not) adding nothing — CANNOT happen in production, where the sweep runs inside a SIGTERM handler
+// that exits the process; it pins the shared claim for an in-process caller (§C6 item 4).
 test("570d2570: a close during a watchdog-armed turn, sweep first, then the watchdog's cut — one terminal, the close's", async () => {
   const mainMessageId = "57000006-0000-4000-8000-000000000006";
   await withMainTurn(
@@ -432,4 +452,106 @@ test("570d2570: a close during a watchdog-armed turn, watchdog's cut first, then
       assertCloseCut(await terminalsFor(rig.record, mainMessageId), "after the kill");
     },
   );
+});
+
+// 570d2570 C3 (test-engineer, VERIFICATION §C3) — the gap the first fix missed. After the `session/prompt` response
+// arrives, `runPromptTurn` waits for the late `session/update` stream to go quiet (>= 1 s, SESSION_REPLY_IDLE_MS)
+// before it returns, and the first fix recorded "ended on its own" only on that return. A close whose kill lands in
+// that second gave a finished turn the close's code (live: d4889ceb L60 end_turn, then L61 failed). Here the drain is
+// HELD open, so the kill provably lands inside it.
+test("570d2570 C3: a turn that answered end_turn and is still in the late-update drain gets its own done at the kill", async () => {
+  const mainMessageId = "57000008-0000-4000-8000-000000000008";
+  const drainEntered = createDeferred<void>();
+  const drainRelease = createDeferred<void>();
+  await withMainTurn({ sessionId: "close-cut-main-8", mainMessageId }, async (rig) => {
+    // The real client's late-update drain, held open: "not quiet yet".
+    (
+      rig.control.client as unknown as { waitForSessionUpdatesIdle: () => Promise<void> }
+    ).waitForSessionUpdatesIdle = async () => {
+      drainEntered.resolve();
+      await drainRelease.promise;
+    };
+    rig.control.resolveMainPrompt({ stopReason: "end_turn" });
+    await drainEntered.promise;
+    await drainForClose(rig.owner);
+    assert.equal(rig.owner.terminalizeCustodyOnSignal(), 1);
+    const atKill = await terminalsFor(rig.record, mainMessageId);
+    assert.equal(atKill.length, 1);
+    assert.equal(
+      atKill[0]?.phase,
+      "done",
+      `the turn's own terminal, not the close's: ${JSON.stringify(atKill[0])}`,
+    );
+    assert.equal(atKill[0]?.stopReason, "end_turn");
+    drainRelease.resolve();
+    await withRaceTimeout(rig.run, MUST_FINISH_MS, "the turn never finished");
+    const terminals = await terminalsFor(rig.record, mainMessageId);
+    assert.equal(terminals.length, 1, "exactly one terminal");
+    assert.equal(terminals[0]?.phase, "done");
+  });
+});
+
+test("570d2570 C3 (control): a turn that answered CANCELLED during the drain still gets the close's code", async () => {
+  const mainMessageId = "57000009-0000-4000-8000-000000000009";
+  const drainEntered = createDeferred<void>();
+  const drainRelease = createDeferred<void>();
+  await withMainTurn({ sessionId: "close-cut-main-9", mainMessageId }, async (rig) => {
+    (
+      rig.control.client as unknown as { waitForSessionUpdatesIdle: () => Promise<void> }
+    ).waitForSessionUpdatesIdle = async () => {
+      drainEntered.resolve();
+      await drainRelease.promise;
+    };
+    rig.control.resolveMainPrompt({ stopReason: "cancelled" }); // what session/close produces
+    await drainEntered.promise;
+    await drainForClose(rig.owner);
+    rig.owner.terminalizeCustodyOnSignal();
+    assertCloseCut(await terminalsFor(rig.record, mainMessageId), "at the kill");
+    drainRelease.resolve();
+    await withRaceTimeout(rig.run, MUST_FINISH_MS, "the turn never finished");
+    assertCloseCut(await terminalsFor(rig.record, mainMessageId), "after the drain");
+  });
+});
+
+// 570d2570 §C6 item 1 (test-engineer code review) — the branch "the runtime has CLAIMED the delivery while its entry
+// is still registered": the runtime's choke point flips the claim synchronously and then awaits its own async
+// append, and the kill can land inside that await. The sweep must then write nothing (the runtime's line is the
+// one). Row 7 awaits the run before the sweep, so its entry is already unregistered and never reaches this branch;
+// the runtime's private entry is not reachable from a rig, so this drives the owner and the registry directly.
+test("570d2570 C6: an entry the runtime already CLAIMED but has not yet unregistered gets nothing from the sweep", async () => {
+  await withTempHome("acpx-close-cut-claimed-", async () => {
+    const sweep = async (
+      sessionId: string,
+      claimFirst: boolean,
+    ): Promise<{ written: number; lines: number }> => {
+      await fs.mkdir(path.dirname(sessionEventActivePath(sessionId)), { recursive: true });
+      const lease = await tryAcquireQueueOwnerLease(sessionId);
+      assert(lease, "expected a queue-owner lease");
+      const owner = await SessionQueueOwner.start(lease, stubControlHandlers(), {
+        maxQueueDepth: 8,
+      });
+      const entry: OpenMainTurnDelivery = {
+        context: { messageId: `msg-${sessionId}`, requestId: `req-${sessionId}` },
+        terminalClaimed: false,
+      };
+      registerOpenMainTurnDelivery(sessionId, entry);
+      try {
+        if (claimFirst) {
+          assert.equal(claimMainTurnDeliveryTerminal(entry), true, "the runtime won the claim");
+        }
+        await drainForClose(owner);
+        const written = owner.terminalizeCustodyOnSignal();
+        const raw = await fs.readFile(sessionEventActivePath(sessionId), "utf8").catch(() => "");
+        const lines = raw.split("\n").filter((line) => line.includes(`msg-${sessionId}`)).length;
+        return { written, lines };
+      } finally {
+        unregisterOpenMainTurnDelivery(sessionId, entry);
+        await owner.close();
+        resetSessionCloseIntentForTests();
+      }
+    };
+    // Positive control: the same sweep on an UNclaimed entry writes the close's line — the sensor can see one.
+    assert.deepEqual(await sweep("close-cut-claimed-control", false), { written: 1, lines: 1 });
+    assert.deepEqual(await sweep("close-cut-claimed", true), { written: 0, lines: 0 });
+  });
 });
