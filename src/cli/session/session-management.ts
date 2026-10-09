@@ -701,6 +701,12 @@ async function createSessionRecordWithClient(
           ...(options.parentSeatId?.trim() ? { parentSeatId: options.parentSeatId.trim() } : {}),
         }
       : {}),
+    // `--no-parent` (brick 5eaf316c): the creator as provenance only — no `kind`, no edge.
+    // Written here, at construction, where no `<id>.json` exists yet; every later write
+    // keeps it through `preserveParentLinkageForPersist` (disk wins).
+    ...(options.spawnedBySessionId?.trim()
+      ? { spawnedBySessionId: options.spawnedBySessionId.trim() }
+      : {}),
     ...(options.metadata && Object.keys(options.metadata).length > 0
       ? { metadata: { ...options.metadata } }
       : {}),

@@ -112,6 +112,12 @@ export type SessionCreateOptions = {
   /** The parent's seat id, resolved same-box only (C3/D-B1-9, brick 5ad22d5d). */
   parentSeatId?: string;
   /**
+   * `sessions new --no-parent` only (brick 5eaf316c): the session that WOULD have been the
+   * parent, kept as write-once provenance (`SessionRecord.spawnedBySessionId`) with no edge.
+   * Never set beside `parentSessionId` — with a parent, the first re-parent captures it.
+   */
+  spawnedBySessionId?: string;
+  /**
    * CREATE INTO AN EXISTING SEAT — `sessions new --seat <seat-ref>` (D11, brick
    * b64dfbb3). The new record joins the named seat **prepared but not active**:
    * `holderActive: false` and **no** `holderOrdinal`, because the ordinal is

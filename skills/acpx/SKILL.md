@@ -261,7 +261,9 @@ Behavior:
   template's stored auto-prompt
 - `new --no-parent` records no parent session and no parent seat (a top-level
   session; its agent gets no `ACPX_PARENT_*`) while still inheriting agent,
-  model, effort, credentials and brick from the caller
+  model, effort, credentials and brick from the caller; the caller is kept as
+  provenance in `spawned_by_session_id` (`sessions show --format json`), never
+  as an edge
 - `new --favorite` creates the session's seat starred (as `seats favorite
 <seat> --on`); refused on a seat join
 - `set-parent --session-id <id> --no-parent` clears one session's parent
