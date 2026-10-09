@@ -6,7 +6,7 @@ import { formatErrorMessage } from "../../acp/error-normalization.js";
 import { harnessIdForAgentCommand } from "../../acp/harness-capabilities.js";
 import { supportsMidTurnPromptInjection } from "../../acp/mid-turn-injection-support.js";
 import { withTimeout } from "../../async-control.js";
-import { SessionClosedError } from "../../errors.js";
+import { QueueConnectionError, SessionClosedError } from "../../errors.js";
 import { checkpointPerfMetricsCapture } from "../../perf-metrics-capture.js";
 import { incrementPerfCounter, setPerfGauge } from "../../perf-metrics.js";
 import { promptToDisplayText } from "../../prompt-content.js";
@@ -40,13 +40,14 @@ import {
   SessionQueueOwner,
   releaseQueueOwnerLease,
   hasLiveProcessGroup,
+  isProcessAlive,
   tryAcquireQueueOwnerLease,
   trySubmitToRunningOwner,
   type QueueOwnerLease,
   signalProcessGroup,
   waitMs,
 } from "../queue/ipc.js";
-import { refreshQueueOwnerLease } from "../queue/lease-store.js";
+import { readQueueOwnerRecord, refreshQueueOwnerLease } from "../queue/lease-store.js";
 import { QueueOwnerTurnController } from "../queue/owner-turn-controller.js";
 import { terminalizeAbsorbedDeliveriesOnOwnerExit } from "./absorbed-delivery-registry.js";
 import { resolveAndEnsureAgentFolder } from "./agent-folder.js";
@@ -75,10 +76,11 @@ import {
 } from "./queue-owner-process.js";
 import { runQueuedTask } from "./runtime.js";
 
-// Overall connect-poll budget for a cold-respawn owner startup (× 50 ms ≈ 6 s).
-// Shared across all re-spawn attempts so the worst-case latency stays at the
-// historical ~6 s bound rather than ballooning to a multiple of it.
-const QUEUE_OWNER_STARTUP_MAX_ATTEMPTS = 120;
+// Wall-clock budget for a cold-respawn owner startup, shared across all re-spawn
+// attempts. It is a TIME bound, not a poll count: once the owner's lease exists a
+// single poll costs ~2 s (the submit transport's connect retries), so a count of
+// polls says nothing about how long the client waits (brick://addea939).
+const QUEUE_OWNER_STARTUP_BUDGET_MS = 30_000;
 // Bounded re-spawns within that budget. A transient single-owner startup failure
 // (owner dies before lock+listen) must self-heal within ONE message; a persistent
 // one must still fail fast (W13-24-14 / RCA §3.5). One spawn + up to two re-spawns.
@@ -1295,18 +1297,61 @@ export type SendSessionRuntimeDeps = {
   spawnQueueOwnerProcess: (options: QueueOwnerRuntimeOptions) => SpawnedQueueOwner;
   waitMs: (ms: number) => Promise<void>;
   readStartupFailureDetail: (sessionId: string) => string | undefined;
-  maxPollAttempts: number;
+  startupBudgetMs: number;
+  nowMs: () => number;
   maxSpawnAttempts: number;
 };
 
-const defaultSendSessionRuntimeDeps: SendSessionRuntimeDeps = {
+export const defaultSendSessionRuntimeDeps: SendSessionRuntimeDeps = {
   submitToRunningOwner,
   spawnQueueOwnerProcess,
   waitMs,
   readStartupFailureDetail: readQueueOwnerStartupFailureDetail,
-  maxPollAttempts: QUEUE_OWNER_STARTUP_MAX_ATTEMPTS,
+  startupBudgetMs: QUEUE_OWNER_STARTUP_BUDGET_MS,
+  nowMs: Date.now,
   maxSpawnAttempts: QUEUE_OWNER_MAX_SPAWN_ATTEMPTS,
 };
+
+// ⚠️ DO NOT "FIX" THIS BY LETTING THE THROW THROUGH, and do not narrow it to
+// `retryable`. Every cold start passes through "lease written, socket not yet
+// listening" (lease-acquire → SessionQueueOwner.start, a window that stretches under
+// load). In that state `trySubmitToRunningOwner` does not return `undefined` ("not
+// yet"): it spends ~2 s of connect retries and THROWS this error. A caller waiting
+// for a freshly spawned owner must read it as "not yet", exactly like `undefined`
+// (brick://addea939 RCA §Q1; the throw used to strand the first prompt of a new
+// session). Held by test/queue-cold-respawn.test.ts T-A1*/T-A2.
+function isQueueNotAcceptingRequests(error: unknown): error is QueueConnectionError {
+  return (
+    error instanceof QueueConnectionError && error.detailCode === "QUEUE_NOT_ACCEPTING_REQUESTS"
+  );
+}
+
+// `starting` is set when the lease exists but nothing listens yet; `outcome` is the
+// submit result otherwise (`undefined` = no usable owner).
+type StartupSubmit = {
+  outcome: SessionSendOutcome | undefined;
+  starting: QueueConnectionError | undefined;
+};
+
+// One submit attempt, with "lease written, listener not yet bound" reported as a
+// state (`starting`) instead of a throw. Every other error still propagates.
+async function submitOrNoteStarting(
+  deps: SendSessionRuntimeDeps,
+  options: SessionSendOptions,
+  waitForCompletion: boolean,
+): Promise<StartupSubmit> {
+  try {
+    return {
+      starting: undefined,
+      outcome: await deps.submitToRunningOwner(options, waitForCompletion),
+    };
+  } catch (error) {
+    if (isQueueNotAcceptingRequests(error)) {
+      return { starting: error, outcome: undefined };
+    }
+    throw error;
+  }
+}
 
 function describeOwnerExit(exit: OwnerExitInfo): string {
   if (exit.signal !== null) {
@@ -1355,6 +1400,22 @@ function formatOwnerStartFailure(
   );
 }
 
+// Budget spent with a live lease that never listened and an owner that has not
+// exited: nothing was submitted, so hand back the retryable not-accepting error
+// UNCHANGED (message, detailCode, retryable). Callers classify the enqueue failure
+// by that text/code (acpx-ui classifyEnqueueFailure); a plain "failed to start"
+// would read as ack-ambiguous and be converted to hold-until-idle, re-stranding a
+// session that never idles. "failed to start" stays for never-saw-a-lease and for
+// dead owners. Held by T-A1b and its two controls.
+function throwIfStillStarting(
+  lastStarting: QueueConnectionError | undefined,
+  spawned: SpawnedQueueOwner,
+): void {
+  if (lastStarting && !spawned.exit) {
+    throw lastStarting;
+  }
+}
+
 // Cold-respawn startup: spawn a queue owner and wait for it to become
 // submittable, re-spawning a fresh owner (bounded) whenever the spawned one dies
 // before it can create its lock + listen. This is the W13-24-14 fix: a transient
@@ -1373,17 +1434,22 @@ export async function spawnAndAwaitQueueOwner(
   let spawned = deps.spawnQueueOwnerProcess(runtimeOptions);
   let spawnsUsed = 1;
   let lastExit: OwnerExitInfo | undefined;
+  let lastStarting: QueueConnectionError | undefined;
+  const startedAtMs = deps.nowMs();
   try {
-    for (let attempt = 0; attempt < deps.maxPollAttempts; attempt += 1) {
-      const queued = await deps.submitToRunningOwner(effectiveOptions, waitForCompletion);
-      if (queued) {
-        return queued;
+    while (deps.nowMs() - startedAtMs < deps.startupBudgetMs) {
+      // `starting` falls through like `undefined`: a dead owner is still caught by
+      // the `spawned.exit` check below.
+      const attempt = await submitOrNoteStarting(deps, effectiveOptions, waitForCompletion);
+      lastStarting = attempt.starting;
+      if (attempt.outcome) {
+        return attempt.outcome;
       }
 
       const exit = spawned.exit;
       if (exit) {
         // The spawned owner died before becoming submittable. Re-spawn a fresh
-        // one (within the shared poll budget) so a transient hiccup self-heals;
+        // one (within the shared startup budget) so a transient hiccup self-heals;
         // once the bounded attempts are spent, fail fast rather than polling a
         // corpse for the remaining budget.
         lastExit = exit;
@@ -1405,6 +1471,7 @@ export async function spawnAndAwaitQueueOwner(
 
       await deps.waitMs(QUEUE_CONNECT_RETRY_MS);
     }
+    throwIfStillStarting(lastStarting, spawned);
   } finally {
     spawned.dispose();
   }
@@ -1454,7 +1521,54 @@ function assertRecordOpenForCliPrompt(record: SessionRecord, options: SessionSen
   throw new SessionClosedError(record.acpxRecordId);
 }
 
-export async function sendSession(options: SessionSendOptions): Promise<SessionSendOutcome> {
+// How much of the startup budget a lease that is not yet accepting still has: the
+// lease must belong to a live pid and be younger than the budget. Anything else is
+// a wedged or dead owner and gets no grace (0).
+async function startupBudgetLeftForLease(
+  sessionId: string,
+  deps: SendSessionRuntimeDeps,
+): Promise<number> {
+  const lease = await readQueueOwnerRecord(sessionId);
+  if (!lease || !isProcessAlive(lease.pid)) {
+    return 0;
+  }
+  const leaseAgeMs = deps.nowMs() - Date.parse(lease.createdAt);
+  return Number.isFinite(leaseAgeMs) ? Math.max(0, deps.startupBudgetMs - leaseAgeMs) : 0;
+}
+
+// The first submit of `sendSession` reaches an owner another client spawned a moment
+// earlier (second send into a cold start): lease written, listener not yet bound, so
+// it throws QUEUE_NOT_ACCEPTING_REQUESTS (A2, brick://addea939). If the lease is
+// young and its pid alive, wait for the listener on the startup budget rather than
+// failing — and never spawn a second owner, which would only defer on the `wx` lease.
+// An OLD lease that is not accepting is a wedged owner and keeps today's error. An
+// `undefined` result (lease cleared, owner gone) falls through to the cold spawn.
+async function submitToRunningOrStartingOwner(
+  options: SessionSendOptions,
+  waitForCompletion: boolean,
+  deps: SendSessionRuntimeDeps,
+): Promise<SessionSendOutcome | undefined> {
+  let attempt = await submitOrNoteStarting(deps, options, waitForCompletion);
+  const firstError = attempt.starting;
+  if (!firstError) {
+    return attempt.outcome;
+  }
+  const deadlineMs = deps.nowMs() + (await startupBudgetLeftForLease(options.sessionId, deps));
+  while (attempt.starting && deps.nowMs() < deadlineMs) {
+    await deps.waitMs(QUEUE_CONNECT_RETRY_MS);
+    attempt = await submitOrNoteStarting(deps, options, waitForCompletion);
+  }
+  if (attempt.starting) {
+    // Budget spent: the ORIGINAL error, so the caller's classification is unchanged.
+    throw firstError;
+  }
+  return attempt.outcome;
+}
+
+export async function sendSession(
+  options: SessionSendOptions,
+  deps: SendSessionRuntimeDeps = defaultSendSessionRuntimeDeps,
+): Promise<SessionSendOutcome> {
   const waitForCompletion = options.waitForCompletion !== false;
   // Resolved once, and checked BEFORE the owner-option persist below writes the
   // record twice — a refused prompt must not mutate the session it was refused by.
@@ -1462,12 +1576,16 @@ export async function sendSession(options: SessionSendOptions): Promise<SessionS
   assertRecordOpenForCliPrompt(record, options);
   const effectiveOptions = await persistSendOwnerOptions(record, options);
 
-  const queuedToOwner = await submitToRunningOwner(effectiveOptions, waitForCompletion);
+  const queuedToOwner = await submitToRunningOrStartingOwner(
+    effectiveOptions,
+    waitForCompletion,
+    deps,
+  );
   if (queuedToOwner) {
     return queuedToOwner;
   }
 
-  return await spawnAndAwaitQueueOwner(effectiveOptions);
+  return await spawnAndAwaitQueueOwner(effectiveOptions, deps);
 }
 
 // Split from its former `resolveAndPersistSendOwnerOptions` shape so `sendSession`
