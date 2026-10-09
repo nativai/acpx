@@ -21,12 +21,26 @@ import {
 } from "./context-alarm.js";
 import { readSeatStore, seatFromStore } from "./persistence/seat-store.js";
 
+/**
+ * The stored fill as the alarm reads it. Brick 4a6716b5: a fill past its KNOWN window is no
+ * fill — the same rule `rememberContextFill` applies to a fresh report, applied here too
+ * because a record persisted by an older build can still carry one (a false turn-start
+ * alarm after the next owner respawn).
+ */
 export function contextFillFromState(
   state: SessionContextFill | undefined,
 ): ContextFill | undefined {
-  return state === undefined
-    ? undefined
-    : { used: state.used_tokens, window: state.window_tokens, compactAt: state.compaction_tokens };
+  if (state === undefined) {
+    return undefined;
+  }
+  if (state.window_tokens > 0 && state.used_tokens > state.window_tokens) {
+    return undefined;
+  }
+  return {
+    used: state.used_tokens,
+    window: state.window_tokens,
+    compactAt: state.compaction_tokens,
+  };
 }
 
 /**

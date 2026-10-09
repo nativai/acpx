@@ -46,7 +46,7 @@ import {
   seatFromStore,
   setSeatContextAlarm,
 } from "../src/session/persistence/seat-store.js";
-import type { SessionRecord } from "../src/types.js";
+import type { SessionContextFill, SessionRecord } from "../src/types.js";
 import { makeSessionRecord, withTempHome, writeSessionRecordFile } from "./runtime-test-helpers.js";
 
 const fill = (used: number, window: number, compactAt?: number): ContextFill => ({
@@ -417,6 +417,8 @@ async function runTwoTurns(params: {
   seatLevel?: number;
   /** Also read back what the turns persisted: the record's fill and `acpx context`. */
   readBack?: boolean;
+  /** A fill already on the record before the first turn (as an older build persisted it). */
+  persistedFill?: SessionContextFill;
 }) {
   return await withTempHome("acpx-context-alarm-runtime-", async (homeDir) => {
     const record: SessionRecord = {
@@ -427,6 +429,7 @@ async function runTwoTurns(params: {
         cwd: homeDir,
       }),
       seatId: SEAT,
+      ...(params.persistedFill ? { acpx: { context_fill: params.persistedFill } } : {}),
     };
     await writeSessionRecordFile(homeDir, record);
     await mintSeatRow(sessionBaseDir(), {
@@ -523,6 +526,19 @@ test("4a6716b5 — used == window is a reading: stored, and it rings past the le
     /^⟦CONTEXT-ALARM⟧ Context 1,000,000 \/ 1,000,000 tokens \(100\.0 %\)/,
   );
   assert.equal(rig.storedFill?.used_tokens, 1_000_000);
+});
+
+test("4a6716b5 — a record PERSISTED with an impossible fill (an older build): a real turn opens with no notice, and `acpx context` does not print it", async () => {
+  const rig = await runTwoTurns({
+    usages: [],
+    persistedFill: { used_tokens: 1_104_235, window_tokens: 828_400, compaction_tokens: 784_800 },
+    readBack: true,
+  });
+  assert.deepEqual(rig.injected, []);
+  assert.deepEqual(rig.turnTops, [undefined, undefined]);
+  assert.equal(rig.contextCli?.code, 0, rig.contextCli?.stderr);
+  assert.doesNotMatch(rig.contextCli?.stdout ?? "", /1,104,235/);
+  assert.match(rig.contextCli?.stdout ?? "", /^context: 0 \/ 0 tokens \(0\.0 %\)/);
 });
 
 test("4a6716b5 — window unknown (0), large used: stored as reported with window 0, no alarm (unchanged)", async () => {
