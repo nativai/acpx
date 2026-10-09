@@ -2959,10 +2959,11 @@ test("sessions new --from-template --brick preserves template metadata, context,
       [["stamp", BRICK_X, "session-started", "--by", `session:${instanceId}`]],
     );
 
+    // 45 s: covers a cold owner start, which A1 waits for up to 30 s (QUEUE_OWNER_STARTUP_BUDGET_MS).
     const operations = await waitFor(async () => {
       const entries = await readMockOperations(operationLog);
       return entries.some((entry) => entry.method === "session/prompt") ? entries : null;
-    }, 15_000);
+    }, 45_000);
     const newIndex = operations.findIndex((entry) => entry.method === "session/new");
     const promptIndex = operations.findIndex(
       (entry) => entry.method === "session/prompt" && entry.text === "TPL AUTO",
@@ -3149,6 +3150,7 @@ async function startSleepingDelivery(
     { env: ownerEnv, stdio: ["ignore", "ignore", "ignore"] },
   );
   blocker.unref();
+  // 45 s: covers a cold owner start, which A1 waits for up to 30 s (QUEUE_OWNER_STARTUP_BUDGET_MS).
   await waitFor(async () => {
     const operations = await readMockOperations(operationLog).catch(() => []);
     return operations.some(
@@ -3156,8 +3158,9 @@ async function startSleepingDelivery(
     )
       ? true
       : null;
-  }, 15_000);
+  }, 45_000);
   // the delivery must be ACCEPTED before the close, or this measures a different state
+  // 45 s: covers a cold owner start, which A1 waits for up to 30 s (QUEUE_OWNER_STARTUP_BUDGET_MS).
   await waitFor(async () => {
     const stream = path.join(
       homeDir,
@@ -3167,7 +3170,7 @@ async function startSleepingDelivery(
     );
     const raw = await fs.readFile(stream, "utf8").catch(() => "");
     return raw.includes(messageId) && raw.includes('"phase":"accepted"') ? true : null;
-  }, 15_000);
+  }, 45_000);
 }
 
 async function freshSleepingTarget(
@@ -3373,6 +3376,7 @@ test("external brick metadata and an unknown legacy key survive owner turn-end, 
     };
 
     try {
+      // 45 s: covers a cold owner start, which A1 waits for up to 30 s (QUEUE_OWNER_STARTUP_BUDGET_MS).
       await waitFor(async () => {
         const operations = await readMockOperations(operationLog);
         return operations.some(
@@ -3380,7 +3384,7 @@ test("external brick metadata and an unknown legacy key survive owner turn-end, 
         )
           ? true
           : null;
-      }, 10_000);
+      }, 45_000);
 
       const env = {
         PATH: `${BRICK_SHIM_DIR}:${process.env.PATH ?? ""}`,
